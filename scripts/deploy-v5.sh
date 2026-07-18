@@ -4161,6 +4161,39 @@ smoke_turn_canary() { # <pinned master release>
   ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${ACTIVE_PORT}' timeout 300 node scripts/v5-smoke-turn-canary.mjs"
 }
 
+# 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。背景:「点击添加附件无反应」
+# 回归上线 ~20h 才被用户报障 —— turn canary 只覆盖 WS 契约,健康端点不点 UI,前端交互
+# 层此前没有任何门。本门在**部署发起机本机**用真 Chromium(受信事件)走核心旅程:
+# UI 登录 → 附件全链(filechooser 弹出+真实上传)→ 目标入口 → 带附件发送上屏。
+# 脚本自建 ssh 隧道访问 $ACTIVE_PORT(kl-mirror 无浏览器;隧道由 node 进程管理,
+# libuv spawn 不继承部署锁 fd,不会占住 /var/lock/oc-v5-deploy.lock)。
+# 失败语义(第一期):fail-loud 非零退出 = 部署判定失败,但**不进 validation 自动回滚链**
+# —— UI 断言存在文案/选择器漂移的假阳性面,整 release 自动回滚代价不对称;连续两周零
+# 假阳性后升级进 validation_failure 链(升级时同步 v5ReleaseSafety 断言)。
+# 调用位置 = 各成功出口 end_planned_maintenance 之后(维护标记已清,UI 无维护态干扰)。
+# V5_SMOKE_E2E=0 显式豁免(紧急场景;默认必跑)。
+smoke_e2e_journey() {
+  [[ "${V5_SMOKE_E2E:-1}" == 1 ]] || { echo "  · E2E 旅程门已显式豁免(V5_SMOKE_E2E=0)"; return 0; }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] E2E journey canary(真浏览器用户旅程)"
+    return 0
+  fi
+  # 依赖活体探测:部署树 node_modules 必须已含 playwright-core(合并本批后需 npm install)。
+  # 缺失 = fail-loud 指引,绝不静默跳过(浏览器缺失→跳过 = fail-open,正是本门要消灭的洞)。
+  if [[ ! -d "$REPO_ROOT/node_modules/playwright-core" ]]; then
+    echo "✗✗ E2E 旅程门依赖缺失:$REPO_ROOT/node_modules/playwright-core 不存在。" >&2
+    echo "   在部署树执行 npm install 后重试;紧急豁免用 V5_SMOKE_E2E=0(需事后补跑)。" >&2
+    return 1
+  fi
+  echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送,remote port=$ACTIVE_PORT)──"
+  if ! V5_E2E_REMOTE_PORT="$ACTIVE_PORT" timeout 240 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
+    echo "✗✗ E2E 旅程门失败:用户可感知路径疑似回归(登录/附件/目标/发送其一)。" >&2
+    echo "   部署已落地但判定失败 —— 核查失败截图(/tmp/e2e-journey-fail-*.png);" >&2
+    echo "   确认回归则 scripts/deploy-v5.sh --rollback;确认假阳性则修 journey 脚本断言并登记。" >&2
+    return 1
+  fi
+}
+
 # C5:rollback 收尾后的 real-turn canary —— **非阻断**。回滚本体必须能落地,故这里
 # 的真 turn 只做"回滚后引擎是否真能出正文"的健康观测:失败只大声告警,**绝不**反向翻回
 # 已成功的回滚(回滚往往正是在引擎已坏时执行,再拿 turn 结果当门会把救援自我否决)。
@@ -4779,6 +4812,7 @@ deploy() {
   if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     echo "  ✓ setup-first 完成：扫码实时感知已上线；Plugin/安装仍钉旧 v1.0，等待用户在界面绑定"
     end_planned_maintenance
+    smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
@@ -4787,6 +4821,7 @@ deploy() {
   if [[ "$kp_deploy_bracket" == 0 ]]; then
     echo "  · Knowledge Planet:零接触部署(门未关/classify 降级),跳过 seed;promotion 顺延至下次部署或显式 verify lane"
     end_planned_maintenance
+    smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=zero-touch)。"
@@ -4806,6 +4841,7 @@ deploy() {
     exit 1
   fi
   end_planned_maintenance
+  smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
   echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -5015,6 +5051,8 @@ deploy_dist() {
   [[ "$DRY" == 1 ]] || smoke "$ACTIVE_PORT"
   dist_handshake_smoke "$ACTIVE_PORT"
   end_planned_maintenance
+  # dist(纯前端)是 UI 回归的最高发面(2026-07-18 附件事故即 --dist 上线),E2E 旅程门必跑。
+  smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
   echo "✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"

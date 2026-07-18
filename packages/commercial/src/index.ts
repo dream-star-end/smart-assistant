@@ -4299,6 +4299,7 @@ export async function registerCommercial(
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
+    promptQueueEnabled: isPromptQueueV1Enabled(),
     resolveContainerEndpoint,
     // 模型执行权威(方案 §2):注入即开启 flag —— 签发 + attestation 门 + descriptor 分类。
     ...(modelAuthoritySigner && modelCatalogCache

@@ -269,13 +269,17 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           detail.kind === 'agent'
             ? await getAgentCapabilityReadiness(userId, detail.slug, detail.versionId, { preset })
             : null
+        const publicDetail = {
+          ...detail,
+          ...marketplaceArtifactCompatibility(detail.kind, detail.pluginType),
+        }
+        delete (publicDetail as { riskFlags?: unknown }).riskFlags
         send(
           res,
           200,
           {
             detail: {
-              ...detail,
-              ...marketplaceArtifactCompatibility(detail.kind, detail.pluginType),
+              ...publicDetail,
               ...(capabilityReadiness ? { capabilityReadiness } : {}),
             },
           },

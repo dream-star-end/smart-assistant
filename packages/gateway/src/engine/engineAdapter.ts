@@ -58,6 +58,9 @@ export type CollabAgentPolicy = 'team-mode-prefer-delegate'
  *  额外携带 sessionTotals ref / toolUseIdToName(spec 明示允许 totals ref 方案)。 */
 export interface TurnParams {
   input: string | Array<{ type: string; [k: string]: unknown }>
+  /** PG coordinator-originated turn. Adapters may use this to enforce that
+   * no hidden runner-local queue forms behind the platform claim. */
+  queueTurn?: boolean
   /** PR2 v1.0.66 — server-owned requestId(engine-reported 计费关联用;CCB noop 透传)。 */
   requestId?: string
   /** Stable logical paid-turn key shared by persistence and proxy billing. */

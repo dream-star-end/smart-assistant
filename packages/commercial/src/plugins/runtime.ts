@@ -42,7 +42,10 @@ import {
   listVerifiedRuntimePluginContracts,
   loadVerifiedRuntimePluginContract,
 } from './review.js'
-import { managedPluginWritePolicy } from './writePolicy.js'
+import {
+  managedPluginWritePolicy,
+  managedPluginWritePreapprovalPolicy,
+} from './writePolicy.js'
 
 export class PluginRuntimeFacadeError extends Error {
   readonly code:
@@ -79,6 +82,14 @@ export interface RuntimePluginWriteControl {
   acceptedVersion: number | null
   acceptedAt: string | null
   disclaimerText: string
+  preapproval: {
+    available: boolean
+    enabled: boolean
+    disclaimerVersion: number | null
+    acceptedVersion: number | null
+    acceptedAt: string | null
+    disclaimerText: string | null
+  }
 }
 
 export interface RuntimePluginManagementEntry extends RuntimePluginCatalogEntry {
@@ -171,6 +182,9 @@ function writeControlFor(
     plugin_write_enabled: boolean
     plugin_write_disclaimer_version: number | null
     plugin_write_disclaimer_accepted_at: Date | null
+    plugin_write_preapproval_enabled: boolean
+    plugin_write_preapproval_disclaimer_version: number | null
+    plugin_write_preapproval_accepted_at: Date | null
   },
 ): RuntimePluginWriteControl | null {
   if (!actions.some((action) => action.effect === 'write')) return null
@@ -180,6 +194,13 @@ function writeControlFor(
     row.plugin_write_enabled === true &&
     row.plugin_write_disclaimer_version === policy.version &&
     row.plugin_write_disclaimer_accepted_at instanceof Date
+  const preapprovalPolicy = managedPluginWritePreapprovalPolicy(slug)
+  const preapprovalEnabled =
+    enabled &&
+    preapprovalPolicy !== null &&
+    row.plugin_write_preapproval_enabled === true &&
+    row.plugin_write_preapproval_disclaimer_version === preapprovalPolicy.version &&
+    row.plugin_write_preapproval_accepted_at instanceof Date
   return {
     available: true,
     enabled,
@@ -187,6 +208,14 @@ function writeControlFor(
     acceptedVersion: row.plugin_write_disclaimer_version,
     acceptedAt: row.plugin_write_disclaimer_accepted_at?.toISOString() ?? null,
     disclaimerText: policy.disclaimerText,
+    preapproval: {
+      available: preapprovalPolicy !== null,
+      enabled: preapprovalEnabled,
+      disclaimerVersion: preapprovalPolicy?.version ?? null,
+      acceptedVersion: row.plugin_write_preapproval_disclaimer_version,
+      acceptedAt: row.plugin_write_preapproval_accepted_at?.toISOString() ?? null,
+      disclaimerText: preapprovalPolicy?.disclaimerText ?? null,
+    },
   }
 }
 
@@ -202,6 +231,44 @@ function ledgerReplay(row: LedgerRow): RuntimePluginWriteExecution {
 function stablePluginErrorCode(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code
   return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'INTERNAL'
+}
+
+interface KnowledgePlanetCommentPage {
+  count: number
+  sort: 'asc' | 'desc'
+  beginTime?: string
+  endTime?: string
+}
+
+function normalizeKnowledgePlanetCommentPage(value: unknown): KnowledgePlanetCommentPage {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment lookup page is invalid')
+  const raw = value as Record<string, unknown>
+  const allowed = new Set(['count', 'sort', 'beginTime', 'endTime'])
+  if (Object.keys(raw).some((key) => !allowed.has(key)))
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment lookup page is invalid')
+  if (
+    !Number.isInteger(raw.count) ||
+    (raw.count as number) < 1 ||
+    (raw.count as number) > 50 ||
+    !['asc', 'desc'].includes(String(raw.sort)) ||
+    (raw.beginTime !== undefined &&
+      (typeof raw.beginTime !== 'string' || raw.beginTime.length > 80)) ||
+    (raw.endTime !== undefined && (typeof raw.endTime !== 'string' || raw.endTime.length > 80))
+  )
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment lookup page is invalid')
+  return {
+    count: raw.count as number,
+    sort: raw.sort as 'asc' | 'desc',
+    ...(typeof raw.beginTime === 'string' ? { beginTime: raw.beginTime } : {}),
+    ...(typeof raw.endTime === 'string' ? { endTime: raw.endTime } : {}),
+  }
+}
+
+function knowledgePlanetRemovalIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin media removal ids are invalid')
+  return [...new Set(value)] as string[]
 }
 
 export class PluginRuntimeFacade {
@@ -517,11 +584,17 @@ export class PluginRuntimeFacade {
       plugin_write_enabled: boolean
       plugin_write_disclaimer_version: number | null
       plugin_write_disclaimer_accepted_at: Date | null
+      plugin_write_preapproval_enabled: boolean
+      plugin_write_preapproval_disclaimer_version: number | null
+      plugin_write_preapproval_accepted_at: Date | null
     }>(
       `SELECT c.id::text, c.provider, c.display_name,
               c.connector_version_id::text, c.status, c.meta,
               c.plugin_write_enabled, c.plugin_write_disclaimer_version,
-              c.plugin_write_disclaimer_accepted_at
+              c.plugin_write_disclaimer_accepted_at,
+              c.plugin_write_preapproval_enabled,
+              c.plugin_write_preapproval_disclaimer_version,
+              c.plugin_write_preapproval_accepted_at
          FROM connections c
          JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
          JOIN marketplace_skill_listings l ON l.slug = v.slug AND l.slug = c.provider
@@ -583,11 +656,17 @@ export class PluginRuntimeFacade {
       plugin_write_enabled: boolean
       plugin_write_disclaimer_version: number | null
       plugin_write_disclaimer_accepted_at: Date | null
+      plugin_write_preapproval_enabled: boolean
+      plugin_write_preapproval_disclaimer_version: number | null
+      plugin_write_preapproval_accepted_at: Date | null
     }>(
       `SELECT c.id::text, c.provider, c.display_name,
               c.connector_version_id::text, c.meta,
               c.plugin_write_enabled, c.plugin_write_disclaimer_version,
-              c.plugin_write_disclaimer_accepted_at
+              c.plugin_write_disclaimer_accepted_at,
+              c.plugin_write_preapproval_enabled,
+              c.plugin_write_preapproval_disclaimer_version,
+              c.plugin_write_preapproval_accepted_at
          FROM connections c
          JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
          JOIN marketplace_skill_listings l ON l.slug = v.slug
@@ -690,6 +769,9 @@ export class PluginRuntimeFacade {
         plugin_write_enabled: boolean
         plugin_write_disclaimer_version: number | null
         plugin_write_disclaimer_accepted_at: Date | null
+        plugin_write_preapproval_enabled: boolean
+        plugin_write_preapproval_disclaimer_version: number | null
+        plugin_write_preapproval_accepted_at: Date | null
       }>(async (client) => {
         const locked = await client.query<PluginAccountRow>(
           `SELECT id::text AS id, user_id::int AS user_id, provider, display_name,
@@ -698,7 +780,11 @@ export class PluginRuntimeFacade {
                   connector_version_id::text AS connector_version_id, spec_hash,
                   exec_contract_hash, auth_contract_version,
                   plugin_write_enabled, plugin_write_disclaimer_version,
-                  plugin_write_disclaimer_accepted_at, status, meta, revoked_at
+                  plugin_write_disclaimer_accepted_at,
+                  plugin_write_preapproval_enabled,
+                  plugin_write_preapproval_disclaimer_version,
+                  plugin_write_preapproval_accepted_at,
+                  status, meta, revoked_at
              FROM connections
             WHERE id = $1::bigint AND user_id = $2
             FOR UPDATE`,
@@ -724,16 +810,23 @@ export class PluginRuntimeFacade {
           plugin_write_enabled: boolean
           plugin_write_disclaimer_version: number | null
           plugin_write_disclaimer_accepted_at: Date | null
+          plugin_write_preapproval_enabled: boolean
+          plugin_write_preapproval_disclaimer_version: number | null
+          plugin_write_preapproval_accepted_at: Date | null
         }>(
           `UPDATE connections
               SET plugin_write_enabled = $3,
+                  plugin_write_preapproval_enabled = CASE WHEN $3 THEN plugin_write_preapproval_enabled ELSE FALSE END,
                   plugin_write_disclaimer_version = CASE WHEN $3 THEN $4 ELSE plugin_write_disclaimer_version END,
                   plugin_write_disclaimer_accepted_at = CASE WHEN $3 THEN now() ELSE plugin_write_disclaimer_accepted_at END,
                   revision = revision + 1, updated_at = now()
             WHERE id = $1::bigint AND user_id = $2 AND revision = $5
               AND status = 'active' AND revoked_at IS NULL
             RETURNING plugin_write_enabled, plugin_write_disclaimer_version,
-                      plugin_write_disclaimer_accepted_at`,
+                      plugin_write_disclaimer_accepted_at,
+                      plugin_write_preapproval_enabled,
+                      plugin_write_preapproval_disclaimer_version,
+                      plugin_write_preapproval_accepted_at`,
           [input.targetId, input.userId, input.enabled, policy.version, row.revision],
         )
         if ((result.rowCount ?? 0) !== 1)
@@ -765,6 +858,122 @@ export class PluginRuntimeFacade {
             [input.targetId, input.userId],
           )
         }
+        return result.rows[0]!
+      }, this.pool)
+      const control = writeControlFor(
+        current.verified.slug,
+        current.verified.contract.actions,
+        updated,
+      )
+      if (!control) throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin write policy missing')
+      return control
+    } finally {
+      await lease.release()
+    }
+  }
+
+  async setManagedAccountWritePreapproval(input: {
+    userId: number
+    targetId: string
+    enabled: boolean
+    accepted?: true
+    disclaimerVersion?: number
+  }): Promise<RuntimePluginWriteControl> {
+    const initial = await this.loadManagedTarget(input.userId, input.targetId)
+    const policy = managedPluginWritePreapprovalPolicy(initial.verified.slug)
+    if (!policy || !initial.verified.contract.actions.some((action) => action.effect === 'write'))
+      throw new PluginRuntimeFacadeError(
+        'BAD_REQUEST',
+        'Plugin does not support account write preapproval',
+      )
+    if (input.enabled && (input.accepted !== true || input.disclaimerVersion !== policy.version))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'current preapproval disclaimer is required')
+
+    const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
+      hardTimeoutMs: 15_000,
+    })
+    try {
+      const current = await this.loadManagedTarget(input.userId, input.targetId)
+      if (
+        current.verified.artifactHash !== initial.verified.artifactHash ||
+        current.verified.execContractHash !== initial.verified.execContractHash
+      )
+        throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin changed before preapproval toggle')
+      await lease.assertHeld()
+      const updated = await tx<{
+        plugin_write_enabled: boolean
+        plugin_write_disclaimer_version: number | null
+        plugin_write_disclaimer_accepted_at: Date | null
+        plugin_write_preapproval_enabled: boolean
+        plugin_write_preapproval_disclaimer_version: number | null
+        plugin_write_preapproval_accepted_at: Date | null
+      }>(async (client) => {
+        const locked = await client.query<PluginAccountRow>(
+          `SELECT id::text AS id, user_id::int AS user_id, provider, display_name,
+                  account_key, aad_seed::text AS aad_seed, secret_enc, secret_nonce,
+                  revision, secret_generation::text AS secret_generation,
+                  connector_version_id::text AS connector_version_id, spec_hash,
+                  exec_contract_hash, auth_contract_version,
+                  plugin_write_enabled, plugin_write_disclaimer_version,
+                  plugin_write_disclaimer_accepted_at,
+                  plugin_write_preapproval_enabled,
+                  plugin_write_preapproval_disclaimer_version,
+                  plugin_write_preapproval_accepted_at,
+                  status, meta, revoked_at
+             FROM connections
+            WHERE id = $1::bigint AND user_id = $2
+            FOR UPDATE`,
+          [input.targetId, input.userId],
+        )
+        const row = locked.rows[0]
+        if (
+          !row ||
+          row.status !== 'active' ||
+          row.revoked_at !== null ||
+          row.provider !== current.verified.slug ||
+          row.revision !== current.row.revision ||
+          row.connector_version_id !== String(current.verified.versionId) ||
+          row.spec_hash.toString('hex') !== current.verified.artifactHash ||
+          row.exec_contract_hash.toString('hex') !== current.verified.execContractHash ||
+          row.auth_contract_version !== current.verified.contract.account.contractVersion
+        )
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin account changed')
+        await assertRuntimePluginInstallEntitlement(input.userId, current.verified, client, {
+          requireCurrent: true,
+        })
+        if (
+          input.enabled &&
+          writeControlFor(current.verified.slug, current.verified.contract.actions, row)?.enabled !==
+            true
+        )
+          throw new PluginRuntimeFacadeError(
+            'WRITE_DISABLED',
+            'Plugin writes must be enabled before preapproval',
+          )
+        const result = await client.query<{
+          plugin_write_enabled: boolean
+          plugin_write_disclaimer_version: number | null
+          plugin_write_disclaimer_accepted_at: Date | null
+          plugin_write_preapproval_enabled: boolean
+          plugin_write_preapproval_disclaimer_version: number | null
+          plugin_write_preapproval_accepted_at: Date | null
+        }>(
+          `UPDATE connections
+              SET plugin_write_preapproval_enabled = $3,
+                  plugin_write_preapproval_disclaimer_version = CASE WHEN $3 THEN $4 ELSE plugin_write_preapproval_disclaimer_version END,
+                  plugin_write_preapproval_accepted_at = CASE WHEN $3 THEN now() ELSE plugin_write_preapproval_accepted_at END,
+                  revision = revision + 1, updated_at = now()
+            WHERE id = $1::bigint AND user_id = $2 AND revision = $5
+              AND status = 'active' AND revoked_at IS NULL
+            RETURNING plugin_write_enabled, plugin_write_disclaimer_version,
+                      plugin_write_disclaimer_accepted_at,
+                      plugin_write_preapproval_enabled,
+                      plugin_write_preapproval_disclaimer_version,
+                      plugin_write_preapproval_accepted_at`,
+          [input.targetId, input.userId, input.enabled, policy.version, row.revision],
+        )
+        if ((result.rowCount ?? 0) !== 1)
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin preapproval toggle CAS failed')
         return result.rows[0]!
       }, this.pool)
       const control = writeControlFor(
@@ -851,24 +1060,45 @@ export class PluginRuntimeFacade {
             'Plugin can edit ordinary Knowledge Planet topics only',
           )
         const preserve = input.params.preserveExistingMedia !== false
+        const hasRemoveImageIds = Object.hasOwn(input.params, 'removeImageIds')
+        const hasRemoveFileIds = Object.hasOwn(input.params, 'removeFileIds')
+        if (!preserve && (hasRemoveImageIds || hasRemoveFileIds))
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin media removal cannot be combined with clearing all existing media',
+          )
+        const removeImageIds = hasRemoveImageIds
+          ? knowledgePlanetRemovalIds(input.params.removeImageIds)
+          : []
+        const removeFileIds = hasRemoveFileIds
+          ? knowledgePlanetRemovalIds(input.params.removeFileIds)
+          : []
+        if (
+          removeImageIds.some((id) => !imageIds.includes(id)) ||
+          removeFileIds.some((id) => !fileIds.includes(id))
+        )
+          throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin media removal target is stale')
+        const removeImages = new Set(removeImageIds)
+        const removeFiles = new Set(removeFileIds)
+        const keepImageIds = preserve ? imageIds.filter((id) => !removeImages.has(id)) : []
+        const keepFileIds = preserve ? fileIds.filter((id) => !removeFiles.has(id)) : []
         const manifest = prepared.mediaManifest as KnowledgePlanetSealedMedia[]
         const newImages = manifest.filter((item) => item.kind === 'image').length
         const newFiles = manifest.filter((item) => item.kind === 'file').length
-        if (
-          (preserve ? imageIds.length : 0) + newImages > 9 ||
-          (preserve ? fileIds.length : 0) + newFiles > 9
-        )
+        if (keepImageIds.length + newImages > 9 || keepFileIds.length + newFiles > 9)
           throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic media limit exceeded')
         prepared.preserveExistingMedia = preserve
+        if (hasRemoveImageIds) prepared.removeImageIds = removeImageIds
+        if (hasRemoveFileIds) prepared.removeFileIds = removeFileIds
         prepared.editSnapshot = {
           expectedDigest: digest,
           previousText: typeof topic.text === 'string' ? topic.text : '',
-          imageIds,
-          fileIds,
+          keepImageIds,
+          keepFileIds,
         }
         if (
           String(prepared.text ?? '').length === 0 &&
-          (preserve ? imageIds.length + fileIds.length : 0) + newImages + newFiles === 0
+          keepImageIds.length + keepFileIds.length + newImages + newFiles === 0
         )
           throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic cannot be empty')
       } else {
@@ -882,13 +1112,23 @@ export class PluginRuntimeFacade {
     if (input.actionId === 'delete_comment') {
       const topicId = String(input.params.topicId ?? '')
       const commentId = String(input.params.commentId ?? '')
+      const lookupPage = Object.hasOwn(input.params, 'lookupPage')
+        ? normalizeKnowledgePlanetCommentPage(input.params.lookupPage)
+        : null
+      if (lookupPage) prepared.lookupPage = lookupPage
       let comment: Record<string, unknown> | undefined
-      for (const sort of ['desc', 'asc'] as const) {
+      const pages: KnowledgePlanetCommentPage[] = lookupPage
+        ? [lookupPage]
+        : [
+            { count: 50, sort: 'desc' },
+            { count: 50, sort: 'asc' },
+          ]
+      for (const page of pages) {
         const read = (await this.call({
           userId: input.userId,
           targetId: input.targetId,
           actionId: 'list_comments',
-          params: { topicId, count: 50, sort },
+          params: { topicId, ...page },
         })) as { comments?: Record<string, unknown>[] }
         comment = read.comments?.find((candidate) => candidate.id === commentId)
         if (comment) break
@@ -923,7 +1163,13 @@ export class PluginRuntimeFacade {
     targetId: string
     actionId: string
     params: Record<string, unknown>
-  }): Promise<{ confirmId: string; provider: string; summary: string; expiresAt: Date }> {
+  }): Promise<{
+    confirmId: string
+    provider: string
+    summary: string
+    expiresAt: Date
+    approvalMode: 'interactive' | 'account_preapproval'
+  }> {
     const initial = await this.loadManagedTarget(input.userId, input.targetId)
     const initialAction = initial.verified.contract.actions.find(
       (candidate) => candidate.id === input.actionId,
@@ -968,6 +1214,9 @@ export class PluginRuntimeFacade {
       )
       if (!control?.enabled)
         throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin writes are disabled')
+      const approvalMode = control.preapproval.enabled
+        ? ('account_preapproval' as const)
+        : ('interactive' as const)
       validateRuntimePluginJson(action.params, sealedParams, 'params')
       await lease.assertHeld()
       const proposed = await proposeLedgerWrite(
@@ -991,6 +1240,13 @@ export class PluginRuntimeFacade {
             authContractVersion: current.verified.contract.account.contractVersion,
           },
           dispatchFenceRequired: true,
+          approval:
+            approvalMode === 'account_preapproval'
+              ? {
+                  source: 'account_preapproval',
+                  policyVersion: control.preapproval.disclaimerVersion!,
+                }
+              : { source: 'user_confirmation' },
         },
         this.pool,
       )
@@ -999,6 +1255,7 @@ export class PluginRuntimeFacade {
         provider: current.verified.slug,
         summary: proposed.summary,
         expiresAt: proposed.expiresAt,
+        approvalMode,
       }
     } finally {
       await lease.release()
@@ -1076,6 +1333,7 @@ export class PluginRuntimeFacade {
           throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin write action changed')
         validateRuntimePluginJson(action.params, begun.params, 'params')
         const policy = managedPluginWritePolicy(verified.slug)
+        const preapprovalPolicy = managedPluginWritePreapprovalPolicy(verified.slug)
         if (!policy)
           throw new PluginRuntimeFacadeError('WRITE_DISABLED', 'Plugin write policy is unavailable')
         await lease.assertHeld()
@@ -1119,6 +1377,9 @@ export class PluginRuntimeFacade {
                   userId: input.userId,
                   connectionId: input.targetId,
                   currentDisclaimerVersion: policy.version,
+                  ...(preapprovalPolicy
+                    ? { currentPreapprovalDisclaimerVersion: preapprovalPolicy.version }
+                    : {}),
                 },
                 this.pool,
               )

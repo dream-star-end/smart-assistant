@@ -1,14 +1,27 @@
-import { Bot, Pencil, Plus, Trash2 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { Bot, Check, ChevronDown, Pencil, Plus, RefreshCw, Trash2, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { api, apiErrorMessage } from '../../lib/api'
 import type {
+  KnowledgePlanetAutomationGroup,
   KnowledgePlanetAutomationRule,
   KnowledgePlanetAutomationView,
   RuntimePluginAccount,
 } from '../../lib/connectors'
 import type { AuthSession } from '../../lib/types'
-import { Alert, Button, Input, Modal, Spinner, Switch, Textarea, useConfirm } from '../ui'
+import {
+  Alert,
+  Button,
+  Input,
+  Modal,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  Spinner,
+  Switch,
+  Textarea,
+  useConfirm,
+} from '../ui'
 
 const RUN_STATUS: Record<string, string> = {
   reserved: '等待生成',
@@ -57,6 +70,15 @@ type RuleDraft = {
   maxReplyChars: string
 }
 
+type RuleValues = {
+  name: string
+  instructions: string
+  triggerKind: 'new_topic' | 'new_question'
+  dailyLimit: number
+  cooldownMinutes: number
+  maxReplyChars: number
+}
+
 const EMPTY_RULE: RuleDraft = {
   groupId: '',
   name: '',
@@ -76,6 +98,48 @@ function draftFrom(rule: KnowledgePlanetAutomationRule): RuleDraft {
     dailyLimit: String(rule.dailyLimit),
     cooldownMinutes: String(rule.cooldownMinutes),
     maxReplyChars: String(rule.maxReplyChars),
+  }
+}
+
+function validateRuleDraft(
+  draft: RuleDraft,
+): { ok: true; values: RuleValues } | { ok: false; error: string } {
+  const name = draft.name.trim()
+  if (name.length === 0) return { ok: false, error: '请输入规则名称' }
+  if (name.includes('\0')) return { ok: false, error: '规则名称包含无效字符' }
+  if (name.length > 100) return { ok: false, error: '规则名称不能超过 100 个字符' }
+
+  const instructions = draft.instructions.trim()
+  if (instructions.length === 0) return { ok: false, error: '请输入回复要求' }
+  if (instructions.includes('\0')) return { ok: false, error: '回复要求包含无效字符' }
+  if (instructions.length > 4_000)
+    return { ok: false, error: '回复要求不能超过 4000 个字符' }
+
+  if (draft.triggerKind !== 'new_topic' && draft.triggerKind !== 'new_question')
+    return { ok: false, error: '请选择有效的触发范围' }
+
+  const dailyLimit = Number(draft.dailyLimit)
+  if (!Number.isInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 10)
+    return { ok: false, error: '每日上限必须是 1–10 的整数' }
+
+  const cooldownMinutes = Number(draft.cooldownMinutes)
+  if (!Number.isInteger(cooldownMinutes) || cooldownMinutes < 5 || cooldownMinutes > 1_440)
+    return { ok: false, error: '冷却时间必须是 5–1440 分钟的整数' }
+
+  const maxReplyChars = Number(draft.maxReplyChars)
+  if (!Number.isInteger(maxReplyChars) || maxReplyChars < 100 || maxReplyChars > 1_200)
+    return { ok: false, error: '回复字符上限必须是 100–1200 的整数' }
+
+  return {
+    ok: true,
+    values: {
+      name,
+      instructions,
+      triggerKind: draft.triggerKind,
+      dailyLimit,
+      cooldownMinutes,
+      maxReplyChars,
+    },
   }
 }
 
@@ -99,8 +163,49 @@ export function KnowledgePlanetAutomationPanel({
   const [accountLimit, setAccountLimit] = useState('10')
   const [editing, setEditing] = useState<KnowledgePlanetAutomationRule | 'new' | null>(null)
   const [draft, setDraft] = useState<RuleDraft>(EMPTY_RULE)
+  const [ruleError, setRuleError] = useState<string | null>(null)
+  const [groups, setGroups] = useState<KnowledgePlanetAutomationGroup[]>([])
+  const [groupsLoading, setGroupsLoading] = useState(false)
+  const [groupsError, setGroupsError] = useState<string | null>(null)
+  const [groupSearch, setGroupSearch] = useState('')
+  const [groupPickerOpen, setGroupPickerOpen] = useState(false)
+  const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>([])
   const [confirm, confirmElement] = useConfirm()
   const manualWriteEnabled = account.writeControl?.enabled === true
+
+  const groupById = useMemo(
+    () => new Map(groups.map((group) => [group.id, group])),
+    [groups],
+  )
+  const configuredGroupIds = useMemo(
+    () => new Set(view?.rules.map((rule) => rule.groupId) ?? []),
+    [view?.rules],
+  )
+  const remainingRuleSlots = Math.max(0, 10 - (view?.rules.length ?? 0))
+  const selectableGroups = useMemo(
+    () => groups.filter((group) => !configuredGroupIds.has(group.id)),
+    [configuredGroupIds, groups],
+  )
+  const filteredGroups = useMemo(() => {
+    const needle = groupSearch.trim().toLocaleLowerCase()
+    if (!needle) return groups
+    return groups.filter(
+      (group) =>
+        group.name.toLocaleLowerCase().includes(needle) || group.id.includes(needle),
+    )
+  }, [groupSearch, groups])
+
+  const loadGroups = useCallback(async () => {
+    setGroupsLoading(true)
+    setGroupsError(null)
+    try {
+      setGroups(await api.listKnowledgePlanetAutomationGroups(auth, account.id))
+    } catch (loadError) {
+      setGroupsError(errorText(loadError, '加载知识星球列表失败'))
+    } finally {
+      setGroupsLoading(false)
+    }
+  }, [account.id, auth])
 
   const reload = useCallback(async () => {
     setError(null)
@@ -119,7 +224,8 @@ export function KnowledgePlanetAutomationPanel({
     if (!manualWriteEnabled) setConsentOpen(false)
     setLoading(true)
     void reload()
-  }, [manualWriteEnabled, reload])
+    if (account.executable) void loadGroups()
+  }, [account.executable, loadGroups, manualWriteEnabled, reload])
 
   const disableAutomation = async () => {
     if (busy) return
@@ -158,39 +264,49 @@ export function KnowledgePlanetAutomationPanel({
 
   const openNewRule = () => {
     setDraft(EMPTY_RULE)
+    setRuleError(null)
+    setSelectedGroupIds([])
+    setGroupSearch('')
     setEditing('new')
+    void loadGroups()
   }
 
   const openEditRule = (rule: KnowledgePlanetAutomationRule) => {
     setDraft(draftFrom(rule))
+    setRuleError(null)
+    setSelectedGroupIds([])
     setEditing(rule)
+    void loadGroups()
   }
 
   const saveRule = async () => {
     if (!editing || busy) return
+    const validated = validateRuleDraft(draft)
+    if (!validated.ok) {
+      setRuleError(validated.error)
+      return
+    }
     setBusy(true)
     setError(null)
-    const values = {
-      name: draft.name,
-      instructions: draft.instructions,
-      triggerKind: draft.triggerKind,
-      dailyLimit: Number(draft.dailyLimit),
-      cooldownMinutes: Number(draft.cooldownMinutes),
-      maxReplyChars: Number(draft.maxReplyChars),
-    }
+    setRuleError(null)
     try {
       if (editing === 'new') {
-        await api.createKnowledgePlanetAutomationRule(auth, account.id, {
-          groupId: draft.groupId,
-          ...values,
+        await api.createKnowledgePlanetAutomationRulesBatch(auth, account.id, {
+          groupIds: selectedGroupIds,
+          ...validated.values,
         })
       } else {
-        await api.patchKnowledgePlanetAutomationRule(auth, account.id, editing.id, values)
+        await api.patchKnowledgePlanetAutomationRule(
+          auth,
+          account.id,
+          editing.id,
+          validated.values,
+        )
       }
       setEditing(null)
       await reload()
     } catch (saveError) {
-      setError(errorText(saveError, '保存自动回复规则失败'))
+      setRuleError(errorText(saveError, '保存自动回复规则失败'))
     } finally {
       setBusy(false)
     }
@@ -321,7 +437,7 @@ export function KnowledgePlanetAutomationPanel({
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[12px] font-medium text-fg">{rule.name}</div>
                   <div className="mt-0.5 text-[10.5px] text-faint">
-                    星球 {rule.groupId} ·{' '}
+                    {groupById.get(rule.groupId)?.name ?? `星球 ${rule.groupId}`} ·{' '}
                     {rule.triggerKind === 'new_question' ? '仅新提问' : '全部新主题'} · 每日{' '}
                     {rule.dailyLimit} 条 · 冷却 {rule.cooldownMinutes} 分钟
                   </div>
@@ -332,7 +448,7 @@ export function KnowledgePlanetAutomationPanel({
                   )}
                 </div>
                 <Switch
-                  aria-label={`${rule.name}自动回复规则`}
+                  aria-label={`${rule.name}（${groupById.get(rule.groupId)?.name ?? rule.groupId}）自动回复规则`}
                   checked={rule.enabled}
                   disabled={!view.control.enabled || busy}
                   onCheckedChange={(checked) => void toggleRule(rule, checked)}
@@ -446,33 +562,193 @@ export function KnowledgePlanetAutomationPanel({
 
       <Modal
         open={editing !== null}
-        onOpenChange={(open) => !open && !busy && setEditing(null)}
-        title={editing === 'new' ? '添加自动回复规则' : '编辑自动回复规则'}
-        description="首次开启规则只从当时最新主题之后开始，不补发历史主题。"
+        onOpenChange={(open) => {
+          if (!open && !busy) {
+            setEditing(null)
+            setRuleError(null)
+            setGroupPickerOpen(false)
+          }
+        }}
+        title={editing === 'new' ? '批量添加自动回复规则' : '编辑自动回复规则'}
+        description="新规则保存后立即启用，并从保存时刻之后的新主题开始扫描，不补发历史主题。"
         footer={
-          <>
-            <Button variant="ghost" size="sm" disabled={busy} onClick={() => setEditing(null)}>
-              取消
-            </Button>
-            <Button variant="primary" size="sm" disabled={busy} onClick={() => void saveRule()}>
-              {busy ? '正在保存…' : '保存规则'}
-            </Button>
-          </>
+          <div className="flex w-full min-w-0 flex-col gap-2">
+            {ruleError && (
+              <Alert tone="danger" className="text-left text-[11.5px]">
+                {ruleError}
+              </Alert>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => setEditing(null)}>
+                取消
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={busy || (editing === 'new' && selectedGroupIds.length === 0)}
+                onClick={() => void saveRule()}
+              >
+                {busy
+                  ? '正在保存…'
+                  : editing === 'new'
+                    ? `保存并启用 ${selectedGroupIds.length} 条规则`
+                    : '保存规则'}
+              </Button>
+            </div>
+          </div>
         }
       >
         <div className="grid gap-3">
-          <label htmlFor="kp-automation-group-id" className="grid gap-1 text-[11.5px] text-muted">
-            星球 ID
-            <Input
-              id="kp-automation-group-id"
-              value={draft.groupId}
-              disabled={editing !== 'new'}
-              placeholder="例如 12345678901234"
-              onChange={(event) =>
-                setDraft((current) => ({ ...current, groupId: event.target.value }))
-              }
-            />
-          </label>
+          {editing === 'new' ? (
+            <div className="grid gap-1 text-[11.5px] text-muted">
+              <span>选择知识星球（可多选）</span>
+              <Popover open={groupPickerOpen} onOpenChange={setGroupPickerOpen}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex min-h-9 w-full items-center justify-between gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-left text-[12px] text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <span className={selectedGroupIds.length > 0 ? '' : 'text-faint'}>
+                      {selectedGroupIds.length > 0
+                        ? `已选择 ${selectedGroupIds.length} 个星球`
+                        : '从当前账号已加入的星球中选择'}
+                    </span>
+                    <ChevronDown size={14} className="shrink-0 text-faint" />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent className="w-[min(30rem,calc(100vw-2rem))] p-0" align="start">
+                  <div className="border-b border-border p-2.5">
+                    <Input
+                      aria-label="搜索知识星球"
+                      value={groupSearch}
+                      placeholder="搜索星球名称或 ID"
+                      onChange={(event) => setGroupSearch(event.target.value)}
+                    />
+                    <div className="mt-2 flex items-center justify-between gap-2 text-[10.5px] text-faint">
+                      <span>
+                        还可选择 {Math.max(0, remainingRuleSlots - selectedGroupIds.length)} 个
+                      </span>
+                      <div className="flex gap-1">
+                        <button
+                          type="button"
+                          className="rounded px-1.5 py-1 text-accent hover:bg-accent-soft disabled:text-faint"
+                          disabled={selectableGroups.length === 0 || remainingRuleSlots === 0}
+                          onClick={() =>
+                            setSelectedGroupIds(
+                              selectableGroups.slice(0, remainingRuleSlots).map((group) => group.id),
+                            )
+                          }
+                        >
+                          选择可用
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded px-1.5 py-1 text-muted hover:bg-hover disabled:text-faint"
+                          disabled={selectedGroupIds.length === 0}
+                          onClick={() => setSelectedGroupIds([])}
+                        >
+                          清空
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="max-h-64 overflow-y-auto p-1.5">
+                    {groupsLoading ? (
+                      <div className="flex items-center justify-center gap-2 py-8 text-[11.5px] text-faint">
+                        <Spinner /> 正在读取星球列表…
+                      </div>
+                    ) : groupsError ? (
+                      <div className="p-2">
+                        <Alert tone="danger" className="text-[11px]">
+                          {groupsError}
+                        </Alert>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          className="mt-2 w-full"
+                          onClick={() => void loadGroups()}
+                        >
+                          <RefreshCw size={12} /> 重试
+                        </Button>
+                      </div>
+                    ) : filteredGroups.length === 0 ? (
+                      <div className="py-8 text-center text-[11.5px] text-faint">
+                        {groups.length === 0 ? '当前账号没有可用星球' : '没有匹配的星球'}
+                      </div>
+                    ) : (
+                      filteredGroups.map((group) => {
+                        const configured = configuredGroupIds.has(group.id)
+                        const selected = selectedGroupIds.includes(group.id)
+                        const atLimit = !selected && selectedGroupIds.length >= remainingRuleSlots
+                        return (
+                          <button
+                            key={group.id}
+                            type="button"
+                            disabled={configured || atLimit}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-hover disabled:cursor-not-allowed disabled:opacity-45"
+                            onClick={() =>
+                              setSelectedGroupIds((current) =>
+                                current.includes(group.id)
+                                  ? current.filter((id) => id !== group.id)
+                                  : [...current, group.id],
+                              )
+                            }
+                          >
+                            <span
+                              className={`flex size-4 shrink-0 items-center justify-center rounded border ${
+                                selected
+                                  ? 'border-accent bg-accent text-white'
+                                  : 'border-border bg-surface'
+                              }`}
+                            >
+                              {selected && <Check size={11} />}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-[12px] text-fg">{group.name}</span>
+                              <span className="block truncate text-[10px] text-faint">
+                                ID {group.id}
+                                {group.memberCount === null ? '' : ` · ${group.memberCount} 位成员`}
+                              </span>
+                            </span>
+                            {configured && <span className="text-[10px] text-faint">已配置</span>}
+                          </button>
+                        )
+                      })
+                    )}
+                  </div>
+                </PopoverContent>
+              </Popover>
+              {selectedGroupIds.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {selectedGroupIds.map((groupId) => (
+                    <span
+                      key={groupId}
+                      className="inline-flex max-w-full items-center gap-1 rounded-full bg-accent-soft px-2 py-1 text-[10.5px] text-accent"
+                    >
+                      <span className="truncate">{groupById.get(groupId)?.name ?? groupId}</span>
+                      <button
+                        type="button"
+                        aria-label={`移除${groupById.get(groupId)?.name ?? groupId}`}
+                        className="shrink-0 rounded-full hover:bg-accent/10"
+                        onClick={() =>
+                          setSelectedGroupIds((current) => current.filter((id) => id !== groupId))
+                        }
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="grid gap-1 text-[11.5px] text-muted">
+              <span>知识星球</span>
+              <div className="rounded-lg border border-border bg-hover px-3 py-2 text-[12px] text-fg">
+                {groupById.get(draft.groupId)?.name ?? `星球 ${draft.groupId}`}
+              </div>
+            </div>
+          )}
           <label htmlFor="kp-automation-rule-name" className="grid gap-1 text-[11.5px] text-muted">
             规则名称
             <Input

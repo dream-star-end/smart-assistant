@@ -138,7 +138,9 @@ export type RefreshResult = {
 export type RefreshOutcome =
   | { kind: "success"; epoch: number; result: RefreshResult }
   | { kind: "invalid"; epoch: number }
-  | { kind: "transient"; epoch: number; retryAfterMs: number }
+  // throttled=true 表示限频早返(nextAllowedAt 未到,本次没发真实网络请求):不是新的失败
+  // 证据,消费方不得计入重试次数,只补睡 retryAfterMs(两层时钟亚毫秒错位的收口语义)。
+  | { kind: "transient"; epoch: number; retryAfterMs: number; throttled?: boolean }
   | { kind: "stale"; epoch: number };
 
 /** 注册（POST /api/auth/register，201）。 */
@@ -973,7 +975,8 @@ export type MarketplaceDetail = {
   /** 结构化元数据（智能体：model/toolsets/skillDeps；技能为 null）。 */
   manifest?: unknown;
   capabilityReadiness?: MarketplaceCapabilityReadiness;
-  riskFlags: MarketplaceRiskFlag[];
+  /** @deprecated Legacy servers may include scanner diagnostics; storefronts must not render them. */
+  riskFlags?: MarketplaceRiskFlag[];
   /** 审核来源；旧后端缺字段时 UI 使用不夸大的通用文案。 */
   reviewSource?: MarketplaceReviewSource | null;
   installCount: number;

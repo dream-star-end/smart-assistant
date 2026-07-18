@@ -82,6 +82,8 @@ export interface LedgerRow {
   params_hash: Buffer
   canonicalization_version: number
   summary: string
+  approval_source: 'user_confirmation' | 'account_preapproval'
+  approval_policy_version: number | null
   idempotency_key: string
   status: LedgerStatus
   error_code: string | null
@@ -99,8 +101,9 @@ const ROW_COLS = `id::text AS id, user_id::int AS user_id, connection_id::text A
   connection_revision, provider, action, connector_version_id::text AS connector_version_id,
   spec_hash, exec_contract_hash, auth_contract_version, params_enc, params_nonce, params_key_version,
   params_aad_seed::text AS params_aad_seed, params_hash, canonicalization_version, summary,
-  idempotency_key, status, error_code, result_digest, created_at, approved_at, started_at,
-  finished_at, expires_at, dispatch_fence_required, dispatch_armed_at`
+  approval_source, approval_policy_version, idempotency_key, status, error_code, result_digest,
+  created_at, approved_at, started_at, finished_at, expires_at, dispatch_fence_required,
+  dispatch_armed_at`
 
 // ─── 纯逻辑:执行入口分类(单测友好,beginExecute 复用) ─────────────────────
 
@@ -149,6 +152,10 @@ export interface ProposeWriteInput {
   }
   /** Plugin-only: stale executing before dispatch_armed_at is a proven pre-dispatch failure. */
   dispatchFenceRequired?: boolean
+  /** Default is an interactive confirmation. Account preapproval starts directly at approved. */
+  approval?:
+    | { source: 'user_confirmation' }
+    | { source: 'account_preapproval'; policyVersion: number }
 }
 
 export interface ProposedWrite {
@@ -161,6 +168,14 @@ export async function proposeWrite(
   input: ProposeWriteInput,
   pool: Pool = getPool(),
 ): Promise<ProposedWrite> {
+  const approval = input.approval ?? { source: 'user_confirmation' as const }
+  const approvalPolicyVersion =
+    approval.source === 'account_preapproval' ? approval.policyVersion : null
+  if (
+    approval.source === 'account_preapproval' &&
+    (!Number.isInteger(approvalPolicyVersion) || Number(approvalPolicyVersion) <= 0)
+  )
+    throw new ConnectorError('BAD_REQUEST', 'account preapproval policy version is invalid')
   const id = randomUUID()
   const paramsAadSeed = randomUUID()
   const canonical = canonicalStringify(input.params)
@@ -202,9 +217,11 @@ export async function proposeWrite(
           params_enc, params_nonce, params_aad_seed, params_hash, canonicalization_version,
           summary, idempotency_key, status, expires_at,
           connector_version_id, spec_hash, exec_contract_hash, auth_contract_version,
-          dispatch_fence_required)
-       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::uuid, $10, $11, $12, $13, 'pending',
-               now() + interval '10 minutes', $14, $15, $16, $17, $18)
+          dispatch_fence_required, approval_source, approval_policy_version, approved_at)
+       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::uuid, $10, $11, $12, $13,
+               CASE WHEN $19 = 'account_preapproval' THEN 'approved' ELSE 'pending' END,
+               now() + interval '10 minutes', $14, $15, $16, $17, $18, $19, $20,
+               CASE WHEN $19 = 'account_preapproval' THEN now() ELSE NULL END)
        RETURNING expires_at`,
       [
         id,
@@ -225,6 +242,8 @@ export async function proposeWrite(
         input.contractPins ? Buffer.from(input.contractPins.execContractHashHex, 'hex') : null,
         input.contractPins?.authContractVersion ?? null,
         input.dispatchFenceRequired === true,
+        approval.source,
+        approvalPolicyVersion,
       ],
     )
     return r.rows[0]!.expires_at
@@ -374,6 +393,9 @@ interface PluginArmConnectionRow extends ConnCheckRow {
   provider: string
   plugin_write_enabled: boolean
   plugin_write_disclaimer_version: number | null
+  plugin_write_preapproval_enabled: boolean
+  plugin_write_preapproval_disclaimer_version: number | null
+  plugin_write_preapproval_accepted_at: Date | null
 }
 
 /**
@@ -530,6 +552,7 @@ export async function armPluginWriteDispatch(
     userId: number
     connectionId: string
     currentDisclaimerVersion: number
+    currentPreapprovalDisclaimerVersion?: number
   },
   pool: Pool = getPool(),
 ): Promise<LedgerRow> {
@@ -541,7 +564,10 @@ export async function armPluginWriteDispatch(
       `SELECT revision, status, revoked_at, provider,
               connector_version_id::text AS connector_version_id, spec_hash,
               exec_contract_hash, auth_contract_version,
-              plugin_write_enabled, plugin_write_disclaimer_version
+              plugin_write_enabled, plugin_write_disclaimer_version,
+              plugin_write_preapproval_enabled,
+              plugin_write_preapproval_disclaimer_version,
+              plugin_write_preapproval_accepted_at
          FROM connections
         WHERE id = $1::bigint AND user_id = $2
         FOR UPDATE`,
@@ -588,6 +614,16 @@ export async function armPluginWriteDispatch(
       connection.plugin_write_disclaimer_version !== opts.currentDisclaimerVersion
     )
       throw new ConnectorError('CONNECTION_ERROR', 'Plugin writes are disabled')
+    if (
+      row.approval_source === 'account_preapproval' &&
+      (connection.plugin_write_preapproval_enabled !== true ||
+        !(connection.plugin_write_preapproval_accepted_at instanceof Date) ||
+        opts.currentPreapprovalDisclaimerVersion === undefined ||
+        connection.plugin_write_preapproval_disclaimer_version !==
+          opts.currentPreapprovalDisclaimerVersion ||
+        row.approval_policy_version !== opts.currentPreapprovalDisclaimerVersion)
+    )
+      throw new ConnectorError('CONNECTION_ERROR', 'Plugin account preapproval is disabled')
 
     const armed = await client.query<LedgerRow>(
       `UPDATE connector_write_ledger

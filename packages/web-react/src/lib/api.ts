@@ -101,6 +101,7 @@ import type {
   KnowledgePlanetSetupView,
   PluginManagementResponse,
   KnowledgePlanetAutomationControl,
+  KnowledgePlanetAutomationGroup,
   KnowledgePlanetAutomationRule,
   KnowledgePlanetAutomationView,
   RuntimePluginAccount,
@@ -301,10 +302,13 @@ export function refreshAuth(
   if (state.flight) return state.flight;
   const now = Date.now();
   if (state.nextAllowedAt > now) {
+    // 限频早返:没发真实网络请求,throttled 标记让消费方不把它计入重试次数
+    // (消费层 setTimeout 亚毫秒早醒会撞进本分支,若当失败计数会"只发一次网络就放弃恢复")。
     return Promise.resolve({
       kind: "transient",
       epoch: expectedEpoch,
       retryAfterMs: state.nextAllowedAt - now,
+      throttled: true,
     });
   }
 
@@ -3108,6 +3112,24 @@ export const api = {
       ),
     ).then((result) => result.writeControl),
 
+  setPluginWritePreapproval: (
+    a: AuthSession,
+    id: string,
+    input:
+      | { enabled: false }
+      | { enabled: true; accepted: true; disclaimerVersion: number },
+  ): Promise<RuntimePluginAccount['writeControl']> =>
+    jsonOrThrow<{ writeControl: RuntimePluginAccount['writeControl'] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/write-preapproval`, {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.writeControl),
+
   getKnowledgePlanetAutomation: (
     a: AuthSession,
     id: string,
@@ -3143,6 +3165,43 @@ export const api = {
         }),
       ),
     ).then((result) => result.control),
+
+  listKnowledgePlanetAutomationGroups: (
+    a: AuthSession,
+    id: string,
+  ): Promise<KnowledgePlanetAutomationGroup[]> =>
+    jsonOrThrow<{ groups: KnowledgePlanetAutomationGroup[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/groups`, {
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((result) => result.groups),
+
+  createKnowledgePlanetAutomationRulesBatch: (
+    a: AuthSession,
+    id: string,
+    input: {
+      groupIds: string[]
+      name: string
+      instructions: string
+      triggerKind: 'new_topic' | 'new_question'
+      dailyLimit: number
+      cooldownMinutes: number
+      maxReplyChars: number
+    },
+  ): Promise<KnowledgePlanetAutomationRule[]> =>
+    jsonOrThrow<{ rules: KnowledgePlanetAutomationRule[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/batch`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.rules),
 
   createKnowledgePlanetAutomationRule: (
     a: AuthSession,

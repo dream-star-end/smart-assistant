@@ -404,8 +404,8 @@ export function ConnectorsTab({
     <div className="flex flex-col">
       <div className="px-5 pt-4">
         <p className="text-[12.5px] leading-relaxed text-faint">
-          绑定你的应用账号后，AI 助手即可在对话中访问这些应用；所有写入类操作（发邮件、
-          上传文件等）都会先在对话里向你逐次确认，未经确认不会执行。
+          绑定你的应用账号后，AI 助手即可在对话中访问这些应用；写入类操作默认会先在对话里
+          向你逐次确认。个别支持的 Plugin 可由你另行授权免逐次确认。
         </p>
         <div className="mt-2 flex items-center justify-between gap-2">
           <span className="text-[11.5px] text-faint">
@@ -450,12 +450,24 @@ export function ConnectorsTab({
                 setErr(null)
                 setSuccess(
                   enabled
-                    ? '知识星球写入能力已开启；发布媒体、点赞、编辑和删除仍需在对话中逐次确认。无人值守自动回复需另行同意。'
+                    ? '知识星球写入能力已开启；默认仍需在对话中逐次确认，免确认与无人值守自动回复需分别另行同意。'
                     : '知识星球写入能力已关闭。',
                 )
                 reload()
               }}
               onWriteAccessError={(error) => setErr(errText(error, '切换 Plugin 写入能力失败'))}
+              onWritePreapprovalChanged={(enabled) => {
+                setErr(null)
+                setSuccess(
+                  enabled
+                    ? '知识星球“免逐次确认”已开启；Agent 可直接执行所有已开放写入动作。无人值守自动回复仍由独立开关控制。'
+                    : '知识星球“免逐次确认”已关闭；后续手动写入恢复逐次确认。',
+                )
+                reload()
+              }}
+              onWritePreapprovalError={(error) =>
+                setErr(errText(error, '切换 Plugin 免逐次确认失败'))
+              }
             />
           )
         })}
@@ -548,6 +560,8 @@ function RuntimePluginCard({
   onRevoke,
   onWriteAccessChanged,
   onWriteAccessError,
+  onWritePreapprovalChanged,
+  onWritePreapprovalError,
 }: {
   auth: AuthSession
   plugin: RuntimePluginCatalogEntry
@@ -558,6 +572,8 @@ function RuntimePluginCard({
   onRevoke: (account: RuntimePluginAccount) => void
   onWriteAccessChanged: (enabled: boolean) => void
   onWriteAccessError: (error: unknown) => void
+  onWritePreapprovalChanged: (enabled: boolean) => void
+  onWritePreapprovalError: (error: unknown) => void
 }) {
   const Icon = connectorIcon(plugin.slug)
   const canSelfAuthorize = plugin.slug === 'knowledge-planet' && plugin.installedCurrent
@@ -566,6 +582,9 @@ function RuntimePluginCard({
   const [consentAccount, setConsentAccount] = useState<RuntimePluginAccount | null>(null)
   const [consentChecked, setConsentChecked] = useState(false)
   const [consentError, setConsentError] = useState<string | null>(null)
+  const [preapprovalAccount, setPreapprovalAccount] = useState<RuntimePluginAccount | null>(null)
+  const [preapprovalChecked, setPreapprovalChecked] = useState(false)
+  const [preapprovalError, setPreapprovalError] = useState<string | null>(null)
   const [writeBusyId, setWriteBusyId] = useState<string | null>(null)
 
   const disableWrite = async (account: RuntimePluginAccount) => {
@@ -600,6 +619,49 @@ function RuntimePluginCard({
     } catch (error) {
       setConsentError(errText(error, '开启 Plugin 写入能力失败'))
       onWriteAccessError(error)
+    } finally {
+      setWriteBusyId(null)
+    }
+  }
+
+  const disablePreapproval = async (account: RuntimePluginAccount) => {
+    if (writeBusyId) return
+    setWriteBusyId(account.id)
+    try {
+      await api.setPluginWritePreapproval(auth, account.id, { enabled: false })
+      onWritePreapprovalChanged(false)
+    } catch (error) {
+      onWritePreapprovalError(error)
+    } finally {
+      setWriteBusyId(null)
+    }
+  }
+
+  const enablePreapproval = async () => {
+    const account = preapprovalAccount
+    const preapproval = account?.writeControl?.preapproval
+    if (
+      !account ||
+      !preapproval ||
+      preapproval.disclaimerVersion === null ||
+      !preapprovalChecked ||
+      writeBusyId
+    )
+      return
+    setPreapprovalError(null)
+    setWriteBusyId(account.id)
+    try {
+      await api.setPluginWritePreapproval(auth, account.id, {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: preapproval.disclaimerVersion,
+      })
+      setPreapprovalAccount(null)
+      setPreapprovalChecked(false)
+      onWritePreapprovalChanged(true)
+    } catch (error) {
+      setPreapprovalError(errText(error, '开启 Plugin 免逐次确认失败'))
+      onWritePreapprovalError(error)
     } finally {
       setWriteBusyId(null)
     }
@@ -739,6 +801,39 @@ function RuntimePluginCard({
               >
                 <Trash2 size={13} /> 解绑
               </Button>
+              {account.writeControl?.preapproval?.available && (
+                <div className="basis-full rounded-lg border border-border bg-hover/50 px-3 py-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11.5px] font-medium text-fg">免逐次确认</div>
+                      <div className="mt-0.5 text-[10.5px] leading-relaxed text-faint">
+                        开启后，Agent 可直接发布主题和评论、上传媒体、点赞、编辑及删除；默认关闭。
+                      </div>
+                    </div>
+                    <span className="text-[11px] text-muted">
+                      {account.writeControl.preapproval.enabled ? '已开启' : '已关闭'}
+                    </span>
+                    <Switch
+                      aria-label={`${account.displayName || plugin.label}免逐次确认`}
+                      checked={account.writeControl.preapproval.enabled}
+                      disabled={
+                        !account.executable ||
+                        !account.writeControl.enabled ||
+                        writeBusyId === account.id
+                      }
+                      onCheckedChange={(checked) => {
+                        if (checked) {
+                          setPreapprovalChecked(false)
+                          setPreapprovalError(null)
+                          setPreapprovalAccount(account)
+                        } else {
+                          void disablePreapproval(account)
+                        }
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
               {plugin.slug === 'knowledge-planet' && account.status === 'active' && (
                 <div className="basis-full">
                   <KnowledgePlanetAutomationPanel auth={auth} account={account} />
@@ -758,7 +853,7 @@ function RuntimePluginCard({
           }
         }}
         title="开启知识星球写入能力"
-        description="开启后仍不会自动发布；主题、评论、媒体、点赞、编辑和删除都必须由你在对话确认卡中单独批准。无人值守回复使用另一份独立授权。"
+        description="开启后，主题、评论、媒体、点赞、编辑和删除默认仍须由你在对话确认卡中单独批准；免逐次确认与无人值守回复使用各自独立授权。"
         footer={
           <>
             <Button
@@ -798,6 +893,60 @@ function RuntimePluginCard({
                 onChange={(event) => setConsentChecked(event.target.checked)}
               />
               <span>我已阅读并理解上述风险与责任，并同意开启写入能力。</span>
+            </label>
+          </div>
+        )}
+      </Modal>
+      <Modal
+        open={preapprovalAccount != null}
+        onOpenChange={(open) => {
+          if (!open && !writeBusyId) {
+            setPreapprovalAccount(null)
+            setPreapprovalChecked(false)
+            setPreapprovalError(null)
+          }
+        }}
+        title="开启免逐次确认"
+        description="这是独立的账号级高风险授权。开启后，所有可使用此账号的 Agent 都可直接执行知识星球写入，不再展示逐次确认卡。"
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={writeBusyId != null}
+              onClick={() => {
+                setPreapprovalAccount(null)
+                setPreapprovalChecked(false)
+                setPreapprovalError(null)
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!preapprovalChecked || writeBusyId != null}
+              onClick={() => void enablePreapproval()}
+            >
+              {writeBusyId ? '正在开启…' : '同意并开启'}
+            </Button>
+          </>
+        }
+      >
+        {preapprovalAccount?.writeControl?.preapproval && (
+          <div className="flex flex-col gap-3">
+            {preapprovalError && <Alert tone="danger">{preapprovalError}</Alert>}
+            <Alert tone="warning" className="text-[12px] leading-relaxed">
+              {preapprovalAccount.writeControl.preapproval.disclaimerText}
+            </Alert>
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border p-3 text-[12px] leading-relaxed text-muted">
+              <input
+                type="checkbox"
+                className="mt-0.5 size-4 accent-accent"
+                checked={preapprovalChecked}
+                onChange={(event) => setPreapprovalChecked(event.target.checked)}
+              />
+              <span>我已阅读并理解上述风险与责任，并明确同意当前账号免逐次确认。</span>
             </label>
           </div>
         )}

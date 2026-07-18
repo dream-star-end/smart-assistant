@@ -300,6 +300,9 @@ export interface PluginAccountRow {
   plugin_write_enabled: boolean
   plugin_write_disclaimer_version: number | null
   plugin_write_disclaimer_accepted_at: Date | null
+  plugin_write_preapproval_enabled: boolean
+  plugin_write_preapproval_disclaimer_version: number | null
+  plugin_write_preapproval_accepted_at: Date | null
   status: 'active' | 'error'
   meta: Record<string, unknown>
   revoked_at: Date | null
@@ -310,7 +313,9 @@ const ACCOUNT_COLS = `id::text AS id, user_id::int AS user_id, provider, display
   secret_generation::text AS secret_generation,
   connector_version_id::text AS connector_version_id, spec_hash, exec_contract_hash,
   auth_contract_version, plugin_write_enabled, plugin_write_disclaimer_version,
-  plugin_write_disclaimer_accepted_at, status, meta, revoked_at`
+  plugin_write_disclaimer_accepted_at, plugin_write_preapproval_enabled,
+  plugin_write_preapproval_disclaimer_version, plugin_write_preapproval_accepted_at,
+  status, meta, revoked_at`
 
 function encryptEnvelope(
   envelope: PluginAccountEnvelopeV1,
@@ -938,7 +943,9 @@ export async function getPluginAccount(
             c.connector_version_id::text AS connector_version_id, c.spec_hash,
             c.exec_contract_hash, c.auth_contract_version,
             c.plugin_write_enabled, c.plugin_write_disclaimer_version,
-            c.plugin_write_disclaimer_accepted_at, c.status, c.meta, c.revoked_at
+            c.plugin_write_disclaimer_accepted_at, c.plugin_write_preapproval_enabled,
+            c.plugin_write_preapproval_disclaimer_version,
+            c.plugin_write_preapproval_accepted_at, c.status, c.meta, c.revoked_at
        FROM connections c
       JOIN marketplace_skill_versions v ON v.id = c.connector_version_id
       JOIN marketplace_skill_listings l ON l.slug = v.slug

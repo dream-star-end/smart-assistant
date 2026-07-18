@@ -53,6 +53,7 @@ import {
   isCodexEngineModel,
   isClientMessageId,
   shouldServeInline,
+  type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
 import {
   classifiedMessageForCode,
@@ -60,6 +61,22 @@ import {
   classifyRunError,
 } from './errorClassify.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
+import {
+  PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
+  PROMPT_QUEUE_DISPATCH_RESULT_TYPE,
+  PROMPT_QUEUE_GRANT_FIELD,
+  PromptQueueCoordinator,
+  type PromptQueueDispatchRequest,
+  type PromptQueueDispatchCancel,
+  type PromptQueueDispatchControl,
+  type PromptQueueSessionContext,
+  type PromptQueueTurnLifecycle,
+} from './promptQueueCoordinator.js'
+import type { PromptQueueExecutionFence } from './sessionManager.js'
+import {
+  HttpPromptQueueClient,
+  readPromptQueueClientConfig,
+} from './promptQueueClient.js'
 // 合成首帧降级兜底模型的 routable 自检(MAJOR-1):兜底模型在当前进程形态下不可路由
 // (host 无对应平台静态 key)时**不降级**,保持 CODEX_BILLING_GUARD fail-closed。
 import { isHostRoutableStaticModel } from './hostStaticProviders.js'
@@ -156,7 +173,7 @@ import {
   normalizeSkillTrainArgs,
   type FeedbackScenario,
 } from './skillTrain.js'
-import { type WebSocket, WebSocketServer } from 'ws'
+import { WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import {
   CronScheduler,
@@ -207,7 +224,12 @@ import {
   type SessionRepoBindFrame,
   type SessionRepoStatusOut,
 } from './sessionRepoWorkspace.js'
-import { SessionManager, parseVerificationVerdict } from './sessionManager.js'
+import {
+  SessionManager,
+  parseVerificationVerdict,
+  persistInterruptedPromptQueueTurn,
+  type PromptQueueExternalTurnReservation,
+} from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
 import {
@@ -1382,6 +1404,7 @@ export class Gateway {
    *  start(); called in shutdown stage 2 to cancel the periodic drain
    *  timer. null when v3 sink isn't configured (personal version). */
   private _stopV3RetryDrainer: (() => void) | null = null
+  private _kickV3RetryDrainer: (() => void) | null = null
   /** Commercial tool telemetry stays subscribed through session drain, then
    *  fsyncs its final aggregate batch before the process may exit. */
   private _toolFailureReporter: ToolFailureReporter | null = null
@@ -1556,6 +1579,13 @@ export class Gateway {
   private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string }>()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
+  /** Commercial bridge sockets are the only valid path for an internal queue
+   * dispatch request. Local/personal WS peers can never receive a grant. */
+  private _bridgeConnections = new WeakSet<WebSocket>()
+  private _promptQueueCoordinator: PromptQueueCoordinator | null = null
+  private _promptQueueLifecycleByFrame = new WeakMap<object, PromptQueueTurnLifecycle>()
+  private _promptQueueExecutionFenceByFrame = new WeakMap<object, PromptQueueExecutionFence>()
+  private _promptQueueClientSessions = new WeakMap<WebSocket, Set<string>>()
   // Pending permission requests: requestId → { sessionKey, toolName, input, toolUseId, peerKey, channel, peer }
   // Used for single-settlement, original-input passthrough, and disconnect auto-deny.
   // `channel` and `peer` are preserved from the original request so disconnect
@@ -1699,6 +1729,43 @@ export class Gateway {
       maxAgeMs: ringCfg.maxAgeMs ?? DEFAULT_RING_CONFIG.maxAgeMs,
       maxBytes: ringCfg.maxBytes ?? DEFAULT_RING_CONFIG.maxBytes,
     })
+    const promptQueueConfig = readPromptQueueClientConfig()
+    if (promptQueueConfig) {
+      this._promptQueueCoordinator = new PromptQueueCoordinator(
+        new HttpPromptQueueClient(promptQueueConfig),
+        {
+          broadcast: (context, snapshot) => this._broadcastPromptQueueSnapshot(context, snapshot),
+          direct: (context, requester, snapshot) => {
+            this._sendPromptQueueSnapshotToClient(context, requester as WebSocket, snapshot)
+          },
+          sendDispatch: (context, frame) => this._sendPromptQueueDispatch(context, frame),
+          interruptExact: async (context, turnId) =>
+            this.sessions.interruptExact(context.owner.sessionKey, turnId),
+          persistInterrupted: async ({ context, detail, turnId, turnIndex }) => {
+            await persistInterruptedPromptQueueTurn({
+              sessionKey: context.owner.sessionKey,
+              peerId: context.owner.clientSessionId,
+              agentId: context.owner.agentId,
+              userId: context.userId,
+              turnIndex,
+              turnKey: turnId,
+              clientMessageId: detail.clientMessageId,
+            })
+          },
+          kickPersistence: () => this._kickV3RetryDrainer?.(),
+          log: {
+            info: (message, fields) => this.log.info(message, fields),
+            warn: (message, fields) => this.log.warn(message, fields),
+            error: (message, fields) => this.log.error(
+              message,
+              fields,
+              fields?.error ? new Error(String(fields.error)) : undefined,
+            ),
+          },
+        },
+      )
+      this.log.info('prompt queue coordinator enabled', { baseUrl: promptQueueConfig.baseUrl })
+    }
     // 2026-04-21 Medium#G1:被 sessionManager 内部驱逐/shutdown 的 sessionKey
     // 由此 callback 统一走 outboundRing.clear,防 ring 内存长期泄漏。server.ts
     // 其他已有的 destroySession 调用点仍然显式 clear(幂等 double-clear 无副作用)。
@@ -1782,6 +1849,7 @@ export class Gateway {
         queue.kick()
         queue.startPeriodic()
         this._stopV3RetryDrainer = () => queue.stopPeriodic()
+        this._kickV3RetryDrainer = () => queue.kick()
         this.log.info('v3 master sink wired', { baseUrl: sinkCfg.baseUrl })
       }
     } catch (err) {
@@ -2521,6 +2589,8 @@ export class Gateway {
     } catch (err) {
       this.log.warn('resume map flush error', undefined, err)
     }
+    this._promptQueueCoordinator?.shutdown()
+    this._promptQueueCoordinator = null
 
     // ── Stage 4.25: persist the final tool-call rollup ──
     // Keep the reporter subscribed until every runner has stopped so late
@@ -2543,6 +2613,7 @@ export class Gateway {
     try {
       const { setV3MasterSinkSingleton } = await import('./v3MasterSink.js')
       setV3MasterSinkSingleton(null)
+      this._kickV3RetryDrainer = null
     } catch (err) {
       this.log.warn('v3 master sink singleton clear error', undefined, err)
     }
@@ -9520,6 +9591,7 @@ export class Gateway {
       ws.close(1008, 'unauthorized')
       return
     }
+    if (isFromBridge) this._bridgeConnections.add(ws)
     // Stash authenticated userId on the WS so every subsequent broadcast lookup
     // can scope peerKey by user, preventing cross-account delivery when two
     // users happen to share the same client-generated peerId (see makePeerKey
@@ -9635,12 +9707,81 @@ export class Gateway {
           if (typeof p?.peerId === 'string') peerIdSet.add(p.peerId)
         }
         this._recentHelloPeers.set(ws, { peerIds: peerIdSet, recordedAt: Date.now() })
-        // Auto-resume: check if any peer has a resumable session that is NOT already active
-        this.autoResumeFromHello(peers, ws).catch((err) =>
-          this.log.error('auto-resume failed', undefined, err),
-        )
+        // Queue-enabled hello has a strict ordering contract: ring replay first,
+        // then one fresh PG snapshot even when no AgentSession exists yet.
+        // Flag-off keeps the legacy fire-and-forget path unchanged.
+        if (this._promptQueueCoordinator && isFromBridge) {
+          try {
+            await this.autoResumeFromHello(peers, ws)
+          } catch (err) {
+            this.log.error('auto-resume failed', undefined, err as Error)
+          }
+          const helloUserId = this.getWsUserId(ws)
+          for (const peer of peers) {
+            const queueAgentId = typeof peer?.agentId === 'string' && peer.agentId
+              ? peer.agentId
+              : 'main'
+            if (
+              typeof peer?.peerId !== 'string' || !peer.peerId ||
+              isHiddenSystemAgentId(queueAgentId)
+            ) continue
+            const context = this._promptQueueContext(helloUserId, peer.peerId, queueAgentId)
+            this._registerPromptQueueClient(ws, context)
+            try {
+              await this._promptQueueCoordinator.hello(context, ws)
+            } catch (err) {
+              this.log.error('prompt queue hello failed', {
+                sessionKey: context.owner.sessionKey,
+              }, err as Error)
+            }
+          }
+        } else {
+          // Auto-resume: check if any peer has a resumable session that is NOT already active
+          this.autoResumeFromHello(peers, ws).catch((err) =>
+            this.log.error('auto-resume failed', undefined, err),
+          )
+        }
         // 检查 pending bind 队列:有匹配 sessionId 的就 dequeue 处理
         this._flushPendingRepoBinds(ws, peerIdSet)
+        return
+      }
+
+      if ((frame as any).type === PROMPT_QUEUE_DISPATCH_RESULT_TYPE) {
+        if (!this._promptQueueCoordinator || !isFromBridge) return
+        const owner = (frame as any).owner
+        if (
+          !owner || typeof owner !== 'object' ||
+          typeof owner.clientSessionId !== 'string' || !owner.clientSessionId ||
+          typeof owner.agentId !== 'string' || !owner.agentId ||
+          isHiddenSystemAgentId(owner.agentId)
+        ) return
+        const context = this._promptQueueContext(
+          this.getWsUserId(ws),
+          owner.clientSessionId,
+          owner.agentId,
+        )
+        const accepted = await this._promptQueueCoordinator.rejectGrant(context, frame)
+        if (!accepted) {
+          this.log.warn('prompt queue late or mismatched rejection dropped', {
+            sessionKey: context.owner.sessionKey,
+          })
+        }
+        return
+      }
+
+      if (typeof (frame as any).type === 'string' && (frame as any).type.startsWith('inbound.prompt_queue.')) {
+        if (!this._promptQueueCoordinator || !isFromBridge) return
+        const queueFrame = frame as unknown as PromptQueueMutationFrame
+        const peer = (queueFrame as any).peer
+        const agentId = (queueFrame as any).agentId
+        if (
+          !peer || typeof peer !== 'object' || typeof peer.id !== 'string' || !peer.id ||
+          peer.kind !== 'dm' || typeof agentId !== 'string' || !agentId ||
+          isHiddenSystemAgentId(agentId)
+        ) return
+        const context = this._promptQueueContext(this.getWsUserId(ws), peer.id, agentId)
+        this._registerPromptQueueClient(ws, context)
+        await this._promptQueueCoordinator.mutate(context, queueFrame, ws)
         return
       }
 
@@ -9661,13 +9802,83 @@ export class Gateway {
       }
 
       if (frame.type === 'inbound.message') {
+        const queueGrant = (frame as any)[PROMPT_QUEUE_GRANT_FIELD]
         // ── 模型执行权威消费(方案 §2)───────────────────────────────────────
         // 顺序铁律:**先消费(需要读 wire 字段),再 strip**。strip 由 dispatchInbound
         // 入口统一兜底(一切入口无条件 strip),descriptor 经 WeakMap 旁路挂载 ——
         // 客户端在 wire 上伪造不出 WeakMap key,故没有「伪造 descriptor」这个面。
-        if (!this._consumeFrameAuthority(ws, frame as any, isFromBridge)) return
+        if (!this._consumeFrameAuthority(ws, frame as any, isFromBridge)) {
+          if (queueGrant !== undefined && this._promptQueueCoordinator && isFromBridge) {
+            const queueAgentId = typeof frame.agentId === 'string' && frame.agentId
+              ? frame.agentId
+              : 'main'
+            const context = this._promptQueueContext(
+              this.getWsUserId(ws),
+              frame.peer.id,
+              queueAgentId,
+            )
+            this._sendPromptQueueGrantCancellation(
+              ws,
+              context,
+              queueGrant,
+              'AUTHORITY_REJECTED',
+            )
+          }
+          return
+        }
         if (isFromBridge) (this.trustedGoalFrames ??= new WeakSet()).add(frame as object)
         else delete (frame as any)._goalState
+
+        delete (frame as any)[PROMPT_QUEUE_GRANT_FIELD]
+        if (queueGrant !== undefined) {
+          if (!this._promptQueueCoordinator || !isFromBridge) return
+          const queueAgentId = typeof frame.agentId === 'string' && frame.agentId
+            ? frame.agentId
+            : 'main'
+          const context = this._promptQueueContext(
+            this.getWsUserId(ws),
+            frame.peer.id,
+            queueAgentId,
+          )
+          const lifecycle = this._promptQueueCoordinator.acceptGrant(
+            context,
+            queueGrant,
+            (control: PromptQueueDispatchControl) => {
+              if (!this._bridgeConnections.has(ws) || ws.readyState !== WebSocket.OPEN) return false
+              try {
+                ws.send(JSON.stringify(control))
+                return true
+              } catch {
+                return false
+              }
+            },
+          )
+          if (!lifecycle) {
+            this._sendPromptQueueGrantCancellation(
+              ws,
+              context,
+              queueGrant,
+              'GRANT_NOT_ACCEPTED',
+            )
+            this.log.warn('prompt queue late or mismatched grant dropped', {
+              sessionKey: context.owner.sessionKey,
+            })
+            return
+          }
+          let executionFence: PromptQueueExecutionFence
+          try {
+            executionFence = this.sessions.beginPromptQueueExecutionFence(context.owner.sessionKey)
+          } catch (err) {
+            await lifecycle.onPreflightRejected('retryable', 'EXECUTION_OWNER_BUSY')
+            this.log.info('prompt queue grant deferred by live runtime owner', {
+              sessionKey: context.owner.sessionKey,
+              error: err instanceof Error ? err.message : String(err),
+            })
+            return
+          }
+          this._promptQueueLifecycleByFrame.set(frame as object, lifecycle)
+          this._promptQueueExecutionFenceByFrame.set(frame as object, executionFence)
+        }
 
         // Stash userId on the frame so downstream dispatchInbound/deliver
         // paths that don't have the WS in scope can still build the correct
@@ -9692,7 +9903,30 @@ export class Gateway {
             }
           })
         }
-        await this.dispatchInbound(frame)
+        try {
+          await this.dispatchInbound(frame)
+        } finally {
+          const unusedQueueLifecycle = this._promptQueueLifecycleByFrame.get(frame as object)
+          const unusedQueueFence = this._promptQueueExecutionFenceByFrame.get(frame as object)
+          if (unusedQueueLifecycle) {
+            this._promptQueueLifecycleByFrame.delete(frame as object)
+            this._promptQueueExecutionFenceByFrame.delete(frame as object)
+            const rejection = (frame as any).__oc_prompt_queue_preflight_rejection as
+              | { disposition?: unknown; reasonCode?: unknown }
+              | undefined
+            const disposition = rejection?.disposition === 'user_action_required'
+              ? 'user_action_required'
+              : 'retryable'
+            const reasonCode = typeof rejection?.reasonCode === 'string'
+              ? rejection.reasonCode
+              : 'PREPROCESS_REJECTED'
+            try {
+              await unusedQueueLifecycle.onPreflightRejected(disposition, reasonCode)
+            } finally {
+              unusedQueueFence?.release()
+            }
+          }
+        }
       } else if (frame.type === 'inbound.goal_sync') {
         if (!isFromBridge) return
         await this.sessions.syncGoalState(frame.goal.sessionId, frame.goal)
@@ -10306,6 +10540,132 @@ export class Gateway {
     }
   }
 
+  private _promptQueueContext(
+    userId: string,
+    peerId: string,
+    agentId: string,
+  ): PromptQueueSessionContext {
+    const safeId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
+    return {
+      userId,
+      owner: {
+        sessionKey: `agent:${agentId}:webchat:dm:${safeId}`,
+        clientSessionId: peerId,
+        agentId,
+        peer: { id: peerId, kind: 'dm' },
+      },
+    }
+  }
+
+  private _registerPromptQueueClient(ws: WebSocket, context: PromptQueueSessionContext): void {
+    let registered = this._promptQueueClientSessions.get(ws)
+    if (!registered) {
+      registered = new Set()
+      this._promptQueueClientSessions.set(ws, registered)
+    }
+    if (!registered.has(context.owner.sessionKey)) {
+      registered.add(context.owner.sessionKey)
+      ws.once('close', () => {
+        void this._promptQueueCoordinator?.disconnect(context, ws).catch((err) => {
+          this.log.warn('prompt queue disconnect cleanup failed', {
+            sessionKey: context.owner.sessionKey,
+          }, err as Error)
+        })
+      })
+    }
+    const peerKey = Gateway.makePeerKey(context.userId, 'webchat', context.owner.peer.id)
+    let set = this.clientsByPeer.get(peerKey)
+    if (!set) {
+      set = new Set()
+      this.clientsByPeer.set(peerKey, set)
+    }
+    if (set.has(ws)) return
+    set.add(ws)
+    ws.once('close', () => {
+      set?.delete(ws)
+      if (set?.size === 0) this.clientsByPeer.delete(peerKey)
+    })
+  }
+
+  /** If commercial preparation already reserved a slot/precheck/journal but
+   * the gateway cannot consume the exact grant, tell that same trusted bridge
+   * to unwind immediately. The bridge validates every original correlation
+   * field before applying compensation, so a malformed/forged marker is inert. */
+  private _sendPromptQueueGrantCancellation(
+    ws: WebSocket,
+    context: PromptQueueSessionContext,
+    markerValue: unknown,
+    reasonCode: string,
+  ): boolean {
+    if (
+      !markerValue || typeof markerValue !== 'object' || Array.isArray(markerValue) ||
+      !this._bridgeConnections.has(ws) || ws.readyState !== WebSocket.OPEN
+    ) return false
+    const marker = markerValue as Record<string, unknown>
+    if (
+      typeof marker.grantId !== 'string' ||
+      typeof marker.itemId !== 'string' ||
+      typeof marker.contentHash !== 'string' ||
+      typeof marker.epoch !== 'string' ||
+      typeof marker.claimToken !== 'string'
+    ) return false
+    const cancel: PromptQueueDispatchCancel = {
+      type: PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
+      grantId: marker.grantId,
+      owner: context.owner,
+      itemId: marker.itemId,
+      contentHash: marker.contentHash,
+      epoch: marker.epoch,
+      claimToken: marker.claimToken,
+      reasonCode,
+    }
+    try {
+      ws.send(JSON.stringify(cancel))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private _broadcastPromptQueueSnapshot(
+    context: PromptQueueSessionContext,
+    snapshot: import('@openclaude/protocol').PromptQueueSnapshot,
+  ): void {
+    const peerKey = Gateway.makePeerKey(context.userId, 'webchat', context.owner.peer.id)
+    this._sendStampedSessionFrame(context.owner.sessionKey, peerKey, snapshot as unknown as Record<string, unknown>)
+  }
+
+  private _sendPromptQueueSnapshotToClient(
+    _context: PromptQueueSessionContext,
+    ws: WebSocket,
+    snapshot: import('@openclaude/protocol').PromptQueueSnapshot,
+  ): void {
+    if (ws.readyState !== WebSocket.OPEN) return
+    try {
+      ws.send(JSON.stringify({ ...snapshot, ts: Date.now() }))
+    } catch {}
+  }
+
+  private _sendPromptQueueDispatch(
+    context: PromptQueueSessionContext,
+    frame: PromptQueueDispatchRequest,
+  ): boolean {
+    const peerKey = Gateway.makePeerKey(context.userId, 'webchat', context.owner.peer.id)
+    const clients = this.clientsByPeer.get(peerKey)
+    if (!clients) return false
+    const data = JSON.stringify(frame)
+    for (const ws of clients) {
+      if (!this._bridgeConnections.has(ws) || ws.readyState !== WebSocket.OPEN) continue
+      try {
+        ws.send(data)
+        return true
+      } catch {
+        // Try another bridge tab before treating the claim as undeliverable.
+      }
+    }
+    return false
+  }
+
   /** Record an authoritative settlement for later replay to late duplicates.
    *  `answers` is carried so that a 3rd tab hitting the already-settled
    *  replay path still sees the collected AskUserQuestion answers. */
@@ -10786,6 +11146,10 @@ export class Gateway {
   }
 
   private async dispatchInbound(frame: InboundFrame, adapter?: ChannelAdapter): Promise<void> {
+    // A few compatibility tests invoke this method with a minimal Gateway-shaped
+    // object. Keep the flag-off/non-queue path independent of coordinator state.
+    const promptQueueLifecycle = this._promptQueueLifecycleByFrame?.get(frame as object)
+    const promptQueueExecutionFence = this._promptQueueExecutionFenceByFrame?.get(frame as object)
     // ── 一切入口无条件 strip `__oc_model_authority`(方案 §2 铁律)──────────────
     // dispatchInbound 是**所有** inbound 的唯一汇流点(bridge WS / 本地 WS / HTTP
     // inbound / cron / delegate / channel adapter),故 strip 收口在这里一处:
@@ -11231,6 +11595,9 @@ export class Gateway {
             },
           }
         : {}),
+      ...(promptQueueExecutionFence
+        ? { promptQueueExecutionFence }
+        : {}),
     })
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
     if (typeof wechatDispatchStarted === 'function') {
@@ -11326,8 +11693,20 @@ export class Gateway {
     const text = frame.content.text ?? ''
     const media = frame.content.media ?? []
     const rawImageEdit = frame.content.imageEdit
-    const externalTurnGuard = rawImageEdit ? await this.sessions.beginExternalTurn(session) : null
+    const externalTurnGuard = rawImageEdit
+      ? await this.sessions.beginExternalTurn(session, {
+          queueTurn: Boolean(promptQueueLifecycle),
+          ...(promptQueueExecutionFence ? { queueExecutionFence: promptQueueExecutionFence } : {}),
+        })
+      : null
     let externalTurnCompleted = false
+    let externalQueueReservation: PromptQueueExternalTurnReservation | undefined
+    let externalQueueLifecycleOwned = false
+    let externalQueuePersistAttempted = false
+    let externalQueueTerminalText: string | undefined
+    let externalQueueError: unknown | undefined
+    let imageEditJobId: string | null = null
+    let imageEditOutputPath: string | null = null
     try {
 
     // Server-side upload validation. MIME is untrusted metadata and all formats
@@ -11340,6 +11719,12 @@ export class Gateway {
     // 防止 (a) 绕前端构造巨 text 帧 (b) 大 text 附件 + 大正文叠加超 300 MB 契约。
     const textByteLen = Buffer.byteLength(text, 'utf8')
     if (textByteLen > MAX_UPLOAD_TOTAL) {
+      if (promptQueueLifecycle) {
+        ;(frame as any).__oc_prompt_queue_preflight_rejection = {
+          disposition: 'user_action_required',
+          reasonCode: 'CONTENT_TOO_LARGE',
+        }
+      }
       const errMsg = `消息文本超过 ${MAX_UPLOAD_TOTAL / 1024 / 1024}MB 限制 (${(textByteLen / 1024 / 1024).toFixed(1)}MB)`
       this.log.warn('upload rejected: text too large', { reason: errMsg, textByteLen, sessionKey })
       this.deliver(
@@ -11357,6 +11742,12 @@ export class Gateway {
       return
     }
     const rejectFrame = (reason: string, ctx?: Record<string, unknown>) => {
+      if (promptQueueLifecycle) {
+        ;(frame as any).__oc_prompt_queue_preflight_rejection = {
+          disposition: 'user_action_required',
+          reasonCode: 'ATTACHMENT_INVALID',
+        }
+      }
       this.log.warn('upload rejected', { reason, sessionKey, ...ctx })
       this.deliver(
         {
@@ -11523,8 +11914,6 @@ export class Gateway {
       }
     }
 
-    let imageEditJobId: string | null = null
-    let imageEditOutputPath: string | null = null
     if (rawImageEdit !== undefined) {
       const rejectEdit = (reason: string) => {
         rejectFrame(`图片标注无效: ${reason}`)
@@ -11637,74 +12026,104 @@ export class Gateway {
             // the trusted relay cache below remains the source of truth.
           }
         }
+        let relayRequest: {
+          masterBaseUrl: string
+          containerToken: string
+          body: string
+        } | null = null
         if (!imageEditOutputPath) {
-        const relayCfg = readV3CodexRelayConfig(process.env)
-        if (!relayCfg) throw new Error('商业版图片计费通道未配置')
-        const relayUrl = `${relayCfg.masterBaseUrl}${V3_CODEX_RELAY_PREFIX}/backend-api/codex/images/annotated-edits`
-        const body = JSON.stringify({
-          jobId: imageEditJobId,
-          prompt: text,
-          width: rawImageEdit.width,
-          height: rawImageEdit.height,
-          sourceBase64: sourceBytes.toString('base64'),
-          ...(isOutpaint
-            ? { outpaint: { aspect: outpaintAspect } }
-            : { maskBase64: normalizedMaskBytes!.toString('base64') }),
-        })
-        let lastDeliveryError: unknown = null
-        imageRuntimeStarted = true
-        for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-            const generated = await fetch(relayUrl, {
-              method: 'POST',
-              headers: {
-                authorization: `Bearer ${relayCfg.containerToken}`,
-                'content-type': 'application/json',
-                'x-openclaude-image-job': imageEditJobId,
-              },
-              body,
-              signal: externalTurnGuard?.signal,
-            })
-            const generatedBody = await generated.json() as {
-              data?: Array<{ b64_json?: string }>
-              error?: { code?: string; message?: string }
-            }
-            const encoded = generatedBody.data?.[0]?.b64_json
-            if (!generated.ok || generatedBody.data?.length !== 1 || typeof encoded !== 'string') {
-              throw Object.assign(
-                new Error(generatedBody.error?.message ?? `Image 2 生成失败 (${generated.status})`),
-                {
-                  imageCode: generatedBody.error?.code,
-                  imageStatus: generated.status,
-                  noRetry: generated.status !== 409 && generated.status < 500,
-                },
-              )
-            }
-            const finalImage = Buffer.from(encoded, 'base64')
-            const finalMeta = await sharp(finalImage, { failOn: 'error' }).metadata()
-            if (finalMeta.format !== 'png' || finalMeta.width !== expectedDims.width || finalMeta.height !== expectedDims.height) {
-              throw new Error('Image 2 返回图片尺寸异常')
-            }
-            const tmpOutputPath = `${outputPath}.${process.pid}.tmp`
-            try {
-              await writeFile(tmpOutputPath, finalImage, { mode: 0o600 })
-              await rename(tmpOutputPath, outputPath)
-            } catch (err) {
-              try { unlinkSync(tmpOutputPath) } catch {}
-              throw err
-            }
-            imageEditOutputPath = outputPath
-            break
-          } catch (err) {
-            if (externalTurnGuard?.signal.aborted) throw err
-            if ((err as { noRetry?: boolean }).noRetry) throw err
-            lastDeliveryError = err
+          const relayCfg = readV3CodexRelayConfig(process.env)
+          if (!relayCfg) throw new Error('商业版图片计费通道未配置')
+          relayRequest = {
+            masterBaseUrl: relayCfg.masterBaseUrl,
+            containerToken: relayCfg.containerToken,
+            body: JSON.stringify({
+              jobId: imageEditJobId,
+              prompt: text,
+              width: rawImageEdit.width,
+              height: rawImageEdit.height,
+              sourceBase64: sourceBytes.toString('base64'),
+              ...(isOutpaint
+                ? { outpaint: { aspect: outpaintAspect } }
+                : { maskBase64: normalizedMaskBytes!.toString('base64') }),
+            }),
           }
         }
-        if (!imageEditOutputPath) throw lastDeliveryError ?? new Error('Image 2 服务连接失败')
+
+        // Queue ImageEdit stays a turn-boundary execution. Activate the exact
+        // durable turn before either a paid relay request or cached delivery;
+        // from here on every exit persists this reservation and settles it.
+        if (promptQueueLifecycle) {
+          externalQueueReservation = await this.sessions.reservePromptQueueExternalTurn(
+            session,
+            promptQueueLifecycle,
+            turnTraceId,
+          )
+          externalQueueLifecycleOwned = true
+          this._promptQueueLifecycleByFrame.delete(frame as object)
+          this._promptQueueExecutionFenceByFrame.delete(frame as object)
+        }
+
+        if (relayRequest) {
+          const relayUrl = `${relayRequest.masterBaseUrl}${V3_CODEX_RELAY_PREFIX}/backend-api/codex/images/annotated-edits`
+          let lastDeliveryError: unknown = null
+          imageRuntimeStarted = true
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              const generated = await fetch(relayUrl, {
+                method: 'POST',
+                headers: {
+                  authorization: `Bearer ${relayRequest.containerToken}`,
+                  'content-type': 'application/json',
+                  'x-openclaude-image-job': imageEditJobId,
+                },
+                body: relayRequest.body,
+                signal: externalTurnGuard?.signal,
+              })
+              const generatedBody = await generated.json() as {
+                data?: Array<{ b64_json?: string }>
+                error?: { code?: string; message?: string }
+              }
+              const encoded = generatedBody.data?.[0]?.b64_json
+              if (!generated.ok || generatedBody.data?.length !== 1 || typeof encoded !== 'string') {
+                throw Object.assign(
+                  new Error(generatedBody.error?.message ?? `Image 2 生成失败 (${generated.status})`),
+                  {
+                    imageCode: generatedBody.error?.code,
+                    imageStatus: generated.status,
+                    noRetry: generated.status !== 409 && generated.status < 500,
+                  },
+                )
+              }
+              const finalImage = Buffer.from(encoded, 'base64')
+              const finalMeta = await sharp(finalImage, { failOn: 'error' }).metadata()
+              if (finalMeta.format !== 'png' || finalMeta.width !== expectedDims.width || finalMeta.height !== expectedDims.height) {
+                throw new Error('Image 2 返回图片尺寸异常')
+              }
+              const tmpOutputPath = `${outputPath}.${process.pid}.tmp`
+              try {
+                await writeFile(tmpOutputPath, finalImage, { mode: 0o600 })
+                await rename(tmpOutputPath, outputPath)
+              } catch (err) {
+                try { unlinkSync(tmpOutputPath) } catch {}
+                throw err
+              }
+              imageEditOutputPath = outputPath
+              break
+            } catch (err) {
+              if (externalTurnGuard?.signal.aborted) throw err
+              if ((err as { noRetry?: boolean }).noRetry) throw err
+              lastDeliveryError = err
+            }
+          }
+          if (!imageEditOutputPath) throw lastDeliveryError ?? new Error('Image 2 服务连接失败')
         }
       } catch (err) {
-        if (externalTurnGuard?.signal.aborted) return
+        externalQueueError = err
+        if (externalTurnGuard?.signal.aborted) {
+          externalQueueTerminalText = '[error] 图片任务已中断。'
+          return
+        }
         const imageCode = (err as { imageCode?: string }).imageCode
         if (imageRuntimeStarted) {
           const rateLimited = (err as { imageStatus?: number }).imageStatus === 429
@@ -11728,6 +12147,7 @@ export class Gateway {
               ? 'Image 2 当前繁忙或已达使用上限，请稍后重试。'
               : rejectionMessage
                 ?? 'Image 2 服务暂时不可用，请稍后重试。'
+          externalQueueTerminalText = `[error] ${message}`
           const errorFrame: OutboundError & { _userId?: string } = {
             type: 'outbound.error',
             ..._inheritOutboundRouting(out),
@@ -11756,6 +12176,8 @@ export class Gateway {
       const responseText = rawImageEdit?.mode === 'outpaint'
         ? `已完成画面比例调整（Image 2 · 50 积分）。\n\n${imageEditOutputPath}`
         : `已完成圈选区域的精确修改（Image 2 · 50 积分）。\n\n${imageEditOutputPath}`
+      externalQueueTerminalText = responseText
+      externalQueuePersistAttempted = Boolean(externalQueueReservation)
       const externalTurn = await this.sessions.recordExternalTurn(session, {
         userText: text,
         assistantText: responseText,
@@ -11764,7 +12186,7 @@ export class Gateway {
           : imageEditJobId,
         traceId: turnTraceId,
         model: 'gpt-image-2',
-      })
+      }, externalQueueReservation)
       const delivered = {
         type: 'outbound.message' as const,
         sessionKey,
@@ -12395,6 +12817,8 @@ export class Gateway {
         ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
+      ...(promptQueueLifecycle ? { queueLifecycle: promptQueueLifecycle } : {}),
+      ...(promptQueueExecutionFence ? { queueExecutionFence: promptQueueExecutionFence } : {}),
       // §2.3 boss 硬指标 3:sessionManager 走"最近 N 条历史"兜底注入成功后回调,
       // gateway 发 sys.context_rebuilt 提示帧告知用户上下文被重建。仅 webchat leader
       // turn 传本回调(delegate/cron/train submit 不传 → 无用户可见提示,正确:那些
@@ -12439,8 +12863,23 @@ export class Gateway {
     // 这层计数覆盖了那段窗口;硬编排退役(2026-07-07 队长自主送审)后 client turn 与
     // engine turn 范围重合,保留计数是对账判据的稳定契约(未来任何 post-submit 编排
     // 复活时也无需再改 hello 判据)。
+    // Ownership moves from preflight to SessionManager at this exact boundary.
+    // The websocket wrapper releases any queue claim still present in the
+    // WeakMap; after deletion, onSettled owns activation/completion instead.
+    if (promptQueueLifecycle?.signal.aborted) {
+      ;(frame as any).__oc_prompt_queue_preflight_rejection = {
+        disposition: 'retryable',
+        reasonCode: 'LEASE_LOST',
+      }
+      return
+    }
+    if (promptQueueLifecycle) {
+      this._promptQueueLifecycleByFrame.delete(frame as object)
+      this._promptQueueExecutionFenceByFrame.delete(frame as object)
+    }
     this.sessions.beginClientTurn(session)
     let clientTurnThrew = false
+    let clientTurnError: unknown | undefined
     try {
       await this.sessions.submit(
         session,
@@ -12457,6 +12896,7 @@ export class Gateway {
 
     } catch (err) {
       clientTurnThrew = true
+      clientTurnError = err
       if (!replayTerminalizedUnhandledError) throw err
       this.log.warn('accepted turn failed after replay-safe terminal delivery', {
         sessionKey,
@@ -12467,6 +12907,15 @@ export class Gateway {
         session,
         turnErrored || clientTurnThrew ? 'errored' : 'completed',
       )
+      if (promptQueueLifecycle) {
+        try {
+          await promptQueueLifecycle.onSettled(clientTurnError)
+        } catch (err) {
+          this.log.error('prompt queue settlement failed', { sessionKey }, err as Error)
+        } finally {
+          promptQueueExecutionFence?.release()
+        }
+      }
     }
     if (
       (frame.channel === 'webchat' || frame.channel === 'wechat' || frame.channel === 'telegram') &&
@@ -12512,7 +12961,43 @@ export class Gateway {
       await liveWechatSendQueue
     }
     } finally {
+      // Once a queue ImageEdit is activated, every post-activation exit owns
+      // one exact tape — including relay rejection, stop, and thrown delivery
+      // errors. Completion may still wait for the normal lossless ACK barrier.
+      if (
+        externalQueueLifecycleOwned
+        && externalQueueReservation
+        && !externalQueuePersistAttempted
+      ) {
+        externalQueuePersistAttempted = true
+        try {
+          await this.sessions.recordExternalTurn(session, {
+            userText: text,
+            assistantText: externalQueueTerminalText ?? '[error] 图片任务执行失败。',
+            requestId: typeof frame.requestId === 'string' && /^[0-9a-f]{32}$/.test(frame.requestId)
+              ? frame.requestId
+              : imageEditJobId ?? externalQueueReservation.turnKey.slice(0, 32),
+            traceId: turnTraceId,
+            model: 'gpt-image-2',
+          }, externalQueueReservation)
+        } catch (err) {
+          externalQueueError ??= err
+          this.log.warn('prompt queue ImageEdit tape is awaiting durable ACK', {
+            sessionKey,
+            turnKey: externalQueueReservation.turnKey,
+          }, err as Error)
+        }
+      }
       externalTurnGuard?.finish(externalTurnCompleted ? 'completed' : 'errored')
+      if (externalQueueLifecycleOwned && promptQueueLifecycle) {
+        try {
+          await promptQueueLifecycle.onSettled(externalQueueError)
+        } catch (err) {
+          this.log.error('prompt queue ImageEdit settlement failed', { sessionKey }, err as Error)
+        } finally {
+          promptQueueExecutionFence?.release()
+        }
+      }
     }
     } finally {
       this._runtimeRecycleIngressActive = Math.max(0, this._runtimeRecycleIngressActive - 1)

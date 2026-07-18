@@ -73,6 +73,22 @@ function deps(overrides: Record<string, unknown> = {}): any {
         acceptedAt: input.enabled === true ? '2026-07-17T00:00:00.000Z' : null,
         disclaimerText: 'test disclaimer',
       }),
+      setManagedAccountWritePreapproval: async (input: Record<string, unknown>) => ({
+        available: true,
+        enabled: true,
+        disclaimerVersion: 1,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T00:00:00.000Z',
+        disclaimerText: 'test disclaimer',
+        preapproval: {
+          available: true,
+          enabled: input.enabled === true,
+          disclaimerVersion: 1,
+          acceptedVersion: input.enabled === true ? 1 : null,
+          acceptedAt: input.enabled === true ? '2026-07-17T00:00:00.000Z' : null,
+          disclaimerText: 'preapproval disclaimer',
+        },
+      }),
     },
     knowledgePlanetSetup: {
       start: async (userId: number, accepted: boolean) => ({
@@ -109,6 +125,10 @@ function deps(overrides: Record<string, unknown> = {}): any {
         pausedReason: null,
       }),
       createRule: async (input: Record<string, unknown>) => ({ id: 'rule-created', ...input }),
+      listGroups: async () => [{ id: '123456789', name: 'Test group', memberCount: 12 }],
+      createRulesBatch: async (input: Record<string, unknown>) => [
+        { id: 'rule-created-batch', ...input },
+      ],
       patchRule: async (input: Record<string, unknown>) => ({
         id: input.ruleId,
         ...(input.patch as Record<string, unknown>),
@@ -246,6 +266,59 @@ describe('Plugin management HTTP dispatcher', () => {
     assert.deepEqual(calls.at(-1), { userId: 42, targetId: '901', enabled: false })
   })
 
+  test('account write preapproval has its own exact consent endpoint', async () => {
+    const calls: unknown[] = []
+    const custom = deps({
+      pluginRuntime: {
+        setManagedAccountWritePreapproval: async (input: unknown) => {
+          calls.push(input)
+          return { preapproval: { enabled: true } }
+        },
+      },
+    })
+    const res = response()
+    await dispatchPluginsRoute(
+      await request('PATCH', '/api/plugins/accounts/901/write-preapproval', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+      }),
+      res,
+      ctx,
+      custom,
+    )
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(calls.at(-1), {
+      userId: 42,
+      targetId: '901',
+      enabled: true,
+      accepted: true,
+      disclaimerVersion: 1,
+    })
+
+    await dispatchPluginsRoute(
+      await request('PATCH', '/api/plugins/accounts/901/write-preapproval', { enabled: false }),
+      response(),
+      ctx,
+      custom,
+    )
+    assert.deepEqual(calls.at(-1), { userId: 42, targetId: '901', enabled: false })
+    for (const invalid of [
+      { enabled: true, accepted: false, disclaimerVersion: 1 },
+      { enabled: true, accepted: true },
+      { enabled: false, disclaimerVersion: 1 },
+    ])
+      await assert.rejects(
+        dispatchPluginsRoute(
+          await request('PATCH', '/api/plugins/accounts/901/write-preapproval', invalid),
+          response(),
+          ctx,
+          custom,
+        ),
+        (error: unknown) => error instanceof HttpError && error.status === 400,
+      )
+  })
+
   test('runtime ownership failures map to stable HTTP errors; unknown methods stay dispatcher-owned', async () => {
     await assert.rejects(
       dispatchPluginsRoute(
@@ -301,6 +374,14 @@ describe('Plugin management HTTP dispatcher', () => {
           calls.push({ kind: 'create', input })
           return { id: '123e4567-e89b-42d3-a456-426614174001' }
         },
+        listGroups: async (userId: number, targetId: string) => {
+          calls.push({ kind: 'groups', input: { userId, targetId } })
+          return [{ id: '123456789', name: '产品群', memberCount: 42 }]
+        },
+        createRulesBatch: async (input: unknown) => {
+          calls.push({ kind: 'batch', input })
+          return [{ id: '123e4567-e89b-42d3-a456-426614174002' }]
+        },
         patchRule: async (input: unknown) => {
           calls.push({ kind: 'patch', input })
           return { id: '123e4567-e89b-42d3-a456-426614174001', enabled: true }
@@ -343,6 +424,46 @@ describe('Plugin management HTTP dispatcher', () => {
         accepted: true,
         disclaimerVersion: 1,
         accountDailyLimit: 12,
+      },
+    })
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('GET', '/api/plugins/accounts/901/automation/groups'),
+      res,
+      ctx,
+      custom,
+    )
+    assert.deepEqual(res.body, {
+      groups: [{ id: '123456789', name: '产品群', memberCount: 42 }],
+    })
+    assert.deepEqual(calls.at(-1), {
+      kind: 'groups',
+      input: { userId: 42, targetId: '901' },
+    })
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('POST', '/api/plugins/accounts/901/automation/rules/batch', {
+        groupIds: ['123456789', '223456789'],
+        name: '新主题',
+        instructions: '只回答产品问题',
+        triggerKind: 'new_question',
+      }),
+      res,
+      ctx,
+      custom,
+    )
+    assert.equal(res.statusCode, 201)
+    assert.deepEqual(calls.at(-1), {
+      kind: 'batch',
+      input: {
+        userId: 42,
+        targetId: '901',
+        groupIds: ['123456789', '223456789'],
+        name: '新主题',
+        instructions: '只回答产品问题',
+        triggerKind: 'new_question',
       },
     })
 

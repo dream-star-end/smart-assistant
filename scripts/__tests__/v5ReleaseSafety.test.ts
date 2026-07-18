@@ -3509,4 +3509,43 @@ wait $!
       'activate-staged 翻转点未在 systemctl start 前断言 lease',
     )
   })
+
+  // 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。
+  // 契约:deploy 三个成功出口 + dist 出口都必须在 end_planned_maintenance 之后、
+  // 完成 echo 之前调 `smoke_e2e_journey || exit 1`(fail-loud;不进 validation 自动
+  // 回滚链是第一期显式裁定,升级时改本断言)。函数本体必须:依赖缺失 fail-loud
+  // (playwright-core 探测,禁静默跳过)+ V5_SMOKE_E2E=0 显式豁免 + dry-run 分支。
+  test('E2E journey gate wired at every success exit and fails loud', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // 函数本体契约。
+    const fnStart = source.indexOf('\nsmoke_e2e_journey() {')
+    assert.ok(fnStart >= 0, 'smoke_e2e_journey 函数缺失')
+    const fnEnd = source.indexOf('\n}', fnStart)
+    const fn = source.slice(fnStart, fnEnd)
+    assert.match(fn, /V5_SMOKE_E2E:-1/, '缺 V5_SMOKE_E2E 豁免开关')
+    assert.match(fn, /node_modules\/playwright-core/, '缺依赖活体探测(缺失必须 fail-loud 而非静默跳过)')
+    assert.match(fn, /return 1/, '依赖缺失/旅程失败必须返回非零')
+    assert.match(fn, /\[dry-run\]/, '缺 dry-run 分支')
+    assert.match(fn, /v5-e2e-journey-canary\.mjs/, '未调用旅程脚本')
+    // 接线契约:调用形态必须是 `smoke_e2e_journey || exit 1`(裸调用在管道/条件上下文
+    // 会被 set -e 放过 = fail-open),且四个成功出口(deploy setup-first/zero-touch/主路径
+    // + dist)各一处、全部位于对应 end_planned_maintenance 之后。
+    const calls = source.match(/smoke_e2e_journey \|\| exit 1/g) ?? []
+    assert.equal(calls.length, 4, `期望 4 个成功出口接线,实际 ${calls.length}`)
+    for (const exitMarker of [
+      'knowledge-planet=setup-first)。"',
+      'knowledge-planet=zero-touch)。"',
+      '"✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
+      '"✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
+    ]) {
+      const exitAt = source.indexOf(exitMarker)
+      assert.ok(exitAt >= 0, `成功出口标记缺失: ${exitMarker}`)
+      const windowStart = source.lastIndexOf('end_planned_maintenance', exitAt)
+      const gateAt = source.lastIndexOf('smoke_e2e_journey || exit 1', exitAt)
+      assert.ok(
+        gateAt > windowStart && gateAt < exitAt,
+        `出口「${exitMarker}」的 E2E 门未落在 end_planned_maintenance 与完成 echo 之间`,
+      )
+    }
+  })
 })

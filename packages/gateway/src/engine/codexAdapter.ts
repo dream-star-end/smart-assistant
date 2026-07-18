@@ -388,6 +388,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       params.input as string | Array<{ type: string; text?: string }>,
       params.requestId,
       params.collabAgentPolicy,
+      params.queueTurn,
     )
     return {
       submitted,

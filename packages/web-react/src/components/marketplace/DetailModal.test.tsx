@@ -68,6 +68,28 @@ test("详情页人向重排:适用场景 / 效果 / 详细介绍 / 分类徽章�
   expect(screen.getByText("办公文档")).toBeInTheDocument();
 });
 
+test("公开详情即使收到旧服务端 riskFlags 也不展示内部扫描诊断", async () => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({
+      riskFlags: [
+        {
+          category: "injection",
+          severity: "warning",
+          code: "PROMPT_INJECTION",
+          message: "internal scanner detail",
+          block: false,
+        },
+      ],
+    }),
+  );
+  listMyAgents.mockResolvedValue([] as MarketplaceMyAgent[]);
+  render(<DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} />);
+
+  expect(await screen.findByText("学术翻译")).toBeInTheDocument();
+  expect(screen.queryByText("疑似提示词注入")).not.toBeInTheDocument();
+  expect(screen.queryByText("internal scanner detail")).not.toBeInTheDocument();
+});
+
 test("Agent 详情展示 typed capabilities、就绪状态与 Plugin 授权入口", async () => {
   getMarketplaceDetail.mockResolvedValue(
     detail({
