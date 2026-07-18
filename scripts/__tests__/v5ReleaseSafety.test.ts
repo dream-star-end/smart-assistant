@@ -177,6 +177,16 @@ async function allRecordedProcessesExited(pidFile: string): Promise<boolean> {
   })
 }
 
+function childProcessGroupLeader(parentPid: number): number | undefined {
+  const out = spawnSync('ps', ['-eo', 'pid=,ppid=,pgid='], { encoding: 'utf8' }).stdout
+  for (const line of out.split('\n')) {
+    const [pidRaw, ppidRaw, pgidRaw] = line.trim().split(/\s+/)
+    const pid = Number(pidRaw)
+    if (Number(ppidRaw) === parentPid && Number(pgidRaw) === pid && pid > 1) return pid
+  }
+  return undefined
+}
+
 async function writeStubbornManualCommand(fx: Awaited<ReturnType<typeof manualLeaseFixture>>): Promise<string> {
   const command = path.join(fx.dir, 'stubborn-command.sh')
   await writeFile(command, [
@@ -438,6 +448,7 @@ describe('v5 release safety lanes', () => {
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'calls=()',
       'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
       'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
@@ -476,6 +487,7 @@ describe('v5 release safety lanes', () => {
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'calls=()',
       'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
       'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
@@ -1447,6 +1459,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'DRY=0',
       'KL_HOST=fake',
       'ACTIVE_SRC=/fixture/active',
@@ -1488,6 +1501,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       "source '" + deploy + "'",
+      'MUTATION_LEASE_BYPASSED=1',
       'DRY=0',
       'KL_HOST=fake',
       'ACTIVE_SRC=/fixture/active',
@@ -2422,6 +2436,7 @@ describe('v5 release safety lanes', () => {
         'set -u',
         'export V5_DEPLOY_SOURCE_ONLY=1',
         `source '${deploy}'`,
+        'MUTATION_LEASE_BYPASSED=1',
         'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790',
         'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
         'model_authority_preflight() { record preflight; return 0; }',
@@ -2771,6 +2786,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
       'authority_flag=1',
       'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
@@ -2847,6 +2863,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
       'authority_flag=1; egress_fail=1',
       'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
@@ -2885,6 +2902,7 @@ describe('v5 release safety lanes', () => {
         'set -u',
         'export V5_DEPLOY_SOURCE_ONLY=1',
         `source '${deploy}'`,
+        'MUTATION_LEASE_BYPASSED=1',
         'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
         'OC_HOTCFG_PLATFORM_ROOT=/platform; seed_state=0',
         'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
@@ -3215,6 +3233,7 @@ describe('v5 release safety lanes', () => {
     const stopFailure = spawnSync('bash', ['-c', [
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'calls=0',
       'sshk() { calls=$((calls+1)); [ "$calls" -ne 2 ]; }',
       'wait_for_candidate_ready() { return 1; }',
@@ -3233,6 +3252,7 @@ describe('v5 release safety lanes', () => {
     const dispatcherStopFailure = spawnSync('bash', ['-c', [
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'ds_snapshot() { DS_phase=canary; DS_transition_step=2; DS_candidate_slot=B; DS_active_slot=A; DS_operation_id=op; DS_lock_version=7; }',
       'recover_canary_prep() { return 42; }',
       'ds_cas_or_die() { touch "$CASSED"; }',
@@ -3249,6 +3269,7 @@ describe('v5 release safety lanes', () => {
     const missingUnit = spawnSync('bash', ['-c', [
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'sshk() { eval "$*"; }',
       'systemctl() { touch "$SYSTEMCTL_CALLED"; return 42; }',
       'export -f systemctl',
@@ -3752,6 +3773,65 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     }
   })
 
+  test('manual mutation wrapper supervisor-group SIGSTOP is fenced by an independent watchdog', async () => {
+    const fx = await manualLeaseFixture()
+    const heartbeat = path.join(fx.dir, 'supervisor-stop-heartbeat')
+    const command = path.join(fx.dir, 'supervisor-stop-command.sh')
+    await writeFile(command, [
+      '#!/bin/bash',
+      "trap '' TERM",
+      'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+      ': >"$COMMAND_STARTED"',
+      'while :; do printf "%s\\n" "$RANDOM" >"$HEARTBEAT"; sleep 0.05; done',
+    ].join('\n') + '\n')
+    await chmod(command, 0o755)
+    const child = spawn('bash', [fx.wrapper, command], {
+      env: { ...fx.env, HEARTBEAT: heartbeat, OC_V5_MUTATION_LEASE_TTL_SECONDS: '30' },
+      stdio: 'ignore',
+    })
+    let supervisorPid: number | undefined
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'heartbeat command never started',
+      )
+      assert.equal(
+        await waitUntilManualLease(() => {
+          supervisorPid = childProcessGroupLeader(child.pid!)
+          return supervisorPid !== undefined
+        }, 3_000),
+        true,
+        'manual internal supervisor PGID not found',
+      )
+      const stoppedAt = Date.now()
+      process.kill(-supervisorPid!, 'SIGSTOP')
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(fx.commandPids), 3_000),
+        true,
+        'independent watchdog left command mutating after supervisor-group STOP',
+      )
+      assert.ok(Date.now() - stoppedAt < 3_000, 'command survived until the 30s TTL instead of immediate STOP fencing')
+      const frozen = await readFile(heartbeat, 'utf8')
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      assert.equal(await readFile(heartbeat, 'utf8'), frozen, 'heartbeat advanced after supervisor-group STOP fencing')
+      assert.equal(await waitForChildExit(child, 5_000), true, 'outer wrapper required SIGCONT to finish')
+      assert.notEqual(child.exitCode, 0, 'supervisor STOP must fail closed')
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 5_000),
+        true,
+        'supervisor STOP left the production-mutation flock held',
+      )
+    } finally {
+      if (supervisorPid) {
+        try { process.kill(-supervisorPid, 'SIGCONT') } catch { /* already gone */ }
+        try { process.kill(-supervisorPid, 'SIGKILL') } catch { /* already gone */ }
+      }
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
   test('manual mutation wrapper fences a running command when the lease ssh disappears', async () => {
     const fx = await manualLeaseFixture()
     const command = await writeStubbornManualCommand(fx)
@@ -4049,56 +4129,49 @@ wait $!
 
   test('F7: mutation-lease deactivation covered on compensation + emergency/staged flips', async () => {
     const source = await readFile(deploy, 'utf8')
-    // helper 已定义
-    assert.match(source, /reacquire_mutation_lease_best_effort\(\) \{/)
-    // ── R2-6:补偿路径改为**阻塞等待**重取(远端 flock -w 180),等待失败才降级续作补偿 ──
+    // helper 已定义；失锁后禁止自动重取并猜测 saga 阶段，更不能无 lease 补偿。
+    assert.match(source, /require_mutation_lease_for_compensation\(\) \{/)
     {
-      const rqStart = source.indexOf('reacquire_mutation_lease_best_effort() {')
+      const rqStart = source.indexOf('require_mutation_lease_for_compensation() {')
       const rqEnd = source.indexOf('# ───────────────────────── dangerous offline cutover', rqStart)
-      assert.ok(rqStart >= 0 && rqEnd > rqStart, '未找到 reacquire 函数体')
+      assert.ok(rqStart >= 0 && rqEnd > rqStart, '未找到 compensation lease fence 函数体')
       const rq = source.slice(rqStart, rqEnd)
-      assert.match(rq, /acquire_production_mutation_lease 180/, 'R2-6:reacquire 未走 180s 阻塞等待重取')
-      assert.match(rq, /CRITICAL/, 'R2-6:reacquire 降级路径缺 CRITICAL stderr')
-      assert.ok(
-        rq.includes('补偿优先于互斥,残余窗口=host-action 90s 内的并发,已知且接受'),
-        'R2-6:reacquire 降级路径缺"已知且接受残余窗口"注记(须同时在函数注释)',
-      )
+      assert.doesNotMatch(rq, /acquire_production_mutation_lease/, '失锁补偿禁止在 generic child 内自动重取 lease')
+      assert.match(rq, /return 86/, '失锁补偿必须返回专用 crash-stop rc=86')
+      assert.match(rq, /禁止无 lease 补偿\/回滚/, '失锁补偿必须 fail-closed 并保留恢复现场')
     }
-    // acquire 支持可配置等待秒数(默认 60,reacquire 传 180),远端 flock 用参数化等待。
-    assert.ok(source.includes('local lease_wait="${1:-60}"'), 'R2-6:acquire 未参数化等待秒数(默认 60)')
-    assert.match(source, /flock -w \$\{lease_wait\} 9 \|\| exit 75/, 'R2-6:remote lease flock 未用参数化等待秒数')
-    // deploy 两条补偿路径(validation + plugin seed)各挂一次
+    // deploy 两条补偿路径(validation + plugin seed)各挂一次 fail-closed fence。
     assert.equal(
-      source.match(/reacquire_mutation_lease_best_effort "deploy-validation-compensation"/g)?.length,
+      source.match(/require_mutation_lease_for_compensation "deploy-validation-compensation"/g)?.length,
       2,
-      'deploy 补偿(validation + plugin seed)未各挂一次 reacquire',
+      'deploy 补偿(validation + plugin seed)未各挂一次 lease fence',
     )
-    // deploy 补偿内 reacquire 先于 knowledge_planet_compensate_deploy
+    // deploy 补偿内 fence 先于 knowledge_planet_compensate_deploy
     const deployStart = source.indexOf('\ndeploy() {')
     const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
     const deployBody = source.slice(deployStart, deployEnd)
     assert.ok(
-      deployBody.indexOf('reacquire_mutation_lease_best_effort "deploy-validation-compensation"') <
+      deployBody.indexOf('require_mutation_lease_for_compensation "deploy-validation-compensation"') <
         deployBody.indexOf('knowledge_planet_compensate_deploy'),
-      'deploy 补偿 reacquire 未先于 compensate',
+      'deploy 补偿 lease fence 未先于 compensate',
     )
     // rollback 补偿覆盖(2026-07-17 KP 门摘除后):真正做反向补偿的只剩 hotcfg smoke-failure
     // reverse compensation + 非 hotcfg activate-failure 两条;其余插件侧失败已降级为
     // warn+open_gate_current 兜底继续(不做补偿,lease 仍在持有中),不需要 reacquire。
     assert.equal(
-      source.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
+      source.match(/require_mutation_lease_for_compensation "rollback-compensation"/g)?.length,
       2,
-      'rollback 反向补偿路径(hotcfg smoke-failure + 非 hotcfg activate-failure)未挂 reacquire',
+      'rollback 反向补偿路径未挂 lease fence',
     )
     // hotcfg smoke-failure 反向补偿紧邻先于 rollback_runtime_tuple 1 1。
     assert.match(
       source,
-      /reacquire_mutation_lease_best_effort "rollback-compensation"\n\s*if rollback_runtime_tuple 1 1 "\$kp_rollback_helper"/,
+      /require_mutation_lease_for_compensation "rollback-compensation" \|\| exit 86\n\s*if rollback_runtime_tuple 1 1 "\$kp_rollback_helper"/,
     )
     // 非 hotcfg 三条:reacquire 紧邻先于 Knowledge Planet 补偿(open_gate / transition)。
     assert.match(
       source,
-      /reacquire_mutation_lease_best_effort "rollback-compensation"\n(\s*if \[\[ "\$kp_rb_bracket" == 1 \]\]; then\n)?\s*knowledge_planet_plugin_(open_gate_to_release|transition_to_release) "\$live_master"/,
+      /require_mutation_lease_for_compensation "rollback-compensation" \|\| exit 86\n(\s*if \[\[ "\$kp_rb_bracket" == 1 \]\]; then\n)?\s*knowledge_planet_plugin_(open_gate_to_release|transition_to_release) "\$live_master"/,
     )
     // 全部 2 次 reacquire(2026-07-17 KP 门摘除后仅剩真反向补偿两条)都落在
     // rollback() 函数体内(不外溢别的 lane)。
@@ -4107,25 +4180,46 @@ wait $!
       const rbEnd = source.indexOf('\nrollback_runtime_tuple() {', rbStart)
       const rbBody = source.slice(rbStart, rbEnd)
       assert.equal(
-        rbBody.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
+        rbBody.match(/require_mutation_lease_for_compensation "rollback-compensation"/g)?.length,
         2,
-        'rollback-compensation reacquire 未全部落在 rollback() 内',
+        'rollback-compensation lease fence 未全部落在 rollback() 内',
       )
     }
-    // 2026-07-17 lease 孤儿修复:ACTIVE 在 spawn 后立即置位(轮询窗被 trap 打断
-    // 也能回收本地 ssh;远端 holder 由 base 侧自释放设计负责,见 PPid 自检循环)。
-    assert.match(
-      source,
-      /MUTATION_LEASE_PID=\$!\n[\s\S]{0,400}?MUTATION_LEASE_ACTIVE=1/,
+    // ACTIVE 在本地 TTL spawn 后、ssh/LEASED 前置位；acquisition 中断可回收二者。
+    const ttlSpawn = source.indexOf('MUTATION_LEASE_TTL_PID=$!')
+    const leaseActive = source.indexOf('MUTATION_LEASE_ACTIVE=1', ttlSpawn)
+    const sshSpawn = source.indexOf('exec setsid ssh -o ServerAliveInterval=2', ttlSpawn)
+    assert.ok(ttlSpawn >= 0 && leaseActive > ttlSpawn && sshSpawn > leaseActive, 'lease acquisition ACTIVE/TTL/ssh 顺序错误')
+    const kpVerifyStart = source.indexOf('\nknowledge_planet_plugin_verify_user() {')
+    const kpVerifyEnd = source.indexOf('\nknowledge_planet_plugin_smoke_gate() {', kpVerifyStart)
+    const kpVerify = source.slice(kpVerifyStart, kpVerifyEnd)
+    const kpAcquire = kpVerify.indexOf('acquire_production_mutation_lease')
+    const kpSupervisedBuild = kpVerify.indexOf('run_mutation_lane_supervised knowledge_planet_build_release_mutation')
+    const kpRelease = kpVerify.indexOf('release_production_mutation_lease', kpSupervisedBuild)
+    const kpScan = kpVerify.indexOf('seed-knowledge-planet-plugin.ts', kpRelease)
+    assert.ok(
+      kpAcquire >= 0 && kpSupervisedBuild > kpAcquire && kpRelease > kpSupervisedBuild && kpScan > kpRelease,
+      'Knowledge Planet 仅 build_release 窄窗须走持续 lease supervisor，扫码窗须在 release 后',
     )
-    // abort_continue 恢复动作(caddy_render_reload)前调用
+    const dispatch = source.slice(source.lastIndexOf('case "$MODE" in'))
+    assert.match(
+      dispatch,
+      /smoke\|baseline-census\|model-authority-preflight\|model-authority-observation-status\|reclaim-mutation-lease\|knowledge-planet-verify\)\n\s*run_selected_mode "\$MODE"/,
+      '只读/特殊 lane 应直接 dispatch',
+    )
+    assert.match(
+      dispatch,
+      /\*\)\n\s*run_mutation_lane_supervised run_selected_mode "\$MODE"/,
+      '所有其余 mutation lane 必须统一经过持续 lease supervisor',
+    )
+    // abort_continue 恢复动作(caddy_render_reload)前调用 fail-closed fence
     const abortStart = source.indexOf('\nabort_continue() {')
     const abortEnd = source.indexOf('\n# ═════════ --recover', abortStart)
     const abortBody = source.slice(abortStart, abortEnd)
-    const abortReacquire = abortBody.indexOf('reacquire_mutation_lease_best_effort "abort-continue"')
+    const abortReacquire = abortBody.indexOf('require_mutation_lease_for_compensation "abort-continue"')
     assert.ok(
       abortReacquire >= 0 && abortReacquire < abortBody.indexOf('caddy_render_reload'),
-      'abort_continue 恢复动作前未挂 reacquire',
+      'abort_continue 恢复动作前未挂 lease fence',
     )
     // emergency tuple 翻转点:activate saga 前断言 lease
     const emStart = source.indexOf('\nactivate_emergency_tuple() {')
