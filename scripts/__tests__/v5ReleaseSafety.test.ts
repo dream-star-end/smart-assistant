@@ -1861,6 +1861,8 @@ describe('v5 release safety lanes', () => {
     ])
     assert.ok(meta.capabilities.includes('durable-turn-dispatch-v1'))
     assert.ok(meta.requiredMigrations.includes('0170_durable_turn_dispatch'))
+    // scheduler 泄漏门白名单必须登记本批新 reconciler(漏登=部署 smoke 判泄漏→假回滚,20260718 实撞)
+    assert.match(source, /allowed="\$allowed[^"]*\bturnDispatchReconciler\b[^"]*"/)
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
     assert.match(
       source.slice(buildRuntimeStart, buildRuntimeEnd),
