@@ -191,6 +191,31 @@ describe("lossless v2 turn tape", () => {
     assert.deepEqual(first.finalize, second.finalize);
   });
 
+  test("RFC §2.4:payload 带 dispatch 身份 → 每个 part+finalize 信封携带;缺省则不携带(legacy 形状不变)", () => {
+    // 2026-07-18 实证回归门:此前信封漏传 dispatchId/attemptNo → 全量 tape 无身份 →
+    // turn_dispatches 恒停 accepted、零 terminal(§2.4 收敛全断)。
+    const withDispatch = buildLosslessTurnTapeRequests({
+      ...PAYLOAD,
+      createdAt: 123,
+      turnKey: "c".repeat(64),
+      dispatchId: "3e0a2b52-9d31-4c8f-9b6e-000000000001",
+      attemptNo: 2,
+    });
+    for (const part of withDispatch.parts) {
+      assert.equal(part.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
+      assert.equal(part.attemptNo, 2);
+    }
+    assert.equal(withDispatch.finalize.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
+    assert.equal(withDispatch.finalize.attemptNo, 2);
+    // 身份是信封元数据,canonical 本体语义不因信封补齐而改(payload 自身字段决定 canonical)。
+    const parsed = JSON.parse(withDispatch.canonical.toString("utf8"));
+    assert.equal(parsed.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
+    // legacy(无身份)payload:信封不得出现 undefined 字段污染既有形状。
+    const legacy = buildLosslessTurnTapeRequests({ ...PAYLOAD, createdAt: 123, turnKey: "d".repeat(64) });
+    assert.ok(!("dispatchId" in legacy.parts[0]!));
+    assert.ok(!("dispatchId" in legacy.finalize));
+  });
+
   test("auto-waive reason is fsynced on every envelope and canonical tape", () => {
     const tape = buildLosslessTurnTapeRequests({
       ...PAYLOAD,

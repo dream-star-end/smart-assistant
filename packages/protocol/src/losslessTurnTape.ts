@@ -78,6 +78,10 @@ export interface LosslessTurnTapePartRequest {
   /** Standard base64 (not base64url) of this part's raw canonical bytes. */
   data: string
   createdAt: number
+  /** RFC-v5-durable-turn-dispatch §2.4:sink 首片带 dispatch 身份 → 落 tape header,
+   * finalize 据此同事务收敛 turn_dispatches → terminal。可选(legacy tape / 非 durable lane 无)。 */
+  dispatchId?: string
+  attemptNo?: number
 }
 
 export interface LosslessTurnTapeFinalizeRequest {
@@ -95,6 +99,9 @@ export interface LosslessTurnTapeFinalizeRequest {
   totalBytes: number
   partCount: number
   createdAt: number
+  /** 同 part:dispatch 身份(master 收敛以 tape header 存量为准,finalize 携带仅为对称冗余)。 */
+  dispatchId?: string
+  attemptNo?: number
 }
 
 export type LosslessTurnTapeRequest =

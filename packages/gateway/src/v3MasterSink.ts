@@ -339,6 +339,13 @@ export function buildLosslessTurnTapeRequests(
     partCount,
     createdAt,
     ...(payload.waiveReason ? { waiveReason: payload.waiveReason } : {}),
+    // RFC §2.4:dispatch 身份随信封上行(sink 首片 → master 落 tape header → finalize 同事务
+    // 收敛 turn_dispatches)。2026-07-18 实证:此处漏传 → 全量 tape 无身份 → dispatch 恒停
+    // accepted、零 terminal。canonical/hash 不受影响(payload 本体本就含 dispatchId,此处
+    // 只是信封元数据补齐)。
+    ...(typeof payload.dispatchId === 'string' && typeof payload.attemptNo === 'number'
+      ? { dispatchId: payload.dispatchId, attemptNo: payload.attemptNo }
+      : {}),
   } as const
   const parts: LosslessTurnTapePartRequest[] = []
   for (let partIndex = 0; partIndex < partCount; partIndex++) {
