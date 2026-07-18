@@ -3608,4 +3608,40 @@ wait $!
     const tc = source.slice(tcStart, source.indexOf('\n}', tcStart))
     assert.match(tc, /clear_smoke_waiver turn/, 'turn canary 成功必须清除豁免留痕(债务偿还语义)')
   })
+
+  // 2026-07-18 门禁审计批E:env 双源类事故(07-08/07-11 Resend 两断)的两道防线。
+  //  ① bootstrap 存在性守卫:openclaude.json / env 一旦存在即现网权威,重跑 bootstrap
+  //     绝不重建(07-11 事故=恢复重跑从已退役 v3 env 回灌,冲掉热修 RESEND_API_KEY)。
+  //     该守卫此前不在任何测试保护下——重构 bootstrap 删掉它 CI 不会红,本测试补锁。
+  //  ② env 必备键门:deploy/deploy_dist 激活前 fail-closed 校验远端 env 含
+  //     deploy/v5/required-env-keys.txt 每个键(键丢失类灾难面的部署前防线)。
+  test('bootstrap existence guards and env required-keys gate stay wired', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // ① 两道存在性守卫:守卫判断必须出现,且"已存在→保留"分支先于派生动作。
+    const ocJson = source.indexOf("if [ -f '$V5_HOME/openclaude.json' ]; then echo '  ⚠ openclaude.json 已存在 → 保留现网文件")
+    assert.ok(ocJson >= 0, 'openclaude.json 存在性守卫缺失(重跑 bootstrap 会重建现网权威文件)')
+    const envGuard = source.indexOf("if [ -f '$V5_ENV' ]; then echo '  ⚠ $V5_ENV 已存在 → 保留现网 env")
+    assert.ok(envGuard >= 0, 'env 存在性守卫缺失(重跑 bootstrap 会从 v3 env 回灌冲掉热修密钥)')
+    // ② env 必备键门:函数存在 + 清单文件路径正确 + deploy()/deploy_dist() 都在
+    //    build/activate 之前接线。
+    const fnAt = source.indexOf('\nassert_env_required_keys() {')
+    assert.ok(fnAt >= 0, 'assert_env_required_keys 函数缺失')
+    const fn = source.slice(fnAt, source.indexOf('\n}', fnAt))
+    assert.match(fn, /required-env-keys\.txt/, 'env 必备键门未读 deploy/v5/required-env-keys.txt 清单')
+    assert.match(fn, /return 1/, 'env 必备键门必须 fail-closed')
+    const manifest = await readFile(path.join(path.dirname(deploy), '..', 'deploy', 'v5', 'required-env-keys.txt'), 'utf8')
+    for (const key of ['DATABASE_URL', 'RESEND_API_KEY', 'OC_EGRESS_SECRET', 'OC_RUNTIME_IMAGE']) {
+      assert.ok(manifest.includes(key), `required-env-keys.txt 缺关键键 ${key}`)
+    }
+    const deployStart = source.indexOf('\ndeploy() {')
+    const deployBody = source.slice(deployStart, source.indexOf('\noffline_recycle_inner() {', deployStart))
+    const dGate = deployBody.indexOf('assert_env_required_keys')
+    const dBuild = deployBody.indexOf('build_release')
+    assert.ok(dGate >= 0 && dBuild > dGate, 'deploy() 的 env 必备键门必须在 build_release 之前')
+    const distStart = source.indexOf('\ndeploy_dist() {')
+    const distBody = source.slice(distStart, source.indexOf('\n}', distStart))
+    const sGate = distBody.indexOf('assert_env_required_keys')
+    const sBuild = distBody.indexOf('build_release')
+    assert.ok(sGate >= 0 && sBuild > sGate, 'deploy_dist() 的 env 必备键门必须在 build_release 之前')
+  })
 })

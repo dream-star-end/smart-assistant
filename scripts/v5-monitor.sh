@@ -401,6 +401,24 @@ check_probe_result() { # <name> <file> <interval_secs> <人话>
   fi
 }
 
+check_mail_key_sync() {
+  # Resend key 双源一致性(2026-07-18 门禁审计批E)。背景:07-11 事故=重跑 bootstrap 时
+  # env 从 v3 env(已退役但仍是派生源)回灌,冲掉热修 RESEND_API_KEY,验证邮件静默断
+  # 数天。bootstrap 存在性守卫已堵"重跑回灌"路径;本检查盯**回灌源本身的陈旧度**:
+  # v3 env 仍存在且 key 与 v5 不一致 → 它就是一颗哑弹(任何"确要重建先移走 env 文件"
+  # 的操作都会把旧 key 灌回来)→ warning 直到两侧同步或 v3 env 移除。
+  local v5env="/etc/openclaude/commercial-v5.env" v3env="/etc/openclaude/commercial.env" k5 k3
+  if [ ! -f "$v3env" ]; then record mail_key_sync ok "v3 env 已移除,无回灌源"; return; fi
+  k5="$(grep '^RESEND_API_KEY=' "$v5env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  k3="$(grep '^RESEND_API_KEY=' "$v3env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [ -z "$k5" ]; then record mail_key_sync bad "v5 env 缺 RESEND_API_KEY(邮件通道键丢失)"; return; fi
+  if [ -n "$k3" ] && [ "$k3" != "$k5" ]; then
+    record mail_key_sync bad "v3 env(bootstrap 派生源)的 RESEND_API_KEY 与 v5 不一致——回灌哑弹,同步或移除 $v3env"
+  else
+    record mail_key_sync ok "Resend key 双源一致(或 v3 侧无该键)"
+  fi
+}
+
 check_smoke_waiver() {
   # 部署门豁免留痕(2026-07-18 门禁审计):deploy-v5.sh 在 V5_SMOKE_TURN=0/V5_SMOKE_E2E=0
   # 豁免时写 /var/lib/openclaude-v5/smoke-waiver-<gate>.json,对应门后续真跑通过才清除。
@@ -444,7 +462,8 @@ check_severity() {
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化。均按 warning。
     # smoke_waiver/e2e_flake = 部署验证债与门 flake 记账,值得看但非现网故障。
     # e2e_probe 依赖部署发起机在线,失联概率高于现网故障,先按 warning(稳定后可升级)。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake|e2e_probe) echo warning ;;
+    # mail_key_sync = 回灌哑弹预警(尚未爆),warning;真断邮由 mail 检查按 critical 报。
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake|e2e_probe|mail_key_sync) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -481,6 +500,7 @@ check_mail
 check_turn_failures
 check_kp_plugin
 check_client_4xx_storm
+check_mail_key_sync
 check_smoke_waiver
 check_e2e_flake
 check_probe_result turn_probe /var/lib/openclaude-v5/turn-probe.json 1800 "持续 turn 探针"

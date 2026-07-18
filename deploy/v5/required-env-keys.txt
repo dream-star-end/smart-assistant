@@ -1,0 +1,16 @@
+# v5 生产 env 必备键清单(2026-07-18 门禁审计批E)。
+# deploy-v5.sh assert_env_required_keys 在激活前 fail-closed 校验:远端 $V5_ENV 必须
+# 含以下每个键(只查存在性,不查值——值的权威=现网文件,见 bootstrap 存在性守卫)。
+# 背景:07-08/07-11 Resend 两断 = env 双源回灌冲掉热修密钥,静默断数天。存在性校验
+# 挡的是"键整个丢了"这类灾难面;新增关键凭据/开关键时必须同步登记此清单
+# (v5ReleaseSafety.test.ts 锁定清单文件与门的接线)。
+DATABASE_URL
+RESEND_API_KEY
+MAIL_FROM
+OC_EGRESS_SECRET
+OC_RUNTIME_CHANNEL
+OC_RUNTIME_IMAGE
+OC_RUNTIME_IMAGE_ID
+OC_INSTANCE_ID
+INTERNAL_CONTROL_PORT
+INTERNAL_PROXY_PORT

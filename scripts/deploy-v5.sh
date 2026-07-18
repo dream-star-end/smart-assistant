@@ -4146,6 +4146,43 @@ knowledge_planet_plugin_smoke_gate() { # <pinned master release>
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --smoke-only"
 }
 
+# ── env 必备键门(2026-07-18 门禁审计批E):激活前 fail-closed 校验远端 $V5_ENV 含
+# deploy/v5/required-env-keys.txt 的每个键。只查存在性不查值(值权威=现网文件)。
+# 背景:07-08/07-11 Resend 两断=env 双源回灌冲掉热修密钥,静默断数天——键丢失类灾难
+# 此前无任何提交前/部署前防线。新增关键键必须同步登记清单。
+assert_env_required_keys() {
+  local manifest="$REPO_ROOT/deploy/v5/required-env-keys.txt" keys missing
+  [[ -f "$manifest" ]] || { echo "✗ env 必备键清单缺失:$manifest" >&2; return 1; }
+  keys="$(grep -v -e '^[[:space:]]*$' -e '^#' "$manifest")"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] assert env required keys($(wc -l <<<"$keys") 个)@ $V5_ENV"
+    return 0
+  fi
+  missing="$(ssh "$KL_HOST" bash -s -- "$V5_ENV" <<REMOTE
+set -euo pipefail
+env_file="\$1"
+[[ -f "\$env_file" ]] || { echo "__ENV_FILE_MISSING__"; exit 0; }
+while IFS= read -r k; do
+  [[ -n "\$k" ]] || continue
+  grep -q "^\$k=" "\$env_file" || echo "\$k"
+done <<'KEYS'
+$keys
+KEYS
+REMOTE
+)" || { echo "✗ env 必备键校验执行失败(ssh/远端错误)" >&2; return 1; }
+  if [[ "$missing" == "__ENV_FILE_MISSING__" ]]; then
+    echo "✗ 远端 env 文件不存在:$V5_ENV(先跑 bootstrap)" >&2
+    return 1
+  fi
+  if [[ -n "$missing" ]]; then
+    echo "✗ 远端 $V5_ENV 缺必备键(键丢失=Resend 断邮类静默灾难面,拒绝激活):" >&2
+    sed 's/^/    /' <<<"$missing" >&2
+    echo "  修复:补齐键后重试;确属退役键则从 deploy/v5/required-env-keys.txt 删行。" >&2
+    return 1
+  fi
+  echo "  ✓ env 必备键齐全($(wc -l <<<"$keys") 个)"
+}
+
 # ── 豁免留痕(2026-07-18 门禁审计):V5_SMOKE_TURN=0 / V5_SMOKE_E2E=0 是部署链上仅存的
 # 显式 fail-open 逃逸口。豁免必须"可见":豁免即写 kl-mirror 持久 marker,v5-monitor 持续
 # warning 告警,直到对应门在后续任意 lane 真跑通过(smoke_* 成功即清除)。禁止手工删 marker。
@@ -4677,6 +4714,8 @@ deploy() {
   fi
   echo "── 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
+  echo "── env 必备键门(批E):激活前校验远端 env 键齐全 ──"
+  assert_env_required_keys
   # build_release:从锁定 sha 的 git archive 建不可变 release(--with-dist 时 vite build 进
   # reldir,代码+前端同一 release 共享一次翻转+重启;无 --with-dist 则硬链继承当前 dist)。
   # 背景(2026-07-10 事故):deploy 后紧跟 --dist 的成对重启会把刚续写的 turn 二次掐死 →
@@ -5099,6 +5138,8 @@ deploy_dist() {
   assert_no_rollout_in_progress
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
+  echo "── env 必备键门(批E):激活前校验远端 env 键齐全 ──"
+  assert_env_required_keys
   WITH_DIST=1   # 蓝绿:前端变更=建含新 dist 的完整 release + 原子翻转(同 deploy,一次重启)
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
   knowledge_planet_plugin_assert_release_compatible "$BUILT_RELEASE" "$BUILT_RELEASE" \
