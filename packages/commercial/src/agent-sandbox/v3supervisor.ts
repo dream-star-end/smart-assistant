@@ -65,6 +65,7 @@ import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js"
 import type { ComputeHostRow } from "../compute-pool/types.js";
 import { computeInboundNonce } from "../bridgeSecret.js";
 import { v3MayServe } from "../channelMigration/channelState.js";
+import { containerSubnetPrefixForChannel } from "../containerNet.js";
 import { codexBindingAffinityKey, dockerContainerOwnedByChannel, getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
@@ -124,8 +125,9 @@ export const V3_INTERNAL_PROXY_URL = "http://172.30.0.1:18791";
 
 // P1d v5 容器网络 channel 化:v5 容器落 openclaude-v5-net(172.31/16),egress 走 v5 自己的
 // 内部代理(172.31.0.1:18892),与 v3(172.30/172.30.0.1:18791)物理隔离。v3 取值不变。
+// 网段值收口 containerNet(单一权威;SSRF 白名单/bound_ip 校验同源,禁复制)。
 function ocSubnetPrefixForChannel(): string {
-  return getRuntimeChannel() === "v5" ? "172.31" : "172.30";
+  return containerSubnetPrefixForChannel();
 }
 // 导出:内部代理 gateway IP / port 是"容器 egress 目标"与"master 监听 bind"的【单一权威】。
 // index.ts 启动期用它校验 INTERNAL_PROXY_BIND/PORT env 与 channel 期望一致(消双权威错位)。
