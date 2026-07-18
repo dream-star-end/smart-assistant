@@ -765,6 +765,7 @@ export async function handleMarketplaceDetail(
     ...detail,
     ...marketplaceArtifactCompatibility(detail.kind, detail.pluginType),
   }
+  delete (publicDetail as { riskFlags?: unknown }).riskFlags
   const capabilityReadiness =
     detail.kind === 'agent'
       ? await getAgentCapabilityReadiness(uid(user), slug, detail.versionId, { preset })

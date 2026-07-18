@@ -180,6 +180,13 @@ describe('0168 Knowledge Planet automation migration', () => {
       }),
       call: async (input: { actionId: string }) => {
         if (input.actionId === 'get_group') return { group: { id: groupId } }
+        if (input.actionId === 'list_groups')
+          return {
+            groups: [
+              { id: groupId, name: '产品星球', memberCount: 120 },
+              { id: '323456789', name: '用户星球', memberCount: 80 },
+            ],
+          }
         if (input.actionId === 'list_topics')
           return { topics: [{ id: '223456789', createdAt: '2026-07-18T00:00:00.000Z' }] }
         throw new Error(`unexpected action ${input.actionId}`)
@@ -230,5 +237,31 @@ describe('0168 Knowledge Planet automation migration', () => {
 
     await service.deleteRule(userId, targetId, created.id)
     assert.equal((await service.get(userId, targetId)).rules.length, 0)
+
+    assert.deepEqual(await service.listGroups(userId, targetId), [
+      { id: groupId, name: '产品星球', memberCount: 120 },
+      { id: '323456789', name: '用户星球', memberCount: 80 },
+    ])
+    const batch = await service.createRulesBatch({
+      userId,
+      targetId,
+      groupIds: [groupId, '323456789'],
+      name: '批量规则',
+      instructions: '只回复明确提问，不确定就跳过。',
+      triggerKind: 'new_question',
+    })
+    assert.equal(batch.length, 2)
+    assert.ok(batch.every((rule) => rule.enabled && rule.lastCursorAt !== null))
+    const cursors = await query<{ group_id: string; cursor_topic_id: string | null }>(
+      `SELECT group_id, cursor_topic_id
+         FROM plugin_automation_rules
+        WHERE connection_id = $1::bigint AND deleted_at IS NULL
+        ORDER BY group_id`,
+      [targetId],
+    )
+    assert.deepEqual(cursors.rows, [
+      { group_id: groupId, cursor_topic_id: null },
+      { group_id: '323456789', cursor_topic_id: null },
+    ])
   })
 })

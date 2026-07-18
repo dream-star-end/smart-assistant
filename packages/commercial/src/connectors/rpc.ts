@@ -756,6 +756,28 @@ async function handleCall(
           actionId,
           params: body.params ?? {},
         })
+        if (proposed.approvalMode === 'account_preapproval') {
+          const executed = await rt.deps.pluginFacade.executeConfirmedWrite({
+            userId: who.userId,
+            targetId: body.connectionId,
+            confirmId: proposed.confirmId,
+          })
+          if (executed.kind === 'in_progress') {
+            sendEnvelope(res, { kind: 'in_progress', id: proposed.confirmId })
+            return
+          }
+          if (executed.kind === 'replay') {
+            sendEnvelope(res, {
+              kind: 'replay',
+              status: executed.status,
+              ...(executed.errorCode ? { errorCode: executed.errorCode } : {}),
+              ...(executed.resultDigest ? { resultDigest: executed.resultDigest } : {}),
+            })
+            return
+          }
+          sendEnvelope(res, { kind: 'result', result: executed.result, pluginType })
+          return
+        }
         sendEnvelope(res, {
           kind: 'confirmation_required',
           id: proposed.confirmId,

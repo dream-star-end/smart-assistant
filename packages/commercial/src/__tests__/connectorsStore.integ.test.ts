@@ -460,6 +460,30 @@ describe('connector_write_ledger 状态机', () => {
     assert.equal(row.params_enc!.includes(Buffer.from('canary_params_v1')), false)
   })
 
+  test('account preapproval is durably attributed and starts approved without a second mutation', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const { connection } = await mkConnection(uid)
+    const proposal = await proposeWrite({
+      userId: uid,
+      connectionId: connection.id,
+      connectionRevision: connection.revision,
+      provider: 'notion',
+      action: 'create_page',
+      params: { parentPageId: 'a'.repeat(32), title: '预授权', content: '正文' },
+      summary: '账号预授权写入',
+      approval: { source: 'account_preapproval', policyVersion: 1 },
+    })
+    const row = await getLedgerRow(proposal.id, uid)
+    assert.ok(row)
+    assert.equal(row.status, 'approved')
+    assert.equal(row.approval_source, 'account_preapproval')
+    assert.equal(row.approval_policy_version, 1)
+    assert.ok(row.approved_at)
+    const begun = await beginExec(proposal.id, uid, connection.id)
+    assert.equal(begun.kind, 'ok')
+  })
+
   test('approve:CAS + expires_at 重设执行窗口;重复 approve 幂等', async (t) => {
     if (skipIfNoDb(t)) return
     const uid = await mkUser()

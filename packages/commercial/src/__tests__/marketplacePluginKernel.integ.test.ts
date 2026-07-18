@@ -1270,12 +1270,18 @@ describe('marketplace Plugin kernel migration', () => {
         env: process.env,
         browserRuntime: { supportsContract: () => true } as never,
       })
-      assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 17)
+      assert.equal(
+        (await facade.catalog(activeUserId))[0]?.actions.length,
+        KNOWLEDGE_PLANET_PLUGIN_ARTIFACT.actions.length,
+      )
       const offTarget = (await facade.list(activeUserId)).find(
         (target) => target.id === activeAccount.id,
       )
       assert.ok(offTarget)
-      assert.equal(offTarget.actions.length, 15)
+      assert.equal(
+        offTarget.actions.length,
+        KNOWLEDGE_PLANET_PLUGIN_ARTIFACT.actions.filter((action) => action.effect === 'read').length,
+      )
       assert.equal(
         offTarget.actions.some((action) => !action.readOnly),
         false,
@@ -1295,8 +1301,12 @@ describe('marketplace Plugin kernel migration', () => {
         { available: true, enabled: false, acceptedVersion: null, acceptedAt: null },
       )
       assert.match(offControl.disclaimerText, /真实知识星球身份/)
-      assert.match(offControl.disclaimerText, /每一次发布或评论仍须由你在对话确认卡中单独确认/)
+      assert.match(offControl.disclaimerText, /每一次操作仍须由你在对话确认卡中单独批准/)
       assert.match(offControl.disclaimerText, /不会自动重试/)
+      assert.equal(offControl.preapproval.available, true)
+      assert.equal(offControl.preapproval.enabled, false)
+      assert.equal(offControl.preapproval.acceptedVersion, null)
+      assert.match(offControl.preapproval.disclaimerText ?? '', /免逐次确认/)
       await assert.rejects(
         facade.proposeWrite({
           userId: activeUserId,
@@ -1332,10 +1342,18 @@ describe('marketplace Plugin kernel migration', () => {
         (target) => target.id === activeAccount.id,
       )
       assert.ok(onTarget)
-      assert.equal(onTarget.actions.length, 17)
+      assert.equal(onTarget.actions.length, KNOWLEDGE_PLANET_PLUGIN_ARTIFACT.actions.length)
       assert.deepEqual(
         onTarget.actions.filter((action) => !action.readOnly).map((action) => action.id),
-        ['create_topic', 'create_comment'],
+        [
+          'create_topic',
+          'create_comment',
+          'edit_topic',
+          'delete_topic',
+          'delete_comment',
+          'set_topic_like',
+          'set_comment_like',
+        ],
       )
 
       const staleProposal = await facade.proposeWrite({
@@ -1370,6 +1388,82 @@ describe('marketplace Plugin kernel migration', () => {
         accepted: true,
         disclaimerVersion: offControl.disclaimerVersion,
       })
+      const preapprovedControl = await facade.setManagedAccountWritePreapproval({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: enabledControl.preapproval.disclaimerVersion!,
+      })
+      assert.equal(preapprovedControl.preapproval.enabled, true)
+      assert.ok(preapprovedControl.preapproval.acceptedAt)
+      const preapprovedProposal = await facade.proposeWrite({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        actionId: 'set_topic_like',
+        params: { topicId: '987654', liked: true },
+      })
+      assert.equal(preapprovedProposal.approvalMode, 'account_preapproval')
+      const preapprovedLedger = await getLedgerRow(
+        preapprovedProposal.confirmId,
+        activeUserId,
+        getPool(),
+      )
+      assert.equal(preapprovedLedger?.status, 'approved')
+      assert.equal(preapprovedLedger?.approval_source, 'account_preapproval')
+      assert.equal(
+        preapprovedLedger?.approval_policy_version,
+        enabledControl.preapproval.disclaimerVersion,
+      )
+      let preapprovedDispatches = 0
+      const preapprovedFacade = new PluginRuntimeFacade({
+        pool: getPool(),
+        redis: transitionRedis,
+        env: process.env,
+        browserRuntime: {
+          supportsContract: () => true,
+          async runAction(input: {
+            storageState: unknown
+            beforeDispatch: () => Promise<void>
+          }) {
+            await input.beforeDispatch()
+            preapprovedDispatches += 1
+            return { result: { liked: true }, storageState: input.storageState }
+          },
+        } as never,
+      })
+      assert.deepEqual(
+        await preapprovedFacade.executeConfirmedWrite({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          confirmId: preapprovedProposal.confirmId,
+        }),
+        { kind: 'result', result: { liked: true } },
+      )
+      assert.equal(preapprovedDispatches, 1)
+      assert.equal(
+        (await getLedgerRow(preapprovedProposal.confirmId, activeUserId, getPool()))?.status,
+        'succeeded',
+      )
+      const disableRaceProposal = await preapprovedFacade.proposeWrite({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        actionId: 'set_topic_like',
+        params: { topicId: '987654', liked: false },
+      })
+      await facade.setManagedAccountWritePreapproval({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        enabled: false,
+      })
+      await assert.rejects(
+        facade.executeConfirmedWrite({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          confirmId: disableRaceProposal.confirmId,
+        }),
+        (error: unknown) => error instanceof ConnectorError && error.code === 'REVISION_MISMATCH',
+      )
       const uncertainProposal = await facade.proposeWrite({
         userId: activeUserId,
         targetId: activeAccount.id,
@@ -1384,7 +1478,8 @@ describe('marketplace Plugin kernel migration', () => {
         env: process.env,
         browserRuntime: {
           supportsContract: () => true,
-          async runAction() {
+          async runAction(input: { beforeDispatch: () => Promise<void> }) {
+            await input.beforeDispatch()
             dispatches += 1
             throw new Error('ambiguous worker exit')
           },
@@ -1631,7 +1726,10 @@ describe('marketplace Plugin kernel migration', () => {
         expectedExecContractHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.execContractHash,
         env: process.env,
       })
-      assert.equal((await facade.catalog(activeUserId))[0]?.actions.length, 17)
+      assert.equal(
+        (await facade.catalog(activeUserId))[0]?.actions.length,
+        KNOWLEDGE_PLANET_PLUGIN_ARTIFACT.actions.length,
+      )
       const twiceMigratedActive = await getPluginAccount(
         activeAccount.id,
         activeUserId,

@@ -48,7 +48,11 @@ const TRANSITION_ACCOUNT_COLUMNS = `c.id::text AS id, c.user_id::int AS user_id,
   c.secret_enc, c.secret_nonce, c.revision,
   c.secret_generation::text AS secret_generation,
   c.connector_version_id::text AS connector_version_id, c.spec_hash,
-  c.exec_contract_hash, c.auth_contract_version, c.status, c.meta, c.revoked_at`
+  c.exec_contract_hash, c.auth_contract_version,
+  c.plugin_write_enabled, c.plugin_write_disclaimer_version,
+  c.plugin_write_disclaimer_accepted_at, c.plugin_write_preapproval_enabled,
+  c.plugin_write_preapproval_disclaimer_version,
+  c.plugin_write_preapproval_accepted_at, c.status, c.meta, c.revoked_at`
 
 async function readCensus(
   runner: Pool | PoolClient,

@@ -84,6 +84,12 @@ export interface KnowledgePlanetAutomationView {
   recentRuns: KnowledgePlanetAutomationRunView[]
 }
 
+export interface KnowledgePlanetAutomationGroupView {
+  id: string
+  name: string
+  memberCount: number | null
+}
+
 interface AccountRow {
   id: string
   status: string
@@ -311,6 +317,46 @@ export class KnowledgePlanetAutomationService {
     }
   }
 
+  async listGroups(
+    userId: number,
+    targetId: string,
+  ): Promise<KnowledgePlanetAutomationGroupView[]> {
+    assertTargetId(targetId)
+    await this.assertExecutableAccount(userId, targetId)
+    const result = (await this.runtime.call({
+      userId,
+      targetId,
+      actionId: 'list_groups',
+      params: {},
+    })) as {
+      groups?: Array<{ id?: unknown; name?: unknown; memberCount?: unknown }>
+    }
+    const seen = new Set<string>()
+    const groups: KnowledgePlanetAutomationGroupView[] = []
+    for (const candidate of result.groups ?? []) {
+      if (
+        typeof candidate.id !== 'string' ||
+        !GROUP_ID_RE.test(candidate.id) ||
+        seen.has(candidate.id) ||
+        typeof candidate.name !== 'string'
+      )
+        continue
+      const name = candidate.name.trim().slice(0, 256)
+      if (!name) continue
+      seen.add(candidate.id)
+      groups.push({
+        id: candidate.id,
+        name,
+        memberCount:
+          Number.isInteger(candidate.memberCount) && Number(candidate.memberCount) >= 0
+            ? Number(candidate.memberCount)
+            : null,
+      })
+      if (groups.length === 50) break
+    }
+    return groups
+  }
+
   async setControl(input: {
     userId: number
     targetId: string
@@ -478,6 +524,115 @@ export class KnowledgePlanetAutomationService {
       }
     }, this.pool)
     return mapRule(row)
+  }
+
+  async createRulesBatch(input: {
+    userId: number
+    targetId: string
+    groupIds: string[]
+    name: string
+    instructions: string
+    triggerKind?: 'new_topic' | 'new_question'
+    dailyLimit?: number
+    cooldownMinutes?: number
+    maxReplyChars?: number
+  }): Promise<KnowledgePlanetAutomationRuleView[]> {
+    assertTargetId(input.targetId)
+    if (!Array.isArray(input.groupIds) || input.groupIds.length < 1 || input.groupIds.length > 10)
+      throw new KnowledgePlanetAutomationError('BAD_REQUEST', 'groupIds is invalid')
+    const groupIds = input.groupIds.map((value) => {
+      if (typeof value !== 'string' || !GROUP_ID_RE.test(value))
+        throw new KnowledgePlanetAutomationError('BAD_REQUEST', 'groupIds is invalid')
+      return value
+    })
+    if (new Set(groupIds).size !== groupIds.length)
+      throw new KnowledgePlanetAutomationError('BAD_REQUEST', 'groupIds contains duplicates')
+    const name = boundedString(input.name, 1, 100, 'name')
+    const instructions = boundedString(input.instructions, 1, 4_000, 'instructions')
+    const triggerKind = input.triggerKind ?? 'new_topic'
+    if (!['new_topic', 'new_question'].includes(triggerKind))
+      throw new KnowledgePlanetAutomationError('BAD_REQUEST', 'triggerKind is invalid')
+    const dailyLimit = boundedInteger(input.dailyLimit ?? 5, 1, 10, 'dailyLimit')
+    const cooldownMinutes = boundedInteger(input.cooldownMinutes ?? 15, 5, 1_440, 'cooldownMinutes')
+    const maxReplyChars = boundedInteger(input.maxReplyChars ?? 800, 100, 1_200, 'maxReplyChars')
+
+    const liveGroups = await this.listGroups(input.userId, input.targetId)
+    const liveGroupIds = new Set(liveGroups.map((group) => group.id))
+    if (groupIds.some((groupId) => !liveGroupIds.has(groupId)))
+      throw new KnowledgePlanetAutomationError(
+        'BAD_REQUEST',
+        'One or more Knowledge Planet groups are unavailable',
+      )
+
+    const rows = await tx(async (client) => {
+      const account = await lockAccount(client, input.userId, input.targetId)
+      assertManualWriteEnabled(account)
+      const control = await client.query<ControlRow>(
+        `SELECT enabled, disclaimer_version, disclaimer_accepted_at,
+                account_daily_limit, paused_reason
+           FROM plugin_automation_controls
+          WHERE connection_id = $1::bigint AND user_id = $2
+          FOR UPDATE`,
+        [input.targetId, input.userId],
+      )
+      if (!mapControl(control.rows[0], true).enabled)
+        throw new KnowledgePlanetAutomationError(
+          'CONSENT_REQUIRED',
+          'Unattended automation must be enabled first',
+        )
+      const existing = await client.query<{ group_id: string }>(
+        `SELECT group_id FROM plugin_automation_rules
+          WHERE connection_id = $1::bigint AND user_id = $2 AND deleted_at IS NULL
+          FOR UPDATE`,
+        [input.targetId, input.userId],
+      )
+      if (existing.rows.length + groupIds.length > 10)
+        throw new KnowledgePlanetAutomationError('CONFLICT', 'Automation rule limit reached')
+      const configured = new Set(existing.rows.map((row) => row.group_id))
+      if (groupIds.some((groupId) => configured.has(groupId)))
+        throw new KnowledgePlanetAutomationError(
+          'CONFLICT',
+          'Only one automation rule is allowed per group',
+        )
+
+      const created: RuleRow[] = []
+      try {
+        for (const groupId of groupIds) {
+          const result = await client.query<RuleRow>(
+            `INSERT INTO plugin_automation_rules
+               (connection_id, user_id, group_id, name, instructions, trigger_kind,
+                enabled, cursor_topic_id, cursor_created_at, next_run_at,
+                daily_limit, cooldown_minutes, max_reply_chars)
+             VALUES ($1::bigint, $2, $3, $4, $5, $6,
+                     TRUE, NULL, now(), now(), $7, $8, $9)
+             RETURNING id::text AS id, group_id, name, instructions, trigger_kind, enabled,
+                       cursor_created_at, next_run_at, daily_limit, cooldown_minutes,
+                       max_reply_chars, consecutive_failures, paused_reason, created_at, updated_at`,
+            [
+              input.targetId,
+              input.userId,
+              groupId,
+              name,
+              instructions,
+              triggerKind,
+              dailyLimit,
+              cooldownMinutes,
+              maxReplyChars,
+            ],
+          )
+          created.push(result.rows[0]!)
+        }
+      } catch (error) {
+        if ((error as { code?: unknown })?.code === '23505')
+          throw new KnowledgePlanetAutomationError(
+            'CONFLICT',
+            'Only one automation rule is allowed per group',
+          )
+        throw error
+      }
+      return created
+    }, this.pool)
+    return rows.map(mapRule)
   }
 
   async patchRule(input: {

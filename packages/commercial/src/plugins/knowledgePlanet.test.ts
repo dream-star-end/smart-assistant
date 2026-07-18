@@ -91,11 +91,11 @@ describe('official Knowledge Planet Plugin', () => {
       }),
       'current',
     )
-    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 3)
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 4)
     assert.deepEqual(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0], {
-      version: '1.2.0',
-      artifactHash: 'ee306d2ede7fe277084e842687ff798317ada778aeda942e31bb5770c83f0824',
-      execContractHash: '240e3cfe91898d8cb13ba983a05f0cf1082ccee57a22d27674ebd409f894f949',
+      version: '1.3.0',
+      artifactHash: '1dbcb8d8861ae812431277e0144c93dd6018f0ba47b1ea359a8dcfb173a0c258',
+      execContractHash: 'ae7f8dab13127f098d5e7aa676556c0c00354d12dbf1df632bc0e9dfa766a898',
     })
     for (const predecessor of KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS)
       assert.equal(classifyKnowledgePlanetSetupPin(predecessor), 'compatible-predecessor')
@@ -144,8 +144,8 @@ describe('official Knowledge Planet Plugin', () => {
     )
   })
 
-  test('v1.3 exposes bounded reads plus confirmed rich writes without credential-bearing results', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.3.0')
+  test('v1.4 exposes bounded reads plus default-confirmed or account-preapproved rich writes without credential-bearing results', () => {
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.4.0')
     assert.equal(KNOWLEDGE_PLANET_DRIVER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.equal(KNOWLEDGE_PLANET_LAUNCHER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.deepEqual(
@@ -176,6 +176,12 @@ describe('official Knowledge Planet Plugin', () => {
         'set_comment_like',
       ],
     )
+    for (const action of KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.filter(
+      (candidate) => candidate.effect === 'write',
+    )) {
+      assert.match(action.description, /默认逐次确认/)
+      assert.match(action.description, /免确认/)
+    }
     const forbidden = /(?:url|uri|href|token|cookie|header|signature|secret)/i
     const visit = (schema: unknown): void => {
       if (!schema || typeof schema !== 'object') return
