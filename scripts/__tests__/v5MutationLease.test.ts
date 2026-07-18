@@ -129,6 +129,56 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
     assert.match(out.stdout, /\bMETA_CLEARED\b/, out.stdout)
   })
 
+  test('reclaim clears stale metadata under a free flock without signalling a reused live pid', async () => {
+    const fx = await fixture(3600)
+    const out = orchestrate(
+      [
+        'sleep 30 & OTHER=$!',
+        `printf '{"schema":1,"remote_pid":%s,"started_at":1,"ttl":1,"deploy_id":"old","holder_host":"old","mode":"deploy"}\\n' "$OTHER" > "${fx.meta}"`,
+        'reclaim_production_mutation_lease 2>&1 | grep -o "CLEAN:no-meta-lock-free" | head -1',
+        'kill -0 "$OTHER" 2>/dev/null && echo OTHER_ALIVE',
+        `[ -f "${fx.meta}" ] || echo META_CLEARED`,
+        'kill "$OTHER" 2>/dev/null; wait "$OTHER" 2>/dev/null',
+        'true',
+      ].join('\n'),
+      fx.env,
+    )
+    assert.equal(out.status, 0, out.stderr)
+    assert.match(out.stdout, /\bCLEAN:no-meta-lock-free\b/, out.stdout)
+    assert.match(out.stdout, /\bOTHER_ALIVE\b/, `reclaim signalled an unrelated live pid\n${out.stdout}`)
+    assert.match(out.stdout, /\bMETA_CLEARED\b/, out.stdout)
+  })
+
+  test('reclaim never lets force bypass exact flock-owner proof', async () => {
+    const fx = await fixture(3600)
+    const release = path.join(fx.dir, 'release-locker')
+    const out = orchestrate(
+      [
+        `flock "${fx.lock}" bash -c 'while [ ! -e "${release}" ]; do sleep 0.05; done' & LOCKER=$!`,
+        `for _ in $(seq 1 100); do flock -n "${fx.lock}" true 2>/dev/null || break; sleep 0.05; done`,
+        'sleep 30 & OTHER=$!',
+        `printf '{"schema":1,"remote_pid":%s,"started_at":1,"ttl":1,"deploy_id":"wrong","holder_host":"wrong","mode":"deploy"}\\n' "$OTHER" > "${fx.meta}"`,
+        'reclaim_production_mutation_lease 2>&1 | grep -o "REFUSE:holder-identity-mismatch" | head -1',
+        'OC_V5_RECLAIM_FORCE=1 reclaim_production_mutation_lease 2>&1 | grep -o "REFUSE:holder-identity-mismatch" | head -1',
+        'kill -0 "$LOCKER" 2>/dev/null && echo LOCKER_ALIVE',
+        'kill -0 "$OTHER" 2>/dev/null && echo OTHER_ALIVE',
+        `: > "${release}"`,
+        'wait "$LOCKER" 2>/dev/null',
+        'kill "$OTHER" 2>/dev/null; wait "$OTHER" 2>/dev/null',
+        'true',
+      ].join('\n'),
+      fx.env,
+    )
+    assert.equal(out.status, 0, out.stderr)
+    assert.equal(
+      (out.stdout.match(/\bREFUSE:holder-identity-mismatch\b/g) ?? []).length,
+      2,
+      out.stdout,
+    )
+    assert.match(out.stdout, /\bLOCKER_ALIVE\b/, `reclaim killed the real lock owner\n${out.stdout}`)
+    assert.match(out.stdout, /\bOTHER_ALIVE\b/, `reclaim killed the unrelated metadata pid\n${out.stdout}`)
+  })
+
   test('reclaim cleans a stale meta whose holder process is already dead', async () => {
     const fx = await fixture(3600)
     const out = orchestrate(
@@ -140,7 +190,9 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
         `RPID=$(sed -n 's/.*"remote_pid":\\([0-9]*\\).*/\\1/p' "${fx.meta}")`,
         'kill -9 "$RPID" 2>/dev/null',
         'kill -9 "$KEEPER" 2>/dev/null; wait "$KEEPER" 2>/dev/null',
-        'sleep 0.5',
+        // holder loop 的在飞 sleep 继承 fd9，最多再持锁约 1s；reclaim 只有在内核
+        // flock 真空闲后才能宣告 CLEAN，而不能只凭 holder PID 已死猜测。
+        `for _ in $(seq 1 50); do flock -n "${fx.lock}" true 2>/dev/null && break; sleep 0.1; done`,
         `[ -f "${fx.meta}" ] && echo STALE_META_REMAINS`,
         'reclaim_production_mutation_lease 2>&1 | grep -oE "CLEAN:(stale|no-meta-lock-free)" | head -1',
         `[ -f "${fx.meta}" ] || echo META_CLEARED`,

@@ -1074,16 +1074,19 @@ set -Eeuo pipefail
 lock="$1"; meta="$2"; force="$3"
 [ "$force" = 1 ] || force=0
 now="$(date +%s)"
-# 锁空闲判定:独立 fd flock -n 拿到 = 无任何 OFD 持锁(holder 已死,内核已释放 flock)。
-lock_free=0
-if [ -e "$lock" ]; then
-  if exec 8>"$lock" 2>/dev/null && flock -n 8 2>/dev/null; then lock_free=1; flock -u 8 2>/dev/null || true; fi
+# 独立 probe 若能取锁，必须**保持到 meta 清完**：这既证明旧 holder 已无 OFD flock，
+# 也堵住“probe 解锁→新 holder 插入→误删新 meta”的 TOCTOU。此分支绝不读取/发送
+# meta PID（旧 PID 可能已被无关进程复用）。
+exec 8>"$lock" 2>/dev/null || { echo "ERROR:lock-open-failed"; exit 0; }
+if flock -n 8 2>/dev/null; then
+  rm -f "$meta" 2>/dev/null || true
+  echo "CLEAN:no-meta-lock-free"
+  flock -u 8 2>/dev/null || true
   exec 8>&- 2>/dev/null || true
-else
-  lock_free=1
+  exit 0
 fi
+exec 8>&- 2>/dev/null || true
 if [ ! -f "$meta" ]; then
-  if [ "$lock_free" = 1 ]; then echo "CLEAN:no-meta-lock-free"; exit 0; fi
   echo "REFUSE:lock-held-without-meta(有 OFD 持锁但无 fencing meta;拒绝盲清)"; exit 0
 fi
 command -v jq >/dev/null 2>&1 || { echo "ERROR:jq-missing"; exit 0; }
@@ -1096,23 +1099,74 @@ hmode="$(jq -r '.mode // empty' "$meta" 2>/dev/null || true)"
 case "$rpid" in ''|*[!0-9]*) echo "REFUSE:meta-unparseable"; exit 0 ;; esac
 case "$started" in ''|*[!0-9]*) started=0 ;; esac
 case "$ttl" in ''|*[!0-9]*) ttl=0 ;; esac
+lock_id="$(stat -L -c '%d:%i' "$lock" 2>/dev/null || true)"
+case "$lock_id" in ''|*[!0-9:]*) echo "ERROR:lock-stat-failed"; exit 0 ;; esac
+lock_inode="${lock_id##*:}"
+pid_owns_lock() {
+  pid="$1"
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -d "/proc/$pid/fd" ] || return 1
+  for fd_path in "/proc/$pid"/fd/*; do
+    [ -e "$fd_path" ] || continue
+    [ "$(stat -L -c '%d:%i' "$fd_path" 2>/dev/null || true)" = "$lock_id" ] || continue
+    fd="${fd_path##*/}"
+    grep -Eq "^lock:.*[[:space:]]FLOCK[[:space:]]+ADVISORY[[:space:]]+WRITE[[:space:]]+.*:${lock_inode}[[:space:]]" \
+      "/proc/$pid/fdinfo/$fd" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# kill -0 只证明 PID 存在，不能证明它仍是 meta 所指 holder。真正授权信号的证据是：
+# 同一 PID 的某 fd 指向当前 lock dev:inode，且该 fdinfo 直证 FLOCK WRITE。
 holder_alive=0; kill -0 "$rpid" 2>/dev/null && holder_alive=1
+if [ "$holder_alive" != 1 ] || ! pid_owns_lock "$rpid"; then
+  echo "REFUSE:holder-identity-mismatch pid=$rpid deploy_id=$did"
+  exit 0
+fi
 age=$(( now - started ))
 stale=0
-[ "$holder_alive" = 0 ] && stale=1
 [ "$ttl" -gt 0 ] && [ "$age" -ge "$ttl" ] && stale=1
 if [ "$stale" = 0 ] && [ "$force" != 1 ]; then
   printf 'REFUSE:holder-live pid=%s host=%s mode=%s age=%ss ttl=%ss deploy_id=%s\n' "$rpid" "$hhost" "$hmode" "$age" "$ttl" "$did"
   exit 0
 fi
 reason=stale; [ "$stale" = 0 ] && reason=forced
-if [ "$holder_alive" = 1 ]; then
-  kill -TERM "$rpid" 2>/dev/null || true
-  i=0; while [ "$i" -lt 5 ]; do kill -0 "$rpid" 2>/dev/null || break; sleep 1; i=$((i+1)); done
-  kill -0 "$rpid" 2>/dev/null && kill -KILL "$rpid" 2>/dev/null || true
+# 发 TERM 前重验，禁止 fd close / PID reuse 窗把信号送给无关进程。
+pid_owns_lock "$rpid" || { echo "REFUSE:holder-identity-changed pid=$rpid"; exit 0; }
+kill -TERM "$rpid" 2>/dev/null || true
+
+# 等 holder 正常 trap 退出；若仍持锁，KILL 前再次证明**同一个 PID 仍持同一 flock**。
+i=0
+while [ "$i" -lt 5 ]; do
+  exec 8>"$lock" 2>/dev/null || { echo "ERROR:lock-open-failed"; exit 0; }
+  if flock -n 8 2>/dev/null; then break; fi
+  exec 8>&- 2>/dev/null || true
+  sleep 1
+  i=$((i+1))
+done
+if ! flock -n 8 2>/dev/null; then
+  exec 8>&- 2>/dev/null || true
+  pid_owns_lock "$rpid" || { echo "REFUSE:holder-identity-changed-before-kill pid=$rpid"; exit 0; }
+  kill -KILL "$rpid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 5 ]; do
+    exec 8>"$lock" 2>/dev/null || { echo "ERROR:lock-open-failed"; exit 0; }
+    if flock -n 8 2>/dev/null; then break; fi
+    exec 8>&- 2>/dev/null || true
+    sleep 1
+    i=$((i+1))
+  done
+fi
+# 只有 probe 现持 flock 才能删 meta / 宣告 CLEAN；否则未知 holder 仍在，fail-closed。
+if ! flock -n 8 2>/dev/null; then
+  exec 8>&- 2>/dev/null || true
+  echo "REFUSE:termination-unconfirmed pid=$rpid"
+  exit 0
 fi
 rm -f "$meta" 2>/dev/null || true
 printf 'CLEAN:%s pid=%s host=%s mode=%s age=%ss ttl=%ss deploy_id=%s\n' "$reason" "$rpid" "$hhost" "$hmode" "$age" "$ttl" "$did"
+flock -u 8 2>/dev/null || true
+exec 8>&- 2>/dev/null || true
 exit 0
 REMOTE
   )"; then
