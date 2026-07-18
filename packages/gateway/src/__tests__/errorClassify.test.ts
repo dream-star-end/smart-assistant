@@ -5,7 +5,11 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { classifyDelegateOutputError, classifyRunError } from '../errorClassify.js'
+import {
+  classifiedMessageForCode,
+  classifyDelegateOutputError,
+  classifyRunError,
+} from '../errorClassify.js'
 
 describe('classifyRunError', () => {
   it('insufficient_credits: anthropicProxy 402 INSUFFICIENT_CREDITS', () => {
@@ -42,8 +46,57 @@ describe('classifyRunError', () => {
   })
 
   it('upstream_failed: ACCOUNT_POOL_BUSY', () => {
+    // "all accounts busy" 里的 "busy" 不带前置 "model" → 不误判 model_capacity,
+    // 仍归 upstream(词族边界回归)。
     const r = classifyRunError('ACCOUNT_POOL_BUSY: all accounts busy')
     assert.equal(r.code, 'upstream_failed')
+  })
+
+  it('model_capacity: at capacity + try a different model', () => {
+    const r = classifyRunError('Selected model is at capacity. Please try a different model.')
+    assert.equal(r.code, 'model_capacity')
+    assert.equal(r.message, '模型繁忙,请稍后重试或切换模型')
+  })
+
+  it('model_capacity: overloaded', () => {
+    assert.equal(classifyRunError('model is overloaded').code, 'model_capacity')
+  })
+
+  it('model_capacity: model ... busy', () => {
+    assert.equal(
+      classifyRunError('The model is currently busy, retry shortly').code,
+      'model_capacity',
+    )
+  })
+
+  it('model_capacity: capacity limit exceeded', () => {
+    assert.equal(classifyRunError('capacity limit exceeded for this deployment').code, 'model_capacity')
+  })
+
+  it('model_capacity 优先于 upstream:529 Overloaded', () => {
+    // Anthropic 529 "Overloaded" 串含 overloaded → 命中容量档(排在 upstream 之前)。
+    assert.equal(
+      classifyRunError('529 {"type":"error","error":{"type":"overloaded_error"}}').code,
+      'model_capacity',
+    )
+  })
+
+  it('现状钉死:裸 529(无容量词/无 50[234])→ unknown', () => {
+    // 任务备注对 529 归类不确定;此处钉死真实现状:529 既不在 rate(429)也不在
+    // upstream(50[234])正则,且无容量词 → unknown(caller 压成 upstream_failed 发帧)。
+    assert.equal(classifyRunError('HTTP 529 returned by gateway').code, 'unknown')
+  })
+
+  it('classifiedMessageForCode 与 PATTERNS 同源(无平行文案表)', () => {
+    assert.equal(classifiedMessageForCode('model_capacity'), '模型繁忙,请稍后重试或切换模型')
+    assert.equal(classifiedMessageForCode('rate_limited'), '当前账号被限流,请稍后再试')
+    assert.equal(classifiedMessageForCode('insufficient_credits'), '余额不足,请充值后继续')
+    assert.equal(classifiedMessageForCode('upstream_failed'), 'Anthropic 上游异常,请稍后重试')
+    // classifyRunError 命中同码时,message 与 classifiedMessageForCode 完全一致。
+    assert.equal(
+      classifyRunError('model is overloaded').message,
+      classifiedMessageForCode('model_capacity'),
+    )
   })
 
   it('unknown: 普通运行时错误', () => {

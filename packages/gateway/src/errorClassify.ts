@@ -7,13 +7,21 @@
  * 所以服务端用纯字符串匹配做一次粗分类。
  *
  * 故意只识别少量高确定性场景,其它一律回退 'unknown' → caller 仍发老的
- * `[error] ${msg}` 文本气泡,UX 不变。新增 code 时在这里加,前端 schema
- * 同步加 Type.Literal()。
+ * `[error] ${msg}` 文本气泡,UX 不变。
+ *
+ * 新增 code 是跨包契约动作,必须三处同步:
+ *   1. 本文件 ClassifiedErrorCode + PATTERNS(server-only 的 provider 原文识别);
+ *   2. protocol turnErrorTaxonomy 的 TURN_ERROR_TAXONOMY(唯一权威语义表,决定
+ *      retryable/cta/expected 等跨端语义);
+ *   3. 若该 code 会进 wire OutboundError.code,同步 protocol frames.ts 的
+ *      OutboundError.code Type.Union()。
+ * 契约测试(turnErrorTaxonomyContract)锁 1↔2↔3 的 code 集合同源。
  */
 
 export type ClassifiedErrorCode =
   | 'insufficient_credits'
   | 'rate_limited'
+  | 'model_capacity'
   | 'upstream_failed'
   | 'unknown'
 
@@ -49,6 +57,16 @@ const PATTERNS: Array<{
     code: 'rate_limited',
     message: '当前账号被限流,请稍后再试',
   },
+  // 模型容量满载 —— 上游"at capacity"/overloaded/model busy 词族。与 upstream_failed
+  // 的区别是语义可行动:同模型稍后可用、换模型立即可用(taxonomy cta=retry_or_switch)。
+  // 必须排在 upstream_failed 之前:"overloaded" 常与 5xx/upstream 措辞同现,先命中
+  // 更精确的容量语义,否则被泛化上游正则吞成 upstream_failed。本函数只喂错误串,
+  // 不会误伤用户正文里的 "capacity"。
+  {
+    re: /at capacity|capacity.{0,40}(?:limit|exceed|full)|overloaded|model.{0,20}busy|try a different model/i,
+    code: 'model_capacity',
+    message: '模型繁忙,请稍后重试或切换模型',
+  },
   // 502/503/504 / 上游连接失败
   {
     re: /(?:\b50[234]\b|upstream|ECONNRESET|ETIMEDOUT|ENOTFOUND|ACCOUNT_POOL_(?:BUSY|UNAVAILABLE)|UPSTREAM_FAILED)/i,
@@ -64,6 +82,16 @@ export function classifyRunError(raw: string | undefined | null): ClassifiedErro
     if (p.re.test(s)) return { code: p.code, message: p.message }
   }
   return { code: 'unknown', message: '' }
+}
+
+/**
+ * 已知语义码 → 规范中文文案。给 runner 已预分类(errorClass)但没有可再匹配的
+ * 原文时用:server.ts 拿到 errorClass 后按码取文案,与 classifyRunError 的 message
+ * 同源(PATTERNS 是唯一权威,不另建平行文案表)。未在 PATTERNS 出现的码返回空串。
+ */
+export function classifiedMessageForCode(code: Exclude<ClassifiedErrorCode, 'unknown'>): string {
+  const hit = PATTERNS.find((p) => p.code === code)
+  return hit ? hit.message : ''
 }
 
 export function classifyDelegateOutputError(

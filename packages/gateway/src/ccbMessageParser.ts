@@ -19,6 +19,7 @@ import type {
   SessionStreamEvent,
   TurnToolEntry,
 } from './engine/engineEvents.js'
+import type { ClassifiedErrorCode } from './errorClassify.js'
 import type { SdkMessage } from './subprocessRunner.js'
 
 function bashOutputTailBlock(raw: Record<string, any>): OutboundContentBlock | null {
@@ -47,6 +48,66 @@ export type {
   SessionStreamEvent,
   TurnToolEntry,
 } from './engine/engineEvents.js'
+
+/**
+ * 自动重试侧信道载荷 —— 仅 turn_status='retrying' 携带。不进 tape、不持久化,
+ * 断线重连由 retryAt(下一次尝试的绝对 epoch ms)重算倒计时。字段语义与
+ * protocol frames.ts OutboundTurnStatus 的 retrying 分支逐字段对齐。
+ */
+export interface TurnRetryMeta {
+  attempt: number
+  max: number
+  delayMs: number
+  retryAt: number
+}
+
+/**
+ * gateway 侧 turn 非流式阶段态。
+ *
+ * `'compacting'` / `null` 是 engine 中立事件(EngineContentEvent.turn_status)的
+ * 原生取值;`{status:'retrying', retry}` 是 gateway 上层对底座 fake-SDK retrying
+ * 状态的语义加宽 —— engine 事件类型仍只认 `'compacting'|null`,retrying 形态经
+ * 受控 cast 跨 engine/ 类型边界(adapter 的 onEvent 直通透传保真,server 侧按本
+ * 类型 narrow 消费,session cache 也以此建模)。
+ */
+export type GatewayTurnPhase = 'compacting' | null | { status: 'retrying'; retry: TurnRetryMeta }
+
+/**
+ * gateway 上层实际流经 onLeaderEvent 的事件模型 —— 在 engine 中立
+ * SessionStreamEvent 基础上加宽两处:error 事件可携带 runner 预分类的
+ * errorClass;turn_status 的 status 可为 retrying 形态。engine/ 的类型不在本包
+ * 所有权内,故用本地加宽类型 + 边界 cast,而不改 engine 事件契约。
+ *
+ * SessionStreamEvent ⊆ GatewayStreamEvent(errorClass 可选、GatewayTurnPhase ⊇
+ * 'compacting'|null),因此接受 GatewayStreamEvent 的 handler 可安全下传给要求
+ * SessionStreamEvent handler 的 submit()(函数参数逆变)。
+ */
+export type GatewayStreamEvent =
+  | Exclude<SessionStreamEvent, { kind: 'error' } | { kind: 'turn_status' }>
+  | { kind: 'error'; error: string; errorClass?: ClassifiedErrorCode }
+  | { kind: 'turn_status'; status: GatewayTurnPhase }
+
+/** 校验底座 fake-SDK retrying 状态携带的 retry 载荷;形状非法返回 null(调用方
+ *  据此降级为 status:null,不把畸形侧信道透给前端)。 */
+function normalizeTurnRetry(raw: unknown): TurnRetryMeta | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  const { attempt, max, delayMs, retryAt } = r
+  if (
+    typeof attempt !== 'number' || !Number.isFinite(attempt) || attempt < 1 ||
+    typeof max !== 'number' || !Number.isFinite(max) || max < 1 ||
+    typeof delayMs !== 'number' || !Number.isFinite(delayMs) || delayMs < 0 ||
+    typeof retryAt !== 'number' || !Number.isFinite(retryAt) || retryAt < 0
+  ) {
+    return null
+  }
+  return {
+    attempt: Math.floor(attempt),
+    max: Math.floor(max),
+    delayMs: Math.floor(delayMs),
+    retryAt: Math.floor(retryAt),
+  }
+}
 
 /** Accumulated turn result stats */
 export interface TurnResult {
@@ -508,12 +569,29 @@ export class CcbMessageParser {
         const block = bashOutputTailBlock(raw)
         if (block) this.onEvent({ kind: 'block', block })
       } else if (raw.subtype === 'status') {
-        // CCB SDKStatus 当前只有 'compacting' | null(coreSchemas.ts:1268)。
-        // 任何其它值都 normalize 到 null —— 防止未来 CCB 加新 status 字面量
-        // 时,gateway 没有显式 mapping 就把未审过的字符串塞给前端。
-        const mapped: 'compacting' | null =
-          raw.status === 'compacting' ? 'compacting' : null
-        this.onEvent({ kind: 'turn_status', status: mapped })
+        // 受控枚举:CCB SDKStatus 有 'compacting' | null(coreSchemas.ts:1268);
+        // codex runner 另注入 fake-SDK `status:'retrying'` + retry 载荷(自动重试
+        // 侧信道)。除这两类显式识别的形态外,任何其它值 normalize 到 null ——
+        // 防止未来底座加新 status 字面量时,gateway 没有显式 mapping 就把未审过
+        // 的字符串塞给前端。
+        if (raw.status === 'compacting') {
+          this.onEvent({ kind: 'turn_status', status: 'compacting' })
+        } else if (raw.status === 'retrying') {
+          const retry = normalizeTurnRetry(raw.retry)
+          if (retry) {
+            // retrying 形态经受控加宽跨 engine/ 边界:engine 事件类型只认
+            // 'compacting'|null,这里对底座自动重试状态做 gateway 侧语义扩展
+            // (adapter onEvent 直通透传,server 侧按 GatewayTurnPhase 消费)。
+            this.onEvent({
+              kind: 'turn_status',
+              status: { status: 'retrying', retry },
+            } as unknown as SessionStreamEvent)
+          } else {
+            this.onEvent({ kind: 'turn_status', status: null })
+          }
+        } else {
+          this.onEvent({ kind: 'turn_status', status: null })
+        }
       }
       return
     }
