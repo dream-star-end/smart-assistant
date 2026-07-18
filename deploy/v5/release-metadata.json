@@ -30,7 +30,9 @@
     "0164_admin_audit_model_admin_grant",
     "0166_prompt_queue",
     "0167_turn_waiver_receipts",
-    "0168_knowledge_planet_automation"
+    "0168_knowledge_planet_automation",
+    "0169_plugin_write_preapproval",
+    "0170_durable_turn_dispatch"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
@@ -38,9 +40,10 @@
     "model_authority_v1",
     "model_authority_v1-egress",
     "lossless-turn-tape-v2",
-    "lossless-turn-runtime-batch-v1"
+    "lossless-turn-runtime-batch-v1",
+    "durable-turn-dispatch-v1"
   ],
-  "runtimeCapabilities": ["model_authority_v1", "lossless-turn-tape-v2"],
+  "runtimeCapabilities": ["model_authority_v1", "lossless-turn-tape-v2", "durable-turn-dispatch-v1"],
   "bridgeFrameSchema": "1",
   "runtimeApi": "1"
 }
