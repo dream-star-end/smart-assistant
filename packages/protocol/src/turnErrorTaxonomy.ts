@@ -39,8 +39,15 @@ export interface TurnErrorSemantics {
    * 只进服务端日志与「查看详情」的脱敏摘要。
    */
   allowPublicServerMessage?: boolean
-  /** 预期业务态:不进错误遥测(前端 EXPECTED_TURN_ERR_CODES 由此派生)。 */
+  /** 预期业务态(用户意图/业务规则的正常分支,非故障)。 */
   expected?: boolean
+  /**
+   * 是否进错误遥测(前端 reportTurnError)。**与 expected 解耦**(Codex 审计
+   * R4-5c 裁定):capacity/图片繁忙这类"对单用户是预期态"的码,对平台是
+   * 运营故障信号,必须保持上报聚合。缺省 true;只有用户主动行为(停止/
+   * 取消)与纯业务规则拒绝(未开通/配置变更)才 false。
+   */
+  reportable?: boolean
   /** 免单类:命中即走自动免单展示分支(前端 WAIVED_ERROR_CODES 由此派生)。 */
   waivable?: boolean
 }
@@ -51,7 +58,7 @@ export interface TurnErrorSemantics {
  */
 export const TURN_ERROR_TAXONOMY = {
   // ── 计费/配额 ────────────────────────────────────────────
-  insufficient_credits: { retryable: false, cta: 'topup', expected: true },
+  insufficient_credits: { retryable: false, cta: 'topup', expected: true, reportable: false },
   rate_limited: { retryable: true, cta: 'retry', expected: true },
 
   // ── 上游模型服务(errorClassify / codex runner 分类产物)────
@@ -70,8 +77,8 @@ export const TURN_ERROR_TAXONOMY = {
   auth_error: { retryable: false, cta: 'relogin' },
   service_restart: { retryable: true, cta: 'retry', expected: true },
   session_persist_unavailable: { retryable: true, cta: 'retry' },
-  stopped: { retryable: false, cta: 'none', expected: true },
-  user_cancelled: { retryable: false, cta: 'none', expected: true },
+  stopped: { retryable: false, cta: 'none', expected: true, reportable: false },
+  user_cancelled: { retryable: false, cta: 'none', expected: true, reportable: false },
   runner_crashed: { retryable: true, cta: 'retry' },
 
   // ── 免单类(tape 大写码归一化后落这里;waive 查询仍用大写原值)──
@@ -83,17 +90,17 @@ export const TURN_ERROR_TAXONOMY = {
   turn_limit: { retryable: false, cta: 'none', waivable: true },
 
   // ── 模型权威 gate 拒帧(bridge/egress)─────────────────────
-  model_config_changed_retry_turn: { retryable: false, cta: 'retry', expected: true },
-  model_not_available: { retryable: false, cta: 'switch_model', expected: true },
+  model_config_changed_retry_turn: { retryable: false, cta: 'retry', expected: true, reportable: false },
+  model_not_available: { retryable: false, cta: 'switch_model', expected: true, reportable: false },
   unresolved_agent_model: { retryable: false, cta: 'switch_model' },
   model_authority_unavailable: { retryable: true, cta: 'retry' },
   model_catalog_unavailable: { retryable: true, cta: 'retry' },
-  unauthorized_model: { retryable: false, cta: 'switch_model', expected: true },
+  unauthorized_model: { retryable: false, cta: 'switch_model', expected: true, reportable: false },
 
   // ── 连接/环境(bridge error 帧码归一化产物)────────────────
   unauthorized: { retryable: false, cta: 'relogin' },
-  maintenance: { retryable: false, cta: 'none', expected: true },
-  conn_kicked: { retryable: true, cta: 'none', expected: true },
+  maintenance: { retryable: false, cta: 'none', expected: true, reportable: false },
+  conn_kicked: { retryable: true, cta: 'none', expected: true, reportable: false },
   /** 运行环境已重建:重试无效,必须刷新页面(服务端 message 指路,可信展示)。 */
   container_outdated: { retryable: false, cta: 'refresh', allowPublicServerMessage: true },
   err_container: { retryable: true, cta: 'retry' },
@@ -113,10 +120,10 @@ export const TURN_ERROR_TAXONOMY = {
   voice_timeout: { retryable: true, cta: 'retry' },
 
   // ── 遗留兼容(新 bridge 不再发射;归一化仍认,防旧 master 回滚窗残帧)──
-  codex_turn_busy: { retryable: true, cta: 'none', expected: true },
-  codex_pool_busy: { retryable: true, cta: 'retry', expected: true },
-  codex_route_unavailable: { retryable: true, cta: 'retry', expected: true },
-  codex_container_recycled: { retryable: true, cta: 'retry', expected: true },
+  codex_turn_busy: { retryable: true, cta: 'none', expected: true, reportable: false },
+  codex_pool_busy: { retryable: true, cta: 'retry', expected: true, reportable: false },
+  codex_route_unavailable: { retryable: true, cta: 'retry', expected: true, reportable: false },
+  codex_container_recycled: { retryable: true, cta: 'retry', expected: true, reportable: false },
   codex_billing: { retryable: true, cta: 'retry' },
   /** 历史前端码(与 upstream_failed 语义重复,仅存量会话水合可见)。 */
   upstream_error: { retryable: true, cta: 'retry' },
@@ -182,6 +189,10 @@ export const EXPECTED_TURN_ERROR_CODES: ReadonlySet<string> = new Set(
 )
 export const WAIVED_TURN_ERROR_CODES: ReadonlySet<string> = new Set(
   Object.keys(_taxonomyView).filter((k) => _taxonomyView[k].waivable === true),
+)
+/** 不进错误遥测的码(前端 reportTurnError 豁免集;与 expected 解耦,见字段注释)。 */
+export const REPORT_EXEMPT_TURN_ERROR_CODES: ReadonlySet<string> = new Set(
+  Object.keys(_taxonomyView).filter((k) => _taxonomyView[k].reportable === false),
 )
 
 /**
