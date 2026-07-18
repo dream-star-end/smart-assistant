@@ -132,7 +132,8 @@ function ocSubnetPrefixForChannel(): string {
 // 导出:内部代理 gateway IP / port 是"容器 egress 目标"与"master 监听 bind"的【单一权威】。
 // index.ts 启动期用它校验 INTERNAL_PROXY_BIND/PORT env 与 channel 期望一致(消双权威错位)。
 export function ocGatewayIpForChannel(): string {
-  return getRuntimeChannel() === "v5" ? "172.31.0.1" : V3_GATEWAY_IP;
+  // 由 containerNet 网段前缀派生(.0.1 = bridge gateway),消除 channel→网段的第二份映射。
+  return `${containerSubnetPrefixForChannel()}.0.1`;
 }
 export function ocInternalProxyPortForChannel(): number {
   // v5 用 18892(避开 v3 占用的 18791 内部代理 + 18792 baseline server);v3 仍 18791。

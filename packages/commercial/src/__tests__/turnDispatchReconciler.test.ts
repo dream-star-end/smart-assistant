@@ -62,10 +62,13 @@ interface Canned {
 
 function makeFakePool(canned: Canned) {
   const writes: string[] = []
+  // accepted 扫描的 SQL 时间参数捕获(Codex R1 MAJOR 回归锁:扫描下限必须是
+  // ACCEPTED_UNREACHABLE_ALERT_MS 而非 stuckMs,否则求证瘫痪要等 90min+ 才首告)。
+  const acceptedScanCutoffs: Date[] = []
   // 单点路由:pool.query 与事务 client.query 共用。B8 的 terminal-未通知分支走
   // pool.connect() 单事务(SELECT … FOR UPDATE 锁行 → 重验 → 财务联查 → projection/manual),
   // 故 fake 必须提供 connect() + 事务 client。
-  const route = (sql: string) => {
+  const route = (sql: string, params?: unknown[]) => {
     const s = sql.replace(/\s+/g, ' ')
     // 事务控制帧。
     if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [], rowCount: 0 }
@@ -86,25 +89,29 @@ function makeFakePool(canned: Canned) {
     if (s.includes("status = 'admitted'") && s.includes('lease_until')) return { rows: canned.admittedLeaseExpired ?? [], rowCount: (canned.admittedLeaseExpired ?? []).length }
     if (s.includes("status = 'rejecting'") && s.includes('ORDER BY admitted_at')) return { rows: canned.rejecting ?? [], rowCount: (canned.rejecting ?? []).length }
     if (s.includes("status = 'terminal'") && s.includes('client_notified = FALSE')) return { rows: canned.terminalUnnotified ?? [], rowCount: (canned.terminalUnnotified ?? []).length }
-    if (s.includes("status = 'accepted'") && s.includes('COALESCE(accepted_at')) return { rows: canned.acceptedStuck ?? [], rowCount: (canned.acceptedStuck ?? []).length }
+    if (s.includes("status = 'accepted'") && s.includes('COALESCE(accepted_at')) {
+      if (params?.[0] instanceof Date) acceptedScanCutoffs.push(params[0] as Date)
+      return { rows: canned.acceptedStuck ?? [], rowCount: (canned.acceptedStuck ?? []).length }
+    }
     // ⓪ scanOpenSessionGone(LEFT JOIN)必须先于 openAged 路由:两者都含 status IN (open 三态)。
     if (s.includes('LEFT JOIN client_sessions')) return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
     if (s.includes("status IN ('admitted', 'accepted', 'rejecting')")) return { rows: canned.openAged ?? [], rowCount: (canned.openAged ?? []).length }
     return { rows: [], rowCount: 0 }
   }
   const pool = {
-    async query(sql: string) {
-      return route(sql)
+    async query(sql: string, params?: unknown[]) {
+      return route(sql, params)
     },
     async connect() {
       return {
-        async query(sql: string) {
-          return route(sql)
+        async query(sql: string, params?: unknown[]) {
+          return route(sql, params)
         },
         release() {},
       }
     },
     writes,
+    acceptedScanCutoffs,
   }
   return pool
 }
@@ -371,6 +378,14 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     assert.equal(counts.rejectedTerminal, 0, '不可达绝不推断终态')
     assert.equal(counts.manualReconcile, 0)
     assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")), '不动 dispatch 状态')
+    // Codex R1 MAJOR 回归锁:扫描 cutoff 必须按 15min 取(不是 stuckMs 的 90min 下限),
+    // 否则求证系统性瘫痪(SSRF 拦死)要等 90min+ 才首告。
+    assert.equal(pool.acceptedScanCutoffs.length >= 1, true, 'accepted 扫描必须带时间参数')
+    const cutoffAge = Date.now() - pool.acceptedScanCutoffs[0]!.getTime()
+    assert.ok(
+      cutoffAge > 14 * 60_000 && cutoffAge < 16 * 60_000,
+      `扫描下限必须≈15min(实际 ${Math.round(cutoffAge / 60_000)}min)`,
+    )
   })
 
   test('accepted 求证失败但龄 <15min → 不告警(等下轮,避免抖动噪音)', async () => {
@@ -387,6 +402,23 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
       !alerts.some((a) => a.payload?.kind === 'accepted_unreachable'),
       '15min 内的瞬时不可达不告警',
     )
+  })
+
+  test('探测窗(15min~stuckMs)可达行零状态迁移:容器回 rejected 也不得提前终态', async () => {
+    // 扫描下限降到 15min 只为告警探测;所有状态迁移仍由 stuckMs 门守住(零侵入承诺)。
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      },
+    })
+    assert.equal(counts.rejectedTerminal, 0, '探测窗内不做 not_accepted 终态迁移')
+    assert.equal(counts.manualReconcile, 0)
+    assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")), '零状态写入')
   })
 
   test('accepted dispatch still running → no terminal (keep waiting)', async () => {
