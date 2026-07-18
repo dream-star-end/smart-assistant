@@ -41,8 +41,11 @@ const {
   getTurnDispatchStateByDispatch,
   inboxSinkStaged,
   inboxTerminal,
+  isTurnDispatchLive,
+  markTurnDispatchLive,
   normalizeDispatchUserId,
   recoverTurnDispatchInboxOnBoot,
+  unmarkTurnDispatchLive,
   rejectTurnDispatchIfAbsent,
   resolveInboxTerminalAck,
 } = await import('../turnDispatchInbox.js')
@@ -413,6 +416,79 @@ describe('boot recovery 故障注入(§7 1/2/3/4/8)', () => {
     assert.equal(stats.recoveryPending, 1)
     // sink_staged 计 ①(d-retry)+ none(d-none)= 2。
     assert.equal(stats.sinkStaged, 2)
+  })
+
+  test('活执行行一律跳过:sweep 撞在飞 turn 不得合成 crashed(2026-07-19 误杀事故回归)', async () => {
+    // 复现事故形态:turn 已 running、真 tape 未 stage、master 无 part(none)——
+    // 周期 sweep tick 落在这个窗口。修复前:走 none 分支合成 SERVICE_RESTART crashed;
+    // 修复后:活标记行原样跳过,状态不动、零副作用。
+    await seedRunning('web-live', 'cm-live', 'd-live')
+    markTurnDispatchLive('d-live', 1)
+
+    const stagedFor = new Set<string>()
+    const deps = {
+      retryQueueHasDispatch: async () => false,
+      queryMasterTapeState: async (): Promise<MasterTapeStateResult> => ({ state: 'none' }),
+      stageSyntheticCrashedTape: async (row: { dispatchId: string }) => {
+        stagedFor.add(row.dispatchId)
+      },
+      isDispatchLive: isTurnDispatchLive,
+    }
+
+    const stats = await recoverTurnDispatchInboxOnBoot(deps)
+    const live = await getTurnDispatchByLogicalKey('u1', 'web-live', 'cm-live')
+    assert.equal(live?.state, 'running', '活行状态必须原样保持(不得过渡 recovery_pending)')
+    assert.equal(stagedFor.has('d-live'), false, '活行绝不合成 synthetic crashed tape')
+    assert.ok(stats.liveSkipped >= 1, 'liveSkipped 计数可观测')
+
+    // queued 活行同样受保护(受理后等 session 锁的窗口):不得被打成 rejected。
+    await insertQueuedTurnDispatch({
+      userId: 'u1',
+      sessionId: 'web-live-q',
+      clientMessageId: 'cm-live-q',
+      dispatchId: 'd-live-q',
+      attemptNo: 1,
+      payloadHash: 'h',
+    })
+    markTurnDispatchLive('d-live-q', 1)
+    await recoverTurnDispatchInboxOnBoot(deps)
+    assert.equal(
+      (await getTurnDispatchByLogicalKey('u1', 'web-live-q', 'cm-live-q'))?.state,
+      'queued',
+      'queued 活行不得被 sweep 打成 rejected',
+    )
+
+    // 注销后回归正常协议:none 分支照常合成(证明保护不是永久豁免)。
+    unmarkTurnDispatchLive('d-live', 1)
+    unmarkTurnDispatchLive('d-live-q', 1)
+    await recoverTurnDispatchInboxOnBoot(deps)
+    assert.equal(
+      (await getTurnDispatchByLogicalKey('u1', 'web-live', 'cm-live'))?.state,
+      'sink_staged',
+      '注销活标记后按协议收敛',
+    )
+    assert.equal(stagedFor.has('d-live'), true, '注销后 none 分支照常合成 synthetic tape')
+    assert.equal(
+      (await getTurnDispatchByLogicalKey('u1', 'web-live-q', 'cm-live-q'))?.state,
+      'rejected',
+      '注销后 queued 孤儿照常 rejected',
+    )
+  })
+
+  test('活标记引用计数:重复帧 mark/unmark 不得误删首达执行的保护', () => {
+    markTurnDispatchLive('d-rc', 1) // 首达(执行中)
+    markTurnDispatchLive('d-rc', 1) // 重复帧到达
+    unmarkTurnDispatchLive('d-rc', 1) // 重复帧早退注销
+    assert.equal(isTurnDispatchLive('d-rc', 1), true, '首达执行的保护仍在')
+    unmarkTurnDispatchLive('d-rc', 1) // 首达 settle
+    assert.equal(isTurnDispatchLive('d-rc', 1), false)
+    unmarkTurnDispatchLive('d-rc', 1) // 多余注销安全 no-op
+    assert.equal(isTurnDispatchLive('d-rc', 1), false)
+    // attemptNo 参与键:同 dispatch 不同 attempt 互不串扰。
+    markTurnDispatchLive('d-rc', 2)
+    assert.equal(isTurnDispatchLive('d-rc', 1), false)
+    assert.equal(isTurnDispatchLive('d-rc', 2), true)
+    unmarkTurnDispatchLive('d-rc', 2)
   })
 
   test('synthetic crashed tape 确定性:同 inbox 行 → 同 payload(严禁 Date.now())', async () => {
