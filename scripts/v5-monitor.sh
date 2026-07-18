@@ -463,7 +463,7 @@ check_severity() {
     # smoke_waiver/e2e_flake = 部署验证债与门 flake 记账,值得看但非现网故障。
     # e2e_probe 依赖部署发起机在线,失联概率高于现网故障,先按 warning(稳定后可升级)。
     # mail_key_sync = 回灌哑弹预警(尚未爆),warning;真断邮由 mail 检查按 critical 报。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake|e2e_probe|mail_key_sync) echo warning ;;
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake|e2e_probe|e2e_sd_probe|mail_key_sync) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -505,6 +505,7 @@ check_smoke_waiver
 check_e2e_flake
 check_probe_result turn_probe /var/lib/openclaude-v5/turn-probe.json 1800 "持续 turn 探针"
 check_probe_result e2e_probe  /var/lib/openclaude-v5/e2e-probe.json  3600 "持续 E2E 旅程探针"
+check_probe_result e2e_sd_probe /var/lib/openclaude-v5/e2e-sd-probe.json 3600 "持续会话展示 e2e 探针(@smoke)"
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)

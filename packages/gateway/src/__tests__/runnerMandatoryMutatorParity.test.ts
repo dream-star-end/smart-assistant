@@ -36,7 +36,7 @@ describe('runner 必调 mutator 平价(sessionManager 鸭子类型硬调集)', (
     test(`${name} 实现全部 sessionManager 必调 mutator`, () => {
       for (const m of MANDATORY_MUTATORS) {
         assert.equal(
-          typeof (cls.prototype as Record<string, unknown>)[m],
+          typeof (cls.prototype as unknown as Record<string, unknown>)[m],
           'function',
           `${name}.prototype.${m} 缺失——sessionManager 硬调会 TypeError,turn 永不终态(用户卡"思考中")。` +
             `实现它,或若该 mutator 已从 sessionManager 移除,同步更新本清单。`,
@@ -51,7 +51,7 @@ describe('runner 必调 mutator 平价(sessionManager 鸭子类型硬调集)', (
   // 方法体反射断言顺序(2026-07-18 批E 挖出的原始隐患:TypeError 落在 runner 已停、
   // 上下文已清之后,会话留在半迁移残骸态)。
   test('SubprocessRunner 实现 setExecutionTarget(CCB 专属能力)', () => {
-    assert.equal(typeof (SubprocessRunner.prototype as Record<string, unknown>).setExecutionTarget, 'function')
+    assert.equal(typeof (SubprocessRunner.prototype as unknown as Record<string, unknown>).setExecutionTarget, 'function')
   })
 
   test('sessionManager.setExecutionTarget 的能力检查先于破坏性动作', async () => {

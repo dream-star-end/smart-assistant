@@ -27,6 +27,7 @@
     "format": "biome format --write packages",
     "test:gateway": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
     "test:mcp-memory": "npx tsx --test packages/mcp-memory/src/__tests__/*.test.ts",
+    "test:cli": "npx tsx --test packages/cli/src/__tests__/*.test.ts",
     "test:web": "npx tsx --test packages/web/__tests__/*.test.ts",
     "test:web:gate": "bash .github/scripts/tap-suite-gate.sh test:web .github/known-failures/web.txt",
     "test:commercial:integ:gate": "bash .github/scripts/tap-suite-gate.sh test:commercial:integ .github/known-failures/commercial-integ.txt",

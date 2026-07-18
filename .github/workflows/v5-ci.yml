@@ -52,6 +52,10 @@ jobs:
           - name: mcp-memory
             run: npm run test:mcp-memory
             timeout: 10
+          - name: cli
+            # 发布物包此前零测试;导入图冒烟(plugin-sdk 纯类型包有意不设,typecheck 即全部运行面)。
+            run: npm run test:cli
+            timeout: 10
           - name: repo-lints
             # 仓库定制正确性 lint(调度器接线/未定义引用)。biome(存量 3614 错误)与
             # lint:agent-containers-sql(6 处存量违规)暂不入门——见 docs/V5_CI.md 债表。

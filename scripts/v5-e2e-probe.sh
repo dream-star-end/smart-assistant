@@ -59,14 +59,38 @@ run_journey() {
 out=""
 if out="$(run_journey 2>&1)"; then
   write_result true probe "$(echo "$out" | tail -c 300)"
-  exit 0
+else
+  echo "e2e-probe: 首跑失败,重试一次全新旅程" >&2
+  if out2="$(run_journey 2>&1)"; then
+    # 重试通过 = flake:结果记成功但 kind=flaky(monitor 不告警;flake 流水账另有
+    # deploy 侧 e2e-journey-flake.json,两个面向不同——这里是"线上现在好不好"。)
+    write_result true flaky "首跑失败重试通过:$(echo "$out" | tail -c 200)"
+  else
+    write_result false probe "连续两跑失败:$(echo "$out2" | tail -c 300)"
+  fi
 fi
-echo "e2e-probe: 首跑失败,重试一次全新旅程" >&2
-if out2="$(run_journey 2>&1)"; then
-  # 重试通过 = flake:结果记成功但 kind=flaky(monitor 不告警;flake 流水账另有
-  # deploy 侧 e2e-journey-flake.json,两个面向不同——这里是"线上现在好不好"。)
-  write_result true flaky "首跑失败重试通过:$(echo "$out" | tail -c 200)"
-  exit 0
+
+# ── session-display @smoke(2026-07-18 批F):会话展示/持久化/重连收敛层(durable-turn
+# 事故类)的持续探针。接部署回滚链前的成熟期观测面(与旅程门同一路径:flake 曲线稳定
+# 再升级,债表有记)。独立结果文件+独立 monitor 检查:依赖未装=持续可见,不静默降级。
+SD_DIR="$SCRIPT_DIR/../e2e/session-display"
+SD_RESULT="/var/lib/openclaude-v5/e2e-sd-probe.json"
+write_sd_result() { # <ok> <kind> <detail>
+  ssh "$KL_HOST" bash -s -- "$SD_RESULT" "$1" "$2" "$3" <<'REMOTE' || true
+set -Eeuo pipefail
+f="$1"; ok="$2"; kind="$3"; detail="$4"
+mkdir -p -m 700 "$(dirname "$f")"
+jq -n --argjson ok "$ok" --arg kind "$kind" --arg detail "$detail" --argjson at "$(date +%s)" \
+  '{ok:$ok,kind:$kind,detail:($detail|.[0:400]),at:$at}' >"$f.tmp"
+chmod 600 "$f.tmp"; mv -f "$f.tmp" "$f"
+REMOTE
+}
+if [[ ! -d "$SD_DIR/node_modules/@playwright/test" ]]; then
+  write_sd_result false infra "session-display 依赖未装:cd e2e/session-display && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install"
+elif sd_out="$(cd "$SD_DIR" && OC_E2E_SSH_HOST="$KL_HOST" OC_E2E_REMOTE_PORT="$port" \
+    timeout 420 ./run.sh --grep @smoke 2>&1)"; then
+  write_sd_result true probe "$(echo "$sd_out" | tail -c 300)"
+else
+  write_sd_result false probe "@smoke 失败:$(echo "$sd_out" | tail -c 300)"
 fi
-write_result false probe "连续两跑失败:$(echo "$out2" | tail -c 300)"
 exit 0
