@@ -26,7 +26,13 @@ import {
   startSessionsGcSweeper,
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
-import { casToTerminal, getDispatch } from "../dispatch/turnDispatchStore.js";
+import {
+  casToManualReconcile,
+  casToTerminal,
+  getDispatch,
+  resolveManualReconcile,
+  scanOpenSessionGone,
+} from "../dispatch/turnDispatchStore.js";
 import { insertErrorProjection, readActiveErrorProjections } from "../dispatch/errorProjections.js";
 import { _sanitizeMasterHistoricalMessagesForFrame } from "../ws/userChatBridge.js";
 
@@ -1723,6 +1729,42 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
       "SELECT user_id FROM client_sessions WHERE id = 's-dd-race-3'",
     );
     assert.equal(owner.rows[0]!.user_id, "c:8");
+  });
+
+  maybe("⓪ 会话亡自动结案:墓碑会话的 open dispatch 入扫描并可结案;活会话不误伤", async () => {
+    // 墓碑路径:admit(短租约)→ 删会话 → scanOpenSessionGone 捞出 → manual(session_deleted)+机器 resolution。
+    await backend.upsertClientSession(mkSession({ id: "s-dd-gone-1", userId: CUSER }));
+    const admit = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-gone-1", clientMessageId: "cm-dd-gone-1", leaseTtlMs: 1 }),
+    );
+    assert.equal(admit.kind, "admitted");
+    const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+    await backend.deleteClientSession("s-dd-gone-1", CUSER);
+    const future = Date.now() + 5_000; // 租约(1ms TTL)必已过期
+    const rows = await scanOpenSessionGone(pool, { minAgeMs: 0, limit: 50, now: future });
+    assert.ok(rows.some((r) => r.dispatchId === d.dispatchId), "墓碑会话的 open dispatch 应入扫描");
+    const held = await casToManualReconcile(pool, {
+      dispatchId: d.dispatchId,
+      conflictReason: "session_deleted",
+      fromStatuses: ["admitted", "accepted", "rejecting"],
+    });
+    assert.ok(held);
+    assert.ok(await resolveManualReconcile(pool, { dispatchId: d.dispatchId, resolution: "auto_closed:session_deleted" }));
+    const after = await getDispatch(pool, d.dispatchId);
+    assert.equal(after!.status, "manual_reconcile");
+    assert.equal(after!.resolution, "auto_closed:session_deleted");
+    // 已结案 → 不再入扫描(status 出 open 三态)。
+    const again = await scanOpenSessionGone(pool, { minAgeMs: 0, limit: 50, now: future });
+    assert.ok(!again.some((r) => r.dispatchId === d.dispatchId));
+    // 活会话不误伤:同样短租约过期,但会话未删 → 不入扫描(交 ① 分支容器求证)。
+    await backend.upsertClientSession(mkSession({ id: "s-dd-gone-2", userId: CUSER }));
+    const admit2 = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-gone-2", clientMessageId: "cm-dd-gone-2", leaseTtlMs: 1 }),
+    );
+    assert.equal(admit2.kind, "admitted");
+    const d2 = (admit2 as { dispatch: { dispatchId: string } }).dispatch;
+    const live = await scanOpenSessionGone(pool, { minAgeMs: 0, limit: 50, now: future });
+    assert.ok(!live.some((r) => r.dispatchId === d2.dispatchId), "活会话的 dispatch 不得被会话亡臂误伤");
   });
 
   maybe("finalize 收敛(§2.4):tape header 带 dispatch 身份 → dispatch terminal(outcome=tape.status)", async () => {

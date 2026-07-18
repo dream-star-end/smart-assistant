@@ -1,6 +1,8 @@
 // turnDispatchReconciler —— open dispatch 的周期收敛(RFC-v5-durable-turn-dispatch §2.3)。
 //
-// leaderBundle shared 单跑(双 master 下只 leader 跑,避免双求证竞态)。三分支全 CAS + 有界 LIMIT:
+// leaderBundle shared 单跑(双 master 下只 leader 跑,避免双求证竞态)。四分支全 CAS + 有界 LIMIT:
+//   ⓪ open ∧ 租约过期 ∧ 会话墓碑/行亡 → manual_reconcile(session_deleted)+ 机器 resolution
+//        自动结案(用户面已消失:tape 落不进、projection 无处渲染、容器求证永不收敛;不告警)
 //   ① admitted ∧ 租约过期 ∧ age>5min → CAS rejecting(epoch fence)→ 容器求证 reject-if-absent:
 //        rejected tombstone → terminal(not_accepted) → fail-visible;有行 → accepted;不可达 → 留 rejecting 重试
 //   ② accepted ∧ 卡 stuck 阈值 → 容器 dispatch-state:sink_staged/terminal/running 等;sink_stage_failed/
@@ -28,9 +30,11 @@ import {
   DISPATCH_REJECT_MIN_AGE_MS,
   getDispatchForUpdate,
   markClientNotified,
+  resolveManualReconcile,
   scanAcceptedStuck,
   scanAdmittedLeaseExpired,
   scanOpenAged,
+  scanOpenSessionGone,
   scanRejecting,
   scanTerminalUnnotified,
   type Queryable,
@@ -186,11 +190,13 @@ export interface ReconcileTickCounts {
   projections: number
   notified: number
   alerts: number
+  /** ⓪ 会话墓碑/行亡 → 自动结案(manual_reconcile(session_deleted)+ 机器 resolution)。 */
+  sessionGoneClosed: number
 }
 
 /**
- * 跑一轮收敛。顺序:① rejecting 求证(可能产出新 terminal)→ ③ terminal 未通知(消化① 的产物)
- * → ② accepted stuck → open>7d 告警。全 best-effort:单行失败不拖累其余。
+ * 跑一轮收敛。顺序:⓪ 会话亡自动结案 → ① rejecting 求证(可能产出新 terminal)→ ③ terminal
+ * 未通知(消化① 的产物)→ ② accepted stuck → open>7d 告警。全 best-effort:单行失败不拖累其余。
  */
 export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promise<ReconcileTickCounts> {
   const now = deps.now ?? Date.now
@@ -206,6 +212,32 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     projections: 0,
     notified: 0,
     alerts: 0,
+    sessionGoneClosed: 0,
+  }
+
+  // ── ⓪ open ∧ 租约过期 ∧ 会话墓碑/行亡 → 自动结案(session_deleted)────────
+  // 会话墓碑是 durable proof「用户面已不存在」:tape 落不进(stage 返 session_deleted)、
+  // projection 无处渲染、容器常随会话回收 → ①② 的容器求证对这类行永远收敛不动
+  // (2026-07-18 e2e 实证:accepted 恒卡,直到 open>7d 才以告警冒头)。执行 outcome 无从
+  // 求证也不可伪造(I2:not_accepted 只认容器 tombstone)→ 不走 terminal,走
+  // manual_reconcile(证据行永存)+ 机器 resolution 立即记账进 90d GC 窗。不告警:
+  // 用户删会话 / e2e teardown 是正常生命周期,不是运维事件。放最前:免得这类行先被
+  // ①CAS 进 rejecting 白耗容器求证轮次。
+  const gone = await scanOpenSessionGone(deps.pool, { minAgeMs: rejectMinAge, limit, now: now() })
+  for (const row of gone) {
+    const held = await casToManualReconcile(deps.pool, {
+      dispatchId: row.dispatchId,
+      conflictReason: 'session_deleted',
+      fromStatuses: ['admitted', 'accepted', 'rejecting'],
+      now: now(),
+    })
+    if (held === null) continue // 竞态:tape finalize / 别的路径先动了
+    await resolveManualReconcile(deps.pool, {
+      dispatchId: row.dispatchId,
+      resolution: 'auto_closed:session_deleted',
+      now: now(),
+    })
+    counts.sessionGoneClosed++
   }
 
   // ── ① admitted ∧ 租约过期 ∧ age>rejectMinAge ─────────────────────────────
@@ -565,6 +597,7 @@ export function startTurnDispatchReconciler(
     projections: 0,
     notified: 0,
     alerts: 0,
+    sessionGoneClosed: 0,
   }
 
   async function runOneTick(): Promise<ReconcileTickCounts> {

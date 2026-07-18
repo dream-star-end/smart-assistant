@@ -7,8 +7,11 @@
 //   J1 UI 登录(真实表单;依赖线上 turnstile_bypass=true,同 turn canary 的 bypass 前提)
 //   J2 附件全链:「+」菜单 → 添加附件 → filechooser 真实弹出 → 真实上传 → chip done
 //   J3 目标入口:「+」菜单 → 设定目标 → 对话框弹出
-//   J4 带附件发送:消息上屏 + 附件区清空(turn 结果不在此等待 —— WS 三信号由
-//      v5-smoke-turn-canary 硬门覆盖,此处只验 UI 发送旅程,避免双倍等待窗)
+//   J4 带附件发送:消息上屏 + 附件区清空
+//   J5 送达硬断言:失败签名(发送失败/消息暂未安全送达)零容忍 + 助手回复完成
+//      (2026-07-18 受理竞态事故裁定:乐观上屏≠送达 —— 旧 J4 只断言上屏,新会话首发
+//      必挂的回归穿门而过;WS smoke turn 走的不是 UI 发送路径,盖不住这一层。J5 等一轮
+//      真回复,与 smoke turn 的等待窗有意冗余 —— 两者路径不同,冗余即覆盖)
 //
 // 运行形态:在**部署发起机**(本机)执行,自建 ssh 隧道访问 kl-mirror 的 master 端口
 // (kl-mirror 无浏览器;隧道由本进程 spawn/回收,libuv 不继承部署锁 fd,不会占住
@@ -45,6 +48,8 @@ const EMAIL = process.env.V5_CANARY_EMAIL ?? "v5-canary@claudeai.chat";
 const PASSWORD_FILE = process.env.V5_CANARY_PASSWORD_FILE ?? "/root/.secrets/v5-canary.password";
 const ARTIFACTS = process.env.OC_E2E_ARTIFACTS ?? tmpdir();
 const STEP_TIMEOUT = 20_000;
+/** J5 等一轮真回复的上限(journey 在 smoke-turn 之后跑,模型链路已证健康;宽限防偶发慢轮误杀)。 */
+const TURN_WAIT_TIMEOUT = 120_000;
 
 function fatal(code, msg) {
   console.error(`e2e-journey: ${msg}`);
@@ -194,7 +199,28 @@ try {
     }
   });
 
-  console.log("e2e-journey: 旅程全过(登录/附件/目标/发送)");
+  await step("J5 送达硬断言:失败卡零容忍+助手回复完成", async () => {
+    // 2026-07-18 受理竞态事故:发送失败时乐观气泡照样上屏,旧断言「上屏=成功」让新会话
+    // 首发必挂的回归穿门(canary 账号当场撞到、被重试语义掩蔽后门照放绿)。送达升硬门:
+    //   失败判据 = ErrorBanner 签名(发送失败 / 消息暂未安全送达),一出现立即 fail;
+    //   成功判据 =「重新生成」按钮出现(完成态 assistant 行的稳定结构钩子;J1 全新会话
+    //   基线为 0,>0 即助手回复完成)—— 覆盖 admission→执行→回传全链,假阳性面窄。
+    const failSig = page.getByText(/发送失败|消息暂未安全送达/).first();
+    const regen = page.getByRole("button", { name: "重新生成" });
+    const deadline = Date.now() + TURN_WAIT_TIMEOUT;
+    for (;;) {
+      if ((await failSig.count()) > 0) {
+        throw new Error("发送失败签名出现(消息未送达,见截图)");
+      }
+      if ((await regen.count()) > 0) break;
+      if (Date.now() > deadline) {
+        throw new Error(`assistant 回复在 ${TURN_WAIT_TIMEOUT / 1000}s 内未完成(无失败卡亦无回复 = turn 挂起)`);
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  });
+
+  console.log("e2e-journey: 旅程全过(登录/附件/目标/发送/送达)");
   await browser.close();
   cleanupTunnel();
   process.exit(0);

@@ -57,6 +57,7 @@ interface Canned {
   terminalUnnotified?: Raw[]
   acceptedStuck?: Raw[]
   openAged?: Raw[]
+  openSessionGone?: Raw[]
 }
 
 function makeFakePool(canned: Canned) {
@@ -86,6 +87,8 @@ function makeFakePool(canned: Canned) {
     if (s.includes("status = 'rejecting'") && s.includes('ORDER BY admitted_at')) return { rows: canned.rejecting ?? [], rowCount: (canned.rejecting ?? []).length }
     if (s.includes("status = 'terminal'") && s.includes('client_notified = FALSE')) return { rows: canned.terminalUnnotified ?? [], rowCount: (canned.terminalUnnotified ?? []).length }
     if (s.includes("status = 'accepted'") && s.includes('COALESCE(accepted_at')) return { rows: canned.acceptedStuck ?? [], rowCount: (canned.acceptedStuck ?? []).length }
+    // ⓪ scanOpenSessionGone(LEFT JOIN)必须先于 openAged 路由:两者都含 status IN (open 三态)。
+    if (s.includes('LEFT JOIN client_sessions')) return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
     if (s.includes("status IN ('admitted', 'accepted', 'rejecting')")) return { rows: canned.openAged ?? [], rowCount: (canned.openAged ?? []).length }
     return { rows: [], rowCount: 0 }
   }
@@ -121,6 +124,35 @@ describe('resolveDispatchStuckThresholdMs', () => {
     // env above floor honored, capped at 24h
     assert.equal(resolveDispatchStuckThresholdMs(String(3 * 3_600_000), 600_000), 3 * 3_600_000)
     assert.equal(resolveDispatchStuckThresholdMs(String(999 * 3_600_000), 600_000), MAX_ACCEPTED_STUCK_MS)
+  })
+})
+
+describe('⓪ session-gone auto close(2026-07-18 e2e 残留 accepted 恒卡实证)', () => {
+  test('会话亡的 open dispatch → manual(session_deleted)+机器 resolution;零告警零容器求证', async () => {
+    const pool = makeFakePool({
+      openSessionGone: [rawRow({ status: 'accepted', outcome: null, failure_code: null })],
+    })
+    const alerts: unknown[] = []
+    let containerCalls = 0
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        rejectIfAbsent: async (): Promise<ContainerCallResult> => {
+          containerCalls++
+          return { kind: 'unreachable', detail: 'test' }
+        },
+        getDispatchState: async (): Promise<ContainerCallResult> => {
+          containerCalls++
+          return { kind: 'unreachable', detail: 'test' }
+        },
+      },
+      enqueueAlert: (e) => alerts.push(e),
+    })
+    assert.equal(counts.sessionGoneClosed, 1)
+    assert.equal(alerts.length, 0)
+    assert.equal(containerCalls, 0)
+    assert.ok(pool.writes.some((w) => w.includes("status = 'manual_reconcile'") && w.includes('conflict_reason')))
+    assert.ok(pool.writes.some((w) => w.includes('SET resolution =')))
   })
 })
 

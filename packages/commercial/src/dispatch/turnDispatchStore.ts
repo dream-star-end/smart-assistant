@@ -66,6 +66,11 @@ const DISPATCH_COLUMNS = `
   lease_epoch, lease_until, anchor_seq, admitted_at, accepted_at, terminal_at,
   last_attempt_at`
 
+/** join 场景用(scanOpenSessionGone):client_sessions 与 turn_dispatches 同名列须限定表别名 d。 */
+const DISPATCH_COLUMNS_QUALIFIED = DISPATCH_COLUMNS.split(',')
+  .map((c) => `d.${c.trim()}`)
+  .join(', ')
+
 interface RawDispatchRow {
   dispatch_id: string
   user_id: string
@@ -559,6 +564,31 @@ export async function scanTerminalUnnotified(
       ORDER BY terminal_at ASC NULLS FIRST
       LIMIT $1`,
     [String(Math.max(1, input.limit))],
+  )
+  return res.rows.map(mapRow)
+}
+
+/**
+ * reconciler 扫描:open 三态 ∧ 租约已过期 ∧ 会话行已墓碑/不存在(用户面已消失)。
+ * 会话归属键 = user_id 'c:<uid>'(web 受理 lane 唯一铸行方);join miss(行亡/异主)与
+ * deleted_at 墓碑同判「会话亡」。租约过期 + minAge 双闸:绝不与在飞 bridge 抢行。
+ */
+export async function scanOpenSessionGone(
+  q: Queryable,
+  input: { minAgeMs: number; limit: number; now?: number },
+): Promise<TurnDispatchRow[]> {
+  const now = input.now ?? Date.now()
+  const res = await q.query<RawDispatchRow>(
+    `SELECT ${DISPATCH_COLUMNS_QUALIFIED} FROM turn_dispatches d
+      LEFT JOIN client_sessions s
+        ON s.id = d.session_id AND s.user_id = 'c:' || d.user_id::text
+      WHERE d.status IN ('admitted', 'accepted', 'rejecting')
+        AND (d.lease_until IS NULL OR d.lease_until <= $1)
+        AND d.admitted_at <= $2
+        AND (s.id IS NULL OR s.deleted_at IS NOT NULL)
+      ORDER BY d.admitted_at ASC
+      LIMIT $3`,
+    [new Date(now), new Date(now - Math.max(0, input.minAgeMs)), String(Math.max(1, input.limit))],
   )
   return res.rows.map(mapRow)
 }
