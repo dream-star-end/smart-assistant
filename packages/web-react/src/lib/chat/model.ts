@@ -380,6 +380,8 @@ export type ChatSession = {
   _lastFrameSeq?: number;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
+  /** Server projection revision paired with `_maxSeq`; persisted across reload. */
+  _historyRevision?: number;
   /** 已应用 full 载荷的 SessionDetail.updatedAt 水位:同步权威传播(P1 缺席删除)的版本护栏,
    *  只允许 updatedAt ≥ 此值的 full 执行缺席删除。仅进程内存,不随 StoredSession 落地
    *  (重开会话从 0 起,首个 full 天然可授权;护栏防的是同进程内两条 REST 的乱序竞态)。*/

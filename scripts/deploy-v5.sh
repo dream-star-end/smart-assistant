@@ -584,11 +584,95 @@ REMOTE
 # schema_migrations 并 fail-closed，绝不替操作者偷偷迁库。既校验当前 checkout，也可校验
 # rollback/canary 的远端 release，避免“当前库够新”被误当成“目标 release 依赖已满足”。
 required_migrations_csv() { # <metadata-path> <local|remote>
-  local metadata="$1" location="$2" jq_filter
-  jq_filter='if (.requiredMigrations | type) == "array" and (.requiredMigrations | length) > 0 and all(.requiredMigrations[]; type == "string" and test("^[0-9]{4}_[a-z0-9_]+$")) then .requiredMigrations | unique | join(",") else error("invalid requiredMigrations") end'
+  local metadata="$1" location="$2"
+  # Validate metadata against the migration files in THIS target release. Never
+  # use the current checkout to judge an older rollback archive: migrations that
+  # did not exist in that immutable release are not its dependencies. Exact
+  # array equality also rejects duplicates, omissions and hand-reordering.
   case "$location" in
-    local) jq -er "$jq_filter" "$metadata" ;;
-    remote) ssh "$KL_HOST" "jq -er '$jq_filter' '$metadata'" ;;
+    local)
+      node - "$metadata" <<'NODE'
+const fs = require('node:fs')
+const path = require('node:path')
+const metadata = process.argv[2]
+const suffix = path.join('deploy', 'v5', 'release-metadata.json')
+if (!metadata.endsWith(suffix)) throw new Error(`unexpected metadata path: ${metadata}`)
+const root = metadata.slice(0, -suffix.length).replace(/[\\/]$/, '')
+const doc = JSON.parse(fs.readFileSync(metadata, 'utf8'))
+const min = doc.minimumRequiredMigration
+if (typeof min !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(min))
+  throw new Error('invalid minimumRequiredMigration')
+const dir = path.join(root, 'packages', 'commercial', 'src', 'db', 'migrations')
+const expected = fs.readdirSync(dir).filter((f) => f.endsWith('.sql'))
+  .map((f) => f.slice(0, -4)).filter((v) => v >= min).sort()
+const actual = doc.requiredMigrations
+if (!Array.isArray(actual) || actual.length === 0 ||
+    actual.some((v) => typeof v !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(v)) ||
+    JSON.stringify(actual) !== JSON.stringify(expected)) {
+  throw new Error(`requiredMigrations mismatch; expected=${expected.join(',')} actual=${Array.isArray(actual) ? actual.join(',') : '<invalid>'}`)
+}
+process.stdout.write(actual.join(','))
+NODE
+      ;;
+    remote)
+      ssh "$KL_HOST" node - "$metadata" "$RELEASES_ROOT" <<'NODE'
+const fs = require('node:fs')
+const path = require('node:path')
+const metadata = process.argv[2]
+const releasesRoot = process.argv[3]
+const suffix = path.join('deploy', 'v5', 'release-metadata.json')
+if (!metadata.endsWith(suffix)) throw new Error(`unexpected metadata path: ${metadata}`)
+const root = metadata.slice(0, -suffix.length).replace(/[\\/]$/, '')
+const doc = JSON.parse(fs.readFileSync(metadata, 'utf8'))
+const min = doc.minimumRequiredMigration
+const dir = path.join(root, 'packages', 'commercial', 'src', 'db', 'migrations')
+const actual = doc.requiredMigrations
+
+// Releases built after this gate must carry an exact floor-derived manifest.
+// Immutable pre-floor archives cannot be rewritten, though, and their curated
+// lists were not globally sorted. Permit that historical shape only for a real
+// completed rel-* archive which explicitly lacks the history-revision capability.
+// Once the capability is adopted, the separate capability floor forbids falling
+// back to these archives; a capable or local candidate can never use this escape.
+if (min === undefined) {
+  const resolvedRoot = path.resolve(root)
+  const resolvedReleasesRoot = path.resolve(releasesRoot)
+  const capabilities = doc.capabilities
+  const immutableLegacyRelease =
+    path.dirname(resolvedRoot) === resolvedReleasesRoot &&
+    path.basename(resolvedRoot).startsWith('rel-') &&
+    fs.lstatSync(resolvedRoot).isDirectory() &&
+    fs.realpathSync(resolvedRoot) === resolvedRoot &&
+    fs.lstatSync(path.join(resolvedRoot, '.complete')).isFile() &&
+    path.resolve(metadata) === path.join(resolvedRoot, suffix)
+  const validCapabilities =
+    Array.isArray(capabilities) &&
+    capabilities.every((v) => typeof v === 'string') &&
+    new Set(capabilities).size === capabilities.length
+  const validLegacyMigrations =
+    Array.isArray(actual) && actual.length > 0 &&
+    actual.every((v) => typeof v === 'string' && /^[0-9]{4}_[a-z0-9_]+$/.test(v)) &&
+    new Set(actual).size === actual.length &&
+    actual.every((v) => fs.statSync(path.join(dir, `${v}.sql`)).isFile())
+  if (!immutableLegacyRelease) throw new Error('legacy migration manifest requires an immutable completed rel-* archive')
+  if (!validCapabilities) throw new Error('invalid legacy capabilities')
+  if (capabilities.includes('history-projection-revision-v1'))
+    throw new Error('legacy migration manifest cannot declare history projection capability')
+  if (!validLegacyMigrations) throw new Error('invalid legacy requiredMigrations')
+} else {
+  if (typeof min !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(min))
+    throw new Error('invalid minimumRequiredMigration')
+  const expected = fs.readdirSync(dir).filter((f) => f.endsWith('.sql'))
+    .map((f) => f.slice(0, -4)).filter((v) => v >= min).sort()
+  if (!Array.isArray(actual) || actual.length === 0 ||
+      actual.some((v) => typeof v !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(v)) ||
+      JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`requiredMigrations mismatch; expected=${expected.join(',')} actual=${Array.isArray(actual) ? actual.join(',') : '<invalid>'}`)
+  }
+}
+process.stdout.write(actual.join(','))
+NODE
+      ;;
     *) echo "✗ required_migrations_csv location 非法:$location" >&2; return 2 ;;
   esac
 }
@@ -1225,9 +1309,9 @@ recover_cutover() {
   local reason="${1:-offline cutover failed}"
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] recover old activation and start $V5_UNIT ($reason)"; return 0; }
   echo "⚠ 离线步骤失败，恢复旧激活面并启动旧服务：$reason" >&2
-  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" <<'REMOTE'
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$HISTORY_PROJECTION_REVISION_CAP" <<'REMOTE'
 set -Eeuo pipefail
-root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"
+root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"; history_cap="${10}"
 mkdir -p "$(dirname "$lock")"; touch "$lock"; chmod 600 "$lock"; exec 9>"$lock"; flock -x 9
 mkdir -p -m 700 "$(dirname "$marker")"; touch "$maintenance_lock"; chmod 600 "$maintenance_lock"
 exec 8>"$maintenance_lock"; flock -x 8
@@ -1265,6 +1349,7 @@ if [[ "$secure" == 1 ]]; then
   source_moved=0; source_installed=0; env_installed=0
   rollback_partial() {
     local rc=$? restore_failed=0
+    [[ $# -eq 0 ]] || rc="$1"
     trap - ERR
     if [[ "$source_moved" == 1 ]]; then
       if [[ "$source_installed" == 1 && -d "$remote_src" ]]; then
@@ -1311,6 +1396,29 @@ if [[ "$secure" == 1 ]]; then
   # paths (node_modules/data). The old tracked activation is overlaid in an
   # isolated sibling directory; no live file changes until the directory swap.
   systemctl stop "$unit"
+  candidate_start_attempted="$(jq -er '
+    if .candidate_start_attempted == true then "true"
+    elif (.candidate_start_attempted // false) == false then "false"
+    else error("invalid candidate_start_attempted") end
+  ' "$bundle/state.json")"
+  # Once the candidate may have served, history_revision is an irreversible
+  # projection protocol floor. If the trusted old source is legacy but the
+  # stopped current source is capable, restore/restart current rather than
+  # silently serving stale projections from the old bundle.
+  old_metadata="$bundle/source/deploy/v5/release-metadata.json"
+  old_history_capability="$(jq -er --arg c "$history_cap" '(.capabilities // []) as $caps
+    | if ($caps | type) != "array" then error("capabilities must be an array")
+      elif (($caps | index($c)) != null) then "capable" else "incapable" end' "$old_metadata")"
+  if [[ "$candidate_start_attempted" == true && "$old_history_capability" == incapable ]]; then
+    current_metadata="$remote_src/deploy/v5/release-metadata.json"
+    current_history_capability="$(jq -er --arg c "$history_cap" '(.capabilities // []) as $caps
+      | if ($caps | type) != "array" then error("capabilities must be an array")
+        elif (($caps | index($c)) != null) then "capable" else "incapable" end' "$current_metadata")"
+    if [[ "$current_history_capability" != incapable ]]; then
+      echo "FATAL: refusing irreversible history projection downgrade during offline recovery" >&2
+      rollback_partial 1
+    fi
+  fi
   cp -al "$remote_src/." "$restore_dir/"
   rsync -a --delete \
     --exclude '.git' --exclude 'node_modules' --exclude 'data' --exclude '*.log' \
@@ -1406,6 +1514,24 @@ mv "$env_file.tmp" "$env_file"
 REMOTE
 }
 
+mark_cutover_candidate_start_attempted() {
+  cutover_break_glass && return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] persist candidate_start_attempted before staged start"; return 0; }
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" <<'REMOTE'
+set -Eeuo pipefail
+root="$1"; lock="$2"; nonce="$3"; bundle="$root/$nonce"; state_file="$bundle/state.json"
+exec 9>"$lock"; flock -x 9
+[[ "$(jq -r '.state' "$state_file")" == activating ]] \
+  || { echo 'FATAL: candidate start marker requires activating state' >&2; exit 1; }
+now="$(date +%s)"
+jq --argjson at "$now" \
+  '.candidate_start_attempted=true | .candidate_start_attempted_at=$at | .updated_at=$at' \
+  "$state_file" >"$state_file.tmp"
+chmod 600 "$state_file.tmp"; sync -f "$state_file.tmp" || sync
+mv "$state_file.tmp" "$state_file"; sync -f "$bundle" || sync
+REMOTE
+}
+
 cutover_transition() {
   local expected="$1" next="$2"
   cutover_require_args || return 1
@@ -1433,7 +1559,9 @@ applied_set="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc "SELECT COALESCE(string_
 applied_hash="$(printf '%s' "$applied_set" | sha256sum | awk '{print $1}')"
 [[ "$applied_hash" == "$(jq -r '.applied_migrations_hash' "$manifest")" ]] || { echo 'FATAL: applied migration set changed after prepare' >&2; exit 1; }
 [[ "$(jq -r '.state' "$state_file")" == "$expected" ]] || { echo 'FATAL: invalid/replayed cutover state' >&2; exit 1; }
-now="$(date +%s)"; jq -n --arg state "$next" --argjson at "$now" '{state:$state,updated_at:$at}' >"$state_file.tmp"
+now="$(date +%s)"
+jq --arg state "$next" --argjson at "$now" '.state=$state | .updated_at=$at' \
+  "$state_file" >"$state_file.tmp"
 chmod 600 "$state_file.tmp"; sync -f "$state_file.tmp" || sync; mv "$state_file.tmp" "$state_file"; sync -f "$bundle" || sync
 REMOTE
 }
@@ -1679,13 +1807,14 @@ build_release() {
       else
         echo '  lock 变化/无基线 → npm ci' >&2; cd '$staging' && npm ci --no-audit --no-fund >/dev/null 2>&1
       fi"; then echo "✗ node_modules 准备失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
-  # dist:--with-dist 时**在 staging(archive pinned 源)上 vite build**(R2#2:不从共用工作树构建,
+  # dist:--with-dist 时**在 staging(archive pinned 源)上跑官方 workspace build**
+  # (`tsc -b && vite build`;R2#2:不从共用工作树构建,
   # 彻底消 dist 与 archive 不同源);否则硬链继承当前 release 的 dist(前端未变)。两路 DIST_BUILD_ID
   # 都从 staging 读。
   if [[ "$WITH_DIST" == 1 ]]; then
-    echo "── vite build @ staging(pinned $short_sha,不读共用工作树)──" >&2
-    if ! ssh "$KL_HOST" "set -e; cd '$staging/packages/web-react' && npx vite build >/dev/null 2>&1"; then
-      echo "✗ staging vite build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+    echo "── web official build @ staging(pinned $short_sha,不读共用工作树)──" >&2
+    if ! ssh "$KL_HOST" "set -e; cd '$staging' && npm run build --workspace packages/web-react >/dev/null 2>&1"; then
+      echo "✗ staging web official build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   else
     if ! ssh "$KL_HOST" "set -e
         [ -n '$cur' ] && [ -d '$cur/packages/web-react/dist' ] || { echo '✗ 当前 release 无 dist 可继承' >&2; exit 1; }
@@ -1784,6 +1913,69 @@ assert_release_capability_for_sessions_pg() {
 LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
 LOSSLESS_RUNTIME_BATCH_CAP="lossless-turn-runtime-batch-v1"
 LOSSLESS_RUNTIME_BATCH_ENV="LOSSLESS_TURN_TAPE_RUNTIME_BATCHING"
+HISTORY_PROJECTION_REVISION_CAP="history-projection-revision-v1"
+
+# history_revision makes projection-only mutations and authoritative removals
+# visible to incremental clients. A legacy master ignores that revision and can
+# therefore serve a stale projection. First adoption is single-master and the
+# capability floor is irreversible: even revision zero is not downgrade-safe,
+# because an offline new client may later reconnect after legacy-only writes.
+probe_release_history_projection_revision() { # $1=release; 0=present,1=absent,2=unknown
+  local reldir="$1" result="" rc=0
+  if result="$(ssh "$KL_HOST" "set -e
+      metadata='$reldir/deploy/v5/release-metadata.json'
+      [ -r \"\$metadata\" ]
+      jq -er --arg c '$HISTORY_PROJECTION_REVISION_CAP' '(.capabilities // []) as \$caps
+        | if (\$caps | type) != \"array\" then error(\"capabilities must be an array\")
+          elif ((\$caps | index(\$c)) != null) then \"capable\"
+          else \"incapable\"
+          end' \"\$metadata\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  result="$(printf '%s' "$result" | tr -d '[:space:]')"
+  [[ $rc -eq 0 ]] || return 2
+  case "$result" in
+    capable) return 0 ;;
+    incapable) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+assert_history_projection_revision_pair() { # $1=live $2=target $3=context
+  local live="$1" target="$2" context="${3:-transition}" live_rc=0 target_rc=0
+  probe_release_history_projection_revision "$live" || live_rc=$?
+  probe_release_history_projection_revision "$target" || target_rc=$?
+  if [[ $live_rc -eq 2 || $target_rc -eq 2 ]]; then
+    echo "✗ $context 无法核验 $HISTORY_PROJECTION_REVISION_CAP(live_rc=$live_rc target_rc=$target_rc),fail-closed。" >&2
+    return 1
+  fi
+  if [[ $live_rc -ne $target_rc ]]; then
+    echo "✗ $context 的 live/target history projection 代际不一致；禁止双 master 或自动 saga 回切(live_rc=$live_rc target_rc=$target_rc)。" >&2
+    return 1
+  fi
+  echo "  ✓ $context 的 live/target history projection 代际一致。"
+}
+
+assert_history_projection_revision_offline_target() { # $1=target $2=previous; caller proved master inactive
+  prepare_history_projection_revision_activation "$1" "$2"
+}
+
+prepare_history_projection_revision_activation() { # $1=target $2=current
+  local target="$1" current="$2" target_rc=0 current_rc=0
+  probe_release_history_projection_revision "$target" || target_rc=$?
+  case "$target_rc" in
+    0) return 0 ;;
+    2)
+      echo "✗ 目标 release 的 $HISTORY_PROJECTION_REVISION_CAP 状态不可核验:$target" >&2
+      return 1 ;;
+  esac
+  probe_release_history_projection_revision "$current" || current_rc=$?
+  [[ $current_rc -eq 1 ]] && return 0
+  echo "✗ 拒绝不可逆 history projection 降级:current_rc=$current_rc；旧 master 会绕过 projection revision（即使当前 revision 全为 0 也不安全）。" >&2
+  return 1
+}
 
 # Tri-state artifact probe. Return codes are part of the safety contract:
 #   0 = capability is explicitly present
@@ -3148,6 +3340,10 @@ assert_release_activation_compensation_compatible() {  # $1=old_release $2=candi
     fi
     echo "  ✓ 自动补偿目标 master/runtime 均具备 $LOSSLESS_TURN_TAPE_CAP(无条件检查,无首写竞态)。" >&2
   fi
+  if ! prepare_history_projection_revision_activation "$old_release" "$candidate_release"; then
+    mark_deploy_recovery_required "history projection revision prevents automatic compensation to old master:$old_release"
+    return 1
+  fi
 }
 
 # 仅供紧邻的已通过能力门的补偿路径调用：恢复旧 symlink/.prev-release 并 restart 旧 unit。
@@ -3242,6 +3438,7 @@ activate_release() {
   [[ "$ACTIVE_SLOT" == A ]] && old_prev_file="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
   # 前端资产先于任何 live 翻转就位；失败仅留下加法式孤儿资产，无运行态变化。
   sync_assets_to_pool "$reldir" || return 1
+  prepare_history_projection_revision_activation "$reldir" "$prev" || return 1
   tmplink="$ACTIVE_SRC.newlink.$$"
   # A slot:同时写 .prev-release 文件(传统 lane 兼容兜底);B slot:rollback 权威在 deploy_state.previous_active_release,不写文件(不污染 A 的兜底)。
   local prev_file_cmd=""
@@ -3538,6 +3735,7 @@ activate_runtime_tuple() {
   local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
+  assert_history_projection_revision_pair "$prev_src" "$BUILT_RELEASE" "runtime hotcfg activation" || return 1
   # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
   if [[ "$ACTIVE_SLOT" == A ]]; then
     old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
@@ -3789,8 +3987,8 @@ snapshot_and_sync_source() {
 # 不许再复制)。副作用:设全局 DIST_BUILD_ID 供 dist_handshake_smoke 校验。不含 restart。
 DIST_BUILD_ID=""
 build_and_sync_dist() {
-  echo "── vite build ──"
-  run "(cd '$REPO_ROOT/packages/web-react' && npx vite build)"
+  echo "── web official build(tsc + vite) ──"
+  run "(cd '$REPO_ROOT' && npm run build --workspace packages/web-react)"
   local dist="$REPO_ROOT/packages/web-react/dist"
   if [[ "$DRY" != 1 ]]; then
     DIST_BUILD_ID="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
@@ -4649,6 +4847,17 @@ deploy() {
   if hotcfg_bundle_axis_on; then hc_bundle=1; hc_any=1; fi
   if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
   [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
+  if [[ "$hc_any" == 1 ]] && ! assert_history_projection_revision_pair "$kp_previous_release" "$BUILT_RELEASE" "runtime hotcfg activation"; then
+    if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
+      echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
+      exit 1
+    fi
+    # The hotcfg saga may automatically restore the old master after the new
+    # process has served. Across this irreversible floor, first adoption uses
+    # the ordinary single-master restart and leaves the runtime tuple unchanged.
+    echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
+    hc_bundle=0; hc_release=0; hc_any=0
+  fi
   if [[ "$hc_any" == 1 ]]; then
     echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release disable_bundle=$DISABLE_BUNDLE_FLAG disable_release=$DISABLE_RELEASE_FLAG)──"
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
@@ -4972,7 +5181,9 @@ activate_staged_inner() {
   fi
   # RFC §1.2:此处 sshk start 是 staged lane 的真正激活翻转点(unit 从停机→起旧同构状态)。翻转前
   # 活体断言远端 lease;此刻 unit 仍停(live 未改),失活即 exit 1 交由 activate_staged 的 recover_cutover。
+  assert_history_projection_revision_offline_target "$REMOTE_SRC" "$CUTOVER_ROOT/$CUTOVER_NONCE/source" || return 1
   assert_mutation_lease_alive "activate-staged-flip" || { echo "✗ production-mutation lease 失活;未激活 staged(unit 仍停,live 未改)" >&2; exit 1; }
+  mark_cutover_candidate_start_attempted || return 1
   echo "── start openclaude-v5(同构状态一次性激活)──"
   sshk "systemctl start $V5_UNIT"
   run "sleep 4"
@@ -5031,6 +5242,17 @@ deploy_dist() {
   if hotcfg_bundle_axis_on; then hc_bundle=1; hc_any=1; fi
   if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
   [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
+  local dist_previous_release=""
+  dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
+  [[ -n "$dist_previous_release" ]] || { echo "✗ --dist 无法解析当前 live release" >&2; exit 1; }
+  if [[ "$hc_any" == 1 ]] && ! assert_history_projection_revision_pair "$dist_previous_release" "$BUILT_RELEASE" "runtime hotcfg dist activation"; then
+    if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
+      echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
+      exit 1
+    fi
+    echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
+    hc_bundle=0; hc_release=0; hc_any=0
+  fi
   if [[ "$hc_any" == 1 ]]; then
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
@@ -5401,6 +5623,15 @@ rollback_runtime_tuple() {
       kp_plugin_bracket=0
     fi
   fi
+  if ! prepare_history_projection_revision_activation "$master" "$prev_src"; then
+    if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
+      knowledge_planet_plugin_transition_to_release "$plugin_helper" "$prev_src" \
+        && knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
+        || knowledge_planet_plugin_open_gate_current "$plugin_helper" \
+        || mark_deploy_recovery_required "master capability floor rejected tuple rollback and Plugin DB compensation failed"
+    fi
+    return 1
+  fi
   # 新 committed 条目 masterRelease=$master(=回滚到的 master),last committed 恒=live。
   # 末参 prev_master(R2-B2)仅供首启 pre-state;回滚时 history 必已有 committed 条目,不会触发。
   if ! hotcfg_rmt oc_hotcfg_activate_saga \
@@ -5617,6 +5848,7 @@ capability_matrix_preflight() {
   ssh "$KL_HOST" "jq -e '(.capabilities // []) | index(\"dual-master-v1\")' '$cma'" >/dev/null 2>&1 \
     || { echo "✗ active release 未声明 dual-master-v1 —— 双 master 不兼容,拒绝 canary(active 须先经基建版升级)" >&2; return 1; }
   assert_lossless_canary_pair "$active_rel" "$candidate_rel" || return 1
+  assert_history_projection_revision_pair "$active_rel" "$candidate_rel" "canary" || return 1
   # ③ 版本字段兼容(MAJOR 7):bridgeFrameSchema / runtimeApi
   local key av cv
   for key in bridgeFrameSchema runtimeApi; do
@@ -5925,6 +6157,13 @@ canary() {
   assert_lossless_turn_tape_floor "$reldir"
   # cutover 后 P3 candidate 也是一条真实激活路径；不能绕过模型权威兼容地板。
   assert_model_authority_floor "$reldir"
+  # Projection generations may not be started side-by-side. First adoption
+  # must use the ordinary single-master restart lane.
+  assert_history_projection_revision_pair "$DS_active_release" "$reldir" "canary pre-start" || {
+    echo "✗ history projection 代际不兼容;candidate 尚未初始化/启动,回 stable" >&2
+    recover_canary_prep "$cand"
+    exit 1
+  }
   # assets → union 池(candidate 与 active 前端 chunk 并集,跨 lane 可得)
   sync_assets_to_pool "$reldir"
 

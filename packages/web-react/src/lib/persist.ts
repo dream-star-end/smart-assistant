@@ -102,6 +102,8 @@ export type StoredSession = {
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
+  /** Projection revision paired with `_maxSeq` for safe incremental reads. */
+  _historyRevision?: number;
   /** 归档 `_orderSeq` 水位(字段名为滚动兼容保留)。*/
   _archivedThroughSeq?: number;
   /** 已归档消息条数(会话总数 = tail + 此值;UI"还有 N 条"与"从云端加载"按钮据此)。*/
@@ -472,6 +474,10 @@ export function mergeFullServerWins(
     deletionAuthority?: boolean;
     /** 当前活跃轮 clientMessageId(REST/WS 竞态守卫,活跃轮的行绝不被载荷自证清除)。 */
     activeClientMessageId?: string;
+    /** A projection revision change invalidates persisted rows absent from
+     * the full payload. Archived rows are dropped for later rehydration;
+     * hot rows with `_seq` propagate cross-device deletion. */
+    invalidateProjectionCache?: boolean;
   },
 ): ChatMessage[] {
   const hasExactCompletionEvidence =
@@ -498,6 +504,14 @@ export function mergeFullServerWins(
   //  P2(证据为正,无需版本护栏)—— 已被载荷作证覆盖 turn 的本地过期副本 → 删。
   local = local.filter((m) => {
     if (!m) return false;
+    if (opts?.invalidateProjectionCache === true) {
+      if (isArchivedServerRow(m, archivedThroughSeq)) return false;
+      const persisted = typeof m._seq === "number" && Number.isSafeInteger(m._seq) && m._seq > 0;
+      const belongsToActiveTurn =
+        typeof opts.activeClientMessageId === "string" &&
+        (m.id === opts.activeClientMessageId || m._clientMessageId === opts.activeClientMessageId);
+      if (persisted && m.id && !serverIdsForAuthority.has(m.id) && !belongsToActiveTurn) return false;
+    }
     if (
       opts?.deletionAuthority === true &&
       m._source === "server" &&

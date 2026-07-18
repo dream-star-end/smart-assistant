@@ -631,7 +631,10 @@ describe('v5 release safety lanes', () => {
     assert.match(source, /gc_rc" in[\s\S]*75\)[\s\S]*首个 rm 前安全跳过整轮删除/)
 
     const build = source.match(/build_release\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    assert.ok(build.indexOf('harden_release_baseline "$staging"') > build.indexOf('vite build'))
+    assert.ok(
+      build.indexOf('harden_release_baseline "$staging"') >
+        build.indexOf('npm run build --workspace packages/web-react'),
+    )
     assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf("'$staging/.complete'"))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
@@ -910,11 +913,19 @@ describe('v5 release safety lanes', () => {
 
   test('requiredMigrations gate includes deploy_state and precedes every write dispatch', async () => {
     const metadata = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8')) as {
+      minimumRequiredMigration: string
       requiredMigrations: string[]
     }
     assert.ok(metadata.requiredMigrations.includes('0135_deploy_state'))
     assert.ok(metadata.requiredMigrations.includes('0153_marketplace_plugin_kernel'))
     assert.ok(metadata.requiredMigrations.includes('0168_knowledge_planet_automation'))
+    const migrationDir = path.join(root, 'packages/commercial/src/db/migrations')
+    const expected = (await readdir(migrationDir))
+      .filter((name) => name.endsWith('.sql'))
+      .map((name) => name.slice(0, -4))
+      .filter((version) => version >= metadata.minimumRequiredMigration)
+      .sort()
+    assert.deepEqual(metadata.requiredMigrations, expected)
     const source = await readFile(deploy, 'utf8')
     const gateAt = source.indexOf('assert_repo_required_migrations || exit 1')
     const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
@@ -926,6 +937,153 @@ describe('v5 release safety lanes', () => {
     assert.equal(dry.status, 0, dry.stderr || dry.stdout)
     const combined = dry.stdout + dry.stderr
     assert.ok(combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'))
+  })
+
+  test('requiredMigrations manifest is exact for the target release archive, including rollback fixtures', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-migration-manifest-')); dirs.push(dir)
+    const release = path.join(dir, 'old-release')
+    const migrations = path.join(release, 'packages/commercial/src/db/migrations')
+    const metadataDir = path.join(release, 'deploy/v5')
+    await mkdir(migrations, { recursive: true })
+    await mkdir(metadataDir, { recursive: true })
+    await writeFile(path.join(migrations, '0123_first.sql'), '-- old release\n')
+    await writeFile(path.join(migrations, '0124_second.sql'), '-- old release\n')
+    const metadata = path.join(metadataDir, 'release-metadata.json')
+    await writeFile(metadata, JSON.stringify({
+      minimumRequiredMigration: '0123_first',
+      requiredMigrations: ['0123_first', '0124_second'],
+    }))
+    const invoke = (file: string) => spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `required_migrations_csv '${file}' local`,
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    const valid = invoke(metadata)
+    assert.equal(valid.status, 0, valid.stderr)
+    assert.equal(valid.stdout, '0123_first,0124_second')
+    // A migration introduced only in today's checkout is correctly irrelevant
+    // to this old immutable archive; omitting a file that IS in the archive is not.
+    await writeFile(metadata, JSON.stringify({
+      minimumRequiredMigration: '0123_first', requiredMigrations: ['0123_first'],
+    }))
+    const omitted = invoke(metadata)
+    assert.notEqual(omitted.status, 0)
+    assert.match(omitted.stderr, /requiredMigrations mismatch/)
+  })
+
+  test('remote immutable legacy releases remain usable before the history projection floor', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-legacy-migration-manifest-')); dirs.push(dir)
+    const releasesRoot = path.join(dir, 'releases')
+    const release = path.join(releasesRoot, 'rel-ccd3e7e0-legacy')
+    const migrations = path.join(release, 'packages/commercial/src/db/migrations')
+    const metadataDir = path.join(release, 'deploy/v5')
+    await mkdir(migrations, { recursive: true })
+    await mkdir(metadataDir, { recursive: true })
+    await writeFile(path.join(release, '.complete'), '{"sha":"ccd3e7e0"}\n')
+
+    // Exact release-metadata.json shape shipped by ccd3e7e0: it predates
+    // minimumRequiredMigration and its curated list is intentionally not sorted.
+    const legacyMetadata = {
+      databaseCompatibility: 'backward-compatible',
+      requiredMigrations: [
+        '0123_gpt56_models',
+        '0124_gpt56_xhigh_defaults',
+        '0134_sessions_master_pg',
+        '0133_selfheal_incidents',
+        '0134_selfheal_condition_concurrency',
+        '0135_selfheal_hardening',
+        '0135_deploy_state',
+        '0137_selfheal_user_notice_approval',
+        '0143_model_catalog',
+        '0144_model_authority_guards',
+        '0145_retire_legacy_incident_notices',
+        '0146_connector_ai_declarative_verification',
+        '0147_lossless_turn_tapes',
+        '0148_inbox_rich_assets',
+        '0149_audit_hardening',
+        '0150_agent_tool_rollups',
+        '0151_product_friction_events',
+        '0152_marketplace_capability_bindings',
+        '0153_marketplace_plugin_kernel',
+        '0154_model_admin_audit_returning_grant',
+        '0155_selfheal_drill_policy',
+        '0156_selfheal_execution_routing',
+        '0157_lossless_runtime_batches',
+        '0158_skill_retrieval_shadow',
+        '0159_goal_state',
+        '0163_plugin_write_control',
+        '0164_admin_audit_model_admin_grant',
+        '0166_prompt_queue',
+        '0167_turn_waiver_receipts',
+        '0168_knowledge_planet_automation',
+        '0169_plugin_write_preapproval',
+        '0170_durable_turn_dispatch',
+      ],
+      capabilities: [
+        'sessions-store-pg-v1',
+        'dual-master-v1',
+        'model_authority_v1',
+        'model_authority_v1-egress',
+        'lossless-turn-tape-v2',
+        'lossless-turn-runtime-batch-v1',
+        'durable-turn-dispatch-v1',
+      ],
+      runtimeCapabilities: [
+        'model_authority_v1',
+        'lossless-turn-tape-v2',
+        'durable-turn-dispatch-v1',
+      ],
+      bridgeFrameSchema: '1',
+      runtimeApi: '1',
+    }
+    for (const migration of legacyMetadata.requiredMigrations) {
+      await writeFile(path.join(migrations, `${migration}.sql`), '-- legacy release\n')
+    }
+    const metadata = path.join(metadataDir, 'release-metadata.json')
+    const invoke = (location: 'local' | 'remote') => spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `RELEASES_ROOT='${releasesRoot}'`,
+      "ssh() { local _host=\"$1\"; shift; \"$@\"; }",
+      `required_migrations_csv '${metadata}' ${location}`,
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+
+    await writeFile(metadata, JSON.stringify(legacyMetadata))
+    const legacyRemote = invoke('remote')
+    assert.equal(legacyRemote.status, 0, legacyRemote.stderr)
+    assert.equal(legacyRemote.stdout, legacyMetadata.requiredMigrations.join(','))
+
+    const legacyLocal = invoke('local')
+    assert.notEqual(legacyLocal.status, 0)
+    assert.match(legacyLocal.stderr, /invalid minimumRequiredMigration/)
+
+    await writeFile(metadata, JSON.stringify({
+      ...legacyMetadata,
+      capabilities: [...legacyMetadata.capabilities, 'history-projection-revision-v1'],
+    }))
+    const capableWithoutFloor = invoke('remote')
+    assert.notEqual(capableWithoutFloor.status, 0)
+    assert.match(capableWithoutFloor.stderr, /legacy migration manifest cannot declare history projection capability/)
+
+    await writeFile(metadata, JSON.stringify({
+      ...legacyMetadata,
+      requiredMigrations: [...legacyMetadata.requiredMigrations, legacyMetadata.requiredMigrations[0]],
+    }))
+    const duplicate = invoke('remote')
+    assert.notEqual(duplicate.status, 0)
+    assert.match(duplicate.stderr, /invalid legacy requiredMigrations/)
+  })
+
+  test('root typecheck and every dist build use the official web workspace gate', async () => {
+    const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
+    assert.match(pkg.scripts.typecheck, /typecheck --workspace packages\/web-react/)
+    const source = await readFile(deploy, 'utf8')
+    assert.doesNotMatch(source, /cd '\$staging\/packages\/web-react' && npx vite build/)
+    assert.doesNotMatch(source, /cd '\$REPO_ROOT\/packages\/web-react' && npx vite build/)
+    assert.match(source, /cd '\$staging' && npm run build --workspace packages\/web-react/)
+    assert.match(source, /cd '\$REPO_ROOT' && npm run build --workspace packages\/web-react/)
   })
 
   test('requiredMigrations remote failure stays fail-closed in production OR-list context', () => {
@@ -1304,6 +1462,13 @@ describe('v5 release safety lanes', () => {
       'smoke() { :; }',
       'mark_deploy_recovery_required() { printf "%s\\n" "$1" >>"$RECOVERY_LOG"; }',
       'probe_release_lossless_master_capability() {',
+      '  case "$1" in',
+      '    /release/candidate) return 0 ;;',
+      '    /release/old) return 1 ;;',
+      '    *) return 2 ;;',
+      '  esac',
+      '}',
+      'probe_release_history_projection_revision() {',
       '  case "$1" in',
       '    /release/candidate) return 0 ;;',
       '    /release/old) return 1 ;;',
@@ -1849,10 +2014,12 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
     assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
+    assert.ok(meta.capabilities.includes('history-projection-revision-v1'))
     assert.ok(meta.requiredMigrations.includes('0157_lossless_runtime_batches'))
     assert.ok(meta.requiredMigrations.includes('0164_admin_audit_model_admin_grant'))
     assert.ok(meta.requiredMigrations.includes('0166_prompt_queue'))
     assert.ok(meta.requiredMigrations.includes('0167_turn_waiver_receipts'))
+    assert.ok(meta.requiredMigrations.includes('0172_client_session_history_revision'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, [
       'model_authority_v1',
@@ -1870,6 +2037,234 @@ describe('v5 release safety lanes', () => {
     )
     // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
+  })
+
+  test('history projection revision capability blocks mixed writers and unsafe downgrade', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-history-revision-')); dirs.push(dir)
+    const legacy = path.join(dir, 'legacy')
+    const capable = path.join(dir, 'capable')
+    for (const [release, capabilities] of [
+      [legacy, ['dual-master-v1']],
+      [capable, ['dual-master-v1', 'history-projection-revision-v1']],
+    ] as const) {
+      await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
+      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'), JSON.stringify({ capabilities }))
+    }
+
+    const invoke = (command: string) => spawnSync('bash', ['-c', [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=0; KL_HOST=fake; ACTIVE_UNIT=fake.service; ACTIVE_PORT=18890; V5_ENV=/fake/env',
+      'ssh() {',
+      '  local host="$1"; shift; local command="$*"',
+      '  case "$command" in',
+      '    *"metadata="*) bash -c "$command" ;;',
+      '    *) printf "UNEXPECTED:%s\\n" "$command" >&2; return 90 ;;',
+      '  esac',
+      '}',
+      'smoke() { printf "SMOKE\\n"; }',
+      'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$*"; }',
+      command,
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+
+    const mixed = invoke(`assert_history_projection_revision_pair '${legacy}' '${capable}' canary`)
+    assert.notEqual(mixed.status, 0)
+    assert.match(mixed.stderr, /代际不一致/)
+    const same = invoke(`assert_history_projection_revision_pair '${capable}' '${capable}' canary`)
+    assert.equal(same.status, 0, same.stderr)
+
+    const firstAdoption = invoke(`prepare_history_projection_revision_activation '${capable}' '${legacy}'`)
+    assert.equal(firstAdoption.status, 0, firstAdoption.stderr)
+    const zeroRevisionDowngrade = invoke(`prepare_history_projection_revision_activation '${legacy}' '${capable}'`)
+    assert.notEqual(zeroRevisionDowngrade.status, 0)
+    assert.match(zeroRevisionDowngrade.stderr, /不可逆 history projection 降级/)
+    assert.doesNotMatch(zeroRevisionDowngrade.stdout + zeroRevisionDowngrade.stderr, /STOP|RESTART/)
+
+    const source = await readFile(deploy, 'utf8')
+    const prepareBody = source.slice(
+      source.indexOf('prepare_history_projection_revision_activation()'),
+      source.indexOf('\n# Tri-state artifact probe', source.indexOf('prepare_history_projection_revision_activation()')),
+    )
+    assert.doesNotMatch(prepareBody, /systemctl stop|history_projection_revision_count/)
+    assert.match(prepareBody, /即使当前 revision 全为 0 也不安全/)
+    const activationBody = source.slice(
+      source.indexOf('activate_release() {'),
+      source.indexOf('\n# 传统 deploy/rollback', source.indexOf('activate_release() {')),
+    )
+    assert.ok(
+      activationBody.indexOf('prepare_history_projection_revision_activation "$reldir" "$prev"')
+        < activationBody.indexOf("mv -T '$tmplink' '$ACTIVE_SRC'"),
+      'ordinary downgrade must hit the irreversible floor before the source flip',
+    )
+    const canaryLane = source.slice(
+      source.indexOf('canary() {'),
+      source.indexOf('\n# 内部账号 allowlist', source.indexOf('canary() {')),
+    )
+    assert.ok(
+      canaryLane.indexOf('assert_history_projection_revision_pair "$DS_active_release" "$reldir" "canary pre-start"')
+        < canaryLane.indexOf('start_candidate_unit_and_wait "$cand"'),
+      'mixed projection generations must be rejected before candidate start',
+    )
+    const recoveryBody = source.slice(
+      source.indexOf('recover_cutover()'),
+      source.indexOf('\nset_cutover_maintenance() {', source.indexOf('recover_cutover()')),
+    )
+    const transitionBody = source.slice(
+      source.indexOf('cutover_transition()'),
+      source.indexOf('\nbegin_cutover_step() {', source.indexOf('cutover_transition()')),
+    )
+    assert.ok(recoveryBody.indexOf('systemctl stop "$unit"') < recoveryBody.indexOf('current_history_capability='))
+    assert.ok(recoveryBody.indexOf('rollback_partial 1') < recoveryBody.indexOf('cp -al "$remote_src/." "$restore_dir/"'))
+
+    const remoteScript = recoveryBody.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE/)?.[1]
+    assert.ok(remoteScript, 'recover_cutover remote body not found')
+    const fixture = await mkdtemp(path.join(tmpdir(), 'v5-history-recovery-')); dirs.push(fixture)
+    const cutoverRoot = path.join(fixture, 'cutovers')
+    const nonce = 'a'.repeat(32)
+    const bundle = path.join(cutoverRoot, nonce)
+    const remoteSrc = path.join(fixture, 'current-source')
+    const bin = path.join(fixture, 'bin')
+    const marker = path.join(fixture, 'maintenance.json')
+    const systemctlLog = path.join(fixture, 'systemctl.log')
+    const envFile = path.join(fixture, 'current.env')
+    const targetCommit = 'b'.repeat(40)
+    const appliedSet = 'fixture_migration'
+    const appliedHash = createHash('sha256').update(appliedSet).digest('hex')
+    await mkdir(path.join(bundle, 'source/deploy/v5'), { recursive: true, mode: 0o700 })
+    await chmod(bundle, 0o700)
+    await mkdir(path.join(remoteSrc, 'deploy/v5'), { recursive: true })
+    await mkdir(bin)
+    const host = spawnSync('hostname', ['-f'], { encoding: 'utf8' }).stdout.trim()
+    await writeFile(path.join(bundle, 'manifest.json'), JSON.stringify({
+      host,
+      nonce,
+      old_image: 'fixture:image',
+      old_image_id: 'sha256:fixture',
+      target_commit: targetCommit,
+      database_compatibility: 'backward-compatible',
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      target_image: 'fixture:image',
+      target_image_id: 'sha256:fixture',
+      applied_migrations_hash: appliedHash,
+    }), { mode: 0o600 })
+    await writeFile(path.join(bundle, 'commercial-v5.env'), 'DATABASE_URL=postgres://unused\n', { mode: 0o600 })
+    await writeFile(path.join(bundle, 'state.json'), JSON.stringify({
+      state: 'activating', candidate_start_attempted: true,
+    }), { mode: 0o600 })
+    await writeFile(path.join(bundle, 'source/deploy/v5/release-metadata.json'), JSON.stringify({
+      capabilities: ['durable-turn-dispatch-v1'],
+    }))
+    await writeFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), JSON.stringify({
+      capabilities: ['durable-turn-dispatch-v1', 'history-projection-revision-v1'],
+    }))
+    await writeFile(envFile, 'DATABASE_URL=postgres://unused\nCURRENT=1\n', { mode: 0o600 })
+    await writeFile(marker, JSON.stringify({ schema: 1, nonce }))
+    await writeFile(path.join(bin, 'docker'), [
+      '#!/bin/sh',
+      'printf "%s\\n" sha256:fixture',
+    ].join('\n') + '\n')
+    await writeFile(path.join(bin, 'systemctl'), [
+      '#!/bin/sh',
+      'printf "%s\\n" "$*" >>"$SYSTEMCTL_LOG"',
+    ].join('\n') + '\n')
+    await writeFile(path.join(bin, 'curl'), [
+      '#!/bin/sh',
+      'printf "%s\\n" \'{"ok":true,"channel":"v5"}\'',
+    ].join('\n') + '\n')
+    await writeFile(path.join(bin, 'psql'), [
+      '#!/bin/sh',
+      'printf "%s\\n" "$APPLIED_SET"',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'docker'), 0o755)
+    await chmod(path.join(bin, 'systemctl'), 0o755)
+    await chmod(path.join(bin, 'curl'), 0o755)
+    await chmod(path.join(bin, 'psql'), 0o755)
+    const transitionScript = transitionBody.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE/)?.[1]
+    assert.ok(transitionScript, 'cutover_transition remote body not found')
+    const transitioned = spawnSync('bash', ['-c', transitionScript!, '--',
+      cutoverRoot,
+      path.join(fixture, 'cutover.lock'),
+      nonce,
+      targetCommit,
+      'activating',
+      'activated',
+      envFile,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, APPLIED_SET: appliedSet },
+    })
+    assert.equal(transitioned.status, 0, transitioned.stderr || transitioned.stdout)
+    const activatedState = JSON.parse(await readFile(path.join(bundle, 'state.json'), 'utf8'))
+    assert.equal(activatedState.state, 'activated')
+    assert.equal(activatedState.candidate_start_attempted, true)
+    const recovered = spawnSync('bash', ['-c', remoteScript!, '--',
+      cutoverRoot,
+      path.join(fixture, 'cutover.lock'),
+      nonce,
+      remoteSrc,
+      envFile,
+      `openclaude-v5-history-test-${process.pid}.service`,
+      '18890',
+      marker,
+      path.join(fixture, 'maintenance.lock'),
+      'history-projection-revision-v1',
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
+    })
+    assert.notEqual(recovered.status, 0)
+    assert.match(recovered.stderr, /refusing irreversible history projection downgrade/)
+    assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
+    await assert.rejects(readFile(marker, 'utf8'))
+    const currentMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
+    assert.ok(currentMeta.capabilities.includes('history-projection-revision-v1'))
+
+    // A stage/pre-start failure may leave capable metadata in a partial source,
+    // but it never served. The durable marker is the authority: restore the
+    // trusted legacy bundle instead of starting the half-staged tree.
+    await writeFile(path.join(bundle, 'state.json'), JSON.stringify({
+      state: 'staging', candidate_start_attempted: false,
+    }), { mode: 0o600 })
+    await writeFile(marker, JSON.stringify({ schema: 1, nonce }))
+    await writeFile(systemctlLog, '')
+    const preStartRecovery = spawnSync('bash', ['-c', remoteScript!, '--',
+      cutoverRoot,
+      path.join(fixture, 'cutover.lock'),
+      nonce,
+      remoteSrc,
+      envFile,
+      `openclaude-v5-history-test-${process.pid}.service`,
+      '18890',
+      marker,
+      path.join(fixture, 'maintenance.lock'),
+      'history-projection-revision-v1',
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
+    })
+    assert.equal(preStartRecovery.status, 0, preStartRecovery.stderr || preStartRecovery.stdout)
+    assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
+    await assert.rejects(readFile(marker, 'utf8'))
+    const restoredMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
+    assert.ok(!restoredMeta.capabilities.includes('history-projection-revision-v1'))
+
+    const stagedBody = source.slice(
+      source.indexOf('activate_staged_inner()'),
+      source.indexOf('\nactivate_staged() {', source.indexOf('activate_staged_inner()')),
+    )
+    assert.ok(
+      stagedBody.indexOf('mark_cutover_candidate_start_attempted')
+        < stagedBody.indexOf('systemctl start $V5_UNIT'),
+      'candidate start evidence must commit before the first start attempt',
+    )
   })
 
   test('model-authority readiness tolerates startup delay, rejects PID churn, and has a hard deadline', async () => {

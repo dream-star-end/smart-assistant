@@ -46,7 +46,7 @@
     "test:evals": "npx tsx --test --test-force-exit evals/run.test.ts",
     "test": "npm run test:gateway && npm run test:web && npm run test:storage && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
-    "typecheck": "tsc --build",
+    "typecheck": "tsc --build && npm run typecheck --workspace packages/web-react",
     "check:v5": "npm run check:tutorials && npm run typecheck && npm run test:v5:ops && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:commercial:unit:gate",
     "typecheck:clean": "tsc --build --clean",
     "typecheck:watch": "tsc --build --watch",

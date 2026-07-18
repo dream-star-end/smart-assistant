@@ -387,7 +387,8 @@ export async function applyTurnWaiver(
           SET updated_at=GREATEST(
                 s.updated_at + 1,
                 (floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT
-              )
+              ),
+              history_revision=s.history_revision + 1
         WHERE s.user_id=$1
           AND EXISTS (
             SELECT 1

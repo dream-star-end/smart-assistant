@@ -286,7 +286,8 @@ export type SessionMeta = {
 /**
  * GET /api/sessions/:id（全量或增量）。
  * - 全量（无 since / since≤0）：isPartial=false，messages 为完整数组。
- * - 增量（?since=<seq>）：messages 仅含 `_seq > since` 的增量；legacy 行降级为
+ * - 增量（?since=<seq>&since_history_revision=<rev>）：revision 匹配时 messages
+ *   仅含 `_seq > since` 的增量；legacy 行或 revision 缺失/不匹配降级为
  *   isPartial=false + 全量 messages（后端无副作用回填）。
  * maxSeq 由 messages 实算（非 next_seq-1），客户端据此推进游标。
  *
@@ -306,6 +307,10 @@ export type SessionDetail = {
   lastAt: number;
   messages: unknown[];
   updatedAt: number;
+  /** Projection revision paired with `maxSeq`; absent only on rolling old backends. */
+  historyRevision?: number;
+  /** Client-local marker: incremental request hit a legacy backend and was retried full. */
+  _projectionRevisionUnsupported?: true;
   isPartial: boolean;
   totalMessageCount: number;
   maxSeq: number;
@@ -326,6 +331,8 @@ export type SessionArchivePage = {
   messages: unknown[];
   hasMore: boolean;
   oldestSeq: number | null;
+  /** Projection revision captured with this page (rolling old backend may omit). */
+  historyRevision?: number;
 };
 
 /**

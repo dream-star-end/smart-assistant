@@ -1408,6 +1408,12 @@ export function resolveDelegateParentClientSessionId(args: {
   return webchat?.[1] ?? key
 }
 
+export function _parseHistoryRevisionCursor(raw: string | null): number | undefined {
+  if (raw === null || !/^(0|[1-9]\d*)$/.test(raw)) return undefined
+  const parsed = Number(raw)
+  return Number.isSafeInteger(parsed) ? parsed : undefined
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -3663,9 +3669,17 @@ export class Gateway {
         // `since` fall back to the full payload via `isPartial: false`.
         const sinceRaw = url.searchParams.get('since')
         const sinceSeq = sinceRaw !== null ? Number(sinceRaw) : 0
+        const historyRevisionRaw = url.searchParams.get('since_history_revision')
+        // Missing/invalid rolling-client revisions are intentionally not a
+        // 400: storage treats them as a revision mismatch and returns a full
+        // payload, which self-heals old clients without a coordinated cutover.
+        const sinceHistoryRevision = _parseHistoryRevisionCursor(historyRevisionRaw)
         const useIncremental = Number.isFinite(sinceSeq) && sinceSeq > 0
         if (useIncremental) {
-          getClientSessionPartial(sessId, userId, sinceSeq, { projection: 'chat' })
+          getClientSessionPartial(sessId, userId, sinceSeq, {
+            projection: 'chat',
+            sinceHistoryRevision,
+          })
             .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
             .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
         } else {
