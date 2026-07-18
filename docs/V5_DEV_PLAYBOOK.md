@@ -99,9 +99,21 @@ git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrit
 npm run typecheck                                   # 全仓 tsc --build(必须干净)
 npm run test:gateway                                # node tsx --test(≈1255 个)
 cd packages/web-react && npx vitest run             # ≈433 个
+cd packages/web-react && npm run test:browser       # 真 Chromium 组件冒烟(见下方红线)
 npm run test:storage                                # ≈224 个
 npm run test:commercial:unit                        # 本机缺 PG/Redis 会有 ~70 个存量环境失败!
 ```
+🔴 **用户可感知交互面必须过真浏览器,jsdom 绿不作数**(2026-07-18 附件事故制度化):
+jsdom 对"点击→系统行为"类契约恒假阴性 —— label 激活查找走 ownerDocument 而非 tree
+scope、fireEvent 非受信不触发 React discrete 同步 flush,「点击添加附件无反应」这类
+回归在 jsdom 里**物理上测不出**。凡动 Composer / 消息渲染 / 会话列表等高频交互文件:
+- `packages/web-react/browser-tests/`(esbuild bundle 真组件 + playwright-core 受信
+  点击,`npm run test:browser`,CI web-react job 必跑)是这类契约的**唯一有效层**;
+  新增交互契约(菜单内触发 file input/dialog、原生激活路径、指针序列依赖)在这里加用例,
+  且必须**红绿对照**(把修复撤掉跑一遍必须红,恒绿的守门是假守门)。
+- 部署后线上旅程由 `scripts/v5-e2e-journey-canary.mjs`(E2E 旅程门,§4.2)兜底。
+- 浏览器解析单一权威=`scripts/lib/resolve-browser.mjs`(env OC_E2E_BROWSER→系统
+  Chrome→ms-playwright 缓存);找不到浏览器=fail-loud,禁"缺浏览器就跳过"(fail-open)。
 **commercial unit 失败判定法**(不许因存量失败误判,也不许漏掉新增失败):
 ```bash
 # 在基线 commit 的树与你的树各跑一次,diff 失败名单;你的失败集必须 ⊆ 基线失败集
@@ -259,6 +271,14 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 > 已坏项继续告警，monitor/部署/cutover 共用远端 flock，smoke 后按 schema+nonce 清理，
 > 超时仍坏立即升级真实事故；可信且全健康的 stale schema=1 可自动清，其他 stale marker
 > 保留但不阻塞部署、全程 fail-open。禁止人工造 marker。
+> **E2E 旅程门(2026-07-18 附件事故补强)**:deploy 与 --dist 的每个成功出口在
+> end_planned_maintenance 后必跑 `smoke_e2e_journey`——部署发起机本机起真 Chromium,
+> 自建 ssh 隧道走线上核心旅程(UI 登录/附件全链含 filechooser/目标入口/带附件发送)。
+> 失败=fail-loud 非零退出(部署判定失败,截图在 /tmp/e2e-journey-fail-*.png,人工裁定
+> --rollback 或修断言);第一期**不进 validation 自动回滚链**(UI 断言有文案漂移假阳性面,
+> 连续两周零假阳性后升级,升级时同步 v5ReleaseSafety 断言)。`V5_SMOKE_E2E=0` 显式豁免
+> (紧急场景,事后必须补跑)。依赖:部署树 node_modules 需含 playwright-core(npm install),
+> 缺失门会 fail-loud 指引。接线契约由 v5ReleaseSafety.test.ts 锁定(四出口+函数体)。
 ```bash
 cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件会被 rsync 上去)
 git status --porcelain                       # 必须为空
