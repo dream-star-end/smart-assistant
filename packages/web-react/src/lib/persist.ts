@@ -16,7 +16,61 @@
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage, ChatRoutingSnapshot } from "./chat/model";
 import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
+import {
+  collapsedAnchorTerminalKind,
+  DISPATCH_ERROR_ROW_ID_PREFIX,
+  isCollapsedTapeAnchor,
+} from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
+
+/** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
+export type ServerTurnTerminal = "completed" | "error";
+
+/**
+ * 从 server 载荷推导「已收尾 turn → 终态类别」映射(clientMessageId 键)。socket.applyServerMessages
+ * 据此**显式收敛**:清发送态 + user 行置 replied/error(不依赖 completion-evidence 巧合路径)。
+ *  - error:dispatch error projection 虚拟行(id 前缀 oc-dispatch-err:)或任何带 _errorCode 的 server
+ *    终态行(engine_error 等持久化错误卡)。
+ *  - completed:真 lossless tape(finalize 时原子落库)展开的 server-authored 生成行
+ *    (assistant/thinking/tool、无 _errorCode)—— 单行即证明整 turn 已收尾。
+ * **completed 覆盖 error**:同 cmid 若既有真 tape 生成行又有 error projection(late-tape 撤销竞态),
+ * 以真内容为准(与渲染层 collectResolvedDispatchTurnIds 抑制口径一致)。
+ */
+export function detectServerTerminalTurns(
+  serverRows: readonly ChatMessage[],
+): Map<string, ServerTurnTerminal> {
+  const errored = new Set<string>();
+  const completed = new Set<string>();
+  for (const m of serverRows) {
+    const cmid = m?._clientMessageId;
+    if (typeof cmid !== "string" || cmid.length === 0) continue;
+    // §9 折叠 anchor:**按 `_dispatchOutcome` 分类**(outcome-aware 谓词拆分)。折叠 anchor 是
+    // 空正文的 server assistant 行,若落入下方泛化分支会被一律判 completed —— 但 crashed/executed_error
+    // 折叠 anchor 应判 error。故在此优先拦截并按终态映射(completed/interrupted→completed;
+    // crashed/executed_error/not_accepted→error;非终态→不作证)。
+    if (isCollapsedTapeAnchor(m)) {
+      const kind = collapsedAnchorTerminalKind(m._dispatchOutcome);
+      if (kind === "completed") completed.add(cmid);
+      else if (kind === "error") errored.add(cmid);
+      continue;
+    }
+    if (
+      (typeof m.id === "string" && m.id.startsWith(DISPATCH_ERROR_ROW_ID_PREFIX)) ||
+      (typeof m._errorCode === "string" && m._errorCode.length > 0)
+    ) {
+      errored.add(cmid);
+    } else if (
+      isServerAuthoredRow(m) &&
+      (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
+    ) {
+      completed.add(cmid);
+    }
+  }
+  const out = new Map<string, ServerTurnTerminal>();
+  for (const cmid of errored) out.set(cmid, "error");
+  for (const cmid of completed) out.set(cmid, "completed"); // completed 覆盖 error(真 tape 胜过残留投影)
+  return out;
+}
 
 /** IndexedDB schema 版本 + 唯一对象存储名。*/
 const DB_VERSION = 1;
@@ -293,6 +347,16 @@ function isGeneratedRole(role: ChatMessage["role"] | undefined): boolean {
 }
 
 /**
+ * §9 折叠卷展开行:本地把折叠 anchor 展开成的 flat 行(server 权威内容水合,带 `_tapeExpandedFrom` 标记)。
+ * server 只回折叠 anchor、**从不回这些展开行**,故它们在 full 载荷里"缺席"是**预期**而非删除信号 ——
+ * 必须豁免 P1 缺席删除,否则每次 full sync 都把展开态打回折叠。(它们是 `_source:'server'`,天然不入
+ * P2 的 isCoveredStaleLocalRow 非 server 行删除;此处只需闭合 P1。)
+ */
+function isLocallyExpandedTapeRow(m: ChatMessage): boolean {
+  return typeof m._tapeExpandedFrom === "string" && m._tapeExpandedFrom.length > 0;
+}
+
+/**
  * **同步权威传播**(07-17 tail 洪水事故收尾根治):从 server 载荷自身推导"已被权威 tape 覆盖的
  * turn 集",据此删除本地残留的过期副本。此前完成证据只认调用方传入的 completedClientMessageId
  * (仅"刚完成的那一轮"),事故期间落进 IndexedDB 的历史脏行(旧代码铸的 live 行:无
@@ -420,7 +484,9 @@ export function mergeFullServerWins(
       m._source === "server" &&
       m.id &&
       !serverIdsForAuthority.has(m.id) &&
-      !isArchivedServerRow(m, archivedThroughSeq)
+      !isArchivedServerRow(m, archivedThroughSeq) &&
+      // §9:折叠卷展开行 server 只回折叠 anchor、从不回展开行 → 其缺席是预期,豁免"缺席即删"。
+      !isLocallyExpandedTapeRow(m)
     ) {
       return false;
     }
@@ -450,7 +516,10 @@ export function mergeFullServerWins(
           m.role === "user" ||
           (isTeamOwnedRole(m.role) && !m._adoptedInto) ||
           // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
-          (m.role === "system" && !isServerAuthoredRow(m))),
+          (m.role === "system" && !isServerAuthoredRow(m)) ||
+          // ⑥ §9 折叠卷展开行:server 只回折叠 anchor、从不回展开行。折叠 tape 非末轮(展开行落在
+          //    中段)时,须与 P1 缺席豁免一致地保留,否则 full sync 把中段展开态打回折叠。
+          isLocallyExpandedTapeRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
     return applyHistoryProjectionPatches(stableSortByTs(serverChanged ? serverMerged : server));
@@ -591,6 +660,17 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
     serverMsg = {
       ...serverMsg,
       usage: { ...(serverMsg.usage ?? {}), waived: true },
+    };
+  }
+  // §9 折叠 anchor 的**本地展开态是渲染态权威**:server 重发折叠 anchor(同 id、无展开标记)绝不能把
+  // 已展开的会话打回折叠——展开行是 server 权威内容的水合,不回退(RFC §9.1 "保留本地展开")。与 waived
+  // 同款单调保留:仅保留展开标记 + 游标,anchor 其余字段仍 server-wins。展开行本体(独立 flat 行)由
+  // mergeFullServerWins 的 P1 缺席豁免(isLocallyExpandedTapeRow)保护。
+  if (localMsg._tapeExpanded === true && serverMsg._tapeCollapsed === true) {
+    serverMsg = {
+      ...serverMsg,
+      _tapeExpanded: true,
+      ...(localMsg._tapeExpandCursor !== undefined ? { _tapeExpandCursor: localMsg._tapeExpandCursor } : {}),
     };
   }
   // server echo owns the durable user row, but these client-only fields are required to

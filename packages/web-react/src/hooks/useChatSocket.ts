@@ -112,6 +112,34 @@ export type UseChatSocket = {
   loadOlderHistory: (
     sessId: string | undefined,
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
+  /**
+   * §9 折叠卷展开:拉 tape 记录一页(getTapeRecords)并就地展开折叠 anchor(socket.applyExpandedTapeRecords)。
+   * `cursor` 缺省(null)=首页,续拉传上次返回的 nextCursor。并发去重(同 anchor 在飞时忽略);非抛出式契约。
+   */
+  expandCollapsedTape: (
+    sessId: string | undefined,
+    anchorId: string,
+    tapeId: string,
+    cursor?: number | null,
+  ) => Promise<{ ok: boolean; nextCursor?: number | null; total?: number; busy?: boolean; error?: boolean }>;
+  /** §9 折叠卷收起(纯本地,抹展开行还原折叠态)。 */
+  collapseTape: (sessId: string | undefined, anchorId: string) => void;
+  /**
+   * §9 截断记录"查看完整":原样拉 tape 记录一页(不改会话内存,供截断工具卡内联抽屉显示更完整版本)。
+   * 失败返 null(非抛出)。
+   */
+  fetchTapeRecords: (
+    sessId: string | undefined,
+    tapeId: string,
+    cursor?: number | null,
+  ) => Promise<{ records: ChatMessage[]; nextCursor: number | null; total: number } | null>;
+  /** §9(M-§9-1)单条超大记录分块读(≤256KB/请求;失败返 null 非抛出)。 */
+  fetchTapeRecordChunk: (
+    sessId: string | undefined,
+    tapeId: string,
+    recordOrdinal: number,
+    offset?: number,
+  ) => Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
   /** 删除某会话的本地持久副本（与 removeSession 配套）。*/
   removePersisted: (sessId: string) => void;
   /** 清空当前 user 命名空间（登出隐私收尾）。*/
@@ -501,6 +529,71 @@ export function useChatSocket(opts: {
     },
     [socket],
   );
+  // §9 折叠卷展开并发闸(按 sessId::anchorId,同 anchor 在飞不重入)。
+  const expandingTapesRef = useRef<Set<string>>(new Set());
+  const expandCollapsedTape = useCallback<UseChatSocket["expandCollapsedTape"]>(
+    async (sessId, anchorId, tapeId, cursor) => {
+      const a = authRef.current;
+      if (!a || !sessId || !anchorId || !tapeId) return { ok: false };
+      const guardKey = `${sessId}::${anchorId}`;
+      if (expandingTapesRef.current.has(guardKey)) return { ok: false, busy: true };
+      expandingTapesRef.current.add(guardKey);
+      try {
+        const page = await api.getTapeRecords(a, sessId, tapeId, cursor ?? null);
+        const records = Array.isArray(page.records) ? (page.records as ChatMessage[]) : [];
+        const nextCursor = typeof page.nextCursor === "number" ? page.nextCursor : null;
+        // applyExpandedTapeRecords 内部已 persistSession + scheduleNotify(展开态随 IndexedDB 往返保留)。
+        socket.applyExpandedTapeRecords(sessId, anchorId, records, nextCursor);
+        return { ok: true, nextCursor, total: typeof page.total === "number" ? page.total : records.length };
+      } catch {
+        return { ok: false, error: true }; // 失败:卡片保留"可重试",不封死
+      } finally {
+        expandingTapesRef.current.delete(guardKey);
+      }
+    },
+    [socket],
+  );
+  const collapseTape = useCallback<UseChatSocket["collapseTape"]>(
+    (sessId, anchorId) => {
+      if (!sessId || !anchorId) return;
+      socket.collapseTape(sessId, anchorId);
+    },
+    [socket],
+  );
+  const fetchTapeRecords = useCallback<UseChatSocket["fetchTapeRecords"]>(
+    async (sessId, tapeId, cursor) => {
+      const a = authRef.current;
+      if (!a || !sessId || !tapeId) return null;
+      try {
+        const page = await api.getTapeRecords(a, sessId, tapeId, cursor ?? null);
+        return {
+          records: Array.isArray(page.records) ? (page.records as ChatMessage[]) : [],
+          nextCursor: typeof page.nextCursor === "number" ? page.nextCursor : null,
+          total: typeof page.total === "number" ? page.total : 0,
+        };
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
+  const fetchTapeRecordChunk = useCallback<UseChatSocket["fetchTapeRecordChunk"]>(
+    async (sessId, tapeId, recordOrdinal, offset) => {
+      const a = authRef.current;
+      if (!a || !sessId || !tapeId || !Number.isInteger(recordOrdinal) || recordOrdinal < 0) return null;
+      try {
+        const r = await api.getTapeRecordChunk(a, sessId, tapeId, recordOrdinal, offset ?? 0);
+        return {
+          chunk: typeof r.chunk === "string" ? r.chunk : "",
+          nextOffset: typeof r.nextOffset === "number" ? r.nextOffset : null,
+          totalBytes: typeof r.totalBytes === "number" ? r.totalBytes : 0,
+        };
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
   const storedMaxSeq = useCallback(
     (sessId: string | undefined) => {
       void snap.version;
@@ -551,6 +644,10 @@ export function useChatSocket(opts: {
       mergeServerHistory,
       storedMaxSeq,
       loadOlderHistory,
+      expandCollapsedTape,
+      collapseTape,
+      fetchTapeRecords,
+      fetchTapeRecordChunk,
       removePersisted,
       wipePersistence,
       sendRepoBind,
@@ -576,6 +673,10 @@ export function useChatSocket(opts: {
       mergeServerHistory,
       storedMaxSeq,
       loadOlderHistory,
+      expandCollapsedTape,
+      collapseTape,
+      fetchTapeRecords,
+      fetchTapeRecordChunk,
       removePersisted,
       wipePersistence,
       sendRepoBind,

@@ -792,7 +792,8 @@ describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
     const n = Math.floor(rnd() * 9); // 0..8 条(含空/单元素边界)
     const out: ChatMessage[] = [];
     for (let i = 0; i < n; i++) {
-      const m: ChatMessage = { id: `m${i}`, role: "assistant", text: "" };
+      // ts 有意可缺(下方 ~15% 分支不赋值,测非有限/缺失 ts 的排序兜底):用 as 断言,不改运行时。
+      const m = { id: `m${i}`, role: "assistant", text: "" } as ChatMessage;
       // ~65% 带 _orderSeq(小池子 → 制造碰撞/乱序/时钟偏移);其余为本地乐观行(无 _orderSeq)。
       if (rnd() < 0.65) m._orderSeq = 1 + Math.floor(rnd() * 6);
       if (rnd() < 0.5) m._seq = 1 + Math.floor(rnd() * 40); // 比较器应完全忽略 _seq

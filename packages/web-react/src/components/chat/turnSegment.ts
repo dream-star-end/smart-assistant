@@ -42,7 +42,10 @@ export function turnFinalAssistantFlags(messages: ChatMessage[]): boolean[] {
     m.role === "assistant" &&
     typeof m.text === "string" &&
     m.text.trim().length > 0 &&
-    !m._errorCode;
+    !m._errorCode &&
+    // §9 折叠 anchor 显式排除:它是"终态存在证据"而非"末条 assistant 正文"(RFC §9-B1),
+    // 绝不挂评分卡。其正文尚未展开;展开后由真 tape 展开行(独立行)承接末条评分。
+    !m._tapeCollapsed;
   const orderTuple = (m: ChatMessage, index: number): [number, number, number] => [
     typeof m._orderSeq === "number" && Number.isSafeInteger(m._orderSeq) && m._orderSeq > 0
       ? m._orderSeq

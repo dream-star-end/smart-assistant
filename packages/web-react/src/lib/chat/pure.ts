@@ -40,6 +40,9 @@ export const RECENT_INFLIGHT_WINDOW_MS = 15 * 60_000;
 export const KEEPALIVE_INTERVAL_MS = 30_000;
 /** THINKING_SAFETY 兜底：10min 无新帧才杀 turn（websocket.js:274）。*/
 export const THINKING_SAFETY_MS = 10 * 60_000;
+/** reconcile 'turn_state_unknown' 后临时缩短的 thinking-safety 复检间隔(RFC §4)：server 无法
+ *  判定在飞 turn 终态时,把默认 10min 首窗降到 60s,尽快 REST 复检拉回终态/error projection。*/
+export const TURN_STATE_UNKNOWN_SAFETY_MS = 60_000;
 /** 重连后等 replay 先赢，再 REST reconcile 的 grace（websocket.js:284）。*/
 export const RECONNECT_RECONCILE_GRACE_MS = 4000;
 /** reconnect 后延迟启动 drain，让 hello/resume isFinal 先到（websocket.js:2104）。*/

@@ -320,6 +320,31 @@ export type SessionArchivePage = {
 };
 
 /**
+ * §9 折叠卷/截断记录展开:GET /api/sessions/:id/tape/:tapeId/records?cursor=<int>&limit=<int>。
+ * `records` = 该 tape 的 chat-safe 投影记录一页(逐记录 ≤64KB 截断,截断处带 `_fullBytes`;绝不吐
+ * exact 原始 payload);`nextCursor` = 下一页游标(null=已到末页);`total` = 该 tape 记录总数。
+ * 单页 ≤200 行 / ≤1MB(server 上限)。鉴权走 (session_id,user_id,tape_id) 复合分租,越权/不存在统一 404。
+ */
+export type TapeRecordsPage = {
+  records: unknown[];
+  nextCursor: number | null;
+  total: number;
+};
+
+/**
+ * M-§9-1 超大内容"查看完整"按记录有界读:
+ * GET /api/sessions/:id/tape/:tapeId/records?recordOrdinal=<n>&offset=<bytes>。
+ * 返回该单条 record 的 chat-safe 展示文本一个字节窗口(`chunk`,≤256KB/请求,绝不整卷/整条 exact payload);
+ * `nextOffset` = 下一窗口起始字节(null=读尽);`totalBytes` = 该记录展示文本总字节。
+ * 路由层 per-user 令牌桶限频(10 req/10s,超限 429);越权/不存在/非收敛卷统一 404。
+ */
+export type TapeRecordChunk = {
+  chunk: string;
+  nextOffset: number | null;
+  totalBytes: number;
+};
+
+/**
  * PUT /api/sessions/:id 请求体。`_baseSyncedAt` 是乐观并发基线（上次同步到的
  * updatedAt）：服务端若发现 existing.updated_at > _baseSyncedAt → 409 conflict。
  * wire body 上限 2MB（超出 413）；存储层 blob 上限 4MB（post-merge 超出也 413 oversized）。

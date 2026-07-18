@@ -31,13 +31,14 @@ import {
   childSignature,
   defaultCollapsed,
   errorPresentation,
+  formatTapeBytes,
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
-import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
+import { Alert, Avatar, Badge, Button, IconButton, Spinner } from "../ui";
 import { ChildBlockView } from "./AgentGroupCard";
 import { Media } from "./media";
 import { ResponseRatingCard } from "./ResponseRating";
@@ -67,6 +68,12 @@ export type FeedbackContext = {
   textPreview: string;
 };
 
+export type TapeRecordsResult = {
+  records: ChatMessage[];
+  nextCursor: number | null;
+  total: number;
+} | null;
+
 export type CardCallbacks = {
   onRegenerate?: () => void;
   onContinue?: () => void;
@@ -74,6 +81,25 @@ export type CardCallbacks = {
   onFeedback?: (ctx: FeedbackContext) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
+  /**
+   * §9 展开折叠卷:拉一页投影记录并就地展开(cursor=null 首页,续拉传上次 nextCursor)。返回结果
+   * 供折叠卡管理 loading/error 局部态。缺省(demo/只读/未接线)→ 折叠卡为静态摘要,不可展开。
+   */
+  onExpandTape?: (
+    anchorId: string,
+    tapeId: string,
+    cursor: number | null,
+  ) => Promise<{ ok: boolean; nextCursor?: number | null; error?: boolean; busy?: boolean }>;
+  /** §9 收起折叠卷(纯本地,抹展开行还原折叠态)。 */
+  onCollapseTape?: (anchorId: string) => void;
+  /** §9 截断记录"查看完整":原样拉一页 tape 记录供内联抽屉显示更完整版本(不改会话内存)。 */
+  onFetchTapeRecords?: (tapeId: string, cursor: number | null) => Promise<TapeRecordsResult>;
+  /** §9(M-§9-1)单条超大记录分块读(ToolCard 查看完整真通路)。 */
+  onFetchTapeRecordChunk?: (
+    tapeId: string,
+    recordOrdinal: number,
+    offset: number,
+  ) => Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
 };
 
 function buildFeedbackCtx(m: ChatMessage): FeedbackContext {
@@ -273,8 +299,11 @@ const USER_STATUS_LABEL: Record<string, string> = {
 export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) {
   const status = msg.status;
   return (
-    <div className="flex flex-col items-end animate-in">
-      <div className="max-w-[78%] whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg">
+    <div className="flex flex-col items-end animate-in" data-testid="user-row">
+      <div
+        className="max-w-[78%] whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg"
+        data-testid="message-text"
+      >
         {msg.text}
       </div>
       {msg._media && msg._media.length > 0 && (
@@ -304,6 +333,101 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
   );
 }
 
+// ═══════════════ §9 折叠卷卡(CollapseCard)═══════════════
+/**
+ * 折叠 anchor 行渲染(RFC §9.1)。大 tape 投影超上限时 server 只回一条折叠 anchor;本卡是该轮内容的
+ * **入口**而非正文——折叠态显示"本轮完整输出 N MB，点击加载",点击经 cb.onExpandTape 拉取投影记录
+ * 就地展开(展开行由 MessageList 作为独立卡渲染在本卡之后)。展开后本卡收缩成**分节头**:承载"收起"
+ * 与"继续加载更多"(分页游标 `_tapeExpandCursor` 非 null 时)。
+ *
+ * 终态存在证据(_dispatchOutcome 终态)只影响清发送态/抑制 error projection(见 render/persist),
+ * 与本卡渲染正交;本卡不挂评分卡/MetaRow(折叠行非"末条 assistant 正文")。
+ */
+export function CollapseCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+  const expanded = msg._tapeExpanded === true;
+  const hasMore = typeof msg._tapeExpandCursor === "number"; // number 游标=还有下一页;null/undefined=已拉全
+  const sizeLabel = formatTapeBytes(msg._tapeTotalBytes) || "较大内容";
+  const tapeId = msg._turnTapeId;
+  const canExpand = !!cb.onExpandTape && typeof tapeId === "string" && tapeId.length > 0;
+
+  const doExpand = async (cursor: number | null) => {
+    if (!cb.onExpandTape || !tapeId || loading) return;
+    setLoading(true);
+    setError(false);
+    try {
+      const res = await cb.onExpandTape(msg.id, tapeId, cursor);
+      if (!res.ok && res.error) setError(true);
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!expanded) {
+    return (
+      <div className="animate-in" data-testid="collapse-card">
+        <button
+          type="button"
+          onClick={() => void doExpand(null)}
+          disabled={loading || !canExpand}
+          aria-busy={loading}
+          className={cn(
+            "flex w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3.5 py-2.5 text-left text-[13px] transition-colors",
+            canExpand && !loading ? "cursor-pointer hover:bg-hover" : "cursor-default",
+          )}
+        >
+          <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-hover text-muted">
+            {loading ? <Spinner size={13} /> : <FileText size={13} />}
+          </span>
+          <span className="min-w-0 flex-1 text-fg/90">
+            {loading
+              ? "正在加载完整输出…"
+              : error
+                ? "加载失败，点击重试"
+                : `本轮完整输出 ${sizeLabel}${canExpand ? "，点击加载" : ""}`}
+          </span>
+          {!loading && canExpand && <ChevronDown size={15} className="shrink-0 text-faint" />}
+        </button>
+      </div>
+    );
+  }
+
+  // 展开态:分节头(收起 / 继续加载 / 卷级截断提示)。展开行由 MessageList 渲染在本卡之后。
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-border bg-hover/40 px-3.5 py-2 text-xs text-muted">
+      <FileText size={13} className="shrink-0" />
+      <span className="min-w-0">本轮完整输出 {sizeLabel} · 已展开</span>
+      {hasMore && (
+        <Button
+          size="sm"
+          variant="secondary"
+          shape="pill"
+          onClick={() => void doExpand(msg._tapeExpandCursor ?? null)}
+          disabled={loading}
+        >
+          {loading ? <Spinner size={12} /> : "继续加载更多"}
+        </Button>
+      )}
+      {cb.onCollapseTape && (
+        <button
+          type="button"
+          onClick={() => cb.onCollapseTape?.(msg.id)}
+          className="ml-auto rounded-full px-2 py-0.5 text-muted hover:text-fg [@media(hover:none)]:min-h-9 [@media(hover:none)]:py-2"
+        >
+          收起
+        </button>
+      )}
+      {msg._projectionTruncated && (
+        <span className="basis-full text-[11px] text-faint">内容较多，部分记录已省略（仅展示投影上限内的记录）。</span>
+      )}
+      {error && <span className="basis-full text-[11px] text-danger">加载失败，请重试。</span>}
+    </div>
+  );
+}
+
 // ═══════════════ assistant ═══════════════
 export function AssistantCard({
   msg,
@@ -321,7 +445,7 @@ export function AssistantCard({
     : null;
 
   return (
-    <div className="group flex gap-4 animate-in">
+    <div className="group flex gap-4 animate-in" data-testid="assistant-row">
       {/* 移动端隐藏助手头像:窄屏下头像+间距挤占正文宽度(boss 反馈),≥sm 才显示。 */}
       <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
         <Sparkles size={16} />

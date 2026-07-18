@@ -11,10 +11,17 @@
 import { Info, Sparkles } from "lucide-react";
 import { memo, useState } from "react";
 import type { ChatMessage } from "../lib/chat/model";
-import { HIDDEN_REVIEWER_AGENT_ID, messageKind, messageSignature } from "../lib/chat/render";
+import {
+  collectResolvedDispatchTurnIds,
+  HIDDEN_REVIEWER_AGENT_ID,
+  isProjectionSuppressedByTerminal,
+  messageKind,
+  messageSignature,
+} from "../lib/chat/render";
 import {
   AssistantCard,
   type CardCallbacks,
+  CollapseCard,
   DelegateProgressCard,
   GoalCard,
   PlanCard,
@@ -76,6 +83,11 @@ export const MessageRenderer = memo(
     readOnly = false,
   }: RendererProps) {
     const ctx = { isLast, sending, turnActivity, inActiveTurn, turnFinalAssistant };
+    // §9 折叠 anchor 优先拦截(role 通常为 assistant,须在 role 分派之前):渲染折叠卷卡,而非 AssistantCard。
+    // 折叠 anchor 是"终态存在证据"入口、非正文,故不出评分卡/MetaRow(turnSegment 已排除其为末条正文)。
+    if (message._tapeCollapsed) {
+      return <CollapseCard msg={message} cb={cb} />;
+    }
     switch (messageKind(message)) {
       case "user":
         return <UserCard msg={message} cb={cb} />;
@@ -103,7 +115,7 @@ export const MessageRenderer = memo(
         // 既有 TodoWrite 只读紧凑卡(含步骤与完成状态),翻旧会话仍能看到当时的计划。
         if (message.toolName === "TodoWrite") {
           if (inActiveTurn && sending) return null;
-          return <ToolCardSlot message={message} />;
+          return <ToolCardSlot message={message} onFetchTapeRecords={cb.onFetchTapeRecords} onFetchTapeRecordChunk={cb.onFetchTapeRecordChunk} />;
         }
         // oc-* 研究工具:直接渲染干净的专属卡片,**去掉"终端 + 命令"外壳**(boss 反馈套壳没必要)。
         // 命令出错时 researchToolCard 返回 null → 回落 ToolCardSlot 终端卡,保证报错可见。
@@ -112,7 +124,7 @@ export const MessageRenderer = memo(
           const ocCard = researchToolCard(ocCmd, message);
           if (ocCard) return <div className="px-0.5 py-1">{ocCard}</div>;
         }
-        return <ToolCardSlot message={message} />;
+        return <ToolCardSlot message={message} onFetchTapeRecords={cb.onFetchTapeRecords} onFetchTapeRecordChunk={cb.onFetchTapeRecordChunk} />;
       }
       case "plan":
         // structured plan steps:当前活跃段且本轮进行中 → 统一进 composer 上方的
@@ -354,8 +366,15 @@ export function MessageList({
   // runtime-event。两者都不出卡,也绝不能占掉「最近 100 条可见消息」窗口。
   // reducer 会就地 mutation messages,这里故意每次 render 重算轻量投影,不以数组引用 memo。
   // 权威 messages 数组从不改写/过滤,持久化与逐字节原始记录仍完整保留。
+  // 渲染层双保险(RFC §5):同 _clientMessageId 已有真 tape 生成行时,抑制该轮的 dispatch error
+  // projection 虚拟行 —— server 侧 late-tape 撤销投影(§2.4)传播到端前的竞态窗口兜底,避免
+  // 「结果已显示 + 错误卡并存」。
+  const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(messages);
   const renderableMessages = messages.filter(
-    (m) => !m._historyProjection && messageKind(m) !== "unknown",
+    (m) =>
+      !m._historyProjection &&
+      messageKind(m) !== "unknown" &&
+      !isProjectionSuppressedByTerminal(m, resolvedDispatchTurnIds),
   );
   // 溢出：默认只挂最近 LOAD_MORE_STEP 条**可见**消息,"加载更多历史"递增。
   const [visible, setVisible] = useState(LOAD_MORE_STEP);

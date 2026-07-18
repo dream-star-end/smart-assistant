@@ -186,6 +186,56 @@ export type ChatMessage = {
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
   _errorCode?: string;
   _errorDetail?: string;
+  /**
+   * durable turn dispatch(RFC §5)server 侧持久化标记:该行**证明**其 _clientMessageId 的
+   * dispatch 已终态失败(受理未执行/服务重启中断等,免单)。error projection 虚拟行恒带
+   * `_dispatchLost`;`_dispatchTerminal` 是**去枚举化**的重试判据单一权威(重试铸新 clientMessageId
+   * 靠它,不靠前端枚举内部 failureCode)。两者均由 server 铸,前端只读。
+   */
+  _dispatchLost?: boolean;
+  _dispatchTerminal?: boolean;
+
+  // ── lossless turn tape 水合标记（v2 tape;server-authored 行携带，前端只读）──
+  /** 该行所属的 lossless turn tape id（tape 是一个原子同步单元）。 */
+  _turnTapeId?: string;
+  /** hydration 的 complete-anchor 分支盖章：该 tape 已完整原子落库（同步权威传播的作证前提）。 */
+  _turnTapeComplete?: boolean;
+  /** tape 内容 sha256。§9 折叠行展开的三元组定位键之一（(_turnTapeId, _turnTapeSha256, anchor id)）。 */
+  _turnTapeSha256?: string;
+
+  // ── §9 会话读物化投影：折叠行 / 展开态 / 截断（server 铸折叠标记，前端只读；展开态本地渲染态）──
+  /**
+   * 折叠 anchor 行（RFC §9.1）：大 tape 的投影超总量上限时，server 只回一条折叠 anchor 而非 N 条
+   * 展开行。渲染为折叠卡（"本轮完整输出 N MB，点击加载"）。终态谓词见 render.isCollapsedAnchorTerminalEvidence：
+   * 折叠 anchor + 终态 `_dispatchOutcome` = 该轮"终态存在证据"（参与清 in-flight / 抑制 error projection），
+   * 但**不是**"内容已展开"（不触发评分卡/MetaRow 等需正文的门；折叠行非"末条 assistant 正文"）。
+   */
+  _tapeCollapsed?: boolean;
+  /** 折叠行：本轮完整输出字节数（折叠卡文案 "N MB" 的来源）。 */
+  _tapeTotalBytes?: number;
+  /** 折叠行：dispatch 终态（completed|interrupted|crashed|executed_error|not_accepted）。终态存在证据判据。 */
+  _dispatchOutcome?: string;
+  /** 卷级投影截断标记（per-tape 投影超 512KB/512 行尾部截断）：即便展开也只能到投影上限，余量走分页端点。 */
+  _projectionTruncated?: boolean;
+  /**
+   * 逐记录截断（RFC §9.1，工具输出等单记录超 64KB）：该记录被截断，此值 = 完整字节数。
+   * **存在 ⟺ 该记录被截断**（前端以本字段为截断判据，见 render.isRecordTruncated）。server 线上另带
+   * `_truncated:true`（wire boolean），但前端**不读** `_truncated`——它与 assistant 续写标记 `_truncated:string`
+   * 同名会歧义，故以无歧义的 `_fullBytes` 作单一判据。截断工具卡尾部渲染"输出已截断（共 N MB），查看完整"。
+   */
+  _fullBytes?: number;
+  /** M-§9-1:截断记录在投影内的 record ordinal(server 附)——"查看完整"分块读的定位键。 */
+  _recordOrdinal?: number;
+
+  // ── 折叠 anchor 的本地展开态（渲染态 + 会话内存；随 IndexedDB persist 往返保留，不推同步游标）──
+  /** 折叠 anchor 已本地展开：render 层据此把折叠卡切成"分节头 + 已展开的展开行"，展开行是 server 权威内容水合。 */
+  _tapeExpanded?: boolean;
+  /** 展开行标记 = 来源折叠 anchor 的 anchorKey（(_turnTapeId::_turnTapeSha256::anchorId)）。合并保护键：
+   *  server 只回折叠 anchor、从不回展开行，故展开行须豁免"缺席即删"，且合并遇折叠 anchor 时保留本地展开。 */
+  _tapeExpandedFrom?: string;
+  /** 折叠 anchor 已展开到的下一页游标；null=已拉全（无"继续加载"）；number=还有更多页。 */
+  _tapeExpandCursor?: number | null;
+
   /** 空轮 notice 标记。*/
   _emptyTurn?: boolean;
   _emptyTurnSoft?: boolean;

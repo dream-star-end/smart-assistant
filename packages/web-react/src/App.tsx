@@ -1367,6 +1367,9 @@ export function App() {
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
+  // §9 tape 展开/续拉/收起/截断查看:hook 方法本身 useCallback 稳定,只随 activeId 换会话时重建
+  //     (与 regenerate/send/retrySend 一致);demo/只读不接线 → 折叠卡为静态摘要、截断卡无"查看完整"。
+  const { expandCollapsedTape, collapseTape, fetchTapeRecords, fetchTapeRecordChunk } = chat;
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
       onRegenerate: regenerate,
@@ -1374,8 +1377,31 @@ export function App() {
       onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
       onRetrySend: demo ? undefined : retrySend,
+      onExpandTape: demo
+        ? undefined
+        : (anchorId, tapeId, cursor) => expandCollapsedTape(activeId, anchorId, tapeId, cursor),
+      onCollapseTape: demo ? undefined : (anchorId) => collapseTape(activeId, anchorId),
+      onFetchTapeRecords: demo
+        ? undefined
+        : (tapeId, cursor) => fetchTapeRecords(activeId, tapeId, cursor),
+      onFetchTapeRecordChunk: demo
+        ? undefined
+        : (tapeId, recordOrdinal, offset) =>
+            fetchTapeRecordChunk(activeId, tapeId, recordOrdinal, offset),
     }),
-    [regenerate, send, demo, openSettings, onFeedback, retrySend],
+    [
+      regenerate,
+      send,
+      demo,
+      openSettings,
+      onFeedback,
+      retrySend,
+      expandCollapsedTape,
+      collapseTape,
+      fetchTapeRecords,
+      fetchTapeRecordChunk,
+      activeId,
+    ],
   );
 
   // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。
