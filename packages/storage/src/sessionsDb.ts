@@ -1414,6 +1414,9 @@ export type MessageLike = {
   /** Immutable presentation/archive position assigned on first persistence.
    * `_seq` remains the mutable content-version cursor. */
   _orderSeq?: number
+  /** Server-authored ordinal inside one lossless turn tape. Rows from one tape
+   * share `_orderSeq`; this freezes their intra-turn order across clock skew. */
+  _turnTapeOrdinal?: number
   [k: string]: unknown
 }
 
@@ -1426,6 +1429,18 @@ export function compareMessagesByOrder(a: MessageLike, b: MessageLike): number {
   const ao = isValidOrderSeq(a?._orderSeq) ? a._orderSeq : Number.MAX_SAFE_INTEGER
   const bo = isValidOrderSeq(b?._orderSeq) ? b._orderSeq : Number.MAX_SAFE_INTEGER
   if (ao !== bo) return ao - bo
+  const tapeOrdinal = (message: MessageLike): number | null =>
+    typeof message._turnTapeId === 'string' && message._turnTapeId.length > 0 &&
+    typeof message._turnTapeOrdinal === 'number' &&
+    Number.isSafeInteger(message._turnTapeOrdinal) && message._turnTapeOrdinal >= 0
+      ? message._turnTapeOrdinal
+      : null
+  const atape = tapeOrdinal(a)
+  const btape = tapeOrdinal(b)
+  const arank = a._tapeCollapsed === true ? 0 : atape !== null ? 1 : 2
+  const brank = b._tapeCollapsed === true ? 0 : btape !== null ? 1 : 2
+  if (arank !== brank) return arank - brank
+  if (atape !== null && btape !== null && atape !== btape) return atape - btape
   const at = typeof a?.ts === 'number' && Number.isFinite(a.ts) ? a.ts : 0
   const bt = typeof b?.ts === 'number' && Number.isFinite(b.ts) ? b.ts : 0
   return at - bt
@@ -1588,6 +1603,9 @@ function projectionCheckpoint(message: MessageLike): MessageLike {
     ...(seq !== undefined ? { _seq: seq } : {}),
     ...(orderSeq !== undefined ? { _orderSeq: orderSeq } : {}),
     ...(tapeId !== undefined ? { _turnTapeId: tapeId } : {}),
+    ...(typeof message._turnTapeOrdinal === 'number'
+      ? { _turnTapeOrdinal: message._turnTapeOrdinal }
+      : {}),
     ...(typeof message._turnTapeSha256 === 'string'
       ? { _turnTapeSha256: message._turnTapeSha256 }
       : {}),
@@ -1667,6 +1685,9 @@ export function projectClientSessionMessagesForChat(messages: readonly MessageLi
       ...(typeof message._seq === 'number' && Number.isFinite(message._seq) ? { _seq: message._seq } : {}),
       ...(isValidOrderSeq(message._orderSeq) ? { _orderSeq: message._orderSeq } : {}),
       ...(typeof message._turnTapeId === 'string' ? { _turnTapeId: message._turnTapeId } : {}),
+      ...(typeof message._turnTapeOrdinal === 'number'
+        ? { _turnTapeOrdinal: message._turnTapeOrdinal }
+        : {}),
       ...(typeof message._turnTapeSha256 === 'string'
         ? { _turnTapeSha256: message._turnTapeSha256 }
         : {}),
@@ -1796,7 +1817,7 @@ const CLIENT_PUT_TEAM_MESSAGE_FIELDS: ReadonlySet<string> = new Set<string>(
 )
 
 const SERVER_AUTHORITATIVE_FIELDS: ReadonlySet<string> = new Set<string>([
-  '_source', '_seq', '_orderSeq', 'usage',
+  '_source', '_seq', '_orderSeq', '_turnTapeOrdinal', 'usage',
   '_truncated', '_errorCode', '_errorDetail',
 ])
 

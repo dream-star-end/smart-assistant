@@ -106,6 +106,17 @@ describe("persist — 历史合并纯函数", () => {
     expect(out.map((row) => row.id)).toEqual(["u1", "a1", "u2"]);
   });
 
+  test("full merge 保留中段 user 的原始锚点，不把它漂到后一条 server 行之后", () => {
+    const a1 = { id: "a1", role: "assistant", text: "one", ts: 1, _source: "server", _orderSeq: 1 } as ChatMessage;
+    const user = { id: "local-user", role: "user", text: "问", ts: 999 } as ChatMessage;
+    const a2 = { id: "a2", role: "assistant", text: "two", ts: 2, _source: "server", _orderSeq: 2 } as ChatMessage;
+
+    const out = mergeFullServerWins([a1, a2], [a1, user, a2]);
+
+    expect(out.map((row) => row.id)).toEqual(["a1", "local-user", "a2"]);
+    expect(user._orderSeq).toBeUndefined(); // 临时锚只参与本次排序，不伪造持久顺序轴。
+  });
+
   test("exact terminal evidence replaces only that turn's m-* fallback, not a queued next turn", () => {
     const local: ChatMessage[] = [
       { id: "m-user-1", role: "user", text: "u1", ts: 1 },
@@ -952,6 +963,20 @@ describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
     expect(once.map((m) => m.id)).toEqual(["C", "A", "B"]);
     const twice = stableSortByTs(once.map((m) => ({ ...m })));
     expect(twice.map((m) => m.id)).toEqual(["C", "A", "B"]);
+  });
+
+  test("同一完整 tape 按 record ordinal 排序，时钟回拨不能把终答排到思考/工具前", () => {
+    const input: ChatMessage[] = [
+      { id: "thinking", role: "thinking", text: "想", ts: 300, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 0 },
+      { id: "tool", role: "tool", text: "查", ts: 200, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 1 },
+      { id: "answer", role: "assistant", text: "答", ts: 100, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 2 },
+      { id: "terminal-note", role: "assistant", text: "终态证据", ts: 0, _orderSeq: 5, _turnTapeId: "t-1" },
+      { id: "collapsed", role: "assistant", text: "本轮输出", ts: 400, _orderSeq: 5, _turnTapeId: "t-1", _tapeCollapsed: true },
+    ];
+
+    expect(stableSortByTs([...input]).map((m) => m.id)).toEqual([
+      "collapsed", "thinking", "tool", "answer", "terminal-note",
+    ]);
   });
 });
 

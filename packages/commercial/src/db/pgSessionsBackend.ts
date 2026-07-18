@@ -949,6 +949,7 @@ function hydrateTapeRecordContent(
     // back into client_sessions.messages.
     _turnTapeId: row.tape_id,
     _turnTapeMsgId: row.msg_id,
+    _turnTapeOrdinal: row.ordinal,
     _turnTapeSha256: row.tape_sha256,
     _turnTapeExpanded: true,
     // 来源边界硬化:legacy 分支显式压掉 payload 自带的同名字段(受信 materializer 不会产出,
@@ -1094,6 +1095,7 @@ function expandHydratedRuntimeBatch(
       _turnTapeId: row.tape_id,
       _turnTapeMsgId: id,
       _turnTapePhysicalMsgId: row.msg_id,
+      _turnTapeOrdinal: row.ordinal,
       _turnTapeSha256: row.tape_sha256,
       _turnTapeExpanded: true,
       ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
@@ -1223,6 +1225,7 @@ const projectionOversizeNote = (bytes: number): string =>
 function sentinelForOversizeRow(original: MessageLike, fullBytes: number): MessageLike {
   const note = projectionOversizeNote(fullBytes);
   const ordinal = typeof original._recordOrdinal === "number" ? original._recordOrdinal : null;
+  const tapeOrdinal = typeof original._turnTapeOrdinal === "number" ? original._turnTapeOrdinal : null;
   return {
     ...(typeof original.id === "string" ? { id: original.id } : {}),
     role: typeof original.role === "string" ? original.role : "tool",
@@ -1230,6 +1233,8 @@ function sentinelForOversizeRow(original: MessageLike, fullBytes: number): Messa
     ...(typeof original._clientMessageId === "string" ? { _clientMessageId: original._clientMessageId } : {}),
     ...(typeof original._errorCode === "string" ? { _errorCode: original._errorCode } : {}),
     ...(typeof original._turnTapeMsgId === "string" ? { _turnTapeMsgId: original._turnTapeMsgId } : {}),
+    ...(typeof original._turnTapeId === "string" ? { _turnTapeId: original._turnTapeId } : {}),
+    ...(tapeOrdinal !== null ? { _turnTapeOrdinal: tapeOrdinal } : {}),
     ...(ordinal !== null ? { _recordOrdinal: ordinal } : {}),
     _projectionSentinel: true,
     _truncated: true,
@@ -1246,6 +1251,8 @@ function sentinelForOversizeRecord(tapeId: string, ordinal: number, fullBytes: n
   return {
     id: `oc-projection-oversize:${tapeId}:${ordinal}`,
     role: "tool",
+    _turnTapeId: tapeId,
+    _turnTapeOrdinal: ordinal,
     _projectionSentinel: true,
     _truncated: true,
     _fullBytes: fullBytes,
@@ -1275,6 +1282,8 @@ function extractTerminalRowEvidence(visible: MessageLike[]): MessageLike | null 
       ...(typeof r._clientMessageId === "string" ? { _clientMessageId: r._clientMessageId } : {}),
       ...(typeof r.status === "string" ? { status: r.status } : {}),
       ...(typeof r._errorCode === "string" ? { _errorCode: r._errorCode } : {}),
+      ...(typeof r._turnTapeId === "string" ? { _turnTapeId: r._turnTapeId } : {}),
+      ...(typeof r._turnTapeOrdinal === "number" ? { _turnTapeOrdinal: r._turnTapeOrdinal } : {}),
       ...(r._turnTapeComplete === true ? { _turnTapeComplete: true } : {}),
       _projectionTerminalEvidence: true,
       text: typeof r.text === "string" ? utf8PrefixBytes(r.text, 4096) : "",
@@ -1914,6 +1923,18 @@ function rehydrateBuildingAccumulator(
   return { visible, tailWinners };
 }
 
+/** Existing materialized projection rows already persist `_recordOrdinal` for
+ * every source record. Promote it on read so this rollout fixes old complete
+ * projections immediately; newly built rows also carry the dedicated field. */
+function projectionTapeOrdinal(row: MessageLike): number | null {
+  const value = typeof row._turnTapeOrdinal === "number"
+    ? row._turnTapeOrdinal
+    : row._recordOrdinal;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
 /** chat 读第二阶段:把某卷投影行现盖 _seq/_orderSeq(活体 anchor)+ 现算 cost/waiver 叠加;
  *  卷级截断(state='truncated')时给末行盖 `_projectionTruncated:true`(前端渲染「已截断,查看完整」)。 */
 function applyProjectionForChat(
@@ -1925,6 +1946,9 @@ function applyProjectionForChat(
   const billingAnchorId = enrich?.billingAnchorId ?? null;
   const out = storedRows.map((stored) => {
     let row: MessageLike = { ...stored };
+    const ordinal = projectionTapeOrdinal(row);
+    if (ordinal !== null) row._turnTapeOrdinal = ordinal;
+    else delete row._turnTapeOrdinal;
     // `_winnerOrdinal` 是 building 续段内部记账,不上 wire;`_recordOrdinal` 仅截断行需要
     // (前端"查看完整"按记录分块拉),非截断行剥掉减噪。
     delete row._winnerOrdinal;
@@ -1933,6 +1957,7 @@ function applyProjectionForChat(
     else delete row._seq;
     if (typeof anchor._orderSeq === "number") row._orderSeq = anchor._orderSeq;
     else delete row._orderSeq;
+    if (typeof anchor._turnTapeId === "string") row._turnTapeId = anchor._turnTapeId;
     if (enrich && billingAnchorId !== null && row.id === billingAnchorId) {
       row = mergeExactUsage(row, enrich, true);
     }
@@ -2127,7 +2152,16 @@ async function readGenerationProjectionRows(
   const out = new Map<string, MessageLike[]>();
   for (const r of res.rows) {
     if (!Array.isArray(r.rows)) continue;
-    const gen = r.rows.filter((m) => m && (m.role === "assistant" || m.role === "user"));
+    const gen = r.rows
+      .filter((m) => m && (m.role === "assistant" || m.role === "user"))
+      .map((m): MessageLike => {
+        const ordinal = projectionTapeOrdinal(m);
+        return {
+          ...m,
+          _turnTapeId: r.tape_id,
+          ...(ordinal !== null ? { _turnTapeOrdinal: ordinal } : {}),
+        };
+      });
     // B-§9-3 兜底:assistant 完成行被行预算尾截掉时,用 header terminal_row 补一条(保 dedup/完成证据)。
     const term = r.terminal_row;
     if (term && typeof term === "object" && term.role === "assistant") {
@@ -2258,6 +2292,10 @@ async function listTapeChatProjectionRecordsImpl(
     // 前端 socket.applyExpandedTapeRecords 透传 + ToolCard 读 `_recordOrdinal` 零改动即通。剥内部记账字段;
     // 非截断行同 chat 读剥掉 `_recordOrdinal` 减噪。
     const rec: MessageLike = { ...stored };
+    const ordinal = projectionTapeOrdinal(rec);
+    rec._turnTapeId = tapeId;
+    if (ordinal !== null) rec._turnTapeOrdinal = ordinal;
+    else delete rec._turnTapeOrdinal;
     delete rec._winnerOrdinal;
     if (rec._truncated !== true) delete rec._recordOrdinal;
     const recBytes = jsonBytes(rec);

@@ -2100,6 +2100,15 @@ describe("pgSessionsBackend §9 会话读物化投影", () => {
     assert.equal(proj.rows[0]!.row_count, 3, "visible = thinking + tool + assistant");
     assert.equal(proj.rows[0]!.next_part, 3, "next_part = record 总数");
 
+    // 模拟本次发布前已 complete 的存量投影：它们每行已有 `_recordOrdinal`，但还没有
+    // 专用 `_turnTapeOrdinal`。读侧必须即时 promote，不能要求重建所有旧投影。
+    await pool.query(
+      `UPDATE tape_chat_projection
+          SET rows=(SELECT jsonb_agg(item - '_turnTapeOrdinal') FROM jsonb_array_elements(rows) item)
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+
     const chat = await backend.getClientSession(sessionId, userId, { projection: "chat" });
     const asst = (chat!.messages as MessageLike[]).find((m) => m.role === "assistant")!;
     assert.equal(asst.text, "最终回答", "保真:assistant 正文");
@@ -2108,6 +2117,13 @@ describe("pgSessionsBackend §9 会话读物化投影", () => {
     assert.ok((chat!.messages as MessageLike[]).some((m) => m.role === "tool" && m.output === "file1\nfile2"),
       "保真:工具输出");
     assert.equal(asst._turnTapeComplete, true, "投影展开行携带 _turnTapeComplete");
+    assert.deepEqual(
+      (chat!.messages as MessageLike[])
+        .filter((m) => m._turnTapeId === tape.finalize.tapeId)
+        .map((m) => m._turnTapeOrdinal),
+      [0, 1, 2],
+      "投影展开行透传 tape record ordinal，前端不依赖各记录 wall clock 排序",
+    );
 
     // 删 records(BYTEA 源)后 chat 仍全展开(证明走投影,不触 BYTEA);exact 反而缺 record 失败。
     await pool.query("DELETE FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2",
