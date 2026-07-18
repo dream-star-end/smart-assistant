@@ -170,6 +170,26 @@ describe('Plugin runtime facade', () => {
       keepFileIds: ['523456789'],
     })
 
+    const mediaOnly = await prepare({
+      ...base,
+      params: {
+        groupId: '623456789',
+        topicId: '123456789',
+        removeImageIds: ['323456789'],
+      },
+    })
+    assert.equal(mediaOnly.text, 'body', 'media-only edit must preserve the current topic body')
+
+    const explicitBlank = await prepare({
+      ...base,
+      params: {
+        groupId: '623456789',
+        topicId: '123456789',
+        text: '',
+      },
+    })
+    assert.equal(explicitBlank.text, '', 'an explicit empty body must not be rewritten')
+
     for (const params of [
       {
         groupId: '623456789',

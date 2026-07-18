@@ -1086,6 +1086,11 @@ export class PluginRuntimeFacade {
         const removeFiles = new Set(removeFileIds)
         const keepImageIds = preserve ? imageIds.filter((id) => !removeImages.has(id)) : []
         const keepFileIds = preserve ? fileIds.filter((id) => !removeFiles.has(id)) : []
+        const previousText = typeof topic.text === 'string' ? topic.text : ''
+        // edit_topic is a full-replacement upstream API. Omitting `text` means
+        // "media-only edit", not "clear the body"; an explicitly supplied
+        // empty string still keeps its existing clear-text semantics.
+        if (!Object.hasOwn(input.params, 'text')) prepared.text = previousText
         const manifest = prepared.mediaManifest as KnowledgePlanetSealedMedia[]
         const newImages = manifest.filter((item) => item.kind === 'image').length
         const newFiles = manifest.filter((item) => item.kind === 'file').length
@@ -1096,7 +1101,7 @@ export class PluginRuntimeFacade {
         if (hasRemoveFileIds) prepared.removeFileIds = removeFileIds
         prepared.editSnapshot = {
           expectedDigest: digest,
-          previousText: typeof topic.text === 'string' ? topic.text : '',
+          previousText,
           keepImageIds,
           keepFileIds,
         }

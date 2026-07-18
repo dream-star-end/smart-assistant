@@ -1184,6 +1184,46 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
   })
 
+  test('知识星球二维码 revision 更新时替换过期图片并回收旧 object URL', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    const base = {
+      sessionId: '12121212-1212-4212-8212-121212121212',
+      status: 'waiting_for_scan' as const,
+      phase: 'waiting_for_scan' as const,
+      qrReady: true,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    }
+    mockedKnowledgeStart.mockResolvedValue({ ...base, qrRevision: 1 })
+    mockedKnowledgeStatus.mockResolvedValue({ ...base, qrRevision: 2 })
+    mockedKnowledgeQr
+      .mockResolvedValueOnce(new Blob(['qr-1'], { type: 'image/png' }))
+      .mockResolvedValueOnce(new Blob(['qr-2'], { type: 'image/png' }))
+    const createObjectUrl = vi
+      .fn()
+      .mockReturnValueOnce('blob:knowledge-planet-qr-1')
+      .mockReturnValueOnce('blob:knowledge-planet-qr-2')
+    const revokeObjectUrl = vi.fn()
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    const qr = await within(dialog).findByAltText('知识星球微信登录二维码')
+    expect(qr).toHaveAttribute('src', 'blob:knowledge-planet-qr-1')
+    await waitFor(
+      () => expect(qr).toHaveAttribute('src', 'blob:knowledge-planet-qr-2'),
+      { timeout: 3_000 },
+    )
+    expect(mockedKnowledgeQr).toHaveBeenCalledTimes(2)
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:knowledge-planet-qr-1')
+  })
+
   test('市场安装后一次性自动打开知识星球授权弹层', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })

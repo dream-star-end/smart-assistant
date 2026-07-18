@@ -335,9 +335,9 @@ export function buildWriteDetail(
         text: String(params.text ?? ''),
         preserveExistingMedia: params.preserveExistingMedia !== false,
         existingImageIds:
-          (params.editSnapshot as Record<string, unknown> | undefined)?.imageIds ?? [],
+          (params.editSnapshot as Record<string, unknown> | undefined)?.keepImageIds ?? [],
         existingFileIds:
-          (params.editSnapshot as Record<string, unknown> | undefined)?.fileIds ?? [],
+          (params.editSnapshot as Record<string, unknown> | undefined)?.keepFileIds ?? [],
         media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
         warning: '知识星球主题编辑是完整替换；最终校验与写入之间仍存在极短竞态窗口。',
       }

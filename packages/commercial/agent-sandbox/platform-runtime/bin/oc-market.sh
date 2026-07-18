@@ -9,7 +9,7 @@ SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 # Plugin authoring lives here rather than packages/gateway so the command can ship
 # through the true-hot platform bundle without a runtime image rebuild. The old
-# publish-connector surface remains as a compatibility alias.
+# publish-connector surface retains read-only help/examples but cannot publish.
 if [ "${1:-}" = "plugin" ] || [ "${1:-}" = "publish-connector" ]; then
   MARKET_COMMAND="$1"
   shift
@@ -373,6 +373,11 @@ parser.add_argument("--tags", default="连接器", help="comma-separated tags")
 parser.add_argument("--intro-file", help="optional Markdown storefront introduction")
 parser.add_argument("--visibility", choices=("public", "org"), default="public")
 args = parser.parse_args(argv)
+
+die(
+    "legacy publish-connector is disabled; use `oc-market plugin prepare --file ...`, "
+    "show the returned summary to the user, then run its confirmed publishCommand"
+)
 
 spec = json_object(args.spec_file, "--spec-file")
 decision = json_object(args.security_decision_file, "--security-decision-file")

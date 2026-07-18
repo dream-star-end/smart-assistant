@@ -976,12 +976,21 @@ function ManagedBrowserSetupDialog({
   const [starting, setStarting] = useState(false)
   const [setup, setSetup] = useState<KnowledgePlanetSetupView | null>(null)
   const [qrUrl, setQrUrl] = useState<string | null>(null)
+  const [loadedQrKey, setLoadedQrKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [reportedActive, setReportedActive] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const setupSessionId = setup?.sessionId ?? null
   const setupStatus = setup?.status ?? null
   const setupQrReady = setup?.qrReady === true
+  const hasSetupQrRevision =
+    typeof setup?.qrRevision === 'number' && Number.isSafeInteger(setup.qrRevision)
+  const setupQrRevision =
+    hasSetupQrRevision
+      ? Number(setup?.qrRevision)
+      : setupQrReady
+        ? 1
+        : 0
   const setupPhase =
     setup?.phase ??
     (setupStatus === 'active'
@@ -1080,6 +1089,9 @@ function ManagedBrowserSetupDialog({
 
   useEffect(() => {
     if (!setupQrReady || !setupSessionId) return
+    const qrKey = `${setupSessionId}:${setupQrRevision}`
+    const revisionBound = !isWeibo && hasSetupQrRevision
+    if (revisionBound && loadedQrKey === qrKey) return
     let cancelled = false
     let timer: number | undefined
     const load = () => {
@@ -1094,6 +1106,7 @@ function ManagedBrowserSetupDialog({
             if (previous) URL.revokeObjectURL(previous)
             return next
           })
+          if (revisionBound) setLoadedQrKey(qrKey)
           setError(null)
           timer = window.setTimeout(load, 8_000)
         })
@@ -1109,7 +1122,15 @@ function ManagedBrowserSetupDialog({
       cancelled = true
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [auth, isWeibo, setupQrReady, setupSessionId])
+  }, [
+    auth,
+    hasSetupQrRevision,
+    isWeibo,
+    loadedQrKey,
+    setupQrReady,
+    setupQrRevision,
+    setupSessionId,
+  ])
 
   useEffect(() => {
     if (setupStatus !== 'active' || reportedActive) return

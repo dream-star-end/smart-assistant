@@ -76,6 +76,7 @@ interface SetupSession {
   phase: KnowledgePlanetSetupPhase
   terminal: TerminalClaim | null
   qr: Buffer | null
+  qrRevision: number
   stateBuffer: Buffer | null
   handle: KnowledgePlanetLoginWorkerHandle | null
   completion: Promise<void> | null
@@ -89,6 +90,7 @@ export interface KnowledgePlanetSetupView {
   status: PublicSetupStatus
   phase: KnowledgePlanetSetupPhase
   qrReady: boolean
+  qrRevision: number
   agentReady: boolean
   createdAt: string
   expiresAt: string
@@ -241,6 +243,7 @@ export class KnowledgePlanetSetupManager {
       status: session.status,
       phase: session.phase,
       qrReady: session.status === 'waiting_for_scan' && session.qr !== null,
+      qrRevision: session.qrRevision,
       agentReady: session.agentReady,
       createdAt: new Date(session.createdAt).toISOString(),
       expiresAt: new Date(session.expiresAt).toISOString(),
@@ -323,6 +326,7 @@ export class KnowledgePlanetSetupManager {
       phase: 'generating_qr',
       terminal: null,
       qr: null,
+      qrRevision: 0,
       stateBuffer: null,
       handle: null,
       completion: null,
@@ -341,6 +345,7 @@ export class KnowledgePlanetSetupManager {
           if (session.terminal !== null || session.status !== 'waiting_for_scan') return
           wipe(session.qr)
           session.qr = Buffer.from(png)
+          session.qrRevision += 1
           session.phase = 'waiting_for_scan'
         },
         onAuthenticated: (state) => {

@@ -269,6 +269,20 @@ describe('buildWriteSummary / buildWriteDetail', () => {
     assert.equal(d.kind, 'email')
     assert.equal(String(d.text).length, '完整正文'.repeat(100).length)
   })
+  test('知识星球编辑确认详情展示服务端快照中实际保留的媒体 ID', () => {
+    const d = buildWriteDetail('knowledge-planet', 'edit_topic', {
+      groupId: '123456789',
+      topicId: '223456789',
+      text: '正文',
+      editSnapshot: {
+        previousText: '旧正文',
+        keepImageIds: ['323456789'],
+        keepFileIds: ['423456789'],
+      },
+    })
+    assert.deepEqual(d.existingImageIds, ['323456789'])
+    assert.deepEqual(d.existingFileIds, ['423456789'])
+  })
   test('未登记 write action 兜底 detail 返回 params 原样', () => {
     const d = buildWriteDetail('x', 'y', { a: 1 })
     assert.deepEqual(d, { kind: 'params', params: { a: 1 } })

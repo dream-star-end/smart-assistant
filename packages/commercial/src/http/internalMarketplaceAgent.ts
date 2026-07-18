@@ -675,6 +675,21 @@ async function handlePublish(
       { error: { code: 'BAD_KIND', message: 'kind must be skill|agent|connector' } },
       requestId,
     )
+  if (kind === 'connector') {
+    if (!marketplaceConnectorsEnabled())
+      return send(res, 404, { error: { code: 'NOT_FOUND' } }, requestId)
+    return send(
+      res,
+      409,
+      {
+        error: {
+          code: 'CONFIRMATION_REQUIRED',
+          message: 'Plugin 发布必须使用 prepare-plugin / publish-plugin 两阶段确认流程',
+        },
+      },
+      requestId,
+    )
+  }
   // 可见范围(企业版 P3.1):visibility='org' 要求容器用户是 org active 成员 → listing.org_id=其 org。
   const orgId = body.visibility === 'org' ? callerOrgId : null
   if (body.visibility === 'org' && !orgId)
@@ -684,24 +699,6 @@ async function handlePublish(
       { error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的技能' } },
       requestId,
     )
-
-  if (kind === 'connector') {
-    if (!marketplaceConnectorsEnabled())
-      return send(res, 404, { error: { code: 'NOT_FOUND' } }, requestId)
-    const prepared = prepareConnectorPublish(body)
-    if (!prepared.ok)
-      return send(
-        res,
-        prepared.status,
-        {
-          error: { code: prepared.code, message: prepared.message },
-          ...(prepared.riskFlags ? { riskFlags: prepared.riskFlags } : {}),
-        },
-        requestId,
-      )
-    await publishPreparedPlugin(res, requestId, prepared, userId, orgId)
-    return
-  }
 
   const slug = asStr(body.slug, 64)
   if (!slug || !SLUG_RE.test(slug))
