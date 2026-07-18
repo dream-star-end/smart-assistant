@@ -219,7 +219,7 @@ describe('receiveSelfhealFuseClear — §3.3', () => {
     assert.equal((await getReleaseFuse()).releaseRequestId, 'rr-fuse-missing')
   })
 
-  it('rejects a wrong/unknown epoch with 409 and preserves the current epoch', async () => {
+  it('tombstones an absent exact V5 epoch with 200 and preserves the current epoch', async () => {
     await engageReleaseFuse({ reason: 'stuck', releaseRequestId: 'rr-fuse-current' })
     const body = {
       repairId: 'fuse',
@@ -228,12 +228,16 @@ describe('receiveSelfhealFuseClear — §3.3', () => {
       expectedReleaseRequestId: 'rr-fuse-wrong',
     }
     const res = await receiver.receiveSelfhealFuseClear(signedInput(FUSE_PATH, 'fuse', body), cfg)
-    assert.equal(res.status, 409)
-    assert.equal(res.body.error, 'release_fuse_epoch_mismatch')
-    assert.equal(res.body.expectedReleaseRequestId, 'rr-fuse-wrong')
-    assert.equal(res.body.currentReleaseRequestId, 'rr-fuse-current')
+    assert.equal(res.status, 200)
+    assert.equal(res.body.cleared, true)
+    assert.equal(res.body.outcome, 'cleared')
+    assert.equal(res.body.releaseRequestId, 'rr-fuse-wrong')
     assert.equal((await getReleaseFuse()).engaged, true)
     assert.equal((await getReleaseFuse()).releaseRequestId, 'rr-fuse-current')
+    assert.equal(
+      await engageReleaseFuse({ reason: 'late wrong epoch', releaseRequestId: 'rr-fuse-wrong' }),
+      false,
+    )
   })
 
   it('response-loss retry of a cleared epoch is 200 already_cleared and cannot clear epoch B', async () => {

@@ -2184,12 +2184,13 @@ export type ClearReleaseFuseResult =
       currentReleaseRequestId: string | null
     }
 
-/** Clear one exact local Tier2 fuse epoch.
+/** Clear one exact, V5-adjudicated local Tier2 fuse epoch.
  *
- * Clearing appends the immutable releaseRequestId tombstone before changing
- * the singleton. The tombstone check/insert and singleton read/write are one
- * BEGIN IMMEDIATE transaction, so a retry of the same epoch is idempotent while
- * an old/wrong epoch can never clear the current one. */
+ * Every authenticated exact clear appends an immutable releaseRequestId
+ * tombstone, even if this personal host never projected that epoch (for
+ * example B arrived while local A was already engaged). A different active
+ * singleton is preserved. This lets V5 converge its durable per-epoch queue
+ * without allowing a delayed B callback to engage after B was adjudicated. */
 export async function clearReleaseFuse(input: {
   clearedBy: string
   expectedReleaseRequestId: string
@@ -2220,27 +2221,21 @@ export async function clearReleaseFuse(input: {
       const current = db
         .prepare('SELECT engaged, release_request_id FROM selfheal_release_fuse WHERE id = 1')
         .get() as { engaged: number; release_request_id: string | null }
-      if (
-        current.engaged !== 1 ||
-        current.release_request_id !== input.expectedReleaseRequestId
-      ) {
-        return {
-          outcome: 'epoch_mismatch',
-          releaseRequestId: input.expectedReleaseRequestId,
-          currentReleaseRequestId: current.engaged === 1 ? current.release_request_id : null,
-        }
-      }
-
       db.prepare(`
         INSERT INTO selfheal_release_fuse_cleared_epochs
           (release_request_id, cleared_at, cleared_by)
         VALUES (?, ?, ?)
       `).run(input.expectedReleaseRequestId, iso, input.clearedBy)
-      db.prepare(`
-        UPDATE selfheal_release_fuse
-        SET engaged = 0, cleared_at = ?, cleared_by = ?
-        WHERE id = 1
-      `).run(iso, input.clearedBy)
+      if (
+        current.engaged === 1 &&
+        current.release_request_id === input.expectedReleaseRequestId
+      ) {
+        db.prepare(`
+          UPDATE selfheal_release_fuse
+          SET engaged = 0, cleared_at = ?, cleared_by = ?
+          WHERE id = 1
+        `).run(iso, input.clearedBy)
+      }
       return { outcome: 'cleared', releaseRequestId: input.expectedReleaseRequestId }
     })
     .immediate()

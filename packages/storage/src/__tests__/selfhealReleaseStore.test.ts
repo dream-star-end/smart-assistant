@@ -369,7 +369,7 @@ describe('cancelReleaseJob — three states + not_found', () => {
 })
 
 describe('selfheal_release_fuse — exact epochs + append-only clear tombstones', () => {
-  it('serializes engage/clear, rejects wrong epochs, and never resurrects a cleared epoch', async () => {
+  it('serializes engage/clear, tombstones absent exact epochs, and never resurrects them', async () => {
     const db = await getSelfhealDb()
     db.exec(`
       DELETE FROM selfheal_release_fuse_cleared_epochs;
@@ -396,13 +396,15 @@ describe('selfheal_release_fuse — exact epochs + append-only clear tombstones'
     assert.equal(f.reason, 'deploy_unknown')
     assert.equal(f.releaseRequestId, 'rrA')
 
-    // A different/unknown epoch never clears the current epoch.
+    // V5 may have persisted B while personal A was already engaged. Its exact
+    // adjudicated clear tombstones B but must not clear current A.
     assert.deepEqual(
-      await clearReleaseFuse({ clearedBy: 'wrong', expectedReleaseRequestId: 'rrB' }),
-      { outcome: 'epoch_mismatch', releaseRequestId: 'rrB', currentReleaseRequestId: 'rrA' },
+      await clearReleaseFuse({ clearedBy: 'boss-B', expectedReleaseRequestId: 'rrB' }),
+      { outcome: 'cleared', releaseRequestId: 'rrB' },
     )
     assert.equal((await getReleaseFuse()).releaseRequestId, 'rrA')
     assert.equal((await getReleaseFuse()).engaged, true)
+    assert.equal(await engageReleaseFuse({ reason: 'late-B', releaseRequestId: 'rrB' }), false)
 
     assert.deepEqual(
       await clearReleaseFuse({
@@ -422,31 +424,32 @@ describe('selfheal_release_fuse — exact epochs + append-only clear tombstones'
       { outcome: 'already_cleared', releaseRequestId: 'rrA' },
     )
 
-    // A delayed worker from A cannot resurrect A; a distinct B epoch can engage.
+    // A delayed worker from A cannot resurrect A; a distinct C epoch can engage.
     assert.equal(await engageReleaseFuse({ reason: 'stale-A', releaseRequestId: 'rrA' }), false)
-    assert.equal(await engageReleaseFuse({ reason: 'next', releaseRequestId: 'rrB' }), true)
+    assert.equal(await engageReleaseFuse({ reason: 'next', releaseRequestId: 'rrC' }), true)
     f = await getReleaseFuse()
     assert.equal(f.engaged, true)
-    assert.equal(f.releaseRequestId, 'rrB')
+    assert.equal(f.releaseRequestId, 'rrC')
     assert.equal(f.clearedAt, null)
     assert.equal(f.clearedBy, null)
 
-    // A's response-loss retry stays idempotent and, critically, leaves B intact.
+    // A's response-loss retry stays idempotent and, critically, leaves C intact.
     assert.deepEqual(
       await clearReleaseFuse({ clearedBy: 'late-A', expectedReleaseRequestId: 'rrA' }),
       { outcome: 'already_cleared', releaseRequestId: 'rrA' },
     )
     assert.equal((await getReleaseFuse()).engaged, true)
-    assert.equal((await getReleaseFuse()).releaseRequestId, 'rrB')
+    assert.equal((await getReleaseFuse()).releaseRequestId, 'rrC')
 
     assert.deepEqual(
-      await clearReleaseFuse({ clearedBy: 'boss', expectedReleaseRequestId: 'rrB' }),
-      { outcome: 'cleared', releaseRequestId: 'rrB' },
+      await clearReleaseFuse({ clearedBy: 'boss', expectedReleaseRequestId: 'rrC' }),
+      { outcome: 'cleared', releaseRequestId: 'rrC' },
     )
-    // Explicit A-clear → B-clear → stale-A interleaving: both epochs remain
+    // Explicit A/B/C clears → stale callbacks: all epochs remain
     // tombstoned and neither delayed engage can revive the singleton.
     assert.equal(await engageReleaseFuse({ reason: 'late-A', releaseRequestId: 'rrA' }), false)
     assert.equal(await engageReleaseFuse({ reason: 'late-B', releaseRequestId: 'rrB' }), false)
+    assert.equal(await engageReleaseFuse({ reason: 'late-C', releaseRequestId: 'rrC' }), false)
     assert.equal((await getReleaseFuse()).engaged, false)
 
     const tombstones = db
@@ -458,7 +461,8 @@ describe('selfheal_release_fuse — exact epochs + append-only clear tombstones'
       .all() as Array<{ release_request_id: string; cleared_by: string }>
     assert.deepEqual(tombstones, [
       { release_request_id: 'rrA', cleared_by: 'boss' },
-      { release_request_id: 'rrB', cleared_by: 'boss' },
+      { release_request_id: 'rrB', cleared_by: 'boss-B' },
+      { release_request_id: 'rrC', cleared_by: 'boss' },
     ])
   })
 
