@@ -24,6 +24,7 @@ import {
   Volume2,
   Wallet,
 } from "lucide-react";
+import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
 import { memo, useEffect, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
@@ -74,6 +75,10 @@ export type CardCallbacks = {
   onFeedback?: (ctx: FeedbackContext) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
+  /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
+   *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
+   *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
+  resolveRetryTarget?: (clientMessageId: string) => ChatMessage | undefined;
 };
 
 function buildFeedbackCtx(m: ChatMessage): FeedbackContext {
@@ -320,6 +325,28 @@ export function AssistantCard({
     ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)
     : null;
 
+  // ── 红卡重试 CTA 硬门(任务④)────────────────────────────────────────────────────
+  // 语义(retryable/cta)从 protocol taxonomy 派生,不在组件里手写码判断。
+  const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
+  const sem = turnErrorSemantics(normalizedCode);
+  const isInsufficient = normalizedCode === "insufficient_credits";
+  // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
+  // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 不显示精确「重试」,
+  // 落回原有 onRegenerate「重新尝试」兜底(现状语义)。
+  const retryEligible =
+    !!presentedError &&
+    !presentedError.waived &&
+    sem.retryable &&
+    (sem.cta === "retry" || sem.cta === "retry_or_switch");
+  const retryTarget =
+    retryEligible && msg._clientMessageId
+      ? cb.resolveRetryTarget?.(msg._clientMessageId)
+      : undefined;
+  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」引导。
+  // 模型选择器为非受控 DropdownMenu,无可编程打开入口(见报告),故只留文案不做次按钮。
+  const showSwitchModelHint =
+    !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch";
+
   return (
     <div className="group flex gap-4 animate-in">
       {/* 移动端隐藏助手头像:窄屏下头像+间距挤占正文宽度(boss 反馈),≥sm 才显示。 */}
@@ -400,15 +427,33 @@ export function AssistantCard({
                 </details>
               )}
               <div className="mt-2.5 flex flex-wrap items-center gap-2">
-                {msg._errorCode?.toLowerCase() === "insufficient_credits" && cb.onTopUp && (
-                  <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
-                    <Wallet size={14} /> 去充值
+                {isInsufficient ? (
+                  // insufficient_credits「去充值」现状不动。
+                  cb.onTopUp && (
+                    <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
+                      <Wallet size={14} /> 去充值
+                    </Button>
+                  )
+                ) : retryTarget ? (
+                  // 精确路径可用:优先精确重发原轮(复用原 payload 含附件),不走 onRegenerate。
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    shape="pill"
+                    onClick={() => cb.onRetrySend?.(retryTarget)}
+                  >
+                    <RotateCcw size={14} /> 重试
                   </Button>
+                ) : (
+                  // 精确路径不可用(找不到原 user 行 / 不可重试码)→ 保持现状 onRegenerate 兜底。
+                  cb.onRegenerate && (
+                    <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
+                      <RotateCcw size={14} /> 重新尝试
+                    </Button>
+                  )
                 )}
-                {msg._errorCode?.toLowerCase() !== "insufficient_credits" && cb.onRegenerate && (
-                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-                    <RotateCcw size={14} /> 重新尝试
-                  </Button>
+                {showSwitchModelHint && (
+                  <span className="text-xs text-muted">或在上方切换模型后重试</span>
                 )}
               </div>
             </div>

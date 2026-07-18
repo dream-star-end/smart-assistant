@@ -16,6 +16,25 @@ import type { InboundMessage, MediaRef } from "./frames";
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
 export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" | "error";
 
+/**
+ * 本轮非流式阶段状态（会话级软提示的单一权威判别联合，镜像 protocol OutboundTurnStatus）。
+ *  - `'compacting'`：CCB 压缩上下文中（数十秒~数分钟无 stream），沿用字符串态不改。
+ *  - `{ kind:'retrying' }`：自动重试等待中（模型繁忙/瞬态失败），`retryAt` = 下次尝试的
+ *    绝对 epoch ms（断线重连后前端按它重算剩余倒计时，不从完整 delayMs 重头显示）。
+ *  `null` = 回到普通流式 / 空闲态。**只驱动软提示 UX，不作业务完成信号**（业务完成走
+ *  outbound.message isFinal）。retry 元数据只在 retrying 分支存在，不在其它态漂移。
+ */
+export type TurnStatusState =
+  | "compacting"
+  | { kind: "retrying"; attempt: number; max: number; retryAt: number };
+
+/** 判别 `_turnStatus` 是否处于「自动重试中」态（供 reducer 内容帧自动消解 + 渲染层消费）。 */
+export function isRetryingTurnStatus(
+  s: TurnStatusState | null | undefined,
+): s is { kind: "retrying"; attempt: number; max: number; retryAt: number } {
+  return typeof s === "object" && s !== null && s.kind === "retrying";
+}
+
 /** A user turn's immutable model/team/reasoning selection, reused by retry. */
 export type ChatRoutingSnapshot = {
   model?: string;
@@ -341,7 +360,7 @@ export type ChatSession = {
   _agentSwitchedAt?: number | null;
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
-  _turnStatus?: string | null;
+  _turnStatus?: TurnStatusState | null;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
   _isFirstTurnAfterReady?: boolean;

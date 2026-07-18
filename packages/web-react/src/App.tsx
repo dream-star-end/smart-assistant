@@ -1366,6 +1366,20 @@ export function App() {
     [demo, activeId, agent.id],
   );
 
+  // 红卡 CTA 硬门(任务④)的精确重试目标解析:按 assistant 错误行的 _clientMessageId 在当前会话
+  // 里定位可原样重发的 user 行(status='error',带完整 payload)。现场取 messages(稳定句柄 sockRef,
+  // 不捕获每帧刷新的 wsMessages),与 retrySend 同 deps(仅随会话切换变);找不到 → 红卡不显示「重试」。
+  const resolveRetryTarget = useCallback(
+    (clientMessageId: string): ChatMessage | undefined => {
+      if (demo || !activeId) return undefined;
+      const msgs = sockRef.current?.getMessages(activeId) ?? [];
+      return msgs.find(
+        (m) => m.role === "user" && m.id === clientMessageId && m.status === "error",
+      );
+    },
+    [demo, activeId],
+  );
+
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
@@ -1374,8 +1388,9 @@ export function App() {
       onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
       onRetrySend: demo ? undefined : retrySend,
+      resolveRetryTarget: demo ? undefined : resolveRetryTarget,
     }),
-    [regenerate, send, demo, openSettings, onFeedback, retrySend],
+    [regenerate, send, demo, openSettings, onFeedback, retrySend, resolveRetryTarget],
   );
 
   // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。

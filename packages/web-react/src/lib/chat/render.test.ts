@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "./model";
+import { friendlyBridgeErrorMessage } from "./pure";
 import {
   childSignature,
   defaultCollapsed,
@@ -246,5 +247,48 @@ describe("errorLabel / stripMarkdown", () => {
     expect(stripMarkdown("**粗** 和 `代码`")).toBe("粗 和 代码");
     expect(stripMarkdown("[链接](http://x)")).toBe("链接");
     expect(stripMarkdown("- 项目")).toBe("项目");
+  });
+});
+
+describe("errorPresentation 兜底分支:不再裸透传 text(任务②)", () => {
+  test("裸 [turn failed 终止器 → 按码文案作正文,原文进 detail(可见排查线索)", () => {
+    const p = errorPresentation("upstream_failed", "[turn failed: model overloaded]", undefined);
+    expect(p.title).toBe("模型服务暂时中断");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("upstream_failed"));
+    expect(p.message).not.toContain("turn failed");
+    expect(p.detail).toBe("[turn failed: model overloaded]");
+    expect(p.waived).toBe(false);
+  });
+
+  test("[error] 终止器 → 同样收敛为按码文案 + 原文进 detail", () => {
+    const p = errorPresentation("upstream_failed", "[error] server shutting down", undefined);
+    expect(p.message).toBe(friendlyBridgeErrorMessage("upstream_failed"));
+    expect(p.detail).toBe("[error] server shutting down");
+  });
+
+  test("已知友好文案(applyOutboundError 写入的按码正文)原样保留", () => {
+    const friendly = friendlyBridgeErrorMessage("upstream_failed");
+    const p = errorPresentation("upstream_failed", friendly, undefined);
+    expect(p.message).toBe(friendly);
+  });
+
+  test("JSON 信封原文不进 detail(隐去技术串),仍按码文案", () => {
+    const p = errorPresentation("internal_error", '{"error":"boom","status":500}', undefined);
+    expect(p.message).toBe(friendlyBridgeErrorMessage("internal_error"));
+    expect(p.detail).toBeUndefined();
+    expect(JSON.stringify(p)).not.toContain("boom");
+  });
+
+  test("container_outdated 合法服务端 message → 透传作正文(白名单)", () => {
+    const p = errorPresentation("container_outdated", "运行环境已升级，请刷新页面。", undefined);
+    expect(p.title).toBe("运行环境已更新，请刷新页面");
+    expect(p.message).toBe("运行环境已升级，请刷新页面。");
+  });
+
+  test("未知码 → 标题「出错了」+ 通用兜底正文,非内部原文进 detail", () => {
+    const p = errorPresentation("brand_new_code", "临时不可用", undefined);
+    expect(p.title).toBe("出错了");
+    expect(p.message).toBe("系统暂时不可用，请稍后重试。");
+    expect(p.detail).toBe("临时不可用");
   });
 });

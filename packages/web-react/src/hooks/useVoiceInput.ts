@@ -11,9 +11,27 @@
  *   stop  → recorder.stop() → 冲刷最后一片后 send {type:'stop'}
  *   server {type:'transcript'}(中间) / {type:'polish', text}(最终) / {type:'error'}
  */
+import { isKnownTurnErrorCode } from "@openclaude/protocol";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { friendlyBridgeErrorMessage, normalizeBridgeErrorCode } from "../lib/chat/pure";
 
 export type VoiceState = "idle" | "connecting" | "recording" | "transcribing";
+
+/**
+ * STT 错误文案(任务⑤):`msg.code` 经 normalizeBridgeErrorCode(薄包装 protocol
+ * normalizeTurnErrorCode)查 taxonomy —— 已知码走按码文案(voice_upstream_error →
+ * 「语音识别服务暂时不可用，请重试」/voice_timeout →「语音识别超时，请重试」,均来自单一权威
+ * BRIDGE_ERROR_MESSAGES),未知码用语音专属通用兜底。**不再直接展示服务端 message**:
+ * friendlyBridgeErrorMessage 仅对 allowPublicServerMessage 白名单码透传 message,voice_* 不在
+ * 白名单内 → 服务端裸串不会外泄给用户。
+ */
+function voiceErrorMessage(code: unknown, message: unknown): string {
+  const n = normalizeBridgeErrorCode(code);
+  if (isKnownTurnErrorCode(n)) {
+    return friendlyBridgeErrorMessage(code, typeof message === "string" ? message : undefined);
+  }
+  return "语音识别失败，请重试";
+}
 
 function chooseMimeType(): string {
   const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
@@ -146,7 +164,7 @@ export function useVoiceInput({
     };
 
     ws.onmessage = (ev) => {
-      let msg: { type?: string; text?: string; rawText?: string; message?: string };
+      let msg: { type?: string; text?: string; rawText?: string; message?: string; code?: string };
       try {
         msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
       } catch {
@@ -199,7 +217,7 @@ export function useVoiceInput({
         cleanup();
         setState("idle");
       } else if (msg.type === "error") {
-        fail(msg.message || "语音识别出错");
+        fail(voiceErrorMessage(msg.code, msg.message));
       }
     };
 

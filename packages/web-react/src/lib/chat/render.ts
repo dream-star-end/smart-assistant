@@ -10,8 +10,15 @@
  *  3. 折叠态默认值（thinking 完成折叠 / agent-group 运行展开完成折叠），用户显式切换
  *     后由组件本地 state 锁定，不被签名重渲覆盖。
  */
+import {
+  isDisplayableServerMessage,
+  normalizeTurnErrorCode,
+  turnErrorSemantics,
+  WAIVED_TURN_ERROR_CODES,
+} from "@openclaude/protocol";
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage, ChildBlock } from "./model";
+import { friendlyBridgeErrorMessage } from "./pure";
 
 /**
  * 隐藏审查员(平台内置、管理 API 404 隐藏的系统 agent)的 agentId —— 单一权威。
@@ -268,50 +275,79 @@ export function defaultCollapsed(
 export const CONTINUE_PROMPT =
   "请接着上一条回复被截断的位置继续完成，不要重复已写过的内容，直接续写。";
 
-/** 归一化错误码 → 用户可读中文标题。未知码回退原码（仍可读、可反馈）。 */
+/**
+ * 归一化错误码 → 用户可读中文**标题**表。**key 集合与 protocol TURN_ERROR_TAXONOMY 对齐**
+ * (契约测试 turnErrorTaxonomy.contract 锁死每码有标题,防漂移);正文在 pure.ts
+ * BRIDGE_ERROR_MESSAGES(同源同 key,另一权威)。标题=类别,「怎么办」在正文。未知码回退「出错了」。
+ */
 const ERROR_LABELS: Record<string, string> = {
+  // ── 计费/配额 ──
   insufficient_credits: "积分余额不足",
   rate_limited: "请求过于频繁，请稍后再试",
-  context_too_long: "上下文超长，请精简或开新会话",
-  upstream_error: "模型服务暂时不可用",
+  // ── 上游模型服务 ──
+  model_capacity: "模型繁忙",
+  upstream_failed: "模型服务暂时中断",
   upstream_timeout: "模型响应超时",
   network_error: "网络异常，请重试",
-  service_restart: "服务重启，本轮已中断",
-  conn_kicked: "连接已断开",
-  maintenance: "服务维护中",
-  unauthorized_model: "模型未开通",
-  unauthorized: "登录已失效",
-  // 模型权威 gate 的拒帧(方案 §4 R3-m12)。标题=类别,「怎么办」在 friendlyBridgeErrorMessage。
-  model_config_changed_retry_turn: "模型配置已更新，请重发",
-  model_not_available: "模型不可用",
-  unresolved_agent_model: "未能确定模型",
-  model_authority_unavailable: "模型服务暂时不可用",
-  model_catalog_unavailable: "模型服务暂时不可用",
-  stopped: "已停止本轮生成",
+  context_too_long: "上下文超长，请精简或开新会话",
+  bad_request: "请求无法处理",
+  // ── 引擎/平台执行 ──
+  engine_error: "任务执行失败",
   internal_error: "服务内部错误",
   auth_error: "认证状态异常",
-  engine_error: "任务执行失败",
+  service_restart: "服务重启，本轮已中断",
+  session_persist_unavailable: "消息暂未安全送达",
+  stopped: "已停止本轮生成",
+  user_cancelled: "已取消本轮",
+  runner_crashed: "执行环境异常中断",
+  // ── 免单类 ──
   model_authority_expired: "本轮已自动免单",
   liveness_timeout: "本轮已自动免单",
   idle_timeout: "本轮已自动免单",
   no_response: "本轮已自动免单",
   phantom_turn: "本轮已自动免单",
   turn_limit: "本轮已自动免单",
+  // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
+  model_config_changed_retry_turn: "模型配置已更新，请重发",
+  model_not_available: "模型不可用",
+  unresolved_agent_model: "未能确定模型",
+  model_authority_unavailable: "模型服务暂时不可用",
+  model_catalog_unavailable: "模型服务暂时不可用",
+  unauthorized_model: "模型未开通",
+  // ── 连接/环境 ──
+  unauthorized: "登录已失效",
+  maintenance: "服务维护中",
+  conn_kicked: "连接已断开",
+  container_outdated: "运行环境已更新，请刷新页面",
+  err_container: "运行环境异常",
+  err_container_timeout: "运行环境响应超时",
+  err_internal: "服务内部错误",
+  forbidden: "操作被拒绝",
+  err_frame_too_big: "内容过大",
+  bad_json: "数据格式异常",
+  bad_sequence: "消息时序异常",
+  unknown_control: "未知控制指令",
+  // ── 媒体/子系统 ──
+  image_upstream_rejected: "图片生成被拒绝",
+  image_server_busy: "图片服务繁忙",
+  voice_upstream_error: "语音识别失败",
+  voice_timeout: "语音识别超时",
+  // ── 遗留兼容 ──
+  codex_turn_busy: "上一轮仍在进行",
+  codex_pool_busy: "账号池繁忙",
+  codex_route_unavailable: "服务暂时不可用",
+  codex_container_recycled: "环境已重建",
+  codex_billing: "计费服务暂时不可用",
+  upstream_error: "模型服务暂时不可用",
 };
 export function errorLabel(code: string | undefined): string {
-  if (!code) return "出错了";
-  // 未知码回退友好"出错了"(不再把裸码 err_xxx 抛给用户;原始码/消息在「查看详情」)。
-  return ERROR_LABELS[code.trim().toLowerCase()] ?? "出错了";
+  // 归一化(legacy 大写码经 normalizeTurnErrorCode → 语义码)后查表;未知码回退友好「出错了」
+  // (不再把裸码 err_xxx 抛给用户;原始码/消息在「查看详情」)。
+  return ERROR_LABELS[normalizeTurnErrorCode(code)] ?? "出错了";
 }
 
-const WAIVED_ERROR_CODES = new Set([
-  "model_authority_expired",
-  "liveness_timeout",
-  "idle_timeout",
-  "no_response",
-  "phantom_turn",
-  "turn_limit",
-]);
+/** 免单类错误码集合:**从 protocol 单一权威派生**(TURN_ERROR_TAXONOMY 中 waivable===true)。 */
+const WAIVED_ERROR_CODES = WAIVED_TURN_ERROR_CODES;
 
 function requestReference(...values: Array<string | undefined>): string | undefined {
   for (const value of values) {
@@ -346,7 +382,7 @@ export function errorPresentation(
   detail: string | undefined,
   waiverApplied = false,
 ): ErrorPresentation {
-  let normalized = code?.trim().toLowerCase() ?? "";
+  let normalized = normalizeTurnErrorCode(code);
   if (/MODEL_AUTHORITY_INVALID|MODEL_AUTHORITY_EXPIRED/i.test(`${code ?? ""}\n${text ?? ""}\n${detail ?? ""}`)) {
     normalized = "model_authority_expired";
   }
@@ -398,10 +434,36 @@ export function errorPresentation(
       waived: false,
     };
   }
+  // ── 兜底分支:**不再裸透传 text**(任务②)────────────────────────────────────────
+  // 历史上这里直接把 msg.text 当正文,持久化会话水合后 tape 终止器(如「[turn failed: …]」/
+  // 「[error] server shutting down」)、平台内部串会原样甩给用户。收敛为:仅当 text 正是**该码
+  // 已知友好文案**(applyOutboundError 写入的按码正文)或**白名单可信服务端 message**时原样保留;
+  // 否则(裸终止器 / 内部串 / 其它非已知原文)一律用 errorLabel 标题 + friendlyBridgeErrorMessage
+  // 正文,原文只落「查看详情」(detail 空则塞进去,保持可见性)。
+  const t = text?.trim() ?? "";
+  const byCode = friendlyBridgeErrorMessage(normalized); // 纯按码正文(不喂 message,避免 server-msg 自反)
+  // [turn failed …] / [error] … 是 tape 终止器(以 [ 开头,已被 looksLikeInternalError 命中),显式列出
+  // 仅为可读;serverMsgOk = 该码白名单且 message 过展示守卫(必非 [ 开头,故与 raw 互斥)。
+  const isRaw = !t || looksLikeInternalError(t) || /^\[(?:turn failed|error)\b/i.test(t);
+  const sem = turnErrorSemantics(normalized);
+  const serverMsgOk = sem.allowPublicServerMessage === true && isDisplayableServerMessage(t);
+  const keepText = !isRaw && (t === byCode || serverMsgOk);
+  if (keepText) {
+    return {
+      title: errorLabel(normalized),
+      message: t,
+      ...(detail?.trim() ? { detail: detail.trim() } : {}),
+      waived: false,
+    };
+  }
+  // 原文进 detail(若 detail 空):[error]/[turn failed] 终止器是可展示排查线索;真正的 JSON 信封/
+  // 堆栈(looksLikeInternalError 但非终止器前缀)才隐去,不外泄。
+  const isTerminator = /^\[(?:turn failed|error)\b/i.test(t);
+  const rawForDetail = t && (isTerminator || !looksLikeInternalError(t)) ? t : "";
   return {
-    title: errorLabel(code),
-    message: text?.trim() || "本轮未正常完成，请重试。",
-    ...(detail?.trim() ? { detail: detail.trim() } : {}),
+    title: errorLabel(normalized),
+    message: byCode,
+    ...(detail?.trim() ? { detail: detail.trim() } : rawForDetail ? { detail: rawForDetail } : {}),
     waived: false,
   };
 }
