@@ -1655,6 +1655,121 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
   })
 
+  test('自动回复规则可编辑，非法字段在弹窗内精确拦截且不发请求', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const account: RuntimePluginAccount = {
+      id: '910',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '规则编辑账号',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: knowledgePlanetWriteControl({
+        enabled: true,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T01:02:03.000Z',
+      }),
+    }
+    const rule = {
+      id: '123e4567-e89b-42d3-a456-426614174010',
+      groupId: '12345678901234',
+      name: '原规则',
+      instructions: '原回复要求',
+      triggerKind: 'new_topic' as const,
+      enabled: true,
+      dailyLimit: 5,
+      cooldownMinutes: 15,
+      maxReplyChars: 800,
+      consecutiveFailures: 0,
+      pausedReason: null,
+      lastCursorAt: '2026-07-17T02:03:04.000Z',
+      nextRunAt: '2026-07-17T02:03:04.000Z',
+      createdAt: '2026-07-17T02:03:04.000Z',
+      updatedAt: '2026-07-17T02:03:04.000Z',
+    }
+    const view = {
+      control: {
+        available: true,
+        enabled: true,
+        disclaimerVersion: 1,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T02:03:04.000Z',
+        disclaimerText: '无人值守会自动计费并发布带 AI 标识的文字回复。',
+        accountDailyLimit: 10,
+        pausedReason: null,
+      },
+      rules: [rule],
+      recentRuns: [],
+    }
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [account],
+    })
+    mockedGetKnowledgePlanetAutomation.mockResolvedValue(view)
+    mockedPatchKnowledgePlanetRule.mockResolvedValue({
+      ...rule,
+      name: '已更新规则',
+      instructions: '只回复能够确认的问题',
+    })
+
+    render(<ConnectorsTab auth={auth} />)
+    fireEvent.click(await screen.findByRole('button', { name: '编辑' }))
+    let dialog = await screen.findByRole('dialog')
+    fireEvent.change(within(dialog).getByLabelText('规则名称'), {
+      target: { value: '  已更新规则  ' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('回复要求'), {
+      target: { value: '  只回复能够确认的问题  ' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存规则' }))
+
+    await waitFor(() =>
+      expect(mockedPatchKnowledgePlanetRule).toHaveBeenCalledWith(auth, '910', rule.id, {
+        name: '已更新规则',
+        instructions: '只回复能够确认的问题',
+        triggerKind: 'new_topic',
+        dailyLimit: 5,
+        cooldownMinutes: 15,
+        maxReplyChars: 800,
+      }),
+    )
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    mockedPatchKnowledgePlanetRule.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    dialog = await screen.findByRole('dialog')
+    const numbers = within(dialog).getAllByRole('spinbutton')
+    fireEvent.change(numbers[0]!, { target: { value: '11' } })
+    const saveButton = within(dialog).getByRole('button', { name: '保存规则' })
+    fireEvent.click(saveButton)
+    const dailyLimitError = await within(dialog).findByRole('alert')
+    expect(dailyLimitError).toHaveTextContent('每日上限必须是 1–10 的整数')
+    expect(dailyLimitError.parentElement).toContainElement(saveButton)
+    expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
+    expect(mockedCreateKnowledgePlanetRulesBatch).not.toHaveBeenCalled()
+
+    fireEvent.change(numbers[0]!, { target: { value: '5' } })
+    fireEvent.change(within(dialog).getByLabelText('回复要求'), { target: { value: '   ' } })
+    fireEvent.click(saveButton)
+    expect(await within(dialog).findByText('请输入回复要求')).toBeInTheDocument()
+    expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
+    expect(mockedCreateKnowledgePlanetRulesBatch).not.toHaveBeenCalled()
+
+    fireEvent.change(within(dialog).getByLabelText('回复要求'), {
+      target: { value: '只回复能够确认的问题' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('规则名称'), {
+      target: { value: '无效\0规则' },
+    })
+    fireEvent.click(saveButton)
+    expect(await within(dialog).findByText('规则名称包含无效字符')).toBeInTheDocument()
+    expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
+    expect(mockedCreateKnowledgePlanetRulesBatch).not.toHaveBeenCalled()
+  })
+
   test('授权成功提示在解绑时立即清除，解绑后无需刷新即可重新发起扫码', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     const account = {
