@@ -391,6 +391,7 @@ export function App() {
     setActiveId,
     selectSession,
     newSession,
+    noteModelPatched,
     onHydrated,
     renameSessionPrompt,
     deleteSessionConfirm,
@@ -424,6 +425,8 @@ export function App() {
     },
     // URL 深链恢复未决：暂停自动选中（URL 指定 > 最近会话）。
     holdAutoSelect: pendingRouteSession !== null,
+    // 新建会话占位定格当前有效模型(含空态显式选择,防被 resolver 按 default 覆盖)。
+    currentModelId: () => modelId,
   });
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
@@ -451,8 +454,11 @@ export function App() {
   }, [demo, models, activeId, modelPrefs]);
 
   // 显式选择模型:活动会话存在则写通三持有方(best-effort PATCH,失败契约同 rename:
-  // 下次 listSessions server-wins 盖回,重选即重试;新会话行未建 404 同样吞掉,由建行
-  // PUT/建行后收敛 PATCH 落地)。无活动会话(空会话态)仅更新选择器,作为下一会话意图。
+  // 服务端存有**旧值**时下次 listSessions server-wins 盖回,重选即重试;服务端从未有值
+  // (NULL=从未显式选择,无"清除"流)则缺席不表态,本地意图保留 —— 两种失败面都可自愈。
+  // 新会话行未建 404 同样吞掉,由建行 PUT/建行后收敛 PATCH 落地。PATCH 成功登记本地写
+  // 水位(noteModelPatched):拦截 PATCH 前发出的旧 list/detail 迟到响应盖回旧值的竞态。
+  // 无活动会话(空会话态)仅更新选择器,作为下一会话意图。
   const selectModel = useCallback(
     (id: string) => {
       setModelId(id);
@@ -461,11 +467,14 @@ export function App() {
       if (!sid) return;
       setSessions((c) => c.map((s) => (s.id === sid ? { ...s, modelId: id } : s)));
       sockRef.current?.setSessionModel(sid, id);
-      void api.patchSessionModel(authRef.current, sid, id).catch(() => {
-        /* best-effort:本地已改;server 无值不清本地,有旧值则下次 server-wins 盖回可重选 */
-      });
+      api
+        .patchSessionModel(authRef.current, sid, id)
+        .then((r) => noteModelPatched(sid, r.updatedAt))
+        .catch(() => {
+          /* best-effort:本地已改,失败面自愈见上注 */
+        });
     },
-    [demo, activeId, setSessions],
+    [demo, activeId, setSessions, noteModelPatched],
   );
   // 回填给 useAuth 的 chat 域收尾（onClearAuth/onLoginSuccess 经 sessionsResetRef 调用）。
   sessionsResetRef.current = resetSessionList;

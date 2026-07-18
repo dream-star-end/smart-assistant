@@ -99,6 +99,10 @@ export type UseSessionListOptions = {
    * 深链 resolve/放弃后置 false，自动选中恢复正常判定。
    */
   holdAutoSelect?: boolean;
+  /** 新建会话占位时读取"当前有效模型"(App 选择器现值,含空态显式选择),定格为新会话的
+   *  per-session 模型 —— 否则空态选完模型再点「新建会话」,占位无自有模型,resolver 会
+   *  按 default 恢复,空态选择被丢(Codex 审 MAJOR)。 */
+  currentModelId?: () => string | undefined;
 };
 
 export type UseSessionList = {
@@ -108,6 +112,10 @@ export type UseSessionList = {
   setActiveId: React.Dispatch<React.SetStateAction<string | undefined>>;
   selectSession: (id: string) => void;
   newSession: () => void;
+  /** 会话模型 PATCH 成功后登记本地写水位(服务端返回的 updatedAt):此后到达的
+   *  list/detail 载荷若 updatedAt 低于水位,其 modelId 视为陈旧不应用 —— 拦截
+   *  「PATCH 前发出的旧响应迟到,把刚选的模型盖回旧值」竞态(Codex 审 MAJOR)。*/
+  noteModelPatched: (sessId: string, updatedAt: number) => void;
   /** IndexedDB 注水回调（喂给 useChatSocket.onHydrated）。 */
   onHydrated: (stored: StoredSession[]) => void;
   renameSessionPrompt: (s: Session) => Promise<void>;
@@ -151,6 +159,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   // 把上一个用户的历史污染进单例 WS service / 写进新用户的 IndexedDB 命名空间（隐私）。
   const userIdRef = useRef<string | null>(null);
   userIdRef.current = user?.id ?? null;
+  // 会话模型本地写水位(sessId → PATCH 返回的 updatedAt,取 max):见 noteModelPatched 注释。
+  const modelPatchFloorRef = useRef<Map<string, number>>(new Map());
+  const noteModelPatched = useCallback((sessId: string, updatedAt: number) => {
+    const cur = modelPatchFloorRef.current.get(sessId) ?? 0;
+    if (updatedAt > cur) modelPatchFloorRef.current.set(sessId, updatedAt);
+  }, []);
 
   // IndexedDB 注水回调：把本地会话填进侧栏（本地优先；随后 listSessions server-wins 覆盖元数据）。
   const onHydrated = useCallback(
@@ -179,6 +193,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         // 登出/换号守卫：await 期间用户已变 → 丢弃，绝不污染当前会话/新用户 IndexedDB。
         if (userIdRef.current !== owner) return;
         const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
+        // 会话模型陈旧载荷拦截:detail 若发出于本地 PATCH 之前(updatedAt < 本地写水位),
+        // 其 modelId 视为陈旧丢弃(消息合并照常 —— socket 有自己的版本护栏)。
+        const modelFloor = modelPatchFloorRef.current.get(id) ?? 0;
+        const freshModelId =
+          typeof detail.updatedAt === "number" && detail.updatedAt >= modelFloor
+            ? detail.modelId
+            : undefined;
         cbRef.current.sockRef.current?.mergeServerHistory({
           sessId: id,
           agentId: detail.agentId || agentId,
@@ -190,13 +211,14 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           archivedThroughSeq: detail.archivedThroughSeq,
           archivedCount: detail.archivedCount,
           serverUpdatedAt: detail.updatedAt,
-          modelId: detail.modelId,
+          modelId: freshModelId,
         });
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
-        // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地。
-        if (detail.modelId) {
+        // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地
+        // (服务端 NULL 只表示"从未显式选择",不存在"清除"流,缺席=不表态)。
+        if (freshModelId) {
           setSessions((c) =>
-            c.map((s) => (s.id === id && s.modelId !== detail.modelId ? { ...s, modelId: detail.modelId } : s)),
+            c.map((s) => (s.id === id && s.modelId !== freshModelId ? { ...s, modelId: freshModelId } : s)),
           );
         }
         historyFetchedAtRef.current.set(id, Date.now());
@@ -239,12 +261,16 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     // 非 demo：新建一个 WS 会话占位（peer.id 用真实 id），socket 侧在首次 send 时
     // 惰性 ensureSession —— 空会话不必提前占用 service 槽位。
     const id = genWsSessionId();
+    // 定格当前有效模型为新会话选择(含空态显式选择;见 currentModelId 注释)。纯本地占位,
+    // 服务端落地仍走首发建行 PUT / 建行后收敛 PATCH。
+    const inheritModel = cbRef.current.currentModelId?.();
     const s: Session = {
       id,
       title: "新对话",
       ownerUserId: user.id,
       updatedAt: new Date().toISOString(),
       messageCount: 0,
+      ...(inheritModel ? { modelId: inheritModel } : {}),
     };
     setSessions((c) => [s, ...c]);
     setActiveId(id);
@@ -262,7 +288,17 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       .listSessions(cbRef.current.authSession)
       .then((metas) => {
         if (cancelled) return;
-        const server = metas.map((m) => metaToSession(m, user.id));
+        const server = metas.map((m) => {
+          const s = metaToSession(m, user.id);
+          // 会话模型陈旧载荷拦截(与 loadHistory 同款):list 响应发出于本地 PATCH 之前
+          // → 剥掉其 modelId 键(键缺席=不表态,合并保留本地新选择),其余元数据照常 server-wins。
+          const floor = modelPatchFloorRef.current.get(m.id) ?? 0;
+          if (s.modelId !== undefined && m.updatedAt < floor) {
+            const { modelId: _stale, ...rest } = s;
+            return rest;
+          }
+          return s;
+        });
         setSessions((cur) => upsertSessions(cur, server, true));
       })
       .catch(() => {
@@ -318,6 +354,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     cbRef.current.onDeleteSession?.(s.id);
     historyFetchedAtRef.current.delete(s.id);
     historyFetchingRef.current.delete(s.id);
+    modelPatchFloorRef.current.delete(s.id);
     if (!demo) {
       cbRef.current.sockRef.current?.removeSession(s.id);
       cbRef.current.sockRef.current?.removePersisted(s.id); // 清 IndexedDB 本地副本
@@ -335,6 +372,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const reset = useCallback(() => {
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
+    modelPatchFloorRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     setSessions([]);
     setActiveId(undefined);
@@ -348,6 +386,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     setActiveId,
     selectSession,
     newSession,
+    noteModelPatched,
     onHydrated,
     renameSessionPrompt,
     deleteSessionConfirm,

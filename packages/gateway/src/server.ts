@@ -3707,12 +3707,18 @@ export class Gateway {
             this.sendJson(res, 400, { error: 'invalid JSON' })
             return
           }
-          // modelId(会话级模型选择)建行透传:形态非法/缺省一律按未携带处理(upsert COALESCE
-          // 保留既有值,绝不清空)。与 PATCH 同一校验口径。
-          const putModelId =
-            typeof data.modelId === 'string' && /^[A-Za-z0-9._:-]{1,120}$/.test(data.modelId.trim())
-              ? data.modelId.trim()
-              : undefined
+          // modelId(会话级模型选择)建行透传。键缺席=不表态(upsert COALESCE 保留既有值,
+          // 绝不清空);**键存在但非法 → 400**(与 PATCH 同一校验口径;静默忽略会造成
+          // "客户端以为已保存、服务端实际没存"的假成功,Codex 审 MINOR)。
+          let putModelId: string | undefined
+          if (data.modelId !== undefined) {
+            const m = typeof data.modelId === 'string' ? data.modelId.trim() : ''
+            if (!/^[A-Za-z0-9._:-]{1,120}$/.test(m)) {
+              this.sendJson(res, 400, { error: 'modelId invalid (1-120 chars, [A-Za-z0-9._:-])' })
+              return
+            }
+            putModelId = m
+          }
           const updatedAt = Date.now()
           const result = await upsertClientSession({
             id: sessId,

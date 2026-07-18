@@ -32,7 +32,8 @@
     "0167_turn_waiver_receipts",
     "0168_knowledge_planet_automation",
     "0169_plugin_write_preapproval",
-    "0170_durable_turn_dispatch"
+    "0170_durable_turn_dispatch",
+    "0173_client_session_model"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
