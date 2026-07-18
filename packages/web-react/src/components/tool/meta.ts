@@ -129,6 +129,9 @@ export const OC_TOOLS = {
   // 应用连接器(webdav/imap/notion/github/feishu):body 专属卡含写操作确认卡
   // (connectorCards.tsx,human-in-the-loop 安全关键)。
   "oc-connect": { icon: Plug, label: "应用连接", tone: "accent" },
+  // 市场 Plugin(知识星球/微博等)沿用同一服务端确认账本与确认卡；CLI stdout 只提供
+  // 不透明 confirmation id，卡片内容仍由后端权威详情铸造。
+  "oc-plugin": { icon: Plug, label: "市场插件", tone: "accent" },
 } satisfies Record<string, ToolMeta>;
 
 /** oc-* CLI 名的联合类型(= OC_TOOLS 的键)。body 卡注册表以它为键,保证不会给未登记的

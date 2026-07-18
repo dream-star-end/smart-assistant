@@ -449,13 +449,9 @@ export function ConnectorsTab({
               onWriteAccessChanged={(enabled) => {
                 setErr(null)
                 setSuccess(
-                  plugin.slug === 'knowledge-planet'
-                    ? enabled
-                      ? '知识星球写入能力已开启；默认仍需在对话中逐次确认，免确认与无人值守自动回复需分别另行同意。'
-                      : '知识星球写入能力已关闭。'
-                    : enabled
-                      ? `${plugin.label}写入能力已开启；每次写操作仍需在对话中逐次确认。`
-                      : `${plugin.label}写入能力已关闭。`,
+                  enabled
+                    ? `${plugin.label}写入能力已开启；默认仍需在对话中逐次确认，免逐次确认需另行同意。${plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
+                    : `${plugin.label}写入能力已关闭。`,
                 )
                 reload()
               }}
@@ -464,8 +460,8 @@ export function ConnectorsTab({
                 setErr(null)
                 setSuccess(
                   enabled
-                    ? '知识星球“免逐次确认”已开启；Agent 可直接执行所有已开放写入动作。无人值守自动回复仍由独立开关控制。'
-                    : '知识星球“免逐次确认”已关闭；后续手动写入恢复逐次确认。',
+                    ? `${plugin.label}“免逐次确认”已开启；Agent 可直接执行所有已开放写入动作。${plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
+                    : `${plugin.label}“免逐次确认”已关闭；后续写入恢复逐次确认。`,
                 )
                 reload()
               }}
@@ -814,7 +810,7 @@ function RuntimePluginCard({
                     <div className="min-w-0 flex-1">
                       <div className="text-[11.5px] font-medium text-fg">免逐次确认</div>
                       <div className="mt-0.5 text-[10.5px] leading-relaxed text-faint">
-                        开启后，Agent 可直接发布主题和评论、上传媒体、点赞、编辑及删除；默认关闭。
+                        开启后，Agent 可直接执行此 Plugin 的全部已开放写入动作；默认关闭。
                       </div>
                     </div>
                     <span className="text-[11px] text-muted">
@@ -859,8 +855,8 @@ function RuntimePluginCard({
             setConsentError(null)
           }
         }}
-        title="开启知识星球写入能力"
-        description="开启后，主题、评论、媒体、点赞、编辑和删除默认仍须由你在对话确认卡中单独批准；免逐次确认与无人值守回复使用各自独立授权。"
+        title={`开启${plugin.label}写入能力`}
+        description={`开启后，此 Plugin 的写入动作默认仍须由你在对话确认卡中单独批准；免逐次确认使用独立授权。${plugin.slug === 'knowledge-planet' ? '无人值守回复也使用独立授权。' : ''}`}
         footer={
           <>
             <Button
@@ -914,7 +910,7 @@ function RuntimePluginCard({
           }
         }}
         title="开启免逐次确认"
-        description="这是独立的账号级高风险授权。开启后，所有可使用此账号的 Agent 都可直接执行知识星球写入，不再展示逐次确认卡。"
+        description={`这是独立的账号级高风险授权。开启后，所有可使用此账号的 Agent 都可直接执行${plugin.label}写入，不再展示逐次确认卡。`}
         footer={
           <>
             <Button

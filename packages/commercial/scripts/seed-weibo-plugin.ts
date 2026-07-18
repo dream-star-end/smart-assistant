@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 /** Exact-image DOM smoke, official Weibo seed, and verified-user account handoff. */
 
+import assert from 'node:assert/strict'
 import { createDecipheriv, createHash } from 'node:crypto'
 import { lstat, readFile, rm } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
@@ -14,8 +15,16 @@ import { seedWeiboPlugin } from '../src/marketplace/seedWeiboPlugin.js'
 import {
   type BrowserStorageStateV1,
   bindManagedBrowserPluginAccount,
+  decryptPluginAccountEnvelope,
+  getPluginAccount,
 } from '../src/plugins/accounts.js'
 import { ManagedBrowserRuntime } from '../src/plugins/browserRuntime.js'
+import {
+  closeOfficialManagedBrowserPluginListingGate,
+  openOfficialManagedBrowserPluginListingGate,
+  readOfficialManagedBrowserTransitionCensus,
+} from '../src/plugins/officialManagedBrowserTransition.js'
+import { loadVerifiedRuntimePluginContract } from '../src/plugins/review.js'
 import {
   COMPILED_WEIBO_PLUGIN,
   WEIBO_PLUGIN_CONTRACT,
@@ -205,12 +214,155 @@ async function leaseRedis(): Promise<IORedis> {
   return redis
 }
 
+function writePolicyFingerprint(
+  row: NonNullable<Awaited<ReturnType<typeof getPluginAccount>>>,
+): string {
+  return JSON.stringify({
+    writeEnabled: row.plugin_write_enabled,
+    writeVersion: row.plugin_write_disclaimer_version,
+    writeAcceptedAt: row.plugin_write_disclaimer_accepted_at?.toISOString() ?? null,
+    preapprovalEnabled: row.plugin_write_preapproval_enabled,
+    preapprovalVersion: row.plugin_write_preapproval_disclaimer_version,
+    preapprovalAcceptedAt: row.plugin_write_preapproval_accepted_at?.toISOString() ?? null,
+  })
+}
+
+async function loadUpgradeAccount(userId: number) {
+  const census = await readOfficialManagedBrowserTransitionCensus(WEIBO_PLUGIN_CONTRACT.id)
+  if (
+    census.installs.length !== 1 ||
+    census.accounts.length !== 1 ||
+    census.installs[0]?.userId !== userId ||
+    census.accounts[0]?.userId !== userId ||
+    census.accounts[0]?.status !== 'active' ||
+    census.currentVersionId === null ||
+    census.installs[0]?.versionId !== census.currentVersionId ||
+    census.accounts[0]?.versionId !== census.currentVersionId
+  )
+    throw new Error('Weibo upgrade scope is not exactly one active install/account for this user')
+  const accountId = census.accounts[0].id
+  const row = await getPluginAccount(accountId, userId, getPool(), { includeError: true })
+  if (!row || row.status !== 'active') throw new Error('Weibo upgrade account disappeared')
+  const sourceVersionId = Number(row.connector_version_id)
+  if (!Number.isSafeInteger(sourceVersionId) || sourceVersionId <= 0)
+    throw new Error('Weibo upgrade source version is invalid')
+  const verified = await loadVerifiedRuntimePluginContract(sourceVersionId, getPool(), {
+    env: process.env,
+  })
+  if (
+    verified.pluginType !== 'managed-browser' ||
+    verified.slug !== WEIBO_PLUGIN_CONTRACT.id ||
+    row.provider !== verified.slug ||
+    row.spec_hash.toString('hex') !== verified.artifactHash ||
+    row.exec_contract_hash.toString('hex') !== verified.execContractHash
+  )
+    throw new Error('Weibo upgrade account trust pins do not match its exact source contract')
+  const envelope = decryptPluginAccountEnvelope(row, verified.contract, process.env)
+  return {
+    census,
+    storageState: envelope.storageState,
+    accountInstanceId: envelope.accountInstanceId,
+    writePolicyFingerprint: writePolicyFingerprint(row),
+    sourceVersionId: census.currentVersionId,
+    sourceArtifactHash: verified.artifactHash,
+    sourceExecContractHash: verified.execContractHash,
+  }
+}
+
+async function assertUpgradeCensusUnchanged(
+  expected: Awaited<ReturnType<typeof readOfficialManagedBrowserTransitionCensus>>,
+): Promise<void> {
+  const current = await readOfficialManagedBrowserTransitionCensus(WEIBO_PLUGIN_CONTRACT.id)
+  assert.deepEqual(
+    current,
+    expected,
+    'Weibo install/account census changed during live verification',
+  )
+}
+
+async function verifyUpgradedAccount(
+  reusable: Awaited<ReturnType<typeof loadUpgradeAccount>>,
+  userId: number,
+  targetVersionId: string,
+): Promise<Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>> {
+  const finalCensus = await readOfficialManagedBrowserTransitionCensus(WEIBO_PLUGIN_CONTRACT.id)
+  assert.deepEqual(
+    finalCensus,
+    {
+      currentVersionId: targetVersionId,
+      installs: reusable.census.installs.map((row) => ({
+        ...row,
+        versionId: targetVersionId,
+        artifactHash: COMPILED_WEIBO_PLUGIN.artifactHash,
+      })),
+      accounts: reusable.census.accounts.map((row) => {
+        const migrated = row.versionId !== targetVersionId
+        return {
+          ...row,
+          versionId: targetVersionId,
+          revision: row.revision + (migrated ? 1 : 0),
+          secretGeneration: migrated
+            ? String(BigInt(row.secretGeneration) + 1n)
+            : row.secretGeneration,
+          specHash: COMPILED_WEIBO_PLUGIN.artifactHash,
+          execContractHash: COMPILED_WEIBO_PLUGIN.execContractHash,
+          authContractVersion: WEIBO_PLUGIN_CONTRACT.account.contractVersion,
+        }
+      }),
+    },
+    'Weibo upgrade final census is not the exact verified scope',
+  )
+  const finalRow = await getPluginAccount(reusable.census.accounts[0]!.id, userId, getPool(), {
+    includeError: true,
+  })
+  if (!finalRow || finalRow.connector_version_id !== targetVersionId)
+    throw new Error('Weibo upgraded account pin is missing')
+  const finalVerified = await loadVerifiedRuntimePluginContract(
+    Number(targetVersionId),
+    getPool(),
+    {
+      env: process.env,
+    },
+  )
+  if (
+    finalVerified.pluginType !== 'managed-browser' ||
+    finalVerified.slug !== WEIBO_PLUGIN_CONTRACT.id ||
+    finalVerified.artifactHash !== COMPILED_WEIBO_PLUGIN.artifactHash ||
+    finalVerified.execContractHash !== COMPILED_WEIBO_PLUGIN.execContractHash
+  )
+    throw new Error('Weibo upgraded account target contract is not exact')
+  const finalEnvelope = decryptPluginAccountEnvelope(finalRow, finalVerified.contract, process.env)
+  assert.equal(
+    finalEnvelope.accountInstanceId,
+    reusable.accountInstanceId,
+    'Weibo account identity changed during version migration',
+  )
+  assert.deepEqual(
+    finalEnvelope.storageState,
+    reusable.storageState,
+    'Weibo persisted login state changed during version migration',
+  )
+  assert.equal(
+    writePolicyFingerprint(finalRow),
+    reusable.writePolicyFingerprint,
+    'Weibo raw write/preapproval grants changed during version migration',
+  )
+  return {
+    id: finalRow.id,
+    accountInstanceId: finalEnvelope.accountInstanceId,
+    outcome: 'reused',
+  }
+}
+
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? ''
-  const match = /^--verify-and-seed-user=(\d{1,16})$/.exec(mode)
+  const match = /^--verify-and-(seed|upgrade)-user=(\d{1,16})$/.exec(mode)
   if (process.argv.length !== 3 || !match)
-    throw new Error('usage: seed-weibo-plugin.ts --verify-and-seed-user=ID')
-  const userId = Number(match[1])
+    throw new Error(
+      'usage: seed-weibo-plugin.ts --verify-and-seed-user=ID | --verify-and-upgrade-user=ID',
+    )
+  const operation = match[1] as 'seed' | 'upgrade'
+  const userId = Number(match[2])
   if (!Number.isSafeInteger(userId) || userId <= 0) throw new Error('verification user is invalid')
   const imageId = exactImageId()
   const docker = dockerClient()
@@ -219,7 +371,13 @@ async function main(): Promise<void> {
     .inspect()
     .catch(() => null)
   if (!image || image.Id !== imageId) throw new Error('exact runtime image is unavailable')
-  const storageState = await loadVerifiedState()
+  if (operation === 'seed') {
+    const census = await readOfficialManagedBrowserTransitionCensus(WEIBO_PLUGIN_CONTRACT.id)
+    if (census.installs.length > 0 || census.accounts.length > 0)
+      throw new Error('existing Weibo users require --verify-and-upgrade-user, not fresh seed mode')
+  }
+  const reusable = operation === 'upgrade' ? await loadUpgradeAccount(userId) : null
+  const storageState = reusable?.storageState ?? (await loadVerifiedState())
   const service = new WeiboDockerService(docker, {
     imageId,
     workerRoot: '/run/openclaude-v5/weibo-plugin-smoke-workers',
@@ -229,35 +387,61 @@ async function main(): Promise<void> {
     socketGid: 1000,
   })
   let redis: IORedis | null = null
+  let restoreSourceGate = false
   try {
     const smoke = await exactImageSmoke(service, storageState)
     const qrDigest = await qrSmoke(service)
     redis = await leaseRedis()
+    if (reusable) {
+      await assertUpgradeCensusUnchanged(reusable.census)
+      await closeOfficialManagedBrowserPluginListingGate({
+        slug: WEIBO_PLUGIN_CONTRACT.id,
+        env: process.env,
+        pool: getPool(),
+      })
+      restoreSourceGate = true
+    }
+    let account: Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>> | null = null
     const seeded = await seedWeiboPlugin({
       functionalVerified: true,
       env: process.env,
       leaseRedis: redis,
+      ...(reusable
+        ? {
+            expectedScope: reusable.census,
+            beforeListingOpen: async ({ versionId }: { versionId: string }) => {
+              // The transition committed, so the old gate can no longer be
+              // reopened. Keep the target gated until all exact postconditions pass.
+              restoreSourceGate = false
+              account = await verifyUpgradedAccount(reusable, userId, versionId)
+            },
+          }
+        : {}),
     })
-    await installApprovedVersion({
-      userId,
-      versionId: seeded.versionId,
-      installAudit: { source: 'official-weibo-live-verification', installedBy: userId },
-    })
-    const account = await bindManagedBrowserPluginAccount({
-      userId,
-      versionId: Number(seeded.versionId),
-      displayName: '微博',
-      accountHint: '微博扫码账号',
-      storageState: smoke.storageState,
-      existing: 'reuse-identical',
-      env: process.env,
-      pool: getPool(),
-    })
+    restoreSourceGate = false
+    if (!reusable) {
+      await installApprovedVersion({
+        userId,
+        versionId: seeded.versionId,
+        installAudit: { source: 'official-weibo-live-verification', installedBy: userId },
+      })
+      account = await bindManagedBrowserPluginAccount({
+        userId,
+        versionId: Number(seeded.versionId),
+        displayName: '微博',
+        accountHint: '微博扫码账号',
+        storageState: smoke.storageState,
+        existing: 'reuse-identical',
+        env: process.env,
+        pool: getPool(),
+      })
+    } else if (!account) throw new Error('Weibo upgrade did not verify before listing open')
     process.stdout.write(
       `${JSON.stringify({
         ...seeded,
         account,
         verification: {
+          operation,
           userId,
           selfIdDigest: createHash('sha256').update(smoke.selfId).digest('hex'),
           passedActionIds: smoke.passed,
@@ -269,12 +453,30 @@ async function main(): Promise<void> {
         },
       })}\n`,
     )
+  } catch (error) {
+    if (restoreSourceGate && reusable) {
+      await openOfficialManagedBrowserPluginListingGate({
+        slug: WEIBO_PLUGIN_CONTRACT.id,
+        expectedVersionId: reusable.sourceVersionId,
+        expectedArtifactHash: reusable.sourceArtifactHash,
+        expectedExecContractHash: reusable.sourceExecContractHash,
+        env: process.env,
+        pool: getPool(),
+      }).catch((restoreError) => {
+        process.stderr.write(
+          `Weibo source listing gate recovery failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}\n`,
+        )
+      })
+    }
+    throw error
   } finally {
     await service.closeAndDrain().catch(() => {})
     if (redis) await redis.quit().catch(() => redis?.disconnect())
     await closePool().catch(() => {})
-    const keyPath = process.env.OC_WEIBO_VERIFY_KEY_FILE?.trim()
-    if (keyPath) await rm(keyPath, { force: true }).catch(() => {})
+    if (operation === 'seed') {
+      const keyPath = process.env.OC_WEIBO_VERIFY_KEY_FILE?.trim()
+      if (keyPath) await rm(keyPath, { force: true }).catch(() => {})
+    }
   }
 }
 

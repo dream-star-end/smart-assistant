@@ -8,6 +8,7 @@ import { query } from '../db/queries.js'
 import type { PluginLeaseRedis } from '../plugins/accountLease.js'
 import {
   OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+  type OfficialManagedBrowserTransitionScope,
   openOfficialManagedBrowserPluginListingGate,
   transitionOfficialManagedBrowserPluginVersion,
 } from '../plugins/officialManagedBrowserTransition.js'
@@ -26,16 +27,16 @@ import { scanSkillArtifact } from './skillScanner.js'
 
 const OFFICIAL_NAME = '微博'
 const OFFICIAL_DESCRIPTION =
-  '通过隔离受管浏览器和微博公开网页界面，读取账号资料、首页与用户微博、正文、评论和搜索结果；用户逐次确认后，可发布图文微博、编辑或删除自己的微博、评论与回复、转发，以及设置点赞和关注状态。无需购买微博开放平台套餐，不读取或重放网页接口响应。扫码登录状态加密保存；遇到验证码或风控立即停止。'
+  '通过隔离受管浏览器和微博公开网页界面，读取账号资料、首页与用户微博、正文、评论和搜索结果；开启写入后默认逐次确认，也可由用户另行接受账号级高风险声明后免确认执行发布、编辑、删除、评论、回复、转发、点赞和关注。无需购买微博开放平台套餐，不读取或重放网页接口响应。扫码登录状态加密保存；遇到验证码或风控立即停止。'
 const OFFICIAL_TAGS = ['微博', '社交媒体', '内容检索', '内容发布', '网页自动化']
 const OFFICIAL_USE_CASES = [
   '读取当前账号、指定用户资料与主页微博',
   '查看首页时间线、微博正文和当前页面评论',
   '按关键词搜索公开微博',
-  '逐次确认后发布文字或最多九张图片的微博',
-  '逐次确认后编辑或永久删除自己发布的微博',
-  '逐次确认后评论、回复或删除自己的评论与回复',
-  '逐次确认后转发微博并设置点赞或关注的目标状态',
+  '默认逐次确认；账号单独授权后可发布文字或最多九张图片的微博',
+  '默认逐次确认；账号单独授权后可编辑或永久删除自己发布的微博',
+  '默认逐次确认；账号单独授权后可评论、回复或删除自己的评论与回复',
+  '默认逐次确认；账号单独授权后可转发微博并设置点赞或关注的目标状态',
 ]
 
 interface LocatedVersion {
@@ -184,6 +185,8 @@ export async function seedWeiboPlugin(input: {
   ownerUserId?: number
   env?: NodeJS.ProcessEnv
   leaseRedis?: PluginLeaseRedis | null
+  /** Upgrade-only scope proven by exact-image read smoke; never inferred by the seed itself. */
+  expectedScope?: OfficialManagedBrowserTransitionScope
   beforeListingOpen?: (target: { versionId: string }) => Promise<void>
 }): Promise<SeedWeiboPluginResult> {
   if (input.functionalVerified !== true)
@@ -235,11 +238,11 @@ export async function seedWeiboPlugin(input: {
         outcomeExamples: [
           '汇总首页时间线或指定用户的近期微博并继续分析',
           '按关键词搜索公开微博，再读取指定正文和评论',
-          '经逐次确认发布图文微博，或编辑、删除自己的微博',
-          '经逐次确认评论、回复、转发、点赞或关注，并保留写入账本',
+          '默认经逐次确认发布图文微博，或编辑、删除自己的微博；账号单独授权后可免确认',
+          '默认经逐次确认评论、回复、转发、点赞或关注；账号单独授权后可免确认并保留写入账本',
         ],
         humanMd:
-          '平台官方 Plugin。它只操纵微博公开网页界面，不调用开放平台付费接口，也不读取、解析、记录或重放网页接口响应。安装后使用微博扫码登录，账号状态加密保存。默认只读；写入须先开启账号写能力，且每一次写操作仍必须在对话确认卡中单独批准，不提供账号级免确认。编辑和删除只允许当前账号自己的内容，并在点击前复核摘要；点赞和关注按目标状态执行。网页出现验证码、风控或身份异常时立即停止，绝不尝试绕过；结果不明确时绝不自动重试。',
+          '平台官方 Plugin。它只操纵微博公开网页界面，不调用开放平台付费接口，也不读取、解析、记录或重放网页接口响应。安装后使用微博扫码登录，账号状态加密保存。默认只读；写入须先开启账号写能力，且默认每一次写操作都在对话确认卡中单独批准。用户可另行接受独立的账号级高风险声明后开启免逐次确认；该授权默认关闭，关闭写入也会使它失效。编辑和删除只允许当前账号自己的内容，并在点击前复核摘要；点赞和关注按目标状态执行。所有写入都保留加密账本和派发围栏。网页出现验证码、风控或身份异常时立即停止，绝不尝试绕过；结果不明确时绝不自动重试。',
         queueAiReview: false,
       })
       located = await locateVersion()
@@ -272,6 +275,7 @@ export async function seedWeiboPlugin(input: {
     env,
     pool: getPool(),
     redis: input.leaseRedis,
+    ...(input.expectedScope ? { expectedScope: input.expectedScope } : {}),
     ...(input.beforeListingOpen ? { openListingAtCommit: false } : {}),
   })
   if (input.beforeListingOpen) {

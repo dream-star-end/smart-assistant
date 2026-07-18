@@ -44,6 +44,7 @@ import {
   OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
   closeOfficialManagedBrowserPluginListingGate,
   openOfficialManagedBrowserPluginListingGate,
+  readOfficialManagedBrowserTransitionCensus,
   transitionOfficialManagedBrowserPluginVersion,
 } from '../plugins/officialManagedBrowserTransition.js'
 import {
@@ -654,7 +655,8 @@ describe('marketplace Plugin kernel migration', () => {
          ('knowledge-planet-mutation@test.local', 'x', TRUE),
          ('knowledge-planet-soft@test.local', 'x', TRUE),
          ('knowledge-planet-orphan@test.local', 'x', TRUE),
-         ('knowledge-planet-partial@test.local', 'x', TRUE)
+         ('knowledge-planet-partial@test.local', 'x', TRUE),
+         ('knowledge-planet-phantom@test.local', 'x', TRUE)
        RETURNING id::text, email`,
     )
     const transitionUserId = (email: string) => {
@@ -779,6 +781,7 @@ describe('marketplace Plugin kernel migration', () => {
       const mutationUserId = transitionUserId('knowledge-planet-mutation@test.local')
       const softUserId = transitionUserId('knowledge-planet-soft@test.local')
       const orphanUserId = transitionUserId('knowledge-planet-orphan@test.local')
+      const phantomUserId = transitionUserId('knowledge-planet-phantom@test.local')
       for (const userId of [
         activeUserId,
         errorUserId,
@@ -888,6 +891,50 @@ describe('marketplace Plugin kernel migration', () => {
         slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
         env: process.env,
       })
+      const guardedScope = await readOfficialManagedBrowserTransitionCensus(
+        KNOWLEDGE_PLANET_PLUGIN_SLUG,
+      )
+      await assert.rejects(
+        transitionOfficialManagedBrowserPluginVersion({
+          slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
+          targetVersionId: oldVersion.rows[0]!.id,
+          expectedArtifactHash: oldCompiled.artifactHash,
+          expectedExecContractHash: oldCompiled.execContractHash,
+          ownerUserId: Number(admin.rows[0]!.id),
+          env: process.env,
+          redis: transitionRedis,
+          openListingAtCommit: false,
+          expectedScope: {
+            ...guardedScope,
+            installs: [
+              ...guardedScope.installs,
+              { ...guardedScope.installs[0]!, id: '999999999999999999' },
+            ],
+          },
+        }),
+        /transition scope changed/,
+      )
+      await query("UPDATE connections SET status = 'error' WHERE id = $1::bigint", [
+        activeAccount.id,
+      ])
+      await assert.rejects(
+        transitionOfficialManagedBrowserPluginVersion({
+          slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
+          targetVersionId: oldVersion.rows[0]!.id,
+          expectedArtifactHash: oldCompiled.artifactHash,
+          expectedExecContractHash: oldCompiled.execContractHash,
+          ownerUserId: Number(admin.rows[0]!.id),
+          env: process.env,
+          redis: transitionRedis,
+          openListingAtCommit: false,
+          expectedScope: guardedScope,
+        }),
+        /transition scope changed/,
+        'same account id with a changed status must fail the verified census fence',
+      )
+      await query("UPDATE connections SET status = 'active' WHERE id = $1::bigint", [
+        activeAccount.id,
+      ])
 
       const initialHandoffBinds: Array<
         Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
@@ -1280,7 +1327,8 @@ describe('marketplace Plugin kernel migration', () => {
       assert.ok(offTarget)
       assert.equal(
         offTarget.actions.length,
-        KNOWLEDGE_PLANET_PLUGIN_ARTIFACT.actions.filter((action) => action.effect === 'read').length,
+        KNOWLEDGE_PLANET_PLUGIN_ARTIFACT.actions.filter((action) => action.effect === 'read')
+          .length,
       )
       assert.equal(
         offTarget.actions.some((action) => !action.readOnly),
@@ -1708,7 +1756,18 @@ describe('marketplace Plugin kernel migration', () => {
         slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
         env: process.env,
       })
-      const upgradedAgain = await transitionOfficialManagedBrowserPluginVersion({
+      const upgradeScope = await readOfficialManagedBrowserTransitionCensus(
+        KNOWLEDGE_PLANET_PLUGIN_SLUG,
+      )
+      let lockedCensusReachedResolve!: () => void
+      const lockedCensusReached = new Promise<void>((resolve) => {
+        lockedCensusReachedResolve = resolve
+      })
+      let releaseLockedCensusResolve!: () => void
+      const holdLockedCensus = new Promise<void>((resolve) => {
+        releaseLockedCensusResolve = resolve
+      })
+      const upgradedAgainPromise = transitionOfficialManagedBrowserPluginVersion({
         slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
         targetVersionId: seeded.versionId,
         expectedArtifactHash: COMPILED_KNOWLEDGE_PLANET_PLUGIN.artifactHash,
@@ -1717,7 +1776,69 @@ describe('marketplace Plugin kernel migration', () => {
         env: process.env,
         redis: transitionRedis,
         openListingAtCommit: false,
+        expectedScope: upgradeScope,
+        failureInjector(point) {
+          if (point !== 'after-locked-census') return
+          lockedCensusReachedResolve()
+          return holdLockedCensus
+        },
       })
+      let lockedCensusTimeout: NodeJS.Timeout | undefined
+      try {
+        await Promise.race([
+          lockedCensusReached,
+          new Promise<never>((_resolve, reject) => {
+            lockedCensusTimeout = setTimeout(
+              () => reject(new Error('transition did not reach locked census')),
+              5_000,
+            )
+          }),
+        ])
+      } catch (error) {
+        releaseLockedCensusResolve()
+        throw error
+      } finally {
+        if (lockedCensusTimeout) clearTimeout(lockedCensusTimeout)
+      }
+      let concurrentInstallSettled = false
+      const concurrentInstall = installApprovedVersion({
+        userId: phantomUserId,
+        versionId: oldVersion.rows[0]!.id,
+      }).then(
+        (value) => {
+          concurrentInstallSettled = true
+          return { ok: true as const, value }
+        },
+        (error: unknown) => {
+          concurrentInstallSettled = true
+          return { ok: false as const, error }
+        },
+      )
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(
+        concurrentInstallSettled,
+        false,
+        'new install must block behind transition locks',
+      )
+      releaseLockedCensusResolve()
+      const upgradedAgain = await upgradedAgainPromise
+      const concurrentInstallResult = await concurrentInstall
+      assert.equal(concurrentInstallResult.ok, false)
+      assert.ok(
+        !concurrentInstallResult.ok &&
+          concurrentInstallResult.error instanceof MarketplaceError &&
+          concurrentInstallResult.error.code === 'NOT_INSTALLABLE',
+      )
+      assert.equal(
+        (
+          await query<{ count: string }>(
+            `SELECT count(*)::text AS count FROM marketplace_installs
+              WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
+            [phantomUserId, KNOWLEDGE_PLANET_PLUGIN_SLUG],
+          )
+        ).rows[0]?.count,
+        '0',
+      )
       assert.equal(upgradedAgain.targetVersionId, seeded.versionId)
       await openOfficialManagedBrowserPluginListingGate({
         slug: KNOWLEDGE_PLANET_PLUGIN_SLUG,
