@@ -369,6 +369,12 @@ export type ChatSession = {
    *  改写(无 server requestId/无 preCheck),暖 codex 会话续写被计费闸 fail-closed
    *  拒绝(2026-07-07 boss 团队模式"一直无响应"事故:CODEX_BILLING_GUARD)。 */
   _lastRouting?: ChatRoutingSnapshot;
+  /** 会话级模型选择(用户在该会话显式选择/首发时定格的模型;per-session 持久化,
+   *  IndexedDB + 服务端 client_sessions.model_id 双落点)。**与 _lastRouting 分责**:
+   *  _lastRouting 是"最近实际发送"的路由快照(合成续写/计费分类复用,只在发送时写),
+   *  本字段是"用户选择"(切会话恢复选择器用,选择即写,未发送也生效)。恢复时须经
+   *  resolveSessionModel 校验仍可见且健康,否则回落 default_model。 */
+  _selectedModelId?: string;
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;

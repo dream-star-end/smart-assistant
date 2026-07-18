@@ -50,6 +50,7 @@ const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_t
 const MIGRATION_GOAL_STATE = path.resolve(here, "../db/migrations/0159_goal_state.sql");
 const MIGRATION_0157 = path.resolve(here, "../db/migrations/0157_lossless_runtime_batches.sql");
 const MIGRATION_0170 = path.resolve(here, "../db/migrations/0170_durable_turn_dispatch.sql");
+const MIGRATION_0173 = path.resolve(here, "../db/migrations/0173_client_session_model.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -98,6 +99,8 @@ before(async () => {
   await pool.query("CREATE TABLE IF NOT EXISTS usage_records (id BIGSERIAL PRIMARY KEY)");
   await pool.query("CREATE TABLE IF NOT EXISTS turn_traces (trace_id TEXT PRIMARY KEY)");
   await pool.query(await readFile(MIGRATION_0170, { encoding: "utf8" }));
+  // 0173:client_sessions.model_id(会话级模型选择;本套件的读写 SQL 均已含该列)。
+  await pool.query(await readFile(MIGRATION_0173, { encoding: "utf8" }));
   // 0167 also alters billing/inbox tables that are intentionally absent from
   // this isolated sessions schema. Mirror its tape column and waiver table so
   // the backend contract still exercises the production SQL shape.
@@ -166,6 +169,7 @@ function mkSession(over: Partial<ClientSession> = {}): ClientSession {
     lastAt: over.lastAt ?? now,
     messages: over.messages ?? [],
     updatedAt: over.updatedAt ?? now,
+    ...(over.modelId !== undefined ? { modelId: over.modelId } : {}),
   };
 }
 
@@ -311,6 +315,33 @@ describe("pgSessionsBackend contract", () => {
     assert.ok(r1.ok && r2.ok && r3.ok);
     assert.ok(r2.updatedAt > r1.updatedAt, `${r2.updatedAt} > ${r1.updatedAt}`);
     assert.ok(r3.updatedAt > r2.updatedAt, `${r3.updatedAt} > ${r2.updatedAt}`);
+  });
+
+  maybe("model_id(会话级模型选择):PUT 建行携带/未携带 COALESCE 保留/setClientSessionModel 单调", async () => {
+    // 建行携带 → 全读路径回带
+    await backend.upsertClientSession(mkSession({ modelId: "kimi-k3" }));
+    const got = await backend.getClientSession("s-1", "u-1");
+    assert.equal(got?.modelId, "kimi-k3");
+    assert.equal((await backend.listClientSessions("u-1")).find((s) => s.id === "s-1")?.modelId, "kimi-k3");
+    assert.equal((await backend.getClientSessionPartial("s-1", "u-1", 0))?.modelId, "kimi-k3");
+
+    // 全量 PUT 未携带 → COALESCE 保留(SQLite 侧同语义,见 storage sessionsClientModel.test)
+    const r = await backend.upsertClientSession(mkSession({ updatedAt: got!.updatedAt }), got!.updatedAt);
+    assert.equal(r, "applied");
+    assert.equal((await backend.getClientSession("s-1", "u-1"))?.modelId, "kimi-k3");
+
+    // setClientSessionModel:落值 + 逻辑版本严格递增;缺行 ok:false
+    const m1 = await backend.setClientSessionModel("s-1", "u-1", "glm-5.2");
+    const m2 = await backend.setClientSessionModel("s-1", "u-1", "gpt-5.5");
+    assert.ok(m1.ok && m2.ok);
+    assert.ok(m2.updatedAt > m1.updatedAt, `${m2.updatedAt} > ${m1.updatedAt}`);
+    assert.equal((await backend.getClientSession("s-1", "u-1"))?.modelId, "gpt-5.5");
+    assert.equal((await backend.setClientSessionModel("s-nope", "u-1", "kimi-k3")).ok, false);
+    // 从未选择的会话:键缺席(缺席=未表态,前端回落 default_model)
+    await backend.upsertClientSession(mkSession({ id: "s-nomodel" }));
+    const none = await backend.getClientSession("s-nomodel", "u-1");
+    assert.ok(none);
+    assert.equal("modelId" in none!, false);
   });
 
   maybe("appendForRequest 先到 → map 记录 + 幂等 already_exists", async () => {

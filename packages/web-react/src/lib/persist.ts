@@ -114,6 +114,9 @@ export type StoredSession = {
   /** 最近一次发送的路由字段快照(model/teamMode/effort);reload 后合成续写复用,
    *  缺失会让暖 codex 会话的续写被计费闸拒(见 chat/model.ts 同名字段注释)。 */
   _lastRouting?: ChatRoutingSnapshot;
+  /** 会话级模型选择(per-session 持久化;同设备 reload 即时恢复,服务端 canonical 到达后
+   *  server-wins。与 _lastRouting 语义不同:那是"最近实际发送"供合成续写,这是"用户选择"。 */
+  _selectedModelId?: string;
 };
 
 /** 解析可用的 IDBFactory；不可用（SSR/jsdom/禁用）返回 null。*/

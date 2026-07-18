@@ -269,6 +269,16 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("ALTER TABLE client_sessions ADD COLUMN origin_channel TEXT DEFAULT NULL")
     }
   } catch { /* table just created with column already */ }
+  // Migration: model_id — 会话级模型选择(per-session UI 恢复提示,非执行权威)。
+  // NULL = 用户从未在该会话显式选过模型 → 前端回落用户 default_model 偏好。
+  // 每 turn 的实际执行模型仍由 inbound.message.model + bridge authz 决定,本列
+  // 只负责"重开会话恢复选择器"与跨设备同步。PG 侧对应迁移 0173_client_session_model。
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'model_id')) {
+      db.exec("ALTER TABLE client_sessions ADD COLUMN model_id TEXT DEFAULT NULL")
+    }
+  } catch { /* table just created with column already */ }
 
   // ── 长会话热尾巴 + 归档(spill/archive)──
   //
@@ -1329,6 +1339,9 @@ export interface ClientSession {
   lastAt: number
   messages: unknown[]
   updatedAt: number
+  /** 会话级模型选择(UI 恢复提示,非执行权威;缺省 = 未显式选择 → 前端回落 default_model)。
+   *  写路径:建行 PUT 可携带;既有会话经 setClientSessionModel(PATCH)。upsert 未携带时保留既有值。 */
+  modelId?: string
   // 归档水位(热尾巴 + 归档)。读侧透传给客户端:archivedCount 用于"还有 N 条"计数与
   // "从云端加载更早历史"按钮是否出现;archivedThroughSeq 名称为滚动兼容保留,
   // 值是 `_orderSeq` 水位。旧行/无归档 → 0。
@@ -1345,6 +1358,8 @@ export interface ClientSessionMeta {
   lastAt: number
   messageCount: number
   updatedAt: number
+  /** 会话级模型选择(见 {@link ClientSession.modelId};列表回带供切会话即时恢复选择器)。 */
+  modelId?: string
 }
 
 export interface ClientSessionLifecycleRef {
@@ -2792,8 +2807,8 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
     }
 
     const result = db.prepare(`
-      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count)
-      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, MAX(@updatedAt, @updatedAtFloor), @nextSeq, @archivedThroughSeq, @archivedCount)
+      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, MAX(@updatedAt, @updatedAtFloor), @nextSeq, @archivedThroughSeq, @archivedCount, @modelId)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         title = excluded.title,
@@ -2801,6 +2816,9 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
         last_at = excluded.last_at,
         messages = excluded.messages,
         message_count = excluded.message_count,
+        -- model_id:PUT 未携带(NULL)= 保留既有(元数据权威写路径是 setClientSessionModel,
+        -- 全量 PUT 不得把它清空);携带则以 PUT 为准(建行场景)。
+        model_id = COALESCE(excluded.model_id, client_sessions.model_id),
         -- updated_at 逻辑版本(RFC D3b):冲突更新走 DB 计算 MAX(既有+1, now, 客户端回传值)
         -- 严格单调推进。**首建(BLOCKER-1)**:新插入的 updated_at 也取 MAX(客户端回传, 服务端时钟
         -- 下限 @updatedAtFloor)—— 不再无条件信任客户端 @updatedAt(客户端可回传 0 / 旧值,首建
@@ -2823,6 +2841,7 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
       messages: finalJson,
       // message_count = 热尾巴条数 + 已归档累计条数(含本次 delta),给列表/计数用。
       messageCount: tail.length + newArchivedCount,
+      modelId: session.modelId ?? null,
       updatedAt: session.updatedAt,
       // D3b 逻辑版本的墙钟下限(= PG 侧 floor(epoch_ms(clock_timestamp())) 的 SQLite 对应)。
       updatedAtFloor: now,
@@ -3776,11 +3795,12 @@ async function _sqliteListClientSessions(userId: string): Promise<ClientSessionM
   const db = await getSessionsDb()
   const rows = db.prepare(`
     SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
-           message_count as msg_count
+           message_count as msg_count, model_id
     FROM client_sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY last_at DESC
   `).all(userId) as Array<{
     id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; updated_at: number; msg_count: number
+    model_id: string | null
   }>
   return rows.map(r => ({
     id: r.id,
@@ -3791,6 +3811,7 @@ async function _sqliteListClientSessions(userId: string): Promise<ClientSessionM
     lastAt: r.last_at,
     messageCount: r.msg_count,
     updatedAt: r.updated_at,
+    ...(r.model_id ? { modelId: r.model_id } : {}),
   }))
 }
 
@@ -3801,12 +3822,13 @@ async function _sqliteGetClientSession(
 ): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
-    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
+    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
   const row = (userId ? db.prepare(sql).get(id, userId) : db.prepare(sql).get(id)) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
     archived_through_seq: number | null; archived_count: number | null
+    model_id: string | null
   } | undefined
   if (!row) return null
   const archivedThroughOrderSeq = row.archived_through_seq ?? 0
@@ -3826,6 +3848,7 @@ async function _sqliteGetClientSession(
       ? projectClientSessionMessagesForChat(exactMessages)
       : exactMessages,
     updatedAt: row.updated_at,
+    ...(row.model_id ? { modelId: row.model_id } : {}),
     // 归档水位透传(读新列,零额外 IO)。getClientSession 返回的 messages 是热尾巴;
     // 客户端据 archivedThroughSeq 判定本地已归档行的保留,据 archivedCount 显示计数。
     archivedCount: row.archived_count ?? 0,
@@ -3876,11 +3899,12 @@ async function _sqliteGetClientSessionPartial(
 ): Promise<ClientSessionPartial | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
-    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
   ).get(id, userId) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
     archived_through_seq: number | null; archived_count: number | null
+    model_id: string | null
   } | undefined
   if (!row) return null
   const archivedCount = row.archived_count ?? 0
@@ -3929,6 +3953,7 @@ async function _sqliteGetClientSessionPartial(
     lastAt: row.last_at,
     messages,
     updatedAt: row.updated_at,
+    ...(row.model_id ? { modelId: row.model_id } : {}),
     // 总条数 = 热尾巴条数 + 已归档条数(row.messages 现在只存热尾巴,allMsgs 即热尾巴)。
     totalMessageCount: allMsgs.length + archivedCount,
     maxSeq,
@@ -4121,6 +4146,21 @@ async function _sqliteRenameClientSession(id: string, userId: string, title: str
   return { ok: !!row, updatedAt: row ? row.updated_at : now }
 }
 
+/**
+ * Metadata-only 会话模型选择更新(PATCH /api/sessions/:id modelId 专用),与 rename 同构:
+ * 单列 UPDATE 收口,不触碰 messages/next_seq;updated_at 逻辑版本照常单调推进(其它设备
+ * listSessions server-wins 拿到新选择)。值是 UI 恢复提示(非执行权威),存储层视作 opaque
+ * 短字符串,格式校验在 gateway 边界。
+ */
+async function _sqliteSetClientSessionModel(id: string, userId: string, modelId: string): Promise<{ ok: boolean; updatedAt: number }> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const row = db.prepare(
+    'UPDATE client_sessions SET model_id = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL RETURNING updated_at'
+  ).get(modelId, now, id, userId) as { updated_at: number } | undefined
+  return { ok: !!row, updatedAt: row ? row.updated_at : now }
+}
+
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
 async function _sqliteListUnclaimedSessions(): Promise<Array<{
   id: string; agentId: string; title: string; createdAt: number;
@@ -4307,6 +4347,7 @@ const sqliteBackend = {
   readTapeRecordChunk: _sqliteReadTapeRecordChunk,
   deleteClientSession: _sqliteDeleteClientSession,
   renameClientSession: _sqliteRenameClientSession,
+  setClientSessionModel: _sqliteSetClientSessionModel,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
   upsertMasterClientSession: _sqliteUpsertMasterClientSession,
@@ -4420,6 +4461,9 @@ export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] =
 
 export const renameClientSession: ClientSessionsBackend['renameClientSession'] =
   (...args) => getActiveBackend().renameClientSession(...args)
+
+export const setClientSessionModel: ClientSessionsBackend['setClientSessionModel'] =
+  (...args) => getActiveBackend().setClientSessionModel(...args)
 
 export const listUnclaimedSessions: ClientSessionsBackend['listUnclaimedSessions'] =
   () => getActiveBackend().listUnclaimedSessions()

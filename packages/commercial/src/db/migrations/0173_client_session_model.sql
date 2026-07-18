@@ -1,0 +1,15 @@
+-- 0173 — client_sessions.model_id:会话级模型选择持久化。
+--
+-- 需求:每个会话选择的模型独立记忆,互不影响;重开会话/换设备恢复该会话上次选择。
+-- 语义:
+--   · NULL(默认)= 用户从未在该会话显式选过模型 → 前端回落用户 default_model 偏好。
+--   · 本列是 **UI 恢复提示,非执行权威** —— 每 turn 实际执行模型仍由
+--     inbound.message.model + bridge 的模型授权(userChatBridge authz/preCheck)决定。
+--     前端恢复时还会校验模型"仍对该用户可见且未降级",否则回落默认,故存量脏值无害。
+--   · 写路径:建行 PUT 可携带;既有会话经 PATCH /api/sessions/:id { modelId }
+--     (storage setClientSessionModel,单列 UPDATE + updated_at 逻辑版本单调推进)。
+--     全量 PUT 未携带时 COALESCE 保留既有值,不清空。
+--
+-- 纯加列,backward-compatible:旧 release 不读此列,可提前 apply(§4.5 人工受控)。
+-- SQLite 对应演进在 @openclaude/storage sessionsDb.ts(pragma 探测 + ALTER,自愈式)。
+ALTER TABLE client_sessions ADD COLUMN IF NOT EXISTS model_id TEXT DEFAULT NULL;

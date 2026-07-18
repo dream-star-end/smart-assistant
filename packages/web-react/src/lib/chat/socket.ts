@@ -179,7 +179,11 @@ export type ChatSocketDeps = {
    * 返回**是否已确认建行**：true=PUT 200 或 409-stale（行已存在）；false=网络/5xx/401 等失败
    * （调用方据此不标 ensured、下次发送/重连重试，见 socket.ts serverSessionInflight，Codex 审 MAJOR）。
    */
-  ensureServerSession?: (sessId: string, agentId: string, title?: string) => Promise<boolean> | boolean;
+  ensureServerSession?: (sessId: string, agentId: string, title?: string, modelId?: string) => Promise<boolean> | boolean;
+  /** 会话级模型选择持久化到 master(PATCH /api/sessions/:id { modelId })。best-effort:
+   *  建行确认后的竞态收敛补写(见 ensureServerSessionOnce)——受理路径会先于 ensure PUT
+   *  幂等建行(PR#126),PUT 随体的 modelId 竞态输掉时靠本回调落地。 */
+  persistSessionModel?: (sessId: string, modelId: string) => Promise<void> | void;
   /** 跨设备持久化「用户发送的消息」到 master(POST /api/sessions/:id/user-message)。
    *  带本地 client id → getSession 回带同 id,前端合并去重。best-effort。 */
   persistUserMessage?: (
@@ -1746,6 +1750,16 @@ export class ChatSocket {
     this.scheduleNotify();
   }
 
+  /** 会话级模型选择(纯元数据,与 renameSession 同构):改内存 _selectedModelId + notify →
+   *  persist sig 变化,IndexedDB 随之落地。服务端 canonical 由调用方经 PATCH 同步。
+   *  会话尚不存在(新会话未发首条消息)→ no-op:首发时 sendMessage 会定格 + 建行 PUT 携带。*/
+  setSessionModel(sessId: string, modelId: string): void {
+    const s = this.sessions.get(sessId);
+    if (!s || s._selectedModelId === modelId) return;
+    s._selectedModelId = modelId;
+    this.scheduleNotify();
+  }
+
   removeSession(sessId: string): void {
     this.serverSessionEnsured.delete(sessId);
     this.serverSessionInflight.delete(sessId);
@@ -1833,6 +1847,7 @@ export class ChatSocket {
       _localTeardownAt: typeof s._localTeardownAt === "number" ? s._localTeardownAt : undefined,
       _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
       ...(s._lastRouting ? { _lastRouting: { ...s._lastRouting } } : {}),
+      ...(s._selectedModelId ? { _selectedModelId: s._selectedModelId } : {}),
     };
   }
 
@@ -1892,6 +1907,9 @@ export class ChatSocket {
     s._agentSwitchedAt = typeof stored._agentSwitchedAt === "number" ? stored._agentSwitchedAt : null;
     const restoredRouting = normalizeRetiredRouting(stored._lastRouting);
     s._lastRouting = restoredRouting ? { ...restoredRouting } : undefined;
+    if (typeof stored._selectedModelId === "string" && stored._selectedModelId) {
+      s._selectedModelId = stored._selectedModelId;
+    }
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
@@ -1923,6 +1941,9 @@ export class ChatSocket {
       completedClientMessageId?: string;
       /** 载荷的 SessionDetail.updatedAt:P1 缺席删除的版本护栏证据(见下)。 */
       serverUpdatedAt?: number;
+      /** 载荷的 SessionDetail.modelId(会话级模型选择,server canonical):携带时 server-wins
+       *  镜像进会话态(缺省=服务端无值,保留本地,与侧栏 listSessions 合并同语义)。 */
+      modelId?: string;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -1939,6 +1960,9 @@ export class ChatSocket {
     const hasVersion = typeof serverUpdatedAt === "number" && Number.isFinite(serverUpdatedAt);
     const watermark = s._lastServerSyncUpdatedAt ?? 0;
     if (hasVersion && serverUpdatedAt < watermark) return;
+    // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
+    // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
+    if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;
     // 终态收敛(RFC §5 M5):先从载荷推导「已收尾 turn → 终态类别」。error projection(§2.5)、
     // 持久化 error 卡、真 tape 生成行都在此被识别,合并后 convergeTerminalTurns 显式清发送态 +
     // 落 user 行终态,不再依赖「completion-evidence 恰好命中」的巧合路径。
@@ -2243,6 +2267,10 @@ export class ChatSocket {
     teamMode?: boolean;
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
+    // 会话级模型选择定格:首发/换模发送都把当前有效模型落为会话选择(建行 PUT 在下面
+    // 读它随体携带,故必须先于 ensureServerSessionOnce 写入)。p.model 缺省(模型列表
+    // 未加载等)不清空既有选择。
+    if (p.model) sess._selectedModelId = p.model;
     // 主控 session 建行(每会话一次):必须在容器跑完 turn 回传 authored 消息之前落地,
     // 否则 session_not_found 风暴。ensurePromise:用于把"用户消息持久化"排在主控建行之后
     // (行须先存在,否则 append 404)。
@@ -2346,11 +2374,19 @@ export class ChatSocket {
     if (existing) return existing;
     const sid = sess.id;
     const pending = Promise.resolve()
-      .then(() => this.deps.ensureServerSession?.(sid, agentId, sess.title))
+      // modelId 随建行 PUT 携带(读调用时刻的会话选择;服务端 COALESCE,未携带不清空)。
+      .then(() => this.deps.ensureServerSession?.(sid, agentId, sess.title, sess._selectedModelId))
       .then((ok) => {
         this.serverSessionInflight.delete(sid);
         // 仅当会话仍在(PUT pending 期间未被 remove/reset)才标 ensured,避免给已删会话留残 marker。
-        if (ok && this.sessions.has(sid)) this.serverSessionEnsured.add(sid);
+        if (ok && this.sessions.has(sid)) {
+          this.serverSessionEnsured.add(sid);
+          // 会话级模型选择收敛:受理路径会先于本 PUT 幂等建行(PR#126,后到 PUT 409),
+          // PUT 随体的 modelId 竞态输掉时不落地。行确认存在后补一发元数据 PATCH,
+          // 与"选择时 PATCH"同一写通道/同一 best-effort 契约(幂等,多写同值无害)。
+          const chosen = this.sessions.get(sid)?._selectedModelId;
+          if (chosen) void this.deps.persistSessionModel?.(sid, chosen);
+        }
         return !!ok;
       })
       .catch(() => {
