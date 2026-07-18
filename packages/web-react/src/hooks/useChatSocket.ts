@@ -181,6 +181,10 @@ export function useChatSocket(opts: {
   onRepoStatus?: (frame: RepoStatusWire) => void;
   /** GitHub 绑定校验失败帧回调。*/
   onRepoBindError?: (frame: RepoBindErrorWire) => void;
+  /** 会话模型服务端同步入口(= useSessionList.queueModelPatch,App 经 ref 注入)。
+   *  首发建行确认后的收敛写**必须**走它进同一 per-session 串行器 —— 队列外直发 api 会与
+   *  显式选择的 PATCH 形成跨写者乱序(后完成的旧值覆盖新选择,Codex 审 REJECT)。*/
+  queueModelPatch?: (sessId: string, modelId: string) => void;
 }): UseChatSocket {
   const { auth, ready, laneReady, enabled, defaultAgentId, refreshBalance, refreshInbox, userId, onHydrated } = opts;
 
@@ -200,6 +204,8 @@ export function useChatSocket(opts: {
   onRepoStatusRef.current = opts.onRepoStatus;
   const onRepoBindErrorRef = useRef(opts.onRepoBindError);
   onRepoBindErrorRef.current = opts.onRepoBindError;
+  const queueModelPatchRef = useRef(opts.queueModelPatch);
+  queueModelPatchRef.current = opts.queueModelPatch;
 
   // 持久存储（按 user 命名空间）+ 立即落盘句柄 + 写盘签名（防无谓 IDB 写）。
   const storeRef = useRef<SessionStore | null>(null);
@@ -296,15 +302,11 @@ export function useChatSocket(opts: {
           return (e as { status?: number } | null)?.status === 409;
         }
       },
-      // 会话级模型选择收敛补写(建行确认后由 socket 调;best-effort,失败下次选择/发送再收敛)。
-      persistSessionModel: async (sessId, modelId) => {
-        const a = authRef.current;
-        if (!a) return;
-        try {
-          await api.patchSessionModel(a, sessId, modelId);
-        } catch {
-          /* best-effort:本地 + IndexedDB 仍在;下次显式选择或跨设备打开时以 server 为准 */
-        }
+      // 会话级模型选择收敛补写(建行确认后由 socket 调)。**不直发 api**:进 useSessionList
+      // 的 per-session 串行器(queueModelPatch),与显式选择共用同一写通道 —— 否则两写者
+      // 并发,后完成的旧值会覆盖新选择(Codex 审:跨写者乱序 REJECT)。
+      persistSessionModel: (sessId, modelId) => {
+        queueModelPatchRef.current?.(sessId, modelId);
       },
       // 跨设备持久化用户消息(行已由 ensureServerSession 建)。best-effort,失败静默。
       persistUserMessage: async (sessId, msg) => {

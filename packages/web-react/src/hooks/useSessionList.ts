@@ -194,10 +194,15 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
             if (r.updatedAt > st.floor) st.floor = r.updatedAt;
             if (st.pending === v) st.pending = undefined; // 期间无更新选择 → 收敛
           } catch {
-            // 失败(404 行未建/网络/5xx):解除 pending 退出。本地意图仍在侧栏/socket/IndexedDB;
-            // 服务端有旧值则下次 list server-wins 盖回可重选,行未建则由建行 PUT/收敛 PATCH 落地。
-            if (st.pending === v) st.pending = undefined;
-            break;
+            // 失败(404 行未建/网络/5xx):
+            //  - pending 仍是本值 → 解除并退出(本地意图仍在侧栏/socket/IndexedDB;服务端有
+            //    旧值则下次 list server-wins 盖回可重选,行未建则由建行 PUT/收敛 PATCH 落地);
+            //  - pending 已被更新(失败期间用户又选了新值)→ **继续循环把最新意图发出去**,
+            //    绝不 break —— 否则新 pending 永不出网且永久压制服务端载荷(Codex 审 MAJOR)。
+            if (st.pending === v) {
+              st.pending = undefined;
+              break;
+            }
           }
         }
       } finally {

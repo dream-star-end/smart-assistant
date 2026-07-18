@@ -1105,6 +1105,8 @@ export function App() {
     // GitHub 仓库绑定状态/错误帧 → useRepoBinding（经 ref，见 repoStatusHandlerRef）。
     onRepoStatus: (f) => repoStatusHandlerRef.current(f),
     onRepoBindError: (f) => repoBindErrorHandlerRef.current(f),
+    // 会话模型收敛写与显式选择共用同一 per-session 串行器(防跨写者乱序)。
+    queueModelPatch,
   });
   sockRef.current = chat; // 回填稳定句柄（供上方 send/regenerate/历史方法引用）。
 
