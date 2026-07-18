@@ -52,6 +52,12 @@ export const MAX_ACCEPTED_STUCK_MS = 24 * 3_600_000
 export const REJECTING_UNREACHABLE_ALERT_MS = 30 * 60 * 1000
 /** accepted 等 sink 超此龄 → 告警。 */
 export const SINK_WAIT_ALERT_MS = 24 * 3_600_000
+/**
+ * accepted 行的容器求证持续失败超此龄 → 运维告警。曾经此路径静默 continue,唯一兜底是
+ * 7d open_aged:2026-07-18 transport SSRF 白名单网段错配把求证 100% 拦死(81 连败),
+ * 收敛链瘫痪 27h 无人知晓。求证失败必须有告警出口,不允许无限静默重试。
+ */
+export const ACCEPTED_UNREACHABLE_ALERT_MS = 15 * 60 * 1000
 
 /** accepted stuck 阈值解析:向上夹(同 finalizeJournalReconciler.resolveStuckThresholdMs 模式)。 */
 export function resolveDispatchStuckThresholdMs(
@@ -273,7 +279,21 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   const stuck = await scanAcceptedStuck(deps.pool, { stuckMs, limit, now: now() })
   for (const row of stuck) {
     const res = await deps.container.getDispatchState(idOf(row))
-    if (res.kind !== 'ok') continue // 不可达/错误 → 等下轮
+    if (res.kind !== 'ok') {
+      // 不可达/错误 → 等下轮重试;但持续失败必须有告警出口(alertWarn 按 dispatch+日去重):
+      // 曾静默 continue,SSRF 网段错配 100% 拦死求证时收敛链瘫痪 27h 无人知晓。
+      const age = now() - (row.acceptedAt ?? row.admittedAt).getTime()
+      if (age > ACCEPTED_UNREACHABLE_ALERT_MS) {
+        alertWarn(
+          enqueue,
+          row,
+          `accepted dispatch 容器求证持续失败 ${Math.round(age / 60_000)}min(${res.kind}: ${res.detail})`,
+          'accepted_unreachable',
+        )
+        counts.alerts++
+      }
+      continue
+    }
     if (res.state === 'rejected') {
       // 容器把这条 accepted 的 inbox 行终态化为 rejected tombstone(如 boot recovery:
       // queued/running 被拒)。这是**显式** durable negative proof(I2 允许),→ CAS
