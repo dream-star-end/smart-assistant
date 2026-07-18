@@ -55,6 +55,10 @@ vi.mock("../../lib/api", async (importOriginal) => {
       getKnowledgePlanetSetup: vi.fn(),
       getKnowledgePlanetSetupQr: vi.fn(),
       cancelKnowledgePlanetSetup: vi.fn(),
+      startWeiboSetup: vi.fn(),
+      getWeiboSetup: vi.fn(),
+      getWeiboSetupQr: vi.fn(),
+      cancelWeiboSetup: vi.fn(),
       revokePluginAccount: vi.fn(),
       setPluginWriteAccess: vi.fn(),
       setPluginWritePreapproval: vi.fn(),
@@ -90,6 +94,10 @@ const mockedKnowledgeStart = vi.mocked(api.startKnowledgePlanetSetup)
 const mockedKnowledgeStatus = vi.mocked(api.getKnowledgePlanetSetup)
 const mockedKnowledgeQr = vi.mocked(api.getKnowledgePlanetSetupQr)
 const mockedKnowledgeCancel = vi.mocked(api.cancelKnowledgePlanetSetup)
+const mockedWeiboStart = vi.mocked(api.startWeiboSetup)
+const mockedWeiboStatus = vi.mocked(api.getWeiboSetup)
+const mockedWeiboQr = vi.mocked(api.getWeiboSetupQr)
+const mockedWeiboCancel = vi.mocked(api.cancelWeiboSetup)
 const mockedPluginRevoke = vi.mocked(api.revokePluginAccount)
 const mockedSetPluginWriteAccess = vi.mocked(api.setPluginWriteAccess)
 const mockedSetPluginWritePreapproval = vi.mocked(api.setPluginWritePreapproval)
@@ -302,6 +310,28 @@ function knowledgePlanetPlugin() {
     installedVersion: '1.2.0',
     latestVersionId: '101',
     latestVersion: '1.2.0',
+    installedCurrent: true,
+    updateAvailable: false,
+    available: true,
+  }
+}
+
+function weiboPlugin() {
+  return {
+    versionId: '301',
+    slug: 'weibo',
+    pluginType: 'managed-browser' as const,
+    label: '微博',
+    description: '通过受管浏览器读取微博，并在逐次确认后执行常用写操作',
+    accountMode: 'required' as const,
+    actions: [
+      { id: 'list_home_posts', description: '读取首页微博', readOnly: true as const },
+      { id: 'create_post', description: '发布微博', readOnly: false as const },
+    ],
+    installed: true,
+    installedVersion: '1.0.0',
+    latestVersionId: '301',
+    latestVersion: '1.0.0',
     installedCurrent: true,
     updateAvailable: false,
     available: true,
@@ -1078,6 +1108,55 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
         auth,
         '11111111-1111-4111-8111-111111111111',
       ),
+    )
+  })
+
+  test('微博使用微博客户端扫码，并提供可单独打开的实时二维码链接', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [weiboPlugin()], accounts: [] })
+    mockedWeiboStart.mockResolvedValue({
+      sessionId: '33333333-3333-4333-8333-333333333333',
+      status: 'waiting_for_scan',
+      qrReady: true,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    })
+    mockedWeiboStatus.mockImplementation(() => new Promise(() => {}))
+    mockedWeiboQr.mockResolvedValue(new Blob(['png'], { type: 'image/png' }))
+    mockedWeiboCancel.mockResolvedValue({
+      sessionId: '33333333-3333-4333-8333-333333333333',
+      status: 'cancelled',
+      qrReady: false,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    })
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:weibo-qr'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('微博')
+    fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('授权微博')).toBeInTheDocument()
+    expect(within(dialog).getByText(/微博客户端扫码一次即可复用登录/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(await within(dialog).findByAltText('微博登录二维码')).toHaveAttribute(
+      'src',
+      'blob:weibo-qr',
+    )
+    expect(within(dialog).getByRole('link', { name: '单独打开二维码' })).toHaveAttribute(
+      'target',
+      '_blank',
+    )
+    expect(mockedWeiboStart).toHaveBeenCalledWith(auth)
+    expect(mockedWeiboQr).toHaveBeenCalledWith(auth, '33333333-3333-4333-8333-333333333333')
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }))
+    await waitFor(() =>
+      expect(mockedWeiboCancel).toHaveBeenCalledWith(auth, '33333333-3333-4333-8333-333333333333'),
     )
   })
 
