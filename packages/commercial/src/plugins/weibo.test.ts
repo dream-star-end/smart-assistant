@@ -29,7 +29,7 @@ function framed(value: unknown): Buffer {
 
 describe('official Weibo Plugin', () => {
   test('pins one exact platform artifact and has no compatible predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.0.0')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.1.0')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(
@@ -69,7 +69,7 @@ describe('official Weibo Plugin', () => {
     )
   })
 
-  test('exposes bounded common reads and per-operation-confirmed writes', () => {
+  test('exposes bounded common reads and default-confirmed writes with independent preapproval', () => {
     assert.deepEqual(
       WEIBO_PLUGIN_CONTRACT.actions.map((action) => action.id),
       [
@@ -103,8 +103,16 @@ describe('official Weibo Plugin', () => {
       (candidate) => candidate.effect === 'write',
     ))
       assert.match(action.description, /逐次确认/)
-    assert.ok(managedPluginWritePolicy(WEIBO_PLUGIN_SLUG))
-    assert.equal(managedPluginWritePreapprovalPolicy(WEIBO_PLUGIN_SLUG), null)
+    const writePolicy = managedPluginWritePolicy(WEIBO_PLUGIN_SLUG)
+    assert.equal(writePolicy?.version, 2)
+    assert.match(writePolicy?.disclaimerText ?? '', /默认每一次写操作仍须.*确认卡/)
+    assert.match(writePolicy?.disclaimerText ?? '', /独立的账号级高风险声明/)
+    const preapprovalPolicy = managedPluginWritePreapprovalPolicy(WEIBO_PLUGIN_SLUG)
+    assert.equal(preapprovalPolicy?.version, 1)
+    assert.match(preapprovalPolicy?.disclaimerText ?? '', /发布文字或图片微博/)
+    assert.match(preapprovalPolicy?.disclaimerText ?? '', /删除不可撤销/)
+    assert.match(preapprovalPolicy?.disclaimerText ?? '', /点赞和关注/)
+    assert.match(preapprovalPolicy?.disclaimerText ?? '', /派发围栏/)
   })
 
   test('keeps account state and browser network inside exact signed origins', () => {

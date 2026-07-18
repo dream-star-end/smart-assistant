@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
 
 export const WEIBO_PLUGIN_SLUG = 'weibo'
-export const WEIBO_PLUGIN_VERSION = '1.0.0'
+export const WEIBO_PLUGIN_VERSION = '1.1.0'
 export const WEIBO_WORKER_DIGEST = createHash('sha256').update(WEIBO_WORKER_SOURCE).digest('hex')
 export const WEIBO_DRIVER_ID = `weibo-${WEIBO_WORKER_DIGEST.slice(0, 57)}`
 export const WEIBO_DRIVER_VERSION = WEIBO_PLUGIN_VERSION
@@ -321,7 +321,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_post',
-      description: '使用当前真实微博身份发布文字或图片微博（逐次确认）',
+      description: '使用当前真实微博身份发布文字或图片微博（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 600,
       params: {
@@ -342,7 +342,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'edit_post',
-      description: '编辑自己已发布微博的正文（逐次确认）',
+      description: '编辑自己已发布微博的正文（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 300,
       params: {
@@ -365,7 +365,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'delete_post',
-      description: '永久删除自己发布的微博（不可撤销；逐次确认）',
+      description: '永久删除自己发布的微博（不可撤销；默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 180,
       params: {
@@ -378,7 +378,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_comment',
-      description: '评论指定微博（逐次确认）',
+      description: '评论指定微博（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 180,
       params: {
@@ -400,7 +400,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'reply_comment',
-      description: '回复指定微博评论（逐次确认）',
+      description: '回复指定微博评论（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 180,
       params: {
@@ -423,7 +423,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'delete_comment',
-      description: '永久删除自己发表的微博评论或回复（不可撤销；逐次确认）',
+      description: '永久删除自己发表的微博评论或回复（不可撤销；默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 180,
       params: {
@@ -441,7 +441,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'repost_post',
-      description: '转发指定微博并可附带文字（逐次确认）',
+      description: '转发指定微博并可附带文字（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 180,
       params: {
@@ -458,7 +458,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'set_post_like',
-      description: '把指定微博点赞状态设置为已赞或未赞（逐次确认）',
+      description: '把指定微博点赞状态设置为已赞或未赞（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 180,
       params: {
@@ -471,7 +471,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'set_following',
-      description: '把指定微博用户关注状态设置为已关注或未关注（逐次确认）',
+      description: '把指定微博用户关注状态设置为已关注或未关注（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 180,
       params: {

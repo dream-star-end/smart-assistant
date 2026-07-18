@@ -329,9 +329,9 @@ function weiboPlugin() {
       { id: 'create_post', description: '发布微博', readOnly: false as const },
     ],
     installed: true,
-    installedVersion: '1.0.0',
+    installedVersion: '1.1.0',
     latestVersionId: '301',
-    latestVersion: '1.0.0',
+    latestVersion: '1.1.0',
     installedCurrent: true,
     updateAvailable: false,
     available: true,
@@ -357,6 +357,30 @@ function knowledgePlanetWriteControl(
       acceptedAt: null,
       disclaimerText:
         '开启后所有 Agent 可直接发布、上传媒体、点赞、编辑和永久删除，不再展示逐次确认卡。',
+    },
+    ...overrides,
+  }
+}
+
+function weiboWriteControl(
+  overrides: Partial<NonNullable<RuntimePluginAccount['writeControl']>> = {},
+): NonNullable<RuntimePluginAccount['writeControl']> {
+  return {
+    available: true,
+    enabled: false,
+    disclaimerVersion: 2,
+    acceptedVersion: null,
+    acceptedAt: null,
+    disclaimerText:
+      '开启后会以你的真实微博身份发布、编辑、删除、评论、回复、转发、点赞或关注；默认逐次确认。',
+    preapproval: {
+      available: true,
+      enabled: false,
+      disclaimerVersion: 1,
+      acceptedVersion: null,
+      acceptedAt: null,
+      disclaimerText:
+        '开启后所有 Agent 可直接发布微博、评论、回复、转发、点赞、关注、编辑和永久删除，不再展示逐次确认卡。',
     },
     ...overrides,
   }
@@ -1463,6 +1487,79 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       }),
     )
     expect(await screen.findByText(/“免逐次确认”已开启/)).toBeInTheDocument()
+  })
+
+  test('微博展示账号级免逐次确认，独立同意后开启且可直接关闭', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const base = weiboWriteControl({
+      enabled: true,
+      acceptedVersion: 2,
+      acceptedAt: '2026-07-19T01:02:03.000Z',
+    })
+    const enabled = weiboWriteControl({
+      ...base,
+      preapproval: {
+        ...base.preapproval!,
+        enabled: true,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-19T03:04:05.000Z',
+      },
+    })
+    const account: RuntimePluginAccount = {
+      id: '3',
+      provider: 'weibo',
+      pluginType: 'managed-browser',
+      displayName: '我的微博',
+      accountHint: '微博扫码账号',
+      status: 'active',
+      actions: weiboPlugin().actions,
+      versionId: '301',
+      executable: true,
+      writeControl: base,
+    }
+    mockedPluginManagement
+      .mockResolvedValueOnce({ catalog: [weiboPlugin()], accounts: [account] })
+      .mockResolvedValueOnce({
+        catalog: [weiboPlugin()],
+        accounts: [{ ...account, writeControl: enabled }],
+      })
+      .mockResolvedValue({ catalog: [weiboPlugin()], accounts: [account] })
+    mockedSetPluginWritePreapproval
+      .mockResolvedValueOnce(enabled)
+      .mockResolvedValueOnce(base)
+
+    render(<ConnectorsTab auth={auth} />)
+    expect(
+      await screen.findByText('开启后，Agent 可直接执行此 Plugin 的全部已开放写入动作；默认关闭。'),
+    ).toBeInTheDocument()
+    const preapprovalSwitch = screen.getByRole('switch', { name: '我的微博免逐次确认' })
+    expect(preapprovalSwitch).not.toBeChecked()
+    fireEvent.click(preapprovalSwitch)
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/直接执行微博写入/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/发布微博、评论、回复、转发、点赞、关注/)).toBeInTheDocument()
+    const enable = within(dialog).getByRole('button', { name: '同意并开启' })
+    expect(enable).toBeDisabled()
+    fireEvent.click(within(dialog).getByRole('checkbox'))
+    fireEvent.click(enable)
+
+    await waitFor(() =>
+      expect(mockedSetPluginWritePreapproval).toHaveBeenCalledWith(auth, '3', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+      }),
+    )
+    expect(await screen.findByText(/微博“免逐次确认”已开启/)).toBeInTheDocument()
+    await waitFor(() => expect(preapprovalSwitch).toBeChecked())
+    fireEvent.click(preapprovalSwitch)
+    await waitFor(() =>
+      expect(mockedSetPluginWritePreapproval).toHaveBeenLastCalledWith(auth, '3', {
+        enabled: false,
+      }),
+    )
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   test('开启写入失败时在免责声明弹层内说明错误且不乐观翻转', async () => {

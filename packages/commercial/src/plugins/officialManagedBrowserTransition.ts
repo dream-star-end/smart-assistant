@@ -43,6 +43,30 @@ interface TransitionCensus {
   accounts: PluginAccountRow[]
 }
 
+export interface OfficialManagedBrowserTransitionScope {
+  currentVersionId: string | null
+  installs: ReadonlyArray<{
+    id: string
+    userId: number
+    versionId: string
+    artifactHash: string
+    agentIds: unknown
+  }>
+  accounts: ReadonlyArray<{
+    id: string
+    userId: number
+    versionId: string
+    revision: number
+    secretGeneration: string
+    status: string
+    specHash: string
+    execContractHash: string
+    authContractVersion: number
+  }>
+}
+
+export type OfficialManagedBrowserTransitionCensus = OfficialManagedBrowserTransitionScope
+
 const TRANSITION_ACCOUNT_COLUMNS = `c.id::text AS id, c.user_id::int AS user_id,
   c.provider, c.display_name, c.account_key, c.aad_seed::text AS aad_seed,
   c.secret_enc, c.secret_nonce, c.revision,
@@ -93,8 +117,8 @@ async function readCensus(
   }
 }
 
-function censusFingerprint(census: TransitionCensus): string {
-  return JSON.stringify({
+function publicCensus(census: TransitionCensus): OfficialManagedBrowserTransitionCensus {
+  return {
     currentVersionId: census.currentVersionId,
     installs: census.installs.map((row) => ({
       id: row.id,
@@ -108,13 +132,38 @@ function censusFingerprint(census: TransitionCensus): string {
       userId: row.user_id,
       versionId: row.connector_version_id,
       revision: row.revision,
-      generation: row.secret_generation,
+      secretGeneration: row.secret_generation,
       status: row.status,
       specHash: row.spec_hash.toString('hex'),
       execContractHash: row.exec_contract_hash.toString('hex'),
       authContractVersion: row.auth_contract_version,
     })),
-  })
+  }
+}
+
+function scopeFingerprint(scope: OfficialManagedBrowserTransitionScope): string {
+  return JSON.stringify(scope)
+}
+
+function assertExpectedScope(
+  census: TransitionCensus,
+  expectedFingerprint: string,
+): void {
+  if (scopeFingerprint(publicCensus(census)) !== expectedFingerprint)
+    throw new Error('official managed-browser Plugin transition scope changed')
+}
+
+/** Non-secret deploy census used to pin an explicitly verified upgrade scope. */
+export async function readOfficialManagedBrowserTransitionCensus(
+  slug: string,
+  pool: Pool = getPool(),
+): Promise<OfficialManagedBrowserTransitionCensus> {
+  const census = await readCensus(pool, slug, false)
+  return publicCensus(census)
+}
+
+function censusFingerprint(census: TransitionCensus): string {
+  return scopeFingerprint(publicCensus(census))
 }
 
 async function acquireAllAccountLeases(
@@ -179,7 +228,7 @@ async function setOfficialManagedBrowserListingGate(input: {
     const version = await lockMarketplaceVersion(client, versionId)
     const listing = await lockMarketplaceListing(client, input.slug)
     const gate = await client.query<{ revoked_reason: string | null }>(
-      `SELECT revoked_reason FROM marketplace_skill_listings WHERE slug = $1`,
+      'SELECT revoked_reason FROM marketplace_skill_listings WHERE slug = $1',
       [input.slug],
     )
     const gateReason = gate.rows[0]?.revoked_reason ?? null
@@ -286,14 +335,22 @@ export async function transitionOfficialManagedBrowserPluginVersion(input: {
   env?: NodeJS.ProcessEnv
   pool?: Pool
   redis?: PluginLeaseRedis | null
+  /** Exact deploy-verified active install/account rows; checked before and inside every retry. */
+  expectedScope?: OfficialManagedBrowserTransitionScope
   /** Keep the global Plugin gate closed while a different source is activated. */
   openListingAtCommit?: boolean
-  failureInjector?: (point: 'after-accounts' | 'after-installs') => void | Promise<void>
+  failureInjector?: (
+    point: 'after-locked-census' | 'after-accounts' | 'after-installs',
+  ) => void | Promise<void>
 }): Promise<OfficialManagedBrowserTransitionResult> {
   const pool = input.pool ?? getPool()
+  const expectedScopeFingerprint = input.expectedScope
+    ? scopeFingerprint(input.expectedScope)
+    : null
   const deadline = Date.now() + TRANSITION_DEADLINE_MS
   for (;;) {
     const discovered = await readCensus(pool, input.slug, false)
+    if (expectedScopeFingerprint) assertExpectedScope(discovered, expectedScopeFingerprint)
     let leases: PluginAccountLease[] = []
     try {
       leases = await acquireAllAccountLeases(
@@ -337,14 +394,17 @@ export async function transitionOfficialManagedBrowserPluginVersion(input: {
       ]
         .filter((id, index, all) => all.indexOf(id) === index)
         .sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0))
-      const lockedVersions = new Map<string, NonNullable<Awaited<ReturnType<typeof lockMarketplaceVersion>>>>()
+      const lockedVersions = new Map<
+        string,
+        NonNullable<Awaited<ReturnType<typeof lockMarketplaceVersion>>>
+      >()
       for (const versionId of versionIds) {
         const version = await lockMarketplaceVersion(client, versionId)
         if (version) lockedVersions.set(version.id, version)
       }
       const listing = await lockMarketplaceListing(client, input.slug)
       const gate = await client.query<{ revoked_reason: string | null }>(
-        `SELECT revoked_reason FROM marketplace_skill_listings WHERE slug = $1`,
+        'SELECT revoked_reason FROM marketplace_skill_listings WHERE slug = $1',
         [input.slug],
       )
       const gateReason = gate.rows[0]?.revoked_reason ?? null
@@ -381,6 +441,8 @@ export async function transitionOfficialManagedBrowserPluginVersion(input: {
       const locked = await readCensus(client, input.slug, true)
       if (censusFingerprint(locked) !== censusFingerprint(discovered))
         throw new CensusChangedError('Plugin transition census changed')
+      if (expectedScopeFingerprint) assertExpectedScope(locked, expectedScopeFingerprint)
+      await input.failureInjector?.('after-locked-census')
       const targetVerified = await loadVerifiedRuntimePluginContract(
         Number(input.targetVersionId),
         client,
@@ -395,7 +457,10 @@ export async function transitionOfficialManagedBrowserPluginVersion(input: {
         throw new Error('official managed-browser Plugin target signature mismatch')
 
       let migratedAccounts = 0
-      const verifiedByVersion = new Map<number, Awaited<ReturnType<typeof loadVerifiedRuntimePluginContract>>>()
+      const verifiedByVersion = new Map<
+        number,
+        Awaited<ReturnType<typeof loadVerifiedRuntimePluginContract>>
+      >()
       for (const row of locked.accounts) {
         if (row.connector_version_id === input.targetVersionId) continue
         const versionId = Number(row.connector_version_id)
