@@ -113,6 +113,15 @@ export function useAdminAuth(): AdminAuthState {
           return;
         }
         if (outcome.kind === "transient") {
+          // throttled 限频早返不计重试(未发真实网络请求;语义与坑同 useAuth 的 boot 循环)。
+          if (outcome.throttled) {
+            try {
+              await waitForRecovery(Math.max(1, outcome.retryAfterMs), controller.signal);
+            } catch {
+              return;
+            }
+            continue;
+          }
           const local = ADMIN_RECOVERY_BACKOFF_MS[Math.min(refreshAttempt, ADMIN_RECOVERY_BACKOFF_MS.length - 1)];
           refreshAttempt += 1;
           if (refreshAttempt >= 2) {
