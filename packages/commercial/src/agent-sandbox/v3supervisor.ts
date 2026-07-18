@@ -72,6 +72,7 @@ import { SupervisorError } from "./types.js";
 import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
+import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
 import {
@@ -2439,6 +2440,13 @@ export async function provisionV3Container(
       // 行为(FILE_ALLOWED_DIRS + TEMP_PREFIX + agent_cwd MEDIA_EXTENSIONS)。
       "OC_V3_TRUSTED_FILE_SERVE=1",
     ];
+    const promptQueueEnabled = getRuntimeChannel() === "v5" && isPromptQueueV1Enabled();
+    if (promptQueueEnabled) {
+      // Both halves of the container-side strict gate are server-authored.
+      // Never pass through a loose/truthy flag, and never rely on model
+      // authority wiring to incidentally provide the commercial owner id.
+      env.push("OC_PROMPT_QUEUE_V1=1", `OC_USER_ID=${String(uid)}`);
+    }
     // Dedicated container capability: OC_RUNTIME_CHANNEL is a master-process
     // signal and would also change the in-container CLI web-root semantics.
     if (getRuntimeChannel() === "v5") {
@@ -2500,7 +2508,7 @@ export async function provisionV3Container(
       env.push(
         typeof keyringAssignment === "function" ? keyringAssignment() : keyringAssignment,
       );
-      env.push(`OC_USER_ID=${String(uid)}`);
+      if (!promptQueueEnabled) env.push(`OC_USER_ID=${String(uid)}`);
       if (deps.modelAuthority.required) env.push("OC_MODEL_AUTHORITY=1");
       // 次级模型(WebFetch/WebSearch 等隐藏调用走的 ANTHROPIC_SMALL_FAST_MODEL)由 **master
       // 单向下发**:master 签发 authority 时把它列进 auxModels(egress 据此放行),这里注入同一
