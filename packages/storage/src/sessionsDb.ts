@@ -990,6 +990,23 @@ export async function turnDispatchInboxStats(): Promise<{ openJobs: number; byte
   return { openJobs: Number(open.n) || 0, bytes: Number(bytesRow.b) || 0 }
 }
 
+/**
+ * Planned runtime recycle fence: only a `running` row proves model execution
+ * has begun but its tape has not reached the durable sink yet.
+ *
+ * `queued` has not entered model execution; `recovery_pending` is already an
+ * orphan from an earlier process; `sink_staged` is durable; and
+ * `sink_stage_failed` is already fail-visible/manual. Keep this predicate
+ * narrower than the healthz "open job" gauge above.
+ */
+export async function countRuntimeRecycleUnsafeTurnDispatches(): Promise<number> {
+  const db = await getSessionsDb()
+  const row = db
+    .prepare("SELECT COUNT(*) AS n FROM turn_dispatch_inbox WHERE state = 'running'")
+    .get() as { n: number }
+  return Number(row.n) || 0
+}
+
 export async function upsertSessionMeta(meta: SessionMeta): Promise<void> {
   const db = await getSessionsDb()
   db.prepare(`

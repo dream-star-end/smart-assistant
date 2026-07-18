@@ -2140,9 +2140,13 @@ export function makeTurnTapeStateHandler(deps: TurnTapeStateHandlerDeps): Server
     const userId = `c:${identity.userId}`;
     try {
       const result = await deps.storage.getTurnTapeStateByDispatch(userId, dispatchId, attemptNo);
-      // M1:返回 state(三态)+ status(tape 精确终态 completed/interrupted/crashed;none→null)。
-      // gateway recovery finalized 分支据 status 决定重播语义。
-      sendJsonOk(res, 200, { state: result.state, status: result.status }, requestId);
+      // state/status 与 dispatch lease 来自同一 PG statement snapshot。none
+      // 分支的 lease boolean 是 gateway 恢复协议的滚动兼容能力证据。
+      sendJsonOk(res, 200, {
+        state: result.state,
+        status: result.status,
+        dispatchLeaseActive: result.dispatchLeaseActive,
+      }, requestId);
     } catch (err) {
       log.error("turn_tape_state_read_failed", { dispatchId, attemptNo, err: err as Error });
       sendJsonError(res, 500, "TURN_TAPE_STATE_ERROR", "turn tape state read failed", requestId);

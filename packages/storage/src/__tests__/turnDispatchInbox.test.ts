@@ -12,6 +12,7 @@ process.env.OPENCLAUDE_HOME = testHome
 
 const {
   closeSessionsDb,
+  countRuntimeRecycleUnsafeTurnDispatches,
   getSessionsDb,
   casTurnDispatchState,
   deleteClientSession,
@@ -238,6 +239,68 @@ test('按 dispatchId 查行 + healthz gauge open-job 计数', async () => {
   const stats = await turnDispatchInboxStats()
   assert.ok(stats.openJobs >= 1, 'open-job 计数覆盖 running 行')
   assert.ok(stats.bytes > 0, '字节 gauge 非零')
+})
+
+test('runtime recycle 只把 running 视为 durable unsafe', async () => {
+  const before = await countRuntimeRecycleUnsafeTurnDispatches()
+  const states = [
+    'queued',
+    'running',
+    'recovery_pending',
+    'sink_staged',
+    'sink_stage_failed',
+    'terminal',
+    'rejected',
+  ] as const
+
+  for (const [index, target] of states.entries()) {
+    const k = {
+      userId: 'u-drain',
+      sessionId: `web-drain-${index}`,
+      clientMessageId: `cm-drain-${index}`,
+      dispatchId: `d-drain-${index}`,
+      attemptNo: 1,
+      payloadHash: 'h',
+    }
+    await insertQueuedTurnDispatch(k)
+    if (target === 'queued') continue
+    if (target === 'rejected') {
+      await casTurnDispatchState({
+        userId: k.userId,
+        sessionId: k.sessionId,
+        clientMessageId: k.clientMessageId,
+        fromStates: ['queued'],
+        toState: 'rejected',
+        outcome: 'not_accepted',
+      })
+      continue
+    }
+    await recordTurnDispatchRunning({
+      userId: k.userId,
+      sessionId: k.sessionId,
+      clientMessageId: k.clientMessageId,
+      agentId: 'main',
+      turnIndex: 1,
+      turnKey: `tk-${index}`,
+      requestId: null,
+      createdAt: 1,
+    })
+    if (target === 'running') continue
+    await casTurnDispatchState({
+      userId: k.userId,
+      sessionId: k.sessionId,
+      clientMessageId: k.clientMessageId,
+      fromStates: ['running'],
+      toState: target,
+      ...(target === 'terminal' ? { outcome: 'completed' as const } : {}),
+    })
+  }
+
+  assert.equal(
+    await countRuntimeRecycleUnsafeTurnDispatches(),
+    before + 1,
+    'queued/recovery/sink/terminal/rejected 均不得阻塞 planned recycle',
+  )
 })
 
 test('session 硬删级联清 inbox 行', async () => {

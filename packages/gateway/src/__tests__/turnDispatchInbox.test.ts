@@ -8,6 +8,7 @@ import { sign as edSign, generateKeyPairSync } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import { after, describe, test } from 'node:test'
 
 import type { MasterTapeStateResult } from '../turnDispatchInbox.js'
@@ -45,12 +46,15 @@ const {
   isTurnDispatchLive,
   markTurnDispatchLive,
   normalizeDispatchUserId,
+  queryMasterTapeState,
   recoverTurnDispatchInboxOnBoot,
+  runDurableDispatchAdmission,
   unmarkTurnDispatchLive,
   rejectTurnDispatchIfAbsent,
   resolveInboxTerminalAck,
 } = await import('../turnDispatchInbox.js')
 const { lookupRecentTerminal, recordRecentTerminal } = await import('../sessionManager.js')
+const { Gateway } = await import('../server.js')
 
 after(async () => {
   await closeSessionsDb()
@@ -368,7 +372,7 @@ describe('boot recovery 故障注入(§7 1/2/3/4/8)', () => {
     const tapeState: Record<string, MasterTapeStateResult> = {
       'd-finalized': { state: 'finalized' },
       'd-partial': { state: 'partial' },
-      'd-none': { state: 'none' },
+      'd-none': { state: 'none', dispatchLeaseActive: false },
       'd-unreachable': { state: 'unreachable' },
     }
 
@@ -429,7 +433,10 @@ describe('boot recovery 故障注入(§7 1/2/3/4/8)', () => {
     const stagedFor = new Set<string>()
     const deps = {
       retryQueueHasDispatch: async () => false,
-      queryMasterTapeState: async (): Promise<MasterTapeStateResult> => ({ state: 'none' }),
+      queryMasterTapeState: async (): Promise<MasterTapeStateResult> => ({
+        state: 'none',
+        dispatchLeaseActive: false,
+      }),
       stageSyntheticCrashedTape: async (row: { dispatchId: string }) => {
         stagedFor.add(row.dispatchId)
       },
@@ -504,6 +511,288 @@ describe('boot recovery 故障注入(§7 1/2/3/4/8)', () => {
     assert.equal(a.createdAt, 5555, 'createdAt 取 inbox 持久化值,确定性')
     assert.equal(a.turnKey, 'tk-d-none')
     assert.equal(a.dispatchId, 'd-none')
+  })
+})
+
+describe('master tape-state lease fence', () => {
+  const env = {
+    OPENCLAUDE_V3_MASTER_BASE_URL: 'http://master.test',
+    OPENCLAUDE_V3_CONTAINER_TOKEN: 'token',
+  }
+
+  function fetcher(body: Record<string, unknown>) {
+    return (async () => ({
+      statusCode: 200,
+      body: Readable.from([JSON.stringify(body)]),
+    })) as never
+  }
+
+  test('none 必须带 boolean lease;老 master 缺字段按 unreachable fail-closed', async () => {
+    assert.deepEqual(
+      await queryMasterTapeState('d-lease-wire', 1, {
+        env,
+        fetcher: fetcher({ state: 'none', status: null, dispatchLeaseActive: true }),
+      }),
+      { state: 'none', dispatchLeaseActive: true },
+    )
+    assert.deepEqual(
+      await queryMasterTapeState('d-lease-wire', 1, {
+        env,
+        fetcher: fetcher({ state: 'none', status: null, dispatchLeaseActive: false }),
+      }),
+      { state: 'none', dispatchLeaseActive: false },
+    )
+    assert.deepEqual(
+      await queryMasterTapeState('d-lease-wire', 1, {
+        env,
+        fetcher: fetcher({ state: 'none', status: null }),
+      }),
+      { state: 'unreachable' },
+      '滚动窗口老 master 缺 lease 证据不得被当作 none negative proof',
+    )
+  })
+
+  test('none+活 lease 延后 synthetic;lease 失活后的下一轮正常收敛', async () => {
+    await insertQueuedTurnDispatch({
+      userId: 'u1',
+      sessionId: 'web-lease-defer',
+      clientMessageId: 'cm-lease-defer',
+      dispatchId: 'd-lease-defer',
+      attemptNo: 1,
+      payloadHash: 'h',
+    })
+    await recordTurnDispatchRunning({
+      userId: 'u1',
+      sessionId: 'web-lease-defer',
+      clientMessageId: 'cm-lease-defer',
+      agentId: 'main',
+      turnIndex: 1,
+      turnKey: 'tk-lease-defer',
+      requestId: null,
+      createdAt: 1,
+    })
+
+    let leaseActive = true
+    let staged = 0
+    const deps = {
+      retryQueueHasDispatch: async () => false,
+      queryMasterTapeState: async (dispatchId: string): Promise<MasterTapeStateResult> =>
+        dispatchId === 'd-lease-defer'
+          ? { state: 'none', dispatchLeaseActive: leaseActive }
+          : { state: 'unreachable' },
+      stageSyntheticCrashedTape: async (row: { dispatchId: string }) => {
+        if (row.dispatchId === 'd-lease-defer') staged++
+      },
+    }
+
+    const first = await recoverTurnDispatchInboxOnBoot(deps)
+    assert.equal(
+      (await getTurnDispatchByLogicalKey('u1', 'web-lease-defer', 'cm-lease-defer'))?.state,
+      'recovery_pending',
+    )
+    assert.ok(first.leaseDeferred >= 1)
+    assert.equal(staged, 0, '活 lease 下不得合成 SERVICE_RESTART')
+
+    leaseActive = false
+    await recoverTurnDispatchInboxOnBoot(deps)
+    assert.equal(
+      (await getTurnDispatchByLogicalKey('u1', 'web-lease-defer', 'cm-lease-defer'))?.state,
+      'sink_staged',
+    )
+    assert.equal(staged, 1, 'lease 失活后按既有确定性 none 分支收敛')
+  })
+
+  test('直接注入 none 但缺 lease 字段也保持 recovery_pending', async () => {
+    await insertQueuedTurnDispatch({
+      userId: 'u1',
+      sessionId: 'web-lease-missing',
+      clientMessageId: 'cm-lease-missing',
+      dispatchId: 'd-lease-missing',
+      attemptNo: 1,
+      payloadHash: 'h',
+    })
+    await recordTurnDispatchRunning({
+      userId: 'u1',
+      sessionId: 'web-lease-missing',
+      clientMessageId: 'cm-lease-missing',
+      agentId: 'main',
+      turnIndex: 1,
+      turnKey: 'tk-lease-missing',
+      requestId: null,
+      createdAt: 1,
+    })
+    let staged = false
+    await recoverTurnDispatchInboxOnBoot({
+      retryQueueHasDispatch: async () => false,
+      queryMasterTapeState: async (dispatchId) =>
+        dispatchId === 'd-lease-missing' ? { state: 'none' } : { state: 'unreachable' },
+      stageSyntheticCrashedTape: async () => {
+        staged = true
+      },
+    })
+    assert.equal(
+      (await getTurnDispatchByLogicalKey('u1', 'web-lease-missing', 'cm-lease-missing'))?.state,
+      'recovery_pending',
+    )
+    assert.equal(staged, false)
+  })
+})
+
+describe('生产受理接线 × 压缩 periodic tick', () => {
+  test('原始执行与重复帧重叠时,真实 tick 仍看见 live 引用;settle 后下一 tick 收敛', async () => {
+    const ctx = {
+      uid: 'u1',
+      sessionId: 'web-live-e2e',
+      clientMessageId: 'cm-live-e2e',
+      dispatchId: 'd-live-e2e',
+      attemptNo: 1,
+      payloadHash: 'h',
+      billingRequestId: 'b',
+    }
+    const events: string[] = []
+    let releaseDispatch!: () => void
+    const held = new Promise<void>((resolve) => {
+      releaseDispatch = resolve
+    })
+    let started!: () => void
+    const dispatchStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+
+    const original = runDurableDispatchAdmission({
+      ctx,
+      sendReceipt: (row) => events.push(`receipt:${row?.state ?? 'absent'}`),
+      dispatch: async () => {
+        events.push('dispatch')
+        await recordTurnDispatchRunning({
+          userId: ctx.uid,
+          sessionId: ctx.sessionId,
+          clientMessageId: ctx.clientMessageId,
+          agentId: 'main',
+          turnIndex: 1,
+          turnKey: 'tk-live-e2e',
+          requestId: null,
+          createdAt: 1,
+        })
+        started()
+        await held
+      },
+    })
+    await dispatchStarted
+    assert.deepEqual(events.slice(0, 2), ['receipt:queued', 'dispatch'])
+
+    const duplicate = await runDurableDispatchAdmission({
+      ctx,
+      sendReceipt: (row) => events.push(`duplicate-receipt:${row?.state ?? 'absent'}`),
+      dispatch: async () => {
+        throw new Error('duplicate must not dispatch')
+      },
+    })
+    assert.equal(duplicate, 'duplicate')
+    assert.equal(isTurnDispatchLive(ctx.dispatchId, ctx.attemptNo), true)
+    assert.ok(events.includes('duplicate-receipt:running'))
+
+    const oldSweep = process.env.OC_TURN_DISPATCH_SWEEP_MS
+    process.env.OC_TURN_DISPATCH_SWEEP_MS = '1000'
+    const gateway = Object.create(Gateway.prototype) as any
+    gateway._turnDispatchRecoveryTimer = null
+    gateway._turnDispatchRecoveryInFlight = false
+    gateway.log = { error: () => {} }
+    let synthetic = 0
+    let ticks = 0
+    let firstTick!: () => void
+    let secondTick!: () => void
+    const firstTickDone = new Promise<void>((resolve) => {
+      firstTick = resolve
+    })
+    const secondTickDone = new Promise<void>((resolve) => {
+      secondTick = resolve
+    })
+    let firstStats: Awaited<ReturnType<typeof recoverTurnDispatchInboxOnBoot>> | undefined
+    gateway._runTurnDispatchRecoverySweep = async () => {
+      const stats = await recoverTurnDispatchInboxOnBoot({
+        retryQueueHasDispatch: async () => false,
+        queryMasterTapeState: async (dispatchId: string): Promise<MasterTapeStateResult> =>
+          dispatchId === ctx.dispatchId
+            ? { state: 'none', dispatchLeaseActive: false }
+            : { state: 'unreachable' },
+        isDispatchLive: isTurnDispatchLive,
+        stageSyntheticCrashedTape: async (row: { dispatchId: string }) => {
+          if (row.dispatchId === ctx.dispatchId) synthetic++
+        },
+      })
+      ticks++
+      if (ticks === 1) {
+        firstStats = stats
+        firstTick()
+      } else if (ticks === 2) {
+        secondTick()
+      }
+    }
+
+    try {
+      gateway._startTurnDispatchRecoveryLoop({})
+      // Production unrefs the timer so it never blocks process shutdown; the
+      // test explicitly refs this exact timer while awaiting two real ticks.
+      gateway._turnDispatchRecoveryTimer.ref()
+      await firstTickDone
+      assert.ok((firstStats?.liveSkipped ?? 0) >= 1)
+      assert.equal(synthetic, 0)
+      assert.equal(
+        (await getTurnDispatchByLogicalKey(ctx.uid, ctx.sessionId, ctx.clientMessageId))?.state,
+        'running',
+      )
+
+      releaseDispatch()
+      assert.equal(await original, 'executed')
+      assert.equal(isTurnDispatchLive(ctx.dispatchId, ctx.attemptNo), false)
+
+      await secondTickDone
+      assert.equal(synthetic, 1)
+      assert.equal(
+        (await getTurnDispatchByLogicalKey(ctx.uid, ctx.sessionId, ctx.clientMessageId))?.state,
+        'sink_staged',
+      )
+    } finally {
+      releaseDispatch()
+      await original.catch(() => {})
+      if (gateway._turnDispatchRecoveryTimer) clearInterval(gateway._turnDispatchRecoveryTimer)
+      if (oldSweep === undefined) delete process.env.OC_TURN_DISPATCH_SWEEP_MS
+      else process.env.OC_TURN_DISPATCH_SWEEP_MS = oldSweep
+    }
+  })
+
+  test('dispatch 抛错仍在 finally 注销 live 引用', async () => {
+    const ctx = {
+      uid: 'u1',
+      sessionId: 'web-live-throw',
+      clientMessageId: 'cm-live-throw',
+      dispatchId: 'd-live-throw',
+      attemptNo: 1,
+      payloadHash: 'h',
+      billingRequestId: 'b',
+    }
+    await assert.rejects(
+      runDurableDispatchAdmission({
+        ctx,
+        sendReceipt: () => {},
+        dispatch: async () => {
+          await recordTurnDispatchRunning({
+            userId: ctx.uid,
+            sessionId: ctx.sessionId,
+            clientMessageId: ctx.clientMessageId,
+            agentId: 'main',
+            turnIndex: 1,
+            turnKey: 'tk-live-throw',
+            requestId: null,
+            createdAt: 1,
+          })
+          throw new Error('dispatch boom')
+        },
+      }),
+      /dispatch boom/,
+    )
+    assert.equal(isTurnDispatchLive(ctx.dispatchId, ctx.attemptNo), false)
   })
 })
 

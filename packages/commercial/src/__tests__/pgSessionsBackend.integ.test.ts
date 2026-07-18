@@ -27,6 +27,8 @@ import {
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
 import {
+  casAdmittedToAccepted,
+  casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
   getDispatch,
@@ -1722,6 +1724,72 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
     assert.equal(dd.kind, "deduplicated");
   });
 
+  maybe("tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-dd-lease-1", userId: CUSER }));
+    const admitted = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-lease-1", clientMessageId: "cm-dd-lease-1" }),
+    );
+    assert.equal(admitted.kind, "admitted");
+    const dispatch = (admitted as {
+      dispatch: { dispatchId: string; leaseEpoch: number };
+    }).dispatch;
+
+    const fresh = await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1);
+    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true });
+    assert.deepEqual(
+      await backend.getTurnTapeStateByDispatch("c:8", dispatch.dispatchId, 1),
+      { state: "none", status: null, dispatchLeaseActive: false },
+      "错误租户不能观察 lease",
+    );
+    assert.deepEqual(
+      await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 2),
+      { state: "none", status: null, dispatchLeaseActive: false },
+      "attemptNo 必须同样参与 lease scope",
+    );
+
+    assert.ok(await casAdmittedToAccepted(pool, {
+      dispatchId: dispatch.dispatchId,
+      expectedEpoch: dispatch.leaseEpoch,
+    }));
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1))
+        .dispatchLeaseActive,
+      true,
+      "accepted 行在短租约有效期内仍是 secondary fence",
+    );
+
+    await pool.query(
+      "UPDATE turn_dispatches SET lease_until = statement_timestamp() - interval '1 second' WHERE dispatch_id = $1",
+      [dispatch.dispatchId],
+    );
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1))
+        .dispatchLeaseActive,
+      false,
+      "过期 lease 不再延后恢复",
+    );
+
+    await backend.upsertClientSession(mkSession({ id: "s-dd-lease-2", userId: CUSER }));
+    const rejectingAdmit = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-lease-2", clientMessageId: "cm-dd-lease-2" }),
+    );
+    assert.equal(rejectingAdmit.kind, "admitted");
+    const rejectingDispatch = (rejectingAdmit as {
+      dispatch: { dispatchId: string; leaseEpoch: number };
+    }).dispatch;
+    assert.ok(await casAdmittedToRejecting(pool, {
+      dispatchId: rejectingDispatch.dispatchId,
+      expectedEpoch: rejectingDispatch.leaseEpoch,
+      ownerId: "reconciler-test",
+    }));
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, rejectingDispatch.dispatchId, 1))
+        .dispatchLeaseActive,
+      false,
+      "rejecting 不属于 lease-active open execution set",
+    );
+  });
+
   maybe("受理即建行(PUT-vs-WS 竞态根治):无预建行 admitted;ensure PUT 后到 rejected_stale;墓碑/他人行不动", async () => {
     // ① 无预建行(前端 ensure PUT 尚未到达,2026-07-18 线上新会话首条消息必失败根因):
     //    受理事务自建行 → admitted,user 行与 anchorSeq 同事务落地。
@@ -1822,6 +1890,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
     const tapeState = await backend.getTurnTapeStateByDispatch(CUSER, d.dispatchId, 1);
     assert.equal(tapeState.state, "finalized");
     assert.equal(tapeState.status, "completed");
+    assert.equal(tapeState.dispatchLeaseActive, false);
   });
 
   maybe("late tape(§7.9):not_accepted+投影 → 真 tape finalize 同事务撤投影 + manual_reconcile(late_tape)", async () => {

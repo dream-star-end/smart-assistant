@@ -178,7 +178,9 @@ CREATE TABLE turn_dispatch_inbox (
   running → recovery_pending → ①本地 retry queue 有同 dispatch/attempt entry →
   sink_staged;②否则查 master tape/dispatch 终态(none/partial/finalized 三态):
   finalized → terminal;partial → sink_stage_failed+manual(不生成异 hash tape);
-  不可达 → 保持 recovery_pending 重试,禁止推断;none → 构造确定性 synthetic
+  不可达 → 保持 recovery_pending 重试,禁止推断;master 的 tape state 与同租户
+  dispatch lease 由**单条 PG statement 同快照**返回;none+活 lease → 保持
+  recovery_pending(周期 sweep 在 lease 失活后重试),none+失活 lease → 构造确定性 synthetic
   crashed tape(用 inbox 持久化的 turn_key/request_id/created_at/turn_index,
   多次恢复同 tapeId/hash;最小诚实错误记录 {status:'crashed', text:'',
   errorCode:'SERVICE_RESTART', errorDetail:'任务因服务重启中断,未能恢复已生成内容'})
@@ -191,6 +193,10 @@ CREATE TABLE turn_dispatch_inbox (
   containerId)→ private map → strip wire 字段;一切非验签入口(HTTP/cron/
   delegate/本地)无条件 strip;非 webchat-DM channel 即使带字段走 legacy;
 - runtime capability `durable-turn-dispatch-v1`(release metadata + attest)。
+- planned runtime recycle:host 先 arm gateway ingress + SessionManager submit 双内存闸,
+  再查 SQLite 是否仍有 `running` 行;任一活跃/读失败/查询期间 gate TTL 到期均非 200
+  延后回收。重叠握手串行化,后请求不触碰先请求保留的闸;只有双闸仍 armed
+  且 durable running=0 才允许 stale runtime replacement。
 - CCB 引擎:dispatch 身份并入 model-authority envelope 转发至 egress,
   modelAuthorityGate 验签核对(uid/containerId/billingRequestId/dispatchId/
   attemptNo/expiry),proxyBilling settlement 与 usage INSERT 写 dispatch_id/attempt_no。
@@ -229,7 +235,7 @@ CREATE TABLE turn_dispatch_inbox (
 回滚:任一面独立回滚安全(新字段全可选;无 capability → legacy;negative proof
 只在 capability 确认后启用)。
 
-## 7. 故障注入测试清单(Codex PASS 注意项 10,全部行为断言)
+## 7. 故障注入测试清单(全部行为断言)
 
 1. inbox fsync 后 enqueue 前 kill → boot rejected(not_accepted)→ fail-visible;
 2. running 后模型返回前 kill → recovery 协议三态;
@@ -241,11 +247,18 @@ CREATE TABLE turn_dispatch_inbox (
 8. partial tape + 本地 queue entry 丢失 → sink_stage_failed+manual,无异 hash tape;
 9. late true tape → projection 撤销+完整 materialize+manual_reconcile 单事务;
 10. CCB/Codex usage_records 均带 dispatch identity。
+11. planned recycle 在 running/SQLite 失败/gate 查询中到期时均延后,无在飞行才 200;
+12. 真实 1s periodic tick 与首达+重复帧重叠:重复 unmark 不拆首达 live 引用,
+    首 tick 跳过、settle 后次 tick 才收敛;none+活 lease 同样延后 synthetic。
+13. 两个 recycle handshake 重叠:后请求返回 busy 且不释放先请求已受理双闸;
+    双闸 TTL 真到期后才允许新一轮评估。
 
 ## 8. 登记债(诚实权衡)
 
-- master 自动重派 outbox(v1 不做):触发条件=dispatch_lost 告警月频>3 或 boss
-  要求零触达恢复;receipt/attempt/billing_request_id 已铺底。
+- master 自动重派 outbox(v1 不做):planned recycle 已由 drain+短 lease 双闸保护,
+  但真容器/宿主崩溃时已经生成而未 stage 的内容仍只能落确定性 SERVICE_RESTART
+  诚实失败。触发条件=dispatch_lost 告警月频>3 或 boss 要求零触达恢复;
+  receipt/attempt/billing_request_id 已铺底。
 - sink outbox 并入容器 sqlite 单事务(消除跨 durable 面消歧协议):简化债,
   触发条件=boot recovery 消歧协议出现实际误判事故。
 - attach 22-31s 性能(独立批次);codex relay PATH_NOT_ALLOWED(独立批次)。
