@@ -9,6 +9,7 @@
 
 import { chmod, lstat, mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
+import { ConnectorError } from '../connectors/errors.js'
 import type { DnsResolver, PinnedAddress } from '../connectors/outboundPolicy.js'
 import { normalizeHttpsOrigin, resolvePinnedAddress } from '../connectors/outboundPolicy.js'
 import { type BrowserStorageStateV1, validateBrowserStorageState } from './accounts.js'
@@ -193,12 +194,22 @@ export async function resolveManagedBrowserPins(
   const pins: ManagedBrowserPinnedOrigin[] = []
   for (const origin of contract.runtime.network.origins) {
     const url = new URL(origin)
-    let pin: PinnedAddress
-    try {
-      pin = await resolvePinnedAddress(url.hostname, resolver)
-    } catch {
-      throw new ManagedBrowserRuntimeError('DNS_POLICY', 'managed-browser origin DNS is unsafe')
+    let pin: PinnedAddress | null = null
+    for (let attempt = 0; attempt < 3 && pin === null; attempt++) {
+      try {
+        pin = await resolvePinnedAddress(url.hostname, resolver)
+      } catch (error) {
+        const transient =
+          error instanceof ConnectorError &&
+          error.code === 'OUTBOUND_BLOCKED' &&
+          /^dns (?:resolution failed|returned no records)/.test(error.message)
+        if (!transient || attempt === 2)
+          throw new ManagedBrowserRuntimeError('DNS_POLICY', 'managed-browser origin DNS is unsafe')
+        await new Promise((resolveRetry) => setTimeout(resolveRetry, 100))
+      }
     }
+    if (!pin)
+      throw new ManagedBrowserRuntimeError('DNS_POLICY', 'managed-browser origin DNS is unsafe')
     if (pin.family !== 4)
       throw new ManagedBrowserRuntimeError('DNS_POLICY', 'managed-browser v1 requires an IPv4 pin')
     pins.push({

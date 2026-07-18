@@ -404,6 +404,8 @@ import {
 import { KnowledgePlanetSetupManager } from './plugins/knowledgePlanetSetup.js'
 import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutomation.js'
 import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
+import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
+import { WeiboSetupManager } from './plugins/weiboSetup.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
@@ -1372,6 +1374,8 @@ export async function registerCommercial(
   // a mutable tag is never accepted as the worker trust root.
   let knowledgePlanetService: KnowledgePlanetDockerService | undefined
   let knowledgePlanetSetup: KnowledgePlanetSetupManager | undefined
+  let weiboService: WeiboDockerService | undefined
+  let weiboSetup: WeiboSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
@@ -1386,9 +1390,19 @@ export async function registerCommercial(
       socketUid: 1000,
       socketGid: 1000,
     })
-    const registries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
+    weiboService = new WeiboDockerService(pluginDocker, {
+      imageId: cfg.OC_RUNTIME_IMAGE_ID,
+      workerRoot: '/var/lib/openclaude-v5/plugin-workers-weibo',
+      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers-weibo',
+      expectedOwnerUid: 0,
+      socketUid: 1000,
+      socketGid: 1000,
+    })
+    const knowledgePlanetRegistries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
+    const weiboRegistries = createWeiboRuntimeRegistries(weiboService)
     const browserRuntime = new ManagedBrowserRuntime({
-      ...registries,
+      drivers: new Map([...knowledgePlanetRegistries.drivers, ...weiboRegistries.drivers]),
+      launchers: new Map([...knowledgePlanetRegistries.launchers, ...weiboRegistries.launchers]),
       profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
       expectedOwnerUid: 0,
     })
@@ -1398,6 +1412,9 @@ export async function registerCommercial(
       knowledgePlanetMedia: knowledgePlanetMediaDeps,
     })
     knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
+    weiboSetup = new WeiboSetupManager(weiboService, {
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)
@@ -3303,6 +3320,7 @@ export async function registerCommercial(
     directContainerPreview,
     pluginRuntime: pluginFacade,
     knowledgePlanetSetup,
+    weiboSetup,
     knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
@@ -5185,7 +5203,7 @@ export async function registerCommercial(
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
-        await knowledgePlanetSetup?.closeAndDrain()
+        await Promise.all([knowledgePlanetSetup?.closeAndDrain(), weiboSetup?.closeAndDrain()])
       } catch {
         /* ignore */
       }

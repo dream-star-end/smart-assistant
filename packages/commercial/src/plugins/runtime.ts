@@ -42,10 +42,8 @@ import {
   listVerifiedRuntimePluginContracts,
   loadVerifiedRuntimePluginContract,
 } from './review.js'
-import {
-  managedPluginWritePolicy,
-  managedPluginWritePreapprovalPolicy,
-} from './writePolicy.js'
+import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
+import { managedPluginWritePolicy, managedPluginWritePreapprovalPolicy } from './writePolicy.js'
 
 export class PluginRuntimeFacadeError extends Error {
   readonly code:
@@ -887,7 +885,10 @@ export class PluginRuntimeFacade {
         'Plugin does not support account write preapproval',
       )
     if (input.enabled && (input.accepted !== true || input.disclaimerVersion !== policy.version))
-      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'current preapproval disclaimer is required')
+      throw new PluginRuntimeFacadeError(
+        'BAD_REQUEST',
+        'current preapproval disclaimer is required',
+      )
 
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: 15_000,
@@ -898,7 +899,10 @@ export class PluginRuntimeFacade {
         current.verified.artifactHash !== initial.verified.artifactHash ||
         current.verified.execContractHash !== initial.verified.execContractHash
       )
-        throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin changed before preapproval toggle')
+        throw new PluginRuntimeFacadeError(
+          'TARGET_STALE',
+          'Plugin changed before preapproval toggle',
+        )
       await lease.assertHeld()
       const updated = await tx<{
         plugin_write_enabled: boolean
@@ -943,8 +947,8 @@ export class PluginRuntimeFacade {
         })
         if (
           input.enabled &&
-          writeControlFor(current.verified.slug, current.verified.contract.actions, row)?.enabled !==
-            true
+          writeControlFor(current.verified.slug, current.verified.contract.actions, row)
+            ?.enabled !== true
         )
           throw new PluginRuntimeFacadeError(
             'WRITE_DISABLED',
@@ -1158,6 +1162,102 @@ export class PluginRuntimeFacade {
     return prepared
   }
 
+  private async prepareWeiboWriteParams(input: {
+    userId: number
+    targetId: string
+    actionId: string
+    params: Record<string, unknown>
+  }): Promise<Record<string, unknown>> {
+    if (
+      Object.hasOwn(input.params, 'mediaManifest') ||
+      Object.hasOwn(input.params, 'editSnapshot') ||
+      Object.hasOwn(input.params, 'deleteSnapshot')
+    )
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'server-owned Plugin fields are forbidden')
+
+    const prepared: Record<string, unknown> = { ...input.params }
+    if (input.actionId === 'create_post') {
+      const imagePaths = Array.isArray(input.params.images)
+        ? (input.params.images as unknown[]).filter(
+            (value): value is string => typeof value === 'string',
+          )
+        : []
+      if (imagePaths.length > 0) {
+        if (!this.opts.knowledgePlanetMedia)
+          throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin media is unavailable')
+        prepared.mediaManifest = await sealKnowledgePlanetMedia({
+          userId: input.userId,
+          items: imagePaths.map((path) => ({ path, kind: 'image' as const })),
+          deps: this.opts.knowledgePlanetMedia,
+        })
+      } else prepared.mediaManifest = []
+      prepared.text = typeof input.params.text === 'string' ? input.params.text : ''
+      if (String(prepared.text).length === 0 && imagePaths.length === 0)
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin post cannot be empty')
+    }
+
+    if (input.actionId === 'edit_post' || input.actionId === 'delete_post') {
+      const read = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: 'get_post',
+        params: {
+          userId: String(input.params.userId ?? ''),
+          postId: String(input.params.postId ?? ''),
+        },
+      })) as { post?: Record<string, unknown> }
+      const post = read.post
+      const expectedDigest = post?.contentDigest
+      const expectedUserId = String(input.params.userId ?? '')
+      const expectedPostId = String(input.params.postId ?? '')
+      if (
+        !post ||
+        post.userId !== expectedUserId ||
+        post.id !== expectedPostId ||
+        post.owned !== true ||
+        typeof expectedDigest !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(expectedDigest)
+      )
+        throw new PluginRuntimeFacadeError(
+          'BAD_REQUEST',
+          'Plugin owned-post snapshot is unavailable',
+        )
+      const snapshot = { expectedDigest, owned: true }
+      if (input.actionId === 'edit_post') prepared.editSnapshot = snapshot
+      else prepared.deleteSnapshot = snapshot
+    }
+
+    if (input.actionId === 'delete_comment') {
+      const read = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: 'list_comments',
+        params: {
+          userId: String(input.params.userId ?? ''),
+          postId: String(input.params.postId ?? ''),
+          count: 50,
+        },
+      })) as { comments?: Record<string, unknown>[] }
+      const comment = read.comments?.find(
+        (candidate) => candidate.id === String(input.params.commentId ?? ''),
+      )
+      const expectedDigest = comment?.contentDigest
+      if (
+        !comment ||
+        comment.postId !== String(input.params.postId ?? '') ||
+        comment.owned !== true ||
+        typeof expectedDigest !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(expectedDigest)
+      )
+        throw new PluginRuntimeFacadeError(
+          'BAD_REQUEST',
+          'Plugin owned-comment snapshot is unavailable',
+        )
+      prepared.deleteSnapshot = { expectedDigest, owned: true }
+    }
+    return prepared
+  }
+
   async proposeWrite(input: {
     userId: number
     targetId: string
@@ -1190,7 +1290,9 @@ export class PluginRuntimeFacade {
     const sealedParams =
       initial.verified.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG
         ? await this.prepareKnowledgePlanetWriteParams(input)
-        : input.params
+        : initial.verified.slug === WEIBO_PLUGIN_SLUG
+          ? await this.prepareWeiboWriteParams(input)
+          : input.params
 
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: 15_000,
@@ -1349,7 +1451,10 @@ export class PluginRuntimeFacade {
           ? (begun.params.mediaManifest as KnowledgePlanetSealedMedia[])
           : []
         let staged: Awaited<ReturnType<typeof stageKnowledgePlanetMedia>> | null = null
-        if (verified.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG && manifest.length > 0) {
+        if (
+          [KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG].includes(verified.slug) &&
+          manifest.length > 0
+        ) {
           const mediaDeps = this.opts.knowledgePlanetMedia
           if (!mediaDeps)
             throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin media is unavailable')

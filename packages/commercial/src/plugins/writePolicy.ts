@@ -1,4 +1,5 @@
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
+import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
 
 export interface ManagedPluginWritePolicy {
   version: number
@@ -23,16 +24,22 @@ const KNOWLEDGE_PLANET_WRITE_PREAPPROVAL_POLICY: ManagedPluginWritePreapprovalPo
       '开启“免逐次确认”后，当前账号下可使用知识星球 Plugin 的所有 Agent 都能直接发布主题、评论或回复，上传图片和附件，设置点赞状态，完整替换编辑主题，以及永久删除主题、评论或回复，不再逐次向你展示确认卡。该独立授权是对手动写入声明中“每次确认”默认规则的明确例外；内容和互动会立即对相应星球成员可见，删除不可撤销，编辑可能覆盖现有正文或媒体。AI 可能误解你的意图、选错目标、生成错误或不当内容，也可能在短时间内连续执行多次操作。你应确保 Agent 指令、内容、附件和目标合法合规，拥有必要权利并遵守知识星球及所在星球规则。平台仍会执行参数校验、账号锁、媒体完整性校验、编辑或删除前快照复核、加密审计和结果不明确时不自动重试，但这些保护不能替代你的逐次审阅。关闭本开关会阻止尚未开始的新免确认写入；已经进入发送阶段的操作仍可能完成。启用即表示你理解并接受免逐次确认带来的全部风险和最终责任。',
   })
 
+const WEIBO_WRITE_POLICY: ManagedPluginWritePolicy = Object.freeze({
+  version: 1,
+  disclaimerText:
+    '开启后，Plugin 可使用你当前登录的真实微博身份发布文字或图片微博、编辑或永久删除自己的微博、评论或回复、删除自己的评论或回复、转发微博，以及设置点赞和关注状态。这些操作会立即对微博中的相应用户可见，编辑会改变已发布内容，删除不可撤销。你应确保内容真实、合法并拥有文字和图片所需权利，遵守微博社区公约及适用法律，避免泄露隐私或机密信息。AI 可能理解错误、选错目标或生成不当内容；每一次写操作都必须由你在对话确认卡中单独批准，本插件不支持账号级免逐次确认。上游网页没有条件更新版本号，最终复核与点击之间仍可能存在极短竞态窗口。验证码、风控或身份异常会立即停止，系统不会尝试绕过。发送结果不明确时不会自动重试，请先到微博核实，避免重复发布或互动。',
+})
+
 /** A managed-browser Plugin may expose writes only when the platform owns a current policy. */
 export function managedPluginWritePolicy(slug: string): ManagedPluginWritePolicy | null {
-  return slug === KNOWLEDGE_PLANET_PLUGIN_SLUG ? KNOWLEDGE_PLANET_WRITE_POLICY : null
+  if (slug === KNOWLEDGE_PLANET_PLUGIN_SLUG) return KNOWLEDGE_PLANET_WRITE_POLICY
+  if (slug === WEIBO_PLUGIN_SLUG) return WEIBO_WRITE_POLICY
+  return null
 }
 
 /** Independent policy for account-level removal of the per-operation confirmation card. */
 export function managedPluginWritePreapprovalPolicy(
   slug: string,
 ): ManagedPluginWritePreapprovalPolicy | null {
-  return slug === KNOWLEDGE_PLANET_PLUGIN_SLUG
-    ? KNOWLEDGE_PLANET_WRITE_PREAPPROVAL_POLICY
-    : null
+  return slug === KNOWLEDGE_PLANET_PLUGIN_SLUG ? KNOWLEDGE_PLANET_WRITE_PREAPPROVAL_POLICY : null
 }

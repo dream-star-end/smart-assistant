@@ -99,6 +99,15 @@ function deps(overrides: Record<string, unknown> = {}): any {
       qr: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]),
       cancel: async () => ({ sessionId: SESSION, status: 'cancelled' }),
     },
+    weiboSetup: {
+      start: async (userId: number, accepted: boolean) => ({
+        sessionId: SESSION,
+        status: accepted && userId === 42 ? 'waiting_for_scan' : 'failed',
+      }),
+      status: async () => ({ sessionId: SESSION, status: 'finalizing' }),
+      qr: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 2]),
+      cancel: async () => ({ sessionId: SESSION, status: 'cancelled' }),
+    },
     knowledgePlanetAutomation: {
       get: async () => ({
         control: {
@@ -198,6 +207,40 @@ describe('Plugin management HTTP dispatcher', () => {
       ),
       (error: unknown) => error instanceof HttpError && error.status === 400,
     )
+  })
+
+  test('Weibo setup uses the provider-bound manager and a private no-store QR endpoint', async () => {
+    let res = response()
+    await dispatchPluginsRoute(
+      await request('POST', '/api/plugins/weibo/setup', { acceptTerms: true }),
+      res,
+      ctx,
+      deps(),
+    )
+    assert.equal(res.statusCode, 201)
+    assert.deepEqual(res.body, { sessionId: SESSION, status: 'waiting_for_scan' })
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('GET', `/api/plugins/weibo/setup/${SESSION}/qr`),
+      res,
+      ctx,
+      deps(),
+    )
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.headers.get('content-type'), 'image/png')
+    assert.equal(res.headers.get('cache-control'), 'no-store, private')
+    assert.deepEqual([...res.bytes], [137, 80, 78, 71, 13, 10, 26, 10, 2])
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('DELETE', `/api/plugins/weibo/setup/${SESSION}`),
+      res,
+      ctx,
+      deps(),
+    )
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.body, { sessionId: SESSION, status: 'cancelled' })
   })
 
   test('write access requires the exact current consent body and authenticated owner', async () => {

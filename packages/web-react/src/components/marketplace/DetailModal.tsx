@@ -323,8 +323,10 @@ export function DetailModal({
       setInstallResult(result)
       setDone(true)
       onInstalled()
-      if (result.needsAuthorization.includes('knowledge-planet'))
-        onOpenConnectors?.('knowledge-planet')
+      const managedBrowserAuthorization = result.needsAuthorization.find((slug) =>
+        ['knowledge-planet', 'weibo'].includes(slug),
+      )
+      if (managedBrowserAuthorization) onOpenConnectors?.(managedBrowserAuthorization)
     } catch (e) {
       setErr(apiErrorMessage(e, '安装失败'))
     } finally {

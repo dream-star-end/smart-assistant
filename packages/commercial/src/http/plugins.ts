@@ -8,6 +8,8 @@ import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetu
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
+import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
+import { WeiboSetupError } from '../plugins/weiboSetup.js'
 import { requireAuth } from './auth.js'
 import type { CommercialHttpDeps, RequestContext } from './handlers.js'
 import { HttpError, readJsonBody, sendJson } from './util.js'
@@ -15,6 +17,7 @@ import { HttpError, readJsonBody, sendJson } from './util.js'
 export interface PluginHttpDeps {
   pluginRuntime?: PluginRuntimeFacade
   knowledgePlanetSetup?: KnowledgePlanetSetupManager
+  weiboSetup?: WeiboSetupManager
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
 }
 
@@ -25,10 +28,15 @@ function userIdFrom(value: string): number {
   return id
 }
 
-function setupManager(deps: CommercialHttpDeps & PluginHttpDeps): KnowledgePlanetSetupManager {
-  if (!deps.knowledgePlanetSetup)
-    throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
-  return deps.knowledgePlanetSetup
+type ManagedSetupManager = KnowledgePlanetSetupManager | WeiboSetupManager
+
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: 'knowledge-planet' | 'weibo',
+): ManagedSetupManager {
+  const manager = provider === 'knowledge-planet' ? deps.knowledgePlanetSetup : deps.weiboSetup
+  if (!manager) throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+  return manager
 }
 
 function runtime(deps: CommercialHttpDeps & PluginHttpDeps): PluginRuntimeFacade {
@@ -65,16 +73,17 @@ function exactBodyKeys(body: Record<string, unknown>, allowed: readonly string[]
 }
 
 function mapSetupError(error: unknown): never {
-  if (!(error instanceof KnowledgePlanetSetupError)) throw error
+  if (!(error instanceof KnowledgePlanetSetupError) && !(error instanceof WeiboSetupError))
+    throw error
   switch (error.code) {
     case 'NOT_INSTALLED':
-      throw new HttpError(403, error.code, 'Knowledge Planet Plugin is not installed')
+      throw new HttpError(403, error.code, 'Plugin is not installed')
     case 'SETUP_ACTIVE':
     case 'ACCOUNT_ALREADY_EXISTS':
-      throw new HttpError(409, error.code, 'Knowledge Planet account setup conflicts')
+      throw new HttpError(409, error.code, 'Plugin account setup conflicts')
     case 'SETUP_NOT_FOUND':
     case 'QR_NOT_READY':
-      throw new HttpError(404, error.code, 'Knowledge Planet setup not found')
+      throw new HttpError(404, error.code, 'Plugin setup not found')
     case 'TERMS_REQUIRED':
       throw new HttpError(400, error.code, 'terms acceptance is required')
     case 'CAPACITY_EXCEEDED':
@@ -122,9 +131,19 @@ function mapRuntimeError(error: unknown): never {
   throw error
 }
 
-function setupMatch(path: string): { sessionId: string; qr: boolean } | null {
-  const match = /^\/api\/plugins\/knowledge-planet\/setup\/([0-9a-f-]{36})(\/qr)?$/.exec(path)
-  return match ? { sessionId: match[1]!, qr: match[2] === '/qr' } : null
+function setupMatch(
+  path: string,
+): { provider: 'knowledge-planet' | 'weibo'; sessionId: string; qr: boolean } | null {
+  const match = /^\/api\/plugins\/(knowledge-planet|weibo)\/setup\/([0-9a-f-]{36})(\/qr)?$/.exec(
+    path,
+  )
+  return match
+    ? {
+        provider: match[1] as 'knowledge-planet' | 'weibo',
+        sessionId: match[2]!,
+        qr: match[3] === '/qr',
+      }
+    : null
 }
 
 export async function dispatchPluginsRoute(
@@ -144,7 +163,8 @@ export async function dispatchPluginsRoute(
     return
   }
 
-  if (method === 'POST' && path === '/api/plugins/knowledge-planet/setup') {
+  const setupRoot = /^\/api\/plugins\/(knowledge-planet|weibo)\/setup$/.exec(path)
+  if (method === 'POST' && setupRoot) {
     const body = await readJsonBody(req, 1024)
     if (
       body === null ||
@@ -154,7 +174,7 @@ export async function dispatchPluginsRoute(
     )
       throw new HttpError(400, 'BAD_REQUEST', 'body must contain only acceptTerms')
     try {
-      const setup = await setupManager(deps).start(
+      const setup = await setupManager(deps, setupRoot[1] as 'knowledge-planet' | 'weibo').start(
         userId,
         (body as Record<string, unknown>).acceptTerms === true,
       )
@@ -213,8 +233,7 @@ export async function dispatchPluginsRoute(
     }
   }
 
-  const writePreapproval =
-    /^\/api\/plugins\/accounts\/(\d{1,16})\/write-preapproval$/.exec(path)
+  const writePreapproval = /^\/api\/plugins\/accounts\/(\d{1,16})\/write-preapproval$/.exec(path)
   if (writePreapproval && method === 'PATCH') {
     const body = await readJsonBody(req, 2048)
     if (body === null || typeof body !== 'object' || Array.isArray(body))
@@ -295,8 +314,7 @@ export async function dispatchPluginsRoute(
     }
   }
 
-  const automationGroups =
-    /^\/api\/plugins\/accounts\/(\d{1,16})\/automation\/groups$/.exec(path)
+  const automationGroups = /^\/api\/plugins\/accounts\/(\d{1,16})\/automation\/groups$/.exec(path)
   if (automationGroups && method === 'GET') {
     try {
       const groups = await automation(deps).listGroups(userId, automationGroups[1]!)
@@ -472,7 +490,7 @@ export async function dispatchPluginsRoute(
   const match = setupMatch(path)
   if (match && method === 'GET' && match.qr) {
     try {
-      const png = await setupManager(deps).qr(userId, match.sessionId)
+      const png = await setupManager(deps, match.provider).qr(userId, match.sessionId)
       res.statusCode = 200
       res.setHeader('Content-Type', 'image/png')
       res.setHeader('Content-Length', String(png.length))
@@ -487,7 +505,7 @@ export async function dispatchPluginsRoute(
   }
   if (match && method === 'GET' && !match.qr) {
     try {
-      sendJson(res, 200, await setupManager(deps).status(userId, match.sessionId))
+      sendJson(res, 200, await setupManager(deps, match.provider).status(userId, match.sessionId))
       return
     } catch (error) {
       mapSetupError(error)
@@ -495,7 +513,7 @@ export async function dispatchPluginsRoute(
   }
   if (match && method === 'DELETE' && !match.qr) {
     try {
-      sendJson(res, 200, await setupManager(deps).cancel(userId, match.sessionId))
+      sendJson(res, 200, await setupManager(deps, match.provider).cancel(userId, match.sessionId))
       return
     } catch (error) {
       mapSetupError(error)
