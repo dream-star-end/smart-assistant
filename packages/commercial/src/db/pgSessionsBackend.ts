@@ -470,6 +470,20 @@ async function pgAppendServerAuthoredCore(
   return { applied: true, seq: seqOfMessage(tail, message.id) };
 }
 
+/**
+ * Transaction-aware seam for prompt-queue activation. Queue state and the
+ * corresponding user transcript row must commit or roll back together.
+ * Ordinary callers should continue using the backend facade methods below.
+ */
+export async function appendPromptQueueUserMessageInTransaction(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  message: MessageLike & { id: string; role: "user" },
+): Promise<ServerAuthoredAppendResult> {
+  return pgAppendServerAuthoredCore(client, sessionId, userId, message);
+}
+
 // ── wechat_bindings 行 → 领域对象(复刻 storage/wechatBindings.ts 的私有 rowToBinding;
 //    storage 本批冻结,helper 未导出,故此处复制。逻辑简单稳定,已在交接清单登记)。────
 const IM_WECHAT_SUFFIX = "@im.wechat";

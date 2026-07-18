@@ -32,12 +32,33 @@ import {
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { createLogger } from '../logger.js'
+import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
+import { turnErrorSemantics } from '@openclaude/protocol'
 import type { CollabAgentPolicy } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
 const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
+
+// ── turn/start 窄路径自动重试(turn-retry 批,2026-07-18)──────────────────
+// 只重试 **turn/start 请求本身被拒**的窄路径(app-server 明确 JSON-RPC application
+// error + retryable 语义 + 本 attempt 零可观测输出/零 usage/零终态帧)。**status=
+// 'failed' 一律不重试**:实测②——failed 后 user input 已落 thread(rollout
+// response_item 在 API 调用前落盘且不回滚),重发 turn/start 会重复 user input。
+const RETRY_MAX_ATTEMPTS = 3
+/** 第 N 次失败后、第 N+1 次尝试前的基础退避(index = 失败的 attempt 序号 − 1)。 */
+const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
+const RETRY_JITTER_MS = 500
+
+/** 自动重试侧信道载荷(不进 tape)。字段与 protocol frames.ts OutboundTurnStatus
+ *  的 retrying 分支 / ccbMessageParser TurnRetryMeta 逐字段对齐。 */
+interface TurnRetryMeta {
+  attempt: number
+  max: number
+  delayMs: number
+  retryAt: number
+}
 
 function runnerShutdownTimeoutMs(name: string, fallback: number): number {
   const raw = Number(process.env[name])
@@ -182,6 +203,27 @@ interface QueuedTurn {
    *  一 closure 拿,不读 instance 字段。 */
   requestId?: string
   collabAgentPolicy?: CollabAgentPolicy
+  queueTurn?: boolean
+}
+
+export class PromptQueueRunnerInvariantError extends Error {
+  readonly code = 'PROMPT_QUEUE_RUNNER_INVARIANT'
+  constructor(message: string) {
+    super(message)
+    this.name = 'PromptQueueRunnerInvariantError'
+  }
+}
+
+export function assertPromptQueueRunnerAdmission(
+  queueTurn: boolean,
+  processing: boolean,
+  queuedTurns: number,
+): void {
+  if (queueTurn && (processing || queuedTurns > 0)) {
+    throw new PromptQueueRunnerInvariantError(
+      `queue turn cannot enter Codex runner backlog (processing=${processing}, queued=${queuedTurns})`,
+    )
+  }
 }
 
 interface PendingRequest {
@@ -450,6 +492,11 @@ interface RunnerMessage {
   /** Billing-only stable terminal classification. Unlike stop_reason this
    * distinguishes an explicit user interrupt from process/deploy shutdown. */
   billing_terminal_code?: 'USER_CANCELLED' | 'CODEX_ERROR'
+  /** turn-retry 批 — runner 现场对 error 文本做的结构化分类(gateway 共享
+   *  classifyRunError,非 'unknown' 才带)。ccbMessageParser / server 据此派生
+   *  outbound.error.code(权威语义在 protocol turnErrorTaxonomy)。仅 is_error
+   *  result 帧带。 */
+  errorClass?: ClassifiedErrorCode
   event?: unknown
 }
 
@@ -944,7 +991,13 @@ export class CodexAppServerRunner extends EventEmitter {
    *  before sending `turn/start`, resolved by handleNotification on
    *  `turn/completed` for the matching turnId. */
   private currentTurnCompleter: {
-    resolve: (turn: { status?: string; durationMs?: number; error?: { message?: string } }) => void
+    resolve: (turn: {
+      status?: string
+      durationMs?: number
+      /** turn-retry 批 — codex turn/completed 的 turn.error 除 message 外还带
+       *  codexErrorInfo(实测值形如 "other");透传进内部日志,不进用户面。 */
+      error?: { message?: string; codexErrorInfo?: unknown }
+    }) => void
     reject: (err: Error) => void
   } | null = null
   /** Request id of the currently executing paid turn. Needed to settle usage
@@ -983,6 +1036,26 @@ export class CodexAppServerRunner extends EventEmitter {
    *  by emitResult on turn/completed; null if no token notifications were
    *  received this turn (codex bug or zero-LLM turn). */
   private currentTurnUsage: CodexTokenBreakdown | null = null
+  // ── turn-retry 批:per-attempt 台账(单调 flags,fail-closed 重试门)──────
+  /** 本 attempt 是否已越过任一对外「可观测输出」边界(assistant text / thinking /
+   *  reasoning delta、plan/goal 块)。任一置位 → turn/start 窄路径重试禁止(重试
+   *  会重复已展示内容)。resetAttemptState 复位。 */
+  private attemptHadObservableOutput = false
+  /** 本 attempt 是否已越过任一 tool_use / tool_result / permission(requestUserInput)/
+   *  item handler 注册边界。置位 → 重试禁止。resetAttemptState 复位。 */
+  private attemptHadToolOrPermission = false
+  /** 本 attempt 是否已 emit 过任一 billing/result 终态帧(emitResult / 强制关停)。
+   *  置位 → 重试禁止(已记账,重发会二次 settle)。resetAttemptState 复位。 */
+  private attemptEmittedTerminal = false
+  /** 退避 sleep 的中断句柄。非空 = 正处于 turn/start 重试退避窗口;interrupt() 在此
+   *  期间(activeTurnId 为 null)也接受,abort 后 runTurn 走 USER_CANCELLED 终态。 */
+  private pendingRetryAbort: AbortController | null = null
+  /** 审计 R8 — 本次退避窗口内 proc 是否已经崩溃/关闭。proc close/error 回调唤醒退避
+   *  时置位;runTurn 的 proc-gone 门据此把终态判为 crashed(而非 interrupt 的
+   *  USER_CANCELLED)。close 已把 proc 置 null(门的 `!this.proc` 分支即可命中),
+   *  但 error 早于 close 且刻意不清 proc(留到 close 收尾以吸收晚到 stdout),故需要
+   *  这个独立标记让 error 唤醒的退避也走 proc-gone 终态。安装每个退避控制器时复位。 */
+  private retryBackoffProcGone = false
   /** Issue A v1.0.108 — 最新 codex `account/rateLimits/updated` 快照,piggy-back
    *  到下一个 emitResult。**故意不在 turn 边界 clear**:让 init 阶段 / 上一 turn
    *  完成后 / 任意时刻收到的最新值粘住。
@@ -1334,6 +1407,14 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   interrupt(): boolean {
+    // 审计 R8:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,runTurn 的
+    // backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清 retrying 状态帧。
+    // **必须先于 proc 存活守卫**:proc 已死但退避 sleep 仍在跑时(如 crash 与 close
+    // 之间的窗口),用户 stop 也要能立即中断退避,否则要等满退避才收尾。
+    if (this.pendingRetryAbort) {
+      this.pendingRetryAbort.abort()
+      return true
+    }
     if (!this.proc || this.proc.killed) return false
     if (!this.threadId || !this.activeTurnId) return false
     void this.sendRequest('turn/interrupt', {
@@ -1350,6 +1431,17 @@ export class CodexAppServerRunner extends EventEmitter {
       })
     })
     return true
+  }
+
+  /** 审计 R8 — proc 在 turn/start 重试退避窗口内崩溃/关闭时唤醒退避 sleep,让 runTurn
+   *  的 proc-gone 门立即转 crashed 终态(不再等满退避)。非退避期(pendingRetryAbort
+   *  为 null)是 no-op;置 retryBackoffProcGone 与 interrupt 的用户取消路径区分终态。
+   *  幂等(AbortController.abort 幂等)。proc close/error 回调各调用一次。 */
+  private wakeRetryBackoffOnProcGone(): void {
+    if (this.pendingRetryAbort) {
+      this.retryBackoffProcGone = true
+      this.pendingRetryAbort.abort()
+    }
   }
 
   constructor(private opts: CodexAppServerRunnerOpts) {
@@ -1459,6 +1551,7 @@ export class CodexAppServerRunner extends EventEmitter {
     /** PR2 v1.0.66 — 见 QueuedTurn.requestId 注释。 */
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
+    queueTurn = false,
   ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
@@ -1466,8 +1559,9 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emit('spawn', { resumed: this.threadId != null })
     }
     const prompt = normalisePrompt(textOrBlocks)
+    assertPromptQueueRunnerAdmission(queueTurn, this.processing, this.queue.length)
     return new Promise((resolve, reject) => {
-      this.queue.push({ prompt, resolve, reject, requestId, collabAgentPolicy })
+      this.queue.push({ prompt, resolve, reject, requestId, collabAgentPolicy, queueTurn })
       void this.drain()
     })
   }
@@ -1477,6 +1571,13 @@ export class CodexAppServerRunner extends EventEmitter {
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
     this.shuttingDown = true
+    // turn-retry 批:若正卡在 turn/start 重试退避,唤醒它(abortableDelay 立即返回)。
+    // runTurn 的退避后 proc-gone 门会据 shuttingDown 转终态,不把 turn/start 发进
+    // 即将被 kill 的管道(否则 sendRequest 无人 settle → 挂死)。
+    if (this.pendingRetryAbort) {
+      this.pendingRetryAbort.abort()
+      this.pendingRetryAbort = null
+    }
     const pendingQueue = this.queue
     this.queue = []
     for (const q of pendingQueue) q.reject(new Error('CodexAppServerRunner shutdown'))
@@ -1746,6 +1847,10 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       log.error('codex app-server proc error', { err: err.message })
       this.emit('error', err)
+      // 审计 R8:proc 在 turn/start 重试退避窗口内出错 → 唤醒退避,让 runTurn 立即转
+      // crashed 终态(retryBackoffProcGone,不误判 USER_CANCELLED)。error 刻意不清
+      // this.proc(晚到 stdout 留到 close 收尾),故 proc-gone 门靠标记而非 `!this.proc`。
+      this.wakeRetryBackoffOnProcGone()
       // `error` can precede `close`. Keep the exact process identity, pending
       // turn, and partial JSON line alive until the stdio-drained close
       // boundary; otherwise late paid output is silently discarded.
@@ -1783,6 +1888,10 @@ export class CodexAppServerRunner extends EventEmitter {
       const closeReason = `codex app-server exited code=${code} signal=${signal ?? ''}`
       if (wasShutdown) this.emitForcedShutdownResult(closeReason)
       this.failAllPending(closeReason)
+      // 审计 R8:proc 关闭时唤醒仍在跑的退避 sleep,让 runTurn 立即转终态(否则要等满
+      // 退避才命中下面 proc=null 的 proc-gone 门)。shutdown 路径已在 shutdown() 里 abort
+      // 过(幂等);crash 路径这里是唯一唤醒点。
+      this.wakeRetryBackoffOnProcGone()
       this.proc = null
       this.spawnedProviderSignature = null
       this.initialized = false
@@ -2088,6 +2197,8 @@ export class CodexAppServerRunner extends EventEmitter {
     })
     this.pendingUserInputIdsByRpc.set(rpcKey, requestId)
 
+    // turn-retry 台账:permission / requestUserInput 请求是对外 emit 边界 → 置位。
+    this.attemptHadToolOrPermission = true
     // Reuse the exact CCB parser ingress. CcbMessageParser converts this
     // synthetic control_request into the canonical permission_request event,
     // so no Codex-specific frame or frontend card is introduced.
@@ -2174,6 +2285,28 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       const autoApproval = this.buildServerRequestAutoApproval(msg.method, msg.params)
       if (autoApproval !== null) {
+        // 审计 R2 — 自动批准 = 对当前 thread 的权限/命令/文件副作用,是本 attempt
+        // 的对外 emit 边界。**必须在写批准响应之前**单调置位台账 flag:同一 stdout
+        // chunk 内的 reverse-RPC 可能先于 turn/start 的 Promise resolve 到达,若不在此
+        // 记账,后续 turn/start application error 时重试门会误判"零权限副作用"而重发,
+        // 造成已批准的副作用重复执行。与 handleRequestUserInput 的记账点对称。
+        this.attemptHadToolOrPermission = true
+        // 若该 reverse-RPC 携带 turnId 且本 attempt 尚未 adopt(activeTurnId===null)
+        // 且 turn 在飞(currentTurnCompleter),提前 adopt —— 与 handleRequestUserInput /
+        // handleNotification 的 early-turn adoption 同语义,让重试门的 activeTurnId
+        // 守卫也一并 fail-closed(双重封死),并把后继 turn/completed 清理正确定界。
+        const approvalTurnId =
+          msg.params && typeof msg.params === 'object'
+            ? (msg.params as Record<string, unknown>).turnId
+            : undefined
+        if (
+          typeof approvalTurnId === 'string' &&
+          approvalTurnId.length > 0 &&
+          this.activeTurnId === null &&
+          this.currentTurnCompleter
+        ) {
+          this.activeTurnId = approvalTurnId
+        }
         log.info('codex app-server server request auto-approved', {
           sessionKey: this.opts.sessionKey,
           method: msg.method,
@@ -2203,6 +2336,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // key made separate turns fight over one card and made multi-client
     // persistence preserve duplicate random-id plan rows.
     const planBlockId = `codex-plan-${this.activeTurnId ?? 'pending'}`
+    // turn-retry 台账:plan 块是对外可观测输出边界 → 置位。
+    this.attemptHadObservableOutput = true
     this.emit('message', {
       type: 'openclaude_plan',
       session_id: this.threadId,
@@ -2214,6 +2349,8 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private emitGoalBlock(goal: CodexGoalBlock): void {
+    // turn-retry 台账:goal 块是对外可观测输出边界 → 置位。
+    this.attemptHadObservableOutput = true
     const platformGoal = this.syncedPlatformGoal
     this.emit('message', {
       type: 'openclaude_goal',
@@ -2315,6 +2452,8 @@ export class CodexAppServerRunner extends EventEmitter {
     if (method === 'item/agentMessage/delta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
+      // turn-retry 台账:assistant 正文 delta 是对外可观测输出边界 → 置位。
+      this.attemptHadObservableOutput = true
       this.currentAssistantBuf += delta
       this.emit('message', {
         type: 'stream_event',
@@ -2369,6 +2508,8 @@ export class CodexAppServerRunner extends EventEmitter {
     if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
+      // turn-retry 台账:reasoning/thinking delta 是对外可观测输出边界 → 置位。
+      this.attemptHadObservableOutput = true
       const itemId = typeof p.itemId === 'string' ? p.itemId : ''
       if (itemId) {
         const st = this.reasoningItemState.get(itemId) ?? { sawContent: false }
@@ -2396,6 +2537,8 @@ export class CodexAppServerRunner extends EventEmitter {
         this.reasoningItemState.set(itemId, st)
         return
       }
+      // turn-retry 台账:summary part boundary(💭 段落分隔)也是对外输出 → 置位。
+      this.attemptHadObservableOutput = true
       this.emit('message', {
         type: 'stream_event',
         session_id: this.threadId,
@@ -2455,11 +2598,18 @@ export class CodexAppServerRunner extends EventEmitter {
         .finally(() => {
           this.inflightItemHandlers.delete(handler)
         })
+      // turn-retry 台账:item handler 注册即代表本 attempt 已产出工具/输出侧效果
+      // (handler 内部 emitToolResult / text_delta 也会置位,但注册点先于其异步体
+      // 执行 —— 提前置位保证 fail-closed,即便 handler 尚未 flush)。
+      this.attemptHadToolOrPermission = true
       this.inflightItemHandlers.add(handler)
       return
     }
     if (method === 'turn/completed') {
-      // Per schema: { threadId, turn: { id, status, durationMs, error? } }
+      // Per schema: { threadId, turn: { id, status, durationMs, error? } }.
+      // turn-retry 批:turn.error 除 message 外还带 codexErrorInfo(实测值形如
+      // "other");这里把整个 turn(含 error 全字段)wholesale 透传给 completer,
+      // runTurn 的 failed 分支据此读 codexErrorInfo 进内部日志(不进用户面)。
       const turn = p.turn as Record<string, unknown> | undefined
       if (!turn) return
       // Defensive: even though we already filtered turnId above (via top-level
@@ -2960,6 +3110,134 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emit('session_id', tid)
   }
 
+  /** turn-retry 批 — 每个 attempt 起点集中复位 per-attempt 态。**保留
+   *  priorTurnTotal**(跨 attempt/turn 的累计基线)。activeTurnTotal 先断言 delta
+   *  为零再清(重试路径下 turn/start 被拒前不可能有 tokenUsage 通知);非零=底座
+   *  异常,promote 而非丢弃,防漏账。pendingUserInputs 断言空(串行 runner 不变量)。 */
+  private resetAttemptState(): void {
+    if (this.pendingUserInputs.size > 0) {
+      // 到达 attempt 起点仍有挂起 reverse-request → 违反串行 runner 不变量。settle
+      // 掉(no-answer)后再继续,绝不带进新 attempt。
+      log.error('resetAttemptState: pendingUserInputs not empty at attempt boundary', {
+        sessionKey: this.opts.sessionKey,
+        count: this.pendingUserInputs.size,
+      })
+      this.settleAllPendingUserInputs('attempt reset')
+    }
+    if (this.activeTurnTotal !== null) {
+      const delta = _subtractTokenBreakdown(
+        this.activeTurnTotal,
+        this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN,
+      )
+      if (!this._isZeroBreakdown(delta)) {
+        // 理论不可达(重试门已保证零 usage);真发生则 promote 到 priorTurnTotal 保账,
+        // 不静默丢。
+        log.error('resetAttemptState: non-zero usage delta at attempt boundary — promoting', {
+          sessionKey: this.opts.sessionKey,
+          delta,
+        })
+        this.priorTurnTotal = this.activeTurnTotal
+      }
+      this.activeTurnTotal = null
+    }
+    this.currentTurnCompleter = null
+    this.activeTurnId = null
+    this.currentAssistantBuf = ''
+    this.currentPlanDraft = ''
+    this.reasoningItemState.clear()
+    this.emittedToolUseIds.clear()
+    this.inflightItemHandlers.clear()
+    this.collabReceiverToSpawnId.clear()
+    this.collabSpawnReceivers.clear()
+    this.completedCollabSpawnResults.clear()
+    this.currentTurnUsage = null
+    this.attemptHadObservableOutput = false
+    this.attemptHadToolOrPermission = false
+    this.attemptEmittedTerminal = false
+  }
+
+  private _isZeroBreakdown(b: CodexTokenBreakdown): boolean {
+    return (
+      b.totalTokens === 0 &&
+      b.inputTokens === 0 &&
+      b.outputTokens === 0 &&
+      b.cachedInputTokens === 0 &&
+      b.reasoningOutputTokens === 0
+    )
+  }
+
+  /** consumeActiveTurnUsage 口径下,本 attempt 是否零 usage —— **不 consume**
+   *  (不 promote priorTurnTotal),仅 peek,供重试门判定。 */
+  private activeAttemptUsageIsZero(): boolean {
+    if (this.activeTurnTotal === null) return true
+    const delta = _subtractTokenBreakdown(
+      this.activeTurnTotal,
+      this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN,
+    )
+    return this._isZeroBreakdown(delta)
+  }
+
+  /** 退避基础延迟(index = 失败的 attempt 序号 − 1)+ 0..RETRY_JITTER_MS 抖动。
+   *  抽成方法便于测试 override(与既有 ensureSpawned/sendRequest override 同模式)。 */
+  private computeRetryDelayMs(failedAttempt: number): number {
+    const base =
+      RETRY_BACKOFFS_MS[failedAttempt - 1] ?? RETRY_BACKOFFS_MS[RETRY_BACKOFFS_MS.length - 1]
+    return base + Math.floor(Math.random() * (RETRY_JITTER_MS + 1))
+  }
+
+  /** 可中断退避 sleep。resolve(true)=被 interrupt() abort;resolve(false)=正常睡满。 */
+  private abortableDelay(ms: number, signal: AbortSignal): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      if (signal.aborted) {
+        resolve(true)
+        return
+      }
+      const onAbort = () => {
+        clearTimeout(timer)
+        resolve(true)
+      }
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(false)
+      }, ms)
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  /** turn/start 窄路径自动重试门。**全部**满足才允许重试(fail-closed):
+   *   1. 还有重试额度(failedAttempt < RETRY_MAX_ATTEMPTS,共 3 attempt);
+   *   2. err 是明确的 JSON-RPC application error(有 rpcCode/rpcMessage 且
+   *      rpcMethod==='turn/start');transport 断连/进程 exit/超时形状(裸 Error,
+   *      无 rpcCode)一律不算;
+   *   3. app-server 子进程仍存活;
+   *   4. 未获得/未 adopt 任何 turnId(activeTurnId 为 null)且 completer 未被任何
+   *      提前到达的 turn 通知 settle(currentTurnCompleter 非空)——任一破坏 = 结局
+   *      未知,不重试;
+   *   5. classifyRunError(rpcMessage) 命中 retryable 语义(turnErrorSemantics);
+   *   6. 本 attempt 两台账 flag 均 false、usage 为零、未 emit 过终态帧;
+   *   7. pendingUserInputs 为空(非空 = 违反门,放弃重试走终态,不静默清)。 */
+  private shouldRetryTurnStart(err: unknown, failedAttempt: number): boolean {
+    if (failedAttempt >= RETRY_MAX_ATTEMPTS) return false
+    const e = err as Partial<JsonRpcCallError> | null | undefined
+    if (
+      !e ||
+      typeof e.rpcCode !== 'number' ||
+      typeof e.rpcMessage !== 'string' ||
+      e.rpcMethod !== 'turn/start'
+    ) {
+      return false
+    }
+    if (!this.proc || this.proc.killed) return false
+    if (this.activeTurnId !== null) return false
+    if (this.currentTurnCompleter === null) return false
+    if (!turnErrorSemantics(classifyRunError(e.rpcMessage).code).retryable) return false
+    if (this.attemptHadObservableOutput || this.attemptHadToolOrPermission) return false
+    if (this.attemptEmittedTerminal) return false
+    if (!this.activeAttemptUsageIsZero()) return false
+    if (this.pendingUserInputs.size > 0) return false
+    return true
+  }
+
   private async runTurn(
     prompt: string,
     requestId?: string,
@@ -2984,31 +3262,15 @@ export class CodexAppServerRunner extends EventEmitter {
       effectiveCwd,
       repoBound: this._boundRepoBinding != null,
     })
-    this.currentAssistantBuf = ''
-    this.currentPlanDraft = ''
-    // Per-item reasoning state is turn-scoped (codex re-assigns itemIds each
-    // turn) — clear at turn-start so the summary/mode lock and first-part
-    // skip flag don't bleed across turns.
-    this.reasoningItemState.clear()
-    // Per-turn tool_use/tool_result 配对台账:codex 每 turn 重排 item id,turn 起点
-    // 清空,避免跨 turn 泄漏 / 与新 turn 复用的 id 撞车漏发补配的 tool_use。
-    this.emittedToolUseIds.clear()
-    // Collaboration receiver ids are scoped to the current Codex turn's
-    // spawn/wait control items. Clear them up front so a recycled runner does
-    // not close a stale Agent card from a previous turn when receiver thread
-    // ids happen to repeat in later protocol frames.
-    this.collabReceiverToSpawnId.clear()
-    this.collabSpawnReceivers.clear()
-    this.completedCollabSpawnResults.clear()
-    // Per-turn token state: cleared at turn-start so a partial state from a
-    // crashed prior turn never bleeds into this turn's billing. priorTurnTotal
-    // is intentionally NOT cleared — it's the cumulative-thread baseline that
-    // must persist across turns. activeTurnTotal/currentTurnUsage are
-    // refreshed by `thread/tokenUsage/updated` notifications during the turn.
-    this.activeTurnTotal = null
-    this.currentTurnUsage = null
+    // Per-attempt 态(currentAssistantBuf / currentPlanDraft / reasoningItemState /
+    // emittedToolUseIds / collab maps / activeTurnTotal / currentTurnUsage / 三个
+    // 台账 flag)的复位统一交给 resetAttemptState(在每个 attempt 起点调用)。
+    // priorTurnTotal 跨 turn 保留(累计基线),不在此清。这里只做 turn 级一次性准备。
     this.currentCollabAgentPolicy = collabAgentPolicy
 
+    // turn-retry 批:失败次数计数(1 = 首次尝试)。仅 turn/start 请求被拒的窄路径
+    // 允许递增(见 shouldRetryTurnStart);status='failed' 等一切 turn 内失败均不重试。
+    let attempt = 1
     try {
       if (
         this.proc &&
@@ -3084,130 +3346,226 @@ export class CodexAppServerRunner extends EventEmitter {
 
       await this.syncPlatformGoal()
 
-      // Set up the completion box BEFORE turn/start so a fast turn/completed
-      // notification (rare but possible) doesn't slip past us.
-      const completed = new Promise<{
-        status?: string
-        durationMs?: number
-        error?: { message?: string }
-      }>((resolve, reject) => {
-        this.currentTurnCompleter = { resolve, reject }
-      })
+      // ── attempt 循环 ──────────────────────────────────────────────────
+      // 仅「turn/start 请求本身被拒」的窄路径可循环重试(shouldRetryTurnStart 门)。
+      // 一旦 turn/start 成功返回 turn.id,turn 进入执行,后续任何失败(status=
+      // 'failed'/interrupted/异常)都**不**在此循环内重试 —— 直接 return 或抛给外
+      // 层 catch 走终态(实测②:turn 一旦开始,user input 已落 thread,重发会重复)。
+      for (;;) {
+        // 每个 attempt 起点集中复位 per-attempt 态(见 resetAttemptState)。
+        this.resetAttemptState()
 
-      const tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
-        | { turn?: { id?: string } }
-        | undefined
-      const turnId = tres?.turn?.id
-      if (typeof turnId !== 'string' || !turnId) {
-        throw new Error('turn/start did not return turn.id')
-      }
-      this.activeTurnId = turnId
+        // Set up the completion box BEFORE turn/start so a fast turn/completed
+        // notification (rare but possible) doesn't slip past us.
+        const completed = new Promise<{
+          status?: string
+          durationMs?: number
+          error?: { message?: string; codexErrorInfo?: unknown }
+        }>((resolve, reject) => {
+          this.currentTurnCompleter = { resolve, reject }
+        })
 
-      const turn = await completed
-
-      // Drain any in-flight item-completed handlers (e.g. imageGeneration's
-      // base64 decode + writeFile, copyImagePathsToPublicDir for savedPath)
-      // that are still pending. codex emits item/completed before
-      // turn/completed, so by the time `await completed` resolves all of
-      // this turn's item handlers are already registered in the Set —
-      // a single snapshot Promise.allSettled is sufficient (no loop). Without
-      // this, currentAssistantBuf may snapshot empty for emitResult, and
-      // the handler's text_delta / tool_result frames arrive AFTER the
-      // result frame, by which point ccbMessageParser has already finalized
-      // and the frontend drops or mis-orders them.
-      if (this.inflightItemHandlers.size > 0) {
-        await Promise.allSettled([...this.inflightItemHandlers])
-      }
-
-      this.activeTurnId = null
-
-      const durationMs = Date.now() - startedAt
-      const status = turn?.status
-      // Compute per-turn usage delta from the most recent
-      // thread/tokenUsage/updated snapshot we observed during this turn.
-      // If codex never emitted one (e.g. an empty/no-LLM turn or a cancelled
-      // turn before the first call settled), fall through with usage=undefined.
-      const turnUsage = this.consumeActiveTurnUsage()
-      log.info('codex app-server turn end', {
-        sessionKey: this.opts.sessionKey,
-        status,
-        durationMs,
-        assistantChars: this.currentAssistantBuf.length,
-        ...(turnUsage
-          ? {
-              inputTokens: turnUsage.inputTokens,
-              outputTokens: turnUsage.outputTokens,
-              cachedInputTokens: turnUsage.cachedInputTokens,
-              reasoningOutputTokens: turnUsage.reasoningOutputTokens,
+        let tres: { turn?: { id?: string } } | undefined
+        try {
+          tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
+            | { turn?: { id?: string } }
+            | undefined
+        } catch (startErr) {
+          if (this.shouldRetryTurnStart(startErr, attempt)) {
+            // 本 attempt 的 completed promise 就此放弃(无人 await)。必须立即
+            // 解除 completer 并挂 no-op catch:否则退避期间 close-only 路径
+            // (close → failAllPending)会 reject 一个无人接的 Promise →
+            // unhandled rejection(gateway 无全局守卫,Node 默认可升级为进程
+            // 退出,codex 子进程崩溃就此放大成整个 gateway 退出)。
+            this.currentTurnCompleter = null
+            void completed.catch(() => {})
+            const nextAttempt = attempt + 1
+            const delayMs = this.computeRetryDelayMs(attempt)
+            const cls = classifyRunError((startErr as JsonRpcCallError).rpcMessage).code
+            log.warn('codex turn/start rejected — auto-retrying (narrow path)', {
+              sessionKey: this.opts.sessionKey,
+              attempt,
+              nextAttempt,
+              delayMs,
+              errorClass: cls,
+              rpcCode: (startErr as JsonRpcCallError).rpcCode,
+            })
+            // 排定重试:进入退避前发 retrying 侧信道帧;所有退出路径(成功进入下一
+            // attempt / interrupt / 异常)经 finally 保证清 status:null,且在 turn/start
+            // 重发**前**清(不等 final)。
+            this.emitRetryingStatus({
+              attempt: nextAttempt,
+              max: RETRY_MAX_ATTEMPTS,
+              delayMs,
+              retryAt: Date.now() + delayMs,
+            })
+            const controller = new AbortController()
+            this.pendingRetryAbort = controller
+            // 审计 R8:每个退避窗口起点复位 proc-gone 标记(仅本窗口内 close/error 置位)。
+            this.retryBackoffProcGone = false
+            let interruptedDuringBackoff = false
+            try {
+              interruptedDuringBackoff = await this.abortableDelay(delayMs, controller.signal)
+            } finally {
+              this.pendingRetryAbort = null
+              this.emitTurnStatus(null)
             }
-          : {}),
-      })
+            // proc 在退避期间消失(crash close 置 proc=null / error 唤醒置
+            // retryBackoffProcGone / shutdown kill)→ 绝不把 turn/start 重发进死管道
+            // (writeRaw 静默失败、pending 无人 settle → runTurn 挂死)。转外层 catch
+            // 走终态(parser finalized 会与可能的 forced result 去重)。必须先于
+            // interrupt 判定:shutdown abort 与 proc-gone 唤醒的退避都走这里,不误报成
+            // USER_CANCELLED。审计 R8:retryBackoffProcGone 捕获 error 早于 close(proc
+            // 尚未置 null)的窗口,让其也判为 crashed 而非用户取消。
+            if (!this.proc || this.proc.killed || this.shuttingDown || this.retryBackoffProcGone) {
+              throw new Error('codex app-server gone during retry backoff')
+            }
+            if (interruptedDuringBackoff) {
+              // 用户在退避窗口内 interrupt():终止后继 attempt,走 USER_CANCELLED 终态
+              // (载荷对齐既有 interrupted 分支)。此路径无 turn 执行 → 无 partial usage。
+              this.activeTurnId = null
+              this.currentTurnCompleter = null
+              const cancelUsage = this.consumeActiveTurnUsage()
+              this.emitResult({
+                durationMs: Date.now() - startedAt,
+                ok: false,
+                error: 'codex turn interrupted',
+                usage: cancelUsage ? _codexUsageToAnthropicShape(cancelUsage) : undefined,
+                requestId,
+                rateLimits: this._consumeRateLimitsForEmit(),
+                stopReason: 'interrupted',
+                terminalCode: 'USER_CANCELLED',
+              })
+              return
+            }
+            attempt = nextAttempt
+            continue
+          }
+          // 不满足重试门 → 抛给外层 catch 走终态(fail closed)。
+          throw startErr
+        }
 
-      const usagePayload = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
-      // Issue A v1.0.108 — snapshot 当前最新已知 rateLimits piggy-back 到 billing 帧。
-      // **故意不 clear** this.latestRateLimits:让快照粘在 runner instance 上,后到
-      // notification 也能被下一 turn 带出。
-      // round-2 dedup(Codex review NEEDS-FIX 2):若与上次真正发出的快照相等(JSON 序列化对比),
-      // 则不带 rateLimits — 避免下游 quota.ts 在 30s throttle 过期后把同一份旧值再写一次,
-      // 把 quota_updated_at 假刷新成 NOW 误导 admin UI 以为 Codex 刚观测过。
-      const rateLimitsPayload = this._consumeRateLimitsForEmit()
+        const turnId = tres?.turn?.id
+        if (typeof turnId !== 'string' || !turnId) {
+          throw new Error('turn/start did not return turn.id')
+        }
+        this.activeTurnId = turnId
 
-      if (status === 'completed') {
-        this.emitResult({
+        const turn = await completed
+
+        // Drain any in-flight item-completed handlers (e.g. imageGeneration's
+        // base64 decode + writeFile, copyImagePathsToPublicDir for savedPath)
+        // that are still pending. codex emits item/completed before
+        // turn/completed, so by the time `await completed` resolves all of
+        // this turn's item handlers are already registered in the Set —
+        // a single snapshot Promise.allSettled is sufficient (no loop). Without
+        // this, currentAssistantBuf may snapshot empty for emitResult, and
+        // the handler's text_delta / tool_result frames arrive AFTER the
+        // result frame, by which point ccbMessageParser has already finalized
+        // and the frontend drops or mis-orders them.
+        if (this.inflightItemHandlers.size > 0) {
+          await Promise.allSettled([...this.inflightItemHandlers])
+        }
+
+        this.activeTurnId = null
+
+        const durationMs = Date.now() - startedAt
+        const status = turn?.status
+        // Compute per-turn usage delta from the most recent
+        // thread/tokenUsage/updated snapshot we observed during this turn.
+        // If codex never emitted one (e.g. an empty/no-LLM turn or a cancelled
+        // turn before the first call settled), fall through with usage=undefined.
+        const turnUsage = this.consumeActiveTurnUsage()
+        log.info('codex app-server turn end', {
+          sessionKey: this.opts.sessionKey,
+          status,
           durationMs,
-          ok: true,
-          text: this.currentAssistantBuf,
-          usage: usagePayload,
-          requestId,
-          rateLimits: rateLimitsPayload,
-          // LOW-2:codex 'completed' = 正常终态 → Anthropic 口径 'end_turn'。
-          stopReason: 'end_turn',
+          assistantChars: this.currentAssistantBuf.length,
+          ...(turnUsage
+            ? {
+                inputTokens: turnUsage.inputTokens,
+                outputTokens: turnUsage.outputTokens,
+                cachedInputTokens: turnUsage.cachedInputTokens,
+                reasoningOutputTokens: turnUsage.reasoningOutputTokens,
+              }
+            : {}),
         })
-      } else if (status === 'failed') {
-        const errMsg = turn?.error?.message ?? 'codex turn failed'
-        // Surface error in the stream so the UI shows something — without
-        // this, a failed turn after deltas would leave the user wondering.
-        this.emit('message', {
-          type: 'stream_event',
-          session_id: this.threadId,
-          event: {
-            type: 'content_block_delta',
-            index: 0,
-            delta: { type: 'text_delta', text: `\n\n[turn failed: ${errMsg}]\n` },
-          },
-        } as unknown as RunnerMessage)
-        this.emitResult({
-          durationMs,
-          ok: false,
-          error: errMsg,
-          usage: usagePayload,
-          requestId,
-          rateLimits: rateLimitsPayload,
-        })
-      } else if (status === 'interrupted') {
-        // Bill partial work on interrupted turns: codex already charged for
-        // tokens before the user hit stop, so emit the delta we observed.
-        this.emitResult({
-          durationMs,
-          ok: false,
-          error: 'codex turn interrupted',
-          usage: usagePayload,
-          requestId,
-          rateLimits: rateLimitsPayload,
-          // LOW-2:用户主动 stop —— 无 Anthropic 等价枚举,用自描述 'interrupted'
-          // (下游只对 'max_tokens' 有分支语义,其余值透传展示)。
-          stopReason: 'interrupted',
-          terminalCode: 'USER_CANCELLED',
-        })
-      } else {
-        this.emitResult({
-          durationMs,
-          ok: false,
-          error: `codex turn unexpected status=${status ?? 'unknown'}`,
-          usage: usagePayload,
-          requestId,
-          rateLimits: rateLimitsPayload,
-        })
+
+        const usagePayload = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
+        // Issue A v1.0.108 — snapshot 当前最新已知 rateLimits piggy-back 到 billing 帧。
+        // **故意不 clear** this.latestRateLimits:让快照粘在 runner instance 上,后到
+        // notification 也能被下一 turn 带出。
+        // round-2 dedup(Codex review NEEDS-FIX 2):若与上次真正发出的快照相等(JSON 序列化对比),
+        // 则不带 rateLimits — 避免下游 quota.ts 在 30s throttle 过期后把同一份旧值再写一次,
+        // 把 quota_updated_at 假刷新成 NOW 误导 admin UI 以为 Codex 刚观测过。
+        const rateLimitsPayload = this._consumeRateLimitsForEmit()
+
+        if (status === 'completed') {
+          this.emitResult({
+            durationMs,
+            ok: true,
+            text: this.currentAssistantBuf,
+            usage: usagePayload,
+            requestId,
+            rateLimits: rateLimitsPayload,
+            // LOW-2:codex 'completed' = 正常终态 → Anthropic 口径 'end_turn'。
+            stopReason: 'end_turn',
+          })
+        } else if (status === 'failed') {
+          const errMsg = turn?.error?.message ?? 'codex turn failed'
+          const codexErrorInfo = turn?.error?.codexErrorInfo
+          // turn-retry 批:**不再注入裸文本** `[turn failed: ...]` text_delta —— 错误
+          // 只走结构化 errorClass + result 帧,不污染 assistant 正文(codexAdapter 的
+          // errorKind 分类改由 result.result → lastErrorText 承载)。
+          // **status='failed' 一律不自动重发 turn/start**(实测②:input 已落 thread,
+          // rollout response_item 在 API 调用前落盘且不回滚,持久化视图里失败 turn 记为
+          // completed/error:null 无法事后区分;重发 = 重复 user input)。thread/rollback
+          // 事后回滚方案登记为债(见 playbook turn-retry 批)。
+          const errorClass = this.classifyErrorClass(errMsg)
+          log.error('codex app-server turn failed status', {
+            sessionKey: this.opts.sessionKey,
+            errMsg,
+            ...(errorClass ? { errorClass } : {}),
+            // codexErrorInfo(turn.error 的附加字段,实测值 "other")仅进内部日志,
+            // 不进用户面。
+            ...(codexErrorInfo !== undefined ? { codexErrorInfo } : {}),
+          })
+          this.emitResult({
+            durationMs,
+            ok: false,
+            error: errMsg,
+            usage: usagePayload,
+            requestId,
+            rateLimits: rateLimitsPayload,
+            ...(errorClass ? { errorClass } : {}),
+          })
+        } else if (status === 'interrupted') {
+          // Bill partial work on interrupted turns: codex already charged for
+          // tokens before the user hit stop, so emit the delta we observed.
+          this.emitResult({
+            durationMs,
+            ok: false,
+            error: 'codex turn interrupted',
+            usage: usagePayload,
+            requestId,
+            rateLimits: rateLimitsPayload,
+            // LOW-2:用户主动 stop —— 无 Anthropic 等价枚举,用自描述 'interrupted'
+            // (下游只对 'max_tokens' 有分支语义,其余值透传展示)。
+            stopReason: 'interrupted',
+            terminalCode: 'USER_CANCELLED',
+          })
+        } else {
+          this.emitResult({
+            durationMs,
+            ok: false,
+            error: `codex turn unexpected status=${status ?? 'unknown'}`,
+            usage: usagePayload,
+            requestId,
+            rateLimits: rateLimitsPayload,
+          })
+        }
+        // turn 已终态(completed/failed/interrupted/unexpected)→ 退出 attempt 循环。
+        return
       }
     } catch (err) {
       // Best-effort drain on the error path too. If turn/start failed
@@ -3225,14 +3583,19 @@ export class CodexAppServerRunner extends EventEmitter {
       this.activeTurnId = null
       this.currentTurnCompleter = null
       const durationMs = Date.now() - startedAt
+      // turn-retry 批:catch 路径也结构化分类(非 unknown 才带 errorClass)。此路径
+      // 覆盖 turn/start 拒绝但**不满足重试门**、attach/spawn 失败、mid-turn 异常等。
+      const errMsg = `codex app-server: ${(err as Error).message}`
+      const errorClass = this.classifyErrorClass(errMsg)
       log.error('codex app-server turn failed', {
         sessionKey: this.opts.sessionKey,
         err: (err as Error).message,
+        ...(errorClass ? { errorClass } : {}),
       })
       this.emitResult({
         durationMs,
         ok: false,
-        error: `codex app-server: ${(err as Error).message}`,
+        error: errMsg,
         usage: failedTurnUsage
           ? _codexUsageToAnthropicShape(failedTurnUsage)
           : undefined,
@@ -3240,6 +3603,7 @@ export class CodexAppServerRunner extends EventEmitter {
         // Issue A v1.0.108 — catch 路径也走 dedup helper(notification 与 turn 异常
         // 不耦合,init 阶段可能已经收到过快照,但若上一 turn 已发同值就别再发)。
         rateLimits: this._consumeRateLimitsForEmit(),
+        ...(errorClass ? { errorClass } : {}),
       })
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
@@ -3250,6 +3614,8 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private emitAssistantToolUse(id: string, name: string, input: unknown): void {
+    // turn-retry 台账:tool_use 是对外 emit 边界 → 置位,封死 turn/start 窄路径重试。
+    this.attemptHadToolOrPermission = true
     // 登记本 turn 已发 tool_use 的 item id —— emitToolResult 据此判断是否孤儿。
     this.emittedToolUseIds.add(id)
     this.emit('message', {
@@ -3274,6 +3640,8 @@ export class CodexAppServerRunner extends EventEmitter {
     orphanPairing?: { name: string; input: unknown },
     engineMeta?: { exitCode?: number; terminationReason?: ToolTerminationReason },
   ): void {
+    // turn-retry 台账:tool_result 是对外 emit 边界 → 置位。
+    this.attemptHadToolOrPermission = true
     if (!this.emittedToolUseIds.has(toolUseId)) {
       // 孤儿 result:先补一帧配对 tool_use(emitAssistantToolUse 内部会登记 id,
       // 故同 id 的后续 result 不再重复补发)。
@@ -3313,6 +3681,20 @@ export class CodexAppServerRunner extends EventEmitter {
     } as unknown as RunnerMessage)
   }
 
+  /** turn-retry 批 — 发射 fake-SDK `retrying` 状态帧(与 compacting 同 stdout 形状,
+   *  ccbMessageParser 的 subtype:'status' 分支消费 retry 载荷并映射成 gateway
+   *  turn_status.retrying)。**本帧自身不置台账 flag**(侧信道,不算 turn 输出)。
+   *  清除走 emitTurnStatus(null)。 */
+  private emitRetryingStatus(retry: TurnRetryMeta): void {
+    this.emit('message', {
+      type: 'system',
+      subtype: 'status',
+      session_id: this.threadId,
+      status: 'retrying',
+      retry,
+    } as unknown as RunnerMessage)
+  }
+
   /** Issue A v1.0.108 round-2 — 决定本次 emitResult 是否带 rateLimits。
    *  规则:latestRateLimits 为 null → 没快照,返 undefined。
    *  否则与 lastEmittedRateLimitsJson 比较:
@@ -3349,7 +3731,11 @@ export class CodexAppServerRunner extends EventEmitter {
      *  注释);不传 → result 行不带 stop_reason(failed / 异常路径)。 */
     stopReason?: string
     terminalCode?: 'USER_CANCELLED' | 'CODEX_ERROR'
+    /** turn-retry 批 — 非 'unknown' 的结构化错误码(classifyRunError 产物)。 */
+    errorClass?: ClassifiedErrorCode
   }): void {
+    // turn-retry 台账:任何 result 终态帧发出即封死本 attempt 的 turn/start 重试。
+    this.attemptEmittedTerminal = true
     const msg: RunnerMessage = {
       type: 'result',
       subtype: opts.ok ? 'success' : 'error_during_execution',
@@ -3365,8 +3751,16 @@ export class CodexAppServerRunner extends EventEmitter {
       ...(!opts.ok
         ? { billing_terminal_code: opts.terminalCode ?? 'CODEX_ERROR' as const }
         : {}),
+      ...(opts.errorClass ? { errorClass: opts.errorClass } : {}),
     }
     this.emit('message', msg)
+  }
+
+  /** turn-retry 批 — error 文本结构化分类;'unknown' 归 undefined(不带 errorClass,
+   *  caller 走既有裸 error 展示,UX 不变)。 */
+  private classifyErrorClass(errStr: string | undefined): ClassifiedErrorCode | undefined {
+    const code = classifyRunError(errStr).code
+    return code === 'unknown' ? undefined : code
   }
 }
 

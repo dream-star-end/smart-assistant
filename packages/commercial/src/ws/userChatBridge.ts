@@ -220,11 +220,214 @@ export const CLOSE_BRIDGE = {
  * 导出供 index.ts 装配 createTunnelContainerSocket 时复用,避免两处 magic number 漂移。 */
 export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 
+export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
+export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
+export const PROMPT_QUEUE_DISPATCH_CANCEL_TYPE = "outbound.prompt_queue.dispatch_cancel";
+export const PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE = "outbound.prompt_queue.dispatch_activated";
+export const PROMPT_QUEUE_GRANT_FIELD = "__oc_prompt_queue_grant";
+
+export interface PromptQueueDispatchRequest {
+  type: typeof PROMPT_QUEUE_DISPATCH_REQUEST_TYPE;
+  grantId: string;
+  owner: {
+    sessionKey: string;
+    clientSessionId: string;
+    agentId: string;
+    peer: { id: string; kind: "dm" };
+  };
+  claim: { epoch: string; claimToken: string };
+  item: {
+    itemId: string;
+    clientMessageId: string;
+    contentHash: string;
+    content: Record<string, unknown>;
+    requestedExecution: {
+      agentId: string;
+      model?: string;
+      effortLevel?: string | null;
+      teamMode?: boolean;
+    };
+  };
+}
+
+export interface PromptQueueDispatchResult {
+  type: typeof PROMPT_QUEUE_DISPATCH_RESULT_TYPE;
+  grantId: string;
+  owner: PromptQueueDispatchRequest["owner"];
+  itemId: string;
+  contentHash: string;
+  epoch: string;
+  claimToken: string;
+  outcome: "rejected";
+  disposition: "retryable" | "user_action_required";
+  reasonCode: string;
+}
+
+export interface PromptQueueDispatchCancel {
+  type: typeof PROMPT_QUEUE_DISPATCH_CANCEL_TYPE;
+  grantId: string;
+  owner: PromptQueueDispatchRequest["owner"];
+  itemId: string;
+  contentHash: string;
+  epoch: string;
+  claimToken: string;
+  reasonCode: string;
+}
+
+export interface PromptQueueDispatchActivated {
+  type: typeof PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE;
+  grantId: string;
+  owner: PromptQueueDispatchRequest["owner"];
+  itemId: string;
+  contentHash: string;
+  epoch: string;
+  claimToken: string;
+}
+
+/**
+ * Parse the trusted container→master queue hand-off. This is deliberately a
+ * separate internal envelope: browsers cannot mint a dispatch grant merely by
+ * adding private fields to an ordinary inbound.message.
+ */
+export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDispatchRequest | null {
+  if (!isPlainRecord(value) || value.type !== PROMPT_QUEUE_DISPATCH_REQUEST_TYPE) return null;
+  if (!hasOnlyKeys(value, ["type", "grantId", "owner", "claim", "item"])) return null;
+  if (typeof value.grantId !== "string" || !/^[0-9a-f-]{36}$/.test(value.grantId)) return null;
+  const owner = value.owner;
+  const claim = value.claim;
+  const item = value.item;
+  if (!isPlainRecord(owner) || !hasOnlyKeys(owner, ["sessionKey", "clientSessionId", "agentId", "peer"])) return null;
+  if (
+    typeof owner.sessionKey !== "string" || owner.sessionKey.length < 1 || owner.sessionKey.length > 512 ||
+    typeof owner.clientSessionId !== "string" || owner.clientSessionId.length < 1 || owner.clientSessionId.length > 256 ||
+    typeof owner.agentId !== "string" || owner.agentId.length < 1 || owner.agentId.length > 64 ||
+    !isPlainRecord(owner.peer) || !hasOnlyKeys(owner.peer, ["id", "kind"]) ||
+    owner.peer.kind !== "dm" || owner.peer.id !== owner.clientSessionId
+  ) return null;
+  const canonicalSessionKey =
+    `agent:${owner.agentId}:webchat:dm:${owner.peer.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+  if (owner.sessionKey !== canonicalSessionKey) return null;
+  if (
+    !isPlainRecord(claim) || !hasOnlyKeys(claim, ["epoch", "claimToken"]) ||
+    typeof claim.epoch !== "string" || !/^(0|[1-9][0-9]*)$/.test(claim.epoch) ||
+    typeof claim.claimToken !== "string" || !/^[0-9a-f]{64}$/.test(claim.claimToken)
+  ) return null;
+  if (!isPlainRecord(item) || !hasOnlyKeys(item, ["itemId", "clientMessageId", "contentHash", "content", "requestedExecution"])) return null;
+  if (
+    !isClientMessageId(item.itemId) || !isClientMessageId(item.clientMessageId) ||
+    typeof item.contentHash !== "string" || !/^[0-9a-f]{64}$/.test(item.contentHash) ||
+    !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
+  ) return null;
+  const execution = item.requestedExecution;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "effortLevel", "teamMode"])) return null;
+  if (execution.agentId !== owner.agentId) return null;
+  if (execution.model !== undefined && typeof execution.model !== "string") return null;
+  if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
+  if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
+  return value as unknown as PromptQueueDispatchRequest;
+}
+
+export function parsePromptQueueDispatchCancel(value: unknown): PromptQueueDispatchCancel | null {
+  if (!isPlainRecord(value) || value.type !== PROMPT_QUEUE_DISPATCH_CANCEL_TYPE) return null;
+  if (!hasOnlyKeys(value, [
+    "type", "grantId", "owner", "itemId", "contentHash", "epoch", "claimToken", "reasonCode",
+  ])) return null;
+  const request = parsePromptQueueDispatchRequest({
+    type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+    grantId: value.grantId,
+    owner: value.owner,
+    claim: { epoch: value.epoch, claimToken: value.claimToken },
+    item: {
+      itemId: value.itemId,
+      clientMessageId: value.itemId,
+      contentHash: value.contentHash,
+      content: {},
+      requestedExecution: {
+        agentId: isPlainRecord(value.owner) ? value.owner.agentId : undefined,
+      },
+    },
+  });
+  if (
+    request === null ||
+    typeof value.reasonCode !== "string" ||
+    !/^[A-Z0-9_]{1,64}$/.test(value.reasonCode)
+  ) return null;
+  return value as unknown as PromptQueueDispatchCancel;
+}
+
+export function parsePromptQueueDispatchActivated(value: unknown): PromptQueueDispatchActivated | null {
+  if (!isPlainRecord(value) || value.type !== PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE) return null;
+  if (!hasOnlyKeys(value, [
+    "type", "grantId", "owner", "itemId", "contentHash", "epoch", "claimToken",
+  ])) return null;
+  const request = parsePromptQueueDispatchRequest({
+    type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+    grantId: value.grantId,
+    owner: value.owner,
+    claim: { epoch: value.epoch, claimToken: value.claimToken },
+    item: {
+      itemId: value.itemId,
+      clientMessageId: value.itemId,
+      contentHash: value.contentHash,
+      content: {},
+      requestedExecution: {
+        agentId: isPlainRecord(value.owner) ? value.owner.agentId : undefined,
+      },
+    },
+  });
+  return request === null ? null : value as unknown as PromptQueueDispatchActivated;
+}
+
+function samePromptQueueDispatch(
+  control: PromptQueueDispatchCancel | PromptQueueDispatchActivated,
+  request: PromptQueueDispatchRequest,
+): boolean {
+  return control.grantId === request.grantId &&
+    control.owner.sessionKey === request.owner.sessionKey &&
+    control.owner.clientSessionId === request.owner.clientSessionId &&
+    control.owner.agentId === request.owner.agentId &&
+    control.owner.peer.id === request.owner.peer.id &&
+    control.owner.peer.kind === request.owner.peer.kind &&
+    control.itemId === request.item.itemId &&
+    control.contentHash === request.item.contentHash &&
+    control.epoch === request.claim.epoch &&
+    control.claimToken === request.claim.claimToken;
+}
+
+function promptQueueDispositionForCode(
+  code: string,
+): "retryable" | "user_action_required" {
+  return /^(?:ERR_INSUFFICIENT_CREDITS|INSUFFICIENT_CREDITS|MODEL_NOT_AVAILABLE|UNAUTHORIZED_MODEL|UNRESOLVED_AGENT_MODEL|AGENT_NOT_FOUND|INVALID_|ERR_FRAME_TOO_BIG)/.test(code)
+    ? "user_action_required"
+    : "retryable";
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allow = new Set(allowed);
+  return Object.keys(value).every((key) => allow.has(key));
+}
+
+export function shouldRejectCodexTurnForG7(
+  hasActiveTurn: boolean,
+  isPromptQueueDispatch: boolean,
+): boolean {
+  return hasActiveTurn && !isPromptQueueDispatch;
+}
+
 /** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 /** 连接到容器的超时 ms。容器 WS 同机回环,1s 都嫌长。 */
 const DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS = 5_000;
+
+/** Queue grants must either reach the container or resolve negative while the
+ * server-side claim is still live. The timeout also becomes a cancellation
+ * fence: a late async preparation result is never allowed to start a turn. */
+const DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS = 20_000;
 
 /** ConnectionRegistry 默认 maxPerUser(沿用 connections.ts 的 3)。 */
 const DEFAULT_MAX_PER_USER = 3;
@@ -564,6 +767,10 @@ async function resolveTurnExecution(
 
 export interface UserChatBridgeDeps {
   jwtSecret: string | Uint8Array;
+  /** Prompt queue is dark unless the process-level rollout flag is exactly on. */
+  promptQueueEnabled?: boolean;
+  /** Internal queue preparation deadline; override only for focused tests. */
+  promptQueuePreparationTimeoutMs?: number;
   /**
    * 模型执行权威签发(方案 §2)。注入即开启 flag —— 见 BridgeModelAuthorityDeps。
    * 缺省(v3 / 测试 / flag 未开)→ bridge 行为与本批次之前**完全一致**。
@@ -1287,6 +1494,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const connectTimeoutMs = deps.containerConnectTimeoutMs ?? DEFAULT_CONTAINER_CONNECT_TIMEOUT_MS;
   const heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
   const heartbeatTimeoutMs = deps.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS;
+  const promptQueuePreparationTimeoutMs =
+    Number.isSafeInteger(deps.promptQueuePreparationTimeoutMs) &&
+      (deps.promptQueuePreparationTimeoutMs ?? 0) > 0
+      ? deps.promptQueuePreparationTimeoutMs!
+      : DEFAULT_PROMPT_QUEUE_PREPARATION_TIMEOUT_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
   const createContainerSocket = deps.createContainerSocket
@@ -1295,6 +1507,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   const registry = new ConnectionRegistry({ maxPerUser });
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });
+  const pendingPromptQueueCompensations = new Set<Promise<void>>();
+  const trackPromptQueueCompensation = (work: Promise<void>): void => {
+    pendingPromptQueueCompensations.add(work);
+    void work.catch((err) => {
+      log?.error("user-chat-bridge: prompt queue compensation failed", { err });
+    }).finally(() => pendingPromptQueueCompensations.delete(work));
+  };
 
   /**
    * Phase 0.4 — bridge-layer outbound ring buffer (process-singleton).
@@ -1911,7 +2130,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     /** 容器 attest 是否携带 durable-turn-dispatch-v1:true 才走 dispatch 受理,否则 legacy。 */
     let containerHasDurableDispatch = false;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
-    const attestQueue: Array<{ data: RawData; isBinary: boolean }> = [];
+    const attestQueue: Array<{
+      data: RawData;
+      isBinary: boolean;
+      ingress: "browser" | "prompt_queue";
+      dispatchRequest?: PromptQueueDispatchRequest;
+    }> = [];
     let attestQueuedBytes = 0;
 
     /** 容器不支持 / 不及时 attest → 拒连接 + 触发 stale recycle(下次连接拿到新容器)。 */
@@ -2003,9 +2227,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         keyIds: attestedKeyIds,
         keyIdsUnknown,
       });
-      // 原样重放:缓冲的是**未处理的原始帧**,重放即走完整 onUserMessage 流程
+      // 原样重放:缓冲的是**未处理的原始帧**,重放即走完整 prepareQueuedTurn 流程
       // (authz / codex 分类 / 计费编排 / 签发注入),不存在"半处理帧"的中间态。
-      for (const m of queued) onUserMessage(m.data, m.isBinary);
+      for (const m of queued) {
+        prepareQueuedTurn(m.data, m.isBinary, m.ingress, m.dispatchRequest);
+      }
     };
 
     /**
@@ -2043,7 +2269,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      *
      * 为什么早期 fence 不够:`resolveAuthorityExecOrReject` 的 fence 发生在 turn 起手,
      * 之后还要走 createCodexRoute → acquire → getAgentCostMultiplier → preCheck →
-     * startInflightJournal → attachMasterHistoricalMessages 一连串 await(codex 路径实测
+     * startInflightJournal → attachMasterTurnState 一连串 await(codex 路径实测
      * 可达数十~数百 ms,慢 DB / 大历史时更长)。管理员在这中间禁用模型 / 撤销授权 / 改价
      * 都会 bump epoch,而旧实现会拿**那个已经过时的快照**签出票据 —— 并且 turn lease 的
      * TTL 是 50min。于是"安全变更立刻生效"这条承诺在最要紧的那条路径上被打穿:
@@ -2069,10 +2295,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       billingRequestId?: string;
       authorityTurnId?: string;
       log: Logger | null;
+      onReject?: (code: string) => void;
       /** 拒帧时的补偿(abort journal / release preCheck / 还槽);无预扣的路径不传。 */
       compensate?: (reason: string) => Promise<void> | void;
     }): Promise<Record<string, unknown> | null> => {
       const reject = async (code: string, message: string, reason: string): Promise<null> => {
+        args.onReject?.(code);
         try {
           await args.compensate?.(reason);
         } catch (err) {
@@ -2138,8 +2366,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       model: string | null;
       classifiedCodex: boolean;
       log: Logger | null;
+      onReject?: (code: string) => void;
     }): Promise<ResolvedTurnExecution | null> => {
       const reject = (code: string, message: string): null => {
+        args.onReject?.(code);
         if (!cleaned && userWs.readyState === WebSocket.OPEN) {
           sendErrorFrame(userWs, code, message);
         }
@@ -2254,6 +2484,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       readonly peerKey: string;
       readonly peerId: string | null;
       readonly clientMessageId: string | null;
+      readonly promptQueueGrantId: string | null;
       acquireInflight: boolean;
       acquiredAccountId: bigint | null;
       acquiredSlotId: string | null;
@@ -2261,6 +2492,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       releaseTimer: ReturnType<typeof setTimeout> | null;
     };
     const activeCodexTurnsByPeer = new Map<string, ActiveCodexTurnState>();
+    const promptQueueDispatchCancellations = new Map<string, {
+      request: PromptQueueDispatchRequest;
+      cancel(reasonCode: string): Promise<void>;
+    }>();
     const codexPeerKey = (peerId: string | null): string =>
       peerId === null ? "__missing_peer__" : `peer:${peerId}`;
     const isCurrentCodexTurnState = (state: ActiveCodexTurnState): boolean =>
@@ -2296,6 +2531,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const current = activeCodexTurnsByPeer.get(state.peerKey);
       if (current === state && current.stateId === state.stateId) {
         activeCodexTurnsByPeer.delete(state.peerKey);
+      }
+      if (state.promptQueueGrantId !== null) {
+        promptQueueDispatchCancellations.delete(state.promptQueueGrantId);
       }
       if (accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
         try { deps.codexBinding.release(accountId, slotId); } catch { /* best effort */ }
@@ -2581,12 +2819,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     // ---------- 双向 pipe handlers ----------
 
-    const attachMasterHistoricalMessages = async (
+    // Single preparation helper for both browser turns and internally granted
+    // queue turns. Persistence, dedupe, master history and GoalState therefore
+    // cannot drift between the legacy and queued dispatch lanes.
+    const attachMasterTurnState = async (
       frameObj: Record<string, unknown>,
       turnLog: Logger | null,
       // MIN1:受理成功后 fire-and-forget 回填 turn_traces.dispatch_id/request_id 用(纯展示)。
       // 由各 IIFE 传入本 turn 的 canonical traceId(捕获的稳定值,防跨帧 mutate);缺则不回填。
       traceId: string | null = null,
+      // prompt-queue lane:协调器已持久化 user 行 → persistUserRow=false 跳过受理/持久块
+      // (含 durable dispatch 准入 —— 绝不给 queue turn 建第二套 turn_dispatches 权威,防权威源分裂);
+      // onReject 在受理/goal 拒轮时回调,让 queue 协调器取消本次 dispatch grant。
+      persistUserRow = true,
+      onReject?: (code: string) => void,
     ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
@@ -2667,13 +2913,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // reject-if-absent 成 not_accepted、给用户弹一张假 error 卡(RFC B10 根因)。放到受理前:dedup
       // 走 return 不转发任何帧,故**不破坏「受理先于一切」不变量**(该不变量约束的是"转发前 user 行必须在")。
       // legacy 路径(无 admitUserTurn)不建 dispatch 行、无孤儿风险 → 保持既有「持久后再 dedup」顺序。
-      if (useDispatchAdmission && clientMessageId !== null) {
+      if (persistUserRow && useDispatchAdmission && clientMessageId !== null) {
         await ensureHistory();
         if (cleaned) return null;
         if (tryDedupCompleted()) return null;
       }
 
-      if (clientMessageId !== null && (useDispatchAdmission || deps.persistMasterUserMessage)) {
+      // persistUserRow=false(prompt-queue lane)整块跳过:queue 协调器已建 user 行 + turn 权威,
+      // 此处再走 admit/persist 会造成 turn_dispatches 与 queue lifecycle 双权威(权威源分裂)。
+      if (persistUserRow && clientMessageId !== null && (useDispatchAdmission || deps.persistMasterUserMessage)) {
         const content = frameObj.content && typeof frameObj.content === "object"
           ? frameObj.content as { text?: unknown; media?: unknown }
           : {};
@@ -2870,6 +3118,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           }
           if (!persisted) {
+            onReject?.("SESSION_PERSIST_UNAVAILABLE");
             turnLog?.warn("user-chat-bridge: persist user row before forward failed", {
               sessionId: peerId,
               clientMessageId,
@@ -2914,6 +3163,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           // 副作用(错误帧/日志/回滚)仍留在此调用点。见该函数头注释。
           const resolved = await resolveTurnGoalState(deps.loadGoalState, uid, peerId);
           if (resolved.kind === "unavailable") {
+            // prompt-queue lane:回执让协调器取消 grant(browser lane 无 dispatchRequest → no-op)。
+            onReject?.("GOAL_STATE_UNAVAILABLE");
             // Goal attribution is part of the paid turn's durable authority. A
             // transient PG read failure must not be converted to `null`: doing so
             // would run the turn without goal_id and make later repair impossible.
@@ -2953,9 +3204,59 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
     };
 
-    const onUserMessage = (data: RawData, isBinary: boolean): void => {
+    // Both the browser legacy lane and the internal PG dispatch grant enter
+    // this one preparation pipeline. Consequently catalog/epoch fencing,
+    // Codex slot acquisition, preCheck, journal creation and authority sealing
+    // cannot diverge between the two paths.
+    const prepareQueuedTurn = (
+      data: RawData,
+      isBinary: boolean,
+      ingress: "browser" | "prompt_queue" = "browser",
+      dispatchRequest?: PromptQueueDispatchRequest,
+    ): void => {
+      const isPromptQueueDispatch = ingress === "prompt_queue";
+      let promptQueueResolved = false;
+      let promptQueueFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+      const rejectPromptQueueDispatch = (reasonCode: string): void => {
+        if (!dispatchRequest || promptQueueResolved) return;
+        promptQueueResolved = true;
+        if (promptQueueFallbackTimer !== null) clearTimeout(promptQueueFallbackTimer);
+        const result: PromptQueueDispatchResult = {
+          type: PROMPT_QUEUE_DISPATCH_RESULT_TYPE,
+          grantId: dispatchRequest.grantId,
+          owner: dispatchRequest.owner,
+          itemId: dispatchRequest.item.itemId,
+          contentHash: dispatchRequest.item.contentHash,
+          epoch: dispatchRequest.claim.epoch,
+          claimToken: dispatchRequest.claim.claimToken,
+          outcome: "rejected",
+          disposition: promptQueueDispositionForCode(reasonCode),
+          reasonCode,
+        };
+        const encoded = Buffer.from(JSON.stringify(result), "utf8");
+        forwardInboundFrame(encoded, false, encoded.length);
+      };
+      const forwardPreparedFrame = (
+        frameData: RawData,
+        frameIsBinary: boolean,
+        frameLength: number,
+      ): boolean => {
+        // `rejectPromptQueueDispatch` is also the cancellation edge. Every
+        // async preparation lane funnels through this helper, so a timeout or
+        // earlier negative result prevents a late physical execution. Codex
+        // callers observe `false` and run their existing slot/journal/precheck
+        // compensation before returning.
+        if (dispatchRequest && promptQueueResolved) return false;
+        const accepted = forwardInboundFrame(frameData, frameIsBinary, frameLength);
+        if (accepted && dispatchRequest && !promptQueueResolved) {
+          promptQueueResolved = true;
+          if (promptQueueFallbackTimer !== null) clearTimeout(promptQueueFallbackTimer);
+        }
+        return accepted;
+      };
       const len = rawDataLen(data);
       if (len > maxFrameBytes) {
+        rejectPromptQueueDispatch("ERR_FRAME_TOO_BIG");
         sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG",
           `user frame ${len} > max ${maxFrameBytes}`);
         try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
@@ -2978,8 +3279,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
         attestQueuedBytes += len;
-        attestQueue.push({ data, isBinary });
+        attestQueue.push({ data, isBinary, ingress, dispatchRequest });
         return;
+      }
+      if (dispatchRequest) {
+        promptQueueFallbackTimer = setTimeout(
+          () => rejectPromptQueueDispatch("DISPATCH_PREPARATION_TIMEOUT"),
+          promptQueuePreparationTimeoutMs,
+        );
+        promptQueueFallbackTimer.unref?.();
       }
       let passthroughData: RawData = data;
       let passthroughLen = len;
@@ -3079,6 +3387,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (Object.prototype.hasOwnProperty.call(parsedObj, DISPATCH_AUTHORITY_FIELD)) {
               stripDispatchAuthorityField(parsedObj);
               bridgeLog?.warn("user-chat-bridge: client-supplied dispatch authority field stripped");
+              const strippedStr = JSON.stringify(parsedObj);
+              passthroughData = Buffer.from(strippedStr, "utf8");
+              passthroughLen = Buffer.byteLength(strippedStr);
+            }
+            // The grant correlation is created only by the internal dispatch
+            // request handler below. A browser-authored lookalike must die before
+            // it can reach the container coordinator.
+            if (
+              !isPromptQueueDispatch &&
+              Object.prototype.hasOwnProperty.call(parsedObj, PROMPT_QUEUE_GRANT_FIELD)
+            ) {
+              delete parsedObj[PROMPT_QUEUE_GRANT_FIELD];
+              bridgeLog?.warn("user-chat-bridge: client-supplied prompt queue grant stripped");
               const strippedStr = JSON.stringify(parsedObj);
               passthroughData = Buffer.from(strippedStr, "utf8");
               passthroughLen = Buffer.byteLength(strippedStr);
@@ -3273,6 +3594,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const frameAgentId = typeof frameAgentIdRaw === "string" ? frameAgentIdRaw : null;
             const teamModeRequested = (parsed as { teamMode?: unknown }).teamMode === true;
             if (frameAgentId === HIDDEN_REVIEWER_AGENT_ID) {
+              rejectPromptQueueDispatch("AGENT_NOT_FOUND");
               bridgeLog?.info("user-chat-bridge: hidden system agent direct frame rejected", {
                 agentId: frameAgentId,
               });
@@ -3300,6 +3622,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               agentModelResolverHandle !== null &&
               agentModelResolverHandle.isRuntimeDenied(frameAgentId)
             ) {
+              rejectPromptQueueDispatch("UNRESOLVED_AGENT_MODEL");
               void agentModelResolverHandle.refresh();
               bridgeLog?.info("user-chat-bridge: agent runtime not ready, frame rejected", {
                 agentId: frameAgentId,
@@ -3374,6 +3697,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 同款拒帧路径。先补触发一次权威快照 refresh(新装 agent 的窗口期
               // miss,用户重发即可命中),再拒本帧。
               void agentModelResolverHandle.refresh();
+              rejectPromptQueueDispatch("UNRESOLVED_AGENT_MODEL");
               bridgeLog?.info("user-chat-bridge: agent model unresolved, frame rejected", {
                 agentId: effectiveFrameAgentId,
               });
@@ -3402,6 +3726,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               effectiveModel !== null &&
               !modelCheckerHandle.isAllowed(effectiveModel)
             ) {
+              rejectPromptQueueDispatch("UNAUTHORIZED_MODEL");
               bridgeLog?.info("user-chat-bridge: model not authorized", {
                 modelId: effectiveModel,
                 source,
@@ -3557,11 +3882,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const authorityModelCapture = authorityModelForFrame;
         void (async () => {
           // M6:总括 try/catch —— 本 IIFE 无预扣/journal/槽,一切**意外**异常(签票 crypto /
-          // JSON.stringify / forward 抛)必须收敛成「dispatch 终态化 + error 帧」,禁 unhandled
-          // rejection。dispatchRecordA 声明在 try 外,供 catch 兜底终态化。
+          // JSON.stringify / forward 抛)必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,
+          // 禁 unhandled rejection。dispatchRecordA 声明在 try 外,供 catch 兜底终态化。
           let dispatchRecordA: AdmittedDispatch | undefined;
           try {
             if (turnTraceIdCapture === null || inboundParsedCapture === null) {
+              rejectPromptQueueDispatch("ERR_INTERNAL");
               bridgeLog?.error("user-chat-bridge: annotated image frame missing trace invariant");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                 sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
@@ -3569,11 +3895,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            const enrichedParsed = await attachMasterHistoricalMessages(
+            const enrichedParsed = await attachMasterTurnState(
               inboundParsedCapture,
               turnLogCapture,
               turnTraceIdCapture,
+              !isPromptQueueDispatch,
+              rejectPromptQueueDispatch,
             );
+            // null:attachMasterTurnState 已在内部拒轮(含 dispatch 终态化 + onReject);此处直接 return。
             if (enrichedParsed === null) return;
             dispatchRecordA = lookupAdmittedDispatch(enrichedParsed);
             if (cleaned) { failDispatchPreForward(dispatchRecordA, "bridge_cleaned"); return; }
@@ -3584,6 +3913,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 model: authorityModelCapture,
                 classifiedCodex: true,
                 log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
               });
               if (authorityExec === null) {
                 failDispatchPreForward(dispatchRecordA, "authority_rejected");
@@ -3605,6 +3935,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 exec: authorityExec,
                 billingRequestId: requestId,
                 log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
               });
               if (sealed === null) { failDispatchPreForward(dispatchRecordA, "authority_seal_rejected"); return; }
               authorityFields = sealed;
@@ -3623,19 +3954,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const rewrittenStr = JSON.stringify(rewrittenObj);
             const rewrittenLen = Buffer.byteLength(rewrittenStr);
             if (rewrittenLen > maxFrameBytes) {
+              rejectPromptQueueDispatch("ERR_FRAME_TOO_BIG");
+              failDispatchPreForward(dispatchRecordA, "ERR_FRAME_TOO_BIG");
               turnLogCapture?.error("user-chat-bridge: rewritten annotated image frame too big", {
                 rewrittenLen, max: maxFrameBytes,
               });
-              failDispatchPreForward(dispatchRecordA, "ERR_FRAME_TOO_BIG");
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
                 sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG", `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`);
                 try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
               }
               return;
             }
-            forwardInboundFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+            // forwardPreparedFrame:queue lane 走它兜住 promptQueueResolved(cancel 边);browser
+            // lane 无 dispatchRequest → 等价 forwardInboundFrame。dispatch 已 accepted 交容器,不终态化。
+            forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
           } catch (err) {
             bridgeLog?.error("user-chat-bridge: annotated image IIFE unexpected error", { err });
+            rejectPromptQueueDispatch("ERR_INTERNAL");
             failDispatchPreForward(dispatchRecordA, "annotated_image_unexpected_exception");
             if (!cleaned && userWs.readyState === WebSocket.OPEN) {
               sendErrorFrame(userWs, "ERR_INTERNAL", "internal error");
@@ -3655,7 +3990,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ? inboundParsedFrame.clientMessageId
           : null;
         const peerKeyForAcquire = codexPeerKey(peerIdForAcquire);
-        if (activeCodexTurnsByPeer.has(peerKeyForAcquire)) {
+        if (shouldRejectCodexTurnForG7(
+          activeCodexTurnsByPeer.has(peerKeyForAcquire),
+          isPromptQueueDispatch,
+        )) {
           // Same-session strict single-flight. Do not close the bridge: other
           // sessions on this connection remain usable and the exact failed turn
           // can be retried without disturbing their lifecycle state.
@@ -3668,6 +4006,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           );
           return;
         }
+        if (isPromptQueueDispatch && activeCodexTurnsByPeer.has(peerKeyForAcquire)) {
+          // A PG queue grant says nothing about a legacy turn that predates the
+          // queue authority. Never label that live bridge owner "stale" or free
+          // its account/route. This is an internal retryable grant failure (the
+          // queued item remains durable), not the legacy user-facing G7 error.
+          turnLogForFrame?.info("user-chat-bridge: queue dispatch waiting for live codex owner", {
+            peerId: peerIdForAcquire,
+          });
+          rejectPromptQueueDispatch("EXECUTION_OWNER_BUSY");
+          return;
+        }
         // Reserve the peer synchronously before the first await. This is both the
         // same-session admission lock and the ABA fence for late async continuations.
         const codexTurnState: ActiveCodexTurnState = {
@@ -3675,6 +4024,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           peerKey: peerKeyForAcquire,
           peerId: peerIdForAcquire,
           clientMessageId: clientMessageIdForAcquire,
+          promptQueueGrantId: dispatchRequest?.grantId ?? null,
           acquireInflight: true,
           acquiredAccountId: null,
           acquiredSlotId: null,
@@ -3687,6 +4037,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           clientMessageId: clientMessageIdForAcquire,
         };
         const sendTurnErrorFrame = (code: string, message: string): void => {
+          rejectPromptQueueDispatch(code);
           sendErrorFrame(userWs, code, message, turnIdentity);
         };
         const codexBinding = deps.codexBinding;
@@ -3727,10 +4078,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            const preparedInbound = await attachMasterHistoricalMessages(
+            const preparedInbound = await attachMasterTurnState(
               inboundParsedCapture,
               turnLogCapture,
               turnTraceIdCapture,
+              !isPromptQueueDispatch,
+              rejectPromptQueueDispatch,
             );
             if (preparedInbound === null || !isCurrentCodexTurnState(codexTurnState)) return;
             dispatchRecordB = lookupAdmittedDispatch(preparedInbound);
@@ -3744,6 +4097,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 model: authorityModelCapture,
                 classifiedCodex: true,
                 log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
               });
               if (authorityExec === null) return;
               if (!isCurrentCodexTurnState(codexTurnState)) return;
@@ -4198,6 +4552,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   billingRequestId: requestId,
                   ...(authorityTurnId === null ? {} : { authorityTurnId }),
                   log: turnLogCapture,
+                  onReject: rejectPromptQueueDispatch,
                   // seal 只报告拒因；真正的资源补偿统一由下方 finally 状态机执行。
                   compensate: (reason) => { abandonReason = reason; },
                 });
@@ -4243,13 +4598,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 转 Buffer 走文本帧(isBinary=false)— 接收端 .toString() 行为一致。
               frameForwardData = Buffer.from(rewrittenStr, "utf8");
               frameForwardLen = rewrittenLen;
-              forwardCommitted = forwardInboundFrame(
+              forwardCommitted = forwardPreparedFrame(
                 frameForwardData,
                 frameForwardIsBinary,
                 frameForwardLen,
               );
               turnForwarded = forwardCommitted;
               if (!forwardCommitted) abandonReason = "container_forward_rejected";
+              if (forwardCommitted && dispatchRequest) {
+                promptQueueDispatchCancellations.set(dispatchRequest.grantId, {
+                  request: dispatchRequest,
+                  cancel: async (reasonCode) => {
+                    // The gateway accepted the grant but lost/released the exact
+                    // PG claim before SessionManager activation. No provider work
+                    // may run, so unwind every commercial resource immediately.
+                    inflightCodexTurns.delete(requestId);
+                    releaseCodexTurnState(codexTurnState, `prompt_queue_${reasonCode}`);
+                    await snap.abandon(`prompt_queue_${reasonCode}`, "CLIENT_ABORT");
+                  },
+                });
+              }
               } finally {
                 if (!forwardCommitted) {
                   inflightCodexTurns.delete(requestId);
@@ -4274,6 +4642,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 const sealed = await sealAuthorityFieldsOrReject({
                   exec: authorityExec,
                   log: turnLogCapture,
+                  onReject: rejectPromptQueueDispatch,
                   compensate: () => releaseAcquiredSlotForFailure(),
                 });
                 if (sealed === null) return;
@@ -4315,11 +4684,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
             // 已 acquire(+ billing 注册若启用)完毕,继续同步 forward 路径
             // (等价于"放行 frame")。两条分支都已 rewrite 注入 traceId(CG2a 合同)。
-            turnForwarded = forwardInboundFrame(
+            turnForwarded = forwardPreparedFrame(
               frameForwardData,
               frameForwardIsBinary,
               frameForwardLen,
             );
+            if (turnForwarded && dispatchRequest) {
+              promptQueueDispatchCancellations.set(dispatchRequest.grantId, {
+                request: dispatchRequest,
+                cancel: async (reasonCode) => {
+                  releaseCodexTurnState(codexTurnState, `prompt_queue_${reasonCode}`);
+                },
+              });
+            }
           } catch (err) {
             const errName = (err as { name?: string } | null | undefined)?.name ?? "";
             if (errName === "ContainerStaleBindingError") {
@@ -4392,7 +4769,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const classifiedCodexCapture = isCodexInboundFrame;
         void (async () => {
           // M6:总括 try/catch —— CCB turn 无预扣/journal/槽(计费在 egress 逐请求结算),一切
-          // **意外**异常必须收敛成「dispatch 终态化 + error 帧」,禁 unhandled rejection。
+          // **意外**异常必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,禁 unhandled rejection。
           // dispatchRecordC 声明在 try 外供 catch 兜底。
           let dispatchRecordC: AdmittedDispatch | undefined;
           try {
@@ -4408,13 +4785,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 model: authorityModelCapture,
                 classifiedCodex: classifiedCodexCapture,
                 log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
               });
               if (authorityExec === null) return;
             }
-            const enrichedParsed = await attachMasterHistoricalMessages(
+            const enrichedParsed = await attachMasterTurnState(
               inboundParsedCapture,
               turnLogCapture,
               turnTraceIdCapture,
+              !isPromptQueueDispatch,
+              rejectPromptQueueDispatch,
             );
             if (enrichedParsed === null) return;
             dispatchRecordC = lookupAdmittedDispatch(enrichedParsed);
@@ -4430,6 +4810,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // CCB 计费行丢失 turn↔dispatch 关联)。legacy(无 dispatch 记录)→ undefined 不带。
                 ...(dispatchRecordC ? { billingRequestId: dispatchRecordC.billingRequestId } : {}),
                 log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
               });
               if (sealed === null) { failDispatchPreForward(dispatchRecordC, "authority_seal_rejected"); return; }
               authorityFields = sealed;
@@ -4459,9 +4840,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            forwardInboundFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+            // forwardPreparedFrame:queue lane 兜住 promptQueueResolved;browser lane 等价
+            // forwardInboundFrame。dispatch 已 accepted 交容器,forward 后不终态化。
+            forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
           } catch (err) {
             bridgeLog?.error("user-chat-bridge: ccb inbound IIFE unexpected error", { err });
+            rejectPromptQueueDispatch("ERR_INTERNAL");
             failDispatchPreForward(dispatchRecordC, "ccb_inbound_unexpected_exception");
             if (!cleaned && userWs.readyState === WebSocket.OPEN) {
               sendErrorFrame(userWs, "ERR_INTERNAL", "internal error");
@@ -4470,7 +4854,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         })();
         return;
       }
-      forwardInboundFrame(passthroughData, isBinary, passthroughLen);
+      forwardPreparedFrame(passthroughData, isBinary, passthroughLen);
+    };
+
+    const onUserMessage = (data: RawData, isBinary: boolean): void => {
+      prepareQueuedTurn(data, isBinary, "browser");
     };
 
     /**
@@ -4602,6 +4990,113 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               dropAdmittedDispatch(rec.clientMessageId);
             }
             return;
+          }
+        }
+      }
+      // Queue dispatch is a container→master control request, never a browser
+      // broadcast. Convert it into one ordinary inbound.message and feed that
+      // message through the exact same authority/route/precheck/journal helper
+      // as a legacy turn. The private correlation comes back to the gateway only
+      // after those gates have succeeded.
+      if (!isBinary) {
+        let dispatchText: string | null = null;
+        if (typeof data === "string") dispatchText = data;
+        else if (Buffer.isBuffer(data)) {
+          try { dispatchText = data.toString("utf8"); } catch { dispatchText = null; }
+        }
+        if (dispatchText !== null) {
+          let candidate: unknown = null;
+          try { candidate = JSON.parse(dispatchText); } catch { /* ordinary non-JSON frame */ }
+          const isActivatedEnvelope = isPlainRecord(candidate) &&
+            candidate.type === PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE;
+          if (isActivatedEnvelope && deps.promptQueueEnabled === true) {
+            const activated = parsePromptQueueDispatchActivated(candidate);
+            if (activated === null) {
+              bridgeLog?.warn("user-chat-bridge: malformed prompt queue activation acknowledgement dropped");
+              return;
+            }
+            const registered = promptQueueDispatchCancellations.get(activated.grantId);
+            if (!registered || !samePromptQueueDispatch(activated, registered.request)) {
+              bridgeLog?.warn("user-chat-bridge: stale or mismatched prompt queue activation acknowledgement dropped", {
+                grantId: activated.grantId,
+              });
+              return;
+            }
+            // PG activation is the exact ownership boundary. From this point a
+            // bridge disconnect must preserve ordinary cross-bridge billing;
+            // only pre-activation registrations are eligible for compensation.
+            promptQueueDispatchCancellations.delete(activated.grantId);
+            return;
+          }
+          const isCancelEnvelope = isPlainRecord(candidate) &&
+            candidate.type === PROMPT_QUEUE_DISPATCH_CANCEL_TYPE;
+          if (isCancelEnvelope && deps.promptQueueEnabled === true) {
+            const cancel = parsePromptQueueDispatchCancel(candidate);
+            if (cancel === null) {
+              bridgeLog?.warn("user-chat-bridge: malformed prompt queue dispatch cancel dropped");
+              return;
+            }
+            const registered = promptQueueDispatchCancellations.get(cancel.grantId);
+            if (!registered || !samePromptQueueDispatch(cancel, registered.request)) {
+              bridgeLog?.warn("user-chat-bridge: stale or mismatched prompt queue cancel dropped", {
+                grantId: cancel.grantId,
+              });
+              return;
+            }
+            // Delete before awaiting: duplicates and late terminal frames can
+            // never invoke the accounting compensation twice.
+            promptQueueDispatchCancellations.delete(cancel.grantId);
+            trackPromptQueueCompensation(registered.cancel(cancel.reasonCode));
+            return;
+          }
+          const isQueueEnvelope = isPlainRecord(candidate) &&
+            candidate.type === PROMPT_QUEUE_DISPATCH_REQUEST_TYPE;
+          // Flag-off means literal legacy behavior: even an exact queue-looking
+          // container frame remains ordinary outbound traffic. A nested string
+          // can never trigger the internal lane.
+          if (!isQueueEnvelope || deps.promptQueueEnabled !== true) {
+            // fall through to the pre-existing container→browser path
+          } else {
+          const request = parsePromptQueueDispatchRequest(candidate);
+          if (request === null) {
+            bridgeLog?.warn("user-chat-bridge: malformed prompt queue dispatch request dropped");
+            return;
+          }
+          const canonicalSessionKey =
+            `agent:${request.owner.agentId}:webchat:dm:${request.owner.peer.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+          if (request.owner.sessionKey !== canonicalSessionKey) {
+            bridgeLog?.warn("user-chat-bridge: prompt queue dispatch owner mismatch", {
+              sessionKey: request.owner.sessionKey,
+            });
+            return;
+          }
+          const execution = request.item.requestedExecution;
+          const inbound = {
+            type: "inbound.message",
+            channel: "webchat",
+            peer: request.owner.peer,
+            agentId: request.owner.agentId,
+            clientMessageId: request.item.clientMessageId,
+            idempotencyKey: `prompt-queue:${request.grantId}`,
+            content: request.item.content,
+            ...(execution.model !== undefined ? { model: execution.model } : {}),
+            ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
+            ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
+            [PROMPT_QUEUE_GRANT_FIELD]: {
+              grantId: request.grantId,
+              itemId: request.item.itemId,
+              contentHash: request.item.contentHash,
+              epoch: request.claim.epoch,
+              claimToken: request.claim.claimToken,
+            },
+          };
+          prepareQueuedTurn(
+            Buffer.from(JSON.stringify(inbound), "utf8"),
+            false,
+            "prompt_queue",
+            request,
+          );
+          return;
           }
         }
       }
@@ -6004,6 +6499,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // user 侧 detach(idempotent)
       detachUserSide(finalCause);
 
+      // An exact queue registration exists only between container forward and
+      // the PG activation acknowledgement. A container/bridge restart in this
+      // interval proves that no provider submit owns the grant, so compensate
+      // slot/route, Redis reservation and journal immediately. Registrations
+      // removed by dispatch_activated retain the ordinary cross-bridge billing
+      // semantics documented below.
+      const unactivatedQueueDispatches = [...promptQueueDispatchCancellations.values()];
+      promptQueueDispatchCancellations.clear();
+      for (const registered of unactivatedQueueDispatches) {
+        trackPromptQueueCompensation(
+          registered.cancel("BRIDGE_CLOSED_BEFORE_ACTIVATION"),
+        );
+      }
+
       // P0 修复(2026-07-03)— **桥关 ≠ turn 终止,finalCleanup 不再 abort 残留
       // inflight turn**。v5 断流续写语义下(turn 跨 WS 重连存活 + ring 重放),用户
       // 断线/重连/displacement/master 平滑重启后,容器侧 codex turn 继续跑;旧实现
@@ -6077,6 +6586,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
     });
+    while (pendingPromptQueueCompensations.size > 0) {
+      await Promise.allSettled([...pendingPromptQueueCompensations]);
+    }
   }
 
   /**

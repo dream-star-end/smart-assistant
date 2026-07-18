@@ -304,10 +304,13 @@ export function refreshAuth(
   if (state.flight) return state.flight;
   const now = Date.now();
   if (state.nextAllowedAt > now) {
+    // 限频早返:没发真实网络请求,throttled 标记让消费方不把它计入重试次数
+    // (消费层 setTimeout 亚毫秒早醒会撞进本分支,若当失败计数会"只发一次网络就放弃恢复")。
     return Promise.resolve({
       kind: "transient",
       epoch: expectedEpoch,
       retryAfterMs: state.nextAllowedAt - now,
+      throttled: true,
     });
   }
 

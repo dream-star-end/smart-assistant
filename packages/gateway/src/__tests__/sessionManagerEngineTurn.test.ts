@@ -887,6 +887,47 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("审计 R3:runner result 帧带 errorClass → sessionManager onEvent kind:'error' 透传同值(链路不再断)", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      // 底座在 result 帧上带结构化 errorClass(codex runner 现场 classifyRunError
+      // 产物;此处用 FakeCcbRunner 把同形字段注入 result,驱动 parser→adapter→
+      // sessionManager 全链路)。
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "the model is at capacity, retry later",
+            errorClass: "model_capacity",
+          });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, events);
+
+      const errEvent = events.find(
+        (e): e is Extract<SessionStreamEvent, { kind: "error" }> => e.kind === "error",
+      );
+      assert.ok(errEvent, "error 事件必须发出");
+      // 修复前:TurnResult / buildTurnSummary 都不复制 errorClass → 这里恒 undefined。
+      assert.equal(
+        errEvent.errorClass,
+        "model_capacity",
+        "runner 预分类 errorClass 必须原样贯通到 onEvent(TurnResult→TurnSummary→finalizeTurn 链路)",
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("runner error waits for drained late output instead of freezing an early partial", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);

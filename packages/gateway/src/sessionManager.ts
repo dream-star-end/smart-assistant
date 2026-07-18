@@ -57,6 +57,8 @@ import {
   type OutboundContentBlock,
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
+import { classifyRunError } from './errorClassify.js'
+import type { GatewayTurnPhase } from './ccbMessageParser.js'
 import {
   type ExecutionTarget,
   type RemoteTargetController,
@@ -66,6 +68,23 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
 
 const log = createLogger({ module: 'sessionManager' })
+
+/**
+ * generic 引擎失败(非 auth、非 terminalOverride 控制码)的 tape errorCode 细分。
+ *
+ * 命中 classifyRunError 的语义码就落**小写语义码**(model_capacity /
+ * rate_limited / upstream_failed / insufficient_credits),让回看/遥测能区分
+ * 失败种类;未命中保持历史 `'ENGINE_ERROR'`(值域不变,零迁移)。
+ *
+ * **大写控制码路径(AUTH_ERROR / NO_RESPONSE / PHANTOM_TURN / IDLE_TIMEOUT /
+ * LIVENESS_TIMEOUT / TURN_LIMIT / USER_CANCELLED …)不经本函数** —— 免单查询
+ * (internalTurnWaive)按大写码精确匹配存量,细分只作用于原本会写 'ENGINE_ERROR'
+ * 的那一支。`_` 前缀 = 契约测试 seam。
+ */
+export function _tapeErrorCodeForGenericFailure(detail: string | undefined): string {
+  const cls = classifyRunError(detail)
+  return cls.code === 'unknown' ? 'ENGINE_ERROR' : cls.code
+}
 
 /**
  * 缺省 agent 工作目录(agent 未显式 pin cwd 时用)。
@@ -104,6 +123,28 @@ export function resolveDefaultWorkspaceCwd(env: NodeJS.ProcessEnv = process.env)
 export function isCommercialManagedRuntime(env: NodeJS.ProcessEnv = process.env): boolean {
   if (env.OC_RUNTIME_CHANNEL !== undefined && env.OC_RUNTIME_CHANNEL.trim() !== '') return true
   return Boolean(env.OPENCLAUDE_V3_MASTER_BASE_URL && env.OPENCLAUDE_V3_CONTAINER_TOKEN)
+}
+
+export function assertPromptQueueExecutionAdmission(
+  queueTurn: boolean,
+  activeSubmits: number,
+  activeClientTurns: number,
+  queueExecutionActive = false,
+): void {
+  if (queueTurn && (activeSubmits !== 0 || activeClientTurns !== 1)) {
+    throw new Error(
+      `PROMPT_QUEUE_EXECUTION_INVARIANT: expected one client turn and no queued submit ` +
+      `(client=${activeClientTurns}, submit=${activeSubmits})`,
+    )
+  }
+  if (queueExecutionActive) {
+    throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: queue execution already owns this session')
+  }
+}
+
+export interface PromptQueueExternalTurnReservation {
+  turnIndex: number
+  turnKey: string
 }
 
 function normalizeToolsetListForCompare(toolsets: unknown): string[] | undefined {
@@ -305,20 +346,22 @@ export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
  * 抽成 pure function 是为了让阈值选择策略锁在测试里 —— 防止以后有人无意识地
  * 把 OR 分支"清理"掉退回 5min 单档,从而再次让 compacting 期间被误杀。
  *
+ * compacting 与 retrying(自动重试等待期)同属"turn 仍在工作但暂无 token"的
+ * 非流式阶段,都取长档阈值,不被 idle watchdog 误杀。
+ *
  * Live watchdog 调用点见本文件 `submit()` 内 livenessTimer。
  */
 export function pickIdleTimeoutMs(
-  currentTurnStatus: 'compacting' | null | undefined,
+  currentTurnStatus: GatewayTurnPhase | undefined,
   pendingToolCalls: number,
   /** M1a:providerTag 泛化为 engine id('ccb' | 'codex')。codex 判定从旧
    *  'codex-native'(provider 语义)改为 'codex'(engine 语义),真值表不变。 */
   engineId?: string,
 ): number {
-  if (
-    pendingToolCalls > 0 ||
+  const inNonStreamingPhase =
     currentTurnStatus === 'compacting' ||
-    engineId === 'codex'
-  ) {
+    (typeof currentTurnStatus === 'object' && currentTurnStatus !== null)
+  if (pendingToolCalls > 0 || inNonStreamingPhase || engineId === 'codex') {
     return IDLE_TIMEOUT_TOOL_MS
   }
   return IDLE_TIMEOUT_DEFAULT_MS
@@ -507,17 +550,19 @@ export interface AgentSession {
   /**
    * 当前 turn 的 backend-side 非流式阶段状态。
    *
-   * 当前唯一非 null 值是 `'compacting'` —— CCB auto/manual compact 期间走单独
-   * LLM 调用,这段时间不产生 assistant token,前端如果只看流量会以为卡死。
-   * server.ts 在收到 `kind:'turn_status'` 事件时更新此 cache 并 deliver 帧;
-   * turn 终态(final/error)清回 null。autoResumeFromHello 在 ring replay
-   * 之后,如果 runner 仍在跑且 cache !== null,补发一帧给重连的客户端
-   * (兜底 ring eviction 导致原 compact_start 帧已被冲掉的情况)。
+   * 非 null 值有两类:`'compacting'`(CCB auto/manual compact 期间走单独 LLM
+   * 调用,这段时间不产生 assistant token)与 `{status:'retrying', retry}`
+   * (codex 自动重试等待期)。两者都是"turn 仍在工作但暂无 token"的阶段态,
+   * 前端如果只看流量会以为卡死。server.ts 在收到 `kind:'turn_status'` 事件时
+   * 更新此 cache 并 deliver 帧;turn 终态(final/error)清回 null。
+   * autoResumeFromHello 在 ring replay 之后,如果 runner 仍在跑且 cache 非空,
+   * 补发一帧给重连的客户端(兜底 ring eviction 导致原阶段帧已被冲掉的情况;
+   * retrying 补发时按缓存的 retry.retryAt 让前端重算剩余倒计时)。
    *
-   * 不持久化、不跨进程 —— gateway 重启后默认 null(下次 compact_start 自然
-   * 把它推到 'compacting',不依赖任何持久状态)。
+   * 不持久化、不跨进程 —— gateway 重启后默认 null(下次阶段帧自然把它推回对应
+   * 状态,不依赖任何持久状态)。
    */
-  currentTurnStatus?: 'compacting' | null
+  currentTurnStatus?: GatewayTurnPhase
   /**
    * Active turn count — number of in-flight `submit()` promises for this session.
    *
@@ -1209,6 +1254,37 @@ function tailContentHash(payload: Record<string, unknown>): string {
     .digest('hex')
 }
 
+/** Close a PG-active queue turn after a gateway/container restart without ever
+ * re-running it. The exact turnKey makes the tape and waiver idempotent across
+ * repeated recovery attempts; queued means the lossless drainer owns delivery. */
+export async function persistInterruptedPromptQueueTurn(args: {
+  sessionKey: string
+  peerId: string
+  agentId: string
+  userId: string
+  turnIndex: number
+  turnKey: string
+  clientMessageId: string
+}): Promise<void> {
+  const outcome = await persistServerAuthoredTurnOutcome({
+    sessionKey: args.sessionKey,
+    peerId: args.peerId,
+    agentId: args.agentId,
+    userId: args.userId,
+    turnIndex: args.turnIndex,
+    turnKey: args.turnKey,
+    clientMessageId: args.clientMessageId,
+    text: '运行环境重启，本轮已安全中断并自动免单，请重新发送。',
+    status: 'interrupted',
+    errorCode: 'SERVICE_RESTART',
+    errorDetail: 'prompt queue active turn recovered after gateway restart',
+    waiveReason: 'no_response',
+  })
+  if (outcome === 'dropped' || outcome === 'skipped') {
+    throw new Error(`prompt queue restart tape was not retained (${outcome})`)
+  }
+}
+
 /** A short-lived host-controlled drain rejected a new runtime turn. */
 export class RuntimeRecycleDrainingError extends Error {
   readonly code = 'RUNTIME_RECYCLE_DRAINING'
@@ -1229,8 +1305,25 @@ class TurnHardLimitError extends Error {
   }
 }
 
+export interface PromptQueueExecutionFence {
+  readonly sessionKey: string
+  readonly token: symbol
+  release(): void
+}
+
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
+  /** Queue execution uses the existing promise only as an execution mutex.
+   * The WeakSet is the synchronous admission fence that rejects, rather than
+   * queues, any second submit while that mutex is owned. */
+  private _promptQueueExecutions = new WeakSet<AgentSession>()
+  /** Engine switches replace AgentSession objects, so the invariant also needs
+   * a stable logical-session fence that survives object replacement attempts. */
+  private _promptQueueExecutionKeys = new Set<string>()
+  /** Accepted grants need a fence before getOrCreate() and attachment
+   * preprocessing. The token lets that one queue dispatch adopt/replace its
+   * own session while every legacy or second dispatch fails closed. */
+  private _promptQueueDispatchFences = new Map<string, symbol>()
   /** Shared gate for every submit path during a host-controlled image recycle. */
   private _runtimeRecycleDrainUntil = 0
   private _runtimeRecycleDrainTimer: ReturnType<typeof setTimeout> | null = null
@@ -1971,22 +2064,40 @@ export class SessionManager {
   async recordExternalTurn(
     session: AgentSession,
     args: { userText: string; assistantText: string; requestId: string; traceId?: string; model?: string },
+    reservation?: PromptQueueExternalTurnReservation,
   ): Promise<{ turnIndex: number; messageId: string }> {
     // Caller owns session.lock through beginExternalTurn().
     {
-      const legacyId = this._resumeMap.get(session.sessionKey)
-      const turnIndex = await reserveTurnIndex(session.sessionKey, {
-        minimumLastTurn: session.turns,
-        legacySessionIds:
-          legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
-      })
-      const turnKey = deriveLosslessTurnKey({
-        sessionId: session.peerId,
-        agentId: session.agentId,
-        turnIndex,
-        status: 'completed',
-        text: args.assistantText,
-      })
+      let turnIndex: number
+      let turnKey: string
+      if (reservation) {
+        turnIndex = reservation.turnIndex
+        const expectedTurnKey = deriveLosslessTurnKey({
+          sessionId: session.peerId,
+          agentId: session.agentId,
+          turnIndex,
+          status: 'completed',
+          text: '',
+        })
+        if (reservation.turnKey !== expectedTurnKey) {
+          throw new Error('prompt queue external turn reservation does not match session identity')
+        }
+        turnKey = reservation.turnKey
+      } else {
+        const legacyId = this._resumeMap.get(session.sessionKey)
+        turnIndex = await reserveTurnIndex(session.sessionKey, {
+          minimumLastTurn: session.turns,
+          legacySessionIds:
+            legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
+        })
+        turnKey = deriveLosslessTurnKey({
+          sessionId: session.peerId,
+          agentId: session.agentId,
+          turnIndex,
+          status: 'completed',
+          text: args.assistantText,
+        })
+      }
       session.turns = turnIndex
       session.currentUserText = args.userText
       session.currentAssistantBuf = args.assistantText
@@ -2057,20 +2168,96 @@ export class SessionManager {
     }
   }
 
+  /** Reserve and activate a prompt-queue external turn before its paid relay
+   * starts. The reservation is later passed to recordExternalTurn(), so a
+   * crash cannot charge first and mint a different logical turn on retry. */
+  async reservePromptQueueExternalTurn(
+    session: AgentSession,
+    queueLifecycle: {
+      readonly queueTurn: true
+      onTurnReserved(reservation: {
+        turnIndex: number
+        turnKey: string
+        traceId?: string
+      }): Promise<void>
+    },
+    traceId?: string,
+  ): Promise<PromptQueueExternalTurnReservation> {
+    const legacyId = this._resumeMap.get(session.sessionKey)
+    const turnIndex = await reserveTurnIndex(session.sessionKey, {
+      minimumLastTurn: session.turns,
+      legacySessionIds:
+        legacyId && legacyId !== session.sessionKey ? [legacyId] : [],
+    })
+    const turnKey = deriveLosslessTurnKey({
+      sessionId: session.peerId,
+      agentId: session.agentId,
+      turnIndex,
+      status: 'completed',
+      text: '',
+    })
+    session.turns = turnIndex - 1
+    session._currentTurnKey = turnKey
+    await queueLifecycle.onTurnReserved({
+      turnIndex,
+      turnKey,
+      ...(traceId ? { traceId } : {}),
+    })
+    return { turnIndex, turnKey }
+  }
+
   /** Acquire the per-session turn lock for platform work that runs outside
    * the model runner. Stop requests abort its signal, and the returned finish
    * callback releases both the lock and reconnect-visible activity count. */
-  async beginExternalTurn(session: AgentSession): Promise<{
+  async beginExternalTurn(
+    session: AgentSession,
+    opts?: { queueTurn?: boolean; queueExecutionFence?: PromptQueueExecutionFence },
+  ): Promise<{
     signal: AbortSignal
     finish: (outcome: 'completed' | 'errored') => void
   }> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
+    const queueTurn = opts?.queueTurn === true
+    const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
+      session.sessionKey,
+      opts?.queueExecutionFence,
+    )
+    if (opts?.queueExecutionFence && !ownsDispatchFence) {
+      throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: stale queue execution fence')
+    }
     const prev = session.lock
-    let release!: () => void
+    let release: () => void = () => {}
+    this.beginClientTurn(session)
+    try {
+      assertPromptQueueExecutionAdmission(
+        queueTurn,
+        session._activeTurnCount ?? 0,
+        session._activeClientTurnCount ?? 0,
+        this._promptQueueExecutions.has(session) ||
+          this._promptQueueExecutionKeys.has(session.sessionKey) ||
+          (this._promptQueueDispatchFences.has(session.sessionKey) && !ownsDispatchFence),
+      )
+    } catch (err) {
+      this.endClientTurn(session, 'errored')
+      throw err
+    }
+    if (queueTurn) {
+      this._promptQueueExecutions.add(session)
+      this._promptQueueExecutionKeys.add(session.sessionKey)
+    }
     session.lock = new Promise<void>((resolve) => { release = resolve })
     const controller = new AbortController()
-    this.beginClientTurn(session)
-    await prev
+    try {
+      await prev
+    } catch (err) {
+      this.endClientTurn(session, 'errored')
+      if (queueTurn) {
+        this._promptQueueExecutions.delete(session)
+        this._promptQueueExecutionKeys.delete(session.sessionKey)
+      }
+      release()
+      throw err
+    }
     session._externalTurnAbort = controller
     let finished = false
     return {
@@ -2079,7 +2266,12 @@ export class SessionManager {
         if (finished) return
         finished = true
         if (session._externalTurnAbort === controller) session._externalTurnAbort = undefined
+        session._currentTurnKey = undefined
         this.endClientTurn(session, outcome)
+        if (queueTurn) {
+          this._promptQueueExecutions.delete(session)
+          this._promptQueueExecutionKeys.delete(session.sessionKey)
+        }
         release()
       },
     }
@@ -2312,6 +2504,47 @@ export class SessionManager {
     return filter ? keys.filter(filter) : keys
   }
 
+  /** Fence the complete accepted-grant window: session lookup/engine switch,
+   * attachment preprocessing, activation, provider execution and settlement.
+   * PG still owns ordering; this token only turns accidental parallel runtime
+   * work into a synchronous invariant failure. */
+  beginPromptQueueExecutionFence(sessionKey: string): PromptQueueExecutionFence {
+    const existing = this.sessions.get(sessionKey)
+    if (
+      this._promptQueueDispatchFences.has(sessionKey) ||
+      this._promptQueueExecutionKeys.has(sessionKey) ||
+      (existing?._activeTurnCount ?? 0) > 0 ||
+      (existing?._activeClientTurnCount ?? 0) > 0
+    ) {
+      throw new Error(
+        'PROMPT_QUEUE_EXECUTION_INVARIANT: logical session already owns runtime work',
+      )
+    }
+    const token = Symbol(`prompt-queue:${sessionKey}`)
+    this._promptQueueDispatchFences.set(sessionKey, token)
+    let released = false
+    return {
+      sessionKey,
+      token,
+      release: () => {
+        if (released) return
+        released = true
+        if (this._promptQueueDispatchFences.get(sessionKey) === token) {
+          this._promptQueueDispatchFences.delete(sessionKey)
+        }
+      },
+    }
+  }
+
+  private _ownsPromptQueueExecutionFence(
+    sessionKey: string,
+    fence: PromptQueueExecutionFence | undefined,
+  ): boolean {
+    return fence !== undefined &&
+      fence.sessionKey === sessionKey &&
+      this._promptQueueDispatchFences.get(sessionKey) === fence.token
+  }
+
   async getOrCreate(opts: {
     sessionKey: string
     agent: AgentDef
@@ -2379,6 +2612,8 @@ export class SessionManager {
      *  既存 session 的 effort 切换走 submit(effortLevel) — 在那里和 turn 入队
      *  原子串行,避免 getOrCreate→submit 之间的窗口期被另一条并发消息覆盖。 */
     effortLevel?: string | null
+    /** Accepted queue grant fence acquired before any session/preflight work. */
+    promptQueueExecutionFence?: PromptQueueExecutionFence
     /**
      * Workload tag → CCB `--workload <tag>` → `cc_workload=<tag>` in the
      * billing-header attribution block. Set this to `'cron'` for
@@ -2408,6 +2643,18 @@ export class SessionManager {
      *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
     usageAttribution?: UsageAttributionTag
   }): Promise<AgentSession> {
+    const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
+      opts.sessionKey,
+      opts.promptQueueExecutionFence,
+    )
+    if (
+      (opts.promptQueueExecutionFence && !ownsDispatchFence) ||
+      (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
+    ) {
+      throw new Error(
+        'PROMPT_QUEUE_EXECUTION_INVARIANT: queue preflight owns this logical session',
+      )
+    }
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
@@ -2446,6 +2693,14 @@ export class SessionManager {
           ? engineId
           : existing.providerTag
       if (existing.providerTag !== desiredEngine) {
+        if (
+          this._promptQueueExecutionKeys.has(opts.sessionKey) ||
+          (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
+        ) {
+          throw new Error(
+            'PROMPT_QUEUE_EXECUTION_INVARIANT: engine switch cannot replace an active queue session',
+          )
+        }
         // Same logical client session, but the desired engine changed (model
         // switch across engines, or agent switched between CCB and Codex).
         // Native resume ids are engine-specific, so tear down the old runner
@@ -2738,6 +2993,19 @@ export class SessionManager {
        * dispatchInbound 从验签 descriptor 取出)。仅 webchat-DM durable turn 传;
        * 驱动 inbox running(先于模型)+ turn-end tape 带 dispatchId/attemptNo。 */
       dispatchContext?: AgentSession['_currentDispatch']
+      /** Lifecycle owned by the PG prompt-queue coordinator. The reservation
+       * hook runs after the real durable turn id is minted and before either
+       * engine receives input. */
+      queueLifecycle?: {
+        readonly queueTurn: true
+        onTurnReserved(reservation: {
+          turnIndex: number
+          turnKey: string
+          traceId?: string
+        }): Promise<void>
+      }
+      /** Token returned by beginPromptQueueExecutionFence(). */
+      queueExecutionFence?: PromptQueueExecutionFence
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -2796,11 +3064,32 @@ export class SessionManager {
     const callerSpecifiedToolsets = Object.prototype.hasOwnProperty.call(opts ?? {}, 'toolsets')
     const desiredToolsets = normalizeToolsetListForCompare(opts?.toolsets)
 
+    const queueTurn = opts?.queueLifecycle !== undefined
+    const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
+      session.sessionKey,
+      opts?.queueExecutionFence,
+    )
+    if (opts?.queueExecutionFence && !ownsDispatchFence) {
+      throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: stale queue execution fence')
+    }
+    assertPromptQueueExecutionAdmission(
+      queueTurn,
+      session._activeTurnCount ?? 0,
+      session._activeClientTurnCount ?? 0,
+      this._promptQueueExecutions.has(session) ||
+        this._promptQueueExecutionKeys.has(session.sessionKey) ||
+        (this._promptQueueDispatchFences.has(session.sessionKey) && !ownsDispatchFence),
+    )
+
     const prev = session.lock
-    let release!: () => void
+    let release: () => void = () => {}
     let memoryTurnBarrier: KernelFileLock | undefined
     let replayLifecycleStarted = false
     let unhandledTurnError: unknown | undefined
+    if (queueTurn) {
+      this._promptQueueExecutions.add(session)
+      this._promptQueueExecutionKeys.add(session.sessionKey)
+    }
     session.lock = new Promise<void>((r) => (release = r))
     // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 ++。详见
     // AgentSession._activeTurnCount 注释。位置:lock 新建后、`await prev`
@@ -3076,6 +3365,7 @@ export class SessionManager {
             opts?.modelAuthority,
             opts?.replayLifecycle?.clientMessageId,
             opts?.dispatchContext,
+            opts?.queueLifecycle,
           ),
           livenessPromise,
         ])
@@ -3171,6 +3461,10 @@ export class SessionManager {
           session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
           session._currentTurnKey = undefined
           session._currentDispatch = undefined
+          if (queueTurn) {
+            this._promptQueueExecutions.delete(session)
+            this._promptQueueExecutionKeys.delete(session.sessionKey)
+          }
           release()
         }
       }
@@ -3200,6 +3494,14 @@ export class SessionManager {
      *  webchat-DM durable turn 才有;用于**模型调用前**落 inbox running + turn-end
      *  tape 带 dispatchId。 */
     dispatchContext?: AgentSession['_currentDispatch'],
+    queueLifecycle?: {
+      readonly queueTurn: true
+      onTurnReserved(reservation: {
+        turnIndex: number
+        turnKey: string
+        traceId?: string
+      }): Promise<void>
+    },
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -3301,6 +3603,13 @@ export class SessionManager {
       }
       session._currentDispatch = dispatchContext
     }
+    if (queueLifecycle) {
+      await queueLifecycle.onTurnReserved({
+        turnIndex: projectedTurnIndex,
+        turnKey,
+        ...(traceId ? { traceId } : {}),
+      })
+    }
     const assistantMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}`
     const thinkingMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}-thinking`
     // V3 v7.1 — canonical tool row id factory. Same lifecycle as the
@@ -3355,6 +3664,7 @@ export class SessionManager {
           modelAuthority,
           retryRuntimeEvents,
           retryAssistantSegments,
+          queueLifecycle?.queueTurn === true,
           attempt < MAX_RETRIES,
           !phantomRetryUsed,
         )
@@ -3483,6 +3793,9 @@ export class SessionManager {
     retryRuntimeEvents: DurableRuntimeEvent[] = [],
     /** User-visible retry notices already emitted before this attempt. */
     retryAssistantSegments: SegmentRecord[] = [],
+    /** True only for a claimed PG queue turn; propagated to runner-local
+     * backlog guards and never changes engine semantics. */
+    queueTurn = false,
     /** Whether an auth result may reject for another credential-refresh try. */
     retryAuthErrors = true,
     /** Whether an empty phantom result may reject for its one clean-process try. */
@@ -4325,7 +4638,9 @@ export class SessionManager {
                   ? {
                       errorCode:
                         terminalOverride?.errorCode ??
-                        (result.errorKind === 'auth' ? 'AUTH_ERROR' : 'ENGINE_ERROR'),
+                        (result.errorKind === 'auth'
+                          ? 'AUTH_ERROR'
+                          : _tapeErrorCodeForGenericFailure(result.errorDetail)),
                       errorDetail:
                         terminalOverride?.reason ??
                         result.errorDetail ??
@@ -4414,7 +4729,17 @@ export class SessionManager {
           // terminal completion until the authoritative master ACKs it.
           if (persistenceAcknowledged) {
             if (terminalErrorForClient) {
-              onEvent({ kind: 'error', error: terminalErrorForClient })
+              // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的
+              // buildTurnSummary 从 TurnResult 复制),直读即可 —— 不再 cast 穿透,
+              // 也不再靠 server 侧重新正则解析 errorDetail 兜底。runner 预分类在场
+              // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
+              // server 侧回落 classifyRunError,行为不变。
+              const preClassified = result?.errorClass
+              onEvent({
+                kind: 'error',
+                error: terminalErrorForClient,
+                ...(preClassified ? { errorClass: preClassified } : {}),
+              })
             } else if (pendingFinal) {
               onEvent(pendingFinal)
             }
@@ -4480,6 +4805,7 @@ export class SessionManager {
       // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
       const submittedTurn = runner.submitTurn({
         input: userTextOrBlocks,
+        ...(queueTurn ? { queueTurn: true } : {}),
         requestId,
         ...(turnKey ? { turnKey } : {}),
         // 模型权威批次 §4:bridge turn 的两张签名票(本地路径 undefined → CCB runner
@@ -4530,6 +4856,14 @@ export class SessionManager {
     if (external && !external.signal.aborted) external.abort()
     const runnerInterrupted = s.runner.interrupt()
     return !!external || runnerInterrupted
+  }
+
+  /** Stop-and-run fence: never interrupt a newer turn that raced the queue
+   * mutation/PG response. Exact logical turnKey is the only accepted owner. */
+  interruptExact(sessionKey: string, turnKey: string): boolean {
+    const session = this.sessions.get(sessionKey)
+    if (!session || session._currentTurnKey !== turnKey) return false
+    return this.interrupt(sessionKey)
   }
 
   getByKey(sessionKey: string): AgentSession | undefined {

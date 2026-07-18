@@ -214,6 +214,9 @@ describe('buildCodexProviderConfigArgs — requiresOpenaiAuth argv', () => {
       '-c', `model_providers.${id}.name="OpenAI (OpenClaude relay)"`,
       '-c', `model_providers.${id}.base_url="http://127.0.0.1:${PORT}${CODEX_OFFICIAL_RELAY_BASE_PATH}"`,
       '-c', `model_providers.${id}.wire_api="responses"`,
+      // turn-retry 批:原生重试旋钮(乘性 → 单 API 调用最多 12 次尝试)。
+      '-c', `model_providers.${id}.request_max_retries=1`,
+      '-c', `model_providers.${id}.stream_max_retries=5`,
       '-c', `model_providers.${id}.requires_openai_auth=true`,
       '-c', 'preferred_auth_method="chatgpt"',
       '-c', 'disable_response_storage=true',

@@ -16,13 +16,13 @@ import {
   classifyEmptyTurn,
   countAnswerBlocks,
   type EmptyTurnDecision,
-  EXPECTED_TURN_ERR_CODES,
   findOrCreateStreamingRow,
   frameSeqKey,
   friendlyBridgeErrorMessage,
   getFrameSeqCursor,
   isBridgeAuthControlError,
   normalizeBridgeErrorCode,
+  REPORT_EXEMPT_TURN_ERR_CODES,
   safeBridgeErrorDetail,
   shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
@@ -34,6 +34,7 @@ import {
   type ChatSession,
   type ChildBlock,
   clearTurnTiming,
+  isRetryingTurnStatus,
   isServerAuthoredRow,
   markFrameReceived,
   rebuildIndexes,
@@ -1132,6 +1133,10 @@ export function applyOutboundMessage(
   if (!frame.isFinal && !frame.cronJob && hasBlocks && !tailOnlyFrame && !sess._sendingInFlight)
     sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
+  // 自动重试软提示的**内容帧兜底消解**:引擎在下一 attempt 产出真实内容(非 tail-only)即代表流
+  // 已恢复 → 清 retrying,防 gateway 的 turn_status:null 复位帧在断线重连窗口丢失时软提示粘住。
+  // final/error/interrupted 由 clearTurnTiming 统一清 _turnStatus,此处只兜「流恢复但 null 帧丢」。
+  if (hasBlocks && !tailOnlyFrame && isRetryingTurnStatus(sess._turnStatus)) sess._turnStatus = null;
   // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
   if (sess._sendingInFlight && !frame.isFinal && !tailOnlyFrame) effects.onLiveFrame?.(sess);
 
@@ -1641,7 +1646,21 @@ export function applyOutboundMessage(
 export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire): void {
   if (!acceptFrameSeq(sess, frame)) return;
   markFrameReceived(sess); // liveness signal
-  sess._turnStatus = frame.status === "compacting" ? "compacting" : null;
+  // 判别联合(turn-retry 批):compacting 沿用字符串态;retrying 存下 attempt/max/retryAt 软提示
+  // 载荷(不进 tape);其余(status:null / compact_end / abort)回到普通流式空态。retry 元数据只在
+  // retrying 分支携带,故此处显式 narrow,不接受其它态漂出 retry 字段。
+  if (frame.status === "compacting") {
+    sess._turnStatus = "compacting";
+  } else if (frame.status === "retrying") {
+    sess._turnStatus = {
+      kind: "retrying",
+      attempt: frame.retry.attempt,
+      max: frame.retry.max,
+      retryAt: frame.retry.retryAt,
+    };
+  } else {
+    sess._turnStatus = null;
+  }
 }
 
 // ═══════════════ outbound.error 双帧（§11）═══════════════
@@ -1687,7 +1706,10 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     }
   }
   effects.persistSession?.(sess.id);
-  if (!EXPECTED_TURN_ERR_CODES.has(normalized)) {
+  // 遥测上报口径用**遥测豁免集**(reportable===false),与"预期业务态"(expected)解耦
+  // (Codex 审计 R5c):rate_limited/model_capacity/service_restart/image_server_busy 虽对用户预期,
+  // 但是平台运营故障信号,必须上报;仅用户主动(stopped/user_cancelled)与业务拒绝类才豁免。
+  if (!REPORT_EXEMPT_TURN_ERR_CODES.has(normalized)) {
     effects.reportTurnError?.({
       code: normalized,
       message: `${normalized}: ${frame.message || frame.detail || ""}`,

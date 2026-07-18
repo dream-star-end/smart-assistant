@@ -79,6 +79,11 @@ describe('buildCodexProviderConfigArgs', () => {
       'model_providers.api111.base_url="https://yunwu.ai/v1"',
       '-c',
       'model_providers.api111.wire_api="responses"',
+      // turn-retry 批:原生 API 重试旋钮(乘性 → 单 API 调用最多 12 次尝试)。
+      '-c',
+      'model_providers.api111.request_max_retries=1',
+      '-c',
+      'model_providers.api111.stream_max_retries=5',
       '-c',
       'preferred_auth_method="apikey"',
       '-c',
@@ -115,6 +120,10 @@ describe('buildCodexProviderConfigArgs', () => {
       '-c',
       'model_providers.route_provider.wire_api="responses"',
       '-c',
+      'model_providers.route_provider.request_max_retries=1',
+      '-c',
+      'model_providers.route_provider.stream_max_retries=5',
+      '-c',
       'preferred_auth_method="apikey"',
       '-c',
       'disable_response_storage=true',
@@ -146,6 +155,29 @@ describe('buildCodexProviderConfigArgs', () => {
       OC_CODEX_DISABLE_RESPONSE_STORAGE: 'false',
     })
     assert.ok(args.includes('disable_response_storage=false'), args.join(' '))
+  })
+
+  it('turn-retry:provider block 追加原生重试旋钮(request/stream max_retries,乘性→12)', () => {
+    // 两旋钮经 codex 0.144 --strict-config 实测接受;乘性 = (request+1)×(stream+1)
+    // = 2×6 = 12 次单-API-调用尝试。把 mid-turn capacity 血崩窗口从 ~7s 拉宽到 ~30s+。
+    const pairs = pairsOf(
+      buildCodexProviderConfigArgs({
+        OC_CODEX_MODEL_PROVIDER: 'api222',
+        OC_CODEX_BASE_URL: 'https://relay.example/v1',
+      }),
+    )
+    assert.ok(
+      pairs.includes('model_providers.api222.request_max_retries=1'),
+      pairs.join(' '),
+    )
+    assert.ok(
+      pairs.includes('model_providers.api222.stream_max_retries=5'),
+      pairs.join(' '),
+    )
+    // 两键都挂在具体 provider id 下(provider-scoped,不是顶层键)。
+    assert.ok(!pairs.some((p) => /^(?:request|stream)_max_retries=/.test(p)), pairs.join(' '))
+    // 官方 OAuth 空 override(无 provider block)不产任何 retry 键。
+    assert.deepEqual(buildCodexProviderConfigArgs({}, {}), [])
   })
 })
 

@@ -6,7 +6,7 @@
 `docs/V5_DEV_PLAYBOOK.md`**(v5 单一权威手册:架构地图/开发工作流/按症状定位路由/
 部署生效面矩阵/技术债登记)。演进方向见 `docs/V5_ROADMAP_2026H2.md`。
 - v5 canonical 分支 = `feat/v5-aurora-rewrite`(部署树 /opt/openclaude/openclaude-v5-aurora);新 worktree 一律基于它。
-- 部署红线速记:容器内代码(gateway/CCB/entrypoint)改动必须重建 runtime image;前端必须 vite build+rsync dist+重启;egress 代码必须 --egress;env overrides 改动必须手动同步线上 env;迁移人工 apply+登记 schema_migrations。
+- 部署红线速记:容器内源码(gateway/CCB/storage/protocol)走 runtime source release 轴(deploy-v5.sh,零镜像重建;Dockerfile/镜像工具链改动才重建 runtime image,见 playbook §2 生效面矩阵);前端必须 vite build+rsync dist+重启;egress 代码必须 --egress;env overrides 改动必须手动同步线上 env;迁移人工 apply+登记 schema_migrations。
 - 完成的定义 = 测试实跑通过 + Codex 审计 PASS + 按生效面矩阵部署 + smoke 通过。
 
 

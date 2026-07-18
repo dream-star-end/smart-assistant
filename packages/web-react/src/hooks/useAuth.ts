@@ -203,6 +203,19 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
           return;
         }
         if (outcome.kind === "transient") {
+          // throttled = api 层限频早返(nextAllowedAt 未到,没发真实网络请求)——不是新的
+          // 失败证据,不计入重试次数;补睡剩余限频窗后重进循环(届时必发真实请求,收敛)。
+          // 背景:消费层 setTimeout 有亚毫秒早醒(libuv ms 取整),睡满 retryAfterMs 醒来仍可能
+          // 差 <1ms 撞进限频分支;把它当失败会"只发一次网络就放弃恢复"(CI flake 同根因,
+          // 生产语义同错:显示恢复失败前应真的试满 2 次网络)。
+          if (outcome.throttled) {
+            try {
+              await waitForRecovery(Math.max(1, outcome.retryAfterMs), controller.signal);
+            } catch {
+              return;
+            }
+            continue;
+          }
           const localBackoff = AUTH_RECOVERY_BACKOFF_MS[Math.min(refreshAttempt, AUTH_RECOVERY_BACKOFF_MS.length - 1)];
           refreshAttempt += 1;
           if (refreshAttempt >= 2) {

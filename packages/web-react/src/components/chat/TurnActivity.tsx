@@ -12,6 +12,7 @@
  */
 import { useEffect, useState } from "react";
 import type { TodoItem } from "./PinnedTaskTracker";
+import { isRetryingTurnStatus, type TurnStatusState } from "../../lib/chat/model";
 import { computeTypingLabel } from "../../lib/chat/pure";
 import { cn } from "../../lib/utils";
 
@@ -25,8 +26,9 @@ export type TurnActivityInfo = {
   startedAt: number | null;
   /** 最近一帧到达时刻（_lastFrameAt），用于静默时长升级文案。 */
   lastFrameAt?: number;
-  /** turn 状态（compacting 时显示「正在压缩上下文」）。 */
-  turnStatus?: string | null;
+  /** turn 非流式阶段态(判别联合,单一权威 model.ts TurnStatusState):
+   *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 「模型繁忙，自动重试中」+ 倒计时。 */
+  turnStatus?: TurnStatusState | null;
   /** 容器冷启（sys.cold_start）：typing 文案追加「容器首次加载中」后缀。 */
   coldStart?: boolean;
   /** 显示用 agent 名（如「主助手」「编程助手」）。 */
@@ -71,10 +73,21 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   const secs = Math.max(0, Math.round((now - started) / 1000));
   const silenceMs = info.lastFrameAt ? Math.max(0, now - info.lastFrameAt) : 0;
 
+  // 自动重试软提示优先级最高:此时 turn 未流式(上一 attempt 失败、等待下一次),秒级倒计时
+  // 由本组件自带的 1s tick 驱动(retryAt - now,断线重连按绝对时刻重算,不精确亦可)。软提示走
+  // warning tone、**不是红卡**——错误仍在自动挽救中,不该吓用户。
+  const retry = isRetryingTurnStatus(info.turnStatus) ? info.turnStatus : null;
+
   let text: string;
   let cls = "";
-  if (info.turnStatus === "compacting") {
-    // 压缩上下文优先级最高（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。
+  if (retry) {
+    const remain = Math.max(0, Math.ceil((retry.retryAt - now) / 1000));
+    text = `模型繁忙，自动重试中（第 ${retry.attempt}/${retry.max} 次）${
+      remain > 0 ? ` · ${remain}s 后重试` : "…"
+    }`;
+    cls = "retrying";
+  } else if (info.turnStatus === "compacting") {
+    // 压缩上下文（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。
     ({ text, cls } = computeTypingLabel({ name: info.agentName, secs, silenceMs, turnStatus: "compacting" }));
   } else if (info.leaderStep) {
     // 团队模式：消息区常长时间纯空白（队长在委派/编排），用队长当前 step 填充等待文案。
@@ -85,14 +98,13 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
       name: info.agentName,
       secs,
       silenceMs,
-      turnStatus: info.turnStatus,
       hint,
     }));
   }
 
   return (
     <div
-      className={cn("flex items-center gap-2 py-1 text-[13px] text-muted", cls)}
+      className={cn("flex items-center gap-2 py-1 text-[13px]", retry ? "text-warning" : "text-muted", cls)}
       aria-label="生成中"
       aria-live="polite"
     >

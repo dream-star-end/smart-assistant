@@ -255,6 +255,20 @@ export function buildCodexProviderConfigArgs(
     `model_providers.${providerId}.base_url=${tomlString(baseUrl)}`,
     '-c',
     `model_providers.${providerId}.wire_api=${tomlString(wireApi)}`,
+    // ── 原生 API 重试旋钮(turn-retry 批,2026-07-18)────────────────────
+    // codex 0.144 `--strict-config` 下两键实测被接受(两 key 分别用真实 relay
+    // key 验证通过;bogus provider id 被 CODEX_PROVIDER_ID_RE 拒证明校验真实)。
+    // 两旋钮对 5xx/上游过载**乘性**生效:单个 API 调用的总尝试 = (request+1)×
+    // (stream+1)。此处 request_max_retries=1、stream_max_retries=5 → 单调用最多
+    // 12 次尝试(默认 request=0×stream=5 = 6 次,约 7.3s 指数退避)。
+    // 目的:把 mid-turn capacity 血崩窗口从 ~7s 拉宽到 ~30s+。这是**无副作用**的
+    // 正确重试层 —— 底座在同一个 HTTP 调用内做透明重放,不重发 turn、不重复
+    // user input(与 runner 上层「仅 turn/start 请求本身被拒」的窄路径重试正交,
+    // 见 codexAppServerRunner.runTurn 实测②注释)。
+    '-c',
+    `model_providers.${providerId}.request_max_retries=1`,
+    '-c',
+    `model_providers.${providerId}.stream_max_retries=5`,
     ...(requiresOpenaiAuth
       ? ['-c', `model_providers.${providerId}.requires_openai_auth=true`]
       : []),

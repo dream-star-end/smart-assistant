@@ -24,6 +24,7 @@ import {
   addMessage,
   type ChatMessage,
   createSession,
+  isRetryingTurnStatus,
   isServerAuthoredRow,
   resetReplyTracker,
   shouldApplyGoalSnapshot,
@@ -35,6 +36,7 @@ import {
   applyOutboundError,
   applyOutboundMessage,
   applyResumeFailed,
+  applyTurnStatus,
   normalizeDelegateCards,
   normalizeGoalCards,
   type FrameEffects,
@@ -42,6 +44,7 @@ import {
 import {
   ChatSocket,
   messageAttemptIdempotencyKey,
+  preciseRetryEligible,
   writeAutoContinuePreamblePref,
   type ChatSocketDeps,
 } from "./socket";
@@ -364,6 +367,118 @@ describe("模型权威拒帧的用户向文案(MODEL_CONFIG_CHANGED_RETRY_TURN �
     expect(EXPECTED_TURN_ERR_CODES.has("model_not_available")).toBe(true);
     expect(EXPECTED_TURN_ERR_CODES.has("model_authority_unavailable")).toBe(false);
     expect(EXPECTED_TURN_ERR_CODES.has("model_catalog_unavailable")).toBe(false);
+  });
+});
+
+// friendlyBridgeErrorMessage 服务端 message 白名单透传(任务①/⑥)。
+describe("friendlyBridgeErrorMessage · 服务端 message 白名单", () => {
+  test("container_outdated(allowPublicServerMessage) 带合法 message → 透传服务端原因", () => {
+    const msg = friendlyBridgeErrorMessage("container_outdated", "运行环境已升级到 v9，请刷新页面。");
+    expect(msg).toBe("运行环境已升级到 v9，请刷新页面。");
+  });
+
+  test("container_outdated 带 JSON 形态 message → 回按码文案(不透传技术串)", () => {
+    const msg = friendlyBridgeErrorMessage(
+      "container_outdated",
+      '{"error":"image_missing","status":503}',
+    );
+    expect(msg).not.toMatch(/image_missing|503|\{/);
+    expect(msg).toMatch(/刷新页面/); // 按码文案仍指向「刷新」而非「重试」
+  });
+
+  test("非白名单码(rate_limited)即便带合法 message 也不透传 → 按码文案", () => {
+    const msg = friendlyBridgeErrorMessage("rate_limited", "slow down please");
+    expect(msg).not.toMatch(/slow down/);
+    expect(msg).toMatch(/稍后|重试/);
+  });
+
+  test("model_capacity → 引导稍后重试或切换模型(新增码,非兜底)", () => {
+    const msg = friendlyBridgeErrorMessage("model_capacity");
+    expect(msg).not.toMatch(/系统暂时不可用/);
+    expect(msg).toMatch(/切换|模型|重试/);
+  });
+
+  test("container_outdated 正文指向刷新页面(不是重试)", () => {
+    expect(friendlyBridgeErrorMessage("container_outdated")).toMatch(/刷新页面/);
+  });
+});
+
+// ═══════════════ applyTurnStatus retrying 软提示(任务③)═══════════════
+function turnStatusFrame(over: AnyFrame): Parameters<typeof applyTurnStatus>[1] {
+  return {
+    type: "outbound.turn_status",
+    sessionKey: "agent:main:webchat:dm:s1",
+    channel: "webchat",
+    peer: { id: "s1", kind: "dm" },
+    ...over,
+  } as unknown as Parameters<typeof applyTurnStatus>[1];
+}
+
+describe("applyTurnStatus retrying 判别联合", () => {
+  test("status=retrying → _turnStatus 建模为 {kind,attempt,max,retryAt}", () => {
+    const s = sess();
+    const retryAt = Date.now() + 5000;
+    applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 2, max: 3, delayMs: 5000, retryAt } }));
+    expect(isRetryingTurnStatus(s._turnStatus)).toBe(true);
+    expect(s._turnStatus).toEqual({ kind: "retrying", attempt: 2, max: 3, retryAt });
+  });
+
+  test("compacting 现状不变(字符串态)", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "compacting" }));
+    expect(s._turnStatus).toBe("compacting");
+  });
+
+  test("status=null 复位帧 → 清 retrying 软提示", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 1, max: 3, delayMs: 2000, retryAt: Date.now() + 2000 } }));
+    expect(isRetryingTurnStatus(s._turnStatus)).toBe(true);
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    expect(s._turnStatus).toBeNull();
+  });
+
+  test("null 帧丢失时,下一 attempt 的内容帧自动清 retrying(防粘住)", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 2, max: 3, delayMs: 3000, retryAt: Date.now() + 3000 } }));
+    expect(isRetryingTurnStatus(s._turnStatus)).toBe(true);
+    // 引擎在下一 attempt 产出真实文本内容(非 tail-only)→ 流恢复,软提示自动消解。
+    applyOutboundMessage(
+      s,
+      msgFrame({ blocks: [{ kind: "text", text: "重试成功后的回复" }], frameSeq: 1 }),
+      {},
+    );
+    expect(s._turnStatus).toBeNull();
+  });
+
+  test("tool_output_tail-only 帧不清 retrying(不是内容恢复)", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 2, max: 3, delayMs: 3000, retryAt: Date.now() + 3000 } }));
+    applyOutboundMessage(
+      s,
+      msgFrame({ blocks: [{ kind: "tool_output_tail", blockId: "b1", tail: "x", totalBytes: 1 }], frameSeq: 1 }),
+      {},
+    );
+    expect(isRetryingTurnStatus(s._turnStatus)).toBe(true);
+  });
+
+  test("终态 error 帧 → clearTurnTiming 清 _turnStatus", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    s._activeClientMessageId = "u1";
+    applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 3, max: 3, delayMs: 0, retryAt: Date.now() } }));
+    applyOutboundError(s, {
+      type: "outbound.error",
+      sessionKey: "k",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      code: "model_capacity",
+      message: "at capacity",
+      clientMessageId: "u1",
+      isFinal: false,
+    } as never);
+    expect(s._turnStatus).toBeNull();
   });
 });
 
@@ -1816,6 +1931,82 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s._sendingInFlight).toBe(false);
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
     expect(persistSession).toHaveBeenCalledWith("s1");
+  });
+});
+
+// 遥测上报口径:改用 REPORT_EXEMPT(reportable===false),与 expected 解耦(Codex 审计 R5c)。
+describe("applyOutboundError 遥测上报口径(R5c:report-exempt 而非 expected)", () => {
+  const fire = (code: string) => {
+    const s = sess();
+    addMessage(s, "user", "hi", { status: "sent", ts: 1 });
+    s._sendingInFlight = true;
+    const reportTurnError = vi.fn();
+    applyOutboundError(
+      s,
+      { type: "outbound.error", channel: "webchat", peer: { id: "s1", kind: "dm" }, code, message: "x", isFinal: true } as never,
+      { reportTurnError },
+    );
+    return reportTurnError;
+  };
+
+  test("rate_limited / model_capacity / service_restart / image_server_busy → 恢复上报(平台运营信号)", () => {
+    for (const code of ["rate_limited", "model_capacity", "service_restart", "image_server_busy"]) {
+      expect(fire(code)).toHaveBeenCalledWith(expect.objectContaining({ code }));
+    }
+  });
+
+  test("stopped / user_cancelled / insufficient_credits / maintenance → 仍豁免上报(用户主动/业务拒绝)", () => {
+    for (const code of ["stopped", "user_cancelled", "insufficient_credits", "maintenance"]) {
+      expect(fire(code)).not.toHaveBeenCalled();
+    }
+  });
+
+  test("基建故障(engine_error / model_authority_unavailable)→ 上报", () => {
+    expect(fire("engine_error")).toHaveBeenCalled();
+    expect(fire("model_authority_unavailable")).toHaveBeenCalled();
+  });
+});
+
+// 精确重试资格(红卡 CTA 硬门 R4):与 retryMessage 实际读取字段严格对齐。
+describe("preciseRetryEligible(Codex 审计 R4:精确重试完整性硬门)", () => {
+  const base = (over: Partial<ChatMessage>): ChatMessage =>
+    ({ id: "u1", role: "user", text: "hi", ts: 1, status: "error", ...over }) as ChatMessage;
+
+  test("自带 _routing、无附件 → 可精确重试", () => {
+    expect(preciseRetryEligible(base({ _routing: { model: "m", teamMode: false, effortLevel: null } }))).toBe(true);
+  });
+
+  test("无 _routing(依赖 _lastRouting 回退)→ 不可精确重试(不借用别轮快照)", () => {
+    expect(preciseRetryEligible(base({ _routing: undefined }))).toBe(false);
+  });
+
+  test("带附件且 media 仍携带 url/base64 → 可精确重试", () => {
+    expect(
+      preciseRetryEligible(
+        base({ _routing: { teamMode: false }, _media: [{ kind: "image", url: "https://x/a.png" }] }),
+      ),
+    ).toBe(true);
+  });
+
+  test("带附件但 media 只剩 localSrc(url/base64 均缺)→ 不可精确重试(重发证据已丢)", () => {
+    expect(
+      preciseRetryEligible(
+        base({ _routing: { teamMode: false }, _media: [{ kind: "image", localSrc: "blob:abc" }] }),
+      ),
+    ).toBe(false);
+  });
+
+  test("_retryMedia 优先于 _media 作重发源(imageEdit 剥离 localSrc 的出站版本)", () => {
+    // _media 只剩 localSrc,但 _retryMedia 带 url → 按 retryMessage 实读源(_retryMedia ?? _media)判为可重发。
+    expect(
+      preciseRetryEligible(
+        base({
+          _routing: { teamMode: false },
+          _media: [{ kind: "image", localSrc: "blob:abc" }],
+          _retryMedia: [{ kind: "image", url: "https://x/a.png" }],
+        }),
+      ),
+    ).toBe(true);
   });
 });
 

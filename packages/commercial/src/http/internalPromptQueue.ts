@@ -323,10 +323,11 @@ function parseClaim(value: unknown): PromptQueueClaimRequest {
     }
   }
   if (value.action === 'activate') {
-    assertOnlyKeys(value, ['action', 'epoch', 'claimToken', 'turnId', 'traceId', 'steerDelivery'])
+    assertOnlyKeys(value, ['action', 'epoch', 'claimToken', 'turnId', 'turnIndex', 'traceId', 'steerDelivery'])
     assertString('epoch', value.epoch, 20, VERSION_RE)
     assertString('claimToken', value.claimToken, 64, TOKEN_RE)
     assertString('turnId', value.turnId, 64, TURN_ID_RE)
+    assertTurnIndex(value.turnIndex)
     if (value.traceId !== undefined) assertString('traceId', value.traceId, 64, TRACE_ID_RE)
     if (!['native', 'fork-native', 'turn-boundary'].includes(String(value.steerDelivery))) {
       throw new InvalidPromptQueueBodyError('invalid steerDelivery')
@@ -336,11 +337,29 @@ function parseClaim(value: unknown): PromptQueueClaimRequest {
       epoch: value.epoch,
       claimToken: value.claimToken,
       turnId: value.turnId,
+      turnIndex: value.turnIndex,
       ...(typeof value.traceId === 'string' ? { traceId: value.traceId } : {}),
       steerDelivery: value.steerDelivery as 'native' | 'fork-native' | 'turn-boundary',
     }
   }
+  if (value.action === 'complete') {
+    assertOnlyKeys(value, ['action', 'turnId', 'turnIndex'])
+    assertString('turnId', value.turnId, 64, TURN_ID_RE)
+    assertTurnIndex(value.turnIndex)
+    return { action: 'complete', turnId: value.turnId, turnIndex: value.turnIndex }
+  }
+  if (value.action === 'interrupt_ack') {
+    assertOnlyKeys(value, ['action', 'turnId'])
+    assertString('turnId', value.turnId, 64, TURN_ID_RE)
+    return { action: 'interrupt_ack', turnId: value.turnId }
+  }
   throw new InvalidPromptQueueBodyError('unknown claim action')
+}
+
+function assertTurnIndex(value: unknown): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > 2_147_483_647) {
+    throw new InvalidPromptQueueBodyError('turnIndex must fit the non-negative PostgreSQL integer range')
+  }
 }
 
 class InvalidPromptQueueBodyError extends Error {}

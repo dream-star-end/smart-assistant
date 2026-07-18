@@ -238,6 +238,36 @@ function normalizeRetiredRouting(
   return { ...routing, model: DEFAULT_CODEX_ENGINE_MODEL };
 }
 
+/**
+ * 精确重试(红卡 CTA)资格判定 —— 与 `retryMessage` 实际读取的字段**严格对齐**(单一权威,
+ * Codex 审计 R4)。
+ *
+ * `retryMessage` 复用被中断轮的 routing 与附件:routing 取 `_routing`(缺省回退
+ * `sess._lastRouting`),media 取 `_retryMedia ?? _media`。精确 CTA 是"原样重发这一轮"的承诺,
+ * 不允许悄悄借用**另一轮**的 `_lastRouting` 快照(会用错模型/effort 重发),也不允许在附件的
+ * 重发证据已丢时静默降级成纯文本重发。故这里加两条完整性硬门:
+ *   ① 该 user 行**自带** `_routing` 快照(不依赖 `_lastRouting` 回退);
+ *   ② 若原消息带附件,`retryMessage` 实际读取的 media 源(`_retryMedia ?? _media`)必须仍
+ *      携带服务端可解析的传输证据(`url`/`base64`)—— `localSrc` 是本机 blob,持久化即被剥离
+ *      (见 `toStored`),不可跨发。
+ * 任一不满足 → 精确 CTA 不显示(由红卡落回 `onRegenerate` 兜底)。**不改 `retryMessage` 既有
+ * 调用方语义**:手动用户气泡「重试」(legacy 行无 `_routing` 时仍回退 `_lastRouting`)不受影响。
+ */
+export function preciseRetryEligible(
+  msg: Pick<ChatMessage, "_routing" | "_media" | "_retryMedia">,
+): boolean {
+  if (!msg._routing) return false;
+  const hadAttachments = (msg._media?.length ?? 0) > 0 || (msg._retryMedia?.length ?? 0) > 0;
+  if (!hadAttachments) return true;
+  const source = msg._retryMedia && msg._retryMedia.length > 0 ? msg._retryMedia : msg._media;
+  if (!source || source.length === 0) return false;
+  return source.every(
+    (r) =>
+      (typeof r.url === "string" && r.url.length > 0) ||
+      (typeof r.base64 === "string" && r.base64.length > 0),
+  );
+}
+
 /** rAF 合并渲染的隐藏-tab 兜底间隔:rAF 在隐藏 tab 被节流到几乎不触发,用此 setTimeout
  *  保证 snapshot 仍按时刷新 + listeners 触发(避免后台积压、切前台时一致);也封顶渲染延迟。*/
 const NOTIFY_FALLBACK_MS = 250;
@@ -2440,6 +2470,9 @@ export class ChatSocket {
     const text = userMsg._modelText ?? userMsg.text ?? "";
     // Historical rows written before message-level snapshots fall back to the session
     // snapshot; all new rows bind retry routing to the original user turn.
+    // NB: the red-card precise CTA never reaches this fallback — resolveRetryTarget gates it
+    // behind preciseRetryEligible (own _routing required). Only the manual user-bubble retry
+    // (legacy send-failure rows) may still fall back to _lastRouting, and that path is preserved.
     const routing = normalizeRetiredRouting(userMsg._routing ?? sess._lastRouting);
     if (routing) {
       userMsg._routing = { ...routing };

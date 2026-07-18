@@ -689,3 +689,32 @@ test('chat transport moved off api into the WS engine (api has no chat stub)', (
   // api 只剩 REST，不再暴露 chat 入口。
   expect((api as unknown as { chat?: unknown }).chat).toBeUndefined()
 })
+
+test('refresh 限频早返带 throttled 标记且不发真实网络请求(2026-07-18 CI flake 根因锁)', async () => {
+  // 背景:api 层 nextAllowedAt 与消费层 setTimeout 是两个时钟,消费层睡满 retryAfterMs
+  // 醒来仍可能因亚毫秒早醒撞进限频分支。限频早返若不与真实网络失败区分,boot 恢复循环
+  // 会把它计成一次失败 → "只发一次网络请求就放弃恢复"(App.test flake 的根因,生产同错)。
+  const fetchMock = vi.fn(async (url: string) => {
+    if (String(url).includes('/api/auth/refresh'))
+      return authErr(503, 'UPSTREAM_UNAVAILABLE', 'temporary outage')
+    return ok({})
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('')
+  const epoch = session.snapshot().epoch
+  const refreshCalls = () =>
+    fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/auth/refresh')).length
+
+  // 第一次:真实网络失败 → transient 且不带 throttled(真实失败必须计入重试)。
+  const first = await api.refresh(session, epoch)
+  expect(first.kind).toBe('transient')
+  expect(first.kind === 'transient' && first.throttled).toBeFalsy()
+  expect(refreshCalls()).toBe(1)
+
+  // nextAllowedAt 未到,立即再调:限频早返 → throttled=true + 剩余窗口,且零网络请求。
+  const second = await api.refresh(session, epoch)
+  expect(second.kind).toBe('transient')
+  expect(second.kind === 'transient' && second.throttled).toBe(true)
+  expect(second.kind === 'transient' && second.retryAfterMs > 0).toBe(true)
+  expect(refreshCalls()).toBe(1)
+})

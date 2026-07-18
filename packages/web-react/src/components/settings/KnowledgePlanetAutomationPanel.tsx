@@ -70,6 +70,15 @@ type RuleDraft = {
   maxReplyChars: string
 }
 
+type RuleValues = {
+  name: string
+  instructions: string
+  triggerKind: 'new_topic' | 'new_question'
+  dailyLimit: number
+  cooldownMinutes: number
+  maxReplyChars: number
+}
+
 const EMPTY_RULE: RuleDraft = {
   groupId: '',
   name: '',
@@ -89,6 +98,48 @@ function draftFrom(rule: KnowledgePlanetAutomationRule): RuleDraft {
     dailyLimit: String(rule.dailyLimit),
     cooldownMinutes: String(rule.cooldownMinutes),
     maxReplyChars: String(rule.maxReplyChars),
+  }
+}
+
+function validateRuleDraft(
+  draft: RuleDraft,
+): { ok: true; values: RuleValues } | { ok: false; error: string } {
+  const name = draft.name.trim()
+  if (name.length === 0) return { ok: false, error: '请输入规则名称' }
+  if (name.includes('\0')) return { ok: false, error: '规则名称包含无效字符' }
+  if (name.length > 100) return { ok: false, error: '规则名称不能超过 100 个字符' }
+
+  const instructions = draft.instructions.trim()
+  if (instructions.length === 0) return { ok: false, error: '请输入回复要求' }
+  if (instructions.includes('\0')) return { ok: false, error: '回复要求包含无效字符' }
+  if (instructions.length > 4_000)
+    return { ok: false, error: '回复要求不能超过 4000 个字符' }
+
+  if (draft.triggerKind !== 'new_topic' && draft.triggerKind !== 'new_question')
+    return { ok: false, error: '请选择有效的触发范围' }
+
+  const dailyLimit = Number(draft.dailyLimit)
+  if (!Number.isInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 10)
+    return { ok: false, error: '每日上限必须是 1–10 的整数' }
+
+  const cooldownMinutes = Number(draft.cooldownMinutes)
+  if (!Number.isInteger(cooldownMinutes) || cooldownMinutes < 5 || cooldownMinutes > 1_440)
+    return { ok: false, error: '冷却时间必须是 5–1440 分钟的整数' }
+
+  const maxReplyChars = Number(draft.maxReplyChars)
+  if (!Number.isInteger(maxReplyChars) || maxReplyChars < 100 || maxReplyChars > 1_200)
+    return { ok: false, error: '回复字符上限必须是 100–1200 的整数' }
+
+  return {
+    ok: true,
+    values: {
+      name,
+      instructions,
+      triggerKind: draft.triggerKind,
+      dailyLimit,
+      cooldownMinutes,
+      maxReplyChars,
+    },
   }
 }
 
@@ -112,6 +163,7 @@ export function KnowledgePlanetAutomationPanel({
   const [accountLimit, setAccountLimit] = useState('10')
   const [editing, setEditing] = useState<KnowledgePlanetAutomationRule | 'new' | null>(null)
   const [draft, setDraft] = useState<RuleDraft>(EMPTY_RULE)
+  const [ruleError, setRuleError] = useState<string | null>(null)
   const [groups, setGroups] = useState<KnowledgePlanetAutomationGroup[]>([])
   const [groupsLoading, setGroupsLoading] = useState(false)
   const [groupsError, setGroupsError] = useState<string | null>(null)
@@ -212,6 +264,7 @@ export function KnowledgePlanetAutomationPanel({
 
   const openNewRule = () => {
     setDraft(EMPTY_RULE)
+    setRuleError(null)
     setSelectedGroupIds([])
     setGroupSearch('')
     setEditing('new')
@@ -220,6 +273,7 @@ export function KnowledgePlanetAutomationPanel({
 
   const openEditRule = (rule: KnowledgePlanetAutomationRule) => {
     setDraft(draftFrom(rule))
+    setRuleError(null)
     setSelectedGroupIds([])
     setEditing(rule)
     void loadGroups()
@@ -227,29 +281,32 @@ export function KnowledgePlanetAutomationPanel({
 
   const saveRule = async () => {
     if (!editing || busy) return
+    const validated = validateRuleDraft(draft)
+    if (!validated.ok) {
+      setRuleError(validated.error)
+      return
+    }
     setBusy(true)
     setError(null)
-    const values = {
-      name: draft.name,
-      instructions: draft.instructions,
-      triggerKind: draft.triggerKind,
-      dailyLimit: Number(draft.dailyLimit),
-      cooldownMinutes: Number(draft.cooldownMinutes),
-      maxReplyChars: Number(draft.maxReplyChars),
-    }
+    setRuleError(null)
     try {
       if (editing === 'new') {
         await api.createKnowledgePlanetAutomationRulesBatch(auth, account.id, {
           groupIds: selectedGroupIds,
-          ...values,
+          ...validated.values,
         })
       } else {
-        await api.patchKnowledgePlanetAutomationRule(auth, account.id, editing.id, values)
+        await api.patchKnowledgePlanetAutomationRule(
+          auth,
+          account.id,
+          editing.id,
+          validated.values,
+        )
       }
       setEditing(null)
       await reload()
     } catch (saveError) {
-      setError(errorText(saveError, '保存自动回复规则失败'))
+      setRuleError(errorText(saveError, '保存自动回复规则失败'))
     } finally {
       setBusy(false)
     }
@@ -508,29 +565,37 @@ export function KnowledgePlanetAutomationPanel({
         onOpenChange={(open) => {
           if (!open && !busy) {
             setEditing(null)
+            setRuleError(null)
             setGroupPickerOpen(false)
           }
         }}
         title={editing === 'new' ? '批量添加自动回复规则' : '编辑自动回复规则'}
         description="新规则保存后立即启用，并从保存时刻之后的新主题开始扫描，不补发历史主题。"
         footer={
-          <>
-            <Button variant="ghost" size="sm" disabled={busy} onClick={() => setEditing(null)}>
-              取消
-            </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={busy || (editing === 'new' && selectedGroupIds.length === 0)}
-              onClick={() => void saveRule()}
-            >
-              {busy
-                ? '正在保存…'
-                : editing === 'new'
-                  ? `保存并启用 ${selectedGroupIds.length} 条规则`
-                  : '保存规则'}
-            </Button>
-          </>
+          <div className="flex w-full min-w-0 flex-col gap-2">
+            {ruleError && (
+              <Alert tone="danger" className="text-left text-[11.5px]">
+                {ruleError}
+              </Alert>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => setEditing(null)}>
+                取消
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={busy || (editing === 'new' && selectedGroupIds.length === 0)}
+                onClick={() => void saveRule()}
+              >
+                {busy
+                  ? '正在保存…'
+                  : editing === 'new'
+                    ? `保存并启用 ${selectedGroupIds.length} 条规则`
+                    : '保存规则'}
+              </Button>
+            </div>
+          </div>
         }
       >
         <div className="grid gap-3">

@@ -848,10 +848,13 @@ export const OutboundError = Type.Object({
   peer: Peer,
   /** Same turn identity as the companion outbound.message final. */
   clientMessageId: Type.Optional(ClientMessageId),
-  /** 已识别错误分类。前端按 code 决定 UX(insufficient_credits → 给"去充值"CTA)。 */
+  /** 已识别错误分类。前端按 code 决定 UX(insufficient_credits → 给"去充值"CTA)。
+   *  枚举值必须 ∈ protocol turnErrorTaxonomy(契约测试锁);unknown 由
+   *  server 压成 upstream_failed 后再发,wire 上永不出现未知码。 */
   code: Type.Union([
     Type.Literal('insufficient_credits'),
     Type.Literal('rate_limited'),
+    Type.Literal('model_capacity'),
     Type.Literal('upstream_failed'),
   ]),
   /** 简短人类文案,前端直接渲染。 */
@@ -979,22 +982,38 @@ export type OutboundCodexBilling = Static<typeof OutboundCodexBilling>
 // 来源:CCB stdout `{type:'system', subtype:'status', status:'compacting'|null}`
 // (cli/print.ts:2214 + services/compact/compact.ts:414,763,819,1106)
 // ───────────────────────────────────────────────
-export const OutboundTurnStatus = Type.Object({
+const _turnStatusCommon = {
   type: Type.Literal('outbound.turn_status'),
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
-  /** 当前 turn 的非流式阶段。null = 回到普通流式 / 空闲态。
-   *  受控枚举,未来扩展(如 'restoring' / 'waiting_for_hook')必须由
-   *  gateway 显式映射,不接受 CCB raw 字符串透传。 */
-  status: Type.Union([
-    Type.Literal('compacting'),
-    Type.Null(),
-  ]),
   // V3 S12e — 与 outbound.message / outbound.codex_billing 同 trace 语义,
   // 标记触发本帧的 turn。dispatchInbound stamp,仅观察用。
   traceId: Type.Optional(TraceIdString),
-})
+} as const
+/** 当前 turn 的非流式阶段。null = 回到普通流式 / 空闲态。
+ *  受控判别联合(turn-retry 批):retry 元数据只在 status='retrying' 分支
+ *  存在,不允许在其它状态下可选漂移。未来扩展(如 'restoring')必须由
+ *  gateway 显式映射,不接受 CCB raw 字符串透传。 */
+export const OutboundTurnStatus = Type.Union([
+  Type.Object({
+    ..._turnStatusCommon,
+    status: Type.Union([Type.Literal('compacting'), Type.Null()]),
+  }),
+  Type.Object({
+    ..._turnStatusCommon,
+    status: Type.Literal('retrying'),
+    /** 自动重试侧信道(不进 tape):attempt 从 1 计,max 含首次尝试。
+     *  retryAt = 下一次尝试的绝对 epoch ms(断线重连后前端按它重算剩余
+     *  倒计时,不从完整 delayMs 重头显示)。 */
+    retry: Type.Object({
+      attempt: Type.Integer({ minimum: 1 }),
+      max: Type.Integer({ minimum: 1 }),
+      delayMs: Type.Integer({ minimum: 0 }),
+      retryAt: Type.Integer({ minimum: 0 }),
+    }),
+  }),
+])
 export type OutboundTurnStatus = Static<typeof OutboundTurnStatus>
 
 // ───────────────────────────────────────────────

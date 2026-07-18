@@ -24,6 +24,7 @@ import {
   Volume2,
   Wallet,
 } from "lucide-react";
+import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
 import { memo, useEffect, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
@@ -100,6 +101,10 @@ export type CardCallbacks = {
     recordOrdinal: number,
     offset: number,
   ) => Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
+  /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
+   *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
+   *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
+  resolveRetryTarget?: (clientMessageId: string) => ChatMessage | undefined;
 };
 
 function buildFeedbackCtx(m: ChatMessage): FeedbackContext {
@@ -444,6 +449,41 @@ export function AssistantCard({
     ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)
     : null;
 
+  // ── 红卡重试 CTA 硬门(任务④)────────────────────────────────────────────────────
+  // 语义(retryable/cta)从 protocol taxonomy 派生,不在组件里手写码判断。
+  const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
+  const sem = turnErrorSemantics(normalizedCode);
+  const isInsufficient = normalizedCode === "insufficient_credits";
+  // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
+  // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 不显示精确「重试」,
+  // 落回原有 onRegenerate「重新尝试」兜底(现状语义)。
+  const retryEligible =
+    !!presentedError &&
+    !presentedError.waived &&
+    sem.retryable &&
+    (sem.cta === "retry" || sem.cta === "retry_or_switch");
+  const retryTarget =
+    retryEligible && msg._clientMessageId
+      ? cb.resolveRetryTarget?.(msg._clientMessageId)
+      : undefined;
+  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」引导。
+  // 模型选择器为非受控 DropdownMenu,无可编程打开入口(见报告),故只留文案不做次按钮。
+  const showSwitchModelHint =
+    !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch";
+  // ── 重发按钮末轮门控(Codex 审计 R5)────────────────────────────────────────────────
+  // onRegenerate 兜底 = 重发**最后一条** user 消息;历史中间错误卡若显示任何重发按钮,一点就把
+  // 无关的最新一轮内容重发出去(精确重发亦会把历史消息插到当前会话尾,乱序)。故裁定:错误卡上的
+  // 一切重发按钮(精确「重试」+ 兜底「重新尝试」+「切换模型」引导)只在**该错误卡属于最后一轮**时
+  // 显示。末轮判据复用 turnSegment 单一权威 inActiveTurn(= 该行位于最后一条 user 之后 = 当前轮
+  // 尾部;错误卡恒追加在其归属 user 轮之后,故与"_clientMessageId 命中最后一条 user"等价),不另
+  // 造第二套轮判定。历史中间错误卡:不显示任何重发按钮(标题/正文/详情照旧)。
+  // 「去充值」是导航非重发,不受此门控。
+  const isLastTurn = ctx.inActiveTurn === true;
+  const showPreciseRetry = !isInsufficient && isLastTurn && !!retryTarget;
+  const showRegenFallback = !isInsufficient && isLastTurn && !retryTarget && !!cb.onRegenerate;
+  const showTopUp = isInsufficient && !!cb.onTopUp;
+  const showActionRow = showTopUp || showPreciseRetry || showRegenFallback || (isLastTurn && showSwitchModelHint);
+
   return (
     <div className="group flex gap-4 animate-in" data-testid="assistant-row">
       {/* 移动端隐藏助手头像:窄屏下头像+间距挤占正文宽度(boss 反馈),≥sm 才显示。 */}
@@ -459,13 +499,19 @@ export function AssistantCard({
           </div>
         )}
 
-        {/* 正文：错误时不在卡外渲染裸正文(友好文案并入下方红卡),避免"server shutting down"式裸文本 */}
+        {/* 正文：
+            - 正常回复(无 error)→ Markdown 渲染 msg.text;
+            - 失败轮但模型已产出**合法部分回答**(R6:errorPresentation.bodyText,已剥离尾部终止器/
+              内部串)→ 同样 Markdown 正常渲染,红卡在其下方(与 live 双卡形态一致);终止器/JSON
+              内部串类正文不进这里(bodyText 为空),只由下方红卡按码文案承载;
+            - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
           <Markdown signMedia live={live}>
             {msg.text}
           </Markdown>
+        ) : hasError && presentedError?.bodyText ? (
+          <Markdown signMedia>{presentedError.bodyText}</Markdown>
         ) : live && !hasError ? (
-          // 流式已起但正文尚空：用本轮活动指示（阶段反馈）取代裸三个点；无活动快照时回退三点。
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
         {live && msg.text && !hasError && (
@@ -523,18 +569,34 @@ export function AssistantCard({
                   </pre>
                 </details>
               )}
-              <div className="mt-2.5 flex flex-wrap items-center gap-2">
-                {msg._errorCode?.toLowerCase() === "insufficient_credits" && cb.onTopUp && (
-                  <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
-                    <Wallet size={14} /> 去充值
-                  </Button>
-                )}
-                {msg._errorCode?.toLowerCase() !== "insufficient_credits" && cb.onRegenerate && (
-                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-                    <RotateCcw size={14} /> 重新尝试
-                  </Button>
-                )}
-              </div>
+              {showActionRow && (
+                <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                  {showTopUp ? (
+                    // insufficient_credits「去充值」= 导航非重发,不受末轮门控。
+                    <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
+                      <Wallet size={14} /> 去充值
+                    </Button>
+                  ) : showPreciseRetry ? (
+                    // 末轮 + 精确路径可用:优先精确重发原轮(复用原 payload 含附件),不走 onRegenerate。
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      shape="pill"
+                      onClick={() => cb.onRetrySend?.(retryTarget!)}
+                    >
+                      <RotateCcw size={14} /> 重试
+                    </Button>
+                  ) : showRegenFallback ? (
+                    // 末轮 + 精确路径不可用(找不到原 user 行 / 不可重试码)→ onRegenerate 兜底。
+                    <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
+                      <RotateCcw size={14} /> 重新尝试
+                    </Button>
+                  ) : null}
+                  {isLastTurn && showSwitchModelHint && (
+                    <span className="text-xs text-muted">或在上方切换模型后重试</span>
+                  )}
+                </div>
+              )}
             </div>
           </Alert>
         )}
