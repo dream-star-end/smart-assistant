@@ -146,6 +146,11 @@ export interface V3MasterRetryQueue {
   stopPeriodic(): void
   /** Inspect-only — used by tests + metrics. */
   pendingCount(): Promise<number>
+  /** RFC-v5-durable-turn-dispatch §3 boot recovery ① — is there a staged entry
+   *  for this (dispatchId, attemptNo)? True = tape was already fsynced before
+   *  the crash → the inbox row can safely go sink_staged (the drainer will
+   *  deliver it). Scans on-disk entries; ENOENT-tolerant. */
+  hasEntryForDispatch(dispatchId: string, attemptNo: number): Promise<boolean>
 }
 
 export interface MakeV3MasterRetryQueueDeps {
@@ -159,6 +164,18 @@ export interface MakeV3MasterRetryQueueDeps {
   now?: () => number
   /** Override only for tests. */
   drainIntervalMs?: number
+  /** RFC-v5-durable-turn-dispatch §3/§B6 — deferred master ACK for a durable-inbox
+   *  entry (first attempt failed, drained later). Fires only for entries whose
+   *  payload carries a `dispatchId`; drives the container inbox row to terminal.
+   *  M-R1-1 ① — **returns terminal-confirmed**: `true` when the inbox terminal CAS landed
+   *  (or is already terminal — idempotent); `false` when the terminal write failed. The drainer
+   *  deletes the on-disk entry only on `true`; a `false` keeps the entry (backoff + retry) so a
+   *  master-ACK'd tape whose local terminal CAS failed never silently stays `sink_staged`. */
+  onDispatchAck?: (
+    dispatchId: string,
+    attemptNo: number,
+    status: 'completed' | 'interrupted' | 'crashed',
+  ) => boolean | Promise<boolean>
 }
 
 export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3MasterRetryQueue {
@@ -339,8 +356,26 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
       // Attempt.
       try {
         await deps.attemptSend(entry.payload)
-        stats.drained++
-        await ackDurable(name)
+        // M-R1-1 ①:顺序反转 —— master ACK 成功后,**先**驱动 durable inbox 终态(仅 dispatch turn),
+        // 终态 CAS 确认(onDispatchAck 返回 true)才 ackDurable 删文件。写失败(返回 false)→ 保留
+        // 文件:tape 已在 master(finalize 幂等),下轮 drain 重试终态迁移(inbox CAS 幂等)。bump
+        // attempts + lastErrorAt 让退避生效,避免"终态一直写不进"时热重传 tape 打满 master。
+        const terminalConfirmed = await driveDispatchTerminal(entry.payload, name)
+        if (terminalConfirmed) {
+          stats.drained++
+          await ackDurable(name)
+        } else {
+          stats.retried++
+          stats.pending++
+          await rewriteAfterFailure(
+            filepath,
+            entry,
+            'transient',
+            'inbox terminal CAS write failed after master ACK',
+            name,
+            stats,
+          )
+        }
       } catch (err) {
         if (
           err instanceof V3SinkError &&
@@ -368,27 +403,70 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
         stats.pending++
         const cls: V3SinkErrorClass =
           err instanceof V3SinkError ? err.errorClass : 'transient'
-        const updated: V3MasterRetryEntry = {
-          ...entry,
-          attempts: entry.attempts + 1,
-          lastErrorClass: cls,
-          lastErrorAt: now(),
-          lastErrorMessage: err instanceof Error ? err.message : String(err),
-        }
-        try {
-          await atomicWriteJson(filepath, updated)
-        } catch (writeErr) {
-          if ((writeErr as NodeJS.ErrnoException).code === 'ENOENT') {
-            // Dir vanished mid-pass. Re-create on next enqueue.
-            log.warn('v3MasterRetryQueue: dir vanished during retry rewrite', { name })
-          } else {
-            stats.errors++
-            log.error('v3MasterRetryQueue: retry rewrite failed', { name }, writeErr)
-          }
-        }
+        await rewriteAfterFailure(
+          filepath,
+          entry,
+          cls,
+          err instanceof Error ? err.message : String(err),
+          name,
+          stats,
+        )
       }
     }
     return stats
+  }
+
+  /**
+   * M-R1-1 ① — drive the durable inbox row to terminal after a successful master ACK.
+   * Returns `true` when there is nothing to converge (non-dispatch entry) or the terminal
+   * migration is confirmed (onDispatchAck resolved `true` / already terminal); `false` when the
+   * terminal write failed (hook resolved `false` or threw) so the caller keeps the entry.
+   */
+  async function driveDispatchTerminal(
+    payload: V3MasterSinkWirePayload & { createdAt: number },
+    name: string,
+  ): Promise<boolean> {
+    const { dispatchId, attemptNo, status } = payload
+    if (!deps.onDispatchAck || typeof dispatchId !== 'string' || typeof attemptNo !== 'number') {
+      return true
+    }
+    try {
+      return await deps.onDispatchAck(dispatchId, attemptNo, status)
+    } catch (hookErr) {
+      log.warn('v3MasterRetryQueue: onDispatchAck hook threw; retaining entry', { name }, hookErr)
+      return false
+    }
+  }
+
+  /** Bump attempts + lastError* and atomically rewrite the entry so per-entry backoff applies.
+   *  Shared by the send-failure path and the M-R1-1 terminal-CAS-unconfirmed path. ENOENT (dir
+   *  vanished mid-pass) is tolerated; any other write error counts as an error stat. */
+  async function rewriteAfterFailure(
+    filepath: string,
+    entry: V3MasterRetryEntry,
+    lastErrorClass: V3SinkErrorClass,
+    lastErrorMessage: string,
+    name: string,
+    stats: DrainStats,
+  ): Promise<void> {
+    const updated: V3MasterRetryEntry = {
+      ...entry,
+      attempts: entry.attempts + 1,
+      lastErrorClass,
+      lastErrorAt: now(),
+      lastErrorMessage,
+    }
+    try {
+      await atomicWriteJson(filepath, updated)
+    } catch (writeErr) {
+      if ((writeErr as NodeJS.ErrnoException).code === 'ENOENT') {
+        // Dir vanished mid-pass. Re-create on next enqueue.
+        log.warn('v3MasterRetryQueue: dir vanished during retry rewrite', { name })
+      } else {
+        stats.errors++
+        log.error('v3MasterRetryQueue: retry rewrite failed', { name }, writeErr)
+      }
+    }
   }
 
   function startPeriodic(): void {
@@ -415,6 +493,34 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     }
   }
 
+  async function hasEntryForDispatch(dispatchId: string, attemptNo: number): Promise<boolean> {
+    let names: string[]
+    try {
+      names = await readdir(dir)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false
+      throw err
+    }
+    for (const name of names.filter((n) => n.endsWith('.json') && !n.includes('.tmp-'))) {
+      let raw: string
+      try {
+        raw = await readFile(join(dir, name), 'utf8')
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue
+        continue
+      }
+      try {
+        const parsed = JSON.parse(raw) as { payload?: { dispatchId?: unknown; attemptNo?: unknown } }
+        if (parsed?.payload?.dispatchId === dispatchId && parsed?.payload?.attemptNo === attemptNo) {
+          return true
+        }
+      } catch {
+        // malformed — irrelevant to this lookup
+      }
+    }
+    return false
+  }
+
   return {
     stageDurable,
     ackDurable,
@@ -424,6 +530,7 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
     startPeriodic,
     stopPeriodic,
     pendingCount,
+    hasEntryForDispatch,
   }
 }
 

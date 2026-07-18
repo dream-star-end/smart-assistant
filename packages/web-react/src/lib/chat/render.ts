@@ -17,8 +17,166 @@ import {
   WAIVED_TURN_ERROR_CODES,
 } from "@openclaude/protocol";
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
+import { isServerAuthoredRow } from "./model";
 import type { ChatMessage, ChildBlock } from "./model";
 import { friendlyBridgeErrorMessage } from "./pure";
+
+/**
+ * durable turn dispatch(RFC §2.5)的 error projection 虚拟行 id 前缀。server 为「受理成功但
+ * 未执行/未收尾」的 turn 铸造这条虚拟行(role 'assistant'、_errorCode ∈ dispatch 终态码、
+ * _clientMessageId 指向锚点 user 行),前端按既有 error 卡渲染。
+ */
+export const DISPATCH_ERROR_ROW_ID_PREFIX = "oc-dispatch-err:";
+
+/**
+ * dispatch 终态错误码(免单语义:受理未执行 = 未计费 / 服务重启中断 = 已退款)。归一化小写。
+ * 这些是 **server 权威的稳定协议码**:`dispatch_lost`/`dispatch_not_accepted` 由 reconciler 铸在
+ * error projection 上;`service_restart` 由 gateway 写在**不可变 tape**(boot recovery synthetic
+ * crashed)里 —— 不可变行无法回填 master 标记,故按稳定协议码识别(非脆弱的内部 failureCode 枚举)。
+ */
+export const DISPATCH_LOST_ERROR_CODES = new Set([
+  "dispatch_lost",
+  "dispatch_not_accepted",
+  "service_restart",
+]);
+
+/** 该行是否为 dispatch error projection 虚拟行(id 前缀判定,单一权威)。 */
+export function isDispatchErrorProjectionRow(m: Pick<ChatMessage, "id"> | null | undefined): boolean {
+  return typeof m?.id === "string" && m.id.startsWith(DISPATCH_ERROR_ROW_ID_PREFIX);
+}
+
+/** 归一化后是否命中 dispatch 终态错误码(仅用于稳定协议码;projection 走标记不走码)。 */
+export function isDispatchLostCode(code: string | undefined | null): boolean {
+  return typeof code === "string" && DISPATCH_LOST_ERROR_CODES.has(code.trim().toLowerCase());
+}
+
+/**
+ * **去枚举化的重试判据单一权威(RFC §5 M5)**:该行是否证明其 turn 的 dispatch 已终态失败,
+ * 需要重试铸新 clientMessageId。优先级:
+ *   ① error projection 虚拟行(id 前缀,code-agnostic);
+ *   ② server 持久标记 `_dispatchTerminal`(projection 恒带,未来新终态类别也带 → 前端零改动);
+ *   ③ 不可变 tape 的稳定协议码(service_restart 等,gateway 写、无法回填标记的兜底)。
+ * 前端**不**再枚举内部 failureCode(codex_pre_forward_abandoned / ERR_FRAME_TOO_BIG …)——那些
+ * 都被 ① 一网打尽。
+ */
+export function isDispatchTerminalRow(
+  m: Pick<ChatMessage, "id" | "_dispatchTerminal" | "_errorCode"> | null | undefined,
+): boolean {
+  if (!m) return false;
+  if (isDispatchErrorProjectionRow(m)) return true;
+  if (m._dispatchTerminal === true) return true;
+  return isDispatchLostCode(m._errorCode);
+}
+
+/**
+ * 渲染层双保险(RFC §5):收集「同 _clientMessageId 已存在非 error 终态行」的 turn 集。
+ * server 侧 late-tape 会撤销 projection(§2.4),这是撤销传播前竞态窗口的端上兜底 —— 真 tape
+ * 展开的 server-authored 生成行(assistant/thinking/tool、无 _errorCode)一旦出现,同轮的 error
+ * projection 行即被抑制,避免「结果已显示 + 错误卡并存」。
+ */
+export function collectResolvedDispatchTurnIds(messages: readonly ChatMessage[]): Set<string> {
+  const resolved = new Set<string>();
+  for (const m of messages) {
+    const cmid = m?._clientMessageId;
+    if (typeof cmid !== "string" || cmid.length === 0) continue;
+    if (isDispatchErrorProjectionRow(m)) continue;
+    // 折叠 anchor(§9)= 真 tape 已落库的水合入口 → tape 权威压过 dispatch error projection:
+    // 只要该轮存在折叠 anchor(任一终态),同轮的 dispatch_lost 投影即被抑制(late-tape 撤销投影
+    // 传播前的端上竞态兜底,与 detectServerTerminalTurns 的 completed 覆盖 error 口径一致)。
+    if (isCollapsedTapeAnchor(m)) {
+      resolved.add(cmid);
+      continue;
+    }
+    if (typeof m._errorCode === "string" && m._errorCode.length > 0) continue;
+    if (
+      isServerAuthoredRow(m) &&
+      (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
+    ) {
+      resolved.add(cmid);
+    }
+  }
+  return resolved;
+}
+
+/** 该 projection 行是否应被同轮非 error 终态行抑制(渲染层调用,配合 collectResolvedDispatchTurnIds)。 */
+export function isProjectionSuppressedByTerminal(
+  m: Pick<ChatMessage, "id" | "_clientMessageId">,
+  resolvedTurnIds: Set<string>,
+): boolean {
+  return (
+    isDispatchErrorProjectionRow(m) &&
+    typeof m._clientMessageId === "string" &&
+    resolvedTurnIds.has(m._clientMessageId)
+  );
+}
+
+// ═══════════════ §9 会话读物化投影:折叠 anchor / 截断记录 ═══════════════
+
+/** 该行是否为折叠 anchor 行(RFC §9.1:大 tape 只回一条折叠 anchor 而非 N 条展开行)。 */
+export function isCollapsedTapeAnchor(m: Pick<ChatMessage, "_tapeCollapsed"> | null | undefined): boolean {
+  return !!m && m._tapeCollapsed === true;
+}
+
+/**
+ * 折叠行/展开行的**精确定位三元组键**(RFC §9.1):`_turnTapeId :: _turnTapeSha256 :: anchor id`。
+ * 展开替换按此键定位,**严禁按 _seq 批量替换**——同一 _seq 上并列多条 projection 虚拟行,按 _seq 会误伤。
+ * tapeSha 缺省(server 未带)时以空串占位,anchor id 仍保证唯一。
+ */
+export function tapeAnchorKey(
+  m: Pick<ChatMessage, "id" | "_turnTapeId" | "_turnTapeSha256">,
+): string {
+  return `${m._turnTapeId ?? ""}::${m._turnTapeSha256 ?? ""}::${m.id}`;
+}
+
+/**
+ * 折叠 anchor 的 `_dispatchOutcome` → 终态类别(RFC §9-B1 谓词拆分)。
+ *  - completed / interrupted → 'completed':该轮**有内容**(tape 存在,含被中断的部分产出)→ 清发送态、
+ *    user 行置 replied、抑制同轮 dispatch error projection;
+ *  - crashed / executed_error / not_accepted → 'error':终态但失败;
+ *  - 其余/缺省 → null:非终态(不作终态存在证据,不清发送态)。
+ */
+export function collapsedAnchorTerminalKind(
+  outcome: string | undefined | null,
+): "completed" | "error" | null {
+  switch ((outcome ?? "").trim().toLowerCase()) {
+    case "completed":
+    case "interrupted":
+      return "completed";
+    case "crashed":
+    case "executed_error":
+    case "not_accepted":
+      return "error";
+    default:
+      return null;
+  }
+}
+
+/**
+ * 折叠 anchor 是否构成该轮"终态存在证据"(RFC §9-B1):`_tapeCollapsed ∧ _dispatchOutcome 为终态`。
+ * = 参与 exact-clientMessageId 清 _sendingInFlight 与 error projection 抑制;但**不是**"内容已展开"
+ * (评分卡/MetaRow 等需正文的门不由它触发;折叠行非"末条 assistant 正文",见 turnSegment)。
+ */
+export function isCollapsedAnchorTerminalEvidence(
+  m: Pick<ChatMessage, "_tapeCollapsed" | "_dispatchOutcome"> | null | undefined,
+): boolean {
+  return isCollapsedTapeAnchor(m) && collapsedAnchorTerminalKind(m?._dispatchOutcome) !== null;
+}
+
+/**
+ * 该记录是否被逐记录截断(RFC §9.1)。判据 = `_fullBytes` 存在(server 截断记录时与 wire `_truncated:true`
+ * 同发,但前端只认无歧义的 `_fullBytes`,避开 assistant 续写标记 `_truncated:string` 的同名歧义)。
+ */
+export function isRecordTruncated(m: Pick<ChatMessage, "_fullBytes"> | null | undefined): boolean {
+  return !!m && typeof m._fullBytes === "number" && m._fullBytes > 0;
+}
+
+/** 字节数 → 人类可读("N MB"/"N KB"/"N B")。折叠卡"本轮完整输出 N"与截断卡"共 N"共用。 */
+export function formatTapeBytes(n: number | undefined | null): string {
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return "";
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${Math.round(n)} B`;
+}
 
 /**
  * 隐藏审查员(平台内置、管理 API 404 隐藏的系统 agent)的 agentId —— 单一权威。
@@ -100,7 +258,13 @@ export function messageSignature(
   // 非末条,而该行自身字段未变(reducer 就地 mutate 同引用)。必须与 isLast 同放 sig head,否则
   // memo 浅比较判「无变化」漏渲、旧行评价残留。非 assistant 行恒 false(与 isLast 一样对全 role
   // 落进 head,不影响非消费方——只 AssistantCard 读它)。
-  const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}`;
+  // §9 折叠 anchor 由 MessageRenderer 拦截渲染 CollapseCard(不走 role 分派):其重渲触发字段
+  // (_tapeExpanded / _tapeExpandCursor / _tapeTotalBytes / _dispatchOutcome)不在下方 role 分支里,
+  // 折进 head 保证展开态翻转、续拉游标变化时穿透 memo 重渲。非折叠行恒空片段,不影响既有签名。
+  const collapse = m._tapeCollapsed
+    ? `|tc:${m._tapeExpanded ? 1 : 0}:${m._tapeExpandCursor ?? "n"}:${m._tapeTotalBytes ?? 0}:${m._dispatchOutcome ?? ""}`
+    : "";
+  const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}${collapse}`;
   switch (m.role) {
     case "assistant":
       return [
@@ -424,6 +588,27 @@ export function errorPresentation(
   }
   const waiverEligible = WAIVED_ERROR_CODES.has(normalized);
   const ref = requestReference(detail, text);
+  // durable turn dispatch(RFC §5)error projection 文案。三者恒免单 tone(waived:true → 温和
+  // ShieldCheck 卡):dispatch_lost / dispatch_not_accepted = 受理成功但从未开始执行(durable
+  // not_accepted 证明,未计费);service_restart = 服务重启掐断,已生成内容无法恢复(已退款)。
+  // 均非平台内部错误,不甩堆栈。dispatch_not_accepted 是 reconciler 对「容器 rejected tombstone」
+  // 铸的精确码(MIN2),与 dispatch_lost 同免单文案。
+  if (normalized === "dispatch_lost" || normalized === "dispatch_not_accepted") {
+    return {
+      title: "消息未开始处理",
+      message: "消息未能开始处理，已确认未计费，请重试。",
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: true,
+    };
+  }
+  if (normalized === "service_restart") {
+    return {
+      title: ERROR_LABELS.service_restart,
+      message: "任务因服务重启中断，未能恢复已生成内容。本轮未计费；如已扣除，积分已原路退回，你可以重新尝试。",
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: true,
+    };
+  }
   if (waiverEligible && waiverApplied) {
     const message = normalized === "turn_limit"
       ? "任务达到 12 小时运行上限，系统已中断。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。"

@@ -85,6 +85,11 @@ export type FrameEffects = {
   /** resume_failed / reconcile：游标已推进 + 标 _liveStreamBroken 后，强制 REST 全量 sync。*/
   forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
   /**
+   * reconcile 'turn_state_unknown'(RFC §4):server 无法判定在飞 turn 终态。**绝不清发送态**,
+   * 由 socket 把该会话 thinking-safety 定时降至 60s(默认 10min),尽快复检服务端权威态。
+   */
+  onTurnStateUnknown?: (sessId: string) => void;
+  /**
    * 立即把会话快照落 IndexedDB（断点续传游标 durable）。resume_failed 推进游标后必须
    * 同步落地：否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环。
    * turn 收尾（isFinal）也落一次保证 reload 不丢已完成轮。
@@ -959,6 +964,22 @@ export function applyOutboundMessage(
     return;
   }
 
+  // ── reconcile 'turn_state_unknown'(非 final,RFC §4)──
+  // hello 对账时 server 对客户端上报的在飞 turn **无法给出终态**(durable inbox 无行且不是
+  // negative proof)。此时**绝不清 _sendingInFlight** —— turn 可能仍在服务端执行,静默清态正是
+  // 本 RFC 要根治的丢 turn 症状。改为:① 立即 REST 全量对账拉回权威态(含 error projection);
+  // ② 请 socket 把 thinking-safety 定时降至 60s(默认 10min),尽快让用户看到终态或错误投影。
+  // markFrameReceived 计活(server 确在应答),但不触碰 turn 生命周期。到达此处已过 cross-turn
+  // 守卫:frame.clientMessageId 要么命中 active、要么本地无 active/legacy 无 id,均安全放行。
+  if (!frame.isFinal && frame.meta?.reconcile === "turn_state_unknown") {
+    markFrameReceived(sess);
+    const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
+    if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });
+    else effects.forceSync?.(sess.id);
+    effects.onTurnStateUnknown?.(sess.id);
+    return;
+  }
+
   // ── §11 双帧 error 抑制：紧随 outbound.error 的 [error] text isFinal 不渲染气泡 ──
   let suppressLegacyErrorText = false;
   if (
@@ -1011,18 +1032,32 @@ export function applyOutboundMessage(
     }
   }
 
-  // ── reconcile 合成 final：hello 重连对账时 server 判定该轮**已在服务端正常收尾**、但客户端仍挂
-  //    发送态(missed 真 final)。清发送态收口本轮 UI,但**不走空轮分类**(空 blocks 不合成空气泡——
-  //    内容其实已在服务端生成),并强制 REST 全量对账拉回客户端丢失的内容(参考 applyResumeFailed)。──
-  if (frame.isFinal && frame.meta?.reconcile === "turn_completed") {
-    const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
+  // ── reconcile 合成 final(turn_completed / interrupted,RFC §4 身份对称)──
+  //    hello 重连对账时 server 判定该在飞 turn **已在服务端收尾**(正常完成 / 中断),但客户端仍挂
+  //    发送态(missed 真 final)。这些合成帧**现在必带 clientMessageId**,归属按 **exact clientMessageId
+  //    匹配**:仅当它精确命中当前 active turn(或本地无 active / legacy 无 id)才收口本轮发送态。跨轮
+  //    mismatch 由顶部 cross-turn 守卫拦截,此处再显式校验一次 —— 旧轮的 reconcile final 绝不清新轮
+  //    的 sending 态(R3「拿上一轮 outcome 冒充当前在飞 turn」根因的端上闭合)。收口不走空轮分类
+  //    (空 blocks 不合成空气泡——内容其实已在服务端生成/中断),并强制 REST 全量对账拉回真实内容。──
+  if (
+    frame.isFinal &&
+    (frame.meta?.reconcile === "turn_completed" || frame.meta?.reconcile === "interrupted")
+  ) {
+    const active = sess._activeClientMessageId;
+    const frameCmid = frame.clientMessageId;
+    if (frameCmid && active && frameCmid !== active) {
+      // 旧轮 reconcile 命中新轮:只精确对账旧轮内容,绝不触碰新轮生命周期。
+      effects.forceSync?.(sess.id, { clientMessageId: frameCmid });
+      return;
+    }
+    const clientMessageId = frameCmid ?? active;
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
     resetReplyTracker(sess);
-    // 该轮已在服务端正常收尾（含 imageEdit 结果图）：消解运行中占位，结果随 forceSync 回带。
+    // 该轮已在服务端收尾（含 imageEdit 结果图）：消解运行中占位，结果随 forceSync 回带。
     resolveGenPlaceholders(sess, extractImageEditJobId(frame));
     effects.onFinal?.(sess, frame, false, clientMessageId);
     if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });

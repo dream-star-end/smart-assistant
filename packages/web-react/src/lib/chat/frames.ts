@@ -261,6 +261,13 @@ export type InboundHelloWire = {
     inFlight: boolean;
     lastFrameSeq: number;
     resumeActiveTurnCandidateMessageIds?: string[];
+    /**
+     * durable turn dispatch(RFC §4 身份对称):该 peer 当前在飞 turn 的 clientMessageId
+     * (= _activeClientMessageId)。**仅在 inFlight 时携带**;autoResumeFromHello 用它绑定
+     * ring/inbox 查询到具体 turn 身份,合成 reconcile 帧据此回带同一 clientMessageId,避免
+     * 拿上一轮 outcome 冒充当前在飞 turn(R3 根因)。缺省(legacy)→ 服务端走旧行为。
+     */
+    inFlightClientMessageId?: string;
   }>;
 };
 

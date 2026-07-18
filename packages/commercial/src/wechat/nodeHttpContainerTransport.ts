@@ -99,15 +99,17 @@ export function makeNodeHttpContainerTransport(
   // node:http.Agent 的 keep-alive 池由 transport 实例持有,master 进程生命周期复用。
   const agent = new Agent({ keepAlive: true, keepAliveMsecs, maxSockets })
 
-  return {
-    supportsTunnel: false,
-    async post(
-      endpoint: { host: string; port: number; tunnel?: unknown },
-      path: string,
-      headers: Record<string, string>,
-      bodyJson: string,
-      timeoutMs: number,
-    ): Promise<{ status: number; bodyText: string; headers?: Record<string, string> }> {
+  // 请求执行体(POST/GET 共用):HMAC/身份 header 由调用方(inboundDispatcher / dispatch
+   // containerDispatchClient)组装并塞进 headers;本层只管 SSRF 白名单 + 绝对 deadline +
+   // body cap。GET 传 bodyBuf=null(无 content-length,不写 body)。
+  const performRequest = async (
+    method: "GET" | "POST",
+    endpoint: { host: string; port: number; tunnel?: unknown },
+    path: string,
+    headers: Record<string, string>,
+    bodyBuf: Buffer | null,
+    timeoutMs: number,
+  ): Promise<{ status: number; bodyText: string; headers?: Record<string, string> }> => {
       if (endpoint.tunnel !== undefined) {
         // dispatcher 上游已经在 `endpoint.tunnel !== undefined && !supportsTunnel` 时返回了
         // tunnel_unsupported outcome,本 transport 不会被调到 — 留一道防线避免误用。
@@ -118,10 +120,9 @@ export function makeNodeHttpContainerTransport(
         throw new Error(TRANSPORT_HOST_BLOCKED_ERROR)
       }
 
-      const bodyBuf = Buffer.from(bodyJson, "utf-8")
       const reqHeaders: Record<string, string> = {
         ...headers,
-        "content-length": String(bodyBuf.length),
+        ...(bodyBuf !== null ? { "content-length": String(bodyBuf.length) } : {}),
       }
 
       return new Promise((resolve, reject) => {
@@ -147,7 +148,7 @@ export function makeNodeHttpContainerTransport(
           {
             host: endpoint.host,
             port: endpoint.port,
-            method: "POST",
+            method,
             path,
             headers: reqHeaders,
             agent,
@@ -218,9 +219,25 @@ export function makeNodeHttpContainerTransport(
           settle(() => reject(new Error(`request error: ${err.message}`)), null)
         })
 
-        req.write(bodyBuf)
+        if (bodyBuf !== null) req.write(bodyBuf)
         req.end()
       })
+  }
+
+  return {
+    supportsTunnel: false,
+    post(endpoint, path, headers, bodyJson, timeoutMs) {
+      return performRequest("POST", endpoint, path, headers, Buffer.from(bodyJson, "utf-8"), timeoutMs)
+    },
+    request(method, endpoint, path, headers, bodyJson, timeoutMs) {
+      return performRequest(
+        method,
+        endpoint,
+        path,
+        headers,
+        bodyJson === null ? null : Buffer.from(bodyJson, "utf-8"),
+        timeoutMs,
+      )
     },
   }
 }

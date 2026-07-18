@@ -1,0 +1,15 @@
+{
+  "name": "oc-e2e-session-display",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OpenClaude v5 session-display e2e regression suite (playwright). Isolated dependency domain — do not add to root workspaces.",
+  "scripts": {
+    "test": "playwright test",
+    "test:smoke": "playwright test --grep @smoke",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0",
+    "ws": "8.18.0"
+  }
+}

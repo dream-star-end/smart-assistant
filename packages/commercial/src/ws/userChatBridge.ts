@@ -45,7 +45,7 @@ import type { Pool } from "pg";
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
-import { recordTurnTrace } from "./turnTraces.js";
+import { recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
 import { GoalStateError } from "../goal/goalStateService.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
 import type { NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
@@ -71,6 +71,7 @@ import {
   startInflightJournal,
   abortInflightJournal,
   loadUsageAttributionCredits,
+  readJournalForTakeover,
   type JournalFailureCode,
 } from "../billing/proxyBilling.js";
 import {
@@ -89,6 +90,10 @@ import {
   DEFAULT_CODEX_ENGINE_MODEL,
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_FIELD,
+  DURABLE_TURN_DISPATCH_CAPABILITY,
+  DISPATCH_AUTHORITY_FIELD,
+  stripDispatchAuthorityField,
+  computeDispatchRequestHash,
   isCodexEngineModel,
   isClientMessageId,
   newTraceId,
@@ -99,8 +104,23 @@ import {
   type ModelExecutionDescriptor,
   type TraceIdIssue,
   type GoalStateSnapshot,
+  type DispatchRequestContent,
 } from "@openclaude/protocol";
+import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
+import {
+  casAdmittedToAccepted,
+  casToManualReconcile,
+  casToTerminal,
+  heartbeatLease,
+  DISPATCH_LEASE_TTL_MS,
+  DISPATCH_LEASE_HEARTBEAT_MS,
+} from "../dispatch/turnDispatchStore.js";
+import type {
+  AdmitUserTurnInput,
+  AdmitUserTurnResult,
+} from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
+import { MASTER_HISTORY_MAX_MESSAGES, MASTER_HISTORY_MAX_CHARS } from "./masterHistoryLimits.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
 import type { ModelCatalogCache, ModelCatalogSnapshot } from "../billing/modelCatalog.js";
@@ -933,6 +953,10 @@ export interface UserChatBridgeDeps {
     applied: boolean;
     reason?: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized";
   }>;
+  /** durable turn dispatch 受理面(RFC-v5-durable-turn-dispatch §2.1)。注入且容器 attest
+   * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
+   * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
+  admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
   /**
    * plan v3 G5/G7 — codex per-account 并发槽 + 严格单飞 acquire/release。
    *
@@ -1127,9 +1151,6 @@ const HIDDEN_REVIEWER_AGENT_ID = "hidden-reviewer";
  */
 const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
 
-const MASTER_HISTORY_MAX_MESSAGES = 48;
-const MASTER_HISTORY_MAX_CHARS = 18_000;
-
 /**
  * PR2 v1.0.66 — user WS close 后等 codex billing 帧的 drain 窗口。
  *
@@ -1151,6 +1172,27 @@ function readDrainBillingMs(): number {
   if (!raw) return DEFAULT_DRAIN_BILLING_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 50 ? n : DEFAULT_DRAIN_BILLING_MS;
+}
+
+/**
+ * RFC §2.2 B1 — durable dispatch 的 drain 窗口。有在飞 admitted dispatch 时,drain 需给 reconciler/
+ * heartbeat 足够时间守住 lease 或等 dispatch 走到终态,故窗口取
+ * `max(readDrainBillingMs(), OC_DISPATCH_DRAIN_MS)`,默认 60s、硬上限 120s。
+ *
+ * 与 codex billing 的 5s 分开:billing 帧毫秒级到达 5s 足够;dispatch lease 续租/接管周期在分钟级
+ * (reconciler 30s + jitter),5s 会让本连接的 admitted dispatch 提前离开 drain、lease 被误当孤儿。
+ * env 非法/缺省 → 60s;超 120s → clamp 到 120s(防配置把容器 WS 卡死太久挤占 host)。
+ */
+const DEFAULT_DISPATCH_DRAIN_MS = 60_000;
+const MAX_DISPATCH_DRAIN_MS = 120_000;
+function readDispatchDrainMs(): number {
+  const raw = process.env.OC_DISPATCH_DRAIN_MS;
+  let n = DEFAULT_DISPATCH_DRAIN_MS;
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 50) n = parsed;
+  }
+  return Math.min(n, MAX_DISPATCH_DRAIN_MS);
 }
 
 /**
@@ -2085,6 +2127,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let containerChallenge: string | null = null;
     /** pending = 缓冲用户帧;ok = 放行;failed = 连接已判死(帧丢弃,close 在飞)。 */
     let attestState: "pending" | "ok" | "failed" = authorityOn ? "pending" : "ok";
+    /** 容器 attest 是否携带 durable-turn-dispatch-v1:true 才走 dispatch 受理,否则 legacy。 */
+    let containerHasDurableDispatch = false;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
     const attestQueue: Array<{
       data: RawData;
@@ -2159,6 +2203,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return;
       }
       containerChallenge = challenge;
+      // capability 门:容器广播 durable-turn-dispatch-v1 才走 dispatch 受理(RFC §2.2)。
+      containerHasDurableDispatch = caps.includes(DURABLE_TURN_DISPATCH_CAPABILITY);
       attestState = "ok";
       if (attestTimer !== null) {
         clearTimeout(attestTimer);
@@ -2606,6 +2652,111 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let drainCause: BridgeCloseCause | null = null;
     let userDetached = false;
 
+    // ── durable turn dispatch(RFC §2.2 B1)本连接受理簿记 ─────────────────────
+    //   admittedDispatches: clientMessageId → dispatch 身份 + lease。仅
+    //     containerHasDurableDispatch 时落表;记录本连接持 lease 的 admitted turn。
+    //     生命周期:受理时 set;pre-forward 失败 CAS terminal / heartbeat 判非本 owner
+    //     (turn 终态或被接管)时删除;finalCleanup 清空。
+    //   dispatchHeartbeatTimer: 持 lease 期间长窗口 attach 内续租(匹配 owner+epoch+
+    //     status='admitted');lease drop 出 map,drain 期间保活(仅 finalCleanup 清)。
+    //   drain 完成条件与 inflightCodexTurns 并列(checkDrainComplete)。
+    interface AdmittedDispatch {
+      clientMessageId: string;
+      sessionId: string;
+      dispatchId: string;
+      billingRequestId: string;
+      attemptNo: number;
+      leaseEpoch: number;
+      anchorSeq: bigint | null;
+      /** = envelope payloadHash(sha256 内容身份;容器验帧体 hash 用)。 */
+      requestHash: string;
+    }
+    const admittedDispatches = new Map<string, AdmittedDispatch>();
+    let dispatchHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    /** 删记录并在 drain 期推进完成判定(map 空 + inflight 空才收尾)。 */
+    const dropAdmittedDispatch = (clientMessageId: string): void => {
+      if (admittedDispatches.delete(clientMessageId)) checkDrainComplete();
+    };
+    /** 首次受理时惰性起心跳(unref);legacy 连接从不受理 → 永不建 timer(行为不变)。 */
+    const ensureDispatchHeartbeat = (): void => {
+      if (dispatchHeartbeatTimer !== null || !deps.pgPool) return;
+      dispatchHeartbeatTimer = setInterval(() => {
+        const pool = deps.pgPool;
+        if (!pool) return;
+        for (const rec of [...admittedDispatches.values()]) {
+          void heartbeatLease(pool, {
+            dispatchId: rec.dispatchId,
+            ownerId: connId,
+            leaseEpoch: rec.leaseEpoch,
+            leaseTtlMs: DISPATCH_LEASE_TTL_MS,
+          })
+            .then((held) => {
+              // held=false ⇒ 已非本 owner(被接管 / 已离态)→ 停止把它当权威。
+              if (!held) dropAdmittedDispatch(rec.clientMessageId);
+            })
+            .catch(() => {});
+        }
+      }, DISPATCH_LEASE_HEARTBEAT_MS);
+      dispatchHeartbeatTimer.unref?.();
+    };
+    /** pre-forward 失败出口:CAS terminal(executed_error)+ 移除记录。fire-and-forget。
+     *  B-R1-1:client_notified 一律 **false**。即便此刻 socket OPEN、也发了实时 error 帧,那只是
+     *  「加速」——socket OPEN ≠ 前端已 durable 落地该终态(帧可能在途丢、页面已切走)。durable 的
+     *  「已告知」唯一由 reconciler 在 error projection 同事务置真(§2.3 ③)。绝不用瞬态 socket 态推断
+     *  client_notified,否则 fail-visible(I1)会因误判「已通知」而永不补投影。 */
+    const failDispatchPreForward = (
+      record: AdmittedDispatch | undefined,
+      failureCode: string,
+    ): void => {
+      if (record === undefined) return;
+      const pool = deps.pgPool;
+      dropAdmittedDispatch(record.clientMessageId);
+      if (!pool) return;
+      void casToTerminal(pool, {
+        dispatchId: record.dispatchId,
+        outcome: "executed_error",
+        failureCode,
+        clientNotified: false,
+        expectedEpoch: record.leaseEpoch,
+      }).catch(() => {});
+    };
+    /** 按帧的 clientMessageId 反查本连接受理记录(IIFE forward/失败出口共用)。 */
+    const lookupAdmittedDispatch = (
+      frameObj: Record<string, unknown>,
+    ): AdmittedDispatch | undefined => {
+      const cmid = isClientMessageId(frameObj.clientMessageId)
+        ? frameObj.clientMessageId
+        : null;
+      return cmid === null ? undefined : admittedDispatches.get(cmid);
+    };
+    /** 帧注入 __oc_dispatch envelope(记录存在 + 签发基建就位才注)。mirror MODEL_AUTHORITY_FIELD。 */
+    const dispatchAuthorityField = (
+      record: AdmittedDispatch | undefined,
+    ): Record<string, unknown> => {
+      if (
+        record === undefined ||
+        authorityDeps === undefined ||
+        containerChallenge === null ||
+        containerId === undefined
+      ) {
+        return {};
+      }
+      return {
+        [DISPATCH_AUTHORITY_FIELD]: mintDispatchEnvelope(authorityDeps.signer, {
+          uid,
+          containerId,
+          sessionId: record.sessionId,
+          clientMessageId: record.clientMessageId,
+          dispatchId: record.dispatchId,
+          attemptNo: record.attemptNo,
+          payloadHash: record.requestHash,
+          billingRequestId: record.billingRequestId,
+          connectionChallenge: containerChallenge,
+        }),
+      };
+    };
+
     const recordBillingRecovery = (
       requestId: string,
       outcome: "pending" | "failed" | "recovered" | "abandoned",
@@ -2674,6 +2825,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const attachMasterTurnState = async (
       frameObj: Record<string, unknown>,
       turnLog: Logger | null,
+      // MIN1:受理成功后 fire-and-forget 回填 turn_traces.dispatch_id/request_id 用(纯展示)。
+      // 由各 IIFE 传入本 turn 的 canonical traceId(捕获的稳定值,防跨帧 mutate);缺则不回填。
+      traceId: string | null = null,
+      // prompt-queue lane:协调器已持久化 user 行 → persistUserRow=false 跳过受理/持久块
+      // (含 durable dispatch 准入 —— 绝不给 queue turn 建第二套 turn_dispatches 权威,防权威源分裂);
+      // onReject 在受理/goal 拒轮时回调,让 queue 协调器取消本次 dispatch grant。
       persistUserRow = true,
       onReject?: (code: string) => void,
     ): Promise<Record<string, unknown> | null> => {
@@ -2691,7 +2848,80 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // Make the server-side ordering invariant explicit here instead: the
       // authoritative user row must exist before route/acquire/precheck/
       // journal/history injection or any physical forward can happen.
-      if (persistUserRow && clientMessageId !== null && deps.persistMasterUserMessage) {
+      const useDispatchAdmission = containerHasDurableDispatch && deps.admitUserTurn !== undefined;
+
+      // B3(R3):本帧受理成功后落此(= 刚受理 dispatch 的 clientMessageId)。受理**之后**的任何 pre-forward
+      // 失败出口(goal unavailable / sanitize 抛 / 任意异常 / 未预期早 return)必须据此 CAS terminal +
+      // drop,否则留 admitted 永续租孤儿 + 无 error projection(违反 I1)。成功交棒调用方前置空(所有权移交)。
+      let admittedThisFrame: string | null = null;
+
+      // 主会话历史**只读一次**,给「dispatch 受理前 dedup」与「受理/持久化后 enrichment」共用。
+      // fail-open:读失败绝不阻断受理/转发(历史只是 UX 上下文,不是 authz/billing)。
+      //   - dispatch 路径:受理**之前**读并 dedup(见下,避免孤儿 admitted dispatch);
+      //   - legacy 路径:保持「先持久 user 行,再读历史」的既有顺序不变(权威 user 行先于历史注入)。
+      let rawHistory: unknown[] | null = null;
+      let historyLoaded = false;
+      const ensureHistory = async (): Promise<void> => {
+        if (historyLoaded) return;
+        historyLoaded = true;
+        if (!deps.loadMasterSessionMessages) return;
+        try {
+          const raw = await deps.loadMasterSessionMessages(uid, peerId);
+          if (Array.isArray(raw)) rawHistory = raw;
+        } catch (err) {
+          turnLog?.warn("user-chat-bridge: load master history failed", {
+            sessionId: peerId,
+            err,
+          });
+        }
+      };
+      // 该 clientMessageId 是否早已产出 completed assistant 行(legacy 完成、无 dispatch;或
+      // dispatch 已完成、tape 已 materialize)→ 回 dedup ack 收口。命中返 true(调用方 return null)。
+      const tryDedupCompleted = (): boolean => {
+        if (clientMessageId === null || rawHistory === null) return false;
+        const alreadyCompleted = rawHistory.some((value) => {
+          if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+          const row = value as Record<string, unknown>;
+          return row.role === "assistant" &&
+            row._clientMessageId === clientMessageId &&
+            row.status === "completed" &&
+            row._errorCode === undefined &&
+            row._isError !== true;
+        });
+        if (!alreadyCompleted) return false;
+        const idempotencyKey = typeof frameObj.idempotencyKey === "string"
+          ? frameObj.idempotencyKey
+          : undefined;
+        try {
+          userWs.send(JSON.stringify({
+            type: "outbound.ack",
+            deduplicated: true,
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+            peer: { id: peerId, kind: "dm" },
+            clientMessageId,
+          }));
+        } catch { /* client left; durable response remains syncable */ }
+        turnLog?.info("user-chat-bridge: completed client turn deduplicated", {
+          sessionId: peerId,
+          clientMessageId,
+        });
+        return true;
+      };
+
+      // ── legacy-completed dedup(B10)——dispatch 路径**受理之前**判定 ─────────
+      // 若先受理再 dedup,会留下一条永不终态化的孤儿 admitted dispatch —— reconciler 之后会把它
+      // reject-if-absent 成 not_accepted、给用户弹一张假 error 卡(RFC B10 根因)。放到受理前:dedup
+      // 走 return 不转发任何帧,故**不破坏「受理先于一切」不变量**(该不变量约束的是"转发前 user 行必须在")。
+      // legacy 路径(无 admitUserTurn)不建 dispatch 行、无孤儿风险 → 保持既有「持久后再 dedup」顺序。
+      if (persistUserRow && useDispatchAdmission && clientMessageId !== null) {
+        await ensureHistory();
+        if (cleaned) return null;
+        if (tryDedupCompleted()) return null;
+      }
+
+      // persistUserRow=false(prompt-queue lane)整块跳过:queue 协调器已建 user 行 + turn 权威,
+      // 此处再走 admit/persist 会造成 turn_dispatches 与 queue lifecycle 双权威(权威源分裂)。
+      if (persistUserRow && clientMessageId !== null && (useDispatchAdmission || deps.persistMasterUserMessage)) {
         const content = frameObj.content && typeof frameObj.content === "object"
           ? frameObj.content as { text?: unknown; media?: unknown }
           : {};
@@ -2711,124 +2941,267 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             : Date.now(),
           ...(persistedMedia.length > 0 ? { _media: persistedMedia } : {}),
         };
-        let persisted = false;
-        let lastReason: string | undefined;
-        const retryDelays = [0, 50, 150];
-        for (const delayMs of retryDelays) {
-          if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
-          if (cleaned) return null;
-          try {
-            const result = await deps.persistMasterUserMessage(uid, peerId, message);
-            if (result.applied || result.reason === "already_exists") {
-              persisted = true;
-              break;
-            }
-            lastReason = result.reason;
-            // Only the known PUT-vs-WS creation race is retryable here.
-            if (result.reason !== "session_not_found") break;
-          } catch (err) {
-            lastReason = (err as Error)?.message ?? String(err);
-            break;
-          }
-        }
-        if (!persisted) {
-          onReject?.("SESSION_PERSIST_UNAVAILABLE");
-          turnLog?.warn("user-chat-bridge: persist user row before forward failed", {
-            sessionId: peerId,
-            clientMessageId,
-            reason: lastReason,
-          });
-          sendErrorFrame(
-            userWs,
-            "SESSION_PERSIST_UNAVAILABLE",
-            "user message could not be durably admitted; retry safely",
-            { peerId, clientMessageId },
+        if (useDispatchAdmission && deps.admitUserTurn) {
+          // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
+          // 单事务:幂等 append user 行 → UPSERT dispatch 冲突表裁定。billingRequestId 与
+          // envelope payloadHash 均在此确定;'admitted' 落 admittedDispatches(接管复用旧
+          // billingRequestId,故读 result.dispatch.* 而非本地铸值)。
+          const admitModel = typeof frameObj.model === "string" && frameObj.model !== ""
+            ? frameObj.model
+            : null;
+          const admitAgentId = typeof frameObj.agentId === "string" && frameObj.agentId !== ""
+            ? frameObj.agentId
+            : "main";
+          // requestHash 权威 = protocol.computeDispatchRequestHash(frame.content);容器
+          // gateway 用同一函数对同一 content 重算并断言,故此处**必须**同源(不可自铸 sha256)。
+          const requestHash = computeDispatchRequestHash(
+            frameObj.content as DispatchRequestContent | null | undefined,
           );
-          return null;
-        }
-      }
-
-      let enriched = frameObj;
-      if (deps.loadMasterSessionMessages) try {
-        const raw = await deps.loadMasterSessionMessages(uid, peerId);
-        if (clientMessageId !== null && Array.isArray(raw)) {
-          const alreadyCompleted = raw.some((value) => {
-            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-            const row = value as Record<string, unknown>;
-            return row.role === "assistant" &&
-              row._clientMessageId === clientMessageId &&
-              row.status === "completed" &&
-              row._errorCode === undefined &&
-              row._isError !== true;
-          });
-          if (alreadyCompleted) {
-            const idempotencyKey = typeof frameObj.idempotencyKey === "string"
-              ? frameObj.idempotencyKey
-              : undefined;
-            try {
-              userWs.send(JSON.stringify({
-                type: "outbound.ack",
-                deduplicated: true,
-                ...(idempotencyKey ? { idempotencyKey } : {}),
-                peer: { id: peerId, kind: "dm" },
-                clientMessageId,
-              }));
-            } catch { /* client left; durable response remains syncable */ }
-            turnLog?.info("user-chat-bridge: completed client turn deduplicated", {
+          const dispatchId = randomUUID();
+          const billingRequestId = ensureRequestIdServerSide();
+          let admit: AdmitUserTurnResult;
+          try {
+            admit = await deps.admitUserTurn({
+              uid,
+              sessionUserId: "c:" + uid.toString(),
               sessionId: peerId,
               clientMessageId,
+              agentId: admitAgentId,
+              model: admitModel,
+              requestHash,
+              billingRequestId,
+              dispatchId,
+              ownerId: connId,
+              message,
             });
+          } catch (err) {
+            turnLog?.error("user-chat-bridge: dispatch admission threw", {
+              sessionId: peerId, clientMessageId, err,
+            });
+            sendErrorFrame(
+              userWs,
+              "SESSION_PERSIST_UNAVAILABLE",
+              "user message could not be durably admitted; retry safely",
+              { peerId, clientMessageId },
+            );
+            return null;
+          }
+          // R4-B1:cleaned 检查**不得**早于 admitted 接管 —— admit await 期间连接可能已 cleanup,
+          // 提交成功的 dispatch 若在登记前 early return 就成了孤儿 lease(admitted 永续租、无
+          // projection)。顺序铁律:先接管所有权,再判连接死活;死了立即终态化。
+          switch (admit.kind) {
+            case "admitted": {
+              const d = admit.dispatch;
+              admittedDispatches.set(clientMessageId, {
+                clientMessageId,
+                sessionId: peerId,
+                dispatchId: d.dispatchId,
+                billingRequestId: d.billingRequestId,
+                attemptNo: d.attemptNo,
+                leaseEpoch: d.leaseEpoch,
+                anchorSeq: d.anchorSeq,
+                requestHash,
+              });
+              // B3(R3):标记本帧已受理 —— 受理后任何 pre-forward 失败出口据此终态化(下方 try/finally)。
+              admittedThisFrame = clientMessageId;
+              if (cleaned) {
+                failDispatchPreForward(
+                  admittedDispatches.get(clientMessageId),
+                  "bridge_closed_during_admission",
+                );
+                admittedThisFrame = null;
+                return null;
+              }
+              // R5 note:heartbeat 只在确认连接存活后才起 —— finalCleanup 已跑过的话,此刻新建的
+              // interval 无人清理,会把整个 bridge 闭包钉在内存里。顺序=登记→cleaned→heartbeat。
+              ensureDispatchHeartbeat();
+              // MIN1:受理成功后回填 turn_traces 的纯展示列(fire-and-forget,不动主链)。
+              if (traceId !== null) {
+                updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLog?.warn(msg, fields), {
+                  traceId,
+                  dispatchId: d.dispatchId,
+                  requestId: d.billingRequestId,
+                });
+              }
+              break; // 继续 enrichment / forward
+            }
+            case "deduplicated": {
+              const idempotencyKey = typeof frameObj.idempotencyKey === "string"
+                ? frameObj.idempotencyKey
+                : undefined;
+              try {
+                userWs.send(JSON.stringify({
+                  type: "outbound.ack",
+                  deduplicated: true,
+                  ...(idempotencyKey ? { idempotencyKey } : {}),
+                  peer: { id: peerId, kind: "dm" },
+                  clientMessageId,
+                }));
+              } catch { /* client left; durable response remains syncable */ }
+              turnLog?.info("user-chat-bridge: dispatch deduplicated", {
+                sessionId: peerId, clientMessageId,
+              });
+              return null;
+            }
+            case "already_owned":
+            case "in_flight":
+              sendErrorFrame(
+                userWs, "TURN_BUSY", "previous turn still in progress",
+                { peerId, clientMessageId },
+              );
+              return null;
+            case "previously_failed":
+              sendErrorFrame(
+                userWs, "TURN_PREVIOUSLY_FAILED",
+                "this message previously failed; resend to retry",
+                { peerId, clientMessageId },
+              );
+              return null;
+            case "manual_hold":
+              sendErrorFrame(
+                userWs, "TURN_MANUAL_HOLD", "正在人工核对，请稍后",
+                { peerId, clientMessageId },
+              );
+              return null;
+            case "immutable_conflict":
+              sendErrorFrame(
+                userWs, "TURN_IMMUTABLE_CONFLICT",
+                "message content changed for the same id",
+                { peerId, clientMessageId },
+              );
+              return null;
+            case "session_not_found":
+            case "session_deleted":
+            case "append_error":
+              turnLog?.warn("user-chat-bridge: dispatch admission unavailable", {
+                sessionId: peerId, clientMessageId, kind: admit.kind,
+              });
+              sendErrorFrame(
+                userWs, "SESSION_PERSIST_UNAVAILABLE",
+                "user message could not be durably admitted; retry safely",
+                { peerId, clientMessageId },
+              );
+              return null;
+            default: {
+              const _exhaustive: never = admit;
+              turnLog?.error("user-chat-bridge: unhandled dispatch admission kind", {
+                kind: (admit as { kind?: string }).kind,
+              });
+              void _exhaustive;
+              sendErrorFrame(
+                userWs, "SESSION_PERSIST_UNAVAILABLE",
+                "user message could not be durably admitted; retry safely",
+                { peerId, clientMessageId },
+              );
+              return null;
+            }
+          }
+        } else if (deps.persistMasterUserMessage) {
+          let persisted = false;
+          let lastReason: string | undefined;
+          const retryDelays = [0, 50, 150];
+          for (const delayMs of retryDelays) {
+            if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+            if (cleaned) return null;
+            try {
+              const result = await deps.persistMasterUserMessage(uid, peerId, message);
+              if (result.applied || result.reason === "already_exists") {
+                persisted = true;
+                break;
+              }
+              lastReason = result.reason;
+              // Only the known PUT-vs-WS creation race is retryable here.
+              if (result.reason !== "session_not_found") break;
+            } catch (err) {
+              lastReason = (err as Error)?.message ?? String(err);
+              break;
+            }
+          }
+          if (!persisted) {
+            onReject?.("SESSION_PERSIST_UNAVAILABLE");
+            turnLog?.warn("user-chat-bridge: persist user row before forward failed", {
+              sessionId: peerId,
+              clientMessageId,
+              reason: lastReason,
+            });
+            sendErrorFrame(
+              userWs,
+              "SESSION_PERSIST_UNAVAILABLE",
+              "user message could not be durably admitted; retry safely",
+              { peerId, clientMessageId },
+            );
             return null;
           }
         }
-        const historical = Array.isArray(raw)
-          ? _sanitizeMasterHistoricalMessagesForFrame(raw, {
-              ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
-            })
-          : [];
-        if (historical.length > 0) {
-          turnLog?.info("user-chat-bridge: attached master history", {
-            sessionId: peerId,
-            messageCount: historical.length,
-          });
-          enriched = { ...enriched, _masterHistoricalMessages: historical };
-        }
-      } catch (err) {
-        // Fail-open: history bridging is UX context, not authz/billing.
-        turnLog?.warn("user-chat-bridge: load master history failed", {
-          sessionId: peerId,
-          err,
-        });
       }
-      if (deps.loadGoalState) {
-        // 二分语义收敛到 resolveTurnGoalState 单一权威(NOT_FOUND=确定性放行 vs 其它=拒轮);
-        // 副作用(错误帧/日志/回滚)仍留在此调用点。见该函数头注释。
-        const resolved = await resolveTurnGoalState(deps.loadGoalState, uid, peerId);
-        if (resolved.kind === "unavailable") {
-          onReject?.("GOAL_STATE_UNAVAILABLE");
-          // Goal attribution is part of the paid turn's durable authority. A
-          // transient PG read failure must not be converted to `null`: doing so
-          // would run the turn without goal_id and make later repair impossible.
-          // Reject this turn before it reaches the container; Codex callers that
-          // already reserved billing/slots unwind through their existing
-          // pre-forward compensation path.
-          turnLog?.error("user-chat-bridge: load platform goal failed; turn rejected", {
-            sessionId: peerId,
-            err: resolved.err,
+
+      // enrichment:dispatch 路径复用受理前已读的 rawHistory;legacy 路径此刻(持久之后)才首读,
+      // 保持「权威 user 行先于历史读/注入」的既有顺序。ensureHistory 幂等,不会二次查库。
+      // B3(R3):从此处到 return enriched 是「受理之后、转发之前」窗口。任何异常/早 return 出口都必须
+      // 终态化本帧受理的 dispatch —— try/finally 收口:成功交棒前置空 admittedThisFrame(所有权移交
+      // 调用方,由它 lookupAdmittedDispatch 后走 failDispatchPreForward);未交棒即离开 → CAS terminal。
+      try {
+        await ensureHistory();
+        // legacy 路径的 dedup 在持久之后判定(dispatch 路径已在受理前 dedup,useDispatchAdmission 分支
+        // 内 tryDedupCompleted 已消费;此处仅对 legacy 生效,避免二次 dedup 同一轮)。
+        if (!useDispatchAdmission && tryDedupCompleted()) return null;
+        let enriched = frameObj;
+        if (rawHistory !== null) {
+          const historical = _sanitizeMasterHistoricalMessagesForFrame(rawHistory, {
+            ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
           });
-          if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-            sendErrorFrame(
-              userWs,
-              "GOAL_STATE_UNAVAILABLE",
-              "goal state unavailable, retry this turn shortly",
-            );
+          if (historical.length > 0) {
+            turnLog?.info("user-chat-bridge: attached master history", {
+              sessionId: peerId,
+              messageCount: historical.length,
+            });
+            enriched = { ...enriched, _masterHistoricalMessages: historical };
           }
-          return null;
         }
-        // NOT_FOUND → resolved.goalState===null(放行,归因仍可修复);否则真实快照。
-        enriched = { ...enriched, _goalState: resolved.goalState };
+        if (deps.loadGoalState) {
+          // 二分语义收敛到 resolveTurnGoalState 单一权威(NOT_FOUND=确定性放行 vs 其它=拒轮);
+          // 副作用(错误帧/日志/回滚)仍留在此调用点。见该函数头注释。
+          const resolved = await resolveTurnGoalState(deps.loadGoalState, uid, peerId);
+          if (resolved.kind === "unavailable") {
+            // prompt-queue lane:回执让协调器取消 grant(browser lane 无 dispatchRequest → no-op)。
+            onReject?.("GOAL_STATE_UNAVAILABLE");
+            // Goal attribution is part of the paid turn's durable authority. A
+            // transient PG read failure must not be converted to `null`: doing so
+            // would run the turn without goal_id and make later repair impossible.
+            // Reject this turn before it reaches the container; Codex callers that
+            // already reserved billing/slots unwind through their existing
+            // pre-forward compensation path.
+            turnLog?.error("user-chat-bridge: load platform goal failed; turn rejected", {
+              sessionId: peerId,
+              err: resolved.err,
+            });
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(
+                userWs,
+                "GOAL_STATE_UNAVAILABLE",
+                "goal state unavailable, retry this turn shortly",
+              );
+            }
+            // B3(R3):受理后 goal 出口 —— 就地终态化(明确失败码),置空后 finally 不再重复。
+            if (admittedThisFrame !== null) {
+              failDispatchPreForward(admittedDispatches.get(admittedThisFrame), "goal_state_unavailable");
+              admittedThisFrame = null;
+            }
+            return null;
+          }
+          // NOT_FOUND → resolved.goalState===null(放行,归因仍可修复);否则真实快照。
+          enriched = { ...enriched, _goalState: resolved.goalState };
+        }
+        // 成功:所有权移交调用方(它据返回帧 lookupAdmittedDispatch 后接管 pre-forward 终态化)。
+        admittedThisFrame = null;
+        return enriched;
+      } finally {
+        // 未交棒即离开(sanitize/goal 读抛 / 任何未预期早 return)→ 终态化,绝不留孤儿 admitted。
+        // casToTerminal 幂等(CAS on epoch),即便调用方 catch 再兜底一次也安全。
+        if (admittedThisFrame !== null) {
+          failDispatchPreForward(admittedDispatches.get(admittedThisFrame), "history_injection_failed");
+        }
       }
-      return enriched;
     };
 
     // Both the browser legacy lane and the internal PG dispatch grant enter
@@ -3005,6 +3378,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (Object.prototype.hasOwnProperty.call(parsedObj, MODEL_AUTHORITY_FIELD)) {
               stripModelAuthorityField(parsedObj);
               bridgeLog?.warn("user-chat-bridge: client-supplied model authority field stripped");
+              const strippedStr = JSON.stringify(parsedObj);
+              passthroughData = Buffer.from(strippedStr, "utf8");
+              passthroughLen = Buffer.byteLength(strippedStr);
+            }
+            // durable dispatch envelope 同理:裸 wire 字段可被容器内同 uid 进程伪造 →
+            // 无条件先剥离,bridge 后续再按受理记录重新注入(RFC §2.2)。
+            if (Object.prototype.hasOwnProperty.call(parsedObj, DISPATCH_AUTHORITY_FIELD)) {
+              stripDispatchAuthorityField(parsedObj);
+              bridgeLog?.warn("user-chat-bridge: client-supplied dispatch authority field stripped");
               const strippedStr = JSON.stringify(parsedObj);
               passthroughData = Buffer.from(strippedStr, "utf8");
               passthroughLen = Buffer.byteLength(strippedStr);
@@ -3456,6 +3838,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 typeof peerIdRaw === "string" && peerIdRaw !== ""
                   ? `agent:${effectiveFrameAgentId}:webchat:dm:${peerIdRaw.replace(/[^a-zA-Z0-9_-]/g, "_")}`
                   : "(unknown-peer)";
+              // TODO(durable-dispatch): turn_traces.dispatch_id/request_id 是纯展示列
+              // (RFC §2 I3),但本 trace 登记是**同步**发生于分类阶段,而 dispatch 受理与
+              // server requestId 铸造都在下游 async IIFE(attach 之后)。此处两者均未就绪 →
+              // 保持 null(recordTurnTrace 默认 null,schema 兼容)。要填充需把 trace insert
+              // 移到受理后逐 IIFE 重复登记,与"不 restructure id-minting"约束冲突,故不做。
               recordTurnTrace(
                 deps.pgPool,
                 (msg, fields) => turnLogForFrame?.warn(msg, fields),
@@ -3494,75 +3881,101 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnLogCapture = turnLogForFrame;
         const authorityModelCapture = authorityModelForFrame;
         void (async () => {
-          if (turnTraceIdCapture === null || inboundParsedCapture === null) {
+          // M6:总括 try/catch —— 本 IIFE 无预扣/journal/槽,一切**意外**异常(签票 crypto /
+          // JSON.stringify / forward 抛)必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,
+          // 禁 unhandled rejection。dispatchRecordA 声明在 try 外,供 catch 兜底终态化。
+          let dispatchRecordA: AdmittedDispatch | undefined;
+          try {
+            if (turnTraceIdCapture === null || inboundParsedCapture === null) {
+              rejectPromptQueueDispatch("ERR_INTERNAL");
+              bridgeLog?.error("user-chat-bridge: annotated image frame missing trace invariant");
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
+                try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
+              }
+              return;
+            }
+            const enrichedParsed = await attachMasterTurnState(
+              inboundParsedCapture,
+              turnLogCapture,
+              turnTraceIdCapture,
+              !isPromptQueueDispatch,
+              rejectPromptQueueDispatch,
+            );
+            // null:attachMasterTurnState 已在内部拒轮(含 dispatch 终态化 + onReject);此处直接 return。
+            if (enrichedParsed === null) return;
+            dispatchRecordA = lookupAdmittedDispatch(enrichedParsed);
+            if (cleaned) { failDispatchPreForward(dispatchRecordA, "bridge_cleaned"); return; }
+            // 模型执行权威:epoch fence + descriptor(拒帧 → 直接 return,本路径尚无预扣)。
+            let authorityExec: ResolvedTurnExecution | null = null;
+            if (authorityOn) {
+              authorityExec = await resolveAuthorityExecOrReject({
+                model: authorityModelCapture,
+                classifiedCodex: true,
+                log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
+              });
+              if (authorityExec === null) {
+                failDispatchPreForward(dispatchRecordA, "authority_rejected");
+                return;
+              }
+            }
+            // Image 2 owns its exact 50-credit reservation inside the trusted
+            // relay. Do not acquire a chat slot, open a Codex journal, or create
+            // a chat Redis reservation for a turn the gateway intentionally
+            // completes without starting Codex. The relay resolves the active
+            // container binding/account independently.
+            // durable dispatch:复用受理铸的稳定 billingRequestId 作 server requestId(接管稳定)。
+            const requestId = dispatchRecordA ? dispatchRecordA.billingRequestId : ensureRequestIdServerSide();
+            // 签发边界(MAJOR-2):重读 epoch → 一致才签。本路径的计费在可信 relay 内自持
+            // (不开 journal、不占 chat 槽)→ 无需补偿,拒帧的代价是零。
+            let authorityFields: Record<string, unknown> = {};
+            if (authorityExec !== null) {
+              const sealed = await sealAuthorityFieldsOrReject({
+                exec: authorityExec,
+                billingRequestId: requestId,
+                log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
+              });
+              if (sealed === null) { failDispatchPreForward(dispatchRecordA, "authority_seal_rejected"); return; }
+              authorityFields = sealed;
+            }
+            if (cleaned) { failDispatchPreForward(dispatchRecordA, "bridge_cleaned"); return; }
+            const rewrittenObj = {
+              ...enrichedParsed,
+              requestId,
+              traceId: turnTraceIdCapture,
+              // 注入签名执行权威 + 把 frame.model 归一为 canonical(容器侧断言
+              // descriptor.canonicalModel === frame.model,不一致即拒)。
+              ...authorityFields,
+              // durable dispatch envelope(容器 durable inbox 准入 + at-most-once)。
+              ...dispatchAuthorityField(dispatchRecordA),
+            };
+            const rewrittenStr = JSON.stringify(rewrittenObj);
+            const rewrittenLen = Buffer.byteLength(rewrittenStr);
+            if (rewrittenLen > maxFrameBytes) {
+              rejectPromptQueueDispatch("ERR_FRAME_TOO_BIG");
+              failDispatchPreForward(dispatchRecordA, "ERR_FRAME_TOO_BIG");
+              turnLogCapture?.error("user-chat-bridge: rewritten annotated image frame too big", {
+                rewrittenLen, max: maxFrameBytes,
+              });
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG", `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`);
+                try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+              }
+              return;
+            }
+            // forwardPreparedFrame:queue lane 走它兜住 promptQueueResolved(cancel 边);browser
+            // lane 无 dispatchRequest → 等价 forwardInboundFrame。dispatch 已 accepted 交容器,不终态化。
+            forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+          } catch (err) {
+            bridgeLog?.error("user-chat-bridge: annotated image IIFE unexpected error", { err });
             rejectPromptQueueDispatch("ERR_INTERNAL");
-            bridgeLog?.error("user-chat-bridge: annotated image frame missing trace invariant");
+            failDispatchPreForward(dispatchRecordA, "annotated_image_unexpected_exception");
             if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-              sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
-              try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
+              sendErrorFrame(userWs, "ERR_INTERNAL", "internal error");
             }
-            return;
           }
-          const enrichedParsed = await attachMasterTurnState(
-            inboundParsedCapture,
-            turnLogCapture,
-            !isPromptQueueDispatch,
-            rejectPromptQueueDispatch,
-          );
-          if (enrichedParsed === null || cleaned) return;
-          // 模型执行权威:epoch fence + descriptor(拒帧 → 直接 return,本路径尚无预扣)。
-          let authorityExec: ResolvedTurnExecution | null = null;
-          if (authorityOn) {
-            authorityExec = await resolveAuthorityExecOrReject({
-              model: authorityModelCapture,
-              classifiedCodex: true,
-              log: turnLogCapture,
-              onReject: rejectPromptQueueDispatch,
-            });
-            if (authorityExec === null) return;
-          }
-          // Image 2 owns its exact 50-credit reservation inside the trusted
-          // relay. Do not acquire a chat slot, open a Codex journal, or create
-          // a chat Redis reservation for a turn the gateway intentionally
-          // completes without starting Codex. The relay resolves the active
-          // container binding/account independently.
-          const requestId = ensureRequestIdServerSide();
-          // 签发边界(MAJOR-2):重读 epoch → 一致才签。本路径的计费在可信 relay 内自持
-          // (不开 journal、不占 chat 槽)→ 无需补偿,拒帧的代价是零。
-          let authorityFields: Record<string, unknown> = {};
-          if (authorityExec !== null) {
-            const sealed = await sealAuthorityFieldsOrReject({
-              exec: authorityExec,
-              billingRequestId: requestId,
-              log: turnLogCapture,
-              onReject: rejectPromptQueueDispatch,
-            });
-            if (sealed === null) return;
-            authorityFields = sealed;
-          }
-          if (cleaned) return;
-          const rewrittenObj = {
-            ...enrichedParsed,
-            requestId,
-            traceId: turnTraceIdCapture,
-            // 注入签名执行权威 + 把 frame.model 归一为 canonical(容器侧断言
-            // descriptor.canonicalModel === frame.model,不一致即拒)。
-            ...authorityFields,
-          };
-          const rewrittenStr = JSON.stringify(rewrittenObj);
-          const rewrittenLen = Buffer.byteLength(rewrittenStr);
-          if (rewrittenLen > maxFrameBytes) {
-            rejectPromptQueueDispatch("ERR_FRAME_TOO_BIG");
-            turnLogCapture?.error("user-chat-bridge: rewritten annotated image frame too big", {
-              rewrittenLen, max: maxFrameBytes,
-            });
-            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-              sendErrorFrame(userWs, "ERR_FRAME_TOO_BIG", `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`);
-              try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
-            }
-            return;
-          }
-          forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
         })();
         return;
       }
@@ -3650,6 +4063,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const turnLogCapture = turnLogForFrame;
         void (async () => {
           let turnForwarded = false;
+          // durable dispatch 受理记录(attach 后赋值);声明在 try 外供 finally 兜底终态化。
+          let dispatchRecordB: AdmittedDispatch | undefined;
           try {
             // CG2a invariant — codex inbound 必经 inbound.message 分支 ⇒ trace + parsed 必非 null。
             // 这里前置校验(acquire 之前),invariant 破坏 → close 1011,无需 release。
@@ -3666,10 +4081,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const preparedInbound = await attachMasterTurnState(
               inboundParsedCapture,
               turnLogCapture,
+              turnTraceIdCapture,
               !isPromptQueueDispatch,
               rejectPromptQueueDispatch,
             );
             if (preparedInbound === null || !isCurrentCodexTurnState(codexTurnState)) return;
+            dispatchRecordB = lookupAdmittedDispatch(preparedInbound);
             // ── 模型执行权威:epoch fence + descriptor(方案 §1.2 R3-B2)─────────
             // **必须在 acquire / preCheck / journal 之前**:此刻拒帧的代价是零(没占槽、
             // 没预扣、没开 journal)。放到后面拒 = 要写一堆补偿回滚,而补偿路径正是漏账
@@ -3843,7 +4260,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 multiplier: composedMultiplier,
               };
 
-              const requestId = ensureRequestIdServerSide();
+              // durable dispatch:复用受理铸的稳定 billingRequestId 作 server requestId
+              // (接管跨 attempt 稳定;journal/票据/结算全绑同一值)。
+              const requestId = dispatchRecordB ? dispatchRecordB.billingRequestId : ensureRequestIdServerSide();
               // 先铸 turnId 再落 journal；随后签票必须复用同一值，并把 billingRequestId
               // 绑到 requestId。这样进程崩溃后只读 journal 也能复原“哪张票对应哪笔账”。
               const authorityTurnId = authorityExec !== null
@@ -3928,6 +4347,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     // traceId 让跨桥的 cost_charged 广播 / billing 日志仍钉回本
                     // turn 的 canonical trace。CG2c invariant 保证此处非 null。
                     traceId: turnTraceIdCapture,
+                    // durable dispatch 身份:durableCodexBilling settle 侧写
+                    // usage_records/journal 的 dispatch_id/attempt_no(RFC §2.2)。
+                    ...(dispatchRecordB
+                      ? { dispatchId: dispatchRecordB.dispatchId, attemptNo: dispatchRecordB.attemptNo }
+                      : {}),
                     ...(authorityExec === null
                       ? {}
                       : {
@@ -3939,18 +4363,53 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                           securityEpoch: String(authorityExec.securityEpoch),
                         }),
                   },
+                  // 落**列**(非仅 ctx):reconciler 财务联查按 dispatch_id 列直查(RFC §2.3)。
+                  ...(dispatchRecordB
+                    ? { dispatchId: dispatchRecordB.dispatchId, attemptNo: dispatchRecordB.attemptNo }
+                    : {}),
                 });
                 if (!admitted) {
-                  turnLogCapture?.error("user-chat-bridge: request journal conflict", {
-                    requestId,
-                  });
-                  if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-                    sendTurnErrorFrame("CODEX_BILLING", "journal unavailable");
-                    try { userWs.close(CLOSE_BRIDGE.INTERNAL, "journal unavailable"); } catch { /* */ }
+                  // journal 已存在。durable 路径 = lease 接管复用同 billingRequestId(RFC §7.7):
+                  // 严格比对列(user/dispatch/attempt)+ ctx.model —— 全对且 inflight 才复用;
+                  // aborted = 本 attempt 计费面已耗尽(旧桥主动 abort),终态化让用户显式重发;
+                  // 其余(committed/finalizing/比对不一致)= 财务歧义 → manual_reconcile,绝不盲用。
+                  let reuseAsTakenOver = false;
+                  if (dispatchRecordB !== undefined) {
+                    const existing = await readJournalForTakeover(pgPool, requestId).catch(() => null);
+                    if (
+                      existing !== null &&
+                      existing.state === "inflight" &&
+                      existing.userId === uid.toString() &&
+                      existing.dispatchId === dispatchRecordB.dispatchId &&
+                      existing.attemptNo === dispatchRecordB.attemptNo &&
+                      existing.model === effectiveModel
+                    ) {
+                      reuseAsTakenOver = true;
+                      turnLogCapture?.info("user-chat-bridge: journal takeover reuse", {
+                        requestId, dispatchId: dispatchRecordB.dispatchId,
+                      });
+                    } else if (existing !== null && existing.state === "aborted") {
+                      failDispatchPreForward(dispatchRecordB, "journal_aborted");
+                    } else {
+                      void casToManualReconcile(pgPool, {
+                        dispatchId: dispatchRecordB.dispatchId,
+                        conflictReason: "journal_takeover_mismatch",
+                      }).catch(() => {});
+                      dropAdmittedDispatch(dispatchRecordB.clientMessageId);
+                    }
                   }
-                  await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
-                  releaseAcquiredSlotForFailure();
-                  return;
+                  if (!reuseAsTakenOver) {
+                    turnLogCapture?.error("user-chat-bridge: request journal conflict", {
+                      requestId,
+                    });
+                    if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                      sendTurnErrorFrame("CODEX_BILLING", "journal unavailable");
+                      try { userWs.close(CLOSE_BRIDGE.INTERNAL, "journal unavailable"); } catch { /* */ }
+                    }
+                    await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+                    releaseAcquiredSlotForFailure();
+                    return;
+                  }
                 }
               } catch (err) {
                 turnLogCapture?.error("user-chat-bridge: startInflightJournal failed", {
@@ -4024,6 +4483,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     derivedPricing,
                     reservation: reservationForTurn,
                     authority: snap.authority,
+                    // B7b:live codex settle 把 dispatch 身份写进 usage_records.dispatch_id/
+                    // attempt_no(与 journal 列一致)。legacy turn(无 dispatch)→ null。
+                    dispatchId: dispatchRecordB?.dispatchId ?? null,
+                    attemptNo: dispatchRecordB?.attemptNo ?? null,
                   });
                   snapState = { kind: "handle", handle };
                   return handle;
@@ -4110,6 +4573,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // 模型执行权威:签票绑定本 turn 的 server-owned requestId(billingRequestId),
                 // 并把 frame.model 归一为 canonical(容器断言 canonicalModel === frame.model)。
                 ...authorityFields,
+                // durable dispatch envelope(容器 durable inbox 准入 + at-most-once)。
+                ...dispatchAuthorityField(dispatchRecordB),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -4194,6 +4659,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // billing 未启用(legacy NULL 容器 / 测试):无 server requestId 可绑,
                 // 仍必须签票 —— 容器侧(flag 开)对无 envelope 的帧一律拒。
                 ...authorityFields,
+                // durable dispatch envelope(记录存在才注;此分支通常无 durable capability)。
+                ...dispatchAuthorityField(dispatchRecordB),
               };
               const rewrittenStr = JSON.stringify(rewrittenObj);
               const rewrittenLen = Buffer.byteLength(rewrittenStr);
@@ -4276,7 +4743,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           } finally {
             codexTurnState.acquireInflight = false;
-            if (!turnForwarded) releaseCodexTurnState(codexTurnState, "not_forwarded");
+            if (!turnForwarded) {
+              releaseCodexTurnState(codexTurnState, "not_forwarded");
+              // durable dispatch:本 IIFE 一切 pre-forward 失败出口(route/acquire/preCheck/
+              // journal/seal/frame-too-big/disconnect)在此单点 CAS terminal + 移除记录,
+              // 避免逐点埋点漏项;成功 forward 的记录留给心跳(终态由 tape finalize 收敛)。
+              failDispatchPreForward(dispatchRecordB, "codex_pre_forward_abandoned");
+            }
           }
         })();
         return; // 同步路径不再 forward,等 async 完成后由 forwardInboundFrame 走
@@ -4295,65 +4768,89 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const authorityModelCapture = authorityModelForFrame;
         const classifiedCodexCapture = isCodexInboundFrame;
         void (async () => {
-          // 模型执行权威:epoch fence + descriptor。CCB turn 的计费在 egress 侧按请求
-          // 结算(见方案 §4),此处拒帧无需任何回滚。
-          //
-          // classifiedCodex 传**同步分类结果**而不是 false:走到这条路径的 codex 帧
-          // 是"没注 codexBinding/createCodexRoute"的降级形态(测试 / 个人版),它的
-          // engine 确实是 codex —— 传 false 会把这类帧误判成 engine 漂移。
-          let authorityExec: ResolvedTurnExecution | null = null;
-          if (authorityOn) {
-            authorityExec = await resolveAuthorityExecOrReject({
-              model: authorityModelCapture,
-              classifiedCodex: classifiedCodexCapture,
-              log: turnLogCapture,
-              onReject: rejectPromptQueueDispatch,
-            });
-            if (authorityExec === null) return;
-          }
-          const enrichedParsed = await attachMasterTurnState(
-            inboundParsedCapture,
-            turnLogCapture,
-            !isPromptQueueDispatch,
-            rejectPromptQueueDispatch,
-          );
-          if (enrichedParsed === null) return;
-          // 签发边界(MAJOR-2):CCB turn 的计费在 egress 逐请求结算,此处无预扣/无 journal
-          // → 无需补偿;但 epoch 重读一样不能省 —— 拿过时快照签出的票 lease 长达 50min,
-          // 会让「刚被 admin 撤销的模型」在这条 turn 里继续跑到 egress 的下一次 fence 才拦下。
-          let authorityFields: Record<string, unknown> = {};
-          if (authorityExec !== null) {
-            const sealed = await sealAuthorityFieldsOrReject({
-              exec: authorityExec,
-              log: turnLogCapture,
-              onReject: rejectPromptQueueDispatch,
-            });
-            if (sealed === null) return;
-            authorityFields = sealed;
-          }
-          if (cleaned) return;
-          const rewrittenObj = {
-            ...enrichedParsed,
-            traceId: turnTraceIdCapture,
-            ...authorityFields,
-          };
-          const rewrittenStr = JSON.stringify(rewrittenObj);
-          const rewrittenLen = Buffer.byteLength(rewrittenStr);
-          if (rewrittenLen > maxFrameBytes) {
-            turnLogCapture?.error("user-chat-bridge: rewritten inbound frame too big", {
-              rewrittenLen, max: maxFrameBytes,
-            });
-            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
-              sendErrorFrame(
-                userWs,
-                "ERR_FRAME_TOO_BIG",
-                `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
-              );
-              try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+          // M6:总括 try/catch —— CCB turn 无预扣/journal/槽(计费在 egress 逐请求结算),一切
+          // **意外**异常必须收敛成「dispatch 终态化 + error 帧 + queue grant 取消」,禁 unhandled rejection。
+          // dispatchRecordC 声明在 try 外供 catch 兜底。
+          let dispatchRecordC: AdmittedDispatch | undefined;
+          try {
+            // 模型执行权威:epoch fence + descriptor。CCB turn 的计费在 egress 侧按请求
+            // 结算(见方案 §4),此处拒帧无需任何回滚。
+            //
+            // classifiedCodex 传**同步分类结果**而不是 false:走到这条路径的 codex 帧
+            // 是"没注 codexBinding/createCodexRoute"的降级形态(测试 / 个人版),它的
+            // engine 确实是 codex —— 传 false 会把这类帧误判成 engine 漂移。
+            let authorityExec: ResolvedTurnExecution | null = null;
+            if (authorityOn) {
+              authorityExec = await resolveAuthorityExecOrReject({
+                model: authorityModelCapture,
+                classifiedCodex: classifiedCodexCapture,
+                log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
+              });
+              if (authorityExec === null) return;
             }
-            return;
+            const enrichedParsed = await attachMasterTurnState(
+              inboundParsedCapture,
+              turnLogCapture,
+              turnTraceIdCapture,
+              !isPromptQueueDispatch,
+              rejectPromptQueueDispatch,
+            );
+            if (enrichedParsed === null) return;
+            dispatchRecordC = lookupAdmittedDispatch(enrichedParsed);
+            // 签发边界(MAJOR-2):CCB turn 的计费在 egress 逐请求结算,此处无预扣/无 journal
+            // → 无需补偿;但 epoch 重读一样不能省 —— 拿过时快照签出的票 lease 长达 50min,
+            // 会让「刚被 admin 撤销的模型」在这条 turn 里继续跑到 egress 的下一次 fence 才拦下。
+            let authorityFields: Record<string, unknown> = {};
+            if (authorityExec !== null) {
+              const sealed = await sealAuthorityFieldsOrReject({
+                exec: authorityExec,
+                // B7a:CCB turn 把 dispatch 的稳定 billingRequestId 签进 model-authority envelope,
+                // egress gate 据此反查 dispatch 身份写 usage_records.dispatch_id/attempt_no(否则
+                // CCB 计费行丢失 turn↔dispatch 关联)。legacy(无 dispatch 记录)→ undefined 不带。
+                ...(dispatchRecordC ? { billingRequestId: dispatchRecordC.billingRequestId } : {}),
+                log: turnLogCapture,
+                onReject: rejectPromptQueueDispatch,
+              });
+              if (sealed === null) { failDispatchPreForward(dispatchRecordC, "authority_seal_rejected"); return; }
+              authorityFields = sealed;
+            }
+            if (cleaned) { failDispatchPreForward(dispatchRecordC, "bridge_cleaned"); return; }
+            const rewrittenObj = {
+              ...enrichedParsed,
+              traceId: turnTraceIdCapture,
+              ...authorityFields,
+              // durable dispatch envelope(容器 durable inbox 准入 + at-most-once)。
+              ...dispatchAuthorityField(dispatchRecordC),
+            };
+            const rewrittenStr = JSON.stringify(rewrittenObj);
+            const rewrittenLen = Buffer.byteLength(rewrittenStr);
+            if (rewrittenLen > maxFrameBytes) {
+              turnLogCapture?.error("user-chat-bridge: rewritten inbound frame too big", {
+                rewrittenLen, max: maxFrameBytes,
+              });
+              failDispatchPreForward(dispatchRecordC, "ERR_FRAME_TOO_BIG");
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "ERR_FRAME_TOO_BIG",
+                  `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
+                );
+                try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+              }
+              return;
+            }
+            // forwardPreparedFrame:queue lane 兜住 promptQueueResolved;browser lane 等价
+            // forwardInboundFrame。dispatch 已 accepted 交容器,forward 后不终态化。
+            forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+          } catch (err) {
+            bridgeLog?.error("user-chat-bridge: ccb inbound IIFE unexpected error", { err });
+            rejectPromptQueueDispatch("ERR_INTERNAL");
+            failDispatchPreForward(dispatchRecordC, "ccb_inbound_unexpected_exception");
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, "ERR_INTERNAL", "internal error");
+            }
           }
-          forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
         })();
         return;
       }
@@ -4462,6 +4959,36 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             (parsedAttest as { type?: unknown }).type === CONTAINER_ATTEST_FRAME_TYPE
           ) {
             onContainerAttest(parsedAttest as Record<string, unknown>);
+            return;
+          }
+        }
+        // ── turn_dispatch_receipt(RFC §3.b)── 容器已持有该逻辑键的 inbox 行(重复
+        // 到达/接管重发)。内部控制帧,绝不透传浏览器。消费 = dispatch CAS accepted +
+        // 本连接放下转发所有权(容器已拥有执行,lease 心跳不再由本桥续)。
+        if (attestPeek !== null && attestPeek.includes('"outbound.control.turn_dispatch_receipt"')) {
+          let parsedReceipt: unknown = null;
+          try { parsedReceipt = JSON.parse(attestPeek); } catch { /* 非 JSON → 落回常规路径 */ }
+          if (
+            parsedReceipt !== null && typeof parsedReceipt === "object" &&
+            (parsedReceipt as { type?: unknown }).type === "outbound.control.turn_dispatch_receipt"
+          ) {
+            const receipt = parsedReceipt as { clientMessageId?: unknown; dispatchId?: unknown };
+            const cmid = isClientMessageId(receipt.clientMessageId) ? receipt.clientMessageId : null;
+            const rec = cmid !== null ? admittedDispatches.get(cmid) : undefined;
+            if (
+              rec !== undefined &&
+              typeof receipt.dispatchId === "string" &&
+              receipt.dispatchId === rec.dispatchId
+            ) {
+              const pool = deps.pgPool;
+              if (pool) {
+                void casAdmittedToAccepted(pool, {
+                  dispatchId: rec.dispatchId,
+                  expectedEpoch: rec.leaseEpoch,
+                }).catch(() => {});
+              }
+              dropAdmittedDispatch(rec.clientMessageId);
+            }
             return;
           }
         }
@@ -5306,10 +5833,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const passReason = reason && reason.length > 0 && reason.length < 120
         ? reason.toString("utf8")
         : "client closed";
-      // 仅在没有 codex inflight 时才透传 close 给容器(走 force final 路径);
-      // 有 inflight 时进 drain,container 留着等 billing,drain 收尾时由 finalCleanup
-      // 统一 terminate。
-      if (inflightCodexTurns.size === 0) {
+      // 仅在没有 codex inflight 且无在飞 durable dispatch 时才透传 close 给容器
+      // (走 force final 路径);有其一时进 drain,container 留着让 turn 跑完 + 收 billing /
+      // 保 lease,drain 收尾时由 finalCleanup 统一 terminate。
+      if (inflightCodexTurns.size === 0 && admittedDispatches.size === 0) {
         try {
           if (containerWs.readyState === WebSocket.OPEN
             || containerWs.readyState === WebSocket.CONNECTING) {
@@ -5372,14 +5899,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
       // 还没进 drain
       // drain 适用条件:user-side 故障(client_close / backpressure / internal_error)
-      // 同时有在飞 codex turn → container 仍可发 billing 帧,窗口内能到的就 settle。
+      // 同时有在飞 codex turn(等 billing)或在飞 durable dispatch(保 lease / 等终态)。
       // container_* / shutdown / frame_too_big / auth_failed 等路径不走 drain。
       const shouldDrain =
         !force &&
         (triggerCause === "client_close" ||
           triggerCause === "backpressure" ||
           triggerCause === "internal_error") &&
-        inflightCodexTurns.size > 0;
+        (inflightCodexTurns.size > 0 || admittedDispatches.size > 0);
 
       if (!shouldDrain) {
         finalCleanup(triggerCause);
@@ -5395,24 +5922,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       for (const [requestId, snap] of inflightCodexTurns) {
         recordBillingRecovery(requestId, "pending", snap);
       }
+      // RFC §2.2 B1:有在飞 admitted dispatch → 取 max(billing, dispatch drain,默认 60s / 上限 120s);
+      // 无 dispatch(纯 codex billing drain)→ 沿用 5s billing 窗口。
+      const drainMs = admittedDispatches.size > 0
+        ? Math.max(readDrainBillingMs(), readDispatchDrainMs())
+        : readDrainBillingMs();
       drainTimer = setTimeout(() => {
         bridgeLog?.warn("user-chat-bridge: drain timeout", {
           leftover: inflightCodexTurns.size,
+          admittedLeftover: admittedDispatches.size,
         });
         for (const [requestId, snap] of inflightCodexTurns) {
           recordBillingRecovery(requestId, "failed", snap);
         }
         finalCleanup(drainCause ?? "client_close");
-      }, readDrainBillingMs());
+      }, drainMs);
       drainTimer.unref?.();
     }
 
     /**
-     * billing settle 把 inflightCodexTurns.size 减到 0 时调,提前结束 drain。
-     * 不在 drain 期 / Map 非空时 no-op。
+     * billing settle(inflightCodexTurns→0)或 dispatch 记录清空(dropAdmittedDispatch)时调,
+     * 双 map 均空才提前结束 drain。不在 drain 期 / 任一 map 非空时 no-op。
      */
     function checkDrainComplete(): void {
-      if (drainTimer !== null && inflightCodexTurns.size === 0) {
+      if (drainTimer !== null && inflightCodexTurns.size === 0 && admittedDispatches.size === 0) {
         clearTimeout(drainTimer);
         drainTimer = null;
         finalCleanup(drainCause ?? "client_close");
@@ -5780,6 +6313,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               });
             }
           }
+          // B7b:cross-bridge recovery settle 也要写 dispatch 身份到 usage_records
+          // (与 durableCodexBilling 同源:从 journal ctx 读出 dispatchId/attemptNo)。
+          const crossBridgeDispatchId =
+            typeof ctx.dispatchId === "string" ? ctx.dispatchId : null;
+          const crossBridgeAttemptNo =
+            typeof ctx.attemptNo === "number" && Number.isInteger(ctx.attemptNo)
+              ? ctx.attemptNo
+              : null;
           const finalizer = makeCodexFinalizer({
             pgPool,
             preCheckRedis: preCheckRedisBound,
@@ -5790,6 +6331,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             derivedPricing,
             reservation,
             authority: recoveredAuthority,
+            dispatchId: crossBridgeDispatchId,
+            attemptNo: crossBridgeAttemptNo,
           });
           const result = await finalizer.commit(
             frame.usage, frame.codexStatus, {
@@ -5940,6 +6483,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         clearTimeout(drainTimer);
         drainTimer = null;
       }
+      // durable dispatch 心跳只在 finalCleanup 停(drain 期间必须续 lease,故不在
+      // detachUserSide 里清)。残留 admitted 记录不 CAS terminal:桥关 ≠ turn 死,
+      // 心跳一停 lease 到期后由 turnDispatchReconciler 裁决(与上面 inflight 同纪律)。
+      if (dispatchHeartbeatTimer !== null) {
+        clearInterval(dispatchHeartbeatTimer);
+        dispatchHeartbeatTimer = null;
+      }
 
       // keyring 普查:连接终结 = 这个容器的这条连接不再在册。留着不摘 = 轮换步骤② 的
       // 覆盖率会被已经断开的连接稀释(永远收敛不到 100%,或反过来把已下线的旧 env
@@ -5988,6 +6538,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
       }
       inflightCodexTurns.clear();
+      // durable dispatch 本地簿记清空(权威在 turn_dispatches;reconciler 兜底 open 行)。
+      admittedDispatches.clear();
 
       // Release every session-scoped admission state. Awaiting acquire/route
       // continuations carry the state identity fence and release any resource
@@ -6182,4 +6734,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 // ---------- 测试 re-exports ------------------------------------------------
 // 供单测直接拿到内部 helpers,不走 ws upgrade 全链路就能验逻辑
 
-export { rawDataLen as _rawDataLen, encode4503Reason as _encode4503Reason };
+export {
+  rawDataLen as _rawDataLen,
+  encode4503Reason as _encode4503Reason,
+  readDispatchDrainMs as _readDispatchDrainMs,
+  readDrainBillingMs as _readDrainBillingMs,
+};

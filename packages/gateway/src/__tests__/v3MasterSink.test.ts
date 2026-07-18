@@ -119,6 +119,11 @@ function fakeQueue(): V3MasterRetryQueue & { enqueued: any[]; kicks: number } {
     startPeriodic() {},
     stopPeriodic() {},
     async pendingCount() { return enqueued.length; },
+    async hasEntryForDispatch(dispatchId, attemptNo) {
+      return enqueued.some(
+        (e) => e?.payload?.dispatchId === dispatchId && e?.payload?.attemptNo === attemptNo,
+      );
+    },
   };
 }
 
@@ -392,6 +397,74 @@ describe("makeV3MasterSink.persistOrQueue", () => {
     if (outcome.ok || !outcome.queued) assert.fail("expected queued outcome");
     assert.equal(outcome.errorClass, "transient");
     assert.equal(queue.enqueued.length, 1);
+  });
+});
+
+describe("M-R1-1 ① — onAck gates durable entry deletion", () => {
+  const DISPATCH_PAYLOAD: V3MasterSinkPayload = {
+    ...PAYLOAD,
+    dispatchId: "d-sink-1",
+    attemptNo: 1,
+  };
+
+  test("terminal CAS confirmed (onAck true) → entry deleted, ok", async () => {
+    const queue = fakeQueue();
+    let ackCalls = 0;
+    const sink = makeV3MasterSink({
+      config: CFG,
+      retryQueue: queue,
+      attemptSendImpl: async () => { /* master ACK ok */ },
+      inboxHooks: { onAck: async () => { ackCalls++; return true; } },
+    });
+    const outcome = await sink.persistOrQueue(DISPATCH_PAYLOAD);
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(ackCalls, 1, "onAck fired once");
+    assert.equal(queue.enqueued.length, 0, "terminal 确认 → entry 删除");
+  });
+
+  test("terminal CAS unconfirmed (onAck false) → entry retained + queued outcome + drainer kicked", async () => {
+    const queue = fakeQueue();
+    let ackCalls = 0;
+    const sink = makeV3MasterSink({
+      config: CFG,
+      retryQueue: queue,
+      attemptSendImpl: async () => { /* master ACK ok */ },
+      inboxHooks: { onAck: async () => { ackCalls++; return false; } },
+    });
+    const outcome = await sink.persistOrQueue(DISPATCH_PAYLOAD);
+    assert.equal(outcome.ok, false);
+    if (outcome.ok || !outcome.queued) assert.fail("expected queued outcome");
+    assert.equal(outcome.errorClass, "transient");
+    assert.equal(ackCalls, 1);
+    assert.equal(queue.enqueued.length, 1, "terminal 未确认 → entry 保留(下轮 drain 重试)");
+    assert.equal(queue.kicks, 1, "kick drainer to retry terminal migration");
+  });
+
+  test("onAck throws → treated as unconfirmed → entry retained", async () => {
+    const queue = fakeQueue();
+    const sink = makeV3MasterSink({
+      config: CFG,
+      retryQueue: queue,
+      attemptSendImpl: async () => { /* master ACK ok */ },
+      inboxHooks: { onAck: async () => { throw new Error("inbox CAS write failed"); } },
+    });
+    const outcome = await sink.persistOrQueue(DISPATCH_PAYLOAD);
+    assert.equal(outcome.ok, false);
+    if (outcome.ok || !outcome.queued) assert.fail("expected queued outcome");
+    assert.equal(queue.enqueued.length, 1, "onAck 抛 → 视为未确认 → entry 保留");
+  });
+
+  test("dispatch payload without onAck hook → still acked (no hook = nothing to converge)", async () => {
+    const queue = fakeQueue();
+    const sink = makeV3MasterSink({
+      config: CFG,
+      retryQueue: queue,
+      attemptSendImpl: async () => { /* master ACK ok */ },
+      // no inboxHooks
+    });
+    const outcome = await sink.persistOrQueue(DISPATCH_PAYLOAD);
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(queue.enqueued.length, 0);
   });
 });
 

@@ -217,7 +217,9 @@ import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
 import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
   makeServerAuthoredHandler,
+  makeTurnTapeStateHandler,
   SERVER_AUTHORED_PATH,
+  TURN_TAPE_STATE_PATH,
   type ServerAuthoredHandler,
 } from "./http/internalServerAuthored.js";
 import {
@@ -347,6 +349,7 @@ import {
   appendServerAuthoredMessageDrainByUser,
   drainDelegateCostForClientSession,
   getClientSession,
+  getEngineContextMessages,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
   upsertMasterClientSession,
   softDeleteMasterSession,
@@ -357,9 +360,15 @@ import {
 } from "@openclaude/storage";
 import {
   createPgSessionsBackend,
+  type DispatchAdmissionBackend,
   startSessionsGcSweeper,
   type LosslessTurnTapeStorage,
 } from "./db/pgSessionsBackend.js";
+import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.js";
+import {
+  resolveDispatchStuckThresholdMs,
+  startTurnDispatchReconciler,
+} from "./dispatch/turnDispatchReconciler.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
 import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
 import {
@@ -1139,6 +1148,8 @@ export async function registerCommercial(
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
+  // durable turn dispatch(RFC §2):受理/tape-state/projection 读需 DispatchAdmissionBackend 面。
+  let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
   const goalUsageRefreshRef: {
     current: (userId: string, sessionId: string) => void | Promise<void>;
   } = { current: () => { /* GoalState service is assembled below. */ } };
@@ -1151,6 +1162,7 @@ export async function registerCommercial(
       });
       setClientSessionsBackend(pgSessionsBackend);
       losslessTurnTapeStorage = pgSessionsBackend;
+      dispatchAdmissionBackend = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
       // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
       sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({
@@ -1895,6 +1907,11 @@ export async function registerCommercial(
         pgPool: getPool(),
         getSigner: () => modelAuthoritySigner,
       });
+      // durable turn dispatch(RFC §2.4 / §3):容器 boot recovery 查 tape 三态。同容器身份双因子。
+      const turnTapeStateHandler: ServerAuthoredHandler = makeTurnTapeStateHandler({
+        identityRepo,
+        storage: dispatchAdmissionBackend,
+      });
       // V5 queue P1 compatibility layer:strict opt-in. Flag off means no store
       // instance and no route registration, so legacy internal dispatch remains exact.
       const promptQueueHandler: PromptQueueHandler | null = isPromptQueueV1Enabled()
@@ -2116,6 +2133,9 @@ export async function registerCommercial(
         }
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
+        }
+        if (path === TURN_TAPE_STATE_PATH) {
+          return turnTapeStateHandler(req, res, ctx);
         }
         if (path === LITERATURE_SEARCH_PATH) {
           return literatureProxyHandler(req, res, ctx);
@@ -4373,10 +4393,12 @@ export async function registerCommercial(
         platformRoot: cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT,
       });
     },
-    loadMasterSessionMessages: async (uid, sessionId) => {
-      const session = await getClientSession(sessionId, MASTER_USER_PREFIX + uid.toString());
-      return session?.messages ?? null;
-    },
+    // 引擎历史注入(RFC §9):切到 getEngineContextMessages —— 投影 assistant 生成行 + 热行
+    // canonical user 行按 _orderSeq 合并 + 48 行/18k 截断,绝不全量水合 tape BYTEA(挂历史 22-31s
+    // 根治)。返回形态与旧 getClientSession(...).messages 兼容(MessageLike[] | null);dedup 判定
+    // 字段(_clientMessageId/status/_errorCode)在投影生成行保真,tryDedupCompleted 不受影响。
+    loadMasterSessionMessages: async (uid, sessionId) =>
+      getEngineContextMessages(sessionId, MASTER_USER_PREFIX + uid.toString()),
     loadGoalState: (uid, sessionId) => goalStateService.get(uid, sessionId),
     updateGoalEngineMetrics: (args) => goalStateService.updateEngineMetrics(args),
     persistMasterUserMessage: async (uid, sessionId, message) =>
@@ -4385,6 +4407,11 @@ export async function registerCommercial(
         MASTER_USER_PREFIX + uid.toString(),
         message,
       ),
+    // durable turn dispatch 受理面(RFC §2.1):容器 attest durable-turn-dispatch-v1 时
+    // 替代 persistMasterUserMessage(单事务 append + dispatch 冲突表)。未装 backend → undefined → legacy。
+    admitUserTurn: dispatchAdmissionBackend
+      ? (input) => dispatchAdmissionBackend!.admitUserTurn(input)
+      : undefined,
     // plan v3 G5/G7 → M2 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
     codexBinding,
@@ -4625,6 +4652,93 @@ export async function registerCommercial(
           intervalMs,
           thresholdMs,
           durableWaiverAgeMs,
+        }));
+        return { stop: () => h.stop() };
+      },
+    });
+  }
+
+  // durable turn dispatch reconciler(RFC §2.3):open dispatch 周期收敛(admitted 过期租约 →
+  // 容器求证 → terminal/accepted;terminal 未通知 → 财务联查 → error projection / manual_reconcile)。
+  // leaderBundle shared 单跑(双 master 只 leader)。仅 v5(turn_dispatches 由 0170 建)。
+  if (runtimeChannel === "v5" && process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_DISABLED !== "1") {
+    const dispatchBridgeSecret = bridgeSecret;
+    leaderBundle.add({
+      name: "turnDispatchReconciler",
+      domain: "shared",
+      start: () => {
+        const rawInterval = Number(process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 30_000;
+        const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS);
+        const stuckThresholdMs = resolveDispatchStuckThresholdMs(
+          process.env.COMMERCIAL_TURN_DISPATCH_STUCK_MS,
+          Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
+        );
+        // 独立 transport 实例(keep-alive 池);无 bridgeSecret → resolveRunningEndpoint 恒 null,
+        // 容器求证分支跳过,reconciler 仍跑纯 DB 的财务/告警分支(不静默丢终态)。
+        const container = makeContainerDispatchClient({
+          transport: makeNodeHttpContainerTransport(),
+          bridgeSecret: dispatchBridgeSecret ?? "",
+          resolveRunningEndpoint: async (uid) => {
+            if (!dispatchBridgeSecret) return null;
+            // M3:remote-host 容器的 bound_ip **不是** master 可直拨的地址(它在 node-agent
+            // 隧道后)。join compute_hosts 拿 host 名:非 'self' = remote-host → 打 tunnel 标记,
+            // 让 containerDispatchClient(supportsTunnel=false)归为 unreachable 保持 unknown +
+            // 告警,**绝不**对 bound_ip 做 false-dial(可能误命中同网段无关主机 = 伪 negative proof)。
+            // v1 self-host 范围;tunnel transport 支持登记在 RFC §8 债表。
+            const r = await getPool().query<{
+              id: string;
+              bound_ip: string | null;
+              port: number | null;
+              host_name: string | null;
+            }>(
+              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
+                      ch.name AS host_name
+                 FROM agent_containers ac
+                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
+                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
+                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
+                ORDER BY ac.updated_at DESC LIMIT 1`,
+              [uid.toString(), getRuntimeChannel()],
+            );
+            const row = r.rows[0];
+            if (!row || !row.bound_ip || row.port === null) return null;
+            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
+            return {
+              host: row.bound_ip,
+              port: Number(row.port),
+              containerId: Number(row.id),
+              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
+            };
+          },
+        });
+        const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
+          pool: getPool(),
+          container,
+          intervalMs,
+          stuckThresholdMs,
+          // B-R1-1:abort 掉从未执行的 pre-forward journal 后,提前释放其 preCheck reservation
+          // (best-effort;reservation 本会自然过期)。
+          releaseReservation: (ref) =>
+            releasePreCheck(preCheckRedis, { userId: ref.userId, requestId: ref.requestId }).then(() => {}),
+          // M4:error projection 落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
+          // reconcile 帧型(前端 applyOutboundMessage 收到即 forceSync 拉回 projection error 卡)。
+          // published≠delivered:用户离线/已切轮则无害吞掉,projection 已持久,下次 sync 必达。
+          nudgeClient: (uid, sessionId, clientMessageId) => {
+            try {
+              userChatBridge.broadcastToUser(uid, {
+                type: "outbound.message",
+                channel: "webchat",
+                peer: { id: sessionId, kind: "dm" },
+                clientMessageId,
+                isFinal: false,
+                meta: { reconcile: "turn_state_unknown" },
+                ts: Date.now(),
+              });
+            } catch {
+              /* best-effort */
+            }
+          },
         }));
         return { stop: () => h.stop() };
       },

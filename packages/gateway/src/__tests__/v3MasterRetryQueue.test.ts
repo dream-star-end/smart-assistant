@@ -407,6 +407,94 @@ describe("drainOnce — transient retry", () => {
   });
 });
 
+// ─── drainOnce: M-R1-1 ① deferred terminal migration gates unlink ─────────
+
+describe("drainOnce — onDispatchAck gates unlink (M-R1-1 ①)", () => {
+  test("onDispatchAck false retains file (+backoff); next drain past backoff converges", async () => {
+    let clock = Date.now();
+    let sendCalls = 0;
+    let ackAttempts = 0;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      now: () => clock,
+      attemptSend: async () => { sendCalls++; /* master ACK ok (idempotent) */ },
+      // Fail terminal CAS on the first drain, succeed on the second.
+      onDispatchAck: async () => {
+        ackAttempts++;
+        return ackAttempts >= 2;
+      },
+    });
+    await writeEntryDirect({
+      schemaVersion: 1,
+      payload: basePayload({ dispatchId: "d-drain-1", attemptNo: 1 }),
+      firstSeenAt: clock,
+      attempts: 0,
+    });
+
+    // Round 1: master ACK ok but terminal CAS unconfirmed → file kept, attempts bumped.
+    const s1 = await q.drainOnce();
+    assert.equal(sendCalls, 1);
+    assert.equal(ackAttempts, 1);
+    assert.equal(s1.drained, 0, "terminal 未确认 → 不计 drained");
+    assert.equal(s1.pending, 1);
+    let files = await listJsonFiles();
+    assert.equal(files.length, 1, "onDispatchAck false → 文件保留(下轮 drain 重试)");
+    const reread = JSON.parse(await readFile(join(dir, files[0]), "utf8")) as V3MasterRetryEntry;
+    assert.equal(reread.attempts, 1, "attempts bumped so backoff applies (no hot re-upload spin)");
+    assert.equal(reread.lastErrorClass, "transient");
+    assert.ok(typeof reread.lastErrorAt === "number");
+
+    // Same clock: backoff window not elapsed → skipped, no re-send.
+    const s1b = await q.drainOnce();
+    assert.equal(sendCalls, 1, "退避窗内不重发 master");
+    assert.equal(s1b.pending, 1);
+
+    // Round 2 (advance clock past backoff): terminal CAS confirmed → file deleted.
+    clock += 6 * 60_000;
+    const s2 = await q.drainOnce();
+    assert.equal(sendCalls, 2, "退避到期幂等重发 master(finalize 幂等)");
+    assert.equal(ackAttempts, 2);
+    assert.equal(s2.drained, 1);
+    files = await listJsonFiles();
+    assert.equal(files.length, 0, "二轮 terminal 确认 → 文件删除(收敛)");
+  });
+
+  test("onDispatchAck throws → treated as unconfirmed → file retained", async () => {
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => { /* master ACK ok */ },
+      onDispatchAck: async () => { throw new Error("inbox terminal CAS write failed"); },
+    });
+    await writeEntryDirect({
+      schemaVersion: 1,
+      payload: basePayload({ dispatchId: "d-drain-2", attemptNo: 1 }),
+      firstSeenAt: Date.now(),
+      attempts: 0,
+    });
+    const stats = await q.drainOnce();
+    assert.equal(stats.drained, 0, "hook 抛 → 未确认终态,不删文件");
+    assert.equal(stats.pending, 1);
+    const files = await listJsonFiles();
+    assert.equal(files.length, 1, "onDispatchAck 抛 → 文件保留");
+  });
+
+  test("non-dispatch entry (no dispatchId) drains normally regardless of onDispatchAck", async () => {
+    let ackCalls = 0;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      attemptSend: async () => { /* ok */ },
+      onDispatchAck: async () => { ackCalls++; return false; },
+    });
+    // Legacy/ordinary entry with no dispatch identity → onDispatchAck must not fire.
+    await writeEntryDirect(entry(basePayload({ dispatchId: undefined, attemptNo: undefined })));
+    const stats = await q.drainOnce();
+    assert.equal(stats.drained, 1, "无 dispatch 身份 → 正常排空");
+    assert.equal(ackCalls, 0, "非 dispatch turn 不触发 onDispatchAck");
+    const files = await listJsonFiles();
+    assert.equal(files.length, 0);
+  });
+});
+
 // ─── drainOnce: fatal terminal ───────────────────────────────────────────
 
 describe("drainOnce — fatal terminal", () => {

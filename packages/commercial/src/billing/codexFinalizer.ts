@@ -146,6 +146,12 @@ export interface CodexFinalizeContext {
   parentTurnKey?: string | null;
   parentSessionId?: string | null;
   delegateAgentId?: string | null;
+  /**
+   * 0170 durable-turn dispatch 身份(RFC §2/§3)。durable codex 路径从 journal ctx
+   * 读出后透传;legacy codex turn 无 dispatch → null,usage_records 两列写 NULL(不 hard-fail)。
+   */
+  dispatchId?: string | null;
+  attemptNo?: number | null;
   // v5(M1b):不再携带 accountId —— codex 记账 usage_records.account_id 恒写
   // SQL NULL(0044 SET NULL FK 语义,与 deepseek/minimax 静态 provider 同型),
   // 不再用 v3 的 `accountId=0n` 假账号占位。
@@ -315,6 +321,8 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
             turnKey: attribution?.turnKey ?? ctx.turnKey ?? null,
             parentTurnKey: attribution?.parentTurnKey ?? ctx.parentTurnKey ?? null,
             authority: ctx.authority ?? null,
+            dispatchId: ctx.dispatchId ?? null,
+            attemptNo: ctx.attemptNo ?? null,
           });
         } catch (err) {
           if (!(err instanceof SettlementCommitOutcomeUnknownError)) {

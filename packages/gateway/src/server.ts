@@ -53,6 +53,7 @@ import {
   isCodexEngineModel,
   isClientMessageId,
   shouldServeInline,
+  stripDispatchAuthorityField,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
 import {
@@ -112,6 +113,8 @@ import {
   getClientSession,
   getClientSessionPartial,
   readArchivedMessages,
+  listTapeChatProjectionRecords,
+  readTapeRecordChunk,
   upsertClientSession,
   appendServerAuthoredMessage,
   deleteClientSession,
@@ -120,6 +123,7 @@ import {
   listUnclaimedSessions,
   claimSession,
   probeSessionsDb,
+  turnDispatchInboxStats,
 } from '@openclaude/storage'
 import {
   filterUserVisibleAgentsForManagement,
@@ -226,6 +230,7 @@ import {
 } from './sessionRepoWorkspace.js'
 import {
   SessionManager,
+  lookupRecentTerminal,
   parseVerificationVerdict,
   persistInterruptedPromptQueueTurn,
   type PromptQueueExternalTurnReservation,
@@ -279,6 +284,29 @@ import {
   type ConnectionAuthorityContext,
   type TurnExecutionDescriptor,
 } from './modelAuthority.js'
+import {
+  DISPATCH_AUTHORITY_FIELD,
+  DispatchAuthorityConsumer,
+  DispatchRejected,
+  type DispatchTurnContext,
+  admitTurnDispatch,
+  attachDispatchContext,
+  buildSyntheticCrashedTapePayload,
+  buildTurnDispatchReceiptFrame,
+  buildTurnDispatchStateResponse,
+  durableTurnDispatchCapabilities,
+  getDispatchContext,
+  getTurnDispatchState,
+  getTurnDispatchStateByDispatch,
+  inboxReject,
+  inboxSinkStageFailedByDispatch,
+  inboxSinkStagedByDispatch,
+  normalizeDispatchUserId,
+  queryMasterTapeState,
+  recoverTurnDispatchInboxOnBoot,
+  rejectTurnDispatchIfAbsent,
+  resolveInboxTerminalAck,
+} from './turnDispatchInbox.js'
 import {
   LocalExecutionRejected,
   ModelCatalogUnavailableError,
@@ -1395,6 +1423,13 @@ export class Gateway {
   private log = createLogger({ module: 'gateway' })
   private _containerPreview: ContainerPreviewHandler
   private rateLimiter = new RateLimiter()
+  // M-§9-1 — per-user 内存令牌桶限频,给超大内容查看端点的**行分页**分支(GET tape/:tapeId/records)。
+  // 10 req/10s:翻页正常够用,又挡住脚本刷爆投影读(rows 大 JSONB detoast 成本高)。
+  private tapeRecordsRateLimiter = new RateLimiter({ maxRequests: 10, windowMs: 10_000 })
+  // M6②(R3)— 分块读分支(?recordOrdinal=…)**独立**令牌桶,30 req/10s。单条 4MB 记录按 256KB 分块
+  // 需 ~16 次连拉,共用 10/10s 桶会撞第 11 块 429、前端把半截冒充完整(已同批修前端 partial 提示)。
+  // 分块读只回单记录字节窗口(≤256KB),detoast 是单 record payload,成本远低于行分页,故给更宽配额。
+  private tapeRecordChunkRateLimiter = new RateLimiter({ maxRequests: 30, windowMs: 10_000 })
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
@@ -1405,6 +1440,17 @@ export class Gateway {
    *  timer. null when v3 sink isn't configured (personal version). */
   private _stopV3RetryDrainer: (() => void) | null = null
   private _kickV3RetryDrainer: (() => void) | null = null
+  /** RFC-v5-durable-turn-dispatch §3 — durable inbox 的 retry queue 句柄(boot
+   *  recovery ① 查同 dispatch entry + synthetic crashed tape 走同一 queue)。 */
+  private _turnDispatchQueue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue | null = null
+  /** RFC-v5-durable-turn-dispatch §B5 — durable turn dispatch 链路整体就绪。
+   *  仅当 sink hooks 装配 ∧ 端点注册 ∧ boot recovery 首跑成功 后置真;capability 广播
+   *  (attest/healthz)据此 fail-closed(见 durableTurnDispatchCapabilities)。 */
+  private _durableTurnDispatchReady = false
+  /** RFC-v5-durable-turn-dispatch §B4 — 周期 recovery 重试定时器(single-flight)。 */
+  private _turnDispatchRecoveryTimer: NodeJS.Timeout | null = null
+  /** single-flight 门闩:boot 首跑 / 周期扫一次只跑一轮,防重入。 */
+  private _turnDispatchRecoveryInFlight = false
   /** Commercial tool telemetry stays subscribed through session drain, then
    *  fsyncs its final aggregate batch before the process may exit. */
   private _toolFailureReporter: ToolFailureReporter | null = null
@@ -1664,6 +1710,9 @@ export class Gateway {
   private _modelAuthority = ModelAuthorityConsumer.fromEnv(process.env, (event, fields) =>
     this.log.error(event, fields),
   )
+  /** RFC-v5-durable-turn-dispatch §3 — dispatch 票据验签消费器(复用 model authority
+   *  同一 keyring / 同连接 challenge;kind 域隔离)。 */
+  private _dispatchAuthority = DispatchAuthorityConsumer.fromEnv(process.env)
   /** 每条 bridge 连接的 challenge(WeakMap:ws GC 即释放)。 */
   private _authorityConns = new WeakMap<WebSocket, ConnectionAuthorityContext>()
 
@@ -1841,8 +1890,87 @@ export class Gateway {
             }
             return sinkAttemptOnce(p)
           },
+          // RFC-v5-durable-turn-dispatch §3/§B6 + M-R1-1 ①(R3)— 延迟送达 ACK 驱动 inbox terminal。
+          // 返回终态是否确认:resolveInboxTerminalAck 内 CAS 成功 / 已幂等终态(同 outcome)→ true,drainer
+          // 删文件;CAS 落空且行非目标终态(缺失 / 仍非终态 / 异 outcome)→ false,**保留文件**退避重试,
+          // 绝不"文件已删、行永停 sink_staged"。写失败(抛)→ false(同样保留)。
+          onDispatchAck: async (dispatchId, attemptNo, status): Promise<boolean> => {
+            try {
+              const ok = await resolveInboxTerminalAck(dispatchId, attemptNo, status)
+              if (!ok) {
+                this.log.warn(
+                  'inbox terminal (deferred ack) CAS did not apply and row not target-terminal; retaining entry',
+                  { dispatchId, attemptNo, status },
+                )
+              }
+              return ok
+            } catch (err) {
+              this.log.error(
+                'inbox terminal (deferred ack) write failed; retaining entry for retry',
+                { dispatchId },
+                err as Error,
+              )
+              return false
+            }
+          },
         })
-        const sink = makeV3MasterSink({ config: sinkCfg, retryQueue: queue })
+        const sink = makeV3MasterSink({
+          config: sinkCfg,
+          retryQueue: queue,
+          // RFC-v5-durable-turn-dispatch §3/§B6 — sink 生命周期钩子驱动 inbox 状态机。
+          // **await durable 迁移(去 best-effort)**:钩子返回 = 状态迁移已尝试落库并确认;
+          // 迁移失败一律 error log + 依赖周期 recovery 兜底,绝不静默停在旧态。
+          inboxHooks: {
+            onStaged: async (dispatchId, attemptNo) => {
+              try {
+                await inboxSinkStagedByDispatch(dispatchId, attemptNo)
+              } catch (err) {
+                // running→sink_staged 写失败:tape 已 fsync 进 retry queue,boot ①路径
+                // (retryQueueHasDispatch→sink_staged)会收敛。仅 error log。
+                this.log.error('inbox sink_staged write failed', { dispatchId }, err as Error)
+              }
+            },
+            // M-R1-1 ①(R3)— 同步 ACK 后**先**确认 terminal CAS 再删 entry。返回终态是否确认:
+            // resolveInboxTerminalAck 成功 / 已幂等终态 → true(persistOrQueue 随后 ackDurable 删 entry);
+            // CAS 落空且行非目标终态 / 写失败 → false(保留 entry + kick drainer 重试,幂等)。
+            onAck: async (dispatchId, attemptNo, status): Promise<boolean> => {
+              try {
+                const ok = await resolveInboxTerminalAck(dispatchId, attemptNo, status)
+                if (!ok) {
+                  this.log.warn(
+                    'inbox terminal (sync ack) CAS did not apply and row not target-terminal; retaining entry',
+                    { dispatchId, attemptNo, status },
+                  )
+                }
+                return ok
+              } catch (err) {
+                this.log.error(
+                  'inbox terminal (sync ack) write failed; retaining entry for retry',
+                  { dispatchId },
+                  err as Error,
+                )
+                return false
+              }
+            },
+            onStageFailed: async (dispatchId, attemptNo) => {
+              this.log.error('turn dispatch tape stage failed', { dispatchId, attemptNo })
+              // B6:stageDurable 失败 → 行仍 running(从未 stage)。sink_stage_failed 写入
+              // **必须同步确认**;写入也失败 → error log,行留 running 由周期 recovery
+              // (running→recovery 协议)兜底重试,不许静默停在 running。
+              try {
+                const row = await inboxSinkStageFailedByDispatch(dispatchId, attemptNo)
+                if (!row) {
+                  this.log.error(
+                    'inbox sink_stage_failed CAS did not apply; leaving to periodic recovery',
+                    { dispatchId, attemptNo },
+                  )
+                }
+              } catch (err) {
+                this.log.error('inbox sink_stage_failed write failed', { dispatchId }, err as Error)
+              }
+            },
+          },
+        })
         sinkAttemptOnce = (p) => sink.attemptOnce(p)
         setV3MasterSinkSingleton(sink)
         // Boot drain — best-effort, never blocks listen().
@@ -1850,7 +1978,23 @@ export class Gateway {
         queue.startPeriodic()
         this._stopV3RetryDrainer = () => queue.stopPeriodic()
         this._kickV3RetryDrainer = () => queue.kick()
-        this.log.info('v3 master sink wired', { baseUrl: sinkCfg.baseUrl })
+        // RFC-v5-durable-turn-dispatch §3/§B4/§B5 — durable inbox boot recovery。**在开放新
+        // ingress 前单飞跑完**:queued→rejected;running→三态收敛。阻塞于 sink 就绪之后
+        // (需 retry queue 查同 dispatch + 合成 tape 走同一 queue)。
+        this._turnDispatchQueue = queue
+        // _runTurnDispatchRecoverySweep 成功一轮 → 自置 _durableTurnDispatchReady(B5);
+        // 首跑失败仅 log(不置 ready → capability 不申报 → legacy),周期 recovery 会自愈。
+        try {
+          await this._runTurnDispatchRecoverySweep(queue)
+        } catch (err) {
+          this.log.error('turn dispatch boot recovery failed', undefined, err as Error)
+        }
+        // B4:启动首跑之后挂周期 single-flight 重试(收敛 recovery_pending / 不可达行)。
+        this._startTurnDispatchRecoveryLoop(queue)
+        this.log.info('v3 master sink wired', {
+          baseUrl: sinkCfg.baseUrl,
+          durableTurnDispatchReady: this._durableTurnDispatchReady,
+        })
       }
     } catch (err) {
       // Non-fatal — fall back to legacy local durable path. Ops will see
@@ -2207,6 +2351,7 @@ export class Gateway {
 
     // Start rate limiter cleanup
     this.rateLimiter.startCleanup()
+    this.tapeRecordsRateLimiter.startCleanup()
 
     // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
     eventBus.on('task.created', (ev) => {
@@ -2552,6 +2697,11 @@ export class Gateway {
       this.log.warn('v3 retry drainer stop error', undefined, err)
     }
     this._stopV3RetryDrainer = null
+    // RFC-v5-durable-turn-dispatch §B4 — 停周期 recovery 定时器(纯附加,清干净不留句柄)。
+    if (this._turnDispatchRecoveryTimer) {
+      clearInterval(this._turnDispatchRecoveryTimer)
+      this._turnDispatchRecoveryTimer = null
+    }
 
     // ── Stage 3: drain channel adapters (Telegram etc.) ──
     for (const ch of this.channels.values()) {
@@ -3041,6 +3191,45 @@ export class Gateway {
       return
     }
 
+    // ── RFC-v5-durable-turn-dispatch §3 端点(鉴权同 wechat-inbound:checkInboundBypass,
+    //    HMAC-derived nonce,fail-closed;master reconciler / turnDispatchReconciler 调用)──
+    //
+    // POST /internal/v3/turn-reject-if-absent —— reconciler rejecting 分支:有 inbox 行
+    // 返状态(negative proof 不成立);无行插 rejected(not_accepted)墓碑。durable
+    // rejected tombstone 是 I2 里 negative proof 的**唯一**合法来源。
+    if (url.pathname === '/internal/v3/turn-reject-if-absent' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleTurnRejectIfAbsent(req, res).catch((err) => {
+        this.log.error('turn-reject-if-absent handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    // GET /internal/v3/turn-dispatch-state —— reconciler accepted 分支查行(按逻辑键)。
+    if (url.pathname === '/internal/v3/turn-dispatch-state' && req.method === 'GET') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleTurnDispatchState(url, res).catch((err) => {
+        this.log.error('turn-dispatch-state handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
     // Frontend diagnostic trace sink — receives ring-buffer events from
     // packages/web/public/modules/trace.js for diagnosing the "已读但无回复"
     // class of bug (assistant frame delivered by gateway but never landed in
@@ -3110,7 +3299,18 @@ export class Gateway {
           }
         : { ok: true }
       body.containerId = OC_CONTAINER_ID || null
-      body.capabilities = bridgeReady ? ['file-proxy-v1'] : []
+      // RFC-v5-durable-turn-dispatch §3/§B5 — durable-turn-dispatch-v1 runtime capability
+      // 在 healthz 与 attest 两处一致广播,且**绑定完整 readiness**(验签能力 ∧ sink 装配 ∧
+      // boot recovery 首跑成功);任一不满足 → 不申报(legacy)。单一权威 durableTurnDispatchCapabilities。
+      const healthzCaps: string[] = []
+      if (bridgeReady) healthzCaps.push('file-proxy-v1')
+      healthzCaps.push(
+        ...durableTurnDispatchCapabilities(
+          this._dispatchAuthority.enabled,
+          this._durableTurnDispatchReady,
+        ),
+      )
+      body.capabilities = healthzCaps
       // v5 灰度可观测 — channel 标签 + commercial 运行时状态(控制面静默 / 运行时隔离 /
       // 灰度归属的只读断言面)。无标签默认 "v3";commercial 未注入 runtimeStatus 时省略。
       body.channel = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3'
@@ -3158,8 +3358,19 @@ export class Gateway {
           })
         return
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify(body))
+      // 容器形态(c 空):附 durable inbox open-job / 字节 gauge(RFC §3 healthz),
+      // 异步取一次后 end。stats 失败不阻塞健康返回(inbox 是可观测面,非可服务面)。
+      void turnDispatchInboxStats()
+        .then((stats) => {
+          body.turnDispatchInbox = { openJobs: stats.openJobs, bytes: stats.bytes }
+        })
+        .catch(() => {
+          body.turnDispatchInbox = { openJobs: null, bytes: null }
+        })
+        .finally(() => {
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(body))
+        })
       return
     }
     if (path === '/metrics') {
@@ -3335,6 +3546,59 @@ export class Gateway {
         else if (r.reason === 'session_deleted') this.sendJson(res, 410, { error: 'session_deleted' })
         else this.sendJson(res, 409, { error: r.reason ?? 'conflict' })
       })().catch(() => this.sendJson(res, 500, { error: 'append failed' }))
+      return
+    }
+    // 超大内容查看端点(RFC §9):GET /api/sessions/:id/tape/:tapeId/records?cursor=<int>&limit=<int>
+    // 从 chat 物化投影(complete/truncated)按行游标分页;分租((session_id,user_id,tape_id) 复合,
+    // 越权/不存在/无收敛投影统一 404);chat-safe 投影形态,绝不吐 exact 原始 payload。
+    const tapeRecordsMatch = url.pathname.match(
+      /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/tape\/([A-Za-z0-9_-]{8,128})\/records$/,
+    )
+    if (tapeRecordsMatch) {
+      const sessId = tapeRecordsMatch[1]
+      const tapeId = tapeRecordsMatch[2]
+      const userId = this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const cursorRaw = Number(url.searchParams.get('cursor'))
+      const limitRaw = Number(url.searchParams.get('limit'))
+      const cursor = Number.isFinite(cursorRaw) && cursorRaw > 0 ? Math.floor(cursorRaw) : 0
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 200
+      // M-§9-1 — 全量分块读定位参数:recordOrdinal 选中该卷内某条超大记录、offset 为其内容内
+      // 字节偏移。透传给 backend(语义由 commercial pgBackend 落地;个人版 sqlite 桩恒 null)。
+      // 缺省/非法 → undefined(不改变既有行游标分页语义)。
+      const recordOrdinalRaw = Number(url.searchParams.get('recordOrdinal'))
+      const offsetRaw = Number(url.searchParams.get('offset'))
+      const recordOrdinal =
+        Number.isFinite(recordOrdinalRaw) && recordOrdinalRaw >= 0 ? Math.floor(recordOrdinalRaw) : undefined
+      const offset =
+        Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : undefined
+      // M6②(R3)— 分支特化限频:分块读(?recordOrdinal=…)走独立 30/10s 桶(4MB 需 ~16 块连拉);
+      // 行分页走 10/10s 桶。两桶隔离,分块连拉绝不撞行分页配额、也不再撞第 11 块 429。
+      const chunkBranch = recordOrdinal !== undefined
+      const limiter = chunkBranch ? this.tapeRecordChunkRateLimiter : this.tapeRecordsRateLimiter
+      const limiterChannel = chunkBranch ? 'tape-record-chunk' : 'tape-records'
+      if (!limiter.check(userId, limiterChannel)) {
+        this.sendJson(res, 429, { error: 'rate limited' })
+        return
+      }
+      if (recordOrdinal !== undefined) {
+        // 分块读分支:响应形状 {chunk,nextOffset,totalBytes} 与行分页 {records,...} 不同,
+        // 显式分流(readTapeRecordChunk 单请求 ≤256KB,绝不整卷;null=越权/不存在/未收敛→404)。
+        readTapeRecordChunk(sessId, userId, tapeId, recordOrdinal, offset ?? 0)
+          .then((r) => r
+            ? this.sendJson(res, 200, r)
+            : this.sendJson(res, 404, { error: 'not found' }))
+          .catch(() => this.sendJson(res, 500, { error: 'tape record chunk read failed' }))
+        return
+      }
+      listTapeChatProjectionRecords(sessId, userId, tapeId, cursor, limit)
+        .then((r) => r
+          ? this.sendJson(res, 200, r)
+          : this.sendJson(res, 404, { error: 'not found' }))
+        .catch(() => this.sendJson(res, 500, { error: 'tape records read failed' }))
       return
     }
     // 归档分页端点(长会话热尾巴+归档 §2.1):GET /api/sessions/:id/archive?before=<seq>&limit=<n>
@@ -4185,6 +4449,117 @@ export class Gateway {
    * 整段消息走错容器属于上游路由 bug,跟 dispatchInbound 收到一条 WS frame 信任
    * _userId 是同一信任模型(checkInboundBypass 已确认 caller = master broker)。
    */
+  /**
+   * RFC-v5-durable-turn-dispatch §3 — POST /internal/v3/turn-reject-if-absent。
+   *
+   * body { userId, sessionId, clientMessageId, dispatchId, attemptNo }。事务:有行返
+   * 现有状态(negative proof 不成立);无行插 rejected(not_accepted)墓碑。返回
+   * { inserted, state, outcome } —— reconciler 据此决定 fail-visible vs 转 accepted。
+   */
+  private async handleTurnRejectIfAbsent(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let raw: string
+    try {
+      raw = await this.readBody(req, 16 * 1024)
+    } catch {
+      this.sendJson(res, 400, { error: 'read failed' })
+      return
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid json' })
+      return
+    }
+    const body = (parsed ?? {}) as Record<string, unknown>
+    const userId = body.userId
+    const sessionId = body.sessionId
+    const clientMessageId = body.clientMessageId
+    const dispatchId = body.dispatchId
+    const attemptNo = body.attemptNo
+    if (
+      typeof userId !== 'string' || userId === '' ||
+      typeof sessionId !== 'string' || sessionId === '' ||
+      typeof clientMessageId !== 'string' || clientMessageId === '' ||
+      typeof dispatchId !== 'string' || dispatchId === '' ||
+      typeof attemptNo !== 'number' || !Number.isInteger(attemptNo) || attemptNo < 1
+    ) {
+      this.sendJson(res, 400, { error: 'userId/sessionId/clientMessageId/dispatchId/attemptNo required' })
+      return
+    }
+    // B1:inbox 逻辑键 user_id 统一裸 uid(与 descriptor.uid / OC_USER_ID 同源)。master 若
+    // 漏传 c:<uid> 前缀 → 归一,避免同用户在 inbox 裂成两把键(去重/negative proof 失效)。
+    const result = await rejectTurnDispatchIfAbsent({
+      userId: normalizeDispatchUserId(userId),
+      sessionId,
+      clientMessageId,
+      dispatchId,
+      attemptNo,
+    })
+    // MINOR ①:dispatch_id 撞了别的逻辑键(master 契约破坏)→ 409,明确 conflict,绝不谎报
+    // inserted:true / 让 reconciler 误当作"已落 negative proof"。正常路径仍 200。
+    if (result.conflict) {
+      this.log.error('turn reject-if-absent: dispatchId collides with another logical key', {
+        dispatchId,
+        attemptNo,
+      })
+      this.sendJson(res, 409, {
+        error: 'dispatch identity conflict',
+        conflict: true,
+        inserted: false,
+        state: null,
+        outcome: null,
+      })
+      return
+    }
+    this.sendJson(res, 200, {
+      inserted: result.inserted,
+      state: result.state,
+      outcome: result.outcome,
+    })
+  }
+
+  /**
+   * RFC-v5-durable-turn-dispatch §3 — GET /internal/v3/turn-dispatch-state。
+   *
+   * 按 dispatchId+attemptNo 或逻辑键(userId+sessionId+clientMessageId)查行。
+   * 200 { found, state, outcome, dispatchId, attemptNo } —— reconciler accepted+stuck
+   * 分支据此判 sink_staged/terminal(等)/ running(等)/ 行消失(manual)。
+   */
+  private async handleTurnDispatchState(url: URL, res: ServerResponse): Promise<void> {
+    const q = url.searchParams
+    const dispatchId = q.get('dispatchId')
+    const attemptNoRaw = q.get('attemptNo')
+    let row = null as Awaited<ReturnType<typeof getTurnDispatchState>>
+    if (dispatchId && attemptNoRaw) {
+      const attemptNo = Number(attemptNoRaw)
+      if (!Number.isInteger(attemptNo) || attemptNo < 1) {
+        this.sendJson(res, 400, { error: 'attemptNo must be a positive integer' })
+        return
+      }
+      row = await getTurnDispatchStateByDispatch(dispatchId, attemptNo)
+    } else {
+      const userId = q.get('userId')
+      const sessionId = q.get('sessionId')
+      const clientMessageId = q.get('clientMessageId')
+      if (!userId || !sessionId || !clientMessageId) {
+        this.sendJson(res, 400, {
+          error: 'dispatchId+attemptNo or userId+sessionId+clientMessageId required',
+        })
+        return
+      }
+      // B1:同 reject-if-absent —— user_id 归一裸 uid,查询键与准入键同源。
+      row = await getTurnDispatchState({
+        userId: normalizeDispatchUserId(userId),
+        sessionId,
+        clientMessageId,
+      })
+    }
+    // B4(R3):行缺失 → state:'absent'(非 null),master client 据此对 accepted 行走 manual_reconcile。
+    // 响应形状收敛到 buildTurnDispatchStateResponse 单一权威(可断言,两侧契约同源)。
+    this.sendJson(res, 200, buildTurnDispatchStateResponse(row))
+  }
+
   private async handleWechatInbound(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const MAX_INBOUND_BODY = 256 * 1024
     let raw: string
@@ -9569,6 +9944,163 @@ export class Gateway {
     } catch { /* ws may already be closed */ }
   }
 
+  /**
+   * RFC-v5-durable-turn-dispatch §3 — durable inbox boot recovery 编排。
+   *
+   * 注入三个 dep 到协议实现(recoverTurnDispatchInboxOnBoot):本地 retry queue 查同
+   * dispatch、master 三态查询、synthetic crashed tape staging(走同一 retry queue,
+   * 确定性 payload 来自 inbox 持久化字段)。
+   */
+  private async _recoverTurnDispatchInbox(
+    queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
+  ): Promise<void> {
+    await recoverTurnDispatchInboxOnBoot({
+      retryQueueHasDispatch: (dispatchId, attemptNo) =>
+        queue.hasEntryForDispatch(dispatchId, attemptNo),
+      queryMasterTapeState: (dispatchId, attemptNo) => queryMasterTapeState(dispatchId, attemptNo),
+      stageSyntheticCrashedTape: async (row) => {
+        const payload = buildSyntheticCrashedTapePayload(row)
+        // stageDurable 只需 wire payload;tape 分片在 drain 时由 attemptSend 现算。
+        // createdAt 用 inbox 持久化值 → 确定性(多次恢复同 tapeId/hash)。
+        await queue.stageDurable({
+          schemaVersion: 1,
+          payload: { ...payload },
+          firstSeenAt: row.createdAt,
+          attempts: 0,
+        })
+        // stage 成功后立即 kick,让 crashed tape 尽快送达 master。
+        queue.kick()
+      },
+      onManualReconcile: (row, reason) => {
+        this.log.error('turn dispatch boot recovery: manual reconcile required', {
+          dispatchId: row.dispatchId,
+          reason,
+        })
+      },
+    })
+  }
+
+  /**
+   * RFC-v5-durable-turn-dispatch §B4/§B5 — recovery 单飞一轮(boot 首跑 + 周期共用)。
+   *
+   * single-flight 门闩 `_turnDispatchRecoveryInFlight` 防重入(boot 与周期、周期各轮之间)。
+   * 成功跑完一轮 → 置 `_durableTurnDispatchReady`(B5:即便 boot 首跑曾失败,某轮周期成功即自愈)。
+   * 检查+置位同步发生(await 前),JS 单线程下并发调用第二个必早退,无竞态。
+   */
+  private async _runTurnDispatchRecoverySweep(
+    queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
+  ): Promise<void> {
+    if (this._turnDispatchRecoveryInFlight) return
+    this._turnDispatchRecoveryInFlight = true
+    try {
+      await this._recoverTurnDispatchInbox(queue)
+      this._durableTurnDispatchReady = true
+    } finally {
+      this._turnDispatchRecoveryInFlight = false
+    }
+  }
+
+  /**
+   * RFC-v5-durable-turn-dispatch §B4 — 周期 single-flight recovery 重试。
+   *
+   * boot 首跑只处理"启动瞬间"的 open 行;不可达(recovery_pending)/瞬时写失败留下的
+   * 未终局行需要周期重试才能最终收敛(I1 永不静默)。每 60s 一轮:先看是否存在 open 行
+   * (无 → 跳过,不空扫),再走单飞 sweep。timer unref 不挡进程退出;shutdown 里清。
+   */
+  private _startTurnDispatchRecoveryLoop(
+    queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
+  ): void {
+    if (this._turnDispatchRecoveryTimer) return
+    const RETRY_MS = 60_000
+    this._turnDispatchRecoveryTimer = setInterval(() => {
+      void (async () => {
+        try {
+          if (this._turnDispatchRecoveryInFlight) return
+          const stats = await turnDispatchInboxStats()
+          if (stats.openJobs === 0) return
+          await this._runTurnDispatchRecoverySweep(queue)
+        } catch (err) {
+          this.log.error('turn dispatch periodic recovery sweep failed', undefined, err as Error)
+        }
+      })()
+    }, RETRY_MS)
+    this._turnDispatchRecoveryTimer.unref?.()
+  }
+
+  /**
+   * RFC-v5-durable-turn-dispatch §3.b — 已有 inbox 行时回执给 bridge。
+   *
+   * bridge 据此 CAS accepted(dispatch 已被容器受理执行,不再开第二条 IIFE)。控制帧,
+   * bridge 拦截消费,**绝不**透传给浏览器(同 container_attest)。
+   */
+  private _sendTurnDispatchReceipt(
+    ws: WebSocket,
+    ctx: DispatchTurnContext,
+    row: Awaited<ReturnType<typeof admitTurnDispatch>>['row'],
+  ): void {
+    try {
+      ws.send(JSON.stringify(buildTurnDispatchReceiptFrame(ctx, row, Date.now())))
+    } catch { /* ws may already be closed */ }
+  }
+
+  /**
+   * RFC-v5-durable-turn-dispatch §3 — 消费 webchat-DM inbound.message 的 dispatch 票据。
+   *
+   * 返回值 = 是否放行本帧继续处理(caller:`if (!_consumeDispatchAuthority(...)) return` 丢帧)。
+   *
+   * 无票据 no-op → legacy(return true):非 bridge 连接 / 非 webchat-DM / 不带 __oc_dispatch /
+   * dispatchAuthority 未 enabled —— 一律放行走 legacy(不建 inbox 行,现状语义)。census 100% 前
+   * 混跑期,没有 dispatch 追踪的 turn 行为等同今天。
+   *
+   * **带票据但消费失败 = fail-closed 拒帧(return false)**:一旦帧带 __oc_dispatch 且各前置门
+   * 满足,验签/断言任一失败(配置漂移 / keyring 不符 / 篡改)都**拒帧**,绝不回落 legacy 执行 ——
+   * master 已同事务建 dispatch,legacy 跑完真 tape = 与 reconciler 的 tombstone 双终态分裂。拒帧后
+   * master reconciler 走 reject-if-absent → not_accepted → 用户可见失败(I1/I2 双保)。仅告警,不回内文。
+   *
+   * 验签+全断言通过 → descriptor 挂 WeakMap(dispatchInbound 据此走 durable 准入),return true。
+   */
+  private _consumeDispatchAuthority(
+    ws: WebSocket,
+    frame: Record<string, unknown>,
+    isFromBridge: boolean,
+  ): boolean {
+    if (!isFromBridge || !this._dispatchAuthority.enabled) return true
+    const peer = frame.peer as { kind?: unknown } | undefined
+    if (frame.channel !== 'webchat' || peer?.kind !== 'dm') return true
+    const raw = frame[DISPATCH_AUTHORITY_FIELD]
+    if (raw === undefined || raw === null) return true
+    const conn = this._authorityConns.get(ws)
+    if (!conn) return true
+    try {
+      // 帧体 hash 断言需真实 content(text + media);computeDispatchRequestHash 只取
+      // 内容身份字段(kind + url/base64 摘要),UI-only 字段自动被忽略。
+      const content = (frame.content ?? {}) as {
+        text?: string
+        media?: readonly { kind?: string; url?: string; base64?: string }[]
+      }
+      // B9:同 turn 的 model-authority descriptor(_consumeFrameAuthority 已在本入口之前消费)
+      // 带 billingRequestId 时交叉核对 —— 两票据 master 同事务铸造,billing 身份必一致。
+      const modelAuthorityBillingRequestId = getTurnAuthority(frame as object)?.billingRequestId
+      const ctx: DispatchTurnContext = this._dispatchAuthority.consume(frame, conn.challenge, content, {
+        ...(modelAuthorityBillingRequestId !== undefined ? { modelAuthorityBillingRequestId } : {}),
+      })
+      attachDispatchContext(frame, ctx)
+      return true
+    } catch (err) {
+      // 带票据的帧消费失败 = 配置漂移(keyring)或篡改。绝不 legacy 执行(master 已建
+      // dispatch,legacy 跑完 = 双终态分裂);拒帧后 master reconciler 走 tombstone →
+      // not_accepted → 用户可见失败,I1/I2 双保。
+      if (err instanceof DispatchRejected) {
+        this.log.error('dispatch_authority.rejected: frame refused', { code: err.code })
+      } else {
+        this.log.error('dispatch_authority.error: frame refused', {
+          err: (err as Error)?.message ?? String(err),
+        })
+      }
+      return false
+    }
+  }
+
   // ───────── WS ─────────
   private handleWsConnection(ws: WebSocket, req: IncomingMessage): void {
     if (this._shuttingDown) {
@@ -9634,15 +10166,23 @@ export class Gateway {
       this._authorityConns.set(ws, authorityConn)
       ws.once('close', () => this._modelAuthority.closeConnection(authorityConn))
       try {
-        ws.send(
-          JSON.stringify(
-            buildContainerAttestFrame(
-              this._modelAuthority,
-              authorityConn,
-              Number(process.env.OC_CONTAINER_ID) || null,
-            ),
-          ),
+        const attestFrame = buildContainerAttestFrame(
+          this._modelAuthority,
+          authorityConn,
+          Number(process.env.OC_CONTAINER_ID) || null,
         )
+        // RFC-v5-durable-turn-dispatch §3/§B5 — durable-turn-dispatch-v1 runtime capability
+        // 并入 attest 广播(与 model_authority_v1 同一 capabilities 集合;bridge 的 admission
+        // 门据此分流:无此 capability → legacy 路径不建 dispatch 行)。**绑定完整 readiness**:
+        // 验签能力 ∧ sink 装配 ∧ boot recovery 首跑成功,任一不满足 → 不申报(fail-closed)。
+        attestFrame.capabilities = [
+          ...attestFrame.capabilities,
+          ...durableTurnDispatchCapabilities(
+            this._dispatchAuthority.enabled,
+            this._durableTurnDispatchReady,
+          ),
+        ]
+        ws.send(JSON.stringify(attestFrame))
       } catch (err) {
         this.log.warn('model_authority.attest_send_failed', {
           err: (err as Error)?.message ?? String(err),
@@ -9700,6 +10240,10 @@ export class Gateway {
           inFlight?: boolean
           lastFrameSeq?: number
           resumeActiveTurnCandidateMessageIds?: unknown
+          /** RFC-v5-durable-turn-dispatch §4 — 前端 _activeClientMessageId:该 tab
+           *  自认为仍在飞的那条 user 行 id。带上 → autoResume 走精确身份对账决策表;
+           *  缺失(legacy)→ 旧 inFlight 布尔行为。 */
+          inFlightClientMessageId?: string
         }> = hello.peers || []
         // Phase 4 — 把这些 peerId 记下来,bind 帧用 5s grace window 校验
         const peerIdSet = new Set<string>()
@@ -9826,6 +10370,13 @@ export class Gateway {
           }
           return
         }
+        // dispatch 票据消费(同顺序铁律:先消费再 strip)。带票据即 master 已建 dispatch,
+        // 消费失败必须拒帧 —— legacy 降级会造成"error 行与真回复并存"的双终态分裂
+        // (master 侧 dispatch 无 receipt → reconciler tombstone → not_accepted,而 legacy
+        // 执行照跑出真回复)。fail-closed:master 权威由 reconciler 收敛成可见失败。
+        // 无票据(非 durable / 非 webchat-DM / 未 enabled)→ return true 放行 legacy;
+        // dispatch 票据与 prompt-queue grant 互斥,故此门失败无 queue grant 需取消。
+        if (!this._consumeDispatchAuthority(ws, frame as any, isFromBridge)) return
         if (isFromBridge) (this.trustedGoalFrames ??= new WeakSet()).add(frame as object)
         else delete (frame as any)._goalState
 
@@ -9902,6 +10453,46 @@ export class Gateway {
               this._autoDenyPendingPermissions(peerKey)
             }
           })
+        }
+        // ── durable inbox 准入(RFC-v5-durable-turn-dispatch §3.b)───────────
+        // 有 descriptor(webchat-DM 已验签):INSERT queued;已有行 → 回执帧给
+        // bridge,不执行;inserted → 走 dispatchInbound,finally 兜底 CAS rejected
+        // (行仍 queued = 从未进入执行 → 不留孤儿给 boot)。dispatch 票据与 prompt-queue
+        // grant 互斥(durable webchat-DM turn 不带 queueGrant),故此分支无 queue lifecycle
+        // 需清理;queue lifecycle 清理只挂在下方非 dctx 路径。
+        const dctx = getDispatchContext(frame as object)
+        if (dctx) {
+          let admitted: { inserted: boolean; row: Awaited<ReturnType<typeof admitTurnDispatch>>['row'] }
+          try {
+            admitted = await admitTurnDispatch({ ctx: dctx })
+          } catch (err) {
+            // 受理事务异常 = 拒轮(可重试),不半受理。不建 inbox 行 → 无孤儿。
+            this.log.error('turn dispatch admit failed', { dispatchId: dctx.dispatchId }, err as Error)
+            return
+          }
+          if (!admitted.inserted) {
+            // 重复到达(transport retry / 双 master):回现有行状态,绝不二次执行(I2)。
+            this._sendTurnDispatchReceipt(ws, dctx, admitted.row)
+            return
+          }
+          // B2:**首次受理(INSERT queued fsync 成功)后立即回发 receipt**(state='queued'),
+          // bridge 据此 CAS dispatch accepted 并放下 lease —— 不能等到"重复帧"才回执,否则单发
+          // 场景下 master 永远收不到 receipt,dispatch 悬在 admitted 直到 reconciler 兜底。
+          this._sendTurnDispatchReceipt(ws, dctx, admitted.row)
+          try {
+            await this.dispatchInbound(frame)
+          } finally {
+            // 行仍 queued(rate-limit / agent 不存在 / 异常早退,从未 running)→ CAS
+            // rejected(not_accepted);running+ 则 CAS 落空 no-op(fail-visible I1)。
+            await inboxReject({
+              userId: dctx.uid,
+              sessionId: dctx.sessionId,
+              clientMessageId: dctx.clientMessageId,
+            }).catch((err) =>
+              this.log.warn('turn dispatch orphan reject failed', { dispatchId: dctx.dispatchId }, err),
+            )
+          }
+          return
         }
         try {
           await this.dispatchInbound(frame)
@@ -10864,6 +11455,7 @@ export class Gateway {
       inFlight?: boolean
       lastFrameSeq?: number
       resumeActiveTurnCandidateMessageIds?: unknown
+      inFlightClientMessageId?: string
     }>,
     ws: WebSocket,
   ): Promise<void> {
@@ -11078,7 +11670,73 @@ export class Gateway {
       // 预处理(mkdir / writeFile / parseDocument 等异步阶段,getOrCreate 后、
       // submit 前)是另一类同症状窗口,留作 Plan 1 follow-up 单独评估
       // (涉及 idempotency / rate-limit 失败路径要不要 counter-- 的语义)。
-      if (
+      // RFC-v5-durable-turn-dispatch §4 — reconcile 身份对称决策表。
+      //
+      // 前端带 inFlightClientMessageId(_activeClientMessageId)时走**精确身份对账**:
+      // 不再拿"上一轮 outcome"冒充这一轮终态(R3 根因)。字段缺失(legacy 客户端)
+      // 回落旧 _shouldPushTurnInterruptedFinal 布尔判据,行为完全不变。
+      const inFlightCmid = peer.inFlightClientMessageId
+      if (session && typeof inFlightCmid === 'string' && inFlightCmid !== '') {
+        // running 匹配 → 现有 status 重播 / ring replay 已覆盖(上方),不推合成终态。
+        if (session._runningClientMessageId === inFlightCmid) {
+          // no-op:该 turn 仍在飞,前端会收到重播的流式帧。
+        } else {
+          const outcome = lookupRecentTerminal(session, inFlightCmid)
+          // 合成帧一律携带 clientMessageId(reducer 按 exact id 归属;绝不误清别的 user 行)。
+          const basePeer = { id: peerId, kind: 'dm' as const }
+          try {
+            if (outcome === 'completed') {
+              // ring 命中 completed → turn_completed reconcile(空 blocks,前端清发送态 +
+              // force-sync 拉 REST 权威内容;绝不用"被中断请重发"诱导重复付费)。
+              ws.send(JSON.stringify({
+                type: 'outbound.message',
+                sessionKey,
+                channel: 'webchat',
+                peer: basePeer,
+                agentId: aid,
+                blocks: [],
+                clientMessageId: inFlightCmid,
+                meta: { reconcile: 'turn_completed', clientMessageId: inFlightCmid } as any,
+                isFinal: true,
+                ts: Date.now(),
+              }))
+              this.log.info('auto-resume reconcile turn_completed (id-bound)', { sessionKey, clientMessageId: inFlightCmid })
+            } else if (outcome === 'interrupted' || outcome === 'crashed') {
+              // ring 命中中断类 → interrupted reconcile(带 id)。
+              ws.send(JSON.stringify({
+                type: 'outbound.message',
+                sessionKey,
+                channel: 'webchat',
+                peer: basePeer,
+                agentId: aid,
+                blocks: [],
+                clientMessageId: inFlightCmid,
+                meta: { reconcile: 'turn_interrupted', interrupted: 'service_restart', clientMessageId: inFlightCmid } as any,
+                isFinal: true,
+                ts: Date.now(),
+              }))
+              this.log.info('auto-resume reconcile turn_interrupted (id-bound)', { sessionKey, clientMessageId: inFlightCmid })
+            } else {
+              // 未知身份(ring 未命中 且 非 running)→ **非 final** turn_state_unknown。
+              // 不冒充终态:前端立即 reconcileSession(force-sync)+ 缩短 safety 定时,
+              // 由 REST 权威内容决定该 user 行的真实归宿。
+              ws.send(JSON.stringify({
+                type: 'outbound.message',
+                sessionKey,
+                channel: 'webchat',
+                peer: basePeer,
+                agentId: aid,
+                blocks: [],
+                clientMessageId: inFlightCmid,
+                meta: { reconcile: 'turn_state_unknown', clientMessageId: inFlightCmid } as any,
+                isFinal: false,
+                ts: Date.now(),
+              }))
+              this.log.info('auto-resume reconcile turn_state_unknown (id-bound)', { sessionKey, clientMessageId: inFlightCmid })
+            }
+          } catch {}
+        }
+      } else if (
         session &&
         _shouldPushTurnInterruptedFinal(
           peerInFlight,
@@ -11159,6 +11817,10 @@ export class Gateway {
     // descriptor 走 WeakMap 而不是 frame 上的私有属性,正是为了让「strip 干净」与
     // 「descriptor 可用」两件事互不冲突(见 modelAuthority.ts 的 authorityByFrame)。
     stripModelAuthorityField(frame as unknown as Record<string, unknown>)
+    // 成对无条件 strip `__oc_dispatch`(RFC-v5-durable-turn-dispatch §3 铁律):bridge
+    // WS 路径已在 _consumeDispatchAuthority 读完并挂进 WeakMap,wire 字段使命已尽;其余
+    // 入口该字段只可能来自客户端伪造 → 删掉,永不被信任 / 流进 runner / 日志 / 持久化。
+    stripDispatchAuthorityField(frame as unknown as Record<string, unknown>)
     if (!this.trustedGoalFrames?.has(frame as object)) delete (frame as any)._goalState
 
     // Ingress guard: drop new messages once shutdown begins so we don't spin
@@ -12778,9 +13440,25 @@ export class Gateway {
         }
       }
     }
+    // RFC-v5-durable-turn-dispatch §3 — durable inbox 准入身份透传:runOneTurnWithRetry
+    // 据此在**模型调用前**把 inbox queued→running(同事务落 finalize 元数据),turn-end
+    // tape 带 dispatchId/attemptNo。无 descriptor(本地/legacy)→ undefined,现状语义。
+    const turnDispatchContext = getDispatchContext(frame as object)
     const leaderSubmitOpts = {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
+      ...(turnDispatchContext
+        ? {
+            dispatchContext: {
+              userId: turnDispatchContext.uid,
+              sessionId: turnDispatchContext.sessionId,
+              clientMessageId: turnDispatchContext.clientMessageId,
+              dispatchId: turnDispatchContext.dispatchId,
+              attemptNo: turnDispatchContext.attemptNo,
+            },
+          }
+        : {}),
       ...(Object.prototype.hasOwnProperty.call(frame, '_goalState')
         ? { platformGoal: frame._goalState ?? null }
         : {}),
@@ -12906,6 +13584,7 @@ export class Gateway {
       this.sessions.endClientTurn(
         session,
         turnErrored || clientTurnThrew ? 'errored' : 'completed',
+        safeClientMessageId,
       )
       if (promptQueueLifecycle) {
         try {

@@ -40,6 +40,7 @@ import {
   makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
+import { getDispatchByBillingRequestId } from "../../dispatch/turnDispatchStore.js";
 import { checkRateLimit } from "../../middleware/rateLimit.js";
 import {
   UnroutableProviderError,
@@ -924,6 +925,60 @@ export function makeAnthropicProxyHandler(
       const attribution = extractUsageAttribution(body.metadata);
       const sessionId = attribution.sessionId;
 
+      // 0170 durable-turn dispatch 身份(RFC-v5-durable-turn-dispatch §3 CCB 段 / §7 项 10)。
+      // gate 生效且 authority envelope 携带 **server 签名的** billingRequestId 时(= 本请求在
+      // dispatch 下),反查 dispatch 的 dispatchId/attemptNo 打进 usage_records + journal 列,
+      // 让 CCB 引擎的计费行可 join 回逻辑 turn。
+      //
+      // **fail-closed(B7a,钱安全)**:带 durable billingRequestId 的请求**绝不**能静默按 legacy
+      // 计费——那会让付费 turn 的计费行丢失 turn↔dispatch 关联(reconciler 财务联查失灵 → 可能误
+      // 判「未计费」发免单卡)。故:反查抛错(DB 抖动)→ 503 可重试拒绝;反查无行(签名 id 却查不到
+      // dispatch,硬不一致)→ 409 拒绝。绝不 `.catch(()=>null)` 降级。legacy / 非 dispatch 请求
+      // (gate 无 billingRequestId)才走 null 跳过。
+      let dispatchIdentity: { dispatchId: string; attemptNo: number } | null = null;
+      if (gate?.billingRequestId) {
+        const rejectDispatchFailClosed = async (
+          status: number,
+          code: string,
+          message: string,
+          rejectKey: ProxyRejectReason,
+        ): Promise<void> => {
+          await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
+          session.zeroizeSecrets();
+          await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
+            userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
+          });
+          incrAnthropicProxyReject(rejectKey);
+          sendJsonError(res, status, code, message, requestId);
+        };
+        try {
+          dispatchIdentity = await getDispatchByBillingRequestId(deps.pgPool, gate.billingRequestId);
+        } catch (err) {
+          userLog.error("proxy_dispatch_lookup_failed", {
+            err: errSummary(err),
+          });
+          await rejectDispatchFailClosed(
+            503,
+            "DISPATCH_LOOKUP_UNAVAILABLE",
+            "dispatch identity lookup failed, retry shortly",
+            "dispatch_lookup_failed",
+          );
+          return;
+        }
+        if (dispatchIdentity === null) {
+          userLog.error("proxy_dispatch_row_missing", {
+            note: "signed billingRequestId has no dispatch row",
+          });
+          await rejectDispatchFailClosed(
+            409,
+            "DISPATCH_IDENTITY_MISSING",
+            "dispatch identity not found for this request",
+            "dispatch_row_missing",
+          );
+          return;
+        }
+      }
+
       // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
       //
       // case (c) release ownership:journal fail 时 session 已 ready 但 finalizer 还没装,
@@ -936,6 +991,11 @@ export function makeAnthropicProxyHandler(
           containerId: containerIdBig,
           model: body.model,
           precheckCredits: pre.maxCost,
+          // 落**列**(B7a):reconciler 财务联查按 request_finalize_journal.dispatch_id 列直查,
+          // 只落 ctx 不落列 = 有账不认 → 误判「未计费」。ctx 仍留一份供 recovery/排障。
+          ...(dispatchIdentity
+            ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
+            : {}),
           ctxJson: gate
             ? {
                 authorityKind: gate.authorityKind,
@@ -944,6 +1004,11 @@ export function makeAnthropicProxyHandler(
                 billingRevision: gate.snapshot.billingRevision,
                 securityEpoch: gate.securityEpoch.toString(),
                 source: "ccb_proxy",
+                // 0170 durable-turn dispatch 身份(best-effort;非 dispatch → 缺省)。
+                // recovery/observability 据此关联逻辑 turn。
+                ...(dispatchIdentity
+                  ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
+                  : {}),
                 ...(gate.authorityKind === "bridge_signed"
                   ? {
                       authorityTurnId: gate.authorityTurnId,
@@ -1048,6 +1113,10 @@ export function makeAnthropicProxyHandler(
                 kind: gate.authorityKind,
               }
             : null,
+          // 0170 durable-turn dispatch 身份(RFC §3 CCB 段)。非 dispatch / legacy → null,
+          // settle 时 usage_records.dispatch_id/attempt_no 写 NULL。
+          dispatchId: dispatchIdentity?.dispatchId ?? null,
+          attemptNo: dispatchIdentity?.attemptNo ?? null,
         },
       );
 

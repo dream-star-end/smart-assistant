@@ -70,7 +70,7 @@ import {
   type LosslessTurnTapePartRequest,
   type TurnWaiveReason,
 } from "@openclaude/protocol";
-import type { LosslessTurnTapeStorage } from "../db/pgSessionsBackend.js";
+import type { DispatchAdmissionBackend, LosslessTurnTapeStorage } from "../db/pgSessionsBackend.js";
 import type { TurnWaiverInput, TurnWaiverResult } from "../billing/refund.js";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
@@ -103,6 +103,8 @@ const LOSSLESS_TURN_TAPE_WIRE_MAX_BODY_BYTES = Math.ceil((LOSSLESS_TURN_TAPE_PAR
 /** Path the container's V3MasterSink POSTs to. Mounted on both the plain
  *  self-host listener and the mTLS remote-host listener. */
 export const SERVER_AUTHORED_PATH = "/internal/v3/server-authored-message";
+/** 容器 boot recovery 查 tape 三态(RFC §2.4 / §3):GET ?dispatchId=&attemptNo=。 */
+export const TURN_TAPE_STATE_PATH = "/internal/v3/turn-tape-state";
 
 /** Per-tool field caps. Container-side `_capToolEntry` already enforces
  *  these by UTF-8 byte budget; the schema caps are slightly looser char
@@ -1710,6 +1712,10 @@ const LosslessTapeBaseSchema = z.object({
   totalBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   partCount: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   createdAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  // durable turn dispatch 身份(RFC §2.4):sink 首片带来 → 落 tape header。可选(legacy tape 无)。
+  // 不改 protocol 线型:zod 在 master 边界接收,storage 从 parsed.data 单独取传入。
+  dispatchId: z.string().uuid().optional(),
+  attemptNo: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 });
 
 const LosslessTapePartSchema = LosslessTapeBaseSchema.extend({
@@ -1805,8 +1811,11 @@ async function handleLosslessTurnTapeRequest(args: {
       sendJsonError(args.res, 400, "INVALID_TURN_TAPE_PART", "turn tape part bytes rejected", args.requestId);
       return;
     }
+    const partDispatchIdentity = parsed.data.dispatchId !== undefined
+      ? { dispatchId: parsed.data.dispatchId, attemptNo: parsed.data.attemptNo ?? 1 }
+      : undefined;
     try {
-      const result = await args.storage.stageLosslessTurnTapePart(args.userId, body, bytes);
+      const result = await args.storage.stageLosslessTurnTapePart(args.userId, body, bytes, partDispatchIdentity);
       if (result.applied === "session_not_found") {
         sendJsonError(args.res, 404, "SESSION_NOT_FOUND", "no client_sessions row for sessionId+userId", args.requestId);
         return;
@@ -1865,6 +1874,22 @@ async function handleLosslessTurnTapeRequest(args: {
       }
       if (result.applied !== "finalized" && result.applied !== "idempotent") {
         throw new Error("unexpected lossless turn tape finalize result");
+      }
+      // late true tape(RFC §2.4):reconciler 已宣告 not_accepted、error 卡已投影,tape 迟到。
+      // storage 已在同一 tx 撤 projection + 转 dispatch → manual_reconcile,内容仍完整 materialize
+      // (钱安全)。这里发一条 critical 告警交人工核对(已告知用户失败却又计费产出内容)。
+      if (result.dispatchLateTape) {
+        void enqueueAlert({
+          event_type: EVENTS.OPS_INCIDENT_OPENED,
+          severity: "critical",
+          title: "late turn tape 迟到(已告知失败却又产出计费内容)",
+          body:
+            `session \`${body.sessionId}\` tape \`${body.tapeId}\`:reconciler 已宣告该 turn ` +
+            `not_accepted 并向用户投影 error 卡,tape 随后到达。内容已完整 materialize(钱安全 I5),` +
+            `dispatch 已转 manual_reconcile、error 卡已撤销。请人工核对计费与用户告知一致性。`,
+          payload: { source: "losslessTurnTapeFinalize", kind: "late_tape", session_id: body.sessionId, tape_id: body.tapeId },
+          dedupe_key: `${EVENTS.OPS_INCIDENT_OPENED}:late_tape:${body.tapeId}`,
+        }).catch(() => {});
       }
       if (result.engineBillings.length > 0) {
         if (!args.settleCodexBilling) {
@@ -2058,4 +2083,69 @@ function sendJsonError(
     [REQUEST_ID_HEADER]: requestId,
   });
   res.end(body);
+}
+
+// ─── GET /internal/v3/turn-tape-state ────────────────────────────────────────
+// 容器 boot recovery 用(RFC §2.4 / §3):按 dispatch 身份问 master「这条 turn 的 tape 落到哪了」。
+// 三态:none(无 header)/ partial(有 header 未 finalize)/ finalized。容器据此决定
+// recovery 分支(finalized→terminal;partial→sink_stage_failed+manual;none→构造 synthetic crashed)。
+// 同 server-authored 的容器身份双因子(bearer + host/ip),GET + query 参数。
+
+const DISPATCH_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export interface TurnTapeStateHandlerDeps {
+  identityRepo: ContainerIdentityRepo;
+  /** pgSessionsBackend(DispatchAdmissionBackend);缺省 → 503。 */
+  storage?: Pick<DispatchAdmissionBackend, "getTurnTapeStateByDispatch">;
+  logger?: Logger;
+}
+
+export function makeTurnTapeStateHandler(deps: TurnTapeStateHandlerDeps): ServerAuthoredHandler {
+  const log = (deps.logger ?? rootLogger).child({ subsys: "internalTurnTapeState" });
+  return async function handle(req, res, ctx) {
+    setSecurityHeaders(res);
+    const requestId = ensureRequestId(req);
+    res.setHeader(REQUEST_ID_HEADER, requestId);
+
+    if (req.method !== "GET") {
+      sendJsonError(res, 405, "METHOD_NOT_ALLOWED", "GET required", requestId);
+      return;
+    }
+    let identity;
+    try {
+      identity = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization);
+    } catch (err) {
+      if (err instanceof ContainerIdentityError) {
+        sendJsonError(res, 401, "UNAUTHORIZED", "container identity verification failed", requestId);
+        return;
+      }
+      throw err;
+    }
+    if (!deps.storage) {
+      sendJsonError(res, 503, "TURN_TAPE_STATE_UNAVAILABLE", "turn tape state store unavailable", requestId);
+      return;
+    }
+    const url = new URL(req.url ?? "/", "http://internal");
+    const dispatchId = url.searchParams.get("dispatchId") ?? "";
+    if (!DISPATCH_UUID_RE.test(dispatchId)) {
+      sendJsonError(res, 400, "BAD_DISPATCH_ID", "dispatchId must be a uuid", requestId);
+      return;
+    }
+    const attemptNo = Number(url.searchParams.get("attemptNo") ?? "1");
+    if (!Number.isInteger(attemptNo) || attemptNo < 1) {
+      sendJsonError(res, 400, "BAD_ATTEMPT_NO", "attemptNo must be a positive integer", requestId);
+      return;
+    }
+    const userId = `c:${identity.userId}`;
+    try {
+      const result = await deps.storage.getTurnTapeStateByDispatch(userId, dispatchId, attemptNo);
+      // M1:返回 state(三态)+ status(tape 精确终态 completed/interrupted/crashed;none→null)。
+      // gateway recovery finalized 分支据 status 决定重播语义。
+      sendJsonOk(res, 200, { state: result.state, status: result.status }, requestId);
+    } catch (err) {
+      log.error("turn_tape_state_read_failed", { dispatchId, attemptNo, err: err as Error });
+      sendJsonError(res, 500, "TURN_TAPE_STATE_ERROR", "turn tape state read failed", requestId);
+    }
+  };
 }

@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  DURABLE_TURN_DISPATCH_CAPABILITY,
   LOSSLESS_TURN_TAPE_CAPABILITY,
   LOSSLESS_TURN_TAPE_RUNTIME_BATCH_CAPABILITY,
   MODEL_AUTHORITY_CAPABILITY,
@@ -287,9 +288,12 @@ describe("四面 capability 广播 + 步骤 5 兼容地板", () => {
     assert.deepEqual(meta.runtimeCapabilities, [
       MODEL_AUTHORITY_CAPABILITY,
       LOSSLESS_TURN_TAPE_CAPABILITY,
+      // 0170:gateway runtime 面新增 durable turn dispatch(inbox + 端点 + ring)。
+      DURABLE_TURN_DISPATCH_CAPABILITY,
     ]);
     assert.ok(meta.requiredMigrations.includes("0143_model_catalog"));
     assert.ok(meta.requiredMigrations.includes("0157_lossless_runtime_batches"));
+    assert.ok(meta.requiredMigrations.includes("0170_durable_turn_dispatch"));
   });
 
   test("cutover marker 置位 + flag 关 → 拒启(不可逆地板);其余组合放行", () => {

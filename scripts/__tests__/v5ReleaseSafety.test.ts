@@ -1854,7 +1854,13 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.requiredMigrations.includes('0166_prompt_queue'))
     assert.ok(meta.requiredMigrations.includes('0167_turn_waiver_receipts'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
-    assert.deepEqual(meta.runtimeCapabilities, ['model_authority_v1', 'lossless-turn-tape-v2'])
+    assert.deepEqual(meta.runtimeCapabilities, [
+      'model_authority_v1',
+      'lossless-turn-tape-v2',
+      'durable-turn-dispatch-v1',
+    ])
+    assert.ok(meta.capabilities.includes('durable-turn-dispatch-v1'))
+    assert.ok(meta.requiredMigrations.includes('0170_durable_turn_dispatch'))
     assert.ok(buildRuntimeStart >= 0 && buildRuntimeEnd > buildRuntimeStart)
     assert.match(
       source.slice(buildRuntimeStart, buildRuntimeEnd),

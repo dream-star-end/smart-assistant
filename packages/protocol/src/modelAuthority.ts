@@ -399,7 +399,8 @@ export function encodeTurnLeaseEnvelope(lease: TurnLease, sig: Uint8Array): stri
   return encodeEnvelope(TURN_LEASE_KIND, lease as unknown as JsonValue, sig)
 }
 
-function encodeEnvelope(kind: string, payload: JsonValue, sig: Uint8Array): string {
+/** 通用签名信封编码(dispatchAuthority 等兄弟票据复用)。 */
+export function encodeEnvelope(kind: string, payload: JsonValue, sig: Uint8Array): string {
   const envelope = {
     v: MODEL_AUTHORITY_VERSION,
     kind,
@@ -548,7 +549,8 @@ export function stripModelAuthorityField(
   }
 }
 
-function decodeEnvelope(
+/** 通用签名信封解码(dispatchAuthority 等兄弟票据复用;kind 域隔离防跨票据混用)。 */
+export function decodeEnvelope(
   envelopeB64: string,
   expectKind: string,
 ): { payload: unknown; sig: Buffer } {
@@ -585,7 +587,8 @@ function decodeEnvelope(
   return { payload: env.payload, sig }
 }
 
-function verifySignature(
+/** 通用 Ed25519 验签(keyring 域与 model authority 共用一套轮换语义)。 */
+export function verifySignature(
   signingInput: Buffer,
   sig: Buffer,
   keyId: string,
@@ -607,7 +610,7 @@ function verifySignature(
   if (!ok) throw new ModelAuthorityError('VerifyFail', 'authority: signature verification failed')
 }
 
-function assertNotExpired(expiresAt: number, now: number): void {
+export function assertNotExpired(expiresAt: number, now: number): void {
   if (!(expiresAt > now)) {
     throw new ModelAuthorityError('Expired', `authority: expired at ${expiresAt} (now=${now})`)
   }
