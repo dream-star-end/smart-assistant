@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { AttachChip, Composer } from "./Composer";
@@ -64,6 +64,24 @@ describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFo
     input.addEventListener("click", clickSpy);
     fireEvent.click(label);
     expect(clickSpy).toHaveBeenCalledTimes(1);
+  });
+
+  /** 竞态守门（2026-07-18 生产事故回归锁）:
+   *  真浏览器里 label 的原生转发是 post-dispatch activation,发生在 click 派发完成之后;
+   *  Radix Item 默认 select 会在派发过程中同步关菜单卸载 Portal → label detached →
+   *  htmlFor 按 tree scope 解析不到 input → 选择器不弹(真机 Chromium 实证 0 转发)。
+   *  上面的"转发"测试在 jsdom 恒绿测不出(jsdom 的 label control 查找走 ownerDocument
+   *  而非 root tree,detached 也能转发)——所以这里直接锁 detach 本身:
+   *  点击当下 label 必须仍 connected(即 onSelect 已 preventDefault),菜单随后异步关闭。 */
+  test("点击附件项后 label 在激活窗口内保持挂载（select 已拦截），菜单随后异步关闭", async () => {
+    render(<Composer onSend={() => {}} onUpload={uploadStub} />);
+    openPlusMenu();
+    const label = screen.getByText("添加附件").closest("label") as HTMLLabelElement;
+    fireEvent.click(label);
+    // click 派发结束的同步时刻:label 必须还在 DOM(原生激活依赖此窗口)。
+    expect(label.isConnected).toBe(true);
+    // 菜单不常驻:宏任务后正常关闭。
+    await waitFor(() => expect(screen.queryByText("添加附件")).toBeNull());
   });
 });
 
