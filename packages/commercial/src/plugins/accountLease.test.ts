@@ -34,6 +34,17 @@ class FakeRedis implements PluginLeaseRedis {
 }
 
 describe('Plugin account Redis lease', () => {
+  test('accepts the managed-browser write window and rejects unbounded leases', async () => {
+    const redis = new FakeRedis()
+    const lease = await acquirePluginAccountLease(redis, '41', { hardTimeoutMs: 700_000 })
+    await lease.release()
+    await assert.rejects(
+      acquirePluginAccountLease(redis, '41', { hardTimeoutMs: 900_001 }),
+      (error: unknown) =>
+        error instanceof PluginAccountLeaseError && error.code === 'LEASE_UNAVAILABLE',
+    )
+  })
+
   test('serializes the same account across independent runtime instances', async () => {
     const redis = new FakeRedis()
     const first = await acquirePluginAccountLease(redis, '41', {

@@ -212,6 +212,14 @@ export type RuntimePluginAccount = {
     acceptedVersion: number | null
     acceptedAt: string | null
     disclaimerText: string
+    preapproval?: {
+      available: boolean
+      enabled: boolean
+      disclaimerVersion: number | null
+      acceptedVersion: number | null
+      acceptedAt: string | null
+      disclaimerText: string | null
+    }
   } | null
 }
 
@@ -247,6 +255,12 @@ export type KnowledgePlanetAutomationRule = {
   nextRunAt: string
   createdAt: string
   updatedAt: string
+}
+
+export type KnowledgePlanetAutomationGroup = {
+  id: string
+  name: string
+  memberCount: number | null
 }
 
 export type KnowledgePlanetAutomationRun = {

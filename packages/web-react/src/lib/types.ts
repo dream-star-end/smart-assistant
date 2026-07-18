@@ -973,7 +973,8 @@ export type MarketplaceDetail = {
   /** 结构化元数据（智能体：model/toolsets/skillDeps；技能为 null）。 */
   manifest?: unknown;
   capabilityReadiness?: MarketplaceCapabilityReadiness;
-  riskFlags: MarketplaceRiskFlag[];
+  /** @deprecated Legacy servers may include scanner diagnostics; storefronts must not render them. */
+  riskFlags?: MarketplaceRiskFlag[];
   /** 审核来源；旧后端缺字段时 UI 使用不夸大的通用文案。 */
   reviewSource?: MarketplaceReviewSource | null;
   installCount: number;

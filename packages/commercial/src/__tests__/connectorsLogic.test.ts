@@ -772,6 +772,7 @@ describe('RPC 信封契约', () => {
             provider: 'knowledge-planet',
             summary: '发布知识星球主题',
             expiresAt,
+            approvalMode: 'interactive',
           }
         },
         executeConfirmedWrite: async () => {
@@ -814,6 +815,72 @@ describe('RPC 信封契约', () => {
       params: { groupId: '123', text: 'hello' },
     })
     assert.equal(directCalls, 0)
+  })
+
+  test('/v3/plugins/call 在账号免确认授权下沿同一账本立即执行', async () => {
+    const okRepo = {
+      async findActiveByHostAndBoundIp() {
+        return {
+          id: 1,
+          user_id: 7,
+          bound_ip: '1.2.3.4',
+          host_uuid: 'h',
+          secret_hash: (await import('node:crypto'))
+            .createHash('sha256')
+            .update(Buffer.from('b'.repeat(64), 'hex'))
+            .digest(),
+        }
+      },
+    }
+    const confirmId = '33333333-3333-4333-8333-333333333333'
+    let executionInput: unknown
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okRepo,
+      pool: {} as never,
+      redis: { eval: async () => 1 } as never,
+      pluginFacade: {
+        catalog: async () => [],
+        list: async () => [],
+        classifyTarget: async () => 'managed-browser',
+        actionEffect: async () => 'write',
+        proposeWrite: async () => ({
+          confirmId,
+          provider: 'knowledge-planet',
+          summary: '点赞主题',
+          expiresAt: new Date('2026-07-17T01:02:03.000Z'),
+          approvalMode: 'account_preapproval',
+        }),
+        executeConfirmedWrite: async (input) => {
+          executionInput = input
+          return { kind: 'result', result: { liked: true } }
+        },
+        call: async () => {
+          throw new Error('unexpected read')
+        },
+      },
+      log: () => {},
+    })
+    const { res, state } = makeFakeRes()
+    await handler(
+      makeFakeReq({
+        method: 'POST',
+        url: '/v3/plugins/call',
+        headers: { authorization: `Bearer oc-v3.1.${'b'.repeat(64)}` },
+        body: JSON.stringify({
+          connectionId: '41',
+          action: 'set_topic_like',
+          params: { topicId: '123', liked: true },
+        }),
+      }),
+      res,
+      { hostUuid: 'h', boundIp: '1.2.3.4' },
+    )
+    assert.deepEqual(executionInput, { userId: 7, targetId: '41', confirmId })
+    assert.deepEqual(JSON.parse(state.body), {
+      kind: 'result',
+      result: { liked: true },
+      pluginType: 'managed-browser',
+    })
   })
 
   test('/v3/plugins/call 的 confirmId 完全委托账本执行并保留 unknown replay', async () => {

@@ -101,6 +101,7 @@ import type {
   KnowledgePlanetSetupView,
   PluginManagementResponse,
   KnowledgePlanetAutomationControl,
+  KnowledgePlanetAutomationGroup,
   KnowledgePlanetAutomationRule,
   KnowledgePlanetAutomationView,
   RuntimePluginAccount,
@@ -3108,6 +3109,24 @@ export const api = {
       ),
     ).then((result) => result.writeControl),
 
+  setPluginWritePreapproval: (
+    a: AuthSession,
+    id: string,
+    input:
+      | { enabled: false }
+      | { enabled: true; accepted: true; disclaimerVersion: number },
+  ): Promise<RuntimePluginAccount['writeControl']> =>
+    jsonOrThrow<{ writeControl: RuntimePluginAccount['writeControl'] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/write-preapproval`, {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.writeControl),
+
   getKnowledgePlanetAutomation: (
     a: AuthSession,
     id: string,
@@ -3143,6 +3162,43 @@ export const api = {
         }),
       ),
     ).then((result) => result.control),
+
+  listKnowledgePlanetAutomationGroups: (
+    a: AuthSession,
+    id: string,
+  ): Promise<KnowledgePlanetAutomationGroup[]> =>
+    jsonOrThrow<{ groups: KnowledgePlanetAutomationGroup[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/groups`, {
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((result) => result.groups),
+
+  createKnowledgePlanetAutomationRulesBatch: (
+    a: AuthSession,
+    id: string,
+    input: {
+      groupIds: string[]
+      name: string
+      instructions: string
+      triggerKind: 'new_topic' | 'new_question'
+      dailyLimit: number
+      cooldownMinutes: number
+      maxReplyChars: number
+    },
+  ): Promise<KnowledgePlanetAutomationRule[]> =>
+    jsonOrThrow<{ rules: KnowledgePlanetAutomationRule[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/batch`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.rules),
 
   createKnowledgePlanetAutomationRule: (
     a: AuthSession,

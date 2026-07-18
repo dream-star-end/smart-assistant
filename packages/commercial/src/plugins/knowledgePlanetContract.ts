@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js'
 
 export const KNOWLEDGE_PLANET_PLUGIN_SLUG = 'knowledge-planet'
-export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.3.0'
+export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.4.0'
 /**
  * The implementation digest is part of both registry IDs, so changing trusted
  * worker code necessarily changes the marketplace artifact hash. Reusing the
@@ -18,9 +18,9 @@ export const KNOWLEDGE_PLANET_WORKER_DIGEST = createHash('sha256')
   .update(KNOWLEDGE_PLANET_WORKER_SOURCE)
   .digest('hex')
 export const KNOWLEDGE_PLANET_DRIVER_ID = `kp-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 60)}`
-export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.3.0'
+export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.4.0'
 export const KNOWLEDGE_PLANET_LAUNCHER_ID = `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`
-export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.3.0'
+export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.4.0'
 
 const authorSchema = {
   type: 'object',
@@ -624,7 +624,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_topic',
-      description: '在指定知识星球发布文本、图片和附件主题（每次执行都需用户单独确认）',
+      description: '在指定知识星球发布文本、图片和附件主题（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 600,
       params: {
@@ -648,7 +648,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'create_comment',
-      description: '在指定主题发布文字或单图评论/回复（每次执行都需用户单独确认）',
+      description: '在指定主题发布文字或单图评论/回复（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 600,
       params: {
@@ -673,7 +673,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'edit_topic',
-      description: '完整编辑普通主题正文并可追加图片或附件（保留现有媒体，逐次确认）',
+      description: '完整编辑普通主题正文并可追加图片或附件（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 600,
       params: {
@@ -700,7 +700,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'delete_topic',
-      description: '永久删除主题（不可撤销，逐次确认）',
+      description: '永久删除主题（不可撤销；默认逐次确认，账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 120,
       params: {
@@ -713,7 +713,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'delete_comment',
-      description: '永久删除评论或回复（不可撤销，逐次确认）',
+      description: '永久删除评论或回复（不可撤销；默认逐次确认，账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 120,
       params: {
@@ -730,7 +730,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'set_topic_like',
-      description: '把主题点赞状态设置为已赞或未赞（逐次确认）',
+      description: '把主题点赞状态设置为已赞或未赞（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 120,
       params: {
@@ -743,7 +743,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'set_comment_like',
-      description: '把评论点赞状态设置为已赞或未赞（逐次确认）',
+      description: '把评论点赞状态设置为已赞或未赞（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 120,
       params: {
@@ -765,12 +765,16 @@ if (COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType !== 'managed-browser')
   throw new Error('Knowledge Planet Plugin contract subtype mismatch')
 
 /**
- * Exact predecessor accepted only for the one-time product-login-first rollout.
- * It was platform-reviewed and signed in production, and its browser account
- * state contract is byte-for-byte compatible with v1.2. No other historical
- * or user-published Knowledge Planet artifact is eligible for setup.
+ * Exact platform-reviewed predecessors accepted for additive official upgrades.
+ * Their browser account-state contract is byte-for-byte compatible with v1.4;
+ * no other historical or user-published Knowledge Planet artifact is eligible.
  */
 export const KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
+  Object.freeze({
+    version: '1.3.0',
+    artifactHash: '1dbcb8d8861ae812431277e0144c93dd6018f0ba47b1ea359a8dcfb173a0c258',
+    execContractHash: 'ae7f8dab13127f098d5e7aa676556c0c00354d12dbf1df632bc0e9dfa766a898',
+  }),
   Object.freeze({
     version: '1.2.0',
     artifactHash: 'ee306d2ede7fe277084e842687ff798317ada778aeda942e31bb5770c83f0824',

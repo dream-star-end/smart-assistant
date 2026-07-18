@@ -23,7 +23,6 @@ import type {
 import { AgentScopePicker, normalizeAgentScope } from '../AgentScopePicker'
 import { Markdown } from '../Markdown'
 import { Alert, Badge, Button, Modal } from '../ui'
-import { friendlyRiskFlags } from './riskFlags'
 
 /** 人向商品信息块(适用场景 / 效果示例 / 详细介绍)——description 之后、徽章行之前。 */
 function StorefrontInfo({ detail }: { detail: MarketplaceDetail }) {
@@ -348,7 +347,6 @@ export function DetailModal({
     }
   }
 
-  const warns = friendlyRiskFlags(detail?.riskFlags)
   const isPreset = !!detail?.preset
   const isPreinstalledConnector = detail?.kind === 'connector' && !!detail.preinstalled
   // detail.versionId 是当前上架版本(最新权威);已安装且 pin 的不是它 → 可更新。
@@ -620,17 +618,6 @@ export function DetailModal({
               </Badge>
             )}
           </div>
-
-          {warns.length > 0 && (
-            <div className="flex flex-col gap-1.5">
-              {warns.map((w) => (
-                <Alert key={w.label} tone={w.tone}>
-                  <span className="font-medium">{w.label}：</span>
-                  {w.message}
-                </Alert>
-              ))}
-            </div>
-          )}
 
           {detail.rawBundle &&
             Object.keys(detail.rawBundle).some((p) => p.startsWith('scripts/')) && (

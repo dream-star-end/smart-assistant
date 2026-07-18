@@ -213,6 +213,42 @@ export async function dispatchPluginsRoute(
     }
   }
 
+  const writePreapproval =
+    /^\/api\/plugins\/accounts\/(\d{1,16})\/write-preapproval$/.exec(path)
+  if (writePreapproval && method === 'PATCH') {
+    const body = await readJsonBody(req, 2048)
+    if (body === null || typeof body !== 'object' || Array.isArray(body))
+      throw new HttpError(400, 'BAD_REQUEST', 'write preapproval body must be an object')
+    const value = body as Record<string, unknown>
+    const keys = Object.keys(value).sort()
+    const enabled = value.enabled
+    const validDisable = enabled === false && keys.join('\0') === 'enabled'
+    const validEnable =
+      enabled === true &&
+      value.accepted === true &&
+      Number.isInteger(value.disclaimerVersion) &&
+      keys.join('\0') === ['accepted', 'disclaimerVersion', 'enabled'].join('\0')
+    if (!validDisable && !validEnable)
+      throw new HttpError(400, 'BAD_REQUEST', 'write preapproval body is invalid')
+    try {
+      const writeControl = await runtime(deps).setManagedAccountWritePreapproval({
+        userId,
+        targetId: writePreapproval[1]!,
+        enabled: enabled as boolean,
+        ...(validEnable
+          ? {
+              accepted: true as const,
+              disclaimerVersion: Number(value.disclaimerVersion),
+            }
+          : {}),
+      })
+      sendJson(res, 200, { writeControl })
+      return
+    } catch (error) {
+      mapRuntimeError(error)
+    }
+  }
+
   const automationRoot = /^\/api\/plugins\/accounts\/(\d{1,16})\/automation$/.exec(path)
   if (automationRoot && method === 'GET') {
     try {
@@ -253,6 +289,68 @@ export async function dispatchPluginsRoute(
           : {}),
       })
       sendJson(res, 200, { control })
+      return
+    } catch (error) {
+      mapAutomationError(error)
+    }
+  }
+
+  const automationGroups =
+    /^\/api\/plugins\/accounts\/(\d{1,16})\/automation\/groups$/.exec(path)
+  if (automationGroups && method === 'GET') {
+    try {
+      const groups = await automation(deps).listGroups(userId, automationGroups[1]!)
+      sendJson(res, 200, { groups })
+      return
+    } catch (error) {
+      mapAutomationError(error)
+    }
+  }
+
+  const automationRulesBatch =
+    /^\/api\/plugins\/accounts\/(\d{1,16})\/automation\/rules\/batch$/.exec(path)
+  if (automationRulesBatch && method === 'POST') {
+    const raw = await readJsonBody(req, 16 * 1024)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+      throw new HttpError(400, 'BAD_REQUEST', 'automation rule batch body must be an object')
+    const body = raw as Record<string, unknown>
+    if (
+      !Array.isArray(body.groupIds) ||
+      body.groupIds.some((value) => typeof value !== 'string') ||
+      typeof body.name !== 'string' ||
+      typeof body.instructions !== 'string' ||
+      (body.triggerKind !== undefined && typeof body.triggerKind !== 'string') ||
+      (body.dailyLimit !== undefined && !Number.isInteger(body.dailyLimit)) ||
+      (body.cooldownMinutes !== undefined && !Number.isInteger(body.cooldownMinutes)) ||
+      (body.maxReplyChars !== undefined && !Number.isInteger(body.maxReplyChars)) ||
+      !exactBodyKeys(body, [
+        'groupIds',
+        'name',
+        'instructions',
+        'triggerKind',
+        'dailyLimit',
+        'cooldownMinutes',
+        'maxReplyChars',
+      ])
+    )
+      throw new HttpError(400, 'BAD_REQUEST', 'automation rule batch body is invalid')
+    try {
+      const rules = await automation(deps).createRulesBatch({
+        userId,
+        targetId: automationRulesBatch[1]!,
+        groupIds: body.groupIds as string[],
+        name: body.name,
+        instructions: body.instructions,
+        ...(body.triggerKind !== undefined
+          ? { triggerKind: body.triggerKind as 'new_topic' | 'new_question' }
+          : {}),
+        ...(body.dailyLimit !== undefined ? { dailyLimit: Number(body.dailyLimit) } : {}),
+        ...(body.cooldownMinutes !== undefined
+          ? { cooldownMinutes: Number(body.cooldownMinutes) }
+          : {}),
+        ...(body.maxReplyChars !== undefined ? { maxReplyChars: Number(body.maxReplyChars) } : {}),
+      })
+      sendJson(res, 201, { rules })
       return
     } catch (error) {
       mapAutomationError(error)

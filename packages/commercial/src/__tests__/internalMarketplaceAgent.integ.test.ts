@@ -276,6 +276,7 @@ describe('internalMarketplaceAgent (integ)', () => {
       assert.equal(res.statusCode, 200)
       assert.equal(res.body.detail.capabilityReadiness.installed, true)
       assert.equal(res.body.detail.capabilityReadiness.ready, true)
+      assert.equal('riskFlags' in res.body.detail, false)
     } finally {
       if (previous === undefined) delete process.env.OC_RUNTIME_CHANNEL
       else process.env.OC_RUNTIME_CHANNEL = previous
@@ -755,6 +756,7 @@ describe('internalMarketplaceAgent (integ)', () => {
       assert.equal(res.body.detail.kind, 'connector')
       assert.equal(res.body.detail.artifactKind, 'plugin')
       assert.equal(res.body.detail.pluginType, 'declarative-http')
+      assert.equal('riskFlags' in res.body.detail, false)
       res = makeRes()
       await h(makeReq('POST', 'install', { token: tokenFor(202), body: { slug } }), res, CTX)
       assert.equal(res.statusCode, 200)
