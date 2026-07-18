@@ -1,0 +1,7 @@
+# v5 commercial-integ(*.integ.test.ts,真 PG/Redis)已知存量失败清单。
+# 行格式/匹配规则与 commercial-unit.txt 同契约(diff-known-failures.sh,测试点全路径粒度)。
+#
+# 2026-07-18 门禁审计批C 首建:integ 套件此前**完全不在 CI**(104 个文件零门禁)。
+# 基线 bootstrap 流程:本文件初始为空 → PR 首轮 CI 实跑暴露 CI 环境存量失败集 →
+# 从 CI TAP artifact 按 docs/V5_CI.md 重生成命令逐条登记(带理由)→ 门转绿。
+# 空基线语义 = "integ 在 CI 环境应当全绿";任何失败都是新增,红了就修或有据登记。
