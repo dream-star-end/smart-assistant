@@ -1,0 +1,30 @@
+{
+  "__doc": [
+    "browser-tests 覆盖面强制清单(2026-07-18 门禁审计批D)。",
+    "背景:jsdom 对『点击→系统行为』类契约恒假阴性(附件事故),真浏览器覆盖此前是",
+    "逐文件 opt-in 纯人工纪律——新交互文件不加用例即重开缺口。本清单把纪律机制化:",
+    "check-coverage.mjs 扫描 src/**/*.tsx 中命中高危模式(type=\"file\" / htmlFor /",
+    "DropdownMenu)的文件,每个必须出现在 covered(带 run.mjs 用例 ID)或 waived(带",
+    "书面理由)或 waivedPrefixes 之下,否则 CI 红。新增高危交互文件 = PR 里必须做一次",
+    "显式决定,没有静默旁路。豁免不是终点:waived 条目属于债,扩面时逐个转 covered。"
+  ],
+  "covered": {
+    "src/components/Composer.tsx": ["T1", "T2", "T3", "T4", "T5"],
+    "src/components/ModelSelector.tsx": ["T6", "T7"],
+    "src/components/chat/ResponseRating.tsx": ["T8"],
+    "src/components/settings/TopupDialog.tsx": ["T9"]
+  },
+  "waived": {
+    "src/components/chat/cards.tsx": "消息卡片族:评分子组件已由 T8 覆盖;卡片整体渲染由 jsdom + E2E 旅程(J5 完成态)覆盖。菜单类交互扩面时转 covered。",
+    "src/components/manage/LibraryPanel.tsx": "管理中心文库面板(低频管理面);上传 input 走与 Composer 同一 ui 原语。扩面批转 covered。",
+    "src/components/manage/MemoryPanel.tsx": "管理中心记忆面板(低频管理面)。扩面批转 covered。",
+    "src/components/org/CreateOrgWizard.tsx": "org 企业开通向导(低频,后端 integ 覆盖强)。扩面批转 covered。",
+    "src/components/org/OrgTopupDialog.tsx": "org 充值弹窗:个人版同构组件已由 T9 覆盖 Portal 契约。扩面批转 covered。",
+    "src/components/settings/FeedbackTab.tsx": "设置-反馈页(低频);附件 input 与 Composer 同构。扩面批转 covered。",
+    "src/components/settings/KnowledgePlanetAutomationPanel.tsx": "KP 自动化面板(admin 向运营功能,插件门槛在运行时 fail-closed)。"
+  },
+  "waivedPrefixes": {
+    "src/admin/": "admin 管理面(仅 root/运营使用,非用户高频面;回归影响面=内部)。",
+    "src/components/ui/": "UI 原语库:Portal/激活行为经由消费方用例(T1-T9)在真实组合下覆盖,原语单测在 jsdom ui.test.tsx。"
+  }
+}
