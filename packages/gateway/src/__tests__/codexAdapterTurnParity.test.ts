@@ -79,20 +79,27 @@ interface Harness {
 
 const SESSION_KEY = "agent:main:webchat:dm:codex-peer";
 
-function makeHarness(opts: Partial<EngineCreateOpts> = {}): Harness {
+function makeHarness(
+  opts: Partial<EngineCreateOpts> = {},
+  // turn-retry 批:可选自定义 auto-responder(在 proc 生成时即装,避免默认握手
+  // 竞态)。不传 → 默认全自动应答。
+  customOnRequest?: (p: FakeCodexProc, req: JsonRpcRequest) => void,
+): Harness {
   const procs: FakeCodexProc[] = [];
   const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
   __setCodexAppServerSpawnForTests(((cmd: string, args: string[]) => {
     spawnCalls.push({ cmd, args });
     const p = new FakeCodexProc();
     // 默认 auto-responder:握手/线程/turn 全自动应答。测试可换 p.onRequest。
-    p.onRequest = (req) => {
-      if (req.method === "initialize") p.respondTo(req.id, {});
-      else if (req.method === "thread/start") p.respondTo(req.id, { thread: { id: "thr-new-1" } });
-      else if (req.method === "thread/resume") p.respondTo(req.id, {});
-      else if (req.method === "turn/start") p.respondTo(req.id, { turn: { id: "turn-1", status: "inProgress" } });
-      else if (req.method === "turn/interrupt") p.respondTo(req.id, {});
-    };
+    p.onRequest = customOnRequest
+      ? (req) => customOnRequest(p, req)
+      : (req) => {
+          if (req.method === "initialize") p.respondTo(req.id, {});
+          else if (req.method === "thread/start") p.respondTo(req.id, { thread: { id: "thr-new-1" } });
+          else if (req.method === "thread/resume") p.respondTo(req.id, {});
+          else if (req.method === "turn/start") p.respondTo(req.id, { turn: { id: "turn-1", status: "inProgress" } });
+          else if (req.method === "turn/interrupt") p.respondTo(req.id, {});
+        };
     procs.push(p);
     return p as unknown as ReturnType<typeof spawn>;
   }) as unknown as typeof spawn);
@@ -896,5 +903,62 @@ describe("CodexAdapter — billing 侧信道边界", () => {
     );
     assert.equal(classifyCodexErrorKind({ isError: true, assistantText: "" }, "boom"), "other");
     assert.equal(classifyCodexErrorKind({ isError: false, assistantText: "" }, null), undefined);
+  });
+});
+
+describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => {
+  test("首个 turn/start 被拒(capacity JSON-RPC error)→ 退避重试第二次成功:恰好一个 billing + 一个成功 final,且 retrying 状态帧被清除", async () => {
+    let turnStarts = 0;
+    const h = makeHarness({}, (p, req) => {
+      if (req.method === "initialize") p.respondTo(req.id, {});
+      else if (req.method === "thread/start") p.respondTo(req.id, { thread: { id: "thr-new-1" } });
+      else if (req.method === "thread/resume") p.respondTo(req.id, {});
+      else if (req.method === "turn/start") {
+        turnStarts++;
+        if (turnStarts === 1) {
+          // 明确 JSON-RPC application error(容量语义,retryable)。
+          p.reply({
+            jsonrpc: "2.0",
+            id: req.id,
+            error: { code: -32010, message: "the model is at capacity, please try again" },
+          });
+        } else {
+          p.respondTo(req.id, { turn: { id: "turn-1", status: "inProgress" } });
+          p.notify("turn/completed", { turnId: "turn-1", turn: { id: "turn-1", status: "completed", durationMs: 4 } });
+        }
+      } else if (req.method === "turn/interrupt") p.respondTo(req.id, {});
+    });
+    // 退避提速(真机 2000ms → 5ms),不改语义只缩测试时长。
+    (h.adapter as unknown as { kernel: { computeRetryDelayMs: (n: number) => number } }).kernel.computeRetryDelayMs =
+      () => 5;
+
+    const turn = beginTurn(h, { requestId: "req-retry" });
+    const summary = await turn.summary;
+
+    // 重试真的发生:两次 turn/start。
+    assert.equal(turnStarts, 2);
+    // 恰好一个成功 final(summary),不是 error。
+    assert.ok(summary);
+    assert.equal(summary.isError, false);
+    // 恰好一个 billing 事件(attempt 1 被拒不产 result → 不产 billing)。
+    assert.equal(h.billing.length, 1);
+    assert.equal(h.billing[0].status, "success");
+    // 审计 R9:重试端到端恰好 emit 一个 kind='final' 内容事件 —— 被拒的 attempt 1
+    // 不产 result → 不产 final;成功的 attempt 2 产唯一一个。重发不得多发 turn 终态。
+    const finalEvents = h.events.filter((e) => e.kind === "final");
+    assert.equal(finalEvents.length, 1, `expected exactly one final, got ${JSON.stringify(blockKinds(h.events))}`);
+    // retrying 侧信道:一帧 retrying(attempt=2/max=3)+ 随后一帧 null 清除。
+    const statusEvents = h.events.filter((e) => e.kind === "turn_status") as Array<{
+      kind: "turn_status";
+      status: unknown;
+    }>;
+    assert.equal(statusEvents.length, 2, JSON.stringify(statusEvents));
+    assert.deepEqual((statusEvents[0].status as { status: string; retry: { attempt: number; max: number } }).status, "retrying");
+    assert.equal(
+      (statusEvents[0].status as { retry: { attempt: number; max: number } }).retry.attempt,
+      2,
+    );
+    assert.equal((statusEvents[0].status as { retry: { max: number } }).retry.max, 3);
+    assert.equal(statusEvents[1].status, null);
   });
 });

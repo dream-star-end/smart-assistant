@@ -55,7 +55,11 @@ import {
   shouldServeInline,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
-import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
+import {
+  classifiedMessageForCode,
+  classifyDelegateOutputError,
+  classifyRunError,
+} from './errorClassify.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
   PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
@@ -125,7 +129,12 @@ import {
   userVisibleDefaultAgentId,
 } from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
-import type { SessionStreamEvent } from './ccbMessageParser.js'
+import type {
+  GatewayStreamEvent,
+  GatewayTurnPhase,
+  SessionStreamEvent,
+  TurnRetryMeta,
+} from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
 import {
   type SkillEvalRun,
@@ -11031,19 +11040,23 @@ export class Gateway {
       //     紧跟着的 turn-interrupted isFinal,自行清空 UI 状态)
       // 单 ws send(只给本次 hello 的 client 看,不是所有 peerKey),与下方
       // synthetic isFinal 同模式 —— 不走 deliver(),避免把同一帧再 ring + 广播。
-      if (session && session.runner.isRunning && session.currentTurnStatus !== null) {
+      if (session && session.runner.isRunning && session.currentTurnStatus != null) {
         try {
+          const phase = session.currentTurnStatus
+          // retrying 补发展平为 status:'retrying' + 平级 retry(前端按 retry.retryAt
+          // 重算剩余倒计时,不从完整 delayMs 重头显示);compacting/null 照旧。
           const turnStatusFrame = JSON.stringify({
             type: 'outbound.turn_status',
             sessionKey,
             channel: 'webchat',
             peer: { id: peerId, kind: 'dm' },
-            status: session.currentTurnStatus,
+            ..._turnStatusWireFields(phase),
             ts: Date.now(),
           })
           ws.send(turnStatusFrame)
           this.log.info('auto-resume rebroadcast turn_status', {
-            sessionKey, status: session.currentTurnStatus,
+            sessionKey,
+            status: typeof phase === 'object' ? phase.status : phase,
           })
         } catch {}
       }
@@ -11352,21 +11365,18 @@ export class Gateway {
       if ('error' in decision) {
         const _errUserId: string =
           typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
-        const errFrame = {
-          type: 'outbound.message' as const,
+        // 结构化双帧:先 outbound.error(模型路由拒绝 → upstream_failed,新客户端红卡),
+        // 再兼容 [error] final(终止器,内文不变;不泄漏 decision.reason 内部线索)。
+        const rejectFrames = _earlyRejectErrorFrames({
           sessionKey,
           channel: frame.channel,
           peer: frame.peer,
-          blocks: [
-            {
-              kind: 'text' as const,
-              text: `[error] model routing rejected (${decision.error})`,
-            },
-          ],
-          isFinal: true,
+          userId: _errUserId,
           traceId: turnTraceId,
-          _userId: _errUserId,
-        }
+          code: 'upstream_failed',
+          message: '模型服务暂时不可用，请稍后重试或切换模型',
+          legacyErrorText: `[error] model routing rejected (${decision.error})`,
+        })
         // 不要泄漏 decision.reason 内文(可能含 agent provider 等内部线索),
         // 仅给前端 error code,内部细节走 log。
         this.log.warn('inferAgentForModel rejected', {
@@ -11375,7 +11385,7 @@ export class Gateway {
           error: decision.error,
           reason: decision.reason,
         })
-        this.deliver(errFrame, adapter)
+        for (const f of rejectFrames) this.deliver(f, adapter)
         return
       }
       if (decision.agentId !== agent.id) {
@@ -11530,19 +11540,20 @@ export class Gateway {
         const mapped = this._mapLocalExecutionError(err)
         if (!mapped) throw err
         // 用户可见:回 error 帧收尾本 turn(与 inferAgentForModel 拒帧同形),不 spawn runner。
-        this.deliver(
-          {
-            type: 'outbound.message' as const,
-            sessionKey,
-            channel: frame.channel,
-            peer: frame.peer,
-            blocks: [{ kind: 'text' as const, text: `[error] ${mapped.code}` }],
-            isFinal: true,
-            traceId: turnTraceId,
-            _userId: activeUserId,
-          } as OutboundMessage,
-          adapter,
-        )
+        // mapped.code 是 MODEL_NOT_AVAILABLE / MODEL_CATALOG_UNAVAILABLE 类,wire
+        // OutboundError.code 无对应枚举 → 统一走 'upstream_failed'(红卡 + 重试引导);
+        // 裸 [error] final 保留原样 mapped.code(旧客户端终止器)。
+        const rejectFrames = _earlyRejectErrorFrames({
+          sessionKey,
+          channel: frame.channel,
+          peer: frame.peer,
+          userId: activeUserId,
+          traceId: turnTraceId,
+          code: 'upstream_failed',
+          message: '模型服务暂时不可用，请稍后重试或切换模型',
+          legacyErrorText: `[error] ${mapped.code}`,
+        })
+        for (const f of rejectFrames) this.deliver(f, adapter)
         return
       }
     }
@@ -12408,7 +12419,11 @@ export class Gateway {
     // 永远拦不到。
     let _apiErrorIntercepted = false
     let _apiErrorText = ''
-    const onLeaderEvent = (e: SessionStreamEvent) => {
+    // 参数类型加宽为 GatewayStreamEvent(见 ccbMessageParser):error 事件可带
+    // runner 预分类的 errorClass,turn_status 的 status 可为 retrying 形态。
+    // SessionStreamEvent ⊆ GatewayStreamEvent,故本 handler 仍可下传给要求
+    // SessionStreamEvent handler 的 sessions.submit()(函数参数逆变)。
+    const onLeaderEvent = (e: GatewayStreamEvent) => {
       if (e.kind === 'block') {
         const b = e.block as any
         // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
@@ -12650,12 +12665,11 @@ export class Gateway {
         //     autoResumeFromHello 的 cache 兜底补发
         //   - 与 codex_billing 同模式:routing tuple + traceId 都从 main `out` 继承,
         //     deliver() 的 _userId 路由也走 _inheritOutboundRouting 自动带上
+        // e.status 是 GatewayTurnPhase('compacting' | null | retrying 形态)。
+        // session cache 直接存 phase;wire 帧按 protocol OutboundTurnStatus 判别
+        // 联合展平(retrying → status:'retrying' + 平级 retry;其余 → status)。
         session.currentTurnStatus = e.status
-        const turnStatusFrame: OutboundTurnStatus & { _userId?: string } = {
-          type: 'outbound.turn_status',
-          ..._inheritOutboundRouting(out),
-          status: e.status,
-        }
+        const turnStatusFrame = _buildTurnStatusFrame(_inheritOutboundRouting(out), e.status)
         // ts / frameSeq 由 deliver() 在 ring 落地时一并 stamp,这里不预填
         // (与 outbound.codex_billing / outbound.error 同 wire stamp 模式)。
         this.deliver(turnStatusFrame, adapter)
@@ -12715,7 +12729,14 @@ export class Gateway {
         // P1-3 — 已识别错误(余额/限流/上游)发结构化 outbound.error 帧 + 紧跟
         // 老的 [error] text bubble (turn 终止器,frameSeq 单调,新客户端按 seq
         // 抑制重复气泡,旧客户端无视 outbound.error,只看到 [error] 文本降级 UX)。
-        const cls = classifyRunError(e.error)
+        // runner 已把错误预分类(errorClass)时优先用之,文案按码取(与
+        // classifyRunError 同源);否则回落到对原始错误串做正则粗分类。
+        // 'model_capacity' 是新增 wire code(容量满载),直接透传。
+        const preClass = e.errorClass
+        const cls =
+          preClass && preClass !== 'unknown'
+            ? { code: preClass, message: classifiedMessageForCode(preClass) }
+            : classifyRunError(e.error)
         // Always emit the structured error card.  Older clients still get
         // the compatibility `[error]` final below; modern clients suppress
         // that raw bubble and keep the technical string folded in `detail`.
@@ -13312,6 +13333,78 @@ export function _inheritOutboundRouting(
     ...(out._userId ? { _userId: out._userId } : {}),
     ...(out.traceId ? { traceId: out.traceId } : {}),
   }
+}
+
+/**
+ * GatewayTurnPhase → OutboundTurnStatus 判别联合的 status 分支字段。
+ * retrying 形态展平为 `status:'retrying'` + 平级 `retry`;compacting/null 为
+ * `status` 本身。给「拼装未类型化 wire 对象」的路径用(autoResume 的 JSON.stringify)。
+ */
+export function _turnStatusWireFields(
+  phase: GatewayTurnPhase,
+): { status: 'compacting' | null } | { status: 'retrying'; retry: TurnRetryMeta } {
+  return phase && typeof phase === 'object'
+    ? { status: 'retrying', retry: phase.retry }
+    : { status: phase }
+}
+
+/**
+ * 构造完整 outbound.turn_status wire 帧(带路由继承)。显式按判别联合分支构造,
+ * 避免把 union 型 status 字段 spread 进单个 literal(TS 无法归约回 OutboundTurnStatus
+ * 判别联合)。`ts`/`frameSeq` 交给 deliver() 落地 stamp。
+ */
+export function _buildTurnStatusFrame(
+  routing: ReturnType<typeof _inheritOutboundRouting>,
+  phase: GatewayTurnPhase,
+): OutboundTurnStatus & { _userId?: string } {
+  if (phase && typeof phase === 'object') {
+    return { type: 'outbound.turn_status', ...routing, status: 'retrying', retry: phase.retry }
+  }
+  return { type: 'outbound.turn_status', ...routing, status: phase }
+}
+
+/**
+ * 早期拒帧(创建 runner 之前的模型路由 / 本地执行拒绝)的结构化双帧构造。
+ *
+ * 返回**有序**二元组 `[结构化 outbound.error, 兼容 [error] final]`,调用方按序
+ * deliver():新客户端识别 outbound.error 渲染红卡 + CTA、按相邻 frameSeq 抑制其后
+ * 的裸 `[error]` 文本;旧客户端无视 outbound.error,仍靠 `[error]` final 终止本
+ * turn(终止器语义不变)。此处尚无主 `out`,路由字段手工继承入参。
+ *
+ * `_` 前缀 = 契约测试 seam(锁双帧顺序 + 路由一致)。
+ */
+export function _earlyRejectErrorFrames(args: {
+  sessionKey: string
+  channel: string
+  peer: Peer
+  userId: string
+  traceId: string
+  code: OutboundError['code']
+  message: string
+  legacyErrorText: string
+}): readonly [OutboundError & { _userId?: string }, OutboundMessage & { _userId?: string }] {
+  const structured: OutboundError & { _userId?: string } = {
+    type: 'outbound.error',
+    sessionKey: args.sessionKey,
+    channel: args.channel,
+    peer: args.peer,
+    code: args.code,
+    message: args.message,
+    isFinal: false,
+    traceId: args.traceId,
+    _userId: args.userId,
+  }
+  const legacyFinal: OutboundMessage & { _userId?: string } = {
+    type: 'outbound.message',
+    sessionKey: args.sessionKey,
+    channel: args.channel,
+    peer: args.peer,
+    blocks: [{ kind: 'text', text: args.legacyErrorText }],
+    isFinal: true,
+    traceId: args.traceId,
+    _userId: args.userId,
+  }
+  return [structured, legacyFinal] as const
 }
 
 // ── 长会话热尾巴 + 归档 (Agent B §2) — pure helpers(`_` 前缀 test seam)──

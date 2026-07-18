@@ -26,7 +26,7 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
   └─► 用户容器(docker,openclaude-v5-net 172.31/16,镜像 openclaude/openclaude-runtime:v5-ccb-*)
         容器内 gateway(packages/gateway)= 真正执行 turn 的进程
         引擎层 EngineAdapter:CcbAdapter(claude-code-best)/ CodexAdapter(codex app-server)
-        /api/skills|cron|memory|agents 等管理面 = 容器代理路径(改了必须重建 runtime image!)
+        /api/skills|cron|memory|agents 等管理面 = 容器代理路径(gateway 源码,走 runtime source release 轴,见 §2 矩阵)
         skill:平台 baseline(A/B 当前 release 的 slot-local 路径 ro bind)+ marketplace hub(syncMarketplaceHub 落盘)
 ```
 
@@ -196,7 +196,7 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;codex 跨桥重连计费走 journal 权威。造数验证用 psql 必须显式 COMMIT。
 
 ### 3.5 市场/技能问题
-市场权威=master PG;容器侧靠 `syncMarketplaceHub`(已内建单飞+5s TTL+限频 warn 日志,"装了不显示"先看容器日志里的 sync warn)。管理面读技能在**容器内 gateway** 执行(生效面=runtime image)。用户向 skill API 必须 `includePlatform:false`(防平台技能泄露)。
+市场权威=master PG;容器侧靠 `syncMarketplaceHub`(已内建单飞+5s TTL+限频 warn 日志,"装了不显示"先看容器日志里的 sync warn)。管理面读技能在**容器内 gateway** 执行(生效面=runtime source release 轴,§2 矩阵)。用户向 skill API 必须 `includePlatform:false`(防平台技能泄露)。
 
 ### 3.6 遥测/审计
 工具失败遥测:显式开关 `OC_TOOL_FAILURE_AUDIT=1`(容器 reporter+master 路由双端;v3 无此键=默认关)。dedupe 走 `idx_aa_agent_event_id` 索引。
@@ -541,6 +541,8 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 | selfheal:writer-guard trigger 有意 deferred | schema_migrations 有 0136 记账行但 **trigger 不存在**(0137 显式 DROP 并把 SQL 移驻 db/deferred/selfheal_writer_guard.sql;当时回滚池仍含旧 writer)。**验收只认 pg_trigger,禁看 migration ledger** | 回滚池候选全部 ≥ selfheal 合并点后,以**新迁移版本**入仓启用(勿复用 0136 号) |
 | ~~selfheal:派单候选无优先级~~ **已偿还**(2026-07-17,批1a P4) | sweeper 派单 ORDER BY:critical(及等待>2h 的 warning 提级)优先→同级 opened_at ASC→id;不 LIMIT(熔断/冷却候选不挡后续事故) | — |
 | selfheal:Tier2 release 全链未通(批1b) | transport drill + **Tier1 机器路径已生产实证**(批1a),但 Tier2 代码修复的 真commit→verify→pending_release→一键放行→deployDriver 全链从未走通。**根因不止"没演练"**:①admin 放行→个人版 deployDriver 当前是**同步**的,而部署会重启 master → 放行请求很可能在写审计/返回 200 前被自己杀掉;②deployDriver **不懂 v5 生效面**(把 gateway 代码当普通文件一键 `--with-dist`,实际要重建 runtime image;egress 要 `--egress`;迁移/env/lockfile 不能走一键) | 批1b:先把放行→部署改 **durable async**(admin 事务=claim+审计+outbox→202;个人版 durable release job+独立 worker;结果经 callback outbox 回传;UI/脚本轮询 pending_release→deploying→deployed)+ 落 **touched-path 生效面分类器**(不能安全自动的面继续 pending/manual,禁假报 deployed)+ deployDriver merge 后 push origin(失败则不部署);再做 release drill(selfheal.drill:release_v1 seed + drill 脚本 --release,放行走 admin API 但保留显式 `--approve` 二段人工确认) |
+| turn-retry:codex 失败 turn 无干净自动重试 | 实测 codex 0.144:turn status='failed' 后 user input **保留**在 thread(rollout response_item 在 API 调用前落盘不回滚;持久化视图失败 turn 记为 completed/error:null)→ 整 turn 自动重发=重复 user input,已按设计审硬门禁止;现行覆盖=①原生乘性重试(request_max_retries=1×stream_max_retries=5,单 API 调用 12 次尝试,mid-turn 无副作用)②turn/start 应用级拒绝窄路径 gateway 重试③终态友好红卡+精确重试 CTA | 协议里有 thread/rollback(ThreadRollbackParams)可先回滚失败 turn items 再重发;若 capacity 类整 turn 失败频率仍高:隔离探测 rollback 语义(rollout 落盘/计费/并发)后走该路,过 Codex 审 |
+| turn-retry:delegate/cron/图片/语音无自动重试 | 举一反三清单确认这些链路瞬时失败一次性放弃(delegate 错误已结构化文案,重试未做;cron 有"下轮自愈"语义可接受;图片 IMAGE_SERVER_BUSY/语音 STT 一次性失败) | 对应链路用户报障出现时:复用 turnErrorTaxonomy.retryable + 有界退避,delegate 优先 |
 | selfheal:0137 用户通知全关 | incident_policies.user_notice_enabled 全 f;0137 attestation 只认 svc_v5/http_v5 fully_automatic deploy_v5,AUTO_DEPLOY_TIER2=0 下人工放行不产 attestation → 即使修复成功也不会形成用户通知 proposal(设计使然) | 独立批3:审批人绑定+真实影响证据链演练后,先只开一个 policy 试点 |
 
 ### 审计体系速记(2026-07-11 整改批)

@@ -15,10 +15,13 @@ import type {
   DetectedToolResult,
   DetectedToolUse,
   DurableRuntimeEvent,
+  EngineTurnPhase,
   SegmentRecord,
   SessionStreamEvent,
+  TurnRetryMeta,
   TurnToolEntry,
 } from './engine/engineEvents.js'
+import type { ClassifiedErrorCode } from './errorClassify.js'
 import type { SdkMessage } from './subprocessRunner.js'
 
 function bashOutputTailBlock(raw: Record<string, any>): OutboundContentBlock | null {
@@ -39,14 +42,52 @@ function bashOutputTailBlock(raw: Record<string, any>): OutboundContentBlock | n
 
 // M0 engine 适配层:事件/工具快照类型的权威源迁至 engine/engineEvents.ts(engine
 // 中立模块);此处 re-export 兼容存量 import(server/v3MasterSink/commercial/测试)。
+// 审计 R3:TurnRetryMeta 亦上提至 engineEvents.ts(权威源),此处 re-export 兼容。
 export type {
   DetectedToolResult,
   DetectedToolUse,
   PermissionRequest,
   SegmentRecord,
   SessionStreamEvent,
+  TurnRetryMeta,
   TurnToolEntry,
 } from './engine/engineEvents.js'
+
+/**
+ * 审计 R3 前的本地加宽类型收敛为**权威类型的兼容别名**。
+ *
+ * retrying turn_status 形态与 error 事件的 errorClass 已正式上提进 engine 权威
+ * 事件类型(engineEvents.ts 的 EngineTurnPhase / EngineContentEvent):
+ *   - `GatewayTurnPhase` === engine 权威 `EngineTurnPhase`;
+ *   - `GatewayStreamEvent` === engine 中立 `SessionStreamEvent`(error/turn_status
+ *     已含 errorClass/retrying,二者此刻完全等价)。
+ * 两个导出名保留仅为不惊动 server.ts 的既有 import(server.ts 不在本批所有权内);
+ * 新代码应直接用权威名。gateway 侧不再有任何跨 engine/ 边界的受控 cast。
+ */
+export type GatewayTurnPhase = EngineTurnPhase
+export type GatewayStreamEvent = SessionStreamEvent
+
+/** 校验底座 fake-SDK retrying 状态携带的 retry 载荷;形状非法返回 null(调用方
+ *  据此降级为 status:null,不把畸形侧信道透给前端)。 */
+function normalizeTurnRetry(raw: unknown): TurnRetryMeta | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  const { attempt, max, delayMs, retryAt } = r
+  if (
+    typeof attempt !== 'number' || !Number.isFinite(attempt) || attempt < 1 ||
+    typeof max !== 'number' || !Number.isFinite(max) || max < 1 ||
+    typeof delayMs !== 'number' || !Number.isFinite(delayMs) || delayMs < 0 ||
+    typeof retryAt !== 'number' || !Number.isFinite(retryAt) || retryAt < 0
+  ) {
+    return null
+  }
+  return {
+    attempt: Math.floor(attempt),
+    max: Math.floor(max),
+    delayMs: Math.floor(delayMs),
+    retryAt: Math.floor(retryAt),
+  }
+}
 
 /** Accumulated turn result stats */
 export interface TurnResult {
@@ -66,6 +107,11 @@ export interface TurnResult {
   thinkingText: string
   /** True if CCB marked the result as an error (e.g. API failure) */
   isError: boolean
+  /** 审计 R3 — 底座在 result 帧上现场预分类的结构化错误码(codex runner 的
+   *  classifyRunError 产物;CCB result 帧不带 → 恒 undefined)。此前 _handleResult
+   *  丢弃了这个字段,导致 codex 的 errorClass 到 TurnSummary 就断链。现逐字段透传,
+   *  adapter 的 buildTurnSummary 复制到 TurnSummary。 */
+  errorClass?: ClassifiedErrorCode
   errorDetail?: string
   /** Anthropic API stop_reason from CCB's result row; null if CCB didn't
    *  populate it (older CCB or pre-termination crash). Used for three-state
@@ -508,12 +554,28 @@ export class CcbMessageParser {
         const block = bashOutputTailBlock(raw)
         if (block) this.onEvent({ kind: 'block', block })
       } else if (raw.subtype === 'status') {
-        // CCB SDKStatus 当前只有 'compacting' | null(coreSchemas.ts:1268)。
-        // 任何其它值都 normalize 到 null —— 防止未来 CCB 加新 status 字面量
-        // 时,gateway 没有显式 mapping 就把未审过的字符串塞给前端。
-        const mapped: 'compacting' | null =
-          raw.status === 'compacting' ? 'compacting' : null
-        this.onEvent({ kind: 'turn_status', status: mapped })
+        // 受控枚举:CCB SDKStatus 有 'compacting' | null(coreSchemas.ts:1268);
+        // codex runner 另注入 fake-SDK `status:'retrying'` + retry 载荷(自动重试
+        // 侧信道)。除这两类显式识别的形态外,任何其它值 normalize 到 null ——
+        // 防止未来底座加新 status 字面量时,gateway 没有显式 mapping 就把未审过
+        // 的字符串塞给前端。
+        if (raw.status === 'compacting') {
+          this.onEvent({ kind: 'turn_status', status: 'compacting' })
+        } else if (raw.status === 'retrying') {
+          const retry = normalizeTurnRetry(raw.retry)
+          if (retry) {
+            // 审计 R3:retrying 形态已是 engine 权威事件类型(EngineTurnPhase)的
+            // 一等取值,直接 emit —— 不再经 `as unknown as SessionStreamEvent` 穿透。
+            this.onEvent({
+              kind: 'turn_status',
+              status: { status: 'retrying', retry },
+            })
+          } else {
+            this.onEvent({ kind: 'turn_status', status: null })
+          }
+        } else {
+          this.onEvent({ kind: 'turn_status', status: null })
+        }
       }
       return
     }
@@ -1081,6 +1143,11 @@ export class CcbMessageParser {
     // dead id and re-crashes, forming an infinite loop.
     const errorsField = (msg as any).errors
     const isError = !!(msg as any).is_error
+    // 审计 R3:底座(codex runner)在 result 帧上带的结构化 errorClass 逐字段透传到
+    // TurnResult。CCB result 帧无此字段 → undefined,不落 TurnResult(条件展开)。
+    const rawErrorClass = (msg as any).errorClass
+    const errorClass: ClassifiedErrorCode | undefined =
+      typeof rawErrorClass === 'string' ? (rawErrorClass as ClassifiedErrorCode) : undefined
     const errorDetail = isError
       ? JSON.stringify({
           subtype: (msg as any).subtype,
@@ -1103,6 +1170,7 @@ export class CcbMessageParser {
       assistantText: this.assistantBuf,
       thinkingText: this.thinkingBuf,
       isError,
+      ...(errorClass !== undefined ? { errorClass } : {}),
       ...(errorDetail !== undefined ? { errorDetail } : {}),
       stopReason,
       numTurns,

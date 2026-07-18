@@ -6,6 +6,15 @@
  * state.js 已单独标注）。它们是 parity 验收的天然测试锚点：现网每个都有对应单测，
  * 漏掉/改坏任一个 = 重现一类历史已修 bug。
  */
+import {
+  EXPECTED_TURN_ERROR_CODES,
+  isDisplayableServerMessage,
+  isKnownTurnErrorCode,
+  normalizeTurnErrorCode,
+  REPORT_EXEMPT_TURN_ERROR_CODES,
+  type TurnErrorCode,
+  turnErrorSemantics,
+} from "@openclaude/protocol";
 import type {
   OutboundContentBlock,
   OutboundMessageWire,
@@ -610,61 +619,107 @@ export function backoffDelay(attempts: number): number {
 
 // ═══════════════ bridge error 归一化（websocket.js:3906-3935）═══════════════
 
+/**
+ * 归一化任意来源错误码 → 语义码。**薄包装 protocol normalizeTurnErrorCode**(单一权威:
+ * 大写 legacy 控制码走 LEGACY_CODE_ALIASES、其余转小写)。只保留一条前端 only 特判:裸
+ * `BACKPRESSURE`(无 ERR_ 前缀)——protocol 只认 `ERR_BACKPRESSURE`,而现网旧 master 曾裸发
+ * 该码,归连接态兜旧回滚窗残帧。空值 → 'unknown'(与 protocol 一致)。
+ */
 export function normalizeBridgeErrorCode(code: unknown): string {
-  const raw = String(code || "").trim();
-  const upper = raw.toUpperCase();
-  if (upper === "ERR_INSUFFICIENT_CREDITS" || upper === "INSUFFICIENT_CREDITS") return "insufficient_credits";
-  if (upper === "UNAUTHORIZED_MODEL") return "unauthorized_model";
-  if (upper === "MAINTENANCE") return "maintenance";
-  // 连接态错误归一(**遗留兼容**:新 bridge 已不再对 kick/重启/背压发 turn 级 error 帧,
-  // 连接态信号全走 close code——4505/4509/1009,见 classifyClose;此映射只兜旧 master
-  // 回滚窗口的残帧,不应再有新增发射点)。
-  if (upper === "ERR_CONN_KICKED" || upper === "CONN_KICKED") return "conn_kicked";
-  if (upper === "ERR_BACKPRESSURE" || upper === "BACKPRESSURE") return "conn_kicked";
-  // codex_* v5 不会到达，保留归一化无害（删 codex 专属 UI 文案即可）。
-  if (upper === "CODEX_TURN_BUSY") return "codex_turn_busy";
-  if (upper === "CODEX_POOL_BUSY") return "codex_pool_busy";
-  if (upper === "CODEX_ROUTE_UNAVAILABLE") return "codex_route_unavailable";
-  if (upper === "CODEX_CONTAINER_RECYCLED") return "codex_container_recycled";
-  if (upper === "SESSION_PERSIST_UNAVAILABLE") return "session_persist_unavailable";
-  return raw ? raw.toLowerCase() : "unknown";
+  if (String(code ?? "").trim().toUpperCase() === "BACKPRESSURE") return "conn_kicked";
+  return normalizeTurnErrorCode(code);
 }
 
 export function isBridgeAuthControlError(code: unknown): boolean {
   return normalizeBridgeErrorCode(code) === "unauthorized";
 }
 
+/**
+ * 用户向错误正文表 —— **key 集合与 protocol TURN_ERROR_TAXONOMY 对齐**(契约测试 turnErrorTaxonomy
+ * .contract 锁死每码有正文,防漂移)。标题在 render.ts ERROR_LABELS(同表另一权威,同源同 key)。
+ * 语义(retryable/cta/allowPublicServerMessage)只在 protocol,这里只落中文文案。
+ * 合并语义相同的码用同一串(如 authority/catalog 不可用;两 codex_unavailable 别名)。
+ */
+export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
+  // ── 计费/配额 ──
+  insufficient_credits: "余额不足，充值后即可继续使用。",
+  rate_limited: "请求暂时较多，请稍后直接重试本条消息。",
+  // ── 上游模型服务 ──
+  model_capacity: "当前模型访问量较大，请稍后重试，或在上方切换到其他模型立即继续。",
+  upstream_failed: "任务执行暂时中断，你的消息已保留，可直接重试。",
+  upstream_timeout: "模型响应超时，你的消息已保留，请重试。",
+  network_error: "网络波动导致本轮中断，请重试。",
+  context_too_long: "上下文长度超过模型上限，请精简内容或开启新会话。",
+  bad_request: "这条请求无法被处理，请调整内容后重试。",
+  // ── 引擎/平台执行 ──
+  engine_error: "任务执行时遇到内部错误，你的消息已保留，可以直接重试。",
+  internal_error: "服务遇到内部错误，你的消息已保留，请重试。",
+  auth_error: "认证状态异常，本轮未正常完成，请重新尝试。",
+  service_restart: "服务正在更新，本轮已中断，请重试。",
+  session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
+  stopped: "本轮生成已停止。",
+  user_cancelled: "本轮已取消。",
+  runner_crashed: "执行环境意外中断，你的消息已保留，请重试。",
+  // ── 免单类(waivable;errorPresentation 走 waiver 分支,此处仅供契约完备 + 兜底展示)──
+  model_authority_expired: "长任务的执行凭证未能继续，本轮不收费，你可以重新尝试。",
+  liveness_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
+  idle_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
+  no_response: "任务未能产生有效回复，本轮未扣费。",
+  phantom_turn: "任务未能产生有效回复，本轮未扣费。",
+  turn_limit: "任务达到运行上限，系统已中断，本轮不收费。",
+  // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
+  model_config_changed_retry_turn:
+    "平台的模型配置刚刚更新，本轮已停止（不计费）。你的消息没有丢：点它下方的「重试」即可原样重发。",
+  model_not_available: "这个模型当前不可用（已下架或未对你的账号开通），请在上方切换一个模型后重发。",
+  unresolved_agent_model: "没能确定本轮要用的模型，请在上方选择模型后重发。",
+  model_authority_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
+  model_catalog_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
+  unauthorized_model: "当前账号尚未开通这个模型，请切换模型或联系管理员。",
+  // ── 连接/环境 ──
+  unauthorized: "登录状态已失效，请重新登录后继续。",
+  maintenance: "服务正在维护中，请稍后再试。",
+  conn_kicked: "连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。",
+  // 运行环境已重建:必须**刷新页面**,重试无效(allowPublicServerMessage:服务端 message 指路)。
+  container_outdated: "运行环境已更新，请刷新页面后重新发送（直接重试不会生效）。",
+  err_container: "运行环境出现异常，你的消息已保留，请重试。",
+  err_container_timeout: "运行环境响应超时，请重试。",
+  err_internal: "服务遇到内部错误，请重试。",
+  forbidden: "该操作被拒绝，请检查后重试。",
+  err_frame_too_big: "本轮内容过大无法处理，请精简后重试。",
+  bad_json: "收到的数据格式异常，请重试。",
+  bad_sequence: "消息时序出现异常，请重试。",
+  unknown_control: "收到无法识别的指令，请重试。",
+  // ── 媒体/子系统(image_* 白名单可展示服务端 message)──
+  image_upstream_rejected: "图片生成/编辑被上游拒绝（可能触发了内容审核），请调整描述或更换图片后重试。",
+  image_server_busy: "图片服务当前繁忙，请稍后重试。",
+  voice_upstream_error: "语音识别服务暂时不可用，请重试",
+  voice_timeout: "语音识别超时，请重试",
+  // ── 遗留兼容(新 bridge 不再发射,归一化仍认)──
+  codex_turn_busy: "上一轮任务仍在运行，请等它结束后再发送。",
+  codex_pool_busy: "账号池繁忙，请稍后重试。",
+  codex_route_unavailable: "GPT 服务暂时不可用，你的消息已保留，请稍后重试。",
+  codex_container_recycled: "环境已重建，请刷新页面后重发。",
+  codex_billing: "计费服务暂时不可用，本轮未开始，请稍后重试。",
+  upstream_error: "模型服务暂时不可用，你的消息已保留，请重试。",
+};
+
+/** 未知码的通用兜底正文(契约测试据此判定「某码是否漏配正文」)。 */
+export const BRIDGE_ERROR_FALLBACK = "系统暂时不可用，请稍后重试。";
+
 export function friendlyBridgeErrorMessage(code: unknown, message?: string): string {
   const n = normalizeBridgeErrorCode(code);
-  if (n === "insufficient_credits") return "余额不足，充值后即可继续使用。";
-  if (n === "unauthorized_model") return "当前账号尚未开通这个模型，请切换模型或联系管理员。";
-  if (n === "maintenance") return "服务正在维护中，请稍后再试。";
-  // ── 模型权威 gate 的拒帧(bridge / egress;方案 §4 R3-m12)────────────────────────
-  // 这四个码此前没有用户向文案，全部落进下面的通用兜底「系统暂时不可用」——用户既不知道
-  // 发生了什么，也不知道能不能重发（config_changed 明明是**可原样重发**的）。
-  // 闭环靠既有入口：出错时 reducer 会把本轮那条用户消息置为 status='error'，用户气泡下方
-  // 就带「重试」按钮（cards.tsx onRetrySend，复用原 payload 含附件原地重发），文案直接指向它。
-  if (n === "model_config_changed_retry_turn")
-    return "平台的模型配置刚刚更新，本轮已停止（不计费）。你的消息没有丢：点它下方的「重试」即可原样重发。";
-  if (n === "model_not_available")
-    return "这个模型当前不可用（已下架或未对你的账号开通），请在上方切换一个模型后重发。";
-  if (n === "unresolved_agent_model")
-    return "没能确定本轮要用的模型，请在上方选择模型后重发。";
-  if (n === "model_authority_unavailable" || n === "model_catalog_unavailable")
-    return "模型配置正在同步，请稍后点「重试」重发本条消息。";
-  // 遗留兼容文案(新 bridge 不再发该帧):如实告知会自动恢复,不再误导用户手动刷新。
-  if (n === "conn_kicked") return "连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。";
-  if (n === "codex_turn_busy") return "上一轮任务仍在运行，请等它结束后再发送。";
-  if (n === "codex_pool_busy") return "账号池繁忙，请稍后重试。";
-  if (n === "codex_route_unavailable" || n === "codex_unavailable")
-    return "GPT 服务暂时不可用，你的消息已保留，请稍后重试。";
-  if (n === "codex_billing") return "计费服务暂时不可用，本轮未开始，请稍后重试。";
-  if (n === "rate_limited") return "请求暂时较多，请稍后直接重试本条消息。";
-  if (n === "upstream_failed") return "任务执行暂时中断，你的消息已保留，可直接重试。";
-  if (n === "session_persist_unavailable")
-    return "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。";
-  // 未知码:回友好通用文案,不把裸技术消息(如 "server shutting down")抛给用户。
-  return "系统暂时不可用，请稍后重试。";
+  // 服务端 message 白名单透传(任务①):仅当该码 allowPublicServerMessage===true 且 message 过
+  // 展示守卫(≤200 字符、非 JSON/堆栈形态)→ 直显服务端原因(如 container_outdated 的具体指路、
+  // image_upstream_rejected 的审核说明);否则一律回按码文案,绝不把裸技术串抛给用户。
+  if (typeof message === "string" && isKnownTurnErrorCode(n)) {
+    if (turnErrorSemantics(n).allowPublicServerMessage && isDisplayableServerMessage(message)) {
+      return message;
+    }
+  }
+  if (isKnownTurnErrorCode(n)) return BRIDGE_ERROR_MESSAGES[n];
+  // codex_unavailable 是历史别名(非 taxonomy 码),与 route_unavailable 同义。
+  if (n === "codex_unavailable") return BRIDGE_ERROR_MESSAGES.codex_route_unavailable;
+  return BRIDGE_ERROR_FALLBACK;
 }
 
 /**
@@ -677,26 +732,23 @@ export function safeBridgeErrorDetail(code: unknown, traceId?: unknown): string 
   return trace ? `${summary}\n请求编号：${trace}` : summary;
 }
 
-/** 预期业务态错误码：不自动上报（websocket.js:4038）。*/
-export const EXPECTED_TURN_ERR_CODES = new Set([
-  "insufficient_credits",
-  "unauthorized_model",
-  "maintenance",
-  // 模型配置在 turn 中途变更（admin 改价/停用/调权限）→ 拒本轮 + 引导重发：是**预期业务态**，
-  // 不是故障（一次 admin 改配置会让所有在途 turn 各上报一次，污染错误监控口径）。
-  // 同理 model_not_available = 模型下架/未开通（与 unauthorized_model 同类）。
-  // **不含** model_authority_unavailable / model_catalog_unavailable：那两个是 catalog 拉不起来
-  // 的基建故障，必须上报告警。
-  "model_config_changed_retry_turn",
-  "model_not_available",
-  // 连接态瞬态(遗留残帧才会出现):部署/踢连接不是 turn 故障,不进错误监控
-  // (曾经每次发版让所有 mid-turn 客户端各上报一次,污染口径)。
-  "conn_kicked",
-  "codex_turn_busy",
-  "codex_pool_busy",
-  "codex_route_unavailable",
-  "codex_container_recycled",
-]);
+/**
+ * 预期业务态错误码(**展示语义**:对单用户是正常业务分支,非故障)。**从 protocol 单一权威派生**
+ * (TURN_ERROR_TAXONOMY 中 expected===true,见 EXPECTED_TURN_ERROR_CODES)。含
+ * rate_limited/model_capacity/service_restart/image_server_busy 等"对用户预期、但对平台是运营
+ * 信号"的码 —— 它们仍**要进遥测**,故上报口径**不用本集合**,改用下方 REPORT_EXEMPT。
+ * ⚠️ 遥测抑制请勿用本集合(那是历史误用,Codex 审计 R5c 已拆分);本集合供展示/交互语义消费。
+ */
+export const EXPECTED_TURN_ERR_CODES: ReadonlySet<string> = EXPECTED_TURN_ERROR_CODES;
+
+/**
+ * **遥测豁免**错误码:reducer 上报 turn_error 时抑制这些码(reportTurnError 不发)。**从 protocol
+ * 单一权威派生**(TURN_ERROR_TAXONOMY 中 reportable===false,见 REPORT_EXEMPT_TURN_ERROR_CODES)。
+ * **与 expected 解耦**(Codex 审计 R5c 裁定):只有用户主动行为(stopped/user_cancelled)与纯业务
+ * 规则拒绝(insufficient_credits/未开通/配置变更/维护/连接踢出/codex_* 遗留)才豁免;
+ * rate_limited/model_capacity/service_restart/image_server_busy 恢复上报(平台运营故障信号)。
+ */
+export const REPORT_EXEMPT_TURN_ERR_CODES: ReadonlySet<string> = REPORT_EXEMPT_TURN_ERROR_CODES;
 
 // ═══════════════ 流式行身份（server canonical id upsert，websocket.js:606）═══════════════
 

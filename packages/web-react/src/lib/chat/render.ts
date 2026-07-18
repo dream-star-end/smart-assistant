@@ -10,8 +10,15 @@
  *  3. 折叠态默认值（thinking 完成折叠 / agent-group 运行展开完成折叠），用户显式切换
  *     后由组件本地 state 锁定，不被签名重渲覆盖。
  */
+import {
+  isDisplayableServerMessage,
+  normalizeTurnErrorCode,
+  turnErrorSemantics,
+  WAIVED_TURN_ERROR_CODES,
+} from "@openclaude/protocol";
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage, ChildBlock } from "./model";
+import { friendlyBridgeErrorMessage } from "./pure";
 
 /**
  * 隐藏审查员(平台内置、管理 API 404 隐藏的系统 agent)的 agentId —— 单一权威。
@@ -268,50 +275,79 @@ export function defaultCollapsed(
 export const CONTINUE_PROMPT =
   "请接着上一条回复被截断的位置继续完成，不要重复已写过的内容，直接续写。";
 
-/** 归一化错误码 → 用户可读中文标题。未知码回退原码（仍可读、可反馈）。 */
+/**
+ * 归一化错误码 → 用户可读中文**标题**表。**key 集合与 protocol TURN_ERROR_TAXONOMY 对齐**
+ * (契约测试 turnErrorTaxonomy.contract 锁死每码有标题,防漂移);正文在 pure.ts
+ * BRIDGE_ERROR_MESSAGES(同源同 key,另一权威)。标题=类别,「怎么办」在正文。未知码回退「出错了」。
+ */
 const ERROR_LABELS: Record<string, string> = {
+  // ── 计费/配额 ──
   insufficient_credits: "积分余额不足",
   rate_limited: "请求过于频繁，请稍后再试",
-  context_too_long: "上下文超长，请精简或开新会话",
-  upstream_error: "模型服务暂时不可用",
+  // ── 上游模型服务 ──
+  model_capacity: "模型繁忙",
+  upstream_failed: "模型服务暂时中断",
   upstream_timeout: "模型响应超时",
   network_error: "网络异常，请重试",
-  service_restart: "服务重启，本轮已中断",
-  conn_kicked: "连接已断开",
-  maintenance: "服务维护中",
-  unauthorized_model: "模型未开通",
-  unauthorized: "登录已失效",
-  // 模型权威 gate 的拒帧(方案 §4 R3-m12)。标题=类别,「怎么办」在 friendlyBridgeErrorMessage。
-  model_config_changed_retry_turn: "模型配置已更新，请重发",
-  model_not_available: "模型不可用",
-  unresolved_agent_model: "未能确定模型",
-  model_authority_unavailable: "模型服务暂时不可用",
-  model_catalog_unavailable: "模型服务暂时不可用",
-  stopped: "已停止本轮生成",
+  context_too_long: "上下文超长，请精简或开新会话",
+  bad_request: "请求无法处理",
+  // ── 引擎/平台执行 ──
+  engine_error: "任务执行失败",
   internal_error: "服务内部错误",
   auth_error: "认证状态异常",
-  engine_error: "任务执行失败",
+  service_restart: "服务重启，本轮已中断",
+  session_persist_unavailable: "消息暂未安全送达",
+  stopped: "已停止本轮生成",
+  user_cancelled: "已取消本轮",
+  runner_crashed: "执行环境异常中断",
+  // ── 免单类 ──
   model_authority_expired: "本轮已自动免单",
   liveness_timeout: "本轮已自动免单",
   idle_timeout: "本轮已自动免单",
   no_response: "本轮已自动免单",
   phantom_turn: "本轮已自动免单",
   turn_limit: "本轮已自动免单",
+  // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
+  model_config_changed_retry_turn: "模型配置已更新，请重发",
+  model_not_available: "模型不可用",
+  unresolved_agent_model: "未能确定模型",
+  model_authority_unavailable: "模型服务暂时不可用",
+  model_catalog_unavailable: "模型服务暂时不可用",
+  unauthorized_model: "模型未开通",
+  // ── 连接/环境 ──
+  unauthorized: "登录已失效",
+  maintenance: "服务维护中",
+  conn_kicked: "连接已断开",
+  container_outdated: "运行环境已更新，请刷新页面",
+  err_container: "运行环境异常",
+  err_container_timeout: "运行环境响应超时",
+  err_internal: "服务内部错误",
+  forbidden: "操作被拒绝",
+  err_frame_too_big: "内容过大",
+  bad_json: "数据格式异常",
+  bad_sequence: "消息时序异常",
+  unknown_control: "未知控制指令",
+  // ── 媒体/子系统 ──
+  image_upstream_rejected: "图片生成被拒绝",
+  image_server_busy: "图片服务繁忙",
+  voice_upstream_error: "语音识别失败",
+  voice_timeout: "语音识别超时",
+  // ── 遗留兼容 ──
+  codex_turn_busy: "上一轮仍在进行",
+  codex_pool_busy: "账号池繁忙",
+  codex_route_unavailable: "服务暂时不可用",
+  codex_container_recycled: "环境已重建",
+  codex_billing: "计费服务暂时不可用",
+  upstream_error: "模型服务暂时不可用",
 };
 export function errorLabel(code: string | undefined): string {
-  if (!code) return "出错了";
-  // 未知码回退友好"出错了"(不再把裸码 err_xxx 抛给用户;原始码/消息在「查看详情」)。
-  return ERROR_LABELS[code.trim().toLowerCase()] ?? "出错了";
+  // 归一化(legacy 大写码经 normalizeTurnErrorCode → 语义码)后查表;未知码回退友好「出错了」
+  // (不再把裸码 err_xxx 抛给用户;原始码/消息在「查看详情」)。
+  return ERROR_LABELS[normalizeTurnErrorCode(code)] ?? "出错了";
 }
 
-const WAIVED_ERROR_CODES = new Set([
-  "model_authority_expired",
-  "liveness_timeout",
-  "idle_timeout",
-  "no_response",
-  "phantom_turn",
-  "turn_limit",
-]);
+/** 免单类错误码集合:**从 protocol 单一权威派生**(TURN_ERROR_TAXONOMY 中 waivable===true)。 */
+const WAIVED_ERROR_CODES = WAIVED_TURN_ERROR_CODES;
 
 function requestReference(...values: Array<string | undefined>): string | undefined {
   for (const value of values) {
@@ -332,9 +368,45 @@ function looksLikeInternalError(value: string | undefined): boolean {
   );
 }
 
+/**
+ * 「查看详情」detail 统一守卫(Codex 审计 R7)。新 tape 码(model_capacity 等)可能携带 Codex 的
+ * JSON errorDetail;若无条件透传就会绕过 engine_error 特判直接进 <pre> 外泄。规则:
+ *   - 终止器短 prose([turn failed: …] / [error] …)是可读排查线索 → 保留;
+ *   - JSON 信封 / 堆栈 / 内部串(looksLikeInternalError)→ 脱敏,只保留可提取的请求 ID;
+ *   - 其余普通说明(白名单服务端 message 亦属此类,非内部串)→ 原样保留(不受影响)。
+ */
+function sanitizeErrorDetail(detail: string | undefined): string | undefined {
+  const d = detail?.trim();
+  if (!d) return undefined;
+  if (/^\[(?:turn failed|error)\b/i.test(d)) return d;
+  if (looksLikeInternalError(d)) {
+    const ref = requestReference(d);
+    return ref ? `请求 ID：${ref}` : undefined;
+  }
+  return d;
+}
+
+/**
+ * 从正文尾部切出 tape 兼容终止器([turn failed: …] / [error] …)。tape 把它作为兼容 final
+ * 追加到最后一个 assistant segment 的 text 尾,合法部分回答与终止器常同串:
+ *   "…正常部分回答…\n\n[turn failed: …]\n"
+ * 返回 { body: 终止器前的正文(trim), terminator: 终止器串(trim) };无终止器 → body=原串、terminator=""。
+ */
+function splitTrailingTerminator(text: string): { body: string; terminator: string } {
+  const m = /\n*[ \t]*(\[(?:turn failed|error)\b[^\n]*)\s*$/i.exec(text);
+  if (!m) return { body: text, terminator: "" };
+  return { body: text.slice(0, m.index).trim(), terminator: m[1].trim() };
+}
+
 export type ErrorPresentation = {
   title: string;
   message: string;
+  /**
+   * 失败轮里模型已产出的**合法部分回答**正文(Codex 审计 R6)。tape 水合把 _errorCode 挂在最后一个
+   * assistant segment,其 text 可能同时携带正常部分回答;此字段承载那段正文,由 AssistantCard 用
+   * Markdown 正常渲染,红卡(message=按码文案)在其下方,复刻 live 双卡形态。无部分回答时缺省。
+   */
+  bodyText?: string;
   detail?: string;
   waived: boolean;
 };
@@ -346,7 +418,7 @@ export function errorPresentation(
   detail: string | undefined,
   waiverApplied = false,
 ): ErrorPresentation {
-  let normalized = code?.trim().toLowerCase() ?? "";
+  let normalized = normalizeTurnErrorCode(code);
   if (/MODEL_AUTHORITY_INVALID|MODEL_AUTHORITY_EXPIRED/i.test(`${code ?? ""}\n${text ?? ""}\n${detail ?? ""}`)) {
     normalized = "model_authority_expired";
   }
@@ -390,7 +462,10 @@ export function errorPresentation(
       waived: false,
     };
   }
-  if (normalized === "engine_error" && (looksLikeInternalError(text) || looksLikeInternalError(detail))) {
+  // engine_error 且**正文本身**是 JSON/堆栈内部串 → 收敛为友好内部错误文案(把内部转储当"答复"
+  // 甩给用户是最刺眼的一类)。**只看 text**(不再因 detail 内部就命中):若 text 是合法部分回答、
+  // 仅 detail 是内部串,应落到下方 R6 分支保住部分回答(detail 交由 sanitizeErrorDetail 脱敏)。
+  if (normalized === "engine_error" && looksLikeInternalError(text)) {
     return {
       title: ERROR_LABELS.engine_error,
       message: "任务执行时遇到内部错误。你的消息已保留，可以直接重试。",
@@ -398,10 +473,39 @@ export function errorPresentation(
       waived: false,
     };
   }
+  // ── 兜底分支:区分「终止器/内部串」「合法部分回答」「空」三类 text(任务②ﾠ+ Codex 审计 R6)──
+  // 历史上这里直接把 msg.text 当正文,tape 终止器(「[turn failed: …]」/「[error] server shutting
+  // down」)、平台内部串会原样甩给用户;更早的整改又把**合法部分回答**一并降进 detail(刷新后消失)。
+  // 现在:仅当 text 正是**该码已知友好文案**或**白名单服务端 message**时原样作正文;否则切出尾部终止
+  // 器,前半段若是合法部分回答 → 进 bodyText(AssistantCard 正常 Markdown 渲染)、红卡正文用按码文案;
+  // 终止器/内部串按 R7 守卫决定去留,detail 一律过 sanitizeErrorDetail。
+  const t = text?.trim() ?? "";
+  const byCode = friendlyBridgeErrorMessage(normalized); // 纯按码正文(不喂 message,避免 server-msg 自反)
+  const safeDetail = sanitizeErrorDetail(detail); // R7:统一守卫 _errorDetail(JSON/堆栈脱敏,保留请求 ID)
+  // [turn failed …] / [error] … 是 tape 终止器(以 [ 开头,已被 looksLikeInternalError 命中),显式列出
+  // 仅为可读;serverMsgOk = 该码白名单且 message 过展示守卫(必非 [ 开头,故与 raw 互斥)。
+  const isRaw = !t || looksLikeInternalError(t) || /^\[(?:turn failed|error)\b/i.test(t);
+  const sem = turnErrorSemantics(normalized);
+  const serverMsgOk = sem.allowPublicServerMessage === true && isDisplayableServerMessage(t);
+  const keepText = !isRaw && (t === byCode || serverMsgOk);
+  if (keepText) {
+    return {
+      title: errorLabel(normalized),
+      message: t,
+      ...(safeDetail ? { detail: safeDetail } : {}),
+      waived: false,
+    };
+  }
+  // R6:切出尾部终止器,前半段若是合法部分回答(非空、非内部串) → 作 bodyText 正常渲染,红卡在其下方。
+  const { body: preTerminator, terminator } = splitTrailingTerminator(t);
+  const partialAnswer = preTerminator && !looksLikeInternalError(preTerminator) ? preTerminator : "";
+  // detail 优先级:已脱敏的原 _errorDetail > 终止器排查线索 > 无。真正的 JSON 信封/堆栈已被 R7 隐去。
+  const detailOut = safeDetail ?? (terminator || undefined);
   return {
-    title: errorLabel(code),
-    message: text?.trim() || "本轮未正常完成，请重试。",
-    ...(detail?.trim() ? { detail: detail.trim() } : {}),
+    title: errorLabel(normalized),
+    message: byCode,
+    ...(partialAnswer ? { bodyText: partialAnswer } : {}),
+    ...(detailOut ? { detail: detailOut } : {}),
     waived: false,
   };
 }

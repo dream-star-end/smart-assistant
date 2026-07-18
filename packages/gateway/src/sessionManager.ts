@@ -55,6 +55,8 @@ import {
   type OutboundContentBlock,
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
+import { classifyRunError } from './errorClassify.js'
+import type { GatewayTurnPhase } from './ccbMessageParser.js'
 import {
   type ExecutionTarget,
   type RemoteTargetController,
@@ -64,6 +66,23 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
 
 const log = createLogger({ module: 'sessionManager' })
+
+/**
+ * generic 引擎失败(非 auth、非 terminalOverride 控制码)的 tape errorCode 细分。
+ *
+ * 命中 classifyRunError 的语义码就落**小写语义码**(model_capacity /
+ * rate_limited / upstream_failed / insufficient_credits),让回看/遥测能区分
+ * 失败种类;未命中保持历史 `'ENGINE_ERROR'`(值域不变,零迁移)。
+ *
+ * **大写控制码路径(AUTH_ERROR / NO_RESPONSE / PHANTOM_TURN / IDLE_TIMEOUT /
+ * LIVENESS_TIMEOUT / TURN_LIMIT / USER_CANCELLED …)不经本函数** —— 免单查询
+ * (internalTurnWaive)按大写码精确匹配存量,细分只作用于原本会写 'ENGINE_ERROR'
+ * 的那一支。`_` 前缀 = 契约测试 seam。
+ */
+export function _tapeErrorCodeForGenericFailure(detail: string | undefined): string {
+  const cls = classifyRunError(detail)
+  return cls.code === 'unknown' ? 'ENGINE_ERROR' : cls.code
+}
 
 /**
  * 缺省 agent 工作目录(agent 未显式 pin cwd 时用)。
@@ -325,20 +344,22 @@ export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
  * 抽成 pure function 是为了让阈值选择策略锁在测试里 —— 防止以后有人无意识地
  * 把 OR 分支"清理"掉退回 5min 单档,从而再次让 compacting 期间被误杀。
  *
+ * compacting 与 retrying(自动重试等待期)同属"turn 仍在工作但暂无 token"的
+ * 非流式阶段,都取长档阈值,不被 idle watchdog 误杀。
+ *
  * Live watchdog 调用点见本文件 `submit()` 内 livenessTimer。
  */
 export function pickIdleTimeoutMs(
-  currentTurnStatus: 'compacting' | null | undefined,
+  currentTurnStatus: GatewayTurnPhase | undefined,
   pendingToolCalls: number,
   /** M1a:providerTag 泛化为 engine id('ccb' | 'codex')。codex 判定从旧
    *  'codex-native'(provider 语义)改为 'codex'(engine 语义),真值表不变。 */
   engineId?: string,
 ): number {
-  if (
-    pendingToolCalls > 0 ||
+  const inNonStreamingPhase =
     currentTurnStatus === 'compacting' ||
-    engineId === 'codex'
-  ) {
+    (typeof currentTurnStatus === 'object' && currentTurnStatus !== null)
+  if (pendingToolCalls > 0 || inNonStreamingPhase || engineId === 'codex') {
     return IDLE_TIMEOUT_TOOL_MS
   }
   return IDLE_TIMEOUT_DEFAULT_MS
@@ -527,17 +548,19 @@ export interface AgentSession {
   /**
    * 当前 turn 的 backend-side 非流式阶段状态。
    *
-   * 当前唯一非 null 值是 `'compacting'` —— CCB auto/manual compact 期间走单独
-   * LLM 调用,这段时间不产生 assistant token,前端如果只看流量会以为卡死。
-   * server.ts 在收到 `kind:'turn_status'` 事件时更新此 cache 并 deliver 帧;
-   * turn 终态(final/error)清回 null。autoResumeFromHello 在 ring replay
-   * 之后,如果 runner 仍在跑且 cache !== null,补发一帧给重连的客户端
-   * (兜底 ring eviction 导致原 compact_start 帧已被冲掉的情况)。
+   * 非 null 值有两类:`'compacting'`(CCB auto/manual compact 期间走单独 LLM
+   * 调用,这段时间不产生 assistant token)与 `{status:'retrying', retry}`
+   * (codex 自动重试等待期)。两者都是"turn 仍在工作但暂无 token"的阶段态,
+   * 前端如果只看流量会以为卡死。server.ts 在收到 `kind:'turn_status'` 事件时
+   * 更新此 cache 并 deliver 帧;turn 终态(final/error)清回 null。
+   * autoResumeFromHello 在 ring replay 之后,如果 runner 仍在跑且 cache 非空,
+   * 补发一帧给重连的客户端(兜底 ring eviction 导致原阶段帧已被冲掉的情况;
+   * retrying 补发时按缓存的 retry.retryAt 让前端重算剩余倒计时)。
    *
-   * 不持久化、不跨进程 —— gateway 重启后默认 null(下次 compact_start 自然
-   * 把它推到 'compacting',不依赖任何持久状态)。
+   * 不持久化、不跨进程 —— gateway 重启后默认 null(下次阶段帧自然把它推回对应
+   * 状态,不依赖任何持久状态)。
    */
-  currentTurnStatus?: 'compacting' | null
+  currentTurnStatus?: GatewayTurnPhase
   /**
    * Active turn count — number of in-flight `submit()` promises for this session.
    *
@@ -4495,7 +4518,9 @@ export class SessionManager {
                   ? {
                       errorCode:
                         terminalOverride?.errorCode ??
-                        (result.errorKind === 'auth' ? 'AUTH_ERROR' : 'ENGINE_ERROR'),
+                        (result.errorKind === 'auth'
+                          ? 'AUTH_ERROR'
+                          : _tapeErrorCodeForGenericFailure(result.errorDetail)),
                       errorDetail:
                         terminalOverride?.reason ??
                         result.errorDetail ??
@@ -4584,7 +4609,17 @@ export class SessionManager {
           // terminal completion until the authoritative master ACKs it.
           if (persistenceAcknowledged) {
             if (terminalErrorForClient) {
-              onEvent({ kind: 'error', error: terminalErrorForClient })
+              // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的
+              // buildTurnSummary 从 TurnResult 复制),直读即可 —— 不再 cast 穿透,
+              // 也不再靠 server 侧重新正则解析 errorDetail 兜底。runner 预分类在场
+              // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
+              // server 侧回落 classifyRunError,行为不变。
+              const preClassified = result?.errorClass
+              onEvent({
+                kind: 'error',
+                error: terminalErrorForClient,
+                ...(preClassified ? { errorClass: preClassified } : {}),
+              })
             } else if (pendingFinal) {
               onEvent(pendingFinal)
             }

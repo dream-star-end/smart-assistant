@@ -5,7 +5,11 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { classifyDelegateOutputError, classifyRunError } from '../errorClassify.js'
+import {
+  classifiedMessageForCode,
+  classifyDelegateOutputError,
+  classifyRunError,
+} from '../errorClassify.js'
 
 describe('classifyRunError', () => {
   it('insufficient_credits: anthropicProxy 402 INSUFFICIENT_CREDITS', () => {
@@ -36,14 +40,85 @@ describe('classifyRunError', () => {
     assert.equal(r.code, 'upstream_failed')
   })
 
+  it('upstream_failed: 通用 5xx(500/511/599,审计 R1 不再只认 50[234])', () => {
+    // 审计 R1:`\b5\d{2}\b` 覆盖全部 5xx。逐个钉死此前会漏成 unknown 的码。
+    assert.equal(classifyRunError('500 Internal Server Error').code, 'upstream_failed')
+    assert.equal(classifyRunError('gateway said 511 Network Authentication Required').code, 'upstream_failed')
+    assert.equal(classifyRunError('HTTP 599 from relay').code, 'upstream_failed')
+  })
+
+  it('upstream_failed: 边界不误伤嵌字词数字(审计 R1,与旧 \\b50[234]\\b 同量级)', () => {
+    // "523ms" 里 3 与 m 之间无 \b → 不命中 5xx 档 → 保持 unknown(误伤面不扩大)。
+    assert.equal(classifyRunError('request took 523ms then failed with TypeError').code, 'unknown')
+  })
+
   it('upstream_failed: ECONNRESET', () => {
     const r = classifyRunError('socket hang up: ECONNRESET')
     assert.equal(r.code, 'upstream_failed')
   })
 
+  it('upstream_failed: ECONNREFUSED / EAI_AGAIN(审计 R1 补网络错误)', () => {
+    assert.equal(classifyRunError('connect ECONNREFUSED 127.0.0.1:443').code, 'upstream_failed')
+    assert.equal(classifyRunError('getaddrinfo EAI_AGAIN api.anthropic.com').code, 'upstream_failed')
+  })
+
   it('upstream_failed: ACCOUNT_POOL_BUSY', () => {
+    // "all accounts busy" 里的 "busy" 不带前置 "model" → 不误判 model_capacity,
+    // 仍归 upstream(词族边界回归)。
     const r = classifyRunError('ACCOUNT_POOL_BUSY: all accounts busy')
     assert.equal(r.code, 'upstream_failed')
+  })
+
+  it('model_capacity: at capacity + try a different model', () => {
+    const r = classifyRunError('Selected model is at capacity. Please try a different model.')
+    assert.equal(r.code, 'model_capacity')
+    assert.equal(r.message, '模型繁忙,请稍后重试或切换模型')
+  })
+
+  it('model_capacity: overloaded', () => {
+    assert.equal(classifyRunError('model is overloaded').code, 'model_capacity')
+  })
+
+  it('model_capacity: model ... busy', () => {
+    assert.equal(
+      classifyRunError('The model is currently busy, retry shortly').code,
+      'model_capacity',
+    )
+  })
+
+  it('model_capacity: capacity limit exceeded', () => {
+    assert.equal(classifyRunError('capacity limit exceeded for this deployment').code, 'model_capacity')
+  })
+
+  it('model_capacity 优先于 upstream:529 Overloaded', () => {
+    // Anthropic 529 "Overloaded" 串含 overloaded → 命中容量档(排在 upstream 之前)。
+    assert.equal(
+      classifyRunError('529 {"type":"error","error":{"type":"overloaded_error"}}').code,
+      'model_capacity',
+    )
+  })
+
+  it('裸 529 → model_capacity(审计 R1:Anthropic 529=overloaded,容量语义)', () => {
+    // 审计 R1 改判:529 是 Anthropic overloaded 状态码,语义=容量满载(可重试/
+    // 可换模型),故显式命中容量档(排在通用 5xx upstream 之前),不再落 unknown。
+    assert.equal(classifyRunError('HTTP 529 returned by gateway').code, 'model_capacity')
+    // 与词族命中同码时 message 一致。
+    assert.equal(
+      classifyRunError('HTTP 529 returned by gateway').message,
+      classifiedMessageForCode('model_capacity'),
+    )
+  })
+
+  it('classifiedMessageForCode 与 PATTERNS 同源(无平行文案表)', () => {
+    assert.equal(classifiedMessageForCode('model_capacity'), '模型繁忙,请稍后重试或切换模型')
+    assert.equal(classifiedMessageForCode('rate_limited'), '当前账号被限流,请稍后再试')
+    assert.equal(classifiedMessageForCode('insufficient_credits'), '余额不足,请充值后继续')
+    assert.equal(classifiedMessageForCode('upstream_failed'), 'Anthropic 上游异常,请稍后重试')
+    // classifyRunError 命中同码时,message 与 classifiedMessageForCode 完全一致。
+    assert.equal(
+      classifyRunError('model is overloaded').message,
+      classifiedMessageForCode('model_capacity'),
+    )
   })
 
   it('unknown: 普通运行时错误', () => {

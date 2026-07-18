@@ -25,7 +25,35 @@ import type {
   OutboundContentBlock,
   ToolTerminationReason,
 } from '@openclaude/protocol'
+import type { ClassifiedErrorCode } from '../errorClassify.js'
 export type { DurableRuntimeEvent } from '@openclaude/protocol'
+
+/**
+ * 自动重试侧信道载荷 —— turn_status='retrying' 形态携带(见 EngineTurnPhase)。
+ * 不进 tape、不持久化,断线重连由 retryAt(下一次尝试的绝对 epoch ms)重算倒计时。
+ * 字段语义与 protocol frames.ts OutboundTurnStatus 的 retrying 分支逐字段对齐。
+ *
+ * 审计 R3:此前作为 gateway 本地加宽类型定义在 ccbMessageParser.ts,经受控 cast
+ * 跨 engine/ 边界。现上提为 engine 权威事件类型的一部分(ccbMessageParser 保留
+ * `TurnRetryMeta` re-export 兼容存量 import)。
+ */
+export interface TurnRetryMeta {
+  attempt: number
+  max: number
+  delayMs: number
+  retryAt: number
+}
+
+/**
+ * turn 非流式阶段态(EngineContentEvent.turn_status 的取值)。
+ *   - `'compacting'` / `null`:底座原生非流式状态(CCB setSDKStatus 侧信道)。
+ *   - `{status:'retrying', retry}`:codex runner turn/start 窄路径自动重试的排定
+ *     侧信道(gateway 语义,不进 tape)。
+ *
+ * 审计 R3:retrying 形态此前是 ccbMessageParser 的本地加宽(GatewayTurnPhase)+
+ * 受控 cast;现正式进权威事件类型,parser / server / sessionManager 不再 cast。
+ */
+export type EngineTurnPhase = 'compacting' | null | { status: 'retrying'; retry: TurnRetryMeta }
 
 /** Permission request from the engine (CCB: stdio control_request protocol) */
 export interface PermissionRequest {
@@ -145,13 +173,18 @@ export interface EngineFinalMeta {
 export type EngineContentEvent =
   | { kind: 'block'; block: OutboundContentBlock }
   | { kind: 'final'; meta?: EngineFinalMeta }
-  | { kind: 'error'; error: string }
+  // 审计 R3:error 事件可携带 runner 现场预分类的 errorClass(codex classifyRunError
+  // 产物;CCB 缺省不带)。server.ts 据此直接按码组 outbound.error,省一次原文正则;
+  // 缺省 undefined → 回落 classifyRunError,行为不变。此前是 ccbMessageParser 的本地
+  // 加宽(GatewayStreamEvent)+ 边界 cast,现上提进权威类型。
+  | { kind: 'error'; error: string; errorClass?: ClassifiedErrorCode }
   | { kind: 'permission_request'; request: PermissionRequest }
-  // 当前 turn 的 backend-side 非流式阶段状态(目前仅 'compacting' / null)。
-  // CCB 由 stdout `{type:'system', subtype:'status', status:'compacting'|null}`
-  // 触发,gateway 上层包装成 `outbound.turn_status` 帧推给前端。受控枚举,
-  // 不透传任意底座内部状态 —— 防协议被底座私有状态污染。
-  | { kind: 'turn_status'; status: 'compacting' | null }
+  // 当前 turn 的 backend-side 非流式阶段状态。CCB 由 stdout
+  // `{type:'system', subtype:'status', status:'compacting'|null}` 触发;codex runner
+  // 另注入 `retrying` 形态(见 EngineTurnPhase)。gateway 上层包装成
+  // `outbound.turn_status` 帧推给前端。受控枚举,不透传任意底座内部状态 —— 防协议
+  // 被底座私有状态污染。审计 R3:retrying 形态已进权威类型,不再经 cast 穿透。
+  | { kind: 'turn_status'; status: EngineTurnPhase }
 
 /**
  * EngineAdapter → sessionManager 的 canonical 事件模型。
@@ -240,6 +273,12 @@ export interface TurnSummary {
    *  错误字符串是底座私有知识(CCB: AUTH_KEYWORDS_RE / AUTH_ERROR_PREFIX_RE),
    *  分类逻辑下沉在各 adapter 内。 */
   errorKind?: 'auth' | 'model_authority' | 'other'
+  /** 审计 R3 — runner 现场对 error 文本的结构化分类(codex classifyRunError 产物,
+   *  非 'unknown' 才带;CCB 缺省不带)。此前 codex 的 errorClass 在 TurnResult →
+   *  TurnSummary 映射时被丢,sessionManager 读到恒 undefined、只靠重新正则解析
+   *  errorDetail 偶然兜住。现正式贯通:各 adapter 的 buildTurnSummary 从 TurnResult
+   *  逐字段复制,sessionManager 直读本字段派生 outbound.error.code。 */
+  errorClass?: ClassifiedErrorCode
   /** Complete engine-reported error object/string, never truncated. */
   errorDetail?: string
   /** 底座报告 --resume/thread id 已失效(CCB: "No conversation found with
