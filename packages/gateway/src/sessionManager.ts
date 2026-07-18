@@ -1223,6 +1223,12 @@ class TurnHardLimitError extends Error {
   }
 }
 
+export interface PromptQueueExecutionFence {
+  readonly sessionKey: string
+  readonly token: symbol
+  release(): void
+}
+
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   /** Queue execution uses the existing promise only as an execution mutex.
@@ -1232,6 +1238,10 @@ export class SessionManager {
   /** Engine switches replace AgentSession objects, so the invariant also needs
    * a stable logical-session fence that survives object replacement attempts. */
   private _promptQueueExecutionKeys = new Set<string>()
+  /** Accepted grants need a fence before getOrCreate() and attachment
+   * preprocessing. The token lets that one queue dispatch adopt/replace its
+   * own session while every legacy or second dispatch fails closed. */
+  private _promptQueueDispatchFences = new Map<string, symbol>()
   /** Shared gate for every submit path during a host-controlled image recycle. */
   private _runtimeRecycleDrainUntil = 0
   private _runtimeRecycleDrainTimer: ReturnType<typeof setTimeout> | null = null
@@ -2119,13 +2129,20 @@ export class SessionManager {
    * callback releases both the lock and reconnect-visible activity count. */
   async beginExternalTurn(
     session: AgentSession,
-    opts?: { queueTurn?: boolean },
+    opts?: { queueTurn?: boolean; queueExecutionFence?: PromptQueueExecutionFence },
   ): Promise<{
     signal: AbortSignal
     finish: (outcome: 'completed' | 'errored') => void
   }> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
     const queueTurn = opts?.queueTurn === true
+    const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
+      session.sessionKey,
+      opts?.queueExecutionFence,
+    )
+    if (opts?.queueExecutionFence && !ownsDispatchFence) {
+      throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: stale queue execution fence')
+    }
     const prev = session.lock
     let release: () => void = () => {}
     this.beginClientTurn(session)
@@ -2135,7 +2152,8 @@ export class SessionManager {
         session._activeTurnCount ?? 0,
         session._activeClientTurnCount ?? 0,
         this._promptQueueExecutions.has(session) ||
-          this._promptQueueExecutionKeys.has(session.sessionKey),
+          this._promptQueueExecutionKeys.has(session.sessionKey) ||
+          (this._promptQueueDispatchFences.has(session.sessionKey) && !ownsDispatchFence),
       )
     } catch (err) {
       this.endClientTurn(session, 'errored')
@@ -2404,6 +2422,47 @@ export class SessionManager {
     return filter ? keys.filter(filter) : keys
   }
 
+  /** Fence the complete accepted-grant window: session lookup/engine switch,
+   * attachment preprocessing, activation, provider execution and settlement.
+   * PG still owns ordering; this token only turns accidental parallel runtime
+   * work into a synchronous invariant failure. */
+  beginPromptQueueExecutionFence(sessionKey: string): PromptQueueExecutionFence {
+    const existing = this.sessions.get(sessionKey)
+    if (
+      this._promptQueueDispatchFences.has(sessionKey) ||
+      this._promptQueueExecutionKeys.has(sessionKey) ||
+      (existing?._activeTurnCount ?? 0) > 0 ||
+      (existing?._activeClientTurnCount ?? 0) > 0
+    ) {
+      throw new Error(
+        'PROMPT_QUEUE_EXECUTION_INVARIANT: logical session already owns runtime work',
+      )
+    }
+    const token = Symbol(`prompt-queue:${sessionKey}`)
+    this._promptQueueDispatchFences.set(sessionKey, token)
+    let released = false
+    return {
+      sessionKey,
+      token,
+      release: () => {
+        if (released) return
+        released = true
+        if (this._promptQueueDispatchFences.get(sessionKey) === token) {
+          this._promptQueueDispatchFences.delete(sessionKey)
+        }
+      },
+    }
+  }
+
+  private _ownsPromptQueueExecutionFence(
+    sessionKey: string,
+    fence: PromptQueueExecutionFence | undefined,
+  ): boolean {
+    return fence !== undefined &&
+      fence.sessionKey === sessionKey &&
+      this._promptQueueDispatchFences.get(sessionKey) === fence.token
+  }
+
   async getOrCreate(opts: {
     sessionKey: string
     agent: AgentDef
@@ -2471,6 +2530,8 @@ export class SessionManager {
      *  既存 session 的 effort 切换走 submit(effortLevel) — 在那里和 turn 入队
      *  原子串行,避免 getOrCreate→submit 之间的窗口期被另一条并发消息覆盖。 */
     effortLevel?: string | null
+    /** Accepted queue grant fence acquired before any session/preflight work. */
+    promptQueueExecutionFence?: PromptQueueExecutionFence
     /**
      * Workload tag → CCB `--workload <tag>` → `cc_workload=<tag>` in the
      * billing-header attribution block. Set this to `'cron'` for
@@ -2500,6 +2561,18 @@ export class SessionManager {
      *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
     usageAttribution?: UsageAttributionTag
   }): Promise<AgentSession> {
+    const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
+      opts.sessionKey,
+      opts.promptQueueExecutionFence,
+    )
+    if (
+      (opts.promptQueueExecutionFence && !ownsDispatchFence) ||
+      (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
+    ) {
+      throw new Error(
+        'PROMPT_QUEUE_EXECUTION_INVARIANT: queue preflight owns this logical session',
+      )
+    }
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
@@ -2538,7 +2611,10 @@ export class SessionManager {
           ? engineId
           : existing.providerTag
       if (existing.providerTag !== desiredEngine) {
-        if (this._promptQueueExecutionKeys.has(opts.sessionKey)) {
+        if (
+          this._promptQueueExecutionKeys.has(opts.sessionKey) ||
+          (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
+        ) {
           throw new Error(
             'PROMPT_QUEUE_EXECUTION_INVARIANT: engine switch cannot replace an active queue session',
           )
@@ -2842,6 +2918,8 @@ export class SessionManager {
           traceId?: string
         }): Promise<void>
       }
+      /** Token returned by beginPromptQueueExecutionFence(). */
+      queueExecutionFence?: PromptQueueExecutionFence
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -2901,12 +2979,20 @@ export class SessionManager {
     const desiredToolsets = normalizeToolsetListForCompare(opts?.toolsets)
 
     const queueTurn = opts?.queueLifecycle !== undefined
+    const ownsDispatchFence = this._ownsPromptQueueExecutionFence(
+      session.sessionKey,
+      opts?.queueExecutionFence,
+    )
+    if (opts?.queueExecutionFence && !ownsDispatchFence) {
+      throw new Error('PROMPT_QUEUE_EXECUTION_INVARIANT: stale queue execution fence')
+    }
     assertPromptQueueExecutionAdmission(
       queueTurn,
       session._activeTurnCount ?? 0,
       session._activeClientTurnCount ?? 0,
       this._promptQueueExecutions.has(session) ||
-        this._promptQueueExecutionKeys.has(session.sessionKey),
+        this._promptQueueExecutionKeys.has(session.sessionKey) ||
+        (this._promptQueueDispatchFences.has(session.sessionKey) && !ownsDispatchFence),
     )
 
     const prev = session.lock

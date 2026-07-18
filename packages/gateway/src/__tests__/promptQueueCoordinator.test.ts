@@ -16,6 +16,7 @@ import {
 import {
   PROMPT_QUEUE_DISPATCH_RESULT_TYPE,
   PromptQueueCoordinator,
+  type PromptQueueDispatchControl,
   type PromptQueueDispatchRequest,
   type PromptQueueSessionContext,
 } from '../promptQueueCoordinator.js'
@@ -190,6 +191,7 @@ describe('PromptQueueCoordinator claimed execution', () => {
   for (const engine of ['ccb', 'codex'] as const) {
     test(`${engine} activates only after the real reservation and preserves attachments`, async () => {
       const h = lifecycleHarness(engine)
+      const commercialControls: PromptQueueDispatchControl[] = []
       try {
         await h.coordinator.hello(context, {})
         assert.equal(h.directs[0]?.version, '1')
@@ -199,7 +201,14 @@ describe('PromptQueueCoordinator claimed execution', () => {
           (h.dispatches[0]?.item.content.media as Array<{ url: string }>)[0]?.url,
           mediaUrl,
         )
-        const lifecycle = h.coordinator.acceptGrant(context, marker(h.dispatches[0]!))
+        const lifecycle = h.coordinator.acceptGrant(
+          context,
+          marker(h.dispatches[0]!),
+          (frame) => {
+            commercialControls.push(frame)
+            return true
+          },
+        )
         assert.ok(lifecycle)
         await lifecycle.onTurnReserved({
           turnIndex: 9,
@@ -216,6 +225,15 @@ describe('PromptQueueCoordinator claimed execution', () => {
           traceId: 'trace_queue_123456',
           steerDelivery: 'turn-boundary',
         })
+        assert.deepEqual(commercialControls, [{
+          type: 'outbound.prompt_queue.dispatch_activated',
+          grantId: h.dispatches[0]!.grantId,
+          owner: context.owner,
+          itemId: detail.itemId,
+          contentHash: detail.contentHash,
+          epoch: '5',
+          claimToken: 'ef'.repeat(32),
+        }])
         await lifecycle.onSettled()
         assert.ok(h.calls.some((call) => call.action === 'complete'))
         assert.deepEqual(
@@ -589,6 +607,7 @@ describe('PromptQueueCoordinator claimed execution', () => {
           }
         }
         if (claim.action === 'release') return { snapshot: snapshot('8'), outcome: 'released' }
+        if (claim.action === 'activate') return { snapshot: snapshot('8'), outcome: 'activated' }
         throw new Error(`unexpected ${claim.action}`)
       },
     }
@@ -615,13 +634,14 @@ describe('PromptQueueCoordinator claimed execution', () => {
       )
       await renewedDone
       assert.equal(lifecycle.signal.aborted, false)
-      await lifecycle.onPreflightRejected('retryable', 'ATTACHMENT_UNAVAILABLE')
+      await lifecycle.onTurnReserved({ turnIndex: 31, turnKey: '71'.repeat(32) })
       assert.deepEqual(calls.at(-1), {
-        action: 'release',
+        action: 'activate',
         epoch: '9',
         claimToken: 'ac'.repeat(32),
-        disposition: 'retryable',
-        reasonCode: 'ATTACHMENT_UNAVAILABLE',
+        turnId: '71'.repeat(32),
+        turnIndex: 31,
+        steerDelivery: 'turn-boundary',
       })
     } finally {
       coordinator.shutdown()

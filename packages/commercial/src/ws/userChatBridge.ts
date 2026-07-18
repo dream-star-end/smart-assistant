@@ -203,6 +203,7 @@ export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = "outbound.prompt_queue.dispatch_request";
 export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = "outbound.prompt_queue.dispatch_result";
 export const PROMPT_QUEUE_DISPATCH_CANCEL_TYPE = "outbound.prompt_queue.dispatch_cancel";
+export const PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE = "outbound.prompt_queue.dispatch_activated";
 export const PROMPT_QUEUE_GRANT_FIELD = "__oc_prompt_queue_grant";
 
 export interface PromptQueueDispatchRequest {
@@ -251,6 +252,16 @@ export interface PromptQueueDispatchCancel {
   epoch: string;
   claimToken: string;
   reasonCode: string;
+}
+
+export interface PromptQueueDispatchActivated {
+  type: typeof PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE;
+  grantId: string;
+  owner: PromptQueueDispatchRequest["owner"];
+  itemId: string;
+  contentHash: string;
+  epoch: string;
+  claimToken: string;
 }
 
 /**
@@ -324,20 +335,43 @@ export function parsePromptQueueDispatchCancel(value: unknown): PromptQueueDispa
   return value as unknown as PromptQueueDispatchCancel;
 }
 
+export function parsePromptQueueDispatchActivated(value: unknown): PromptQueueDispatchActivated | null {
+  if (!isPlainRecord(value) || value.type !== PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE) return null;
+  if (!hasOnlyKeys(value, [
+    "type", "grantId", "owner", "itemId", "contentHash", "epoch", "claimToken",
+  ])) return null;
+  const request = parsePromptQueueDispatchRequest({
+    type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+    grantId: value.grantId,
+    owner: value.owner,
+    claim: { epoch: value.epoch, claimToken: value.claimToken },
+    item: {
+      itemId: value.itemId,
+      clientMessageId: value.itemId,
+      contentHash: value.contentHash,
+      content: {},
+      requestedExecution: {
+        agentId: isPlainRecord(value.owner) ? value.owner.agentId : undefined,
+      },
+    },
+  });
+  return request === null ? null : value as unknown as PromptQueueDispatchActivated;
+}
+
 function samePromptQueueDispatch(
-  cancel: PromptQueueDispatchCancel,
+  control: PromptQueueDispatchCancel | PromptQueueDispatchActivated,
   request: PromptQueueDispatchRequest,
 ): boolean {
-  return cancel.grantId === request.grantId &&
-    cancel.owner.sessionKey === request.owner.sessionKey &&
-    cancel.owner.clientSessionId === request.owner.clientSessionId &&
-    cancel.owner.agentId === request.owner.agentId &&
-    cancel.owner.peer.id === request.owner.peer.id &&
-    cancel.owner.peer.kind === request.owner.peer.kind &&
-    cancel.itemId === request.item.itemId &&
-    cancel.contentHash === request.item.contentHash &&
-    cancel.epoch === request.claim.epoch &&
-    cancel.claimToken === request.claim.claimToken;
+  return control.grantId === request.grantId &&
+    control.owner.sessionKey === request.owner.sessionKey &&
+    control.owner.clientSessionId === request.owner.clientSessionId &&
+    control.owner.agentId === request.owner.agentId &&
+    control.owner.peer.id === request.owner.peer.id &&
+    control.owner.peer.kind === request.owner.peer.kind &&
+    control.itemId === request.item.itemId &&
+    control.contentHash === request.item.contentHash &&
+    control.epoch === request.claim.epoch &&
+    control.claimToken === request.claim.claimToken;
 }
 
 function promptQueueDispositionForCode(
@@ -1431,6 +1465,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   const registry = new ConnectionRegistry({ maxPerUser });
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });
+  const pendingPromptQueueCompensations = new Set<Promise<void>>();
+  const trackPromptQueueCompensation = (work: Promise<void>): void => {
+    pendingPromptQueueCompensations.add(work);
+    void work.catch((err) => {
+      log?.error("user-chat-bridge: prompt queue compensation failed", { err });
+    }).finally(() => pendingPromptQueueCompensations.delete(work));
+  };
 
   /**
    * Phase 0.4 — bridge-layer outbound ring buffer (process-singleton).
@@ -3552,18 +3593,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           );
           return;
         }
-        if (isPromptQueueDispatch) {
-          const staleState = activeCodexTurnsByPeer.get(peerKeyForAcquire);
-          if (staleState !== undefined) {
-            // The PG coordinator only grants after the prior exact turn reached
-            // a durable boundary. If the bridge-local G7 map lags that authority,
-            // release its execution resources instead of rejecting the queued
-            // item. This bypass is unavailable to legacy/browser frames.
-            turnLogForFrame?.warn("user-chat-bridge: releasing stale G7 state for queue grant", {
-              peerId: peerIdForAcquire,
-            });
-            releaseCodexTurnState(staleState, "prompt_queue_handoff");
-          }
+        if (isPromptQueueDispatch && activeCodexTurnsByPeer.has(peerKeyForAcquire)) {
+          // A PG queue grant says nothing about a legacy turn that predates the
+          // queue authority. Never label that live bridge owner "stale" or free
+          // its account/route. This is an internal retryable grant failure (the
+          // queued item remains durable), not the legacy user-facing G7 error.
+          turnLogForFrame?.info("user-chat-bridge: queue dispatch waiting for live codex owner", {
+            peerId: peerIdForAcquire,
+          });
+          rejectPromptQueueDispatch("EXECUTION_OWNER_BUSY");
+          return;
         }
         // Reserve the peer synchronously before the first await. This is both the
         // same-session admission lock and the ABA fence for late async continuations.
@@ -4441,6 +4480,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (dispatchText !== null) {
           let candidate: unknown = null;
           try { candidate = JSON.parse(dispatchText); } catch { /* ordinary non-JSON frame */ }
+          const isActivatedEnvelope = isPlainRecord(candidate) &&
+            candidate.type === PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE;
+          if (isActivatedEnvelope && deps.promptQueueEnabled === true) {
+            const activated = parsePromptQueueDispatchActivated(candidate);
+            if (activated === null) {
+              bridgeLog?.warn("user-chat-bridge: malformed prompt queue activation acknowledgement dropped");
+              return;
+            }
+            const registered = promptQueueDispatchCancellations.get(activated.grantId);
+            if (!registered || !samePromptQueueDispatch(activated, registered.request)) {
+              bridgeLog?.warn("user-chat-bridge: stale or mismatched prompt queue activation acknowledgement dropped", {
+                grantId: activated.grantId,
+              });
+              return;
+            }
+            // PG activation is the exact ownership boundary. From this point a
+            // bridge disconnect must preserve ordinary cross-bridge billing;
+            // only pre-activation registrations are eligible for compensation.
+            promptQueueDispatchCancellations.delete(activated.grantId);
+            return;
+          }
           const isCancelEnvelope = isPlainRecord(candidate) &&
             candidate.type === PROMPT_QUEUE_DISPATCH_CANCEL_TYPE;
           if (isCancelEnvelope && deps.promptQueueEnabled === true) {
@@ -4459,12 +4519,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // Delete before awaiting: duplicates and late terminal frames can
             // never invoke the accounting compensation twice.
             promptQueueDispatchCancellations.delete(cancel.grantId);
-            void registered.cancel(cancel.reasonCode).catch((err) => {
-              bridgeLog?.error("user-chat-bridge: prompt queue dispatch cancel failed", {
-                grantId: cancel.grantId,
-                err,
-              });
-            });
+            trackPromptQueueCompensation(registered.cancel(cancel.reasonCode));
             return;
           }
           const isQueueEnvelope = isPlainRecord(candidate) &&
@@ -5894,6 +5949,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // user 侧 detach(idempotent)
       detachUserSide(finalCause);
 
+      // An exact queue registration exists only between container forward and
+      // the PG activation acknowledgement. A container/bridge restart in this
+      // interval proves that no provider submit owns the grant, so compensate
+      // slot/route, Redis reservation and journal immediately. Registrations
+      // removed by dispatch_activated retain the ordinary cross-bridge billing
+      // semantics documented below.
+      const unactivatedQueueDispatches = [...promptQueueDispatchCancellations.values()];
+      promptQueueDispatchCancellations.clear();
+      for (const registered of unactivatedQueueDispatches) {
+        trackPromptQueueCompensation(
+          registered.cancel("BRIDGE_CLOSED_BEFORE_ACTIVATION"),
+        );
+      }
+
       // P0 修复(2026-07-03)— **桥关 ≠ turn 终止,finalCleanup 不再 abort 残留
       // inflight turn**。v5 断流续写语义下(turn 跨 WS 重连存活 + ring 重放),用户
       // 断线/重连/displacement/master 平滑重启后,容器侧 codex turn 继续跑;旧实现
@@ -5926,7 +5995,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       for (const state of [...activeCodexTurnsByPeer.values()]) {
         releaseCodexTurnState(state, "bridge_cleanup");
       }
-      promptQueueDispatchCancellations.clear();
       try { connectAbort.abort(); } catch { /* */ }
       try {
         // 注意:CLOSING 状态也强 terminate(),不依赖对端 echo,
@@ -5966,6 +6034,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
     });
+    while (pendingPromptQueueCompensations.size > 0) {
+      await Promise.allSettled([...pendingPromptQueueCompensations]);
+    }
   }
 
   /**

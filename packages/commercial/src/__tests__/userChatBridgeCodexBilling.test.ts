@@ -46,8 +46,10 @@ import { signAccess } from "../auth/jwt.js";
 import {
   createUserChatBridge,
   BRIDGE_WS_PATH,
+  PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE,
   PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
   PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+  PROMPT_QUEUE_DISPATCH_RESULT_TYPE,
   codexAbandonFailureCode,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
@@ -847,6 +849,155 @@ describe("userChatBridge / prompt queue accepted-grant cancellation", () => {
     assert.equal(usageInserts(rig).length, 0);
     assert.equal(ledgerInserts(rig).length, 0);
     ws.close();
+  });
+
+  test("container restart before activation exactly compensates slot, precheck and journal", async () => {
+      const acquireBefore = rig.binding.acquireCalls;
+      const releaseBefore = rig.binding.releaseCalls;
+      const abortBefore = journalAborts(rig).length;
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      const request = {
+        type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+        grantId: "123e4567-e89b-12d3-a456-426614174011",
+        owner: {
+          sessionKey: "agent:codex:webchat:dm:queue-restart-peer",
+          clientSessionId: "queue-restart-peer",
+          agentId: "codex",
+          peer: { id: "queue-restart-peer", kind: "dm" },
+        },
+        claim: { epoch: "18", claimToken: "bc".repeat(32) },
+        item: {
+          itemId: "queue-restart-item",
+          clientMessageId: "queue-restart-message",
+          contentHash: "de".repeat(32),
+          content: { text: "queued restart turn" },
+          requestedExecution: { agentId: "codex", model: "gpt-5.6-sol" },
+        },
+      } as const;
+      containerWs.send(JSON.stringify(request));
+      const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal(forwarded.type, "inbound.message");
+      assert.equal(rig.binding.acquireCalls, acquireBefore + 1);
+      assert.ok(rig.preCheckRedis.totalLocked(11n) > 0n);
+
+      containerWs.terminate();
+      await waitUntil(() =>
+        rig.binding.releaseCalls === releaseBefore + 1 &&
+        rig.preCheckRedis.totalLocked(11n) === 0n &&
+        journalAborts(rig).length === abortBefore + 1,
+      );
+      assert.equal(usageInserts(rig).length, 0);
+      assert.equal(ledgerInserts(rig).length, 0);
+      ws.close();
+  });
+
+  test("queue grant never releases a live legacy Codex owner", async () => {
+      const acquireBefore = rig.binding.acquireCalls;
+      const releaseBefore = rig.binding.releaseCalls;
+      const abortBefore = journalAborts(rig).length;
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "mixed-owner-peer", kind: "dm" },
+        clientMessageId: "legacy-live-message",
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        content: { text: "legacy turn stays live" },
+      }));
+      const legacy = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      const lockedBefore = rig.preCheckRedis.totalLocked(11n);
+      assert.equal(rig.binding.acquireCalls, acquireBefore + 1);
+      assert.ok(lockedBefore > 0n);
+
+      const queueRequest = {
+        type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+        grantId: "123e4567-e89b-12d3-a456-426614174013",
+        owner: {
+          sessionKey: "agent:codex:webchat:dm:mixed-owner-peer",
+          clientSessionId: "mixed-owner-peer",
+          agentId: "codex",
+          peer: { id: "mixed-owner-peer", kind: "dm" },
+        },
+        claim: { epoch: "20", claimToken: "be".repeat(32) },
+        item: {
+          itemId: "mixed-owner-item",
+          clientMessageId: "mixed-owner-message",
+          contentHash: "e1".repeat(32),
+          content: { text: "must wait durably" },
+          requestedExecution: { agentId: "codex", model: "gpt-5.6-sol" },
+        },
+      } as const;
+      containerWs.send(JSON.stringify(queueRequest));
+      const rejected = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+      assert.equal(rejected.type, PROMPT_QUEUE_DISPATCH_RESULT_TYPE);
+      assert.equal(rejected.reasonCode, "EXECUTION_OWNER_BUSY");
+      assert.equal(rejected.disposition, "retryable");
+      assert.equal(rig.binding.acquireCalls, acquireBefore + 1);
+      assert.equal(rig.binding.releaseCalls, releaseBefore);
+      assert.equal(rig.preCheckRedis.totalLocked(11n), lockedBefore);
+      assert.equal(journalAborts(rig).length, abortBefore);
+
+      containerWs.send(JSON.stringify({
+        type: "outbound.codex_billing",
+        requestId: legacy.requestId,
+        engineSessionId: ENGINE_SID,
+        status: "success",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }));
+      await waitUntil(() => rig.binding.releaseCalls === releaseBefore + 1);
+      ws.close();
+  });
+
+  test("activation acknowledgement removes only pre-activation compensation", async () => {
+      const releaseBefore = rig.binding.releaseCalls;
+      const abortBefore = journalAborts(rig).length;
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      const request = {
+        type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+        grantId: "123e4567-e89b-12d3-a456-426614174012",
+        owner: {
+          sessionKey: "agent:codex:webchat:dm:queue-active-peer",
+          clientSessionId: "queue-active-peer",
+          agentId: "codex",
+          peer: { id: "queue-active-peer", kind: "dm" },
+        },
+        claim: { epoch: "19", claimToken: "bd".repeat(32) },
+        item: {
+          itemId: "queue-active-item",
+          clientMessageId: "queue-active-message",
+          contentHash: "df".repeat(32),
+          content: { text: "queued active turn" },
+          requestedExecution: { agentId: "codex", model: "gpt-5.6-sol" },
+        },
+      } as const;
+      containerWs.send(JSON.stringify(request));
+      await waitContainerNextFrame(containerWs);
+      containerWs.send(JSON.stringify({
+        type: PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE,
+        grantId: request.grantId,
+        owner: request.owner,
+        itemId: request.item.itemId,
+        contentHash: request.item.contentHash,
+        epoch: request.claim.epoch,
+        claimToken: request.claim.claimToken,
+      }));
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+      containerWs.terminate();
+      await waitUntil(() => rig.binding.releaseCalls === releaseBefore + 1);
+      assert.ok(rig.preCheckRedis.totalLocked(11n) > 0n);
+      assert.equal(journalAborts(rig).length, abortBefore);
+      ws.close();
   });
 });
 

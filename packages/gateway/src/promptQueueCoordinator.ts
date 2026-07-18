@@ -14,6 +14,7 @@ const LEASE_RENEW_MARGIN_MS = 10_000
 export const PROMPT_QUEUE_DISPATCH_REQUEST_TYPE = 'outbound.prompt_queue.dispatch_request'
 export const PROMPT_QUEUE_DISPATCH_RESULT_TYPE = 'outbound.prompt_queue.dispatch_result'
 export const PROMPT_QUEUE_DISPATCH_CANCEL_TYPE = 'outbound.prompt_queue.dispatch_cancel'
+export const PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE = 'outbound.prompt_queue.dispatch_activated'
 export const PROMPT_QUEUE_GRANT_FIELD = '__oc_prompt_queue_grant'
 
 export interface PromptQueueSessionContext {
@@ -68,6 +69,20 @@ export interface PromptQueueDispatchCancel {
   reasonCode: string
 }
 
+export interface PromptQueueDispatchActivated {
+  type: typeof PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE
+  grantId: string
+  owner: PromptQueueWireOwner
+  itemId: string
+  contentHash: string
+  epoch: string
+  claimToken: string
+}
+
+export type PromptQueueDispatchControl =
+  | PromptQueueDispatchCancel
+  | PromptQueueDispatchActivated
+
 export interface PromptQueueTurnLifecycle {
   readonly queueTurn: true
   /** Aborted if the exact accepted claim is lost before activation. Consumers
@@ -115,7 +130,7 @@ interface PendingClaim {
   renewTimer: ReturnType<typeof setTimeout> | null
   grantAccepted: boolean
   lifecycleAbort: AbortController | null
-  cancelCommercial: ((frame: PromptQueueDispatchCancel) => boolean) | null
+  sendCommercialControl: ((frame: PromptQueueDispatchControl) => boolean) | null
 }
 
 interface ActiveReceipt {
@@ -203,7 +218,7 @@ export class PromptQueueCoordinator {
   acceptGrant(
     context: PromptQueueSessionContext,
     marker: unknown,
-    cancelCommercial?: (frame: PromptQueueDispatchCancel) => boolean,
+    sendCommercialControl?: (frame: PromptQueueDispatchControl) => boolean,
   ): PromptQueueTurnLifecycle | null {
     const state = this.states.get(context.owner.sessionKey)
     const parsed = parseGrantMarker(marker)
@@ -220,7 +235,7 @@ export class PromptQueueCoordinator {
       return null
     pending.grantAccepted = true
     pending.lifecycleAbort = new AbortController()
-    pending.cancelCommercial = cancelCommercial ?? null
+    pending.sendCommercialControl = sendCommercialControl ?? null
     // The commercial bridge has consumed this exact grant, so the short
     // acknowledgement deadline no longer applies. Keep renewing the PG claim
     // until the real SessionManager reservation activates it; otherwise a
@@ -258,8 +273,26 @@ export class PromptQueueCoordinator {
               `prompt queue activation rejected: ${activation.code ?? activation.outcome}`,
             )
           }
+          if (
+            pending.sendCommercialControl &&
+            !pending.sendCommercialControl({
+              type: PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE,
+              grantId: pending.grantId,
+              owner: context.owner,
+              itemId: pending.claim.itemId,
+              contentHash: pending.detail.contentHash,
+              epoch: pending.claim.epoch,
+              claimToken: pending.claim.claimToken,
+            })
+          ) {
+            // PG is already active, but no provider work has started yet. Keep
+            // the in-memory state in its pre-activation shape so reconciliation
+            // writes one interrupted tape instead of pretending this process
+            // owns a runnable turn whose commercial resources are unknown.
+            throw new Error('prompt queue activation acknowledgement was not delivered')
+          }
           this.clearPendingTimers(pending)
-          pending.cancelCommercial = null
+          pending.sendCommercialControl = null
           state.pending = null
           state.activeReceipt = { turnId: turnKey, turnIndex }
           activated = true
@@ -336,7 +369,7 @@ export class PromptQueueCoordinator {
       if (state.pending && !state.pending.grantAccepted) {
         await this.releasePendingLocked(state, 'NO_CLIENT')
       }
-      if (!state.activeReceipt) {
+      if (!state.pending && !state.activeReceipt) {
         this.clearRecovery(state)
         state.closed = true
         this.states.delete(context.owner.sessionKey)
@@ -497,7 +530,7 @@ export class PromptQueueCoordinator {
       renewTimer: null,
       grantAccepted: false,
       lifecycleAbort: null,
-      cancelCommercial: null,
+      sendCommercialControl: null,
     }
     state.pending = pending
     this.scheduleClaimTimers(state, pending)
@@ -663,11 +696,11 @@ export class PromptQueueCoordinator {
     if (!pending) return
     this.clearPendingTimers(pending)
     state.pending = null
-    if (pending.grantAccepted && pending.cancelCommercial) {
-      const cancel = pending.cancelCommercial
-      pending.cancelCommercial = null
+    if (pending.grantAccepted && pending.sendCommercialControl) {
+      const sendControl = pending.sendCommercialControl
+      pending.sendCommercialControl = null
       try {
-        cancel({
+        sendControl({
           type: PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
           grantId: pending.grantId,
           owner: state.context.owner,

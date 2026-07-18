@@ -168,6 +168,63 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe('prompt queue execution through real engine adapters', () => {
+  test('accepted pre-submit fence blocks hidden submit and cross-engine replacement', async () => {
+    const kernel = new FakeCcbKernel()
+    const adapter = new CcbAdapter(
+      {
+        sessionKey: 'agent:main:webchat:dm:queue-pre-submit-fence',
+        agentId: 'main',
+        agentBaseDir: process.cwd(),
+        model: 'glm-5.2',
+      } as EngineCreateOpts,
+      kernel as unknown as SubprocessRunner,
+    )
+    const session = makeSession(adapter, 'pre-submit-fence')
+    session._activeClientTurnCount = 0
+    const manager = new SessionManager(config)
+    ;(manager as unknown as { _saveResumeMap: () => void })._saveResumeMap = () => {}
+    ;(manager as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      session.sessionKey,
+      session,
+    )
+    const fence = manager.beginPromptQueueExecutionFence(session.sessionKey)
+    try {
+      await assert.rejects(
+        manager.submit(session, 'hidden legacy submit', () => {}),
+        /PROMPT_QUEUE_EXECUTION_INVARIANT/,
+      )
+      await assert.rejects(
+        manager.getOrCreate({
+          sessionKey: session.sessionKey,
+          agent: { id: 'main', name: 'Main', model: 'gpt-5.6-sol' } as any,
+          channel: 'webchat',
+          peerId: session.peerId,
+          model: 'gpt-5.6-sol',
+        }),
+        /PROMPT_QUEUE_EXECUTION_INVARIANT/,
+      )
+      assert.equal(
+        (manager as unknown as { sessions: Map<string, AgentSession> }).sessions.get(
+          session.sessionKey,
+        ),
+        session,
+      )
+      assert.equal(
+        await manager.getOrCreate({
+          sessionKey: session.sessionKey,
+          agent: { id: 'main', name: 'Main', model: 'glm-5.2' } as any,
+          channel: 'webchat',
+          peerId: session.peerId,
+          model: 'glm-5.2',
+          promptQueueExecutionFence: fence,
+        }),
+        session,
+      )
+    } finally {
+      fence.release()
+    }
+  })
+
   for (const engine of ['ccb', 'codex'] as const) {
     test(`${engine} reserves once, owns the execution mutex and rejects a hidden submit`, async () => {
       const kernel = engine === 'ccb' ? new FakeCcbKernel() : new FakeCodexKernel()

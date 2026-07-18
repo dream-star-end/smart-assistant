@@ -64,9 +64,11 @@ import {
   PromptQueueCoordinator,
   type PromptQueueDispatchRequest,
   type PromptQueueDispatchCancel,
+  type PromptQueueDispatchControl,
   type PromptQueueSessionContext,
   type PromptQueueTurnLifecycle,
 } from './promptQueueCoordinator.js'
+import type { PromptQueueExecutionFence } from './sessionManager.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
@@ -1573,6 +1575,7 @@ export class Gateway {
   private _bridgeConnections = new WeakSet<WebSocket>()
   private _promptQueueCoordinator: PromptQueueCoordinator | null = null
   private _promptQueueLifecycleByFrame = new WeakMap<object, PromptQueueTurnLifecycle>()
+  private _promptQueueExecutionFenceByFrame = new WeakMap<object, PromptQueueExecutionFence>()
   private _promptQueueClientSessions = new WeakMap<WebSocket, Set<string>>()
   // Pending permission requests: requestId → { sessionKey, toolName, input, toolUseId, peerKey, channel, peer }
   // Used for single-settlement, original-input passthrough, and disconnect auto-deny.
@@ -9831,10 +9834,10 @@ export class Gateway {
           const lifecycle = this._promptQueueCoordinator.acceptGrant(
             context,
             queueGrant,
-            (cancel: PromptQueueDispatchCancel) => {
+            (control: PromptQueueDispatchControl) => {
               if (!this._bridgeConnections.has(ws) || ws.readyState !== WebSocket.OPEN) return false
               try {
-                ws.send(JSON.stringify(cancel))
+                ws.send(JSON.stringify(control))
                 return true
               } catch {
                 return false
@@ -9853,7 +9856,19 @@ export class Gateway {
             })
             return
           }
+          let executionFence: PromptQueueExecutionFence
+          try {
+            executionFence = this.sessions.beginPromptQueueExecutionFence(context.owner.sessionKey)
+          } catch (err) {
+            await lifecycle.onPreflightRejected('retryable', 'EXECUTION_OWNER_BUSY')
+            this.log.info('prompt queue grant deferred by live runtime owner', {
+              sessionKey: context.owner.sessionKey,
+              error: err instanceof Error ? err.message : String(err),
+            })
+            return
+          }
           this._promptQueueLifecycleByFrame.set(frame as object, lifecycle)
+          this._promptQueueExecutionFenceByFrame.set(frame as object, executionFence)
         }
 
         // Stash userId on the frame so downstream dispatchInbound/deliver
@@ -9883,8 +9898,10 @@ export class Gateway {
           await this.dispatchInbound(frame)
         } finally {
           const unusedQueueLifecycle = this._promptQueueLifecycleByFrame.get(frame as object)
+          const unusedQueueFence = this._promptQueueExecutionFenceByFrame.get(frame as object)
           if (unusedQueueLifecycle) {
             this._promptQueueLifecycleByFrame.delete(frame as object)
+            this._promptQueueExecutionFenceByFrame.delete(frame as object)
             const rejection = (frame as any).__oc_prompt_queue_preflight_rejection as
               | { disposition?: unknown; reasonCode?: unknown }
               | undefined
@@ -9894,7 +9911,11 @@ export class Gateway {
             const reasonCode = typeof rejection?.reasonCode === 'string'
               ? rejection.reasonCode
               : 'PREPROCESS_REJECTED'
-            await unusedQueueLifecycle.onPreflightRejected(disposition, reasonCode)
+            try {
+              await unusedQueueLifecycle.onPreflightRejected(disposition, reasonCode)
+            } finally {
+              unusedQueueFence?.release()
+            }
           }
         }
       } else if (frame.type === 'inbound.goal_sync') {
@@ -11115,6 +11136,7 @@ export class Gateway {
     // A few compatibility tests invoke this method with a minimal Gateway-shaped
     // object. Keep the flag-off/non-queue path independent of coordinator state.
     const promptQueueLifecycle = this._promptQueueLifecycleByFrame?.get(frame as object)
+    const promptQueueExecutionFence = this._promptQueueExecutionFenceByFrame?.get(frame as object)
     // ── 一切入口无条件 strip `__oc_model_authority`(方案 §2 铁律)──────────────
     // dispatchInbound 是**所有** inbound 的唯一汇流点(bridge WS / 本地 WS / HTTP
     // inbound / cron / delegate / channel adapter),故 strip 收口在这里一处:
@@ -11562,6 +11584,9 @@ export class Gateway {
             },
           }
         : {}),
+      ...(promptQueueExecutionFence
+        ? { promptQueueExecutionFence }
+        : {}),
     })
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
     if (typeof wechatDispatchStarted === 'function') {
@@ -11658,7 +11683,10 @@ export class Gateway {
     const media = frame.content.media ?? []
     const rawImageEdit = frame.content.imageEdit
     const externalTurnGuard = rawImageEdit
-      ? await this.sessions.beginExternalTurn(session, { queueTurn: Boolean(promptQueueLifecycle) })
+      ? await this.sessions.beginExternalTurn(session, {
+          queueTurn: Boolean(promptQueueLifecycle),
+          ...(promptQueueExecutionFence ? { queueExecutionFence: promptQueueExecutionFence } : {}),
+        })
       : null
     let externalTurnCompleted = false
     let externalQueueReservation: PromptQueueExternalTurnReservation | undefined
@@ -12022,6 +12050,7 @@ export class Gateway {
           )
           externalQueueLifecycleOwned = true
           this._promptQueueLifecycleByFrame.delete(frame as object)
+          this._promptQueueExecutionFenceByFrame.delete(frame as object)
         }
 
         if (relayRequest) {
@@ -12768,6 +12797,7 @@ export class Gateway {
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
       ...(promptQueueLifecycle ? { queueLifecycle: promptQueueLifecycle } : {}),
+      ...(promptQueueExecutionFence ? { queueExecutionFence: promptQueueExecutionFence } : {}),
       // §2.3 boss 硬指标 3:sessionManager 走"最近 N 条历史"兜底注入成功后回调,
       // gateway 发 sys.context_rebuilt 提示帧告知用户上下文被重建。仅 webchat leader
       // turn 传本回调(delegate/cron/train submit 不传 → 无用户可见提示,正确:那些
@@ -12822,7 +12852,10 @@ export class Gateway {
       }
       return
     }
-    if (promptQueueLifecycle) this._promptQueueLifecycleByFrame.delete(frame as object)
+    if (promptQueueLifecycle) {
+      this._promptQueueLifecycleByFrame.delete(frame as object)
+      this._promptQueueExecutionFenceByFrame.delete(frame as object)
+    }
     this.sessions.beginClientTurn(session)
     let clientTurnThrew = false
     let clientTurnError: unknown | undefined
@@ -12858,6 +12891,8 @@ export class Gateway {
           await promptQueueLifecycle.onSettled(clientTurnError)
         } catch (err) {
           this.log.error('prompt queue settlement failed', { sessionKey }, err as Error)
+        } finally {
+          promptQueueExecutionFence?.release()
         }
       }
     }
@@ -12938,6 +12973,8 @@ export class Gateway {
           await promptQueueLifecycle.onSettled(externalQueueError)
         } catch (err) {
           this.log.error('prompt queue ImageEdit settlement failed', { sessionKey }, err as Error)
+        } finally {
+          promptQueueExecutionFence?.release()
         }
       }
     }

@@ -6,6 +6,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { signAccess } from '../auth/jwt.js'
 import {
   BRIDGE_WS_PATH,
+  PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE,
   PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
   PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
   PROMPT_QUEUE_DISPATCH_RESULT_TYPE,
@@ -13,6 +14,7 @@ import {
   createUserChatBridge,
   parsePromptQueueDispatchRequest,
   parsePromptQueueDispatchCancel,
+  parsePromptQueueDispatchActivated,
   shouldRejectCodexTurnForG7,
 } from '../ws/userChatBridge.js'
 
@@ -156,6 +158,23 @@ describe('commercial prompt queue dispatch grant', () => {
     assert.deepEqual(parsePromptQueueDispatchCancel(cancel), cancel)
     assert.equal(
       parsePromptQueueDispatchCancel({ ...cancel, claimToken: '00'.repeat(32), extra: true }),
+      null,
+    )
+  })
+
+  test('activation acknowledgement requires the complete original grant correlation', () => {
+    const activated = {
+      type: PROMPT_QUEUE_DISPATCH_ACTIVATED_TYPE,
+      grantId: request.grantId,
+      owner: request.owner,
+      itemId: request.item.itemId,
+      contentHash: request.item.contentHash,
+      epoch: request.claim.epoch,
+      claimToken: request.claim.claimToken,
+    }
+    assert.deepEqual(parsePromptQueueDispatchActivated(activated), activated)
+    assert.equal(
+      parsePromptQueueDispatchActivated({ ...activated, epoch: '01' }),
       null,
     )
   })
