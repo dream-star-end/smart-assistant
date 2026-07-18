@@ -91,8 +91,10 @@ function fakeStore() {
           owner: snapshot.owner,
           snapshotVersion: snapshot.version,
           itemId: 'x',
+          clientMessageId: 'x',
           state: 'queued',
           content: {},
+          attachments: [],
           contentHash: 'a'.repeat(64),
           contentBytes: '0',
           requestedExecution: {},
@@ -250,5 +252,26 @@ describe('internalPromptQueue mutation and claim parsing', () => {
     assert.equal(valid.status, 200)
     assert.equal(fake.calls[0]?.method, 'claim')
     assert.equal(fake.calls[0]?.args[1], 7)
+  })
+
+  test('activate and complete require the real non-negative turnIndex', async () => {
+    const fake = fakeStore()
+    const handler = makePromptQueueHandler({ identityRepo, store: fake.store })
+    const activate = {
+      action: 'activate', epoch: '2', claimToken: 'a'.repeat(64), turnId: 'b'.repeat(64),
+      turnIndex: 19, steerDelivery: 'turn-boundary',
+    }
+    assert.equal((await call(handler, PROMPT_QUEUE_CLAIM_PATH, {
+      owner, claim: { ...activate, turnIndex: -1 },
+    })).status, 400)
+    assert.equal((await call(handler, PROMPT_QUEUE_CLAIM_PATH, {
+      owner, claim: { ...activate, turnIndex: '19' },
+    })).status, 400)
+    assert.equal((await call(handler, PROMPT_QUEUE_CLAIM_PATH, { owner, claim: activate })).status, 200)
+    assert.deepEqual(fake.calls.at(-1)?.args[2], activate)
+
+    const complete = { action: 'complete', turnId: 'b'.repeat(64), turnIndex: 19 }
+    assert.equal((await call(handler, PROMPT_QUEUE_CLAIM_PATH, { owner, claim: complete })).status, 200)
+    assert.deepEqual(fake.calls.at(-1)?.args[2], complete)
   })
 })

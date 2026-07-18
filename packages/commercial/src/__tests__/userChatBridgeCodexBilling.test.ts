@@ -46,6 +46,8 @@ import { signAccess } from "../auth/jwt.js";
 import {
   createUserChatBridge,
   BRIDGE_WS_PATH,
+  PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
+  PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
   codexAbandonFailureCode,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
@@ -459,6 +461,7 @@ async function startRig(opts: {
    * 每条 inbound 注入签名 envelope,且**签发边界重读 epoch**(MAJOR-2)。
    */
   modelAuthority?: boolean;
+  promptQueueEnabled?: boolean;
 } = {}): Promise<BillingRig> {
   // 模型执行权威装配(flag 关 → 全部 undefined,rig 行为与本批次之前完全一致)
   const authoritySigner = opts.modelAuthority === true ? AuthoritySigner.createEphemeral() : null;
@@ -533,6 +536,7 @@ async function startRig(opts: {
     logger: opts.logger,
     appendCostCredits: opts.appendCostCredits,
     maxPerUser: opts.maxPerUser,
+    promptQueueEnabled: opts.promptQueueEnabled,
     ...(authoritySigner !== null
       ? {
           modelAuthority: {
@@ -781,6 +785,67 @@ describe("userChatBridge / annotated Image 2 — forward only", () => {
       false,
       "outpaint must not run ordinary chat preCheck",
     );
+    ws.close();
+  });
+});
+
+describe("userChatBridge / prompt queue accepted-grant cancellation", () => {
+  let rig: BillingRig;
+  before(async () => {
+    rig = await startRig({ userBalance: 1_000_000n, promptQueueEnabled: true });
+  });
+  after(async () => { await stopRig(rig); });
+
+  test("lease loss before provider submit releases slot, precheck and inflight journal", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+    const request = {
+      type: PROMPT_QUEUE_DISPATCH_REQUEST_TYPE,
+      grantId: "123e4567-e89b-12d3-a456-426614174001",
+      owner: {
+        sessionKey: "agent:codex:webchat:dm:queue-billing-peer",
+        clientSessionId: "queue-billing-peer",
+        agentId: "codex",
+        peer: { id: "queue-billing-peer", kind: "dm" },
+      },
+      claim: { epoch: "17", claimToken: "ab".repeat(32) },
+      item: {
+        itemId: "queue-billing-item",
+        clientMessageId: "queue-billing-message",
+        contentHash: "cd".repeat(32),
+        content: { text: "queued paid turn" },
+        requestedExecution: { agentId: "codex", model: "gpt-5.6-sol" },
+      },
+    } as const;
+
+    containerWs.send(JSON.stringify(request));
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    assert.equal(forwarded.type, "inbound.message");
+    assert.match(String(forwarded.requestId), /^[0-9a-f]{32}$/);
+    assert.equal(rig.binding.acquireCalls, 1);
+    assert.ok(rig.preCheckRedis.totalLocked(11n) > 0n);
+    assert.equal(journalAborts(rig).length, 0);
+
+    containerWs.send(JSON.stringify({
+      type: PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
+      grantId: request.grantId,
+      owner: request.owner,
+      itemId: request.item.itemId,
+      contentHash: request.item.contentHash,
+      epoch: request.claim.epoch,
+      claimToken: request.claim.claimToken,
+      reasonCode: "LEASE_LOST",
+    }));
+
+    await waitUntil(() =>
+      rig.binding.releaseCalls === 1 &&
+      rig.preCheckRedis.totalLocked(11n) === 0n &&
+      journalAborts(rig).length === 1,
+    );
+    assert.equal(usageInserts(rig).length, 0);
+    assert.equal(ledgerInserts(rig).length, 0);
     ws.close();
   });
 });

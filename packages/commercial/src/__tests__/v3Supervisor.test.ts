@@ -742,8 +742,10 @@ describe("provisionV3Container", () => {
     // v5 channel 在此断言它**不存在** —— 共享 auth.json 可能残留上游 key,不得暴露
     // 给 v5 用户容器(feat/v5-codex-oauth-egress B6)。
     const savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    const savedPromptQueue = process.env.OC_PROMPT_QUEUE_V1;
     try {
       process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_PROMPT_QUEUE_V1 = "1";
       const { docker, captured } = makeDocker();
       await provisionV3Container(
         {
@@ -758,6 +760,8 @@ describe("provisionV3Container", () => {
       );
       const env = captured.containersCreated[0]?.Env ?? [];
       assert.ok(env.includes("OC_CONTAINER_PREVIEW_ENABLED=1"));
+      assert.ok(env.includes("OC_PROMPT_QUEUE_V1=1"));
+      assert.ok(env.includes("OC_USER_ID=779"));
       const binds = (captured.containersCreated[0]?.HostConfig?.Binds ?? []) as string[];
       assert.ok(binds.length > 0, "v5 容器仍需其它 bind(data/proj/codex volume 等)");
       assert.ok(
@@ -769,6 +773,8 @@ describe("provisionV3Container", () => {
     } finally {
       if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
       else process.env.OC_RUNTIME_CHANNEL = savedChannel;
+      if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
+      else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
     }
   });
 
