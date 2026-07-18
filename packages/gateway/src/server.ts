@@ -18,7 +18,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
-import { homedir } from 'node:os'
+import { homedir, loadavg } from 'node:os'
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import type { Duplex } from 'node:stream'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
@@ -104,6 +104,7 @@ import {
 } from './metrics.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, type EvictionStats, OutboundRingBuffer } from './outboundRing.js'
+import { collectDevStatus, renderDevStatusHtml } from './devStatus.js'
 import { looksRedactedProxyUrl, maskProxyUrl, normalizeProxyUrl } from './proxyEnv.js'
 import { RateLimiter } from './rateLimit.js'
 import { type RedisFrameEnvelope, RedisSessionBus } from './redisSessionBus.js'
@@ -1761,6 +1762,36 @@ export class Gateway {
         runLog: summary,
         recentRuns,
       })
+      return
+    }
+    if (url.pathname === '/api/dev-status') {
+      // 并行开发看板(2026-07-18 审计条6)。只读聚合;敏感面=全量会话/日志尾/worktree
+      // 归属 → 仅管理员可看(个人版单管理员,默认 boss)。?format=html 返回自包含页面
+      // (服务端渲染,绕开前端 SW/缓存管线);默认 JSON 供 safe-restart 静默门等脚本消费。
+      if (req.method !== 'GET') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      const adminUser = process.env.OPENCLAUDE_ADMIN_USER || 'boss'
+      if (this.getUserId(req) !== adminUser) {
+        this.sendError(res, 403, 'admin only')
+        return
+      }
+      try {
+        const status = collectDevStatus({
+          sessions: () => this.sessions.list(),
+          terminals: () => this.claudeTerminal?.listActive() ?? [],
+          loadavg: () => loadavg(),
+        })
+        if (url.searchParams.get('format') === 'html') {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+          res.end(renderDevStatusHtml(status))
+        } else {
+          this.sendJson(res, 200, status)
+        }
+      } catch (err) {
+        this.sendError(res, 500, err instanceof Error ? err.message : String(err))
+      }
       return
     }
     if (url.pathname === '/api/claude-terminal/terminate') {
@@ -7748,6 +7779,7 @@ export function terminalContentDisposition(
 const KNOWN_ROUTES = [
   '/api/healthz',
   '/api/doctor',
+  '/api/dev-status',
   '/api/claude-terminal/terminate',
   '/api/claude-terminal/upload',
   '/api/claude-terminal/sessions',

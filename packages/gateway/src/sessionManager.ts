@@ -346,6 +346,10 @@ export interface AgentSession {
   ccbSessionId: string | null
   lock: Promise<void>
   lastUsedAt: number
+  // 当前 turn 的启动时刻(取得 submit lock 后置位,turn finally 清空)。null/absent=空闲。
+  // 唯一消费方是 /api/dev-status 看板与 safe-restart 静默门(in-flight turn 计数),
+  // 不参与任何执行语义。
+  _turnActiveSince?: number | null
   // 跨 turn 累积
   totalCostUSD: number
   totalInputTokens: number
@@ -950,6 +954,7 @@ export class SessionManager {
     let turnPromise: Promise<void> | null = null
     try {
       await prev
+      session._turnActiveSince = Date.now()
       // P2.2 minimal strict gate: if a continuation watch from the prior turn is
       // still delivering/persisting the late continuation (out-of-lock), let it
       // finish BEFORE this user submit repoints the pump / writes stdin — otherwise
@@ -1283,6 +1288,7 @@ export class SessionManager {
         throw err
       }
     } finally {
+      session._turnActiveSince = null
       release()
     }
   }
@@ -2522,6 +2528,8 @@ export class SessionManager {
     ccbSessionId: string | null
     turns: number
     totalCostUSD: number
+    runnerRunning: boolean
+    turnActiveSince: number | null
   }[] {
     return [...this.sessions.values()].map((s) => ({
       sessionKey: s.sessionKey,
@@ -2530,6 +2538,8 @@ export class SessionManager {
       ccbSessionId: s.ccbSessionId,
       turns: s.turns,
       totalCostUSD: s.totalCostUSD,
+      runnerRunning: !!s.runner?.isRunning,
+      turnActiveSince: s._turnActiveSince ?? null,
     }))
   }
 

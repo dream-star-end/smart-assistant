@@ -101,6 +101,8 @@ interface ActiveTerminalSession {
   command: string
   outputChunks: OutputChunk[]
   outputBytes: number
+  // 最近一次 PTY 输出时刻,仅供 /api/dev-status 看板与 safe-restart 静默门判活跃度。
+  lastOutputAt: number | null
   cleanupTimer: ReturnType<typeof setTimeout> | null
   dataDisposable: PtyDisposable
   exitDisposable: PtyDisposable
@@ -716,6 +718,30 @@ export class ClaudeTerminalManager {
     return this.owners.ownerOf(sessionId)
   }
 
+  // 管理侧只读列表(/api/dev-status 看板;含全部用户)。不含 transcript 内容。
+  listActive(): {
+    sessionId: string
+    userId: string
+    createdAt: number
+    cwd: string
+    lastOutputAt: number | null
+    outputBytes: number
+  }[] {
+    const rows = []
+    for (const s of this.sessions.values()) {
+      if (s.closed) continue
+      rows.push({
+        sessionId: s.sessionId,
+        userId: s.userId,
+        createdAt: s.createdAt,
+        cwd: s.cwd,
+        lastOutputAt: s.lastOutputAt,
+        outputBytes: s.outputBytes,
+      })
+    }
+    return rows
+  }
+
   // Session ids with a live PTY, optionally scoped to one owner.
   liveSessionIds(userId?: string): Set<string> {
     const ids = new Set<string>()
@@ -815,6 +841,7 @@ export class ClaudeTerminalManager {
       command,
       outputChunks: [],
       outputBytes: 0,
+      lastOutputAt: null,
       cleanupTimer: null,
       dataDisposable: { dispose: () => {} },
       exitDisposable: { dispose: () => {} },
@@ -992,6 +1019,7 @@ export class ClaudeTerminalManager {
     }
     session.outputChunks.push({ data: chunk, bytes })
     session.outputBytes += bytes
+    session.lastOutputAt = Date.now()
     while (session.outputBytes > OUTPUT_REPLAY_MAX_BYTES && session.outputChunks.length > 1) {
       const removed = session.outputChunks.shift()
       if (removed) session.outputBytes -= removed.bytes
