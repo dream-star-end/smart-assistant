@@ -503,6 +503,45 @@ describe('runTurn — proc 于退避期间消失(crash/shutdown)', () => {
     await h.cleanup()
   })
 
+  // 审计 R2-MAJOR — close-only 竞态:退避期间 proc 直接 close(无先行 error 事件)。
+  // close handler 会 failAllPending():若旧 attempt 的 completer 未解除,会 reject 一个
+  // 无人 await 的 completed promise → unhandled rejection(gateway 无全局守卫,Node
+  // 默认可升级为进程退出)。修复=进入重试分支立即置空 completer + no-op catch。
+  it('close-only:退避期间 close(failAllPending→wake→proc=null 全序)→ 零 unhandled rejection + 恰好一个 result + 无二次 turn/start', async () => {
+    const h = await makeRetryHarness({ delayMs: 10_000 })
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      let turnStarts = 0
+      h.r.sendRequest = async (method: string) => {
+        if (method !== 'turn/start') return {}
+        turnStarts++
+        throw jsonRpcAppError('at capacity')
+      }
+      const runPromise = h.r.runTurn('hi', 'req-close-only')
+      await waitFor(() => h.r.pendingRetryAbort !== null)
+      // 修复后的不变量:进入退避前 completer 已解除,failAllPending 无可 reject。
+      assert.equal(h.r.currentTurnCompleter, null, 'completer detached before backoff')
+      // 复刻 close handler 的真实顺序(codexAppServerRunner close 回调)。
+      h.r.failAllPending('codex app-server exited code=1 signal=')
+      h.r.wakeRetryBackoffOnProcGone()
+      h.r.proc = null
+      await runPromise
+      // unhandledRejection 在宏任务边界才派发,settle 两拍再断言。
+      await new Promise((r) => setTimeout(r, 30))
+      assert.deepEqual(unhandled, [], 'no unhandled rejection from abandoned completer')
+      assert.equal(turnStarts, 1, 'no second turn/start')
+      const res = results(h.messages)
+      assert.equal(res.length, 1)
+      assert.equal(res[0].is_error, true)
+      assert.notEqual(res[0].billing_terminal_code, 'USER_CANCELLED')
+    } finally {
+      process.removeListener('unhandledRejection', onUnhandled)
+    }
+    await h.cleanup()
+  })
+
   it('R8:proc 已 null(crash 与 close 之间)时 interrupt() 仍中断退避(先于 proc 存活守卫)', async () => {
     const h = await makeRetryHarness({ delayMs: 10_000 })
     let turnStarts = 0

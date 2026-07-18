@@ -3349,6 +3349,13 @@ export class CodexAppServerRunner extends EventEmitter {
             | undefined
         } catch (startErr) {
           if (this.shouldRetryTurnStart(startErr, attempt)) {
+            // 本 attempt 的 completed promise 就此放弃(无人 await)。必须立即
+            // 解除 completer 并挂 no-op catch:否则退避期间 close-only 路径
+            // (close → failAllPending)会 reject 一个无人接的 Promise →
+            // unhandled rejection(gateway 无全局守卫,Node 默认可升级为进程
+            // 退出,codex 子进程崩溃就此放大成整个 gateway 退出)。
+            this.currentTurnCompleter = null
+            void completed.catch(() => {})
             const nextAttempt = attempt + 1
             const delayMs = this.computeRetryDelayMs(attempt)
             const cls = classifyRunError((startErr as JsonRpcCallError).rpcMessage).code
