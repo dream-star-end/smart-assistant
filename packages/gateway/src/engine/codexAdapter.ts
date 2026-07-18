@@ -19,8 +19,10 @@
  *     engine/engineSessionId.ts 唯一 helper 派生，作为 usage_records 的
  *     稳定会话维度；turn 账务归因另用 turnKey。
  *   - errorKind 分类按 codex 错误形状(401 / token 失效 / 认证失败),分类语料 =
- *     assistantText(内核 failed 路径会先 emit "[turn failed: ...]" delta)+
- *     result 帧的原始 error 字符串(catch 路径不产 delta,只有 result.result)。
+ *     assistantText + result 帧的原始 error 字符串(lastErrorText)。turn-retry 批
+ *     起,内核 failed / catch 两路径**都不再注入** "[turn failed: ...]" delta ——
+ *     错误只走结构化 errorClass + result.result,故 assistantText 恒为真实模型正文,
+ *     分类完全由 lastErrorText(result.result)承载(与 catch 路径一直以来一致)。
  *   - 安全 gate:内核的 agentProvider **强制归一为 'codex-native'**(不透传
  *     agents.yaml 原值)。promptSlots 的 literature scrub(SKILLS_LITERATURE 含
  *     master 凭证通道提示)以 `provider !== 'codex-native'` 判定 —— engine 由
