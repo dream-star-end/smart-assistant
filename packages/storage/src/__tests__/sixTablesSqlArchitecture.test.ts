@@ -72,6 +72,10 @@ const WHITELIST = new Set<string>([
   // **只读 JOIN deleted_at**(判定"会话已软删")——不写六表、不绕 ownership fence;放 backend
   // 反而把 goal 域的离场语义搬进 sessions backend,内聚更差。写入面仍只经白名单 backend。
   "packages/commercial/src/admin/auditRetention.ts",
+  // 07-18 债偿:turn dispatch reconciler ⓪ 臂(会话亡自动结案)。与 auditRetention 同构:对
+  // client_sessions 仅**只读 LEFT JOIN**(id+user_id 归属 + deleted_at 墓碑,判定"用户面已
+  // 消失"的 open dispatch)——不写六表;dispatch 域的离场判定放 sessions backend 反而内聚更差。
+  "packages/commercial/src/dispatch/turnDispatchStore.ts",
   "scripts/v5-sessions-backfill-pg.ts",
   "scripts/v5-sessions-spill-archive.ts",
   "scripts/sessions-fix-oversized.ts",
