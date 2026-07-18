@@ -184,6 +184,14 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 4. 委派/团队:hidden-reviewer 有每父 turn ≤3 次硬熔断(server.ts HiddenDelegateGuard,429);delegate 有 idle 5min/hard 45min 超时,Stop 级联中断;一次性委派子会话收尾即 destroySession(2026-07-07,warm runner 不留存)。
 5. **"客户端转圈不止但服务端其实跑完了"**(团队模式高发,2026-07-07 事故):turn 是否真在飞看 session 双计数(`_activeTurnCount` engine 级 + `_activeClientTurnCount` 客户 turn 级,含 review 编排窗口),**别看 runner.isRunning(warm runner 恒 true)**。恢复链权威:hello 重连对账(`_shouldPushTurnInterruptedFinal`→completed 推 meta.reconcile 静默 final / errored 推 service_restart 文案)+ resume_failed→REST 全量对账 + review 迟到团队卡 persistLateTurnArtifacts 补 drain。ring 帧分级(delegate_progress/turn_status=progress 级先淘,contentLossSeq 水位线判回放),团队进度帧 >15帧/s 冲穿 ring 属预期,content 不应受累。取证三件套:容器 docker logs 的 `delegate`/`team_review`/`verification verdict` 行 + master /var/log/openclaude-v5.log 的 `userChatBridge closed(cause)`/`resume replay miss` + client_sessions.last_at 对时间线。
 
+6. **「服务重启,本轮已中断」红卡(SERVICE_RESTART)**:先别信文案——这是 synthetic crashed
+   tape 的固定话术,合法触发只剩**真 boot recovery**(容器崩溃/重启后孤儿收敛)。取证顺序:
+   ①容器 docker logs 搜 `turn dispatch boot recovery complete`,看它前面**有没有 `server started`
+   boot banner**——没有 = 活进程里 recovery 被再触发(2026-07-19 P0:周期 sweep 误杀活 turn,
+   已修=活标记注册表,回归看 stats.liveSkipped);②master 侧 `ssrf_blocked` 行 = transport 白名单
+   与容器网段错配(已收口 containerNet 单一权威,再现=有人复制了私有副本);③对照 turn_dispatches
+   行的 admitted→terminal 间隔,秒级即死大概率是①。
+
 ### 3.3 会话历史/持久化问题(高频类)
 心智模型:**用户行走 POST /user-message；模型生成内容由 v2 lossless turn tape 在 PG 中完整保存，`client_sessions.messages` 只留常量大小 anchor，读取时水合为 assistant/thinking/tool/agent-group/plan/goal**。合并语义在 `lib/persist.ts`:
 - full 合并 `mergeFullServerWins`:server 权威在前,保留尾部乐观段 + 中段 local-only user 行 + 中段 local-only 团队卡;
@@ -498,6 +506,8 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 | ~~v5 无后台孤儿回收网~~ **部分偿还**(02878333,07-06) | orphanReconcile 已放开 v5-owned(channel 双侧隔离,与 409 自愈错峰幂等,smoke 白名单已登记);**idleSweep/volumeGc 仍钉死**(活跃容器误杀窗口/不可逆删卷) | idleSweep:补 turn 级活跃屏障后再放;volumeGc:v3 退役收尾+观察期结束后单独评估 |
 
 | ~~org 订阅期内桶~~ **已偿还**(二期 8a4c14a9,0115) | 四桶+席位订阅(org-pro/max/ultra 9折池化)+自助开通+席位闸 | — |
+| 活集生产接线无进程内测试 | durable dispatch 活标记(mark 先于 INSERT queued/finally 注销)的 server.ts WS 受理块接线只有静态审计+canary 长 turn 实证;受理块在 WS handler 闭包内,现有 harness 够不到(Codex R1 MINOR 知情登记) | 改受理块或 recovery 协议时,先补 e2e OC_TURN_DISPATCH_SWEEP_MS 压缩 tick 行为用例 |
+| 滚动重启 mid-turn 无 drain/lease 双闸 | 容器滚动重启落在 turn 在飞窗,boot recovery(真 boot)仍会对 none 行合成 SERVICE_RESTART crashed=诚实失败+免单,但内容丢、需用户重试;根治=滚动前 drain(inbox 有 running 行延迟)+recovery none 分支查 master dispatch lease | master 重派 outbox(durable 批债①)落地时一并设计;或 dispatch_lost 类事故月频 >3 |
 | 远端 host release/bundle 分发 | runtime release/platform bundle 仅本机(kl-mirror);多机硬门:OC_RUNTIME_RELEASE 非空+非 self-host placement → 调度前拒 provision+告警(v3supervisor 带测试) | 新增 compute host 时做 rsync 分发(与 baseline REMOTE_HOST_CCB_BASELINE_DIR 推送同构)+node-agent inspect 契约补 imageId/labels |
 | 模型权威独立批次(P2c+seed model) | 模型目录 master 下发(ModelExecutionCatalog:bridge 授权/engine 分类/计费编排/容器执行同快照消费,per-uid 过滤,enabled=false fail-closed)+seed agent model/engine 声明化(bridge 按容器实际 seed revision 推导);设计审 R1-B5/R2-B1 裁定不与镜像瘦身同批 —— **在此之前 platform-seed.yaml 禁放 model/engine/provider 键(schema 硬拒),模型面改动仍走 protocol 常量+release 滚动** | 下一个模型/计费面批次单独设计单独 Codex 审 |
 | SupervisorErrorCode 无平台专用码 | platform bundle/release/多机门校验失败统一映射 InvalidArgument(ensureRunning 短重试,功能正确但运维信号不如 CcbBaselineMissing 清晰) | 首次生产遇到 bundle 校验失败排障时加专用码+critical 告警 |
