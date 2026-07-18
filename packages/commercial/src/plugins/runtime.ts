@@ -233,6 +233,44 @@ function stablePluginErrorCode(error: unknown): string {
   return typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'INTERNAL'
 }
 
+interface KnowledgePlanetCommentPage {
+  count: number
+  sort: 'asc' | 'desc'
+  beginTime?: string
+  endTime?: string
+}
+
+function normalizeKnowledgePlanetCommentPage(value: unknown): KnowledgePlanetCommentPage {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment lookup page is invalid')
+  const raw = value as Record<string, unknown>
+  const allowed = new Set(['count', 'sort', 'beginTime', 'endTime'])
+  if (Object.keys(raw).some((key) => !allowed.has(key)))
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment lookup page is invalid')
+  if (
+    !Number.isInteger(raw.count) ||
+    (raw.count as number) < 1 ||
+    (raw.count as number) > 50 ||
+    !['asc', 'desc'].includes(String(raw.sort)) ||
+    (raw.beginTime !== undefined &&
+      (typeof raw.beginTime !== 'string' || raw.beginTime.length > 80)) ||
+    (raw.endTime !== undefined && (typeof raw.endTime !== 'string' || raw.endTime.length > 80))
+  )
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment lookup page is invalid')
+  return {
+    count: raw.count as number,
+    sort: raw.sort as 'asc' | 'desc',
+    ...(typeof raw.beginTime === 'string' ? { beginTime: raw.beginTime } : {}),
+    ...(typeof raw.endTime === 'string' ? { endTime: raw.endTime } : {}),
+  }
+}
+
+function knowledgePlanetRemovalIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin media removal ids are invalid')
+  return [...new Set(value)] as string[]
+}
+
 export class PluginRuntimeFacade {
   private readonly pool: Pool
   private readonly browser: ManagedBrowserRuntime
@@ -1022,24 +1060,45 @@ export class PluginRuntimeFacade {
             'Plugin can edit ordinary Knowledge Planet topics only',
           )
         const preserve = input.params.preserveExistingMedia !== false
+        const hasRemoveImageIds = Object.hasOwn(input.params, 'removeImageIds')
+        const hasRemoveFileIds = Object.hasOwn(input.params, 'removeFileIds')
+        if (!preserve && (hasRemoveImageIds || hasRemoveFileIds))
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin media removal cannot be combined with clearing all existing media',
+          )
+        const removeImageIds = hasRemoveImageIds
+          ? knowledgePlanetRemovalIds(input.params.removeImageIds)
+          : []
+        const removeFileIds = hasRemoveFileIds
+          ? knowledgePlanetRemovalIds(input.params.removeFileIds)
+          : []
+        if (
+          removeImageIds.some((id) => !imageIds.includes(id)) ||
+          removeFileIds.some((id) => !fileIds.includes(id))
+        )
+          throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin media removal target is stale')
+        const removeImages = new Set(removeImageIds)
+        const removeFiles = new Set(removeFileIds)
+        const keepImageIds = preserve ? imageIds.filter((id) => !removeImages.has(id)) : []
+        const keepFileIds = preserve ? fileIds.filter((id) => !removeFiles.has(id)) : []
         const manifest = prepared.mediaManifest as KnowledgePlanetSealedMedia[]
         const newImages = manifest.filter((item) => item.kind === 'image').length
         const newFiles = manifest.filter((item) => item.kind === 'file').length
-        if (
-          (preserve ? imageIds.length : 0) + newImages > 9 ||
-          (preserve ? fileIds.length : 0) + newFiles > 9
-        )
+        if (keepImageIds.length + newImages > 9 || keepFileIds.length + newFiles > 9)
           throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic media limit exceeded')
         prepared.preserveExistingMedia = preserve
+        if (hasRemoveImageIds) prepared.removeImageIds = removeImageIds
+        if (hasRemoveFileIds) prepared.removeFileIds = removeFileIds
         prepared.editSnapshot = {
           expectedDigest: digest,
           previousText: typeof topic.text === 'string' ? topic.text : '',
-          imageIds,
-          fileIds,
+          keepImageIds,
+          keepFileIds,
         }
         if (
           String(prepared.text ?? '').length === 0 &&
-          (preserve ? imageIds.length + fileIds.length : 0) + newImages + newFiles === 0
+          keepImageIds.length + keepFileIds.length + newImages + newFiles === 0
         )
           throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin topic cannot be empty')
       } else {
@@ -1053,13 +1112,23 @@ export class PluginRuntimeFacade {
     if (input.actionId === 'delete_comment') {
       const topicId = String(input.params.topicId ?? '')
       const commentId = String(input.params.commentId ?? '')
+      const lookupPage = Object.hasOwn(input.params, 'lookupPage')
+        ? normalizeKnowledgePlanetCommentPage(input.params.lookupPage)
+        : null
+      if (lookupPage) prepared.lookupPage = lookupPage
       let comment: Record<string, unknown> | undefined
-      for (const sort of ['desc', 'asc'] as const) {
+      const pages: KnowledgePlanetCommentPage[] = lookupPage
+        ? [lookupPage]
+        : [
+            { count: 50, sort: 'desc' },
+            { count: 50, sort: 'asc' },
+          ]
+      for (const page of pages) {
         const read = (await this.call({
           userId: input.userId,
           targetId: input.targetId,
           actionId: 'list_comments',
-          params: { topicId, count: 50, sort },
+          params: { topicId, ...page },
         })) as { comments?: Record<string, unknown>[] }
         comment = read.comments?.find((candidate) => candidate.id === commentId)
         if (comment) break

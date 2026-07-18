@@ -32,6 +32,7 @@ import {
   validateKnowledgePlanetAccountState,
 } from './knowledgePlanet.js'
 import {
+  KNOWLEDGE_PLANET_COMMENT_RESULT_MAX,
   KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INITIAL_DELAY_MS,
   KNOWLEDGE_PLANET_LOGIN_PROBE_INTERVAL_MS,
@@ -50,6 +51,38 @@ import {
 } from './knowledgePlanetWorkerSource.js'
 
 const roots: string[] = []
+
+function knowledgePlanetWorkerCommentHelpers() {
+  const start = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('function text')
+  const end = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('\nfunction buildAction', start)
+  assert.ok(start >= 0 && end > start)
+  return Function(
+    'createHash',
+    'Buffer',
+    'NUMERIC_ID',
+    `'use strict'; ${KNOWLEDGE_PLANET_WORKER_SOURCE.slice(start, end)}; return { projectComment, flattenComments, normalizedCommentPage, commentQuery, commentListResult, firstArrayAt };`,
+  )(createHash, Buffer, /^\d{6,32}$/) as {
+    projectComment: (
+      value: Record<string, unknown>,
+      hierarchy?: Record<string, unknown>,
+    ) => Record<string, unknown>
+    flattenComments: (values: unknown[]) => {
+      comments: Array<Record<string, unknown>>
+      truncated: boolean
+      hasPartialReplies: boolean
+    }
+    normalizedCommentPage: (
+      value: Record<string, unknown>,
+      requireExplicit?: boolean,
+    ) => Record<string, unknown>
+    commentQuery: (page: Record<string, unknown>) => Record<string, unknown>
+    commentListResult: (
+      payload: Record<string, unknown>,
+      page: Record<string, unknown>,
+    ) => Record<string, unknown>
+    firstArrayAt: (payload: Record<string, unknown>, keys: string[]) => unknown[]
+  }
+}
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
@@ -91,11 +124,11 @@ describe('official Knowledge Planet Plugin', () => {
       }),
       'current',
     )
-    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 4)
+    assert.equal(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS.length, 5)
     assert.deepEqual(KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0], {
-      version: '1.3.0',
-      artifactHash: '1dbcb8d8861ae812431277e0144c93dd6018f0ba47b1ea359a8dcfb173a0c258',
-      execContractHash: 'ae7f8dab13127f098d5e7aa676556c0c00354d12dbf1df632bc0e9dfa766a898',
+      version: '1.4.0',
+      artifactHash: 'bc027e75eade8285c776f0ca6aa1f10bc32d8f6e4bc870b1be35a965946a04fb',
+      execContractHash: '02d496327bf1d088b3f6b1821731416980ac6a77e21df16dabeea2da0882d8b8',
     })
     for (const predecessor of KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS)
       assert.equal(classifyKnowledgePlanetSetupPin(predecessor), 'compatible-predecessor')
@@ -103,6 +136,13 @@ describe('official Knowledge Planet Plugin', () => {
       classifyKnowledgePlanetSetupPin({
         ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
         artifactHash: '0'.repeat(64),
+      }),
+      null,
+    )
+    assert.equal(
+      classifyKnowledgePlanetSetupPin({
+        ...KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS[0]!,
+        version: '1.5.0',
       }),
       null,
     )
@@ -144,8 +184,8 @@ describe('official Knowledge Planet Plugin', () => {
     )
   })
 
-  test('v1.4 exposes bounded reads plus default-confirmed or account-preapproved rich writes without credential-bearing results', () => {
-    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.4.0')
+  test('v1.5 exposes bounded reply-aware reads plus default-confirmed or account-preapproved rich writes without credential-bearing results', () => {
+    assert.equal(KNOWLEDGE_PLANET_PLUGIN_VERSION, '1.5.0')
     assert.equal(KNOWLEDGE_PLANET_DRIVER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.equal(KNOWLEDGE_PLANET_LAUNCHER_VERSION, KNOWLEDGE_PLANET_PLUGIN_VERSION)
     assert.deepEqual(
@@ -196,6 +236,212 @@ describe('official Knowledge Planet Plugin', () => {
       }
     }
     for (const action of KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions) visit(action.result)
+  })
+
+  test('projects upstream embedded replies as a bounded flat hierarchy without claiming missing replies are complete', () => {
+    const helpers = knowledgePlanetWorkerCommentHelpers()
+    const rawComments = [
+      {
+        comment_id: '100001',
+        text: 'root',
+        replies_count: 3,
+        replied_comments: [
+          {
+            comment_id: '100002',
+            parent_comment_id: '100001',
+            text: 'child',
+            replies_count: 1,
+            replied_comments: [
+              {
+                comment_id: '100003',
+                parent_comment_id: '100002',
+                text: 'grandchild',
+              },
+            ],
+          },
+          { comment_id: '100004', text: 'second child' },
+        ],
+      },
+      { comment_id: '100005', text: 'second root', replies_count: 0 },
+    ]
+    const page = helpers.normalizedCommentPage(
+      { count: 2, sort: 'asc', beginTime: '2026-07-01T00:00:00.000+0800' },
+      true,
+    )
+    assert.deepEqual(page, {
+      count: 2,
+      sort: 'asc',
+      beginTime: '2026-07-01T00:00:00.000+0800',
+    })
+    assert.deepEqual(helpers.commentQuery(page), {
+      count: 2,
+      sort: 'asc',
+      begin_time: '2026-07-01T00:00:00.000+0800',
+      with_sticky: true,
+    })
+    const result = helpers.commentListResult({ resp_data: { comments: rawComments } }, page) as {
+      comments: Array<Record<string, unknown>>
+      topLevelCount: number
+      returnedCount: number
+      truncated: boolean
+      hasPartialReplies: boolean
+      page: Record<string, unknown>
+    }
+    assert.deepEqual(
+      result.comments.map((comment) => comment.id),
+      ['100001', '100002', '100003', '100004', '100005'],
+    )
+    assert.deepEqual(
+      result.comments.map((comment) => comment.rootCommentId),
+      ['100001', '100001', '100001', '100001', '100005'],
+    )
+    assert.deepEqual(
+      result.comments.map((comment) => comment.parentCommentId),
+      [undefined, '100001', '100002', '100001', undefined],
+    )
+    assert.deepEqual(
+      result.comments.map((comment) => comment.depth),
+      [0, 1, 2, 1, 0],
+    )
+    assert.deepEqual(
+      result.comments.map((comment) => comment.returnedReplyCount),
+      [2, 1, 0, 0, 0],
+    )
+    assert.equal(result.comments[0]?.replyCount, 3)
+    assert.equal(result.comments[0]?.repliesComplete, false)
+    assert.equal(result.comments[1]?.repliesComplete, true)
+    assert.equal(result.comments[2]?.repliesComplete, undefined)
+    assert.deepEqual(
+      {
+        topLevelCount: result.topLevelCount,
+        returnedCount: result.returnedCount,
+        truncated: result.truncated,
+        hasPartialReplies: result.hasPartialReplies,
+        page: result.page,
+      },
+      {
+        topLevelCount: 2,
+        returnedCount: 5,
+        truncated: false,
+        hasPartialReplies: true,
+        page,
+      },
+    )
+    const action = KNOWLEDGE_PLANET_PLUGIN_CONTRACT.actions.find(
+      (candidate) => candidate.id === 'list_comments',
+    )!
+    validateRuntimePluginJson(action.result, result, 'result')
+
+    const duplicate = helpers.flattenComments([
+      { comment_id: '200001', text: 'first' },
+      {
+        comment_id: '200001',
+        text: 'duplicate',
+        replied_comments: [{ comment_id: '200002', text: 'unique child' }],
+      },
+    ])
+    assert.deepEqual(
+      duplicate.comments.map((comment) => [comment.id, comment.text]),
+      [
+        ['200001', 'first'],
+        ['200002', 'unique child'],
+      ],
+    )
+    assert.equal(duplicate.comments[1]?.parentCommentId, '200001')
+
+    const capped = helpers.flattenComments(
+      Array.from({ length: KNOWLEDGE_PLANET_COMMENT_RESULT_MAX + 1 }, (_, index) => ({
+        comment_id: String(300000 + index),
+        text: String(index),
+      })),
+    )
+    assert.equal(capped.comments.length, KNOWLEDGE_PLANET_COMMENT_RESULT_MAX)
+    assert.equal(capped.truncated, true)
+    assert.throws(() => helpers.normalizedCommentPage({ count: 50, sort: 'asc', extra: 1 }, true))
+    assert.throws(() => helpers.normalizedCommentPage({ sort: 'asc' }, true))
+  })
+
+  test('uses exactly the supplied comment lookup page to find nested replies and never falls back', async () => {
+    const helpers = knowledgePlanetWorkerCommentHelpers()
+    const start = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf('async function currentComment')
+    const end = KNOWLEDGE_PLANET_WORKER_SOURCE.indexOf(
+      '\nasync function verifyWritePrecondition',
+      start,
+    )
+    assert.ok(start >= 0 && end > start)
+    const queries: Array<Record<string, unknown>> = []
+    let responses: Array<Record<string, unknown>> = []
+    const currentComment = Function(
+      'fetchApi',
+      'commentQuery',
+      'normalizedCommentPage',
+      'firstArrayAt',
+      'flattenComments',
+      `'use strict'; ${KNOWLEDGE_PLANET_WORKER_SOURCE.slice(start, end)}; return currentComment;`,
+    )(
+      async (_api: unknown, spec: { query: Record<string, unknown> }) => {
+        queries.push(spec.query)
+        return responses.shift() ?? { resp_data: { comments: [] } }
+      },
+      helpers.commentQuery,
+      helpers.normalizedCommentPage,
+      helpers.firstArrayAt,
+      helpers.flattenComments,
+    ) as (
+      api: unknown,
+      state: unknown,
+      topicId: string,
+      commentId: string,
+      lookupPage?: Record<string, unknown>,
+    ) => Promise<Record<string, unknown> | null>
+
+    responses = [
+      {
+        resp_data: {
+          comments: [
+            {
+              comment_id: '400001',
+              replied_comments: [{ comment_id: '400002', text: 'target reply' }],
+            },
+          ],
+        },
+      },
+    ]
+    assert.equal(
+      (
+        await currentComment({}, {}, '900001', '400002', {
+          count: 20,
+          sort: 'asc',
+          beginTime: '2026-07-01T00:00:00.000+0800',
+        })
+      )?.id,
+      '400002',
+    )
+    assert.deepEqual(queries.splice(0), [
+      {
+        count: 20,
+        sort: 'asc',
+        begin_time: '2026-07-01T00:00:00.000+0800',
+        with_sticky: true,
+      },
+    ])
+
+    responses = [{ resp_data: { comments: [] } }, { resp_data: { comments: [] } }]
+    assert.equal(
+      await currentComment({}, {}, '900001', '400002', { count: 20, sort: 'desc' }),
+      null,
+    )
+    assert.equal(queries.splice(0).length, 1, 'an explicit lookup page must never fall back')
+
+    responses = [
+      { resp_data: { comments: [] } },
+      { resp_data: { comments: [{ comment_id: '400002', text: 'default fallback' }] } },
+    ]
+    assert.equal((await currentComment({}, {}, '900001', '400002'))?.id, '400002')
+    assert.deepEqual(
+      queries.splice(0).map((query) => query.sort),
+      ['desc', 'asc'],
+    )
   })
 
   test('declares the same numeric ID domain enforced by every worker action path', () => {
@@ -289,6 +535,21 @@ describe('official Knowledge Planet Plugin', () => {
       comment.body,
       JSON.stringify({ req_data: { text: '评论', image_ids: [], mentioned_user_ids: [] } }),
     )
+    assert.equal(
+      helpers.buildKnowledgePlanetWriteRequest('create_comment', {
+        topicId: '223456789',
+        repliedCommentId: '523456789',
+        text: '楼中楼回复',
+      })?.body,
+      JSON.stringify({
+        req_data: {
+          text: '楼中楼回复',
+          image_ids: [],
+          replied_comment_id: '523456789',
+          mentioned_user_ids: [],
+        },
+      }),
+    )
     assert.deepEqual(
       helpers.buildKnowledgePlanetWriteRequest(
         'create_topic',
@@ -314,6 +575,32 @@ describe('official Knowledge Planet Plugin', () => {
     assert.equal(
       helpers.buildKnowledgePlanetWriteRequest('delete_topic', { topicId: '223456789' })?.method,
       'DELETE',
+    )
+    assert.deepEqual(
+      helpers.buildKnowledgePlanetWriteRequest('delete_comment', { commentId: '523456789' }),
+      {
+        method: 'DELETE',
+        path: '/v2/comments/523456789',
+        query: {},
+        resultKind: 'ok',
+        body: undefined,
+      },
+    )
+    assert.equal(
+      helpers.buildKnowledgePlanetWriteRequest(
+        'edit_topic',
+        { groupId: '123456789', topicId: '223456789', text: 'edited' },
+        { imageIds: ['623456789', '723456789'], fileIds: ['823456789'] },
+      )?.body,
+      JSON.stringify({
+        req_data: {
+          type: 'talk',
+          text: 'edited',
+          image_ids: ['623456789', '723456789'],
+          file_ids: ['823456789'],
+          mentioned_user_ids: [],
+        },
+      }),
     )
     assert.equal(
       helpers.buildKnowledgePlanetWriteRequest('set_comment_like', {
@@ -341,6 +628,10 @@ describe('official Knowledge Planet Plugin', () => {
     assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /data\?\.succeeded !== true/)
     assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /dataAt\(data\)\.image_id/)
     assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /dataAt\(data\)\.file_id/)
+    assert.match(
+      KNOWLEDGE_PLANET_WORKER_SOURCE,
+      /uploaded\.imageIds = \[\.\.\.params\.editSnapshot\.keepImageIds, \.\.\.uploaded\.imageIds\]/,
+    )
     assert.equal([...KNOWLEDGE_PLANET_WORKER_SOURCE.matchAll(/api\.fetch\(/g)].length, 1)
     assert.doesNotMatch(KNOWLEDGE_PLANET_WORKER_SOURCE, /retry|retries/i)
   })
@@ -645,6 +936,55 @@ describe('official Knowledge Planet Plugin', () => {
     assert.match(KNOWLEDGE_PLANET_WORKER_SOURCE, /while \(result\[listKey\]\.length > 0/)
   })
 
+  test('keeps a worst-case flattened comment page plus account state below the worker frame ceiling', () => {
+    const comment = {
+      id: '123456',
+      rootCommentId: '123456',
+      parentCommentId: '223456',
+      depth: KNOWLEDGE_PLANET_COMMENT_RESULT_MAX - 1,
+      createdAt: '2026-07-18T00:00:00.000+0800',
+      text: '😀'.repeat(1_200),
+      author: { id: '323456', name: '😀'.repeat(128) },
+      replyTo: { id: '423456', name: '😀'.repeat(128) },
+      likeCount: 999_999,
+      replyCount: 999_999,
+      returnedReplyCount: 999_999,
+      repliesComplete: false,
+      sticky: true,
+      liked: true,
+      images: [
+        {
+          id: '523456',
+          type: 'image/'.concat('x'.repeat(58)),
+          width: 99_999,
+          height: 99_999,
+          size: 50 * 1024 * 1024,
+        },
+      ],
+      contentDigest: 'f'.repeat(64),
+    }
+    const storageState = {
+      cookies: [{ value: 'x'.repeat(KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES - 128) }],
+      origins: [],
+    }
+    const completed = {
+      event: 'completed',
+      result: {
+        comments: Array.from({ length: KNOWLEDGE_PLANET_COMMENT_RESULT_MAX }, () => comment),
+        topLevelCount: 50,
+        returnedCount: KNOWLEDGE_PLANET_COMMENT_RESULT_MAX,
+        truncated: true,
+        hasPartialReplies: true,
+        page: { count: 50, sort: 'asc' },
+      },
+      storageState,
+    }
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(completed), 'utf8') <
+        KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES,
+    )
+  })
+
   test('decodes coalesced ready plus a near-limit completed frame independently', () => {
     const workerFrame = (value: unknown) => {
       const body = Buffer.from(JSON.stringify(value))
@@ -654,7 +994,7 @@ describe('official Knowledge Planet Plugin', () => {
     }
     const ready = workerFrame({
       event: 'ready',
-      runtime: 'knowledge-planet-worker-v1.3',
+      runtime: 'knowledge-planet-worker-v1.5',
       playwrightMcpVersion: '0.0.76',
     })
     const completedBase = {
