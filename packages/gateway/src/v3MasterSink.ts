@@ -120,6 +120,12 @@ export interface V3MasterSinkWirePayload {
   /** Browser-authored persisted user-row id for this webchat turn. Optional
    * for legacy retry-queue entries and non-webchat producers. */
   clientMessageId?: string
+  /** RFC-v5-durable-turn-dispatch §2.4/§3 — durable dispatch identity. Present
+   * only on webchat-DM turns admitted through the durable inbox. Rides the
+   * canonical tape payload (enters the tape hash) so the master ACK can drive
+   * the container inbox row to terminal keyed by (dispatchId, attemptNo). */
+  dispatchId?: string
+  attemptNo?: number
   status: 'completed' | 'interrupted' | 'crashed'
   /** Stable logical turn identity used by lossless persistence and exact billing. */
   turnKey?: string
@@ -466,16 +472,83 @@ export type PersistOutcome =
   | { ok: false; queued: true; errorClass: 'transient' | 'session_missing' }
   | { ok: false; queued: false; droppedReason: string }
 
+/** RFC-v5-durable-turn-dispatch §3/§B6 — durable inbox lifecycle hooks. Fired only
+ * for payloads carrying a `dispatchId` (webchat-DM durable turns); ordinary
+ * turns / legacy entries no-op.
+ *
+ * B6 — **awaited durable migration (best-effort removed)**: each hook is awaited so the
+ * inbox state transition is confirmed before persistOrQueue proceeds.
+ *
+ * M-R1-1 ① — **onAck gates the durable entry deletion**: `onAck` returns whether the inbox
+ * terminal CAS is confirmed landed (`true`) or not (`false`). persistOrQueue must call it
+ * **before** `ackDurable` and only delete the staged entry when it returns `true`; a `false`
+ * (terminal write failed) keeps the entry so the drainer retries the terminal migration
+ * (idempotent: master finalize idempotent + inbox CAS idempotent). This closes the hole where
+ * the old order (ackDurable → onAck) deleted the entry, then swallowed a terminal-write failure,
+ * leaving the inbox permanently `sink_staged` (periodic recovery previously no-op'd on it).
+ *
+ * `onStaged`/`onStageFailed` remain best-effort-migration (own their error handling + rely on
+ * periodic recovery); only `onAck` carries the confirm/keep signal because only it gates deletion. */
+export interface V3DispatchInboxHooks {
+  /** After the tape is fsynced to the retry queue (running → sink_staged). */
+  onStaged?: (dispatchId: string, attemptNo: number) => void | Promise<void>
+  /** After master ACK — drives the inbox row to terminal. Returns `true` when the terminal
+   *  state is confirmed reached (or already terminal — idempotent); `false` when the terminal
+   *  write failed and the durable entry must be kept for a drainer retry. */
+  onAck?: (
+    dispatchId: string,
+    attemptNo: number,
+    status: 'completed' | 'interrupted' | 'crashed',
+  ) => boolean | Promise<boolean>
+  /** stageDurable itself failed (I/O) — never fsynced (→ sink_stage_failed). */
+  onStageFailed?: (dispatchId: string, attemptNo: number) => void | Promise<void>
+}
+
 export interface MakeV3MasterSinkDeps {
   config: V3MasterSinkConfig
   retryQueue: V3MasterRetryQueue
   /** Override only for tests. */
   attemptSendImpl?: typeof attemptSend
   now?: () => number
+  /** RFC-v5-durable-turn-dispatch §3 inbox hooks (best-effort). */
+  inboxHooks?: V3DispatchInboxHooks
+}
+
+/** B6 — await the inbox migration hook; a thrown/rejected hook is logged but never breaks the
+ *  lossless persistence outcome. Awaiting (vs the old fire-and-forget `void`) is what makes the
+ *  state transition confirmed-synchronous before persistOrQueue moves on. Used by the best-effort
+ *  hooks (onStaged / onStageFailed) that do not gate the durable entry deletion. */
+async function fireInboxHook(fn: (() => void | Promise<void>) | undefined): Promise<void> {
+  if (!fn) return
+  try {
+    await fn()
+  } catch (err) {
+    log.warn('v3 sink: dispatch inbox hook threw', undefined, err)
+  }
+}
+
+/** M-R1-1 ① — fire the onAck hook and report whether the inbox terminal CAS is confirmed.
+ *  No hook → `true` (nothing to converge, safe to ack). A thrown/rejected hook is treated as
+ *  `false` (not confirmed) so the durable entry is kept for a drainer retry rather than deleted
+ *  on an unconfirmed terminal. */
+async function fireInboxAckHook(
+  fn: V3DispatchInboxHooks['onAck'],
+  dispatchId: string,
+  attemptNo: number,
+  status: 'completed' | 'interrupted' | 'crashed',
+): Promise<boolean> {
+  if (!fn) return true
+  try {
+    return await fn(dispatchId, attemptNo, status)
+  } catch (err) {
+    log.warn('v3 sink: onAck inbox hook threw; retaining entry for retry', undefined, err)
+    return false
+  }
 }
 
 export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
   const now = deps.now ?? (() => Date.now())
+  const hooks = deps.inboxHooks
 
   const attemptOnce = (payload: V3MasterSinkWirePayload): Promise<void> => {
     if (deps.attemptSendImpl) return deps.attemptSendImpl(payload, { config: deps.config })
@@ -493,9 +566,45 @@ export function makeV3MasterSink(deps: MakeV3MasterSinkDeps): V3MasterSink {
       firstSeenAt,
       attempts: 0,
     }
-    const receipt = await deps.retryQueue.stageDurable(entry)
+    const dispatchId = payload.dispatchId
+    const attemptNo = payload.attemptNo
+    const hasDispatch = typeof dispatchId === 'string' && typeof attemptNo === 'number'
+    let receipt: string
+    try {
+      receipt = await deps.retryQueue.stageDurable(entry)
+    } catch (err) {
+      // stageDurable 抛 = 从未 fsync(ENOSPC 等)→ 行仍 running。**await** sink_stage_failed
+      // 迁移(B6:同步确认,不再 fire-and-forget),再 rethrow(唯一真失败)。写入自身若失败,
+      // hook 内 error log + 行留 running 由周期 recovery 兜底(不静默停在 running)。
+      if (hasDispatch)
+        await fireInboxHook(() => hooks?.onStageFailed?.(dispatchId as string, attemptNo as number))
+      throw err
+    }
+    // tape 已 durable → running 转 sink_staged(master ACK 前的可恢复态)。await 确认迁移。
+    if (hasDispatch)
+      await fireInboxHook(() => hooks?.onStaged?.(dispatchId as string, attemptNo as number))
     try {
       await attemptOnce(entry.payload)
+      // M-R1-1 ①:顺序反转 —— master 同步 ACK 成功后,**先**确认 inbox terminal CAS 落库,
+      // **再** ackDurable 删 durable entry。terminal 写失败(onAck 返回 false)→ 不删 entry:
+      // tape 已在 master(finalize 幂等),但去重态未收敛 → 保留 entry 让 drainer 重试终态迁移
+      // (inbox CAS 幂等),避免"entry 已删、行永停 sink_staged"的静默停摆。
+      if (hasDispatch) {
+        const confirmed = await fireInboxAckHook(
+          hooks?.onAck,
+          dispatchId as string,
+          attemptNo as number,
+          payload.status,
+        )
+        if (!confirmed) {
+          deps.retryQueue.kick()
+          log.info('v3 master sink: inbox terminal CAS unconfirmed, retaining entry for retry', {
+            sessionId: payload.sessionId,
+            turnIndex: payload.turnIndex,
+          })
+          return { ok: false, queued: true, errorClass: 'transient' }
+        }
+      }
       await deps.retryQueue.ackDurable(receipt)
       return { ok: true }
     } catch (err) {

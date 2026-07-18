@@ -441,6 +441,45 @@ export async function getSessionsDb(): Promise<Database.Database> {
       ON pending_usage_patches(user_id, parent_turn_key) WHERE parent_turn_key IS NOT NULL;
   `)
 
+  // ── turn_dispatch_inbox(RFC-v5-durable-turn-dispatch §3)──────────────────
+  //
+  // 容器 durable inbox = **执行准入 + 永久去重的唯一权威**(I2 at-most-once)。
+  //   - identity 行(user_id, session_id, client_message_id)一旦落库永久保留 ——
+  //     negative proof 只能由 rejected tombstone 提供,绝不由"内存为空/GET 无行/
+  //     超时"推断。
+  //   - INSERT 仅"不存在才插"(insertQueuedTurnDispatch 用 ON CONFLICT DO NOTHING,
+  //     严禁 OR REPLACE):accepted/running/terminal 永不被后到的同键/higher-attempt
+  //     覆盖;重复到达只回现有行状态。
+  //   - UNIQUE(dispatch_id, attempt_no) 是第二道去重护栏(逻辑键之外)。
+  //   - session 硬删(_sqliteDeleteClientSession)级联清本表(隐私一致)。
+  //
+  // 无 payload BLOB:boot recovery 不重放签名帧,只按 state + 持久化的
+  // turn_key/request_id/created_at/turn_index 做确定性收敛。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS turn_dispatch_inbox (
+      user_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      client_message_id TEXT NOT NULL,
+      dispatch_id TEXT NOT NULL,
+      attempt_no INTEGER NOT NULL,
+      payload_hash TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('queued','running','recovery_pending','sink_staged','sink_stage_failed','terminal','rejected')),
+      outcome TEXT CHECK (outcome IN ('completed','interrupted','crashed','not_accepted')),
+      agent_id TEXT,
+      turn_index INTEGER,
+      turn_key TEXT,
+      request_id TEXT,
+      created_at INTEGER NOT NULL,
+      accepted_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, session_id, client_message_id),
+      UNIQUE (dispatch_id, attempt_no)
+    );
+    -- boot recovery 与 healthz open-job 计数走此部分索引(只覆盖未落终态的行)。
+    CREATE INDEX IF NOT EXISTS idx_tdi_open ON turn_dispatch_inbox(state)
+      WHERE state NOT IN ('terminal','rejected');
+  `)
+
   // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
   // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
   _db = db
@@ -576,6 +615,369 @@ export async function pruneAutoDreamSuccessEvents(
   db.prepare(
     `DELETE FROM auto_dream_success_events WHERE agent_id = ? AND seq <= ?`,
   ).run(agentId, Math.max(0, Math.floor(throughSeq)))
+}
+
+// ─── turn_dispatch_inbox CRUD(RFC-v5-durable-turn-dispatch §3)──────────────
+//
+// 容器 durable inbox 的持久面权威。gateway/turnDispatchInbox.ts 在其上封装状态机;
+// server.ts / sessionManager.ts / boot recovery 只经这些函数读写(单一权威)。
+
+export type TurnDispatchInboxState =
+  | 'queued'
+  | 'running'
+  | 'recovery_pending'
+  | 'sink_staged'
+  | 'sink_stage_failed'
+  | 'terminal'
+  | 'rejected'
+
+export type TurnDispatchInboxOutcome = 'completed' | 'interrupted' | 'crashed' | 'not_accepted'
+
+export interface TurnDispatchInboxRow {
+  userId: string
+  sessionId: string
+  clientMessageId: string
+  dispatchId: string
+  attemptNo: number
+  payloadHash: string
+  state: TurnDispatchInboxState
+  outcome: TurnDispatchInboxOutcome | null
+  agentId: string | null
+  turnIndex: number | null
+  turnKey: string | null
+  requestId: string | null
+  createdAt: number
+  acceptedAt: number
+  updatedAt: number
+}
+
+interface TurnDispatchInboxDbRow {
+  user_id: string
+  session_id: string
+  client_message_id: string
+  dispatch_id: string
+  attempt_no: number
+  payload_hash: string
+  state: TurnDispatchInboxState
+  outcome: TurnDispatchInboxOutcome | null
+  agent_id: string | null
+  turn_index: number | null
+  turn_key: string | null
+  request_id: string | null
+  created_at: number
+  accepted_at: number
+  updated_at: number
+}
+
+function _mapTurnDispatchInboxRow(r: TurnDispatchInboxDbRow): TurnDispatchInboxRow {
+  return {
+    userId: r.user_id,
+    sessionId: r.session_id,
+    clientMessageId: r.client_message_id,
+    dispatchId: r.dispatch_id,
+    attemptNo: r.attempt_no,
+    payloadHash: r.payload_hash,
+    state: r.state,
+    outcome: r.outcome,
+    agentId: r.agent_id,
+    turnIndex: r.turn_index,
+    turnKey: r.turn_key,
+    requestId: r.request_id,
+    createdAt: r.created_at,
+    acceptedAt: r.accepted_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+function _readTurnDispatchByLogicalKey(
+  db: Database.Database,
+  userId: string,
+  sessionId: string,
+  clientMessageId: string,
+): TurnDispatchInboxRow | null {
+  const row = db
+    .prepare(
+      'SELECT * FROM turn_dispatch_inbox WHERE user_id = ? AND session_id = ? AND client_message_id = ?',
+    )
+    .get(userId, sessionId, clientMessageId) as TurnDispatchInboxDbRow | undefined
+  return row ? _mapTurnDispatchInboxRow(row) : null
+}
+
+/**
+ * 准入:仅当逻辑键**不存在**时插入 queued 行(ON CONFLICT DO NOTHING,严禁 OR REPLACE)。
+ *
+ * 返回 { inserted, row }:
+ *   - inserted=true → 本次新插了 queued 行(调用方 fsync 成功后 beginClientTurn);
+ *   - inserted=false → 已有行(重复到达)→ 调用方回执现有状态给 bridge,**不执行**;
+ *   - inserted=false ∧ row=null → dispatch_id 撞了别的逻辑键(master 契约破坏,pathological)。
+ */
+export async function insertQueuedTurnDispatch(input: {
+  userId: string
+  sessionId: string
+  clientMessageId: string
+  dispatchId: string
+  attemptNo: number
+  payloadHash: string
+  now?: number
+}): Promise<{ inserted: boolean; row: TurnDispatchInboxRow | null }> {
+  const db = await getSessionsDb()
+  const now = input.now ?? Date.now()
+  const txn = db.transaction((): { inserted: boolean; row: TurnDispatchInboxRow | null } => {
+    const res = db
+      .prepare(
+        `INSERT INTO turn_dispatch_inbox
+           (user_id, session_id, client_message_id, dispatch_id, attempt_no, payload_hash,
+            state, outcome, created_at, accepted_at, updated_at)
+         VALUES (@userId, @sessionId, @clientMessageId, @dispatchId, @attemptNo, @payloadHash,
+            'queued', NULL, @now, @now, @now)
+         ON CONFLICT DO NOTHING`,
+      )
+      .run({
+        userId: input.userId,
+        sessionId: input.sessionId,
+        clientMessageId: input.clientMessageId,
+        dispatchId: input.dispatchId,
+        attemptNo: input.attemptNo,
+        payloadHash: input.payloadHash,
+        now,
+      })
+    const row = _readTurnDispatchByLogicalKey(
+      db,
+      input.userId,
+      input.sessionId,
+      input.clientMessageId,
+    )
+    return { inserted: res.changes > 0, row }
+  })
+  return txn()
+}
+
+/**
+ * CAS 状态迁移(from-state 守卫)。命中 → 更新 state/outcome/updated_at,返回新行;
+ * 未命中(当前 state 不在 fromStates 内)→ 返回 null(调用方不重试、按幂等处理)。
+ * 单事务读改,消除并发迁移竞态。
+ */
+export async function casTurnDispatchState(input: {
+  userId: string
+  sessionId: string
+  clientMessageId: string
+  fromStates: readonly TurnDispatchInboxState[]
+  toState: TurnDispatchInboxState
+  outcome?: TurnDispatchInboxOutcome | null
+  now?: number
+}): Promise<TurnDispatchInboxRow | null> {
+  const db = await getSessionsDb()
+  const now = input.now ?? Date.now()
+  const placeholders = input.fromStates.map(() => '?').join(',')
+  const setOutcome = input.outcome !== undefined
+  const txn = db.transaction((): TurnDispatchInboxRow | null => {
+    const res = db
+      .prepare(
+        `UPDATE turn_dispatch_inbox
+            SET state = ?,
+                ${setOutcome ? 'outcome = ?,' : ''}
+                updated_at = ?
+          WHERE user_id = ? AND session_id = ? AND client_message_id = ?
+            AND state IN (${placeholders})`,
+      )
+      .run(
+        input.toState,
+        ...(setOutcome ? [input.outcome ?? null] : []),
+        now,
+        input.userId,
+        input.sessionId,
+        input.clientMessageId,
+        ...input.fromStates,
+      )
+    if (res.changes === 0) return null
+    return _readTurnDispatchByLogicalKey(
+      db,
+      input.userId,
+      input.sessionId,
+      input.clientMessageId,
+    )
+  })
+  return txn()
+}
+
+/**
+ * queued → running,同事务落 finalize 元数据(agent_id/turn_index/turn_key/request_id/
+ * created_at),**先于模型调用**。created_at 覆写为该 turn 的规范 createdAt —— boot recovery
+ * 合成 crashed tape 用它确定性重放(严禁 Date.now())。命中返回新行,否则 null。
+ */
+export async function recordTurnDispatchRunning(input: {
+  userId: string
+  sessionId: string
+  clientMessageId: string
+  agentId: string
+  turnIndex: number
+  turnKey: string
+  requestId: string | null
+  createdAt: number
+  now?: number
+}): Promise<TurnDispatchInboxRow | null> {
+  const db = await getSessionsDb()
+  const now = input.now ?? Date.now()
+  const txn = db.transaction((): TurnDispatchInboxRow | null => {
+    const res = db
+      .prepare(
+        `UPDATE turn_dispatch_inbox
+            SET state = 'running',
+                agent_id = @agentId,
+                turn_index = @turnIndex,
+                turn_key = @turnKey,
+                request_id = @requestId,
+                created_at = @createdAt,
+                updated_at = @now
+          WHERE user_id = @userId AND session_id = @sessionId
+            AND client_message_id = @clientMessageId
+            AND state = 'queued'`,
+      )
+      .run({
+        userId: input.userId,
+        sessionId: input.sessionId,
+        clientMessageId: input.clientMessageId,
+        agentId: input.agentId,
+        turnIndex: input.turnIndex,
+        turnKey: input.turnKey,
+        requestId: input.requestId,
+        createdAt: input.createdAt,
+        now,
+      })
+    if (res.changes === 0) return null
+    return _readTurnDispatchByLogicalKey(
+      db,
+      input.userId,
+      input.sessionId,
+      input.clientMessageId,
+    )
+  })
+  return txn()
+}
+
+export async function getTurnDispatchByLogicalKey(
+  userId: string,
+  sessionId: string,
+  clientMessageId: string,
+): Promise<TurnDispatchInboxRow | null> {
+  const db = await getSessionsDb()
+  return _readTurnDispatchByLogicalKey(db, userId, sessionId, clientMessageId)
+}
+
+export async function getTurnDispatchByDispatchId(
+  dispatchId: string,
+  attemptNo: number,
+): Promise<TurnDispatchInboxRow | null> {
+  const db = await getSessionsDb()
+  const row = db
+    .prepare('SELECT * FROM turn_dispatch_inbox WHERE dispatch_id = ? AND attempt_no = ?')
+    .get(dispatchId, attemptNo) as TurnDispatchInboxDbRow | undefined
+  return row ? _mapTurnDispatchInboxRow(row) : null
+}
+
+/**
+ * reject-if-absent tombstone(RFC §3 端点 / bridge pre-forward 失败出口):
+ * 单事务 —— 有行返现有行(negative proof 不成立);无行插 rejected(not_accepted)墓碑。
+ *
+ * 返回 { inserted, row, conflict }(与 {@link insertQueuedTurnDispatch} 同构):
+ *   - inserted=true ∧ row!=null → 本次插了 rejected 墓碑;
+ *   - inserted=false ∧ row!=null → 逻辑键已有行(重复到达)→ 返回现有状态,不覆盖;
+ *   - inserted=false ∧ row=null ∧ conflict=true → 逻辑键不存在但 (dispatch_id,attempt_no)
+ *     撞了**别的**逻辑键(master 契约破坏,pathological)。**明确 conflict 结果**,绝不再
+ *     谎报 inserted:true —— 调用方据此按契约违反处理(不当作"已插墓碑")。
+ */
+export async function insertRejectedTombstoneIfAbsent(input: {
+  userId: string
+  sessionId: string
+  clientMessageId: string
+  dispatchId: string
+  attemptNo: number
+  payloadHash: string
+  now?: number
+}): Promise<{ inserted: boolean; row: TurnDispatchInboxRow | null; conflict?: boolean }> {
+  const db = await getSessionsDb()
+  const now = input.now ?? Date.now()
+  const txn = db.transaction(
+    (): { inserted: boolean; row: TurnDispatchInboxRow | null; conflict?: boolean } => {
+      const existing = _readTurnDispatchByLogicalKey(
+        db,
+        input.userId,
+        input.sessionId,
+        input.clientMessageId,
+      )
+      if (existing) return { inserted: false, row: existing }
+      const res = db
+        .prepare(
+          `INSERT INTO turn_dispatch_inbox
+             (user_id, session_id, client_message_id, dispatch_id, attempt_no, payload_hash,
+              state, outcome, created_at, accepted_at, updated_at)
+           VALUES (@userId, @sessionId, @clientMessageId, @dispatchId, @attemptNo, @payloadHash,
+              'rejected', 'not_accepted', @now, @now, @now)
+           ON CONFLICT DO NOTHING`,
+        )
+        .run({
+          userId: input.userId,
+          sessionId: input.sessionId,
+          clientMessageId: input.clientMessageId,
+          dispatchId: input.dispatchId,
+          attemptNo: input.attemptNo,
+          payloadHash: input.payloadHash,
+          now,
+        })
+      if (res.changes === 0) {
+        // 逻辑键已确认不存在(上面 existing=null),INSERT 却 ON CONFLICT DO NOTHING →
+        // 只能是 (dispatch_id, attempt_no) UNIQUE 撞了别的逻辑键。明确 conflict,不谎报插入。
+        return { inserted: false, row: null, conflict: true }
+      }
+      return {
+        inserted: true,
+        row: _readTurnDispatchByLogicalKey(
+          db,
+          input.userId,
+          input.sessionId,
+          input.clientMessageId,
+        ),
+      }
+    },
+  )
+  return txn()
+}
+
+/** boot recovery:未落终态的所有行(queued/running/recovery_pending/sink_staged/sink_stage_failed)。 */
+export async function scanOpenTurnDispatches(): Promise<TurnDispatchInboxRow[]> {
+  const db = await getSessionsDb()
+  const rows = db
+    .prepare(
+      `SELECT * FROM turn_dispatch_inbox
+        WHERE state NOT IN ('terminal','rejected')
+        ORDER BY accepted_at ASC`,
+    )
+    .all() as TurnDispatchInboxDbRow[]
+  return rows.map(_mapTurnDispatchInboxRow)
+}
+
+/** healthz gauge:open-job 数 + 近似字节(用于容量观测,不参与判定)。 */
+export async function turnDispatchInboxStats(): Promise<{ openJobs: number; bytes: number }> {
+  const db = await getSessionsDb()
+  const open = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM turn_dispatch_inbox WHERE state NOT IN ('terminal','rejected')",
+    )
+    .get() as { n: number }
+  // 近似字节:行数 × 固定列开销 + 变长文本长度和。SQLite 无廉价 per-table 字节量,
+  // 用 length() 求和给一个可观测的量级(healthz 只做趋势/容量告警,不做精确核算)。
+  const bytesRow = db
+    .prepare(
+      `SELECT COALESCE(SUM(
+          64
+          + length(user_id) + length(session_id) + length(client_message_id)
+          + length(dispatch_id) + length(payload_hash)
+          + COALESCE(length(agent_id),0) + COALESCE(length(turn_key),0)
+          + COALESCE(length(request_id),0)
+        ), 0) AS b FROM turn_dispatch_inbox`,
+    )
+    .get() as { b: number }
+  return { openJobs: Number(open.n) || 0, bytes: Number(bytesRow.b) || 0 }
 }
 
 export async function upsertSessionMeta(meta: SessionMeta): Promise<void> {
@@ -3618,6 +4020,56 @@ async function _sqliteReadArchivedMessages(
   }
 }
 
+/** 引擎上下文读(RFC §9)。个人版/容器无 tape 物化投影(会话正文全量内联),生成行即热行本体。
+ *  返回热行原样(调用方 sanitizer 再做 48 行/18k 截断);缺省仅用于满足 ClientSessionsBackend 契约。 */
+async function _sqliteGetEngineContextMessages(
+  sessionId: string,
+  userId: string,
+): Promise<MessageLike[] | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT messages, archived_through_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessionId, userId) as { messages: string; archived_through_seq: number | null } | undefined
+  if (!row) return null
+  let msgs: MessageLike[]
+  try {
+    const parsed = JSON.parse(row.messages)
+    msgs = Array.isArray(parsed) ? (parsed as MessageLike[]) : []
+  } catch {
+    msgs = []
+  }
+  return deriveOrderSeqsForRead(msgs, row.archived_through_seq ?? 0)
+}
+
+/** 超大内容查看端点后端(RFC §9)。个人版无 tape_chat_projection 表 → 恒 null(端点回 404)。
+ *
+ * `recordOrdinal`/`offset`(可选,M-§9-1):单条超大记录的全量分块读定位 —— recordOrdinal 选
+ * 中该卷内某条记录、offset 为其内容内的字节偏移。commercial pgBackend 是唯一有真实投影表的实现,
+ * 语义由它落地;本 sqlite 桩只需**同步接口签名**(ClientSessionsBackend 类型从 sqliteBackend 派生),
+ * 个人版恒 null 不改变。 */
+async function _sqliteListTapeChatProjectionRecords(
+  _sessionId: string,
+  _userId: string,
+  _tapeId: string,
+  _cursor: number,
+  _limit: number,
+  _recordOrdinal?: number,
+  _offset?: number,
+): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+  return null
+}
+
+/** 同上:单条超大记录的分块读(M-§9-1 真通路)。个人版无投影表,恒 null=404。 */
+async function _sqliteReadTapeRecordChunk(
+  _sessionId: string,
+  _userId: string,
+  _tapeId: string,
+  _recordOrdinal: number,
+  _offset: number,
+): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
+  return null
+}
+
 /** Soft-delete: zero out messages and mark as deleted. Prevents stale PUTs from resurrecting. */
 async function _sqliteDeleteClientSession(id: string, userId?: string): Promise<boolean> {
   const db = await getSessionsDb()
@@ -3640,6 +4092,10 @@ async function _sqliteDeleteClientSession(id: string, userId?: string): Promise<
     // 该会话的委派 pending 若不清,会话删后永无队长行去 drain → 永不排空的孤儿。软删 late-cost
     // 现已直接 noop(见 appendCostCredits 软删分支),此处级联清是同一不变量的另一半。
     db.prepare('DELETE FROM pending_usage_patches WHERE parent_session_id = ?').run(id)
+    // turn_dispatch_inbox 级联清(RFC-v5-durable-turn-dispatch §3):identity 行本永久
+    // 保留作去重权威,但用户删会话=不再要这份历史,隐私语义应与 messages 清零一致。
+    // 删后的会话不会再受理新 turn,故清空去重权威无 at-most-once 风险。
+    db.prepare('DELETE FROM turn_dispatch_inbox WHERE session_id = ?').run(id)
     return true
   })
   return txn()
@@ -3846,6 +4302,9 @@ const sqliteBackend = {
   classifyClientSessions: _sqliteClassifyClientSessions,
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
+  getEngineContextMessages: _sqliteGetEngineContextMessages,
+  listTapeChatProjectionRecords: _sqliteListTapeChatProjectionRecords,
+  readTapeRecordChunk: _sqliteReadTapeRecordChunk,
   deleteClientSession: _sqliteDeleteClientSession,
   renameClientSession: _sqliteRenameClientSession,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
@@ -3946,6 +4405,15 @@ export const getClientSessionPartial: ClientSessionsBackend['getClientSessionPar
 
 export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages'] =
   (...args) => getActiveBackend().readArchivedMessages(...args)
+
+export const getEngineContextMessages: ClientSessionsBackend['getEngineContextMessages'] =
+  (...args) => getActiveBackend().getEngineContextMessages(...args)
+
+export const listTapeChatProjectionRecords: ClientSessionsBackend['listTapeChatProjectionRecords'] =
+  (...args) => getActiveBackend().listTapeChatProjectionRecords(...args)
+
+export const readTapeRecordChunk: ClientSessionsBackend['readTapeRecordChunk'] =
+  (...args) => getActiveBackend().readTapeRecordChunk(...args)
 
 export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] =
   (...args) => getActiveBackend().deleteClientSession(...args)

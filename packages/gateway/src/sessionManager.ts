@@ -10,6 +10,7 @@ import {
   getMaxTurnIdx,
   indexTurn,
   MemoryDir,
+  recordTurnDispatchRunning,
   reserveTurnIndex,
   paths,
   type KernelFileLock,
@@ -46,6 +47,7 @@ import {
   getV3MasterSinkOrNull,
   type V3MasterSinkPayload,
 } from './v3MasterSink.js'
+import { failClosedOnRunningCasMiss } from './turnDispatchInbox.js'
 import {
   AUTHORITY_TURN_MAX_LIFETIME_MS,
   type TurnWaiveReason,
@@ -583,6 +585,54 @@ export interface AgentSession {
   /** Browser user-row id bound to the submit that currently owns session.lock.
    * Unlike _activeTurnCount, this never describes queued submits. */
   _runningClientMessageId?: string
+
+  /** RFC-v5-durable-turn-dispatch §4 — per-session recent-terminal ring
+   * (cap 8: clientMessageId → outcome). autoResumeFromHello 用 hello 携带的
+   * inFlightClientMessageId 精确对账:命中 completed → turn_completed reconcile
+   * 帧带 id;命中中断类 → interrupted 帧带 id;未知 → turn_state_unknown。
+   * 非持久化(重启后空 → 未知身份 → forceSync,不冒充终态)。 */
+  _recentTerminalRing?: Array<{ clientMessageId: string; outcome: 'completed' | 'interrupted' | 'crashed' }>
+
+  /** RFC-v5-durable-turn-dispatch §3 — 本 turn 的 durable inbox 准入身份
+   * (server.ts dispatchInbound 从验签 descriptor 取出并在 submit 前挂上)。
+   * runOneTurnWithRetry 用它在**模型调用前**落 inbox running;turn-end 持久化
+   * 用它把 dispatchId/attemptNo 带进 tape payload,ACK 回调据此驱动 terminal。
+   * 仅 webchat-DM durable turn 有;legacy/本地路径恒 undefined。 */
+  _currentDispatch?: {
+    userId: string
+    sessionId: string
+    clientMessageId: string
+    dispatchId: string
+    attemptNo: number
+  }
+}
+
+/** RFC-v5-durable-turn-dispatch §4 — recent-terminal ring 容量。 */
+const RECENT_TERMINAL_RING_CAP = 8
+
+/**
+ * 把一次客户 turn 的终态记入 per-session recent-terminal ring(endClientTurn 调用)。
+ * 同 clientMessageId 覆盖旧记录(幂等);超 cap 淘汰最老。
+ */
+export function recordRecentTerminal(
+  session: AgentSession,
+  clientMessageId: string,
+  outcome: 'completed' | 'interrupted' | 'crashed',
+): void {
+  if (!clientMessageId) return
+  const ring = session._recentTerminalRing ?? (session._recentTerminalRing = [])
+  const existing = ring.findIndex((e) => e.clientMessageId === clientMessageId)
+  if (existing >= 0) ring.splice(existing, 1)
+  ring.push({ clientMessageId, outcome })
+  while (ring.length > RECENT_TERMINAL_RING_CAP) ring.shift()
+}
+
+/** ring 查询:命中返回 outcome,未命中返回 undefined(= 未知身份,调用方发 unknown)。 */
+export function lookupRecentTerminal(
+  session: AgentSession,
+  clientMessageId: string,
+): 'completed' | 'interrupted' | 'crashed' | undefined {
+  return session._recentTerminalRing?.find((e) => e.clientMessageId === clientMessageId)?.outcome
 }
 
 function takeDurableEventOrdinal(session: AgentSession): number {
@@ -717,6 +767,10 @@ function persistServerAuthoredTurnOutcome(args: {
   turnKey?: string
   waiveReason?: TurnWaiveReason
   continuationOfTurnKey?: string
+  /** RFC-v5-durable-turn-dispatch §3 — durable inbox 准入身份。仅本 turn 的**主
+   *  tape**携带(continuation tape 恒不带);随 tape payload 入 hash,master ACK
+   *  据此驱动 inbox row → terminal。 */
+  dispatch?: { dispatchId: string; attemptNo: number }
   createdAt?: number
   text: string
   /** Optional full reasoning/thinking text for the same turn. Persisted as a
@@ -797,6 +851,11 @@ function persistServerAuthoredTurnOutcome(args: {
       ...(args.waiveReason ? { waiveReason: args.waiveReason } : {}),
       ...(args.continuationOfTurnKey
         ? { continuationOfTurnKey: args.continuationOfTurnKey }
+        : {}),
+      // durable dispatch identity 只挂主 tape：continuation tape(post-terminal
+      // Bash tail)绝不携带,避免非主内容触发 inbox terminal / 污染 dispatch 归属。
+      ...(args.dispatch && !args.continuationOfTurnKey
+        ? { dispatchId: args.dispatch.dispatchId, attemptNo: args.dispatch.attemptNo }
         : {}),
       status: args.status,
       text: args.text,
@@ -2675,6 +2734,10 @@ export class SessionManager {
         onBeforeRelease: (unhandledError: unknown | undefined) => void
         onEnd: () => void
       }
+      /** RFC-v5-durable-turn-dispatch §3 — durable inbox 准入身份(server.ts
+       * dispatchInbound 从验签 descriptor 取出)。仅 webchat-DM durable turn 传;
+       * 驱动 inbox running(先于模型)+ turn-end tape 带 dispatchId/attemptNo。 */
+      dispatchContext?: AgentSession['_currentDispatch']
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -3012,6 +3075,7 @@ export class SessionManager {
             opts?.collabAgentPolicy,
             opts?.modelAuthority,
             opts?.replayLifecycle?.clientMessageId,
+            opts?.dispatchContext,
           ),
           livenessPromise,
         ])
@@ -3106,6 +3170,7 @@ export class SessionManager {
           }
           session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
           session._currentTurnKey = undefined
+          session._currentDispatch = undefined
           release()
         }
       }
@@ -3131,6 +3196,10 @@ export class SessionManager {
     modelAuthority?: TurnModelAuthority,
     /** Validated browser user-row id for exact durable attribution. */
     clientMessageId?: string,
+    /** RFC-v5-durable-turn-dispatch §3 — 本 turn 的 durable inbox 准入身份。
+     *  webchat-DM durable turn 才有;用于**模型调用前**落 inbox running + turn-end
+     *  tape 带 dispatchId。 */
+    dispatchContext?: AgentSession['_currentDispatch'],
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -3183,6 +3252,55 @@ export class SessionManager {
     })
     session._currentTurnKey = turnKey
     session._nextDurableEventOrdinal = 0
+    // RFC-v5-durable-turn-dispatch §3 — durable inbox: queued → running,同事务落
+    // finalize 元数据(agent_id/turn_index/turn_key/request_id/created_at),**先于
+    // 模型调用**。created_at 在此现取一次并持久化,boot recovery 合成 crashed tape
+    // 用它确定性重放(严禁恢复期 Date.now())。runOneTurnWithRetry 在 lock 内跑,
+    // dispatchContext 天然 turn-scoped;记 session._currentDispatch 供 turn-end 持久化取。
+    if (dispatchContext) {
+      // B3 fail-closed:queued→running CAS **必须确认**才允许调用模型。返回 null(CAS 落空:
+      // 行已非 queued / 缺失)或抛异常(DB 故障)→ 禁止调用模型,CAS inbox → rejected
+      // (not_accepted)并抛 TurnDispatchNotAcceptedError 走既有失败路径终局。绝不"告警后继续跑"
+      // —— 那会让 rejected 墓碑与真 tape 并存(双终态,§3 铁律)。
+      let runningRow: Awaited<ReturnType<typeof recordTurnDispatchRunning>> = null
+      let recordErr: unknown
+      try {
+        runningRow = await recordTurnDispatchRunning({
+          userId: dispatchContext.userId,
+          sessionId: dispatchContext.sessionId,
+          clientMessageId: dispatchContext.clientMessageId,
+          agentId: session.agentId,
+          turnIndex: projectedTurnIndex,
+          turnKey,
+          requestId: typeof requestId === 'string' && requestId !== '' ? requestId : null,
+          createdAt: Date.now(),
+        })
+      } catch (err) {
+        recordErr = err
+      }
+      if (recordErr !== undefined || runningRow === null) {
+        log.error(
+          'turn dispatch running CAS unconfirmed — refusing model call (fail-closed)',
+          {
+            sessionKey: session.sessionKey,
+            dispatchId: dispatchContext.dispatchId,
+            recordMissed: runningRow === null,
+          },
+          recordErr instanceof Error ? recordErr : undefined,
+        )
+        // 落 rejected 墓碑 + 抛错(既有失败路径:submit replayLifecycle 投影用户可见错误,
+        // 不写 tape → 无双终态)。**只在 running CAS 确认后**才把 dispatch 记进 session,
+        // 避免 turn-end 持久化误取一个从未进入执行的 dispatch。
+        await failClosedOnRunningCasMiss({
+          userId: dispatchContext.userId,
+          sessionId: dispatchContext.sessionId,
+          clientMessageId: dispatchContext.clientMessageId,
+          dispatchId: dispatchContext.dispatchId,
+          cause: recordErr,
+        })
+      }
+      session._currentDispatch = dispatchContext
+    }
     const assistantMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}`
     const thinkingMessageId = `srv-${session.peerId}-${session.agentId}-t${projectedTurnIndex}-thinking`
     // V3 v7.1 — canonical tool row id factory. Same lifecycle as the
@@ -3694,6 +3812,7 @@ export class SessionManager {
                 ...(clientMessageId ? { clientMessageId } : {}),
                 ...(turnKey ? { turnKey } : {}),
                 ...(waiveReason ? { waiveReason } : {}),
+                ...(session._currentDispatch ? { dispatch: session._currentDispatch } : {}),
                 text: partialAssistant.text,
                 ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
                 status,
@@ -4167,6 +4286,7 @@ export class SessionManager {
                 ...activeGoalAttribution(session),
                 ...(clientMessageId ? { clientMessageId } : {}),
                 ...(turnKey ? { turnKey } : {}),
+                ...(session._currentDispatch ? { dispatch: session._currentDispatch } : {}),
                 text: assistantText,
                 ...(completedHasThinking ? { thinkingText } : {}),
                 status: terminalOverride?.status ?? 'completed',
@@ -4459,10 +4579,19 @@ export class SessionManager {
   }
 
   /** team-durability — 客户 turn 收尾(含 review 编排在内的整个 turn 生命周期结束)。
-   *  outcome 记入 _lastClientTurnOutcome 供 hello 重连对账区分"正常完成 vs 中断"。 */
-  endClientTurn(session: AgentSession, outcome: 'completed' | 'errored'): void {
+   *  outcome 记入 _lastClientTurnOutcome 供 hello 重连对账区分"正常完成 vs 中断"。
+   *  RFC-v5-durable-turn-dispatch §4:带 clientMessageId 时同步记入 recent-terminal
+   *  ring —— 精确身份对账(命中 completed→turn_completed;命中中断→interrupted)。 */
+  endClientTurn(
+    session: AgentSession,
+    outcome: 'completed' | 'errored',
+    clientMessageId?: string,
+  ): void {
     session._activeClientTurnCount = Math.max(0, (session._activeClientTurnCount ?? 0) - 1)
     session._lastClientTurnOutcome = outcome
+    if (clientMessageId) {
+      recordRecentTerminal(session, clientMessageId, outcome === 'completed' ? 'completed' : 'interrupted')
+    }
   }
 
 
