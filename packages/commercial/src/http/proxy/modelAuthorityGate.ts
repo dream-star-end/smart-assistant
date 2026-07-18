@@ -232,6 +232,14 @@ export interface ModelAuthorityDecision {
   turnLeaseIssuedAtMs: number | null;
   /** 本次请求在 egress 完成 turn lease 验签的服务端时间(ms);无 lease 时为 null。 */
   turnLeaseVerifiedAtMs: number | null;
+  /**
+   * 0170 durable-turn dispatch:已验签 bridge authority envelope 携带的 server-owned
+   * `billingRequestId`(可选协议字段 ModelAuthorityPayload.billingRequestId —— **只读,不改协议**)。
+   * settle 侧据此反查 dispatch 身份(getDispatchByBillingRequestId)写入
+   * usage_records.dispatch_id/attempt_no。仅完整 authority envelope 带此值时存在;
+   * lease-only / local_catalog 路径缺席。
+   */
+  billingRequestId?: string;
 }
 
 /**
@@ -534,6 +542,9 @@ function verifyBridgeAuthority(a: {
     // 其 issuedAt 不能冒充长 lease 的 rollout 续跑证据。
     turnLeaseIssuedAtMs: lease?.issuedAt ?? null,
     turnLeaseVerifiedAtMs: lease === null ? null : a.now,
+    // 0170:只从完整 authority envelope 读 billingRequestId(可选协议字段);lease-only 缺席。
+    // settle 侧用它反查 dispatch 身份写入 usage_records.dispatch_id/attempt_no。
+    ...(authority?.billingRequestId ? { billingRequestId: authority.billingRequestId } : {}),
   };
 }
 

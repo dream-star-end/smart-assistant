@@ -137,6 +137,12 @@ export interface FinalizeContext {
    * 调用方不传 → 行为与本批次之前一致。
    */
   authority?: BillingAuthorityStamp | null;
+  /**
+   * 0170 durable-turn dispatch 身份(RFC §2/§3)。handler 按每请求 dispatch 反查后透传;
+   * 非 dispatch 路径(legacy / codexFinalizer)不传 → usage_records 两列写 NULL。
+   */
+  dispatchId?: string | null;
+  attemptNo?: number | null;
 }
 
 export interface FinalizeOutcome {
@@ -209,13 +215,17 @@ export async function startInflightJournal(
      *  billing pricing；跨 bridge settle 必须消费它，不能回读另一代异步缓存。普通同桥
      *  settle 仍以本地 inflight Map 中的 pricing 为准。anthropic 路径默认只含 model。 */
     ctxJson?: Record<string, unknown>;
+    /** durable dispatch 身份(RFC §2.2)— 落**列**而非仅 ctx:reconciler 财务联查按
+     *  dispatch_id 列直查,不落列 = 有账不认 → 误写"未计费"。legacy 路径不传 = NULL。 */
+    dispatchId?: string | null;
+    attemptNo?: number | null;
   },
 ): Promise<boolean> {
   const journalCtx = { model: ctx.model, ...(ctx.ctxJson ?? {}) };
   const inserted = await pool.query(
     `INSERT INTO request_finalize_journal
-       (request_id, user_id, container_id, state, ctx, precheck_credits)
-     VALUES ($1, $2, $3, 'inflight', $4::jsonb, $5)
+       (request_id, user_id, container_id, state, ctx, precheck_credits, dispatch_id, attempt_no)
+     VALUES ($1, $2, $3, 'inflight', $4::jsonb, $5, $6, $7)
      ON CONFLICT (request_id) DO NOTHING`,
     [
       ctx.requestId,
@@ -225,9 +235,45 @@ export async function startInflightJournal(
       ctx.containerId === null ? null : ctx.containerId.toString(),
       JSON.stringify(journalCtx),
       ctx.precheckCredits.toString(),
+      ctx.dispatchId ?? null,
+      ctx.attemptNo ?? null,
     ],
   );
   return inserted.rowCount === 1;
+}
+
+/** 接管路径读 journal 现行(RFC §7.7):比对用**列**(权威),ctx 只补 model。 */
+export async function readJournalForTakeover(
+  pool: Pool,
+  requestId: string,
+): Promise<{
+  state: string;
+  userId: string;
+  dispatchId: string | null;
+  attemptNo: number | null;
+  model: string | null;
+} | null> {
+  const row = (
+    await pool.query<{
+      state: string;
+      user_id: string;
+      dispatch_id: string | null;
+      attempt_no: number | null;
+      ctx: { model?: unknown } | null;
+    }>(
+      `SELECT state, user_id, dispatch_id, attempt_no, ctx
+         FROM request_finalize_journal WHERE request_id = $1`,
+      [requestId],
+    )
+  ).rows[0];
+  if (!row) return null;
+  return {
+    state: row.state,
+    userId: row.user_id,
+    dispatchId: row.dispatch_id,
+    attemptNo: row.attempt_no,
+    model: typeof row.ctx?.model === "string" ? row.ctx.model : null,
+  };
 }
 
 /**
@@ -433,6 +479,8 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         turnKey: ctx.turnKey,
         parentTurnKey: ctx.parentTurnKey,
         authority: ctx.authority ?? null,
+        dispatchId: ctx.dispatchId ?? null,
+        attemptNo: ctx.attemptNo ?? null,
       });
     } catch (err) {
       ctx.log.error("proxy_finalize_settle_db_failed", {
@@ -678,6 +726,13 @@ export async function settleUsageAndLedger(
      * 旧测试、影子期的 CCB 路径都不传,落库形状与本批次之前完全一致。
      */
     authority?: BillingAuthorityStamp | null;
+    /**
+     * 0170 durable-turn dispatch 身份(RFC-v5-durable-turn-dispatch §2/§3)。缺省/null →
+     * dispatch_id / attempt_no 两列写 NULL(legacy 路径 / 非 dispatch 请求,rollback-safe)。
+     * 双引擎(CCB proxy + codex durable)在此单点收敛写入。
+     */
+    dispatchId?: string | null;
+    attemptNo?: number | null;
   },
 ): Promise<SettleResult> {
   const client = await pool.connect();
@@ -726,9 +781,9 @@ export async function settleUsageAndLedger(
            price_snapshot, cost_credits, session_id, parent_session_id,
            delegate_agent_id, request_id, status, org_id,
            execution_revision, projection_revision, security_epoch, authority_kind,
-           turn_key, parent_turn_key)
+           turn_key, parent_turn_key, dispatch_id, attempt_no)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22)
+                 $17, $18, $19, $20, $21, $22, $23, $24)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
@@ -756,6 +811,9 @@ export async function settleUsageAndLedger(
           args.authority?.kind ?? null,
           args.turnKey ?? null,
           args.parentTurnKey ?? null,
+          // 0170 durable-turn dispatch 身份(双引擎收敛的唯一 usage_records 写入点)。
+          args.dispatchId ?? null,
+          args.attemptNo ?? null,
         ],
       );
       usageId = BigInt(ins.rows[0]!.id);

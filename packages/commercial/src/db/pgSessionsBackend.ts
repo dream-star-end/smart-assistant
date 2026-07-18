@@ -93,6 +93,20 @@ import {
 import { bumpGoalUsageSnapshotForTape } from "../goal/goalStateService.js";
 import { ensurePendingTurnWaiverInTransaction } from "../billing/refund.js";
 import { lockTurnBillingKeys, numericCommercialUserId } from "../billing/turnLock.js";
+import {
+  admitDispatch,
+  type AdmitDispatchResult,
+  casToManualReconcile,
+  casToTerminal,
+  getDispatch,
+} from "../dispatch/turnDispatchStore.js";
+import {
+  projectionToVirtualMessage,
+  readActiveErrorProjections,
+  revokeErrorProjection,
+} from "../dispatch/errorProjections.js";
+import type { Queryable } from "../dispatch/turnDispatchStore.js";
+import { MASTER_HISTORY_MAX_MESSAGES, MASTER_HISTORY_MAX_CHARS } from "../ws/masterHistoryLimits.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -390,12 +404,18 @@ interface SessionWriteRow {
  * 以区分 not_found / deleted)→ archived 命中查 → 解析 → planAppendServerAuthored(纯决策)
  * → execPgSpillPlan → 主行 UPDATE(updated_at 逻辑版本)。
  */
+/** 从消息数组按 id 取 _seq(admitUserTurn 求 anchor_seq 用;不在热尾巴 → undefined)。 */
+function seqOfMessage(msgs: MessageLike[], id: string): number | undefined {
+  const hit = msgs.find((m) => m && m.id === id);
+  return typeof hit?._seq === "number" ? hit._seq : undefined;
+}
+
 async function pgAppendServerAuthoredCore(
   client: PoolClient,
   sessId: string,
   userId: string,
   message: MessageLike & { id: string },
-): Promise<ServerAuthoredAppendResult> {
+): Promise<ServerAuthoredAppendResult & { seq?: number }> {
   const row = (
     await client.query<SessionWriteRow>(
       "SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
@@ -423,7 +443,10 @@ async function pgAppendServerAuthoredCore(
 
   const currentNextSeq = typeof row.next_seq === "number" && row.next_seq > 0 ? row.next_seq : 1;
   const plan = planAppendServerAuthored(msgs, message, currentNextSeq, bigIntNumOr(row.archived_through_seq, 0));
-  if (plan.kind === "already_exists") return { applied: false, reason: "already_exists" };
+  if (plan.kind === "already_exists") {
+    // 幂等重发:该消息行已在热尾巴,回其现有 _seq 供 admit 复用 anchor(dispatch 通常也已存在)。
+    return { applied: false, reason: "already_exists", seq: seqOfMessage(msgs, message.id) };
+  }
   if (plan.kind === "oversized") return { applied: false, reason: "oversized" };
 
   const now = Date.now();
@@ -443,7 +466,8 @@ async function pgAppendServerAuthoredCore(
     // 并发软删抢在 SELECT 与 UPDATE 之间(FOR UPDATE 下不可达;保留作最后防线,宁报终态不复活墓碑)。
     return { applied: false, reason: "session_deleted" };
   }
-  return { applied: true };
+  // 新 append 的消息拿到的 _seq = admit 的 anchor_seq(user 行位置,projection 排序键)。
+  return { applied: true, seq: seqOfMessage(tail, message.id) };
 }
 
 // ── wechat_bindings 行 → 领域对象(复刻 storage/wechatBindings.ts 的私有 rowToBinding;
@@ -586,14 +610,56 @@ export type LosslessTurnTapeFinalizeResult =
       applied: "finalized" | "idempotent";
       recordCount: number;
       engineBillings: DurableCodexBilling[];
+      /**
+       * late true tape(RFC §2.4):reconciler 已宣告 not_accepted、error 卡已投影,tape 却迟到。
+       * 内容仍完整 materialize(钱安全 I5),但 dispatch 转 manual_reconcile 且投影已撤销 —— 调用层
+       * (internalServer finalize handler)据此发一条告警交人工核对(已告知用户失败却又产出计费内容)。
+       */
+      dispatchLateTape?: boolean;
     }
   | { applied: "session_not_found" | "session_deleted" | "incomplete" };
+
+/**
+ * finalize 收敛 dispatch(RFC §2.4)。仅当 tape header 带 dispatch_id 时调用(legacy tape 跳过)。
+ *   - 非终态(admitted/accepted/rejecting)→ CAS terminal,outcome 映射 tape.status;
+ *   - 已 terminal(not_accepted)= late tape → 撤 error projection + manual_reconcile(late_tape);
+ *   - 已 terminal(completed 等)/ manual_reconcile → 幂等 no-op。
+ * CAS-first(原子);仅失败后读一次判 late tape(此时行已终态,读值稳定)。
+ */
+async function convergeDispatchOnFinalize(
+  client: PoolClient,
+  dispatchId: string,
+  tapeStatus: string,
+): Promise<{ lateTape: boolean }> {
+  const outcome =
+    tapeStatus === "completed" ? "completed" :
+    tapeStatus === "interrupted" ? "interrupted" : "crashed";
+  const converged = await casToTerminal(client, {
+    dispatchId,
+    outcome,
+    fromStatuses: ["admitted", "accepted", "rejecting"],
+  });
+  if (converged !== null) return { lateTape: false };
+  const d = await getDispatch(client, dispatchId);
+  if (d && d.status === "terminal" && d.outcome === "not_accepted") {
+    await revokeErrorProjection(client, dispatchId);
+    const held = await casToManualReconcile(client, {
+      dispatchId,
+      conflictReason: "late_tape",
+      fromStatuses: ["terminal"],
+    });
+    return { lateTape: held !== null };
+  }
+  return { lateTape: false };
+}
 
 export interface LosslessTurnTapeStorage {
   stageLosslessTurnTapePart(
     userId: string,
     request: LosslessTurnTapePartRequest,
     payload: Buffer,
+    /** dispatch 身份(sink 首片带来,落 tape header;finalize 收敛 + GET turn-tape-state 读它)。 */
+    dispatchIdentity?: { dispatchId: string; attemptNo: number },
   ): Promise<LosslessTurnTapeStageResult>;
   finalizeLosslessTurnTape(
     userId: string,
@@ -601,7 +667,127 @@ export interface LosslessTurnTapeStorage {
   ): Promise<LosslessTurnTapeFinalizeResult>;
 }
 
-export type PgSessionsBackend = ClientSessionsBackend & LosslessTurnTapeStorage;
+// ── durable turn dispatch 受理面(RFC §2.1 / §2.5 / GET turn-tape-state)──────────
+export interface AdmitUserTurnInput {
+  /** dispatch user_id(numeric)。 */
+  uid: bigint;
+  /** client_sessions.user_id(= `c:<uid>`),append user 行用。 */
+  sessionUserId: string;
+  sessionId: string;
+  /** = message.id;dispatch 逻辑键第三段。 */
+  clientMessageId: string;
+  agentId: string;
+  model: string | null;
+  /** sha256(text + sorted media refs)。 */
+  requestHash: string;
+  /** 新行才铸的稳定 billing request id(接管复用旧值)。 */
+  billingRequestId: string;
+  /** 新行才用的 dispatch_id(fresh uuid)。 */
+  dispatchId: string;
+  /** 本 bridge 连接 id(lease owner)。 */
+  ownerId: string;
+  /** 要幂等 append 的 user 消息行。 */
+  message: MessageLike & { id: string };
+  leaseTtlMs?: number;
+  now?: number;
+}
+
+export type AdmitUserTurnResult =
+  | AdmitDispatchResult
+  | { kind: "session_not_found" }
+  | { kind: "session_deleted" }
+  | { kind: "append_error"; reason: string };
+
+export type TurnTapeDispatchState = "none" | "partial" | "finalized";
+
+/**
+ * GET turn-tape-state 的返回(M1)。`state` 决定 boot recovery 分支(none/partial/finalized);
+ * `status` = tape header 的精确终态(completed/interrupted/crashed),仅当有 tape 行时非空
+ * (none → null)。gateway 侧 recovery 据 status 决定 finalized 分支的具体重播语义。
+ */
+export interface TurnTapeStateResult {
+  state: TurnTapeDispatchState;
+  status: string | null;
+}
+
+export interface DispatchAdmissionBackend {
+  /** 单事务:幂等 append user 行 → 取 _seq → UPSERT dispatch 冲突表裁定(RFC §2.1)。 */
+  admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult>;
+  /** 容器 boot recovery 用:按 dispatch 身份查 tape 三态(none/partial/finalized)+ 精确 status。 */
+  getTurnTapeStateByDispatch(
+    userId: string,
+    dispatchId: string,
+    attemptNo: number,
+  ): Promise<TurnTapeStateResult>;
+  /** 会话读侧 error projection 虚拟行(仅 client-facing 读合并;引擎历史注入绝不含它,RFC §2.5)。 */
+  listDispatchErrorProjectionMessages(
+    userId: string,
+    sessionId: string,
+  ): Promise<Record<string, unknown>[]>;
+  /** M-§9-1 超大内容"查看完整"按记录有界读:单条 record 的展示文本一个字节窗口(≤256KB/请求,
+   *  绝不整卷;分租/不存在/非收敛卷 → null=404)。offset/nextOffset 按 hydrate 后文本字节计。 */
+  readTapeRecordChunk(
+    sessionId: string,
+    userId: string,
+    tapeId: string,
+    recordOrdinal: number,
+    offset: number,
+  ): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
+}
+
+export type PgSessionsBackend = ClientSessionsBackend &
+  LosslessTurnTapeStorage &
+  DispatchAdmissionBackend;
+
+/**
+ * 单一投影 helper(RFC §2.5)— client-facing 读边界(full / partial / archive 分页)唯一收口。
+ * 仅 `projection==='chat'` 时调用:引擎历史注入(loadMasterSessionMessages,无 options=exact
+ * 读)绝不经过这里,失败提示永不进模型上下文。
+ *
+ * 插入 = 局部 splice 在「最后一个 _seq <= anchor 的行」之后;**绝不全量重排**(等 _seq 的
+ * tape 展开行相对顺序是持久化语义,重排=95e5c0ea 那类事故)。幂等:同 id 已存在即跳过。
+ * anchorRange 供 archive 分页只并入本页范围内的投影(锚在热尾的绝不落进归档页)。
+ */
+async function mergeDispatchErrorProjectionRows(
+  q: Queryable,
+  sessionUserId: string,
+  sessionId: string,
+  messages: MessageLike[],
+  anchorRange?: { minInclusive: number; maxExclusive: number },
+): Promise<MessageLike[]> {
+  if (!sessionUserId.startsWith("c:")) return messages;
+  let uid: bigint;
+  try {
+    uid = BigInt(sessionUserId.slice(2));
+  } catch {
+    return messages;
+  }
+  const rows = await readActiveErrorProjections(q, uid, sessionId);
+  if (rows.length === 0) return messages;
+  const out = [...messages];
+  for (const row of rows) {
+    const anchor = Number(row.anchorSeq);
+    if (
+      anchorRange !== undefined &&
+      (anchor < anchorRange.minInclusive || anchor >= anchorRange.maxExclusive)
+    ) {
+      continue;
+    }
+    const virtual = projectionToVirtualMessage(row);
+    const vid = (virtual as { id: string }).id;
+    if (out.some((m) => (m as { id?: unknown }).id === vid)) continue;
+    let idx = 0;
+    for (let i = out.length - 1; i >= 0; i--) {
+      const s = (out[i] as { _seq?: unknown })._seq;
+      if (typeof s === "number" && Number.isFinite(s) && s <= anchor) {
+        idx = i + 1;
+        break;
+      }
+    }
+    out.splice(idx, 0, virtual as MessageLike);
+  }
+  return out;
+}
 
 function sha256Bytes(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -651,7 +837,55 @@ type HydratedTapeRow = {
   delegate_costs: unknown;
 };
 
-function hydrateTapeRecord(
+/** 已解析的每卷可变计费叠加(cost/waiver/delegate)。权威源恒是 turn_tape_cost_components
+ *  / pending_usage_patches / turn_waivers —— chat 投影只存不可变内容,这三项读时现算叠加
+ *  (RFC §9:waiver 可 finalize 后才 apply / cost 可晚到 stage,冻结即分裂权威)。 */
+type ExactUsageEnrichment = {
+  costCredits: string;
+  waiverApplied: boolean;
+  delegates: Array<{ agentId: string; costCredits: string }>;
+};
+
+function parseDelegateCosts(value: unknown): Array<{ agentId: string; costCredits: string }> {
+  return Array.isArray(value)
+    ? value.flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const row = item as Record<string, unknown>;
+        return typeof row.agentId === "string" &&
+          typeof row.costCredits === "string" && /^\d+$/.test(row.costCredits)
+          ? [{ agentId: row.agentId, costCredits: row.costCredits }]
+          : [];
+      })
+    : [];
+}
+
+/** 把可变计费叠加并入行 usage。与今日 hydrateTapeRecord 内联合并逐字节等价:key 顺序
+ *  = record/anchor(content 已并) → cost → waiver → delegate;全空则原样返回(不凭空造 usage)。 */
+function mergeExactUsage(msg: MessageLike, enrich: ExactUsageEnrichment, isBillingAnchor: boolean): MessageLike {
+  const exactCostUsage = BigInt(enrich.costCredits) > 0n ? { costCredits: enrich.costCredits } : {};
+  // The live cost_waived frame updates the current browser immediately, but
+  // history hydration must carry the same truth for refreshes, offline users
+  // and other devices. Only an applied waiver (whose CHECK requires a receipt)
+  // may project completion; the tape's pending decision alone is not a refund.
+  const exactWaiverUsage = enrich.waiverApplied && isBillingAnchor ? { waived: true } : {};
+  const exactDelegateUsage = enrich.delegates.length > 0 ? { delegates: enrich.delegates } : {};
+  if (
+    Object.keys(exactCostUsage).length === 0 &&
+    Object.keys(exactWaiverUsage).length === 0 &&
+    Object.keys(exactDelegateUsage).length === 0
+  ) {
+    return msg;
+  }
+  const base = msg.usage && typeof msg.usage === "object" && !Array.isArray(msg.usage)
+    ? (msg.usage as Record<string, unknown>)
+    : {};
+  return { ...msg, usage: { ...base, ...exactCostUsage, ...exactWaiverUsage, ...exactDelegateUsage } };
+}
+
+/** 内容水合(不含可变计费叠加):hash 校验 + 解析 + _turnTape 作证标记 + 基础 usage
+ *  ({...recordUsage,...anchorUsage})。chat 物化投影**只存这一层**;exact 读与 chat 现算
+ *  在其上叠加 cost/waiver/delegate。 */
+function hydrateTapeRecordContent(
   row: HydratedTapeRow,
   anchor: MessageLike,
   requireRecordHash: boolean,
@@ -684,26 +918,6 @@ function hydrateTapeRecord(
   const anchorUsage = full.id === anchor.id && anchor.usage && typeof anchor.usage === "object"
     ? anchor.usage as Record<string, unknown>
     : {};
-  const exactCostUsage = BigInt(row.cost_credits) > 0n ? { costCredits: row.cost_credits } : {};
-  // The live cost_waived frame updates the current browser immediately, but
-  // history hydration must carry the same truth for refreshes, offline users
-  // and other devices. Only an applied waiver (whose CHECK requires a receipt)
-  // may project completion; the tape's pending decision alone is not a refund.
-  // Keep the original cost for audit while the UI hides it behind that marker.
-  const exactWaiverUsage = row.waiver_applied && full.id === anchor.id
-    ? { waived: true }
-    : {};
-  const exactDelegates = Array.isArray(row.delegate_costs)
-    ? row.delegate_costs.flatMap((value) => {
-        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-        const item = value as Record<string, unknown>;
-        return typeof item.agentId === "string" &&
-          typeof item.costCredits === "string" && /^\d+$/.test(item.costCredits)
-          ? [{ agentId: item.agentId, costCredits: item.costCredits }]
-          : [];
-      })
-    : [];
-  const exactDelegateUsage = exactDelegates.length > 0 ? { delegates: exactDelegates } : {};
   return {
     ...full,
     _source: "server",
@@ -722,14 +936,31 @@ function hydrateTapeRecord(
     // its anchor sequence: partial sync either returns every record or none.
     ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
     ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
-    ...(Object.keys(recordUsage).length > 0 ||
-        Object.keys(anchorUsage).length > 0 ||
-        Object.keys(exactCostUsage).length > 0 ||
-        Object.keys(exactWaiverUsage).length > 0 ||
-        Object.keys(exactDelegateUsage).length > 0
-      ? { usage: { ...recordUsage, ...anchorUsage, ...exactCostUsage, ...exactWaiverUsage, ...exactDelegateUsage } }
+    ...(Object.keys(recordUsage).length > 0 || Object.keys(anchorUsage).length > 0
+      ? { usage: { ...recordUsage, ...anchorUsage } }
       : {}),
   };
+}
+
+/** exact 读用:内容水合 + 逐行可变计费叠加(cost/waiver/delegate 来自 hydration SQL 的行内子查询)。
+ *  与今日逐字节等价。chat 物化投影读走 hydrateTapeRecordContent + 现算叠加(见 chat 分支)。 */
+function hydrateTapeRecord(
+  row: HydratedTapeRow,
+  anchor: MessageLike,
+  requireRecordHash: boolean,
+  fromCompleteAnchor = false,
+): MessageLike {
+  const content = hydrateTapeRecordContent(row, anchor, requireRecordHash, fromCompleteAnchor);
+  return mergeExactUsage(
+    content,
+    {
+      costCredits: row.cost_credits,
+      waiverApplied: row.waiver_applied,
+      delegates: parseDelegateCosts(row.delegate_costs),
+    },
+    // cost 组件恒挂在 billing anchor 行(SQL billing_anchor_id=r.msg_id);waiver 亦 full.id===anchor.id。
+    content.id === anchor.id,
+  );
 }
 
 type HydratedRuntimeBatchDescriptor = {
@@ -860,6 +1091,1256 @@ function expandHydratedRuntimeBatch(
   };
 }
 
+// ── 会话读物化投影(RFC §9)────────────────────────────────────────────────────
+// 只读缓存派生面:finalize 同事务把该卷的 chat **内容行**(不含可变 cost/waiver)物化进
+// tape_chat_projection;chat 读两阶段(header-only → 投影展开),存量卷惰性回填。任何异常
+// 降级 = 有界折叠,绝不回退全量水合。投影绝不参与完整性/结算/dedup 写侧(§9.2)。
+const PROJECTION_ROW_MAX_BYTES = 64 * 1024; // 逐记录 64KB 截断
+const PROJECTION_TAPE_MAX_BYTES = 512 * 1024; // per-tape ≤512KB
+const PROJECTION_TAPE_MAX_ROWS = 512; // per-tape ≤512 行
+const CHAT_PROJECTION_MAX_BYTES = 8 * 1024 * 1024; // chat 单响应投影总量 ≤8MB
+const CHAT_PROJECTION_MAX_ROWS = 2000; // chat 单响应投影总量 ≤2000 行
+const DEFAULT_BACKFILL_BYTES = 16 * 1024 * 1024; // OC_BACKFILL_BYTES 默认 16MB
+// 分段回填每段最多拉多少 record 行(界定单次 pg fetch,防超大卷一次性入内存)。
+const BACKFILL_SEGMENT_RECORD_LIMIT = 4000;
+// B-§9-1(R3 重开):预算是**硬**的 —— 任何 record 越本读剩余预算一律 defer 折叠(绝不强读),
+// 越整 fullBudget 才判「永不适配」→ 终态 truncated + sentinel(绝不整条拉入进程)。推进保证靠
+// 「新一轮读预算重置后可容纳 ≤fullBudget 的单条」:sorted 里最小的未收敛卷在 budget==fullBudget
+// 时最先起步,其首条 ≤fullBudget 必被读入(或 >fullBudget 立即 truncated 收敛),故每读至少一卷取得
+// 进展 —— 数学上无死锁。删掉旧 FLOOR「小条强读」路径(它破坏硬预算不变量)。
+
+function backfillBudgetBytes(): number {
+  const raw = Number(process.env.OC_BACKFILL_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_BACKFILL_BYTES;
+}
+
+function jsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value ?? null), "utf8");
+}
+
+/** code-point 安全的字节前缀截断(保留前 maxBytes 字节)。 */
+function utf8PrefixBytes(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maxBytes) return value;
+  let end = Math.max(0, maxBytes);
+  // 不能切在 UTF-8 continuation 字节中间(0b10xxxxxx),回退到 code-point 边界。
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+/** 递归找到最长字符串叶子并截断它(从尾部剥离 ~over 字节)。截断到才返回 true。 */
+function truncateLongestString(node: unknown, over: number): boolean {
+  let bestRef: Record<string | number, unknown> | null = null;
+  let bestKey: string | number = "";
+  let bestLen = 0;
+  const walk = (obj: unknown): void => {
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) {
+        const v = obj[i];
+        if (typeof v === "string") {
+          const b = Buffer.byteLength(v, "utf8");
+          if (b > bestLen) { bestLen = b; bestRef = obj as unknown as Record<number, unknown>; bestKey = i; }
+        } else if (v && typeof v === "object") walk(v);
+      }
+    } else if (obj && typeof obj === "object") {
+      for (const k of Object.keys(obj as Record<string, unknown>)) {
+        const v = (obj as Record<string, unknown>)[k];
+        if (typeof v === "string") {
+          const b = Buffer.byteLength(v, "utf8");
+          if (b > bestLen) { bestLen = b; bestRef = obj as Record<string, unknown>; bestKey = k; }
+        } else if (v && typeof v === "object") walk(v);
+      }
+    }
+  };
+  walk(node);
+  if (!bestRef || bestLen < 64) return false;
+  const cur = String((bestRef as Record<string | number, unknown>)[bestKey]);
+  const marker = "…[截断]";
+  const keep = Math.max(0, Buffer.byteLength(cur, "utf8") - over - Buffer.byteLength(marker, "utf8"));
+  (bestRef as Record<string | number, unknown>)[bestKey] = utf8PrefixBytes(cur, keep) + marker;
+  return true;
+}
+
+// PG JSONB 不能存 U+0000,且游离代理项(unpaired surrogate)也非法。chat 读侧 exact 水合
+// (chatTailRows SQL)历来对二者做 regexp_replace→U+FFFD;物化投影落 JSONB 前必须同语义脱敏,
+// 否则 bash tail 里的这类字节会让 INSTALL ::jsonb 抛 22P05。exact/admin 面仍从 BYTEA 读原始字节。
+const JSONB_ILLEGAL_RE = /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+function sanitizeJsonbString(s: string): string {
+  JSONB_ILLEGAL_RE.lastIndex = 0;
+  if (!JSONB_ILLEGAL_RE.test(s)) return s;
+  return s.replace(JSONB_ILLEGAL_RE, "\uFFFD");
+}
+/** 递归就地脱敏行内所有字符串值(U+0000 / 游离代理项 → U+FFFD),使其可安全落 JSONB。 */
+function sanitizeRowForJsonb(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) {
+      const v = node[i];
+      if (typeof v === "string") node[i] = sanitizeJsonbString(v);
+      else if (v && typeof v === "object") sanitizeRowForJsonb(v);
+    }
+  } else if (node && typeof node === "object") {
+    const obj = node as Record<string, unknown>;
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      if (typeof v === "string") obj[k] = sanitizeJsonbString(v);
+      else if (v && typeof v === "object") sanitizeRowForJsonb(v);
+    }
+  }
+}
+
+function formatProjectionMB(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+const projectionOversizeNote = (bytes: number): string =>
+  `内容过大（约 ${formatProjectionMB(bytes)}），已省略预览，可点“查看完整”按记录分块查看。`;
+
+/** B-§9-2 单条越限替身:剥离最长字符串仍越 64KB(叶子全是小字符串/深层结构)→ 固定尺寸替身行,
+ *  单条永不越限。保留身份 + 终态判定字段 + `_fullBytes`/`_recordOrdinal`(供前端"查看完整"分块拉取)。 */
+function sentinelForOversizeRow(original: MessageLike, fullBytes: number): MessageLike {
+  const note = projectionOversizeNote(fullBytes);
+  const ordinal = typeof original._recordOrdinal === "number" ? original._recordOrdinal : null;
+  return {
+    ...(typeof original.id === "string" ? { id: original.id } : {}),
+    role: typeof original.role === "string" ? original.role : "tool",
+    ...(typeof original.status === "string" ? { status: original.status } : {}),
+    ...(typeof original._clientMessageId === "string" ? { _clientMessageId: original._clientMessageId } : {}),
+    ...(typeof original._errorCode === "string" ? { _errorCode: original._errorCode } : {}),
+    ...(typeof original._turnTapeMsgId === "string" ? { _turnTapeMsgId: original._turnTapeMsgId } : {}),
+    ...(ordinal !== null ? { _recordOrdinal: ordinal } : {}),
+    _projectionSentinel: true,
+    _truncated: true,
+    _fullBytes: fullBytes,
+    output: note,
+    text: note,
+  };
+}
+
+/** B-§9-1 首/中段 record 越回填预算替身:**未读 payload**,只据 ordinal + octet_length 造替身
+ *  (供"查看完整"按记录分块拉取)。绝不整条拉入进程。id 按 (tape,ordinal) 唯一,避免跨卷 dedup 撞键。 */
+function sentinelForOversizeRecord(tapeId: string, ordinal: number, fullBytes: number): MessageLike {
+  const note = projectionOversizeNote(fullBytes);
+  return {
+    id: `oc-projection-oversize:${tapeId}:${ordinal}`,
+    role: "tool",
+    _projectionSentinel: true,
+    _truncated: true,
+    _fullBytes: fullBytes,
+    _recordOrdinal: ordinal,
+    output: note,
+    text: note,
+  };
+}
+
+/** M-§9-2 卷级畸形/空卷终态替身:固定尺寸提示行(无 record 身份)。id 带 tapeId,避免跨卷 dedup 撞键。 */
+function volumeSentinelRow(tapeId: string, text: string): MessageLike {
+  return { id: `oc-projection-note:${tapeId}`, role: "assistant", _projectionSentinel: true, status: "error", text };
+}
+
+/** B-§9-3 完成证据:该卷终态 assistant/error 行的最小保真拷贝
+ *  (id/_clientMessageId/status/_errorCode/text≤4KB);独立于 rows 行预算,尾截也不丢。 */
+function extractTerminalRowEvidence(visible: MessageLike[]): MessageLike | null {
+  for (let i = visible.length - 1; i >= 0; i--) {
+    const r = visible[i]!;
+    const isTerminal =
+      r.role === "assistant" || r.role === "error" ||
+      typeof r._errorCode === "string" || r.status === "error" || r.status === "completed";
+    if (!isTerminal) continue;
+    const ev: MessageLike = {
+      ...(typeof r.id === "string" ? { id: r.id } : {}),
+      ...(typeof r.role === "string" ? { role: r.role } : {}),
+      ...(typeof r._clientMessageId === "string" ? { _clientMessageId: r._clientMessageId } : {}),
+      ...(typeof r.status === "string" ? { status: r.status } : {}),
+      ...(typeof r._errorCode === "string" ? { _errorCode: r._errorCode } : {}),
+      ...(r._turnTapeComplete === true ? { _turnTapeComplete: true } : {}),
+      _projectionTerminalEvidence: true,
+      text: typeof r.text === "string" ? utf8PrefixBytes(r.text, 4096) : "",
+    };
+    sanitizeRowForJsonb(ev);
+    return ev;
+  }
+  return null;
+}
+
+/** B-§9-3(R3)兜底完成证据:**不读任何 record payload**,从 tape header status + dispatch join 的
+ *  client_message_id 合成最小终态证据行。三条终态 truncated 路径(空卷/首条越预算/解析错)即便一条
+ *  record 都没 hydrate,仍无条件写 header terminal_row —— 前端按 exact clientMessageId 清 in-flight +
+ *  抑制同轮 projection,engine readGenerationProjectionRows dedup 兜底(role='assistant')也成立。
+ *  clientMessageId 只能来自 dispatch join(content 不可读);legacy 无 dispatch 卷 → 无 cmid(仍写 status
+ *  证据,至少保完成态)。id 稳定唯一(tape 派生),避免跨卷 dedup 撞键。text:''(engine 窗口按空文本过滤
+ *  不入模型上下文;判定字段完整保真)。 */
+async function synthesizeTerminalRowFromHeader(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+): Promise<MessageLike | null> {
+  const r = (await client.query<{ tape_status: string | null; client_message_id: string | null }>(
+    `SELECT t.status AS tape_status, d.client_message_id
+       FROM client_session_turn_tapes t
+       LEFT JOIN turn_dispatches d ON d.dispatch_id = t.dispatch_id
+      WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+    [sessionId, userId, tapeId],
+  )).rows[0];
+  if (!r) return null;
+  const status = r.tape_status;
+  if (status !== "completed" && status !== "interrupted" && status !== "crashed") return null;
+  const ev: MessageLike = {
+    id: `oc-projection-terminal:${tapeId}`,
+    role: "assistant",
+    ...(typeof r.client_message_id === "string" ? { _clientMessageId: r.client_message_id } : {}),
+    status,
+    // crashed 走 dispatch_lost 展示码(前端 DISPATCH_LOST_ERROR_CODES 识别);completed 带完成戳(engine
+    // tryDedupCompleted 据此认既有完成 turn)。interrupted 仅保 status。
+    ...(status === "crashed" ? { _errorCode: "SERVICE_RESTART" } : {}),
+    ...(status === "completed" ? { _turnTapeComplete: true } : {}),
+    _projectionTerminalEvidence: true,
+    text: "",
+  };
+  sanitizeRowForJsonb(ev);
+  return ev;
+}
+
+/** 单条投影行 64KB 截断:超限则剥离最长内容字符串,标 `_truncated:true` + `_fullBytes`;
+ *  B-§9-2 硬上限收口:剥离后仍越 64KB → 替换为固定尺寸 sentinel(单条永不越限)。
+ *  chat-safe:绝不吐 exact 原始超大 payload,超大记录只能在 chat 面看到截断预览。 */
+function truncateProjectionRow(row: MessageLike): { row: MessageLike; bytes: number } {
+  const fullBytes = jsonBytes(row);
+  if (fullBytes <= PROJECTION_ROW_MAX_BYTES) return { row, bytes: fullBytes };
+  const clone = structuredClone(row) as MessageLike;
+  let guard = 0;
+  while (jsonBytes(clone) > PROJECTION_ROW_MAX_BYTES && guard++ < 16) {
+    const over = jsonBytes(clone) - PROJECTION_ROW_MAX_BYTES;
+    if (!truncateLongestString(clone, over + 512)) break;
+  }
+  clone._truncated = true;
+  clone._fullBytes = fullBytes;
+  const clonedBytes = jsonBytes(clone);
+  if (clonedBytes > PROJECTION_ROW_MAX_BYTES) {
+    const sentinel = sentinelForOversizeRow(row, fullBytes);
+    return { row: sentinel, bytes: jsonBytes(sentinel) };
+  }
+  return { row: clone, bytes: clonedBytes };
+}
+
+type ProjectionSourceRecord = {
+  msg_id: string;
+  ordinal: number;
+  role: string;
+  content_sha256: string;
+  payload: Buffer;
+};
+
+/** bash_output_tail runtime-event 的资格 + 目标键(与 projectClientSessionMessagesForChat 一致的
+ *  轻校验;读侧 projectClientSessionMessagesForChat 会再校验一次,build 只求 winner 去重有界)。 */
+function tailWinnerTarget(runtimeEvent: unknown): { target: string; totalBytes: number } | null {
+  if (!runtimeEvent || typeof runtimeEvent !== "object" || Array.isArray(runtimeEvent)) return null;
+  const ev = runtimeEvent as Record<string, unknown>;
+  if (ev.type !== "system" || ev.subtype !== "bash_output_tail") return null;
+  const tool = ev.tool_use_id;
+  if (typeof tool !== "string" || !/^[A-Za-z0-9_-]+$/.test(tool)) return null;
+  const rawParent = ev.parent_tool_use_id;
+  const parent = typeof rawParent === "string" && rawParent.length > 0 ? rawParent : "";
+  const totalBytes = typeof ev.total_bytes === "number" && Number.isFinite(ev.total_bytes)
+    ? Math.max(0, ev.total_bytes) : 0;
+  return { target: `${parent}\0${tool}`, totalBytes };
+}
+
+/** 从一卷 tape 的有序 record 构建 chat 内容投影行(visible 行 + bash_output_tail winner)。
+ *  与今日 chat 水合(chatVisibleRows + chatTailRows winner 选取 → hydrateTapeRecordContent)同构,
+ *  但**不含**可变 cost/waiver(读时现算叠加)。逐记录 64KB 截断 + per-tape 512KB/512 行尾截。
+ *  existing = 分段回填时已累计的行(visible 追加、tail winner 合并)。 */
+function buildTapeChatContentRows(
+  records: ProjectionSourceRecord[],
+  tapeId: string,
+  tapeSha256: string,
+  billingAnchorId: string,
+  existing?: { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> },
+): {
+  visible: MessageLike[];
+  tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>;
+} {
+  // content 水合用的最小 anchor:只带 id(billing anchor,供 anchorUsage 判定)+ sha(_turnTapeSha256
+  // 由 row.tape_sha256 决定,这里不影响)。刻意不带 _seq/_orderSeq —— 投影不入库序号,读时现盖。
+  const contentAnchor: MessageLike = { id: billingAnchorId, _turnTapeSha256: tapeSha256 };
+  const visible = existing ? existing.visible : [];
+  const tailWinners = existing ? existing.tailWinners : new Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>();
+  for (const rec of records) {
+    const hydrationRow: HydratedTapeRow = {
+      tape_id: tapeId,
+      tape_sha256: tapeSha256,
+      waive_reason: null,
+      waiver_applied: false,
+      msg_id: rec.msg_id,
+      ordinal: rec.ordinal,
+      role: rec.role,
+      content_sha256: rec.content_sha256,
+      payload: rec.payload,
+      cost_credits: "0",
+      delegate_costs: [],
+    };
+    const content = hydrateTapeRecordContent(hydrationRow, contentAnchor, false, true);
+    // 记录 ordinal(= client_session_turn_tape_records.ordinal):截断行携此 → 前端"查看完整"
+    // 按 recordOrdinal 分块拉取该记录(M-§9-1);读侧渲染忽略,sanitizer 白名单会剥离,不入模型上下文。
+    content._recordOrdinal = rec.ordinal;
+    if (rec.role !== "runtime-event") {
+      visible.push(content);
+      continue;
+    }
+    const target = tailWinnerTarget(content._runtimeEvent);
+    if (!target) continue; // 非 bash_output_tail runtime-event:chat 不展示,丢弃(与 chatVisibleRows 同)。
+    const prev = tailWinners.get(target.target);
+    if (!prev || target.totalBytes > prev.totalBytes ||
+        (target.totalBytes === prev.totalBytes && rec.ordinal > prev.ordinal)) {
+      tailWinners.set(target.target, { row: content, totalBytes: target.totalBytes, ordinal: rec.ordinal });
+    }
+  }
+  return { visible, tailWinners };
+}
+
+/** R4-B2:有界追加的唯一收口 —— 追加 nextBytes 前按行数/字节双上限弹出尾行,返回弹出后的 totalBytes。
+ *  finalizeProjectionRows 与 commitVolumeTruncated 共用:任何合成行(terminal 证据 sentinel)追加都必须
+ *  经此,512 行/512KB 是**硬**上限,合成证据也不例外。 */
+function evictTailForBoundedAppend(out: MessageLike[], totalBytes: number, nextBytes: number): number {
+  while (
+    out.length > 0 &&
+    (out.length >= PROJECTION_TAPE_MAX_ROWS || totalBytes + nextBytes > PROJECTION_TAPE_MAX_BYTES)
+  ) {
+    totalBytes -= jsonBytes(out.pop()!);
+  }
+  return totalBytes;
+}
+
+/** 把 build 累计的 visible + tailWinners 摊平成有序投影行(visible 按 ordinal,winner 按 ordinal 追加),
+ *  逐记录 64KB 截断 + per-tape 512KB/512 行尾截,返回可落库形态。
+ *  B-§9-2:去掉「首行免死」豁免 —— 单条经 truncateProjectionRow 恒 ≤64KB,卷级第一条也不得越 512KB。
+ *  B-§9-3:尾截把 terminal 行截掉时,rows 末尾必保 terminal 完成证据(必要时弹出末行腾位,守 ≤512 行/512KB);
+ *  并返回 terminalRow 供 header 列无条件写。
+ *  MINOR①:winner 行落 `_winnerOrdinal`,building 续段 rehydrate 用真实 ordinal(非 MAX_SAFE_INTEGER)。 */
+function finalizeProjectionRows(
+  visible: MessageLike[],
+  tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>,
+): { rows: MessageLike[]; totalBytes: number; truncated: boolean; terminalRow: MessageLike | null } {
+  const ordered: MessageLike[] = [
+    ...visible,
+    ...[...tailWinners.values()].sort((a, b) => a.ordinal - b.ordinal).map((w) => ({ ...w.row, _winnerOrdinal: w.ordinal })),
+  ];
+  const terminalRow = extractTerminalRowEvidence(visible);
+  const out: MessageLike[] = [];
+  let totalBytes = 0;
+  let truncated = false;
+  for (const row of ordered) {
+    if (out.length >= PROJECTION_TAPE_MAX_ROWS) { truncated = true; break; }
+    // 落 JSONB 前脱敏 U+0000/游离代理项(否则 ::jsonb 抛 22P05);再按字节截断计量。
+    sanitizeRowForJsonb(row);
+    const t = truncateProjectionRow(row);
+    if (totalBytes + t.bytes > PROJECTION_TAPE_MAX_BYTES) { truncated = true; break; }
+    out.push(t.row);
+    totalBytes += t.bytes;
+  }
+  // B-§9-3:尾截掉了 terminal 行 → rows 末尾补 terminal 完成证据 sentinel(必要时弹末行腾位守上限)。
+  if (truncated && terminalRow) {
+    const alreadyHas = terminalRow.id !== undefined && out.some((r) => r.id === terminalRow.id);
+    if (!alreadyHas) {
+      const sentinel: MessageLike = { ...terminalRow, _projectionTruncated: true };
+      sanitizeRowForJsonb(sentinel);
+      const sBytes = jsonBytes(sentinel);
+      totalBytes = evictTailForBoundedAppend(out, totalBytes, sBytes);
+      out.push(sentinel);
+      totalBytes += sBytes;
+    }
+  }
+  return { rows: out, totalBytes, truncated, terminalRow };
+}
+
+/** finalize 同事务:从已 materialize 的 records 写该卷 chat 投影(state=complete/truncated)。
+ *  幂等:PK 冲突 DO NOTHING(同 sha 即已有;finalize 持 tape FOR UPDATE,首写恒最先)。 */
+async function writeTapeChatProjectionOnFinalize(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  tapeSha256: string,
+  billingAnchorId: string,
+  records: ProjectionSourceRecord[],
+): Promise<void> {
+  const { visible, tailWinners } = buildTapeChatContentRows(records, tapeId, tapeSha256, billingAnchorId);
+  const built = finalizeProjectionRows(visible, tailWinners);
+  await client.query(
+    `INSERT INTO tape_chat_projection
+       (session_id,user_id,tape_id,rows,state,next_part,tape_sha256,total_bytes,row_count,terminal_row,updated_at)
+     VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10::jsonb,NOW())
+     ON CONFLICT (session_id,user_id,tape_id) DO NOTHING`,
+    [
+      sessionId, userId, tapeId, JSON.stringify(built.rows),
+      built.truncated ? "truncated" : "complete",
+      records.length, tapeSha256, built.totalBytes, built.rows.length,
+      built.terminalRow ? JSON.stringify(built.terminalRow) : null,
+    ],
+  );
+}
+
+type ProjectionHeader = {
+  state: "building" | "complete" | "truncated";
+  tape_sha256: string;
+  total_bytes: number;
+  row_count: number;
+  /** B-§9-3 完成证据(独立于 rows 行预算):尾截丢了 terminal 行时读侧兜底。小 JSONB,与 rows 分列,不 detoast 大字段。 */
+  terminalRow: MessageLike | null;
+};
+
+/** chat 读第一阶段:只读投影 header(**不含 rows JSONB,绝不触 parts/records BYTEA**)。 */
+async function readProjectionHeaders(
+  q: Queryable,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, ProjectionHeader>> {
+  if (tapeIds.length === 0) return new Map();
+  const res = await q.query<{
+    tape_id: string; state: string; tape_sha256: string; total_bytes: string; row_count: number;
+    terminal_row: MessageLike | null;
+  }>(
+    // terminal_row 是小 JSONB(独立列),不含大 rows JSONB → SELECT 不 detoast 大字段(仍守「header-only 不触 BYTEA」)。
+    `SELECT tape_id, state, tape_sha256, total_bytes, row_count, terminal_row
+       FROM tape_chat_projection
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])`,
+    [sessionId, userId, tapeIds],
+  );
+  return new Map(res.rows.map((r) => [r.tape_id, {
+    state: r.state as ProjectionHeader["state"],
+    tape_sha256: r.tape_sha256,
+    total_bytes: bigIntNum(r.total_bytes, "tape_chat_projection.total_bytes"),
+    row_count: r.row_count,
+    terminalRow: r.terminal_row && typeof r.terminal_row === "object" ? r.terminal_row : null,
+  }]));
+}
+
+type TapeCostEnrichment = { billingAnchorId: string | null } & ExactUsageEnrichment;
+
+/** chat 读:批量现算每卷可变计费叠加(turn_tape_cost_components + pending + turn_waivers,
+ *  **均非 BYTEA 表**)。权威源不冻结在投影里 —— waiver 可 finalize 后 apply、cost 可晚到 stage。 */
+async function readTapeCostEnrichment(
+  q: Queryable,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, TapeCostEnrichment>> {
+  if (tapeIds.length === 0) return new Map();
+  const res = await q.query<{
+    tape_id: string; billing_anchor_id: string | null; cost_credits: string;
+    waiver_applied: boolean; delegate_costs: unknown;
+  }>(
+    `SELECT t.tape_id, t.billing_anchor_id,
+            EXISTS (
+              SELECT 1 FROM turn_waivers w
+               WHERE ('c:' || w.user_id::text)=t.user_id
+                 AND w.turn_key=t.turn_key AND w.status='applied'
+            ) AS waiver_applied,
+            COALESCE((
+              SELECT SUM(c.cost_credits)::text FROM (
+                SELECT c.cost_credits::numeric AS cost_credits
+                  FROM turn_tape_cost_components c
+                 WHERE c.user_id=t.user_id AND c.session_id=t.session_id
+                   AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
+                UNION ALL
+                SELECT p.cost_credits::numeric AS cost_credits
+                  FROM pending_usage_patches p
+                 WHERE p.user_id=t.user_id
+                   AND t.billing_anchor_id IS NOT NULL
+                   AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+              ) c
+            ), '0') AS cost_credits,
+            COALESCE((
+              SELECT jsonb_agg(jsonb_build_object('agentId', g.delegate_agent_id, 'costCredits', g.cost_credits)
+                       ORDER BY g.delegate_agent_id)
+                FROM (
+                  SELECT d.delegate_agent_id, SUM(d.cost_credits)::text AS cost_credits FROM (
+                    SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
+                      FROM turn_tape_cost_components c
+                     WHERE c.user_id=t.user_id AND c.session_id=t.session_id
+                       AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
+                    UNION ALL
+                    SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
+                      FROM pending_usage_patches p
+                     WHERE p.user_id=t.user_id
+                       AND t.billing_anchor_id IS NOT NULL
+                       AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+                  ) d WHERE d.delegate_agent_id IS NOT NULL
+                  GROUP BY d.delegate_agent_id
+                ) g
+            ), '[]'::jsonb) AS delegate_costs
+       FROM client_session_turn_tapes t
+      WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])`,
+    [sessionId, userId, tapeIds],
+  );
+  return new Map(res.rows.map((r) => [r.tape_id, {
+    billingAnchorId: r.billing_anchor_id,
+    costCredits: r.cost_credits,
+    waiverApplied: r.waiver_applied,
+    delegates: parseDelegateCosts(r.delegate_costs),
+  }]));
+}
+
+type CollapseMeta = { totalBytes: number; clientMessageId: string | null; dispatchOutcome: string | null };
+
+/** tape header 精确终态(completed/interrupted/crashed)→ 折叠行 outcome。其它/缺失一律不给终态字段。 */
+function mapTapeStatusToOutcome(status: string | null): string | null {
+  return status === "completed" || status === "interrupted" || status === "crashed" ? status : null;
+}
+
+/** 折叠行元数据(B-§9-4):outcome **权威 = client_session_turn_tapes.status**(tape header 精确终态),
+ *  **不再** 取 turn_dispatches.outcome —— 后者会把 late-tape 转 manual(outcome=not_accepted)错显成折叠行
+ *  的终态,且 legacy 无 dispatch 卷拿不到终态。dispatch 仅补 client_message_id(前端按 exact cmid 清 in-flight)。 */
+async function readCollapseMeta(
+  q: Queryable,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, CollapseMeta>> {
+  if (tapeIds.length === 0) return new Map();
+  const res = await q.query<{
+    tape_id: string; total_bytes: string; client_message_id: string | null; tape_status: string | null;
+  }>(
+    `SELECT t.tape_id, t.total_bytes, d.client_message_id, t.status AS tape_status
+       FROM client_session_turn_tapes t
+       LEFT JOIN turn_dispatches d ON d.dispatch_id = t.dispatch_id
+      WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])`,
+    [sessionId, userId, tapeIds],
+  );
+  return new Map(res.rows.map((r) => [r.tape_id, {
+    totalBytes: bigIntNumOr(r.total_bytes, 0),
+    clientMessageId: r.client_message_id,
+    dispatchOutcome: mapTapeStatusToOutcome(r.tape_status),
+  }]));
+}
+
+/** M-§9-3 展开集批量读投影 rows(complete/truncated),一次 tape_id=ANY 取回,消 N+1。 */
+async function readProjectionRowsBatch(
+  q: Queryable,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, MessageLike[]>> {
+  const out = new Map<string, MessageLike[]>();
+  if (tapeIds.length === 0) return out;
+  const res = await q.query<{ tape_id: string; rows: MessageLike[] }>(
+    `SELECT tape_id, rows FROM tape_chat_projection
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[]) AND state IN ('complete','truncated')`,
+    [sessionId, userId, tapeIds],
+  );
+  for (const r of res.rows) if (Array.isArray(r.rows)) out.set(r.tape_id, r.rows);
+  return out;
+}
+
+/** M-§9-2 卷级终态截断:畸形/空卷/越预算首条 → truncated + sentinel 行 + terminal_row。一次性 log
+ *  (此后读侧见 truncated 不再回填,自然不复触)。调用前顶部块已确保 building 行存在,故恒走 UPDATE +
+ *  CAS 守 building/next_part/sha,防覆盖并发进展(CAS 落空即别人已推进,不 log noise 也无害)。 */
+async function commitVolumeTruncated(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  expectedSha: string,
+  fromNextPart: number,
+  rows: MessageLike[],
+  terminalRow: MessageLike | null,
+  logReason: string,
+): Promise<void> {
+  // B-§9-3(R3):终态证据带 _clientMessageId 时并入 rows 末尾(chat 读据此按 exact cmid 清 in-flight /
+  // 抑制同轮 projection —— 卷级 sentinel 本身无 cmid);terminal_row 列独立写(engine
+  // readGenerationProjectionRows dedup 兜底)。二者同源,无 payload 读。
+  const outRows = [...rows];
+  let outBytes = outRows.reduce((s, r) => s + jsonBytes(r), 0);
+  if (terminalRow && typeof terminalRow._clientMessageId === "string") {
+    const has = terminalRow.id !== undefined && outRows.some((r) => r.id === terminalRow.id);
+    if (!has) {
+      const evid: MessageLike = { ...terminalRow, _projectionTruncated: true };
+      sanitizeRowForJsonb(evid);
+      // R4-B2:合成证据同样过硬上限收口(512 building 行 + oversize 次条的构造曾越到 513 行)。
+      const evidBytes = jsonBytes(evid);
+      outBytes = evictTailForBoundedAppend(outRows, outBytes, evidBytes);
+      outRows.push(evid);
+      outBytes += evidBytes;
+    }
+  }
+  const totalBytes = outBytes;
+  const upd = await client.query(
+    `UPDATE tape_chat_projection
+        SET rows=$4::jsonb, state='truncated', next_part=$5, total_bytes=$6, row_count=$7,
+            terminal_row=$8::jsonb, updated_at=NOW()
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state='building'
+        AND next_part=$9 AND tape_sha256=$10`,
+    [sessionId, userId, tapeId, JSON.stringify(outRows), outRows.length, totalBytes, outRows.length,
+      terminalRow ? JSON.stringify(terminalRow) : null, fromNextPart, expectedSha],
+  );
+  if ((upd.rowCount ?? 0) > 0) {
+    // eslint-disable-next-line no-console
+    console.warn("[pgSessions] tape_chat_projection volume terminally truncated", { sessionId, tapeId, reason: logReason });
+  }
+}
+
+/** 惰性回填一卷(单段):从 building 游标 next_part 起读 records(BYTEA;仅存量无投影卷),构建投影,
+ *  CAS 推进。返回终态(complete/truncated 可展开;building 本次折叠)+ 本段读取字节数。
+ *  B-§9-1:先读 record header(octet_length),预算内才 SELECT payload;单条越预算绝不整读(sentinel)。
+ *  M-§9-2:空卷/解析异常 → 终态 truncated + sentinel(一次性 log,二读不复触)。
+ *  sha 漂移 → 作废重建;并发 CAS 失败 → 回读现态。绝不回退全量水合。 */
+async function backfillTapeSegment(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  expectedSha: string,
+  billingAnchorId: string,
+  budgetBytes: number,
+): Promise<{ state: ProjectionHeader["state"]; bytesRead: number }> {
+  return withTx(pool, async (client) => {
+    // 该卷 record 总数(判定分段是否读尽)。
+    const cnt = (await client.query<{ n: string; maxo: number | null }>(
+      `SELECT COUNT(*)::text AS n, MAX(ordinal) AS maxo
+         FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tapeId],
+    )).rows[0];
+    const recordCount = Number(cnt?.n ?? 0);
+
+    // 现态(FOR UPDATE 串行化同卷并发回填)。
+    const existingRow = (await client.query<{
+      state: string; next_part: number; tape_sha256: string; rows: MessageLike[];
+    }>(
+      `SELECT state, next_part, tape_sha256, rows FROM tape_chat_projection
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 FOR UPDATE`,
+      [sessionId, userId, tapeId],
+    )).rows[0];
+    if (existingRow && (existingRow.state === "complete" || existingRow.state === "truncated")) {
+      return { state: existingRow.state as ProjectionHeader["state"], bytesRead: 0 };
+    }
+    // sha 漂移(tape 被重写)或不存在 → 重置为 next_part=0 的新 building。
+    let nextPart = 0;
+    let acc: { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> } =
+      { visible: [], tailWinners: new Map() };
+    if (existingRow && existingRow.state === "building" && existingRow.tape_sha256 === expectedSha) {
+      nextPart = existingRow.next_part;
+      acc = rehydrateBuildingAccumulator(Array.isArray(existingRow.rows) ? existingRow.rows : []);
+    }
+    const shaDrift = !!existingRow && existingRow.tape_sha256 !== expectedSha;
+    if (!existingRow) {
+      await client.query(
+        `INSERT INTO tape_chat_projection
+           (session_id,user_id,tape_id,rows,state,next_part,tape_sha256,total_bytes,row_count)
+         VALUES ($1,$2,$3,'[]'::jsonb,'building',0,$4,0,0)
+         ON CONFLICT (session_id,user_id,tape_id) DO NOTHING`,
+        [sessionId, userId, tapeId, expectedSha],
+      );
+    } else if (shaDrift) {
+      await client.query(
+        `UPDATE tape_chat_projection SET rows='[]'::jsonb, state='building', next_part=0,
+                tape_sha256=$4, total_bytes=0, row_count=0, terminal_row=NULL, updated_at=NOW()
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tapeId, expectedSha],
+      );
+      nextPart = 0;
+      acc = { visible: [], tailWinners: new Map() };
+    }
+    const casFromNextPart = shaDrift ? 0 : nextPart;
+
+    // M-§9-2:空卷(finalized anchor 却无 records = 畸形)→ 终态 truncated + 卷级 sentinel + 一次性 log。
+    // B-§9-3(R3):无条件写 header terminal_row(从 tape header + dispatch join 合成,无 payload 读)。
+    if (recordCount === 0) {
+      const synth = await synthesizeTerminalRowFromHeader(client, sessionId, userId, tapeId);
+      await commitVolumeTruncated(
+        client, sessionId, userId, tapeId, expectedSha, casFromNextPart,
+        [volumeSentinelRow(tapeId, "该轮内容缺失，无法展开。")], synth, "empty_records",
+      );
+      return { state: "truncated", bytesRead: 0 };
+    }
+
+    // B-§9-1:先读 record header(ordinal + octet_length,**不拉 payload**),预算内才决定 SELECT 哪些 payload。
+    const fullBudget = backfillBudgetBytes();
+    const heads = (await client.query<{ ordinal: number; sz: number }>(
+      `SELECT ordinal, octet_length(payload) AS sz
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4
+        ORDER BY ordinal LIMIT $5`,
+      [sessionId, userId, tapeId, nextPart, BACKFILL_SEGMENT_RECORD_LIMIT],
+    )).rows;
+
+    const consumeOrdinals: number[] = [];
+    let planned = 0;
+    let oversize: { ordinal: number; sz: number } | null = null;
+    let deferred = false;
+    for (const h of heads) {
+      const sz = Number(h.sz) || 0;
+      if (consumeOrdinals.length === 0) {
+        // 首条 record 的硬预算准入(R3:无 FLOOR 强读):
+        if (sz > fullBudget) { oversize = { ordinal: h.ordinal, sz }; break; } // 超整预算 → 永不适配任一单读 → sentinel + truncated,绝不整条拉入进程
+        if (sz > budgetBytes) { deferred = true; break; }                       // 超本读剩余预算(整预算够)→ defer(本次折叠,下轮空预算 ≤fullBudget 必可读)
+        // ≤ 本读剩余预算 → 读入(单条内存安全);消费后进入 else 分支按剩余预算续接。
+      } else if (planned + sz > budgetBytes) {
+        break;
+      }
+      consumeOrdinals.push(h.ordinal);
+      planned += sz;
+    }
+
+    // B-§9-1:首条 record 越整预算 → 该卷直接 truncated + 单记录 sentinel(未读 payload)。
+    // B-§9-3(R3):完成证据优先取 acc.visible 已 hydrate 的真终态行;acc 无(首条即越预算,一条都没
+    // hydrate)→ 从 header 合成,保证 terminal_row 非空。
+    if (oversize) {
+      const rows = finalizeProjectionRows(
+        [...acc.visible, sentinelForOversizeRecord(tapeId, oversize.ordinal, oversize.sz)],
+        acc.tailWinners,
+      );
+      const terminal = rows.terminalRow
+        ?? await synthesizeTerminalRowFromHeader(client, sessionId, userId, tapeId);
+      await commitVolumeTruncated(
+        client, sessionId, userId, tapeId, expectedSha, casFromNextPart,
+        rows.rows, terminal, `record_over_budget:${oversize.sz}>${fullBudget}`,
+      );
+      return { state: "truncated", bytesRead: 0 };
+    }
+    // 本读剩余预算不足以起步该卷(整预算足)→ 不消费、保持 building、本次折叠,下次读足预算再收敛。
+    if (deferred || consumeOrdinals.length === 0) {
+      return { state: "building", bytesRead: 0 };
+    }
+
+    // 预算内的 record:仅 SELECT 这些 ordinal 的 payload(有界,绝不整卷拉入)。
+    const lastConsume = consumeOrdinals[consumeOrdinals.length - 1]!;
+    const seg = (await client.query<ProjectionSourceRecord>(
+      `SELECT msg_id, ordinal, role, content_sha256, payload
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4 AND ordinal <= $5
+        ORDER BY ordinal`,
+      [sessionId, userId, tapeId, nextPart, lastConsume],
+    )).rows;
+    let bytesRead = 0;
+    const consume: ProjectionSourceRecord[] = [];
+    let lastOrdinal = nextPart - 1;
+    for (const rec of seg) {
+      const payload = Buffer.from(rec.payload);
+      consume.push({ ...rec, payload });
+      bytesRead += payload.length;
+      lastOrdinal = rec.ordinal;
+    }
+
+    // M-§9-2:record payload 解析异常(坏 JSON / hash 不符)→ 终态 truncated + 卷级 sentinel + 一次性 log。
+    let built: { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> };
+    let finalized: { rows: MessageLike[]; totalBytes: number; truncated: boolean; terminalRow: MessageLike | null };
+    try {
+      built = buildTapeChatContentRows(consume, tapeId, expectedSha, billingAnchorId, acc);
+      finalized = finalizeProjectionRows(built.visible, built.tailWinners);
+    } catch (err) {
+      // B-§9-3(R3):解析错也无条件写 header terminal_row(从 header 合成,无 payload 读)。
+      const synth = await synthesizeTerminalRowFromHeader(client, sessionId, userId, tapeId);
+      await commitVolumeTruncated(
+        client, sessionId, userId, tapeId, expectedSha, casFromNextPart,
+        [volumeSentinelRow(tapeId, "该轮内容无法解析，已停止展开。")], synth,
+        `record_parse_error:${(err as Error)?.message ?? "unknown"}`,
+      );
+      return { state: "truncated", bytesRead: 0 };
+    }
+
+    const reachedEnd = cnt?.maxo != null && lastOrdinal >= cnt.maxo;
+    const newState = reachedEnd
+      ? (finalized.truncated ? "truncated" : "complete")
+      : (finalized.truncated ? "truncated" : "building");
+    // CAS 推进:防并发 lost-update(WHERE state='building' AND next_part=$prev AND sha 未漂移)。terminal_row 无条件写。
+    const upd = await client.query(
+      `UPDATE tape_chat_projection
+          SET rows=$4::jsonb, state=$5, next_part=$6, total_bytes=$7, row_count=$8,
+              terminal_row=$11::jsonb, updated_at=NOW()
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          AND state='building' AND next_part=$9 AND tape_sha256=$10`,
+      [
+        sessionId, userId, tapeId, JSON.stringify(finalized.rows), newState,
+        lastOrdinal + 1, finalized.totalBytes, finalized.rows.length, casFromNextPart, expectedSha,
+        finalized.terminalRow ? JSON.stringify(finalized.terminalRow) : null,
+      ],
+    );
+    if ((upd.rowCount ?? 0) === 0) {
+      // 并发已推进/漂移 → 回读现态(不覆盖)。
+      const cur = (await client.query<{ state: string }>(
+        `SELECT state FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tapeId],
+      )).rows[0];
+      const st = cur?.state === "complete" || cur?.state === "truncated" ? cur.state : "building";
+      return { state: st as ProjectionHeader["state"], bytesRead };
+    }
+    return { state: newState as ProjectionHeader["state"], bytesRead };
+  });
+}
+
+/** 从 building 行已累计的 rows 还原 build 累加器(visible + tail winner map)供下一段续建。 */
+function rehydrateBuildingAccumulator(
+  rows: MessageLike[],
+): { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> } {
+  const visible: MessageLike[] = [];
+  const tailWinners = new Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>();
+  for (const row of rows) {
+    if (row.role === "runtime-event") {
+      const target = tailWinnerTarget(row._runtimeEvent);
+      if (target) {
+        // MINOR①:winner 落库带 `_winnerOrdinal`(真实 ordinal),续段还原用它排序/去重 —— 非
+        // MAX_SAFE_INTEGER(否则跨段 winner 排序错位、同 total_bytes 平局永不被更晚 ordinal 覆盖)。
+        const ordinal = typeof row._winnerOrdinal === "number" ? row._winnerOrdinal : Number.MAX_SAFE_INTEGER;
+        tailWinners.set(target.target, { row, totalBytes: target.totalBytes, ordinal });
+      }
+      continue;
+    }
+    visible.push(row);
+  }
+  return { visible, tailWinners };
+}
+
+/** chat 读第二阶段:把某卷投影行现盖 _seq/_orderSeq(活体 anchor)+ 现算 cost/waiver 叠加;
+ *  卷级截断(state='truncated')时给末行盖 `_projectionTruncated:true`(前端渲染「已截断,查看完整」)。 */
+function applyProjectionForChat(
+  storedRows: MessageLike[],
+  anchor: MessageLike,
+  enrich: TapeCostEnrichment | undefined,
+  truncated: boolean,
+): MessageLike[] {
+  const billingAnchorId = enrich?.billingAnchorId ?? null;
+  const out = storedRows.map((stored) => {
+    let row: MessageLike = { ...stored };
+    // `_winnerOrdinal` 是 building 续段内部记账,不上 wire;`_recordOrdinal` 仅截断行需要
+    // (前端"查看完整"按记录分块拉),非截断行剥掉减噪。
+    delete row._winnerOrdinal;
+    if (row._truncated !== true) delete row._recordOrdinal;
+    if (typeof anchor._seq === "number") row._seq = anchor._seq;
+    else delete row._seq;
+    if (typeof anchor._orderSeq === "number") row._orderSeq = anchor._orderSeq;
+    else delete row._orderSeq;
+    if (enrich && billingAnchorId !== null && row.id === billingAnchorId) {
+      row = mergeExactUsage(row, enrich, true);
+    }
+    return row;
+  });
+  if (truncated && out.length > 0) out[out.length - 1]!._projectionTruncated = true;
+  return out;
+}
+
+/** 折叠 anchor 行(RFC §9):anchor 原样 + 显式终态字段。finalized 折叠 = 终态存在证据,≠ 内容已展开。 */
+function collapsedAnchorRow(anchor: MessageLike, meta: CollapseMeta | undefined): MessageLike {
+  return {
+    ...anchor,
+    _tapeCollapsed: true,
+    _tapeTotalBytes: meta?.totalBytes ?? 0,
+    _clientMessageId: meta?.clientMessageId ?? (anchor._clientMessageId as string | undefined) ?? undefined,
+    _dispatchOutcome: meta?.dispatchOutcome ?? undefined,
+  };
+}
+
+/** chat 读物化投影主路径(RFC §9)。两阶段:header-only → 投影展开;存量卷惰性回填;
+ *  超预算 / building / 异常一律**有界折叠**,绝不回退全量水合。 */
+async function hydrateChatFromProjection(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  messages: MessageLike[],
+): Promise<MessageLike[]> {
+  const tapeAnchors = messages.filter(
+    (m) => m && typeof m._turnTapeId === "string" && typeof m._turnTapeSha256 === "string",
+  );
+  const tapeIds = [...new Set(tapeAnchors.map((m) => m._turnTapeId as string))];
+
+  // 第一阶段:只读投影 header(不触任何 BYTEA)。
+  const headers = await readProjectionHeaders(pool, sessionId, userId, tapeIds);
+  // 每卷 anchor 的 sha(判定投影漂移)。同 tapeId 多 anchor 罕见,取首个。
+  const shaByTape = new Map<string, string>();
+  for (const a of tapeAnchors) {
+    const tid = a._turnTapeId as string;
+    if (!shaByTape.has(tid)) shaByTape.set(tid, a._turnTapeSha256 as string);
+  }
+
+  // 可用投影(complete/truncated 且 sha 未漂移)vs 待回填(无/building/漂移)。
+  const usable = new Set<string>();
+  const needBackfill: string[] = [];
+  for (const tid of tapeIds) {
+    const h = headers.get(tid);
+    if (h && (h.state === "complete" || h.state === "truncated") && h.tape_sha256 === shaByTape.get(tid)) {
+      usable.add(tid);
+    } else {
+      needBackfill.push(tid);
+    }
+  }
+
+  // 惰性回填:存量卷按 total_bytes 小卷优先,单次读 ≤OC_BACKFILL_BYTES;超预算的留待下次读。
+  if (needBackfill.length > 0) {
+    const sizes = await readCollapseMeta(pool, sessionId, userId, needBackfill);
+    const anchorById = new Map(tapeAnchors.map((a) => [a._turnTapeId as string, a]));
+    const sorted = [...needBackfill].sort(
+      (x, y) => (sizes.get(x)?.totalBytes ?? 0) - (sizes.get(y)?.totalBytes ?? 0),
+    );
+    let budget = backfillBudgetBytes();
+    for (const tid of sorted) {
+      if (budget <= 0) break;
+      const sha = shaByTape.get(tid);
+      const billingAnchorId = String(anchorById.get(tid)?.id ?? "");
+      if (!sha || !billingAnchorId) continue;
+      try {
+        const r = await backfillTapeSegment(pool, sessionId, userId, tid, sha, billingAnchorId, budget);
+        budget -= r.bytesRead;
+        if (r.state === "complete" || r.state === "truncated") usable.add(tid);
+      } catch {
+        // 回填失败只影响本次性能:留作折叠,下次读继续。绝不抛(否则整会话读挂)。
+      }
+    }
+  }
+
+  // chat 单响应投影预算(≤8MB/≤2000 行):从最新卷起累计,超限的最老卷折叠。
+  const usableTotal = new Map<string, ProjectionHeader>();
+  for (const tid of usable) {
+    const h = headers.get(tid);
+    // 回填新写的卷 header 不在首阶段 map 里,补读一次(仍非 BYTEA)。
+    usableTotal.set(tid, h ?? { state: "complete", tape_sha256: shaByTape.get(tid) ?? "", total_bytes: 0, row_count: 0, terminalRow: null });
+  }
+  const missingHeader = [...usable].filter((tid) => !headers.has(tid));
+  if (missingHeader.length > 0) {
+    const fresh = await readProjectionHeaders(pool, sessionId, userId, missingHeader);
+    for (const [tid, h] of fresh) usableTotal.set(tid, h);
+  }
+  const expand = new Set<string>();
+  let budgetBytes = 0;
+  let budgetRows = 0;
+  // messages 按时间升序;从尾(最新)向头累计。
+  const seenTape = new Set<string>();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    const tid = typeof m._turnTapeId === "string" ? m._turnTapeId : null;
+    if (!tid || !usable.has(tid) || seenTape.has(tid)) continue;
+    seenTape.add(tid);
+    const h = usableTotal.get(tid)!;
+    if (budgetBytes + h.total_bytes <= CHAT_PROJECTION_MAX_BYTES && budgetRows + h.row_count <= CHAT_PROJECTION_MAX_ROWS) {
+      expand.add(tid);
+      budgetBytes += h.total_bytes;
+      budgetRows += h.row_count;
+    }
+  }
+
+  // 折叠集 = 所有非展开的 tape(待回填未收敛 + 超预算)。批量读折叠元数据 + 展开集 cost 叠加 + 投影 rows。
+  // M-§9-3:展开集 rows 一次 tape_id=ANY 批量取回,消 N+1。
+  const collapseTapes = tapeIds.filter((tid) => !expand.has(tid));
+  const [collapseMeta, costEnrich, projectionRowsByTape] = await Promise.all([
+    readCollapseMeta(pool, sessionId, userId, collapseTapes),
+    readTapeCostEnrichment(pool, sessionId, userId, [...expand]),
+    readProjectionRowsBatch(pool, sessionId, userId, [...expand]),
+  ]);
+
+  const assembled = messages.flatMap((anchor) => {
+    const tid = typeof anchor._turnTapeId === "string" ? anchor._turnTapeId : null;
+    if (!tid || typeof anchor._turnTapeSha256 !== "string") return [anchor];
+    if (expand.has(tid)) {
+      const stored = projectionRowsByTape.get(tid);
+      // 展开集但 rows 读空(极端并发被清)→ 降级折叠,绝不回退全量水合。
+      if (!stored) return [collapsedAnchorRow(anchor, collapseMeta.get(tid))];
+      return applyProjectionForChat(
+        stored, anchor, costEnrich.get(tid), usableTotal.get(tid)?.state === "truncated",
+      );
+    }
+    return [collapsedAnchorRow(anchor, collapseMeta.get(tid))];
+  });
+
+  return projectClientSessionMessagesForChat(assembled);
+}
+
+// ── 引擎上下文读(RFC §9)──────────────────────────────────────────────────────
+// loadMasterSessionMessages 切到这里:按 _orderSeq 合并 client_sessions.messages 的 canonical
+// user 行 与 投影表的 assistant 生成行,合并后做与 sanitizer 同构的 48 行/18k 截断。产物与今日
+// sanitizer 等价(不丢用户问题),但绝不为此全量水合 192MB(引擎历史本就截到 48 行)。
+// 无投影卷同惰性回填预算;折叠/省略行绝不进产物。exact/durable/admin 面不受影响。
+
+/** 与 bridge extractMasterHistoryText 同构:text || content(string)|| content 数组拼接。 */
+function extractHistoryText(msg: MessageLike): string {
+  if (typeof msg.text === "string") return msg.text;
+  if (typeof msg.content === "string") return msg.content;
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .map((part) => {
+        if (part && typeof part === "object") {
+          const t = (part as { text?: unknown }).text;
+          return typeof t === "string" ? t : "";
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+/** 与 _sanitizeMasterHistoricalMessagesForFrame 同构的窗口选取(48 行/18k 字符),但**保留整行字段**
+ *  (_clientMessageId/status/_errorCode 供 dedup + 再 sanitize 双用)。上限常数单一权威在
+ *  masterHistoryLimits。 */
+function selectMasterHistoryWindow(msgs: MessageLike[]): MessageLike[] {
+  const rows = msgs.filter((m) => {
+    if (!m || (m.role !== "user" && m.role !== "assistant")) return false;
+    if (m.system === true) return false;
+    return extractHistoryText(m).trim() !== "";
+  });
+  let selected = rows.slice(-MASTER_HISTORY_MAX_MESSAGES);
+  while (selected.length > 0) {
+    const chars = selected.reduce((sum, m) => sum + extractHistoryText(m).length, 0);
+    if (chars <= MASTER_HISTORY_MAX_CHARS) break;
+    selected = selected.slice(1);
+  }
+  return selected;
+}
+
+/** 读一组卷已收敛投影里的 user/assistant 生成行(engine-context 只要这两类,tool/thinking/runtime 不进
+ *  模型上下文)。header-only 判定 state,rows 仅取可展开卷。 */
+async function readGenerationProjectionRows(
+  q: Queryable,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, MessageLike[]>> {
+  if (tapeIds.length === 0) return new Map();
+  const res = await q.query<{ tape_id: string; rows: MessageLike[]; terminal_row: MessageLike | null }>(
+    `SELECT tape_id, rows, terminal_row FROM tape_chat_projection
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
+        AND state IN ('complete','truncated')`,
+    [sessionId, userId, tapeIds],
+  );
+  const out = new Map<string, MessageLike[]>();
+  for (const r of res.rows) {
+    if (!Array.isArray(r.rows)) continue;
+    const gen = r.rows.filter((m) => m && (m.role === "assistant" || m.role === "user"));
+    // B-§9-3 兜底:assistant 完成行被行预算尾截掉时,用 header terminal_row 补一条(保 dedup/完成证据)。
+    const term = r.terminal_row;
+    if (term && typeof term === "object" && term.role === "assistant") {
+      const alreadyIn = term.id !== undefined && gen.some((m) => m.id === term.id);
+      const hasEvidence = gen.some(
+        (m) => m.role === "assistant" && (typeof m._clientMessageId === "string" || m._turnTapeComplete === true),
+      );
+      if (!alreadyIn && !hasEvidence) gen.push(term);
+    }
+    out.set(r.tape_id, gen);
+  }
+  return out;
+}
+
+/** engine-context 主实现。返回 MessageLike[](与今日 loadMasterSessionMessages 返回兼容:
+ *  MessageLike[] | null)。 */
+async function computeEngineContextMessages(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+): Promise<MessageLike[] | null> {
+  const row = (
+    await pool.query<{ messages: string; archived_through_seq: number | null }>(
+      "SELECT messages, archived_through_seq FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
+      [sessionId, userId],
+    )
+  ).rows[0];
+  if (!row) return null;
+  let hot: MessageLike[];
+  try {
+    const parsed = JSON.parse(row.messages);
+    hot = Array.isArray(parsed) ? (parsed as MessageLike[]) : [];
+  } catch {
+    hot = [];
+  }
+  hot = deriveOrderSeqsForRead(hot, bigIntNumOr(row.archived_through_seq, 0));
+
+  const anchors = hot.filter(
+    (m) => m && typeof m._turnTapeId === "string" && typeof m._turnTapeSha256 === "string",
+  );
+  const tapeIds = [...new Set(anchors.map((m) => m._turnTapeId as string))];
+  const shaByTape = new Map<string, string>();
+  for (const a of anchors) {
+    const tid = a._turnTapeId as string;
+    if (!shaByTape.has(tid)) shaByTape.set(tid, a._turnTapeSha256 as string);
+  }
+
+  // 可用投影 vs 待回填(与 chat 读同一惰性回填预算机制)。
+  const headers = await readProjectionHeaders(pool, sessionId, userId, tapeIds);
+  const needBackfill: string[] = [];
+  for (const tid of tapeIds) {
+    const h = headers.get(tid);
+    if (!(h && (h.state === "complete" || h.state === "truncated") && h.tape_sha256 === shaByTape.get(tid))) {
+      needBackfill.push(tid);
+    }
+  }
+  if (needBackfill.length > 0) {
+    const sizes = await readCollapseMeta(pool, sessionId, userId, needBackfill);
+    const anchorById = new Map(anchors.map((a) => [a._turnTapeId as string, a]));
+    const sorted = [...needBackfill].sort(
+      (x, y) => (sizes.get(x)?.totalBytes ?? 0) - (sizes.get(y)?.totalBytes ?? 0),
+    );
+    let budget = backfillBudgetBytes();
+    for (const tid of sorted) {
+      if (budget <= 0) break;
+      const sha = shaByTape.get(tid);
+      const billingAnchorId = String(anchorById.get(tid)?.id ?? "");
+      if (!sha || !billingAnchorId) continue;
+      try {
+        const r = await backfillTapeSegment(pool, sessionId, userId, tid, sha, billingAnchorId, budget);
+        budget -= r.bytesRead;
+      } catch {
+        /* 回填失败 → 该卷生成行本次省略(折叠),不阻断上下文注入 */
+      }
+    }
+  }
+
+  const generationRows = await readGenerationProjectionRows(pool, sessionId, userId, tapeIds);
+  const merged: MessageLike[] = [];
+  for (const m of hot) {
+    const tid = typeof m._turnTapeId === "string" ? m._turnTapeId : null;
+    if (tid && typeof m._turnTapeSha256 === "string") {
+      // tape 锚点:热行本体是无正文的 assistant 空壳,用投影的生成行替代(现盖 _seq/_orderSeq)。
+      const rows = generationRows.get(tid);
+      if (!rows) continue; // 无投影/未收敛 → 生成行省略(折叠),user 问题仍在热行中。
+      for (const g of rows) {
+        const out: MessageLike = { ...g };
+        if (typeof m._orderSeq === "number") out._orderSeq = m._orderSeq;
+        if (typeof m._seq === "number") out._seq = m._seq;
+        merged.push(out);
+      }
+      continue;
+    }
+    merged.push(m);
+  }
+  merged.sort(compareMessagesByOrder);
+  return selectMasterHistoryWindow(merged);
+}
+
+/** 展开端点后端(RFC §9):按行游标分页某卷已收敛投影(complete/truncated);chat-safe 形态。 */
+async function listTapeChatProjectionRecordsImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  cursor: number,
+  limit: number,
+): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+  // 分租 + tape 复合校验:会话不属本人 / tape 无收敛投影 → null(端点统一 404)。
+  const res = await pool.query<{ rows: MessageLike[]; row_count: number }>(
+    `SELECT rows, row_count FROM tape_chat_projection
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state IN ('complete','truncated')`,
+    [sessionId, userId, tapeId],
+  );
+  const row = res.rows[0];
+  if (!row || !Array.isArray(row.rows)) return null;
+  const all = row.rows;
+  const total = all.length;
+  const start = Number.isFinite(cursor) && cursor > 0 ? Math.floor(cursor) : 0;
+  const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) && limit > 0 ? limit : 200)));
+  const page: MessageLike[] = [];
+  let bytes = 0;
+  let next = start;
+  for (let i = start; i < all.length && page.length < cappedLimit; i++) {
+    const stored = all[i]!;
+    // M-§9-1(M6① R3):截断记录**保留 `_recordOrdinal`**(前端 ToolCard 按 `_recordOrdinal` 触发"查看
+    // 完整"分块拉取)。与 chat 读投影行(applyProjectionForChat)同名 —— 展开端点与 chat 读走同一字段,
+    // 前端 socket.applyExpandedTapeRecords 透传 + ToolCard 读 `_recordOrdinal` 零改动即通。剥内部记账字段;
+    // 非截断行同 chat 读剥掉 `_recordOrdinal` 减噪。
+    const rec: MessageLike = { ...stored };
+    delete rec._winnerOrdinal;
+    if (rec._truncated !== true) delete rec._recordOrdinal;
+    const recBytes = jsonBytes(rec);
+    // 单页序列化 ≤1MB(page 非空时命中即停,下页续)。
+    if (page.length > 0 && bytes + recBytes > 1024 * 1024) break;
+    page.push(rec);
+    bytes += recBytes;
+    next = i + 1;
+  }
+  return { records: page, nextCursor: next < total ? next : null, total };
+}
+
+/** M-§9-1 按记录有界读:从 client_session_turn_tape_records 读单条 record 的**内容文本**一个字节窗口
+ *  (SQL substring,绝不整卷/整条拉入进程),供前端"查看完整"分块拼接。返回 chat-safe 文本切片:
+ *  从 record payload(JSON MessageLike)hydrate 后的展示文本(output/bashTail/text),按 utf8 安全边界切。
+ *  offset/limit 均按 hydrate 后文本的字节计。分租/不存在/非收敛卷 → null(端点统一 404)。
+ *  单请求 ≤256KB。R4-M1 双护栏:
+ *  ①单记录解析上限(OC_TAPE_RECORD_PARSE_CAP 默认 8MB):octet_length 预检超限 → 404,payload
+ *    压根不 SELECT(RFC §9「单记录解析上限」;前端按既有 partial 语义提示"内容过大");
+ *  ②进程内派生文本 LRU(4 槽,键含 sha):一次 hydrate 服务整个分块序列 —— 无缓存时 16 块曾重复
+ *    拉取/解析 16 次同一 payload。缓存值是**派生展示文本**(非 exact 原始字节),进程重启即失,无一致性负担。 */
+const TAPE_RECORD_CHUNK_MAX_BYTES = 256 * 1024;
+function tapeRecordParseCapBytes(): number {
+  const raw = Number(process.env.OC_TAPE_RECORD_PARSE_CAP ?? "");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 8 * 1024 * 1024;
+}
+const tapeRecordTextLru = new Map<string, Buffer>();
+const TAPE_RECORD_TEXT_LRU_SLOTS = 4;
+async function readTapeRecordChunkImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  recordOrdinal: number,
+  offset: number,
+): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
+  if (!Number.isInteger(recordOrdinal) || recordOrdinal < 0) return null;
+  // 分租 + 收敛投影存在性(与列表端点同口径);不存在 → 404。
+  const proj = await pool.query<{ tape_sha256: string }>(
+    `SELECT tape_sha256 FROM tape_chat_projection
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state IN ('complete','truncated')`,
+    [sessionId, userId, tapeId],
+  );
+  if (proj.rows.length === 0) return null;
+  const lruKey = `${sessionId}\0${userId}\0${tapeId}\0${recordOrdinal}\0${proj.rows[0]!.tape_sha256}`;
+  let buf = tapeRecordTextLru.get(lruKey);
+  if (buf !== undefined) {
+    // LRU touch:删了重插保新鲜度。
+    tapeRecordTextLru.delete(lruKey);
+    tapeRecordTextLru.set(lruKey, buf);
+  } else {
+    // ①解析上限预检:只查 octet_length,不拉 payload。超限 = 该记录不支持完整查看(404,
+    // 前端保留截断预览并按 partial 语义提示),绝不整读进进程。
+    const head = (await pool.query<{ role: string; content_sha256: string; bytes: string }>(
+      `SELECT role, content_sha256, octet_length(payload)::text AS bytes
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+      [sessionId, userId, tapeId, recordOrdinal],
+    )).rows[0];
+    if (!head) return null;
+    if (Number(head.bytes) > tapeRecordParseCapBytes()) return null;
+    const rec = (await pool.query<{ payload: Buffer }>(
+      `SELECT payload FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+      [sessionId, userId, tapeId, recordOrdinal],
+    )).rows[0];
+    if (!rec) return null;
+    // hydrate 该 record 得展示文本(与投影同构;绝不吐 exact 原始 payload 字节)。
+    let text = "";
+    try {
+      const content = hydrateTapeRecordContent(
+        {
+          tape_id: tapeId, tape_sha256: proj.rows[0]!.tape_sha256, waive_reason: null, waiver_applied: false,
+          msg_id: "", ordinal: recordOrdinal, role: head.role, content_sha256: head.content_sha256,
+          payload: Buffer.from(rec.payload), cost_credits: "0", delegate_costs: [],
+        },
+        { id: "", _turnTapeSha256: proj.rows[0]!.tape_sha256 }, false, true,
+      );
+      text = typeof content.output === "string" && content.output.length > 0
+        ? content.output
+        : typeof content.bashTail === "string" && content.bashTail.length > 0
+          ? content.bashTail
+          : typeof content.text === "string" ? content.text : "";
+    } catch {
+      return null; // 坏 record → 404(不吐半损内容)
+    }
+    buf = Buffer.from(text, "utf8");
+    tapeRecordTextLru.set(lruKey, buf);
+    while (tapeRecordTextLru.size > TAPE_RECORD_TEXT_LRU_SLOTS) {
+      const oldest = tapeRecordTextLru.keys().next().value;
+      if (oldest === undefined) break;
+      tapeRecordTextLru.delete(oldest);
+    }
+  }
+  const totalBytes = buf.length;
+  let start = Number.isFinite(offset) && offset > 0 ? Math.min(Math.floor(offset), totalBytes) : 0;
+  // utf8 安全(双端):start 落在 continuation 字节中间时前移到字符边界(nextOffset 恒为合法边界,
+  // 此处防御任意客户端 offset);end 同理不切半字符。
+  while (start > 0 && start < totalBytes && (buf[start]! & 0xc0) === 0x80) start--;
+  let end = Math.min(start + TAPE_RECORD_CHUNK_MAX_BYTES, totalBytes);
+  while (end > start && end < totalBytes && (buf[end]! & 0xc0) === 0x80) end--;
+  const chunk = buf.subarray(start, end).toString("utf8");
+  return { chunk, nextOffset: end < totalBytes ? end : null, totalBytes };
+}
+
 async function hydrateTurnTapeMessages(
   pool: Pool,
   sessionId: string,
@@ -876,6 +2357,11 @@ async function hydrateTurnTapeMessages(
   if (refs.length === 0) return messages;
   const tapeIds = [...new Set(refs.map((m) => m._turnTapeId as string))];
   const exact = options.projection !== "chat";
+  // chat 读走物化投影两阶段(RFC §9):header-only → 投影展开 + 惰性回填,绝不触 tape BYTEA
+  // (存量卷回填除外)。exact(durable/admin 面)保持全量水合语义不变,一字不动。
+  if (!exact) {
+    return await hydrateChatFromProjection(pool, sessionId, userId, messages);
+  }
   const counts = exact
     ? new Map<string, { count: number; tapeSha256: string }>()
     : new Map(
@@ -1262,10 +2748,79 @@ export function createPgSessionsBackend(
   const expectedGeneration = options.expectedGeneration;
 
   const backend: PgSessionsBackend = {
+    async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
+      return withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
+        // 1) 幂等 append user 行(既有 id 幂等)。
+        const appended = await pgAppendServerAuthoredCore(
+          client,
+          input.sessionId,
+          input.sessionUserId,
+          input.message,
+        );
+        if (!appended.applied) {
+          if (appended.reason === "session_not_found") return { kind: "session_not_found" };
+          if (appended.reason === "session_deleted") return { kind: "session_deleted" };
+          // already_exists = 幂等重发,继续 admit(dispatch 通常已存在→dedup/failed);
+          // malformed/oversized = 拒轮。
+          if (appended.reason !== "already_exists") {
+            return { kind: "append_error", reason: appended.reason ?? "unknown" };
+          }
+        }
+        // 2) anchor_seq = 该 user 行的 _seq(projection 排序键;不在热尾巴时 null)。
+        const anchorSeq = typeof appended.seq === "number" ? BigInt(appended.seq) : null;
+        // 3) UPSERT dispatch + 冲突表裁定(同一 tx,受理即拥有 I1)。
+        return admitDispatch(client, {
+          dispatchId: input.dispatchId,
+          userId: input.uid,
+          sessionId: input.sessionId,
+          clientMessageId: input.clientMessageId,
+          agentId: input.agentId,
+          model: input.model,
+          requestHash: input.requestHash,
+          billingRequestId: input.billingRequestId,
+          ownerId: input.ownerId,
+          anchorSeq,
+          ...(input.leaseTtlMs !== undefined ? { leaseTtlMs: input.leaseTtlMs } : {}),
+          ...(input.now !== undefined ? { now: input.now } : {}),
+        });
+      });
+    },
+
+    async getTurnTapeStateByDispatch(
+      userId: string,
+      dispatchId: string,
+      attemptNo: number,
+    ): Promise<TurnTapeStateResult> {
+      const res = await pool.query<{ finalized_at: string | null; status: string }>(
+        `SELECT finalized_at, status FROM client_session_turn_tapes
+          WHERE user_id = $1 AND dispatch_id = $2 AND attempt_no = $3
+          ORDER BY (finalized_at IS NOT NULL) DESC
+          LIMIT 1`,
+        [userId, dispatchId, attemptNo],
+      );
+      if (res.rows.length === 0) return { state: "none", status: null };
+      const row = res.rows[0]!;
+      return {
+        state: row.finalized_at !== null ? "finalized" : "partial",
+        status: row.status ?? null,
+      };
+    },
+
+    async listDispatchErrorProjectionMessages(
+      userId: string,
+      sessionId: string,
+    ): Promise<Record<string, unknown>[]> {
+      // 投影 user_id 是 numeric uid(非 `c:<uid>`);非商业会话直接空。
+      if (!/^c:[1-9][0-9]*$/.test(userId)) return [];
+      const rows = await readActiveErrorProjections(pool, BigInt(userId.slice(2)), sessionId);
+      return rows.map(projectionToVirtualMessage);
+    },
+
     async stageLosslessTurnTapePart(
       userId: string,
       request: LosslessTurnTapePartRequest,
       payload: Buffer,
+      dispatchIdentity?: { dispatchId: string; attemptNo: number },
     ): Promise<LosslessTurnTapeStageResult> {
       return withTx(pool, async (client) => {
         const session = (
@@ -1289,9 +2844,12 @@ export function createPgSessionsBackend(
             created_at: string;
             waive_reason: string | null;
             finalized_at: string | null;
+            dispatch_id: string | null;
+            attempt_no: number | null;
           }>(
             `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
-                    total_bytes, part_count, created_at, waive_reason, finalized_at
+                    total_bytes, part_count, created_at, waive_reason, finalized_at,
+                    dispatch_id, attempt_no
                FROM client_session_turn_tapes
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
               FOR UPDATE`,
@@ -1308,7 +2866,11 @@ export function createPgSessionsBackend(
             bigIntNum(existingTape.total_bytes, "turn_tape.total_bytes") === request.totalBytes &&
             existingTape.part_count === request.partCount &&
             bigIntNum(existingTape.created_at, "turn_tape.created_at") === request.createdAt &&
-            existingTape.waive_reason === (request.waiveReason ?? null);
+            existingTape.waive_reason === (request.waiveReason ?? null) &&
+            // M2:同 tapeId 必须同 dispatch —— 不同 dispatch/attempt(异次执行)复用同 tapeId
+            // 不是幂等 replay,是同键异身份冲突,必须拒(否则 A 的 tape 被 B 的 header 冒充成"已存")。
+            existingTape.dispatch_id === (dispatchIdentity?.dispatchId ?? null) &&
+            existingTape.attempt_no === (dispatchIdentity?.attemptNo ?? null);
           if (!same) throw new Error("lossless turn tape immutable header conflict");
           // Finalization already materialized sanitized records and billing.
           // A rolling old writer may retry raw parts after we privacy-purged
@@ -1318,8 +2880,9 @@ export function createPgSessionsBackend(
           await client.query(
             `INSERT INTO client_session_turn_tapes
                (session_id, user_id, tape_id, agent_id, turn_index, status,
-                turn_key, tape_sha256, total_bytes, part_count, created_at, waive_reason)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+                turn_key, tape_sha256, total_bytes, part_count, created_at, waive_reason,
+                dispatch_id, attempt_no)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
             [
               request.sessionId,
               userId,
@@ -1333,6 +2896,8 @@ export function createPgSessionsBackend(
               request.partCount,
               request.createdAt,
               request.waiveReason ?? null,
+              dispatchIdentity?.dispatchId ?? null,
+              dispatchIdentity?.attemptNo ?? null,
             ],
           );
         }
@@ -1407,9 +2972,12 @@ export function createPgSessionsBackend(
             waive_reason: string | null;
             finalized_at: string | null;
             engine_billings: unknown;
+            dispatch_id: string | null;
+            attempt_no: number | null;
           }>(
             `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
-                    total_bytes, part_count, created_at, waive_reason, finalized_at, engine_billings
+                    total_bytes, part_count, created_at, waive_reason, finalized_at, engine_billings,
+                    dispatch_id, attempt_no
                FROM client_session_turn_tapes
               WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
               FOR UPDATE`,
@@ -1447,10 +3015,16 @@ export function createPgSessionsBackend(
           if (!Array.isArray(tape.engine_billings)) {
             throw new Error("lossless turn tape finalized engine billings malformed");
           }
+          // 幂等 replay 分支同样收敛 dispatch(不依赖 parts):首轮 finalize 若已收敛,CAS no-op。
+          let replayLate = false;
+          if (tape.dispatch_id !== null) {
+            replayLate = (await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status)).lateTape;
+          }
           return {
             applied: "idempotent",
             recordCount: Number(count.rows[0]?.count ?? 0),
             engineBillings: structuredClone(tape.engine_billings) as DurableCodexBilling[],
+            ...(replayLate ? { dispatchLateTape: true } : {}),
           };
         }
 
@@ -1775,10 +3349,34 @@ export function createPgSessionsBackend(
             WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
           [request.sessionId, userId, request.tapeId],
         );
+        // 会话读物化投影(RFC §9):同事务从已 materialize 的 records 构建该卷 chat 内容投影,
+        // state=complete/truncated。只读缓存派生面,绝不参与本 tape 的完整性/结算/dedup 写侧。
+        await writeTapeChatProjectionOnFinalize(
+          client,
+          request.sessionId,
+          userId,
+          request.tapeId,
+          request.tapeSha256,
+          turn.billingAnchorId,
+          turn.records.map((item, ordinal) => ({
+            msg_id: item.id,
+            ordinal,
+            role: item.role,
+            content_sha256: item.payloadSha256,
+            payload: item.payloadBytes,
+          })),
+        );
+        // dispatch 收敛(RFC §2.4):tape header 带 dispatch_id → 非终态转 terminal(映射 status),
+        // 或迟到 tape 撤 projection + manual_reconcile。与内容 materialize 同一 tx,原子。
+        let dispatchLate = false;
+        if (tape.dispatch_id !== null) {
+          dispatchLate = (await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status)).lateTape;
+        }
         return {
           applied: "finalized",
           recordCount: turn.records.length,
           engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
+          ...(dispatchLate ? { dispatchLateTape: true } : {}),
         };
       });
       if (goalUsageChanged && result.applied === "finalized") {
@@ -2694,7 +4292,10 @@ export function createPgSessionsBackend(
         JSON.parse(row.messages) as MessageLike[],
         archivedThroughOrderSeq,
       );
-      const messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
+      let messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
+      if (options.projection === "chat") {
+        messages = await mergeDispatchErrorProjectionRows(pool, row.user_id, row.id, messages);
+      }
       return {
         id: row.id,
         userId: row.user_id,
@@ -2794,6 +4395,11 @@ export function createPgSessionsBackend(
         isPartial = false;
       }
       messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, messages, options);
+      if (options.projection === "chat") {
+        // partial 也全量并入 active 投影(无自有 seq,不受 since 游标裁剪;前端按 id 幂等
+        // 去重,量级 = 未决失败数,恒小)。
+        messages = await mergeDispatchErrorProjectionRows(pool, row.user_id, row.id, messages);
+      }
       return {
         id: row.id,
         userId: row.user_id,
@@ -2861,8 +4467,48 @@ export function createPgSessionsBackend(
       const oldestSeq = page.length > 0 && typeof page[0]._orderSeq === "number"
         ? page[0]._orderSeq
         : null;
-      const hydrated = await hydrateTurnTapeMessages(pool, sessId, userId, page, options);
+      let hydrated = await hydrateTurnTapeMessages(pool, sessId, userId, page, options);
+      if (options.projection === "chat" && page.length > 0 && oldestSeq !== null) {
+        // 只并入锚落在本页 seq 范围内的投影(锚在热尾/更早页的绝不重复出现)。
+        hydrated = await mergeDispatchErrorProjectionRows(pool, userId, sessId, hydrated, {
+          minInclusive: oldestSeq,
+          maxExclusive: effectiveBefore,
+        });
+      }
       return { messages: hydrated, hasMore, oldestSeq };
+    },
+
+    // ── 引擎上下文读(RFC §9)──────────────────────────────────────────────────
+    // loadMasterSessionMessages 切到这里:投影 assistant 生成行 + 热行 canonical user 行合并,
+    // 48 行/18k 截断。绝不全量水合 tape BYTEA(引擎历史本就有界)。
+    async getEngineContextMessages(
+      sessionId: string,
+      userId: string,
+    ): Promise<MessageLike[] | null> {
+      return computeEngineContextMessages(pool, sessionId, userId);
+    },
+
+    // ── 超大内容查看端点后端(RFC §9)──────────────────────────────────────────
+    // 分租((session_id,user_id,tape_id) 复合)+ 行游标分页;chat-safe 投影形态,绝不吐 exact payload。
+    async listTapeChatProjectionRecords(
+      sessionId: string,
+      userId: string,
+      tapeId: string,
+      cursor: number,
+      limit: number,
+    ): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+      return listTapeChatProjectionRecordsImpl(pool, sessionId, userId, tapeId, cursor, limit);
+    },
+
+    // M-§9-1 "查看完整"按记录有界读(≤256KB/请求,绝不整卷)。gateway 路由层加 per-user 令牌桶限频 + 429。
+    async readTapeRecordChunk(
+      sessionId: string,
+      userId: string,
+      tapeId: string,
+      recordOrdinal: number,
+      offset: number,
+    ): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
+      return readTapeRecordChunkImpl(pool, sessionId, userId, tapeId, recordOrdinal, offset);
     },
 
     // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
@@ -2883,6 +4529,10 @@ export function createPgSessionsBackend(
         await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
         await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
         await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
+        // 投影是纯 UI 面,随会话删;turn_dispatches 是财务/审计证据,有意保留。
+        await client.query("DELETE FROM turn_dispatch_error_projections WHERE session_id = $1", [id]);
+        // chat 物化投影(RFC §9)是只读缓存派生面,随会话删(权威 tape records 由上面级联清)。
+        await client.query("DELETE FROM tape_chat_projection WHERE session_id = $1", [id]);
         return true;
       });
     },

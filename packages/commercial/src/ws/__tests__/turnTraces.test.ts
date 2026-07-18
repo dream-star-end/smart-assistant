@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Pool } from "pg";
-import { recordTurnTrace } from "../turnTraces.js";
+import { recordTurnTrace, updateTurnTraceDispatch } from "../turnTraces.js";
 
 const ROW = {
   traceId: "5abe495ea308943a99e853649297b1b5",
@@ -37,6 +37,10 @@ describe("recordTurnTrace", () => {
       ROW.sessionKey,
       "main",
       "gpt-5.6-sol",
+      // 0170 durable turn dispatch:dispatch_id / request_id 纯展示列;分类阶段登记时未就绪 → NULL
+      // (受理成功后由 updateTurnTraceDispatch fire-and-forget 回填)。
+      null,
+      null,
     ]);
   });
 
@@ -64,6 +68,33 @@ describe("recordTurnTrace", () => {
     } as unknown as Pool;
     recordTurnTrace(pool, undefined, { traceId: "t", userId: 2n, sessionKey: "k" });
     await new Promise((r) => setImmediate(r));
-    assert.deepEqual(calls[0].params, ["t", "2", "k", null, null]);
+    assert.deepEqual(calls[0].params, ["t", "2", "k", null, null, null, null]);
+  });
+
+  it("updateTurnTraceDispatch → COALESCE 回填 dispatch_id/request_id(纯展示,不动主链)", async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const pool = {
+      query: (sql: string, params: unknown[]) => {
+        calls.push({ sql, params });
+        return Promise.resolve({ rowCount: 1 });
+      },
+    } as unknown as Pool;
+    updateTurnTraceDispatch(pool, undefined, {
+      traceId: "tr-1",
+      dispatchId: "11111111-1111-4111-8111-111111111111",
+      requestId: "br-1",
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].sql, /UPDATE turn_traces/);
+    assert.match(calls[0].sql, /COALESCE\(dispatch_id, \$2\)/);
+    assert.match(calls[0].sql, /COALESCE\(request_id, \$3\)/);
+    assert.deepEqual(calls[0].params, ["tr-1", "11111111-1111-4111-8111-111111111111", "br-1"]);
+  });
+
+  it("updateTurnTraceDispatch 无 pool → 空转不抛", () => {
+    assert.doesNotThrow(() =>
+      updateTurnTraceDispatch(undefined, undefined, { traceId: "t", dispatchId: "d", requestId: "r" }),
+    );
   });
 });

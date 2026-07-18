@@ -18,6 +18,7 @@ import * as http from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 
 import {
+  DURABLE_TURN_DISPATCH_CAPABILITY,
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_FIELD,
   verifyAuthority,
@@ -40,11 +41,14 @@ import {
   CLOSE_BRIDGE,
   BRIDGE_WS_PATH,
   CONTAINER_ATTEST_FRAME_TYPE,
+  _readDispatchDrainMs,
   type BridgeModelAuthorityDeps,
+  type UserChatBridgeDeps,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
+import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
 import {
   ModelCatalogSnapshot,
   type ModelCatalogCache,
@@ -201,6 +205,13 @@ async function startRig(opts: {
    *   'stale'    = ring 里没有 master 当前 activeKeyId(轮换步骤③ 早于 ①)→ 必须当场拒 + recycle。
    */
   keyIds?: "real" | "legacy" | "stale";
+  /** B10:容器 attest 携带 durable-turn-dispatch-v1 → 走 dispatch 受理路径。 */
+  durableDispatch?: boolean;
+  admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
+  loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
+  loadGoalState?: (uid: bigint, sessionId: string) => Promise<unknown>;
+  /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
+  pgPool?: unknown;
 }): Promise<Rig> {
   const containerSeen: string[] = [];
   const recycled: Array<{ containerId: number; reason: string }> = [];
@@ -216,6 +227,20 @@ async function startRig(opts: {
     // 容器 gateway 的行为:连接建立即发 attest 帧(见 gateway handleWsConnection)。
     const sendAttest = () => {
       if (opts.attest === "silent") return;
+      if (opts.durableDispatch && opts.attest === "yes") {
+        // B10:手工 attest 帧携带 durable-turn-dispatch-v1 + model-authority 双 capability。
+        // 省略 keyIds(keyIdsUnknown → 不判死),仅为驱动 dispatch 受理路径。
+        ws.send(
+          JSON.stringify({
+            type: CONTAINER_ATTEST_FRAME_TYPE,
+            capabilities: [MODEL_AUTHORITY_CAPABILITY, DURABLE_TURN_DISPATCH_CAPABILITY],
+            connectionChallenge: "chal-" + Math.random().toString(16).slice(2),
+            containerId: CONTAINER_ID,
+            authorityTtlMs: 120_000,
+          }),
+        );
+        return;
+      }
       if (keyIdsMode === "real" && opts.attest === "yes") {
         // **真容器代码**:keyring 来自 master 注入的 env ring(这里直接用 signer 的公钥环),
         // keyIds/指纹由 gateway 侧算 —— census 与 attest 帧形状的跨包 parity 一并被锁死。
@@ -280,6 +305,25 @@ async function startRig(opts: {
     }),
     containerConnectTimeoutMs: 1500,
     ...(modelAuthority ? { modelAuthority } : {}),
+    ...(opts.admitUserTurn ? { admitUserTurn: opts.admitUserTurn } : {}),
+    ...(opts.loadMasterSessionMessages
+      ? { loadMasterSessionMessages: opts.loadMasterSessionMessages }
+      : {}),
+    ...(opts.loadGoalState
+      ? { loadGoalState: opts.loadGoalState as UserChatBridgeDeps["loadGoalState"] }
+      : {}),
+    // B3(R3):注入 pgPool 时必须补齐 codex 计费三件套(bridge fail-closed 校验);glm-5.2(CCB)
+    // 在 goal 失败(转发前)短路,故 preCheckRedis/pricing 永不被调用,空桩即可满足类型。
+    ...(opts.pgPool
+      ? {
+          pgPool: opts.pgPool as UserChatBridgeDeps["pgPool"],
+          preCheckRedis: {
+            atomicReserve: async () => ({ ok: true }),
+            release: async () => {},
+          } as unknown as UserChatBridgeDeps["preCheckRedis"],
+          pricing: { get: () => undefined } as unknown as UserChatBridgeDeps["pricing"],
+        }
+      : {}),
   });
 
   const gateway = http.createServer((_, res) => res.end());
@@ -808,6 +852,372 @@ describe("bridge 模型执行权威 — keyring census(轮换步骤② gate)", (
       assert.equal(rig.census.size, 0, "判死的连接不进 census");
       ws.close();
     } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B10 — dispatch 路径 legacy-completed dedup 在受理之前(不留孤儿 admitted dispatch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function fakeAdmittedDispatch(clientMessageId: string): AdmitUserTurnResult {
+  const now = new Date();
+  return {
+    kind: "admitted",
+    takeover: false,
+    dispatch: {
+      dispatchId: "11111111-1111-4111-8111-111111111111",
+      userId: BigInt(UID),
+      sessionId: "sess-b10",
+      clientMessageId,
+      agentId: "main",
+      model: "glm-5.2",
+      requestHash: "h".repeat(64),
+      billingRequestId: "br-b10",
+      attemptNo: 1,
+      status: "admitted",
+      outcome: null,
+      failureCode: null,
+      conflictReason: null,
+      resolution: null,
+      resolvedAt: null,
+      clientNotified: false,
+      ownerId: "conn-b10",
+      leaseEpoch: 1,
+      leaseUntil: new Date(now.getTime() + 90_000),
+      anchorSeq: 5n,
+      admittedAt: now,
+      acceptedAt: null,
+      terminalAt: null,
+      lastAttemptAt: now,
+    },
+  };
+}
+
+describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", () => {
+  test("已有 completed assistant 行 → dedup ack 且 admitUserTurn 从未被调用(无孤儿 dispatch)", async () => {
+    let admitCalls = 0;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      admitUserTurn: async (input) => {
+        admitCalls++;
+        return fakeAdmittedDispatch(input.clientMessageId);
+      },
+      loadMasterSessionMessages: async () => [
+        { id: "cm-b10", role: "user", text: "do once", ts: 1 },
+        {
+          id: "srv-b10",
+          role: "assistant",
+          text: "already done",
+          status: "completed",
+          _clientMessageId: "cm-b10",
+          ts: 2,
+        },
+      ],
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const fc = frameCollector(ws);
+      ws.send(
+        inboundFrame({
+          clientMessageId: "cm-b10",
+          idempotencyKey: "web:cm-b10:0",
+          peer: { id: "sess-b10", kind: "dm" },
+        }),
+      );
+      const ack = await fc.next();
+      assert.equal(ack.type, "outbound.ack");
+      assert.equal(ack.deduplicated, true);
+      assert.equal(ack.clientMessageId, "cm-b10");
+      // B10 核心:dedup 在受理之前 → admitUserTurn 从未被调用 → 无永续租的孤儿 dispatch。
+      assert.equal(admitCalls, 0);
+      // 未转发任何 inbound.message。
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(
+        rig.containerSeen.some((s) => {
+          try { return (JSON.parse(s) as { type?: string }).type === "inbound.message"; }
+          catch { return false; }
+        }),
+        false,
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("无 completed 行 → 正常受理(admitUserTurn 被调用一次,不被 dedup 误伤)", async () => {
+    let admitCalls = 0;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      admitUserTurn: async (input) => {
+        admitCalls++;
+        return fakeAdmittedDispatch(input.clientMessageId);
+      },
+      loadMasterSessionMessages: async () => [
+        { id: "u-old", role: "user", text: "older", ts: 1 },
+        { id: "a-old", role: "assistant", text: "older answer", status: "completed", _clientMessageId: "u-old", ts: 2 },
+      ],
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(
+        inboundFrame({
+          clientMessageId: "cm-fresh",
+          idempotencyKey: "web:cm-fresh:0",
+          peer: { id: "sess-b10", kind: "dm" },
+        }),
+      );
+      // dedup 只在同 clientMessageId 已 completed 时短路;此轮是新 id → 受理照常进行。
+      await waitFor(() => admitCalls === 1);
+      assert.equal(admitCalls, 1);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B3(R3)— 受理成功后 pre-forward 失败出口必须终态化 dispatch(否则 admitted 永续租孤儿)
+// ─────────────────────────────────────────────────────────────────────────────
+describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(executed_error)+ 不转发", () => {
+  test("goal 读失败(非 NOT_FOUND)→ 受理后终态化:casToTerminal(executed_error) + drop + 无转发", async () => {
+    const DISPATCH_ID = "11111111-1111-4111-8111-111111111111"; // fakeAdmittedDispatch 固定值
+    const queries: Array<{ sql: string; params: unknown[] }> = [];
+    // mock pgPool:捕获所有 query,统一回空;user 状态查空 → 不拦(fail-open)。
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 0 };
+      },
+    };
+    let admitCalls = 0;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      admitUserTurn: async (input) => {
+        admitCalls++;
+        return fakeAdmittedDispatch(input.clientMessageId);
+      },
+      // goal 读抛非 NOT_FOUND 错 → resolveTurnGoalState 判 unavailable → 受理后拒轮。
+      loadGoalState: async () => {
+        throw new Error("goal db down");
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const fc = frameCollector(ws);
+      ws.send(
+        inboundFrame({
+          clientMessageId: "cm-goal-fail",
+          idempotencyKey: "web:cm-goal-fail:0",
+          peer: { id: "sess-b3", kind: "dm" },
+        }),
+      );
+      // 1) 受理发生(admitUserTurn 被调用)。
+      await waitFor(() => admitCalls === 1);
+      // 2) 用户收到 GOAL_STATE_UNAVAILABLE 错误帧。
+      let errFrame: Record<string, unknown> | null = null;
+      for (let i = 0; i < 30 && errFrame === null; i++) {
+        const f = await Promise.race([
+          fc.next(),
+          new Promise<Record<string, unknown>>((r) => setTimeout(() => r({ type: "__timeout" }), 200)),
+        ]);
+        if ((f.code === "GOAL_STATE_UNAVAILABLE") || (f.type === "error" && (f as { code?: string }).code === "GOAL_STATE_UNAVAILABLE")) {
+          errFrame = f;
+        } else if (f.type === "__timeout") {
+          break;
+        }
+      }
+      assert.ok(errFrame, "用户收到 GOAL_STATE_UNAVAILABLE 错误帧");
+      // 3) B3 核心:受理后失败出口 → casToTerminal(executed_error) 落到 pgPool。
+      await waitFor(() =>
+        queries.some(
+          (q) =>
+            /UPDATE turn_dispatches/.test(q.sql) &&
+            /status = 'terminal'/.test(q.sql) &&
+            q.params[0] === DISPATCH_ID &&
+            q.params[1] === "executed_error",
+        ),
+      );
+      const casQ = queries.find(
+        (q) => /status = 'terminal'/.test(q.sql) && q.params[0] === DISPATCH_ID && q.params[1] === "executed_error",
+      )!;
+      // failureCode 明确(goal 出口),clientNotified=false(durable「已通知」只由 reconciler 置真)。
+      assert.equal(casQ.params[2], "goal_state_unavailable", "failure_code = goal_state_unavailable");
+      assert.equal(casQ.params[3], false, "client_notified=false(不用瞬态 socket 态推断)");
+      // 4) 绝不转发 inbound.message(拒轮先于转发)。
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(
+        rig.containerSeen.some((s) => {
+          try { return (JSON.parse(s) as { type?: string }).type === "inbound.message"; }
+          catch { return false; }
+        }),
+        false,
+        "goal 失败拒轮 → 无 inbound.message 转发",
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("R4-B1 受理 await 期间连接 cleanup → admitted 仍被接管终态化,无孤儿 lease、无转发", async () => {
+    const queries: { sql: string; params: unknown[] }[] = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    const DISPATCH_ID = "11111111-1111-4111-8111-111111111111"; // fakeAdmittedDispatch 固定值
+    let admitCalls = 0;
+    let releaseAdmit: (() => void) | null = null;
+    const admitGate = new Promise<void>((r) => { releaseAdmit = r; });
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      pgPool,
+      admitUserTurn: async (input) => {
+        admitCalls++;
+        // 受控暂停:让 cleanup 发生在 admit await 期间(R4-B1 的精确竞态窗)。
+        await admitGate;
+        return fakeAdmittedDispatch(input.clientMessageId);
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(
+        inboundFrame({
+          clientMessageId: "cm-race-b1",
+          idempotencyKey: "web:cm-race-b1:0",
+          peer: { id: "sess-race", kind: "dm" },
+        }),
+      );
+      await waitFor(() => admitCalls === 1);
+      // admission 挂起中,客户端断连 → bridge cleanup(cleaned=true,双 map 皆空立即 final)。
+      ws.close();
+      await new Promise((r) => setTimeout(r, 80));
+      // 现在才让 admission 提交成功返回 —— 修复前:early return 于登记前,孤儿 admitted;
+      // 修复后:先接管(登记)再判 cleaned → 立即 failDispatchPreForward 终态化。
+      releaseAdmit!();
+      await waitFor(() =>
+        queries.some(
+          (q) =>
+            /UPDATE turn_dispatches/.test(q.sql) &&
+            /status = 'terminal'/.test(q.sql) &&
+            q.params[0] === DISPATCH_ID &&
+            q.params[1] === "executed_error" &&
+            q.params[2] === "bridge_closed_during_admission",
+        ),
+      );
+      const casQ = queries.find((q) => q.params[2] === "bridge_closed_during_admission")!;
+      assert.equal(casQ.params[3], false, "client_notified=false(连接已死,durable 告知交 reconciler)");
+      // 绝不转发:连接死于受理期,帧不得进容器。
+      assert.equal(
+        rig.containerSeen.some((s2) => {
+          try { return (JSON.parse(s2) as { type?: string }).type === "inbound.message"; }
+          catch { return false; }
+        }),
+        false,
+        "cleanup 后受理成功 → 终态化而非转发",
+      );
+      // R5 note:cleaned 命中路径不得启动 heartbeat interval(finalCleanup 已过,无人清理 = 闭包泄漏)。
+      // 行为断言:终态化后静置 >1 个心跳间隔窗口的缩影,pgPool 不再出现 lease heartbeat UPDATE。
+      const qCountAfterTerminal = queries.length;
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(
+        queries.slice(qCountAfterTerminal).some((q) => /lease_until/.test(q.sql) && /UPDATE turn_dispatches/.test(q.sql) && !/status = 'terminal'/.test(q.sql)),
+        false,
+        "无 late heartbeat(interval 未被启动)",
+      );
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M7(R3)— durable dispatch drain 窗口:有在飞 admitted dispatch 时 ≥60s(默认),
+// drain 定时 = max(billing, dispatch)。
+// ─────────────────────────────────────────────────────────────────────────────
+describe("M7 readDispatchDrainMs — 默认 ≥60s / clamp ≤120s / env 覆盖", () => {
+  const KEY = "OC_DISPATCH_DRAIN_MS";
+  function withEnv(v: string | undefined, fn: () => void): void {
+    const prev = process.env[KEY];
+    if (v === undefined) delete process.env[KEY];
+    else process.env[KEY] = v;
+    try { fn(); } finally {
+      if (prev === undefined) delete process.env[KEY];
+      else process.env[KEY] = prev;
+    }
+  }
+  test("缺省 → 60_000(≥60s)", () => {
+    withEnv(undefined, () => assert.equal(_readDispatchDrainMs(), 60_000));
+  });
+  test("env 覆盖 90s → 90_000", () => {
+    withEnv("90000", () => assert.equal(_readDispatchDrainMs(), 90_000));
+  });
+  test("env 200s → clamp 到硬上限 120_000", () => {
+    withEnv("200000", () => assert.equal(_readDispatchDrainMs(), 120_000));
+  });
+  test("env 非法/过小 → 回落 60_000", () => {
+    withEnv("nope", () => assert.equal(_readDispatchDrainMs(), 60_000));
+    withEnv("10", () => assert.equal(_readDispatchDrainMs(), 60_000));
+  });
+});
+
+describe("M7 drain 窗口:有 admitted dispatch → max(billing, dispatch)（非 5s billing 窗口）", () => {
+  test("admitted 未终态 + user close → drain 取 dispatch 窗口(远大于 billing)", async () => {
+    const prevBilling = process.env.DRAIN_BILLING_MS;
+    const prevDispatch = process.env.OC_DISPATCH_DRAIN_MS;
+    // billing=100ms、dispatch=700ms:有 admitted → max=700ms;若误用 billing 窗口则 ~100ms。
+    process.env.DRAIN_BILLING_MS = "100";
+    process.env.OC_DISPATCH_DRAIN_MS = "700";
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      // admit 成功且不失败 goal → dispatch 保持 admitted(mock 容器不发 receipt/terminal,不掉出 map)。
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input.clientMessageId),
+    });
+    // 捕获 bridge→容器 socket 的 close 时刻(drain 结束时 finalCleanup 关它)。
+    let containerCloseAt = 0;
+    rig.containerWss.on("connection", (ws) => {
+      ws.on("close", () => { if (containerCloseAt === 0) containerCloseAt = Date.now(); });
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(
+        inboundFrame({
+          clientMessageId: "cm-m7",
+          idempotencyKey: "web:cm-m7:0",
+          peer: { id: "sess-m7", kind: "dm" },
+        }),
+      );
+      // 等 dispatch 受理并转发(容器收到 inbound.message → dispatch 已 admitted 且在飞)。
+      await waitFor(() =>
+        rig.containerSeen.some((s) => {
+          try { return (JSON.parse(s) as { type?: string }).type === "inbound.message"; }
+          catch { return false; }
+        }),
+      );
+      const closedAt = Date.now();
+      ws.close(); // client_close → 有 admitted dispatch → 进 drain
+      // 等 drain 结束(容器 socket 被 finalCleanup 关闭)。
+      await waitFor(() => containerCloseAt > 0, 4000);
+      const elapsed = containerCloseAt - closedAt;
+      // 取 dispatch 窗口(700ms)而非 billing(100ms):留足抖动余量,断言明显 > billing 窗口。
+      assert.ok(elapsed >= 500, `drain 应取 dispatch 窗口(~700ms),实测 ${elapsed}ms(billing=100ms 会 ~100ms)`);
+    } finally {
+      if (prevBilling === undefined) delete process.env.DRAIN_BILLING_MS;
+      else process.env.DRAIN_BILLING_MS = prevBilling;
+      if (prevDispatch === undefined) delete process.env.OC_DISPATCH_DRAIN_MS;
+      else process.env.OC_DISPATCH_DRAIN_MS = prevDispatch;
       await stopRig(rig);
     }
   });

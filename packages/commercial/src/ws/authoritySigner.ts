@@ -93,6 +93,7 @@ import type { AuthorityKeyCoverage } from './authorityKeyCensus.js'
 import {
   AUTHORITY_TTL_MS,
   type AuthorityKeyring,
+  type DispatchAuthorityPayload,
   MODEL_AUTHORITY_KEYRING_ENV,
   MODEL_AUTHORITY_VERSION,
   type ModelAuthorityBundle,
@@ -103,8 +104,10 @@ import {
   type TurnLease,
   CONTAINER_PREVIEW_PROTOCOL_VERSION,
   authoritySigningInput,
+  dispatchAuthoritySigningInput,
   encodeAuthorityEnvelope,
   encodeAuthorityKeyring,
+  encodeDispatchAuthorityEnvelope,
   encodeTurnLeaseEnvelope,
   keyringFingerprint,
   keyringKeyIds,
@@ -742,6 +745,21 @@ export class AuthoritySigner {
   signTurnLease(lease: TurnLease): string {
     const sig = cryptoSign(null, turnLeaseSigningInput(lease), this.privateKey(lease.keyId))
     return encodeTurnLeaseEnvelope(lease, sig)
+  }
+
+  /**
+   * 对已组装好的 dispatch authority payload 签名 → __oc_dispatch envelope(RFC-v5-durable-turn
+   * -dispatch §2.2)。与 signAuthority/signTurnLease 同构:私钥独占在 master,容器只有公钥。
+   * payload.keyId 必须在 ring 内(dispatchSigner 组装时置 = activeKeyId)。载荷字段的业务取值
+   * (uid/dispatchId/payloadHash/…)由调用方 dispatch/dispatchSigner 组装,本类只铸签名。
+   */
+  signDispatchAuthority(payload: DispatchAuthorityPayload): string {
+    const sig = cryptoSign(
+      null,
+      dispatchAuthoritySigningInput(payload),
+      this.privateKey(payload.keyId),
+    )
+    return encodeDispatchAuthorityEnvelope(payload, sig)
   }
 
   /**

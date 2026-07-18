@@ -217,6 +217,19 @@ export interface ContainerTransport {
     bodyJson: string,
     timeoutMs: number,
   ): Promise<{ status: number; bodyText: string; headers?: Record<string, string> }>
+  /**
+   * 通用方法(GET/POST 共用同一 SSRF/deadline/HMAC-header 基建)。durable turn dispatch
+   * reconciler 的容器求证走它(reject-if-absent=POST,dispatch-state=GET)。GET 传 bodyJson=null。
+   * 可选:老 mock 只实现 post 仍满足接口;需要 GET 的调用方注入实装 transport。
+   */
+  request?(
+    method: "GET" | "POST",
+    endpoint: { host: string; port: number; tunnel?: unknown },
+    path: string,
+    headers: Record<string, string>,
+    bodyJson: string | null,
+    timeoutMs: number,
+  ): Promise<{ status: number; bodyText: string; headers?: Record<string, string> }>
   /** true → 接受 endpoint.tunnel;false / undefined → 默认 self-host only。 */
   supportsTunnel?: boolean
 }

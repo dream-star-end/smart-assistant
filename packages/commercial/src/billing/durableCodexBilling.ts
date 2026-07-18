@@ -217,6 +217,11 @@ export async function settleDurableCodexBilling(
     : {}) as Record<string, unknown>;
   const model = typeof ctx.model === "string" ? ctx.model : null;
   const agentId = typeof ctx.agentId === "string" ? ctx.agentId : "codex";
+  // 0170 durable-turn dispatch 身份:bridge 把 dispatchId(string uuid)/attemptNo(number)
+  // 写进 journal ctx。legacy codex turn 无 dispatch → null,不 hard-fail(RFC §3 / §7 项 10)。
+  const dispatchId = typeof ctx.dispatchId === "string" ? ctx.dispatchId : null;
+  const attemptNo =
+    typeof ctx.attemptNo === "number" && Number.isInteger(ctx.attemptNo) ? ctx.attemptNo : null;
   const reservation: ReservationHandle = { userId: userId.toString(), requestId };
   const waive = async (reason: string): Promise<DurableCodexBillingSettleOutcome> => {
     const markedReason = permanentCodexWaiverReason(reason);
@@ -316,6 +321,8 @@ export async function settleDurableCodexBilling(
     derivedPricing,
     reservation,
     authority,
+    dispatchId,
+    attemptNo,
   });
   try {
     await finalizer.commit(usageFromFrame(frame), frame.status, {

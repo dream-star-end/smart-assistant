@@ -592,7 +592,12 @@ export type ProxyRejectReason =
   | "session_pin_unbound"
   | "session_pin_temporarily_unavailable"
   // P3.2 provider 健康度:OC_PROVIDER_HEALTH_ENFORCE=1 时,degraded provider 的模型被 503 拦截。
-  | "provider_degraded";
+  | "provider_degraded"
+  // 0170 durable-turn dispatch(B7a fail-closed):带 server 签名 billingRequestId 的请求
+  // 反查 dispatch 身份失败 —— lookup 抛错(DB 抖动,503 可重试)/ 无行(签名 id 却无 dispatch,
+  // 409 硬不一致)。绝不静默按 legacy 计费(会丢 turn↔dispatch 关联 → 财务联查失灵)。
+  | "dispatch_lookup_failed"
+  | "dispatch_row_missing";
 export function incrAnthropicProxyReject(reason: ProxyRejectReason): void {
   anthropicProxyReject.inc({ reason });
 }
