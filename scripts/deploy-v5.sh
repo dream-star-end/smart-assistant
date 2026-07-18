@@ -3888,7 +3888,7 @@ smoke() {
   #   sessionsGcSweep(P2 会话权威迁 PG:usage 聚合 pending/map 老化 GC,advisory lease fencing,
   #     仅 OC_SESSIONS_STORE=pg 时启动——白名单允许≠必然存在。RFC-v5-sessions-pg D3)
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
