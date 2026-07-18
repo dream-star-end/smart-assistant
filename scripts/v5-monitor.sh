@@ -373,6 +373,39 @@ check_serving_masters() {
   fi
 }
 
+check_smoke_waiver() {
+  # 部署门豁免留痕(2026-07-18 门禁审计):deploy-v5.sh 在 V5_SMOKE_TURN=0/V5_SMOKE_E2E=0
+  # 豁免时写 /var/lib/openclaude-v5/smoke-waiver-<gate>.json,对应门后续真跑通过才清除。
+  # 存在 = 有未补跑的部署验证债 → 持续 warning(6h 重提),消灭"豁免后忘补跑"的静默窗。
+  # 两侧契约:marker 路径/清除语义在 deploy-v5.sh record_smoke_waiver/clear_smoke_waiver。
+  local dir="/var/lib/openclaude-v5" f found="" detail=""
+  for f in "$dir"/smoke-waiver-*.json; do
+    [ -f "$f" ] || continue
+    found=1
+    detail="$detail$(jq -r '"[\(.gate)] 豁免于 \(.waived_at|todate) commit=\(.commit[0:8])"' "$f" 2>/dev/null || echo "[$(basename "$f")] 内容损坏") "
+  done
+  if [ -n "$found" ]; then
+    record smoke_waiver bad "部署门豁免未补跑:${detail}——重跑对应门(deploy --smoke / E2E)通过后自动清除"
+  else
+    record smoke_waiver ok "无未补跑的部署门豁免"
+  fi
+}
+
+check_e2e_flake() {
+  # E2E 旅程门 flake 记账(deploy-v5.sh smoke_e2e_journey 重试通过时 +1):7 天窗口内有
+  # 记账 → warning。flake 常态 = 滚动窗竞态类存量 bug 的症状面(v5-roll-recovery-tape-race),
+  # 不是可忽略噪音;7 天无新增自然静默(marker 不清除,留流水账)。
+  local f="/var/lib/openclaude-v5/e2e-journey-flake.json" last count
+  if [ ! -f "$f" ]; then record e2e_flake ok "E2E 旅程门无 flake 记账"; return; fi
+  last="$(jq -r '.last_at // 0' "$f" 2>/dev/null || echo 0)"
+  count="$(jq -r '.count // 0' "$f" 2>/dev/null || echo 0)"
+  if [ "$last" -gt 0 ] && [ $((NOW - last)) -le $((7*86400)) ]; then
+    record e2e_flake bad "E2E 旅程门 7 天内出现重试通过(累计 ${count} 次,last=$(date -d "@$last" '+%m-%d %H:%M' 2>/dev/null)):部署门在靠重试续命,查滚动窗竞态类根因"
+  else
+    record e2e_flake ok "E2E 旅程门 7 天内无 flake(历史累计 ${count} 次)"
+  fi
+}
+
 # 检查项 → 告警 severity(方案 §2.3-2):服务/HTTP/公网/池/镜像 = critical(聊天全挂),
 # 磁盘/内存 = warning(容量预警,尚未致命)。未知项保守按 warning。
 # mail = critical:注册/找回密码链路对新用户等同全挂,且历史上两次静默断数天。
@@ -380,7 +413,8 @@ check_severity() {
   case "$1" in
     deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures) echo critical ;;
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化。均按 warning。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm) echo warning ;;
+    # smoke_waiver/e2e_flake = 部署验证债与门 flake 记账,值得看但非现网故障。
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -417,6 +451,8 @@ check_mail
 check_turn_failures
 check_kp_plugin
 check_client_4xx_storm
+check_smoke_waiver
+check_e2e_flake
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)

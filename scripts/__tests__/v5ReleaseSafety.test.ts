@@ -3518,42 +3518,94 @@ wait $!
     )
   })
 
-  // 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。
-  // 契约:deploy 三个成功出口 + dist 出口都必须在 end_planned_maintenance 之后、
-  // 完成 echo 之前调 `smoke_e2e_journey || exit 1`(fail-loud;不进 validation 自动
-  // 回滚链是第一期显式裁定,升级时改本断言)。函数本体必须:依赖缺失 fail-loud
-  // (playwright-core 探测,禁静默跳过)+ V5_SMOKE_E2E=0 显式豁免 + dry-run 分支。
-  test('E2E journey gate wired at every success exit and fails loud', async () => {
+  // 2026-07-18 附件事故门禁补强 + 同日门禁审计升级(二期):E2E 用户旅程门(真浏览器)
+  // 已进 validation 补偿链。契约:
+  //  ① 函数本体:V5_SMOKE_E2E=0 豁免必须写留痕(record_smoke_waiver,monitor 告警到补跑)、
+  //     playwright-core 依赖活体探测(缺失 fail-loud 禁静默跳过)、dry-run 分支、失败自动
+  //     重试恰好一次且重试通过必须 record_e2e_flake 记账(fail-open 可见化)、双跑失败必须
+  //     返回非零。
+  //  ② 接线:一期"成功出口 end_planned_maintenance 之后 || exit 1"的 post-live 形态必须
+  //     绝迹(已 live 才验、只喊不撤);deploy()/deploy_dist() 以 validation_failure 赋值
+  //     形态挂进各自补偿链;finalize 提交 stable 前、canary READY 内部验证后必须有真 turn
+  //     功能门(finalize 还要 E2E),全部先于不可逆动作(停旧 unit / 放量)。
+  //  ③ dist 对称补偿:compensate_dist_activation 存在(hotcfg 轴复用 rollback_runtime_tuple,
+  //     非 hotcfg 轴 symlink 回切,禁第二套恢复机制),且 deploy_dist 校验失败路径调用它。
+  test('E2E journey gate wired into validation compensation chains', async () => {
     const source = await readFile(deploy, 'utf8')
-    // 函数本体契约。
+    // ① 函数本体契约。
     const fnStart = source.indexOf('\nsmoke_e2e_journey() {')
     assert.ok(fnStart >= 0, 'smoke_e2e_journey 函数缺失')
     const fnEnd = source.indexOf('\n}', fnStart)
     const fn = source.slice(fnStart, fnEnd)
     assert.match(fn, /V5_SMOKE_E2E:-1/, '缺 V5_SMOKE_E2E 豁免开关')
+    assert.match(fn, /record_smoke_waiver e2e/, '豁免必须写留痕(monitor 持续告警直到补跑)')
     assert.match(fn, /node_modules\/playwright-core/, '缺依赖活体探测(缺失必须 fail-loud 而非静默跳过)')
-    assert.match(fn, /return 1/, '依赖缺失/旅程失败必须返回非零')
+    assert.match(fn, /return 1/, '依赖缺失/旅程双跑失败必须返回非零')
     assert.match(fn, /\[dry-run\]/, '缺 dry-run 分支')
-    assert.match(fn, /v5-e2e-journey-canary\.mjs/, '未调用旅程脚本')
-    // 接线契约:调用形态必须是 `smoke_e2e_journey || exit 1`(裸调用在管道/条件上下文
-    // 会被 set -e 放过 = fail-open),且四个成功出口(deploy setup-first/zero-touch/主路径
-    // + dist)各一处、全部位于对应 end_planned_maintenance 之后。
-    const calls = source.match(/smoke_e2e_journey \|\| exit 1/g) ?? []
-    assert.equal(calls.length, 4, `期望 4 个成功出口接线,实际 ${calls.length}`)
-    for (const exitMarker of [
-      'knowledge-planet=setup-first)。"',
-      'knowledge-planet=zero-touch)。"',
-      '"✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
-      '"✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
-    ]) {
-      const exitAt = source.indexOf(exitMarker)
-      assert.ok(exitAt >= 0, `成功出口标记缺失: ${exitMarker}`)
-      const windowStart = source.lastIndexOf('end_planned_maintenance', exitAt)
-      const gateAt = source.lastIndexOf('smoke_e2e_journey || exit 1', exitAt)
-      assert.ok(
-        gateAt > windowStart && gateAt < exitAt,
-        `出口「${exitMarker}」的 E2E 门未落在 end_planned_maintenance 与完成 echo 之间`,
-      )
-    }
+    const journeyCalls = fn.match(/v5-e2e-journey-canary\.mjs/g) ?? []
+    assert.equal(journeyCalls.length, 2, '旅程脚本必须恰好双跑(首跑+重试一次);确定性回归两跑必双红,多于两跑=掩蔽')
+    assert.match(fn, /record_e2e_flake/, '重试通过必须 flake 记账,禁静默续命')
+    // ② 一期 post-live 形态绝迹。
+    assert.equal(
+      source.match(/smoke_e2e_journey \|\| exit 1/g),
+      null,
+      '发现 post-live "|| exit 1" 形态:E2E 门必须在补偿链内,不允许已 live 才验',
+    )
+    // deploy():E2E 校验位于 turn canary 之后、validation 补偿分支之前。
+    const deployStart = source.indexOf('\ndeploy() {')
+    assert.ok(deployStart >= 0, 'deploy() 函数缺失')
+    const deployBody = source.slice(deployStart, source.indexOf('\noffline_recycle_inner() {', deployStart))
+    const dTurn = deployBody.indexOf('smoke_turn_canary "$BUILT_RELEASE"')
+    const dE2e = deployBody.indexOf('! smoke_e2e_journey')
+    const dComp = deployBody.indexOf('if [[ -n "$validation_failure" ]]')
+    assert.ok(
+      dTurn >= 0 && dE2e > dTurn && dComp > dE2e,
+      'deploy() E2E 门必须在 turn canary 之后、validation 补偿分支之前',
+    )
+    assert.ok(
+      deployBody.includes('validation_failure="E2E journey gate failed'),
+      'deploy() E2E 失败必须走 validation_failure(对称补偿)',
+    )
+    // deploy_dist():校验链 + 对称补偿。
+    const distStart = source.indexOf('\ndeploy_dist() {')
+    assert.ok(distStart >= 0, 'deploy_dist() 函数缺失')
+    const distBody = source.slice(distStart, source.indexOf('\n}', distStart))
+    assert.ok(
+      distBody.includes('validation_failure="E2E journey gate failed'),
+      'deploy_dist() E2E 失败必须走 validation_failure(对称补偿)',
+    )
+    assert.ok(
+      distBody.includes('compensate_dist_activation "$BUILT_RELEASE" "$dist_previous_release" "$hc_any"'),
+      'deploy_dist() 校验失败必须走 compensate_dist_activation 对称补偿(禁 set -e 裸退出留坏 dist)',
+    )
+    const cdaStart = source.indexOf('\ncompensate_dist_activation() {')
+    assert.ok(cdaStart >= 0, 'compensate_dist_activation 缺失')
+    const cda = source.slice(cdaStart, source.indexOf('\n}', cdaStart))
+    assert.match(cda, /rollback_runtime_tuple/, 'dist 补偿 hotcfg 轴必须复用 rollback_runtime_tuple(禁第二套恢复机制)')
+    assert.ok(cda.includes('activate_release "$previous"'), 'dist 补偿非 hotcfg 轴必须 symlink 回切旧 release')
+    // finalize:提交 stable 前功能门(真 turn + E2E)都在停旧 unit 之前。
+    const finStart = source.indexOf('\nfinalize() {')
+    assert.ok(finStart >= 0, 'finalize() 函数缺失')
+    const finBody = source.slice(finStart, source.indexOf('lane: --abort', finStart))
+    const fTurn = finBody.indexOf('smoke_turn_canary "$precommit_release"')
+    const fE2e = finBody.indexOf('smoke_e2e_journey "$(slot_port "$cand")"')
+    const fStop = finBody.indexOf('systemctl stop $(slot_unit "$old")')
+    assert.ok(
+      fTurn >= 0 && fE2e > fTurn && fStop > fE2e,
+      'finalize 提交前必须依次过真 turn/E2E 功能门,且都在停旧 unit 之前',
+    )
+    // canary lane:READY+内部验证之后必须有 candidate 真 turn 门(不验真 turn 不准放量)。
+    assert.ok(
+      source.includes('smoke_turn_canary "$reldir" "$(slot_port "$cand")"'),
+      'canary lane READY 后缺 candidate 真 turn 门',
+    )
+    // ③ 豁免留痕机制:record/clear 存在,turn canary 成功必须清除留痕。
+    assert.ok(
+      source.includes('\nrecord_smoke_waiver() {') && source.includes('\nclear_smoke_waiver() {'),
+      '豁免留痕 record_smoke_waiver/clear_smoke_waiver 函数缺失',
+    )
+    const tcStart = source.indexOf('\nsmoke_turn_canary() {')
+    const tc = source.slice(tcStart, source.indexOf('\n}', tcStart))
+    assert.match(tc, /clear_smoke_waiver turn/, 'turn canary 成功必须清除豁免留痕(债务偿还语义)')
   })
 })
