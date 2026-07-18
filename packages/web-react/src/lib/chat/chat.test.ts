@@ -44,6 +44,7 @@ import {
 import {
   ChatSocket,
   messageAttemptIdempotencyKey,
+  preciseRetryEligible,
   writeAutoContinuePreamblePref,
   type ChatSocketDeps,
 } from "./socket";
@@ -1930,6 +1931,82 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s._sendingInFlight).toBe(false);
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
     expect(persistSession).toHaveBeenCalledWith("s1");
+  });
+});
+
+// 遥测上报口径:改用 REPORT_EXEMPT(reportable===false),与 expected 解耦(Codex 审计 R5c)。
+describe("applyOutboundError 遥测上报口径(R5c:report-exempt 而非 expected)", () => {
+  const fire = (code: string) => {
+    const s = sess();
+    addMessage(s, "user", "hi", { status: "sent", ts: 1 });
+    s._sendingInFlight = true;
+    const reportTurnError = vi.fn();
+    applyOutboundError(
+      s,
+      { type: "outbound.error", channel: "webchat", peer: { id: "s1", kind: "dm" }, code, message: "x", isFinal: true } as never,
+      { reportTurnError },
+    );
+    return reportTurnError;
+  };
+
+  test("rate_limited / model_capacity / service_restart / image_server_busy → 恢复上报(平台运营信号)", () => {
+    for (const code of ["rate_limited", "model_capacity", "service_restart", "image_server_busy"]) {
+      expect(fire(code)).toHaveBeenCalledWith(expect.objectContaining({ code }));
+    }
+  });
+
+  test("stopped / user_cancelled / insufficient_credits / maintenance → 仍豁免上报(用户主动/业务拒绝)", () => {
+    for (const code of ["stopped", "user_cancelled", "insufficient_credits", "maintenance"]) {
+      expect(fire(code)).not.toHaveBeenCalled();
+    }
+  });
+
+  test("基建故障(engine_error / model_authority_unavailable)→ 上报", () => {
+    expect(fire("engine_error")).toHaveBeenCalled();
+    expect(fire("model_authority_unavailable")).toHaveBeenCalled();
+  });
+});
+
+// 精确重试资格(红卡 CTA 硬门 R4):与 retryMessage 实际读取字段严格对齐。
+describe("preciseRetryEligible(Codex 审计 R4:精确重试完整性硬门)", () => {
+  const base = (over: Partial<ChatMessage>): ChatMessage =>
+    ({ id: "u1", role: "user", text: "hi", ts: 1, status: "error", ...over }) as ChatMessage;
+
+  test("自带 _routing、无附件 → 可精确重试", () => {
+    expect(preciseRetryEligible(base({ _routing: { model: "m", teamMode: false, effortLevel: null } }))).toBe(true);
+  });
+
+  test("无 _routing(依赖 _lastRouting 回退)→ 不可精确重试(不借用别轮快照)", () => {
+    expect(preciseRetryEligible(base({ _routing: undefined }))).toBe(false);
+  });
+
+  test("带附件且 media 仍携带 url/base64 → 可精确重试", () => {
+    expect(
+      preciseRetryEligible(
+        base({ _routing: { teamMode: false }, _media: [{ kind: "image", url: "https://x/a.png" }] }),
+      ),
+    ).toBe(true);
+  });
+
+  test("带附件但 media 只剩 localSrc(url/base64 均缺)→ 不可精确重试(重发证据已丢)", () => {
+    expect(
+      preciseRetryEligible(
+        base({ _routing: { teamMode: false }, _media: [{ kind: "image", localSrc: "blob:abc" }] }),
+      ),
+    ).toBe(false);
+  });
+
+  test("_retryMedia 优先于 _media 作重发源(imageEdit 剥离 localSrc 的出站版本)", () => {
+    // _media 只剩 localSrc,但 _retryMedia 带 url → 按 retryMessage 实读源(_retryMedia ?? _media)判为可重发。
+    expect(
+      preciseRetryEligible(
+        base({
+          _routing: { teamMode: false },
+          _media: [{ kind: "image", localSrc: "blob:abc" }],
+          _retryMedia: [{ kind: "image", url: "https://x/a.png" }],
+        }),
+      ),
+    ).toBe(true);
   });
 });
 

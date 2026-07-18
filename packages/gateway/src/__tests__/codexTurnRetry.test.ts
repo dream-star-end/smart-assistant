@@ -262,6 +262,109 @@ describe('runTurn — 重试门(fail-closed)', () => {
     assert.equal(statusFrames(h.messages).length, 0)
     await h.cleanup()
   })
+
+  // 审计 R9 — 重试门逐维补齐。每维在 turn/start 被拒**之前**越过对应门条件,
+  // 断言 fail-closed(仅一次 turn/start、无 retrying 侧信道、恰好一个 result)。
+  it('可观测输出(先发 assistant delta)→ 不重试', async () => {
+    const h = await makeRetryHarness()
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      // 走真实的 agentMessage delta 通知路径,置 attemptHadObservableOutput。
+      h.r.handleNotification('item/agentMessage/delta', { delta: 'partial answer' })
+      assert.equal(h.r.attemptHadObservableOutput, true, 'assistant delta 置可观测输出台账')
+      throw jsonRpcAppError('at capacity')
+    }
+    await h.r.runTurn('hi', 'req-observable')
+    assert.equal(turnStarts, 1, 'observable output blocks retry (重发会重复已展示内容)')
+    assert.equal(statusFrames(h.messages).length, 0)
+    assert.equal(results(h.messages).length, 1)
+    await h.cleanup()
+  })
+
+  it('本 attempt usage 非零 → 不重试(已计费,重发会二次记账)', async () => {
+    const h = await makeRetryHarness()
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      // 注入非零 usage delta(activeTurnTotal 非零、priorTurnTotal 缺省 → delta 非零)。
+      h.r.activeTurnTotal = {
+        cachedInputTokens: 0,
+        inputTokens: 7,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 7,
+      }
+      assert.equal(h.r.activeAttemptUsageIsZero(), false, 'usage 门应判定非零')
+      throw jsonRpcAppError('at capacity')
+    }
+    await h.r.runTurn('hi', 'req-usage')
+    assert.equal(turnStarts, 1, 'non-zero usage blocks retry')
+    assert.equal(statusFrames(h.messages).length, 0)
+    await h.cleanup()
+  })
+
+  it('本 attempt 已 emit 终态帧(attemptEmittedTerminal)→ 不重试', async () => {
+    const h = await makeRetryHarness()
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      // 模拟本 attempt 已发过 billing/result 终态帧(已记账,重发会二次 settle)。
+      h.r.attemptEmittedTerminal = true
+      throw jsonRpcAppError('at capacity')
+    }
+    await h.r.runTurn('hi', 'req-terminal')
+    assert.equal(turnStarts, 1, 'a prior terminal frame this attempt blocks retry')
+    assert.equal(statusFrames(h.messages).length, 0)
+    await h.cleanup()
+  })
+
+  it('已 adopt turnId(reverse-RPC 先到)→ 不重试(activeTurnId 守卫)', async () => {
+    const h = await makeRetryHarness()
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      // 模拟同 chunk 内 reverse-RPC 先于 turn/start resolve 已 adopt 了 turnId。
+      h.r.activeTurnId = 't-adopted-early'
+      throw jsonRpcAppError('at capacity')
+    }
+    await h.r.runTurn('hi', 'req-adopted')
+    assert.equal(turnStarts, 1, 'an adopted turnId means the outcome is unknown → no retry')
+    assert.equal(statusFrames(h.messages).length, 0)
+    await h.cleanup()
+  })
+
+  it('R2:reverse-RPC 权限自动批准(先于 turn/start 拒到达)→ 记账 + adopt turnId + 不重试', async () => {
+    const h = await makeRetryHarness()
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      // 走真实 handleLine 自动批准路径(命令审批 reverse-RPC,带 turnId)。
+      h.r.handleLine(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 501,
+          method: 'item/commandExecution/requestApproval',
+          params: { turnId: 't-approval-1', command: 'ls' },
+        }),
+      )
+      // R2:写批准响应之前已单调置台账 + adopt turnId(双重 fail-closed)。
+      assert.equal(h.r.attemptHadToolOrPermission, true, '自动批准即置权限台账 flag')
+      assert.equal(h.r.activeTurnId, 't-approval-1', 'reverse-RPC turnId 已 adopt')
+      throw jsonRpcAppError('at capacity')
+    }
+    await h.r.runTurn('hi', 'req-approval')
+    assert.equal(turnStarts, 1, 'auto-approved permission side-effect blocks retry')
+    assert.equal(statusFrames(h.messages).length, 0)
+    // 批准响应确实写给了 codex(harness stdin no-op)。
+    assert.equal(results(h.messages).length, 1)
+    await h.cleanup()
+  })
 })
 
 describe('runTurn — status=failed 永不自动重发 turn/start(实测②)', () => {
@@ -371,6 +474,52 @@ describe('runTurn — proc 于退避期间消失(crash/shutdown)', () => {
     assert.equal(res[0].is_error, true)
     // shutdown 路径不是用户取消 → 不带 USER_CANCELLED。
     assert.notEqual(res[0].billing_terminal_code, 'USER_CANCELLED')
+    await h.cleanup()
+  })
+
+  // 审计 R8 — proc close/error 唤醒退避(proc-gone 立即转 crashed 终态)。
+  it('R8:proc error(早于 close,proc 仍非 null)唤醒退避 → crashed 终态,不误判 USER_CANCELLED', async () => {
+    const h = await makeRetryHarness({ delayMs: 10_000 })
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      throw jsonRpcAppError('at capacity')
+    }
+    const runPromise = h.r.runTurn('hi', 'req-proc-error')
+    await waitFor(() => h.r.pendingRetryAbort !== null)
+    // proc 'error' 回调的行为:唤醒退避但**刻意不清 proc**(晚到 stdout 留给 close)。
+    // proc-gone 门靠 retryBackoffProcGone 标记命中,而非 `!this.proc`。
+    h.r.wakeRetryBackoffOnProcGone()
+    assert.equal(h.r.retryBackoffProcGone, true)
+    await runPromise
+    assert.equal(turnStarts, 1, 'no re-send after proc error during backoff')
+    const res = results(h.messages)
+    assert.equal(res.length, 1)
+    assert.equal(res[0].is_error, true)
+    // proc-gone(非用户取消)→ 不带 USER_CANCELLED。
+    assert.notEqual(res[0].billing_terminal_code, 'USER_CANCELLED')
+    assert.equal(h.r.pendingRetryAbort, null)
+    await h.cleanup()
+  })
+
+  it('R8:proc 已 null(crash 与 close 之间)时 interrupt() 仍中断退避(先于 proc 存活守卫)', async () => {
+    const h = await makeRetryHarness({ delayMs: 10_000 })
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      throw jsonRpcAppError('at capacity')
+    }
+    const runPromise = h.r.runTurn('hi', 'req-interrupt-procdead')
+    await waitFor(() => h.r.pendingRetryAbort !== null)
+    // proc 已消失但退避仍在跑:旧顺序会被 `if (!this.proc) return false` 挡下。
+    h.r.proc = null
+    const ok = h.runner.interrupt()
+    assert.equal(ok, true, 'interrupt 先处理 pendingRetryAbort,不被 proc 存活守卫挡下')
+    await runPromise
+    assert.equal(turnStarts, 1, 'no second turn/start')
+    assert.equal(results(h.messages).length, 1)
     await h.cleanup()
   })
 })

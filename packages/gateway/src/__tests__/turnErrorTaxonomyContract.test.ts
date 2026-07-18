@@ -81,6 +81,36 @@ describe('turnErrorTaxonomy 契约 — tape 新写入语义码', () => {
   })
 })
 
+describe('turnErrorTaxonomy 契约 — 免单码不得进 errorClass 细分路径(审计 R9)', () => {
+  // 来源:commercial internalTurnWaive.ts —— 按大写 tape `_errorCode` 精确匹配的
+  // 自动免单集(LIVENESS_TIMEOUT/IDLE_TIMEOUT/NO_RESPONSE/PHANTOM_TURN)。硬编码
+  // 在此(不跨包 import commercial),用途是防未来把这些码搬进 gateway 的
+  // classifyRunError / errorClass 细分产出路径 —— 那会让"平台故障自动免单"与
+  // "用户可见细分错误"两套语义落在同一码上打架(免单查询按大写精确匹配存量,
+  // 细分路径按小写语义码派生 UX;两者归一后必须不相交)。
+  const WAIVE_UPPERCASE_CODES = ['LIVENESS_TIMEOUT', 'IDLE_TIMEOUT', 'NO_RESPONSE', 'PHANTOM_TURN']
+
+  it('细分路径产出的小写语义码集合与免单码归一后无交集', () => {
+    // tape 新写入的小写语义码 = errorClass 细分路径能产出的全部非 unknown 码。
+    // 用本文件的代表性驱动集 + 真实 tape 细分函数收集(不复制其正则)。
+    const detailedLowerCodes = new Set<string>()
+    for (const s of CLASSIFY_SAMPLES) {
+      const cls = classifyRunError(s.input).code
+      if (cls !== 'unknown') detailedLowerCodes.add(cls)
+      const tapeCode = _tapeErrorCodeForGenericFailure(s.input)
+      // 细分路径产出的**小写**语义码才算(大写 ENGINE_ERROR 兜底不属于细分,跳过)。
+      if (tapeCode === tapeCode.toLowerCase()) detailedLowerCodes.add(tapeCode)
+    }
+    for (const raw of WAIVE_UPPERCASE_CODES) {
+      const norm = normalizeTurnErrorCode(raw) // 归一到小写语义码
+      assert.ok(
+        !detailedLowerCodes.has(norm),
+        `免单码 ${raw} 归一为 ${norm} 落入了 errorClass 细分产出集(会与免单查询抢语义)`,
+      )
+    }
+  })
+})
+
 describe('turnErrorTaxonomy 契约 — legacy 大写控制码归一', () => {
   const LEGACY_CODES = [
     'ENGINE_ERROR',

@@ -11,6 +11,7 @@
  */
 import {
   EXPECTED_TURN_ERROR_CODES,
+  REPORT_EXEMPT_TURN_ERROR_CODES,
   TURN_ERROR_TAXONOMY,
   WAIVED_TURN_ERROR_CODES,
 } from "@openclaude/protocol";
@@ -20,6 +21,7 @@ import {
   BRIDGE_ERROR_MESSAGES,
   EXPECTED_TURN_ERR_CODES,
   friendlyBridgeErrorMessage,
+  REPORT_EXEMPT_TURN_ERR_CODES,
 } from "./pure";
 import { errorLabel } from "./render";
 
@@ -52,6 +54,31 @@ describe("turnErrorTaxonomy 契约:文案表 key 与 protocol 权威表对齐", 
     expect(EXPECTED_TURN_ERR_CODES.has("model_catalog_unavailable")).toBe(false);
     expect(EXPECTED_TURN_ERR_CODES.has("insufficient_credits")).toBe(true);
   });
+
+  test("REPORT_EXEMPT_TURN_ERR_CODES 从 protocol REPORT_EXEMPT_TURN_ERROR_CODES 派生(遥测口径,与 expected 解耦)", () => {
+    expect([...REPORT_EXEMPT_TURN_ERR_CODES].sort()).toEqual([...REPORT_EXEMPT_TURN_ERROR_CODES].sort());
+    // R5c 关键拆分:这些码"对用户预期"但"对平台是运营故障信号",EXPECTED 命中而 REPORT_EXEMPT **不**命中
+    // → 恢复上报。
+    for (const code of ["rate_limited", "model_capacity", "service_restart", "image_server_busy"]) {
+      expect(EXPECTED_TURN_ERR_CODES.has(code)).toBe(true);
+      expect(REPORT_EXEMPT_TURN_ERR_CODES.has(code)).toBe(false);
+    }
+    // 用户主动 / 纯业务拒绝类:两集合都命中(既是预期态、也豁免遥测)。
+    for (const code of ["stopped", "user_cancelled", "insufficient_credits", "maintenance"]) {
+      expect(REPORT_EXEMPT_TURN_ERR_CODES.has(code)).toBe(true);
+    }
+    // 基建故障:两集合都不命中(必须上报)。
+    expect(REPORT_EXEMPT_TURN_ERR_CODES.has("model_authority_unavailable")).toBe(false);
+    expect(REPORT_EXEMPT_TURN_ERR_CODES.has("engine_error")).toBe(false);
+  });
+
+  test.each(Object.keys(TURN_ERROR_TAXONOMY))(
+    "『%s』REPORT_EXEMPT 命中 ⟺ taxonomy.reportable===false",
+    (code) => {
+      const reportable = (TURN_ERROR_TAXONOMY as Record<string, { reportable?: boolean }>)[code].reportable;
+      expect(REPORT_EXEMPT_TURN_ERR_CODES.has(code)).toBe(reportable === false);
+    },
+  );
 
   test("免单集合(render WAIVED)与 protocol WAIVED_TURN_ERROR_CODES 一致", () => {
     // WAIVED_ERROR_CODES 未导出,借 errorPresentation 的免单标题间接校验其派生正确。

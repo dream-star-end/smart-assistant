@@ -11,6 +11,7 @@ import {
   isDisplayableServerMessage,
   isKnownTurnErrorCode,
   normalizeTurnErrorCode,
+  REPORT_EXEMPT_TURN_ERROR_CODES,
   type TurnErrorCode,
   turnErrorSemantics,
 } from "@openclaude/protocol";
@@ -732,15 +733,22 @@ export function safeBridgeErrorDetail(code: unknown, traceId?: unknown): string 
 }
 
 /**
- * 预期业务态错误码：不自动上报(websocket.js:4038)。**从 protocol 单一权威派生**
- * (TURN_ERROR_TAXONOMY 中 expected===true 的码,见 EXPECTED_TURN_ERROR_CODES),不再前端
- * 手写维护第二份清单。含义与旧手写集一致(insufficient_credits/unauthorized_model/maintenance/
- * model_config_changed_retry_turn/model_not_available/conn_kicked/codex_* 均 expected:true),
- * 并顺带纳入 taxonomy 里同样标 expected 的 rate_limited/service_restart/stopped/user_cancelled/
- * model_capacity/image_server_busy —— 它们本就是预期业务态,不该污染错误监控口径。
- * **不含** model_authority_unavailable / model_catalog_unavailable(基建故障,必须上报)。
+ * 预期业务态错误码(**展示语义**:对单用户是正常业务分支,非故障)。**从 protocol 单一权威派生**
+ * (TURN_ERROR_TAXONOMY 中 expected===true,见 EXPECTED_TURN_ERROR_CODES)。含
+ * rate_limited/model_capacity/service_restart/image_server_busy 等"对用户预期、但对平台是运营
+ * 信号"的码 —— 它们仍**要进遥测**,故上报口径**不用本集合**,改用下方 REPORT_EXEMPT。
+ * ⚠️ 遥测抑制请勿用本集合(那是历史误用,Codex 审计 R5c 已拆分);本集合供展示/交互语义消费。
  */
 export const EXPECTED_TURN_ERR_CODES: ReadonlySet<string> = EXPECTED_TURN_ERROR_CODES;
+
+/**
+ * **遥测豁免**错误码:reducer 上报 turn_error 时抑制这些码(reportTurnError 不发)。**从 protocol
+ * 单一权威派生**(TURN_ERROR_TAXONOMY 中 reportable===false,见 REPORT_EXEMPT_TURN_ERROR_CODES)。
+ * **与 expected 解耦**(Codex 审计 R5c 裁定):只有用户主动行为(stopped/user_cancelled)与纯业务
+ * 规则拒绝(insufficient_credits/未开通/配置变更/维护/连接踢出/codex_* 遗留)才豁免;
+ * rate_limited/model_capacity/service_restart/image_server_busy 恢复上报(平台运营故障信号)。
+ */
+export const REPORT_EXEMPT_TURN_ERR_CODES: ReadonlySet<string> = REPORT_EXEMPT_TURN_ERROR_CODES;
 
 // ═══════════════ 流式行身份（server canonical id upsert，websocket.js:606）═══════════════
 

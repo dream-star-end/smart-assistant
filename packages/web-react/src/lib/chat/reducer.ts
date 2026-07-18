@@ -16,13 +16,13 @@ import {
   classifyEmptyTurn,
   countAnswerBlocks,
   type EmptyTurnDecision,
-  EXPECTED_TURN_ERR_CODES,
   findOrCreateStreamingRow,
   frameSeqKey,
   friendlyBridgeErrorMessage,
   getFrameSeqCursor,
   isBridgeAuthControlError,
   normalizeBridgeErrorCode,
+  REPORT_EXEMPT_TURN_ERR_CODES,
   safeBridgeErrorDetail,
   shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
@@ -1671,7 +1671,10 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     }
   }
   effects.persistSession?.(sess.id);
-  if (!EXPECTED_TURN_ERR_CODES.has(normalized)) {
+  // 遥测上报口径用**遥测豁免集**(reportable===false),与"预期业务态"(expected)解耦
+  // (Codex 审计 R5c):rate_limited/model_capacity/service_restart/image_server_busy 虽对用户预期,
+  // 但是平台运营故障信号,必须上报;仅用户主动(stopped/user_cancelled)与业务拒绝类才豁免。
+  if (!REPORT_EXEMPT_TURN_ERR_CODES.has(normalized)) {
     effects.reportTurnError?.({
       code: normalized,
       message: `${normalized}: ${frame.message || frame.detail || ""}`,

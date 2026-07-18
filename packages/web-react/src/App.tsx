@@ -66,6 +66,7 @@ import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
+import { preciseRetryEligible } from "./lib/chat/socket";
 import {
   findRewriteTarget,
   findStopTarget,
@@ -1366,16 +1367,21 @@ export function App() {
     [demo, activeId, agent.id],
   );
 
-  // 红卡 CTA 硬门(任务④)的精确重试目标解析:按 assistant 错误行的 _clientMessageId 在当前会话
-  // 里定位可原样重发的 user 行(status='error',带完整 payload)。现场取 messages(稳定句柄 sockRef,
-  // 不捕获每帧刷新的 wsMessages),与 retrySend 同 deps(仅随会话切换变);找不到 → 红卡不显示「重试」。
+  // 红卡 CTA 硬门(任务④ / Codex 审计 R4)的精确重试目标解析:按 assistant 错误行的
+  // _clientMessageId 在当前会话里定位可**原样重发**的 user 行。现场取 messages(稳定句柄 sockRef,
+  // 不捕获每帧刷新的 wsMessages),与 retrySend 同 deps(仅随会话切换变)。资格三条:
+  //   (a) 该 user 行存在且 status='error'(有完整 payload、确实失败);
+  //   (b)(c) 自带 _routing 快照 + 附件重发证据仍在 —— 见 preciseRetryEligible(与 retryMessage
+  //   实际读取的字段严格对齐,防止借用别轮 _lastRouting / 静默丢附件)。任一不满足 → 返回
+  //   undefined,红卡落回 onRegenerate 兜底(见 AssistantCard 的 R5 末轮门控)。
   const resolveRetryTarget = useCallback(
     (clientMessageId: string): ChatMessage | undefined => {
       if (demo || !activeId) return undefined;
       const msgs = sockRef.current?.getMessages(activeId) ?? [];
-      return msgs.find(
+      const target = msgs.find(
         (m) => m.role === "user" && m.id === clientMessageId && m.status === "error",
       );
+      return target && preciseRetryEligible(target) ? target : undefined;
     },
     [demo, activeId],
   );

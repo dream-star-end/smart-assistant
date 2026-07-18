@@ -368,9 +368,45 @@ function looksLikeInternalError(value: string | undefined): boolean {
   );
 }
 
+/**
+ * 「查看详情」detail 统一守卫(Codex 审计 R7)。新 tape 码(model_capacity 等)可能携带 Codex 的
+ * JSON errorDetail;若无条件透传就会绕过 engine_error 特判直接进 <pre> 外泄。规则:
+ *   - 终止器短 prose([turn failed: …] / [error] …)是可读排查线索 → 保留;
+ *   - JSON 信封 / 堆栈 / 内部串(looksLikeInternalError)→ 脱敏,只保留可提取的请求 ID;
+ *   - 其余普通说明(白名单服务端 message 亦属此类,非内部串)→ 原样保留(不受影响)。
+ */
+function sanitizeErrorDetail(detail: string | undefined): string | undefined {
+  const d = detail?.trim();
+  if (!d) return undefined;
+  if (/^\[(?:turn failed|error)\b/i.test(d)) return d;
+  if (looksLikeInternalError(d)) {
+    const ref = requestReference(d);
+    return ref ? `请求 ID：${ref}` : undefined;
+  }
+  return d;
+}
+
+/**
+ * 从正文尾部切出 tape 兼容终止器([turn failed: …] / [error] …)。tape 把它作为兼容 final
+ * 追加到最后一个 assistant segment 的 text 尾,合法部分回答与终止器常同串:
+ *   "…正常部分回答…\n\n[turn failed: …]\n"
+ * 返回 { body: 终止器前的正文(trim), terminator: 终止器串(trim) };无终止器 → body=原串、terminator=""。
+ */
+function splitTrailingTerminator(text: string): { body: string; terminator: string } {
+  const m = /\n*[ \t]*(\[(?:turn failed|error)\b[^\n]*)\s*$/i.exec(text);
+  if (!m) return { body: text, terminator: "" };
+  return { body: text.slice(0, m.index).trim(), terminator: m[1].trim() };
+}
+
 export type ErrorPresentation = {
   title: string;
   message: string;
+  /**
+   * 失败轮里模型已产出的**合法部分回答**正文(Codex 审计 R6)。tape 水合把 _errorCode 挂在最后一个
+   * assistant segment,其 text 可能同时携带正常部分回答;此字段承载那段正文,由 AssistantCard 用
+   * Markdown 正常渲染,红卡(message=按码文案)在其下方,复刻 live 双卡形态。无部分回答时缺省。
+   */
+  bodyText?: string;
   detail?: string;
   waived: boolean;
 };
@@ -426,7 +462,10 @@ export function errorPresentation(
       waived: false,
     };
   }
-  if (normalized === "engine_error" && (looksLikeInternalError(text) || looksLikeInternalError(detail))) {
+  // engine_error 且**正文本身**是 JSON/堆栈内部串 → 收敛为友好内部错误文案(把内部转储当"答复"
+  // 甩给用户是最刺眼的一类)。**只看 text**(不再因 detail 内部就命中):若 text 是合法部分回答、
+  // 仅 detail 是内部串,应落到下方 R6 分支保住部分回答(detail 交由 sanitizeErrorDetail 脱敏)。
+  if (normalized === "engine_error" && looksLikeInternalError(text)) {
     return {
       title: ERROR_LABELS.engine_error,
       message: "任务执行时遇到内部错误。你的消息已保留，可以直接重试。",
@@ -434,14 +473,15 @@ export function errorPresentation(
       waived: false,
     };
   }
-  // ── 兜底分支:**不再裸透传 text**(任务②)────────────────────────────────────────
-  // 历史上这里直接把 msg.text 当正文,持久化会话水合后 tape 终止器(如「[turn failed: …]」/
-  // 「[error] server shutting down」)、平台内部串会原样甩给用户。收敛为:仅当 text 正是**该码
-  // 已知友好文案**(applyOutboundError 写入的按码正文)或**白名单可信服务端 message**时原样保留;
-  // 否则(裸终止器 / 内部串 / 其它非已知原文)一律用 errorLabel 标题 + friendlyBridgeErrorMessage
-  // 正文,原文只落「查看详情」(detail 空则塞进去,保持可见性)。
+  // ── 兜底分支:区分「终止器/内部串」「合法部分回答」「空」三类 text(任务②ﾠ+ Codex 审计 R6)──
+  // 历史上这里直接把 msg.text 当正文,tape 终止器(「[turn failed: …]」/「[error] server shutting
+  // down」)、平台内部串会原样甩给用户;更早的整改又把**合法部分回答**一并降进 detail(刷新后消失)。
+  // 现在:仅当 text 正是**该码已知友好文案**或**白名单服务端 message**时原样作正文;否则切出尾部终止
+  // 器,前半段若是合法部分回答 → 进 bodyText(AssistantCard 正常 Markdown 渲染)、红卡正文用按码文案;
+  // 终止器/内部串按 R7 守卫决定去留,detail 一律过 sanitizeErrorDetail。
   const t = text?.trim() ?? "";
   const byCode = friendlyBridgeErrorMessage(normalized); // 纯按码正文(不喂 message,避免 server-msg 自反)
+  const safeDetail = sanitizeErrorDetail(detail); // R7:统一守卫 _errorDetail(JSON/堆栈脱敏,保留请求 ID)
   // [turn failed …] / [error] … 是 tape 终止器(以 [ 开头,已被 looksLikeInternalError 命中),显式列出
   // 仅为可读;serverMsgOk = 该码白名单且 message 过展示守卫(必非 [ 开头,故与 raw 互斥)。
   const isRaw = !t || looksLikeInternalError(t) || /^\[(?:turn failed|error)\b/i.test(t);
@@ -452,18 +492,20 @@ export function errorPresentation(
     return {
       title: errorLabel(normalized),
       message: t,
-      ...(detail?.trim() ? { detail: detail.trim() } : {}),
+      ...(safeDetail ? { detail: safeDetail } : {}),
       waived: false,
     };
   }
-  // 原文进 detail(若 detail 空):[error]/[turn failed] 终止器是可展示排查线索;真正的 JSON 信封/
-  // 堆栈(looksLikeInternalError 但非终止器前缀)才隐去,不外泄。
-  const isTerminator = /^\[(?:turn failed|error)\b/i.test(t);
-  const rawForDetail = t && (isTerminator || !looksLikeInternalError(t)) ? t : "";
+  // R6:切出尾部终止器,前半段若是合法部分回答(非空、非内部串) → 作 bodyText 正常渲染,红卡在其下方。
+  const { body: preTerminator, terminator } = splitTrailingTerminator(t);
+  const partialAnswer = preTerminator && !looksLikeInternalError(preTerminator) ? preTerminator : "";
+  // detail 优先级:已脱敏的原 _errorDetail > 终止器排查线索 > 无。真正的 JSON 信封/堆栈已被 R7 隐去。
+  const detailOut = safeDetail ?? (terminator || undefined);
   return {
     title: errorLabel(normalized),
     message: byCode,
-    ...(detail?.trim() ? { detail: detail.trim() } : rawForDetail ? { detail: rawForDetail } : {}),
+    ...(partialAnswer ? { bodyText: partialAnswer } : {}),
+    ...(detailOut ? { detail: detailOut } : {}),
     waived: false,
   };
 }

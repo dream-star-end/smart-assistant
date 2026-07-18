@@ -943,6 +943,10 @@ describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => 
     // 恰好一个 billing 事件(attempt 1 被拒不产 result → 不产 billing)。
     assert.equal(h.billing.length, 1);
     assert.equal(h.billing[0].status, "success");
+    // 审计 R9:重试端到端恰好 emit 一个 kind='final' 内容事件 —— 被拒的 attempt 1
+    // 不产 result → 不产 final;成功的 attempt 2 产唯一一个。重发不得多发 turn 终态。
+    const finalEvents = h.events.filter((e) => e.kind === "final");
+    assert.equal(finalEvents.length, 1, `expected exactly one final, got ${JSON.stringify(blockKinds(h.events))}`);
     // retrying 侧信道:一帧 retrying(attempt=2/max=3)+ 随后一帧 null 清除。
     const statusEvents = h.events.filter((e) => e.kind === "turn_status") as Array<{
       kind: "turn_status";

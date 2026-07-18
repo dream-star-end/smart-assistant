@@ -40,9 +40,26 @@ describe('classifyRunError', () => {
     assert.equal(r.code, 'upstream_failed')
   })
 
+  it('upstream_failed: 通用 5xx(500/511/599,审计 R1 不再只认 50[234])', () => {
+    // 审计 R1:`\b5\d{2}\b` 覆盖全部 5xx。逐个钉死此前会漏成 unknown 的码。
+    assert.equal(classifyRunError('500 Internal Server Error').code, 'upstream_failed')
+    assert.equal(classifyRunError('gateway said 511 Network Authentication Required').code, 'upstream_failed')
+    assert.equal(classifyRunError('HTTP 599 from relay').code, 'upstream_failed')
+  })
+
+  it('upstream_failed: 边界不误伤嵌字词数字(审计 R1,与旧 \\b50[234]\\b 同量级)', () => {
+    // "523ms" 里 3 与 m 之间无 \b → 不命中 5xx 档 → 保持 unknown(误伤面不扩大)。
+    assert.equal(classifyRunError('request took 523ms then failed with TypeError').code, 'unknown')
+  })
+
   it('upstream_failed: ECONNRESET', () => {
     const r = classifyRunError('socket hang up: ECONNRESET')
     assert.equal(r.code, 'upstream_failed')
+  })
+
+  it('upstream_failed: ECONNREFUSED / EAI_AGAIN(审计 R1 补网络错误)', () => {
+    assert.equal(classifyRunError('connect ECONNREFUSED 127.0.0.1:443').code, 'upstream_failed')
+    assert.equal(classifyRunError('getaddrinfo EAI_AGAIN api.anthropic.com').code, 'upstream_failed')
   })
 
   it('upstream_failed: ACCOUNT_POOL_BUSY', () => {
@@ -81,10 +98,15 @@ describe('classifyRunError', () => {
     )
   })
 
-  it('现状钉死:裸 529(无容量词/无 50[234])→ unknown', () => {
-    // 任务备注对 529 归类不确定;此处钉死真实现状:529 既不在 rate(429)也不在
-    // upstream(50[234])正则,且无容量词 → unknown(caller 压成 upstream_failed 发帧)。
-    assert.equal(classifyRunError('HTTP 529 returned by gateway').code, 'unknown')
+  it('裸 529 → model_capacity(审计 R1:Anthropic 529=overloaded,容量语义)', () => {
+    // 审计 R1 改判:529 是 Anthropic overloaded 状态码,语义=容量满载(可重试/
+    // 可换模型),故显式命中容量档(排在通用 5xx upstream 之前),不再落 unknown。
+    assert.equal(classifyRunError('HTTP 529 returned by gateway').code, 'model_capacity')
+    // 与词族命中同码时 message 一致。
+    assert.equal(
+      classifyRunError('HTTP 529 returned by gateway').message,
+      classifiedMessageForCode('model_capacity'),
+    )
   })
 
   it('classifiedMessageForCode 与 PATTERNS 同源(无平行文案表)', () => {

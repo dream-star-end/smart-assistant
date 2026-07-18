@@ -178,6 +178,9 @@ function buildTurnSummary(result: TurnResult, telemetry: TelemetryChannel): Turn
     numTurns: result.numTurns,
     isError: result.isError,
     ...(errorKind ? { errorKind } : {}),
+    // 审计 R3:与 codexAdapter 对称,把 TurnResult.errorClass 复制到 TurnSummary。
+    // CCB result 帧不产 errorClass(恒 undefined,不落),此处仅保证映射对称、不丢字段。
+    ...(result.errorClass !== undefined ? { errorClass: result.errorClass } : {}),
     ...(errorKind === 'model_authority'
       ? { errorDetail: 'MODEL_AUTHORITY_EXPIRED' }
       : result.errorDetail !== undefined

@@ -111,6 +111,10 @@ function buildTurnSummary(result: TurnResult, ctx: CodexTurnContext): TurnSummar
     numTurns: result.numTurns,
     isError: result.isError,
     ...(errorKind ? { errorKind } : {}),
+    // 审计 R3:把 runner 现场预分类的 errorClass 从 TurnResult 逐字段复制到
+    // TurnSummary —— 此前漏复制,sessionManager 读到恒 undefined、只靠重新正则
+    // 解析 errorDetail 偶然兜住。现链路贯通。
+    ...(result.errorClass !== undefined ? { errorClass: result.errorClass } : {}),
     ...(result.errorDetail !== undefined ? { errorDetail: result.errorDetail } : {}),
     // codex 的 stale-thread 自愈在内核内(thread/resume -32600 "no rollout
     // found" → 透明 thread/start + 重发 session_id),不经 resume-map 逐出路径;

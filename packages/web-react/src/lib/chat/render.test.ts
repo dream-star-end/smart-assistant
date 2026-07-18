@@ -285,10 +285,68 @@ describe("errorPresentation 兜底分支:不再裸透传 text(任务②)", () =>
     expect(p.message).toBe("运行环境已升级，请刷新页面。");
   });
 
-  test("未知码 → 标题「出错了」+ 通用兜底正文,非内部原文进 detail", () => {
+  test("未知码 + 合法正文 → 标题「出错了」+ 通用兜底正文,正文进 bodyText(R6:不再降进 detail)", () => {
     const p = errorPresentation("brand_new_code", "临时不可用", undefined);
     expect(p.title).toBe("出错了");
     expect(p.message).toBe("系统暂时不可用，请稍后重试。");
-    expect(p.detail).toBe("临时不可用");
+    // R6:合法部分回答(非终止器/非内部串)现走 bodyText 正常渲染,不再被降进「查看详情」。
+    expect(p.bodyText).toBe("临时不可用");
+    expect(p.detail).toBeUndefined();
+  });
+});
+
+describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => {
+  test("R6:合法部分回答 + 尾部终止器同串 → 部分回答进 bodyText,红卡正文按码,终止器进 detail", () => {
+    const raw = "这是模型已经写出的一段正常回答。\n\n[turn failed: Selected model is at capacity. Please try a different model.]\n";
+    const p = errorPresentation("engine_error", raw, undefined);
+    expect(p.title).not.toBe("出错了");
+    expect(p.bodyText).toBe("这是模型已经写出的一段正常回答。");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("engine_error"));
+    expect(p.message).not.toContain("turn failed");
+    expect(p.detail).toBe("[turn failed: Selected model is at capacity. Please try a different model.]");
+    // 终止器是纯 prose,detail/bodyText 均无 JSON 信封形态。
+    expect(p.detail).not.toMatch(/"error"|"status"/);
+    expect(p.bodyText).not.toMatch(/[{[]/);
+  });
+
+  test("R6:纯终止器(无部分回答)→ 无 bodyText,红卡按码 + 终止器进 detail(回归)", () => {
+    const p = errorPresentation("upstream_failed", "[turn failed: model overloaded]", undefined);
+    expect(p.bodyText).toBeUndefined();
+    expect(p.message).toBe(friendlyBridgeErrorMessage("upstream_failed"));
+    expect(p.detail).toBe("[turn failed: model overloaded]");
+  });
+
+  test("R7:非 engine_error(model_capacity)带 Codex JSON errorDetail → 脱敏保留请求 ID,不泄漏 JSON", () => {
+    const jsonDetail = '{"error":{"code":"model_capacity","status":503},"request_id":"9cad8ad4bf74b7050694873e6ab16b01"}';
+    const p = errorPresentation("model_capacity", "", jsonDetail);
+    expect(p.message).toBe(friendlyBridgeErrorMessage("model_capacity"));
+    expect(p.detail).toBe("请求 ID：9cad8ad4bf74b7050694873e6ab16b01");
+    expect(JSON.stringify(p)).not.toMatch(/model_capacity","status|503|"error":\{/);
+  });
+
+  test("R7:内部 JSON detail 无可提取请求 ID → detail 整个隐去(不外泄)", () => {
+    const p = errorPresentation("model_capacity", "", '{"error":"overloaded upstream at run (/srv/x.js:1:2)"}');
+    expect(p.detail).toBeUndefined();
+    expect(JSON.stringify(p)).not.toContain("overloaded upstream");
+  });
+
+  test("R6:合法部分回答 + 内部 JSON detail(model_capacity)→ 部分回答仍可见,detail 脱敏", () => {
+    const p = errorPresentation(
+      "model_capacity",
+      "部分结果:第一步已完成。",
+      '{"error":{"status":503},"request_id":"abcd1234abcd1234abcd1234abcd1234"}',
+    );
+    expect(p.bodyText).toBe("部分结果:第一步已完成。");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("model_capacity"));
+    expect(p.detail).toBe("请求 ID：abcd1234abcd1234abcd1234abcd1234");
+    expect(JSON.stringify(p)).not.toMatch(/"error":\{|503/);
+  });
+
+  test("R6:engine_error 且正文本身是内部串 → 仍收敛为内部错误文案(不当部分回答)", () => {
+    const raw = '{"error":"API Error","code":"UPSTREAM"}\n at run (/srv/app.js:1:2)';
+    const p = errorPresentation("engine_error", raw, undefined);
+    expect(p.bodyText).toBeUndefined();
+    expect(p.message).toContain("内部错误");
+    expect(JSON.stringify(p)).not.toContain("API Error");
   });
 });

@@ -55,7 +55,7 @@ import {
   type OutboundContentBlock,
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
-import { classifyRunError, type ClassifiedErrorCode } from './errorClassify.js'
+import { classifyRunError } from './errorClassify.js'
 import type { GatewayTurnPhase } from './ccbMessageParser.js'
 import {
   type ExecutionTarget,
@@ -4319,18 +4319,17 @@ export class SessionManager {
           // terminal completion until the authoritative master ACKs it.
           if (persistenceAcknowledged) {
             if (terminalErrorForClient) {
-              // runner 已把错误预分类时透传 errorClass,让 server.ts 直接按码组
-              // 结构化 outbound.error(省一次原文正则)。engine/ 的 TurnSummary /
-              // error 事件类型不在本包所有权内,errorClass 作为可选字段读取:
-              // codex adapter 在场则带上,缺省 undefined → server 侧回落
-              // classifyRunError,行为不变。
-              const preClassified = (result as { errorClass?: ClassifiedErrorCode })
-                .errorClass
+              // 审计 R3:errorClass 已是 TurnSummary 的权威字段(各 adapter 的
+              // buildTurnSummary 从 TurnResult 复制),直读即可 —— 不再 cast 穿透,
+              // 也不再靠 server 侧重新正则解析 errorDetail 兜底。runner 预分类在场
+              // 则透传给 server.ts 直接按码组 outbound.error;缺省 undefined →
+              // server 侧回落 classifyRunError,行为不变。
+              const preClassified = result?.errorClass
               onEvent({
                 kind: 'error',
                 error: terminalErrorForClient,
                 ...(preClassified ? { errorClass: preClassified } : {}),
-              } as SessionStreamEvent)
+              })
             } else if (pendingFinal) {
               onEvent(pendingFinal)
             }

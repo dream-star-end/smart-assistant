@@ -1029,6 +1029,12 @@ export class CodexAppServerRunner extends EventEmitter {
   /** 退避 sleep 的中断句柄。非空 = 正处于 turn/start 重试退避窗口;interrupt() 在此
    *  期间(activeTurnId 为 null)也接受,abort 后 runTurn 走 USER_CANCELLED 终态。 */
   private pendingRetryAbort: AbortController | null = null
+  /** 审计 R8 — 本次退避窗口内 proc 是否已经崩溃/关闭。proc close/error 回调唤醒退避
+   *  时置位;runTurn 的 proc-gone 门据此把终态判为 crashed(而非 interrupt 的
+   *  USER_CANCELLED)。close 已把 proc 置 null(门的 `!this.proc` 分支即可命中),
+   *  但 error 早于 close 且刻意不清 proc(留到 close 收尾以吸收晚到 stdout),故需要
+   *  这个独立标记让 error 唤醒的退避也走 proc-gone 终态。安装每个退避控制器时复位。 */
+  private retryBackoffProcGone = false
   /** Issue A v1.0.108 — 最新 codex `account/rateLimits/updated` 快照,piggy-back
    *  到下一个 emitResult。**故意不在 turn 边界 clear**:让 init 阶段 / 上一 turn
    *  完成后 / 任意时刻收到的最新值粘住。
@@ -1380,14 +1386,15 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   interrupt(): boolean {
-    if (!this.proc || this.proc.killed) return false
-    // turn-retry 批:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,
-    // runTurn 的 backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清
-    // retrying 状态帧。必须先于下面的 activeTurnId 非空守卫。
+    // 审计 R8:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,runTurn 的
+    // backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清 retrying 状态帧。
+    // **必须先于 proc 存活守卫**:proc 已死但退避 sleep 仍在跑时(如 crash 与 close
+    // 之间的窗口),用户 stop 也要能立即中断退避,否则要等满退避才收尾。
     if (this.pendingRetryAbort) {
       this.pendingRetryAbort.abort()
       return true
     }
+    if (!this.proc || this.proc.killed) return false
     if (!this.threadId || !this.activeTurnId) return false
     void this.sendRequest('turn/interrupt', {
       threadId: this.threadId,
@@ -1403,6 +1410,17 @@ export class CodexAppServerRunner extends EventEmitter {
       })
     })
     return true
+  }
+
+  /** 审计 R8 — proc 在 turn/start 重试退避窗口内崩溃/关闭时唤醒退避 sleep,让 runTurn
+   *  的 proc-gone 门立即转 crashed 终态(不再等满退避)。非退避期(pendingRetryAbort
+   *  为 null)是 no-op;置 retryBackoffProcGone 与 interrupt 的用户取消路径区分终态。
+   *  幂等(AbortController.abort 幂等)。proc close/error 回调各调用一次。 */
+  private wakeRetryBackoffOnProcGone(): void {
+    if (this.pendingRetryAbort) {
+      this.retryBackoffProcGone = true
+      this.pendingRetryAbort.abort()
+    }
   }
 
   constructor(private opts: CodexAppServerRunnerOpts) {
@@ -1806,6 +1824,10 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       log.error('codex app-server proc error', { err: err.message })
       this.emit('error', err)
+      // 审计 R8:proc 在 turn/start 重试退避窗口内出错 → 唤醒退避,让 runTurn 立即转
+      // crashed 终态(retryBackoffProcGone,不误判 USER_CANCELLED)。error 刻意不清
+      // this.proc(晚到 stdout 留到 close 收尾),故 proc-gone 门靠标记而非 `!this.proc`。
+      this.wakeRetryBackoffOnProcGone()
       // `error` can precede `close`. Keep the exact process identity, pending
       // turn, and partial JSON line alive until the stdio-drained close
       // boundary; otherwise late paid output is silently discarded.
@@ -1843,6 +1865,10 @@ export class CodexAppServerRunner extends EventEmitter {
       const closeReason = `codex app-server exited code=${code} signal=${signal ?? ''}`
       if (wasShutdown) this.emitForcedShutdownResult(closeReason)
       this.failAllPending(closeReason)
+      // 审计 R8:proc 关闭时唤醒仍在跑的退避 sleep,让 runTurn 立即转终态(否则要等满
+      // 退避才命中下面 proc=null 的 proc-gone 门)。shutdown 路径已在 shutdown() 里 abort
+      // 过(幂等);crash 路径这里是唯一唤醒点。
+      this.wakeRetryBackoffOnProcGone()
       this.proc = null
       this.spawnedProviderSignature = null
       this.initialized = false
@@ -2236,6 +2262,28 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       const autoApproval = this.buildServerRequestAutoApproval(msg.method, msg.params)
       if (autoApproval !== null) {
+        // 审计 R2 — 自动批准 = 对当前 thread 的权限/命令/文件副作用,是本 attempt
+        // 的对外 emit 边界。**必须在写批准响应之前**单调置位台账 flag:同一 stdout
+        // chunk 内的 reverse-RPC 可能先于 turn/start 的 Promise resolve 到达,若不在此
+        // 记账,后续 turn/start application error 时重试门会误判"零权限副作用"而重发,
+        // 造成已批准的副作用重复执行。与 handleRequestUserInput 的记账点对称。
+        this.attemptHadToolOrPermission = true
+        // 若该 reverse-RPC 携带 turnId 且本 attempt 尚未 adopt(activeTurnId===null)
+        // 且 turn 在飞(currentTurnCompleter),提前 adopt —— 与 handleRequestUserInput /
+        // handleNotification 的 early-turn adoption 同语义,让重试门的 activeTurnId
+        // 守卫也一并 fail-closed(双重封死),并把后继 turn/completed 清理正确定界。
+        const approvalTurnId =
+          msg.params && typeof msg.params === 'object'
+            ? (msg.params as Record<string, unknown>).turnId
+            : undefined
+        if (
+          typeof approvalTurnId === 'string' &&
+          approvalTurnId.length > 0 &&
+          this.activeTurnId === null &&
+          this.currentTurnCompleter
+        ) {
+          this.activeTurnId = approvalTurnId
+        }
         log.info('codex app-server server request auto-approved', {
           sessionKey: this.opts.sessionKey,
           method: msg.method,
@@ -3323,6 +3371,8 @@ export class CodexAppServerRunner extends EventEmitter {
             })
             const controller = new AbortController()
             this.pendingRetryAbort = controller
+            // 审计 R8:每个退避窗口起点复位 proc-gone 标记(仅本窗口内 close/error 置位)。
+            this.retryBackoffProcGone = false
             let interruptedDuringBackoff = false
             try {
               interruptedDuringBackoff = await this.abortableDelay(delayMs, controller.signal)
@@ -3330,12 +3380,14 @@ export class CodexAppServerRunner extends EventEmitter {
               this.pendingRetryAbort = null
               this.emitTurnStatus(null)
             }
-            // proc 在退避期间消失(crash close 置 proc=null / shutdown kill)→ 绝不
-            // 把 turn/start 重发进死管道(writeRaw 静默失败、pending 无人 settle →
-            // runTurn 挂死)。转外层 catch 走终态(parser finalized 会与可能的 forced
-            // result 去重)。必须先于 interrupt 判定:shutdown abort 的退避也走这里,
-            // 不误报成 USER_CANCELLED。
-            if (!this.proc || this.proc.killed || this.shuttingDown) {
+            // proc 在退避期间消失(crash close 置 proc=null / error 唤醒置
+            // retryBackoffProcGone / shutdown kill)→ 绝不把 turn/start 重发进死管道
+            // (writeRaw 静默失败、pending 无人 settle → runTurn 挂死)。转外层 catch
+            // 走终态(parser finalized 会与可能的 forced result 去重)。必须先于
+            // interrupt 判定:shutdown abort 与 proc-gone 唤醒的退避都走这里,不误报成
+            // USER_CANCELLED。审计 R8:retryBackoffProcGone 捕获 error 早于 close(proc
+            // 尚未置 null)的窗口,让其也判为 crashed 而非用户取消。
+            if (!this.proc || this.proc.killed || this.shuttingDown || this.retryBackoffProcGone) {
               throw new Error('codex app-server gone during retry backoff')
             }
             if (interruptedDuringBackoff) {
