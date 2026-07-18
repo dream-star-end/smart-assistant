@@ -20,7 +20,7 @@ import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js
 
 const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
 const WORKER_FILE = 'knowledge-planet-worker.mjs'
-const WORKER_RUNTIME = 'knowledge-planet-worker-v1.3'
+const WORKER_RUNTIME = 'knowledge-planet-worker-v1.5'
 const EXPECTED_PLAYWRIGHT_MCP_VERSION = '0.0.76'
 const WORKER_MAX_FRAME_BYTES = 1024 * 1024
 const WORKER_STDERR_MAX_BYTES = 64 * 1024

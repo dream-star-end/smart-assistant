@@ -90,7 +90,7 @@ TURN_ERR_MIN_USERS="${V5MON_TURN_ERR_MIN_USERS:-2}"    # 多用户阈:≥N 个�
 TURN_ERR_MIN_EVENTS="${V5MON_TURN_ERR_MIN_EVENTS:-3}"  # 多用户阈:且总失败 ≥N 次
 TURN_ERR_SOLO_EVENTS="${V5MON_TURN_ERR_SOLO:-8}"       # 单源阈:单窗总失败 ≥N 次
 # KP 官方托管浏览器插件版本(= KNOWLEDGE_PLANET_PLUGIN_VERSION;插件 bump 版本时同步本值)。
-KP_PLUGIN_VERSION="${V5MON_KP_VERSION:-1.4.0}"
+KP_PLUGIN_VERSION="${V5MON_KP_VERSION:-1.5.0}"
 # 客户端 4xx 风暴:同一 clientIp × route 在窗口内 >阈值 次 4xx。背景:2026-07-17 /api/media-signed
 # 20min 内 410×381 无人告警。日志消费与 check_mail 同法(grep app 日志 + 解析 "ts")。
 CLIENT_4XX_WINDOW_SECS="${V5MON_CLIENT_4XX_WINDOW:-600}"     # 回看窗(10min)

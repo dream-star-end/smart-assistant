@@ -13,6 +13,7 @@ export const KNOWLEDGE_PLANET_QR_MIN_LUMINANCE_DEVIATION = 70
 export const KNOWLEDGE_PLANET_WORKER_MAX_OUTPUT_BYTES = 1024 * 1024
 export const KNOWLEDGE_PLANET_WORKER_MAX_STATE_JSON_BYTES = 256 * 1024
 export const KNOWLEDGE_PLANET_TOPIC_PAGE_MAX = 10
+export const KNOWLEDGE_PLANET_COMMENT_RESULT_MAX = 100
 
 export const KNOWLEDGE_PLANET_LOGIN_PROBE_CONTROL_SOURCE = String.raw`
 function scheduleKnowledgePlanetLoginProbe(now, pageAuthenticated, pageHintApplied, nextProbeAt, attempts) {
@@ -423,24 +424,77 @@ function projectGroup(value) {
   });
 }
 
-function projectComment(value) {
+function projectComment(value, hierarchy = {}) {
   const raw = value && typeof value === 'object' ? value : {};
   const images = Array.isArray(raw.images) ? raw.images : [];
+  const replies = Array.isArray(raw.replied_comments) ? raw.replied_comments : [];
+  const commentId = id(raw.comment_id || raw.id);
+  const replyCount = integer(raw.replies_count ?? raw.reply_count);
   const projected = compact({
-    id: id(raw.comment_id || raw.id),
+    id: commentId,
+    rootCommentId: id(hierarchy.rootCommentId) || commentId,
+    parentCommentId: id(raw.parent_comment_id) || id(hierarchy.parentCommentId),
+    depth: Number.isInteger(hierarchy.depth) && hierarchy.depth >= 0 ? hierarchy.depth : 0,
     createdAt: text(raw.create_time || raw.created_at, 64),
     text: text(raw.text, 1_200),
     author: projectAuthor(raw.owner || raw.user),
     replyTo: projectAuthor(raw.repliee || raw.reply_to),
     likeCount: integer(raw.likes_count ?? raw.like_count),
+    replyCount,
+    returnedReplyCount: replies.length,
+    repliesComplete: replyCount === undefined ? undefined : replyCount === replies.length,
     sticky: booleanValue(raw.sticky),
     liked: booleanValue(raw.user_specific?.liked ?? raw.liked),
     images: images.slice(0, 1).map(projectImage),
   });
   return { ...projected, contentDigest: contentDigest({
+    id: projected.id,
+    rootCommentId: projected.rootCommentId,
+    parentCommentId: projected.parentCommentId,
     text: projected.text || '',
     imageIds: Array.isArray(projected.images) ? projected.images.map((item) => item.id).filter(Boolean) : [],
   }) };
+}
+
+function flattenComments(values) {
+  const roots = Array.isArray(values) ? values : [];
+  const stack = roots.slice().reverse().map((value) => ({
+    value,
+    depth: 0,
+    parentCommentId: undefined,
+    rootCommentId: undefined,
+  }));
+  const comments = [];
+  const seen = new Set();
+  let truncated = false;
+  let hasPartialReplies = false;
+  while (stack.length > 0 && comments.length < ${KNOWLEDGE_PLANET_COMMENT_RESULT_MAX}) {
+    const frame = stack.pop();
+    const raw = frame.value && typeof frame.value === 'object' ? frame.value : {};
+    const projected = projectComment(frame.value, frame);
+    const replies = Array.isArray(raw.replied_comments) ? raw.replied_comments : [];
+    if (projected.repliesComplete === false) hasPartialReplies = true;
+    if (projected.id && !seen.has(projected.id)) {
+      seen.add(projected.id);
+      comments.push(projected);
+    }
+    if (!projected.id) continue;
+    if (frame.depth >= ${KNOWLEDGE_PLANET_COMMENT_RESULT_MAX - 1}) {
+      if (replies.length > 0) truncated = true;
+      continue;
+    }
+    for (let index = replies.length - 1; index >= 0; index -= 1) stack.push({
+      value: replies[index],
+      depth: frame.depth + 1,
+      parentCommentId: projected.id,
+      rootCommentId: projected.rootCommentId,
+    });
+  }
+  return {
+    comments,
+    truncated: truncated || stack.length > 0,
+    hasPartialReplies,
+  };
 }
 
 function projectHashtag(value) {
@@ -512,6 +566,55 @@ function topicQuery(params, count) {
   });
 }
 
+function normalizedCommentPage(value, requireExplicit = false) {
+  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const allowed = new Set(['count', 'sort', 'beginTime', 'endTime']);
+  if (Object.keys(raw).some((key) => !allowed.has(key))) throw new Error('page');
+  if (requireExplicit && (!Number.isInteger(raw.count) || !['asc', 'desc'].includes(raw.sort))) throw new Error('page');
+  if (raw.count !== undefined && (!Number.isInteger(raw.count) || raw.count < 1 || raw.count > 50)) throw new Error('page');
+  if (raw.sort !== undefined && !['asc', 'desc'].includes(raw.sort)) throw new Error('page');
+  if (raw.beginTime !== undefined && typeof raw.beginTime !== 'string') throw new Error('page');
+  if (raw.endTime !== undefined && typeof raw.endTime !== 'string') throw new Error('page');
+  return compact({
+    count: raw.count ?? 10,
+    sort: raw.sort ?? 'asc',
+    beginTime: text(raw.beginTime, 80),
+    endTime: text(raw.endTime, 80),
+  });
+}
+
+function requestedCommentPage(params) {
+  return normalizedCommentPage(compact({
+    count: params.count,
+    sort: params.sort,
+    beginTime: params.beginTime,
+    endTime: params.endTime,
+  }));
+}
+
+function commentQuery(page) {
+  return compact({
+    count: page.count,
+    sort: page.sort,
+    begin_time: page.beginTime,
+    end_time: page.endTime,
+    with_sticky: true,
+  });
+}
+
+function commentListResult(payload, page) {
+  const topLevel = firstArrayAt(payload, ['comments', 'items', 'list']).slice(0, page.count);
+  const flattened = flattenComments(topLevel);
+  return {
+    comments: flattened.comments,
+    topLevelCount: topLevel.length,
+    returnedCount: flattened.comments.length,
+    truncated: flattened.truncated,
+    hasPartialReplies: flattened.hasPartialReplies,
+    page,
+  };
+}
+
 function buildAction(action, params) {
   const count = Number.isInteger(params.count) ? params.count : 10;
   const topicCount = Math.min(count, ${KNOWLEDGE_PLANET_TOPIC_PAGE_MAX});
@@ -534,8 +637,11 @@ function buildAction(action, params) {
   };
   if (action === 'list_comments' && NUMERIC_ID.test(params.topicId)) return {
     path: '/v2/topics/' + params.topicId + '/comments',
-    query: { sort: ['asc', 'desc'].includes(params.sort) ? params.sort : 'asc', count },
-    project: (data) => ({ comments: firstArrayAt(data, ['comments', 'items', 'list']).slice(0, 50).map(projectComment) }),
+    query: commentQuery(requestedCommentPage(params)),
+    project: (data) => {
+      const page = requestedCommentPage(params);
+      return commentListResult(data, page);
+    },
   };
   if (action === 'search_topics' && NUMERIC_ID.test(params.groupId) && typeof params.keyword === 'string') return {
     path: '/v2/search/groups/' + params.groupId + '/topics',
@@ -730,6 +836,8 @@ async function finishAction(api, input, result) {
     result = { ...result, [listKey]: [...result[listKey]] };
     while (result[listKey].length > 0 && Buffer.byteLength(JSON.stringify({ event: 'completed', result, storageState: state }), 'utf8') > MAX_OUTPUT) result[listKey].pop();
     if ('nextEndTime' in result) result.nextEndTime = result[listKey].at(-1)?.createdAt;
+    if ('returnedCount' in result) result.returnedCount = result[listKey].length;
+    if ('truncated' in result) result.truncated = true;
     completed = { event: 'completed', result: compact(result), storageState: state };
   }
   await writeTerminalAndExit(completed);
@@ -786,10 +894,13 @@ async function currentTopic(api, state, topicId) {
   return projectTopic(objectAt(data, 'topic'));
 }
 
-async function currentComment(api, state, topicId, commentId) {
-  for (const sort of ['desc', 'asc']) {
-    const data = await fetchApi(api, { method: 'GET', path: '/v2/topics/' + topicId + '/comments', query: { count: 50, sort } }, state);
-    const found = firstArrayAt(data, ['comments', 'items', 'list']).map(projectComment).find((item) => item.id === commentId);
+async function currentComment(api, state, topicId, commentId, lookupPage) {
+  const pages = lookupPage
+    ? [normalizedCommentPage(lookupPage, true)]
+    : [normalizedCommentPage({ count: 50, sort: 'desc' }, true), normalizedCommentPage({ count: 50, sort: 'asc' }, true)];
+  for (const page of pages) {
+    const data = await fetchApi(api, { method: 'GET', path: '/v2/topics/' + topicId + '/comments', query: commentQuery(page) }, state);
+    const found = flattenComments(firstArrayAt(data, ['comments', 'items', 'list']).slice(0, page.count)).comments.find((item) => item.id === commentId);
     if (found) return found;
   }
   return null;
@@ -810,7 +921,7 @@ async function verifyWritePrecondition(api, state, action, params) {
   }
   if (action === 'delete_comment') {
     if (!params.deleteSnapshot) throw new Error('snapshot');
-    const comment = await currentComment(api, state, params.topicId, params.commentId);
+    const comment = await currentComment(api, state, params.topicId, params.commentId, params.lookupPage);
     return comment !== null && comment.contentDigest === params.deleteSnapshot.expectedDigest;
   }
   return true;
@@ -882,8 +993,8 @@ async function runWriteAction(input, relay, api) {
     else uploaded.fileIds.push(uploadedId);
   }
   if (input.actionId === 'edit_topic' && params.preserveExistingMedia) {
-    uploaded.imageIds = [...params.editSnapshot.imageIds, ...uploaded.imageIds];
-    uploaded.fileIds = [...params.editSnapshot.fileIds, ...uploaded.fileIds];
+    uploaded.imageIds = [...params.editSnapshot.keepImageIds, ...uploaded.imageIds];
+    uploaded.fileIds = [...params.editSnapshot.keepFileIds, ...uploaded.fileIds];
   }
   if (uploaded.imageIds.length > 9 || uploaded.fileIds.length > 9) throw new Error('media');
   // Uploading can take materially longer than the final API mutation. Recheck again after all
@@ -1175,7 +1286,7 @@ try {
   if (!['action', 'login'].includes(input.mode) || typeof input.token !== 'string' || !Array.isArray(input.cookieDomains) || !Array.isArray(input.stateOrigins)) throw new Error('input');
   const remaining = Number(input.deadlineMs) - Date.now();
   if (!Number.isFinite(remaining) || remaining < 1_000 || remaining > 15 * 60_000) throw new Error('deadline');
-  writeFrame({ event: 'ready', runtime: 'knowledge-planet-worker-v1.3', playwrightMcpVersion });
+  writeFrame({ event: 'ready', runtime: 'knowledge-planet-worker-v1.5', playwrightMcpVersion });
   const relayHosts = new Set(input.mode === 'action' ? ['api.zsxq.com', 'upload-z1.qiniup.com'] : input.allowedOrigins.map((origin) => new URL(origin).hostname));
   const relay = await startRelay(input.token, relayHosts);
   const timer = setTimeout(() => process.exit(124), remaining + 2_000);

@@ -4,10 +4,13 @@ import { createHash } from 'node:crypto'
 
 import type { ManagedBrowserPluginContractV1 } from './contracts.js'
 import { compileRuntimePluginArtifact } from './contracts.js'
-import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js'
+import {
+  KNOWLEDGE_PLANET_COMMENT_RESULT_MAX,
+  KNOWLEDGE_PLANET_WORKER_SOURCE,
+} from './knowledgePlanetWorkerSource.js'
 
 export const KNOWLEDGE_PLANET_PLUGIN_SLUG = 'knowledge-planet'
-export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.4.0'
+export const KNOWLEDGE_PLANET_PLUGIN_VERSION = '1.5.0'
 /**
  * The implementation digest is part of both registry IDs, so changing trusted
  * worker code necessarily changes the marketplace artifact hash. Reusing the
@@ -18,9 +21,9 @@ export const KNOWLEDGE_PLANET_WORKER_DIGEST = createHash('sha256')
   .update(KNOWLEDGE_PLANET_WORKER_SOURCE)
   .digest('hex')
 export const KNOWLEDGE_PLANET_DRIVER_ID = `kp-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 60)}`
-export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.4.0'
+export const KNOWLEDGE_PLANET_DRIVER_VERSION = '1.5.0'
 export const KNOWLEDGE_PLANET_LAUNCHER_ID = `kp-container-${KNOWLEDGE_PLANET_WORKER_DIGEST.slice(0, 50)}`
-export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.4.0'
+export const KNOWLEDGE_PLANET_LAUNCHER_VERSION = '1.5.0'
 
 const authorSchema = {
   type: 'object',
@@ -48,6 +51,13 @@ const sha256Schema = {
   minLength: 64,
   maxLength: 64,
   pattern: '^[0-9a-f]{64,64}$',
+}
+
+const numericIdParamSchema = {
+  type: 'string',
+  minLength: 6,
+  maxLength: 32,
+  pattern: '^[0-9]{6,32}$',
 }
 
 const mediaPathSchema = { type: 'string', minLength: 1, maxLength: 512 }
@@ -140,17 +150,37 @@ const commentSchema = {
   type: 'object',
   properties: {
     id: { type: 'string', maxLength: 32 },
+    rootCommentId: numericIdParamSchema,
+    parentCommentId: numericIdParamSchema,
+    depth: { type: 'integer', minimum: 0, maximum: KNOWLEDGE_PLANET_COMMENT_RESULT_MAX - 1 },
     createdAt: { type: 'string', maxLength: 64 },
     text: { type: 'string', maxLength: 1_200 },
     author: authorSchema,
     replyTo: authorSchema,
     likeCount: { type: 'integer', minimum: 0 },
+    replyCount: { type: 'integer', minimum: 0 },
+    returnedReplyCount: { type: 'integer', minimum: 0 },
+    repliesComplete: { type: 'boolean' },
     sticky: { type: 'boolean' },
     liked: { type: 'boolean' },
     images: { type: 'array', maxItems: 1, items: imageSchema },
     contentDigest: sha256Schema,
   },
-  required: ['id'],
+  required: ['id', 'rootCommentId', 'depth', 'returnedReplyCount'],
+  additionalProperties: false,
+}
+
+const commentPageProperties = {
+  count: { type: 'integer', minimum: 1, maximum: 50 },
+  sort: { type: 'string', enum: ['asc', 'desc'] },
+  beginTime: { type: 'string', maxLength: 80 },
+  endTime: { type: 'string', maxLength: 80 },
+}
+
+const commentPageSchema = {
+  type: 'object',
+  properties: commentPageProperties,
+  required: ['count', 'sort'],
   additionalProperties: false,
 }
 
@@ -176,22 +206,15 @@ const topicListParamsSchema = {
   additionalProperties: false,
 }
 
-const numericIdParamSchema = {
-  type: 'string',
-  minLength: 6,
-  maxLength: 32,
-  pattern: '^[0-9]{6,32}$',
-}
-
 const editSnapshotSchema = {
   type: 'object',
   properties: {
     expectedDigest: sha256Schema,
     previousText: { type: 'string', maxLength: 12_000 },
-    imageIds: { type: 'array', maxItems: 10, items: numericIdParamSchema },
-    fileIds: { type: 'array', maxItems: 10, items: numericIdParamSchema },
+    keepImageIds: { type: 'array', maxItems: 10, items: numericIdParamSchema },
+    keepFileIds: { type: 'array', maxItems: 10, items: numericIdParamSchema },
   },
-  required: ['expectedDigest', 'previousText', 'imageIds', 'fileIds'],
+  required: ['expectedDigest', 'previousText', 'keepImageIds', 'keepFileIds'],
   additionalProperties: false,
 }
 
@@ -317,15 +340,15 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'list_comments',
-      description: '读取指定主题的评论列表',
+      description:
+        '读取指定主题当前页面的顶层评论，以及上游实际返回的楼中楼回复；结果展平并标注父子关系',
       effect: 'read',
       timeoutSeconds: 30,
       params: {
         type: 'object',
         properties: {
           topicId: numericIdParamSchema,
-          count: { type: 'integer', minimum: 1, maximum: 50 },
-          sort: { type: 'string', enum: ['asc', 'desc'] },
+          ...commentPageProperties,
         },
         required: ['topicId'],
         additionalProperties: false,
@@ -335,11 +358,27 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
         properties: {
           comments: {
             type: 'array',
-            maxItems: 50,
+            maxItems: KNOWLEDGE_PLANET_COMMENT_RESULT_MAX,
             items: commentSchema,
           },
+          topLevelCount: { type: 'integer', minimum: 0, maximum: 50 },
+          returnedCount: {
+            type: 'integer',
+            minimum: 0,
+            maximum: KNOWLEDGE_PLANET_COMMENT_RESULT_MAX,
+          },
+          truncated: { type: 'boolean' },
+          hasPartialReplies: { type: 'boolean' },
+          page: commentPageSchema,
         },
-        required: ['comments'],
+        required: [
+          'comments',
+          'topLevelCount',
+          'returnedCount',
+          'truncated',
+          'hasPartialReplies',
+          'page',
+        ],
         additionalProperties: false,
       },
     },
@@ -673,7 +712,8 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'edit_topic',
-      description: '完整编辑普通主题正文并可追加图片或附件（默认逐次确认；账号授权后可免确认）',
+      description:
+        '完整编辑普通主题正文，可追加或按 ID 移除图片/附件（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 600,
       params: {
@@ -683,6 +723,8 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
           topicId: numericIdParamSchema,
           text: { type: 'string', maxLength: 10_000 },
           preserveExistingMedia: { type: 'boolean' },
+          removeImageIds: { type: 'array', maxItems: 9, items: numericIdParamSchema },
+          removeFileIds: { type: 'array', maxItems: 9, items: numericIdParamSchema },
           images: { type: 'array', maxItems: 9, items: mediaPathSchema },
           files: { type: 'array', maxItems: 9, items: mediaPathSchema },
           mediaManifest: { type: 'array', maxItems: 18, items: sealedMediaSchema },
@@ -713,7 +755,8 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
     },
     {
       id: 'delete_comment',
-      description: '永久删除评论或回复（不可撤销；默认逐次确认，账号授权后可免确认）',
+      description:
+        '永久删除评论或楼中楼回复；删除非默认页面的项目时须原样传入 list_comments 返回的 page 作为 lookupPage（不可撤销；默认逐次确认，账号授权后可免确认）',
       effect: 'write',
       timeoutSeconds: 120,
       params: {
@@ -721,6 +764,7 @@ export const KNOWLEDGE_PLANET_PLUGIN_ARTIFACT = Object.freeze({
         properties: {
           topicId: numericIdParamSchema,
           commentId: numericIdParamSchema,
+          lookupPage: commentPageSchema,
           deleteSnapshot: deleteSnapshotSchema,
         },
         required: ['topicId', 'commentId'],
@@ -766,10 +810,15 @@ if (COMPILED_KNOWLEDGE_PLANET_PLUGIN.pluginType !== 'managed-browser')
 
 /**
  * Exact platform-reviewed predecessors accepted for additive official upgrades.
- * Their browser account-state contract is byte-for-byte compatible with v1.4;
+ * Their browser account-state contract is byte-for-byte compatible with v1.5;
  * no other historical or user-published Knowledge Planet artifact is eligible.
  */
 export const KNOWLEDGE_PLANET_SETUP_COMPATIBLE_PREDECESSORS = Object.freeze([
+  Object.freeze({
+    version: '1.4.0',
+    artifactHash: 'bc027e75eade8285c776f0ca6aa1f10bc32d8f6e4bc870b1be35a965946a04fb',
+    execContractHash: '02d496327bf1d088b3f6b1821731416980ac6a77e21df16dabeea2da0882d8b8',
+  }),
   Object.freeze({
     version: '1.3.0',
     artifactHash: '1dbcb8d8861ae812431277e0144c93dd6018f0ba47b1ea359a8dcfb173a0c258',
