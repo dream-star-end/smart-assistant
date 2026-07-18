@@ -100,6 +100,10 @@ import type {
   DeclarativeOauthStartResult,
   KnowledgePlanetSetupView,
   PluginManagementResponse,
+  KnowledgePlanetAutomationControl,
+  KnowledgePlanetAutomationGroup,
+  KnowledgePlanetAutomationRule,
+  KnowledgePlanetAutomationView,
   RuntimePluginAccount,
 } from './connectors'
 import { normalizeOrgPlan, normalizeOrgSubscription } from './orgBilling'
@@ -3104,6 +3108,167 @@ export const api = {
         }),
       ),
     ).then((result) => result.writeControl),
+
+  setPluginWritePreapproval: (
+    a: AuthSession,
+    id: string,
+    input:
+      | { enabled: false }
+      | { enabled: true; accepted: true; disclaimerVersion: number },
+  ): Promise<RuntimePluginAccount['writeControl']> =>
+    jsonOrThrow<{ writeControl: RuntimePluginAccount['writeControl'] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/write-preapproval`, {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.writeControl),
+
+  getKnowledgePlanetAutomation: (
+    a: AuthSession,
+    id: string,
+  ): Promise<KnowledgePlanetAutomationView> =>
+    jsonOrThrow<KnowledgePlanetAutomationView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation`, {
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  setKnowledgePlanetAutomation: (
+    a: AuthSession,
+    id: string,
+    input:
+      | { enabled: false; accountDailyLimit?: number }
+      | {
+          enabled: true
+          accepted: true
+          disclaimerVersion: number
+          accountDailyLimit?: number
+        },
+  ): Promise<KnowledgePlanetAutomationControl> =>
+    jsonOrThrow<{ control: KnowledgePlanetAutomationControl }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation`, {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.control),
+
+  listKnowledgePlanetAutomationGroups: (
+    a: AuthSession,
+    id: string,
+  ): Promise<KnowledgePlanetAutomationGroup[]> =>
+    jsonOrThrow<{ groups: KnowledgePlanetAutomationGroup[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/groups`, {
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((result) => result.groups),
+
+  createKnowledgePlanetAutomationRulesBatch: (
+    a: AuthSession,
+    id: string,
+    input: {
+      groupIds: string[]
+      name: string
+      instructions: string
+      triggerKind: 'new_topic' | 'new_question'
+      dailyLimit: number
+      cooldownMinutes: number
+      maxReplyChars: number
+    },
+  ): Promise<KnowledgePlanetAutomationRule[]> =>
+    jsonOrThrow<{ rules: KnowledgePlanetAutomationRule[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/batch`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.rules),
+
+  createKnowledgePlanetAutomationRule: (
+    a: AuthSession,
+    id: string,
+    input: {
+      groupId: string
+      name: string
+      instructions: string
+      triggerKind: 'new_topic' | 'new_question'
+      dailyLimit: number
+      cooldownMinutes: number
+      maxReplyChars: number
+    },
+  ): Promise<KnowledgePlanetAutomationRule> =>
+    jsonOrThrow<{ rule: KnowledgePlanetAutomationRule }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((result) => result.rule),
+
+  patchKnowledgePlanetAutomationRule: (
+    a: AuthSession,
+    id: string,
+    ruleId: string,
+    patch: Partial<{
+      name: string
+      instructions: string
+      triggerKind: 'new_topic' | 'new_question'
+      enabled: boolean
+      dailyLimit: number
+      cooldownMinutes: number
+      maxReplyChars: number
+    }>,
+  ): Promise<KnowledgePlanetAutomationRule> =>
+    jsonOrThrow<{ rule: KnowledgePlanetAutomationRule }>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/${encodeURIComponent(ruleId)}`,
+          {
+            method: 'PATCH',
+            credentials: 'include',
+            headers: bearerHeaders(t, true),
+            body: JSON.stringify(patch),
+          },
+        ),
+      ),
+    ).then((result) => result.rule),
+
+  deleteKnowledgePlanetAutomationRule: (
+    a: AuthSession,
+    id: string,
+    ruleId: string,
+  ): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/plugins/accounts/${encodeURIComponent(id)}/automation/rules/${encodeURIComponent(ruleId)}`,
+          {
+            method: 'DELETE',
+            credentials: 'include',
+            headers: bearerHeaders(t),
+          },
+        ),
+      ),
+    ).then(() => undefined),
 
   // ── 企业版(P3.1)org 自助后台 ─────────────────────────────────────────
   // org 由服务端从 caller membership 推导,前端**不带** org_id。批次 D 端点(usage/

@@ -20,15 +20,16 @@ import { KNOWLEDGE_PLANET_WORKER_SOURCE } from './knowledgePlanetWorkerSource.js
 
 const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
 const WORKER_FILE = 'knowledge-planet-worker.mjs'
-const WORKER_RUNTIME = 'knowledge-planet-worker-v1.2'
+const WORKER_RUNTIME = 'knowledge-planet-worker-v1.5'
 const EXPECTED_PLAYWRIGHT_MCP_VERSION = '0.0.76'
 const WORKER_MAX_FRAME_BYTES = 1024 * 1024
 const WORKER_STDERR_MAX_BYTES = 64 * 1024
 const WORKER_LABEL = 'com.openclaude.plugin.worker'
-const WORKER_LABEL_VALUE = 'knowledge-planet-v1.2'
+const WORKER_LABEL_VALUE = 'knowledge-planet-v1.3'
 const RECLAIMABLE_WORKER_LABEL_VALUES = new Set([
   'knowledge-planet-v1',
   'knowledge-planet-v1.1',
+  'knowledge-planet-v1.2',
   WORKER_LABEL_VALUE,
 ])
 const WORKER_EXPIRY_LABEL = 'com.openclaude.plugin.expires_at_ms'
@@ -73,11 +74,15 @@ export class KnowledgePlanetRuntimeError extends Error {
     | 'LOGIN_EXPIRED_ACCOUNT'
     | 'CLOSING'
     | 'CLEANUP_FAILED'
+    | 'PRECONDITION_CHANGED'
+
+  readonly dispatchProvenNotStarted: boolean
 
   constructor(code: KnowledgePlanetRuntimeError['code'], message: string = code) {
     super(message)
     this.name = 'KnowledgePlanetRuntimeError'
     this.code = code
+    this.dispatchProvenNotStarted = code === 'PRECONDITION_CHANGED'
   }
 }
 
@@ -90,6 +95,15 @@ interface ReadyEvent {
 interface FailedEvent {
   event: 'failed'
   code: 'WORKER_FAILED' | 'LOGIN_EXPIRED' | 'UPSTREAM_FAILED'
+}
+
+interface PreparedEvent {
+  event: 'prepared'
+}
+
+interface NotDispatchedEvent {
+  event: 'not_dispatched'
+  code: 'PRECONDITION_CHANGED'
 }
 
 interface CompletedEvent {
@@ -108,7 +122,14 @@ interface AuthenticatedEvent {
   storageState: unknown
 }
 
-type WorkerEvent = ReadyEvent | FailedEvent | CompletedEvent | QrEvent | AuthenticatedEvent
+type WorkerEvent =
+  | ReadyEvent
+  | PreparedEvent
+  | NotDispatchedEvent
+  | FailedEvent
+  | CompletedEvent
+  | QrEvent
+  | AuthenticatedEvent
 
 function plainEvent(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value))
@@ -140,6 +161,16 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
     if (!['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_FAILED'].includes(String(event.code)))
       throw new KnowledgePlanetRuntimeError('PROTOCOL', 'worker failure code is invalid')
     return event as unknown as FailedEvent
+  }
+  if (event.event === 'prepared') {
+    exactEventKeys(event, ['event'])
+    return event as unknown as PreparedEvent
+  }
+  if (event.event === 'not_dispatched') {
+    exactEventKeys(event, ['event', 'code'])
+    if (event.code !== 'PRECONDITION_CHANGED')
+      throw new KnowledgePlanetRuntimeError('PROTOCOL', 'worker precondition code is invalid')
+    return event as unknown as NotDispatchedEvent
   }
   if (event.event === 'completed') {
     exactEventKeys(event, ['event', 'result', 'storageState'])
@@ -432,6 +463,8 @@ export class KnowledgePlanetDockerService {
     input: Record<string, unknown>
     onEvent?: (event: WorkerEvent) => void
     signal?: AbortSignal
+    beforeDispatch?: () => Promise<void>
+    inputDirectory?: string
   }): Promise<ActiveWorker> {
     if (args.signal?.aborted) throw args.signal.reason
     this.reserveWorker(args.key, args.kind)
@@ -452,6 +485,8 @@ export class KnowledgePlanetDockerService {
     input: Record<string, unknown>
     onEvent?: (event: WorkerEvent) => void
     signal?: AbortSignal
+    beforeDispatch?: () => Promise<void>
+    inputDirectory?: string
   }): Promise<ActiveWorker> {
     const materialized = await this.initialize()
     if (args.signal?.aborted) throw args.signal.reason
@@ -464,6 +499,13 @@ export class KnowledgePlanetDockerService {
       expectedOwnerUid: this.opts.expectedOwnerUid ?? 0,
       socketUid: this.opts.socketUid ?? 1000,
       socketGid: this.opts.socketGid ?? 1000,
+      limits: {
+        maxConnections: 64,
+        maxConcurrent: 8,
+        maxBytesPerDirection: 64 * 1024 * 1024,
+        idleTimeoutMs: 120_000,
+        connectTimeoutMs: 10_000,
+      },
     })
     if (args.signal?.aborted) {
       await broker.close()
@@ -473,6 +515,18 @@ export class KnowledgePlanetDockerService {
     let stream: Duplex | null = null
     let cleanupFailure: unknown = null
     try {
+      if (args.inputDirectory) {
+        const stat = await lstat(args.inputDirectory)
+        if (
+          !isAbsolute(args.inputDirectory) ||
+          !stat.isDirectory() ||
+          stat.isSymbolicLink() ||
+          stat.uid !== (this.opts.expectedOwnerUid ?? 0) ||
+          (stat.mode & 0o777) !== 0o555 ||
+          (await realpath(args.inputDirectory)) !== args.inputDirectory
+        )
+          throw new KnowledgePlanetRuntimeError('UNAVAILABLE', 'worker input directory is unsafe')
+      }
       container = await this.createContainerInHostSlot({
         Image: this.opts.imageId,
         User: '1000:1000',
@@ -536,6 +590,17 @@ export class KnowledgePlanetDockerService {
               ReadOnly: true,
               BindOptions: { Propagation: 'rprivate' },
             },
+            ...(args.inputDirectory
+              ? [
+                  {
+                    Type: 'bind' as const,
+                    Source: args.inputDirectory,
+                    Target: '/inputs',
+                    ReadOnly: true,
+                    BindOptions: { Propagation: 'rprivate' as const },
+                  },
+                ]
+              : []),
           ],
           RestartPolicy: { Name: 'no', MaximumRetryCount: 0 },
           LogConfig: { Type: 'none', Config: {} },
@@ -554,6 +619,9 @@ export class KnowledgePlanetDockerService {
       if (args.signal?.aborted) throw args.signal.reason
       const events: WorkerEvent[] = []
       let protocolFailure: unknown = null
+      let dispatchFailure: unknown = null
+      let dispatchPromise: Promise<void> | null = null
+      let prepared = false
       let stderrBytes = 0
       const decoder = new FrameDecoder((event) => {
         if (events.length === 0 && event.event !== 'ready')
@@ -561,13 +629,36 @@ export class KnowledgePlanetDockerService {
             'PROTOCOL',
             'worker omitted compatibility handshake',
           )
-        if (events.some((item) => ['failed', 'completed', 'authenticated'].includes(item.event)))
+        if (
+          events.some((item) =>
+            ['failed', 'completed', 'authenticated', 'not_dispatched'].includes(item.event),
+          )
+        )
           throw new KnowledgePlanetRuntimeError(
             'PROTOCOL',
             'worker emitted data after terminal event',
           )
         events.push(event)
         args.onEvent?.(event)
+        if (event.event === 'prepared') {
+          if (prepared || !args.beforeDispatch || !stream)
+            throw new KnowledgePlanetRuntimeError('PROTOCOL', 'worker dispatch fence is invalid')
+          prepared = true
+          dispatchPromise = args
+            .beforeDispatch()
+            .then(
+              () =>
+                new Promise<void>((resolveWrite, reject) => {
+                  stream!.write(frame({ event: 'dispatch' }), (error) =>
+                    error ? reject(error) : resolveWrite(),
+                  )
+                }),
+            )
+            .catch((error) => {
+              dispatchFailure = error
+              void current.kill().catch(() => {})
+            })
+        }
       })
       const stdout = new Writable({
         write(chunk: Buffer, _encoding, callback) {
@@ -617,6 +708,7 @@ export class KnowledgePlanetDockerService {
           ]).finally(() => {
             if (timer) clearTimeout(timer)
           })
+          if (dispatchPromise) await dispatchPromise
           await Promise.race([
             streamEnded,
             new Promise<never>((_resolve, reject) => {
@@ -637,9 +729,10 @@ export class KnowledgePlanetDockerService {
           if (
             status !== 0 ||
             !terminal ||
-            !['failed', 'completed', 'authenticated'].includes(terminal.event)
+            !['failed', 'completed', 'authenticated', 'not_dispatched'].includes(terminal.event)
           )
             throw new KnowledgePlanetRuntimeError('EXECUTION_FAILED', 'worker did not finish')
+          if (dispatchFailure) throw dispatchFailure
           completed = events
         } catch (error) {
           failure = error
@@ -690,6 +783,8 @@ export class KnowledgePlanetDockerService {
     params: Record<string, unknown>
     deadlineMs: number
     signal?: AbortSignal
+    beforeDispatch?: () => Promise<void>
+    inputDirectory?: string
   }): Promise<{ result: unknown; storageState: unknown }> {
     const worker = await this.startWorker({
       key: args.profileDir,
@@ -697,6 +792,8 @@ export class KnowledgePlanetDockerService {
       pins: args.pins,
       deadlineMs: args.deadlineMs,
       ...(args.signal ? { signal: args.signal } : {}),
+      ...(args.beforeDispatch ? { beforeDispatch: args.beforeDispatch } : {}),
+      ...(args.inputDirectory ? { inputDirectory: args.inputDirectory } : {}),
       input: {
         mode: 'action',
         actionId: args.actionId,
@@ -712,6 +809,11 @@ export class KnowledgePlanetDockerService {
         throw new KnowledgePlanetRuntimeError('LOGIN_EXPIRED_ACCOUNT', 'Plugin login expired')
       throw new KnowledgePlanetRuntimeError('EXECUTION_FAILED', 'Knowledge Planet read failed')
     }
+    if (terminal.event === 'not_dispatched')
+      throw new KnowledgePlanetRuntimeError(
+        'PRECONDITION_CHANGED',
+        'Knowledge Planet target changed before dispatch',
+      )
     if (terminal.event !== 'completed')
       throw new KnowledgePlanetRuntimeError('PROTOCOL', 'action worker terminal event is invalid')
     return { result: terminal.result, storageState: terminal.storageState }
@@ -793,6 +895,7 @@ class KnowledgePlanetManagedSession implements ManagedBrowserSession {
     actionId: string,
     params: Record<string, unknown>,
     signal: AbortSignal,
+    beforeDispatch?: () => Promise<void>,
   ): Promise<unknown> {
     if (this.executing || this.completed)
       throw new ManagedBrowserRuntimeError('EXECUTION_FAILED', 'browser session is single use')
@@ -808,8 +911,10 @@ class KnowledgePlanetManagedSession implements ManagedBrowserSession {
         storageState: this.args.storageState,
         actionId,
         params,
-        deadlineMs: Date.now() + 120_000,
+        deadlineMs: Date.now() + 570_000,
         signal,
+        ...(beforeDispatch ? { beforeDispatch } : {}),
+        ...(this.args.inputDirectory ? { inputDirectory: this.args.inputDirectory } : {}),
       })
       return this.completed.result
     } finally {
@@ -847,11 +952,14 @@ export function createKnowledgePlanetRuntimeRegistries(service: KnowledgePlanetD
     version: KNOWLEDGE_PLANET_DRIVER_VERSION,
     launcherId: KNOWLEDGE_PLANET_LAUNCHER_ID,
     launcherVersion: KNOWLEDGE_PLANET_LAUNCHER_VERSION,
-    maximumNetwork: { origins: ['https://api.zsxq.com'], methods: ['GET', 'POST'] },
+    maximumNetwork: {
+      origins: ['https://api.zsxq.com', 'https://upload-z1.qiniup.com'],
+      methods: ['DELETE', 'GET', 'POST', 'PUT'],
+    },
     async execute(args) {
       if (!(args.session instanceof KnowledgePlanetManagedSession))
         throw new ManagedBrowserRuntimeError('EXECUTION_FAILED', 'driver session is invalid')
-      return args.session.execute(args.actionId, args.params, args.signal)
+      return args.session.execute(args.actionId, args.params, args.signal, args.beforeDispatch)
     },
   }
   return {

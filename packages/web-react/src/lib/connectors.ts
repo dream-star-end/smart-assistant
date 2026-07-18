@@ -212,12 +212,80 @@ export type RuntimePluginAccount = {
     acceptedVersion: number | null
     acceptedAt: string | null
     disclaimerText: string
+    preapproval?: {
+      available: boolean
+      enabled: boolean
+      disclaimerVersion: number | null
+      acceptedVersion: number | null
+      acceptedAt: string | null
+      disclaimerText: string | null
+    }
   } | null
 }
 
 export type PluginManagementResponse = {
   catalog: RuntimePluginCatalogEntry[]
   accounts: RuntimePluginAccount[]
+}
+
+export type KnowledgePlanetAutomationControl = {
+  available: boolean
+  enabled: boolean
+  disclaimerVersion: number
+  acceptedVersion: number | null
+  acceptedAt: string | null
+  disclaimerText: string
+  accountDailyLimit: number
+  pausedReason: string | null
+}
+
+export type KnowledgePlanetAutomationRule = {
+  id: string
+  groupId: string
+  name: string
+  instructions: string
+  triggerKind: 'new_topic' | 'new_question'
+  enabled: boolean
+  dailyLimit: number
+  cooldownMinutes: number
+  maxReplyChars: number
+  consecutiveFailures: number
+  pausedReason: string | null
+  lastCursorAt: string | null
+  nextRunAt: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type KnowledgePlanetAutomationGroup = {
+  id: string
+  name: string
+  memberCount: number | null
+}
+
+export type KnowledgePlanetAutomationRun = {
+  id: string
+  ruleId: string
+  sourceTopicId: string
+  status:
+    | 'reserved'
+    | 'generating'
+    | 'ready'
+    | 'dispatching'
+    | 'succeeded'
+    | 'skipped'
+    | 'failed'
+    | 'unknown'
+  reasonCode: string | null
+  upstreamCommentId: string | null
+  createdAt: string
+  finishedAt: string | null
+}
+
+export type KnowledgePlanetAutomationView = {
+  control: KnowledgePlanetAutomationControl
+  rules: KnowledgePlanetAutomationRule[]
+  recentRuns: KnowledgePlanetAutomationRun[]
 }
 
 export type KnowledgePlanetSetupView = {
@@ -379,6 +447,9 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   LEASE_BUSY: '账号正在执行任务，请稍后再解绑',
   LEASE_UNAVAILABLE: '账号安全锁暂不可用，请稍后重试',
   WRITE_DISABLED: '写入能力尚未开启，请先在 Plugin 账号中阅读免责声明并开启',
+  CONSENT_REQUIRED: '请先阅读并接受无人值守自动回复免责声明',
+  MEDIA_INVALID: '图片或附件无效、已变化或超过大小限制，请重新选择',
+  PRECONDITION_CHANGED: '目标内容在确认后已变化，本次操作未发送，请重新检查',
   TARGET_NOT_FOUND: 'Plugin 账号不存在或已解绑',
   TARGET_STALE: 'Plugin 账号状态已变化，请刷新后重试',
   INTERNAL: '服务暂时不可用，请稍后重试',

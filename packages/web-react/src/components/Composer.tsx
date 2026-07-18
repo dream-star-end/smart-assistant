@@ -102,6 +102,9 @@ export function Composer({
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
   // 目标对话框开合:入口从会话头部迁至「+」菜单后,由 Composer 持有开合态(菜单项触发打开)。
   const [goalOpen, setGoalOpen] = useState(false);
+  // 「+」菜单受控开合:附件项须在 onSelect 里 preventDefault 阻止 Radix 同步关菜单
+  // (卸载会杀掉 label 的原生激活,见附件项注释),菜单关闭改由我们在宏任务里手动触发。
+  const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -321,7 +324,7 @@ export function Composer({
               菜单在移动端同样以触屏打开,DropdownMenu 原语已含 py-2 触控目标与向上翻转;
               无任何可用项时(demo)退化为禁用按钮,不弹空菜单。 */}
           {hasPlusMenu ? (
-            <DropdownMenu>
+            <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
               <DropdownMenuTrigger asChild>
                 <IconButton
                   data-product-feature={PRODUCT_CAPABILITIES.files.id}
@@ -348,10 +351,21 @@ export function Composer({
               <DropdownMenuContent align="start" side="top">
                 {canAttach && (
                   // 附件项渲染为原生 <label htmlFor>：点击/触摸经浏览器原生 label 激活直接打开
-                  // file input,不走合成 input.click()——避免 Radix 菜单关闭/卸载与合成 click 的
-                  // 竞态,以及国产内核/iOS Safari 对合成 click 的静默吞噬。asChild 把菜单项语义与
-                  // 键盘可达性(Radix 管理)叠加到 label 上,桌面行为不变。
-                  <DropdownMenuItem asChild data-product-feature={PRODUCT_CAPABILITIES.files.id}>
+                  // file input,不走合成 input.click()(国产内核/iOS Safari 会静默吞掉隐藏 input
+                  // 上的合成 click,实证 61de46e2/de16e2be)。
+                  // onSelect 必须 preventDefault:Radix 默认 select 会在受信点击的派发过程中同步
+                  // 关菜单卸载 Portal,而 label 的原生转发(post-dispatch activation)发生在派发
+                  // 完成之后——届时 label 已 detached,htmlFor 解析不到 input,选择器不弹
+                  // (真机 Chromium 实证 0 转发;jsdom fireEvent 是非受信事件不同步 flush,测不出)。
+                  // 菜单关闭改在宏任务里手动触发:排在原生激活之后,选择器已拉起,关菜单不影响。
+                  <DropdownMenuItem
+                    asChild
+                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      setTimeout(() => setPlusMenuOpen(false), 0);
+                    }}
+                  >
                     <label htmlFor={fileInputId}>
                       <Paperclip size={16} className="shrink-0 text-muted" />
                       添加附件

@@ -104,7 +104,7 @@ describe('runtime Plugin contracts', () => {
       () =>
         compileRuntimePluginArtifact({
           ...managedArtifact(),
-          network: { origins: ['https://wx.zsxq.com'], methods: ['GET', 'DELETE'] },
+          network: { origins: ['https://wx.zsxq.com'], methods: ['GET', 'PATCH'] },
         }),
       /network method/,
     )

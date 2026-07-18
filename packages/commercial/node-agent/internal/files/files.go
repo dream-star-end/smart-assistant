@@ -49,10 +49,10 @@ var AllowedRoots = []string{
 }
 
 // AllowedDirRegexes 定义"父目录"必须匹配的严格正则集合 —— 用于允许操作那些
-// 名字带 per-user 序号(uid)的动态目录,典型即 v3 commercial 用户 docker volume
+// 名字带 per-user 序号(uid)的动态目录,典型即 v3/v5 commercial 用户 docker volume
 // 下的 uploads/generated 子目录:
 //
-//	/var/lib/docker/volumes/oc-v3-data-u<uid>/_data/(uploads|generated)
+//	/var/lib/docker/volumes/oc-(v3|v5)-data-u<uid>/_data/(uploads|generated)
 //
 // 匹配方式:对清洗后的文件路径取 filepath.Dir(),与每个正则尝试。任一命中即视
 // 为合法。
@@ -66,7 +66,7 @@ var AllowedRoots = []string{
 // 安全:resolveParentNoSymlink 会先 EvalSymlinks parent 真身,再用本组正则匹配,
 // 防御 user-data symlink 逃逸到此动态根。
 var AllowedDirRegexes = []*regexp.Regexp{
-	regexp.MustCompile(`^/var/lib/docker/volumes/oc-v3-data-u[1-9][0-9]{0,18}/_data/(uploads|generated)$`),
+	regexp.MustCompile(`^/var/lib/docker/volumes/oc-(v3|v5)-data-u[1-9][0-9]{0,18}/_data/(uploads|generated)$`),
 }
 
 // dirMatchesAllowedRegex 检查 dir(已 Clean)是否命中 AllowedDirRegexes 任一项。

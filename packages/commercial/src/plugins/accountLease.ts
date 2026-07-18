@@ -12,6 +12,9 @@ const RENEW_SCRIPT = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end`
 const RELEASE_SCRIPT = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`
+// Managed-browser writes can legitimately run for 600 s, plus media staging,
+// contract revalidation and encrypted state commit. Keep a finite upper bound.
+const MAX_LEASE_HARD_TIMEOUT_MS = 15 * 60_000
 
 export class PluginAccountLeaseError extends Error {
   readonly code: 'LEASE_UNAVAILABLE' | 'LEASE_BUSY' | 'LEASE_LOST'
@@ -44,7 +47,7 @@ export async function acquirePluginAccountLease(
   if (
     !Number.isInteger(opts.hardTimeoutMs) ||
     opts.hardTimeoutMs < 1000 ||
-    opts.hardTimeoutMs > 120_000
+    opts.hardTimeoutMs > MAX_LEASE_HARD_TIMEOUT_MS
   )
     throw new PluginAccountLeaseError('LEASE_UNAVAILABLE', 'invalid Plugin hard timeout')
 

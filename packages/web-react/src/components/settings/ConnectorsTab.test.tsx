@@ -57,6 +57,14 @@ vi.mock("../../lib/api", async (importOriginal) => {
       cancelKnowledgePlanetSetup: vi.fn(),
       revokePluginAccount: vi.fn(),
       setPluginWriteAccess: vi.fn(),
+      setPluginWritePreapproval: vi.fn(),
+      getKnowledgePlanetAutomation: vi.fn(),
+      setKnowledgePlanetAutomation: vi.fn(),
+      listKnowledgePlanetAutomationGroups: vi.fn(),
+      createKnowledgePlanetAutomationRulesBatch: vi.fn(),
+      createKnowledgePlanetAutomationRule: vi.fn(),
+      patchKnowledgePlanetAutomationRule: vi.fn(),
+      deleteKnowledgePlanetAutomationRule: vi.fn(),
     },
   };
 });
@@ -84,6 +92,15 @@ const mockedKnowledgeQr = vi.mocked(api.getKnowledgePlanetSetupQr)
 const mockedKnowledgeCancel = vi.mocked(api.cancelKnowledgePlanetSetup)
 const mockedPluginRevoke = vi.mocked(api.revokePluginAccount)
 const mockedSetPluginWriteAccess = vi.mocked(api.setPluginWriteAccess)
+const mockedSetPluginWritePreapproval = vi.mocked(api.setPluginWritePreapproval)
+const mockedGetKnowledgePlanetAutomation = vi.mocked(api.getKnowledgePlanetAutomation)
+const mockedSetKnowledgePlanetAutomation = vi.mocked(api.setKnowledgePlanetAutomation)
+const mockedListKnowledgePlanetGroups = vi.mocked(api.listKnowledgePlanetAutomationGroups)
+const mockedCreateKnowledgePlanetRulesBatch = vi.mocked(
+  api.createKnowledgePlanetAutomationRulesBatch,
+)
+const mockedPatchKnowledgePlanetRule = vi.mocked(api.patchKnowledgePlanetAutomationRule)
+const mockedDeleteKnowledgePlanetRule = vi.mocked(api.deleteKnowledgePlanetAutomationRule)
 
 afterEach(cleanup);
 beforeEach(() => {
@@ -92,6 +109,34 @@ beforeEach(() => {
   mockedDeclCatalog.mockResolvedValue({ connectors: [] })
   mockedDeclConnections.mockResolvedValue({ connections: [] })
   mockedPluginManagement.mockResolvedValue({ catalog: [], accounts: [] })
+  mockedGetKnowledgePlanetAutomation.mockResolvedValue({
+    control: {
+      available: true,
+      enabled: false,
+      disclaimerVersion: 1,
+      acceptedVersion: null,
+      acceptedAt: null,
+      disclaimerText: '无人值守会自动计费并发布带 AI 标识的文字回复。',
+      accountDailyLimit: 10,
+      pausedReason: null,
+    },
+    rules: [],
+    recentRuns: [],
+  })
+  mockedSetKnowledgePlanetAutomation.mockResolvedValue({
+    available: true,
+    enabled: true,
+    disclaimerVersion: 1,
+    acceptedVersion: 1,
+    acceptedAt: '2026-07-17T00:00:00.000Z',
+    disclaimerText: '无人值守会自动计费并发布带 AI 标识的文字回复。',
+    accountDailyLimit: 10,
+    pausedReason: null,
+  })
+  mockedListKnowledgePlanetGroups.mockResolvedValue([
+    { id: '12345678901234', name: '产品交流星球', memberCount: 128 },
+    { id: '22345678901234', name: '内部测试星球', memberCount: 12 },
+  ])
   // 旧目录 fixture 转成管理中心聚合契约，既保留既有交互覆盖，也钉住新读模型。
   mockedDeclManagement.mockImplementation(async (session) => {
     const [catalogResponse, connectionsResponse] = await Promise.all([
@@ -274,6 +319,15 @@ function knowledgePlanetWriteControl(
     acceptedAt: null,
     disclaimerText:
       '写入会以你的真实身份发布到知识星球。请确认内容合法、准确且不侵犯他人权益；结果不明确时不要重复提交。',
+    preapproval: {
+      available: true,
+      enabled: false,
+      disclaimerVersion: 1,
+      acceptedVersion: null,
+      acceptedAt: null,
+      disclaimerText:
+        '开启后所有 Agent 可直接发布、上传媒体、点赞、编辑和永久删除，不再展示逐次确认卡。',
+    },
     ...overrides,
   }
 }
@@ -1273,6 +1327,65 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
   })
 
+  test('免逐次确认默认关闭，必须接受独立免责声明后才能开启', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const base = knowledgePlanetWriteControl({
+      enabled: true,
+      acceptedVersion: 1,
+      acceptedAt: '2026-07-17T01:02:03.000Z',
+    })
+    const enabled = knowledgePlanetWriteControl({
+      ...base,
+      preapproval: {
+        ...base.preapproval!,
+        enabled: true,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T03:04:05.000Z',
+      },
+    })
+    const account: RuntimePluginAccount = {
+      id: '912',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '免确认账号',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: base,
+    }
+    mockedPluginManagement
+      .mockResolvedValueOnce({ catalog: [knowledgePlanetPlugin()], accounts: [account] })
+      .mockResolvedValue({
+        catalog: [knowledgePlanetPlugin()],
+        accounts: [{ ...account, writeControl: enabled }],
+      })
+    mockedSetPluginWritePreapproval.mockResolvedValue(enabled)
+
+    render(<ConnectorsTab auth={auth} />)
+    const preapprovalSwitch = await screen.findByRole('switch', {
+      name: '免确认账号免逐次确认',
+    })
+    expect(preapprovalSwitch).not.toBeChecked()
+    fireEvent.click(preapprovalSwitch)
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/永久删除/)).toBeInTheDocument()
+    const enable = within(dialog).getByRole('button', { name: '同意并开启' })
+    expect(enable).toBeDisabled()
+    fireEvent.click(within(dialog).getByRole('checkbox'))
+    fireEvent.click(enable)
+
+    await waitFor(() =>
+      expect(mockedSetPluginWritePreapproval).toHaveBeenCalledWith(auth, '912', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+      }),
+    )
+    expect(await screen.findByText(/“免逐次确认”已开启/)).toBeInTheDocument()
+  })
+
   test('开启写入失败时在免责声明弹层内说明错误且不乐观翻转', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     const account: RuntimePluginAccount = {
@@ -1353,6 +1466,308 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     ).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: '发布账号写入能力' })).toBeChecked()
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  test('无人值守自动回复默认关闭，必须独立阅读免责声明并勾选后才能开启', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const account: RuntimePluginAccount = {
+      id: '908',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '自动回复账号',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: knowledgePlanetWriteControl({
+        enabled: true,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T01:02:03.000Z',
+      }),
+    }
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [account],
+    })
+    const disabledView = {
+      control: {
+        available: true,
+        enabled: false,
+        disclaimerVersion: 1,
+        acceptedVersion: null,
+        acceptedAt: null,
+        disclaimerText: '无人值守会自动计费并发布带 AI 标识的文字回复。',
+        accountDailyLimit: 10,
+        pausedReason: null,
+      },
+      rules: [],
+      recentRuns: [],
+    }
+    mockedGetKnowledgePlanetAutomation
+      .mockResolvedValueOnce(disabledView)
+      .mockResolvedValue({
+        ...disabledView,
+        control: {
+          ...disabledView.control,
+          enabled: true,
+          acceptedVersion: 1,
+          acceptedAt: '2026-07-17T02:03:04.000Z',
+          accountDailyLimit: 12,
+        },
+      })
+
+    render(<ConnectorsTab auth={auth} />)
+    const automationSwitch = await screen.findByRole('switch', {
+      name: '知识星球无人值守自动回复',
+    })
+    expect(automationSwitch).not.toBeChecked()
+    fireEvent.click(automationSwitch)
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/自动计费并发布带 AI 标识/)).toBeInTheDocument()
+    const enable = within(dialog).getByRole('button', { name: '同意并开启' })
+    expect(enable).toBeDisabled()
+    fireEvent.change(within(dialog).getByRole('spinbutton'), { target: { value: '12' } })
+    fireEvent.click(within(dialog).getByRole('checkbox'))
+    expect(enable).toBeEnabled()
+    fireEvent.click(enable)
+
+    await waitFor(() =>
+      expect(mockedSetKnowledgePlanetAutomation).toHaveBeenCalledWith(auth, '908', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+        accountDailyLimit: 12,
+      }),
+    )
+    await waitFor(() => expect(automationSwitch).toBeChecked())
+  })
+
+  test('自动回复可从实时星球下拉多选并原子创建已启用规则', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const account: RuntimePluginAccount = {
+      id: '909',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '规则账号',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: knowledgePlanetWriteControl({
+        enabled: true,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T01:02:03.000Z',
+      }),
+    }
+    const rule = {
+      id: '11111111-1111-4111-8111-111111111111',
+      groupId: '12345678901234',
+      name: '回答新提问',
+      instructions: '仅在能够确定答案时简洁回复，不确定就跳过。',
+      triggerKind: 'new_question' as const,
+      enabled: true,
+      dailyLimit: 3,
+      cooldownMinutes: 20,
+      maxReplyChars: 600,
+      consecutiveFailures: 0,
+      pausedReason: null,
+      lastCursorAt: '2026-07-17T02:03:04.000Z',
+      nextRunAt: '2026-07-17T02:03:04.000Z',
+      createdAt: '2026-07-17T02:03:04.000Z',
+      updatedAt: '2026-07-17T02:03:04.000Z',
+    }
+    const secondRule = {
+      ...rule,
+      id: '123e4567-e89b-42d3-a456-426614174002',
+      groupId: '22345678901234',
+    }
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [account],
+    })
+    const baseView = {
+      control: {
+        available: true,
+        enabled: true,
+        disclaimerVersion: 1,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T02:03:04.000Z',
+        disclaimerText: '无人值守会自动计费并发布带 AI 标识的文字回复。',
+        accountDailyLimit: 10,
+        pausedReason: null,
+      },
+      rules: [],
+      recentRuns: [],
+    }
+    mockedGetKnowledgePlanetAutomation
+      .mockResolvedValueOnce(baseView)
+      .mockResolvedValue({ ...baseView, rules: [rule, secondRule] })
+    mockedCreateKnowledgePlanetRulesBatch.mockResolvedValue([rule, secondRule])
+
+    render(<ConnectorsTab auth={auth} />)
+    fireEvent.click(await screen.findByRole('button', { name: '添加规则' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: /从当前账号已加入的星球中选择/ }),
+    )
+    fireEvent.click(await screen.findByRole('button', { name: /产品交流星球/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /内部测试星球/ }))
+    fireEvent.change(within(dialog).getByLabelText('规则名称'), {
+      target: { value: '回答新提问' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('回复要求'), {
+      target: { value: '仅在能够确定答案时简洁回复，不确定就跳过。' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('触发范围'), {
+      target: { value: 'new_question' },
+    })
+    const numbers = within(dialog).getAllByRole('spinbutton')
+    fireEvent.change(numbers[0]!, { target: { value: '3' } })
+    fireEvent.change(numbers[1]!, { target: { value: '20' } })
+    fireEvent.change(numbers[2]!, { target: { value: '600' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存并启用 2 条规则' }))
+
+    await waitFor(() =>
+      expect(mockedCreateKnowledgePlanetRulesBatch).toHaveBeenCalledWith(auth, '909', {
+        groupIds: ['12345678901234', '22345678901234'],
+        name: '回答新提问',
+        instructions: '仅在能够确定答案时简洁回复，不确定就跳过。',
+        triggerKind: 'new_question',
+        dailyLimit: 3,
+        cooldownMinutes: 20,
+        maxReplyChars: 600,
+      }),
+    )
+    expect(
+      await screen.findByRole('switch', {
+        name: '回答新提问（产品交流星球）自动回复规则',
+      }),
+    ).toBeChecked()
+    expect(
+      screen.getByRole('switch', {
+        name: '回答新提问（内部测试星球）自动回复规则',
+      }),
+    ).toBeChecked()
+    expect(screen.getByText(/产品交流星球/)).toBeInTheDocument()
+    expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
+  })
+
+  test('自动回复规则可编辑，非法字段在弹窗内精确拦截且不发请求', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const account: RuntimePluginAccount = {
+      id: '910',
+      provider: 'knowledge-planet',
+      pluginType: 'managed-browser',
+      displayName: '规则编辑账号',
+      accountHint: '微信扫码账号',
+      status: 'active',
+      actions: knowledgePlanetPlugin().actions,
+      versionId: '101',
+      executable: true,
+      writeControl: knowledgePlanetWriteControl({
+        enabled: true,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T01:02:03.000Z',
+      }),
+    }
+    const rule = {
+      id: '123e4567-e89b-42d3-a456-426614174010',
+      groupId: '12345678901234',
+      name: '原规则',
+      instructions: '原回复要求',
+      triggerKind: 'new_topic' as const,
+      enabled: true,
+      dailyLimit: 5,
+      cooldownMinutes: 15,
+      maxReplyChars: 800,
+      consecutiveFailures: 0,
+      pausedReason: null,
+      lastCursorAt: '2026-07-17T02:03:04.000Z',
+      nextRunAt: '2026-07-17T02:03:04.000Z',
+      createdAt: '2026-07-17T02:03:04.000Z',
+      updatedAt: '2026-07-17T02:03:04.000Z',
+    }
+    const view = {
+      control: {
+        available: true,
+        enabled: true,
+        disclaimerVersion: 1,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-17T02:03:04.000Z',
+        disclaimerText: '无人值守会自动计费并发布带 AI 标识的文字回复。',
+        accountDailyLimit: 10,
+        pausedReason: null,
+      },
+      rules: [rule],
+      recentRuns: [],
+    }
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [account],
+    })
+    mockedGetKnowledgePlanetAutomation.mockResolvedValue(view)
+    mockedPatchKnowledgePlanetRule.mockResolvedValue({
+      ...rule,
+      name: '已更新规则',
+      instructions: '只回复能够确认的问题',
+    })
+
+    render(<ConnectorsTab auth={auth} />)
+    fireEvent.click(await screen.findByRole('button', { name: '编辑' }))
+    let dialog = await screen.findByRole('dialog')
+    fireEvent.change(within(dialog).getByLabelText('规则名称'), {
+      target: { value: '  已更新规则  ' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('回复要求'), {
+      target: { value: '  只回复能够确认的问题  ' },
+    })
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存规则' }))
+
+    await waitFor(() =>
+      expect(mockedPatchKnowledgePlanetRule).toHaveBeenCalledWith(auth, '910', rule.id, {
+        name: '已更新规则',
+        instructions: '只回复能够确认的问题',
+        triggerKind: 'new_topic',
+        dailyLimit: 5,
+        cooldownMinutes: 15,
+        maxReplyChars: 800,
+      }),
+    )
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    mockedPatchKnowledgePlanetRule.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    dialog = await screen.findByRole('dialog')
+    const numbers = within(dialog).getAllByRole('spinbutton')
+    fireEvent.change(numbers[0]!, { target: { value: '11' } })
+    const saveButton = within(dialog).getByRole('button', { name: '保存规则' })
+    fireEvent.click(saveButton)
+    const dailyLimitError = await within(dialog).findByRole('alert')
+    expect(dailyLimitError).toHaveTextContent('每日上限必须是 1–10 的整数')
+    expect(dailyLimitError.parentElement).toContainElement(saveButton)
+    expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
+    expect(mockedCreateKnowledgePlanetRulesBatch).not.toHaveBeenCalled()
+
+    fireEvent.change(numbers[0]!, { target: { value: '5' } })
+    fireEvent.change(within(dialog).getByLabelText('回复要求'), { target: { value: '   ' } })
+    fireEvent.click(saveButton)
+    expect(await within(dialog).findByText('请输入回复要求')).toBeInTheDocument()
+    expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
+    expect(mockedCreateKnowledgePlanetRulesBatch).not.toHaveBeenCalled()
+
+    fireEvent.change(within(dialog).getByLabelText('回复要求'), {
+      target: { value: '只回复能够确认的问题' },
+    })
+    fireEvent.change(within(dialog).getByLabelText('规则名称'), {
+      target: { value: '无效\0规则' },
+    })
+    fireEvent.click(saveButton)
+    expect(await within(dialog).findByText('规则名称包含无效字符')).toBeInTheDocument()
+    expect(mockedPatchKnowledgePlanetRule).not.toHaveBeenCalled()
+    expect(mockedCreateKnowledgePlanetRulesBatch).not.toHaveBeenCalled()
   })
 
   test('授权成功提示在解绑时立即清除，解绑后无需刷新即可重新发起扫码', async () => {

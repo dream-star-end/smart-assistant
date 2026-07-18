@@ -235,6 +235,8 @@ func TestValidatePath_V3UserVolumeMedia(t *testing.T) {
 		// accept
 		{"uploads 下文件", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/abc.txt", false},
 		{"generated 下文件", "/var/lib/docker/volumes/oc-v3-data-u42/_data/generated/img.png", false},
+		{"v5 uploads 下文件", "/var/lib/docker/volumes/oc-v5-data-u42/_data/uploads/abc.txt", false},
+		{"v5 generated 下文件", "/var/lib/docker/volumes/oc-v5-data-u42/_data/generated/img.png", false},
 		{"uid=1 小数字", "/var/lib/docker/volumes/oc-v3-data-u1/_data/uploads/a.bin", false},
 		{"uid=19 位 (MAX_SAFE_INT 范围)", "/var/lib/docker/volumes/oc-v3-data-u9007199254740991/_data/uploads/a", false},
 		{"含 dedup-style 文件名 (digest.ext)", "/var/lib/docker/volumes/oc-v3-data-u42/_data/uploads/deadbeef.jpg", false},
@@ -257,6 +259,7 @@ func TestValidatePath_V3UserVolumeMedia(t *testing.T) {
 		{"uid 含负号", "/var/lib/docker/volumes/oc-v3-data-u-1/_data/uploads/x", true},
 		{"uid 超长 20 位", "/var/lib/docker/volumes/oc-v3-data-u12345678901234567890/_data/uploads/x", true},
 		{"卷名前缀不对(proj 而非 data)", "/var/lib/docker/volumes/oc-v3-proj-u42/_data/uploads/x", true},
+		{"非 commercial channel", "/var/lib/docker/volumes/oc-v4-data-u42/_data/uploads/x", true},
 		{"docker volumes 根下其它卷", "/var/lib/docker/volumes/random-vol/_data/uploads/x", true},
 
 		// reject — 路径穿越
@@ -280,11 +283,12 @@ func TestValidatePath_V3UserVolumeMedia(t *testing.T) {
 }
 
 // handleGet 覆盖(2026-05-16 Phase 2):master 通过这个 endpoint 拉远端 user
-// volume 文件。锁定四件事:
+// volume 文件。锁定五件事:
 //   - 正常存在的普通文件 → 200 + 完整 body + 正确 Content-Length
 //   - 不存在 → 404 NOT_FOUND(让 master 区分 fallback 与 502)
 //   - 目录而非普通文件 → 400 NOT_REGULAR_FILE(挡 dir/FIFO/device)
 //   - 白名单外路径 → 400 BAD_PATH(validatePath gate)
+//   - 最终项 symlink → 400 OPEN_FAIL(O_NOFOLLOW gate)
 func TestHandleGet_RegularFile_200(t *testing.T) {
 	tmpDir := t.TempDir()
 	cleanup := withTempAllowedRoot(t, tmpDir)
@@ -332,6 +336,34 @@ func TestHandleGet_NotFound_404(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "NOT_FOUND") {
 		t.Fatalf("body should contain NOT_FOUND, got %q", rec.Body.String())
+	}
+}
+
+func TestHandleGet_FinalSymlink_400(t *testing.T) {
+	tmpDir := t.TempDir()
+	cleanup := withTempAllowedRoot(t, tmpDir)
+	defer cleanup()
+
+	target := filepath.Join(tmpDir, "target.bin")
+	link := filepath.Join(tmpDir, "link.bin")
+	if err := os.WriteFile(target, []byte("must-not-follow"), 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("seed symlink: %v", err)
+	}
+
+	q := url.Values{}
+	q.Set("path", link)
+	req := httptest.NewRequest(http.MethodGet, "/files?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	(&Handler{}).handleGet(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400 got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "OPEN_FAIL") {
+		t.Fatalf("body should contain OPEN_FAIL, got %q", rec.Body.String())
 	}
 }
 

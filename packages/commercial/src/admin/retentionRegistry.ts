@@ -127,6 +127,8 @@ export const DURABLE_TABLES: readonly string[] = [
   "org_memberships",
   "org_subscriptions",
   "orgs",
+  // 高风险自动回复总开关/独立同意是账号活体配置;账号删除时由 FK 级联离场。
+  "plugin_automation_controls",
   // prompt_queue 家族:队列活体状态,靠消费出队 + 用户删除 FK 级联清理,无定期时间 sweep
   // (prompt_queue_mutations 是审计流水,单独走 ttl,见 AUDIT_RETENTION_POLICIES)。
   "prompt_queue_heads",
@@ -148,6 +150,9 @@ export const DURABLE_TABLES: readonly string[] = [
   "subscription_plans",
   "system_settings",
   "topup_plans",
+  // 精确轮次退款幂等栅栏兼具账务回溯凭据；与 credit_ledger/usage_records 同档，
+  // 必须永久保留以阻止历史 turn_key 被重复退款，不按时间清理。
+  "turn_waivers",
   "turn_tape_cost_components",
   "usage_records",
   "user_api_keys",
