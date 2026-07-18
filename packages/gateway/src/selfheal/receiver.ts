@@ -635,10 +635,12 @@ export interface FuseClearBody {
   repairId: 'fuse'
   reason: string
   clearedBy: string
+  expectedReleaseRequestId: string
 }
 
 /** Parse the fuse-clear body (§3.3): the fixed repairId literal "fuse" (so the
- *  shared HMAC signed-string format applies) + free-text reason / clearedBy. */
+ *  shared HMAC signed-string format applies), the exact immutable fuse epoch,
+ *  and free-text reason / clearedBy. */
 export function parseFuseClearBody(raw: Buffer): FuseClearBody | null {
   let parsed: unknown
   try {
@@ -653,7 +655,18 @@ export function parseFuseClearBody(raw: Buffer): FuseClearBody | null {
   if (typeof p.clearedBy !== 'string' || p.clearedBy.length === 0 || p.clearedBy.length > 200) {
     return null
   }
-  return { repairId: 'fuse', reason: p.reason, clearedBy: p.clearedBy }
+  if (
+    typeof p.expectedReleaseRequestId !== 'string' ||
+    !SELFHEAL_ID_RE.test(p.expectedReleaseRequestId)
+  ) {
+    return null
+  }
+  return {
+    repairId: 'fuse',
+    reason: p.reason,
+    clearedBy: p.clearedBy,
+    expectedReleaseRequestId: p.expectedReleaseRequestId,
+  }
 }
 
 /** Clear the LOCAL Tier2 release fuse (§3.3), audited. The v5 side initiates
@@ -683,12 +696,39 @@ export async function receiveSelfhealFuseClear(
     now,
   )
   if (!verified.ok) return { status: verified.status, body: { error: verified.error } }
-  const flipped = await clearReleaseFuse({ clearedBy: body.clearedBy, now: new Date(now).toISOString() })
+  const result = await clearReleaseFuse({
+    clearedBy: body.clearedBy,
+    expectedReleaseRequestId: body.expectedReleaseRequestId,
+    now: new Date(now).toISOString(),
+  })
   // Durable audit line — the fuse clear is a privileged Tier2 gate reset.
   log.warn('selfheal release fuse clear', {
     clearedBy: body.clearedBy,
     reason: body.reason,
-    flipped,
+    expectedReleaseRequestId: body.expectedReleaseRequestId,
+    outcome: result.outcome,
+    ...(result.outcome === 'epoch_mismatch'
+      ? { currentReleaseRequestId: result.currentReleaseRequestId }
+      : {}),
   })
-  return { status: 200, body: { ok: true, cleared: flipped } }
+  if (result.outcome === 'epoch_mismatch') {
+    return {
+      status: 409,
+      body: {
+        ok: false,
+        error: 'release_fuse_epoch_mismatch',
+        expectedReleaseRequestId: body.expectedReleaseRequestId,
+        currentReleaseRequestId: result.currentReleaseRequestId,
+      },
+    }
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      cleared: true,
+      releaseRequestId: result.releaseRequestId,
+      outcome: result.outcome,
+    },
+  }
 }

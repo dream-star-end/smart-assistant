@@ -23,7 +23,7 @@
  * the remote production-mutation lease.
  */
 
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { createInterface } from 'node:readline'
@@ -56,6 +56,10 @@ const CANONICAL_PUSH_ATTEMPTS = 3
 /** After a timeout kill, wait up to this long for the scope's cgroup to die
  *  before reading durable state (§F5①). */
 const DEFAULT_KILL_GRACE_MS = 30_000
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000
+const DEFAULT_GIT_PUSH_TIMEOUT_MS = 120_000
+const DEFAULT_COMMAND_TERM_GRACE_MS = 1_000
+const DEFAULT_COMMAND_KILL_CONFIRM_MS = 5_000
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
@@ -77,10 +81,44 @@ interface ReceiptShape {
   rrid: string
   sha: string
   outcome: string
+  planHash?: string
+  manifestHash?: string
+  candidateRef?: string
   reason?: string
   proofs?: Record<string, unknown>
   canonicalPush?: string
   exit?: number
+}
+
+export interface ReleaseCommandResult {
+  code: number
+  stdout: string
+  stderr: string
+  timedOut: boolean
+  /** True only when the command's dedicated process group no longer exists. */
+  terminationConfirmed: boolean
+}
+
+export interface ReleaseCommandOptions {
+  timeoutMs?: number
+  termGraceMs?: number
+  killConfirmMs?: number
+  maxBufferBytes?: number
+}
+
+type ReleaseCommandRunner = (
+  cmd: string,
+  args: string[],
+  options?: ReleaseCommandOptions,
+) => Promise<ReleaseCommandResult>
+
+export interface DefaultReleaseWorkerPrimitivesOptions {
+  commandTimeoutMs?: number
+  gitPushTimeoutMs?: number
+  commandTermGraceMs?: number
+  commandKillConfirmMs?: number
+  /** Test seam for deterministic timeout/readback behavior. */
+  runCommand?: ReleaseCommandRunner
 }
 
 /** Injectable host primitives (tests substitute a fake lane runner + git). */
@@ -151,107 +189,254 @@ export function getSelfhealReleaseWorkerDeps(
 
 // ── default host primitives ──────────────────────────────────────────────────
 
-function runCmd(
+function processGroupExists(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+function signalProcessGroup(pgid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pgid, signal)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err
+  }
+}
+
+async function waitForProcessGroupGone(pgid: number, maxWaitMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, maxWaitMs)
+  for (;;) {
+    if (!processGroupExists(pgid)) return true
+    if (Date.now() >= deadline) return false
+    await sleep(Math.min(20, Math.max(1, deadline - Date.now())))
+  }
+}
+
+/**
+ * Run a release-worker host command in its own process group with a hard wall
+ * deadline. A timeout targets the WHOLE group (TERM, short grace, then KILL) and
+ * reports success only after the PGID is confirmed absent. This deliberately
+ * does not depend on an execFile callback: a wedged leader or a surviving
+ * grandchild cannot keep the worker awaiting forever or be mistaken for stopped.
+ */
+export function runReleaseCommand(
   cmd: string,
   args: string[],
-): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((res) => {
-    execFile(cmd, args, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-      const code =
-        err && typeof (err as { code?: unknown }).code === 'number'
-          ? ((err as { code: number }).code)
-          : err
-            ? 1
-            : 0
-      res({ code, stdout: String(stdout), stderr: String(stderr) })
+  options: ReleaseCommandOptions = {},
+): Promise<ReleaseCommandResult> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
+  const termGraceMs = options.termGraceMs ?? DEFAULT_COMMAND_TERM_GRACE_MS
+  const killConfirmMs = options.killConfirmMs ?? DEFAULT_COMMAND_KILL_CONFIRM_MS
+  const maxBufferBytes = options.maxBufferBytes ?? 8 * 1024 * 1024
+
+  return new Promise((resolvePromise) => {
+    const child = spawn(cmd, args, {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const pgid = child.pid
+    let stdout = ''
+    let stderr = ''
+    let exitCode = 1
+    let settled = false
+    let timedOut = false
+    let terminating: Promise<void> | null = null
+
+    const append = (current: string, chunk: Buffer): string => {
+      if (Buffer.byteLength(current) >= maxBufferBytes) return current
+      return (current + String(chunk)).slice(0, maxBufferBytes)
+    }
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout = append(stdout, chunk)
+    })
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr = append(stderr, chunk)
+    })
+
+    const finish = (terminationConfirmed: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      // If confirmation failed, do not let inherited pipes/reference keep the
+      // gateway alive. The detached group remains an explicit unknown outcome.
+      if (!terminationConfirmed) {
+        child.stdout.destroy()
+        child.stderr.destroy()
+        child.unref()
+      }
+      resolvePromise({
+        code: timedOut ? 124 : exitCode,
+        stdout,
+        stderr,
+        timedOut,
+        terminationConfirmed,
+      })
+    }
+
+    const terminateAtDeadline = (): Promise<void> => {
+      if (terminating) return terminating
+      timedOut = true
+      terminating = (async () => {
+        if (!pgid) {
+          finish(false)
+          return
+        }
+        try {
+          signalProcessGroup(pgid, 'SIGTERM')
+        } catch (err) {
+          stderr = append(stderr, Buffer.from(`\nTERM process group failed: ${String(err)}`))
+        }
+        if (!(await waitForProcessGroupGone(pgid, termGraceMs))) {
+          try {
+            signalProcessGroup(pgid, 'SIGKILL')
+          } catch (err) {
+            stderr = append(stderr, Buffer.from(`\nKILL process group failed: ${String(err)}`))
+          }
+        }
+        finish(await waitForProcessGroupGone(pgid, killConfirmMs))
+      })()
+      return terminating
+    }
+
+    const timer = setTimeout(() => void terminateAtDeadline(), Math.max(1, timeoutMs))
+
+    child.once('error', (err) => {
+      stderr = append(stderr, Buffer.from(String(err)))
+      exitCode = 1
+      if (!pgid) finish(true)
+    })
+    child.once('close', (code) => {
+      exitCode = typeof code === 'number' ? code : 1
+      if (timedOut) return
+      if (!pgid || !processGroupExists(pgid)) finish(true)
+      // A leader that exited while a background descendant remains is NOT a
+      // completed command. Leave the deadline armed; it will reap the whole PG.
     })
   })
 }
 
-export const defaultReleaseWorkerPrimitives: ReleaseWorkerPrimitives = {
-  async runLane(input) {
-    return await new Promise<{ timedOut: boolean }>((resolvePromise) => {
-      const child = spawn(
-        'systemd-run',
-        [
-          '--scope',
-          `--unit=${input.scopeUnit}`,
-          '--collect',
-          '--',
-          'bash',
-          input.laneScriptPath,
-          input.argsFilePath,
-        ],
-        { stdio: ['ignore', 'pipe', 'pipe'] },
+export function createDefaultReleaseWorkerPrimitives(
+  options: DefaultReleaseWorkerPrimitivesOptions = {},
+): ReleaseWorkerPrimitives {
+  const runCommand = options.runCommand ?? runReleaseCommand
+  const commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
+  const gitPushTimeoutMs = options.gitPushTimeoutMs ?? DEFAULT_GIT_PUSH_TIMEOUT_MS
+  const termGraceMs = options.commandTermGraceMs ?? DEFAULT_COMMAND_TERM_GRACE_MS
+  const killConfirmMs = options.commandKillConfirmMs ?? DEFAULT_COMMAND_KILL_CONFIRM_MS
+  const runCmd = (cmd: string, args: string[], timeoutMs = commandTimeoutMs) =>
+    runCommand(cmd, args, { timeoutMs, termGraceMs, killConfirmMs })
+
+  return {
+    async runLane(input) {
+      return await new Promise<{ timedOut: boolean }>((resolvePromise) => {
+        const child = spawn(
+          'systemd-run',
+          [
+            '--scope',
+            `--unit=${input.scopeUnit}`,
+            '--collect',
+            '--',
+            'bash',
+            input.laneScriptPath,
+            input.argsFilePath,
+          ],
+          { stdio: ['ignore', 'pipe', 'pipe'] },
+        )
+        const pending: Promise<void>[] = []
+        const rl = createInterface({ input: child.stdout })
+        rl.on('line', (line) => {
+          const t = line.trim()
+          if (!t) return
+          let evt: unknown
+          try {
+            evt = JSON.parse(t)
+          } catch {
+            return
+          }
+          if (
+            evt &&
+            typeof evt === 'object' &&
+            ((evt as LaneEvent).evt === 'checkpoint' || (evt as LaneEvent).evt === 'receipt')
+          ) {
+            pending.push(Promise.resolve(input.onEvent(evt as LaneEvent)).catch(() => {}))
+          }
+        })
+        child.stderr.on('data', (chunk: Buffer) => {
+          log.info('release lane', { line: String(chunk).slice(0, 400) })
+        })
+        let timedOut = false
+        const timer = setTimeout(() => {
+          timedOut = true
+          // Kill the whole scope's cgroup (the deploy may have forked children).
+          void runCmd('systemctl', ['kill', `${input.scopeUnit}.scope`])
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            /* already gone */
+          }
+        }, input.timeoutMs)
+        timer.unref?.()
+        child.on('error', (err) => {
+          log.error('release lane spawn error', { scopeUnit: input.scopeUnit }, err)
+        })
+        child.on('exit', () => {
+          clearTimeout(timer)
+          void Promise.all(pending).then(() => resolvePromise({ timedOut }))
+        })
+      })
+    },
+    async scopeLiveness(scopeUnit) {
+      // `systemctl is-active` prints the ActiveState to stdout regardless of exit
+      // code (exit is 0 only for 'active'), so classify by the STATE STRING — never
+      // by the exit code alone (a truly-dead scope reports 'inactive' with a
+      // non-zero exit; treating every non-zero as 'unknown' would livelock it).
+      const r = await runCmd('systemctl', ['is-active', `${scopeUnit}.scope`])
+      if (r.timedOut || !r.terminationConfirmed) return 'unknown'
+      return classifyScopeState(r.stdout)
+    },
+    async killScope(scopeUnit) {
+      const r = await runCmd('systemctl', ['kill', '-s', 'SIGKILL', `${scopeUnit}.scope`])
+      if (r.timedOut || !r.terminationConfirmed || r.code !== 0) {
+        throw new Error('scope kill command failed or timed out')
+      }
+    },
+    async pushCanonical({ canonicalRepo, canonicalBranch, sha }) {
+      const ls = await runCmd('git', [
+        '-C',
+        canonicalRepo,
+        'ls-remote',
+        'origin',
+        `refs/heads/${canonicalBranch}`,
+      ])
+      if (ls.timedOut || !ls.terminationConfirmed || ls.code !== 0) return 'pending'
+      const remoteHead = ls.stdout.split(/\s+/)[0] ?? ''
+      if (remoteHead === sha) return 'pushed'
+      const push = await runCmd(
+        'git',
+        ['-C', canonicalRepo, 'push', 'origin', `${sha}:refs/heads/${canonicalBranch}`],
+        gitPushTimeoutMs,
       )
-      const pending: Promise<void>[] = []
-      const rl = createInterface({ input: child.stdout })
-      rl.on('line', (line) => {
-        const t = line.trim()
-        if (!t) return
-        let evt: unknown
-        try {
-          evt = JSON.parse(t)
-        } catch {
-          return
-        }
-        if (
-          evt &&
-          typeof evt === 'object' &&
-          ((evt as LaneEvent).evt === 'checkpoint' || (evt as LaneEvent).evt === 'receipt')
-        ) {
-          pending.push(Promise.resolve(input.onEvent(evt as LaneEvent)).catch(() => {}))
-        }
-      })
-      child.stderr.on('data', (chunk: Buffer) => {
-        log.info('release lane', { line: String(chunk).slice(0, 400) })
-      })
-      let timedOut = false
-      const timer = setTimeout(() => {
-        timedOut = true
-        // Kill the whole scope's cgroup (the deploy may have forked children).
-        void runCmd('systemctl', ['kill', `${input.scopeUnit}.scope`])
-        try {
-          child.kill('SIGKILL')
-        } catch {
-          /* already gone */
-        }
-      }, input.timeoutMs)
-      timer.unref?.()
-      child.on('error', (err) => {
-        log.error('release lane spawn error', { scopeUnit: input.scopeUnit }, err)
-      })
-      child.on('exit', () => {
-        clearTimeout(timer)
-        void Promise.all(pending).then(() => resolvePromise({ timedOut }))
-      })
-    })
-  },
-  async scopeLiveness(scopeUnit) {
-    // `systemctl is-active` prints the ActiveState to stdout regardless of exit
-    // code (exit is 0 only for 'active'), so classify by the STATE STRING — never
-    // by the exit code alone (a truly-dead scope reports 'inactive' with a
-    // non-zero exit; treating every non-zero as 'unknown' would livelock it).
-    const r = await runCmd('systemctl', ['is-active', `${scopeUnit}.scope`])
-    return classifyScopeState(r.stdout)
-  },
-  async killScope(scopeUnit) {
-    await runCmd('systemctl', ['kill', '-s', 'SIGKILL', `${scopeUnit}.scope`])
-  },
-  async pushCanonical({ canonicalRepo, canonicalBranch, sha }) {
-    const ls = await runCmd('git', ['-C', canonicalRepo, 'ls-remote', 'origin', `refs/heads/${canonicalBranch}`])
-    const remoteHead = ls.stdout.split(/\s+/)[0] ?? ''
-    if (remoteHead === sha) return 'pushed'
-    const push = await runCmd('git', [
-      '-C',
-      canonicalRepo,
-      'push',
-      'origin',
-      `${sha}:refs/heads/${canonicalBranch}`,
-    ])
-    return push.code === 0 ? 'pushed' : 'pending'
-  },
+      if (push.timedOut || !push.terminationConfirmed || push.code !== 0) return 'pending'
+      // A successful `git push` process is not proof that the exact remote ref now
+      // names the approved SHA. Always perform a fresh exact readback.
+      const readback = await runCmd('git', [
+        '-C',
+        canonicalRepo,
+        'ls-remote',
+        'origin',
+        `refs/heads/${canonicalBranch}`,
+      ])
+      if (readback.timedOut || !readback.terminationConfirmed || readback.code !== 0)
+        return 'pending'
+      return (readback.stdout.split(/\s+/)[0] ?? '') === sha ? 'pushed' : 'pending'
+    },
+  }
 }
+
+export const defaultReleaseWorkerPrimitives = createDefaultReleaseWorkerPrimitives()
 
 // ── worker ───────────────────────────────────────────────────────────────────
 
@@ -397,7 +582,8 @@ export class SelfhealReleaseWorker {
         },
       })
       if (res.outcome === 'claimed') return res.job
-      // busy (another deploy in flight) / noop (lost CAS) — retry a later tick.
+      // fuse_engaged / busy / noop — no lane starts; retry only after the gate
+      // or competing deploy changes durable state.
       return null
     })
     if (!claimed) return
@@ -652,25 +838,33 @@ export class SelfhealReleaseWorker {
   // ── receipt adjudication (§8.2) ────────────────────────────────────────────
 
   private async adjudicate(job: SelfhealReleaseJob, receiptRaw: string | null): Promise<void> {
+    // The streamed checkpoint is persisted asynchronously before runLane returns.
+    // Re-read the durable row so a deployed receipt can NEVER authorize a close
+    // from the stale pre-lane job object (which has checkpoint_json=null).
+    const durableJob = (await getReleaseJob(job.releaseRequestId)) ?? job
     const r = parseReceipt(receiptRaw)
-    if (!receiptValid(r, job)) {
-      await this.terminalizeUnknown(job, 'malformed_receipt', r?.proofs)
+    if (!receiptValid(r, durableJob)) {
+      await this.terminalizeUnknown(durableJob, 'malformed_receipt', r?.proofs)
       return
     }
     const receipt = r as ReceiptShape
     switch (receipt.outcome) {
       case 'deployed':
-        await this.terminalizeDeployed(job, receipt.proofs ?? {}, receipt.canonicalPush)
+        await this.terminalizeDeployed(durableJob, receipt.proofs ?? {})
         return
       case 'deploy_failed':
-        await this.terminalizeFailed(job, receipt.reason ?? 'proof_not_applied', receipt.proofs)
+        await this.terminalizeFailed(
+          durableJob,
+          receipt.reason ?? 'proof_not_applied',
+          receipt.proofs,
+        )
         return
       case 'manual':
-        await this.terminalizeManual(job, receipt.reason ?? 'lane_manual')
+        await this.terminalizeManual(durableJob, receipt.reason ?? 'lane_manual')
         return
       default: // 'deploy_unknown'
         await this.terminalizeUnknown(
-          job,
+          durableJob,
           receipt.reason ?? 'proof_indeterminate',
           receipt.proofs,
         )
@@ -681,10 +875,10 @@ export class SelfhealReleaseWorker {
   private async terminalizeDeployed(
     job: SelfhealReleaseJob,
     proofs: Record<string, unknown>,
-    laneCanonicalPush: string | undefined,
   ): Promise<void> {
-    const canonicalPush =
-      laneCanonicalPush === 'pushed' ? 'pushed' : await this.retryCanonicalPush(job)
+    // The lane's self-reported canonicalPush is advisory only. The personal
+    // worker independently verifies the exact remote branch SHA every time.
+    const canonicalPush = await this.retryCanonicalPush(job)
     if (canonicalPush === 'pushed') {
       await markReleaseJobCanonicalPushed(job.releaseRequestId)
     } else {
@@ -723,7 +917,7 @@ export class SelfhealReleaseWorker {
     const cp = safeParse(job.checkpointJson ?? '{}')
     const proofs = (cp.proofs ?? {}) as Record<string, unknown>
     // Deploy effect is proven applied (checkpoint) → deployed regardless of push.
-    await this.terminalizeDeployed(job, proofs, undefined)
+    await this.terminalizeDeployed(job, proofs)
   }
 
   private async terminalizeUnknown(
@@ -830,6 +1024,10 @@ export class SelfhealReleaseWorker {
       releaseRequestId: job.releaseRequestId,
       releasePhase: 'deployed',
       sha: job.approvedSha,
+      approvedSha: job.approvedSha,
+      planHash: job.deployPlanHash ?? '',
+      manifestHash: job.manifestHash ?? '',
+      candidateRef: candidateRefFor(job.repairId, job.approvedSha),
       surfaces,
       proofs,
       ...(canonicalPush === 'pending' ? { canonicalPush: 'pending' } : {}),
@@ -996,16 +1194,26 @@ function parseReceipt(raw: string | null): ReceiptShape | null {
   return null
 }
 
-/** Strong receipt binding (§8.2): rrid/sha must equal the job's frozen values,
- *  outcome must be a known code, exit must be an integer. Any deviation is
- *  malformed → the caller settles deploy_unknown. */
+/** Strong receipt binding (§8.2). Every outcome binds rrid/sha. A `deployed`
+ * receipt additionally binds the full frozen tuple, carries complete all-ok
+ * proofs for the frozen plan, AND is backed by this same job's already-durable,
+ * strongly-bound checkpoint. A receipt alone can never claim an applied effect. */
 function receiptValid(r: ReceiptShape | null, job: SelfhealReleaseJob): boolean {
-  return (
+  const baseValid =
     !!r &&
     r.evt === 'receipt' &&
     r.rrid === job.releaseRequestId &&
     r.sha === job.approvedSha &&
     ['deployed', 'deploy_failed', 'deploy_unknown', 'manual'].includes(r.outcome) &&
     Number.isInteger(r.exit)
+  if (!baseValid || !r) return false
+  if (r.outcome !== 'deployed') return true
+  return (
+    r.planHash === (job.deployPlanHash ?? '') &&
+    r.manifestHash === (job.manifestHash ?? '') &&
+    r.candidateRef === candidateRefFor(job.repairId, job.approvedSha) &&
+    proofsCoverPlan(r.proofs, planSurfacesOf(job)) &&
+    !!job.checkpointJson &&
+    checkpointRecordBinds(safeParse(job.checkpointJson), job)
   )
 }

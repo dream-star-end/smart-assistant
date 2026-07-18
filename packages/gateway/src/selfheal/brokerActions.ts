@@ -14,8 +14,8 @@
  *  - `restart_service` only accepts units in an env-provided allowlist
  *    (OC_SELFHEAL_RESTART_UNITS). Empty allowlist ⇒ every unit rejected — the
  *    safe default until block C explicitly opts units in.
- *  - `clean_disk` never touches data: docker prune is object-only (NO --volumes),
- *    journal vacuum is bounded by a validated size.
+ *  - Global disk cleanup is intentionally absent: neither Docker's global
+ *    object graph nor the shared journal is scoped to a single V5 repair.
  *  - `switch_node` is a reserved interface: params are validated but the actual
  *    egress switch integrates with egressSubscription (block C); until wired it
  *    returns `status: 'reserved'` rather than pretending to act.
@@ -119,13 +119,6 @@ function optionalString(obj: Record<string, unknown>, key: string): string | und
   return v
 }
 
-function oneOf<T extends string>(value: string, allowed: readonly T[], key: string): T {
-  if (!(allowed as readonly string[]).includes(value)) {
-    throw new BrokerActionError(`param "${key}" must be one of [${allowed.join(', ')}]`)
-  }
-  return value as T
-}
-
 /** Systemd unit allowlist, env-driven. Empty ⇒ nothing may be restarted. */
 export function restartUnitAllowlist(): string[] {
   return (process.env.OC_SELFHEAL_RESTART_UNITS ?? '')
@@ -169,43 +162,6 @@ const restartService: BrokerActionDef<RestartServiceParams> = {
   },
 }
 
-interface CleanDiskParams {
-  target: 'docker' | 'journal'
-  /** journal only: vacuum size, e.g. "500M" | "2G". */
-  vacuumSize?: string
-}
-
-const cleanDisk: BrokerActionDef<CleanDiskParams> = {
-  kind: 'clean_disk',
-  validate(raw) {
-    const obj = asObject(raw, ['target', 'vacuumSize'])
-    const target = oneOf(requireString(obj, 'target'), ['docker', 'journal'] as const, 'target')
-    const vacuumSize = optionalString(obj, 'vacuumSize')
-    if (vacuumSize !== undefined && !/^\d{1,6}[KMG]$/.test(vacuumSize)) {
-      throw new BrokerActionError('param "vacuumSize" must look like 500M / 2G')
-    }
-    if (target === 'docker' && vacuumSize !== undefined) {
-      throw new BrokerActionError('vacuumSize is only valid for target "journal"')
-    }
-    return { target, vacuumSize }
-  },
-  async execute(params, ctx) {
-    if (params.target === 'docker') {
-      // Object-only prune. NEVER --volumes: volumes hold real data (a red-line
-      // that must never be auto-touched).
-      const r = await ctx.run('docker', ['system', 'prune', '-f'])
-      return r.code === 0
-        ? { ok: true, status: 'cleaned', detail: { target: 'docker' } }
-        : { ok: false, status: 'clean_failed', detail: { target: 'docker', code: r.code } }
-    }
-    const size = params.vacuumSize ?? '500M'
-    const r = await ctx.run('journalctl', [`--vacuum-size=${size}`])
-    return r.code === 0
-      ? { ok: true, status: 'cleaned', detail: { target: 'journal', vacuumSize: size } }
-      : { ok: false, status: 'clean_failed', detail: { target: 'journal', code: r.code } }
-  },
-}
-
 interface SwitchNodeParams {
   node?: string
 }
@@ -233,7 +189,6 @@ const switchNode: BrokerActionDef<SwitchNodeParams> = {
 /** The Tier1 allowlist registry. Anything not keyed here is rejected. */
 export const TIER1_ACTIONS: Record<string, BrokerActionDef> = {
   [restartService.kind]: restartService as BrokerActionDef,
-  [cleanDisk.kind]: cleanDisk as BrokerActionDef,
   [switchNode.kind]: switchNode as BrokerActionDef,
 }
 

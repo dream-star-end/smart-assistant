@@ -17,7 +17,6 @@ set -uo pipefail
 
 OPCODE="${SSH_ORIGINAL_COMMAND:-${1:-}}"
 EGRESS_UNIT="openclaude-v5-egress.service"
-JOURNAL_VACUUM="500M"
 
 emit() { # emit <outcome> <exit_code> <detail-json>
   printf '{"opcode":"%s","outcome":"%s","exit":%s,"detail":%s,"at":"%s"}\n' \
@@ -38,9 +37,8 @@ emit() { # emit <outcome> <exit_code> <detail-json>
 # 根本不会被派单。但 marker TTL 只有 180s,而部署收尾/失败/回滚可能更久:那个
 # 边缘窗口里 monitor 会重新写 firing,自愈就可能和正在收尾的部署**抢着重启同一
 # 个服务**(自愈的 ssh 动作不走 sg 本机的 deploy 锁,拦不住它)。
-# 因此 marker 活跃期内**任何 opcode 一律让路**——不按 check 细分:部署期间清盘
-# 会删掉部署正在用的 build cache,同样是冲突。自愈延迟一轮(monitor 2min tick)
-# 无害,真故障下一轮会再被探到。
+# 因此 marker 活跃期内**任何 opcode 一律让路**——自愈延迟一轮
+# (monitor 2min tick)无害,真故障下一轮会再被探到。
 MAINT_MARKER="${OC_SELFHEAL_MAINT_MARKER:-/run/openclaude-v5/planned-maintenance.json}"
 maintenance_active() {
   [ -f "$MAINT_MARKER" ] || return 1
@@ -90,7 +88,7 @@ fi
 case "$OPCODE" in
   capabilities-v1)
     # 三层交集握手:本执行器支持的 opcode 清单(broker 启动/首用时核对)。
-    emit ok 0 '{"capabilities":["restart-v5-egress-v1","clean-v5-disk-v1"]}'
+    emit ok 0 '{"capabilities":["restart-v5-egress-v1"]}'
     exit 0
     ;;
 
@@ -105,22 +103,6 @@ case "$OPCODE" in
     esc="$(printf '%s' "$out" | tail -c 400 | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')"
     emit failed "$rc" "$(printf '{"unit":"%s","stderr":"%s"}' "$EGRESS_UNIT" "$esc")"
     exit "$rc"
-    ;;
-
-  clean-v5-disk-v1)
-    stand_down_if_maintenance   # 过渡冗余告警隔离(互斥正确性来自下面的 lease)
-    acquire_mutation_lease      # 持有 lease 直到进程退出,包住整个 opcode
-    # 固定步骤、固定上限,绝不接受调用方参数。docker 只 prune 对象(NEVER
-    # --volumes:卷含真实数据是红线);journal 定量回收。
-    d_out="$(docker system prune -f 2>&1)"; d_rc=$?
-    j_out="$(journalctl --vacuum-size="$JOURNAL_VACUUM" 2>&1)"; j_rc=$?
-    if [ "$d_rc" -eq 0 ] && [ "$j_rc" -eq 0 ]; then
-      recl="$(printf '%s' "$d_out" | grep -oE 'Total reclaimed space: .*' | tail -1 | sed 's/"/\\"/g')"
-      emit completed 0 "$(printf '{"docker":"%s","journal_vacuum":"%s"}' "${recl:-0}" "$JOURNAL_VACUUM")"
-      exit 0
-    fi
-    emit failed 1 "$(printf '{"docker_rc":%s,"journal_rc":%s}' "$d_rc" "$j_rc")"
-    exit 1
     ;;
 
   *)

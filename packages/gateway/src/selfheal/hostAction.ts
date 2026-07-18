@@ -24,7 +24,7 @@ const log = createLogger({ module: 'selfheal-hostaction' })
  *  transmit. Must stay in sync with the remote wrapper and the master policy
  *  action_opcode values; the broker additionally asserts the frozen master
  *  opcode equals the value this module maps a condition key to. */
-export const TIER1_OPCODES = new Set(['restart-v5-egress-v1', 'clean-v5-disk-v1'])
+export const TIER1_OPCODES = new Set(['restart-v5-egress-v1'])
 
 /** Exact condition-key → opcode map (batch1a). Prefix conditions expand to
  *  their concrete probe keys here — an EXACT map, never a broad prefix, so a
@@ -32,8 +32,6 @@ export const TIER1_OPCODES = new Set(['restart-v5-egress-v1', 'clean-v5-disk-v1'
 export const CONDITION_OPCODE_MAP: Record<string, string> = {
   'ops.monitor:svc_egress': 'restart-v5-egress-v1',
   'ops.monitor:http_egress': 'restart-v5-egress-v1',
-  'ops.monitor:disk_root': 'clean-v5-disk-v1',
-  'ops.monitor:disk_var': 'clean-v5-disk-v1',
 }
 
 /**

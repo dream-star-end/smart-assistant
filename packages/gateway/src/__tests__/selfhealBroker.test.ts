@@ -13,7 +13,12 @@ import {
   SELFHEAL_DRILL_RELEASE_KEY,
   SelfhealBroker,
 } from '../selfheal/broker.js'
-import { type CommandRunner, type RunResult, TIER1_ACTIONS } from '../selfheal/brokerActions.js'
+import {
+  type CommandRunner,
+  type RunResult,
+  TIER1_ACTION_KINDS,
+  TIER1_ACTIONS,
+} from '../selfheal/brokerActions.js'
 import { type VerificationResult, signVerification } from '../selfheal/verifier.js'
 
 const VERIFY_KEY = 'test-verify-hmac-signing-key-1234'
@@ -141,7 +146,7 @@ describe('SelfhealBroker Tier1', () => {
     assert.equal(resp.status, 'rejected')
   })
 
-  it('clean_disk docker prunes objects only (never volumes)', async () => {
+  it('clean_disk is not registered because cleanup cannot be scoped to V5', async () => {
     const { run, calls } = stubRunner(() => ({ code: 0 }))
     const broker = new SelfhealBroker({
       socketPath: '/unused',
@@ -156,9 +161,11 @@ describe('SelfhealBroker Tier1', () => {
       actionKind: 'clean_disk',
       params: { target: 'docker' },
     })
-    assert.equal(resp.ok, true)
-    assert.deepEqual(calls[0], { cmd: 'docker', args: ['system', 'prune', '-f'] })
-    assert.ok(!calls[0]!.args.includes('--volumes'), 'must never prune volumes (data red-line)')
+    assert.equal(resp.ok, false)
+    assert.equal(resp.status, 'rejected')
+    assert.match(String(resp.detail?.reason), /unknown action/)
+    assert.equal(calls.length, 0, 'a removed global cleanup action must never reach the runner')
+    assert.deepEqual(TIER1_ACTION_KINDS.sort(), ['restart_service', 'switch_node'])
   })
 
   it('switch_node is a reserved no-op', async () => {

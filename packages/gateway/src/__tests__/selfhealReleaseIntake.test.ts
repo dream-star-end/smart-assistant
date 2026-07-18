@@ -25,7 +25,6 @@ const {
   getReleaseJob,
   getReleaseFuse,
   engageReleaseFuse,
-  clearReleaseFuse,
   cancelReleaseJob,
   claimReleaseJob,
   insertReleaseJobReceived,
@@ -106,10 +105,16 @@ function releaseBody(repairId: string, rrid: string, over: Record<string, unknow
 
 beforeEach(async () => {
   const db = await getSelfhealDb()
-  db.exec(
-    'DELETE FROM selfheal_release_jobs; DELETE FROM selfheal_callback_outbox; DELETE FROM broker_actions;',
-  )
-  await clearReleaseFuse({ clearedBy: 'reset' })
+  db.exec(`
+    DELETE FROM selfheal_release_jobs;
+    DELETE FROM selfheal_callback_outbox;
+    DELETE FROM broker_actions;
+    DELETE FROM selfheal_release_fuse_cleared_epochs;
+    UPDATE selfheal_release_fuse
+    SET engaged = 0, reason = NULL, release_request_id = NULL,
+        engaged_at = NULL, cleared_at = NULL, cleared_by = NULL
+    WHERE id = 1;
+  `)
 })
 
 describe('receiveSelfhealRelease — §3.1 durable intake', () => {
@@ -128,7 +133,7 @@ describe('receiveSelfhealRelease — §3.1 durable intake', () => {
 
   it('local fuse engaged → 423 release_fuse_engaged (no job created)', async () => {
     await seedCutover('r2')
-    await engageReleaseFuse({ reason: 'halt' })
+    await engageReleaseFuse({ reason: 'halt', releaseRequestId: 'fuse-r2' })
     const res = await receiver.receiveSelfhealRelease(signedInput(RELEASE_PATH, 'r2', releaseBody('r2', 'rrid-2')), cfg)
     assert.equal(res.status, 423)
     assert.equal(res.body.error, 'release_fuse_engaged')
@@ -188,18 +193,82 @@ describe('receiveSelfhealRelease — §3.1 durable intake', () => {
 })
 
 describe('receiveSelfhealFuseClear — §3.3', () => {
-  it('clears the engaged local fuse and returns 200', async () => {
-    await engageReleaseFuse({ reason: 'stuck' })
+  it('clears only the exact engaged epoch and returns an epoch-bound 200', async () => {
+    await engageReleaseFuse({ reason: 'stuck', releaseRequestId: 'rr-fuse-A' })
     assert.equal((await getReleaseFuse()).engaged, true)
-    const body = { repairId: 'fuse', reason: 'boss cleared after audit', clearedBy: 'boss' }
+    const body = {
+      repairId: 'fuse',
+      reason: 'boss cleared after audit',
+      clearedBy: 'boss',
+      expectedReleaseRequestId: 'rr-fuse-A',
+    }
     const res = await receiver.receiveSelfhealFuseClear(signedInput(FUSE_PATH, 'fuse', body), cfg)
     assert.equal(res.status, 200)
     assert.equal(res.body.cleared, true)
+    assert.equal(res.body.releaseRequestId, 'rr-fuse-A')
+    assert.equal(res.body.outcome, 'cleared')
     assert.equal((await getReleaseFuse()).engaged, false)
   })
 
+  it('rejects a missing expected epoch before state change (400)', async () => {
+    await engageReleaseFuse({ reason: 'stuck', releaseRequestId: 'rr-fuse-missing' })
+    const body = { repairId: 'fuse', reason: 'x', clearedBy: 'boss' }
+    const res = await receiver.receiveSelfhealFuseClear(signedInput(FUSE_PATH, 'fuse', body), cfg)
+    assert.equal(res.status, 400)
+    assert.equal((await getReleaseFuse()).engaged, true)
+    assert.equal((await getReleaseFuse()).releaseRequestId, 'rr-fuse-missing')
+  })
+
+  it('rejects a wrong/unknown epoch with 409 and preserves the current epoch', async () => {
+    await engageReleaseFuse({ reason: 'stuck', releaseRequestId: 'rr-fuse-current' })
+    const body = {
+      repairId: 'fuse',
+      reason: 'x',
+      clearedBy: 'boss',
+      expectedReleaseRequestId: 'rr-fuse-wrong',
+    }
+    const res = await receiver.receiveSelfhealFuseClear(signedInput(FUSE_PATH, 'fuse', body), cfg)
+    assert.equal(res.status, 409)
+    assert.equal(res.body.error, 'release_fuse_epoch_mismatch')
+    assert.equal(res.body.expectedReleaseRequestId, 'rr-fuse-wrong')
+    assert.equal(res.body.currentReleaseRequestId, 'rr-fuse-current')
+    assert.equal((await getReleaseFuse()).engaged, true)
+    assert.equal((await getReleaseFuse()).releaseRequestId, 'rr-fuse-current')
+  })
+
+  it('response-loss retry of a cleared epoch is 200 already_cleared and cannot clear epoch B', async () => {
+    await engageReleaseFuse({ reason: 'A', releaseRequestId: 'rr-fuse-A' })
+    const clearA = {
+      repairId: 'fuse',
+      reason: 'audited A',
+      clearedBy: 'boss',
+      expectedReleaseRequestId: 'rr-fuse-A',
+    }
+    assert.equal(
+      (await receiver.receiveSelfhealFuseClear(signedInput(FUSE_PATH, 'fuse', clearA), cfg)).body.outcome,
+      'cleared',
+    )
+    await engageReleaseFuse({ reason: 'B', releaseRequestId: 'rr-fuse-B' })
+
+    const retry = await receiver.receiveSelfhealFuseClear(
+      signedInput(FUSE_PATH, 'fuse', clearA),
+      cfg,
+    )
+    assert.equal(retry.status, 200)
+    assert.equal(retry.body.cleared, true)
+    assert.equal(retry.body.releaseRequestId, 'rr-fuse-A')
+    assert.equal(retry.body.outcome, 'already_cleared')
+    assert.equal((await getReleaseFuse()).engaged, true)
+    assert.equal((await getReleaseFuse()).releaseRequestId, 'rr-fuse-B')
+  })
+
   it('rejects a body whose repairId is not the fixed literal "fuse" (400)', async () => {
-    const body = { repairId: 'not-fuse', reason: 'x', clearedBy: 'y' }
+    const body = {
+      repairId: 'not-fuse',
+      reason: 'x',
+      clearedBy: 'y',
+      expectedReleaseRequestId: 'rr-fuse-x',
+    }
     const res = await receiver.receiveSelfhealFuseClear(signedInput(FUSE_PATH, 'not-fuse', body), cfg)
     assert.equal(res.status, 400)
   })
