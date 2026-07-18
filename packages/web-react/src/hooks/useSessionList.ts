@@ -32,6 +32,8 @@ function storedToSession(s: StoredSession, ownerUserId: string): Session {
     ownerUserId,
     updatedAt: new Date(s.updatedAt ?? s.lastAt ?? Date.now()).toISOString(),
     messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
+    // modelId 无值时不落键:upsertSessions 的 spread 合并按"键缺席=不表态"保留另一侧的值。
+    ...(s._selectedModelId ? { modelId: s._selectedModelId } : {}),
   };
 }
 
@@ -43,6 +45,8 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     ownerUserId,
     updatedAt: new Date(m.updatedAt ?? m.lastAt ?? Date.now()).toISOString(),
     messageCount: m.messageCount ?? 0,
+    // 服务端无值(该会话从未显式选过/PATCH 尚未落地)= 键缺席,server-wins 合并不清掉本地意图。
+    ...(m.modelId ? { modelId: m.modelId } : {}),
   };
 }
 
@@ -186,7 +190,15 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           archivedThroughSeq: detail.archivedThroughSeq,
           archivedCount: detail.archivedCount,
           serverUpdatedAt: detail.updatedAt,
+          modelId: detail.modelId,
         });
+        // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
+        // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地。
+        if (detail.modelId) {
+          setSessions((c) =>
+            c.map((s) => (s.id === id && s.modelId !== detail.modelId ? { ...s, modelId: detail.modelId } : s)),
+          );
+        }
         historyFetchedAtRef.current.set(id, Date.now());
       } catch (e) {
         // 404 = 本地新建/未同步会话，无 server 历史（正常）：打冷却戳，避免每次重选都空打 404，

@@ -6,6 +6,7 @@ import {
   extractAutoDreamFeature,
   extractPrefs,
   initialModelFromPreferences,
+  resolveSessionModel,
 } from "./modelPreferences";
 
 const MODELS: PublicModel[] = [
@@ -55,6 +56,33 @@ describe("model preferences", () => {
   test("team leader effort is resolved against the actual Sol execution model", () => {
     expect(effectiveEffortModelId("MiniMax-M3", true)).toBe("gpt-5.6-sol");
     expect(effectiveEffortModelId("gpt-5.6-terra", false)).toBe("gpt-5.6-terra");
+  });
+
+  test("per-session 恢复解析:会话选择 > default_model > 首个健康模型", () => {
+    // 会话自己的持久化选择优先(即使与 default_model 不同)
+    expect(
+      resolveSessionModel(MODELS, "glm-5.2", { default_model: "gpt-5.6-terra" }),
+    ).toBe("glm-5.2");
+    // 会话无选择 → default_model
+    expect(
+      resolveSessionModel(MODELS, undefined, { default_model: "gpt-5.6-terra" }),
+    ).toBe("gpt-5.6-terra");
+    // 会话无选择且无 default → 首个健康模型
+    expect(resolveSessionModel(MODELS, undefined, {})).toBe("gpt-5.6-sol");
+  });
+
+  test("per-session 恢复解析:会话模型下架/降级不粘死,回落默认", () => {
+    // 下架(不在列表)→ 回落 default_model
+    expect(
+      resolveSessionModel(MODELS, "retired-model", { default_model: "gpt-5.6-terra" }),
+    ).toBe("gpt-5.6-terra");
+    // 降级(degraded)→ 同样回落;default 也降级 → 首个健康模型
+    const degraded = MODELS.map((m) =>
+      m.id === "glm-5.2" || m.id === "gpt-5.6-terra" ? { ...m, degraded: true } : m,
+    );
+    expect(
+      resolveSessionModel(degraded, "glm-5.2", { default_model: "gpt-5.6-terra" }),
+    ).toBe("gpt-5.6-sol");
   });
 
   test("extracts Auto-Dream feature projection from preference snapshots", () => {

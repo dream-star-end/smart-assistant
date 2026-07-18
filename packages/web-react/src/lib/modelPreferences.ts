@@ -73,6 +73,23 @@ export function initialModelFromPreferences(
 }
 
 /**
+ * 会话打开/切换时的选择器恢复解析:**会话自己的持久化选择优先**,其次用户
+ * default_model 偏好,再回落首个健康模型(与 initialModelFromPreferences 同口径)。
+ * 会话存的 modelId 只是 UI 恢复提示 —— 恢复时必须仍在当前用户可见列表且未降级,
+ * 否则视为不存在(模型下架/撤权/降级后不粘死,也杜绝脏值流入发送帧)。
+ */
+export function resolveSessionModel(
+  models: PublicModel[],
+  sessionModelId: string | undefined,
+  prefs: PrefsView,
+): string | undefined {
+  const own = sessionModelId
+    ? models.find((m) => m.id === sessionModelId && m.degraded !== true)
+    : undefined;
+  return own?.id ?? initialModelFromPreferences(models, prefs);
+}
+
+/**
  * 用户全局 effort 仅在当前执行模型的 API capability 投影允许时发送。
  * unsupported / 未设置均返回 undefined，让具体模型沿用自身默认。
  */

@@ -67,6 +67,9 @@ export type Session = {
   ownerUserId: string;
   updatedAt: string;
   messageCount: number;
+  /** 会话级模型选择(per-session 持久化;缺省 = 未显式选择 → 选择器回落 default_model)。
+   *  来源:本地选择写通 / IndexedDB 注水 / listSessions server-wins;App 切会话据此恢复选择器。 */
+  modelId?: string;
 };
 
 export type Message = {
@@ -276,6 +279,8 @@ export type SessionMeta = {
   lastAt: number;
   messageCount: number;
   updatedAt: number;
+  /** 会话级模型选择(服务端 client_sessions.model_id;缺省 = 该会话从未显式选过)。 */
+  modelId?: string;
 };
 
 /**
@@ -304,6 +309,8 @@ export type SessionDetail = {
   isPartial: boolean;
   totalMessageCount: number;
   maxSeq: number;
+  /** 会话级模型选择(见 SessionMeta.modelId;detail 回带供 socket 会话镜像 → IndexedDB)。 */
+  modelId?: string;
   /** 已归档条数（会话总数 = 返回的 tail 数 + 此值）。缺省=0（未归档/老后端）。*/
   archivedCount?: number;
   /** 已归档的最大 `_orderSeq` 水位；字段名为滚动兼容保留。缺省=0。*/
@@ -358,6 +365,8 @@ export type PutSessionInput = {
   createdAt?: number;
   lastAt?: number;
   messages?: unknown[];
+  /** 会话级模型选择:仅建行场景携带(服务端 COALESCE,未携带绝不清空既有值)。 */
+  modelId?: string;
   _baseSyncedAt?: number;
 };
 

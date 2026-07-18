@@ -94,9 +94,9 @@ import {
   effectiveEffortModelId,
   effortForModel,
   extractPrefs,
-  initialModelFromPreferences,
   type PreferenceEffort,
   type PrefsView,
+  resolveSessionModel,
 } from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
@@ -222,6 +222,9 @@ export function App() {
   // /api/me/preferences。两者同批 hydrate 后才决定初始值,避免迟到偏好覆盖人工选择。
   const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
   const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
+  // 最近一次 preferences 快照(default_model 解析用):per-session 模型恢复的回落基准。
+  // 写入点 = models 装载批 + SettingsCenter onPreferencesChange;下方 resolver effect 消费。
+  const [modelPrefs, setModelPrefs] = useState<PrefsView>({});
   const [preferenceEffort, setPreferenceEffort] = useState<PreferenceEffort | undefined>();
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
@@ -422,6 +425,48 @@ export function App() {
     // URL 深链恢复未决：暂停自动选中（URL 指定 > 最近会话）。
     holdAutoSelect: pendingRouteSession !== null,
   });
+
+  // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
+  //
+  // 选择器的值 = 活动会话的有效模型:会话自己的持久化选择优先(须仍可见且健康,
+  // 否则回落),其次 default_model 偏好,再回落首个健康模型(resolveSessionModel)。
+  // 数据流:侧栏 Session.modelId(IndexedDB 注水 + listSessions server-wins + 选择写通)
+  // 是本 effect 的读源;显式选择经 selectModel 写通三持有方(侧栏 + WS service/IndexedDB +
+  // 服务端 PATCH,与 rename 同款收口)。空会话态(无 activeId)解析结果 = 纯默认,作为
+  // "下一个新会话"的初始意图;空态显式选择只改 modelId state,不进本 effect 依赖,不被覆盖。
+  const activeSessionModelId =
+    !demo && activeId ? sessions.find((s) => s.id === activeId)?.modelId : undefined;
+  useEffect(() => {
+    // 活动会话解析:切会话/会话模型到达(注水·listSessions·detail 回填)/偏好变更时恢复。
+    // activeId 必须进依赖:A(有模型)→B(无模型)切换时 activeSessionModelId 可能不变,
+    // 仅 activeId 变,不重跑就会把 A 的模型粘给 B。
+    if (demo || models.length === 0 || !activeId) return;
+    setModelId(resolveSessionModel(models, activeSessionModelId, modelPrefs));
+  }, [demo, models, activeId, activeSessionModelId, modelPrefs]);
+  useEffect(() => {
+    // 空会话态默认:boot 初值与 default_model 变更传导(= 下一个新会话的初始意图)。
+    // 空态的显式选择(selectModel 只 setModelId)不改本 effect 依赖,不会被覆盖。
+    if (demo || models.length === 0 || activeId !== undefined) return;
+    setModelId(resolveSessionModel(models, undefined, modelPrefs));
+  }, [demo, models, activeId, modelPrefs]);
+
+  // 显式选择模型:活动会话存在则写通三持有方(best-effort PATCH,失败契约同 rename:
+  // 下次 listSessions server-wins 盖回,重选即重试;新会话行未建 404 同样吞掉,由建行
+  // PUT/建行后收敛 PATCH 落地)。无活动会话(空会话态)仅更新选择器,作为下一会话意图。
+  const selectModel = useCallback(
+    (id: string) => {
+      setModelId(id);
+      if (demo) return;
+      const sid = activeId;
+      if (!sid) return;
+      setSessions((c) => c.map((s) => (s.id === sid ? { ...s, modelId: id } : s)));
+      sockRef.current?.setSessionModel(sid, id);
+      void api.patchSessionModel(authRef.current, sid, id).catch(() => {
+        /* best-effort:本地已改;server 无值不清本地,有旧值则下次 server-wins 盖回可重选 */
+      });
+    },
+    [demo, activeId, setSessions],
+  );
   // 回填给 useAuth 的 chat 域收尾（onClearAuth/onLoginSuccess 经 sessionsResetRef 调用）。
   sessionsResetRef.current = resetSessionList;
 
@@ -499,6 +544,9 @@ export function App() {
           ownerUserId: user.id,
           updatedAt: new Date().toISOString(),
           messageCount: 0,
+          // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
+          // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
+          ...(modelId ? { modelId } : {}),
         };
         setSessions((c) => [createdSession!, ...c]);
         setActiveId(sessionId);
@@ -736,16 +784,13 @@ export function App() {
   }, [refreshMe]);
 
   const applyConversationPreferences = useCallback(
-    (prefs: PrefsView, patch?: Record<string, unknown>) => {
+    (prefs: PrefsView, _patch?: Record<string, unknown>) => {
       setPreferenceEffort(prefs.default_effort);
-      if (
-        patch &&
-        Object.prototype.hasOwnProperty.call(patch, "default_model")
-      ) {
-        setModelId(initialModelFromPreferences(models, prefs));
-      }
+      // default_model 变更经 modelPrefs → resolver effect 传导:只影响「无自有持久化选择」
+      // 的会话与空会话态;已显式选过模型的会话保持自身选择(per-session 隔离语义)。
+      setModelPrefs(prefs);
     },
-    [models],
+    [],
   );
 
   // 打开管理中心到指定分区（侧栏入口 + 工具卡「打开记忆/技能/定时」按钮统一走此）。
@@ -993,7 +1038,9 @@ export function App() {
       .then(([ms, prefs]) => {
         if (cancelled) return;
         setModels(ms);
-        setModelId(initialModelFromPreferences(ms, prefs));
+        // 初始 modelId 不在此直接写:models/modelPrefs 落定会触发 per-session resolver
+        // effect,按「活动会话持久化选择 > default_model > 首个健康模型」统一解析。
+        setModelPrefs(prefs);
         setPreferenceEffort(prefs.default_effort);
       })
       .catch(() => {
@@ -1871,7 +1918,7 @@ export function App() {
           onAgentClick={() => setPickerOpen(true)}
           models={models}
           selectedModelId={modelId}
-          onSelectModel={setModelId}
+          onSelectModel={selectModel}
           modelsLoading={modelsLoading}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
           // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。

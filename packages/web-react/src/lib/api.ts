@@ -1582,6 +1582,24 @@ export const api = {
     ),
 
   /**
+   * 会话级模型选择持久化（PATCH /api/sessions/:id，Bearer，元数据专用，与 rename 同款）。
+   * best-effort 失败契约同 rename：本地已改,服务端失败则下次 listSessions server-wins
+   * 盖回,用户重选即重试。会话行尚未建（新会话未发首条消息）时 404,同样吞掉——建行
+   * PUT(ensureServerSession)会随体携带 modelId 收敛。
+   */
+  patchSessionModel: (a: AuthSession, id: string, modelId: string): Promise<{ ok: true; updatedAt: number }> =>
+    jsonOrThrow<{ ok: true; updatedAt: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ modelId }),
+        }),
+      ),
+    ),
+
+  /**
    * 跨设备持久化「用户发送的消息」（POST /api/sessions/:id/user-message，Bearer）。
    * 带前端 client 消息 id；服务端直写(role:'user',绕乐观并发,scoped by userId),
    * getSession 回带同 id → 前端合并去重。best-effort，调用方吞错不阻断发送。

@@ -22,10 +22,11 @@ function persistSignature(s: StoredSession): string {
     ? `${last.text?.length ?? 0}/${last.output?.length ?? 0}/${last.partialJson?.length ?? 0}/${last._completed ? 1 : 0}/${last.status ?? ""}`
     : "";
   // title 计入:rename 是纯元数据变更,漏掉它 IndexedDB 永远存旧标题(reload 即回退)。
+  // _selectedModelId 同理:会话级模型选择也是纯元数据变更,漏掉则选完不发消息时 reload 即回退。
   const inflightSig = s._sendingInFlight
     ? `1/${s._turnStartedAt ?? 0}/${s._lastFrameAt ?? 0}`
     : "0";
-  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${inflightSig}:${s._trackerResetAt ?? 0}:${s._trackerResetServerTs ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
+  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${s._selectedModelId ?? ""}:${inflightSig}:${s._trackerResetAt ?? 0}:${s._trackerResetServerTs ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
 }
 
 /**
@@ -57,6 +58,8 @@ export type UseChatSocket = {
   removeSession: (sessId: string) => void;
   /** 重命名会话(WS service 内存 + IndexedDB;服务端 PATCH 由 App 层同步)。*/
   renameSession: (sessId: string, title: string) => void;
+  /** 会话级模型选择(WS service 内存 + IndexedDB;服务端 PATCH 由 App 层同步,与 rename 同构)。*/
+  setSessionModel: (sessId: string, modelId: string) => void;
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
@@ -102,6 +105,8 @@ export type UseChatSocket = {
     archivedCount?: number;
     /** SessionDetail.updatedAt:full 缺席删除(同步权威传播 P1)的版本护栏证据。*/
     serverUpdatedAt?: number;
+    /** SessionDetail.modelId(会话级模型选择):携带时 server-wins 镜像进会话态。*/
+    modelId?: string;
   }) => void;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
@@ -272,15 +277,33 @@ export function useChatSocket(opts: {
       // fire-and-forget：建行是快 REST，远早于容器跑完 turn 后的 authored POST；失败不阻塞发送
       // （容器 append 自带重试 + syncSession GET 兜底）。messages:[] + baseSyncedAt:0 → 已存在
       // 则 rejected_stale 空操作，绝不 clobber server-authored 历史。
-      ensureServerSession: async (sessId, agentId, title) => {
+      ensureServerSession: async (sessId, agentId, title, modelId) => {
         const a = authRef.current;
         if (!a) return false; // 未登录:不标 ensured,登录后下次发送重试
         try {
-          await api.putSession(a, sessId, { agentId, title: title || "新会话", messages: [], _baseSyncedAt: 0 });
+          // modelId(会话级模型选择)随建行携带;受理路径抢先建行(PR#126)时本 PUT 409,
+          // 由 socket 侧建行确认后的 persistSessionModel PATCH 收敛。
+          await api.putSession(a, sessId, {
+            agentId,
+            title: title || "新会话",
+            messages: [],
+            ...(modelId ? { modelId } : {}),
+            _baseSyncedAt: 0,
+          });
           return true; // PUT 200:建行确认
         } catch (e) {
           // 409 = 行已存在(并发抢先 / 已建)→ 同样视为已确认,不必重试;其余(网络/5xx/401)→ 重试。
           return (e as { status?: number } | null)?.status === 409;
+        }
+      },
+      // 会话级模型选择收敛补写(建行确认后由 socket 调;best-effort,失败下次选择/发送再收敛)。
+      persistSessionModel: async (sessId, modelId) => {
+        const a = authRef.current;
+        if (!a) return;
+        try {
+          await api.patchSessionModel(a, sessId, modelId);
+        } catch {
+          /* best-effort:本地 + IndexedDB 仍在;下次显式选择或跨设备打开时以 server 为准 */
         }
       },
       // 跨设备持久化用户消息(行已由 ensureServerSession 建)。best-effort,失败静默。
@@ -472,6 +495,10 @@ export function useChatSocket(opts: {
     (sessId: string, title: string) => socket.renameSession(sessId, title),
     [socket],
   );
+  const setSessionModel = useCallback(
+    (sessId: string, modelId: string) => socket.setSessionModel(sessId, modelId),
+    [socket],
+  );
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
@@ -499,6 +526,7 @@ export function useChatSocket(opts: {
         archivedThroughSeq: p.archivedThroughSeq,
         archivedCount: p.archivedCount,
         serverUpdatedAt: p.serverUpdatedAt,
+        modelId: p.modelId,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },
@@ -633,6 +661,7 @@ export function useChatSocket(opts: {
       ensureServerSession,
       removeSession,
       renameSession,
+      setSessionModel,
       switchAgent,
       send,
       stop,
@@ -662,6 +691,7 @@ export function useChatSocket(opts: {
       ensureServerSession,
       removeSession,
       renameSession,
+      setSessionModel,
       switchAgent,
       send,
       stop,

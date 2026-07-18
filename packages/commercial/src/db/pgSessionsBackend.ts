@@ -6,7 +6,7 @@
 // 容器内 gateway / 个人版不加载 commercial → 天然 SQLite,行为零变化。
 //
 // 本文件是 SQLite backend(packages/storage/src/sessionsDb.ts 的 sqliteBackend)的**行为等价
-// PG 实现**。契约 `ClientSessionsBackend = typeof sqliteBackend` 在类型层强制 27 方法全覆盖
+// PG 实现**。契约 `ClientSessionsBackend = typeof sqliteBackend` 在类型层强制 28 方法全覆盖
 // (漏一个 / 签名不符 = 编译错)。业务决策(merge/seq/spill/usage-patch/delegate 累加)**全部
 // 复用** @openclaude/storage 导出的引擎中立纯函数(planSpillOverflow / planAppendServerAuthored /
 // mergePreservingServerAuthored / normalizeAndAssignSeqs / appendServerAuthoredPure /
@@ -2752,7 +2752,7 @@ async function hydrateTurnTapeMessages(
 }
 
 /**
- * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`(27 方法),
+ * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`(28 方法),
  * 由 registerCommercial 注入。方法内闭包持有 pool。
  */
 export function createPgSessionsBackend(
@@ -3530,8 +3530,8 @@ export function createPgSessionsBackend(
 
           const res = await client.query(
             `INSERT INTO client_sessions
-               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13)
+               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13, $15)
              ON CONFLICT (id) DO UPDATE SET
                agent_id = EXCLUDED.agent_id,
                title = EXCLUDED.title,
@@ -3539,6 +3539,9 @@ export function createPgSessionsBackend(
                last_at = EXCLUDED.last_at,
                messages = EXCLUDED.messages,
                message_count = EXCLUDED.message_count,
+               -- model_id:PUT 未携带(NULL)= 保留既有(元数据权威写路径是 setClientSessionModel,
+               -- 全量 PUT 不得清空);携带则以 PUT 为准(建行场景)。
+               model_id = COALESCE(EXCLUDED.model_id, client_sessions.model_id),
                -- updated_at 逻辑版本(RFC D3b):冲突更新走 DB 计算 GREATEST。**首建(BLOCKER-1)**:
                -- 新插入(无冲突)的 updated_at 也取 GREATEST(客户端 $10, 服务端时钟下限 clock_ms)——
                -- 不再无条件信任客户端 $10(客户端可回传 0 / 旧值,首建后紧跟 baseSyncedAt=0 的第二个
@@ -3564,6 +3567,7 @@ export function createPgSessionsBackend(
               plan.archivedThroughSeq,
               newArchivedCount,
               baseSyncedAt,
+              session.modelId ?? null,
             ],
           );
           if ((res.rowCount ?? 0) > 0) return "applied";
@@ -4272,8 +4276,9 @@ export function createPgSessionsBackend(
           last_at: string;
           updated_at: string;
           msg_count: number;
+          model_id: string | null;
         }>(
-          `SELECT id, agent_id, title, pinned, created_at, last_at, updated_at, message_count AS msg_count
+          `SELECT id, agent_id, title, pinned, created_at, last_at, updated_at, message_count AS msg_count, model_id
              FROM client_sessions WHERE user_id = $1 AND deleted_at IS NULL ORDER BY last_at DESC`,
           [userId],
         )
@@ -4287,6 +4292,7 @@ export function createPgSessionsBackend(
         lastAt: bigIntNum(r.last_at, "last_at"),
         messageCount: r.msg_count,
         updatedAt: bigIntNum(r.updated_at, "updated_at"),
+        ...(r.model_id ? { modelId: r.model_id } : {}),
       }));
     },
 
@@ -4296,8 +4302,8 @@ export function createPgSessionsBackend(
       options: ClientSessionReadOptions = {},
     ): Promise<ClientSession | null> {
       const sql = userId
-        ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL"
-        : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND deleted_at IS NULL";
+        ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL"
+        : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL";
       const row = (
         await pool.query<{
           id: string;
@@ -4311,6 +4317,7 @@ export function createPgSessionsBackend(
           updated_at: string;
           archived_through_seq: number | null;
           archived_count: number | null;
+          model_id: string | null;
         }>(sql, userId ? [id, userId] : [id])
       ).rows[0];
       if (!row) return null;
@@ -4333,6 +4340,7 @@ export function createPgSessionsBackend(
         lastAt: bigIntNum(row.last_at, "last_at"),
         messages,
         updatedAt: bigIntNum(row.updated_at, "updated_at"),
+        ...(row.model_id ? { modelId: row.model_id } : {}),
         archivedCount: bigIntNumOr(row.archived_count, 0),
         archivedThroughSeq: archivedThroughOrderSeq,
       };
@@ -4388,8 +4396,9 @@ export function createPgSessionsBackend(
           updated_at: string;
           archived_through_seq: number | null;
           archived_count: number | null;
+          model_id: string | null;
         }>(
-          "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+          "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
           [id, userId],
         )
       ).rows[0];
@@ -4437,6 +4446,7 @@ export function createPgSessionsBackend(
         lastAt: bigIntNum(row.last_at, "last_at"),
         messages,
         updatedAt: bigIntNum(row.updated_at, "updated_at"),
+        ...(row.model_id ? { modelId: row.model_id } : {}),
         totalMessageCount: allMsgs.length + archivedCount,
         maxSeq,
         isPartial,
@@ -4571,6 +4581,20 @@ export function createPgSessionsBackend(
           `UPDATE client_sessions SET title = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
              WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL RETURNING updated_at`,
           [title, id, userId],
+        )
+      ).rows[0];
+      return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
+    },
+
+    async setClientSessionModel(id: string, userId: string, modelId: string): Promise<{ ok: boolean; updatedAt: number }> {
+      const now = Date.now();
+      // 与 renameClientSession 同构:metadata-only 单列 UPDATE,updated_at 逻辑版本单调推进
+      // (其它设备 listSessions server-wins 拿到新选择)。值为 UI 恢复提示,校验在 gateway 边界。
+      const row = (
+        await pool.query<{ updated_at: string }>(
+          `UPDATE client_sessions SET model_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+             WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL RETURNING updated_at`,
+          [modelId, id, userId],
         )
       ).rows[0];
       return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };

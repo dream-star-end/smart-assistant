@@ -119,6 +119,7 @@ import {
   appendServerAuthoredMessage,
   deleteClientSession,
   renameClientSession,
+  setClientSessionModel,
   recordAutoDreamSuccessfulSession,
   listUnclaimedSessions,
   claimSession,
@@ -3699,13 +3700,19 @@ export class Gateway {
             }
             return
           }
-          let data: { agentId?: string; title?: string; pinned?: unknown; createdAt?: number; lastAt?: number; messages?: unknown; _baseSyncedAt?: number }
+          let data: { agentId?: string; title?: string; pinned?: unknown; createdAt?: number; lastAt?: number; messages?: unknown; modelId?: unknown; _baseSyncedAt?: number }
           try {
             data = JSON.parse(body)
           } catch {
             this.sendJson(res, 400, { error: 'invalid JSON' })
             return
           }
+          // modelId(会话级模型选择)建行透传:形态非法/缺省一律按未携带处理(upsert COALESCE
+          // 保留既有值,绝不清空)。与 PATCH 同一校验口径。
+          const putModelId =
+            typeof data.modelId === 'string' && /^[A-Za-z0-9._:-]{1,120}$/.test(data.modelId.trim())
+              ? data.modelId.trim()
+              : undefined
           const updatedAt = Date.now()
           const result = await upsertClientSession({
             id: sessId,
@@ -3716,6 +3723,7 @@ export class Gateway {
             createdAt: data.createdAt || Date.now(),
             lastAt: data.lastAt || Date.now(),
             messages: (data.messages as unknown[]) || [],
+            ...(putModelId ? { modelId: putModelId } : {}),
             updatedAt,
           }, data._baseSyncedAt || 0)
           if (result === 'oversized') {
@@ -3735,24 +3743,54 @@ export class Gateway {
         return
       }
       if (req.method === 'PATCH') {
-        // 元数据专用更新(当前仅 title)。不走 PUT 的"整 blob 替换 + 乐观并发"语义:
-        // rename 不携带 messages,骑 PUT 要么 409 要么把未随带的客户端消息 merge 掉。
+        // 元数据专用更新(title / modelId,至少携带其一)。不走 PUT 的"整 blob 替换 + 乐观
+        // 并发"语义:元数据不携带 messages,骑 PUT 要么 409 要么把未随带的客户端消息 merge 掉。
+        // modelId = 会话级模型选择(UI 恢复提示,非执行权威;执行仍走每 turn 帧字段 + bridge
+        // authz)。仅做形态校验,不查 catalog —— 前端恢复时会校验"仍可见且健康"否则回落默认,
+        // 服务端查 catalog 只会引入无收益的耦合(模型下架后历史值也需要能安全存在)。
         ;(async () => {
-          let data: { title?: unknown }
+          let data: { title?: unknown; modelId?: unknown }
           try {
             data = JSON.parse(await this.readBody(req, 16 * 1024))
           } catch {
             this.sendJson(res, 400, { error: 'invalid JSON' })
             return
           }
+          const hasTitle = data.title !== undefined
+          const hasModel = data.modelId !== undefined
+          if (!hasTitle && !hasModel) {
+            this.sendJson(res, 400, { error: 'title or modelId required' })
+            return
+          }
           const title = typeof data.title === 'string' ? data.title.trim() : ''
-          if (!title || title.length > 120) {
+          if (hasTitle && (!title || title.length > 120)) {
             this.sendJson(res, 400, { error: 'title required (1-120 chars)' })
             return
           }
-          const r = await renameClientSession(sessId, userId, title)
-          if (!r.ok) this.sendJson(res, 404, { error: 'not found' })
-          else this.sendJson(res, 200, { ok: true, updatedAt: r.updatedAt })
+          const modelId = typeof data.modelId === 'string' ? data.modelId.trim() : ''
+          if (hasModel && !/^[A-Za-z0-9._:-]{1,120}$/.test(modelId)) {
+            this.sendJson(res, 400, { error: 'modelId invalid (1-120 chars, [A-Za-z0-9._:-])' })
+            return
+          }
+          // 两字段独立单列 UPDATE(现实调用方一次只改一个;都带时顺序执行,updatedAt 取末次)。
+          let updatedAt = 0
+          if (hasTitle) {
+            const r = await renameClientSession(sessId, userId, title)
+            if (!r.ok) {
+              this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            updatedAt = r.updatedAt
+          }
+          if (hasModel) {
+            const r = await setClientSessionModel(sessId, userId, modelId)
+            if (!r.ok) {
+              this.sendJson(res, 404, { error: 'not found' })
+              return
+            }
+            updatedAt = r.updatedAt
+          }
+          this.sendJson(res, 200, { ok: true, updatedAt })
         })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
         return
       }
