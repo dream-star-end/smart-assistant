@@ -48,7 +48,18 @@ afterEach(async () => {
 })
 
 describe("defaultIsHostAllowed", () => {
-  it("only allows 172.30.0.0/16 IPv4 addresses", () => {
+  // 白名单必须随 runtime channel 走本 channel 容器网段(containerNet 单一权威)。
+  // 曾硬编码 172.30/16:v5 下 master→容器 dispatch 求证 100% 被自己拦死(2026-07-18
+  // 收敛链瘫痪事故)——而本测试当时只断言了 v3 语境,把 bug 锁成了"正确行为"。
+  // 契约:**两个 channel 都必须显式覆盖**,各自放行本网段、拒斥对方网段。
+  const savedChannel = process.env.OC_RUNTIME_CHANNEL
+  afterEach(() => {
+    if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL
+    else process.env.OC_RUNTIME_CHANNEL = savedChannel
+  })
+
+  it("v3 channel(默认):allows 172.30/16, rejects 172.31/16", () => {
+    delete process.env.OC_RUNTIME_CHANNEL
     assert.equal(defaultIsHostAllowed("172.30.0.1"), true)
     assert.equal(defaultIsHostAllowed("172.30.255.255"), true)
     assert.equal(defaultIsHostAllowed("172.31.0.1"), false)
@@ -57,6 +68,15 @@ describe("defaultIsHostAllowed", () => {
     assert.equal(defaultIsHostAllowed("172.30.0.1.5"), false) // 非 IPv4
     assert.equal(defaultIsHostAllowed("localhost"), false) // hostname 不接受
     assert.equal(defaultIsHostAllowed(""), false)
+  })
+
+  it("v5 channel:allows 172.31/16(容器真网段), rejects 172.30/16", () => {
+    process.env.OC_RUNTIME_CHANNEL = "v5"
+    assert.equal(defaultIsHostAllowed("172.31.0.1"), true)
+    assert.equal(defaultIsHostAllowed("172.31.190.148"), true) // 事故中被误拦的真实容器 IP 形态
+    assert.equal(defaultIsHostAllowed("172.30.0.1"), false)
+    assert.equal(defaultIsHostAllowed("127.0.0.1"), false)
+    assert.equal(defaultIsHostAllowed("localhost"), false)
   })
 })
 

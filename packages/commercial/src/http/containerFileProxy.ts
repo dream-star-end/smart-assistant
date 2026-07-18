@@ -35,14 +35,13 @@
 import type { ClientRequest, IncomingMessage, ServerResponse } from "node:http";
 import { request as httpRequest } from "node:http";
 import { createHmac } from "node:crypto";
-import { isIPv4 } from "node:net";
 import { basename } from "node:path";
 import { ACTIVE_CONTENT_TYPES, isActiveContentType } from "@openclaude/protocol";
 import type { TLSSocket } from "node:tls";
 import type { RequestContext } from "./handlers.js";
 import type { V3ContainerStatus, V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 import { getV3ContainerStatus } from "../agent-sandbox/v3supervisor.js";
-import { getRuntimeChannel } from "../runtimeChannel.js";
+import { isPlatformContainerIp } from "../containerNet.js";
 import {
   isContainerCapabilityReady,
   type CapabilityProbeDeps,
@@ -71,10 +70,8 @@ const inflight = new Map<string, number>();
  *  v3=172.30.0.0/16,v5=172.31.0.0/16。各 channel 的 proxy 只能够到本 channel 网段容器,
  *  防 SSRF 跨网段、也防 v3 proxy 误连 v5 容器(反之亦然)。 */
 function isBoundIpAllowed(ip: string): boolean {
-  if (!isIPv4(ip)) return false;
-  const p = ip.split(".").map(Number);
-  const expectSecond = getRuntimeChannel() === "v5" ? 31 : 30;
-  return p[0] === 172 && p[1] === expectSecond;
+  // channel-aware 网段判定收口 containerNet(单一权威,禁复制)。
+  return isPlatformContainerIp(ip);
 }
 
 /**

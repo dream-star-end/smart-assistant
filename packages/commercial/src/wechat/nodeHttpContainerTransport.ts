@@ -9,9 +9,9 @@
  *   - **不**支持 remote-host tunnel:`supportsTunnel:false`,dispatcher 看到 endpoint.tunnel 时
  *     会先走 `tunnel_unsupported` 路径,不会调到本 transport(slice 7b 限定 self-host)
  *
- * **SSRF 边界**:`endpoint.host` 必须是 `172.30.0.0/16`(docker bridge gateway 的 CIDR;与
- * `containerFileProxy.isBoundIpAllowed` 同源)— 这是生产里 broker 仅允许打的网段。`isHostAllowed`
- * 是注入点便于本地 127.0.0.1 测试,但默认实装关死,production 走 strict check。
+ * **SSRF 边界**:`endpoint.host` 必须落在**本 channel 的容器网段**(v3=172.30/16,v5=172.31/16;
+ * 判定收口 `containerNet.isPlatformContainerIp` 单一权威)— 这是生产里 broker 仅允许打的网段。
+ * `isHostAllowed` 是注入点便于本地 127.0.0.1 测试,但默认实装关死,production 走 strict check。
  *
  * **timeout 模型**:dispatcher 传入的 `timeoutMs` 是 **绝对 deadline**(wall-clock),不是 socket
  * 空闲 timeout。connect / TLS handshake / 服务端 read body / response 流式 drip 全程一把 ruler
@@ -26,8 +26,8 @@
 
 import { Agent, request as defaultHttpRequest } from "node:http"
 import type { IncomingMessage } from "node:http"
-import { isIPv4 } from "node:net"
 
+import { isPlatformContainerIp } from "../containerNet.js"
 import { rootLogger, type Logger } from "../logging/logger.js"
 import type { ContainerTransport } from "./inboundDispatcher.js"
 
@@ -38,18 +38,17 @@ const RESPONSE_BODY_CAP_BYTES = 64 * 1024
 const DEFAULT_KEEP_ALIVE_MSECS = 60_000
 
 /**
- * 默认 SSRF 白名单:`172.30.0.0/16`。
+ * 默认 SSRF 白名单:**本 channel 的容器网段**(v3=172.30/16,v5=172.31/16)。
  *
- * 与 `packages/commercial/src/http/containerFileProxy.ts:isBoundIpAllowed` 同源 — broker 仅允许
- * 打 docker bridge 段的容器 endpoint。`endpoint.host` 缺失 / 非 IPv4 / 网段不对均直接拒。
+ * 判定收口在 `containerNet.isPlatformContainerIp`(单一权威)— broker 仅允许打本
+ * channel docker bridge 段的容器 endpoint。`endpoint.host` 缺失 / 非 IPv4 / 网段不对均直接拒。
+ * (曾硬编码 172.30/16:v5 下 master→容器 dispatch 求证 100% 被拦,§2.4 收敛链上线即瘫。)
  *
  * **不放开**: 不接受 hostname(DNS resolve) — 防止 host 配置漂移时 broker 打到错误目标;
  * dispatcher 上游(resolveContainerEndpoint)已保证 host = 容器 bound_ip 字符串,合同里就是 IP。
  */
 export function defaultIsHostAllowed(host: string): boolean {
-  if (!isIPv4(host)) return false
-  const p = host.split(".").map(Number)
-  return p[0] === 172 && p[1] === 30
+  return isPlatformContainerIp(host)
 }
 
 /** node:http.request 的最小 typing(默认 `import {request}` 即可,测试可注入 mock)。 */
@@ -57,7 +56,7 @@ export type HttpRequestImpl = typeof defaultHttpRequest
 
 export interface MakeNodeHttpContainerTransportOptions {
   /**
-   * SSRF 白名单注入点。**production 不传**(默认 `defaultIsHostAllowed` = 172.30/16);
+   * SSRF 白名单注入点。**production 不传**(默认 `defaultIsHostAllowed` = 本 channel 容器网段);
    * 测试本地 `127.0.0.1` 时注入 `() => true` 即可。
    *
    * 实现层故意把这个做成注入点而不是 env / config — broker prod 路径没有任何理由放开 strict

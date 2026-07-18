@@ -302,9 +302,12 @@ import {
   inboxReject,
   inboxSinkStageFailedByDispatch,
   inboxSinkStagedByDispatch,
+  isTurnDispatchLive,
+  markTurnDispatchLive,
   normalizeDispatchUserId,
   queryMasterTapeState,
   recoverTurnDispatchInboxOnBoot,
+  unmarkTurnDispatchLive,
   rejectTurnDispatchIfAbsent,
   resolveInboxTerminalAck,
 } from './turnDispatchInbox.js'
@@ -10002,6 +10005,8 @@ export class Gateway {
       retryQueueHasDispatch: (dispatchId, attemptNo) =>
         queue.hasEntryForDispatch(dispatchId, attemptNo),
       queryMasterTapeState: (dispatchId, attemptNo) => queryMasterTapeState(dispatchId, attemptNo),
+      // 活执行行一律跳过(§B4 周期 sweep 防误杀在飞 turn);boot 首跑注册表恒空,语义不变。
+      isDispatchLive: (dispatchId, attemptNo) => isTurnDispatchLive(dispatchId, attemptNo),
       stageSyntheticCrashedTape: async (row) => {
         const payload = buildSyntheticCrashedTapePayload(row)
         // stageDurable 只需 wire payload;tape 分片在 drain 时由 attemptSend 现算。
@@ -10055,7 +10060,12 @@ export class Gateway {
     queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
   ): void {
     if (this._turnDispatchRecoveryTimer) return
-    const RETRY_MS = 60_000
+    // e2e 用 OC_TURN_DISPATCH_SWEEP_MS 压缩 tick 周期复现"sweep 撞在飞 turn"场景;
+    // 生产不设 → 60s。clamp 防误配(过小空转,过大失去收敛时效)。
+    const envMs = Number(process.env.OC_TURN_DISPATCH_SWEEP_MS)
+    const RETRY_MS = Number.isFinite(envMs) && envMs > 0
+      ? Math.min(Math.max(envMs, 1_000), 600_000)
+      : 60_000
     this._turnDispatchRecoveryTimer = setInterval(() => {
       void (async () => {
         try {
@@ -10506,16 +10516,22 @@ export class Gateway {
         // 需清理;queue lifecycle 清理只挂在下方非 dctx 路径。
         const dctx = getDispatchContext(frame as object)
         if (dctx) {
+          // 活标记先于 INSERT queued:恢复 sweep 扫到的行若在飞必已带标记(无竞态窗);
+          // 受理失败/重复到达在下方各早退口注销,执行 settle 在 finally 注销。
+          markTurnDispatchLive(dctx.dispatchId, dctx.attemptNo)
           let admitted: { inserted: boolean; row: Awaited<ReturnType<typeof admitTurnDispatch>>['row'] }
           try {
             admitted = await admitTurnDispatch({ ctx: dctx })
           } catch (err) {
             // 受理事务异常 = 拒轮(可重试),不半受理。不建 inbox 行 → 无孤儿。
+            unmarkTurnDispatchLive(dctx.dispatchId, dctx.attemptNo)
             this.log.error('turn dispatch admit failed', { dispatchId: dctx.dispatchId }, err as Error)
             return
           }
           if (!admitted.inserted) {
             // 重复到达(transport retry / 双 master):回现有行状态,绝不二次执行(I2)。
+            // 本次到达没有开启执行 → 立即注销本次标记(若首达仍在执行,其自己的标记还在)。
+            unmarkTurnDispatchLive(dctx.dispatchId, dctx.attemptNo)
             this._sendTurnDispatchReceipt(ws, dctx, admitted.row)
             return
           }
@@ -10535,6 +10551,9 @@ export class Gateway {
             }).catch((err) =>
               this.log.warn('turn dispatch orphan reject failed', { dispatchId: dctx.dispatchId }, err),
             )
+            // 执行链路 settle,行已终局侧(sink_staged/rejected/terminal;泄漏 running 属
+            // 异常残留)→ 注销活标记,后续交给 sweep/boot 按协议收敛。
+            unmarkTurnDispatchLive(dctx.dispatchId, dctx.attemptNo)
           }
           return
         }
