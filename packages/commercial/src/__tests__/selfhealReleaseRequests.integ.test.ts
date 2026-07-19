@@ -861,9 +861,10 @@ describe("§6.3 admin 读接口 + fuse clear", () => {
       ...adminInput(), expectedReleaseRequestId: epochB,
     })).outcome, "cleared");
 
-    await releaseCallback(repairId, "failed", {
+    const lateReplay = await releaseCallback(repairId, "failed", {
       releaseRequestId: epochA, releasePhase: "deploy_unknown", reason: "late A replay",
     });
+    assert.equal(lateReplay.status, 200, "已裁决 epoch 的迟到 receipt 必须幂等成功而非内部 500");
     assert.equal(await fuseEngaged(), false, "A tombstone 永久阻止旧 callback 复活");
     const tombstones = await query<{ n: string }>(
       `SELECT COUNT(*)::text AS n FROM selfheal_release_fuse_epochs

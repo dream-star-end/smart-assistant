@@ -469,8 +469,9 @@ async function materializeLegacyFuseProjection(
     `INSERT INTO selfheal_release_fuse_epochs
        (release_request_id, reason, engaged_at, engaged_by,
         cleared_at, cleared_by, clear_reason, personal_ack_at)
-     VALUES ($1, $2, COALESCE($3, $5), COALESCE($4, 'legacy:pre-0174'),
-             $5, COALESCE($6, 'legacy:pre-0174'),
+     VALUES ($1, $2, COALESCE($3::timestamptz, $5::timestamptz),
+             COALESCE($4, 'legacy:pre-0174'),
+             $5::timestamptz, COALESCE($6, 'legacy:pre-0174'),
              'materialized from pre-0174 release fuse', $7)
      ON CONFLICT (release_request_id) DO UPDATE
        SET cleared_at = COALESCE(selfheal_release_fuse_epochs.cleared_at, EXCLUDED.cleared_at),
