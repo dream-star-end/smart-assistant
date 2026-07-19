@@ -10,6 +10,7 @@ import { describe, test } from 'node:test'
 import { type OcConnectDeps, runOcConnectCli } from '../ocConnectCli.js'
 import {
   CONNECTOR_BAD_RESPONSE,
+  CONNECTOR_NO_CONTAINER_TOKEN,
   CONNECTOR_NO_MASTER_BASE,
   CONNECTOR_RPC_HTTP,
   CONNECTOR_RPC_TIMEOUT,
@@ -557,6 +558,101 @@ describe('ocConnectorsClient.callConnectors', () => {
     assert.deepEqual(json, { connections: [] })
   })
 
+  test('scrubbed Codex env falls back to the paired container-auth file for both surfaces', async () => {
+    const seen: Array<{ url: string; authorization: string | null }> = []
+    const fetchImpl = (async (url: any, init: any) => {
+      seen.push({
+        url: String(url),
+        authorization: new Headers(init.headers).get('authorization'),
+      })
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    const readFile = (path: string) => {
+      assert.equal(path, '/home/agent/.openclaude/container-auth.json')
+      return JSON.stringify({
+        masterBaseUrl: 'http://master.from-file:18892///',
+        containerToken: 'token-from-file',
+      })
+    }
+
+    await callConnectors(
+      'list',
+      {},
+      {
+        env: { HOME: '/home/agent' },
+        fetchImpl,
+        readFile,
+      },
+    )
+    await callConnectors(
+      'list',
+      {},
+      {
+        env: { HOME: '/home/agent' },
+        fetchImpl,
+        readFile,
+        surface: 'plugins',
+      },
+    )
+
+    assert.deepEqual(seen, [
+      {
+        url: 'http://master.from-file:18892/v3/connectors/list',
+        authorization: 'Bearer token-from-file',
+      },
+      {
+        url: 'http://master.from-file:18892/v3/plugins/list',
+        authorization: 'Bearer token-from-file',
+      },
+    ])
+  })
+
+  test('partial direct credentials never mix with the paired container-auth file', async () => {
+    const seen: Array<{ url: string; authorization: string | null }> = []
+    const fetchImpl = (async (url: any, init: any) => {
+      seen.push({
+        url: String(url),
+        authorization: new Headers(init.headers).get('authorization'),
+      })
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    const readFile = () =>
+      JSON.stringify({
+        masterBaseUrl: 'http://paired-master',
+        containerToken: 'paired-token',
+      })
+
+    await callConnectors(
+      'list',
+      {},
+      {
+        env: {
+          HOME: '/home/agent',
+          OPENCLAUDE_V3_MASTER_BASE_URL: 'http://unpaired-env-master',
+        },
+        fetchImpl,
+        readFile,
+      },
+    )
+    await callConnectors(
+      'list',
+      {},
+      {
+        env: {
+          HOME: '/home/agent',
+          OPENCLAUDE_V3_CONTAINER_TOKEN: 'unpaired-env-token',
+        },
+        fetchImpl,
+        readFile,
+      },
+    )
+
+    assert.deepEqual(seen, [
+      { url: 'http://paired-master/v3/connectors/list', authorization: 'Bearer paired-token' },
+      { url: 'http://paired-master/v3/connectors/list', authorization: 'Bearer paired-token' },
+    ])
+  })
+
   test('non-2xx → CONNECTOR_RPC_HTTP with status only (body swallowed)', async () => {
     const fetchImpl = (async () =>
       new Response('secret upstream detail', { status: 502 })) as typeof fetch
@@ -593,8 +689,48 @@ describe('ocConnectorsClient.callConnectors', () => {
 
   test('missing master base → CONNECTOR_NO_MASTER_BASE', async () => {
     await assert.rejects(
-      () => callConnectors('list', {}, { env: {} }),
+      () =>
+        callConnectors(
+          'list',
+          {},
+          {
+            env: {},
+            readFile: () => {
+              throw new Error('missing')
+            },
+          },
+        ),
       (e: any) => e instanceof ConnectorError && e.code === CONNECTOR_NO_MASTER_BASE,
+    )
+  })
+
+  test('malformed or incomplete auth file fails closed with stable missing-field errors', async () => {
+    await assert.rejects(
+      () =>
+        callConnectors(
+          'list',
+          {},
+          {
+            env: { HOME: '/home/agent' },
+            readFile: () => '{not-json',
+          },
+        ),
+      (e: any) => e instanceof ConnectorError && e.code === CONNECTOR_NO_MASTER_BASE,
+    )
+    await assert.rejects(
+      () =>
+        callConnectors(
+          'list',
+          {},
+          {
+            env: {
+              HOME: '/home/agent',
+              OPENCLAUDE_V3_MASTER_BASE_URL: 'http://direct-master',
+            },
+            readFile: () => JSON.stringify({ masterBaseUrl: 7, containerToken: 'file-token' }),
+          },
+        ),
+      (e: any) => e instanceof ConnectorError && e.code === CONNECTOR_NO_CONTAINER_TOKEN,
     )
   })
 })
