@@ -290,6 +290,37 @@ describe("A2 resolveIncident → 活跃修复 cancel_requested(verifying 不动)
     return { incidentId: inc.rows[0].id, repairId: rep.rows[0].id };
   }
 
+  async function insertBoundReleaseRequest(
+    repairId: string,
+    incidentId: string,
+    status: "queued" | "accepted" | "deploying",
+    delivered = false,
+  ): Promise<void> {
+    const approvedSha = "a".repeat(40);
+    const planHash = "b".repeat(64);
+    const manifestHash = "c".repeat(64);
+    const event = await query<{ id: string }>(
+      `INSERT INTO codex_repair_events (repair_id, kind, message, detail)
+       VALUES ($1::bigint, 'progress', 'test pending release', $2::jsonb)
+       RETURNING id::text AS id`,
+      [repairId, JSON.stringify({
+        phase: "pending_release",
+        sha: approvedSha,
+        deployPlanHash: planHash,
+        manifestHash,
+        classification: { surfaces: ["master"] },
+      })],
+    );
+    await query(
+      `INSERT INTO selfheal_release_requests
+         (repair_id, incident_id, requested_by, approved_sha, status,
+          deploy_plan_hash, manifest_hash, plan_detail, source_event_id, delivered_at)
+       VALUES ($1::bigint, $2::bigint, '1', $3, $4, $5, $6, '{}'::jsonb,
+               $7::bigint, CASE WHEN $8::boolean THEN NOW() ELSE NULL END)`,
+      [repairId, incidentId, approvedSha, status, planHash, manifestHash, event.rows[0].id, delivered],
+    );
+  }
+
   for (const st of ["pending", "dispatched", "acked", "running"]) {
     test(`${st} → cancel_requested + repair_event(kind=cancel)`, async (t) => {
       if (skipIfNoPg(t)) return;
@@ -315,12 +346,7 @@ describe("A2 resolveIncident → 活跃修复 cancel_requested(verifying 不动)
   test("批1b:deploying release request 的 running repair:resolve 不取消(receipt 裁决)", async (t) => {
     if (skipIfNoPg(t)) return;
     const { incidentId, repairId } = await seedIncidentWithRepair("running");
-    await query(
-      `INSERT INTO selfheal_release_requests
-         (repair_id, incident_id, requested_by, approved_sha, status)
-       VALUES ($1::bigint, $2::bigint, '1', $3, 'deploying')`,
-      [repairId, incidentId, "a".repeat(40)],
-    );
+    await insertBoundReleaseRequest(repairId, incidentId, "deploying");
     await tx((client: PoolClient) => resolveIncident(incidentId, "probe", client));
     const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
     assert.equal(r.rows[0].status, "running", "deploying 在途 → resolve 不取消 repair,交 receipt 裁决");
@@ -334,12 +360,7 @@ describe("A2 resolveIncident → 活跃修复 cancel_requested(verifying 不动)
     // queued(delivered_at NULL,个人版从未收到)→ 乐观撤单安全,同事务直接置 cancelled。
     {
       const { incidentId, repairId } = await seedIncidentWithRepair("running");
-      await query(
-        `INSERT INTO selfheal_release_requests
-           (repair_id, incident_id, requested_by, approved_sha, status)
-         VALUES ($1::bigint, $2::bigint, '1', $3, 'queued')`,
-        [repairId, incidentId, "a".repeat(40)],
-      );
+      await insertBoundReleaseRequest(repairId, incidentId, "queued");
       await tx((client: PoolClient) => resolveIncident(incidentId, "admin", client));
       const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
       assert.equal(r.rows[0].status, "cancel_requested", "queued:repair → cancel_requested");
@@ -353,12 +374,7 @@ describe("A2 resolveIncident → 活跃修复 cancel_requested(verifying 不动)
     // 交 sweeper postCancel 的 releaseCancel 裁决收口;repair 仍进 cancel 流。
     {
       const { incidentId, repairId } = await seedIncidentWithRepair("running");
-      await query(
-        `INSERT INTO selfheal_release_requests
-           (repair_id, incident_id, requested_by, approved_sha, status, delivered_at)
-         VALUES ($1::bigint, $2::bigint, '1', $3, 'accepted', NOW())`,
-        [repairId, incidentId, "a".repeat(40)],
-      );
+      await insertBoundReleaseRequest(repairId, incidentId, "accepted", true);
       await tx((client: PoolClient) => resolveIncident(incidentId, "admin", client));
       const r = await query<{ status: string }>(`SELECT status FROM codex_repairs WHERE id=$1::bigint`, [repairId]);
       assert.equal(r.rows[0].status, "cancel_requested", "accepted:repair 仍进 cancel 流");

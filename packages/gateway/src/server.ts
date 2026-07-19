@@ -124,6 +124,7 @@ import {
   listUnclaimedSessions,
   claimSession,
   probeSessionsDb,
+  countRuntimeRecycleUnsafeTurnDispatches,
   turnDispatchInboxStats,
 } from '@openclaude/storage'
 import {
@@ -299,15 +300,18 @@ import {
   getDispatchContext,
   getTurnDispatchState,
   getTurnDispatchStateByDispatch,
-  inboxReject,
   inboxSinkStageFailedByDispatch,
   inboxSinkStagedByDispatch,
+  isInboundBypassMethodAllowed,
+  isTurnDispatchLive,
   normalizeDispatchUserId,
   queryMasterTapeState,
   recoverTurnDispatchInboxOnBoot,
   rejectTurnDispatchIfAbsent,
   resolveInboxTerminalAck,
+  runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
+import { RuntimeRecycleDrainCoordinator } from './runtimeRecycleDrain.js'
 import {
   LocalExecutionRejected,
   ModelCatalogUnavailableError,
@@ -1404,6 +1408,12 @@ export function resolveDelegateParentClientSessionId(args: {
   return webchat?.[1] ?? key
 }
 
+export function _parseHistoryRevisionCursor(raw: string | null): number | undefined {
+  if (raw === null || !/^(0|[1-9]\d*)$/.test(raw)) return undefined
+  const parsed = Number(raw)
+  return Number.isSafeInteger(parsed) ? parsed : undefined
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -1461,6 +1471,7 @@ export class Gateway {
   /** Host-controlled stale-image barrier: covers dispatch preprocessing. */
   private _runtimeRecycleDrainUntil = 0
   private _runtimeRecycleIngressActive = 0
+  private _runtimeRecycleDrainCoordinator: RuntimeRecycleDrainCoordinator | null = null
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, {
@@ -3102,21 +3113,43 @@ export class Gateway {
         return
       }
       const ttlMs = 10_000
-      this._runtimeRecycleDrainUntil = Date.now() + ttlMs
-      const sessionDrain = this.sessions.armRuntimeRecycleDrain(ttlMs)
-      const activeIngress = this._runtimeRecycleIngressActive
-      if (!sessionDrain.accepted || activeIngress > 0) {
-        this._runtimeRecycleDrainUntil = 0
-        this.sessions.releaseRuntimeRecycleDrain()
-        this.sendJson(res, 409, {
-          ok: false,
-          reason: 'active_turn',
-          activeIngress,
-          activeTurns: sessionDrain.activeTurns,
+      let coordinator = this._runtimeRecycleDrainCoordinator
+      if (coordinator === null) {
+        coordinator = new RuntimeRecycleDrainCoordinator({
+          ttlMs,
+          now: () => Date.now(),
+          armGatewayDrain: (until) => {
+            this._runtimeRecycleDrainUntil = until
+          },
+          isGatewayDrainActive: (now) => this._runtimeRecycleDrainUntil > now,
+          releaseGatewayDrain: () => {
+            this._runtimeRecycleDrainUntil = 0
+          },
+          armSessionDrain: (ttl) => this.sessions.armRuntimeRecycleDrain(ttl),
+          isSessionDrainActive: (now) => this.sessions.isRuntimeRecycleDraining(now),
+          releaseSessionDrain: () => this.sessions.releaseRuntimeRecycleDrain(),
+          activeIngress: () => this._runtimeRecycleIngressActive,
+          countDurableRunning: () => countRuntimeRecycleUnsafeTurnDispatches(),
         })
-        return
+        this._runtimeRecycleDrainCoordinator = coordinator
       }
-      this.sendJson(res, 200, { ok: true, drainTtlMs: ttlMs })
+      void coordinator.attempt().then(
+        (decision) => {
+          if (decision.ok) {
+            this.sendJson(res, 200, { ok: true, drainTtlMs: decision.drainTtlMs })
+            return
+          }
+          this.sendJson(res, decision.status, decision)
+        },
+        (err) => {
+          // Unexpected callback failure is still fail-closed: never leave a
+          // half-armed drain or let the supervisor interpret it as accepted.
+          this._runtimeRecycleDrainUntil = 0
+          this.sessions.releaseRuntimeRecycleDrain()
+          this.log.error('runtime recycle drain evaluation failed', undefined, err as Error)
+          this.sendJson(res, 503, { ok: false, reason: 'drain_state_unavailable' })
+        },
+      )
       return
     }
 
@@ -3636,9 +3669,17 @@ export class Gateway {
         // `since` fall back to the full payload via `isPartial: false`.
         const sinceRaw = url.searchParams.get('since')
         const sinceSeq = sinceRaw !== null ? Number(sinceRaw) : 0
+        const historyRevisionRaw = url.searchParams.get('since_history_revision')
+        // Missing/invalid rolling-client revisions are intentionally not a
+        // 400: storage treats them as a revision mismatch and returns a full
+        // payload, which self-heals old clients without a coordinated cutover.
+        const sinceHistoryRevision = _parseHistoryRevisionCursor(historyRevisionRaw)
         const useIncremental = Number.isFinite(sinceSeq) && sinceSeq > 0
         if (useIncremental) {
-          getClientSessionPartial(sessId, userId, sinceSeq, { projection: 'chat' })
+          getClientSessionPartial(sessId, userId, sinceSeq, {
+            projection: 'chat',
+            sinceHistoryRevision,
+          })
             .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
             .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
         } else {
@@ -4455,7 +4496,7 @@ export class Gateway {
     if (!/^[A-Za-z0-9_-]{43}$/.test(INBOUND_NONCE)) return false
     const remoteIp = req.socket.remoteAddress || ''
     if (remoteIp !== TRUST_BRIDGE_IP && remoteIp !== `::ffff:${TRUST_BRIDGE_IP}`) return false
-    if ((req.method || '') !== 'POST') return false
+    if (!isInboundBypassMethodAllowed(req.method || '', url.pathname)) return false
     // Phase 1 只用一个端点,但前缀放开方便后续 broker → 容器扩控制面(notify-user 等)。
     // 任何不以 /internal/v3/ 开头的路径直接拒,确保 bypass 不会泄到其它路由。
     if (!url.pathname.startsWith('/internal/v3/')) return false
@@ -10002,6 +10043,8 @@ export class Gateway {
       retryQueueHasDispatch: (dispatchId, attemptNo) =>
         queue.hasEntryForDispatch(dispatchId, attemptNo),
       queryMasterTapeState: (dispatchId, attemptNo) => queryMasterTapeState(dispatchId, attemptNo),
+      // 活执行行一律跳过(§B4 周期 sweep 防误杀在飞 turn);boot 首跑注册表恒空,语义不变。
+      isDispatchLive: (dispatchId, attemptNo) => isTurnDispatchLive(dispatchId, attemptNo),
       stageSyntheticCrashedTape: async (row) => {
         const payload = buildSyntheticCrashedTapePayload(row)
         // stageDurable 只需 wire payload;tape 分片在 drain 时由 attemptSend 现算。
@@ -10055,7 +10098,12 @@ export class Gateway {
     queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
   ): void {
     if (this._turnDispatchRecoveryTimer) return
-    const RETRY_MS = 60_000
+    // e2e 用 OC_TURN_DISPATCH_SWEEP_MS 压缩 tick 周期复现"sweep 撞在飞 turn"场景;
+    // 生产不设 → 60s。clamp 防误配(过小空转,过大失去收敛时效)。
+    const envMs = Number(process.env.OC_TURN_DISPATCH_SWEEP_MS)
+    const RETRY_MS = Number.isFinite(envMs) && envMs > 0
+      ? Math.min(Math.max(envMs, 1_000), 600_000)
+      : 60_000
     this._turnDispatchRecoveryTimer = setInterval(() => {
       void (async () => {
         try {
@@ -10506,36 +10554,28 @@ export class Gateway {
         // 需清理;queue lifecycle 清理只挂在下方非 dctx 路径。
         const dctx = getDispatchContext(frame as object)
         if (dctx) {
-          let admitted: { inserted: boolean; row: Awaited<ReturnType<typeof admitTurnDispatch>>['row'] }
-          try {
-            admitted = await admitTurnDispatch({ ctx: dctx })
-          } catch (err) {
-            // 受理事务异常 = 拒轮(可重试),不半受理。不建 inbox 行 → 无孤儿。
-            this.log.error('turn dispatch admit failed', { dispatchId: dctx.dispatchId }, err as Error)
-            return
-          }
-          if (!admitted.inserted) {
-            // 重复到达(transport retry / 双 master):回现有行状态,绝不二次执行(I2)。
-            this._sendTurnDispatchReceipt(ws, dctx, admitted.row)
-            return
-          }
-          // B2:**首次受理(INSERT queued fsync 成功)后立即回发 receipt**(state='queued'),
-          // bridge 据此 CAS dispatch accepted 并放下 lease —— 不能等到"重复帧"才回执,否则单发
-          // 场景下 master 永远收不到 receipt,dispatch 悬在 admitted 直到 reconciler 兜底。
-          this._sendTurnDispatchReceipt(ws, dctx, admitted.row)
-          try {
-            await this.dispatchInbound(frame)
-          } finally {
-            // 行仍 queued(rate-limit / agent 不存在 / 异常早退,从未 running)→ CAS
-            // rejected(not_accepted);running+ 则 CAS 落空 no-op(fail-visible I1)。
-            await inboxReject({
-              userId: dctx.uid,
-              sessionId: dctx.sessionId,
-              clientMessageId: dctx.clientMessageId,
-            }).catch((err) =>
-              this.log.warn('turn dispatch orphan reject failed', { dispatchId: dctx.dispatchId }, err),
-            )
-          }
+          // 单一生产 helper 锁住 mark→INSERT→首次 receipt→dispatch→finally unmark
+          // 全顺序;周期 sweep 的压缩 tick 回归直接走同一条接线。
+          await runDurableDispatchAdmission({
+            ctx: dctx,
+            sendReceipt: (row) => this._sendTurnDispatchReceipt(ws, dctx, row),
+            dispatch: () => this.dispatchInbound(frame),
+            onAdmitError: (err) => {
+              // 受理事务异常 = 拒轮(可重试),不半受理。不建 inbox 行 → 无孤儿。
+              this.log.error(
+                'turn dispatch admit failed',
+                { dispatchId: dctx.dispatchId },
+                err as Error,
+              )
+            },
+            onOrphanRejectError: (err) => {
+              this.log.warn(
+                'turn dispatch orphan reject failed',
+                { dispatchId: dctx.dispatchId },
+                err,
+              )
+            },
+          })
           return
         }
         try {

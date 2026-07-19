@@ -55,6 +55,10 @@ vi.mock("../../lib/api", async (importOriginal) => {
       getKnowledgePlanetSetup: vi.fn(),
       getKnowledgePlanetSetupQr: vi.fn(),
       cancelKnowledgePlanetSetup: vi.fn(),
+      startWeiboSetup: vi.fn(),
+      getWeiboSetup: vi.fn(),
+      getWeiboSetupQr: vi.fn(),
+      cancelWeiboSetup: vi.fn(),
       revokePluginAccount: vi.fn(),
       setPluginWriteAccess: vi.fn(),
       setPluginWritePreapproval: vi.fn(),
@@ -90,6 +94,10 @@ const mockedKnowledgeStart = vi.mocked(api.startKnowledgePlanetSetup)
 const mockedKnowledgeStatus = vi.mocked(api.getKnowledgePlanetSetup)
 const mockedKnowledgeQr = vi.mocked(api.getKnowledgePlanetSetupQr)
 const mockedKnowledgeCancel = vi.mocked(api.cancelKnowledgePlanetSetup)
+const mockedWeiboStart = vi.mocked(api.startWeiboSetup)
+const mockedWeiboStatus = vi.mocked(api.getWeiboSetup)
+const mockedWeiboQr = vi.mocked(api.getWeiboSetupQr)
+const mockedWeiboCancel = vi.mocked(api.cancelWeiboSetup)
 const mockedPluginRevoke = vi.mocked(api.revokePluginAccount)
 const mockedSetPluginWriteAccess = vi.mocked(api.setPluginWriteAccess)
 const mockedSetPluginWritePreapproval = vi.mocked(api.setPluginWritePreapproval)
@@ -308,6 +316,28 @@ function knowledgePlanetPlugin() {
   }
 }
 
+function weiboPlugin() {
+  return {
+    versionId: '301',
+    slug: 'weibo',
+    pluginType: 'managed-browser' as const,
+    label: '微博',
+    description: '通过受管浏览器读取微博，并在逐次确认后执行常用写操作',
+    accountMode: 'required' as const,
+    actions: [
+      { id: 'list_home_posts', description: '读取首页微博', readOnly: true as const },
+      { id: 'create_post', description: '发布微博', readOnly: false as const },
+    ],
+    installed: true,
+    installedVersion: '1.1.0',
+    latestVersionId: '301',
+    latestVersion: '1.1.0',
+    installedCurrent: true,
+    updateAvailable: false,
+    available: true,
+  }
+}
+
 function knowledgePlanetWriteControl(
   overrides: Partial<NonNullable<RuntimePluginAccount['writeControl']>> = {},
 ): NonNullable<RuntimePluginAccount['writeControl']> {
@@ -327,6 +357,30 @@ function knowledgePlanetWriteControl(
       acceptedAt: null,
       disclaimerText:
         '开启后所有 Agent 可直接发布、上传媒体、点赞、编辑和永久删除，不再展示逐次确认卡。',
+    },
+    ...overrides,
+  }
+}
+
+function weiboWriteControl(
+  overrides: Partial<NonNullable<RuntimePluginAccount['writeControl']>> = {},
+): NonNullable<RuntimePluginAccount['writeControl']> {
+  return {
+    available: true,
+    enabled: false,
+    disclaimerVersion: 2,
+    acceptedVersion: null,
+    acceptedAt: null,
+    disclaimerText:
+      '开启后会以你的真实微博身份发布、编辑、删除、评论、回复、转发、点赞或关注；默认逐次确认。',
+    preapproval: {
+      available: true,
+      enabled: false,
+      disclaimerVersion: 1,
+      acceptedVersion: null,
+      acceptedAt: null,
+      disclaimerText:
+        '开启后所有 Agent 可直接发布微博、评论、回复、转发、点赞、关注、编辑和永久删除，不再展示逐次确认卡。',
     },
     ...overrides,
   }
@@ -1081,6 +1135,95 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
   })
 
+  test('微博使用微博客户端扫码，并提供可单独打开的实时二维码链接', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [weiboPlugin()], accounts: [] })
+    mockedWeiboStart.mockResolvedValue({
+      sessionId: '33333333-3333-4333-8333-333333333333',
+      status: 'waiting_for_scan',
+      qrReady: true,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    })
+    mockedWeiboStatus.mockImplementation(() => new Promise(() => {}))
+    mockedWeiboQr.mockResolvedValue(new Blob(['png'], { type: 'image/png' }))
+    mockedWeiboCancel.mockResolvedValue({
+      sessionId: '33333333-3333-4333-8333-333333333333',
+      status: 'cancelled',
+      qrReady: false,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    })
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:weibo-qr'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('微博')
+    fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('授权微博')).toBeInTheDocument()
+    expect(within(dialog).getByText(/微博客户端扫码一次即可复用登录/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(await within(dialog).findByAltText('微博登录二维码')).toHaveAttribute(
+      'src',
+      'blob:weibo-qr',
+    )
+    expect(within(dialog).getByRole('link', { name: '单独打开二维码' })).toHaveAttribute(
+      'target',
+      '_blank',
+    )
+    expect(mockedWeiboStart).toHaveBeenCalledWith(auth)
+    expect(mockedWeiboQr).toHaveBeenCalledWith(auth, '33333333-3333-4333-8333-333333333333')
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }))
+    await waitFor(() =>
+      expect(mockedWeiboCancel).toHaveBeenCalledWith(auth, '33333333-3333-4333-8333-333333333333'),
+    )
+  })
+
+  test('知识星球二维码 revision 更新时替换过期图片并回收旧 object URL', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    const base = {
+      sessionId: '12121212-1212-4212-8212-121212121212',
+      status: 'waiting_for_scan' as const,
+      phase: 'waiting_for_scan' as const,
+      qrReady: true,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      expiresAt: '2026-07-18T00:04:00.000Z',
+    }
+    mockedKnowledgeStart.mockResolvedValue({ ...base, qrRevision: 1 })
+    mockedKnowledgeStatus.mockResolvedValue({ ...base, qrRevision: 2 })
+    mockedKnowledgeQr
+      .mockResolvedValueOnce(new Blob(['qr-1'], { type: 'image/png' }))
+      .mockResolvedValueOnce(new Blob(['qr-2'], { type: 'image/png' }))
+    const createObjectUrl = vi
+      .fn()
+      .mockReturnValueOnce('blob:knowledge-planet-qr-1')
+      .mockReturnValueOnce('blob:knowledge-planet-qr-2')
+    const revokeObjectUrl = vi.fn()
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    const qr = await within(dialog).findByAltText('知识星球微信登录二维码')
+    expect(qr).toHaveAttribute('src', 'blob:knowledge-planet-qr-1')
+    await waitFor(
+      () => expect(qr).toHaveAttribute('src', 'blob:knowledge-planet-qr-2'),
+      { timeout: 3_000 },
+    )
+    expect(mockedKnowledgeQr).toHaveBeenCalledTimes(2)
+    expect(revokeObjectUrl).toHaveBeenCalledWith('blob:knowledge-planet-qr-1')
+  })
+
   test('市场安装后一次性自动打开知识星球授权弹层', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
@@ -1384,6 +1527,79 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       }),
     )
     expect(await screen.findByText(/“免逐次确认”已开启/)).toBeInTheDocument()
+  })
+
+  test('微博展示账号级免逐次确认，独立同意后开启且可直接关闭', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const base = weiboWriteControl({
+      enabled: true,
+      acceptedVersion: 2,
+      acceptedAt: '2026-07-19T01:02:03.000Z',
+    })
+    const enabled = weiboWriteControl({
+      ...base,
+      preapproval: {
+        ...base.preapproval!,
+        enabled: true,
+        acceptedVersion: 1,
+        acceptedAt: '2026-07-19T03:04:05.000Z',
+      },
+    })
+    const account: RuntimePluginAccount = {
+      id: '3',
+      provider: 'weibo',
+      pluginType: 'managed-browser',
+      displayName: '我的微博',
+      accountHint: '微博扫码账号',
+      status: 'active',
+      actions: weiboPlugin().actions,
+      versionId: '301',
+      executable: true,
+      writeControl: base,
+    }
+    mockedPluginManagement
+      .mockResolvedValueOnce({ catalog: [weiboPlugin()], accounts: [account] })
+      .mockResolvedValueOnce({
+        catalog: [weiboPlugin()],
+        accounts: [{ ...account, writeControl: enabled }],
+      })
+      .mockResolvedValue({ catalog: [weiboPlugin()], accounts: [account] })
+    mockedSetPluginWritePreapproval
+      .mockResolvedValueOnce(enabled)
+      .mockResolvedValueOnce(base)
+
+    render(<ConnectorsTab auth={auth} />)
+    expect(
+      await screen.findByText('开启后，Agent 可直接执行此 Plugin 的全部已开放写入动作；默认关闭。'),
+    ).toBeInTheDocument()
+    const preapprovalSwitch = screen.getByRole('switch', { name: '我的微博免逐次确认' })
+    expect(preapprovalSwitch).not.toBeChecked()
+    fireEvent.click(preapprovalSwitch)
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/直接执行微博写入/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/发布微博、评论、回复、转发、点赞、关注/)).toBeInTheDocument()
+    const enable = within(dialog).getByRole('button', { name: '同意并开启' })
+    expect(enable).toBeDisabled()
+    fireEvent.click(within(dialog).getByRole('checkbox'))
+    fireEvent.click(enable)
+
+    await waitFor(() =>
+      expect(mockedSetPluginWritePreapproval).toHaveBeenCalledWith(auth, '3', {
+        enabled: true,
+        accepted: true,
+        disclaimerVersion: 1,
+      }),
+    )
+    expect(await screen.findByText(/微博“免逐次确认”已开启/)).toBeInTheDocument()
+    await waitFor(() => expect(preapprovalSwitch).toBeChecked())
+    fireEvent.click(preapprovalSwitch)
+    await waitFor(() =>
+      expect(mockedSetPluginWritePreapproval).toHaveBeenLastCalledWith(auth, '3', {
+        enabled: false,
+      }),
+    )
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   test('开启写入失败时在免责声明弹层内说明错误且不乐观翻转', async () => {

@@ -1334,6 +1334,8 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   // 应用连接器:输出含 confirmation_required 触发对象 → 写操作确认卡(human-in-the-loop);
   // 其余输出(list/读操作)→ null 兜底 GenericOcCard。实现在 connectorCards.tsx。
   "oc-connect": (_c, t) => connectorToolCard(t),
+  // 市场 Plugin 使用与应用连接器相同的确认账本输出契约。
+  "oc-plugin": (_c, t) => connectorToolCard(t),
 };
 
 /**
@@ -1348,9 +1350,13 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
  */
 /** 失败时仍走专属卡的 CLI(卡内自渲染失败状态 + 原因,如 oc-browser 提取首个 Error 行);
  *  其余 CLI 的专属卡不感知 error,失败一律 GenericOcCard 兜底,避免错误输出被当正常结果解析。
- *  oc-connect:即便 CLI 以非零退出码提示"需要确认",输出里的确认触发对象也必须渲染成
+ *  oc-connect/oc-plugin:即便 CLI 以非零退出码提示"需要确认",输出里的确认触发对象也必须渲染成
  *  确认卡(解析不出才落 GenericOcCard error)。 */
-const ERROR_AWARE_OC_CARDS: ReadonlySet<OcCli> = new Set<OcCli>(["oc-browser", "oc-connect"]);
+const ERROR_AWARE_OC_CARDS: ReadonlySet<OcCli> = new Set<OcCli>([
+  "oc-browser",
+  "oc-connect",
+  "oc-plugin",
+]);
 
 export function researchToolCard(command: string, tool: ToolLike): ReactNode | null {
   if (!command) return null;

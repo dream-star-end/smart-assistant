@@ -207,6 +207,52 @@ export function buildWriteSummary(
         `用知识星球${hint}把评论 ${String(params.commentId ?? '')} 设置为${params.liked === true ? '已点赞' : '未点赞'}`,
         2000,
       )
+
+    case 'weibo/create_post': {
+      const text = String(params.text ?? '')
+      const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
+      return ellipsize(
+        `用微博${hint}发布微博（${media.length} 张图片）：「${ellipsize(text, 300)}」`,
+        2000,
+      )
+    }
+    case 'weibo/edit_post':
+      return ellipsize(
+        `用微博${hint}编辑微博 ${String(params.postId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'weibo/delete_post':
+      return ellipsize(`用微博${hint}永久删除微博 ${String(params.postId ?? '')}（不可撤销）`, 2000)
+    case 'weibo/create_comment':
+      return ellipsize(
+        `用微博${hint}评论微博 ${String(params.postId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'weibo/reply_comment':
+      return ellipsize(
+        `用微博${hint}回复评论 ${String(params.commentId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'weibo/delete_comment':
+      return ellipsize(
+        `用微博${hint}永久删除评论 ${String(params.commentId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'weibo/repost_post':
+      return ellipsize(
+        `用微博${hint}转发微博 ${String(params.postId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'weibo/set_post_like':
+      return ellipsize(
+        `用微博${hint}把微博 ${String(params.postId ?? '')} 设置为${params.liked === true ? '已点赞' : '未点赞'}`,
+        2000,
+      )
+    case 'weibo/set_following':
+      return ellipsize(
+        `用微博${hint}把用户 ${String(params.userId ?? '')} 设置为${params.following === true ? '已关注' : '未关注'}`,
+        2000,
+      )
     default:
       return ellipsize(`${provider} 写操作 ${action}`, 2000)
   }
@@ -289,9 +335,9 @@ export function buildWriteDetail(
         text: String(params.text ?? ''),
         preserveExistingMedia: params.preserveExistingMedia !== false,
         existingImageIds:
-          (params.editSnapshot as Record<string, unknown> | undefined)?.imageIds ?? [],
+          (params.editSnapshot as Record<string, unknown> | undefined)?.keepImageIds ?? [],
         existingFileIds:
-          (params.editSnapshot as Record<string, unknown> | undefined)?.fileIds ?? [],
+          (params.editSnapshot as Record<string, unknown> | undefined)?.keepFileIds ?? [],
         media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
         warning: '知识星球主题编辑是完整替换；最终校验与写入之间仍存在极短竞态窗口。',
       }
@@ -321,6 +367,65 @@ export function buildWriteDetail(
         kind: 'knowledge_planet_comment_like',
         commentId: String(params.commentId ?? ''),
         liked: params.liked === true,
+      }
+
+    case 'weibo/create_post':
+      return {
+        kind: 'weibo_post',
+        text: String(params.text ?? ''),
+        media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
+      }
+    case 'weibo/edit_post':
+      return {
+        kind: 'weibo_post_edit',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        text: String(params.text ?? ''),
+        warning: '微博正文将被修改；最终复核与网页点击之间仍存在极短竞态窗口。',
+      }
+    case 'weibo/delete_post':
+      return {
+        kind: 'weibo_delete_post',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        irreversible: true,
+      }
+    case 'weibo/create_comment':
+    case 'weibo/reply_comment':
+      return {
+        kind: action === 'reply_comment' ? 'weibo_comment_reply' : 'weibo_comment',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        commentId: params.commentId ?? null,
+        text: String(params.text ?? ''),
+      }
+    case 'weibo/delete_comment':
+      return {
+        kind: 'weibo_delete_comment',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        commentId: String(params.commentId ?? ''),
+        irreversible: true,
+      }
+    case 'weibo/repost_post':
+      return {
+        kind: 'weibo_repost',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        text: String(params.text ?? ''),
+      }
+    case 'weibo/set_post_like':
+      return {
+        kind: 'weibo_post_like',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        liked: params.liked === true,
+      }
+    case 'weibo/set_following':
+      return {
+        kind: 'weibo_following',
+        userId: String(params.userId ?? ''),
+        following: params.following === true,
       }
     default:
       // 兜底:原样返回(params 本身已过严格 schema,无凭据)

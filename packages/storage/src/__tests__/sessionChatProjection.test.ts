@@ -40,6 +40,16 @@ describe('browser chat history projection', () => {
     assert.deepEqual(chat.map((row) => row.id), ['u1', 'a1', 'u2'])
   })
 
+  test('orders rows from one tape by record ordinal before their rollback-prone timestamps', () => {
+    const chat = projectClientSessionMessagesForChat([
+      { id: 'thinking', role: 'thinking', text: 'think', ts: 300, _orderSeq: 5, _turnTapeId: 't-1', _turnTapeOrdinal: 0 },
+      { id: 'tool', role: 'tool', text: 'tool', ts: 200, _orderSeq: 5, _turnTapeId: 't-1', _turnTapeOrdinal: 1 },
+      { id: 'answer', role: 'assistant', text: 'answer', ts: 100, _orderSeq: 5, _turnTapeId: 't-1', _turnTapeOrdinal: 2 },
+    ])
+
+    assert.deepEqual(chat.map((row) => row.id), ['thinking', 'tool', 'answer'])
+  })
+
   test('20k large hidden runtime rows collapse to one tiny checkpoint', () => {
     const blob = 'x'.repeat(4096)
     const exact = Array.from({ length: 20_000 }, (_, i) =>

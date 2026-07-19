@@ -43,6 +43,59 @@ function unauthorized() {
   return { ok: false, status: 401, headers: { get: () => null }, json: async () => ({}) }
 }
 
+test('getSession pairs since cursor with history revision and omits invalid revisions', async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ok({
+    id: 'web-session-1', messages: [], isPartial: true, maxSeq: 42, historyRevision: 7,
+  }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-history')
+
+  await api.getSession(session, 'web-session-1', 42, 7)
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+    '/api/sessions/web-session-1?since=42&since_history_revision=7',
+  )
+
+  fetchMock.mockClear()
+  await api.getSession(session, 'web-session-1', 42, -1)
+  expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/sessions/web-session-1?since=42')
+})
+
+test('getSession retries old incremental wire once as an unconditional full read', async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => {
+    if (fetchMock.mock.calls.length === 1) {
+      return ok({ id: 'web-session-1', messages: [], isPartial: true, maxSeq: 42 })
+    }
+    return ok({ id: 'web-session-1', messages: [{ role: 'user', content: 'full' }], isPartial: false })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-history-legacy')
+
+  const detail = await api.getSession(session, 'web-session-1', 42, 0)
+
+  expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
+    '/api/sessions/web-session-1?since=42&since_history_revision=0',
+    '/api/sessions/web-session-1',
+  ])
+  expect(detail).toMatchObject({
+    isPartial: false,
+    messages: [{ content: 'full' }],
+    _projectionRevisionUnsupported: true,
+  })
+})
+
+test('getSession marks an initial full response from a legacy projection backend', async () => {
+  const fetchMock = vi.fn(async () => ok({
+    id: 'web-session-1', messages: [], isPartial: false, maxSeq: 0,
+  }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-history-legacy-full')
+
+  const detail = await api.getSession(session, 'web-session-1')
+
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(detail._projectionRevisionUnsupported).toBe(true)
+})
+
 const ME_BODY = {
   user: {
     id: 'u1',

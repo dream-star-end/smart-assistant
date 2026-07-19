@@ -30,6 +30,12 @@ import {
   loadVerifiedRuntimePluginContract,
 } from '../plugins/review.js'
 import {
+  COMPILED_WEIBO_PLUGIN,
+  WEIBO_PLUGIN_SLUG,
+  WEIBO_PLUGIN_VERSION,
+  isOfficialWeiboPluginIdentity,
+} from '../plugins/weiboContract.js'
+import {
   lockMarketplaceListing,
   lockMarketplaceMutationSet,
   lockMarketplaceVersion,
@@ -574,7 +580,8 @@ async function publishSkillVersionInternal(
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
   if (
     isDefaultConnectorSlug(input.slug) ||
-    (input.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG && !allowOfficialKnowledgePlanetSeed)
+    ([KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG].includes(input.slug) &&
+      !allowOfficialKnowledgePlanetSeed)
   )
     throw new MarketplaceError(
       'SLUG_OWNED_BY_OTHER',
@@ -707,6 +714,26 @@ export async function publishOfficialKnowledgePlanetVersion(
     throw new MarketplaceError(
       'ARTIFACT_MISMATCH',
       'Knowledge Planet platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
+}
+
+/** Narrow platform-seed bypass for the exact version-controlled Weibo artifact. */
+export async function publishOfficialWeiboVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  if (
+    input.slug !== WEIBO_PLUGIN_SLUG ||
+    input.version !== WEIBO_PLUGIN_VERSION ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'managed-browser' ||
+    input.artifactHash !== COMPILED_WEIBO_PLUGIN.artifactHash ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'Weibo platform seed identity does not match the pinned artifact',
     )
   return publishSkillVersionInternal(input, true)
 }
@@ -1379,15 +1406,22 @@ export async function listApprovedForSearch(
     )
       continue
     const verifiedRuntime = verifiedRuntimeContracts.get(Number(x.id))
-    const officialKnowledgePlanet =
+    const officialManagedBrowser =
       x.kind === 'connector' &&
-      isOfficialKnowledgePlanetPluginIdentity({
+      (isOfficialKnowledgePlanetPluginIdentity({
         slug: x.slug,
         pluginType: x.plugin_type,
         artifactHash: x.artifact_hash,
         execContractHash: verifiedRuntime?.execContractHash ?? null,
         reviewSource: x.review_source,
-      })
+      }) ||
+        isOfficialWeiboPluginIdentity({
+          slug: x.slug,
+          pluginType: x.plugin_type,
+          artifactHash: x.artifact_hash,
+          execContractHash: verifiedRuntime?.execContractHash ?? null,
+          reviewSource: x.review_source,
+        }))
     out.push({
       versionId: x.id,
       slug: x.slug,
@@ -1411,7 +1445,7 @@ export async function listApprovedForSearch(
         Number.parseInt(x.rating_up ?? '0', 10) || 0,
         Number.parseInt(x.rating_down ?? '0', 10) || 0,
       ),
-      ...(officialKnowledgePlanet ? { official: true } : {}),
+      ...(officialManagedBrowser ? { official: true } : {}),
     })
   }
   return out
@@ -1624,6 +1658,13 @@ export async function getListingDetail(
           official:
             preinstalled ||
             isOfficialKnowledgePlanetPluginIdentity({
+              slug: x.slug,
+              pluginType: x.plugin_type,
+              artifactHash: x.artifact_hash,
+              execContractHash: verifiedRuntimeExecContractHash,
+              reviewSource: x.review_source,
+            }) ||
+            isOfficialWeiboPluginIdentity({
               slug: x.slug,
               pluginType: x.plugin_type,
               artifactHash: x.artifact_hash,

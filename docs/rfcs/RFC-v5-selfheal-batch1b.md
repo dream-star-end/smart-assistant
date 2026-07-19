@@ -22,7 +22,8 @@ v1 以为缺的只是 release drill。实际有两个结构性根因:
 - marker TTL 仅 180s,且**在部署构建/远端 staging 后期才创建** —— 不覆盖整个 release build 段;
 - 无健康检查时 marker 可 `SKIPPED`,部署仍继续(此时闸不存在);
 - wrapper 是"先检查再执行" → **check→action TOCTOU**;
-- `clean-v5-disk-v1` 会与 Docker/runtime build 抢;egress restart 会与 `--egress` 激活/回滚抢。
+- host-global disk cleanup（旧 `clean-v5-disk-v1`，现已退役）会与 Docker/runtime build 抢;
+  egress restart 会与 `--egress` 激活/回滚抢。
 
 → 当前残留风险**低但非零**(disk 类未开;主场景 marker 覆盖 restart 段),但**不得宣称已根治**。
 
@@ -33,8 +34,8 @@ v1 以为缺的只是 release drill。实际有两个结构性根因:
 - host-action wrapper **不是查询它**,而是 `flock -n` **取得同一把锁并持有整个 opcode 执行期**;拿不到 → exit 66 让路(消灭 TOCTOU)。
 - 本地 `/var/lock/oc-v5-deploy.lock` 与远端 host-mutation lease **固定锁序**(先本地后远端),防死锁。
 - **marker 回归本职**:只做告警隔离,不承担互斥正确性。
-- **显式例外(补偿优先于互斥,实现审 R3/R4 收口)**:lease 在翻转后失活时,补偿/回滚路径**先阻塞重取**(`flock -w 180`);重取仍失败则**降级继续补偿**并打 CRITICAL 告警——恢复生产稳态优先于严格互斥。残余并发窗口按对方持有者**分别陈述**:与自愈 host-action opcode 并发时以其 90s 动作超时为上限;与人工 `with-production-mutation-lease.sh` 持锁操作并发时**无时长上限**(180s 等不到锁的最可能原因正是人工长操作在持锁)——此时 CRITICAL 告警已发出,运维纪律=**先停下人工持锁操作、确认补偿现场,再继续**。已知且接受。除该补偿降级分支外,写 lane 的任何前向翻转在 lease 失活时一律中止。
-- **非 deploy-v5 lane 也必须入列**(Codex MAJOR4):人工 migration / env 同步 / systemd unit 安装 / runtime image build+tag 切换等,要么走持同一 lease 的受控 wrapper/runbook,要么在 durable maintenance inhibit 下执行 —— 否则"绝不冲突"不成立。
+- **失锁一律 crash-stop（旧的“重取 180s / 无锁补偿”例外已删除）**：每条写 lane 在首个副作用前预置 exact-nonce `.mutation-lane-inflight`；独立 PGID watchdog 同时监督 outer、远端 holder、更早到期的本地 TTL 与 lane 内 exact PID/starttime sentinel。sentinel 与 leader 同 PGID，并一直保留到最后的 marker-clear SSH 返回；leader 随后才释放/reap sentinel，故 leader 被提前 reap 时仍有不可复用的 PGID 锚点。任一监督面失活先 `SIGKILL` 整个 lane PGID，再释放残余 lease。失锁后禁止自动重取、cleanup、补偿或回滚，返回专用 rc=86 并保留 in-flight / saga 持久状态。运维必须先核对 deploy_state、symlink/unit、runtime tuple 与插件门，人工移除 in-flight marker 后才可运行显式 `--recover` / `--abort`；不得按旧 runbook 在另一 holder 可能已写入后继续盲补偿。
+- **非 deploy-v5 lane 也必须入列**(Codex MAJOR4):人工 migration / env 同步 / systemd unit 安装 / runtime image build+tag 切换等,要么走持同一 lease 的受控 wrapper/runbook,要么在 durable maintenance inhibit 下执行。`with-production-mutation-lease.sh` 的 command、supervisor、watchdog 分属独立 PGID；watchdog 在 gate 前 ready，并把 supervisor/holder/TTL 的 STOP/dead 与失锁同样裁决，先 KILL command 再断 lease——否则"绝不冲突"不成立。
 
 ### 1.3 批1b Tier2 部署面
 

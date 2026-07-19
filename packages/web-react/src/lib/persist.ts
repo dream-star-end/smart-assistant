@@ -102,6 +102,8 @@ export type StoredSession = {
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
+  /** Projection revision paired with `_maxSeq` for safe incremental reads. */
+  _historyRevision?: number;
   /** 归档 `_orderSeq` 水位(字段名为滚动兼容保留)。*/
   _archivedThroughSeq?: number;
   /** 已归档消息条数(会话总数 = tail + 此值;UI"还有 N 条"与"从云端加载"按钮据此)。*/
@@ -295,11 +297,15 @@ export function applyHistoryProjectionPatches(messages: ChatMessage[]): ChatMess
  *     内容；旧逻辑只保尾部会在「团队轮之后又有新轮」的 reopen 场景整卡丢失。保留后由
  *     normalizeDelegateCards（loadStored/applyServerMessages 收口处）按 blockId/runId
  *     兜底折叠,不会与 server 带回的 delegate 工具行形成重复卡。
+ *  ⑦ **本地 permission 卡**（中段）——permission_request / permission_settled 只在 reducer
+ *     生成客户端过程卡，server 历史不产出该 role。断线重连的 auto-deny 往往紧邻 final；full
+ *     sync 必须保住它并维持原槽，否则会丢卡或漂到 final 后。
  *
  * 其余角色（assistant/thinking/tool）乐观消息可能已被 server 以 `srv-*` 重写，中段保留
  * 会出现重复卡片，故仍只保尾部（非尾部=已被取代→丢弃）。
- * 合并后按 `(anchorOrderSeq, ts, index)` 真全序：耐久行位置冻结，本地乐观窗只在锚点内
- * 用 ts/index 排列，server echo 后自然收敛到 `_orderSeq`。
+ * 合并时先按 local 原槽位放回 server 同 id 行与 client-owned 行，再追加 local 尚未见到的
+ * server 行，最后按 `(anchorOrderSeq, ts, index)` 真全序：耐久行位置冻结，本地乐观窗只在
+ * 原槽位前一条耐久行的锚点内用 ts/index 排列，server echo 后自然收敛到 `_orderSeq`。
  *
  * **债A 偿还(server-authored 团队卡)**：server 现会带回 agent-group 骨架行(id `srv-*`、
  * `_source:'server'`、无 childBlocks),用于跨设备/清缓存场景保住团队结构+终态。去重按 runId:
@@ -349,6 +355,10 @@ function isGeneratedRole(role: ChatMessage["role"] | undefined): boolean {
   return role === "assistant" || role === "thinking" || role === "tool";
 }
 
+function validHistoryOrder(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
 /**
  * §9 折叠卷展开行:本地把折叠 anchor 展开成的 flat 行(server 权威内容水合,带 `_tapeExpandedFrom` 标记)。
  * server 只回折叠 anchor、**从不回这些展开行**,故它们在 full 载荷里"缺席"是**预期**而非删除信号 ——
@@ -357,6 +367,18 @@ function isGeneratedRole(role: ChatMessage["role"] | undefined): boolean {
  */
 function isLocallyExpandedTapeRow(m: ChatMessage): boolean {
   return typeof m._tapeExpandedFrom === "string" && m._tapeExpandedFrom.length > 0;
+}
+
+/**
+ * Full merge 的排序轴信任边界：本地 reducer / IndexedDB 铸的行不得携带 `_orderSeq` 进入
+ * durable axis；即使缓存被旧版本污染，也只能按原槽位锚定。显式 `_source:'server'` 的行是
+ * 热尾归档或 tape 展开留下的 server-derived durable cache，必须保留冻结轴（不能退回客户端 ts）。
+ */
+function sanitizePreservedLocalRow(m: ChatMessage): ChatMessage {
+  if (m._source === "server" || !("_orderSeq" in m)) return m;
+  const { _orderSeq: _untrustedOrderSeq, ...safe } = m;
+  void _untrustedOrderSeq;
+  return safe as ChatMessage;
 }
 
 /**
@@ -456,6 +478,10 @@ export function mergeFullServerWins(
     deletionAuthority?: boolean;
     /** 当前活跃轮 clientMessageId(REST/WS 竞态守卫,活跃轮的行绝不被载荷自证清除)。 */
     activeClientMessageId?: string;
+    /** A projection revision change invalidates persisted rows absent from
+     * the full payload. Archived rows are dropped for later rehydration;
+     * hot rows with `_seq` propagate cross-device deletion. */
+    invalidateProjectionCache?: boolean;
   },
 ): ChatMessage[] {
   const hasExactCompletionEvidence =
@@ -482,6 +508,14 @@ export function mergeFullServerWins(
   //  P2(证据为正,无需版本护栏)—— 已被载荷作证覆盖 turn 的本地过期副本 → 删。
   local = local.filter((m) => {
     if (!m) return false;
+    if (opts?.invalidateProjectionCache === true) {
+      if (isArchivedServerRow(m, archivedThroughSeq)) return false;
+      const persisted = typeof m._seq === "number" && Number.isSafeInteger(m._seq) && m._seq > 0;
+      const belongsToActiveTurn =
+        typeof opts.activeClientMessageId === "string" &&
+        (m.id === opts.activeClientMessageId || m._clientMessageId === opts.activeClientMessageId);
+      if (persisted && m.id && !serverIdsForAuthority.has(m.id) && !belongsToActiveTurn) return false;
+    }
     if (
       opts?.deletionAuthority === true &&
       m._source === "server" &&
@@ -518,6 +552,8 @@ export function mergeFullServerWins(
           // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
           m.role === "user" ||
           (isTeamOwnedRole(m.role) && !m._adoptedInto) ||
+          // ⑦ permission_request / settled 是 client-owned 过程卡；server 历史无此 role。
+          m.role === "permission" ||
           // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
           (m.role === "system" && !isServerAuthoredRow(m)) ||
           // ⑥ §9 折叠卷展开行:server 只回折叠 anchor、从不回展开行。折叠 tape 非末轮(展开行落在
@@ -527,8 +563,61 @@ export function mergeFullServerWins(
   if (!tail.length && !preservedMid.length) {
     return applyHistoryProjectionPatches(stableSortByTs(serverChanged ? serverMerged : server));
   }
-  // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedMid→tail 的插入序。
-  return applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...preservedMid, ...tail]));
+  const safeByOriginal = new Map<ChatMessage, ChatMessage>();
+  for (const m of [...preservedMid, ...tail]) safeByOriginal.set(m, sanitizePreservedLocalRow(m));
+  const safePreservedMid = preservedMid.map((m) => safeByOriginal.get(m)!);
+  const safeTail = tail.map((m) => safeByOriginal.get(m)!);
+  const hasDurableOrderAxis = serverMerged.some(
+    (m) => typeof m._orderSeq === "number" && Number.isSafeInteger(m._orderSeq) && m._orderSeq > 0,
+  );
+  if (!hasDurableOrderAxis) {
+    // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
+    return applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]));
+  }
+  // 中段 client-owned 行若在拼接时离开本地原槽，会错误继承 server 尾行的排序锚点。
+  // 一方面按原 local 插入序重建槽位；另一方面保留一次性 anchor override，明确冻结其
+  // 最近一条可信耐久行。override 以去掉本地伪造 `_orderSeq` 后的对象为 key，不写回消息。
+  const preservedMidSet = new Set(preservedMid);
+  const preserved = new Set<ChatMessage>([...preservedMid, ...tail]);
+  const serverMergedById = new Map<string, ChatMessage>();
+  for (const m of serverMerged) if (m?.id) serverMergedById.set(m.id, m);
+  const anchorOverrides = new Map<ChatMessage, number>();
+  let localCarry = 0;
+  for (let localIndex = 0; localIndex < i; localIndex++) {
+    const original = local[localIndex]!;
+    const safe = safeByOriginal.get(original) ?? original;
+    const peer = original?.id ? serverMergedById.get(original.id) : undefined;
+    const ownOrPeer = validHistoryOrder(peer?._orderSeq)
+      ? peer._orderSeq
+      : validHistoryOrder(safe?._orderSeq)
+        ? safe._orderSeq
+        : null;
+    if (ownOrPeer !== null) localCarry = ownOrPeer;
+    if (preservedMidSet.has(original) && !validHistoryOrder(safe._orderSeq) && localCarry > 0) {
+      anchorOverrides.set(safe, localCarry);
+    }
+  }
+  const emittedServerIds = new Set<string>();
+  const inLocalOrder: ChatMessage[] = [];
+  for (const m of local) {
+    const serverRow = m?.id ? serverMergedById.get(m.id) : undefined;
+    if (serverRow) {
+      if (!emittedServerIds.has(serverRow.id)) {
+        inLocalOrder.push(serverRow);
+        emittedServerIds.add(serverRow.id);
+      }
+    } else if (preserved.has(m)) {
+      inLocalOrder.push(safeByOriginal.get(m)!);
+    }
+  }
+  // Full sync 可能首次带回 final；放到原 local 槽位重建之后，再由 durable order axis 归位。
+  for (const m of serverMerged) {
+    if (!m?.id || !emittedServerIds.has(m.id)) {
+      inLocalOrder.push(m);
+      if (m?.id) emittedServerIds.add(m.id);
+    }
+  }
+  return applyHistoryProjectionPatches(stableSortByTs(inLocalOrder, anchorOverrides));
 }
 
 /**
@@ -762,32 +851,45 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
  * 历史全序稳定排序。展示主轴 = 冻结的 `_orderSeq`(首次持久化即定、任何 patch 不改);缺自身
  * `_orderSeq` 的本地乐观行**锚定到插入序里最近一条带 `_orderSeq` 的耐久行**(anchorOrderSeq
  * carry-forward),锚内再按 `(ts, 插入序 idx)` 定序 —— 这样耐久行位置绝对冻结,乐观窗只在锚点内
- * 浮动,server echo 后自然收敛。比较器是**单一字典序元组** `(anchorOrderSeq, ts, idx)`:三键皆数字
- * 且 idx 全局唯一 → **可传递、反对称、诱导全序**(消除旧版混排 `_seq`/`ts` 两域 + 缺 ts 整趟
- * bail-out 造成的非传递环)。export 供 property/fuzz 单测直接验证该全序不变量。
+ * 浮动,server echo 后自然收敛。同一 tape 的展开行共享一个 `_orderSeq`，其内部再按持久的
+ * `_turnTapeOrdinal` 排序，不能让各 record 的 wall clock 回拨把终答移到 thinking/tool 前。
+ * 比较器是**单一字典序元组**
+ * `(anchorOrderSeq, durableRank, intraRank, tapeOrdinal, ts, idx)`，末键全局唯一，保持全序。
+ * `anchorOverrides` 只修复 full merge 重排出来的 preservedMid；override 不写回消息也不更新 carry。
  */
-export function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
+export function stableSortByTs(
+  messages: ChatMessage[],
+  anchorOverrides?: ReadonlyMap<ChatMessage, number>,
+): ChatMessage[] {
   if (messages.length <= 1) return messages;
-  const orderOf = (m: ChatMessage): number | null =>
-    typeof m._orderSeq === "number" &&
-    Number.isSafeInteger(m._orderSeq) &&
-    m._orderSeq > 0
-      ? m._orderSeq
-      : null;
   let anchorOrderSeq = 0;
   const sorted = messages
     .map((m, idx) => {
-      const ownOrderSeq = orderOf(m);
+      const ownOrderSeq = validHistoryOrder(m._orderSeq) ? m._orderSeq : null;
       if (ownOrderSeq !== null) anchorOrderSeq = ownOrderSeq;
+      const override = validHistoryOrder(anchorOverrides?.get(m))
+        ? anchorOverrides!.get(m)!
+        : null;
+      const tapeOrdinal =
+        typeof m._turnTapeId === "string" && m._turnTapeId.length > 0 &&
+        typeof m._turnTapeOrdinal === "number" &&
+        Number.isSafeInteger(m._turnTapeOrdinal) && m._turnTapeOrdinal >= 0
+          ? m._turnTapeOrdinal
+          : null;
       return {
         m,
         idx,
-        anchorOrderSeq: ownOrderSeq ?? anchorOrderSeq,
+        // override 刻意不写回 carry：tail 仍锚到合并载荷最后一条耐久行。
+        anchorOrderSeq: ownOrderSeq ?? override ?? anchorOrderSeq,
         // 同一 _orderSeq 槽内**耐久行恒先于**锚定其上的本地乐观行:锚点语义是「该乐观行按
         // 插入序紧跟这条耐久行之后」,故即便时钟偏移让乐观行 ts 更小,也绝不得排到锚点耐久行
         // 之前。这条 tiebreak 还消除 anchor carry-forward 的**非幂等**——否则乐观行被更小的
         // ts 甩到锚点耐久行之前,下一趟排序会重新锚定到更靠前的耐久行 → 顺序反复漂移。
         durableRank: ownOrderSeq !== null ? 0 : 1,
+        // 折叠标题先于展开正文；正文按 tape ordinal；无 ordinal 的 terminal/sentinel
+        // 补充行置后。全是 legacy 无 ordinal 时 rank 相同，仍回退 ts/index。
+        intraRank: m._tapeCollapsed === true ? 0 : tapeOrdinal !== null ? 1 : 2,
+        tapeOrdinal: tapeOrdinal ?? 0,
         ts: typeof m?.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
       };
     })
@@ -797,6 +899,8 @@ export function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
     .sort((a, b) =>
       a.anchorOrderSeq - b.anchorOrderSeq ||
       a.durableRank - b.durableRank ||
+      a.intraRank - b.intraRank ||
+      a.tapeOrdinal - b.tapeOrdinal ||
       a.ts - b.ts ||
       a.idx - b.idx)
     .map((x) => x.m);

@@ -42,6 +42,8 @@ const REQUIRE_TEST_DB =
 let pgAvailable = false;
 
 async function cleanCommercialSchema(): Promise<void> {
+  // 全量迁移不只创建表，也创建 function/type/trigger。仅 DROP TABLE 会让下一套从零
+  // 迁移在残留 function 上撞 already-exists；统一走带 `_test` 库名硬防护的 schema reset。
   await resetTestSchemaForTest();
 }
 

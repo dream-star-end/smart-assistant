@@ -278,6 +278,18 @@ describe('managed-browser Plugin runtime', () => {
       resolve6: async () => ['::1'],
     }
     await assert.rejects(resolveManagedBrowserPins(contract, mixed), /DNS is unsafe/)
+    let attempts = 0
+    const transient: DnsResolver = {
+      resolve4: async () => {
+        attempts++
+        if (attempts === 1)
+          throw Object.assign(new Error('temporary resolver failure'), { code: 'ETIMEOUT' })
+        return ['93.184.216.34']
+      },
+      resolve6: async () => [],
+    }
+    assert.equal((await resolveManagedBrowserPins(contract, transient))[0]!.ip, '93.184.216.34')
+    assert.equal(attempts, 2)
     const ipv6Only: DnsResolver = {
       resolve4: async () => [],
       resolve6: async () => ['2606:4700:4700::1111'],

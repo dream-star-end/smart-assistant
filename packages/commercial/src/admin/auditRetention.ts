@@ -141,6 +141,9 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   // 批D D3:自愈放行请求账本。量小、账本性质(与 codex_repairs 同档),永久可回溯放行
   // 决策链,不删。
   "selfheal_release_requests",
+  // 每个 release fuse epoch（含尚未裁决的 pending uncertainty）都是永久防重放/
+  // 防丢失栅栏；删除会让迟到 callback 重拉闸或让并发 epoch 消失。
+  "selfheal_release_fuse_epochs",
 ] as const;
 
 // 模块加载即校验:合规永久表与运维永久账本表名不得重叠(命名域彻底分离,防混淆)。

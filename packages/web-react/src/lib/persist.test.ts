@@ -106,6 +106,17 @@ describe("persist — 历史合并纯函数", () => {
     expect(out.map((row) => row.id)).toEqual(["u1", "a1", "u2"]);
   });
 
+  test("full merge 保留中段 user 的原始锚点，不把它漂到后一条 server 行之后", () => {
+    const a1 = { id: "a1", role: "assistant", text: "one", ts: 1, _source: "server", _orderSeq: 1 } as ChatMessage;
+    const user = { id: "local-user", role: "user", text: "问", ts: 999 } as ChatMessage;
+    const a2 = { id: "a2", role: "assistant", text: "two", ts: 2, _source: "server", _orderSeq: 2 } as ChatMessage;
+
+    const out = mergeFullServerWins([a1, a2], [a1, user, a2]);
+
+    expect(out.map((row) => row.id)).toEqual(["a1", "local-user", "a2"]);
+    expect(user._orderSeq).toBeUndefined(); // 临时锚只参与本次排序，不伪造持久顺序轴。
+  });
+
   test("exact terminal evidence replaces only that turn's m-* fallback, not a queued next turn", () => {
     const local: ChatMessage[] = [
       { id: "m-user-1", role: "user", text: "u1", ts: 1 },
@@ -541,12 +552,13 @@ describe("persist — 历史合并纯函数", () => {
     expect(merged.map((m) => m.id)).toEqual(["u-local", "srv-a"]);
   });
 
-  // v5 真实 reopen 场景:server-authored 历史只有 assistant/tool 行,团队卡是 client-owned。
-  // 团队轮之后又有新一轮 → 团队卡落在「最后一个 server 已知 id」之前(中段),旧逻辑整卡丢弃。
-  test("mergeFullServerWins: 保留中段 local-only 团队卡(agent-group/delegate-progress 不随 server-wins 丢弃)", () => {
+  // v5 真实 reopen 场景:server-authored 历史带冻结 _orderSeq,团队卡是 client-owned。
+  // 团队轮之后又有新一轮 → 团队卡落在「最后一个 server 已知 id」之前(中段),必须既保留
+  // 又留在 final 前。旧测试没给 server fixture 加 _orderSeq,漏掉 durable order axis 上线后的回归。
+  test("mergeFullServerWins: 保留中段 local-only 团队卡且不漂到 final 后", () => {
     const server = [
-      { ...msg("srv-1", "第一轮答案"), ts: 100 },
-      { ...msg("srv-2", "第二轮答案"), ts: 500 },
+      { ...msg("srv-1", "本轮用户输入"), role: "user" as const, ts: 100, _orderSeq: 1 },
+      { ...msg("srv-2", "本轮最终答案"), ts: 500, _orderSeq: 2, _source: "server" as const },
     ];
     const group: ChatMessage = {
       id: "m-group",
@@ -568,13 +580,98 @@ describe("persist — 历史合并纯函数", () => {
       _completed: true,
       entries: [{ phase: "text", text: "进行中", ts: 301 }],
     };
+    const permission: ChatMessage = {
+      id: "m-permission",
+      role: "permission",
+      text: "AskUserQuestion",
+      ts: 400,
+      requestId: "req-1",
+      _resolved: true,
+      _behavior: "deny",
+      _settledReason: "disconnect",
+    };
     // 中段还有一条非团队的 local-only assistant → 仍按旧语义丢弃(可能已被 srv-* 重写)。
     const staleAssistant = { ...msg("m-stale", "被取代的乐观助手行"), ts: 250 };
-    const local = [server[0], group, staleAssistant, progress, server[1]];
+    const local = [server[0], group, staleAssistant, progress, permission, server[1]];
 
     const merged = mergeFullServerWins(server, local);
-    expect(merged.map((m) => m.id)).toEqual(["srv-1", "m-group", "m-prog", "srv-2"]);
+    expect(merged.map((m) => m.id)).toEqual(["srv-1", "m-group", "m-prog", "m-permission", "srv-2"]);
     expect(merged.find((m) => m.id === "m-group")!.childBlocks?.length).toBe(1);
+  });
+
+  test("mergeFullServerWins: reconnect full 新增 final 后过程卡仍在 final 前且重复合并幂等", () => {
+    const user: ChatMessage = {
+      id: "srv-user",
+      role: "user",
+      text: "做一个异星探索游戏",
+      ts: 100,
+      _orderSeq: 1,
+      _source: "server",
+    };
+    const final: ChatMessage = {
+      id: "srv-final",
+      role: "assistant",
+      text: "最终方案",
+      ts: 500,
+      _orderSeq: 2,
+      _source: "server",
+    };
+    const group: ChatMessage = {
+      id: "m-group",
+      role: "agent-group",
+      text: "并行研究",
+      ts: 200,
+      _delegateRunId: "run-1",
+      _completed: true,
+      childBlocks: [{ kind: "text", text: "研究完成" }],
+    };
+    const permission: ChatMessage = {
+      id: "m-permission",
+      role: "permission",
+      text: "AskUserQuestion",
+      ts: 300,
+      requestId: "req-1",
+      _resolved: true,
+      _behavior: "deny",
+      _settledReason: "disconnect",
+    };
+
+    // reconnect 前 local 尚无 final；full sync 把 final 首次带回。
+    const once = mergeFullServerWins([user, final], [user, group, permission]);
+    expect(once.map((m) => m.id)).toEqual(["srv-user", "m-group", "m-permission", "srv-final"]);
+    const twice = mergeFullServerWins([user, final], once);
+    expect(twice.map((m) => m.id)).toEqual(once.map((m) => m.id));
+  });
+
+  test("mergeFullServerWins: 所有 local-only 行剥离伪造 _orderSeq,只有 server 可进入 durable axis", () => {
+    const server: ChatMessage[] = [
+      { id: "srv-1", role: "user", text: "一", ts: 100, _orderSeq: 1, _source: "server" },
+      { id: "srv-2", role: "assistant", text: "二", ts: 200, _orderSeq: 2, _source: "server" },
+      { id: "srv-3", role: "assistant", text: "三", ts: 300, _orderSeq: 3, _source: "server" },
+    ];
+    const local: ChatMessage[] = [
+      // 同 id local 伪造值不能覆盖 server 的 1。
+      { ...server[0], _orderSeq: 999 },
+      { id: "m-user", role: "user", text: "local user", ts: 110, _orderSeq: 999 },
+      { id: "m-team", role: "agent-group", text: "team", ts: 120, _delegateRunId: "run-x", _orderSeq: 1 },
+      { id: "m-permission", role: "permission", text: "ask", ts: 130, requestId: "req-x", _orderSeq: 999 },
+      server[1],
+      // 最大 local-only 连续尾也不能携伪造排序轴。
+      { id: "m-tail", role: "assistant", text: "optimistic tail", ts: 250, _orderSeq: 1 },
+    ];
+
+    const merged = mergeFullServerWins(server, local);
+    expect(merged.map((m) => m.id)).toEqual([
+      "srv-1",
+      "m-user",
+      "m-team",
+      "m-permission",
+      "srv-2",
+      "m-tail",
+      "srv-3",
+    ]);
+    expect(merged.filter((m) => m.id.startsWith("m-")).every((m) => m._orderSeq === undefined)).toBe(true);
+    expect(merged.filter((m) => m.id.startsWith("srv-")).map((m) => m._orderSeq)).toEqual([1, 2, 3]);
   });
 
   test("mergeFullServerWins: 被 adopt 吸收的 standalone progress(_adoptedInto)不重复保留", () => {
@@ -655,11 +752,16 @@ describe("persist — 历史合并纯函数", () => {
       _delegateStatus: "ok",
       _resultPreview: "server 骨架摘要",
     };
-    const server = [{ ...msg("srv-a", "答"), ts: 100 }, serverSkeleton];
-    const local = [{ ...msg("srv-a", ""), ts: 100 }, localRich];
+    const final = { ...msg("srv-final", "最终答复"), ts: 300, _orderSeq: 3, _source: "server" as const };
+    const server = [
+      { ...msg("srv-a", "用户输入"), role: "user" as const, ts: 100, _orderSeq: 1 },
+      { ...serverSkeleton, _orderSeq: 2 },
+      final,
+    ];
+    const local = [{ ...server[0] }, localRich, final];
     const merged = mergeFullServerWins(server, local);
     // 骨架行(srv-group-1)被丢弃,本地富卡(m-group)保留
-    expect(merged.map((m) => m.id)).toEqual(["srv-a", "m-group"]);
+    expect(merged.map((m) => m.id)).toEqual(["srv-a", "m-group", "srv-final"]);
     const g = merged.find((m) => m.id === "m-group")!;
     // 2c73030d:server 行绝不吞本地富卡的 childBlocks / 展示字段
     expect(g.childBlocks?.map((b) => b.text)).toEqual(["子代理过程输出"]);
@@ -792,14 +894,14 @@ describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
     const n = Math.floor(rnd() * 9); // 0..8 条(含空/单元素边界)
     const out: ChatMessage[] = [];
     for (let i = 0; i < n; i++) {
-      // ts 有意可缺(下方 ~15% 分支不赋值,测非有限/缺失 ts 的排序兜底):用 as 断言,不改运行时。
-      const m = { id: `m${i}`, role: "assistant", text: "" } as ChatMessage;
+      const m: ChatMessage = { id: `m${i}`, role: "assistant", text: "", ts: 0 };
       // ~65% 带 _orderSeq(小池子 → 制造碰撞/乱序/时钟偏移);其余为本地乐观行(无 _orderSeq)。
       if (rnd() < 0.65) m._orderSeq = 1 + Math.floor(rnd() * 6);
       if (rnd() < 0.5) m._seq = 1 + Math.floor(rnd() * 40); // 比较器应完全忽略 _seq
       const tsRoll = rnd();
       if (tsRoll < 0.15) {
-        /* 缺 ts */
+        // Fuzz the malformed legacy-wire case without weakening ChatMessage.ts.
+        delete (m as Partial<ChatMessage>).ts;
       } else if (tsRoll < 0.3) {
         m.ts = Number.NaN; // 非有限 ts → 实现按 0 兜底,不得整趟 bail-out
       } else {
@@ -862,6 +964,20 @@ describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
     const twice = stableSortByTs(once.map((m) => ({ ...m })));
     expect(twice.map((m) => m.id)).toEqual(["C", "A", "B"]);
   });
+
+  test("同一完整 tape 按 record ordinal 排序，时钟回拨不能把终答排到思考/工具前", () => {
+    const input: ChatMessage[] = [
+      { id: "thinking", role: "thinking", text: "想", ts: 300, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 0 },
+      { id: "tool", role: "tool", text: "查", ts: 200, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 1 },
+      { id: "answer", role: "assistant", text: "答", ts: 100, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 2 },
+      { id: "terminal-note", role: "assistant", text: "终态证据", ts: 0, _orderSeq: 5, _turnTapeId: "t-1" },
+      { id: "collapsed", role: "assistant", text: "本轮输出", ts: 400, _orderSeq: 5, _turnTapeId: "t-1", _tapeCollapsed: true },
+    ];
+
+    expect(stableSortByTs([...input]).map((m) => m.id)).toEqual([
+      "collapsed", "thinking", "tool", "answer", "terminal-note",
+    ]);
+  });
 });
 
 // ─── 热尾巴 / 归档合并（SESSION_ARCHIVE_DESIGN §3.2/§3.3） ────────────────────
@@ -883,6 +999,18 @@ describe("persist — 热尾巴/归档合并", () => {
     // 归档旧行(a1/a2)保留、不被"server 不认识 = 丢弃"误杀;热尾巴 server-wins。
     expect(merged.map((m) => m.id)).toEqual(["a1", "a2", "a3", "a4"]);
     expect(merged.find((m) => m.id === "a3")!.text).toBe("S-3");
+  });
+
+  test("mergeFullServerWins(热尾巴): server-derived 归档缓存保留 _orderSeq,不被逆序 ts 打乱", () => {
+    const local: ChatMessage[] = [
+      { id: "a1", role: "assistant", text: "一", ts: 900, _source: "server", _seq: 1, _orderSeq: 1 },
+      { id: "a2", role: "assistant", text: "二", ts: 100, _source: "server", _seq: 2, _orderSeq: 2 },
+      { id: "a3", role: "assistant", text: "三", ts: 300, _source: "server", _seq: 3, _orderSeq: 3 },
+    ];
+    const server = [{ ...local[2], text: "S-3" }];
+    const merged = mergeFullServerWins(server, local, 2);
+    expect(merged.map((m) => m.id)).toEqual(["a1", "a2", "a3"]);
+    expect(merged.map((m) => m._orderSeq)).toEqual([1, 2, 3]);
   });
 
   test("mergeFullServerWins(热尾巴): 水位=0(未归档)时旧版行为不变——中段 server 不认识的助手仍丢弃", () => {

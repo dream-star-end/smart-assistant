@@ -170,6 +170,26 @@ describe('Plugin runtime facade', () => {
       keepFileIds: ['523456789'],
     })
 
+    const mediaOnly = await prepare({
+      ...base,
+      params: {
+        groupId: '623456789',
+        topicId: '123456789',
+        removeImageIds: ['323456789'],
+      },
+    })
+    assert.equal(mediaOnly.text, 'body', 'media-only edit must preserve the current topic body')
+
+    const explicitBlank = await prepare({
+      ...base,
+      params: {
+        groupId: '623456789',
+        topicId: '123456789',
+        text: '',
+      },
+    })
+    assert.equal(explicitBlank.text, '', 'an explicit empty body must not be rewritten')
+
     for (const params of [
       {
         groupId: '623456789',
@@ -212,6 +232,94 @@ describe('Plugin runtime facade', () => {
         error instanceof PluginRuntimeFacadeError &&
         error.code === 'BAD_REQUEST' &&
         /cannot be empty/.test(error.message),
+    )
+  })
+
+  test('seals Weibo destructive writes only to the exact owned post or comment identity', async () => {
+    const facade = new PluginRuntimeFacade({
+      pool: { query: async () => result([]) } as never,
+      redis: null,
+    })
+    const prepare = (
+      facade as unknown as {
+        prepareWeiboWriteParams(input: {
+          userId: number
+          targetId: string
+          actionId: string
+          params: Record<string, unknown>
+        }): Promise<Record<string, unknown>>
+      }
+    ).prepareWeiboWriteParams.bind(facade)
+    const base = { userId: 7, targetId: '41' }
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async () => ({
+      post: {
+        id: 'AbCdE',
+        userId: '12345',
+        owned: true,
+        contentDigest: 'c'.repeat(64),
+      },
+    })
+    const deleted = await prepare({
+      ...base,
+      actionId: 'delete_post',
+      params: { userId: '12345', postId: 'AbCdE' },
+    })
+    assert.deepEqual(deleted.deleteSnapshot, {
+      expectedDigest: 'c'.repeat(64),
+      owned: true,
+    })
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async () => ({
+      post: {
+        id: 'Wrong',
+        userId: '12345',
+        owned: true,
+        contentDigest: 'c'.repeat(64),
+      },
+    })
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'edit_post',
+        params: { userId: '12345', postId: 'AbCdE', text: 'changed' },
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError &&
+        error.code === 'BAD_REQUEST' &&
+        /snapshot/.test(error.message),
+    )
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async () => ({
+      comments: [
+        {
+          id: '778899',
+          postId: 'OtherPost',
+          owned: true,
+          contentDigest: 'd'.repeat(64),
+        },
+      ],
+    })
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'delete_comment',
+        params: { userId: '12345', postId: 'AbCdE', commentId: '778899' },
+      }),
+      (error: unknown) =>
+        error instanceof PluginRuntimeFacadeError &&
+        error.code === 'BAD_REQUEST' &&
+        /snapshot/.test(error.message),
+    )
+
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'delete_post',
+        params: {
+          userId: '12345',
+          postId: 'AbCdE',
+          deleteSnapshot: { expectedDigest: 'e'.repeat(64), owned: true },
+        },
+      }),
+      (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST',
     )
   })
 })

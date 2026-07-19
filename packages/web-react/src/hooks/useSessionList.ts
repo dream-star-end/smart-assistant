@@ -234,7 +234,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       historyFetchingRef.current.add(id);
       try {
         const sinceSeq = cbRef.current.sockRef.current?.storedMaxSeq(id) ?? 0;
-        const detail = await api.getSession(cbRef.current.authSession, id, sinceSeq);
+        const sinceHistoryRevision = cbRef.current.sockRef.current?.storedHistoryRevision(id);
+        const detail = await api.getSession(
+          cbRef.current.authSession,
+          id,
+          sinceSeq,
+          sinceHistoryRevision,
+        );
         // 登出/换号守卫：await 期间用户已变 → 丢弃，绝不污染当前会话/新用户 IndexedDB。
         if (userIdRef.current !== owner) return;
         const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
@@ -256,6 +262,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           archivedCount: detail.archivedCount,
           serverUpdatedAt: detail.updatedAt,
           modelId: freshModelId,
+          historyRevision: detail.historyRevision,
+          invalidateProjectionCache: detail._projectionRevisionUnsupported === true,
         });
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地

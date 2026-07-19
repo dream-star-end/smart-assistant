@@ -153,15 +153,18 @@ describe("socket — toStored 序列化", () => {
     addMessage(sess, "user", "hi");
     sess._archivedThroughSeq = 42;
     sess._archivedCount = 7;
+    sess._historyRevision = 3;
     const out = s.toStored("s1")!;
     expect(out._archivedThroughSeq).toBe(42);
     expect(out._archivedCount).toBe(7);
+    expect(out._historyRevision).toBe(3);
     // 复原到一个新 socket 实例。
     const s2 = socket();
     s2.loadStored(out);
     const restored = s2.sessions.get("s1")!;
     expect(restored._archivedThroughSeq).toBe(42);
     expect(restored._archivedCount).toBe(7);
+    expect(restored._historyRevision).toBe(3);
   });
 
   test("未知会话 toStored → null", () => {
@@ -223,6 +226,53 @@ describe("socket — applyServerMessages 合并 server canonical", () => {
     expect(sess.messages.map((m) => m.id)).toEqual(["a1", "a2", "a3", "a4"]); // 旧归档行不丢
     expect(sess._archivedThroughSeq).toBe(2);
     expect(sess._archivedCount).toBe(2);
+  });
+
+  test("history revision 变化：丢弃已水合归档缓存，后续分页从当前权威重载", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    const srv = (id: string, seq: number): ChatMessage =>
+      ({ id, role: "assistant", text: id, ts: seq, _source: "server", _seq: seq, _orderSeq: seq }) as ChatMessage;
+    sess.messages.push(srv("a1", 1), srv("a2", 2), srv("a3", 3), srv("a4", 4));
+    sess._historyRevision = 0;
+    s.applyServerMessages("s1", "main", [srv("a3", 3), srv("a4", 4)], true, 4, {
+      archivedThroughSeq: 2,
+      archivedCount: 2,
+      historyRevision: 1,
+      serverUpdatedAt: 10,
+    });
+    expect(sess.messages.map((message) => message.id)).toEqual(["a3", "a4"]);
+    expect(sess._historyRevision).toBe(1);
+  });
+
+  test("legacy full fallback：每次丢弃无 revision 保护的已水合归档缓存", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    const srv = (id: string, seq: number): ChatMessage =>
+      ({ id, role: "assistant", text: id, ts: seq, _source: "server", _seq: seq, _orderSeq: seq }) as ChatMessage;
+    sess.messages.push(srv("a1", 1), srv("a2", 2), srv("a3", 3));
+    s.applyServerMessages("s1", "main", [srv("a3", 3)], true, 3, {
+      archivedThroughSeq: 2,
+      archivedCount: 2,
+      serverUpdatedAt: 10,
+      invalidateProjectionCache: true,
+    });
+    expect(sess.messages.map((message) => message.id)).toEqual(["a3"]);
+  });
+
+  test("history revision 变化：full 缺席会删除已持久化 client-owned 行，但保留未同步行", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    sess.messages.push(
+      ({ id: "persisted-user", role: "user", text: "old", ts: 1, _seq: 1, _orderSeq: 1 }) as ChatMessage,
+      ({ id: "srv-answer", role: "assistant", text: "answer", ts: 2, _source: "server", _seq: 2, _orderSeq: 2 }) as ChatMessage,
+      ({ id: "optimistic-user", role: "user", text: "new", ts: 3 }) as ChatMessage,
+    );
+    sess._historyRevision = 0;
+    s.applyServerMessages("s1", "main", [
+      ({ id: "srv-answer", role: "assistant", text: "answer", ts: 2, _source: "server", _seq: 2, _orderSeq: 2 }) as ChatMessage,
+    ], true, 2, { historyRevision: 1, serverUpdatedAt: 10 });
+    expect(sess.messages.map((message) => message.id)).toEqual(["srv-answer", "optimistic-user"]);
   });
 });
 

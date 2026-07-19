@@ -33,6 +33,7 @@ const {
   getSessionsDb,
   readArchivedMessages,
   SESSION_TAIL_MIN_MSGS,
+  SESSION_SOFT_TRIM_BYTES,
   SESSION_TAIL_TARGET_BYTES,
   upsertClientSession,
 } = await import('../sessionsDb.js')
@@ -354,7 +355,10 @@ describe('browser chat projection (SQLite compatibility)', () => {
       (message._historyProjection as { kind: string }).kind), ['checkpoint', 'bash-tail'])
 
     const partial = await getClientSessionPartial(
-      'web-chat-projection', USER, 1, { projection: 'chat' },
+      'web-chat-projection', USER, 1, {
+        projection: 'chat',
+        sinceHistoryRevision: chat!.historyRevision,
+      },
     )
     assert.equal(partial!.isPartial, true)
     assert.equal(partial!.maxSeq, 2)
@@ -545,13 +549,140 @@ describe('增量协议兼容', () => {
     const watermark = full?.archivedThroughSeq ?? 0
 
     // 老游标取水位处(< 热尾巴最小 _seq),since>0 且全员有 _seq → isPartial=true
-    const partial = await getClientSessionPartial('web-inc', USER, watermark)
+    const partial = await getClientSessionPartial('web-inc', USER, watermark, {
+      sinceHistoryRevision: full?.historyRevision,
+    })
     assert.ok(partial)
     assert.equal(partial.isPartial, true, '增量语义不变(有 _seq + since>0)')
     assert.ok(partial.messages.length > 0, '返回的热尾巴非空')
     for (const m of partial.messages as Msg[]) {
       assert.ok((m._seq as number) > watermark, '增量只返回 _seq > since 的行')
     }
+  })
+})
+
+describe('history revision — 增量安全栅栏', () => {
+  it('schema 有默认列；匹配才 partial，缺失/不匹配降级 full，删除单调 bump', async () => {
+    const db = await getSessionsDb()
+    const columns = db.pragma('table_info(client_sessions)') as Array<{ name: string; dflt_value: string | null }>
+    const historyColumn = columns.find((column) => column.name === 'history_revision')
+    assert.ok(historyColumn)
+    assert.equal(historyColumn.dflt_value, '0')
+
+    const sessionId = 'web-history-revision'
+    const initialMessages = [
+      makeMsg('hr-1', 1, undefined, 1024, 'client'),
+      makeMsg('hr-2', 2, undefined, 1024, 'client'),
+    ]
+    assert.equal(await upsertClientSession({
+      id: sessionId, userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: initialMessages, updatedAt: 1000,
+    }, 0), 'applied')
+
+    let full = await getClientSession(sessionId, USER)
+    assert.ok(full)
+    assert.equal(full.historyRevision, 0)
+    const initialMaxSeq = Math.max(...(full.messages as Msg[]).map((message) => message._seq ?? 0))
+
+    const missingRevision = await getClientSessionPartial(sessionId, USER, 1)
+    assert.equal(missingRevision?.isPartial, false, 'rolling old client must self-heal with full')
+    const wrongRevision = await getClientSessionPartial(sessionId, USER, 1, { sinceHistoryRevision: 99 })
+    assert.equal(wrongRevision?.isPartial, false)
+    const matching = await getClientSessionPartial(sessionId, USER, 1, {
+      sinceHistoryRevision: full.historyRevision,
+    })
+    assert.equal(matching?.isPartial, true)
+
+    // A normal append is represented by a fresh `_seq`, so the projection
+    // revision must stay stable and incremental mode remains useful.
+    assert.equal(await upsertClientSession({
+      ...full,
+      messages: [...full.messages, makeMsg('hr-3', 3, undefined, 1024, 'client')],
+      updatedAt: full.updatedAt,
+    }, full.updatedAt), 'applied')
+    full = await getClientSession(sessionId, USER)
+    assert.ok(full)
+    assert.equal(full.historyRevision, 0)
+
+    // Omitting hr-2 has no message row that could carry a new `_seq`; the
+    // revision advances atomically and an old cursor receives a full repair.
+    assert.equal(await upsertClientSession({
+      ...full,
+      messages: (full.messages as Msg[]).filter((message) => message.id !== 'hr-2'),
+      updatedAt: full.updatedAt,
+    }, full.updatedAt), 'applied')
+    const repaired = await getClientSessionPartial(sessionId, USER, initialMaxSeq, {
+      sinceHistoryRevision: 0,
+    })
+    assert.ok(repaired)
+    assert.equal(repaired.isPartial, false)
+    assert.equal(repaired.historyRevision, 1)
+    assert.deepEqual((repaired.messages as Msg[]).map((message) => message.id), ['hr-1', 'hr-3'])
+  })
+
+  it('内容 patch 与 spill 同事务时 bump revision，归档重读拿到新版本', async () => {
+    const sessionId = 'web-history-spill-patch'
+    await upsertClientSession({
+      id: sessionId, userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: makeMsgs(65, 1024, 'hrsp'), updatedAt: 1000,
+    }, 0)
+    const db = await getSessionsDb()
+    const hot = await rowMessages(sessionId)
+    hot[0] = { ...hot[0], _source: 'server' }
+    let encoded = JSON.stringify(hot)
+    const targetBytes = SESSION_SOFT_TRIM_BYTES - 5
+    const padding = targetBytes - Buffer.byteLength(encoded, 'utf8')
+    assert.ok(padding > 0)
+    hot[0].text += 'x'.repeat(padding)
+    encoded = JSON.stringify(hot)
+    assert.equal(Buffer.byteLength(encoded, 'utf8'), targetBytes)
+    db.prepare('UPDATE client_sessions SET messages=?, message_count=? WHERE id=? AND user_id=?')
+      .run(encoded, hot.length, sessionId, USER)
+    db.prepare(
+      'INSERT INTO server_authored_request_map (request_id,user_id,session_id,msg_id) VALUES (?,?,?,?)',
+    ).run('req-history-spill', USER, sessionId, 'hrsp-0')
+
+    const before = await getClientSession(sessionId, USER)
+    assert.equal(before?.historyRevision, 0)
+    assert.equal((await appendCostCredits('req-history-spill', USER, '42')).applied, 'patched')
+
+    const repaired = await getClientSessionPartial(sessionId, USER, 65, {
+      sinceHistoryRevision: 0,
+    })
+    assert.ok(repaired)
+    assert.equal(repaired.isPartial, false)
+    assert.equal(repaired.historyRevision, 1)
+    assert.equal((repaired.messages as Msg[]).some((message) => message.id === 'hrsp-0'), false)
+    const archive = await readArchivedMessages(sessionId, USER, 0, 10)
+    const patched = (archive.messages as Msg[]).find((message) => message.id === 'hrsp-0')
+    assert.equal((patched?.usage as { costCredits?: string } | undefined)?.costCredits, '42')
+  })
+
+  it('server append 去重删除 phantom 行时 bump revision，旧 cursor 收到 full', async () => {
+    const sessionId = 'web-history-phantom'
+    await upsertClientSession({
+      id: sessionId, userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, updatedAt: 1000,
+      messages: [
+        { id: 'hrp-user', role: 'user', text: 'q', ts: 1 },
+        { id: 'hrp-local', role: 'assistant', text: 'partial', ts: 2 },
+      ],
+    }, 0)
+    const before = await getClientSession(sessionId, USER)
+    assert.equal(before?.historyRevision, 0)
+    assert.deepEqual(await appendServerAuthoredMessage(sessionId, USER, {
+      id: 'hrp-server', role: 'assistant', text: 'complete', ts: 3,
+    }), { applied: true })
+    const repaired = await getClientSessionPartial(sessionId, USER, 2, {
+      sinceHistoryRevision: before?.historyRevision,
+    })
+    assert.ok(repaired)
+    assert.equal(repaired.isPartial, false)
+    assert.equal(repaired.historyRevision, 1)
+    assert.deepEqual((repaired.messages as Msg[]).map((message) => message.id), [
+      'hrp-user',
+      'hrp-server',
+    ])
   })
 })
 

@@ -352,6 +352,34 @@ describe("repairDispatcher.postReleaseDelivery(批1b:durable async intake,只认
     assert.equal(r.reason, "authority_mismatch");
   });
 
+  test("400/422 确定性契约拒绝 → authority_mismatch,不无限 retry", async () => {
+    for (const status of [400, 422]) {
+      const { fetchFn } = makeFetch(status, JSON.stringify({ ok: false, error: "invalid_frozen_hash" }));
+      const r = await postReleaseDelivery(RELEASE_BODY, { fetch: fetchFn, now: () => NOW });
+      assert.equal(r.outcome, "authority_mismatch");
+      assert.equal(r.reason, "invalid_frozen_hash");
+    }
+  });
+
+  test("硬 deadline 覆盖 headers 与 body，injected fetch 忽略 signal 也有界", async () => {
+    const neverHeaders: FetchLike = async () => await new Promise(() => {});
+    const a = await postReleaseDelivery(RELEASE_BODY, {
+      fetch: neverHeaders, requestTimeoutMs: 20, now: () => NOW,
+    });
+    assert.equal(a.outcome, "retry");
+    assert.match(a.error ?? "", /request_timeout/);
+
+    const neverBody: FetchLike = async () => ({
+      status: 202,
+      text: async () => await new Promise(() => {}),
+    });
+    const b = await postReleaseDelivery(RELEASE_BODY, {
+      fetch: neverBody, requestTimeoutMs: 20, now: () => NOW,
+    });
+    assert.equal(b.outcome, "retry");
+    assert.match(b.error ?? "", /request_timeout/);
+  });
+
   test("423 → fuse_engaged(退避重投,不转终态)", async () => {
     const { fetchFn } = makeFetch(423, JSON.stringify({ ok: false, error: "release_fuse_engaged" }));
     const r = await postReleaseDelivery(RELEASE_BODY, { fetch: fetchFn, now: () => NOW });
@@ -384,11 +412,19 @@ describe("repairDispatcher.postReleaseDelivery(批1b:durable async intake,只认
 
 describe("repairDispatcher.postFuseClear(批1b:熔断双侧收敛)", () => {
   test("2xx → ok;POST 到 /api/webhooks/v5-selfheal-fuse-clear,body repairId='fuse',同 HMAC 契约", async () => {
-    const { fetchFn, calls } = makeFetch(200, JSON.stringify({ ok: true }));
-    const r = await postFuseClear({ reason: "admin cleared", clearedBy: "42" }, { fetch: fetchFn, now: () => NOW });
+    const epoch = "rr-epoch-a";
+    const { fetchFn, calls } = makeFetch(200, JSON.stringify({
+      cleared: true, outcome: "cleared", releaseRequestId: epoch,
+    }));
+    const r = await postFuseClear(
+      { reason: "admin cleared", clearedBy: "42", expectedReleaseRequestId: epoch },
+      { fetch: fetchFn, now: () => NOW },
+    );
     assert.equal(r.ok, true);
     assert.equal(calls[0].url, "http://127.0.0.1:19999/api/webhooks/v5-selfheal-fuse-clear");
-    assert.deepEqual(JSON.parse(calls[0].init.body), { repairId: "fuse", reason: "admin cleared", clearedBy: "42" });
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+      repairId: "fuse", reason: "admin cleared", clearedBy: "42", expectedReleaseRequestId: epoch,
+    });
     const h = calls[0].init.headers;
     const bodySha = createHash("sha256").update(calls[0].init.body).digest("hex");
     const expected = createHmac("sha256", "webhook-hmac-secret")
@@ -399,8 +435,27 @@ describe("repairDispatcher.postFuseClear(批1b:熔断双侧收敛)", () => {
 
   test("非 2xx / 网络异常 → ok=false(下轮再收敛)", async () => {
     const { fetchFn: f500 } = makeFetch(500, "");
-    assert.equal((await postFuseClear({ reason: "x", clearedBy: "1" }, { fetch: f500, now: () => NOW })).ok, false);
+    assert.equal((await postFuseClear(
+      { reason: "x", clearedBy: "1", expectedReleaseRequestId: "rr-a" },
+      { fetch: f500, now: () => NOW },
+    )).ok, false);
     const fThrow: FetchLike = async () => { throw new Error("ECONNREFUSED"); };
-    assert.equal((await postFuseClear({ reason: "x", clearedBy: "1" }, { fetch: fThrow, now: () => NOW })).ok, false);
+    assert.equal((await postFuseClear(
+      { reason: "x", clearedBy: "1", expectedReleaseRequestId: "rr-a" },
+      { fetch: fThrow, now: () => NOW },
+    )).ok, false);
+  });
+
+  test("2xx ACK 必须回显 exact epoch", async () => {
+    const wrong = makeFetch(200, JSON.stringify({ cleared: true, releaseRequestId: "rr-b" }));
+    assert.equal((await postFuseClear(
+      { reason: "x", clearedBy: "1", expectedReleaseRequestId: "rr-a" },
+      { fetch: wrong.fetchFn, now: () => NOW },
+    )).ok, false);
+    const malformed = makeFetch(200, JSON.stringify({ cleared: true }));
+    assert.equal((await postFuseClear(
+      { reason: "x", clearedBy: "1", expectedReleaseRequestId: "rr-a" },
+      { fetch: malformed.fetchFn, now: () => NOW },
+    )).ok, false);
   });
 });

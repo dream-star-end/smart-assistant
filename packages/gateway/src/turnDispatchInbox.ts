@@ -564,6 +564,8 @@ export type TapeStatus = 'completed' | 'interrupted' | 'crashed'
 export interface MasterTapeStateResult {
   state: MasterTapeState
   tapeStatus?: TapeStatus
+  /** Required when state=none; protects recovery while the master dispatch lease is live. */
+  dispatchLeaseActive?: boolean
 }
 
 /** GET /internal/v3/turn-tape-state?dispatchId=&attemptNo= 契约客户端。 */
@@ -599,9 +601,19 @@ export async function queryMasterTapeState(
       bodyText += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
       if (bodyText.length > 64 * 1024) break
     }
-    const parsed = JSON.parse(bodyText) as { state?: unknown; status?: unknown }
-    if (parsed.state === 'none' || parsed.state === 'partial') {
-      return { state: parsed.state }
+    const parsed = JSON.parse(bodyText) as {
+      state?: unknown
+      status?: unknown
+      dispatchLeaseActive?: unknown
+    }
+    if (parsed.state === 'none') {
+      // Rolling-safe capability handshake: a new gateway talking to an old
+      // master must wait, not turn missing lease evidence into negative proof.
+      if (typeof parsed.dispatchLeaseActive !== 'boolean') return { state: 'unreachable' }
+      return { state: 'none', dispatchLeaseActive: parsed.dispatchLeaseActive }
+    }
+    if (parsed.state === 'partial') {
+      return { state: 'partial' }
     }
     if (parsed.state === 'finalized') {
       const tapeStatus =
@@ -661,6 +673,118 @@ export function buildSyntheticCrashedTapePayload(row: TurnDispatchInboxRow): {
   }
 }
 
+// ---------------------------------------------------------------------------
+// inbound bypass 的 method×path 契约(checkInboundBypass 复用)
+// ---------------------------------------------------------------------------
+
+/**
+ * master→容器 internal 通道的 method 白名单:POST 为默认;GET **仅**放行
+ * turn-dispatch-state(reconciler 只读求证,RFC §2.4/§3)。
+ *
+ * 共享 bypass 曾钉死 POST,durable 批新增 GET 端点后鉴权恒 401 —— §2.4 收敛链在
+ * SSRF 网段错配之下还叠着这一层,两层都是"上线以来零次成功"的静默死链
+ * (2026-07-19,SSRF 修通后才暴露)。新增 GET 端点必须在这里显式登记。
+ */
+export function isInboundBypassMethodAllowed(method: string, pathname: string): boolean {
+  if (method === 'POST') return true
+  return method === 'GET' && pathname === '/internal/v3/turn-dispatch-state'
+}
+
+// ---------------------------------------------------------------------------
+// 活执行注册表(live dispatch registry)
+// ---------------------------------------------------------------------------
+//
+// 恢复协议(§3)的全部推断都以「该行没有活着的执行方」为前提:boot 单飞时前提天然成立
+// (新进程无在飞 turn),但 §B4 周期 sweep 复用同一协议跑在**活进程**里 —— 2026-07-19
+// 事故:sweep tick 落在 turn 在飞窗(queued 等锁 / running 生成中、真 tape 未 stage),
+// 走 none 分支把自己进程正在执行的 turn 合成 SERVICE_RESTART crashed(boss 实锤 8 秒
+// 被枪毙)。因此:受理方在 INSERT queued **之前**登记活标记,执行链路 settle 后注销;
+// recovery 对活标记行一律跳过。mark 先于行存在 ⇒ sweep 扫到的行若在飞必已带标记,无竞态窗。
+// 进程死亡即注册表清零 → boot recovery 语义不变(孤儿照收)。
+
+// 引用计数而非 Set:transport retry 可能让同一 dispatch 的重复帧与首达执行**并发**走
+// 受理块(mark→查重→unmark),Set 语义下重复帧的 unmark 会误删首达执行中的保护。
+const liveDispatchRefs = new Map<string, number>()
+
+function liveKeyOf(dispatchId: string, attemptNo: number): string {
+  return `${dispatchId}#${attemptNo}`
+}
+
+/** 受理方在 INSERT queued 前登记(引用 +1);每次 mark 必须配对一次 unmark。 */
+export function markTurnDispatchLive(dispatchId: string, attemptNo: number): void {
+  const key = liveKeyOf(dispatchId, attemptNo)
+  liveDispatchRefs.set(key, (liveDispatchRefs.get(key) ?? 0) + 1)
+}
+
+/** 执行链路 settle / 受理早退口注销(引用 -1,归零移除);多余调用安全 no-op。 */
+export function unmarkTurnDispatchLive(dispatchId: string, attemptNo: number): void {
+  const key = liveKeyOf(dispatchId, attemptNo)
+  const next = (liveDispatchRefs.get(key) ?? 0) - 1
+  if (next <= 0) liveDispatchRefs.delete(key)
+  else liveDispatchRefs.set(key, next)
+}
+
+/** recovery 跳活行用;也导出给测试断言注册表状态。 */
+export function isTurnDispatchLive(dispatchId: string, attemptNo: number): boolean {
+  return liveDispatchRefs.has(liveKeyOf(dispatchId, attemptNo))
+}
+
+export type DurableDispatchAdmissionResult = 'executed' | 'duplicate' | 'admit_failed'
+
+/**
+ * Production durable WS admission lifecycle.
+ *
+ * Ordering is part of the protocol: mark before INSERT, send the first receipt
+ * immediately after a durable INSERT (before dispatch), and keep the live
+ * reference until dispatch settles. A transport duplicate owns a separate
+ * reference, so its early unmark cannot expose the original execution to the
+ * periodic recovery sweep.
+ */
+export async function runDurableDispatchAdmission(input: {
+  ctx: DispatchTurnContext
+  sendReceipt: (row: TurnDispatchInboxRow | null) => void
+  dispatch: () => Promise<void>
+  onAdmitError?: (err: unknown) => void
+  onOrphanRejectError?: (err: unknown) => void
+}): Promise<DurableDispatchAdmissionResult> {
+  const { ctx } = input
+  markTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+  let admitted: Awaited<ReturnType<typeof admitTurnDispatch>>
+  try {
+    admitted = await admitTurnDispatch({ ctx })
+  } catch (err) {
+    unmarkTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+    input.onAdmitError?.(err)
+    return 'admit_failed'
+  }
+
+  if (!admitted.inserted) {
+    unmarkTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+    input.sendReceipt(admitted.row)
+    return 'duplicate'
+  }
+
+  try {
+    // B2: first durable acceptance is acknowledged before model dispatch so
+    // the master can CAS admitted → accepted on a single transport delivery.
+    input.sendReceipt(admitted.row)
+    await input.dispatch()
+  } finally {
+    try {
+      await inboxReject({
+        userId: ctx.uid,
+        sessionId: ctx.sessionId,
+        clientMessageId: ctx.clientMessageId,
+      })
+    } catch (err) {
+      input.onOrphanRejectError?.(err)
+    } finally {
+      unmarkTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+    }
+  }
+  return 'executed'
+}
+
 export interface BootRecoveryDeps {
   /** 本地 retry queue 是否已有该 dispatch/attempt 的 entry(①路径)。 */
   retryQueueHasDispatch: (dispatchId: string, attemptNo: number) => Promise<boolean>
@@ -670,6 +794,11 @@ export interface BootRecoveryDeps {
   stageSyntheticCrashedTape: (row: TurnDispatchInboxRow) => Promise<void>
   /** manual/告警出口(partial 分支等)。 */
   onManualReconcile?: (row: TurnDispatchInboxRow, reason: string) => void
+  /**
+   * 该 dispatch 是否正被本进程活执行(受理→执行 settle 的全窗,含 queued 等锁)。
+   * 活行一律跳过 —— 恢复推断只对无执行方的行成立。省略 = 全不活(boot 单飞语义)。
+   */
+  isDispatchLive?: (dispatchId: string, attemptNo: number) => boolean
   now?: () => number
 }
 
@@ -680,6 +809,10 @@ export interface BootRecoveryStats {
   terminal: number
   sinkStageFailed: number
   recoveryPending: number
+  /** 因活执行标记跳过的行数(周期 sweep 下 >0 属正常;boot 首跑恒 0)。 */
+  liveSkipped: number
+  /** master dispatch lease 仍活,none 分支延后 synthetic 的行数。 */
+  leaseDeferred: number
 }
 
 /**
@@ -697,6 +830,8 @@ export async function recoverTurnDispatchInboxOnBoot(
     terminal: 0,
     sinkStageFailed: 0,
     recoveryPending: 0,
+    liveSkipped: 0,
+    leaseDeferred: 0,
   }
   const now = deps.now ?? (() => Date.now())
   const rows = await scanOpenTurnDispatches()
@@ -723,6 +858,14 @@ async function recoverOneRow(
   now: () => number,
 ): Promise<void> {
   const key = keyOf(row)
+
+  // 活执行行一律不碰(任何状态):恢复协议的孤儿推断只对无执行方的行成立。
+  // 周期 sweep 撞上在飞 turn(queued 等锁 / running 生成中 / sink_staged 刚落)全走这里跳过;
+  // boot 首跑注册表恒空,不改变 boot 语义。
+  if (deps.isDispatchLive?.(row.dispatchId, row.attemptNo)) {
+    stats.liveSkipped++
+    return
+  }
 
   // queued → rejected(not_accepted):受理过但从未进入执行(fsync 后 enqueue 前崩)。
   if (row.state === 'queued') {
@@ -779,6 +922,14 @@ async function recoverOneRow(
   if (state === 'unreachable') {
     // 保持 recovery_pending 重试,禁止推断(fail-closed I2)。
     stats.recoveryPending++
+    return
+  }
+
+  if (result.dispatchLeaseActive !== false) {
+    // none + 活 lease:master 仍可能有一个刚受理/刚 accepted 的执行方,不能把
+    // "尚无 tape"当作进程已死。缺字段同样 fail-closed(滚动期间老 master)。
+    stats.recoveryPending++
+    if (result.dispatchLeaseActive === true) stats.leaseDeferred++
     return
   }
 

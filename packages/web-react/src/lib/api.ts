@@ -1408,19 +1408,48 @@ export const api = {
 
   /**
    * 取单个会话（GET /api/sessions/:id，Bearer）。
-   * sinceSeq>0 → 增量同步（仅返 `_seq > sinceSeq` 的 messages；legacy 行降级全量）。
+   * sinceSeq>0 且 revision 匹配 → 增量同步；缺失/不匹配由后端降级全量。
    * 不存在 → 404（经 ApiError 抛）。id 形态须匹配后端 `[A-Za-z0-9_-]{8,50}`。
    */
-  getSession: (a: AuthSession, id: string, sinceSeq = 0): Promise<SessionDetail> => {
-    const suffix = sinceSeq > 0 ? `?since=${encodeURIComponent(String(sinceSeq))}` : "";
-    return jsonOrThrow<SessionDetail>(
+  getSession: (
+    a: AuthSession,
+    id: string,
+    sinceSeq = 0,
+    sinceHistoryRevision?: number,
+  ): Promise<SessionDetail> => {
+    const params = new URLSearchParams();
+    if (sinceSeq > 0) {
+      params.set("since", String(sinceSeq));
+      if (Number.isSafeInteger(sinceHistoryRevision) && (sinceHistoryRevision as number) >= 0) {
+        params.set("since_history_revision", String(sinceHistoryRevision));
+      }
+    }
+    const query = params.toString();
+    const suffix = query ? `?${query}` : "";
+    const request = (requestSuffix: string) => jsonOrThrow<SessionDetail>(
       callWithRefresh(a, (t) =>
-        fetch(`/api/sessions/${encodeURIComponent(id)}${suffix}`, {
+        fetch(`/api/sessions/${encodeURIComponent(id)}${requestSuffix}`, {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
       ),
     );
+    return request(suffix).then((detail) => {
+      if (
+        !Number.isSafeInteger(detail.historyRevision)
+        || (detail.historyRevision as number) < 0
+      ) {
+        // A legacy backend can return a plausible `_seq` partial without the
+        // projection revision. Never retain that cursor: retry an incremental
+        // request once as full, and mark every legacy full so callers evict
+        // hydrated projection caches during a coordinated downgrade.
+        if (sinceSeq > 0) {
+          return request("").then((full) => ({ ...full, _projectionRevisionUnsupported: true as const }));
+        }
+        return { ...detail, _projectionRevisionUnsupported: true as const };
+      }
+      return detail;
+    });
   },
 
   getSessionGoal: (a: AuthSession, id: string): Promise<GoalStateSnapshot | null> =>
@@ -3148,6 +3177,53 @@ export const api = {
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch(`/api/plugins/knowledge-planet/setup/${encodeURIComponent(sessionId)}`, {
+          method: 'DELETE',
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  startWeiboSetup: (a: AuthSession): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch('/api/plugins/weibo/setup', {
+          method: 'POST',
+          credentials: 'include',
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ acceptTerms: true }),
+        }),
+      ),
+    ),
+
+  getWeiboSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/weibo/setup/${encodeURIComponent(sessionId)}`, {
+          credentials: 'include',
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  async getWeiboSetupQr(a: AuthSession, sessionId: string): Promise<Blob> {
+    const res = await callWithRefresh(a, (t) =>
+      fetch(`/api/plugins/weibo/setup/${encodeURIComponent(sessionId)}/qr`, {
+        credentials: 'include',
+        headers: { ...bearerHeaders(t), Accept: 'image/png' },
+      }),
+    )
+    assertAuthResponseCurrent(res)
+    if (!res.ok) await throwApi(res)
+    const blob = await res.blob()
+    assertAuthResponseCurrent(res)
+    return blob
+  },
+
+  cancelWeiboSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/weibo/setup/${encodeURIComponent(sessionId)}`, {
           method: 'DELETE',
           credentials: 'include',
           headers: bearerHeaders(t),

@@ -1,5 +1,5 @@
 /**
- * oc-connect 确认卡（human-in-the-loop 写操作门）测试。
+ * oc-connect / oc-plugin 确认卡（human-in-the-loop 写操作门）测试。
  *
  * 覆盖（P0#1 防伪造为核心）：
  *   1. parseOcConnectConfirmation：**只取 id**——混杂日志提取 / 截断 / 缺字段 / 非确认类型 /
@@ -12,7 +12,7 @@
  *   5. 拉取失败 → 显示错误且批准按钮**禁用**；id 不符 → 无法核验且禁用；服务端终态 → 无按钮
  *   6. 降级：无 connectorConfirm → 不拉取、无按钮、不展示任何摘要（无凭据=无可信内容）；
  *      无 sendUserText → 手动跟进文案
- *   7. 与 meta 单一权威的集成：OC_TOOLS 登记 + detectOcCli 识别 oc-connect
+ *   7. 与 meta 单一权威的集成：OC_TOOLS 登记 + detectOcCli 识别 oc-connect / oc-plugin
  */
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -30,6 +30,7 @@ import {
   parseOcConnectConfirmation,
 } from "./connectorCards";
 import { detectOcCli, OC_TOOLS } from "./meta";
+import { researchToolCard } from "./researchCards";
 
 afterEach(cleanup);
 
@@ -155,6 +156,40 @@ describe("connectorToolCard 分派", () => {
       "oc-connect",
     );
     expect(detectOcCli("echo oc-connect")).toBeNull();
+  });
+
+  test("oc-plugin 微博写操作渲染权威确认卡；普通读取回落 Plugin 通用卡", async () => {
+    expect(OC_TOOLS["oc-plugin"].label).toBe("市场插件");
+    const command =
+      "oc-plugin call weibo create_post --account 3 --params '{\"text\":\"发布测试\"}'";
+    expect(detectOcCli(command)).toBe("oc-plugin");
+
+    const getDetail = vi.fn().mockResolvedValue(
+      detailOf({
+        provider: "weibo",
+        action: "create_post",
+        summary: "发布微博：《发布测试》",
+        detail: { text: "发布测试" },
+      }),
+    );
+    const card = researchToolCard(command, { output: TRIGGER_JSON, error: true });
+    render(
+      <ToolCardActionsContext.Provider value={{ connectorConfirm: { getDetail, decide: vi.fn() } }}>
+        <ChatInteractionContext.Provider value={{ sendUserText: vi.fn() }}>
+          {card}
+        </ChatInteractionContext.Provider>
+      </ToolCardActionsContext.Provider>,
+    );
+    expect(await screen.findByText("发布微博：《发布测试》")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认执行" })).toBeEnabled();
+
+    cleanup();
+    const readCard = researchToolCard("oc-plugin call weibo get_self --account 3", {
+      output: '{"user":{"id":"1"}}',
+    });
+    render(<div>{readCard}</div>);
+    expect(screen.getByText("市场插件")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "确认执行" })).not.toBeInTheDocument();
   });
 });
 

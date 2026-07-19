@@ -27,6 +27,8 @@ import {
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
 import {
+  casAdmittedToAccepted,
+  casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
   getDispatch,
@@ -50,6 +52,7 @@ const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_t
 const MIGRATION_GOAL_STATE = path.resolve(here, "../db/migrations/0159_goal_state.sql");
 const MIGRATION_0157 = path.resolve(here, "../db/migrations/0157_lossless_runtime_batches.sql");
 const MIGRATION_0170 = path.resolve(here, "../db/migrations/0170_durable_turn_dispatch.sql");
+const MIGRATION_0175 = path.resolve(here, "../db/migrations/0175_client_session_history_revision.sql");
 const MIGRATION_0173 = path.resolve(here, "../db/migrations/0173_client_session_model.sql");
 
 let pool: Pool;
@@ -101,6 +104,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0170, { encoding: "utf8" }));
   // 0173:client_sessions.model_id(会话级模型选择;本套件的读写 SQL 均已含该列)。
   await pool.query(await readFile(MIGRATION_0173, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0175, { encoding: "utf8" }));
   // 0167 also alters billing/inbox tables that are intentionally absent from
   // this isolated sessions schema. Mirror its tape column and waiver table so
   // the backend contract still exercises the production SQL shape.
@@ -259,6 +263,45 @@ describe("pgSessionsBackend contract", () => {
     assert.equal((got.messages as MessageLike[])[0].id, "m-1");
   });
 
+  maybe("history revision 匹配才 partial，PUT 缺席删除 bump 并强制 full", async () => {
+    const sessionId = "s-history-revision";
+    await backend.upsertClientSession(mkSession({
+      id: sessionId,
+      messages: [
+        { id: "hr-1", role: "user", text: "one", ts: 1 },
+        { id: "hr-2", role: "user", text: "two", ts: 2 },
+      ],
+      updatedAt: 1000,
+    }));
+    let full = await backend.getClientSession(sessionId, "u-1");
+    assert.ok(full);
+    assert.equal(full.historyRevision, 0);
+
+    assert.equal((await backend.getClientSessionPartial(sessionId, "u-1", 1))?.isPartial, false);
+    assert.equal((await backend.getClientSessionPartial(sessionId, "u-1", 1, {
+      sinceHistoryRevision: 99,
+    }))?.isPartial, false);
+    assert.equal((await backend.getClientSessionPartial(sessionId, "u-1", 1, {
+      sinceHistoryRevision: 0,
+    }))?.isPartial, true);
+
+    assert.equal(await backend.upsertClientSession({
+      ...full,
+      messages: (full.messages as MessageLike[]).filter((message) => message.id !== "hr-2"),
+      updatedAt: full.updatedAt,
+    }, full.updatedAt), "applied");
+    const repaired = await backend.getClientSessionPartial(sessionId, "u-1", 2, {
+      sinceHistoryRevision: 0,
+    });
+    assert.ok(repaired);
+    assert.equal(repaired.isPartial, false);
+    assert.equal(repaired.historyRevision, 1);
+    assert.deepEqual((repaired.messages as MessageLike[]).map((message) => message.id), ["hr-1"]);
+
+    full = await backend.getClientSession(sessionId, "u-1");
+    assert.equal(full?.historyRevision, 1);
+  });
+
   maybe("classifyClientSessions 批量区分 active/deleted/missing 并保序", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-live", userId: "u-1" }));
     await backend.upsertClientSession(mkSession({ id: "s-deleted", userId: "u-1" }));
@@ -305,6 +348,31 @@ describe("pgSessionsBackend contract", () => {
       applied: false,
       reason: "session_deleted",
     });
+  });
+
+  maybe("server append 去重 phantom 行会推进 history revision", async () => {
+    const sessionId = "s-history-phantom";
+    await backend.upsertClientSession(mkSession({
+      id: sessionId,
+      messages: [
+        { id: "hp-user", role: "user", text: "q", ts: 1 },
+        { id: "hp-local", role: "assistant", text: "partial", ts: 2 },
+      ],
+    }));
+    const before = await backend.getClientSession(sessionId, "u-1");
+    assert.ok(before);
+    assert.deepEqual(await backend.appendServerAuthoredMessage(sessionId, "u-1", {
+      id: "hp-server", role: "assistant", text: "complete", ts: 3,
+    }), { applied: true });
+    const repaired = await backend.getClientSessionPartial(sessionId, "u-1", 2, {
+      sinceHistoryRevision: before.historyRevision,
+    });
+    assert.ok(repaired);
+    assert.equal(repaired.isPartial, false);
+    assert.equal(repaired.historyRevision, (before.historyRevision ?? 0) + 1);
+    assert.deepEqual((repaired.messages as MessageLike[]).map((message) => message.id), [
+      "hp-user", "hp-server",
+    ]);
   });
 
   maybe("逻辑版本单调:rename 严格递增,stale PUT 不倒退", async () => {
@@ -919,7 +987,9 @@ describe("pgSessionsBackend lossless turn tape", () => {
       await backend.appendCostCredits("cost-late", userId, "5", "ccb-1", null, null, turnKey),
       { applied: "patched" },
     );
-    const costDelta = await backend.getClientSessionPartial(sessionId, userId, beforeLateCostSeq);
+    const costDelta = await backend.getClientSessionPartial(sessionId, userId, beforeLateCostSeq, {
+      sinceHistoryRevision: hydrated.historyRevision,
+    });
     assert.ok(costDelta?.isPartial);
     const deltaAssistant = (costDelta.messages as MessageLike[]).find((m) => m.role === "assistant");
     assert.ok(deltaAssistant, "late exact cost must bump the billing anchor sequence");
@@ -1062,6 +1132,11 @@ describe("pgSessionsBackend lossless turn tape", () => {
     await backend.appendServerAuthoredMessage(sessionId, userId, {
       id: prefix, role: "assistant", text: "legacy answer", ts: 3,
     });
+    const beforeUpgrade = await backend.getClientSession(sessionId, userId);
+    assert.ok(beforeUpgrade);
+    const beforeUpgradeMaxSeq = Math.max(...(beforeUpgrade.messages as MessageLike[]).map(
+      (message) => typeof message._seq === "number" ? message._seq : 0,
+    ));
     const tape = buildTape({
       sessionId,
       agentId: "main",
@@ -1091,6 +1166,15 @@ describe("pgSessionsBackend lossless turn tape", () => {
       await backend.finalizeLosslessTurnTape(userId, tape.finalize),
       { applied: "finalized", recordCount: 3, engineBillings: [] },
     );
+    const repaired = await backend.getClientSessionPartial(
+      sessionId,
+      userId,
+      beforeUpgradeMaxSeq,
+      { sinceHistoryRevision: beforeUpgrade.historyRevision },
+    );
+    assert.ok(repaired);
+    assert.equal(repaired.isPartial, false, "legacy projection removal must force a full repair");
+    assert.equal(repaired.historyRevision, (beforeUpgrade.historyRevision ?? 0) + 1);
     const hot = await pool.query<{ messages: string }>(
       "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
       [sessionId, userId],
@@ -1247,7 +1331,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
       sessionId,
       userId,
       originalSeq,
-      { projection: "chat" },
+      { projection: "chat", sinceHistoryRevision: chat.historyRevision },
     );
     assert.ok(incremental?.isPartial);
     assert.equal((incremental.messages as MessageLike[]).some((message) => message.role === "tool"), false,
@@ -1722,6 +1806,72 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
     assert.equal(dd.kind, "deduplicated");
   });
 
+  maybe("tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-dd-lease-1", userId: CUSER }));
+    const admitted = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-lease-1", clientMessageId: "cm-dd-lease-1" }),
+    );
+    assert.equal(admitted.kind, "admitted");
+    const dispatch = (admitted as {
+      dispatch: { dispatchId: string; leaseEpoch: number };
+    }).dispatch;
+
+    const fresh = await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1);
+    assert.deepEqual(fresh, { state: "none", status: null, dispatchLeaseActive: true });
+    assert.deepEqual(
+      await backend.getTurnTapeStateByDispatch("c:8", dispatch.dispatchId, 1),
+      { state: "none", status: null, dispatchLeaseActive: false },
+      "错误租户不能观察 lease",
+    );
+    assert.deepEqual(
+      await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 2),
+      { state: "none", status: null, dispatchLeaseActive: false },
+      "attemptNo 必须同样参与 lease scope",
+    );
+
+    assert.ok(await casAdmittedToAccepted(pool, {
+      dispatchId: dispatch.dispatchId,
+      expectedEpoch: dispatch.leaseEpoch,
+    }));
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1))
+        .dispatchLeaseActive,
+      true,
+      "accepted 行在短租约有效期内仍是 secondary fence",
+    );
+
+    await pool.query(
+      "UPDATE turn_dispatches SET lease_until = statement_timestamp() - interval '1 second' WHERE dispatch_id = $1",
+      [dispatch.dispatchId],
+    );
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, dispatch.dispatchId, 1))
+        .dispatchLeaseActive,
+      false,
+      "过期 lease 不再延后恢复",
+    );
+
+    await backend.upsertClientSession(mkSession({ id: "s-dd-lease-2", userId: CUSER }));
+    const rejectingAdmit = await backend.admitUserTurn(
+      admitInput({ sessionId: "s-dd-lease-2", clientMessageId: "cm-dd-lease-2" }),
+    );
+    assert.equal(rejectingAdmit.kind, "admitted");
+    const rejectingDispatch = (rejectingAdmit as {
+      dispatch: { dispatchId: string; leaseEpoch: number };
+    }).dispatch;
+    assert.ok(await casAdmittedToRejecting(pool, {
+      dispatchId: rejectingDispatch.dispatchId,
+      expectedEpoch: rejectingDispatch.leaseEpoch,
+      ownerId: "reconciler-test",
+    }));
+    assert.equal(
+      (await backend.getTurnTapeStateByDispatch(CUSER, rejectingDispatch.dispatchId, 1))
+        .dispatchLeaseActive,
+      false,
+      "rejecting 不属于 lease-active open execution set",
+    );
+  });
+
   maybe("受理即建行(PUT-vs-WS 竞态根治):无预建行 admitted;ensure PUT 后到 rejected_stale;墓碑/他人行不动", async () => {
     // ① 无预建行(前端 ensure PUT 尚未到达,2026-07-18 线上新会话首条消息必失败根因):
     //    受理事务自建行 → admitted,user 行与 anchorSeq 同事务落地。
@@ -1822,6 +1972,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
     const tapeState = await backend.getTurnTapeStateByDispatch(CUSER, d.dispatchId, 1);
     assert.equal(tapeState.state, "finalized");
     assert.equal(tapeState.status, "completed");
+    assert.equal(tapeState.dispatchLeaseActive, false);
   });
 
   maybe("late tape(§7.9):not_accepted+投影 → 真 tape finalize 同事务撤投影 + manual_reconcile(late_tape)", async () => {
@@ -1838,6 +1989,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
       dispatchId: d.dispatchId, userId: UID, sessionId: "s-dd-late-3",
       clientMessageId: "cm-dd-3", errorCode: "dispatch_lost", anchorSeq: d.anchorSeq ?? 0n,
     });
+    const revisionBefore = BigInt((await pool.query<{ history_revision: string }>(
+      "SELECT history_revision FROM client_sessions WHERE id = $1 AND user_id = $2",
+      ["s-dd-late-3", CUSER],
+    )).rows[0]!.history_revision);
     // chat 投影读含虚拟行;exact(引擎)读不含 —— RFC §2.5 读侧口径。
     const chatRead = await backend.getClientSession("s-dd-late-3", CUSER, { projection: "chat" });
     assert.ok(chatRead!.messages.some((m) => String((m as { id?: string }).id).startsWith("oc-dispatch-err:")));
@@ -1854,6 +2009,17 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 投影 /
       });
     }
     assert.equal((await backend.finalizeLosslessTurnTape(CUSER, tape.finalize)).applied, "finalized");
+    const revisionAfter = BigInt((await pool.query<{ history_revision: string }>(
+      "SELECT history_revision FROM client_sessions WHERE id = $1 AND user_id = $2",
+      ["s-dd-late-3", CUSER],
+    )).rows[0]!.history_revision);
+    assert.equal(revisionAfter, revisionBefore + 1n, "撤销已下发投影必须推进 absence revision");
+    assert.equal((await backend.finalizeLosslessTurnTape(CUSER, tape.finalize)).applied, "idempotent");
+    const revisionAfterReplay = BigInt((await pool.query<{ history_revision: string }>(
+      "SELECT history_revision FROM client_sessions WHERE id = $1 AND user_id = $2",
+      ["s-dd-late-3", CUSER],
+    )).rows[0]!.history_revision);
+    assert.equal(revisionAfterReplay, revisionAfter, "幂等 replay 不得重复推进 revision");
     const row = await getDispatch(pool, d.dispatchId);
     assert.equal(row!.status, "manual_reconcile");
     assert.equal(row!.conflictReason, "late_tape");
@@ -1934,6 +2100,15 @@ describe("pgSessionsBackend §9 会话读物化投影", () => {
     assert.equal(proj.rows[0]!.row_count, 3, "visible = thinking + tool + assistant");
     assert.equal(proj.rows[0]!.next_part, 3, "next_part = record 总数");
 
+    // 模拟本次发布前已 complete 的存量投影：它们每行已有 `_recordOrdinal`，但还没有
+    // 专用 `_turnTapeOrdinal`。读侧必须即时 promote，不能要求重建所有旧投影。
+    await pool.query(
+      `UPDATE tape_chat_projection
+          SET rows=(SELECT jsonb_agg(item - '_turnTapeOrdinal') FROM jsonb_array_elements(rows) item)
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+
     const chat = await backend.getClientSession(sessionId, userId, { projection: "chat" });
     const asst = (chat!.messages as MessageLike[]).find((m) => m.role === "assistant")!;
     assert.equal(asst.text, "最终回答", "保真:assistant 正文");
@@ -1942,6 +2117,13 @@ describe("pgSessionsBackend §9 会话读物化投影", () => {
     assert.ok((chat!.messages as MessageLike[]).some((m) => m.role === "tool" && m.output === "file1\nfile2"),
       "保真:工具输出");
     assert.equal(asst._turnTapeComplete, true, "投影展开行携带 _turnTapeComplete");
+    assert.deepEqual(
+      (chat!.messages as MessageLike[])
+        .filter((m) => m._turnTapeId === tape.finalize.tapeId)
+        .map((m) => m._turnTapeOrdinal),
+      [0, 1, 2],
+      "投影展开行透传 tape record ordinal，前端不依赖各记录 wall clock 排序",
+    );
 
     // 删 records(BYTEA 源)后 chat 仍全展开(证明走投影,不触 BYTEA);exact 反而缺 record 失败。
     await pool.query("DELETE FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2",

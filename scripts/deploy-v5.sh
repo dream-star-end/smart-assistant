@@ -112,6 +112,7 @@ PRODUCTION_MUTATION_LOCK="${OC_V5_PRODUCTION_MUTATION_LOCK:-/run/openclaude-v5/p
 # 消除"生产变更被永久焊死、无自动过期"的死锁(C1)。非法/0 → 回退 7200(2h)。
 MUTATION_LEASE_TTL_SECONDS="${OC_V5_MUTATION_LEASE_TTL_SECONDS:-7200}"
 [[ "$MUTATION_LEASE_TTL_SECONDS" =~ ^[1-9][0-9]*$ ]] || MUTATION_LEASE_TTL_SECONDS=7200
+(( MUTATION_LEASE_TTL_SECONDS >= 2 )) || MUTATION_LEASE_TTL_SECONDS=7200
 # holder fencing 元数据(reclaim 读它裁决陈旧):{remote_pid,started_at,ttl,deploy_id,holder_host,mode}。
 PRODUCTION_MUTATION_LEASE_META="${PRODUCTION_MUTATION_LOCK}.meta"
 BASELINE_REMOUNT_TIMEOUT_SECONDS="${OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS:-2700}"
@@ -487,8 +488,8 @@ prepare_live_baseline_safety() {
   if [[ "$DRY" != 1 ]]; then
     [[ "$live_release" == "$RELEASES_ROOT"/rel-* ]] \
       || { echo "✗ serving release 不在可信 releases 根:$live_release" >&2; return 1; }
-    ssh "$KL_HOST" "test -f '$live_release/.complete'" \
-      || { echo "✗ serving release 缺 .complete:$live_release" >&2; return 1; }
+    assert_release_marker "$live_release" \
+      || { echo "✗ serving release 完整标记无效:$live_release" >&2; return 1; }
   fi
   echo "── V5 CCB baseline 一次性安全迁移(current=$live_release)──"
   install_v5_slot_units || return 1
@@ -584,11 +585,97 @@ REMOTE
 # schema_migrations 并 fail-closed，绝不替操作者偷偷迁库。既校验当前 checkout，也可校验
 # rollback/canary 的远端 release，避免“当前库够新”被误当成“目标 release 依赖已满足”。
 required_migrations_csv() { # <metadata-path> <local|remote>
-  local metadata="$1" location="$2" jq_filter
-  jq_filter='if (.requiredMigrations | type) == "array" and (.requiredMigrations | length) > 0 and all(.requiredMigrations[]; type == "string" and test("^[0-9]{4}_[a-z0-9_]+$")) then .requiredMigrations | unique | join(",") else error("invalid requiredMigrations") end'
+  local metadata="$1" location="$2"
+  # Validate metadata against the migration files in THIS target release. Never
+  # use the current checkout to judge an older rollback archive: migrations that
+  # did not exist in that immutable release are not its dependencies. Exact
+  # array equality also rejects duplicates, omissions and hand-reordering.
   case "$location" in
-    local) jq -er "$jq_filter" "$metadata" ;;
-    remote) ssh "$KL_HOST" "jq -er '$jq_filter' '$metadata'" ;;
+    local)
+      node - "$metadata" <<'NODE'
+const fs = require('node:fs')
+const path = require('node:path')
+const metadata = process.argv[2]
+const suffix = path.join('deploy', 'v5', 'release-metadata.json')
+if (!metadata.endsWith(suffix)) throw new Error(`unexpected metadata path: ${metadata}`)
+const root = metadata.slice(0, -suffix.length).replace(/[\\/]$/, '')
+const doc = JSON.parse(fs.readFileSync(metadata, 'utf8'))
+const min = doc.minimumRequiredMigration
+if (typeof min !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(min))
+  throw new Error('invalid minimumRequiredMigration')
+const dir = path.join(root, 'packages', 'commercial', 'src', 'db', 'migrations')
+const expected = fs.readdirSync(dir).filter((f) => f.endsWith('.sql'))
+  .map((f) => f.slice(0, -4)).filter((v) => v >= min).sort()
+const actual = doc.requiredMigrations
+if (!Array.isArray(actual) || actual.length === 0 ||
+    actual.some((v) => typeof v !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(v)) ||
+    JSON.stringify(actual) !== JSON.stringify(expected)) {
+  throw new Error(`requiredMigrations mismatch; expected=${expected.join(',')} actual=${Array.isArray(actual) ? actual.join(',') : '<invalid>'}`)
+}
+process.stdout.write(actual.join(','))
+NODE
+      ;;
+    remote)
+      ssh "$KL_HOST" node - "$metadata" "$RELEASES_ROOT" "${TRUSTED_LEGACY_PREDECESSOR:-}" <<'NODE'
+const fs = require('node:fs')
+const path = require('node:path')
+const metadata = process.argv[2]
+const releasesRoot = process.argv[3]
+const trustedLegacyPredecessor = process.argv[4]
+const suffix = path.join('deploy', 'v5', 'release-metadata.json')
+if (!metadata.endsWith(suffix)) throw new Error(`unexpected metadata path: ${metadata}`)
+const root = metadata.slice(0, -suffix.length).replace(/[\\/]$/, '')
+const doc = JSON.parse(fs.readFileSync(metadata, 'utf8'))
+const min = doc.minimumRequiredMigration
+const dir = path.join(root, 'packages', 'commercial', 'src', 'db', 'migrations')
+const actual = doc.requiredMigrations
+
+// Releases built after this gate must carry an exact floor-derived manifest.
+// Immutable pre-floor archives cannot be rewritten, though, and their curated
+// lists were not globally sorted. Permit that historical shape only for a real
+// completed rel-* archive which explicitly lacks the history-revision capability.
+// Once the capability is adopted, the separate capability floor forbids falling
+// back to these archives; a capable or local candidate can never use this escape.
+if (min === undefined) {
+  const resolvedRoot = path.resolve(root)
+  const resolvedReleasesRoot = path.resolve(releasesRoot)
+  const capabilities = doc.capabilities
+  const immutableLegacyRelease =
+    path.dirname(resolvedRoot) === resolvedReleasesRoot &&
+    path.basename(resolvedRoot).startsWith('rel-') &&
+    resolvedRoot === trustedLegacyPredecessor &&
+    fs.lstatSync(resolvedRoot).isDirectory() &&
+    fs.realpathSync(resolvedRoot) === resolvedRoot &&
+    fs.lstatSync(path.join(resolvedRoot, '.complete')).isFile() &&
+    path.resolve(metadata) === path.join(resolvedRoot, suffix)
+  const validCapabilities =
+    Array.isArray(capabilities) &&
+    capabilities.every((v) => typeof v === 'string') &&
+    new Set(capabilities).size === capabilities.length
+  const validLegacyMigrations =
+    Array.isArray(actual) && actual.length > 0 &&
+    actual.every((v) => typeof v === 'string' && /^[0-9]{4}_[a-z0-9_]+$/.test(v)) &&
+    new Set(actual).size === actual.length &&
+    actual.every((v) => fs.statSync(path.join(dir, `${v}.sql`)).isFile())
+  if (!immutableLegacyRelease) throw new Error('legacy migration manifest requires the exact captured predecessor')
+  if (!validCapabilities) throw new Error('invalid legacy capabilities')
+  if (capabilities.includes('history-projection-revision-v1'))
+    throw new Error('legacy migration manifest cannot declare history projection capability')
+  if (!validLegacyMigrations) throw new Error('invalid legacy requiredMigrations')
+} else {
+  if (typeof min !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(min))
+    throw new Error('invalid minimumRequiredMigration')
+  const expected = fs.readdirSync(dir).filter((f) => f.endsWith('.sql'))
+    .map((f) => f.slice(0, -4)).filter((v) => v >= min).sort()
+  if (!Array.isArray(actual) || actual.length === 0 ||
+      actual.some((v) => typeof v !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(v)) ||
+      JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`requiredMigrations mismatch; expected=${expected.join(',')} actual=${Array.isArray(actual) ? actual.join(',') : '<invalid>'}`)
+  }
+}
+process.stdout.write(actual.join(','))
+NODE
+      ;;
     *) echo "✗ required_migrations_csv location 非法:$location" >&2; return 2 ;;
   esac
 }
@@ -702,10 +789,144 @@ PLANNED_MAINTENANCE_NONCE=""
 PLANNED_MAINTENANCE_ACTIVE=0
 DEPLOY_HOLDER_OWNED=0
 # production-mutation lease 运行态(见 PRODUCTION_MUTATION_LOCK 注释)。
-MUTATION_LEASE_PID=""       # 后台 ssh(远端持 flock + sleep infinity)的本地 pid
+MUTATION_LEASE_PID=""       # 后台 ssh(远端持 flock)的本地 pid
+MUTATION_LEASE_START=""     # /proc starttime，防 PID reuse / zombie 假活
+MUTATION_LEASE_PGID=""      # 独立 PGID，outer 整组 STOP/KILL 不冻结 ssh client
+MUTATION_LEASE_TTL_PID=""   # 早于远端 hard TTL 的本地 monotonic watchdog
+MUTATION_LEASE_TTL_START=""
+MUTATION_LEASE_TTL_PGID=""  # 独立 PGID，outer 整组 STOP/KILL 时 deadline 仍推进
 MUTATION_LEASE_ACTIVE=0     # 1=已持有,cleanup 需释放
 MUTATION_LEASE_BYPASSED=0   # 1=OC_V5_SKIP_MUTATION_LEASE 紧急旁路,活性断言直接放行
 KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=0
+MUTATION_LANE_PID=""
+MUTATION_LANE_START=""
+MUTATION_LANE_PGID=""
+MUTATION_LANE_ANCHOR_PID=""   # lane PGID 内独立 sentinel；leader 被 reap 后仍防 PGID reuse
+MUTATION_LANE_ANCHOR_START=""
+MUTATION_LANE_WATCH_PID=""
+MUTATION_LANE_WATCH_START=""
+MUTATION_LANE_WATCH_PGID=""
+MUTATION_LANE_STATE_DIR=""
+MUTATION_LANE_INFLIGHT_ACTIVE=0
+MUTATION_LANE_INFLIGHT_NONCE=""
+
+process_state_start() { # <pid> -> "state starttime"
+  local raw rest
+  raw="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  rest="${raw##*) }"
+  set -- $rest
+  [[ $# -ge 20 ]] || return 1
+  printf '%s %s\n' "$1" "${20}"
+}
+
+process_start_time() { # <pid>
+  local state start
+  read -r state start < <(process_state_start "$1") || return 1
+  printf '%s\n' "$start"
+}
+
+same_live_process() { # <pid> <starttime>
+  local state start
+  read -r state start < <(process_state_start "$1") || return 1
+  [[ "$state" != Z && "$state" != X && "$state" != x && "$start" == "$2" ]]
+}
+
+same_process_identity() { # <pid> <starttime>; zombies still anchor PID/PGID against reuse
+  local state start
+  read -r state start < <(process_state_start "$1") || return 1
+  [[ "$start" == "$2" ]]
+}
+
+same_supervised_process() { # <pid> <starttime>; stopped supervisors are not healthy
+  local state start
+  read -r state start < <(process_state_start "$1") || return 1
+  case "$state" in Z|X|x|T|t) return 1 ;; esac
+  [[ "$start" == "$2" ]]
+}
+
+terminate_exact_process() { # <pid> <starttime>; never signal a reused pid
+  local pid="$1" start="$2" i
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && -n "$start" ]] || return 0
+  same_live_process "$pid" "$start" || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for i in $(seq 1 20); do
+    same_live_process "$pid" "$start" || return 0
+    sleep 0.1
+  done
+  same_live_process "$pid" "$start" && kill -KILL "$pid" 2>/dev/null || true
+}
+
+process_group_has_live_members() { # <pgid>; zombies cannot execute mutations
+  local pgid="$1" snapshot rc
+  [[ "$pgid" =~ ^[0-9]+$ && "$pgid" -gt 1 ]] || return 1
+  snapshot="$(ps -eo pgid=,stat= 2>/dev/null)" || {
+    echo "FATAL:无法枚举 PGID=$pgid；保守裁决为仍有 live member" >&2
+    return 0
+  }
+  if awk -v wanted="$pgid" '
+    $1 == wanted && substr($2,1,1) != "Z" { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' <<<"$snapshot"; then
+    return 0
+  else
+    rc=$?
+    [[ "$rc" == 1 ]] && return 1
+    echo "FATAL:无法解析 PGID=$pgid 进程快照；保守裁决为仍有 live member" >&2
+    return 0
+  fi
+}
+
+process_group_has_live_members_except() { # <pgid> <allowed-pid>
+  local pgid="$1" allowed="$2" snapshot rc
+  [[ "$pgid" =~ ^[0-9]+$ && "$pgid" -gt 1 && "$allowed" =~ ^[0-9]+$ ]] || return 1
+  snapshot="$(ps -eo pgid=,stat=,pid= 2>/dev/null)" || {
+    echo "FATAL:无法枚举 PGID=$pgid descendants；保守裁决为仍有 live member" >&2
+    return 0
+  }
+  if awk -v wanted="$pgid" -v allowed="$allowed" '
+    $1 == wanted && $3 != allowed && substr($2,1,1) != "Z" { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' <<<"$snapshot"; then
+    return 0
+  else
+    rc=$?
+    [[ "$rc" == 1 ]] && return 1
+    echo "FATAL:无法解析 PGID=$pgid descendants 快照；保守裁决为仍有 live member" >&2
+    return 0
+  fi
+}
+
+process_group_has_live_members_except_two() { # <pgid> <allowed-pid-1> <allowed-pid-2>
+  local pgid="$1" allowed1="$2" allowed2="$3" snapshot rc
+  [[ "$pgid" =~ ^[0-9]+$ && "$pgid" -gt 1 \
+    && "$allowed1" =~ ^[0-9]+$ && "$allowed2" =~ ^[0-9]+$ ]] || return 1
+  snapshot="$(ps -eo pgid=,stat=,pid= 2>/dev/null)" || {
+    echo "FATAL:无法枚举 PGID=$pgid descendants；保守裁决为仍有 live member" >&2
+    return 0
+  }
+  if awk -v wanted="$pgid" -v allowed1="$allowed1" -v allowed2="$allowed2" '
+    $1 == wanted && $3 != allowed1 && $3 != allowed2 && substr($2,1,1) != "Z" { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' <<<"$snapshot"; then
+    return 0
+  else
+    rc=$?
+    [[ "$rc" == 1 ]] && return 1
+    echo "FATAL:无法解析 PGID=$pgid descendants 快照；保守裁决为仍有 live member" >&2
+    return 0
+  fi
+}
+
+terminate_mutation_lane_group() { # <pgid>; safe only while lease is still live
+  local pgid="$1" i
+  [[ "$pgid" =~ ^[0-9]+$ && "$pgid" -gt 1 ]] || return 0
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  for i in $(seq 1 20); do
+    process_group_has_live_members "$pgid" || return 0
+    sleep 0.1
+  done
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+}
 
 begin_planned_maintenance() { # <deploy|dist|rollback> <include-egress:0|1>
   local maintenance_mode="$1" include_egress="$2" target_commit nonce result healthy_checks
@@ -832,6 +1053,7 @@ REMOTE
 end_planned_maintenance() {
   local nonce="$PLANNED_MAINTENANCE_NONCE" result
   [[ "$PLANNED_MAINTENANCE_ACTIVE" == 1 && -n "$nonce" ]] || return 0
+  require_mutation_lease_for_compensation "planned-maintenance-cleanup" || exit 86
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] end planned-maintenance schema=2 nonce=$nonce(nonce-match)"
     PLANNED_MAINTENANCE_ACTIVE=0; PLANNED_MAINTENANCE_NONCE=""
@@ -863,6 +1085,22 @@ cleanup_deploy_process() {
   local rc=$?
   trap - EXIT
   set +e
+  if [[ -n "$MUTATION_LANE_PGID" ]] && {
+      same_process_identity "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \
+        || same_process_identity "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START"
+    }; then
+    if mutation_lease_live; then
+      terminate_mutation_lane_group "$MUTATION_LANE_PGID"
+    else
+      kill -KILL -- "-$MUTATION_LANE_PGID" 2>/dev/null || true
+    fi
+  fi
+  if [[ -n "$MUTATION_LANE_PID" ]] \
+      && ! same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START"; then
+    wait "$MUTATION_LANE_PID" 2>/dev/null || true
+  fi
+  stop_mutation_lane_watchdog
+  [[ -n "$MUTATION_LANE_STATE_DIR" ]] && rm -rf -- "$MUTATION_LANE_STATE_DIR"
   [[ "$PLANNED_MAINTENANCE_ACTIVE" == 1 ]] && end_planned_maintenance >/dev/null 2>&1
   # 释放远端 lease 先于本地 holder(锁序反向):kill 后台 ssh → 远端 flock 随通道关闭而释放。
   release_production_mutation_lease >/dev/null 2>&1
@@ -877,10 +1115,11 @@ cleanup_deploy_process() {
 # 与本地 deploy lock 固定锁序:先本地(fd 8)后远端(本函数),防死锁。
 # 超时/失败一律 return 非零,调用方 exit 3。紧急旁路 OC_V5_SKIP_MUTATION_LEASE=1(大写 WARNING)。
 acquire_production_mutation_lease() {  # [<wait_secs>=60]
-  # 远端 flock 竞锁等待秒数(默认 60;补偿路径 reacquire 传 180 阻塞等待)。LEASED 轮询上限 = wait + 30s 冗余。
+  # 远端 flock 竞锁等待秒数(默认 60；仅首次 acquisition 可等待，失锁补偿禁止重取)。
+  # LEASED 轮询上限 = wait + 30s 冗余。
   local lease_wait="${1:-60}"
   [[ "$lease_wait" =~ ^[0-9]+$ ]] || lease_wait=60
-  local poll_ceiling=$(( lease_wait + 30 ))
+  local poll_ceiling=$(( lease_wait + 30 )) poll_attempts=$(( (lease_wait + 30) * 10 ))
   [[ "$MUTATION_LEASE_ACTIVE" == 1 ]] && return 0
   if [[ "${OC_V5_SKIP_MUTATION_LEASE:-0}" == 1 ]]; then
     MUTATION_LEASE_BYPASSED=1
@@ -893,8 +1132,10 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
     MUTATION_LEASE_ACTIVE=1
     return 0
   fi
-  local out got=0 waited=0 remote_script inherited_close=""
+  local out got=0 waited=0 remote_script ttl_isolated=0 holder_isolated=0 i
+  local lease_monitor_was_on=0
   local lease_ttl="$MUTATION_LEASE_TTL_SECONDS"
+  local ttl_margin=2 local_ttl
   # deploy_id/holder_host = fencing 证据(reclaim 打印持有者身份;deploy_id 也用作 holder 自清 meta 的归属校验)。
   local deploy_id holder_host meta_path
   deploy_id="$(openssl rand -hex 12)"
@@ -939,35 +1180,106 @@ while :; do
   if [ \"\$lease_ttl\" -gt 0 ] && [ \$(( now - lease_start )) -ge \"\$lease_ttl\" ]; then drop_meta; exit 0; fi
   sleep 1
 done"
-  if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" && "${OC_V5_DEPLOY_LOCK_FD}" =~ ^[0-9]+$ ]]; then
-    inherited_close="${OC_V5_DEPLOY_LOCK_FD}>&-"
-  fi
-  eval 'ssh "$KL_HOST" "$remote_script" >"$out" 2>/dev/null 8>&- '"$inherited_close"' &'
-  MUTATION_LEASE_PID=$!
-  # 立即置 ACTIVE:轮询窗口内(spawn 后~LEASED 前)被 trap 打断时,release 才会
-  # 回收本地 ssh(远端 holder 检测父进程消失后 ≤1s 自释放;2026-07-17 复盘:
-  # 迟至轮询成功才置位=竞态窗孤儿)。
+  # 本地 deadline 从 ssh spawn **之前**开始，且早于远端 hard TTL。若 LEASED
+  # 因网络缓冲迟到至远端 flock 已释放，acquire loop 会先看到本地 watchdog 已死，
+  # 永不接受 stale handshake。watchdog/ssh 均关闭本地 deploy/KP 锁 fd，避免 outer
+  # 在 supervisor 尚未启动的 acquisition 窗被 SIGKILL 后焊死本地锁。
+  (( lease_ttl > 10 )) && ttl_margin=5
+  (( lease_ttl > ttl_margin )) || ttl_margin=1
+  local_ttl=$(( lease_ttl - ttl_margin ))
+  (( local_ttl >= 1 )) || local_ttl=1
+  # 后台 child 必须先在非 job-control 模式继承 outer PGID，setsid 才能以同一
+  # PID 成为新 session leader；若调用者原本开了 monitor mode，随后恢复。
+  if [[ $- == *m* ]]; then lease_monitor_was_on=1; set +m; fi
+  (
+    trap - EXIT INT TERM HUP
+    exec 8>&- 9>&-
+    if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" && "${OC_V5_DEPLOY_LOCK_FD}" =~ ^[0-9]+$ ]]; then
+      eval "exec ${OC_V5_DEPLOY_LOCK_FD}>&-"
+    fi
+    # setsid 必须发生在 exec 链内，保持 $! / starttime 是最终 sleep 的 exact
+    # identity；否则 outer 整个 PGID 被 STOP 时 deadline 也会冻结。
+    exec setsid sleep "$local_ttl"
+  ) &
+  MUTATION_LEASE_TTL_PID=$!
+  MUTATION_LEASE_TTL_START="$(process_start_time "$MUTATION_LEASE_TTL_PID")" || {
+    kill -KILL "$MUTATION_LEASE_TTL_PID" 2>/dev/null || true
+    # 无 exact starttime 时绝不做可能无界的 wait；该 child 尚未持任何生产资源。
+    MUTATION_LEASE_TTL_PID=""; MUTATION_LEASE_TTL_PGID=""
+    rm -f "$out"
+    [[ "$lease_monitor_was_on" == 1 ]] && set -m
+    echo "✗ 无法启动 production-mutation 本地 TTL watchdog" >&2
+    return 1
+  }
   MUTATION_LEASE_ACTIVE=1
+  for i in $(seq 1 100); do
+    same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" || break
+    MUTATION_LEASE_TTL_PGID="$(ps -o pgid= -p "$MUTATION_LEASE_TTL_PID" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$MUTATION_LEASE_TTL_PGID" == "$MUTATION_LEASE_TTL_PID" ]]; then
+      ttl_isolated=1
+      break
+    fi
+    sleep 0.01
+  done
+  if [[ "$ttl_isolated" != 1 ]]; then
+    release_production_mutation_lease || true
+    rm -f "$out"
+    [[ "$lease_monitor_was_on" == 1 ]] && set -m
+    echo "✗ production-mutation 本地 TTL watchdog 未隔离为独立 PGID" >&2
+    return 1
+  fi
+  (
+    trap - EXIT INT TERM HUP
+    exec 8>&- 9>&-
+    if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" && "${OC_V5_DEPLOY_LOCK_FD}" =~ ^[0-9]+$ ]]; then
+      eval "exec ${OC_V5_DEPLOY_LOCK_FD}>&-"
+    fi
+    exec setsid ssh -o ServerAliveInterval=2 -o ServerAliveCountMax=2 "$KL_HOST" "$remote_script"
+  ) >"$out" 2>/dev/null &
+  MUTATION_LEASE_PID=$!
+  [[ "$lease_monitor_was_on" == 1 ]] && set -m
+  MUTATION_LEASE_START="$(process_start_time "$MUTATION_LEASE_PID")" || {
+    kill -KILL "$MUTATION_LEASE_PID" 2>/dev/null || true
+    # 未取得 starttime 时不能证明可安全 wait；远端 holder 自身仍受 hard TTL 限制。
+    MUTATION_LEASE_PID=""; MUTATION_LEASE_PGID=""
+    release_production_mutation_lease || true
+    rm -f "$out"
+    echo "✗ 无法记录 production-mutation ssh 进程身份" >&2
+    return 1
+  }
+  for i in $(seq 1 100); do
+    same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" || break
+    MUTATION_LEASE_PGID="$(ps -o pgid= -p "$MUTATION_LEASE_PID" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$MUTATION_LEASE_PGID" == "$MUTATION_LEASE_PID" ]]; then
+      holder_isolated=1
+      break
+    fi
+    sleep 0.01
+  done
+  if [[ "$holder_isolated" != 1 ]]; then
+    release_production_mutation_lease
+    rm -f "$out"
+    echo "✗ production-mutation ssh holder 未隔离为独立 PGID" >&2
+    return 1
+  fi
   # 轮询 LEASED(截止 poll_ceiling=wait+30s);ssh 提前退出(flock 竞争失败/连接失败)→ kill -0 断链即止。
-  while (( waited < poll_ceiling )); do
+  while (( waited < poll_attempts )); do
+    same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" || break
+    same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" || break
     if grep -q LEASED "$out" 2>/dev/null; then got=1; break; fi
-    kill -0 "$MUTATION_LEASE_PID" 2>/dev/null || break
-    sleep 1; waited=$((waited + 1))
+    sleep 0.1; waited=$((waited + 1))
   done
   rm -f "$out"
-  if [[ "$got" != 1 ]]; then
-    MUTATION_LEASE_ACTIVE=0
-    if [[ -n "$MUTATION_LEASE_PID" ]]; then
-      kill "$MUTATION_LEASE_PID" 2>/dev/null || true
-      wait "$MUTATION_LEASE_PID" 2>/dev/null || true
-    fi
-    MUTATION_LEASE_PID=""
+  if [[ "$got" != 1 ]] \
+      || ! same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" \
+      || ! same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START"; then
+    release_production_mutation_lease
     echo "✗ 未取得 kl-mirror production-mutation lease(远端 flock -w ${lease_wait} 竞争超时 / ssh 失败 / ${poll_ceiling}s 无 LEASED)。" >&2
     echo "  可能有另一生产变更(部署 / 自愈 host-action / 人工 runbook wrapper)正持锁;" >&2
     echo "  稍后重试或核查 $KL_HOST:$PRODUCTION_MUTATION_LOCK。紧急旁路(仅 runbook 记载):OC_V5_SKIP_MUTATION_LEASE=1。" >&2
     return 1
   fi
-  echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,持有至本次收尾;远端 holder 硬 TTL ${lease_ttl}s,deploy_id=$deploy_id)"
+  echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,本地安全 TTL ${local_ttl}s,远端 holder 硬 TTL ${lease_ttl}s,deploy_id=$deploy_id)"
   return 0
 }
 
@@ -990,16 +1302,19 @@ set -Eeuo pipefail
 lock="$1"; meta="$2"; force="$3"
 [ "$force" = 1 ] || force=0
 now="$(date +%s)"
-# 锁空闲判定:独立 fd flock -n 拿到 = 无任何 OFD 持锁(holder 已死,内核已释放 flock)。
-lock_free=0
-if [ -e "$lock" ]; then
-  if exec 8>"$lock" 2>/dev/null && flock -n 8 2>/dev/null; then lock_free=1; flock -u 8 2>/dev/null || true; fi
+# 独立 probe 若能取锁，必须**保持到 meta 清完**：这既证明旧 holder 已无 OFD flock，
+# 也堵住“probe 解锁→新 holder 插入→误删新 meta”的 TOCTOU。此分支绝不读取/发送
+# meta PID（旧 PID 可能已被无关进程复用）。
+exec 8>"$lock" 2>/dev/null || { echo "ERROR:lock-open-failed"; exit 0; }
+if flock -n 8 2>/dev/null; then
+  rm -f "$meta" 2>/dev/null || true
+  echo "CLEAN:no-meta-lock-free"
+  flock -u 8 2>/dev/null || true
   exec 8>&- 2>/dev/null || true
-else
-  lock_free=1
+  exit 0
 fi
+exec 8>&- 2>/dev/null || true
 if [ ! -f "$meta" ]; then
-  if [ "$lock_free" = 1 ]; then echo "CLEAN:no-meta-lock-free"; exit 0; fi
   echo "REFUSE:lock-held-without-meta(有 OFD 持锁但无 fencing meta;拒绝盲清)"; exit 0
 fi
 command -v jq >/dev/null 2>&1 || { echo "ERROR:jq-missing"; exit 0; }
@@ -1012,23 +1327,74 @@ hmode="$(jq -r '.mode // empty' "$meta" 2>/dev/null || true)"
 case "$rpid" in ''|*[!0-9]*) echo "REFUSE:meta-unparseable"; exit 0 ;; esac
 case "$started" in ''|*[!0-9]*) started=0 ;; esac
 case "$ttl" in ''|*[!0-9]*) ttl=0 ;; esac
+lock_id="$(stat -L -c '%d:%i' "$lock" 2>/dev/null || true)"
+case "$lock_id" in ''|*[!0-9:]*) echo "ERROR:lock-stat-failed"; exit 0 ;; esac
+lock_inode="${lock_id##*:}"
+pid_owns_lock() {
+  pid="$1"
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -d "/proc/$pid/fd" ] || return 1
+  for fd_path in "/proc/$pid"/fd/*; do
+    [ -e "$fd_path" ] || continue
+    [ "$(stat -L -c '%d:%i' "$fd_path" 2>/dev/null || true)" = "$lock_id" ] || continue
+    fd="${fd_path##*/}"
+    grep -Eq "^lock:.*[[:space:]]FLOCK[[:space:]]+ADVISORY[[:space:]]+WRITE[[:space:]]+.*:${lock_inode}[[:space:]]" \
+      "/proc/$pid/fdinfo/$fd" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# kill -0 只证明 PID 存在，不能证明它仍是 meta 所指 holder。真正授权信号的证据是：
+# 同一 PID 的某 fd 指向当前 lock dev:inode，且该 fdinfo 直证 FLOCK WRITE。
 holder_alive=0; kill -0 "$rpid" 2>/dev/null && holder_alive=1
+if [ "$holder_alive" != 1 ] || ! pid_owns_lock "$rpid"; then
+  echo "REFUSE:holder-identity-mismatch pid=$rpid deploy_id=$did"
+  exit 0
+fi
 age=$(( now - started ))
 stale=0
-[ "$holder_alive" = 0 ] && stale=1
 [ "$ttl" -gt 0 ] && [ "$age" -ge "$ttl" ] && stale=1
 if [ "$stale" = 0 ] && [ "$force" != 1 ]; then
   printf 'REFUSE:holder-live pid=%s host=%s mode=%s age=%ss ttl=%ss deploy_id=%s\n' "$rpid" "$hhost" "$hmode" "$age" "$ttl" "$did"
   exit 0
 fi
 reason=stale; [ "$stale" = 0 ] && reason=forced
-if [ "$holder_alive" = 1 ]; then
-  kill -TERM "$rpid" 2>/dev/null || true
-  i=0; while [ "$i" -lt 5 ]; do kill -0 "$rpid" 2>/dev/null || break; sleep 1; i=$((i+1)); done
-  kill -0 "$rpid" 2>/dev/null && kill -KILL "$rpid" 2>/dev/null || true
+# 发 TERM 前重验，禁止 fd close / PID reuse 窗把信号送给无关进程。
+pid_owns_lock "$rpid" || { echo "REFUSE:holder-identity-changed pid=$rpid"; exit 0; }
+kill -TERM "$rpid" 2>/dev/null || true
+
+# 等 holder 正常 trap 退出；若仍持锁，KILL 前再次证明**同一个 PID 仍持同一 flock**。
+i=0
+while [ "$i" -lt 5 ]; do
+  exec 8>"$lock" 2>/dev/null || { echo "ERROR:lock-open-failed"; exit 0; }
+  if flock -n 8 2>/dev/null; then break; fi
+  exec 8>&- 2>/dev/null || true
+  sleep 1
+  i=$((i+1))
+done
+if ! flock -n 8 2>/dev/null; then
+  exec 8>&- 2>/dev/null || true
+  pid_owns_lock "$rpid" || { echo "REFUSE:holder-identity-changed-before-kill pid=$rpid"; exit 0; }
+  kill -KILL "$rpid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 5 ]; do
+    exec 8>"$lock" 2>/dev/null || { echo "ERROR:lock-open-failed"; exit 0; }
+    if flock -n 8 2>/dev/null; then break; fi
+    exec 8>&- 2>/dev/null || true
+    sleep 1
+    i=$((i+1))
+  done
+fi
+# 只有 probe 现持 flock 才能删 meta / 宣告 CLEAN；否则未知 holder 仍在，fail-closed。
+if ! flock -n 8 2>/dev/null; then
+  exec 8>&- 2>/dev/null || true
+  echo "REFUSE:termination-unconfirmed pid=$rpid"
+  exit 0
 fi
 rm -f "$meta" 2>/dev/null || true
 printf 'CLEAN:%s pid=%s host=%s mode=%s age=%ss ttl=%ss deploy_id=%s\n' "$reason" "$rpid" "$hhost" "$hmode" "$age" "$ttl" "$did"
+flock -u 8 2>/dev/null || true
+exec 8>&- 2>/dev/null || true
 exit 0
 REMOTE
   )"; then
@@ -1047,54 +1413,72 @@ REMOTE
 }
 
 release_production_mutation_lease() {
+  local incomplete=0
   [[ "$MUTATION_LEASE_ACTIVE" == 1 ]] || return 0
-  MUTATION_LEASE_ACTIVE=0
-  [[ "$DRY" == 1 ]] && return 0
+  if [[ "$DRY" == 1 ]]; then MUTATION_LEASE_ACTIVE=0; return 0; fi
   if [[ -n "$MUTATION_LEASE_PID" ]]; then
-    kill "$MUTATION_LEASE_PID" 2>/dev/null || true
-    wait "$MUTATION_LEASE_PID" 2>/dev/null || true
-    MUTATION_LEASE_PID=""
+    terminate_exact_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START"
+    if same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START"; then
+      incomplete=1
+    else
+      wait "$MUTATION_LEASE_PID" 2>/dev/null || true
+      MUTATION_LEASE_PID=""; MUTATION_LEASE_START=""; MUTATION_LEASE_PGID=""
+    fi
   fi
+  if [[ -n "$MUTATION_LEASE_TTL_PID" ]]; then
+    terminate_exact_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"
+    if same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"; then
+      incomplete=1
+    else
+      wait "$MUTATION_LEASE_TTL_PID" 2>/dev/null || true
+      MUTATION_LEASE_TTL_PID=""; MUTATION_LEASE_TTL_START=""; MUTATION_LEASE_TTL_PGID=""
+    fi
+  fi
+  # Keep ACTIVE=1 until both exact identities are collected. A controlled
+  # signal/EXIT trap in the middle can then re-enter this cleanup idempotently
+  # instead of mistaking a still-live holder for an already released lease.
+  if [[ "$incomplete" == 1 ]]; then
+    echo "FATAL:production-mutation lease 有 KILL-pending 进程；不阻塞 wait，保留 exact identity 供重试" >&2
+    return 1
+  fi
+  MUTATION_LEASE_ACTIVE=0
+  return 0
+}
+
+mutation_lease_live() {
+  [[ "$MUTATION_LEASE_BYPASSED" == 1 || "$DRY" == 1 ]] && return 0
+  [[ "$MUTATION_LEASE_ACTIVE" == 1 ]] || return 1
+  [[ -n "$MUTATION_LEASE_PID" && -n "$MUTATION_LEASE_START" \
+    && -n "$MUTATION_LEASE_TTL_PID" && -n "$MUTATION_LEASE_TTL_START" ]] || return 1
+  same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
+    && same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"
 }
 
 # 翻转/激活类关键点前活体断言:后台 ssh 死 → 远端 flock 已随通道关闭释放,自愈 host-action
-# 可能已插入 → 返回非零,调用方走本 lane 既有失败/补偿路径(绝不带死锁盲翻)。
+# 可能已插入 → 返回专用 86；调用方必须直接 crash-stop，禁止 cleanup/补偿。
 assert_mutation_lease_alive() {
   local ctx="${1:-flip}"
   [[ "$MUTATION_LEASE_BYPASSED" == 1 || "$DRY" == 1 ]] && return 0
   if [[ "$MUTATION_LEASE_ACTIVE" != 1 ]]; then
     echo "✗ [$ctx] production-mutation lease 未持有(不应发生);中止本次翻转。" >&2
-    return 1
+    return 86
   fi
-  if [[ -z "$MUTATION_LEASE_PID" ]] || ! kill -0 "$MUTATION_LEASE_PID" 2>/dev/null; then
-    echo "✗ [$ctx] production-mutation lease 后台 ssh 已死(远端 flock 可能已释放,自愈 host-action 可能已介入);中止翻转,走本 lane 既有失败路径。" >&2
-    MUTATION_LEASE_ACTIVE=0
-    return 1
+  if ! mutation_lease_live; then
+    echo "✗ [$ctx] production-mutation lease ssh/本地 TTL 已失活(远端 flock 可能已释放);crash-stop 本 lane。" >&2
+    return 86
   fi
   return 0
 }
 
-# 补偿路径专用:执行补偿(恢复稳态)前**阻塞等待**重取远端 lease,**永不因失败中止补偿**(恢复稳态优先)。
-# 与 assert_mutation_lease_alive 的语义正好相反:翻转点失活→中止(前滚有害);补偿点失活→阻塞重取
-# (远端 flock -w 180,其余持有者只有秒级 host-action opcode 或已死部署的残留 lease,几乎必成)后照样补偿。
-# 等待仍失败才降级在无 lease 下继续:**补偿优先于互斥,残余窗口=host-action 90s 内的并发,已知且接受**。
-reacquire_mutation_lease_best_effort() {  # <ctx>
+# 补偿路径同样禁止越过 lease。失锁后 generic parent 不猜 child saga 阶段、不重取后
+# 自动补偿（期间其它 holder 可能已经写过）；直接返回专用 86，由 supervisor crash-stop
+# 整个 lane，保留 deploy_state / in-flight marker，待人工核对后显式恢复。
+require_mutation_lease_for_compensation() {  # <ctx>
   local ctx="${1:-compensation}"
   [[ "$MUTATION_LEASE_BYPASSED" == 1 || "$DRY" == 1 ]] && return 0
-  # 已活体持有则无需重取(幂等:多个补偿入口可安全连调)。
-  if [[ "$MUTATION_LEASE_ACTIVE" == 1 && -n "$MUTATION_LEASE_PID" ]] && kill -0 "$MUTATION_LEASE_PID" 2>/dev/null; then
-    return 0
-  fi
-  echo "⚠ [$ctx] production-mutation lease 已失活;补偿前**阻塞等待**重新 acquire(远端 flock -w 180,至多 ~180s;其余持有者只有秒级 host-action opcode 或已死部署的残留 lease,几乎必成)…" >&2
-  MUTATION_LEASE_ACTIVE=0; MUTATION_LEASE_PID=""   # 复位,让 acquire 阻塞重取(等待窗 180s)
-  if acquire_production_mutation_lease 180; then
-    echo "  ✓ [$ctx] 补偿前已重新取得 production-mutation lease。" >&2
-  else
-    # 阻塞等待(180s)仍失败 → 降级:补偿优先于互斥,残余窗口=host-action 90s 内的并发,已知且接受。
-    # deploy-v5.sh 无自带企微/告警通道(告警走 app 侧 admin_alert_outbox·wecomAlert,非本脚本),故仅 CRITICAL stderr。
-    echo "⚠⚠⚠ CRITICAL [$ctx] production-mutation lease 阻塞等待(180s)仍失败;补偿在**无 lease**下继续(补偿优先于互斥,残余窗口=host-action 90s 内的并发,已知且接受)。" >&2
-  fi
-  return 0
+  mutation_lease_live && return 0
+  echo "FATAL [$ctx] production-mutation lease 已失活；禁止无 lease 补偿/回滚。保留持久状态，crash-stop 后人工核对并显式 recover。" >&2
+  return 86
 }
 
 # ───────────────────────── dangerous offline cutover guard ────────────────
@@ -1223,11 +1607,12 @@ REMOTE
 
 recover_cutover() {
   local reason="${1:-offline cutover failed}"
+  require_mutation_lease_for_compensation "offline-cutover-recovery" || exit 86
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] recover old activation and start $V5_UNIT ($reason)"; return 0; }
   echo "⚠ 离线步骤失败，恢复旧激活面并启动旧服务：$reason" >&2
-  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" <<'REMOTE'
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$HISTORY_PROJECTION_REVISION_CAP" <<'REMOTE'
 set -Eeuo pipefail
-root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"
+root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"; history_cap="${10}"
 mkdir -p "$(dirname "$lock")"; touch "$lock"; chmod 600 "$lock"; exec 9>"$lock"; flock -x 9
 mkdir -p -m 700 "$(dirname "$marker")"; touch "$maintenance_lock"; chmod 600 "$maintenance_lock"
 exec 8>"$maintenance_lock"; flock -x 8
@@ -1265,6 +1650,7 @@ if [[ "$secure" == 1 ]]; then
   source_moved=0; source_installed=0; env_installed=0
   rollback_partial() {
     local rc=$? restore_failed=0
+    [[ $# -eq 0 ]] || rc="$1"
     trap - ERR
     if [[ "$source_moved" == 1 ]]; then
       if [[ "$source_installed" == 1 && -d "$remote_src" ]]; then
@@ -1311,6 +1697,29 @@ if [[ "$secure" == 1 ]]; then
   # paths (node_modules/data). The old tracked activation is overlaid in an
   # isolated sibling directory; no live file changes until the directory swap.
   systemctl stop "$unit"
+  candidate_start_attempted="$(jq -er '
+    if .candidate_start_attempted == true then "true"
+    elif (.candidate_start_attempted // false) == false then "false"
+    else error("invalid candidate_start_attempted") end
+  ' "$bundle/state.json")"
+  # Once the candidate may have served, history_revision is an irreversible
+  # projection protocol floor. If the trusted old source is legacy but the
+  # stopped current source is capable, restore/restart current rather than
+  # silently serving stale projections from the old bundle.
+  old_metadata="$bundle/source/deploy/v5/release-metadata.json"
+  old_history_capability="$(jq -er --arg c "$history_cap" '(.capabilities // []) as $caps
+    | if ($caps | type) != "array" then error("capabilities must be an array")
+      elif (($caps | index($c)) != null) then "capable" else "incapable" end' "$old_metadata")"
+  if [[ "$candidate_start_attempted" == true && "$old_history_capability" == incapable ]]; then
+    current_metadata="$remote_src/deploy/v5/release-metadata.json"
+    current_history_capability="$(jq -er --arg c "$history_cap" '(.capabilities // []) as $caps
+      | if ($caps | type) != "array" then error("capabilities must be an array")
+        elif (($caps | index($c)) != null) then "capable" else "incapable" end' "$current_metadata")"
+    if [[ "$current_history_capability" != incapable ]]; then
+      echo "FATAL: refusing irreversible history projection downgrade during offline recovery" >&2
+      rollback_partial 1
+    fi
+  fi
   cp -al "$remote_src/." "$restore_dir/"
   rsync -a --delete \
     --exclude '.git' --exclude 'node_modules' --exclude 'data' --exclude '*.log' \
@@ -1406,6 +1815,24 @@ mv "$env_file.tmp" "$env_file"
 REMOTE
 }
 
+mark_cutover_candidate_start_attempted() {
+  cutover_break_glass && return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] persist candidate_start_attempted before staged start"; return 0; }
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" <<'REMOTE'
+set -Eeuo pipefail
+root="$1"; lock="$2"; nonce="$3"; bundle="$root/$nonce"; state_file="$bundle/state.json"
+exec 9>"$lock"; flock -x 9
+[[ "$(jq -r '.state' "$state_file")" == activating ]] \
+  || { echo 'FATAL: candidate start marker requires activating state' >&2; exit 1; }
+now="$(date +%s)"
+jq --argjson at "$now" \
+  '.candidate_start_attempted=true | .candidate_start_attempted_at=$at | .updated_at=$at' \
+  "$state_file" >"$state_file.tmp"
+chmod 600 "$state_file.tmp"; sync -f "$state_file.tmp" || sync
+mv "$state_file.tmp" "$state_file"; sync -f "$bundle" || sync
+REMOTE
+}
+
 cutover_transition() {
   local expected="$1" next="$2"
   cutover_require_args || return 1
@@ -1433,7 +1860,9 @@ applied_set="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc "SELECT COALESCE(string_
 applied_hash="$(printf '%s' "$applied_set" | sha256sum | awk '{print $1}')"
 [[ "$applied_hash" == "$(jq -r '.applied_migrations_hash' "$manifest")" ]] || { echo 'FATAL: applied migration set changed after prepare' >&2; exit 1; }
 [[ "$(jq -r '.state' "$state_file")" == "$expected" ]] || { echo 'FATAL: invalid/replayed cutover state' >&2; exit 1; }
-now="$(date +%s)"; jq -n --arg state "$next" --argjson at "$now" '{state:$state,updated_at:$at}' >"$state_file.tmp"
+now="$(date +%s)"
+jq --arg state "$next" --argjson at "$now" '.state=$state | .updated_at=$at' \
+  "$state_file" >"$state_file.tmp"
 chmod 600 "$state_file.tmp"; sync -f "$state_file.tmp" || sync; mv "$state_file.tmp" "$state_file"; sync -f "$bundle" || sync
 REMOTE
 }
@@ -1532,17 +1961,107 @@ write_version() {
 #   - sessions.db 早已外置 /root/.openclaude-v5/,data/ 空 → 无"运行中 master 数据在树内"问题。
 RELEASES_ROOT="/opt/openclaude/openclaude-v5-releases"
 DEPLOY_RECOVERY_MARKER="$RELEASES_ROOT/.manual-recovery-required"
+MUTATION_LANE_INFLIGHT_MARKER="${OC_V5_MUTATION_LANE_MARKER:-$RELEASES_ROOT/.mutation-lane-inflight}"
 RELEASES_KEEP="${RELEASES_KEEP:-6}"
+
+arm_mutation_lane_inflight() { # parent-only; called while lease is live
+  [[ "$DRY" == 1 || "$MUTATION_LEASE_BYPASSED" == 1 ]] && return 0
+  local nonce source_commit result
+  nonce="$(openssl rand -hex 16)"
+  source_commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$nonce" =~ ^[0-9a-f]{32}$ && "$source_commit" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "✗ 无法生成 mutation lane in-flight 身份" >&2
+    return 1
+  }
+  if ! result="$(ssh "$KL_HOST" bash -s -- "$MUTATION_LANE_INFLIGHT_MARKER" \
+      "$nonce" "$MODE" "$source_commit" "$$" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; nonce="$2"; mode="$3"; source_commit="$4"; outer_pid="$5"
+[[ "$nonce" =~ ^[0-9a-f]{32}$ && "$source_commit" =~ ^[0-9a-f]{40}$ && "$outer_pid" =~ ^[1-9][0-9]*$ ]] || exit 2
+dir="$(dirname "$marker")"
+mkdir -p -m 700 "$dir"
+tmp="${marker}.tmp.$$"
+umask 077
+jq -n --arg nonce "$nonce" --arg mode "$mode" --arg source_commit "$source_commit" \
+  --argjson outer_pid "$outer_pid" --argjson started_at "$(date +%s)" \
+  '{schema:1,nonce:$nonce,mode:$mode,source_commit:$source_commit,outer_pid:$outer_pid,started_at:$started_at}' >"$tmp"
+chmod 600 "$tmp"
+sync -f "$tmp" || sync
+if ! ln "$tmp" "$marker" 2>/dev/null; then rm -f "$tmp"; echo EXISTS; exit 20; fi
+sync -f "$dir" || sync
+jq -e --arg nonce "$nonce" --arg mode "$mode" --arg source_commit "$source_commit" \
+  '.schema == 1 and .nonce == $nonce and .mode == $mode and .source_commit == $source_commit' \
+  "$marker" >/dev/null
+rm -f "$tmp"
+sync -f "$dir" || sync
+echo "ARMED:$nonce"
+REMOTE
+  )"; then
+    echo "✗ mutation lane in-flight marker 已存在或无法原子预置:$KL_HOST:$MUTATION_LANE_INFLIGHT_MARKER" >&2
+    return 1
+  fi
+  [[ "$result" == "ARMED:$nonce" ]] || { echo "✗ mutation lane marker 返回异常:$result" >&2; return 1; }
+  MUTATION_LANE_INFLIGHT_NONCE="$nonce"
+  MUTATION_LANE_INFLIGHT_ACTIVE=1
+  echo "  ✓ mutation lane in-flight 已预置(mode=$MODE nonce=$nonce)"
+}
+
+clear_mutation_lane_inflight_exact() { # child-only; last mutation before controlled exit
+  [[ "$MUTATION_LANE_INFLIGHT_ACTIVE" == 1 && -n "$MUTATION_LANE_INFLIGHT_NONCE" ]] || return 0
+  [[ "$DRY" == 1 || "$MUTATION_LEASE_BYPASSED" == 1 ]] && return 0
+  local result
+  if ! result="$(ssh "$KL_HOST" bash -s -- "$MUTATION_LANE_INFLIGHT_MARKER" \
+      "$MUTATION_LANE_INFLIGHT_NONCE" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; nonce="$2"; dir="$(dirname "$marker")"
+if [[ -f "$marker" ]] && jq -e --arg nonce "$nonce" '.schema == 1 and .nonce == $nonce' "$marker" >/dev/null 2>&1; then
+  rm -f "$marker"
+  sync -f "$dir" || sync
+  [[ ! -e "$marker" ]]
+  echo CLEARED
+else
+  echo PRESERVED
+fi
+REMOTE
+  )"; then
+    echo "✗ mutation lane in-flight marker exact clear 失败；保留供人工恢复" >&2
+    return 1
+  fi
+  [[ "$result" == CLEARED ]] || { echo "✗ mutation lane marker nonce 已变化/不存在；拒绝宣告收尾:$result" >&2; return 1; }
+  MUTATION_LANE_INFLIGHT_ACTIVE=0
+  MUTATION_LANE_INFLIGHT_NONCE=""
+}
+
+mutation_lane_inflight_absent() { # read-only parent verification
+  [[ "$DRY" == 1 || "$MUTATION_LEASE_BYPASSED" == 1 ]] && return 0
+  ssh "$KL_HOST" "test ! -e '$MUTATION_LANE_INFLIGHT_MARKER'"
+}
 
 # 状态提交回执无法裁决时，绝不能继续猜测并翻另一生效面。落一个远端持久标记，后续所有
 # 写 lane 起手即拒；人工核对 deploy_state / A/B symlink / unit / tuple history 后才能移除。
 mark_deploy_recovery_required() {  # $1=reason
-  local reason="$1" quoted
-  printf -v quoted '%q' "$reason"
-  ssh "$KL_HOST" "set -e; umask 077; mkdir -p '$RELEASES_ROOT'; printf '%s\\n' $quoted > '$DEPLOY_RECOVERY_MARKER.tmp'; mv -f '$DEPLOY_RECOVERY_MARKER.tmp' '$DEPLOY_RECOVERY_MARKER'" \
-    || echo "FATAL:人工恢复标记也写入失败:$DEPLOY_RECOVERY_MARKER" >&2
+  local reason="$1" encoded
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] mark manual recovery required:$reason"; return 0; }
+  encoded="$(printf '%s' "$reason" | base64 -w0)"
+  if ! ssh "$KL_HOST" bash -s -- "$DEPLOY_RECOVERY_MARKER" "$encoded" <<'REMOTE'
+set -Eeuo pipefail
+marker="$1"; encoded="$2"; dir="$(dirname "$marker")"; tmp="${marker}.tmp.$$"
+umask 077
+mkdir -p -m 700 "$dir"
+printf '%s' "$encoded" | base64 -d >"$tmp"
+chmod 600 "$tmp"
+sync -f "$tmp" || sync
+mv -f "$tmp" "$marker"
+sync -f "$dir" || sync
+[[ "$(base64 -w0 <"$marker")" == "$encoded" ]]
+REMOTE
+  then
+    echo "FATAL:人工恢复标记写入/回读失败:$DEPLOY_RECOVERY_MARKER；保留 mutation in-flight 证据并 crash-stop" >&2
+    exit 86
+  fi
   echo "FATAL:部署进入人工恢复态:$reason" >&2
   echo "  标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER（核对并修复 state/runtime 后人工移除）" >&2
+  return 0
 }
 
 assert_no_deploy_recovery_marker() {
@@ -1551,6 +2070,12 @@ assert_no_deploy_recovery_marker() {
     echo "✗ 检测到未收敛的人工恢复标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER" >&2
     ssh "$KL_HOST" "sed -n '1,20p' '$DEPLOY_RECOVERY_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
     echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，收敛后人工移除。" >&2
+    return 1
+  fi
+  if ! ssh "$KL_HOST" "test ! -e '$MUTATION_LANE_INFLIGHT_MARKER'"; then
+    echo "✗ 检测到未收敛的 mutation lane in-flight 标记:$KL_HOST:$MUTATION_LANE_INFLIGHT_MARKER" >&2
+    ssh "$KL_HOST" "cat '$MUTATION_LANE_INFLIGHT_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
+    echo "  上次 lane 可能因 lease/parent 丢失被 crash-stop；禁止自动补偿或新写。先核对 deploy_state、symlink/unit/runtime 后人工移除。" >&2
     return 1
   fi
 }
@@ -1619,6 +2144,349 @@ bg_current_release() {
   ssh "$KL_HOST" "test -L '$src' && readlink -f '$src' || true" 2>/dev/null || true
 }
 
+# Release 完整标记 v2。旧 `{sha,builtAt}` 标记从来没有绑定源码 full SHA、metadata 或
+# 实际制品；因此不能继续作为任意 rollback/canary 的信任根。唯一兼容例外是：本次
+# invocation 已同时持有 deploy lock + production-mutation lease 后、任何 release 写入前
+# 精确捕获并验证的 serving predecessor。这个例外只活在当前进程内，不落盘、不泛化。
+RELEASE_COMPLETE_SCHEMA_VERSION=2
+CAPTURED_RELEASE_PREDECESSOR=""
+TRUSTED_LEGACY_PREDECESSOR=""
+TRUSTED_LEGACY_SOURCE_COMMIT=""
+TRUSTED_LEGACY_ARTIFACT_SHA256=""
+CAPTURED_EGRESS_PREDECESSOR=""
+TRUSTED_LEGACY_EGRESS_PREDECESSOR=""
+TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT=""
+TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256=""
+
+# 对 release 全树（含 node_modules/dist、常规文件 mode 与 symlink 原始 target）做稳定
+# SHA-256；只排除根 `.complete` 本身，避免 marker 自引用。函数既可本地自测，也会通过
+# `declare -f` 原样流到 kl-mirror，build/verify 共用一份算法，禁止双实现漂移。
+release_artifact_digest() { # <absolute-release-root>
+  local root="$1"
+  [[ -d "$root" && ! -L "$root" ]] || {
+    echo "FATAL: release artifact root 非真实目录:$root" >&2
+    return 1
+  }
+  # One Python walker avoids spawning ~4 processes per file (the old shell
+  # manifest took >90 s on the 38k-file production release). Length-prefixed
+  # byte fields cover arbitrary path/symlink bytes without TSV ambiguity; file,
+  # directory and symlink type/mode/uid/gid are all bound. Root .complete alone
+  # is excluded to avoid self-reference.
+  python3 - "$root" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = os.fsencode(os.path.abspath(sys.argv[1]))
+if not os.path.isdir(root) or os.path.islink(root):
+    raise SystemExit("FATAL: release artifact root is not a real directory")
+
+def identity(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid,
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+def snapshot_tree():
+    root_stat = os.lstat(root)
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise RuntimeError("release artifact root changed type")
+    rows = []
+
+    def collect(directory, prefix=b""):
+        with os.scandir(directory) as scan:
+            for entry in scan:
+                name = entry.name
+                rel = name if not prefix else prefix + b"/" + name
+                if rel == b".complete":
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                mode = st.st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                    raise RuntimeError(f"non-regular release entry: {os.fsdecode(rel)!r}")
+                rows.append((rel, entry.path, identity(st)))
+                if stat.S_ISDIR(mode):
+                    collect(entry.path, rel)
+
+    collect(root)
+    rows.sort(key=lambda item: item[0])
+    return identity(root_stat), rows
+
+root_before, entries = snapshot_tree()
+digest = hashlib.sha256(b"openclaude-release-artifact-v2\0")
+
+def field(value):
+    if isinstance(value, str):
+        value = value.encode("ascii")
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+root_stat = os.lstat(root)
+if identity(root_stat) != root_before:
+    raise RuntimeError("release artifact root changed before digest")
+field(b"D")
+field(b"")
+field(str(stat.S_IMODE(root_stat.st_mode)))
+field(str(root_stat.st_uid))
+field(str(root_stat.st_gid))
+
+for rel, absolute, before in entries:
+    st = os.lstat(absolute)
+    if identity(st) != before:
+        raise RuntimeError(f"release entry changed during digest: {os.fsdecode(rel)!r}")
+    mode = st.st_mode
+    kind = b"F" if stat.S_ISREG(mode) else b"D" if stat.S_ISDIR(mode) else b"L"
+    field(kind)
+    field(rel)
+    field(str(stat.S_IMODE(mode)))
+    field(str(st.st_uid))
+    field(str(st.st_gid))
+    if kind == b"F":
+        field(str(st.st_size))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(absolute, flags)
+        if identity(os.fstat(fd)) != before:
+            os.close(fd)
+            raise RuntimeError(f"release file changed before open: {os.fsdecode(rel)!r}")
+        with os.fdopen(fd, "rb", buffering=1024 * 1024) as fh:
+            while chunk := fh.read(1024 * 1024):
+                digest.update(chunk)
+            if identity(os.fstat(fh.fileno())) != before:
+                raise RuntimeError(f"release file changed while open: {os.fsdecode(rel)!r}")
+    elif kind == b"L":
+        field(os.readlink(absolute))
+    if identity(os.lstat(absolute)) != before:
+        raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+
+# A per-entry check alone misses a new/deleted path after the directory was
+# scanned or after that directory's own hash step. Re-snapshot the entire tree
+# and compare the exact path/type/identity set plus the release root identity.
+root_after, entries_after = snapshot_tree()
+before_signature = [(rel, before) for rel, _absolute, before in entries]
+after_signature = [(rel, after) for rel, _absolute, after in entries_after]
+if root_after != root_before or after_signature != before_signature:
+    raise RuntimeError("release tree changed during digest")
+
+print(digest.hexdigest())
+PY
+}
+
+# 远端只读 probe：物理边界、marker schema、目录名、VERSION、metadata digest 与全树
+# artifact digest 一次核完。stdout 是内部 TSV，不承载人类日志。
+release_marker_probe() { # <release-dir>
+  local reldir="$1"
+  {
+    declare -f release_artifact_digest
+    cat <<'REMOTE'
+set -Eeuo pipefail
+reldir="$1"; releases_root="$2"; schema="$3"
+root_real="$(readlink -f -- "$releases_root")"
+dir_real="$(readlink -f -- "$reldir")"
+[[ -n "$root_real" && -n "$dir_real" && "$dir_real" == "$reldir" \
+  && "$(dirname -- "$dir_real")" == "$root_real" && -d "$dir_real" && ! -L "$dir_real" ]] || {
+  echo "FATAL: release 不是真实 releases-root 直系目录:$reldir" >&2; exit 1;
+}
+marker="$reldir/.complete"; metadata="$reldir/deploy/v5/release-metadata.json"; version="$reldir/VERSION.json"
+[[ -f "$marker" && ! -L "$marker" && -f "$metadata" && ! -L "$metadata" \
+  && -f "$version" && ! -L "$version" ]] || {
+  echo "FATAL: release marker/metadata/VERSION 缺失或为 symlink:$reldir" >&2; exit 1;
+}
+read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$reldir")
+read -r marker_uid marker_gid marker_mode < <(stat -Lc '%u %g %a' -- "$marker")
+[[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] || {
+  echo "FATAL: release root ownership/mode 不可信:$reldir uid=$root_uid gid=$root_gid mode=$root_mode" >&2; exit 1;
+}
+[[ "$marker_uid" == 0 && "$marker_gid" == 0 \
+  && ( "$marker_mode" == 644 || "$marker_mode" == 444 ) ]] || {
+  echo "FATAL: release marker ownership/mode 不可信:$marker uid=$marker_uid gid=$marker_gid mode=$marker_mode" >&2; exit 1;
+}
+kind="$(jq -er --argjson schema "$schema" '
+  if (.schemaVersion == $schema) then "strong"
+  elif (has("schemaVersion") | not) then "legacy"
+  else error("unsupported release marker schema") end
+' "$marker")" || exit 1
+base="$(basename -- "$reldir")"
+version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || exit 1
+if [[ "$kind" == strong ]]; then
+  row="$(jq -er --argjson schema "$schema" '
+    if ((keys | sort) == (["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] | sort)
+      and .schemaVersion == $schema
+      and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
+      and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
+      and (.metadataSha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$")))
+    then [.sourceCommit,.builtAt,.metadataSha256,.artifactSha256] | @tsv
+    else error("invalid strong release marker") end
+  ' "$marker")" || exit 1
+  IFS=$'\t' read -r source_commit built_at metadata_want artifact_want <<<"$row"
+  stem="${base#rel-}"; stem="${stem%-migrated}"; suffix="-$built_at"
+  [[ "$base" == rel-* && "$stem" == *"$suffix" ]] || {
+    echo "FATAL: strong marker builtAt 与 release dirname 不一致:$base" >&2; exit 1;
+  }
+  short="${stem%"$suffix"}"
+  [[ "$short" =~ ^[0-9a-f]{7,40}$ && "$source_commit" == "$short"* \
+    && "$version_commit" == "$short" ]] || {
+    echo "FATAL: strong marker sourceCommit/dirname/VERSION 不一致:$base" >&2; exit 1;
+  }
+  metadata_have="$(sha256sum -- "$metadata" | cut -d' ' -f1)"
+  [[ "$metadata_have" == "$metadata_want" ]] || {
+    echo "FATAL: release metadata digest mismatch:$reldir" >&2; exit 1;
+  }
+  artifact_have="$(release_artifact_digest "$reldir")"
+  [[ "$artifact_have" == "$artifact_want" ]] || {
+    echo "FATAL: release artifact digest mismatch:$reldir" >&2; exit 1;
+  }
+  printf 'strong\t%s\t%s\t%s\t%s\n' "$source_commit" "$short" "$built_at" "$artifact_want"
+else
+  row="$(jq -er '
+    if (((keys | sort) == (["builtAt","sha"] | sort)
+        or (keys | sort) == (["builtAt","migrated","sha"] | sort))
+      and (.sha | type == "string" and test("^[0-9a-f]{7,40}$"))
+      and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
+      and ((has("migrated") | not) or .migrated == true))
+    then [.sha,.builtAt] | @tsv else error("invalid legacy release marker") end
+  ' "$marker")" || exit 1
+  IFS=$'\t' read -r short built_at <<<"$row"
+  [[ "$base" == "rel-$short-$built_at" || "$base" == "rel-$short-$built_at-migrated" ]] || {
+    echo "FATAL: legacy marker sha/builtAt 与 release dirname 不一致:$base" >&2; exit 1;
+  }
+  [[ "$version_commit" == "$short" ]] || {
+    echo "FATAL: legacy marker 与 VERSION.commit 不一致:$base" >&2; exit 1;
+  }
+  artifact_have="$(release_artifact_digest "$reldir")"
+  [[ "$artifact_have" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  # Keep probe columns uniform:kind,source identity,dirname short,builtAt,artifact.
+  # Legacy has no full source identity, so its validated short SHA occupies both
+  # identity columns until the caller resolves it against trusted git objects.
+  printf 'legacy\t%s\t%s\t%s\t%s\n' "$short" "$short" "$built_at" "$artifact_have"
+fi
+REMOTE
+  } | ssh "$KL_HOST" bash -s -- "$reldir" "$RELEASES_ROOT" "$RELEASE_COMPLETE_SCHEMA_VERSION"
+}
+
+assert_release_metadata_matches_commit() { # <release-dir> <full-commit>
+  local reldir="$1" full="$2"
+  [[ "$full" =~ ^[0-9a-f]{40}$ ]] || return 1
+  git -C "$REPO_ROOT" cat-file -e "${full}^{commit}" 2>/dev/null || {
+    echo "✗ release sourceCommit 不在本地 trusted git object store:$full" >&2; return 1;
+  }
+  if ! git -C "$REPO_ROOT" show "${full}:deploy/v5/release-metadata.json" \
+      | ssh "$KL_HOST" "cmp - '$reldir/deploy/v5/release-metadata.json'"; then
+    echo "✗ release-metadata 原始字节不等于 trusted git $full:$reldir" >&2
+    return 1
+  fi
+}
+
+assert_release_marker() { # <release-dir> [master|egress legacy trust scope]
+  local reldir="$1" trust_scope="${2:-master}" probe kind source short built artifact
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 验证 release strong marker/full sourceCommit/metadata+artifact digest:$reldir"
+    return 0
+  fi
+  probe="$(release_marker_probe "$reldir")" || {
+    echo "✗ release 完整标记校验失败:$reldir" >&2; return 1;
+  }
+  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
+  case "$kind" in
+    strong)
+      assert_release_metadata_matches_commit "$reldir" "$source" || return 1
+      ;;
+    legacy)
+      local trusted_path trusted_source trusted_artifact
+      case "$trust_scope" in
+        master)
+          trusted_path="$TRUSTED_LEGACY_PREDECESSOR"
+          trusted_source="$TRUSTED_LEGACY_SOURCE_COMMIT"
+          trusted_artifact="$TRUSTED_LEGACY_ARTIFACT_SHA256"
+          ;;
+        egress)
+          trusted_path="$TRUSTED_LEGACY_EGRESS_PREDECESSOR"
+          trusted_source="$TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT"
+          trusted_artifact="$TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256"
+          ;;
+        *) echo "✗ legacy release trust scope 非法:$trust_scope" >&2; return 1 ;;
+      esac
+      [[ -n "$trusted_path" && "$reldir" == "$trusted_path" \
+        && "$trusted_source" =~ ^[0-9a-f]{40}$ && "$trusted_source" == "$source"* \
+        && "$trusted_artifact" =~ ^[0-9a-f]{64}$ && "$artifact" == "$trusted_artifact" ]] || {
+        echo "✗ generic legacy .complete 非本 invocation 精确捕获且制品未变的 $trust_scope predecessor，拒绝:$reldir" >&2
+        return 1
+      }
+      assert_release_metadata_matches_commit "$reldir" "$trusted_source" || return 1
+      ;;
+    *) echo "✗ release marker probe 返回非法 kind:${kind:-<empty>}" >&2; return 1 ;;
+  esac
+  echo "  ✓ release marker 校验通过(kind=$kind path=$reldir)"
+}
+
+capture_trusted_release_predecessor() { # [explicit-release-dir，仅供 hermetic test]
+  local current="${1:-}" probe kind source short built artifact full
+  [[ "$DRY" == 1 ]] && return 0
+  if [[ -z "$current" ]]; then
+    resolve_active_lane || return 1
+    current="$(bg_current_release "$ACTIVE_SRC")"
+  fi
+  [[ -n "$current" ]] || { echo "✗ 无法在 mutation 前捕获 serving predecessor" >&2; return 1; }
+  probe="$(release_marker_probe "$current")" || {
+    echo "✗ serving predecessor marker/目录/VERSION 校验失败:$current" >&2; return 1;
+  }
+  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
+  CAPTURED_RELEASE_PREDECESSOR="$current"
+  TRUSTED_LEGACY_PREDECESSOR=""; TRUSTED_LEGACY_SOURCE_COMMIT=""; TRUSTED_LEGACY_ARTIFACT_SHA256=""
+  case "$kind" in
+    strong)
+      assert_release_metadata_matches_commit "$current" "$source" || return 1
+      ;;
+    legacy)
+      full="$(git -C "$REPO_ROOT" rev-parse --verify "${source}^{commit}" 2>/dev/null || true)"
+      [[ "$full" =~ ^[0-9a-f]{40}$ && "$full" == "$source"* ]] || {
+        echo "✗ legacy predecessor short SHA 无法唯一解析为 trusted full commit:$source" >&2; return 1;
+      }
+      assert_release_metadata_matches_commit "$current" "$full" || return 1
+      TRUSTED_LEGACY_PREDECESSOR="$current"
+      TRUSTED_LEGACY_SOURCE_COMMIT="$full"
+      TRUSTED_LEGACY_ARTIFACT_SHA256="$artifact"
+      ;;
+    *) echo "✗ serving predecessor marker kind 非法:${kind:-<empty>}" >&2; return 1 ;;
+  esac
+  echo "  ✓ 已在 deploy+mutation lock 内捕获 predecessor(kind=$kind path=$current)"
+}
+
+# Egress may intentionally lag the serving master by many releases. Capture its
+# real process cwd under the same two locks, but grant this legacy pin only to
+# egress activation/compensation; it is never a master rollback trust root.
+capture_trusted_egress_predecessor() { # [explicit-release-dir，仅供 hermetic test]
+  local current="${1:-}" probe kind source short built artifact full
+  [[ "$DRY" == 1 ]] && return 0
+  if [[ -z "$current" ]]; then
+    current="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+  fi
+  [[ -n "$current" ]] || { echo "✗ 无法在 mutation 前捕获 egress predecessor" >&2; return 1; }
+  probe="$(release_marker_probe "$current")" || {
+    echo "✗ egress predecessor marker/目录/VERSION 校验失败:$current" >&2; return 1;
+  }
+  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
+  CAPTURED_EGRESS_PREDECESSOR="$current"
+  TRUSTED_LEGACY_EGRESS_PREDECESSOR=""; TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT=""
+  TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256=""
+  case "$kind" in
+    strong)
+      assert_release_metadata_matches_commit "$current" "$source" || return 1
+      ;;
+    legacy)
+      full="$(git -C "$REPO_ROOT" rev-parse --verify "${source}^{commit}" 2>/dev/null || true)"
+      [[ "$full" =~ ^[0-9a-f]{40}$ && "$full" == "$source"* ]] || {
+        echo "✗ legacy egress predecessor short SHA 无法唯一解析:$source" >&2; return 1;
+      }
+      assert_release_metadata_matches_commit "$current" "$full" || return 1
+      TRUSTED_LEGACY_EGRESS_PREDECESSOR="$current"
+      TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT="$full"
+      TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256="$artifact"
+      ;;
+    *) echo "✗ egress predecessor marker kind 非法:${kind:-<empty>}" >&2; return 1 ;;
+  esac
+  echo "  ✓ 已在 deploy+mutation lock 内捕获 egress predecessor(kind=$kind path=$current)"
+}
+
 # 蓝绿前置:active slot 的 src 必须已是 symlink 布局且指向 RELEASES_ROOT 下的完整 release(否则先迁移)。
 # $1=要校验的 src(默认 ACTIVE_SRC;传统 lane resolve_active_lane 后传 active slot 的 src)。
 assert_bluegreen_layout() {
@@ -1651,6 +2519,80 @@ assert_not_bluegreen_for_cutover() {
 # rel-* 命名空间,activate/rollback/GC 只认带 .complete 的目录,Codex P0#3)。sha 全程钉死一次
 # 贯穿 archive/VERSION/dist(工作树必须干净=即该 sha,Codex P0#2)。
 BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""
+
+write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <builtAt> <schema>
+  local root="$1" full_sha="$2" short_sha="$3" built_at="$4" schema="$5"
+  local metadata_sha artifact_sha marker_tmp root_uid root_gid root_mode marker_uid marker_gid marker_mode
+  [[ "$full_sha" =~ ^[0-9a-f]{40}$ && "$short_sha" =~ ^[0-9a-f]{7,40}$ \
+    && "$full_sha" == "$short_sha"* && "$built_at" =~ ^[0-9]{8}-[0-9]{6}$ \
+    && "$schema" =~ ^[1-9][0-9]*$ ]] || {
+    echo 'FATAL: strong release identity 参数非法' >&2; return 1;
+  }
+  [[ -d "$root" && ! -L "$root" ]] || { echo 'FATAL: strong release root 非法' >&2; return 1; }
+  # Legacy real-directory migration may start from the historical 0775 root.
+  # Normalize only the release root itself while stopped/staged, then prove the
+  # trust anchor is root-owned and not group/other writable before hashing it.
+  chown 0:0 -- "$root" || return 1
+  chmod go-w -- "$root" || return 1
+  read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$root")
+  [[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] || {
+    echo "FATAL: strong release root ownership/mode 不可信:$root" >&2; return 1;
+  }
+  test -f "$root/package.json"
+  test -d "$root/node_modules"
+  test -f "$root/VERSION.json"
+  test -f "$root/packages/web-react/dist/index.html"
+  test -f "$root/deploy/v5/release-metadata.json"
+  [[ "$(jq -er '.commit | select(type == "string")' "$root/VERSION.json")" == "$short_sha" ]] || {
+    echo 'FATAL: VERSION.commit 与 pinned source short SHA 不一致' >&2; return 1;
+  }
+  metadata_sha="$(sha256sum -- "$root/deploy/v5/release-metadata.json" | cut -d' ' -f1)"
+  artifact_sha="$(release_artifact_digest "$root")"
+  [[ "$metadata_sha" =~ ^[0-9a-f]{64}$ && "$artifact_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  marker_tmp="${root}.complete.$$"
+  if ! jq -n \
+    --argjson schemaVersion "$schema" \
+    --arg sourceCommit "$full_sha" \
+    --arg builtAt "$built_at" \
+    --arg metadataSha256 "$metadata_sha" \
+    --arg artifactSha256 "$artifact_sha" \
+    '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256}' >"$marker_tmp"; then
+    rm -f -- "$marker_tmp"
+    return 1
+  fi
+  chmod 0644 "$marker_tmp" || { rm -f -- "$marker_tmp"; return 1; }
+  chown 0:0 "$marker_tmp" || { rm -f -- "$marker_tmp"; return 1; }
+  mv -f -- "$marker_tmp" "$root/.complete" || { rm -f -- "$marker_tmp"; return 1; }
+  read -r marker_uid marker_gid marker_mode < <(stat -Lc '%u %g %a' -- "$root/.complete")
+  [[ "$marker_uid" == 0 && "$marker_gid" == 0 && "$marker_mode" == 644 ]] || {
+    echo "FATAL: strong release marker ownership/mode 不可信:$root/.complete" >&2; return 1;
+  }
+  # Re-hash after the marker is durably in place (the marker itself is excluded)
+  # so a concurrent tree mutation between the first digest and publish cannot
+  # create a self-consistent-looking marker that was never verified as a whole.
+  [[ "$(release_artifact_digest "$root")" == "$artifact_sha" ]] || {
+    echo "FATAL: strong release tree changed while publishing marker:$root" >&2; return 1;
+  }
+}
+
+publish_strong_release() { # <staging> <final-dir> <full-sha> <short-sha> <builtAt>
+  local staging="$1" reldir="$2" full_sha="$3" short_sha="$4" built_at="$5"
+  {
+    declare -f release_artifact_digest write_strong_release_marker_local
+    cat <<'REMOTE'
+set -Eeuo pipefail
+staging="$1"; reldir="$2"; full_sha="$3"; short_sha="$4"; built_at="$5"; schema="$6"
+[[ -d "$staging" && ! -L "$staging" && ! -e "$reldir" ]] || {
+  echo 'FATAL: strong release staging/final path 非法' >&2; exit 1;
+}
+write_strong_release_marker_local "$staging" "$full_sha" "$short_sha" "$built_at" "$schema"
+mv -T -- "$staging" "$reldir"
+REMOTE
+  } | ssh "$KL_HOST" bash -s -- \
+    "$staging" "$reldir" "$full_sha" "$short_sha" "$built_at" "$RELEASE_COMPLETE_SCHEMA_VERSION"
+}
+
 build_release() {
   BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""; DIST_BUILD_ID=""
   local full_sha short_sha ts staging reldir cur
@@ -1666,6 +2608,10 @@ build_release() {
     echo "  [dry-run] build→$staging(archive+node_modules+dist 从 staging pinned 源构建+VERSION+.complete)→ mv -T→$reldir" >&2
     BUILT_RELEASE="$reldir"; return 0
   fi
+  [[ -n "$cur" && "$cur" == "$CAPTURED_RELEASE_PREDECESSOR" ]] || {
+    echo "✗ build_release 前 serving predecessor 未在持锁后精确捕获/已漂移(captured=${CAPTURED_RELEASE_PREDECESSOR:-<none>} current=${cur:-<none>})" >&2
+    return 1
+  }
   # 工作树非干净只是提示(archive 用 full_sha 已 pin,uncommitted 被忽略;避免"以为部署了未提交改动")
   assert_clean_source_tree
   # 远端建到 staging;任一步失败 → 清 staging + return 1(半成品不落 rel-*)
@@ -1679,13 +2625,14 @@ build_release() {
       else
         echo '  lock 变化/无基线 → npm ci' >&2; cd '$staging' && npm ci --no-audit --no-fund >/dev/null 2>&1
       fi"; then echo "✗ node_modules 准备失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
-  # dist:--with-dist 时**在 staging(archive pinned 源)上 vite build**(R2#2:不从共用工作树构建,
+  # dist:--with-dist 时**在 staging(archive pinned 源)上跑官方 workspace build**
+  # (`tsc -b && vite build`;R2#2:不从共用工作树构建,
   # 彻底消 dist 与 archive 不同源);否则硬链继承当前 release 的 dist(前端未变)。两路 DIST_BUILD_ID
   # 都从 staging 读。
   if [[ "$WITH_DIST" == 1 ]]; then
-    echo "── vite build @ staging(pinned $short_sha,不读共用工作树)──" >&2
-    if ! ssh "$KL_HOST" "set -e; cd '$staging/packages/web-react' && npx vite build >/dev/null 2>&1"; then
-      echo "✗ staging vite build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+    echo "── web official build @ staging(pinned $short_sha,不读共用工作树)──" >&2
+    if ! ssh "$KL_HOST" "set -e; cd '$staging' && npm run build --workspace packages/web-react >/dev/null 2>&1"; then
+      echo "✗ staging web official build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   else
     if ! ssh "$KL_HOST" "set -e
         [ -n '$cur' ] && [ -d '$cur/packages/web-react/dist' ] || { echo '✗ 当前 release 无 dist 可继承' >&2; exit 1; }
@@ -1703,11 +2650,8 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  # 完整性校验 + .complete + 原子改名 staging→rel-*
-  if ! ssh "$KL_HOST" "set -e
-      test -f '$staging/package.json' && test -d '$staging/node_modules' && test -f '$staging/VERSION.json' && test -f '$staging/packages/web-react/dist/index.html'
-      printf '{\"sha\":\"$short_sha\",\"builtAt\":\"$ts\"}\n' > '$staging/.complete'
-      mv -T '$staging' '$reldir'"; then
+  # 完整性校验 + strong .complete(full source/metadata/tree digests) + 原子改名。
+  if ! publish_strong_release "$staging" "$reldir" "$full_sha" "$short_sha" "$ts"; then
     echo "✗ 完整性校验/原子改名失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   BUILT_RELEASE="$reldir"
   echo "  ✓ release 就绪(带 .complete):$reldir" >&2
@@ -1784,6 +2728,69 @@ assert_release_capability_for_sessions_pg() {
 LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
 LOSSLESS_RUNTIME_BATCH_CAP="lossless-turn-runtime-batch-v1"
 LOSSLESS_RUNTIME_BATCH_ENV="LOSSLESS_TURN_TAPE_RUNTIME_BATCHING"
+HISTORY_PROJECTION_REVISION_CAP="history-projection-revision-v1"
+
+# history_revision makes projection-only mutations and authoritative removals
+# visible to incremental clients. A legacy master ignores that revision and can
+# therefore serve a stale projection. First adoption is single-master and the
+# capability floor is irreversible: even revision zero is not downgrade-safe,
+# because an offline new client may later reconnect after legacy-only writes.
+probe_release_history_projection_revision() { # $1=release; 0=present,1=absent,2=unknown
+  local reldir="$1" result="" rc=0
+  if result="$(ssh "$KL_HOST" "set -e
+      metadata='$reldir/deploy/v5/release-metadata.json'
+      [ -r \"\$metadata\" ]
+      jq -er --arg c '$HISTORY_PROJECTION_REVISION_CAP' '(.capabilities // []) as \$caps
+        | if (\$caps | type) != \"array\" then error(\"capabilities must be an array\")
+          elif ((\$caps | index(\$c)) != null) then \"capable\"
+          else \"incapable\"
+          end' \"\$metadata\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  result="$(printf '%s' "$result" | tr -d '[:space:]')"
+  [[ $rc -eq 0 ]] || return 2
+  case "$result" in
+    capable) return 0 ;;
+    incapable) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+assert_history_projection_revision_pair() { # $1=live $2=target $3=context
+  local live="$1" target="$2" context="${3:-transition}" live_rc=0 target_rc=0
+  probe_release_history_projection_revision "$live" || live_rc=$?
+  probe_release_history_projection_revision "$target" || target_rc=$?
+  if [[ $live_rc -eq 2 || $target_rc -eq 2 ]]; then
+    echo "✗ $context 无法核验 $HISTORY_PROJECTION_REVISION_CAP(live_rc=$live_rc target_rc=$target_rc),fail-closed。" >&2
+    return 1
+  fi
+  if [[ $live_rc -ne $target_rc ]]; then
+    echo "✗ $context 的 live/target history projection 代际不一致；禁止双 master 或自动 saga 回切(live_rc=$live_rc target_rc=$target_rc)。" >&2
+    return 1
+  fi
+  echo "  ✓ $context 的 live/target history projection 代际一致。"
+}
+
+assert_history_projection_revision_offline_target() { # $1=target $2=previous; caller proved master inactive
+  prepare_history_projection_revision_activation "$1" "$2"
+}
+
+prepare_history_projection_revision_activation() { # $1=target $2=current
+  local target="$1" current="$2" target_rc=0 current_rc=0
+  probe_release_history_projection_revision "$target" || target_rc=$?
+  case "$target_rc" in
+    0) return 0 ;;
+    2)
+      echo "✗ 目标 release 的 $HISTORY_PROJECTION_REVISION_CAP 状态不可核验:$target" >&2
+      return 1 ;;
+  esac
+  probe_release_history_projection_revision "$current" || current_rc=$?
+  [[ $current_rc -eq 1 ]] && return 0
+  echo "✗ 拒绝不可逆 history projection 降级:current_rc=$current_rc；旧 master 会绕过 projection revision（即使当前 revision 全为 0 也不安全）。" >&2
+  return 1
+}
 
 # Tri-state artifact probe. Return codes are part of the safety contract:
 #   0 = capability is explicitly present
@@ -2463,6 +3470,7 @@ model_authority_fleet_census() {
 
 rollback_seed_authority_by_rev() { # <reason>
   local reason="$1" live
+  require_mutation_lease_for_compensation "seed-authority-rollback" || exit 86
   if ! remote_env_set OC_SEED_AUTHORITY_BY_REV 0; then
     live="$(remote_env_get OC_SEED_AUTHORITY_BY_REV)"
     [[ "$live" == 0 ]] || {
@@ -2826,6 +3834,7 @@ model_authority_rollback_diagnostics() { # <reason>
 # 任一步失败立即短路；尤其 census/CLI 失败时总 flag 与 egress 均保持开启，fail-closed。
 rollback_model_authority_before_cutover() { # <reason>
   local reason="${1:-manual disable}" current_flag
+  require_mutation_lease_for_compensation "model-authority-rollback" || exit 86
   assert_no_rollout_in_progress || { model_authority_rollback_diagnostics "deploy_state 非 stable"; return 1; }
   current_flag="$(remote_env_get "$MODEL_AUTHORITY_FLAG_KEY")" \
     || { model_authority_rollback_diagnostics "无法读取总 flag"; return 1; }
@@ -2864,6 +3873,7 @@ rollback_model_authority_before_cutover() { # <reason>
 # enable 尚未重启 master 时的窄补偿：此时没有新签发面，只需先写 flag=0，再重启
 # egress 并活体确认 enforce=false；写 0 失败时禁止任何重启。
 rollback_model_authority_egress_only() {
+  require_mutation_lease_for_compensation "model-authority-egress-rollback" || exit 86
   remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || return 1
   ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || return 1
   wait_for_model_authority_egress_ready false 60
@@ -2882,6 +3892,7 @@ enable_model_authority() {
   remote_env_set "$MODEL_AUTHORITY_PROVISION_FLAG_KEY" 1 || exit 1
   if ! remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1; then
     # 写失败的远端状态不确定：只做 env 补偿并验证，不重启任何进程。
+    require_mutation_lease_for_compensation "model-authority-flag-write-compensation" || exit 86
     remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || true
     [[ "$(remote_env_get "$MODEL_AUTHORITY_FLAG_KEY")" == 0 ]] \
       || { echo "FATAL:flag=1 写失败且无法确认补偿为 0；禁止重启，人工核查 $V5_ENV" >&2; exit 1; }
@@ -3110,6 +4121,7 @@ enable_runtime_tape_batching() {
       || ! smoke "$ACTIVE_PORT" \
       || ! assert_lossless_runtime_batch_floor "$active"; then
     echo "✗ batching 开启未通过健康门；恢复 flag=0 并重启同一 capable release。" >&2
+    require_mutation_lease_for_compensation "runtime-batching-compensation" || exit 86
     remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 0 || true
     ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
     smoke "$ACTIVE_PORT" || true
@@ -3126,6 +4138,7 @@ enable_runtime_tape_batching() {
 # 回退后第二次瞬态探测失败而留下 state=old/runtime=new 的分裂现场。
 assert_release_activation_compensation_compatible() {  # $1=old_release $2=candidate_release
   local old_release="$1" candidate_release="$2" image_id runtime_release
+  require_mutation_lease_for_compensation "release-activation-compensation" || exit 86
   if ! assert_lossless_runtime_batch_floor "$old_release"; then
     mark_deploy_recovery_required "lossless writer 已可能对外服务,runtime-event batch 地板拒绝旧 master:$old_release"
     return 1
@@ -3148,6 +4161,10 @@ assert_release_activation_compensation_compatible() {  # $1=old_release $2=candi
     fi
     echo "  ✓ 自动补偿目标 master/runtime 均具备 $LOSSLESS_TURN_TAPE_CAP(无条件检查,无首写竞态)。" >&2
   fi
+  if ! prepare_history_projection_revision_activation "$old_release" "$candidate_release"; then
+    mark_deploy_recovery_required "history projection revision prevents automatic compensation to old master:$old_release"
+    return 1
+  fi
 }
 
 # 仅供紧邻的已通过能力门的补偿路径调用：恢复旧 symlink/.prev-release 并 restart 旧 unit。
@@ -3155,6 +4172,7 @@ assert_release_activation_compensation_compatible() {  # $1=old_release $2=candi
 restore_release_runtime_after_compatibility_guard() {  # $1=old_release $2=old_prev_file $3=reason
   local old_release="$1" old_prev_file="$2" reason="$3"
   local tmplink="$ACTIVE_SRC.rollback.$$"
+  require_mutation_lease_for_compensation "release-runtime-rollback" || exit 86
   echo "⚠ 激活未提交($reason)→ 补偿恢复 slot=$ACTIVE_SLOT old=$old_release" >&2
   if ! ssh "$KL_HOST" "set -Eeuo pipefail
       rm -f '$tmplink'
@@ -3191,6 +4209,7 @@ restore_release_activation() {  # $1=old_release $2=old_prev_file $3=reason $4=c
 # 保持当前运行面不动，避免 state=new/runtime=old 的盲补偿分裂。
 restore_release_state_if_committed() {  # $1=target
   local target="$1" status="" i status_sql
+  require_mutation_lease_for_compensation "release-state-reconcile" || exit 86
   status_sql="$(ds_stable_release_status_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" \
     "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE" "$target")"
   for i in 1 2 3; do
@@ -3229,8 +4248,8 @@ activate_release() {
     echo "  [dry-run] 校验+assets 先就位→翻转 $ACTIVE_SRC(slot=$ACTIVE_SLOT)→restart/smoke $ACTIVE_UNIT:$ACTIVE_PORT→严格 state CAS；任一步失败回切旧 release"
     return 0
   fi
+  assert_release_marker "$reldir" || return 1
   assert_release_required_migrations "$reldir" || return 1
-  ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
   assert_release_baseline_security "$reldir" || return 1
   # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
   assert_release_capability_for_sessions_pg "$reldir"
@@ -3239,9 +4258,13 @@ activate_release() {
   assert_model_authority_floor "$reldir"
   prev="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev" ]] || { echo "✗ 无法解析 active slot 当前 release，拒绝激活。" >&2; return 1; }
+  assert_release_marker "$prev" || {
+    echo "✗ 激活前无法证明 exact predecessor 可安全补偿:$prev" >&2; return 1;
+  }
   [[ "$ACTIVE_SLOT" == A ]] && old_prev_file="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
   # 前端资产先于任何 live 翻转就位；失败仅留下加法式孤儿资产，无运行态变化。
   sync_assets_to_pool "$reldir" || return 1
+  prepare_history_projection_revision_activation "$reldir" "$prev" || return 1
   tmplink="$ACTIVE_SRC.newlink.$$"
   # A slot:同时写 .prev-release 文件(传统 lane 兼容兜底);B slot:rollback 权威在 deploy_state.previous_active_release,不写文件(不污染 A 的兜底)。
   local prev_file_cmd=""
@@ -3527,6 +4550,7 @@ activate_runtime_tuple() {
     echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
     return 0
   fi
+  assert_release_marker "$BUILT_RELEASE" || return 1
   assert_release_required_migrations "$BUILT_RELEASE" || return 1
   assert_release_baseline_security "$BUILT_RELEASE" || return 1
   # hotcfg 路径的 master symlink 翻转走 saga 的 extra_apply,**不经 activate_release** →
@@ -3538,6 +4562,10 @@ activate_runtime_tuple() {
   local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
+  assert_release_marker "$prev_src" || {
+    echo "✗ hotcfg 激活前 exact predecessor marker 无效:$prev_src" >&2; return 1;
+  }
+  assert_history_projection_revision_pair "$prev_src" "$BUILT_RELEASE" "runtime hotcfg activation" || return 1
   # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
   if [[ "$ACTIVE_SLOT" == A ]]; then
     old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
@@ -3657,8 +4685,8 @@ activate_emergency_tuple() {
   smoke_cmd="$(hotcfg_core_smoke_cmd)"  # R4-M2:与正常激活同强度(含 sessionsDb=ok)
   # masterRelease=prev_src(master 源码不动,history 记当前 live);extra_apply/revert 传空。
   # RFC §1.2:进入不可逆激活 saga(env 翻转 + current + restart)前活体断言远端 lease。此刻 live tuple
-  # 未改,失活即干净退出(saga 未起,无需回滚);中止本 lane,走既有 exit 1 失败路径。
-  assert_mutation_lease_alive "emergency-tuple-flip" || { echo "✗ production-mutation lease 失活;未激活 emergency tuple(live 未改)" >&2; exit 1; }
+  # 未改,失活即以专用 rc=86 crash-stop(saga 未起,无需回滚/cleanup)。
+  assert_mutation_lease_alive "emergency-tuple-flip" || { echo "✗ production-mutation lease 失活;crash-stop(live 未改)" >&2; exit 86; }
   hotcfg_rmt oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "" "$bundle" \
@@ -3672,16 +4700,29 @@ activate_emergency_tuple() {
 migrate_to_bluegreen() {
   echo "══ v5 迁移蓝绿 symlink 布局 on $KL_HOST ══"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] 已 symlink 则跳过;否则 stop→mv 实目录→唯一 rel-<sha>-<ts>-migrated(写 .complete)→ln -s→start→smoke(带 ERR 恢复 trap)"
+    echo "  [dry-run] 已 symlink 则强 marker 校验后跳过;否则钉 full commit+metadata 原始字节→stop→mv→写 strong .complete→ln -s→start→smoke"
     return 0
   fi
   # R2#3:幂等跳过必须是**合法**蓝绿布局(指向 rel-* 且带 .complete),不能见 symlink 就当已迁移
   if ssh "$KL_HOST" "test -L '$REMOTE_SRC'"; then
-    if ssh "$KL_HOST" "set -e; t=\$(readlink -f '$REMOTE_SRC'); case \"\$t\" in '$RELEASES_ROOT'/rel-*) test -f \"\$t/.complete\" ;; *) exit 1 ;; esac"; then
+    local migrated_current
+    migrated_current="$(bg_current_release "$REMOTE_SRC")"
+    if [[ -n "$migrated_current" && "$migrated_current" == "$CAPTURED_RELEASE_PREDECESSOR" ]] \
+        && assert_release_marker "$migrated_current"; then
       echo "  ✓ 已是合法蓝绿布局,幂等跳过"; return 0
     fi
-    echo "✗ $REMOTE_SRC 是 symlink 但非合法蓝绿布局(悬垂/非 rel-*/缺 .complete),拒绝自动迁移,人工处置" >&2; return 1
+    echo "✗ $REMOTE_SRC 是 symlink 但 marker/血缘不可信,拒绝自动迁移,人工处置" >&2; return 1
   fi
+  # 实目录首次迁移没有旧 marker 可用。首写前从 VERSION.short 唯一解析 trusted local
+  # full commit，并逐字节比对该 commit 的 release metadata；unknown/漂移一律拒绝。
+  local sha full_sha ts reldir
+  sha="$(ssh "$KL_HOST" "jq -er '.commit | select(type == \"string\")' '$REMOTE_SRC/VERSION.json'")" || return 1
+  [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || { echo "✗ 实目录 VERSION.commit 非法:$sha" >&2; return 1; }
+  full_sha="$(git -C "$REPO_ROOT" rev-parse --verify "${sha}^{commit}" 2>/dev/null || true)"
+  [[ "$full_sha" =~ ^[0-9a-f]{40}$ && "$full_sha" == "$sha"* ]] || {
+    echo "✗ 实目录 VERSION short SHA 无法唯一解析:$sha" >&2; return 1;
+  }
+  assert_release_metadata_matches_commit "$REMOTE_SRC" "$full_sha" || return 1
   # Legacy real-directory migration is another old-code restart path. Establish
   # the reservation before changing modes or stopping/starting that process.
   echo "── 蓝绿迁移前建立 CCB baseline 安全边界 ──"
@@ -3689,27 +4730,34 @@ migrate_to_bluegreen() {
   harden_release_baseline "$REMOTE_SRC" || return 1
   strip_shared_baseline_env_keys || return 1
   assert_release_baseline_security "$REMOTE_SRC" || return 1
-  local sha ts reldir
-  sha="$(ssh "$KL_HOST" "jq -r .commit '$REMOTE_SRC/VERSION.json' 2>/dev/null || echo unknown")"
   ts="$(date -u +%Y%m%d-%H%M%S)"
   reldir="$RELEASES_ROOT/rel-$sha-$ts-migrated"
-  echo "── 停机 → 实目录搬入 $reldir → 写 .complete → symlink → 启动(一次性,几秒停机;ERR 自动恢复贯穿 start)──"
+  echo "── 停机 → 实目录搬入 $reldir → 写 strong .complete → symlink → 启动(一次性,几秒停机;ERR 自动恢复贯穿 start)──"
   # ERR trap 覆盖到 start 成功之后才 `trap - ERR`(R2#3:start 失败也回滚);restore 处理已建 symlink 状态
-  ssh "$KL_HOST" "set -Eeuo pipefail
-    mkdir -p '$RELEASES_ROOT'
-    test ! -e '$reldir'                    # 唯一目标必须不存在(防 mv 进已存在目录内部)
-    systemctl stop '$V5_UNIT'
+  {
+    declare -f release_artifact_digest write_strong_release_marker_local
+    cat <<'REMOTE'
+set -Eeuo pipefail
+remote_src="$1"; releases_root="$2"; reldir="$3"; unit="$4"
+full_sha="$5"; short_sha="$6"; built_at="$7"; schema="$8"
+mkdir -p "$releases_root"
+test ! -e "$reldir"
+systemctl stop "$unit"
     moved=0; linked=0
     restore() {
-      [ \"\$linked\" = 1 ] && rm -f '$REMOTE_SRC'
-      if [ \"\$moved\" = 1 ] && [ ! -e '$REMOTE_SRC' ] && [ -d '$reldir' ]; then mv '$reldir' '$REMOTE_SRC' || true; fi
-      systemctl start '$V5_UNIT' || true; echo 'FATAL: 迁移失败,已尽力恢复实目录并启动旧服务' >&2; }
+      [ "$linked" = 1 ] && rm -f "$remote_src"
+      if [ "$moved" = 1 ] && [ ! -e "$remote_src" ] && [ -d "$reldir" ]; then mv "$reldir" "$remote_src" || true; fi
+      systemctl start "$unit" || true; echo 'FATAL: 迁移失败,已尽力恢复实目录并启动旧服务' >&2; }
     trap restore ERR
-    mv '$REMOTE_SRC' '$reldir'; moved=1
-    printf '{\"sha\":\"$sha\",\"builtAt\":\"$ts\",\"migrated\":true}\n' > '$reldir/.complete'
-    ln -s '$reldir' '$REMOTE_SRC'; linked=1
-    systemctl start '$V5_UNIT'
-    trap - ERR" || { echo "✗ 迁移执行失败(见上 FATAL 恢复日志)" >&2; return 1; }
+mv "$remote_src" "$reldir"; moved=1
+write_strong_release_marker_local "$reldir" "$full_sha" "$short_sha" "$built_at" "$schema"
+ln -s "$reldir" "$remote_src"; linked=1
+systemctl start "$unit"
+trap - ERR
+REMOTE
+  } | ssh "$KL_HOST" bash -s -- "$REMOTE_SRC" "$RELEASES_ROOT" "$reldir" "$V5_UNIT" \
+    "$full_sha" "$sha" "$ts" "$RELEASE_COMPLETE_SCHEMA_VERSION" \
+    || { echo "✗ 迁移执行失败(见上 FATAL 恢复日志)" >&2; return 1; }
   run "sleep 4"
   if ! smoke; then
     echo "✗ 迁移后 smoke 失败,自动回切实目录布局并重启旧服务" >&2
@@ -3789,8 +4837,8 @@ snapshot_and_sync_source() {
 # 不许再复制)。副作用:设全局 DIST_BUILD_ID 供 dist_handshake_smoke 校验。不含 restart。
 DIST_BUILD_ID=""
 build_and_sync_dist() {
-  echo "── vite build ──"
-  run "(cd '$REPO_ROOT/packages/web-react' && npx vite build)"
+  echo "── web official build(tsc + vite) ──"
+  run "(cd '$REPO_ROOT' && npm run build --workspace packages/web-react)"
   local dist="$REPO_ROOT/packages/web-react/dist"
   if [[ "$DRY" != 1 ]]; then
     DIST_BUILD_ID="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
@@ -4104,6 +5152,14 @@ knowledge_planet_candidate_commit() {
   printf '%s' "$BUILT_RELEASE_SOURCE_COMMIT"
 }
 
+KNOWLEDGE_PLANET_BUILD_STATE_FILE=""
+knowledge_planet_build_release_mutation() {
+  [[ -n "$KNOWLEDGE_PLANET_BUILD_STATE_FILE" ]] || return 2
+  build_release || return $?
+  printf '%s\n%s\n' "$BUILT_RELEASE" "$BUILT_RELEASE_SOURCE_COMMIT" \
+    >"$KNOWLEDGE_PLANET_BUILD_STATE_FILE"
+}
+
 knowledge_planet_plugin_verify_user() {
   echo "══ Knowledge Planet Plugin preverification(user=$KNOWLEDGE_PLANET_VERIFY_USER)══"
   if [[ "$DRY" == 1 ]]; then
@@ -4119,10 +5175,36 @@ knowledge_planet_plugin_verify_user() {
   # "同一时刻至多一个 verifier / 不与部署对撞"仍由入口的 KP-verify 专用锁(fd 9)+ 全局 deploy lock(fd 8)保证。
   # 锁序:deploy lock(fd 8)→ KP-verify lock(fd 9)→ 全局 lease(此处,先本地后远端,与既有约定一致)。
   acquire_production_mutation_lease || { echo "✗ 未取得 production-mutation lease;拒绝构建 Knowledge Planet 验证 release" >&2; return 3; }
-  local build_rc=0
-  build_release || build_rc=1
+  if ! capture_trusted_release_predecessor; then
+    release_production_mutation_lease
+    echo "✗ 无法在 Knowledge Planet build 首写前捕获可信 serving predecessor" >&2
+    return 3
+  fi
+  local build_rc=0 kp_errexit_was_on=0
+  local -a build_state=()
+  KNOWLEDGE_PLANET_BUILD_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/oc-v5-kp-build-state.XXXXXX")" || {
+    release_production_mutation_lease
+    return 3
+  }
+  [[ $- == *e* ]] && kp_errexit_was_on=1
+  set +e
+  run_mutation_lane_supervised knowledge_planet_build_release_mutation
+  build_rc=$?
+  [[ "$kp_errexit_was_on" == 1 ]] && set -e
   release_production_mutation_lease
-  [[ "$build_rc" == 0 ]] || { echo "✗ Knowledge Planet verification release build failed" >&2; return 1; }
+  if [[ "$build_rc" == 0 ]]; then
+    mapfile -t build_state <"$KNOWLEDGE_PLANET_BUILD_STATE_FILE"
+  fi
+  rm -f -- "$KNOWLEDGE_PLANET_BUILD_STATE_FILE"
+  KNOWLEDGE_PLANET_BUILD_STATE_FILE=""
+  [[ "$build_rc" == 0 ]] || { echo "✗ Knowledge Planet verification release build failed/crash-stopped(rc=$build_rc)" >&2; return "$build_rc"; }
+  [[ "${#build_state[@]}" == 2 && "${build_state[0]}" == "$RELEASES_ROOT"/rel-* \
+    && "${build_state[1]}" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "✗ Knowledge Planet supervised build state missing/invalid" >&2
+    return 1
+  }
+  BUILT_RELEASE="${build_state[0]}"
+  BUILT_RELEASE_SOURCE_COMMIT="${build_state[1]}"
   local source_commit
   source_commit="$(knowledge_planet_candidate_commit)" || return 1
   echo "── 人工扫码验证窗(不持全局 lease;紧急自愈 host-action 此窗内可正常抢锁)──"
@@ -4569,6 +5651,7 @@ knowledge_planet_compensate_deploy() { # <helper/new> <previous> <hotcfg:0|1> <e
   local helper="$1" previous="$2" hotcfg="$3" egress_switched="$4" previous_egress="$5"
   local had_previous_plugin="${6:-1}"
   local failed=0
+  require_mutation_lease_for_compensation "knowledge-planet-deploy-compensation" || exit 86
   [[ "$had_previous_plugin" =~ ^[01]$ ]] || {
     echo "✗ Knowledge Planet compensation previous-plugin flag 非法:$had_previous_plugin" >&2
     return 2
@@ -4613,6 +5696,7 @@ knowledge_planet_compensate_deploy() { # <helper/new> <previous> <hotcfg:0|1> <e
 knowledge_planet_compensate_setup_first() { # <helper/new> <previous> <hotcfg:0|1> <egress-switched:0|1> <previous-egress> <predecessor-version-id>
   local helper="$1" previous="$2" hotcfg="$3" egress_switched="$4" previous_egress="$5"
   local predecessor_version_id="$6" failed=0 source_restored=0
+  require_mutation_lease_for_compensation "knowledge-planet-setup-first-compensation" || exit 86
   [[ "$predecessor_version_id" =~ ^[1-9][0-9]{0,15}$ ]] || {
     echo "✗ Knowledge Planet setup-first compensation version ID 非法:${predecessor_version_id:-<empty>}" >&2
     return 2
@@ -4642,16 +5726,19 @@ knowledge_planet_compensate_setup_first() { # <helper/new> <previous> <hotcfg:0|
 }
 
 activate_egress_release() {
-  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps require_cap=0
+  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps running_cwd require_cap=0
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;安装目标 unit→restart→health/cwd；失败回切"
     return 0
   fi
-  ssh "$KL_HOST" "test -f '$reldir/.complete' && test -f '$reldir/deploy/v5/$V5_EGRESS_UNIT'" || {
-    echo "✗ egress 目标 release 不完整或缺 unit:$reldir" >&2; return 1;
+  assert_release_marker "$reldir" egress || return 1
+  assert_release_marker "$prev" egress || return 1
+  running_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+  [[ "$running_cwd" == "$prev" ]] || {
+    echo "✗ egress 激活前进程 cwd 已漂移(expected=$prev actual=${running_cwd:-<none>})" >&2; return 1;
   }
-  ssh "$KL_HOST" "test -n '$prev' && test -f '$prev/.complete'" || {
-    echo "✗ 无法证明旧 egress cwd 是完整 release:$prev；拒绝在无回退点时切换" >&2; return 1;
+  ssh "$KL_HOST" "test -f '$reldir/deploy/v5/$V5_EGRESS_UNIT'" || {
+    echo "✗ egress 目标 release 不完整或缺 unit:$reldir" >&2; return 1;
   }
   if ! ssh "$KL_HOST" "set -Eeuo pipefail
     rm -f '$tmplink'
@@ -4673,6 +5760,7 @@ activate_egress_release() {
 
   # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切只需原子翻回旧 release；
   # 不必恢复旧 unit 文件（旧代码仍由同一个 ExecStart 入口启动）。
+  require_mutation_lease_for_compensation "egress-release-compensation" || exit 86
   if ssh "$KL_HOST" "set -Eeuo pipefail
     rm -f '$tmplink'
     ln -s '$prev' '$tmplink'
@@ -4706,8 +5794,11 @@ deploy() {
   }
   if [[ "$RESTART_EGRESS" == 1 && "$DRY" != 1 ]]; then
     # 必须在 master symlink 翻转前钉住旧 egress 真正 cwd；active=A 时翻转后再读会丢回退点。
-    egress_prev_release="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
-    ssh "$KL_HOST" "test -n '$egress_prev_release' && test -f '$egress_prev_release/.complete'" || {
+    egress_prev_release="$CAPTURED_EGRESS_PREDECESSOR"
+    local current_egress_cwd
+    current_egress_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+    [[ -n "$egress_prev_release" && "$current_egress_cwd" == "$egress_prev_release" ]] \
+      && assert_release_marker "$egress_prev_release" egress || {
       echo "✗ --egress 起手无法钉住完整旧 egress cwd:$egress_prev_release；拒绝先改 master" >&2; exit 1;
     }
     echo "  · egress 回退点:$egress_prev_release"
@@ -4744,6 +5835,17 @@ deploy() {
   if hotcfg_bundle_axis_on; then hc_bundle=1; hc_any=1; fi
   if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
   [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
+  if [[ "$hc_any" == 1 ]] && ! assert_history_projection_revision_pair "$kp_previous_release" "$BUILT_RELEASE" "runtime hotcfg activation"; then
+    if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
+      echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
+      exit 1
+    fi
+    # The hotcfg saga may automatically restore the old master after the new
+    # process has served. Across this irreversible floor, first adoption uses
+    # the ordinary single-master restart and leaves the runtime tuple unchanged.
+    echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
+    hc_bundle=0; hc_release=0; hc_any=0
+  fi
   if [[ "$hc_any" == 1 ]]; then
     echo "── runtime hotcfg 已启用(bundle=$hc_bundle release=$hc_release disable_bundle=$DISABLE_BUNDLE_FLAG disable_release=$DISABLE_RELEASE_FLAG)──"
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
@@ -4754,13 +5856,13 @@ deploy() {
   # RFC §1.2:进入不可逆翻转段(KP 门关闭 / release 激活 / egress)前活体断言远端 lease 仍持有。
   # 此刻 live master 仍未改,失活即 end maintenance 后干净退出(无 KP 门需回滚)。
   if ! assert_mutation_lease_alive "deploy-master-flip"; then
-    end_planned_maintenance || true
-    echo "✗ production-mutation lease 失活;未进入翻转段(live 未改)" >&2
-    exit 1
+    echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
+    exit 86
   fi
   echo "── Knowledge Planet Plugin:关闭跨版本执行门──"
   local kp_deploy_bracket=1
   if ! knowledge_planet_plugin_close_gate "$BUILT_RELEASE"; then
+    require_mutation_lease_for_compensation "knowledge-planet-close-gate-recovery" || exit 86
     if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
       # setup-first 是显式插件升级 lane,门关不上=前提不成立,保持阻断语义。
       knowledge_planet_plugin_open_setup_first_gate_to_version \
@@ -4783,6 +5885,7 @@ deploy() {
   kp_previous_plugin_version_id="$KNOWLEDGE_PLANET_GATE_VERSION_ID"
   if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     if [[ "$DRY" != 1 && "$kp_previous_plugin_version_id" != "$kp_setup_plugin_version_id" ]]; then
+      require_mutation_lease_for_compensation "knowledge-planet-setup-first-version-recovery" || exit 86
       knowledge_planet_plugin_open_setup_first_gate_to_version \
         "$BUILT_RELEASE" "$kp_setup_plugin_version_id" \
         || mark_deploy_recovery_required "Knowledge Planet setup-first close changed the exact predecessor and restore failed"
@@ -4802,6 +5905,7 @@ deploy() {
       # 2026-07-17 纠偏:classify 只服务于"插件迁移的补偿目标可用性"判定;
       # 失败=降级为零接触(重开门后继续部署),不再阻断平台部署。
       echo "⚠ Knowledge Planet previous-release classify 失败:插件零接触继续部署" >&2
+      require_mutation_lease_for_compensation "knowledge-planet-classify-recovery" || exit 86
       knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$kp_previous_release" \
         || knowledge_planet_plugin_open_gate_current "$BUILT_RELEASE" \
         || mark_deploy_recovery_required "Knowledge Planet previous-release classification failed and gate restore was not confirmed"
@@ -4815,6 +5919,7 @@ deploy() {
   echo "  · Knowledge Planet closed current=${kp_previous_plugin_version_id:-<none>} previous-exact-available=$kp_had_previous_plugin"
   if [[ "$hc_any" == 1 ]]; then
     if ! activate_runtime_tuple; then
+      require_mutation_lease_for_compensation "runtime-tuple-activation-recovery" || exit 86
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
         if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
           knowledge_planet_plugin_open_setup_first_gate_to_version \
@@ -4831,6 +5936,7 @@ deploy() {
     fi
   else
     if ! activate_release "$BUILT_RELEASE"; then
+      require_mutation_lease_for_compensation "release-activation-gate-recovery" || exit 86
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
         if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
           knowledge_planet_plugin_open_setup_first_gate_to_version \
@@ -4849,7 +5955,8 @@ deploy() {
   if [[ "$RESTART_EGRESS" == 1 ]]; then
     # egress 翻转前再断言一次 lease(master 已翻转,失活 → 走 validation_failure 对称补偿)。
     if ! assert_mutation_lease_alive "deploy-egress-flip"; then
-      validation_failure="production-mutation lease 失活(egress 激活前)"
+      echo "✗ production-mutation lease 失活(egress 激活前)；禁止进入 validation compensation" >&2
+      exit 86
     else
       echo "── 激活 openclaude-v5-egress 独立 release(显式 --egress;SIGTERM drain 在飞流)──"
       if activate_egress_release "$BUILT_RELEASE" "$egress_prev_release"; then
@@ -4898,8 +6005,8 @@ deploy() {
   fi
   if [[ -n "$validation_failure" ]]; then
     echo "✗ $validation_failure；Plugin 门仍关闭，开始 source/DB 对称补偿" >&2
-    # F7:补偿(恢复旧稳态)前 best-effort 重取 lease,缩小与自愈 host-action 并发窗;失败也照样补偿(恢复稳态优先)。
-    reacquire_mutation_lease_best_effort "deploy-validation-compensation"
+    # F7:补偿(恢复旧稳态)前 复核 lease,缩小与自愈 host-action 并发窗;失活则 crash-stop，禁止无 lease 补偿。
+    require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
     if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
       knowledge_planet_compensate_setup_first \
         "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
@@ -4934,8 +6041,8 @@ deploy() {
   echo "── Knowledge Planet Plugin:消费加密交接 + 绑定账号 + 官方发布/install 升级 + 旧 Skill 加法迁移──"
   if ! knowledge_planet_plugin_seed "$BUILT_RELEASE"; then
     echo "✗ Knowledge Planet Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
-    # F7:同上,补偿前 best-effort 重取 lease(helper 幂等,与上方 validation 补偿可安全连调)。
-    reacquire_mutation_lease_best_effort "deploy-validation-compensation"
+    # F7:同上,补偿前 复核 lease(helper 幂等,与上方 validation 补偿可安全连调)。
+    require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
     knowledge_planet_compensate_deploy \
       "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
       "$egress_switched" "$egress_prev_release" "$kp_had_previous_plugin" \
@@ -4998,12 +6105,20 @@ REMOTE
 }
 
 offline_recycle() {
+  local rc had_errexit=0
   begin_cutover_step prepared recycling || return 1
-  if ( set -Eeuo pipefail; offline_recycle_inner ); then
+  [[ $- == *e* ]] && had_errexit=1
+  set +e
+  ( set -Eeuo pipefail; offline_recycle_inner )
+  rc=$?
+  if [[ "$had_errexit" == 1 ]]; then set -e; fi
+  if [[ "$rc" == 0 ]]; then
     cutover_transition recycling recycled || { recover_cutover "cannot commit recycled state"; return 1; }
-  else
-    local rc=$?; recover_cutover "offline recycle failed"; return "$rc"
+    return 0
   fi
+  [[ "$rc" == 86 ]] && { echo "FATAL:offline recycle lease loss；跳过 recovery，保留 cutover 状态" >&2; return 86; }
+  recover_cutover "offline recycle failed"
+  return "$rc"
 }
 
 # ───────────────────────── stage/activate:停机原子迁移 lane ─────────────────
@@ -5021,12 +6136,20 @@ stage_inner() {
 }
 
 stage() {
+  local rc had_errexit=0
   begin_cutover_step recycled staging || return 1
-  if ( set -Eeuo pipefail; stage_inner ); then
+  [[ $- == *e* ]] && had_errexit=1
+  set +e
+  ( set -Eeuo pipefail; stage_inner )
+  rc=$?
+  if [[ "$had_errexit" == 1 ]]; then set -e; fi
+  if [[ "$rc" == 0 ]]; then
     cutover_transition staging staged || { recover_cutover "cannot commit staged state"; return 1; }
-  else
-    local rc=$?; recover_cutover "stage failed"; return "$rc"
+    return 0
   fi
+  [[ "$rc" == 86 ]] && { echo "FATAL:stage lease loss；跳过 recovery，保留 cutover 状态" >&2; return 86; }
+  recover_cutover "stage failed"
+  return "$rc"
 }
 
 activate_staged_inner() {
@@ -5074,8 +6197,10 @@ activate_staged_inner() {
     echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version"
   fi
   # RFC §1.2:此处 sshk start 是 staged lane 的真正激活翻转点(unit 从停机→起旧同构状态)。翻转前
-  # 活体断言远端 lease;此刻 unit 仍停(live 未改),失活即 exit 1 交由 activate_staged 的 recover_cutover。
-  assert_mutation_lease_alive "activate-staged-flip" || { echo "✗ production-mutation lease 失活;未激活 staged(unit 仍停,live 未改)" >&2; exit 1; }
+  # 活体断言远端 lease;此刻 unit 仍停(live 未改),失活即 rc=86，wrapper 明确跳过 recover_cutover。
+  assert_history_projection_revision_offline_target "$REMOTE_SRC" "$CUTOVER_ROOT/$CUTOVER_NONCE/source" || return 1
+  assert_mutation_lease_alive "activate-staged-flip" || { echo "✗ production-mutation lease 失活;crash-stop staged(unit 仍停,live 未改)" >&2; exit 86; }
+  mark_cutover_candidate_start_attempted || return 1
   echo "── start openclaude-v5(同构状态一次性激活)──"
   sshk "systemctl start $V5_UNIT"
   run "sleep 4"
@@ -5095,13 +6220,21 @@ activate_staged_inner() {
 }
 
 activate_staged() {
+  local rc had_errexit=0
   begin_cutover_step staged activating || return 1
-  if ( set -Eeuo pipefail; activate_staged_inner ); then
+  [[ $- == *e* ]] && had_errexit=1
+  set +e
+  ( set -Eeuo pipefail; activate_staged_inner )
+  rc=$?
+  if [[ "$had_errexit" == 1 ]]; then set -e; fi
+  if [[ "$rc" == 0 ]]; then
     cutover_transition activating activated || { recover_cutover "cannot commit activated state"; return 1; }
     clear_cutover_maintenance || echo "⚠ 激活成功但 maintenance marker 清理失败；最迟在 deadline 自动失效" >&2
-  else
-    local rc=$?; recover_cutover "activate failed"; return "$rc"
+    return 0
   fi
+  [[ "$rc" == 86 ]] && { echo "FATAL:activate-staged lease loss；跳过 recovery/maintenance cleanup，保留 cutover 状态" >&2; return 86; }
+  recover_cutover "activate failed"
+  return "$rc"
 }
 
 # ───────────────────────── dist:前端生效面(web-react)─────────────────────────
@@ -5153,6 +6286,19 @@ deploy_dist() {
   if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
   [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
   if [[ "$hc_any" == 1 ]]; then
+    local dist_previous_release=""
+    dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
+    [[ -n "$dist_previous_release" ]] || { echo "✗ --dist 无法解析当前 live release" >&2; exit 1; }
+    if ! assert_history_projection_revision_pair "$dist_previous_release" "$BUILT_RELEASE" "runtime hotcfg dist activation"; then
+      if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
+        echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
+        exit 1
+      fi
+      echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
+      hc_bundle=0; hc_release=0; hc_any=0
+    fi
+  fi
+  if [[ "$hc_any" == 1 ]]; then
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
@@ -5163,9 +6309,8 @@ deploy_dist() {
   begin_planned_maintenance dist 0
   # RFC §1.2:dist 翻转前活体断言远端 lease(此刻 live 未改,失活即干净退出)。
   if ! assert_mutation_lease_alive "dist-flip"; then
-    end_planned_maintenance || true
-    echo "✗ production-mutation lease 失活;未激活(live 未改)" >&2
-    exit 1
+    echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
+    exit 86
   fi
   if [[ "$hc_any" == 1 ]]; then
     activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
@@ -5225,16 +6370,15 @@ rollback() {
     kp_rollback_helper="$(bg_current_release "$ACTIVE_SRC")"
     begin_planned_maintenance rollback 0
     if ! assert_mutation_lease_alive "rollback-tuple-flip"; then
-      end_planned_maintenance || true
-      echo "✗ production-mutation lease 失活;未回滚(live 未改)" >&2
-      exit 1
+      echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
+      exit 86
     fi
     rollback_runtime_tuple "$ROLLBACK_N" 1 "$kp_rollback_helper" \
       || { echo "✗ tuple 回滚失败(saga 已自动恢复现场)" >&2; exit 1; }
     kp_rollback_target="$(bg_current_release "$ACTIVE_SRC")"
     if [[ -z "$kp_rollback_target" ]] || ! smoke "$ACTIVE_PORT"; then
-      # F7:反向补偿(恢复回滚前 tuple)前 best-effort 重取 lease;失败也照补(恢复稳态优先)。
-      reacquire_mutation_lease_best_effort "rollback-compensation"
+      # F7:反向补偿(恢复回滚前 tuple)前 复核 lease;失活则 crash-stop。
+      require_mutation_lease_for_compensation "rollback-compensation" || exit 86
       if rollback_runtime_tuple 1 1 "$kp_rollback_helper" && smoke "$ACTIVE_PORT"; then
         # 2026-07-17 纠偏:插件门恢复 best-effort(release 身份 → current 兜底),
         # 门恢复失败不推翻已成功的 source 反向补偿。
@@ -5254,6 +6398,7 @@ rollback() {
       # (昨日实测该反向补偿链条二次失败直接打进 manual-recovery)。兜底重开
       # 当前已审批版本;兜底也失败才标记人工恢复,回滚仍算成功。
       echo "⚠ Knowledge Planet release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不推翻回滚" >&2
+      require_mutation_lease_for_compensation "tuple-rollback-gate-recovery" || exit 86
       knowledge_planet_plugin_open_gate_current "$kp_rollback_helper" \
         || mark_deploy_recovery_required "tuple rollback succeeded but Plugin gate could not be reopened (current-version fallback also failed)"
     fi
@@ -5302,15 +6447,16 @@ rollback() {
   # a query returning false is stale before the later symlink switch.
   live_master="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$live_master" ]] || { echo "✗ 显式回滚前无法解析当前 live master" >&2; exit 1; }
+  assert_release_marker "$live_master" || exit 1
+  assert_release_marker "$target" || exit 1
   image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
   runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
   assert_lossless_explicit_rollback_target \
     "$live_master" "$target" "$image_id" "$runtime_release" || exit 1
   begin_planned_maintenance rollback 0
   if ! assert_mutation_lease_alive "rollback-flip"; then
-    end_planned_maintenance || true
-    echo "✗ production-mutation lease 失活;未回滚(live 未改)" >&2
-    exit 1
+    echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
+    exit 86
   fi
   # 2026-07-17 架构纠偏:插件括号 best-effort——回滚是紧急通道,插件侧失败只降级
   # (零接触/兜底重开当前已审批版本),永不阻断回滚本体。
@@ -5322,6 +6468,7 @@ rollback() {
   fi
   if [[ "$kp_rb_bracket" == 1 ]] && ! knowledge_planet_plugin_transition_to_release "$live_master" "$target"; then
     echo "⚠ Knowledge Planet 版本反向迁移失败(目标 release 可能早于插件审批):跳过迁移,兜底重开当前已审批版本后继续回滚" >&2
+    require_mutation_lease_for_compensation "rollback-plugin-transition-recovery" || exit 86
     knowledge_planet_plugin_open_gate_current "$live_master" \
       || mark_deploy_recovery_required "rollback Plugin transition failed and current-version gate restore also failed"
     kp_rb_bracket=0
@@ -5331,8 +6478,8 @@ rollback() {
   if ! activate_release "$target"; then
     # activate_release 已把 source 补偿回 live_master。插件补偿 best-effort:
     # 迁移过才迁回;兜底 current;只有兜底也失败才标记人工恢复。
-    # F7:补偿前 best-effort 重取 lease(非 hotcfg rollback 补偿入口,与其它补偿同类)。
-    reacquire_mutation_lease_best_effort "rollback-compensation"
+    # F7:补偿前 复核 lease(非 hotcfg rollback 补偿入口,与其它补偿同类)。
+    require_mutation_lease_for_compensation "rollback-compensation" || exit 86
     if [[ "$kp_rb_bracket" == 1 ]]; then
       knowledge_planet_plugin_transition_to_release "$live_master" "$live_master" \
         && knowledge_planet_plugin_open_gate_to_release "$live_master" "$live_master" \
@@ -5353,6 +6500,7 @@ rollback() {
     # 2026-07-17 纠偏:回滚本体已成功,门开启失败不再反向推翻;兜底 current,
     # 兜底也失败才标记人工恢复,回滚仍算成功。
     echo "⚠ Knowledge Planet release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不推翻回滚" >&2
+    require_mutation_lease_for_compensation "rollback-gate-recovery" || exit 86
     knowledge_planet_plugin_open_gate_current "$live_master" \
       || mark_deploy_recovery_required "rollback succeeded but Plugin gate could not be reopened (current-version fallback also failed)"
   fi
@@ -5378,6 +6526,9 @@ rollback_runtime_tuple() {
   prev_src="$(bg_current_release "$ACTIVE_SRC")"   # 当前 active slot master 源码
   plugin_helper="${helper_override:-$prev_src}"
   [[ -n "$prev_src" ]] || { echo "✗ tuple 回滚前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
+  assert_release_marker "$prev_src" || {
+    echo "✗ tuple 回滚前当前 master marker 无效:$prev_src" >&2; return 1;
+  }
   [[ "$prev_src" == "$ACTIVE_STATE_RELEASE" ]] || {
     echo "✗ deploy_state.active_release=$ACTIVE_STATE_RELEASE 与 slot=$ACTIVE_SLOT symlink=$prev_src 不一致，拒绝回滚。" >&2
     return 1
@@ -5488,6 +6639,7 @@ rollback_runtime_tuple() {
   [[ -n "$master" ]] || master="$(jq -r '.masterRelease // ""' <<<"$prev")"
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
+  assert_release_marker "$master" || return 1
   assert_release_required_migrations "$master" || return 1
   assert_release_baseline_security "$master" || return 1
   # Current-capable/unknown → target reader+actual writer are proved without a
@@ -5541,10 +6693,21 @@ rollback_runtime_tuple() {
   if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
     if ! knowledge_planet_plugin_transition_to_release "$plugin_helper" "$master"; then
       echo "⚠ Knowledge Planet 版本反向迁移失败(目标 release 可能早于插件审批):跳过迁移,兜底重开当前已审批版本后继续回滚" >&2
+      require_mutation_lease_for_compensation "tuple-rollback-plugin-transition-recovery" || exit 86
       knowledge_planet_plugin_open_gate_current "$plugin_helper" \
         || mark_deploy_recovery_required "tuple rollback Plugin transition failed and current-version gate restore also failed"
       kp_plugin_bracket=0
     fi
+  fi
+  if ! prepare_history_projection_revision_activation "$master" "$prev_src"; then
+    if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
+      require_mutation_lease_for_compensation "tuple-rollback-projection-compensation" || exit 86
+      knowledge_planet_plugin_transition_to_release "$plugin_helper" "$prev_src" \
+        && knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
+        || knowledge_planet_plugin_open_gate_current "$plugin_helper" \
+        || mark_deploy_recovery_required "master capability floor rejected tuple rollback and Plugin DB compensation failed"
+    fi
+    return 1
   fi
   # 新 committed 条目 masterRelease=$master(=回滚到的 master),last committed 恒=live。
   # 末参 prev_master(R2-B2)仅供首启 pre-state;回滚时 history 必已有 committed 条目,不会触发。
@@ -5552,7 +6715,8 @@ rollback_runtime_tuple() {
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
     "$image" "$image_id" "$release" "$bundle" \
     "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$master" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "$transition_kind"; then
+      "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "$transition_kind"; then
+    require_mutation_lease_for_compensation "tuple-rollback-saga-compensation" || exit 86
     if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
       knowledge_planet_plugin_transition_to_release "$plugin_helper" "$prev_src" \
         && knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
@@ -5573,6 +6737,7 @@ rollback_runtime_tuple() {
     knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$master" \
       || {
         echo "⚠ Knowledge Planet release 身份门开启失败(目标可能早于插件审批),走 current-version 兜底,不阻断回滚" >&2
+        require_mutation_lease_for_compensation "tuple-rollback-target-gate-recovery" || exit 86
         knowledge_planet_plugin_open_gate_current "$plugin_helper" \
           || mark_deploy_recovery_required "tuple rollback target active but Plugin gate failed to open (current-version fallback also failed)"
       }
@@ -5762,6 +6927,7 @@ capability_matrix_preflight() {
   ssh "$KL_HOST" "jq -e '(.capabilities // []) | index(\"dual-master-v1\")' '$cma'" >/dev/null 2>&1 \
     || { echo "✗ active release 未声明 dual-master-v1 —— 双 master 不兼容,拒绝 canary(active 须先经基建版升级)" >&2; return 1; }
   assert_lossless_canary_pair "$active_rel" "$candidate_rel" || return 1
+  assert_history_projection_revision_pair "$active_rel" "$candidate_rel" "canary" || return 1
   # ③ 版本字段兼容(MAJOR 7):bridgeFrameSchema / runtimeApi
   local key av cv
   for key in bridgeFrameSchema runtimeApi; do
@@ -5894,6 +7060,7 @@ init_candidate_slot() {
     echo "  [dry-run] mkdir $chome; 派生 openclaude.json(port=$cport,已存在则保留);装 $cunit;symlink $csrc→$reldir"
     return 0
   fi
+  assert_release_marker "$reldir" || return 1
   # openclaude.json:从 A 的派生,仅改 gateway.port;已存在则保留(权威=现网 slot 家)
   ssh "$KL_HOST" "set -e
     mkdir -p '$chome'
@@ -5904,7 +7071,6 @@ init_candidate_slot() {
     fi"
   # 源码 symlink → release(原子:临时链 + mv -T)
   ssh "$KL_HOST" "set -e
-    test -f '$reldir/.complete'
     rm -f '$csrc.newlink.$$'
     ln -s '$reldir' '$csrc.newlink.$$'
     mv -T '$csrc.newlink.$$' '$csrc'"
@@ -6015,11 +7181,13 @@ canary() {
   echo "══ v5 --canary(蓝绿双 master 起手;RFC D5)══"
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
+  [[ "$DRY" == 1 ]] || assert_release_marker "$(bg_current_release "$ACTIVE_SRC")"
   assert_runtime_channel_column
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,拒绝 canary" >&2; exit 1; }
   if [[ -n "$CANARY_RELEASE" ]]; then
     local requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
     [[ "$CANARY_RELEASE" == /* ]] && requested_release="$CANARY_RELEASE"
+    assert_release_marker "$requested_release"
     assert_release_required_migrations "$requested_release"
   fi
   ds_snapshot
@@ -6049,13 +7217,17 @@ canary() {
   if [[ -n "$CANARY_RELEASE" ]]; then
     reldir="$RELEASES_ROOT/$CANARY_RELEASE"; [[ "$CANARY_RELEASE" == /* ]] && reldir="$CANARY_RELEASE"
     echo "── 复用指定 release:$reldir ──"
-    sshk "test -f '$reldir/.complete' || { echo '✗ 指定 release 无 .complete: $reldir' >&2; exit 1; }"
   else
     WITH_DIST=1
     build_release || { echo "✗ build_release 失败(未 CAS candidate_release,live 未改)" >&2; exit 1; }
     reldir="$BUILT_RELEASE"
   fi
   [[ "$DRY" == 1 ]] && reldir="$RELEASES_ROOT/rel-cand-dry"
+  assert_release_marker "$reldir" || {
+    echo "✗ candidate release 完整 marker 无效;回 stable(§8 canary<READY)" >&2
+    recover_canary_prep "$cand"
+    exit 1
+  }
   assert_release_baseline_security "$reldir" || {
     echo "✗ candidate release baseline 不安全;回 stable(§8 canary<READY)" >&2
     recover_canary_prep "$cand"
@@ -6070,6 +7242,13 @@ canary() {
   assert_lossless_turn_tape_floor "$reldir"
   # cutover 后 P3 candidate 也是一条真实激活路径；不能绕过模型权威兼容地板。
   assert_model_authority_floor "$reldir"
+  # Projection generations may not be started side-by-side. First adoption
+  # must use the ordinary single-master restart lane.
+  assert_history_projection_revision_pair "$DS_active_release" "$reldir" "canary pre-start" || {
+    echo "✗ history projection 代际不兼容;candidate 尚未初始化/启动,回 stable" >&2
+    recover_canary_prep "$cand"
+    exit 1
+  }
   # assets → union 池(candidate 与 active 前端 chunk 并集,跨 lane 可得)
   sync_assets_to_pool "$reldir"
 
@@ -6092,8 +7271,8 @@ canary() {
   ds_cas_or_die "generation=generation+1, cohort_salt='$salt', cohort_percent=0, cohort_allowlist=$allowlist, transition_step=$DS_STEP_CANARY_READY" "$DS_STEP_CANARY_READY" "canary READY gen bumped salt rotated allowlist=internal"
   # RFC §1.2:candidate 变为可路由(Caddy 产 matcher)前活体断言 lease;失活 → 回 stable(§8 canary<READY)。
   assert_mutation_lease_alive "canary-ready" || {
-    echo "✗ production-mutation lease 失活;candidate 已 READY 但不暴露,回 stable" >&2
-    recover_canary_prep "$cand"; exit 1; }
+    echo "✗ production-mutation lease 失活;candidate 已 READY 但不暴露；保留 deploy_state，crash-stop" >&2
+    exit 86; }
   # 此刻起 Caddy 生成器才产 matcher(step≥READY)
   caddy_render_reload
   # 内部账号验证:带当前代次 lane cookie 探 candidate(BLOCKER 5②:硬门,去 || true)
@@ -6133,6 +7312,7 @@ _internal_allowlist_sql() {
 # 【铁律】HOME 绝不递归删(RFC §8 R4:HOME 是持久 slot 状态含 uploads/诊断,可能是上一轮 active 的家)。
 recover_canary_prep() {
   local cand="$1" csrc cunit; csrc="$(slot_src "$cand")"; cunit="$(slot_unit "$cand")"
+  require_mutation_lease_for_compensation "canary-prep-recovery" || exit 86
   echo "── 恢复(canary<READY):stop candidate + 清本 operation 产物(不删 HOME)→ 回 stable ──"
   # step0-1 尚未执行 init_candidate_slot，candidate unit 可能从未安装；这种“确实无 unit 文件”
   # 是已清理状态而非失败。unit 文件存在时 stop/disable 必须成功；SSH/远端命令失败仍 fail-closed。
@@ -6153,9 +7333,15 @@ promote() {
   echo "══ v5 --promote=$PROMOTE_PCT(cohort 放量;RFC D5)══"
   ds_snapshot
   ds_assert_phase canary
+  if [[ "$DRY" != 1 ]]; then
+    local promote_candidate="$DS_candidate_release"
+    [[ "$promote_candidate" == /* ]] || promote_candidate="$RELEASES_ROOT/$promote_candidate"
+    assert_release_marker "$promote_candidate" || exit 1
+    assert_release_marker "$(bg_current_release "$(slot_src "$DS_active_slot")")" || exit 1
+  fi
   [[ "$DRY" == 1 || "$DS_transition_step" -ge "$DS_STEP_CANARY_READY" ]] || { echo "✗ canary 未到 READY(step=$DS_transition_step),不能放量" >&2; exit 1; }
   new_operation_id promote
-  assert_mutation_lease_alive "promote" || { echo "✗ production-mutation lease 失活;放量中止(cohort_percent 未改)" >&2; exit 1; }
+  assert_mutation_lease_alive "promote" || { echo "✗ production-mutation lease 失活;放量 crash-stop(cohort_percent 未改)" >&2; exit 86; }
   ds_cas_or_die "cohort_percent=$PROMOTE_PCT, operation_id='$OP'" "$DS_STEP_CANARY_READY" "promote percent=$PROMOTE_PCT"
   echo "  · percent=$PROMOTE_PCT(在线用户下次 /api/me 重评;观察面=双 slot healthz + 错误日志 diff + 计费一致性抽查)"
   echo "✓ --promote 完成。continue:--promote=<更高> / --finalize / --abort"
@@ -6203,6 +7389,10 @@ finalize() {
     || { echo "✗ finalize 缺 candidate_release，无法校验 Knowledge Planet contract" >&2; exit 1; }
   [[ -z "$kp_candidate_release" || "$kp_candidate_release" == /* ]] \
     || kp_candidate_release="$RELEASES_ROOT/$kp_candidate_release"
+  [[ "$DRY" == 1 ]] || {
+    assert_release_marker "$kp_candidate_release" || exit 1
+    assert_release_marker "$(bg_current_release "$(slot_src "$DS_active_slot")")" || exit 1
+  }
   knowledge_planet_plugin_assert_release_compatible \
     "$kp_candidate_release" "$kp_candidate_release" \
     || echo "⚠ candidate 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:finalize 后该插件将 RUNTIME_UNAVAILABLE 直至验证晋升;finalize 不因此阻断(2026-07-17 纠偏)" >&2
@@ -6239,6 +7429,7 @@ finalize() {
             echo "  ⚠ 无法从 journal 恢复 egress 基线,但 OC_FINALIZE_SKIP_EGRESS_GATE=1 已放行(危险,登记债)"
           else
             echo "✗ finalize resume 无法恢复 step0 egress 原基线(journal 缺失/损坏)→ fail-closed 转 aborting(§8)" >&2
+            require_mutation_lease_for_compensation "finalize-baseline-recovery" || exit 86
             ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize resume: egress baseline unrecoverable → aborting"
             sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
             abort_continue "$old" "$cand"
@@ -6288,11 +7479,8 @@ finalize_run_steps() {
   if [[ "$DRY" == 1 || "$DS_transition_step" -lt 2 ]]; then
     # RFC §1.2:默认流量 master 交接(step2)是 finalize 唯一用户可感翻转,交接前活体断言 lease。
     if ! assert_mutation_lease_alive "finalize-step2"; then
-      echo "✗ production-mutation lease 失活;finalize step2 交接前中止 → 转 aborting 补偿(§8)" >&2
-      ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize step2: lease dead → aborting"
-      sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
-      abort_continue "$old" "$cand"
-      exit 1
+      echo "✗ production-mutation lease 失活;finalize step2 前 crash-stop，保留 deploy_state 供人工裁决" >&2
+      exit 86
     fi
     echo "── ② 渲染默认→candidate(step2 语义)+ reload + 硬验证新请求全落 candidate ──"
     export DS_RENDER_STEP_OVERRIDE=2
@@ -6303,6 +7491,7 @@ finalize_run_steps() {
     unset DS_RENDER_STEP_OVERRIDE
     if [[ "$step2_ok" != 1 ]]; then
       echo "✗ finalize step2 验证失败(默认未确认切到 candidate)→ 转 aborting 补偿(§8)" >&2
+      require_mutation_lease_for_compensation "finalize-step2-compensation" || exit 86
       ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize step2 verify FAILED → aborting"
       sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
       abort_continue "$old" "$cand"
@@ -6336,6 +7525,7 @@ finalize_run_steps() {
     wait_for_slot_leadership "$cand" 1 60 || echo "  · 轮询超时,交由四门槛裁决"
     if ! ( vip_control_gate "$cand" && egress_gate_conservation ); then
       echo "✗ finalize 四门槛未过 → 补偿:desired 收回旧 slot + 重启旧 unit + 转 aborting(§8)" >&2
+      require_mutation_lease_for_compensation "finalize-gate-compensation" || exit 86
       ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize gate FAILED → compensate → aborting"
       sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
       abort_continue "$old" "$cand"
@@ -6354,6 +7544,7 @@ finalize_run_steps() {
       echo "── (resume step6)提交 stable 前重新核验 candidate($cand)liveness+leadership+VIP+control-probe ──"
       if ! ( wait_for_slot_leadership "$cand" 1 60 && vip_control_gate "$cand" ); then
         echo "✗ (resume step6)candidate 异常 → 转 aborting(§8:先起旧 unit 核验健康再切回)" >&2
+        require_mutation_lease_for_compensation "finalize-step6-compensation" || exit 86
         ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize resume step6 candidate UNHEALTHY → aborting"
         sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
         abort_continue "$old" "$cand"
@@ -6382,6 +7573,7 @@ finalize_run_steps() {
       fi
       if [[ -n "$precommit_failed" ]]; then
         echo "✗ finalize 提交前 ${precommit_failed} 失败 → 转 aborting，保留恢复路径" >&2
+        require_mutation_lease_for_compensation "finalize-precommit-compensation" || exit 86
         ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit gate(${precommit_failed}) FAILED → aborting"
         sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
         abort_continue "$old" "$cand"
@@ -6408,6 +7600,7 @@ abort() {
   echo "══ v5 --abort(秒级回退到旧 active;RFC D5)══"
   ds_snapshot
   ds_assert_phase canary finalizing aborting
+  require_mutation_lease_for_compensation "abort-entry" || exit 86
   local cand="${DS_candidate_slot:-B}" old="$DS_active_slot"
   # MINOR:aborting resume 沿用状态行原 operation_id(崩溃重跑不新造 OP;journal 归并同一操作)。
   if [[ "$DS_phase" == "aborting" && -n "${DS_operation_id:-}" ]]; then
@@ -6434,13 +7627,18 @@ abort() {
 # 是幂等核验,总是执行。abort transition_step 序:0(begin)→2(desired 收回)→3(candidate 停)→commit。
 abort_continue() {
   local old="$1" cand="$2" csrc; csrc="$(slot_src "$cand")"
-  local old_src image_id runtime_release
+  local old_src old_release image_id runtime_release
   old_src="$(slot_src "$old")"
+  old_release="$(bg_current_release "$old_src")"
+  [[ "$DRY" == 1 ]] || {
+    [[ -n "$old_release" ]] || { echo "✗ abort 无法解析旧 slot release:$old_src" >&2; return 1; }
+    assert_release_marker "$old_release" || return 1
+  }
   image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
   runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
-  # F7:abort/recover 是补偿/恢复路径(把公共流量与 leadership 收回旧 slot),恢复动作前 best-effort
-  # 重取 lease 缩小与自愈 host-action 并发窗;失败也照样恢复(停在坏态更有害,恢复稳态优先)。
-  reacquire_mutation_lease_best_effort "abort-continue"
+  # F7:abort/recover 是补偿/恢复路径(把公共流量与 leadership 收回旧 slot),恢复动作前
+  # 复核 lease；失活即 crash-stop，保留 aborting 状态供人工裁决后显式恢复。
+  require_mutation_lease_for_compensation "abort-continue" || exit 86
   # Must run before Caddy can route a single request back to old. The canary
   # preflight already closes the first-tape race; this fresh fail-closed check
   # also protects abort/recover after tapes exist.
@@ -6495,6 +7693,9 @@ recover() {
   local p="$DS_phase" s="$DS_transition_step" cand="${DS_candidate_slot:-}" old="$DS_active_slot"
   OP="${DS_operation_id:-p3-recover-$$}"
   echo "  · 当前 (phase=$p, step=$s, candidate=${cand:-<none>}, active=$old)"
+  if [[ "$p" != stable ]]; then
+    require_mutation_lease_for_compensation "recover-entry" || exit 86
+  fi
   case "$p" in
     stable)
       echo "  · phase=stable:无进行中操作,无需恢复。" ;;
@@ -6531,6 +7732,505 @@ recover() {
       abort ;;
     *)
       echo "✗ 未知 phase=$p,人工介入" >&2; exit 1 ;;
+  esac
+}
+
+close_mutation_lane_inherited_locks() {
+  exec 8>&- 9>&-
+  if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" && "${OC_V5_DEPLOY_LOCK_FD}" =~ ^[0-9]+$ ]]; then
+    eval "exec ${OC_V5_DEPLOY_LOCK_FD}>&-"
+  fi
+}
+
+hard_stop_mutation_lane_group() { # lease is lost/unknown: no TERM grace
+  local i signalled=0
+  if [[ -n "$MUTATION_LANE_PGID" ]] && {
+      same_process_identity "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \
+        || same_process_identity "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START"
+    }; then
+    kill -KILL -- "-$MUTATION_LANE_PGID" 2>/dev/null || true
+    signalled=1
+  elif [[ -n "$MUTATION_LANE_PID" ]] \
+      && same_process_identity "$MUTATION_LANE_PID" "$MUTATION_LANE_START"; then
+    kill -KILL "$MUTATION_LANE_PID" 2>/dev/null || true
+    signalled=1
+  else
+    echo "FATAL:mutation lane leader identity 已消失；拒绝向可能复用的 PGID=$MUTATION_LANE_PGID 发信号" >&2
+  fi
+  if [[ "$signalled" == 1 ]]; then
+    for i in $(seq 1 20); do
+      process_group_has_live_members "$MUTATION_LANE_PGID" || break
+      sleep 0.05
+    done
+  fi
+  if [[ -n "$MUTATION_LANE_PID" ]] \
+      && ! same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START"; then
+    # Zombie/gone leaders are safe to reap without blocking. A KILL-pending
+    # D-state leader must never wedge the supervisor in wait(2); outer exit will
+    # reparent it and the durable in-flight marker remains.
+    wait "$MUTATION_LANE_PID" 2>/dev/null || true
+  fi
+  # KILL-pending D-state tasks cannot return to userspace to mutate; keep the marker.
+  [[ "$signalled" == 1 ]] && process_group_has_live_members "$MUTATION_LANE_PGID" \
+    && echo "FATAL:mutation lane PGID=$MUTATION_LANE_PGID 仍有 KILL-pending 进程；保留 in-flight marker" >&2
+  return 0
+}
+
+stop_mutation_lane_watchdog() {
+  local i incomplete=0
+  if [[ -n "$MUTATION_LANE_WATCH_PID" && -n "$MUTATION_LANE_WATCH_START" ]] \
+      && same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START"; then
+    if [[ "$MUTATION_LANE_WATCH_PGID" == "$MUTATION_LANE_WATCH_PID" ]]; then
+      kill -TERM -- "-$MUTATION_LANE_WATCH_PGID" 2>/dev/null || true
+      for i in $(seq 1 20); do
+        process_group_has_live_members "$MUTATION_LANE_WATCH_PGID" || break
+        sleep 0.05
+      done
+      process_group_has_live_members "$MUTATION_LANE_WATCH_PGID" \
+        && kill -KILL -- "-$MUTATION_LANE_WATCH_PGID" 2>/dev/null || true
+    else
+      terminate_exact_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START"
+    fi
+  fi
+  if [[ -n "$MUTATION_LANE_WATCH_PGID" ]] \
+      && process_group_has_live_members "$MUTATION_LANE_WATCH_PGID"; then
+    incomplete=1
+  fi
+  if [[ -n "$MUTATION_LANE_WATCH_PID" ]]; then
+    if same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START"; then
+      incomplete=1
+    else
+      wait "$MUTATION_LANE_WATCH_PID" 2>/dev/null || true
+    fi
+  fi
+  if [[ "$incomplete" == 1 ]]; then
+    echo "FATAL:mutation watchdog 仍为 KILL-pending；不阻塞 wait，保留 identity/state" >&2
+    return 1
+  fi
+  MUTATION_LANE_WATCH_PID=""; MUTATION_LANE_WATCH_START=""; MUTATION_LANE_WATCH_PGID=""
+  return 0
+}
+
+reset_mutation_lane_runtime() {
+  stop_mutation_lane_watchdog || return 86
+  [[ -n "$MUTATION_LANE_STATE_DIR" ]] && rm -rf -- "$MUTATION_LANE_STATE_DIR"
+  MUTATION_LANE_PID=""; MUTATION_LANE_START=""; MUTATION_LANE_PGID=""
+  MUTATION_LANE_ANCHOR_PID=""; MUTATION_LANE_ANCHOR_START=""; MUTATION_LANE_STATE_DIR=""
+  return 0
+}
+
+mutation_lane_payload_cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  set +e
+  # Payload owns PLANNED_MAINTENANCE_* state. Signal/crash/lease-loss exits skip
+  # all mutation cleanup. Controlled exits may clear only that exact nonce while
+  # the parent concurrently supervises the lease. The durable in-flight marker
+  # is intentionally left for the two-phase parent/leader handshake below.
+  if (( rc < 128 )) && [[ "$rc" != 86 ]] && mutation_lease_live; then
+    if [[ "$PLANNED_MAINTENANCE_ACTIVE" == 1 ]]; then
+      end_planned_maintenance || rc=1
+    fi
+    mutation_lease_live || rc=86
+  else
+    echo "FATAL:mutation payload 非受控退出/lease loss(rc=$rc)；跳过 planned-maintenance cleanup" >&2
+    rc=86
+  fi
+  exit "$rc"
+}
+
+run_mutation_lane_supervised() { # <function> [args...]
+  local lane_fn="$1" outer_pid="$$" outer_start monitor_was_on=0
+  local gate ready done authorize anchor_ready anchor_release anchor_wait completed="" event_rc=0 lane_rc=0 i
+  shift
+  if [[ "$DRY" == 1 || "$MUTATION_LEASE_BYPASSED" == 1 ]]; then
+    "$lane_fn" "$@"
+    return $?
+  fi
+  mutation_lease_live || { echo "FATAL:mutation lane 启动前 lease 已失活" >&2; return 86; }
+  arm_mutation_lane_inflight || return 3
+  mutation_lease_live || { echo "FATAL:预置 in-flight marker 后 lease 已失活；拒绝启动 lane" >&2; return 86; }
+  outer_start="$(process_start_time "$outer_pid")" || return 86
+  MUTATION_LANE_STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/oc-v5-mutation-lane.XXXXXX")" || return 86
+  gate="$MUTATION_LANE_STATE_DIR/go"
+  ready="$MUTATION_LANE_STATE_DIR/watchdog-ready"
+  done="$MUTATION_LANE_STATE_DIR/payload-done"
+  authorize="$MUTATION_LANE_STATE_DIR/authorize-clear"
+  anchor_ready="$MUTATION_LANE_STATE_DIR/anchor-ready"
+  anchor_release="$MUTATION_LANE_STATE_DIR/anchor-release"
+  anchor_wait="$MUTATION_LANE_STATE_DIR/anchor-wait"
+  MUTATION_LANE_ANCHOR_PID=""; MUTATION_LANE_ANCHOR_START=""
+  if ! mkfifo -m 600 "$anchor_wait"; then
+    echo "FATAL:无法创建 mutation lane sentinel wait FIFO；保留 in-flight marker" >&2
+    reset_mutation_lane_runtime || true
+    return 86
+  fi
+
+  [[ $- == *m* ]] && monitor_was_on=1
+  set -m
+  (
+    trap - EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    set +m
+    # 独立 sentinel 与 payload leader 同 PGID，但不执行 mutation。它在 phase1
+    # 持续锚定 PGID：即使 Bash 抢先 reap leader，parent/watchdog 仍可证明该
+    # numeric PGID 未复用并安全 KILL 整组。watchdog ready 前它自行监 outer/lease，
+    # 且关闭继承锁，避免极早期 outer SIGKILL 留下锁泄漏。
+    (
+      trap - EXIT
+      trap 'exit 0' INT TERM HUP
+      close_mutation_lane_inherited_locks
+      exec 7<>"$anchor_wait" || exit 86
+      while [[ ! -e "$anchor_release" ]]; do
+        if [[ ! -e "$ready" ]]; then
+          same_live_process "$outer_pid" "$outer_start" || exit 137
+          mutation_lease_live || exit 86
+        fi
+        # Bash builtin timed read: unlike external sleep, this creates no
+        # same-PGID child that could pollute the phase1 descendant census.
+        read -r -t 0.02 -u 7 _ || true
+      done
+    ) &
+    anchor_pid=$!
+    anchor_start="$(process_start_time "$anchor_pid")" || {
+      kill -KILL "$anchor_pid" 2>/dev/null || true
+      exit 86
+    }
+    printf '%s %s\n' "$anchor_pid" "$anchor_start" >"${anchor_ready}.tmp.$BASHPID"
+    mv -f "${anchor_ready}.tmp.$BASHPID" "$anchor_ready"
+    while [[ ! -e "$gate" ]]; do
+      same_live_process "$outer_pid" "$outer_start" || exit 137
+      mutation_lease_live || exit 86
+      sleep 0.02
+    done
+    # Never call the payload in an if/|| context: Bash propagates conditional
+    # errexit suppression into functions. This nested, non-conditional subshell
+    # explicitly restores -Eeuo so a naked failure cannot run later mutations.
+    set +e
+    (
+      trap mutation_lane_payload_cleanup EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      trap 'exit 129' HUP
+      set -Eeuo pipefail
+      "$lane_fn" "$@"
+    )
+    lane_rc=$?
+    set -e
+    if [[ "$lane_rc" == 86 || "$lane_rc" -ge 128 ]]; then exit 86; fi
+    printf '%s\n' "$lane_rc" >"${done}.tmp.$BASHPID"
+    mv -f "${done}.tmp.$BASHPID" "$done"
+    while [[ ! -e "$authorize" ]]; do
+      same_live_process "$outer_pid" "$outer_start" || exit 86
+      mutation_lease_live || exit 86
+      sleep 0.02
+    done
+    same_live_process "$outer_pid" "$outer_start" || exit 86
+    mutation_lease_live || exit 86
+    same_live_process "$anchor_pid" "$anchor_start" || exit 86
+    clear_mutation_lane_inflight_exact || exit 1
+    # The sentinel must outlive every child-spawning mutation. In particular,
+    # clear_mutation_lane_inflight_exact uses ssh; releasing the PGID anchor
+    # before that child returns would let a killed/reaped leader strand an
+    # unfenced clear process. These are the final local actions before exit.
+    : >"$anchor_release" || exit 86
+    anchor_released=0
+    for i in $(seq 1 100); do
+      if ! same_live_process "$anchor_pid" "$anchor_start"; then
+        anchor_released=1
+        break
+      fi
+      same_live_process "$outer_pid" "$outer_start" || exit 86
+      mutation_lease_live || exit 86
+      sleep 0.02
+    done
+    [[ "$anchor_released" == 1 ]] || exit 86
+    wait "$anchor_pid" 2>/dev/null || true
+    exit "$lane_rc"
+  ) &
+  MUTATION_LANE_PID=$!
+  MUTATION_LANE_START="$(process_start_time "$MUTATION_LANE_PID")" || {
+    kill -KILL "$MUTATION_LANE_PID" 2>/dev/null || true
+    MUTATION_LANE_PID=""
+    [[ "$monitor_was_on" == 1 ]] || set +m
+    reset_mutation_lane_runtime || true
+    return 86
+  }
+  MUTATION_LANE_PGID="$(ps -o pgid= -p "$MUTATION_LANE_PID" 2>/dev/null | tr -d '[:space:]')"
+  if [[ "$MUTATION_LANE_PGID" != "$MUTATION_LANE_PID" ]]; then
+    echo "FATAL:mutation lane 未隔离为独立 PGID(pid=$MUTATION_LANE_PID pgid=${MUTATION_LANE_PGID:-missing})" >&2
+    hard_stop_mutation_lane_group
+    [[ "$monitor_was_on" == 1 ]] || set +m
+    reset_mutation_lane_runtime || true
+    return 86
+  fi
+  for i in $(seq 1 100); do
+    [[ -e "$anchor_ready" ]] && break
+    same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START" || break
+    sleep 0.02
+  done
+  read -r MUTATION_LANE_ANCHOR_PID MUTATION_LANE_ANCHOR_START <"$anchor_ready" 2>/dev/null || true
+  if ! { [[ "$MUTATION_LANE_ANCHOR_PID" =~ ^[1-9][0-9]*$ \
+        && "$MUTATION_LANE_ANCHOR_START" =~ ^[1-9][0-9]*$ ]] \
+      && same_process_identity "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" \
+      && [[ "$(ps -o pgid= -p "$MUTATION_LANE_ANCHOR_PID" 2>/dev/null | tr -d '[:space:]')" == "$MUTATION_LANE_PGID" ]]; }; then
+    echo "FATAL:mutation lane PGID sentinel 未就绪/身份不匹配；拒绝开放 gate" >&2
+    hard_stop_mutation_lane_group
+    [[ "$monitor_was_on" == 1 ]] || set +m
+    reset_mutation_lane_runtime || true
+    return 86
+  fi
+
+  # Independent-PGID sibling survives outer process-group SIGKILL and a stopped
+  # outer supervisor. Gate is opened only after this watcher has closed inherited
+  # lock FDs and published readiness. Any exact outer/holder/local-TTL loss KILLs
+  # the entire lane group first, then terminates remaining lease identities; no
+  # cleanup/rollback runs without lease and the pre-armed marker remains.
+  (
+    trap - EXIT
+    trap 'exit 0' INT TERM HUP
+    set +m
+    close_mutation_lane_inherited_locks
+    : >"$ready"
+    while same_supervised_process "$outer_pid" "$outer_start" \
+        && same_supervised_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
+        && same_supervised_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" \
+        && { [[ -e "$anchor_release" ]] \
+          || same_supervised_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START"; }; do
+      sleep 0.02
+    done
+    if same_process_identity "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \
+        || same_process_identity "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START"; then
+      kill -KILL -- "-$MUTATION_LANE_PGID" 2>/dev/null || true
+    fi
+    for i in $(seq 1 20); do
+      process_group_has_live_members "$MUTATION_LANE_PGID" || break
+      sleep 0.05
+    done
+    terminate_exact_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START"
+    terminate_exact_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"
+    rm -rf -- "$MUTATION_LANE_STATE_DIR"
+  ) &
+  MUTATION_LANE_WATCH_PID=$!
+  MUTATION_LANE_WATCH_START="$(process_start_time "$MUTATION_LANE_WATCH_PID")" || {
+    kill -KILL "$MUTATION_LANE_WATCH_PID" 2>/dev/null || true
+    MUTATION_LANE_WATCH_PID=""
+    [[ "$monitor_was_on" == 1 ]] || set +m
+    hard_stop_mutation_lane_group; reset_mutation_lane_runtime || true; return 86
+  }
+  MUTATION_LANE_WATCH_PGID="$(ps -o pgid= -p "$MUTATION_LANE_WATCH_PID" 2>/dev/null | tr -d '[:space:]')"
+  if [[ "$MUTATION_LANE_WATCH_PGID" != "$MUTATION_LANE_WATCH_PID" ]]; then
+    echo "FATAL:mutation watchdog 未隔离为独立 PGID(pid=$MUTATION_LANE_WATCH_PID pgid=${MUTATION_LANE_WATCH_PGID:-missing})" >&2
+    terminate_exact_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START"
+    [[ "$monitor_was_on" == 1 ]] || set +m
+    hard_stop_mutation_lane_group; reset_mutation_lane_runtime || true; return 86
+  fi
+  [[ "$monitor_was_on" == 1 ]] || set +m
+  for i in $(seq 1 100); do
+    [[ -e "$ready" ]] && break
+    same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START" || break
+    sleep 0.02
+  done
+  if [[ ! -e "$ready" ]] || ! same_live_process "$outer_pid" "$outer_start" \
+      || ! same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START" \
+      || ! mutation_lease_live; then
+    echo "FATAL:mutation lane gate 前 supervisor/lease 不完整；crash-stop" >&2
+    hard_stop_mutation_lane_group
+    reset_mutation_lane_runtime || true
+    return 86
+  fi
+  : >"$gate"
+
+  # Phase 1: payload finishes but the lane leader waits for a plain authorize file.
+  # Parent can now prove there are no live descendants while the durable marker
+  # still exists. Any holder/TTL/watchdog/leader loss before authorization is a
+  # crash-stop and therefore cannot create a marker-clear gap.
+  while [[ ! -e "$done" ]]; do
+    if ! mutation_lease_live; then
+      echo "FATAL:production-mutation lease/本地 TTL 在 payload 期间失活；立即 KILL lane PGID" >&2
+      hard_stop_mutation_lane_group
+      reset_mutation_lane_runtime || true
+      return 86
+    fi
+    if ! same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START"; then
+      echo "FATAL:mutation lane parent watchdog 在 payload 期间退出；fail-closed" >&2
+      hard_stop_mutation_lane_group
+      reset_mutation_lane_runtime || true
+      return 86
+    fi
+    if [[ -e "$anchor_release" ]] \
+        || ! same_live_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START"; then
+      echo "FATAL:mutation lane PGID sentinel 在 payload 期间提前释放/退出；fail-closed" >&2
+      hard_stop_mutation_lane_group
+      reset_mutation_lane_runtime || true
+      return 86
+    fi
+    if ! same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START"; then
+      # Keep the recorded PGID occupied until hard_stop signals/reaps it; waiting
+      # first would create an avoidable PID/PGID reuse window.
+      echo "FATAL:mutation lane leader 在 payload-done 前退出；保留 in-flight marker" >&2
+      hard_stop_mutation_lane_group
+      reset_mutation_lane_runtime || true
+      return 86
+    fi
+    sleep 0.05
+  done
+  lane_rc="$(cat "$done" 2>/dev/null || true)"
+  [[ "$lane_rc" =~ ^[0-9]+$ && "$lane_rc" -lt 128 && "$lane_rc" != 86 ]] || {
+    echo "FATAL:payload completion rc 非法:$lane_rc" >&2
+    hard_stop_mutation_lane_group
+    reset_mutation_lane_runtime || true
+    return 86
+  }
+  # Freeze the exact leader before proving its group empty. This lets its current
+  # 20ms polling sleep drain, while persistent payload descendants remain visible.
+  # A plain file authorization is nonblocking, so leader death can never wedge the
+  # parent in a FIFO open while lease supervision is paused.
+  same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \
+    && kill -STOP "$MUTATION_LANE_PID" 2>/dev/null || {
+      echo "FATAL:payload-done 后无法 STOP exact lane leader" >&2
+      hard_stop_mutation_lane_group
+      reset_mutation_lane_runtime || true
+      return 86
+    }
+  local group_quiet=0
+  for i in $(seq 1 100); do
+    if ! mutation_lease_live \
+        || ! same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START" \
+        || ! same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \
+        || ! same_live_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" \
+        || [[ -e "$anchor_release" ]]; then
+      break
+    fi
+    if ! process_group_has_live_members_except_two "$MUTATION_LANE_PGID" \
+        "$MUTATION_LANE_PID" "$MUTATION_LANE_ANCHOR_PID"; then
+      group_quiet=1
+      break
+    fi
+    sleep 0.02
+  done
+  if [[ "$group_quiet" != 1 ]]; then
+    echo "FATAL:payload 返回后 lane PGID 仍有 descendants；KILL 并保留 in-flight marker" >&2
+    hard_stop_mutation_lane_group
+    reset_mutation_lane_runtime || true
+    return 86
+  fi
+  if ! mutation_lease_live \
+      || ! same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START" \
+      || ! same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \
+      || ! same_live_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" \
+      || [[ -e "$anchor_release" ]]; then
+    echo "FATAL:marker-clear 授权前 lease/watchdog/sentinel 条件失活；保留 in-flight marker" >&2
+    hard_stop_mutation_lane_group
+    reset_mutation_lane_runtime || true
+    return 86
+  fi
+  : >"$authorize"
+  same_live_process "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \
+    && kill -CONT "$MUTATION_LANE_PID" 2>/dev/null || {
+      echo "FATAL:marker-clear authorize 后 exact lane leader 已失活" >&2
+      hard_stop_mutation_lane_group
+      reset_mutation_lane_runtime || true
+      return 86
+    }
+
+  # Phase 2: leader performs exact marker clear while the non-mutating sentinel
+  # continues to anchor this PGID. Only after the clear ssh child has returned
+  # does the leader release/reap the sentinel and exit. Continue racing both
+  # identities against ssh/TTL/outer-watchdog.
+  if wait -n -p completed "$MUTATION_LANE_PID" "$MUTATION_LEASE_PID" \
+      "$MUTATION_LEASE_TTL_PID" "$MUTATION_LANE_WATCH_PID"; then
+    event_rc=0
+  else
+    event_rc=$?
+  fi
+  if [[ "$completed" == "$MUTATION_LANE_PID" ]]; then
+    lane_rc="$event_rc"
+    if same_process_identity "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START"; then
+      echo "FATAL:lane leader 已退出但 PGID sentinel 未受控回收；crash-stop 并保留 in-flight marker" >&2
+      hard_stop_mutation_lane_group
+      reset_mutation_lane_runtime || true
+      return 86
+    fi
+    # wait-n 已回收 exact leader；立即丢弃 raw PID/PGID，确保后续任一
+    # reset/EXIT 失败路径都不可能向复用后的无关进程组发信号。
+    MUTATION_LANE_PID=""; MUTATION_LANE_START=""; MUTATION_LANE_PGID=""
+    MUTATION_LANE_ANCHOR_PID=""; MUTATION_LANE_ANCHOR_START=""
+    if ! mutation_lease_live \
+        || ! same_live_process "$MUTATION_LANE_WATCH_PID" "$MUTATION_LANE_WATCH_START"; then
+      echo "FATAL:lane 与 lease/watchdog 同时退出；按 lease loss 裁决" >&2
+      # wait-n 已回收 lane leader；授权前已证明无 descendants，禁止再向旧
+      # numeric PGID 发信号（可能已被无关进程组复用）。
+      reset_mutation_lane_runtime || true
+      return 86
+    fi
+    # wait -n 已回收 leader，旧 numeric PGID 此刻不再是可安全发信号的
+    # identity。授权前已证明 group 只剩 leader；授权后固定代码仅同步 clear
+    # marker，不会留下后台 descendant，因此这里禁止再 probe/kill 旧 PGID。
+    if [[ "$lane_rc" == 86 || "$lane_rc" -ge 128 ]]; then
+      echo "FATAL:mutation lane crash-stop rc=$lane_rc；保留 in-flight marker" >&2
+      reset_mutation_lane_runtime || true
+      return 86
+    fi
+    if ! mutation_lane_inflight_absent; then
+      echo "FATAL:受控 lane 退出但 exact in-flight clear 未确认；保留标记" >&2
+      reset_mutation_lane_runtime || return 86
+      return 1
+    fi
+    MUTATION_LANE_INFLIGHT_ACTIVE=0; MUTATION_LANE_INFLIGHT_NONCE=""
+    reset_mutation_lane_runtime || return 86
+    return "$lane_rc"
+  fi
+
+  if [[ "$completed" == "$MUTATION_LEASE_PID" ]]; then
+    echo "FATAL:production-mutation ssh holder 先退出；立即 KILL lane PGID，禁止补偿" >&2
+  elif [[ "$completed" == "$MUTATION_LEASE_TTL_PID" ]]; then
+    echo "FATAL:production-mutation 本地安全 TTL 到点；立即 KILL lane PGID" >&2
+  elif [[ "$completed" == "$MUTATION_LANE_WATCH_PID" ]]; then
+    echo "FATAL:mutation lane parent watchdog 意外退出；fail-closed KILL lane PGID" >&2
+  else
+    echo "FATAL:mutation lane supervisor 无法裁决首退进程；fail-closed" >&2
+  fi
+  hard_stop_mutation_lane_group
+  reset_mutation_lane_runtime || true
+  return 86
+}
+
+run_selected_mode() { # [mode]
+  local selected_mode="${1:-$MODE}"
+  case "$selected_mode" in
+    bootstrap) bootstrap ;;
+    migrate-bluegreen) migrate_to_bluegreen ;;
+    smoke)     resolve_active_lane; smoke "$ACTIVE_PORT" ;;
+    knowledge-planet-verify) knowledge_planet_plugin_verify_user ;;
+    baseline-census) run_ccb_baseline_remount census ;;
+    baseline-remount) run_ccb_baseline_remount remount ;;
+    deploy)    deploy ;;
+    dist)      deploy_dist ;;
+    model-authority-preflight) model_authority_preflight ;;
+    enable-model-authority)    enable_model_authority ;;
+    disable-model-authority)   disable_model_authority ;;
+    model-authority-observation-status) model_authority_observation_status ;;
+    enable-seed-authority-by-rev) enable_seed_authority_by_rev ;;
+    record-model-authority-emergency-drill) record_model_authority_emergency_drill ;;
+    model-authority-cutover)   model_authority_cutover ;;
+    enable-runtime-tape-batching) enable_runtime_tape_batching ;;
+    emergency-tuple) emergency_tuple ;;
+    activate-emergency-tuple) activate_emergency_tuple ;;
+    prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;
+    offline-recycle) assert_not_bluegreen_for_cutover; offline_recycle ;;
+    stage)     assert_not_bluegreen_for_cutover; stage ;;
+    activate-staged) assert_not_bluegreen_for_cutover; activate_staged ;;
+    rollback)  rollback ;;
+    reclaim-mutation-lease) reclaim_production_mutation_lease ;;
+    canary)    canary ;;
+    promote)   promote ;;
+    finalize)  finalize ;;
+    abort)     abort ;;
+    recover)   recover ;;
+    *) echo "✗ 未知 mode:$selected_mode" >&2; return 2 ;;
   esac
 }
 
@@ -6666,35 +8366,27 @@ case "$MODE" in
   *) acquire_production_mutation_lease || exit 3 ;;
 esac
 
+# Legacy marker 兼容权只在会 build/flip/放量 master release 的 invocation 建立：此刻本地
+# deploy lock 与远端 mutation lease 均已持有，而 run_mutation_lane_supervised 尚未 arm
+# in-flight marker，故这是任何 release/state/unit 写入前的唯一可信捕获点。
 case "$MODE" in
-  bootstrap) bootstrap ;;
-  migrate-bluegreen) migrate_to_bluegreen ;;
-  smoke)     resolve_active_lane; smoke "$ACTIVE_PORT" ;;
-  knowledge-planet-verify) knowledge_planet_plugin_verify_user ;;
-  baseline-census) run_ccb_baseline_remount census ;;
-  baseline-remount) run_ccb_baseline_remount remount ;;
-  deploy)    deploy ;;
-  dist)      deploy_dist ;;
-  model-authority-preflight) model_authority_preflight ;;
-  enable-model-authority)    enable_model_authority ;;
-  disable-model-authority)   disable_model_authority ;;
-  model-authority-observation-status) model_authority_observation_status ;;
-  enable-seed-authority-by-rev) enable_seed_authority_by_rev ;;
-  record-model-authority-emergency-drill) record_model_authority_emergency_drill ;;
-  model-authority-cutover)   model_authority_cutover ;;
-  enable-runtime-tape-batching) enable_runtime_tape_batching ;;
-  emergency-tuple) emergency_tuple ;;
-  activate-emergency-tuple) activate_emergency_tuple ;;
-  prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;
-  offline-recycle) assert_not_bluegreen_for_cutover; offline_recycle ;;
-  stage)     assert_not_bluegreen_for_cutover; stage ;;
-  activate-staged) assert_not_bluegreen_for_cutover; activate_staged ;;
-  rollback)  rollback ;;
-  reclaim-mutation-lease) reclaim_production_mutation_lease ;;
-  # ── P3 双 master cohort lane ──
-  canary)    canary ;;
-  promote)   promote ;;
-  finalize)  finalize ;;
-  abort)     abort ;;
-  recover)   recover ;;
+  deploy)
+    capture_trusted_release_predecessor || exit 1
+    [[ "$RESTART_EGRESS" != 1 ]] || capture_trusted_egress_predecessor || exit 1
+    ;;
+  dist|rollback|canary|promote|finalize|abort|recover)
+    capture_trusted_release_predecessor || exit 1 ;;
+  migrate-bluegreen)
+    # 首次实目录迁移没有 predecessor marker；已是 symlink 的幂等重跑则必须也在
+    # supervisor arm 首写前捕获 exact target，函数内只消费这份已锁定身份。
+    migrate_predecessor="$(bg_current_release "$REMOTE_SRC")"
+    [[ -z "$migrate_predecessor" ]] \
+      || capture_trusted_release_predecessor "$migrate_predecessor" || exit 1 ;;
+esac
+
+case "$MODE" in
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify)
+    run_selected_mode "$MODE" ;;
+  *)
+    run_mutation_lane_supervised run_selected_mode "$MODE" ;;
 esac

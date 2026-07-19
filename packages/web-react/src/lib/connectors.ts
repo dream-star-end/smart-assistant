@@ -288,7 +288,7 @@ export type KnowledgePlanetAutomationView = {
   recentRuns: KnowledgePlanetAutomationRun[]
 }
 
-export type KnowledgePlanetSetupView = {
+export type ManagedBrowserSetupView = {
   sessionId: string
   status: 'waiting_for_scan' | 'finalizing' | 'active' | 'cancelled' | 'expired' | 'failed'
   phase?:
@@ -301,12 +301,16 @@ export type KnowledgePlanetSetupView = {
     | 'expired'
     | 'failed'
   qrReady: boolean
+  /** Monotonic server revision; each refreshed QR image increments it. */
+  qrRevision?: number
   agentReady?: boolean
   createdAt: string
   expiresAt: string
   accountId?: string
   errorCode?: string
 }
+
+export type KnowledgePlanetSetupView = ManagedBrowserSetupView
 
 /**
  * 该 authMode 是否走 OAuth 授权码重定向流（用户 BYOA 自建应用：填 client 凭据 → 跳授权页）。

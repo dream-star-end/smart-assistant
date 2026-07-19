@@ -408,13 +408,12 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
   // ⑥ release delivery(批1b,§6.2):fuse 未 engaged 时交付 due queued 请求。
   //    dormant:无 queued 请求即零行为(release request 表仅在 boss 放行后有行)。
   try {
-    const fuseR = await query<{ engaged: boolean }>(
-      `SELECT engaged FROM selfheal_release_fuse WHERE id = 1`,
-    );
-    if (!fuseR.rows[0]?.engaged) {
-      const MAX_PER_TICK = 10;
-      for (let i = 0; i < MAX_PER_TICK; i++) {
+    const MAX_PER_TICK = 10;
+    for (let i = 0; i < MAX_PER_TICK; i++) {
         // 原子认领 + 租约推进(指数退避 cap 10min):并发/重叠 tick SKIP LOCKED 不重复交付。
+        // Fuse predicate lives in the SAME statement snapshot as the claim;
+        // an earlier SELECT followed by UPDATE could claim after a concurrent
+        // deploy_unknown had already engaged the global gate.
         // 注:SET 里的 next_delivery_at 表达式引用 delivery_attempts 的**旧值**(PG 语义),
         // RETURNING 返回自增后的新值。
         const claim = await query<{
@@ -430,9 +429,17 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
             WHERE id = (
               SELECT id FROM selfheal_release_requests
                WHERE status = 'queued' AND next_delivery_at <= NOW()
+                 AND NOT EXISTS (
+                   SELECT 1 FROM selfheal_release_fuse_epochs
+                    WHERE cleared_at IS NULL
+                 )
                ORDER BY next_delivery_at ASC, id ASC
                LIMIT 1 FOR UPDATE SKIP LOCKED
             )
+              AND NOT EXISTS (
+                SELECT 1 FROM selfheal_release_fuse_epochs
+                 WHERE cleared_at IS NULL
+              )
             RETURNING id::text AS id, release_request_id, repair_id::text AS repair_id,
                       incident_id::text AS incident_id, approved_sha, base_sha,
                       deploy_plan_hash, manifest_hash, delivery_attempts`,
@@ -494,7 +501,6 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
           log.warn("selfheal_release_delivery_failed",
             { releaseRequestId: rr.release_request_id, err: (err as Error)?.message });
         }
-      }
     }
   } catch (err) {
     out.errors++;
@@ -522,24 +528,54 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
     log.warn("selfheal_release_watch_failed", { err: (err as Error)?.message ?? String(err) });
   }
 
-  // ⑧ 熔断双侧收敛(批1b,§6.2):v5 已清(cleared_at 非空)且个人版未 ack → 投递 fuse-clear,
-  //    个人版 200 后回填 personal_ack_at。CAS 保证恰一次收敛。
+  // ⑧ 熔断双侧收敛(批1b,§6.2):每个 v5 epoch 已清且个人版未 ack → 投递 exact
+  //    fuse-clear。不能扫 singleton:清 A 会立刻把 singleton 投影到仍 engaged 的 B,
+  //    但 A 的个人版 clear obligation 仍必须独立完成。
   try {
-    const f = await query<{ reason: string | null; cleared_by: string | null }>(
-      `SELECT reason, cleared_by FROM selfheal_release_fuse
-        WHERE id = 1 AND engaged = FALSE AND cleared_at IS NOT NULL AND personal_ack_at IS NULL`,
+    const epochs = await query<{
+      reason: string | null;
+      clear_reason: string | null;
+      cleared_by: string | null;
+      release_request_id: string;
+      cleared_at: Date;
+    }>(
+      `SELECT reason, clear_reason, cleared_by, release_request_id, cleared_at
+         FROM selfheal_release_fuse_epochs
+        WHERE cleared_at IS NOT NULL AND personal_ack_at IS NULL
+        ORDER BY cleared_at ASC, release_request_id ASC
+        LIMIT 10`,
     );
-    if (f.rows.length > 0) {
+    for (const epoch of epochs.rows) {
       const del = await postFuseClear(
-        { reason: f.rows[0].reason ?? "fuse cleared by admin", clearedBy: f.rows[0].cleared_by ?? "admin" },
+        {
+          reason: epoch.clear_reason ?? epoch.reason ?? "fuse cleared by admin",
+          clearedBy: epoch.cleared_by ?? "admin",
+          expectedReleaseRequestId: epoch.release_request_id,
+        },
         { query, tx, now, logger: log },
       );
       if (del.ok) {
-        const cas = await query(
-          `UPDATE selfheal_release_fuse SET personal_ack_at = NOW()
-            WHERE id = 1 AND engaged = FALSE AND cleared_at IS NOT NULL AND personal_ack_at IS NULL`,
-        );
-        if ((cas.rowCount ?? 0) > 0) out.fuseConverged++;
+        const converged = await tx(async (client: PoolClient) => {
+          // Global lock order is singleton → epoch (callbacks, admin clear and
+          // the rolling-upgrade triggers use the same order).
+          await client.query(`SELECT 1 FROM selfheal_release_fuse WHERE id = 1 FOR UPDATE`);
+          const cas = await client.query(
+            `UPDATE selfheal_release_fuse_epochs SET personal_ack_at = NOW()
+              WHERE release_request_id = $1 AND cleared_at IS NOT NULL
+                AND personal_ack_at IS NULL`,
+            [epoch.release_request_id],
+          );
+          if ((cas.rowCount ?? 0) === 0) return false;
+          // Keep the singleton's legacy/UI ack field coherent only when it is
+          // still projecting this cleared epoch. Epoch ledger remains authority.
+          await client.query(
+            `UPDATE selfheal_release_fuse SET personal_ack_at = NOW()
+              WHERE id = 1 AND engaged = FALSE AND release_request_id = $1`,
+            [epoch.release_request_id],
+          );
+          return true;
+        });
+        if (converged) out.fuseConverged++;
       }
     }
   } catch (err) {
@@ -547,7 +583,7 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
     log.warn("selfheal_fuse_converge_failed", { err: (err as Error)?.message ?? String(err) });
   }
 
-  // ⑨ 熔断 engaged → durable critical 告警(F13①)。callback 端 deploy_unknown 只在同事务落
+  // ⑨ 熔断 engaged → durable critical 告警(F13①)。callback 端 uncertainty 只在同事务落
   //    critical repair 事件(不做非事务 enqueue);此处把它接上 sweeper 既有告警出口(alert outbox)。
   //    dedupe 以本次 engagement(release_request_id / engaged_at)为界,每次 engage 至多告警一次
   //    (fuse 保持 engaged 直到人工清;沿用 dispatcher 保险丝"outbox 已有该 dedupe_key 即永久跳过")。
@@ -568,9 +604,9 @@ export async function sweepRepairsOnce(deps: RepairSweepDeps = {}): Promise<Repa
         enqueue({
           event_type: OPS_REPAIR_FAILED,
           severity: "critical",
-          title: "自愈 Tier2 部署熔断已拉起(deploy_unknown),禁自动部署待人工裁决",
+          title: "自愈 Tier2 release uncertainty 熔断已拉起，禁自动部署待人工裁决",
           body:
-            `release=\`${frow.release_request_id ?? "-"}\` deploy_unknown 已 engage 全局 Tier2 部署熔断` +
+            `release=\`${frow.release_request_id ?? "-"}\` 已因部署/canonical 收敛不确定 engage 全局 Tier2 部署熔断` +
             `(${frow.reason ?? ""});请人工按 /version·deploy_state·远端 ref 裁决后走 fuse-clear 审计流。`,
           payload: { release_request_id: frow.release_request_id, reason: frow.reason, kind: "release_fuse_engaged" },
           dedupe_key: dedupe,

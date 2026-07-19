@@ -240,7 +240,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     assert.equal(c?.status, undefined, 'replied dropped (derived now)')
   })
 
-  it('drops + counts server-authoritative fields (_source/_seq/_orderSeq/usage/_truncated/_errorCode/_errorDetail)', () => {
+  it('drops + counts server-authoritative fields (_source/_seq/_orderSeq/_turnTapeOrdinal/usage/_truncated/_errorCode/_errorDetail)', () => {
     const cleaned = _stripClientPutMessage({
       id: 'm-evil',
       role: 'assistant',
@@ -249,6 +249,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
       _source: 'server',
       _seq: 9999,
       _orderSeq: 7777,
+      _turnTapeOrdinal: 42,
       usage: { costCredits: '1000', inputTokens: 0 },
       _truncated: true,
       _errorCode: 'oops',
@@ -257,6 +258,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     assert.equal(cleaned?._source, undefined)
     assert.equal(cleaned?._seq, undefined)
     assert.equal(cleaned?._orderSeq, undefined)
+    assert.equal(cleaned?._turnTapeOrdinal, undefined)
     assert.equal(cleaned?.usage, undefined)
     assert.equal(cleaned?._truncated, undefined)
     assert.equal(cleaned?._errorCode, undefined)
@@ -266,6 +268,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     assert.equal(counts._source, 1)
     assert.equal(counts._seq, 1)
     assert.equal(counts._orderSeq, 1)
+    assert.equal(counts._turnTapeOrdinal, 1)
     assert.equal(counts.usage, 1)
     assert.equal(counts._truncated, 1)
     assert.equal(counts._errorCode, 1)

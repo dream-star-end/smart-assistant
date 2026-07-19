@@ -124,7 +124,8 @@ before(async () => {
     archived_count BIGINT NOT NULL DEFAULT 0,
     message_count BIGINT NOT NULL DEFAULT 0,
     last_at BIGINT NOT NULL DEFAULT 0,
-    updated_at BIGINT NOT NULL DEFAULT 0
+    updated_at BIGINT NOT NULL DEFAULT 0,
+    history_revision BIGINT NOT NULL DEFAULT 0
   )`)
   await pool.query(`CREATE TABLE client_session_archived_ids (
     session_id TEXT NOT NULL,

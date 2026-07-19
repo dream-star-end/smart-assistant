@@ -83,7 +83,8 @@ describe("turnErrorTaxonomy 契约:文案表 key 与 protocol 权威表对齐", 
   test("免单集合(render WAIVED)与 protocol WAIVED_TURN_ERROR_CODES 一致", () => {
     // WAIVED_ERROR_CODES 未导出,借 errorPresentation 的免单标题间接校验其派生正确。
     for (const code of WAIVED_TURN_ERROR_CODES) {
-      expect(TURN_ERROR_TAXONOMY[code as keyof typeof TURN_ERROR_TAXONOMY].waivable).toBe(true);
+      const row = (TURN_ERROR_TAXONOMY as Record<string, { waivable?: boolean }>)[code];
+      expect(row.waivable).toBe(true);
     }
   });
 
