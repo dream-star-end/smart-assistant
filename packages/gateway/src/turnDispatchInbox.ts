@@ -564,6 +564,8 @@ export type TapeStatus = 'completed' | 'interrupted' | 'crashed'
 export interface MasterTapeStateResult {
   state: MasterTapeState
   tapeStatus?: TapeStatus
+  /** Required when state=none; protects recovery while the master dispatch lease is live. */
+  dispatchLeaseActive?: boolean
 }
 
 /** GET /internal/v3/turn-tape-state?dispatchId=&attemptNo= 契约客户端。 */
@@ -599,9 +601,19 @@ export async function queryMasterTapeState(
       bodyText += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
       if (bodyText.length > 64 * 1024) break
     }
-    const parsed = JSON.parse(bodyText) as { state?: unknown; status?: unknown }
-    if (parsed.state === 'none' || parsed.state === 'partial') {
-      return { state: parsed.state }
+    const parsed = JSON.parse(bodyText) as {
+      state?: unknown
+      status?: unknown
+      dispatchLeaseActive?: unknown
+    }
+    if (parsed.state === 'none') {
+      // Rolling-safe capability handshake: a new gateway talking to an old
+      // master must wait, not turn missing lease evidence into negative proof.
+      if (typeof parsed.dispatchLeaseActive !== 'boolean') return { state: 'unreachable' }
+      return { state: 'none', dispatchLeaseActive: parsed.dispatchLeaseActive }
+    }
+    if (parsed.state === 'partial') {
+      return { state: 'partial' }
     }
     if (parsed.state === 'finalized') {
       const tapeStatus =
@@ -717,6 +729,62 @@ export function isTurnDispatchLive(dispatchId: string, attemptNo: number): boole
   return liveDispatchRefs.has(liveKeyOf(dispatchId, attemptNo))
 }
 
+export type DurableDispatchAdmissionResult = 'executed' | 'duplicate' | 'admit_failed'
+
+/**
+ * Production durable WS admission lifecycle.
+ *
+ * Ordering is part of the protocol: mark before INSERT, send the first receipt
+ * immediately after a durable INSERT (before dispatch), and keep the live
+ * reference until dispatch settles. A transport duplicate owns a separate
+ * reference, so its early unmark cannot expose the original execution to the
+ * periodic recovery sweep.
+ */
+export async function runDurableDispatchAdmission(input: {
+  ctx: DispatchTurnContext
+  sendReceipt: (row: TurnDispatchInboxRow | null) => void
+  dispatch: () => Promise<void>
+  onAdmitError?: (err: unknown) => void
+  onOrphanRejectError?: (err: unknown) => void
+}): Promise<DurableDispatchAdmissionResult> {
+  const { ctx } = input
+  markTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+  let admitted: Awaited<ReturnType<typeof admitTurnDispatch>>
+  try {
+    admitted = await admitTurnDispatch({ ctx })
+  } catch (err) {
+    unmarkTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+    input.onAdmitError?.(err)
+    return 'admit_failed'
+  }
+
+  if (!admitted.inserted) {
+    unmarkTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+    input.sendReceipt(admitted.row)
+    return 'duplicate'
+  }
+
+  try {
+    // B2: first durable acceptance is acknowledged before model dispatch so
+    // the master can CAS admitted → accepted on a single transport delivery.
+    input.sendReceipt(admitted.row)
+    await input.dispatch()
+  } finally {
+    try {
+      await inboxReject({
+        userId: ctx.uid,
+        sessionId: ctx.sessionId,
+        clientMessageId: ctx.clientMessageId,
+      })
+    } catch (err) {
+      input.onOrphanRejectError?.(err)
+    } finally {
+      unmarkTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
+    }
+  }
+  return 'executed'
+}
+
 export interface BootRecoveryDeps {
   /** 本地 retry queue 是否已有该 dispatch/attempt 的 entry(①路径)。 */
   retryQueueHasDispatch: (dispatchId: string, attemptNo: number) => Promise<boolean>
@@ -743,6 +811,8 @@ export interface BootRecoveryStats {
   recoveryPending: number
   /** 因活执行标记跳过的行数(周期 sweep 下 >0 属正常;boot 首跑恒 0)。 */
   liveSkipped: number
+  /** master dispatch lease 仍活,none 分支延后 synthetic 的行数。 */
+  leaseDeferred: number
 }
 
 /**
@@ -761,6 +831,7 @@ export async function recoverTurnDispatchInboxOnBoot(
     sinkStageFailed: 0,
     recoveryPending: 0,
     liveSkipped: 0,
+    leaseDeferred: 0,
   }
   const now = deps.now ?? (() => Date.now())
   const rows = await scanOpenTurnDispatches()
@@ -851,6 +922,14 @@ async function recoverOneRow(
   if (state === 'unreachable') {
     // 保持 recovery_pending 重试,禁止推断(fail-closed I2)。
     stats.recoveryPending++
+    return
+  }
+
+  if (result.dispatchLeaseActive !== false) {
+    // none + 活 lease:master 仍可能有一个刚受理/刚 accepted 的执行方,不能把
+    // "尚无 tape"当作进程已死。缺字段同样 fail-closed(滚动期间老 master)。
+    stats.recoveryPending++
+    if (result.dispatchLeaseActive === true) stats.leaseDeferred++
     return
   }
 

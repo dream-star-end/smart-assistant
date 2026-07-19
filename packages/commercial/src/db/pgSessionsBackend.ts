@@ -722,6 +722,8 @@ export type TurnTapeDispatchState = "none" | "partial" | "finalized";
 export interface TurnTapeStateResult {
   state: TurnTapeDispatchState;
   status: string | null;
+  /** Same-snapshot secondary fence for gateway recovery when state=none. */
+  dispatchLeaseActive: boolean;
 }
 
 export interface DispatchAdmissionBackend {
@@ -2818,18 +2820,53 @@ export function createPgSessionsBackend(
       dispatchId: string,
       attemptNo: number,
     ): Promise<TurnTapeStateResult> {
-      const res = await pool.query<{ finalized_at: string | null; status: string }>(
-        `SELECT finalized_at, status FROM client_session_turn_tapes
-          WHERE user_id = $1 AND dispatch_id = $2 AND attempt_no = $3
-          ORDER BY (finalized_at IS NOT NULL) DESC
-          LIMIT 1`,
-        [userId, dispatchId, attemptNo],
+      const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+      if (!uidMatch) return { state: "none", status: null, dispatchLeaseActive: false };
+      const dispatchUserId = uidMatch[1]!;
+      const res = await pool.query<{
+        tape_found: boolean;
+        finalized_at: string | null;
+        tape_status: string | null;
+        dispatch_lease_active: boolean;
+      }>(
+        `SELECT
+           (tape.tape_id IS NOT NULL) AS tape_found,
+           tape.finalized_at,
+           tape.status AS tape_status,
+           COALESCE(
+             dispatch.status IN ('admitted','accepted')
+               AND dispatch.lease_until > statement_timestamp(),
+             FALSE
+           ) AS dispatch_lease_active
+         FROM (VALUES (1)) AS singleton(n)
+         LEFT JOIN LATERAL (
+           SELECT tape_id, finalized_at, status
+             FROM client_session_turn_tapes
+            WHERE user_id = $1 AND dispatch_id = $3 AND attempt_no = $4
+            ORDER BY (finalized_at IS NOT NULL) DESC
+            LIMIT 1
+         ) AS tape ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT status, lease_until
+             FROM turn_dispatches
+            WHERE user_id = $2 AND dispatch_id = $3 AND attempt_no = $4
+            LIMIT 1
+         ) AS dispatch ON TRUE`,
+        [userId, dispatchUserId, dispatchId, attemptNo],
       );
-      if (res.rows.length === 0) return { state: "none", status: null };
+      // singleton guarantees one row. Tape and lease evidence come from this
+      // one PostgreSQL statement snapshot: a separate read could observe
+      // none, race with finalize, then observe an expired lease and synthesize
+      // a false SERVICE_RESTART tape.
       const row = res.rows[0]!;
+      const dispatchLeaseActive = row.dispatch_lease_active === true;
+      if (!row.tape_found) {
+        return { state: "none", status: null, dispatchLeaseActive };
+      }
       return {
         state: row.finalized_at !== null ? "finalized" : "partial",
-        status: row.status ?? null,
+        status: row.tape_status ?? null,
+        dispatchLeaseActive,
       };
     },
 

@@ -467,6 +467,7 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 全量现网后告别"随改随发"。规则(可按运营数据调整):
 - **常规批次攒窗口发**:非紧急改动合并 canonical 后不立即部署,攒到当日发版窗口(默认每日 1-2 个,北京时间午后/晚间)一次上线;一窗一条面向用户 changelog(改动可感知时)。
 - **hotfix 例外**:现网事故/计费错账/安全面可即时发,但仍必须走 deploy-v5.sh+smoke,并在下一窗口补 changelog。
+- **P0 stop-the-line**:已定性且未关闭的 P0 存续期间,同一故障域/子系统禁止再合入或上线功能批;只允许诊断、修复与验证该 P0 的改动。例外必须由 boss 明确批准,不能靠临时放宽 branch protection 绕过。
 - **发版门**:check:v5 全绿(typecheck+gateway+mcp-memory+storage+web-react+commercial 基线集 diff)+生效面矩阵分类;镜像面改动放量前 canary(agent uid)。
 - **单日多批合并**:允许(canonical 持续集成),但部署窗口是节流阀;并行会话共用窗口,部署前必 fetch 核对 tip 与镜像 tag,避免互覆(07-06 教训:egress 面被并行部署漏掉)。
 
@@ -506,8 +507,9 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 | ~~v5 无后台孤儿回收网~~ **部分偿还**(02878333,07-06) | orphanReconcile 已放开 v5-owned(channel 双侧隔离,与 409 自愈错峰幂等,smoke 白名单已登记);**idleSweep/volumeGc 仍钉死**(活跃容器误杀窗口/不可逆删卷) | idleSweep:补 turn 级活跃屏障后再放;volumeGc:v3 退役收尾+观察期结束后单独评估 |
 
 | ~~org 订阅期内桶~~ **已偿还**(二期 8a4c14a9,0115) | 四桶+席位订阅(org-pro/max/ultra 9折池化)+自助开通+席位闸 | — |
-| 活集生产接线无进程内测试 | durable dispatch 活标记(mark 先于 INSERT queued/finally 注销)的 server.ts WS 受理块接线只有静态审计+canary 长 turn 实证;受理块在 WS handler 闭包内,现有 harness 够不到(Codex R1 MINOR 知情登记) | 改受理块或 recovery 协议时,先补 e2e OC_TURN_DISPATCH_SWEEP_MS 压缩 tick 行为用例 |
-| 滚动重启 mid-turn 无 drain/lease 双闸 | 容器滚动重启落在 turn 在飞窗,boot recovery(真 boot)仍会对 none 行合成 SERVICE_RESTART crashed=诚实失败+免单,但内容丢、需用户重试;根治=滚动前 drain(inbox 有 running 行延迟)+recovery none 分支查 master dispatch lease | master 重派 outbox(durable 批债①)落地时一并设计;或 dispatch_lost 类事故月频 >3 |
+| ~~活集生产接线无进程内测试~~ **已偿还**(2026-07-19) | server.ts 改走 runDurableDispatchAdmission 单一生产 helper,锁住 mark→INSERT→首次 receipt→dispatch→finally unmark 顺序;行为用例以真实 SQLite+`OC_TURN_DISPATCH_SWEEP_MS=1000` tick 重叠首达与重复帧,证明重复帧 unmark 不会拆掉首达 live 引用、settle 后下一 tick 才按 recovery 收敛 | — |
+| ~~计划滚动重启 mid-turn 无 drain/lease 双闸~~ **已偿还**(2026-07-19) | recycle handshake 在既有 ingress/session gate 上增加 durable `running` 行闸,DB 读失败/TTL 读中到期均 fail-closed;重叠握手由进程内 coordinator 串行化,后请求不得释放先请求已受理的双闸。master turn-tape-state 用单条 PG statement 同快照返回 tape+同租户 dispatch lease,none+活 lease 延后 synthetic。accepted lease 只是 90s 量级 secondary fence,planned recycle 主保护仍是 drain | — |
+| 真容器崩溃后无自动内容重派 | 非计划进程/宿主崩溃会清空内存 drain/live registry;短 dispatch lease 过期且 master 无 tape 后仍合成确定性 SERVICE_RESTART crashed(诚实失败+免单),已经生成但未 stage 的内容无法恢复 | master 自动重派 outbox 落地;或 dispatch_lost 类事故月频 >3;或 boss 要求零触达恢复 |
 | 远端 host release/bundle 分发 | runtime release/platform bundle 仅本机(kl-mirror);多机硬门:OC_RUNTIME_RELEASE 非空+非 self-host placement → 调度前拒 provision+告警(v3supervisor 带测试) | 新增 compute host 时做 rsync 分发(与 baseline REMOTE_HOST_CCB_BASELINE_DIR 推送同构)+node-agent inspect 契约补 imageId/labels |
 | 模型权威独立批次(P2c+seed model) | 模型目录 master 下发(ModelExecutionCatalog:bridge 授权/engine 分类/计费编排/容器执行同快照消费,per-uid 过滤,enabled=false fail-closed)+seed agent model/engine 声明化(bridge 按容器实际 seed revision 推导);设计审 R1-B5/R2-B1 裁定不与镜像瘦身同批 —— **在此之前 platform-seed.yaml 禁放 model/engine/provider 键(schema 硬拒),模型面改动仍走 protocol 常量+release 滚动** | 下一个模型/计费面批次单独设计单独 Codex 审 |
 | SupervisorErrorCode 无平台专用码 | platform bundle/release/多机门校验失败统一映射 InvalidArgument(ensureRunning 短重试,功能正确但运维信号不如 CcbBaselineMissing 清晰) | 首次生产遇到 bundle 校验失败排障时加专用码+critical 告警 |

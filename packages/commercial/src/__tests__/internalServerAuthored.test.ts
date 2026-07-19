@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 
 import {
   makeServerAuthoredHandler,
+  makeTurnTapeStateHandler,
   SERVER_AUTHORED_PATH,
   type ServerAuthoredStorage,
   type ServerAuthoredHandlerCtx,
@@ -101,6 +102,39 @@ function makeRes(): { res: ServerResponse; rec: RecordedRes } {
 }
 
 const CTX: ServerAuthoredHandlerCtx = { hostUuid: VALID_HOST, boundIp: VALID_IP };
+
+describe("internal turn-tape-state lease response", () => {
+  test("derives tenant from authenticated container and returns lease evidence", async () => {
+    const dispatchId = "11111111-1111-4111-8111-111111111111";
+    let call: { userId: string; dispatchId: string; attemptNo: number } | undefined;
+    const handler = makeTurnTapeStateHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP, 7, 42),
+      storage: {
+        async getTurnTapeStateByDispatch(userId, seenDispatchId, attemptNo) {
+          call = { userId, dispatchId: seenDispatchId, attemptNo };
+          return { state: "none", status: null, dispatchLeaseActive: true };
+        },
+      },
+    });
+    const { res, rec } = makeRes();
+    await handler(
+      makeReq({
+        method: "GET",
+        url: `/internal/v3/turn-tape-state?dispatchId=${dispatchId}&attemptNo=2`,
+        auth: `Bearer ${VALID_TOKEN}`,
+      }),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.deepEqual(call, { userId: "c:42", dispatchId, attemptNo: 2 });
+    assert.deepEqual(JSON.parse(rec.body), {
+      state: "none",
+      status: null,
+      dispatchLeaseActive: true,
+    });
+  });
+});
 
 function fakeStorage(impl: ServerAuthoredStorage["appendServerAuthoredMessage"]): ServerAuthoredStorage {
   return {
