@@ -65,12 +65,12 @@ const PENDING_DETAIL: Record<string, unknown> = {
       { name: "typecheck", ok: true },
     ],
   },
-  deployPlanHash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef0",
-  manifestHash: "cafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00dcafef00d0",
+  deployPlanHash: "d".repeat(64),
+  manifestHash: "c".repeat(64),
 };
 
 const PENDING_EVENT: RepairEventRow = {
-  id: "e1",
+  id: "101",
   repair_id: "42",
   kind: "progress",
   message: "verify PASS → pending_release，等待人工放行",
@@ -80,7 +80,7 @@ const PENDING_EVENT: RepairEventRow = {
 
 // 非 pending_release 的进度事件(detail.phase 非 pending_release)。
 const PLAIN_EVENT: RepairEventRow = {
-  id: "e0",
+  id: "100",
   repair_id: "42",
   kind: "progress",
   message: "正在分析根因…",
@@ -130,6 +130,7 @@ function routeGet(path: string): Promise<unknown> {
 function releaseReq(over: Partial<ReleaseRequestRow> = {}): ReleaseRequestRow {
   return {
     releaseRequestId: "rr-9f8e7d6c",
+    sourceEventId: PENDING_EVENT.id,
     status: "queued",
     approvedSha: PENDING_DETAIL.sha as string,
     baseSha: PENDING_DETAIL.baseSha as string,
@@ -294,7 +295,7 @@ describe("待放行卡富化（human gate）", () => {
     expect(screen.getByText("runtime-source")).toBeTruthy();
     expect(screen.getByText("--with-dist")).toBeTruthy();
     // deployPlanHash 短值（前 12 位）
-    expect(screen.getByText(/deadbeefdead/)).toBeTruthy();
+    expect(screen.getByText(/dddddddddddd/)).toBeTruthy();
     // 验证层结果
     expect(screen.getByText("验证层结果")).toBeTruthy();
     // 改动文件（截断列表 + 总数）
@@ -347,7 +348,9 @@ describe("放行 202 异步 + 状态流", () => {
     await screen.findByText("修复已就绪，待放行部署");
     await clickReleaseAndConfirm();
     await waitFor(() =>
-      expect(adminSend).toHaveBeenCalledWith("POST", "/selfheal/repairs/42/release"),
+      expect(adminSend).toHaveBeenCalledWith("POST", "/selfheal/repairs/42/release", {
+        expectedPendingReleaseEventId: PENDING_EVENT.id,
+      }),
     );
     expect(await screen.findByText(/已提交放行请求/)).toBeTruthy();
     expect(screen.queryByText("已放行，个人版已确认部署完成")).toBeNull();
@@ -372,7 +375,7 @@ describe("放行 202 异步 + 状态流", () => {
     expect(screen.getByText(/代码已部署（等待探测确认事故恢复）/)).toBeTruthy();
   });
 
-  test("releaseRequests=deploy_failed → 回到可重新放行 + 显示上次失败原因", async () => {
+  test("同 source event 已 deploy_failed → 禁止二次部署，等待新的候选事件", async () => {
     detail = detailWith([PENDING_EVENT], "running", [
       releaseReq({
         status: "deploy_failed",
@@ -382,11 +385,35 @@ describe("放行 202 异步 + 状态流", () => {
     ]);
     renderPage(<SelfhealPage />);
     await openDetail();
-    expect(await screen.findByText("上次放行未成功，可重新放行")).toBeTruthy();
+    expect(await screen.findByText("本候选已完成一次放行，等待新的修复候选")).toBeTruthy();
     expect(screen.getByText(/上次失败原因：canonical_advanced/)).toBeTruthy();
-    const btn = screen.getByRole("button", { name: "重新放行" });
-    expect(btn).toBeTruthy();
-    expect(btn).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "一键放行" })).toBeDisabled();
+  });
+
+  test("新的 pending_release event 不复用旧终态请求，可生成新逻辑审批", async () => {
+    const next = { ...PENDING_EVENT, id: "102", created_at: "2026-07-11T00:15:00Z" };
+    detail = detailWith([PENDING_EVENT, next], "running", [
+      releaseReq({ status: "deploy_failed", sourceEventId: PENDING_EVENT.id }),
+    ]);
+    renderPage(<SelfhealPage />);
+    await openDetail();
+    expect(await screen.findByText("修复已就绪，待放行部署")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "一键放行" })).not.toBeDisabled();
+  });
+
+  test("同 created_at 的 pending_release 事件按最大 bigint id 选择 exact 审批键", async () => {
+    const sameTimeNewer = { ...PENDING_EVENT, id: "102" };
+    detail = detailWith([sameTimeNewer, PENDING_EVENT], "running");
+    adminSend.mockResolvedValue({ ok: true, releaseRequestId: "rr-new", status: "queued" });
+    renderPage(<SelfhealPage />);
+    await openDetail();
+    await screen.findByText("修复已就绪，待放行部署");
+    await clickReleaseAndConfirm();
+    await waitFor(() =>
+      expect(adminSend).toHaveBeenCalledWith("POST", "/selfheal/repairs/42/release", {
+        expectedPendingReleaseEventId: "102",
+      }),
+    );
   });
 });
 
@@ -411,7 +438,12 @@ describe("熔断 banner + 放行禁用/清除", () => {
   });
 
   test("清除熔断 → prompt 填 reason 后打 POST /release-fuse/clear", async () => {
-    fuse = { engaged: true, reason: "deploy_unknown", engagedAt: "2026-07-11T00:20:00Z" };
+    fuse = {
+      engaged: true,
+      reason: "deploy_unknown",
+      releaseRequestId: "rr-deadbeef",
+      engagedAt: "2026-07-11T00:20:00Z",
+    };
     renderPage(<SelfhealPage />);
     fireEvent.click(await screen.findByRole("button", { name: "清除熔断" }));
     const dialog = await screen.findByRole("dialog");
@@ -421,8 +453,35 @@ describe("熔断 banner + 放行禁用/清除", () => {
     await waitFor(() =>
       expect(adminSend).toHaveBeenCalledWith("POST", "/selfheal/release-fuse/clear", {
         reason: "已人工核对恢复稳定",
+        expectedReleaseRequestId: "rr-deadbeef",
       }),
     );
     expect(await screen.findByText("已清除部署熔断，Tier2 放行恢复可用")).toBeTruthy();
+  });
+
+  test("清 A 后仍有 B pending → 提示熔断保持，不误报 Tier2 已恢复", async () => {
+    fuse = {
+      engaged: true,
+      reason: "A unknown",
+      releaseRequestId: "rr-a",
+      engagedAt: "2026-07-11T00:20:00Z",
+    };
+    adminSend.mockResolvedValue({
+      cleared: true,
+      outcome: "cleared",
+      releaseRequestId: "rr-a",
+      remainingReleaseRequestId: "rr-b",
+    });
+    renderPage(<SelfhealPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "清除熔断" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByRole("textbox"), {
+      target: { value: "A 已人工裁决" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "确认清除" }));
+    expect(
+      await screen.findByText("已裁决 rr-a；仍有 rr-b 待裁决，Tier2 熔断保持"),
+    ).toBeTruthy();
+    expect(screen.queryByText("已清除部署熔断，Tier2 放行恢复可用")).toBeNull();
   });
 });

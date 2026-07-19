@@ -83,6 +83,7 @@ export type ReleaseRequestStatus =
  */
 export interface ReleaseRequestRow {
   releaseRequestId: string;
+  sourceEventId: string | null;
   status: ReleaseRequestStatus;
   approvedSha: string;
   baseSha: string | null;
@@ -135,6 +136,14 @@ export interface ReleaseFuseResp {
   releaseRequestId?: string | null;
   engagedAt?: string | null;
   engagedBy?: string | null;
+}
+
+export interface ReleaseFuseClearResp {
+  cleared: boolean;
+  outcome: "cleared" | "already_cleared";
+  releaseRequestId?: string;
+  clearedAt?: string;
+  remainingReleaseRequestId?: string;
 }
 
 /** POST …/repairs/:id/release 的 202 异步回执（契约 §6.1）。 */

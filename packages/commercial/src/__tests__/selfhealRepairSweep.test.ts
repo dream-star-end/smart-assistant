@@ -372,7 +372,12 @@ interface ReleaseFakeOpts {
 }
 
 function makeReleaseFake(opts: ReleaseFakeOpts = {}) {
-  const rec = { finalizeSqls: [] as string[], eventDetails: [] as string[], convergeCas: 0 };
+  const rec = {
+    finalizeSqls: [] as string[],
+    eventDetails: [] as string[],
+    convergeCas: 0,
+    convergeParams: [] as unknown[],
+  };
   let claimServed = false;
   const fakeQuery = (async (sql: string, params?: unknown[]) => {
     // 其他步全空(不干扰):verify / timeout / cancel / active / candidate。
@@ -385,16 +390,12 @@ function makeReleaseFake(opts: ReleaseFakeOpts = {}) {
     if (/cleared_at IS NOT NULL AND personal_ack_at IS NULL/.test(sql) && /SELECT reason/.test(sql)) {
       return qr(opts.convergeRows ?? []);
     }
-    if (/SELECT engaged FROM selfheal_release_fuse/.test(sql)) {
-      return qr([{ engaged: opts.fuseEngaged ?? false }]);
-    }
     if (/SET delivery_attempts = delivery_attempts \+ 1/.test(sql)) {
-      if (claimServed || !opts.claimRow) return qr([]);
+      if (claimServed || !opts.claimRow || opts.fuseEngaged) return qr([]);
       claimServed = true;
       return qr([opts.claimRow]);
     }
     if (/WHERE \(status='accepted'/.test(sql)) return qr(opts.watchRows ?? []);
-    if (/SET personal_ack_at = NOW\(\)/.test(sql)) { rec.convergeCas++; return qr([], 1); }
     return qr([]);
   }) as unknown as RepairSweepDeps["query"];
 
@@ -409,6 +410,15 @@ function makeReleaseFake(opts: ReleaseFakeOpts = {}) {
           rec.eventDetails.push(String((params as unknown[])?.[3] ?? ""));
           return qr([]);
         }
+        if (/SELECT 1 FROM selfheal_release_fuse WHERE id = 1 FOR UPDATE/.test(sql)) {
+          return qr([{ "?column?": 1 }]);
+        }
+        if (/UPDATE selfheal_release_fuse_epochs SET personal_ack_at/.test(sql)) {
+          rec.convergeCas++;
+          rec.convergeParams = params ?? [];
+          return qr([], 1);
+        }
+        if (/UPDATE selfheal_release_fuse SET personal_ack_at/.test(sql)) return qr([], 1);
         return qr([]);
       },
     } as unknown as PoolClient;
@@ -493,14 +503,55 @@ describe("sweepRepairsOnce — 批1b release 步", () => {
   });
 
   test("fuse 双侧收敛:v5 已清 + 未 ack → 投递个人版 → 回填 personal_ack_at", async () => {
-    const fake = makeReleaseFake({ convergeRows: [{ reason: "admin cleared", cleared_by: "42" }] });
+    const clearedAt = new Date("2026-07-18T12:34:56.000Z");
+    const fake = makeReleaseFake({ convergeRows: [{
+      reason: "deploy_unknown",
+      clear_reason: "admin cleared",
+      cleared_by: "42",
+      release_request_id: "rr-epoch-a",
+      cleared_at: clearedAt,
+    }] });
     const clears: unknown[] = [];
     const r = await sweepRepairsOnce(releaseDeps(fake, {
       postFuseClear: async (input) => { clears.push(input); return { ok: true }; },
     }));
     assert.equal(r.fuseConverged, 1);
-    assert.deepEqual(clears[0], { reason: "admin cleared", clearedBy: "42" });
+    assert.deepEqual(clears[0], {
+      reason: "admin cleared",
+      clearedBy: "42",
+      expectedReleaseRequestId: "rr-epoch-a",
+    });
     assert.equal(fake.rec.convergeCas, 1, "personal_ack_at 回填 CAS 执行一次");
+    assert.deepEqual(fake.rec.convergeParams, ["rr-epoch-a"], "ACK CAS 绑定 exact epoch 主键");
+  });
+
+  test("fuse 多 epoch 收敛:A/B 清除义务逐项投递且各自 ACK", async () => {
+    const fake = makeReleaseFake({ convergeRows: [
+      {
+        reason: "A unknown", clear_reason: "A adjudicated", cleared_by: "42",
+        release_request_id: "rr-a", cleared_at: new Date("2026-07-18T12:00:00.123Z"),
+      },
+      {
+        reason: "B unknown", clear_reason: "B adjudicated", cleared_by: "42",
+        release_request_id: "rr-b", cleared_at: new Date("2026-07-18T12:01:00.456Z"),
+      },
+    ] });
+    const clears: Array<{ expectedReleaseRequestId: string; reason: string }> = [];
+    const r = await sweepRepairsOnce(releaseDeps(fake, {
+      postFuseClear: async (input) => {
+        clears.push({
+          expectedReleaseRequestId: input.expectedReleaseRequestId,
+          reason: input.reason,
+        });
+        return { ok: true };
+      },
+    }));
+    assert.equal(r.fuseConverged, 2);
+    assert.deepEqual(clears, [
+      { expectedReleaseRequestId: "rr-a", reason: "A adjudicated" },
+      { expectedReleaseRequestId: "rr-b", reason: "B adjudicated" },
+    ]);
+    assert.equal(fake.rec.convergeCas, 2);
   });
 
   test("dormant:无 release request → 全部 release 步零行为", async () => {

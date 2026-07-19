@@ -52,7 +52,7 @@ const MIGRATION_0147 = path.resolve(here, "../db/migrations/0147_lossless_turn_t
 const MIGRATION_GOAL_STATE = path.resolve(here, "../db/migrations/0159_goal_state.sql");
 const MIGRATION_0157 = path.resolve(here, "../db/migrations/0157_lossless_runtime_batches.sql");
 const MIGRATION_0170 = path.resolve(here, "../db/migrations/0170_durable_turn_dispatch.sql");
-const MIGRATION_0172 = path.resolve(here, "../db/migrations/0172_client_session_history_revision.sql");
+const MIGRATION_0175 = path.resolve(here, "../db/migrations/0175_client_session_history_revision.sql");
 const MIGRATION_0173 = path.resolve(here, "../db/migrations/0173_client_session_model.sql");
 
 let pool: Pool;
@@ -102,9 +102,9 @@ before(async () => {
   await pool.query("CREATE TABLE IF NOT EXISTS usage_records (id BIGSERIAL PRIMARY KEY)");
   await pool.query("CREATE TABLE IF NOT EXISTS turn_traces (trace_id TEXT PRIMARY KEY)");
   await pool.query(await readFile(MIGRATION_0170, { encoding: "utf8" }));
-  await pool.query(await readFile(MIGRATION_0172, { encoding: "utf8" }));
   // 0173:client_sessions.model_id(会话级模型选择;本套件的读写 SQL 均已含该列)。
   await pool.query(await readFile(MIGRATION_0173, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0175, { encoding: "utf8" }));
   // 0167 also alters billing/inbox tables that are intentionally absent from
   // this isolated sessions schema. Mirror its tape column and waiver table so
   // the backend contract still exercises the production SQL shape.

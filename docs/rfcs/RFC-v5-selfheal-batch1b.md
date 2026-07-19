@@ -22,7 +22,8 @@ v1 以为缺的只是 release drill。实际有两个结构性根因:
 - marker TTL 仅 180s,且**在部署构建/远端 staging 后期才创建** —— 不覆盖整个 release build 段;
 - 无健康检查时 marker 可 `SKIPPED`,部署仍继续(此时闸不存在);
 - wrapper 是"先检查再执行" → **check→action TOCTOU**;
-- `clean-v5-disk-v1` 会与 Docker/runtime build 抢;egress restart 会与 `--egress` 激活/回滚抢。
+- host-global disk cleanup（旧 `clean-v5-disk-v1`，现已退役）会与 Docker/runtime build 抢;
+  egress restart 会与 `--egress` 激活/回滚抢。
 
 → 当前残留风险**低但非零**(disk 类未开;主场景 marker 覆盖 restart 段),但**不得宣称已根治**。
 

@@ -93,13 +93,18 @@ export type FetchLike = (
     method: string;
     headers: Record<string, string>;
     body: string;
+    signal?: AbortSignal;
   },
 ) => Promise<{ status: number; text: () => Promise<string> }>;
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 export interface DispatcherDeps {
   query?: typeof _query;
   tx?: typeof _tx;
   fetch?: FetchLike;
+  /** Hard wall deadline covering response headers and body. */
+  requestTimeoutMs?: number;
   now?: () => number;
   logger?: Logger;
   enqueueAlert?: (event: AlertEventInput) => void;
@@ -171,7 +176,7 @@ function signWebhook(
 
 async function defaultFetch(
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
 ): Promise<{ status: number; text: () => Promise<string> }> {
   // M5:redirect 'manual' —— 3xx 不跟随(okStatus 只认 2xx → 3xx 按失败),封死重定向出网逃逸。
   const res = await fetch(url, {
@@ -179,6 +184,7 @@ async function defaultFetch(
     headers: init.headers,
     body: init.body,
     redirect: "manual",
+    signal: init.signal,
   });
   return { status: res.status, text: () => res.text() };
 }
@@ -196,7 +202,7 @@ async function postSigned(
   bodyObj: Record<string, unknown>,
   repairId: string,
   okStatus: (s: number) => boolean,
-  deps: Required<Pick<DispatcherDeps, "fetch" | "now" | "logger">>,
+  deps: Required<Pick<DispatcherDeps, "fetch" | "requestTimeoutMs" | "now" | "logger">>,
 ): Promise<{ res: PostResult; rawText: string | null }> {
   const base = dispatchBaseUrl();
   const secret = webhookSecret();
@@ -211,8 +217,10 @@ async function postSigned(
   const fullUrl = `${base}${path}`;
   const signedPath = new URL(fullUrl).pathname;
   const sig = signWebhook(secret, "POST", signedPath, ts, nonce, repairId, sha256Hex(body));
-  try {
-    const res = await deps.fetch(fullUrl, {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const operation = (async () => {
+    const response = await deps.fetch(fullUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -221,19 +229,33 @@ async function postSigned(
         "X-Selfheal-Sig": sig,
       },
       body,
+      signal: controller.signal,
     });
-    let rawText: string | null = null;
-    try {
-      rawText = await res.text();
-    } catch {
-      /* body 读失败不致命 */
-    }
-    return { res: { ok: okStatus(res.status), httpStatus: res.status }, rawText };
+    // The deadline covers the body too. A peer that returns headers and then
+    // stalls must not monopolize the sweeper singleflight forever.
+    const rawText = await response.text();
+    return { response, rawText };
+  })();
+  // Promise.race cannot cancel an injected fetch implementation. Attach a
+  // terminal rejection handler before racing so a late rejection is consumed.
+  void operation.catch(() => {});
+  try {
+    const expired = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`request_timeout_${deps.requestTimeoutMs}ms`));
+      }, deps.requestTimeoutMs);
+    });
+    const { response, rawText } = await Promise.race([operation, expired]);
+    return { res: { ok: okStatus(response.status), httpStatus: response.status }, rawText };
   } catch (err) {
     return {
       res: { ok: false, error: (err as Error)?.message ?? String(err) },
       rawText: null,
     };
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+    controller.abort();
   }
 }
 
@@ -251,6 +273,10 @@ function resolveDeps(deps: DispatcherDeps) {
     query: deps.query ?? _query,
     tx: deps.tx ?? _tx,
     fetch: deps.fetch ?? defaultFetch,
+    requestTimeoutMs:
+      Number.isFinite(deps.requestTimeoutMs) && Number(deps.requestTimeoutMs) > 0
+        ? Math.floor(Number(deps.requestTimeoutMs))
+        : DEFAULT_REQUEST_TIMEOUT_MS,
     now: deps.now ?? (() => Date.now()),
     logger: deps.logger ?? rootLogger.child({ subsys: "selfheal", module: "dispatcher" }),
     enqueueAlert: deps.enqueueAlert ?? _safeEnqueueAlert,
@@ -386,7 +412,7 @@ export async function dispatchRepair(
     { repairId: created.id, incidentId, attempt: created.attempt },
     created.id,
     (s) => s === 202,
-    { fetch: d.fetch, now: d.now, logger: d.logger },
+    { fetch: d.fetch, requestTimeoutMs: d.requestTimeoutMs, now: d.now, logger: d.logger },
   );
 
   if (!postRes.ok) {
@@ -450,7 +476,7 @@ export async function redispatchPending(deps: DispatcherDeps = {}): Promise<numb
       { repairId: row.id, incidentId: row.incident_id, attempt: Number(row.attempt) },
       row.id,
       (s) => s === 202,
-      { fetch: d.fetch, now: d.now, logger: d.logger },
+      { fetch: d.fetch, requestTimeoutMs: d.requestTimeoutMs, now: d.now, logger: d.logger },
     );
     if (res.ok) {
       await markDispatched(row.id, row.incident_id, d);
@@ -494,7 +520,7 @@ export async function postCancel(
     body,
     input.repairId,
     (s) => s >= 200 && s < 300,
-    { fetch: d.fetch, now: d.now, logger: d.logger },
+    { fetch: d.fetch, requestTimeoutMs: d.requestTimeoutMs, now: d.now, logger: d.logger },
   );
   // F2(R2-1):releaseCancel 裁决在 200(cancelled/idempotent/not_found/too_late)与 409(repair_mismatch)
   // 都可能带,故无论 res.ok 都解析 body 取它;terminated/accepted(repair 级 cancel 语义)只在 2xx 成功时解释。
@@ -534,7 +560,7 @@ export async function postCancel(
 /**
  * 交付裁决(sweeper delivery 步据此推进 release request 状态,见 §6.2)。
  *   - accepted:个人版 202 durable intake 已受理 → request queued→accepted。
- *   - authority_mismatch:个人版 409(本地权威复核不符 / rrid 冲突)→ manual_required。
+ *   - authority_mismatch:个人版 400/409/422(确定性契约拒绝)→ manual_required。
  *   - fuse_engaged:个人版 423(本地熔断)→ 退避重投(request 保持 queued)。
  *   - retry:网络 / 5xx / 3xx / 配置缺失 → attempts++ 指数退避重投。
  */
@@ -587,7 +613,7 @@ export async function postReleaseDelivery(
     },
     input.repairId,
     (s) => s === 202,
-    { fetch: d.fetch, now: d.now, logger: d.logger },
+    { fetch: d.fetch, requestTimeoutMs: d.requestTimeoutMs, now: d.now, logger: d.logger },
   );
   // body 用于取 error/reason 展示;裁决只认状态码。
   let body: { ok?: unknown; error?: unknown; status?: unknown; detail?: unknown } | null = null;
@@ -615,7 +641,7 @@ export async function postReleaseDelivery(
   let outcome: ReleaseDeliveryOutcome;
   if (status === 202) outcome = "accepted";
   else if (status === 423) outcome = "fuse_engaged";
-  else if (status === 409) outcome = "authority_mismatch";
+  else if (status === 400 || status === 409 || status === 422) outcome = "authority_mismatch";
   else outcome = "retry";
 
   if (outcome !== "accepted") {
@@ -643,20 +669,36 @@ export interface FuseClearDelivery {
 /**
  * 经隧道 POST 个人版 fuse-clear 端点,把 v5 侧已清除的熔断收敛到个人版本地熔断表。
  * 契约:`POST ${OC_SELFHEAL_DISPATCH_URL}/api/webhooks/v5-selfheal-fuse-clear`,同 HMAC
- *   信任链(repairId 固定串 "fuse" 复用签名串格式),body `{ repairId:'fuse', reason, clearedBy }`。
- * 个人版清本地熔断 + 记审计日志行,返回 200。2xx=成功;其余/网络异常=失败(下轮再收敛)。
+ *   信任链(repairId 固定串 "fuse" 复用签名串格式),body
+ *   `{ repairId:'fuse', reason, clearedBy, expectedReleaseRequestId }`。
+ * 个人版按 epoch CAS 清本地熔断并回显同一 releaseRequestId。只有 2xx + exact epoch ACK
+ * 才算成功;其余/网络异常下轮重试。
  */
 export async function postFuseClear(
-  input: { reason: string; clearedBy: string },
+  input: { reason: string; clearedBy: string; expectedReleaseRequestId: string },
   deps: DispatcherDeps = {},
 ): Promise<FuseClearDelivery> {
   const d = resolveDeps(deps);
-  const { res } = await postSigned(
+  const { res, rawText } = await postSigned(
     "/api/webhooks/v5-selfheal-fuse-clear",
-    { repairId: "fuse", reason: input.reason.slice(0, 500), clearedBy: input.clearedBy.slice(0, 128) },
+    {
+      repairId: "fuse",
+      reason: input.reason.slice(0, 500),
+      clearedBy: input.clearedBy.slice(0, 128),
+      expectedReleaseRequestId: input.expectedReleaseRequestId,
+    },
     "fuse",
     (s) => s >= 200 && s < 300,
-    { fetch: d.fetch, now: d.now, logger: d.logger },
+    { fetch: d.fetch, requestTimeoutMs: d.requestTimeoutMs, now: d.now, logger: d.logger },
   );
-  return { ok: res.ok, httpStatus: res.httpStatus, error: res.error };
+  if (!res.ok) return { ok: false, httpStatus: res.httpStatus, error: res.error };
+  try {
+    const ack = JSON.parse(rawText ?? "") as { releaseRequestId?: unknown };
+    if (ack.releaseRequestId !== input.expectedReleaseRequestId) {
+      return { ok: false, httpStatus: res.httpStatus, error: "fuse clear ack epoch mismatch" };
+    }
+  } catch {
+    return { ok: false, httpStatus: res.httpStatus, error: "fuse clear ack malformed" };
+  }
+  return { ok: true, httpStatus: res.httpStatus };
 }

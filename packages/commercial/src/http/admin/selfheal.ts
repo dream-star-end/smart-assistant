@@ -188,10 +188,15 @@ export async function handleAdminReleaseRepair(
   }
   const admin = await requireAdmin(req, deps.jwtSecret);
   try {
+    const raw = (await readJsonBody(req)) as { expectedPendingReleaseEventId?: unknown };
+    if (typeof raw?.expectedPendingReleaseEventId !== "string") {
+      throw new HttpError(400, "VALIDATION", "expectedPendingReleaseEventId is required");
+    }
     const r = await adminReleaseRepair(m[1], {
       adminId: admin.id,
       ip: ctx.clientIp,
       userAgent: ctx.userAgent,
+      expectedPendingReleaseEventId: raw.expectedPendingReleaseEventId,
     });
     if (r.outcome === "not_found") throw new HttpError(404, "NOT_FOUND", "repair not found");
     if (r.outcome === "malformed") {
@@ -207,11 +212,12 @@ export async function handleAdminReleaseRepair(
     if (r.outcome === "fuse_engaged") {
       throw new HttpError(423, "RELEASE_FUSE_ENGAGED", r.reason ?? "release fuse engaged");
     }
-    // 202 已受理(异步):部署由交付步 + callback 异步驱动,Location 指向请求资源。
+    // New request is 202; an exact source-event retry recovers the one existing
+    // logical request (including a terminal one) with 200.
     sendJson(
       res,
-      202,
-      { ok: true, releaseRequestId: r.releaseRequestId, status: "queued" },
+      r.outcome === "existing" ? 200 : 202,
+      { ok: true, releaseRequestId: r.releaseRequestId, status: r.status ?? "queued" },
       { Location: `/api/admin/selfheal/release-requests/${r.releaseRequestId}` },
     );
   } catch (err) {
@@ -264,7 +270,13 @@ export async function handleAdminClearReleaseFuse(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const admin = await requireAdmin(req, deps.jwtSecret);
-  const raw = (await readJsonBody(req).catch(() => ({}))) as { reason?: unknown };
+  const raw = (await readJsonBody(req).catch(() => ({}))) as {
+    reason?: unknown;
+    expectedReleaseRequestId?: unknown;
+  };
+  if (typeof raw.expectedReleaseRequestId !== "string") {
+    throw new HttpError(400, "VALIDATION", "expectedReleaseRequestId is required");
+  }
   const reason =
     typeof raw?.reason === "string" && raw.reason.trim().length > 0
       ? raw.reason.trim().slice(0, 500)
@@ -274,11 +286,21 @@ export async function handleAdminClearReleaseFuse(
     ip: ctx.clientIp,
     userAgent: ctx.userAgent,
     reason,
+    expectedReleaseRequestId: raw.expectedReleaseRequestId,
   });
   if (r.outcome === "not_engaged") {
     throw new HttpError(409, "NOT_ENGAGED", "release fuse is not engaged");
   }
-  sendJson(res, 200, { cleared: true });
+  if (r.outcome === "generation_mismatch") {
+    throw new HttpError(409, "FUSE_GENERATION_MISMATCH", "release fuse generation changed");
+  }
+  sendJson(res, 200, {
+    cleared: true,
+    outcome: r.outcome,
+    releaseRequestId: r.releaseRequestId,
+    clearedAt: r.clearedAt,
+    remainingReleaseRequestId: r.remainingReleaseRequestId,
+  });
 }
 
 

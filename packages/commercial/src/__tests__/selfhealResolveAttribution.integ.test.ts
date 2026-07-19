@@ -78,7 +78,8 @@ beforeEach(async () => {
       WHERE match_key IN ('ops.monitor:svc_egress','ops.monitor:http_egress')`,
   );
   await query(
-    `UPDATE incident_policies SET execution_class='tier1', action_opcode='clean-v5-disk-v1'
+    `UPDATE incident_policies
+        SET auto_repair=FALSE, execution_class='tier2', action_opcode=NULL
       WHERE match_key='ops.monitor:disk'`,
   );
   _resetPolicyCacheForTest();
@@ -229,10 +230,12 @@ describe("P5 drill policy seed(0155)", () => {
 describe("批1a Tier1 执行路由", () => {
   const EGRESS = "ops.monitor:svc_egress"; // 0156: tier1 + restart-v5-egress-v1
 
-  test("0156 seed:egress/disk policy = tier1 + opcode;其余 tier2 无 opcode", async (t) => {
+  test("egress 保持 tier1；0174 disk 固定 manual tier2 且无 host-global opcode", async (t) => {
     if (skipIfNoPg(t)) return;
-    const r = await query<{ match_key: string; execution_class: string; action_opcode: string | null }>(
-      `SELECT match_key, execution_class, action_opcode FROM incident_policies
+    const r = await query<{
+      match_key: string; auto_repair: boolean; execution_class: string; action_opcode: string | null;
+    }>(
+      `SELECT match_key, auto_repair, execution_class, action_opcode FROM incident_policies
         WHERE match_key IN ('ops.monitor:svc_egress','ops.monitor:http_egress','ops.monitor:disk','ops.monitor:mail')
         ORDER BY match_key`,
     );
@@ -240,9 +243,23 @@ describe("批1a Tier1 执行路由", () => {
     assert.equal(by["ops.monitor:svc_egress"].execution_class, "tier1");
     assert.equal(by["ops.monitor:svc_egress"].action_opcode, "restart-v5-egress-v1");
     assert.equal(by["ops.monitor:http_egress"].action_opcode, "restart-v5-egress-v1");
-    assert.equal(by["ops.monitor:disk"].action_opcode, "clean-v5-disk-v1");
+    assert.equal(by["ops.monitor:disk"].auto_repair, false);
+    assert.equal(by["ops.monitor:disk"].execution_class, "tier2");
+    assert.equal(by["ops.monitor:disk"].action_opcode, null);
     assert.equal(by["ops.monitor:mail"].execution_class, "tier2");
     assert.equal(by["ops.monitor:mail"].action_opcode, null);
+  });
+
+  test("0174 DB constraint 拒绝复活 legacy clean-v5-disk-v1", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await assert.rejects(
+      query(
+        `UPDATE incident_policies
+            SET auto_repair=TRUE, execution_class='tier1', action_opcode='clean-v5-disk-v1'
+          WHERE match_key='ops.monitor:disk'`,
+      ),
+      (err: unknown) => (err as { code?: string }).code === "23514",
+    );
   });
 
   test("context 携带 executionClass+actionOpcode(执行侧冻结源)", async (t) => {

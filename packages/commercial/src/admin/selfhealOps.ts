@@ -168,6 +168,7 @@ export async function listIncidents(
  */
 export interface ReleaseRequestSummary {
   releaseRequestId: string;
+  sourceEventId: string | null;
   status: string;
   approvedSha: string;
   baseSha: string | null;
@@ -236,11 +237,12 @@ export async function getIncidentDetail(id: string): Promise<IncidentDetail | nu
   const releaseByRepair = new Map<string, ReleaseRequestSummary[]>();
   if (repR.rows.length > 0) {
     const rrR = await query<{
-      release_request_id: string; repair_id: string; status: string;
+      release_request_id: string; source_event_id: string | null; repair_id: string; status: string;
       approved_sha: string; base_sha: string | null; deploy_plan_hash: string | null;
       failure_reason: string | null; created_at: Date; updated_at: Date;
     }>(
-      `SELECT release_request_id, repair_id::text AS repair_id, status,
+      `SELECT release_request_id, source_event_id::text AS source_event_id,
+              repair_id::text AS repair_id, status,
               approved_sha, base_sha, deploy_plan_hash, failure_reason, created_at, updated_at
          FROM selfheal_release_requests
         WHERE repair_id = ANY($1::bigint[])
@@ -251,6 +253,7 @@ export async function getIncidentDetail(id: string): Promise<IncidentDetail | nu
       const arr = releaseByRepair.get(rr.repair_id) ?? [];
       arr.push({
         releaseRequestId: rr.release_request_id,
+        sourceEventId: rr.source_event_id,
         status: rr.status,
         approvedSha: rr.approved_sha,
         baseSha: rr.base_sha,
@@ -498,6 +501,7 @@ interface PendingReleaseFrozen {
 }
 
 const SHA40_RE = /^[0-9a-f]{40}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
 
 /** 从最新 pending_release 事件 detail 结构化校验 + 冻结字段(缺/形态错 → null=malformed)。 */
 function freezePendingRelease(detail: unknown): PendingReleaseFrozen | null {
@@ -508,7 +512,7 @@ function freezePendingRelease(detail: unknown): PendingReleaseFrozen | null {
   if (!SHA40_RE.test(sha)) return null;
   const deployPlanHash = typeof d.deployPlanHash === "string" ? d.deployPlanHash : "";
   const manifestHash = typeof d.manifestHash === "string" ? d.manifestHash : "";
-  if (deployPlanHash.length === 0 || manifestHash.length === 0) return null;
+  if (!SHA256_RE.test(deployPlanHash) || !SHA256_RE.test(manifestHash)) return null;
   let baseSha: string | null = null;
   if (d.baseSha !== undefined && d.baseSha !== null) {
     if (typeof d.baseSha !== "string" || !SHA40_RE.test(d.baseSha)) return null;
@@ -517,12 +521,23 @@ function freezePendingRelease(detail: unknown): PendingReleaseFrozen | null {
   return { approvedSha: sha, baseSha, deployPlanHash, manifestHash, planDetail: d };
 }
 
-export type ReleaseOutcome = "queued" | "not_found" | "conflict" | "malformed" | "fuse_engaged";
+export type ReleaseOutcome =
+  | "queued"
+  | "existing"
+  | "not_found"
+  | "conflict"
+  | "malformed"
+  | "fuse_engaged";
 
 export interface AdminReleaseResult {
   outcome: ReleaseOutcome;
   releaseRequestId?: string;
+  status?: string;
   reason?: string;
+}
+
+export interface AdminReleaseInput extends AdminResolveInput {
+  expectedPendingReleaseEventId: string;
 }
 
 /**
@@ -541,9 +556,12 @@ export interface AdminReleaseResult {
  */
 export async function adminReleaseRepair(
   repairId: string,
-  input: AdminResolveInput,
+  input: AdminReleaseInput,
 ): Promise<AdminReleaseResult> {
   if (!ID_RE.test(repairId)) throw new RangeError("invalid id");
+  if (!ID_RE.test(input.expectedPendingReleaseEventId)) {
+    throw new RangeError("invalid expectedPendingReleaseEventId");
+  }
   try {
     return await tx(async (client: PoolClient) => {
       const rep = await client.query<{ id: string; incident_id: string; status: string }>(
@@ -553,40 +571,138 @@ export async function adminReleaseRepair(
       );
       const row = rep.rows[0];
       if (!row) return { outcome: "not_found" as const };
-      if (row.status !== "running") {
-        return { outcome: "conflict" as const, reason: `repair is ${row.status}` };
-      }
-      // 最新 pending_release 事件(个人版 verify 过、待放行时上报)。
-      const evt = await client.query<{ detail: unknown }>(
-        `SELECT detail FROM codex_repair_events
-          WHERE repair_id = $1::bigint AND kind = 'progress'
+      // Load the exact event the admin reviewed. It is the idempotency key, so
+      // a response-loss retry must still recover its original request even if
+      // a newer pending_release event has since appeared.
+      const evt = await client.query<{ id: string; detail: unknown }>(
+        `SELECT id::text AS id, detail FROM codex_repair_events
+          WHERE id = $2::bigint AND repair_id = $1::bigint AND kind = 'progress'
             AND detail->>'phase' = 'pending_release'
-          ORDER BY id DESC LIMIT 1`,
-        [repairId],
+          LIMIT 1`,
+        [repairId, input.expectedPendingReleaseEventId],
       );
       if (evt.rows.length === 0) {
-        return { outcome: "conflict" as const, reason: "no pending_release event" };
+        return { outcome: "conflict" as const, reason: "reviewed pending_release event not found" };
       }
-      const frozen = freezePendingRelease(evt.rows[0].detail);
+      const sourceEvent = evt.rows[0];
+      const frozen = freezePendingRelease(sourceEvent.detail);
       if (!frozen) {
         return {
           outcome: "malformed" as const,
           reason: "pending_release event detail malformed (phase/sha/deployPlanHash/manifestHash)",
         };
       }
+      // The immutable source event is the logical idempotency key across every
+      // terminal state. Response loss, concurrency, and later retries all
+      // recover this one row; one reviewed event can never deploy twice.
+      const prior = await client.query<{
+        release_request_id: string;
+        source_event_id: string | null;
+        repair_id: string;
+        status: string;
+        approved_sha: string;
+        base_sha: string | null;
+        deploy_plan_hash: string | null;
+        manifest_hash: string | null;
+      }>(
+        `SELECT release_request_id, source_event_id::text AS source_event_id,
+                repair_id::text AS repair_id, status, approved_sha, base_sha,
+                deploy_plan_hash, manifest_hash, created_at
+           FROM selfheal_release_requests
+          WHERE source_event_id = $1::bigint
+             OR (
+               source_event_id IS NULL AND repair_id = $2::bigint
+               AND approved_sha = $3 AND base_sha IS NOT DISTINCT FROM $4::text
+               AND deploy_plan_hash = $5 AND manifest_hash = $6
+               AND created_at >= (
+                 SELECT created_at FROM codex_repair_events WHERE id = $1::bigint
+               )
+             )
+          ORDER BY (source_event_id IS NOT NULL) DESC, id DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [
+          sourceEvent.id,
+          repairId,
+          frozen.approvedSha,
+          frozen.baseSha,
+          frozen.deployPlanHash,
+          frozen.manifestHash,
+        ],
+      );
+      if (prior.rows.length > 0) {
+        const p = prior.rows[0];
+        const binds =
+          p.repair_id === repairId &&
+          p.approved_sha === frozen.approvedSha &&
+          p.base_sha === frozen.baseSha &&
+          p.deploy_plan_hash === frozen.deployPlanHash &&
+          p.manifest_hash === frozen.manifestHash;
+        if (!binds) {
+          return {
+            outcome: "conflict" as const,
+            reason: "source event already bound to different frozen fields",
+          };
+        }
+        if (p.source_event_id === null) {
+          // Upgrade bridge for a pre-0174 ledger row that the migration could
+          // not correlate (for example because of legacy timestamp drift).
+          // Exact frozen tuple + repair binding is sufficient to consume the
+          // reviewed event without creating a second deployment.
+          await client.query(
+            `UPDATE selfheal_release_requests
+                SET source_event_id = $2::bigint
+              WHERE release_request_id = $1 AND source_event_id IS NULL`,
+            [p.release_request_id, sourceEvent.id],
+          );
+        }
+        return {
+          outcome: "existing" as const,
+          releaseRequestId: p.release_request_id,
+          status: p.status,
+        };
+      }
+      // Only a NEW approval requires the repair to remain in the pending-release
+      // running state. An exact source-event retry is handled above regardless
+      // of the later repair/request terminal state, so response loss always
+      // recovers the original rrid instead of creating ambiguity.
+      if (row.status !== "running") {
+        return { outcome: "conflict" as const, reason: `repair is ${row.status}` };
+      }
+      // A NEW approval must still target the latest pending_release event.
+      // The repair row lock serializes progress writers, so this check remains
+      // stable through the request insert below.
+      const latest = await client.query<{ id: string }>(
+        `SELECT id::text AS id FROM codex_repair_events
+          WHERE repair_id = $1::bigint AND kind = 'progress'
+            AND detail->>'phase' = 'pending_release'
+          ORDER BY id DESC LIMIT 1`,
+        [repairId],
+      );
+      if (latest.rows[0]?.id !== sourceEvent.id) {
+        return {
+          outcome: "conflict" as const,
+          reason: `pending_release event changed (latest=${latest.rows[0]?.id ?? "none"})`,
+        };
+      }
       // 全局熔断:engaged 时禁再放行(Tier2 新部署熔断,人工 clear 后才可放行)。
       const fuse = await client.query<{ engaged: boolean }>(
         `SELECT engaged FROM selfheal_release_fuse WHERE id = 1 FOR UPDATE`,
       );
-      if (fuse.rows[0]?.engaged) {
+      const pendingFuseEpoch = await client.query<{ engaged: boolean }>(
+        `SELECT EXISTS(
+           SELECT 1 FROM selfheal_release_fuse_epochs WHERE cleared_at IS NULL
+         ) AS engaged`,
+      );
+      if (fuse.rows[0]?.engaged || pendingFuseEpoch.rows[0]?.engaged) {
         return { outcome: "fuse_engaged" as const, reason: "release fuse engaged" };
       }
       // INSERT release request(冻结字段全部来自事件 detail;唯一活跃索引冲突 → 23505 → 409)。
       const ins = await client.query<{ release_request_id: string }>(
         `INSERT INTO selfheal_release_requests
            (repair_id, incident_id, requested_by, approved_sha, base_sha,
-            deploy_plan_hash, manifest_hash, plan_detail)
-         VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, $7, $8::jsonb)
+            deploy_plan_hash, manifest_hash, plan_detail, source_event_id)
+         VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, $7, $8::jsonb, $9::bigint)
          RETURNING release_request_id`,
         [
           repairId,
@@ -597,6 +713,7 @@ export async function adminReleaseRepair(
           frozen.deployPlanHash,
           frozen.manifestHash,
           JSON.stringify(frozen.planDetail),
+          sourceEvent.id,
         ],
       );
       const rrid = ins.rows[0].release_request_id;
@@ -608,13 +725,14 @@ export async function adminReleaseRepair(
           repair_id: repairId,
           incident_id: row.incident_id,
           release_request_id: rrid,
+          source_event_id: sourceEvent.id,
           approved_sha: frozen.approvedSha,
           outcome: "queued",
         },
         ip: input.ip ?? null,
         userAgent: input.userAgent ?? null,
       });
-      return { outcome: "queued" as const, releaseRequestId: rrid };
+      return { outcome: "queued" as const, releaseRequestId: rrid, status: "queued" };
     });
   } catch (err) {
     if ((err as { code?: string })?.code === "23505") {
@@ -629,6 +747,7 @@ export async function adminReleaseRepair(
 
 export interface ReleaseRequestView {
   releaseRequestId: string;
+  sourceEventId: string | null;
   repairId: string;
   incidentId: string;
   status: string;
@@ -659,14 +778,16 @@ const RRID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 export async function getReleaseRequest(rrid: string): Promise<ReleaseRequestDetail | null> {
   if (!RRID_RE.test(rrid)) throw new RangeError("invalid releaseRequestId");
   const r = await query<{
-    release_request_id: string; repair_id: string; incident_id: string; status: string;
+    release_request_id: string; source_event_id: string | null;
+    repair_id: string; incident_id: string; status: string;
     requested_by: string; approved_sha: string; base_sha: string | null;
     deploy_plan_hash: string | null; manifest_hash: string | null; plan_detail: unknown;
     failure_reason: string | null; delivery_attempts: number; next_delivery_at: Date | null;
     delivered_at: Date | null; created_at: Date; updated_at: Date;
     resolved_at: Date | null; resolved_by: string | null;
   }>(
-    `SELECT release_request_id, repair_id::text AS repair_id, incident_id::text AS incident_id,
+    `SELECT release_request_id, source_event_id::text AS source_event_id,
+            repair_id::text AS repair_id, incident_id::text AS incident_id,
             status, requested_by, approved_sha, base_sha, deploy_plan_hash, manifest_hash,
             plan_detail, failure_reason, delivery_attempts, next_delivery_at, delivered_at,
             created_at, updated_at, resolved_at, resolved_by
@@ -687,6 +808,7 @@ export async function getReleaseRequest(rrid: string): Promise<ReleaseRequestDet
   return {
     request: {
       releaseRequestId: rr.release_request_id,
+      sourceEventId: rr.source_event_id,
       repairId: rr.repair_id,
       incidentId: rr.incident_id,
       status: rr.status,
@@ -751,7 +873,11 @@ export async function getReleaseFuse(): Promise<ReleaseFuseView> {
   };
 }
 
-export type FuseClearOutcome = "cleared" | "not_engaged";
+export type FuseClearOutcome =
+  | "cleared"
+  | "already_cleared"
+  | "generation_mismatch"
+  | "not_engaged";
 
 /**
  * 清除全局熔断(带审计,tx fail-closed)。CAS engaged=TRUE → FALSE + cleared_at/by;
@@ -759,26 +885,220 @@ export type FuseClearOutcome = "cleared" | "not_engaged";
  * 向个人版投递 fuse-clear,确认后回填)。熔断只拦 Tier2 新放行,不拦人工 rollback/recover。
  */
 export async function clearReleaseFuse(
-  input: AdminResolveInput & { reason?: string | null },
-): Promise<{ outcome: FuseClearOutcome }> {
+  input: AdminResolveInput & { reason?: string | null; expectedReleaseRequestId: string },
+): Promise<{
+  outcome: FuseClearOutcome;
+  releaseRequestId?: string;
+  clearedAt?: string;
+  remainingReleaseRequestId?: string;
+}> {
+  if (!RRID_RE.test(input.expectedReleaseRequestId)) {
+    throw new RangeError("invalid expectedReleaseRequestId");
+  }
   return tx(async (client: PoolClient) => {
-    const cas = await client.query<{ id: number }>(
-      `UPDATE selfheal_release_fuse
-          SET engaged = FALSE, cleared_at = NOW(), cleared_by = $1, personal_ack_at = NULL
-        WHERE id = 1 AND engaged = TRUE
-        RETURNING id`,
-      [String(input.adminId)],
+    // The singleton is a UI/current projection; selfheal_release_fuse_epochs is
+    // the durable set of every unresolved uncertainty and every cleared epoch.
+    // All writers lock the singleton first, then an epoch, preserving one lock
+    // order while allowing a second deploy_unknown to survive behind the first.
+    const cur = await client.query<{
+      engaged: boolean;
+      reason: string | null;
+      release_request_id: string | null;
+      engaged_at: Date | null;
+      engaged_by: string | null;
+      cleared_at: Date | null;
+      cleared_by: string | null;
+      personal_ack_at: Date | null;
+    }>(
+      `SELECT engaged, reason, release_request_id, engaged_at, engaged_by,
+              cleared_at, cleared_by, personal_ack_at
+         FROM selfheal_release_fuse WHERE id = 1 FOR UPDATE`,
     );
-    if (cas.rows.length === 0) return { outcome: "not_engaged" as const };
+    const row = cur.rows[0];
+    if (!row) throw new Error("release fuse singleton missing");
+
+    // Upgrade-window bridge: a pre-0174 runtime may have changed only the
+    // singleton after the migration committed. Fold that exact projection into
+    // the epoch ledger before adjudicating this clear.
+    if (row.release_request_id && row.engaged) {
+      await client.query(
+        `INSERT INTO selfheal_release_fuse_epochs
+           (release_request_id, reason, engaged_at, engaged_by)
+         VALUES ($1, $2, COALESCE($3, NOW()), COALESCE($4, 'legacy:pre-0174'))
+         ON CONFLICT (release_request_id) DO NOTHING`,
+        [row.release_request_id, row.reason, row.engaged_at, row.engaged_by],
+      );
+    } else if (row.release_request_id && row.cleared_at) {
+      await client.query(
+        `INSERT INTO selfheal_release_fuse_epochs
+           (release_request_id, reason, engaged_at, engaged_by,
+            cleared_at, cleared_by, clear_reason, personal_ack_at)
+         VALUES ($1, $2, COALESCE($3, $5), COALESCE($4, 'legacy:pre-0174'),
+                 $5, COALESCE($6, 'legacy:pre-0174'),
+                 'materialized from pre-0174 release fuse', $7)
+         ON CONFLICT (release_request_id) DO UPDATE
+           SET cleared_at = COALESCE(selfheal_release_fuse_epochs.cleared_at, EXCLUDED.cleared_at),
+               cleared_by = COALESCE(selfheal_release_fuse_epochs.cleared_by, EXCLUDED.cleared_by),
+               clear_reason = COALESCE(
+                 selfheal_release_fuse_epochs.clear_reason,
+                 EXCLUDED.clear_reason
+               ),
+               personal_ack_at = COALESCE(
+                 selfheal_release_fuse_epochs.personal_ack_at,
+                 EXCLUDED.personal_ack_at
+               )`,
+        [
+          row.release_request_id,
+          row.reason,
+          row.engaged_at,
+          row.engaged_by,
+          row.cleared_at,
+          row.cleared_by,
+          row.personal_ack_at,
+        ],
+      );
+    }
+
+    const epoch = await client.query<{
+      reason: string | null;
+      engaged_at: Date;
+      engaged_by: string;
+      cleared_at: Date | null;
+      cleared_by: string | null;
+      personal_ack_at: Date | null;
+    }>(
+      `SELECT reason, engaged_at, engaged_by, cleared_at, cleared_by, personal_ack_at
+         FROM selfheal_release_fuse_epochs
+        WHERE release_request_id = $1 FOR UPDATE`,
+      [input.expectedReleaseRequestId],
+    );
+    const existing = epoch.rows[0];
+    if (existing?.cleared_at) {
+      const pending = await client.query<{
+        release_request_id: string;
+        reason: string | null;
+        engaged_at: Date;
+        engaged_by: string;
+      }>(
+        `SELECT release_request_id, reason, engaged_at, engaged_by
+           FROM selfheal_release_fuse_epochs
+          WHERE cleared_at IS NULL
+          ORDER BY engaged_at ASC, release_request_id ASC
+          LIMIT 1
+          FOR UPDATE`,
+      );
+      const next = pending.rows[0];
+      if (next) {
+        await client.query(
+          `UPDATE selfheal_release_fuse
+              SET engaged=TRUE, reason=$2, release_request_id=$1, engaged_at=$3,
+                  engaged_by=$4, cleared_at=NULL, cleared_by=NULL, personal_ack_at=NULL
+            WHERE id=1`,
+          [next.release_request_id, next.reason, next.engaged_at, next.engaged_by],
+        );
+      } else {
+        await client.query(
+          `UPDATE selfheal_release_fuse
+              SET engaged=FALSE, reason=$2, release_request_id=$1, engaged_at=$3,
+                  engaged_by=$4, cleared_at=$5, cleared_by=$6, personal_ack_at=$7
+            WHERE id=1`,
+          [
+            input.expectedReleaseRequestId,
+            existing.reason,
+            existing.engaged_at,
+            existing.engaged_by,
+            existing.cleared_at,
+            existing.cleared_by,
+            existing.personal_ack_at,
+          ],
+        );
+      }
+      return {
+        outcome: "already_cleared" as const,
+        releaseRequestId: input.expectedReleaseRequestId,
+        clearedAt: existing.cleared_at.toISOString(),
+        ...(next ? { remainingReleaseRequestId: next.release_request_id } : {}),
+      };
+    }
+    if (!existing) {
+      return row?.engaged
+        ? {
+            outcome: "generation_mismatch" as const,
+            releaseRequestId: row.release_request_id ?? undefined,
+          }
+        : { outcome: "not_engaged" as const };
+    }
+    if (!row?.engaged || row.release_request_id !== input.expectedReleaseRequestId) {
+      return {
+        outcome: "generation_mismatch" as const,
+        releaseRequestId: row?.release_request_id ?? undefined,
+      };
+    }
+    const cleared = await client.query<{ cleared_at: Date }>(
+      `UPDATE selfheal_release_fuse_epochs
+          SET cleared_at = NOW(), cleared_by = $2, clear_reason = $3,
+              personal_ack_at = NULL
+        WHERE release_request_id = $1 AND cleared_at IS NULL
+        RETURNING cleared_at`,
+      [input.expectedReleaseRequestId, String(input.adminId), input.reason ?? null],
+    );
+    const clearedAt = cleared.rows[0]?.cleared_at;
+    if (!clearedAt) throw new Error("release fuse epoch clear CAS lost under singleton lock");
+    const pending = await client.query<{
+      release_request_id: string;
+      reason: string | null;
+      engaged_at: Date;
+      engaged_by: string;
+    }>(
+      `SELECT release_request_id, reason, engaged_at, engaged_by
+         FROM selfheal_release_fuse_epochs
+        WHERE cleared_at IS NULL
+        ORDER BY engaged_at ASC, release_request_id ASC
+        LIMIT 1
+        FOR UPDATE`,
+    );
+    const next = pending.rows[0];
+    const cas = next
+      ? await client.query(
+          `UPDATE selfheal_release_fuse
+              SET engaged = TRUE, reason = $2, release_request_id = $1,
+                  engaged_at = $3, engaged_by = $4,
+                  cleared_at = NULL, cleared_by = NULL, personal_ack_at = NULL
+            WHERE id = 1 AND engaged = TRUE AND release_request_id = $5`,
+          [
+            next.release_request_id,
+            next.reason,
+            next.engaged_at,
+            next.engaged_by,
+            input.expectedReleaseRequestId,
+          ],
+        )
+      : await client.query(
+          `UPDATE selfheal_release_fuse
+              SET engaged = FALSE, cleared_at = $2, cleared_by = $3, personal_ack_at = NULL
+            WHERE id = 1 AND engaged = TRUE AND release_request_id = $1`,
+          [input.expectedReleaseRequestId, clearedAt, String(input.adminId)],
+        );
+    if ((cas.rowCount ?? 0) !== 1) throw new Error("release fuse clear CAS lost under singleton lock");
     await writeAdminAudit(client, {
       adminId: input.adminId,
       action: "selfheal.fuse_clear",
       target: "release_fuse",
-      after: { reason: input.reason ?? null },
+      after: {
+        reason: input.reason ?? null,
+        release_request_id: input.expectedReleaseRequestId,
+        cleared_at: clearedAt.toISOString(),
+        remaining_release_request_id: next?.release_request_id ?? null,
+      },
       ip: input.ip ?? null,
       userAgent: input.userAgent ?? null,
     });
-    return { outcome: "cleared" as const };
+    return {
+      outcome: "cleared" as const,
+      releaseRequestId: input.expectedReleaseRequestId,
+      clearedAt: clearedAt.toISOString(),
+      ...(next ? { remainingReleaseRequestId: next.release_request_id } : {}),
+    };
   });
 }
 
