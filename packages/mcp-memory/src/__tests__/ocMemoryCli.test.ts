@@ -66,6 +66,29 @@ test('oc-memory covers help, retired Core, Recall and all Archival operations', 
     const id = /id=(arc-[a-z0-9-]+)/i.exec(result.stdout)?.[1]
     assert.ok(id, result.stdout)
 
+    result = await runCli(home, ['archival-search', '*', '--limit', '1'])
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, new RegExp(id))
+    assert.match(result.stdout, /unique oc-memory cli coverage entry/)
+
+    result = await runCli(home, ['archival-add', 'pending heartbeat item'])
+    assert.equal(result.code, 0, result.stderr)
+    const pendingId = /id=(arc-[a-z0-9-]+)/i.exec(result.stdout)?.[1]
+    assert.ok(pendingId, result.stdout)
+
+    result = await runCli(home, [
+      'archival-search',
+      'pending OR reminder OR TODO OR deadline',
+      '--limit',
+      '3',
+    ])
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, new RegExp(pendingId))
+    assert.match(result.stdout, /pending heartbeat item/)
+
+    result = await runCli(home, ['archival-delete', pendingId])
+    assert.equal(result.code, 0, result.stderr)
+
     result = await runCli(home, [
       'archival-search',
       'unique oc-memory cli coverage entry',

@@ -137,9 +137,21 @@ export async function archivalSearch(
   limit = 5,
 ): Promise<ArchivalSearchResult[]> {
   await ensureSchema()
+  const db = await getSessionsDb()
+  if (query.trim() === '*') {
+    const rows = db
+      .prepare(
+        `SELECT id, content, tags
+         FROM archival
+         WHERE agent_id = ?
+         ORDER BY updated_at DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(agentId, limit) as Array<{ id: string; content: string; tags: string }>
+    return rows.map((row, index) => ({ ...row, score: 1 / (61 + index) }))
+  }
   const cleanQuery = literalFtsQuery(query)
   if (!cleanQuery) return []
-  const db = await getSessionsDb()
   const rows = db
     .prepare(
       `SELECT a.id, a.content, a.tags, bm25(archival_fts) AS score

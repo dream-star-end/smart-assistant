@@ -14,27 +14,48 @@ describe('literalFtsQuery', () => {
     assert.equal(literalFtsQuery('---***'), '')
   })
 
-  test('quotes FTS5 boolean keywords alone and between normal words', () => {
-    for (const keyword of ['AND', 'OR', 'NOT']) {
+  test('keeps boolean words literal except bounded uppercase OR groups', () => {
+    assert.equal(literalFtsQuery('OR'), '"OR"')
+    for (const keyword of ['AND', 'NOT']) {
       assert.equal(literalFtsQuery(keyword), `"${keyword}"`)
       assert.equal(literalFtsQuery(`foo ${keyword} bar`), `"foo" "${keyword}" "bar"`)
     }
+    assert.equal(literalFtsQuery('foo or bar'), '"foo" "or" "bar"')
+    assert.equal(literalFtsQuery('foo OR bar'), '("foo") OR ("bar")')
+    assert.equal(literalFtsQuery('foo bar OR baz qux'), '("foo" "bar") OR ("baz" "qux")')
+    assert.equal(literalFtsQuery('foo OR ***'), '"foo" "OR"')
   })
 
-  test('produces executable FTS5 queries that match punctuation and boolean words literally', () => {
+  test('produces executable FTS5 queries for literal tokens and explicit any-term groups', () => {
     const db = new Database(':memory:')
     try {
       db.exec('CREATE VIRTUAL TABLE docs USING fts5(content)')
       const insert = db.prepare('INSERT INTO docs(content) VALUES (?)')
-      for (const content of ['no such session', 'foo AND bar', 'foo OR bar', 'foo NOT bar']) {
+      for (const content of [
+        'no such session',
+        'foo AND bar',
+        'foo NOT bar',
+        'pending action',
+        'reminder item',
+        'TODO note',
+        'deadline soon',
+        'unrelated',
+      ]) {
         insert.run(content)
       }
 
       const search = db.prepare('SELECT content FROM docs WHERE docs MATCH ?')
-      for (const query of ['no-such-session', 'foo AND bar', 'foo OR bar', 'foo NOT bar']) {
+      for (const query of ['no-such-session', 'foo AND bar', 'foo NOT bar']) {
         const rows = search.all(literalFtsQuery(query)) as Array<{ content: string }>
         assert.deepEqual(rows, [{ content: query.replaceAll('-', ' ') }])
       }
+      const anyTerm = search.all(
+        literalFtsQuery('pending OR reminder OR TODO OR deadline'),
+      ) as Array<{ content: string }>
+      assert.deepEqual(
+        anyTerm.map((row) => row.content),
+        ['pending action', 'reminder item', 'TODO note', 'deadline soon'],
+      )
     } finally {
       db.close()
     }

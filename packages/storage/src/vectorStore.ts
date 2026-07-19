@@ -322,6 +322,24 @@ export async function hybridArchivalSearch(
   const db = await getSessionsDb()
   const fetchLimit = limit * 4
 
+  if (query.trim() === '*') {
+    const rows = db
+      .prepare(
+        `SELECT id, content, tags
+         FROM archival
+         WHERE agent_id = ?
+         ORDER BY updated_at DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(agentId, limit) as Array<{ id: string; content: string; tags: string }>
+    return rows.map((row, index) => ({
+      ...row,
+      score: 1 / (61 + index),
+      bm25Rank: null,
+      vecRank: null,
+    }))
+  }
+
   // 1. BM25 search
   const cleanQuery = literalFtsQuery(query)
   const bm25Rows = cleanQuery

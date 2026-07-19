@@ -314,7 +314,7 @@ describe('oc-vision and oc-figcheck real CLI pipeline with isolated Codex backen
     const fakeCodex = join(work, 'fake-codex')
     writeFileSync(
       fakeCodex,
-      `#!/usr/bin/node
+      `#!${process.execPath}
 import fs from 'node:fs'
 const args = process.argv.slice(2)
 const value = (flag) => args[args.indexOf(flag) + 1]
