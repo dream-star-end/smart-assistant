@@ -51,6 +51,20 @@ process.env.OPENCLAUDE_HOME = testHome
       (repair_id, phase, message, detail_json, status, attempts, next_attempt_at, created_at, updated_at)
       VALUES ('legacy-rp', 'pending_release', 'held', '{"a":1}', 'queued', 0, 500, 100, 100),
              ('legacy-rp', 'done', 'ok', '{"b":2}', 'sent', 3, 600, 100, 200);
+
+    CREATE TABLE selfheal_release_fuse (
+      id                 INTEGER PRIMARY KEY CHECK (id = 1),
+      engaged            INTEGER NOT NULL DEFAULT 0,
+      reason             TEXT,
+      release_request_id TEXT,
+      engaged_at         TEXT,
+      cleared_at         TEXT,
+      cleared_by         TEXT
+    );
+    INSERT INTO selfheal_release_fuse
+      (id, engaged, reason, release_request_id, engaged_at, cleared_at, cleared_by)
+      VALUES (1, 0, 'legacy-cleared', 'rrLegacyCleared',
+              '2025-12-31T23:00:00.000Z', '2026-01-01T00:00:00.000Z', 'legacy-boss');
   `)
   db.close()
 }
@@ -94,6 +108,28 @@ function baseInsert(rrid: string, repairId: string, payloadHash = 'ph') {
     planJson: '{"surfaces":["master"]}',
   })
 }
+
+describe('selfheal_release_fuse cleared-epoch migration', () => {
+  it('backfills the old singleton clear stamp into the append-only tombstone ledger', async () => {
+    assert.equal(
+      await engageReleaseFuse({ reason: 'delayed-old-worker', releaseRequestId: 'rrLegacyCleared' }),
+      false,
+    )
+    const row = (await getSelfhealDb())
+      .prepare(`
+        SELECT release_request_id, cleared_at, cleared_by
+        FROM selfheal_release_fuse_cleared_epochs
+        WHERE release_request_id = 'rrLegacyCleared'
+      `)
+      .get()
+    assert.deepEqual(row, {
+      release_request_id: 'rrLegacyCleared',
+      cleared_at: '2026-01-01T00:00:00.000Z',
+      cleared_by: 'legacy-boss',
+    })
+    assert.equal((await getReleaseFuse()).engaged, false)
+  })
+})
 
 describe('insertReleaseJobReceived — idempotency & conflict', () => {
   it('inserts a fresh release request and freezes its fields', async () => {
@@ -177,6 +213,32 @@ describe('claimReleaseJob — CAS pre-claim + global singleflight', () => {
       toStatus: 'deployed',
       message: 'deployed',
       detail: { releaseRequestId: 'rrB', releasePhase: 'deployed' },
+    })
+  })
+
+  it('checks the release fuse inside the same immediate transaction as the claim CAS', async () => {
+    await baseInsert('rrFuseClaim', 'repFuseClaim')
+    assert.equal(
+      await engageReleaseFuse({ reason: 'halt new claims', releaseRequestId: 'fuseClaimEpoch' }),
+      true,
+    )
+    const blocked = await claimReleaseJob({ releaseRequestId: 'rrFuseClaim', scopeUnit: 'never' })
+    assert.equal(blocked.outcome, 'fuse_engaged')
+    assert.equal((await getReleaseJob('rrFuseClaim'))?.status, 'received')
+
+    await clearReleaseFuse({
+      clearedBy: 'test',
+      expectedReleaseRequestId: 'fuseClaimEpoch',
+    })
+    const claimed = await claimReleaseJob({ releaseRequestId: 'rrFuseClaim', scopeUnit: 'after-clear' })
+    assert.equal(claimed.outcome, 'claimed')
+    await terminalizeReleaseJobWithCallback({
+      releaseRequestId: 'rrFuseClaim',
+      repairId: 'repFuseClaim',
+      fromStatuses: ['deploying'],
+      toStatus: 'deployed',
+      message: 'deployed',
+      detail: { releaseRequestId: 'rrFuseClaim', releasePhase: 'deployed' },
     })
   })
 })
@@ -306,41 +368,113 @@ describe('cancelReleaseJob — three states + not_found', () => {
   })
 })
 
-describe('selfheal_release_fuse — idempotent engage/clear', () => {
-  it('starts disengaged, engages once, ignores re-engage, clears, re-engages fresh', async () => {
+describe('selfheal_release_fuse — exact epochs + append-only clear tombstones', () => {
+  it('serializes engage/clear, tombstones absent exact epochs, and never resurrects them', async () => {
+    const db = await getSelfhealDb()
+    db.exec(`
+      DELETE FROM selfheal_release_fuse_cleared_epochs;
+      UPDATE selfheal_release_fuse
+      SET engaged = 0, reason = NULL, release_request_id = NULL,
+          engaged_at = NULL, cleared_at = NULL, cleared_by = NULL
+      WHERE id = 1;
+    `)
     assert.equal((await getReleaseFuse()).engaged, false)
 
     assert.equal(
-      await engageReleaseFuse({ reason: 'deploy_unknown', releaseRequestId: 'rrF', now: '2026-01-01T00:00:00.000Z' }),
+      await engageReleaseFuse({ reason: 'deploy_unknown', releaseRequestId: 'rrA', now: '2026-01-01T00:00:00.000Z' }),
       true,
     )
     let f = await getReleaseFuse()
     assert.equal(f.engaged, true)
     assert.equal(f.reason, 'deploy_unknown')
-    assert.equal(f.releaseRequestId, 'rrF')
+    assert.equal(f.releaseRequestId, 'rrA')
     assert.equal(f.engagedAt, '2026-01-01T00:00:00.000Z')
 
     // Idempotent: an already-engaged fuse keeps the ORIGINAL cause.
-    assert.equal(await engageReleaseFuse({ reason: 'other', releaseRequestId: 'rrX' }), false)
+    assert.equal(await engageReleaseFuse({ reason: 'other', releaseRequestId: 'rrB' }), false)
     f = await getReleaseFuse()
     assert.equal(f.reason, 'deploy_unknown')
-    assert.equal(f.releaseRequestId, 'rrF')
+    assert.equal(f.releaseRequestId, 'rrA')
 
-    assert.equal(await clearReleaseFuse({ clearedBy: 'boss' }), true)
+    // V5 may have persisted B while personal A was already engaged. Its exact
+    // adjudicated clear tombstones B but must not clear current A.
+    assert.deepEqual(
+      await clearReleaseFuse({ clearedBy: 'boss-B', expectedReleaseRequestId: 'rrB' }),
+      { outcome: 'cleared', releaseRequestId: 'rrB' },
+    )
+    assert.equal((await getReleaseFuse()).releaseRequestId, 'rrA')
+    assert.equal((await getReleaseFuse()).engaged, true)
+    assert.equal(await engageReleaseFuse({ reason: 'late-B', releaseRequestId: 'rrB' }), false)
+
+    assert.deepEqual(
+      await clearReleaseFuse({
+        clearedBy: 'boss',
+        expectedReleaseRequestId: 'rrA',
+        now: '2026-01-01T00:01:00.000Z',
+      }),
+      { outcome: 'cleared', releaseRequestId: 'rrA' },
+    )
     f = await getReleaseFuse()
     assert.equal(f.engaged, false)
     assert.equal(f.clearedBy, 'boss')
 
-    // Idempotent clear.
-    assert.equal(await clearReleaseFuse({ clearedBy: 'boss2' }), false)
+    // Response-loss retry of the same immutable epoch is an idempotent success.
+    assert.deepEqual(
+      await clearReleaseFuse({ clearedBy: 'boss2', expectedReleaseRequestId: 'rrA' }),
+      { outcome: 'already_cleared', releaseRequestId: 'rrA' },
+    )
 
-    // Re-engage after clear resets the clear stamp.
-    assert.equal(await engageReleaseFuse({ reason: 'again' }), true)
+    // A delayed worker from A cannot resurrect A; a distinct C epoch can engage.
+    assert.equal(await engageReleaseFuse({ reason: 'stale-A', releaseRequestId: 'rrA' }), false)
+    assert.equal(await engageReleaseFuse({ reason: 'next', releaseRequestId: 'rrC' }), true)
     f = await getReleaseFuse()
     assert.equal(f.engaged, true)
+    assert.equal(f.releaseRequestId, 'rrC')
     assert.equal(f.clearedAt, null)
     assert.equal(f.clearedBy, null)
-    await clearReleaseFuse({ clearedBy: 'cleanup' })
+
+    // A's response-loss retry stays idempotent and, critically, leaves C intact.
+    assert.deepEqual(
+      await clearReleaseFuse({ clearedBy: 'late-A', expectedReleaseRequestId: 'rrA' }),
+      { outcome: 'already_cleared', releaseRequestId: 'rrA' },
+    )
+    assert.equal((await getReleaseFuse()).engaged, true)
+    assert.equal((await getReleaseFuse()).releaseRequestId, 'rrC')
+
+    assert.deepEqual(
+      await clearReleaseFuse({ clearedBy: 'boss', expectedReleaseRequestId: 'rrC' }),
+      { outcome: 'cleared', releaseRequestId: 'rrC' },
+    )
+    // Explicit A/B/C clears → stale callbacks: all epochs remain
+    // tombstoned and neither delayed engage can revive the singleton.
+    assert.equal(await engageReleaseFuse({ reason: 'late-A', releaseRequestId: 'rrA' }), false)
+    assert.equal(await engageReleaseFuse({ reason: 'late-B', releaseRequestId: 'rrB' }), false)
+    assert.equal(await engageReleaseFuse({ reason: 'late-C', releaseRequestId: 'rrC' }), false)
+    assert.equal((await getReleaseFuse()).engaged, false)
+
+    const tombstones = db
+      .prepare(`
+        SELECT release_request_id, cleared_by
+        FROM selfheal_release_fuse_cleared_epochs
+        ORDER BY release_request_id
+      `)
+      .all() as Array<{ release_request_id: string; cleared_by: string }>
+    assert.deepEqual(tombstones, [
+      { release_request_id: 'rrA', cleared_by: 'boss' },
+      { release_request_id: 'rrB', cleared_by: 'boss-B' },
+      { release_request_id: 'rrC', cleared_by: 'boss' },
+    ])
+  })
+
+  it('admits exactly one of two same-turn competing engage transactions', async () => {
+    const [c, d] = await Promise.all([
+      engageReleaseFuse({ reason: 'compete-C', releaseRequestId: 'rrC' }),
+      engageReleaseFuse({ reason: 'compete-D', releaseRequestId: 'rrD' }),
+    ])
+    assert.equal(Number(c) + Number(d), 1)
+    const winner = (await getReleaseFuse()).releaseRequestId
+    assert.ok(winner === 'rrC' || winner === 'rrD')
+    await clearReleaseFuse({ clearedBy: 'cleanup', expectedReleaseRequestId: winner })
   })
 })
 

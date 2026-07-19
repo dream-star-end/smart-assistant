@@ -4,6 +4,7 @@ import * as assert from 'node:assert/strict'
  * classification (completed/failed/unknown), config fail-closed, and the
  * option-injection guard on the host env. No real SSH — the runner is injected.
  */
+import { readFileSync } from 'node:fs'
 import { describe, it } from 'node:test'
 import {
   CONDITION_OPCODE_MAP,
@@ -109,6 +110,22 @@ describe('executeHostOpcode — strict outcome classification', () => {
     assert.equal(r.outcome, 'rejected')
     assert.equal(called, false, 'a non-whitelisted opcode is never transmitted')
   })
+  it('the retired clean-v5-disk-v1 opcode fails closed without SSH', async () => {
+    let called = false
+    const r = await executeHostOpcode(
+      'clean-v5-disk-v1',
+      {
+        ...CFG,
+        runner: async () => {
+          called = true
+          return { code: 0, stdout: '{}', stderr: '', timedOut: false }
+        },
+      },
+      clock,
+    )
+    assert.equal(r.outcome, 'rejected')
+    assert.equal(called, false, 'a frozen legacy disk request must never reach SSH')
+  })
 })
 
 describe('opcode maps stay coherent', () => {
@@ -117,10 +134,25 @@ describe('opcode maps stay coherent', () => {
       assert.ok(TIER1_OPCODES.has(op), `${op} must be a known Tier1 opcode`)
     }
   })
-  it('maps the four batch1a condition keys', () => {
+  it('maps only the two service conditions; disk conditions have no Tier1 route', () => {
+    assert.deepEqual(Object.keys(CONDITION_OPCODE_MAP).sort(), [
+      'ops.monitor:http_egress',
+      'ops.monitor:svc_egress',
+    ])
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:svc_egress'], 'restart-v5-egress-v1')
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:http_egress'], 'restart-v5-egress-v1')
-    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_root'], 'clean-v5-disk-v1')
-    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_var'], 'clean-v5-disk-v1')
+    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_root'], undefined)
+    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_var'], undefined)
+  })
+
+  it('remote forced-command wrapper advertises no disk opcode or global cleanup command', () => {
+    const wrapper = readFileSync(
+      new URL('../../../../ops/oc-selfheal-host-action.sh', import.meta.url),
+      'utf8',
+    )
+    assert.doesNotMatch(wrapper, /clean-v5-disk-v1/)
+    assert.doesNotMatch(wrapper, /docker\s+system\s+prune/)
+    assert.doesNotMatch(wrapper, /journalctl\s+--vacuum/)
+    assert.match(wrapper, /"capabilities":\["restart-v5-egress-v1"\]/)
   })
 })

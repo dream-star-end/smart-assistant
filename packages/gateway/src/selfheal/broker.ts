@@ -6,7 +6,7 @@
  * Unix socket, which the root-side broker validates and performs itself:
  *
  *   Tier1  — deterministic ops from the {@link TIER1_ACTIONS} allowlist
- *            (restart_service / clean_disk / switch_node). Strict param schema,
+ *            (restart_service / switch_node). Strict param schema,
  *            fixed shell-free commands, audit log.
  *
  *   Tier2  — production cutover: `{ sha, verificationRef }`. The broker trusts

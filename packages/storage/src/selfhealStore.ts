@@ -29,6 +29,10 @@
 //   selfheal_nonces      — replay defense for the inbound webhook. INSERT-or-fail
 //                          on the nonce PK; a second delivery with the same nonce
 //                          loses the INSERT and is rejected. TTL-purged.
+//   selfheal_release_fuse_cleared_epochs — append-only tombstones keyed by the
+//                          immutable release_request_id. Once an epoch is
+//                          cleared, a delayed engage for that epoch can never
+//                          resurrect the fuse or overwrite a newer epoch.
 //   selfheal_callback_outbox — durable broker→master callback queue (BLOCKER2):
 //                          the pending_release progress marker and the deployed
 //                          done callback are ENQUEUED here (idempotent on
@@ -396,6 +400,23 @@ export async function getSelfhealDb(): Promise<Database.Database> {
       cleared_by         TEXT
     );
     INSERT OR IGNORE INTO selfheal_release_fuse (id, engaged) VALUES (1, 0);
+
+    -- Append-only cleared-epoch ledger. The singleton row above describes the
+    -- CURRENT fuse, while this table permanently rejects delayed re-engagement
+    -- of an already-cleared immutable release request epoch.
+    CREATE TABLE IF NOT EXISTS selfheal_release_fuse_cleared_epochs (
+      release_request_id TEXT PRIMARY KEY,
+      cleared_at         TEXT NOT NULL,
+      cleared_by         TEXT NOT NULL
+    );
+    -- Upgrade bridge: old versions preserved their most recently cleared epoch
+    -- only on the disengaged singleton. Tombstone it once so a delayed old
+    -- worker cannot resurrect that epoch after this binary starts.
+    INSERT OR IGNORE INTO selfheal_release_fuse_cleared_epochs
+      (release_request_id, cleared_at, cleared_by)
+      SELECT release_request_id, cleared_at, COALESCE(cleared_by, 'legacy-migration')
+      FROM selfheal_release_fuse
+      WHERE engaged = 0 AND release_request_id IS NOT NULL AND cleared_at IS NOT NULL;
   `)
 
   // Schema guard: rebuild selfheal_jobs when an old DB lacks 'cancelling' in the
@@ -1808,6 +1829,9 @@ export async function insertReleaseJobReceived(input: {
 
 export type ClaimReleaseJobResult =
   | { outcome: 'claimed'; job: SelfhealReleaseJob }
+  /** The local Tier2 release fuse is engaged. The fuse check and claim CAS are
+   *  one BEGIN IMMEDIATE transaction, so no new claim can cross an engage. */
+  | { outcome: 'fuse_engaged' }
   /** Another release is already 'deploying' host-wide (global singleflight) —
    *  the caller must NOT claim; retry when the in-flight deploy settles. */
   | { outcome: 'busy' }
@@ -1816,8 +1840,9 @@ export type ClaimReleaseJobResult =
   | { outcome: 'noop' }
 
 /**
- * Atomic pre-claim (§8 step 3): CAS `received & claimed_at IS NULL` →
- * `deploying + claimed_at + scope_unit`, GATED by a GLOBAL singleflight — if ANY
+ * Atomic pre-claim (§8 step 3): under one BEGIN IMMEDIATE transaction, first
+ * require the local release fuse disengaged, then CAS `received & claimed_at IS
+ * NULL` → `deploying + claimed_at + scope_unit`, GATED by a GLOBAL singleflight — if ANY
  * OTHER row is already 'deploying', return `busy` and mutate nothing (at most one
  * host-wide deploy in flight, honoring the single production-mutation lease).
  * When `deployingCallback` is supplied, the winning claim ALSO enqueues the
@@ -1836,6 +1861,10 @@ export async function claimReleaseJob(input: {
   const now = isoNow(input.now)
   const nowMs = isoToEpochMs(now)
   const txn = db.transaction((): ClaimReleaseJobResult => {
+    const fuse = db
+      .prepare('SELECT engaged FROM selfheal_release_fuse WHERE id = 1')
+      .get() as { engaged: number } | undefined
+    if (fuse?.engaged !== 0) return { outcome: 'fuse_engaged' }
     const other = db
       .prepare(
         "SELECT release_request_id FROM selfheal_release_jobs WHERE status = 'deploying' AND release_request_id != ? LIMIT 1",
@@ -1871,7 +1900,10 @@ export async function claimReleaseJob(input: {
       .get(input.releaseRequestId) as ReleaseJobRow
     return { outcome: 'claimed', job: rowToReleaseJob(row) }
   })
-  return txn()
+  // Acquire the SQLite writer reservation before reading the fuse. An engage
+  // that committed first is observed; one that starts later waits until the
+  // claim CAS commits, giving the two mutations a single serial order.
+  return txn.immediate()
 }
 
 /** Set-once durable checkpoint (§9 deploy_effect_applied). Returns false if a
@@ -2102,40 +2134,109 @@ export async function getReleaseFuse(): Promise<SelfhealReleaseFuse> {
   }
 }
 
-/** Engage the local Tier2 fuse (idempotent CAS engaged 0→1): records reason +
- *  rrid + time and clears any prior clear stamp. Returns true only for the call
- *  that flipped it — an already-engaged fuse is a no-op (keeps the ORIGINAL
- *  reason/rrid, the first cause of the halt). */
+/** Engage one immutable local Tier2 fuse epoch.
+ *
+ * The tombstone lookup, singleton read, and singleton write share one
+ * BEGIN IMMEDIATE transaction. An already-cleared releaseRequestId can
+ * therefore never be resurrected by a delayed worker after a newer epoch has
+ * engaged. Returns true only for the call that installed the current epoch; an
+ * already-engaged fuse remains a no-op and keeps the ORIGINAL cause. */
 export async function engageReleaseFuse(input: {
   reason: string
-  releaseRequestId?: string | null
+  releaseRequestId: string
   now?: string
 }): Promise<boolean> {
   const db = await getSelfhealDb()
+  if (typeof input.releaseRequestId !== 'string' || input.releaseRequestId.length === 0) {
+    throw new Error('releaseRequestId is required to engage the release fuse')
+  }
   const iso = isoNow(input.now)
-  const res = db
-    .prepare(`
-      UPDATE selfheal_release_fuse
-      SET engaged = 1, reason = ?, release_request_id = ?, engaged_at = ?, cleared_at = NULL, cleared_by = NULL
-      WHERE id = 1 AND engaged = 0
-    `)
-    .run(input.reason, input.releaseRequestId ?? null, iso)
-  return res.changes > 0
+  return db
+    .transaction(() => {
+      const cleared = db
+        .prepare(
+          'SELECT 1 FROM selfheal_release_fuse_cleared_epochs WHERE release_request_id = ?',
+        )
+        .get(input.releaseRequestId)
+      if (cleared) return false
+
+      const current = db
+        .prepare('SELECT engaged, release_request_id FROM selfheal_release_fuse WHERE id = 1')
+        .get() as { engaged: number; release_request_id: string | null }
+      if (current.engaged === 1) return false
+
+      db.prepare(`
+        UPDATE selfheal_release_fuse
+        SET engaged = 1, reason = ?, release_request_id = ?, engaged_at = ?, cleared_at = NULL, cleared_by = NULL
+        WHERE id = 1
+      `).run(input.reason, input.releaseRequestId, iso)
+      return true
+    })
+    .immediate()
 }
 
-/** Clear the local Tier2 fuse (idempotent CAS engaged 1→0): records cleared_by +
- *  time, preserving reason/rrid as the audit trail of what was cleared. Returns
- *  true only for the call that flipped it. */
+export type ClearReleaseFuseResult =
+  | { outcome: 'cleared'; releaseRequestId: string }
+  | { outcome: 'already_cleared'; releaseRequestId: string }
+  | {
+      outcome: 'epoch_mismatch'
+      releaseRequestId: string
+      currentReleaseRequestId: string | null
+    }
+
+/** Clear one exact, V5-adjudicated local Tier2 fuse epoch.
+ *
+ * Every authenticated exact clear appends an immutable releaseRequestId
+ * tombstone, even if this personal host never projected that epoch (for
+ * example B arrived while local A was already engaged). A different active
+ * singleton is preserved. This lets V5 converge its durable per-epoch queue
+ * without allowing a delayed B callback to engage after B was adjudicated. */
 export async function clearReleaseFuse(input: {
   clearedBy: string
+  expectedReleaseRequestId: string
   now?: string
-}): Promise<boolean> {
+}): Promise<ClearReleaseFuseResult> {
   const db = await getSelfhealDb()
+  if (
+    typeof input.expectedReleaseRequestId !== 'string' ||
+    input.expectedReleaseRequestId.length === 0
+  ) {
+    throw new Error('expectedReleaseRequestId is required to clear the release fuse')
+  }
   const iso = isoNow(input.now)
-  const res = db
-    .prepare(
-      'UPDATE selfheal_release_fuse SET engaged = 0, cleared_at = ?, cleared_by = ? WHERE id = 1 AND engaged = 1',
-    )
-    .run(iso, input.clearedBy)
-  return res.changes > 0
+  return db
+    .transaction((): ClearReleaseFuseResult => {
+      const prior = db
+        .prepare(
+          'SELECT 1 FROM selfheal_release_fuse_cleared_epochs WHERE release_request_id = ?',
+        )
+        .get(input.expectedReleaseRequestId)
+      if (prior) {
+        return {
+          outcome: 'already_cleared',
+          releaseRequestId: input.expectedReleaseRequestId,
+        }
+      }
+
+      const current = db
+        .prepare('SELECT engaged, release_request_id FROM selfheal_release_fuse WHERE id = 1')
+        .get() as { engaged: number; release_request_id: string | null }
+      db.prepare(`
+        INSERT INTO selfheal_release_fuse_cleared_epochs
+          (release_request_id, cleared_at, cleared_by)
+        VALUES (?, ?, ?)
+      `).run(input.expectedReleaseRequestId, iso, input.clearedBy)
+      if (
+        current.engaged === 1 &&
+        current.release_request_id === input.expectedReleaseRequestId
+      ) {
+        db.prepare(`
+          UPDATE selfheal_release_fuse
+          SET engaged = 0, cleared_at = ?, cleared_by = ?
+          WHERE id = 1
+        `).run(iso, input.clearedBy)
+      }
+      return { outcome: 'cleared', releaseRequestId: input.expectedReleaseRequestId }
+    })
+    .immediate()
 }

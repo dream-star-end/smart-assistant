@@ -24,14 +24,18 @@ const {
   getReleaseJob,
   getReleaseFuse,
   engageReleaseFuse,
-  clearReleaseFuse,
   claimReleaseJob,
   setReleaseJobReceipt,
   setReleaseJobCheckpoint,
   setJobFrozenRouting,
   setJobReleaseRevoked,
 } = storage
-const { SelfhealReleaseWorker, classifyScopeState } = await import('../selfheal/releaseWorker.js')
+const {
+  SelfhealReleaseWorker,
+  classifyScopeState,
+  createDefaultReleaseWorkerPrimitives,
+  runReleaseCommand,
+} = await import('../selfheal/releaseWorker.js')
 type LaneEvent = import('../selfheal/releaseWorker.js').LaneEvent
 type Primitives = import('../selfheal/releaseWorker.js').ReleaseWorkerPrimitives
 
@@ -89,10 +93,13 @@ function receiptEvt(rrid: string, outcome: string, extra: Record<string, unknown
     evt: 'receipt',
     rrid,
     sha: SHA,
+    planHash: PLAN,
+    manifestHash: MAN,
+    candidateRef: `refs/heads/selfheal/candidates/r-${rrid}-${SHA.slice(0, 12)}`,
     outcome,
     exit: 0,
     reason: 'r',
-    proofs: { master: { ok: true, detail: 'ok' } },
+    proofs: { web: { ok: true, detail: 'ok' }, slot: { ok: true, detail: 'ok' } },
     canonicalPush: 'pushed',
     ...extra,
   } as LaneEvent
@@ -130,9 +137,10 @@ function primitives(
     push?: 'pushed' | 'pending'
     onLane?: (input: { scopeUnit: string }) => void
   } = {},
-): { p: Primitives; laneRuns: string[]; killRuns: string[] } {
+): { p: Primitives; laneRuns: string[]; killRuns: string[]; pushRuns: number[] } {
   const laneRuns: string[] = []
   const killRuns: string[] = []
+  const pushRuns: number[] = []
   const has = (s: Set<string> | undefined, scope: string) => !!s && (s.has('*') || s.has(scope))
   const p: Primitives = {
     async runLane(input) {
@@ -156,10 +164,11 @@ function primitives(
       }
     },
     async pushCanonical() {
+      pushRuns.push(pushRuns.length + 1)
       return opts.push ?? 'pushed'
     },
   }
-  return { p, laneRuns, killRuns }
+  return { p, laneRuns, killRuns, pushRuns }
 }
 
 function makeWorker(
@@ -191,8 +200,16 @@ async function outbox(rrid: string): Promise<{ phase: string; detail: Record<str
 beforeEach(async () => {
   // Reset shared singletons (fuse + tables) between tests.
   const db = await getSelfhealDb()
-  db.exec('DELETE FROM selfheal_release_jobs; DELETE FROM selfheal_callback_outbox; DELETE FROM selfheal_jobs;')
-  await clearReleaseFuse({ clearedBy: 'test-reset' })
+  db.exec(`
+    DELETE FROM selfheal_release_jobs;
+    DELETE FROM selfheal_callback_outbox;
+    DELETE FROM selfheal_jobs;
+    DELETE FROM selfheal_release_fuse_cleared_epochs;
+    UPDATE selfheal_release_fuse
+    SET engaged = 0, reason = NULL, release_request_id = NULL,
+        engaged_at = NULL, cleared_at = NULL, cleared_by = NULL
+    WHERE id = 1;
+  `)
 })
 
 describe('release worker — claim → lane → adjudicate', () => {
@@ -213,6 +230,13 @@ describe('release worker — claim → lane → adjudicate', () => {
     const dep = ob.find((r) => r.phase === 'deployed')!
     assert.equal(dep.detail.releasePhase, 'deployed')
     assert.equal(dep.detail.sha, SHA)
+    assert.equal(dep.detail.approvedSha, SHA)
+    assert.equal(dep.detail.planHash, PLAN)
+    assert.equal(dep.detail.manifestHash, MAN)
+    assert.equal(
+      dep.detail.candidateRef,
+      `refs/heads/selfheal/candidates/r-dep-1-${SHA.slice(0, 12)}`,
+    )
     assert.deepEqual(dep.detail.surfaces, ['web'])
     assert.ok(dep.detail.proofs, 'proofs carried in the deployed detail')
   })
@@ -252,6 +276,44 @@ describe('release worker — claim → lane → adjudicate', () => {
     assert.equal((await getReleaseFuse()).engaged, true)
   })
 
+  it('a deployed receipt without the frozen tuple is deploy_unknown even with a checkpoint', async () => {
+    await insertJob('weak-1')
+    const weak = receiptEvt('weak-1', 'deployed')
+    weak.planHash = undefined
+    weak.manifestHash = undefined
+    weak.candidateRef = undefined
+    const { p } = primitives([checkpointEvt('weak-1'), weak])
+    await makeWorker(p).pumpOnce()
+    assert.equal((await getReleaseJob('weak-1'))?.status, 'deploy_unknown')
+    assert.equal((await getReleaseFuse()).engaged, true)
+  })
+
+  it('a deployed receipt with a wrong frozen hash is deploy_unknown', async () => {
+    await insertJob('tuple-1')
+    const bad = receiptEvt('tuple-1', 'deployed', { manifestHash: 'wrong' })
+    const { p } = primitives([checkpointEvt('tuple-1'), bad])
+    await makeWorker(p).pumpOnce()
+    assert.equal((await getReleaseJob('tuple-1'))?.status, 'deploy_unknown')
+    assert.equal((await getReleaseFuse()).engaged, true)
+  })
+
+  it('a deployed receipt with partial proofs is deploy_unknown', async () => {
+    await insertJob('partial-1')
+    const partial = receiptEvt('partial-1', 'deployed', { proofs: { web: { ok: true } } })
+    const { p } = primitives([checkpointEvt('partial-1'), partial])
+    await makeWorker(p).pumpOnce()
+    assert.equal((await getReleaseJob('partial-1'))?.status, 'deploy_unknown')
+    assert.equal((await getReleaseFuse()).engaged, true)
+  })
+
+  it("a deployed receipt without this job's durable checkpoint is deploy_unknown", async () => {
+    await insertJob('nocp-1')
+    const { p } = primitives([receiptEvt('nocp-1', 'deployed')])
+    await makeWorker(p).pumpOnce()
+    assert.equal((await getReleaseJob('nocp-1'))?.status, 'deploy_unknown')
+    assert.equal((await getReleaseFuse()).engaged, true)
+  })
+
   it('no receipt at all (lane emitted nothing) → deploy_unknown (+fuse)', async () => {
     await insertJob('none-1')
     const { p } = primitives([])
@@ -271,7 +333,7 @@ describe('release worker — claim → lane → adjudicate', () => {
 
   it('canonical push pending → deployed terminal kept, failure_reason + fuse engaged (F12)', async () => {
     await insertJob('push-1')
-    const { p } = primitives([checkpointEvt('push-1'), receiptEvt('push-1', 'deployed', { canonicalPush: 'pending' })], {
+    const { p, pushRuns } = primitives([checkpointEvt('push-1'), receiptEvt('push-1', 'deployed', { canonicalPush: 'pushed' })], {
       push: 'pending',
     })
     await makeWorker(p).pumpOnce()
@@ -283,6 +345,7 @@ describe('release worker — claim → lane → adjudicate', () => {
     const fuse = await getReleaseFuse()
     assert.equal(fuse.engaged, true, 'canonical_push_pending engages the fuse')
     assert.equal(fuse.reason, 'canonical_push_pending')
+    assert.equal(pushRuns.length, 3, 'lane self-report is ignored; worker exhausts exact readback retries')
   })
 })
 
@@ -341,6 +404,85 @@ describe('classifyScopeState — R2-2 three-state liveness mapping', () => {
   it('unknown / empty / unexpected are UNKNOWN (fail-closed)', () => {
     for (const s of ['unknown', '', '   ', 'garbage'])
       assert.equal(classifyScopeState(s), 'unknown', `${JSON.stringify(s)} must be unknown`)
+  })
+})
+
+describe('default release primitives — bounded commands + exact canonical readback', () => {
+  const commandResult = (
+    overrides: Partial<{
+      code: number
+      stdout: string
+      stderr: string
+      timedOut: boolean
+      terminationConfirmed: boolean
+    }> = {},
+  ) => ({
+    code: 0,
+    stdout: '',
+    stderr: '',
+    timedOut: false,
+    terminationConfirmed: true,
+    ...overrides,
+  })
+
+  it('a never-returning command with a TERM-resistant background grandchild is hard-bounded and reaped', async () => {
+    const started = Date.now()
+    const result = await runReleaseCommand(
+      'bash',
+      [
+        '-c',
+        'trap "" TERM; (trap "" TERM; while :; do sleep 10; done) & echo grandchild=$!; while :; do sleep 10; done',
+      ],
+      { timeoutMs: 40, termGraceMs: 30, killConfirmMs: 2_000 },
+    )
+    assert.equal(result.timedOut, true)
+    assert.equal(result.terminationConfirmed, true, 'whole detached PGID must be absent')
+    assert.match(result.stdout, /grandchild=\d+/, 'the timed command really spawned a descendant')
+    assert.ok(Date.now() - started < 3_000, 'hard deadline + teardown remains wall-clock bounded')
+  })
+
+  it('a timed-out/unterminated scope probe maps to unknown (fail-closed)', async () => {
+    const p = createDefaultReleaseWorkerPrimitives({
+      runCommand: async () =>
+        commandResult({ stdout: 'inactive\n', timedOut: true, terminationConfirmed: false }),
+    })
+    assert.equal(await p.scopeLiveness('scope-x'), 'unknown')
+  })
+
+  it('git push success is pending unless a fresh exact ls-remote readback matches', async () => {
+    const calls: string[][] = []
+    const scripted = [
+      commandResult({ stdout: `${BASE}\trefs/heads/feat/x\n` }),
+      commandResult(),
+      commandResult({ stdout: `${BASE}\trefs/heads/feat/x\n` }),
+    ]
+    const p = createDefaultReleaseWorkerPrimitives({
+      runCommand: async (_cmd, args) => {
+        calls.push(args)
+        return scripted.shift() ?? commandResult({ code: 1 })
+      },
+    })
+    assert.equal(
+      await p.pushCanonical({ canonicalRepo: '/canon', canonicalBranch: 'feat/x', sha: SHA }),
+      'pending',
+    )
+    assert.equal(calls.length, 3, 'pre-readback, push, and post-push exact readback all ran')
+    assert.equal(calls[1]?.includes('push'), true)
+    assert.equal(calls[2]?.includes('ls-remote'), true)
+  })
+
+  it('a git push timeout is pending (the deployed close path then fuses)', async () => {
+    const scripted = [
+      commandResult({ stdout: `${BASE}\trefs/heads/feat/x\n` }),
+      commandResult({ code: 124, timedOut: true }),
+    ]
+    const p = createDefaultReleaseWorkerPrimitives({
+      runCommand: async () => scripted.shift() ?? commandResult({ code: 1 }),
+    })
+    assert.equal(
+      await p.pushCanonical({ canonicalRepo: '/canon', canonicalBranch: 'feat/x', sha: SHA }),
+      'pending',
+    )
   })
 })
 
@@ -506,6 +648,7 @@ describe('release worker — crash recovery (never re-runs deploy)', () => {
   it('deploying + persisted receipt → normal close (idempotent)', async () => {
     await insertJob('rc-1')
     await claimReleaseJob({ releaseRequestId: 'rc-1', scopeUnit: 'scope-rc1' })
+    await setReleaseJobCheckpoint('rc-1', JSON.stringify(checkpointEvt('rc-1')))
     await setReleaseJobReceipt('rc-1', JSON.stringify(receiptEvt('rc-1', 'deployed')))
     const { p, laneRuns } = primitives([]) // scopeLiveness='inactive' → dead lane
     await makeWorker(p).pumpOnce()

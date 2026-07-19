@@ -1010,7 +1010,7 @@ export class Gateway {
         const tier1Enabled = process.env.OC_SELFHEAL_TIER1_ENABLED === '1'
         if (tier1Enabled) {
           this.log.warn(
-            'selfheal Tier1 actions ENABLED — verify host-routing before relying on restart/clean_disk',
+            'selfheal Tier1 actions ENABLED — verify host-routing before relying on restart_service',
           )
         }
         this._selfhealBroker = new SelfhealBroker({

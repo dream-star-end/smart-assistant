@@ -45,7 +45,7 @@ ARGS_FILE="${1:-}"
 if [ -z "$ARGS_FILE" ] || [ ! -f "$ARGS_FILE" ]; then
   log "argsFile missing or not a file: '${ARGS_FILE:-<none>}'"
   # No rrid/sha available → emit a bare fail-closed manual receipt.
-  emit_json "$(jq -nc '{evt:"receipt",rrid:"",sha:"",outcome:"manual",reason:"bad_args_file",proofs:{},canonicalPush:"pending",exit:78}')"
+  emit_json "$(jq -nc '{evt:"receipt",rrid:"",sha:"",planHash:"",manifestHash:"",candidateRef:"",outcome:"manual",reason:"bad_args_file",proofs:{},canonicalPush:"pending",exit:78}')"
   exit 0
 fi
 
@@ -67,14 +67,16 @@ emit_receipt() {
   local outcome="$1" reason="$2" cpush="$3" exitc="$4" faces="$5" receipt
   if [ "$reason" = "__null__" ]; then
     receipt="$(jq -nc \
-      --arg rrid "$rrid" --arg sha "$sha" --arg outcome "$outcome" \
+      --arg rrid "$rrid" --arg sha "$sha" --arg planHash "$planHash" \
+      --arg manifestHash "$manifestHash" --arg candidateRef "$candidateRef" --arg outcome "$outcome" \
       --arg cpush "$cpush" --argjson exit "$exitc" --argjson proofs "$faces" \
-      '{evt:"receipt",rrid:$rrid,sha:$sha,outcome:$outcome,reason:null,proofs:$proofs,canonicalPush:$cpush,exit:$exit}')"
+      '{evt:"receipt",rrid:$rrid,sha:$sha,planHash:$planHash,manifestHash:$manifestHash,candidateRef:$candidateRef,outcome:$outcome,reason:null,proofs:$proofs,canonicalPush:$cpush,exit:$exit}')"
   else
     receipt="$(jq -nc \
-      --arg rrid "$rrid" --arg sha "$sha" --arg outcome "$outcome" --arg reason "$reason" \
+      --arg rrid "$rrid" --arg sha "$sha" --arg planHash "$planHash" \
+      --arg manifestHash "$manifestHash" --arg candidateRef "$candidateRef" --arg outcome "$outcome" --arg reason "$reason" \
       --arg cpush "$cpush" --argjson exit "$exitc" --argjson proofs "$faces" \
-      '{evt:"receipt",rrid:$rrid,sha:$sha,outcome:$outcome,reason:$reason,proofs:$proofs,canonicalPush:$cpush,exit:$exit}')"
+      '{evt:"receipt",rrid:$rrid,sha:$sha,planHash:$planHash,manifestHash:$manifestHash,candidateRef:$candidateRef,outcome:$outcome,reason:$reason,proofs:$proofs,canonicalPush:$cpush,exit:$exit}')"
   fi
   emit_json "$receipt"
 }

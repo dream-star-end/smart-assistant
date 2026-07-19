@@ -321,7 +321,7 @@ scp ops/oc-selfheal-host-action.sh kl-mirror:/usr/local/sbin/oc-selfheal-host-ac
 # kl-mirror ~/.ssh/authorized_keys 追加:
 #   restrict,command="/usr/local/sbin/oc-selfheal-host-action" <action_key.pub>
 ssh -i /root/.secrets/v5-selfheal/action_key -o IdentitiesOnly=yes kl-mirror capabilities-v1
-#   => {"capabilities":["restart-v5-egress-v1","clean-v5-disk-v1"]}  ← 三层交集第一层实证
+#   => {"capabilities":["restart-v5-egress-v1"]}  ← 三层交集第一层实证
 
 # ③ env + 重启【合并成一次!分两次=多中断一次会话】
 cat >> /etc/openclaude/selfheal.env <<'EOF'
@@ -360,8 +360,7 @@ ssh kl-mirror "systemctl stop openclaude-v5-egress.service"
    不开 incident → **自愈不会被派单**。
 2. **wrapper 侧(最后一道)**:`oc-selfheal-host-action` 在动作 opcode 执行前查 marker,
    活跃(`schema=2` ∧ `deadline>now`)则**任何 opcode 让路**(exit 66 → `rejected`,
-   receipt 带部署 mode/target)。不按 check 细分——部署期间清盘会删掉部署正在用的
-   build cache,同样是冲突。
+   receipt 带部署 mode/target)。
 
 **⚠️ 已知不完备(不得宣称已根治)**:marker **不能充当互斥锁** —— TTL 仅 180s、
 在部署后期才创建(不覆盖 release build 段)、无健康检查时可 `SKIPPED`、wrapper 是
