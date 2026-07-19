@@ -14,8 +14,9 @@
 
 import type Database from 'better-sqlite3'
 import * as sqliteVec from 'sqlite-vec'
-import { getSessionsDb } from './sessionsDb.js'
 import type { EmbeddingProvider } from './embedding.js'
+import { literalFtsQuery } from './ftsQuery.js'
+import { getSessionsDb } from './sessionsDb.js'
 
 // ── Initialization ───────────────────────────────
 
@@ -322,7 +323,7 @@ export async function hybridArchivalSearch(
   const fetchLimit = limit * 4
 
   // 1. BM25 search
-  const cleanQuery = query.replace(/["()*]/g, ' ').trim()
+  const cleanQuery = literalFtsQuery(query)
   const bm25Rows = cleanQuery
     ? (db.prepare(`
         SELECT a.id, a.content, a.tags, bm25(archival_fts) AS score
@@ -415,7 +416,7 @@ export async function hybridSessionSearch(
   const fetchLimit = limit * 4
 
   // 1. BM25 search (existing logic from searchSessions)
-  const cleanQuery = query.replace(/["()*]/g, ' ').trim()
+  const cleanQuery = literalFtsQuery(query)
   if (!cleanQuery && !provider) return []
 
   const agentFilter = agentId ? 'AND m.agent_id = ?' : ''

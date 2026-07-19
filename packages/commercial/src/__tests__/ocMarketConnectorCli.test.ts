@@ -121,7 +121,7 @@ test('oc-market plugin examples 优先提供紧凑 blueprint，并保留三种�
   }
 })
 
-test('oc-market plugin prepare/publish 使用单文件、loopback 与服务端 hash 双重绑定确认', async () => {
+test('oc-market plugin prepare/validate/publish 使用单文件、loopback 与服务端 hash 双重绑定确认', async () => {
   const validationHash = 'a'.repeat(64)
   const received: Array<{ url: string; body: Record<string, unknown> }> = []
   const server = createServer((req, res) => {
@@ -172,6 +172,17 @@ test('oc-market plugin prepare/publish 使用单文件、loopback 与服务端 h
       outcomeExamples: ['授权账号后返回身份'],
       tags: ['API插件', '测试'],
     })
+
+    r = await run(['plugin', 'validate', '--file', f.draft], env)
+    assert.equal(r.code, 0, r.stderr)
+    const aliasValidated = JSON.parse(r.stdout) as {
+      validationHash: string
+      publishCommand: string
+    }
+    assert.equal(aliasValidated.validationHash, validationHash)
+    assert.match(aliasValidated.publishCommand, new RegExp(`--confirm ${validationHash}$`))
+    assert.equal(received[1]?.url, '/internal/v3/marketplace/agent-local/prepare-plugin')
+    assert.deepEqual(received[1]?.body, received[0]?.body)
 
     received.length = 0
     r = await run(['plugin', 'publish', '--file', f.draft, '--confirm', 'b'.repeat(64)], env)
