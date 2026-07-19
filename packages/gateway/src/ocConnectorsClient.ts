@@ -11,6 +11,8 @@
  * 解析 kind 处理;只有真正的传输层/HTTP 失败才在此抛 ConnectorError。
  */
 import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 // 稳定错误码(绝不含上游明文/凭据;只暴露非敏感上下文如 HTTP 状态数)。
 export const CONNECTOR_RPC_TIMEOUT = 'CONNECTOR_RPC_TIMEOUT'
@@ -37,25 +39,63 @@ export interface ConnectorCallOptions {
   env?: NodeJS.ProcessEnv
   /** 注入 fetch(测试用);默认全局 fetch。 */
   fetchImpl?: typeof fetch
+  /** 注入文件读取(测试用);默认 readFileSync。 */
+  readFile?: FileReader
   /** 请求总超时(含 body 读取)。Plugin 媒体写最长 12min；普通连接器仍为 75s。 */
   timeoutMs?: number
   /** Historical default is connectors; oc-plugin selects the canonical plugins alias. */
   surface?: ConnectorRpcSurface
 }
 
-/** 读容器身份 bearer;缺失 → ConnectorError(CONNECTOR_NO_CONTAINER_TOKEN)。 */
-export function readContainerToken(env: NodeJS.ProcessEnv = process.env): string {
+type FileReader = (path: string, encoding: BufferEncoding) => string
+
+interface ConnectorEndpoint {
+  masterBaseUrl: string
+  containerToken: string
+}
+
+function readContainerTokenIfAvailable(
+  env: NodeJS.ProcessEnv,
+  readFile: FileReader,
+): string | null {
   const tok = env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
   if (tok) return tok
   const file = env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE?.trim()
-  if (file) {
-    try {
-      const fromFile = readFileSync(file, 'utf8').trim()
-      if (fromFile) return fromFile
-    } catch {
-      throw new ConnectorError(CONNECTOR_NO_CONTAINER_TOKEN)
-    }
+  if (!file) return null
+  try {
+    return readFile(file, 'utf8').trim() || null
+  } catch {
+    return null
   }
+}
+
+function readContainerAuthFile(
+  env: NodeJS.ProcessEnv,
+  readFile: FileReader,
+): ConnectorEndpoint | null {
+  const openclaudeHome =
+    env.OPENCLAUDE_HOME?.trim() || join(env.HOME?.trim() || homedir(), '.openclaude')
+  try {
+    const parsed: unknown = JSON.parse(
+      readFile(join(openclaudeHome, 'container-auth.json'), 'utf8'),
+    )
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const masterBaseUrl = (parsed as Record<string, unknown>).masterBaseUrl
+    const containerToken = (parsed as Record<string, unknown>).containerToken
+    if (typeof masterBaseUrl !== 'string' || typeof containerToken !== 'string') return null
+    const base = masterBaseUrl.trim()
+    const token = containerToken.trim()
+    if (!base || !token) return null
+    return { masterBaseUrl: base.replace(/\/+$/, ''), containerToken: token }
+  } catch {
+    return null
+  }
+}
+
+/** 读容器身份 bearer;缺失 → ConnectorError(CONNECTOR_NO_CONTAINER_TOKEN)。 */
+export function readContainerToken(env: NodeJS.ProcessEnv = process.env): string {
+  const token = readContainerTokenIfAvailable(env, readFileSync)
+  if (token) return token
   throw new ConnectorError(CONNECTOR_NO_CONTAINER_TOKEN)
 }
 
@@ -64,6 +104,30 @@ export function resolveMasterBase(env: NodeJS.ProcessEnv = process.env): string 
   const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
   if (!base) throw new ConnectorError(CONNECTOR_NO_MASTER_BASE)
   return base.replace(/\/+$/, '')
+}
+
+/**
+ * 解析连接器 RPC 的容器身份。CCB 直接使用 supervisor env；Codex 子进程按安全策略
+ * 清空 OPENCLAUDE_* 后，整体回退 entrypoint 每次启动成对写入的 container-auth.json。
+ * 两个字段必须来自同一通道，禁止把 env 与文件内容拼成一对。
+ */
+export function resolveConnectorEndpoint(
+  env: NodeJS.ProcessEnv = process.env,
+  readFile: FileReader = readFileSync,
+): ConnectorEndpoint {
+  const directBase = env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
+  const directToken = readContainerTokenIfAvailable(env, readFile)
+  if (directBase && directToken) {
+    return {
+      masterBaseUrl: directBase.replace(/\/+$/, ''),
+      containerToken: directToken,
+    }
+  }
+
+  const fromFile = readContainerAuthFile(env, readFile)
+  if (fromFile) return fromFile
+  if (!directBase) throw new ConnectorError(CONNECTOR_NO_MASTER_BASE)
+  throw new ConnectorError(CONNECTOR_NO_CONTAINER_TOKEN)
 }
 
 /**
@@ -77,16 +141,18 @@ export async function callConnectors(
 ): Promise<any> {
   const env = opts.env ?? process.env
   const doFetch = opts.fetchImpl ?? fetch
-  const base = resolveMasterBase(env)
-  const token = readContainerToken(env)
-  const url = `${base}/v3/${opts.surface ?? 'connectors'}/${op}`
+  const endpoint = resolveConnectorEndpoint(env, opts.readFile ?? readFileSync)
+  const url = `${endpoint.masterBaseUrl}/v3/${opts.surface ?? 'connectors'}/${op}`
   const ctl = new AbortController()
   const defaultTimeoutMs = (opts.surface ?? 'connectors') === 'plugins' ? 720_000 : 75_000
   const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? defaultTimeoutMs)
   try {
     const res = await doFetch(url, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${endpoint.containerToken}`,
+        'content-type': 'application/json',
+      },
       body: JSON.stringify(body ?? {}),
       signal: ctl.signal,
     })

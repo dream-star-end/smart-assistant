@@ -479,6 +479,32 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     assert.match(src, /minimal main-only/);
   });
 
+  test("entrypoint.ts exposes oc-plugin to login shells without violating validate-only or overwriting user files", () => {
+    const src = readFileSync(ENTRYPOINT_TS, "utf8");
+    assert.match(
+      src,
+      /const PLATFORM_PLUGIN_SOURCE = "\/run\/oc\/platform\/current\/bin\/oc-plugin"/,
+    );
+    assert.match(src, /const USER_PLATFORM_BIN_DIR = "\/home\/agent\/\.local\/bin"/);
+    assert.match(src, /lstatSync\(USER_PLUGIN_LINK\)/);
+    assert.match(src, /readlinkSync\(USER_PLUGIN_LINK\) !== PLATFORM_PLUGIN_SOURCE/);
+    assert.match(src, /symlinkSync\(PLATFORM_PLUGIN_SOURCE, USER_PLUGIN_LINK\)/);
+    assert.match(src, /already exists with an unexpected target; preserved/);
+    assert.doesNotMatch(
+      src,
+      /unlinkSync\(USER_PLUGIN_LINK\)/,
+      "entrypoint 不得删除用户已有的普通文件、目录或异向链接",
+    );
+
+    const validateOnlyIdx = src.indexOf('if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1")');
+    const validateExitIdx = src.indexOf("process.exit(0);", validateOnlyIdx);
+    const pluginLinkIdx = src.indexOf("const PLATFORM_PLUGIN_SOURCE");
+    assert.ok(
+      validateOnlyIdx > 0 && validateExitIdx > validateOnlyIdx && pluginLinkIdx > validateExitIdx,
+      "oc-plugin 链接写入必须位于 validate-only 早退之后",
+    );
+  });
+
   test("M4a:平台 seed skill 从 skip-if-exists 改 hash-overwrite(平台更新送达存量 volume)", () => {
     const src = readFileSync(ENTRYPOINT_TS, "utf8");
     // ensureAgentSeedSkill 不再 skip-if-exists 短路;改经 shouldWriteSeededSkill 判定覆写。
