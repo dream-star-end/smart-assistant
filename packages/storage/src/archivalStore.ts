@@ -8,6 +8,7 @@
 // Use cases: API docs, project architecture notes, code patterns,
 // detailed procedures that don't fit in the 4K MEMORY.md budget.
 
+import { literalFtsQuery } from './ftsQuery.js'
 import { getSessionsDb } from './sessionsDb.js'
 
 // Single shared promise so that concurrent first-use calls all wait for the
@@ -137,6 +138,20 @@ export async function archivalSearch(
 ): Promise<ArchivalSearchResult[]> {
   await ensureSchema()
   const db = await getSessionsDb()
+  if (query.trim() === '*') {
+    const rows = db
+      .prepare(
+        `SELECT id, content, tags
+         FROM archival
+         WHERE agent_id = ?
+         ORDER BY updated_at DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(agentId, limit) as Array<{ id: string; content: string; tags: string }>
+    return rows.map((row, index) => ({ ...row, score: 1 / (61 + index) }))
+  }
+  const cleanQuery = literalFtsQuery(query)
+  if (!cleanQuery) return []
   const rows = db
     .prepare(
       `SELECT a.id, a.content, a.tags, bm25(archival_fts) AS score
@@ -146,7 +161,7 @@ export async function archivalSearch(
        ORDER BY score
        LIMIT ?`,
     )
-    .all(query, agentId, limit) as Array<{
+    .all(cleanQuery, agentId, limit) as Array<{
     id: string
     content: string
     tags: string

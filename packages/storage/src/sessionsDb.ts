@@ -23,6 +23,7 @@ import {
   planSpillOverflow,
   type SpillChunkPlan,
 } from './clientSessionsPlan.js'
+import { literalFtsQuery } from './ftsQuery.js'
 import { paths } from './paths.js'
 // wechat_bindings 是 master 六表之一,其 SQLite 实现在 wechatBindings.ts(靠近 wechat 专用
 // helper),这里 import 进来组合成完整的 sqliteBackend。函数声明,循环 import 下实例化即就绪。
@@ -1154,7 +1155,7 @@ export async function searchSessions(
   agentId?: string,
 ): Promise<SearchHit[]> {
   const db = await getSessionsDb()
-  const cleanQuery = query.replace(/["()*]/g, ' ').trim()
+  const cleanQuery = literalFtsQuery(query)
   if (!cleanQuery) return []
   // If agentId provided, filter at SQL level for correctness
   const agentFilter = agentId ? 'AND m.agent_id = ?' : ''

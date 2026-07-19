@@ -1,4 +1,7 @@
 import * as assert from 'node:assert/strict'
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { runOcWebCli } from '../ocWebCli.js'
 
@@ -99,5 +102,39 @@ describe('runOcWebCli — flag parsing robustness', () => {
     const r = await runOcWebCli(['health', '--json=1'])
     assert.equal(r.exitCode, 2)
     assert.match(r.stderr, /takes no value/)
+  })
+})
+
+describe('runOcWebCli — health integration', () => {
+  it('executes the configured parser and formats a successful health result', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-web-health-'))
+    const bin = join(dir, 'web-context-helper')
+    await writeFile(
+      bin,
+      `#!/bin/sh
+payload="$(cat)"
+case "$payload" in
+  *'"op":"health_check"'*) printf '%s\\n' '{"ok":true,"python":true,"browser":false}' ;;
+  *) printf '%s\\n' 'unexpected payload' >&2; exit 9 ;;
+esac
+`,
+    )
+    await chmod(bin, 0o755)
+
+    const previous = process.env.OPENCLAUDE_WEB_CONTEXT_BIN
+    process.env.OPENCLAUDE_WEB_CONTEXT_BIN = bin
+    try {
+      const r = await runOcWebCli(['health', '--json'])
+      assert.equal(r.exitCode, 0, r.stderr)
+      assert.deepEqual(JSON.parse(r.stdout), {
+        ok: true,
+        python: true,
+        browser: false,
+      })
+    } finally {
+      if (previous === undefined) process.env.OPENCLAUDE_WEB_CONTEXT_BIN = undefined
+      else process.env.OPENCLAUDE_WEB_CONTEXT_BIN = previous
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

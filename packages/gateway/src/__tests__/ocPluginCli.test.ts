@@ -120,6 +120,33 @@ describe('oc-plugin shared CLI surface', () => {
     ])
   })
 
+  test('searches the installed Plugin catalog with the exact query', async () => {
+    const calls: Array<{ op: string; body: unknown }> = []
+    const result = await runOcPluginCli(['catalog', '微博'], {
+      transport: async (op, body) => {
+        calls.push({ op, body })
+        return {
+          plugins: [
+            {
+              slug: 'weibo',
+              label: '微博',
+              description: '读取与管理微博账号',
+              actions: [
+                { id: 'get_self', readOnly: true },
+                { id: 'create_post', readOnly: false },
+              ],
+            },
+          ],
+        }
+      },
+    })
+    assert.equal(result.exitCode, 0)
+    assert.deepEqual(calls, [{ op: 'catalog', body: { query: '微博' } }])
+    assert.match(result.stdout, /匹配「微博」的插件/)
+    assert.match(result.stdout, /weibo · 微博/)
+    assert.match(result.stdout, /get_self、create_post\(写·需确认\)/)
+  })
+
   test('transport selects /v3/plugins and shell wrapper stays a thin pinned entry', async () => {
     let url = ''
     await callConnectors(
