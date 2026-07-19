@@ -488,8 +488,8 @@ prepare_live_baseline_safety() {
   if [[ "$DRY" != 1 ]]; then
     [[ "$live_release" == "$RELEASES_ROOT"/rel-* ]] \
       || { echo "✗ serving release 不在可信 releases 根:$live_release" >&2; return 1; }
-    ssh "$KL_HOST" "test -f '$live_release/.complete'" \
-      || { echo "✗ serving release 缺 .complete:$live_release" >&2; return 1; }
+    assert_release_marker "$live_release" \
+      || { echo "✗ serving release 完整标记无效:$live_release" >&2; return 1; }
   fi
   echo "── V5 CCB baseline 一次性安全迁移(current=$live_release)──"
   install_v5_slot_units || return 1
@@ -616,11 +616,12 @@ process.stdout.write(actual.join(','))
 NODE
       ;;
     remote)
-      ssh "$KL_HOST" node - "$metadata" "$RELEASES_ROOT" <<'NODE'
+      ssh "$KL_HOST" node - "$metadata" "$RELEASES_ROOT" "${TRUSTED_LEGACY_PREDECESSOR:-}" <<'NODE'
 const fs = require('node:fs')
 const path = require('node:path')
 const metadata = process.argv[2]
 const releasesRoot = process.argv[3]
+const trustedLegacyPredecessor = process.argv[4]
 const suffix = path.join('deploy', 'v5', 'release-metadata.json')
 if (!metadata.endsWith(suffix)) throw new Error(`unexpected metadata path: ${metadata}`)
 const root = metadata.slice(0, -suffix.length).replace(/[\\/]$/, '')
@@ -642,6 +643,7 @@ if (min === undefined) {
   const immutableLegacyRelease =
     path.dirname(resolvedRoot) === resolvedReleasesRoot &&
     path.basename(resolvedRoot).startsWith('rel-') &&
+    resolvedRoot === trustedLegacyPredecessor &&
     fs.lstatSync(resolvedRoot).isDirectory() &&
     fs.realpathSync(resolvedRoot) === resolvedRoot &&
     fs.lstatSync(path.join(resolvedRoot, '.complete')).isFile() &&
@@ -655,7 +657,7 @@ if (min === undefined) {
     actual.every((v) => typeof v === 'string' && /^[0-9]{4}_[a-z0-9_]+$/.test(v)) &&
     new Set(actual).size === actual.length &&
     actual.every((v) => fs.statSync(path.join(dir, `${v}.sql`)).isFile())
-  if (!immutableLegacyRelease) throw new Error('legacy migration manifest requires an immutable completed rel-* archive')
+  if (!immutableLegacyRelease) throw new Error('legacy migration manifest requires the exact captured predecessor')
   if (!validCapabilities) throw new Error('invalid legacy capabilities')
   if (capabilities.includes('history-projection-revision-v1'))
     throw new Error('legacy migration manifest cannot declare history projection capability')
@@ -2142,6 +2144,349 @@ bg_current_release() {
   ssh "$KL_HOST" "test -L '$src' && readlink -f '$src' || true" 2>/dev/null || true
 }
 
+# Release 完整标记 v2。旧 `{sha,builtAt}` 标记从来没有绑定源码 full SHA、metadata 或
+# 实际制品；因此不能继续作为任意 rollback/canary 的信任根。唯一兼容例外是：本次
+# invocation 已同时持有 deploy lock + production-mutation lease 后、任何 release 写入前
+# 精确捕获并验证的 serving predecessor。这个例外只活在当前进程内，不落盘、不泛化。
+RELEASE_COMPLETE_SCHEMA_VERSION=2
+CAPTURED_RELEASE_PREDECESSOR=""
+TRUSTED_LEGACY_PREDECESSOR=""
+TRUSTED_LEGACY_SOURCE_COMMIT=""
+TRUSTED_LEGACY_ARTIFACT_SHA256=""
+CAPTURED_EGRESS_PREDECESSOR=""
+TRUSTED_LEGACY_EGRESS_PREDECESSOR=""
+TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT=""
+TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256=""
+
+# 对 release 全树（含 node_modules/dist、常规文件 mode 与 symlink 原始 target）做稳定
+# SHA-256；只排除根 `.complete` 本身，避免 marker 自引用。函数既可本地自测，也会通过
+# `declare -f` 原样流到 kl-mirror，build/verify 共用一份算法，禁止双实现漂移。
+release_artifact_digest() { # <absolute-release-root>
+  local root="$1"
+  [[ -d "$root" && ! -L "$root" ]] || {
+    echo "FATAL: release artifact root 非真实目录:$root" >&2
+    return 1
+  }
+  # One Python walker avoids spawning ~4 processes per file (the old shell
+  # manifest took >90 s on the 38k-file production release). Length-prefixed
+  # byte fields cover arbitrary path/symlink bytes without TSV ambiguity; file,
+  # directory and symlink type/mode/uid/gid are all bound. Root .complete alone
+  # is excluded to avoid self-reference.
+  python3 - "$root" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = os.fsencode(os.path.abspath(sys.argv[1]))
+if not os.path.isdir(root) or os.path.islink(root):
+    raise SystemExit("FATAL: release artifact root is not a real directory")
+
+def identity(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid,
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+def snapshot_tree():
+    root_stat = os.lstat(root)
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise RuntimeError("release artifact root changed type")
+    rows = []
+
+    def collect(directory, prefix=b""):
+        with os.scandir(directory) as scan:
+            for entry in scan:
+                name = entry.name
+                rel = name if not prefix else prefix + b"/" + name
+                if rel == b".complete":
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                mode = st.st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                    raise RuntimeError(f"non-regular release entry: {os.fsdecode(rel)!r}")
+                rows.append((rel, entry.path, identity(st)))
+                if stat.S_ISDIR(mode):
+                    collect(entry.path, rel)
+
+    collect(root)
+    rows.sort(key=lambda item: item[0])
+    return identity(root_stat), rows
+
+root_before, entries = snapshot_tree()
+digest = hashlib.sha256(b"openclaude-release-artifact-v2\0")
+
+def field(value):
+    if isinstance(value, str):
+        value = value.encode("ascii")
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+root_stat = os.lstat(root)
+if identity(root_stat) != root_before:
+    raise RuntimeError("release artifact root changed before digest")
+field(b"D")
+field(b"")
+field(str(stat.S_IMODE(root_stat.st_mode)))
+field(str(root_stat.st_uid))
+field(str(root_stat.st_gid))
+
+for rel, absolute, before in entries:
+    st = os.lstat(absolute)
+    if identity(st) != before:
+        raise RuntimeError(f"release entry changed during digest: {os.fsdecode(rel)!r}")
+    mode = st.st_mode
+    kind = b"F" if stat.S_ISREG(mode) else b"D" if stat.S_ISDIR(mode) else b"L"
+    field(kind)
+    field(rel)
+    field(str(stat.S_IMODE(mode)))
+    field(str(st.st_uid))
+    field(str(st.st_gid))
+    if kind == b"F":
+        field(str(st.st_size))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(absolute, flags)
+        if identity(os.fstat(fd)) != before:
+            os.close(fd)
+            raise RuntimeError(f"release file changed before open: {os.fsdecode(rel)!r}")
+        with os.fdopen(fd, "rb", buffering=1024 * 1024) as fh:
+            while chunk := fh.read(1024 * 1024):
+                digest.update(chunk)
+            if identity(os.fstat(fh.fileno())) != before:
+                raise RuntimeError(f"release file changed while open: {os.fsdecode(rel)!r}")
+    elif kind == b"L":
+        field(os.readlink(absolute))
+    if identity(os.lstat(absolute)) != before:
+        raise RuntimeError(f"release entry changed while hashing: {os.fsdecode(rel)!r}")
+
+# A per-entry check alone misses a new/deleted path after the directory was
+# scanned or after that directory's own hash step. Re-snapshot the entire tree
+# and compare the exact path/type/identity set plus the release root identity.
+root_after, entries_after = snapshot_tree()
+before_signature = [(rel, before) for rel, _absolute, before in entries]
+after_signature = [(rel, after) for rel, _absolute, after in entries_after]
+if root_after != root_before or after_signature != before_signature:
+    raise RuntimeError("release tree changed during digest")
+
+print(digest.hexdigest())
+PY
+}
+
+# 远端只读 probe：物理边界、marker schema、目录名、VERSION、metadata digest 与全树
+# artifact digest 一次核完。stdout 是内部 TSV，不承载人类日志。
+release_marker_probe() { # <release-dir>
+  local reldir="$1"
+  {
+    declare -f release_artifact_digest
+    cat <<'REMOTE'
+set -Eeuo pipefail
+reldir="$1"; releases_root="$2"; schema="$3"
+root_real="$(readlink -f -- "$releases_root")"
+dir_real="$(readlink -f -- "$reldir")"
+[[ -n "$root_real" && -n "$dir_real" && "$dir_real" == "$reldir" \
+  && "$(dirname -- "$dir_real")" == "$root_real" && -d "$dir_real" && ! -L "$dir_real" ]] || {
+  echo "FATAL: release 不是真实 releases-root 直系目录:$reldir" >&2; exit 1;
+}
+marker="$reldir/.complete"; metadata="$reldir/deploy/v5/release-metadata.json"; version="$reldir/VERSION.json"
+[[ -f "$marker" && ! -L "$marker" && -f "$metadata" && ! -L "$metadata" \
+  && -f "$version" && ! -L "$version" ]] || {
+  echo "FATAL: release marker/metadata/VERSION 缺失或为 symlink:$reldir" >&2; exit 1;
+}
+read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$reldir")
+read -r marker_uid marker_gid marker_mode < <(stat -Lc '%u %g %a' -- "$marker")
+[[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] || {
+  echo "FATAL: release root ownership/mode 不可信:$reldir uid=$root_uid gid=$root_gid mode=$root_mode" >&2; exit 1;
+}
+[[ "$marker_uid" == 0 && "$marker_gid" == 0 \
+  && ( "$marker_mode" == 644 || "$marker_mode" == 444 ) ]] || {
+  echo "FATAL: release marker ownership/mode 不可信:$marker uid=$marker_uid gid=$marker_gid mode=$marker_mode" >&2; exit 1;
+}
+kind="$(jq -er --argjson schema "$schema" '
+  if (.schemaVersion == $schema) then "strong"
+  elif (has("schemaVersion") | not) then "legacy"
+  else error("unsupported release marker schema") end
+' "$marker")" || exit 1
+base="$(basename -- "$reldir")"
+version_commit="$(jq -er '.commit | select(type == "string")' "$version")" || exit 1
+if [[ "$kind" == strong ]]; then
+  row="$(jq -er --argjson schema "$schema" '
+    if ((keys | sort) == (["artifactSha256","builtAt","metadataSha256","schemaVersion","sourceCommit"] | sort)
+      and .schemaVersion == $schema
+      and (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$"))
+      and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
+      and (.metadataSha256 | type == "string" and test("^[0-9a-f]{64}$"))
+      and (.artifactSha256 | type == "string" and test("^[0-9a-f]{64}$")))
+    then [.sourceCommit,.builtAt,.metadataSha256,.artifactSha256] | @tsv
+    else error("invalid strong release marker") end
+  ' "$marker")" || exit 1
+  IFS=$'\t' read -r source_commit built_at metadata_want artifact_want <<<"$row"
+  stem="${base#rel-}"; stem="${stem%-migrated}"; suffix="-$built_at"
+  [[ "$base" == rel-* && "$stem" == *"$suffix" ]] || {
+    echo "FATAL: strong marker builtAt 与 release dirname 不一致:$base" >&2; exit 1;
+  }
+  short="${stem%"$suffix"}"
+  [[ "$short" =~ ^[0-9a-f]{7,40}$ && "$source_commit" == "$short"* \
+    && "$version_commit" == "$short" ]] || {
+    echo "FATAL: strong marker sourceCommit/dirname/VERSION 不一致:$base" >&2; exit 1;
+  }
+  metadata_have="$(sha256sum -- "$metadata" | cut -d' ' -f1)"
+  [[ "$metadata_have" == "$metadata_want" ]] || {
+    echo "FATAL: release metadata digest mismatch:$reldir" >&2; exit 1;
+  }
+  artifact_have="$(release_artifact_digest "$reldir")"
+  [[ "$artifact_have" == "$artifact_want" ]] || {
+    echo "FATAL: release artifact digest mismatch:$reldir" >&2; exit 1;
+  }
+  printf 'strong\t%s\t%s\t%s\t%s\n' "$source_commit" "$short" "$built_at" "$artifact_want"
+else
+  row="$(jq -er '
+    if (((keys | sort) == (["builtAt","sha"] | sort)
+        or (keys | sort) == (["builtAt","migrated","sha"] | sort))
+      and (.sha | type == "string" and test("^[0-9a-f]{7,40}$"))
+      and (.builtAt | type == "string" and test("^[0-9]{8}-[0-9]{6}$"))
+      and ((has("migrated") | not) or .migrated == true))
+    then [.sha,.builtAt] | @tsv else error("invalid legacy release marker") end
+  ' "$marker")" || exit 1
+  IFS=$'\t' read -r short built_at <<<"$row"
+  [[ "$base" == "rel-$short-$built_at" || "$base" == "rel-$short-$built_at-migrated" ]] || {
+    echo "FATAL: legacy marker sha/builtAt 与 release dirname 不一致:$base" >&2; exit 1;
+  }
+  [[ "$version_commit" == "$short" ]] || {
+    echo "FATAL: legacy marker 与 VERSION.commit 不一致:$base" >&2; exit 1;
+  }
+  artifact_have="$(release_artifact_digest "$reldir")"
+  [[ "$artifact_have" =~ ^[0-9a-f]{64}$ ]] || exit 1
+  # Keep probe columns uniform:kind,source identity,dirname short,builtAt,artifact.
+  # Legacy has no full source identity, so its validated short SHA occupies both
+  # identity columns until the caller resolves it against trusted git objects.
+  printf 'legacy\t%s\t%s\t%s\t%s\n' "$short" "$short" "$built_at" "$artifact_have"
+fi
+REMOTE
+  } | ssh "$KL_HOST" bash -s -- "$reldir" "$RELEASES_ROOT" "$RELEASE_COMPLETE_SCHEMA_VERSION"
+}
+
+assert_release_metadata_matches_commit() { # <release-dir> <full-commit>
+  local reldir="$1" full="$2"
+  [[ "$full" =~ ^[0-9a-f]{40}$ ]] || return 1
+  git -C "$REPO_ROOT" cat-file -e "${full}^{commit}" 2>/dev/null || {
+    echo "✗ release sourceCommit 不在本地 trusted git object store:$full" >&2; return 1;
+  }
+  if ! git -C "$REPO_ROOT" show "${full}:deploy/v5/release-metadata.json" \
+      | ssh "$KL_HOST" "cmp - '$reldir/deploy/v5/release-metadata.json'"; then
+    echo "✗ release-metadata 原始字节不等于 trusted git $full:$reldir" >&2
+    return 1
+  fi
+}
+
+assert_release_marker() { # <release-dir> [master|egress legacy trust scope]
+  local reldir="$1" trust_scope="${2:-master}" probe kind source short built artifact
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 验证 release strong marker/full sourceCommit/metadata+artifact digest:$reldir"
+    return 0
+  fi
+  probe="$(release_marker_probe "$reldir")" || {
+    echo "✗ release 完整标记校验失败:$reldir" >&2; return 1;
+  }
+  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
+  case "$kind" in
+    strong)
+      assert_release_metadata_matches_commit "$reldir" "$source" || return 1
+      ;;
+    legacy)
+      local trusted_path trusted_source trusted_artifact
+      case "$trust_scope" in
+        master)
+          trusted_path="$TRUSTED_LEGACY_PREDECESSOR"
+          trusted_source="$TRUSTED_LEGACY_SOURCE_COMMIT"
+          trusted_artifact="$TRUSTED_LEGACY_ARTIFACT_SHA256"
+          ;;
+        egress)
+          trusted_path="$TRUSTED_LEGACY_EGRESS_PREDECESSOR"
+          trusted_source="$TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT"
+          trusted_artifact="$TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256"
+          ;;
+        *) echo "✗ legacy release trust scope 非法:$trust_scope" >&2; return 1 ;;
+      esac
+      [[ -n "$trusted_path" && "$reldir" == "$trusted_path" \
+        && "$trusted_source" =~ ^[0-9a-f]{40}$ && "$trusted_source" == "$source"* \
+        && "$trusted_artifact" =~ ^[0-9a-f]{64}$ && "$artifact" == "$trusted_artifact" ]] || {
+        echo "✗ generic legacy .complete 非本 invocation 精确捕获且制品未变的 $trust_scope predecessor，拒绝:$reldir" >&2
+        return 1
+      }
+      assert_release_metadata_matches_commit "$reldir" "$trusted_source" || return 1
+      ;;
+    *) echo "✗ release marker probe 返回非法 kind:${kind:-<empty>}" >&2; return 1 ;;
+  esac
+  echo "  ✓ release marker 校验通过(kind=$kind path=$reldir)"
+}
+
+capture_trusted_release_predecessor() { # [explicit-release-dir，仅供 hermetic test]
+  local current="${1:-}" probe kind source short built artifact full
+  [[ "$DRY" == 1 ]] && return 0
+  if [[ -z "$current" ]]; then
+    resolve_active_lane || return 1
+    current="$(bg_current_release "$ACTIVE_SRC")"
+  fi
+  [[ -n "$current" ]] || { echo "✗ 无法在 mutation 前捕获 serving predecessor" >&2; return 1; }
+  probe="$(release_marker_probe "$current")" || {
+    echo "✗ serving predecessor marker/目录/VERSION 校验失败:$current" >&2; return 1;
+  }
+  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
+  CAPTURED_RELEASE_PREDECESSOR="$current"
+  TRUSTED_LEGACY_PREDECESSOR=""; TRUSTED_LEGACY_SOURCE_COMMIT=""; TRUSTED_LEGACY_ARTIFACT_SHA256=""
+  case "$kind" in
+    strong)
+      assert_release_metadata_matches_commit "$current" "$source" || return 1
+      ;;
+    legacy)
+      full="$(git -C "$REPO_ROOT" rev-parse --verify "${source}^{commit}" 2>/dev/null || true)"
+      [[ "$full" =~ ^[0-9a-f]{40}$ && "$full" == "$source"* ]] || {
+        echo "✗ legacy predecessor short SHA 无法唯一解析为 trusted full commit:$source" >&2; return 1;
+      }
+      assert_release_metadata_matches_commit "$current" "$full" || return 1
+      TRUSTED_LEGACY_PREDECESSOR="$current"
+      TRUSTED_LEGACY_SOURCE_COMMIT="$full"
+      TRUSTED_LEGACY_ARTIFACT_SHA256="$artifact"
+      ;;
+    *) echo "✗ serving predecessor marker kind 非法:${kind:-<empty>}" >&2; return 1 ;;
+  esac
+  echo "  ✓ 已在 deploy+mutation lock 内捕获 predecessor(kind=$kind path=$current)"
+}
+
+# Egress may intentionally lag the serving master by many releases. Capture its
+# real process cwd under the same two locks, but grant this legacy pin only to
+# egress activation/compensation; it is never a master rollback trust root.
+capture_trusted_egress_predecessor() { # [explicit-release-dir，仅供 hermetic test]
+  local current="${1:-}" probe kind source short built artifact full
+  [[ "$DRY" == 1 ]] && return 0
+  if [[ -z "$current" ]]; then
+    current="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+  fi
+  [[ -n "$current" ]] || { echo "✗ 无法在 mutation 前捕获 egress predecessor" >&2; return 1; }
+  probe="$(release_marker_probe "$current")" || {
+    echo "✗ egress predecessor marker/目录/VERSION 校验失败:$current" >&2; return 1;
+  }
+  IFS=$'\t' read -r kind source short built artifact <<<"$probe"
+  CAPTURED_EGRESS_PREDECESSOR="$current"
+  TRUSTED_LEGACY_EGRESS_PREDECESSOR=""; TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT=""
+  TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256=""
+  case "$kind" in
+    strong)
+      assert_release_metadata_matches_commit "$current" "$source" || return 1
+      ;;
+    legacy)
+      full="$(git -C "$REPO_ROOT" rev-parse --verify "${source}^{commit}" 2>/dev/null || true)"
+      [[ "$full" =~ ^[0-9a-f]{40}$ && "$full" == "$source"* ]] || {
+        echo "✗ legacy egress predecessor short SHA 无法唯一解析:$source" >&2; return 1;
+      }
+      assert_release_metadata_matches_commit "$current" "$full" || return 1
+      TRUSTED_LEGACY_EGRESS_PREDECESSOR="$current"
+      TRUSTED_LEGACY_EGRESS_SOURCE_COMMIT="$full"
+      TRUSTED_LEGACY_EGRESS_ARTIFACT_SHA256="$artifact"
+      ;;
+    *) echo "✗ egress predecessor marker kind 非法:${kind:-<empty>}" >&2; return 1 ;;
+  esac
+  echo "  ✓ 已在 deploy+mutation lock 内捕获 egress predecessor(kind=$kind path=$current)"
+}
+
 # 蓝绿前置:active slot 的 src 必须已是 symlink 布局且指向 RELEASES_ROOT 下的完整 release(否则先迁移)。
 # $1=要校验的 src(默认 ACTIVE_SRC;传统 lane resolve_active_lane 后传 active slot 的 src)。
 assert_bluegreen_layout() {
@@ -2174,6 +2519,80 @@ assert_not_bluegreen_for_cutover() {
 # rel-* 命名空间,activate/rollback/GC 只认带 .complete 的目录,Codex P0#3)。sha 全程钉死一次
 # 贯穿 archive/VERSION/dist(工作树必须干净=即该 sha,Codex P0#2)。
 BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""
+
+write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <builtAt> <schema>
+  local root="$1" full_sha="$2" short_sha="$3" built_at="$4" schema="$5"
+  local metadata_sha artifact_sha marker_tmp root_uid root_gid root_mode marker_uid marker_gid marker_mode
+  [[ "$full_sha" =~ ^[0-9a-f]{40}$ && "$short_sha" =~ ^[0-9a-f]{7,40}$ \
+    && "$full_sha" == "$short_sha"* && "$built_at" =~ ^[0-9]{8}-[0-9]{6}$ \
+    && "$schema" =~ ^[1-9][0-9]*$ ]] || {
+    echo 'FATAL: strong release identity 参数非法' >&2; return 1;
+  }
+  [[ -d "$root" && ! -L "$root" ]] || { echo 'FATAL: strong release root 非法' >&2; return 1; }
+  # Legacy real-directory migration may start from the historical 0775 root.
+  # Normalize only the release root itself while stopped/staged, then prove the
+  # trust anchor is root-owned and not group/other writable before hashing it.
+  chown 0:0 -- "$root" || return 1
+  chmod go-w -- "$root" || return 1
+  read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$root")
+  [[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] || {
+    echo "FATAL: strong release root ownership/mode 不可信:$root" >&2; return 1;
+  }
+  test -f "$root/package.json"
+  test -d "$root/node_modules"
+  test -f "$root/VERSION.json"
+  test -f "$root/packages/web-react/dist/index.html"
+  test -f "$root/deploy/v5/release-metadata.json"
+  [[ "$(jq -er '.commit | select(type == "string")' "$root/VERSION.json")" == "$short_sha" ]] || {
+    echo 'FATAL: VERSION.commit 与 pinned source short SHA 不一致' >&2; return 1;
+  }
+  metadata_sha="$(sha256sum -- "$root/deploy/v5/release-metadata.json" | cut -d' ' -f1)"
+  artifact_sha="$(release_artifact_digest "$root")"
+  [[ "$metadata_sha" =~ ^[0-9a-f]{64}$ && "$artifact_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  marker_tmp="${root}.complete.$$"
+  if ! jq -n \
+    --argjson schemaVersion "$schema" \
+    --arg sourceCommit "$full_sha" \
+    --arg builtAt "$built_at" \
+    --arg metadataSha256 "$metadata_sha" \
+    --arg artifactSha256 "$artifact_sha" \
+    '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
+      metadataSha256:$metadataSha256,artifactSha256:$artifactSha256}' >"$marker_tmp"; then
+    rm -f -- "$marker_tmp"
+    return 1
+  fi
+  chmod 0644 "$marker_tmp" || { rm -f -- "$marker_tmp"; return 1; }
+  chown 0:0 "$marker_tmp" || { rm -f -- "$marker_tmp"; return 1; }
+  mv -f -- "$marker_tmp" "$root/.complete" || { rm -f -- "$marker_tmp"; return 1; }
+  read -r marker_uid marker_gid marker_mode < <(stat -Lc '%u %g %a' -- "$root/.complete")
+  [[ "$marker_uid" == 0 && "$marker_gid" == 0 && "$marker_mode" == 644 ]] || {
+    echo "FATAL: strong release marker ownership/mode 不可信:$root/.complete" >&2; return 1;
+  }
+  # Re-hash after the marker is durably in place (the marker itself is excluded)
+  # so a concurrent tree mutation between the first digest and publish cannot
+  # create a self-consistent-looking marker that was never verified as a whole.
+  [[ "$(release_artifact_digest "$root")" == "$artifact_sha" ]] || {
+    echo "FATAL: strong release tree changed while publishing marker:$root" >&2; return 1;
+  }
+}
+
+publish_strong_release() { # <staging> <final-dir> <full-sha> <short-sha> <builtAt>
+  local staging="$1" reldir="$2" full_sha="$3" short_sha="$4" built_at="$5"
+  {
+    declare -f release_artifact_digest write_strong_release_marker_local
+    cat <<'REMOTE'
+set -Eeuo pipefail
+staging="$1"; reldir="$2"; full_sha="$3"; short_sha="$4"; built_at="$5"; schema="$6"
+[[ -d "$staging" && ! -L "$staging" && ! -e "$reldir" ]] || {
+  echo 'FATAL: strong release staging/final path 非法' >&2; exit 1;
+}
+write_strong_release_marker_local "$staging" "$full_sha" "$short_sha" "$built_at" "$schema"
+mv -T -- "$staging" "$reldir"
+REMOTE
+  } | ssh "$KL_HOST" bash -s -- \
+    "$staging" "$reldir" "$full_sha" "$short_sha" "$built_at" "$RELEASE_COMPLETE_SCHEMA_VERSION"
+}
+
 build_release() {
   BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""; DIST_BUILD_ID=""
   local full_sha short_sha ts staging reldir cur
@@ -2189,6 +2608,10 @@ build_release() {
     echo "  [dry-run] build→$staging(archive+node_modules+dist 从 staging pinned 源构建+VERSION+.complete)→ mv -T→$reldir" >&2
     BUILT_RELEASE="$reldir"; return 0
   fi
+  [[ -n "$cur" && "$cur" == "$CAPTURED_RELEASE_PREDECESSOR" ]] || {
+    echo "✗ build_release 前 serving predecessor 未在持锁后精确捕获/已漂移(captured=${CAPTURED_RELEASE_PREDECESSOR:-<none>} current=${cur:-<none>})" >&2
+    return 1
+  }
   # 工作树非干净只是提示(archive 用 full_sha 已 pin,uncommitted 被忽略;避免"以为部署了未提交改动")
   assert_clean_source_tree
   # 远端建到 staging;任一步失败 → 清 staging + return 1(半成品不落 rel-*)
@@ -2227,11 +2650,8 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  # 完整性校验 + .complete + 原子改名 staging→rel-*
-  if ! ssh "$KL_HOST" "set -e
-      test -f '$staging/package.json' && test -d '$staging/node_modules' && test -f '$staging/VERSION.json' && test -f '$staging/packages/web-react/dist/index.html'
-      printf '{\"sha\":\"$short_sha\",\"builtAt\":\"$ts\"}\n' > '$staging/.complete'
-      mv -T '$staging' '$reldir'"; then
+  # 完整性校验 + strong .complete(full source/metadata/tree digests) + 原子改名。
+  if ! publish_strong_release "$staging" "$reldir" "$full_sha" "$short_sha" "$ts"; then
     echo "✗ 完整性校验/原子改名失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   BUILT_RELEASE="$reldir"
   echo "  ✓ release 就绪(带 .complete):$reldir" >&2
@@ -3828,8 +4248,8 @@ activate_release() {
     echo "  [dry-run] 校验+assets 先就位→翻转 $ACTIVE_SRC(slot=$ACTIVE_SLOT)→restart/smoke $ACTIVE_UNIT:$ACTIVE_PORT→严格 state CAS；任一步失败回切旧 release"
     return 0
   fi
+  assert_release_marker "$reldir" || return 1
   assert_release_required_migrations "$reldir" || return 1
-  ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
   assert_release_baseline_security "$reldir" || return 1
   # 割接后 capability 门:deploy/dist/rollback 的激活都经本函数,一处即覆盖全部激活/回滚路径。
   assert_release_capability_for_sessions_pg "$reldir"
@@ -3838,6 +4258,9 @@ activate_release() {
   assert_model_authority_floor "$reldir"
   prev="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev" ]] || { echo "✗ 无法解析 active slot 当前 release，拒绝激活。" >&2; return 1; }
+  assert_release_marker "$prev" || {
+    echo "✗ 激活前无法证明 exact predecessor 可安全补偿:$prev" >&2; return 1;
+  }
   [[ "$ACTIVE_SLOT" == A ]] && old_prev_file="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
   # 前端资产先于任何 live 翻转就位；失败仅留下加法式孤儿资产，无运行态变化。
   sync_assets_to_pool "$reldir" || return 1
@@ -4127,6 +4550,7 @@ activate_runtime_tuple() {
     echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
     return 0
   fi
+  assert_release_marker "$BUILT_RELEASE" || return 1
   assert_release_required_migrations "$BUILT_RELEASE" || return 1
   assert_release_baseline_security "$BUILT_RELEASE" || return 1
   # hotcfg 路径的 master symlink 翻转走 saga 的 extra_apply,**不经 activate_release** →
@@ -4138,6 +4562,9 @@ activate_runtime_tuple() {
   local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
+  assert_release_marker "$prev_src" || {
+    echo "✗ hotcfg 激活前 exact predecessor marker 无效:$prev_src" >&2; return 1;
+  }
   assert_history_projection_revision_pair "$prev_src" "$BUILT_RELEASE" "runtime hotcfg activation" || return 1
   # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
   if [[ "$ACTIVE_SLOT" == A ]]; then
@@ -4273,16 +4700,29 @@ activate_emergency_tuple() {
 migrate_to_bluegreen() {
   echo "══ v5 迁移蓝绿 symlink 布局 on $KL_HOST ══"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] 已 symlink 则跳过;否则 stop→mv 实目录→唯一 rel-<sha>-<ts>-migrated(写 .complete)→ln -s→start→smoke(带 ERR 恢复 trap)"
+    echo "  [dry-run] 已 symlink 则强 marker 校验后跳过;否则钉 full commit+metadata 原始字节→stop→mv→写 strong .complete→ln -s→start→smoke"
     return 0
   fi
   # R2#3:幂等跳过必须是**合法**蓝绿布局(指向 rel-* 且带 .complete),不能见 symlink 就当已迁移
   if ssh "$KL_HOST" "test -L '$REMOTE_SRC'"; then
-    if ssh "$KL_HOST" "set -e; t=\$(readlink -f '$REMOTE_SRC'); case \"\$t\" in '$RELEASES_ROOT'/rel-*) test -f \"\$t/.complete\" ;; *) exit 1 ;; esac"; then
+    local migrated_current
+    migrated_current="$(bg_current_release "$REMOTE_SRC")"
+    if [[ -n "$migrated_current" && "$migrated_current" == "$CAPTURED_RELEASE_PREDECESSOR" ]] \
+        && assert_release_marker "$migrated_current"; then
       echo "  ✓ 已是合法蓝绿布局,幂等跳过"; return 0
     fi
-    echo "✗ $REMOTE_SRC 是 symlink 但非合法蓝绿布局(悬垂/非 rel-*/缺 .complete),拒绝自动迁移,人工处置" >&2; return 1
+    echo "✗ $REMOTE_SRC 是 symlink 但 marker/血缘不可信,拒绝自动迁移,人工处置" >&2; return 1
   fi
+  # 实目录首次迁移没有旧 marker 可用。首写前从 VERSION.short 唯一解析 trusted local
+  # full commit，并逐字节比对该 commit 的 release metadata；unknown/漂移一律拒绝。
+  local sha full_sha ts reldir
+  sha="$(ssh "$KL_HOST" "jq -er '.commit | select(type == \"string\")' '$REMOTE_SRC/VERSION.json'")" || return 1
+  [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]] || { echo "✗ 实目录 VERSION.commit 非法:$sha" >&2; return 1; }
+  full_sha="$(git -C "$REPO_ROOT" rev-parse --verify "${sha}^{commit}" 2>/dev/null || true)"
+  [[ "$full_sha" =~ ^[0-9a-f]{40}$ && "$full_sha" == "$sha"* ]] || {
+    echo "✗ 实目录 VERSION short SHA 无法唯一解析:$sha" >&2; return 1;
+  }
+  assert_release_metadata_matches_commit "$REMOTE_SRC" "$full_sha" || return 1
   # Legacy real-directory migration is another old-code restart path. Establish
   # the reservation before changing modes or stopping/starting that process.
   echo "── 蓝绿迁移前建立 CCB baseline 安全边界 ──"
@@ -4290,27 +4730,34 @@ migrate_to_bluegreen() {
   harden_release_baseline "$REMOTE_SRC" || return 1
   strip_shared_baseline_env_keys || return 1
   assert_release_baseline_security "$REMOTE_SRC" || return 1
-  local sha ts reldir
-  sha="$(ssh "$KL_HOST" "jq -r .commit '$REMOTE_SRC/VERSION.json' 2>/dev/null || echo unknown")"
   ts="$(date -u +%Y%m%d-%H%M%S)"
   reldir="$RELEASES_ROOT/rel-$sha-$ts-migrated"
-  echo "── 停机 → 实目录搬入 $reldir → 写 .complete → symlink → 启动(一次性,几秒停机;ERR 自动恢复贯穿 start)──"
+  echo "── 停机 → 实目录搬入 $reldir → 写 strong .complete → symlink → 启动(一次性,几秒停机;ERR 自动恢复贯穿 start)──"
   # ERR trap 覆盖到 start 成功之后才 `trap - ERR`(R2#3:start 失败也回滚);restore 处理已建 symlink 状态
-  ssh "$KL_HOST" "set -Eeuo pipefail
-    mkdir -p '$RELEASES_ROOT'
-    test ! -e '$reldir'                    # 唯一目标必须不存在(防 mv 进已存在目录内部)
-    systemctl stop '$V5_UNIT'
+  {
+    declare -f release_artifact_digest write_strong_release_marker_local
+    cat <<'REMOTE'
+set -Eeuo pipefail
+remote_src="$1"; releases_root="$2"; reldir="$3"; unit="$4"
+full_sha="$5"; short_sha="$6"; built_at="$7"; schema="$8"
+mkdir -p "$releases_root"
+test ! -e "$reldir"
+systemctl stop "$unit"
     moved=0; linked=0
     restore() {
-      [ \"\$linked\" = 1 ] && rm -f '$REMOTE_SRC'
-      if [ \"\$moved\" = 1 ] && [ ! -e '$REMOTE_SRC' ] && [ -d '$reldir' ]; then mv '$reldir' '$REMOTE_SRC' || true; fi
-      systemctl start '$V5_UNIT' || true; echo 'FATAL: 迁移失败,已尽力恢复实目录并启动旧服务' >&2; }
+      [ "$linked" = 1 ] && rm -f "$remote_src"
+      if [ "$moved" = 1 ] && [ ! -e "$remote_src" ] && [ -d "$reldir" ]; then mv "$reldir" "$remote_src" || true; fi
+      systemctl start "$unit" || true; echo 'FATAL: 迁移失败,已尽力恢复实目录并启动旧服务' >&2; }
     trap restore ERR
-    mv '$REMOTE_SRC' '$reldir'; moved=1
-    printf '{\"sha\":\"$sha\",\"builtAt\":\"$ts\",\"migrated\":true}\n' > '$reldir/.complete'
-    ln -s '$reldir' '$REMOTE_SRC'; linked=1
-    systemctl start '$V5_UNIT'
-    trap - ERR" || { echo "✗ 迁移执行失败(见上 FATAL 恢复日志)" >&2; return 1; }
+mv "$remote_src" "$reldir"; moved=1
+write_strong_release_marker_local "$reldir" "$full_sha" "$short_sha" "$built_at" "$schema"
+ln -s "$reldir" "$remote_src"; linked=1
+systemctl start "$unit"
+trap - ERR
+REMOTE
+  } | ssh "$KL_HOST" bash -s -- "$REMOTE_SRC" "$RELEASES_ROOT" "$reldir" "$V5_UNIT" \
+    "$full_sha" "$sha" "$ts" "$RELEASE_COMPLETE_SCHEMA_VERSION" \
+    || { echo "✗ 迁移执行失败(见上 FATAL 恢复日志)" >&2; return 1; }
   run "sleep 4"
   if ! smoke; then
     echo "✗ 迁移后 smoke 失败,自动回切实目录布局并重启旧服务" >&2
@@ -4728,6 +5175,11 @@ knowledge_planet_plugin_verify_user() {
   # "同一时刻至多一个 verifier / 不与部署对撞"仍由入口的 KP-verify 专用锁(fd 9)+ 全局 deploy lock(fd 8)保证。
   # 锁序:deploy lock(fd 8)→ KP-verify lock(fd 9)→ 全局 lease(此处,先本地后远端,与既有约定一致)。
   acquire_production_mutation_lease || { echo "✗ 未取得 production-mutation lease;拒绝构建 Knowledge Planet 验证 release" >&2; return 3; }
+  if ! capture_trusted_release_predecessor; then
+    release_production_mutation_lease
+    echo "✗ 无法在 Knowledge Planet build 首写前捕获可信 serving predecessor" >&2
+    return 3
+  fi
   local build_rc=0 kp_errexit_was_on=0
   local -a build_state=()
   KNOWLEDGE_PLANET_BUILD_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/oc-v5-kp-build-state.XXXXXX")" || {
@@ -5181,16 +5633,19 @@ knowledge_planet_compensate_setup_first() { # <helper/new> <previous> <hotcfg:0|
 }
 
 activate_egress_release() {
-  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps require_cap=0
+  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps running_cwd require_cap=0
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;安装目标 unit→restart→health/cwd；失败回切"
     return 0
   fi
-  ssh "$KL_HOST" "test -f '$reldir/.complete' && test -f '$reldir/deploy/v5/$V5_EGRESS_UNIT'" || {
-    echo "✗ egress 目标 release 不完整或缺 unit:$reldir" >&2; return 1;
+  assert_release_marker "$reldir" egress || return 1
+  assert_release_marker "$prev" egress || return 1
+  running_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+  [[ "$running_cwd" == "$prev" ]] || {
+    echo "✗ egress 激活前进程 cwd 已漂移(expected=$prev actual=${running_cwd:-<none>})" >&2; return 1;
   }
-  ssh "$KL_HOST" "test -n '$prev' && test -f '$prev/.complete'" || {
-    echo "✗ 无法证明旧 egress cwd 是完整 release:$prev；拒绝在无回退点时切换" >&2; return 1;
+  ssh "$KL_HOST" "test -f '$reldir/deploy/v5/$V5_EGRESS_UNIT'" || {
+    echo "✗ egress 目标 release 不完整或缺 unit:$reldir" >&2; return 1;
   }
   if ! ssh "$KL_HOST" "set -Eeuo pipefail
     rm -f '$tmplink'
@@ -5246,8 +5701,11 @@ deploy() {
   }
   if [[ "$RESTART_EGRESS" == 1 && "$DRY" != 1 ]]; then
     # 必须在 master symlink 翻转前钉住旧 egress 真正 cwd；active=A 时翻转后再读会丢回退点。
-    egress_prev_release="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
-    ssh "$KL_HOST" "test -n '$egress_prev_release' && test -f '$egress_prev_release/.complete'" || {
+    egress_prev_release="$CAPTURED_EGRESS_PREDECESSOR"
+    local current_egress_cwd
+    current_egress_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+    [[ -n "$egress_prev_release" && "$current_egress_cwd" == "$egress_prev_release" ]] \
+      && assert_release_marker "$egress_prev_release" egress || {
       echo "✗ --egress 起手无法钉住完整旧 egress cwd:$egress_prev_release；拒绝先改 master" >&2; exit 1;
     }
     echo "  · egress 回退点:$egress_prev_release"
@@ -5842,6 +6300,8 @@ rollback() {
   # a query returning false is stale before the later symlink switch.
   live_master="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$live_master" ]] || { echo "✗ 显式回滚前无法解析当前 live master" >&2; exit 1; }
+  assert_release_marker "$live_master" || exit 1
+  assert_release_marker "$target" || exit 1
   image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
   runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
   assert_lossless_explicit_rollback_target \
@@ -5919,6 +6379,9 @@ rollback_runtime_tuple() {
   prev_src="$(bg_current_release "$ACTIVE_SRC")"   # 当前 active slot master 源码
   plugin_helper="${helper_override:-$prev_src}"
   [[ -n "$prev_src" ]] || { echo "✗ tuple 回滚前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
+  assert_release_marker "$prev_src" || {
+    echo "✗ tuple 回滚前当前 master marker 无效:$prev_src" >&2; return 1;
+  }
   [[ "$prev_src" == "$ACTIVE_STATE_RELEASE" ]] || {
     echo "✗ deploy_state.active_release=$ACTIVE_STATE_RELEASE 与 slot=$ACTIVE_SLOT symlink=$prev_src 不一致，拒绝回滚。" >&2
     return 1
@@ -6029,6 +6492,7 @@ rollback_runtime_tuple() {
   [[ -n "$master" ]] || master="$(jq -r '.masterRelease // ""' <<<"$prev")"
   [[ -n "$master" ]] || { echo "✗ 目标 history 记录缺 masterRelease 字段,无法对齐回滚 master 源码(旧格式 history?)" >&2; return 1; }
   ssh "$KL_HOST" "test -d '$master'" || { echo "✗ 目标 master release 目录不存在(可能已被 GC): $master" >&2; return 1; }
+  assert_release_marker "$master" || return 1
   assert_release_required_migrations "$master" || return 1
   assert_release_baseline_security "$master" || return 1
   # Current-capable/unknown → target reader+actual writer are proved without a
@@ -6449,6 +6913,7 @@ init_candidate_slot() {
     echo "  [dry-run] mkdir $chome; 派生 openclaude.json(port=$cport,已存在则保留);装 $cunit;symlink $csrc→$reldir"
     return 0
   fi
+  assert_release_marker "$reldir" || return 1
   # openclaude.json:从 A 的派生,仅改 gateway.port;已存在则保留(权威=现网 slot 家)
   ssh "$KL_HOST" "set -e
     mkdir -p '$chome'
@@ -6459,7 +6924,6 @@ init_candidate_slot() {
     fi"
   # 源码 symlink → release(原子:临时链 + mv -T)
   ssh "$KL_HOST" "set -e
-    test -f '$reldir/.complete'
     rm -f '$csrc.newlink.$$'
     ln -s '$reldir' '$csrc.newlink.$$'
     mv -T '$csrc.newlink.$$' '$csrc'"
@@ -6570,11 +7034,13 @@ canary() {
   echo "══ v5 --canary(蓝绿双 master 起手;RFC D5)══"
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
+  [[ "$DRY" == 1 ]] || assert_release_marker "$(bg_current_release "$ACTIVE_SRC")"
   assert_runtime_channel_column
   prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,拒绝 canary" >&2; exit 1; }
   if [[ -n "$CANARY_RELEASE" ]]; then
     local requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
     [[ "$CANARY_RELEASE" == /* ]] && requested_release="$CANARY_RELEASE"
+    assert_release_marker "$requested_release"
     assert_release_required_migrations "$requested_release"
   fi
   ds_snapshot
@@ -6604,13 +7070,17 @@ canary() {
   if [[ -n "$CANARY_RELEASE" ]]; then
     reldir="$RELEASES_ROOT/$CANARY_RELEASE"; [[ "$CANARY_RELEASE" == /* ]] && reldir="$CANARY_RELEASE"
     echo "── 复用指定 release:$reldir ──"
-    sshk "test -f '$reldir/.complete' || { echo '✗ 指定 release 无 .complete: $reldir' >&2; exit 1; }"
   else
     WITH_DIST=1
     build_release || { echo "✗ build_release 失败(未 CAS candidate_release,live 未改)" >&2; exit 1; }
     reldir="$BUILT_RELEASE"
   fi
   [[ "$DRY" == 1 ]] && reldir="$RELEASES_ROOT/rel-cand-dry"
+  assert_release_marker "$reldir" || {
+    echo "✗ candidate release 完整 marker 无效;回 stable(§8 canary<READY)" >&2
+    recover_canary_prep "$cand"
+    exit 1
+  }
   assert_release_baseline_security "$reldir" || {
     echo "✗ candidate release baseline 不安全;回 stable(§8 canary<READY)" >&2
     recover_canary_prep "$cand"
@@ -6702,6 +7172,12 @@ promote() {
   echo "══ v5 --promote=$PROMOTE_PCT(cohort 放量;RFC D5)══"
   ds_snapshot
   ds_assert_phase canary
+  if [[ "$DRY" != 1 ]]; then
+    local promote_candidate="$DS_candidate_release"
+    [[ "$promote_candidate" == /* ]] || promote_candidate="$RELEASES_ROOT/$promote_candidate"
+    assert_release_marker "$promote_candidate" || exit 1
+    assert_release_marker "$(bg_current_release "$(slot_src "$DS_active_slot")")" || exit 1
+  fi
   [[ "$DRY" == 1 || "$DS_transition_step" -ge "$DS_STEP_CANARY_READY" ]] || { echo "✗ canary 未到 READY(step=$DS_transition_step),不能放量" >&2; exit 1; }
   new_operation_id promote
   assert_mutation_lease_alive "promote" || { echo "✗ production-mutation lease 失活;放量 crash-stop(cohort_percent 未改)" >&2; exit 86; }
@@ -6752,6 +7228,10 @@ finalize() {
     || { echo "✗ finalize 缺 candidate_release，无法校验 Knowledge Planet contract" >&2; exit 1; }
   [[ -z "$kp_candidate_release" || "$kp_candidate_release" == /* ]] \
     || kp_candidate_release="$RELEASES_ROOT/$kp_candidate_release"
+  [[ "$DRY" == 1 ]] || {
+    assert_release_marker "$kp_candidate_release" || exit 1
+    assert_release_marker "$(bg_current_release "$(slot_src "$DS_active_slot")")" || exit 1
+  }
   knowledge_planet_plugin_assert_release_compatible \
     "$kp_candidate_release" "$kp_candidate_release" \
     || echo "⚠ candidate 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:finalize 后该插件将 RUNTIME_UNAVAILABLE 直至验证晋升;finalize 不因此阻断(2026-07-17 纠偏)" >&2
@@ -6970,8 +7450,13 @@ abort() {
 # 是幂等核验,总是执行。abort transition_step 序:0(begin)→2(desired 收回)→3(candidate 停)→commit。
 abort_continue() {
   local old="$1" cand="$2" csrc; csrc="$(slot_src "$cand")"
-  local old_src image_id runtime_release
+  local old_src old_release image_id runtime_release
   old_src="$(slot_src "$old")"
+  old_release="$(bg_current_release "$old_src")"
+  [[ "$DRY" == 1 ]] || {
+    [[ -n "$old_release" ]] || { echo "✗ abort 无法解析旧 slot release:$old_src" >&2; return 1; }
+    assert_release_marker "$old_release" || return 1
+  }
   image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
   runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
   # F7:abort/recover 是补偿/恢复路径(把公共流量与 leadership 收回旧 slot),恢复动作前
@@ -7702,6 +8187,24 @@ case "$MODE" in
   # 全局 lease 仅在函数内围绕 build_release(唯一共享命名空间写)窄取窄放。
   knowledge-planet-verify) ;;
   *) acquire_production_mutation_lease || exit 3 ;;
+esac
+
+# Legacy marker 兼容权只在会 build/flip/放量 master release 的 invocation 建立：此刻本地
+# deploy lock 与远端 mutation lease 均已持有，而 run_mutation_lane_supervised 尚未 arm
+# in-flight marker，故这是任何 release/state/unit 写入前的唯一可信捕获点。
+case "$MODE" in
+  deploy)
+    capture_trusted_release_predecessor || exit 1
+    [[ "$RESTART_EGRESS" != 1 ]] || capture_trusted_egress_predecessor || exit 1
+    ;;
+  dist|rollback|canary|promote|finalize|abort|recover)
+    capture_trusted_release_predecessor || exit 1 ;;
+  migrate-bluegreen)
+    # 首次实目录迁移没有 predecessor marker；已是 symlink 的幂等重跑则必须也在
+    # supervisor arm 首写前捕获 exact target，函数内只消费这份已锁定身份。
+    migrate_predecessor="$(bg_current_release "$REMOTE_SRC")"
+    [[ -z "$migrate_predecessor" ]] \
+      || capture_trusted_release_predecessor "$migrate_predecessor" || exit 1 ;;
 esac
 
 case "$MODE" in

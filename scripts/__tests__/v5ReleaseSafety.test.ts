@@ -679,7 +679,7 @@ describe('v5 release safety lanes', () => {
     assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('rsync -az --delete'))
     const migrate = source.match(/migrate_to_bluegreen\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf('harden_release_baseline "$REMOTE_SRC"'))
-    assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf("systemctl stop '$V5_UNIT'"))
+    assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf('systemctl stop "$unit"'))
     const unitInstall = source.match(/install_v5_slot_units\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(unitInstall, /if ! systemctl is-active --quiet '\$V5_BASELINE_PORT_GUARD_SOCKET'; then[\s\S]*systemctl start '\$V5_BASELINE_PORT_GUARD_SOCKET'/)
     assert.doesNotMatch(unitInstall, /systemctl restart[^\n]*V5_BASELINE_PORT_GUARD_SOCKET/)
@@ -693,7 +693,7 @@ describe('v5 release safety lanes', () => {
       build.indexOf('harden_release_baseline "$staging"') >
         build.indexOf('npm run build --workspace packages/web-react'),
     )
-    assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf("'$staging/.complete'"))
+    assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
     assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$master"/)
@@ -1030,7 +1030,7 @@ describe('v5 release safety lanes', () => {
     assert.match(omitted.stderr, /requiredMigrations mismatch/)
   })
 
-  test('remote immutable legacy releases remain usable before the history projection floor', async () => {
+  test('remote legacy migration manifests are scoped to the exact captured predecessor', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-legacy-migration-manifest-')); dirs.push(dir)
     const releasesRoot = path.join(dir, 'releases')
     const release = path.join(releasesRoot, 'rel-ccd3e7e0-legacy')
@@ -1099,16 +1099,21 @@ describe('v5 release safety lanes', () => {
       await writeFile(path.join(migrations, `${migration}.sql`), '-- legacy release\n')
     }
     const metadata = path.join(metadataDir, 'release-metadata.json')
-    const invoke = (location: 'local' | 'remote') => spawnSync('bash', ['-c', [
+    const invoke = (location: 'local' | 'remote', trustPredecessor = true) => spawnSync('bash', ['-c', [
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
       `RELEASES_ROOT='${releasesRoot}'`,
+      `TRUSTED_LEGACY_PREDECESSOR=${trustPredecessor ? `'${release}'` : "''"}`,
       "ssh() { local _host=\"$1\"; shift; \"$@\"; }",
       `required_migrations_csv '${metadata}' ${location}`,
     ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
 
     await writeFile(metadata, JSON.stringify(legacyMetadata))
+    const untrustedLegacy = invoke('remote', false)
+    assert.notEqual(untrustedLegacy.status, 0)
+    assert.match(untrustedLegacy.stderr, /exact captured predecessor/)
+
     const legacyRemote = invoke('remote')
     assert.equal(legacyRemote.status, 0, legacyRemote.stderr)
     assert.equal(legacyRemote.stdout, legacyMetadata.requiredMigrations.join(','))
@@ -1132,6 +1137,187 @@ describe('v5 release safety lanes', () => {
     const duplicate = invoke('remote')
     assert.notEqual(duplicate.status, 0)
     assert.match(duplicate.stderr, /invalid legacy requiredMigrations/)
+  })
+
+  test('strong release markers detect tampering and legacy trust is exact-invocation predecessor only', async () => {
+    const deploySource = await readFile(deploy, 'utf8')
+    assert.match(deploySource, /write_strong_release_marker_local\(\)[\s\S]*schemaVersion:\$schemaVersion[\s\S]*sourceCommit:\$sourceCommit[\s\S]*metadataSha256:\$metadataSha256[\s\S]*artifactSha256:\$artifactSha256/)
+    assert.match(deploySource, /activate_release\(\)[\s\S]*assert_release_marker "\$reldir"[\s\S]*assert_release_required_migrations "\$reldir"/)
+    assert.match(deploySource, /rollback_runtime_tuple\(\)[\s\S]*assert_release_marker "\$master"[\s\S]*assert_release_required_migrations "\$master"/)
+    const captureAt = deploySource.lastIndexOf('capture_trusted_release_predecessor || exit 1')
+    assert.ok(captureAt > deploySource.lastIndexOf('acquire_production_mutation_lease || exit 3'))
+    assert.ok(captureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'))
+    const egressCaptureAt = deploySource.lastIndexOf('capture_trusted_egress_predecessor || exit 1')
+    assert.ok(egressCaptureAt > deploySource.lastIndexOf('acquire_production_mutation_lease || exit 3'))
+    assert.ok(egressCaptureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'))
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-marker-')); dirs.push(dir)
+    const releasesRoot = path.join(dir, 'releases')
+    await mkdir(releasesRoot)
+    const full = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const short = full.slice(0, 8)
+    const metadataRaw = spawnSync(
+      'git', ['show', `${full}:deploy/v5/release-metadata.json`],
+      { cwd: root, encoding: 'utf8' },
+    ).stdout
+    assert.match(full, /^[0-9a-f]{40}$/)
+    assert.ok(metadataRaw.length > 0)
+
+    const makeRelease = async (builtAt: string) => {
+      const release = path.join(releasesRoot, `rel-${short}-${builtAt}`)
+      await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
+      await mkdir(path.join(release, 'node_modules'), { recursive: true })
+      await mkdir(path.join(release, 'packages/web-react/dist'), { recursive: true })
+      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'), metadataRaw)
+      await writeFile(path.join(release, 'VERSION.json'), JSON.stringify({ commit: short }))
+      await writeFile(path.join(release, 'package.json'), '{}\n')
+      await writeFile(path.join(release, 'node_modules/dependency.js'), 'module.exports = 1\n')
+      await writeFile(path.join(release, 'packages/web-react/dist/index.html'), '<html>fixture</html>\n')
+      return release
+    }
+    const invoke = (command: string) => spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `RELEASES_ROOT='${releasesRoot}'`,
+      'KL_HOST=fake',
+      'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
+      command,
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+
+    const strong = await makeRelease('20260719-010203')
+    const artifact = invoke(`release_artifact_digest '${strong}'`)
+    assert.equal(artifact.status, 0, artifact.stderr)
+    const marker = {
+      schemaVersion: 2,
+      sourceCommit: full,
+      builtAt: '20260719-010203',
+      metadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      artifactSha256: artifact.stdout.trim(),
+    }
+    await writeFile(path.join(strong, '.complete'), JSON.stringify(marker))
+    const validStrong = invoke(`assert_release_marker '${strong}'`)
+    assert.equal(validStrong.status, 0, validStrong.stderr)
+
+    const hardenedStrong = await makeRelease('20260719-010206')
+    await chmod(hardenedStrong, 0o775)
+    const publishHardened = invoke([
+      `write_strong_release_marker_local '${hardenedStrong}' '${full}' '${short}' '20260719-010206' 2`,
+      `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}')" == '0:0:755' ]]`,
+      `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}/.complete')" == '0:0:644' ]]`,
+      `assert_release_marker '${hardenedStrong}'`,
+    ].join('\n'))
+    assert.equal(publishHardened.status, 0, publishHardened.stderr)
+
+    await chmod(path.join(strong, '.complete'), 0o666)
+    const writableMarker = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(writableMarker.status, 0)
+    assert.match(writableMarker.stderr, /marker ownership\/mode 不可信/)
+    await chmod(path.join(strong, '.complete'), 0o644)
+
+    await chmod(strong, 0o775)
+    const writableRoot = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(writableRoot.status, 0)
+    assert.match(writableRoot.stderr, /root ownership\/mode 不可信/)
+    await chmod(strong, 0o755)
+
+    await writeFile(path.join(strong, 'node_modules/dependency.js'), 'module.exports = 2\n')
+    const artifactTamper = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(artifactTamper.status, 0)
+    assert.match(artifactTamper.stderr, /artifact digest mismatch/)
+    await writeFile(path.join(strong, 'node_modules/dependency.js'), 'module.exports = 1\n')
+
+    await writeFile(path.join(strong, '.complete'), JSON.stringify({
+      ...marker,
+      artifactSha256: 'f'.repeat(64),
+    }))
+    const markerMismatch = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(markerMismatch.status, 0)
+    assert.match(markerMismatch.stderr, /artifact digest mismatch/)
+    await writeFile(path.join(strong, '.complete'), JSON.stringify(marker))
+
+    await writeFile(path.join(strong, 'deploy/v5/release-metadata.json'), `${metadataRaw}\n`)
+    const metadataTamper = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(metadataTamper.status, 0)
+    assert.match(metadataTamper.stderr, /metadata digest mismatch/)
+    await writeFile(path.join(strong, 'deploy/v5/release-metadata.json'), metadataRaw)
+
+    const legacy = await makeRelease('20260719-010204')
+    await writeFile(path.join(legacy, '.complete'), JSON.stringify({ sha: short, builtAt: '20260719-010204' }))
+    const unknownLegacy = invoke(`assert_release_marker '${legacy}'`)
+    assert.notEqual(unknownLegacy.status, 0)
+    assert.match(unknownLegacy.stderr, /非本 invocation 精确捕获.*predecessor/)
+    const knownLegacy = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `assert_release_marker '${legacy}'`,
+    ].join('\n'))
+    assert.equal(knownLegacy.status, 0, knownLegacy.stderr)
+
+    const changedLegacy = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `printf '%s\\n' 'module.exports = 9' > '${legacy}/node_modules/dependency.js'`,
+      `assert_release_marker '${legacy}'`,
+    ].join('\n'))
+    assert.notEqual(changedLegacy.status, 0)
+    assert.match(changedLegacy.stderr, /制品未变/)
+    await writeFile(path.join(legacy, 'node_modules/dependency.js'), 'module.exports = 1\n')
+
+    const otherLegacy = await makeRelease('20260719-010205')
+    await writeFile(path.join(otherLegacy, '.complete'), JSON.stringify({ sha: short, builtAt: '20260719-010205' }))
+    const wrongLegacy = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `assert_release_marker '${otherLegacy}'`,
+    ].join('\n'))
+    assert.notEqual(wrongLegacy.status, 0)
+    assert.match(wrongLegacy.stderr, /非本 invocation 精确捕获.*predecessor/)
+
+    const splitMasterAndEgress = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `capture_trusted_egress_predecessor '${otherLegacy}'`,
+      `assert_release_marker '${legacy}'`,
+      `assert_release_marker '${otherLegacy}' egress`,
+    ].join('\n'))
+    assert.equal(splitMasterAndEgress.status, 0, splitMasterAndEgress.stderr)
+    const egressPinIsNotMasterTrust = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `capture_trusted_egress_predecessor '${otherLegacy}'`,
+      `assert_release_marker '${otherLegacy}'`,
+    ].join('\n'))
+    assert.notEqual(egressPinIsNotMasterTrust.status, 0)
+    assert.match(egressPinIsNotMasterTrust.stderr, /master predecessor/)
+  })
+
+  test('release artifact digest rejects a path added after its initial tree snapshot', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-digest-race-')); dirs.push(dir)
+    const release = path.join(dir, 'release')
+    await mkdir(release)
+    const large = path.join(release, 'a-large.bin')
+    const added = path.join(release, 'z-added-after-snapshot')
+    const truncate = spawnSync('truncate', ['-s', '64M', large], { encoding: 'utf8' })
+    assert.equal(truncate.status, 0, truncate.stderr)
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'python3() {',
+      '  command /usr/bin/python3 "$@" <&0 & local child=$!',
+      '  (',
+      '    while kill -0 "$child" 2>/dev/null; do',
+      `      for fd in /proc/$child/fd/*; do [[ "$(readlink -f "$fd" 2>/dev/null || true)" == '${large}' ]] && { printf x > '${added}'; exit 0; }; done`,
+      '    done',
+      '  ) & local mutator=$!',
+      '  local rc=0; wait "$child" || rc=$?; wait "$mutator" || true; return "$rc"',
+      '}',
+      `release_artifact_digest '${release}'`,
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /release tree changed during digest/)
   })
 
   test('root typecheck and every dist build use the official web workspace gate', async () => {
@@ -1512,6 +1698,7 @@ describe('v5 release safety lanes', () => {
       'ACTIVE_STATE_LOCK_VERSION=7',
       'ACTIVE_STATE_RELEASE=/release/old',
       'ACTIVE_STATE_PREVIOUS_RELEASE=/release/older',
+      'assert_release_marker() { :; }',
       'assert_release_required_migrations() { :; }',
       'assert_release_capability_for_sessions_pg() { :; }',
       'assert_lossless_turn_tape_floor() { :; }',
@@ -1929,7 +2116,9 @@ describe('v5 release safety lanes', () => {
     assert.match(egressActivate, /wait_for_egress_release_ready "\$reldir" "\$require_cap" 30/)
     assert.match(egressActivate, /wait_for_egress_release_ready "\$prev" 0 30/)
     assert.doesNotMatch(egressActivate, /run "sleep 3"/)
-    assert.match(deployBody, /egress_prev_release=.*systemctl show -p MainPID/)
+    assert.match(deployBody, /egress_prev_release="\$CAPTURED_EGRESS_PREDECESSOR"/)
+    assert.match(deployBody, /current_egress_cwd=.*systemctl show -p MainPID/)
+    assert.match(deployBody, /current_egress_cwd" == "\$egress_prev_release/)
     assert.match(deployBody, /activate_egress_release "\$BUILT_RELEASE" "\$egress_prev_release"/)
     assert.doesNotMatch(deployBody, /systemctl restart openclaude-v5-egress/)
   })
@@ -2079,7 +2268,8 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.requiredMigrations.includes('0164_admin_audit_model_admin_grant'))
     assert.ok(meta.requiredMigrations.includes('0166_prompt_queue'))
     assert.ok(meta.requiredMigrations.includes('0167_turn_waiver_receipts'))
-    assert.ok(meta.requiredMigrations.includes('0172_client_session_history_revision'))
+    assert.ok(meta.requiredMigrations.includes('0174_selfheal_release_safety_fences'))
+    assert.ok(meta.requiredMigrations.includes('0175_client_session_history_revision'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, [
       'model_authority_v1',
