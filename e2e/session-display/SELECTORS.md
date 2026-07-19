@@ -27,6 +27,7 @@
   (绝不祖先/后代双计)。user=`[data-testid=user-row], .flex.flex-col.items-end:has(.bg-bubble)`;
   assistant=`[data-testid=assistant-row], .group.flex.gap-4:has(.prose)`。故套件对"含 testid 的
   本分支构建"与"尚未部署 testid 的现网构建"都能跑(现网自验即靠回退)。
+- 过程卡顺序回归锚点:`team-panel` / `permission-card`；与 `assistant-row` 组成 DOM 全序断言。
 - user 状态标签 发送中/排队中/已送达/已读/已回复/发送失败(+重试按钮文案"重试")。
 - 加载完成判据:aria-label="正在加载会话历史" 消失 ∧ 出现 .prose/.bg-bubble。
 

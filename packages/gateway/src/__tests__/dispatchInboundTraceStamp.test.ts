@@ -267,6 +267,20 @@ test('inheritOutboundRouting: propagates traceId + _userId when present on out',
   assert.equal(r._userId, 'u1')
 })
 
+test('inheritOutboundRouting: propagates exact clientMessageId to permission-derived frames', () => {
+  const out = {
+    type: 'outbound.message',
+    sessionKey: 'sk1',
+    channel: 'webchat',
+    peer: { id: 'p1', kind: 'dm' as const },
+    blocks: [],
+    isFinal: false,
+    clientMessageId: 'm-user-1',
+  } as OutboundMessage
+  const r = _inheritOutboundRouting(out)
+  assert.equal(r.clientMessageId, 'm-user-1')
+})
+
 test('inheritOutboundRouting: explicit field list — non-routing extras on out do NOT leak', () => {
   // This is the v2-minor-2 guard: if `out` ever grows a non-routing field
   // (e.g. block buffers, per-turn meta), `_inheritOutboundRouting` must NOT
@@ -319,6 +333,7 @@ test('stripPrivateRoutingFields: permission_request shape — private fields rem
     sessionKey: 'sk1',
     channel: 'webchat',
     peer: { id: 'p1', kind: 'dm' as const },
+    clientMessageId: 'm-user-1',
     traceId: '01234567890abcdef01234567890abcd',
     _userId: 'u1',
     _connectionTraceId: 'c1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -338,6 +353,7 @@ test('stripPrivateRoutingFields: permission_request shape — private fields rem
   // public schema fields preserved
   assert.equal((wire as any).type, 'outbound.permission_request')
   assert.equal((wire as any).traceId, '01234567890abcdef01234567890abcd')
+  assert.equal((wire as any).clientMessageId, 'm-user-1')
   assert.equal((wire as any).requestId, 'r1')
   assert.equal((wire as any).toolName, 'Bash')
   // CRITICAL: serialise the wire — must not contain any private field name

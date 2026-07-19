@@ -41,6 +41,7 @@ import {
   resetReplyTracker,
   trackServerTs,
 } from "./model";
+import { repairPostFinalProcessOrder } from "./order";
 import { errorLabel } from "./render";
 
 /** teardown 后非 final 帧的压制时间窗(客户端同域):覆盖 stop 后 server 收尾期,不无界压制多端新 turn。*/
@@ -471,6 +472,9 @@ function mergeDelegateProgressIntoGroup(sess: ChatSession, groupMsg: ChatMessage
   if (standalone.error || standalone._isError) groupMsg._isError = true;
   if (standalone._completed && !groupMsg._completed) groupMsg._completed = true;
   if (standalone.completedAt && !groupMsg.completedAt) groupMsg.completedAt = standalone.completedAt;
+  if (groupMsg._source !== "server" && !groupMsg._turnOwnerId) {
+    groupMsg._turnOwnerId = standalone._turnOwnerId ?? standalone._clientMessageId;
+  }
   if (standalone.runId) {
     groupMsg._delegateRunId = standalone.runId;
     if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
@@ -549,6 +553,9 @@ function normalizeDelegateToolRow(sess: ChatSession, msg: ChatMessage): boolean 
     ? sess.messages.find((m) => m !== msg && m.role === "agent-group" && m.blockId === msg.blockId)
     : null;
   if (existingGroup) {
+    if (existingGroup._source !== "server" && !existingGroup._turnOwnerId) {
+      existingGroup._turnOwnerId = msg._turnOwnerId ?? msg._clientMessageId;
+    }
     const preview = friendlyDelegateResultPreview(msg.output);
     if (preview && !existingGroup._resultPreview) existingGroup._resultPreview = preview.slice(0, 200);
     if (msg.error) existingGroup._isError = true;
@@ -566,6 +573,9 @@ function normalizeDelegateToolRow(sess: ChatSession, msg: ChatMessage): boolean 
   msg._delegateAgentId = info.agentId;
   msg._delegateGoal = info.goalKey;
   msg._completed = !!msg._completed;
+  if (msg._source !== "server" && !msg._turnOwnerId) {
+    msg._turnOwnerId = msg._clientMessageId;
+  }
   const preview = friendlyDelegateResultPreview(msg.output);
   if (preview && !msg._resultPreview) msg._resultPreview = preview.slice(0, 200);
   if (msg.error) msg._isError = true;
@@ -739,7 +749,11 @@ function applyDelegatePhaseToGroup(sess: ChatSession, groupMsg: ChatMessage, blo
   }
 }
 
-function handleDelegateProgressBlock(sess: ChatSession, block: DelegateProgressBlock): void {
+function handleDelegateProgressBlock(
+  sess: ChatSession,
+  block: DelegateProgressBlock,
+  turnOwnerId?: string,
+): void {
   if (!block.runId) return;
   let groupMsgId = sess._delegateRunGroups?.get(block.runId);
   if (groupMsgId === undefined) {
@@ -758,6 +772,9 @@ function handleDelegateProgressBlock(sess: ChatSession, block: DelegateProgressB
   if (groupMsgId) {
     const groupMsg = sess.messages.find((m) => m.id === groupMsgId);
     if (groupMsg) {
+      if (groupMsg._source !== "server" && !groupMsg._turnOwnerId && turnOwnerId) {
+        groupMsg._turnOwnerId = turnOwnerId;
+      }
       applyDelegatePhaseToGroup(sess, groupMsg, block);
       return;
     }
@@ -781,6 +798,7 @@ function handleDelegateProgressBlock(sess: ChatSession, block: DelegateProgressB
       _delegateAgentId: block.agentId || "",
       _delegateGoal: goalRaw ? normalizeDelegateGoalKey(goalRaw) : "",
       _completed: false,
+      ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
     });
     if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
     sess._delegateRunGroups.set(block.runId, groupMsg.id);
@@ -799,6 +817,7 @@ function handleDelegateProgressBlock(sess: ChatSession, block: DelegateProgressB
       entries: [],
       childBlocks: [],
       _completed: false,
+      ...(turnOwnerId ? { _turnOwnerId: turnOwnerId } : {}),
     });
   }
   if (block.agentId) msg.agentId = block.agentId;
@@ -964,6 +983,11 @@ export function applyOutboundMessage(
     return;
   }
 
+  // Exact turn ownership for browser-only process cards.  Rolling legacy
+  // frames without an id may use the active turn, but an explicit frame id
+  // always wins and is never replaced with a nearby active turn.
+  const frameTurnOwnerId = frame.clientMessageId ?? sess._activeClientMessageId;
+
   // ── reconcile 'turn_state_unknown'(非 final,RFC §4)──
   // hello 对账时 server 对客户端上报的在飞 turn **无法给出终态**(durable inbox 无行且不是
   // negative proof)。此时**绝不清 _sendingInFlight** —— turn 可能仍在服务端执行,静默清态正是
@@ -1027,6 +1051,7 @@ export function applyOutboundMessage(
       sess._activeClientMessageId = undefined;
       clearTurnTiming(sess);
       resetReplyTracker(sess);
+      sess.messages = repairPostFinalProcessOrder(sess.messages);
       effects.onFinal?.(sess, frame, true, clientMessageId);
       return;
     }
@@ -1059,6 +1084,7 @@ export function applyOutboundMessage(
     resetReplyTracker(sess);
     // 该轮已在服务端收尾（含 imageEdit 结果图）：消解运行中占位，结果随 forceSync 回带。
     resolveGenPlaceholders(sess, extractImageEditJobId(frame));
+    sess.messages = repairPostFinalProcessOrder(sess.messages);
     effects.onFinal?.(sess, frame, false, clientMessageId);
     if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });
     else effects.forceSync?.(sess.id);
@@ -1196,7 +1222,7 @@ export function applyOutboundMessage(
           : "";
 
     if (b.kind === "delegate_progress") {
-      handleDelegateProgressBlock(sess, b as unknown as DelegateProgressBlock);
+      handleDelegateProgressBlock(sess, b as unknown as DelegateProgressBlock, frameTurnOwnerId);
       continue;
     }
 
@@ -1366,6 +1392,9 @@ export function applyOutboundMessage(
               existingTool._delegate = true;
               existingTool._delegateAgentId = fields._delegateAgentId;
               existingTool._delegateGoal = fields._delegateGoal;
+              if (!existingTool._turnOwnerId && frameTurnOwnerId) {
+                existingTool._turnOwnerId = frameTurnOwnerId;
+              }
               sess._agentGroups.set(tb.blockId, existingTool.id);
               sess._blockIdToMsgId?.set(tb.blockId, existingTool.id);
               adoptStandaloneDelegateRun(sess, existingTool);
@@ -1382,6 +1411,7 @@ export function applyOutboundMessage(
               childBlocks: [],
               ...agentFields,
               ...(delegateFields || {}),
+              ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
             });
             sess._agentGroups.set(tb.blockId, groupMsg.id);
             sess._blockIdToMsgId?.set(tb.blockId, groupMsg.id);
@@ -1390,6 +1420,9 @@ export function applyOutboundMessage(
             const groupMsgId = sess._agentGroups.get(tb.blockId);
             const groupMsg = sess.messages.find((m) => m.id === groupMsgId);
             if (groupMsg) {
+              if (groupMsg._source !== "server" && !groupMsg._turnOwnerId && frameTurnOwnerId) {
+                groupMsg._turnOwnerId = frameTurnOwnerId;
+              }
               if (desc && groupMsg.text !== desc) groupMsg.text = desc;
               if (delegateFields) {
                 groupMsg._delegate = true;
@@ -1636,6 +1669,7 @@ export function applyOutboundMessage(
     // 生成占位卡（需求 C）消解：本 turn 收尾 → imageEdit 结果图已作为 assistant 消息原位落地，
     // 删占位行。直投终帧回带顶层 imageEditJobId 时精确匹配；缺省按串行语义消解运行中占位（见函数注释）。
     resolveGenPlaceholders(sess, extractImageEditJobId(frame));
+    sess.messages = repairPostFinalProcessOrder(sess.messages);
     effects.onFinal?.(sess, frame, isCronOrHeartbeat, clientMessageId);
     // 服务重启掐断上游生成流的合成 final:有截断内容则自动续写(守卫在 socket 侧)。
     if (frame.meta?.interrupted === "service_restart") effects.scheduleRestartContinue?.(sess.id);
@@ -1897,6 +1931,9 @@ export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermiss
     inputPreview: frame.inputPreview || "",
     inputJson: frame.inputJson || null,
     _resolved: false,
+    ...((frame.clientMessageId ?? sess._activeClientMessageId)
+      ? { _turnOwnerId: frame.clientMessageId ?? sess._activeClientMessageId }
+      : {}),
   });
 }
 

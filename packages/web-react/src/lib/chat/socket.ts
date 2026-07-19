@@ -39,6 +39,7 @@ import {
   resetReplyTracker,
   shouldApplyGoalSnapshot,
 } from "./model";
+import { repairPostFinalProcessOrder } from "./order";
 import {
   isCollapsedTapeAnchor,
   isDispatchLostCode,
@@ -1915,7 +1916,14 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
+    const repairedStoredMessages = repairPostFinalProcessOrder(s.messages);
+    const repairedStoredOrder = repairedStoredMessages !== s.messages;
+    if (repairedStoredOrder) s.messages = repairedStoredMessages;
     this.sessions.set(stored.id, s);
+    // The persistence callback resolves the snapshot through this.sessions,
+    // so register the repaired session first.  A clean second load remains a
+    // zero-write fast path because the repair is idempotent.
+    if (repairedStoredOrder) this.deps.persistSession?.(stored.id);
     if (inFlightFresh) this.resetThinkingSafety(stored.id);
     this.scheduleNotify();
   }
@@ -2021,6 +2029,7 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
+    s.messages = repairPostFinalProcessOrder(s.messages);
     // 生成占位卡兜底消解:对账带回的 server 行若证明占位所属轮已在服务端收尾(锚点 user
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
@@ -2080,6 +2089,7 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
+    s.messages = repairPostFinalProcessOrder(s.messages);
     this.scheduleNotify();
   }
 

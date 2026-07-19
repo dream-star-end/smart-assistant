@@ -374,4 +374,20 @@ describe('OutboundPermissionRequest schema', () => {
       false,
     )
   })
+  it('accepts a valid clientMessageId and rejects an invalid turn id', () => {
+    assert.equal(
+      Value.Check(OutboundPermissionRequest, {
+        ...(baseOutboundPermissionRequest() as object),
+        clientMessageId: 'm-user_permission-1',
+      }),
+      true,
+    )
+    assert.equal(
+      Value.Check(OutboundPermissionRequest, {
+        ...(baseOutboundPermissionRequest() as object),
+        clientMessageId: 'contains spaces',
+      }),
+      false,
+    )
+  })
 })

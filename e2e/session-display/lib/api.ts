@@ -74,6 +74,17 @@ export class Api {
     return j.sessions ?? [];
   }
 
+  async currentUserId(token: string): Promise<string> {
+    const res = await fetch(`${this.base}/api/me`, { headers: this.authHeaders(token) });
+    if (!res.ok) throw new Error(`[api] me ${res.status}`);
+    const body: any = await res.json();
+    const id = body?.user?.id ?? body?.id;
+    if (id === undefined || id === null || String(id).length === 0) {
+      throw new Error('[api] me missing user id');
+    }
+    return String(id);
+  }
+
   async getSession(token: string, id: string, since?: number): Promise<SessionDetail> {
     const url = new URL(`${this.base}/api/sessions/${id}`);
     if (typeof since === 'number') url.searchParams.set('since', String(since));

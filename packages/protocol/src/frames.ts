@@ -741,6 +741,8 @@ export const OutboundPermissionRequest = Type.Object({
   peer: Peer,
   requestId: Type.String(),
   toolName: Type.String(),
+  /** Exact browser-authored user row that owns the turn which requested the permission. */
+  clientMessageId: Type.Optional(ClientMessageId),
   toolUseId: Type.Optional(Type.String()),
   inputPreview: Type.Optional(Type.String()),
   inputJson: Type.Optional(Type.Unknown()),

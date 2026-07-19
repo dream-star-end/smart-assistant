@@ -74,6 +74,7 @@ export function PermissionCard({
 
   return (
     <div
+      data-testid="permission-card"
       className={cn(
         "rounded-lg border bg-surface animate-in",
         tone === "allow" && "border-success/40",

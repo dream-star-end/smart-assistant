@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
+import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer } from "./MessageRenderer";
 import type { CardCallbacks } from "./chat/cards";
@@ -498,6 +499,47 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
     expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
     expect(screen.getByText(/1 完成/)).toBeInTheDocument();
     expect(screen.getByText(/1 超时/)).toBeInTheDocument();
+  });
+
+  test("旧缓存 empty incremental 自愈后：团队面板与用户问答 DOM 都在最终答复前", async () => {
+    const user = mk("user", {
+      id: "u-order",
+      text: "一起排查",
+      _orderSeq: 1,
+      _source: "server",
+    });
+    const final = mk("assistant", {
+      id: "a-order",
+      text: "最终修复结论",
+      _orderSeq: 2,
+      _source: "server",
+      _clientMessageId: user.id,
+    });
+    const poisoned = [
+      user,
+      final,
+      g("g-order-1", "排查前端", { _completed: true }),
+      g("g-order-2", "排查同步", { _completed: true }),
+      mk("permission", {
+        id: "p-order",
+        toolName: "AskUserQuestion",
+        requestId: "req-order",
+        _resolved: true,
+        _behavior: "deny",
+        _settledReason: "disconnect",
+        inputJson: { questions: [{ question: "是否继续？", options: [{ label: "继续" }] }] },
+      }),
+    ];
+    const repaired = applyServerIncremental(poisoned, []);
+
+    const { container } = renderList(repaired);
+    await screen.findByText("最终修复结论");
+    const team = container.querySelector('[data-testid="team-panel"]')!;
+    const permission = container.querySelector('[data-testid="permission-card"]')!;
+    const assistant = screen.getByText("最终修复结论").closest('[data-testid="assistant-row"]')!;
+    expect(team.compareDocumentPosition(permission) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(permission.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText("连接断开，已自动拒绝")).toBeInTheDocument();
   });
 });
 

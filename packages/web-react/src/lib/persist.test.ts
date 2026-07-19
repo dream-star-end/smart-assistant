@@ -643,6 +643,74 @@ describe("persist — 历史合并纯函数", () => {
     expect(twice.map((m) => m.id)).toEqual(once.map((m) => m.id));
   });
 
+  test("mergeFullServerWins: 已污染缓存 final 在前时也能自愈并保持重复 full 幂等", () => {
+    const user: ChatMessage = {
+      id: "u-poison",
+      role: "user",
+      text: "继续排查",
+      ts: 100,
+      _orderSeq: 1,
+      _source: "server",
+    };
+    const final: ChatMessage = {
+      id: "a-poison",
+      role: "assistant",
+      text: "排查完成",
+      ts: 500,
+      _orderSeq: 2,
+      _source: "server",
+      _clientMessageId: user.id,
+    };
+    const group: ChatMessage = {
+      id: "g-poison",
+      role: "agent-group",
+      text: "团队协作",
+      ts: 200,
+    };
+    const permission: ChatMessage = {
+      id: "p-poison",
+      role: "permission",
+      text: "AskUserQuestion",
+      ts: 300,
+      requestId: "req-poison",
+      _resolved: true,
+    };
+
+    const once = mergeFullServerWins([user, final], [user, final, group, permission]);
+    expect(once.map((message) => message.id)).toEqual([
+      "u-poison",
+      "g-poison",
+      "p-poison",
+      "a-poison",
+    ]);
+    expect(once.find((message) => message.id === "g-poison")?._turnOwnerId).toBe(user.id);
+    expect(once.find((message) => message.id === "p-poison")?._turnOwnerId).toBe(user.id);
+    const twice = mergeFullServerWins([user, final], once);
+    expect(twice.map((message) => message.id)).toEqual(once.map((message) => message.id));
+  });
+
+  test("applyServerIncremental: empty ?since response repairs poison and then stays zero-copy", () => {
+    const poisoned: ChatMessage[] = [
+      { id: "u1", role: "user", text: "问", ts: 1, _orderSeq: 1, _source: "server" },
+      {
+        id: "a1",
+        role: "assistant",
+        text: "答",
+        ts: 4,
+        _orderSeq: 2,
+        _source: "server",
+        _clientMessageId: "u1",
+      },
+      { id: "g1", role: "agent-group", text: "团队协作", ts: 2 },
+      { id: "p1", role: "permission", text: "用户问答", ts: 3, requestId: "req-1" },
+    ];
+
+    const repaired = applyServerIncremental(poisoned, []);
+    expect(repaired.map((message) => message.id)).toEqual(["u1", "g1", "p1", "a1"]);
+    expect(repaired).not.toBe(poisoned);
+    expect(applyServerIncremental(repaired, [])).toBe(repaired);
+  });
+
   test("mergeFullServerWins: 所有 local-only 行剥离伪造 _orderSeq,只有 server 可进入 durable axis", () => {
     const server: ChatMessage[] = [
       { id: "srv-1", role: "user", text: "一", ts: 100, _orderSeq: 1, _source: "server" },
