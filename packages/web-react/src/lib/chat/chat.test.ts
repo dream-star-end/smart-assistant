@@ -35,6 +35,8 @@ import {
   applyLegacyBridgeError,
   applyOutboundError,
   applyOutboundMessage,
+  applyPermissionRequest,
+  applyPermissionSettled,
   applyResumeFailed,
   applyTurnStatus,
   normalizeDelegateCards,
@@ -48,7 +50,11 @@ import {
   writeAutoContinuePreamblePref,
   type ChatSocketDeps,
 } from "./socket";
-import type { OutboundMessageWire } from "./frames";
+import type {
+  OutboundMessageWire,
+  OutboundPermissionRequestWire,
+  OutboundPermissionSettledWire,
+} from "./frames";
 
 // ─── helpers ──────────────────────────────────────────────────────────
 function sess(id = "s1", agentId = "main") {
@@ -986,10 +992,13 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
 
   test("delegate_progress start before delegate_task tool_use is adopted into one agent-group", () => {
     const s = sess();
+    const user = addMessage(s, "user", "开始委派", { id: "u-delegate-live", status: "sent" });
+    s._activeClientMessageId = user.id;
     applyOutboundMessage(
       s,
       msgFrame({
         frameSeq: 1,
+        clientMessageId: user.id,
         blocks: [
           {
             kind: "delegate_progress",
@@ -1008,6 +1017,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
       s,
       msgFrame({
         frameSeq: 2,
+        clientMessageId: user.id,
         blocks: [
           {
             kind: "tool_use",
@@ -1023,6 +1033,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     const groups = s.messages.filter((m) => m.role === "agent-group");
     expect(groups).toHaveLength(1);
     expect(groups[0]._delegateRunId).toBe("dlg-1");
+    expect(groups[0]._turnOwnerId).toBe(user.id);
     expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
   });
 
@@ -1746,6 +1757,60 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "实时输出")).toBe(true);
     expect(s._agentGroups?.get("nested-agent")).toBe("tool-hist");
     expect(s.messages.some((m) => m.role === "tool" || m.role === "delegate-progress")).toBe(false);
+  });
+});
+
+describe("process-card turn ownership", () => {
+  test("request uses exact clientMessageId and settlement retains the owner", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "需要确认", { id: "u-permission", status: "sent" });
+    s._activeClientMessageId = "different-active-turn";
+    const request: OutboundPermissionRequestWire = {
+      type: "outbound.permission_request",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      requestId: "req-owner",
+      toolName: "AskUserQuestion",
+      clientMessageId: user.id,
+      frameSeq: 1,
+    };
+
+    const card = applyPermissionRequest(s, request)!;
+    expect(card._turnOwnerId).toBe(user.id);
+
+    const settled: OutboundPermissionSettledWire = {
+      type: "outbound.permission_settled",
+      sessionKey: request.sessionKey,
+      channel: request.channel,
+      peer: request.peer,
+      requestId: request.requestId,
+      behavior: "deny",
+      reason: "disconnect",
+      frameSeq: 2,
+    };
+    applyPermissionSettled(s, settled);
+    expect(card._resolved).toBe(true);
+    expect(card._turnOwnerId).toBe(user.id);
+  });
+
+  test("persisted delegate tool conversion retains its exact turn owner", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "委派任务", { id: "u-delegate", status: "sent" });
+    s._activeClientMessageId = user.id;
+    const tool = addMessage(s, "tool", "delegate_task", {
+      id: "tool-delegate",
+      toolName: "delegate_task",
+      blockId: "block-delegate",
+      inputJson: { agentId: "coder", goal: "检查实现" },
+      _completed: true,
+    });
+    expect(tool._clientMessageId).toBe(user.id);
+
+    normalizeDelegateCards(s);
+
+    expect(tool.role).toBe("agent-group");
+    expect(tool._turnOwnerId).toBe(user.id);
   });
 });
 

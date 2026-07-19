@@ -107,6 +107,49 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
     expect(sess.title).toBe("live"); // 未被磁盘 "disk" 覆盖
     expect(sess.messages.map((m) => m.text)).toEqual(["live-msg"]); // 未被磁盘 d1 覆盖
   });
+
+  test("旧 IDB poison 注水即修复并只写回一次，第二次注水零迁移写", () => {
+    const persist = vi.fn();
+    const first = socket(persist);
+    first.loadStored(
+      storedFix("s-poison", {
+        _maxSeq: 2,
+        _historyRevision: 7,
+        messages: [
+          msg("u1", "问", { role: "user", _orderSeq: 1, _source: "server" }),
+          msg("a1", "最终答复", {
+            _orderSeq: 2,
+            _source: "server",
+            _clientMessageId: "u1",
+          }),
+          msg("g1", "团队协作", { role: "agent-group" }),
+          msg("p1", "用户问答", { role: "permission", requestId: "req-1", _resolved: true }),
+        ],
+      }),
+    );
+
+    expect(first.sessions.get("s-poison")!.messages.map((message) => message.id)).toEqual([
+      "u1",
+      "g1",
+      "p1",
+      "a1",
+    ]);
+    expect(persist).toHaveBeenCalledTimes(1);
+    const repairedSnapshot = first.toStored("s-poison")!;
+    expect(repairedSnapshot._maxSeq).toBe(2);
+    expect(repairedSnapshot._historyRevision).toBe(7);
+
+    const secondPersist = vi.fn();
+    const second = socket(secondPersist);
+    second.loadStored(repairedSnapshot);
+    expect(second.sessions.get("s-poison")!.messages.map((message) => message.id)).toEqual([
+      "u1",
+      "g1",
+      "p1",
+      "a1",
+    ]);
+    expect(secondPersist).not.toHaveBeenCalled();
+  });
 });
 
 describe("socket — toStored 序列化", () => {
@@ -202,6 +245,27 @@ describe("socket — applyServerMessages 合并 server canonical", () => {
     s.applyServerMessages("s1", "main", [msg("b", "S-b"), msg("c", "S-c")], false, 5);
     expect(sess.messages.map((m) => m.id)).toEqual(["a", "b", "c"]);
     expect(sess.messages.find((m) => m.id === "b")!.text).toBe("S-b");
+  });
+
+  test("empty partial reconcile：即使 messages=[] 也修复已污染的过程卡尾", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    sess.messages = [
+      msg("u1", "问", { role: "user", _orderSeq: 1, _source: "server" }),
+      msg("a1", "最终答复", {
+        _orderSeq: 2,
+        _source: "server",
+        _clientMessageId: "u1",
+      }),
+      msg("g1", "团队协作", { role: "agent-group" }),
+      msg("p1", "用户问答", { role: "permission", requestId: "req-1" }),
+    ];
+
+    s.applyServerMessages("s1", "main", [], false, 2, { historyRevision: 7 });
+
+    expect(sess.messages.map((message) => message.id)).toEqual(["u1", "g1", "p1", "a1"]);
+    expect(sess._maxSeq).toBe(2);
+    expect(sess._historyRevision).toBe(7);
   });
 
   test("_maxSeq 单调不回退", () => {

@@ -16,6 +16,7 @@
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage, ChatRoutingSnapshot } from "./chat/model";
 import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
+import { repairPostFinalProcessOrder } from "./chat/order";
 import {
   collapsedAnchorTerminalKind,
   DISPATCH_ERROR_ROW_ID_PREFIX,
@@ -484,6 +485,7 @@ export function mergeFullServerWins(
     invalidateProjectionCache?: boolean;
   },
 ): ChatMessage[] {
+  local = repairPostFinalProcessOrder(local);
   const hasExactCompletionEvidence =
     !!completedClientMessageId &&
     server.some(
@@ -561,7 +563,9 @@ export function mergeFullServerWins(
           isLocallyExpandedTapeRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
-    return applyHistoryProjectionPatches(stableSortByTs(serverChanged ? serverMerged : server));
+    return repairPostFinalProcessOrder(
+      applyHistoryProjectionPatches(stableSortByTs(serverChanged ? serverMerged : server)),
+    );
   }
   const safeByOriginal = new Map<ChatMessage, ChatMessage>();
   for (const m of [...preservedMid, ...tail]) safeByOriginal.set(m, sanitizePreservedLocalRow(m));
@@ -572,7 +576,9 @@ export function mergeFullServerWins(
   );
   if (!hasDurableOrderAxis) {
     // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
-    return applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]));
+    return repairPostFinalProcessOrder(
+      applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail])),
+    );
   }
   // 中段 client-owned 行若在拼接时离开本地原槽，会错误继承 server 尾行的排序锚点。
   // 一方面按原 local 插入序重建槽位；另一方面保留一次性 anchor override，明确冻结其
@@ -617,7 +623,9 @@ export function mergeFullServerWins(
       if (m?.id) emittedServerIds.add(m.id);
     }
   }
-  return applyHistoryProjectionPatches(stableSortByTs(inLocalOrder, anchorOverrides));
+  return repairPostFinalProcessOrder(
+    applyHistoryProjectionPatches(stableSortByTs(inLocalOrder, anchorOverrides)),
+  );
 }
 
 /**
@@ -635,6 +643,7 @@ export function applyServerIncremental(
     activeClientMessageId?: string;
   },
 ): ChatMessage[] {
+  local = repairPostFinalProcessOrder(local);
   if (!incoming.length) return local;
   if (
     completedClientMessageId &&
@@ -663,7 +672,7 @@ export function applyServerIncremental(
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return applyHistoryProjectionPatches(stableSortByTs(merged));
+  return repairPostFinalProcessOrder(applyHistoryProjectionPatches(stableSortByTs(merged)));
 }
 
 /**
@@ -673,12 +682,15 @@ export function applyServerIncremental(
  * 按 `_orderSeq` 归位。无新增时**返回原引用**(零拷贝,免无谓重渲)。
  */
 export function mergeArchivedHistory(local: ChatMessage[], archived: ChatMessage[]): ChatMessage[] {
+  local = repairPostFinalProcessOrder(local);
   if (!archived.length) return local;
   const existing = new Set<string>();
   for (const m of local) if (m?.id) existing.add(m.id);
   const add = archived.filter((m) => m?.id && !existing.has(m.id));
   if (!add.length) return local;
-  return applyHistoryProjectionPatches(stableSortByTs([...add, ...local]));
+  return repairPostFinalProcessOrder(
+    applyHistoryProjectionPatches(stableSortByTs([...add, ...local])),
+  );
 }
 
 /** `_orderSeq ≤ 归档水位` = server 已把该行搬进归档 chunk。 */

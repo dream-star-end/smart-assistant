@@ -22,6 +22,7 @@
 | 5 | `05-error-projection` | 注入 terminal(not_accepted)+active projection→"消息未开始处理/已确认未计费"卡+重试；revoked 不显示 | — | **§9 + DB 注入**（否则 skip） |
 | 6 | `06-archive-paging` | 归档逐页拉取：无重复行 / 空页不谎报 hasMore / 游标严格递减 / 有限步终止 | — | 无（负例亦可自验） |
 | 7 | `07-resend-dedup` | 同 clientMessageId 协议级双发→不出双回复、不双计费（服务端幂等 `web:<cmid>:0`） | — | 真 turn(WS) |
+| 8 | `08-post-final-process-order` | 原始 IDB poison + `?since=2` 空增量→过程卡回到 final 前、写回 IDB、二次 reload 稳定 | — | canary + 浏览器路由拦截 |
 
 `@smoke` 子集（1/2/4）供部署门用：`./run.sh --grep @smoke`。用例 2 未部署 §9 时自动 skip，
 不会把 smoke 门判红。
@@ -73,6 +74,7 @@ OC_E2E_SSH_HOST=kl-mirror OC_E2E_REMOTE_PORT=18790 ./run.sh
 
 # 跑单条
 ./run.sh 03-reconnect-inflight.spec.ts
+./run.sh 08-post-final-process-order.spec.ts
 
 # 已有直达地址（不建隧道）
 OC_E2E_BASE_URL=http://127.0.0.1:18790 OC_E2E_PASSWORD=… ./run.sh
@@ -113,7 +115,8 @@ PASS/FAIL/SKIP + skip 原因。报告落 `reports/html/index.html`（`npm run re
 ## 维护须知
 
 - 关键节点已在 `packages/web-react` 补 `data-testid`：`user-row` / `assistant-row` /
-  `message-text`（user 气泡）/ `collapse-card`（§9 折叠卡）。assistant 正文仍走既有稳定
+  `message-text`（user 气泡）/ `collapse-card`（§9 折叠卡）/ `team-panel` /
+  `permission-card`。assistant 正文仍走既有稳定
   `.prose`（避免侵入共享 `Markdown` 组件）。改这些组件时保持 testid。
 - 文案类断言（错误卡"消息未开始处理/已确认未计费"、折叠卡"本轮完整输出…"）来自 §5/§9
   契约；前端改文案需同步 `lib/ui.ts` 的 `TEXT`/选择器。

@@ -30,6 +30,8 @@ export const SEL = {
   typing: (p: Page): Locator => p.locator('[aria-label="生成中"]'),
   historySkeleton: (p: Page): Locator => p.locator('[aria-label="正在加载会话历史"]'),
   collapseCard: (p: Page): Locator => p.getByTestId('collapse-card'),
+  teamPanel: (p: Page): Locator => p.getByTestId('team-panel'),
+  permissionCard: (p: Page): Locator => p.getByTestId('permission-card'),
   // 侧栏会话项
   selectedSession: (p: Page): Locator => p.locator('[aria-current="true"]'),
   // 错误卡

@@ -171,7 +171,7 @@ export const TeamPanel = memo(
     const collapsed = userCollapsed ?? (allDone && !everActive);
 
     return (
-      <div className="rounded-xl border border-border bg-surface animate-in">
+      <div className="rounded-xl border border-border bg-surface animate-in" data-testid="team-panel">
         <button
           type="button"
           onClick={() => setUserCollapsed(!collapsed)}
