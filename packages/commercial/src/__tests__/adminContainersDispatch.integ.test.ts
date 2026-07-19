@@ -26,6 +26,7 @@ import type Docker from "dockerode";
 import { createPool, closePool, setPoolOverride, resetPool, getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import {
   adminRestartContainer,
   adminStopContainer,
@@ -39,27 +40,6 @@ import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "system_settings",
-  "users",
-  "schema_migrations",
-];
 
 let pgAvailable = false;
 
@@ -80,8 +60,7 @@ async function probe(): Promise<boolean> {
 }
 
 async function cleanCommercialSchema(): Promise<void> {
-  const sql = `DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`;
-  await query(sql);
+  await resetTestSchemaForTest();
 }
 
 before(async () => {
@@ -99,7 +78,6 @@ before(async () => {
 
 after(async () => {
   if (!pgAvailable) return;
-  try { await cleanCommercialSchema(); } catch { /* */ }
   await closePool();
   resetPool();
 });
@@ -141,8 +119,8 @@ async function insertV2Container(uid: number): Promise<bigint> {
   );
   const r = await query<{ id: string }>(
     `INSERT INTO agent_containers
-       (user_id, subscription_id, docker_name, workspace_volume, home_volume, image, status)
-     VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, 'running')
+       (user_id, subscription_id, docker_name, workspace_volume, home_volume, image, secret_hash, status)
+     VALUES ($1::bigint, $2::bigint, $3, $4, $5, $6, $7::bytea, 'running')
      RETURNING id::text`,
     [
       String(uid),
@@ -151,6 +129,7 @@ async function insertV2Container(uid: number): Promise<bigint> {
       `oc-ws-u${uid}`,
       `oc-home-u${uid}`,
       "openclaude/agent-runtime:test",
+      Buffer.alloc(32, 1),
     ],
   );
   return BigInt(r.rows[0]!.id);

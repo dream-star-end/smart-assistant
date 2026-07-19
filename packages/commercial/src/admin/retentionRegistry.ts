@@ -53,6 +53,7 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
   // 批D D3 新增:session_goals 终态离场,由 auditRetentionSweeper tick 驱动
   // (sweepTerminalSessionGoals,见 auditRetention.ts)。
   session_goals: "auditRetentionSweeper.sweepTerminalSessionGoals (admin/auditRetention.ts)",
+  // 0170 durable dispatch:open/manual 未收敛行永久保留；只有已收敛终态按双龄列规则清理。
   turn_dispatches: "auditRetentionSweeper.sweepResolvedTurnDispatches (admin/auditRetention.ts)",
 };
 
@@ -150,8 +151,7 @@ export const DURABLE_TABLES: readonly string[] = [
   "skill_search_log",
   "subscription_plans",
   "system_settings",
-  // Derived read projection; deleteClientSession removes it with the owning
-  // session and no independent time-based sweep is required.
+  // 0170 会话 tape 的只读派生投影；会话删除路径显式清理，权威 tape 不依赖本表。
   "tape_chat_projection",
   "topup_plans",
   // 精确轮次退款幂等栅栏兼具账务回溯凭据；与 credit_ledger/usage_records 同档，

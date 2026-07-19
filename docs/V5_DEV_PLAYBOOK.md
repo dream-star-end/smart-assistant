@@ -279,14 +279,26 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 > 已坏项继续告警，monitor/部署/cutover 共用远端 flock，smoke 后按 schema+nonce 清理，
 > 超时仍坏立即升级真实事故；可信且全健康的 stale schema=1 可自动清，其他 stale marker
 > 保留但不阻塞部署、全程 fail-open。禁止人工造 marker。
-> **E2E 旅程门(2026-07-18 附件事故补强)**:deploy 与 --dist 的每个成功出口在
-> end_planned_maintenance 后必跑 `smoke_e2e_journey`——部署发起机本机起真 Chromium,
-> 自建 ssh 隧道走线上核心旅程(UI 登录/附件全链含 filechooser/目标入口/带附件发送)。
-> 失败=fail-loud 非零退出(部署判定失败,截图在 /tmp/e2e-journey-fail-*.png,人工裁定
-> --rollback 或修断言);第一期**不进 validation 自动回滚链**(UI 断言有文案漂移假阳性面,
-> 连续两周零假阳性后升级,升级时同步 v5ReleaseSafety 断言)。`V5_SMOKE_E2E=0` 显式豁免
-> (紧急场景,事后必须补跑)。依赖:部署树 node_modules 需含 playwright-core(npm install),
-> 缺失门会 fail-loud 指引。接线契约由 v5ReleaseSafety.test.ts 锁定(四出口+函数体)。
+> **E2E 旅程门(2026-07-18 附件事故补强;同日门禁审计批A 升级二期)**:
+> `smoke_e2e_journey` 已进 **validation 补偿链**——deploy/--dist 在激活后、
+> end_planned_maintenance 前调用,失败=与 full smoke 同级 → 对称补偿回滚旧 release
+> (一期"成功出口 post-live 只喊不撤"废止;J5 已实证真阳性捕获)。防 flake 毒化回滚链:
+> 失败自动重试恰好一次全新旅程(确定性回归两跑必双红),重试通过强制 flake 记账
+> (kl-mirror e2e-journey-flake.json,monitor 7 天窗 warning)。`V5_SMOKE_E2E=0`/
+> `V5_SMOKE_TURN=0` 豁免会写持久 waiver marker,monitor 持续告警直到对应门真跑通过
+> (smoke_* 成功自动清除)——豁免必须补跑,没有静默旁路。依赖:部署树 node_modules 需含
+> playwright-core,缺失 fail-loud。接线契约由 v5ReleaseSafety.test.ts 锁定(补偿链形态+
+> 函数体+dist 对称补偿+finalize/canary 功能门)。
+> **批A 一并收口**:--dist 激活后校验失败走 compensate_dist_activation 对称回滚(此前
+> set -e 裸退出留坏 dist);finalize 提交 stable 前(停旧 unit 前)必过真 turn+E2E,失败
+> 转 aborting;canary READY+内部验证后必过 candidate 真 turn,不过不准放量。
+> **turn canary 矩阵(批B)**:三格 codex-new/ccb-new(模型从 /api/models 运行时解析)/
+> codex-reuse(固定 peerId 持久会话),每格三信号;timeout 720。
+> **env 必备键门(批E)**:deploy/--dist 在 build 前 fail-closed 校验远端 env 含
+> deploy/v5/required-env-keys.txt 全部键(新增关键凭据必须登记清单)。
+> **持续探针(批B/F)**:kl-mirror timer 30min 矩阵轮转真 turn + 本机 timer 60min E2E
+> 旅程与 session-display @smoke,结果落 /var/lib/openclaude-v5/*.json,由 v5-monitor
+> 消费(未安装/失败/陈旧都告警);安装=scripts/install-v5-probes.sh(经 mutation lease)。
 ```bash
 cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件会被 rsync 上去)
 git status --porcelain                       # 必须为空
@@ -521,6 +533,12 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 | kimi-k3 512k 用户档无计费边界硬顶 | 非 admin 的 512k 窗口分档(modelRolePolicy)**只是投影/执行窗口,不是计费上限**:上限的唯一执行点=客户端 CCB auto-compact(descriptor.contextWindow 驱动),master/egress 侧无按角色的 input token 硬顶(staticKeyProviders 的 maxInputTokens 是 provider 级 1M,非角色级)。故单个超大 turn 可越过 512k 一路冲到 1M 机制窗口、按 kimi 费率计费,普通用户成本短时越出预期档位 | 出现成本异常投诉,或单 turn 输入 P99 > 600k(监控)时:在签发/egress 面补按角色的 input token 硬顶(413 拒),把 512k 从"投影提示"升格为"计费边界" |
 | moonshot 直连仅验非流式 happy-path | kimi-k3 上游(api.kimi.com/coding,x-api-key)接入只实测了非流式 happy-path(staticKeyProviders 注释所载);**streaming 下 tool_use 的 input_json_delta 是否真增量到达、真实 429 错误信封形态是否匹配 CCB Anthropic 错误解析器(getAssistantMessageFromError 的 429 分支:anthropic-ratelimit-unified-* 头 / `{error:{message}}` 内层提取 / retry-after 头)均未实测** | 部署后人工跑一次 `scripts/probe-moonshot-kimi.mjs`(要真钱+生产 key,不进 CI):streaming 增量断言 + 打真 429 dump 信封与解析器期望比对,通过后销此债 |
 | 0160 系新模型迁移 profile 契约 | **model_catalog capability_profile 必须 snake_case**(parseCapabilityProfile wire 契约;07-17 camelCase 曾致快照重建 fail-closed、模型列表面 503 六分钟)。契约测试 migrationCapabilityProfiles.test.ts 已锁死全部写 profile 的迁移;新模型迁移必须 catalog 行先于 pricing 行(ensure_for_pricing 派生函数不认识新 id 会按 anthropic/200k 建错行),catalog 写走 fn_model_stage_version→fn_model_activate(0144 起禁直插 active) | —(已由测试机制守护,此行留作认知锚) |
+| session-display @smoke 未进部署回滚链(07-18 批F) | 会话展示/持久化/重连收敛层(durable-turn 事故类)已有小时级探针(v5-e2e-probe.sh 附带跑 @smoke,monitor e2e_sd_probe 消费),但未挂 deploy validation 链——与旅程门同一成熟路径 | 探针连续两周零假阳性 → 把 @smoke 子集(01/02/04)挂进 deploy() validation 链(参照 smoke_e2e_journey 形态,同步 v5ReleaseSafety 断言) |
+| 进程内 turn 全链路串联测试未建(07-18 批F) | 受理→派发→执行→持久化→前端渲染仍是 4 段分测,段间接缝(乐观上屏≠送达/goal 404 被吞类)只有线上探针能抓;跨包 in-process harness 是多天工程,不半吊子上 | 下一次 turn 链路架构改动(如重派 outbox 批)时随批立项:以 e2e/session-display 的行为契约为蓝本建 in-process harness(桩引擎+真 PG) |
+| commercial-integ 基线 bootstrap 中(07-18 批C) | integ 门已进 CI 但基线为空,首轮 CI 暴露 CI 环境存量失败集后须从 TAP artifact 登记(流程见基线头注),随后把 commercial-integ 加入 required checks | 本批 PR 首轮 CI 跑完即 bootstrap;绿后 `gh api PATCH required_status_checks` 补入 |
+| browser-tests waived 7 组件待扩面(07-18 批D) | coverage-manifest.json waived 区:cards/LibraryPanel/MemoryPanel/CreateOrgWizard/OrgTopupDialog/FeedbackTab/KP 面板——豁免有书面理由但仍是 jsdom 假阴性风险面 | 每月扩面一批(转 covered);新事故命中 waived 文件=立即转 |
+| biome/agent-containers-sql/evals 不入 CI(07-18 批C) | biome 存量 3614 错误、agent-containers-sql lint 6 处存量违规(state 过滤缺失,涉计费/admin 查询,须逐个人工裁定)、evals 需真实 LLM key | biome=专项清理批(改动面大,单独立项);sql lint=逐处裁定后入 repo-lints;evals=接 canary 账号周跑 timer 而非 PR 门 |
+| web-react 包级 typecheck 不在任何门(07-18 批D 发现) | 根级 tsc --build 不含 web-react 的 vitest 测试文件,包级 `tsc -b` 才含且有存量类型错(turnErrorTaxonomy.contract.test.ts .waivable 访问)——测试文件的类型腐化无门可拦 | 修完存量类型错后把 `cd packages/web-react && npm run typecheck` 并入 CI web-react cell |
 | 知识库 org 化 | research_documents/artifacts 租户主键 (user_id,doc_id) + 引用权威链须跨 user 重构 | P3.1 稳定后单独立项 |
 | 多 org 归属 | V1 单 active org(uq_user_active_org);放开=删索引+payer 选择+/api/org 显式 org_id | 真实客户需求 |
 | org 钱包锁竞争 | 同 org 高并发扣费串行化于 orgs 行锁(spendTwoBucket FOR UPDATE) | 大客户并发异常时改乐观扣减 |

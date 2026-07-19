@@ -17,8 +17,8 @@
  *   3. body `error.code === "RATE_LIMITED"`
  *
  * 每个端点用独立 scope 避免桶串扰。`/api/auth/register` 依赖
- * `DEFAULTS.allow_registration=true`(systemSettings.ts:108),handlers.ts:387
- * 前置门默认放行 → 走到 enforceRateLimit;无需 setSystemSetting。
+ * `allow_registration=true`；本文件在每个 case 前显式写入，避免生产默认关停
+ * 让请求在 rate-limit 之前返回 403。
  */
 
 import { describe, test, before, after, beforeEach } from "node:test";
@@ -29,6 +29,7 @@ import IORedis from "ioredis";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { warmupLoginDummyHash } from "../auth/login.js";
@@ -44,29 +45,12 @@ const REQUIRE_TEST_DB =
 
 const JWT_SECRET = "z".repeat(64);
 
-/** 防线:DROP SCHEMA 杀伤面大,强制 dbname 以 `_test` 结尾,unmet 直接 throw。 */
-function assertTestDatabase(url: string): void {
-  let dbName: string;
-  try {
-    dbName = new URL(url).pathname.replace(/^\//, "");
-  } catch {
-    throw new Error(`invalid TEST_DATABASE_URL: ${url}`);
-  }
-  if (!dbName.endsWith("_test")) {
-    throw new Error(
-      `refusing to reset non-test database: ${dbName} (must end with _test)`,
-    );
-  }
-}
-
 /** 全量 migration 创建 40+ 表,手工维护白名单成本高 + 容易遗漏新表(如
  *  admin_alert_channels)。DROP SCHEMA CASCADE 一次清干净,
  *  CREATE SCHEMA 后由 runMigrations() 全量重建。
- *  仅用于测试 DB,assertTestDatabase 阻挡 prod 误炸。 */
+ *  仅用于测试 DB,resetTestSchemaForTest 按实际 current_database() 阻挡 prod 误炸。 */
 async function cleanCommercialSchema(): Promise<void> {
-  assertTestDatabase(TEST_DB_URL);
-  await query("DROP SCHEMA IF EXISTS public CASCADE");
-  await query("CREATE SCHEMA public");
+  await resetTestSchemaForTest();
   await query("GRANT ALL ON SCHEMA public TO public");
 }
 
@@ -124,17 +108,6 @@ before(async () => {
     await cleanCommercialSchema();
     await runMigrations();
     await warmupLoginDummyHash();
-    // 2026-05-25:DEFAULTS.allow_registration 已翻 false(生产关停),但本套 case
-    // 是验证 /api/auth/register 路由级 rate-limit wiring(需要前置门放行才走到
-    // enforceRateLimit)。一次性 UPSERT system_settings 让 row 存在 + value=true
-    // 覆盖默认。beforeEach 只 TRUNCATE user-data 表,不动 system_settings → 全套
-    // case 共享这条 setting,且与生产关停默认互不影响。
-    await query(
-      `INSERT INTO system_settings(key, value, updated_at)
-       VALUES ('allow_registration', 'true'::jsonb, NOW())
-       ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value, updated_at = NOW()`,
-    );
   } else if (REQUIRE_TEST_DB) {
     throw new Error("Postgres test fixture required");
   }
@@ -189,7 +162,6 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
     await closePool();
   }
 });
@@ -197,6 +169,14 @@ after(async () => {
 beforeEach(async () => {
   if (!pgAvailable || !redis) return;
   await query("TRUNCATE TABLE refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  // users 的 TRUNCATE ... CASCADE 会连带清掉带 updated_by FK 的 system_settings；
+  // 每个 case 都重新开启注册，确保请求能越过开关并真正命中 rate-limit wiring。
+  await query(
+    `INSERT INTO system_settings(key, value, updated_at)
+     VALUES ('allow_registration', 'true'::jsonb, NOW())
+     ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = NOW()`,
+  );
   await redis.flushdb();
   mailer.sent.length = 0;
 });
@@ -247,8 +227,8 @@ function assertRateLimited(r: { status: number; json: Record<string, unknown>; h
 describe("AINV-6 — auth endpoints rate-limit wired", () => {
   test("/api/auth/register: 第 4 次返 429 RATE_LIMITED + Retry-After", async (t) => {
     if (skipIfMissing(t)) return;
-    // DEFAULTS.allow_registration=true(systemSettings.ts:108)→ handlers.ts:387 前置门
-    // 默认放行,无需 setSystemSetting。前 3 次走业务(空 body → register zod 拒,400/422 等)桶 +1
+    // beforeEach 显式开启 allow_registration；前 3 次走业务
+    // (空 body → register zod 拒,400/422 等)并让桶 +1。
     for (let i = 0; i < 3; i++) {
       const r = await postJson("/api/auth/register", {});
       assert.notEqual(r.status, 429, `第 ${i + 1} 次不该已经 429`);
@@ -283,7 +263,7 @@ describe("AINV-6 — auth endpoints rate-limit wired", () => {
 
   test("三端点桶相互独立(同 IP 注册满 cap 不影响 login/verify-email)", async (t) => {
     if (skipIfMissing(t)) return;
-    // 注册路径靠 DEFAULTS.allow_registration=true 默认放行(systemSettings.ts:108)
+    // 注册路径由 beforeEach 的 allow_registration=true 放行。
     // register 打满 4 次(第 4 次本身就 429)
     for (let i = 0; i < 3; i++) await postJson("/api/auth/register", {});
     const reg4 = await postJson("/api/auth/register", {});

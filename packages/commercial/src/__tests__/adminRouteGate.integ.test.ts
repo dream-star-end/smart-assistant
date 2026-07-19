@@ -22,6 +22,7 @@ import type { MailMessage, Mailer } from '../auth/mail.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import { createCommercialHandler } from '../http/router.js'
 import { wrapIoredis } from '../middleware/rateLimit.js'
 
@@ -85,8 +86,7 @@ before(async () => {
   process.env.COMMERCIAL_METRICS_BEARER = METRICS_BEARER
   await resetPool()
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
-  await query('DROP SCHEMA IF EXISTS public CASCADE')
-  await query('CREATE SCHEMA public')
+  await resetTestSchemaForTest()
   await query('GRANT ALL ON SCHEMA public TO public')
   await runMigrations()
   redis = await probeRedis()

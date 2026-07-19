@@ -45,37 +45,43 @@ export async function getModelCatalogCache(): Promise<ModelCatalogCache> {
   if (starting) return starting;
   starting = (async () => {
     const c = new ModelCatalogCache();
-    c.onError = (err) => {
-      log.error("catalog_cache_error", { err: (err as Error)?.message ?? String(err) });
-    };
-    // 每次重建(含 admin 激活触发的 NOTIFY)都体检一遍能力上限:配错的行要在被第一个用户
-    // 撞到之前喊出来。这里只能告警(NOTIFY 回调里抛没人接);启动路径下面会硬断言。
-    c.onRebuild = (snap) => {
-      const violations = checkSnapshotCapabilities(snap);
+    try {
+      c.onError = (err) => {
+        log.error("catalog_cache_error", { err: (err as Error)?.message ?? String(err) });
+      };
+      // 每次重建(含 admin 激活触发的 NOTIFY)都体检一遍能力上限:配错的行要在被第一个用户
+      // 撞到之前喊出来。这里只能告警(NOTIFY 回调里抛没人接);启动路径下面会硬断言。
+      c.onRebuild = (snap) => {
+        const violations = checkSnapshotCapabilities(snap);
+        if (violations.length > 0) {
+          log.error("catalog_capability_violations", { violations });
+        }
+      };
+      await c.rebuild();
+      await c.startListener();
+      // 启动断言(方案 §4 "启动/激活期断言"):enforce 期一条违规就拒启 —— 带着"声明能识图但
+      // 上游是纯文本端点"这种行上线,等于给用户发一个必然 400 的模型。
+      const violations = checkSnapshotCapabilities(c.current());
       if (violations.length > 0) {
-        log.error("catalog_capability_violations", { violations });
+        if (isModelAuthorityEnforced()) {
+          throw new Error(
+            `[model-catalog] capability exceeds provider mechanism limits: ${violations.join("; ")}`,
+          );
+        }
+        log.error("catalog_capability_violations_shadow", { violations });
       }
-    };
-    await c.rebuild();
-    await c.startListener();
-    // 启动断言(方案 §4 "启动/激活期断言"):enforce 期一条违规就拒启 —— 带着"声明能识图但
-    // 上游是纯文本端点"这种行上线,等于给用户发一个必然 400 的模型。
-    const violations = checkSnapshotCapabilities(c.current());
-    if (violations.length > 0) {
-      if (isModelAuthorityEnforced()) {
-        throw new Error(
-          `[model-catalog] capability exceeds provider mechanism limits: ${violations.join("; ")}`,
-        );
-      }
-      log.error("catalog_capability_violations_shadow", { violations });
+      cache = c;
+      log.info("catalog_cache_ready", {
+        securityEpoch: c.current().securityEpoch.toString(),
+        executionRevision: c.current().executionRevision.slice(0, 12),
+        enforced: isModelAuthorityEnforced(),
+      });
+      return c;
+    } catch (err) {
+      // startListener 之后的能力断言也可能失败；失败启动必须关闭已开的 LISTEN socket。
+      await c.shutdown();
+      throw err;
     }
-    cache = c;
-    log.info("catalog_cache_ready", {
-      securityEpoch: c.current().securityEpoch.toString(),
-      executionRevision: c.current().executionRevision.slice(0, 12),
-      enforced: isModelAuthorityEnforced(),
-    });
-    return c;
   })().finally(() => {
     starting = null;
   });
@@ -85,6 +91,18 @@ export async function getModelCatalogCache(): Promise<ModelCatalogCache> {
 /** 已初始化的 cache(未初始化 → null)。诊断/装配判定用,不做懒初始化。 */
 export function peekModelCatalogCache(): ModelCatalogCache | null {
   return cache;
+}
+
+/**
+ * 关闭并复位进程级 catalog 单例。gateway shutdown / 同进程测试热重启必须走这里；
+ * 只关 Pool 不会关闭独立的 PostgreSQL LISTEN Client，会让进程永久持有 socket。
+ */
+export async function shutdownModelCatalogCache(): Promise<void> {
+  const pending = starting;
+  if (pending) await pending.catch(() => undefined);
+  const current = cache;
+  cache = null;
+  if (current) await current.shutdown();
 }
 
 /**

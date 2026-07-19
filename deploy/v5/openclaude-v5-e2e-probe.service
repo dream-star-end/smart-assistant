@@ -1,0 +1,16 @@
+# v5 线上持续 E2E 旅程探针(2026-07-18 门禁审计批B)—— 安装在**部署发起机本机**
+# (非 kl-mirror:E2E 需真 Chromium,与 deploy 时 E2E 门同形态,本机起浏览器+ssh 隧道)。
+# 每 60 分钟走一遍线上核心旅程(登录/附件/目标/发送/送达),结果经 ssh 写回 kl-mirror
+# /var/lib/openclaude-v5/e2e-probe.json,由 v5-monitor.sh check_e2e_probe 消费(含
+# staleness:本机宕机/timer 失效 → 探针文件陈旧 → monitor 告警"探针失联",fail-visible)。
+[Unit]
+Description=OpenClaude v5 continuous E2E journey probe (local Chromium, every 60min)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5-aurora
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/bash scripts/v5-e2e-probe.sh
+TimeoutStartSec=600

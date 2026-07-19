@@ -177,10 +177,20 @@ function buildFakePool(): FakePoolHandle {
       // maintenance_mode = false(无 row → DEFAULTS)
       return { rows: [], rowCount: 0 };
     }
+    if (head.startsWith("SELECT U.CREDITS::TEXT AS WALLET")) {
+      return { rows: [{ wallet: "99999999", period: "0" }], rowCount: 1 };
+    }
+    if (head.startsWith("SELECT (O.CREDITS + COALESCE(OS.PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
     if (head.startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")) return { rows: [], rowCount: 1 };
     if (head.startsWith("UPDATE REQUEST_FINALIZE_JOURNAL")) return { rows: [], rowCount: 1 };
     if (head.startsWith("INSERT INTO USAGE_RECORDS")) return { rows: [{ id: "1" }], rowCount: 1 };
+    if (head.startsWith("SELECT M.ORG_ID::TEXT AS ORG_ID")) return { rows: [], rowCount: 0 };
     if (head.startsWith("SELECT CREDITS")) return { rows: [{ credits: "99999999" }], rowCount: 1 };
+    if (head.startsWith("SELECT ID::TEXT AS ID, PERIOD_CREDITS::TEXT AS PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
     if (head.startsWith("UPDATE USERS SET CREDITS")) return { rows: [], rowCount: 1 };
     if (head.startsWith("INSERT INTO CREDIT_LEDGER")) return { rows: [{ id: "101" }], rowCount: 1 };
     if (head.startsWith("UPDATE USAGE_RECORDS SET LEDGER_ID")) return { rows: [], rowCount: 1 };
@@ -399,6 +409,13 @@ class MockRes {
     if (!this.listeners.has(ev)) this.listeners.set(ev, []);
     this.listeners.get(ev)!.push(cb);
     return this;
+  }
+  once(ev: string, cb: (...a: unknown[]) => void): this {
+    const wrapped = (...args: unknown[]) => {
+      this.off(ev, wrapped);
+      cb(...args);
+    };
+    return this.on(ev, wrapped);
   }
   off(ev: string, cb: (...a: unknown[]) => void): this {
     const arr = this.listeners.get(ev);

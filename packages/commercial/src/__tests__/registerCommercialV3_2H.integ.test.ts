@@ -26,6 +26,7 @@ import {
 } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { registerCommercial, type RegisterCommercialResult } from "../index.js";
 import { signAccess } from "../auth/jwt.js";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
@@ -38,14 +39,6 @@ const TEST_REDIS_URL =
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
-const COMMERCIAL_TABLES = [
-  "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
-  "agent_subscriptions", "user_preferences", "request_finalize_journal",
-  "orders", "topup_plans", "usage_records",
-  "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
-  "email_verifications", "users", "schema_migrations",
-];
-
 let pgAvailable = false;
 const ORIGINAL_ENV: Record<string, string | undefined> = {};
 
@@ -55,6 +48,7 @@ function snapshotEnv(): void {
     "COMMERCIAL_AUTO_MIGRATE", "OPENCLAUDE_KMS_KEY",
     "INTERNAL_PROXY_BIND", "INTERNAL_PROXY_PORT",
     "COMMERCIAL_ALERTS_DISABLED",
+    "OC_CONTROL_PLANE_LEADER", "COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED",
   ]) ORIGINAL_ENV[k] = process.env[k];
 }
 function restoreEnv(): void {
@@ -87,15 +81,20 @@ before(async () => {
   process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString("base64");
   // 静默 alert 调度器,避免后台 tick 影响 shutdown 等待
   process.env.COMMERCIAL_ALERTS_DISABLED = "1";
+  // 本文件验证 HTTP/WS composition，不验证后台 mutator。测试进程内反复
+  // register/shutdown 时，boot tick 可能已在 shutdown 前起跑并继续持有 PG socket；
+  // 显式以 follower + 关闭唯一 local reaper 运行，确保没有无关后台 handle 泄漏。
+  process.env.OC_CONTROL_PLANE_LEADER = "0";
+  process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED = "1";
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 5 }));
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     try { await closePool(); } catch { /* */ }
   }
   restoreEnv();
@@ -196,9 +195,9 @@ describe("V3 2H — registerCommercial 接入装配", () => {
       jwtSecret: JWT_SECRET,
       skipInternalProxy: true,
     });
+    const httpServer = createServer();
     try {
       // 起一个 http server 让 r.handleWsUpgrade 接管 upgrade
-      const httpServer = createServer();
       httpServer.on("upgrade", (req, socket, head) => {
         if (!r.handleWsUpgrade(req, socket, head)) {
           try { socket.destroy(); } catch { /* */ }
@@ -219,8 +218,10 @@ describe("V3 2H — registerCommercial 接入装配", () => {
       });
       assert.equal(closeInfo.code, 1008);
       assert.match(closeInfo.reason, /unauthorized/i);
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     } finally {
+      if (httpServer.listening) {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      }
       await r.shutdown();
     }
   });
@@ -234,8 +235,8 @@ describe("V3 2H — registerCommercial 接入装配", () => {
       jwtSecret: JWT_SECRET,
       skipInternalProxy: true,
     });
+    const httpServer = createServer();
     try {
-      const httpServer = createServer();
       httpServer.on("upgrade", (req, socket, head) => {
         if (!r.handleWsUpgrade(req, socket, head)) {
           try { socket.destroy(); } catch { /* */ }
@@ -256,7 +257,8 @@ describe("V3 2H — registerCommercial 接入装配", () => {
       );
       const token2 = issued.token;
       const ws = new WebSocket(
-        `ws://127.0.0.1:${port}/ws/user-chat-bridge?token=${encodeURIComponent(token2)}`,
+        `ws://127.0.0.1:${port}/ws/user-chat-bridge`,
+        ["bearer", token2],
       );
       const closeInfo = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("ws never closed")), 5000);
@@ -272,8 +274,10 @@ describe("V3 2H — registerCommercial 接入装配", () => {
       const parsed = JSON.parse(closeInfo.reason) as { retryAfterSec?: number; reason?: string };
       assert.equal(parsed.retryAfterSec, 5);
       assert.equal(parsed.reason, "supervisor_not_wired");
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     } finally {
+      if (httpServer.listening) {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      }
       await r.shutdown();
     }
   });
@@ -290,8 +294,8 @@ describe("V3 2H — registerCommercial 接入装配", () => {
         return { host: "127.0.0.1", port: 1 };
       },
     });
+    const httpServer = createServer();
     try {
-      const httpServer = createServer();
       httpServer.on("upgrade", (req, socket, head) => {
         if (!r.handleWsUpgrade(req, socket, head)) {
           try { socket.destroy(); } catch { /* */ }
@@ -310,7 +314,8 @@ describe("V3 2H — registerCommercial 接入装配", () => {
         JWT_SECRET,
       );
       const ws = new WebSocket(
-        `ws://127.0.0.1:${port}/ws/user-chat-bridge?token=${encodeURIComponent(issued.token)}`,
+        `ws://127.0.0.1:${port}/ws/user-chat-bridge`,
+        ["bearer", issued.token],
       );
       const closeInfo = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("ws never closed")), 8000);
@@ -325,8 +330,10 @@ describe("V3 2H — registerCommercial 接入装配", () => {
         "拨号失败应得 1011 internal,而非 4503");
       assert.equal(observedUid, BigInt(u.rows[0].id),
         "resolveContainerEndpoint 应收到 token 解析出的 uid");
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     } finally {
+      if (httpServer.listening) {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      }
       await r.shutdown();
     }
   });

@@ -16,6 +16,7 @@ import IORedis from "ioredis";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { PricingCache } from "../billing/pricing.js";
 import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
@@ -30,26 +31,6 @@ const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 // 与 http.integ.test.ts 一致,测试后清掉所有商业化表重建
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
-
 let pgAvailable = false;
 let redis: IORedis | null = null;
 
@@ -83,7 +64,7 @@ before(async () => {
     await resetPool();
     const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
     setPoolOverride(pool);
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
+    await resetTestSchemaForTest();
     await runMigrations();
   } else if (REQUIRE_TEST_DB) {
     throw new Error("PG test fixture required (REQUIRE_TEST_DB=1 but no DB reachable)");
@@ -100,8 +81,15 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
-    await closePool();
+    // 本文件会改全局 visibility 并插入缓存专用模型；结束时恢复完整迁移种子态，
+    // 后继集成文件不得继承 picker fixture。
+    try {
+      await resetTestSchemaForTest();
+      await runMigrations();
+    } finally {
+      await closePool();
+      await resetPool();
+    }
   }
 });
 
@@ -122,21 +110,41 @@ async function waitFor(pred: () => boolean | Promise<boolean>, timeoutMs = 2000,
   return false;
 }
 
+async function preparePricingFixture(): Promise<void> {
+  // 0143+ 的 DB guard 禁止删除仍被 runtime 使用的权威模型定价。测试缓存行为时
+  // 保留全部 required rows，只把无关模型降为 admin visibility；这样既维持生产
+  // 不变量，又能让 public-list 断言继续拥有确定的 sonnet/opus 两行视图。
+  await query(
+    "DELETE FROM model_pricing WHERE model_id IN ('legacy-v1', 'pricing-listener-new', 'pricing-listener-delete')",
+  );
+  await query("UPDATE model_pricing SET visibility = 'admin'");
+  await query(
+    `INSERT INTO model_pricing(model_id, display_name,
+       input_per_mtok, output_per_mtok,
+       cache_read_per_mtok, cache_write_per_mtok,
+       multiplier, enabled, sort_order, visibility)
+     VALUES
+       ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100,'public'),
+       ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90,'public'),
+       ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,1.5,TRUE,110,'admin')
+     ON CONFLICT (model_id) DO UPDATE SET
+       display_name = EXCLUDED.display_name,
+       input_per_mtok = EXCLUDED.input_per_mtok,
+       output_per_mtok = EXCLUDED.output_per_mtok,
+       cache_read_per_mtok = EXCLUDED.cache_read_per_mtok,
+       cache_write_per_mtok = EXCLUDED.cache_write_per_mtok,
+       multiplier = EXCLUDED.multiplier,
+       enabled = EXCLUDED.enabled,
+       sort_order = EXCLUDED.sort_order,
+       visibility = EXCLUDED.visibility`,
+  );
+}
+
 // ───────────────────────────────────────────────────────────────────
 describe("PricingCache.load (integ)", () => {
   beforeEach(async () => {
     if (!pgAvailable) return;
-    // 恢复 seed 状态
-    await query("DELETE FROM model_pricing");
-    await query(
-      `INSERT INTO model_pricing(model_id, display_name,
-         input_per_mtok, output_per_mtok,
-         cache_read_per_mtok, cache_write_per_mtok,
-         multiplier, enabled, sort_order)
-       VALUES
-         ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100),
-         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90)`,
-    );
+    await preparePricingFixture();
   });
 
   test("loads both seeded rows + get returns correct values", async (t) => {
@@ -144,7 +152,8 @@ describe("PricingCache.load (integ)", () => {
     const p = new PricingCache();
     await p.load();
     try {
-      assert.equal(p.size(), 2);
+      const count = await query<{ count: string }>("SELECT COUNT(*)::text AS count FROM model_pricing");
+      assert.equal(p.size(), Number(count.rows[0].count));
       const sonnet = p.get("claude-sonnet-4-6");
       assert.ok(sonnet, "sonnet row must load");
       assert.equal(sonnet!.display_name, "Claude Sonnet 4.6");
@@ -185,7 +194,8 @@ describe("PricingCache.load (integ)", () => {
     const p = new PricingCache();
     await p.load();
     try {
-      assert.equal(p.size(), 3);
+      const count = await query<{ count: string }>("SELECT COUNT(*)::text AS count FROM model_pricing");
+      assert.equal(p.size(), Number(count.rows[0].count));
       assert.ok(p.get("legacy-v1"), "disabled model still accessible via get()");
       const list = p.listPublic();
       assert.equal(list.length, 2, "disabled model excluded from public list");
@@ -200,14 +210,7 @@ describe("PricingCache.load (integ)", () => {
 describe("PricingCache LISTEN/NOTIFY auto-reload (integ)", () => {
   beforeEach(async () => {
     if (!pgAvailable) return;
-    await query("DELETE FROM model_pricing");
-    await query(
-      `INSERT INTO model_pricing(model_id, display_name,
-         input_per_mtok, output_per_mtok,
-         cache_read_per_mtok, cache_write_per_mtok,
-         multiplier, enabled, sort_order)
-       VALUES ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100)`,
-    );
+    await preparePricingFixture();
   });
 
   test("UPDATE fires NOTIFY → cache reloaded with new multiplier", async (t) => {
@@ -235,17 +238,17 @@ describe("PricingCache LISTEN/NOTIFY auto-reload (integ)", () => {
     await p.load();
     await p.startListener(TEST_DB_URL);
     try {
-      assert.equal(p.get("claude-haiku-4-5"), null);
+      assert.equal(p.get("pricing-listener-new"), null);
       await query(
         `INSERT INTO model_pricing(model_id, display_name,
            input_per_mtok, output_per_mtok,
            cache_read_per_mtok, cache_write_per_mtok,
-           multiplier, enabled, sort_order)
-         VALUES ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,2.0,TRUE,110)`,
+           multiplier, enabled, sort_order, visibility)
+         VALUES ('pricing-listener-new','Listener New',80,400,8,100,2.0,FALSE,910,'admin')`,
       );
-      const reloaded = await waitFor(() => p.get("claude-haiku-4-5") !== null);
+      const reloaded = await waitFor(() => p.get("pricing-listener-new") !== null);
       assert.ok(reloaded, "new row must appear in cache after NOTIFY");
-      assert.equal(p.get("claude-haiku-4-5")!.display_name, "Claude Haiku 4.5");
+      assert.equal(p.get("pricing-listener-new")!.display_name, "Listener New");
     } finally {
       await p.shutdown();
     }
@@ -253,13 +256,20 @@ describe("PricingCache LISTEN/NOTIFY auto-reload (integ)", () => {
 
   test("DELETE removes entry from cache", async (t) => {
     if (skipIfNoPg(t)) return;
+    await query(
+      `INSERT INTO model_pricing(model_id, display_name,
+         input_per_mtok, output_per_mtok,
+         cache_read_per_mtok, cache_write_per_mtok,
+         multiplier, enabled, sort_order, visibility)
+       VALUES ('pricing-listener-delete','Listener Delete',80,400,8,100,2.0,FALSE,911,'admin')`,
+    );
     const p = new PricingCache();
     await p.load();
     await p.startListener(TEST_DB_URL);
     try {
-      assert.ok(p.get("claude-sonnet-4-6"));
-      await query("DELETE FROM model_pricing WHERE model_id = $1", ["claude-sonnet-4-6"]);
-      const gone = await waitFor(() => p.get("claude-sonnet-4-6") === null);
+      assert.ok(p.get("pricing-listener-delete"));
+      await query("DELETE FROM model_pricing WHERE model_id = $1", ["pricing-listener-delete"]);
+      const gone = await waitFor(() => p.get("pricing-listener-delete") === null);
       assert.ok(gone, "row must disappear from cache after NOTIFY");
     } finally {
       await p.shutdown();
@@ -279,21 +289,9 @@ describe("/api/public/models (http integ)", () => {
 
   before(async () => {
     if (!pgAvailable || !redis) return;
-    await query("DELETE FROM model_pricing");
-    // 注意:haiku 故意 enabled=TRUE 模拟生产状态(boss 翻 true 让 WebFetch 能用),
-    // 但 listPublic / /api/public/models 必须把它过滤掉(品牌叙事:UI 不展示)。
-    // 0049 后 visibility 列控制 listPublic 过滤;haiku 显式 visibility='admin'
-    // 锁定生产 migration 行为(老 HIDDEN_FROM_PUBLIC_LIST 等价物)。
-    await query(
-      `INSERT INTO model_pricing(model_id, display_name,
-         input_per_mtok, output_per_mtok,
-         cache_read_per_mtok, cache_write_per_mtok,
-         multiplier, enabled, sort_order, visibility)
-       VALUES
-         ('claude-sonnet-4-6','Claude Sonnet 4.6',300,1500,30,375,2.0,TRUE,100,'public'),
-         ('claude-opus-4-7','Claude Opus 4.7',500,2500,50,625,2.0,TRUE,90,'public'),
-         ('claude-haiku-4-5','Claude Haiku 4.5',80,400,8,100,1.5,TRUE,110,'admin')`,
-    );
+    // 注意:haiku 保持可路由但 visibility='admin'，其余 required rows 同样保留且
+    // 收窄为 admin；public picker 因而确定只展示 sonnet + opus。
+    await preparePricingFixture();
     pricing = new PricingCache();
     await pricing.load();
 

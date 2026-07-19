@@ -13,6 +13,7 @@ import { generatePersona } from '../account-pool/persona.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -52,8 +53,7 @@ before(async () => {
   assertTestDatabase(TEST_DB_URL)
   await resetPool()
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
-  await query('DROP SCHEMA IF EXISTS public CASCADE')
-  await query('CREATE SCHEMA public')
+  await resetTestSchemaForTest()
   await query('GRANT ALL ON SCHEMA public TO public')
   await runMigrations()
 })

@@ -4953,6 +4953,15 @@ export class SessionManager {
   ): Promise<void> {
     const session = this.sessions.get(sessionKey)
     if (!session) throw new Error(`session not found: ${sessionKey}`)
+    // 能力前置检查(2026-07-18 批E,runnerMandatoryMutatorParity 挖出):execution-target
+    // 切换是 CCB(SubprocessRunner)专属能力;codex app-server runner 无 setExecutionTarget。
+    // 必须在任何破坏性动作(shutdown/清 resume 表)之前 fail-fast——否则鸭子类型硬调会在
+    // runner 已停、上下文已清之后才 TypeError,把会话留在半迁移残骸态。
+    if (typeof (session.runner as { setExecutionTarget?: unknown }).setExecutionTarget !== 'function') {
+      throw new Error(
+        `session runner does not support execution-target switch (codex app-server sessions are local-only): ${sessionKey}`,
+      )
+    }
 
     const prev = session.lock
     let release!: () => void

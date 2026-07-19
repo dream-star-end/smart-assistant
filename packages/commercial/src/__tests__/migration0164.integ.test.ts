@@ -93,11 +93,6 @@ after(async () => {
   } catch {
     /* best-effort */
   }
-  try {
-    await resetTestSchemaForTest();
-  } catch {
-    /* */
-  }
   await closePool();
 });
 

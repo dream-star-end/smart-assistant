@@ -28,6 +28,7 @@ import { randomBytes } from "node:crypto";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { KMS_KEY_BYTES } from "../crypto/keys.js";
 import { encrypt } from "../crypto/aead.js";
 import { createAccount, getAccount, updateAccount } from "../account-pool/store.js";
@@ -43,14 +44,6 @@ const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
   "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
-  "agent_subscriptions", "user_preferences", "request_finalize_journal",
-  "orders", "topup_plans", "usage_records",
-  "credit_ledger", "model_pricing", "claude_accounts", "egress_proxies", "refresh_tokens",
-  "email_verifications", "users", "schema_migrations",
-];
 
 let pgAvailable = false;
 let TEST_EGRESS_PROXY_ID = "1";
@@ -71,7 +64,7 @@ before(async () => {
   }
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
   const _ep = encrypt("http://test:test@10.0.0.1:8080", KEY);
   const _r = await query<{ id: string }>(
@@ -83,7 +76,7 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     await closePool();
   }
 });

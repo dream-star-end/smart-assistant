@@ -28,6 +28,7 @@ import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -39,11 +40,7 @@ const BOUND_IP = '10.9.9.9'
 let pgAvailable = false
 
 async function dropAllTables(): Promise<void> {
-  const db = await query<{ db: string }>('SELECT current_database() AS db')
-  if (!/_test$/.test(db.rows[0]?.db ?? '')) throw new Error('refusing non-test db')
-  await query(`DO $$ DECLARE r RECORD; BEGIN
-    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP
-      EXECUTE 'DROP TABLE IF EXISTS public.'||quote_ident(r.tablename)||' CASCADE'; END LOOP; END $$;`)
+  await resetTestSchemaForTest()
 }
 
 function startServer(): Promise<{ port: number; requests: string[]; close(): Promise<void> }> {
@@ -202,11 +199,6 @@ before(async () => {
 })
 after(async () => {
   if (pgAvailable) {
-    try {
-      await dropAllTables()
-    } catch {
-      /* */
-    }
     await closePool()
   }
 })

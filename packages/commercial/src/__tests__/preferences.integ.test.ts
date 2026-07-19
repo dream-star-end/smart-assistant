@@ -22,6 +22,7 @@ import IORedis from "ioredis";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { signAccess } from "../auth/jwt.js";
@@ -39,26 +40,6 @@ const TEST_REDIS_URL =
   process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
 
 let pgAvailable = false;
 let redis: IORedis | null = null;
@@ -81,7 +62,7 @@ before(async () => {
     await resetPool();
     const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
     setPoolOverride(pool);
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch {}
+    await resetTestSchemaForTest();
     await runMigrations();
   } else if (REQUIRE_TEST_DB) {
     throw new Error("PG test fixture required");
@@ -93,7 +74,7 @@ before(async () => {
 after(async () => {
   if (redis) { try { await redis.flushdb(); } catch {} await redis.quit(); }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch {}
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     await closePool();
   }
 });

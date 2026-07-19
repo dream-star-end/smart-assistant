@@ -1196,7 +1196,8 @@ export class CodexAppServerRunner extends EventEmitter {
   // sessionManager.submit() L1131 在 traceId 非空时硬调 `runner.setTraceId(traceId)`。
   // 缺方法 → TypeError → turn 永不 complete → 用户卡 "思考中"(2026-05-11 v1.0.123 复现)。
   // 这是 setModel 同型 bug 第二次踩坑;若再加第三个 sessionManager-side 必调 mutator,
-  // runnerContractParity.test.ts 会先把谁漏 parity 暴露出来。
+  // runnerMandatoryMutatorParity.test.ts 会先把谁漏 parity 暴露出来(前身
+  // runnerContractParity 曾在 adapter 重构中丢失,2026-07-18 批E 重建并要求同步登记)。
   // codex app-server 是长驻进程,trace id 当前不透传给子进程,只做 opts stash —
   // SubprocessRunner 那条 OPENCLAUDE_TRACE_ID env 注入路径并不适用。
   get traceId(): string | undefined {

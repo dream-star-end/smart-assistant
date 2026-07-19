@@ -1,0 +1,12 @@
+# v5 持续 turn 探针 timer —— 每 30 分钟(分钟 7/37,错开 monitor 的偶数分钟轮)。
+# Persistent=false:探针是即时性检查,停机期间漏掉的轮次没有补跑意义。
+[Unit]
+Description=Run OpenClaude v5 turn probe every 30 minutes
+
+[Timer]
+OnCalendar=*:7/30
+AccuracySec=60s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

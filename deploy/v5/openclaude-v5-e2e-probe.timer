@@ -1,0 +1,11 @@
+# v5 持续 E2E 探针 timer(本机)—— 每小时分钟 23(错开整点任务簇)。
+[Unit]
+Description=Run OpenClaude v5 E2E journey probe hourly
+
+[Timer]
+OnCalendar=*:23
+AccuracySec=120s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

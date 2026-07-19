@@ -9,6 +9,7 @@ import { after, before, beforeEach, describe, test } from 'node:test'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import {
   abortInflight,
   getChannelState,
@@ -29,7 +30,7 @@ const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB
 let pgAvailable = false
 
 async function resetSchema(): Promise<void> {
-  await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+  await resetTestSchemaForTest()
 }
 async function probe(): Promise<boolean> {
   const p = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 })
@@ -60,11 +61,6 @@ before(async () => {
 })
 after(async () => {
   if (pgAvailable) {
-    try {
-      await resetSchema()
-    } catch {
-      /* ignore */
-    }
     await closePool()
   }
 })

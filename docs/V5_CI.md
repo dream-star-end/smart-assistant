@@ -16,13 +16,25 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | typecheck | `npm run typecheck` | 同左(`tsc --build`) | 20 min |
 | gateway | `npm run test:gateway` | 同左 | 25 min |
 | storage | `npm run test:storage` | 同左 | 15 min |
-| web-react | `npm run test:web-react` | 同左(等价 `cd packages/web-react && npx vitest run`) | 25 min |
+| web-react | `check:tutorials` + `test:web-react` + `test:browser` | 同左(browser-tests 双遍:桌面+移动仿真,含覆盖面 manifest 门) | 30 min |
+| web | `npm run test:web:gate` | 同左(基线 diff 门,`.github/known-failures/web.txt`) | 15 min |
+| mcp-memory | `npm run test:mcp-memory` | 同左 | 10 min |
+| cli | `npm run test:cli` | 同左(导入图冒烟;plugin-sdk 纯类型包有意不设) | 10 min |
+| repo-lints | `lint:scheduler-wiring` + `lint:undefined-refs` | 同左 | 10 min |
 | commercial-unit | `npm run test:commercial:unit:gate` | 同左(需本地 PG fixture,见下) | 30 min |
+| commercial-integ | `npm run test:commercial:integ:gate` | 同左(需 PG+Redis fixture;基线 bootstrap 流程见 `.github/known-failures/commercial-integ.txt` 头注) | 45 min |
+| v5-ops | `npm run test:v5:ops` | 同左(需 PG fixture + root;含 release-safety/canary 契约) | 20 min |
 
-一把梭:`npm run check:v5` 依次跑全部五项(与 CI 完全同一组命令)。
+**required checks(GitHub 分支保护,2026-07-18 批F 起)**:typecheck / gateway / storage /
+web-react / commercial-unit / v5-ops / web / mcp-memory / cli / repo-lints 共 10 项。
+commercial-integ 待基线 bootstrap 完成后加入。改 required 集用
+`gh api -X PATCH .../protection/required_status_checks --input <json>`(admin)。
 
 注意:`check:v5` 是 v5 的质量门,**不含** biome lint / integ 测试;v3 的全量门仍是
-`npm run check`。
+`npm run check`。**有意不入门并登记为债(2026-07-18 门禁审计批C)**:biome(存量
+3614 错误,须专项清理)、`lint:agent-containers-sql`(6 处存量违规待逐个裁定)、
+evals(需真实 LLM key);web-react **包级** `tsc -b` 含 vitest 测试文件且有存量类型错
+(根级 typecheck 不含),修完才能把包级 typecheck 入门。
 
 ## commercial-unit:基线失败集 diff 门
 
@@ -37,13 +49,18 @@ ledger / v3Supervisor / userChatBridge 一带,尚未在 v5 轨修复)。为了�
    `COMMERCIAL_UNIT_TAP=commercial-unit.tap` 把 `TAP_OUT` 和 artifact 上传路径绑在
    一起;无论测试成败都上传名为 `commercial-unit-tap` 的产物,产物缺失本身也会让
    job 失败,避免门禁只报套件名却丢失真实断言详情;
-2. `.github/scripts/diff-known-failures.sh` 从 TAP 提取**顶层**失败集
-   (`^not ok` 只匹配列 0 = 顶层 test/suite 名;嵌套子测试是缩进的,不参与),
-   与 `.github/known-failures/commercial-unit.txt` 逐行比较;
+2. `.github/scripts/diff-known-failures.sh` 从 TAP 提取**所有层级**失败点的
+   **全路径**集合(2026-07-18 批C 升级:反向扫描按缩进建 "父 > 子" 路径;绝对路径
+   顶层名归一化为仓库相对路径),与基线清单逐行比较。基线行支持两种形态:精确
+   路径,或 `X > *` 结尾的显式 glob(仅限负载敏感 flaky 套件,必须带注释理由);
 3. **只有基线之外的新增失败才 fail**;基线内的存量失败放行;
    基线里"本轮没失败"的条目打 warning 提示清理;
-   TAP 里一个测试点都没有(套件没跑起来)或 runner 非零退出但抓不到任何
-   `not ok`(基础设施崩溃)→ 直接 fail,防假绿。
+   TAP 里一个测试点都没有(套件没跑起来)、缺 `# tests N` 收尾汇总(runner 中途
+   崩溃,截断守卫)、或 runner 非零退出但抓不到任何 `not ok`(基础设施崩溃)
+   → 直接 fail,防假绿。
+4. 同一门机制有三个消费者(`tap-suite-gate.sh` 通用 wrapper):commercial-unit /
+   web(`known-failures/web.txt`)/ commercial-integ(`known-failures/commercial-integ.txt`,
+   初始为空,bootstrap 流程见其头注)。
 
 防静默 skip:商业测试的 DB 门控是 `process.env.CI === "true" ||
 process.env.REQUIRE_TEST_DB === "1"` —— 命中门控时 PG 不可用会直接 throw
@@ -70,19 +87,38 @@ artifact/seed 校验在 CI 真正执行;runner 是 GitHub 一次性虚机,不接
   暴露出的、可证明与本次改动无关的历史失败,加行时必须在 PR 里说明依据。
 - 重新生成 / 核对清单(在仓库根目录,需本地 PG fixture):
 
+  **基线真值必须取自 CI 环境的 TAP artifact,不是本机**(两边环境失败集不同;
+  历史清单曾由本机实跑生成,批C 起废止该做法):
+
   ```bash
-  CI=true REQUIRE_TEST_DB=1 \
-  TEST_DATABASE_URL=postgres://test:test@127.0.0.1:55432/openclaude_test \
-  npm run test:commercial:unit > commercial-unit.tap 2>&1
-  grep '^not ok' commercial-unit.tap | sed 's/^not ok [0-9]* - //' | sort -u
+  gh run list --branch feat/v5-aurora-rewrite --limit 3   # 找最近的绿 run
+  gh run download <run-id> -n commercial-unit-tap
+  # 提取全路径失败集(与 diff-known-failures.sh 的 awk 一字不差):
+  tac commercial-unit.tap | awk '
+  /^( *)(not )?ok [0-9]+ - / {
+    line=$0; indent=0
+    while (substr(line, indent+1, 1) == " ") indent++
+    name=line
+    sub(/^ *(not )?ok [0-9]+ - /, "", name)
+    sub(/ # (TODO|SKIP).*$/, "", name)
+    sub(/^\/[^ ]*\/packages\//, "packages/", name)
+    sub(/^\/[^ ]*\/scripts\//, "scripts/", name)
+    sub(/^\/[^ ]*\/e2e\//, "e2e/", name)
+    ctx[indent]=name
+    if (line ~ /^ *not ok /) {
+      path=name
+      for (d=indent-4; d>=0; d-=4) { if (d in ctx) path=ctx[d] " > " path }
+      print path
+    }
+  }' | sort -u
   ```
 
-  当前清单即由该命令于 2026-07-05(HEAD=151f7b41)本机两次实跑取并集生成
-  (30 条稳定 + 1 条负载敏感 flaky,共 31 条)。
+  当前 commercial-unit 清单由三轮 CI TAP artifact(2026-07-18,HEAD=6cd5a5f7)
+  并集生成:122 条精确路径 + 7 个 flaky 套件的显式 `> *` glob。
 
-- 已知局限:基线粒度是**顶层 suite/test**。若一个 suite 已在基线内,其内部
-  新增的子测试失败不会被 diff 捕获(整个 suite 已被豁免)。所以清单越短,
-  门越灵敏 —— 又一个尽快清零存量的理由。
+- 粒度语义(批C 升级后):基线内 suite 的**内部新增子失败一样会红**(旧版按顶层
+  suite 整体豁免的盲区已消灭);只有显式 `X > *` glob 的 flaky 套件仍整体豁免——
+  glob 越少门越灵敏,连续两周 stale 的 glob 条目应删除。
 
 ### 本地 PG/Redis fixture
 

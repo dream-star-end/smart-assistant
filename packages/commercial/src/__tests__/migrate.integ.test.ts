@@ -6,12 +6,14 @@ import path from "node:path";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations, MigrationIntegrityError } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-02 迁移系统集成测试。
  *
- * 与 db.integ 共用测试库(openclaude_test),但每个 test 前先 DROP 掉商业化相关的表,
- * 保证干净起点。库名硬要求以 `_test` 结尾 —— 防止手滑跑到生产库。
+ * 与 db.integ 共用测试库(openclaude_test),但每个 test 前重建 public schema,
+ * 保证迁移账本、表、函数和类型都从同一个干净起点重放。实际连接库名必须以
+ * `_test` 结尾 —— 防止手滑跑到生产库。
  *
  * 需要本地起 PG/Redis fixture — 见 packages/commercial/README.md。
  * CI 或 REQUIRE_TEST_DB=1 时,pg 未就绪 → 直接 fail(不 skip)。
@@ -26,38 +28,8 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-/** 所有商业化表 + schema_migrations。用 DROP ... CASCADE,顺序无所谓,
- *  但仍列全,方便未来新增迁移时保持清理同步。 */
-const COMMERCIAL_TABLES = [
-  "prompt_queue_item_attachments",
-  "prompt_queue_mutations",
-  "prompt_queue_items",
-  "prompt_queue_heads",
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
-
 async function cleanCommercialSchema(): Promise<void> {
-  // DROP 时用 CASCADE 避免被 ON DELETE RESTRICT / INDEX 挡住。
-  // 注意:不 drop 其他不相关的表(比如 db.integ 的 _db_integ_demo),
-  // 但它在另一个测试进程,不会在本 pool 看到残留。
-  const sql = `DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`;
-  await query(sql);
+  await resetTestSchemaForTest();
 }
 
 async function probe(): Promise<boolean> {
@@ -95,8 +67,14 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
-    await closePool();
+    // 门禁审计批F 根治:teardown 留"全量迁移稳定态"给后继文件(公民守则见 helpers/db.ts);
+    // 旧白名单清场(掀迁移账本留表)会毒化后继文件的 runMigrations(42P07)。
+    try {
+      await resetTestSchemaForTest();
+      await runMigrations();
+    } finally {
+      await closePool();
+    }
   }
 });
 

@@ -1,0 +1,8 @@
+# packages/web(个人版/共享 vanilla 前端)test:web 已知存量失败清单。
+# 行格式/匹配规则与 commercial-unit.txt 同契约(diff-known-failures.sh,测试点全路径粒度;
+# 文件路径已由提取侧归一化为仓库相对路径)。
+# 基线取自 2026-07-18 本机实跑(HEAD=6cd5a5f7);CI 首轮若集合不同,按 CI TAP artifact 修订。
+packages/web/__tests__/adminShellRedesign.test.ts
+packages/web/__tests__/pureFunctions.test.ts
+T-ADMIN: admin.html / modules/admin.js DOM integrity
+T-ADMIN: admin.html / modules/admin.js DOM integrity > admin.html + modules/admin.js both exist (Phase 4D shipped)

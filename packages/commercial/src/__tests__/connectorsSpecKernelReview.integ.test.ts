@@ -34,6 +34,7 @@ import { ConnectorSpecError } from '../connectors/spec/types.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -58,17 +59,7 @@ async function probe(): Promise<boolean> {
 }
 
 async function dropAllTables(): Promise<void> {
-  const db = await query<{ db: string }>('SELECT current_database() AS db')
-  const name = db.rows[0]?.db ?? ''
-  if (!/_test$/.test(name)) throw new Error(`refusing to drop tables on non-test database: ${name}`)
-  await query(`
-    DO $$ DECLARE r RECORD;
-    BEGIN
-      FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
-        EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
-      END LOOP;
-    END $$;
-  `)
+  await resetTestSchemaForTest()
 }
 
 before(async () => {
@@ -86,11 +77,6 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try {
-      await dropAllTables()
-    } catch {
-      /* */
-    }
     await closePool()
   }
 })
@@ -382,11 +368,19 @@ describe('loadVerifiedContract', () => {
     )
   })
 
-  test('kind 被篡改成 skill → WRONG_ARTIFACT_KIND(P0-2)', async (t) => {
+  test('approved listing 的 kind 篡改被 DB immutable trigger 拒绝', async (t) => {
     if (skipIfNoDb(t)) return
-    const { versionId, slug } = await approved()
-    await query(`UPDATE marketplace_skill_listings SET kind='skill' WHERE slug=$1`, [slug])
-    await assert.rejects(loadVerifiedContract(versionId, getPool()), isCode('WRONG_ARTIFACT_KIND'))
+    const { slug } = await approved()
+    await assert.rejects(
+      query(`UPDATE marketplace_skill_listings SET kind='skill' WHERE slug=$1`, [slug]),
+      (error: unknown) =>
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === '23514' &&
+        error instanceof Error &&
+        /kind\/plugin_type is immutable/.test(error.message),
+    )
   })
 
   test('exec_revoked_at 置位 → EXEC_REVOKED(fail-closed)', async (t) => {

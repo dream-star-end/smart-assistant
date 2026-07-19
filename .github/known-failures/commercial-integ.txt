@@ -1,0 +1,45 @@
+# v5 commercial-integ(*.integ.test.ts,真 PG/Redis)已知存量失败清单。
+# 行格式/匹配规则与 commercial-unit.txt 同契约(diff-known-failures.sh,测试点全路径粒度)。
+#
+# 2026-07-18 门禁审计批C 首建:integ 套件此前**完全不在 CI**(104 个文件零门禁)。
+# 基线 bootstrap 流程:本文件初始为空 → PR 首轮 CI 实跑暴露 CI 环境存量失败集 →
+# 从 CI TAP artifact 按 docs/V5_CI.md 重生成命令逐条登记(带理由)→ 门转绿。
+# 空基线语义 = "integ 在 CI 环境应当全绿";任何失败都是新增,红了就修或有据登记。
+
+# 2026-07-19:legacy v3 agent subscription 路径的存量失败。0090 已有明确迁移论证:
+# 该从未 provision 的旧路径是 dead code，并移除了 agent_containers(user_id) arbiter；
+# openAgentSubscription 在 v5 又有硬拒绝。以下均由同一 ON CONFLICT(user_id) 42P10
+# 级联产生，保持精确子路径登记，不用 suite glob，确保任何新增失败仍会变红。
+cancelAgentSubscription
+cancelAgentSubscription > 再 cancel 幂等(was_auto_renew=false)
+cancelAgentSubscription > 设 auto_renew=false;本期仍有效(status=active / end_at 不变)
+checkAgentAccess
+checkAgentAccess > 容器 error → CONTAINER_NOT_RUNNABLE
+checkAgentAccess > 订阅 active + 容器 provisioning → ok
+checkAgentAccess > 订阅 active + 容器 running → ok
+checkAgentAccess > 订阅 end_at 过期但 status 仍 active → SUBSCRIPTION_EXPIRED
+checkAgentAccess > 订阅 status=canceled → NO_SUBSCRIPTION(没 active)
+getAgentStatus
+getAgentStatus > 已订阅:返回 active 订阅 + provisioning 容器
+listVolumeGcCandidates + markContainerRemoved
+listVolumeGcCandidates + markContainerRemoved > volume_gc_at < now 的 stopped 容器出现在候选列表,markRemoved 后不再出现
+listVolumeGcCandidates + markContainerRemoved > 未到 GC 时间的 stopped 不会出现
+listVolumeGcCandidates + restoreVolumeGcAfterFailure
+listVolumeGcCandidates + restoreVolumeGcAfterFailure > restoreVolumeGcAfterFailure → volume_gc_at 重回未来时间,下次可重试
+listVolumeGcCandidates + restoreVolumeGcAfterFailure > 两次调用 → 第一次认领后,第二次拿不到该行(防 double-GC)
+listVolumeGcCandidates + restoreVolumeGcAfterFailure > 认领成功 → volume_gc_at 置 NULL,返回行包含 user_id
+markContainerRunning / markContainerError
+markContainerRunning / markContainerError > markContainerError: status=error + last_error 截断到 2048+'…'
+markContainerRunning / markContainerError > markContainerRunning: status=running + docker_id + last_started_at
+markContainerStoppedAfterExpiry
+markContainerStoppedAfterExpiry > 把 container 置 stopped 并设 volume_gc_at = now + gcDays 天
+markContainerStoppedAfterExpiry > 状态为 removed 时不 overwrite(WHERE status IN ... 排除)
+markExpiredSubscriptions
+markExpiredSubscriptions > end_at < now 的 active 订阅被置 expired 并返回
+markExpiredSubscriptions > 未到期不 sweep
+openAgentSubscription
+openAgentSubscription > happy path: 扣 2900 积分 + INSERT sub + UPSERT container(provisioning)
+openAgentSubscription > 自定义价格 + 时长
+openAgentSubscription > 重复 open 同用户 → AgentAlreadyActiveError
+re-subscribe after expiry
+re-subscribe after expiry > expired 订阅后再 open:sub 新建 + container 同一行(status 重置为 provisioning)

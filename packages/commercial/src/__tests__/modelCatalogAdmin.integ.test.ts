@@ -164,11 +164,6 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try {
-      await resetTestSchemaForTest();
-    } catch {
-      /* */
-    }
     resetModelCatalogAdminPoolOverride();
     await closePool();
   }

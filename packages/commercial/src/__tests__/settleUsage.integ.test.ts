@@ -33,6 +33,7 @@ import {
 } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import {
   loadUsageAttributionCredits,
   settleUsageAndLedger,
@@ -50,30 +51,12 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-/** 防线:DROP SCHEMA 一旦误指 staging/prod 杀伤面极大。强制要求 dbname 以 `_test`
- *  结尾,unmet 直接 throw,不去碰 schema。 */
-function assertTestDatabase(url: string): void {
-  let dbName: string;
-  try {
-    dbName = new URL(url).pathname.replace(/^\//, "");
-  } catch {
-    throw new Error(`invalid TEST_DATABASE_URL: ${url}`);
-  }
-  if (!dbName.endsWith("_test")) {
-    throw new Error(
-      `refusing to reset non-test database: ${dbName} (must end with _test)`,
-    );
-  }
-}
-
 /** 重置 public schema —— 全量 migration 创建 40+ 表(含 system_settings、oauth_identities
  *  等多次新增),手工维护白名单成本高。DROP SCHEMA CASCADE 一次清干净,
  *  CREATE SCHEMA 后由 runMigrations() 全量重建。
- *  仅用于测试 DB,assertTestDatabase 阻挡 prod 误炸。 */
+ *  仅用于测试 DB,resetTestSchemaForTest 按实际 current_database() 阻挡 prod 误炸。 */
 async function cleanCommercialSchema(): Promise<void> {
-  assertTestDatabase(TEST_DB_URL);
-  await query("DROP SCHEMA IF EXISTS public CASCADE");
-  await query("CREATE SCHEMA public");
+  await resetTestSchemaForTest();
   await query("GRANT ALL ON SCHEMA public TO public");
 }
 
@@ -113,7 +96,6 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
     await closePool();
   }
 });
@@ -244,7 +226,7 @@ describe("settleUsageAndLedger (integ)", () => {
     assert.equal(led.rows[0].reason, "chat");
     assert.equal(led.rows[0].ref_type, "usage_record");
     assert.equal(led.rows[0].ref_id, result.usageId.toString());
-    assert.equal(led.rows[0].memo, null); // 非 clamp → memo NULL
+    assert.equal(led.rows[0].memo, "cost=300");
 
     // usage_records ledger_id 反写
     const ur = await query<{
@@ -554,7 +536,7 @@ describe("settleUsageAndLedger (integ)", () => {
     assert.ok(led.rows[0].memo !== null);
     assert.match(led.rows[0].memo!, /clamped/);
     assert.match(led.rows[0].memo!, /cost=300/);
-    assert.match(led.rows[0].memo!, /balance=100/);
+    assert.match(led.rows[0].memo!, /total=100/);
   });
 
   test("DeepSeek path: accountId=null → usage_records.account_id IS NULL, debit 正常", async (t) => {

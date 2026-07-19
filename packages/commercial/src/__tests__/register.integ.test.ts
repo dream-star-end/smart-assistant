@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { register, RegisterError, isEmailDomainBlocked } from "../auth/register.js";
 import { verifyPassword } from "../auth/passwords.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
@@ -29,29 +30,8 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
-
 async function cleanCommercialSchema(): Promise<void> {
-  const sql = `DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`;
-  await query(sql);
+  await resetTestSchemaForTest();
 }
 
 async function probe(): Promise<boolean> {
@@ -103,7 +83,6 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
     await closePool();
   }
 });

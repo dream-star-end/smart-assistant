@@ -43,6 +43,24 @@ jobs:
             # 浏览器解析:ubuntu runner 预装 google-chrome(scripts/lib/resolve-browser.mjs)。
             run: npm run check:tutorials && npm run test:web-react && npm run --workspace @openclaude/web-react test:browser
             timeout: 30
+          # ── 2026-07-18 门禁审计批C 新增:此前"有测试脚本但 CI 从不跑"的缺口 ──
+          - name: web
+            # packages/web(38 文件,纯 node):经基线 diff 门(.github/known-failures/web.txt,
+            # 3 个存量失败已登记;新失败=红)。
+            run: npm run test:web:gate
+            timeout: 15
+          - name: mcp-memory
+            run: npm run test:mcp-memory
+            timeout: 10
+          - name: cli
+            # 发布物包此前零测试;导入图冒烟(plugin-sdk 纯类型包有意不设,typecheck 即全部运行面)。
+            run: npm run test:cli
+            timeout: 10
+          - name: repo-lints
+            # 仓库定制正确性 lint(调度器接线/未定义引用)。biome(存量 3614 错误)与
+            # lint:agent-containers-sql(6 处存量违规)暂不入门——见 docs/V5_CI.md 债表。
+            run: npm run lint:scheduler-wiring && npm run lint:undefined-refs
+            timeout: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -226,5 +244,105 @@ jobs:
         with:
           name: commercial-unit-tap
           path: ${{ env.COMMERCIAL_UNIT_TAP }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # 2026-07-18 门禁审计批C:commercial integ(104 个 *.integ.test.ts,真 PG/Redis 路径)
+  # 此前完全不在 CI —— DB 事务/竞态/幂等类回归可无阻合入。与 commercial-unit 同 fixture,
+  # 走同一 diff 门机制(基线 .github/known-failures/commercial-integ.txt,bootstrap 流程
+  # 见该文件头注)。root 理由同 unit(provision 契约 /run/ccb-ssh 权限路径)。
+  commercial-integ:
+    name: commercial-integ (known-failures diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI: 'true'
+      REQUIRE_TEST_DB: '1'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+      TEST_REDIS_URL: redis://127.0.0.1:56379/0
+      COMMERCIAL_INTEG_TAP: commercial-integ.tap
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for test fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if docker exec '${{ job.services.postgres.id }}' pg_isready -U test -d openclaude_test; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Postgres did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          for i in {1..30}; do
+            if docker exec '${{ job.services.redis.id }}' redis-cli ping; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Redis did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run commercial integ tests (baseline diff gate)
+        env:
+          TAP_OUT: ${{ env.COMMERCIAL_INTEG_TAP }}
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            "TEST_REDIS_URL=$TEST_REDIS_URL" \
+            "TAP_OUT=$TAP_OUT" \
+            npm run test:commercial:integ:gate
+
+      - name: Upload TAP output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: commercial-integ-tap
+          path: ${{ env.COMMERCIAL_INTEG_TAP }}
           if-no-files-found: error
           retention-days: 14

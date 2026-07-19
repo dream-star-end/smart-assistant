@@ -75,8 +75,12 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
-    await closePool();
+    try {
+      await cleanCommercialSchema();
+      await runMigrations();
+    } finally {
+      await closePool();
+    }
   }
 });
 

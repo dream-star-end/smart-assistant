@@ -42,6 +42,7 @@ import sharp from "sharp";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { signAccess } from "../auth/jwt.js";
@@ -73,41 +74,6 @@ const TEST_MEDIA_SIGN_KEY = deriveMediaSignKey(TEST_BRIDGE_SECRET);
 
 // 完整表列表(0001..0046)。`DROP TABLE IF EXISTS ... CASCADE` 对未列出的表
 // 不会自动级联删表本身,只会断 FK,所以必须显式枚举所有表名。
-const COMMERCIAL_TABLES = [
-  "inbox_message_assets",
-  "inbox_message_reads",
-  "inbox_messages",
-  "oauth_identities",
-  "compute_host_audit",
-  "compute_pool_state",
-  "account_refresh_events",
-  "feedback",
-  "compute_hosts",
-  "user_remote_hosts",
-  "admin_alert_silences",
-  "admin_alert_outbox",
-  "admin_alert_rule_state",
-  "admin_alert_channels",
-  "system_settings",
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
-
 let pgAvailable = false;
 let redis: IORedis | null = null;
 let server: Server | null = null;
@@ -140,7 +106,7 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 
   redis = await probeRedis();
@@ -181,7 +147,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     await closePool();
   }
 });

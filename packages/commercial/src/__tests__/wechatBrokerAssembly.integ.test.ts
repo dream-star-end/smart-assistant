@@ -30,6 +30,7 @@ import {
 } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { registerCommercial, type RegisterCommercialResult } from "../index.js";
 
 const TEST_DB_URL =
@@ -42,17 +43,9 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-/**
- * 动态读 public schema 全部 table 名 — 比硬编码 list 稳。historically 2H 测试
- * 用静态白名单导致 schema 演进后 "system_settings already exists"。
- */
-async function dropAllPublicTables(): Promise<void> {
-  const rows = await query<{ tablename: string }>(
-    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
-  );
-  if (rows.rowCount === 0) return;
-  const names = rows.rows.map(r => `"${r.tablename}"`).join(", ");
-  await query(`DROP TABLE IF EXISTS ${names} CASCADE`);
+/** 全 schema 重置；静态表白名单会随迁移演进漂移并留下 relation。 */
+async function resetSchema(): Promise<void> {
+  await resetTestSchemaForTest();
 }
 const ORIGINAL_ENV: Record<string, string | undefined> = {};
 const ENV_KEYS = [
@@ -99,13 +92,12 @@ before(async () => {
   delete process.env.INTERNAL_PROXY_PORT;
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 5 }));
-  await dropAllPublicTables();
+  await resetSchema();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try { await dropAllPublicTables(); } catch { /* */ }
     try { await closePool(); } catch { /* */ }
   }
   restoreEnv();

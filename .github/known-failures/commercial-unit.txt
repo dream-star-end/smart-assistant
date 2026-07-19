@@ -1,43 +1,152 @@
-# v5 commercial-unit 已知存量失败清单(顶层 test/suite 名,与 TAP `not ok` 行一致)
-# 生成/维护方法见 docs/V5_CI.md。修掉一个存量失败就从这里删掉对应行。
-# 基线取自 2026-07-05 本机两次实跑(HEAD=151f7b41)的并集:
-# admin-route-inventory: 2026-07-08 重钉 baseline(org/model-ops/account-groups/alerts 等已上线路由从未同步)已修绿,移出清单。
+# v5 commercial-unit 已知存量失败清单 —— **测试点全路径粒度**(2026-07-18 门禁审计批C)。
+#
+# 行格式(与 diff-known-failures.sh 的提取/匹配规则同契约):
+#   suite                    精确匹配一个顶层失败点
+#   suite > sub > ...        精确匹配一个嵌套失败点(路径用 " > " 连接)
+#   suite > *                通配 suite 下全部后代——仅允许用于**负载敏感 flaky 套件**
+#                            (逐点钉死会随机翻红);每个 glob 必须带注释说明理由。
+# 历史教训:旧清单只记顶层 suite 名 = 基线内 suite 的**内部新增子失败被整体豁免**
+# (docs/V5_CI.md 曾自承此盲区)。现在子测试级新失败一样红。
+# 维护:修掉一个存量失败 → stale 告警会点名 → 删除对应行。重生成命令见 docs/V5_CI.md
+# (基线真值必须取自 CI 环境的 TAP artifact,不是本机——两边环境失败集不同)。
+#
+# 基线真值:CI runs 29651159433/29650676184/29649945036(HEAD=6cd5a5f7)三轮并集。
 getV3ContainerStatus
+getV3ContainerStatus > active row + docker running → state='running'
 makeV3EnsureRunning
+makeV3EnsureRunning > active + missing → stopAndRemove(标 vanished) + provision 新容器 + ok
+makeV3EnsureRunning > active + missing(orphan cid=NULL, age>=15s)→ stopAndRemove 翻 vanished + reprovision 自愈(既有路径不回归)
+makeV3EnsureRunning > active + running 但镜像过期 → stopAndRemove + 用新镜像 provision(滚动回收)
+makeV3EnsureRunning > active + stopped(docker exited)→ stopAndRemove(标 vanished) + provision 新容器 + ok (v1.0.117)
+makeV3EnsureRunning > provision 失败(image guard ImageOutdated)→ ContainerUnreadyError('image_outdated', 300s) 且不发起 docker create
+makeV3EnsureRunning > provision 失败(image missing)→ ContainerUnreadyError('image_missing', 300s)
+makeV3EnsureRunning > provision 时 host 满 per-host cap → ContainerUnreadyError('host_full', retryAfter=10)
+makeV3EnsureRunning > 无 active 行 + provision 后 healthz timeout → ContainerUnreadyError('starting')
+makeV3EnsureRunning > 无 active 行 → 走 provision 路径,成功后返新容器 endpoint
 preCheck — BINV-5: cost multiplier 不进 preCheck 路径
+preCheck — BINV-5: cost multiplier 不进 preCheck 路径 > 行为层: preCheck 执行只 SELECT credits FROM users,不触 agent_cost_overrides
 provisionV3Container
-# 2026-07-10 登记:下行随 07-07 NameConflict 自愈修复(b9bcd348 时代)落地,但同日起
-# commercial-unit 门被握手测试丢帧竞态挂死(46303b5b 已修),该项从未被门检出过。
-# 零改动探针 PR #15(基底 ad954fcf+仅挂死修复)复现同一失败,证实为基底存量、
-# CI 环境依赖(docker mock 行为),非任何在途分支引入。修掉后删除本行。
-provisionV3Container — docker create NameConflict 自愈
+provisionV3Container > Codex relay env: passes non-secret knobs but rewrites upstream URL to container loopback relay
+provisionV3Container > agent_containers row: bound_ip + secret_hash(SHA256 BYTEA) + state=active + container_internal_id
+provisionV3Container > container.start 失败 → docker rm -f + 补偿翻 vanished(Tx1 已提交)
+provisionV3Container > docker createContainer 参数符合 §9.3 全部硬约束
+provisionV3Container > docker createContainer 失败 → Tx1 提交后中段失败,补偿翻 vanished(不留 active 行)
+provisionV3Container > idx_ac_host_bound_ip_active(0030 composite,0048 后新仲裁器)冲突也走 retry 路径
+provisionV3Container > placement 指定 boundIp 的 fixed 分支也写 image(v1.0.200 image col 回归锁)
+provisionV3Container > rejects mock secret 不是 64 hex(防生成器漂移)
+provisionV3Container > uniq_ac_bound_ip_active 冲突自动重试换 IP
+provisionV3Container > 结构性守卫:docker.createContainer / start 被调时 provision client 上无悬挂 BEGIN(Tx1 已 COMMIT 释放)
+provisionV3Container > 资源限额 env 覆盖:合法小数 CPU 正确转换 + 非法微值回退默认(Codex round 1 BLOCKER 回归锁)
 provisionV3Container — CCB baseline 挂载分支
+provisionV3Container — CCB baseline 挂载分支 > (root only) baseline 齐全 → 10 条 Binds(5 volume + codex-auth + ssh + AGENTS.md + CLAUDE.md + skills 父目录)
+provisionV3Container — CCB baseline 挂载分支 > baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(7 条 Binds:5 volume + codex-auth + ssh,无 baseline ro)
+provisionV3Container — CCB baseline 挂载分支 > baseline 缺失 + optional 未开 → 抛 CcbBaselineMissing
 provisionV3Container — RemoteContractViolation 守门(v1.0.8)
+provisionV3Container — RemoteContractViolation 守门(v1.0.8) > createAndStart 返回 null(整个响应缺失)→ RemoteContractViolation + 补偿翻 vanished
+provisionV3Container — RemoteContractViolation 守门(v1.0.8) > createAndStart 返回 {containerInternalId: '   '} (纯空白) → RemoteContractViolation + 补偿翻 vanished
+provisionV3Container — RemoteContractViolation 守门(v1.0.8) > createAndStart 返回 {containerInternalId: ''} → RemoteContractViolation + 补偿翻 vanished
+provisionV3Container — RemoteContractViolation 守门(v1.0.8) > createAndStart 返回 {containerInternalId: undefined} → RemoteContractViolation + 补偿翻 vanished
 provisionV3Container — image label guard (v1.0.84 PR \#4)
+provisionV3Container — image label guard (v1.0.84 PR \#4) > enforce + features 是 v3-sink-extra(子串非 token)→ ImageOutdated
+provisionV3Container — image label guard (v1.0.84 PR \#4) > enforce + features 缺 v3-sink → SupervisorError code=ImageOutdated;无 BEGIN/INSERT/createContainer 副作用
+provisionV3Container — image label guard (v1.0.84 PR \#4) > enforce + getImage().inspect() 抛 generic Error → 透 wrapDockerError,非 ImageOutdated
+provisionV3Container — image label guard (v1.0.84 PR \#4) > enforce + getImage().inspect() 抛 statusCode=404(image absent)→ guard 放行;后续撞 ImageNotFound 走原路径
+provisionV3Container — image label guard (v1.0.84 PR \#4) > enforce + 完全无 oc.runtime.features key → ImageOutdated
+provisionV3Container — image label guard (v1.0.84 PR \#4) > facade 路径 + features 含 v3-sink → 走 containerService.inspectImage,docker.getImage 不被触
+provisionV3Container — image label guard (v1.0.84 PR \#4) > facade 路径 + features 缺 v3-sink → ImageOutdated;detail 含 resolved hostId(非 'self')
+provisionV3Container — image label guard (v1.0.84 PR \#4) > facade 路径 + inspectImage 抛 generic Error → wrapDockerError,非 ImageOutdated
+provisionV3Container — image label guard (v1.0.84 PR \#4) > facade 路径 + inspectImage 返 null(image absent)→ guard 放行(不抢 ImageNotFound)
+provisionV3Container — image label guard (v1.0.84 PR \#4) > monolith fallback + features 含 v3-sink → provision 正常,docker.getImage 被调 1 次
+provisionV3Container — image label guard (v1.0.84 PR \#4) > off 模式 → guard 完全 short-circuit,docker.getImage 不被调
+provisionV3Container — image label guard (v1.0.84 PR \#4) > warn 模式 + features 缺 v3-sink → console.warn 一次,provision 仍成功
+provisionV3Container — image label guard (v1.0.84 PR \#4) > 非法值(env=garbage)走 enforce 默认 → 缺 v3-sink 抛 ImageOutdated
+provisionV3Container — image label guard (v1.0.84 PR \#4) > 默认值(env 未设)= enforce → 缺 v3-sink 仍抛 ImageOutdated
 provisionV3Container — per-host bridge gateway env injection
+provisionV3Container — per-host bridge gateway env injection > remote host + bridgeCidr 形状不符 → InvalidArgument(docker create 前拦截)
+provisionV3Container — per-host bridge gateway env injection > remote host + bridgeCidr=172.30.1.0/24(boheyun)→ env 注入 172.30.1.1
+provisionV3Container — per-host bridge gateway env injection > remote host + bridgeCidr=172.30.2.0/24(tk1)→ env 注入 172.30.2.1
+provisionV3Container — per-host bridge gateway env injection > remote host + 缺 bridgeCidr → InvalidArgument(fail-fast,不静默退化为 self IP)
+provisionV3Container — per-host bridge gateway env injection > self host 默认路径(monolith)→ env 仍是 V3_GATEWAY_IP=172.30.0.1
 provisionV3Container — per-host max_containers cap (3I)
+provisionV3Container — per-host max_containers cap (3I) > INSERT 行的 host_uuid = effectiveHostUuid(hostId 优先于 selfHostId)
+provisionV3Container — per-host max_containers cap (3I) > INSERT 行的 host_uuid = effectiveHostUuid(selfHostId 兜底时)
+provisionV3Container — per-host max_containers cap (3I) > active < cap → 正常 provision(host max=3,2 active)
+provisionV3Container — per-host max_containers cap (3I) > active = cap → 抛 SupervisorError('HostFull') 在事务内 + 不动 docker
+provisionV3Container — per-host max_containers cap (3I) > active > cap(运维手动塞了多)→ 仍然 HostFull,不会绕过
+provisionV3Container — per-host max_containers cap (3I) > compute_hosts 行 missing(max_containers IS NULL)→ InvalidArgument
+provisionV3Container — per-host max_containers cap (3I) > effectiveHostUuid 缺失(无 hostId 也无 selfHostId)→ InvalidArgument fail-closed
+provisionV3Container — per-host max_containers cap (3I) > env OC_MAX_RUNNING_CONTAINERS 已废弃 → no-op,只看 compute_hosts.max_containers
+provisionV3Container — per-host max_containers cap (3I) > hostId="" + selfHostId 合法 → InvalidArgument (拒绝静默退化为 selfHostId)
+provisionV3Container — per-host max_containers cap (3I) > vanished 行不计入 cap(已死容器不占容量)
+provisionV3Container — per-host max_containers cap (3I) > 两个 host 各自独立 cap(hostA 满,hostB 空 → hostB 仍可 provision)
+provisionV3Container — per-host max_containers cap (3I) > 非 canonical UUID(大写/缺位/带空格)→ InvalidArgument fail-closed
 stopAndRemoveV3Container
-# 2026-07-11 清债:userChatBridge 全部 6 套件修绿并移出清单——根因三类:①sys.relay_ready
-# 连接性帧插队 vs once 取帧竞态(改 frameCollector+nextBusinessFrame 过滤);②close code
-# 语义演进后断言陈腐(kick=4505/shutdown=4509/模型未授权=4507/容器超大帧=maxPayload→1011);
-# ③ring replay miss 断言锁了 1b488863 已废除的"bridge 越权 resume_failed"旧语义(现契约=
-# miss 静默,裁决在容器)。此后该文件必须保持全绿,新失败=真回归。
+stopAndRemoveV3Container > stops + removes + sets state='vanished'
 v3 agent_migrations ledger — INV-8 留 placeholder
-v3 agent_migrations reconciler — INV-10 (planned phase bottom-line, R6.11 §14.2.6)
-v3 reconciler — INV-7 占位(Phase 2.D)
-v3 reconciler — 非 planned phase 静默 skip(Phase 2.C MVP, Phase 2.D 待落)
+v3 agent_migrations ledger — INV-8 留 placeholder > INV-8(待 §14.2.4 ⑥f writer 落地后转 active):⑥f routing ACK 超时分支不回退 state / host_id;只 force-rm 旧 paused 容器,留 phase='attached_route' 等 §14.2.6 reconciler 推前。当下 writer 代码不存,无被测对象,转 active 会制造假覆盖。Phase 2 plan Codex review 第 6/7 点确认保留
 v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3)
-v3 sweepers — INV-2 open migration exclusion(NOT EXISTS + UPDATE guard + Direction A 保护)
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-3 — ensureRunning 早 guard:open migration → 503 'migration_in_progress'
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-3 — ensureRunning 早 guard:open migration → 503 'migration_in_progress' > open migration phase='created' → ContainerUnreadyError(2, 'migration_in_progress') + 不进 docker / readiness
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-3 — ensureRunning 早 guard:open migration → 503 'migration_in_progress' > open migration phase='planned' → ContainerUnreadyError(2, 'migration_in_progress') + 不进 docker / readiness
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-3 — ensureRunning 早 guard:open migration → 503 'migration_in_progress' > open migration phase='started' → ContainerUnreadyError(2, 'migration_in_progress') + 不进 docker / readiness
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-3 — ensureRunning 早 guard:open migration → 503 'migration_in_progress' > 无 open migration(空 ledger)→ ensureRunning 走到下一步(由 forbidden docker.getContainer 引爆,证明 INV-3 未拦)
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁)
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + committed migration → getV3ContainerStatus 仍返 row(终态不阻塞 reuse)
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + open migration phase='attached_pre' → getV3ContainerStatus 返 null
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + open migration phase='attached_route' → getV3ContainerStatus 返 null
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + open migration phase='created' → getV3ContainerStatus 返 null
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + open migration phase='detached' → getV3ContainerStatus 返 null
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + open migration phase='planned' → getV3ContainerStatus 返 null
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + open migration phase='started' → getV3ContainerStatus 返 null
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + rolled_back migration → getV3ContainerStatus 仍返 row
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > active row + 无 migration → getV3ContainerStatus 返 row(baseline)
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3) > INV-4 — getV3ContainerStatus NOT EXISTS half(SQL 行为锁) > 不同 user 的 open migration 不阻塞本 user 的 SELECT(uid 维度隔离)
 v3migrationLedger — INV-6 (createPlannedMigration contract)
+v3migrationLedger — INV-6 (createPlannedMigration contract) > INV-6 防双 open:同 container 第二次 createPlannedMigration → 23505 unique violation
+v3migrationLedger — INV-6 (createPlannedMigration contract) > INV-6: createPlannedMigration → phase='planned' + new_cid NULL + paused_at NULL
 v3migrationLedger — TERMINAL_PHASES 常量正确性(防 future bug)
+v3migrationLedger — TERMINAL_PHASES 常量正确性(防 future bug) > TERMINAL_PHASES 含且仅含 committed / rolled_back
 v3migrationLedger — findOpenByContainer / listStale (reader side)
+v3migrationLedger — findOpenByContainer / listStale (reader side) > findOpenByContainer:planned 行返回;committed 行不返
+v3migrationLedger — findOpenByContainer / listStale (reader side) > findOpenByContainer:rolled_back 行不返
+v3migrationLedger — findOpenByContainer / listStale (reader side) > listStale:committed / rolled_back 行不返
+v3migrationLedger — findOpenByContainer / listStale (reader side) > listStale:phase 未结束 + updated_at < cutoff 行被返
+v3migrationLedger — findOpenByContainer / listStale (reader side) > listStale:thresholdSec 非法值 throw
 v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口)
+v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口) > findOpenByUser:active container + planned migration → 返 OpenMigrationSummary
+v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口) > findOpenByUser:container 状态非 active/pending_apply → null
+v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口) > findOpenByUser:migration committed → null
+v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口) > findOpenByUser:migration rolled_back → null
+v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口) > findOpenByUser:其他 uid → null(uid 锁身份)
+v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口) > findOpenByUser:无 migration → null
 v3migrationLedger — markPhase / 终态 markers
+v3migrationLedger — markPhase / 终态 markers > markCommitted → phase='committed' + committed_at NOT NULL + updated_at 推进
+v3migrationLedger — markPhase / 终态 markers > markPhase 同事务可写 pausedAt(③ pause 路径)
+v3migrationLedger — markPhase / 终态 markers > markPhase('created', {newContainerInternalId}) → cid + updated_at 推进 + paused_at 仍 NULL
+v3migrationLedger — markPhase / 终态 markers > markRolledBack → phase='rolled_back' + committed_at 保持 NULL(终态语义)
 v3migrationLedger — markPhase 入参 guard(Codex Phase 2.A review v2 BLOCKER)
+v3migrationLedger — markPhase 入参 guard(Codex Phase 2.A review v2 BLOCKER) > markPhase('committed' as any) → 抛 MigrationPhaseInputError;行不被修改
+v3migrationLedger — markPhase 入参 guard(Codex Phase 2.A review v2 BLOCKER) > markPhase('rolled_back' as any) → 抛 MigrationPhaseInputError;不让 unique partial idx 失效
 v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2)
-# 下一条为负载敏感 flaky(同日更早一轮本机跑观测到,近两轮未复现;若长期不再出现可删):
+v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2) > markCommitted 后再 markPhase 抛 MigrationGuardError 且不修改行
+v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2) > markCommitted 后再 markRolledBack 抛 — 防 committed_at 残留+phase 矛盾
+v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2) > markRolledBack 后再 markCommitted 抛 — 防 committed_at 反向覆盖
+v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2) > 不存在的 migrationId markPhase 抛 MigrationGuardError(WHERE rowCount=0)
+v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2) > 重复 markCommitted 第二次抛 — 不静默幂等
+#
+# ── 以下为三轮 CI 均未失败、但历史上反复出没的负载敏感 flaky 套件(旧基线遗留)。
+# 用显式 glob 豁免以防随机翻红;连续两周 stale 不再出没即删行(监督=stale 告警)。
 assertPlatformDefaultModelConfigured
-# 2026-07-11 登记:本机补长驻 octest-redis(56379)后首次暴露——该 metrics 测试在 redis
-# 可达时走到新分支稳定失败;基线树(aurora@1f4bef5c)同法复现 11/12 同一子测,非在途
-# 分支引入。修掉后删除本行。
+assertPlatformDefaultModelConfigured > *
 V3 2I-2 — anthropicProxy + bridge histograms/counters
+V3 2I-2 — anthropicProxy + bridge histograms/counters > *
+provisionV3Container — docker create NameConflict 自愈
+provisionV3Container — docker create NameConflict 自愈 > *
+v3 agent_migrations reconciler — INV-10 (planned phase bottom-line, R6.11 §14.2.6)
+v3 agent_migrations reconciler — INV-10 (planned phase bottom-line, R6.11 §14.2.6) > *
+v3 reconciler — INV-7 占位(Phase 2.D)
+v3 reconciler — INV-7 占位(Phase 2.D) > *
+v3 reconciler — 非 planned phase 静默 skip(Phase 2.C MVP, Phase 2.D 待落)
+v3 reconciler — 非 planned phase 静默 skip(Phase 2.C MVP, Phase 2.D 待落) > *
+v3 sweepers — INV-2 open migration exclusion(NOT EXISTS + UPDATE guard + Direction A 保护)
+v3 sweepers — INV-2 open migration exclusion(NOT EXISTS + UPDATE guard + Direction A 保护) > *

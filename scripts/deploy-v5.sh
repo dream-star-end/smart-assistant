@@ -5228,34 +5228,119 @@ knowledge_planet_plugin_smoke_gate() { # <pinned master release>
     npx --no-install tsx packages/commercial/scripts/seed-knowledge-planet-plugin.ts --smoke-only"
 }
 
+# ── env 必备键门(2026-07-18 门禁审计批E):激活前 fail-closed 校验远端 $V5_ENV 含
+# deploy/v5/required-env-keys.txt 的每个键。只查存在性不查值(值权威=现网文件)。
+# 背景:07-08/07-11 Resend 两断=env 双源回灌冲掉热修密钥,静默断数天——键丢失类灾难
+# 此前无任何提交前/部署前防线。新增关键键必须同步登记清单。
+assert_env_required_keys() {
+  local manifest="$REPO_ROOT/deploy/v5/required-env-keys.txt" keys missing
+  [[ -f "$manifest" ]] || { echo "✗ env 必备键清单缺失:$manifest" >&2; return 1; }
+  keys="$(grep -v -e '^[[:space:]]*$' -e '^#' "$manifest")"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] assert env required keys($(wc -l <<<"$keys") 个)@ $V5_ENV"
+    return 0
+  fi
+  missing="$(ssh "$KL_HOST" bash -s -- "$V5_ENV" <<REMOTE
+set -euo pipefail
+env_file="\$1"
+[[ -f "\$env_file" ]] || { echo "__ENV_FILE_MISSING__"; exit 0; }
+while IFS= read -r k; do
+  [[ -n "\$k" ]] || continue
+  grep -q "^\$k=" "\$env_file" || echo "\$k"
+done <<'KEYS'
+$keys
+KEYS
+REMOTE
+)" || { echo "✗ env 必备键校验执行失败(ssh/远端错误)" >&2; return 1; }
+  if [[ "$missing" == "__ENV_FILE_MISSING__" ]]; then
+    echo "✗ 远端 env 文件不存在:$V5_ENV(先跑 bootstrap)" >&2
+    return 1
+  fi
+  if [[ -n "$missing" ]]; then
+    echo "✗ 远端 $V5_ENV 缺必备键(键丢失=Resend 断邮类静默灾难面,拒绝激活):" >&2
+    sed 's/^/    /' <<<"$missing" >&2
+    echo "  修复:补齐键后重试;确属退役键则从 deploy/v5/required-env-keys.txt 删行。" >&2
+    return 1
+  fi
+  echo "  ✓ env 必备键齐全($(wc -l <<<"$keys") 个)"
+}
+
+# ── 豁免留痕(2026-07-18 门禁审计):V5_SMOKE_TURN=0 / V5_SMOKE_E2E=0 是部署链上仅存的
+# 显式 fail-open 逃逸口。豁免必须"可见":豁免即写 kl-mirror 持久 marker,v5-monitor 持续
+# warning 告警,直到对应门在后续任意 lane 真跑通过(smoke_* 成功即清除)。禁止手工删 marker。
+SMOKE_WAIVER_DIR="/var/lib/openclaude-v5"
+record_smoke_waiver() { # <turn|e2e>
+  local gate="$1" commit
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] record smoke waiver gate=$gate"; return 0; fi
+  commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  ssh "$KL_HOST" bash -s -- "$SMOKE_WAIVER_DIR" "$gate" "$commit" <<'REMOTE' \
+    || echo "⚠ 豁免留痕写入失败(不阻断):请人工登记补跑义务 gate=$gate" >&2
+set -Eeuo pipefail
+dir="$1"; gate="$2"; commit="$3"
+mkdir -p -m 700 "$dir"
+jq -n --arg gate "$gate" --arg commit "$commit" --argjson at "$(date +%s)" \
+  '{gate:$gate,commit:$commit,waived_at:$at}' > "$dir/smoke-waiver-$gate.tmp" \
+  && mv -f "$dir/smoke-waiver-$gate.tmp" "$dir/smoke-waiver-$gate.json"
+REMOTE
+}
+clear_smoke_waiver() { # <turn|e2e>
+  if [[ "$DRY" == 1 ]]; then return 0; fi
+  ssh "$KL_HOST" "rm -f '$SMOKE_WAIVER_DIR/smoke-waiver-$1.json'" 2>/dev/null || true
+}
+# E2E 重试通过 = flake 记账(不清除;monitor 按 last_at 时间窗告警,流速归零即自然静默)。
+record_e2e_flake() {
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] record e2e flake"; return 0; fi
+  ssh "$KL_HOST" bash -s -- "$SMOKE_WAIVER_DIR" <<'REMOTE' \
+    || echo "⚠ E2E flake 留痕写入失败(不阻断)" >&2
+set -Eeuo pipefail
+dir="$1"; f="$dir/e2e-journey-flake.json"
+mkdir -p -m 700 "$dir"
+prev=0; [[ -f "$f" ]] && prev="$(jq -r '.count // 0' "$f" 2>/dev/null || echo 0)"
+jq -n --argjson prev "$prev" --argjson at "$(date +%s)" '{count:($prev+1),last_at:$at}' \
+  > "$f.tmp" && mv -f "$f.tmp" "$f"
+REMOTE
+}
+
 # 2026-07-17 goal 事故门禁补强:激活后真跑一个 codex 引擎聊天 turn(canary 账号,
 # WS 全链路,PUT 建会话→inbound.message→text 判成)。背景:goal bug 致 codex 引擎
 # 100% turn 必挂时,健康端点/调度器 smoke 全绿——没有任何门跑过真 turn。
 # 失败 = 与 full smoke 同级的强校验失败(走对称补偿回滚)。V5_SMOKE_TURN=0 可跳过
-# (紧急场景明示豁免;默认必跑)。
-smoke_turn_canary() { # <pinned master release>
-  local release="$1"
+# (紧急场景明示豁免;默认必跑)。port 可覆盖(finalize/canary lane 打 candidate 口)。
+smoke_turn_canary() { # <pinned master release> [port]
+  local release="$1" port="${2:-$ACTIVE_PORT}"
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] real-turn canary(codex 引擎全链路)@ $release"
     return 0
   fi
-  echo "── smoke:canary 真 turn(codex 引擎全链路,port=$ACTIVE_PORT)──"
-  ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${ACTIVE_PORT}' timeout 300 node scripts/v5-smoke-turn-canary.mjs"
+  # 2026-07-18 批B:canary 升级为三格矩阵(codex-new/ccb-new/codex-reuse),串行三个真
+  # turn,timeout 从 300 提到 720(xhigh 思考档单 turn 可近 90s 静默窗)。
+  echo "── smoke:canary 真 turn 矩阵(codex/ccb × 新建/复用,port=$port)──"
+  ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${port}' timeout 720 node scripts/v5-smoke-turn-canary.mjs" \
+    || return 1
+  clear_smoke_waiver turn
 }
 
 # 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。背景:「点击添加附件无反应」
 # 回归上线 ~20h 才被用户报障 —— turn canary 只覆盖 WS 契约,健康端点不点 UI,前端交互
 # 层此前没有任何门。本门在**部署发起机本机**用真 Chromium(受信事件)走核心旅程:
-# UI 登录 → 附件全链(filechooser 弹出+真实上传)→ 目标入口 → 带附件发送上屏。
-# 脚本自建 ssh 隧道访问 $ACTIVE_PORT(kl-mirror 无浏览器;隧道由 node 进程管理,
+# UI 登录 → 附件全链(filechooser 弹出+真实上传)→ 目标入口 → 带附件发送 → J5 送达硬断言。
+# 脚本自建 ssh 隧道访问目标口(kl-mirror 无浏览器;隧道由 node 进程管理,
 # libuv spawn 不继承部署锁 fd,不会占住 /var/lock/oc-v5-deploy.lock)。
-# 失败语义(第一期):fail-loud 非零退出 = 部署判定失败,但**不进 validation 自动回滚链**
-# —— UI 断言存在文案/选择器漂移的假阳性面,整 release 自动回滚代价不对称;连续两周零
-# 假阳性后升级进 validation_failure 链(升级时同步 v5ReleaseSafety 断言)。
-# 调用位置 = 各成功出口 end_planned_maintenance 之后(维护标记已清,UI 无维护态干扰)。
-# V5_SMOKE_E2E=0 显式豁免(紧急场景;默认必跑)。
-smoke_e2e_journey() {
-  [[ "${V5_SMOKE_E2E:-1}" == 1 ]] || { echo "  · E2E 旅程门已显式豁免(V5_SMOKE_E2E=0)"; return 0; }
+# 失败语义(2026-07-18 门禁审计升级,二期):本门已进 validation 补偿链——deploy/dist 在
+# 激活后、end_planned_maintenance 前调用,失败=与 full smoke 同级 → 对称补偿回滚旧
+# release("已 live 才验、只喊不撤"的一期形态废止;J5 已实证真阳性捕获能力)。
+# maintenance marker 是纯监控静默(TTL 180s,超时自然失效),与 UI 展示无关,门在窗内跑
+# 无副作用。防 flake 毒化回滚链:首跑失败自动重试一次**全新旅程**——确定性回归两跑必
+# 双红;偶发竞态(如滚动窗 tape-race 存量 bug)过第二把时强制留痕(record_e2e_flake +
+# stderr),绝不静默,这是 fail-open 可见化而非掩蔽。
+# V5_SMOKE_E2E=0 显式豁免(紧急场景;默认必跑;豁免写持久 marker,monitor 告警到补跑)。
+smoke_e2e_journey() { # [port](默认 $ACTIVE_PORT;finalize 传 candidate 口)
+  local port="${1:-$ACTIVE_PORT}"
+  if [[ "${V5_SMOKE_E2E:-1}" != 1 ]]; then
+    echo "  · E2E 旅程门已显式豁免(V5_SMOKE_E2E=0)——写豁免留痕,monitor 将持续告警直到补跑通过"
+    record_smoke_waiver e2e
+    return 0
+  fi
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] E2E journey canary(真浏览器用户旅程)"
     return 0
@@ -5264,16 +5349,24 @@ smoke_e2e_journey() {
   # 缺失 = fail-loud 指引,绝不静默跳过(浏览器缺失→跳过 = fail-open,正是本门要消灭的洞)。
   if [[ ! -d "$REPO_ROOT/node_modules/playwright-core" ]]; then
     echo "✗✗ E2E 旅程门依赖缺失:$REPO_ROOT/node_modules/playwright-core 不存在。" >&2
-    echo "   在部署树执行 npm install 后重试;紧急豁免用 V5_SMOKE_E2E=0(需事后补跑)。" >&2
+    echo "   在部署树执行 npm install 后重试;紧急豁免用 V5_SMOKE_E2E=0(会留痕告警,事后必须补跑)。" >&2
     return 1
   fi
-  echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送,remote port=$ACTIVE_PORT)──"
-  if ! V5_E2E_REMOTE_PORT="$ACTIVE_PORT" timeout 240 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
-    echo "✗✗ E2E 旅程门失败:用户可感知路径疑似回归(登录/附件/目标/发送其一)。" >&2
-    echo "   部署已落地但判定失败 —— 核查失败截图(/tmp/e2e-journey-fail-*.png);" >&2
-    echo "   确认回归则 scripts/deploy-v5.sh --rollback;确认假阳性则修 journey 脚本断言并登记。" >&2
-    return 1
+  echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送/送达,remote port=$port)──"
+  if V5_E2E_REMOTE_PORT="$port" timeout 240 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
+    clear_smoke_waiver e2e
+    return 0
   fi
+  echo "⚠ E2E 旅程门首跑失败,自动重试一次(全新会话/全新旅程);确定性回归第二跑必然复现" >&2
+  if V5_E2E_REMOTE_PORT="$port" timeout 240 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
+    echo "⚠⚠ E2E 重试通过:按 flake 记账(疑似滚动窗竞态,见 v5-roll-recovery-tape-race),首跑截图留证(/tmp/e2e-journey-fail-*.png)" >&2
+    record_e2e_flake
+    clear_smoke_waiver e2e
+    return 0
+  fi
+  echo "✗✗ E2E 旅程门失败(连续两跑):用户可感知路径回归(登录/附件/目标/发送/送达其一)。" >&2
+  echo "   失败截图:/tmp/e2e-journey-fail-*.png;本门在补偿链内,调用方将对称回滚旧 release。" >&2
+  return 1
 }
 
 # C5:rollback 收尾后的 real-turn canary —— **非阻断**。回滚本体必须能落地,故这里
@@ -5282,7 +5375,7 @@ smoke_e2e_journey() {
 # V5_SMOKE_TURN=0 显式豁免(与 deploy 侧同一开关)。
 smoke_turn_canary_advisory() { # <pinned master release>
   local release="$1"
-  [[ "${V5_SMOKE_TURN:-1}" == 1 ]] || { echo "  · real-turn canary 已显式豁免(V5_SMOKE_TURN=0)"; return 0; }
+  [[ "${V5_SMOKE_TURN:-1}" == 1 ]] || { echo "  · real-turn canary 已显式豁免(V5_SMOKE_TURN=0)——写豁免留痕"; record_smoke_waiver turn; return 0; }
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] real-turn canary(rollback 后·非阻断)@ $release"
     return 0
@@ -5712,6 +5805,8 @@ deploy() {
   fi
   echo "── 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
+  echo "── env 必备键门(批E):激活前校验远端 env 键齐全 ──"
+  assert_env_required_keys
   # build_release:从锁定 sha 的 git archive 建不可变 release(--with-dist 时 vite build 进
   # reldir,代码+前端同一 release 共享一次翻转+重启;无 --with-dist 则硬链继承当前 dist)。
   # 背景(2026-07-10 事故):deploy 后紧跟 --dist 的成对重启会把刚续写的 turn 二次掐死 →
@@ -5882,13 +5977,24 @@ deploy() {
   if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
     validation_failure="full master smoke failed"
   fi
-  if [[ -z "$validation_failure" && "$DRY" != 1 && "${V5_SMOKE_TURN:-1}" == 1 ]] \
-    && ! smoke_turn_canary "$BUILT_RELEASE"; then
-    validation_failure="real-turn canary failed(codex 引擎真 turn 未出正文)"
+  if [[ -z "$validation_failure" && "$DRY" != 1 ]]; then
+    if [[ "${V5_SMOKE_TURN:-1}" == 1 ]]; then
+      smoke_turn_canary "$BUILT_RELEASE" \
+        || validation_failure="real-turn canary failed(codex 引擎真 turn 未出正文)"
+    else
+      echo "  · real-turn canary 已显式豁免(V5_SMOKE_TURN=0)——写豁免留痕,monitor 将持续告警直到补跑通过"
+      record_smoke_waiver turn
+    fi
   fi
   if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
     && ! dist_handshake_smoke "$ACTIVE_PORT"; then
     validation_failure="frontend build handshake failed"
+  fi
+  # 2026-07-18 门禁审计:E2E 旅程门进 validation 补偿链(激活后、KP 收尾/维护结束前)。
+  # 一期"成功出口 post-live 只喊不撤"的形态废止:UI 回归被抓到时必须还在补偿窗内,
+  # 失败 → 与 smoke/turn canary 同级 → 对称补偿回滚旧 release。函数内置豁免/重试/留痕。
+  if [[ -z "$validation_failure" ]] && ! smoke_e2e_journey; then
+    validation_failure="E2E journey gate failed(真浏览器用户旅程回归)"
   fi
   if [[ -z "$validation_failure" && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     echo "── Knowledge Planet Plugin:扫码 UI 已就绪，恢复旧 v1.0 listing gate──"
@@ -5919,7 +6025,6 @@ deploy() {
   if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     echo "  ✓ setup-first 完成：扫码实时感知已上线；Plugin/安装仍钉旧 v1.0，等待用户在界面绑定"
     end_planned_maintenance
-    smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
@@ -5928,7 +6033,6 @@ deploy() {
   if [[ "$kp_deploy_bracket" == 0 ]]; then
     echo "  · Knowledge Planet:零接触部署(门未关/classify 降级),跳过 seed;promotion 顺延至下次部署或显式 verify lane"
     end_planned_maintenance
-    smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=zero-touch)。"
@@ -5948,7 +6052,6 @@ deploy() {
     exit 1
   fi
   end_planned_maintenance
-  smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
   echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -6146,12 +6249,30 @@ activate_staged() {
 #      重启 master(全量 WS 重连 → 客户端拿到新 build id → 安全点软刷新);线上 / 的
 #      oc-build meta 必须等于本地构建值,fail-closed。
 # 回滚:index.html 回滚 = checkout 旧源码重跑 --dist;旧资产 14 天窗口内一直在线。
+
+# 2026-07-18 门禁审计:dist 对称补偿。此前 deploy_dist 激活后 smoke/握手失败只靠 set -e
+# 裸退出——坏 dist 保持 live、无回滚(与 deploy() 的 validation_failure 补偿链结构不对称,
+# 而 dist 恰是 UI 回归最高发面)。本函数收口"激活后强校验失败 → 恢复旧 release":
+# hotcfg 轴复用 rollback_runtime_tuple(与 rollback lane 同一原语;其内部 KP 括号本就
+# best-effort,最坏=插件休眠+大声告警,不阻断恢复);非 hotcfg 轴纯 symlink 回切。
+# 不引入第二套恢复机制。
+compensate_dist_activation() { # <new-release> <previous-release> <hotcfg:0|1>
+  local helper="$1" previous="$2" hotcfg="$3"
+  if [[ "$hotcfg" == 1 ]]; then
+    rollback_runtime_tuple 1 0 "$helper" 1 && smoke "$ACTIVE_PORT"
+  else
+    activate_release "$previous" && smoke "$ACTIVE_PORT"
+  fi
+}
+
 deploy_dist() {
   echo "══ v5 dist deploy(前端生效面,蓝绿)on $KL_HOST ══"
   # MAJOR 3 + BLOCKER 4:rollout 进行中拒绝;解析 active slot(蓝绿 finalize 后可能 B)。
   assert_no_rollout_in_progress
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
+  echo "── env 必备键门(批E):激活前校验远端 env 键齐全 ──"
+  assert_env_required_keys
   WITH_DIST=1   # 蓝绿:前端变更=建含新 dist 的完整 release + 原子翻转(同 deploy,一次重启)
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
   knowledge_planet_plugin_assert_release_compatible "$BUILT_RELEASE" "$BUILT_RELEASE" \
@@ -6182,6 +6303,9 @@ deploy_dist() {
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
   fi
+  # 对称补偿锚点:激活前钉住当前 live release(补偿目标)。
+  local dist_previous_release=""
+  dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
   begin_planned_maintenance dist 0
   # RFC §1.2:dist 翻转前活体断言远端 lease(此刻 live 未改,失活即干净退出)。
   if ! assert_mutation_lease_alive "dist-flip"; then
@@ -6193,11 +6317,32 @@ deploy_dist() {
   else
     activate_release "$BUILT_RELEASE"
   fi
-  [[ "$DRY" == 1 ]] || smoke "$ACTIVE_PORT"
-  dist_handshake_smoke "$ACTIVE_PORT"
+  # 2026-07-18 门禁审计:激活后强校验统一进 validation 链,任一失败 → 对称补偿恢复旧
+  # release(与 deploy() 同构;此前这里是 set -e 裸退出=坏 dist 保持 live)。
+  # dist(纯前端)是 UI 回归的最高发面(07-18 附件事故即 --dist 上线),E2E 旅程门必跑。
+  local validation_failure=""
+  if [[ "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
+    validation_failure="full master smoke failed"
+  fi
+  if [[ -z "$validation_failure" ]] && ! dist_handshake_smoke "$ACTIVE_PORT"; then
+    validation_failure="frontend build handshake failed"
+  fi
+  if [[ -z "$validation_failure" ]] && ! smoke_e2e_journey; then
+    validation_failure="E2E journey gate failed(真浏览器用户旅程回归)"
+  fi
+  if [[ -n "$validation_failure" ]]; then
+    echo "✗ $validation_failure；开始 dist 对称补偿(恢复旧 release)" >&2
+    require_mutation_lease_for_compensation "dist-validation-compensation" || exit 86
+    if ! compensate_dist_activation "$BUILT_RELEASE" "$dist_previous_release" "$hc_any"; then
+      mark_deploy_recovery_required "dist validation failed and compensation failed: $validation_failure"
+      end_planned_maintenance || true
+      exit 1
+    fi
+    end_planned_maintenance || true
+    echo "✗ dist 强校验失败；已确认回到旧 release,本次 dist 未生效" >&2
+    exit 1
+  fi
   end_planned_maintenance
-  # dist(纯前端)是 UI 回归的最高发面(2026-07-18 附件事故即 --dist 上线),E2E 旅程门必跑。
-  smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
   echo "✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -7138,6 +7283,20 @@ canary() {
     echo "  用 deploy-v5.sh --abort 撤下 candidate,或核查 candidate 健康后重跑 --canary。" >&2
     exit 1
   }
+  # READY 后真 turn 门(2026-07-18 门禁审计):candidate 必须能出一个三信号真 turn 才准
+  # 放量——此前 canary lane 只有 healthz/capability/路由预检,主链路功能零验证。位置在
+  # READY+内部验证之后:candidate 已按 lane 语义完整服务(percent=0,仅内部账号),真 turn
+  # 只打 candidate 主服务口,不碰真实用户流量。失败=candidate 保持 READY 但明示不可放量,
+  # 修复后重跑 --canary 或 --abort 撤下。
+  if [[ "$DRY" != 1 && "${V5_SMOKE_TURN:-1}" == 1 ]]; then
+    smoke_turn_canary "$reldir" "$(slot_port "$cand")" || {
+      echo "✗ canary candidate 真 turn 失败:candidate 不可放量。核查 candidate 主链路后重跑 --canary,或 --abort 撤下。" >&2
+      exit 1
+    }
+  elif [[ "$DRY" != 1 ]]; then
+    echo "  · canary 真 turn 门已显式豁免(V5_SMOKE_TURN=0)——写豁免留痕"
+    record_smoke_waiver turn
+  fi
   echo "✓ --canary 完成(gen=$((DS_generation)) candidate=$cand percent=0 allowlist=内部)。放量:deploy-v5.sh --promote=<pct>"
 }
 
@@ -7392,14 +7551,30 @@ finalize_run_steps() {
         exit 1
       fi
     fi
-    # fresh step5 与 resume step6 都在 commit stable 前跑完整 leader smoke + release/dist 握手。
-    # 任一失败都保留/拉起旧 slot 并进入 aborting，不制造“已切换但命令判失败”的终态。
+    # fresh step5 与 resume step6 都在 commit stable 前跑完整 leader smoke + release/dist 握手
+    # + 真 turn/E2E 功能门(2026-07-18 门禁审计:切主是直接改用户流量走向的不可逆点,此前
+    # 主链路功能零验证——healthz 全绿 ≠ turn 能出正文)。任一失败都保留/拉起旧 slot 并进入
+    # aborting，不制造“已切换但命令判失败”的终态。
     if [[ "$DRY" != 1 ]]; then
-      echo "── 提交 stable 前完整 smoke + candidate release/dist 握手 ──"
+      echo "── 提交 stable 前完整 smoke + candidate release/dist 握手 + 真 turn/E2E 功能门 ──"
+      local precommit_release="$DS_candidate_release" precommit_failed=""
+      [[ "$precommit_release" == /* ]] || precommit_release="$RELEASES_ROOT/$precommit_release"
+      if [[ "${V5_SMOKE_TURN:-1}" != 1 ]]; then
+        echo "  · finalize 提交前 real-turn canary 已显式豁免(V5_SMOKE_TURN=0)——写豁免留痕"
+        record_smoke_waiver turn
+      fi
       if ! smoke "$(slot_port "$cand")" || ! dist_handshake_smoke "$(slot_port "$cand")"; then
-        echo "✗ finalize 提交前 smoke/版本握手失败 → 转 aborting，保留恢复路径" >&2
+        precommit_failed="smoke/版本握手"
+      elif [[ "${V5_SMOKE_TURN:-1}" == 1 ]] \
+        && ! smoke_turn_canary "$precommit_release" "$(slot_port "$cand")"; then
+        precommit_failed="real-turn canary(切主前 candidate 真 turn)"
+      elif ! smoke_e2e_journey "$(slot_port "$cand")"; then
+        precommit_failed="E2E 旅程门(切主前 candidate 真浏览器旅程)"
+      fi
+      if [[ -n "$precommit_failed" ]]; then
+        echo "✗ finalize 提交前 ${precommit_failed} 失败 → 转 aborting，保留恢复路径" >&2
         require_mutation_lease_for_compensation "finalize-precommit-compensation" || exit 86
-        ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit smoke/dist handshake FAILED → aborting"
+        ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit gate(${precommit_failed}) FAILED → aborting"
         sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
         abort_continue "$old" "$cand"
         exit 1

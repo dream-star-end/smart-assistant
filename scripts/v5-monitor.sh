@@ -373,14 +373,97 @@ check_serving_masters() {
   fi
 }
 
+check_probe_result() { # <name> <file> <interval_secs> <人话>
+  # 持续探针结果消费(2026-07-18 门禁审计批B):探针(turn=kl-mirror timer 30min /
+  # e2e=部署发起机 timer 60min)只写结果文件,告警统一走本管线(去重/6h 重提/恢复)。
+  # 判定:文件缺失=探针未安装(bad,fail-visible);ok=false=探针失败(bad);
+  # 结果陈旧 >3×interval 且当前无 maintenance=探针失联(bad;本机宕机/timer 失效也要可见);
+  # kind=skipped(维护窗/变更 lease 避让)与 kind=flaky(重试通过)都算 ok(flake 流水账
+  # 由 e2e_flake 检查单独盯)。
+  local name="$1" f="$2" interval="$3" human="$4" ok at kind detail age
+  if [ ! -f "$f" ]; then record "$name" bad "$human:探针未安装/无结果($f)——跑 scripts/install-v5-probes.sh"; return; fi
+  ok="$(jq -r '.ok // false' "$f" 2>/dev/null || echo parse-error)"
+  at="$(jq -r '.at // 0' "$f" 2>/dev/null || echo 0)"
+  kind="$(jq -r '.kind // ""' "$f" 2>/dev/null || true)"
+  detail="$(jq -r '.detail // ""' "$f" 2>/dev/null | head -c 200)"
+  if [ "$ok" = "parse-error" ] || ! [ "$at" -gt 0 ] 2>/dev/null; then
+    record "$name" bad "$human:结果文件损坏($f)"; return
+  fi
+  age=$((NOW - at))
+  if [ "$age" -gt $((interval * 3)) ]; then
+    record "$name" bad "$human:结果陈旧 $((age/60))min(>3×${interval}s)——timer 失效/探针机失联"
+    return
+  fi
+  if [ "$ok" = "true" ]; then
+    record "$name" ok "$human:${kind:-probe} ok($((age/60))min 前)"
+  else
+    record "$name" bad "$human:探针失败(kind=$kind,$((age/60))min 前):$detail"
+  fi
+}
+
+check_mail_key_sync() {
+  # Resend key 双源一致性(2026-07-18 门禁审计批E)。背景:07-11 事故=重跑 bootstrap 时
+  # env 从 v3 env(已退役但仍是派生源)回灌,冲掉热修 RESEND_API_KEY,验证邮件静默断
+  # 数天。bootstrap 存在性守卫已堵"重跑回灌"路径;本检查盯**回灌源本身的陈旧度**:
+  # v3 env 仍存在且 key 与 v5 不一致 → 它就是一颗哑弹(任何"确要重建先移走 env 文件"
+  # 的操作都会把旧 key 灌回来)→ warning 直到两侧同步或 v3 env 移除。
+  local v5env="/etc/openclaude/commercial-v5.env" v3env="/etc/openclaude/commercial.env" k5 k3
+  if [ ! -f "$v3env" ]; then record mail_key_sync ok "v3 env 已移除,无回灌源"; return; fi
+  k5="$(grep '^RESEND_API_KEY=' "$v5env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  k3="$(grep '^RESEND_API_KEY=' "$v3env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [ -z "$k5" ]; then record mail_key_sync bad "v5 env 缺 RESEND_API_KEY(邮件通道键丢失)"; return; fi
+  if [ -n "$k3" ] && [ "$k3" != "$k5" ]; then
+    record mail_key_sync bad "v3 env(bootstrap 派生源)的 RESEND_API_KEY 与 v5 不一致——回灌哑弹,同步或移除 $v3env"
+  else
+    record mail_key_sync ok "Resend key 双源一致(或 v3 侧无该键)"
+  fi
+}
+
+check_smoke_waiver() {
+  # 部署门豁免留痕(2026-07-18 门禁审计):deploy-v5.sh 在 V5_SMOKE_TURN=0/V5_SMOKE_E2E=0
+  # 豁免时写 /var/lib/openclaude-v5/smoke-waiver-<gate>.json,对应门后续真跑通过才清除。
+  # 存在 = 有未补跑的部署验证债 → 持续 warning(6h 重提),消灭"豁免后忘补跑"的静默窗。
+  # 两侧契约:marker 路径/清除语义在 deploy-v5.sh record_smoke_waiver/clear_smoke_waiver。
+  local dir="/var/lib/openclaude-v5" f found="" detail=""
+  for f in "$dir"/smoke-waiver-*.json; do
+    [ -f "$f" ] || continue
+    found=1
+    detail="$detail$(jq -r '"[\(.gate)] 豁免于 \(.waived_at|todate) commit=\(.commit[0:8])"' "$f" 2>/dev/null || echo "[$(basename "$f")] 内容损坏") "
+  done
+  if [ -n "$found" ]; then
+    record smoke_waiver bad "部署门豁免未补跑:${detail}——重跑对应门(deploy --smoke / E2E)通过后自动清除"
+  else
+    record smoke_waiver ok "无未补跑的部署门豁免"
+  fi
+}
+
+check_e2e_flake() {
+  # E2E 旅程门 flake 记账(deploy-v5.sh smoke_e2e_journey 重试通过时 +1):7 天窗口内有
+  # 记账 → warning。flake 常态 = 滚动窗竞态类存量 bug 的症状面(v5-roll-recovery-tape-race),
+  # 不是可忽略噪音;7 天无新增自然静默(marker 不清除,留流水账)。
+  local f="/var/lib/openclaude-v5/e2e-journey-flake.json" last count
+  if [ ! -f "$f" ]; then record e2e_flake ok "E2E 旅程门无 flake 记账"; return; fi
+  last="$(jq -r '.last_at // 0' "$f" 2>/dev/null || echo 0)"
+  count="$(jq -r '.count // 0' "$f" 2>/dev/null || echo 0)"
+  if [ "$last" -gt 0 ] && [ $((NOW - last)) -le $((7*86400)) ]; then
+    record e2e_flake bad "E2E 旅程门 7 天内出现重试通过(累计 ${count} 次,last=$(date -d "@$last" '+%m-%d %H:%M' 2>/dev/null)):部署门在靠重试续命,查滚动窗竞态类根因"
+  else
+    record e2e_flake ok "E2E 旅程门 7 天内无 flake(历史累计 ${count} 次)"
+  fi
+}
+
 # 检查项 → 告警 severity(方案 §2.3-2):服务/HTTP/公网/池/镜像 = critical(聊天全挂),
 # 磁盘/内存 = warning(容量预警,尚未致命)。未知项保守按 warning。
 # mail = critical:注册/找回密码链路对新用户等同全挂,且历史上两次静默断数天。
 check_severity() {
   case "$1" in
-    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures) echo critical ;;
+    # turn_probe = 主链路真 turn 主动探针,失败即"用户此刻发消息大概率挂"→ critical。
+    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures|turn_probe) echo critical ;;
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化。均按 warning。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm) echo warning ;;
+    # smoke_waiver/e2e_flake = 部署验证债与门 flake 记账,值得看但非现网故障。
+    # e2e_probe 依赖部署发起机在线,失联概率高于现网故障,先按 warning(稳定后可升级)。
+    # mail_key_sync = 回灌哑弹预警(尚未爆),warning;真断邮由 mail 检查按 critical 报。
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|smoke_waiver|e2e_flake|e2e_probe|e2e_sd_probe|mail_key_sync) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -417,6 +500,12 @@ check_mail
 check_turn_failures
 check_kp_plugin
 check_client_4xx_storm
+check_mail_key_sync
+check_smoke_waiver
+check_e2e_flake
+check_probe_result turn_probe /var/lib/openclaude-v5/turn-probe.json 1800 "持续 turn 探针"
+check_probe_result e2e_probe  /var/lib/openclaude-v5/e2e-probe.json  3600 "持续 E2E 旅程探针"
+check_probe_result e2e_sd_probe /var/lib/openclaude-v5/e2e-sd-probe.json 3600 "持续会话展示 e2e 探针(@smoke)"
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)

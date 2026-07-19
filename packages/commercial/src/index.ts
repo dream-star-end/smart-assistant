@@ -333,6 +333,7 @@ import {
   getModelCatalogCache,
   isModelAuthorityEnforced,
   peekModelCatalogCache,
+  shutdownModelCatalogCache,
 } from "./billing/modelCatalogRuntime.js";
 import {
   MASTER_CAPABILITIES,
@@ -5281,6 +5282,7 @@ export async function registerCommercial(
       // 0069 — 同理清空 literature skill provider(同进程热重启场景,且 closure 持
       // pg pool 句柄,留着会阻止 closePool 释放最后引用)
       try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
+      try { await shutdownModelCatalogCache(); } catch { /* ignore */ }
       try { await pricing.shutdown(); } catch { /* ignore */ }
       try { await redis.quit(); } catch { /* ignore */ }
       await closeModelCatalogAdminPool();

@@ -186,6 +186,14 @@ function buildFakePool(override: FakePoolOverride = {}) {
       return { rows: [], rowCount: 0 };
     }
 
+    if (head.startsWith("SELECT U.CREDITS::TEXT AS WALLET")) {
+      const c = override.userCredits ?? 99_999_999n;
+      return { rows: [{ wallet: c.toString(), period: "0" }], rowCount: 1 };
+    }
+    if (head.startsWith("SELECT (O.CREDITS + COALESCE(OS.PERIOD_CREDITS")) {
+      return { rows: [], rowCount: 0 };
+    }
+
     if (head.startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")) {
       return { rows: [], rowCount: 1 };
     }
@@ -195,9 +203,17 @@ function buildFakePool(override: FakePoolOverride = {}) {
     if (head.startsWith("INSERT INTO USAGE_RECORDS")) {
       return { rows: [{ id: "1" }], rowCount: 1 };
     }
+    if (head.startsWith("SELECT M.ORG_ID::TEXT AS ORG_ID")) {
+      // resolveOrgBillingContext:外接 key fixture 不属于企业组织。
+      return { rows: [], rowCount: 0 };
+    }
     if (head.startsWith("SELECT CREDITS")) {
       const c = override.userCredits ?? 99_999_999n;
       return { rows: [{ credits: c.toString() }], rowCount: 1 };
+    }
+    if (head.startsWith("SELECT ID::TEXT AS ID, PERIOD_CREDITS::TEXT AS PERIOD_CREDITS")) {
+      // spendTwoBucket:无 active 个人订阅，全部从持久钱包扣。
+      return { rows: [], rowCount: 0 };
     }
     if (head.startsWith("UPDATE USERS SET CREDITS")) {
       return { rows: [], rowCount: 1 };
@@ -463,6 +479,13 @@ class MockRes {
     if (!this.listeners.has(ev)) this.listeners.set(ev, []);
     this.listeners.get(ev)!.push(cb);
     return this;
+  }
+  once(ev: string, cb: (...a: unknown[]) => void): this {
+    const wrapped = (...args: unknown[]) => {
+      this.off(ev, wrapped);
+      cb(...args);
+    };
+    return this.on(ev, wrapped);
   }
   off(ev: string, cb: (...a: unknown[]) => void): this {
     const arr = this.listeners.get(ev);
@@ -1254,21 +1277,21 @@ describe("Phase 5 Step 7 — H1 / H2 / PII strip / fallback golden tests", () =>
     assert.ok(last0.startsWith("# OpenClaude Platform Context"));
   });
 
-  test("H1.2 同 userId 不同 client body → metadata.user_id keyset 同形态 + account_uuid 字节级稳定 + session_id 各异", async () => {
+  test("H1.2 同 userId 不同 client body → keyset 同形态 + account_uuid 稳定 + client session_id 保真", async () => {
     const accountUuids: string[] = [];
     const sessionIds: string[] = [];
     const keysets: string[][] = [];
     for (let i = 0; i < 3; i++) {
       const cap = makeCapturingFetch();
       const h = buildHarness({ fetchImpl: cap.fetchImpl });
-      // 客户端透传一个 session_id 占位值,验它必被覆盖
+      // 2026-05-25 反关联修复后，合法 client session_id 是会话 pin 权威，服务端必须保真。
       const res = await h.run({
         body: {
           ...minBody(),
           metadata: {
             user_id: JSON.stringify({
               device_id: `client-${i}-deviceid`,
-              session_id: "CLIENT_INJECTED_SESSION_DO_NOT_LEAK",
+              session_id: `client-session-${i}`,
             }),
           },
         },
@@ -1291,15 +1314,11 @@ describe("Phase 5 Step 7 — H1 / H2 / PII strip / fallback golden tests", () =>
     // account_uuid 同 userId 跨多次稳定
     assert.equal(accountUuids[0], accountUuids[1]);
     assert.equal(accountUuids[1], accountUuids[2]);
-    // session_id 各不相同 + 都不等于 client 透传值
+    // 三个客户端会话各自保留其稳定 session_id；不能再按旧 Phase 5 语义每请求随机覆盖。
     assert.notEqual(sessionIds[0], sessionIds[1]);
     assert.notEqual(sessionIds[1], sessionIds[2]);
-    for (const sid of sessionIds) {
-      assert.notEqual(sid, "CLIENT_INJECTED_SESSION_DO_NOT_LEAK");
-      assert.match(
-        sid,
-        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-      );
+    for (let i = 0; i < sessionIds.length; i++) {
+      assert.equal(sessionIds[i], `client-session-${i}`);
     }
   });
 

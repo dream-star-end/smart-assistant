@@ -58,6 +58,7 @@ import { computeAccountKey } from '../connectors/store.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError } from '../http/util.js'
 import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
@@ -128,11 +129,7 @@ async function probePg(): Promise<boolean> {
 }
 
 async function dropAllTables(): Promise<void> {
-  const db = await query<{ db: string }>('SELECT current_database() AS db')
-  if (!/_test$/.test(db.rows[0]?.db ?? '')) throw new Error('refusing to drop non-test db')
-  await query(`DO $$ DECLARE r RECORD; BEGIN
-    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname='public') LOOP
-      EXECUTE 'DROP TABLE IF EXISTS public.'||quote_ident(r.tablename)||' CASCADE'; END LOOP; END $$;`)
+  await resetTestSchemaForTest()
 }
 
 // ─── 受控本地上游(同时扮演 token origin 与 api origin,按 path 分流) ──────────
@@ -520,11 +517,6 @@ before(async () => {
 after(async () => {
   if (server) await server.close()
   if (pgAvailable) {
-    try {
-      await dropAllTables()
-    } catch {
-      /* */
-    }
     await closePool()
   }
 })
