@@ -329,9 +329,9 @@ function weiboPlugin() {
       { id: 'create_post', description: '发布微博', readOnly: false as const },
     ],
     installed: true,
-    installedVersion: '1.1.0',
+    installedVersion: '1.2.0',
     latestVersionId: '301',
-    latestVersion: '1.1.0',
+    latestVersion: '1.2.0',
     installedCurrent: true,
     updateAvailable: false,
     available: true,
@@ -1570,7 +1570,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     render(<ConnectorsTab auth={auth} />)
     expect(
-      await screen.findByText('开启后，Agent 可直接执行此 Plugin 的全部已开放写入动作；默认关闭。'),
+      await screen.findByText('开启后，Agent 直接执行写入，不展示确认卡；默认关闭。'),
     ).toBeInTheDocument()
     const preapprovalSwitch = screen.getByRole('switch', { name: '我的微博免逐次确认' })
     expect(preapprovalSwitch).not.toBeChecked()
@@ -1591,8 +1591,9 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
         disclaimerVersion: 1,
       }),
     )
-    expect(await screen.findByText(/微博“免逐次确认”已开启/)).toBeInTheDocument()
+    expect(await screen.findByText(/微博“免逐次确认”已开启.*不再展示确认卡/)).toBeInTheDocument()
     await waitFor(() => expect(preapprovalSwitch).toBeChecked())
+    expect(screen.getByText('已生效：Agent 直接执行写入，不展示确认卡。')).toBeInTheDocument()
     fireEvent.click(preapprovalSwitch)
     await waitFor(() =>
       expect(mockedSetPluginWritePreapproval).toHaveBeenLastCalledWith(auth, '3', {
@@ -1600,6 +1601,43 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       }),
     )
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  test('微博条款版本升级后明确提示重新同意，不把旧授权显示为已生效', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const account: RuntimePluginAccount = {
+      id: '3',
+      provider: 'weibo',
+      pluginType: 'managed-browser',
+      displayName: '我的微博',
+      accountHint: '微博扫码账号',
+      status: 'active',
+      actions: weiboPlugin().actions,
+      versionId: '301',
+      executable: true,
+      writeControl: weiboWriteControl({
+        enabled: false,
+        disclaimerVersion: 3,
+        acceptedVersion: 2,
+        acceptedAt: '2026-07-19T01:02:03.000Z',
+        preapproval: {
+          available: true,
+          enabled: false,
+          disclaimerVersion: 2,
+          acceptedVersion: 1,
+          acceptedAt: '2026-07-19T03:04:05.000Z',
+          disclaimerText: '新版免确认条款',
+        },
+      }),
+    }
+    mockedPluginManagement.mockResolvedValue({ catalog: [weiboPlugin()], accounts: [account] })
+
+    render(<ConnectorsTab auth={auth} />)
+
+    expect(await screen.findByText('写入条款已更新，需重新同意')).toBeInTheDocument()
+    expect(screen.getByText('免确认条款已更新，需重新同意后才会生效。')).toBeInTheDocument()
+    expect(screen.getByText('需重新同意')).toBeInTheDocument()
+    expect(screen.queryByText('已生效：Agent 直接执行写入，不展示确认卡。')).not.toBeInTheDocument()
   })
 
   test('开启写入失败时在免责声明弹层内说明错误且不乐观翻转', async () => {

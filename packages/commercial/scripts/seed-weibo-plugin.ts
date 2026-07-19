@@ -127,7 +127,7 @@ async function exactImageSmoke(
       signal: new AbortController().signal,
     })
     storageState = executed.storageState
-    passed.push(actionId)
+    if (!passed.includes(actionId)) passed.push(actionId)
     return executed.result as Record<string, unknown>
   }
   const self = await run('get_self', {})
@@ -157,6 +157,26 @@ async function exactImageSmoke(
     keyword: String(user?.name ?? '微博').slice(0, 30) || '微博',
     count: 5,
   })
+  await run('get_unread_counts', {})
+  for (const category of ['mentions', 'comments', 'likes', 'followers'])
+    await run('list_notifications', { category, count: 5 })
+  const followers = await run('list_followers', { count: 5 })
+  const following = await run('list_following', { count: 5 })
+  const searchedUsers = await run('search_users', {
+    keyword: String(user?.name ?? '微博').slice(0, 30) || '微博',
+    count: 5,
+  })
+  await run('list_favorites', { count: 5 })
+  await run('list_liked_posts', { count: 5 })
+  await run('list_hot_searches', { count: 10 })
+  const threads = await run('list_message_threads', { count: 5 })
+  const messageTarget = [threads.threads, following.users, followers.users, searchedUsers.users]
+    .flatMap((items) => (Array.isArray(items) ? (items as Record<string, unknown>[]) : []))
+    .map((item) => String(item.userId ?? item.id ?? ''))
+    .find((candidate) => /^\d{5,20}$/.test(candidate))
+  if (!messageTarget)
+    throw new Error('verified account has no readable user for message-thread smoke')
+  await run('get_message_thread', { userId: messageTarget, count: 5 })
   return { storageState, selfId, passed }
 }
 

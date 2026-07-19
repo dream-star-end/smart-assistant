@@ -7,7 +7,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
 
 export const WEIBO_PLUGIN_SLUG = 'weibo'
-export const WEIBO_PLUGIN_VERSION = '1.1.0'
+export const WEIBO_PLUGIN_VERSION = '1.2.0'
 export const WEIBO_WORKER_DIGEST = createHash('sha256').update(WEIBO_WORKER_SOURCE).digest('hex')
 export const WEIBO_DRIVER_ID = `weibo-${WEIBO_WORKER_DIGEST.slice(0, 57)}`
 export const WEIBO_DRIVER_VERSION = WEIBO_PLUGIN_VERSION
@@ -92,6 +92,7 @@ const postSchema = {
     url: { type: 'string', maxLength: 512 },
     owned: { type: 'boolean' },
     liked: { type: 'boolean' },
+    favorited: { type: 'boolean' },
     likeCount: { type: 'integer', minimum: 0 },
     commentCount: { type: 'integer', minimum: 0 },
     repostCount: { type: 'integer', minimum: 0 },
@@ -134,6 +135,8 @@ const commentSchema = {
     text: { type: 'string', maxLength: 5_000 },
     createdAt: { type: 'string', maxLength: 128 },
     owned: { type: 'boolean' },
+    liked: { type: 'boolean' },
+    likeCount: { type: 'integer', minimum: 0 },
     parentCommentId: opaqueIdSchema,
     contentDigest: sha256Schema,
   },
@@ -157,6 +160,84 @@ const snapshotSchema = {
   type: 'object',
   properties: { expectedDigest: sha256Schema, owned: { type: 'boolean', enum: [true] } },
   required: ['expectedDigest', 'owned'],
+  additionalProperties: false,
+}
+const commentDeleteSnapshotSchema = {
+  type: 'object',
+  properties: {
+    expectedDigest: sha256Schema,
+    targetKind: { type: 'string', enum: ['own_comment', 'received_on_own_post'] },
+    postExpectedDigest: sha256Schema,
+  },
+  required: ['expectedDigest', 'targetKind'],
+  additionalProperties: false,
+}
+const notificationCategorySchema = {
+  type: 'string',
+  enum: ['mentions', 'comments', 'likes', 'followers'],
+}
+const notificationSchema = {
+  type: 'object',
+  properties: {
+    id: opaqueIdSchema,
+    category: notificationCategorySchema,
+    actor: userSchema,
+    text: { type: 'string', maxLength: 5_000 },
+    createdAt: { type: 'string', maxLength: 128 },
+    unread: { type: 'boolean' },
+    userId: userIdSchema,
+    postId: postIdSchema,
+    url: { type: 'string', maxLength: 512 },
+    contentDigest: sha256Schema,
+  },
+  required: ['id', 'category', 'actor', 'text', 'url', 'contentDigest'],
+  additionalProperties: false,
+}
+const messageThreadSchema = {
+  type: 'object',
+  properties: {
+    userId: userIdSchema,
+    userName: { type: 'string', maxLength: 128 },
+    profileUrl: { type: 'string', maxLength: 512 },
+    lastMessage: { type: 'string', maxLength: 5_000 },
+    lastMessageAt: { type: 'string', maxLength: 128 },
+    unreadCount: { type: 'integer', minimum: 0 },
+    url: { type: 'string', maxLength: 512 },
+    contentDigest: sha256Schema,
+  },
+  required: [
+    'userId',
+    'userName',
+    'profileUrl',
+    'lastMessage',
+    'unreadCount',
+    'url',
+    'contentDigest',
+  ],
+  additionalProperties: false,
+}
+const messageSchema = {
+  type: 'object',
+  properties: {
+    id: opaqueIdSchema,
+    userId: userIdSchema,
+    senderId: userIdSchema,
+    senderName: { type: 'string', maxLength: 128 },
+    text: { type: 'string', maxLength: 5_000 },
+    createdAt: { type: 'string', maxLength: 128 },
+    mine: { type: 'boolean' },
+    contentDigest: sha256Schema,
+  },
+  required: ['id', 'userId', 'senderId', 'text', 'mine', 'contentDigest'],
+  additionalProperties: false,
+}
+const completeUsersResultSchema = {
+  type: 'object',
+  properties: {
+    users: { type: 'array', maxItems: 50, items: userSchema },
+    complete: { type: 'boolean' },
+  },
+  required: ['users', 'complete'],
   additionalProperties: false,
 }
 
@@ -320,6 +401,222 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
       },
     },
     {
+      id: 'get_unread_counts',
+      description: '读取微博通知与私信的当前未读数量汇总；打开消息箱可能同步刷新网页红点',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: { type: 'object', properties: {}, additionalProperties: false },
+      result: {
+        type: 'object',
+        properties: {
+          counts: {
+            type: 'object',
+            properties: {
+              mentions: { type: 'integer', minimum: 0 },
+              comments: { type: 'integer', minimum: 0 },
+              likes: { type: 'integer', minimum: 0 },
+              followers: { type: 'integer', minimum: 0 },
+              privateMessages: { type: 'integer', minimum: 0 },
+            },
+            required: ['mentions', 'comments', 'likes', 'followers', 'privateMessages'],
+            additionalProperties: false,
+          },
+          complete: { type: 'boolean' },
+        },
+        required: ['counts', 'complete'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_notifications',
+      description: '读取 @、评论、赞或新粉丝通知；打开消息页可能同步清除网页红点',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: {
+          category: notificationCategorySchema,
+          count: { type: 'integer', minimum: 1, maximum: 50 },
+        },
+        required: ['category'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          notifications: { type: 'array', maxItems: 50, items: notificationSchema },
+          complete: { type: 'boolean' },
+        },
+        required: ['notifications', 'complete'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_message_threads',
+      description: '读取近期微博私信会话列表；私信属于非公开内容',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: { count: { type: 'integer', minimum: 1, maximum: 50 } },
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          threads: { type: 'array', maxItems: 50, items: messageThreadSchema },
+          complete: { type: 'boolean' },
+        },
+        required: ['threads', 'complete'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'get_message_thread',
+      description: '读取与指定微博用户的近期私信正文；私信属于非公开内容',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: {
+          userId: userIdSchema,
+          count: { type: 'integer', minimum: 1, maximum: 50 },
+        },
+        required: ['userId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          messages: { type: 'array', maxItems: 50, items: messageSchema },
+          complete: { type: 'boolean' },
+        },
+        required: ['messages', 'complete'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_followers',
+      description: '读取当前账号或指定用户的近期粉丝列表',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: {
+          userId: userIdSchema,
+          count: { type: 'integer', minimum: 1, maximum: 50 },
+        },
+        additionalProperties: false,
+      },
+      result: completeUsersResultSchema,
+    },
+    {
+      id: 'list_following',
+      description: '读取当前账号或指定用户的近期关注列表',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: {
+          userId: userIdSchema,
+          count: { type: 'integer', minimum: 1, maximum: 50 },
+        },
+        additionalProperties: false,
+      },
+      result: completeUsersResultSchema,
+    },
+    {
+      id: 'search_users',
+      description: '按关键词搜索公开微博用户',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: {
+          keyword: { type: 'string', minLength: 1, maxLength: 100 },
+          count: { type: 'integer', minimum: 1, maximum: 20 },
+        },
+        required: ['keyword'],
+        additionalProperties: false,
+      },
+      result: completeUsersResultSchema,
+    },
+    {
+      id: 'list_favorites',
+      description: '读取当前账号近期收藏的微博',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: { count: { type: 'integer', minimum: 1, maximum: 20 } },
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          posts: { type: 'array', maxItems: 20, items: postSchema },
+          complete: { type: 'boolean' },
+        },
+        required: ['posts', 'complete'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_liked_posts',
+      description: '读取当前账号近期赞过的微博',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: { count: { type: 'integer', minimum: 1, maximum: 20 } },
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          posts: { type: 'array', maxItems: 20, items: postSchema },
+          complete: { type: 'boolean' },
+        },
+        required: ['posts', 'complete'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'list_hot_searches',
+      description: '读取微博公开热搜榜当前可见条目',
+      effect: 'read',
+      timeoutSeconds: 120,
+      params: {
+        type: 'object',
+        properties: { count: { type: 'integer', minimum: 1, maximum: 50 } },
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          searches: {
+            type: 'array',
+            maxItems: 50,
+            items: {
+              type: 'object',
+              properties: {
+                rank: { type: 'integer', minimum: 1, maximum: 100 },
+                keyword: { type: 'string', minLength: 1, maxLength: 200 },
+                url: { type: 'string', maxLength: 512 },
+                hotValue: { type: 'integer', minimum: 0 },
+                label: { type: 'string', maxLength: 64 },
+              },
+              required: ['rank', 'keyword', 'url'],
+              additionalProperties: false,
+            },
+          },
+          complete: { type: 'boolean' },
+        },
+        required: ['searches', 'complete'],
+        additionalProperties: false,
+      },
+    },
+    {
       id: 'create_post',
       description: '使用当前真实微博身份发布文字或图片微博（默认逐次确认；账号授权后可免确认）',
       effect: 'write',
@@ -432,7 +729,7 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
           userId: userIdSchema,
           postId: postIdSchema,
           commentId: opaqueIdSchema,
-          deleteSnapshot: snapshotSchema,
+          deleteSnapshot: commentDeleteSnapshotSchema,
         },
         required: ['userId', 'postId', 'commentId'],
         additionalProperties: false,
@@ -478,6 +775,62 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
         type: 'object',
         properties: { userId: userIdSchema, following: { type: 'boolean' } },
         required: ['userId', 'following'],
+        additionalProperties: false,
+      },
+      result: mutationResultSchema,
+    },
+    {
+      id: 'send_message',
+      description: '向指定微博用户发送私信（私信属于非公开内容；默认逐次确认；账号授权后可免确认）',
+      effect: 'write',
+      timeoutSeconds: 180,
+      params: {
+        type: 'object',
+        properties: {
+          userId: userIdSchema,
+          text: { type: 'string', minLength: 1, maxLength: 1_000 },
+        },
+        required: ['userId', 'text'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: { message: messageSchema },
+        required: ['message'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'set_post_favorite',
+      description: '把指定微博收藏状态设置为已收藏或未收藏（默认逐次确认；账号授权后可免确认）',
+      effect: 'write',
+      timeoutSeconds: 180,
+      params: {
+        type: 'object',
+        properties: {
+          userId: userIdSchema,
+          postId: postIdSchema,
+          favorited: { type: 'boolean' },
+        },
+        required: ['userId', 'postId', 'favorited'],
+        additionalProperties: false,
+      },
+      result: mutationResultSchema,
+    },
+    {
+      id: 'set_comment_like',
+      description: '把指定微博评论点赞状态设置为已赞或未赞（默认逐次确认；账号授权后可免确认）',
+      effect: 'write',
+      timeoutSeconds: 180,
+      params: {
+        type: 'object',
+        properties: {
+          userId: userIdSchema,
+          postId: postIdSchema,
+          commentId: opaqueIdSchema,
+          liked: { type: 'boolean' },
+        },
+        required: ['userId', 'postId', 'commentId', 'liked'],
         additionalProperties: false,
       },
       result: mutationResultSchema,

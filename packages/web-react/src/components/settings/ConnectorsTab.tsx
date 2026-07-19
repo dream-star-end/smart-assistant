@@ -460,7 +460,7 @@ export function ConnectorsTab({
                 setErr(null)
                 setSuccess(
                   enabled
-                    ? `${plugin.label}“免逐次确认”已开启；Agent 可直接执行所有已开放写入动作。${plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
+                    ? `${plugin.label}“免逐次确认”已开启；Agent 可直接执行所有已开放写入动作，不再展示确认卡。${plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
                     : `${plugin.label}“免逐次确认”已关闭；后续写入恢复逐次确认。`,
                 )
                 reload()
@@ -756,94 +756,124 @@ function RuntimePluginCard({
       )}
       {accounts.length > 0 && (
         <ul className="mt-3 flex flex-col divide-y divide-border border-t border-border pt-1">
-          {accounts.map((account) => (
-            <li key={account.id} className="flex flex-wrap items-center gap-2 py-2">
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-[13px] text-fg">
-                  {account.displayName || plugin.label}
+          {accounts.map((account) => {
+            const writePolicyStale =
+              account.writeControl !== null &&
+              account.writeControl.acceptedVersion !== null &&
+              account.writeControl.acceptedVersion !== account.writeControl.disclaimerVersion
+            const preapprovalPolicyStale =
+              account.writeControl?.preapproval?.acceptedVersion !== null &&
+              account.writeControl?.preapproval?.acceptedVersion !== undefined &&
+              account.writeControl.preapproval.disclaimerVersion !== null &&
+              account.writeControl.preapproval.acceptedVersion !==
+                account.writeControl.preapproval.disclaimerVersion
+            return (
+              <li key={account.id} className="flex flex-wrap items-center gap-2 py-2">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px] text-fg">
+                    {account.displayName || plugin.label}
+                  </div>
+                  {account.accountHint && (
+                    <div className="truncate text-[11px] text-faint">{account.accountHint}</div>
+                  )}
                 </div>
-                {account.accountHint && (
-                  <div className="truncate text-[11px] text-faint">{account.accountHint}</div>
-                )}
-              </div>
-              <span className={account.executable ? 'text-[11px] text-success' : 'text-[11px] text-warning'}>
-                {account.status === 'error'
-                  ? '需重新授权'
-                  : account.executable
-                    ? '可用'
-                    : plugin.updateAvailable
-                      ? '需先更新'
-                      : plugin.installedCurrent && account.versionId !== plugin.versionId
-                        ? '需重新授权'
-                        : '当前不可用'}
-              </span>
-              {account.writeControl && (
-                <div className="flex items-center gap-2 text-[11.5px] text-muted">
-                  <span>{account.writeControl.enabled ? '写入已开启' : '写入已关闭'}</span>
-                  <Switch
-                    aria-label={`${account.displayName || plugin.label}写入能力`}
-                    checked={account.writeControl.enabled}
-                    disabled={!account.executable || writeBusyId === account.id}
-                    onCheckedChange={(checked) => {
-                      if (checked) {
-                        setConsentChecked(false)
-                        setConsentError(null)
-                        setConsentAccount(account)
-                      } else {
-                        void disableWrite(account)
-                      }
-                    }}
-                  />
-                </div>
-              )}
-              <Button
-                variant="ghost"
-                size="sm"
-                className="text-danger"
-                onClick={() => onRevoke(account)}
-              >
-                <Trash2 size={13} /> 解绑
-              </Button>
-              {account.writeControl?.preapproval?.available && (
-                <div className="basis-full rounded-lg border border-border bg-hover/50 px-3 py-2">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[11.5px] font-medium text-fg">免逐次确认</div>
-                      <div className="mt-0.5 text-[10.5px] leading-relaxed text-faint">
-                        开启后，Agent 可直接执行此 Plugin 的全部已开放写入动作；默认关闭。
-                      </div>
-                    </div>
-                    <span className="text-[11px] text-muted">
-                      {account.writeControl.preapproval.enabled ? '已开启' : '已关闭'}
+                <span className={account.executable ? 'text-[11px] text-success' : 'text-[11px] text-warning'}>
+                  {account.status === 'error'
+                    ? '需重新授权'
+                    : account.executable
+                      ? '可用'
+                      : plugin.updateAvailable
+                        ? '需先更新'
+                        : plugin.installedCurrent && account.versionId !== plugin.versionId
+                          ? '需重新授权'
+                          : '当前不可用'}
+                </span>
+                {account.writeControl && (
+                  <div className="flex items-center gap-2 text-[11.5px] text-muted">
+                    <span className={writePolicyStale ? 'text-warning' : undefined}>
+                      {writePolicyStale
+                        ? '写入条款已更新，需重新同意'
+                        : account.writeControl.enabled
+                          ? '写入已开启'
+                          : '写入已关闭'}
                     </span>
                     <Switch
-                      aria-label={`${account.displayName || plugin.label}免逐次确认`}
-                      checked={account.writeControl.preapproval.enabled}
-                      disabled={
-                        !account.executable ||
-                        !account.writeControl.enabled ||
-                        writeBusyId === account.id
-                      }
+                      aria-label={`${account.displayName || plugin.label}写入能力`}
+                      checked={account.writeControl.enabled}
+                      disabled={!account.executable || writeBusyId === account.id}
                       onCheckedChange={(checked) => {
                         if (checked) {
-                          setPreapprovalChecked(false)
-                          setPreapprovalError(null)
-                          setPreapprovalAccount(account)
+                          setConsentChecked(false)
+                          setConsentError(null)
+                          setConsentAccount(account)
                         } else {
-                          void disablePreapproval(account)
+                          void disableWrite(account)
                         }
                       }}
                     />
                   </div>
-                </div>
-              )}
-              {plugin.slug === 'knowledge-planet' && account.status === 'active' && (
-                <div className="basis-full">
-                  <KnowledgePlanetAutomationPanel auth={auth} account={account} />
-                </div>
-              )}
-            </li>
-          ))}
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-danger"
+                  onClick={() => onRevoke(account)}
+                >
+                  <Trash2 size={13} /> 解绑
+                </Button>
+                {account.writeControl?.preapproval?.available && (
+                  <div className="basis-full rounded-lg border border-border bg-hover/50 px-3 py-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[11.5px] font-medium text-fg">免逐次确认</div>
+                        <div
+                          className={`mt-0.5 text-[10.5px] leading-relaxed ${
+                            preapprovalPolicyStale ? 'text-warning' : 'text-faint'
+                          }`}
+                        >
+                          {preapprovalPolicyStale
+                            ? '免确认条款已更新，需重新同意后才会生效。'
+                            : account.writeControl.preapproval.enabled
+                              ? '已生效：Agent 直接执行写入，不展示确认卡。'
+                              : '开启后，Agent 直接执行写入，不展示确认卡；默认关闭。'}
+                        </div>
+                      </div>
+                      <span className="text-[11px] text-muted">
+                        {preapprovalPolicyStale
+                          ? '需重新同意'
+                          : account.writeControl.preapproval.enabled
+                            ? '已开启'
+                            : '已关闭'}
+                      </span>
+                      <Switch
+                        aria-label={`${account.displayName || plugin.label}免逐次确认`}
+                        checked={account.writeControl.preapproval.enabled}
+                        disabled={
+                          !account.executable ||
+                          !account.writeControl.enabled ||
+                          writeBusyId === account.id
+                        }
+                        onCheckedChange={(checked) => {
+                          if (checked) {
+                            setPreapprovalChecked(false)
+                            setPreapprovalError(null)
+                            setPreapprovalAccount(account)
+                          } else {
+                            void disablePreapproval(account)
+                          }
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+                {plugin.slug === 'knowledge-planet' && account.status === 'active' && (
+                  <div className="basis-full">
+                    <KnowledgePlanetAutomationPanel auth={auth} account={account} />
+                  </div>
+                )}
+              </li>
+            )
+          })}
         </ul>
       )}
       <Modal

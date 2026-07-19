@@ -181,6 +181,7 @@ describe("connectorToolCard 分派", () => {
       </ToolCardActionsContext.Provider>,
     );
     expect(await screen.findByText("发布微博：《发布测试》")).toBeInTheDocument();
+    expect(screen.getByText(/写操作待确认 · 发布微博/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "确认执行" })).toBeEnabled();
 
     cleanup();

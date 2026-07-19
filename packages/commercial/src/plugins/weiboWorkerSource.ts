@@ -26,7 +26,8 @@ const ACTION_ORIGINS = new Set([
 ]);
 const WRITE_ACTIONS = new Set([
   'create_post', 'edit_post', 'delete_post', 'create_comment', 'reply_comment',
-  'delete_comment', 'repost_post', 'set_post_like', 'set_following'
+  'delete_comment', 'repost_post', 'set_post_like', 'set_following',
+  'send_message', 'set_post_favorite', 'set_comment_like'
 ]);
 const RISK_TEXT = /安全验证|访问异常|操作频繁|账号存在风险|请完成验证|验证码|登录保护|行为异常/;
 let terminal = false;
@@ -493,7 +494,13 @@ async function projectComment(root, postId, selfId, parentCommentId) {
     if (authorName && text.startsWith(authorName)) text = text.slice(authorName.length).replace(/^\s*[：:]\s*/, '');
     const info = body && body.querySelector('.info');
     const createdAt = info && Array.from(info.children).map((child) => ({ child, text: (child.textContent || '').replace(/\s+/g, ' ').trim() })).find((item) => !item.child.classList.contains('opt') && item.text.length > 0);
-    return { userId: author && author.userId, text: text.slice(0, 5000), authorName, createdAt: createdAt && createdAt.text.slice(0, 128) };
+    const like = body && body.querySelector('button.woo-like-main');
+    const liked = !!like && (like.getAttribute('aria-pressed') === 'true' || /(?:^|\s)_cur_/.test(like.closest('[class*="_likebox_"]')?.className || '') || !!like.querySelector('.woo-like-liked'));
+    return {
+      userId: author && author.userId, text: text.slice(0, 5000), authorName,
+      createdAt: createdAt && createdAt.text.slice(0, 128), liked,
+      likeText: like && (like.textContent || '').slice(0, 40)
+    };
   });
   if (!raw.userId || !/^\d{5,20}$/.test(raw.userId) || !raw.createdAt) return null;
   const text = cleanText(raw.text, 5000);
@@ -506,6 +513,8 @@ async function projectComment(root, postId, selfId, parentCommentId) {
     createdAt,
     ...(parentCommentId ? { parentCommentId } : {}),
     owned: raw.userId === selfId,
+    liked: raw.liked,
+    likeCount: countFrom(raw.likeText || ''),
     contentDigest: digest(stable)
   };
 }
@@ -547,9 +556,365 @@ async function findComment(page, postId, commentId, selfId) {
   const matches = (await collectCommentEntries(page, postId, selfId)).entries.filter((entry) => entry.comment.id === commentId);
   return matches.length === 1 ? matches[0] : null;
 }
+async function projectUserCard(anchor, selfId) {
+  const raw = await anchor.evaluate((element) => {
+    let url;
+    try { url = new URL(element.href, location.href); } catch { return null; }
+    const match = /^\/u\/(\d{5,20})(?:\/|$)/.exec(url.pathname);
+    if (!match) return null;
+    const root = element.closest('.list_person, .wbpro-scroller-item, li, article, [class*="card"]') || element.parentElement || element;
+    const sameUser = Array.from(root.querySelectorAll('a[href]')).filter((candidate) => {
+      try { return new URL(candidate.href, location.href).pathname === '/u/' + match[1]; } catch { return false; }
+    });
+    const named = sameUser.find((candidate) => (candidate.textContent || '').trim().length > 0);
+    const name = ((named && (named.getAttribute('title') || named.textContent)) || element.getAttribute('title') || element.textContent || '')
+      .replace(/\s+/g, ' ').trim().slice(0, 128);
+    const text = (root.textContent || '').replace(/\s+/g, ' ').trim();
+    const follow = Array.from(root.querySelectorAll('button,[role="button"]')).find((candidate) => /^(关注|已关注|互相关注)$/.test((candidate.textContent || '').replace(/\s+/g, '').trim()));
+    const follower = /粉丝[：:]?\s*(\d+(?:\.\d+)?[万亿]?)/.exec(text) || /(\d+(?:\.\d+)?[万亿]?)\s*粉丝/.exec(text);
+    return {
+      id: match[1], name, text, follower: follower && follower[1],
+      verified: /认证|icon_approve|verified/.test(text + ' ' + root.className),
+      following: !!follow && !/^关注$/.test((follow.textContent || '').replace(/\s+/g, '').trim())
+    };
+  });
+  if (!raw || !raw.name) return null;
+  return {
+    id: raw.id,
+    name: raw.name,
+    profileUrl: 'https://weibo.com/u/' + raw.id,
+    verified: raw.verified,
+    following: raw.id === selfId ? true : raw.following,
+    ...(raw.follower ? { followerCount: countFrom(raw.follower) } : {})
+  };
+}
+async function collectUsers(page, selfId, count) {
+  const roots = page.locator('.wbpro-scroller-item, .list_person, .card-user-b');
+  const users = [];
+  const seen = new Set();
+  const total = Math.min(await roots.count(), 200);
+  for (let index = 0; index < total && users.length < count; index += 1) {
+    const root = roots.nth(index);
+    if (!await visible(root)) continue;
+    const anchors = root.locator('a[href*="/u/"]');
+    let anchor = null;
+    const anchorCount = Math.min(await anchors.count(), 20);
+    for (let anchorIndex = 0; anchorIndex < anchorCount; anchorIndex += 1) {
+      const candidate = anchors.nth(anchorIndex);
+      if (await visible(candidate)) { anchor = candidate; break; }
+    }
+    if (!anchor) continue;
+    const user = await projectUserCard(anchor, selfId).catch(() => null);
+    if (!user || seen.has(user.id)) continue;
+    seen.add(user.id);
+    users.push(user);
+  }
+  const text = await bodyText(page);
+  const explicitEnd = /暂无数据|暂无内容|没有更多内容了|没有更多了/.test(text);
+  const clientOnly = /更多内容请至客户端查看/.test(text);
+  return { users, complete: explicitEnd && !clientOnly && users.length <= count };
+}
+async function projectNotification(root, category) {
+  const raw = await root.evaluate((element) => {
+    const visible = (candidate) => {
+      const bounds = candidate.getBoundingClientRect(); const style = getComputedStyle(candidate);
+      return bounds.width > 0 && bounds.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const actors = [];
+    let target = null;
+    for (const anchor of element.querySelectorAll('a[href]')) {
+      if (!visible(anchor)) continue;
+      let url;
+      try { url = new URL(anchor.href, location.href); } catch { continue; }
+      const user = /^\/u\/(\d{5,20})(?:\/|$)/.exec(url.pathname);
+      if (user) {
+        const name = (anchor.getAttribute('title') || anchor.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+        actors.push({ id: user[1], name, url: 'https://weibo.com/u/' + user[1] });
+      }
+      const post = /^\/(\d{5,20})\/([A-Za-z0-9_-]{5,32})\/?$/.exec(url.pathname);
+      if (post) target = { userId: post[1], postId: post[2], url: 'https://weibo.com/' + post[1] + '/' + post[2] };
+    }
+    const actor = actors.find((candidate) => candidate.name) || actors[0] || null;
+    const text = (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 5000);
+    const time = Array.from(element.querySelectorAll('time,a,span')).map((candidate) => (candidate.getAttribute('title') || candidate.textContent || '').replace(/\s+/g, ' ').trim())
+      .find((value) => /(?:\d{1,2}[-月]\d{1,2}|\d{1,2}:\d{2}|分钟前|小时前|昨天)/.test(value)) || '';
+    const unread = !!element.querySelector('.woo-badge-dot,.woo-badge-count,[class*="unread"],[class*="new_"]');
+    return { actor, target, text, time: time.slice(0, 128), unread };
+  });
+  if (!raw.actor || !raw.text) return null;
+  const stable = { category, actorId: raw.actor.id, text: cleanText(raw.text, 5000), url: raw.target?.url || raw.actor.url };
+  return {
+    id: digest(stable),
+    category,
+    actor: { id: raw.actor.id, name: raw.actor.name || ('微博用户' + raw.actor.id.slice(-4)), profileUrl: raw.actor.url },
+    text: stable.text,
+    ...(raw.time ? { createdAt: raw.time } : {}),
+    unread: raw.unread,
+    ...(raw.target ? { userId: raw.target.userId, postId: raw.target.postId } : {}),
+    url: stable.url,
+    contentDigest: digest(stable)
+  };
+}
+async function collectNotifications(page, category, count) {
+  const roots = page.locator('.wbpro-scroller-item');
+  const notifications = [];
+  const seen = new Set();
+  const total = Math.min(await roots.count(), 200);
+  for (let index = 0; index < total && notifications.length < count; index += 1) {
+    const item = await projectNotification(roots.nth(index), category).catch(() => null);
+    if (!item || seen.has(item.id)) continue;
+    seen.add(item.id);
+    notifications.push(item);
+  }
+  const text = await bodyText(page);
+  return {
+    notifications,
+    complete: /暂无数据|暂无内容|没有更多内容了|没有更多了/.test(text) && notifications.length <= count
+  };
+}
+async function unreadCounts(page) {
+  await gotoAuthenticated(page, 'https://weibo.com/');
+  const message = page.locator('a[title="消息"]').first();
+  if (await visible(message)) {
+    await message.hover().catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  const desktop = await page.evaluate(() => {
+    const visible = (element) => {
+      const bounds = element.getBoundingClientRect(); const style = getComputedStyle(element);
+      return bounds.width > 0 && bounds.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const aliases = new Map([['@我的', 'mentions'], ['评论', 'comments'], ['赞', 'likes'], ['新粉丝', 'followers'], ['粉丝', 'followers'], ['私信', 'privateMessages']]);
+    const counts = { mentions: 0, comments: 0, likes: 0, followers: 0, privateMessages: 0 };
+    const seen = new Set();
+    for (const anchor of document.querySelectorAll('a[href]')) {
+      if (!visible(anchor)) continue;
+      const label = (anchor.textContent || '').replace(/\s+/g, ' ').trim();
+      const key = aliases.get(label);
+      if (!key) continue;
+      seen.add(key);
+      const root = anchor.closest('li,[role="menuitem"],.woo-pop-item-main') || anchor;
+      const badge = root.querySelector('.woo-badge-count,[class*="badge-count"]');
+      const match = /\d+/.exec((badge && badge.textContent) || '');
+      counts[key] = match ? Number(match[0]) : 0;
+    }
+    return { counts, complete: ['mentions','comments','likes','followers','privateMessages'].every((key) => seen.has(key)) };
+  });
+  try {
+    await gotoMessagePage(page, 'https://m.weibo.cn/message');
+    await page.waitForFunction(() => document.querySelectorAll('.lite-msg-list').length >= 4, null, { timeout: 15_000 });
+    const mobile = await page.locator('.lite-msg-list').evaluateAll((rows) => {
+      const aliases = new Map([['@我的', 'mentions'], ['评论', 'comments'], ['赞', 'likes'], ['未关注人私信', 'privateMessages']]);
+      const counts = { mentions: 0, comments: 0, likes: 0, privateMessages: 0 };
+      const seen = new Set();
+      for (const row of rows.slice(0, 4)) {
+        const label = (row.querySelector('h3') && row.querySelector('h3').textContent || '').replace(/\s+/g, ' ').trim();
+        const key = aliases.get(label);
+        if (!key) continue;
+        seen.add(key);
+        const badge = row.querySelector('.m-bubble-red');
+        counts[key] = Number.parseInt((badge && badge.textContent || '0').trim(), 10) || 0;
+      }
+      for (const row of rows.slice(4)) {
+        const badge = row.querySelector('.m-bubble-red');
+        counts.privateMessages += Number.parseInt((badge && badge.textContent || '0').trim(), 10) || 0;
+      }
+      return { counts, complete: ['mentions','comments','likes','privateMessages'].every((key) => seen.has(key)) };
+    });
+    for (const key of ['mentions', 'comments', 'likes', 'privateMessages'])
+      desktop.counts[key] = Math.max(desktop.counts[key], mobile.counts[key]);
+    desktop.complete = desktop.complete && mobile.complete;
+  } catch {}
+  return desktop;
+}
+async function hotSearches(page, count) {
+  await gotoAuthenticated(page, 'https://weibo.com/');
+  return page.locator('.hotBand a[href*="s.weibo.com/weibo"]').evaluateAll((anchors, maximum) => {
+    const output = [];
+    const seen = new Set();
+    let truncated = false;
+    for (const anchor of anchors) {
+      let url;
+      try { url = new URL(anchor.href, location.href); } catch { continue; }
+      let keyword = (url.searchParams.get('q') || '').replace(/^#|#$/g, '').trim();
+      if (!keyword || seen.has(keyword)) continue;
+      seen.add(keyword);
+      if (output.length >= maximum) {
+        truncated = true;
+        continue;
+      }
+      const text = (anchor.textContent || '').replace(/\s+/g, ' ').trim();
+      const trailing = /(\d{3,})$/.exec(text);
+      const item = { rank: output.length + 1, keyword: keyword.slice(0, 200), url: url.toString().slice(0, 512) };
+      if (trailing) item.hotValue = Number(trailing[1]);
+      if (/登顶/.test(text)) item.label = '登顶';
+      output.push(item);
+    }
+    return { searches: output, complete: !truncated };
+  }, count);
+}
+async function gotoMessagePage(page, url) {
+  let failure = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await gotoAuthenticated(page, url);
+      return;
+    } catch (error) {
+      failure = error;
+      if (attempt < 2) await page.waitForTimeout(750);
+    }
+  }
+  throw failure || new Error('message');
+}
+function avatarUserId(src) {
+  let filename = '';
+  try { filename = new URL(src).pathname.split('/').pop() || ''; } catch { return null; }
+  const prefix = filename.slice(0, 8);
+  let value = NaN;
+  if (/^00[0-9A-Za-z]{6}$/.test(prefix)) {
+    const alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    value = 0;
+    for (const character of prefix) {
+      const digit = alphabet.indexOf(character);
+      if (digit < 0) return null;
+      value = value * 62 + digit;
+    }
+  } else if (/^[0-9a-f]{8}$/i.test(prefix)) value = Number.parseInt(prefix, 16);
+  if (!Number.isSafeInteger(value)) return null;
+  const userId = String(value);
+  return /^\d{5,20}$/.test(userId) ? userId : null;
+}
+async function collectMessageThreads(page, count) {
+  await gotoMessagePage(page, 'https://m.weibo.cn/message');
+  await page.waitForFunction(() => document.querySelectorAll('.lite-msg-list').length >= 4 || /暂无|出错|重试/.test(document.body.innerText || ''), null, { timeout: 15_000 }).catch(() => {});
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const before = await page.locator('.lite-msg-list').count();
+    if (Math.max(0, before - 4) >= count) break;
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await page.waitForTimeout(900);
+    const after = await page.locator('.lite-msg-list').count();
+    if (after === before) break;
+  }
+  await assertNoChallenge(page);
+  const raw = await page.locator('.lite-msg-list').evaluateAll((rows) => rows.slice(4).map((row) => {
+    const name = row.querySelector('h3.m-text-cut');
+    const preview = row.querySelector('.m-box-col.m-box-dir .m-text-box h4.m-text-cut');
+    const date = row.querySelector('.box-right h4.m-text-cut');
+    const badge = row.querySelector('.m-bubble-red');
+    const image = row.querySelector('img');
+    return {
+      userName: (name && name.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128),
+      lastMessage: (preview && preview.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 5000),
+      lastMessageAt: (date && date.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128),
+      unreadCount: Number.parseInt((badge && badge.textContent || '0').trim(), 10) || 0,
+      avatar: image && image.src || ''
+    };
+  }));
+  const threads = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const userId = avatarUserId(item.avatar);
+    if (!userId || !item.userName || seen.has(userId)) continue;
+    seen.add(userId);
+    const stable = {
+      userId, userName: item.userName, lastMessage: item.lastMessage,
+      lastMessageAt: item.lastMessageAt, unreadCount: item.unreadCount
+    };
+    threads.push({
+      userId,
+      userName: item.userName,
+      profileUrl: 'https://weibo.com/u/' + userId,
+      lastMessage: item.lastMessage,
+      ...(item.lastMessageAt ? { lastMessageAt: item.lastMessageAt } : {}),
+      unreadCount: item.unreadCount,
+      url: 'https://m.weibo.cn/message/chat?uid=' + userId,
+      contentDigest: digest(stable)
+    });
+    if (threads.length >= count) break;
+  }
+  const text = await bodyText(page);
+  return { threads, complete: /暂无私信|暂无消息|没有更多/.test(text) && threads.length <= count };
+}
+async function projectMessageThread(page, userId, selfId, count) {
+  const raw = await page.evaluate(() => {
+    let createdAt = '';
+    const messages = [];
+    for (const element of document.querySelectorAll('.lite-bubble-time,.lite-bubble-list')) {
+      if (element.classList.contains('lite-bubble-time')) {
+        createdAt = (element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128);
+        continue;
+      }
+      const bubble = element.querySelector('.bubble-box');
+      let text = (bubble && bubble.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 5000);
+      if (!text) text = bubble && bubble.querySelector('img') ? '[图片]' : '[非文本消息]';
+      const sender = element.querySelector('h4');
+      messages.push({
+        mine: element.classList.contains('bubble-r'),
+        text,
+        createdAt,
+        senderName: (sender && sender.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 128)
+      });
+    }
+    return { messages, hasEarlier: /更早前的私信/.test(document.body.innerText || '') };
+  });
+  const occurrences = new Map();
+  const projected = raw.messages.map((message) => {
+    const senderId = message.mine ? selfId : userId;
+    const stable = {
+      userId, senderId, text: cleanText(message.text, 5000),
+      createdAt: message.createdAt || '', mine: message.mine
+    };
+    const contentDigest = digest(stable);
+    const occurrence = (occurrences.get(contentDigest) || 0) + 1;
+    occurrences.set(contentDigest, occurrence);
+    return {
+      id: digest({ contentDigest, occurrence }),
+      userId,
+      senderId,
+      ...(message.senderName ? { senderName: message.senderName } : {}),
+      text: stable.text,
+      ...(message.createdAt ? { createdAt: message.createdAt } : {}),
+      mine: message.mine,
+      contentDigest
+    };
+  });
+  const limit = Math.min(count, 50);
+  return {
+    messages: projected.slice(Math.max(0, projected.length - limit)),
+    complete: !raw.hasEarlier && projected.length <= limit
+  };
+}
+async function collectMessageThread(page, userId, selfId, count) {
+  await gotoMessagePage(page, 'https://m.weibo.cn/message/chat?uid=' + userId);
+  await page.waitForFunction(() => document.querySelector('.chat-page-wrap') || /暂无|出错|重试/.test(document.body.innerText || ''), null, { timeout: 15_000 }).catch(() => {});
+  const current = new URL(page.url());
+  if (current.pathname !== '/message/chat' || current.searchParams.get('uid') !== userId) throw new Error('message');
+  await assertNoChallenge(page);
+  return projectMessageThread(page, userId, selfId, count);
+}
+async function prepareMessageComposer(page, userId, text) {
+  await gotoMessagePage(page, 'https://m.weibo.cn/message/chat?uid=' + userId);
+  const current = new URL(page.url());
+  if (current.pathname !== '/message/chat' || current.searchParams.get('uid') !== userId) throw new Error('message');
+  await assertNoChallenge(page);
+  let textarea = await uniqueVisible(page.locator('.lite-page-editor textarea:not(.shadow)'));
+  if (!textarea) {
+    const trigger = await uniqueVisible(page.locator('.lite-page-editor .main-text'));
+    if (!trigger) throw new Error('message-composer');
+    await trigger.click({ timeout: 10_000 });
+    textarea = await uniqueVisible(page.locator('.lite-page-editor textarea:not(.shadow)'));
+  }
+  if (!textarea) throw new Error('message-composer');
+  await textarea.fill(text);
+  await page.waitForTimeout(150);
+  const send = await uniqueVisible(page.locator('.lite-page-editor button.btn-send'));
+  if (!send || await send.evaluate((element) => element.classList.contains('disable'))) throw new Error('message-composer');
+  const recipient = cleanText(await page.locator('.lite-topbar .nav-main').first().innerText().catch(() => ''), 128);
+  return { send, recipient };
+}
 async function actionRead(page, input) {
   const params = input.params || {};
-  const selfId = input.actionId === 'search_posts' ? null : await ensureSelfId(page);
+  const selfId = ['search_posts', 'search_users'].includes(input.actionId) ? null : await ensureSelfId(page);
   if (input.actionId === 'get_self') {
     await gotoAuthenticated(page, 'https://weibo.com/u/' + selfId);
     return { user: await projectUser(page, selfId, selfId) };
@@ -600,6 +965,49 @@ async function actionRead(page, input) {
     await gotoAuthenticated(page, 'https://m.weibo.cn/search?containerid=' + encodeURIComponent('100103type=1&q=' + params.keyword));
     return { posts: await collectMobileSearchPosts(page, null, count) };
   }
+  if (input.actionId === 'get_unread_counts') return unreadCounts(page);
+  if (input.actionId === 'list_message_threads') return collectMessageThreads(page, Math.min(params.count || 20, 50));
+  if (input.actionId === 'get_message_thread') return collectMessageThread(page, params.userId, selfId, Math.min(params.count || 20, 50));
+  if (input.actionId === 'list_notifications') {
+    const limit = Math.min(params.count || 20, 50);
+    if (params.category === 'followers') {
+      await gotoAuthenticated(page, 'https://weibo.com/u/page/follow/' + selfId + '?relate=fans');
+      const listed = await collectUsers(page, selfId, limit);
+      return {
+        notifications: listed.users.map((user) => {
+          const stable = { category: 'followers', actorId: user.id, text: user.name + ' 关注了你', url: user.profileUrl };
+          return {
+            id: digest(stable), category: 'followers', actor: user, text: stable.text,
+            url: user.profileUrl, contentDigest: digest(stable)
+          };
+        }),
+        complete: listed.complete
+      };
+    }
+    const paths = { mentions: '/at/weibo', comments: '/comment/inbox', likes: '/like/inbox' };
+    await gotoAuthenticated(page, 'https://weibo.com' + paths[params.category]);
+    return collectNotifications(page, params.category, limit);
+  }
+  if (input.actionId === 'list_followers' || input.actionId === 'list_following') {
+    const userId = params.userId || selfId;
+    const suffix = input.actionId === 'list_followers' ? '?relate=fans' : '';
+    await gotoAuthenticated(page, 'https://weibo.com/u/page/follow/' + userId + suffix);
+    return collectUsers(page, selfId, Math.min(params.count || 20, 50));
+  }
+  if (input.actionId === 'search_users') {
+    await gotoAuthenticated(page, 'https://s.weibo.com/user?q=' + encodeURIComponent(params.keyword));
+    return collectUsers(page, '', Math.min(params.count || 10, 20));
+  }
+  if (input.actionId === 'list_favorites' || input.actionId === 'list_liked_posts') {
+    const segment = input.actionId === 'list_favorites' ? 'fav' : 'like';
+    const limit = Math.min(params.count || 10, 20);
+    await gotoAuthenticated(page, 'https://weibo.com/u/page/' + segment + '/' + selfId);
+    const posts = await collectPosts(page, selfId, limit);
+    const marked = posts.map((post) => input.actionId === 'list_favorites' ? { ...post, favorited: true } : { ...post, liked: true });
+    const text = await bodyText(page);
+    return { posts: marked, complete: /暂无数据|暂无内容|没有更多内容了|没有更多了/.test(text) && !/更多内容请至客户端查看/.test(text) && marked.length <= limit };
+  }
+  if (input.actionId === 'list_hot_searches') return hotSearches(page, Math.min(params.count || 10, 50));
   throw new Error('action');
 }
 async function awaitDispatch() {
@@ -609,6 +1017,12 @@ async function awaitDispatch() {
 }
 function sameSnapshot(current, snapshot) {
   return !!snapshot && snapshot.owned === true && current.owned === true && current.contentDigest === snapshot.expectedDigest;
+}
+function sameCommentDeleteSnapshot(comment, post, snapshot) {
+  if (!snapshot || comment.contentDigest !== snapshot.expectedDigest) return false;
+  if (snapshot.targetKind === 'own_comment') return comment.owned === true;
+  return snapshot.targetKind === 'received_on_own_post' && comment.owned === false &&
+    post.owned === true && post.contentDigest === snapshot.postExpectedDigest;
 }
 async function exactMenuItem(page, text) {
   const candidates = page.locator('[role="button"],button,[role="menuitem"]');
@@ -629,6 +1043,13 @@ async function clickMoreForCard(card) {
   if (!await visible(more)) throw new Error('menu');
   await more.click({ timeout: 10_000 });
 }
+async function inspectFavoriteState(page, card) {
+  await clickMoreForCard(card);
+  const add = await exactMenuItem(page, '收藏');
+  const remove = await exactMenuItem(page, '取消收藏');
+  if (!!add === !!remove) throw new Error('favorite');
+  return { favorited: !!remove, item: remove || add };
+}
 async function confirmDialog(page, labels) {
   for (const label of labels) {
     const button = await exactMenuItem(page, label);
@@ -647,6 +1068,10 @@ async function commentActionControl(root, kind) {
   const nested = await root.evaluate((element) => element.classList.contains('item2'));
   const body = nested ? root.locator(':scope > .con2') : root.locator(':scope > .item1in .con1');
   if (await body.count() !== 1) return null;
+  if (kind === 'like') {
+    const button = await uniqueVisible(body.locator('button.woo-like-main'));
+    return button;
+  }
   const selector = kind === 'reply' ? 'i.woo-font--comment[title="评论"]' : 'i[title="删除"]';
   const icon = await uniqueVisible(body.locator(selector));
   if (!icon) return null;
@@ -740,6 +1165,26 @@ async function writeAction(page, input) {
     if (observed !== params.following) throw new Error('follow');
     return { ok: true, changed: current !== observed };
   }
+  if (input.actionId === 'send_message') {
+    const before = await collectMessageThread(page, params.userId, selfId, 50);
+    const beforeIds = new Set(before.messages.map((message) => message.id));
+    const prepared = await prepareMessageComposer(page, params.userId, params.text);
+    await awaitDispatch();
+    const fresh = await prepareMessageComposer(page, params.userId, params.text);
+    if (prepared.recipient && fresh.recipient && prepared.recipient !== fresh.recipient)
+      await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
+    await fresh.send.click({ timeout: 10_000 });
+    await assertNoChallenge(page);
+    const expected = cleanText(params.text, 1000);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const observed = await projectMessageThread(page, params.userId, selfId, 50);
+      const matches = observed.messages.filter((message) => message.mine && message.text === expected && !beforeIds.has(message.id));
+      if (matches.length === 1) return { message: matches[0] };
+      if (matches.length > 1) throw new Error('message-result');
+      await page.waitForTimeout(500);
+    }
+    throw new Error('message-result');
+  }
   await gotoAuthenticated(page, 'https://weibo.com/' + params.userId + '/' + params.postId);
   const card = await awaitPostCard(page, params.userId, params.postId);
   if (!card || !await card.count()) throw new Error('post');
@@ -760,6 +1205,51 @@ async function writeAction(page, input) {
     await page.waitForTimeout(1000);
     const after = (await projectPost(freshCard, selfId, params.userId, params.postId)).liked;
     if (after !== params.liked) throw new Error('like');
+    return { ok: true, changed: true };
+  }
+  if (input.actionId === 'set_post_favorite') {
+    const before = await inspectFavoriteState(page, card);
+    await page.keyboard.press('Escape').catch(() => {});
+    await awaitDispatch();
+    await assertNoChallenge(page);
+    await gotoAuthenticated(page, currentPost.url);
+    const freshCard = await awaitPostCard(page, params.userId, params.postId);
+    if (!freshCard) throw new Error('post');
+    const freshPost = await projectPost(freshCard, selfId, params.userId, params.postId);
+    if (freshPost.id !== params.postId || freshPost.userId !== params.userId) throw new Error('post');
+    const fresh = await inspectFavoriteState(page, freshCard);
+    if (fresh.favorited === params.favorited) {
+      await page.keyboard.press('Escape').catch(() => {});
+      return { ok: true, changed: false };
+    }
+    await fresh.item.click({ timeout: 10_000 });
+    await page.waitForTimeout(1_000);
+    await gotoAuthenticated(page, currentPost.url);
+    const observedCard = await awaitPostCard(page, params.userId, params.postId);
+    if (!observedCard) throw new Error('post');
+    const observed = await inspectFavoriteState(page, observedCard);
+    await page.keyboard.press('Escape').catch(() => {});
+    if (observed.favorited !== params.favorited) throw new Error('favorite');
+    return { ok: true, changed: before.favorited !== observed.favorited };
+  }
+  if (input.actionId === 'set_comment_like') {
+    const found = await findComment(page, params.postId, params.commentId, selfId);
+    if (!found) throw new Error('comment');
+    await awaitDispatch();
+    await assertNoChallenge(page);
+    const freshCard = await awaitPostCard(page, params.userId, params.postId);
+    if (!freshCard) throw new Error('post');
+    const freshPost = await projectPost(freshCard, selfId, params.userId, params.postId);
+    if (freshPost.id !== params.postId || freshPost.userId !== params.userId) throw new Error('post');
+    const fresh = await findComment(page, params.postId, params.commentId, selfId);
+    if (!fresh) throw new Error('comment');
+    if (fresh.comment.liked === params.liked) return { ok: true, changed: false };
+    const control = await commentActionControl(fresh.root, 'like');
+    if (!control) throw new Error('comment-like');
+    await control.click({ timeout: 10_000 });
+    await page.waitForTimeout(1_000);
+    const observed = await findComment(page, params.postId, params.commentId, selfId);
+    if (!observed || observed.comment.liked !== params.liked) throw new Error('comment-like');
     return { ok: true, changed: true };
   }
   if (input.actionId === 'edit_post' || input.actionId === 'delete_post') {
@@ -823,7 +1313,7 @@ async function writeAction(page, input) {
   if (input.actionId === 'reply_comment' || input.actionId === 'delete_comment') {
     const found = await findComment(page, params.postId, params.commentId, selfId);
     if (!found) throw new Error('comment');
-    if (input.actionId === 'delete_comment' && !sameSnapshot(found.comment, params.deleteSnapshot))
+    if (input.actionId === 'delete_comment' && !sameCommentDeleteSnapshot(found.comment, currentPost, params.deleteSnapshot))
       await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
     const kind = input.actionId === 'reply_comment' ? 'reply' : 'delete';
     const control = await commentActionControl(found.root, kind);
@@ -834,8 +1324,11 @@ async function writeAction(page, input) {
     const replyParentId = found.comment.parentCommentId || found.comment.id;
     await awaitDispatch();
     await assertNoChallenge(page);
+    const freshCard = await awaitPostCard(page, params.userId, params.postId);
     const fresh = await findComment(page, params.postId, params.commentId, selfId);
-    if (!fresh || (input.actionId === 'delete_comment' && !sameSnapshot(fresh.comment, params.deleteSnapshot)))
+    if (!freshCard) throw new Error('post');
+    const freshPost = await projectPost(freshCard, selfId, params.userId, params.postId);
+    if (!fresh || (input.actionId === 'delete_comment' && !sameCommentDeleteSnapshot(fresh.comment, freshPost, params.deleteSnapshot)))
       await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
     const freshControl = await commentActionControl(fresh.root, kind);
     if (!freshControl) throw new Error('comment-control');
