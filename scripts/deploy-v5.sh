@@ -6164,16 +6164,18 @@ deploy_dist() {
   if hotcfg_bundle_axis_on; then hc_bundle=1; hc_any=1; fi
   if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
   [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
-  local dist_previous_release=""
-  dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
-  [[ -n "$dist_previous_release" ]] || { echo "✗ --dist 无法解析当前 live release" >&2; exit 1; }
-  if [[ "$hc_any" == 1 ]] && ! assert_history_projection_revision_pair "$dist_previous_release" "$BUILT_RELEASE" "runtime hotcfg dist activation"; then
-    if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
-      echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
-      exit 1
+  if [[ "$hc_any" == 1 ]]; then
+    local dist_previous_release=""
+    dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
+    [[ -n "$dist_previous_release" ]] || { echo "✗ --dist 无法解析当前 live release" >&2; exit 1; }
+    if ! assert_history_projection_revision_pair "$dist_previous_release" "$BUILT_RELEASE" "runtime hotcfg dist activation"; then
+      if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
+        echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
+        exit 1
+      fi
+      echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
+      hc_bundle=0; hc_release=0; hc_any=0
     fi
-    echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
-    hc_bundle=0; hc_release=0; hc_any=0
   fi
   if [[ "$hc_any" == 1 ]]; then
     if [[ "$hc_bundle" == 1 ]]; then build_platform_bundle || { echo "✗ platform bundle 构建失败(live 未改)" >&2; exit 1; }; fi
