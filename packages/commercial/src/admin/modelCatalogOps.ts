@@ -348,7 +348,12 @@ export async function listCatalog(): Promise<CatalogOverview> {
  */
 async function activateSnapshotOrThrow(): Promise<void> {
   const cache = await getModelCatalogCache();
-  const snap = await cache.rebuild();
+  await cache.rebuild();
+  // 提交产生的 NOTIFY 可能在上面的同步 rebuild 期间启动更新一代的后台 rebuild；
+  // generation fence 会让较早一代只返回结果而不提交到 cache。写接口回 2xx 前必须再走
+  // 执行面同款 fresh fence：等待最新在飞重建并确认进程快照已真正恢复，而不是把一次
+  // 临时 unknown 窗口暴露给紧随其后的用户请求。
+  const snap = await cache.assertFresh();
   const violations = checkSnapshotCapabilities(snap);
   if (violations.length > 0) {
     // 单行校验已挡住绝大多数;能到这里说明**存量行**有问题(如 provider spec 改窄了上限)。
