@@ -4442,7 +4442,8 @@ wait $!
   //     形态挂进各自补偿链;finalize 提交 stable 前、canary READY 内部验证后必须有真 turn
   //     功能门(finalize 还要 E2E),全部先于不可逆动作(停旧 unit / 放量)。
   //  ③ dist 对称补偿:compensate_dist_activation 存在(hotcfg 轴复用 rollback_runtime_tuple,
-  //     非 hotcfg 轴 symlink 回切,禁第二套恢复机制),且 deploy_dist 校验失败路径调用它。
+  //     非 hotcfg 轴 symlink 回切,禁第二套恢复机制),deploy_dist 校验失败路径在持有
+  //     production-mutation lease 的前提下调用它。
   test('E2E journey gate wired into validation compensation chains', async () => {
     const source = await readFile(deploy, 'utf8')
     // ① 函数本体契约。
@@ -4490,6 +4491,18 @@ wait $!
     assert.ok(
       distBody.includes('compensate_dist_activation "$BUILT_RELEASE" "$dist_previous_release" "$hc_any"'),
       'deploy_dist() 校验失败必须走 compensate_dist_activation 对称补偿(禁 set -e 裸退出留坏 dist)',
+    )
+    const distLeaseFence = distBody.indexOf(
+      'require_mutation_lease_for_compensation "dist-validation-compensation" || exit 86',
+    )
+    const distCompensate = distBody.indexOf(
+      'compensate_dist_activation "$BUILT_RELEASE" "$dist_previous_release" "$hc_any"',
+    )
+    assert.ok(distLeaseFence >= 0, 'deploy_dist() 补偿前必须 fail-closed 复核 mutation lease')
+    assert.ok(distLeaseFence < distCompensate, 'deploy_dist() mutation lease fence 必须先于补偿写')
+    assert.ok(
+      !source.includes('reacquire_mutation_lease_best_effort'),
+      '失锁后禁止 best-effort 重取并自动补偿(必须 crash-stop 留 recovery marker)',
     )
     const cdaStart = source.indexOf('\ncompensate_dist_activation() {')
     assert.ok(cdaStart >= 0, 'compensate_dist_activation 缺失')

@@ -6332,7 +6332,7 @@ deploy_dist() {
   fi
   if [[ -n "$validation_failure" ]]; then
     echo "✗ $validation_failure；开始 dist 对称补偿(恢复旧 release)" >&2
-    reacquire_mutation_lease_best_effort "dist-validation-compensation"
+    require_mutation_lease_for_compensation "dist-validation-compensation" || exit 86
     if ! compensate_dist_activation "$BUILT_RELEASE" "$dist_previous_release" "$hc_any"; then
       mark_deploy_recovery_required "dist validation failed and compensation failed: $validation_failure"
       end_planned_maintenance || true
