@@ -587,10 +587,10 @@ export function mergeFullServerWins(
     const original = local[localIndex]!;
     const safe = safeByOriginal.get(original) ?? original;
     const peer = original?.id ? serverMergedById.get(original.id) : undefined;
-    const ownOrPeer = validHistoryOrder(safe?._orderSeq)
-      ? safe._orderSeq
-      : validHistoryOrder(peer?._orderSeq)
-        ? peer._orderSeq
+    const ownOrPeer = validHistoryOrder(peer?._orderSeq)
+      ? peer._orderSeq
+      : validHistoryOrder(safe?._orderSeq)
+        ? safe._orderSeq
         : null;
     if (ownOrPeer !== null) localCarry = ownOrPeer;
     if (preservedMidSet.has(original) && !validHistoryOrder(safe._orderSeq) && localCarry > 0) {
