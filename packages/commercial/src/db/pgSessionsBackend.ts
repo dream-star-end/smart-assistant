@@ -1127,6 +1127,9 @@ const CHAT_PROJECTION_MAX_ROWS = 2000; // chat 单响应投影总量 ≤2000 行
 const DEFAULT_BACKFILL_BYTES = 16 * 1024 * 1024; // OC_BACKFILL_BYTES 默认 16MB
 // 分段回填每段最多拉多少 record 行(界定单次 pg fetch,防超大卷一次性入内存)。
 const BACKFILL_SEGMENT_RECORD_LIMIT = 4000;
+// 用户主动展开 building 存量卷时,同一请求最多推进 8 段。与单请求共享字节预算共同限制
+// PG round-trip / 内存；常见两段卷可一次收敛，极端超长卷留给下一次点击继续推进。
+const ON_DEMAND_BACKFILL_MAX_SEGMENTS = 8;
 // B-§9-1(R3 重开):预算是**硬**的 —— 任何 record 越本读剩余预算一律 defer 折叠(绝不强读),
 // 越整 fullBudget 才判「永不适配」→ 终态 truncated + sentinel(绝不整条拉入进程)。推进保证靠
 // 「新一轮读预算重置后可容纳 ≤fullBudget 的单条」:sorted 里最小的未收敛卷在 budget==fullBudget
@@ -2271,12 +2274,52 @@ async function listTapeChatProjectionRecordsImpl(
   limit: number,
 ): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
   // 分租 + tape 复合校验:会话不属本人 / tape 无收敛投影 → null(端点统一 404)。
-  const res = await pool.query<{ rows: MessageLike[]; row_count: number }>(
-    `SELECT rows, row_count FROM tape_chat_projection
-      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state IN ('complete','truncated')`,
-    [sessionId, userId, tapeId],
-  );
-  const row = res.rows[0];
+  const readReady = async (): Promise<{ rows: MessageLike[]; row_count: number } | undefined> => (
+    await pool.query<{ rows: MessageLike[]; row_count: number }>(
+      `SELECT rows, row_count FROM tape_chat_projection
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state IN ('complete','truncated')`,
+      [sessionId, userId, tapeId],
+    )
+  ).rows[0];
+
+  let row = await readReady();
+  if (!row) {
+    // 折叠卡点击是用户对存量 building 卷的主动读取；此前这里只返回 404，而惰性回填只能靠
+    // 下一次 full session read 偶然推进，导致用户反复看到「加载失败」。沿用同一 CAS 回填器，
+    // 在既有硬字节预算内多推进少量 segment，再回读 ready 投影。exact 三元组 + finalized
+    // header 既防越租，也不把 missing / foreign / 未终态 tape 的差异泄露给端点。
+    try {
+      const tape = (
+        await pool.query<{ tape_sha256: string; billing_anchor_id: string | null }>(
+          `SELECT tape_sha256, billing_anchor_id
+             FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND finalized_at IS NOT NULL`,
+          [sessionId, userId, tapeId],
+        )
+      ).rows[0];
+      if (!tape || typeof tape.billing_anchor_id !== "string" || tape.billing_anchor_id.length === 0) return null;
+
+      let budget = backfillBudgetBytes();
+      for (let segment = 0; segment < ON_DEMAND_BACKFILL_MAX_SEGMENTS && budget > 0; segment++) {
+        const progress = await backfillTapeSegment(
+          pool,
+          sessionId,
+          userId,
+          tapeId,
+          tape.tape_sha256,
+          tape.billing_anchor_id,
+          budget,
+        );
+        if (progress.state === "complete" || progress.state === "truncated") break;
+        if (progress.bytesRead <= 0) break;
+        budget -= progress.bytesRead;
+      }
+      row = await readReady();
+    } catch {
+      // 与不存在/越权/未 finalized 同一失败形态；坏存量卷不能泄露内部状态，也不能拖垮会话页。
+      return null;
+    }
+  }
   if (!row || !Array.isArray(row.rows)) return null;
   const all = row.rows;
   const total = all.length;
