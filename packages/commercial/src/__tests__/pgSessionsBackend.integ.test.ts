@@ -545,6 +545,37 @@ describe("pgSessionsBackend contract", () => {
     }
   });
 
+  maybe("detail/partial 的 archivedCount 以 chunk.message_count 实际合计收口", async () => {
+    const big = "z".repeat(40 * 1024);
+    const messages = Array.from({ length: 90 }, (_, i): MessageLike => ({
+      id: `drift-${i}`, role: "user", text: big,
+    }));
+    await backend.upsertClientSession(mkSession({ id: "s-arch-drift", messages, updatedAt: 1 }));
+    const actual = Number((await pool.query<{ n: string }>(
+      `SELECT COALESCE(SUM(message_count),0)::text AS n
+         FROM client_session_archive_chunks WHERE session_id=$1 AND user_id=$2`,
+      ["s-arch-drift", "u-1"],
+    )).rows[0]!.n);
+    assert.ok(actual > 0, "测试前提:已产生 archive chunks");
+    await pool.query(
+      "UPDATE client_sessions SET archived_count=$3 WHERE id=$1 AND user_id=$2",
+      ["s-arch-drift", "u-1", actual + 5],
+    );
+    const detail = await backend.getClientSession("s-arch-drift", "u-1");
+    const partial = await backend.getClientSessionPartial("s-arch-drift", "u-1", 0);
+    assert.equal(detail!.archivedCount, actual, "detail 不透传漂移的缓存计数");
+    assert.equal(partial!.archivedCount, actual, "partial 不透传漂移的缓存计数");
+    assert.equal(partial!.totalMessageCount, partial!.messages.length + actual);
+
+    await backend.upsertClientSession(mkSession({ id: "s-arch-zero", userId: "u-1" }));
+    await pool.query(
+      "UPDATE client_sessions SET archived_count=3 WHERE id=$1 AND user_id=$2",
+      ["s-arch-zero", "u-1"],
+    );
+    assert.equal((await backend.getClientSession("s-arch-zero", "u-1"))!.archivedCount, 0,
+      "零 chunk 时实际归档数为 0");
+  });
+
   maybe("wechat CRUD + 账号唯一冲突 → WechatAccountAlreadyBoundError", async () => {
     await backend.upsertWechatBinding({ userId: "u-1", accountId: "acc-1", loginUserId: "L1", botToken: "tok1" });
     const b = await backend.getWechatBindingByUserId("u-1");
@@ -2130,6 +2161,85 @@ async function replaceTapeWithBulkRuntimeRecords(
   return runtimePayload.length;
 }
 
+/** 构造大量真实可见 tool rows + 原 billing assistant，用于锁定主动展开按 immutable record
+ * ordinal 分页，不再受 512 行物化投影上限约束。 */
+async function replaceTapeWithBulkVisibleRecords(
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  toolCount: number,
+): Promise<void> {
+  const anchor = (await pool.query<{
+    msg_id: string; role: string; ts: string; content_sha256: string; payload: Buffer;
+  }>(
+    `SELECT r.msg_id,r.role,r.ts,r.content_sha256,r.payload
+       FROM client_session_turn_tape_records r
+       JOIN client_session_turn_tapes t
+         ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+        AND t.billing_anchor_id=r.msg_id
+      WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3`,
+    [sessionId, userId, tapeId],
+  )).rows[0]!;
+  await pool.query(
+    "DELETE FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
+    [sessionId, userId, tapeId],
+  );
+  for (let first = 0; first < toolCount; first += 100) {
+    const rows = Array.from({ length: Math.min(100, toolCount - first) }, (_, i) => {
+      const ordinal = first + i;
+      const msgId = `bulk-visible-${ordinal}`;
+      const payload = Buffer.from(JSON.stringify({
+        id: msgId,
+        role: "tool",
+        text: "",
+        ts: 1_783_944_000_000,
+        toolName: "Bash",
+        output: `visible-${ordinal}`,
+        _completed: true,
+      }), "utf8");
+      return { ordinal, msgId, payload };
+    });
+    const params: unknown[] = [];
+    const values = rows.map((row) => {
+      const base = params.length;
+      params.push(
+        sessionId, userId, tapeId, row.msgId, row.ordinal, "tool", 1_783_944_000_000,
+        sha256(row.payload), row.payload,
+      );
+      return `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},` +
+        `$${base + 6},$${base + 7},$${base + 8},$${base + 9})`;
+    });
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+       VALUES ${values.join(",")}`,
+      params,
+    );
+  }
+  // 留一个 ordinal 空洞，再在尾部放 billing assistant；游标必须把它当物理轴而非可见 offset。
+  await pool.query(
+    `INSERT INTO client_session_turn_tape_records
+       (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [sessionId, userId, tapeId, anchor.msg_id, toolCount + 7, anchor.role,
+      anchor.ts, anchor.content_sha256, anchor.payload],
+  );
+  await pool.query(
+    `UPDATE client_session_turn_tapes
+        SET total_bytes=(
+          SELECT COALESCE(SUM(octet_length(payload)),0)
+            FROM client_session_turn_tape_records
+           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        )
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+    [sessionId, userId, tapeId],
+  );
+  await pool.query(
+    "DELETE FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
+    [sessionId, userId, tapeId],
+  );
+}
+
 describe("pgSessionsBackend §9 会话读物化投影", () => {
   maybe("finalize 物化 chat 投影(保真);chat 读走投影不触 records BYTEA", async () => {
     const sessionId = "sess-p9-a";
@@ -2493,15 +2603,14 @@ describe("pgSessionsBackend §9 会话读物化投影", () => {
     assert.equal(nope, null, "不存在 tape → null(404)");
   });
 
-  maybe("展开端点:building 存量卷在一次点击内按需推进多段并返回内容", async () => {
+  maybe("展开端点:projection building/missing 不阻断，上万 runtime rows 也只读可见记录", async () => {
     const sessionId = "sess-p9-expand-backfill";
     const userId = "c:9112";
     const turnKey = "ea".repeat(32);
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
 
-    // 8001 条不可见 runtime-event + 末尾 assistant = 8002 个物理 records。首轮 chat read
-    // 受 BACKFILL_SEGMENT_RECORD_LIMIT=4000 限制只能留下 building；主动展开应在同一请求内
-    // 连续推进两个 segment，而不是直接 null → HTTP 404。
+    // 8001 条不可见 runtime-event + 末尾 assistant = 8002 个物理 records。会话首屏投影仍按
+    // 4000-record 段有界回填并处于 building；主动展开直接分页 immutable 可见记录，不推进它。
     const previousBudget = process.env.OC_BACKFILL_BYTES;
     process.env.OC_BACKFILL_BYTES = String(16 * 1024 * 1024);
     try {
@@ -2529,96 +2638,159 @@ describe("pgSessionsBackend §9 会话读物化投影", () => {
         [sessionId, userId, tape.finalize.tapeId],
       )).rows[0]!;
       assert.deepEqual(before, { state: "building", next_part: 4000 });
-      const remainingBytes = Number((await pool.query<{ bytes: string }>(
-        `SELECT COALESCE(SUM(octet_length(payload)),0)::text AS bytes
-           FROM client_session_turn_tape_records
-          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4`,
-        [sessionId, userId, tape.finalize.tapeId, before.next_part],
-      )).rows[0]!.bytes);
-      assert.ok(remainingBytes <= Number(process.env.OC_BACKFILL_BYTES),
-        "主动展开读取的剩余 payload 不越共享 OC_BACKFILL_BYTES 预算");
 
       const page = await backend.listTapeChatProjectionRecords(
         sessionId, userId, tape.finalize.tapeId, 0, 100,
       );
-      assert.ok(page, "一次主动展开即收敛并返回投影");
+      assert.ok(page, "building 投影不再造成 404");
+      assert.equal(page!.total, 1, "runtime-event 不计入可见 total");
+      assert.equal(page!.records.length, 1, "只返回末尾 assistant");
+      assert.equal(page!.nextCursor, null);
       assert.ok(page!.records.some((m) => m.role === "assistant" && m.text === "按需回填后的完整回答"));
       const after = (await pool.query<{ state: string; next_part: number }>(
         "SELECT state,next_part FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
         [sessionId, userId, tape.finalize.tapeId],
       )).rows[0]!;
-      assert.deepEqual(after, { state: "complete", next_part: 8002 });
-      assert.ok(after.next_part - before.next_part > 4000, "主动展开确实连续推进了两个 segment");
-      assert.ok(after.next_part - before.next_part <= 8 * 4000, "仍受 8 segment 上限约束");
+      assert.deepEqual(after, before, "主动展开是纯读，不再同步物化整卷");
     } finally {
       if (previousBudget === undefined) Reflect.deleteProperty(process.env, "OC_BACKFILL_BYTES");
       else process.env.OC_BACKFILL_BYTES = previousBudget;
     }
   });
 
-  maybe("展开端点:多段共享一个字节预算，耗尽后保持 building", async () => {
-    const sessionId = "sess-p9-expand-budget";
+  maybe("展开端点:超过 512 个可见 records 仍可按物理 ordinal 全量翻页", async () => {
+    const sessionId = "sess-p9-expand-unbounded";
     const userId = "c:9113";
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
-    const tape = projTape(sessionId, "eb".repeat(32), { text: "预算后正文" });
+    const tape = projTape(sessionId, "eb".repeat(32), { text: "第 531 条最终回答" });
     await stageAndFinalize(userId, tape);
-    const recordBytes = await replaceTapeWithBulkRuntimeRecords(sessionId, userId, tape.finalize.tapeId, 12000);
+    await replaceTapeWithBulkVisibleRecords(sessionId, userId, tape.finalize.tapeId, 530);
 
-    const previousBudget = process.env.OC_BACKFILL_BYTES;
-    // 每次请求总预算恰容 4500 条：首轮 chat read 因 4000-record 段上限停在 4000；
-    // 主动展开第一段再读 4000，第二段只能读剩余 500，不能为下一段重置预算。
-    process.env.OC_BACKFILL_BYTES = String(recordBytes * 4500);
-    try {
-      await backend.getClientSession(sessionId, userId, { projection: "chat" });
-      const before = (await pool.query<{ state: string; next_part: number }>(
-        "SELECT state,next_part FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
-        [sessionId, userId, tape.finalize.tapeId],
-      )).rows[0]!;
-      assert.deepEqual(before, { state: "building", next_part: 4000 });
-
-      assert.equal(
-        await backend.listTapeChatProjectionRecords(sessionId, userId, tape.finalize.tapeId, 0, 100),
-        null,
-        "共享预算耗尽时仍 building，不能冒充 ready 投影",
+    const seen: MessageLike[] = [];
+    let cursor = 0;
+    for (let pageNo = 0; pageNo < 4; pageNo++) {
+      const page = await backend.listTapeChatProjectionRecords(
+        sessionId, userId, tape.finalize.tapeId, cursor, 200,
       );
-      const after = (await pool.query<{ state: string; next_part: number }>(
-        "SELECT state,next_part FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
-        [sessionId, userId, tape.finalize.tapeId],
-      )).rows[0]!;
-      assert.deepEqual(after, { state: "building", next_part: 8500 },
-        "单次展开跨两段合计只读 4500 条，共享预算没有逐段重置");
-    } finally {
-      if (previousBudget === undefined) Reflect.deleteProperty(process.env, "OC_BACKFILL_BYTES");
-      else process.env.OC_BACKFILL_BYTES = previousBudget;
+      assert.ok(page);
+      assert.equal(page!.total, 531, "total=530 tool + 1 assistant，不受 projection 512 行上限影响");
+      seen.push(...page!.records);
+      if (page!.nextCursor === null) break;
+      assert.ok(page!.nextCursor > cursor, "物理 ordinal 游标严格推进");
+      cursor = page!.nextCursor;
     }
+    assert.equal(seen.length, 531, "跨页无缺失");
+    assert.equal(new Set(seen.map((m) => m.id)).size, 531, "跨页无重复");
+    assert.equal(seen.at(-1)?.role, "assistant");
+    assert.equal(seen.at(-1)?.text, "第 531 条最终回答");
+    assert.equal((seen.at(-1)?._turnTapeOrdinal as number), 537, "ordinal 空洞不破坏末页定位");
   });
 
-  maybe("展开端点:单次最多推进 8 个 segment", async () => {
-    const sessionId = "sess-p9-expand-segment-cap";
+  maybe("展开端点:8MiB 原始读取预算中止时游标停在首条未返回记录", async () => {
+    const sessionId = "sess-p9-expand-raw-budget";
     const userId = "c:9114";
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
-    const tape = projTape(sessionId, "ec".repeat(32), { text: "段上限后正文" });
+    // materialized tool payload 同时保留 text/output 两份展示字段；2.2M 字符→单 record 约4.4MiB。
+    const large = "R".repeat(2_200_000);
+    const tape = projTape(sessionId, "ec".repeat(32), {
+      text: "预算后的最终回答",
+      tools: [
+        { toolUseId: "raw-0", blockId: "raw-0", toolName: "Bash", inputJson: {}, inputPreview: "0", output: large, isError: false, durationMs: 1, ts: 2, arrivedAt: 2 },
+        { toolUseId: "raw-1", blockId: "raw-1", toolName: "Bash", inputJson: {}, inputPreview: "1", output: large, isError: false, durationMs: 1, ts: 3, arrivedAt: 3 },
+      ],
+    });
     await stageAndFinalize(userId, tape);
-    const recordBytes = await replaceTapeWithBulkRuntimeRecords(sessionId, userId, tape.finalize.tapeId, 36001);
+    await pool.query(
+      "DELETE FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
+      [sessionId, userId, tape.finalize.tapeId],
+    );
 
-    const previousBudget = process.env.OC_BACKFILL_BYTES;
-    process.env.OC_BACKFILL_BYTES = String(recordBytes * 40000);
+    const first = await backend.listTapeChatProjectionRecords(
+      sessionId, userId, tape.finalize.tapeId, 0, 100,
+    );
+    assert.ok(first);
+    assert.equal(first!.records.length, 1, "两条各约 4.4MiB，单页原始 BYTEA 不得同时进入进程");
+    assert.equal(first!.records[0]!._turnTapeOrdinal, 0);
+    assert.equal(first!.nextCursor, 1, "预算停在第二条的物理 ordinal");
+    const second = await backend.listTapeChatProjectionRecords(
+      sessionId, userId, tape.finalize.tapeId, first!.nextCursor!, 100,
+    );
+    assert.ok(second);
+    assert.deepEqual(second!.records.map((m) => m._turnTapeOrdinal), [1, 2], "下页不漏第二条与 assistant");
+    assert.equal(second!.nextCursor, null);
+  });
+
+  maybe("展开端点:完整 JSON 响应含 envelope/分隔符仍不超过 1MiB", async () => {
+    const sessionId = "sess-p9-expand-json-budget";
+    const userId = "c:9117";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tools = Array.from({ length: 200 }, (_, i) => ({
+      toolUseId: `json-${i}`, blockId: `json-${i}`, toolName: "Bash",
+      // 第 102 条精确校准：若预算漏算 records 的 [] 两字节，旧实现会返回 1,048,577 bytes。
+      inputJson: { i }, inputPreview: String(i), output: "J".repeat(i === 101 ? 4_377 : 4_824),
+      isError: false, durationMs: 1, ts: i + 2, arrivedAt: i + 2,
+    }));
+    const tape = projTape(sessionId, "f0".repeat(32), { text: "JSON 预算后的最终回答", tools });
+    await stageAndFinalize(userId, tape);
+    await pool.query(
+      `UPDATE client_session_turn_tape_records SET ordinal=ordinal+2147483000
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+
+    const first = await backend.listTapeChatProjectionRecords(
+      sessionId, userId, tape.finalize.tapeId, 0, 200,
+    );
+    assert.ok(first);
+    const firstBytes = Buffer.byteLength(JSON.stringify(first), "utf8");
+    assert.ok(firstBytes <= 1024 * 1024,
+      `完整 HTTP body（records 数组、逗号、游标和 total）必须在 1MiB 内，实际 ${firstBytes}`);
+    assert.notEqual(first!.nextCursor, null, "200 条临界行与末尾 assistant 需要换页");
+    const second = await backend.listTapeChatProjectionRecords(
+      sessionId, userId, tape.finalize.tapeId, first!.nextCursor!, 200,
+    );
+    assert.ok(second);
+    const all = [...first!.records, ...second!.records];
+    assert.equal(all.length, 201, "预算换页后 200 tool + assistant 无缺失");
+    assert.equal(new Set(all.map((m) => m.id)).size, 201, "预算换页后无重复");
+    assert.equal(all.at(-1)?.text, "JSON 预算后的最终回答");
+  });
+
+  maybe("展开端点:单记录超过解析上限不拉 payload，返回可继续分块定位的真实 sentinel", async () => {
+    const sessionId = "sess-p9-expand-sentinel";
+    const userId = "c:9116";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = projTape(sessionId, "ef".repeat(32), {
+      text: "sentinel 后回答",
+      tools: [{
+        toolUseId: "sentinel", blockId: "sentinel", toolName: "Bash", inputJson: {},
+        inputPreview: "x", output: "S".repeat(120_000), isError: false, durationMs: 1, ts: 2, arrivedAt: 2,
+      }],
+    });
+    await stageAndFinalize(userId, tape);
+    await pool.query(
+      "DELETE FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const previousCap = process.env.OC_TAPE_RECORD_PARSE_CAP;
+    process.env.OC_TAPE_RECORD_PARSE_CAP = "1024";
     try {
-      await backend.getClientSession(sessionId, userId, { projection: "chat" });
-      assert.equal(
-        await backend.listTapeChatProjectionRecords(sessionId, userId, tape.finalize.tapeId, 0, 100),
-        null,
-        "8 段后仍有记录时保持 building",
+      const page = await backend.listTapeChatProjectionRecords(
+        sessionId, userId, tape.finalize.tapeId, 0, 100,
       );
-      const after = (await pool.query<{ state: string; next_part: number }>(
-        "SELECT state,next_part FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
-        [sessionId, userId, tape.finalize.tapeId],
-      )).rows[0]!;
-      assert.deepEqual(after, { state: "building", next_part: 36000 },
-        "首轮 4000 + 主动展开 8×4000，单次不得推进第 9 段");
+      assert.ok(page);
+      const sentinel = page!.records[0]!;
+      assert.equal(sentinel.id, `srv-${sessionId}-main-t1-tool-sentinel`);
+      assert.equal(sentinel.role, "tool");
+      assert.equal(sentinel._turnTapeOrdinal, 0);
+      assert.equal(sentinel._recordOrdinal, 0);
+      assert.equal(sentinel._projectionSentinel, true);
+      assert.equal(sentinel._truncated, true);
+      assert.ok((sentinel._fullBytes as number) > 1024);
+      assert.equal(page!.records[1]!.text, "sentinel 后回答", "超大记录不阻断后续 assistant");
     } finally {
-      if (previousBudget === undefined) Reflect.deleteProperty(process.env, "OC_BACKFILL_BYTES");
-      else process.env.OC_BACKFILL_BYTES = previousBudget;
+      if (previousCap === undefined) Reflect.deleteProperty(process.env, "OC_TAPE_RECORD_PARSE_CAP");
+      else process.env.OC_TAPE_RECORD_PARSE_CAP = previousCap;
     }
   });
 
@@ -3029,10 +3201,14 @@ describe("R4 终审边界(Codex R4 findings 回归门)", () => {
     });
     await stageAndFinalize(userId, tape);
     const tapeId = tape.finalize.tapeId;
+    await pool.query(
+      "DELETE FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3",
+      [sessionId, userId, tapeId],
+    );
     const page = await backend.listTapeChatProjectionRecords(sessionId, userId, tapeId, 0, 100);
     const ord = (page!.records.find((r) => (r as MessageLike)._truncated === true) as MessageLike)._recordOrdinal as number;
     const first = await backend.readTapeRecordChunk(sessionId, userId, tapeId, ord, 0);
-    assert.ok(first && first.nextOffset !== null, "首块命中且未读尽");
+    assert.ok(first && first.nextOffset !== null, "projection 缺失仍按 finalized tape header 命中首块");
     // 行为证明:删掉 record 行后,派生文本仍从进程 LRU 服务 —— 不存在"每块重拉整卷"路径。
     await pool.query(
       "DELETE FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4",
