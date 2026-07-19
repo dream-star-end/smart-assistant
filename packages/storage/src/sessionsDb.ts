@@ -213,6 +213,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       last_at INTEGER NOT NULL,
       messages TEXT NOT NULL DEFAULT '[]',
       message_count INTEGER NOT NULL DEFAULT 0,
+      history_revision INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_client_sessions_last ON client_sessions(last_at);
@@ -233,6 +234,16 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("ALTER TABLE client_sessions ADD COLUMN deleted_at INTEGER DEFAULT NULL")
       // Migrate existing __deleted__ tombstones to the new column
       db.exec("UPDATE client_sessions SET deleted_at = updated_at WHERE title = '__deleted__'")
+    }
+  } catch { /* table just created with column already */ }
+  // Migration: projection revision for mutations that cannot be represented
+  // by the per-message `_seq` cursor (for example an in-place waiver or a
+  // client PUT that removes a previously persisted message). Incremental
+  // reads are safe only when the caller presents this exact revision.
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'history_revision')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN history_revision INTEGER NOT NULL DEFAULT 0')
     }
   } catch { /* table just created with column already */ }
   // Migration: store message counts separately so list endpoints don't parse
@@ -1359,6 +1370,9 @@ export interface ClientSession {
   /** 会话级模型选择(UI 恢复提示,非执行权威;缺省 = 未显式选择 → 前端回落 default_model)。
    *  写路径:建行 PUT 可携带;既有会话经 setClientSessionModel(PATCH)。upsert 未携带时保留既有值。 */
   modelId?: string
+  /** Server-owned revision for projection changes invisible to `_seq`.
+   * Optional on write inputs for rolling callers; every DB read populates it. */
+  historyRevision?: number
   // 归档水位(热尾巴 + 归档)。读侧透传给客户端:archivedCount 用于"还有 N 条"计数与
   // "从云端加载更早历史"按钮是否出现;archivedThroughSeq 名称为滚动兼容保留,
   // 值是 `_orderSeq` 水位。旧行/无归档 → 0。
@@ -1400,6 +1414,9 @@ export type MessageLike = {
   /** Immutable presentation/archive position assigned on first persistence.
    * `_seq` remains the mutable content-version cursor. */
   _orderSeq?: number
+  /** Server-authored ordinal inside one lossless turn tape. Rows from one tape
+   * share `_orderSeq`; this freezes their intra-turn order across clock skew. */
+  _turnTapeOrdinal?: number
   [k: string]: unknown
 }
 
@@ -1412,6 +1429,18 @@ export function compareMessagesByOrder(a: MessageLike, b: MessageLike): number {
   const ao = isValidOrderSeq(a?._orderSeq) ? a._orderSeq : Number.MAX_SAFE_INTEGER
   const bo = isValidOrderSeq(b?._orderSeq) ? b._orderSeq : Number.MAX_SAFE_INTEGER
   if (ao !== bo) return ao - bo
+  const tapeOrdinal = (message: MessageLike): number | null =>
+    typeof message._turnTapeId === 'string' && message._turnTapeId.length > 0 &&
+    typeof message._turnTapeOrdinal === 'number' &&
+    Number.isSafeInteger(message._turnTapeOrdinal) && message._turnTapeOrdinal >= 0
+      ? message._turnTapeOrdinal
+      : null
+  const atape = tapeOrdinal(a)
+  const btape = tapeOrdinal(b)
+  const arank = a._tapeCollapsed === true ? 0 : atape !== null ? 1 : 2
+  const brank = b._tapeCollapsed === true ? 0 : btape !== null ? 1 : 2
+  if (arank !== brank) return arank - brank
+  if (atape !== null && btape !== null && atape !== btape) return atape - btape
   const at = typeof a?.ts === 'number' && Number.isFinite(a.ts) ? a.ts : 0
   const bt = typeof b?.ts === 'number' && Number.isFinite(b.ts) ? b.ts : 0
   return at - bt
@@ -1526,6 +1555,8 @@ export function deriveArchivedOrderSeqsForRead<T extends MessageLike>(messages: 
  * surface; chat is the bounded browser presentation surface. */
 export type ClientSessionReadOptions = {
   projection?: 'exact' | 'chat'
+  /** Revision paired with `sinceSeq`; missing/mismatch forces a full read. */
+  sinceHistoryRevision?: number
 }
 
 export type HistoryProjection =
@@ -1572,6 +1603,9 @@ function projectionCheckpoint(message: MessageLike): MessageLike {
     ...(seq !== undefined ? { _seq: seq } : {}),
     ...(orderSeq !== undefined ? { _orderSeq: orderSeq } : {}),
     ...(tapeId !== undefined ? { _turnTapeId: tapeId } : {}),
+    ...(typeof message._turnTapeOrdinal === 'number'
+      ? { _turnTapeOrdinal: message._turnTapeOrdinal }
+      : {}),
     ...(typeof message._turnTapeSha256 === 'string'
       ? { _turnTapeSha256: message._turnTapeSha256 }
       : {}),
@@ -1651,6 +1685,9 @@ export function projectClientSessionMessagesForChat(messages: readonly MessageLi
       ...(typeof message._seq === 'number' && Number.isFinite(message._seq) ? { _seq: message._seq } : {}),
       ...(isValidOrderSeq(message._orderSeq) ? { _orderSeq: message._orderSeq } : {}),
       ...(typeof message._turnTapeId === 'string' ? { _turnTapeId: message._turnTapeId } : {}),
+      ...(typeof message._turnTapeOrdinal === 'number'
+        ? { _turnTapeOrdinal: message._turnTapeOrdinal }
+        : {}),
       ...(typeof message._turnTapeSha256 === 'string'
         ? { _turnTapeSha256: message._turnTapeSha256 }
         : {}),
@@ -1780,7 +1817,7 @@ const CLIENT_PUT_TEAM_MESSAGE_FIELDS: ReadonlySet<string> = new Set<string>(
 )
 
 const SERVER_AUTHORITATIVE_FIELDS: ReadonlySet<string> = new Set<string>([
-  '_source', '_seq', '_orderSeq', 'usage',
+  '_source', '_seq', '_orderSeq', '_turnTapeOrdinal', 'usage',
   '_truncated', '_errorCode', '_errorDetail',
 ])
 
@@ -2752,6 +2789,81 @@ function _filterOutArchivedIncoming(
 const _STALE_WRITE_ROLLBACK = new Error('__stale_write_rollback__')
 
 /**
+ * Whether a PUT removed a previously persisted hot-row message. New or
+ * changed messages receive a fresh `_seq` and are therefore visible to an
+ * incremental reader; removals have no row to carry a new `_seq`, so they
+ * must advance the separate history revision and force one full refresh.
+ *
+ * Compare before spill: moving an old row from the hot tail into the archive
+ * is not a logical deletion. Duplicate ids are counted rather than set-tested
+ * so malformed legacy rows still fail safe. Anonymous rows can only be proven
+ * preserved when the exact server object survives the merge.
+ */
+export function hasInvisibleMessageRemoval(
+  oldMessages: readonly MessageLike[],
+  finalMessages: readonly MessageLike[],
+): boolean {
+  const remainingById = new Map<string, number>()
+  const remainingAnonymous = new Set<MessageLike>()
+  for (const message of finalMessages) {
+    if (typeof message?.id === 'string') {
+      remainingById.set(message.id, (remainingById.get(message.id) ?? 0) + 1)
+    } else if (message && typeof message === 'object') {
+      remainingAnonymous.add(message)
+    }
+  }
+  for (const message of oldMessages) {
+    if (typeof message?.id === 'string') {
+      const count = remainingById.get(message.id) ?? 0
+      if (count === 0) return true
+      remainingById.set(message.id, count - 1)
+    } else if (!remainingAnonymous.has(message)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Covers both removals and a freshly versioned row that the same mutation
+ * immediately spills out of the hot tail. In the latter case `_seq` advanced,
+ * but the partial-read source no longer contains the new version.
+ */
+export function hasInvisibleHistoryMutation(
+  oldMessages: readonly MessageLike[],
+  finalMessages: readonly MessageLike[],
+  visibleMessages: readonly MessageLike[],
+): boolean {
+  if (hasInvisibleMessageRemoval(oldMessages, finalMessages)) return true
+
+  const oldSeqById = new Map<string, number | undefined>()
+  for (const message of oldMessages) {
+    if (typeof message?.id === 'string' && !oldSeqById.has(message.id)) {
+      oldSeqById.set(message.id, typeof message._seq === 'number' ? message._seq : undefined)
+    }
+  }
+  const visibleVersions = new Set<string>()
+  const visibleAnonymous = new Set<MessageLike>()
+  for (const message of visibleMessages) {
+    if (typeof message?.id === 'string' && typeof message._seq === 'number') {
+      visibleVersions.add(`${message.id}\u0000${message._seq}`)
+    } else if (message && typeof message === 'object') {
+      visibleAnonymous.add(message)
+    }
+  }
+  for (const message of finalMessages) {
+    if (typeof message?.id === 'string') {
+      const oldSeq = oldSeqById.get(message.id)
+      const seq = typeof message._seq === 'number' ? message._seq : undefined
+      if (oldSeq !== seq && !visibleVersions.has(`${message.id}\u0000${String(seq)}`)) return true
+    } else if (!visibleAnonymous.has(message)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * Returns true if the row was actually inserted/updated, false if rejected.
  * @param baseSyncedAt - client's last known server updated_at (optimistic concurrency).
  *   On conflict, the write is only applied if the existing row's updated_at <= baseSyncedAt
@@ -2770,10 +2882,10 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
   const db = await getSessionsDb()
   const txn = db.transaction((): UpsertClientSessionResult => {
     const existing = db.prepare(
-      'SELECT messages, updated_at, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+      'SELECT messages, updated_at, next_seq, archived_through_seq, archived_count, history_revision FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
     ).get(session.id, session.userId) as {
       messages: string; updated_at: number; next_seq: number | null
-      archived_through_seq: number | null; archived_count: number | null
+      archived_through_seq: number | null; archived_count: number | null; history_revision: number
     } | undefined
 
     // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
@@ -2815,6 +2927,9 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
     })
     const newArchivedCount = (existing?.archived_count ?? 0) + spill.archivedDelta
     const tail = spill.tail
+    const historyRevisionDelta = existing && (
+      hasInvisibleHistoryMutation(oldMsgs, finalMessages, tail) || spill.archivedDelta > 0
+    ) ? 1 : 0
 
     // Size guard — see MAX_SESSION_BYTES(spill 后作用于 tail;tail ≤ TAIL_TARGET(2M) < 4M,
     // 理论不可达,保留作最后防线)。Buffer.byteLength 让多字节 UTF-8(中文/emoji)按落盘字节计。
@@ -2824,8 +2939,8 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
     }
 
     const result = db.prepare(`
-      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id)
-      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, MAX(@updatedAt, @updatedAtFloor), @nextSeq, @archivedThroughSeq, @archivedCount, @modelId)
+      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, history_revision, model_id)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, MAX(@updatedAt, @updatedAtFloor), @nextSeq, @archivedThroughSeq, @archivedCount, 0, @modelId)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         title = excluded.title,
@@ -2844,7 +2959,8 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
         updated_at = MAX(client_sessions.updated_at + 1, @updatedAtFloor, excluded.updated_at),
         next_seq = excluded.next_seq,
         archived_through_seq = excluded.archived_through_seq,
-        archived_count = excluded.archived_count
+        archived_count = excluded.archived_count,
+        history_revision = client_sessions.history_revision + @historyRevisionDelta
       WHERE client_sessions.updated_at <= @baseSyncedAt
         AND client_sessions.user_id = @userId
     `).run({
@@ -2866,6 +2982,7 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
       nextSeq,
       archivedThroughSeq: spill.archivedThroughSeq,
       archivedCount: newArchivedCount,
+      historyRevisionDelta,
     })
     if (result.changes > 0) return 'applied'
     // result.changes === 0:ON CONFLICT WHERE 因 client_sessions.updated_at > @baseSyncedAt
@@ -2983,6 +3100,8 @@ function _appendServerAuthoredCore(
   const archivedDelta = _executeSpillPlan(db, sessId, userId, plan.chunksToInsert, plan.idsToInsert, now)
   const newArchivedCount = (row.archived_count ?? 0) + archivedDelta
   const tail = plan.tail
+  const historyRevisionDelta =
+    hasInvisibleMessageRemoval(msgs, tail) || archivedDelta > 0 ? 1 : 0
 
   // Belt-and-braces: the SELECT above already gated on `deleted_at !== null`
   // inside the same BEGIN IMMEDIATE transaction, so a concurrent soft-delete
@@ -2995,8 +3114,8 @@ function _appendServerAuthoredCore(
   // updated_at 逻辑版本(RFC D3b):由 DB 计算 MAX(updated_at + 1, now) 严格单调推进
   // (双 master 下同毫秒双写 / 时钟偏差被 cur+1 兜底,消除 stale-write 静默覆盖)。
   const update = db.prepare(
-    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = ?, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-  ).run(plan.finalJson, tail.length + newArchivedCount, now, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId)
+    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = ?, archived_through_seq = ?, archived_count = ?, history_revision = history_revision + ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+  ).run(plan.finalJson, tail.length + newArchivedCount, now, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, historyRevisionDelta, sessId, userId)
   if (update.changes !== 1) {
     // Race: row was deleted between SELECT and UPDATE within the same txn.
     // Should be unreachable under BEGIN IMMEDIATE, but if SQLite's transaction
@@ -3311,8 +3430,9 @@ async function _sqliteAppendCostCredits(
           const nowMs = Date.now()
           const archivedDelta = _executeSpillPlan(db, mapRow.session_id, userId, plan.chunksToInsert, plan.idsToInsert, nowMs)
           const newArchivedCount = (sess.archived_count ?? 0) + archivedDelta
+          const historyRevisionDelta = archivedDelta > 0 ? 1 : 0
           db.prepare(
-            'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
+            'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ?, history_revision = history_revision + ? WHERE id = ? AND user_id = ?'
           ).run(
             plan.finalJson,
             plan.tail.length + newArchivedCount,
@@ -3320,6 +3440,7 @@ async function _sqliteAppendCostCredits(
             nowMs,
             plan.archivedThroughSeq,
             newArchivedCount,
+            historyRevisionDelta,
             mapRow.session_id,
             userId,
           )
@@ -3463,9 +3584,10 @@ async function _sqliteDrainDelegateCostForClientSession(
     const nowMs = Date.now()
     const archivedDelta = _executeSpillPlan(db, clientSessionId, userId, plan.chunksToInsert, plan.idsToInsert, nowMs)
     const newArchivedCount = (sess!.archived_count ?? 0) + archivedDelta
+    const historyRevisionDelta = archivedDelta > 0 ? 1 : 0
     db.prepare(
-      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
-    ).run(plan.finalJson, plan.tail.length + newArchivedCount, nowMs, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId)
+      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ?, history_revision = history_revision + ? WHERE id = ? AND user_id = ?'
+    ).run(plan.finalJson, plan.tail.length + newArchivedCount, nowMs, nowMs, plan.archivedThroughSeq, newArchivedCount, historyRevisionDelta, clientSessionId, userId)
 
     // 只删本次读到的行——并发新 park 不在列表里,留给下一轮。
     for (const p of pendings) del.run(userId, p.request_id)
@@ -3839,12 +3961,12 @@ async function _sqliteGetClientSession(
 ): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
-    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
+    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
   const row = (userId ? db.prepare(sql).get(id, userId) : db.prepare(sql).get(id)) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
-    archived_through_seq: number | null; archived_count: number | null
+    archived_through_seq: number | null; archived_count: number | null; history_revision: number
     model_id: string | null
   } | undefined
   if (!row) return null
@@ -3865,6 +3987,7 @@ async function _sqliteGetClientSession(
       ? projectClientSessionMessagesForChat(exactMessages)
       : exactMessages,
     updatedAt: row.updated_at,
+    historyRevision: row.history_revision,
     ...(row.model_id ? { modelId: row.model_id } : {}),
     // 归档水位透传(读新列,零额外 IO)。getClientSession 返回的 messages 是热尾巴;
     // 客户端据 archivedThroughSeq 判定本地已归档行的保留,据 archivedCount 显示计数。
@@ -3905,6 +4028,10 @@ export interface ClientSessionPartial extends ClientSession {
  * Once any write path (upsert / appendServerAuthored) runs on the row, the
  * row enters incremental mode and subsequent GETs honour `since`.
  *
+ * Incremental mode also requires `options.sinceHistoryRevision` to equal the
+ * row's server-owned projection revision. Missing/mismatch returns the full
+ * hot projection so rolling old clients self-heal without a coordinated cut.
+ *
  * `maxSeq` is computed from the actual messages array (NOT `next_seq`); per
  * Codex review #5, `next_seq - 1` may drift in the rare schema-mismatch case.
  */
@@ -3916,11 +4043,11 @@ async function _sqliteGetClientSessionPartial(
 ): Promise<ClientSessionPartial | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
-    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
   ).get(id, userId) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
-    archived_through_seq: number | null; archived_count: number | null
+    archived_through_seq: number | null; archived_count: number | null; history_revision: number
     model_id: string | null
   } | undefined
   if (!row) return null
@@ -3950,7 +4077,10 @@ async function _sqliteGetClientSessionPartial(
     if (s > maxSeq) maxSeq = s
   }
   const sinceIsValid = Number.isFinite(sinceSeq) && sinceSeq > 0
-  if (!anyMissingSeq && sinceIsValid) {
+  const historyRevisionMatches =
+    Number.isSafeInteger(options.sinceHistoryRevision) &&
+    options.sinceHistoryRevision === row.history_revision
+  if (!anyMissingSeq && sinceIsValid && historyRevisionMatches) {
     messages = allMsgs.filter((m) => typeof m?._seq === 'number' && (m._seq as number) > sinceSeq)
     isPartial = true
   } else {
@@ -3970,6 +4100,7 @@ async function _sqliteGetClientSessionPartial(
     lastAt: row.last_at,
     messages,
     updatedAt: row.updated_at,
+    historyRevision: row.history_revision,
     ...(row.model_id ? { modelId: row.model_id } : {}),
     // 总条数 = 热尾巴条数 + 已归档条数(row.messages 现在只存热尾巴,allMsgs 即热尾巴)。
     totalMessageCount: allMsgs.length + archivedCount,
@@ -3988,6 +4119,8 @@ export interface ReadArchivedMessagesResult {
   hasMore: boolean
   /** 本页最老一条的 _orderSeq(字段名保留兼容);空页 → null。 */
   oldestSeq: number | null
+  /** Projection revision captured with this archive page. */
+  historyRevision?: number
 }
 
 /**
@@ -4017,13 +4150,15 @@ async function _sqliteReadArchivedMessages(
 
   // 会话归属 + 取水位(缺省 beforeSeq 的锚点)。行不存在/非本人/已删 → 空结果。
   const row = db.prepare(
-    'SELECT archived_through_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
-  ).get(sessId, userId) as { archived_through_seq: number | null } | undefined
+    'SELECT archived_through_seq, history_revision FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessId, userId) as { archived_through_seq: number | null; history_revision: number } | undefined
   if (!row) return { messages: [], hasMore: false, oldestSeq: null }
   const watermark = typeof row.archived_through_seq === 'number' ? row.archived_through_seq : 0
   const effectiveBefore = Number.isFinite(beforeSeq) && beforeSeq > 0 ? beforeSeq : watermark + 1
   // effectiveBefore ≤ 1:没有 _orderSeq < 1 的归档消息可返回。
-  if (effectiveBefore <= 1) return { messages: [], hasMore: false, oldestSeq: null }
+  if (effectiveBefore <= 1) {
+    return { messages: [], hasMore: false, oldestSeq: null, historyRevision: row.history_revision }
+  }
 
   // 候选 chunk:first_seq(= chunk 内 _seq 最小值)< effectiveBefore 者才可能含合格消息。
   // 从新到旧读(last_seq DESC),攒到多于一页即停。
@@ -4059,6 +4194,7 @@ async function _sqliteReadArchivedMessages(
     messages: options.projection === 'chat' ? projectClientSessionMessagesForChat(page) : page,
     hasMore,
     oldestSeq,
+    historyRevision: row.history_revision,
   }
 }
 

@@ -64,6 +64,8 @@ import {
   deriveOrderSeqsForRead,
   type DrainDelegateCostResult,
   MAX_SESSION_BYTES,
+  hasInvisibleHistoryMutation,
+  hasInvisibleMessageRemoval,
   type MessageLike,
   mergePreservingServerAuthored,
   normalizeAndAssignOrderSeqs,
@@ -453,14 +455,17 @@ async function pgAppendServerAuthoredCore(
   const archivedDelta = await execPgSpillPlan(client, sessId, userId, plan.chunksToInsert, plan.idsToInsert, now);
   const newArchivedCount = bigIntNumOr(row.archived_count, 0) + archivedDelta;
   const tail = plan.tail;
+  const historyRevisionDelta =
+    hasInvisibleMessageRemoval(msgs, tail) || archivedDelta > 0 ? 1 : 0;
 
   const upd = await client.query(
     `UPDATE client_sessions
        SET messages = $1, message_count = $2, last_at = $3,
            updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-           next_seq = $4, archived_through_seq = $5, archived_count = $6
+           next_seq = $4, archived_through_seq = $5, archived_count = $6,
+           history_revision = history_revision + $9
      WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL`,
-    [plan.finalJson, tail.length + newArchivedCount, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId],
+    [plan.finalJson, tail.length + newArchivedCount, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId, historyRevisionDelta],
   );
   if (upd.rowCount !== 1) {
     // 并发软删抢在 SELECT 与 UPDATE 之间(FOR UPDATE 下不可达;保留作最后防线,宁报终态不复活墓碑)。
@@ -561,6 +566,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_sessions", "pinned", "smallint"],
   ["client_sessions", "next_seq", "integer"],
   ["client_sessions", "archived_through_seq", "integer"],
+  ["client_sessions", "history_revision", "bigint"],
   ["client_session_archive_chunks", "session_id", "text"],
   ["client_session_archive_chunks", "first_seq", "integer"],
   ["client_session_archive_chunks", "messages", "text"],
@@ -644,7 +650,7 @@ async function convergeDispatchOnFinalize(
   client: PoolClient,
   dispatchId: string,
   tapeStatus: string,
-): Promise<{ lateTape: boolean }> {
+): Promise<{ lateTape: boolean; projectionRevoked: boolean }> {
   const outcome =
     tapeStatus === "completed" ? "completed" :
     tapeStatus === "interrupted" ? "interrupted" : "crashed";
@@ -653,18 +659,18 @@ async function convergeDispatchOnFinalize(
     outcome,
     fromStatuses: ["admitted", "accepted", "rejecting"],
   });
-  if (converged !== null) return { lateTape: false };
+  if (converged !== null) return { lateTape: false, projectionRevoked: false };
   const d = await getDispatch(client, dispatchId);
   if (d && d.status === "terminal" && d.outcome === "not_accepted") {
-    await revokeErrorProjection(client, dispatchId);
+    const projectionRevoked = await revokeErrorProjection(client, dispatchId);
     const held = await casToManualReconcile(client, {
       dispatchId,
       conflictReason: "late_tape",
       fromStatuses: ["terminal"],
     });
-    return { lateTape: held !== null };
+    return { lateTape: held !== null, projectionRevoked };
   }
-  return { lateTape: false };
+  return { lateTape: false, projectionRevoked: false };
 }
 
 export interface LosslessTurnTapeStorage {
@@ -943,6 +949,7 @@ function hydrateTapeRecordContent(
     // back into client_sessions.messages.
     _turnTapeId: row.tape_id,
     _turnTapeMsgId: row.msg_id,
+    _turnTapeOrdinal: row.ordinal,
     _turnTapeSha256: row.tape_sha256,
     _turnTapeExpanded: true,
     // 来源边界硬化:legacy 分支显式压掉 payload 自带的同名字段(受信 materializer 不会产出,
@@ -1088,6 +1095,7 @@ function expandHydratedRuntimeBatch(
       _turnTapeId: row.tape_id,
       _turnTapeMsgId: id,
       _turnTapePhysicalMsgId: row.msg_id,
+      _turnTapeOrdinal: row.ordinal,
       _turnTapeSha256: row.tape_sha256,
       _turnTapeExpanded: true,
       ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
@@ -1217,6 +1225,7 @@ const projectionOversizeNote = (bytes: number): string =>
 function sentinelForOversizeRow(original: MessageLike, fullBytes: number): MessageLike {
   const note = projectionOversizeNote(fullBytes);
   const ordinal = typeof original._recordOrdinal === "number" ? original._recordOrdinal : null;
+  const tapeOrdinal = typeof original._turnTapeOrdinal === "number" ? original._turnTapeOrdinal : null;
   return {
     ...(typeof original.id === "string" ? { id: original.id } : {}),
     role: typeof original.role === "string" ? original.role : "tool",
@@ -1224,6 +1233,8 @@ function sentinelForOversizeRow(original: MessageLike, fullBytes: number): Messa
     ...(typeof original._clientMessageId === "string" ? { _clientMessageId: original._clientMessageId } : {}),
     ...(typeof original._errorCode === "string" ? { _errorCode: original._errorCode } : {}),
     ...(typeof original._turnTapeMsgId === "string" ? { _turnTapeMsgId: original._turnTapeMsgId } : {}),
+    ...(typeof original._turnTapeId === "string" ? { _turnTapeId: original._turnTapeId } : {}),
+    ...(tapeOrdinal !== null ? { _turnTapeOrdinal: tapeOrdinal } : {}),
     ...(ordinal !== null ? { _recordOrdinal: ordinal } : {}),
     _projectionSentinel: true,
     _truncated: true,
@@ -1240,6 +1251,8 @@ function sentinelForOversizeRecord(tapeId: string, ordinal: number, fullBytes: n
   return {
     id: `oc-projection-oversize:${tapeId}:${ordinal}`,
     role: "tool",
+    _turnTapeId: tapeId,
+    _turnTapeOrdinal: ordinal,
     _projectionSentinel: true,
     _truncated: true,
     _fullBytes: fullBytes,
@@ -1269,6 +1282,8 @@ function extractTerminalRowEvidence(visible: MessageLike[]): MessageLike | null 
       ...(typeof r._clientMessageId === "string" ? { _clientMessageId: r._clientMessageId } : {}),
       ...(typeof r.status === "string" ? { status: r.status } : {}),
       ...(typeof r._errorCode === "string" ? { _errorCode: r._errorCode } : {}),
+      ...(typeof r._turnTapeId === "string" ? { _turnTapeId: r._turnTapeId } : {}),
+      ...(typeof r._turnTapeOrdinal === "number" ? { _turnTapeOrdinal: r._turnTapeOrdinal } : {}),
       ...(r._turnTapeComplete === true ? { _turnTapeComplete: true } : {}),
       _projectionTerminalEvidence: true,
       text: typeof r.text === "string" ? utf8PrefixBytes(r.text, 4096) : "",
@@ -1908,6 +1923,18 @@ function rehydrateBuildingAccumulator(
   return { visible, tailWinners };
 }
 
+/** Existing materialized projection rows already persist `_recordOrdinal` for
+ * every source record. Promote it on read so this rollout fixes old complete
+ * projections immediately; newly built rows also carry the dedicated field. */
+function projectionTapeOrdinal(row: MessageLike): number | null {
+  const value = typeof row._turnTapeOrdinal === "number"
+    ? row._turnTapeOrdinal
+    : row._recordOrdinal;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
 /** chat 读第二阶段:把某卷投影行现盖 _seq/_orderSeq(活体 anchor)+ 现算 cost/waiver 叠加;
  *  卷级截断(state='truncated')时给末行盖 `_projectionTruncated:true`(前端渲染「已截断,查看完整」)。 */
 function applyProjectionForChat(
@@ -1919,6 +1946,9 @@ function applyProjectionForChat(
   const billingAnchorId = enrich?.billingAnchorId ?? null;
   const out = storedRows.map((stored) => {
     let row: MessageLike = { ...stored };
+    const ordinal = projectionTapeOrdinal(row);
+    if (ordinal !== null) row._turnTapeOrdinal = ordinal;
+    else delete row._turnTapeOrdinal;
     // `_winnerOrdinal` 是 building 续段内部记账,不上 wire;`_recordOrdinal` 仅截断行需要
     // (前端"查看完整"按记录分块拉),非截断行剥掉减噪。
     delete row._winnerOrdinal;
@@ -1927,6 +1957,7 @@ function applyProjectionForChat(
     else delete row._seq;
     if (typeof anchor._orderSeq === "number") row._orderSeq = anchor._orderSeq;
     else delete row._orderSeq;
+    if (typeof anchor._turnTapeId === "string") row._turnTapeId = anchor._turnTapeId;
     if (enrich && billingAnchorId !== null && row.id === billingAnchorId) {
       row = mergeExactUsage(row, enrich, true);
     }
@@ -2121,7 +2152,16 @@ async function readGenerationProjectionRows(
   const out = new Map<string, MessageLike[]>();
   for (const r of res.rows) {
     if (!Array.isArray(r.rows)) continue;
-    const gen = r.rows.filter((m) => m && (m.role === "assistant" || m.role === "user"));
+    const gen = r.rows
+      .filter((m) => m && (m.role === "assistant" || m.role === "user"))
+      .map((m): MessageLike => {
+        const ordinal = projectionTapeOrdinal(m);
+        return {
+          ...m,
+          _turnTapeId: r.tape_id,
+          ...(ordinal !== null ? { _turnTapeOrdinal: ordinal } : {}),
+        };
+      });
     // B-§9-3 兜底:assistant 完成行被行预算尾截掉时,用 header terminal_row 补一条(保 dedup/完成证据)。
     const term = r.terminal_row;
     if (term && typeof term === "object" && term.role === "assistant") {
@@ -2252,6 +2292,10 @@ async function listTapeChatProjectionRecordsImpl(
     // 前端 socket.applyExpandedTapeRecords 透传 + ToolCard 读 `_recordOrdinal` 零改动即通。剥内部记账字段;
     // 非截断行同 chat 读剥掉 `_recordOrdinal` 减噪。
     const rec: MessageLike = { ...stored };
+    const ordinal = projectionTapeOrdinal(rec);
+    rec._turnTapeId = tapeId;
+    if (ordinal !== null) rec._turnTapeOrdinal = ordinal;
+    else delete rec._turnTapeOrdinal;
     delete rec._winnerOrdinal;
     if (rec._truncated !== true) delete rec._recordOrdinal;
     const recBytes = jsonBytes(rec);
@@ -3082,7 +3126,19 @@ export function createPgSessionsBackend(
           // 幂等 replay 分支同样收敛 dispatch(不依赖 parts):首轮 finalize 若已收敛,CAS no-op。
           let replayLate = false;
           if (tape.dispatch_id !== null) {
-            replayLate = (await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status)).lateTape;
+            const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+            replayLate = convergence.lateTape;
+            if (convergence.projectionRevoked) {
+              // finalize 已在事务起点持有 session 行锁；在这里传播 projection absence，
+              // 不让 reconciler 形成 dispatch→session、与本路径 session→dispatch 的反序。
+              await client.query(
+                `UPDATE client_sessions
+                    SET history_revision=history_revision + 1,
+                        updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                  WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+                [request.sessionId, userId],
+              );
+            }
           }
           return {
             applied: "idempotent",
@@ -3295,6 +3351,7 @@ export function createPgSessionsBackend(
         // would make hydration return duplicate paid records. Archived
         // collisions stay fail-closed above because rewriting archive chunks
         // is not part of this atomic finalize operation.
+        const preUpgradeMessages = existingMessages;
         const recordIds = new Set(allRecordIds);
         existingMessages = existingMessages.filter(
           (message) => typeof message?.id !== "string" || !recordIds.has(message.id),
@@ -3321,7 +3378,8 @@ export function createPgSessionsBackend(
             `UPDATE client_sessions SET
                messages=$1, message_count=$2, last_at=$3,
                updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-               next_seq=$4, archived_through_seq=$5, archived_count=$6
+               next_seq=$4, archived_through_seq=$5, archived_count=$6,
+               history_revision=history_revision + $9
              WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
             [
               plan.finalJson,
@@ -3332,6 +3390,7 @@ export function createPgSessionsBackend(
               archivedCount,
               request.sessionId,
               userId,
+              hasInvisibleMessageRemoval(preUpgradeMessages, plan.tail) || archivedDelta > 0 ? 1 : 0,
             ],
           );
         }
@@ -3434,7 +3493,19 @@ export function createPgSessionsBackend(
         // 或迟到 tape 撤 projection + manual_reconcile。与内容 materialize 同一 tx,原子。
         let dispatchLate = false;
         if (tape.dispatch_id !== null) {
-          dispatchLate = (await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status)).lateTape;
+          const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
+          dispatchLate = convergence.lateTape;
+          if (convergence.projectionRevoked) {
+            // 仅 absence 需要 revision；projection insert 每次 partial 都会全量并入。
+            // 当前事务已持 session 锁，因此不会引入 reconciler 的锁序反转。
+            await client.query(
+              `UPDATE client_sessions
+                  SET history_revision=history_revision + 1,
+                      updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+              [request.sessionId, userId],
+            );
+          }
         }
         return {
           applied: "finalized",
@@ -3514,8 +3585,9 @@ export function createPgSessionsBackend(
               next_seq: number | null;
               archived_through_seq: number | null;
               archived_count: number | null;
+              history_revision: string;
             }>(
-              "SELECT messages, updated_at, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
+              "SELECT messages, updated_at, next_seq, archived_through_seq, archived_count, history_revision FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
               [session.id, session.userId],
             )
           ).rows[0];
@@ -3564,11 +3636,14 @@ export function createPgSessionsBackend(
             now,
           );
           const newArchivedCount = bigIntNumOr(existing?.archived_count, 0) + archivedDelta;
+          const historyRevisionDelta = existing && (
+            hasInvisibleHistoryMutation(oldMsgs, finalMessages, tail) || archivedDelta > 0
+          ) ? 1 : 0;
 
           const res = await client.query(
             `INSERT INTO client_sessions
-               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13, $15)
+               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id, history_revision)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13, $15, 0)
              ON CONFLICT (id) DO UPDATE SET
                agent_id = EXCLUDED.agent_id,
                title = EXCLUDED.title,
@@ -3587,7 +3662,8 @@ export function createPgSessionsBackend(
                updated_at = GREATEST(client_sessions.updated_at + 1, ${CLOCK_MS_SQL}, EXCLUDED.updated_at),
                next_seq = EXCLUDED.next_seq,
                archived_through_seq = EXCLUDED.archived_through_seq,
-               archived_count = EXCLUDED.archived_count
+               archived_count = EXCLUDED.archived_count,
+               history_revision = client_sessions.history_revision + $16
              WHERE client_sessions.updated_at <= $14 AND client_sessions.user_id = $2`,
             [
               session.id,
@@ -3605,6 +3681,7 @@ export function createPgSessionsBackend(
               newArchivedCount,
               baseSyncedAt,
               session.modelId ?? null,
+              historyRevisionDelta,
             ],
           );
           if ((res.rowCount ?? 0) > 0) return "applied";
@@ -3988,7 +4065,8 @@ export function createPgSessionsBackend(
                   `UPDATE client_sessions SET
                      messages=$1,message_count=$2,last_at=$3,
                      updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-                     next_seq=$4,archived_through_seq=$5,archived_count=$6
+                     next_seq=$4,archived_through_seq=$5,archived_count=$6,
+                     history_revision=history_revision + $9
                    WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
                   [
                     finalJson,
@@ -3999,6 +4077,7 @@ export function createPgSessionsBackend(
                     archivedCount,
                     map.session_id,
                     userId,
+                    archivedDelta > 0 ? 1 : 0,
                   ],
                 );
               } else {
@@ -4007,7 +4086,8 @@ export function createPgSessionsBackend(
                 // bump the session version so full-sync clients revalidate.
                 await client.query(
                   `UPDATE client_sessions
-                      SET updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                      SET updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
+                          history_revision=history_revision + 1
                     WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
                   [map.session_id, userId],
                 );
@@ -4083,13 +4163,15 @@ export function createPgSessionsBackend(
               const nowMs = Date.now();
               const archivedDelta = await execPgSpillPlan(client, mapRow.session_id, userId, plan.chunksToInsert, plan.idsToInsert, nowMs);
               const newArchivedCount = bigIntNumOr(sess.archived_count, 0) + archivedDelta;
+              const historyRevisionDelta = archivedDelta > 0 ? 1 : 0;
               await client.query(
                 `UPDATE client_sessions
                    SET messages = $1, message_count = $2, last_at = $3,
                        updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-                       next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5
+                       next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5,
+                       history_revision = history_revision + $8
                  WHERE id = $6 AND user_id = $7`,
-                [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId],
+                [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, mapRow.session_id, userId, historyRevisionDelta],
               );
               return { applied: "patched" };
             }
@@ -4273,13 +4355,15 @@ export function createPgSessionsBackend(
         const nowMs = Date.now();
         const archivedDelta = await execPgSpillPlan(client, clientSessionId, userId, plan.chunksToInsert, plan.idsToInsert, nowMs);
         const newArchivedCount = bigIntNumOr(sess!.archived_count, 0) + archivedDelta;
+        const historyRevisionDelta = archivedDelta > 0 ? 1 : 0;
         await client.query(
           `UPDATE client_sessions
              SET messages = $1, message_count = $2, last_at = $3,
                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
-                 next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5
+                 next_seq = next_seq + 1, archived_through_seq = $4, archived_count = $5,
+                 history_revision = history_revision + $8
            WHERE id = $6 AND user_id = $7`,
-          [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId],
+          [plan.finalJson, plan.tail.length + newArchivedCount, nowMs, plan.archivedThroughSeq, newArchivedCount, clientSessionId, userId, historyRevisionDelta],
         );
 
         for (const p of pendings) {
@@ -4339,8 +4423,8 @@ export function createPgSessionsBackend(
       options: ClientSessionReadOptions = {},
     ): Promise<ClientSession | null> {
       const sql = userId
-        ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL"
-        : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL";
+        ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL"
+        : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL";
       const row = (
         await pool.query<{
           id: string;
@@ -4354,6 +4438,7 @@ export function createPgSessionsBackend(
           updated_at: string;
           archived_through_seq: number | null;
           archived_count: number | null;
+          history_revision: string;
           model_id: string | null;
         }>(sql, userId ? [id, userId] : [id])
       ).rows[0];
@@ -4377,6 +4462,7 @@ export function createPgSessionsBackend(
         lastAt: bigIntNum(row.last_at, "last_at"),
         messages,
         updatedAt: bigIntNum(row.updated_at, "updated_at"),
+        historyRevision: bigIntNum(row.history_revision, "history_revision"),
         ...(row.model_id ? { modelId: row.model_id } : {}),
         archivedCount: bigIntNumOr(row.archived_count, 0),
         archivedThroughSeq: archivedThroughOrderSeq,
@@ -4433,9 +4519,10 @@ export function createPgSessionsBackend(
           updated_at: string;
           archived_through_seq: number | null;
           archived_count: number | null;
+          history_revision: string;
           model_id: string | null;
         }>(
-          "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+          "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
           [id, userId],
         )
       ).rows[0];
@@ -4458,9 +4545,13 @@ export function createPgSessionsBackend(
         if (s > maxSeq) maxSeq = s;
       }
       const sinceIsValid = Number.isFinite(sinceSeq) && sinceSeq > 0;
+      const historyRevision = bigIntNum(row.history_revision, "history_revision");
+      const historyRevisionMatches =
+        Number.isSafeInteger(options.sinceHistoryRevision) &&
+        options.sinceHistoryRevision === historyRevision;
       let messages: MessageLike[];
       let isPartial: boolean;
-      if (!anyMissingSeq && sinceIsValid) {
+      if (!anyMissingSeq && sinceIsValid && historyRevisionMatches) {
         messages = allMsgs.filter((m) => typeof m?._seq === "number" && (m._seq as number) > sinceSeq);
         isPartial = true;
       } else {
@@ -4483,6 +4574,7 @@ export function createPgSessionsBackend(
         lastAt: bigIntNum(row.last_at, "last_at"),
         messages,
         updatedAt: bigIntNum(row.updated_at, "updated_at"),
+        historyRevision,
         ...(row.model_id ? { modelId: row.model_id } : {}),
         totalMessageCount: allMsgs.length + archivedCount,
         maxSeq,
@@ -4501,15 +4593,18 @@ export function createPgSessionsBackend(
     ): Promise<ReadArchivedMessagesResult> {
       const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) ? limit : 100)));
       const row = (
-        await pool.query<{ archived_through_seq: number | null }>(
-          "SELECT archived_through_seq FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        await pool.query<{ archived_through_seq: number | null; history_revision: string }>(
+          "SELECT archived_through_seq, history_revision FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
           [sessId, userId],
         )
       ).rows[0];
       if (!row) return { messages: [], hasMore: false, oldestSeq: null };
       const watermark = bigIntNumOr(row.archived_through_seq, 0);
+      const historyRevision = bigIntNum(row.history_revision, "history_revision");
       const effectiveBefore = Number.isFinite(beforeSeq) && beforeSeq > 0 ? beforeSeq : watermark + 1;
-      if (effectiveBefore <= 1) return { messages: [], hasMore: false, oldestSeq: null };
+      if (effectiveBefore <= 1) {
+        return { messages: [], hasMore: false, oldestSeq: null, historyRevision };
+      }
 
       const chunkRows = (
         await pool.query<{ messages: string }>(
@@ -4549,7 +4644,7 @@ export function createPgSessionsBackend(
           maxExclusive: effectiveBefore,
         });
       }
-      return { messages: hydrated, hasMore, oldestSeq };
+      return { messages: hydrated, hasMore, oldestSeq, historyRevision };
     },
 
     // ── 引擎上下文读(RFC §9)──────────────────────────────────────────────────

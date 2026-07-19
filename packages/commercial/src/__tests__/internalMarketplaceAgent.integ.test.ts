@@ -617,6 +617,23 @@ describe('internalMarketplaceAgent (integ)', () => {
       }
       let res = makeRes()
       await ownerHandler(
+        makeReq('POST', 'publish', {
+          token: tokenFor(201),
+          body: pluginDraft,
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error.code, 'CONFIRMATION_REQUIRED')
+      let untouched = await query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM marketplace_skill_listings WHERE slug=$1',
+        [slug],
+      )
+      assert.equal(untouched.rows[0]?.count, '0', 'legacy publish must remain side-effect-free')
+
+      res = makeRes()
+      await ownerHandler(
         makeReq('POST', 'validate-plugin', {
           token: tokenFor(201),
           body: pluginDraft,
@@ -634,7 +651,7 @@ describe('internalMarketplaceAgent (integ)', () => {
       assert.deepEqual(res.body.permissionSummary.actions, [
         { id: 'whoami', method: 'GET', effect: 'read' },
       ])
-      let untouched = await query<{ count: string }>(
+      untouched = await query<{ count: string }>(
         'SELECT count(*)::text AS count FROM marketplace_skill_listings WHERE slug=$1',
         [slug],
       )

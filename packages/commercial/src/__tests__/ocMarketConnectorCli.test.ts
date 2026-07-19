@@ -265,18 +265,12 @@ test('oc-market plugin publish 缺少确认 hash 时不接触 relay', async () =
   assert.match(r.stderr, /--confirm/)
 })
 
-test('oc-market publish-connector 只经 loopback relay 发送正确 payload', async () => {
-  let received: unknown = null
+test('oc-market publish-connector 真实发布被禁用且不接触 loopback relay', async () => {
   let receivedUrl = ''
   const server = createServer((req, res) => {
     receivedUrl = req.url ?? ''
-    const chunks: Buffer[] = []
-    req.on('data', (c) => chunks.push(c))
-    req.on('end', () => {
-      received = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-      res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ ok: true, versionId: 'v-test', status: 'pending' }))
-    })
+    res.statusCode = 500
+    res.end()
   })
   await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
   const address = server.address()
@@ -305,26 +299,16 @@ test('oc-market publish-connector 只经 loopback relay 发送正确 payload', a
       ],
       { OPENCLAUDE_HOME: f.home },
     )
-    assert.equal(r.code, 0, r.stderr)
-    assert.equal(receivedUrl, '/internal/v3/marketplace/agent-local/publish')
-    assert.deepEqual(received, {
-      kind: 'connector',
-      version: '1.2.3',
-      spec: { id: 'cli-connector', identity: {}, actions: [] },
-      securityDecision: { audience: {}, actions: {} },
-      category: 'daily-tools',
-      useCases: ['查询当前身份', '读取条目列表'],
-      outcomeExamples: ['给定账号→返回身份'],
-      tags: ['连接器', '测试'],
-      visibility: 'org',
-    })
-    assert.match(r.stdout, /"versionId": "v-test"/)
+    assert.equal(r.code, 1)
+    assert.match(r.stderr, /legacy publish-connector is disabled/)
+    assert.match(r.stderr, /plugin prepare/)
+    assert.equal(receivedUrl, '')
   } finally {
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
   }
 })
 
-test('oc-market publish-connector 对坏 JSON 与 relay 错误给结构化失败', async () => {
+test('oc-market publish-connector 在读取坏 JSON 前即 fail-closed', async () => {
   const f = await fixture(1)
   await writeFile(f.spec, '[]')
   const baseArgs = [
@@ -340,12 +324,8 @@ test('oc-market publish-connector 对坏 JSON 与 relay 错误给结构化失败
     '--use-cases',
     '查询当前身份',
   ]
-  let r = await run(baseArgs, { OPENCLAUDE_HOME: f.home })
+  const r = await run(baseArgs, { OPENCLAUDE_HOME: f.home })
   assert.equal(r.code, 1)
-  assert.match(r.stderr, /must contain a JSON object/)
-
-  await writeFile(f.spec, JSON.stringify({ id: 'cli-connector' }))
-  r = await run(baseArgs, { OPENCLAUDE_HOME: f.home })
-  assert.equal(r.code, 1)
-  assert.match(r.stderr, /publish relay failed/)
+  assert.match(r.stderr, /legacy publish-connector is disabled/)
+  assert.doesNotMatch(r.stderr, /must contain a JSON object/)
 })

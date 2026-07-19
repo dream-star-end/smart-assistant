@@ -301,6 +301,8 @@ export type ManagedBrowserSetupView = {
     | 'expired'
     | 'failed'
   qrReady: boolean
+  /** Monotonic server revision; each refreshed QR image increments it. */
+  qrRevision?: number
   agentReady?: boolean
   createdAt: string
   expiresAt: string

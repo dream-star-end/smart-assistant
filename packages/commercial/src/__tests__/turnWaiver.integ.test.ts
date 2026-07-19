@@ -241,13 +241,15 @@ describe('exact turn waiver + targeted inbox (integ)', () => {
     assert.equal(first.refundedCredits, 259n)
     assert.equal(first.recordCount, 1)
     assert.equal(first.totalAfter, 389n)
-    const firstVersion = BigInt((
-      await query<{ updated_at: string }>(
-        'SELECT updated_at::text AS updated_at FROM client_sessions WHERE id=$1',
+    const firstSessionVersion = (
+      await query<{ updated_at: string; history_revision: string }>(
+        'SELECT updated_at::text AS updated_at,history_revision::text AS history_revision FROM client_sessions WHERE id=$1',
         [sessionId],
       )
-    ).rows[0]!.updated_at)
+    ).rows[0]!
+    const firstVersion = BigInt(firstSessionVersion.updated_at)
     assert.ok(firstVersion > 100n)
+    assert.equal(firstSessionVersion.history_revision, '1')
 
     const balances = await query<{ wallet: string; period: string }>(
       `SELECT u.credits::text AS wallet,s.period_credits::text AS period
@@ -296,12 +298,21 @@ describe('exact turn waiver + targeted inbox (integ)', () => {
     assert.equal(replay.inboxMessageId, first.inboxMessageId)
     assert.equal(
       (
-        await query<{ updated_at: string }>(
-          'SELECT updated_at::text AS updated_at FROM client_sessions WHERE id=$1',
+        await query<{ updated_at: string; history_revision: string }>(
+          'SELECT updated_at::text AS updated_at,history_revision::text AS history_revision FROM client_sessions WHERE id=$1',
           [sessionId],
         )
       ).rows[0]!.updated_at,
       firstVersion.toString(),
+    )
+    assert.equal(
+      (
+        await query<{ history_revision: string }>(
+          'SELECT history_revision::text AS history_revision FROM client_sessions WHERE id=$1',
+          [sessionId],
+        )
+      ).rows[0]!.history_revision,
+      '1',
     )
     assert.equal(
       (

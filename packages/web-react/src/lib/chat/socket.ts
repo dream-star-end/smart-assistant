@@ -1840,6 +1840,7 @@ export class ChatSocket {
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
+      ...(typeof s._historyRevision === "number" ? { _historyRevision: s._historyRevision } : {}),
       ...(typeof s._archivedThroughSeq === "number" ? { _archivedThroughSeq: s._archivedThroughSeq } : {}),
       ...(typeof s._archivedCount === "number" ? { _archivedCount: s._archivedCount } : {}),
       _trackerResetAt: typeof s._trackerResetAt === "number" ? s._trackerResetAt : undefined,
@@ -1878,6 +1879,7 @@ export class ChatSocket {
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
     s._lastFrameSeq = stored._lastFrameSeq;
     s._maxSeq = stored._maxSeq;
+    s._historyRevision = stored._historyRevision;
     if (typeof stored._archivedThroughSeq === "number") s._archivedThroughSeq = stored._archivedThroughSeq;
     if (typeof stored._archivedCount === "number") s._archivedCount = stored._archivedCount;
     s._streamingAssistant = null;
@@ -1944,6 +1946,10 @@ export class ChatSocket {
       /** 载荷的 SessionDetail.modelId(会话级模型选择,server canonical):携带时 server-wins
        *  镜像进会话态(缺省=服务端无值,保留本地,与侧栏 listSessions 合并同语义)。 */
       modelId?: string;
+      /** Projection revision paired with maxSeq; set only after payload acceptance. */
+      historyRevision?: number;
+      /** Legacy backend fallback: invalidate hydrated projections on every full read. */
+      invalidateProjectionCache?: boolean;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -1967,6 +1973,15 @@ export class ChatSocket {
     // 持久化 error 卡、真 tape 生成行都在此被识别,合并后 convergeTerminalTurns 显式清发送态 +
     // 落 user 行终态,不再依赖「completion-evidence 恰好命中」的巧合路径。
     const terminalTurns = detectServerTerminalTurns(msgs);
+    const incomingHistoryRevision = archive?.historyRevision;
+    const hasHistoryRevision =
+      typeof incomingHistoryRevision === "number" &&
+      Number.isSafeInteger(incomingHistoryRevision) &&
+      incomingHistoryRevision >= 0;
+    const historyRevisionChanged =
+      hasHistoryRevision && incomingHistoryRevision !== s._historyRevision;
+    const invalidateProjectionCache =
+      historyRevisionChanged || (full && archive?.invalidateProjectionCache === true);
     // P1 缺席删除只在「载荷携带版本且 ≥ 水位」的 full 上授权;无版本信息的载荷照常合并但不授权
     // (缺席不可证)。活跃轮守卫:发送中的轮绝不被载荷自证清除 —— **但载荷携带该活跃轮的精确终态
     // 证据时给守卫开口**(server 权威胜),让合并按证据收敛本地乐观行,而非把已终态轮永久保护住。
@@ -1982,12 +1997,16 @@ export class ChatSocket {
           {
             deletionAuthority: hasVersion,
             activeClientMessageId,
+            invalidateProjectionCache,
           },
         )
       : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId, {
           activeClientMessageId,
         });
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
+    if (hasHistoryRevision) {
+      s._historyRevision = incomingHistoryRevision;
+    }
     if (archivedThroughSeq > 0) s._archivedThroughSeq = archivedThroughSeq;
     if (typeof archive?.archivedCount === "number" && Number.isFinite(archive.archivedCount)) {
       s._archivedCount = archive.archivedCount;
@@ -2062,6 +2081,13 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     this.scheduleNotify();
+  }
+
+  /** Archive-page revision mismatch recovery. Bypass the ordinary debounce:
+   * the page was captured from a different projection generation, so a full
+   * history reconciliation is required before retrying pagination. */
+  syncHistoryNow(sessId: string): void {
+    void this.deps.syncSession?.(sessId);
   }
 
   /**

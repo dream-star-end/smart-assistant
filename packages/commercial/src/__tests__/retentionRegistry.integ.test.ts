@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import {
   AUDIT_RETENTION_POLICIES,
   PERMANENT_AUDIT_TABLES,
@@ -41,13 +42,9 @@ const REQUIRE_TEST_DB =
 let pgAvailable = false;
 
 async function cleanCommercialSchema(): Promise<void> {
-  const rows = await query<{ table_name: string }>(
-    `SELECT table_name FROM information_schema.tables
-      WHERE table_schema='public' AND table_type='BASE TABLE'`,
-  );
-  if (rows.rows.length === 0) return;
-  const quoted = rows.rows.map((r) => `"${r.table_name.replaceAll('"', '""')}"`).join(", ");
-  await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
+  // 全量迁移不只创建表，也创建 function/type/trigger。仅 DROP TABLE 会让下一套从零
+  // 迁移在残留 function 上撞 already-exists；统一走带 `_test` 库名硬防护的 schema reset。
+  await resetTestSchemaForTest();
 }
 
 async function probe(): Promise<boolean> {

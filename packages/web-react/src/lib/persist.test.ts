@@ -106,6 +106,17 @@ describe("persist — 历史合并纯函数", () => {
     expect(out.map((row) => row.id)).toEqual(["u1", "a1", "u2"]);
   });
 
+  test("full merge 保留中段 user 的原始锚点，不把它漂到后一条 server 行之后", () => {
+    const a1 = { id: "a1", role: "assistant", text: "one", ts: 1, _source: "server", _orderSeq: 1 } as ChatMessage;
+    const user = { id: "local-user", role: "user", text: "问", ts: 999 } as ChatMessage;
+    const a2 = { id: "a2", role: "assistant", text: "two", ts: 2, _source: "server", _orderSeq: 2 } as ChatMessage;
+
+    const out = mergeFullServerWins([a1, a2], [a1, user, a2]);
+
+    expect(out.map((row) => row.id)).toEqual(["a1", "local-user", "a2"]);
+    expect(user._orderSeq).toBeUndefined(); // 临时锚只参与本次排序，不伪造持久顺序轴。
+  });
+
   test("exact terminal evidence replaces only that turn's m-* fallback, not a queued next turn", () => {
     const local: ChatMessage[] = [
       { id: "m-user-1", role: "user", text: "u1", ts: 1 },
@@ -883,14 +894,14 @@ describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
     const n = Math.floor(rnd() * 9); // 0..8 条(含空/单元素边界)
     const out: ChatMessage[] = [];
     for (let i = 0; i < n; i++) {
-      // ts 有意可缺(下方 ~15% 分支不赋值,测非有限/缺失 ts 的排序兜底):用 as 断言,不改运行时。
-      const m = { id: `m${i}`, role: "assistant", text: "" } as ChatMessage;
+      const m: ChatMessage = { id: `m${i}`, role: "assistant", text: "", ts: 0 };
       // ~65% 带 _orderSeq(小池子 → 制造碰撞/乱序/时钟偏移);其余为本地乐观行(无 _orderSeq)。
       if (rnd() < 0.65) m._orderSeq = 1 + Math.floor(rnd() * 6);
       if (rnd() < 0.5) m._seq = 1 + Math.floor(rnd() * 40); // 比较器应完全忽略 _seq
       const tsRoll = rnd();
       if (tsRoll < 0.15) {
-        /* 缺 ts */
+        // Fuzz the malformed legacy-wire case without weakening ChatMessage.ts.
+        delete (m as Partial<ChatMessage>).ts;
       } else if (tsRoll < 0.3) {
         m.ts = Number.NaN; // 非有限 ts → 实现按 0 兜底,不得整趟 bail-out
       } else {
@@ -952,6 +963,20 @@ describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
     expect(once.map((m) => m.id)).toEqual(["C", "A", "B"]);
     const twice = stableSortByTs(once.map((m) => ({ ...m })));
     expect(twice.map((m) => m.id)).toEqual(["C", "A", "B"]);
+  });
+
+  test("同一完整 tape 按 record ordinal 排序，时钟回拨不能把终答排到思考/工具前", () => {
+    const input: ChatMessage[] = [
+      { id: "thinking", role: "thinking", text: "想", ts: 300, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 0 },
+      { id: "tool", role: "tool", text: "查", ts: 200, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 1 },
+      { id: "answer", role: "assistant", text: "答", ts: 100, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 2 },
+      { id: "terminal-note", role: "assistant", text: "终态证据", ts: 0, _orderSeq: 5, _turnTapeId: "t-1" },
+      { id: "collapsed", role: "assistant", text: "本轮输出", ts: 400, _orderSeq: 5, _turnTapeId: "t-1", _tapeCollapsed: true },
+    ];
+
+    expect(stableSortByTs([...input]).map((m) => m.id)).toEqual([
+      "collapsed", "thinking", "tool", "answer", "terminal-note",
+    ]);
   });
 });
 

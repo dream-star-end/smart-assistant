@@ -10,6 +10,19 @@ import type { AuthSession } from "../lib/types";
 /** 流式期防 IDB 写抖：尾沿 debounce 后落盘一次（isFinal/resume_failed 走立即写，不等它）。*/
 const PERSIST_DEBOUNCE_MS = 900;
 
+export function isArchiveHistoryRevisionCompatible(
+  currentRevision: number | undefined,
+  pageRevision: number | undefined,
+): boolean {
+  const currentIsValid =
+    typeof currentRevision === "number" && Number.isSafeInteger(currentRevision) && currentRevision >= 0;
+  if (!currentIsValid) return true;
+  return typeof pageRevision === "number" &&
+    Number.isSafeInteger(pageRevision) &&
+    pageRevision >= 0 &&
+    pageRevision === currentRevision;
+}
+
 /**
  * 会话写盘签名（debounce 去重，避免无谓 IDB 写）：消息条数 + 末条多维度（文本/工具输出/
  * partialJson 长度、完成标记、状态）+ 游标 + 时间戳。覆盖流式期最常变的「末条」增长
@@ -107,9 +120,13 @@ export type UseChatSocket = {
     serverUpdatedAt?: number;
     /** SessionDetail.modelId(会话级模型选择):携带时 server-wins 镜像进会话态。*/
     modelId?: string;
+    historyRevision?: number;
+    invalidateProjectionCache?: boolean;
   }) => void;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
+  /** Projection revision paired with storedMaxSeq; absent forces a full fallback. */
+  storedHistoryRevision: (sessId: string | undefined) => number | undefined;
   /**
    * 归档滚动加载：从云端拉一页更早的归档历史(getSessionArchive)并前插进会话(只前插/按 id 去重,
    * 不覆盖本地富卡)。返回本页结果供 UI 驱动"加载更多"按钮三态(loading/更多/无更多/失败可重试)。
@@ -248,11 +265,19 @@ export function useChatSocket(opts: {
         if (!sess) return;
         try {
           const sinceSeq = typeof sess._maxSeq === "number" && sess._maxSeq > 0 ? sess._maxSeq : 0;
-          const detail = await api.getSession(a, sessId, sinceSeq);
+          const detail = await api.getSession(a, sessId, sinceSeq, sess._historyRevision);
           const serverMsgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : null;
+          const revisionRepair =
+            typeof detail.historyRevision === "number" &&
+            Number.isSafeInteger(detail.historyRevision) &&
+            detail.historyRevision >= 0 &&
+            detail.historyRevision !== sess._historyRevision;
+          const projectionRepair = revisionRepair || detail._projectionRevisionUnsupported === true;
           // 只在 server 返回非空 tape 时合并——绝不用空结果抹掉活转录。热尾巴:透传归档水位,
           // 本地 `_seq ≤ archivedThroughSeq`的旧行才不会被"server 不认识 = 丢弃"误杀。
-          if (serverMsgs && (serverMsgs.length > 0 || detail.isPartial)) {
+          // 唯一例外是 history revision 改变：即使 full 为空也必须应用，才能传播删除/清掉
+          // 过期归档水合缓存；活跃轮仍由 applyServerMessages 的 active-turn guard 保护。
+          if (serverMsgs && (serverMsgs.length > 0 || detail.isPartial || projectionRepair)) {
             socket?.applyServerMessages(
               sessId,
               detail.agentId || sess.agentId,
@@ -264,6 +289,8 @@ export function useChatSocket(opts: {
               archivedCount: detail.archivedCount,
               completedClientMessageId: context?.clientMessageId,
               serverUpdatedAt: detail.updatedAt,
+              historyRevision: detail.historyRevision,
+              invalidateProjectionCache: detail._projectionRevisionUnsupported === true,
               },
             );
           }
@@ -529,6 +556,8 @@ export function useChatSocket(opts: {
         archivedCount: p.archivedCount,
         serverUpdatedAt: p.serverUpdatedAt,
         modelId: p.modelId,
+        historyRevision: p.historyRevision,
+        invalidateProjectionCache: p.invalidateProjectionCache,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },
@@ -546,6 +575,13 @@ export function useChatSocket(opts: {
         const before = socket.archiveBeforeSeq(sessId);
         const page = await api.getSessionArchive(a, sessId, before);
         const msgs = Array.isArray(page.messages) ? (page.messages as ChatMessage[]) : [];
+        const currentHistoryRevision = socket.sessions.get(sessId)?._historyRevision;
+        if (!isArchiveHistoryRevisionCompatible(currentHistoryRevision, page.historyRevision)) {
+          // A session full-sync already advanced while this archive request
+          // was in flight. Never reintroduce stale hydrated archive rows.
+          socket.syncHistoryNow(sessId);
+          return { ok: false, loaded: 0, hasMore: true, error: true };
+        }
         if (msgs.length > 0) {
           socket.prependArchivedMessages(sessId, msgs);
           persistRef.current(sessId); // 前插后落地(下次 reload 直接展示已拉回的旧历史)
@@ -631,6 +667,14 @@ export function useChatSocket(opts: {
     },
     [snap],
   );
+  const storedHistoryRevision = useCallback(
+    (sessId: string | undefined) => {
+      void snap.version;
+      const value = sessId ? snap.sessions.get(sessId)?._historyRevision : undefined;
+      return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+    },
+    [snap],
+  );
   const removePersisted = useCallback((sessId: string) => {
     sigRef.current.delete(sessId);
     const st = storeRef.current;
@@ -674,6 +718,7 @@ export function useChatSocket(opts: {
       respondPermission,
       mergeServerHistory,
       storedMaxSeq,
+      storedHistoryRevision,
       loadOlderHistory,
       expandCollapsedTape,
       collapseTape,
@@ -704,6 +749,7 @@ export function useChatSocket(opts: {
       respondPermission,
       mergeServerHistory,
       storedMaxSeq,
+      storedHistoryRevision,
       loadOlderHistory,
       expandCollapsedTape,
       collapseTape,

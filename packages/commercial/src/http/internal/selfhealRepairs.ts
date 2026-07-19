@@ -59,6 +59,7 @@ const ROUTE_RE =
 
 const WEBHOOK_TS_WINDOW_MS = 120_000;
 const DETAIL_MAX_BYTES = 16 * 1024;
+const RELEASE_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** 活跃(非终态)状态:回调只在活跃态有效。 */
 const ACTIVE = ["dispatched", "acked", "running", "verifying"];
@@ -305,7 +306,8 @@ async function casRepairToVerifying(
  *     → append cancelReceiptRace 事件(receipt 胜,repair 转入探测验证);
  *   - 此前处于 running/acked/verifying → 正常 deployed 收口(不额外记 race);
  *   - 0 行(repair 已真终态 cancelled/failed/succeeded…)→ append 跳过警示(部署事实已落库,归因交人工)。
- * FOR UPDATE 锁定 repair 行:先读旧态再 CAS,同事务内一致(request 行已在上游 FOR UPDATE,锁序 request→repair)。
+ * FOR UPDATE 锁定 repair 行:先读旧态再 CAS,同事务内一致。调用链在进入
+ * request 行之前已先锁 repair，统一全局锁序 repair→request→fuse。
  */
 async function settleRepairOnDeployedReceipt(
   client: PoolClient,
@@ -429,6 +431,222 @@ const RELEASE_ACTIVE = ["queued", "accepted", "deploying"];
  */
 const TERMINAL_RECEIPT_PHASES = new Set(["deployed", "deploy_failed", "deploy_unknown"]);
 
+type FuseEngageOutcome = "engaged" | "same_epoch" | "other_epoch" | "cleared_epoch";
+
+interface FuseProjectionRow {
+  engaged: boolean;
+  reason: string | null;
+  release_request_id: string | null;
+  engaged_at: Date | null;
+  engaged_by: string | null;
+  cleared_at: Date | null;
+  cleared_by: string | null;
+  personal_ack_at: Date | null;
+}
+
+/**
+ * 0174 is backward-compatible with a briefly overlapping pre-0174 runtime.
+ * That runtime only writes the singleton, so every new writer first folds its
+ * projected epoch into the durable ledger while holding the singleton lock.
+ */
+async function materializeLegacyFuseProjection(
+  client: PoolClient,
+  cur: FuseProjectionRow,
+): Promise<void> {
+  if (!cur.release_request_id) return;
+  if (cur.engaged) {
+    await client.query(
+      `INSERT INTO selfheal_release_fuse_epochs
+         (release_request_id, reason, engaged_at, engaged_by)
+       VALUES ($1, $2, COALESCE($3, NOW()), COALESCE($4, 'legacy:pre-0174'))
+       ON CONFLICT (release_request_id) DO NOTHING`,
+      [cur.release_request_id, cur.reason, cur.engaged_at, cur.engaged_by],
+    );
+    return;
+  }
+  if (!cur.cleared_at) return;
+  await client.query(
+    `INSERT INTO selfheal_release_fuse_epochs
+       (release_request_id, reason, engaged_at, engaged_by,
+        cleared_at, cleared_by, clear_reason, personal_ack_at)
+     VALUES ($1, $2, COALESCE($3::timestamptz, $5::timestamptz),
+             COALESCE($4, 'legacy:pre-0174'),
+             $5::timestamptz, COALESCE($6, 'legacy:pre-0174'),
+             'materialized from pre-0174 release fuse', $7)
+     ON CONFLICT (release_request_id) DO UPDATE
+       SET cleared_at = COALESCE(selfheal_release_fuse_epochs.cleared_at, EXCLUDED.cleared_at),
+           cleared_by = COALESCE(selfheal_release_fuse_epochs.cleared_by, EXCLUDED.cleared_by),
+           clear_reason = COALESCE(
+             selfheal_release_fuse_epochs.clear_reason,
+             EXCLUDED.clear_reason
+           ),
+           personal_ack_at = COALESCE(
+             selfheal_release_fuse_epochs.personal_ack_at,
+             EXCLUDED.personal_ack_at
+           )`,
+    [
+      cur.release_request_id,
+      cur.reason,
+      cur.engaged_at,
+      cur.engaged_by,
+      cur.cleared_at,
+      cur.cleared_by,
+      cur.personal_ack_at,
+    ],
+  );
+}
+
+/** Persist every uncertainty epoch; the singleton is only the oldest pending
+ * epoch projected to admin UI/delivery gates. A concurrent B while A is active
+ * is therefore not forgotten when the operator later clears A. */
+async function engageReleaseFuseEpoch(
+  client: PoolClient,
+  rrid: string,
+  reason: string,
+  engagedBy: string,
+): Promise<FuseEngageOutcome> {
+  const curR = await client.query<FuseProjectionRow>(
+    `SELECT engaged, reason, release_request_id, engaged_at, engaged_by,
+            cleared_at, cleared_by, personal_ack_at
+       FROM selfheal_release_fuse WHERE id = 1 FOR UPDATE`,
+  );
+  const cur = curR.rows[0];
+  if (!cur) throw new Error("release fuse singleton missing");
+  await materializeLegacyFuseProjection(client, cur);
+  const prior = await client.query<{
+    reason: string | null;
+    engaged_at: Date;
+    engaged_by: string;
+    cleared_at: Date | null;
+    cleared_by: string | null;
+    personal_ack_at: Date | null;
+  }>(
+    `SELECT reason, engaged_at, engaged_by, cleared_at, cleared_by, personal_ack_at
+       FROM selfheal_release_fuse_epochs
+      WHERE release_request_id = $1
+      FOR UPDATE`,
+    [rrid],
+  );
+  let epoch = prior.rows[0];
+  let inserted = false;
+  if (!epoch) {
+    const created = await client.query<{
+      reason: string | null;
+      engaged_at: Date;
+      engaged_by: string;
+      cleared_at: Date | null;
+      cleared_by: string | null;
+      personal_ack_at: Date | null;
+    }>(
+      `INSERT INTO selfheal_release_fuse_epochs
+         (release_request_id, reason, engaged_at, engaged_by)
+       VALUES ($1, $2, NOW(), $3)
+       RETURNING reason, engaged_at, engaged_by, cleared_at, cleared_by, personal_ack_at`,
+      [rrid, reason, engagedBy],
+    );
+    epoch = created.rows[0];
+    inserted = true;
+  }
+  if (!epoch) throw new Error("release fuse epoch insert failed");
+  const pending = await client.query<{
+    release_request_id: string;
+    reason: string | null;
+    engaged_at: Date;
+    engaged_by: string;
+  }>(
+    `SELECT release_request_id, reason, engaged_at, engaged_by
+       FROM selfheal_release_fuse_epochs
+      WHERE cleared_at IS NULL
+      ORDER BY engaged_at ASC, release_request_id ASC
+      LIMIT 1
+      FOR UPDATE`,
+  );
+  const projected = pending.rows[0];
+  if (projected) {
+    await client.query(
+      `UPDATE selfheal_release_fuse
+          SET engaged=TRUE, reason=$2, release_request_id=$1, engaged_at=$3,
+              engaged_by=$4, cleared_at=NULL, cleared_by=NULL, personal_ack_at=NULL
+        WHERE id=1`,
+      [projected.release_request_id, projected.reason, projected.engaged_at, projected.engaged_by],
+    );
+  } else {
+    await client.query(
+      `UPDATE selfheal_release_fuse
+          SET engaged=FALSE, reason=$2, release_request_id=$1, engaged_at=$3,
+              engaged_by=$4, cleared_at=$5, cleared_by=$6, personal_ack_at=$7
+        WHERE id=1`,
+      [
+        rrid,
+        epoch.reason,
+        epoch.engaged_at,
+        epoch.engaged_by,
+        epoch.cleared_at,
+        epoch.cleared_by,
+        epoch.personal_ack_at,
+      ],
+    );
+  }
+  if (epoch.cleared_at) return "cleared_epoch";
+  if (projected?.release_request_id !== rrid) return "other_epoch";
+  return inserted ? "engaged" : "same_epoch";
+}
+
+const RELEASE_SURFACE_TO_FACE: Readonly<Record<string, string>> = {
+  master: "master",
+  web: "web",
+  egress: "egress",
+  "runtime-source": "runtime",
+  "platform-runtime": "platform",
+};
+const RELEASE_STAGING_SURFACES = new Set(["web", "runtime-source", "platform-runtime", "egress"]);
+
+function callbackProofsCoverPlan(proofs: unknown, planDetail: unknown): boolean {
+  if (!proofs || typeof proofs !== "object" || Array.isArray(proofs)) return false;
+  if (!planDetail || typeof planDetail !== "object" || Array.isArray(planDetail)) return false;
+  const classification = (planDetail as Record<string, unknown>).classification;
+  if (!classification || typeof classification !== "object" || Array.isArray(classification)) return false;
+  const rawSurfaces = (classification as Record<string, unknown>).surfaces;
+  if (!Array.isArray(rawSurfaces) || rawSurfaces.length === 0) return false;
+  const faces = new Set<string>();
+  let needsSlot = false;
+  for (const surface of rawSurfaces) {
+    if (typeof surface !== "string") return false;
+    const face = RELEASE_SURFACE_TO_FACE[surface];
+    if (!face) return false;
+    faces.add(face);
+    if (RELEASE_STAGING_SURFACES.has(surface)) needsSlot = true;
+  }
+  if (needsSlot) faces.add("slot");
+  const record = proofs as Record<string, unknown>;
+  const present = Object.keys(record);
+  if (![...faces].every((face) => present.includes(face))) return false;
+  return present.length > 0 && present.every((face) => {
+    const proof = record[face];
+    return !!proof && typeof proof === "object" && !Array.isArray(proof) &&
+      (proof as Record<string, unknown>).ok === true;
+  });
+}
+
+function deployedCallbackBindingError(
+  detail: Record<string, unknown>,
+  request: {
+    approved_sha: string;
+    deploy_plan_hash: string | null;
+    manifest_hash: string | null;
+    plan_detail: unknown;
+  },
+  repairId: string,
+): string | null {
+  if (detail.approvedSha !== request.approved_sha) return "approved_sha";
+  if (detail.planHash !== request.deploy_plan_hash) return "deploy_plan_hash";
+  if (detail.manifestHash !== request.manifest_hash) return "manifest_hash";
+  const expectedRef = `refs/heads/selfheal/candidates/${repairId}-${request.approved_sha.slice(0, 12)}`;
+  if (detail.candidateRef !== expectedRef) return "candidate_ref";
+  if (!callbackProofsCoverPlan(detail.proofs, request.plan_detail)) return "proofs";
+  return null;
+}
+
 /** deployed receipt:请求→deployed + 事件 + jti + repair(含 cancel 途中)→verifying 收口(R2-1②/F8③)。 */
 async function applyDeployedReceipt(
   client: PoolClient,
@@ -445,7 +663,35 @@ async function applyDeployedReceipt(
       WHERE release_request_id=$1`,
     [rrid],
   );
+  let canonicalPushFuse: FuseEngageOutcome | null = null;
+  if (eventDetail.canonicalPush === "pending") {
+    // The deployment effect is proven live, so the request remains deployed
+    // and the repair advances to verifying. Source and production are still
+    // divergent, though: mirror the personal-side fuse so this exact epoch can
+    // be adjudicated and converged through the normal audited clear protocol.
+    canonicalPushFuse = await engageReleaseFuseEpoch(
+      client,
+      rrid,
+      "canonical_push_pending",
+      "callback:canonical_push_pending",
+    );
+  }
   await appendEvent(client, repairId, action, message, eventDetail);
+  if (canonicalPushFuse) {
+    await appendEvent(
+      client,
+      repairId,
+      "note",
+      "CRITICAL deployed effect is live but canonical push is pending; Tier2 release fuse remains engaged until audited convergence.",
+      {
+        ...eventDetail,
+        critical: true,
+        fuseEngaged: canonicalPushFuse !== "cleared_epoch",
+        fuseOutcome: canonicalPushFuse,
+        reason: "canonical_push_pending",
+      },
+    );
+  }
   // 请求 CAS 已是 replay 守卫,jti 消费为 belt-and-suspenders(与正常 done 同纪律)。
   if (jti) await consumeJti(client, repairId, jti, "done");
   // §4/R2-1②:同一事务 repair running/cancel_requested/cancelling → verifying 收口(deployed receipt 胜过
@@ -469,14 +715,13 @@ async function applyDeployUnknownReceipt(
       WHERE release_request_id=$1`,
     [rrid, reason],
   );
-  // §4:同事务 engage 全局 Tier2 部署熔断(fuse 行 CAS,首次 engage first-write-wins;新 engage 复位)。
-  await client.query(
-    `UPDATE selfheal_release_fuse
-        SET engaged=TRUE, reason=$2, release_request_id=$1, engaged_at=NOW(),
-            engaged_by='callback:deploy_unknown',
-            cleared_at=NULL, cleared_by=NULL, personal_ack_at=NULL
-      WHERE id=1 AND engaged=FALSE`,
-    [rrid, reason ?? "deploy_unknown"],
+  // §4:同事务 engage; cleared epoch tombstones make a delayed old callback a
+  // permanent no-op instead of resurrecting a fuse the operator already cleared.
+  const fuseOutcome = await engageReleaseFuseEpoch(
+    client,
+    rrid,
+    reason ?? "deploy_unknown",
+    "callback:deploy_unknown",
   );
   await appendEvent(client, repairId, action, message, eventDetail);
   // F13①:同事务 append 一条 critical 告警事件(durable 记录);实际 outbox enqueue 由 sweeper
@@ -487,15 +732,14 @@ async function applyDeployUnknownReceipt(
     "note",
     `CRITICAL deploy_unknown:全局 Tier2 部署熔断已 engage(reason=${reason ?? "deploy_unknown"});` +
       "禁自动部署,待人工按 /version·deploy_state·远端 ref 裁决后走 fuse-clear 审计流。",
-    { ...eventDetail, critical: true, fuseEngaged: true },
+    { ...eventDetail, critical: true, fuseEngaged: fuseOutcome !== "cleared_epoch", fuseOutcome },
   );
 }
 
 /**
  * F9a:未知 rrid(break-glass 本地 rrid)终态回调也要收口(操作在 URL/capability 认证的 repair 上;
  * 无请求行可 CAS,故不动 selfheal_release_requests):
- *   - deployed → repair running→verifying 收口 + 事件(break-glass/auto 部署成功也要走探测归因);
- *   - deploy_unknown → 同事务 engage 全局熔断 + 事件 + F13① critical 告警事件;
+ *   - deployed/deploy_unknown → 无冻结请求行可核对,统一按 deploy_unknown 拉熔断等待人工裁决;
  *   - 其余 → 照旧仅记录事件。
  */
 async function handleUnknownRridReleaseCallback(
@@ -507,30 +751,31 @@ async function handleUnknownRridReleaseCallback(
   message: string,
   eventDetail: Record<string, unknown>,
   reason: string | null,
-  jti: string | undefined,
 ): Promise<ActionResult> {
   const body = { status: "release_event_recorded", releaseRequestId: rrid };
-  if (releasePhase === "deployed") {
-    await appendEvent(client, repairIdFromPath, action, message, eventDetail);
-    if (jti) await consumeJti(client, repairIdFromPath, jti, "done");
-    // R2-1②:break-glass deployed 同样按扩展 CAS 收口(cancel 途中的 repair 也不能永久卡 cancelling)。
-    await settleRepairOnDeployedReceipt(client, repairIdFromPath, message.slice(0, 1000), eventDetail);
-    return { code: "ok", body };
-  }
-  if (releasePhase === "deploy_unknown") {
-    await client.query(
-      `UPDATE selfheal_release_fuse
-          SET engaged=TRUE, reason=$1, release_request_id=$2, engaged_at=NOW(),
-              engaged_by='callback:deploy_unknown:unknown_rrid',
-              cleared_at=NULL, cleared_by=NULL, personal_ack_at=NULL
-        WHERE id=1 AND engaged=FALSE`,
-      [reason ?? "deploy_unknown", rrid],
+  if (releasePhase === "deployed" || releasePhase === "deploy_unknown") {
+    const unknownReason = releasePhase === "deployed"
+      ? "unknown_release_request_deployed_receipt"
+      : reason ?? "deploy_unknown";
+    const fuseOutcome = await engageReleaseFuseEpoch(
+      client,
+      rrid,
+      unknownReason,
+      "callback:unknown_rrid",
     );
-    await appendEvent(client, repairIdFromPath, action, message, eventDetail);
+    await appendEvent(client, repairIdFromPath, "failed",
+      "release receipt cannot be bound to a frozen request; manual adjudication required",
+      { ...eventDetail, releasePhase: "deploy_unknown", reason: unknownReason, fuseOutcome });
     await appendEvent(client, repairIdFromPath, "note",
-      `CRITICAL deploy_unknown(未知 rrid):全局 Tier2 部署熔断已 engage(reason=${reason ?? "deploy_unknown"});禁自动部署,待人工裁决。`,
-      { ...eventDetail, critical: true, fuseEngaged: true });
-    return { code: "ok", body };
+      `CRITICAL deploy_unknown(未知 rrid):无法核对冻结制品(reason=${unknownReason});禁自动部署,待人工裁决。`,
+      {
+        ...eventDetail,
+        releasePhase: "deploy_unknown",
+        critical: true,
+        fuseEngaged: fuseOutcome !== "cleared_epoch",
+        fuseOutcome,
+      });
+    return { code: "ok", body: { ...body, status: "deploy_unknown" } };
   }
   // deploying / deploy_failed / manual_required / 非法:照旧仅记录事件(容忍 break-glass)。
   await appendEvent(client, repairIdFromPath, action, message, eventDetail);
@@ -564,15 +809,32 @@ async function handleReleaseCallback(
   const eventDetail: Record<string, unknown> = { ...detail, releaseRequestId: rrid, releasePhase };
   const reason = typeof detail.reason === "string" ? detail.reason.slice(0, 2000) : null;
   return tx(async (client) => {
-    const rq = await client.query<{ repair_id: string; status: string }>(
-      `SELECT repair_id::text AS repair_id, status
+    // Keep the same lock order as admin approval (repair → request → fuse).
+    // The URL/capability already names the authoritative repair, so locking it
+    // first avoids the inverse request→repair order that can deadlock an exact
+    // approval retry racing a terminal receipt.
+    const repairLock = await client.query(
+      `SELECT 1 FROM codex_repairs WHERE id = $1::bigint FOR UPDATE`,
+      [repairIdFromPath],
+    );
+    if ((repairLock.rowCount ?? 0) === 0) return { code: "not_found" as const };
+    const rq = await client.query<{
+      repair_id: string;
+      status: string;
+      approved_sha: string;
+      deploy_plan_hash: string | null;
+      manifest_hash: string | null;
+      plan_detail: unknown;
+    }>(
+      `SELECT repair_id::text AS repair_id, status, approved_sha,
+              deploy_plan_hash, manifest_hash, plan_detail
          FROM selfheal_release_requests WHERE release_request_id = $1 FOR UPDATE`,
       [rrid],
     );
     if (rq.rows.length === 0) {
       // F9a:未知 rrid(break-glass 本地 rrid 等)终态回调也要收口。
       return handleUnknownRridReleaseCallback(
-        client, repairIdFromPath, rrid, releasePhase, action, message, eventDetail, reason, jti,
+        client, repairIdFromPath, rrid, releasePhase, action, message, eventDetail, reason,
       );
     }
     // capability 逐 repair 最小权限强绑定:rrid 必须属于 URL/capability 认证的同一 repair。
@@ -583,6 +845,27 @@ async function handleReleaseCallback(
     }
     const repairId = rq.rows[0].repair_id;
     const curStatus = rq.rows[0].status;
+
+    // Validate a success receipt before any terminal idempotency shortcut. A
+    // malformed replay against an already-terminal request remains a protocol
+    // breach and must not be silently acknowledged as a valid deployment.
+    if (releasePhase === "deployed") {
+      const bindingError = deployedCallbackBindingError(detail, rq.rows[0], repairId);
+      if (bindingError) {
+        const mismatchReason = `deployed_receipt_binding_mismatch:${bindingError}`;
+        await applyDeployUnknownReceipt(
+          client,
+          rrid,
+          repairId,
+          "failed",
+          "deployed receipt failed frozen tuple/proof validation",
+          { ...eventDetail, releasePhase: "deploy_unknown", receiptBindingError: bindingError },
+          mismatchReason,
+        );
+        if (jti) await consumeJti(client, repairId, jti, "done");
+        return { code: "ok", body: { status: "deploy_unknown", releaseRequestId: rrid } };
+      }
+    }
 
     // F2③:请求已被乐观置 cancelled,但收到终态 receipt → receipt 胜(照常应用终态转移)。
     const cancelReceiptRace = curStatus === "cancelled" && TERMINAL_RECEIPT_PHASES.has(releasePhase);
@@ -768,21 +1051,24 @@ export async function dispatchSelfhealRepairsRoute(
     throw err;
   }
 
-  const detail = safeDetail(parsed.detail);
-  // M4:message 是 codex 自由文本,同样过值级凭据清洗(key 级对纯字符串是 no-op)。
-  const message = scrubSecretsInString(parsed.message);
-
   // 批1b:release 回调分流(§4)。detail.releaseRequestId 存在 = release 语义(progress/done/
   // failed 传输仍不变,语义在 detail.releasePhase);无 rrid = 原 repair 语义完全不变。
   // rrid/phase 取**未脱敏**的 parsed.detail(路由字段,非凭据)。
   const rawDetail = parsed.detail;
-  const rrid =
-    rawDetail && typeof rawDetail.releaseRequestId === "string" && rawDetail.releaseRequestId.length > 0
-      ? rawDetail.releaseRequestId
-      : null;
+  const rawRrid = rawDetail?.releaseRequestId;
+  if (rawRrid !== undefined &&
+      (typeof rawRrid !== "string" || !RELEASE_REQUEST_ID_RE.test(rawRrid))) {
+    sendError(res, 400, "INVALID_BODY", "invalid releaseRequestId", requestId);
+    return;
+  }
+  const rrid = typeof rawRrid === "string" ? rawRrid : null;
   const releasePhase =
     rawDetail && typeof rawDetail.releasePhase === "string" ? rawDetail.releasePhase : "";
   const isReleaseAction = action === "progress" || action === "done" || action === "failed";
+
+  const detail = safeDetail(parsed.detail);
+  // M4:message 是 codex 自由文本,同样过值级凭据清洗(key 级对纯字符串是 no-op)。
+  const message = scrubSecretsInString(parsed.message);
 
   try {
     let result: ActionResult;

@@ -22,6 +22,7 @@ import {
   type IncidentListResp,
   type IncidentRow,
   type IncidentStatus,
+  type ReleaseFuseClearResp,
   type ReleaseFuseResp,
   type ReleaseRequestAck,
   type ReleaseRequestRow,
@@ -40,6 +41,12 @@ type BadgeTone = "neutral" | "accent" | "success" | "warning" | "danger" | "info
 const POLL_MS = 15_000;
 const PAGE = 50;
 const MAX_LIMIT = 300;
+
+function compareDecimalIds(a: string, b: string): number {
+  const left = BigInt(a);
+  const right = BigInt(b);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
 /** incident status → 徽标（open=未恢复 / repairing=修复中 / resolved=已恢复）。 */
 const INCIDENT_STATUS_META: Record<IncidentStatus, { label: string; tone: BadgeTone }> = {
@@ -94,7 +101,13 @@ function latestEventFor(repairId: string, events: RepairEventRow[]): RepairEvent
   let latest: RepairEventRow | null = null;
   for (const e of events) {
     if (e.repair_id !== repairId) continue;
-    if (!latest || e.created_at > latest.created_at) latest = e;
+    if (
+      !latest ||
+      e.created_at > latest.created_at ||
+      (e.created_at === latest.created_at && compareDecimalIds(e.id, latest.id) > 0)
+    ) {
+      latest = e;
+    }
   }
   return latest;
 }
@@ -124,9 +137,6 @@ const RELEASE_STATUS_META: Record<string, { label: string; tone: BadgeTone; spin
 };
 /** 部署进行中（占用唯一活跃请求，不可再次放行）。 */
 const RELEASE_INFLIGHT = new Set(["queued", "accepted", "deploying"]);
-/** 可重新放行的终态（上次放行未成功，回到待放行姿态 → 新 rrid）。 */
-const RELEASE_RETRIABLE = new Set(["deploy_failed", "manual_required", "cancelled"]);
-
 function releaseStatusMeta(status: string): { label: string; tone: BadgeTone; spin?: boolean } {
   return RELEASE_STATUS_META[status] ?? { label: status, tone: "neutral" };
 }
@@ -238,31 +248,37 @@ const CHANGED_FILES_SHOWN = 12;
  */
 function PendingReleaseCard({
   repair,
+  sourceEventId,
   planDetail,
   fuse,
   releasing,
   onRelease,
 }: {
   repair: RepairRow;
+  sourceEventId: string;
   planDetail: Record<string, unknown> | null | undefined;
   fuse: ReleaseFuseResp | null;
   releasing: boolean;
-  onRelease: (repairId: string, manualCount: number) => void;
+  onRelease: (repairId: string, manualCount: number, sourceEventId: string) => void;
 }) {
   const plan = normalizePlan(planDetail);
-  const rr = latestReleaseRequest(repair.releaseRequests);
+  const rr = latestReleaseRequest(
+    repair.releaseRequests?.filter((request) => request.sourceEventId === sourceEventId),
+  );
   const fuseEngaged = !!fuse?.engaged;
   const inflight = rr ? RELEASE_INFLIGHT.has(rr.status) : false;
-  const terminalNoRetry = rr?.status === "deployed" || rr?.status === "deploy_unknown";
-  const isRetry = !!rr && RELEASE_RETRIABLE.has(rr.status);
-  const buttonDisabled = releasing || fuseEngaged || inflight || terminalNoRetry;
-  const buttonLabel = releasing ? "放行中…" : isRetry ? "重新放行" : "一键放行";
+  // One immutable pending_release event is one logical approval. Any terminal
+  // result requires a new reviewed event; the UI must not offer a second deploy
+  // for the same event.
+  const terminal = !!rr && !inflight;
+  const buttonDisabled = releasing || fuseEngaged || inflight || terminal;
+  const buttonLabel = releasing ? "放行中…" : "一键放行";
 
   let header: string;
   if (inflight) header = "部署放行进行中";
   else if (rr?.status === "deployed") header = "代码已部署，等待探测确认恢复";
   else if (rr?.status === "deploy_unknown") header = "部署结果未知，等待人工裁决";
-  else if (isRetry) header = "上次放行未成功，可重新放行";
+  else if (terminal) header = "本候选已完成一次放行，等待新的修复候选";
   else header = "修复已就绪，待放行部署";
 
   return (
@@ -281,7 +297,7 @@ function PendingReleaseCard({
           <Button
             variant="primary"
             size="sm"
-            onClick={() => onRelease(repair.id, plan.manual.length)}
+            onClick={() => onRelease(repair.id, plan.manual.length, sourceEventId)}
             disabled={buttonDisabled}
           >
             {buttonLabel}
@@ -320,7 +336,7 @@ function PendingReleaseCard({
             <span className="font-mono">{short(rr.releaseRequestId, 8)}…</span>
             <TimeAgo value={rr.updatedAt} />
           </div>
-          {rr.failureReason && (RELEASE_RETRIABLE.has(rr.status) || rr.status === "deploy_unknown") && (
+          {rr.failureReason && terminal && rr.status !== "deployed" && (
             <div className="mt-1.5 rounded border border-danger/30 bg-danger-soft px-2 py-1 text-danger">
               上次失败原因：{rr.failureReason}
             </div>
@@ -467,7 +483,10 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
   );
 
   const sortedEvents = useMemo(
-    () => [...(data?.events ?? [])].sort((a, b) => a.created_at.localeCompare(b.created_at)),
+    () =>
+      [...(data?.events ?? [])].sort(
+        (a, b) => a.created_at.localeCompare(b.created_at) || compareDecimalIds(a.id, b.id),
+      ),
     [data],
   );
   const activeRepair = useMemo(
@@ -489,18 +508,18 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
     [data, sortedEvents],
   );
   // 该 repair 最新 pending_release 事件的 detail —— 待放行卡富化的唯一数据源(契约 §11)。
-  const pendingReleaseDetail = useMemo(() => {
+  const pendingReleaseEvent = useMemo(() => {
     if (!pendingReleaseRepair) return undefined;
     let latest: RepairEventRow | null = null;
     for (const e of sortedEvents) {
       if (e.repair_id !== pendingReleaseRepair.id) continue;
       if (e.detail?.phase !== PENDING_RELEASE_PHASE) continue;
-      if (!latest || e.created_at > latest.created_at) latest = e;
+      if (!latest || compareDecimalIds(e.id, latest.id) > 0) latest = e;
     }
-    return latest?.detail ?? undefined;
+    return latest ?? undefined;
   }, [pendingReleaseRepair, sortedEvents]);
 
-  const onRelease = async (repairId: string, manualCount: number) => {
+  const onRelease = async (repairId: string, manualCount: number, sourceEventId: string) => {
     const ok = await confirm({
       title: "放行部署？",
       body: (
@@ -525,6 +544,7 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
       const ack = await adminSend<ReleaseRequestAck | undefined>(
         "POST",
         `/selfheal/repairs/${encodeURIComponent(repairId)}/release`,
+        { expectedPendingReleaseEventId: sourceEventId },
       );
       toast(
         ack?.releaseRequestId
@@ -559,13 +579,16 @@ function IncidentDetailBody({ id, fuse }: { id: string; fuse: ReleaseFuseResp | 
     <div className="flex flex-col gap-4">
       {/* 待放行卡（RFC §6 human gate：base→sha / 改动文件 / 分类 / 验证层 / manual 警示，
           放行 202 异步 + 状态流；全局熔断禁用放行）。 */}
-      {pendingReleaseRepair && (
+      {pendingReleaseRepair && pendingReleaseEvent && (
         <PendingReleaseCard
           repair={pendingReleaseRepair}
-          planDetail={pendingReleaseDetail}
+          sourceEventId={pendingReleaseEvent.id}
+          planDetail={pendingReleaseEvent.detail}
           fuse={fuse}
           releasing={releasing}
-          onRelease={(repairId, manualCount) => void onRelease(repairId, manualCount)}
+          onRelease={(repairId, manualCount, sourceEventId) =>
+            void onRelease(repairId, manualCount, sourceEventId)
+          }
         />
       )}
 
@@ -826,6 +849,11 @@ export default function SelfhealPage() {
   // 清除全局部署熔断（RFC §6 双侧收敛）：二次确认 + 必填 reason（写审计），
   // 清除后 v5 恢复接受放行、个人版本地阻断解除。usePrompt 强制非空 reason。
   const onClearFuse = async () => {
+    const expectedReleaseRequestId = fuseData?.releaseRequestId;
+    if (!expectedReleaseRequestId) {
+      toast("熔断缺少代际标识，已拒绝通配清除；请刷新后人工核查", "error");
+      return;
+    }
     const reason = await promptReason({
       title: "清除 Tier2 部署熔断？",
       body: (
@@ -841,8 +869,18 @@ export default function SelfhealPage() {
     if (!reason) return;
     setClearingFuse(true);
     try {
-      await adminSend("POST", "/selfheal/release-fuse/clear", { reason });
-      toast("已清除部署熔断，Tier2 放行恢复可用", "success");
+      const result = await adminSend<ReleaseFuseClearResp>("POST", "/selfheal/release-fuse/clear", {
+        reason,
+        expectedReleaseRequestId,
+      });
+      if (result.remainingReleaseRequestId) {
+        toast(
+          `已裁决 ${expectedReleaseRequestId}；仍有 ${result.remainingReleaseRequestId} 待裁决，Tier2 熔断保持`,
+          "success",
+        );
+      } else {
+        toast("已清除部署熔断，Tier2 放行恢复可用", "success");
+      }
       refreshFuse();
     } catch (e) {
       toast(apiErrorMessage(e, "清除熔断失败"), "error");

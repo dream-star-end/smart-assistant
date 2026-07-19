@@ -219,6 +219,9 @@ export type ChatMessage = {
   _turnTapeId?: string;
   /** hydration 的 complete-anchor 分支盖章：该 tape 已完整原子落库（同步权威传播的作证前提）。 */
   _turnTapeComplete?: boolean;
+  /** 该行在同一 lossless turn tape 内的持久 record ordinal。多个展开行共享 `_orderSeq`，
+   *  其内部顺序必须以本字段为准，不能依赖会回拨/碰撞的 wall-clock `ts`。 */
+  _turnTapeOrdinal?: number;
   /** tape 内容 sha256。§9 折叠行展开的三元组定位键之一（(_turnTapeId, _turnTapeSha256, anchor id)）。 */
   _turnTapeSha256?: string;
 
@@ -380,6 +383,8 @@ export type ChatSession = {
   _lastFrameSeq?: number;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
+  /** Server projection revision paired with `_maxSeq`; persisted across reload. */
+  _historyRevision?: number;
   /** 已应用 full 载荷的 SessionDetail.updatedAt 水位:同步权威传播(P1 缺席删除)的版本护栏,
    *  只允许 updatedAt ≥ 此值的 full 执行缺席删除。仅进程内存,不随 StoredSession 落地
    *  (重开会话从 0 起,首个 full 天然可授权;护栏防的是同进程内两条 REST 的乱序竞态)。*/

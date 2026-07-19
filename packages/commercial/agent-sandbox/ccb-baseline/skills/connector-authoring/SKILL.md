@@ -56,7 +56,7 @@ oc-market plugin prepare --file /tmp/openclaude-plugin.json
 - 写操作必须准确呈现在校验摘要中；不得把写入/发送伪装成读取。运行时仍保留
   propose → 用户确认 → execute 门。
 - 不得自己拼 `curl`/`wget` 或调用内部 HTTP 端点；只用 `oc-market plugin`。失败时如实报告
-  CLI 错误，绝不改用直连兜底。旧 `publish-connector` 仅供历史兼容，新建流程不得使用。
+  CLI 错误，绝不改用直连兜底。旧 `publish-connector` 已禁用真实发布，仅保留帮助与示例。
 
 ## 与运行 Plugin 的边界
 

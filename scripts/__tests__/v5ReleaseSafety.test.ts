@@ -81,6 +81,7 @@ async function manualLeaseFixture() {
   const blockerRelease = path.join(dir, 'blocker-release')
   const sshPids = path.join(dir, 'ssh-pids')
   const remotePids = path.join(dir, 'remote-pids')
+  const commandPids = path.join(dir, 'command-pids')
   const wrapper = path.join(dir, 'with-production-mutation-lease.sh')
   const command = path.join(dir, 'wrapped-command.sh')
   const source = await readFile(manualMutationLease, 'utf8')
@@ -94,12 +95,28 @@ async function manualLeaseFixture() {
     [
       '#!/bin/bash',
       'printf "%s\\n" "$$" >>"$FAKE_SSH_PIDS"',
+      'while [[ "${1:-}" == "-o" ]]; do',
+      '  [[ $# -ge 2 ]] || exit 2',
+      '  shift 2',
+      'done',
+      '[[ $# -ge 2 ]] || exit 2',
       'shift',
-      'bash -c "$1" &',
+      'remote_out=""',
+      'if [[ "${FAKE_SSH_BUFFER_OUTPUT_UNTIL_REMOTE_EXIT:-0}" == 1 ]]; then',
+      '  remote_out="$(mktemp)"',
+      '  bash -c "$1" >"$remote_out" &',
+      'else',
+      '  bash -c "$1" &',
+      'fi',
       'remote_pid=$!',
       'printf "%s\\n" "$remote_pid" >>"$FAKE_REMOTE_PIDS"',
       "trap 'exit 0' HUP INT TERM",
       'wait "$remote_pid"',
+      'rc=$?',
+      'if [[ -n "$remote_out" ]]; then cat "$remote_out"; rm -f -- "$remote_out"; fi',
+      'delay="${FAKE_SSH_EXIT_DELAY_SECONDS:-0}"',
+      '[[ "$delay" == 0 ]] || sleep "$delay"',
+      'exit "$rc"',
     ].join('\n') + '\n',
   )
   await chmod(path.join(bin, 'ssh'), 0o755)
@@ -122,6 +139,7 @@ async function manualLeaseFixture() {
     blockerRelease,
     sshPids,
     remotePids,
+    commandPids,
     wrapper,
     command,
     env: {
@@ -130,6 +148,7 @@ async function manualLeaseFixture() {
       KL_HOST: 'fake-manual-lease',
       FAKE_SSH_PIDS: sshPids,
       FAKE_REMOTE_PIDS: remotePids,
+      COMMAND_PIDS: commandPids,
       COMMAND_STARTED: commandStarted,
       COMMAND_RELEASE: commandRelease,
       BLOCKER_STARTED: blockerStarted,
@@ -147,6 +166,43 @@ async function killManualLeaseFixtureProcesses(...pidFiles: string[]): Promise<v
       try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
     }
   }
+}
+
+async function allRecordedProcessesExited(pidFile: string): Promise<boolean> {
+  const raw = await readFile(pidFile, 'utf8').catch(() => '')
+  const pids = raw.split(/\s+/).map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 1)
+  if (pids.length === 0) return false
+  return pids.every((pid) => {
+    try { process.kill(pid, 0); return false } catch { return true }
+  })
+}
+
+function childProcessGroupLeader(parentPid: number): number | undefined {
+  const out = spawnSync('ps', ['-eo', 'pid=,ppid=,pgid='], { encoding: 'utf8' }).stdout
+  for (const line of out.split('\n')) {
+    const [pidRaw, ppidRaw, pgidRaw] = line.trim().split(/\s+/)
+    const pid = Number(pidRaw)
+    if (Number(ppidRaw) === parentPid && Number(pgidRaw) === pid && pid > 1) return pid
+  }
+  return undefined
+}
+
+async function writeStubbornManualCommand(fx: Awaited<ReturnType<typeof manualLeaseFixture>>): Promise<string> {
+  const command = path.join(fx.dir, 'stubborn-command.sh')
+  await writeFile(command, [
+    '#!/bin/bash',
+    "trap '' TERM",
+    'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+    '(',
+    "  trap '' TERM",
+    '  printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+    '  while :; do sleep 0.1; done',
+    ') &',
+    ': >"$COMMAND_STARTED"',
+    'while :; do sleep 0.1; done',
+  ].join('\n') + '\n')
+  await chmod(command, 0o755)
+  return command
 }
 
 async function caddyRemoteFixture() {
@@ -392,6 +448,7 @@ describe('v5 release safety lanes', () => {
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'calls=()',
       'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
       'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
@@ -430,6 +487,7 @@ describe('v5 release safety lanes', () => {
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'calls=()',
       'knowledge_planet_plugin_close_gate() { calls+=("close:$1"); }',
       'knowledge_planet_plugin_transition_to_release() { calls+=("UNEXPECTED-transition:$*"); return 91; }',
@@ -621,7 +679,7 @@ describe('v5 release safety lanes', () => {
     assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('rsync -az --delete'))
     const migrate = source.match(/migrate_to_bluegreen\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf('harden_release_baseline "$REMOTE_SRC"'))
-    assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf("systemctl stop '$V5_UNIT'"))
+    assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf('systemctl stop "$unit"'))
     const unitInstall = source.match(/install_v5_slot_units\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(unitInstall, /if ! systemctl is-active --quiet '\$V5_BASELINE_PORT_GUARD_SOCKET'; then[\s\S]*systemctl start '\$V5_BASELINE_PORT_GUARD_SOCKET'/)
     assert.doesNotMatch(unitInstall, /systemctl restart[^\n]*V5_BASELINE_PORT_GUARD_SOCKET/)
@@ -631,8 +689,11 @@ describe('v5 release safety lanes', () => {
     assert.match(source, /gc_rc" in[\s\S]*75\)[\s\S]*首个 rm 前安全跳过整轮删除/)
 
     const build = source.match(/build_release\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    assert.ok(build.indexOf('harden_release_baseline "$staging"') > build.indexOf('vite build'))
-    assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf("'$staging/.complete'"))
+    assert.ok(
+      build.indexOf('harden_release_baseline "$staging"') >
+        build.indexOf('npm run build --workspace packages/web-react'),
+    )
+    assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
     assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
     assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$master"/)
@@ -910,11 +971,19 @@ describe('v5 release safety lanes', () => {
 
   test('requiredMigrations gate includes deploy_state and precedes every write dispatch', async () => {
     const metadata = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8')) as {
+      minimumRequiredMigration: string
       requiredMigrations: string[]
     }
     assert.ok(metadata.requiredMigrations.includes('0135_deploy_state'))
     assert.ok(metadata.requiredMigrations.includes('0153_marketplace_plugin_kernel'))
     assert.ok(metadata.requiredMigrations.includes('0168_knowledge_planet_automation'))
+    const migrationDir = path.join(root, 'packages/commercial/src/db/migrations')
+    const expected = (await readdir(migrationDir))
+      .filter((name) => name.endsWith('.sql'))
+      .map((name) => name.slice(0, -4))
+      .filter((version) => version >= metadata.minimumRequiredMigration)
+      .sort()
+    assert.deepEqual(metadata.requiredMigrations, expected)
     const source = await readFile(deploy, 'utf8')
     const gateAt = source.indexOf('assert_repo_required_migrations || exit 1')
     const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
@@ -926,6 +995,339 @@ describe('v5 release safety lanes', () => {
     assert.equal(dry.status, 0, dry.stderr || dry.stdout)
     const combined = dry.stdout + dry.stderr
     assert.ok(combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'))
+  })
+
+  test('requiredMigrations manifest is exact for the target release archive, including rollback fixtures', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-migration-manifest-')); dirs.push(dir)
+    const release = path.join(dir, 'old-release')
+    const migrations = path.join(release, 'packages/commercial/src/db/migrations')
+    const metadataDir = path.join(release, 'deploy/v5')
+    await mkdir(migrations, { recursive: true })
+    await mkdir(metadataDir, { recursive: true })
+    await writeFile(path.join(migrations, '0123_first.sql'), '-- old release\n')
+    await writeFile(path.join(migrations, '0124_second.sql'), '-- old release\n')
+    const metadata = path.join(metadataDir, 'release-metadata.json')
+    await writeFile(metadata, JSON.stringify({
+      minimumRequiredMigration: '0123_first',
+      requiredMigrations: ['0123_first', '0124_second'],
+    }))
+    const invoke = (file: string) => spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `required_migrations_csv '${file}' local`,
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    const valid = invoke(metadata)
+    assert.equal(valid.status, 0, valid.stderr)
+    assert.equal(valid.stdout, '0123_first,0124_second')
+    // A migration introduced only in today's checkout is correctly irrelevant
+    // to this old immutable archive; omitting a file that IS in the archive is not.
+    await writeFile(metadata, JSON.stringify({
+      minimumRequiredMigration: '0123_first', requiredMigrations: ['0123_first'],
+    }))
+    const omitted = invoke(metadata)
+    assert.notEqual(omitted.status, 0)
+    assert.match(omitted.stderr, /requiredMigrations mismatch/)
+  })
+
+  test('remote legacy migration manifests are scoped to the exact captured predecessor', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-legacy-migration-manifest-')); dirs.push(dir)
+    const releasesRoot = path.join(dir, 'releases')
+    const release = path.join(releasesRoot, 'rel-ccd3e7e0-legacy')
+    const migrations = path.join(release, 'packages/commercial/src/db/migrations')
+    const metadataDir = path.join(release, 'deploy/v5')
+    await mkdir(migrations, { recursive: true })
+    await mkdir(metadataDir, { recursive: true })
+    await writeFile(path.join(release, '.complete'), '{"sha":"ccd3e7e0"}\n')
+
+    // Exact release-metadata.json shape shipped by ccd3e7e0: it predates
+    // minimumRequiredMigration and its curated list is intentionally not sorted.
+    const legacyMetadata = {
+      databaseCompatibility: 'backward-compatible',
+      requiredMigrations: [
+        '0123_gpt56_models',
+        '0124_gpt56_xhigh_defaults',
+        '0134_sessions_master_pg',
+        '0133_selfheal_incidents',
+        '0134_selfheal_condition_concurrency',
+        '0135_selfheal_hardening',
+        '0135_deploy_state',
+        '0137_selfheal_user_notice_approval',
+        '0143_model_catalog',
+        '0144_model_authority_guards',
+        '0145_retire_legacy_incident_notices',
+        '0146_connector_ai_declarative_verification',
+        '0147_lossless_turn_tapes',
+        '0148_inbox_rich_assets',
+        '0149_audit_hardening',
+        '0150_agent_tool_rollups',
+        '0151_product_friction_events',
+        '0152_marketplace_capability_bindings',
+        '0153_marketplace_plugin_kernel',
+        '0154_model_admin_audit_returning_grant',
+        '0155_selfheal_drill_policy',
+        '0156_selfheal_execution_routing',
+        '0157_lossless_runtime_batches',
+        '0158_skill_retrieval_shadow',
+        '0159_goal_state',
+        '0163_plugin_write_control',
+        '0164_admin_audit_model_admin_grant',
+        '0166_prompt_queue',
+        '0167_turn_waiver_receipts',
+        '0168_knowledge_planet_automation',
+        '0169_plugin_write_preapproval',
+        '0170_durable_turn_dispatch',
+      ],
+      capabilities: [
+        'sessions-store-pg-v1',
+        'dual-master-v1',
+        'model_authority_v1',
+        'model_authority_v1-egress',
+        'lossless-turn-tape-v2',
+        'lossless-turn-runtime-batch-v1',
+        'durable-turn-dispatch-v1',
+      ],
+      runtimeCapabilities: [
+        'model_authority_v1',
+        'lossless-turn-tape-v2',
+        'durable-turn-dispatch-v1',
+      ],
+      bridgeFrameSchema: '1',
+      runtimeApi: '1',
+    }
+    for (const migration of legacyMetadata.requiredMigrations) {
+      await writeFile(path.join(migrations, `${migration}.sql`), '-- legacy release\n')
+    }
+    const metadata = path.join(metadataDir, 'release-metadata.json')
+    const invoke = (location: 'local' | 'remote', trustPredecessor = true) => spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `RELEASES_ROOT='${releasesRoot}'`,
+      `TRUSTED_LEGACY_PREDECESSOR=${trustPredecessor ? `'${release}'` : "''"}`,
+      "ssh() { local _host=\"$1\"; shift; \"$@\"; }",
+      `required_migrations_csv '${metadata}' ${location}`,
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+
+    await writeFile(metadata, JSON.stringify(legacyMetadata))
+    const untrustedLegacy = invoke('remote', false)
+    assert.notEqual(untrustedLegacy.status, 0)
+    assert.match(untrustedLegacy.stderr, /exact captured predecessor/)
+
+    const legacyRemote = invoke('remote')
+    assert.equal(legacyRemote.status, 0, legacyRemote.stderr)
+    assert.equal(legacyRemote.stdout, legacyMetadata.requiredMigrations.join(','))
+
+    const legacyLocal = invoke('local')
+    assert.notEqual(legacyLocal.status, 0)
+    assert.match(legacyLocal.stderr, /invalid minimumRequiredMigration/)
+
+    await writeFile(metadata, JSON.stringify({
+      ...legacyMetadata,
+      capabilities: [...legacyMetadata.capabilities, 'history-projection-revision-v1'],
+    }))
+    const capableWithoutFloor = invoke('remote')
+    assert.notEqual(capableWithoutFloor.status, 0)
+    assert.match(capableWithoutFloor.stderr, /legacy migration manifest cannot declare history projection capability/)
+
+    await writeFile(metadata, JSON.stringify({
+      ...legacyMetadata,
+      requiredMigrations: [...legacyMetadata.requiredMigrations, legacyMetadata.requiredMigrations[0]],
+    }))
+    const duplicate = invoke('remote')
+    assert.notEqual(duplicate.status, 0)
+    assert.match(duplicate.stderr, /invalid legacy requiredMigrations/)
+  })
+
+  test('strong release markers detect tampering and legacy trust is exact-invocation predecessor only', async () => {
+    const deploySource = await readFile(deploy, 'utf8')
+    assert.match(deploySource, /write_strong_release_marker_local\(\)[\s\S]*schemaVersion:\$schemaVersion[\s\S]*sourceCommit:\$sourceCommit[\s\S]*metadataSha256:\$metadataSha256[\s\S]*artifactSha256:\$artifactSha256/)
+    assert.match(deploySource, /activate_release\(\)[\s\S]*assert_release_marker "\$reldir"[\s\S]*assert_release_required_migrations "\$reldir"/)
+    assert.match(deploySource, /rollback_runtime_tuple\(\)[\s\S]*assert_release_marker "\$master"[\s\S]*assert_release_required_migrations "\$master"/)
+    const captureAt = deploySource.lastIndexOf('capture_trusted_release_predecessor || exit 1')
+    assert.ok(captureAt > deploySource.lastIndexOf('acquire_production_mutation_lease || exit 3'))
+    assert.ok(captureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'))
+    const egressCaptureAt = deploySource.lastIndexOf('capture_trusted_egress_predecessor || exit 1')
+    assert.ok(egressCaptureAt > deploySource.lastIndexOf('acquire_production_mutation_lease || exit 3'))
+    assert.ok(egressCaptureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'))
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-marker-')); dirs.push(dir)
+    const releasesRoot = path.join(dir, 'releases')
+    await mkdir(releasesRoot)
+    const full = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const short = full.slice(0, 8)
+    const metadataRaw = spawnSync(
+      'git', ['show', `${full}:deploy/v5/release-metadata.json`],
+      { cwd: root, encoding: 'utf8' },
+    ).stdout
+    assert.match(full, /^[0-9a-f]{40}$/)
+    assert.ok(metadataRaw.length > 0)
+
+    const makeRelease = async (builtAt: string) => {
+      const release = path.join(releasesRoot, `rel-${short}-${builtAt}`)
+      await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
+      await mkdir(path.join(release, 'node_modules'), { recursive: true })
+      await mkdir(path.join(release, 'packages/web-react/dist'), { recursive: true })
+      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'), metadataRaw)
+      await writeFile(path.join(release, 'VERSION.json'), JSON.stringify({ commit: short }))
+      await writeFile(path.join(release, 'package.json'), '{}\n')
+      await writeFile(path.join(release, 'node_modules/dependency.js'), 'module.exports = 1\n')
+      await writeFile(path.join(release, 'packages/web-react/dist/index.html'), '<html>fixture</html>\n')
+      return release
+    }
+    const invoke = (command: string) => spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `RELEASES_ROOT='${releasesRoot}'`,
+      'KL_HOST=fake',
+      'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
+      command,
+    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+
+    const strong = await makeRelease('20260719-010203')
+    const artifact = invoke(`release_artifact_digest '${strong}'`)
+    assert.equal(artifact.status, 0, artifact.stderr)
+    const marker = {
+      schemaVersion: 2,
+      sourceCommit: full,
+      builtAt: '20260719-010203',
+      metadataSha256: createHash('sha256').update(metadataRaw).digest('hex'),
+      artifactSha256: artifact.stdout.trim(),
+    }
+    await writeFile(path.join(strong, '.complete'), JSON.stringify(marker))
+    const validStrong = invoke(`assert_release_marker '${strong}'`)
+    assert.equal(validStrong.status, 0, validStrong.stderr)
+
+    const hardenedStrong = await makeRelease('20260719-010206')
+    await chmod(hardenedStrong, 0o775)
+    const publishHardened = invoke([
+      `write_strong_release_marker_local '${hardenedStrong}' '${full}' '${short}' '20260719-010206' 2`,
+      `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}')" == '0:0:755' ]]`,
+      `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}/.complete')" == '0:0:644' ]]`,
+      `assert_release_marker '${hardenedStrong}'`,
+    ].join('\n'))
+    assert.equal(publishHardened.status, 0, publishHardened.stderr)
+
+    await chmod(path.join(strong, '.complete'), 0o666)
+    const writableMarker = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(writableMarker.status, 0)
+    assert.match(writableMarker.stderr, /marker ownership\/mode 不可信/)
+    await chmod(path.join(strong, '.complete'), 0o644)
+
+    await chmod(strong, 0o775)
+    const writableRoot = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(writableRoot.status, 0)
+    assert.match(writableRoot.stderr, /root ownership\/mode 不可信/)
+    await chmod(strong, 0o755)
+
+    await writeFile(path.join(strong, 'node_modules/dependency.js'), 'module.exports = 2\n')
+    const artifactTamper = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(artifactTamper.status, 0)
+    assert.match(artifactTamper.stderr, /artifact digest mismatch/)
+    await writeFile(path.join(strong, 'node_modules/dependency.js'), 'module.exports = 1\n')
+
+    await writeFile(path.join(strong, '.complete'), JSON.stringify({
+      ...marker,
+      artifactSha256: 'f'.repeat(64),
+    }))
+    const markerMismatch = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(markerMismatch.status, 0)
+    assert.match(markerMismatch.stderr, /artifact digest mismatch/)
+    await writeFile(path.join(strong, '.complete'), JSON.stringify(marker))
+
+    await writeFile(path.join(strong, 'deploy/v5/release-metadata.json'), `${metadataRaw}\n`)
+    const metadataTamper = invoke(`assert_release_marker '${strong}'`)
+    assert.notEqual(metadataTamper.status, 0)
+    assert.match(metadataTamper.stderr, /metadata digest mismatch/)
+    await writeFile(path.join(strong, 'deploy/v5/release-metadata.json'), metadataRaw)
+
+    const legacy = await makeRelease('20260719-010204')
+    await writeFile(path.join(legacy, '.complete'), JSON.stringify({ sha: short, builtAt: '20260719-010204' }))
+    const unknownLegacy = invoke(`assert_release_marker '${legacy}'`)
+    assert.notEqual(unknownLegacy.status, 0)
+    assert.match(unknownLegacy.stderr, /非本 invocation 精确捕获.*predecessor/)
+    const knownLegacy = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `assert_release_marker '${legacy}'`,
+    ].join('\n'))
+    assert.equal(knownLegacy.status, 0, knownLegacy.stderr)
+
+    const changedLegacy = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `printf '%s\\n' 'module.exports = 9' > '${legacy}/node_modules/dependency.js'`,
+      `assert_release_marker '${legacy}'`,
+    ].join('\n'))
+    assert.notEqual(changedLegacy.status, 0)
+    assert.match(changedLegacy.stderr, /制品未变/)
+    await writeFile(path.join(legacy, 'node_modules/dependency.js'), 'module.exports = 1\n')
+
+    const otherLegacy = await makeRelease('20260719-010205')
+    await writeFile(path.join(otherLegacy, '.complete'), JSON.stringify({ sha: short, builtAt: '20260719-010205' }))
+    const wrongLegacy = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `assert_release_marker '${otherLegacy}'`,
+    ].join('\n'))
+    assert.notEqual(wrongLegacy.status, 0)
+    assert.match(wrongLegacy.stderr, /非本 invocation 精确捕获.*predecessor/)
+
+    const splitMasterAndEgress = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `capture_trusted_egress_predecessor '${otherLegacy}'`,
+      `assert_release_marker '${legacy}'`,
+      `assert_release_marker '${otherLegacy}' egress`,
+    ].join('\n'))
+    assert.equal(splitMasterAndEgress.status, 0, splitMasterAndEgress.stderr)
+    const egressPinIsNotMasterTrust = invoke([
+      `capture_trusted_release_predecessor '${legacy}'`,
+      `capture_trusted_egress_predecessor '${otherLegacy}'`,
+      `assert_release_marker '${otherLegacy}'`,
+    ].join('\n'))
+    assert.notEqual(egressPinIsNotMasterTrust.status, 0)
+    assert.match(egressPinIsNotMasterTrust.stderr, /master predecessor/)
+  })
+
+  test('release artifact digest rejects a path added after its initial tree snapshot', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-digest-race-')); dirs.push(dir)
+    const release = path.join(dir, 'release')
+    await mkdir(release)
+    const large = path.join(release, 'a-large.bin')
+    const added = path.join(release, 'z-added-after-snapshot')
+    const truncate = spawnSync('truncate', ['-s', '64M', large], { encoding: 'utf8' })
+    assert.equal(truncate.status, 0, truncate.stderr)
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'python3() {',
+      '  command /usr/bin/python3 "$@" <&0 & local child=$!',
+      '  (',
+      '    while kill -0 "$child" 2>/dev/null; do',
+      `      for fd in /proc/$child/fd/*; do [[ "$(readlink -f "$fd" 2>/dev/null || true)" == '${large}' ]] && { printf x > '${added}'; exit 0; }; done`,
+      '    done',
+      '  ) & local mutator=$!',
+      '  local rc=0; wait "$child" || rc=$?; wait "$mutator" || true; return "$rc"',
+      '}',
+      `release_artifact_digest '${release}'`,
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /release tree changed during digest/)
+  })
+
+  test('root typecheck and every dist build use the official web workspace gate', async () => {
+    const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
+    assert.match(pkg.scripts.typecheck, /typecheck --workspace packages\/web-react/)
+    const source = await readFile(deploy, 'utf8')
+    assert.doesNotMatch(source, /cd '\$staging\/packages\/web-react' && npx vite build/)
+    assert.doesNotMatch(source, /cd '\$REPO_ROOT\/packages\/web-react' && npx vite build/)
+    assert.match(source, /cd '\$staging' && npm run build --workspace packages\/web-react/)
+    assert.match(source, /cd '\$REPO_ROOT' && npm run build --workspace packages\/web-react/)
   })
 
   test('requiredMigrations remote failure stays fail-closed in production OR-list context', () => {
@@ -1243,6 +1645,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'DRY=0',
       'KL_HOST=fake',
       'ACTIVE_SRC=/fixture/active',
@@ -1284,6 +1687,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       "source '" + deploy + "'",
+      'MUTATION_LEASE_BYPASSED=1',
       'DRY=0',
       'KL_HOST=fake',
       'ACTIVE_SRC=/fixture/active',
@@ -1294,6 +1698,7 @@ describe('v5 release safety lanes', () => {
       'ACTIVE_STATE_LOCK_VERSION=7',
       'ACTIVE_STATE_RELEASE=/release/old',
       'ACTIVE_STATE_PREVIOUS_RELEASE=/release/older',
+      'assert_release_marker() { :; }',
       'assert_release_required_migrations() { :; }',
       'assert_release_capability_for_sessions_pg() { :; }',
       'assert_lossless_turn_tape_floor() { :; }',
@@ -1304,6 +1709,13 @@ describe('v5 release safety lanes', () => {
       'smoke() { :; }',
       'mark_deploy_recovery_required() { printf "%s\\n" "$1" >>"$RECOVERY_LOG"; }',
       'probe_release_lossless_master_capability() {',
+      '  case "$1" in',
+      '    /release/candidate) return 0 ;;',
+      '    /release/old) return 1 ;;',
+      '    *) return 2 ;;',
+      '  esac',
+      '}',
+      'probe_release_history_projection_revision() {',
       '  case "$1" in',
       '    /release/candidate) return 0 ;;',
       '    /release/old) return 1 ;;',
@@ -1704,7 +2116,9 @@ describe('v5 release safety lanes', () => {
     assert.match(egressActivate, /wait_for_egress_release_ready "\$reldir" "\$require_cap" 30/)
     assert.match(egressActivate, /wait_for_egress_release_ready "\$prev" 0 30/)
     assert.doesNotMatch(egressActivate, /run "sleep 3"/)
-    assert.match(deployBody, /egress_prev_release=.*systemctl show -p MainPID/)
+    assert.match(deployBody, /egress_prev_release="\$CAPTURED_EGRESS_PREDECESSOR"/)
+    assert.match(deployBody, /current_egress_cwd=.*systemctl show -p MainPID/)
+    assert.match(deployBody, /current_egress_cwd" == "\$egress_prev_release/)
     assert.match(deployBody, /activate_egress_release "\$BUILT_RELEASE" "\$egress_prev_release"/)
     assert.doesNotMatch(deployBody, /systemctl restart openclaude-v5-egress/)
   })
@@ -1849,10 +2263,13 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('model_authority_v1-egress'))
     assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
     assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
+    assert.ok(meta.capabilities.includes('history-projection-revision-v1'))
     assert.ok(meta.requiredMigrations.includes('0157_lossless_runtime_batches'))
     assert.ok(meta.requiredMigrations.includes('0164_admin_audit_model_admin_grant'))
     assert.ok(meta.requiredMigrations.includes('0166_prompt_queue'))
     assert.ok(meta.requiredMigrations.includes('0167_turn_waiver_receipts'))
+    assert.ok(meta.requiredMigrations.includes('0174_selfheal_release_safety_fences'))
+    assert.ok(meta.requiredMigrations.includes('0175_client_session_history_revision'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, [
       'model_authority_v1',
@@ -1870,6 +2287,234 @@ describe('v5 release safety lanes', () => {
     )
     // 既有 capability 不得被本批次挤掉(sessions 割接地板仍在)
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
+  })
+
+  test('history projection revision capability blocks mixed writers and unsafe downgrade', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-history-revision-')); dirs.push(dir)
+    const legacy = path.join(dir, 'legacy')
+    const capable = path.join(dir, 'capable')
+    for (const [release, capabilities] of [
+      [legacy, ['dual-master-v1']],
+      [capable, ['dual-master-v1', 'history-projection-revision-v1']],
+    ] as const) {
+      await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
+      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'), JSON.stringify({ capabilities }))
+    }
+
+    const invoke = (command: string) => spawnSync('bash', ['-c', [
+      'set -u',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=0; KL_HOST=fake; ACTIVE_UNIT=fake.service; ACTIVE_PORT=18890; V5_ENV=/fake/env',
+      'ssh() {',
+      '  local host="$1"; shift; local command="$*"',
+      '  case "$command" in',
+      '    *"metadata="*) bash -c "$command" ;;',
+      '    *) printf "UNEXPECTED:%s\\n" "$command" >&2; return 90 ;;',
+      '  esac',
+      '}',
+      'smoke() { printf "SMOKE\\n"; }',
+      'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$*"; }',
+      command,
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+
+    const mixed = invoke(`assert_history_projection_revision_pair '${legacy}' '${capable}' canary`)
+    assert.notEqual(mixed.status, 0)
+    assert.match(mixed.stderr, /代际不一致/)
+    const same = invoke(`assert_history_projection_revision_pair '${capable}' '${capable}' canary`)
+    assert.equal(same.status, 0, same.stderr)
+
+    const firstAdoption = invoke(`prepare_history_projection_revision_activation '${capable}' '${legacy}'`)
+    assert.equal(firstAdoption.status, 0, firstAdoption.stderr)
+    const zeroRevisionDowngrade = invoke(`prepare_history_projection_revision_activation '${legacy}' '${capable}'`)
+    assert.notEqual(zeroRevisionDowngrade.status, 0)
+    assert.match(zeroRevisionDowngrade.stderr, /不可逆 history projection 降级/)
+    assert.doesNotMatch(zeroRevisionDowngrade.stdout + zeroRevisionDowngrade.stderr, /STOP|RESTART/)
+
+    const source = await readFile(deploy, 'utf8')
+    const prepareBody = source.slice(
+      source.indexOf('prepare_history_projection_revision_activation()'),
+      source.indexOf('\n# Tri-state artifact probe', source.indexOf('prepare_history_projection_revision_activation()')),
+    )
+    assert.doesNotMatch(prepareBody, /systemctl stop|history_projection_revision_count/)
+    assert.match(prepareBody, /即使当前 revision 全为 0 也不安全/)
+    const activationBody = source.slice(
+      source.indexOf('activate_release() {'),
+      source.indexOf('\n# 传统 deploy/rollback', source.indexOf('activate_release() {')),
+    )
+    assert.ok(
+      activationBody.indexOf('prepare_history_projection_revision_activation "$reldir" "$prev"')
+        < activationBody.indexOf("mv -T '$tmplink' '$ACTIVE_SRC'"),
+      'ordinary downgrade must hit the irreversible floor before the source flip',
+    )
+    const canaryLane = source.slice(
+      source.indexOf('canary() {'),
+      source.indexOf('\n# 内部账号 allowlist', source.indexOf('canary() {')),
+    )
+    assert.ok(
+      canaryLane.indexOf('assert_history_projection_revision_pair "$DS_active_release" "$reldir" "canary pre-start"')
+        < canaryLane.indexOf('start_candidate_unit_and_wait "$cand"'),
+      'mixed projection generations must be rejected before candidate start',
+    )
+    const recoveryBody = source.slice(
+      source.indexOf('recover_cutover()'),
+      source.indexOf('\nset_cutover_maintenance() {', source.indexOf('recover_cutover()')),
+    )
+    const transitionBody = source.slice(
+      source.indexOf('cutover_transition()'),
+      source.indexOf('\nbegin_cutover_step() {', source.indexOf('cutover_transition()')),
+    )
+    assert.ok(recoveryBody.indexOf('systemctl stop "$unit"') < recoveryBody.indexOf('current_history_capability='))
+    assert.ok(recoveryBody.indexOf('rollback_partial 1') < recoveryBody.indexOf('cp -al "$remote_src/." "$restore_dir/"'))
+
+    const remoteScript = recoveryBody.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE/)?.[1]
+    assert.ok(remoteScript, 'recover_cutover remote body not found')
+    const fixture = await mkdtemp(path.join(tmpdir(), 'v5-history-recovery-')); dirs.push(fixture)
+    const cutoverRoot = path.join(fixture, 'cutovers')
+    const nonce = 'a'.repeat(32)
+    const bundle = path.join(cutoverRoot, nonce)
+    const remoteSrc = path.join(fixture, 'current-source')
+    const bin = path.join(fixture, 'bin')
+    const marker = path.join(fixture, 'maintenance.json')
+    const systemctlLog = path.join(fixture, 'systemctl.log')
+    const envFile = path.join(fixture, 'current.env')
+    const targetCommit = 'b'.repeat(40)
+    const appliedSet = 'fixture_migration'
+    const appliedHash = createHash('sha256').update(appliedSet).digest('hex')
+    await mkdir(path.join(bundle, 'source/deploy/v5'), { recursive: true, mode: 0o700 })
+    await chmod(bundle, 0o700)
+    await mkdir(path.join(remoteSrc, 'deploy/v5'), { recursive: true })
+    await mkdir(bin)
+    const host = spawnSync('hostname', ['-f'], { encoding: 'utf8' }).stdout.trim()
+    await writeFile(path.join(bundle, 'manifest.json'), JSON.stringify({
+      host,
+      nonce,
+      old_image: 'fixture:image',
+      old_image_id: 'sha256:fixture',
+      target_commit: targetCommit,
+      database_compatibility: 'backward-compatible',
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      target_image: 'fixture:image',
+      target_image_id: 'sha256:fixture',
+      applied_migrations_hash: appliedHash,
+    }), { mode: 0o600 })
+    await writeFile(path.join(bundle, 'commercial-v5.env'), 'DATABASE_URL=postgres://unused\n', { mode: 0o600 })
+    await writeFile(path.join(bundle, 'state.json'), JSON.stringify({
+      state: 'activating', candidate_start_attempted: true,
+    }), { mode: 0o600 })
+    await writeFile(path.join(bundle, 'source/deploy/v5/release-metadata.json'), JSON.stringify({
+      capabilities: ['durable-turn-dispatch-v1'],
+    }))
+    await writeFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), JSON.stringify({
+      capabilities: ['durable-turn-dispatch-v1', 'history-projection-revision-v1'],
+    }))
+    await writeFile(envFile, 'DATABASE_URL=postgres://unused\nCURRENT=1\n', { mode: 0o600 })
+    await writeFile(marker, JSON.stringify({ schema: 1, nonce }))
+    await writeFile(path.join(bin, 'docker'), [
+      '#!/bin/sh',
+      'printf "%s\\n" sha256:fixture',
+    ].join('\n') + '\n')
+    await writeFile(path.join(bin, 'systemctl'), [
+      '#!/bin/sh',
+      'printf "%s\\n" "$*" >>"$SYSTEMCTL_LOG"',
+    ].join('\n') + '\n')
+    await writeFile(path.join(bin, 'curl'), [
+      '#!/bin/sh',
+      'printf "%s\\n" \'{"ok":true,"channel":"v5"}\'',
+    ].join('\n') + '\n')
+    await writeFile(path.join(bin, 'psql'), [
+      '#!/bin/sh',
+      'printf "%s\\n" "$APPLIED_SET"',
+    ].join('\n') + '\n')
+    await chmod(path.join(bin, 'docker'), 0o755)
+    await chmod(path.join(bin, 'systemctl'), 0o755)
+    await chmod(path.join(bin, 'curl'), 0o755)
+    await chmod(path.join(bin, 'psql'), 0o755)
+    const transitionScript = transitionBody.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE/)?.[1]
+    assert.ok(transitionScript, 'cutover_transition remote body not found')
+    const transitioned = spawnSync('bash', ['-c', transitionScript!, '--',
+      cutoverRoot,
+      path.join(fixture, 'cutover.lock'),
+      nonce,
+      targetCommit,
+      'activating',
+      'activated',
+      envFile,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, APPLIED_SET: appliedSet },
+    })
+    assert.equal(transitioned.status, 0, transitioned.stderr || transitioned.stdout)
+    const activatedState = JSON.parse(await readFile(path.join(bundle, 'state.json'), 'utf8'))
+    assert.equal(activatedState.state, 'activated')
+    assert.equal(activatedState.candidate_start_attempted, true)
+    const recovered = spawnSync('bash', ['-c', remoteScript!, '--',
+      cutoverRoot,
+      path.join(fixture, 'cutover.lock'),
+      nonce,
+      remoteSrc,
+      envFile,
+      `openclaude-v5-history-test-${process.pid}.service`,
+      '18890',
+      marker,
+      path.join(fixture, 'maintenance.lock'),
+      'history-projection-revision-v1',
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
+    })
+    assert.notEqual(recovered.status, 0)
+    assert.match(recovered.stderr, /refusing irreversible history projection downgrade/)
+    assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
+    await assert.rejects(readFile(marker, 'utf8'))
+    const currentMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
+    assert.ok(currentMeta.capabilities.includes('history-projection-revision-v1'))
+
+    // A stage/pre-start failure may leave capable metadata in a partial source,
+    // but it never served. The durable marker is the authority: restore the
+    // trusted legacy bundle instead of starting the half-staged tree.
+    await writeFile(path.join(bundle, 'state.json'), JSON.stringify({
+      state: 'staging', candidate_start_attempted: false,
+    }), { mode: 0o600 })
+    await writeFile(marker, JSON.stringify({ schema: 1, nonce }))
+    await writeFile(systemctlLog, '')
+    const preStartRecovery = spawnSync('bash', ['-c', remoteScript!, '--',
+      cutoverRoot,
+      path.join(fixture, 'cutover.lock'),
+      nonce,
+      remoteSrc,
+      envFile,
+      `openclaude-v5-history-test-${process.pid}.service`,
+      '18890',
+      marker,
+      path.join(fixture, 'maintenance.lock'),
+      'history-projection-revision-v1',
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
+    })
+    assert.equal(preStartRecovery.status, 0, preStartRecovery.stderr || preStartRecovery.stdout)
+    assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
+    await assert.rejects(readFile(marker, 'utf8'))
+    const restoredMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
+    assert.ok(!restoredMeta.capabilities.includes('history-projection-revision-v1'))
+
+    const stagedBody = source.slice(
+      source.indexOf('activate_staged_inner()'),
+      source.indexOf('\nactivate_staged() {', source.indexOf('activate_staged_inner()')),
+    )
+    assert.ok(
+      stagedBody.indexOf('mark_cutover_candidate_start_attempted')
+        < stagedBody.indexOf('systemctl start $V5_UNIT'),
+      'candidate start evidence must commit before the first start attempt',
+    )
   })
 
   test('model-authority readiness tolerates startup delay, rejects PID churn, and has a hard deadline', async () => {
@@ -1981,6 +2626,7 @@ describe('v5 release safety lanes', () => {
         'set -u',
         'export V5_DEPLOY_SOURCE_ONLY=1',
         `source '${deploy}'`,
+        'MUTATION_LEASE_BYPASSED=1',
         'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790',
         'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
         'model_authority_preflight() { record preflight; return 0; }',
@@ -2330,6 +2976,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
       'authority_flag=1',
       'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
@@ -2406,6 +3053,7 @@ describe('v5 release safety lanes', () => {
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'ACTIVE_SLOT=A; ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
       'authority_flag=1; egress_fail=1',
       'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
@@ -2444,6 +3092,7 @@ describe('v5 release safety lanes', () => {
         'set -u',
         'export V5_DEPLOY_SOURCE_ONLY=1',
         `source '${deploy}'`,
+        'MUTATION_LEASE_BYPASSED=1',
         'ACTIVE_UNIT=openclaude-v5.service; ACTIVE_PORT=18790; ACTIVE_SRC=/rel/a',
         'OC_HOTCFG_PLATFORM_ROOT=/platform; seed_state=0',
         'record() { printf "%s\\n" "$1" >>"$ORDER_LOG"; }',
@@ -2774,6 +3423,7 @@ describe('v5 release safety lanes', () => {
     const stopFailure = spawnSync('bash', ['-c', [
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'calls=0',
       'sshk() { calls=$((calls+1)); [ "$calls" -ne 2 ]; }',
       'wait_for_candidate_ready() { return 1; }',
@@ -2792,6 +3442,7 @@ describe('v5 release safety lanes', () => {
     const dispatcherStopFailure = spawnSync('bash', ['-c', [
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'ds_snapshot() { DS_phase=canary; DS_transition_step=2; DS_candidate_slot=B; DS_active_slot=A; DS_operation_id=op; DS_lock_version=7; }',
       'recover_canary_prep() { return 42; }',
       'ds_cas_or_die() { touch "$CASSED"; }',
@@ -2808,6 +3459,7 @@ describe('v5 release safety lanes', () => {
     const missingUnit = spawnSync('bash', ['-c', [
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
+      'MUTATION_LEASE_BYPASSED=1',
       'sshk() { eval "$*"; }',
       'systemctl() { touch "$SYSTEMCTL_CALLED"; return 42; }',
       'export -f systemctl',
@@ -3175,8 +3827,8 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
 
   test('manual mutation wrapper holder watches its live sshd parent and isolates stdin', async () => {
     const source = await readFile(manualMutationLease, 'utf8')
-    const start = source.indexOf('REMOTE_HOLDER="')
-    const end = source.indexOf('\nssh "$KL_HOST" "$REMOTE_HOLDER"', start)
+    const start = source.indexOf('remote_holder="')
+    const end = source.indexOf('\n\n  # Keepalive bounds', start)
     assert.ok(start >= 0 && end > start, '未找到 manual production-mutation remote holder')
     const holder = source.slice(start, end)
     const signalTrap = holder.indexOf("trap 'exit 0' HUP INT TERM")
@@ -3194,8 +3846,21 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.ok(loop > leased, 'manual holder 缺 parent-watch 循环')
     assert.ok(holder.indexOf('/proc/\\$\\$/status', loop) > loop, '循环未重读实时 PPid')
     assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', loop) > loop, '循环未复核 parent 活性')
+    assert.ok(
+      holder.indexOf('lease_ttl=') > firstKernelParent && holder.indexOf('lease_ttl=') < leased,
+      'manual holder 须在 LEASED 前固定可配置 hard TTL',
+    )
+    assert.ok(holder.indexOf('now - lease_start', loop) > loop, 'manual holder 循环未执行 hard TTL 到点释放')
     assert.doesNotMatch(holder, /exec sleep infinity/, 'manual holder 禁止 orphanable infinite sleep')
-    assert.match(source, /ssh "\$KL_HOST" "\$REMOTE_HOLDER" <\/dev\/null/, '后台 ssh 必须隔离 stdin')
+    assert.match(source, /ServerAliveInterval=2/, '后台 ssh 必须设置 transport keepalive')
+    assert.match(source, /ServerAliveCountMax=2/, '后台 ssh 必须限制连续 keepalive 丢失次数')
+    assert.match(source, /"\$KL_HOST" "\$remote_holder" <\/dev\/null/, '后台 ssh 必须隔离 stdin')
+    const sshSpawn = source.indexOf('ssh -o ServerAliveInterval=2')
+    const localTtlSpawn = source.indexOf('sleep "$local_ttl" &')
+    assert.ok(localTtlSpawn >= 0 && localTtlSpawn < sshSpawn, '本地 TTL 必须早于 ssh/远端 TTL 启动')
+    const waitRace = source.indexOf('if wait -n -p completed')
+    assert.ok(waitRace >= 0, 'manual supervisor 缺命令/lease/watchdog 首退竞速')
+    assert.ok(source.indexOf('"$SUP_LOCAL_TTL_PID"', waitRace) > waitRace, '本地安全 TTL 未加入首退竞速')
   })
 
   test('manual mutation wrapper normal cleanup releases a reparented remote holder', async () => {
@@ -3266,6 +3931,240 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       blocker.kill('SIGKILL')
       child?.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper SIGKILL watchdog terminates ssh and the whole command group', async () => {
+    const fx = await manualLeaseFixture()
+    const command = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, command], { env: fx.env, stdio: 'ignore' })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'stubborn command never started',
+      )
+      assert.notEqual(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'manual lease was not held')
+      assert.equal(child.kill('SIGKILL'), true, 'failed to SIGKILL outer wrapper')
+      assert.equal(await waitForChildExit(child, 3_000), true, 'outer wrapper did not die')
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 6_000),
+        true,
+        'independent supervisor did not release the mutation lease after wrapper SIGKILL',
+      )
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(fx.commandPids), 6_000),
+        true,
+        'wrapper SIGKILL left the command or its TERM-ignoring grandchild alive',
+      )
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper supervisor-group SIGSTOP is fenced by an independent watchdog', async () => {
+    const fx = await manualLeaseFixture()
+    const heartbeat = path.join(fx.dir, 'supervisor-stop-heartbeat')
+    const command = path.join(fx.dir, 'supervisor-stop-command.sh')
+    await writeFile(command, [
+      '#!/bin/bash',
+      "trap '' TERM",
+      'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+      ': >"$COMMAND_STARTED"',
+      'while :; do printf "%s\\n" "$RANDOM" >"$HEARTBEAT"; sleep 0.05; done',
+    ].join('\n') + '\n')
+    await chmod(command, 0o755)
+    const child = spawn('bash', [fx.wrapper, command], {
+      env: { ...fx.env, HEARTBEAT: heartbeat, OC_V5_MUTATION_LEASE_TTL_SECONDS: '30' },
+      stdio: 'ignore',
+    })
+    let supervisorPid: number | undefined
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'heartbeat command never started',
+      )
+      assert.equal(
+        await waitUntilManualLease(() => {
+          supervisorPid = childProcessGroupLeader(child.pid!)
+          return supervisorPid !== undefined
+        }, 3_000),
+        true,
+        'manual internal supervisor PGID not found',
+      )
+      const stoppedAt = Date.now()
+      process.kill(-supervisorPid!, 'SIGSTOP')
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(fx.commandPids), 3_000),
+        true,
+        'independent watchdog left command mutating after supervisor-group STOP',
+      )
+      assert.ok(Date.now() - stoppedAt < 3_000, 'command survived until the 30s TTL instead of immediate STOP fencing')
+      const frozen = await readFile(heartbeat, 'utf8')
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      assert.equal(await readFile(heartbeat, 'utf8'), frozen, 'heartbeat advanced after supervisor-group STOP fencing')
+      assert.equal(await waitForChildExit(child, 5_000), true, 'outer wrapper required SIGCONT to finish')
+      assert.notEqual(child.exitCode, 0, 'supervisor STOP must fail closed')
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 5_000),
+        true,
+        'supervisor STOP left the production-mutation flock held',
+      )
+    } finally {
+      if (supervisorPid) {
+        try { process.kill(-supervisorPid, 'SIGCONT') } catch { /* already gone */ }
+        try { process.kill(-supervisorPid, 'SIGKILL') } catch { /* already gone */ }
+      }
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper fences a running command when the lease ssh disappears', async () => {
+    const fx = await manualLeaseFixture()
+    const command = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, command], { env: fx.env, stdio: 'ignore' })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'stubborn command never started',
+      )
+      const sshPid = Number((await readFile(fx.sshPids, 'utf8')).trim().split(/\s+/).at(-1))
+      assert.equal(Number.isSafeInteger(sshPid) && sshPid > 1, true, 'missing fake ssh pid')
+      process.kill(sshPid, 'SIGKILL')
+      assert.equal(await waitForChildExit(child, 8_000), true, 'wrapper did not fail after lease ssh loss')
+      assert.equal(child.exitCode, 86, `lease loss must use the dedicated exit code; signal=${child.signalCode}`)
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(fx.commandPids), 6_000),
+        true,
+        'lease loss left the command or its TERM-ignoring grandchild alive',
+      )
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 6_000),
+        true,
+        'lease ssh loss left the remote flock held',
+      )
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper hard TTL fences long commands and preserves normal command status', async () => {
+    const ttlFx = await manualLeaseFixture()
+    const stubborn = await writeStubbornManualCommand(ttlFx)
+    const ttlChild = spawn('bash', [ttlFx.wrapper, stubborn], {
+      env: { ...ttlFx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: '2' },
+      stdio: 'ignore',
+    })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(ttlFx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'TTL command never started',
+      )
+      assert.equal(await waitForChildExit(ttlChild, 8_000), true, 'hard TTL did not stop the wrapper')
+      assert.equal(ttlChild.exitCode, 86, `hard TTL must surface as lease loss; signal=${ttlChild.signalCode}`)
+      assert.equal(
+        await waitUntilManualLease(() => allRecordedProcessesExited(ttlFx.commandPids), 6_000),
+        true,
+        'hard TTL left command-group processes alive',
+      )
+    } finally {
+      ttlChild.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(ttlFx.commandPids, ttlFx.sshPids, ttlFx.remotePids)
+    }
+
+    const rcFx = await manualLeaseFixture()
+    const rcCommand = path.join(rcFx.dir, 'exit-23.sh')
+    await writeFile(rcCommand, '#!/bin/bash\nexit 23\n')
+    await chmod(rcCommand, 0o755)
+    const result = spawnSync('bash', [rcFx.wrapper, rcCommand], {
+      env: rcFx.env,
+      stdio: 'ignore',
+      timeout: 10_000,
+    })
+    try {
+      assert.equal(result.status, 23, `normal command status was not preserved; signal=${result.signal}`)
+      assert.equal(
+        await waitUntilManualLease(() => spawnSync('flock', ['-n', rcFx.lock, 'true']).status === 0, 4_000),
+        true,
+        'normal nonzero command exit left the lease held',
+      )
+    } finally {
+      await killManualLeaseFixtureProcesses(rcFx.sshPids, rcFx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper local TTL fences before a live ssh observes remote TTL close', async () => {
+    const fx = await manualLeaseFixture()
+    const stubborn = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, stubborn], {
+      env: {
+        ...fx.env,
+        OC_V5_MUTATION_LEASE_TTL_SECONDS: '3',
+        FAKE_SSH_EXIT_DELAY_SECONDS: '5',
+      },
+      stdio: 'ignore',
+    })
+    try {
+      assert.equal(
+        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        true,
+        'delayed-close command never started',
+      )
+      assert.equal(
+        await waitUntilManualLease(async () => {
+          if (spawnSync('flock', ['-n', fx.lock, 'true']).status !== 0) return false
+          assert.equal(
+            await allRecordedProcessesExited(fx.commandPids),
+            true,
+            'remote flock became acquirable while the old command group was still alive',
+          )
+          return true
+        }, 6_000),
+        true,
+        'remote hard TTL did not release the lease after local fencing',
+      )
+      assert.equal(await waitForChildExit(child, 4_000), true, 'wrapper did not finish local-TTL cleanup')
+      assert.equal(child.exitCode, 86, `local TTL must surface as lease loss; signal=${child.signalCode}`)
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
+    }
+  })
+
+  test('manual mutation wrapper rejects a stale LEASED receipt delivered after remote TTL', async () => {
+    const fx = await manualLeaseFixture()
+    const stubborn = await writeStubbornManualCommand(fx)
+    const child = spawn('bash', [fx.wrapper, stubborn], {
+      env: {
+        ...fx.env,
+        OC_V5_MUTATION_LEASE_TTL_SECONDS: '3',
+        FAKE_SSH_BUFFER_OUTPUT_UNTIL_REMOTE_EXIT: '1',
+        FAKE_SSH_EXIT_DELAY_SECONDS: '5',
+      },
+      stdio: 'ignore',
+    })
+    try {
+      assert.equal(await waitForChildExit(child, 6_000), true, 'stale-LEASED wrapper did not fail closed')
+      assert.equal(child.exitCode, 86, `stale LEASED must surface as lease loss; signal=${child.signalCode}`)
+      assert.equal(
+        await readFile(fx.commandStarted).then(() => true).catch(() => false),
+        false,
+        'wrapped command started from a stale LEASED receipt after remote flock release',
+      )
+      assert.equal(
+        await readFile(fx.commandPids, 'utf8').then((raw) => raw.trim().length > 0).catch(() => false),
+        false,
+        'stale LEASED spawned the wrapped command process group',
+      )
+    } finally {
+      child.kill('SIGKILL')
+      await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
     }
   })
 
@@ -3420,56 +4319,49 @@ wait $!
 
   test('F7: mutation-lease deactivation covered on compensation + emergency/staged flips', async () => {
     const source = await readFile(deploy, 'utf8')
-    // helper 已定义
-    assert.match(source, /reacquire_mutation_lease_best_effort\(\) \{/)
-    // ── R2-6:补偿路径改为**阻塞等待**重取(远端 flock -w 180),等待失败才降级续作补偿 ──
+    // helper 已定义；失锁后禁止自动重取并猜测 saga 阶段，更不能无 lease 补偿。
+    assert.match(source, /require_mutation_lease_for_compensation\(\) \{/)
     {
-      const rqStart = source.indexOf('reacquire_mutation_lease_best_effort() {')
+      const rqStart = source.indexOf('require_mutation_lease_for_compensation() {')
       const rqEnd = source.indexOf('# ───────────────────────── dangerous offline cutover', rqStart)
-      assert.ok(rqStart >= 0 && rqEnd > rqStart, '未找到 reacquire 函数体')
+      assert.ok(rqStart >= 0 && rqEnd > rqStart, '未找到 compensation lease fence 函数体')
       const rq = source.slice(rqStart, rqEnd)
-      assert.match(rq, /acquire_production_mutation_lease 180/, 'R2-6:reacquire 未走 180s 阻塞等待重取')
-      assert.match(rq, /CRITICAL/, 'R2-6:reacquire 降级路径缺 CRITICAL stderr')
-      assert.ok(
-        rq.includes('补偿优先于互斥,残余窗口=host-action 90s 内的并发,已知且接受'),
-        'R2-6:reacquire 降级路径缺"已知且接受残余窗口"注记(须同时在函数注释)',
-      )
+      assert.doesNotMatch(rq, /acquire_production_mutation_lease/, '失锁补偿禁止在 generic child 内自动重取 lease')
+      assert.match(rq, /return 86/, '失锁补偿必须返回专用 crash-stop rc=86')
+      assert.match(rq, /禁止无 lease 补偿\/回滚/, '失锁补偿必须 fail-closed 并保留恢复现场')
     }
-    // acquire 支持可配置等待秒数(默认 60,reacquire 传 180),远端 flock 用参数化等待。
-    assert.ok(source.includes('local lease_wait="${1:-60}"'), 'R2-6:acquire 未参数化等待秒数(默认 60)')
-    assert.match(source, /flock -w \$\{lease_wait\} 9 \|\| exit 75/, 'R2-6:remote lease flock 未用参数化等待秒数')
-    // deploy 两条补偿路径(validation + plugin seed)各挂一次
+    // deploy 两条补偿路径(validation + plugin seed)各挂一次 fail-closed fence。
     assert.equal(
-      source.match(/reacquire_mutation_lease_best_effort "deploy-validation-compensation"/g)?.length,
+      source.match(/require_mutation_lease_for_compensation "deploy-validation-compensation"/g)?.length,
       2,
-      'deploy 补偿(validation + plugin seed)未各挂一次 reacquire',
+      'deploy 补偿(validation + plugin seed)未各挂一次 lease fence',
     )
-    // deploy 补偿内 reacquire 先于 knowledge_planet_compensate_deploy
+    // deploy 补偿内 fence 先于 knowledge_planet_compensate_deploy
     const deployStart = source.indexOf('\ndeploy() {')
     const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
     const deployBody = source.slice(deployStart, deployEnd)
     assert.ok(
-      deployBody.indexOf('reacquire_mutation_lease_best_effort "deploy-validation-compensation"') <
+      deployBody.indexOf('require_mutation_lease_for_compensation "deploy-validation-compensation"') <
         deployBody.indexOf('knowledge_planet_compensate_deploy'),
-      'deploy 补偿 reacquire 未先于 compensate',
+      'deploy 补偿 lease fence 未先于 compensate',
     )
     // rollback 补偿覆盖(2026-07-17 KP 门摘除后):真正做反向补偿的只剩 hotcfg smoke-failure
     // reverse compensation + 非 hotcfg activate-failure 两条;其余插件侧失败已降级为
     // warn+open_gate_current 兜底继续(不做补偿,lease 仍在持有中),不需要 reacquire。
     assert.equal(
-      source.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
+      source.match(/require_mutation_lease_for_compensation "rollback-compensation"/g)?.length,
       2,
-      'rollback 反向补偿路径(hotcfg smoke-failure + 非 hotcfg activate-failure)未挂 reacquire',
+      'rollback 反向补偿路径未挂 lease fence',
     )
     // hotcfg smoke-failure 反向补偿紧邻先于 rollback_runtime_tuple 1 1。
     assert.match(
       source,
-      /reacquire_mutation_lease_best_effort "rollback-compensation"\n\s*if rollback_runtime_tuple 1 1 "\$kp_rollback_helper"/,
+      /require_mutation_lease_for_compensation "rollback-compensation" \|\| exit 86\n\s*if rollback_runtime_tuple 1 1 "\$kp_rollback_helper"/,
     )
     // 非 hotcfg 三条:reacquire 紧邻先于 Knowledge Planet 补偿(open_gate / transition)。
     assert.match(
       source,
-      /reacquire_mutation_lease_best_effort "rollback-compensation"\n(\s*if \[\[ "\$kp_rb_bracket" == 1 \]\]; then\n)?\s*knowledge_planet_plugin_(open_gate_to_release|transition_to_release) "\$live_master"/,
+      /require_mutation_lease_for_compensation "rollback-compensation" \|\| exit 86\n(\s*if \[\[ "\$kp_rb_bracket" == 1 \]\]; then\n)?\s*knowledge_planet_plugin_(open_gate_to_release|transition_to_release) "\$live_master"/,
     )
     // 全部 2 次 reacquire(2026-07-17 KP 门摘除后仅剩真反向补偿两条)都落在
     // rollback() 函数体内(不外溢别的 lane)。
@@ -3478,25 +4370,46 @@ wait $!
       const rbEnd = source.indexOf('\nrollback_runtime_tuple() {', rbStart)
       const rbBody = source.slice(rbStart, rbEnd)
       assert.equal(
-        rbBody.match(/reacquire_mutation_lease_best_effort "rollback-compensation"/g)?.length,
+        rbBody.match(/require_mutation_lease_for_compensation "rollback-compensation"/g)?.length,
         2,
-        'rollback-compensation reacquire 未全部落在 rollback() 内',
+        'rollback-compensation lease fence 未全部落在 rollback() 内',
       )
     }
-    // 2026-07-17 lease 孤儿修复:ACTIVE 在 spawn 后立即置位(轮询窗被 trap 打断
-    // 也能回收本地 ssh;远端 holder 由 base 侧自释放设计负责,见 PPid 自检循环)。
-    assert.match(
-      source,
-      /MUTATION_LEASE_PID=\$!\n[\s\S]{0,400}?MUTATION_LEASE_ACTIVE=1/,
+    // ACTIVE 在本地 TTL spawn 后、ssh/LEASED 前置位；acquisition 中断可回收二者。
+    const ttlSpawn = source.indexOf('MUTATION_LEASE_TTL_PID=$!')
+    const leaseActive = source.indexOf('MUTATION_LEASE_ACTIVE=1', ttlSpawn)
+    const sshSpawn = source.indexOf('exec setsid ssh -o ServerAliveInterval=2', ttlSpawn)
+    assert.ok(ttlSpawn >= 0 && leaseActive > ttlSpawn && sshSpawn > leaseActive, 'lease acquisition ACTIVE/TTL/ssh 顺序错误')
+    const kpVerifyStart = source.indexOf('\nknowledge_planet_plugin_verify_user() {')
+    const kpVerifyEnd = source.indexOf('\nknowledge_planet_plugin_smoke_gate() {', kpVerifyStart)
+    const kpVerify = source.slice(kpVerifyStart, kpVerifyEnd)
+    const kpAcquire = kpVerify.indexOf('acquire_production_mutation_lease')
+    const kpSupervisedBuild = kpVerify.indexOf('run_mutation_lane_supervised knowledge_planet_build_release_mutation')
+    const kpRelease = kpVerify.indexOf('release_production_mutation_lease', kpSupervisedBuild)
+    const kpScan = kpVerify.indexOf('seed-knowledge-planet-plugin.ts', kpRelease)
+    assert.ok(
+      kpAcquire >= 0 && kpSupervisedBuild > kpAcquire && kpRelease > kpSupervisedBuild && kpScan > kpRelease,
+      'Knowledge Planet 仅 build_release 窄窗须走持续 lease supervisor，扫码窗须在 release 后',
     )
-    // abort_continue 恢复动作(caddy_render_reload)前调用
+    const dispatch = source.slice(source.lastIndexOf('case "$MODE" in'))
+    assert.match(
+      dispatch,
+      /smoke\|baseline-census\|model-authority-preflight\|model-authority-observation-status\|reclaim-mutation-lease\|knowledge-planet-verify\)\n\s*run_selected_mode "\$MODE"/,
+      '只读/特殊 lane 应直接 dispatch',
+    )
+    assert.match(
+      dispatch,
+      /\*\)\n\s*run_mutation_lane_supervised run_selected_mode "\$MODE"/,
+      '所有其余 mutation lane 必须统一经过持续 lease supervisor',
+    )
+    // abort_continue 恢复动作(caddy_render_reload)前调用 fail-closed fence
     const abortStart = source.indexOf('\nabort_continue() {')
     const abortEnd = source.indexOf('\n# ═════════ --recover', abortStart)
     const abortBody = source.slice(abortStart, abortEnd)
-    const abortReacquire = abortBody.indexOf('reacquire_mutation_lease_best_effort "abort-continue"')
+    const abortReacquire = abortBody.indexOf('require_mutation_lease_for_compensation "abort-continue"')
     assert.ok(
       abortReacquire >= 0 && abortReacquire < abortBody.indexOf('caddy_render_reload'),
-      'abort_continue 恢复动作前未挂 reacquire',
+      'abort_continue 恢复动作前未挂 lease fence',
     )
     // emergency tuple 翻转点:activate saga 前断言 lease
     const emStart = source.indexOf('\nactivate_emergency_tuple() {')

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
+import { _parseHistoryRevisionCursor } from '../server.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'server.ts'), 'utf8')
@@ -13,6 +14,16 @@ const routes = source.slice(start, end > start ? end : start + 20_000)
 test('browser session full/incremental/archive routes request the bounded chat projection', () => {
   assert.ok(start >= 0, 'client session route block not found')
   assert.match(routes, /getClientSession\(sessId, userId, \{ projection: 'chat' \}\)/)
-  assert.match(routes, /getClientSessionPartial\(sessId, userId, sinceSeq, \{ projection: 'chat' \}\)/)
+  assert.match(routes, /getClientSessionPartial\(sessId, userId, sinceSeq, \{[\s\S]*?projection: 'chat',[\s\S]*?sinceHistoryRevision,[\s\S]*?\}\)/)
   assert.match(routes, /readArchivedMessages\(sessId, userId, beforeSeq, limit, \{ projection: 'chat' \}\)/)
+  assert.match(routes, /url\.searchParams\.get\('since_history_revision'\)/)
+  assert.match(routes, /_parseHistoryRevisionCursor\(historyRevisionRaw\)/)
+})
+
+test('history revision cursor accepts only canonical non-negative decimal integers', () => {
+  assert.equal(_parseHistoryRevisionCursor('0'), 0)
+  assert.equal(_parseHistoryRevisionCursor('42'), 42)
+  for (const invalid of [null, '', ' ', '00', '01', '+1', '-1', '0x0', '1.0', '9007199254740992']) {
+    assert.equal(_parseHistoryRevisionCursor(invalid), undefined, `must reject ${JSON.stringify(invalid)}`)
+  }
 })
