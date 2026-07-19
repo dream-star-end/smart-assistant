@@ -8,6 +8,7 @@ import { after, before, describe, test } from 'node:test'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query, tx } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -18,9 +19,7 @@ let pgAvailable = false
 let partialDir = ''
 
 async function resetSchema(): Promise<void> {
-  const db = await query<{ db: string }>('SELECT current_database() AS db')
-  if (!/_test$/.test(db.rows[0]?.db ?? '')) throw new Error('refusing to reset non-test database')
-  await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+  await resetTestSchemaForTest()
 }
 
 before(async () => {
@@ -39,7 +38,9 @@ before(async () => {
   await resetSchema()
   partialDir = await mkdtemp(join(tmpdir(), 'oc-migrations-through-0151-'))
   for (const file of (await readdir(MIGRATIONS)).filter((name) => name.endsWith('.sql'))) {
-    if (file === '0152_marketplace_capability_bindings.sql') continue
+    // 构造 0152 之前的真实旧 schema；不能只跳过 0152 后继续套用 0153+，否则
+    // 后续 plugin signature trigger 会先于待测迁移生效，fixture 不再代表升级起点。
+    if (file >= '0152_') continue
     await symlink(join(MIGRATIONS, file), join(partialDir, file))
   }
   await runMigrations({ dir: partialDir })
@@ -114,14 +115,22 @@ before(async () => {
     [userId, skill.rows[0]!.id, agent.rows[0]!.id, pluginAgent.rows[0]!.id],
   )
 
-  const migrated = await runMigrations({ dir: MIGRATIONS })
+  await symlink(
+    join(MIGRATIONS, '0152_marketplace_capability_bindings.sql'),
+    join(partialDir, '0152_marketplace_capability_bindings.sql'),
+  )
+  const migrated = await runMigrations({ dir: partialDir })
   assert.deepEqual(migrated.applied, ['0152_marketplace_capability_bindings'])
 })
 
 after(async () => {
   if (pgAvailable) {
-    await resetSchema().catch(() => {})
-    await closePool()
+    try {
+      await resetSchema()
+      await runMigrations()
+    } finally {
+      await closePool()
+    }
   }
   if (partialDir) await rm(partialDir, { recursive: true, force: true })
 })

@@ -46,7 +46,6 @@ before(async () => {
 
 after(async () => {
   if (!pgAvailable) return
-  await resetTestSchemaForTest().catch(() => undefined)
   await closePool()
 })
 

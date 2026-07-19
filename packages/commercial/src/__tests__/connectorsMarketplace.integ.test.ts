@@ -36,6 +36,7 @@ import { computeAccountKey } from '../connectors/store.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query, tx } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import { handleAdminPutPlatformOauthApp } from '../http/admin/connectorPlatformOauth.js'
 import type { CommercialHttpDeps, RequestContext } from '../http/handlers.js'
 import { HttpError } from '../http/util.js'
@@ -92,9 +93,7 @@ async function probePg(): Promise<boolean> {
 }
 
 async function resetSchema(): Promise<void> {
-  const db = await query<{ db: string }>('SELECT current_database() AS db')
-  if (!/_test$/.test(db.rows[0]?.db ?? '')) throw new Error('refusing to reset non-test database')
-  await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+  await resetTestSchemaForTest()
 }
 
 before(async () => {
@@ -120,11 +119,6 @@ beforeEach(async () => {
 
 after(async () => {
   if (!pgAvailable) return
-  try {
-    await resetSchema()
-  } catch {
-    // best-effort test cleanup
-  }
   await closePool()
 })
 

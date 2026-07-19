@@ -20,6 +20,7 @@ import { after, before, beforeEach, describe, it } from 'node:test'
 import { createPool, closePool, setPoolOverride, resetPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import { runMigrations } from '../db/migrate.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import {
   deleteLibraryDocument,
   listLibraryDocuments,
@@ -61,18 +62,12 @@ before(async () => {
   }
   await resetPool()
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
-  await query('DROP SCHEMA public CASCADE')
-  await query('CREATE SCHEMA public')
+  await resetTestSchemaForTest()
   await runMigrations()
 })
 
 after(async () => {
   if (pgAvailable) {
-    try {
-      await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
-    } catch {
-      /* */
-    }
     await closePool()
   }
 })

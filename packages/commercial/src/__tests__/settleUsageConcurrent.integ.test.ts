@@ -31,6 +31,7 @@ import {
 } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { settleUsageAndLedger } from "../billing/proxyBilling.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { generatePersona } from "../account-pool/persona.js";
@@ -44,24 +45,8 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-function assertTestDatabase(url: string): void {
-  let dbName: string;
-  try {
-    dbName = new URL(url).pathname.replace(/^\//, "");
-  } catch {
-    throw new Error(`invalid TEST_DATABASE_URL: ${url}`);
-  }
-  if (!dbName.endsWith("_test")) {
-    throw new Error(
-      `refusing to reset non-test database: ${dbName} (must end with _test)`,
-    );
-  }
-}
-
 async function cleanCommercialSchema(): Promise<void> {
-  assertTestDatabase(TEST_DB_URL);
-  await query("DROP SCHEMA IF EXISTS public CASCADE");
-  await query("CREATE SCHEMA public");
+  await resetTestSchemaForTest();
   await query("GRANT ALL ON SCHEMA public TO public");
 }
 
@@ -102,7 +87,6 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
     await closePool();
   }
 });

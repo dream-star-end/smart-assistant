@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { register } from "../auth/register.js";
 import {
   verifyEmail,
@@ -31,27 +32,6 @@ const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 let pgAvailable = false;
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "system_settings",
-  "users",
-  "schema_migrations",
-];
 
 async function probe(): Promise<boolean> {
   const p = createPool({
@@ -89,13 +69,13 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     await closePool();
   }
 });

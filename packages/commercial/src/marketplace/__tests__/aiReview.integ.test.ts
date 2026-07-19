@@ -17,6 +17,7 @@ import { after, before, beforeEach, describe, test } from 'node:test'
 import { closePool, createPool, resetPool, setPoolOverride } from '../../db/index.js'
 import { runMigrations } from '../../db/migrate.js'
 import { query } from '../../db/queries.js'
+import { resetTestSchemaForTest } from '../../__tests__/helpers/db.js'
 import {
   claimNextAiReview,
   finishAiReviewEscalate,
@@ -107,14 +108,11 @@ before(async () => {
   }
   await resetPool()
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
-  await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+  await resetTestSchemaForTest()
   await runMigrations()
 })
 after(async () => {
   if (pgAvailable) {
-    try {
-      await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
-    } catch {}
     await closePool()
   }
 })

@@ -50,9 +50,8 @@ export async function truncateAllForTest(
  *
  * 动机(2026-07-11):此前这类套件各自维护一份 COMMERCIAL_TABLES 手工清单,DROP 清单
  * 后重放迁移 —— 新迁移加的表(如 admin_alert_channels)没进清单就撞"already exists",
- * 且该清单在 33 个测试文件里各复制一份、独立漂移(一类必然复发的坑)。schema 级重置
- * 零清单维护,迁移从零重放,确定性成立。其余仍用手工清单的套件属登记债,逐个迁移时
- * 改用本函数。
+ * 且该清单曾在数十个测试文件里各复制一份、独立漂移(一类必然复发的坑)。schema 级
+ * 重置零清单维护,迁移从零重放,确定性成立；共享 public schema 的破坏性清场统一走本函数。
  *
  * 防护与 truncateAllForTest 同源:库名必须以 `_test` 结尾,防 .env 配错清了生产库。
  */

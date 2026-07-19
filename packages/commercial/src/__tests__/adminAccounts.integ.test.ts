@@ -20,6 +20,7 @@ import { AddressInfo } from "node:net";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { signAccess } from "../auth/jwt.js";
 import { createCommercialHandler } from "../http/router.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
@@ -48,27 +49,6 @@ const TEST_DB_URL =
 const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const JWT_SECRET = "z".repeat(64);
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "egress_proxies",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
 
 let pgAvailable = false;
 let redis: IORedis | null = null;
@@ -145,7 +125,7 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 
   redis = await probeRedis();
@@ -183,7 +163,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     await closePool();
   }
   globalThis.fetch = _originalFetch;
@@ -295,7 +275,7 @@ describe("admin accounts — DB 层", () => {
     assert.equal(audits.rows[0].action, "account.delete");
   });
 
-  test("patch:rotate token/refresh → audit 只记 _changed 布尔,不落明文", async (t) => {
+  test("patch:rotate token/refresh → audit 只留变更信号,不落明文", async (t) => {
     if (skipIfNoPg(t)) return;
     const admin = await createUser("a@x.com", "admin");
     const epid = await setupEgressProxy(admin);
@@ -318,7 +298,8 @@ describe("admin accounts — DB 层", () => {
     assert.equal(audits.rows.length, 1);
     const after = audits.rows[0].after as Record<string, unknown>;
     assert.equal(after.oauth_token_changed, true);
-    assert.equal(after.oauth_refresh_token, "<cleared>");
+    // refresh 的调用点清空标记仍命中中央敏感 key 规则；审计只保留脱敏元信息。
+    assert.deepEqual(after.oauth_refresh_token, { __redacted: true, len: 9 });
     // 确认明文永远不在
     const js = JSON.stringify(audits.rows[0]);
     assert.ok(!js.includes("tok1"));
@@ -833,10 +814,11 @@ describe("admin agent-containers — HTTP", () => {
     );
     const subId = sub.rows[0].id;
     const con = await query<{ id: string }>(
-      `INSERT INTO agent_containers(user_id, subscription_id, docker_name, workspace_volume, home_volume, image, status)
-       VALUES ($1, $2, 'agent-u-1', 'vol-ws', 'vol-home', 'test/image', 'running')
+      `INSERT INTO agent_containers(
+         user_id, subscription_id, docker_name, workspace_volume, home_volume, image, secret_hash, status
+       ) VALUES ($1, $2, 'agent-u-1', 'vol-ws', 'vol-home', 'test/image', $3, 'running')
        RETURNING id::text AS id`,
-      [uid.toString(), subId],
+      [uid.toString(), subId, Buffer.alloc(32, 1)],
     );
 
     const list = await fetch(`${baseUrl}/api/admin/agent-containers`, {

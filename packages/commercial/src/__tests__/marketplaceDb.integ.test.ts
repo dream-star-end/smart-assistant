@@ -24,6 +24,7 @@ import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import { querySkillFeedbackRefs } from '../http/internalSkillFeedback.js'
 import {
   MarketplaceError,
@@ -57,12 +58,13 @@ const TEST_DB_URL =
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 
 let pgAvailable = false
+const previousRuntimeChannel = process.env.OC_RUNTIME_CHANNEL
 
 // Throwaway test DB: nuke the whole schema and let runMigrations rebuild it from
 // scratch (a fixed DROP-TABLE subset leaves other migrated tables behind and the
 // next run's migrations fail with "relation already exists").
 async function resetSchema(): Promise<void> {
-  await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+  await resetTestSchemaForTest()
 }
 
 async function probe(): Promise<boolean> {
@@ -82,6 +84,7 @@ async function probe(): Promise<boolean> {
 }
 
 before(async () => {
+  process.env.OC_RUNTIME_CHANNEL = 'v5'
   pgAvailable = await probe()
   if (!pgAvailable) {
     if (REQUIRE_TEST_DB) throw new Error('Postgres test fixture required (REQUIRE_TEST_DB=1)')
@@ -94,13 +97,13 @@ before(async () => {
 })
 
 after(async () => {
-  if (pgAvailable) {
-    try {
-      await resetSchema()
-    } catch {
-      /* ignore */
+  try {
+    if (pgAvailable) {
+      await closePool()
     }
-    await closePool()
+  } finally {
+    if (previousRuntimeChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL
+    else process.env.OC_RUNTIME_CHANNEL = previousRuntimeChannel
   }
 })
 

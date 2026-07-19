@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-03 集成测试:完整跑一次所有内置迁移,验证
@@ -30,17 +31,7 @@ const REQUIRE_TEST_DB =
 let pgAvailable = false;
 
 async function cleanCommercialSchema(): Promise<void> {
-  const rows = await query<{ table_name: string }>(
-    `SELECT table_name
-       FROM information_schema.tables
-      WHERE table_schema = 'public'
-        AND table_type = 'BASE TABLE'`,
-  );
-  if (rows.rows.length === 0) return;
-  const quoted = rows.rows
-    .map((r) => `"${r.table_name.replaceAll('"', '""')}"`)
-    .join(", ");
-  await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
+  await resetTestSchemaForTest();
 }
 
 async function probe(): Promise<boolean> {
@@ -77,8 +68,14 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
-    await closePool();
+    // 门禁审计批F 根治:teardown 留"全量迁移稳定态"给后继文件(公民守则见 helpers/db.ts);
+    // 旧白名单清场(掀迁移账本留表)会毒化后继文件的 runMigrations(42P07)。
+    try {
+      await resetTestSchemaForTest();
+      await runMigrations();
+    } finally {
+      await closePool();
+    }
   }
 });
 
@@ -184,7 +181,7 @@ describe("full migration suite", () => {
     const tp = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM topup_plans",
     );
-    assert.equal(tp.rows[0].cnt, "4");
+    assert.equal(tp.rows[0].cnt, "8");
 
     // 验证关键种子值(防止单价被误改)
     const sonnet = await query<{ input_per_mtok: string; multiplier: string }>(
@@ -648,15 +645,17 @@ describe("full migration suite", () => {
     const subId = sub.rows[0].id;
 
     await query(
-      `INSERT INTO agent_containers(user_id, subscription_id, docker_name, workspace_volume, home_volume, image)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+      `INSERT INTO agent_containers(
+         user_id, subscription_id, docker_name, workspace_volume, home_volume, image, secret_hash
+       ) VALUES ($1, $2, $3, $4, $5, $6, decode(repeat('ab', 32), 'hex'))`,
       [userId, subId, `agent-u${userId}`, `agent-u${userId}-workspace`, `agent-u${userId}-home`, "openclaude/agent:v1"],
     );
 
     await assert.rejects(
       query(
-        `INSERT INTO agent_containers(user_id, subscription_id, docker_name, workspace_volume, home_volume, image)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+        `INSERT INTO agent_containers(
+           user_id, subscription_id, docker_name, workspace_volume, home_volume, image, secret_hash
+         ) VALUES ($1, $2, $3, $4, $5, $6, decode(repeat('cd', 32), 'hex'))`,
         [userId, subId, `agent-u${userId}-2`, `agent-u${userId}-ws2`, `agent-u${userId}-home2`, "openclaude/agent:v1"],
       ),
       /duplicate key value|agent_containers_user_id_key/i,

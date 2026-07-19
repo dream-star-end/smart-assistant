@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { QueryResult, QueryResultRow } from "pg";
 import { createPool, closePool, setPoolOverride } from "../db/index.js";
 import { query, tx, type QueryRunner } from "../db/queries.js";
-import { truncateAllForTest } from "./helpers/db.js";
+import { resetTestSchemaForTest, truncateAllForTest } from "./helpers/db.js";
 
 /**
  * T-01f db 集成测试。
@@ -167,6 +167,29 @@ describe("db.integ", () => {
     };
     await assert.rejects(
       truncateAllForTest(["_db_integ_demo"], stub),
+      /refuses to run against non-test database/,
+    );
+  });
+
+  test("resetTestSchemaForTest refuses to run against non-test database", async () => {
+    const stub: QueryRunner = {
+      async query<Row extends QueryResultRow = QueryResultRow>(
+        sql: string,
+      ): Promise<QueryResult<Row>> {
+        if (/current_database/i.test(sql)) {
+          return {
+            rows: [{ db: "production_db" } as unknown as Row],
+            rowCount: 1,
+            command: "SELECT",
+            oid: 0,
+            fields: [],
+          };
+        }
+        throw new Error(`stub should not see destructive SQL: ${sql}`);
+      },
+    };
+    await assert.rejects(
+      resetTestSchemaForTest(stub),
       /refuses to run against non-test database/,
     );
   });

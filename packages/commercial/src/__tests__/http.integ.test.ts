@@ -6,6 +6,7 @@ import IORedis from "ioredis";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { createCommercialHandler } from "../http/router.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { signAccess } from "../auth/jwt.js";
@@ -28,27 +29,6 @@ const TEST_REDIS_URL =
   process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "system_settings",
-  "schema_migrations",
-];
 
 const JWT_SECRET = "y".repeat(64);
 
@@ -103,21 +83,9 @@ before(async () => {
     await resetPool();
     const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
     setPoolOverride(pool);
-    await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+    await resetTestSchemaForTest();
     await runMigrations();
     await warmupLoginDummyHash();
-    // 2026-05-25:DEFAULTS.allow_registration 翻 false(生产关停)。这套 HTTP
-    // 集成 case 大量用 POST /api/auth/register 走打通流;handler 前置门会先于
-    // rate-limit / 业务逻辑判定 allow_registration,默认 false 会让所有 register
-    // 路径直接 403 REGISTRATION_DISABLED。UPSERT row=true 让 row 命中覆盖默认,
-    // beforeEach 不 TRUNCATE system_settings(见 COMMERCIAL_TABLES 列表也没动)→
-    // 单次设置全套共享。
-    await query(
-      `INSERT INTO system_settings(key, value, updated_at)
-       VALUES ('allow_registration', 'true'::jsonb, NOW())
-       ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value, updated_at = NOW()`,
-    );
   } else if (REQUIRE_TEST_DB) {
     throw new Error("Postgres test fixture required");
   }
@@ -169,7 +137,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     await closePool();
   }
 });
@@ -177,6 +145,14 @@ after(async () => {
 beforeEach(async () => {
   if (!pgAvailable || !redis) return;
   await query("TRUNCATE TABLE refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  // users 的 TRUNCATE ... CASCADE 会连带清掉带 updated_by FK 的 system_settings。
+  // 这套 HTTP case 需要注册前置门放行，因此每个 case 都显式恢复 true。
+  await query(
+    `INSERT INTO system_settings(key, value, updated_at)
+     VALUES ('allow_registration', 'true'::jsonb, NOW())
+     ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = NOW()`,
+  );
   await redis.flushdb();
   mailer.sent.length = 0;
 });
@@ -202,6 +178,22 @@ async function postJson(path: string, body: unknown, headers?: Record<string, st
   let json: Record<string, unknown> = {};
   try { json = (await r.json()) as Record<string, unknown>; } catch { /* empty body */ }
   return { status: r.status, json, headers: r.headers };
+}
+
+async function waitForBlockedRateLimitEvents(
+  scope: string,
+  timeoutMs = 2_000,
+): Promise<Array<{ key: string }>> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const result = await query<{ key: string }>(
+      "SELECT key FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE ORDER BY id",
+      [scope],
+    );
+    if (result.rows.length > 0) return result.rows;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } while (Date.now() < deadline);
+  return [];
 }
 
 async function getJson(path: string, headers?: Record<string, string>): Promise<{
@@ -555,12 +547,9 @@ describe("commercial HTTP router (integ)", () => {
       assert.ok(r4.headers.get("retry-after"));
       // rate_limit_events 落库:scope=verify_email_smoke_email,key=sha256 前缀
       // (绝不是明文 email)
-      const ev = await query<{ key: string }>(
-        "SELECT key FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
-        ["verify_email_smoke_email"],
-      );
-      assert.equal(ev.rows.length, 1, "exactly 1 blocked event");
-      const id = ev.rows[0].key;
+      const events = await waitForBlockedRateLimitEvents("verify_email_smoke_email");
+      assert.equal(events.length, 1, "exactly 1 blocked event");
+      const id = events[0].key;
       assert.match(id, /^[0-9a-f]{16}$/, `key must be 16-hex sha256 prefix, got: ${id}`);
       assert.ok(!id.includes("@"), "key must not contain plaintext email");
     } finally {
@@ -617,11 +606,8 @@ describe("commercial HTTP router (integ)", () => {
       });
       assert.equal(r.status, 429);
       assert.ok(r.headers.get("retry-after"));
-      const ev = await query<{ cnt: string }>(
-        "SELECT COUNT(*)::text AS cnt FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
-        ["register_tight"],
-      );
-      assert.equal(ev.rows[0].cnt, "1", "blocked event must be recorded");
+      const events = await waitForBlockedRateLimitEvents("register_tight");
+      assert.equal(events.length, 1, "blocked event must be recorded");
     } finally {
       await new Promise<void>((resolve) => tightServer.close(() => resolve()));
     }
@@ -679,7 +665,7 @@ describe("commercial HTTP router (integ)", () => {
       );
       assert.equal(u.rows[0].cnt, "0", "blocked register 不应落用户行");
     } finally {
-      // beforeEach 不 TRUNCATE system_settings → 必须显式清,免得污染后续 case
+      // 显式清掉本 case 写入的 blocklist，保持测试结束状态直观。
       await query(
         "DELETE FROM system_settings WHERE key = 'register_email_domain_blocklist'",
       );

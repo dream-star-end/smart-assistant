@@ -22,6 +22,7 @@ import { hashSecret } from '../auth/containerIdentity.js'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
 import { publishSkillVersion, reviewVersion } from '../marketplace/marketplaceDb.js'
 import {
@@ -173,7 +174,7 @@ function connectorSpec(slug: string): Record<string, unknown> {
 }
 
 async function resetSchema(): Promise<void> {
-  await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
+  await resetTestSchemaForTest()
 }
 async function probe(): Promise<boolean> {
   const p = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 })
@@ -200,7 +201,6 @@ before(async () => {
 })
 after(async () => {
   if (pgAvailable) {
-    try { await resetSchema() } catch {}
     await closePool()
   }
 })

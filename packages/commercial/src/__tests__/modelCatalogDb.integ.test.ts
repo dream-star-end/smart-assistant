@@ -10,6 +10,7 @@ import {
 import { createPool, closePool, setPoolOverride, resetPool, getPool } from "../db/index.js";
 import { query, tx } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { loadCatalogSnapshot } from "../billing/modelCatalog.js";
 import { PricingCache } from "../billing/pricing.js";
 
@@ -61,14 +62,7 @@ async function probe(): Promise<boolean> {
 }
 
 async function dropSchema(): Promise<void> {
-  const rows = await query<{ table_name: string }>(
-    `SELECT table_name FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
-  );
-  if (rows.rows.length > 0) {
-    const quoted = rows.rows.map((r) => `"${r.table_name.replaceAll('"', '""')}"`).join(", ");
-    await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
-  }
+  await resetTestSchemaForTest();
 }
 
 before(async () => {
@@ -91,13 +85,14 @@ before(async () => {
 
 after(async () => {
   if (!pgAvailable) return;
+  // 本套会禁用/退休/删除权威模型行；结束时必须把共享 fixture 恢复为全迁移种子态。
   try {
-    await dropSchema();
-  } catch {
-    /* ignore */
+    await resetTestSchemaForTest();
+    await runMigrations();
+  } finally {
+    await closePool();
+    await resetPool();
   }
-  await closePool();
-  await resetPool();
 });
 
 /**
@@ -140,6 +135,7 @@ function expectedContextWindow(modelId: string): number | null {
   if (m === "glm-5.1") return 200_000;
   if (m === "qwen3.7-max" || m === "qwen3.7-plus") return 1_000_000;
   if (m === "kimi-k2.7-code") return 256_000;
+  if (m === "kimi-k3") return 1_048_576;
   return 200_000;
 }
 

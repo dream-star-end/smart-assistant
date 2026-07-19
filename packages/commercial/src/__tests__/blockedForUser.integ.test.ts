@@ -36,27 +36,6 @@ const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0"
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const JWT_SECRET = "z".repeat(64);
 
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "system_settings", // 0016 —— 其他 integ test 漏列这张;裸 DROP IF EXISTS 不影响
-  "users",
-  "schema_migrations",
-];
-
 let pgAvailable = false;
 let redis: IORedis | null = null;
 let server: Server | null = null;
@@ -130,7 +109,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    // 门禁审计批F 根治:teardown 不再掀 schema/迁移账本——结束时必须留全量迁移稳定态给后继文件(公民守则见 helpers/db.ts)
     await closePool();
   }
 });

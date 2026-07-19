@@ -5,6 +5,7 @@ import { Client, Pool } from "pg";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query, tx } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
 
 /**
@@ -74,14 +75,7 @@ async function probe(): Promise<boolean> {
 }
 
 async function dropSchema(): Promise<void> {
-  const rows = await query<{ table_name: string }>(
-    `SELECT table_name FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
-  );
-  if (rows.rows.length > 0) {
-    const quoted = rows.rows.map((r) => `"${r.table_name.replaceAll('"', '""')}"`).join(", ");
-    await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
-  }
+  await resetTestSchemaForTest();
 }
 
 /** 期望 SQL 被 DB 拒绝,并且错误信息命中 needle。 */
@@ -188,11 +182,6 @@ after(async () => {
     await query(`DROP ROLE IF EXISTS ${APP_ROLE}`);
     await query(`DROP ROLE IF EXISTS ${ADMIN_ROLE}`);
     await query(`DROP ROLE IF EXISTS ${DEPLOY_ROLE}`);
-  } catch {
-    /* ignore */
-  }
-  try {
-    await dropSchema();
   } catch {
     /* ignore */
   }

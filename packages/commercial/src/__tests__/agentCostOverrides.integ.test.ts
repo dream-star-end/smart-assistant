@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -50,13 +51,12 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
   setPoolOverride(pool);
-  await query("DROP TABLE IF EXISTS agent_cost_overrides CASCADE");
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try { await query("DROP TABLE IF EXISTS agent_cost_overrides CASCADE"); } catch { /* */ }
     await closePool();
   }
 });

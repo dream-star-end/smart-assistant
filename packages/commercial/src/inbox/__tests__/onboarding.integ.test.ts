@@ -23,6 +23,7 @@ import {
 } from "../../db/index.js";
 import { query } from "../../db/queries.js";
 import { runMigrations } from "../../db/migrate.js";
+import { resetTestSchemaForTest } from "../../__tests__/helpers/db.js";
 import { runOnboardingTick, _internal } from "../onboarding.js";
 
 const TEST_DB_URL =
@@ -32,44 +33,6 @@ const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB
 // 所有 commercial migration 创建的表;DROP CASCADE 时必须显式枚举,
 // 因为 CASCADE 只断 FK 不删未列出的表本身。
 // 来源: `grep CREATE TABLE packages/commercial/src/db/migrations/*.sql`。
-const COMMERCIAL_TABLES = [
-  "account_refresh_events",
-  "admin_alert_channels",
-  "admin_alert_outbox",
-  "admin_alert_rule_state",
-  "admin_alert_silences",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_cost_overrides",
-  "agent_subscriptions",
-  "claude_accounts",
-  "compute_host_audit",
-  "compute_hosts",
-  "compute_pool_state",
-  "credit_ledger",
-  "egress_proxies",
-  "email_verifications",
-  "feedback",
-  "inbox_message_assets",
-  "inbox_message_reads",
-  "inbox_messages",
-  "model_pricing",
-  "model_visibility_grants",
-  "oauth_identities",
-  "orders",
-  "rate_limit_events",
-  "refresh_tokens",
-  "request_finalize_journal",
-  "schema_migrations",
-  "system_settings",
-  "topup_plans",
-  "usage_records",
-  "user_preferences",
-  "user_remote_hosts",
-  "users",
-];
-
 let pgAvailable = false;
 
 async function probePg(): Promise<boolean> {
@@ -93,13 +56,12 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
     await closePool();
   }
 });

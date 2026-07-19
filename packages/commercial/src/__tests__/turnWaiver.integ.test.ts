@@ -7,6 +7,7 @@ import { lockTurnBillingKeys } from '../billing/turnLock.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 import { resolveLegacyWaiverTurnKey } from '../http/internalTurnWaive.js'
 
 const TEST_DB_URL =
@@ -14,17 +15,8 @@ const TEST_DB_URL =
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 let pgAvailable = false
 
-function assertTestDatabase(url: string): void {
-  const name = new URL(url).pathname.replace(/^\//, '')
-  if (!name.endsWith('_test')) {
-    throw new Error(`refusing to reset non-test database: ${name}`)
-  }
-}
-
 async function cleanSchema(): Promise<void> {
-  assertTestDatabase(TEST_DB_URL)
-  await query('DROP SCHEMA IF EXISTS public CASCADE')
-  await query('CREATE SCHEMA public')
+  await resetTestSchemaForTest()
   await query('GRANT ALL ON SCHEMA public TO public')
 }
 
@@ -51,7 +43,6 @@ before(async () => {
 
 after(async () => {
   if (!pgAvailable) return
-  await cleanSchema().catch(() => {})
   await closePool()
 })
 
