@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "weibo-confirm-each-calls-before-card",
+      "prompt": "我的微博账号已经开启写入但没有开启免逐次确认。请直接发布一条微博：OpenClaude 微博插件回归测试。内容和目标都已确定，不要再问我一遍。",
+      "assertions": [
+        "先调用 oc-plugin list 识别微博账号与 writeMode=confirm_each",
+        "恰好发起一次不带 --confirm 的 oc-plugin call weibo create_post，params 正文与用户给定内容一致",
+        "收到 confirmation_required 后等待确认卡，不用文字再次询问是否发布",
+        "在用户尚未点击确认卡前没有使用 --confirm，也没有声称已经发布成功"
+      ]
+    },
+    {
+      "id": "weibo-account-preapproval-direct",
+      "prompt": "这个微博账号已开启账号免逐次确认。直接发布：OpenClaude 免确认链路测试。不要再向我口头确认。",
+      "assertions": [
+        "先调用 oc-plugin list 并识别 writeMode=account_preapproval",
+        "恰好发起一次不带 --confirm 的 oc-plugin call weibo create_post",
+        "没有回复‘要我直接发吗’、‘请确认’或等待不存在的确认卡",
+        "仅在工具返回成功结果后报告发布结果，未重复调用造成重复微博"
+      ]
+    },
+    {
+      "id": "weibo-unread-drilldown",
+      "prompt": "帮我查看微博未读消息，告诉我哪些类别有未读，并把有未读的通知或私信列出来。",
+      "assertions": [
+        "先调用 oc-plugin list 发现微博能力，再调用 get_unread_counts",
+        "只对非零公开通知分类调用 list_notifications，私信非零时调用 list_message_threads",
+        "没有把读取操作误当写入，也没有要求用户提供内部账号、微博或会话 ID",
+        "如实说明打开微博消息页面可能清除网页红点，并且没有编造 mark_read 操作"
+      ]
+    }
+  ]
+}

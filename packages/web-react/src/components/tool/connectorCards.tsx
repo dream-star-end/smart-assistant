@@ -35,14 +35,14 @@ import {
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { ApiError } from "../../lib/api";
 import {
+  type ConnectorConfirmTrigger,
+  type ConnectorConfirmationDetail,
   confirmActionLabel,
   confirmStatusLabel,
   confirmStatusTone,
   connectorErrorText,
   connectorIcon,
   isConfirmExpired,
-  type ConnectorConfirmationDetail,
-  type ConnectorConfirmTrigger,
 } from "../../lib/connectors";
 import { cn } from "../../lib/utils";
 import { Button, Spinner } from "../ui";
@@ -148,6 +148,13 @@ const DETAIL_KEY_LABEL: Record<string, string> = {
   chat: "会话",
   message: "消息内容",
   url: "地址",
+  userId: "微博用户 ID",
+  postId: "微博 ID",
+  commentId: "评论 ID",
+  liked: "点赞状态",
+  favorited: "收藏状态",
+  irreversible: "不可撤销",
+  warning: "风险提示",
 };
 
 function detailKeyLabel(key: string): string {
@@ -291,7 +298,7 @@ export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTri
   // 服务端返回的 id 与卡片 id 不一致（不该发生）→ 视为无法核验，禁用一切操作。
   const unverified = detail !== null && detail.id !== trigger.id;
   const Icon = connectorIcon(detail?.provider ?? "");
-  const actionLabel = detail ? confirmActionLabel(detail.action) : "";
+  const actionLabel = detail ? confirmActionLabel(detail.action, detail.provider) : "";
   // 展示状态：决策回写 > 服务端 status；服务端说 pending 但时钟已过期 → 按 expired 显示（防御）。
   const rawStatus = decidedStatus ?? detail?.status ?? null;
   const expiredByClock = detail ? isConfirmExpired(detail.expiresAt) : false;

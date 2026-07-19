@@ -253,6 +253,21 @@ export function buildWriteSummary(
         `用微博${hint}把用户 ${String(params.userId ?? '')} 设置为${params.following === true ? '已关注' : '未关注'}`,
         2000,
       )
+    case 'weibo/send_message':
+      return ellipsize(
+        `用微博${hint}向用户 ${String(params.userId ?? '')} 发送私信：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'weibo/set_post_favorite':
+      return ellipsize(
+        `用微博${hint}把微博 ${String(params.postId ?? '')} 设置为${params.favorited === true ? '已收藏' : '未收藏'}`,
+        2000,
+      )
+    case 'weibo/set_comment_like':
+      return ellipsize(
+        `用微博${hint}把评论 ${String(params.commentId ?? '')} 设置为${params.liked === true ? '已点赞' : '未点赞'}`,
+        2000,
+      )
     default:
       return ellipsize(`${provider} 写操作 ${action}`, 2000)
   }
@@ -405,6 +420,8 @@ export function buildWriteDetail(
         userId: String(params.userId ?? ''),
         postId: String(params.postId ?? ''),
         commentId: String(params.commentId ?? ''),
+        targetKind:
+          (params.deleteSnapshot as Record<string, unknown> | undefined)?.targetKind ?? '',
         irreversible: true,
       }
     case 'weibo/repost_post':
@@ -426,6 +443,28 @@ export function buildWriteDetail(
         kind: 'weibo_following',
         userId: String(params.userId ?? ''),
         following: params.following === true,
+      }
+    case 'weibo/send_message':
+      return {
+        kind: 'weibo_private_message',
+        userId: String(params.userId ?? ''),
+        text: String(params.text ?? ''),
+        warning: '微博私信属于非公开通信，请确认接收人和内容无误。',
+      }
+    case 'weibo/set_post_favorite':
+      return {
+        kind: 'weibo_post_favorite',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        favorited: params.favorited === true,
+      }
+    case 'weibo/set_comment_like':
+      return {
+        kind: 'weibo_comment_like',
+        userId: String(params.userId ?? ''),
+        postId: String(params.postId ?? ''),
+        commentId: String(params.commentId ?? ''),
+        liked: params.liked === true,
       }
     default:
       // 兜底:原样返回(params 本身已过严格 schema,无凭据)

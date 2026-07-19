@@ -1,17 +1,18 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer } from "./MessageRenderer";
-import type { CardCallbacks } from "./chat/cards";
 import type { PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
+import type { CardCallbacks } from "./chat/cards";
 import {
   THINKING_HEADLINES_ONLY,
   THINKING_MULTI_SEGMENT,
 } from "./tool/__fixtures__/sessionToolTexts";
+import { ChatInteractionContext, ToolCardActionsContext } from "./tool/context";
 
 afterEach(cleanup);
 
@@ -206,6 +207,55 @@ describe("tool / agent-group 集成", () => {
   test("tool role → 委托 ToolCard 渲染（完成态）", () => {
     renderMsg(mk("tool", { toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "x" }));
     expect(screen.getByText("完成")).toBeInTheDocument();
+  });
+
+  test("历史持久化的微博 confirmation_required Bash 工具行恢复为可操作确认卡", async () => {
+    const confirmationId = "315bfd38-7d9f-4a69-8e74-6d34e52aad50";
+    const message = mk("tool", {
+      id: "persisted-weibo-confirmation",
+      toolName: "Bash",
+      inputJson: {
+        command: `echo '{"text":"测试微博"}' | oc-plugin call weibo create_post 2>&1`,
+      },
+      output: `${JSON.stringify({
+        oc_connect: { type: "confirmation_required", id: confirmationId },
+      })}\n写操作需要确认`,
+      error: false,
+      _completed: true,
+    });
+    const getDetail = vi.fn().mockResolvedValue({
+      id: confirmationId,
+      provider: "weibo",
+      action: "create_post",
+      summary: "发布微博：测试微博",
+      detail: { text: "测试微博" },
+      status: "pending",
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    const decide = vi.fn();
+    const sendUserText = vi.fn();
+    const { container } = render(
+      <ToolCardActionsContext.Provider value={{ connectorConfirm: { getDetail, decide } }}>
+        <ChatInteractionContext.Provider value={{ sendUserText }}>
+          <MessageRenderer
+            message={message}
+            sig={messageSignature(message, { isLast: true, sending: false })}
+            isLast
+            sending={false}
+            inActiveTurn={false}
+            cb={{}}
+            onRespondPermission={() => {}}
+          />
+        </ChatInteractionContext.Provider>
+      </ToolCardActionsContext.Provider>,
+    );
+
+    expect(await screen.findByText("写操作待确认 · 发布微博")).toBeInTheDocument();
+    expect(screen.getByText("发布微博：测试微博")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "确认执行" })).toBeEnabled());
+    expect(getDetail).toHaveBeenCalledWith(confirmationId);
+    expect(container.textContent).not.toContain("oc_connect");
+    expect(container.textContent).not.toContain("oc-plugin call");
   });
 
   const TODO_TOOL = () =>

@@ -29,7 +29,7 @@ function framed(value: unknown): Buffer {
 
 describe('official Weibo Plugin', () => {
   test('pins one exact platform artifact and has no compatible predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.1.0')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.2.0')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(
@@ -80,6 +80,16 @@ describe('official Weibo Plugin', () => {
         'get_post',
         'list_comments',
         'search_posts',
+        'get_unread_counts',
+        'list_notifications',
+        'list_message_threads',
+        'get_message_thread',
+        'list_followers',
+        'list_following',
+        'search_users',
+        'list_favorites',
+        'list_liked_posts',
+        'list_hot_searches',
         'create_post',
         'edit_post',
         'delete_post',
@@ -89,29 +99,34 @@ describe('official Weibo Plugin', () => {
         'repost_post',
         'set_post_like',
         'set_following',
+        'send_message',
+        'set_post_favorite',
+        'set_comment_like',
       ],
     )
     assert.equal(
       WEIBO_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'read').length,
-      7,
+      17,
     )
     assert.equal(
       WEIBO_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'write').length,
-      9,
+      12,
     )
     for (const action of WEIBO_PLUGIN_CONTRACT.actions.filter(
       (candidate) => candidate.effect === 'write',
     ))
       assert.match(action.description, /逐次确认/)
     const writePolicy = managedPluginWritePolicy(WEIBO_PLUGIN_SLUG)
-    assert.equal(writePolicy?.version, 2)
+    assert.equal(writePolicy?.version, 3)
     assert.match(writePolicy?.disclaimerText ?? '', /默认每一次写操作仍须.*确认卡/)
     assert.match(writePolicy?.disclaimerText ?? '', /独立的账号级高风险声明/)
     const preapprovalPolicy = managedPluginWritePreapprovalPolicy(WEIBO_PLUGIN_SLUG)
-    assert.equal(preapprovalPolicy?.version, 1)
+    assert.equal(preapprovalPolicy?.version, 2)
     assert.match(preapprovalPolicy?.disclaimerText ?? '', /发布文字或图片微博/)
     assert.match(preapprovalPolicy?.disclaimerText ?? '', /删除不可撤销/)
-    assert.match(preapprovalPolicy?.disclaimerText ?? '', /点赞和关注/)
+    assert.match(preapprovalPolicy?.disclaimerText ?? '', /点赞.*关注/)
+    assert.match(preapprovalPolicy?.disclaimerText ?? '', /发送私信/)
+    assert.match(preapprovalPolicy?.disclaimerText ?? '', /收藏/)
     assert.match(preapprovalPolicy?.disclaimerText ?? '', /派发围栏/)
   })
 
@@ -202,9 +217,20 @@ describe('official Weibo Plugin', () => {
     assert.match(WEIBO_WORKER_SOURCE, /detailAvailable: false/)
     assert.match(
       WEIBO_WORKER_SOURCE,
-      /input\.actionId === 'search_posts' \? null : await ensureSelfId/,
+      /\['search_posts', 'search_users'\]\.includes\(input\.actionId\) \? null : await ensureSelfId/,
     )
     assert.doesNotMatch(WEIBO_WORKER_SOURCE, /__react|reactProps|webpackChunk/)
+    assert.doesNotMatch(WEIBO_WORKER_SOURCE, /__vue__|context\.request|page\.request/)
+    assert.match(WEIBO_WORKER_SOURCE, /\.lite-msg-list/)
+    assert.match(WEIBO_WORKER_SOURCE, /a\[href\*="\/u\/"\]/)
+    assert.match(WEIBO_WORKER_SOURCE, /\.card-user-b/)
+    assert.match(WEIBO_WORKER_SOURCE, /\.lite-bubble-time,\.lite-bubble-list/)
+    assert.match(WEIBO_WORKER_SOURCE, /\.lite-page-editor textarea:not\(\.shadow\)/)
+    assert.match(WEIBO_WORKER_SOURCE, /current\.pathname !== '\/message\/chat'/)
+    assert.match(
+      WEIBO_WORKER_SOURCE,
+      /await awaitDispatch\(\);\n {4}const fresh = await prepareMessageComposer/,
+    )
     assert.ok(
       WEIBO_WORKER_SOURCE.indexOf('await awaitDispatch();') <
         WEIBO_WORKER_SOURCE.indexOf('await fileInput.setInputFiles(files);'),

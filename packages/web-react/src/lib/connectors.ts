@@ -481,11 +481,27 @@ const CONFIRM_ACTION_LABEL: Record<string, string> = {
   create_page: "创建页面",
   create_calendar_event: "创建日历事件",
   send_message: "发送消息",
+  "weibo/create_post": "发布微博",
+  "weibo/edit_post": "编辑微博",
+  "weibo/delete_post": "删除微博",
+  "weibo/create_comment": "发布微博评论",
+  "weibo/reply_comment": "回复微博评论",
+  "weibo/delete_comment": "删除微博评论",
+  "weibo/repost_post": "转发微博",
+  "weibo/set_post_like": "设置微博点赞",
+  "weibo/set_following": "设置微博关注",
+  "weibo/send_message": "发送微博私信",
+  "weibo/set_post_favorite": "设置微博收藏",
+  "weibo/set_comment_like": "设置评论点赞",
 };
 
 /** 写动作 → 中文名（未知动作回退原文，不吞未知类型）。 */
-export function confirmActionLabel(action: string): string {
-  return CONFIRM_ACTION_LABEL[action] || action;
+export function confirmActionLabel(action: string, provider?: string): string {
+  return (
+    CONFIRM_ACTION_LABEL[provider ? `${provider}/${action}` : action] ||
+    CONFIRM_ACTION_LABEL[action] ||
+    action
+  );
 }
 
 const CONFIRM_STATUS_LABEL: Record<ConnectorConfirmStatus, string> = {

@@ -12,8 +12,8 @@
  *
  * 安全边界(全部由本层 + master 共同保证):
  *   - params 一律从 **stdin** 读 JSON(禁走 argv——argv 经 /proc 可被同容器进程读到);无 stdin 视为 {}。
- *   - 写操作(★)不直接执行:master 返回 confirmation_required,前端确认卡引导用户点确认,
- *     再用 `--confirm <id>` 重放执行(执行时不接受模型重新提交的 params)。
+ *   - API 连接器写操作不直接执行；Plugin 写操作由账号 writeMode 决定：逐次确认时 master
+ *     返回 confirmation_required，账号免确认时由 master 直接执行。确认重放始终只认账本 params。
  *   - 第三方正文/文件列表等 **外部内容** 打印时包裹不可信标记(辅助标记,非安全边界)。
  *   - 上游错误不透传,只映射稳定错误码;输出绝不含 token/凭据(客户端本就拿不到,再做防御性脱敏)。
  *
@@ -121,7 +121,7 @@ function usage(surface: CliSurface): string {
       ? '  --account <targetId>       指定目标(同一 Plugin 有多个账户时必填)'
       : '  --account <connectionId>   指定连接(同一 provider 有多个连接时必填)',
     plugin
-      ? '  --confirm <id>             执行已被用户确认的 declarative-http 写操作'
+      ? '  --confirm <id>             执行已被用户在确认卡批准的 Plugin 写操作'
       : '  --confirm <id>             执行已被用户确认的写操作(凭确认卡返回的 id)',
     '  --out <file>               结果含文件时,解码 base64 落盘到 <file>(只打印路径与大小)',
   ].join('\n')
@@ -239,13 +239,26 @@ function formatConnections(connections: any[], surface: CliSurface): string {
     const hint = c?.accountHint ? ` (${c.accountHint})` : ''
     const status = c?.status === 'error' ? 'error（需重新绑定）' : String(c?.status ?? '')
     lines.push(`${c?.provider ?? '?'} · ${name}${hint}  [id: ${c?.id ?? '?'}  状态: ${status}]`)
+    if (surface.rpcSurface === 'plugins' && typeof c?.writeMode === 'string') {
+      const writeMode =
+        c.writeMode === 'account_preapproval'
+          ? '账号免逐次确认（写操作直接执行，不展示确认卡）'
+          : c.writeMode === 'confirm_each'
+            ? '逐次确认（写操作先展示确认卡）'
+            : '关闭（仅可读取）'
+      lines.push(`    写入模式: ${writeMode}`)
+    }
     const actions = Array.isArray(c?.actions) ? c.actions : []
     if (!actions.length) {
       lines.push('    (无可用操作)')
     } else {
       lines.push('    可用操作:')
       for (const a of actions) {
-        const mark = a?.readOnly ? '[只读]' : '[写·需确认]'
+        const mark = a?.readOnly
+          ? '[只读]'
+          : c?.writeMode === 'account_preapproval'
+            ? '[写·账号免确认]'
+            : '[写·需确认]'
         const desc = a?.description ? `  ${a.description}` : ''
         lines.push(`      - ${a?.id ?? '?'}  ${mark}${desc}`)
       }

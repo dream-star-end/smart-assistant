@@ -11,7 +11,7 @@ describe('oc-plugin shared CLI surface', () => {
     assert.match(help.stdout, /Usage: oc-plugin/)
     assert.doesNotMatch(help.stdout, /Usage: oc-connect/)
     assert.match(help.stdout, /--confirm/)
-    assert.match(help.stdout, /declarative-http/)
+    assert.match(help.stdout, /确认卡批准的 Plugin 写操作/)
 
     const list = await runOcPluginCli(['list'], {
       transport: async () => ({
@@ -30,6 +30,50 @@ describe('oc-plugin shared CLI surface', () => {
     assert.match(list.stdout, /可调用的插件/)
     assert.match(list.stdout, /local-reader/)
     assert.match(list.stdout, /plugin:51/)
+  })
+
+  test('shows managed account write mode so the Agent does not invent a second confirmation', async () => {
+    const list = await runOcPluginCli(['list'], {
+      transport: async () => ({
+        plugins: [
+          {
+            id: '3',
+            provider: 'weibo',
+            displayName: '微博',
+            status: 'active',
+            pluginType: 'managed-browser',
+            writeMode: 'account_preapproval',
+            actions: [
+              { id: 'get_self', description: '读取当前账号', readOnly: true },
+              { id: 'create_post', description: '发布微博', readOnly: false },
+            ],
+          },
+          {
+            id: '4',
+            provider: 'knowledge-planet',
+            displayName: '知识星球',
+            status: 'active',
+            pluginType: 'managed-browser',
+            writeMode: 'confirm_each',
+            actions: [{ id: 'create_topic', description: '发布主题', readOnly: false }],
+          },
+          {
+            id: '5',
+            provider: 'read-only-browser',
+            displayName: '只读网页',
+            status: 'active',
+            pluginType: 'managed-browser',
+            writeMode: 'disabled',
+            actions: [{ id: 'read', description: '读取', readOnly: true }],
+          },
+        ],
+      }),
+    })
+    assert.match(list.stdout, /写入模式: 账号免逐次确认（写操作直接执行，不展示确认卡）/)
+    assert.match(list.stdout, /create_post {2}\[写·账号免确认\]/)
+    assert.match(list.stdout, /写入模式: 逐次确认（写操作先展示确认卡）/)
+    assert.match(list.stdout, /create_topic {2}\[写·需确认\]/)
+    assert.match(list.stdout, /写入模式: 关闭（仅可读取）/)
   })
 
   test('passes declarative Plugin write confirmation without reading stdin', async () => {

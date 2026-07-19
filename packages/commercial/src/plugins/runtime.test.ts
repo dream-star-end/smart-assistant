@@ -235,7 +235,7 @@ describe('Plugin runtime facade', () => {
     )
   })
 
-  test('seals Weibo destructive writes only to the exact owned post or comment identity', async () => {
+  test('seals Weibo destructive writes only to an owned post, own comment, or received comment on an owned post', async () => {
     const facade = new PluginRuntimeFacade({
       pool: { query: async () => result([]) } as never,
       redis: null,
@@ -308,6 +308,62 @@ describe('Plugin runtime facade', () => {
         error.code === 'BAD_REQUEST' &&
         /snapshot/.test(error.message),
     )
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      if (input.actionId === 'list_comments')
+        return {
+          comments: [
+            {
+              id: '778899',
+              postId: 'AbCdE',
+              owned: true,
+              contentDigest: 'd'.repeat(64),
+            },
+          ],
+        }
+      throw new Error('unexpected read')
+    }
+    const ownComment = await prepare({
+      ...base,
+      actionId: 'delete_comment',
+      params: { userId: '12345', postId: 'AbCdE', commentId: '778899' },
+    })
+    assert.deepEqual(ownComment.deleteSnapshot, {
+      expectedDigest: 'd'.repeat(64),
+      targetKind: 'own_comment',
+    })
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      if (input.actionId === 'list_comments')
+        return {
+          comments: [
+            {
+              id: '778899',
+              postId: 'AbCdE',
+              owned: false,
+              contentDigest: 'e'.repeat(64),
+            },
+          ],
+        }
+      if (input.actionId === 'get_post')
+        return {
+          post: {
+            id: 'AbCdE',
+            userId: '12345',
+            owned: true,
+            contentDigest: 'f'.repeat(64),
+          },
+        }
+      throw new Error('unexpected read')
+    }
+    const receivedComment = await prepare({
+      ...base,
+      actionId: 'delete_comment',
+      params: { userId: '12345', postId: 'AbCdE', commentId: '778899' },
+    })
+    assert.deepEqual(receivedComment.deleteSnapshot, {
+      expectedDigest: 'e'.repeat(64),
+      targetKind: 'received_on_own_post',
+      postExpectedDigest: 'f'.repeat(64),
+    })
 
     await assert.rejects(
       prepare({

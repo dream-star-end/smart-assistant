@@ -115,6 +115,8 @@ export interface RuntimePluginTargetEntry {
   accountHint: string
   status: 'active'
   actions: Array<{ id: string; description: string; readOnly: boolean }>
+  /** Managed-browser write gate projected for the Agent CLI; omitted for local Plugins. */
+  writeMode?: 'disabled' | 'confirm_each' | 'account_preapproval'
 }
 
 export type RuntimePluginWriteExecution =
@@ -692,6 +694,7 @@ export class PluginRuntimeFacade {
         !this.browser.supportsContract(item.contract)
       )
         continue
+      const writeControl = writeControlFor(row.provider, item.contract.actions, row)
       managedTargets.push({
         id: row.id,
         provider: row.provider,
@@ -700,12 +703,17 @@ export class PluginRuntimeFacade {
         accountHint: typeof row.meta?.account_hint === 'string' ? row.meta.account_hint : '',
         status: 'active',
         actions: item.contract.actions
-          .filter(
-            (action) =>
-              action.effect === 'read' ||
-              writeControlFor(row.provider, item.contract.actions, row)?.enabled === true,
-          )
+          .filter((action) => action.effect === 'read' || writeControl?.enabled === true)
           .map(actionProjection),
+        ...(writeControl
+          ? {
+              writeMode: !writeControl.enabled
+                ? ('disabled' as const)
+                : writeControl.preapproval.enabled
+                  ? ('account_preapproval' as const)
+                  : ('confirm_each' as const),
+            }
+          : {}),
       })
     }
     return [...managedTargets, ...localTargets]
@@ -1250,15 +1258,42 @@ export class PluginRuntimeFacade {
       if (
         !comment ||
         comment.postId !== String(input.params.postId ?? '') ||
-        comment.owned !== true ||
         typeof expectedDigest !== 'string' ||
         !/^[0-9a-f]{64}$/.test(expectedDigest)
       )
-        throw new PluginRuntimeFacadeError(
-          'BAD_REQUEST',
-          'Plugin owned-comment snapshot is unavailable',
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment snapshot is unavailable')
+      if (comment.owned === true) {
+        prepared.deleteSnapshot = { expectedDigest, targetKind: 'own_comment' }
+      } else {
+        const postRead = (await this.call({
+          userId: input.userId,
+          targetId: input.targetId,
+          actionId: 'get_post',
+          params: {
+            userId: String(input.params.userId ?? ''),
+            postId: String(input.params.postId ?? ''),
+          },
+        })) as { post?: Record<string, unknown> }
+        const post = postRead.post
+        const postExpectedDigest = post?.contentDigest
+        if (
+          !post ||
+          post.id !== String(input.params.postId ?? '') ||
+          post.userId !== String(input.params.userId ?? '') ||
+          post.owned !== true ||
+          typeof postExpectedDigest !== 'string' ||
+          !/^[0-9a-f]{64}$/.test(postExpectedDigest)
         )
-      prepared.deleteSnapshot = { expectedDigest, owned: true }
+          throw new PluginRuntimeFacadeError(
+            'BAD_REQUEST',
+            'Plugin received-comment target is not an owned post',
+          )
+        prepared.deleteSnapshot = {
+          expectedDigest,
+          targetKind: 'received_on_own_post',
+          postExpectedDigest,
+        }
+      }
     }
     return prepared
   }
