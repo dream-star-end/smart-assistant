@@ -1125,11 +1125,10 @@ const PROJECTION_TAPE_MAX_ROWS = 512; // per-tape ≤512 行
 const CHAT_PROJECTION_MAX_BYTES = 8 * 1024 * 1024; // chat 单响应投影总量 ≤8MB
 const CHAT_PROJECTION_MAX_ROWS = 2000; // chat 单响应投影总量 ≤2000 行
 const DEFAULT_BACKFILL_BYTES = 16 * 1024 * 1024; // OC_BACKFILL_BYTES 默认 16MB
+const TAPE_RECORD_PAGE_RAW_MAX_BYTES = 8 * 1024 * 1024; // 主动展开单页原始 BYTEA 合计 ≤8MiB
+const TAPE_RECORD_PAGE_RESPONSE_MAX_BYTES = 1024 * 1024; // 主动展开单页 JSON ≤1MiB
 // 分段回填每段最多拉多少 record 行(界定单次 pg fetch,防超大卷一次性入内存)。
 const BACKFILL_SEGMENT_RECORD_LIMIT = 4000;
-// 用户主动展开 building 存量卷时,同一请求最多推进 8 段。与单请求共享字节预算共同限制
-// PG round-trip / 内存；常见两段卷可一次收敛，极端超长卷留给下一次点击继续推进。
-const ON_DEMAND_BACKFILL_MAX_SEGMENTS = 8;
 // B-§9-1(R3 重开):预算是**硬**的 —— 任何 record 越本读剩余预算一律 defer 折叠(绝不强读),
 // 越整 fullBudget 才判「永不适配」→ 终态 truncated + sentinel(绝不整条拉入进程)。推进保证靠
 // 「新一轮读预算重置后可容纳 ≤fullBudget 的单条」:sorted 里最小的未收敛卷在 budget==fullBudget
@@ -1262,6 +1261,32 @@ function sentinelForOversizeRecord(tapeId: string, ordinal: number, fullBytes: n
     _recordOrdinal: ordinal,
     output: note,
     text: note,
+  };
+}
+
+/** 主动展开分页的超大单记录替身。保留真实 record 身份/role/ordinal，payload 不进进程；
+ * `_recordOrdinal` 继续接现有按记录分块入口。 */
+function pagedOversizeRecord(
+  tapeId: string,
+  msgId: string,
+  ordinal: number,
+  role: string,
+  fullBytes: number,
+): MessageLike {
+  const note = projectionOversizeNote(fullBytes);
+  return {
+    id: msgId,
+    role,
+    text: note,
+    output: note,
+    _completed: true,
+    _turnTapeId: tapeId,
+    _turnTapeMsgId: msgId,
+    _turnTapeOrdinal: ordinal,
+    _recordOrdinal: ordinal,
+    _projectionSentinel: true,
+    _truncated: true,
+    _fullBytes: fullBytes,
   };
 }
 
@@ -2264,7 +2289,8 @@ async function computeEngineContextMessages(
   return selectMasterHistoryWindow(merged);
 }
 
-/** 展开端点后端(RFC §9):按行游标分页某卷已收敛投影(complete/truncated);chat-safe 形态。 */
+/** 展开端点后端(RFC §9):按物理 ordinal 分页 finalized 卷的可见 immutable records；
+ * chat-safe 形态，单次原始读取/响应有界，总可见行数不受物化投影上限约束。 */
 async function listTapeChatProjectionRecordsImpl(
   pool: Pool,
   sessionId: string,
@@ -2273,88 +2299,140 @@ async function listTapeChatProjectionRecordsImpl(
   cursor: number,
   limit: number,
 ): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
-  // 分租 + tape 复合校验:会话不属本人 / tape 无收敛投影 → null(端点统一 404)。
-  const readReady = async (): Promise<{ rows: MessageLike[]; row_count: number } | undefined> => (
-    await pool.query<{ rows: MessageLike[]; row_count: number }>(
-      `SELECT rows, row_count FROM tape_chat_projection
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state IN ('complete','truncated')`,
+  // 用户主动展开不再等待整卷 tape_chat_projection 收敛。该缓存的 512 行/512KB 上限只适合
+  // 会话首屏折叠投影；若把它当展开权威，物理记录很多的卷会长期 building→404，或在 512 行
+  // 处提前 truncated。这里直接分页不可变 records：单次读取有界，而可见记录总量无固定上限。
+  const tape = (
+    await pool.query<{ tape_sha256: string; billing_anchor_id: string | null }>(
+      `SELECT tape_sha256, billing_anchor_id
+         FROM client_session_turn_tapes
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND finalized_at IS NOT NULL`,
       [sessionId, userId, tapeId],
     )
   ).rows[0];
+  if (!tape || typeof tape.billing_anchor_id !== "string" || tape.billing_anchor_id.length === 0) return null;
 
-  let row = await readReady();
-  if (!row) {
-    // 折叠卡点击是用户对存量 building 卷的主动读取；此前这里只返回 404，而惰性回填只能靠
-    // 下一次 full session read 偶然推进，导致用户反复看到「加载失败」。沿用同一 CAS 回填器，
-    // 在既有硬字节预算内多推进少量 segment，再回读 ready 投影。exact 三元组 + finalized
-    // header 既防越租，也不把 missing / foreign / 未终态 tape 的差异泄露给端点。
-    try {
-      const tape = (
-        await pool.query<{ tape_sha256: string; billing_anchor_id: string | null }>(
-          `SELECT tape_sha256, billing_anchor_id
-             FROM client_session_turn_tapes
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND finalized_at IS NOT NULL`,
-          [sessionId, userId, tapeId],
-        )
-      ).rows[0];
-      if (!tape || typeof tape.billing_anchor_id !== "string" || tape.billing_anchor_id.length === 0) return null;
-
-      let budget = backfillBudgetBytes();
-      for (let segment = 0; segment < ON_DEMAND_BACKFILL_MAX_SEGMENTS && budget > 0; segment++) {
-        const progress = await backfillTapeSegment(
-          pool,
-          sessionId,
-          userId,
-          tapeId,
-          tape.tape_sha256,
-          tape.billing_anchor_id,
-          budget,
-        );
-        if (progress.state === "complete" || progress.state === "truncated") break;
-        if (progress.bytesRead <= 0) break;
-        budget -= progress.bytesRead;
-      }
-      row = await readReady();
-    } catch {
-      // 与不存在/越权/未 finalized 同一失败形态；坏存量卷不能泄露内部状态，也不能拖垮会话页。
-      return null;
-    }
-  }
-  if (!row || !Array.isArray(row.rows)) return null;
-  const all = row.rows;
-  const total = all.length;
+  // cursor 是“下一条待扫描的物理 ordinal”，不是可见行 offset。runtime-event/ordinal 空洞可
+  // 自然跳过；预算停在某条时原样返回该 ordinal，下一页既不重复已返回行，也不漏未返回行。
   const start = Number.isFinite(cursor) && cursor > 0 ? Math.floor(cursor) : 0;
   const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) && limit > 0 ? limit : 200)));
-  const page: MessageLike[] = [];
-  let bytes = 0;
-  let next = start;
-  for (let i = start; i < all.length && page.length < cappedLimit; i++) {
-    const stored = all[i]!;
-    // M-§9-1(M6① R3):截断记录**保留 `_recordOrdinal`**(前端 ToolCard 按 `_recordOrdinal` 触发"查看
-    // 完整"分块拉取)。与 chat 读投影行(applyProjectionForChat)同名 —— 展开端点与 chat 读走同一字段,
-    // 前端 socket.applyExpandedTapeRecords 透传 + ToolCard 读 `_recordOrdinal` 零改动即通。剥内部记账字段;
-    // 非截断行同 chat 读剥掉 `_recordOrdinal` 减噪。
-    const rec: MessageLike = { ...stored };
-    const ordinal = projectionTapeOrdinal(rec);
-    rec._turnTapeId = tapeId;
-    if (ordinal !== null) rec._turnTapeOrdinal = ordinal;
-    else delete rec._turnTapeOrdinal;
-    delete rec._winnerOrdinal;
-    if (rec._truncated !== true) delete rec._recordOrdinal;
-    const recBytes = jsonBytes(rec);
-    // 单页序列化 ≤1MB(page 非空时命中即停,下页续)。
-    if (page.length > 0 && bytes + recBytes > 1024 * 1024) break;
-    page.push(rec);
-    bytes += recBytes;
-    next = i + 1;
+  const [countRes, headRes] = await Promise.all([
+    pool.query<{ total: string }>(
+      `SELECT COUNT(*)::text AS total
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role <> 'runtime-event'`,
+      [sessionId, userId, tapeId],
+    ),
+    pool.query<{
+      msg_id: string; ordinal: number; role: string; content_sha256: string; payload_bytes: string;
+    }>(
+      `SELECT msg_id, ordinal, role, content_sha256, octet_length(payload)::text AS payload_bytes
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          AND role <> 'runtime-event' AND ordinal >= $4
+        ORDER BY ordinal
+        LIMIT $5`,
+      [sessionId, userId, tapeId, start, cappedLimit + 1],
+    ),
+  ]);
+  const total = bigIntNum(countRes.rows[0]?.total ?? "0", "tape visible record count");
+  const heads = headRes.rows;
+
+  type PageHead = (typeof heads)[number] & { payloadBytes: number; oversize: boolean };
+  const planned: PageHead[] = [];
+  const payloadOrdinals: number[] = [];
+  let rawBytes = 0;
+  let nextCursor: number | null = null;
+  const hydrateCap = Math.min(tapeRecordParseCapBytes(), TAPE_RECORD_PAGE_RAW_MAX_BYTES);
+  for (const head of heads) {
+    if (planned.length >= cappedLimit) {
+      nextCursor = head.ordinal;
+      break;
+    }
+    const payloadBytes = bigIntNum(head.payload_bytes, "tape record payload bytes");
+    const oversize = payloadBytes > hydrateCap;
+    if (!oversize && rawBytes + payloadBytes > TAPE_RECORD_PAGE_RAW_MAX_BYTES) {
+      nextCursor = head.ordinal;
+      break;
+    }
+    planned.push({ ...head, payloadBytes, oversize });
+    if (!oversize) {
+      payloadOrdinals.push(head.ordinal);
+      rawBytes += payloadBytes;
+    }
   }
-  return { records: page, nextCursor: next < total ? next : null, total };
+
+  // header 阶段已证明这些 ordinal 的 payload 合计 ≤8MiB；一次批量取避免逐行 round-trip，且
+  // 进入 Node 的原始 BYTEA 有独立硬上限，不拿 1MiB 响应上限冒充读取上限。
+  const payloadRows = payloadOrdinals.length > 0
+    ? (
+        await pool.query<ProjectionSourceRecord>(
+          `SELECT msg_id, ordinal, role, content_sha256, payload
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=ANY($4::int[])
+            ORDER BY ordinal`,
+          [sessionId, userId, tapeId, payloadOrdinals],
+        )
+      ).rows
+    : [];
+  const payloadByOrdinal = new Map(payloadRows.map((row) => [row.ordinal, row]));
+  const contentAnchor: MessageLike = {
+    id: tape.billing_anchor_id,
+    _turnTapeSha256: tape.tape_sha256,
+  };
+  const page: MessageLike[] = [];
+  // ordinal 是 PostgreSQL INTEGER；用十位最大游标预留 envelope，实际 nextCursor(null 或任意
+  // 非负 ordinal)只会更短。再精确累计 records 的 JSON 与数组逗号，保证整个 HTTP body ≤1MiB。
+  const responseEnvelopeBytes = jsonBytes({ records: [], nextCursor: 2_147_483_647, total });
+  let recordsBytes = 0;
+  for (const head of planned) {
+    let rec: MessageLike;
+    if (head.oversize) {
+      rec = pagedOversizeRecord(tapeId, head.msg_id, head.ordinal, head.role, head.payloadBytes);
+    } else {
+      const source = payloadByOrdinal.get(head.ordinal);
+      if (!source) throw new Error(`[pgSessions] paged tape record missing: ${tapeId}\0${head.ordinal}`);
+      const hydrated = hydrateTapeRecordContent(
+        {
+          tape_id: tapeId,
+          tape_sha256: tape.tape_sha256,
+          waive_reason: null,
+          waiver_applied: false,
+          msg_id: source.msg_id,
+          ordinal: source.ordinal,
+          role: source.role,
+          content_sha256: source.content_sha256,
+          payload: Buffer.from(source.payload),
+          cost_credits: "0",
+          delegate_costs: [],
+        },
+        contentAnchor,
+        false,
+        true,
+      );
+      hydrated._recordOrdinal = head.ordinal;
+      sanitizeRowForJsonb(hydrated);
+      rec = truncateProjectionRow(hydrated).row;
+      if (rec._truncated !== true) rec._recordOrdinal = undefined;
+    }
+    const recBytes = jsonBytes(rec);
+    const separatorBytes = page.length > 0 ? 1 : 0;
+    // 完整响应（envelope + records + 逗号）≤1MiB；第一条恒 ≤64KiB。停在当前 ordinal，
+    // 下页从该条继续。
+    if (responseEnvelopeBytes + recordsBytes + separatorBytes + recBytes > TAPE_RECORD_PAGE_RESPONSE_MAX_BYTES) {
+      nextCursor = head.ordinal;
+      break;
+    }
+    page.push(rec);
+    recordsBytes += separatorBytes + recBytes;
+  }
+  return { records: page, nextCursor, total };
 }
 
 /** M-§9-1 按记录有界读:从 client_session_turn_tape_records 读单条 record 的**内容文本**一个字节窗口
  *  (SQL substring,绝不整卷/整条拉入进程),供前端"查看完整"分块拼接。返回 chat-safe 文本切片:
  *  从 record payload(JSON MessageLike)hydrate 后的展示文本(output/bashTail/text),按 utf8 安全边界切。
- *  offset/limit 均按 hydrate 后文本的字节计。分租/不存在/非收敛卷 → null(端点统一 404)。
+ *  offset/limit 均按 hydrate 后文本的字节计。分租/不存在/未 finalized 卷 → null(端点统一 404)。
  *  单请求 ≤256KB。R4-M1 双护栏:
  *  ①单记录解析上限(OC_TAPE_RECORD_PARSE_CAP 默认 8MB):octet_length 预检超限 → 404,payload
  *    压根不 SELECT(RFC §9「单记录解析上限」;前端按既有 partial 语义提示"内容过大");
@@ -2376,14 +2454,17 @@ async function readTapeRecordChunkImpl(
   offset: number,
 ): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
   if (!Number.isInteger(recordOrdinal) || recordOrdinal < 0) return null;
-  // 分租 + 收敛投影存在性(与列表端点同口径);不存在 → 404。
-  const proj = await pool.query<{ tape_sha256: string }>(
-    `SELECT tape_sha256 FROM tape_chat_projection
-      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state IN ('complete','truncated')`,
+  // 与列表端点同一 finalized + tenant fence；单记录查看不再被派生投影 building/missing 状态
+  // 阻断。tape header/records 才是不可变权威，projection 只是会话首屏缓存。
+  const finalized = await pool.query<{ tape_sha256: string }>(
+    `SELECT tape_sha256 FROM client_session_turn_tapes
+      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        AND finalized_at IS NOT NULL AND billing_anchor_id IS NOT NULL`,
     [sessionId, userId, tapeId],
   );
-  if (proj.rows.length === 0) return null;
-  const lruKey = `${sessionId}\0${userId}\0${tapeId}\0${recordOrdinal}\0${proj.rows[0]!.tape_sha256}`;
+  if (finalized.rows.length === 0) return null;
+  const tapeSha256 = finalized.rows[0]!.tape_sha256;
+  const lruKey = `${sessionId}\0${userId}\0${tapeId}\0${recordOrdinal}\0${tapeSha256}`;
   let buf = tapeRecordTextLru.get(lruKey);
   if (buf !== undefined) {
     // LRU touch:删了重插保新鲜度。
@@ -2411,11 +2492,11 @@ async function readTapeRecordChunkImpl(
     try {
       const content = hydrateTapeRecordContent(
         {
-          tape_id: tapeId, tape_sha256: proj.rows[0]!.tape_sha256, waive_reason: null, waiver_applied: false,
+          tape_id: tapeId, tape_sha256: tapeSha256, waive_reason: null, waiver_applied: false,
           msg_id: "", ordinal: recordOrdinal, role: head.role, content_sha256: head.content_sha256,
           payload: Buffer.from(rec.payload), cost_credits: "0", delegate_costs: [],
         },
-        { id: "", _turnTapeSha256: proj.rows[0]!.tape_sha256 }, false, true,
+        { id: "", _turnTapeSha256: tapeSha256 }, false, true,
       );
       text = typeof content.output === "string" && content.output.length > 0
         ? content.output
@@ -4466,8 +4547,22 @@ export function createPgSessionsBackend(
       options: ClientSessionReadOptions = {},
     ): Promise<ClientSession | null> {
       const sql = userId
-        ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL"
-        : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = $1 AND deleted_at IS NULL";
+        ? `SELECT cs.id, cs.user_id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at,
+                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision, cs.model_id,
+                  COALESCE((
+                    SELECT SUM(ac.message_count) FROM client_session_archive_chunks ac
+                     WHERE ac.session_id=cs.id AND ac.user_id=cs.user_id
+                  ), 0)::text AS archived_count
+             FROM client_sessions cs
+            WHERE cs.id=$1 AND cs.user_id=$2 AND cs.deleted_at IS NULL`
+        : `SELECT cs.id, cs.user_id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at,
+                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision, cs.model_id,
+                  COALESCE((
+                    SELECT SUM(ac.message_count) FROM client_session_archive_chunks ac
+                     WHERE ac.session_id=cs.id AND ac.user_id=cs.user_id
+                  ), 0)::text AS archived_count
+             FROM client_sessions cs
+            WHERE cs.id=$1 AND cs.deleted_at IS NULL`;
       const row = (
         await pool.query<{
           id: string;
@@ -4480,7 +4575,7 @@ export function createPgSessionsBackend(
           messages: string;
           updated_at: string;
           archived_through_seq: number | null;
-          archived_count: number | null;
+          archived_count: string;
           history_revision: string;
           model_id: string | null;
         }>(sql, userId ? [id, userId] : [id])
@@ -4507,7 +4602,9 @@ export function createPgSessionsBackend(
         updatedAt: bigIntNum(row.updated_at, "updated_at"),
         historyRevision: bigIntNum(row.history_revision, "history_revision"),
         ...(row.model_id ? { modelId: row.model_id } : {}),
-        archivedCount: bigIntNumOr(row.archived_count, 0),
+        // archived_count 是写侧缓存计数；存量迁移曾有极少数漂移。详情读以 chunk.message_count
+        // 实际合计为准，读尽后不会留下“还有 N 条”的幽灵按钮。
+        archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
         archivedThroughSeq: archivedThroughOrderSeq,
       };
     },
@@ -4561,16 +4658,23 @@ export function createPgSessionsBackend(
           messages: string;
           updated_at: string;
           archived_through_seq: number | null;
-          archived_count: number | null;
+          archived_count: string;
           history_revision: string;
           model_id: string | null;
         }>(
-          "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+          `SELECT cs.id, cs.user_id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at,
+                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision, cs.model_id,
+                  COALESCE((
+                    SELECT SUM(ac.message_count) FROM client_session_archive_chunks ac
+                     WHERE ac.session_id=cs.id AND ac.user_id=cs.user_id
+                  ), 0)::text AS archived_count
+             FROM client_sessions cs
+            WHERE cs.id=$1 AND cs.user_id=$2 AND cs.deleted_at IS NULL`,
           [id, userId],
         )
       ).rows[0];
       if (!row) return null;
-      const archivedCount = bigIntNumOr(row.archived_count, 0);
+      const archivedCount = bigIntNum(row.archived_count, "archived chunk message count");
       const archivedThroughSeq = bigIntNumOr(row.archived_through_seq, 0);
 
       let allMsgs: MessageLike[] = [];
