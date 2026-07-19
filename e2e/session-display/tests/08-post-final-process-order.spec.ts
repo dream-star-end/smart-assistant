@@ -243,11 +243,19 @@ test('poisoned IDB + empty incremental：过程卡在最终答复前且修复可
     userMessageId,
   ]);
 
-  // 第二次 reload 必须读取已迁移快照，仍保持同一 DOM 顺序；不能只做一次内存临时排序。
-  await page.reload({ waitUntil: 'domcontentloaded' });
+  // App 会把已消费的深链规范化为根路由；第二次 boot 必须重新深链同一目标会话，
+  // 才能证明已迁移快照稳定，而不是误刷新到最近打开的其它会话。
+  await page.goto(`${cfg.baseUrl}/s/${sid}`, { waitUntil: 'domcontentloaded' });
   await waitForHistoryLoaded(page);
   await expect(SEL.teamPanel(page)).toBeVisible();
   await expect(SEL.permissionCard(page)).toBeVisible();
   await expect(SEL.assistantRows(page).filter({ hasText: finalText })).toHaveCount(1);
   expect(await visibleProcessOrder(page)).toEqual(['team', 'permission', 'assistant']);
+  const secondBootStored = await getStored(page, userId, sid);
+  expect(secondBootStored?.messages.map((message) => message.id)).toEqual(expectedIds);
+  expect(secondBootStored?.messages.slice(1, 4).map((message) => message._turnOwnerId)).toEqual([
+    userMessageId,
+    userMessageId,
+    userMessageId,
+  ]);
 });
