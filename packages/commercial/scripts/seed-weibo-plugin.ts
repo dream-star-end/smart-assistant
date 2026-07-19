@@ -322,6 +322,7 @@ async function verifyUpgradedAccount(
     getPool(),
     {
       env: process.env,
+      allowUnlisted: true,
     },
   )
   if (
