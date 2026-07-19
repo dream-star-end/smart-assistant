@@ -2,13 +2,13 @@
 //
 // leaderBundle shared 单跑(双 master 下只 leader 跑,避免双求证竞态)。四分支全 CAS + 有界 LIMIT:
 //   ⓪ open ∧ 租约过期 ∧ 会话墓碑/行亡 → manual_reconcile(session_deleted)+ 机器 resolution
-//        自动结案(用户面已消失:tape 落不进、projection 无处渲染、容器求证永不收敛;不告警)
+//        自动结案(用户面已消失:tape 落不进、状态无处渲染、容器求证永不收敛;不告警)
 //   ① admitted ∧ 租约过期 ∧ age>5min → CAS rejecting(epoch fence)→ 容器求证 reject-if-absent:
 //        rejected tombstone → terminal(not_accepted) → fail-visible;有行 → accepted;不可达 → 留 rejecting 重试
 //   ② accepted ∧ 卡 stuck 阈值 → 容器 dispatch-state:sink_staged/terminal/running 等;sink_stage_failed/
 //        行消失 → manual_reconcile+告警
 //   ③ terminal(not_accepted/executed_error) ∧ 未通知 → 财务联查(journal+usage_records):
-//        未计费 → error projection(免单 tone);有计费证据 → manual_reconcile(绝不写"未计费")+告警
+//        未计费 → client_notified 状态可见(免单 tone);有计费证据 → manual_reconcile(绝不写"未计费")+告警
 // 另:open>7d 只读告警(永不 GC)。
 //
 // 钱安全(I5):有任何计费证据一律 manual_reconcile,绝不静默写"未计费"。negative proof(I2):
@@ -20,7 +20,6 @@ import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
-import { insertErrorProjection } from './errorProjections.js'
 import {
   casAdmittedToRejecting,
   casRejectingToAccepted,
@@ -125,7 +124,7 @@ export interface AbortedJournalRef {
  * **永久 no-execution waiver aborted**。复用 abortInflightJournal 的 SET 语义(state='aborted' +
  * final_credits=0 + 清 settlementClaimId)+ permanentCodexWaiverReason 前缀,使随后的
  * assessDispatchBilling 判定 not_billed(否则「非 aborted 的 inflight journal」被当 billed →
- * 全进 manual、无 projection、违反 I1)。
+ * 全进 manual、用户不可见、违反 I1)。
  *
  * **内嵌 no-usage 守卫**:仅当该 dispatch **无** usage_records 时才 abort。若竟有账(理论上
  * not_accepted 不该有,防御性),WHERE 不命中 → 不动 journal,assess 随后见 usage → billed →
@@ -168,9 +167,9 @@ export interface TurnDispatchReconcilerDeps {
    */
   releaseReservation?: (ref: AbortedJournalRef) => Promise<void>
   /**
-   * best-effort 实时通知(M4):error projection 插入成功后,若用户在线,推一条轻量 sync-nudge
-   * 让前端立即 reconcile(拉回 projection error 卡),不必等下次 hello/sync。published≠delivered
-   * 是现实:失败/离线一律无害吞掉(projection 已持久,下次进会话/sync 必达)。
+   * best-effort 实时通知:verified failure 状态提交后,若用户在线,推一条轻量 sync-nudge
+   * 让前端立即拉回 turn_dispatches 状态,不必等下次 hello/sync。published≠delivered
+   * 是现实:失败/离线一律无害吞掉(状态已持久,下次进会话/sync 必达)。
    */
   nudgeClient?: (uid: bigint, sessionId: string, clientMessageId: string) => void
   stuckThresholdMs?: number
@@ -193,7 +192,7 @@ export interface ReconcileTickCounts {
   rejectedTerminal: number
   accepted: number
   manualReconcile: number
-  projections: number
+  visibleFailures: number
   notified: number
   alerts: number
   /** ⓪ 会话墓碑/行亡 → 自动结案(manual_reconcile(session_deleted)+ 机器 resolution)。 */
@@ -215,7 +214,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     rejectedTerminal: 0,
     accepted: 0,
     manualReconcile: 0,
-    projections: 0,
+    visibleFailures: 0,
     notified: 0,
     alerts: 0,
     sessionGoneClosed: 0,
@@ -223,7 +222,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
 
   // ── ⓪ open ∧ 租约过期 ∧ 会话墓碑/行亡 → 自动结案(session_deleted)────────
   // 会话墓碑是 durable proof「用户面已不存在」:tape 落不进(stage 返 session_deleted)、
-  // projection 无处渲染、容器常随会话回收 → ①② 的容器求证对这类行永远收敛不动
+  // 状态无处渲染、容器常随会话回收 → ①② 的容器求证对这类行永远收敛不动
   // (2026-07-18 e2e 实证:accepted 恒卡,直到 open>7d 才以告警冒头)。执行 outcome 无从
   // 求证也不可伪造(I2:not_accepted 只认容器 tombstone)→ 不走 terminal,走
   // manual_reconcile(证据行永存)+ 机器 resolution 立即记账进 90d GC 窗。不告警:
@@ -267,9 +266,9 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
 
   // ── ③ terminal(not_accepted/executed_error) ∧ 未通知 → fail-visible ──────
   // B8:每行走**单事务** SELECT ... FOR UPDATE 锁本 dispatch 行 → tx 内重验终态 + 财务联查
-  // (journal/usage 同 snapshot)→ INSERT projection + markClientNotified 同 tx 提交。与 tape
+  // (journal/usage 同 snapshot)→ markClientNotified 同 tx 提交。与 tape
   // finalize 的 convergeDispatchOnFinalize(其 casToTerminal 取本行写锁)共享互斥序:要么先
-  // late-tape 撤销投影+转 manual,要么先投影通知——绝不并发产出「error 卡 + 完整 materialize」。
+  // late-tape 转 manual,要么先状态通知——绝不并发产出「失败状态 + 完整 tape」。
   const unnotified = await scanTerminalUnnotified(deps.pool, { limit })
   for (const scanned of unnotified) {
     await settleTerminalUnnotified(deps, scanned, counts, enqueue, assess, now())
@@ -348,7 +347,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
 
 /**
  * B8:terminal-未通知单行的**单事务**收敛。锁本 dispatch 行(与 tape finalize 互斥),
- * tx 内重验终态未变 + 财务联查同 snapshot,再决定 projection(免单)或 manual_reconcile(歧义)。
+ * tx 内重验终态未变 + 财务联查同 snapshot,再决定直接状态可见(免单)或 manual_reconcile(歧义)。
  * 告警/计数/实时 nudge 都在 commit 之后做(不在持锁窗口内做 I/O,也不为回滚的决定发告警)。
  */
 async function settleTerminalUnnotified(
@@ -363,7 +362,7 @@ async function settleTerminalUnnotified(
   // commit 之后要做的副作用(告警/计数/nudge/释放 reservation)在 tx 外执行:先攒起来。
   type Post =
     | { kind: 'manual'; reason: string; reservations: AbortedJournalRef[] }
-    | { kind: 'projected'; inserted: boolean; notified: boolean; reservations: AbortedJournalRef[] }
+    | { kind: 'visible'; notified: boolean; reservations: AbortedJournalRef[] }
   let post: Post | null = null
   try {
     await client.query('BEGIN')
@@ -379,20 +378,20 @@ async function settleTerminalUnnotified(
       return
     }
     if (row.anchorSeq === null) {
-      // 没有 anchor 无法排 projection;交人工(理论上受理即写 anchor,不该出现)。
+      // 没有 anchor 无法把状态排到原用户轮次后;交人工(理论上受理即写 anchor,不该出现)。
       const held = await casToManualReconcile(client, {
         dispatchId: row.dispatchId,
         conflictReason: 'missing_anchor_seq',
         now: nowMs,
       })
       await client.query('COMMIT')
-      if (held) post = { kind: 'manual', reason: 'missing anchor_seq — cannot project error card', reservations: [] }
+      if (held) post = { kind: 'manual', reason: 'missing anchor_seq — cannot place verified failure status', reservations: [] }
       finalizeSettlePost(post, scanned, counts, enqueue, deps)
       return
     }
     // B-R1-1(钱安全):not_accepted = 容器 durable rejected proof = 从未执行 → 同一 tx 内先把
     // pre-forward inflight journal CAS 为永久 no-execution waiver aborted(no-usage 守卫内嵌),
-    // assess 遂得 not_billed → projection。executed_error(已转发执行后出错,可能有账)不碰。
+    // assess 遂得 not_billed → 状态可见。executed_error(已转发执行后出错,可能有账)不碰。
     let reservations: AbortedJournalRef[] = []
     if (row.outcome === 'not_accepted') {
       reservations = await abortNeverExecutedJournalForDispatch(client, row.dispatchId)
@@ -421,18 +420,11 @@ async function settleTerminalUnnotified(
       finalizeSettlePost(post, scanned, counts, enqueue, deps)
       return
     }
-    // 未计费 → 投影 error 卡 + 标记已通知(免单 tone),同 tx 提交。
-    const inserted = await insertErrorProjection(client, {
-      dispatchId: row.dispatchId,
-      userId: row.userId,
-      sessionId: row.sessionId,
-      clientMessageId: row.clientMessageId,
-      errorCode: row.failureCode ?? 'DISPATCH_LOST',
-      anchorSeq: row.anchorSeq,
-    })
+    // 未计费 → 直接把 durable dispatch 标记为用户可见。读侧从本行生成 typed
+    // status record；不再复制/改写为 assistant message。
     const notified = await markClientNotified(client, row.dispatchId)
     await client.query('COMMIT')
-    post = { kind: 'projected', inserted, notified, reservations }
+    post = { kind: 'visible', notified, reservations }
     finalizeSettlePost(post, scanned, counts, enqueue, deps)
   } catch {
     try {
@@ -453,7 +445,7 @@ let loggedMissingReservationReleaser = false
 function finalizeSettlePost(
   post:
     | { kind: 'manual'; reason: string; reservations: AbortedJournalRef[] }
-    | { kind: 'projected'; inserted: boolean; notified: boolean; reservations: AbortedJournalRef[] }
+    | { kind: 'visible'; notified: boolean; reservations: AbortedJournalRef[] }
     | null,
   row: TurnDispatchRow,
   counts: ReconcileTickCounts,
@@ -470,14 +462,16 @@ function finalizeSettlePost(
     counts.alerts++
     return
   }
-  if (post.inserted) counts.projections++
-  if (post.notified) counts.notified++
-  // M4:投影已持久 → 用户在线则推一条轻量 nudge 触发前端 reconcile(拉回 error 卡)。
-  if (post.inserted || post.notified) {
+  if (post.notified) {
+    counts.visibleFailures++
+    counts.notified++
+  }
+  // 状态已持久 → 用户在线则推一条轻量 nudge 触发前端 reconcile。
+  if (post.notified) {
     try {
       deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
     } catch {
-      /* nudge 是 best-effort,失败无害(projection 已持久) */
+      /* nudge 是 best-effort,失败无害(状态已持久) */
     }
   }
 }
@@ -621,7 +615,7 @@ export function startTurnDispatchReconciler(
     rejectedTerminal: 0,
     accepted: 0,
     manualReconcile: 0,
-    projections: 0,
+    visibleFailures: 0,
     notified: 0,
     alerts: 0,
     sessionGoneClosed: 0,

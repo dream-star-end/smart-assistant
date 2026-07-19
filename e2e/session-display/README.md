@@ -4,7 +4,7 @@
 重发双回复）建立的 Playwright e2e 硬门。真浏览器（受信事件）驱动，断言基于**用户可见
 行为**（卡片文案 / 元素状态 / testid），辅以 API 校验；超时一律轮询、无死 sleep。
 
-行为契约来源：`docs/rfcs/RFC-v5-durable-turn-dispatch.md` §1/§4/§5/§9。选择器/契约地图见
+行为契约来源：durable dispatch + immutable turn tape 的直接时间线。选择器/契约地图见
 本目录 `SELECTORS.md`（写 spec 的唯一依据）。
 
 > 独立依赖域：本套件在 `e2e/session-display/` 自带 `package.json` + `node_modules`，
@@ -16,15 +16,15 @@
 | # | spec | 说明 | tag | 依赖 |
 |---|------|------|-----|------|
 | 1 | `01-login-relogin-display` | 登录→建会话→发消息收回复→登出→重登→列表含该会话+打开消息完整（user/assistant 行齐、顺序对） | `@smoke` | 真 turn |
-| 2 | `02-large-session-open` | 大会话打开首屏可交互 < 3s；超预算卷折叠卡出现+可展开 | `@smoke` | **§9**（未部署→skip） |
+| 2 | `02-large-session-open` | 大会话打开首屏可交互 < 3s；真实最终答复直出，2 MiB 工具记录惰性展开 | `@smoke` | **迁移 0176**（未部署→skip） |
 | 3 | `03-reconnect-inflight` | 发消息后立即断 WS→恢复→回复到达 **或** 明确失败卡+重试；**绝不永久静默** | — | 真 turn |
 | 4 | `04-terminal-reconcile` | 回复中途刷新页面→终态正确收敛（spinner 不永挂；回复/失败卡二选一） | `@smoke` | 真 turn |
-| 5 | `05-error-projection` | 注入 terminal(not_accepted)+active projection→"消息未开始处理/已确认未计费"卡+重试；revoked 不显示 | — | **§9 + DB 注入**（否则 skip） |
+| 5 | `05-turn-status` | 注入 verified terminal(not_accepted)→状态卡+重试；late-tape manual_reconcile 不显示 | — | **迁移 0176 + DB 注入**（否则 skip） |
 | 6 | `06-archive-paging` | 归档逐页拉取：无重复行 / 空页不谎报 hasMore / 游标严格递减 / 有限步终止 | — | 无（负例亦可自验） |
 | 7 | `07-resend-dedup` | 同 clientMessageId 协议级双发→不出双回复、不双计费（服务端幂等 `web:<cmid>:0`） | — | 真 turn(WS) |
 | 8 | `08-post-final-process-order` | 原始 IDB poison + `?since=2` 空增量→过程卡回到 final 前、写回 IDB、二次 reload 稳定 | — | canary + 浏览器路由拦截 |
 
-`@smoke` 子集（1/2/4）供部署门用：`./run.sh --grep @smoke`。用例 2 未部署 §9 时自动 skip，
+`@smoke` 子集（1/2/4）供部署门用：`./run.sh --grep @smoke`。用例 2 未部署迁移 0176 时自动 skip，
 不会把 smoke 门判红。
 
 ## 环境矩阵
@@ -44,18 +44,14 @@
 | `OC_E2E_MODEL` | `gpt-5.6-sol` | turn 模型；可换更快模型加速 |
 | `OC_E2E_TURN_TIMEOUT` | `120000` | 单轮回复上限 ms |
 | `OC_E2E_TTI_BUDGET_MS` | `3000` | 用例 2 首屏可交互预算 |
-| `OC_E2E_PG_URL` | — | §9 注入/种子 PG 连接串（**仅预发**）；缺省→用例 2/5 skip-with-reason |
-| `OC_E2E_SECTION9` | — | 无 PG_URL 时，`=1` 显式声明 §9 已部署以放行用例 2 的 seed 路径 |
-| `OC_E2E_PG_USER_ID` | `c:<numericUserId>` | §9 注入时 `client_sessions.user_id` 形态覆盖 |
+| `OC_E2E_PG_URL` | — | direct-timeline 注入/种子 PG 连接串（**仅预发**）；缺省→用例 2/5 skip-with-reason |
+| `OC_E2E_PG_USER_ID` | `c:<numericUserId>` | 注入时 `client_sessions.user_id` 形态覆盖 |
 | `OC_E2E_RETRIES` | `0` | flake 容忍（部署门建议 1） |
 
 ### 目标环境现状（2026-07-18）
 
-- **kl-hk 预发**：运行 `rel-b10fb176`（07-13，**pre-durable-turn**），且**无 canary 账号**。
-  跑预发前需：①部署本批（含迁移 0170）；②在预发 PG（15433）种一个 canary 账号并用
-  `OC_E2E_PASSWORD` 注入；③如需 §9 用例，隧道预发 PG 后设 `OC_E2E_PG_URL`。
-- **kl-mirror 生产**：canary 账号可用（与部署 smoke/journey 门同账号），app=18790。自验就是
-  打这里（§9 尚未上生产 → 用例 2/5 skip）。
+- 需要带 DB 注入的用例时，目标环境必须已完成迁移 0176，并显式提供只指向 canary/预发库的
+  `OC_E2E_PG_URL`；没有注入通道时用例 2/5 会明确 skip。
 
 ## 运行
 
@@ -63,7 +59,7 @@
 cd e2e/session-display
 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install     # 首次；装进本目录 node_modules
 
-# 默认打 kl-hk 预发（需预发已具备账号/§9，见上）
+# 默认打 kl-hk 预发（需预发已具备账号/direct-timeline，见上）
 ./run.sh
 
 # 只跑 smoke 子集（部署门）
@@ -89,7 +85,7 @@ PASS/FAIL/SKIP + skip 原因。报告落 `reports/html/index.html`（`npm run re
 - 只用注入的 **canary/预发专用账号**，断言全部作用于该账号自己的会话（鉴权分租），
   `setOffline`/`reload` 只影响本浏览器页，对服务端与他人零影响。
 - 种子会话一律 `e2e-` 前缀（`OC_E2E_SESSION_PREFIX` 可改），每条用例注册 `track()`
-  → 结束自动 `DELETE`；§9 注入额外 `cleanupSeed()` 清 dispatch/projection。
+  → 结束自动 `DELETE`；direct-timeline 注入额外 `cleanupSeed()` 清 dispatch/tape。
 
 ## 接部署门（建议接线点）
 
@@ -109,16 +105,16 @@ PASS/FAIL/SKIP + skip 原因。报告落 `reports/html/index.html`（`npm run re
 # validation_failure 链。紧急豁免用显式开关（不默认关）。
 ```
 
-落到 §9 上线后的预发回归：部署预发（含 0170）→ 隧道预发 PG 设 `OC_E2E_PG_URL` →
+落到预发回归：部署预发（含 0176）→ 隧道预发 PG 设 `OC_E2E_PG_URL` →
 `./run.sh`（用例 2/5 转为真跑）。
 
 ## 维护须知
 
 - 关键节点已在 `packages/web-react` 补 `data-testid`：`user-row` / `assistant-row` /
-  `message-text`（user 气泡）/ `collapse-card`（§9 折叠卡）/ `team-panel` /
+  `message-text`（user 气泡）/ `turn-process-card`（真实过程游标）/ `team-panel` /
   `permission-card`。assistant 正文仍走既有稳定
   `.prose`（避免侵入共享 `Markdown` 组件）。改这些组件时保持 testid。
-- 文案类断言（错误卡"消息未开始处理/已确认未计费"、折叠卡"本轮完整输出…"）来自 §5/§9
+- 文案类断言（状态卡"消息未开始处理/已确认未计费"、过程游标"Agent 调用过程…"）来自直接时间线
   契约；前端改文案需同步 `lib/ui.ts` 的 `TEXT`/选择器。
-- §9 DB 注入（`lib/seed.ts`）依据迁移 0170/0147/0134 的 schema，**尚未在 §9 环境实跑
-  校验**；§9 落预发后按实际 schema 复核 seed（用例会 skip-on-seed-failure，不制造假失败）。
+- DB 注入（`lib/seed.ts`）依据迁移 0176/0147/0134 的 schema；只允许在 canary/预发库运行，
+  能力不匹配时用例会 skip-on-seed-failure，不制造假失败。

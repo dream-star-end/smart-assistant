@@ -319,7 +319,7 @@ describe("socket — applyServerMessages 合并 server canonical", () => {
       archivedThroughSeq: 2,
       archivedCount: 2,
       serverUpdatedAt: 10,
-      invalidateProjectionCache: true,
+      invalidateHistoryCache: true,
     });
     expect(sess.messages.map((message) => message.id)).toEqual(["a3"]);
   });

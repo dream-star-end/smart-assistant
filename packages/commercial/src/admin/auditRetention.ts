@@ -104,16 +104,6 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
     days: 90,
     predicate: "status IN ('sent','failed')",
   },
-  // durable turn dispatch(RFC §2)。error projection:revoked 行 90d 离场;active(revoked_at
-  // IS NULL)随 dispatch(FK ON DELETE CASCADE,dispatch GC 时一并清)。turn_dispatches 本表
-  // 因 terminal/manual 用不同龄列(terminal_at vs resolved_at)+ open 永不 GC,单列 TTL 表达不了,
-  // 走 bespoke sweepResolvedTurnDispatches(见下,由 sweeper tick 驱动)。
-  {
-    table: "turn_dispatch_error_projections",
-    column: "revoked_at",
-    days: 90,
-    predicate: "revoked_at IS NOT NULL",
-  },
 ] as const;
 
 /** 显式声明永久保留的审计表——出现在删除政策里=编程错误。 */
@@ -175,8 +165,6 @@ export interface AuditRetentionSweeperOptions {
   purgeFn?: (p: RetentionPolicy) => Promise<number>;
   /** 测试用注入:覆盖 session_goals 终态清理(默认 = sweepTerminalSessionGoals)。 */
   sessionGoalsPurgeFn?: () => Promise<number>;
-  /** 测试用注入:覆盖 turn_dispatches 终态清理(默认 = sweepResolvedTurnDispatches)。 */
-  turnDispatchesPurgeFn?: () => Promise<number>;
 }
 
 function defaultOnError(table: string, err: unknown): void {
@@ -262,41 +250,6 @@ export async function sweepTerminalSessionGoals(
   return r.rowCount ?? 0;
 }
 
-/** turn_dispatches 终态离场窗口(天)与单 tick 批量上限。 */
-export const TURN_DISPATCHES_SWEEP_DAYS = 90;
-export const TURN_DISPATCHES_SWEEP_BATCH = 5000;
-
-/**
- * durable turn dispatch(RFC §2)终态行离场(bespoke sweep,由 auditRetentionSweeper tick 驱动)。
- * 清理规则:terminal 行(terminal_at + 90d)或 manual_reconcile **已收敛**行(resolved_at + 90d);
- * open(admitted/accepted/rejecting)与 manual_reconcile 未收敛(resolved_at IS NULL)**永不** GC
- * (未收敛前豁免)。级联清 active projection(FK ON DELETE CASCADE)。幂等 + 单 tick 批量上限。
- *
- * 为何不进 AUDIT_RETENTION_POLICIES:注册表按 table 去重、且是单列 TTL;本表两条离场条件用不同
- * 龄列(terminal_at / resolved_at)+ open 豁免,属 bespoke 形态,沿用 session_goals 同款挂载。
- */
-export async function sweepResolvedTurnDispatches(
-  runQuery: (sql: string, params: unknown[]) => Promise<{ rowCount: number | null }>,
-  days = TURN_DISPATCHES_SWEEP_DAYS,
-  batch = TURN_DISPATCHES_SWEEP_BATCH,
-): Promise<number> {
-  const sql = `
-    WITH victims AS (
-      SELECT dispatch_id
-        FROM turn_dispatches
-       WHERE (status = 'terminal' AND terminal_at < NOW() - ($1 || ' days')::interval)
-          OR (status = 'manual_reconcile' AND resolved_at IS NOT NULL
-              AND resolved_at < NOW() - ($1 || ' days')::interval)
-       ORDER BY COALESCE(resolved_at, terminal_at) ASC
-       LIMIT $2
-    )
-    DELETE FROM turn_dispatches td
-     USING victims v
-     WHERE td.dispatch_id = v.dispatch_id`;
-  const r = await runQuery(sql, [String(days), batch]);
-  return r.rowCount ?? 0;
-}
-
 export function startAuditRetentionSweeper(
   opts: AuditRetentionSweeperOptions = {},
 ): AuditRetentionSweeperHandle {
@@ -306,9 +259,6 @@ export function startAuditRetentionSweeper(
   const sessionGoalsPurgeFn =
     opts.sessionGoalsPurgeFn ??
     (() => sweepTerminalSessionGoals((sql, params) => query(sql, params)));
-  const turnDispatchesPurgeFn =
-    opts.turnDispatchesPurgeFn ??
-    (() => sweepResolvedTurnDispatches((sql, params) => query(sql, params)));
   const policies = resolveRetentionPolicies(opts.overrides);
   let stopped = false;
 
@@ -330,15 +280,6 @@ export function startAuditRetentionSweeper(
       } catch (err) {
         onError("session_goals", err);
         deleted["session_goals"] = -1;
-      }
-    }
-    // bespoke:turn_dispatches 终态离场(terminal_at / resolved_at 双龄列 + open 豁免,非单列 TTL)。
-    if (!stopped) {
-      try {
-        deleted["turn_dispatches"] = await turnDispatchesPurgeFn();
-      } catch (err) {
-        onError("turn_dispatches", err);
-        deleted["turn_dispatches"] = -1;
       }
     }
     const summary = Object.entries(deleted)

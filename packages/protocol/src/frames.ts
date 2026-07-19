@@ -591,6 +591,10 @@ export const OutboundContentBlock = Type.Union([
     toolUseBlockId: Type.Optional(Type.String()),
     toolName: Type.String(),
     isError: Type.Boolean(),
+    /** Complete tool result. `preview` is display-only and may be shortened. */
+    output: Type.Optional(Type.String()),
+    /** Exact structured result before text rendering, when supplied by the engine. */
+    outputJson: Type.Optional(Type.Unknown()),
     preview: Type.Optional(Type.String()),
     parentToolUseId: Type.Optional(Type.String()),
   }),

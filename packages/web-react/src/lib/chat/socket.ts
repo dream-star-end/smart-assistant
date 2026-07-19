@@ -41,14 +41,13 @@ import {
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
 import {
-  isCollapsedTapeAnchor,
+  isTurnTapeProcessControl,
   isDispatchLostCode,
   isDispatchTerminalRow,
-  tapeAnchorKey,
+  turnTapeProcessKey,
 } from "./render";
 import {
   applyServerIncremental,
-  applyHistoryProjectionPatches,
   detectServerTerminalTurns,
   mergeArchivedHistory,
   mergeFullServerWins,
@@ -1807,9 +1806,26 @@ export class ChatSocket {
     // 同时剥离 _media 里的 localSrc：那是乐观渲染用的 blob: URL，持久化到 IndexedDB 后
     // reload 即成死链（blob 是页面生命周期内的）。剥离后重开会话的媒体回落 url 走签名管线。
     const needsLocalSrcStrip = s.messages.some((m) => m._media?.some((r) => r.localSrc));
-    let messages = s.messages.some((m) => m._genPlaceholder)
-      ? s.messages.filter((m) => !m._genPlaceholder)
+    const shouldStrip = (message: ChatMessage) =>
+      !!message._genPlaceholder ||
+      typeof message._turnTapeProcessLoadedFrom === "string" ||
+      message.id.startsWith("projection-") ||
+      message.id.startsWith("oc-dispatch-err:") ||
+      !!(message as ChatMessage & { _historyProjection?: unknown })._historyProjection;
+    let messages = s.messages.some(shouldStrip)
+      ? s.messages.filter((message) => !shouldStrip(message))
       : s.messages;
+    // Process expansion is a view concern. Persist only the tiny control row,
+    // reset to collapsed, so IndexedDB never grows with a 50 MB tool record.
+    if (messages.some((message) => message._turnTapeProcessExpanded)) {
+      messages = messages.map((message) => {
+        if (!message._turnTapeProcessExpanded) return message;
+        const clean = { ...message };
+        delete clean._turnTapeProcessExpanded;
+        delete clean._turnTapeProcessCursor;
+        return clean;
+      });
+    }
     if (needsLocalSrcStrip) {
       messages = messages.map((m) => {
         if (!m._media?.some((r) => r.localSrc)) return m;
@@ -1869,12 +1885,17 @@ export class ChatSocket {
       createdAt: stored.createdAt,
     });
     s.messages = Array.isArray(stored.messages)
-      ? stored.messages.map((message) => {
+      ? stored.messages
+        .filter((message) =>
+          !message.id.startsWith("projection-") &&
+          !message.id.startsWith("oc-dispatch-err:") &&
+          !(message as ChatMessage & { _historyProjection?: unknown })._historyProjection,
+        )
+        .map((message) => {
           const routing = normalizeRetiredRouting(message._routing);
           return routing !== message._routing ? { ...message, _routing: routing } : message;
         })
       : [];
-    applyHistoryProjectionPatches(s.messages);
     s.lastAt = typeof stored.lastAt === "number" ? stored.lastAt : s.lastAt;
     s.updatedAt = stored.updatedAt;
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
@@ -1954,10 +1975,10 @@ export class ChatSocket {
       /** 载荷的 SessionDetail.modelId(会话级模型选择,server canonical):携带时 server-wins
        *  镜像进会话态(缺省=服务端无值,保留本地,与侧栏 listSessions 合并同语义)。 */
       modelId?: string;
-      /** Projection revision paired with maxSeq; set only after payload acceptance. */
+      /** History revision paired with maxSeq; set only after payload acceptance. */
       historyRevision?: number;
-      /** Legacy backend fallback: invalidate hydrated projections on every full read. */
-      invalidateProjectionCache?: boolean;
+      /** Legacy backend fallback: invalidate hydrated history on every full read. */
+      invalidateHistoryCache?: boolean;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -1977,7 +1998,7 @@ export class ChatSocket {
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;
-    // 终态收敛(RFC §5 M5):先从载荷推导「已收尾 turn → 终态类别」。error projection(§2.5)、
+    // 终态收敛:先从载荷推导「已收尾 turn → 终态类别」。verified failure status、
     // 持久化 error 卡、真 tape 生成行都在此被识别,合并后 convergeTerminalTurns 显式清发送态 +
     // 落 user 行终态,不再依赖「completion-evidence 恰好命中」的巧合路径。
     const terminalTurns = detectServerTerminalTurns(msgs);
@@ -1988,8 +2009,8 @@ export class ChatSocket {
       incomingHistoryRevision >= 0;
     const historyRevisionChanged =
       hasHistoryRevision && incomingHistoryRevision !== s._historyRevision;
-    const invalidateProjectionCache =
-      historyRevisionChanged || (full && archive?.invalidateProjectionCache === true);
+    const invalidateHistoryCache =
+      historyRevisionChanged || (full && archive?.invalidateHistoryCache === true);
     // P1 缺席删除只在「载荷携带版本且 ≥ 水位」的 full 上授权;无版本信息的载荷照常合并但不授权
     // (缺席不可证)。活跃轮守卫:发送中的轮绝不被载荷自证清除 —— **但载荷携带该活跃轮的精确终态
     // 证据时给守卫开口**(server 权威胜),让合并按证据收敛本地乐观行,而非把已终态轮永久保护住。
@@ -2005,7 +2026,7 @@ export class ChatSocket {
           {
             deletionAuthority: hasVersion,
             activeClientMessageId,
-            invalidateProjectionCache,
+            invalidateHistoryCache,
           },
         )
       : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId, {
@@ -2049,7 +2070,7 @@ export class ChatSocket {
 
   /**
    * 终态收敛(RFC §5 M5):REST 对账载荷自证「已收尾 turn」时,显式落 user 行终态并清发送态。
-   * 覆盖 durable dispatch 下真 final 帧永不到达的丢 turn 场景(error projection / 静默收尾),
+   * 覆盖 durable dispatch 下真 final 帧永不到达的丢 turn场景(verified status / 静默收尾),
    * 不依赖既有 completion-evidence 的巧合命中。
    *  - completed:user 行 → replied;error:user 行 → error(不覆盖已 replied)。
    *  - 该 turn 恰为当前活跃在飞轮 → clearSendingState 收口("回复中"停转、drain 推进)。
@@ -2094,22 +2115,19 @@ export class ChatSocket {
   }
 
   /** Archive-page revision mismatch recovery. Bypass the ordinary debounce:
-   * the page was captured from a different projection generation, so a full
+   * the page was captured from a different history generation, so a full
    * history reconciliation is required before retrying pagination. */
   syncHistoryNow(sessId: string): void {
     void this.deps.syncSession?.(sessId);
   }
 
   /**
-   * §9 折叠卷展开:把折叠 anchor 拉回的一页 chat-safe 投影记录并入会话。**定位按 (_turnTapeId,
-   * tapeSha, anchor id) 三元组**(tapeAnchorKey),严禁按 _seq 批量替换(同 _seq 上并列多条 projection
-   * 虚拟行,按 _seq 会误伤)。折叠 anchor **保留**在 messages(标 `_tapeExpanded`,render 层切成
-   * 分节头 + 展开行),展开行为 server 权威内容水合(`_source:'server'` + `_tapeExpandedFrom`,合并保护
-   * 见 persist:P1 缺席豁免 + mergeLocalClientFields 单调保留展开标记)。
+   * 将一页真实 immutable tape records 并入过程控制行之后。定位只按
+   * (_turnTapeId,tapeSha,control id)，不会按共享 _seq 批量替换其它内容。
    *
    * **展开行共享 anchor 的 _seq/_orderSeq**(沿用"归档 anchor 展开共享 _seq"既有语义)→ 不新增
    * distinct _seq,故**不推进同步游标、不改 maxSeq/totalMessageCount 口径**(按 anchor 计不变)。
-   * 分页续拉:anchor 已展开时**追加**新页(按 id 去重),更新 `_tapeExpandCursor`(null=已拉全)。
+   * 分页续拉:anchor 已展开时**追加**新页(按 id 去重),更新 `_turnTapeProcessCursor`(null=已拉全)。
    */
   applyExpandedTapeRecords(
     sessId: string,
@@ -2119,23 +2137,40 @@ export class ChatSocket {
   ): void {
     const s = this.sessions.get(sessId);
     if (!s) return;
-    const anchorIdx = s.messages.findIndex((m) => m?.id === anchorId && isCollapsedTapeAnchor(m));
+    const anchorIdx = s.messages.findIndex((m) => m?.id === anchorId && isTurnTapeProcessControl(m));
     if (anchorIdx < 0) return; // anchor 不在(会话已切/被合并覆盖)→ 静默放弃,不误伤
     const anchor = s.messages[anchorIdx];
-    const key = tapeAnchorKey(anchor);
-    // 会话内该 anchor 已有的展开行 id(分页续拉去重:重复页 / 重叠游标不重复插入)。
-    const existing = new Set<string>();
-    for (const m of s.messages) {
-      if (m?._tapeExpandedFrom === key && typeof m.id === "string") existing.add(m.id);
-    }
-    const mapped: ChatMessage[] = [];
+    const key = turnTapeProcessKey(anchor);
+    // Initial timeline already includes the exact assistant/error narrative
+    // records. Process paging encounters those same physical ordinals, so the
+    // whole tape section is merged by immutable id and sorted by authoritative
+    // ordinal. This preserves the Agent's actual order without duplicating or
+    // replacing the immediately visible final answer.
+    const isSameTapeRecord = (message: ChatMessage): boolean =>
+      message.id !== anchor.id &&
+      message._turnTapeId === anchor._turnTapeId &&
+      (anchor._turnTapeSha256 === undefined ||
+        message._turnTapeSha256 === undefined ||
+        message._turnTapeSha256 === anchor._turnTapeSha256);
+    const existingSection = s.messages.filter(isSameTapeRecord);
+    const sectionIds = new Set(existingSection.map((message) => message.id));
+    const idsOutsideSection = new Set(
+      s.messages.filter((message) => !isSameTapeRecord(message)).map((message) => message.id),
+    );
+    const mergedSection = [...existingSection];
     for (const r of Array.isArray(records) ? records : []) {
-      if (!r || typeof r.id !== "string" || r.id.length === 0 || existing.has(r.id)) continue;
-      existing.add(r.id);
-      mapped.push({
+      if (
+        !r ||
+        typeof r.id !== "string" ||
+        r.id.length === 0 ||
+        sectionIds.has(r.id) ||
+        idsOutsideSection.has(r.id)
+      ) continue;
+      sectionIds.add(r.id);
+      mergedSection.push({
         ...r,
         _source: "server",
-        _tapeExpandedFrom: key,
+        _turnTapeProcessLoadedFrom: key,
         _turnTapeId: anchor._turnTapeId,
         _turnTapeSha256: anchor._turnTapeSha256,
         _turnTapeComplete: true,
@@ -2149,17 +2184,32 @@ export class ChatSocket {
         ts: typeof r.ts === "number" && Number.isFinite(r.ts) ? r.ts : anchor.ts,
       });
     }
-    // 折叠 anchor 就地标记展开态(渲染态权威;随 IndexedDB persist 往返保留)。
-    anchor._tapeExpanded = true;
-    anchor._tapeExpandCursor = nextCursor;
-    if (mapped.length > 0) {
-      // 插在**该 anchor 连续展开行段之后**(anchor 或其已展开行),保证分页续拉顺序稳定、不跨轮插入。
-      let insertAt = anchorIdx + 1;
-      for (let i = anchorIdx + 1; i < s.messages.length; i++) {
-        if (s.messages[i]?._tapeExpandedFrom === key) insertAt = i + 1;
-        else break;
-      }
-      s.messages = [...s.messages.slice(0, insertAt), ...mapped, ...s.messages.slice(insertAt)];
+    const originalPosition = new Map(mergedSection.map((message, index) => [message.id, index]));
+    const ordinalOf = (message: ChatMessage): number =>
+      typeof message._turnTapeOrdinal === "number"
+        ? message._turnTapeOrdinal
+        : typeof message._recordOrdinal === "number"
+          ? message._recordOrdinal
+          : Number.MAX_SAFE_INTEGER;
+    mergedSection.sort((a, b) => {
+      const byOrdinal = ordinalOf(a) - ordinalOf(b);
+      if (byOrdinal !== 0) return byOrdinal;
+      const ao = typeof a._ocEventOrdinal === "number" ? a._ocEventOrdinal : Number.MAX_SAFE_INTEGER;
+      const bo = typeof b._ocEventOrdinal === "number" ? b._ocEventOrdinal : Number.MAX_SAFE_INTEGER;
+      if (ao !== bo) return ao - bo;
+      return (originalPosition.get(a.id) ?? 0) - (originalPosition.get(b.id) ?? 0);
+    });
+    // 过程控制就地标记展开态。
+    anchor._turnTapeProcessExpanded = true;
+    anchor._turnTapeProcessCursor = nextCursor;
+    if (mergedSection.length > 0) {
+      const withoutSection = s.messages.filter((message) => !isSameTapeRecord(message));
+      const controlIndex = withoutSection.findIndex((message) => message.id === anchor.id);
+      s.messages = [
+        ...withoutSection.slice(0, controlIndex + 1),
+        ...mergedSection,
+        ...withoutSection.slice(controlIndex + 1),
+      ];
       s._blockIdToMsgId = new Map();
       s._agentGroups = new Map();
       rebuildIndexes(s);
@@ -2171,18 +2221,18 @@ export class ChatSocket {
   }
 
   /**
-   * §9 折叠卷收起:抹掉某折叠 anchor 的展开行、还原折叠态。展开行是可再拉的只读缓存,收起纯本地
+   * Collapse one process cursor:remove fetched rows and return to the small control. The rows are reloadable, so this is local only
    * (不触 server)。游标重置 → 下次展开从首页(cursor=null)重拉。
    */
-  collapseTape(sessId: string, anchorId: string): void {
+  collapseTurnProcess(sessId: string, anchorId: string): void {
     const s = this.sessions.get(sessId);
     if (!s) return;
-    const anchor = s.messages.find((m) => m?.id === anchorId && isCollapsedTapeAnchor(m));
-    if (!anchor || anchor._tapeExpanded !== true) return;
-    const key = tapeAnchorKey(anchor);
-    anchor._tapeExpanded = false;
-    anchor._tapeExpandCursor = undefined;
-    s.messages = s.messages.filter((m) => m._tapeExpandedFrom !== key);
+    const anchor = s.messages.find((m) => m?.id === anchorId && isTurnTapeProcessControl(m));
+    if (!anchor || anchor._turnTapeProcessExpanded !== true) return;
+    const key = turnTapeProcessKey(anchor);
+    anchor._turnTapeProcessExpanded = false;
+    anchor._turnTapeProcessCursor = undefined;
+    s.messages = s.messages.filter((m) => m._turnTapeProcessLoadedFrom !== key);
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
@@ -2567,10 +2617,10 @@ export class ChatSocket {
       ts: Date.now(),
     };
     // 重试语义分流(RFC §5):
-    //  - **dispatch 终态**(error projection / _errorCode ∈ {dispatch_lost, service_restart} 指向同轮):
+    //  - **dispatch 终态**(_dispatchTerminal / 稳定错误码指向同轮):
     //    server 已**证明该 clientMessageId 未被接受或已终态**,复用旧 id 只会撞 admitUserTurn 的
     //    previously_failed 幂等错误帧、永远起不了新 turn。故铸**新 clientMessageId = 新逻辑 turn**,
-    //    并清掉旧轮残留的 dispatch error 行(投影/错误卡)。
+    //    并清掉旧轮残留的 durable dispatch status。
     //  - 其余 **resend-uncertain**(网络失败等,不确定是否已达 server):**复用旧 id + attempt 递增**,
     //    靠 gateway inbound 幂等去重防重复计费(dedup 保护),绝不铸新 id。
     if (this.isDispatchTerminalFailure(sess, userMsg)) {
@@ -2602,10 +2652,10 @@ export class ChatSocket {
 
   /**
    * 该 user 行的发送失败是否源于 durable dispatch 终态(RFC §5 重试分流判据)。**去枚举化**:
-   * 判据走 server 持久标记(projection id 前缀 / `_dispatchTerminal`)+ 不可变 tape 稳定协议码,
+   * 判据走 server 持久标记 `_dispatchTerminal` + 不可变 tape 稳定协议码,
    * 而非前端枚举内部 failureCode —— 单一权威 isDispatchTerminalRow。命中任一:
    *  - user 行自身被标记 dispatch 终态(或带稳定协议码);
-   *  - 同 _clientMessageId(= user 行 id)存在 dispatch 终态行(projection / _dispatchTerminal / 稳定码)。
+   *  - 同 _clientMessageId(= user 行 id)存在 dispatch 终态行(_dispatchTerminal / 稳定码)。
    * 命中 → 重试铸新 clientMessageId;否则复用旧 id(dedup 保护)。
    */
   private isDispatchTerminalFailure(sess: ChatSession, userMsg: ChatMessage): boolean {

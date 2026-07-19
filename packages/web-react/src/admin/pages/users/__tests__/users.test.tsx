@@ -8,6 +8,22 @@ vi.mock('chart.js/auto', () => ({
   },
 }))
 
+// jsdom has no layout engine, so render the virtual list's logical items while
+// keeping production on react-virtuoso's real viewport implementation.
+vi.mock('react-virtuoso', async () => {
+  const React = await import('react')
+  return {
+    VirtuosoMockContext: React.createContext(null),
+    Virtuoso: ({ data = [], itemContent, components = {} }: any) => React.createElement(
+      React.Fragment,
+      null,
+      components.Header ? React.createElement(components.Header) : null,
+      ...data.map((item: unknown, index: number) => itemContent(index, item)),
+      components.Footer ? React.createElement(components.Footer) : null,
+    ),
+  }
+})
+
 vi.mock('../../../lib/adminApi', () => ({
   ApiError: class ApiError extends Error {},
   adminGet: vi.fn(),
@@ -330,17 +346,17 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     expect(screen.queryByRole('button', { name: '允许' })).toBeNull()
     expect(mockGet).toHaveBeenCalledWith('/sessions/web-1', {
       user_id: '1',
-      view: 'chat',
+      view: 'timeline',
     })
 
-    fireEvent.click(screen.getByRole('button', { name: /从云端加载更早的历史/ }))
+    fireEvent.click(screen.getByRole('button', { name: /向上滚动加载更早历史/ }))
     expect(await screen.findByText('云端更早的问题')).toBeTruthy()
     expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
       user_id: '1',
       before: 0,
       limit: 100,
     })
-    expect(screen.queryByRole('button', { name: /从云端加载更早的历史/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /向上滚动加载更早历史/ })).toBeNull()
   })
 
   test('切换会话后丢弃上一会话迟到的归档响应，绝不混入当前会话', async () => {
@@ -368,7 +384,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     const sessionB = screen.getByRole('button', { name: '查看会话：会话二' })
     fireEvent.click(sessionA)
     expect(await screen.findByText('管理员看到的用户问题')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /从云端加载更早的历史/ }))
+    fireEvent.click(screen.getByRole('button', { name: /向上滚动加载更早历史/ }))
     await waitFor(() =>
       expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
         user_id: '1',

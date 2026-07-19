@@ -69,6 +69,11 @@ export function SessionViewerModal({
   const [archiveLoading, setArchiveLoading] = useState(false)
   const [archiveError, setArchiveError] = useState(false)
   const scrollRef = useRef<HTMLDivElement | null>(null)
+  const [scrollParent, setScrollParent] = useState<HTMLDivElement | null>(null)
+  const bindScroll = useCallback((node: HTMLDivElement | null) => {
+    scrollRef.current = node
+    setScrollParent((current) => current === node ? current : node)
+  }, [])
   const initialScrollPendingRef = useRef(false)
   const archiveScrollAnchorRef = useRef<ScrollAnchor | null>(null)
   const loadGenerationRef = useRef(0)
@@ -94,7 +99,7 @@ export function SessionViewerModal({
     setLoading(true)
     void adminGet<ChatSessionPayload>(`/sessions/${encodeURIComponent(sessionId)}`, {
       user_id: userId,
-      view: 'chat',
+      view: 'timeline',
     })
       .then((result) => {
         if (generation !== loadGenerationRef.current) return
@@ -239,7 +244,7 @@ export function SessionViewerModal({
         sign={signMedia}
         authKey={sessionId && userId ? `admin-session:${userId}:${sessionId}` : null}
       >
-        <div ref={scrollRef} className="h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg">
+        <div ref={bindScroll} className="h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg">
           {loading && !payload ? (
             <MessageListSkeleton />
           ) : error ? (
@@ -265,6 +270,7 @@ export function SessionViewerModal({
               cb={EMPTY_CARD_CALLBACKS}
               onRespondPermission={READ_ONLY_PERMISSION}
               readOnly
+              scrollParent={scrollParent}
             />
           ) : null}
         </div>

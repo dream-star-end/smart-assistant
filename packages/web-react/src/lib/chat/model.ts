@@ -108,18 +108,39 @@ export type GenPlaceholder = {
  * 形态对齐现网 _appendSubagentBlock 写入。
  */
 export type ChildBlock = {
-  kind: "text" | "thinking" | "tool_use" | "tool_result" | "tool_output_tail";
+  kind:
+    | "text"
+    | "thinking"
+    | "tool_use"
+    | "tool_result"
+    | "tool_output_tail"
+    | "plan"
+    | "goal"
+    | "error"
+    | "final";
   blockId?: string;
   text?: string;
   toolName?: string;
+  toolUseBlockId?: string;
   inputPreview?: string;
   inputJson?: unknown;
   partialJson?: string;
+  preview?: string;
+  isError?: boolean;
   _partial?: boolean;
   _completed?: boolean;
   output?: string;
+  outputJson?: unknown;
   error?: boolean;
   bashTail?: BashTail;
+  tail?: string;
+  totalBytes?: number;
+  truncatedHead?: boolean;
+  explanation?: string;
+  steps?: Array<{ step: string; status: string }>;
+  objective?: string;
+  status?: string;
+  meta?: unknown;
 };
 
 /**
@@ -174,20 +195,6 @@ export type ChatMessage = {
   _turnOwnerId?: string;
   /** Master-authored exact logical turn key used for targeted billing updates. */
   _turnKey?: string;
-  /** Sanitized server history control row. Raw runtime events never enter the
-   * browser chat projection; these rows are hidden and persist only cursor or
-   * bounded Bash-tail update semantics. */
-  _historyProjection?:
-    | { kind: "checkpoint" }
-    | {
-        kind: "bash-tail";
-        toolUseId: string;
-        parentToolUseId?: string;
-        tail: string;
-        totalBytes: number;
-        truncatedHead: boolean;
-      };
-
   // ── user ──
   status?: UserMsgStatus;
   _media?: MediaRef[];
@@ -213,13 +220,12 @@ export type ChatMessage = {
   _errorCode?: string;
   _errorDetail?: string;
   /**
-   * durable turn dispatch(RFC §5)server 侧持久化标记:该行**证明**其 _clientMessageId 的
-   * dispatch 已终态失败(受理未执行/服务重启中断等,免单)。error projection 虚拟行恒带
-   * `_dispatchLost`;`_dispatchTerminal` 是**去枚举化**的重试判据单一权威(重试铸新 clientMessageId
-   * 靠它,不靠前端枚举内部 failureCode)。两者均由 server 铸,前端只读。
+   * durable turn dispatch server 侧持久化标记:该行证明其 _clientMessageId 的
+   * dispatch 已终态失败。`_turnStatusRecord` 表示它是状态记录、不是 Agent 输出。
    */
   _dispatchLost?: boolean;
   _dispatchTerminal?: boolean;
+  _turnStatusRecord?: boolean;
 
   // ── lossless turn tape 水合标记（v2 tape;server-authored 行携带，前端只读）──
   /** 该行所属的 lossless turn tape id（tape 是一个原子同步单元）。 */
@@ -231,39 +237,40 @@ export type ChatMessage = {
   _turnTapeOrdinal?: number;
   /** tape 内容 sha256。§9 折叠行展开的三元组定位键之一（(_turnTapeId, _turnTapeSha256, anchor id)）。 */
   _turnTapeSha256?: string;
+  /** Exact runtime envelope persisted by the gateway. */
+  _runtimeEvent?: unknown;
+  _runtimeSource?: string;
+  _ocEventOrdinal?: number;
+  /** Exact ordered structured events folded into a single readable plan/goal card. */
+  _eventHistory?: unknown[];
 
-  // ── §9 会话读物化投影：折叠行 / 展开态 / 截断（server 铸折叠标记，前端只读；展开态本地渲染态）──
+  // ── 真实 turn tape 的惰性过程入口（server 铸控制标记，前端只读）──
   /**
-   * 折叠 anchor 行（RFC §9.1）：大 tape 的投影超总量上限时，server 只回一条折叠 anchor 而非 N 条
-   * 展开行。渲染为折叠卡（"本轮完整输出 N MB，点击加载"）。终态谓词见 render.isCollapsedAnchorTerminalEvidence：
-   * 折叠 anchor + 终态 `_dispatchOutcome` = 该轮"终态存在证据"（参与清 in-flight / 抑制 error projection），
-   * 但**不是**"内容已展开"（不触发评分卡/MetaRow 等需正文的门；折叠行非"末条 assistant 正文"）。
+   * 过程控制行只负责记录页游标。最终 assistant 正文始终来自 immutable tape 并立即显示；
+   * 思考、工具与运行事件由用户展开后按物理 ordinal 分页读取。
    */
-  _tapeCollapsed?: boolean;
-  /** 折叠行：本轮完整输出字节数（折叠卡文案 "N MB" 的来源）。 */
-  _tapeTotalBytes?: number;
+  _turnTapeProcess?: boolean;
+  /** 该轮不可变记录总字节数，仅作辅助信息，不替代任何正文。 */
+  _turnTapeTotalBytes?: number;
+  /** 该轮待惰性读取的真实过程记录数。 */
+  _turnTapeProcessCount?: number;
   /** 折叠行：dispatch 终态（completed|interrupted|crashed|executed_error|not_accepted）。终态存在证据判据。 */
   _dispatchOutcome?: string;
-  /** 卷级投影截断标记（per-tape 投影超 512KB/512 行尾部截断）：即便展开也只能到投影上限，余量走分页端点。 */
-  _projectionTruncated?: boolean;
-  /**
-   * 逐记录截断（RFC §9.1，工具输出等单记录超 64KB）：该记录被截断，此值 = 完整字节数。
-   * **存在 ⟺ 该记录被截断**（前端以本字段为截断判据，见 render.isRecordTruncated）。server 线上另带
-   * `_truncated:true`（wire boolean），但前端**不读** `_truncated`——它与 assistant 续写标记 `_truncated:string`
-   * 同名会歧义，故以无歧义的 `_fullBytes` 作单一判据。截断工具卡尾部渲染"输出已截断（共 N MB），查看完整"。
-   */
-  _fullBytes?: number;
-  /** M-§9-1:截断记录在投影内的 record ordinal(server 附)——"查看完整"分块读的定位键。 */
+  /** 记录在 immutable tape 内的物理 ordinal。 */
   _recordOrdinal?: number;
 
-  // ── 折叠 anchor 的本地展开态（渲染态 + 会话内存；随 IndexedDB persist 往返保留，不推同步游标）──
-  /** 折叠 anchor 已本地展开：render 层据此把折叠卡切成"分节头 + 已展开的展开行"，展开行是 server 权威内容水合。 */
-  _tapeExpanded?: boolean;
-  /** 展开行标记 = 来源折叠 anchor 的 anchorKey（(_turnTapeId::_turnTapeSha256::anchorId)）。合并保护键：
-   *  server 只回折叠 anchor、从不回展开行，故展开行须豁免"缺席即删"，且合并遇折叠 anchor 时保留本地展开。 */
-  _tapeExpandedFrom?: string;
-  /** 折叠 anchor 已展开到的下一页游标；null=已拉全（无"继续加载"）；number=还有更多页。 */
-  _tapeExpandCursor?: number | null;
+  /** 超大物理记录尚未取 payload；这是加载状态，不是内容替身。 */
+  _payloadDeferred?: boolean;
+  _payloadBytes?: number;
+  _payloadSha256?: string;
+
+  // ── 过程控制的本地展开态（仅会话内存，不写回 server）──
+  /** 已开始显示真实 Agent 过程。 */
+  _turnTapeProcessExpanded?: boolean;
+  /** 已加载记录所属的过程控制键。 */
+  _turnTapeProcessLoadedFrom?: string;
+  /** 下一页物理 ordinal；null=已读完。 */
+  _turnTapeProcessCursor?: number | null;
 
   /** 空轮 notice 标记。*/
   _emptyTurn?: boolean;
@@ -294,6 +301,8 @@ export type ChatMessage = {
   _partialRafPending?: boolean;
   _completed?: boolean;
   output?: string | null;
+  /** Exact structured tool result before any text-oriented rendering. */
+  outputJson?: unknown;
   error?: boolean;
   bashTail?: BashTail;
 
@@ -390,7 +399,7 @@ export type ChatSession = {
   _lastFrameSeq?: number;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
-  /** Server projection revision paired with `_maxSeq`; persisted across reload. */
+  /** Server history revision paired with `_maxSeq`; persisted across reload. */
   _historyRevision?: number;
   /** 已应用 full 载荷的 SessionDetail.updatedAt 水位:同步权威传播(P1 缺席删除)的版本护栏,
    *  只允许 updatedAt ≥ 此值的 full 执行缺席删除。仅进程内存,不随 StoredSession 落地

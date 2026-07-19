@@ -25,7 +25,7 @@ import {
   Wallet,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
@@ -40,7 +40,7 @@ import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { Alert, Avatar, Badge, Button, IconButton, Spinner } from "../ui";
-import { ChildBlockView } from "./AgentGroupCard";
+import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { Media } from "./media";
 import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
@@ -69,12 +69,6 @@ export type FeedbackContext = {
   textPreview: string;
 };
 
-export type TapeRecordsResult = {
-  records: ChatMessage[];
-  nextCursor: number | null;
-  total: number;
-} | null;
-
 export type CardCallbacks = {
   onRegenerate?: () => void;
   onContinue?: () => void;
@@ -83,24 +77,21 @@ export type CardCallbacks = {
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
   /**
-   * §9 展开折叠卷:拉一页投影记录并就地展开(cursor=null 首页,续拉传上次 nextCursor)。返回结果
-   * 供折叠卡管理 loading/error 局部态。缺省(demo/只读/未接线)→ 折叠卡为静态摘要,不可展开。
+   * 展开一轮真实 Agent 过程：按物理 ordinal 拉一页 immutable tape 记录。
    */
   onExpandTape?: (
     anchorId: string,
     tapeId: string,
     cursor: number | null,
   ) => Promise<{ ok: boolean; nextCursor?: number | null; error?: boolean; busy?: boolean }>;
-  /** §9 收起折叠卷(纯本地,抹展开行还原折叠态)。 */
+  /** 收起已加载过程(纯本地,下次可重新按页读取)。 */
   onCollapseTape?: (anchorId: string) => void;
-  /** §9 截断记录"查看完整":原样拉一页 tape 记录供内联抽屉显示更完整版本(不改会话内存)。 */
-  onFetchTapeRecords?: (tapeId: string, cursor: number | null) => Promise<TapeRecordsResult>;
-  /** §9(M-§9-1)单条超大记录分块读(ToolCard 查看完整真通路)。 */
-  onFetchTapeRecordChunk?: (
+  /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
+  onFetchTapeRecordPayload?: (
     tapeId: string,
     recordOrdinal: number,
-    offset: number,
-  ) => Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
+    expected: { recordId: string; role: string; contentSha256: string },
+  ) => Promise<ChatMessage[] | null>;
   /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
    *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
    *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
@@ -202,30 +193,48 @@ function MetaRow({ msg }: { msg: ChatMessage }) {
 // ─── 朗读（浏览器原生 SpeechSynthesis，无后端 TTS 依赖；不支持的浏览器整按钮隐藏） ───
 function SpeakButton({ getText }: { getText: () => string }) {
   const [speaking, setSpeaking] = useState(false);
+  const speechRun = useRef(0);
   const supported = typeof window !== "undefined" && "speechSynthesis" in window;
   // 卸载时停掉本条朗读，避免离开后还在念。
   useEffect(() => {
     return () => {
-      if (supported && speaking) window.speechSynthesis.cancel();
+      speechRun.current += 1;
+      if (supported) window.speechSynthesis.cancel();
     };
-  }, [supported, speaking]);
+  }, [supported]);
   if (!supported) return null;
   const toggle = () => {
     const synth = window.speechSynthesis;
     if (speaking) {
+      speechRun.current += 1;
       synth.cancel();
       setSpeaking(false);
       return;
     }
-    const text = getText().slice(0, 4000).trim();
+    const text = getText().trim();
     if (!text) return;
+    const run = speechRun.current + 1;
+    speechRun.current = run;
     synth.cancel(); // 停掉其它正在念的消息（全局单例）
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = "zh-CN";
-    u.onend = () => setSpeaking(false);
-    u.onerror = () => setSpeaking(false);
     setSpeaking(true);
-    synth.speak(u);
+    const speakFrom = (start: number) => {
+      if (speechRun.current !== run) return;
+      if (start >= text.length) {
+        setSpeaking(false);
+        return;
+      }
+      let end = Math.min(start + 1_500, text.length);
+      // 不在 UTF-16 代理对中间切块。块长只是浏览器队列的传输量子，不是总量上限。
+      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end -= 1;
+      const utterance = new SpeechSynthesisUtterance(text.slice(start, end));
+      utterance.lang = "zh-CN";
+      utterance.onend = () => speakFrom(end);
+      utterance.onerror = () => {
+        if (speechRun.current === run) setSpeaking(false);
+      };
+      synth.speak(utterance);
+    };
+    speakFrom(0);
   };
   return (
     <IconButton
@@ -338,22 +347,18 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
   );
 }
 
-// ═══════════════ §9 折叠卷卡(CollapseCard)═══════════════
+// ═══════════════ 真实 Agent 过程惰性入口 ═══════════════
 /**
- * 折叠 anchor 行渲染(RFC §9.1)。大 tape 投影超上限时 server 只回一条折叠 anchor;本卡是该轮内容的
- * **入口**而非正文——折叠态显示"本轮完整输出 N MB，点击加载",点击经 cb.onExpandTape 拉取投影记录
- * 就地展开(展开行由 MessageList 作为独立卡渲染在本卡之后)。展开后本卡收缩成**分节头**:承载"收起"
- * 与"继续加载更多"(分页游标 `_tapeExpandCursor` 非 null 时)。
- *
- * 终态存在证据(_dispatchOutcome 终态)只影响清发送态/抑制 error projection(见 render/persist),
- * 与本卡渲染正交;本卡不挂评分卡/MetaRow(折叠行非"末条 assistant 正文")。
+ * 正文不经过本卡：真实 final assistant 由会话首读直接显示。本卡只在用户需要时
+ * 分页读取思考、工具、委派和原始运行事件；分页批次不是总量上限。
  */
-export function CollapseCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks }) {
+export function TurnProcessCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
-  const expanded = msg._tapeExpanded === true;
-  const hasMore = typeof msg._tapeExpandCursor === "number"; // number 游标=还有下一页;null/undefined=已拉全
-  const sizeLabel = formatTapeBytes(msg._tapeTotalBytes) || "较大内容";
+  const expanded = msg._turnTapeProcessExpanded === true;
+  const hasMore = typeof msg._turnTapeProcessCursor === "number"; // number 游标=还有下一页;null/undefined=已拉全
+  const sizeLabel = formatTapeBytes(msg._turnTapeTotalBytes);
+  const count = msg._turnTapeProcessCount ?? 0;
   const tapeId = msg._turnTapeId;
   const canExpand = !!cb.onExpandTape && typeof tapeId === "string" && tapeId.length > 0;
 
@@ -373,7 +378,7 @@ export function CollapseCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks 
 
   if (!expanded) {
     return (
-      <div className="animate-in" data-testid="collapse-card">
+      <div className="animate-in" data-testid="turn-process-card">
         <button
           type="button"
           onClick={() => void doExpand(null)}
@@ -389,10 +394,10 @@ export function CollapseCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks 
           </span>
           <span className="min-w-0 flex-1 text-fg/90">
             {loading
-              ? "正在加载完整输出…"
+              ? "正在读取真实调用记录…"
               : error
                 ? "加载失败，点击重试"
-                : `本轮完整输出 ${sizeLabel}${canExpand ? "，点击加载" : ""}`}
+                : `Agent 调用过程${count > 0 ? `（${count} 条）` : ""}${canExpand ? "，点击展开" : ""}`}
           </span>
           {!loading && canExpand && <ChevronDown size={15} className="shrink-0 text-faint" />}
         </button>
@@ -400,17 +405,19 @@ export function CollapseCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks 
     );
   }
 
-  // 展开态:分节头(收起 / 继续加载 / 卷级截断提示)。展开行由 MessageList 渲染在本卡之后。
+  // 展开态分节头；真实记录由 MessageList 作为独立卡按原顺序渲染。
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-border bg-hover/40 px-3.5 py-2 text-xs text-muted">
       <FileText size={13} className="shrink-0" />
-      <span className="min-w-0">本轮完整输出 {sizeLabel} · 已展开</span>
+      <span className="min-w-0">
+        Agent 调用过程 · 已展开{sizeLabel ? ` · ${sizeLabel}` : ""}
+      </span>
       {hasMore && (
         <Button
           size="sm"
           variant="secondary"
           shape="pill"
-          onClick={() => void doExpand(msg._tapeExpandCursor ?? null)}
+          onClick={() => void doExpand(msg._turnTapeProcessCursor ?? null)}
           disabled={loading}
         >
           {loading ? <Spinner size={12} /> : "继续加载更多"}
@@ -425,11 +432,73 @@ export function CollapseCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks 
           收起
         </button>
       )}
-      {msg._projectionTruncated && (
-        <span className="basis-full text-[11px] text-faint">内容较多，部分记录已省略（仅展示投影上限内的记录）。</span>
-      )}
       {error && <span className="basis-full text-[11px] text-danger">加载失败，请重试。</span>}
     </div>
+  );
+}
+
+/** Durable dispatch failure rendered as status, never as Agent-authored text. */
+export function TurnStatusCard({
+  msg,
+  cb,
+  currentTurn,
+}: {
+  msg: ChatMessage;
+  cb: CardCallbacks;
+  currentTurn: boolean;
+}) {
+  const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
+  const retryTarget = msg._clientMessageId
+    ? cb.resolveRetryTarget?.(msg._clientMessageId)
+    : undefined;
+  return (
+    <div className="rounded-lg border border-warning/30 bg-warning/5 px-3.5 py-3 animate-in" role="status">
+      <div className="flex items-start gap-2.5">
+        <ShieldCheck size={16} className="mt-0.5 shrink-0 text-warning" />
+        <div className="min-w-0 flex-1">
+          <div className="text-[13px] font-medium text-fg">{presented.title}</div>
+          <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted">{presented.message}</div>
+        </div>
+        {currentTurn && retryTarget && cb.onRetrySend && (
+          <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onRetrySend?.(retryTarget)}>
+            <RotateCcw size={12} /> 重试
+          </Button>
+        )}
+        {currentTurn && !retryTarget && cb.onRegenerate && (
+          <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
+            <RotateCcw size={12} /> 重新尝试
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const LONG_MARKDOWN_STEP = 128 * 1024;
+const LIVE_MARKDOWN_TAIL = 64 * 1024;
+
+function ProgressiveMarkdown({ text, live = false }: { text: string; live?: boolean }) {
+  const [visibleChars, setVisibleChars] = useState(LONG_MARKDOWN_STEP);
+  const headEnd = Math.min(visibleChars, text.length);
+  const hasLiveGap = live && text.length > headEnd + LIVE_MARKDOWN_TAIL;
+  const liveTailStart = hasLiveGap ? text.length - LIVE_MARKDOWN_TAIL : text.length;
+  const primaryEnd = live && !hasLiveGap ? text.length : headEnd;
+  return (
+    <>
+      <Markdown signMedia live={live}>{text.slice(0, primaryEnd)}</Markdown>
+      {(hasLiveGap || (!live && headEnd < text.length)) && (
+        <button
+          type="button"
+          onClick={() => setVisibleChars((value) => value + LONG_MARKDOWN_STEP)}
+          className="mt-2 rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+        >
+          {hasLiveGap
+            ? `继续显示中间正文（还有 ${(liveTailStart - headEnd).toLocaleString()} 个字符）`
+            : "继续显示正文"}
+        </button>
+      )}
+      {hasLiveGap && <Markdown signMedia live>{text.slice(liveTailStart)}</Markdown>}
+    </>
   );
 }
 
@@ -506,11 +575,9 @@ export function AssistantCard({
               内部串类正文不进这里(bodyText 为空),只由下方红卡按码文案承载;
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
         {msg.text && !hasError ? (
-          <Markdown signMedia live={live}>
-            {msg.text}
-          </Markdown>
+          <ProgressiveMarkdown text={msg.text} live={live} />
         ) : hasError && presentedError?.bodyText ? (
-          <Markdown signMedia>{presentedError.bodyText}</Markdown>
+          <ProgressiveMarkdown text={presentedError.bodyText} />
         ) : live && !hasError ? (
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
@@ -685,7 +752,7 @@ export const ThinkingCard = memo(
                   i > 0 && "mt-2.5 border-t border-border/60 pt-2.5",
                 )}
               >
-                <Markdown>{seg}</Markdown>
+                <ProgressiveMarkdown text={seg} live={live} />
               </div>
             ))}
             {live && (
@@ -742,7 +809,7 @@ export function PlanCard({ msg }: { msg: ChatMessage }) {
   );
 }
 
-// Engine diagnostic projection. Platform controls and authoritative budgets
+// Engine diagnostic record. Platform controls and authoritative budgets
 // live in the goal dialog opened from the composer "+" menu; this row simply
 // makes native goal updates visible and updates in place through its stable block id.
 export function GoalCard({ msg }: { msg: ChatMessage }) {
@@ -772,6 +839,8 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const children = msg.childBlocks ?? [];
   const done = !!msg._completed;
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
+  const [visibleChildren, setVisibleChildren] = useState(100);
+  const [visibleEntries, setVisibleEntries] = useState(100);
   const collapsed = userCollapsed ?? done;
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
@@ -799,28 +868,53 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
       </button>
       {!collapsed && children.length > 0 && (
         <div className="space-y-2 border-t border-border px-3.5 py-2.5">
-          {children.map((ch, i) => (
+          {children.slice(0, visibleChildren).map((ch, i) => (
             <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
           ))}
+          {visibleChildren < children.length && (
+            <button
+              type="button"
+              onClick={() => setVisibleChildren((value) => value + 100)}
+              className="mx-auto block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+            >
+              继续加载过程（还有 {children.length - visibleChildren} 条）
+            </button>
+          )}
         </div>
       )}
       {!collapsed && entries.length > 0 && (
         <ul className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
-          {entries.slice(-6).map((e, i) => (
-            <li key={i} className="line-clamp-2 break-words" title={`[${e.phase}] ${e.text}`}>
+          {entries.slice(0, visibleEntries).map((e, i) => (
+            <li key={i} className="whitespace-pre-wrap break-words">
               <span className="text-faint">[{e.phase}]</span> {e.text}
             </li>
           ))}
+          {visibleEntries < entries.length && (
+            <li>
+              <button
+                type="button"
+                onClick={() => setVisibleEntries((value) => value + 100)}
+                className="mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+              >
+                继续加载委派记录（还有 {entries.length - visibleEntries} 条）
+              </button>
+            </li>
+          )}
         </ul>
       )}
       {!collapsed && done && msg.summary && (
-        <div className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">{msg.summary}</div>
+        <ProgressivePlainText
+          text={msg.summary}
+          className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted"
+        />
       )}
       {/* 折叠态展示结果摘要（完成后）——与 AgentGroupCard 折叠页脚一致。 */}
       {collapsed && done && msg.summary && (
         <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
           <Check size={13} className="mt-0.5 shrink-0 text-success" />
-          <span className="line-clamp-2">{msg.summary}</span>
+          <span className="line-clamp-2">
+            {msg.summary.slice(0, 500)}{msg.summary.length > 500 ? "…" : ""}
+          </span>
         </div>
       )}
     </div>

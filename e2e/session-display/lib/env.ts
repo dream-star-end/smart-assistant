@@ -9,7 +9,7 @@
 //   OC_E2E_TURNSTILE      默认 "bypass"(bypass 环境占位串;AuthGate BYPASS_TOKEN 同值)
 //   OC_E2E_MODEL          默认 gpt-5.6-sol(codex 引擎,与部署 smoke 同盲区面)
 //   OC_E2E_TURN_TIMEOUT   单轮回复上限 ms,默认 120000
-//   OC_E2E_PG_URL         §9 注入/种子用的 PG 连接串(仅预发;缺省 → 依赖 §9 的用例 skip)
+//   OC_E2E_PG_URL         direct-timeline 注入/种子用 PG 连接串(仅预发;缺省 → 依赖用例 skip)
 //   OC_E2E_SESSION_PREFIX 种子会话 id 前缀,默认 e2e-(便于批量清理)
 
 function required(name: string): string {

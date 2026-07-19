@@ -18,159 +18,15 @@
  * 流式：input 经 normalizeToolForDisplay/resolveToolInput 优先 inputJson、其次容错解析 partialJson —— Edit/Write
  * 的 diff/内容据此边流边渲；_completed 后切完整 inputJson。
  */
-import { AlertTriangle, Check, ChevronRight, FileText } from "lucide-react";
+import { Check, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { cn } from "../lib/utils";
-import type { ChatMessage } from "../lib/chat/model";
-import { formatTapeBytes, isRecordTruncated } from "../lib/chat/render";
-import type { TapeRecordsResult } from "./chat/cards";
 import { ToolBody } from "./tool/bodies";
 import { normalizeToolForDisplay, type ToolLike } from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { Badge, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
-
-/**
- * §9 截断工具输出卡尾部(RFC §9.1)。逐记录超 64KB 的工具输出被截断(带 `_fullBytes`),此处显示
- * "输出已截断（共 N MB），查看完整" —— 点击经同一 tape 记录端点拉取更完整版本,内联抽屉呈现。
- * server 端点亦 chat-safe 有界(单记录解析上限),故"完整"= 端点允许的更完整版本,非 exact 原始 payload。
- */
-/** 前端"查看完整"拼接上限:超出只展示前 4MB(避免超大记录拉爆内存/DOM)。 */
-const VIEW_FULL_MAX_BYTES = 4 * 1024 * 1024;
-
-function TruncatedRecordFooter({
-  message,
-  onFetch,
-  onFetchRecordChunk,
-}: {
-  message: ChatMessage;
-  onFetch?: (tapeId: string, cursor: number | null) => Promise<TapeRecordsResult>;
-  onFetchRecordChunk?: (
-    tapeId: string,
-    recordOrdinal: number,
-    offset: number,
-  ) => Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
-}) {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(false);
-  const [full, setFull] = useState<string | null>(null);
-  const [overflow, setOverflow] = useState(false);
-  // M6②(R3):分块拉取中途拿不到块(限频/瞬态错)→ 已拉到的是**半截**,标 incomplete 并显式提示,
-  // 绝不把半截当完整。
-  const [incomplete, setIncomplete] = useState(false);
-  const fullBytes = message._fullBytes;
-  const tapeId = message._turnTapeId;
-  const recordId = message.id;
-  // M-§9-1:截断行携 `_recordOrdinal`(server 附)→ 走按记录分块拉取真通路(不整卷)。
-  const recordOrdinal = (message as { _recordOrdinal?: number })._recordOrdinal;
-  const canChunk =
-    !!onFetchRecordChunk && typeof tapeId === "string" && tapeId.length > 0 && typeof recordOrdinal === "number";
-  const canView = canChunk || (!!onFetch && typeof tapeId === "string" && tapeId.length > 0);
-
-  const viewFull = async () => {
-    if (!tapeId || loading) return;
-    setLoading(true);
-    setError(false);
-    setOverflow(false);
-    setIncomplete(false);
-    try {
-      // 优先:M-§9-1 按记录分块拉取拼接(真"完整";上限 4MB UTF-8 字节,超出提示"内容过大")。
-      if (canChunk && onFetchRecordChunk && typeof recordOrdinal === "number") {
-        const enc = new TextEncoder();
-        const parts: string[] = [];
-        let bytes = 0;
-        let offset = 0;
-        for (let i = 0; i < 64; i++) {
-          const res = await onFetchRecordChunk(tapeId, recordOrdinal, offset);
-          if (!res) {
-            // M6②(R3):中途拿不到块(限频/瞬态错)。已拉到内容为空 → 纯失败;非空 → 半截,标
-            // incomplete(显式"内容加载不完整,请稍后重试"),**绝不把半截冒充完整**。
-            if (parts.length === 0) setError(true);
-            else setIncomplete(true);
-            break;
-          }
-          // M6③(R3):4MB 上限按 **UTF-8 字节**(TextEncoder)非 JS 字符数。加本块会越限 → 停在整块
-          // 边界(server 单块已按 utf8 安全切,故不切裂多字节字符),标 overflow 只展示已拉部分。
-          const chunkBytes = enc.encode(res.chunk).length;
-          if (bytes + chunkBytes > VIEW_FULL_MAX_BYTES) {
-            setOverflow(true);
-            break;
-          }
-          parts.push(res.chunk);
-          bytes += chunkBytes;
-          if (typeof res.nextOffset !== "number") break;
-          offset = res.nextOffset;
-        }
-        if (parts.length > 0) setFull(parts.join(""));
-        return;
-      }
-      // 兜底:老分页扫描(端点仅回截断预览)——跨页找该记录(≤12 页)。
-      if (!onFetch) { setError(true); return; }
-      let cursor: number | null = null;
-      for (let page = 0; page < 12; page++) {
-        const res: TapeRecordsResult = await onFetch(tapeId, cursor);
-        if (!res) {
-          setError(true);
-          break;
-        }
-        const hit = res.records.find((r) => r?.id === recordId);
-        if (hit) {
-          const text =
-            typeof hit.output === "string" && hit.output.length > 0
-              ? hit.output
-              : typeof hit.text === "string"
-                ? hit.text
-                : "";
-          setFull(text);
-          break;
-        }
-        if (typeof res.nextCursor !== "number") {
-          setError(true); // 扫完全部页仍未命中
-          break;
-        }
-        cursor = res.nextCursor;
-      }
-    } catch {
-      setError(true);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const sizeLabel = formatTapeBytes(fullBytes);
-  return (
-    <div className="mt-2 border-t border-dashed border-border pt-2 text-xs text-muted">
-      <div className="flex flex-wrap items-center gap-2">
-        <AlertTriangle size={13} className="shrink-0 text-warning" />
-        <span>输出已截断{sizeLabel ? `（共 ${sizeLabel}）` : ""}</span>
-        {full === null && canView && (
-          <button
-            type="button"
-            onClick={() => void viewFull()}
-            disabled={loading}
-            aria-busy={loading}
-            className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 text-muted hover:text-fg disabled:opacity-60 [@media(hover:none)]:min-h-9 [@media(hover:none)]:py-2"
-          >
-            {loading ? <Spinner size={12} /> : <FileText size={12} />} 查看完整
-          </button>
-        )}
-      </div>
-      {error && <div className="mt-1 text-[11px] text-danger">未能加载完整内容，请重试。</div>}
-      {incomplete && (
-        <div className="mt-1 text-[11px] text-warning">内容加载不完整，请稍后重试。</div>
-      )}
-      {overflow && (
-        <div className="mt-1 text-[11px] text-warning">内容过大，已展示前 4MB。</div>
-      )}
-      {full !== null && (
-        <pre className="mt-1.5 max-h-96 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-[11px] text-fg/90 [overflow-wrap:anywhere]">
-          {full}
-        </pre>
-      )}
-    </div>
-  );
-}
 
 // 图标底色按工具语义分色(对齐设计稿 .tic.tn-*);error 单独走红。
 const TONE_TILE: Record<string, string> = {
@@ -181,19 +37,108 @@ const TONE_TILE: Record<string, string> = {
   neutral: "bg-hover text-muted",
 };
 
-export function ToolCard({
-  message,
-  onFetchTapeRecords,
-  onFetchTapeRecordChunk,
-}: {
-  message: ToolLike;
-  onFetchTapeRecords?: (tapeId: string, cursor: number | null) => Promise<TapeRecordsResult>;
-  onFetchTapeRecordChunk?: (
-    tapeId: string,
-    recordOrdinal: number,
-    offset: number,
-  ) => Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
-}) {
+const RAW_TEXT_STEP = 128 * 1024;
+
+function rawText(value: unknown): string {
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2) ?? String(value);
+}
+
+function hasExactRecord(message: ToolLike): boolean {
+  return (
+    message.inputJson !== undefined ||
+    !!message.partialJson ||
+    !!message.inputPreview ||
+    message.output != null ||
+    message.outputJson !== undefined ||
+    message.text != null ||
+    message.bashTail != null
+  );
+}
+
+function ProgressiveRawText({ label, text }: { label: string; text: string }) {
+  const [visibleChars, setVisibleChars] = useState(RAW_TEXT_STEP);
+  const visible = Math.min(visibleChars, text.length);
+
+  return (
+    <section>
+      <div className="mb-1 text-[11px] font-medium text-faint">{label}</div>
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg">
+        {text.slice(0, visible)}
+      </pre>
+      {visible < text.length && (
+        <button
+          type="button"
+          onClick={() => setVisibleChars((value) => value + RAW_TEXT_STEP)}
+          className="mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+        >
+          继续显示原始内容（还有 {(text.length - visible).toLocaleString()} 个字符）
+        </button>
+      )}
+    </section>
+  );
+}
+
+/**
+ * 结构化工具卡只负责易读展示；这里始终保留 tape 中的原始输入/输出作为权威记录。
+ * 长内容按固定步长逐段挂载，但没有总量上限，也不会用摘要替换原文。
+ */
+function ExactToolRecord({ message }: { message: ToolLike }) {
+  const sections: Array<{ label: string; text: string }> = [];
+  if (message.inputJson !== undefined) {
+    sections.push({ label: "原始输入", text: rawText(message.inputJson) });
+  } else if (message.partialJson) {
+    sections.push({ label: "原始流式输入", text: message.partialJson });
+  } else if (message.inputPreview) {
+    sections.push({ label: "原始输入", text: message.inputPreview });
+  }
+  if (message.output != null) {
+    sections.push({ label: "原始输出", text: rawText(message.output) });
+  }
+  if (message.outputJson !== undefined && message.outputJson !== message.output) {
+    sections.push({ label: "原始结构化输出", text: rawText(message.outputJson) });
+  }
+  if (message.text != null && message.text !== message.output) {
+    sections.push({ label: "原始文本", text: rawText(message.text) });
+  }
+  if (message.bashTail != null) {
+    sections.push({ label: "原始终端尾记录", text: rawText(message.bashTail) });
+  }
+
+  return (
+    <div className="mt-3 space-y-3 border-t border-border pt-3">
+      {sections.map((section) => (
+        <ProgressiveRawText key={section.label} label={section.label} text={section.text} />
+      ))}
+    </div>
+  );
+}
+
+/** Reusable for specialized cards that intentionally omit the generic tool shell. */
+export function ExactToolRecordDisclosure({ message }: { message: ToolLike }) {
+  const [showExact, setShowExact] = useState(false);
+  if (!hasExactRecord(message)) return null;
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setShowExact((value) => !value)}
+        aria-expanded={showExact}
+        className="mt-3 flex items-center gap-1.5 text-xs text-muted hover:text-fg"
+      >
+        <ChevronRight
+          size={13}
+          aria-hidden="true"
+          className={cn("transition-transform", showExact && "rotate-90")}
+        />
+        {showExact ? "收起原始完整记录" : "查看原始完整记录"}
+      </button>
+      {showExact && <ExactToolRecord message={message} />}
+    </>
+  );
+}
+
+export function ToolCard({ message }: { message: ToolLike }) {
   const display = normalizeToolForDisplay(message);
   const name = display.name;
   const input = display.input;
@@ -209,11 +154,10 @@ export function ToolCard({
   const isRunning = !completed && !isError && !isCancelled;
   const statusLabel = isRunning ? "运行中" : isError ? "失败" : isCancelled ? "已取消" : "完成";
 
-  // §9 逐记录截断(仅主流 tool 行携带 `_fullBytes`;agent-group 子块无此字段 → false)。
-  const showTruncated = isRecordTruncated(message as ChatMessage);
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
-  const hasBody = hasInput || hasOutput || isError || showTruncated;
+  const hasExact = hasExactRecord(message);
+  const hasBody = hasInput || hasOutput || isError || hasExact;
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
@@ -275,13 +219,7 @@ export function ToolCard({
       {open && hasBody && (
         <div className="border-t border-border px-3.5 py-2.5 [&>*:first-child]:mt-0">
           <ToolBody name={name} input={input} tool={renderTool} />
-          {showTruncated && (
-            <TruncatedRecordFooter
-              message={message as ChatMessage}
-              onFetch={onFetchTapeRecords}
-              onFetchRecordChunk={onFetchTapeRecordChunk}
-            />
-          )}
+          {hasExact && <ExactToolRecordDisclosure message={message} />}
         </div>
       )}
     </div>

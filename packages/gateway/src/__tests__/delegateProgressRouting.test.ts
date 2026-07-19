@@ -253,7 +253,7 @@ describe('resolveDelegateProgressRouting — 防御:断链/环/超深/杂 channe
   })
 })
 
-describe('toNestedDelegateProgressLine — 嵌套帧重写成带层级前缀的非终态文本行', () => {
+describe('toNestedDelegateProgressLine — 嵌套 rich block 原样挂卡，纯生命周期帧转非终态文本', () => {
   const args = { runId: 'R1', agentId: 'coder', label: 'reviewer↳coder' }
 
   it('tool 帧 → text 行,复用一级 runId,带层级前缀,末尾换行', () => {
@@ -271,6 +271,7 @@ describe('toNestedDelegateProgressLine — 嵌套帧重写成带层级前缀的�
       agentId: 'coder',
       phase: 'text',
       text: '↳ reviewer↳coder: 调用工具 Bash\n',
+      block: { kind: 'text', text: '↳ reviewer↳coder: 调用工具 Bash\n' },
     })
   })
 
@@ -310,21 +311,35 @@ describe('toNestedDelegateProgressLine — 嵌套帧重写成带层级前缀的�
     assert.equal(line?.text, '↳ reviewer↳coder: 开始委派给 coder: 修 bug\n')
   })
 
-  it('thinking / text 帧 → null(不外泄嵌套思考、不逐 delta 刷原始文本)', () => {
-    assert.equal(
-      toNestedDelegateProgressLine(
-        makeDelegateProgressBlock({ runId: 'R2', agentId: 'coder', phase: 'thinking', text: '想…' }),
-        args,
-      ),
-      null,
+  it('thinking / text 帧保留为一级卡内的真实非终态子记录', () => {
+    const thinking = toNestedDelegateProgressLine(
+      makeDelegateProgressBlock({ runId: 'R2', agentId: 'coder', phase: 'thinking', text: '想…' }),
+      args,
     )
-    assert.equal(
-      toNestedDelegateProgressLine(
-        makeDelegateProgressBlock({ runId: 'R2', agentId: 'coder', phase: 'text', text: 'hello' }),
-        args,
-      ),
-      null,
+    assert.equal(thinking?.phase, 'text')
+    assert.equal((thinking?.block as any)?.text, '↳ reviewer↳coder: 想…\n')
+
+    const text = toNestedDelegateProgressLine(
+      makeDelegateProgressBlock({ runId: 'R2', agentId: 'coder', phase: 'text', text: 'hello' }),
+      args,
     )
+    assert.equal(text?.phase, 'text')
+    assert.equal((text?.block as any)?.text, '↳ reviewer↳coder: hello\n')
+  })
+
+  it('rich nested block is rebound without changing any content', () => {
+    const exact = `${'q'.repeat(40_000)}EXACT_NESTED_END`
+    const line = toNestedDelegateProgressLine({
+      kind: 'delegate_progress',
+      runId: 'R2',
+      agentId: 'coder',
+      phase: 'text',
+      text: 'legacy preview',
+      block: { kind: 'text', text: exact },
+    }, args)
+    assert.equal(line?.runId, 'R1')
+    assert.equal(line?.phase, 'text')
+    assert.equal((line?.block as any)?.text, exact)
   })
 
   it('空 detail → null(无可展示内容)', () => {

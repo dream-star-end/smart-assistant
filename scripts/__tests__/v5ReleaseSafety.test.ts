@@ -1128,7 +1128,7 @@ describe('v5 release safety lanes', () => {
     }))
     const capableWithoutFloor = invoke('remote')
     assert.notEqual(capableWithoutFloor.status, 0)
-    assert.match(capableWithoutFloor.stderr, /legacy migration manifest cannot declare history projection capability/)
+    assert.match(capableWithoutFloor.stderr, /legacy migration manifest cannot declare a post-floor history capability/)
 
     await writeFile(metadata, JSON.stringify({
       ...legacyMetadata,
@@ -1715,7 +1715,7 @@ describe('v5 release safety lanes', () => {
       '    *) return 2 ;;',
       '  esac',
       '}',
-      'probe_release_history_projection_revision() {',
+      'probe_release_direct_turn_timeline() {',
       '  case "$1" in',
       '    /release/candidate) return 0 ;;',
       '    /release/old) return 1 ;;',
@@ -2264,12 +2264,14 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('lossless-turn-tape-v2'))
     assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
     assert.ok(meta.capabilities.includes('history-projection-revision-v1'))
+    assert.ok(meta.capabilities.includes('direct-turn-timeline-v1'))
     assert.ok(meta.requiredMigrations.includes('0157_lossless_runtime_batches'))
     assert.ok(meta.requiredMigrations.includes('0164_admin_audit_model_admin_grant'))
     assert.ok(meta.requiredMigrations.includes('0166_prompt_queue'))
     assert.ok(meta.requiredMigrations.includes('0167_turn_waiver_receipts'))
     assert.ok(meta.requiredMigrations.includes('0174_selfheal_release_safety_fences'))
     assert.ok(meta.requiredMigrations.includes('0175_client_session_history_revision'))
+    assert.ok(meta.requiredMigrations.includes('0176_direct_turn_timeline'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, [
       'model_authority_v1',
@@ -2289,13 +2291,13 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('sessions-store-pg-v1'))
   })
 
-  test('history projection revision capability blocks mixed writers and unsafe downgrade', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-history-revision-')); dirs.push(dir)
+  test('direct turn timeline capability blocks mixed readers/writers and unsafe downgrade', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-direct-timeline-')); dirs.push(dir)
     const legacy = path.join(dir, 'legacy')
     const capable = path.join(dir, 'capable')
     for (const [release, capabilities] of [
       [legacy, ['dual-master-v1']],
-      [capable, ['dual-master-v1', 'history-projection-revision-v1']],
+      [capable, ['dual-master-v1', 'direct-turn-timeline-v1']],
     ] as const) {
       await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
       await writeFile(path.join(release, 'deploy/v5/release-metadata.json'), JSON.stringify({ capabilities }))
@@ -2322,32 +2324,32 @@ describe('v5 release safety lanes', () => {
       env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
     })
 
-    const mixed = invoke(`assert_history_projection_revision_pair '${legacy}' '${capable}' canary`)
+    const mixed = invoke(`assert_direct_turn_timeline_pair '${legacy}' '${capable}' canary`)
     assert.notEqual(mixed.status, 0)
     assert.match(mixed.stderr, /代际不一致/)
-    const same = invoke(`assert_history_projection_revision_pair '${capable}' '${capable}' canary`)
+    const same = invoke(`assert_direct_turn_timeline_pair '${capable}' '${capable}' canary`)
     assert.equal(same.status, 0, same.stderr)
 
-    const firstAdoption = invoke(`prepare_history_projection_revision_activation '${capable}' '${legacy}'`)
+    const firstAdoption = invoke(`prepare_direct_turn_timeline_activation '${capable}' '${legacy}'`)
     assert.equal(firstAdoption.status, 0, firstAdoption.stderr)
-    const zeroRevisionDowngrade = invoke(`prepare_history_projection_revision_activation '${legacy}' '${capable}'`)
+    const zeroRevisionDowngrade = invoke(`prepare_direct_turn_timeline_activation '${legacy}' '${capable}'`)
     assert.notEqual(zeroRevisionDowngrade.status, 0)
-    assert.match(zeroRevisionDowngrade.stderr, /不可逆 history projection 降级/)
+    assert.match(zeroRevisionDowngrade.stderr, /不可逆 direct turn timeline 降级/)
     assert.doesNotMatch(zeroRevisionDowngrade.stdout + zeroRevisionDowngrade.stderr, /STOP|RESTART/)
 
     const source = await readFile(deploy, 'utf8')
     const prepareBody = source.slice(
-      source.indexOf('prepare_history_projection_revision_activation()'),
-      source.indexOf('\n# Tri-state artifact probe', source.indexOf('prepare_history_projection_revision_activation()')),
+      source.indexOf('prepare_direct_turn_timeline_activation()'),
+      source.indexOf('\n# Tri-state artifact probe', source.indexOf('prepare_direct_turn_timeline_activation()')),
     )
-    assert.doesNotMatch(prepareBody, /systemctl stop|history_projection_revision_count/)
-    assert.match(prepareBody, /即使当前 revision 全为 0 也不安全/)
+    assert.doesNotMatch(prepareBody, /systemctl stop|turn_dispatches/)
+    assert.match(prepareBody, /即使当前没有失败行也存在首写竞态/)
     const activationBody = source.slice(
       source.indexOf('activate_release() {'),
       source.indexOf('\n# 传统 deploy/rollback', source.indexOf('activate_release() {')),
     )
     assert.ok(
-      activationBody.indexOf('prepare_history_projection_revision_activation "$reldir" "$prev"')
+      activationBody.indexOf('prepare_direct_turn_timeline_activation "$reldir" "$prev"')
         < activationBody.indexOf("mv -T '$tmplink' '$ACTIVE_SRC'"),
       'ordinary downgrade must hit the irreversible floor before the source flip',
     )
@@ -2356,9 +2358,9 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\n# 内部账号 allowlist', source.indexOf('canary() {')),
     )
     assert.ok(
-      canaryLane.indexOf('assert_history_projection_revision_pair "$DS_active_release" "$reldir" "canary pre-start"')
+      canaryLane.indexOf('assert_direct_turn_timeline_pair "$DS_active_release" "$reldir" "canary pre-start"')
         < canaryLane.indexOf('start_candidate_unit_and_wait "$cand"'),
-      'mixed projection generations must be rejected before candidate start',
+      'mixed timeline generations must be rejected before candidate start',
     )
     const recoveryBody = source.slice(
       source.indexOf('recover_cutover()'),
@@ -2368,12 +2370,12 @@ describe('v5 release safety lanes', () => {
       source.indexOf('cutover_transition()'),
       source.indexOf('\nbegin_cutover_step() {', source.indexOf('cutover_transition()')),
     )
-    assert.ok(recoveryBody.indexOf('systemctl stop "$unit"') < recoveryBody.indexOf('current_history_capability='))
+    assert.ok(recoveryBody.indexOf('systemctl stop "$unit"') < recoveryBody.indexOf('current_direct_capability='))
     assert.ok(recoveryBody.indexOf('rollback_partial 1') < recoveryBody.indexOf('cp -al "$remote_src/." "$restore_dir/"'))
 
     const remoteScript = recoveryBody.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE/)?.[1]
     assert.ok(remoteScript, 'recover_cutover remote body not found')
-    const fixture = await mkdtemp(path.join(tmpdir(), 'v5-history-recovery-')); dirs.push(fixture)
+    const fixture = await mkdtemp(path.join(tmpdir(), 'v5-direct-recovery-')); dirs.push(fixture)
     const cutoverRoot = path.join(fixture, 'cutovers')
     const nonce = 'a'.repeat(32)
     const bundle = path.join(cutoverRoot, nonce)
@@ -2410,7 +2412,7 @@ describe('v5 release safety lanes', () => {
       capabilities: ['durable-turn-dispatch-v1'],
     }))
     await writeFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), JSON.stringify({
-      capabilities: ['durable-turn-dispatch-v1', 'history-projection-revision-v1'],
+      capabilities: ['durable-turn-dispatch-v1', 'history-projection-revision-v1', 'direct-turn-timeline-v1'],
     }))
     await writeFile(envFile, 'DATABASE_URL=postgres://unused\nCURRENT=1\n', { mode: 0o600 })
     await writeFile(marker, JSON.stringify({ schema: 1, nonce }))
@@ -2459,22 +2461,22 @@ describe('v5 release safety lanes', () => {
       nonce,
       remoteSrc,
       envFile,
-      `openclaude-v5-history-test-${process.pid}.service`,
+      `openclaude-v5-direct-test-${process.pid}.service`,
       '18890',
       marker,
       path.join(fixture, 'maintenance.lock'),
-      'history-projection-revision-v1',
+      'direct-turn-timeline-v1',
     ], {
       cwd: root,
       encoding: 'utf8',
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
     })
     assert.notEqual(recovered.status, 0)
-    assert.match(recovered.stderr, /refusing irreversible history projection downgrade/)
+    assert.match(recovered.stderr, /refusing irreversible direct turn timeline downgrade/)
     assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
     await assert.rejects(readFile(marker, 'utf8'))
     const currentMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
-    assert.ok(currentMeta.capabilities.includes('history-projection-revision-v1'))
+    assert.ok(currentMeta.capabilities.includes('direct-turn-timeline-v1'))
 
     // A stage/pre-start failure may leave capable metadata in a partial source,
     // but it never served. The durable marker is the authority: restore the
@@ -2490,11 +2492,11 @@ describe('v5 release safety lanes', () => {
       nonce,
       remoteSrc,
       envFile,
-      `openclaude-v5-history-test-${process.pid}.service`,
+      `openclaude-v5-direct-test-${process.pid}.service`,
       '18890',
       marker,
       path.join(fixture, 'maintenance.lock'),
-      'history-projection-revision-v1',
+      'direct-turn-timeline-v1',
     ], {
       cwd: root,
       encoding: 'utf8',
@@ -2504,7 +2506,7 @@ describe('v5 release safety lanes', () => {
     assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
     await assert.rejects(readFile(marker, 'utf8'))
     const restoredMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
-    assert.ok(!restoredMeta.capabilities.includes('history-projection-revision-v1'))
+    assert.ok(!restoredMeta.capabilities.includes('direct-turn-timeline-v1'))
 
     const stagedBody = source.slice(
       source.indexOf('activate_staged_inner()'),

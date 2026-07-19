@@ -98,6 +98,99 @@ describe("TeamPanel 团队协作面板", () => {
     // 非系统 agent 照常回退裸 id(用户级 id 本身可读)
     expect(screen.getByText("coder")).toBeInTheDocument();
   });
+
+  test("单个队员的超长真实过程按批挂载且最终一条可达", () => {
+    const childBlocks = Array.from({ length: 205 }, (_, index) => ({
+      kind: "text" as const,
+      text: `team-child-${index}`,
+    }));
+    render(
+      <TeamPanel
+        members={[
+          member("a", { _delegateAgentId: "长任务队员", _completed: false, childBlocks }),
+        ]}
+        sig="long-process"
+      />,
+    );
+
+    expect(screen.getByText("team-child-0")).toBeInTheDocument();
+    expect(screen.queryByText("team-child-100")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /继续加载过程/ }));
+    expect(screen.getByText("team-child-100")).toBeInTheDocument();
+    expect(screen.queryByText("team-child-204")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /继续加载过程/ }));
+    expect(screen.getByText("team-child-204")).toBeInTheDocument();
+  });
+
+  test("队员卡可逐段查看真实工具记录直到最后一个字符", () => {
+    const marker = "EXACT_TEAM_RECORD_FINAL_MARKER";
+    const output = `${"x".repeat(270_000)}${marker}`;
+    render(
+      <TeamPanel
+        members={[
+          member("a", {
+            _delegateAgentId: "长任务队员",
+            _delegateGoal: "保留完整记录",
+            _completed: true,
+            inputJson: { goal: "保留完整记录" },
+            output,
+          }),
+        ]}
+        sig="exact-record"
+      />,
+    );
+
+    fireEvent.click(screen.getByText("团队协作 · 1 个智能体"));
+    fireEvent.click(screen.getByText("长任务队员"));
+    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
+    expect(document.body.textContent).toContain(marker);
+    expect(screen.queryByRole("button", { name: /继续显示原始内容/ })).not.toBeInTheDocument();
+  });
+
+  test("服务端完整 transcript 的结果、计划与终态事件均不被丢弃", () => {
+    const marker = "EXACT_CHILD_RESULT_FINAL_MARKER";
+    const output = `${"r".repeat(140_000)}${marker}`;
+    render(
+      <TeamPanel
+        members={[
+          member("a", {
+            _delegateAgentId: "完整过程队员",
+            _completed: true,
+            childBlocks: [
+              {
+                kind: "tool_result",
+                toolName: "Read",
+                toolUseBlockId: "child-read",
+                preview: "short preview",
+                output,
+                isError: false,
+              },
+              { kind: "plan", steps: [{ step: "真实计划步骤", status: "pending" }] },
+              { kind: "final", meta: { stopReason: "end_turn" } },
+            ],
+          }),
+        ]}
+        sig="raw-transcript-events"
+      />,
+    );
+
+    fireEvent.click(screen.getByText("团队协作 · 1 个智能体"));
+    fireEvent.click(screen.getByText("完整过程队员"));
+    expect(screen.getByRole("button", { name: /Read · 原始结果/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /子智能体计划事件/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /子智能体终态事件/ })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Read · 原始结果/ }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: /继续显示原始事件/ }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: /继续显示原始事件/ }));
+    expect(document.body.textContent).toContain(marker);
+  });
 });
 
 describe("TeamPanel 审查裁决徽记 + per-delegate 成本(债C/债D)", () => {

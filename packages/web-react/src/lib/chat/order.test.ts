@@ -113,7 +113,7 @@ describe("repairPostFinalProcessOrder", () => {
       row("c1", "assistant", {
         text: "",
         _clientMessageId: "u1",
-        _tapeCollapsed: true,
+        _turnTapeProcess: true,
         _dispatchOutcome: "completed",
       }),
       row("g1", "agent-group", { _turnOwnerId: "u1" }),

@@ -201,10 +201,10 @@ describe('admin session chat/archive/media handlers', () => {
     )
   })
 
-  test('chat view 返回完整热尾与同 anchor 的 lossless 投影，不受 legacy limit 切片', async () => {
+  test('timeline view 返回真实终态与 process cursor，不受 legacy limit 切片', async () => {
     const out = makeRes()
     await handleAdminGetSession(
-      makeReq('GET', '/api/admin/sessions/web-1?user_id=1&view=chat&limit=1'),
+      makeReq('GET', '/api/admin/sessions/web-1?user_id=1&view=timeline&limit=1'),
       out.res,
       ctx,
       deps,
@@ -216,7 +216,7 @@ describe('admin session chat/archive/media handlers', () => {
     assert.equal(result.body.session.archived_through_seq, 10)
     assert.equal(auditAfter.length, 1)
     assert.deepEqual(auditAfter[0], {
-      mode: 'chat',
+      mode: 'timeline',
       session_id: 'web-1',
       target_user_id: 'c:1',
       scoped_user_id: 'c:1',
@@ -231,7 +231,7 @@ describe('admin session chat/archive/media handlers', () => {
     await assert.rejects(
       () =>
         handleAdminGetSession(
-          makeReq('GET', '/api/admin/sessions/web-1?user_id=2&view=chat'),
+          makeReq('GET', '/api/admin/sessions/web-1?user_id=2&view=timeline'),
           out.res,
           ctx,
           deps,

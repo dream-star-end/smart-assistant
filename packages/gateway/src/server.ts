@@ -113,8 +113,8 @@ import {
   getClientSession,
   getClientSessionPartial,
   readArchivedMessages,
-  listTapeChatProjectionRecords,
-  readTapeRecordChunk,
+  listTurnTapeRecords,
+  readTapeRecordPayloadChunk,
   upsertClientSession,
   appendServerAuthoredMessage,
   deleteClientSession,
@@ -204,7 +204,7 @@ import {
 } from './delegateTimeout.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
-import { serveFileFdWithRange } from './httpRange.js'
+import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
 import { createLogger, type Logger } from './logger.js'
 import {
   startMetricsCollection,
@@ -1250,8 +1250,8 @@ const HIDDEN_REVIEWER_AGENT_ID = 'hidden-reviewer'
  *  披露"仍有未决意见"。默认 2;非法/缺省回退默认。硬护栏另见 MAX_HIDDEN_DELEGATIONS_PER_TURN。 */
 /** 审查委派的 context:喂给隐藏审查员的用户原始需求 + 队长待提交草稿。 */
 function buildTeamReviewContext(userTask: string, leaderDraft: string): string {
-  const task = userTask.trim().slice(0, 8000)
-  const draft = leaderDraft.trim().slice(0, 16000)
+  const task = userTask.trim()
+  const draft = leaderDraft.trim()
   return [
     '【审查任务】队长(全能助手)在团队协作后准备把下面的草稿作为最终答复提交给用户。',
     '请独立审查该草稿:找事实错误、遗漏、过度承诺、执行风险、以及与用户需求的偏离。',
@@ -1434,13 +1434,6 @@ export class Gateway {
   private log = createLogger({ module: 'gateway' })
   private _containerPreview: ContainerPreviewHandler
   private rateLimiter = new RateLimiter()
-  // M-§9-1 — per-user 内存令牌桶限频,给超大内容查看端点的**行分页**分支(GET tape/:tapeId/records)。
-  // 10 req/10s:翻页正常够用,又挡住脚本刷爆投影读(rows 大 JSONB detoast 成本高)。
-  private tapeRecordsRateLimiter = new RateLimiter({ maxRequests: 10, windowMs: 10_000 })
-  // M6②(R3)— 分块读分支(?recordOrdinal=…)**独立**令牌桶,30 req/10s。单条 4MB 记录按 256KB 分块
-  // 需 ~16 次连拉,共用 10/10s 桶会撞第 11 块 429、前端把半截冒充完整(已同批修前端 partial 提示)。
-  // 分块读只回单记录字节窗口(≤256KB),detoast 是单 record payload,成本远低于行分页,故给更宽配额。
-  private tapeRecordChunkRateLimiter = new RateLimiter({ maxRequests: 30, windowMs: 10_000 })
   private _wsKeepaliveTimer: ReturnType<typeof setInterval> | null = null
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
@@ -2363,7 +2356,6 @@ export class Gateway {
 
     // Start rate limiter cleanup
     this.rateLimiter.startCleanup()
-    this.tapeRecordsRateLimiter.startCleanup()
 
     // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
     eventBus.on('task.created', (ev) => {
@@ -3550,9 +3542,13 @@ export class Gateway {
       ;(async () => {
         let body: string
         try {
-          body = await this.readBody(req, 256 * 1024)
-        } catch {
-          this.sendJson(res, 400, { error: 'invalid body' })
+          body = await this.readBody(req, 4 * 1024 * 1024)
+        } catch (error) {
+          if (error instanceof Error && error.message === 'body too large') {
+            this.sendJson(res, 413, { error: 'request body too large', maxBytes: 4 * 1024 * 1024 })
+          } else {
+            this.sendJson(res, 400, { error: 'invalid body' })
+          }
           return
         }
         let data: { id?: unknown; text?: unknown; ts?: unknown; media?: unknown }
@@ -3569,7 +3565,10 @@ export class Gateway {
         const msg = {
           id: data.id,
           role: 'user' as const,
-          text: data.text.slice(0, 200_000),
+          // Persist exactly what the user sent. The former 200k-character
+          // slice silently changed the conversation and was indistinguishable
+          // from an Agent/model failure in a long prompt.
+          text: data.text,
           ts: typeof data.ts === 'number' && Number.isFinite(data.ts) ? data.ts : Date.now(),
           ...(Array.isArray(data.media) ? { _media: data.media } : {}),
         }
@@ -3578,13 +3577,102 @@ export class Gateway {
         else if (r.reason === 'already_exists') this.sendJson(res, 200, { ok: true, idempotent: true })
         else if (r.reason === 'session_not_found') this.sendJson(res, 404, { error: 'session_not_found' })
         else if (r.reason === 'session_deleted') this.sendJson(res, 410, { error: 'session_deleted' })
+        else if (r.reason === 'oversized') this.sendJson(res, 413, { error: 'session too large', reason: 'oversized' })
         else this.sendJson(res, 409, { error: r.reason ?? 'conflict' })
       })().catch(() => this.sendJson(res, 500, { error: 'append failed' }))
       return
     }
-    // 超大内容查看端点(RFC §9):GET /api/sessions/:id/tape/:tapeId/records?cursor=<int>&limit=<int>
-    // 从 chat 物化投影(complete/truncated)按行游标分页;分租((session_id,user_id,tape_id) 复合,
-    // 越权/不存在/无收敛投影统一 404);chat-safe 投影形态,绝不吐 exact 原始 payload。
+    // Raw immutable record payload. The response is the exact post-redaction
+    // JSON bytes committed in client_session_turn_tape_records. Range is
+    // supported, while a normal GET streams the entire record in bounded DB
+    // windows with HTTP backpressure; the window size is never a content cap.
+    const tapePayloadMatch = url.pathname.match(
+      /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/tape\/([A-Za-z0-9_-]{8,128})\/records\/([0-9]+)\/payload$/,
+    )
+    if (tapePayloadMatch) {
+      const sessId = tapePayloadMatch[1]
+      const tapeId = tapePayloadMatch[2]
+      const recordOrdinal = Number(tapePayloadMatch[3])
+      const userId = this.getUserId(req)
+      if ((req.method !== 'GET' && req.method !== 'HEAD') || !Number.isSafeInteger(recordOrdinal)) {
+        this.sendJson(res, req.method === 'GET' || req.method === 'HEAD' ? 400 : 405, {
+          error: req.method === 'GET' || req.method === 'HEAD' ? 'invalid ordinal' : 'method not allowed',
+        })
+        return
+      }
+      ;(async () => {
+        const head = await readTapeRecordPayloadChunk(sessId, userId, tapeId, recordOrdinal, 0, 1)
+        if (!head) {
+          this.sendJson(res, 404, { error: 'not found' })
+          return
+        }
+        const rawRange = req.headers.range
+        const rangeHeader = Array.isArray(rawRange) ? rawRange[0] : rawRange
+        const range = parseByteRange(rangeHeader, head.totalBytes)
+        const start = range?.start ?? 0
+        const endExclusive = range ? range.end + 1 : head.totalBytes
+        const contentLength = Math.max(0, endExclusive - start)
+        res.writeHead(range ? 206 : 200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': contentLength,
+          'Accept-Ranges': 'bytes',
+          'ETag': `"${head.contentSha256}"`,
+          'X-OpenClaude-Record-Id': head.msgId,
+          'X-OpenClaude-Record-Role': head.role,
+          'X-OpenClaude-Content-Sha256': head.contentSha256,
+          ...(range ? { 'Content-Range': `bytes ${start}-${endExclusive - 1}/${head.totalBytes}` } : {}),
+        })
+        if (req.method === 'HEAD' || contentLength === 0) {
+          res.end()
+          return
+        }
+        let offset = start
+        while (offset < endExclusive && !res.destroyed) {
+          const part = await readTapeRecordPayloadChunk(
+            sessId,
+            userId,
+            tapeId,
+            recordOrdinal,
+            offset,
+            Math.min(1024 * 1024, endExclusive - offset),
+          )
+          if (
+            !part || part.start !== offset || part.endExclusive <= offset ||
+            part.contentSha256 !== head.contentSha256 || part.totalBytes !== head.totalBytes
+          ) {
+            res.destroy(new Error('immutable tape payload changed during stream'))
+            return
+          }
+          offset = part.endExclusive
+          if (!res.write(part.chunk)) {
+            if (res.destroyed) return
+            const drained = await new Promise<boolean>((resolve) => {
+              const finish = (value: boolean) => {
+                res.off('drain', onDrain)
+                res.off('close', onClose)
+                res.off('error', onClose)
+                resolve(value)
+              }
+              const onDrain = () => finish(true)
+              const onClose = () => finish(false)
+              res.once('drain', onDrain)
+              res.once('close', onClose)
+              res.once('error', onClose)
+            })
+            if (!drained) return
+          }
+        }
+        if (!res.destroyed) res.end()
+      })().catch((error) => {
+        if (!res.headersSent) this.sendJson(res, 500, { error: 'tape payload read failed' })
+        else res.destroy(error as Error)
+      })
+      return
+    }
+
+    // Cursor-page every immutable physical/logical turn record. Large records
+    // return metadata plus the payload URL above; no generated content is
+    // shortened or replaced.
     const tapeRecordsMatch = url.pathname.match(
       /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/tape\/([A-Za-z0-9_-]{8,128})\/records$/,
     )
@@ -3598,43 +3686,16 @@ export class Gateway {
       }
       const cursorRaw = Number(url.searchParams.get('cursor'))
       const limitRaw = Number(url.searchParams.get('limit'))
-      const cursor = Number.isFinite(cursorRaw) && cursorRaw > 0 ? Math.floor(cursorRaw) : 0
+      const cursor = Number.isSafeInteger(cursorRaw) && cursorRaw > 0 ? cursorRaw : 0
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 200
-      // M-§9-1 — 全量分块读定位参数:recordOrdinal 选中该卷内某条超大记录、offset 为其内容内
-      // 字节偏移。透传给 backend(语义由 commercial pgBackend 落地;个人版 sqlite 桩恒 null)。
-      // 缺省/非法 → undefined(不改变既有行游标分页语义)。
-      const recordOrdinalRaw = Number(url.searchParams.get('recordOrdinal'))
-      const offsetRaw = Number(url.searchParams.get('offset'))
-      const recordOrdinal =
-        Number.isFinite(recordOrdinalRaw) && recordOrdinalRaw >= 0 ? Math.floor(recordOrdinalRaw) : undefined
-      const offset =
-        Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : undefined
-      // M6②(R3)— 分支特化限频:分块读(?recordOrdinal=…)走独立 30/10s 桶(4MB 需 ~16 块连拉);
-      // 行分页走 10/10s 桶。两桶隔离,分块连拉绝不撞行分页配额、也不再撞第 11 块 429。
-      const chunkBranch = recordOrdinal !== undefined
-      const limiter = chunkBranch ? this.tapeRecordChunkRateLimiter : this.tapeRecordsRateLimiter
-      const limiterChannel = chunkBranch ? 'tape-record-chunk' : 'tape-records'
-      if (!limiter.check(userId, limiterChannel)) {
-        this.sendJson(res, 429, { error: 'rate limited' })
-        return
-      }
-      if (recordOrdinal !== undefined) {
-        // 分块读分支:响应形状 {chunk,nextOffset,totalBytes} 与行分页 {records,...} 不同,
-        // 显式分流(readTapeRecordChunk 单请求 ≤256KB,绝不整卷;null=越权/不存在/未收敛→404)。
-        readTapeRecordChunk(sessId, userId, tapeId, recordOrdinal, offset ?? 0)
-          .then((r) => r
-            ? this.sendJson(res, 200, r)
-            : this.sendJson(res, 404, { error: 'not found' }))
-          .catch(() => this.sendJson(res, 500, { error: 'tape record chunk read failed' }))
-        return
-      }
-      listTapeChatProjectionRecords(sessId, userId, tapeId, cursor, limit)
-        .then((r) => r
-          ? this.sendJson(res, 200, r)
+      listTurnTapeRecords(sessId, userId, tapeId, cursor, limit)
+        .then((result) => result
+          ? this.sendJson(res, 200, result)
           : this.sendJson(res, 404, { error: 'not found' }))
         .catch(() => this.sendJson(res, 500, { error: 'tape records read failed' }))
       return
     }
+
     // 归档分页端点(长会话热尾巴+归档 §2.1):GET /api/sessions/:id/archive?before=<seq>&limit=<n>
     // 与下面 /api/sessions/:id 同款按 userId 分租(readArchivedMessages 内部 WHERE user_id=?
     // → userA 永远拿不到 userB 的归档)。commercial 侧 router.ts 的 BLOCKED_FOR_USER_RULES
@@ -3653,7 +3714,7 @@ export class Gateway {
       )
       // readArchivedMessages 直通:{ messages(升序), hasMore, oldestSeq }。storage 内部
       // 再 clamp limit;缺省/0 = 最新归档页(archived_through_seq+1 起)。
-      readArchivedMessages(sessId, userId, beforeSeq, limit, { projection: 'chat' })
+      readArchivedMessages(sessId, userId, beforeSeq, limit, { view: 'timeline' })
         .then((r) => this.sendJson(res, 200, r))
         .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
       return
@@ -3677,13 +3738,13 @@ export class Gateway {
         const useIncremental = Number.isFinite(sinceSeq) && sinceSeq > 0
         if (useIncremental) {
           getClientSessionPartial(sessId, userId, sinceSeq, {
-            projection: 'chat',
+            view: 'timeline',
             sinceHistoryRevision,
           })
             .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
             .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
         } else {
-          getClientSession(sessId, userId, { projection: 'chat' })
+          getClientSession(sessId, userId, { view: 'timeline' })
             .then((s) => {
               if (!s) {
                 this.sendJson(res, 404, { error: 'not found' })
@@ -8977,7 +9038,9 @@ export class Gateway {
             phase: error ? 'error' : 'done',
             isError: Boolean(error),
             text: error || output || '子 agent 已完成,无文本输出。',
-            maxLen: error ? 2_000 : 4_000,
+            // This is the actual terminal child result, not a UI preview.
+            // Keep it complete; large content is lazily mounted by the web UI.
+            maxLen: Number.MAX_SAFE_INTEGER,
           }),
         )
       }
@@ -9051,7 +9114,7 @@ export class Gateway {
             phase: 'error',
             isError: true,
             text: error,
-            maxLen: 2_000,
+            maxLen: Number.MAX_SAFE_INTEGER,
           }),
         )
       }
@@ -13136,7 +13199,7 @@ export class Gateway {
     // engine persist 之前完成,走正常归因/drain)。此处只 stash 两个服务端权威快照,
     // 供 _runDelegateTask 的审查门与审查任务书包装读取:
     session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
-    session._currentTurnUserText = (text ?? '').slice(0, 8000)
+    session._currentTurnUserText = text ?? ''
     // Fire-and-forget shadow hook. It receives the turn's already-resolved agent,
     // canonical trace id and raw text only long enough to hash/rank them; no result
     // is fed back into prompt assembly or execution.

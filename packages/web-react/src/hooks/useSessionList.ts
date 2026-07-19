@@ -263,7 +263,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           serverUpdatedAt: detail.updatedAt,
           modelId: freshModelId,
           historyRevision: detail.historyRevision,
-          invalidateProjectionCache: detail._projectionRevisionUnsupported === true,
+          invalidateHistoryCache: detail._historyRevisionUnsupported === true,
         });
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地

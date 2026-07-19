@@ -237,7 +237,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("UPDATE client_sessions SET deleted_at = updated_at WHERE title = '__deleted__'")
     }
   } catch { /* table just created with column already */ }
-  // Migration: projection revision for mutations that cannot be represented
+  // Migration: history revision for mutations that cannot be represented
   // by the per-message `_seq` cursor (for example an in-place waiver or a
   // client PUT that removes a previously persisted message). Incremental
   // reads are safe only when the caller presents this exact revision.
@@ -1371,7 +1371,7 @@ export interface ClientSession {
   /** 会话级模型选择(UI 恢复提示,非执行权威;缺省 = 未显式选择 → 前端回落 default_model)。
    *  写路径:建行 PUT 可携带;既有会话经 setClientSessionModel(PATCH)。upsert 未携带时保留既有值。 */
   modelId?: string
-  /** Server-owned revision for projection changes invisible to `_seq`.
+  /** Server-owned revision for history changes invisible to `_seq`.
    * Optional on write inputs for rolling callers; every DB read populates it. */
   historyRevision?: number
   // 归档水位(热尾巴 + 归档)。读侧透传给客户端:archivedCount 用于"还有 N 条"计数与
@@ -1438,8 +1438,8 @@ export function compareMessagesByOrder(a: MessageLike, b: MessageLike): number {
       : null
   const atape = tapeOrdinal(a)
   const btape = tapeOrdinal(b)
-  const arank = a._tapeCollapsed === true ? 0 : atape !== null ? 1 : 2
-  const brank = b._tapeCollapsed === true ? 0 : btape !== null ? 1 : 2
+  const arank = a._turnTapeProcess === true ? 0 : atape !== null ? 1 : 2
+  const brank = b._turnTapeProcess === true ? 0 : btape !== null ? 1 : 2
   if (arank !== brank) return arank - brank
   if (atape !== null && btape !== null && atape !== btape) return atape - btape
   const at = typeof a?.ts === 'number' && Number.isFinite(a.ts) ? a.ts : 0
@@ -1522,7 +1522,7 @@ export function normalizeAndAssignOrderSeqs<T extends MessageLike>(
   return { messages, maxOrderSeq }
 }
 
-/** Side-effect-free lazy compatibility projection for hot rows. A later write
+/** Side-effect-free lazy compatibility derivation for hot rows. A later write
  * runs the same derivation and persists the exact same frozen values. */
 export function deriveOrderSeqsForRead<T extends MessageLike>(
   messages: readonly T[],
@@ -1552,158 +1552,13 @@ export function deriveArchivedOrderSeqsForRead<T extends MessageLike>(messages: 
     .map(({ value }) => value)
 }
 
-/** Read projection for client-session history. Exact is the durable/admin
- * surface; chat is the bounded browser presentation surface. */
+/** Read view for client-session history. `timeline` hydrates the same
+ * authoritative records for the browser; it never substitutes bounded or
+ * materialized content. */
 export type ClientSessionReadOptions = {
-  projection?: 'exact' | 'chat'
+  view?: 'exact' | 'timeline'
   /** Revision paired with `sinceSeq`; missing/mismatch forces a full read. */
   sinceHistoryRevision?: number
-}
-
-export type HistoryProjection =
-  | { kind: 'checkpoint' }
-  | {
-      kind: 'bash-tail'
-      toolUseId: string
-      parentToolUseId?: string
-      tail: string
-      totalBytes: number
-      truncatedHead: boolean
-    }
-
-const CHAT_BASH_TAIL_MAX_BYTES = 256 * 1024
-
-function utf8Tail(value: string, maxBytes: number): { value: string; truncated: boolean } {
-  const bytes = Buffer.from(value, 'utf8')
-  if (bytes.length <= maxBytes) return { value, truncated: false }
-  let start = bytes.length - maxBytes
-  // A UTF-8 continuation byte cannot begin a decoded suffix. Move to the
-  // next code-point boundary; at most three additional bytes are skipped.
-  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++
-  return { value: bytes.subarray(start).toString('utf8'), truncated: true }
-}
-
-function projectionAnchorKey(message: MessageLike): string {
-  if (typeof message._turnTapeId === 'string') return `tape:${message._turnTapeId}`
-  if (isValidOrderSeq(message._orderSeq)) return `order:${message._orderSeq}`
-  if (typeof message._seq === 'number' && Number.isFinite(message._seq)) return `seq:${message._seq}`
-  return `id:${String(message.id ?? '')}`
-}
-
-function projectionCheckpoint(message: MessageLike): MessageLike {
-  const tapeId = typeof message._turnTapeId === 'string' ? message._turnTapeId : undefined
-  const seq = typeof message._seq === 'number' && Number.isFinite(message._seq) ? message._seq : undefined
-  const orderSeq = isValidOrderSeq(message._orderSeq) ? message._orderSeq : undefined
-  const suffix = tapeId ?? (seq !== undefined ? `seq-${seq}` : String(message.id ?? 'legacy'))
-  return {
-    id: `projection-checkpoint:${suffix}`,
-    role: 'runtime-event',
-    text: '',
-    ts: typeof message.ts === 'number' ? message.ts : 0,
-    _source: 'server',
-    ...(seq !== undefined ? { _seq: seq } : {}),
-    ...(orderSeq !== undefined ? { _orderSeq: orderSeq } : {}),
-    ...(tapeId !== undefined ? { _turnTapeId: tapeId } : {}),
-    ...(typeof message._turnTapeOrdinal === 'number'
-      ? { _turnTapeOrdinal: message._turnTapeOrdinal }
-      : {}),
-    ...(typeof message._turnTapeSha256 === 'string'
-      ? { _turnTapeSha256: message._turnTapeSha256 }
-      : {}),
-    _turnTapeExpanded: true,
-    _historyProjection: { kind: 'checkpoint' } satisfies HistoryProjection,
-  }
-}
-
-/**
- * Remove exact hidden runtime frames from the browser history projection.
- * Bash tail snapshots are coalesced to one sanitized, bounded patch per tool;
- * runtime-only anchors keep one tiny checkpoint so incremental cursors advance.
- * The input is never mutated and exact callers never invoke this helper.
- */
-export function projectClientSessionMessagesForChat(messages: readonly MessageLike[]): MessageLike[] {
-  const visible: MessageLike[] = []
-  const anchors = new Map<string, MessageLike>()
-  const represented = new Set<string>()
-  const tailWinner = new Map<string, { message: MessageLike; projection: Extract<HistoryProjection, { kind: 'bash-tail' }>; order: number }>()
-
-  for (let order = 0; order < messages.length; order++) {
-    const message = messages[order]!
-    const key = projectionAnchorKey(message)
-    anchors.set(key, message)
-    if (message.role !== 'runtime-event') {
-      visible.push(message)
-      represented.add(key)
-      continue
-    }
-    const raw = message._runtimeEvent
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-    const event = raw as Record<string, unknown>
-    if (event.type !== 'system' || event.subtype !== 'bash_output_tail') continue
-    const toolUseId = event.tool_use_id
-    if (typeof toolUseId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(toolUseId)) continue
-    const rawParentToolUseId = event.parent_tool_use_id
-    if (
-      rawParentToolUseId !== undefined &&
-      rawParentToolUseId !== null &&
-      rawParentToolUseId !== '' &&
-      (typeof rawParentToolUseId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(rawParentToolUseId))
-    ) continue
-    const parentToolUseId = typeof rawParentToolUseId === 'string' && rawParentToolUseId.length > 0
-      ? rawParentToolUseId
-      : undefined
-    const totalBytes = typeof event.total_bytes === 'number' && Number.isFinite(event.total_bytes)
-      ? Math.max(0, event.total_bytes)
-      : 0
-    const tail = utf8Tail(typeof event.tail === 'string' ? event.tail : '', CHAT_BASH_TAIL_MAX_BYTES)
-    const projection: Extract<HistoryProjection, { kind: 'bash-tail' }> = {
-      kind: 'bash-tail',
-      toolUseId,
-      ...(parentToolUseId ? { parentToolUseId } : {}),
-      tail: tail.value,
-      totalBytes,
-      truncatedHead: event.truncated_head === true || tail.truncated,
-    }
-    const target = `${parentToolUseId ?? ''}\0${toolUseId}`
-    const previous = tailWinner.get(target)
-    // Input order is the final deterministic tie-breaker. PG orders by the
-    // complete persisted chronology tuple before calling this helper.
-    if (!previous || totalBytes > previous.projection.totalBytes ||
-        (totalBytes === previous.projection.totalBytes && order > previous.order)) {
-      tailWinner.set(target, { message, projection, order })
-    }
-  }
-
-  for (const { message, projection } of tailWinner.values()) {
-    const key = projectionAnchorKey(message)
-    represented.add(key)
-    visible.push({
-      id: `projection-tail:${String(message.id ?? `${projection.parentToolUseId ?? ''}:${projection.toolUseId}`)}`,
-      role: 'runtime-event',
-      text: '',
-      ts: typeof message.ts === 'number' ? message.ts : 0,
-      _source: 'server',
-      ...(typeof message._seq === 'number' && Number.isFinite(message._seq) ? { _seq: message._seq } : {}),
-      ...(isValidOrderSeq(message._orderSeq) ? { _orderSeq: message._orderSeq } : {}),
-      ...(typeof message._turnTapeId === 'string' ? { _turnTapeId: message._turnTapeId } : {}),
-      ...(typeof message._turnTapeOrdinal === 'number'
-        ? { _turnTapeOrdinal: message._turnTapeOrdinal }
-        : {}),
-      ...(typeof message._turnTapeSha256 === 'string'
-        ? { _turnTapeSha256: message._turnTapeSha256 }
-        : {}),
-      _turnTapeExpanded: true,
-      _historyProjection: projection,
-    })
-  }
-
-  for (const [key, anchor] of anchors) {
-    if (!represented.has(key)) visible.push(projectionCheckpoint(anchor))
-  }
-  return visible
-    .map((value, index) => ({ value, index }))
-    .sort((a, b) => compareMessagesByOrder(a.value, b.value) || a.index - b.index)
-    .map(({ value }) => value)
 }
 
 /**
@@ -1885,8 +1740,8 @@ export function _stripClientPutMessages(
   serverSideMsgs: readonly MessageLike[] = [],
 ): MessageLike[] {
   // GET expands each immutable tape record into a normal message so existing
-  // clients can render it. A client can immediately PUT that projection back.
-  // Identify projections while their server-only tape markers are still
+  // clients can render it. A client can immediately PUT that read expansion back.
+  // Identify expanded records while their server-only tape markers are still
   // present; `_stripClientPutMessage` intentionally removes those markers.
   // The complete anchor in the already-stored hot tail is the authority for
   // which tape ids are safe to discard here.
@@ -2152,8 +2007,8 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
     const cur = merged[i]
     if (!cur) { deduped.push(cur); continue }
     const g = turnGroup[i]
-    // Hydrated tape records are a read projection returned to the browser.
-    // Never copy that projection back into the hot JSON tail on a later PUT;
+    // Hydrated tape records are a read expansion returned to the browser.
+    // Never copy that expansion back into the hot JSON tail on a later PUT;
     // the complete anchor already rehydrates the same immutable records.
     if (
       (cur as { _turnTapeExpanded?: unknown })._turnTapeExpanded === true &&
@@ -3984,9 +3839,7 @@ async function _sqliteGetClientSession(
     pinned: row.pinned === 1,
     createdAt: row.created_at,
     lastAt: row.last_at,
-    messages: options.projection === 'chat'
-      ? projectClientSessionMessagesForChat(exactMessages)
-      : exactMessages,
+    messages: exactMessages,
     updatedAt: row.updated_at,
     historyRevision: row.history_revision,
     ...(row.model_id ? { modelId: row.model_id } : {}),
@@ -4030,8 +3883,8 @@ export interface ClientSessionPartial extends ClientSession {
  * row enters incremental mode and subsequent GETs honour `since`.
  *
  * Incremental mode also requires `options.sinceHistoryRevision` to equal the
- * row's server-owned projection revision. Missing/mismatch returns the full
- * hot projection so rolling old clients self-heal without a coordinated cut.
+ * row's server-owned history revision. Missing/mismatch returns the full hot
+ * timeline so rolling old clients self-heal without a coordinated cut.
  *
  * `maxSeq` is computed from the actual messages array (NOT `next_seq`); per
  * Codex review #5, `next_seq - 1` may drift in the rare schema-mismatch case.
@@ -4089,8 +3942,6 @@ async function _sqliteGetClientSessionPartial(
     isPartial = false
   }
 
-  if (options.projection === 'chat') messages = projectClientSessionMessagesForChat(messages)
-
   return {
     id: row.id,
     userId: row.user_id,
@@ -4120,7 +3971,7 @@ export interface ReadArchivedMessagesResult {
   hasMore: boolean
   /** 本页最老一条的 _orderSeq(字段名保留兼容);空页 → null。 */
   oldestSeq: number | null
-  /** Projection revision captured with this archive page. */
+  /** History revision captured with this archive page. */
   historyRevision?: number
 }
 
@@ -4192,7 +4043,7 @@ async function _sqliteReadArchivedMessages(
     ? page[0]._orderSeq
     : null
   return {
-    messages: options.projection === 'chat' ? projectClientSessionMessagesForChat(page) : page,
+    messages: page,
     hasMore,
     oldestSeq,
     historyRevision: row.history_revision,
@@ -4220,32 +4071,36 @@ async function _sqliteGetEngineContextMessages(
   return deriveOrderSeqsForRead(msgs, row.archived_through_seq ?? 0)
 }
 
-/** 超大内容查看端点后端(RFC §9)。个人版无 tape_chat_projection 表 → 恒 null(端点回 404)。
- *
- * `recordOrdinal`/`offset`(可选,M-§9-1):单条超大记录的全量分块读定位 —— recordOrdinal 选
- * 中该卷内某条记录、offset 为其内容内的字节偏移。commercial pgBackend 是唯一有真实投影表的实现,
- * 语义由它落地;本 sqlite 桩只需**同步接口签名**(ClientSessionsBackend 类型从 sqliteBackend 派生),
- * 个人版恒 null 不改变。 */
-async function _sqliteListTapeChatProjectionRecords(
+/** 不可变 turn-tape 记录分页。个人版 SQLite 没有 commercial tape 表，恒 null。 */
+async function _sqliteListTurnTapeRecords(
   _sessionId: string,
   _userId: string,
   _tapeId: string,
   _cursor: number,
   _limit: number,
-  _recordOrdinal?: number,
-  _offset?: number,
 ): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
   return null
 }
 
-/** 同上:单条超大记录的分块读(M-§9-1 真通路)。个人版无投影表,恒 null=404。 */
-async function _sqliteReadTapeRecordChunk(
+/** 同上：读取单条不可变 JSON payload 的真实字节窗口。 */
+async function _sqliteReadTapeRecordPayloadChunk(
   _sessionId: string,
   _userId: string,
   _tapeId: string,
   _recordOrdinal: number,
   _offset: number,
-): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
+  _requestedBytes?: number,
+): Promise<{
+  chunk: Buffer
+  nextOffset: number | null
+  totalBytes: number
+  start: number
+  endExclusive: number
+  msgId: string
+  role: string
+  contentSha256: string
+  tapeSha256: string
+} | null> {
   return null
 }
 
@@ -4497,8 +4352,8 @@ const sqliteBackend = {
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
-  listTapeChatProjectionRecords: _sqliteListTapeChatProjectionRecords,
-  readTapeRecordChunk: _sqliteReadTapeRecordChunk,
+  listTurnTapeRecords: _sqliteListTurnTapeRecords,
+  readTapeRecordPayloadChunk: _sqliteReadTapeRecordPayloadChunk,
   deleteClientSession: _sqliteDeleteClientSession,
   renameClientSession: _sqliteRenameClientSession,
   setClientSessionModel: _sqliteSetClientSessionModel,
@@ -4604,11 +4459,11 @@ export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages']
 export const getEngineContextMessages: ClientSessionsBackend['getEngineContextMessages'] =
   (...args) => getActiveBackend().getEngineContextMessages(...args)
 
-export const listTapeChatProjectionRecords: ClientSessionsBackend['listTapeChatProjectionRecords'] =
-  (...args) => getActiveBackend().listTapeChatProjectionRecords(...args)
+export const listTurnTapeRecords: ClientSessionsBackend['listTurnTapeRecords'] =
+  (...args) => getActiveBackend().listTurnTapeRecords(...args)
 
-export const readTapeRecordChunk: ClientSessionsBackend['readTapeRecordChunk'] =
-  (...args) => getActiveBackend().readTapeRecordChunk(...args)
+export const readTapeRecordPayloadChunk: ClientSessionsBackend['readTapeRecordPayloadChunk'] =
+  (...args) => getActiveBackend().readTapeRecordPayloadChunk(...args)
 
 export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] =
   (...args) => getActiveBackend().deleteClientSession(...args)

@@ -14,7 +14,7 @@ describe('delegate progress sanitization', () => {
     assert.equal(out, 'hello world xxx…')
   })
 
-  it('streams text and thinking as bounded delegate_progress blocks', () => {
+  it('streams text as a delegate_progress compatibility summary', () => {
     const block = summarizeDelegateProgressEvent(
       { kind: 'block', block: { kind: 'text', text: 'child result' } },
       'run-1',
@@ -189,25 +189,35 @@ describe('makeDelegateBlockPassthrough (rich forward for main-chat-style renderi
     assert.equal(out.block.inputJson, code) // whitespace/indent preserved, not collapsed
   })
 
-  it('forwards tool_result with preview/isError; returns null for non-renderable / non-block', () => {
+  it('forwards complete tool_result and structured plan records; returns null for non-block', () => {
+    const exactOutput = `${'x'.repeat(40_000)}EXACT_DELEGATE_TOOL_END`
     const tr = makeDelegateBlockPassthrough(
-      { kind: 'block', block: { kind: 'tool_result', blockId: 'b1:result', toolUseBlockId: 'b1', toolName: 'Bash', isError: true, preview: 'boom' } },
+      { kind: 'block', block: { kind: 'tool_result', blockId: 'b1:result', toolUseBlockId: 'b1', toolName: 'Bash', isError: true, preview: 'boom', output: exactOutput } },
       'r1',
       'coder',
     ) as any
     assert.equal(tr.block.kind, 'tool_result')
     assert.equal(tr.block.isError, true)
     assert.equal(tr.block.preview, 'boom')
-    assert.equal(makeDelegateBlockPassthrough({ kind: 'block', block: { kind: 'plan' } }, 'r1', 'a'), null)
+    assert.equal(tr.block.output, exactOutput)
+    assert.deepEqual(
+      (makeDelegateBlockPassthrough(
+        { kind: 'block', block: { kind: 'plan', steps: [{ step: '完整步骤', status: 'pending' }] } },
+        'r1',
+        'a',
+      ) as any).block,
+      { kind: 'plan', steps: [{ step: '完整步骤', status: 'pending' }] },
+    )
     assert.equal(makeDelegateBlockPassthrough({ kind: 'error', error: 'x' }, 'r1', 'a'), null)
   })
 
-  it('strips dangerous control chars in rich text but keeps tabs/newlines', () => {
+  it('does not rewrite or truncate authoritative rich text', () => {
+    const text = `a b\u0007c\td\ne${'z'.repeat(40_000)}EXACT_RICH_END`
     const out = makeDelegateBlockPassthrough(
-      { kind: 'block', block: { kind: 'text', text: 'a b\u0007c\td\ne' } },
+      { kind: 'block', block: { kind: 'text', text } },
       'r1',
       'a',
     ) as any
-    assert.equal(out.block.text, 'a b c\td\ne') // bell(\u0007) -> space; \t and \n preserved
+    assert.equal(out.block.text, text)
   })
 })

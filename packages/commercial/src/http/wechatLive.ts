@@ -89,7 +89,7 @@ export async function handleWechatLiveSnapshot(
     throw new HttpError(403, 'FORBIDDEN', 'account not active')
   }
 
-  const session = await getClientSession(verified.sessionId, verified.userId)
+  const session = await getClientSession(verified.sessionId, verified.userId, { view: 'timeline' })
   if (!session) {
     throw new HttpError(404, 'NOT_FOUND', 'wechat session not found')
   }

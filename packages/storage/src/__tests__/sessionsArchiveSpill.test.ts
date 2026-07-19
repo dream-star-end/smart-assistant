@@ -287,7 +287,7 @@ describe('PUT 防复活', () => {
   })
 })
 
-describe('browser chat projection (SQLite compatibility)', () => {
+describe('browser direct timeline (SQLite compatibility)', () => {
   it('legacy hot rows derive order from durable array once and freeze it on the next write', async () => {
     const sessId = 'web-legacy-order'
     await upsertClientSession({
@@ -321,7 +321,7 @@ describe('browser chat projection (SQLite compatibility)', () => {
     assert.deepEqual(frozen.map((m) => m._orderSeq), [1, 2, 3])
   })
 
-  it('exact keeps raw runtime payload while chat returns only sanitized patch/checkpoint', async () => {
+  it('timeline returns the same real runtime records as exact reads', async () => {
     await upsertClientSession({
       id: 'web-chat-projection', userId: USER, agentId: 'main', title: 't', pinned: false,
       createdAt: 1, lastAt: 2, messages: [], updatedAt: 1,
@@ -348,21 +348,20 @@ describe('browser chat projection (SQLite compatibility)', () => {
 
     const exact = await getClientSession('web-chat-projection', USER)
     assert.equal((exact!.messages[0] as Msg)._runtimeEvent !== undefined, true)
-    const chat = await getClientSession('web-chat-projection', USER, { projection: 'chat' })
-    const chatMessages = chat!.messages as Msg[]
-    assert.equal(chatMessages.some((message) => message._runtimeEvent !== undefined), false)
-    assert.deepEqual(chatMessages.map((message) =>
-      (message._historyProjection as { kind: string }).kind), ['checkpoint', 'bash-tail'])
+    const timeline = await getClientSession('web-chat-projection', USER, { view: 'timeline' })
+    const timelineMessages = timeline!.messages as Msg[]
+    assert.deepEqual(timelineMessages, exact!.messages)
 
     const partial = await getClientSessionPartial(
       'web-chat-projection', USER, 1, {
-        projection: 'chat',
-        sinceHistoryRevision: chat!.historyRevision,
+        view: 'timeline',
+        sinceHistoryRevision: timeline!.historyRevision,
       },
     )
     assert.equal(partial!.isPartial, true)
     assert.equal(partial!.maxSeq, 2)
-    assert.equal((partial!.messages[0] as Msg)._historyProjection !== undefined, true)
+    assert.equal((partial!.messages[0] as Msg).id, 'raw-tail')
+    assert.equal((partial!.messages[0] as Msg)._runtimeEvent !== undefined, true)
   })
 })
 
@@ -593,7 +592,7 @@ describe('history revision — 增量安全栅栏', () => {
     })
     assert.equal(matching?.isPartial, true)
 
-    // A normal append is represented by a fresh `_seq`, so the projection
+    // A normal append is represented by a fresh `_seq`, so the history
     // revision must stay stable and incremental mode remains useful.
     assert.equal(await upsertClientSession({
       ...full,

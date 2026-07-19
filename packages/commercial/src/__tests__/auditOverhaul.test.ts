@@ -266,8 +266,6 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       },
       // 批D D3:注入 session_goals 终态清理(默认会打真 query,单测里注入避免碰 DB)。
       sessionGoalsPurgeFn: async () => 7,
-      // 0170:注入 turn_dispatches 终态清理(bespoke,默认会打真 query,单测里注入避免碰 DB)。
-      turnDispatchesPurgeFn: async () => 4,
       onError: (table) => { errs.push(table); },
     });
     try {
@@ -277,11 +275,11 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       assert.deepEqual(errs, ["agent_audit"]);
       assert.ok(purged.includes("turn_traces:90"));
       assert.ok(purged.includes("rate_limit_events:30"));
-      // turn_dispatch_error_projections 是普通 TTL policy(revoked 90d),经 purgeFn 清。
-      assert.ok(purged.includes("turn_dispatch_error_projections:90"));
-      // session_goals / turn_dispatches bespoke sweep 与 TTL policies 同 tick 执行,并入 deleted map。
+      assert.ok(!purged.some((entry) => entry.startsWith("turn_dispatch_error_projections:")));
+      // 会话可见状态跟随会话生命周期，不由时间 sweeper 提前删除。
+      assert.equal(res["turn_dispatches"], undefined);
+      // session_goals bespoke sweep 与 TTL policies 同 tick 执行,并入 deleted map。
       assert.equal(res["session_goals"], 7);
-      assert.equal(res["turn_dispatches"], 4);
     } finally {
       h.stop();
     }
@@ -293,8 +291,6 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       intervalMs: 60_000,
       purgeFn: async () => 0,
       sessionGoalsPurgeFn: async () => { throw new Error("goals boom"); },
-      // 注入 turn_dispatches bespoke 清理避免碰 DB(否则本 tick 也会 onError turn_dispatches)。
-      turnDispatchesPurgeFn: async () => 0,
       onError: (table) => { errs.push(table); },
     });
     try {

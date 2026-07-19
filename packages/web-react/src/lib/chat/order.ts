@@ -27,9 +27,12 @@ function isLocalProcessRow(message: ChatMessage): boolean {
 }
 
 function isTurnTerminalCandidate(message: ChatMessage): boolean {
-  if (message.role !== "assistant" || message._historyProjection) return false;
+  if (
+    message.role !== "assistant" ||
+    (message as unknown as { _historyProjection?: unknown })._historyProjection
+  ) return false;
   const body =
-    !message._tapeCollapsed &&
+    !message._turnTapeProcess &&
     !message._errorCode &&
     typeof message.text === "string" &&
     message.text.trim().length > 0;

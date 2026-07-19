@@ -3,7 +3,7 @@
  *
  * 入口:
  *   - GET  /api/admin/sessions/:id[?user_id=:userId&offset&limit] 旧诊断分页
- *   - GET  /api/admin/sessions/:id?user_id=:userId&view=chat      对话 UI 热尾快照
+ *   - GET  /api/admin/sessions/:id?user_id=:userId&view=timeline  对话 UI 热尾快照
  *   - GET  /api/admin/sessions/:id/archive?user_id=:userId&before&limit
  *   - POST /api/admin/sessions/:id/media-sign?user_id=:userId     目标用户媒体短签
  *
@@ -172,9 +172,15 @@ export async function handleAdminGetSession(
     const { before, limit } = parseArchivePagingParams(url);
     // owner 必须经 storage backend 从权威会话行派生，不能信任前端 user_id；同时避免
     // HTTP 层直连 client_sessions，保持 SQLite/PG backend 的单一抽象边界。
-    const session = await getClientSession(sessionId, scopedUserId);
+    const session = await getClientSession(sessionId, scopedUserId, { view: "timeline" });
     if (!session) throw new HttpError(404, "NOT_FOUND", "session not found");
-    const page = await readArchivedMessages(sessionId, session.userId, before, limit);
+    const page = await readArchivedMessages(
+      sessionId,
+      session.userId,
+      before,
+      limit,
+      { view: "timeline" },
+    );
     await writeAdminAudit(getPool(), {
       adminId: admin.id,
       action: "sessions.read",
@@ -205,18 +211,22 @@ export async function handleAdminGetSession(
   }
 
   const view = url.searchParams.get("view");
-  if (view !== null && view !== "chat") {
-    throw new HttpError(400, "VALIDATION", "view must be chat", {
+  if (view !== null && view !== "timeline") {
+    throw new HttpError(400, "VALIDATION", "view must be timeline", {
       issues: [{ path: "view", message: view }],
     });
   }
   const { offset, limit } = parsePagingParams(url);
-  const s = await getClientSession(sessionId, scopedUserId);
+  const s = await getClientSession(
+    sessionId,
+    scopedUserId,
+    view === "timeline" ? { view: "timeline" } : undefined,
+  );
   if (!s) throw new HttpError(404, "NOT_FOUND", "session not found");
 
-  // chat 模式与用户端 GET /api/sessions/:id 同源：一次返回完整热尾（含 lossless tape
-  // hydration），更早历史只走 /archive 的 _seq 游标。禁止再按 response offset 切 tape。
-  if (view === "chat") {
+  // timeline 模式与用户端 GET /api/sessions/:id 同源：一次返回热尾里的真实
+  // user/final rows + process cursors；更早历史只走 /archive 的 _seq 游标。
+  if (view === "timeline") {
     const messages = Array.isArray(s.messages) ? s.messages : [];
     await writeAdminAudit(getPool(), {
       adminId: admin.id,
@@ -224,7 +234,7 @@ export async function handleAdminGetSession(
       target: `session:${sessionId}`,
       before: null,
       after: {
-        mode: "chat",
+        mode: "timeline",
         session_id: sessionId,
         target_user_id: s.userId,
         scoped_user_id: scopedUserId ?? null,
@@ -337,7 +347,7 @@ export async function handleAdminSignSessionMedia(
   }
   const { scopedUserId } = scopedSessionUserId(url);
   // 与 archive 相同：签名主体只取权威 session owner，URL user_id 仅用于 fail-closed scope。
-  const session = await getClientSession(route.sessionId, scopedUserId);
+  const session = await getClientSession(route.sessionId, scopedUserId, { view: "timeline" });
   if (!session || !COMMERCIAL_SESSION_USER_RE.test(session.userId)) {
     throw new HttpError(404, "NOT_FOUND", "session not found");
   }
@@ -411,7 +421,13 @@ async function readAdminArchivedWindow(
   let remaining = Math.max(0, need);
   // 防御:归档条数有界,但仍加硬上限防 storage 返回异常时死循环。
   for (let guard = 0; guard < 10_000 && remaining > 0; guard++) {
-    const page = await readArchivedMessages(sessionId, ownerUserId, before, 200);
+    const page = await readArchivedMessages(
+      sessionId,
+      ownerUserId,
+      before,
+      200,
+      { view: "timeline" },
+    );
     const msgs = Array.isArray(page.messages) ? page.messages : [];
     if (msgs.length === 0) break;
     // 本页升序(old→new)→ reverse 成 newest→oldest 拼进虚拟顺序。

@@ -1220,6 +1220,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
 
   test("Agent tool_result keeps JSON result preview on completed group", () => {
     const s = sess();
+    const exactOutput = `${"x".repeat(12_000)}EXACT_AGENT_RESULT_END`;
     applyOutboundMessage(
       s,
       msgFrame({
@@ -1246,6 +1247,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
             toolUseBlockId: "spawn-json",
             blockId: "spawn-json:result",
             preview: '{"ok":true}',
+            output: exactOutput,
             isError: false,
           },
         ],
@@ -1255,6 +1257,34 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     const group = s.messages.find((m) => m.role === "agent-group");
     expect(group?._completed).toBe(true);
     expect(group?._resultPreview).toBe('{"ok":true}');
+    expect(group?.inputJson).toEqual({ description: "return json" });
+    expect(group?.output).toBe(exactOutput);
+  });
+
+  test("standalone tool_result keeps complete output even when display preview is absent", () => {
+    const s = sess();
+    const exactOutput = `${"z".repeat(12_000)}EXACT_STANDALONE_RESULT_END`;
+    const exactStructuredOutput = { future_field: { marker: "EXACT_STRUCTURED_RESULT" } };
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolName: "Bash",
+            blockId: "standalone-result",
+            output: exactOutput,
+            outputJson: exactStructuredOutput,
+            isError: false,
+          },
+        ],
+      }),
+    );
+
+    const tool = s.messages.find((m) => m.role === "tool");
+    expect(tool?.output).toBe(exactOutput);
+    expect(tool?.outputJson).toEqual(exactStructuredOutput);
   });
 
   test("adopted delegate_progress preserves completed summary on the group", () => {
@@ -1359,6 +1389,81 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(groups[0]._delegateRunId).toBe("dlg-3");
     expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "child output")).toBe(true);
     expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("delegate child tool keeps complete output instead of its shortened preview", () => {
+    const s = sess();
+    const exactOutput = `${"y".repeat(12_000)}EXACT_CHILD_TOOL_END`;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [{
+          kind: "tool_use",
+          toolName: "delegate_task",
+          blockId: "tool-child-exact",
+          partial: false,
+          inputJson: { agentId: "hidden-reviewer", goal: "检查完整输出" },
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-child-exact",
+          agentId: "hidden-reviewer",
+          goal: "检查完整输出",
+          phase: "start",
+          text: "开始",
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-child-exact",
+          agentId: "hidden-reviewer",
+          phase: "tool",
+          block: {
+            kind: "tool_use",
+            toolName: "Read",
+            blockId: "child-read",
+            inputJson: { file_path: "/tmp/exact" },
+            partial: false,
+          },
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-child-exact",
+          agentId: "hidden-reviewer",
+          phase: "tool",
+          block: {
+            kind: "tool_result",
+            toolName: "Read",
+            toolUseBlockId: "child-read",
+            preview: "short preview",
+            output: exactOutput,
+            isError: false,
+          },
+        }],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    const child = group?.childBlocks?.find((block) => block.kind === "tool_use" && block.blockId === "child-read");
+    expect(child?.output).toBe(exactOutput);
   });
 
 
@@ -1713,6 +1818,14 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
 
   test("persisted Codex delegate tool plus progress rows collapse into one agent-group", () => {
     const s = sess();
+    const exactOutput = JSON.stringify({
+      type: "mcpToolCall",
+      id: "call_hist",
+      server: "openclaude_memory",
+      tool: "delegate_task",
+      status: "completed",
+      result: { content: [{ type: "text", text: `✅ 委派完成\n\n${"z".repeat(12_000)}EXACT_PERSISTED_DELEGATE_END` }] },
+    });
     addMessage(s, "tool", "codex:mcpToolCall", {
       id: "tool-hist",
       ts: 1,
@@ -1726,14 +1839,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
         arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
       },
       _completed: true,
-      output: JSON.stringify({
-        type: "mcpToolCall",
-        id: "call_hist",
-        server: "openclaude_memory",
-        tool: "delegate_task",
-        status: "completed",
-        result: { content: [{ type: "text", text: "✅ 委派完成\n\n最终方案" }] },
-      }),
+      output: exactOutput,
     });
     addMessage(s, "delegate-progress", "", {
       id: "progress-hist",
@@ -1754,6 +1860,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(groups[0].id).toBe("tool-hist");
     expect(groups[0]._delegateRunId).toBe("dlg-hist");
     expect(groups[0]._resultPreview).toContain("委派完成");
+    expect(groups[0].output).toBe(exactOutput);
     expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "实时输出")).toBe(true);
     expect(s._agentGroups?.get("nested-agent")).toBe("tool-hist");
     expect(s.messages.some((m) => m.role === "tool" || m.role === "delegate-progress")).toBe(false);
@@ -2829,7 +2936,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("stored sanitized history tail patch reapplies during IndexedDB hydration", () => {
+  test("rolling old IndexedDB substitution rows are discarded instead of mutating true records", () => {
     const sock = makeSocket();
     sock.loadStored({
       id: "s-history-patch",
@@ -2856,17 +2963,15 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
             totalBytes: 42,
             truncatedHead: false,
           },
-        },
+        } as unknown as ChatMessage,
       ],
       createdAt: 1,
       lastAt: 2,
       _maxSeq: 9,
     });
-    expect(sock.sessions.get("s-history-patch")!.messages[0]!.bashTail).toEqual({
-      tail: "restored tail",
-      totalBytes: 42,
-      truncatedHead: false,
-    });
+    const restored = sock.sessions.get("s-history-patch")!.messages;
+    expect(restored.map((message) => message.id)).toEqual(["srv-tool"]);
+    expect(restored[0]!.bashTail).toBeUndefined();
   });
 
   test("hello names every trailing user-row candidate and ignores only an image placeholder", () => {

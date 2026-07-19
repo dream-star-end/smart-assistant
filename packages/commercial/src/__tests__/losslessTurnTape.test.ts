@@ -130,7 +130,7 @@ describe("materializeLosslessTurn", () => {
     }
   });
 
-  test("keeps every plan/goal update and materializes the final projection without caps", () => {
+  test("keeps every plan/goal update and materializes the final readable record without caps", () => {
     const hugeDetail = "完整结构化细节😀".repeat(20_000);
     const planUpdates = Array.from({ length: 80 }, (_, index) => ({
       kind: "plan",
@@ -237,7 +237,7 @@ describe("materializeLosslessTurn", () => {
     }), /do not reconstruct/);
   });
 
-  test("orders projections and opaque runtime events by one global ordinal", () => {
+  test("orders readable records and opaque runtime events by one global ordinal", () => {
     const rawOne = { jsonrpc: "2.0", method: "item/reasoning/textDelta", params: { delta: "raw-1" } };
     const rawFive = { type: "tool_progress", bytes: "x".repeat(20_000), future: { exact: true } };
     const turn = materializeLosslessTurn({

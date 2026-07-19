@@ -79,11 +79,11 @@ test('getSession retries old incremental wire once as an unconditional full read
   expect(detail).toMatchObject({
     isPartial: false,
     messages: [{ content: 'full' }],
-    _projectionRevisionUnsupported: true,
+    _historyRevisionUnsupported: true,
   })
 })
 
-test('getSession marks an initial full response from a legacy projection backend', async () => {
+test('getSession marks an initial full response from a legacy partial-history backend', async () => {
   const fetchMock = vi.fn(async () => ok({
     id: 'web-session-1', messages: [], isPartial: false, maxSeq: 0,
   }))
@@ -93,7 +93,7 @@ test('getSession marks an initial full response from a legacy projection backend
   const detail = await api.getSession(session, 'web-session-1')
 
   expect(fetchMock).toHaveBeenCalledTimes(1)
-  expect(detail._projectionRevisionUnsupported).toBe(true)
+  expect(detail._historyRevisionUnsupported).toBe(true)
 })
 
 const ME_BODY = {

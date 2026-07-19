@@ -124,7 +124,7 @@ export class Api {
     return (await res.json()) as ArchivePage;
   }
 
-  /** §9 折叠卷/超大内容分页。route-not-found → null(端点未部署);资源 404 → 抛。 */
+  /** 不可变 tape 真实记录分页。route-not-found → null(端点未部署);资源 404 → 抛。 */
   async getTapeRecords(
     token: string,
     id: string,

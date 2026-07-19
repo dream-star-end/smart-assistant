@@ -76,7 +76,6 @@ import {
   planCostPatch,
   planDelegateCostMerge,
   planSpillOverflow,
-  projectClientSessionMessagesForChat,
   type ReadArchivedMessagesResult,
   type ServerAuthoredAppendResult,
   type SpillChunkPlan,
@@ -102,12 +101,6 @@ import {
   casToTerminal,
   getDispatch,
 } from "../dispatch/turnDispatchStore.js";
-import {
-  projectionToVirtualMessage,
-  readActiveErrorProjections,
-  revokeErrorProjection,
-} from "../dispatch/errorProjections.js";
-import type { Queryable } from "../dispatch/turnDispatchStore.js";
 import { MASTER_HISTORY_MAX_MESSAGES, MASTER_HISTORY_MAX_CHARS } from "../ws/masterHistoryLimits.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
@@ -471,7 +464,7 @@ async function pgAppendServerAuthoredCore(
     // 并发软删抢在 SELECT 与 UPDATE 之间(FOR UPDATE 下不可达;保留作最后防线,宁报终态不复活墓碑)。
     return { applied: false, reason: "session_deleted" };
   }
-  // 新 append 的消息拿到的 _seq = admit 的 anchor_seq(user 行位置,projection 排序键)。
+  // 新 append 的消息拿到的 _seq = admit 的 anchor_seq(user 行顺序键)。
   return { applied: true, seq: seqOfMessage(tail, message.id) };
 }
 
@@ -587,6 +580,11 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_turn_tapes", "goal_state_revision", "bigint"],
   ["client_session_turn_tapes", "goal_tokens_used", "bigint"],
   ["client_session_turn_tapes", "record_storage_format", "smallint"],
+  ["client_session_turn_tapes", "client_message_id", "text"],
+  ["client_session_turn_tapes", "continuation_of_turn_key", "text"],
+  ["client_session_turn_tapes", "physical_record_count", "integer"],
+  ["client_session_turn_tapes", "logical_record_count", "integer"],
+  ["client_session_turn_tapes", "record_payload_bytes", "bigint"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
   ["client_session_turn_tape_records", "payload", "bytea"],
   ["server_authored_turn_anchor_map", "turn_key", "text"],
@@ -603,8 +601,8 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
 export interface PgSessionsBackendOptions {
   /** 启动时快照的权威 generation(RFC D5:probe 复核 marker 未漂移)。 */
   expectedGeneration: number;
-  /** Runs only after the owning tape/cost transaction commits. Failures are
-   * projection-only and must never turn a committed billing write into retry. */
+  /** Runs only after the owning tape/cost transaction commits. Callback
+   * failures must never turn a committed billing write into retry. */
   onGoalUsageChanged?: (userId: string, sessionId: string) => void | Promise<void>;
 }
 
@@ -631,8 +629,8 @@ export type LosslessTurnTapeFinalizeResult =
       recordCount: number;
       engineBillings: DurableCodexBilling[];
       /**
-       * late true tape(RFC §2.4):reconciler 已宣告 not_accepted、error 卡已投影,tape 却迟到。
-       * 内容仍完整 materialize(钱安全 I5),但 dispatch 转 manual_reconcile 且投影已撤销 —— 调用层
+       * late true tape(RFC §2.4):reconciler 已宣告 not_accepted 并显示状态,tape 却迟到。
+       * 内容仍完整 materialize(钱安全 I5),但 dispatch 转 manual_reconcile、旧状态自然消失 —— 调用层
        * (internalServer finalize handler)据此发一条告警交人工核对(已告知用户失败却又产出计费内容)。
        */
       dispatchLateTape?: boolean;
@@ -642,7 +640,7 @@ export type LosslessTurnTapeFinalizeResult =
 /**
  * finalize 收敛 dispatch(RFC §2.4)。仅当 tape header 带 dispatch_id 时调用(legacy tape 跳过)。
  *   - 非终态(admitted/accepted/rejecting)→ CAS terminal,outcome 映射 tape.status;
- *   - 已 terminal(not_accepted)= late tape → 撤 error projection + manual_reconcile(late_tape);
+ *   - 已 terminal(not_accepted)= late tape → manual_reconcile(late_tape);直接状态读随之消失;
  *   - 已 terminal(completed 等)/ manual_reconcile → 幂等 no-op。
  * CAS-first(原子);仅失败后读一次判 late tape(此时行已终态,读值稳定)。
  */
@@ -650,7 +648,7 @@ async function convergeDispatchOnFinalize(
   client: PoolClient,
   dispatchId: string,
   tapeStatus: string,
-): Promise<{ lateTape: boolean; projectionRevoked: boolean }> {
+): Promise<{ lateTape: boolean }> {
   const outcome =
     tapeStatus === "completed" ? "completed" :
     tapeStatus === "interrupted" ? "interrupted" : "crashed";
@@ -659,18 +657,17 @@ async function convergeDispatchOnFinalize(
     outcome,
     fromStatuses: ["admitted", "accepted", "rejecting"],
   });
-  if (converged !== null) return { lateTape: false, projectionRevoked: false };
+  if (converged !== null) return { lateTape: false };
   const d = await getDispatch(client, dispatchId);
   if (d && d.status === "terminal" && d.outcome === "not_accepted") {
-    const projectionRevoked = await revokeErrorProjection(client, dispatchId);
     const held = await casToManualReconcile(client, {
       dispatchId,
       conflictReason: "late_tape",
       fromStatuses: ["terminal"],
     });
-    return { lateTape: held !== null, projectionRevoked };
+    return { lateTape: held !== null };
   }
-  return { lateTape: false, projectionRevoked: false };
+  return { lateTape: false };
 }
 
 export interface LosslessTurnTapeStorage {
@@ -741,20 +738,6 @@ export interface DispatchAdmissionBackend {
     dispatchId: string,
     attemptNo: number,
   ): Promise<TurnTapeStateResult>;
-  /** 会话读侧 error projection 虚拟行(仅 client-facing 读合并;引擎历史注入绝不含它,RFC §2.5)。 */
-  listDispatchErrorProjectionMessages(
-    userId: string,
-    sessionId: string,
-  ): Promise<Record<string, unknown>[]>;
-  /** M-§9-1 超大内容"查看完整"按记录有界读:单条 record 的展示文本一个字节窗口(≤256KB/请求,
-   *  绝不整卷;分租/不存在/非收敛卷 → null=404)。offset/nextOffset 按 hydrate 后文本字节计。 */
-  readTapeRecordChunk(
-    sessionId: string,
-    userId: string,
-    tapeId: string,
-    recordOrdinal: number,
-    offset: number,
-  ): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
 }
 
 export type PgSessionsBackend = ClientSessionsBackend &
@@ -762,51 +745,79 @@ export type PgSessionsBackend = ClientSessionsBackend &
   DispatchAdmissionBackend;
 
 /**
- * 单一投影 helper(RFC §2.5)— client-facing 读边界(full / partial / archive 分页)唯一收口。
- * 仅 `projection==='chat'` 时调用:引擎历史注入(loadMasterSessionMessages,无 options=exact
- * 读)绝不经过这里,失败提示永不进模型上下文。
+ * Read verified turn failures directly from the durable dispatch authority.
  *
- * 插入 = 局部 splice 在「最后一个 _seq <= anchor 的行」之后;**绝不全量重排**(等 _seq 的
- * tape 展开行相对顺序是持久化语义,重排=95e5c0ea 那类事故)。幂等:同 id 已存在即跳过。
- * anchorRange 供 archive 分页只并入本页范围内的投影(锚在热尾的绝不落进归档页)。
+ * This is deliberately not an assistant-message projection: the returned row
+ * is a typed status record whose only source is turn_dispatches after the
+ * reconciler has completed the same-transaction no-billing proof. The browser
+ * renders it outside the Agent transcript. A late finalized tape moves the
+ * dispatch to manual_reconcile, so the status naturally disappears without a
+ * second shadow table.
  */
-async function mergeDispatchErrorProjectionRows(
-  q: Queryable,
+async function mergeVerifiedTurnStatusRows(
+  pool: Pool,
   sessionUserId: string,
   sessionId: string,
   messages: MessageLike[],
   anchorRange?: { minInclusive: number; maxExclusive: number },
 ): Promise<MessageLike[]> {
-  if (!sessionUserId.startsWith("c:")) return messages;
-  let uid: bigint;
-  try {
-    uid = BigInt(sessionUserId.slice(2));
-  } catch {
-    return messages;
-  }
-  const rows = await readActiveErrorProjections(q, uid, sessionId);
+  const uidMatch = /^c:([1-9][0-9]*)$/.exec(sessionUserId);
+  if (!uidMatch) return messages;
+  const rows = (
+    await pool.query<{
+      dispatch_id: string;
+      client_message_id: string;
+      failure_code: string | null;
+      anchor_seq: string;
+      terminal_at: Date | null;
+    }>(
+      `SELECT dispatch_id, client_message_id, failure_code, anchor_seq::text, terminal_at
+         FROM turn_dispatches
+        WHERE user_id=$1 AND session_id=$2
+          AND status='terminal' AND client_notified=TRUE
+          AND outcome IN ('not_accepted','executed_error')
+          AND anchor_seq IS NOT NULL
+        ORDER BY anchor_seq, dispatch_id`,
+      [uidMatch[1], sessionId],
+    )
+  ).rows;
   if (rows.length === 0) return messages;
+
   const out = [...messages];
   for (const row of rows) {
-    const anchor = Number(row.anchorSeq);
+    const anchorSeq = bigIntNum(row.anchor_seq, "turn dispatch anchor_seq");
     if (
-      anchorRange !== undefined &&
-      (anchor < anchorRange.minInclusive || anchor >= anchorRange.maxExclusive)
-    ) {
-      continue;
-    }
-    const virtual = projectionToVirtualMessage(row);
-    const vid = (virtual as { id: string }).id;
-    if (out.some((m) => (m as { id?: unknown }).id === vid)) continue;
-    let idx = 0;
+      anchorRange &&
+      (anchorSeq < anchorRange.minInclusive || anchorSeq >= anchorRange.maxExclusive)
+    ) continue;
+    const id = `turn-status:${row.dispatch_id}`;
+    if (out.some((message) => message.id === id)) continue;
+    let insertAt = 0;
+    let orderSeq: number | undefined;
     for (let i = out.length - 1; i >= 0; i--) {
-      const s = (out[i] as { _seq?: unknown })._seq;
-      if (typeof s === "number" && Number.isFinite(s) && s <= anchor) {
-        idx = i + 1;
+      const seq = out[i]?._seq;
+      if (typeof seq === "number" && Number.isFinite(seq) && seq <= anchorSeq) {
+        insertAt = i + 1;
+        if (seq === anchorSeq && typeof out[i]?._orderSeq === "number") {
+          orderSeq = out[i]!._orderSeq;
+        }
         break;
       }
     }
-    out.splice(idx, 0, virtual as MessageLike);
+    out.splice(insertAt, 0, {
+      id,
+      role: "system",
+      text: "",
+      ts: row.terminal_at?.getTime() ?? 0,
+      _source: "server",
+      _seq: anchorSeq,
+      ...(orderSeq !== undefined ? { _orderSeq: orderSeq } : {}),
+      _turnStatusRecord: true,
+      _dispatchTerminal: true,
+      _dispatchLost: true,
+      _errorCode: row.failure_code ?? "DISPATCH_LOST",
+      _clientMessageId: row.client_message_id,
+    });
   }
   return out;
 }
@@ -860,8 +871,8 @@ type HydratedTapeRow = {
 };
 
 /** 已解析的每卷可变计费叠加(cost/waiver/delegate)。权威源恒是 turn_tape_cost_components
- *  / pending_usage_patches / turn_waivers —— chat 投影只存不可变内容,这三项读时现算叠加
- *  (RFC §9:waiver 可 finalize 后才 apply / cost 可晚到 stage,冻结即分裂权威)。 */
+ *  / pending_usage_patches / turn_waivers；读取 immutable records 时现算叠加
+ *  (waiver 可 finalize 后才 apply / cost 可晚到 stage,冻结即分裂权威)。 */
 type ExactUsageEnrichment = {
   costCredits: string;
   waiverApplied: boolean;
@@ -888,7 +899,7 @@ function mergeExactUsage(msg: MessageLike, enrich: ExactUsageEnrichment, isBilli
   // The live cost_waived frame updates the current browser immediately, but
   // history hydration must carry the same truth for refreshes, offline users
   // and other devices. Only an applied waiver (whose CHECK requires a receipt)
-  // may project completion; the tape's pending decision alone is not a refund.
+  // may mark completion; the tape's pending decision alone is not a refund.
   const exactWaiverUsage = enrich.waiverApplied && isBillingAnchor ? { waived: true } : {};
   const exactDelegateUsage = enrich.delegates.length > 0 ? { delegates: enrich.delegates } : {};
   if (
@@ -905,8 +916,7 @@ function mergeExactUsage(msg: MessageLike, enrich: ExactUsageEnrichment, isBilli
 }
 
 /** 内容水合(不含可变计费叠加):hash 校验 + 解析 + _turnTape 作证标记 + 基础 usage
- *  ({...recordUsage,...anchorUsage})。chat 物化投影**只存这一层**;exact 读与 chat 现算
- *  在其上叠加 cost/waiver/delegate。 */
+ *  ({...recordUsage,...anchorUsage});随后在其上叠加 cost/waiver/delegate。 */
 function hydrateTapeRecordContent(
   row: HydratedTapeRow,
   anchor: MessageLike,
@@ -943,8 +953,8 @@ function hydrateTapeRecordContent(
   return {
     ...full,
     _source: "server",
-    // Hydration is a read projection, not another hot-row authority record.
-    // Mark expanded rows so a later browser PUT can discard them and keep the
+    // Hydration does not create another hot-row authority record. Mark expanded
+    // rows so a later browser PUT can discard them and keep the
     // single constant-size tape anchor instead of copying all generated bytes
     // back into client_sessions.messages.
     _turnTapeId: row.tape_id,
@@ -965,8 +975,7 @@ function hydrateTapeRecordContent(
   };
 }
 
-/** exact 读用:内容水合 + 逐行可变计费叠加(cost/waiver/delegate 来自 hydration SQL 的行内子查询)。
- *  与今日逐字节等价。chat 物化投影读走 hydrateTapeRecordContent + 现算叠加(见 chat 分支)。 */
+/** exact 读用:内容水合 + 逐行可变计费叠加(cost/waiver/delegate 来自 hydration SQL 的行内子查询)。 */
 function hydrateTapeRecord(
   row: HydratedTapeRow,
   anchor: MessageLike,
@@ -1115,1466 +1124,111 @@ function expandHydratedRuntimeBatch(
   };
 }
 
-// ── 会话读物化投影(RFC §9)────────────────────────────────────────────────────
-// 只读缓存派生面:finalize 同事务把该卷的 chat **内容行**(不含可变 cost/waiver)物化进
-// tape_chat_projection;chat 读两阶段(header-only → 投影展开),存量卷惰性回填。任何异常
-// 降级 = 有界折叠,绝不回退全量水合。投影绝不参与完整性/结算/dedup 写侧(§9.2)。
-const PROJECTION_ROW_MAX_BYTES = 64 * 1024; // 逐记录 64KB 截断
-const PROJECTION_TAPE_MAX_BYTES = 512 * 1024; // per-tape ≤512KB
-const PROJECTION_TAPE_MAX_ROWS = 512; // per-tape ≤512 行
-const CHAT_PROJECTION_MAX_BYTES = 8 * 1024 * 1024; // chat 单响应投影总量 ≤8MB
-const CHAT_PROJECTION_MAX_ROWS = 2000; // chat 单响应投影总量 ≤2000 行
-const DEFAULT_BACKFILL_BYTES = 16 * 1024 * 1024; // OC_BACKFILL_BYTES 默认 16MB
-const TAPE_RECORD_PAGE_RAW_MAX_BYTES = 8 * 1024 * 1024; // 主动展开单页原始 BYTEA 合计 ≤8MiB
-const TAPE_RECORD_PAGE_RESPONSE_MAX_BYTES = 1024 * 1024; // 主动展开单页 JSON ≤1MiB
-// 分段回填每段最多拉多少 record 行(界定单次 pg fetch,防超大卷一次性入内存)。
-const BACKFILL_SEGMENT_RECORD_LIMIT = 4000;
-// B-§9-1(R3 重开):预算是**硬**的 —— 任何 record 越本读剩余预算一律 defer 折叠(绝不强读),
-// 越整 fullBudget 才判「永不适配」→ 终态 truncated + sentinel(绝不整条拉入进程)。推进保证靠
-// 「新一轮读预算重置后可容纳 ≤fullBudget 的单条」:sorted 里最小的未收敛卷在 budget==fullBudget
-// 时最先起步,其首条 ≤fullBudget 必被读入(或 >fullBudget 立即 truncated 收敛),故每读至少一卷取得
-// 进展 —— 数学上无死锁。删掉旧 FLOOR「小条强读」路径(它破坏硬预算不变量)。
+// ── Direct immutable-tape reads ─────────────────────────────────────────────
+// The browser reads the same post-redaction bytes that were committed by the
+// turn materializer. Request/page/chunk sizes below are transport quanta only:
+// every response carries a cursor or byte range and there is no total-content
+// ceiling, truncation sentinel, terminal-row substitute, or materialized cache.
+const TAPE_RECORD_PAGE_MAX_ROWS = 200;
+const TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES = 8 * 1024 * 1024;
+const TAPE_RECORD_INLINE_QUANTUM_BYTES = 1024 * 1024;
+export const TAPE_RECORD_PAYLOAD_CHUNK_BYTES = 1024 * 1024;
 
-function backfillBudgetBytes(): number {
-  const raw = Number(process.env.OC_BACKFILL_BYTES);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_BACKFILL_BYTES;
-}
-
-function jsonBytes(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value ?? null), "utf8");
-}
-
-/** code-point 安全的字节前缀截断(保留前 maxBytes 字节)。 */
-function utf8PrefixBytes(value: string, maxBytes: number): string {
-  const bytes = Buffer.from(value, "utf8");
-  if (bytes.length <= maxBytes) return value;
-  let end = Math.max(0, maxBytes);
-  // 不能切在 UTF-8 continuation 字节中间(0b10xxxxxx),回退到 code-point 边界。
-  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end--;
-  return bytes.subarray(0, end).toString("utf8");
-}
-
-/** 递归找到最长字符串叶子并截断它(从尾部剥离 ~over 字节)。截断到才返回 true。 */
-function truncateLongestString(node: unknown, over: number): boolean {
-  let bestRef: Record<string | number, unknown> | null = null;
-  let bestKey: string | number = "";
-  let bestLen = 0;
-  const walk = (obj: unknown): void => {
-    if (Array.isArray(obj)) {
-      for (let i = 0; i < obj.length; i++) {
-        const v = obj[i];
-        if (typeof v === "string") {
-          const b = Buffer.byteLength(v, "utf8");
-          if (b > bestLen) { bestLen = b; bestRef = obj as unknown as Record<number, unknown>; bestKey = i; }
-        } else if (v && typeof v === "object") walk(v);
-      }
-    } else if (obj && typeof obj === "object") {
-      for (const k of Object.keys(obj as Record<string, unknown>)) {
-        const v = (obj as Record<string, unknown>)[k];
-        if (typeof v === "string") {
-          const b = Buffer.byteLength(v, "utf8");
-          if (b > bestLen) { bestLen = b; bestRef = obj as Record<string, unknown>; bestKey = k; }
-        } else if (v && typeof v === "object") walk(v);
-      }
-    }
-  };
-  walk(node);
-  if (!bestRef || bestLen < 64) return false;
-  const cur = String((bestRef as Record<string | number, unknown>)[bestKey]);
-  const marker = "…[截断]";
-  const keep = Math.max(0, Buffer.byteLength(cur, "utf8") - over - Buffer.byteLength(marker, "utf8"));
-  (bestRef as Record<string | number, unknown>)[bestKey] = utf8PrefixBytes(cur, keep) + marker;
-  return true;
-}
-
-// PG JSONB 不能存 U+0000,且游离代理项(unpaired surrogate)也非法。chat 读侧 exact 水合
-// (chatTailRows SQL)历来对二者做 regexp_replace→U+FFFD;物化投影落 JSONB 前必须同语义脱敏,
-// 否则 bash tail 里的这类字节会让 INSTALL ::jsonb 抛 22P05。exact/admin 面仍从 BYTEA 读原始字节。
-const JSONB_ILLEGAL_RE = /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
-function sanitizeJsonbString(s: string): string {
-  JSONB_ILLEGAL_RE.lastIndex = 0;
-  if (!JSONB_ILLEGAL_RE.test(s)) return s;
-  return s.replace(JSONB_ILLEGAL_RE, "\uFFFD");
-}
-/** 递归就地脱敏行内所有字符串值(U+0000 / 游离代理项 → U+FFFD),使其可安全落 JSONB。 */
-function sanitizeRowForJsonb(node: unknown): void {
-  if (Array.isArray(node)) {
-    for (let i = 0; i < node.length; i++) {
-      const v = node[i];
-      if (typeof v === "string") node[i] = sanitizeJsonbString(v);
-      else if (v && typeof v === "object") sanitizeRowForJsonb(v);
-    }
-  } else if (node && typeof node === "object") {
-    const obj = node as Record<string, unknown>;
-    for (const k of Object.keys(obj)) {
-      const v = obj[k];
-      if (typeof v === "string") obj[k] = sanitizeJsonbString(v);
-      else if (v && typeof v === "object") sanitizeRowForJsonb(v);
-    }
-  }
-}
-
-function formatProjectionMB(bytes: number): string {
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${bytes} B`;
-}
-const projectionOversizeNote = (bytes: number): string =>
-  `内容过大（约 ${formatProjectionMB(bytes)}），已省略预览，可点“查看完整”按记录分块查看。`;
-
-/** B-§9-2 单条越限替身:剥离最长字符串仍越 64KB(叶子全是小字符串/深层结构)→ 固定尺寸替身行,
- *  单条永不越限。保留身份 + 终态判定字段 + `_fullBytes`/`_recordOrdinal`(供前端"查看完整"分块拉取)。 */
-function sentinelForOversizeRow(original: MessageLike, fullBytes: number): MessageLike {
-  const note = projectionOversizeNote(fullBytes);
-  const ordinal = typeof original._recordOrdinal === "number" ? original._recordOrdinal : null;
-  const tapeOrdinal = typeof original._turnTapeOrdinal === "number" ? original._turnTapeOrdinal : null;
-  return {
-    ...(typeof original.id === "string" ? { id: original.id } : {}),
-    role: typeof original.role === "string" ? original.role : "tool",
-    ...(typeof original.status === "string" ? { status: original.status } : {}),
-    ...(typeof original._clientMessageId === "string" ? { _clientMessageId: original._clientMessageId } : {}),
-    ...(typeof original._errorCode === "string" ? { _errorCode: original._errorCode } : {}),
-    ...(typeof original._turnTapeMsgId === "string" ? { _turnTapeMsgId: original._turnTapeMsgId } : {}),
-    ...(typeof original._turnTapeId === "string" ? { _turnTapeId: original._turnTapeId } : {}),
-    ...(tapeOrdinal !== null ? { _turnTapeOrdinal: tapeOrdinal } : {}),
-    ...(ordinal !== null ? { _recordOrdinal: ordinal } : {}),
-    _projectionSentinel: true,
-    _truncated: true,
-    _fullBytes: fullBytes,
-    output: note,
-    text: note,
-  };
-}
-
-/** B-§9-1 首/中段 record 越回填预算替身:**未读 payload**,只据 ordinal + octet_length 造替身
- *  (供"查看完整"按记录分块拉取)。绝不整条拉入进程。id 按 (tape,ordinal) 唯一,避免跨卷 dedup 撞键。 */
-function sentinelForOversizeRecord(tapeId: string, ordinal: number, fullBytes: number): MessageLike {
-  const note = projectionOversizeNote(fullBytes);
-  return {
-    id: `oc-projection-oversize:${tapeId}:${ordinal}`,
-    role: "tool",
-    _turnTapeId: tapeId,
-    _turnTapeOrdinal: ordinal,
-    _projectionSentinel: true,
-    _truncated: true,
-    _fullBytes: fullBytes,
-    _recordOrdinal: ordinal,
-    output: note,
-    text: note,
-  };
-}
-
-/** 主动展开分页的超大单记录替身。保留真实 record 身份/role/ordinal，payload 不进进程；
- * `_recordOrdinal` 继续接现有按记录分块入口。 */
-function pagedOversizeRecord(
-  tapeId: string,
-  msgId: string,
-  ordinal: number,
-  role: string,
-  fullBytes: number,
-): MessageLike {
-  const note = projectionOversizeNote(fullBytes);
-  return {
-    id: msgId,
-    role,
-    text: note,
-    output: note,
-    _completed: true,
-    _turnTapeId: tapeId,
-    _turnTapeMsgId: msgId,
-    _turnTapeOrdinal: ordinal,
-    _recordOrdinal: ordinal,
-    _projectionSentinel: true,
-    _truncated: true,
-    _fullBytes: fullBytes,
-  };
-}
-
-/** M-§9-2 卷级畸形/空卷终态替身:固定尺寸提示行(无 record 身份)。id 带 tapeId,避免跨卷 dedup 撞键。 */
-function volumeSentinelRow(tapeId: string, text: string): MessageLike {
-  return { id: `oc-projection-note:${tapeId}`, role: "assistant", _projectionSentinel: true, status: "error", text };
-}
-
-/** B-§9-3 完成证据:该卷终态 assistant/error 行的最小保真拷贝
- *  (id/_clientMessageId/status/_errorCode/text≤4KB);独立于 rows 行预算,尾截也不丢。 */
-function extractTerminalRowEvidence(visible: MessageLike[]): MessageLike | null {
-  for (let i = visible.length - 1; i >= 0; i--) {
-    const r = visible[i]!;
-    const isTerminal =
-      r.role === "assistant" || r.role === "error" ||
-      typeof r._errorCode === "string" || r.status === "error" || r.status === "completed";
-    if (!isTerminal) continue;
-    const ev: MessageLike = {
-      ...(typeof r.id === "string" ? { id: r.id } : {}),
-      ...(typeof r.role === "string" ? { role: r.role } : {}),
-      ...(typeof r._clientMessageId === "string" ? { _clientMessageId: r._clientMessageId } : {}),
-      ...(typeof r.status === "string" ? { status: r.status } : {}),
-      ...(typeof r._errorCode === "string" ? { _errorCode: r._errorCode } : {}),
-      ...(typeof r._turnTapeId === "string" ? { _turnTapeId: r._turnTapeId } : {}),
-      ...(typeof r._turnTapeOrdinal === "number" ? { _turnTapeOrdinal: r._turnTapeOrdinal } : {}),
-      ...(r._turnTapeComplete === true ? { _turnTapeComplete: true } : {}),
-      _projectionTerminalEvidence: true,
-      text: typeof r.text === "string" ? utf8PrefixBytes(r.text, 4096) : "",
-    };
-    sanitizeRowForJsonb(ev);
-    return ev;
-  }
-  return null;
-}
-
-/** B-§9-3(R3)兜底完成证据:**不读任何 record payload**,从 tape header status + dispatch join 的
- *  client_message_id 合成最小终态证据行。三条终态 truncated 路径(空卷/首条越预算/解析错)即便一条
- *  record 都没 hydrate,仍无条件写 header terminal_row —— 前端按 exact clientMessageId 清 in-flight +
- *  抑制同轮 projection,engine readGenerationProjectionRows dedup 兜底(role='assistant')也成立。
- *  clientMessageId 只能来自 dispatch join(content 不可读);legacy 无 dispatch 卷 → 无 cmid(仍写 status
- *  证据,至少保完成态)。id 稳定唯一(tape 派生),避免跨卷 dedup 撞键。text:''(engine 窗口按空文本过滤
- *  不入模型上下文;判定字段完整保真)。 */
-async function synthesizeTerminalRowFromHeader(
-  client: PoolClient,
-  sessionId: string,
-  userId: string,
-  tapeId: string,
-): Promise<MessageLike | null> {
-  const r = (await client.query<{ tape_status: string | null; client_message_id: string | null }>(
-    `SELECT t.status AS tape_status, d.client_message_id
-       FROM client_session_turn_tapes t
-       LEFT JOIN turn_dispatches d ON d.dispatch_id = t.dispatch_id
-      WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
-    [sessionId, userId, tapeId],
-  )).rows[0];
-  if (!r) return null;
-  const status = r.tape_status;
-  if (status !== "completed" && status !== "interrupted" && status !== "crashed") return null;
-  const ev: MessageLike = {
-    id: `oc-projection-terminal:${tapeId}`,
-    role: "assistant",
-    ...(typeof r.client_message_id === "string" ? { _clientMessageId: r.client_message_id } : {}),
-    status,
-    // crashed 走 dispatch_lost 展示码(前端 DISPATCH_LOST_ERROR_CODES 识别);completed 带完成戳(engine
-    // tryDedupCompleted 据此认既有完成 turn)。interrupted 仅保 status。
-    ...(status === "crashed" ? { _errorCode: "SERVICE_RESTART" } : {}),
-    ...(status === "completed" ? { _turnTapeComplete: true } : {}),
-    _projectionTerminalEvidence: true,
-    text: "",
-  };
-  sanitizeRowForJsonb(ev);
-  return ev;
-}
-
-/** 单条投影行 64KB 截断:超限则剥离最长内容字符串,标 `_truncated:true` + `_fullBytes`;
- *  B-§9-2 硬上限收口:剥离后仍越 64KB → 替换为固定尺寸 sentinel(单条永不越限)。
- *  chat-safe:绝不吐 exact 原始超大 payload,超大记录只能在 chat 面看到截断预览。 */
-function truncateProjectionRow(row: MessageLike): { row: MessageLike; bytes: number } {
-  const fullBytes = jsonBytes(row);
-  if (fullBytes <= PROJECTION_ROW_MAX_BYTES) return { row, bytes: fullBytes };
-  const clone = structuredClone(row) as MessageLike;
-  let guard = 0;
-  while (jsonBytes(clone) > PROJECTION_ROW_MAX_BYTES && guard++ < 16) {
-    const over = jsonBytes(clone) - PROJECTION_ROW_MAX_BYTES;
-    if (!truncateLongestString(clone, over + 512)) break;
-  }
-  clone._truncated = true;
-  clone._fullBytes = fullBytes;
-  const clonedBytes = jsonBytes(clone);
-  if (clonedBytes > PROJECTION_ROW_MAX_BYTES) {
-    const sentinel = sentinelForOversizeRow(row, fullBytes);
-    return { row: sentinel, bytes: jsonBytes(sentinel) };
-  }
-  return { row: clone, bytes: clonedBytes };
-}
-
-type ProjectionSourceRecord = {
+interface DirectTapeSourceRecord {
   msg_id: string;
   ordinal: number;
   role: string;
   content_sha256: string;
   payload: Buffer;
-};
-
-/** bash_output_tail runtime-event 的资格 + 目标键(与 projectClientSessionMessagesForChat 一致的
- *  轻校验;读侧 projectClientSessionMessagesForChat 会再校验一次,build 只求 winner 去重有界)。 */
-function tailWinnerTarget(runtimeEvent: unknown): { target: string; totalBytes: number } | null {
-  if (!runtimeEvent || typeof runtimeEvent !== "object" || Array.isArray(runtimeEvent)) return null;
-  const ev = runtimeEvent as Record<string, unknown>;
-  if (ev.type !== "system" || ev.subtype !== "bash_output_tail") return null;
-  const tool = ev.tool_use_id;
-  if (typeof tool !== "string" || !/^[A-Za-z0-9_-]+$/.test(tool)) return null;
-  const rawParent = ev.parent_tool_use_id;
-  const parent = typeof rawParent === "string" && rawParent.length > 0 ? rawParent : "";
-  const totalBytes = typeof ev.total_bytes === "number" && Number.isFinite(ev.total_bytes)
-    ? Math.max(0, ev.total_bytes) : 0;
-  return { target: `${parent}\0${tool}`, totalBytes };
 }
 
-/** 从一卷 tape 的有序 record 构建 chat 内容投影行(visible 行 + bash_output_tail winner)。
- *  与今日 chat 水合(chatVisibleRows + chatTailRows winner 选取 → hydrateTapeRecordContent)同构,
- *  但**不含**可变 cost/waiver(读时现算叠加)。逐记录 64KB 截断 + per-tape 512KB/512 行尾截。
- *  existing = 分段回填时已累计的行(visible 追加、tail winner 合并)。 */
-function buildTapeChatContentRows(
-  records: ProjectionSourceRecord[],
-  tapeId: string,
-  tapeSha256: string,
-  billingAnchorId: string,
-  existing?: { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> },
-): {
-  visible: MessageLike[];
-  tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>;
-} {
-  // content 水合用的最小 anchor:只带 id(billing anchor,供 anchorUsage 判定)+ sha(_turnTapeSha256
-  // 由 row.tape_sha256 决定,这里不影响)。刻意不带 _seq/_orderSeq —— 投影不入库序号,读时现盖。
-  const contentAnchor: MessageLike = { id: billingAnchorId, _turnTapeSha256: tapeSha256 };
-  const visible = existing ? existing.visible : [];
-  const tailWinners = existing ? existing.tailWinners : new Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>();
-  for (const rec of records) {
-    const hydrationRow: HydratedTapeRow = {
-      tape_id: tapeId,
-      tape_sha256: tapeSha256,
-      waive_reason: null,
-      waiver_applied: false,
-      msg_id: rec.msg_id,
-      ordinal: rec.ordinal,
-      role: rec.role,
-      content_sha256: rec.content_sha256,
-      payload: rec.payload,
-      cost_credits: "0",
-      delegate_costs: [],
-    };
-    const content = hydrateTapeRecordContent(hydrationRow, contentAnchor, false, true);
-    // 记录 ordinal(= client_session_turn_tape_records.ordinal):截断行携此 → 前端"查看完整"
-    // 按 recordOrdinal 分块拉取该记录(M-§9-1);读侧渲染忽略,sanitizer 白名单会剥离,不入模型上下文。
-    content._recordOrdinal = rec.ordinal;
-    if (rec.role !== "runtime-event") {
-      visible.push(content);
-      continue;
-    }
-    const target = tailWinnerTarget(content._runtimeEvent);
-    if (!target) continue; // 非 bash_output_tail runtime-event:chat 不展示,丢弃(与 chatVisibleRows 同)。
-    const prev = tailWinners.get(target.target);
-    if (!prev || target.totalBytes > prev.totalBytes ||
-        (target.totalBytes === prev.totalBytes && rec.ordinal > prev.ordinal)) {
-      tailWinners.set(target.target, { row: content, totalBytes: target.totalBytes, ordinal: rec.ordinal });
-    }
-  }
-  return { visible, tailWinners };
+interface DirectTapeHeader {
+  tapeId: string;
+  tapeSha256: string;
+  billingAnchorId: string;
+  totalBytes: number;
+  physicalCount: number;
+  logicalCount: number;
+  narrativeCount: number;
+  status: string;
+  clientMessageId: string | null;
 }
 
-/** R4-B2:有界追加的唯一收口 —— 追加 nextBytes 前按行数/字节双上限弹出尾行,返回弹出后的 totalBytes。
- *  finalizeProjectionRows 与 commitVolumeTruncated 共用:任何合成行(terminal 证据 sentinel)追加都必须
- *  经此,512 行/512KB 是**硬**上限,合成证据也不例外。 */
-function evictTailForBoundedAppend(out: MessageLike[], totalBytes: number, nextBytes: number): number {
-  while (
-    out.length > 0 &&
-    (out.length >= PROJECTION_TAPE_MAX_ROWS || totalBytes + nextBytes > PROJECTION_TAPE_MAX_BYTES)
-  ) {
-    totalBytes -= jsonBytes(out.pop()!);
-  }
-  return totalBytes;
-}
-
-/** 把 build 累计的 visible + tailWinners 摊平成有序投影行(visible 按 ordinal,winner 按 ordinal 追加),
- *  逐记录 64KB 截断 + per-tape 512KB/512 行尾截,返回可落库形态。
- *  B-§9-2:去掉「首行免死」豁免 —— 单条经 truncateProjectionRow 恒 ≤64KB,卷级第一条也不得越 512KB。
- *  B-§9-3:尾截把 terminal 行截掉时,rows 末尾必保 terminal 完成证据(必要时弹出末行腾位,守 ≤512 行/512KB);
- *  并返回 terminalRow 供 header 列无条件写。
- *  MINOR①:winner 行落 `_winnerOrdinal`,building 续段 rehydrate 用真实 ordinal(非 MAX_SAFE_INTEGER)。 */
-function finalizeProjectionRows(
-  visible: MessageLike[],
-  tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>,
-): { rows: MessageLike[]; totalBytes: number; truncated: boolean; terminalRow: MessageLike | null } {
-  const ordered: MessageLike[] = [
-    ...visible,
-    ...[...tailWinners.values()].sort((a, b) => a.ordinal - b.ordinal).map((w) => ({ ...w.row, _winnerOrdinal: w.ordinal })),
-  ];
-  const terminalRow = extractTerminalRowEvidence(visible);
-  const out: MessageLike[] = [];
-  let totalBytes = 0;
-  let truncated = false;
-  for (const row of ordered) {
-    if (out.length >= PROJECTION_TAPE_MAX_ROWS) { truncated = true; break; }
-    // 落 JSONB 前脱敏 U+0000/游离代理项(否则 ::jsonb 抛 22P05);再按字节截断计量。
-    sanitizeRowForJsonb(row);
-    const t = truncateProjectionRow(row);
-    if (totalBytes + t.bytes > PROJECTION_TAPE_MAX_BYTES) { truncated = true; break; }
-    out.push(t.row);
-    totalBytes += t.bytes;
-  }
-  // B-§9-3:尾截掉了 terminal 行 → rows 末尾补 terminal 完成证据 sentinel(必要时弹末行腾位守上限)。
-  if (truncated && terminalRow) {
-    const alreadyHas = terminalRow.id !== undefined && out.some((r) => r.id === terminalRow.id);
-    if (!alreadyHas) {
-      const sentinel: MessageLike = { ...terminalRow, _projectionTruncated: true };
-      sanitizeRowForJsonb(sentinel);
-      const sBytes = jsonBytes(sentinel);
-      totalBytes = evictTailForBoundedAppend(out, totalBytes, sBytes);
-      out.push(sentinel);
-      totalBytes += sBytes;
-    }
-  }
-  return { rows: out, totalBytes, truncated, terminalRow };
-}
-
-/** finalize 同事务:从已 materialize 的 records 写该卷 chat 投影(state=complete/truncated)。
- *  幂等:PK 冲突 DO NOTHING(同 sha 即已有;finalize 持 tape FOR UPDATE,首写恒最先)。 */
-async function writeTapeChatProjectionOnFinalize(
-  client: PoolClient,
-  sessionId: string,
-  userId: string,
-  tapeId: string,
-  tapeSha256: string,
-  billingAnchorId: string,
-  records: ProjectionSourceRecord[],
-): Promise<void> {
-  const { visible, tailWinners } = buildTapeChatContentRows(records, tapeId, tapeSha256, billingAnchorId);
-  const built = finalizeProjectionRows(visible, tailWinners);
-  await client.query(
-    `INSERT INTO tape_chat_projection
-       (session_id,user_id,tape_id,rows,state,next_part,tape_sha256,total_bytes,row_count,terminal_row,updated_at)
-     VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10::jsonb,NOW())
-     ON CONFLICT (session_id,user_id,tape_id) DO NOTHING`,
-    [
-      sessionId, userId, tapeId, JSON.stringify(built.rows),
-      built.truncated ? "truncated" : "complete",
-      records.length, tapeSha256, built.totalBytes, built.rows.length,
-      built.terminalRow ? JSON.stringify(built.terminalRow) : null,
-    ],
-  );
-}
-
-type ProjectionHeader = {
-  state: "building" | "complete" | "truncated";
-  tape_sha256: string;
-  total_bytes: number;
-  row_count: number;
-  /** B-§9-3 完成证据(独立于 rows 行预算):尾截丢了 terminal 行时读侧兜底。小 JSONB,与 rows 分列,不 detoast 大字段。 */
-  terminalRow: MessageLike | null;
-};
-
-/** chat 读第一阶段:只读投影 header(**不含 rows JSONB,绝不触 parts/records BYTEA**)。 */
-async function readProjectionHeaders(
-  q: Queryable,
-  sessionId: string,
-  userId: string,
-  tapeIds: string[],
-): Promise<Map<string, ProjectionHeader>> {
-  if (tapeIds.length === 0) return new Map();
-  const res = await q.query<{
-    tape_id: string; state: string; tape_sha256: string; total_bytes: string; row_count: number;
-    terminal_row: MessageLike | null;
-  }>(
-    // terminal_row 是小 JSONB(独立列),不含大 rows JSONB → SELECT 不 detoast 大字段(仍守「header-only 不触 BYTEA」)。
-    `SELECT tape_id, state, tape_sha256, total_bytes, row_count, terminal_row
-       FROM tape_chat_projection
-      WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])`,
-    [sessionId, userId, tapeIds],
-  );
-  return new Map(res.rows.map((r) => [r.tape_id, {
-    state: r.state as ProjectionHeader["state"],
-    tape_sha256: r.tape_sha256,
-    total_bytes: bigIntNum(r.total_bytes, "tape_chat_projection.total_bytes"),
-    row_count: r.row_count,
-    terminalRow: r.terminal_row && typeof r.terminal_row === "object" ? r.terminal_row : null,
-  }]));
-}
-
-type TapeCostEnrichment = { billingAnchorId: string | null } & ExactUsageEnrichment;
-
-/** chat 读:批量现算每卷可变计费叠加(turn_tape_cost_components + pending + turn_waivers,
- *  **均非 BYTEA 表**)。权威源不冻结在投影里 —— waiver 可 finalize 后 apply、cost 可晚到 stage。 */
-async function readTapeCostEnrichment(
-  q: Queryable,
-  sessionId: string,
-  userId: string,
-  tapeIds: string[],
-): Promise<Map<string, TapeCostEnrichment>> {
-  if (tapeIds.length === 0) return new Map();
-  const res = await q.query<{
-    tape_id: string; billing_anchor_id: string | null; cost_credits: string;
-    waiver_applied: boolean; delegate_costs: unknown;
-  }>(
-    `SELECT t.tape_id, t.billing_anchor_id,
-            EXISTS (
-              SELECT 1 FROM turn_waivers w
-               WHERE ('c:' || w.user_id::text)=t.user_id
-                 AND w.turn_key=t.turn_key AND w.status='applied'
-            ) AS waiver_applied,
-            COALESCE((
-              SELECT SUM(c.cost_credits)::text FROM (
-                SELECT c.cost_credits::numeric AS cost_credits
-                  FROM turn_tape_cost_components c
-                 WHERE c.user_id=t.user_id AND c.session_id=t.session_id
-                   AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
-                UNION ALL
-                SELECT p.cost_credits::numeric AS cost_credits
-                  FROM pending_usage_patches p
-                 WHERE p.user_id=t.user_id
-                   AND t.billing_anchor_id IS NOT NULL
-                   AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
-              ) c
-            ), '0') AS cost_credits,
-            COALESCE((
-              SELECT jsonb_agg(jsonb_build_object('agentId', g.delegate_agent_id, 'costCredits', g.cost_credits)
-                       ORDER BY g.delegate_agent_id)
-                FROM (
-                  SELECT d.delegate_agent_id, SUM(d.cost_credits)::text AS cost_credits FROM (
-                    SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
-                      FROM turn_tape_cost_components c
-                     WHERE c.user_id=t.user_id AND c.session_id=t.session_id
-                       AND c.tape_id=t.tape_id AND c.billing_anchor_id=t.billing_anchor_id
-                    UNION ALL
-                    SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
-                      FROM pending_usage_patches p
-                     WHERE p.user_id=t.user_id
-                       AND t.billing_anchor_id IS NOT NULL
-                       AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
-                  ) d WHERE d.delegate_agent_id IS NOT NULL
-                  GROUP BY d.delegate_agent_id
-                ) g
-            ), '[]'::jsonb) AS delegate_costs
-       FROM client_session_turn_tapes t
-      WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])`,
-    [sessionId, userId, tapeIds],
-  );
-  return new Map(res.rows.map((r) => [r.tape_id, {
-    billingAnchorId: r.billing_anchor_id,
-    costCredits: r.cost_credits,
-    waiverApplied: r.waiver_applied,
-    delegates: parseDelegateCosts(r.delegate_costs),
-  }]));
-}
-
-type CollapseMeta = { totalBytes: number; clientMessageId: string | null; dispatchOutcome: string | null };
-
-/** tape header 精确终态(completed/interrupted/crashed)→ 折叠行 outcome。其它/缺失一律不给终态字段。 */
-function mapTapeStatusToOutcome(status: string | null): string | null {
-  return status === "completed" || status === "interrupted" || status === "crashed" ? status : null;
-}
-
-/** 折叠行元数据(B-§9-4):outcome **权威 = client_session_turn_tapes.status**(tape header 精确终态),
- *  **不再** 取 turn_dispatches.outcome —— 后者会把 late-tape 转 manual(outcome=not_accepted)错显成折叠行
- *  的终态,且 legacy 无 dispatch 卷拿不到终态。dispatch 仅补 client_message_id(前端按 exact cmid 清 in-flight)。 */
-async function readCollapseMeta(
-  q: Queryable,
-  sessionId: string,
-  userId: string,
-  tapeIds: string[],
-): Promise<Map<string, CollapseMeta>> {
-  if (tapeIds.length === 0) return new Map();
-  const res = await q.query<{
-    tape_id: string; total_bytes: string; client_message_id: string | null; tape_status: string | null;
-  }>(
-    `SELECT t.tape_id, t.total_bytes, d.client_message_id, t.status AS tape_status
-       FROM client_session_turn_tapes t
-       LEFT JOIN turn_dispatches d ON d.dispatch_id = t.dispatch_id
-      WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])`,
-    [sessionId, userId, tapeIds],
-  );
-  return new Map(res.rows.map((r) => [r.tape_id, {
-    totalBytes: bigIntNumOr(r.total_bytes, 0),
-    clientMessageId: r.client_message_id,
-    dispatchOutcome: mapTapeStatusToOutcome(r.tape_status),
-  }]));
-}
-
-/** M-§9-3 展开集批量读投影 rows(complete/truncated),一次 tape_id=ANY 取回,消 N+1。 */
-async function readProjectionRowsBatch(
-  q: Queryable,
-  sessionId: string,
-  userId: string,
-  tapeIds: string[],
-): Promise<Map<string, MessageLike[]>> {
-  const out = new Map<string, MessageLike[]>();
-  if (tapeIds.length === 0) return out;
-  const res = await q.query<{ tape_id: string; rows: MessageLike[] }>(
-    `SELECT tape_id, rows FROM tape_chat_projection
-      WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[]) AND state IN ('complete','truncated')`,
-    [sessionId, userId, tapeIds],
-  );
-  for (const r of res.rows) if (Array.isArray(r.rows)) out.set(r.tape_id, r.rows);
-  return out;
-}
-
-/** M-§9-2 卷级终态截断:畸形/空卷/越预算首条 → truncated + sentinel 行 + terminal_row。一次性 log
- *  (此后读侧见 truncated 不再回填,自然不复触)。调用前顶部块已确保 building 行存在,故恒走 UPDATE +
- *  CAS 守 building/next_part/sha,防覆盖并发进展(CAS 落空即别人已推进,不 log noise 也无害)。 */
-async function commitVolumeTruncated(
-  client: PoolClient,
-  sessionId: string,
-  userId: string,
-  tapeId: string,
-  expectedSha: string,
-  fromNextPart: number,
-  rows: MessageLike[],
-  terminalRow: MessageLike | null,
-  logReason: string,
-): Promise<void> {
-  // B-§9-3(R3):终态证据带 _clientMessageId 时并入 rows 末尾(chat 读据此按 exact cmid 清 in-flight /
-  // 抑制同轮 projection —— 卷级 sentinel 本身无 cmid);terminal_row 列独立写(engine
-  // readGenerationProjectionRows dedup 兜底)。二者同源,无 payload 读。
-  const outRows = [...rows];
-  let outBytes = outRows.reduce((s, r) => s + jsonBytes(r), 0);
-  if (terminalRow && typeof terminalRow._clientMessageId === "string") {
-    const has = terminalRow.id !== undefined && outRows.some((r) => r.id === terminalRow.id);
-    if (!has) {
-      const evid: MessageLike = { ...terminalRow, _projectionTruncated: true };
-      sanitizeRowForJsonb(evid);
-      // R4-B2:合成证据同样过硬上限收口(512 building 行 + oversize 次条的构造曾越到 513 行)。
-      const evidBytes = jsonBytes(evid);
-      outBytes = evictTailForBoundedAppend(outRows, outBytes, evidBytes);
-      outRows.push(evid);
-      outBytes += evidBytes;
-    }
-  }
-  const totalBytes = outBytes;
-  const upd = await client.query(
-    `UPDATE tape_chat_projection
-        SET rows=$4::jsonb, state='truncated', next_part=$5, total_bytes=$6, row_count=$7,
-            terminal_row=$8::jsonb, updated_at=NOW()
-      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND state='building'
-        AND next_part=$9 AND tape_sha256=$10`,
-    [sessionId, userId, tapeId, JSON.stringify(outRows), outRows.length, totalBytes, outRows.length,
-      terminalRow ? JSON.stringify(terminalRow) : null, fromNextPart, expectedSha],
-  );
-  if ((upd.rowCount ?? 0) > 0) {
-    // eslint-disable-next-line no-console
-    console.warn("[pgSessions] tape_chat_projection volume terminally truncated", { sessionId, tapeId, reason: logReason });
-  }
-}
-
-/** 惰性回填一卷(单段):从 building 游标 next_part 起读 records(BYTEA;仅存量无投影卷),构建投影,
- *  CAS 推进。返回终态(complete/truncated 可展开;building 本次折叠)+ 本段读取字节数。
- *  B-§9-1:先读 record header(octet_length),预算内才 SELECT payload;单条越预算绝不整读(sentinel)。
- *  M-§9-2:空卷/解析异常 → 终态 truncated + sentinel(一次性 log,二读不复触)。
- *  sha 漂移 → 作废重建;并发 CAS 失败 → 回读现态。绝不回退全量水合。 */
-async function backfillTapeSegment(
+async function readDirectTapeHeaders(
   pool: Pool,
   sessionId: string,
   userId: string,
-  tapeId: string,
-  expectedSha: string,
-  billingAnchorId: string,
-  budgetBytes: number,
-): Promise<{ state: ProjectionHeader["state"]; bytesRead: number }> {
-  return withTx(pool, async (client) => {
-    // 该卷 record 总数(判定分段是否读尽)。
-    const cnt = (await client.query<{ n: string; maxo: number | null }>(
-      `SELECT COUNT(*)::text AS n, MAX(ordinal) AS maxo
-         FROM client_session_turn_tape_records WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-      [sessionId, userId, tapeId],
-    )).rows[0];
-    const recordCount = Number(cnt?.n ?? 0);
-
-    // 现态(FOR UPDATE 串行化同卷并发回填)。
-    const existingRow = (await client.query<{
-      state: string; next_part: number; tape_sha256: string; rows: MessageLike[];
+  tapeIds: string[],
+): Promise<Map<string, DirectTapeHeader>> {
+  if (tapeIds.length === 0) return new Map();
+  const rows = (
+    await pool.query<{
+      tape_id: string;
+      tape_sha256: string;
+      billing_anchor_id: string | null;
+      payload_bytes: string;
+      physical_count: string;
+      logical_count: string;
+      narrative_count: string;
+      status: string;
+      client_message_id: string | null;
     }>(
-      `SELECT state, next_part, tape_sha256, rows FROM tape_chat_projection
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 FOR UPDATE`,
-      [sessionId, userId, tapeId],
-    )).rows[0];
-    if (existingRow && (existingRow.state === "complete" || existingRow.state === "truncated")) {
-      return { state: existingRow.state as ProjectionHeader["state"], bytesRead: 0 };
-    }
-    // sha 漂移(tape 被重写)或不存在 → 重置为 next_part=0 的新 building。
-    let nextPart = 0;
-    let acc: { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> } =
-      { visible: [], tailWinners: new Map() };
-    if (existingRow && existingRow.state === "building" && existingRow.tape_sha256 === expectedSha) {
-      nextPart = existingRow.next_part;
-      acc = rehydrateBuildingAccumulator(Array.isArray(existingRow.rows) ? existingRow.rows : []);
-    }
-    const shaDrift = !!existingRow && existingRow.tape_sha256 !== expectedSha;
-    if (!existingRow) {
-      await client.query(
-        `INSERT INTO tape_chat_projection
-           (session_id,user_id,tape_id,rows,state,next_part,tape_sha256,total_bytes,row_count)
-         VALUES ($1,$2,$3,'[]'::jsonb,'building',0,$4,0,0)
-         ON CONFLICT (session_id,user_id,tape_id) DO NOTHING`,
-        [sessionId, userId, tapeId, expectedSha],
-      );
-    } else if (shaDrift) {
-      await client.query(
-        `UPDATE tape_chat_projection SET rows='[]'::jsonb, state='building', next_part=0,
-                tape_sha256=$4, total_bytes=0, row_count=0, terminal_row=NULL, updated_at=NOW()
-          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-        [sessionId, userId, tapeId, expectedSha],
-      );
-      nextPart = 0;
-      acc = { visible: [], tailWinners: new Map() };
-    }
-    const casFromNextPart = shaDrift ? 0 : nextPart;
-
-    // M-§9-2:空卷(finalized anchor 却无 records = 畸形)→ 终态 truncated + 卷级 sentinel + 一次性 log。
-    // B-§9-3(R3):无条件写 header terminal_row(从 tape header + dispatch join 合成,无 payload 读)。
-    if (recordCount === 0) {
-      const synth = await synthesizeTerminalRowFromHeader(client, sessionId, userId, tapeId);
-      await commitVolumeTruncated(
-        client, sessionId, userId, tapeId, expectedSha, casFromNextPart,
-        [volumeSentinelRow(tapeId, "该轮内容缺失，无法展开。")], synth, "empty_records",
-      );
-      return { state: "truncated", bytesRead: 0 };
-    }
-
-    // B-§9-1:先读 record header(ordinal + octet_length,**不拉 payload**),预算内才决定 SELECT 哪些 payload。
-    const fullBudget = backfillBudgetBytes();
-    const heads = (await client.query<{ ordinal: number; sz: number }>(
-      `SELECT ordinal, octet_length(payload) AS sz
-         FROM client_session_turn_tape_records
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4
-        ORDER BY ordinal LIMIT $5`,
-      [sessionId, userId, tapeId, nextPart, BACKFILL_SEGMENT_RECORD_LIMIT],
-    )).rows;
-
-    const consumeOrdinals: number[] = [];
-    let planned = 0;
-    let oversize: { ordinal: number; sz: number } | null = null;
-    let deferred = false;
-    for (const h of heads) {
-      const sz = Number(h.sz) || 0;
-      if (consumeOrdinals.length === 0) {
-        // 首条 record 的硬预算准入(R3:无 FLOOR 强读):
-        if (sz > fullBudget) { oversize = { ordinal: h.ordinal, sz }; break; } // 超整预算 → 永不适配任一单读 → sentinel + truncated,绝不整条拉入进程
-        if (sz > budgetBytes) { deferred = true; break; }                       // 超本读剩余预算(整预算够)→ defer(本次折叠,下轮空预算 ≤fullBudget 必可读)
-        // ≤ 本读剩余预算 → 读入(单条内存安全);消费后进入 else 分支按剩余预算续接。
-      } else if (planned + sz > budgetBytes) {
-        break;
-      }
-      consumeOrdinals.push(h.ordinal);
-      planned += sz;
-    }
-
-    // B-§9-1:首条 record 越整预算 → 该卷直接 truncated + 单记录 sentinel(未读 payload)。
-    // B-§9-3(R3):完成证据优先取 acc.visible 已 hydrate 的真终态行;acc 无(首条即越预算,一条都没
-    // hydrate)→ 从 header 合成,保证 terminal_row 非空。
-    if (oversize) {
-      const rows = finalizeProjectionRows(
-        [...acc.visible, sentinelForOversizeRecord(tapeId, oversize.ordinal, oversize.sz)],
-        acc.tailWinners,
-      );
-      const terminal = rows.terminalRow
-        ?? await synthesizeTerminalRowFromHeader(client, sessionId, userId, tapeId);
-      await commitVolumeTruncated(
-        client, sessionId, userId, tapeId, expectedSha, casFromNextPart,
-        rows.rows, terminal, `record_over_budget:${oversize.sz}>${fullBudget}`,
-      );
-      return { state: "truncated", bytesRead: 0 };
-    }
-    // 本读剩余预算不足以起步该卷(整预算足)→ 不消费、保持 building、本次折叠,下次读足预算再收敛。
-    if (deferred || consumeOrdinals.length === 0) {
-      return { state: "building", bytesRead: 0 };
-    }
-
-    // 预算内的 record:仅 SELECT 这些 ordinal 的 payload(有界,绝不整卷拉入)。
-    const lastConsume = consumeOrdinals[consumeOrdinals.length - 1]!;
-    const seg = (await client.query<ProjectionSourceRecord>(
-      `SELECT msg_id, ordinal, role, content_sha256, payload
-         FROM client_session_turn_tape_records
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4 AND ordinal <= $5
-        ORDER BY ordinal`,
-      [sessionId, userId, tapeId, nextPart, lastConsume],
-    )).rows;
-    let bytesRead = 0;
-    const consume: ProjectionSourceRecord[] = [];
-    let lastOrdinal = nextPart - 1;
-    for (const rec of seg) {
-      const payload = Buffer.from(rec.payload);
-      consume.push({ ...rec, payload });
-      bytesRead += payload.length;
-      lastOrdinal = rec.ordinal;
-    }
-
-    // M-§9-2:record payload 解析异常(坏 JSON / hash 不符)→ 终态 truncated + 卷级 sentinel + 一次性 log。
-    let built: { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> };
-    let finalized: { rows: MessageLike[]; totalBytes: number; truncated: boolean; terminalRow: MessageLike | null };
-    try {
-      built = buildTapeChatContentRows(consume, tapeId, expectedSha, billingAnchorId, acc);
-      finalized = finalizeProjectionRows(built.visible, built.tailWinners);
-    } catch (err) {
-      // B-§9-3(R3):解析错也无条件写 header terminal_row(从 header 合成,无 payload 读)。
-      const synth = await synthesizeTerminalRowFromHeader(client, sessionId, userId, tapeId);
-      await commitVolumeTruncated(
-        client, sessionId, userId, tapeId, expectedSha, casFromNextPart,
-        [volumeSentinelRow(tapeId, "该轮内容无法解析，已停止展开。")], synth,
-        `record_parse_error:${(err as Error)?.message ?? "unknown"}`,
-      );
-      return { state: "truncated", bytesRead: 0 };
-    }
-
-    const reachedEnd = cnt?.maxo != null && lastOrdinal >= cnt.maxo;
-    const newState = reachedEnd
-      ? (finalized.truncated ? "truncated" : "complete")
-      : (finalized.truncated ? "truncated" : "building");
-    // CAS 推进:防并发 lost-update(WHERE state='building' AND next_part=$prev AND sha 未漂移)。terminal_row 无条件写。
-    const upd = await client.query(
-      `UPDATE tape_chat_projection
-          SET rows=$4::jsonb, state=$5, next_part=$6, total_bytes=$7, row_count=$8,
-              terminal_row=$11::jsonb, updated_at=NOW()
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-          AND state='building' AND next_part=$9 AND tape_sha256=$10`,
-      [
-        sessionId, userId, tapeId, JSON.stringify(finalized.rows), newState,
-        lastOrdinal + 1, finalized.totalBytes, finalized.rows.length, casFromNextPart, expectedSha,
-        finalized.terminalRow ? JSON.stringify(finalized.terminalRow) : null,
-      ],
-    );
-    if ((upd.rowCount ?? 0) === 0) {
-      // 并发已推进/漂移 → 回读现态(不覆盖)。
-      const cur = (await client.query<{ state: string }>(
-        `SELECT state FROM tape_chat_projection WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-        [sessionId, userId, tapeId],
-      )).rows[0];
-      const st = cur?.state === "complete" || cur?.state === "truncated" ? cur.state : "building";
-      return { state: st as ProjectionHeader["state"], bytesRead };
-    }
-    return { state: newState as ProjectionHeader["state"], bytesRead };
-  });
-}
-
-/** 从 building 行已累计的 rows 还原 build 累加器(visible + tail winner map)供下一段续建。 */
-function rehydrateBuildingAccumulator(
-  rows: MessageLike[],
-): { visible: MessageLike[]; tailWinners: Map<string, { row: MessageLike; totalBytes: number; ordinal: number }> } {
-  const visible: MessageLike[] = [];
-  const tailWinners = new Map<string, { row: MessageLike; totalBytes: number; ordinal: number }>();
-  for (const row of rows) {
-    if (row.role === "runtime-event") {
-      const target = tailWinnerTarget(row._runtimeEvent);
-      if (target) {
-        // MINOR①:winner 落库带 `_winnerOrdinal`(真实 ordinal),续段还原用它排序/去重 —— 非
-        // MAX_SAFE_INTEGER(否则跨段 winner 排序错位、同 total_bytes 平局永不被更晚 ordinal 覆盖)。
-        const ordinal = typeof row._winnerOrdinal === "number" ? row._winnerOrdinal : Number.MAX_SAFE_INTEGER;
-        tailWinners.set(target.target, { row, totalBytes: target.totalBytes, ordinal });
-      }
-      continue;
-    }
-    visible.push(row);
-  }
-  return { visible, tailWinners };
-}
-
-/** Existing materialized projection rows already persist `_recordOrdinal` for
- * every source record. Promote it on read so this rollout fixes old complete
- * projections immediately; newly built rows also carry the dedicated field. */
-function projectionTapeOrdinal(row: MessageLike): number | null {
-  const value = typeof row._turnTapeOrdinal === "number"
-    ? row._turnTapeOrdinal
-    : row._recordOrdinal;
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-    ? value
-    : null;
-}
-
-/** chat 读第二阶段:把某卷投影行现盖 _seq/_orderSeq(活体 anchor)+ 现算 cost/waiver 叠加;
- *  卷级截断(state='truncated')时给末行盖 `_projectionTruncated:true`(前端渲染「已截断,查看完整」)。 */
-function applyProjectionForChat(
-  storedRows: MessageLike[],
-  anchor: MessageLike,
-  enrich: TapeCostEnrichment | undefined,
-  truncated: boolean,
-): MessageLike[] {
-  const billingAnchorId = enrich?.billingAnchorId ?? null;
-  const out = storedRows.map((stored) => {
-    let row: MessageLike = { ...stored };
-    const ordinal = projectionTapeOrdinal(row);
-    if (ordinal !== null) row._turnTapeOrdinal = ordinal;
-    else delete row._turnTapeOrdinal;
-    // `_winnerOrdinal` 是 building 续段内部记账,不上 wire;`_recordOrdinal` 仅截断行需要
-    // (前端"查看完整"按记录分块拉),非截断行剥掉减噪。
-    delete row._winnerOrdinal;
-    if (row._truncated !== true) delete row._recordOrdinal;
-    if (typeof anchor._seq === "number") row._seq = anchor._seq;
-    else delete row._seq;
-    if (typeof anchor._orderSeq === "number") row._orderSeq = anchor._orderSeq;
-    else delete row._orderSeq;
-    if (typeof anchor._turnTapeId === "string") row._turnTapeId = anchor._turnTapeId;
-    if (enrich && billingAnchorId !== null && row.id === billingAnchorId) {
-      row = mergeExactUsage(row, enrich, true);
-    }
-    return row;
-  });
-  if (truncated && out.length > 0) out[out.length - 1]!._projectionTruncated = true;
-  return out;
-}
-
-/** 折叠 anchor 行(RFC §9):anchor 原样 + 显式终态字段。finalized 折叠 = 终态存在证据,≠ 内容已展开。 */
-function collapsedAnchorRow(anchor: MessageLike, meta: CollapseMeta | undefined): MessageLike {
-  return {
-    ...anchor,
-    _tapeCollapsed: true,
-    _tapeTotalBytes: meta?.totalBytes ?? 0,
-    _clientMessageId: meta?.clientMessageId ?? (anchor._clientMessageId as string | undefined) ?? undefined,
-    _dispatchOutcome: meta?.dispatchOutcome ?? undefined,
-  };
-}
-
-/** chat 读物化投影主路径(RFC §9)。两阶段:header-only → 投影展开;存量卷惰性回填;
- *  超预算 / building / 异常一律**有界折叠**,绝不回退全量水合。 */
-async function hydrateChatFromProjection(
-  pool: Pool,
-  sessionId: string,
-  userId: string,
-  messages: MessageLike[],
-): Promise<MessageLike[]> {
-  const tapeAnchors = messages.filter(
-    (m) => m && typeof m._turnTapeId === "string" && typeof m._turnTapeSha256 === "string",
+      `SELECT t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status,
+              COALESCE(t.client_message_id, d.client_message_id) AS client_message_id,
+              t.record_payload_bytes::text AS payload_bytes,
+              t.physical_record_count::text AS physical_count,
+              t.logical_record_count::text AS logical_count,
+              COUNT(r.msg_id) FILTER (WHERE r.role IN ('assistant','error'))::text AS narrative_count
+         FROM client_session_turn_tapes t
+         LEFT JOIN client_session_turn_tape_records r
+           ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+         LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
+          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL
+        GROUP BY t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status,
+                 t.client_message_id, d.client_message_id, t.record_payload_bytes,
+                 t.physical_record_count, t.logical_record_count`,
+      [sessionId, userId, tapeIds],
+    )
+  ).rows;
+  return new Map(
+    rows.map((row) => [
+      row.tape_id,
+      {
+        tapeId: row.tape_id,
+        tapeSha256: row.tape_sha256,
+        billingAnchorId: row.billing_anchor_id!,
+        totalBytes: bigIntNum(row.payload_bytes, "turn tape payload bytes"),
+        physicalCount: bigIntNum(row.physical_count, "turn tape physical count"),
+        logicalCount: bigIntNum(row.logical_count, "turn tape logical count"),
+        narrativeCount: bigIntNum(row.narrative_count, "turn tape narrative count"),
+        status: row.status,
+        clientMessageId: row.client_message_id,
+      },
+    ]),
   );
-  const tapeIds = [...new Set(tapeAnchors.map((m) => m._turnTapeId as string))];
-
-  // 第一阶段:只读投影 header(不触任何 BYTEA)。
-  const headers = await readProjectionHeaders(pool, sessionId, userId, tapeIds);
-  // 每卷 anchor 的 sha(判定投影漂移)。同 tapeId 多 anchor 罕见,取首个。
-  const shaByTape = new Map<string, string>();
-  for (const a of tapeAnchors) {
-    const tid = a._turnTapeId as string;
-    if (!shaByTape.has(tid)) shaByTape.set(tid, a._turnTapeSha256 as string);
-  }
-
-  // 可用投影(complete/truncated 且 sha 未漂移)vs 待回填(无/building/漂移)。
-  const usable = new Set<string>();
-  const needBackfill: string[] = [];
-  for (const tid of tapeIds) {
-    const h = headers.get(tid);
-    if (h && (h.state === "complete" || h.state === "truncated") && h.tape_sha256 === shaByTape.get(tid)) {
-      usable.add(tid);
-    } else {
-      needBackfill.push(tid);
-    }
-  }
-
-  // 惰性回填:存量卷按 total_bytes 小卷优先,单次读 ≤OC_BACKFILL_BYTES;超预算的留待下次读。
-  if (needBackfill.length > 0) {
-    const sizes = await readCollapseMeta(pool, sessionId, userId, needBackfill);
-    const anchorById = new Map(tapeAnchors.map((a) => [a._turnTapeId as string, a]));
-    const sorted = [...needBackfill].sort(
-      (x, y) => (sizes.get(x)?.totalBytes ?? 0) - (sizes.get(y)?.totalBytes ?? 0),
-    );
-    let budget = backfillBudgetBytes();
-    for (const tid of sorted) {
-      if (budget <= 0) break;
-      const sha = shaByTape.get(tid);
-      const billingAnchorId = String(anchorById.get(tid)?.id ?? "");
-      if (!sha || !billingAnchorId) continue;
-      try {
-        const r = await backfillTapeSegment(pool, sessionId, userId, tid, sha, billingAnchorId, budget);
-        budget -= r.bytesRead;
-        if (r.state === "complete" || r.state === "truncated") usable.add(tid);
-      } catch {
-        // 回填失败只影响本次性能:留作折叠,下次读继续。绝不抛(否则整会话读挂)。
-      }
-    }
-  }
-
-  // chat 单响应投影预算(≤8MB/≤2000 行):从最新卷起累计,超限的最老卷折叠。
-  const usableTotal = new Map<string, ProjectionHeader>();
-  for (const tid of usable) {
-    const h = headers.get(tid);
-    // 回填新写的卷 header 不在首阶段 map 里,补读一次(仍非 BYTEA)。
-    usableTotal.set(tid, h ?? { state: "complete", tape_sha256: shaByTape.get(tid) ?? "", total_bytes: 0, row_count: 0, terminalRow: null });
-  }
-  const missingHeader = [...usable].filter((tid) => !headers.has(tid));
-  if (missingHeader.length > 0) {
-    const fresh = await readProjectionHeaders(pool, sessionId, userId, missingHeader);
-    for (const [tid, h] of fresh) usableTotal.set(tid, h);
-  }
-  const expand = new Set<string>();
-  let budgetBytes = 0;
-  let budgetRows = 0;
-  // messages 按时间升序;从尾(最新)向头累计。
-  const seenTape = new Set<string>();
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]!;
-    const tid = typeof m._turnTapeId === "string" ? m._turnTapeId : null;
-    if (!tid || !usable.has(tid) || seenTape.has(tid)) continue;
-    seenTape.add(tid);
-    const h = usableTotal.get(tid)!;
-    if (budgetBytes + h.total_bytes <= CHAT_PROJECTION_MAX_BYTES && budgetRows + h.row_count <= CHAT_PROJECTION_MAX_ROWS) {
-      expand.add(tid);
-      budgetBytes += h.total_bytes;
-      budgetRows += h.row_count;
-    }
-  }
-
-  // 折叠集 = 所有非展开的 tape(待回填未收敛 + 超预算)。批量读折叠元数据 + 展开集 cost 叠加 + 投影 rows。
-  // M-§9-3:展开集 rows 一次 tape_id=ANY 批量取回,消 N+1。
-  const collapseTapes = tapeIds.filter((tid) => !expand.has(tid));
-  const [collapseMeta, costEnrich, projectionRowsByTape] = await Promise.all([
-    readCollapseMeta(pool, sessionId, userId, collapseTapes),
-    readTapeCostEnrichment(pool, sessionId, userId, [...expand]),
-    readProjectionRowsBatch(pool, sessionId, userId, [...expand]),
-  ]);
-
-  const assembled = messages.flatMap((anchor) => {
-    const tid = typeof anchor._turnTapeId === "string" ? anchor._turnTapeId : null;
-    if (!tid || typeof anchor._turnTapeSha256 !== "string") return [anchor];
-    if (expand.has(tid)) {
-      const stored = projectionRowsByTape.get(tid);
-      // 展开集但 rows 读空(极端并发被清)→ 降级折叠,绝不回退全量水合。
-      if (!stored) return [collapsedAnchorRow(anchor, collapseMeta.get(tid))];
-      return applyProjectionForChat(
-        stored, anchor, costEnrich.get(tid), usableTotal.get(tid)?.state === "truncated",
-      );
-    }
-    return [collapsedAnchorRow(anchor, collapseMeta.get(tid))];
-  });
-
-  return projectClientSessionMessagesForChat(assembled);
 }
 
-// ── 引擎上下文读(RFC §9)──────────────────────────────────────────────────────
-// loadMasterSessionMessages 切到这里:按 _orderSeq 合并 client_sessions.messages 的 canonical
-// user 行 与 投影表的 assistant 生成行,合并后做与 sanitizer 同构的 48 行/18k 截断。产物与今日
-// sanitizer 等价(不丢用户问题),但绝不为此全量水合 192MB(引擎历史本就截到 48 行)。
-// 无投影卷同惰性回填预算;折叠/省略行绝不进产物。exact/durable/admin 面不受影响。
-
-/** 与 bridge extractMasterHistoryText 同构:text || content(string)|| content 数组拼接。 */
-function extractHistoryText(msg: MessageLike): string {
-  if (typeof msg.text === "string") return msg.text;
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content
-      .map((part) => {
-        if (part && typeof part === "object") {
-          const t = (part as { text?: unknown }).text;
-          return typeof t === "string" ? t : "";
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-  return "";
-}
-
-/** 与 _sanitizeMasterHistoricalMessagesForFrame 同构的窗口选取(48 行/18k 字符),但**保留整行字段**
- *  (_clientMessageId/status/_errorCode 供 dedup + 再 sanitize 双用)。上限常数单一权威在
- *  masterHistoryLimits。 */
-function selectMasterHistoryWindow(msgs: MessageLike[]): MessageLike[] {
-  const rows = msgs.filter((m) => {
-    if (!m || (m.role !== "user" && m.role !== "assistant")) return false;
-    if (m.system === true) return false;
-    return extractHistoryText(m).trim() !== "";
-  });
-  let selected = rows.slice(-MASTER_HISTORY_MAX_MESSAGES);
-  while (selected.length > 0) {
-    const chars = selected.reduce((sum, m) => sum + extractHistoryText(m).length, 0);
-    if (chars <= MASTER_HISTORY_MAX_CHARS) break;
-    selected = selected.slice(1);
-  }
-  return selected;
-}
-
-/** 读一组卷已收敛投影里的 user/assistant 生成行(engine-context 只要这两类,tool/thinking/runtime 不进
- *  模型上下文)。header-only 判定 state,rows 仅取可展开卷。 */
-async function readGenerationProjectionRows(
-  q: Queryable,
+async function readHydratedTapeRows(
+  pool: Pool,
   sessionId: string,
   userId: string,
   tapeIds: string[],
-): Promise<Map<string, MessageLike[]>> {
-  if (tapeIds.length === 0) return new Map();
-  const res = await q.query<{ tape_id: string; rows: MessageLike[]; terminal_row: MessageLike | null }>(
-    `SELECT tape_id, rows, terminal_row FROM tape_chat_projection
-      WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
-        AND state IN ('complete','truncated')`,
-    [sessionId, userId, tapeIds],
-  );
-  const out = new Map<string, MessageLike[]>();
-  for (const r of res.rows) {
-    if (!Array.isArray(r.rows)) continue;
-    const gen = r.rows
-      .filter((m) => m && (m.role === "assistant" || m.role === "user"))
-      .map((m): MessageLike => {
-        const ordinal = projectionTapeOrdinal(m);
-        return {
-          ...m,
-          _turnTapeId: r.tape_id,
-          ...(ordinal !== null ? { _turnTapeOrdinal: ordinal } : {}),
-        };
-      });
-    // B-§9-3 兜底:assistant 完成行被行预算尾截掉时,用 header terminal_row 补一条(保 dedup/完成证据)。
-    const term = r.terminal_row;
-    if (term && typeof term === "object" && term.role === "assistant") {
-      const alreadyIn = term.id !== undefined && gen.some((m) => m.id === term.id);
-      const hasEvidence = gen.some(
-        (m) => m.role === "assistant" && (typeof m._clientMessageId === "string" || m._turnTapeComplete === true),
-      );
-      if (!alreadyIn && !hasEvidence) gen.push(term);
-    }
-    out.set(r.tape_id, gen);
-  }
-  return out;
-}
-
-/** engine-context 主实现。返回 MessageLike[](与今日 loadMasterSessionMessages 返回兼容:
- *  MessageLike[] | null)。 */
-async function computeEngineContextMessages(
-  pool: Pool,
-  sessionId: string,
-  userId: string,
-): Promise<MessageLike[] | null> {
-  const row = (
-    await pool.query<{ messages: string; archived_through_seq: number | null }>(
-      "SELECT messages, archived_through_seq FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
-      [sessionId, userId],
-    )
-  ).rows[0];
-  if (!row) return null;
-  let hot: MessageLike[];
-  try {
-    const parsed = JSON.parse(row.messages);
-    hot = Array.isArray(parsed) ? (parsed as MessageLike[]) : [];
-  } catch {
-    hot = [];
-  }
-  hot = deriveOrderSeqsForRead(hot, bigIntNumOr(row.archived_through_seq, 0));
-
-  const anchors = hot.filter(
-    (m) => m && typeof m._turnTapeId === "string" && typeof m._turnTapeSha256 === "string",
-  );
-  const tapeIds = [...new Set(anchors.map((m) => m._turnTapeId as string))];
-  const shaByTape = new Map<string, string>();
-  for (const a of anchors) {
-    const tid = a._turnTapeId as string;
-    if (!shaByTape.has(tid)) shaByTape.set(tid, a._turnTapeSha256 as string);
-  }
-
-  // 可用投影 vs 待回填(与 chat 读同一惰性回填预算机制)。
-  const headers = await readProjectionHeaders(pool, sessionId, userId, tapeIds);
-  const needBackfill: string[] = [];
-  for (const tid of tapeIds) {
-    const h = headers.get(tid);
-    if (!(h && (h.state === "complete" || h.state === "truncated") && h.tape_sha256 === shaByTape.get(tid))) {
-      needBackfill.push(tid);
-    }
-  }
-  if (needBackfill.length > 0) {
-    const sizes = await readCollapseMeta(pool, sessionId, userId, needBackfill);
-    const anchorById = new Map(anchors.map((a) => [a._turnTapeId as string, a]));
-    const sorted = [...needBackfill].sort(
-      (x, y) => (sizes.get(x)?.totalBytes ?? 0) - (sizes.get(y)?.totalBytes ?? 0),
-    );
-    let budget = backfillBudgetBytes();
-    for (const tid of sorted) {
-      if (budget <= 0) break;
-      const sha = shaByTape.get(tid);
-      const billingAnchorId = String(anchorById.get(tid)?.id ?? "");
-      if (!sha || !billingAnchorId) continue;
-      try {
-        const r = await backfillTapeSegment(pool, sessionId, userId, tid, sha, billingAnchorId, budget);
-        budget -= r.bytesRead;
-      } catch {
-        /* 回填失败 → 该卷生成行本次省略(折叠),不阻断上下文注入 */
-      }
-    }
-  }
-
-  const generationRows = await readGenerationProjectionRows(pool, sessionId, userId, tapeIds);
-  const merged: MessageLike[] = [];
-  for (const m of hot) {
-    const tid = typeof m._turnTapeId === "string" ? m._turnTapeId : null;
-    if (tid && typeof m._turnTapeSha256 === "string") {
-      // tape 锚点:热行本体是无正文的 assistant 空壳,用投影的生成行替代(现盖 _seq/_orderSeq)。
-      const rows = generationRows.get(tid);
-      if (!rows) continue; // 无投影/未收敛 → 生成行省略(折叠),user 问题仍在热行中。
-      for (const g of rows) {
-        const out: MessageLike = { ...g };
-        if (typeof m._orderSeq === "number") out._orderSeq = m._orderSeq;
-        if (typeof m._seq === "number") out._seq = m._seq;
-        merged.push(out);
-      }
-      continue;
-    }
-    merged.push(m);
-  }
-  merged.sort(compareMessagesByOrder);
-  return selectMasterHistoryWindow(merged);
-}
-
-/** 展开端点后端(RFC §9):按物理 ordinal 分页 finalized 卷的可见 immutable records；
- * chat-safe 形态，单次原始读取/响应有界，总可见行数不受物化投影上限约束。 */
-async function listTapeChatProjectionRecordsImpl(
-  pool: Pool,
-  sessionId: string,
-  userId: string,
-  tapeId: string,
-  cursor: number,
-  limit: number,
-): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
-  // 用户主动展开不再等待整卷 tape_chat_projection 收敛。该缓存的 512 行/512KB 上限只适合
-  // 会话首屏折叠投影；若把它当展开权威，物理记录很多的卷会长期 building→404，或在 512 行
-  // 处提前 truncated。这里直接分页不可变 records：单次读取有界，而可见记录总量无固定上限。
-  const tape = (
-    await pool.query<{ tape_sha256: string; billing_anchor_id: string | null }>(
-      `SELECT tape_sha256, billing_anchor_id
-         FROM client_session_turn_tapes
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND finalized_at IS NOT NULL`,
-      [sessionId, userId, tapeId],
-    )
-  ).rows[0];
-  if (!tape || typeof tape.billing_anchor_id !== "string" || tape.billing_anchor_id.length === 0) return null;
-
-  // cursor 是“下一条待扫描的物理 ordinal”，不是可见行 offset。runtime-event/ordinal 空洞可
-  // 自然跳过；预算停在某条时原样返回该 ordinal，下一页既不重复已返回行，也不漏未返回行。
-  const start = Number.isFinite(cursor) && cursor > 0 ? Math.floor(cursor) : 0;
-  const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) && limit > 0 ? limit : 200)));
-  const [countRes, headRes] = await Promise.all([
-    pool.query<{ total: string }>(
-      `SELECT COUNT(*)::text AS total
-         FROM client_session_turn_tape_records
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role <> 'runtime-event'`,
-      [sessionId, userId, tapeId],
-    ),
-    pool.query<{
-      msg_id: string; ordinal: number; role: string; content_sha256: string; payload_bytes: string;
-    }>(
-      `SELECT msg_id, ordinal, role, content_sha256, octet_length(payload)::text AS payload_bytes
-         FROM client_session_turn_tape_records
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-          AND role <> 'runtime-event' AND ordinal >= $4
-        ORDER BY ordinal
-        LIMIT $5`,
-      [sessionId, userId, tapeId, start, cappedLimit + 1],
-    ),
-  ]);
-  const total = bigIntNum(countRes.rows[0]?.total ?? "0", "tape visible record count");
-  const heads = headRes.rows;
-
-  type PageHead = (typeof heads)[number] & { payloadBytes: number; oversize: boolean };
-  const planned: PageHead[] = [];
-  const payloadOrdinals: number[] = [];
-  let rawBytes = 0;
-  let nextCursor: number | null = null;
-  const hydrateCap = Math.min(tapeRecordParseCapBytes(), TAPE_RECORD_PAGE_RAW_MAX_BYTES);
-  for (const head of heads) {
-    if (planned.length >= cappedLimit) {
-      nextCursor = head.ordinal;
-      break;
-    }
-    const payloadBytes = bigIntNum(head.payload_bytes, "tape record payload bytes");
-    const oversize = payloadBytes > hydrateCap;
-    if (!oversize && rawBytes + payloadBytes > TAPE_RECORD_PAGE_RAW_MAX_BYTES) {
-      nextCursor = head.ordinal;
-      break;
-    }
-    planned.push({ ...head, payloadBytes, oversize });
-    if (!oversize) {
-      payloadOrdinals.push(head.ordinal);
-      rawBytes += payloadBytes;
-    }
-  }
-
-  // header 阶段已证明这些 ordinal 的 payload 合计 ≤8MiB；一次批量取避免逐行 round-trip，且
-  // 进入 Node 的原始 BYTEA 有独立硬上限，不拿 1MiB 响应上限冒充读取上限。
-  const payloadRows = payloadOrdinals.length > 0
-    ? (
-        await pool.query<ProjectionSourceRecord>(
-          `SELECT msg_id, ordinal, role, content_sha256, payload
-             FROM client_session_turn_tape_records
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=ANY($4::int[])
-            ORDER BY ordinal`,
-          [sessionId, userId, tapeId, payloadOrdinals],
-        )
-      ).rows
-    : [];
-  const payloadByOrdinal = new Map(payloadRows.map((row) => [row.ordinal, row]));
-  const contentAnchor: MessageLike = {
-    id: tape.billing_anchor_id,
-    _turnTapeSha256: tape.tape_sha256,
-  };
-  const page: MessageLike[] = [];
-  // ordinal 是 PostgreSQL INTEGER；用十位最大游标预留 envelope，实际 nextCursor(null 或任意
-  // 非负 ordinal)只会更短。再精确累计 records 的 JSON 与数组逗号，保证整个 HTTP body ≤1MiB。
-  const responseEnvelopeBytes = jsonBytes({ records: [], nextCursor: 2_147_483_647, total });
-  let recordsBytes = 0;
-  for (const head of planned) {
-    let rec: MessageLike;
-    if (head.oversize) {
-      rec = pagedOversizeRecord(tapeId, head.msg_id, head.ordinal, head.role, head.payloadBytes);
-    } else {
-      const source = payloadByOrdinal.get(head.ordinal);
-      if (!source) throw new Error(`[pgSessions] paged tape record missing: ${tapeId}\0${head.ordinal}`);
-      const hydrated = hydrateTapeRecordContent(
-        {
-          tape_id: tapeId,
-          tape_sha256: tape.tape_sha256,
-          waive_reason: null,
-          waiver_applied: false,
-          msg_id: source.msg_id,
-          ordinal: source.ordinal,
-          role: source.role,
-          content_sha256: source.content_sha256,
-          payload: Buffer.from(source.payload),
-          cost_credits: "0",
-          delegate_costs: [],
-        },
-        contentAnchor,
-        false,
-        true,
-      );
-      hydrated._recordOrdinal = head.ordinal;
-      sanitizeRowForJsonb(hydrated);
-      rec = truncateProjectionRow(hydrated).row;
-      if (rec._truncated !== true) rec._recordOrdinal = undefined;
-    }
-    const recBytes = jsonBytes(rec);
-    const separatorBytes = page.length > 0 ? 1 : 0;
-    // 完整响应（envelope + records + 逗号）≤1MiB；第一条恒 ≤64KiB。停在当前 ordinal，
-    // 下页从该条继续。
-    if (responseEnvelopeBytes + recordsBytes + separatorBytes + recBytes > TAPE_RECORD_PAGE_RESPONSE_MAX_BYTES) {
-      nextCursor = head.ordinal;
-      break;
-    }
-    page.push(rec);
-    recordsBytes += separatorBytes + recBytes;
-  }
-  return { records: page, nextCursor, total };
-}
-
-/** M-§9-1 按记录有界读:从 client_session_turn_tape_records 读单条 record 的**内容文本**一个字节窗口
- *  (SQL substring,绝不整卷/整条拉入进程),供前端"查看完整"分块拼接。返回 chat-safe 文本切片:
- *  从 record payload(JSON MessageLike)hydrate 后的展示文本(output/bashTail/text),按 utf8 安全边界切。
- *  offset/limit 均按 hydrate 后文本的字节计。分租/不存在/未 finalized 卷 → null(端点统一 404)。
- *  单请求 ≤256KB。R4-M1 双护栏:
- *  ①单记录解析上限(OC_TAPE_RECORD_PARSE_CAP 默认 8MB):octet_length 预检超限 → 404,payload
- *    压根不 SELECT(RFC §9「单记录解析上限」;前端按既有 partial 语义提示"内容过大");
- *  ②进程内派生文本 LRU(4 槽,键含 sha):一次 hydrate 服务整个分块序列 —— 无缓存时 16 块曾重复
- *    拉取/解析 16 次同一 payload。缓存值是**派生展示文本**(非 exact 原始字节),进程重启即失,无一致性负担。 */
-const TAPE_RECORD_CHUNK_MAX_BYTES = 256 * 1024;
-function tapeRecordParseCapBytes(): number {
-  const raw = Number(process.env.OC_TAPE_RECORD_PARSE_CAP ?? "");
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 8 * 1024 * 1024;
-}
-const tapeRecordTextLru = new Map<string, Buffer>();
-const TAPE_RECORD_TEXT_LRU_SLOTS = 4;
-async function readTapeRecordChunkImpl(
-  pool: Pool,
-  sessionId: string,
-  userId: string,
-  tapeId: string,
-  recordOrdinal: number,
-  offset: number,
-): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
-  if (!Number.isInteger(recordOrdinal) || recordOrdinal < 0) return null;
-  // 与列表端点同一 finalized + tenant fence；单记录查看不再被派生投影 building/missing 状态
-  // 阻断。tape header/records 才是不可变权威，projection 只是会话首屏缓存。
-  const finalized = await pool.query<{ tape_sha256: string }>(
-    `SELECT tape_sha256 FROM client_session_turn_tapes
-      WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
-        AND finalized_at IS NOT NULL AND billing_anchor_id IS NOT NULL`,
-    [sessionId, userId, tapeId],
-  );
-  if (finalized.rows.length === 0) return null;
-  const tapeSha256 = finalized.rows[0]!.tape_sha256;
-  const lruKey = `${sessionId}\0${userId}\0${tapeId}\0${recordOrdinal}\0${tapeSha256}`;
-  let buf = tapeRecordTextLru.get(lruKey);
-  if (buf !== undefined) {
-    // LRU touch:删了重插保新鲜度。
-    tapeRecordTextLru.delete(lruKey);
-    tapeRecordTextLru.set(lruKey, buf);
-  } else {
-    // ①解析上限预检:只查 octet_length,不拉 payload。超限 = 该记录不支持完整查看(404,
-    // 前端保留截断预览并按 partial 语义提示),绝不整读进进程。
-    const head = (await pool.query<{ role: string; content_sha256: string; bytes: string }>(
-      `SELECT role, content_sha256, octet_length(payload)::text AS bytes
-         FROM client_session_turn_tape_records
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
-      [sessionId, userId, tapeId, recordOrdinal],
-    )).rows[0];
-    if (!head) return null;
-    if (Number(head.bytes) > tapeRecordParseCapBytes()) return null;
-    const rec = (await pool.query<{ payload: Buffer }>(
-      `SELECT payload FROM client_session_turn_tape_records
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
-      [sessionId, userId, tapeId, recordOrdinal],
-    )).rows[0];
-    if (!rec) return null;
-    // hydrate 该 record 得展示文本(与投影同构;绝不吐 exact 原始 payload 字节)。
-    let text = "";
-    try {
-      const content = hydrateTapeRecordContent(
-        {
-          tape_id: tapeId, tape_sha256: tapeSha256, waive_reason: null, waiver_applied: false,
-          msg_id: "", ordinal: recordOrdinal, role: head.role, content_sha256: head.content_sha256,
-          payload: Buffer.from(rec.payload), cost_credits: "0", delegate_costs: [],
-        },
-        { id: "", _turnTapeSha256: tapeSha256 }, false, true,
-      );
-      text = typeof content.output === "string" && content.output.length > 0
-        ? content.output
-        : typeof content.bashTail === "string" && content.bashTail.length > 0
-          ? content.bashTail
-          : typeof content.text === "string" ? content.text : "";
-    } catch {
-      return null; // 坏 record → 404(不吐半损内容)
-    }
-    buf = Buffer.from(text, "utf8");
-    tapeRecordTextLru.set(lruKey, buf);
-    while (tapeRecordTextLru.size > TAPE_RECORD_TEXT_LRU_SLOTS) {
-      const oldest = tapeRecordTextLru.keys().next().value;
-      if (oldest === undefined) break;
-      tapeRecordTextLru.delete(oldest);
-    }
-  }
-  const totalBytes = buf.length;
-  let start = Number.isFinite(offset) && offset > 0 ? Math.min(Math.floor(offset), totalBytes) : 0;
-  // utf8 安全(双端):start 落在 continuation 字节中间时前移到字符边界(nextOffset 恒为合法边界,
-  // 此处防御任意客户端 offset);end 同理不切半字符。
-  while (start > 0 && start < totalBytes && (buf[start]! & 0xc0) === 0x80) start--;
-  let end = Math.min(start + TAPE_RECORD_CHUNK_MAX_BYTES, totalBytes);
-  while (end > start && end < totalBytes && (buf[end]! & 0xc0) === 0x80) end--;
-  const chunk = buf.subarray(start, end).toString("utf8");
-  return { chunk, nextOffset: end < totalBytes ? end : null, totalBytes };
-}
-
-async function hydrateTurnTapeMessages(
-  pool: Pool,
-  sessionId: string,
-  userId: string,
-  messages: MessageLike[],
-  options: ClientSessionReadOptions = {},
-): Promise<MessageLike[]> {
-  const refs = messages.filter(
-    (m) =>
-      m &&
-      typeof m._turnTapeId === "string" &&
-      typeof m._turnTapeSha256 === "string",
-  );
-  if (refs.length === 0) return messages;
-  const tapeIds = [...new Set(refs.map((m) => m._turnTapeId as string))];
-  const exact = options.projection !== "chat";
-  // chat 读走物化投影两阶段(RFC §9):header-only → 投影展开 + 惰性回填,绝不触 tape BYTEA
-  // (存量卷回填除外)。exact(durable/admin 面)保持全量水合语义不变,一字不动。
-  if (!exact) {
-    return await hydrateChatFromProjection(pool, sessionId, userId, messages);
-  }
-  const counts = exact
-    ? new Map<string, { count: number; tapeSha256: string }>()
-    : new Map(
-        (
-          await pool.query<{ tape_id: string; tape_sha256: string; record_count: string }>(
-            `SELECT r.tape_id, t.tape_sha256, COUNT(*)::text AS record_count
-               FROM client_session_turn_tape_records r
-               JOIN client_session_turn_tapes t
-                 ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
-              WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
-              GROUP BY r.tape_id, t.tape_sha256`,
-            [sessionId, userId, tapeIds],
-          )
-        ).rows.map((row) => [
-          row.tape_id,
-          { count: Number(row.record_count), tapeSha256: row.tape_sha256 },
-        ]),
-      );
-  const exactRows = exact
-    ? (
-        await pool.query<HydratedTapeRow>(
+  roles?: string[],
+): Promise<HydratedTapeRow[]> {
+  if (tapeIds.length === 0) return [];
+  const roleClause = roles && roles.length > 0 ? "AND r.role=ANY($4::text[])" : "";
+  const params: unknown[] = [sessionId, userId, tapeIds];
+  if (roles && roles.length > 0) params.push(roles);
+  return (
+    await pool.query<HydratedTapeRow>(
       `SELECT r.tape_id, t.tape_sha256, t.waive_reason,
               EXISTS (
                 SELECT 1 FROM turn_waivers w
                  WHERE ('c:' || w.user_id::text)=t.user_id
                    AND w.turn_key=t.turn_key AND w.status='applied'
               ) AS waiver_applied,
-              r.msg_id, r.ordinal,
-              r.role, r.content_sha256, r.payload,
+              r.msg_id, r.ordinal, r.role, r.content_sha256, r.payload,
               COALESCE((
                 SELECT SUM(exact_cost.cost_credits)::text
                   FROM (
@@ -2619,221 +1273,109 @@ async function hydrateTurnTapeMessages(
          FROM client_session_turn_tape_records r
          JOIN client_session_turn_tapes t
            ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
-        WHERE r.session_id = $1 AND r.user_id = $2 AND r.tape_id = ANY($3::text[])
+        WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
+          ${roleClause}
         ORDER BY r.tape_id, r.ordinal`,
-      [sessionId, userId, tapeIds],
-        )
-      ).rows
-    : [];
-  const chatVisibleRows = !exact
-    ? (
-        await pool.query<HydratedTapeRow>(
-          `SELECT r.tape_id, t.tape_sha256, t.waive_reason,
-                  EXISTS (
-                    SELECT 1 FROM turn_waivers w
-                     WHERE ('c:' || w.user_id::text)=t.user_id
-                       AND w.turn_key=t.turn_key AND w.status='applied'
-                  ) AS waiver_applied,
-                  r.msg_id, r.ordinal,
-                  r.role, r.content_sha256, r.payload,
-                  COALESCE((
-                    SELECT SUM(exact_cost.cost_credits)::text
-                      FROM (
-                        SELECT c.cost_credits::numeric AS cost_credits
-                          FROM turn_tape_cost_components c
-                         WHERE c.user_id=r.user_id AND c.session_id=r.session_id
-                           AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
-                        UNION ALL
-                        SELECT p.cost_credits::numeric AS cost_credits
-                          FROM pending_usage_patches p
-                         WHERE p.user_id=r.user_id
-                           AND r.msg_id=t.billing_anchor_id
-                           AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
-                      ) exact_cost
-                  ), '0') AS cost_credits,
-                  COALESCE((
-                    SELECT jsonb_agg(
-                             jsonb_build_object(
-                               'agentId', grouped.delegate_agent_id,
-                               'costCredits', grouped.cost_credits
-                             ) ORDER BY grouped.delegate_agent_id
-                           )
-                      FROM (
-                        SELECT exact_delegate.delegate_agent_id,
-                               SUM(exact_delegate.cost_credits)::text AS cost_credits
-                          FROM (
-                            SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
-                              FROM turn_tape_cost_components c
-                             WHERE c.user_id=r.user_id AND c.session_id=r.session_id
-                               AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
-                            UNION ALL
-                            SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
-                              FROM pending_usage_patches p
-                             WHERE p.user_id=r.user_id
-                               AND r.msg_id=t.billing_anchor_id
-                               AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
-                          ) exact_delegate
-                         WHERE exact_delegate.delegate_agent_id IS NOT NULL
-                         GROUP BY exact_delegate.delegate_agent_id
-                      ) grouped
-                  ), '[]'::jsonb) AS delegate_costs
-             FROM client_session_turn_tape_records r
-             JOIN client_session_turn_tapes t
-               ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
-            WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
-              AND r.role <> 'runtime-event'
-            ORDER BY r.tape_id, r.ordinal`,
-          [sessionId, userId, tapeIds],
-        )
-      ).rows
-    : [];
-  const chatTailRows = !exact
-    ? (
-        await pool.query<HydratedTapeRow>(
-          `WITH candidates AS MATERIALIZED (
-             SELECT r.*, t.tape_sha256, t.waive_reason,
-                    t.created_at AS tape_created_at
-               FROM client_session_turn_tape_records r
-               JOIN client_session_turn_tapes t
-                 ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
-              WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
-                AND r.role='runtime-event'
-                AND position(convert_to('"subtype":"bash_output_tail"', 'UTF8') in r.payload)>0
-           ), parsed AS (
-             SELECT candidates.*,
-                    regexp_replace(
-                      regexp_replace(
-                        convert_from(payload, 'UTF8'),
-                        '(?<=\\\\)u0000', 'uFFFD', 'g'
-                      ),
-                      '(?<=\\\\)u[dD][89a-fA-F][0-9a-fA-F]{2}', 'uFFFD', 'g'
-                    )::jsonb AS body
-               FROM candidates
-           ), eligible AS (
-             SELECT parsed.*,
-                    COALESCE(body #>> '{_runtimeEvent,parent_tool_use_id}', '') AS parent_tool_use_id,
-                    body #>> '{_runtimeEvent,tool_use_id}' AS tool_use_id,
-                    GREATEST(
-                      CASE WHEN jsonb_typeof(body #> '{_runtimeEvent,total_bytes}')='number'
-                           THEN (body #>> '{_runtimeEvent,total_bytes}')::numeric ELSE 0 END,
-                      0
-                    ) AS projected_total_bytes
-               FROM parsed
-              WHERE jsonb_typeof(body #> '{_runtimeEvent,type}')='string'
-                AND body #>> '{_runtimeEvent,type}'='system'
-                AND jsonb_typeof(body #> '{_runtimeEvent,subtype}')='string'
-                AND body #>> '{_runtimeEvent,subtype}'='bash_output_tail'
-                AND jsonb_typeof(body #> '{_runtimeEvent,tool_use_id}')='string'
-                AND body #>> '{_runtimeEvent,tool_use_id}' ~ '^[A-Za-z0-9_-]+$'
-                AND (
-                  body #> '{_runtimeEvent,parent_tool_use_id}' IS NULL
-                  OR body #> '{_runtimeEvent,parent_tool_use_id}'='null'::jsonb
-                  OR (
-                    jsonb_typeof(body #> '{_runtimeEvent,parent_tool_use_id}')='string'
-                    AND (
-                      body #>> '{_runtimeEvent,parent_tool_use_id}'=''
-                      OR body #>> '{_runtimeEvent,parent_tool_use_id}' ~ '^[A-Za-z0-9_-]+$'
-                    )
-                  )
-                )
-           ), ranked AS (
-             SELECT eligible.*,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY parent_tool_use_id, tool_use_id
-                      ORDER BY
-                        projected_total_bytes DESC,
-                        ts DESC NULLS LAST, tape_created_at DESC NULLS LAST,
-                        ordinal DESC, tape_id DESC, msg_id DESC
-                    ) AS winner
-               FROM eligible
-           )
-           SELECT tape_id, tape_sha256, waive_reason, false AS waiver_applied,
-                  msg_id, ordinal, role,
-                  content_sha256, payload, '0'::text AS cost_credits,
-                  '[]'::jsonb AS delegate_costs
-             FROM ranked WHERE winner=1
-            ORDER BY tape_created_at, ordinal, tape_id, msg_id`,
-          [sessionId, userId, tapeIds],
-        )
-      ).rows
-    : [];
-  const rows = exact ? exactRows : [...chatVisibleRows, ...chatTailRows];
-  const byKey = new Map(rows.map((row) => [`${row.tape_id}\0${row.msg_id}`, row]));
+      params,
+    )
+  ).rows;
+}
+
+function directTapeProcessRow(anchor: MessageLike, header: DirectTapeHeader): MessageLike {
+  return {
+    id: `turn-process:${header.tapeId}`,
+    role: "runtime-event",
+    text: "",
+    ts: typeof anchor.ts === "number" ? anchor.ts : 0,
+    _source: "server",
+    _turnTapeId: header.tapeId,
+    _turnTapeSha256: header.tapeSha256,
+    _turnTapeComplete: true,
+    _turnTapeProcess: true,
+    _turnTapeProcessCount: Math.max(0, header.logicalCount - header.narrativeCount),
+    _turnTapeTotalBytes: header.totalBytes,
+    _dispatchOutcome: header.status,
+    ...(header.clientMessageId ? { _clientMessageId: header.clientMessageId } : {}),
+    ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+    ...(typeof anchor._orderSeq === "number" ? { _orderSeq: anchor._orderSeq } : {}),
+  };
+}
+
+/**
+ * Exact/admin reads hydrate every physical and logical record. Browser chat
+ * reads hydrate only genuine assistant/error narrative rows and add one typed
+ * process control before them. The control contains no generated content; it
+ * merely owns the cursor that lazily exposes every remaining immutable record.
+ */
+async function hydrateTurnTapeMessages(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  messages: MessageLike[],
+  options: ClientSessionReadOptions = {},
+): Promise<MessageLike[]> {
+  const refs = messages.filter(
+    (message) =>
+      message &&
+      typeof message._turnTapeId === "string" &&
+      typeof message._turnTapeSha256 === "string",
+  );
+  if (refs.length === 0) return messages;
+  const tapeIds = [...new Set(refs.map((message) => message._turnTapeId as string))];
+  const exact = options.view !== "timeline";
+  const [headers, rows] = await Promise.all([
+    readDirectTapeHeaders(pool, sessionId, userId, tapeIds),
+    readHydratedTapeRows(pool, sessionId, userId, tapeIds, exact ? undefined : ["assistant", "error"]),
+  ]);
   const byTape = new Map<string, HydratedTapeRow[]>();
   for (const row of rows) {
-    const tapeRows = byTape.get(row.tape_id) ?? [];
-    tapeRows.push(row);
-    byTape.set(row.tape_id, tapeRows);
+    const list = byTape.get(row.tape_id) ?? [];
+    list.push(row);
+    byTape.set(row.tape_id, list);
   }
 
-  const hydrated = messages.flatMap((anchor) => {
-    if (
-      typeof anchor?._turnTapeId !== "string" ||
-      typeof anchor?._turnTapeSha256 !== "string"
-    ) {
-      return [anchor];
+  const hydrated = messages.flatMap((anchor): MessageLike[] => {
+    const tapeId = typeof anchor._turnTapeId === "string" ? anchor._turnTapeId : null;
+    const tapeSha256 = typeof anchor._turnTapeSha256 === "string" ? anchor._turnTapeSha256 : null;
+    if (!tapeId || !tapeSha256) return [anchor];
+    const header = headers.get(tapeId);
+    if (!header) throw new Error(`[pgSessions] finalized lossless turn tape missing: ${tapeId}`);
+    if (header.tapeSha256 !== tapeSha256) {
+      throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${tapeId}`);
     }
-    if (anchor._turnTapeComplete === true) {
-      const tapeRows = byTape.get(anchor._turnTapeId);
-      if (exact && (!tapeRows || tapeRows.length === 0)) {
-        throw new Error(`[pgSessions] lossless turn tape records missing: ${anchor._turnTapeId}`);
+    const expectedPhysical = anchor._turnTapePhysicalRecordCount ?? anchor._turnTapeRecordCount;
+    if (
+      typeof expectedPhysical === "number" &&
+      Number.isSafeInteger(expectedPhysical) &&
+      expectedPhysical > 0 &&
+      expectedPhysical !== header.physicalCount
+    ) {
+      throw new Error(`[pgSessions] lossless turn tape physical count mismatch: ${tapeId}`);
+    }
+    const tapeRows = byTape.get(tapeId) ?? [];
+    if (exact) {
+      if (tapeRows.length !== header.physicalCount) {
+        throw new Error(`[pgSessions] lossless turn tape records missing: ${tapeId}`);
       }
-      const expectedCount = anchor._turnTapeRecordCount;
-      const expectedPhysicalCount = anchor._turnTapePhysicalRecordCount;
-      const projectedMeta = counts.get(anchor._turnTapeId);
-      const actualCount = exact ? tapeRows?.length : projectedMeta?.count;
-      if (
-        typeof expectedCount !== "number" ||
-        !Number.isSafeInteger(expectedCount) ||
-        expectedCount <= 0 ||
-        actualCount !== expectedCount
-      ) {
-        throw new Error(`[pgSessions] lossless turn tape record count mismatch: ${anchor._turnTapeId}`);
-      }
-      if (
-        expectedPhysicalCount !== undefined &&
-        (typeof expectedPhysicalCount !== "number" ||
-          !Number.isSafeInteger(expectedPhysicalCount) ||
-          expectedPhysicalCount !== expectedCount)
-      ) {
-        throw new Error(`[pgSessions] lossless turn tape physical count mismatch: ${anchor._turnTapeId}`);
-      }
-      if (tapeRows?.some((row) => row.tape_sha256 !== anchor._turnTapeSha256)) {
-        throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${anchor._turnTapeId}`);
-      }
-      if (!exact && projectedMeta?.tapeSha256 !== anchor._turnTapeSha256) {
-        throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${anchor._turnTapeId}`);
-      }
-      if (!tapeRows || tapeRows.length === 0) {
-        return [{
-          ...anchor,
-          id: `projection-source:${anchor._turnTapeId}`,
-          role: "runtime-event",
-          text: "",
-          _turnTapeExpanded: true,
-        }];
-      }
-      if (!exact) return tapeRows.map((row) => hydrateTapeRecord(row, anchor, false, true));
       const expanded: MessageLike[] = [];
       const batchDescriptors: HydratedRuntimeBatchDescriptor[] = [];
       for (const row of tapeRows) {
         const result = expandHydratedRuntimeBatch(
-          hydrateTapeRecord(row, anchor, false, true),
+          hydrateTapeRecord(row, anchor, false, anchor._turnTapeComplete === true),
           row,
           anchor,
         );
         expanded.push(...result.messages);
         if (result.descriptor) batchDescriptors.push(result.descriptor);
       }
-      const expectedLogicalCount = anchor._turnTapeLogicalRecordCount;
+      const expectedLogical = anchor._turnTapeLogicalRecordCount;
       if (
-        expectedLogicalCount !== undefined &&
-        (typeof expectedLogicalCount !== "number" ||
-          !Number.isSafeInteger(expectedLogicalCount) ||
-          expectedLogicalCount <= 0 ||
-          expanded.length !== expectedLogicalCount)
+        typeof expectedLogical === "number" &&
+        Number.isSafeInteger(expectedLogical) &&
+        expectedLogical > 0 &&
+        expanded.length !== expectedLogical
       ) {
-        throw new Error(`[pgSessions] lossless turn tape logical count mismatch: ${anchor._turnTapeId}`);
+        throw new Error(`[pgSessions] lossless turn tape logical count mismatch: ${tapeId}`);
       }
       const expectedManifestSha = anchor._turnTapeRuntimeManifestSha256;
       if (expectedManifestSha !== undefined) {
@@ -2843,58 +1385,64 @@ async function hydrateTurnTapeMessages(
           batchDescriptors.length === 0 ||
           sha256Bytes(Buffer.from(JSON.stringify(batchDescriptors), "utf8")) !== expectedManifestSha
         ) {
-          throw new Error(`[pgSessions] lossless turn tape runtime manifest mismatch: ${anchor._turnTapeId}`);
+          throw new Error(`[pgSessions] lossless turn tape runtime manifest mismatch: ${tapeId}`);
         }
       } else if (batchDescriptors.length > 0) {
-        throw new Error(`[pgSessions] lossless turn tape runtime manifest missing: ${anchor._turnTapeId}`);
+        throw new Error(`[pgSessions] lossless turn tape runtime manifest missing: ${tapeId}`);
       }
       return expanded;
     }
 
-    // Rolling compatibility with any per-record refs staged by an earlier
-    // pre-release runtime build.
-    if (typeof anchor._turnTapeMsgId !== "string") {
-      throw new Error(`[pgSessions] lossless turn tape anchor malformed: ${anchor._turnTapeId}`);
+    const narrative = tapeRows.map((row) =>
+      hydrateTapeRecord(row, anchor, false, anchor._turnTapeComplete === true),
+    );
+    narrative.sort((a, b) =>
+      (typeof a._turnTapeOrdinal === "number" ? a._turnTapeOrdinal : 0) -
+      (typeof b._turnTapeOrdinal === "number" ? b._turnTapeOrdinal : 0),
+    );
+    const narrativeClientMessageId = narrative.find(
+      (message) => typeof message._clientMessageId === "string",
+    )?._clientMessageId;
+    const clientMessageId = header.clientMessageId ??
+      (typeof narrativeClientMessageId === "string" ? narrativeClientMessageId : null);
+    if (clientMessageId) {
+      for (const message of narrative) {
+        if (typeof message._clientMessageId !== "string") message._clientMessageId = clientMessageId;
+      }
     }
-    const key = `${anchor._turnTapeId}\0${anchor._turnTapeMsgId}`;
-    const row = byKey.get(key);
-    if (!row && !exact) {
-      return [{ ...anchor, role: "runtime-event", text: "", _turnTapeExpanded: true }];
-    }
-    if (!row) throw new Error(`[pgSessions] lossless turn tape record missing: ${key}`);
-    return [hydrateTapeRecord(row, anchor, true)];
+    const process = header.physicalCount > header.narrativeCount
+      ? [directTapeProcessRow(anchor, { ...header, clientMessageId: clientMessageId ?? null })]
+      : [];
+    return [...process, ...narrative];
   });
 
-  // A CCB background Bash process can emit tail snapshots after its owning
-  // model turn has finalized. Those exact raw messages live in immutable
-  // runtime-event continuation tapes. Reapply every monotonic snapshot to the
-  // same tool projection the live reducer updated, while retaining the hidden
-  // runtime-event rows themselves for byte-exact inspection/replay.
-  const topLevelTools = new Map<string, MessageLike>();
-  const childTools = new Map<string, Record<string, unknown>>();
-  const indexChildTools = (blocks: unknown): void => {
-    if (!Array.isArray(blocks)) return;
-    for (const rawBlock of blocks) {
-      if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) continue;
-      const block = rawBlock as Record<string, unknown>;
-      if (block.kind === "tool_use" && typeof block.blockId === "string") {
-        childTools.set(block.blockId, block);
-      }
-      indexChildTools(block.childBlocks);
-    }
-  };
-  for (const message of hydrated) {
-    if (message.role === "tool" && typeof message.blockId === "string") {
-      topLevelTools.set(message.blockId, message);
-    }
-    indexChildTools(message.childBlocks);
-  }
   if (exact) {
+    // Apply exact continuation Bash tails to their real tool records without
+    // deleting the immutable runtime rows themselves.
+    const topLevelTools = new Map<string, MessageLike>();
+    const childTools = new Map<string, Record<string, unknown>>();
+    const indexChildren = (blocks: unknown): void => {
+      if (!Array.isArray(blocks)) return;
+      for (const raw of blocks) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+        const block = raw as Record<string, unknown>;
+        if (block.kind === "tool_use" && typeof block.blockId === "string") {
+          childTools.set(block.blockId, block);
+        }
+        indexChildren(block.childBlocks);
+      }
+    };
+    for (const message of hydrated) {
+      if (message.role === "tool" && typeof message.blockId === "string") {
+        topLevelTools.set(message.blockId, message);
+      }
+      indexChildren(message.childBlocks);
+    }
     for (const message of hydrated) {
       if (message.role !== "runtime-event") continue;
-      const runtime = message._runtimeEvent;
-      if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) continue;
-      const raw = runtime as Record<string, unknown>;
+      const event = message._runtimeEvent;
+      if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+      const raw = event as Record<string, unknown>;
       if (raw.type !== "system" || raw.subtype !== "bash_output_tail") continue;
       const toolUseId = raw.tool_use_id;
       if (typeof toolUseId !== "string" || toolUseId.length === 0) continue;
@@ -2918,8 +1466,281 @@ async function hydrateTurnTapeMessages(
       };
     }
   }
-  return exact ? hydrated : projectClientSessionMessagesForChat(hydrated);
+  return hydrated;
 }
+
+function extractHistoryText(message: MessageLike): string {
+  if (typeof message.text === "string") return message.text;
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .map((part) => part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+      ? (part as { text: string }).text
+      : "")
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** Model context remains bounded by the selected execution engine's physical
+ * context budget. That bound never affects the browser timeline. */
+function selectMasterHistoryWindow(messages: MessageLike[]): MessageLike[] {
+  const rows = messages.filter((message) => {
+    if (!message || (message.role !== "user" && message.role !== "assistant")) return false;
+    if (message.system === true) return false;
+    return extractHistoryText(message).trim() !== "";
+  });
+  let selected = rows.slice(-MASTER_HISTORY_MAX_MESSAGES);
+  while (selected.length > 0) {
+    const chars = selected.reduce((sum, message) => sum + extractHistoryText(message).length, 0);
+    if (chars <= MASTER_HISTORY_MAX_CHARS) break;
+    selected = selected.slice(1);
+  }
+  return selected;
+}
+
+async function computeEngineContextMessages(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+): Promise<MessageLike[] | null> {
+  const row = (
+    await pool.query<{ messages: string; archived_through_seq: number | null }>(
+      "SELECT messages, archived_through_seq FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
+      [sessionId, userId],
+    )
+  ).rows[0];
+  if (!row) return null;
+  let messages: MessageLike[] = [];
+  try {
+    const parsed = JSON.parse(row.messages);
+    if (Array.isArray(parsed)) messages = parsed as MessageLike[];
+  } catch {
+    messages = [];
+  }
+  messages = deriveOrderSeqsForRead(messages, bigIntNumOr(row.archived_through_seq, 0));
+  const direct = await hydrateTurnTapeMessages(pool, sessionId, userId, messages, { view: "timeline" });
+  return selectMasterHistoryWindow(direct);
+}
+
+function deferredTapeRecord(
+  tapeId: string,
+  tapeSha256: string,
+  head: { msg_id: string; ordinal: number; role: string; ts: string; content_sha256: string },
+  payloadBytes: number,
+): MessageLike {
+  return {
+    id: head.msg_id,
+    role: head.role,
+    text: "",
+    ts: bigIntNum(head.ts, "turn tape record ts"),
+    _source: "server",
+    _turnTapeId: tapeId,
+    _turnTapeMsgId: head.msg_id,
+    _turnTapeOrdinal: head.ordinal,
+    _turnTapeSha256: tapeSha256,
+    _turnTapeComplete: true,
+    _recordOrdinal: head.ordinal,
+    _payloadDeferred: true,
+    _payloadBytes: payloadBytes,
+    _payloadSha256: head.content_sha256,
+  };
+}
+
+/** Physical-ordinal cursor paging over every immutable record. Runtime batches
+ * are expanded into their exact logical events; oversized physical records are
+ * returned as metadata-only deferred records whose binary payload URL is the
+ * same authoritative row, not substitute content. */
+async function listTurnTapeRecordsImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  cursor: number,
+  limit: number,
+): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+  const header = (
+    await pool.query<{ tape_sha256: string; billing_anchor_id: string; total: string }>(
+      `SELECT t.tape_sha256, t.billing_anchor_id,
+              (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
+                WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id) AS total
+         FROM client_session_turn_tapes t
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
+      [sessionId, userId, tapeId],
+    )
+  ).rows[0];
+  if (!header) return null;
+  const start = Number.isSafeInteger(cursor) && cursor > 0 ? cursor : 0;
+  const cappedLimit = Math.max(1, Math.min(
+    TAPE_RECORD_PAGE_MAX_ROWS,
+    Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : TAPE_RECORD_PAGE_MAX_ROWS,
+  ));
+  const heads = (
+    await pool.query<{
+      msg_id: string;
+      ordinal: number;
+      role: string;
+      ts: string;
+      content_sha256: string;
+      payload_bytes: string;
+    }>(
+      `SELECT msg_id, ordinal, role, ts::text, content_sha256,
+              octet_length(payload)::text AS payload_bytes
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4
+        ORDER BY ordinal
+        LIMIT $5`,
+      [sessionId, userId, tapeId, start, cappedLimit + 1],
+    )
+  ).rows;
+
+  type Planned = (typeof heads)[number] & { payloadBytes: number; deferred: boolean };
+  const planned: Planned[] = [];
+  const inlineOrdinals: number[] = [];
+  let rawBytes = 0;
+  let nextCursor: number | null = null;
+  for (const head of heads) {
+    if (planned.length >= cappedLimit) {
+      nextCursor = head.ordinal;
+      break;
+    }
+    const payloadBytes = bigIntNum(head.payload_bytes, "turn tape record payload bytes");
+    // Runtime batches can be tiny on the wire yet expand to tens of thousands
+    // of logical events. Always decode them in the browser worker near the
+    // viewport instead of expanding compressed content inside a page response.
+    const deferred = payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES ||
+      head.msg_id.includes("-runtime-batch-");
+    if (!deferred && planned.length > 0 && rawBytes + payloadBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES) {
+      nextCursor = head.ordinal;
+      break;
+    }
+    planned.push({ ...head, payloadBytes, deferred });
+    if (!deferred) {
+      rawBytes += payloadBytes;
+      inlineOrdinals.push(head.ordinal);
+    }
+  }
+
+  const payloadRows = inlineOrdinals.length === 0
+    ? []
+    : (
+        await pool.query<DirectTapeSourceRecord>(
+          `SELECT msg_id, ordinal, role, content_sha256, payload
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=ANY($4::int[])
+            ORDER BY ordinal`,
+          [sessionId, userId, tapeId, inlineOrdinals],
+        )
+      ).rows;
+  const payloadByOrdinal = new Map(payloadRows.map((row) => [row.ordinal, row]));
+  const anchor: MessageLike = { id: header.billing_anchor_id, _turnTapeSha256: header.tape_sha256 };
+  const records: MessageLike[] = [];
+  for (const head of planned) {
+    if (head.deferred) {
+      records.push(deferredTapeRecord(tapeId, header.tape_sha256, head, head.payloadBytes));
+      continue;
+    }
+    const source = payloadByOrdinal.get(head.ordinal);
+    if (!source) throw new Error(`[pgSessions] direct tape record missing: ${tapeId}\0${head.ordinal}`);
+    const row: HydratedTapeRow = {
+      tape_id: tapeId,
+      tape_sha256: header.tape_sha256,
+      waive_reason: null,
+      waiver_applied: false,
+      msg_id: source.msg_id,
+      ordinal: source.ordinal,
+      role: source.role,
+      content_sha256: source.content_sha256,
+      payload: Buffer.from(source.payload),
+      cost_credits: "0",
+      delegate_costs: [],
+    };
+    const result = expandHydratedRuntimeBatch(
+      hydrateTapeRecord(row, anchor, false, true),
+      row,
+      anchor,
+    );
+    for (const message of result.messages) {
+      message._recordOrdinal = head.ordinal;
+      records.push(message);
+    }
+  }
+  return {
+    records,
+    nextCursor,
+    total: bigIntNum(header.total, "turn tape record total"),
+  };
+}
+
+export interface TapeRecordPayloadChunk {
+  chunk: Buffer;
+  nextOffset: number | null;
+  totalBytes: number;
+  start: number;
+  endExclusive: number;
+  msgId: string;
+  role: string;
+  contentSha256: string;
+  tapeSha256: string;
+}
+
+async function readTapeRecordPayloadChunkImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  recordOrdinal: number,
+  offset: number,
+  requestedBytes = TAPE_RECORD_PAYLOAD_CHUNK_BYTES,
+): Promise<TapeRecordPayloadChunk | null> {
+  if (!Number.isSafeInteger(recordOrdinal) || recordOrdinal < 0) return null;
+  if (!Number.isSafeInteger(offset) || offset < 0) return null;
+  const maxBytes = Math.max(1, Math.min(
+    TAPE_RECORD_PAYLOAD_CHUNK_BYTES,
+    Number.isFinite(requestedBytes) ? Math.floor(requestedBytes) : TAPE_RECORD_PAYLOAD_CHUNK_BYTES,
+  ));
+  const row = (
+    await pool.query<{
+      tape_sha256: string;
+      msg_id: string;
+      role: string;
+      content_sha256: string;
+      total_bytes: string;
+      chunk: Buffer;
+    }>(
+      `SELECT t.tape_sha256, r.msg_id, r.role, r.content_sha256,
+              octet_length(r.payload)::text AS total_bytes,
+              substring(
+                r.payload
+                FROM LEAST($5::bigint, octet_length(r.payload)::bigint + 1)::integer
+                FOR $6::integer
+              ) AS chunk
+         FROM client_session_turn_tapes t
+         JOIN client_session_turn_tape_records r
+           ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL
+          AND r.ordinal=$4`,
+      [sessionId, userId, tapeId, recordOrdinal, offset + 1, maxBytes],
+    )
+  ).rows[0];
+  if (!row) return null;
+  const totalBytes = bigIntNum(row.total_bytes, "turn tape record payload bytes");
+  if (offset > totalBytes) return null;
+  const chunk = Buffer.from(row.chunk ?? Buffer.alloc(0));
+  const endExclusive = offset + chunk.length;
+  return {
+    chunk,
+    nextOffset: endExclusive < totalBytes ? endExclusive : null,
+    totalBytes,
+    start: offset,
+    endExclusive,
+    msgId: row.msg_id,
+    role: row.role,
+    contentSha256: row.content_sha256,
+    tapeSha256: row.tape_sha256,
+  };
+}
+
 
 /**
  * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`(28 方法),
@@ -2963,7 +1784,7 @@ export function createPgSessionsBackend(
             return { kind: "append_error", reason: appended.reason ?? "unknown" };
           }
         }
-        // 2) anchor_seq = 该 user 行的 _seq(projection 排序键;不在热尾巴时 null)。
+        // 2) anchor_seq = 该 user 行的 _seq(会话顺序键;不在热尾巴时 null)。
         const anchorSeq = typeof appended.seq === "number" ? BigInt(appended.seq) : null;
         // 3) UPSERT dispatch + 冲突表裁定(同一 tx,受理即拥有 I1)。
         return admitDispatch(client, {
@@ -3036,16 +1857,6 @@ export function createPgSessionsBackend(
         status: row.tape_status ?? null,
         dispatchLeaseActive,
       };
-    },
-
-    async listDispatchErrorProjectionMessages(
-      userId: string,
-      sessionId: string,
-    ): Promise<Record<string, unknown>[]> {
-      // 投影 user_id 是 numeric uid(非 `c:<uid>`);非商业会话直接空。
-      if (!/^c:[1-9][0-9]*$/.test(userId)) return [];
-      const rows = await readActiveErrorProjections(pool, BigInt(userId.slice(2)), sessionId);
-      return rows.map(projectionToVirtualMessage);
     },
 
     async stageLosslessTurnTapePart(
@@ -3252,9 +2063,9 @@ export function createPgSessionsBackend(
           if (tape.dispatch_id !== null) {
             const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
             replayLate = convergence.lateTape;
-            if (convergence.projectionRevoked) {
-              // finalize 已在事务起点持有 session 行锁；在这里传播 projection absence，
-              // 不让 reconciler 形成 dispatch→session、与本路径 session→dispatch 的反序。
+            if (convergence.lateTape) {
+              // 直接状态读以 dispatch.status 为准。late tape 改成 manual_reconcile 后 bump
+              // revision，在线客户端会立刻重读并移除旧失败状态。
               await client.query(
                 `UPDATE client_sessions
                     SET history_revision=history_revision + 1,
@@ -3471,7 +2282,7 @@ export function createPgSessionsBackend(
         // Rolling v1→v2 replay: an old runtime may have committed the same
         // deterministic server-authored ids through the legacy endpoint but
         // lost its ACK. The upgraded runtime retries as a tape. Replace those
-        // hot legacy projections with the single tape anchor; keeping both
+        // hot legacy generated rows with the single tape anchor; keeping both
         // would make hydration return duplicate paid records. Archived
         // collisions stay fail-closed above because rewriting archive chunks
         // is not part of this atomic finalize operation.
@@ -3565,12 +2376,25 @@ export function createPgSessionsBackend(
             [userId, cost.request_id],
           );
         }
+        const clientMessageId = turn.payload.clientMessageId ?? (
+          tape.dispatch_id === null
+            ? null
+            : (
+                await client.query<{ client_message_id: string }>(
+                  "SELECT client_message_id FROM turn_dispatches WHERE dispatch_id=$1",
+                  [tape.dispatch_id],
+                )
+              ).rows[0]?.client_message_id ?? null
+        );
         await client.query(
           `UPDATE client_session_turn_tapes
               SET billing_anchor_id=$1, usage=$2, parent_turn_key=$3,
                   engine_billings=$4, finalized_at=$5, record_storage_format=$6,
-                  goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9
-            WHERE session_id=$10 AND user_id=$11 AND tape_id=$12`,
+                  goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9,
+                  client_message_id=$10, continuation_of_turn_key=$11,
+                  physical_record_count=$12, logical_record_count=$13,
+                  record_payload_bytes=$14
+            WHERE session_id=$15 AND user_id=$16 AND tape_id=$17`,
           [
             turn.billingAnchorId,
             JSON.stringify(turn.payload.usage ?? {}),
@@ -3581,6 +2405,11 @@ export function createPgSessionsBackend(
             turn.payload.goalId ?? null,
             turn.payload.goalStateRevision ?? null,
             goalTokensUsed,
+            clientMessageId,
+            turn.payload.continuationOfTurnKey ?? null,
+            turn.records.length,
+            turn.logicalRecordCount,
+            turn.records.reduce((sum, record) => sum + record.payloadBytes.length, 0),
             request.sessionId,
             userId,
             request.tapeId,
@@ -3596,32 +2425,14 @@ export function createPgSessionsBackend(
             WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
           [request.sessionId, userId, request.tapeId],
         );
-        // 会话读物化投影(RFC §9):同事务从已 materialize 的 records 构建该卷 chat 内容投影,
-        // state=complete/truncated。只读缓存派生面,绝不参与本 tape 的完整性/结算/dedup 写侧。
-        await writeTapeChatProjectionOnFinalize(
-          client,
-          request.sessionId,
-          userId,
-          request.tapeId,
-          request.tapeSha256,
-          turn.billingAnchorId,
-          turn.records.map((item, ordinal) => ({
-            msg_id: item.id,
-            ordinal,
-            role: item.role,
-            content_sha256: item.payloadSha256,
-            payload: item.payloadBytes,
-          })),
-        );
         // dispatch 收敛(RFC §2.4):tape header 带 dispatch_id → 非终态转 terminal(映射 status),
-        // 或迟到 tape 撤 projection + manual_reconcile。与内容 materialize 同一 tx,原子。
+        // 或迟到 tape 转 manual_reconcile。浏览器直接读 tape/dispatch，不再写任何影子内容表。
         let dispatchLate = false;
         if (tape.dispatch_id !== null) {
           const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
           dispatchLate = convergence.lateTape;
-          if (convergence.projectionRevoked) {
-            // 仅 absence 需要 revision；projection insert 每次 partial 都会全量并入。
-            // 当前事务已持 session 锁，因此不会引入 reconciler 的锁序反转。
+          if (convergence.lateTape) {
+            // 当前事务已持 session 锁；revision 让浏览器移除此前的 verified failure 状态。
             await client.query(
               `UPDATE client_sessions
                   SET history_revision=history_revision + 1,
@@ -4587,8 +3398,8 @@ export function createPgSessionsBackend(
         archivedThroughOrderSeq,
       );
       let messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
-      if (options.projection === "chat") {
-        messages = await mergeDispatchErrorProjectionRows(pool, row.user_id, row.id, messages);
+      if (options.view === "timeline") {
+        messages = await mergeVerifiedTurnStatusRows(pool, row.user_id, row.id, messages);
       }
       return {
         id: row.id,
@@ -4706,10 +3517,10 @@ export function createPgSessionsBackend(
         isPartial = false;
       }
       messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, messages, options);
-      if (options.projection === "chat") {
-        // partial 也全量并入 active 投影(无自有 seq,不受 since 游标裁剪;前端按 id 幂等
+      if (options.view === "timeline") {
+        // partial 也全量并入 active verified statuses(无自有 seq,不受 since 游标裁剪;前端按 id 幂等
         // 去重,量级 = 未决失败数,恒小)。
-        messages = await mergeDispatchErrorProjectionRows(pool, row.user_id, row.id, messages);
+        messages = await mergeVerifiedTurnStatusRows(pool, row.user_id, row.id, messages);
       }
       return {
         id: row.id,
@@ -4784,9 +3595,9 @@ export function createPgSessionsBackend(
         ? page[0]._orderSeq
         : null;
       let hydrated = await hydrateTurnTapeMessages(pool, sessId, userId, page, options);
-      if (options.projection === "chat" && page.length > 0 && oldestSeq !== null) {
-        // 只并入锚落在本页 seq 范围内的投影(锚在热尾/更早页的绝不重复出现)。
-        hydrated = await mergeDispatchErrorProjectionRows(pool, userId, sessId, hydrated, {
+      if (options.view === "timeline" && page.length > 0 && oldestSeq !== null) {
+        // 只并入锚落在本页 seq 范围内的 verified statuses。
+        hydrated = await mergeVerifiedTurnStatusRows(pool, userId, sessId, hydrated, {
           minInclusive: oldestSeq,
           maxExclusive: effectiveBefore,
         });
@@ -4794,9 +3605,7 @@ export function createPgSessionsBackend(
       return { messages: hydrated, hasMore, oldestSeq, historyRevision };
     },
 
-    // ── 引擎上下文读(RFC §9)──────────────────────────────────────────────────
-    // loadMasterSessionMessages 切到这里:投影 assistant 生成行 + 热行 canonical user 行合并,
-    // 48 行/18k 截断。绝不全量水合 tape BYTEA(引擎历史本就有界)。
+    // ── 引擎上下文读 ─────────────────────────────────────────────────────────
     async getEngineContextMessages(
       sessionId: string,
       userId: string,
@@ -4804,27 +3613,34 @@ export function createPgSessionsBackend(
       return computeEngineContextMessages(pool, sessionId, userId);
     },
 
-    // ── 超大内容查看端点后端(RFC §9)──────────────────────────────────────────
-    // 分租((session_id,user_id,tape_id) 复合)+ 行游标分页;chat-safe 投影形态,绝不吐 exact payload。
-    async listTapeChatProjectionRecords(
+    // ── immutable tape lazy reads ─────────────────────────────────────────────
+    async listTurnTapeRecords(
       sessionId: string,
       userId: string,
       tapeId: string,
       cursor: number,
       limit: number,
     ): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
-      return listTapeChatProjectionRecordsImpl(pool, sessionId, userId, tapeId, cursor, limit);
+      return listTurnTapeRecordsImpl(pool, sessionId, userId, tapeId, cursor, limit);
     },
 
-    // M-§9-1 "查看完整"按记录有界读(≤256KB/请求,绝不整卷)。gateway 路由层加 per-user 令牌桶限频 + 429。
-    async readTapeRecordChunk(
+    async readTapeRecordPayloadChunk(
       sessionId: string,
       userId: string,
       tapeId: string,
       recordOrdinal: number,
       offset: number,
-    ): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
-      return readTapeRecordChunkImpl(pool, sessionId, userId, tapeId, recordOrdinal, offset);
+      requestedBytes?: number,
+    ): Promise<TapeRecordPayloadChunk | null> {
+      return readTapeRecordPayloadChunkImpl(
+        pool,
+        sessionId,
+        userId,
+        tapeId,
+        recordOrdinal,
+        offset,
+        requestedBytes,
+      );
     },
 
     // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
@@ -4845,10 +3661,8 @@ export function createPgSessionsBackend(
         await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
         await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
         await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
-        // 投影是纯 UI 面,随会话删;turn_dispatches 是财务/审计证据,有意保留。
-        await client.query("DELETE FROM turn_dispatch_error_projections WHERE session_id = $1", [id]);
-        // chat 物化投影(RFC §9)是只读缓存派生面,随会话删(权威 tape records 由上面级联清)。
-        await client.query("DELETE FROM tape_chat_projection WHERE session_id = $1", [id]);
+        // Keep dispatch evidence so the reconciler can close any execution that
+        // raced with deletion and financial/audit history remains attributable.
         return true;
       });
     },

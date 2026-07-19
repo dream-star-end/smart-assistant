@@ -64,6 +64,39 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(strong.tagName).toBe("STRONG");
   });
 
+  test("assistant：超长终态正文逐段挂载且最终字符可达", () => {
+    const marker = "EXACT_ASSISTANT_FINAL_MARKER";
+    renderMsg(mk("assistant", { text: `${"x".repeat(270_000)}${marker}` }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: "继续显示正文" }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: "继续显示正文" }));
+    expect(document.body.textContent).toContain(marker);
+  });
+
+  test("assistant：超长流式正文保留最新真实尾部，同时惰性挂载中段", async () => {
+    const middle = "EXACT_STREAM_MIDDLE_MARKER";
+    const tail = "EXACT_STREAM_LIVE_TAIL";
+    const text = `${"h".repeat(160_000)}${middle}${"t".repeat(160_000)}${tail}`;
+    renderMsg(mk("assistant", { text }), { sending: true, isLast: true });
+    await waitFor(() => expect(document.body.textContent).toContain(tail));
+    expect(document.body.textContent).not.toContain(middle);
+    fireEvent.click(screen.getByRole("button", { name: /继续显示中间正文/ }));
+    expect(document.body.textContent).toContain(middle);
+    expect(document.body.textContent).toContain(tail);
+  });
+
+  test("thinking：超长真实思考展开后逐段挂载且最终字符可达", () => {
+    const marker = "EXACT_THINKING_FINAL_MARKER";
+    renderMsg(mk("thinking", { text: `${"r".repeat(270_000)}${marker}` }));
+    fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: "继续显示正文" }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: "继续显示正文" }));
+    expect(document.body.textContent).toContain(marker);
+  });
+
   test("assistant：余额不足错误卡含「去充值」CTA，点击触发 onTopUp", () => {
     const onTopUp = vi.fn();
     renderMsg(mk("assistant", { _errorCode: "insufficient_credits", _errorDetail: "shortfall 120" }), {
@@ -365,9 +398,30 @@ describe("tool / agent-group 集成", () => {
         ],
       }),
     );
-    expect(screen.getByText("legacy output")).toHaveClass("line-clamp-2", "break-words");
-    expect(screen.getByTitle("[text] legacy output")).toBeInTheDocument();
+    expect(screen.getByText("legacy output")).toHaveClass("whitespace-pre-wrap", "break-words");
     expect(screen.getByText("终端")).toBeInTheDocument();
+  });
+
+  test("delegate-progress entries 按批挂载但可以看到从第一条到最后一条", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        entries: Array.from({ length: 205 }, (_, index) => ({
+          phase: "text",
+          text: `delegate-entry-${index}`,
+          ts: index,
+        })),
+      }),
+    );
+
+    expect(screen.getByText("delegate-entry-0")).toBeInTheDocument();
+    expect(screen.queryByText("delegate-entry-100")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /继续加载委派记录/ }));
+    expect(screen.getByText("delegate-entry-100")).toBeInTheDocument();
+    expect(screen.queryByText("delegate-entry-204")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /继续加载委派记录/ }));
+    expect(screen.getByText("delegate-entry-204")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /继续加载委派记录/ })).not.toBeInTheDocument();
   });
 });
 
@@ -809,21 +863,38 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     return Array.from({ length: n }, (_, i) => mk("user", { id: `u${i}`, text: `m${i}` }));
   }
 
-  test("本地未翻尽(>100 条)→ 本地翻页按钮;count 含归档未拉数(§4)", () => {
-    // 130 条尾巴,visible=100 → 30 本地未挂;归档 500 未拉 → 还有 530 条。
+  test("已加载的 130 条热尾全部属于数据模型，DOM 有界由生产虚拟列表负责", () => {
     renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
-    expect(screen.getByRole("button", { name: /加载更多历史（还有 530 条）/ })).toHaveClass(
+    expect(screen.getByText("m0")).toBeInTheDocument();
+    expect(screen.getByText("m129")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /向上滚动加载更早历史（还有 500 条）/ })).toHaveClass(
       "[@media(hover:none)]:min-h-11",
     );
-    expect(screen.queryByText(/从云端加载更早的历史/)).toBeNull();
   });
 
-  test("无归档时本地翻页按钮 count 即本地未挂(退化行为不变)", () => {
-    renderList(users(130)); // 无 archive prop
-    expect(screen.getByRole("button", { name: /加载更多历史（还有 30 条）/ })).toBeInTheDocument();
+  test("无归档时不造客户端 100 条总量上限", () => {
+    const { container } = renderList(users(130));
+    expect(screen.getByText("m0")).toBeInTheDocument();
+    expect(screen.getByText("m129")).toBeInTheDocument();
+    expect(container.querySelector("button")).toBeNull();
   });
 
-  test("lossless tape 的隐藏 runtime-event 不占最近100条窗口,首屏仍显示真实回复", () => {
+  test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
+    render(
+      <MessageList
+        messages={users(10_000)}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={null}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("正在准备会话");
+    expect(screen.queryByText("m0")).toBeNull();
+    expect(screen.queryByText("m9999")).toBeNull();
+  });
+
+  test("每条 runtime-event 都可检查，最终答复也保持可见", () => {
     const visible: ChatMessage[] = [
       mk("user", { id: "u-visible", text: "可见提问", status: "sent", ts: 1 }),
       mk("thinking", { id: "th-visible", text: "**可见思考**", ts: 2 }),
@@ -838,7 +909,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
       }),
       mk("assistant", { id: "a-visible", text: "可见最终答复", ts: 4 }),
     ];
-    const hidden = Array.from({ length: 120 }, (_, i) => ({
+    const runtime = Array.from({ length: 120 }, (_, i) => ({
       id: `runtime-${i}`,
       role: "runtime-event",
       text: "",
@@ -846,20 +917,58 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
       _runtimeEvent: { type: "system", subtype: "raw_frame", index: i },
     })) as unknown as ChatMessage[];
 
-    renderList([...visible, ...hidden]);
+    renderList([...visible, ...runtime]);
 
     expect(screen.getByText("可见提问")).toBeInTheDocument();
     expect(screen.getByText("可见最终答复")).toBeInTheDocument();
     expect(screen.getByText(/已思考/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /加载更多历史/ })).toBeNull();
+    expect(screen.getAllByText("查看原始记录")).toHaveLength(120);
   });
 
-  test("sanitized history projection rows are hidden even if a future role becomes renderable", () => {
+  test("未识别的 immutable tape 角色不会被静默丢弃", () => {
+    const marker = "EXACT_FUTURE_ROLE_PAYLOAD";
+    renderMsg({
+      id: "future-role-1",
+      role: "future-engine-event" as ChatMessage["role"],
+      text: marker,
+      ts: 1,
+      _turnTapeId: "tape-future-role",
+      _turnTapeComplete: true,
+    });
+
+    expect(screen.getByText("原始 Agent 记录 · future-engine-event")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /原始 Agent 记录/ }));
+    expect(document.body.textContent).toContain(marker);
+  });
+
+  test("计划卡保留易读体验，同时可查看 immutable tape 的完整事件序列", () => {
+    const marker = "EXACT_PLAN_EVENT_HISTORY_MARKER";
+    renderMsg({
+      id: "plan-tape-1",
+      role: "plan",
+      text: "执行计划",
+      ts: 1,
+      steps: [{ step: "完成修复", status: "completed" }],
+      _turnTapeId: "tape-plan",
+      _turnTapeComplete: true,
+      _eventHistory: [
+        { kind: "plan", partial: true, future_field: marker },
+        { kind: "plan", partial: false, steps: [{ step: "完成修复", status: "completed" }] },
+      ],
+    });
+
+    expect(screen.getByText("完成修复")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: "查看原始计划记录" }));
+    expect(document.body.textContent).toContain(marker);
+  });
+
+  test("rolling old cache里的 substitution 行会被丢弃，不能覆盖真实答复", () => {
     const projection = mk("system", {
       id: "projection-checkpoint:tape-1",
       text: "绝不能展示的 checkpoint",
-      _historyProjection: { kind: "checkpoint" },
-    });
+      _historyProjection: { kind: "legacy-checkpoint" },
+    } as unknown as Partial<ChatMessage>);
     renderList([mk("assistant", { id: "answer", text: "正常答复" }), projection]);
     expect(screen.getByText("正常答复")).toBeInTheDocument();
     expect(screen.queryByText("绝不能展示的 checkpoint")).toBeNull();
@@ -868,9 +977,8 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
   test("本地翻尽 + 有归档未拉 → 云端加载按钮,还有 M 条(§5 文案)", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(
-      screen.getByRole("button", { name: /从云端加载更早的历史（还有 500 条）/ }),
+      screen.getByRole("button", { name: /向上滚动加载更早历史（还有 500 条）/ }),
     ).toHaveClass("[@media(hover:none)]:min-h-11");
-    expect(screen.queryByText(/加载更多历史/)).toBeNull();
   });
 
   test("本地翻尽 + 无归档 → 无按钮", () => {
@@ -884,7 +992,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(btn).toHaveTextContent(/加载中/);
     expect(btn).toBeDisabled();
     // loading 时不显示 §5 文案(避免与 spinner 并存的抖动)。
-    expect(screen.queryByText(/从云端加载更早的历史/)).toBeNull();
+    expect(screen.queryByText(/向上滚动加载更早历史/)).toBeNull();
   });
 
   test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", () => {
@@ -899,7 +1007,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
   test("点击云端按钮 → 触发 onLoadOlder", () => {
     const onLoadOlder = vi.fn();
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, onLoadOlder });
-    fireEvent.click(screen.getByRole("button", { name: /从云端加载更早的历史/ }));
+    fireEvent.click(screen.getByRole("button", { name: /向上滚动加载更早历史/ }));
     expect(onLoadOlder).toHaveBeenCalledTimes(1);
   });
 
@@ -917,7 +1025,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(screen.getByText("arch99")).toBeInTheDocument();
     // 仍是云端态,剩余 = 500-100 = 400,无本地翻页按钮。
     expect(
-      screen.getByRole("button", { name: /从云端加载更早的历史（还有 400 条）/ }),
+      screen.getByRole("button", { name: /向上滚动加载更早历史（还有 400 条）/ }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/加载更多历史/)).toBeNull();
   });

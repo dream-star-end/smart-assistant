@@ -19,8 +19,7 @@ import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
 import { repairPostFinalProcessOrder } from "./chat/order";
 import {
   collapsedAnchorTerminalKind,
-  DISPATCH_ERROR_ROW_ID_PREFIX,
-  isCollapsedTapeAnchor,
+  isTurnTapeProcessControl,
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 
@@ -30,12 +29,10 @@ export type ServerTurnTerminal = "completed" | "error";
 /**
  * 从 server 载荷推导「已收尾 turn → 终态类别」映射(clientMessageId 键)。socket.applyServerMessages
  * 据此**显式收敛**:清发送态 + user 行置 replied/error(不依赖 completion-evidence 巧合路径)。
- *  - error:dispatch error projection 虚拟行(id 前缀 oc-dispatch-err:)或任何带 _errorCode 的 server
- *    终态行(engine_error 等持久化错误卡)。
+ *  - error:verified turn status 或任何带 _errorCode 的 server 终态行。
  *  - completed:真 lossless tape(finalize 时原子落库)展开的 server-authored 生成行
  *    (assistant/thinking/tool、无 _errorCode)—— 单行即证明整 turn 已收尾。
- * **completed 覆盖 error**:同 cmid 若既有真 tape 生成行又有 error projection(late-tape 撤销竞态),
- * 以真内容为准(与渲染层 collectResolvedDispatchTurnIds 抑制口径一致)。
+ * **completed 覆盖 error**:同 cmid 若迟到真 tape 已出现,以真内容为准。
  */
 export function detectServerTerminalTurns(
   serverRows: readonly ChatMessage[],
@@ -45,18 +42,15 @@ export function detectServerTerminalTurns(
   for (const m of serverRows) {
     const cmid = m?._clientMessageId;
     if (typeof cmid !== "string" || cmid.length === 0) continue;
-    // §9 折叠 anchor:**按 `_dispatchOutcome` 分类**(outcome-aware 谓词拆分)。折叠 anchor 是
-    // 空正文的 server assistant 行,若落入下方泛化分支会被一律判 completed —— 但 crashed/executed_error
-    // 折叠 anchor 应判 error。故在此优先拦截并按终态映射(completed/interrupted→completed;
-    // crashed/executed_error/not_accepted→error;非终态→不作证)。
-    if (isCollapsedTapeAnchor(m)) {
+    // 过程控制按 durable dispatch outcome 分类，不把空控制行当正文。
+    if (isTurnTapeProcessControl(m)) {
       const kind = collapsedAnchorTerminalKind(m._dispatchOutcome);
       if (kind === "completed") completed.add(cmid);
       else if (kind === "error") errored.add(cmid);
       continue;
     }
     if (
-      (typeof m.id === "string" && m.id.startsWith(DISPATCH_ERROR_ROW_ID_PREFIX)) ||
+      m._turnStatusRecord === true ||
       (typeof m._errorCode === "string" && m._errorCode.length > 0)
     ) {
       errored.add(cmid);
@@ -69,7 +63,7 @@ export function detectServerTerminalTurns(
   }
   const out = new Map<string, ServerTurnTerminal>();
   for (const cmid of errored) out.set(cmid, "error");
-  for (const cmid of completed) out.set(cmid, "completed"); // completed 覆盖 error(真 tape 胜过残留投影)
+  for (const cmid of completed) out.set(cmid, "completed");
   return out;
 }
 
@@ -103,7 +97,7 @@ export type StoredSession = {
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
-  /** Projection revision paired with `_maxSeq` for safe incremental reads. */
+  /** History revision paired with `_maxSeq` for safe incremental reads. */
   _historyRevision?: number;
   /** 归档 `_orderSeq` 水位(字段名为滚动兼容保留)。*/
   _archivedThroughSeq?: number;
@@ -231,58 +225,6 @@ export function dbNameForUser(userId: string | null | undefined): string {
   return `ocv5_sessions__${safe}`;
 }
 
-function historyProjectionChildTool(
-  blocks: unknown,
-  toolUseId: string,
-): Record<string, unknown> | undefined {
-  if (!Array.isArray(blocks)) return undefined;
-  for (const raw of blocks) {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
-    const block = raw as Record<string, unknown>;
-    if (block.kind === "tool_use" && block.blockId === toolUseId) return block;
-    const nested = historyProjectionChildTool(block.childBlocks, toolUseId);
-    if (nested) return nested;
-  }
-  return undefined;
-}
-
-/** Apply sanitized history patches while retaining the hidden patch rows as
- * durable sequence checkpoints. Mutates the owning tool exactly like the live
- * reducer and returns the original array reference. */
-export function applyHistoryProjectionPatches(messages: ChatMessage[]): ChatMessage[] {
-  const topLevelTools = new Map<string, ChatMessage>();
-  for (const message of messages) {
-    if (message.role === "tool" && message.blockId) topLevelTools.set(message.blockId, message);
-  }
-  for (const message of messages) {
-    const patch = message._historyProjection;
-    if (patch?.kind !== "bash-tail" || !patch.toolUseId) continue;
-    const child = (() => {
-      for (const candidate of messages) {
-        const found = historyProjectionChildTool(candidate.childBlocks, patch.toolUseId);
-        if (found) return found;
-      }
-      return undefined;
-    })();
-    const target: Record<string, unknown> | undefined = patch.parentToolUseId
-      ? child
-      : topLevelTools.get(patch.toolUseId) ?? child;
-    if (!target) continue;
-    const previous = target.bashTail;
-    const previousBytes = previous && typeof previous === "object" && !Array.isArray(previous) &&
-      typeof (previous as Record<string, unknown>).totalBytes === "number"
-      ? (previous as Record<string, unknown>).totalBytes as number
-      : 0;
-    if (patch.totalBytes < previousBytes) continue;
-    target.bashTail = {
-      tail: patch.tail,
-      totalBytes: patch.totalBytes,
-      truncatedHead: patch.truncatedHead,
-    };
-  }
-  return messages;
-}
-
 /**
  * full（server canonical 整带）合并：server 为权威在前，保留两类 local-only 消息：
  *  ① **末尾连续的乐观尾消息**（用户刚发出、server 尚未持久化的那一截：从尾部回溯到第一条
@@ -361,13 +303,13 @@ function validHistoryOrder(value: unknown): value is number {
 }
 
 /**
- * §9 折叠卷展开行:本地把折叠 anchor 展开成的 flat 行(server 权威内容水合,带 `_tapeExpandedFrom` 标记)。
+ * Lazily loaded process rows carry `_turnTapeProcessLoadedFrom` and are absent from ordinary timeline refreshes.
  * server 只回折叠 anchor、**从不回这些展开行**,故它们在 full 载荷里"缺席"是**预期**而非删除信号 ——
  * 必须豁免 P1 缺席删除,否则每次 full sync 都把展开态打回折叠。(它们是 `_source:'server'`,天然不入
  * P2 的 isCoveredStaleLocalRow 非 server 行删除;此处只需闭合 P1。)
  */
 function isLocallyExpandedTapeRow(m: ChatMessage): boolean {
-  return typeof m._tapeExpandedFrom === "string" && m._tapeExpandedFrom.length > 0;
+  return typeof m._turnTapeProcessLoadedFrom === "string" && m._turnTapeProcessLoadedFrom.length > 0;
 }
 
 /**
@@ -479,10 +421,10 @@ export function mergeFullServerWins(
     deletionAuthority?: boolean;
     /** 当前活跃轮 clientMessageId(REST/WS 竞态守卫,活跃轮的行绝不被载荷自证清除)。 */
     activeClientMessageId?: string;
-    /** A projection revision change invalidates persisted rows absent from
+    /** A history revision change invalidates persisted rows absent from
      * the full payload. Archived rows are dropped for later rehydration;
      * hot rows with `_seq` propagate cross-device deletion. */
-    invalidateProjectionCache?: boolean;
+    invalidateHistoryCache?: boolean;
   },
 ): ChatMessage[] {
   local = repairPostFinalProcessOrder(local);
@@ -510,7 +452,7 @@ export function mergeFullServerWins(
   //  P2(证据为正,无需版本护栏)—— 已被载荷作证覆盖 turn 的本地过期副本 → 删。
   local = local.filter((m) => {
     if (!m) return false;
-    if (opts?.invalidateProjectionCache === true) {
+    if (opts?.invalidateHistoryCache === true) {
       if (isArchivedServerRow(m, archivedThroughSeq)) return false;
       const persisted = typeof m._seq === "number" && Number.isSafeInteger(m._seq) && m._seq > 0;
       const belongsToActiveTurn =
@@ -524,7 +466,7 @@ export function mergeFullServerWins(
       m.id &&
       !serverIdsForAuthority.has(m.id) &&
       !isArchivedServerRow(m, archivedThroughSeq) &&
-      // §9:折叠卷展开行 server 只回折叠 anchor、从不回展开行 → 其缺席是预期,豁免"缺席即删"。
+      // 惰性过程记录不随会话首读返回，其缺席是预期。
       !isLocallyExpandedTapeRow(m)
     ) {
       return false;
@@ -558,13 +500,13 @@ export function mergeFullServerWins(
           m.role === "permission" ||
           // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
           (m.role === "system" && !isServerAuthoredRow(m)) ||
-          // ⑥ §9 折叠卷展开行:server 只回折叠 anchor、从不回展开行。折叠 tape 非末轮(展开行落在
+          // ⑥ Lazy process rows:the ordinary timeline returns the control + narrative, not fetched process pages.
           //    中段)时,须与 P1 缺席豁免一致地保留,否则 full sync 把中段展开态打回折叠。
           isLocallyExpandedTapeRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
     return repairPostFinalProcessOrder(
-      applyHistoryProjectionPatches(stableSortByTs(serverChanged ? serverMerged : server)),
+      stableSortByTs(serverChanged ? serverMerged : server),
     );
   }
   const safeByOriginal = new Map<ChatMessage, ChatMessage>();
@@ -577,7 +519,7 @@ export function mergeFullServerWins(
   if (!hasDurableOrderAxis) {
     // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
     return repairPostFinalProcessOrder(
-      applyHistoryProjectionPatches(stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail])),
+      stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]),
     );
   }
   // 中段 client-owned 行若在拼接时离开本地原槽，会错误继承 server 尾行的排序锚点。
@@ -624,7 +566,7 @@ export function mergeFullServerWins(
     }
   }
   return repairPostFinalProcessOrder(
-    applyHistoryProjectionPatches(stableSortByTs(inLocalOrder, anchorOverrides)),
+    stableSortByTs(inLocalOrder, anchorOverrides),
   );
 }
 
@@ -672,7 +614,7 @@ export function applyServerIncremental(
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return repairPostFinalProcessOrder(applyHistoryProjectionPatches(stableSortByTs(merged)));
+  return repairPostFinalProcessOrder(stableSortByTs(merged));
 }
 
 /**
@@ -689,7 +631,7 @@ export function mergeArchivedHistory(local: ChatMessage[], archived: ChatMessage
   const add = archived.filter((m) => m?.id && !existing.has(m.id));
   if (!add.length) return local;
   return repairPostFinalProcessOrder(
-    applyHistoryProjectionPatches(stableSortByTs([...add, ...local])),
+    stableSortByTs([...add, ...local]),
   );
 }
 
@@ -766,15 +708,15 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
       usage: { ...(serverMsg.usage ?? {}), waived: true },
     };
   }
-  // §9 折叠 anchor 的**本地展开态是渲染态权威**:server 重发折叠 anchor(同 id、无展开标记)绝不能把
-  // 已展开的会话打回折叠——展开行是 server 权威内容的水合,不回退(RFC §9.1 "保留本地展开")。与 waived
+  // The process control's local expanded flag is view state:an ordinary server refresh must not collapse
+  // the section while the user is inspecting immutable records. 与 waived
   // 同款单调保留:仅保留展开标记 + 游标,anchor 其余字段仍 server-wins。展开行本体(独立 flat 行)由
   // mergeFullServerWins 的 P1 缺席豁免(isLocallyExpandedTapeRow)保护。
-  if (localMsg._tapeExpanded === true && serverMsg._tapeCollapsed === true) {
+  if (localMsg._turnTapeProcessExpanded === true && serverMsg._turnTapeProcess === true) {
     serverMsg = {
       ...serverMsg,
-      _tapeExpanded: true,
-      ...(localMsg._tapeExpandCursor !== undefined ? { _tapeExpandCursor: localMsg._tapeExpandCursor } : {}),
+      _turnTapeProcessExpanded: true,
+      ...(localMsg._turnTapeProcessCursor !== undefined ? { _turnTapeProcessCursor: localMsg._turnTapeProcessCursor } : {}),
     };
   }
   // server echo owns the durable user row, but these client-only fields are required to
@@ -798,6 +740,11 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
     const ensure = () => (out ??= { ...localMsg });
     const preview = friendlyDelegateResultPreview(serverMsg.output);
     if (preview && !localMsg._resultPreview) ensure()._resultPreview = preview.slice(0, 200);
+    if (serverMsg.inputJson !== undefined) ensure().inputJson = serverMsg.inputJson;
+    if (serverMsg.partialJson !== undefined) ensure().partialJson = serverMsg.partialJson;
+    if (serverMsg.inputPreview !== undefined) ensure().inputPreview = serverMsg.inputPreview;
+    if (serverMsg.output !== undefined) ensure().output = serverMsg.output;
+    if (serverMsg.bashTail !== undefined) ensure().bashTail = serverMsg.bashTail;
     if (serverMsg.error && !localMsg._isError) ensure()._isError = true;
     if (serverMsg._completed && !localMsg._completed) ensure()._completed = true;
     return out ?? localMsg;
@@ -900,7 +847,7 @@ export function stableSortByTs(
         durableRank: ownOrderSeq !== null ? 0 : 1,
         // 折叠标题先于展开正文；正文按 tape ordinal；无 ordinal 的 terminal/sentinel
         // 补充行置后。全是 legacy 无 ordinal 时 rank 相同，仍回退 ts/index。
-        intraRank: m._tapeCollapsed === true ? 0 : tapeOrdinal !== null ? 1 : 2,
+        intraRank: m._turnTapeProcess === true ? 0 : tapeOrdinal !== null ? 1 : 2,
         tapeOrdinal: tapeOrdinal ?? 0,
         ts: typeof m?.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
       };

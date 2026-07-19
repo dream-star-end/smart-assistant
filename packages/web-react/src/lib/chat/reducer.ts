@@ -382,7 +382,8 @@ function appendSubagentBlock(
       : null;
     if (target) {
       target._completed = true;
-      target.output = block.preview || "";
+      target.output = block.output ?? block.preview ?? "";
+      if (block.outputJson !== undefined) target.outputJson = block.outputJson;
       target.error = !!block.isError;
       target._partial = false;
     } else {
@@ -394,7 +395,8 @@ function appendSubagentBlock(
         inputJson: null,
         _partial: false,
         _completed: true,
-        output: block.preview || "",
+        output: block.output ?? block.preview ?? "",
+        ...(block.outputJson !== undefined ? { outputJson: block.outputJson } : {}),
         error: !!block.isError,
       });
     }
@@ -409,6 +411,10 @@ function appendSubagentBlock(
       const prev = target.bashTail?.totalBytes ?? 0;
       if (totalBytes >= prev) target.bashTail = { tail, totalBytes, truncatedHead };
     }
+  } else if (block.kind === "plan" || block.kind === "goal") {
+    // Structured child events are real Agent process records. Keep the exact
+    // event instead of replacing it with the legacy one-line progress text.
+    children.push({ ...block } as ChildBlock);
   }
 }
 
@@ -469,6 +475,7 @@ function mergeDelegateProgressIntoGroup(sess: ChatSession, groupMsg: ChatMessage
     }
   }
   if (standalone.summary && !groupMsg._resultPreview) groupMsg._resultPreview = String(standalone.summary).slice(0, 200);
+  if (standalone.summary && groupMsg.output == null) groupMsg.output = String(standalone.summary);
   if (standalone.error || standalone._isError) groupMsg._isError = true;
   if (standalone._completed && !groupMsg._completed) groupMsg._completed = true;
   if (standalone.completedAt && !groupMsg.completedAt) groupMsg.completedAt = standalone.completedAt;
@@ -558,6 +565,14 @@ function normalizeDelegateToolRow(sess: ChatSession, msg: ChatMessage): boolean 
     }
     const preview = friendlyDelegateResultPreview(msg.output);
     if (preview && !existingGroup._resultPreview) existingGroup._resultPreview = preview.slice(0, 200);
+    // The rich group is only presentation. Preserve the authoritative tool
+    // record before removing its duplicate top-level row so no raw field is
+    // replaced by the friendly summary.
+    if (msg.inputJson !== undefined) existingGroup.inputJson = msg.inputJson;
+    if (msg.partialJson !== undefined) existingGroup.partialJson = msg.partialJson;
+    if (msg.inputPreview !== undefined) existingGroup.inputPreview = msg.inputPreview;
+    if (msg.output !== undefined) existingGroup.output = msg.output;
+    if (msg.bashTail !== undefined) existingGroup.bashTail = msg.bashTail;
     if (msg.error) existingGroup._isError = true;
     if (msg._completed && !existingGroup._completed) existingGroup._completed = true;
     const idx = sess.messages.indexOf(msg);
@@ -665,11 +680,11 @@ function isLaterGoalCard(candidate: ChatMessage, current: ChatMessage): boolean 
   return candidateUpdated >= currentUpdated;
 }
 
-/** Hydration can return one server-authored goal projection per historical
- * turn. Collapse them to the same stable identity used by the live reducer so
+/** Hydration can return one server-authored goal record per historical turn.
+ * Collapse them to the same stable identity used by the live reducer so
  * refresh/reconnect never recreates a row per Codex notification.
  *
- * 位置一致性(与实时 reducer 对齐):实时侧目标卡在**首次投影**处创建、后续修订就地
+ * 位置一致性(与实时 reducer 对齐):实时侧目标卡在**首次记录**处创建、后续修订就地
  * Object.assign 更新(同对象、同 id、首位置、内容取最新)。hydrate 每个历史 turn 会各投一张
  * 同身份卡,这里折叠时必须保持同一心智模型——**槽位取最早出现处(位置 min)、内容取最高
  * 修订(内容 max)**,否则刷新后目标卡会跳到「最后更新的 turn」位置,与实时不一致。 */
@@ -737,6 +752,7 @@ function applyDelegatePhaseToGroup(sess: ChatSession, groupMsg: ChatMessage, blo
     groupMsg._completed = true;
     groupMsg.completedAt = Date.now();
     if (block.text && !groupMsg._resultPreview) groupMsg._resultPreview = String(block.text).slice(0, 200);
+    if (block.text && groupMsg.output == null) groupMsg.output = String(block.text);
     if (block.phase === "error") groupMsg._isError = true;
   } else if (block.block && typeof block.block === "object") {
     const child = block.block;
@@ -991,8 +1007,9 @@ export function applyOutboundMessage(
   // ── reconcile 'turn_state_unknown'(非 final,RFC §4)──
   // hello 对账时 server 对客户端上报的在飞 turn **无法给出终态**(durable inbox 无行且不是
   // negative proof)。此时**绝不清 _sendingInFlight** —— turn 可能仍在服务端执行,静默清态正是
-  // 本 RFC 要根治的丢 turn 症状。改为:① 立即 REST 全量对账拉回权威态(含 error projection);
-  // ② 请 socket 把 thinking-safety 定时降至 60s(默认 10min),尽快让用户看到终态或错误投影。
+  // 本 RFC 要根治的丢 turn 症状。改为:① 立即 REST 全量对账拉回权威态
+  // (含 durable dispatch 状态行);② 请 socket 把 thinking-safety 定时降至 60s(默认
+  // 10min),尽快让用户看到真实终态或经核验的错误状态。
   // markFrameReceived 计活(server 确在应答),但不触碰 turn 生命周期。到达此处已过 cross-turn
   // 守卫:frame.clientMessageId 要么命中 active、要么本地无 active/legacy 无 id,均安全放行。
   if (!frame.isFinal && frame.meta?.reconcile === "turn_state_unknown") {
@@ -1407,6 +1424,8 @@ export function applyOutboundMessage(
             const groupMsg = addMessage(sess, "agent-group", desc, {
               blockId: tb.blockId,
               toolName: isDelegate ? tb.toolName || "delegate_task" : "Agent",
+              inputPreview: tb.inputPreview || "",
+              inputJson: tb.inputJson ?? null,
               startTime: Date.now(),
               childBlocks: [],
               ...agentFields,
@@ -1424,6 +1443,8 @@ export function applyOutboundMessage(
                 groupMsg._turnOwnerId = frameTurnOwnerId;
               }
               if (desc && groupMsg.text !== desc) groupMsg.text = desc;
+              groupMsg.inputPreview = tb.inputPreview || groupMsg.inputPreview;
+              if (tb.inputJson !== undefined) groupMsg.inputJson = tb.inputJson;
               if (delegateFields) {
                 groupMsg._delegate = true;
                 groupMsg._delegateAgentId = delegateFields._delegateAgentId;
@@ -1477,17 +1498,28 @@ export function applyOutboundMessage(
       if (sess._streamingThinking) sess._streamingThinking.completedAt = Date.now();
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
-      const rb = b as { toolName?: string; blockId?: string; toolUseBlockId?: string; preview?: string; isError?: boolean };
+      const rb = b as {
+        toolName?: string;
+        blockId?: string;
+        toolUseBlockId?: string;
+        preview?: string;
+        output?: string;
+        outputJson?: unknown;
+        isError?: boolean;
+      };
       const agentToolUseId = rb.toolUseBlockId || (rb.blockId ? String(rb.blockId).replace(/:result$/, "") : null);
       if (agentToolUseId && sess._agentGroups?.has(agentToolUseId)) {
         const groupMsgId = sess._agentGroups.get(agentToolUseId);
         const groupMsg = sess.messages.find((m) => m.id === groupMsgId);
         if (groupMsg) {
-          const rawPreview = rb.preview || "";
+          const rawOutput = rb.output ?? rb.preview ?? "";
+          const rawPreview = rb.preview ?? rawOutput;
           const preview = friendlyDelegateResultPreview(rawPreview) || (isDelegateResultWrapper(rawPreview) ? "" : rawPreview);
           groupMsg._completed = true;
           groupMsg._duration = Date.now() - (groupMsg.startTime || Date.now());
           if (preview && !groupMsg._resultPreview) groupMsg._resultPreview = preview.slice(0, 200);
+          groupMsg.output = rawOutput;
+          if (rb.outputJson !== undefined) groupMsg.outputJson = rb.outputJson;
           groupMsg._isError = !!rb.isError || !!groupMsg._isError;
         }
         continue;
@@ -1498,18 +1530,20 @@ export function applyOutboundMessage(
         const existing = sess.messages.find((m) => m.id === mid);
         if (existing) {
           existing._completed = true;
-          existing.output = rb.preview || "";
+          existing.output = rb.output ?? rb.preview ?? "";
+          if (rb.outputJson !== undefined) existing.outputJson = rb.outputJson;
           existing.error = !!rb.isError;
           existing._partial = false;
           continue;
         }
       }
-      if (!rb.preview) continue;
+      if (rb.output === undefined && rb.preview === undefined) continue;
       const m = addMessage(sess, "tool", rb.toolName || "unknown", {
         toolName: rb.toolName,
         blockId: rb.blockId,
         _completed: true,
-        output: rb.preview || "",
+        output: rb.output ?? rb.preview ?? "",
+        ...(rb.outputJson !== undefined ? { outputJson: rb.outputJson } : {}),
         error: !!rb.isError,
         inputJson: null,
         inputPreview: "",
@@ -1896,7 +1930,7 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
 }
 
 /** turn 免单退款帧：master 已精确冲正扣费并创建站内信。
- *  余额始终刷新；消息投影只允许按 master 持久化的 root turnKey 精确命中。
+ *  余额始终刷新；消息更新只允许按 master 持久化的 root turnKey 精确命中。
  *  `_pendingCostCredits` 没有 turn 归属，绝不能用它猜测，否则迟到的 A 轮免单会
  *  篡改正在展示的 B 轮成本。未命中时等待下一次 server history 对账。*/
 export function applyCostWaived(sess: ChatSession | null, frame: CostWaivedWire, effects: FrameEffects = {}): void {
@@ -1913,12 +1947,12 @@ export function applyCostWaived(sess: ChatSession | null, frame: CostWaivedWire,
   }
   if (!target) {
     // The live fallback row does not know the master turn key. Pull the
-    // applied waiver+receipt projection instead of guessing a nearby row.
+    // authoritative waiver+receipt history instead of guessing a nearby row.
     effects.forceSync?.(sess.id);
     return;
   }
   // Keep gross costCredits as audit evidence. The waived marker controls the
-  // presentation, matching the durable history projection exactly.
+  // presentation, matching the durable history record exactly.
   target.usage = { ...target.usage, waived: true };
 }
 

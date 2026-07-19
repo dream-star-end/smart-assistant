@@ -254,6 +254,11 @@ export function App() {
   const [archiveLoading, setArchiveLoading] = useState(false);
   const [archiveError, setArchiveError] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [chatScrollParent, setChatScrollParent] = useState<HTMLDivElement | null>(null);
+  const bindChatScroll = useCallback((node: HTMLDivElement | null) => {
+    scrollRef.current = node;
+    setChatScrollParent((current) => current === node ? current : node);
+  }, []);
   // 归档前插视口锚点:点击加载前记录 scrollHeight/scrollTop,前插渲染后按高度差校正 scrollTop(见下)。
   const archiveScrollAnchorRef = useRef<{ prevHeight: number; prevTop: number } | null>(null);
   const stopRef = useRef(false);
@@ -1440,9 +1445,9 @@ export function App() {
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
-  // §9 tape 展开/续拉/收起/截断查看:hook 方法本身 useCallback 稳定,只随 activeId 换会话时重建
-  //     (与 regenerate/send/retrySend 一致);demo/只读不接线 → 折叠卡为静态摘要、截断卡无"查看完整"。
-  const { expandCollapsedTape, collapseTape, fetchTapeRecords, fetchTapeRecordChunk } = chat;
+  // True tape process paging + oversized-record loading. Hook methods are stable;
+  // demo/readonly surfaces leave the cursor disabled rather than inventing content.
+  const { expandTurnProcess, collapseTurnProcess, fetchTapeRecordPayload } = chat;
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
       onRegenerate: regenerate,
@@ -1452,15 +1457,12 @@ export function App() {
       onRetrySend: demo ? undefined : retrySend,
       onExpandTape: demo
         ? undefined
-        : (anchorId, tapeId, cursor) => expandCollapsedTape(activeId, anchorId, tapeId, cursor),
-      onCollapseTape: demo ? undefined : (anchorId) => collapseTape(activeId, anchorId),
-      onFetchTapeRecords: demo
+        : (anchorId, tapeId, cursor) => expandTurnProcess(activeId, anchorId, tapeId, cursor),
+      onCollapseTape: demo ? undefined : (anchorId) => collapseTurnProcess(activeId, anchorId),
+      onFetchTapeRecordPayload: demo
         ? undefined
-        : (tapeId, cursor) => fetchTapeRecords(activeId, tapeId, cursor),
-      onFetchTapeRecordChunk: demo
-        ? undefined
-        : (tapeId, recordOrdinal, offset) =>
-            fetchTapeRecordChunk(activeId, tapeId, recordOrdinal, offset),
+        : (tapeId, recordOrdinal, expected) =>
+            fetchTapeRecordPayload(activeId, tapeId, recordOrdinal, expected),
       resolveRetryTarget: demo ? undefined : resolveRetryTarget,
     }),
     [
@@ -1470,10 +1472,9 @@ export function App() {
       openSettings,
       onFeedback,
       retrySend,
-      expandCollapsedTape,
-      collapseTape,
-      fetchTapeRecords,
-      fetchTapeRecordChunk,
+      expandTurnProcess,
+      collapseTurnProcess,
+      fetchTapeRecordPayload,
       activeId,
       resolveRetryTarget,
     ],
@@ -1951,7 +1952,7 @@ export function App() {
           />
         )}
 
-        <div ref={scrollRef} onScroll={onChatScroll} className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+        <div ref={bindChatScroll} onScroll={onChatScroll} className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
           {gated ? (
             <AgentGate
               phase={gate.phase}
@@ -2005,6 +2006,7 @@ export function App() {
                 archive={messageListArchive}
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}
+                scrollParent={chatScrollParent}
               />
             </ResponseRatingProvider>
           )}

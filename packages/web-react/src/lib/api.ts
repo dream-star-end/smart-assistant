@@ -60,7 +60,7 @@ import type {
   SessionArchivePage,
   SessionDetail,
   SessionMeta,
-  TapeRecordChunk,
+  TapeRecordPayload,
   TapeRecordsPage,
   SubscriptionPlanWire,
   MySubscription,
@@ -1440,13 +1440,13 @@ export const api = {
         || (detail.historyRevision as number) < 0
       ) {
         // A legacy backend can return a plausible `_seq` partial without the
-        // projection revision. Never retain that cursor: retry an incremental
+        // history revision. Never retain that cursor: retry an incremental
         // request once as full, and mark every legacy full so callers evict
-        // hydrated projection caches during a coordinated downgrade.
+        // hydrated history caches during a coordinated downgrade.
         if (sinceSeq > 0) {
-          return request("").then((full) => ({ ...full, _projectionRevisionUnsupported: true as const }));
+          return request("").then((full) => ({ ...full, _historyRevisionUnsupported: true as const }));
         }
-        return { ...detail, _projectionRevisionUnsupported: true as const };
+        return { ...detail, _historyRevisionUnsupported: true as const };
       }
       return detail;
     });
@@ -1525,11 +1525,7 @@ export const api = {
     );
   },
 
-  /**
-   * §9 折叠卷/截断记录分页(GET /api/sessions/:id/tape/:tapeId/records，Bearer)——展开折叠卡 /
-   * 查看截断工具输出。`cursor` 缺省(null)=首页;`limit` 默认 200、后端上限 200/≤1MB。返回 chat-safe
-   * 投影记录 + `nextCursor`(null=末页)+ `total`。越权/不存在统一 404(经 ApiError 抛,调用方吞错)。
-   */
+  /** 不可变 turn-tape 记录分页。页大小是批次，不是总内容上限。 */
   getTapeRecords: (
     a: AuthSession,
     id: string,
@@ -1551,30 +1547,29 @@ export const api = {
     );
   },
 
-  /**
-   * §9(M-§9-1)超大内容"查看完整"按记录有界读(GET /api/sessions/:id/tape/:tapeId/records?
-   * recordOrdinal=<n>&offset=<bytes>，Bearer)。返回该单条 record 的展示文本一个字节窗口
-   * (`chunk` ≤256KB，绝不整卷)+ `nextOffset`(null=读尽)+ `totalBytes`。前端分块拉取拼接
-   * (上限 4MB)。路由层 per-user 令牌桶限频超限 → 429(经 ApiError 抛);越权/不存在 → 404。
-   */
-  getTapeRecordChunk: (
+  /** 读取单条记录真实的、脱敏后不可变 JSON payload。浏览器 Fetch 流负责背压。 */
+  getTapeRecordPayload: async (
     a: AuthSession,
     id: string,
     tapeId: string,
     recordOrdinal: number,
-    offset = 0,
-  ): Promise<TapeRecordChunk> => {
-    const params = new URLSearchParams();
-    params.set("recordOrdinal", String(recordOrdinal));
-    if (offset > 0) params.set("offset", String(offset));
-    return jsonOrThrow<TapeRecordChunk>(
-      callWithRefresh(a, (t) =>
-        fetch(
-          `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}/records?${params.toString()}`,
-          { credentials: "include", headers: bearerHeaders(t) },
-        ),
+  ): Promise<TapeRecordPayload> => {
+    const res = await callWithRefresh(a, (token) =>
+      fetch(
+        `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}/records/${recordOrdinal}/payload`,
+        { credentials: "include", headers: bearerHeaders(token) },
       ),
     );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const bytes = await res.arrayBuffer();
+    assertAuthResponseCurrent(res);
+    return {
+      bytes,
+      contentSha256: res.headers.get("x-openclaude-content-sha256") ?? "",
+      recordId: res.headers.get("x-openclaude-record-id") ?? "",
+      role: res.headers.get("x-openclaude-record-role") ?? "",
+    };
   },
 
   /**

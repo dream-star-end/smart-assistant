@@ -1,13 +1,12 @@
-// §9 / durable-turn 依赖用例(2 大会话折叠、5 错误投影)的种子/注入助手。
-// 铁律:仅在**预发**且 OC_E2E_PG_URL 就绪 + 迁移 0170 表存在时可用;任一缺失或注入
+// direct-timeline / durable-turn 依赖用例(2 大会话惰性读取、5 verified 状态)的种子/注入助手。
+// 铁律:仅在**预发**且 OC_E2E_PG_URL 就绪 + 迁移 0176 已完成时可用;任一缺失或注入
 // 失败 → 抛 SeedUnavailable,spec 捕获后 test.skip(不制造假失败)。schema 依据:
-//   0170(turn_dispatches / turn_dispatch_error_projections / tape_chat_projection)
-//   0147(client_session_turn_tapes)/ 0134(client_sessions)。
-// 注:此类 DB 注入无法在无 §9 环境验证,落地 §9 预发后按实际 schema 复核(README 已标注)。
+//   0176(client_session_turn_tapes metadata / direct dispatch status)
+//   0147(client_session_turn_tape_records)/ 0134(client_sessions)。
 
 import { randomBytes } from 'node:crypto';
 import { config } from './env';
-import { probeSection9, runSql, queryScalar } from './pg';
+import { probeDirectTimeline, runSql, queryScalar } from './pg';
 
 export class SeedUnavailable extends Error {}
 
@@ -25,9 +24,9 @@ function q(s: string): string {
   return `'${s.replace(/'/g, "''")}'`;
 }
 
-/** §9 能力门:不可用即抛 SeedUnavailable(带 reason)。 */
-export function requireSection9(): void {
-  const cap = probeSection9();
+/** direct-timeline 能力门:不可用即抛 SeedUnavailable(带 reason)。 */
+export function requireDirectTimeline(): void {
+  const cap = probeDirectTimeline();
   if (!cap.available) throw new SeedUnavailable(cap.reason);
 }
 
@@ -37,101 +36,126 @@ function pgUserId(numericUserId: string): string {
 }
 
 /**
- * 种子:一个含多卷投影、其中至少一卷返回折叠卡的大会话。
- * building 卷读侧一律折叠(§9.1)→ 稳定产出"本轮完整输出 N MB"折叠卡;
- * 另置一 complete 卷(带 rows)用于展开断言。
+ * 种子:一个 finalized tape。最终答复是真实记录并在首屏直出；2 MiB 工具记录
+ * 只返回不可变元数据，用户展开过程后再从 payload 端点读取原文。
  */
 export function seedLargeSession(numericUserId: string, sessionId: string): void {
-  requireSection9();
+  requireDirectTimeline();
   const uid = pgUserId(numericUserId);
   const now = Date.now();
-  const buildingTape = hex64();
-  const completeTape = hex64();
-  const bigBytes = 192 * 1024 * 1024;
+  const tape = hex64();
+  const turnKey = hex64();
+  const userMessageId = `e2e-user-${tape.slice(0, 12)}`;
+  const toolId = `e2e-tool-${tape.slice(0, 12)}`;
+  const answerId = `e2e-answer-${tape.slice(0, 12)}`;
+  const bigBytes = 2 * 1024 * 1024;
+  const hotMessages = JSON.stringify([
+    { id: userMessageId, role: 'user', text: 'e2e 大会话真实过程', ts: now - 2, _source: 'server', _seq: 1, _orderSeq: 1 },
+    {
+      id: answerId,
+      role: 'assistant',
+      text: '',
+      ts: now,
+      _source: 'server',
+      _seq: 2,
+      _orderSeq: 2,
+      _clientMessageId: userMessageId,
+      _turnTapeId: tape,
+      _turnTapeSha256: tape,
+      _turnTapeComplete: true,
+      _turnTapeRecordCount: 2,
+      _turnTapePhysicalRecordCount: 2,
+      _turnTapeLogicalRecordCount: 2,
+    },
+  ]);
 
-  // 会话主行(deleted_at NULL)。
+  // 会话主行只存 user + tape anchor，不复制过程正文。
   runSql(
     `INSERT INTO client_sessions (id,user_id,agent_id,title,created_at,last_at,messages,message_count,updated_at,next_seq)
-     VALUES (${q(sessionId)},${q(uid)},'main','e2e-large-session',${now},${now},'[]',0,${now},10)
-     ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, deleted_at=NULL`,
+     VALUES (${q(sessionId)},${q(uid)},'main','e2e-large-session',${now},${now},${q(hotMessages)},2,${now},3)
+     ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, messages=EXCLUDED.messages,
+       message_count=EXCLUDED.message_count, next_seq=EXCLUDED.next_seq, deleted_at=NULL`,
   );
 
-  for (const [tape, bytes, status] of [
-    [buildingTape, bigBytes, 'completed'],
-    [completeTape, 4096, 'completed'],
-  ] as const) {
-    runSql(
-      `INSERT INTO client_session_turn_tapes
-         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,part_count,created_at,finalized_at)
-       VALUES (${q(sessionId)},${q(uid)},${q(tape)},'main',${tape === buildingTape ? 0 : 1},${q(status)},${q(hex64())},${q(tape)},${bytes},1,${now},${now})
-       ON CONFLICT (session_id,user_id,tape_id) DO NOTHING`,
-    );
-  }
-
-  // building 卷:读侧折叠(半成品永不冒充完整)。
   runSql(
-    `INSERT INTO tape_chat_projection (session_id,user_id,tape_id,rows,state,next_part,tape_sha256,total_bytes,row_count)
-     VALUES (${q(sessionId)},${q(uid)},${q(buildingTape)},'[]'::jsonb,'building',0,${q(buildingTape)},${bigBytes},1)
-     ON CONFLICT (session_id,user_id,tape_id) DO UPDATE SET state='building', total_bytes=EXCLUDED.total_bytes`,
+    `INSERT INTO client_session_turn_tapes
+       (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,
+        part_count,billing_anchor_id,created_at,finalized_at,client_message_id,
+        physical_record_count,logical_record_count,record_payload_bytes)
+     VALUES (${q(sessionId)},${q(uid)},${q(tape)},'main',0,'completed',${q(turnKey)},${q(tape)},
+       ${bigBytes},1,${q(answerId)},${now},${now},${q(userMessageId)},2,2,0)`,
   );
-  // complete 卷:带一条 assistant 文本行,供展开断言。
-  const completeRows = JSON.stringify([
-    { role: 'assistant', kind: 'text', text: 'e2e 展开可见的完整输出内容', _clientMessageId: `m-${completeTape.slice(0, 8)}` },
-  ]);
+
+  // 真实工具 payload 在数据库内构造，避免把 2 MiB 字符串塞进 psql argv。
   runSql(
-    `INSERT INTO tape_chat_projection (session_id,user_id,tape_id,rows,state,next_part,tape_sha256,total_bytes,row_count)
-     VALUES (${q(sessionId)},${q(uid)},${q(completeTape)},${q(completeRows)}::jsonb,'complete',1,${q(completeTape)},4096,1)
-     ON CONFLICT (session_id,user_id,tape_id) DO UPDATE SET state='complete', rows=EXCLUDED.rows`,
+    `WITH exact(payload) AS (
+       SELECT convert_to(jsonb_build_object(
+         'id',${q(toolId)},'role','tool','text','','ts',${now - 1},
+         'toolName','Bash','inputJson',jsonb_build_object('command','e2e-long-output'),
+         'output',repeat('x',${bigBytes}) || 'E2E_TOOL_FINAL_MARKER','_completed',true
+       )::text,'UTF8')
+     )
+     INSERT INTO client_session_turn_tape_records
+       (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+     SELECT ${q(sessionId)},${q(uid)},${q(tape)},${q(toolId)},0,'tool',${now - 1},
+            encode(public.digest(payload,'sha256'),'hex'),payload FROM exact`,
+  );
+  runSql(
+    `WITH exact(payload) AS (
+       SELECT convert_to(jsonb_build_object(
+         'id',${q(answerId)},'role','assistant','text','e2e 首屏可见的真实最终答复','ts',${now},
+         '_clientMessageId',${q(userMessageId)}
+       )::text,'UTF8')
+     )
+     INSERT INTO client_session_turn_tape_records
+       (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+     SELECT ${q(sessionId)},${q(uid)},${q(tape)},${q(answerId)},1,'assistant',${now},
+            encode(public.digest(payload,'sha256'),'hex'),payload FROM exact`,
+  );
+  runSql(
+    `UPDATE client_session_turn_tapes t
+        SET record_payload_bytes=(SELECT SUM(octet_length(r.payload))
+                                    FROM client_session_turn_tape_records r
+                                   WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id)
+      WHERE t.session_id=${q(sessionId)} AND t.user_id=${q(uid)} AND t.tape_id=${q(tape)}`,
   );
 }
 
 /**
- * 注入:一条 terminal(not_accepted)dispatch + active error projection(dispatch_lost)。
- * 读侧投影为虚拟错误行 id='oc-dispatch-err:<dispatch_id>' → 前端渲染"消息未开始处理/已确认未计费"卡。
- * 另注入一条 revoked 投影,断言其**不显示**(钱安全:内容仍完整,不冒充丢失)。
- * 返回可见与被撤销的 clientMessageId。
+ * 注入一条已验证且已通知的 terminal(not_accepted) 状态，及一条已被 late tape
+ * 推翻为 manual_reconcile 的状态。浏览器直接读 turn_dispatches，不制造消息替身。
  */
-export function seedErrorProjection(
+export function seedTurnStatuses(
   numericUserId: string,
   sessionId: string,
-  anchor: { visibleCmid: string; visibleSeq: number; revokedCmid: string; revokedSeq: number },
-): { visibleDispatchId: string; revokedDispatchId: string } {
-  requireSection9();
-  const uid = pgUserId(numericUserId);
+  anchor: { visibleCmid: string; visibleSeq: number; resolvedCmid: string; resolvedSeq: number },
+): { visibleDispatchId: string; resolvedDispatchId: string } {
+  requireDirectTimeline();
   const visibleDispatchId = uuid();
-  const revokedDispatchId = uuid();
+  const resolvedDispatchId = uuid();
 
-  const insertDispatch = (dispatchId: string, cmid: string) =>
+  const insertDispatch = (dispatchId: string, cmid: string, seq: number, resolved: boolean) =>
     runSql(
       `INSERT INTO turn_dispatches
-         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,billing_request_id,status,outcome,terminal_at,admitted_at)
-       VALUES (${q(dispatchId)},${numericUserId},${q(sessionId)},${q(cmid)},'main',${q(hex64())},${q('e2e-' + cmid)},'terminal','not_accepted',NOW(),NOW())
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,billing_request_id,
+          status,outcome,failure_code,conflict_reason,client_notified,anchor_seq,terminal_at,admitted_at)
+       VALUES (${q(dispatchId)},${numericUserId},${q(sessionId)},${q(cmid)},'main',${q(hex64())},${q('e2e-' + cmid)},
+         ${resolved ? "'manual_reconcile'" : "'terminal'"},'not_accepted','dispatch_lost',
+         ${resolved ? "'late_tape'" : 'NULL'},true,${seq},NOW(),NOW())
        ON CONFLICT (dispatch_id) DO NOTHING`,
     );
 
-  insertDispatch(visibleDispatchId, anchor.visibleCmid);
-  insertDispatch(revokedDispatchId, anchor.revokedCmid);
+  insertDispatch(visibleDispatchId, anchor.visibleCmid, anchor.visibleSeq, false);
+  insertDispatch(resolvedDispatchId, anchor.resolvedCmid, anchor.resolvedSeq, true);
 
-  runSql(
-    `INSERT INTO turn_dispatch_error_projections (dispatch_id,user_id,session_id,client_message_id,error_code,anchor_seq)
-     VALUES (${q(visibleDispatchId)},${numericUserId},${q(sessionId)},${q(anchor.visibleCmid)},'dispatch_lost',${anchor.visibleSeq})
-     ON CONFLICT (dispatch_id) DO NOTHING`,
-  );
-  runSql(
-    `INSERT INTO turn_dispatch_error_projections (dispatch_id,user_id,session_id,client_message_id,error_code,anchor_seq,revoked_at)
-     VALUES (${q(revokedDispatchId)},${numericUserId},${q(sessionId)},${q(anchor.revokedCmid)},'dispatch_lost',${anchor.revokedSeq},NOW())
-     ON CONFLICT (dispatch_id) DO NOTHING`,
-  );
-
-  return { visibleDispatchId, revokedDispatchId };
+  return { visibleDispatchId, resolvedDispatchId };
 }
 
-/** 清理注入(会话删除会经 FK 级联 tapes/projection;dispatch 单独清)。 */
+/** 清理注入(会话删除会经 FK 级联 tapes;dispatch 单独清)。 */
 export function cleanupSeed(sessionId: string): void {
   if (!config().pgUrl) return;
   try {
     runSql(`DELETE FROM turn_dispatches WHERE session_id=${q(sessionId)}`);
-    runSql(`DELETE FROM tape_chat_projection WHERE session_id=${q(sessionId)}`);
     queryScalar('SELECT 1');
   } catch {
     /* best-effort */
