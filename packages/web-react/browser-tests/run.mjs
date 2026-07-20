@@ -199,6 +199,37 @@ await check("T7 点「+」→「设定目标」→ 目标对话框弹出", async
 });
 
 let firstAnchorTop = 0;
+async function scrollTimelineDiagnostic(stage) {
+  return page.evaluate((currentStage) => {
+    const state = window.__scrollTimeline;
+    const scroller = document.querySelector("#timeline-scroll-root .timeline-scroll-probe");
+    const row = state.anchor
+      ? Array.from(document.querySelectorAll("#timeline-scroll-root [data-chat-virtual-key]"))
+        .find((candidate) => candidate.getAttribute("data-chat-virtual-key") === state.anchor.key)
+      : null;
+    const wrapper = row?.closest("[data-index]");
+    const button = document.querySelector(
+      "#timeline-scroll-root [data-testid='history-page-loader'] button",
+    );
+    return {
+      stage: currentStage,
+      calls: [...state.calls],
+      mergedPages: state.mergedPages,
+      messageCount: state.messageCount,
+      loading: state.loading,
+      anchor: state.anchor,
+      rowMissing: row === null,
+      currentDataIndex: wrapper?.getAttribute("data-index") ?? null,
+      currentTop: row instanceof HTMLElement && scroller instanceof HTMLElement
+        ? row.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+        : null,
+      scrollTop: scroller instanceof HTMLElement ? scroller.scrollTop : null,
+      scrollHeight: scroller instanceof HTMLElement ? scroller.scrollHeight : null,
+      buttonAriaBusy: button?.getAttribute("aria-busy") ?? null,
+      buttonText: button?.textContent ?? null,
+    };
+  }, stage);
+}
 await check("T8 上滑零请求，点击只取一页、像素锚定且 remount 不重取", async () => {
   const root = page.locator("#timeline-scroll-root .timeline-scroll-probe");
   await root.waitFor({ state: "visible", timeout: 3000 });
@@ -249,11 +280,21 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   const loadButton = root.getByRole("button", { name: "查看更早历史记录" });
   await loadButton.waitFor({ state: "visible", timeout: 3000 });
   await loadButton.click();
-  await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 1, null, { timeout: 3000 });
-  await page.waitForFunction(() => {
-    const button = document.querySelector("#timeline-scroll-root [data-testid='history-page-loader'] button");
-    return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
-  }, null, { timeout: 3000 });
+  try {
+    await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 1, null, { timeout: 3000 });
+  } catch (err) {
+    const diagnostic = await scrollTimelineDiagnostic("merged-pages");
+    throw new Error(`${err.message}; diagnostic=${JSON.stringify(diagnostic)}`);
+  }
+  try {
+    await page.waitForFunction(() => {
+      const button = document.querySelector("#timeline-scroll-root [data-testid='history-page-loader'] button");
+      return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
+    }, null, { timeout: 3000 });
+  } catch (err) {
+    const diagnostic = await scrollTimelineDiagnostic("loader-idle");
+    throw new Error(`${err.message}; diagnostic=${JSON.stringify(diagnostic)}`);
+  }
   const afterClick = await page.evaluate(() => window.__scrollTimeline.calls);
   if (JSON.stringify(afterClick) !== JSON.stringify(["cursor-200"])) {
     throw new Error(`单次点击未严格加载一页:${JSON.stringify(afterClick)}`);

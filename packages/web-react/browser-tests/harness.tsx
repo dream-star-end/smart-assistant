@@ -36,6 +36,14 @@ declare global {
       calls: string[];
       mergedPages: number;
       messageCount: number;
+      loading: boolean;
+      anchor: null | {
+        key: string;
+        top: number;
+        dataIndex: string | null;
+        scrollTop: number;
+        scrollHeight: number;
+      };
     };
     __archiveTimeline: {
       calls: number;
@@ -47,7 +55,13 @@ declare global {
 window.__sends = [];
 window.__uploads = [];
 window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userRetry: null, tapeFetch: null };
-window.__scrollTimeline = { calls: [], mergedPages: 0, messageCount: 0 };
+window.__scrollTimeline = {
+  calls: [],
+  mergedPages: 0,
+  messageCount: 0,
+  loading: false,
+  anchor: null,
+};
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
@@ -245,6 +259,13 @@ function ScrollTimelineProbe() {
     if (loading || !cursor) return;
     const requestedCursor = cursor;
     const anchor = scroller ? captureVisibleVirtualRowAnchor(scroller) : null;
+    window.__scrollTimeline.anchor = anchor ? {
+      key: anchor.key,
+      top: anchor.top,
+      dataIndex: anchor.dataIndex,
+      scrollTop: anchor.scrollTop,
+      scrollHeight: anchor.scrollHeight,
+    } : null;
     setLoading(true);
     window.__scrollTimeline.calls.push(requestedCursor);
     await new Promise((resolve) => setTimeout(resolve, 40));
@@ -264,6 +285,7 @@ function ScrollTimelineProbe() {
     setLoading(false);
   }, [cursor, loading, scroller]);
   window.__scrollTimeline.messageCount = messages.length;
+  window.__scrollTimeline.loading = loading;
   return (
     <div
       ref={setScroller}
