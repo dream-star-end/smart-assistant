@@ -61,6 +61,7 @@ await esbuild.build({
 // 不参与本测试,故在此内联同义规则)。
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
+  .chat-scroll-area{overflow-anchor:none}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
 </style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
@@ -233,6 +234,10 @@ async function scrollTimelineDiagnostic(stage) {
 await check("T8 上滑零请求，点击只取一页、像素锚定且 remount 不重取", async () => {
   const root = page.locator("#timeline-scroll-root .timeline-scroll-probe");
   await root.waitFor({ state: "visible", timeout: 3000 });
+  const overflowAnchor = await root.evaluate((node) => getComputedStyle(node).overflowAnchor);
+  if (overflowAnchor !== "none") {
+    throw new Error(`history scroller overflow-anchor=${overflowAnchor},应为 none`);
+  }
   await page.evaluate(() => {
     const node = document.querySelector("#timeline-scroll-root .timeline-scroll-probe");
     if (!(node instanceof HTMLElement)) throw new Error("missing scroll probe");
