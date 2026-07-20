@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
 const manualMutationLease = path.join(root, 'scripts/with-production-mutation-lease.sh')
 const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
@@ -4470,5 +4471,15 @@ wait $!
         `出口「${exitMarker}」的 E2E 门未落在 end_planned_maintenance 与完成 echo 之间`,
       )
     }
+  })
+
+  test('E2E journey completion requires a new finalized non-error assistant row', async () => {
+    const source = await readFile(e2eJourney, 'utf8')
+    assert.match(source, /assistantRowsBefore = await page\.getByTestId\("assistant-row"\)\.count\(\)/)
+    assert.match(source, /await assistantRows\.count\(\)\) > assistantRowsBefore/)
+    assert.match(source, /newestAssistant\.locator\("\.caret-blink"\)/)
+    assert.match(source, /getByRole\("button", \{ name: "发送", exact: true \}\)/)
+    assert.match(source, /newestAssistant\.locator\('\[role="alert"\]'\)/)
+    assert.doesNotMatch(source, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
   })
 })
