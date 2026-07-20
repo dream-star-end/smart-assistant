@@ -259,6 +259,7 @@ export function messageSignature(
         textSig(m.text),
         m.usage?.traceId ?? "",
         m.usage?.costCredits ?? "",
+        m.usage?.waived ? 1 : 0,
         m._truncated ?? "",
         m._errorCode ?? "",
         m._errorDetail ? m._errorDetail.length : 0,

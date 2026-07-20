@@ -261,6 +261,11 @@ export type ChatMessage = {
 
   /** 超大物理记录尚未取 payload；这是加载状态，不是内容替身。 */
   _payloadDeferred?: boolean;
+  /** 超长 user 行正文存于精确 sidecar；与 Agent tape 使用不同的鉴权读取路径。 */
+  _userPayloadDeferred?: boolean;
+  /** 精确 sidecar 在落库时已具备原样重试所需的路由与附件传输证据。
+   * 仅是能力元数据；正文与附件仍只存在惰性 sidecar。 */
+  _deferredRetryEligible?: boolean;
   _payloadBytes?: number;
   _payloadSha256?: string;
 

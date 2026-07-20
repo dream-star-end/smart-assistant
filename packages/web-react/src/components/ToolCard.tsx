@@ -45,15 +45,7 @@ function rawText(value: unknown): string {
 }
 
 function hasExactRecord(message: ToolLike): boolean {
-  return (
-    message.inputJson !== undefined ||
-    !!message.partialJson ||
-    !!message.inputPreview ||
-    message.output != null ||
-    message.outputJson !== undefined ||
-    message.text != null ||
-    message.bashTail != null
-  );
+  return !!message && typeof message === "object";
 }
 
 function ProgressiveRawText({ label, text }: { label: string; text: string }) {
@@ -84,32 +76,9 @@ function ProgressiveRawText({ label, text }: { label: string; text: string }) {
  * 长内容按固定步长逐段挂载，但没有总量上限，也不会用摘要替换原文。
  */
 function ExactToolRecord({ message }: { message: ToolLike }) {
-  const sections: Array<{ label: string; text: string }> = [];
-  if (message.inputJson !== undefined) {
-    sections.push({ label: "原始输入", text: rawText(message.inputJson) });
-  } else if (message.partialJson) {
-    sections.push({ label: "原始流式输入", text: message.partialJson });
-  } else if (message.inputPreview) {
-    sections.push({ label: "原始输入", text: message.inputPreview });
-  }
-  if (message.output != null) {
-    sections.push({ label: "原始输出", text: rawText(message.output) });
-  }
-  if (message.outputJson !== undefined && message.outputJson !== message.output) {
-    sections.push({ label: "原始结构化输出", text: rawText(message.outputJson) });
-  }
-  if (message.text != null && message.text !== message.output) {
-    sections.push({ label: "原始文本", text: rawText(message.text) });
-  }
-  if (message.bashTail != null) {
-    sections.push({ label: "原始终端尾记录", text: rawText(message.bashTail) });
-  }
-
   return (
-    <div className="mt-3 space-y-3 border-t border-border pt-3">
-      {sections.map((section) => (
-        <ProgressiveRawText key={section.label} label={section.label} text={section.text} />
-      ))}
+    <div className="mt-3 border-t border-border pt-3">
+      <ProgressiveRawText label="原始完整记录" text={rawText(message)} />
     </div>
   );
 }

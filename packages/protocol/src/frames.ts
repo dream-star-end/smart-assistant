@@ -104,6 +104,10 @@ export const InboundMessage = Type.Object({
   agentId: Type.Optional(Type.String()),
   content: Type.Object({
     text: Type.Optional(Type.String()),
+    /** Browser presentation text when it differs from the model-visible
+     * prompt. It is persisted for exact replay, but does not affect dispatch
+     * identity or the model input. */
+    displayText: Type.Optional(Type.String()),
     media: Type.Optional(Type.Array(MediaRef)),
     /** A user-authored, visual selection for a precise image edit. Indices
      * address content.media; the gateway resolves and validates every file,

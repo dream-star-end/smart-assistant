@@ -91,6 +91,12 @@ describe('InboundMessage schema', () => {
   it('accepts frame without traceId / clientTraceId (backward compat)', () => {
     assert.equal(Value.Check(InboundMessage, baseInbound()), true)
   })
+  it('accepts exact browser displayText alongside a different model prompt', () => {
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      content: { text: '模型正文\n[附件提示]', displayText: '模型正文' },
+    }), true)
+  })
   it('accepts valid clientTraceId', () => {
     assert.equal(
       Value.Check(InboundMessage, { ...(baseInbound() as object), clientTraceId: VALID_TRACE }),

@@ -143,14 +143,24 @@ export function modelHistorySemanticText(value: unknown): string {
   const body = textContent(message)
   switch (role) {
     case 'user':
+      appendSection(parts, '', typeof message._modelText === 'string' ? message._modelText : body)
+      break
     case 'assistant':
       appendSection(parts, '', body)
       break
     case 'tool':
       appendSection(parts, 'Tool', message.toolName)
       appendSection(parts, 'Input', message.inputJson ?? message.toolInput ?? message.inputPreview)
-      appendSection(parts, 'Summary', body)
-      appendSection(parts, 'Output', message.output ?? message.outputJson ?? message.bashTail)
+      {
+        const output = message.output ?? message.outputJson ?? message.bashTail
+        // Materialized tool rows commonly carry the exact same bytes in both
+        // `text` and `output`. Labels make the final sections unequal, so the
+        // generic section de-duper cannot catch this. Compare the raw bodies
+        // before labelling to avoid doubling giant Bash output in sidecars and
+        // in the finite model window.
+        if (body !== serialized(output)) appendSection(parts, 'Summary', body)
+        appendSection(parts, 'Output', output)
+      }
       appendSection(parts, 'Error', message.error)
       break
     case 'plan':

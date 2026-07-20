@@ -1118,6 +1118,15 @@ describe("userChatBridge — model authorization", () => {
         assert.equal(sessionId, "sess-persist-order");
         assert.equal(message.id, "m-current-turn");
         assert.equal(message.text, "continue safely");
+        assert.equal(message._modelText, "continue safely\n[attachment text]");
+        assert.deepEqual(message._media, [
+          { kind: "file", url: "/api/media/visible.txt" },
+        ]);
+        assert.deepEqual(message._routing, {
+          model: "gpt-5.6-sol",
+          teamMode: true,
+          effortLevel: "high",
+        });
         order.push("persist");
         return { applied: true };
       },
@@ -1146,7 +1155,16 @@ describe("userChatBridge — model authorization", () => {
         peer: { id: "sess-persist-order", kind: "dm" },
         clientMessageId: "m-current-turn",
         model: "gpt-5.6-sol",
-        content: { text: "continue safely" },
+        effortLevel: "high",
+        teamMode: true,
+        content: {
+          text: "continue safely\n[attachment text]",
+          displayText: "continue safely",
+          media: [
+            { kind: "file", url: "/api/media/visible.txt" },
+            { kind: "file", url: "/api/media/hidden.txt", hidden: true },
+          ],
+        },
       }));
       const forwarded = await forwardedP;
       assert.deepEqual(order, ["persist", "history"]);

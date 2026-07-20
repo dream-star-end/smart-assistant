@@ -16,6 +16,36 @@ const [{ createCommercialHandler }, liveShare, storage] = await Promise.all([
   import('@openclaude/storage'),
 ])
 
+const baseSessionsBackend = storage.getActiveBackend()
+const exactReadOptions: unknown[] = []
+storage.setClientSessionsBackend({
+  ...baseSessionsBackend,
+  getClientSession: async (sessionId: string, userId?: string, options?: unknown) => {
+    if (sessionId === 'wsess-aaaaaaaaaaaaaaaa' && userId === USER_ID) {
+      exactReadOptions.push(options)
+      const message = options && typeof options === 'object' &&
+          (options as { view?: string }).view === 'timeline'
+        ? {
+            id: 'a-deferred', role: 'assistant', text: '', ts: NOW,
+            _payloadDeferred: true, _turnTapeId: 'tape-exact', _recordOrdinal: 1,
+          }
+        : { id: 'a-exact', role: 'assistant', text: 'FINAL-TAPE-MARKER', ts: NOW }
+      return {
+        id: sessionId,
+        userId: USER_ID,
+        agentId: 'main',
+        title: 'exact',
+        pinned: false,
+        createdAt: NOW,
+        lastAt: NOW,
+        updatedAt: NOW,
+        messages: [message],
+      }
+    }
+    return baseSessionsBackend.getClientSession(sessionId, userId, options as never)
+  },
+})
+
 const KEY = liveShare.deriveWechatLiveLinkKey('c'.repeat(64))
 const SESSION_ID = 'wsess-0123456789abcdef'
 const USER_ID = 'c:42'
@@ -218,6 +248,16 @@ describe('gateway-owned wechat binding routes', () => {
 })
 
 describe('wechat live snapshot API', () => {
+  test('finalized tape answer stays visible because the non-lazy live surface reads exact history', async () => {
+    exactReadOptions.length = 0
+    const token = makeToken({ sessionId: 'wsess-aaaaaaaaaaaaaaaa' })
+    const { out } = await call('GET', `/api/wechat/live?t=${token}`)
+    assert.equal(out.statusCode, 200)
+    const body = parseJson(out) as { messages: Array<{ text: string }> }
+    assert.deepEqual(body.messages.map((message) => message.text), ['FINAL-TAPE-MARKER'])
+    assert.deepEqual(exactReadOptions, [undefined])
+  })
+
   test('valid token strips c: for active DB check and returns sanitized messages', async () => {
     await seedSession()
     const token = makeToken()

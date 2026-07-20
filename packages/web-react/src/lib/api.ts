@@ -845,7 +845,7 @@ export type ContainerPreviewTicketResponse = {
 /** Resolve legacy locators through HEAD, then assemble the immutable JSON with
  * real byte-range requests. The 1 MiB quantum is transport backpressure, not a
  * record-size limit; every byte is retained and verified by the payload parser. */
-async function getExactTapeRecordPayload(
+export async function getExactDeferredPayload(
   a: AuthSession,
   url: string,
 ): Promise<TapeRecordPayload> {
@@ -868,7 +868,7 @@ async function getExactTapeRecordPayload(
     recordId.length === 0 || role.length === 0 ||
     head.headers.get("accept-ranges")?.toLowerCase() !== "bytes"
   ) {
-    throw new Error("invalid immutable tape payload metadata");
+    throw new Error("invalid immutable deferred payload metadata");
   }
 
   const target = new Uint8Array(totalBytes);
@@ -893,7 +893,7 @@ async function getExactTapeRecordPayload(
       res.headers.get("x-openclaude-record-role") !== role ||
       chunk.byteLength !== end - offset + 1
     ) {
-      throw new Error("immutable tape payload range identity mismatch");
+      throw new Error("immutable deferred payload range identity mismatch");
     }
     target.set(chunk, offset);
   }
@@ -1612,10 +1612,22 @@ export const api = {
     tapeId: string,
     recordOrdinal: number,
   ): Promise<TapeRecordPayload> => {
-    return getExactTapeRecordPayload(
+    return getExactDeferredPayload(
       a,
       `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}` +
         `/records/${recordOrdinal}/payload`,
+    );
+  },
+
+  /** 超长 user 行的原始 JSON。与 tape payload 共用 HEAD + Range + SHA 契约。 */
+  getUserMessagePayload: async (
+    a: AuthSession,
+    id: string,
+    messageId: string,
+  ): Promise<TapeRecordPayload> => {
+    return getExactDeferredPayload(
+      a,
+      `/api/sessions/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/payload`,
     );
   },
 
@@ -1678,7 +1690,19 @@ export const api = {
   appendUserMessage: (
     a: AuthSession,
     id: string,
-    msg: { id: string; text: string; ts: number; media?: unknown },
+    msg: {
+      id: string;
+      text: string;
+      ts: number;
+      media?: unknown;
+      _retryMedia?: unknown;
+      _imageEdit?: unknown;
+      _modelText?: string;
+      _routing?: unknown;
+      _sendAttempt?: number;
+      _isAutoRetry?: boolean;
+      _idem?: string;
+    },
   ): Promise<void> =>
     jsonOrThrow<{ ok: true }>(
       callWithRefresh(a, (t) =>

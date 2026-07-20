@@ -115,6 +115,7 @@ import {
   readArchivedMessages,
   listTurnTapeRecords,
   readTapeRecordPayloadChunk,
+  readUserMessagePayload,
   upsertClientSession,
   appendServerAuthoredMessage,
   deleteClientSession,
@@ -3551,7 +3552,19 @@ export class Gateway {
           }
           return
         }
-        let data: { id?: unknown; text?: unknown; ts?: unknown; media?: unknown }
+        let data: {
+          id?: unknown
+          text?: unknown
+          ts?: unknown
+          media?: unknown
+          _retryMedia?: unknown
+          _imageEdit?: unknown
+          _modelText?: unknown
+          _routing?: unknown
+          _sendAttempt?: unknown
+          _isAutoRetry?: unknown
+          _idem?: unknown
+        }
         try {
           data = JSON.parse(body)
         } catch {
@@ -3562,6 +3575,18 @@ export class Gateway {
           this.sendJson(res, 400, { error: 'id+text required' })
           return
         }
+        const rawRouting = data._routing && typeof data._routing === 'object' && !Array.isArray(data._routing)
+          ? data._routing as { model?: unknown; teamMode?: unknown; effortLevel?: unknown }
+          : undefined
+        const routing = rawRouting
+          ? {
+              ...(typeof rawRouting.model === 'string' ? { model: rawRouting.model } : {}),
+              ...(typeof rawRouting.teamMode === 'boolean' ? { teamMode: rawRouting.teamMode } : {}),
+              ...(typeof rawRouting.effortLevel === 'string' || rawRouting.effortLevel === null
+                ? { effortLevel: rawRouting.effortLevel }
+                : {}),
+            }
+          : undefined
         const msg = {
           id: data.id,
           role: 'user' as const,
@@ -3571,6 +3596,17 @@ export class Gateway {
           text: data.text,
           ts: typeof data.ts === 'number' && Number.isFinite(data.ts) ? data.ts : Date.now(),
           ...(Array.isArray(data.media) ? { _media: data.media } : {}),
+          ...(Array.isArray(data._retryMedia) ? { _retryMedia: data._retryMedia } : {}),
+          ...(data._imageEdit && typeof data._imageEdit === 'object' && !Array.isArray(data._imageEdit)
+            ? { _imageEdit: data._imageEdit }
+            : {}),
+          ...(typeof data._modelText === 'string' ? { _modelText: data._modelText } : {}),
+          ...(routing ? { _routing: routing } : {}),
+          ...(typeof data._sendAttempt === 'number' && Number.isSafeInteger(data._sendAttempt) && data._sendAttempt >= 0
+            ? { _sendAttempt: data._sendAttempt }
+            : {}),
+          ...(typeof data._isAutoRetry === 'boolean' ? { _isAutoRetry: data._isAutoRetry } : {}),
+          ...(typeof data._idem === 'string' ? { _idem: data._idem } : {}),
         }
         const r = await appendServerAuthoredMessage(sessId, userId, msg)
         if (r.applied) this.sendJson(res, 200, { ok: true })
@@ -3665,6 +3701,102 @@ export class Gateway {
         if (!res.destroyed) res.end()
       })().catch((error) => {
         if (!res.headersSent) this.sendJson(res, 500, { error: 'tape payload read failed' })
+        else res.destroy(error as Error)
+      })
+      return
+    }
+
+    // Oversized user messages use the same exact lazy-payload contract as
+    // immutable Agent records. The hot session row contains only a locator;
+    // mounted browser rows reconstruct the original user JSON via HEAD +
+    // Range without imposing a message-size ceiling.
+    const userPayloadMatch = url.pathname.match(
+      /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/messages\/([^/]{1,240})\/payload$/,
+    )
+    if (userPayloadMatch) {
+      const sessId = userPayloadMatch[1]
+      let msgId = ''
+      try {
+        msgId = decodeURIComponent(userPayloadMatch[2])
+      } catch {
+        this.sendJson(res, 400, { error: 'invalid message id' })
+        return
+      }
+      const userId = this.getUserId(req)
+      if (
+        (req.method !== 'GET' && req.method !== 'HEAD') ||
+        !/^[A-Za-z0-9_:-]{1,80}$/.test(msgId)
+      ) {
+        this.sendJson(res, req.method === 'GET' || req.method === 'HEAD' ? 400 : 405, {
+          error: req.method === 'GET' || req.method === 'HEAD' ? 'invalid message id' : 'method not allowed',
+        })
+        return
+      }
+      ;(async () => {
+        const head = await readUserMessagePayload(sessId, userId, msgId, 0, 1)
+        if (!head) {
+          this.sendJson(res, 404, { error: 'not found' })
+          return
+        }
+        const rawRange = req.headers.range
+        const rangeHeader = Array.isArray(rawRange) ? rawRange[0] : rawRange
+        const range = parseByteRange(rangeHeader, head.totalBytes)
+        const start = range?.start ?? 0
+        const endExclusive = range ? range.end + 1 : head.totalBytes
+        const contentLength = Math.max(0, endExclusive - start)
+        res.writeHead(range ? 206 : 200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': contentLength,
+          'Accept-Ranges': 'bytes',
+          'ETag': `"${head.contentSha256}"`,
+          'X-OpenClaude-Record-Id': head.msgId,
+          'X-OpenClaude-Record-Role': head.role,
+          'X-OpenClaude-Content-Sha256': head.contentSha256,
+          ...(range ? { 'Content-Range': `bytes ${start}-${endExclusive - 1}/${head.totalBytes}` } : {}),
+        })
+        if (req.method === 'HEAD' || contentLength === 0) {
+          res.end()
+          return
+        }
+        let offset = start
+        while (offset < endExclusive && !res.destroyed) {
+          const part = await readUserMessagePayload(
+            sessId,
+            userId,
+            msgId,
+            offset,
+            Math.min(1024 * 1024, endExclusive - offset),
+          )
+          if (
+            !part || part.offset !== offset || part.payload.length === 0 ||
+            part.msgId !== head.msgId || part.role !== head.role ||
+            part.contentSha256 !== head.contentSha256 || part.totalBytes !== head.totalBytes
+          ) {
+            res.destroy(new Error('immutable user payload changed during stream'))
+            return
+          }
+          offset += part.payload.length
+          if (!res.write(part.payload)) {
+            if (res.destroyed) return
+            const drained = await new Promise<boolean>((resolve) => {
+              const finish = (value: boolean) => {
+                res.off('drain', onDrain)
+                res.off('close', onClose)
+                res.off('error', onClose)
+                resolve(value)
+              }
+              const onDrain = () => finish(true)
+              const onClose = () => finish(false)
+              res.once('drain', onDrain)
+              res.once('close', onClose)
+              res.once('error', onClose)
+            })
+            if (!drained) return
+          }
+        }
+        if (!res.destroyed) res.end()
+      })().catch((error) => {
+        if (!res.headersSent) this.sendJson(res, 500, { error: 'user payload read failed' })
         else res.destroy(error as Error)
       })
       return

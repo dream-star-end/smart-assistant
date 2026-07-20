@@ -93,6 +93,7 @@ export type UseChatSocket = {
     sessId: string;
     msgId: string;
     agentId: string;
+    sourceOverride?: ChatMessage;
   }) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
   setActiveSession: (sessId: string | undefined) => void;
@@ -152,6 +153,12 @@ export type UseChatSocket = {
     sessId: string | undefined,
     tapeId: string,
     recordOrdinal: number,
+    expected: TapePayloadExpectation,
+  ) => Promise<ChatMessage[] | null>;
+  /** 按需读取、校验并解析一条超长 user 消息。 */
+  fetchUserMessagePayload: (
+    sessId: string | undefined,
+    messageId: string,
     expected: TapePayloadExpectation,
   ) => Promise<ChatMessage[] | null>;
   /** 删除某会话的本地持久副本（与 removeSession 配套）。*/
@@ -624,7 +631,7 @@ export function useChatSocket(opts: {
   // exactly the most recently decoded immutable record so scrolling back does
   // not download and parse the same 50 MB payload again. One-entry replacement
   // bounds memory independently of conversation length.
-  const tapePayloadCacheRef = useRef<{
+  const deferredPayloadCacheRef = useRef<{
     key: string;
     records: ChatMessage[];
   } | null>(null);
@@ -634,8 +641,8 @@ export function useChatSocket(opts: {
       if (!a || !sessId || !tapeId || !Number.isInteger(recordOrdinal) || recordOrdinal < 0) return null;
       try {
         const cacheKey = `${a.snapshot().epoch}:${sessId}:${tapeId}:${recordOrdinal}:${expected.contentSha256}`;
-        if (tapePayloadCacheRef.current?.key === cacheKey) {
-          return tapePayloadCacheRef.current.records;
+        if (deferredPayloadCacheRef.current?.key === cacheKey) {
+          return deferredPayloadCacheRef.current.records;
         }
         const payload = await api.getTapeRecordPayload(a, sessId, tapeId, recordOrdinal);
         const records = await parseTapeRecordPayload(payload, expected);
@@ -650,7 +657,34 @@ export function useChatSocket(opts: {
           _payloadBytes: undefined,
           _payloadSha256: undefined,
         }));
-        tapePayloadCacheRef.current = { key: cacheKey, records: hydrated };
+        deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
+        return hydrated;
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
+  const fetchUserMessagePayload = useCallback<UseChatSocket["fetchUserMessagePayload"]>(
+    async (sessId, messageId, expected) => {
+      const a = authRef.current;
+      if (!a || !sessId || !messageId) return null;
+      try {
+        const cacheKey = `${a.snapshot().epoch}:${sessId}:user:${messageId}:${expected.contentSha256}`;
+        if (deferredPayloadCacheRef.current?.key === cacheKey) {
+          return deferredPayloadCacheRef.current.records;
+        }
+        const payload = await api.getUserMessagePayload(a, sessId, messageId);
+        const records = await parseTapeRecordPayload(payload, expected);
+        const hydrated: ChatMessage[] = records.map((record) => ({
+          ...record,
+          _source: "server",
+          _payloadDeferred: undefined,
+          _userPayloadDeferred: undefined,
+          _payloadBytes: undefined,
+          _payloadSha256: undefined,
+        }));
+        deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
         return hydrated;
       } catch {
         return null;
@@ -680,7 +714,7 @@ export function useChatSocket(opts: {
   }, []);
   const wipePersistence = useCallback(async () => {
     sigRef.current.clear();
-    tapePayloadCacheRef.current = null;
+    deferredPayloadCacheRef.current = null;
     const st = storeRef.current;
     if (st) await st.wipe();
   }, []);
@@ -722,6 +756,7 @@ export function useChatSocket(opts: {
       expandTurnProcess,
       collapseTurnProcess,
       fetchTapeRecordPayload,
+      fetchUserMessagePayload,
       removePersisted,
       wipePersistence,
       sendRepoBind,
@@ -752,6 +787,7 @@ export function useChatSocket(opts: {
       expandTurnProcess,
       collapseTurnProcess,
       fetchTapeRecordPayload,
+      fetchUserMessagePayload,
       removePersisted,
       wipePersistence,
       sendRepoBind,

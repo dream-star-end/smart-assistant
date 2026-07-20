@@ -92,6 +92,11 @@ export type CardCallbacks = {
     recordOrdinal: number,
     expected: { recordId: string; role: string; contentSha256?: string },
   ) => Promise<ChatMessage[] | null>;
+  /** 按需读取并校验一条超长 user 消息；不要求 tape id/ordinal。 */
+  onFetchUserMessagePayload?: (
+    messageId: string,
+    expected: { recordId: string; role: string; contentSha256?: string },
+  ) => Promise<ChatMessage[] | null>;
   /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
    *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
    *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */

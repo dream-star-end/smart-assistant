@@ -66,7 +66,7 @@ import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
-import { preciseRetryEligible } from "./lib/chat/socket";
+import { exactUserReplayPayload, preciseRetryEligible } from "./lib/chat/socket";
 import {
   findRewriteTarget,
   findStopTarget,
@@ -501,15 +501,21 @@ export function App() {
   }, [activeId]);
 
   const send = useCallback(
-    async (text: string, media?: MediaRef[], imageEdit?: InboundMessage["content"]["imageEdit"]) => {
+    async (
+      text: string,
+      media?: MediaRef[],
+      imageEdit?: InboundMessage["content"]["imageEdit"],
+      displayText?: string,
+    ) => {
       setChatError(null);
+      const visibleText = displayText ?? text;
 
       // demo：本地流式回放（无网络），仅用于离线预览设计。
       if (demo) {
         const userMsg: Message = {
           id: `tmp-${Date.now()}`,
           role: "user",
-          content: text,
+          content: visibleText,
           createdAt: new Date().toISOString(),
         };
         setMessages((m) => [...m, userMsg]);
@@ -537,7 +543,7 @@ export function App() {
       {
         const rewriteTarget = findRewriteTarget(
           sockRef.current?.getMessages(activeId) ?? [],
-          text,
+          visibleText,
           Date.now(),
         );
         if (rewriteTarget) sendImplicitRatingRef.current?.(rewriteTarget, { reason: "改写重发" });
@@ -549,7 +555,7 @@ export function App() {
         sessionId = genWsSessionId();
         createdSession = {
           id: sessionId,
-          title: text.slice(0, 24) || "新对话",
+          title: visibleText.slice(0, 24) || "新对话",
           ownerUserId: user.id,
           updatedAt: new Date().toISOString(),
           messageCount: 0,
@@ -563,7 +569,7 @@ export function App() {
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
         writeTeamMode(sessionId, teamMode);
       }
-      sockRef.current?.ensureSession(sessionId, agent.id, text.slice(0, 24));
+      sockRef.current?.ensureSession(sessionId, agent.id, visibleText.slice(0, 24));
       // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
       // 当前模型不支持时省略,让模型沿用自身默认。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
@@ -573,6 +579,7 @@ export function App() {
         sessId: sessionId,
         agentId: agent.id,
         text,
+        ...(displayText !== undefined && displayText !== text ? { displayText } : {}),
         model: modelId,
         effortLevel: effortForModel(
           models,
@@ -588,11 +595,11 @@ export function App() {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
         const base: Session =
-          found ?? createdSession ?? { id: sid, title: text.slice(0, 24) || "新对话", ownerUserId: user.id, updatedAt: "", messageCount: 0 };
+          found ?? createdSession ?? { id: sid, title: visibleText.slice(0, 24) || "新对话", ownerUserId: user.id, updatedAt: "", messageCount: 0 };
         const updated: Session = {
           ...base,
           id: sid,
-          title: found?.title && found.messageCount > 0 ? found.title : text.slice(0, 24) || "新对话",
+          title: found?.title && found.messageCount > 0 ? found.title : visibleText.slice(0, 24) || "新对话",
           updatedAt: new Date().toISOString(),
           messageCount: (found?.messageCount ?? 0) + 1,
         };
@@ -761,12 +768,36 @@ export function App() {
     setRepoModalOpen(true);
   }, [ensureActiveSession]);
 
-  const regenerate = useCallback(() => {
+  /** Resolve a lazy user locator to its immutable persisted row for one
+   * action. The hydrated object stays on the stack; it is never merged into
+   * ChatSocket/IndexedDB, so even a huge prompt does not bloat hot history. */
+  const loadExactUserMessage = useCallback(
+    async (message: ChatMessage): Promise<ChatMessage | null> => {
+      if (message._userPayloadDeferred !== true) return message;
+      if (!activeId) return null;
+      const records = await sockRef.current?.fetchUserMessagePayload(activeId, message.id, {
+        recordId: message.id,
+        role: "user",
+        ...(message._payloadSha256 ? { contentSha256: message._payloadSha256 } : {}),
+      });
+      const exact = records?.find((record) => record.id === message.id && record.role === "user");
+      if (!exact) return null;
+      return {
+        ...exact,
+        status: message.status ?? exact.status,
+        _routing: exact._routing ?? message._routing,
+        _sendAttempt: message._sendAttempt ?? exact._sendAttempt,
+      };
+    },
+    [activeId],
+  );
+
+  const regenerate = useCallback(async () => {
     // demo 用本地 messages；非 demo 找 WS 末条 user 重发。
     if (demo) {
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].role === "user") {
-          send(messages[i].content ?? "");
+          await send(messages[i].content ?? "");
           return;
         }
       }
@@ -779,11 +810,17 @@ export function App() {
       const m = src[i];
       // 跳过 auto-continue/auto-retry 行:那是系统续跑文案,不是用户的真实提问。
       if (m.role === "user" && !m._isAutoRetry) {
-        send(m._modelText ?? m.text ?? "", m._media);
+        const exact = await loadExactUserMessage(m);
+        if (!exact) {
+          toast("原始消息加载失败，请重试", "error");
+          return;
+        }
+        const replay = exactUserReplayPayload(exact);
+        await send(replay.text, replay.media, replay.imageEdit, replay.displayText);
         return;
       }
     }
-  }, [demo, messages, activeId, send]);
+  }, [demo, messages, activeId, send, loadExactUserMessage, toast]);
 
   // 打开设置中心并顺带刷新余额（顶栏 pill / 侧栏 / AgentGate 充值入口统一走此）。
   const openSettings = useCallback((section: SettingsSection = "account") => {
@@ -1414,15 +1451,28 @@ export function App() {
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
   // model/teamMode/effort 由 socket 复用失败首发的 routing 快照,不读取当前偏好。
   const retrySend = useCallback(
-    (msg: ChatMessage) => {
+    async (msg: ChatMessage) => {
       if (demo || !activeId) return;
+      const exact = await loadExactUserMessage(msg);
+      if (!exact) {
+        toast("原始消息加载失败，请重试", "error");
+        return;
+      }
+      // A deferred red-card CTA was admitted only when the sidecar recorded
+      // complete routing/media evidence. Re-check the decoded row before
+      // dispatch so a corrupt/mismatched payload can never degrade to text-only.
+      if (msg._userPayloadDeferred === true && !preciseRetryEligible(exact)) {
+        toast("原消息的完整重试信息不可用，请使用重新生成", "error");
+        return;
+      }
       sockRef.current?.retryMessage({
         sessId: activeId,
         msgId: msg.id,
         agentId: agent.id,
+        sourceOverride: exact,
       });
     },
-    [demo, activeId, agent.id],
+    [demo, activeId, agent.id, loadExactUserMessage, toast],
   );
 
   // 红卡 CTA 硬门(任务④ / Codex 审计 R4)的精确重试目标解析:按 assistant 错误行的
@@ -1447,7 +1497,12 @@ export function App() {
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
   // True tape process paging + oversized-record loading. Hook methods are stable;
   // demo/readonly surfaces leave the cursor disabled rather than inventing content.
-  const { expandTurnProcess, collapseTurnProcess, fetchTapeRecordPayload } = chat;
+  const {
+    expandTurnProcess,
+    collapseTurnProcess,
+    fetchTapeRecordPayload,
+    fetchUserMessagePayload,
+  } = chat;
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
       onRegenerate: regenerate,
@@ -1463,6 +1518,9 @@ export function App() {
         ? undefined
         : (tapeId, recordOrdinal, expected) =>
             fetchTapeRecordPayload(activeId, tapeId, recordOrdinal, expected),
+      onFetchUserMessagePayload: demo
+        ? undefined
+        : (messageId, expected) => fetchUserMessagePayload(activeId, messageId, expected),
       resolveRetryTarget: demo ? undefined : resolveRetryTarget,
     }),
     [
@@ -1475,6 +1533,7 @@ export function App() {
       expandTurnProcess,
       collapseTurnProcess,
       fetchTapeRecordPayload,
+      fetchUserMessagePayload,
       activeId,
       resolveRetryTarget,
     ],

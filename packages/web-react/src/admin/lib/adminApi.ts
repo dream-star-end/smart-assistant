@@ -4,6 +4,7 @@ import {
   bearerHeaders,
   callWithRefresh,
   jsonOrThrow,
+  getExactDeferredPayload,
   throwApi,
 } from "../../lib/api";
 import { adminSession } from "../auth";
@@ -51,6 +52,12 @@ export function adminGet<T>(path: string, params?: AdminParams): Promise<T> {
       fetch(url, { credentials: "include", headers: bearerHeaders(t) }),
     ),
   );
+}
+
+/** Admin-scoped immutable payload loader. Reuses the user surface's exact
+ * HEAD + 1 MiB Range + identity contract; only the URL/auth scope differs. */
+export function adminGetExactPayload(path: string, params?: AdminParams) {
+  return getExactDeferredPayload(adminSession, buildUrl(path, params));
 }
 
 /**

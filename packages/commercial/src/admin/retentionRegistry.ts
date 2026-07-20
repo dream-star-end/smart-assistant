@@ -77,8 +77,10 @@ export const DURABLE_TABLES: readonly string[] = [
   "claude_accounts",
   "client_session_archive_chunks",
   "client_session_archived_ids",
+  "client_session_turn_tape_model_records",
   "client_session_turn_tape_records",
   "client_session_turn_tapes",
+  "client_session_user_payloads",
   "client_sessions",
   "codex_route_contexts",
   "compute_hosts",
@@ -150,6 +152,11 @@ export const DURABLE_TABLES: readonly string[] = [
   "subscription_plans",
   "system_settings",
   "topup_plans",
+  // 0176 no longer reads/writes these projection-era tables, but retains the
+  // physical data for rollback. Keep them registered until a later migration
+  // actually drops the tables.
+  "tape_chat_projection",
+  "turn_dispatch_error_projections",
   // 精确轮次退款幂等栅栏兼具账务回溯凭据；与 credit_ledger/usage_records 同档，
   // 必须永久保留以阻止历史 turn_key 被重复退款，不按时间清理。
   "turn_waivers",

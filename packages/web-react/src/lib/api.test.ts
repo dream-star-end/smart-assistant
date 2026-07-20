@@ -155,6 +155,76 @@ test('getTapeRecordPayload resolves metadata with HEAD and reconstructs exact by
   expect(reconstructed.every((byte, index) => byte === source[index])).toBe(true)
 })
 
+test('getUserMessagePayload uses the user sidecar URL and the same exact range contract', async () => {
+  const source = new TextEncoder().encode(JSON.stringify({
+    id: 'cm:user:1', role: 'user', text: '完整超长用户消息', ts: 1,
+  }))
+  const hash = 'b'.repeat(64)
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    expect(url).toBe('/api/sessions/session-user-1/messages/cm%3Auser%3A1/payload')
+    if (init?.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(source.length),
+          'accept-ranges': 'bytes',
+          'x-openclaude-content-sha256': hash,
+          'x-openclaude-record-id': 'cm:user:1',
+          'x-openclaude-record-role': 'user',
+        },
+      })
+    }
+    const range = new Headers(init?.headers).get('range')
+    expect(range).toBe(`bytes=0-${source.length - 1}`)
+    return new Response(source, {
+      status: 206,
+      headers: {
+        'content-range': `bytes 0-${source.length - 1}/${source.length}`,
+        'x-openclaude-content-sha256': hash,
+        'x-openclaude-record-id': 'cm:user:1',
+        'x-openclaude-record-role': 'user',
+      },
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-user-payload')
+
+  const result = await api.getUserMessagePayload(session, 'session-user-1', 'cm:user:1')
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(Array.from(new Uint8Array(result.bytes))).toEqual(Array.from(source))
+  expect(result).toMatchObject({
+    contentSha256: hash,
+    recordId: 'cm:user:1',
+    role: 'user',
+  })
+})
+
+test('appendUserMessage forwards the complete exact-replay metadata to master', async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ok({ ok: true }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-user-persist')
+  const message = {
+    id: 'cm-user-persist',
+    text: '显示正文',
+    ts: 123,
+    media: [{ kind: 'image', url: '/api/media/guide.png' }],
+    _retryMedia: [
+      { kind: 'image', url: '/api/media/source.png', hidden: true },
+      { kind: 'image', url: '/api/media/guide.png' },
+    ],
+    _imageEdit: { clientJobId: 'a'.repeat(32), sourceIndex: 0, guideIndex: 1 },
+    _modelText: '显示正文\n[模型附件提示]',
+    _routing: { model: 'gpt-5.6-sol', teamMode: true, effortLevel: 'high' },
+    _sendAttempt: 0,
+  }
+
+  await api.appendUserMessage(session, 'session-user-persist', message)
+
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(fetchMock.mock.calls[0]![0]).toBe('/api/sessions/session-user-persist/user-message')
+  expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toEqual(message)
+})
+
 const ME_BODY = {
   user: {
     id: 'u1',

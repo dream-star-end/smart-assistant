@@ -1295,6 +1295,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     //   - 只写不含正文/媒体路径的 sessions.read admin_audit
     //   - 详见 admin/sessions.ts header comment
     { method: 'GET', pathPrefix: '/api/admin/sessions/', handler: handleAdminGetSession },
+    { method: 'HEAD', pathPrefix: '/api/admin/sessions/', handler: handleAdminGetSession },
     {
       method: 'POST',
       pathPrefix: '/api/admin/sessions/',

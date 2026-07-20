@@ -1953,7 +1953,22 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         id: clientMessageId,
         role: "user",
         text,
+        _modelText: "MODEL-VISIBLE-EXACT-PROMPT",
         ts: 1_783_950_000_123,
+        _media: [{ kind: "image", url: "/api/media/guide.png" }],
+        _retryMedia: [
+          { kind: "image", url: "/api/media/source.png", hidden: true },
+          { kind: "image", url: "/api/media/guide.png" },
+        ],
+        _imageEdit: {
+          clientJobId: "a".repeat(32),
+          sourceIndex: 0,
+          guideIndex: 1,
+          width: 100,
+          height: 80,
+        },
+        _routing: { model: "gpt-5.6-sol", teamMode: true, effortLevel: "high" },
+        _sendAttempt: 2,
       } as MessageLike & { id: string },
     }));
     assert.equal(admitted.kind, "admitted");
@@ -1968,6 +1983,17 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(locator.text, "");
     assert.equal(locator._payloadDeferred, true);
     assert.equal(locator._userPayloadDeferred, true);
+    assert.deepEqual(locator._routing, {
+      model: "gpt-5.6-sol",
+      teamMode: true,
+      effortLevel: "high",
+    });
+    assert.equal(locator._sendAttempt, 2);
+    assert.equal(locator._deferredRetryEligible, true);
+    assert.equal(locator._media, undefined);
+    assert.equal(locator._retryMedia, undefined);
+    assert.equal(locator._imageEdit, undefined);
+    assert.equal(locator._modelText, undefined);
     assert.ok(typeof locator._payloadBytes === "number" && locator._payloadBytes > 4 * 1024 * 1024);
 
     const metadata = await backend.readUserMessagePayload(
@@ -1997,7 +2023,24 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(decoded.id, clientMessageId);
     assert.equal(decoded.role, "user");
     assert.equal(decoded.text, text);
+    assert.equal(decoded._modelText, "MODEL-VISIBLE-EXACT-PROMPT");
     assert.equal(decoded._source, "server");
+    assert.deepEqual(decoded._retryMedia, [
+      { kind: "image", url: "/api/media/source.png", hidden: true },
+      { kind: "image", url: "/api/media/guide.png" },
+    ]);
+    assert.deepEqual(decoded._imageEdit, {
+      clientJobId: "a".repeat(32),
+      sourceIndex: 0,
+      guideIndex: 1,
+      width: 100,
+      height: 80,
+    });
+    assert.deepEqual(decoded._routing, {
+      model: "gpt-5.6-sol",
+      teamMode: true,
+      effortLevel: "high",
+    });
     assert.equal(
       await backend.readUserMessagePayload(sessionId, "c:8", clientMessageId),
       null,
@@ -2008,7 +2051,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     });
     assert.equal(modelContext?.length, 1);
     assert.equal(modelContext?.[0]?.role, "user");
-    assert.equal(modelContext?.[0]?.text, text);
+    assert.equal(modelContext?.[0]?.text, "MODEL-VISIBLE-EXACT-PROMPT");
     assert.equal((modelContext?.[0] as MessageLike)._userPayloadDeferred, undefined);
   });
 

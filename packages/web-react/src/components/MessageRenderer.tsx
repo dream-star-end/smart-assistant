@@ -94,6 +94,7 @@ export const MessageRenderer = memo(
           sending={sending}
           inActiveTurn={inActiveTurn}
           turnActivity={turnActivity}
+          turnFinalAssistant={turnFinalAssistant}
           cb={cb}
           onRespondPermission={onRespondPermission}
           readOnly={readOnly}
@@ -318,42 +319,47 @@ function DeferredTapeRecordCard({
   cb,
   onRespondPermission,
   readOnly,
-}: Omit<RendererProps, "sig" | "delegateCost" | "turnFinalAssistant">) {
+  turnFinalAssistant,
+}: Omit<RendererProps, "sig" | "delegateCost">) {
   const ref = useRef<HTMLDivElement>(null);
   const started = useRef(false);
   const [records, setRecords] = useState<ChatMessage[] | null>(null);
   const [failed, setFailed] = useState(false);
+  const isUserPayload = message._userPayloadDeferred === true;
   const load = useCallback(async () => {
-    if (started.current || !cb.onFetchTapeRecordPayload) return;
-    const tapeId = message._turnTapeId;
-    const ordinal = message._recordOrdinal;
+    if (started.current) return;
     const sha256 = message._payloadSha256;
-    if (!tapeId || typeof ordinal !== "number") return;
-    started.current = true;
-    setFailed(false);
-    const loaded = await cb.onFetchTapeRecordPayload(tapeId, ordinal, {
+    const expected = {
       recordId: message.id,
       role: message.role,
       ...(sha256 ? { contentSha256: sha256 } : {}),
-    });
+    };
+    let request: Promise<ChatMessage[] | null> | null = null;
+    if (isUserPayload) {
+      if (cb.onFetchUserMessagePayload) {
+        request = cb.onFetchUserMessagePayload(message.id, expected);
+      }
+    } else {
+      const tapeId = message._turnTapeId;
+      const ordinal = message._recordOrdinal;
+      if (cb.onFetchTapeRecordPayload && tapeId && typeof ordinal === "number") {
+        request = cb.onFetchTapeRecordPayload(tapeId, ordinal, expected);
+      }
+    }
+    if (!request) {
+      setFailed(true);
+      return;
+    }
+    started.current = true;
+    setFailed(false);
+    const loaded = await request;
     if (!loaded) {
       started.current = false;
       setFailed(true);
       return;
     }
-    setRecords(loaded.map((record) => ({
-      ...record,
-      _turnTapeId: tapeId,
-      _turnTapeSha256: message._turnTapeSha256,
-      _turnTapeOrdinal: ordinal,
-      _recordOrdinal: ordinal,
-      _turnTapeComplete: true,
-      _turnTapeProcessLoadedFrom: message._turnTapeProcessLoadedFrom,
-      _seq: message._seq,
-      _orderSeq: message._orderSeq,
-      _clientMessageId: record._clientMessageId ?? message._clientMessageId,
-    })));
-  }, [cb, message]);
+    setRecords(loaded);
+  }, [cb, isUserPayload, message]);
 
   useEffect(() => {
     const node = ref.current;
@@ -379,17 +385,61 @@ function DeferredTapeRecordCard({
     return (
       <div className="space-y-3">
         {records.map((record, index) => {
+          // Payload bytes are immutable, but billing/status overlays on the
+          // small locator can advance after the first viewport load. Re-merge
+          // them on every locator render so late cost/waiver/reply state stays
+          // visible without downloading the immutable body again.
+          const currentUsage = record.id === message.id && message.usage
+            ? { ...(record.usage ?? {}), ...message.usage }
+            : record.usage;
+          const hydratedRecord: ChatMessage = isUserPayload
+            ? {
+                ...record,
+                _source: "server",
+                status: message.status ?? record.status,
+                ...(currentUsage ? { usage: currentUsage } : {}),
+                _payloadDeferred: undefined,
+                _userPayloadDeferred: undefined,
+                _payloadBytes: undefined,
+                _payloadSha256: undefined,
+                _seq: message._seq,
+                _orderSeq: message._orderSeq,
+                _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+                _routing: record._routing ?? message._routing,
+                _sendAttempt: message._sendAttempt ?? record._sendAttempt,
+                _deferredRetryEligible: undefined,
+              }
+            : {
+                ...record,
+                ...(currentUsage ? { usage: currentUsage } : {}),
+                _turnTapeId: message._turnTapeId,
+                _turnTapeSha256: message._turnTapeSha256,
+                _turnTapeOrdinal: message._recordOrdinal,
+                _recordOrdinal: message._recordOrdinal,
+                _turnTapeComplete: true,
+                _turnTapeProcessLoadedFrom: message._turnTapeProcessLoadedFrom,
+                _seq: message._seq,
+                _orderSeq: message._orderSeq,
+                _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+              };
           const final = isLast && index === records.length - 1;
-          const recordSig = messageSignature(record, { isLast: final, sending, turnFinalAssistant: false });
+          const recordIsFinalAssistant = turnFinalAssistant === true &&
+            hydratedRecord.role === "assistant" && index === records.length - 1;
+          const recordSig = messageSignature(hydratedRecord, {
+            isLast: final,
+            sending,
+            turnFinalAssistant: recordIsFinalAssistant,
+          });
           return (
             <MessageRenderer
-              key={record.id}
-              message={record}
+              key={hydratedRecord.id}
+              message={hydratedRecord}
               sig={recordSig}
               isLast={final}
               sending={sending}
               inActiveTurn={inActiveTurn}
               turnActivity={turnActivity}
+              turnFinalAssistant={recordIsFinalAssistant}
               cb={cb}
               onRespondPermission={onRespondPermission}
               readOnly={readOnly}
@@ -403,10 +453,10 @@ function DeferredTapeRecordCard({
     <div ref={ref} className="rounded-lg border border-dashed border-border bg-surface px-3.5 py-3 text-xs text-muted">
       {failed ? (
         <button type="button" onClick={() => void load()} className="text-danger hover:underline">
-          真实记录加载失败，点击重试
+          {isUserPayload ? "完整用户消息加载失败，点击重试" : "真实记录加载失败，点击重试"}
         </button>
       ) : (
-        <span>正在读取真实 Agent 记录…</span>
+        <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
       )}
     </div>
   );

@@ -40,11 +40,10 @@ import {
   shouldApplyGoalSnapshot,
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
+import { collapseExpandedTapePage, mergeExpandedTapePage } from "./directTimeline";
 import {
-  isTurnTapeProcessControl,
   isDispatchLostCode,
   isDispatchTerminalRow,
-  turnTapeProcessKey,
 } from "./render";
 import {
   applyServerIncremental,
@@ -188,7 +187,19 @@ export type ChatSocketDeps = {
    *  带本地 client id → getSession 回带同 id,前端合并去重。best-effort。 */
   persistUserMessage?: (
     sessId: string,
-    msg: { id: string; text: string; ts: number; media?: InboundMessage["content"]["media"] },
+    msg: {
+      id: string;
+      text: string;
+      ts: number;
+      media?: InboundMessage["content"]["media"];
+      _retryMedia?: InboundMessage["content"]["media"];
+      _imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
+      _modelText?: string;
+      _routing?: ChatRoutingSnapshot;
+      _sendAttempt?: number;
+      _isAutoRetry?: boolean;
+      _idem?: string;
+    },
   ) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
@@ -258,18 +269,46 @@ function normalizeRetiredRouting(
  * 调用方语义**:手动用户气泡「重试」(legacy 行无 `_routing` 时仍回退 `_lastRouting`)不受影响。
  */
 export function preciseRetryEligible(
-  msg: Pick<ChatMessage, "_routing" | "_media" | "_retryMedia">,
+  msg: Pick<
+    ChatMessage,
+    "_routing" | "_media" | "_retryMedia" | "_userPayloadDeferred" | "_deferredRetryEligible"
+  >,
 ): boolean {
   if (!msg._routing) return false;
+  if (msg._userPayloadDeferred === true) return msg._deferredRetryEligible === true;
   const hadAttachments = (msg._media?.length ?? 0) > 0 || (msg._retryMedia?.length ?? 0) > 0;
   if (!hadAttachments) return true;
-  const source = msg._retryMedia && msg._retryMedia.length > 0 ? msg._retryMedia : msg._media;
+  const source = msg._retryMedia ?? msg._media;
   if (!source || source.length === 0) return false;
   return source.every(
     (r) =>
       (typeof r.url === "string" && r.url.length > 0) ||
       (typeof r.base64 === "string" && r.base64.length > 0),
   );
+}
+
+/** Reconstruct one exact user replay body. Retry and regenerate share this
+ * helper so model text, bubble text, attachments and image-edit descriptors
+ * cannot silently diverge. The returned data may be large and is never stored
+ * back into a deferred session locator. */
+export function exactUserReplayPayload(
+  msg: Pick<ChatMessage, "text" | "_modelText" | "_media" | "_retryMedia" | "_imageEdit">,
+): {
+  text: string;
+  displayText?: string;
+  media?: InboundMessage["content"]["media"];
+  imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
+} {
+  const displayText = msg.text ?? "";
+  const text = msg._modelText ?? displayText;
+  const sourceMedia = msg._retryMedia ?? msg._media;
+  const media = sourceMedia && sourceMedia.length > 0 ? sourceMedia : undefined;
+  return {
+    text,
+    ...(displayText !== text ? { displayText } : {}),
+    ...(media ? { media } : {}),
+    ...(msg._imageEdit ? { imageEdit: msg._imageEdit } : {}),
+  };
 }
 
 /** rAF 合并渲染的隐藏-tab 兜底间隔:rAF 在隐藏 tab 被节流到几乎不触发,用此 setTimeout
@@ -2137,85 +2176,14 @@ export class ChatSocket {
   ): void {
     const s = this.sessions.get(sessId);
     if (!s) return;
-    const anchorIdx = s.messages.findIndex((m) => m?.id === anchorId && isTurnTapeProcessControl(m));
-    if (anchorIdx < 0) return; // anchor 不在(会话已切/被合并覆盖)→ 静默放弃,不误伤
-    const anchor = s.messages[anchorIdx];
-    const key = turnTapeProcessKey(anchor);
-    // Initial timeline already includes the exact assistant/error narrative
-    // records. Process paging encounters those same physical ordinals, so the
-    // whole tape section is merged by immutable id and sorted by authoritative
-    // ordinal. This preserves the Agent's actual order without duplicating or
-    // replacing the immediately visible final answer.
-    const isSameTapeRecord = (message: ChatMessage): boolean =>
-      message.id !== anchor.id &&
-      message._turnTapeId === anchor._turnTapeId &&
-      (anchor._turnTapeSha256 === undefined ||
-        message._turnTapeSha256 === undefined ||
-        message._turnTapeSha256 === anchor._turnTapeSha256);
-    const existingSection = s.messages.filter(isSameTapeRecord);
-    const sectionIds = new Set(existingSection.map((message) => message.id));
-    const idsOutsideSection = new Set(
-      s.messages.filter((message) => !isSameTapeRecord(message)).map((message) => message.id),
-    );
-    const mergedSection = [...existingSection];
-    for (const r of Array.isArray(records) ? records : []) {
-      if (
-        !r ||
-        typeof r.id !== "string" ||
-        r.id.length === 0 ||
-        sectionIds.has(r.id) ||
-        idsOutsideSection.has(r.id)
-      ) continue;
-      sectionIds.add(r.id);
-      mergedSection.push({
-        ...r,
-        _source: "server",
-        _turnTapeProcessLoadedFrom: key,
-        _turnTapeId: anchor._turnTapeId,
-        _turnTapeSha256: anchor._turnTapeSha256,
-        _turnTapeComplete: true,
-        // 展开行共享 anchor 顺序轴 → 不新增 distinct _seq(count/游标口径不变)。
-        _seq: anchor._seq,
-        _orderSeq: anchor._orderSeq,
-        _clientMessageId:
-          typeof r._clientMessageId === "string" && r._clientMessageId
-            ? r._clientMessageId
-            : anchor._clientMessageId,
-        ts: typeof r.ts === "number" && Number.isFinite(r.ts) ? r.ts : anchor.ts,
-      });
-    }
-    const originalPosition = new Map(mergedSection.map((message, index) => [message.id, index]));
-    const ordinalOf = (message: ChatMessage): number =>
-      typeof message._turnTapeOrdinal === "number"
-        ? message._turnTapeOrdinal
-        : typeof message._recordOrdinal === "number"
-          ? message._recordOrdinal
-          : Number.MAX_SAFE_INTEGER;
-    mergedSection.sort((a, b) => {
-      const byOrdinal = ordinalOf(a) - ordinalOf(b);
-      if (byOrdinal !== 0) return byOrdinal;
-      const ao = typeof a._ocEventOrdinal === "number" ? a._ocEventOrdinal : Number.MAX_SAFE_INTEGER;
-      const bo = typeof b._ocEventOrdinal === "number" ? b._ocEventOrdinal : Number.MAX_SAFE_INTEGER;
-      if (ao !== bo) return ao - bo;
-      return (originalPosition.get(a.id) ?? 0) - (originalPosition.get(b.id) ?? 0);
-    });
-    // 过程控制就地标记展开态。
-    anchor._turnTapeProcessExpanded = true;
-    anchor._turnTapeProcessCursor = nextCursor;
-    if (mergedSection.length > 0) {
-      const withoutSection = s.messages.filter((message) => !isSameTapeRecord(message));
-      const controlIndex = withoutSection.findIndex((message) => message.id === anchor.id);
-      s.messages = [
-        ...withoutSection.slice(0, controlIndex + 1),
-        ...mergedSection,
-        ...withoutSection.slice(controlIndex + 1),
-      ];
-      s._blockIdToMsgId = new Map();
-      s._agentGroups = new Map();
-      rebuildIndexes(s);
-      normalizeDelegateCards(s);
-      normalizeGoalCards(s);
-    }
+    const next = mergeExpandedTapePage(s.messages, anchorId, records, nextCursor);
+    if (!next) return;
+    s.messages = next;
+    s._blockIdToMsgId = new Map();
+    s._agentGroups = new Map();
+    rebuildIndexes(s);
+    normalizeDelegateCards(s);
+    normalizeGoalCards(s);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }
@@ -2227,12 +2195,9 @@ export class ChatSocket {
   collapseTurnProcess(sessId: string, anchorId: string): void {
     const s = this.sessions.get(sessId);
     if (!s) return;
-    const anchor = s.messages.find((m) => m?.id === anchorId && isTurnTapeProcessControl(m));
-    if (!anchor || anchor._turnTapeProcessExpanded !== true) return;
-    const key = turnTapeProcessKey(anchor);
-    anchor._turnTapeProcessExpanded = false;
-    anchor._turnTapeProcessCursor = undefined;
-    s.messages = s.messages.filter((m) => m._turnTapeProcessLoadedFrom !== key);
+    const next = collapseExpandedTapePage(s.messages, anchorId);
+    if (!next) return;
+    s.messages = next;
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
@@ -2382,7 +2347,14 @@ export class ChatSocket {
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId: p.agentId,
-      content: { text: p.text, ...(outboundMedia ? { media: outboundMedia } : {}), ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}) },
+      content: {
+        text: p.text,
+        ...(p.displayText !== undefined && p.displayText !== p.text
+          ? { displayText: p.displayText }
+          : {}),
+        ...(outboundMedia ? { media: outboundMedia } : {}),
+        ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}),
+      },
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
@@ -2395,7 +2367,7 @@ export class ChatSocket {
       // 重发走 dispatchPayload 会重新构帧,用剥离 localSrc 的版本(blob 不重发)。
       _retryMedia: p.imageEdit ? outboundMedia : undefined,
       _imageEdit: p.imageEdit,
-      _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
+      _modelText: p.displayText !== undefined && p.displayText !== p.text ? p.text : undefined,
       _routing: { ...routing },
       _sendAttempt: 0,
     });
@@ -2412,7 +2384,19 @@ export class ChatSocket {
     // 仍在);容器回传的 server-authored 助手消息走另一条链。
     {
       const sid = sess.id;
-      const um = { id: userMsg.id, text: userMsg.text, ts: userMsg.ts, media: outboundMedia?.filter((m) => m.hidden !== true) };
+      const um = {
+        id: userMsg.id,
+        text: userMsg.text,
+        ts: userMsg.ts,
+        media: outboundMedia?.filter((m) => m.hidden !== true),
+        ...(userMsg._retryMedia !== undefined ? { _retryMedia: userMsg._retryMedia } : {}),
+        ...(userMsg._imageEdit !== undefined ? { _imageEdit: userMsg._imageEdit } : {}),
+        ...(userMsg._modelText !== undefined ? { _modelText: userMsg._modelText } : {}),
+        ...(userMsg._routing !== undefined ? { _routing: userMsg._routing } : {}),
+        ...(userMsg._sendAttempt !== undefined ? { _sendAttempt: userMsg._sendAttempt } : {}),
+        ...(userMsg._isAutoRetry !== undefined ? { _isAutoRetry: userMsg._isAutoRetry } : {}),
+        ...(userMsg._idem !== undefined ? { _idem: userMsg._idem } : {}),
+      };
       void ensurePromise
         .then((ok) => {
           if ((ok || this.serverSessionEnsured.has(sid)) && this.sessions.has(sid)) {
@@ -2579,23 +2563,27 @@ export class ChatSocket {
     sessId: string;
     msgId: string;
     agentId: string;
+    /** Exact lazy-hydrated source for this dispatch only. It is deliberately
+     * not assigned into the hot session or IndexedDB locator. */
+    sourceOverride?: ChatMessage;
   }): void {
     const sess = this.sessions.get(p.sessId);
     if (!sess) return;
     const userMsg = sess.messages.find((m) => m.id === p.msgId && m.role === "user");
     if (!userMsg || userMsg.status !== "error") return;
+    const source = p.sourceOverride?.id === userMsg.id && p.sourceOverride.role === "user"
+      ? p.sourceOverride
+      : userMsg;
     // 主控建行可能在首发失败时未确保 → 幂等补一次(best-effort,不阻塞发送)。
     const agentId = sess.agentId || p.agentId;
     void this.ensureServerSessionOnce(sess, agentId);
-    const retryMedia = userMsg._retryMedia ?? userMsg._media;
-    const media = retryMedia && retryMedia.length > 0 ? retryMedia : undefined;
-    const text = userMsg._modelText ?? userMsg.text ?? "";
+    const replay = exactUserReplayPayload(source);
     // Historical rows written before message-level snapshots fall back to the session
     // snapshot; all new rows bind retry routing to the original user turn.
     // NB: the red-card precise CTA never reaches this fallback — resolveRetryTarget gates it
     // behind preciseRetryEligible (own _routing required). Only the manual user-bubble retry
     // (legacy send-failure rows) may still fall back to _lastRouting, and that path is preserved.
-    const routing = normalizeRetiredRouting(userMsg._routing ?? sess._lastRouting);
+    const routing = normalizeRetiredRouting(source._routing ?? userMsg._routing ?? sess._lastRouting);
     if (routing) {
       userMsg._routing = { ...routing };
       // Continuations belong to the retried turn, not to a later turn that last
@@ -2608,7 +2596,12 @@ export class ChatSocket {
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId,
-      content: { text, ...(media ? { media } : {}), ...(userMsg._imageEdit ? { imageEdit: userMsg._imageEdit } : {}) },
+      content: {
+        text: replay.text,
+        ...(replay.displayText !== undefined ? { displayText: replay.displayText } : {}),
+        ...(replay.media ? { media: replay.media } : {}),
+        ...(replay.imageEdit ? { imageEdit: replay.imageEdit } : {}),
+      },
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel")
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),
@@ -2646,7 +2639,7 @@ export class ChatSocket {
     }
     userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
     // 生成占位卡（需求 C）：imageEdit 重试复用同 clientJobId → 重置上次失败的占位回 running。
-    this.ensureGenPlaceholder(sess, userMsg._imageEdit, true, userMsg.id);
+    this.ensureGenPlaceholder(sess, replay.imageEdit, true, userMsg.id);
     this.dispatchPayload(sess, userMsg, payload);
   }
 

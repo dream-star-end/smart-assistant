@@ -18,6 +18,8 @@ test('browser session full/incremental/archive routes request the direct timelin
   assert.match(routes, /readArchivedMessages\(sessId, userId, beforeSeq, limit, \{ view: 'timeline' \}\)/)
   assert.match(routes, /url\.searchParams\.get\('since_history_revision'\)/)
   assert.match(routes, /_parseHistoryRevisionCursor\(historyRevisionRaw\)/)
+  assert.match(routes, /userPayloadMatch/)
+  assert.match(routes, /readUserMessagePayload\(sessId, userId, msgId, 0, 1\)/)
 })
 
 test('history revision cursor accepts only canonical non-negative decimal integers', () => {

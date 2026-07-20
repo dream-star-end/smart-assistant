@@ -89,7 +89,10 @@ export async function handleWechatLiveSnapshot(
     throw new HttpError(403, 'FORBIDDEN', 'account not active')
   }
 
-  const session = await getClientSession(verified.sessionId, verified.userId, { view: 'timeline' })
+  // This public surface has no tape/user-payload lazy endpoints. Request the
+  // exact hydrated view rather than feeding deferred locators to the legacy
+  // sanitizer (which would render finalized assistant replies as blank).
+  const session = await getClientSession(verified.sessionId, verified.userId)
   if (!session) {
     throw new HttpError(404, 'NOT_FOUND', 'wechat session not found')
   }

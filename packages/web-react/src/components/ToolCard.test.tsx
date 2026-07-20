@@ -77,7 +77,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
 
     fireEvent.click(screen.getByRole("button"));
     fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
-    expect(screen.getByText("原始结构化输出")).toBeInTheDocument();
+    expect(screen.getByText("原始完整记录")).toBeInTheDocument();
     expect(document.body.textContent).toContain("EXACT_STRUCTURED_MARKER");
   });
 
@@ -209,10 +209,14 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("bar")).toBeInTheDocument();
   });
 
-  test("无 body（无 input/output）→ 不可展开（无 aria-expanded）", () => {
+  test("无 input/output 仍可展开查看 tape 中的原始完整记录", () => {
     render(<ToolCard message={{ toolName: "Read", _completed: true }} />);
     const btn = screen.getByRole("button");
-    expect(btn).not.toHaveAttribute("aria-expanded");
+    expect(btn).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(btn);
+    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    expect(screen.getByText("原始完整记录")).toBeInTheDocument();
+    expect(document.querySelector("pre")?.textContent).toContain('"toolName": "Read"');
   });
 
   test("agent-group 子块（ChildBlock 形态）复用本组件渲染", () => {

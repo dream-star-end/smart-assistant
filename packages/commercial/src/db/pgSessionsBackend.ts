@@ -405,6 +405,46 @@ interface SessionWriteRow {
 
 const USER_MESSAGE_INLINE_BYTES = 256 * 1024;
 
+function deferredUserReplayMetadata(message: MessageLike): MessageLike {
+  const rawRouting = message._routing && typeof message._routing === "object" &&
+    !Array.isArray(message._routing)
+    ? message._routing as { model?: unknown; teamMode?: unknown; effortLevel?: unknown }
+    : undefined;
+  const routing = rawRouting
+    ? {
+        ...(typeof rawRouting.model === "string" ? { model: rawRouting.model } : {}),
+        ...(typeof rawRouting.teamMode === "boolean" ? { teamMode: rawRouting.teamMode } : {}),
+        ...(typeof rawRouting.effortLevel === "string" || rawRouting.effortLevel === null
+          ? { effortLevel: rawRouting.effortLevel }
+          : {}),
+      }
+    : undefined;
+  const media = Array.isArray(message._media) ? message._media : undefined;
+  const retryMedia = Array.isArray(message._retryMedia) ? message._retryMedia : undefined;
+  const hadAttachments = (media?.length ?? 0) > 0 || (retryMedia?.length ?? 0) > 0;
+  const retrySource = retryMedia ?? media;
+  const retryEligible = !!routing && (!hadAttachments || (
+    !!retrySource && retrySource.length > 0 && retrySource.every((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      const ref = item as { url?: unknown; base64?: unknown };
+      return (typeof ref.url === "string" && ref.url.length > 0) ||
+        (typeof ref.base64 === "string" && ref.base64.length > 0);
+    })
+  ));
+  return {
+    ...(routing ? { _routing: routing } : {}),
+    ...(typeof message._sendAttempt === "number" && Number.isSafeInteger(message._sendAttempt) &&
+      message._sendAttempt >= 0
+      ? { _sendAttempt: message._sendAttempt }
+      : {}),
+    ...(typeof message._isAutoRetry === "boolean" ? { _isAutoRetry: message._isAutoRetry } : {}),
+    ...(typeof message._idem === "string" && message._idem.length <= 256
+      ? { _idem: message._idem }
+      : {}),
+    _deferredRetryEligible: retryEligible,
+  };
+}
+
 async function deferOversizedUserMessage(
   client: PoolClient,
   sessionId: string,
@@ -415,6 +455,7 @@ async function deferOversizedUserMessage(
   const exact = { ...message, _source: "server" };
   const payload = Buffer.from(JSON.stringify(exact), "utf8");
   if (payload.length <= USER_MESSAGE_INLINE_BYTES) return message;
+  const modelText = typeof message._modelText === "string" ? message._modelText : message.text;
   const contentSha256 = sha256Bytes(payload);
   const inserted = await client.query(
     `INSERT INTO client_session_user_payloads
@@ -428,10 +469,10 @@ async function deferOversizedUserMessage(
       userId,
       message.id,
       payload,
-      message.text,
+      modelText,
       contentSha256,
       payload.length,
-      estimateModelHistoryTokens(message.text),
+      estimateModelHistoryTokens(modelText),
       typeof message.ts === "number" && Number.isFinite(message.ts) ? message.ts : Date.now(),
     ],
   );
@@ -460,6 +501,7 @@ async function deferOversizedUserMessage(
     _userPayloadDeferred: true,
     _payloadBytes: payload.length,
     _payloadSha256: contentSha256,
+    ...deferredUserReplayMetadata(message),
   };
 }
 

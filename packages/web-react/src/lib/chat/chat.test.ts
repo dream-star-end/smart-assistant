@@ -45,6 +45,7 @@ import {
 } from "./reducer";
 import {
   ChatSocket,
+  exactUserReplayPayload,
   messageAttemptIdempotencyKey,
   preciseRetryEligible,
   writeAutoContinuePreamblePref,
@@ -2180,6 +2181,19 @@ describe("preciseRetryEligible(Codex 审计 R4:精确重试完整性硬门)", ()
       ),
     ).toBe(true);
   });
+
+  test("超大 user locator 只依据落库时的精确 sidecar 能力元数据，不把附件塞回热行", () => {
+    expect(preciseRetryEligible(base({
+      _routing: { model: "m", teamMode: false, effortLevel: null },
+      _userPayloadDeferred: true,
+      _deferredRetryEligible: true,
+    }))).toBe(true);
+    expect(preciseRetryEligible(base({
+      _routing: { model: "m", teamMode: false, effortLevel: null },
+      _userPayloadDeferred: true,
+      _deferredRetryEligible: false,
+    }))).toBe(false);
+  });
 });
 
 describe("applyCostWaived (turn 免单退款)", () => {
@@ -2732,6 +2746,82 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(retried.content.imageEdit.clientJobId).toBe("a".repeat(32));
   });
 
+  test("lazy oversized user retries from the exact sidecar source without hydrating the hot locator", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.ensureSession("s1", "main");
+    const session = sock.sessions.get("s1")!;
+    const locator = addMessage(session, "user", "", {
+      status: "error",
+      _userPayloadDeferred: true,
+      _payloadDeferred: true,
+      _payloadBytes: 8_000_000,
+      _payloadSha256: "a".repeat(64),
+      _routing: { model: "gpt-5.6-terra", teamMode: true, effortLevel: "max" },
+      _deferredRetryEligible: true,
+      _sendAttempt: 0,
+    });
+    const imageEdit = {
+      clientJobId: "b".repeat(32),
+      sourceIndex: 0,
+      maskIndex: 1,
+      guideIndex: 2,
+      width: 100,
+      height: 80,
+    } as const;
+    const exact: ChatMessage = {
+      ...locator,
+      text: "用户看到的原始问题",
+      _modelText: "用户看到的原始问题\n[完整模型附件提示]",
+      _media: [{ kind: "image", url: "/api/media/guide.png" }],
+      _retryMedia: [
+        { kind: "image", url: "/api/media/source.png", hidden: true },
+        { kind: "image", url: "/api/media/mask.png", hidden: true },
+        { kind: "image", url: "/api/media/guide.png" },
+      ],
+      _imageEdit: imageEdit,
+      _userPayloadDeferred: undefined,
+      _payloadDeferred: undefined,
+    };
+
+    expect(exactUserReplayPayload(exact)).toMatchObject({
+      text: "用户看到的原始问题\n[完整模型附件提示]",
+      displayText: "用户看到的原始问题",
+      imageEdit,
+    });
+    sock.retryMessage({
+      sessId: "s1",
+      msgId: locator.id,
+      agentId: "main",
+      sourceOverride: exact,
+    });
+
+    const retried = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.message")
+      .at(-1);
+    expect(retried).toMatchObject({
+      model: "gpt-5.6-terra",
+      effortLevel: "max",
+      teamMode: true,
+      content: {
+        text: "用户看到的原始问题\n[完整模型附件提示]",
+        displayText: "用户看到的原始问题",
+        imageEdit,
+      },
+    });
+    expect(retried.content.media).toHaveLength(3);
+    const stored = sock.toStored("s1")!.messages.find((message) => message.id === locator.id)!;
+    expect(stored.text).toBe("");
+    expect(stored._media).toBeUndefined();
+    expect(stored._retryMedia).toBeUndefined();
+    expect(stored._modelText).toBeUndefined();
+    expect(stored._userPayloadDeferred).toBe(true);
+  });
+
   test("optimistic localSrc: 气泡保留本地 blob 即时渲染,出站帧 + 持久化显式剥离", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -2755,6 +2845,55 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const stored = sock.toStored("s1")!;
     expect(stored.messages.find((m) => m.role === "user")?._media).toEqual([
       { kind: "image", url: "/api/media/x.png", filename: "x.png" },
+    ]);
+  });
+
+  test("master user persistence receives the complete replay contract, including hidden image-edit refs", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistUserMessage = vi.fn<NonNullable<ChatSocketDeps["persistUserMessage"]>>();
+    const sock = makeSocket({
+      ensureServerSession: async () => true,
+      persistUserMessage,
+    });
+    sock.setGateReady(true);
+    FakeWS.instances.at(-1)!.open();
+    const imageEdit = {
+      clientJobId: "c".repeat(32),
+      sourceIndex: 0,
+      maskIndex: 1,
+      guideIndex: 2,
+      width: 100,
+      height: 80,
+    } as const;
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "模型正文\n[附件提示]",
+      displayText: "模型正文",
+      media: [
+        { kind: "image", url: "/api/media/source.png", hidden: true },
+        { kind: "image", url: "/api/media/mask.png", hidden: true },
+        { kind: "image", url: "/api/media/guide.png", localSrc: "blob:guide" },
+      ],
+      imageEdit,
+      model: "gpt-5.6-sol",
+      effortLevel: "high",
+      teamMode: true,
+    });
+    await vi.waitFor(() => expect(persistUserMessage).toHaveBeenCalledTimes(1));
+    const persisted = persistUserMessage.mock.calls[0]![1];
+    expect(persisted).toMatchObject({
+      text: "模型正文",
+      _modelText: "模型正文\n[附件提示]",
+      _routing: { model: "gpt-5.6-sol", effortLevel: "high", teamMode: true },
+      _imageEdit: imageEdit,
+      _sendAttempt: 0,
+      media: [{ kind: "image", url: "/api/media/guide.png" }],
+    });
+    expect(persisted._retryMedia).toEqual([
+      { kind: "image", url: "/api/media/source.png", hidden: true },
+      { kind: "image", url: "/api/media/mask.png", hidden: true },
+      { kind: "image", url: "/api/media/guide.png" },
     ]);
   });
 

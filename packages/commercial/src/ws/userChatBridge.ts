@@ -962,6 +962,10 @@ export interface UserChatBridgeDeps {
       text: string;
       ts: number;
       _media?: unknown[];
+      _retryMedia?: unknown[];
+      _imageEdit?: Record<string, unknown>;
+      _modelText?: string;
+      _routing?: { model?: string; teamMode: boolean; effortLevel: string | null };
     },
   ) => Promise<{
     applied: boolean;
@@ -2951,23 +2955,49 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 此处再走 admit/persist 会造成 turn_dispatches 与 queue lifecycle 双权威(权威源分裂)。
       if (persistUserRow && clientMessageId !== null && (useDispatchAdmission || deps.persistMasterUserMessage)) {
         const content = frameObj.content && typeof frameObj.content === "object"
-          ? frameObj.content as { text?: unknown; media?: unknown }
+          ? frameObj.content as {
+              text?: unknown;
+              displayText?: unknown;
+              media?: unknown;
+              imageEdit?: unknown;
+            }
           : {};
         const rawMedia = Array.isArray(content.media) ? content.media : [];
         const persistedMedia = rawMedia.filter((item) =>
           !item || typeof item !== "object" || (item as { hidden?: unknown }).hidden !== true);
+        const modelText = typeof frameObj.content === "string"
+          ? frameObj.content
+          : typeof content.text === "string"
+            ? content.text
+            : "";
+        const displayText = typeof content.displayText === "string"
+          ? content.displayText
+          : modelText;
+        const rawImageEdit = content.imageEdit && typeof content.imageEdit === "object" &&
+          !Array.isArray(content.imageEdit)
+          ? content.imageEdit as Record<string, unknown>
+          : undefined;
+        const routing = {
+          ...(typeof frameObj.model === "string" && frameObj.model !== ""
+            ? { model: frameObj.model }
+            : {}),
+          teamMode: frameObj.teamMode === true,
+          effortLevel: typeof frameObj.effortLevel === "string" || frameObj.effortLevel === null
+            ? frameObj.effortLevel
+            : null,
+        };
         const message = {
           id: clientMessageId,
           role: "user" as const,
-          text: typeof frameObj.content === "string"
-            ? frameObj.content
-            : typeof content.text === "string"
-              ? content.text
-              : "",
+          text: displayText,
           ts: typeof frameObj.ts === "number" && Number.isFinite(frameObj.ts)
             ? frameObj.ts
             : Date.now(),
           ...(persistedMedia.length > 0 ? { _media: persistedMedia } : {}),
+          ...(rawImageEdit && rawMedia.length > 0 ? { _retryMedia: rawMedia } : {}),
+          ...(rawImageEdit ? { _imageEdit: rawImageEdit } : {}),
+          ...(displayText !== modelText ? { _modelText: modelText } : {}),
+          _routing: routing,
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。

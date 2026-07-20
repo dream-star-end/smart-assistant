@@ -6,6 +6,7 @@ import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
 import { MessageRenderer } from "../MessageRenderer";
 import type { CardCallbacks } from "./cards";
+import { ResponseRatingProvider } from "./ResponseRating";
 
 afterEach(cleanup);
 beforeAll(async () => {
@@ -107,7 +108,8 @@ describe("deferred oversized immutable record", () => {
       ts: 1000,
       toolName: "Bash",
       _completed: true,
-    } satisfies ChatMessage]);
+      futureField: { marker: "未来工具字段必须可见" },
+    } as ChatMessage & { futureField: { marker: string } }]);
     renderMsg(deferred, { onFetchTapeRecordPayload });
     await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledWith(
       "tape-1",
@@ -117,7 +119,98 @@ describe("deferred oversized immutable record", () => {
     await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /终端/ }));
     expect(screen.getByText("真实完整输出")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    expect(screen.getByText(/未来工具字段必须可见/)).toBeInTheDocument();
     expect(screen.queryByText(/前 4MB|内容过大|已截断/)).toBeNull();
+  });
+
+  test("loads an oversized user message without requiring tape identity", async () => {
+    const userLocator: ChatMessage = {
+      id: "cm:user:large",
+      role: "user",
+      text: "",
+      ts: 1000,
+      status: "replied",
+      _source: "server",
+      _payloadDeferred: true,
+      _userPayloadDeferred: true,
+      _payloadBytes: 12 * 1024 * 1024,
+      _payloadSha256: "c".repeat(64),
+    };
+    const onFetchUserMessagePayload = vi.fn().mockResolvedValue([{
+      id: "cm:user:large",
+      role: "user",
+      text: "这是用户真实提交的完整超长消息",
+      ts: 1000,
+      status: "sending",
+    } satisfies ChatMessage]);
+    renderMsg(userLocator, { onFetchUserMessagePayload });
+    await waitFor(() => expect(onFetchUserMessagePayload).toHaveBeenCalledWith(
+      "cm:user:large",
+      { recordId: "cm:user:large", role: "user", contentSha256: "c".repeat(64) },
+    ));
+    expect(await screen.findByText("这是用户真实提交的完整超长消息")).toBeInTheDocument();
+    expect(screen.queryByText(/Agent 记录/)).toBeNull();
+  });
+
+  test("deferred final keeps current billing overlays and the final-response rating", async () => {
+    const locator: ChatMessage = {
+      id: "srv-final-large",
+      role: "assistant",
+      text: "",
+      ts: 1000,
+      _source: "server",
+      _turnTapeId: "tape-1",
+      _turnTapeSha256: "sha-1",
+      _recordOrdinal: 9,
+      _payloadDeferred: true,
+      _payloadSha256: "d".repeat(64),
+      usage: { costCredits: "1234" },
+    };
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([{
+      id: "srv-final-large",
+      role: "assistant",
+      text: "真实完整最终回答",
+      ts: 1000,
+      _completed: true,
+      usage: { costCredits: "0", traceId: "trace-1" },
+    } satisfies ChatMessage]);
+    const callbacks = { onFetchTapeRecordPayload };
+    const view = render(
+      <ResponseRatingProvider value={{ ratings: new Map(), submit: () => {} }}>
+        <MessageRenderer
+          message={locator}
+          sig={messageSignature(locator, { isLast: true, sending: false, turnFinalAssistant: true })}
+          isLast
+          sending={false}
+          inActiveTurn
+          turnFinalAssistant
+          cb={callbacks}
+          onRespondPermission={() => {}}
+        />
+      </ResponseRatingProvider>,
+    );
+    expect(await screen.findByText("真实完整最终回答")).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 1234 积分")).toBeInTheDocument();
+    expect(screen.getByText("这条回复怎么样?")).toBeInTheDocument();
+
+    const waived = { ...locator, usage: { costCredits: "1234", waived: true } };
+    view.rerender(
+      <ResponseRatingProvider value={{ ratings: new Map(), submit: () => {} }}>
+        <MessageRenderer
+          message={waived}
+          sig={messageSignature(waived, { isLast: true, sending: false, turnFinalAssistant: true })}
+          isLast
+          sending={false}
+          inActiveTurn
+          turnFinalAssistant
+          cb={callbacks}
+          onRespondPermission={() => {}}
+        />
+      </ResponseRatingProvider>,
+    );
+    expect(await screen.findByLabelText("本轮已免单")).toBeInTheDocument();
+    expect(screen.queryByLabelText("消耗 1234 积分")).toBeNull();
   });
 
   test("transient failure offers retry instead of a permanent placeholder", async () => {

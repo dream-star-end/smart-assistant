@@ -786,6 +786,12 @@
     "handler": "handleAdminGetSession"
   },
   {
+    "method": "HEAD",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/sessions/",
+    "handler": "handleAdminGetSession"
+  },
+  {
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/sessions/",
