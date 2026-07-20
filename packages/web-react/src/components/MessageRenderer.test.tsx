@@ -64,6 +64,37 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(strong.tagName).toBe("STRONG");
   });
 
+  test("已挂载 Bash 卡在相同 totalBytes 的后序 tail 到达时刷新真实正文", () => {
+    const before = mk("tool", {
+      id: "bash-tail-memo",
+      toolName: "Bash",
+      inputJson: { command: "long-running-command" },
+      _completed: true,
+      bashTail: { tail: "旧后台输出", totalBytes: 42, truncatedHead: false },
+    });
+    const view = renderMsg(before);
+    fireEvent.click(screen.getByRole("button", { name: /终端/ }));
+    expect(document.body.textContent).toContain("旧后台输出");
+
+    const after: ChatMessage = {
+      ...before,
+      bashTail: { tail: "新后台输出", totalBytes: 42, truncatedHead: true },
+    };
+    view.rerender(
+      <MessageRenderer
+        message={after}
+        sig={messageSignature(after, { isLast: true, sending: false })}
+        isLast
+        sending={false}
+        inActiveTurn
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(document.body.textContent).not.toContain("旧后台输出");
+    expect(document.body.textContent).toContain("新后台输出");
+  });
+
   test("assistant：超长终态正文逐段挂载且最终字符可达", () => {
     const marker = "EXACT_ASSISTANT_FINAL_MARKER";
     renderMsg(mk("assistant", { text: `${"x".repeat(270_000)}${marker}` }));
@@ -934,6 +965,20 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
       _runtimeSource: "ccb",
       _runtimeEvent: { type: "stream_event", event: { index: i } },
     })) as unknown as ChatMessage[];
+    const bashTails = Array.from({ length: 80 }, (_, i) => ({
+      id: `bash-tail-${i}`,
+      role: "runtime-event",
+      text: "",
+      ts: 210 + i,
+      _runtimeSource: "ccb",
+      _runtimeEvent: {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "tool-visible",
+        tail: `真实后台输出 ${i}`,
+        total_bytes: i + 1,
+      },
+    })) as unknown as ChatMessage[];
     const batchLocator = mk("runtime-event", {
       id: "srv-turn-runtime-batch-0-127-aabbccddeeff",
       text: "",
@@ -957,7 +1002,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
 
     render(
       <MessageList
-        messages={[...visible, ...runtime, batchLocator]}
+        messages={[...visible, ...runtime, ...bashTails, batchLocator]}
         sending={false}
         cb={{ onRegenerate, onFetchTapeRecordPayload }}
         onRespondPermission={() => {}}
@@ -969,6 +1014,7 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(screen.getByText(/已思考/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新生成" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /progress · tool_delta/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /bash_output_tail/ })).toBeNull();
     return waitFor(() => {
       expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(1);
       expect(screen.getByRole("button", { name: /tool_progress/ })).toBeInTheDocument();

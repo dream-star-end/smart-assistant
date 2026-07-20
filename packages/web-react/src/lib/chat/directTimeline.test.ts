@@ -224,6 +224,143 @@ describe("lazy immutable process merge", () => {
     expect(session.messages.find((message) => message.id === "tool-2")?.text).toBe("二");
   });
 
+  test("CCB Bash tail continuation updates loaded tool cards without mutating immutable rows", () => {
+    const { sock, session } = seed();
+    session.messages.push(processControl({
+      id: "turn-process:tape-tail",
+      _turnTapeId: "tape-tail",
+      _turnTapeSha256: "sha-tail",
+      _seq: 6,
+      _orderSeq: 6,
+    }));
+    sock.applyTapeRecordsPage(
+      "s1",
+      "turn-process:tape-1",
+      [
+        srvRow({
+          id: "tool-bg",
+          role: "tool",
+          toolName: "Bash",
+          blockId: "tool-bg",
+          output: "Command running in background with ID: bg-1",
+          _turnTapeOrdinal: 1,
+        }),
+        srvRow({
+          id: "agent-bg",
+          role: "agent-group",
+          childBlocks: [{
+            kind: "tool_use",
+            blockId: "child-bg",
+            toolName: "Bash",
+            output: "Command running in background with ID: bg-2",
+          }],
+          _turnTapeOrdinal: 2,
+        }),
+      ],
+      null,
+    );
+    const originalTool = session.messages.find((message) => message.id === "tool-bg")!;
+    const originalGroup = session.messages.find((message) => message.id === "agent-bg")!;
+
+    const oldTail = srvRow({
+      id: "tail-old",
+      role: "runtime-event",
+      _runtimeSource: "ccb",
+      _runtimeEvent: {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "tool-bg",
+        tail: "旧快照",
+        total_bytes: 42,
+      },
+      _turnTapeOrdinal: 1,
+    });
+    const latestTail = srvRow({
+      id: "tail-latest",
+      role: "runtime-event",
+      _runtimeSource: "ccb",
+      _runtimeEvent: {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "tool-bg",
+        tail: "同字节数但更晚的真实快照",
+        total_bytes: 42,
+        truncated_head: true,
+      },
+      _turnTapeOrdinal: 2,
+    });
+    const childTail = srvRow({
+      id: "tail-child",
+      role: "runtime-event",
+      _runtimeSource: "ccb",
+      _runtimeEvent: {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "child-bg",
+        parent_tool_use_id: "agent-bg",
+        tail: "子 Agent 的真实后台输出",
+        total_bytes: 31,
+      },
+      _turnTapeOrdinal: 3,
+    });
+    sock.applyTapeRecordsPage(
+      "s1",
+      "turn-process:tape-tail",
+      [latestTail, oldTail, childTail],
+      null,
+    );
+
+    expect(originalTool.bashTail).toBeUndefined();
+    expect(originalGroup.childBlocks?.[0]?.bashTail).toBeUndefined();
+    expect(session.messages.find((message) => message.id === "tool-bg")).not.toBe(originalTool);
+    expect(session.messages.find((message) => message.id === "tool-bg")?.bashTail).toEqual({
+      tail: "同字节数但更晚的真实快照",
+      totalBytes: 42,
+      truncatedHead: true,
+    });
+    expect(session.messages.find((message) => message.id === "agent-bg")?.childBlocks?.[0]?.bashTail)
+      .toEqual({ tail: "子 Agent 的真实后台输出", totalBytes: 31, truncatedHead: false });
+    expect(session.messages.find((message) => message.id === "agent-bg")?._runtimeBashTailRevision)
+      .toBe(1);
+    expect(session.messages.find((message) => message.id === "tail-latest")?._runtimeEvent)
+      .toEqual(latestTail._runtimeEvent);
+  });
+
+  test("reverse lazy load reconciles a Bash tail that arrives before its owning tool row", () => {
+    const { sock, session } = seed();
+    const tail = srvRow({
+      id: "tail-first",
+      role: "runtime-event",
+      _runtimeSource: "ccb",
+      _runtimeEvent: {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "tool-later",
+        tail: "先加载的真实尾部",
+        total_bytes: 24,
+      },
+      _turnTapeOrdinal: 2,
+    });
+    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tail], 1);
+    expect(session.messages.find((message) => message.id === "tail-first")).toBeDefined();
+
+    const tool = srvRow({
+      id: "tool-later",
+      role: "tool",
+      toolName: "Bash",
+      blockId: "tool-later",
+      _turnTapeOrdinal: 1,
+    });
+    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tool], null);
+
+    expect(tool.bashTail).toBeUndefined();
+    expect(session.messages.find((message) => message.id === "tool-later")?.bashTail).toEqual({
+      tail: "先加载的真实尾部",
+      totalBytes: 24,
+      truncatedHead: false,
+    });
+  });
+
   test("lazy page merge keeps a local permission card before its real terminal answer", () => {
     const { sock, session } = seed();
     const finalIndex = session.messages.findIndex((message) => message.id === "srv-a-t1");
