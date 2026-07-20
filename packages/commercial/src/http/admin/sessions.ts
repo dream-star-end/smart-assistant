@@ -180,8 +180,13 @@ export function parseArchivePagingParams(url: URL): { before: number; limit: num
   return { before, limit };
 }
 
-export function parseTapePagingParams(url: URL): { cursor: number; limit: number } {
+export function parseTapePagingParams(url: URL): {
+  cursor: number;
+  limit: number;
+  before?: number | null;
+} {
   const cursorRaw = url.searchParams.get("cursor");
+  const beforeRaw = url.searchParams.get("before");
   const limitRaw = url.searchParams.get("limit");
   let cursor = 0;
   let limit = 200;
@@ -203,7 +208,20 @@ export function parseTapePagingParams(url: URL): { cursor: number; limit: number
     }
     limit = parsed;
   }
-  return { cursor, limit };
+  let before: number | null | undefined;
+  if (beforeRaw !== null) {
+    if (beforeRaw === "tail") before = null;
+    else {
+      const parsed = Number(beforeRaw);
+      if (!/^[1-9][0-9]*$/.test(beforeRaw) || !Number.isSafeInteger(parsed)) {
+        throw new HttpError(400, "VALIDATION", "before must be tail or a positive safe integer", {
+          issues: [{ path: "before", message: beforeRaw }],
+        });
+      }
+      before = parsed;
+    }
+  }
+  return { cursor, limit, ...(beforeRaw !== null ? { before } : {}) };
 }
 
 function scopedSessionUserId(url: URL): { rawUserId?: string; scopedUserId?: string } {
@@ -304,8 +322,8 @@ export async function handleAdminGetSession(
   if (route.kind === "tape-records") {
     const session = await getClientSession(sessionId, scopedUserId, { view: "timeline" });
     if (!session) throw new HttpError(404, "NOT_FOUND", "session not found");
-    const { cursor, limit } = parseTapePagingParams(url);
-    const page = await listTurnTapeRecords(sessionId, session.userId, route.tapeId, cursor, limit);
+    const { cursor, limit, before } = parseTapePagingParams(url);
+    const page = await listTurnTapeRecords(sessionId, session.userId, route.tapeId, cursor, limit, before);
     if (!page) throw new HttpError(404, "NOT_FOUND", "turn tape not found");
     await writeAdminAudit(getPool(), {
       adminId: admin.id,

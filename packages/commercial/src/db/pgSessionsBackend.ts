@@ -3476,6 +3476,109 @@ function deferredTapeRecord(
   };
 }
 
+type DirectTapePageHead = {
+  msg_id: string;
+  ordinal: number;
+  role: string;
+  ts: string;
+  content_sha256: string;
+  payload_bytes: string;
+  visible_content_sha256: string | null;
+};
+
+/** Hydrate a selected physical page without changing its paging direction.
+ * The returned logical rows are always in ascending immutable ordinal order. */
+async function hydrateDirectTapePage(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  tapeSha256: string,
+  billingAnchorId: string,
+  heads: DirectTapePageHead[],
+): Promise<MessageLike[]> {
+  const deferred = heads.filter((head) =>
+    bigIntNum(head.payload_bytes, "turn tape record payload bytes") > TAPE_RECORD_INLINE_QUANTUM_BYTES);
+  const planned = heads.filter((head) =>
+    bigIntNum(head.payload_bytes, "turn tape record payload bytes") <= TAPE_RECORD_INLINE_QUANTUM_BYTES);
+  const records: MessageLike[] = deferred.map((head) => deferredTapeRecord(
+    tapeId,
+    tapeSha256,
+    { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
+    bigIntNum(head.payload_bytes, "turn tape record payload bytes"),
+  ));
+
+  if (planned.length > 0) {
+    const payloadRows = (
+      await pool.query<DirectTapeSourceRecord>(
+        `SELECT msg_id, ordinal, role, content_sha256, payload,
+                visible_payload, visible_content_sha256
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=ANY($4::int[])
+          ORDER BY ordinal`,
+        [sessionId, userId, tapeId, planned.map((head) => head.ordinal)],
+      )
+    ).rows;
+    const payloadByOrdinal = new Map(payloadRows.map((row) => [row.ordinal, row]));
+    for (const head of planned) {
+      const source = payloadByOrdinal.get(head.ordinal);
+      if (!source) throw new Error(`[pgSessions] direct tape record missing: ${tapeId}\0${head.ordinal}`);
+      let bytes: Buffer;
+      if (source.visible_payload !== null) {
+        bytes = Buffer.from(source.visible_payload);
+        if (sha256Bytes(bytes) !== source.visible_content_sha256) {
+          throw new Error(`[pgSessions] visible tape payload hash mismatch: ${tapeId}\0${head.ordinal}`);
+        }
+      } else {
+        const visible = userVisiblePhysicalPayload({
+          tape_id: tapeId,
+          tape_sha256: tapeSha256,
+          waive_reason: null,
+          waiver_applied: false,
+          msg_id: source.msg_id,
+          ordinal: source.ordinal,
+          role: source.role,
+          content_sha256: source.content_sha256,
+          payload: Buffer.from(source.payload),
+          cost_credits: "0",
+          delegate_costs: [],
+        }, tapeSha256, billingAnchorId);
+        if (!visible) {
+          throw new Error(`[pgSessions] direct tape record is not a JSON object: ${tapeId}\0${head.ordinal}`);
+        }
+        bytes = visible.bytes;
+      }
+      const message = JSON.parse(bytes.toString("utf8")) as MessageLike;
+      const expanded = expandHydratedRuntimeBatch(
+        message,
+        {
+          tape_id: tapeId,
+          tape_sha256: tapeSha256,
+          waive_reason: null,
+          waiver_applied: false,
+          msg_id: source.msg_id,
+          ordinal: source.ordinal,
+          role: source.role,
+          content_sha256: source.content_sha256,
+          payload: source.payload,
+          cost_credits: "0",
+          delegate_costs: [],
+        },
+        { id: billingAnchorId, _turnTapeSha256: tapeSha256 },
+      ).messages;
+      for (const logical of expanded) {
+        logical._recordOrdinal = head.ordinal;
+        records.push(logical);
+      }
+    }
+  }
+
+  records.sort((a, b) =>
+    (typeof a._recordOrdinal === "number" ? a._recordOrdinal : Number.MAX_SAFE_INTEGER) -
+    (typeof b._recordOrdinal === "number" ? b._recordOrdinal : Number.MAX_SAFE_INTEGER));
+  return records;
+}
+
 /** Physical-ordinal cursor paging over the immutable tape. The separately
  * rendered billing anchor is the only excluded row; every other role is
  * returned, with known platform-private fields removed but no semantic
@@ -3487,6 +3590,7 @@ async function listTurnTapeRecordsImpl(
   tapeId: string,
   cursor: number,
   limit: number,
+  before?: number | null,
 ): Promise<{
   records: MessageLike[];
   nextCursor: number | null;
@@ -3520,15 +3624,65 @@ async function listTurnTapeRecordsImpl(
     TAPE_RECORD_PAGE_MAX_ROWS,
     Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : TAPE_RECORD_PAGE_MAX_ROWS,
   ));
-  type Head = {
-    msg_id: string;
-    ordinal: number;
-    role: string;
-    ts: string;
-    content_sha256: string;
-    payload_bytes: string;
-    visible_content_sha256: string | null;
-  };
+  const total = Math.max(
+    0,
+    bigIntNum(header.logical_record_count, "turn tape record total") - 1,
+  );
+
+  // Reverse/before is an additive browser-tail path. The legacy cursor path
+  // below remains byte-for-byte forward compatible for admin and rolling web
+  // clients during deploy convergence.
+  if (before !== undefined) {
+    const upper = Number.isSafeInteger(before) && (before ?? 0) > 0 ? before : null;
+    const heads = (
+      await pool.query<DirectTapePageHead>(
+        `SELECT msg_id, ordinal, role, ts::text, content_sha256,
+                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,
+                visible_content_sha256
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            AND ($4::integer IS NULL OR ordinal < $4)
+            AND msg_id<>$5
+          ORDER BY ordinal DESC
+          LIMIT $6`,
+        [sessionId, userId, tapeId, upper, header.billing_anchor_id, cappedLimit + 1],
+      )
+    ).rows;
+    const selected: DirectTapePageHead[] = [];
+    let pageRawBytes = 0;
+    let hasMore = false;
+    for (const head of heads) {
+      if (selected.length >= cappedLimit) {
+        hasMore = true;
+        break;
+      }
+      const payloadBytes = bigIntNum(head.payload_bytes, "turn tape record payload bytes");
+      const inlineBytes = payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES ? 0 : payloadBytes;
+      if (selected.length > 0 && pageRawBytes + inlineBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES) {
+        hasMore = true;
+        break;
+      }
+      selected.push(head);
+      pageRawBytes += inlineBytes;
+    }
+    const records = await hydrateDirectTapePage(
+      pool,
+      sessionId,
+      userId,
+      tapeId,
+      header.tape_sha256,
+      header.billing_anchor_id,
+      selected,
+    );
+    return {
+      records,
+      nextCursor: hasMore && selected.length > 0
+        ? Math.min(...selected.map((head) => head.ordinal))
+        : null,
+      total,
+    };
+  }
+
   let rawBytes = 0;
   let nextCursor: number | null = null;
   const records: MessageLike[] = [];
@@ -3536,7 +3690,7 @@ async function listTurnTapeRecordsImpl(
   let exhausted = false;
   while (records.length < cappedLimit && !exhausted && nextCursor === null) {
     const heads = (
-      await pool.query<Head>(
+      await pool.query<DirectTapePageHead>(
         `SELECT msg_id, ordinal, role, ts::text, content_sha256,
                 COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,
                 visible_content_sha256
@@ -3553,110 +3707,38 @@ async function listTurnTapeRecordsImpl(
       break;
     }
 
-    const planned: Array<Head & { payloadBytes: number }> = [];
-    const deferred: Array<Head & { payloadBytes: number }> = [];
-    const batchRecords: MessageLike[] = [];
+    const selected: DirectTapePageHead[] = [];
     for (const head of heads) {
-      if (records.length + planned.length + deferred.length >= cappedLimit) {
+      if (records.length + selected.length >= cappedLimit) {
         nextCursor = head.ordinal;
         break;
       }
       const payloadBytes = bigIntNum(head.payload_bytes, "turn tape record payload bytes");
       if (payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES) {
-        deferred.push({ ...head, payloadBytes });
+        selected.push(head);
         scanCursor = head.ordinal + 1;
         continue;
       }
       if (
-        records.length + planned.length + deferred.length > 0 &&
+        records.length + selected.length > 0 &&
         rawBytes + payloadBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES
       ) {
         nextCursor = head.ordinal;
         break;
       }
-      planned.push({ ...head, payloadBytes });
+      selected.push(head);
       rawBytes += payloadBytes;
       scanCursor = head.ordinal + 1;
     }
-
-    for (const head of deferred) {
-      batchRecords.push(deferredTapeRecord(
-        tapeId,
-        header.tape_sha256,
-        { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
-        head.payloadBytes,
-      ));
-    }
-
-    if (planned.length > 0) {
-      const payloadRows = (
-        await pool.query<DirectTapeSourceRecord>(
-          `SELECT msg_id, ordinal, role, content_sha256, payload,
-                  visible_payload, visible_content_sha256
-             FROM client_session_turn_tape_records
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=ANY($4::int[])
-            ORDER BY ordinal`,
-          [sessionId, userId, tapeId, planned.map((head) => head.ordinal)],
-        )
-      ).rows;
-      const payloadByOrdinal = new Map(payloadRows.map((row) => [row.ordinal, row]));
-      for (const head of planned) {
-        const source = payloadByOrdinal.get(head.ordinal);
-        if (!source) throw new Error(`[pgSessions] direct tape record missing: ${tapeId}\0${head.ordinal}`);
-        let bytes: Buffer;
-        if (source.visible_payload !== null) {
-          bytes = Buffer.from(source.visible_payload);
-          if (sha256Bytes(bytes) !== source.visible_content_sha256) {
-            throw new Error(`[pgSessions] visible tape payload hash mismatch: ${tapeId}\0${head.ordinal}`);
-          }
-        } else {
-          const visible = userVisiblePhysicalPayload({
-            tape_id: tapeId,
-            tape_sha256: header.tape_sha256,
-            waive_reason: null,
-            waiver_applied: false,
-            msg_id: source.msg_id,
-            ordinal: source.ordinal,
-            role: source.role,
-            content_sha256: source.content_sha256,
-            payload: Buffer.from(source.payload),
-            cost_credits: "0",
-            delegate_costs: [],
-          }, header.tape_sha256, header.billing_anchor_id);
-          if (!visible) {
-            throw new Error(`[pgSessions] direct tape record is not a JSON object: ${tapeId}\0${head.ordinal}`);
-          }
-          bytes = visible.bytes;
-        }
-        const message = JSON.parse(bytes.toString("utf8")) as MessageLike;
-        const expanded = expandHydratedRuntimeBatch(
-          message,
-          {
-            tape_id: tapeId,
-            tape_sha256: header.tape_sha256,
-            waive_reason: null,
-            waiver_applied: false,
-            msg_id: source.msg_id,
-            ordinal: source.ordinal,
-            role: source.role,
-            content_sha256: source.content_sha256,
-            payload: source.payload,
-            cost_credits: "0",
-            delegate_costs: [],
-          },
-          { id: header.billing_anchor_id, _turnTapeSha256: header.tape_sha256 },
-        ).messages;
-        for (const logical of expanded) {
-          logical._recordOrdinal = head.ordinal;
-          batchRecords.push(logical);
-        }
-      }
-    }
-
-    batchRecords.sort((a, b) =>
-      (typeof a._recordOrdinal === "number" ? a._recordOrdinal : Number.MAX_SAFE_INTEGER) -
-      (typeof b._recordOrdinal === "number" ? b._recordOrdinal : Number.MAX_SAFE_INTEGER));
-    records.push(...batchRecords);
+    records.push(...await hydrateDirectTapePage(
+      pool,
+      sessionId,
+      userId,
+      tapeId,
+      header.tape_sha256,
+      header.billing_anchor_id,
+      selected,
+    ));
 
     if (nextCursor !== null) break;
     if (heads.length <= cappedLimit) exhausted = true;
@@ -3664,10 +3746,7 @@ async function listTurnTapeRecordsImpl(
   return {
     records,
     nextCursor,
-    total: Math.max(
-      0,
-      bigIntNum(header.logical_record_count, "turn tape record total") - 1,
-    ),
+    total,
   };
 }
 
@@ -5854,12 +5933,13 @@ export function createPgSessionsBackend(
       tapeId: string,
       cursor: number,
       limit: number,
+      before?: number | null,
     ): Promise<{
       records: MessageLike[];
       nextCursor: number | null;
       total: number;
     } | null> {
-      return listTurnTapeRecordsImpl(pool, sessionId, userId, tapeId, cursor, limit);
+      return listTurnTapeRecordsImpl(pool, sessionId, userId, tapeId, cursor, limit, before);
     },
 
     async readTapeRecordPayload(

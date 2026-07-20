@@ -114,7 +114,7 @@ describe("adminGet", () => {
 });
 
 describe("adminGetExactPayload", () => {
-  test("admin scope 复用 HEAD + Range 精确读取并保留查询参数", async () => {
+  test("admin scope 复用 one-byte Range + 分块读取并保留查询参数", async () => {
     const { adminGetExactPayload } = await loadAdminApi();
     // User API coverage already exercises multi-range reconstruction. Keep the
     // admin authorization-path case small so jsdom is not dominated by Blob IO.
@@ -122,18 +122,6 @@ describe("adminGetExactPayload", () => {
     const hash = "a".repeat(64);
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       expect(url).toBe("/api/admin/sessions/web-1/messages/cm%3A1/payload?user_id=1");
-      if (init?.method === "HEAD") {
-        return new Response(null, {
-          status: 200,
-          headers: {
-            "content-length": String(source.length),
-            "accept-ranges": "bytes",
-            "x-openclaude-content-sha256": hash,
-            "x-openclaude-record-id": "cm:1",
-            "x-openclaude-record-role": "user",
-          },
-        });
-      }
       const range = new Headers(init?.headers).get("range")!;
       const match = /^bytes=(\d+)-(\d+)$/.exec(range)!;
       const start = Number(match[1]);

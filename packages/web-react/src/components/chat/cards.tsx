@@ -6,12 +6,10 @@
 import {
   AlertTriangle,
   Brain,
-  ChevronDown,
   ChevronRight,
   ChevronUp,
   Check,
   Copy,
-  FileText,
   Info,
   ListTodo,
   RotateCcw,
@@ -25,14 +23,13 @@ import {
   Wallet,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
   childSignature,
   defaultCollapsed,
   errorPresentation,
-  formatTapeBytes,
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
@@ -76,16 +73,12 @@ export type CardCallbacks = {
   onFeedback?: (ctx: FeedbackContext) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
-  /**
-   * 展开一轮真实 Agent 过程：按物理 ordinal 拉一页 immutable tape 记录。
-   */
-  onExpandTape?: (
+  /** 视口到达一轮真实过程的顶部时，按 exclusive before 拉一页更早 immutable records。 */
+  onLoadOlderTape?: (
     anchorId: string,
     tapeId: string,
-    cursor: number | null,
+    before: number | null,
   ) => Promise<{ ok: boolean; nextCursor?: number | null; error?: boolean; busy?: boolean }>;
-  /** 收起已加载过程(纯本地,下次可重新按页读取)。 */
-  onCollapseTape?: (anchorId: string) => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
   onFetchTapeRecordPayload?: (
     tapeId: string,
@@ -354,92 +347,140 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
   );
 }
 
-// ═══════════════ 真实 Agent 过程惰性入口 ═══════════════
-/**
- * 正文不经过本卡：真实 final assistant 由会话首读直接显示。本卡只在用户需要时
- * 分页读取思考、工具、委派和原始运行事件；分页批次不是总量上限。
- */
+// ═══════════════ 真实 Agent 过程向上惰性加载哨兵 ═══════════════
+/** 默认时间线直接渲染真实思考、工具、委派和运行事件。这个零内容哨兵只负责
+ * 从 tape 尾页开始向前取更早的 immutable records；它不是 Agent 内容或摘要卡。 */
 export function TurnProcessCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
-  const expanded = msg._turnTapeProcessExpanded === true;
-  const hasMore = typeof msg._turnTapeProcessCursor === "number"; // number 游标=还有下一页;null/undefined=已拉全
-  const sizeLabel = formatTapeBytes(msg._turnTapeTotalBytes);
-  const count = msg._turnTapeProcessCount ?? 0;
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const loadingRef = useRef(false);
+  const armedRef = useRef(true);
+  const requestedCursorRef = useRef<string | null>(null);
+  const controlStateRef = useRef({ id: msg.id, tapeId: msg._turnTapeId, initialized: false });
+  const scrollAnchorRef = useRef<{
+    element: HTMLElement;
+    height: number;
+    top: number;
+  } | null>(null);
+  const loadRef = useRef<(manual?: boolean) => void>(() => {});
+  const initialized = msg._turnTapeProcessExpanded === true;
+  const before = initialized && typeof msg._turnTapeProcessCursor === "number"
+    ? msg._turnTapeProcessCursor
+    : null;
+  const complete = initialized && msg._turnTapeProcessCursor === null;
   const tapeId = msg._turnTapeId;
-  const canExpand = !!cb.onExpandTape && typeof tapeId === "string" && tapeId.length > 0;
+  const canLoad = !!cb.onLoadOlderTape && typeof tapeId === "string" && tapeId.length > 0;
 
-  const doExpand = async (cursor: number | null) => {
-    if (!cb.onExpandTape || !tapeId || loading) return;
+  const loadPage = async (manual = false) => {
+    if (!cb.onLoadOlderTape || !tapeId || complete || loadingRef.current) return;
+    const cursorKey = initialized ? String(before) : "tail";
+    if (!manual && requestedCursorRef.current === cursorKey) return;
+    requestedCursorRef.current = cursorKey;
+    loadingRef.current = true;
     setLoading(true);
     setError(false);
+    const scroller = sentinelRef.current?.closest<HTMLElement>(".chat-scroll-area");
+    if (scroller) {
+      scrollAnchorRef.current = {
+        element: scroller,
+        height: scroller.scrollHeight,
+        top: scroller.scrollTop,
+      };
+    }
     try {
-      const res = await cb.onExpandTape(msg.id, tapeId, cursor);
-      if (!res.ok && res.error) setError(true);
+      const res = await cb.onLoadOlderTape(msg.id, tapeId, before);
+      if (!res.ok) {
+        requestedCursorRef.current = null;
+        scrollAnchorRef.current = null;
+        if (res.error) setError(true);
+      }
     } catch {
+      requestedCursorRef.current = null;
+      scrollAnchorRef.current = null;
       setError(true);
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   };
+  loadRef.current = (manual = false) => { void loadPage(manual); };
 
-  if (!expanded) {
-    return (
-      <div className="animate-in" data-testid="turn-process-card">
-        <button
-          type="button"
-          onClick={() => void doExpand(null)}
-          disabled={loading || !canExpand}
-          aria-busy={loading}
-          className={cn(
-            "flex w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3.5 py-2.5 text-left text-[13px] transition-colors",
-            canExpand && !loading ? "cursor-pointer hover:bg-hover" : "cursor-default",
-          )}
-        >
-          <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-hover text-muted">
-            {loading ? <Spinner size={13} /> : <FileText size={13} />}
-          </span>
-          <span className="min-w-0 flex-1 text-fg/90">
-            {loading
-              ? "正在读取真实调用记录…"
-              : error
-                ? "加载失败，点击重试"
-                : `Agent 调用过程${count > 0 ? `（${count} 条）` : ""}${canExpand ? "，点击展开" : ""}`}
-          </span>
-          {!loading && canExpand && <ChevronDown size={15} className="shrink-0 text-faint" />}
-        </button>
-      </div>
-    );
-  }
+  // A history-revision reset reuses the same keyed control component after
+  // removing its loaded rows/cursor. Re-arm that fresh view generation so the
+  // tail loads automatically again instead of being blocked by stale refs from
+  // the prior completed generation.
+  useEffect(() => {
+    const previous = controlStateRef.current;
+    if (
+      previous.id !== msg.id || previous.tapeId !== tapeId ||
+      (previous.initialized && !initialized)
+    ) {
+      armedRef.current = true;
+      requestedCursorRef.current = null;
+    }
+    controlStateRef.current = { id: msg.id, tapeId, initialized };
+  }, [initialized, msg.id, tapeId]);
 
-  // 展开态分节头；真实记录由 MessageList 作为独立卡按原顺序渲染。
+  // Observer lifecycle is independent of cursor/loading. After one trigger it
+  // must observe a real exit before it can arm again, so a cursor re-render can
+  // never cascade through the whole tape while the sentinel stays visible.
+  useEffect(() => {
+    const node = sentinelRef.current;
+    if (!node || !canLoad || complete) return;
+    if (typeof IntersectionObserver === "undefined") {
+      loadRef.current(false);
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      const intersecting = entries.some((entry) => entry.isIntersecting);
+      if (!intersecting) {
+        armedRef.current = true;
+        return;
+      }
+      if (!armedRef.current) return;
+      armedRef.current = false;
+      loadRef.current(false);
+    }, { rootMargin: "240px 0px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [canLoad, complete, initialized, msg.id, tapeId]);
+
+  // Loading an older page inserts rows before the previously visible page.
+  // Preserve the user's viewport by the same height-delta rule used by archive
+  // pagination; the sentinel then genuinely exits and may re-arm later.
+  useLayoutEffect(() => {
+    const anchor = scrollAnchorRef.current;
+    if (!anchor) return;
+    if (anchor.element.scrollHeight > anchor.height) {
+      anchor.element.scrollTop = anchor.top + (anchor.element.scrollHeight - anchor.height);
+      scrollAnchorRef.current = null;
+    }
+  }, [initialized, msg._turnTapeProcessCursor]);
+
+  if (complete) return null;
+
   return (
-    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-border bg-hover/40 px-3.5 py-2 text-xs text-muted">
-      <FileText size={13} className="shrink-0" />
-      <span className="min-w-0">
-        Agent 调用过程 · 已展开{sizeLabel ? ` · ${sizeLabel}` : ""}
-      </span>
-      {hasMore && (
-        <Button
-          size="sm"
-          variant="secondary"
-          shape="pill"
-          onClick={() => void doExpand(msg._turnTapeProcessCursor ?? null)}
-          disabled={loading}
-        >
-          {loading ? <Spinner size={12} /> : "继续加载更多"}
-        </Button>
-      )}
-      {cb.onCollapseTape && (
-        <button
-          type="button"
-          onClick={() => cb.onCollapseTape?.(msg.id)}
-          className="ml-auto rounded-full px-2 py-0.5 text-muted hover:text-fg [@media(hover:none)]:min-h-9 [@media(hover:none)]:py-2"
-        >
-          收起
+    <div
+      ref={sentinelRef}
+      className="flex min-h-8 items-center justify-center py-1 text-xs text-muted"
+      data-testid="turn-process-loader"
+    >
+      {loading ? (
+        <span className="inline-flex items-center gap-1.5" role="status">
+          <Spinner size={12} /> 正在加载真实记录…
+        </span>
+      ) : error ? (
+        <button type="button" className="text-danger" onClick={() => loadRef.current(true)}>
+          更早记录加载失败，点击重试
         </button>
+      ) : canLoad ? (
+        <button type="button" className="text-faint hover:text-muted" onClick={() => loadRef.current(true)}>
+          向上滚动加载更早记录
+        </button>
+      ) : (
+        <span className="text-danger">真实记录暂时无法读取</span>
       )}
-      {error && <span className="basis-full text-[11px] text-danger">加载失败，请重试。</span>}
     </div>
   );
 }

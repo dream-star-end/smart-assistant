@@ -2844,6 +2844,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         : typeof frameContent?.text === "string"
           ? frameContent.text
           : "";
+      const sendAdmissionAck = (): void => {
+        if (clientMessageId === null) return;
+        const idempotencyKey = typeof frameObj.idempotencyKey === "string"
+          ? frameObj.idempotencyKey
+          : undefined;
+        try {
+          userWs.send(JSON.stringify({
+            type: "outbound.ack",
+            admitted: true,
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+            peer: { id: peerId, kind: "dm" },
+            clientMessageId,
+          }));
+        } catch { /* durable admission remains replayable */ }
+      };
 
       // The browser's optimistic POST is intentionally not a dispatch gate.
       // Make the server-side ordering invariant explicit here instead: the
@@ -3071,6 +3086,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 admittedThisFrame = null;
                 return null;
               }
+              // Browser may clear its exact replay journal only after this
+              // transaction-backed admission boundary, never after ws.send().
+              sendAdmissionAck();
               // R5 note:heartbeat 只在确认连接存活后才起 —— finalCleanup 已跑过的话,此刻新建的
               // interval 无人清理,会把整个 bridge 闭包钉在内存里。顺序=登记→cleaned→heartbeat。
               ensureDispatchHeartbeat();
@@ -3104,10 +3122,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             case "already_owned":
             case "in_flight":
-              sendErrorFrame(
-                userWs, "TURN_BUSY", "previous turn still in progress",
-                { peerId, clientMessageId },
-              );
+              // Exact same logical turn is already durable. Treat a browser
+              // reload/reconnect replay as admitted instead of a visible busy
+              // error; the existing owner/recovery path remains authoritative.
+              sendAdmissionAck();
               return null;
             case "previously_failed":
               sendErrorFrame(

@@ -493,8 +493,17 @@ function mergeDelegateProgressIntoGroup(sess: ChatSession, groupMsg: ChatMessage
   return true;
 }
 
+/** Viewport-loaded immutable tape rows are historical evidence, not live UI
+ * state. Normalizers may operate around them but must never rewrite or remove
+ * the rows themselves. */
+function isImmutableTapeViewportRow(message: ChatMessage): boolean {
+  return typeof message._turnTapeProcessLoadedFrom === "string" &&
+    message._turnTapeProcessLoadedFrom.length > 0;
+}
+
 function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): boolean {
   if (groupMsg.role !== "agent-group" || !groupMsg._delegate || progress.role !== "delegate-progress") return false;
+  if (isImmutableTapeViewportRow(progress)) return false;
   // live progress 只绑本地富卡,不落到 server 骨架行(债A：骨架行无过程树,不接收 childBlocks)。
   if (isServerAuthoredRow(groupMsg)) return false;
   if (progress.runId && groupMsg._delegateRunId === progress.runId) return true;
@@ -553,11 +562,14 @@ function adoptStandaloneDelegateRun(sess: ChatSession, groupMsg: ChatMessage): b
 }
 
 function normalizeDelegateToolRow(sess: ChatSession, msg: ChatMessage): boolean {
+  if (isImmutableTapeViewportRow(msg)) return false;
   if (msg.role !== "tool") return false;
   const info = parseDelegateToolInfo(msg.toolName, msg.inputJson, msg.inputPreview);
   if (!info) return false;
   const existingGroup = msg.blockId
-    ? sess.messages.find((m) => m !== msg && m.role === "agent-group" && m.blockId === msg.blockId)
+    ? sess.messages.find((m) =>
+        m !== msg && m.role === "agent-group" && m.blockId === msg.blockId &&
+        !isImmutableTapeViewportRow(m))
     : null;
   if (existingGroup) {
     if (existingGroup._source !== "server" && !existingGroup._turnOwnerId) {
@@ -621,6 +633,7 @@ function foldServerAuthoredAgentGroups(sess: ChatSession): boolean {
   let changed = false;
   for (const m of [...sess.messages]) {
     if (m.role !== "agent-group" || !isServerAuthoredRow(m)) continue;
+    if (isImmutableTapeViewportRow(m)) continue;
     const rid = agentGroupRunId(m);
     if (!rid) continue;
     if (localRichRunIds.has(rid) || seenServerRunIds.has(rid)) {
@@ -641,6 +654,7 @@ export function normalizeDelegateCards(sess: ChatSession): void {
   let changed = false;
   for (const msg of [...sess.messages]) changed = normalizeDelegateToolRow(sess, msg) || changed;
   for (const progress of [...sess.messages]) {
+    if (isImmutableTapeViewportRow(progress)) continue;
     if (progress.role !== "delegate-progress" || progress._adoptedInto) continue;
     const group = findSingleMatchingDelegateGroup(sess, progress);
     if (group) changed = mergeDelegateProgressIntoGroup(sess, group, progress) || changed;
@@ -654,7 +668,10 @@ export function normalizeDelegateCards(sess: ChatSession): void {
   rebuildIndexes(sess);
   sess._delegateRunGroups = new Map();
   for (const msg of sess.messages) {
-    if (msg.role === "agent-group" && msg._delegateRunId) {
+    if (
+      msg.role === "agent-group" && msg._delegateRunId &&
+      !isImmutableTapeViewportRow(msg)
+    ) {
       sess._delegateRunGroups.set(msg._delegateRunId, msg.id);
     }
   }
@@ -693,6 +710,7 @@ export function normalizeGoalCards(sess: ChatSession): void {
   const anchor = new Map<string, ChatMessage>();
   const winner = new Map<string, ChatMessage>();
   for (const msg of sess.messages) {
+    if (isImmutableTapeViewportRow(msg)) continue;
     const identity = goalCardIdentity(msg);
     if (!identity) continue;
     if (!anchor.has(identity)) anchor.set(identity, msg);
@@ -704,6 +722,7 @@ export function normalizeGoalCards(sess: ChatSession): void {
   let changed = false;
   const remove = new Set<ChatMessage>();
   for (const msg of sess.messages) {
+    if (isImmutableTapeViewportRow(msg)) continue;
     const identity = goalCardIdentity(msg);
     if (!identity) continue;
     const slot = anchor.get(identity)!;
@@ -798,7 +817,9 @@ function handleDelegateProgressBlock(
 
   // ── 兜底 ── 已持久化的 standalone delegate-progress 行(旧会话 / 尚未被 adopt)按 runId 继续原地更新。
   const legacy =
-    sess.messages.find((m) => m.role === "delegate-progress" && m.runId === block.runId && !m._adoptedInto) || null;
+    sess.messages.find((m) =>
+      m.role === "delegate-progress" && m.runId === block.runId && !m._adoptedInto &&
+      !isImmutableTapeViewportRow(m)) || null;
 
   // fan-out 成员:队长本轮调用的是复数 `delegate_tasks`(tool 卡不转组、无 per-subtask delegate_task
   // tool_use 可 adopt),直接把该 run 物化成 live agent-group —— 同轮 ≥2 个自动聚成 TeamPanel,turn 末
@@ -889,7 +910,10 @@ function planMessageId(blockId: unknown, turnStart: number): string {
 function findPlanInRange(messages: ChatMessage[], blockId: string, start: number, end: number): ChatMessage | null {
   for (let i = Math.max(0, start); i < Math.min(end, messages.length); i++) {
     const m = messages[i];
-    if (m && m.role === "plan" && m.blockId === blockId) return m;
+    if (
+      m && m.role === "plan" && m.blockId === blockId &&
+      !isImmutableTapeViewportRow(m)
+    ) return m;
   }
   return null;
 }
@@ -1258,6 +1282,11 @@ export function applyOutboundMessage(
       // 无独立 rAF buffer，直接清指针即可（渲染节流在订阅侧批量 notify）。
       sess._streamingThinking = null;
       if (!sess._streamingAssistant) {
+        if (
+          b.messageId && sess.messages.some((message) =>
+            message.id === b.messageId && message.role === "assistant" &&
+            isImmutableTapeViewportRow(message))
+        ) continue;
         sess._streamingAssistant = findOrCreateStreamingRow(
           sess.messages,
           "assistant",
@@ -1275,6 +1304,11 @@ export function applyOutboundMessage(
       sess._streamingAssistant.completedAt = Date.now();
     } else if (b.kind === "thinking") {
       if (!sess._streamingThinking) {
+        if (
+          b.messageId && sess.messages.some((message) =>
+            message.id === b.messageId && message.role === "thinking" &&
+            isImmutableTapeViewportRow(message))
+        ) continue;
         sess._streamingThinking = findOrCreateStreamingRow(
           sess.messages,
           "thinking",
@@ -1647,6 +1681,7 @@ export function applyOutboundMessage(
     if (truncatedReason && sess._streamingAssistant?.text) sess._streamingAssistant._truncated = truncatedReason;
     // finalize plan / tool 卡。
     for (const m of sess.messages) {
+      if (isImmutableTapeViewportRow(m)) continue;
       if (m.role === "plan" && m._partial) {
         m._partial = false;
         m.completedAt = Date.now();
@@ -1973,7 +2008,8 @@ export function applyPermissionRequest(sess: ChatSession, frame: OutboundPermiss
 
 export function applyPermissionSettled(sess: ChatSession, frame: OutboundPermissionSettledWire): void {
   if (!acceptFrameSeq(sess, frame)) return;
-  const msg = sess.messages.find((m) => m.requestId === frame.requestId);
+  const msg = sess.messages.find((m) =>
+    m.requestId === frame.requestId && !isImmutableTapeViewportRow(m));
   if (!msg) return;
   msg._resolved = true;
   msg._behavior = frame.behavior;

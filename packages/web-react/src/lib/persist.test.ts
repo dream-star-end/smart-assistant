@@ -22,7 +22,7 @@ function msg(id: string, text = ""): ChatMessage {
 }
 
 // ─── 最小内存 IDBFactory（仅覆盖 IdbKV 用到的窄 API） ────────────────────────
-function fakeIDBFactory(): IDBFactory {
+function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
   type Entry = { stores: Map<string, Map<string, unknown>> };
   const dbs = new Map<string, Entry>();
   // biome-ignore lint/suspicious/noExplicitAny: 测试桩，刻意松散
@@ -30,27 +30,29 @@ function fakeIDBFactory(): IDBFactory {
     const h = o[`on${ev}`];
     if (typeof h === "function") h.call(o, ...a);
   };
-  function makeReq<T>(exec: () => T) {
+  function makeReq<T>(exec: () => T, settled?: (error?: unknown) => void) {
     // biome-ignore lint/suspicious/noExplicitAny: 测试桩
     const req: any = { onsuccess: null, onerror: null, result: undefined };
     queueMicrotask(() => {
       try {
         req.result = exec();
         fire(req, "success");
+        queueMicrotask(() => settled?.());
       } catch (e) {
         req.error = e;
         fire(req, "error");
+        queueMicrotask(() => settled?.(e));
       }
     });
     return req;
   }
-  function makeStore(map: Map<string, unknown>) {
+  function makeStore(map: Map<string, unknown>, settled?: (error?: unknown) => void) {
     return {
-      get: (k: string) => makeReq(() => map.get(k)),
-      getAll: () => makeReq(() => [...map.values()]),
-      put: (v: unknown, k: string) => makeReq(() => void map.set(k, v)),
-      delete: (k: string) => makeReq(() => void map.delete(k)),
-      clear: () => makeReq(() => void map.clear()),
+      get: (k: string) => makeReq(() => map.get(k), settled),
+      getAll: () => makeReq(() => [...map.values()], settled),
+      put: (v: unknown, k: string) => makeReq(() => void map.set(k, v), settled),
+      delete: (k: string) => makeReq(() => void map.delete(k), settled),
+      clear: () => makeReq(() => void map.clear(), settled),
     };
   }
   // biome-ignore lint/suspicious/noExplicitAny: 测试桩
@@ -68,7 +70,26 @@ function fakeIDBFactory(): IDBFactory {
           entry.stores.set(n, new Map());
           return makeStore(entry.stores.get(n)!);
         },
-        transaction: (n: string) => ({ objectStore: (sn: string) => makeStore(entry.stores.get(sn)!) }),
+        transaction: () => {
+          // biome-ignore lint/suspicious/noExplicitAny: 测试桩
+          const tx: any = { oncomplete: null, onabort: null, onerror: null, error: null };
+          let finished = false;
+          const settle = (error?: unknown) => {
+            if (finished) return;
+            finished = true;
+            if (error) {
+              tx.error = error;
+              fire(tx, "error");
+              fire(tx, "abort");
+              return;
+            }
+            const complete = () => fire(tx, "complete");
+            if (commitGate) void commitGate.then(complete);
+            else queueMicrotask(complete);
+          };
+          tx.objectStore = (sn: string) => makeStore(entry.stores.get(sn)!, settle);
+          return tx;
+        },
         close: () => {},
       };
       req.result = db;
@@ -1054,6 +1075,21 @@ describe("persist — 命名空间", () => {
 });
 
 describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
+  test("durable put waits for readwrite transaction completion", async () => {
+    let releaseCommit!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+    const store = new SessionStore("durable", fakeIDBFactory(gate));
+    let resolved = false;
+    const write = store.putSessionDurably(stored("pending")).then(() => { resolved = true; });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    releaseCommit();
+    await write;
+    expect(resolved).toBe(true);
+  });
+
   test("put → get → getAll → delete → wipe", async () => {
     const f = fakeIDBFactory();
     const store = new SessionStore("u1", f);
@@ -1103,6 +1139,7 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
   test("无 IndexedDB 实现（jsdom 默认）优雅降级为 no-op，不抛", async () => {
     const store = new SessionStore("u1"); // 不注入 factory，jsdom 无 global indexedDB
     await expect(store.putSession(stored("x"))).resolves.toBeUndefined();
+    await expect(store.putSessionDurably(stored("x"))).rejects.toThrow("indexeddb unavailable");
     expect(await store.getSession("x")).toBeUndefined();
     expect(await store.getAll()).toEqual([]);
     await expect(store.wipe()).resolves.toBeUndefined();

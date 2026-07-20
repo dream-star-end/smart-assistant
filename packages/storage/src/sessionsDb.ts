@@ -4238,6 +4238,7 @@ async function _sqliteListTurnTapeRecords(
   _tapeId: string,
   _cursor: number,
   _limit: number,
+  _before?: number | null,
 ): Promise<{
   records: MessageLike[]
   nextCursor: number | null

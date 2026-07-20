@@ -15,6 +15,7 @@
  */
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage, ChatRoutingSnapshot } from "./chat/model";
+import type { InboundMessage } from "./chat/frames";
 import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
 import { repairPostFinalProcessOrder } from "./chat/order";
 import {
@@ -25,6 +26,15 @@ import { friendlyDelegateResultPreview } from "./chat/reducer";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
 export type ServerTurnTerminal = "completed" | "error";
+
+/** A browser turn that has not yet received the server's durable-admission
+ * acknowledgement. The exact wire payload is journaled without a count/byte
+ * cap so reload/reconnect can replay the same idempotent logical turn. */
+export type StoredPendingDispatch = {
+  msgId: string;
+  payload: InboundMessage;
+  enqueuedAt: number;
+};
 
 /**
  * 从 server 载荷推导「已收尾 turn → 终态类别」映射(clientMessageId 键)。socket.applyServerMessages
@@ -114,6 +124,7 @@ export type StoredSession = {
   /** 会话级模型选择(per-session 持久化;同设备 reload 即时恢复,服务端 canonical 到达后
    *  server-wins。与 _lastRouting 语义不同:那是"最近实际发送"供合成续写,这是"用户选择"。 */
   _selectedModelId?: string;
+  _pendingDispatches?: StoredPendingDispatch[];
 };
 
 /** 解析可用的 IDBFactory；不可用（SSR/jsdom/禁用）返回 null。*/
@@ -192,6 +203,37 @@ class IdbKV {
     );
   }
 
+  /** Strict write used only for the outbound dispatch journal. Unlike the
+   * existing best-effort helpers, this resolves at transaction commit and
+   * rejects when IndexedDB is unavailable or the transaction cannot commit. */
+  private putCommitted(key: string, value: unknown): Promise<void> {
+    return this.openDb().then((db) => {
+      if (!db) throw new Error("indexeddb unavailable");
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const fail = (reason: unknown) => {
+          if (settled) return;
+          settled = true;
+          reject(reason instanceof Error ? reason : new Error("indexeddb transaction failed"));
+        };
+        try {
+          const tx = db.transaction(STORE, "readwrite");
+          const req = tx.objectStore(STORE).put(value, key);
+          req.onerror = () => fail(req.error);
+          tx.onerror = () => fail(tx.error);
+          tx.onabort = () => fail(tx.error);
+          tx.oncomplete = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+        } catch (error) {
+          fail(error);
+        }
+      });
+    });
+  }
+
   get<T>(key: string): Promise<T | undefined> {
     return this.run<T>("readonly", (s) => s.get(key) as IDBRequest<T>);
   }
@@ -200,6 +242,9 @@ class IdbKV {
   }
   put(key: string, value: unknown): Promise<unknown> {
     return this.run("readwrite", (s) => s.put(value, key));
+  }
+  putDurably(key: string, value: unknown): Promise<void> {
+    return this.putCommitted(key, value);
   }
   delete(key: string): Promise<unknown> {
     return this.run("readwrite", (s) => s.delete(key));
@@ -304,8 +349,8 @@ function validHistoryOrder(value: unknown): value is number {
 
 /**
  * Lazily loaded process rows carry `_turnTapeProcessLoadedFrom` and are absent from ordinary timeline refreshes.
- * server 只回折叠 anchor、**从不回这些展开行**,故它们在 full 载荷里"缺席"是**预期**而非删除信号 ——
- * 必须豁免 P1 缺席删除,否则每次 full sync 都把展开态打回折叠。(它们是 `_source:'server'`,天然不入
+ * server 只回惰性游标、**从不回这些已加载页**,故它们在 full 载荷里"缺席"是**预期**而非删除信号 ——
+ * 必须豁免 P1 缺席删除,否则每次 full sync 都把当前视口页清掉。(它们是 `_source:'server'`,天然不入
  * P2 的 isCoveredStaleLocalRow 非 server 行删除;此处只需闭合 P1。)
  */
 function isLocallyExpandedTapeRow(m: ChatMessage): boolean {
@@ -716,7 +761,7 @@ function mergeLocalClientFields(
       usage: { ...(serverMsg.usage ?? {}), waived: true },
     };
   }
-  // The process control's local expanded flag is view state:an ordinary server refresh must not collapse
+  // The process control's local loaded flag is view state:an ordinary server refresh must not clear
   // the section while the user is inspecting immutable records. 与 waived
   // 同款单调保留:仅保留展开标记 + 游标,anchor 其余字段仍 server-wins。展开行本体(独立 flat 行)由
   // mergeFullServerWins 的 P1 缺席豁免(isLocallyExpandedTapeRow)保护。
@@ -898,6 +943,12 @@ export class SessionStore {
   async putSession(s: StoredSession): Promise<void> {
     if (this.dead || !s?.id) return;
     await this.kv.put(s.id, s);
+  }
+  /** Dispatch-journal write: success means the readwrite transaction committed. */
+  async putSessionDurably(s: StoredSession): Promise<void> {
+    if (this.dead) throw new Error("session store is closed");
+    if (!s?.id) throw new Error("session id is required");
+    await this.kv.putDurably(s.id, s);
   }
   getSession(id: string): Promise<StoredSession | undefined> {
     if (this.dead) return Promise.resolve(undefined);

@@ -9,7 +9,7 @@ import { MediaSignProvider } from '../../../components/chat/media'
 import { Alert, Badge, Button, EmptyState, Modal } from '../../../components/ui'
 import type { ChatMessage } from '../../../lib/chat/model'
 import { DeferredPayloadQueue } from '../../../lib/chat/deferredPayloadQueue'
-import { collapseExpandedTapePage, mergeExpandedTapePage } from '../../../lib/chat/directTimeline'
+import { mergeTapePage } from '../../../lib/chat/directTimeline'
 import { parseTapeRecordPayload, type TapePayloadExpectation } from '../../../lib/chat/tapePayload'
 import { adminGet, adminGetExactPayload, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { fmtInt } from './format'
@@ -220,10 +220,10 @@ export function SessionViewerModal({
     [sessionId, userId],
   )
 
-  const expandTape = useCallback<NonNullable<CardCallbacks['onExpandTape']>>(async (
+  const loadOlderTape = useCallback<NonNullable<CardCallbacks['onLoadOlderTape']>>(async (
     anchorId,
     tapeId,
-    cursor,
+    before,
   ) => {
     if (!sessionId || !userId) return { ok: false }
     const generation = loadGenerationRef.current
@@ -233,12 +233,12 @@ export function SessionViewerModal({
     try {
       const page = await adminGet<TapeRecordsPayload>(
         `/sessions/${encodeURIComponent(sessionId)}/tape/${encodeURIComponent(tapeId)}/records`,
-        { user_id: userId, cursor: cursor ?? undefined, limit: 200 },
+        { user_id: userId, before: before ?? 'tail', limit: 200 },
       )
       if (generation !== loadGenerationRef.current) return { ok: false }
       const records = Array.isArray(page.records) ? page.records : []
       const nextCursor = typeof page.nextCursor === 'number' ? page.nextCursor : null
-      setMessages((current) => mergeExpandedTapePage(current, anchorId, records, nextCursor) ?? current)
+      setMessages((current) => mergeTapePage(current, anchorId, records, nextCursor) ?? current)
       return {
         ok: true,
         nextCursor,
@@ -250,10 +250,6 @@ export function SessionViewerModal({
       expandingTapesRef.current.delete(guardKey)
     }
   }, [sessionId, userId])
-
-  const collapseTape = useCallback<NonNullable<CardCallbacks['onCollapseTape']>>((anchorId) => {
-    setMessages((current) => collapseExpandedTapePage(current, anchorId) ?? current)
-  }, [])
 
   const fetchExactPayload = useCallback(async (
     path: string,
@@ -308,11 +304,10 @@ export function SessionViewerModal({
   }, [fetchExactPayload, sessionId, userId])
 
   const cardCallbacks = useMemo<CardCallbacks>(() => ({
-    onExpandTape: expandTape,
-    onCollapseTape: collapseTape,
+    onLoadOlderTape: loadOlderTape,
     onFetchTapeRecordPayload: fetchTapePayload,
     onFetchUserMessagePayload: fetchUserPayload,
-  }), [collapseTape, expandTape, fetchTapePayload, fetchUserPayload])
+  }), [fetchTapePayload, fetchUserPayload, loadOlderTape])
 
   const displayTitle = payload?.title || session?.title || '(无标题)'
   const recordCount = session?.message_count ?? messages.length
@@ -356,7 +351,7 @@ export function SessionViewerModal({
         sign={signMedia}
         authKey={sessionId && userId ? `admin-session:${userId}:${sessionId}` : null}
       >
-        <div ref={bindScroll} className="h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg">
+        <div ref={bindScroll} className="chat-scroll-area h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg">
           {loading && !payload ? (
             <MessageListSkeleton />
           ) : error ? (

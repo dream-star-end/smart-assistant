@@ -96,24 +96,12 @@ test('getSession marks an initial full response from a legacy partial-history ba
   expect(detail._historyRevisionUnsupported).toBe(true)
 })
 
-test('getTapeRecordPayload resolves metadata with HEAD and reconstructs exact bytes through 1 MiB ranges', async () => {
+test('getTapeRecordPayload resolves metadata with a one-byte Range and reconstructs exact bytes', async () => {
   const source = new Uint8Array(2 * 1024 * 1024 + 17)
   for (let index = 0; index < source.length; index += 1) source[index] = index % 251
   const hash = 'a'.repeat(64)
   const ranges: string[] = []
   const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
-    if (init?.method === 'HEAD') {
-      return new Response(null, {
-        status: 200,
-        headers: {
-          'content-length': String(source.length),
-          'accept-ranges': 'bytes',
-          'x-openclaude-content-sha256': hash,
-          'x-openclaude-record-id': 'record-range',
-          'x-openclaude-record-role': 'tool',
-        },
-      })
-    }
     const range = new Headers(init?.headers).get('range') ?? ''
     ranges.push(range)
     const matched = /^bytes=(\d+)-(\d+)$/.exec(range)
@@ -142,9 +130,10 @@ test('getTapeRecordPayload resolves metadata with HEAD and reconstructs exact by
   const reconstructed = new Uint8Array(result.bytes)
   expect(fetchMock).toHaveBeenCalledTimes(4)
   expect(ranges).toEqual([
-    'bytes=0-1048575',
-    'bytes=1048576-2097151',
-    `bytes=2097152-${source.length - 1}`,
+    'bytes=0-0',
+    'bytes=1-1048576',
+    'bytes=1048577-2097152',
+    `bytes=2097153-${source.length - 1}`,
   ])
   expect(result).toMatchObject({
     contentSha256: hash,
@@ -155,17 +144,69 @@ test('getTapeRecordPayload resolves metadata with HEAD and reconstructs exact by
   expect(reconstructed.every((byte, index) => byte === source[index])).toBe(true)
 })
 
+test('getTapeRecordPayload rejects an ignored Range before consuming the full response body', async () => {
+  const arrayBuffer = vi.fn(async () => new ArrayBuffer(8 * 1024 * 1024))
+  const cancel = vi.fn(async () => undefined)
+  vi.stubGlobal('fetch', vi.fn(async () => ({
+    ok: true,
+    status: 200,
+    headers: new Headers({ 'content-length': String(8 * 1024 * 1024) }),
+    body: { cancel },
+    arrayBuffer,
+  }) as unknown as Response))
+  const { session } = makeSession('tok-range-ignored')
+
+  await expect(api.getTapeRecordPayload(session, 's1', 'tape-ignored', 1))
+    .rejects.toThrow('invalid immutable deferred payload metadata')
+  expect(arrayBuffer).not.toHaveBeenCalled()
+  expect(cancel).toHaveBeenCalledTimes(1)
+})
+
+test('getTapeRecordPayload validates every later range before consuming its body', async () => {
+  const hash = 'b'.repeat(64)
+  const badArrayBuffer = vi.fn(async () => new ArrayBuffer(2 * 1024 * 1024))
+  const cancel = vi.fn(async () => undefined)
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+    const range = new Headers(init?.headers).get('range')
+    if (range === 'bytes=0-0') {
+      return new Response(new Uint8Array([1]), {
+        status: 206,
+        headers: {
+          'content-range': `bytes 0-0/${1024 * 1024 + 2}`,
+          'x-openclaude-content-sha256': hash,
+          'x-openclaude-record-id': 'record-bad-later-range',
+          'x-openclaude-record-role': 'tool',
+        },
+      })
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      body: { cancel },
+      arrayBuffer: badArrayBuffer,
+    } as unknown as Response
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-bad-later-range')
+
+  await expect(api.getTapeRecordPayload(session, 's1', 'tape-bad-later', 2))
+    .rejects.toThrow('immutable deferred payload range identity mismatch')
+  expect(badArrayBuffer).not.toHaveBeenCalled()
+  expect(cancel).toHaveBeenCalledTimes(1)
+})
+
 test('getTapeRecordPayload aborts the active range when its viewport subscriber leaves', async () => {
   const hash = 'f'.repeat(64)
   const seenSignals: AbortSignal[] = []
   const fetchMock = vi.fn(async (_url: string, init?: RequestInit): Promise<Response> => {
     if (init?.signal) seenSignals.push(init.signal)
-    if (init?.method === 'HEAD') {
-      return new Response(null, {
-        status: 200,
+    const range = new Headers(init?.headers).get('range')
+    if (range === 'bytes=0-0') {
+      return new Response(new Uint8Array([123]), {
+        status: 206,
         headers: {
-          'content-length': String(2 * 1024 * 1024),
-          'accept-ranges': 'bytes',
+          'content-range': `bytes 0-0/${2 * 1024 * 1024}`,
           'x-openclaude-content-sha256': hash,
           'x-openclaude-record-id': 'record-abort',
           'x-openclaude-record-role': 'tool',
@@ -203,24 +244,14 @@ test('getUserMessagePayload uses the user sidecar URL and the same exact range c
   const hash = 'b'.repeat(64)
   const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
     expect(url).toBe('/api/sessions/session-user-1/messages/cm%3Auser%3A1/payload')
-    if (init?.method === 'HEAD') {
-      return new Response(null, {
-        status: 200,
-        headers: {
-          'content-length': String(source.length),
-          'accept-ranges': 'bytes',
-          'x-openclaude-content-sha256': hash,
-          'x-openclaude-record-id': 'cm:user:1',
-          'x-openclaude-record-role': 'user',
-        },
-      })
-    }
     const range = new Headers(init?.headers).get('range')
-    expect(range).toBe(`bytes=0-${source.length - 1}`)
-    return new Response(source, {
+    const matched = /^bytes=(\d+)-(\d+)$/.exec(range ?? '')!
+    const start = Number(matched[1])
+    const end = Number(matched[2])
+    return new Response(source.slice(start, end + 1), {
       status: 206,
       headers: {
-        'content-range': `bytes 0-${source.length - 1}/${source.length}`,
+        'content-range': `bytes ${start}-${end}/${source.length}`,
         'x-openclaude-content-sha256': hash,
         'x-openclaude-record-id': 'cm:user:1',
         'x-openclaude-record-role': 'user',

@@ -54,6 +54,7 @@ class FakeWS {
   open() {
     this.readyState = 1;
     this.onopen?.();
+    this.onmessage?.({ data: JSON.stringify({ type: "sys.relay_ready" }) });
   }
 }
 
@@ -103,7 +104,7 @@ describe("thinking-safety liveness 分流（S3）", () => {
     sock.stop();
   });
 
-  test("连接死链 → 强制重连自愈，绝不误报（无 stop / 无空轮消息 / in-flight 保留 / 无 transient）", () => {
+  test("连接死链 → 强制重连并把未受理 turn 安全回队列（无 stop / 无空轮消息 / 无 transient）", () => {
     vi.useFakeTimers();
     FakeWS.autoPong = false; // keepalive 无 pong → 链路未确认存活（死链）
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
@@ -115,11 +116,14 @@ describe("thinking-safety liveness 分流（S3）", () => {
 
     vi.advanceTimersByTime(THINKING_SAFETY_MS + 5000);
 
-    // 死链下：绝不产生"本轮无响应/超时"这类误报，in-flight 保留待重连恢复；发生了重连。
+    // 死链下：绝不产生"本轮无响应/超时"这类误报；未收到 durable admission 的
+    // exact payload 回到 journal 队列，待新连接 relay-ready 后重放。
     expect(s.messages.some((m) => m._emptyTurn)).toBe(false);
     expect(anySent((d) => d.includes("inbound.control.stop"))).toBe(false);
     expect(sock.getTransientNotice("s1")).toBeNull();
-    expect(s._sendingInFlight).toBe(true);
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.find((message) => message.role === "user")?.status).toBe("queued");
+    expect(sock.toStored("s1")?._pendingDispatches).toHaveLength(1);
     expect(FakeWS.instances.length).toBeGreaterThan(1); // 死链已触发 close→reconnect
     sock.stop();
   });
@@ -186,15 +190,16 @@ describe("retryMessage：发送失败原地重发", () => {
     const s = sock.sessions.get("s1")!;
     const userMsg = s.messages.find((m) => m.role === "user")!;
     // 模拟先前发送失败。
+    sock.stopTurn("s1");
     userMsg.status = "error";
     ws.sent.length = 0;
 
     const userCountBefore = s.messages.filter((m) => m.role === "user").length;
     sock.retryMessage({ sessId: "s1", msgId: userMsg.id, agentId: "main" });
 
-    // 不新增气泡（原地复用同一条），状态回到 sent，in-flight 恢复。
+    // 不新增气泡（原地复用同一条）；物理 send 后仍等待 durable admission。
     expect(s.messages.filter((m) => m.role === "user").length).toBe(userCountBefore);
-    expect(userMsg.status).toBe("sent");
+    expect(userMsg.status).toBe("sending");
     expect(s._sendingInFlight).toBe(true);
     // 重发帧复用 clientMessageId，只把持久化 attempt 从 0 精确推进到 1。
     const inbound = ws.sent.find((d) => d.includes('"inbound.message"'))!;
@@ -204,6 +209,13 @@ describe("retryMessage：发送失败原地重发", () => {
     expect(userMsg._sendAttempt).toBe(1);
     expect(frame.content.text).toBe("带图问题"); // _modelText（含附件的完整模型可见文本）
     expect(Array.isArray(frame.content.media)).toBe(true);
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: userMsg.id,
+    }) });
+    expect(userMsg.status).toBe("sent");
   });
 
   test("非 error 消息 → no-op", () => {

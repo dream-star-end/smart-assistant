@@ -511,12 +511,11 @@ describe('UserDetailSheet — 会话只读查看器', () => {
       { user_id: '1' },
       expect.any(AbortSignal),
     )
-    fireEvent.click(screen.getByRole('button', { name: /Agent 调用过程/ }))
     fireEvent.click(await screen.findByRole('button', { name: /已思考/ }))
     expect(await screen.findByText(/管理员展开的真实思考/)).toBeTruthy()
     expect(mockGet).toHaveBeenCalledWith(
       '/sessions/admin-lazy/tape/tape-admin/records',
-      { user_id: '1', cursor: undefined, limit: 200 },
+      { user_id: '1', before: 'tail', limit: 200 },
     )
   })
 })

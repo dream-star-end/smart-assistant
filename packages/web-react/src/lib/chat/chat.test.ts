@@ -14,7 +14,6 @@ import {
   loadOlderHistoryLabel,
   nonAuthPolicyCloseInfo,
   normalizeBridgeErrorCode,
-  OFFLINE_DRAIN_START_DELAY_MS,
   onopenSetInitialStatus,
   parsePartialJson,
   shouldAutoContinueActionPreamble,
@@ -2550,6 +2549,7 @@ class FakeWS {
   open() {
     this.readyState = 1;
     this.onopen?.();
+    this.onmessage?.({ data: JSON.stringify({ type: "sys.relay_ready" }) });
   }
 }
 
@@ -2670,6 +2670,250 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     vi.useRealTimers();
   });
 
+  test("exact payload is durably journaled before physical send and cleared only by admitted ACK", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let releaseFirst!: () => void;
+    const firstCommit = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const persistSessionDurably = vi.fn()
+      .mockImplementationOnce(() => firstCommit)
+      .mockResolvedValue(undefined);
+    const sock = makeSocket({ persistSessionDurably });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "must survive reload" });
+    const user = sock.sessions.get("s1")!.messages.find((message) => message.role === "user")!;
+    expect(sock.toStored("s1")?._pendingDispatches).toEqual([
+      expect.objectContaining({ msgId: user.id, payload: expect.objectContaining({ clientMessageId: user.id }) }),
+    ]);
+    expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(false);
+
+    releaseFirst();
+    await vi.waitFor(() => expect(ws.sent.some((raw) => {
+      const frame = JSON.parse(raw);
+      return frame.type === "inbound.message" && frame.clientMessageId === user.id;
+    })).toBe(true));
+    expect(user.status).toBe("sending");
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: user.id,
+    }) });
+    expect(sock.toStored("s1")?._pendingDispatches).toBeUndefined();
+    expect(user.status).toBe("sent");
+    expect(sock.sessions.get("s1")?._sendingInFlight).toBe(true);
+  });
+
+  test("pending reconnect status promotes only after every journal item is admitted", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "first peer" });
+    sock.sendMessage({ sessId: "s2", agentId: "main", text: "second peer" });
+    const firstId = sock.sessions.get("s1")!.messages.find((message) => message.role === "user")!.id;
+    const secondId = sock.sessions.get("s2")!.messages.find((message) => message.role === "user")!.id;
+
+    ws.open();
+    await vi.waitFor(() => expect(sock.getSnapshot().status)
+      .toEqual({ label: "补发离线消息… (2)", cls: "connecting" }));
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: firstId,
+    }) });
+    await vi.waitFor(() => expect(sock.getSnapshot().status.cls).toBe("connecting"));
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s2", kind: "dm" },
+      clientMessageId: secondId,
+    }) });
+    await vi.waitFor(() => expect(sock.getSnapshot().status)
+      .toEqual({ label: "已连接", cls: "connected" }));
+  });
+
+  test("relay ready promotes after the last pending item was cleared before relay attachment", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "already converged" });
+
+    ws.readyState = 1;
+    ws.onopen?.();
+    await vi.waitFor(() => expect(sock.getSnapshot().status.cls).toBe("connecting"));
+    sock.removeSession("s1");
+    expect(sock.getSnapshot().status.cls).toBe("connecting");
+
+    ws.onmessage?.({ data: JSON.stringify({ type: "sys.relay_ready" }) });
+    await vi.waitFor(() => expect(sock.getSnapshot().status)
+      .toEqual({ label: "已连接", cls: "connected" }));
+  });
+
+  test("journal storage failure preserves chat availability with an explicit recovery warning", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let rejectCommit!: (error: Error) => void;
+    const failedCommit = new Promise<void>((_resolve, reject) => { rejectCommit = reject; });
+    const persistSessionDurably = vi.fn()
+      .mockImplementationOnce(() => failedCommit)
+      .mockRejectedValue(new Error("quota"));
+    const sock = makeSocket({ persistSessionDurably });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "send despite unavailable storage" });
+    const user = sock.sessions.get("s1")!.messages.find((message) => message.role === "user")!;
+    rejectCommit(new Error("quota"));
+    await vi.waitFor(() => expect(ws.sent.some((raw) => {
+      const frame = JSON.parse(raw);
+      return frame.type === "inbound.message" && frame.clientMessageId === user.id;
+    })).toBe(true));
+    expect(user.status).toBe("sending");
+    expect(sock.getTransientNotice("s1")?.text).toContain("无法保存发送恢复记录");
+    expect(sock.toStored("s1")?._pendingDispatches).toEqual([
+      expect.objectContaining({ msgId: user.id }),
+    ]);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: user.id,
+    }) });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(persistSessionDurably).toHaveBeenCalledTimes(2);
+    expect(sock.toStored("s1")?._pendingDispatches).toBeUndefined();
+    expect(user.status).toBe("sent");
+  });
+
+  test("a pending journal commit survives reconnect without a racing second attempt", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let releaseCommit!: () => void;
+    const commit = new Promise<void>((resolve) => { releaseCommit = resolve; });
+    const persistSessionDurably = vi.fn(() => commit);
+    const sock = makeSocket({ persistSessionDurably });
+    sock.setGateReady(true);
+    const first = FakeWS.instances.at(-1)!;
+    first.open();
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "one logical send" });
+    first.close(1006, "network lost");
+    sock.connect();
+    const second = FakeWS.instances.at(-1)!;
+    second.open();
+    expect(persistSessionDurably).toHaveBeenCalledTimes(1);
+    expect(second.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(false);
+
+    releaseCommit();
+    await vi.waitFor(() => expect(second.sent.filter((raw) =>
+      JSON.parse(raw).type === "inbound.message")).toHaveLength(1));
+    expect(persistSessionDurably).toHaveBeenCalledTimes(1);
+    expect(first.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(false);
+  });
+
+  test("active stop/start replays one physically-sent unadmitted turn exactly once", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const first = FakeWS.instances.at(-1)!;
+    first.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "survive active stop" });
+    const firstFrame = first.sent.map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.message");
+
+    sock.stop();
+    sock.start();
+    sock.connect();
+    const second = FakeWS.instances.at(-1)!;
+    second.open();
+    const replayed = second.sent.map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.message");
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0].clientMessageId).toBe(firstFrame.clientMessageId);
+    expect(replayed[0].idempotencyKey).toBe(firstFrame.idempotencyKey);
+  });
+
+  test("gate close/open replays one physically-sent unadmitted turn exactly once", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const first = FakeWS.instances.at(-1)!;
+    first.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "survive gate close" });
+    const firstFrame = first.sent.map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.message");
+
+    sock.setGateReady(false);
+    sock.setGateReady(true);
+    const second = FakeWS.instances.at(-1)!;
+    second.open();
+    const replayed = second.sent.map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.message");
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0].clientMessageId).toBe(firstFrame.clientMessageId);
+    expect(replayed[0].idempotencyKey).toBe(firstFrame.idempotencyKey);
+  });
+
+  test("admission keeps the peer FIFO slot until exact final, then sends the next prompt", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "first" });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "second" });
+    const users = sock.sessions.get("s1")!.messages.filter((message) => message.role === "user");
+    const inbound = () => ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.message");
+    expect(inbound().map((frame) => frame.content.text)).toEqual(["first"]);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: users[0]!.id,
+    }) });
+    expect(inbound().map((frame) => frame.content.text)).toEqual(["first"]);
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      clientMessageId: users[0]!.id,
+      blocks: [{ kind: "text", text: "done" }],
+      isFinal: true,
+    })) });
+    expect(inbound().map((frame) => frame.content.text)).toEqual(["first", "second"]);
+  });
+
+  test("reload restores an unacknowledged exact dispatch with the same identity", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const original = makeSocket();
+    original.setGateReady(true);
+    const firstWs = FakeWS.instances.at(-1)!;
+    firstWs.open();
+    original.sendMessage({ sessId: "s1", agentId: "main", text: "recover me" });
+    const stored = original.toStored("s1")!;
+    const originalFrame = firstWs.sent.map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.message");
+
+    const restored = makeSocket();
+    restored.loadStored(stored);
+    restored.setGateReady(true);
+    const secondWs = FakeWS.instances.at(-1)!;
+    secondWs.open();
+    const replay = secondWs.sent.map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.message");
+    expect(replay.clientMessageId).toBe(originalFrame.clientMessageId);
+    expect(replay.idempotencyKey).toBe(originalFrame.idempotencyKey);
+    expect(replay.content).toEqual(originalFrame.content);
+  });
+
   test("send while ws OPEN → ws.send called, msg sent, in-flight", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -2687,7 +2931,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(user._sendAttempt).toBe(0);
     expect(s._activeClientMessageId).toBe(user.id);
     expect(s._sendingInFlight).toBe(true);
-    expect(user.status).toBe("sent");
+    expect(user.status).toBe("sending");
   });
 
   test("cost_waived 同时刷新余额与站内信未读角标", () => {
@@ -2932,8 +3176,10 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     });
     const session = sock.sessions.get("s1")!;
     const userMessage = session.messages.find((message) => message.role === "user")!;
-    userMessage.status = "error";
-    session._sendingInFlight = false;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: "s1", kind: "dm" }, clientMessageId: userMessage.id,
+      code: "upstream_failed", message: "failed", frameSeq: 1, ts: 1,
+    }) });
 
     // A later turn overwrites the session snapshot. Retrying the earlier failed row must
     // still use that row's original routing, not the newest turn's selection.
@@ -2945,7 +3191,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       effortLevel: "low",
       teamMode: false,
     });
-    session._sendingInFlight = false;
+    sock.stopTurn("s1");
 
     sock.retryMessage({ sessId: "s1", msgId: userMessage.id, agentId: "main" });
 
@@ -2974,10 +3220,12 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "old turn" });
     const session = sock.sessions.get("s1")!;
     const userMessage = session.messages.find((message) => message.role === "user")!;
-    userMessage.status = "error";
     userMessage._routing = undefined;
-    session._sendingInFlight = false;
     session._lastRouting = { model: "gpt-5.5", effortLevel: "high", teamMode: true };
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: "s1", kind: "dm" }, clientMessageId: userMessage.id,
+      code: "upstream_failed", message: "failed", frameSeq: 1, ts: 1,
+    }) });
 
     sock.retryMessage({ sessId: "s1", msgId: userMessage.id, agentId: "main" });
 
@@ -3010,8 +3258,10 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const session = sock.sessions.get("s1")!;
     const userMessage = session.messages.find((message) => message.role === "user")!;
     expect(userMessage._routing?.effortLevel).toBeNull();
-    userMessage.status = "error";
-    session._sendingInFlight = false;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: "s1", kind: "dm" }, clientMessageId: userMessage.id,
+      code: "upstream_failed", message: "failed", frameSeq: 1, ts: 1,
+    }) });
 
     sock.retryMessage({ sessId: "s1", msgId: userMessage.id, agentId: "main" });
 
@@ -3040,12 +3290,11 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(s.messages.find((m) => m.text === "second")?.status).toBe("queued");
     expect(ws.sent.filter((d) => d.includes('"inbound.message"')).length).toBe(1);
 
-    // 本轮结束(此处以 stop 收尾清 _sendingInFlight)→ kickQueuedDrainIfIdle(deferred)自动发出。
+    // 本轮结束(此处以 stop 收尾)→ 立即释放 FIFO slot 并发出下一条。
     sock.stopTurn("s1");
-    expect(s._sendingInFlight).toBe(false);
-    await new Promise((r) => setTimeout(r, 0)); // flush 延迟一个 macrotask 的 drain 触发
+    expect(s._sendingInFlight).toBe(true);
     expect(ws.sent.some((d) => d.includes('"inbound.message"') && d.includes("second"))).toBe(true);
-    expect(s.messages.find((m) => m.text === "second")?.status).toBe("sent");
+    expect(s.messages.find((m) => m.text === "second")?.status).toBe("sending");
     sock.stop();
   });
 
@@ -3488,7 +3737,6 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(userMessage._sendAttempt).toBe(0);
 
     ws.open();
-    vi.advanceTimersByTime(OFFLINE_DRAIN_START_DELAY_MS + 100);
     const replay = ws.sent.map((raw) => JSON.parse(raw)).find((payload) =>
       payload.type === "inbound.message" && payload.clientMessageId === userMessage.id);
     expect(replay.idempotencyKey).toBe(originalKey);
