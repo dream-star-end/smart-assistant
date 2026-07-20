@@ -50,8 +50,12 @@ export type VisibleVirtualRowAnchor = {
   top: number;
   scrollTop: number;
   scrollHeight: number;
-  historyLayoutRevision: string | null;
+  dataIndex: string | null;
 };
+
+function virtualRowDataIndex(row: HTMLElement): string | null {
+  return row.closest<HTMLElement>("[data-index]")?.getAttribute("data-index") ?? null;
+}
 
 /** Capture an actual rendered row instead of total scrollHeight. Bottom live
  * growth then cannot contaminate correction for rows prepended at the top. */
@@ -73,9 +77,7 @@ export function captureVisibleVirtualRowAnchor(
     top: row.getBoundingClientRect().top - viewport.top,
     scrollTop: scroller.scrollTop,
     scrollHeight: scroller.scrollHeight,
-    historyLayoutRevision: scroller
-      .querySelector<HTMLElement>("[data-chat-history-layout-revision]")
-      ?.getAttribute("data-chat-history-layout-revision") ?? null,
+    dataIndex: virtualRowDataIndex(row),
   };
 }
 
@@ -134,21 +136,18 @@ export function restoreVisibleVirtualRowAnchor(
       const beforeTop = beforeRow
         ? beforeRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
         : null;
-      const layoutMarker = scroller.querySelector<HTMLElement>(
-        "[data-chat-history-layout-revision]",
-      );
-      const currentLayoutRevision = layoutMarker?.getAttribute(
-        "data-chat-history-layout-revision",
-      ) ?? null;
-      const acknowledgedLayoutRevision = layoutMarker?.getAttribute(
-        "data-chat-history-layout-ack",
-      ) ?? null;
-      const newLayoutAcknowledged =
-        currentLayoutRevision !== null &&
-        currentLayoutRevision !== anchor.historyLayoutRevision &&
-        acknowledgedLayoutRevision === currentLayoutRevision;
+      const beforeDataIndex = beforeRow ? virtualRowDataIndex(beforeRow) : null;
+      // react-virtuoso writes each mounted row's current data-array position to
+      // its outer `data-index` wrapper. A real prepend moves the same immutable
+      // row to a higher data index; bottom/live growth leaves it unchanged.
+      // This is direct DOM evidence that Virtuoso accepted the older page,
+      // unlike itemsRendered which need not fire when the visible set is stable.
+      const rowReindexed =
+        anchor.dataIndex !== null &&
+        beforeDataIndex !== null &&
+        beforeDataIndex !== anchor.dataIndex;
       if (
-        newLayoutAcknowledged ||
+        rowReindexed ||
         beforeTop === null ||
         Math.abs(beforeTop - anchor.top) > 0.5
       ) {

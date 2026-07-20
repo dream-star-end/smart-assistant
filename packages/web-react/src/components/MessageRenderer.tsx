@@ -1045,74 +1045,6 @@ export function MessageList({
   const showHistoryBoundary = hasOlderHistory || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
-  const historyPageKeys: string[] = [];
-  const seenHistoryPageKeys = new Set<string>();
-  for (const message of renderableMessages) {
-    const pageKey = message._historyPageKey ?? message._historyPageLoadedFrom;
-    if (typeof pageKey !== "string" || seenHistoryPageKeys.has(pageKey)) continue;
-    seenHistoryPageKeys.add(pageKey);
-    historyPageKeys.push(pageKey);
-  }
-  // This revision changes only when an explicit older-history page becomes
-  // resident. Live bottom output cannot satisfy it. Virtuoso acknowledges the
-  // corresponding data commit through itemsRendered before anchor restoration
-  // is allowed to call the new layout stable.
-  const historyLayoutRevision = `${pagingGeneration}::${JSON.stringify(historyPageKeys)}`;
-  const historyLayoutRevisionRef = useRef(historyLayoutRevision);
-  historyLayoutRevisionRef.current = historyLayoutRevision;
-  const historyLayoutMarkerRef = useRef<HTMLDivElement | null>(null);
-  const historyLayoutMarkerInitializedRef = useRef(false);
-  const pendingHistoryLayoutAckRef = useRef<string | null>(null);
-  const historyLayoutAckFrameRef = useRef<number | null>(null);
-  const bindHistoryLayoutMarker = useCallback((node: HTMLDivElement | null) => {
-    historyLayoutMarkerRef.current = node;
-    if (node && !historyLayoutMarkerInitializedRef.current) {
-      historyLayoutMarkerInitializedRef.current = true;
-      node.setAttribute("data-chat-history-layout-ack", historyLayoutRevisionRef.current);
-    }
-  }, []);
-  const acknowledgeHistoryLayout = useCallback(() => {
-    if (!showHistoryBoundary) return;
-    pendingHistoryLayoutAckRef.current = historyLayoutRevision;
-    if (historyLayoutAckFrameRef.current !== null) return;
-    const publish = () => {
-      historyLayoutAckFrameRef.current = null;
-      const revision = pendingHistoryLayoutAckRef.current;
-      if (!revision || historyLayoutRevisionRef.current !== revision) {
-        pendingHistoryLayoutAckRef.current = null;
-        return;
-      }
-      const marker = historyLayoutMarkerRef.current;
-      if (marker?.getAttribute("data-chat-history-layout-revision") === revision) {
-        marker.setAttribute("data-chat-history-layout-ack", revision);
-        pendingHistoryLayoutAckRef.current = null;
-        return;
-      }
-      // react-virtuoso can publish itemsRendered from its layout effect before
-      // the stable Header ref/attribute is observable on a heavily loaded
-      // renderer. Keep this *event-bound* acknowledgement pending until that
-      // exact revision is in the DOM; a newer revision supersedes it. There is
-      // no wall-clock/frame cap and no content is admitted by this retry.
-      if (typeof requestAnimationFrame === "function") {
-        historyLayoutAckFrameRef.current = requestAnimationFrame(publish);
-      }
-    };
-    if (typeof requestAnimationFrame === "function") {
-      historyLayoutAckFrameRef.current = requestAnimationFrame(publish);
-    } else {
-      publish();
-    }
-  }, [historyLayoutRevision, showHistoryBoundary]);
-  useEffect(() => () => {
-    pendingHistoryLayoutAckRef.current = null;
-    if (
-      historyLayoutAckFrameRef.current !== null &&
-      typeof cancelAnimationFrame === "function"
-    ) {
-      cancelAnimationFrame(historyLayoutAckFrameRef.current);
-    }
-    historyLayoutAckFrameRef.current = null;
-  }, []);
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
@@ -1174,10 +1106,8 @@ export function MessageList({
   const renderVirtualItem = renderItem;
   const historyControl = archive && showHistoryBoundary ? (
     <div
-      ref={bindHistoryLayoutMarker}
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
       data-testid="history-page-loader"
-      data-chat-history-layout-revision={historyLayoutRevision}
     >
       <button
         type="button"
@@ -1240,7 +1170,6 @@ export function MessageList({
       <Virtuoso
         customScrollParent={scrollParent}
         data={virtualItems}
-        itemsRendered={acknowledgeHistoryLayout}
         firstItemIndex={firstItemIndex}
         context={{ header: historyControl, footer }}
         computeItemKey={(_index, item) => itemKey(item)}
