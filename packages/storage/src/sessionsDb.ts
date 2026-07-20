@@ -14,6 +14,15 @@ import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS, type MessageUsageDelegate } from '@openclaude/protocol/teamCards'
+import {
+  availableModelHistoryTokens,
+  estimateModelHistoryTokens,
+  exactModelHistoryTextSuffix,
+  modelHistorySemanticRole,
+  modelHistorySemanticText,
+  MODEL_HISTORY_EXACT_SUFFIX_MARKER,
+  resolveModelHistoryContextWindow,
+} from '@openclaude/protocol'
 import Database from 'better-sqlite3'
 // 引擎中立的写路径决策层(RFC D6b);与本文件构成运行时环(见 clientSessionsPlan.ts 顶注)。
 import {
@@ -1151,7 +1160,7 @@ export interface SearchHit {
 // Returns top-N unique sessions with a snippet of the best-matching turn.
 export async function searchSessions(
   query: string,
-  limit = 5,
+  limit: number | null = 5,
   agentId?: string,
 ): Promise<SearchHit[]> {
   const db = await getSessionsDb()
@@ -1159,7 +1168,10 @@ export async function searchSessions(
   if (!cleanQuery) return []
   // If agentId provided, filter at SQL level for correctness
   const agentFilter = agentId ? 'AND m.agent_id = ?' : ''
-  const params = agentId ? [cleanQuery, agentId, limit * 4] : [cleanQuery, limit * 4]
+  const boundedLimit = limit === null ? null : Math.max(1, Math.floor(limit))
+  const params = agentId
+    ? boundedLimit === null ? [cleanQuery, agentId] : [cleanQuery, agentId, boundedLimit * 4]
+    : boundedLimit === null ? [cleanQuery] : [cleanQuery, boundedLimit * 4]
   const rows = db
     .prepare(
       `
@@ -1178,7 +1190,7 @@ export async function searchSessions(
     WHERE sessions_fts MATCH ?
     ${agentFilter}
     ORDER BY score
-    LIMIT ?
+    ${boundedLimit === null ? '' : 'LIMIT ?'}
   `,
     )
     .all(...params) as Array<{
@@ -1209,27 +1221,29 @@ export async function searchSessions(
       snippet: r.snippet,
       score: r.score,
     })
-    if (out.length >= limit) break
+    if (boundedLimit !== null && out.length >= boundedLimit) break
   }
   return out
 }
 
-// Load up to the 100 most recent turns of a session ordered by turn_idx ascending
-// (for second-pass summarization). The cap prevents loading entire large sessions into memory.
-// Note: indexTurn() inserts up to 2 FTS rows per turn (user + assistant), so LIMIT 200 rows
-// yields ~100 full turns in the common case.
 export async function loadSessionTurns(
   sessionId: string,
+  limit: number | null = 200,
 ): Promise<Array<{ role: string; content: string; turnIdx: number }>> {
   const db = await getSessionsDb()
+  const boundedLimit = limit === null ? null : Math.max(1, Math.floor(limit))
   const rows = db
     .prepare(`
       SELECT turn_idx, role, content FROM sessions_fts
       WHERE session_id = ?
       ORDER BY turn_idx DESC, rowid DESC
-      LIMIT 200
+      ${boundedLimit === null ? '' : 'LIMIT ?'}
     `)
-    .all(sessionId) as Array<{ turn_idx: number; role: string; content: string }>
+    .all(...(boundedLimit === null ? [sessionId] : [sessionId, boundedLimit])) as Array<{
+      turn_idx: number
+      role: string
+      content: string
+    }>
   // Reverse so caller receives turns in chronological order
   return rows.reverse().map((r) => ({ turnIdx: r.turn_idx, role: r.role, content: r.content }))
 }
@@ -1587,8 +1601,9 @@ export const MAX_SESSION_BYTES = 4 * 1024 * 1024
 // 阈值关系(硬约束,勿乱调):SOFT_TRIM(2.5M) > TAIL_TARGET(2M) 且两者都 < MAX(4M)。
 // - TAIL_TARGET 留出 MAX 与它之间 2M 的余量:一次 spill 后尾巴 ≤ 2M,后续 append 有足够
 //   空间累积到下次 SOFT_TRIM 才再 spill,避免每 turn 都 spill(spill 有 chunk 写开销)。
-// - TAIL_MIN_MSGS = 64 > 兜底上下文注入窗口(bridge 48 条 / 容器 40 条):保证模型无法
-//   原生续接、走兜底注入重建上下文时,热尾巴始终 ≥ 该窗口 → spill 对模型侧零影响。
+// - TAIL_MIN_MSGS = 64:keeps a useful recent suffix in the hot row. Older
+//   content remains exact in archive chunks and model reads page those chunks
+//   until the selected model's real context window is filled.
 export const SESSION_SOFT_TRIM_BYTES = Math.floor(2.5 * 1024 * 1024) // 2.5MB
 export const SESSION_TAIL_TARGET_BYTES = 2 * 1024 * 1024 // 2MB
 export const SESSION_TAIL_MIN_MSGS = 64
@@ -3975,6 +3990,74 @@ export interface ReadArchivedMessagesResult {
   historyRevision?: number
 }
 
+/** Private model-context read. This is deliberately separate from browser
+ * history: browser rows are exact/pageable, while this read returns only the
+ * contiguous narrative suffix that can physically fit the selected model. */
+export interface EngineContextReadOptions {
+  contextWindow?: number | null
+  engine?: string
+  currentUserText?: string
+  excludeClientMessageId?: string
+}
+
+/** Filter to real browser-visible semantic records and select a contiguous
+ * exact suffix for the model execution window. Tool results, plans, goals and
+ * delegate outputs remain available across runner/provider switches;
+ * `truncated` only describes this private model input, never browser history. */
+export function selectEngineContextSuffix(
+  messages: MessageLike[],
+  options: EngineContextReadOptions = {},
+): { messages: MessageLike[]; truncated: boolean } {
+  const rows = messages.filter((message) => {
+    if (!message || modelHistorySemanticRole(message) === null) return false
+    if (message.system === true) return false
+    if (
+      options.excludeClientMessageId &&
+      (message.id === options.excludeClientMessageId ||
+        message._clientMessageId === options.excludeClientMessageId)
+    ) return false
+    return modelHistorySemanticText(message).trim().length > 0
+  })
+  const contextWindow = resolveModelHistoryContextWindow(options.contextWindow, options.engine)
+  if (contextWindow === null) return { messages: rows, truncated: false }
+
+  let remaining = availableModelHistoryTokens(contextWindow, options.currentUserText ?? '')
+  const selected: MessageLike[] = []
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!
+    const text = modelHistorySemanticText(row)
+    const rowTokens = estimateModelHistoryTokens(text) + 4
+    if (rowTokens > remaining) {
+      if (remaining > 64) {
+        const suffix = exactModelHistoryTextSuffix(
+          text,
+          Math.max(
+            0,
+            remaining - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 4,
+          ),
+        )
+        if (suffix) {
+          const role = modelHistorySemanticRole(row)!
+          selected.unshift({
+            role,
+            text: MODEL_HISTORY_EXACT_SUFFIX_MARKER + suffix,
+            ...(typeof row.id === 'string' ? { id: row.id } : {}),
+            ...(typeof row._clientMessageId === 'string'
+              ? { _clientMessageId: row._clientMessageId }
+              : {}),
+            ...(typeof row.status === 'string' ? { status: row.status } : {}),
+            ...(typeof row.ts === 'number' ? { ts: row.ts } : {}),
+          })
+        }
+      }
+      return { messages: selected, truncated: true }
+    }
+    selected.unshift(row)
+    remaining -= rowTokens
+  }
+  return { messages: selected, truncated: false }
+}
+
 /**
  * **归档回看分页**(用户上滑加载更早历史;读侧,零写)。
  *
@@ -4018,7 +4101,7 @@ async function _sqliteReadArchivedMessages(
     `SELECT messages FROM client_session_archive_chunks
        WHERE session_id = ? AND user_id = ? AND first_seq < ?
        ORDER BY last_seq DESC`,
-  ).all(sessId, userId, effectiveBefore) as Array<{ messages: string }>
+  ).iterate(sessId, userId, effectiveBefore) as Iterable<{ messages: string }>
 
   const pool: MessageLike[] = []
   for (const cr of chunkRows) {
@@ -4050,11 +4133,12 @@ async function _sqliteReadArchivedMessages(
   }
 }
 
-/** 引擎上下文读(RFC §9)。个人版/容器无 tape 物化投影(会话正文全量内联),生成行即热行本体。
- *  返回热行原样(调用方 sanitizer 再做 48 行/18k 截断);缺省仅用于满足 ClientSessionsBackend 契约。 */
+/** 引擎上下文读(RFC §9)。个人版/容器按所选模型的真实上下文预算，从热行向归档
+ * 逐页回读；不再叠加固定消息数或字符数截断。 */
 async function _sqliteGetEngineContextMessages(
   sessionId: string,
   userId: string,
+  options: EngineContextReadOptions = {},
 ): Promise<MessageLike[] | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
@@ -4068,7 +4152,83 @@ async function _sqliteGetEngineContextMessages(
   } catch {
     msgs = []
   }
-  return deriveOrderSeqsForRead(msgs, row.archived_through_seq ?? 0)
+  let selected = selectEngineContextSuffix(
+    deriveOrderSeqsForRead(msgs, row.archived_through_seq ?? 0),
+    options,
+  )
+  if (selected.truncated) return selected.messages
+
+  // Newest-to-oldest lazy archive walk. Stop as soon as the selected model's
+  // real context window is full instead of materializing the whole session.
+  const chunks = db.prepare(
+    `SELECT messages FROM client_session_archive_chunks
+       WHERE session_id = ? AND user_id = ?
+       ORDER BY last_seq DESC`,
+  ).iterate(sessionId, userId) as Iterable<{ messages: string }>
+  for (const chunk of chunks) {
+    let archived: MessageLike[] = []
+    try {
+      const parsed = JSON.parse(chunk.messages)
+      if (Array.isArray(parsed)) archived = deriveArchivedOrderSeqsForRead(parsed as MessageLike[])
+    } catch { /* malformed legacy chunk contributes no synthetic context */ }
+    const combined = [...archived, ...selected.messages]
+    combined.sort(compareMessagesByOrder)
+    selected = selectEngineContextSuffix(combined, options)
+    if (selected.truncated) break
+  }
+  return selected.messages
+}
+
+function hasCompletedClientMessage(messages: MessageLike[], clientMessageId: string): boolean {
+  return messages.some((message) =>
+    message?.role === 'assistant' &&
+    message._clientMessageId === clientMessageId &&
+    message.status === 'completed' &&
+    message._errorCode === undefined &&
+    message._isError !== true,
+  )
+}
+
+/** Exact retry de-dup lookup. It stays in storage and never transports the
+ * whole transcript merely to answer one clientMessageId predicate. */
+async function _sqliteHasCompletedClientTurn(
+  sessionId: string,
+  userId: string,
+  clientMessageId: string,
+): Promise<boolean> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT messages FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessionId, userId) as { messages: string } | undefined
+  if (!row) return false
+  let hotContainsClientMessage = false
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (Array.isArray(parsed)) {
+      const hot = parsed as MessageLike[]
+      if (hasCompletedClientMessage(hot, clientMessageId)) return true
+      hotContainsClientMessage = hot.some((message) =>
+        message?.id === clientMessageId || message?._clientMessageId === clientMessageId)
+    }
+  } catch { /* continue through valid archive chunks */ }
+  if (hotContainsClientMessage) return false
+  const archivedId = db.prepare(
+    'SELECT 1 FROM client_session_archived_ids WHERE session_id = ? AND msg_id = ?',
+  ).get(sessionId, clientMessageId)
+  if (!archivedId) return false
+  const chunks = db.prepare(
+    `SELECT messages FROM client_session_archive_chunks
+       WHERE session_id = ? AND user_id = ? ORDER BY last_seq DESC`,
+  ).iterate(sessionId, userId) as Iterable<{ messages: string }>
+  for (const chunk of chunks) {
+    try {
+      const parsed = JSON.parse(chunk.messages)
+      if (Array.isArray(parsed) && hasCompletedClientMessage(parsed as MessageLike[], clientMessageId)) {
+        return true
+      }
+    } catch { /* continue */ }
+  }
+  return false
 }
 
 /** 不可变 turn-tape 记录分页。个人版 SQLite 没有 commercial tape 表，恒 null。 */
@@ -4078,11 +4238,34 @@ async function _sqliteListTurnTapeRecords(
   _tapeId: string,
   _cursor: number,
   _limit: number,
-): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+): Promise<{
+  records: MessageLike[]
+  nextCursor: number | null
+  total: number
+} | null> {
   return null
 }
 
-/** 同上：读取单条不可变 JSON payload 的真实字节窗口。 */
+/** 同上：读取单条用户可见不可变 JSON payload。 */
+async function _sqliteReadTapeRecordPayload(
+  _sessionId: string,
+  _userId: string,
+  _tapeId: string,
+  _recordOrdinal: number,
+  _offset = 0,
+  _length?: number,
+): Promise<{
+  payload: Buffer
+  totalBytes: number
+  offset: number
+  msgId: string
+  role: string
+  contentSha256: string
+  tapeSha256: string
+} | null> {
+  return null
+}
+
 async function _sqliteReadTapeRecordPayloadChunk(
   _sessionId: string,
   _userId: string,
@@ -4100,6 +4283,25 @@ async function _sqliteReadTapeRecordPayloadChunk(
   role: string
   contentSha256: string
   tapeSha256: string
+} | null> {
+  return null
+}
+
+/** Commercial PG stores oversized user messages out-of-line. Personal SQLite
+ * never emits those locators, so its matching backend method is an empty read. */
+async function _sqliteReadUserMessagePayload(
+  _sessionId: string,
+  _userId: string,
+  _msgId: string,
+  _offset = 0,
+  _length?: number,
+): Promise<{
+  payload: Buffer
+  totalBytes: number
+  offset: number
+  msgId: string
+  role: 'user'
+  contentSha256: string
 } | null> {
   return null
 }
@@ -4168,6 +4370,20 @@ async function _sqliteSetClientSessionModel(id: string, userId: string, modelId:
     'UPDATE client_sessions SET model_id = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL RETURNING updated_at'
   ).get(modelId, now, id, userId) as { updated_at: number } | undefined
   return { ok: !!row, updatedAt: row ? row.updated_at : now }
+}
+
+/**
+ * Advance the browser-history revision after an external durable authority changes
+ * what the direct timeline reads (for example, a verified turn-dispatch status).
+ * This does not create or replace transcript content; it only invalidates a stale
+ * incremental read cursor so the next read sees the authoritative row.
+ */
+async function _sqliteBumpClientSessionHistoryRevision(id: string, userId: string): Promise<boolean> {
+  const db = await getSessionsDb()
+  const result = db.prepare(
+    'UPDATE client_sessions SET history_revision = history_revision + 1, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+  ).run(Date.now(), id, userId)
+  return result.changes > 0
 }
 
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
@@ -4352,11 +4568,15 @@ const sqliteBackend = {
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
+  hasCompletedClientTurn: _sqliteHasCompletedClientTurn,
   listTurnTapeRecords: _sqliteListTurnTapeRecords,
+  readTapeRecordPayload: _sqliteReadTapeRecordPayload,
   readTapeRecordPayloadChunk: _sqliteReadTapeRecordPayloadChunk,
+  readUserMessagePayload: _sqliteReadUserMessagePayload,
   deleteClientSession: _sqliteDeleteClientSession,
   renameClientSession: _sqliteRenameClientSession,
   setClientSessionModel: _sqliteSetClientSessionModel,
+  bumpClientSessionHistoryRevision: _sqliteBumpClientSessionHistoryRevision,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
   upsertMasterClientSession: _sqliteUpsertMasterClientSession,
@@ -4459,11 +4679,20 @@ export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages']
 export const getEngineContextMessages: ClientSessionsBackend['getEngineContextMessages'] =
   (...args) => getActiveBackend().getEngineContextMessages(...args)
 
+export const hasCompletedClientTurn: ClientSessionsBackend['hasCompletedClientTurn'] =
+  (...args) => getActiveBackend().hasCompletedClientTurn(...args)
+
 export const listTurnTapeRecords: ClientSessionsBackend['listTurnTapeRecords'] =
   (...args) => getActiveBackend().listTurnTapeRecords(...args)
 
+export const readTapeRecordPayload: ClientSessionsBackend['readTapeRecordPayload'] =
+  (...args) => getActiveBackend().readTapeRecordPayload(...args)
+
 export const readTapeRecordPayloadChunk: ClientSessionsBackend['readTapeRecordPayloadChunk'] =
   (...args) => getActiveBackend().readTapeRecordPayloadChunk(...args)
+
+export const readUserMessagePayload: ClientSessionsBackend['readUserMessagePayload'] =
+  (...args) => getActiveBackend().readUserMessagePayload(...args)
 
 export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] =
   (...args) => getActiveBackend().deleteClientSession(...args)
@@ -4473,6 +4702,9 @@ export const renameClientSession: ClientSessionsBackend['renameClientSession'] =
 
 export const setClientSessionModel: ClientSessionsBackend['setClientSessionModel'] =
   (...args) => getActiveBackend().setClientSessionModel(...args)
+
+export const bumpClientSessionHistoryRevision: ClientSessionsBackend['bumpClientSessionHistoryRevision'] =
+  (...args) => getActiveBackend().bumpClientSessionHistoryRevision(...args)
 
 export const listUnclaimedSessions: ClientSessionsBackend['listUnclaimedSessions'] =
   () => getActiveBackend().listUnclaimedSessions()

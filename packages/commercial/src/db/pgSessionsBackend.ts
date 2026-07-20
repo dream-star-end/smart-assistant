@@ -6,7 +6,7 @@
 // 容器内 gateway / 个人版不加载 commercial → 天然 SQLite,行为零变化。
 //
 // 本文件是 SQLite backend(packages/storage/src/sessionsDb.ts 的 sqliteBackend)的**行为等价
-// PG 实现**。契约 `ClientSessionsBackend = typeof sqliteBackend` 在类型层强制 28 方法全覆盖
+// PG 实现**。契约 `ClientSessionsBackend = typeof sqliteBackend` 在类型层强制全部方法覆盖
 // (漏一个 / 签名不符 = 编译错)。业务决策(merge/seq/spill/usage-patch/delegate 累加)**全部
 // 复用** @openclaude/storage 导出的引擎中立纯函数(planSpillOverflow / planAppendServerAuthored /
 // mergePreservingServerAuthored / normalizeAndAssignSeqs / appendServerAuthoredPure /
@@ -41,9 +41,18 @@
 
 import type { Pool, PoolClient } from "pg";
 import { createHash } from "node:crypto";
-import { gunzipSync } from "node:zlib";
+import { freemem } from "node:os";
+import { getHeapStatistics } from "node:v8";
+import { gzipSync, gunzipSync } from "node:zlib";
 import {
   LOSSLESS_TURN_TAPE_SHA256_RE,
+  MODEL_HISTORY_EXACT_SUFFIX_MARKER,
+  availableModelHistoryTokens,
+  estimateModelHistoryTokens,
+  exactModelHistoryTextSuffix,
+  modelHistorySemanticRole,
+  modelHistorySemanticText,
+  resolveModelHistoryContextWindow,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
@@ -63,6 +72,7 @@ import {
   deriveArchivedOrderSeqsForRead,
   deriveOrderSeqsForRead,
   type DrainDelegateCostResult,
+  type EngineContextReadOptions,
   MAX_SESSION_BYTES,
   hasInvisibleHistoryMutation,
   hasInvisibleMessageRemoval,
@@ -77,6 +87,7 @@ import {
   planDelegateCostMerge,
   planSpillOverflow,
   type ReadArchivedMessagesResult,
+  selectEngineContextSuffix,
   type ServerAuthoredAppendResult,
   type SpillChunkPlan,
   _stripClientPutMessages,
@@ -101,7 +112,6 @@ import {
   casToTerminal,
   getDispatch,
 } from "../dispatch/turnDispatchStore.js";
-import { MASTER_HISTORY_MAX_MESSAGES, MASTER_HISTORY_MAX_CHARS } from "../ws/masterHistoryLimits.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -393,6 +403,66 @@ interface SessionWriteRow {
   archived_count: number | null;
 }
 
+const USER_MESSAGE_INLINE_BYTES = 256 * 1024;
+
+async function deferOversizedUserMessage(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  message: MessageLike & { id: string },
+): Promise<(MessageLike & { id: string }) | null> {
+  if (message.role !== "user" || typeof message.text !== "string") return message;
+  const exact = { ...message, _source: "server" };
+  const payload = Buffer.from(JSON.stringify(exact), "utf8");
+  if (payload.length <= USER_MESSAGE_INLINE_BYTES) return message;
+  const contentSha256 = sha256Bytes(payload);
+  const inserted = await client.query(
+    `INSERT INTO client_session_user_payloads
+       (session_id,user_id,msg_id,payload,text_payload,content_sha256,payload_bytes,
+        model_token_estimate,created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     ON CONFLICT (session_id,user_id,msg_id) DO NOTHING
+     RETURNING msg_id`,
+    [
+      sessionId,
+      userId,
+      message.id,
+      payload,
+      message.text,
+      contentSha256,
+      payload.length,
+      estimateModelHistoryTokens(message.text),
+      typeof message.ts === "number" && Number.isFinite(message.ts) ? message.ts : Date.now(),
+    ],
+  );
+  if ((inserted.rowCount ?? 0) === 0) {
+    const existing = (
+      await client.query<{ content_sha256: string; payload_bytes: string }>(
+        `SELECT content_sha256,payload_bytes::text AS payload_bytes
+           FROM client_session_user_payloads
+          WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+        [sessionId, userId, message.id],
+      )
+    ).rows[0];
+    if (
+      !existing ||
+      existing.content_sha256 !== contentSha256 ||
+      bigIntNum(existing.payload_bytes, "user payload bytes") !== payload.length
+    ) return null;
+  }
+  return {
+    id: message.id,
+    role: "user",
+    text: "",
+    ts: typeof message.ts === "number" && Number.isFinite(message.ts) ? message.ts : Date.now(),
+    _source: "server",
+    _payloadDeferred: true,
+    _userPayloadDeferred: true,
+    _payloadBytes: payload.length,
+    _payloadSha256: contentSha256,
+  };
+}
+
 /**
  * server-authored append 执行核心(在事务内,已由调用方取好 advisory / 上层锁)。行为等价于
  * SQLite 的 _appendServerAuthoredCore:FOR UPDATE 锁 client_sessions 行(不带 deleted_at 过滤
@@ -436,8 +506,14 @@ async function pgAppendServerAuthoredCore(
     return { applied: false, reason: "malformed" };
   }
 
+  const hotExisting = msgs.some((item) => item && item.id === message.id);
+  const plannedMessage = hotExisting
+    ? message
+    : await deferOversizedUserMessage(client, sessId, userId, message);
+  if (plannedMessage === null) return { applied: false, reason: "malformed" };
+
   const currentNextSeq = typeof row.next_seq === "number" && row.next_seq > 0 ? row.next_seq : 1;
-  const plan = planAppendServerAuthored(msgs, message, currentNextSeq, bigIntNumOr(row.archived_through_seq, 0));
+  const plan = planAppendServerAuthored(msgs, plannedMessage, currentNextSeq, bigIntNumOr(row.archived_through_seq, 0));
   if (plan.kind === "already_exists") {
     // 幂等重发:该消息行已在热尾巴,回其现有 _seq 供 admit 复用 anchor(dispatch 通常也已存在)。
     return { applied: false, reason: "already_exists", seq: seqOfMessage(msgs, message.id) };
@@ -585,8 +661,14 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_turn_tapes", "physical_record_count", "integer"],
   ["client_session_turn_tapes", "logical_record_count", "integer"],
   ["client_session_turn_tapes", "record_payload_bytes", "bigint"],
+  ["client_session_turn_tapes", "model_record_count", "integer"],
   ["client_session_turn_tape_parts", "payload", "bytea"],
   ["client_session_turn_tape_records", "payload", "bytea"],
+  ["client_session_turn_tape_records", "visible_payload", "bytea"],
+  ["client_session_turn_tape_records", "visible_content_sha256", "text"],
+  ["client_session_turn_tape_model_records", "semantic_text", "text"],
+  ["client_session_turn_tape_model_records", "token_estimate", "integer"],
+  ["client_session_user_payloads", "model_token_estimate", "integer"],
   ["server_authored_turn_anchor_map", "turn_key", "text"],
   ["turn_tape_cost_components", "request_id", "text"],
   ["session_goals", "session_id", "text"],
@@ -640,6 +722,7 @@ export type LosslessTurnTapeFinalizeResult =
 /**
  * finalize 收敛 dispatch(RFC §2.4)。仅当 tape header 带 dispatch_id 时调用(legacy tape 跳过)。
  *   - 非终态(admitted/accepted/rejecting)→ CAS terminal,outcome 映射 tape.status;
+ *   - terminal(executed_error/RESULT_RECOVERY_PENDING)→ 以迟到的真实 tape 精确终态收敛;
  *   - 已 terminal(not_accepted)= late tape → manual_reconcile(late_tape);直接状态读随之消失;
  *   - 已 terminal(completed 等)/ manual_reconcile → 幂等 no-op。
  * CAS-first(原子);仅失败后读一次判 late tape(此时行已终态,读值稳定)。
@@ -659,6 +742,25 @@ async function convergeDispatchOnFinalize(
   });
   if (converged !== null) return { lateTape: false };
   const d = await getDispatch(client, dispatchId);
+  if (
+    d && d.status === "terminal" && d.outcome === "executed_error" &&
+    d.failureCode === "RESULT_RECOVERY_PENDING"
+  ) {
+    // The reconciler's recovery sentinel is explicitly provisional: it says
+    // the executor ended before a complete tape was visible. A later verified
+    // finalize is the stronger authority. Replace only that exact sentinel;
+    // other executed_error outcomes remain immutable and reviewable.
+    await client.query(
+      `UPDATE turn_dispatches
+          SET outcome=$2, failure_code=NULL, client_notified=FALSE,
+              terminal_at=clock_timestamp()
+        WHERE dispatch_id=$1 AND status='terminal'
+          AND outcome='executed_error'
+          AND failure_code='RESULT_RECOVERY_PENDING'`,
+      [dispatchId, outcome],
+    );
+    return { lateTape: false };
+  }
   if (d && d.status === "terminal" && d.outcome === "not_accepted") {
     const held = await casToManualReconcile(client, {
       dispatchId,
@@ -1125,14 +1227,15 @@ function expandHydratedRuntimeBatch(
 }
 
 // ── Direct immutable-tape reads ─────────────────────────────────────────────
-// The browser reads the same post-redaction bytes that were committed by the
-// turn materializer. Request/page/chunk sizes below are transport quanta only:
-// every response carries a cursor or byte range and there is no total-content
-// ceiling, truncation sentinel, terminal-row substitute, or materialized cache.
+// The database retains the full audit tape. Browser reads preserve every
+// semantic record and every future/unknown field by default. The only
+// transformation is a narrow denylist for known platform-private collectors
+// and runtime credential/config fields. This must never become another
+// projection allowlist: new Agent roles, block kinds and payload fields are
+// visible automatically.
 const TAPE_RECORD_PAGE_MAX_ROWS = 200;
 const TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES = 8 * 1024 * 1024;
 const TAPE_RECORD_INLINE_QUANTUM_BYTES = 1024 * 1024;
-export const TAPE_RECORD_PAYLOAD_CHUNK_BYTES = 1024 * 1024;
 
 interface DirectTapeSourceRecord {
   msg_id: string;
@@ -1140,6 +1243,22 @@ interface DirectTapeSourceRecord {
   role: string;
   content_sha256: string;
   payload: Buffer;
+  visible_payload: Buffer | null;
+  visible_content_sha256: string | null;
+}
+
+interface DirectTapeVisibleHead {
+  tape_id: string;
+  msg_id: string;
+  ordinal: number;
+  role: string;
+  ts: string;
+  payload_bytes: string;
+  visible_content_sha256: string | null;
+  billing_anchor_id: string;
+  waiver_applied: boolean;
+  cost_credits: string;
+  delegate_costs: unknown;
 }
 
 interface DirectTapeHeader {
@@ -1149,9 +1268,571 @@ interface DirectTapeHeader {
   totalBytes: number;
   physicalCount: number;
   logicalCount: number;
-  narrativeCount: number;
   status: string;
+  turnKey: string;
   clientMessageId: string | null;
+}
+
+const PRIVATE_TAPE_ROOT_FIELDS = new Set([
+  "engineBilling",
+  "engineBillings",
+  "goalUsageRecords",
+  "runtimeEvents",
+]);
+
+const PRIVATE_NESTED_DELEGATE_FIELDS = new Set([
+  "_nestedDelegateRuntimeEvents",
+  "_durableDelegateRuntimeEvents",
+  "_durableDelegateEngineBillings",
+  "_durableDelegateGoalUsageRecords",
+]);
+
+const PRIVATE_RUNTIME_FIELD_NAMES = new Set([
+  "account",
+  "accessToken",
+  "apiKeySource",
+  "auth",
+  "authorization",
+  "balance",
+  "collaborationMode",
+  "config",
+  "cookie",
+  "cookies",
+  "credentials",
+  "cwd",
+  "developerInstructions",
+  "env",
+  "headers",
+  "idToken",
+  "mcpServers",
+  "planType",
+  "plugins",
+  "rateLimits",
+  "refreshToken",
+  "signature",
+  "skills",
+  "systemInstructions",
+  "systemPrompt",
+  "threadSettings",
+]);
+
+function normalizedPrivateField(key: string): string {
+  return key.replace(/^_+/, "").replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+}
+
+const NORMALIZED_PRIVATE_RUNTIME_FIELDS = new Set(
+  [...PRIVATE_RUNTIME_FIELD_NAMES].map(normalizedPrivateField),
+);
+
+function sanitizeNestedDelegateValue(value: unknown): { value: unknown; omitted: boolean } {
+  if (Array.isArray(value)) {
+    let omitted = false;
+    const items = value.map((item) => {
+      const next = sanitizeNestedDelegateValue(item);
+      omitted ||= next.omitted;
+      return next.value;
+    });
+    return { value: items, omitted };
+  }
+  if (!value || typeof value !== "object") return { value, omitted: false };
+  const source = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  let omitted = false;
+  for (const [key, child] of Object.entries(source)) {
+    if (PRIVATE_NESTED_DELEGATE_FIELDS.has(key)) {
+      omitted = true;
+      continue;
+    }
+    const next = sanitizeNestedDelegateValue(child);
+    omitted ||= next.omitted;
+    out[key] = next.value;
+  }
+  return { value: out, omitted };
+}
+
+function sanitizeRuntimeValue(value: unknown): { value: unknown; omitted: boolean } {
+  if (Array.isArray(value)) {
+    let omitted = false;
+    const items = value.map((item) => {
+      const next = sanitizeRuntimeValue(item);
+      omitted ||= next.omitted;
+      return next.value;
+    });
+    return { value: items, omitted };
+  }
+  if (!value || typeof value !== "object") return { value, omitted: false };
+  const source = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  let omitted = false;
+  for (const [key, child] of Object.entries(source)) {
+    if (
+      PRIVATE_TAPE_ROOT_FIELDS.has(key) ||
+      PRIVATE_NESTED_DELEGATE_FIELDS.has(key) ||
+      NORMALIZED_PRIVATE_RUNTIME_FIELDS.has(normalizedPrivateField(key))
+    ) {
+      omitted = true;
+      continue;
+    }
+    const next = sanitizeRuntimeValue(child);
+    omitted ||= next.omitted;
+    out[key] = next.value;
+  }
+  return { value: out, omitted };
+}
+
+/** Preserve the actual Agent record, including unknown roles/block kinds and
+ * future fields. Only known platform-private metadata is removed. */
+export function userVisibleTapeRecord(value: MessageLike): MessageLike | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  let visible: Record<string, unknown> = { ...source };
+  let omitted = false;
+  for (const key of PRIVATE_TAPE_ROOT_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(visible, key)) {
+      delete visible[key];
+      omitted = true;
+    }
+  }
+  if (source.role === "agent-group") {
+    // The materialized group keeps both its future/raw fields and the
+    // renderer-facing childBlocks. Walk the whole group so a private nested
+    // collector cannot survive through an otherwise user-visible alias such
+    // as transcript, while leaving every unrelated future field untouched.
+    const group = sanitizeNestedDelegateValue(visible);
+    visible = group.value as Record<string, unknown>;
+    omitted ||= group.omitted;
+  }
+  if (source.role === "runtime-event") {
+    if (!source._runtimeEvent || typeof source._runtimeEvent !== "object" || Array.isArray(source._runtimeEvent)) {
+      throw new Error("[pgSessions] runtime tape record lacks a structured event payload");
+    }
+    const event = sanitizeRuntimeValue(source._runtimeEvent);
+    visible._runtimeEvent = event.value;
+    visible.text = JSON.stringify(event.value);
+    delete visible._hiddenRuntimeEvent;
+    omitted ||= event.omitted;
+  }
+  for (const key of PRIVATE_NESTED_DELEGATE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(visible, key)) {
+      delete visible[key];
+      omitted = true;
+    }
+  }
+  if (omitted) visible._internalFieldsOmitted = true;
+  return visible as MessageLike;
+}
+
+type UserVisiblePhysicalPayload = {
+  bytes: Buffer;
+  contentSha256: string;
+  msgId: string;
+  role: string;
+  modelRecords: Array<{
+    logicalOrdinal: number;
+    msgId: string;
+    role: string;
+    semanticText: string;
+    tokenEstimate: number;
+    ts: number | null;
+    clientMessageId: string | null;
+  }>;
+};
+
+type PreparedLosslessTurnTape = {
+  turn: ReturnType<typeof materializeLosslessTurn>;
+  visible: UserVisiblePhysicalPayload[];
+  partManifest: Array<{ partIndex: number; partSha256: string; payloadBytes: number }>;
+  recordPayloadBytes: number;
+};
+
+let finalizeAdmissionTail: Promise<void> = Promise.resolve();
+
+async function waitForPhysicalFinalizeMemory(totalBytes: number): Promise<void> {
+  // One canonical byte buffer plus materialized record buffers are external
+  // memory; UTF-8 decoding and JSON.parse need heap. These estimates are tied
+  // to the actual declared tape size and live process/cgroup memory, not a
+  // product content limit. A turn waits FIFO until the machine can process it.
+  const externalNeed = totalBytes * 3;
+  const heapNeed = totalBytes * 2;
+  for (;;) {
+    const availableSystem = typeof process.availableMemory === "function"
+      ? process.availableMemory()
+      : freemem();
+    const heapAvailable = Math.max(
+      0,
+      getHeapStatistics().heap_size_limit - process.memoryUsage().heapUsed,
+    );
+    if (availableSystem >= externalNeed && heapAvailable >= heapNeed) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+async function acquireFinalizeMemoryAdmission(totalBytes: number): Promise<() => void> {
+  const previous = finalizeAdmissionTail;
+  let release!: () => void;
+  finalizeAdmissionTail = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  await waitForPhysicalFinalizeMemory(totalBytes);
+  return release;
+}
+
+function modelContinuityRecords(records: MessageLike[]): UserVisiblePhysicalPayload["modelRecords"] {
+  const out: UserVisiblePhysicalPayload["modelRecords"] = [];
+  for (let logicalOrdinal = 0; logicalOrdinal < records.length; logicalOrdinal++) {
+    const record = records[logicalOrdinal]!;
+    let role: string | null = modelHistorySemanticRole(record);
+    let semanticText = modelHistorySemanticText(record);
+    if (!role && record.role === "runtime-event") {
+      const event = record._runtimeEvent;
+      if (event && typeof event === "object" && !Array.isArray(event)) {
+        const raw = event as Record<string, unknown>;
+        if (raw.type === "system" && raw.subtype === "bash_output_tail") {
+          // The exact tail is a real tool result continuation. Finite model
+          // context reads do not hydrate the heavyweight tape (and therefore
+          // cannot perform the old in-memory merge), so retain the same fact
+          // as an ordered tool semantic record.
+          role = "tool";
+          semanticText = `Exact tool output tail: ${JSON.stringify({
+            toolUseId: raw.tool_use_id,
+            parentToolUseId: raw.parent_tool_use_id,
+            tail: raw.tail,
+            totalBytes: raw.total_bytes,
+            truncatedHead: raw.truncated_head === true,
+          })}`;
+        }
+      }
+    }
+    if (!role || semanticText.trim().length === 0) continue;
+    out.push({
+      logicalOrdinal,
+      msgId: typeof record.id === "string" && record.id.length > 0
+        ? record.id
+        : `logical-${logicalOrdinal}`,
+      role,
+      semanticText,
+      tokenEstimate: estimateModelHistoryTokens(semanticText),
+      ts: typeof record.ts === "number" && Number.isFinite(record.ts) ? record.ts : null,
+      clientMessageId: typeof record._clientMessageId === "string"
+        ? record._clientMessageId
+        : null,
+    });
+  }
+  return out;
+}
+
+function encodeUserVisibleRuntimeBatch(
+  physical: MessageLike,
+  row: HydratedTapeRow,
+  records: MessageLike[],
+): Buffer {
+  const parts = records.map((record) => Buffer.from(JSON.stringify(record), "utf8"));
+  let offset = 0;
+  const manifest = records.map((record, index) => {
+    const bytes = parts[index]!;
+    const entry = {
+      id: record.id,
+      eventOrdinal: record._ocEventOrdinal,
+      ts: record.ts,
+      source: record._runtimeSource,
+      offset,
+      length: bytes.length,
+      payloadSha256: sha256Bytes(bytes),
+    };
+    offset += bytes.length;
+    return entry;
+  });
+  const raw = Buffer.concat(parts);
+  const compressed = gzipSync(raw, { level: 9 });
+  const wrapper: MessageLike = {
+    id: row.msg_id,
+    role: "runtime-event",
+    text: "",
+    ts: typeof physical.ts === "number" ? physical.ts : records[0]?.ts ?? 0,
+    _runtimeEventBatch: {
+      version: 1,
+      encoding: "gzip+base64",
+      logicalCount: records.length,
+      uncompressedBytes: raw.length,
+      compressedBytes: compressed.length,
+      manifest,
+      manifestSha256: sha256Bytes(Buffer.from(JSON.stringify(manifest), "utf8")),
+      data: compressed.toString("base64"),
+    },
+  };
+  if (physical.usage !== undefined) wrapper.usage = structuredClone(physical.usage);
+  return Buffer.from(JSON.stringify(wrapper), "utf8");
+}
+
+/** Validate the audit bytes, then produce deterministic user-visible bytes.
+ * A null result means the physical record contains only opaque engine state. */
+function userVisiblePhysicalPayload(
+  row: HydratedTapeRow,
+  tapeSha256: string,
+  billingAnchorId: string,
+): UserVisiblePhysicalPayload | null {
+  const anchor: MessageLike = { id: billingAnchorId, _turnTapeSha256: tapeSha256 };
+  const hydrated = hydrateTapeRecord(row, anchor, false, true);
+  let bytes: Buffer;
+  let visibleRecords: MessageLike[];
+  if (hydrated._runtimeEventBatch !== undefined) {
+    const expanded = expandHydratedRuntimeBatch(hydrated, row, anchor).messages;
+    const visible = expanded
+      .map(userVisibleTapeRecord)
+      .filter((message): message is MessageLike => message !== null);
+    if (visible.length === 0) return null;
+    visibleRecords = visible;
+    bytes = encodeUserVisibleRuntimeBatch(hydrated, row, visible);
+  } else {
+    const visible = userVisibleTapeRecord(hydrated);
+    if (!visible) return null;
+    visibleRecords = [visible];
+    bytes = Buffer.from(JSON.stringify(visible), "utf8");
+  }
+  return {
+    bytes,
+    contentSha256: sha256Bytes(bytes),
+    msgId: row.msg_id,
+    role: row.role,
+    modelRecords: modelContinuityRecords(visibleRecords),
+  };
+}
+
+async function prepareLosslessTurnTapeOutsideLocks(
+  pool: Pool,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+): Promise<PreparedLosslessTurnTape | null> {
+  const header = (
+    await pool.query<{
+      agent_id: string;
+      turn_index: number;
+      status: string;
+      turn_key: string;
+      tape_sha256: string;
+      total_bytes: string;
+      part_count: number;
+      created_at: string;
+      waive_reason: string | null;
+      finalized_at: string | null;
+    }>(
+      `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,
+              part_count,created_at,waive_reason,finalized_at
+         FROM client_session_turn_tapes
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [request.sessionId, userId, request.tapeId],
+    )
+  ).rows[0];
+  if (!header || header.finalized_at !== null) return null;
+  if (
+    header.agent_id !== request.agentId ||
+    header.turn_index !== request.turnIndex ||
+    header.status !== request.status ||
+    header.turn_key !== request.turnKey ||
+    header.tape_sha256 !== request.tapeSha256 ||
+    bigIntNum(header.total_bytes, "turn_tape.total_bytes") !== request.totalBytes ||
+    header.part_count !== request.partCount ||
+    bigIntNum(header.created_at, "turn_tape.created_at") !== request.createdAt ||
+    header.waive_reason !== (request.waiveReason ?? null)
+  ) {
+    throw new Error("lossless turn tape finalize header conflict");
+  }
+
+  const canonical = Buffer.allocUnsafe(request.totalBytes);
+  const aggregate = createHash("sha256");
+  const partManifest: PreparedLosslessTurnTape["partManifest"] = [];
+  let writeOffset = 0;
+  for (let partIndex = 0; partIndex < request.partCount; partIndex++) {
+    const part = (
+      await pool.query<{ part_sha256: string; payload: Buffer }>(
+        `SELECT part_sha256,payload
+           FROM client_session_turn_tape_parts
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND part_index=$4`,
+        [request.sessionId, userId, request.tapeId, partIndex],
+      )
+    ).rows[0];
+    if (!part) return null;
+    const bytes = Buffer.from(part.payload);
+    if (sha256Bytes(bytes) !== part.part_sha256) {
+      throw new Error("lossless turn tape part hash mismatch");
+    }
+    if (writeOffset + bytes.length > canonical.length) {
+      throw new Error("lossless turn tape aggregate length mismatch");
+    }
+    bytes.copy(canonical, writeOffset);
+    aggregate.update(bytes);
+    partManifest.push({ partIndex, partSha256: part.part_sha256, payloadBytes: bytes.length });
+    writeOffset += bytes.length;
+  }
+  if (writeOffset !== request.totalBytes || aggregate.digest("hex") !== request.tapeSha256) {
+    throw new Error("lossless turn tape aggregate hash mismatch");
+  }
+  let rawPayload: unknown;
+  try {
+    rawPayload = JSON.parse(canonical.toString("utf8"));
+  } catch (err) {
+    throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
+  }
+  const turn = materializeLosslessTurn(rawPayload);
+  if (
+    turn.payload.sessionId !== request.sessionId ||
+    turn.payload.agentId !== request.agentId ||
+    turn.payload.turnIndex !== request.turnIndex ||
+    turn.payload.status !== request.status ||
+    turn.payload.turnKey !== request.turnKey ||
+    turn.payload.waiveReason !== request.waiveReason
+  ) {
+    throw new Error("lossless turn tape envelope/payload identity mismatch");
+  }
+  const visible = turn.records.map((item, ordinal) => {
+    const payload = userVisiblePhysicalPayload({
+      tape_id: request.tapeId,
+      tape_sha256: request.tapeSha256,
+      waive_reason: null,
+      waiver_applied: false,
+      msg_id: item.id,
+      ordinal,
+      role: item.role,
+      content_sha256: item.payloadSha256,
+      payload: item.payloadBytes,
+      cost_credits: "0",
+      delegate_costs: [],
+    }, request.tapeSha256, turn.billingAnchorId);
+    if (!payload) {
+      throw new Error(`[pgSessions] lossless tape record is not a JSON object: ${item.id}`);
+    }
+    return payload;
+  });
+  return {
+    turn,
+    visible,
+    partManifest,
+    recordPayloadBytes: turn.records.reduce(
+      (sum, record) => sum + record.payloadBytes.length,
+      0,
+    ),
+  };
+}
+
+async function stagePreparedLosslessTurnRecords(
+  pool: Pool,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+  prepared: PreparedLosslessTurnTape,
+): Promise<number> {
+  let modelRecordCount = 0;
+  for (let ordinal = 0; ordinal < prepared.turn.records.length; ordinal++) {
+    const item = prepared.turn.records[ordinal]!;
+    const visible = prepared.visible[ordinal]!;
+    const inserted = await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload,
+          visible_payload,visible_content_sha256)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (session_id,user_id,tape_id,msg_id) DO NOTHING`,
+      [
+        request.sessionId,
+        userId,
+        request.tapeId,
+        item.id,
+        ordinal,
+        item.role,
+        item.ts,
+        item.payloadSha256,
+        item.payloadBytes,
+        visible.bytes,
+        visible.contentSha256,
+      ],
+    );
+    if ((inserted.rowCount ?? 0) === 0) {
+      const existing = (
+        await pool.query<{
+          ordinal: number;
+          content_sha256: string;
+          visible_content_sha256: string | null;
+        }>(
+          `SELECT ordinal,content_sha256,visible_content_sha256
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND msg_id=$4`,
+          [request.sessionId, userId, request.tapeId, item.id],
+        )
+      ).rows[0];
+      if (
+        !existing || existing.ordinal !== ordinal ||
+        existing.content_sha256 !== item.payloadSha256 ||
+        (existing.visible_content_sha256 !== null &&
+          existing.visible_content_sha256 !== visible.contentSha256)
+      ) {
+        throw new Error("lossless turn tape immutable record conflict");
+      }
+      await pool.query(
+        `UPDATE client_session_turn_tape_records
+            SET visible_payload=COALESCE(visible_payload,$5),
+                visible_content_sha256=COALESCE(visible_content_sha256,$6)
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND msg_id=$4`,
+        [request.sessionId, userId, request.tapeId, item.id, visible.bytes, visible.contentSha256],
+      );
+    }
+
+    for (const modelRecord of visible.modelRecords) {
+      const modelMsgId = modelRecord.msgId === `logical-${modelRecord.logicalOrdinal}`
+        ? `${item.id}:logical-${modelRecord.logicalOrdinal}`
+        : modelRecord.msgId;
+      const modelInserted = await pool.query(
+        `INSERT INTO client_session_turn_tape_model_records
+           (session_id,user_id,tape_id,physical_ordinal,logical_ordinal,msg_id,role,
+            semantic_text,token_estimate,ts,client_message_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (session_id,user_id,tape_id,physical_ordinal,logical_ordinal)
+         DO NOTHING`,
+        [
+          request.sessionId,
+          userId,
+          request.tapeId,
+          ordinal,
+          modelRecord.logicalOrdinal,
+          modelMsgId,
+          modelRecord.role,
+          modelRecord.semanticText,
+          modelRecord.tokenEstimate,
+          modelRecord.ts,
+          modelRecord.clientMessageId,
+        ],
+      );
+      if ((modelInserted.rowCount ?? 0) === 0) {
+        const existingModel = (
+          await pool.query<{
+            msg_id: string;
+            role: string;
+            semantic_text: string;
+            token_estimate: number;
+            ts: string | null;
+            client_message_id: string | null;
+          }>(
+            `SELECT msg_id,role,semantic_text,token_estimate,ts::text,client_message_id
+               FROM client_session_turn_tape_model_records
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+                AND physical_ordinal=$4 AND logical_ordinal=$5`,
+            [request.sessionId, userId, request.tapeId, ordinal, modelRecord.logicalOrdinal],
+          )
+        ).rows[0];
+        if (
+          !existingModel ||
+          existingModel.msg_id !== modelMsgId ||
+          existingModel.role !== modelRecord.role ||
+          existingModel.semantic_text !== modelRecord.semanticText ||
+          existingModel.token_estimate !== modelRecord.tokenEstimate ||
+          (existingModel.ts === null
+            ? null
+            : bigIntNum(existingModel.ts, "model record ts")) !== modelRecord.ts ||
+          existingModel.client_message_id !== modelRecord.clientMessageId
+        ) {
+          throw new Error("lossless turn tape immutable model record conflict");
+        }
+      }
+      modelRecordCount += 1;
+    }
+  }
+  return modelRecordCount;
 }
 
 async function readDirectTapeHeaders(
@@ -1169,28 +1850,79 @@ async function readDirectTapeHeaders(
       payload_bytes: string;
       physical_count: string;
       logical_count: string;
-      narrative_count: string;
       status: string;
+      turn_key: string;
       client_message_id: string | null;
     }>(
-      `SELECT t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status,
+      `SELECT t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status, t.turn_key,
               COALESCE(t.client_message_id, d.client_message_id) AS client_message_id,
               t.record_payload_bytes::text AS payload_bytes,
               t.physical_record_count::text AS physical_count,
-              t.logical_record_count::text AS logical_count,
-              COUNT(r.msg_id) FILTER (WHERE r.role IN ('assistant','error'))::text AS narrative_count
+              t.logical_record_count::text AS logical_count
          FROM client_session_turn_tapes t
-         LEFT JOIN client_session_turn_tape_records r
-           ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
          LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
         WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
-          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL
-        GROUP BY t.tape_id, t.tape_sha256, t.billing_anchor_id, t.status,
-                 t.client_message_id, d.client_message_id, t.record_payload_bytes,
-                 t.physical_record_count, t.logical_record_count`,
+          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
       [sessionId, userId, tapeIds],
     )
   ).rows;
+  const legacyTapeIds = rows
+    .filter((row) => row.payload_bytes === "0" || row.physical_count === "0" || row.logical_count === "0")
+    .map((row) => row.tape_id);
+  if (legacyTapeIds.length > 0) {
+    // Migration 0176 deliberately avoids a production-wide >1 GiB backfill.
+    // Derive only tapes on the requested lazy page through the tape PK index,
+    // then cache the exact totals so subsequent reads stay O(number of tapes).
+    const derived = (
+      await pool.query<{
+        tape_id: string;
+        payload_bytes: string;
+        physical_count: string;
+        logical_count: string;
+      }>(
+        `WITH totals AS (
+           SELECT r.session_id, r.user_id, r.tape_id,
+                  COUNT(*)::integer AS physical_count,
+                  COALESCE(SUM(octet_length(r.payload)),0)::bigint AS payload_bytes,
+                  COALESCE(SUM(
+                    CASE
+                      WHEN r.role='runtime-event' AND r.msg_id LIKE '%-runtime-batch-%'
+                      THEN substring(
+                        convert_from(r.payload, 'UTF8')
+                        FROM '"logicalCount"[[:space:]]*:[[:space:]]*([0-9]+)'
+                      )::integer
+                      ELSE 1
+                    END
+                  ),0)::integer AS logical_count
+             FROM client_session_turn_tape_records r
+            WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
+            GROUP BY r.session_id, r.user_id, r.tape_id
+         )
+         UPDATE client_session_turn_tapes t
+            SET physical_record_count=CASE WHEN t.physical_record_count=0
+                                           THEN totals.physical_count ELSE t.physical_record_count END,
+                logical_record_count=CASE WHEN t.logical_record_count=0
+                                          THEN totals.logical_count ELSE t.logical_record_count END,
+                record_payload_bytes=CASE WHEN t.record_payload_bytes=0
+                                          THEN totals.payload_bytes ELSE t.record_payload_bytes END
+           FROM totals
+          WHERE t.session_id=totals.session_id AND t.user_id=totals.user_id
+            AND t.tape_id=totals.tape_id
+          RETURNING t.tape_id, t.record_payload_bytes::text AS payload_bytes,
+                    t.physical_record_count::text AS physical_count,
+                    t.logical_record_count::text AS logical_count`,
+        [sessionId, userId, legacyTapeIds],
+      )
+    ).rows;
+    const byTape = new Map(derived.map((row) => [row.tape_id, row]));
+    for (const row of rows) {
+      const exact = byTape.get(row.tape_id);
+      if (!exact) continue;
+      row.payload_bytes = exact.payload_bytes;
+      row.physical_count = exact.physical_count;
+      row.logical_count = exact.logical_count;
+    }
+  }
   return new Map(
     rows.map((row) => [
       row.tape_id,
@@ -1201,8 +1933,8 @@ async function readDirectTapeHeaders(
         totalBytes: bigIntNum(row.payload_bytes, "turn tape payload bytes"),
         physicalCount: bigIntNum(row.physical_count, "turn tape physical count"),
         logicalCount: bigIntNum(row.logical_count, "turn tape logical count"),
-        narrativeCount: bigIntNum(row.narrative_count, "turn tape narrative count"),
         status: row.status,
+        turnKey: row.turn_key,
         clientMessageId: row.client_message_id,
       },
     ]),
@@ -1215,11 +1947,25 @@ async function readHydratedTapeRows(
   userId: string,
   tapeIds: string[],
   roles?: string[],
+  recordRefs?: Array<{ tapeId: string; msgId: string }>,
 ): Promise<HydratedTapeRow[]> {
   if (tapeIds.length === 0) return [];
-  const roleClause = roles && roles.length > 0 ? "AND r.role=ANY($4::text[])" : "";
+  let nextParam = 4;
+  const roleClause = roles && roles.length > 0
+    ? `AND r.role=ANY($${nextParam++}::text[])`
+    : "";
+  const recordClause = recordRefs && recordRefs.length > 0
+    ? `AND (r.tape_id, r.msg_id) IN (
+         SELECT selected.tape_id, selected.msg_id
+           FROM unnest($${nextParam++}::text[], $${nextParam++}::text[])
+                AS selected(tape_id, msg_id)
+       )`
+    : "";
   const params: unknown[] = [sessionId, userId, tapeIds];
   if (roles && roles.length > 0) params.push(roles);
+  if (recordRefs && recordRefs.length > 0) {
+    params.push(recordRefs.map((ref) => ref.tapeId), recordRefs.map((ref) => ref.msgId));
+  }
   return (
     await pool.query<HydratedTapeRow>(
       `SELECT r.tape_id, t.tape_sha256, t.waive_reason,
@@ -1275,8 +2021,81 @@ async function readHydratedTapeRows(
            ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
         WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
           ${roleClause}
+          ${recordClause}
         ORDER BY r.tape_id, r.ordinal`,
       params,
+    )
+  ).rows;
+}
+
+/** Browser timeline hydration reads locator metadata only. Thousands of tiny
+ * tape anchors can fit in the bounded hot row while their assistant BYTEA
+ * payloads total gigabytes; mounted viewport rows fetch those exact bytes from
+ * the range endpoint instead of amplifying one session GET. */
+async function readDirectTapeVisibleHeads(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<DirectTapeVisibleHead[]> {
+  if (tapeIds.length === 0) return [];
+  return (
+    await pool.query<DirectTapeVisibleHead>(
+      `SELECT r.tape_id, r.msg_id, r.ordinal, r.role, r.ts::text,
+              COALESCE(octet_length(r.visible_payload), octet_length(r.payload))::text
+                AS payload_bytes,
+              r.visible_content_sha256, t.billing_anchor_id,
+              EXISTS (
+                SELECT 1 FROM turn_waivers w
+                 WHERE ('c:' || w.user_id::text)=t.user_id
+                   AND w.turn_key=t.turn_key AND w.status='applied'
+              ) AS waiver_applied,
+              COALESCE((
+                SELECT SUM(exact_cost.cost_credits)::text
+                  FROM (
+                    SELECT c.cost_credits::numeric AS cost_credits
+                      FROM turn_tape_cost_components c
+                     WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                       AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                    UNION ALL
+                    SELECT p.cost_credits::numeric AS cost_credits
+                      FROM pending_usage_patches p
+                     WHERE p.user_id=r.user_id AND r.msg_id=t.billing_anchor_id
+                       AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+                  ) exact_cost
+              ), '0') AS cost_credits,
+              COALESCE((
+                SELECT jsonb_agg(
+                         jsonb_build_object(
+                           'agentId', grouped.delegate_agent_id,
+                           'costCredits', grouped.cost_credits
+                         ) ORDER BY grouped.delegate_agent_id
+                       )
+                  FROM (
+                    SELECT exact_delegate.delegate_agent_id,
+                           SUM(exact_delegate.cost_credits)::text AS cost_credits
+                      FROM (
+                        SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
+                          FROM turn_tape_cost_components c
+                         WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                           AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                        UNION ALL
+                        SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
+                          FROM pending_usage_patches p
+                         WHERE p.user_id=r.user_id AND r.msg_id=t.billing_anchor_id
+                           AND (p.turn_key=t.turn_key OR p.parent_turn_key=t.turn_key)
+                      ) exact_delegate
+                     WHERE exact_delegate.delegate_agent_id IS NOT NULL
+                     GROUP BY exact_delegate.delegate_agent_id
+                  ) grouped
+              ), '[]'::jsonb) AS delegate_costs
+         FROM client_session_turn_tape_records r
+         JOIN client_session_turn_tapes t
+           ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+        WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
+          AND r.msg_id=t.billing_anchor_id
+        ORDER BY r.tape_id, r.ordinal`,
+      [sessionId, userId, tapeIds],
     )
   ).rows;
 }
@@ -1292,7 +2111,10 @@ function directTapeProcessRow(anchor: MessageLike, header: DirectTapeHeader): Me
     _turnTapeSha256: header.tapeSha256,
     _turnTapeComplete: true,
     _turnTapeProcess: true,
-    _turnTapeProcessCount: Math.max(0, header.logicalCount - header.narrativeCount),
+    // The billing anchor is rendered separately as the final row. Everything
+    // else is reachable through this cursor, including future record roles and
+    // every logical runtime event inside a physical batch.
+    _turnTapeProcessCount: Math.max(0, header.logicalCount - 1),
     _turnTapeTotalBytes: header.totalBytes,
     _dispatchOutcome: header.status,
     ...(header.clientMessageId ? { _clientMessageId: header.clientMessageId } : {}),
@@ -1303,16 +2125,21 @@ function directTapeProcessRow(anchor: MessageLike, header: DirectTapeHeader): Me
 
 /**
  * Exact/admin reads hydrate every physical and logical record. Browser chat
- * reads hydrate only genuine assistant/error narrative rows and add one typed
- * process control before them. The control contains no generated content; it
- * merely owns the cursor that lazily exposes every remaining immutable record.
+ * reads return metadata-only assistant/error locators and add one typed
+ * process control before them. Mounted viewport rows fetch exact immutable
+ * bytes; the control owns the cursor for every remaining semantic record.
  */
 async function hydrateTurnTapeMessages(
   pool: Pool,
   sessionId: string,
   userId: string,
   messages: MessageLike[],
-  options: ClientSessionReadOptions = {},
+  options: ClientSessionReadOptions & {
+    deferTimelineNarrative?: boolean;
+    /** Private runner continuity view: hydrate every user-visible semantic
+     * fact, but still skip thinking and opaque audit envelopes. */
+    engineContext?: boolean;
+  } = {},
 ): Promise<MessageLike[]> {
   const refs = messages.filter(
     (message) =>
@@ -1321,23 +2148,72 @@ async function hydrateTurnTapeMessages(
       typeof message._turnTapeSha256 === "string",
   );
   if (refs.length === 0) return messages;
-  const tapeIds = [...new Set(refs.map((message) => message._turnTapeId as string))];
+  const completeRefs = refs.filter((message) => message._turnTapeComplete === true);
+  const rollingRefs = refs
+    .filter((message) => message._turnTapeComplete !== true)
+    .map((message) => {
+      if (typeof message._turnTapeMsgId !== "string") {
+        throw new Error(`[pgSessions] lossless turn tape anchor malformed: ${message._turnTapeId}`);
+      }
+      return {
+        tapeId: message._turnTapeId as string,
+        msgId: message._turnTapeMsgId,
+      };
+    });
+  const completeTapeIds = [
+    ...new Set(completeRefs.map((message) => message._turnTapeId as string)),
+  ];
+  const rollingTapeIds = [...new Set(rollingRefs.map((ref) => ref.tapeId))];
   const exact = options.view !== "timeline";
-  const [headers, rows] = await Promise.all([
-    readDirectTapeHeaders(pool, sessionId, userId, tapeIds),
-    readHydratedTapeRows(pool, sessionId, userId, tapeIds, exact ? undefined : ["assistant", "error"]),
+  const engineContext = options.engineContext === true;
+  const deferTimelineNarrative = !exact && options.deferTimelineNarrative !== false;
+  const timelineRoles = engineContext
+    ? ["assistant", "error", "tool", "plan", "goal", "agent-group", "runtime-event"]
+    : ["assistant", "error"];
+  const [headers, completeRows, timelineHeads, rollingRows] = await Promise.all([
+    readDirectTapeHeaders(pool, sessionId, userId, completeTapeIds),
+    deferTimelineNarrative
+      ? Promise.resolve([] as HydratedTapeRow[])
+      : readHydratedTapeRows(
+          pool,
+          sessionId,
+          userId,
+          completeTapeIds,
+          exact ? undefined : timelineRoles,
+        ),
+    deferTimelineNarrative
+      ? readDirectTapeVisibleHeads(pool, sessionId, userId, completeTapeIds)
+      : Promise.resolve([] as DirectTapeVisibleHead[]),
+    readHydratedTapeRows(pool, sessionId, userId, rollingTapeIds, undefined, rollingRefs),
   ]);
+  const rows = [...completeRows, ...rollingRows];
+  const byKey = new Map(rows.map((row) => [`${row.tape_id}\0${row.msg_id}`, row]));
   const byTape = new Map<string, HydratedTapeRow[]>();
-  for (const row of rows) {
+  for (const row of completeRows) {
     const list = byTape.get(row.tape_id) ?? [];
     list.push(row);
     byTape.set(row.tape_id, list);
+  }
+  const headsByTape = new Map<string, DirectTapeVisibleHead[]>();
+  for (const head of timelineHeads) {
+    const list = headsByTape.get(head.tape_id) ?? [];
+    list.push(head);
+    headsByTape.set(head.tape_id, list);
   }
 
   const hydrated = messages.flatMap((anchor): MessageLike[] => {
     const tapeId = typeof anchor._turnTapeId === "string" ? anchor._turnTapeId : null;
     const tapeSha256 = typeof anchor._turnTapeSha256 === "string" ? anchor._turnTapeSha256 : null;
     if (!tapeId || !tapeSha256) return [anchor];
+    if (anchor._turnTapeComplete !== true) {
+      if (typeof anchor._turnTapeMsgId !== "string") {
+        throw new Error(`[pgSessions] lossless turn tape anchor malformed: ${tapeId}`);
+      }
+      const key = `${tapeId}\0${anchor._turnTapeMsgId}`;
+      const row = byKey.get(key);
+      if (!row) throw new Error(`[pgSessions] lossless turn tape record missing: ${key}`);
+      return [hydrateTapeRecord(row, anchor, true)];
+    }
     const header = headers.get(tapeId);
     if (!header) throw new Error(`[pgSessions] finalized lossless turn tape missing: ${tapeId}`);
     if (header.tapeSha256 !== tapeSha256) {
@@ -1393,9 +2269,40 @@ async function hydrateTurnTapeMessages(
       return expanded;
     }
 
-    const narrative = tapeRows.map((row) =>
-      hydrateTapeRecord(row, anchor, false, anchor._turnTapeComplete === true),
-    );
+    const narrative = deferTimelineNarrative
+      ? (headsByTape.get(tapeId) ?? []).map((head) => {
+          let deferred = deferredTapeRecord(
+            tapeId,
+            header.tapeSha256,
+            {
+              msg_id: head.msg_id,
+              ordinal: head.ordinal,
+              role: head.role,
+              ts: head.ts,
+              ...(head.visible_content_sha256
+                ? { content_sha256: head.visible_content_sha256 }
+                : {}),
+            },
+            bigIntNum(head.payload_bytes, "turn tape timeline payload bytes"),
+          );
+          if (typeof anchor._seq === "number") deferred._seq = anchor._seq;
+          if (typeof anchor._orderSeq === "number") deferred._orderSeq = anchor._orderSeq;
+          deferred.status = header.status;
+          deferred._turnKey = header.turnKey;
+          deferred = mergeExactUsage(
+            deferred,
+            {
+              costCredits: head.cost_credits,
+              waiverApplied: head.waiver_applied,
+              delegates: parseDelegateCosts(head.delegate_costs),
+            },
+            head.msg_id === head.billing_anchor_id,
+          );
+          return deferred;
+        })
+      : tapeRows.map((row) =>
+          hydrateTapeRecord(row, anchor, false, anchor._turnTapeComplete === true),
+        );
     narrative.sort((a, b) =>
       (typeof a._turnTapeOrdinal === "number" ? a._turnTapeOrdinal : 0) -
       (typeof b._turnTapeOrdinal === "number" ? b._turnTapeOrdinal : 0),
@@ -1410,13 +2317,13 @@ async function hydrateTurnTapeMessages(
         if (typeof message._clientMessageId !== "string") message._clientMessageId = clientMessageId;
       }
     }
-    const process = header.physicalCount > header.narrativeCount
+    const process = header.logicalCount > 1
       ? [directTapeProcessRow(anchor, { ...header, clientMessageId: clientMessageId ?? null })]
       : [];
     return [...process, ...narrative];
   });
 
-  if (exact) {
+  if (exact || engineContext) {
     // Apply exact continuation Bash tails to their real tool records without
     // deleting the immutable runtime rows themselves.
     const topLevelTools = new Map<string, MessageLike>();
@@ -1469,38 +2376,399 @@ async function hydrateTurnTapeMessages(
   return hydrated;
 }
 
-function extractHistoryText(message: MessageLike): string {
-  if (typeof message.text === "string") return message.text;
-  if (!Array.isArray(message.content)) return "";
-  return message.content
-    .map((part) => part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
-      ? (part as { text: string }).text
-      : "")
-    .filter(Boolean)
-    .join("\n");
+type FiniteModelContextState = {
+  remainingTokens: number;
+  stopped: boolean;
+  newestFirst: MessageLike[];
+};
+
+type FiniteModelRecord = {
+  id: string;
+  role: string;
+  tokenEstimate: number;
+  ts?: number;
+  clientMessageId?: string;
+  seq?: number;
+  orderSeq?: number;
+};
+
+async function appendFiniteModelRecord(
+  state: FiniteModelContextState,
+  record: FiniteModelRecord,
+  loadFullText: () => Promise<string>,
+  loadSuffixText: (maxCharacters: number) => Promise<string>,
+): Promise<void> {
+  if (state.stopped) return;
+  const push = (text: string): void => {
+    state.newestFirst.push({
+      id: record.id,
+      role: record.role,
+      text,
+      ...(record.ts !== undefined ? { ts: record.ts } : {}),
+      ...(record.clientMessageId ? { _clientMessageId: record.clientMessageId } : {}),
+      ...(record.seq !== undefined ? { _seq: record.seq } : {}),
+      ...(record.orderSeq !== undefined ? { _orderSeq: record.orderSeq } : {}),
+    });
+  };
+  const rowTokens = record.tokenEstimate + 4;
+  if (rowTokens <= state.remainingTokens) {
+    const text = await loadFullText();
+    const exactTokens = estimateModelHistoryTokens(text) + 4;
+    if (exactTokens <= state.remainingTokens) {
+      push(text);
+      state.remainingTokens -= exactTokens;
+      return;
+    }
+    // A nullable rolling-predecessor estimate may be conservative/imprecise.
+    // The loaded value is still bounded by that estimate; select its exact
+    // suffix rather than overfilling the provider request.
+    const suffixBudget = Math.max(
+      0,
+      state.remainingTokens - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 4,
+    );
+    if (state.remainingTokens > 64 && suffixBudget > 0) {
+      const suffix = exactModelHistoryTextSuffix(text, suffixBudget);
+      if (suffix) push(MODEL_HISTORY_EXACT_SUFFIX_MARKER + suffix);
+    }
+    state.stopped = true;
+    return;
+  }
+  const suffixBudget = Math.max(
+    0,
+    state.remainingTokens - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 4,
+  );
+  if (state.remainingTokens > 64 && suffixBudget > 0) {
+    // Four UTF-16/code-point characters per token is the largest possible
+    // exact suffix under the shared estimator (ASCII case). PostgreSQL right()
+    // therefore bounds the value before it enters Node memory.
+    const bounded = await loadSuffixText(Math.min(2_000_000_000, suffixBudget * 4));
+    const suffix = exactModelHistoryTextSuffix(bounded, suffixBudget);
+    if (suffix) push(MODEL_HISTORY_EXACT_SUFFIX_MARKER + suffix);
+  }
+  state.stopped = true;
 }
 
-/** Model context remains bounded by the selected execution engine's physical
- * context budget. That bound never affects the browser timeline. */
-function selectMasterHistoryWindow(messages: MessageLike[]): MessageLike[] {
-  const rows = messages.filter((message) => {
-    if (!message || (message.role !== "user" && message.role !== "assistant")) return false;
-    if (message.system === true) return false;
-    return extractHistoryText(message).trim() !== "";
-  });
-  let selected = rows.slice(-MASTER_HISTORY_MAX_MESSAGES);
-  while (selected.length > 0) {
-    const chars = selected.reduce((sum, message) => sum + extractHistoryText(message).length, 0);
-    if (chars <= MASTER_HISTORY_MAX_CHARS) break;
-    selected = selected.slice(1);
+async function computeFiniteEngineContextMessages(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  hot: MessageLike[],
+  contextWindow: number,
+  options: EngineContextReadOptions,
+): Promise<MessageLike[]> {
+  const state: FiniteModelContextState = {
+    remainingTokens: availableModelHistoryTokens(
+      contextWindow,
+      options.currentUserText ?? "",
+    ),
+    stopped: false,
+    newestFirst: [],
+  };
+  const processedCompleteTapes = new Set<string>();
+
+  const excluded = (id: string, clientMessageId?: string): boolean =>
+    !!options.excludeClientMessageId &&
+    (id === options.excludeClientMessageId || clientMessageId === options.excludeClientMessageId);
+
+  const processDeferredUser = async (message: MessageLike): Promise<void> => {
+    const id = message.id as string;
+    const clientMessageId = typeof message._clientMessageId === "string"
+      ? message._clientMessageId
+      : undefined;
+    if (excluded(id, clientMessageId)) return;
+    const meta = (
+      await pool.query<{
+        model_token_estimate: number | null;
+        character_count: string;
+      }>(
+        `SELECT model_token_estimate, length(text_payload)::text AS character_count
+           FROM client_session_user_payloads
+          WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+        [sessionId, userId, id],
+      )
+    ).rows[0];
+    if (!meta) throw new Error(`[pgSessions] deferred user payload missing: ${sessionId}\0${id}`);
+    // The table is introduced in this release, so normal rows always carry the
+    // exact shared estimate. length() is a safe rolling compatibility upper
+    // bound (one token per code point), never an excuse to read the whole text.
+    const tokenEstimate = meta.model_token_estimate ??
+      bigIntNum(meta.character_count, "deferred user character count");
+    await appendFiniteModelRecord(
+      state,
+      {
+        id,
+        role: "user",
+        tokenEstimate,
+        ...(typeof message.ts === "number" ? { ts: message.ts } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
+        ...(typeof message._seq === "number" ? { seq: message._seq } : {}),
+        ...(typeof message._orderSeq === "number" ? { orderSeq: message._orderSeq } : {}),
+      },
+      async () => {
+        const row = (
+          await pool.query<{ text_payload: string }>(
+            `SELECT text_payload FROM client_session_user_payloads
+              WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+            [sessionId, userId, id],
+          )
+        ).rows[0];
+        if (!row) throw new Error(`[pgSessions] deferred user payload missing: ${sessionId}\0${id}`);
+        return row.text_payload;
+      },
+      async (maxCharacters) => {
+        const row = (
+          await pool.query<{ text_payload: string }>(
+            `SELECT right(text_payload,$4::integer) AS text_payload
+               FROM client_session_user_payloads
+              WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+            [sessionId, userId, id, maxCharacters],
+          )
+        ).rows[0];
+        if (!row) throw new Error(`[pgSessions] deferred user payload missing: ${sessionId}\0${id}`);
+        return row.text_payload;
+      },
+    );
+  };
+
+  const processCompleteTape = async (anchor: MessageLike): Promise<void> => {
+    const tapeId = anchor._turnTapeId as string;
+    if (processedCompleteTapes.has(tapeId)) return;
+    processedCompleteTapes.add(tapeId);
+    const meta = (
+      await pool.query<{
+        tape_sha256: string;
+        model_record_count: number;
+      }>(
+        `SELECT tape_sha256,model_record_count
+           FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            AND finalized_at IS NOT NULL`,
+        [sessionId, userId, tapeId],
+      )
+    ).rows[0];
+    if (!meta) throw new Error(`[pgSessions] finalized lossless turn tape missing: ${tapeId}`);
+    if (meta.tape_sha256 !== anchor._turnTapeSha256) {
+      throw new Error(`[pgSessions] lossless turn tape aggregate hash mismatch: ${tapeId}`);
+    }
+    if (meta.model_record_count === 0) return;
+    if (meta.model_record_count < 0) {
+      // Only a rolling predecessor can reach this compatibility branch. It is
+      // invoked lazily after all newer rows failed to fill the model window,
+      // so an older giant legacy BYTEA is never read speculatively.
+      const legacy = await hydrateTurnTapeMessages(pool, sessionId, userId, [anchor], {
+        view: "timeline",
+        deferTimelineNarrative: false,
+        engineContext: true,
+      });
+      for (let index = legacy.length - 1; index >= 0 && !state.stopped; index--) {
+        const message = legacy[index]!;
+        const role = modelHistorySemanticRole(message);
+        const text = modelHistorySemanticText(message);
+        const id = typeof message.id === "string" ? message.id : `${tapeId}:${index}`;
+        const clientMessageId = typeof message._clientMessageId === "string"
+          ? message._clientMessageId
+          : undefined;
+        if (!role || !text.trim() || excluded(id, clientMessageId)) continue;
+        await appendFiniteModelRecord(
+          state,
+          {
+            id,
+            role,
+            tokenEstimate: estimateModelHistoryTokens(text),
+            ...(typeof message.ts === "number" ? { ts: message.ts } : {}),
+            ...(clientMessageId ? { clientMessageId } : {}),
+            ...(typeof anchor._seq === "number" ? { seq: anchor._seq } : {}),
+            ...(typeof anchor._orderSeq === "number" ? { orderSeq: anchor._orderSeq } : {}),
+          },
+          async () => text,
+          async (maxCharacters) => text.slice(-maxCharacters),
+        );
+      }
+      return;
+    }
+
+    let beforePhysical: number | null = null;
+    let beforeLogical: number | null = null;
+    let visited = 0;
+    while (!state.stopped) {
+      const page: Array<{
+        physical_ordinal: number;
+        logical_ordinal: number;
+        msg_id: string;
+        role: string;
+        token_estimate: number;
+        ts: string | null;
+        client_message_id: string | null;
+      }> = (
+        await pool.query<{
+          physical_ordinal: number;
+          logical_ordinal: number;
+          msg_id: string;
+          role: string;
+          token_estimate: number;
+          ts: string | null;
+          client_message_id: string | null;
+        }>(
+          `SELECT physical_ordinal,logical_ordinal,msg_id,role,token_estimate,
+                  ts::text,client_message_id
+             FROM client_session_turn_tape_model_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+              AND ($4::integer IS NULL OR
+                   (physical_ordinal,logical_ordinal) < ($4::integer,$5::integer))
+            ORDER BY physical_ordinal DESC,logical_ordinal DESC
+            LIMIT 128`,
+          [sessionId, userId, tapeId, beforePhysical, beforeLogical],
+        )
+      ).rows;
+      if (page.length === 0) break;
+      for (const row of page) {
+        visited += 1;
+        beforePhysical = row.physical_ordinal;
+        beforeLogical = row.logical_ordinal;
+        if (excluded(row.msg_id, row.client_message_id ?? undefined)) continue;
+        const keyParams = [
+          sessionId,
+          userId,
+          tapeId,
+          row.physical_ordinal,
+          row.logical_ordinal,
+        ];
+        await appendFiniteModelRecord(
+          state,
+          {
+            id: row.msg_id,
+            role: row.role,
+            tokenEstimate: row.token_estimate,
+            ...(row.ts === null ? {} : { ts: bigIntNum(row.ts, "model record ts") }),
+            ...(row.client_message_id ? { clientMessageId: row.client_message_id } : {}),
+            ...(typeof anchor._seq === "number" ? { seq: anchor._seq } : {}),
+            ...(typeof anchor._orderSeq === "number" ? { orderSeq: anchor._orderSeq } : {}),
+          },
+          async () => {
+            const full = (
+              await pool.query<{ semantic_text: string }>(
+                `SELECT semantic_text FROM client_session_turn_tape_model_records
+                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+                    AND physical_ordinal=$4 AND logical_ordinal=$5`,
+                keyParams,
+              )
+            ).rows[0];
+            if (!full) throw new Error(`[pgSessions] model tape record missing: ${tapeId}`);
+            return full.semantic_text;
+          },
+          async (maxCharacters) => {
+            const suffix = (
+              await pool.query<{ semantic_text: string }>(
+                `SELECT right(semantic_text,$6::integer) AS semantic_text
+                   FROM client_session_turn_tape_model_records
+                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+                    AND physical_ordinal=$4 AND logical_ordinal=$5`,
+                [...keyParams, maxCharacters],
+              )
+            ).rows[0];
+            if (!suffix) throw new Error(`[pgSessions] model tape record missing: ${tapeId}`);
+            return suffix.semantic_text;
+          },
+        );
+        if (state.stopped) return;
+      }
+      if (page.length < 128) break;
+    }
+    if (!state.stopped && visited !== meta.model_record_count) {
+      throw new Error(`[pgSessions] model tape record count mismatch: ${tapeId}`);
+    }
+  };
+
+  const processMessages = async (messages: MessageLike[]): Promise<void> => {
+    for (let index = messages.length - 1; index >= 0 && !state.stopped; index--) {
+      const message = messages[index]!;
+      if (
+        message._turnTapeComplete === true &&
+        typeof message._turnTapeId === "string" &&
+        typeof message._turnTapeSha256 === "string"
+      ) {
+        await processCompleteTape(message);
+        continue;
+      }
+      if (
+        message._turnTapeComplete !== true &&
+        message._turnTapeExpanded !== true &&
+        typeof message._turnTapeId === "string" &&
+        typeof message._turnTapeSha256 === "string"
+      ) {
+        const rolling = await hydrateTurnTapeMessages(pool, sessionId, userId, [message], {
+          view: "timeline",
+          deferTimelineNarrative: false,
+          engineContext: true,
+        });
+        await processMessages(rolling);
+        continue;
+      }
+      if (message._userPayloadDeferred === true && typeof message.id === "string") {
+        await processDeferredUser(message);
+        continue;
+      }
+      const role = modelHistorySemanticRole(message);
+      const text = modelHistorySemanticText(message);
+      const id = typeof message.id === "string" ? message.id : `inline:${index}`;
+      const clientMessageId = typeof message._clientMessageId === "string"
+        ? message._clientMessageId
+        : undefined;
+      if (!role || message.system === true || !text.trim() || excluded(id, clientMessageId)) continue;
+      await appendFiniteModelRecord(
+        state,
+        {
+          id,
+          role,
+          tokenEstimate: estimateModelHistoryTokens(text),
+          ...(typeof message.ts === "number" ? { ts: message.ts } : {}),
+          ...(clientMessageId ? { clientMessageId } : {}),
+          ...(typeof message._seq === "number" ? { seq: message._seq } : {}),
+          ...(typeof message._orderSeq === "number" ? { orderSeq: message._orderSeq } : {}),
+        },
+        async () => text,
+        async (maxCharacters) => text.slice(-maxCharacters),
+      );
+    }
+  };
+
+  await processMessages(hot);
+  let beforeLastSeq: number | null = null;
+  while (!state.stopped) {
+    const archiveRows = (
+      await pool.query<{ messages: string; last_seq: string }>(
+        `SELECT messages,last_seq FROM client_session_archive_chunks
+          WHERE session_id=$1 AND user_id=$2
+            AND ($3::bigint IS NULL OR last_seq < $3)
+          ORDER BY last_seq DESC
+          LIMIT 4`,
+        [sessionId, userId, beforeLastSeq],
+      )
+    ).rows;
+    if (archiveRows.length === 0) break;
+    for (const archive of archiveRows) {
+      beforeLastSeq = bigIntNum(archive.last_seq, "archive last_seq");
+      let archived: MessageLike[] = [];
+      try {
+        const parsed = JSON.parse(archive.messages);
+        if (Array.isArray(parsed)) archived = deriveArchivedOrderSeqsForRead(parsed as MessageLike[]);
+      } catch {
+        continue;
+      }
+      archived.sort(compareMessagesByOrder);
+      await processMessages(archived);
+      if (state.stopped) break;
+    }
+    if (archiveRows.length < 4) break;
   }
-  return selected;
+  return state.newestFirst.reverse();
 }
 
 async function computeEngineContextMessages(
   pool: Pool,
   sessionId: string,
   userId: string,
+  options: EngineContextReadOptions = {},
 ): Promise<MessageLike[] | null> {
   const row = (
     await pool.query<{ messages: string; archived_through_seq: number | null }>(
@@ -1509,22 +2777,206 @@ async function computeEngineContextMessages(
     )
   ).rows[0];
   if (!row) return null;
-  let messages: MessageLike[] = [];
+  let hot: MessageLike[] = [];
   try {
     const parsed = JSON.parse(row.messages);
-    if (Array.isArray(parsed)) messages = parsed as MessageLike[];
+    if (Array.isArray(parsed)) {
+      hot = deriveOrderSeqsForRead(
+        parsed as MessageLike[],
+        bigIntNumOr(row.archived_through_seq, 0),
+      );
+    }
   } catch {
-    messages = [];
+    // A malformed hot legacy row contributes no synthetic context. Valid
+    // archives remain independently readable below.
   }
-  messages = deriveOrderSeqsForRead(messages, bigIntNumOr(row.archived_through_seq, 0));
-  const direct = await hydrateTurnTapeMessages(pool, sessionId, userId, messages, { view: "timeline" });
-  return selectMasterHistoryWindow(direct);
+  hot.sort(compareMessagesByOrder);
+  const contextWindow = resolveModelHistoryContextWindow(options.contextWindow, options.engine);
+  if (contextWindow !== null) {
+    return computeFiniteEngineContextMessages(
+      pool,
+      sessionId,
+      userId,
+      hot,
+      contextWindow,
+      options,
+    );
+  }
+  const hydratePrivateContext = async (messages: MessageLike[]): Promise<MessageLike[]> => {
+    const tapeHydrated = await hydrateTurnTapeMessages(pool, sessionId, userId, messages, {
+      view: "timeline",
+      deferTimelineNarrative: false,
+      engineContext: true,
+    });
+    const deferredIds = tapeHydrated.flatMap((message) =>
+      message._userPayloadDeferred === true && typeof message.id === "string"
+        ? [message.id]
+        : []);
+    if (deferredIds.length === 0) return tapeHydrated;
+    const payloads = (
+      await pool.query<{ msg_id: string; text_payload: string }>(
+        `SELECT msg_id,text_payload
+           FROM client_session_user_payloads
+          WHERE session_id=$1 AND user_id=$2 AND msg_id=ANY($3::text[])`,
+        [sessionId, userId, deferredIds],
+      )
+    ).rows;
+    const byId = new Map(payloads.map((row) => [row.msg_id, row.text_payload]));
+    return tapeHydrated.map((message) => {
+      if (message._userPayloadDeferred !== true || typeof message.id !== "string") return message;
+      const text = byId.get(message.id);
+      if (text === undefined) {
+        throw new Error(`[pgSessions] deferred user payload missing: ${sessionId}\0${message.id}`);
+      }
+      return {
+        id: message.id,
+        role: "user",
+        text,
+        ts: message.ts,
+        _source: "server",
+        ...(typeof message._clientMessageId === "string"
+          ? { _clientMessageId: message._clientMessageId }
+          : {}),
+        ...(typeof message._seq === "number" ? { _seq: message._seq } : {}),
+        ...(typeof message._orderSeq === "number" ? { _orderSeq: message._orderSeq } : {}),
+      };
+    });
+  };
+
+  let selected = selectEngineContextSuffix(await hydratePrivateContext(hot), options);
+  if (selected.truncated) return selected.messages;
+
+  // Walk archive chunks newest-to-oldest in small SQL pages. As soon as the
+  // selected model's actual context window is full, older chunks are never
+  // parsed or hydrated and never cross the master→container wire.
+  let beforeLastSeq: number | null = null;
+  for (;;) {
+    const archiveRows = (
+      await pool.query<{ messages: string; last_seq: string }>(
+        `SELECT messages, last_seq FROM client_session_archive_chunks
+          WHERE session_id=$1 AND user_id=$2
+            AND ($3::bigint IS NULL OR last_seq < $3)
+          ORDER BY last_seq DESC
+          LIMIT 4`,
+        [sessionId, userId, beforeLastSeq],
+      )
+    ).rows;
+    if (archiveRows.length === 0) break;
+    for (const archive of archiveRows) {
+      beforeLastSeq = bigIntNum(archive.last_seq, "archive last_seq");
+      let archived: MessageLike[] = [];
+      try {
+        const parsed = JSON.parse(archive.messages);
+        if (Array.isArray(parsed)) {
+          archived = deriveArchivedOrderSeqsForRead(parsed as MessageLike[]);
+        }
+      } catch {
+        // Match the existing archive contract: skip only the malformed chunk.
+      }
+      archived.sort(compareMessagesByOrder);
+      const hydrated = await hydratePrivateContext(archived);
+      const combined = [...hydrated, ...selected.messages];
+      combined.sort(compareMessagesByOrder);
+      selected = selectEngineContextSuffix(combined, options);
+      if (selected.truncated) return selected.messages;
+    }
+    if (archiveRows.length < 4) break;
+  }
+  return selected.messages;
+}
+
+function containsCompletedClientTurn(messages: MessageLike[], clientMessageId: string): boolean {
+  return messages.some((message) =>
+    message?.role === "assistant" &&
+    message._clientMessageId === clientMessageId &&
+    message.status === "completed" &&
+    message._errorCode === undefined &&
+    message._isError !== true,
+  );
+}
+
+async function hasCompletedClientTurnImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  clientMessageId: string,
+): Promise<boolean> {
+  const tape = (
+    await pool.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND client_message_id=$3
+            AND status='completed' AND finalized_at IS NOT NULL
+       ) AS present`,
+      [sessionId, userId, clientMessageId],
+    )
+  ).rows[0];
+  if (tape?.present === true) return true;
+
+  // Compatibility for completed pre-tape rows. Keep this predicate in the DB
+  // backend so a retry never transports the whole session through the bridge.
+  const session = (
+    await pool.query<{ messages: string }>(
+      `SELECT messages FROM client_sessions
+        WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+      [sessionId, userId],
+    )
+  ).rows[0];
+  if (!session) return false;
+  let hotContainsClientMessage = false;
+  try {
+    const parsed = JSON.parse(session.messages);
+    if (Array.isArray(parsed)) {
+      const hot = parsed as MessageLike[];
+      if (containsCompletedClientTurn(hot, clientMessageId)) return true;
+      hotContainsClientMessage = hot.some((message) =>
+        message?.id === clientMessageId || message?._clientMessageId === clientMessageId,
+      );
+    }
+  } catch { /* continue through valid archive chunks */ }
+  // Archive spill is a frozen prefix. If this user/client id is still in the
+  // hot suffix, a later completed assistant cannot be in an older chunk.
+  if (hotContainsClientMessage) return false;
+  const archivedId = (
+    await pool.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM client_session_archived_ids
+          WHERE session_id=$1 AND msg_id=$2
+       ) AS present`,
+      [sessionId, clientMessageId],
+    )
+  ).rows[0];
+  if (archivedId?.present !== true) return false;
+
+  let beforeLastSeq: number | null = null;
+  for (;;) {
+    const chunks = (
+      await pool.query<{ messages: string; last_seq: string }>(
+        `SELECT messages, last_seq FROM client_session_archive_chunks
+          WHERE session_id=$1 AND user_id=$2
+            AND ($3::bigint IS NULL OR last_seq < $3)
+          ORDER BY last_seq DESC LIMIT 8`,
+        [sessionId, userId, beforeLastSeq],
+      )
+    ).rows;
+    if (chunks.length === 0) return false;
+    for (const chunk of chunks) {
+      beforeLastSeq = bigIntNum(chunk.last_seq, "archive last_seq");
+      try {
+        const parsed = JSON.parse(chunk.messages);
+        if (Array.isArray(parsed) && containsCompletedClientTurn(parsed as MessageLike[], clientMessageId)) {
+          return true;
+        }
+      } catch { /* continue */ }
+    }
+    if (chunks.length < 8) return false;
+  }
 }
 
 function deferredTapeRecord(
   tapeId: string,
   tapeSha256: string,
-  head: { msg_id: string; ordinal: number; role: string; ts: string; content_sha256: string },
+  head: { msg_id: string; ordinal: number; role: string; ts: string; content_sha256?: string },
   payloadBytes: number,
 ): MessageLike {
   return {
@@ -1541,14 +2993,14 @@ function deferredTapeRecord(
     _recordOrdinal: head.ordinal,
     _payloadDeferred: true,
     _payloadBytes: payloadBytes,
-    _payloadSha256: head.content_sha256,
+    ...(head.content_sha256 ? { _payloadSha256: head.content_sha256 } : {}),
   };
 }
 
-/** Physical-ordinal cursor paging over every immutable record. Runtime batches
- * are expanded into their exact logical events; oversized physical records are
- * returned as metadata-only deferred records whose binary payload URL is the
- * same authoritative row, not substitute content. */
+/** Physical-ordinal cursor paging over the immutable tape. The separately
+ * rendered billing anchor is the only excluded row; every other role is
+ * returned, with known platform-private fields removed but no semantic
+ * allowlist. Oversized records use a deferred exact byte locator. */
 async function listTurnTapeRecordsImpl(
   pool: Pool,
   sessionId: string,
@@ -1556,12 +3008,27 @@ async function listTurnTapeRecordsImpl(
   tapeId: string,
   cursor: number,
   limit: number,
-): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+): Promise<{
+  records: MessageLike[];
+  nextCursor: number | null;
+  total: number;
+} | null> {
   const header = (
-    await pool.query<{ tape_sha256: string; billing_anchor_id: string; total: string }>(
+    await pool.query<{
+      tape_sha256: string;
+      billing_anchor_id: string;
+      physical_record_count: string;
+      logical_record_count: string;
+    }>(
       `SELECT t.tape_sha256, t.billing_anchor_id,
-              (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
-                WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id) AS total
+              CASE WHEN t.physical_record_count=0 THEN
+                (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
+                  WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id)
+              ELSE t.physical_record_count::text END AS physical_record_count,
+              CASE WHEN t.logical_record_count=0 THEN
+                (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
+                  WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id)
+                   ELSE t.logical_record_count::text END AS logical_record_count
          FROM client_session_turn_tapes t
         WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
           AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
@@ -1574,101 +3041,165 @@ async function listTurnTapeRecordsImpl(
     TAPE_RECORD_PAGE_MAX_ROWS,
     Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : TAPE_RECORD_PAGE_MAX_ROWS,
   ));
-  const heads = (
-    await pool.query<{
-      msg_id: string;
-      ordinal: number;
-      role: string;
-      ts: string;
-      content_sha256: string;
-      payload_bytes: string;
-    }>(
-      `SELECT msg_id, ordinal, role, ts::text, content_sha256,
-              octet_length(payload)::text AS payload_bytes
-         FROM client_session_turn_tape_records
-        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4
-        ORDER BY ordinal
-        LIMIT $5`,
-      [sessionId, userId, tapeId, start, cappedLimit + 1],
-    )
-  ).rows;
-
-  type Planned = (typeof heads)[number] & { payloadBytes: number; deferred: boolean };
-  const planned: Planned[] = [];
-  const inlineOrdinals: number[] = [];
+  type Head = {
+    msg_id: string;
+    ordinal: number;
+    role: string;
+    ts: string;
+    content_sha256: string;
+    payload_bytes: string;
+    visible_content_sha256: string | null;
+  };
   let rawBytes = 0;
   let nextCursor: number | null = null;
-  for (const head of heads) {
-    if (planned.length >= cappedLimit) {
-      nextCursor = head.ordinal;
+  const records: MessageLike[] = [];
+  let scanCursor = start;
+  let exhausted = false;
+  while (records.length < cappedLimit && !exhausted && nextCursor === null) {
+    const heads = (
+      await pool.query<Head>(
+        `SELECT msg_id, ordinal, role, ts::text, content_sha256,
+                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,
+                visible_content_sha256
+          FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4
+            AND msg_id<>$5
+          ORDER BY ordinal
+          LIMIT $6`,
+        [sessionId, userId, tapeId, scanCursor, header.billing_anchor_id, cappedLimit + 1],
+      )
+    ).rows;
+    if (heads.length === 0) {
+      exhausted = true;
       break;
     }
-    const payloadBytes = bigIntNum(head.payload_bytes, "turn tape record payload bytes");
-    // Runtime batches can be tiny on the wire yet expand to tens of thousands
-    // of logical events. Always decode them in the browser worker near the
-    // viewport instead of expanding compressed content inside a page response.
-    const deferred = payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES ||
-      head.msg_id.includes("-runtime-batch-");
-    if (!deferred && planned.length > 0 && rawBytes + payloadBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES) {
-      nextCursor = head.ordinal;
-      break;
-    }
-    planned.push({ ...head, payloadBytes, deferred });
-    if (!deferred) {
-      rawBytes += payloadBytes;
-      inlineOrdinals.push(head.ordinal);
-    }
-  }
 
-  const payloadRows = inlineOrdinals.length === 0
-    ? []
-    : (
+    const planned: Array<Head & { payloadBytes: number }> = [];
+    const deferred: Array<Head & { payloadBytes: number }> = [];
+    const batchRecords: MessageLike[] = [];
+    for (const head of heads) {
+      if (records.length + planned.length + deferred.length >= cappedLimit) {
+        nextCursor = head.ordinal;
+        break;
+      }
+      const payloadBytes = bigIntNum(head.payload_bytes, "turn tape record payload bytes");
+      if (payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES) {
+        deferred.push({ ...head, payloadBytes });
+        scanCursor = head.ordinal + 1;
+        continue;
+      }
+      if (
+        records.length + planned.length + deferred.length > 0 &&
+        rawBytes + payloadBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES
+      ) {
+        nextCursor = head.ordinal;
+        break;
+      }
+      planned.push({ ...head, payloadBytes });
+      rawBytes += payloadBytes;
+      scanCursor = head.ordinal + 1;
+    }
+
+    for (const head of deferred) {
+      batchRecords.push(deferredTapeRecord(
+        tapeId,
+        header.tape_sha256,
+        { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
+        head.payloadBytes,
+      ));
+    }
+
+    if (planned.length > 0) {
+      const payloadRows = (
         await pool.query<DirectTapeSourceRecord>(
-          `SELECT msg_id, ordinal, role, content_sha256, payload
+          `SELECT msg_id, ordinal, role, content_sha256, payload,
+                  visible_payload, visible_content_sha256
              FROM client_session_turn_tape_records
             WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=ANY($4::int[])
             ORDER BY ordinal`,
-          [sessionId, userId, tapeId, inlineOrdinals],
+          [sessionId, userId, tapeId, planned.map((head) => head.ordinal)],
         )
       ).rows;
-  const payloadByOrdinal = new Map(payloadRows.map((row) => [row.ordinal, row]));
-  const anchor: MessageLike = { id: header.billing_anchor_id, _turnTapeSha256: header.tape_sha256 };
-  const records: MessageLike[] = [];
-  for (const head of planned) {
-    if (head.deferred) {
-      records.push(deferredTapeRecord(tapeId, header.tape_sha256, head, head.payloadBytes));
-      continue;
+      const payloadByOrdinal = new Map(payloadRows.map((row) => [row.ordinal, row]));
+      for (const head of planned) {
+        const source = payloadByOrdinal.get(head.ordinal);
+        if (!source) throw new Error(`[pgSessions] direct tape record missing: ${tapeId}\0${head.ordinal}`);
+        let bytes: Buffer;
+        if (source.visible_payload !== null) {
+          bytes = Buffer.from(source.visible_payload);
+          if (sha256Bytes(bytes) !== source.visible_content_sha256) {
+            throw new Error(`[pgSessions] visible tape payload hash mismatch: ${tapeId}\0${head.ordinal}`);
+          }
+        } else {
+          const visible = userVisiblePhysicalPayload({
+            tape_id: tapeId,
+            tape_sha256: header.tape_sha256,
+            waive_reason: null,
+            waiver_applied: false,
+            msg_id: source.msg_id,
+            ordinal: source.ordinal,
+            role: source.role,
+            content_sha256: source.content_sha256,
+            payload: Buffer.from(source.payload),
+            cost_credits: "0",
+            delegate_costs: [],
+          }, header.tape_sha256, header.billing_anchor_id);
+          if (!visible) {
+            throw new Error(`[pgSessions] direct tape record is not a JSON object: ${tapeId}\0${head.ordinal}`);
+          }
+          bytes = visible.bytes;
+        }
+        const message = JSON.parse(bytes.toString("utf8")) as MessageLike;
+        const expanded = expandHydratedRuntimeBatch(
+          message,
+          {
+            tape_id: tapeId,
+            tape_sha256: header.tape_sha256,
+            waive_reason: null,
+            waiver_applied: false,
+            msg_id: source.msg_id,
+            ordinal: source.ordinal,
+            role: source.role,
+            content_sha256: source.content_sha256,
+            payload: source.payload,
+            cost_credits: "0",
+            delegate_costs: [],
+          },
+          { id: header.billing_anchor_id, _turnTapeSha256: header.tape_sha256 },
+        ).messages;
+        for (const logical of expanded) {
+          logical._recordOrdinal = head.ordinal;
+          batchRecords.push(logical);
+        }
+      }
     }
-    const source = payloadByOrdinal.get(head.ordinal);
-    if (!source) throw new Error(`[pgSessions] direct tape record missing: ${tapeId}\0${head.ordinal}`);
-    const row: HydratedTapeRow = {
-      tape_id: tapeId,
-      tape_sha256: header.tape_sha256,
-      waive_reason: null,
-      waiver_applied: false,
-      msg_id: source.msg_id,
-      ordinal: source.ordinal,
-      role: source.role,
-      content_sha256: source.content_sha256,
-      payload: Buffer.from(source.payload),
-      cost_credits: "0",
-      delegate_costs: [],
-    };
-    const result = expandHydratedRuntimeBatch(
-      hydrateTapeRecord(row, anchor, false, true),
-      row,
-      anchor,
-    );
-    for (const message of result.messages) {
-      message._recordOrdinal = head.ordinal;
-      records.push(message);
-    }
+
+    batchRecords.sort((a, b) =>
+      (typeof a._recordOrdinal === "number" ? a._recordOrdinal : Number.MAX_SAFE_INTEGER) -
+      (typeof b._recordOrdinal === "number" ? b._recordOrdinal : Number.MAX_SAFE_INTEGER));
+    records.push(...batchRecords);
+
+    if (nextCursor !== null) break;
+    if (heads.length <= cappedLimit) exhausted = true;
   }
   return {
     records,
     nextCursor,
-    total: bigIntNum(header.total, "turn tape record total"),
+    total: Math.max(
+      0,
+      bigIntNum(header.logical_record_count, "turn tape record total") - 1,
+    ),
   };
+}
+
+export interface TapeRecordPayload {
+  payload: Buffer;
+  totalBytes: number;
+  offset: number;
+  msgId: string;
+  role: string;
+  contentSha256: string;
+  tapeSha256: string;
 }
 
 export interface TapeRecordPayloadChunk {
@@ -1683,6 +3214,129 @@ export interface TapeRecordPayloadChunk {
   tapeSha256: string;
 }
 
+async function readTapeRecordPayloadImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  recordOrdinal: number,
+  requestedOffset = 0,
+  requestedLength?: number,
+): Promise<TapeRecordPayload | null> {
+  if (
+    !Number.isSafeInteger(recordOrdinal) || recordOrdinal < 0 ||
+    !Number.isSafeInteger(requestedOffset) || requestedOffset < 0 ||
+    (requestedLength !== undefined &&
+      (!Number.isSafeInteger(requestedLength) || requestedLength < 0))
+  ) return null;
+  type VisibleHead = {
+    tape_sha256: string;
+    billing_anchor_id: string;
+    msg_id: string;
+    role: string;
+    content_sha256: string;
+    visible_content_sha256: string | null;
+    visible_bytes: string | null;
+  };
+  const row = (
+    await pool.query<{
+      tape_sha256: string;
+      billing_anchor_id: string;
+      msg_id: string;
+      role: string;
+      content_sha256: string;
+      visible_content_sha256: string | null;
+      visible_bytes: string | null;
+    }>(
+      `SELECT t.tape_sha256, t.billing_anchor_id, r.msg_id, r.role, r.content_sha256,
+              r.visible_content_sha256,
+              CASE WHEN r.visible_payload IS NULL THEN NULL
+                   ELSE octet_length(r.visible_payload)::text END AS visible_bytes
+         FROM client_session_turn_tapes t
+         JOIN client_session_turn_tape_records r
+           ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL
+          AND r.ordinal=$4`,
+      [sessionId, userId, tapeId, recordOrdinal],
+    )
+  ).rows[0];
+  if (!row) return null;
+  let visibleHead: VisibleHead = row;
+  let freshlyMaterialized: Buffer | null = null;
+  if (visibleHead.visible_bytes === null || visibleHead.visible_content_sha256 === null) {
+    // Rolling predecessor rows have no derived payload. Materialize exactly
+    // once, publish it transactionally, then all future requests are true
+    // byte-range reads. New finalizers never enter this compatibility branch.
+    const legacy = (
+      await pool.query<{ payload: Buffer }>(
+        `SELECT payload FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+        [sessionId, userId, tapeId, recordOrdinal],
+      )
+    ).rows[0];
+    if (!legacy) return null;
+    const visible = userVisiblePhysicalPayload({
+      tape_id: tapeId,
+      tape_sha256: row.tape_sha256,
+      waive_reason: null,
+      waiver_applied: false,
+      msg_id: row.msg_id,
+      ordinal: recordOrdinal,
+      role: row.role,
+      content_sha256: row.content_sha256,
+      payload: Buffer.from(legacy.payload),
+      cost_credits: "0",
+      delegate_costs: [],
+    }, row.tape_sha256, row.billing_anchor_id);
+    if (!visible) return null;
+    await pool.query(
+      `UPDATE client_session_turn_tape_records
+          SET visible_payload=COALESCE(visible_payload,$5),
+              visible_content_sha256=COALESCE(visible_content_sha256,$6)
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+      [sessionId, userId, tapeId, recordOrdinal, visible.bytes, visible.contentSha256],
+    );
+    freshlyMaterialized = visible.bytes;
+    visibleHead = {
+      ...row,
+      visible_bytes: String(visible.bytes.length),
+      visible_content_sha256: visible.contentSha256,
+    };
+  }
+  const totalBytes = bigIntNum(visibleHead.visible_bytes!, "visible tape record payload bytes");
+  if (requestedOffset > totalBytes) return null;
+  const length = requestedLength === undefined
+    ? totalBytes - requestedOffset
+    : Math.min(requestedLength, totalBytes - requestedOffset);
+  let chunk: Buffer;
+  if (length === 0) {
+    chunk = Buffer.alloc(0);
+  } else if (freshlyMaterialized !== null) {
+    chunk = freshlyMaterialized.subarray(requestedOffset, requestedOffset + length);
+  } else {
+    const chunkRow = (
+      await pool.query<{ chunk: Buffer }>(
+        `SELECT substring(visible_payload FROM $5::integer + 1 FOR $6::integer) AS chunk
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+        [sessionId, userId, tapeId, recordOrdinal, requestedOffset, length],
+      )
+    ).rows[0];
+    if (!chunkRow) return null;
+    chunk = Buffer.from(chunkRow.chunk ?? Buffer.alloc(0));
+  }
+  return {
+    payload: chunk,
+    totalBytes,
+    offset: requestedOffset,
+    msgId: row.msg_id,
+    role: row.role,
+    contentSha256: visibleHead.visible_content_sha256!,
+    tapeSha256: row.tape_sha256,
+  };
+}
+
 async function readTapeRecordPayloadChunkImpl(
   pool: Pool,
   sessionId: string,
@@ -1690,60 +3344,91 @@ async function readTapeRecordPayloadChunkImpl(
   tapeId: string,
   recordOrdinal: number,
   offset: number,
-  requestedBytes = TAPE_RECORD_PAYLOAD_CHUNK_BYTES,
+  requestedBytes?: number,
 ): Promise<TapeRecordPayloadChunk | null> {
-  if (!Number.isSafeInteger(recordOrdinal) || recordOrdinal < 0) return null;
-  if (!Number.isSafeInteger(offset) || offset < 0) return null;
-  const maxBytes = Math.max(1, Math.min(
-    TAPE_RECORD_PAYLOAD_CHUNK_BYTES,
-    Number.isFinite(requestedBytes) ? Math.floor(requestedBytes) : TAPE_RECORD_PAYLOAD_CHUNK_BYTES,
-  ));
+  const record = await readTapeRecordPayloadImpl(
+    pool,
+    sessionId,
+    userId,
+    tapeId,
+    recordOrdinal,
+    offset,
+    requestedBytes,
+  );
+  if (!record) return null;
+  const endExclusive = record.offset + record.payload.length;
+  return {
+    chunk: record.payload,
+    nextOffset: endExclusive < record.totalBytes ? endExclusive : null,
+    totalBytes: record.totalBytes,
+    start: record.offset,
+    endExclusive,
+    msgId: record.msgId,
+    role: record.role,
+    contentSha256: record.contentSha256,
+    tapeSha256: record.tapeSha256,
+  };
+}
+
+async function readUserMessagePayloadImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  msgId: string,
+  offset = 0,
+  requestedLength?: number,
+): Promise<{
+  payload: Buffer;
+  totalBytes: number;
+  offset: number;
+  msgId: string;
+  role: "user";
+  contentSha256: string;
+} | null> {
+  const requestedOffset = Number.isSafeInteger(offset) && offset >= 0 ? offset : -1;
+  if (requestedOffset < 0) return null;
+  if (
+    requestedLength !== undefined &&
+    (!Number.isSafeInteger(requestedLength) || requestedLength < 0)
+  ) return null;
   const row = (
-    await pool.query<{
-      tape_sha256: string;
-      msg_id: string;
-      role: string;
-      content_sha256: string;
-      total_bytes: string;
-      chunk: Buffer;
-    }>(
-      `SELECT t.tape_sha256, r.msg_id, r.role, r.content_sha256,
-              octet_length(r.payload)::text AS total_bytes,
-              substring(
-                r.payload
-                FROM LEAST($5::bigint, octet_length(r.payload)::bigint + 1)::integer
-                FOR $6::integer
-              ) AS chunk
-         FROM client_session_turn_tapes t
-         JOIN client_session_turn_tape_records r
-           ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
-        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
-          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL
-          AND r.ordinal=$4`,
-      [sessionId, userId, tapeId, recordOrdinal, offset + 1, maxBytes],
+    await pool.query<{ content_sha256: string; payload_bytes: string }>(
+      `SELECT p.content_sha256,p.payload_bytes::text AS payload_bytes
+         FROM client_session_user_payloads p
+         JOIN client_sessions s ON s.id=p.session_id AND s.user_id=p.user_id
+        WHERE p.session_id=$1 AND p.user_id=$2 AND p.msg_id=$3 AND s.deleted_at IS NULL`,
+      [sessionId, userId, msgId],
     )
   ).rows[0];
   if (!row) return null;
-  const totalBytes = bigIntNum(row.total_bytes, "turn tape record payload bytes");
-  if (offset > totalBytes) return null;
-  const chunk = Buffer.from(row.chunk ?? Buffer.alloc(0));
-  const endExclusive = offset + chunk.length;
+  const totalBytes = bigIntNum(row.payload_bytes, "user payload bytes");
+  if (requestedOffset > totalBytes) return null;
+  const length = requestedLength === undefined
+    ? totalBytes - requestedOffset
+    : Math.min(requestedLength, totalBytes - requestedOffset);
+  const payload = length === 0
+    ? Buffer.alloc(0)
+    : Buffer.from((
+        await pool.query<{ chunk: Buffer }>(
+          `SELECT substring(payload FROM $4::integer + 1 FOR $5::integer) AS chunk
+             FROM client_session_user_payloads
+            WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+          [sessionId, userId, msgId, requestedOffset, length],
+        )
+      ).rows[0]?.chunk ?? Buffer.alloc(0));
   return {
-    chunk,
-    nextOffset: endExclusive < totalBytes ? endExclusive : null,
+    payload,
     totalBytes,
-    start: offset,
-    endExclusive,
-    msgId: row.msg_id,
-    role: row.role,
+    offset: requestedOffset,
+    msgId,
+    role: "user",
     contentSha256: row.content_sha256,
-    tapeSha256: row.tape_sha256,
   };
 }
 
 
 /**
- * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`(28 方法),
+ * 构造 master 会话权威的 PG backend。返回对象结构化满足 `ClientSessionsBackend`,
  * 由 registerCommercial 注入。方法内闭包持有 pool。
  */
 export function createPgSessionsBackend(
@@ -1866,9 +3551,14 @@ export function createPgSessionsBackend(
       dispatchIdentity?: { dispatchId: string; attemptNo: number },
     ): Promise<LosslessTurnTapeStageResult> {
       return withTx(pool, async (client) => {
+        // Parts are immutable staging blobs and do not mutate the hot session
+        // row. A plain MVCC ownership/tombstone check keeps them independent
+        // from concurrent chat writes; the tape/session foreign keys still
+        // serialize hard deletion, while finalize alone takes the exclusive
+        // session lock needed to append the visible anchor.
         const session = (
           await client.query<{ deleted_at: string | null }>(
-            "SELECT deleted_at FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+            "SELECT deleted_at FROM client_sessions WHERE id = $1 AND user_id = $2",
             [request.sessionId, userId],
           )
         ).rows[0];
@@ -1984,7 +3674,40 @@ export function createPgSessionsBackend(
       if (request.waiveReason !== undefined && billingUserId === null) {
         throw new Error("turn waiver requires a commercial c:<uid> session owner");
       }
-      const result = await withTx(pool, async (client): Promise<LosslessTurnTapeFinalizeResult> => {
+      const preflight = (
+        await pool.query<{ finalized_at: string | null }>(
+          `SELECT finalized_at FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [request.sessionId, userId, request.tapeId],
+        )
+      ).rows[0];
+      let prepared: PreparedLosslessTurnTape | null = null;
+      let preparedModelRecordCount = 0;
+      let releaseFinalizeAdmission: (() => void) | null = null;
+      if (preflight?.finalized_at === null) {
+        releaseFinalizeAdmission = await acquireFinalizeMemoryAdmission(request.totalBytes);
+        try {
+          prepared = await prepareLosslessTurnTapeOutsideLocks(pool, userId, request);
+          if (prepared) {
+            preparedModelRecordCount = await stagePreparedLosslessTurnRecords(
+              pool,
+              userId,
+              request,
+              prepared,
+            );
+          } else {
+            releaseFinalizeAdmission();
+            releaseFinalizeAdmission = null;
+          }
+        } catch (err) {
+          releaseFinalizeAdmission?.();
+          releaseFinalizeAdmission = null;
+          throw err;
+        }
+      }
+      let result: LosslessTurnTapeFinalizeResult;
+      try {
+        result = await withTx(pool, async (client): Promise<LosslessTurnTapeFinalizeResult> => {
         // Serializes "cost parks while tape finalizes" on the logical turn.
         await requestAdvisoryXactLock(client, userId, `turn:${request.turnKey}`);
         // Shared with rolling lease renewal and every settlement/refund path:
@@ -2083,45 +3806,84 @@ export function createPgSessionsBackend(
           };
         }
 
-        const parts = (
-          await client.query<{ part_index: number; part_sha256: string; payload: Buffer }>(
-            `SELECT part_index, part_sha256, payload
+        if (!prepared) return { applied: "incomplete" };
+        const turn = prepared.turn;
+
+        // Parts are immutable once staged. Recheck only their manifest while
+        // holding the tape row lock; heavyweight BYTEA IO, concatenation,
+        // JSON.parse and user-visible/model materialization already happened
+        // before this transaction.
+        const partManifest = (
+          await client.query<{
+            part_index: number;
+            part_sha256: string;
+            payload_bytes: string;
+          }>(
+            `SELECT part_index,part_sha256,octet_length(payload)::text AS payload_bytes
                FROM client_session_turn_tape_parts
-              WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
-              ORDER BY part_index FOR UPDATE`,
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+              ORDER BY part_index`,
             [request.sessionId, userId, request.tapeId],
           )
         ).rows;
-        if (parts.length !== request.partCount) return { applied: "incomplete" };
-        const chunks: Buffer[] = [];
-        for (let i = 0; i < parts.length; i++) {
-          const part = parts[i]!;
-          if (part.part_index !== i) return { applied: "incomplete" };
-          const bytes = Buffer.from(part.payload);
-          if (sha256Bytes(bytes) !== part.part_sha256) throw new Error("lossless turn tape part hash mismatch");
-          chunks.push(bytes);
+        if (partManifest.length !== prepared.partManifest.length) {
+          return { applied: "incomplete" };
         }
-        const canonical = Buffer.concat(chunks);
-        if (canonical.length !== request.totalBytes || sha256Bytes(canonical) !== request.tapeSha256) {
-          throw new Error("lossless turn tape aggregate hash mismatch");
+        for (let index = 0; index < partManifest.length; index++) {
+          const actual = partManifest[index]!;
+          const expected = prepared.partManifest[index]!;
+          if (
+            actual.part_index !== expected.partIndex ||
+            actual.part_sha256 !== expected.partSha256 ||
+            bigIntNum(actual.payload_bytes, "turn tape part bytes") !== expected.payloadBytes
+          ) {
+            throw new Error("lossless turn tape immutable part manifest conflict");
+          }
         }
-        let rawPayload: unknown;
-        try {
-          rawPayload = JSON.parse(canonical.toString("utf8"));
-        } catch (err) {
-          throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
+
+        const stagedRecords = (
+          await client.query<{
+            msg_id: string;
+            ordinal: number;
+            content_sha256: string;
+            visible_content_sha256: string | null;
+          }>(
+            `SELECT msg_id,ordinal,content_sha256,visible_content_sha256
+               FROM client_session_turn_tape_records
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+              ORDER BY ordinal`,
+            [request.sessionId, userId, request.tapeId],
+          )
+        ).rows;
+        if (stagedRecords.length !== turn.records.length) {
+          throw new Error("lossless turn tape staged record count mismatch");
         }
-        const turn = materializeLosslessTurn(rawPayload);
-        if (
-          turn.payload.sessionId !== request.sessionId ||
-          turn.payload.agentId !== request.agentId ||
-          turn.payload.turnIndex !== request.turnIndex ||
-          turn.payload.status !== request.status ||
-          turn.payload.turnKey !== request.turnKey ||
-          turn.payload.waiveReason !== request.waiveReason
-        ) {
-          throw new Error("lossless turn tape envelope/payload identity mismatch");
+        for (let ordinal = 0; ordinal < stagedRecords.length; ordinal++) {
+          const actual = stagedRecords[ordinal]!;
+          const expected = turn.records[ordinal]!;
+          const expectedVisible = prepared.visible[ordinal]!;
+          if (
+            actual.ordinal !== ordinal ||
+            actual.msg_id !== expected.id ||
+            actual.content_sha256 !== expected.payloadSha256 ||
+            actual.visible_content_sha256 !== expectedVisible.contentSha256
+          ) {
+            throw new Error("lossless turn tape staged record manifest conflict");
+          }
         }
+        const stagedModelCount = (
+          await client.query<{ count: string }>(
+            `SELECT COUNT(*)::text AS count
+               FROM client_session_turn_tape_model_records
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+            [request.sessionId, userId, request.tapeId],
+          )
+        ).rows[0]?.count ?? "0";
+        if (bigIntNum(stagedModelCount, "turn tape model record count") !== preparedModelRecordCount) {
+          throw new Error("lossless turn tape staged model record count mismatch");
+        }
+        const modelRecordCount = preparedModelRecordCount;
+
         // The marker and terminal materialization commit (or roll back)
         // together. Settlement uses the same advisory key, so after this
         // transaction becomes visible it cannot create a new debit.
@@ -2133,39 +3895,6 @@ export function createPgSessionsBackend(
           });
         }
         const goalTokensUsed = computeGoalTokensUsed(turn.payload);
-
-        for (let ordinal = 0; ordinal < turn.records.length; ordinal++) {
-          const item = turn.records[ordinal]!;
-          const inserted = await client.query(
-            `INSERT INTO client_session_turn_tape_records
-               (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-             ON CONFLICT (session_id,user_id,tape_id,msg_id) DO NOTHING`,
-            [
-              request.sessionId,
-              userId,
-              request.tapeId,
-              item.id,
-              ordinal,
-              item.role,
-              item.ts,
-              item.payloadSha256,
-              item.payloadBytes,
-            ],
-          );
-          if ((inserted.rowCount ?? 0) === 0) {
-            const existing = (
-              await client.query<{ ordinal: number; content_sha256: string }>(
-                `SELECT ordinal, content_sha256 FROM client_session_turn_tape_records
-                  WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND msg_id=$4`,
-                [request.sessionId, userId, request.tapeId, item.id],
-              )
-            ).rows[0];
-            if (!existing || existing.ordinal !== ordinal || existing.content_sha256 !== item.payloadSha256) {
-              throw new Error("lossless turn tape immutable record conflict");
-            }
-          }
-        }
 
         type PendingTapeCost = {
           request_id: string;
@@ -2393,8 +4122,8 @@ export function createPgSessionsBackend(
                   goal_id=$7::uuid, goal_state_revision=$8, goal_tokens_used=$9,
                   client_message_id=$10, continuation_of_turn_key=$11,
                   physical_record_count=$12, logical_record_count=$13,
-                  record_payload_bytes=$14
-            WHERE session_id=$15 AND user_id=$16 AND tape_id=$17`,
+                  record_payload_bytes=$14, model_record_count=$15
+            WHERE session_id=$16 AND user_id=$17 AND tape_id=$18`,
           [
             turn.billingAnchorId,
             JSON.stringify(turn.payload.usage ?? {}),
@@ -2409,7 +4138,8 @@ export function createPgSessionsBackend(
             turn.payload.continuationOfTurnKey ?? null,
             turn.records.length,
             turn.logicalRecordCount,
-            turn.records.reduce((sum, record) => sum + record.payloadBytes.length, 0),
+            prepared.recordPayloadBytes,
+            modelRecordCount,
             request.sessionId,
             userId,
             request.tapeId,
@@ -2448,7 +4178,10 @@ export function createPgSessionsBackend(
           engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
           ...(dispatchLate ? { dispatchLateTape: true } : {}),
         };
-      });
+        });
+      } finally {
+        releaseFinalizeAdmission?.();
+      }
       if (goalUsageChanged && result.applied === "finalized") {
         await notifyGoalUsageChanges(options.onGoalUsageChanged, [{ userId, sessionId: request.sessionId }]);
       }
@@ -2474,6 +4207,8 @@ export function createPgSessionsBackend(
               "client_session_turn_tapes",
               "client_session_turn_tape_parts",
               "client_session_turn_tape_records",
+              "client_session_turn_tape_model_records",
+              "client_session_user_payloads",
               "server_authored_turn_anchor_map",
               "turn_tape_cost_components",
               "session_goals",
@@ -3564,29 +5299,36 @@ export function createPgSessionsBackend(
         return { messages: [], hasMore: false, oldestSeq: null, historyRevision };
       }
 
-      const chunkRows = (
-        await pool.query<{ messages: string }>(
-          `SELECT messages FROM client_session_archive_chunks
-             WHERE session_id = $1 AND user_id = $2 AND first_seq < $3
-             ORDER BY last_seq DESC`,
-          [sessId, userId, effectiveBefore],
-        )
-      ).rows;
-
       const messagePool: MessageLike[] = [];
-      for (const cr of chunkRows) {
-        let arr: MessageLike[];
-        try {
-          const parsed = JSON.parse(cr.messages);
-          arr = Array.isArray(parsed) ? (parsed as MessageLike[]) : [];
-        } catch {
-          arr = [];
+      let beforeLastSeq: number | null = null;
+      for (;;) {
+        const chunkRows = (
+          await pool.query<{ messages: string; last_seq: string }>(
+            `SELECT messages, last_seq FROM client_session_archive_chunks
+               WHERE session_id = $1 AND user_id = $2 AND first_seq < $3
+                 AND ($4::bigint IS NULL OR last_seq < $4)
+               ORDER BY last_seq DESC
+               LIMIT 4`,
+            [sessId, userId, effectiveBefore, beforeLastSeq],
+          )
+        ).rows;
+        if (chunkRows.length === 0) break;
+        for (const cr of chunkRows) {
+          beforeLastSeq = bigIntNum(cr.last_seq, "archive last_seq");
+          let arr: MessageLike[];
+          try {
+            const parsed = JSON.parse(cr.messages);
+            arr = Array.isArray(parsed) ? (parsed as MessageLike[]) : [];
+          } catch {
+            arr = [];
+          }
+          for (const m of deriveArchivedOrderSeqsForRead(arr)) {
+            const s = typeof m?._orderSeq === "number" ? m._orderSeq : -1;
+            if (s >= 0 && s < effectiveBefore) messagePool.push(m);
+          }
+          if (messagePool.length > cappedLimit) break;
         }
-        for (const m of deriveArchivedOrderSeqsForRead(arr)) {
-          const s = typeof m?._orderSeq === "number" ? m._orderSeq : -1;
-          if (s >= 0 && s < effectiveBefore) messagePool.push(m);
-        }
-        if (messagePool.length > cappedLimit) break;
+        if (messagePool.length > cappedLimit || chunkRows.length < 4) break;
       }
       messagePool.sort(compareMessagesByOrder);
       const hasMore = messagePool.length > cappedLimit;
@@ -3609,8 +5351,17 @@ export function createPgSessionsBackend(
     async getEngineContextMessages(
       sessionId: string,
       userId: string,
+      options: EngineContextReadOptions = {},
     ): Promise<MessageLike[] | null> {
-      return computeEngineContextMessages(pool, sessionId, userId);
+      return computeEngineContextMessages(pool, sessionId, userId, options);
+    },
+
+    async hasCompletedClientTurn(
+      sessionId: string,
+      userId: string,
+      clientMessageId: string,
+    ): Promise<boolean> {
+      return hasCompletedClientTurnImpl(pool, sessionId, userId, clientMessageId);
     },
 
     // ── immutable tape lazy reads ─────────────────────────────────────────────
@@ -3620,8 +5371,31 @@ export function createPgSessionsBackend(
       tapeId: string,
       cursor: number,
       limit: number,
-    ): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+    ): Promise<{
+      records: MessageLike[];
+      nextCursor: number | null;
+      total: number;
+    } | null> {
       return listTurnTapeRecordsImpl(pool, sessionId, userId, tapeId, cursor, limit);
+    },
+
+    async readTapeRecordPayload(
+      sessionId: string,
+      userId: string,
+      tapeId: string,
+      recordOrdinal: number,
+      offset = 0,
+      length?: number,
+    ): Promise<TapeRecordPayload | null> {
+      return readTapeRecordPayloadImpl(
+        pool,
+        sessionId,
+        userId,
+        tapeId,
+        recordOrdinal,
+        offset,
+        length,
+      );
     },
 
     async readTapeRecordPayloadChunk(
@@ -3643,6 +5417,16 @@ export function createPgSessionsBackend(
       );
     },
 
+    async readUserMessagePayload(
+      sessionId: string,
+      userId: string,
+      msgId: string,
+      offset = 0,
+      length?: number,
+    ) {
+      return readUserMessagePayloadImpl(pool, sessionId, userId, msgId, offset, length);
+    },
+
     // ── deleteClientSession(软删 + 归档级联清)──────────────────────────────────
     async deleteClientSession(id: string, userId?: string): Promise<boolean> {
       const now = Date.now();
@@ -3655,6 +5439,11 @@ export function createPgSessionsBackend(
           ? await client.query(sql, [now, id, userId])
           : await client.query(sql, [now, id]);
         if ((result.rowCount ?? 0) === 0) return false;
+        await client.query(
+          "DELETE FROM client_session_user_payloads WHERE session_id=$1" +
+            (userId ? " AND user_id=$2" : ""),
+          userId ? [id, userId] : [id],
+        );
         // 归档级联清理(同事务,防"主行已删、归档还在"孤儿)。D3:delete 级联也清 parent_session_id
         // 指向该会话的 delegate pending(防永不 drain 的孤儿)。
         await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
@@ -3691,6 +5480,17 @@ export function createPgSessionsBackend(
         )
       ).rows[0];
       return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
+    },
+
+    async bumpClientSessionHistoryRevision(id: string, userId: string): Promise<boolean> {
+      const result = await pool.query(
+        `UPDATE client_sessions
+            SET history_revision = history_revision + 1,
+                updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+        [id, userId],
+      );
+      return (result.rowCount ?? 0) > 0;
     },
 
     async listUnclaimedSessions(): Promise<Array<{

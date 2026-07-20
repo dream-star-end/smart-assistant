@@ -52,6 +52,21 @@ describe("exact immutable tape payload parsing", () => {
     })).resolves.toEqual([record]);
   });
 
+  test("accepts a legacy locator without a hash and trusts only the verified HEAD response hash", async () => {
+    const record = { id: "legacy-final", role: "assistant", text: "旧会话完整回答", ts: 1 };
+    const bytes = bytesOf(record);
+    const contentSha256 = await sha256(bytes);
+    await expect(parseTapeRecordPayload({
+      bytes: arrayBufferOf(bytes),
+      contentSha256,
+      recordId: record.id,
+      role: record.role,
+    }, {
+      recordId: record.id,
+      role: record.role,
+    })).resolves.toEqual([record]);
+  });
+
   test("rejects any altered response identity or payload bytes instead of inventing a fallback row", async () => {
     const record = { id: "answer-1", role: "assistant", text: "真实答案", ts: 1 };
     const bytes = bytesOf(record);

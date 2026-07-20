@@ -328,13 +328,13 @@ function DeferredTapeRecordCard({
     const tapeId = message._turnTapeId;
     const ordinal = message._recordOrdinal;
     const sha256 = message._payloadSha256;
-    if (!tapeId || typeof ordinal !== "number" || !sha256) return;
+    if (!tapeId || typeof ordinal !== "number") return;
     started.current = true;
     setFailed(false);
     const loaded = await cb.onFetchTapeRecordPayload(tapeId, ordinal, {
       recordId: message.id,
       role: message.role,
-      contentSha256: sha256,
+      ...(sha256 ? { contentSha256: sha256 } : {}),
     });
     if (!loaded) {
       started.current = false;

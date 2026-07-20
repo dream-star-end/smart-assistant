@@ -5,7 +5,8 @@ import { decodeTapePayload } from "./tapePayloadCore";
 export type TapePayloadExpectation = {
   recordId: string;
   role: string;
-  contentSha256: string;
+  /** Legacy rows obtain this from the payload HEAD handshake. */
+  contentSha256?: string;
 };
 
 type WorkerReply =
@@ -46,13 +47,17 @@ export async function parseTapeRecordPayload(
   if (
     payload.recordId !== expected.recordId ||
     payload.role !== expected.role ||
-    payload.contentSha256 !== expected.contentSha256
+    !/^[a-f0-9]{64}$/.test(payload.contentSha256) ||
+    (expected.contentSha256 !== undefined && payload.contentSha256 !== expected.contentSha256)
   ) {
     throw new Error("tape payload response identity mismatch");
   }
   const decoded = await parseOffMainThread(payload.bytes);
   if (!decoded.ok) throw new Error(decoded.error);
-  if (decoded.contentSha256 !== expected.contentSha256) {
+  if (
+    decoded.contentSha256 !== payload.contentSha256 ||
+    (expected.contentSha256 !== undefined && decoded.contentSha256 !== expected.contentSha256)
+  ) {
     throw new Error("tape payload content hash mismatch");
   }
   if (decoded.records.length === 0) throw new Error("tape payload contains no logical record");

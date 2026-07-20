@@ -350,6 +350,7 @@ import {
   drainDelegateCostForClientSession,
   getClientSession,
   getEngineContextMessages,
+  hasCompletedClientTurn,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
   upsertMasterClientSession,
   softDeleteMasterSession,
@@ -1150,7 +1151,7 @@ export async function registerCommercial(
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
-  // durable turn dispatch(RFC §2):受理/tape-state/projection 读需 DispatchAdmissionBackend 面。
+  // durable turn dispatch(RFC §2):受理、tape-state 与真实终态读需 DispatchAdmissionBackend 面。
   let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
   const goalUsageRefreshRef: {
     current: (userId: string, sessionId: string) => void | Promise<void>;
@@ -4411,12 +4412,21 @@ export async function registerCommercial(
         platformRoot: cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT,
       });
     },
-    // 引擎历史注入(RFC §9):切到 getEngineContextMessages —— 投影 assistant 生成行 + 热行
-    // canonical user 行按 _orderSeq 合并 + 48 行/18k 截断,绝不全量水合 tape BYTEA(挂历史 22-31s
-    // 根治)。返回形态与旧 getClientSession(...).messages 兼容(MessageLike[] | null);dedup 判定
-    // 字段(_clientMessageId/status/_errorCode)在投影生成行保真,tryDedupCompleted 不受影响。
-    loadMasterSessionMessages: async (uid, sessionId) =>
-      getEngineContextMessages(sessionId, MASTER_USER_PREFIX + uid.toString()),
+    // 引擎历史只读真实 Tape 的有限模型窗口 sidecar。浏览器历史不受该窗口影响；当前
+    // prompt/引擎/上下文窗口均由 bridge 的可信 catalog snapshot 传入，避免回退到全量
+    // BYTEA 全量水合后再做固定行数/字符数截断。
+    loadMasterSessionMessages: async (uid, sessionId, context) =>
+      getEngineContextMessages(
+        sessionId,
+        MASTER_USER_PREFIX + uid.toString(),
+        context,
+      ),
+    hasCompletedClientTurn: async (uid, sessionId, clientMessageId) =>
+      hasCompletedClientTurn(
+        sessionId,
+        MASTER_USER_PREFIX + uid.toString(),
+        clientMessageId,
+      ),
     loadGoalState: (uid, sessionId) => goalStateService.get(uid, sessionId),
     updateGoalEngineMetrics: (args) => goalStateService.updateEngineMetrics(args),
     persistMasterUserMessage: async (uid, sessionId, message) =>
@@ -4677,7 +4687,7 @@ export async function registerCommercial(
   }
 
   // durable turn dispatch reconciler(RFC §2.3):open dispatch 周期收敛(admitted 过期租约 →
-  // 容器求证 → terminal/accepted;terminal 未通知 → 财务联查 → error projection / manual_reconcile)。
+  // 容器求证 → terminal/accepted;terminal 未通知 → 财务联查 → 真实终态 / manual_reconcile)。
   // leaderBundle shared 单跑(双 master 只 leader)。仅 v5(turn_dispatches 由 0170 建)。
   if (runtimeChannel === "v5" && process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_DISABLED !== "1") {
     const dispatchBridgeSecret = bridgeSecret;
@@ -4739,9 +4749,9 @@ export async function registerCommercial(
           // (best-effort;reservation 本会自然过期)。
           releaseReservation: (ref) =>
             releasePreCheck(preCheckRedis, { userId: ref.userId, requestId: ref.requestId }).then(() => {}),
-          // M4:error projection 落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
-          // reconcile 帧型(前端 applyOutboundMessage 收到即 forceSync 拉回 projection error 卡)。
-          // published≠delivered:用户离线/已切轮则无害吞掉,projection 已持久,下次 sync 必达。
+          // M4:真实终态落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
+          // reconcile 帧型(前端收到即 forceSync 拉回该 dispatch 的权威状态卡)。
+          // published≠delivered:用户离线/已切轮则无害吞掉,终态已持久,下次 sync 必达。
           nudgeClient: (uid, sessionId, clientMessageId) => {
             try {
               userChatBridge.broadcastToUser(uid, {

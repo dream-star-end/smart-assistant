@@ -378,13 +378,13 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     assert.equal(counts.rejectedTerminal, 0, '不可达绝不推断终态')
     assert.equal(counts.manualReconcile, 0)
     assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")), '不动 dispatch 状态')
-    // Codex R1 MAJOR 回归锁:扫描 cutoff 必须按 15min 取(不是 stuckMs 的 90min 下限),
-    // 否则求证系统性瘫痪(SSRF 拦死)要等 90min+ 才首告。
+    // All accepted rows are now probed so a durable typed interruption is
+    // visible on the next tick instead of waiting 15/90 minutes.
     assert.equal(pool.acceptedScanCutoffs.length >= 1, true, 'accepted 扫描必须带时间参数')
     const cutoffAge = Date.now() - pool.acceptedScanCutoffs[0]!.getTime()
     assert.ok(
-      cutoffAge > 14 * 60_000 && cutoffAge < 16 * 60_000,
-      `扫描下限必须≈15min(实际 ${Math.round(cutoffAge / 60_000)}min)`,
+      cutoffAge >= 0 && cutoffAge < 5_000,
+      `扫描下限必须≈当前时刻(实际 ${cutoffAge}ms)`,
     )
   })
 
@@ -432,6 +432,34 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     const counts = await runReconcileTick({ pool: pool as unknown as Pool, container })
     assert.equal(counts.rejectedTerminal, 0)
     assert.equal(counts.manualReconcile, 0)
+  })
+
+  test('container typed crash becomes a direct status without fabricating Agent tape', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    let nudged = 0
+    const revisionBumps: Array<[string, string]> = []
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok', state: 'terminal', outcome: 'crashed',
+        }),
+      },
+      nudgeClient: () => { nudged++ },
+      bumpHistoryRevision: async (sessionId, sessionUserId) => {
+        revisionBumps.push([sessionId, sessionUserId])
+        return true
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.equal(counts.notified, 1)
+    assert.equal(nudged, 1)
+    assert.ok(pool.writes.some((w) =>
+      w.includes("status = 'terminal'") && w.includes('failure_code = $3')))
+    assert.deepEqual(revisionBumps, [['sess-0001', 'c:42']])
   })
 })
 

@@ -71,7 +71,7 @@ async function startRig(opts: {
   maxFrameBytes?: number;
   markContainerActivity?: (containerId: number) => void;
   loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
-  loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
+  loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   loadGoalState?: UserChatBridgeDeps["loadGoalState"];
   persistMasterUserMessage?: UserChatBridgeDeps["persistMasterUserMessage"];
   logger?: Logger;
@@ -272,16 +272,18 @@ describe("detectScanSciPaperIntent", () => {
 });
 
 describe("sanitizeMasterHistoricalMessagesForFrame", () => {
-  test("keeps only compact user/assistant text rows for private frame history", () => {
+  test("keeps every selected semantic history row without a second arbitrary cap", () => {
     const rows = _sanitizeMasterHistoricalMessagesForFrame([
       { id: "u1", role: "user", text: "hello", status: "sent", ts: 1 },
       { id: "th1", role: "thinking", text: "hidden" },
       { id: "sys", role: "assistant", text: "system", system: true },
       { id: "a1", role: "assistant", content: [{ text: "answer" }], extra: "drop" },
+      { id: "t1", role: "tool", toolName: "Bash", inputJson: { command: "pwd" }, output: "/srv" },
     ]);
     assert.deepEqual(rows, [
       { id: "u1", role: "user", text: "hello", status: "sent", ts: 1 },
       { id: "a1", role: "assistant", text: "answer" },
+      { id: "t1", role: "tool", text: "Tool: Bash\nInput: {\"command\":\"pwd\"}\nOutput: /srv" },
     ]);
   });
 });
@@ -982,9 +984,14 @@ describe("userChatBridge — model authorization", () => {
     const allowed = new Set<string>(["gpt-5.6-sol"]);
     const rig = await startRig({
       loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
-      loadMasterSessionMessages: async (uid, sessionId) => {
+      loadMasterSessionMessages: async (uid, sessionId, context) => {
         assert.equal(uid, 204n);
         assert.equal(sessionId, "sess-history");
+        assert.deepEqual(context, {
+          contextWindow: null,
+          engine: "codex",
+          currentUserText: "我刚才问了什么？",
+        });
         return [
           { id: "u-old", role: "user", text: "之前问了什么项目", ts: 1 },
           { id: "srv-sess-history-main-t1", role: "assistant", text: "DeepSeek 的回答", ts: 2 },

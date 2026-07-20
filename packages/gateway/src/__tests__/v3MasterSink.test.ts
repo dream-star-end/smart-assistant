@@ -17,6 +17,7 @@ import {
   SERVER_AUTHORED_PATH,
   attemptSend,
   buildLosslessTurnTapeRequests,
+  iterateLosslessTurnTapeParts,
   getV3MasterSinkOrNull,
   makeV3MasterSink,
   readV3MasterSinkConfig,
@@ -163,8 +164,9 @@ describe("lossless v2 turn tape", () => {
     };
 
     const tape = buildLosslessTurnTapeRequests(payload);
-    assert.ok(tape.parts.length > 4);
-    const reconstructed = Buffer.concat(tape.parts.map((part) => {
+    const parts = [...iterateLosslessTurnTapeParts(tape)];
+    assert.ok(parts.length > 4);
+    const reconstructed = Buffer.concat(parts.map((part) => {
       const bytes = Buffer.from(part.data, "base64");
       assert.ok(bytes.length <= LOSSLESS_TURN_TAPE_PART_BYTES);
       assert.equal(createHash("sha256").update(bytes).digest("hex"), part.partSha256);
@@ -187,7 +189,10 @@ describe("lossless v2 turn tape", () => {
     const first = buildLosslessTurnTapeRequests(payload);
     const second = buildLosslessTurnTapeRequests({ ...payload });
     assert.deepEqual(first.canonical, second.canonical);
-    assert.deepEqual(first.parts, second.parts);
+    assert.deepEqual(
+      [...iterateLosslessTurnTapeParts(first)],
+      [...iterateLosslessTurnTapeParts(second)],
+    );
     assert.deepEqual(first.finalize, second.finalize);
   });
 
@@ -201,7 +206,7 @@ describe("lossless v2 turn tape", () => {
       dispatchId: "3e0a2b52-9d31-4c8f-9b6e-000000000001",
       attemptNo: 2,
     });
-    for (const part of withDispatch.parts) {
+    for (const part of iterateLosslessTurnTapeParts(withDispatch)) {
       assert.equal(part.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
       assert.equal(part.attemptNo, 2);
     }
@@ -212,7 +217,7 @@ describe("lossless v2 turn tape", () => {
     assert.equal(parsed.dispatchId, "3e0a2b52-9d31-4c8f-9b6e-000000000001");
     // legacy(无身份)payload:信封不得出现 undefined 字段污染既有形状。
     const legacy = buildLosslessTurnTapeRequests({ ...PAYLOAD, createdAt: 123, turnKey: "d".repeat(64) });
-    assert.ok(!("dispatchId" in legacy.parts[0]!));
+    assert.ok(!("dispatchId" in [...iterateLosslessTurnTapeParts(legacy)][0]!));
     assert.ok(!("dispatchId" in legacy.finalize));
   });
 
@@ -223,7 +228,9 @@ describe("lossless v2 turn tape", () => {
       waiveReason: "platform_authority_expired",
     });
     assert.equal(tape.finalize.waiveReason, "platform_authority_expired");
-    assert.ok(tape.parts.every((part) => part.waiveReason === "platform_authority_expired"));
+    assert.ok([...iterateLosslessTurnTapeParts(tape)].every(
+      (part) => part.waiveReason === "platform_authority_expired",
+    ));
     const canonical = JSON.parse(tape.canonical.toString("utf8"));
     assert.equal(canonical.waiveReason, "platform_authority_expired");
   });

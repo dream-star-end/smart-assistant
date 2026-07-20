@@ -16,6 +16,8 @@
 
 import type { Pool } from 'pg'
 
+import { bumpClientSessionHistoryRevision } from '@openclaude/storage'
+
 import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
@@ -172,6 +174,8 @@ export interface TurnDispatchReconcilerDeps {
    * 是现实:失败/离线一律无害吞掉(状态已持久,下次进会话/sync 必达)。
    */
   nudgeClient?: (uid: bigint, sessionId: string, clientMessageId: string) => void
+  /** 测试可注入;生产默认经 active sessions backend 推进直读时间线版本。 */
+  bumpHistoryRevision?: (sessionId: string, sessionUserId: string) => Promise<boolean>
   stuckThresholdMs?: number
   rejectMinAgeMs?: number
   limit?: number
@@ -279,7 +283,10 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   // (如 SSRF 拦死)要等 stuckMs 才首告(Codex R1 MAJOR)。[ALERT_MS, stuckMs)
   // 窗口内的行**只探测+告警,零状态迁移**——所有既有收敛分支仍由下方 age 门守住。
   const stuck = await scanAcceptedStuck(deps.pool, {
-    stuckMs: Math.min(stuckMs, ACCEPTED_UNREACHABLE_ALERT_MS),
+    // Read typed container state every tick. This is a bounded indexed page,
+    // not a timeout: it lets a restarted executor publish an interruption
+    // without fabricating an Agent tape or waiting 15/90 minutes.
+    stuckMs: 0,
     limit,
     now: now(),
   })
@@ -297,6 +304,33 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
           'accepted_unreachable',
         )
         counts.alerts++
+      }
+      continue
+    }
+    if (res.state === 'terminal' && res.outcome === 'crashed') {
+      // The container durably proves its execution process ended, but it does
+      // not prove that a fully staged result can never arrive later. Persist a
+      // typed dispatch status only; never occupy or replace the immutable tape
+      // namespace. A late real finalize moves this row out of terminal and the
+      // direct timeline naturally removes the status.
+      const terminal = await casToTerminal(deps.pool, {
+        dispatchId: row.dispatchId,
+        outcome: 'executed_error',
+        failureCode: 'RESULT_RECOVERY_PENDING',
+        clientNotified: true,
+        fromStatuses: ['accepted'],
+        now: now(),
+      })
+      if (terminal) {
+        await (deps.bumpHistoryRevision ?? bumpClientSessionHistoryRevision)(
+          row.sessionId,
+          `c:${row.userId}`,
+        )
+        counts.visibleFailures++
+        counts.notified++
+        try {
+          deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
+        } catch { /* status is durable; live nudge is best-effort */ }
       }
       continue
     }

@@ -96,6 +96,65 @@ test('getSession marks an initial full response from a legacy partial-history ba
   expect(detail._historyRevisionUnsupported).toBe(true)
 })
 
+test('getTapeRecordPayload resolves metadata with HEAD and reconstructs exact bytes through 1 MiB ranges', async () => {
+  const source = new Uint8Array(2 * 1024 * 1024 + 17)
+  for (let index = 0; index < source.length; index += 1) source[index] = index % 251
+  const hash = 'a'.repeat(64)
+  const ranges: string[] = []
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+    if (init?.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(source.length),
+          'accept-ranges': 'bytes',
+          'x-openclaude-content-sha256': hash,
+          'x-openclaude-record-id': 'record-range',
+          'x-openclaude-record-role': 'tool',
+        },
+      })
+    }
+    const range = new Headers(init?.headers).get('range') ?? ''
+    ranges.push(range)
+    const matched = /^bytes=(\d+)-(\d+)$/.exec(range)
+    if (!matched) throw new Error(`missing range: ${range}`)
+    const start = Number(matched[1])
+    const end = Number(matched[2])
+    return new Response(source.slice(start, end + 1), {
+      status: 206,
+      headers: {
+        'content-range': `bytes ${start}-${end}/${source.length}`,
+        'x-openclaude-content-sha256': hash,
+        'x-openclaude-record-id': 'record-range',
+        'x-openclaude-record-role': 'tool',
+      },
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-tape-range')
+
+  const result = await api.getTapeRecordPayload(
+    session,
+    'session-range-1',
+    'tape-range-1',
+    7,
+  )
+  const reconstructed = new Uint8Array(result.bytes)
+  expect(fetchMock).toHaveBeenCalledTimes(4)
+  expect(ranges).toEqual([
+    'bytes=0-1048575',
+    'bytes=1048576-2097151',
+    `bytes=2097152-${source.length - 1}`,
+  ])
+  expect(result).toMatchObject({
+    contentSha256: hash,
+    recordId: 'record-range',
+    role: 'tool',
+  })
+  expect(reconstructed.length).toBe(source.length)
+  expect(reconstructed.every((byte, index) => byte === source[index])).toBe(true)
+})
+
 const ME_BODY = {
   user: {
     id: 'u1',

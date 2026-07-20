@@ -58,6 +58,11 @@ const MIGRATION_0176 = path.resolve(here, "../db/migrations/0176_direct_turn_tim
 let pool: Pool;
 let backend: PgSessionsBackend;
 let pgAvailable = false;
+let migration0176EscapedNulBackfill: {
+  physical_record_count: number;
+  logical_record_count: number;
+  record_payload_bytes: string;
+} | null = null;
 
 async function probeAvailability(): Promise<boolean> {
   const p = new Pool({ connectionString: TEST_DB_URL, max: 1, connectionTimeoutMillis: 1500 });
@@ -105,7 +110,76 @@ before(async () => {
   // 0173:client_sessions.model_id(会话级模型选择;本套件的读写 SQL 均已含该列)。
   await pool.query(await readFile(MIGRATION_0173, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0175, { encoding: "utf8" }));
+  // Production history legally contains JSON text escapes such as \u0000.
+  // Seed one before 0176 so the migration itself (not merely the new runtime)
+  // proves it never coerces the TEXT history authority through JSONB.
+  const nulSessionId = "s-migration-0176-escaped-nul";
+  const nulUserId = "u-migration-0176-escaped-nul";
+  const nulTapeId = "a".repeat(64);
+  const nulTapeSha = "b".repeat(64);
+  const nulPayloads = [
+    Buffer.from(JSON.stringify({ id: "nul-thinking", role: "thinking", text: "step" })),
+    Buffer.from(JSON.stringify({ id: "nul-final", role: "assistant", text: "complete" })),
+  ];
+  const nulMessages = JSON.stringify([
+    { id: "legal-json", role: "user", text: "contains\u0000escaped nul" },
+    {
+      id: "nul-final",
+      role: "assistant",
+      _turnTapeId: nulTapeId,
+      _turnTapeSha256: nulTapeSha,
+      _turnTapeComplete: true,
+      _turnTapeRecordCount: 2,
+      _turnTapeLogicalRecordCount: 2,
+    },
+  ]);
+  await pool.query(
+    `INSERT INTO client_sessions
+       (id,user_id,agent_id,title,pinned,created_at,last_at,messages,message_count,updated_at)
+     VALUES ($1,$2,'main','migration fixture',0,1,1,$3,2,1)`,
+    [nulSessionId, nulUserId, nulMessages],
+  );
+  await pool.query(
+    `INSERT INTO client_session_turn_tapes
+       (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+        total_bytes,part_count,billing_anchor_id,created_at,finalized_at)
+     VALUES ($1,$2,$3,'main',1,'completed',$4,$5,$6,1,'nul-final',1,1)`,
+    [
+      nulSessionId,
+      nulUserId,
+      nulTapeId,
+      "c".repeat(64),
+      nulTapeSha,
+      nulPayloads.reduce((sum, payload) => sum + payload.length, 0),
+    ],
+  );
+  for (const [ordinal, payload] of nulPayloads.entries()) {
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        nulSessionId,
+        nulUserId,
+        nulTapeId,
+        ordinal === 0 ? "nul-thinking" : "nul-final",
+        ordinal,
+        ordinal === 0 ? "thinking" : "assistant",
+        ordinal + 1,
+        sha256(payload),
+        payload,
+      ],
+    );
+  }
   await pool.query(await readFile(MIGRATION_0176, { encoding: "utf8" }));
+  migration0176EscapedNulBackfill = (
+    await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
+      `SELECT physical_record_count, logical_record_count, record_payload_bytes::text
+         FROM client_session_turn_tapes
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [nulSessionId, nulUserId, nulTapeId],
+    )
+  ).rows[0] ?? null;
   // 0167 also alters billing/inbox tables that are intentionally absent from
   // this isolated sessions schema. Mirror its tape column and waiver table so
   // the backend contract still exercises the production SQL shape.
@@ -645,6 +719,45 @@ describe("pgSessionsBackend contract", () => {
 });
 
 describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("stages later immutable parts while a concurrent writer holds the hot session row", async () => {
+    const sessionId = "s-tape-stage-no-hot-row-lock";
+    const userId = "u-tape-stage-no-hot-row-lock";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "7".repeat(64),
+      text: "large exact answer".repeat(80_000),
+      createdAt: 1_783_944_000_000,
+    });
+    assert.ok(tape.parts.length > 1);
+    await backend.stageLosslessTurnTapePart(userId, tape.parts[0]!.request, tape.parts[0]!.bytes);
+
+    const locker = await pool.connect();
+    try {
+      await locker.query("BEGIN");
+      await locker.query("SELECT id FROM client_sessions WHERE id=$1 FOR UPDATE", [sessionId]);
+      const staged = backend.stageLosslessTurnTapePart(
+        userId,
+        tape.parts[1]!.request,
+        tape.parts[1]!.bytes,
+      );
+      const result = await Promise.race([
+        staged,
+        new Promise<never>((_, reject) => setTimeout(
+          () => reject(new Error("part staging waited on the unrelated hot session row")),
+          1_000,
+        )),
+      ]);
+      assert.deepEqual(result, { applied: "stored" });
+    } finally {
+      await locker.query("ROLLBACK");
+      locker.release();
+    }
+  });
+
   maybe("waived terminal tape commits one immutable pending billing fence", async () => {
     const sessionId = "s-waived-terminal";
     const userId = "c:7";
@@ -694,11 +807,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
 
     for (const view of [undefined, { view: "timeline" as const }]) {
       const hydrated = await backend.getClientSession(sessionId, userId, view);
-      const messages = hydrated?.messages as Array<{
-        role?: unknown;
-        _turnKey?: unknown;
-        usage?: { waived?: unknown };
-      }> | undefined;
+      const messages = hydrated?.messages as MessageLike[] | undefined;
       const assistant = messages?.find((message) => message.role === "assistant");
       assert.equal(
         assistant?._turnKey,
@@ -706,7 +815,7 @@ describe("pgSessionsBackend lossless turn tape", () => {
         "billing anchor must retain its exact logical turn for live waiver projection",
       );
       assert.equal(
-        assistant?.usage?.waived,
+        (assistant?.usage as { waived?: boolean } | undefined)?.waived,
         undefined,
         "a pending decision must not claim that refund and receipt already completed",
       );
@@ -720,12 +829,10 @@ describe("pgSessionsBackend lossless turn tape", () => {
     );
     for (const view of [undefined, { view: "timeline" as const }]) {
       const hydrated = await backend.getClientSession(sessionId, userId, view);
-      const assistant = (hydrated?.messages as Array<{
-        role?: unknown;
-        usage?: { waived?: unknown };
-      }> | undefined)?.find((message) => message.role === "assistant");
+      const assistant = (hydrated?.messages as MessageLike[] | undefined)
+        ?.find((message) => message.role === "assistant");
       assert.equal(
-        assistant?.usage?.waived,
+        (assistant?.usage as { waived?: boolean } | undefined)?.waived,
         true,
         "an applied waiver with receipt must survive refresh and cross-device hydration",
       );
@@ -1415,7 +1522,12 @@ describe("pgSessionsBackend lossless turn tape", () => {
       assert.ok(timeline);
       const timelineMessages = timeline.messages as MessageLike[];
       assert.equal(timelineMessages.some((message) => message._runtimeEvent !== undefined), false);
-      assert.equal(timelineMessages.find((message) => message.role === "assistant")?.text, "visible answer");
+      const visibleAnswer = timelineMessages.find((message) => message.role === "assistant");
+      assert.equal(visibleAnswer?._payloadDeferred, true);
+      assert.equal(
+        (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, visibleAnswer!)).text,
+        "visible answer",
+      );
       assert.equal(timelineMessages.some((message) => message._turnTapeProcess === true), true);
       const storage = await pool.query<{ record_storage_format: number }>(
         `SELECT record_storage_format FROM client_session_turn_tapes
@@ -1827,6 +1939,79 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(dd.kind, "deduplicated");
   });
 
+  maybe("超 4 MiB 用户消息受理为精确侧车:热行恒小、范围读无损、模型上下文仍取真实文本", async () => {
+    const sessionId = "s-dd-large-user";
+    const clientMessageId = "cm-dd-large-user";
+    const text = `LARGE-USER-HEAD\n${"超长用户真实正文😀".repeat(300_000)}\nLARGE-USER-TAIL`;
+    assert.ok(Buffer.byteLength(text, "utf8") > 4 * 1024 * 1024);
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admitted = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId,
+      requestHash: sha256(text),
+      message: {
+        id: clientMessageId,
+        role: "user",
+        text,
+        ts: 1_783_950_000_123,
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(admitted.kind, "admitted");
+
+    const hot = await pool.query<{ messages: string }>(
+      "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
+      [sessionId, CUSER],
+    );
+    assert.ok(Buffer.byteLength(hot.rows[0]!.messages, "utf8") < 32 * 1024);
+    const locator = (JSON.parse(hot.rows[0]!.messages) as MessageLike[])[0]!;
+    assert.equal(locator.id, clientMessageId);
+    assert.equal(locator.text, "");
+    assert.equal(locator._payloadDeferred, true);
+    assert.equal(locator._userPayloadDeferred, true);
+    assert.ok(typeof locator._payloadBytes === "number" && locator._payloadBytes > 4 * 1024 * 1024);
+
+    const metadata = await backend.readUserMessagePayload(
+      sessionId, CUSER, clientMessageId, 0, 0,
+    );
+    assert.ok(metadata);
+    assert.equal(metadata.payload.length, 0);
+    assert.equal(metadata.totalBytes, locator._payloadBytes);
+    assert.equal(metadata.contentSha256, locator._payloadSha256);
+    const chunks: Buffer[] = [];
+    for (let offset = 0; offset < metadata.totalBytes; offset += 1024 * 1024) {
+      const chunk = await backend.readUserMessagePayload(
+        sessionId,
+        CUSER,
+        clientMessageId,
+        offset,
+        Math.min(1024 * 1024, metadata.totalBytes - offset),
+      );
+      assert.ok(chunk);
+      assert.equal(chunk.offset, offset);
+      chunks.push(chunk.payload);
+    }
+    const raw = Buffer.concat(chunks);
+    assert.equal(raw.length, metadata.totalBytes);
+    assert.equal(sha256(raw), metadata.contentSha256);
+    const decoded = JSON.parse(raw.toString("utf8")) as MessageLike;
+    assert.equal(decoded.id, clientMessageId);
+    assert.equal(decoded.role, "user");
+    assert.equal(decoded.text, text);
+    assert.equal(decoded._source, "server");
+    assert.equal(
+      await backend.readUserMessagePayload(sessionId, "c:8", clientMessageId),
+      null,
+    );
+
+    const modelContext = await backend.getEngineContextMessages(sessionId, CUSER, {
+      contextWindow: null,
+    });
+    assert.equal(modelContext?.length, 1);
+    assert.equal(modelContext?.[0]?.role, "user");
+    assert.equal(modelContext?.[0]?.text, text);
+    assert.equal((modelContext?.[0] as MessageLike)._userPayloadDeferred, undefined);
+  });
+
   maybe("tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-lease-1", userId: CUSER }));
     const admitted = await backend.admitUserTurn(
@@ -1996,6 +2181,61 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(tapeState.dispatchLeaseActive, false);
   });
 
+  for (const tapeStatus of ["completed", "interrupted", "crashed"] as const) {
+    maybe(`recovery sentinel + late ${tapeStatus} tape → timeline removes placeholder and keeps real outcome`, async () => {
+      const suffix = tapeStatus.slice(0, 4);
+      const sessionId = `s-dd-recovery-${suffix}`;
+      const clientMessageId = `cm-dd-recovery-${suffix}`;
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+      const admit = await backend.admitUserTurn(
+        admitInput({ sessionId, clientMessageId }),
+      );
+      assert.equal(admit.kind, "admitted");
+      const d = (admit as { dispatch: { dispatchId: string } }).dispatch;
+      assert.ok(await casToTerminal(pool, {
+        dispatchId: d.dispatchId,
+        outcome: "executed_error",
+        failureCode: "RESULT_RECOVERY_PENDING",
+        clientNotified: true,
+      }));
+      const before = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+      assert.ok(before!.messages.some((m) => (m as MessageLike)._turnStatusRecord === true));
+
+      const tape = buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: tapeStatus,
+        turnKey: createHash("sha256").update(tapeStatus).digest("hex"),
+        text: `real ${tapeStatus} transcript`,
+        createdAt: 1_783_950_150_000,
+      });
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, {
+          dispatchId: d.dispatchId,
+          attemptNo: 1,
+        });
+      }
+      assert.equal(
+        (await backend.finalizeLosslessTurnTape(CUSER, tape.finalize)).applied,
+        "finalized",
+      );
+      const row = await getDispatch(pool, d.dispatchId);
+      assert.equal(row!.status, "terminal");
+      assert.equal(row!.outcome, tapeStatus);
+      assert.equal(row!.failureCode, null);
+      assert.equal(row!.clientNotified, false);
+      const after = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+      assert.ok(!after!.messages.some((m) => (m as MessageLike)._turnStatusRecord === true));
+      const finalLocator = (after!.messages as MessageLike[]).find((m) => m.role === "assistant");
+      assert.equal(finalLocator?._payloadDeferred, true);
+      assert.equal(
+        (await readDeferredRecord(sessionId, CUSER, tape.finalize.tapeId, finalLocator!)).text,
+        `real ${tapeStatus} transcript`,
+      );
+    });
+  }
+
   maybe("late tape(§7.9):verified failure → true tape finalize moves dispatch to manual and timeline shows only truth", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-late-3", userId: CUSER }));
     const admit = await backend.admitUserTurn(
@@ -2049,8 +2289,12 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     const after = await backend.getClientSession("s-dd-late-3", CUSER, { view: "timeline" });
     assert.ok(!after!.messages.some((m) => (m as MessageLike)._turnStatusRecord === true),
       "late truth removes the stale failure status from the browser timeline");
-    assert.equal((after!.messages as MessageLike[]).find((m) => m.role === "assistant")?.text,
-      "迟到的真回复");
+    const finalLocator = (after!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(finalLocator?._payloadDeferred, true);
+    assert.equal(
+      (await readDeferredRecord("s-dd-late-3", CUSER, tape.finalize.tapeId, finalLocator!)).text,
+      "迟到的真回复",
+    );
   });
 });
 
@@ -2064,12 +2308,16 @@ function directTape(
     clientMessageId?: string;
     tools?: Array<Record<string, unknown>>;
     thinkingText?: string;
+    thinkingSegments?: Array<{ index: number; text: string; ts: number; eventOrdinal?: number }>;
     runtimeEvents?: Array<{
       ordinal: number;
       observedAt: number;
       source: "ccb" | "codex-jsonrpc" | "gateway";
       payload: unknown;
     }>;
+    agentGroups?: Array<Record<string, unknown>>;
+    structuredBlocks?: Array<Record<string, unknown>>;
+    assistantSegments?: Array<{ index: number; text: string; ts: number; eventOrdinal?: number }>;
     turnIndex?: number;
   } = {},
 ) {
@@ -2085,7 +2333,11 @@ function directTape(
     ...(over.clientMessageId !== undefined ? { clientMessageId: over.clientMessageId } : {}),
     ...(over.tools !== undefined ? { tools: over.tools } : {}),
     ...(over.thinkingText !== undefined ? { thinkingText: over.thinkingText } : {}),
+    ...(over.thinkingSegments !== undefined ? { thinkingSegments: over.thinkingSegments } : {}),
     ...(over.runtimeEvents !== undefined ? { runtimeEvents: over.runtimeEvents } : {}),
+    ...(over.agentGroups !== undefined ? { agentGroups: over.agentGroups } : {}),
+    ...(over.structuredBlocks !== undefined ? { structuredBlocks: over.structuredBlocks } : {}),
+    ...(over.assistantSegments !== undefined ? { assistantSegments: over.assistantSegments } : {}),
   });
 }
 
@@ -2097,7 +2349,116 @@ async function stageAndFinalize(userId: string, tape: ReturnType<typeof buildTap
   assert.equal(result.applied, "finalized");
 }
 
+async function readDeferredRecord(
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  locator: MessageLike,
+): Promise<MessageLike> {
+  assert.equal(locator._payloadDeferred, true);
+  assert.ok(typeof locator._recordOrdinal === "number");
+  const payload = await backend.readTapeRecordPayload(
+    sessionId,
+    userId,
+    tapeId,
+    locator._recordOrdinal,
+  );
+  assert.ok(payload);
+  return JSON.parse(payload.payload.toString("utf8")) as MessageLike;
+}
+
 describe("pgSessionsBackend direct turn timeline", () => {
+  maybe("engine context hydrates real tape-backed tool, plan, goal and delegate facts", async () => {
+    const sessionId = "s-direct-engine-semantic";
+    const userId = "u-direct-engine-semantic";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "e".repeat(64), {
+      text: "final answer after completed work",
+      thinkingText: "private chain of thought",
+      tools: [{
+        blockId: "tool-semantic-1",
+        toolName: "Bash",
+        inputJson: { command: "cat result.txt" },
+        output: "EXACT-TAPE-TOOL-RESULT",
+        completed: true,
+      }],
+      agentGroups: [{
+        runId: "delegate-semantic-1",
+        agentId: "coder",
+        goal: "review implementation",
+        status: "ok",
+        completedAt: 1_783_944_000_010,
+        resultSummary: "EXACT-TAPE-DELEGATE-SUMMARY",
+        transcript: [{ kind: "text", text: "EXACT-TAPE-DELEGATE-RESULT" }],
+      }],
+      structuredBlocks: [
+        { kind: "plan", blockId: "plan-semantic", text: "release plan", steps: [{ step: "deploy", status: "completed" }] },
+        { kind: "goal", blockId: "goal-semantic", objective: "ship exact history", status: "complete" },
+      ],
+    });
+    await stageAndFinalize(userId, tape);
+
+    const context = await backend.getEngineContextMessages(sessionId, userId);
+    assert.ok(context);
+    assert.deepEqual(
+      context.map((message) => message.role),
+      ["tool", "assistant", "goal", "plan", "agent-group"],
+    );
+    assert.equal(context.some((message) => message.role === "thinking"), false);
+    assert.equal(context.find((message) => message.role === "tool")?.output, "EXACT-TAPE-TOOL-RESULT");
+    assert.equal(
+      (context.find((message) => message.role === "agent-group")?.childBlocks as Array<{ text?: string }>)[0]?.text,
+      "EXACT-TAPE-DELEGATE-RESULT",
+    );
+  });
+
+  maybe("0176 is metadata-only for the large record table and tolerates legal escaped NUL history", async () => {
+    assert.deepEqual(migration0176EscapedNulBackfill, {
+      physical_record_count: 0,
+      logical_record_count: 0,
+      record_payload_bytes: "0",
+    });
+    const sql = await readFile(MIGRATION_0176, { encoding: "utf8" });
+    assert.doesNotMatch(sql, /FROM\s+client_session_turn_tape_records/i);
+  });
+
+  maybe("engine context reads archive plus hot narrative with no fixed row ceiling", async () => {
+    const sessionId = "s-engine-context-complete-history";
+    const userId = "u-engine-context-complete-history";
+    const archived = Array.from({ length: 60 }, (_, index) => ({
+      id: `archive-${index + 1}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+      text: `archived narrative ${index + 1}`,
+      _seq: index + 1,
+    }));
+    const hot = Array.from({ length: 25 }, (_, index) => ({
+      id: `hot-${index + 61}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+      text: `hot narrative ${index + 61}`,
+      _seq: index + 61,
+    }));
+    await pool.query(
+      `INSERT INTO client_sessions
+         (id,user_id,agent_id,title,pinned,created_at,last_at,messages,message_count,
+          updated_at,next_seq,archived_through_seq,archived_count)
+       VALUES ($1,$2,'main','long context',0,1,85,$3,85,85,86,60,60)`,
+      [sessionId, userId, JSON.stringify(hot)],
+    );
+    await pool.query(
+      `INSERT INTO client_session_archive_chunks
+         (session_id,user_id,first_seq,last_seq,message_count,messages,created_at)
+       VALUES ($1,$2,1,60,60,$3,1)`,
+      [sessionId, userId, JSON.stringify(archived)],
+    );
+
+    const context = await backend.getEngineContextMessages(sessionId, userId);
+    assert.ok(context);
+    assert.equal(context.length, 85);
+    assert.equal(context[0]?.id, "archive-1");
+    assert.equal(context[59]?.id, "archive-60");
+    assert.equal(context.at(-1)?.id, "hot-85");
+  });
+
   maybe("0176 leaves legacy tables inert so the predecessor remains runnable during rollout", async () => {
     const tables = await pool.query<{ chat: string | null; failures: string | null }>(
       `SELECT to_regclass('tape_chat_projection')::text AS chat,
@@ -2109,7 +2470,45 @@ describe("pgSessionsBackend direct turn timeline", () => {
     });
   });
 
-  maybe("timeline returns the exact final answer immediately and a lazy cursor over every true process row", async () => {
+  maybe("a predecessor finalizer racing 0176 is readable even when new header counters remain zero", async () => {
+    const sessionId = "s-direct-migration-race";
+    const userId = "u-direct-migration-race";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "6".repeat(64), {
+      clientMessageId: "cm-migration-race",
+      thinkingText: "race thinking",
+      text: "race final exact",
+    });
+    await stageAndFinalize(userId, tape);
+    await pool.query(
+      `UPDATE client_session_turn_tapes
+          SET physical_record_count=0, logical_record_count=0, record_payload_bytes=0
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(timeline);
+    const raceFinal = (timeline.messages as MessageLike[]).find(
+      (message) => message.role === "assistant",
+    );
+    assert.equal(raceFinal?._payloadDeferred, true);
+    assert.equal(
+      (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, raceFinal!)).text,
+      "race final exact",
+    );
+    assert.equal(
+      (timeline.messages as MessageLike[]).find((message) => message._turnTapeProcess === true)
+        ?._turnTapeProcessCount,
+      1,
+    );
+    assert.equal(
+      await backend.hasCompletedClientTurn(sessionId, userId, "cm-migration-race"),
+      true,
+    );
+  });
+
+  maybe("timeline returns exact final/process locators and lazily exposes every semantic row", async () => {
     const sessionId = "s-direct-timeline-truth";
     const userId = "u-direct-timeline-truth";
     const turnKey = "1".repeat(64);
@@ -2121,12 +2520,19 @@ describe("pgSessionsBackend direct turn timeline", () => {
     const tape = directTape(sessionId, turnKey, {
       clientMessageId: "cm-direct-truth",
       thinkingText: "逐步分析真实内容",
+      thinkingSegments: [{
+        index: 0,
+        text: "逐步分析真实内容",
+        ts: 1_783_944_000_000,
+        eventOrdinal: 1,
+      }],
       tools: [{
         blockId: "tool-truth",
         toolName: "Bash",
         inputJson: { command: "printf truth" },
         output: "真实工具输出",
         completed: true,
+        eventOrdinal: 2,
       }],
       runtimeEvents: [{
         ordinal: 7,
@@ -2141,8 +2547,12 @@ describe("pgSessionsBackend direct turn timeline", () => {
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
     const initial = timeline.messages as MessageLike[];
-    assert.equal(initial.find((message) => message.role === "assistant")?.text,
-      "这是 Agent 的真实最终回答");
+    const finalLocator = initial.find((message) => message.role === "assistant");
+    assert.equal(finalLocator?._payloadDeferred, true);
+    assert.equal(
+      (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, finalLocator!)).text,
+      "这是 Agent 的真实最终回答",
+    );
     assert.equal(initial.some((message) => message.role === "thinking"), false);
     assert.equal(initial.some((message) => message.role === "tool"), false);
     assert.equal(initial.some((message) => message._runtimeEvent !== undefined), false);
@@ -2157,23 +2567,277 @@ describe("pgSessionsBackend direct turn timeline", () => {
     );
     assert.ok(page);
     assert.equal(page.nextCursor, null);
-    assert.equal(page.total, 4);
-    assert.deepEqual(page.records.map((message) => message.role), [
-      "runtime-event", "thinking", "tool", "assistant",
-    ]);
+    assert.equal(page.total, 3);
+    assert.deepEqual(page.records.map((message) => message.role), ["thinking", "tool", "runtime-event"]);
     assert.equal(page.records.find((message) => message.role === "tool")?.text, "真实工具输出");
-    assert.deepEqual(
-      page.records.find((message) => message._runtimeEvent !== undefined)?._runtimeEvent,
-      { type: "progress", exact: "真实运行事件" },
-    );
+    assert.equal(page.records.some((message) => message._runtimeEvent !== undefined), true);
 
     const exact = await backend.getClientSession(sessionId, userId);
     assert.ok(exact);
-    assert.deepEqual(
-      (exact.messages as MessageLike[]).filter((message) => message.role !== "user")
-        .map((message) => message.id),
-      page.records.map((message) => message.id),
-      "lazy paging exposes the same immutable records as the exact authority read",
+    assert.equal((exact.messages as MessageLike[]).some(
+      (message) => (message._runtimeEvent as { exact?: string } | undefined)?.exact === "真实运行事件",
+    ), true, "opaque audit evidence remains server-side");
+  });
+
+  maybe("initial timeline shows only the billing anchor while earlier assistant segments stay in process order", async () => {
+    const sessionId = "s-direct-final-anchor-only";
+    const userId = "u-direct-final-anchor-only";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "5".repeat(64), {
+      text: "中间说明最终结论",
+      assistantSegments: [
+        { index: 0, text: "中间说明", ts: 1_783_944_000_001, eventOrdinal: 1 },
+        { index: 1, text: "最终结论", ts: 1_783_944_000_003, eventOrdinal: 3 },
+      ],
+      tools: [{
+        blockId: "between-segments",
+        toolName: "Bash",
+        inputJson: { command: "printf between" },
+        output: "between output",
+        completed: true,
+        arrivedAt: 1_783_944_000_002,
+        eventOrdinal: 2,
+      }],
+    });
+    await stageAndFinalize(userId, tape);
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(timeline);
+    const locators = (timeline.messages as MessageLike[]).filter(
+      (message) => message._payloadDeferred === true,
+    );
+    assert.equal(locators.length, 1);
+    assert.equal((await readDeferredRecord(
+      sessionId, userId, tape.finalize.tapeId, locators[0]!,
+    )).text, "最终结论");
+
+    const page = await backend.listTurnTapeRecords(
+      sessionId, userId, tape.finalize.tapeId, 0, 200,
+    );
+    assert.ok(page);
+    assert.deepEqual(page.records.map((message) => [message.role, message.text]), [
+      ["assistant", "中间说明"],
+      ["tool", "between output"],
+    ]);
+    assert.equal(page.records.some((message) => message.id === locators[0]!.id), false);
+  });
+
+  maybe("user tape API preserves future Agent fields while stripping only known private runtime data", async () => {
+    const sessionId = "s-direct-security-boundary";
+    const userId = "u-direct-security-boundary";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "8".repeat(64), {
+      text: "安全边界后的完整回答",
+      runtimeEvents: [
+        {
+          ordinal: 1,
+          observedAt: 1_783_944_000_001,
+          source: "codex-jsonrpc",
+          payload: {
+            type: "thread/started",
+            params: {
+              rateLimits: { credits: { balance: "BALANCE_SECRET" }, planType: "PLAN_SECRET" },
+              threadSettings: { collaborationMode: { settings: { developer_instructions: "DEV_SECRET" } } },
+              cwd: "/INTERNAL/CWD/SECRET",
+              apiKeySource: "API_KEY_SOURCE_SECRET",
+              plugins: ["PLUGIN_SECRET"],
+              mcp_servers: ["MCP_SECRET"],
+              signature: "THINKING_SIGNATURE_SECRET",
+            },
+          },
+        },
+        {
+          ordinal: 2,
+          observedAt: 1_783_944_000_002,
+          source: "gateway",
+          payload: {
+            type: "system",
+            subtype: "bash_output_tail",
+            tool_use_id: "bash-safe",
+            tail: "SAFE_EXACT_BASH_TAIL",
+            total_bytes: 20,
+            truncated_head: false,
+            cwd: "/MUST/NOT/LEAK",
+          },
+        },
+      ],
+      agentGroups: [{
+        runId: "dlg-security",
+        agentId: "reviewer",
+        goal: "完整审查",
+        status: "ok",
+        resultSummary: "CHILD_EXACT_RESULT",
+        transcript: [{
+          kind: "text",
+          text: "CHILD_EXACT_TRANSCRIPT",
+          _nestedDelegateRuntimeEvents: [{ payload: { developer_instructions: "NESTED_DEV_SECRET" } }],
+        }, {
+          kind: "future_widget",
+          futureField: { exact: "FUTURE_CHILD_FIELD" },
+        }],
+        runtimeEvents: [{
+          ordinal: 3,
+          observedAt: 1_783_944_000_003,
+          source: "codex-jsonrpc",
+          payload: { cwd: "/CHILD/CWD/SECRET", skills: ["CHILD_SKILL_SECRET"] },
+        }],
+        completedAt: 1_783_944_000_004,
+      }],
+    });
+    await stageAndFinalize(userId, tape);
+
+    const page = await backend.listTurnTapeRecords(sessionId, userId, tape.finalize.tapeId, 0, 200);
+    assert.ok(page);
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(timeline);
+    const finalLocator = (timeline.messages as MessageLike[]).find(
+      (message) => message._payloadDeferred === true,
+    );
+    assert.ok(finalLocator);
+    const final = await readDeferredRecord(
+      sessionId, userId, tape.finalize.tapeId, finalLocator,
+    );
+    const wire = JSON.stringify({ page, final });
+    for (const secret of [
+      "BALANCE_SECRET", "PLAN_SECRET", "DEV_SECRET", "/INTERNAL/CWD/SECRET",
+      "API_KEY_SOURCE_SECRET", "PLUGIN_SECRET", "MCP_SECRET", "THINKING_SIGNATURE_SECRET",
+      "/MUST/NOT/LEAK", "NESTED_DEV_SECRET", "/CHILD/CWD/SECRET", "CHILD_SKILL_SECRET",
+    ]) assert.equal(wire.includes(secret), false, `${secret} must stay server-side`);
+    assert.match(wire, /SAFE_EXACT_BASH_TAIL/);
+    assert.match(wire, /CHILD_EXACT_RESULT/);
+    assert.match(wire, /CHILD_EXACT_TRANSCRIPT/);
+    assert.match(wire, /FUTURE_CHILD_FIELD/);
+    assert.match(wire, /安全边界后的完整回答/);
+    assert.equal(page.records.filter((message) => message.role === "runtime-event").length, 2);
+
+    const rawRows = await pool.query<{ ordinal: number; role: string; raw: string }>(
+      `SELECT ordinal, role, convert_from(payload, 'UTF8') AS raw
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        ORDER BY ordinal`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    assert.equal(rawRows.rows.some((row) => row.raw.includes("DEV_SECRET")), true);
+    const opaqueRuntime = rawRows.rows.find((row) => row.raw.includes("BALANCE_SECRET"));
+    assert.ok(opaqueRuntime);
+    const safeRuntime = await backend.readTapeRecordPayload(
+      sessionId, userId, tape.finalize.tapeId, opaqueRuntime.ordinal,
+    );
+    assert.ok(safeRuntime);
+    assert.match(safeRuntime.payload.toString("utf8"), /thread\/started/);
+    assert.doesNotMatch(safeRuntime.payload.toString("utf8"), /BALANCE_SECRET|DEV_SECRET|INTERNAL\/CWD/);
+
+    const groupRow = rawRows.rows.find((row) => row.role === "agent-group");
+    assert.ok(groupRow);
+    const groupPayload = await backend.readTapeRecordPayload(
+      sessionId, userId, tape.finalize.tapeId, groupRow.ordinal,
+    );
+    assert.ok(groupPayload);
+    const safeGroup = groupPayload.payload.toString("utf8");
+    assert.match(safeGroup, /CHILD_EXACT_TRANSCRIPT/);
+    assert.doesNotMatch(safeGroup, /NESTED_DEV_SECRET|CHILD_SKILL_SECRET|CHILD\/CWD/);
+  });
+
+  maybe("batched runtime payload remains fully visible after private fields are stripped", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+    try {
+      const sessionId = "s-direct-runtime-batch-security";
+      const userId = "u-direct-runtime-batch-security";
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+      const runtimeEvents = Array.from({ length: 4 }, (_, index) => ({
+        ordinal: index,
+        observedAt: 1_783_944_100_000 + index,
+        source: "codex-jsonrpc" as const,
+        payload: { type: "opaque", params: { developer_instructions: `BATCH_SECRET_${index}` } },
+      }));
+      const tape = directTape(sessionId, "7".repeat(64), { runtimeEvents, text: "batch complete" });
+      await stageAndFinalize(userId, tape);
+      const batch = (
+        await pool.query<{ ordinal: number }>(
+          `SELECT ordinal FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND msg_id LIKE '%-runtime-batch-%'`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0];
+      assert.ok(batch);
+      const page = await backend.listTurnTapeRecords(sessionId, userId, tape.finalize.tapeId, 0, 200);
+      assert.ok(page);
+      assert.doesNotMatch(JSON.stringify(page), /BATCH_SECRET_/);
+      assert.equal(page.records.filter((message) => message.role === "runtime-event").length, 4);
+      const payload = await backend.readTapeRecordPayload(
+        sessionId, userId, tape.finalize.tapeId, batch.ordinal,
+      );
+      assert.ok(payload);
+      assert.doesNotMatch(payload.payload.toString("utf8"), /BATCH_SECRET_/);
+    } finally {
+      if (previousBatching === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+    }
+  });
+
+  maybe("legacy rolling per-record refs hydrate exactly in hot and archive history", async () => {
+    const sessionId = "s-direct-rolling-ref";
+    const userId = "u-direct-rolling-ref";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "9".repeat(64), { text: "legacy rolling truth" });
+    await stageAndFinalize(userId, tape);
+    const record = (
+      await pool.query<{ msg_id: string; content_sha256: string }>(
+        `SELECT msg_id, content_sha256
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='assistant'`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0];
+    assert.ok(record);
+    const rollingRef: MessageLike = {
+      id: "legacy-rolling-ref",
+      role: "assistant",
+      text: "",
+      _seq: 1,
+      _turnTapeId: tape.finalize.tapeId,
+      _turnTapeMsgId: record.msg_id,
+      // Legacy rolling refs carry the per-record hash in this field.
+      _turnTapeSha256: record.content_sha256,
+    };
+    await pool.query(
+      `UPDATE client_sessions
+          SET messages=$3, message_count=1, next_seq=2,
+              archived_through_seq=0, archived_count=0
+        WHERE id=$1 AND user_id=$2`,
+      [sessionId, userId, JSON.stringify([rollingRef])],
+    );
+
+    const hot = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.equal((hot?.messages as MessageLike[])[0]?.text, "legacy rolling truth");
+
+    await pool.query(
+      `UPDATE client_sessions
+          SET messages='[]', archived_through_seq=1, archived_count=1
+        WHERE id=$1 AND user_id=$2`,
+      [sessionId, userId],
+    );
+    await pool.query(
+      `INSERT INTO client_session_archive_chunks
+         (session_id,user_id,first_seq,last_seq,message_count,messages,created_at)
+       VALUES ($1,$2,1,1,1,$3,1)`,
+      [sessionId, userId, JSON.stringify([rollingRef])],
+    );
+    const archived = await backend.readArchivedMessages(
+      sessionId, userId, 0, 20, { view: "timeline" },
+    );
+    assert.equal(archived.messages[0]?.text, "legacy rolling truth");
+
+    const corruptRef = { ...rollingRef, _turnTapeSha256: "f".repeat(64) };
+    await pool.query(
+      `UPDATE client_session_archive_chunks SET messages=$3
+        WHERE session_id=$1 AND user_id=$2`,
+      [sessionId, userId, JSON.stringify([corruptRef])],
+    );
+    await assert.rejects(
+      backend.readArchivedMessages(sessionId, userId, 0, 20, { view: "timeline" }),
+      /record hash mismatch/,
     );
   });
 
@@ -2199,7 +2863,7 @@ describe("pgSessionsBackend direct turn timeline", () => {
         sessionId, userId, tape.finalize.tapeId, cursor, 10_000,
       );
       assert.ok(page);
-      assert.equal(page.total, 531);
+      assert.equal(page.total, 530);
       pageSizes.push(page.records.length);
       records.push(...page.records);
       if (page.nextCursor === null) break;
@@ -2207,19 +2871,26 @@ describe("pgSessionsBackend direct turn timeline", () => {
       cursor = page.nextCursor;
     } while (true);
 
-    assert.deepEqual(pageSizes, [200, 200, 131], "the server uses bounded page quanta, not a total cap");
-    assert.equal(records.length, 531);
-    assert.equal(new Set(records.map((message) => message.id)).size, 531);
+    assert.deepEqual(pageSizes, [200, 200, 130], "the server uses bounded page quanta, not a total cap");
+    assert.equal(records.length, 530);
+    assert.equal(new Set(records.map((message) => message.id)).size, 530);
     assert.equal(records.filter((message) => message.role === "tool").length, 530);
-    assert.equal(records.at(-1)?.text, "全部过程完成");
     assert.equal(records.some((message) => message._payloadDeferred === true), false);
     assert.equal(records.some((message) => message._projectionTruncated === true), false);
     assert.equal(records.some((message) => message._tapeCollapsed === true), false);
 
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     const initial = timeline!.messages as MessageLike[];
-    assert.equal(initial.find((message) => message.role === "assistant")?.text, "全部过程完成");
-    assert.equal(initial.find((message) => message._turnTapeProcess === true)?._turnTapeProcessCount, 530);
+    const finalLocator = initial.find((message) => message.role === "assistant");
+    assert.equal(finalLocator?._payloadDeferred, true);
+    assert.equal(
+      (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, finalLocator!)).text,
+      "全部过程完成",
+    );
+    assert.equal(
+      initial.find((message) => message._turnTapeProcess === true)?._turnTapeProcessCount,
+      530,
+    );
   });
 
   maybe("an oversized physical record streams its exact post-redaction JSON bytes with no content ceiling", async () => {
@@ -2247,45 +2918,133 @@ describe("pgSessionsBackend direct turn timeline", () => {
     assert.ok(deferred, "large record is represented only by an exact byte locator until requested");
     assert.equal(deferred.role, "tool");
     assert.ok(typeof deferred._payloadBytes === "number" && deferred._payloadBytes > 1_000_000);
-    assert.equal(typeof deferred._payloadSha256, "string");
+    assert.match(String(deferred._payloadSha256), /^[0-9a-f]{64}$/,
+      "the finalized allowlisted payload is hash-addressed before disclosure");
     const ordinal = deferred._recordOrdinal;
     assert.ok(typeof ordinal === "number");
 
+    const metadata = await backend.readTapeRecordPayload(
+      sessionId, userId, tape.finalize.tapeId, ordinal, 0, 0,
+    );
+    assert.ok(metadata);
+    assert.equal(metadata.payload.length, 0);
+    assert.equal(metadata.msgId, deferred.id);
+    assert.equal(metadata.role, "tool");
+    assert.equal(metadata.tapeSha256, tape.finalize.tapeSha256);
     const chunks: Buffer[] = [];
-    let offset = 0;
-    let totalBytes = -1;
-    do {
-      const chunk = await backend.readTapeRecordPayloadChunk(
-        sessionId, userId, tape.finalize.tapeId, ordinal, offset, 128 * 1024,
+    for (let offset = 0; offset < metadata.totalBytes; offset += 1024 * 1024) {
+      const chunk = await backend.readTapeRecordPayload(
+        sessionId, userId, tape.finalize.tapeId, ordinal, offset,
+        Math.min(1024 * 1024, metadata.totalBytes - offset),
       );
       assert.ok(chunk);
-      assert.equal(chunk.start, offset);
-      assert.equal(chunk.msgId, deferred.id);
-      assert.equal(chunk.role, "tool");
-      assert.equal(chunk.contentSha256, deferred._payloadSha256);
-      assert.equal(chunk.tapeSha256, tape.finalize.tapeSha256);
-      if (totalBytes < 0) totalBytes = chunk.totalBytes;
-      assert.equal(chunk.totalBytes, totalBytes);
-      chunks.push(chunk.chunk);
-      if (chunk.nextOffset === null) break;
-      assert.ok(chunk.nextOffset > offset);
-      offset = chunk.nextOffset;
-    } while (true);
-
+      assert.equal(chunk.offset, offset);
+      assert.ok(chunk.payload.length <= 1024 * 1024);
+      chunks.push(chunk.payload);
+    }
     const raw = Buffer.concat(chunks);
-    assert.equal(raw.length, totalBytes);
+    assert.equal(raw.length, metadata.totalBytes);
     assert.equal(raw.length, deferred._payloadBytes);
-    assert.equal(sha256(raw), deferred._payloadSha256);
+    assert.equal(sha256(raw), metadata.contentSha256);
     const decoded = JSON.parse(raw.toString("utf8")) as MessageLike & { output?: string };
     assert.equal(decoded.id, deferred.id);
     assert.equal(decoded.text, hugeOutput);
     assert.equal(decoded.output, hugeOutput);
-    assert.equal(await backend.readTapeRecordPayloadChunk(
-      sessionId, "u-someone-else", tape.finalize.tapeId, ordinal, 0,
+    assert.equal(await backend.readTapeRecordPayload(
+      sessionId, "u-someone-else", tape.finalize.tapeId, ordinal,
     ), null);
-    assert.equal(await backend.readTapeRecordPayloadChunk(
-      sessionId, userId, "f".repeat(64), ordinal, 0,
+    assert.equal(await backend.readTapeRecordPayload(
+      sessionId, userId, "f".repeat(64), ordinal,
     ), null);
+  });
+
+  maybe("timeline GET stays locator-sized across many large final answers", async () => {
+    const sessionId = "s-direct-many-large-finals";
+    const userId = "u-direct-many-large-finals";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const count = 24;
+    for (let index = 0; index < count; index += 1) {
+      const marker = `LARGE-FINAL-${index}-TAIL`;
+      const tape = directTape(
+        sessionId,
+        index.toString(16).padStart(64, "0"),
+        {
+          turnIndex: index + 1,
+          createdAt: 1_783_944_200_000 + index,
+          text: `${"完整正文".repeat(16_000)}${marker}`,
+        },
+      );
+      await stageAndFinalize(userId, tape);
+    }
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(timeline);
+    const wire = JSON.stringify(timeline);
+    const finals = (timeline.messages as MessageLike[]).filter((message) => message.role === "assistant");
+    assert.equal(finals.length, count);
+    assert.equal(finals.every((message) => message._payloadDeferred === true), true);
+    assert.ok(Buffer.byteLength(wire, "utf8") < 100_000,
+      "session GET must not amplify hot anchors into every assistant BYTEA");
+    assert.equal(wire.includes("LARGE-FINAL-0-TAIL"), false);
+    assert.equal(wire.includes(`LARGE-FINAL-${count - 1}-TAIL`), false);
+  });
+
+  maybe("a multi-megabyte final answer is a lazy locator whose exact bytes remain range-readable", async () => {
+    const sessionId = "s-direct-huge-final";
+    const userId = "u-direct-huge-final";
+    const exactTail = "-HUGE-FINAL-EXACT-TAIL";
+    const exactText = `${"真实回答".repeat(300_000)}${exactTail}`;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "a".repeat(64), { text: exactText });
+    await stageAndFinalize(userId, tape);
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    const locator = (timeline!.messages as MessageLike[]).find((message) => message.role === "assistant");
+    assert.equal(locator?._payloadDeferred, true);
+    assert.ok(Number(locator?._payloadBytes ?? 0) > 1_000_000);
+    assert.match(String(locator?._payloadSha256), /^[0-9a-f]{64}$/);
+    assert.equal(JSON.stringify(timeline).includes(exactTail), false);
+    const decoded = await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, locator!);
+    assert.equal(decoded.text, exactText);
+  });
+
+  maybe("legacy large rows omit an unknown visible hash, then materialize one on first range read", async () => {
+    const sessionId = "s-direct-legacy-large-visible";
+    const userId = "u-direct-legacy-large-visible";
+    const exactText = `${"旧版完整回答".repeat(220_000)}-LEGACY-EXACT-TAIL`;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "b".repeat(64), { text: exactText });
+    await stageAndFinalize(userId, tape);
+    await pool.query(
+      `UPDATE client_session_turn_tape_records
+          SET visible_payload=NULL, visible_content_sha256=NULL
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='assistant'`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    const locator = (timeline!.messages as MessageLike[]).find((message) => message.role === "assistant");
+    assert.equal(locator?._payloadDeferred, true);
+    assert.equal(locator?._payloadSha256, undefined,
+      "raw tape hash must never be advertised as the derived visible-payload hash");
+    const ordinal = locator?._recordOrdinal;
+    assert.ok(typeof ordinal === "number");
+    const metadata = await backend.readTapeRecordPayload(
+      sessionId, userId, tape.finalize.tapeId, ordinal, 0, 0,
+    );
+    assert.ok(metadata);
+    assert.match(metadata.contentSha256, /^[0-9a-f]{64}$/);
+    const decoded = await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, locator!);
+    assert.equal(decoded.text, exactText);
+    const stored = await pool.query<{ visible_content_sha256: string | null; bytes: string | null }>(
+      `SELECT visible_content_sha256,
+              CASE WHEN visible_payload IS NULL THEN NULL ELSE octet_length(visible_payload)::text END AS bytes
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+      [sessionId, userId, tape.finalize.tapeId, ordinal],
+    );
+    assert.equal(stored.rows[0]?.visible_content_sha256, metadata.contentSha256);
+    assert.equal(Number(stored.rows[0]?.bytes), metadata.totalBytes);
   });
 
   maybe("corrupt immutable bytes reject the read instead of producing a truncated or synthetic message", async () => {
@@ -2299,7 +3058,7 @@ describe("pgSessionsBackend direct turn timeline", () => {
     await stageAndFinalize(userId, tape);
     await pool.query(
       `UPDATE client_session_turn_tape_records
-          SET payload=$4
+          SET payload=$4, visible_payload=$4
         WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='thinking'`,
       [sessionId, userId, tape.finalize.tapeId, Buffer.from('{"broken":', "utf8")],
     );

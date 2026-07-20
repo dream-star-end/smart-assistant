@@ -138,6 +138,24 @@ describe("deferred oversized immutable record", () => {
     await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
   });
+
+  test("legacy locator without a visible hash still starts the HEAD/range loader", async () => {
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([{
+      id: "srv-tool-large",
+      role: "tool",
+      text: "旧会话真实输出",
+      output: "旧会话真实输出",
+      ts: 1000,
+      toolName: "Bash",
+      _completed: true,
+    } satisfies ChatMessage]);
+    renderMsg({ ...deferred, _payloadSha256: undefined }, { onFetchTapeRecordPayload });
+    await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledWith(
+      "tape-1",
+      7,
+      { recordId: "srv-tool-large", role: "tool" },
+    ));
+  });
 });
 
 describe("runtime event", () => {

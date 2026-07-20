@@ -842,6 +842,64 @@ export type ContainerPreviewTicketResponse = {
   };
 };
 
+/** Resolve legacy locators through HEAD, then assemble the immutable JSON with
+ * real byte-range requests. The 1 MiB quantum is transport backpressure, not a
+ * record-size limit; every byte is retained and verified by the payload parser. */
+async function getExactTapeRecordPayload(
+  a: AuthSession,
+  url: string,
+): Promise<TapeRecordPayload> {
+  const head = await callWithRefresh(a, (token) =>
+    fetch(url, {
+      method: "HEAD",
+      credentials: "include",
+      headers: bearerHeaders(token),
+    }),
+  );
+  assertAuthResponseCurrent(head);
+  if (!head.ok) await throwApi(head);
+  const totalBytes = Number(head.headers.get("content-length"));
+  const contentSha256 = head.headers.get("x-openclaude-content-sha256") ?? "";
+  const recordId = head.headers.get("x-openclaude-record-id") ?? "";
+  const role = head.headers.get("x-openclaude-record-role") ?? "";
+  if (
+    !Number.isSafeInteger(totalBytes) || totalBytes < 1 ||
+    !/^[a-f0-9]{64}$/.test(contentSha256) ||
+    recordId.length === 0 || role.length === 0 ||
+    head.headers.get("accept-ranges")?.toLowerCase() !== "bytes"
+  ) {
+    throw new Error("invalid immutable tape payload metadata");
+  }
+
+  const target = new Uint8Array(totalBytes);
+  const quantum = 1024 * 1024;
+  for (let offset = 0; offset < totalBytes; offset += quantum) {
+    const end = Math.min(totalBytes, offset + quantum) - 1;
+    const res = await callWithRefresh(a, (token) =>
+      fetch(url, {
+        credentials: "include",
+        headers: { ...bearerHeaders(token), Range: `bytes=${offset}-${end}` },
+      }),
+    );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const chunk = new Uint8Array(await res.arrayBuffer());
+    assertAuthResponseCurrent(res);
+    if (
+      res.status !== 206 ||
+      res.headers.get("content-range") !== `bytes ${offset}-${end}/${totalBytes}` ||
+      res.headers.get("x-openclaude-content-sha256") !== contentSha256 ||
+      res.headers.get("x-openclaude-record-id") !== recordId ||
+      res.headers.get("x-openclaude-record-role") !== role ||
+      chunk.byteLength !== end - offset + 1
+    ) {
+      throw new Error("immutable tape payload range identity mismatch");
+    }
+    target.set(chunk, offset);
+  }
+  return { bytes: target.buffer, contentSha256, recordId, role };
+}
+
 export const api = {
   // ── 鉴权 ───────────────────────────────────────────────────────────
 
@@ -1547,29 +1605,18 @@ export const api = {
     );
   },
 
-  /** 读取单条记录真实的、脱敏后不可变 JSON payload。浏览器 Fetch 流负责背压。 */
+  /** 读取单条真实、脱敏后不可变 JSON；HEAD + Range，不发整条巨型响应。 */
   getTapeRecordPayload: async (
     a: AuthSession,
     id: string,
     tapeId: string,
     recordOrdinal: number,
   ): Promise<TapeRecordPayload> => {
-    const res = await callWithRefresh(a, (token) =>
-      fetch(
-        `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}/records/${recordOrdinal}/payload`,
-        { credentials: "include", headers: bearerHeaders(token) },
-      ),
+    return getExactTapeRecordPayload(
+      a,
+      `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}` +
+        `/records/${recordOrdinal}/payload`,
     );
-    assertAuthResponseCurrent(res);
-    if (!res.ok) await throwApi(res);
-    const bytes = await res.arrayBuffer();
-    assertAuthResponseCurrent(res);
-    return {
-      bytes,
-      contentSha256: res.headers.get("x-openclaude-content-sha256") ?? "",
-      recordId: res.headers.get("x-openclaude-record-id") ?? "",
-      role: res.headers.get("x-openclaude-record-role") ?? "",
-    };
   },
 
   /**

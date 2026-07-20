@@ -455,9 +455,9 @@ export async function getDispatch(q: Queryable, dispatchId: string): Promise<Tur
 
 /**
  * 行锁读(SELECT ... FOR UPDATE)。**只能在事务内的 client 上调**(传 pool 会各自成
- * autocommit,锁瞬间释放,失去互斥意义)。B8:reconciler 的「财务判定→projection→notified」
+ * autocommit,锁瞬间释放,失去互斥意义)。B8:reconciler 的「财务判定→durable status→notified」
  * 单事务锁本 dispatch 行,与 tape finalize 的 convergeDispatchOnFinalize(其 casToTerminal
- * UPDATE 同样取本行写锁)共享互斥序,消除「投影 error 卡」与「late tape 完整 materialize」并发。
+ * UPDATE 同样取本行写锁)共享互斥序,消除「终态 error 卡」与「late tape 完整 materialize」并发。
  */
 export async function getDispatchForUpdate(
   client: PoolClient,
