@@ -719,6 +719,81 @@ describe("pgSessionsBackend contract", () => {
 });
 
 describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("an incomplete physically impossible declaration cannot head-of-line block a complete tape", async () => {
+    const incompleteSessionId = "s-incomplete-huge-tape";
+    const completeSessionId = "s-complete-after-incomplete";
+    const incompleteUserId = "u-incomplete-huge-tape";
+    const completeUserId = "u-complete-after-incomplete";
+    await backend.upsertClientSession(mkSession({ id: incompleteSessionId, userId: incompleteUserId }));
+    await backend.upsertClientSession(mkSession({ id: completeSessionId, userId: completeUserId }));
+
+    // This declaration is intentionally much larger than a normal Node heap,
+    // but only its first valid fixed-size part exists. The former admission
+    // path waited on totalBytes before noticing the missing parts and poisoned
+    // the process-global FIFO forever.
+    const incompleteTotalBytes = 16 * 1024 * 1024 * 1024;
+    const incompletePartCount = Math.ceil(incompleteTotalBytes / LOSSLESS_TURN_TAPE_PART_BYTES);
+    const firstPart = Buffer.alloc(LOSSLESS_TURN_TAPE_PART_BYTES, 0x7b);
+    const incompleteBase = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      sessionId: incompleteSessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed" as const,
+      turnKey: "d".repeat(64),
+      tapeId: "e".repeat(64),
+      tapeSha256: "f".repeat(64),
+      totalBytes: incompleteTotalBytes,
+      partCount: incompletePartCount,
+      createdAt: 1_783_944_000_000,
+    };
+    await backend.stageLosslessTurnTapePart(incompleteUserId, {
+      ...incompleteBase,
+      action: "part",
+      partIndex: 0,
+      partSha256: sha256(firstPart),
+      data: firstPart.toString("base64"),
+    }, firstPart);
+
+    const complete = buildTape({
+      sessionId: completeSessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "c".repeat(64),
+      text: "normal exact answer",
+      createdAt: 1_783_944_000_001,
+    });
+    for (const part of complete.parts) {
+      await backend.stageLosslessTurnTapePart(completeUserId, part.request, part.bytes);
+    }
+
+    const incompleteFinalize = backend.finalizeLosslessTurnTape(incompleteUserId, {
+      ...incompleteBase,
+      action: "finalize",
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    const completeFinalize = backend.finalizeLosslessTurnTape(completeUserId, complete.finalize);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const [incompleteResult, completeResult] = await Promise.race([
+      Promise.all([incompleteFinalize, completeFinalize]),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("incomplete tape blocked the following complete finalize")),
+          2_000,
+        );
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
+    assert.deepEqual(incompleteResult, { applied: "incomplete" });
+    assert.deepEqual(completeResult, {
+      applied: "finalized",
+      recordCount: 1,
+      engineBillings: [],
+    });
+  });
+
   maybe("stages later immutable parts while a concurrent writer holds the hot session row", async () => {
     const sessionId = "s-tape-stage-no-hot-row-lock";
     const userId = "u-tape-stage-no-hot-row-lock";
@@ -1983,6 +2058,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(locator.text, "");
     assert.equal(locator._payloadDeferred, true);
     assert.equal(locator._userPayloadDeferred, true);
+    assert.equal(locator._userPayloadId, clientMessageId);
     assert.deepEqual(locator._routing, {
       model: "gpt-5.6-sol",
       teamMode: true,
@@ -2455,6 +2531,67 @@ describe("pgSessionsBackend direct turn timeline", () => {
     );
   });
 
+  maybe("finite engine context lazily rebuilds predecessor model rows in bounded batches", async () => {
+    const sessionId = "s-direct-engine-predecessor";
+    const userId = "u-direct-engine-predecessor";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "d".repeat(64), {
+      text: "predecessor final answer",
+      tools: [{
+        blockId: "predecessor-tool",
+        toolName: "Bash",
+        inputJson: { command: "printf exact" },
+        output: "PREDECESSOR-EXACT-TOOL-OUTPUT",
+        completed: true,
+      }],
+    });
+    await stageAndFinalize(userId, tape);
+    await pool.query(
+      `DELETE FROM client_session_turn_tape_model_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    await pool.query(
+      `UPDATE client_session_turn_tape_records
+          SET model_sidecar_complete=FALSE
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET model_record_count=-1
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+
+    const context = await backend.getEngineContextMessages(sessionId, userId, {
+      contextWindow: 2_000,
+    });
+    assert.ok(context);
+    assert.deepEqual(context.map((message) => message.role), ["tool", "assistant"]);
+    assert.match(String(context[0]?.text), /PREDECESSOR-EXACT-TOOL-OUTPUT/);
+    assert.equal(context[1]?.text, "predecessor final answer");
+    const state = (
+      await pool.query<{
+        model_record_count: number;
+        incomplete: string;
+        sidecars: string;
+      }>(
+        `SELECT t.model_record_count,
+                (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
+                  WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+                    AND r.model_sidecar_complete=FALSE) AS incomplete,
+                (SELECT COUNT(*)::text FROM client_session_turn_tape_model_records m
+                  WHERE m.session_id=t.session_id AND m.user_id=t.user_id AND m.tape_id=t.tape_id)
+                  AS sidecars
+           FROM client_session_turn_tapes t
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.equal(state.incomplete, "0");
+    assert.equal(state.model_record_count, Number(state.sidecars));
+  });
+
   maybe("0176 is metadata-only for the large record table and tolerates legal escaped NUL history", async () => {
     assert.deepEqual(migration0176EscapedNulBackfill, {
       physical_record_count: 0,
@@ -2901,7 +3038,7 @@ describe("pgSessionsBackend direct turn timeline", () => {
     let cursor = 0;
     const records: MessageLike[] = [];
     const pageSizes: number[] = [];
-    do {
+    for (;;) {
       const page = await backend.listTurnTapeRecords(
         sessionId, userId, tape.finalize.tapeId, cursor, 10_000,
       );
@@ -2912,7 +3049,7 @@ describe("pgSessionsBackend direct turn timeline", () => {
       if (page.nextCursor === null) break;
       assert.ok(page.nextCursor > cursor);
       cursor = page.nextCursor;
-    } while (true);
+    }
 
     assert.deepEqual(pageSizes, [200, 200, 130], "the server uses bounded page quanta, not a total cap");
     assert.equal(records.length, 530);

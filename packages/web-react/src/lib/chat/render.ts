@@ -269,7 +269,15 @@ export function messageSignature(
         m.cronPush ? `cron:${m.cronLabel ?? ""}` : "",
       ].join("|");
     case "user":
-      return [head, textSig(m.text), m.status ?? "", (m._media?.length ?? 0)].join("|");
+      return [
+        head,
+        textSig(m.text),
+        m.status ?? "",
+        (m._media?.length ?? 0),
+        m._userPayloadDeferred ? 1 : 0,
+        m._userPayloadId ?? "",
+        m._payloadSha256 ?? "",
+      ].join("|");
     case "thinking":
       return [head, textSig(m.text)].join("|");
     case "tool":

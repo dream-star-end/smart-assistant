@@ -323,27 +323,30 @@ function DeferredTapeRecordCard({
 }: Omit<RendererProps, "sig" | "delegateCost">) {
   const ref = useRef<HTMLDivElement>(null);
   const started = useRef(false);
+  const requestAbortRef = useRef<AbortController | null>(null);
   const [records, setRecords] = useState<ChatMessage[] | null>(null);
   const [failed, setFailed] = useState(false);
   const isUserPayload = message._userPayloadDeferred === true;
+  const payloadId = isUserPayload ? message._userPayloadId ?? message.id : message.id;
+  const payloadSha256 = message._payloadSha256;
+  const tapeId = message._turnTapeId;
+  const recordOrdinal = message._recordOrdinal;
   const load = useCallback(async () => {
     if (started.current) return;
-    const sha256 = message._payloadSha256;
     const expected = {
-      recordId: message.id,
+      recordId: payloadId,
       role: message.role,
-      ...(sha256 ? { contentSha256: sha256 } : {}),
+      ...(payloadSha256 ? { contentSha256: payloadSha256 } : {}),
     };
+    const controller = new AbortController();
     let request: Promise<ChatMessage[] | null> | null = null;
     if (isUserPayload) {
       if (cb.onFetchUserMessagePayload) {
-        request = cb.onFetchUserMessagePayload(message.id, expected);
+        request = cb.onFetchUserMessagePayload(payloadId, expected, controller.signal);
       }
     } else {
-      const tapeId = message._turnTapeId;
-      const ordinal = message._recordOrdinal;
-      if (cb.onFetchTapeRecordPayload && tapeId && typeof ordinal === "number") {
-        request = cb.onFetchTapeRecordPayload(tapeId, ordinal, expected);
+      if (cb.onFetchTapeRecordPayload && tapeId && typeof recordOrdinal === "number") {
+        request = cb.onFetchTapeRecordPayload(tapeId, recordOrdinal, expected, controller.signal);
       }
     }
     if (!request) {
@@ -351,22 +354,46 @@ function DeferredTapeRecordCard({
       return;
     }
     started.current = true;
+    requestAbortRef.current = controller;
     setFailed(false);
-    const loaded = await request;
+    let loaded: ChatMessage[] | null = null;
+    try {
+      loaded = await request;
+    } catch {
+      loaded = null;
+    }
+    if (requestAbortRef.current === controller) requestAbortRef.current = null;
+    if (controller.signal.aborted) return;
     if (!loaded) {
       started.current = false;
       setFailed(true);
       return;
     }
     setRecords(loaded);
-  }, [cb, isUserPayload, message]);
+  }, [
+    cb.onFetchTapeRecordPayload,
+    cb.onFetchUserMessagePayload,
+    isUserPayload,
+    message.role,
+    payloadId,
+    payloadSha256,
+    recordOrdinal,
+    tapeId,
+  ]);
 
   useEffect(() => {
     const node = ref.current;
     if (!node) return;
+    const cancel = () => {
+      const controller = requestAbortRef.current;
+      if (!controller) return;
+      requestAbortRef.current = null;
+      started.current = false;
+      controller.abort();
+    };
     if (typeof IntersectionObserver === "undefined") {
       void load();
-      return;
+      return cancel;
     }
     const observer = new IntersectionObserver(
       (entries) => {
@@ -378,7 +405,10 @@ function DeferredTapeRecordCard({
       { rootMargin: "600px 0px" },
     );
     observer.observe(node);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      cancel();
+    };
   }, [load]);
 
   if (records) {
@@ -395,6 +425,10 @@ function DeferredTapeRecordCard({
           const hydratedRecord: ChatMessage = isUserPayload
             ? {
                 ...record,
+                // Keep UI actions bound to the current dispatch row; the
+                // immutable fetch key remains explicit and survives reload.
+                id: message.id,
+                _userPayloadId: message._userPayloadId ?? message.id,
                 _source: "server",
                 status: message.status ?? record.status,
                 ...(currentUsage ? { usage: currentUsage } : {}),

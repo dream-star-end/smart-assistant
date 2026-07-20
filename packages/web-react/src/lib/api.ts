@@ -848,12 +848,14 @@ export type ContainerPreviewTicketResponse = {
 export async function getExactDeferredPayload(
   a: AuthSession,
   url: string,
+  signal?: AbortSignal,
 ): Promise<TapeRecordPayload> {
   const head = await callWithRefresh(a, (token) =>
     fetch(url, {
       method: "HEAD",
       credentials: "include",
       headers: bearerHeaders(token),
+      signal,
     }),
   );
   assertAuthResponseCurrent(head);
@@ -870,15 +872,18 @@ export async function getExactDeferredPayload(
   ) {
     throw new Error("invalid immutable deferred payload metadata");
   }
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
 
   const target = new Uint8Array(totalBytes);
   const quantum = 1024 * 1024;
   for (let offset = 0; offset < totalBytes; offset += quantum) {
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
     const end = Math.min(totalBytes, offset + quantum) - 1;
     const res = await callWithRefresh(a, (token) =>
       fetch(url, {
         credentials: "include",
         headers: { ...bearerHeaders(token), Range: `bytes=${offset}-${end}` },
+        signal,
       }),
     );
     assertAuthResponseCurrent(res);
@@ -895,6 +900,7 @@ export async function getExactDeferredPayload(
     ) {
       throw new Error("immutable deferred payload range identity mismatch");
     }
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
     target.set(chunk, offset);
   }
   return { bytes: target.buffer, contentSha256, recordId, role };
@@ -1611,11 +1617,13 @@ export const api = {
     id: string,
     tapeId: string,
     recordOrdinal: number,
+    signal?: AbortSignal,
   ): Promise<TapeRecordPayload> => {
     return getExactDeferredPayload(
       a,
       `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}` +
         `/records/${recordOrdinal}/payload`,
+      signal,
     );
   },
 
@@ -1624,10 +1632,12 @@ export const api = {
     a: AuthSession,
     id: string,
     messageId: string,
+    signal?: AbortSignal,
   ): Promise<TapeRecordPayload> => {
     return getExactDeferredPayload(
       a,
       `/api/sessions/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/payload`,
+      signal,
     );
   },
 

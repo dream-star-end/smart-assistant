@@ -8,6 +8,7 @@ import type { CardCallbacks } from '../../../components/chat/cards'
 import { MediaSignProvider } from '../../../components/chat/media'
 import { Alert, Badge, Button, EmptyState, Modal } from '../../../components/ui'
 import type { ChatMessage } from '../../../lib/chat/model'
+import { DeferredPayloadQueue } from '../../../lib/chat/deferredPayloadQueue'
 import { collapseExpandedTapePage, mergeExpandedTapePage } from '../../../lib/chat/directTimeline'
 import { parseTapeRecordPayload, type TapePayloadExpectation } from '../../../lib/chat/tapePayload'
 import { adminGet, adminGetExactPayload, adminSend, apiErrorMessage } from '../../lib/adminApi'
@@ -86,6 +87,10 @@ export function SessionViewerModal({
   const loadGenerationRef = useRef(0)
   const expandingTapesRef = useRef<Set<string>>(new Set())
   const deferredPayloadCacheRef = useRef<{ key: string; records: ChatMessage[] } | null>(null)
+  const deferredPayloadQueueRef = useRef<DeferredPayloadQueue<ChatMessage[]> | null>(null)
+  if (!deferredPayloadQueueRef.current) {
+    deferredPayloadQueueRef.current = new DeferredPayloadQueue<ChatMessage[]>(2)
+  }
 
   const sessionId = session?.session_id ?? null
 
@@ -100,6 +105,7 @@ export function SessionViewerModal({
     setArchiveError(false)
     archiveScrollAnchorRef.current = null
     expandingTapesRef.current.clear()
+    deferredPayloadQueueRef.current?.cancelAll()
     deferredPayloadCacheRef.current = null
     initialScrollPendingRef.current = false
     if (!sessionId || !userId) {
@@ -133,6 +139,7 @@ export function SessionViewerModal({
     loadSession()
     return () => {
       loadGenerationRef.current++
+      deferredPayloadQueueRef.current?.cancelAll()
     }
   }, [loadSession])
 
@@ -252,46 +259,53 @@ export function SessionViewerModal({
     path: string,
     cacheKey: string,
     expected: TapePayloadExpectation,
+    signal?: AbortSignal,
   ): Promise<ChatMessage[] | null> => {
-    if (!userId) return null
+    if (!userId || signal?.aborted) return null
     if (deferredPayloadCacheRef.current?.key === cacheKey) {
       return deferredPayloadCacheRef.current.records
     }
-    try {
-      const payload = await adminGetExactPayload(path, { user_id: userId })
-      const records = await parseTapeRecordPayload(payload, expected)
+    const generation = loadGenerationRef.current
+    return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
+      const payload = await adminGetExactPayload(path, { user_id: userId }, queueSignal)
+      const records = await parseTapeRecordPayload(payload, expected, queueSignal)
+      if (queueSignal.aborted || generation !== loadGenerationRef.current) {
+        throw new DOMException('session changed', 'AbortError')
+      }
       deferredPayloadCacheRef.current = { key: cacheKey, records }
       return records
-    } catch {
-      return null
-    }
+    }, signal)
   }, [userId])
 
   const fetchTapePayload = useCallback<NonNullable<CardCallbacks['onFetchTapeRecordPayload']>>((
     tapeId,
     recordOrdinal,
     expected,
+    signal,
   ) => {
     if (!sessionId) return Promise.resolve(null)
     return fetchExactPayload(
       `/sessions/${encodeURIComponent(sessionId)}/tape/${encodeURIComponent(tapeId)}` +
         `/records/${recordOrdinal}/payload`,
-      `${sessionId}:tape:${tapeId}:${recordOrdinal}:${expected.contentSha256 ?? ''}`,
+      JSON.stringify([userId, sessionId, 'tape', tapeId, recordOrdinal, expected]),
       expected,
+      signal,
     )
-  }, [fetchExactPayload, sessionId])
+  }, [fetchExactPayload, sessionId, userId])
 
   const fetchUserPayload = useCallback<NonNullable<CardCallbacks['onFetchUserMessagePayload']>>((
     messageId,
     expected,
+    signal,
   ) => {
     if (!sessionId) return Promise.resolve(null)
     return fetchExactPayload(
       `/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/payload`,
-      `${sessionId}:user:${messageId}:${expected.contentSha256 ?? ''}`,
+      JSON.stringify([userId, sessionId, 'user', messageId, expected]),
       expected,
+      signal,
     )
-  }, [fetchExactPayload, sessionId])
+  }, [fetchExactPayload, sessionId, userId])
 
   const cardCallbacks = useMemo<CardCallbacks>(() => ({
     onExpandTape: expandTape,
@@ -362,6 +376,7 @@ export function SessionViewerModal({
             </div>
           ) : payload ? (
             <MessageList
+              key={`${userId}:${sessionId}`}
               messages={messages}
               sending={false}
               archive={archive}

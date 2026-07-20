@@ -509,6 +509,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     expect(mockExactPayload).toHaveBeenCalledWith(
       '/sessions/admin-lazy/messages/cm%3Auser%3Aadmin/payload',
       { user_id: '1' },
+      expect.any(AbortSignal),
     )
     fireEvent.click(screen.getByRole('button', { name: /Agent 调用过程/ }))
     fireEvent.click(await screen.findByRole('button', { name: /已思考/ }))

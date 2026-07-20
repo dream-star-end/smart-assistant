@@ -262,6 +262,11 @@ describe('admin session route parsing', () => {
       parseAdminSessionRoute(new URL('https://x/api/admin/sessions/web-1/messages/cm%3Auser%3Alarge/payload')),
       { sessionId: 'web-1', kind: 'user-payload', messageId: 'cm:user:large' },
     )
+    const canonicalMaxId = 'a'.repeat(128)
+    assert.deepEqual(
+      parseAdminSessionRoute(new URL(`https://x/api/admin/sessions/web-1/messages/${canonicalMaxId}/payload`)),
+      { sessionId: 'web-1', kind: 'user-payload', messageId: canonicalMaxId },
+    )
     assert.throws(
       () => parseAdminSessionRoute(new URL('https://x/api/admin/sessions/web-1/archive/extra')),
       (err) => err instanceof HttpError && err.status === 400 && err.code === 'VALIDATION',
@@ -397,7 +402,7 @@ describe('admin session chat/archive/media handlers', () => {
     assert.deepEqual(tapeCalls, [['web-1', 'c:1', TAPE_ID, 0, 25]])
   })
 
-  test('tape/user payload 支持 admin HEAD + Range，正文不进入 audit', async () => {
+  test('tape/user payload 的 HEAD 与直接 Range GET 均审计，正文不进入 audit', async () => {
     const tapeHead = makeRes()
     await handleAdminGetSession(
       makeReq('HEAD', `/api/admin/sessions/web-1/tape/${TAPE_ID}/records/3/payload?user_id=1`),
@@ -441,8 +446,40 @@ describe('admin session chat/archive/media handlers', () => {
       deps,
     )
     assert.deepEqual(userRange.read().raw, USER_PAYLOAD)
+    assert.equal(auditAfter.length, 3)
+    assert.deepEqual(
+      auditAfter.map((entry: any) => entry.mode),
+      ['tape-payload', 'tape-payload', 'user-payload'],
+    )
     assert.ok(!JSON.stringify(auditAfter).includes('完整回答'))
     assert.ok(!JSON.stringify(auditAfter).includes('完整超长提问'))
+  })
+
+  test('未先发 HEAD 的直接 Range GET 仍留下 metadata-only audit', async () => {
+    const out = makeRes()
+    await handleAdminGetSession(
+      makeReq(
+        'GET',
+        `/api/admin/sessions/web-1/tape/${TAPE_ID}/records/3/payload?user_id=1`,
+        undefined,
+        { range: 'bytes=0-7' },
+      ),
+      out.res,
+      ctx,
+      deps,
+    )
+    assert.equal(out.read().status, 206)
+    assert.equal(auditAfter.length, 1)
+    assert.deepEqual(auditAfter[0], {
+      mode: 'tape-payload',
+      session_id: 'web-1',
+      target_user_id: 'c:1',
+      scoped_user_id: 'c:1',
+      tape_id: TAPE_ID,
+      record_ordinal: 3,
+      payload_bytes: TAPE_PAYLOAD.length,
+      request_id: 'req-admin-session',
+    })
   })
 
   test('tape payload 的 user_id scope 不匹配同样 fail-closed', async () => {

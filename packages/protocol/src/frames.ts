@@ -19,6 +19,15 @@ export const CLIENT_MESSAGE_ID_PATTERN = '^[A-Za-z0-9_-]{1,128}$'
 export const CLIENT_MESSAGE_ID_RE = new RegExp(CLIENT_MESSAGE_ID_PATTERN)
 export const isClientMessageId = (value: unknown): value is string =>
   typeof value === 'string' && CLIENT_MESSAGE_ID_RE.test(value)
+/** Durable session rows predate the browser protocol contract and may contain
+ * a legacy colon-delimited id (for example `cm:user:large`). Readers and the
+ * legacy REST append route must accept the union without weakening new
+ * browser-authored frame validation. */
+export const PERSISTED_CLIENT_MESSAGE_ID_PATTERN =
+  '^(?:[A-Za-z0-9_-]{1,128}|[A-Za-z0-9_:-]{1,80})$'
+export const PERSISTED_CLIENT_MESSAGE_ID_RE = new RegExp(PERSISTED_CLIENT_MESSAGE_ID_PATTERN)
+export const isPersistedClientMessageId = (value: unknown): value is string =>
+  typeof value === 'string' && PERSISTED_CLIENT_MESSAGE_ID_RE.test(value)
 const ClientMessageId = Type.String({ pattern: CLIENT_MESSAGE_ID_PATTERN })
 
 export const GoalStateSnapshotSchema = Type.Object({

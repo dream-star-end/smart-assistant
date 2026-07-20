@@ -47,6 +47,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve as resolvePath } from "node:path";
 import { parseByteRange } from "@openclaude/gateway";
+import { isPersistedClientMessageId } from "@openclaude/protocol";
 import { HttpError, readJsonBody, sendJson } from "../util.js";
 import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
@@ -74,7 +75,6 @@ import {
 // 1..128 字符。bigint extractTailId 不适用。
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const TAPE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
-const MESSAGE_ID_RE = /^[A-Za-z0-9_:-]{1,80}$/;
 const COMMERCIAL_SESSION_USER_RE = /^c:[1-9][0-9]{0,18}$/;
 
 export type AdminSessionRoute =
@@ -121,7 +121,7 @@ export function parseAdminSessionRoute(url: URL): AdminSessionRoute {
     } catch {
       invalid();
     }
-    if (!MESSAGE_ID_RE.test(messageId)) invalid();
+    if (!isPersistedClientMessageId(messageId)) invalid();
     return { sessionId, kind: "user-payload", messageId };
   }
   return invalid();
@@ -379,29 +379,28 @@ export async function handleAdminGetSession(
         };
     const head = await readPart(0, 1);
     if (!head) throw new HttpError(404, "NOT_FOUND", "payload not found");
-    // The browser's mandatory HEAD handshake is the single logical audit
-    // event. Range chunks are transport windows, not separate content reads.
-    if (req.method === "HEAD" || req.headers.range === undefined) {
-      await writeAdminAudit(getPool(), {
-        adminId: admin.id,
-        action: "sessions.read",
-        target: `session:${sessionId}`,
-        before: null,
-        after: {
-          mode: route.kind,
-          session_id: sessionId,
-          target_user_id: session.userId,
-          scoped_user_id: scopedUserId ?? null,
-          ...(route.kind === "tape-payload"
-            ? { tape_id: route.tapeId, record_ordinal: route.recordOrdinal }
-            : { message_id: route.messageId }),
-          payload_bytes: head.totalBytes,
-          request_id: ctx.requestId,
-        },
-        ip: ctx.clientIp,
-        userAgent: ctx.userAgent,
-      });
-    }
+    // Audit every HTTP read. A browser normally probes with HEAD before Range,
+    // but that client convention is not a security boundary: a direct Range
+    // GET must leave its own metadata-only audit row as well.
+    await writeAdminAudit(getPool(), {
+      adminId: admin.id,
+      action: "sessions.read",
+      target: `session:${sessionId}`,
+      before: null,
+      after: {
+        mode: route.kind,
+        session_id: sessionId,
+        target_user_id: session.userId,
+        scoped_user_id: scopedUserId ?? null,
+        ...(route.kind === "tape-payload"
+          ? { tape_id: route.tapeId, record_ordinal: route.recordOrdinal }
+          : { message_id: route.messageId }),
+        payload_bytes: head.totalBytes,
+        request_id: ctx.requestId,
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
     await serveAdminExactPayload(req, res, head, readPart);
     return;
   }

@@ -115,6 +115,7 @@ describe("deferred oversized immutable record", () => {
       "tape-1",
       7,
       { recordId: "srv-tool-large", role: "tool", contentSha256: "a".repeat(64) },
+      expect.any(AbortSignal),
     ));
     await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /终端/ }));
@@ -148,9 +149,46 @@ describe("deferred oversized immutable record", () => {
     await waitFor(() => expect(onFetchUserMessagePayload).toHaveBeenCalledWith(
       "cm:user:large",
       { recordId: "cm:user:large", role: "user", contentSha256: "c".repeat(64) },
+      expect.any(AbortSignal),
     ));
     expect(await screen.findByText("这是用户真实提交的完整超长消息")).toBeInTheDocument();
     expect(screen.queryByText(/Agent 记录/)).toBeNull();
+  });
+
+  test("fresh dispatch id hydrates the immutable pre-retry user sidecar after reload", async () => {
+    const onRetrySend = vi.fn();
+    const locator: ChatMessage = {
+      id: "cm-fresh-dispatch",
+      role: "user",
+      text: "",
+      ts: 1000,
+      status: "error",
+      _source: "server",
+      _payloadDeferred: true,
+      _userPayloadDeferred: true,
+      _userPayloadId: "cm:old:sidecar",
+      _payloadBytes: 12 * 1024 * 1024,
+      _payloadSha256: "e".repeat(64),
+    };
+    const onFetchUserMessagePayload = vi.fn().mockResolvedValue([{
+      id: "cm:old:sidecar",
+      role: "user",
+      text: "刷新后仍从旧 sidecar 水合的完整内容",
+      ts: 1000,
+    } satisfies ChatMessage]);
+    renderMsg(locator, { onFetchUserMessagePayload, onRetrySend });
+    await waitFor(() => expect(onFetchUserMessagePayload).toHaveBeenCalledWith(
+      "cm:old:sidecar",
+      { recordId: "cm:old:sidecar", role: "user", contentSha256: "e".repeat(64) },
+      expect.any(AbortSignal),
+    ));
+    expect(await screen.findByText("刷新后仍从旧 sidecar 水合的完整内容")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(onRetrySend).toHaveBeenCalledWith(expect.objectContaining({
+      id: "cm-fresh-dispatch",
+      _userPayloadId: "cm:old:sidecar",
+      text: "刷新后仍从旧 sidecar 水合的完整内容",
+    }));
   });
 
   test("deferred final keeps current billing overlays and the final-response rating", async () => {
@@ -232,6 +270,25 @@ describe("deferred oversized immutable record", () => {
     await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
   });
 
+  test("unmount outside virtual-scroll overscan cancels its payload subscription", async () => {
+    let signal: AbortSignal | undefined;
+    const onFetchTapeRecordPayload = vi.fn((
+      _tapeId: string,
+      _ordinal: number,
+      _expected: { recordId: string; role: string; contentSha256?: string },
+      requestSignal?: AbortSignal,
+    ) => {
+      signal = requestSignal;
+      return new Promise<ChatMessage[] | null>(() => {});
+    });
+    const view = renderMsg(deferred, { onFetchTapeRecordPayload });
+    await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(1));
+    expect(signal?.aborted).toBe(false);
+
+    view.unmount();
+    expect(signal?.aborted).toBe(true);
+  });
+
   test("legacy locator without a visible hash still starts the HEAD/range loader", async () => {
     const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([{
       id: "srv-tool-large",
@@ -247,6 +304,7 @@ describe("deferred oversized immutable record", () => {
       "tape-1",
       7,
       { recordId: "srv-tool-large", role: "tool" },
+      expect.any(AbortSignal),
     ));
   });
 });

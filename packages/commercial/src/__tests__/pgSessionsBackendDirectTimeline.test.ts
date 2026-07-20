@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import type { Pool } from "pg";
 import { createPgSessionsBackend, userVisibleTapeRecord } from "../db/pgSessionsBackend.js";
@@ -261,6 +262,270 @@ test("finite model context pages past 128 semantic records in exact chronologica
   assert.equal(context?.length, 129);
   assert.equal(context?.[0]?.id, "m-0");
   assert.equal(context?.at(-1)?.id, "m-128");
+});
+
+test("predecessor 16k-record tape backfills only the newest physical suffix needed by the model window", async () => {
+  const physicalCount = 16_822;
+  const newestOrdinal = physicalCount - 1;
+  const payload = Buffer.from(JSON.stringify({
+    id: "legacy-newest-tool",
+    role: "tool",
+    text: "",
+    toolName: "Bash",
+    output: `real newest output ${"x".repeat(20_000)}`,
+    ts: 200,
+    _clientMessageId: "cm-legacy",
+  }), "utf8");
+  const contentSha256 = createHash("sha256").update(payload).digest("hex");
+  const sqlCalls: Array<{ sql: string; params: unknown[] }> = [];
+  const payloadOrdinals: number[] = [];
+  let inserted: unknown[] | null = null;
+  const fakePool = {
+    query: async (sql: string, params: unknown[] = []) => {
+      sqlCalls.push({ sql, params });
+      if (sql.includes("SELECT messages, archived_through_seq FROM client_sessions")) {
+        return { rows: [{ messages: JSON.stringify([completeTapeAnchor({
+          _turnTapePhysicalRecordCount: physicalCount,
+        })]), archived_through_seq: 0 }] };
+      }
+      if (sql.includes("SELECT tape_sha256,model_record_count")) {
+        return { rows: [{
+          tape_sha256: "a".repeat(64),
+          billing_anchor_id: "tape-anchor",
+          model_record_count: -1,
+        }] };
+      }
+      if (sql.includes("SELECT ordinal,msg_id,role,content_sha256")) {
+        return {
+          rows: Array.from({ length: 512 }, (_, index) => ({
+            ordinal: newestOrdinal - index,
+            msg_id: index === 0 ? "legacy-newest-tool" : `opaque-${newestOrdinal - index}`,
+            role: index === 0 ? "tool" : "thinking",
+            content_sha256: index === 0 ? contentSha256 : "b".repeat(64),
+            payload_bytes: index === 0 ? String(payload.length) : "1",
+            model_sidecar_complete: false,
+          })),
+        };
+      }
+      if (sql.includes("SELECT msg_id,ordinal,role,content_sha256,payload")) {
+        const ordinals = params[3] as number[];
+        payloadOrdinals.push(...ordinals);
+        assert.deepEqual(ordinals, [newestOrdinal]);
+        return { rows: [{
+          msg_id: "legacy-newest-tool",
+          ordinal: newestOrdinal,
+          role: "tool",
+          content_sha256: contentSha256,
+          payload,
+        }] };
+      }
+      if (sql.includes("INSERT INTO client_session_turn_tape_model_records")) {
+        inserted = params;
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.includes("SELECT physical_ordinal,logical_ordinal,msg_id,role,semantic_text")) {
+        assert.ok(inserted);
+        const physicalOrdinals = inserted[3] as number[];
+        const logicalOrdinals = inserted[4] as number[];
+        const msgIds = inserted[5] as string[];
+        const roles = inserted[6] as string[];
+        const texts = inserted[7] as string[];
+        const estimates = inserted[8] as number[];
+        const timestamps = inserted[9] as Array<string | number | null>;
+        const clientIds = inserted[10] as Array<string | null>;
+        return { rows: logicalOrdinals.map((logicalOrdinal, index) => ({
+          physical_ordinal: physicalOrdinals[index],
+          logical_ordinal: logicalOrdinal,
+          msg_id: msgIds[index],
+          role: roles[index],
+          semantic_text: texts[index],
+          token_estimate: estimates[index],
+          ts: timestamps[index] === null ? null : String(timestamps[index]),
+          client_message_id: clientIds[index],
+        })) };
+      }
+      if (sql.includes("SET model_sidecar_complete=TRUE")) {
+        return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const backend = createPgSessionsBackend(fakePool, { expectedGeneration: 0 });
+
+  const context = await backend.getEngineContextMessages("session-1", "c:1", {
+    contextWindow: 400,
+  });
+
+  assert.equal(context?.length, 1);
+  assert.equal(context?.[0]?.id, "legacy-newest-tool");
+  assert.match(String(context?.[0]?.text), /Earlier bytes of this exact message/);
+  assert.deepEqual(payloadOrdinals, [newestOrdinal]);
+  const headQuery = sqlCalls.find(({ sql }) =>
+    sql.includes("SELECT ordinal,msg_id,role,content_sha256"));
+  assert.ok(headQuery);
+  assert.equal(
+    headQuery.sql.includes("SELECT msg_id,ordinal,role,content_sha256,payload"),
+    false,
+  );
+  assert.equal(sqlCalls.some(({ sql }) => sql.includes("SELECT r.tape_id, t.tape_sha256")), false);
+});
+
+test("predecessor sparse 16k-record tape backfills in bounded pages instead of per physical row", async () => {
+  const physicalCount = 16_822;
+  const semanticOrdinals = new Set([3, 4_201, 10_777, physicalCount - 2]);
+  const payloads = Array.from({ length: physicalCount }, (_, ordinal) => {
+    const semantic = semanticOrdinals.has(ordinal);
+    const value = semantic
+      ? {
+          id: `semantic-${ordinal}`,
+          role: "assistant",
+          text: `short semantic ${ordinal}`,
+          ts: ordinal + 1,
+        }
+      : {
+          id: `runtime-${ordinal}`,
+          role: "runtime-event",
+          text: "",
+          ts: ordinal + 1,
+          _runtimeEvent: { type: "progress", phase: `step-${ordinal}` },
+        };
+    const payload = Buffer.from(JSON.stringify(value), "utf8");
+    return {
+      payload,
+      contentSha256: createHash("sha256").update(payload).digest("hex"),
+      msgId: String(value.id),
+      role: String(value.role),
+    };
+  });
+  const sidecars = new Map<number, Array<{
+    physical_ordinal: number;
+    logical_ordinal: number;
+    msg_id: string;
+    role: string;
+    semantic_text: string;
+    token_estimate: number;
+    ts: string | null;
+    client_message_id: string | null;
+  }>>();
+  const completed = new Set<number>();
+  let metadataQueries = 0;
+  let rawQueries = 0;
+  let totalQueries = 0;
+  let countPublished = false;
+  const fakePool = {
+    query: async (sql: string, params: unknown[] = []) => {
+      totalQueries += 1;
+      if (sql.includes("SELECT messages, archived_through_seq FROM client_sessions")) {
+        return { rows: [{ messages: JSON.stringify([completeTapeAnchor({
+          _turnTapePhysicalRecordCount: physicalCount,
+        })]), archived_through_seq: 0 }] };
+      }
+      if (sql.includes("SELECT tape_sha256,model_record_count")) {
+        return { rows: [{
+          tape_sha256: "a".repeat(64),
+          billing_anchor_id: "tape-anchor",
+          model_record_count: -1,
+        }] };
+      }
+      if (sql.includes("SELECT ordinal,msg_id,role,content_sha256")) {
+        metadataQueries += 1;
+        const before = params[3] === null ? physicalCount : Number(params[3]);
+        const rows = [];
+        for (let ordinal = before - 1; ordinal >= 0 && rows.length < 512; ordinal -= 1) {
+          const source = payloads[ordinal]!;
+          rows.push({
+            ordinal,
+            msg_id: source.msgId,
+            role: source.role,
+            content_sha256: source.contentSha256,
+            payload_bytes: String(source.payload.length),
+            model_sidecar_complete: completed.has(ordinal),
+          });
+        }
+        return { rows };
+      }
+      if (sql.includes("SELECT msg_id,ordinal,role,content_sha256,payload")) {
+        rawQueries += 1;
+        const ordinals = params[3] as number[];
+        return {
+          rows: ordinals
+            .filter((ordinal) => !completed.has(ordinal))
+            .map((ordinal) => {
+              const source = payloads[ordinal]!;
+              return {
+                msg_id: source.msgId,
+                ordinal,
+                role: source.role,
+                content_sha256: source.contentSha256,
+                payload: source.payload,
+              };
+            }),
+        };
+      }
+      if (sql.includes("INSERT INTO client_session_turn_tape_model_records")) {
+        const physicalOrdinals = params[3] as number[];
+        const logicalOrdinals = params[4] as number[];
+        const msgIds = params[5] as string[];
+        const roles = params[6] as string[];
+        const texts = params[7] as string[];
+        const estimates = params[8] as number[];
+        const timestamps = params[9] as Array<string | number | null>;
+        const clientIds = params[10] as Array<string | null>;
+        for (let index = 0; index < physicalOrdinals.length; index += 1) {
+          const physicalOrdinal = physicalOrdinals[index]!;
+          const rows = sidecars.get(physicalOrdinal) ?? [];
+          rows.push({
+            physical_ordinal: physicalOrdinal,
+            logical_ordinal: logicalOrdinals[index]!,
+            msg_id: msgIds[index]!,
+            role: roles[index]!,
+            semantic_text: texts[index]!,
+            token_estimate: estimates[index]!,
+            ts: timestamps[index] === null ? null : String(timestamps[index]),
+            client_message_id: clientIds[index] ?? null,
+          });
+          sidecars.set(physicalOrdinal, rows);
+        }
+        return { rows: [], rowCount: physicalOrdinals.length };
+      }
+      if (sql.includes("SELECT physical_ordinal,logical_ordinal,msg_id,role,semantic_text")) {
+        const ordinals = params[3] as number[];
+        return {
+          rows: ordinals
+            .flatMap((ordinal) => sidecars.get(ordinal) ?? [])
+            .sort((a, b) =>
+              a.physical_ordinal - b.physical_ordinal ||
+              a.logical_ordinal - b.logical_ordinal),
+        };
+      }
+      if (sql.includes("SET model_sidecar_complete=TRUE")) {
+        const ordinals = params[3] as number[];
+        for (const ordinal of ordinals) completed.add(ordinal);
+        return { rows: [], rowCount: ordinals.length };
+      }
+      if (sql.includes("UPDATE client_session_turn_tapes t")) {
+        countPublished = true;
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.includes("FROM client_session_archive_chunks")) return { rows: [] };
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const backend = createPgSessionsBackend(fakePool, { expectedGeneration: 0 });
+
+  const context = await backend.getEngineContextMessages("session-1", "c:1", {
+    contextWindow: 258_400,
+  });
+
+  assert.deepEqual(
+    context?.map((row) => row.id),
+    [...semanticOrdinals].map((ordinal) => `semantic-${ordinal}`),
+  );
+  assert.equal(metadataQueries, Math.ceil(physicalCount / 512));
+  assert.equal(rawQueries, Math.ceil(physicalCount / 512));
+  assert.equal(completed.size, physicalCount);
+  assert.equal(countPublished, true);
+  assert.ok(totalQueries < 200, `expected page-level queries, received ${totalQueries}`);
 });
 
 test("finite model context suffixes deferred giant user text in SQL", async () => {

@@ -916,9 +916,10 @@ export interface UserChatBridgeDeps {
    * Commercial v3 authority for browser chat history lives in master's
    * SQLite, not inside the per-user container. When a browser session switches
    * between providers (e.g. DeepSeek/CCB → Codex native), the container needs
-   * a bounded transcript preamble to bridge the provider-local resume gap.
-   * The dep returns the raw master messages; this bridge strips/caps them
-   * before attaching the private `_masterHistoricalMessages` field.
+   * a model-window-selected transcript preamble to bridge the provider-local
+   * resume gap. The dep returns the selected master messages; this bridge
+   * normalizes their semantic fields before attaching the private
+   * `_masterHistoricalMessages` field, without a second content cap.
    */
   loadMasterSessionMessages?: (
     uid: bigint,

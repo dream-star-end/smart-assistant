@@ -477,7 +477,11 @@ export function mergeFullServerWins(
   server = dropServerTeamSkeletonsOwnedLocally(server, local);
   const localById = new Map<string, ChatMessage>();
   for (const m of local) if (m?.id) localById.set(m.id, m);
-  const serverMerged = server.map((m) => mergeLocalClientFields(m, m?.id ? localById.get(m.id) : undefined));
+  const serverMerged = server.map((m) => mergeLocalClientFields(
+    m,
+    m?.id ? localById.get(m.id) : undefined,
+    opts?.invalidateHistoryCache !== true,
+  ));
   const serverChanged = serverMerged.some((m, idx) => m !== server[idx]);
   const serverIds = new Set<string>();
   for (const m of server) if (m?.id) serverIds.add(m.id);
@@ -696,7 +700,11 @@ function hasOwn(obj: Record<string, unknown>, key: string): boolean {
  * turns look blank. Keep the server row as the base, but fill missing/poorer
  * display fields from the richer local IndexedDB row.
  */
-function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage): ChatMessage {
+function mergeLocalClientFields(
+  serverMsg: ChatMessage,
+  localMsg?: ChatMessage,
+  preserveTapeProcessExpansion = true,
+): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
   // A turn waiver is irreversible (pending→applied only). A live waiver frame
   // may beat an older REST full response with the same message id/version, so
@@ -712,7 +720,11 @@ function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage):
   // the section while the user is inspecting immutable records. 与 waived
   // 同款单调保留:仅保留展开标记 + 游标,anchor 其余字段仍 server-wins。展开行本体(独立 flat 行)由
   // mergeFullServerWins 的 P1 缺席豁免(isLocallyExpandedTapeRow)保护。
-  if (localMsg._turnTapeProcessExpanded === true && serverMsg._turnTapeProcess === true) {
+  if (
+    preserveTapeProcessExpansion &&
+    localMsg._turnTapeProcessExpanded === true &&
+    serverMsg._turnTapeProcess === true
+  ) {
     serverMsg = {
       ...serverMsg,
       _turnTapeProcessExpanded: true,

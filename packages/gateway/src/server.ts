@@ -52,6 +52,7 @@ import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   isCodexEngineModel,
   isClientMessageId,
+  isPersistedClientMessageId,
   shouldServeInline,
   stripDispatchAuthorityField,
   type PromptQueueMutationFrame,
@@ -3571,7 +3572,7 @@ export class Gateway {
           this.sendJson(res, 400, { error: 'invalid JSON' })
           return
         }
-        if (typeof data.id !== 'string' || !/^[\w:-]{1,80}$/.test(data.id) || typeof data.text !== 'string') {
+        if (!isPersistedClientMessageId(data.id) || typeof data.text !== 'string') {
           this.sendJson(res, 400, { error: 'id+text required' })
           return
         }
@@ -3725,7 +3726,7 @@ export class Gateway {
       const userId = this.getUserId(req)
       if (
         (req.method !== 'GET' && req.method !== 'HEAD') ||
-        !/^[A-Za-z0-9_:-]{1,80}$/.test(msgId)
+        !isPersistedClientMessageId(msgId)
       ) {
         this.sendJson(res, req.method === 'GET' || req.method === 'HEAD' ? 400 : 405, {
           error: req.method === 'GET' || req.method === 'HEAD' ? 'invalid message id' : 'method not allowed',

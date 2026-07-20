@@ -512,6 +512,58 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     sock.stop();
   });
 
+  test("deferred + dispatch 终态 + offline 后 reload 仍保留旧 exact sidecar locator", () => {
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    const s = sock.sessions.get("s1")!;
+    const staleId = "cm-deferred-terminal";
+    const locator = addMessage(s, "user", "", {
+      id: staleId,
+      status: "error",
+      _source: "server",
+      _payloadDeferred: true,
+      _userPayloadDeferred: true,
+      _userPayloadId: staleId,
+      _payloadBytes: 8_000_000,
+      _payloadSha256: "a".repeat(64),
+      _routing: { model: "gpt-5.6-terra", teamMode: false, effortLevel: "high" },
+      _deferredRetryEligible: true,
+    });
+    s.messages.push(srvRow({
+      id: "turn-status:deferred",
+      role: "system",
+      _turnStatusRecord: true,
+      _dispatchTerminal: true,
+      _clientMessageId: staleId,
+    }));
+    const exact = {
+      ...locator,
+      text: "旧 sidecar 中的完整超长提问",
+      _payloadDeferred: undefined,
+      _userPayloadDeferred: undefined,
+    } satisfies ChatMessage;
+
+    // No open WebSocket: the fresh dispatch cannot create its server sidecar.
+    sock.retryMessage({ sessId: "s1", msgId: staleId, agentId: "main", sourceOverride: exact });
+    expect(locator.id).not.toBe(staleId);
+    expect(locator.status).toBe("queued");
+    expect(locator._userPayloadId).toBe(staleId);
+
+    const stored = sock.toStored("s1")!;
+    const persisted = stored.messages.find((message) => message.id === locator.id)!;
+    expect(persisted._userPayloadId).toBe(staleId);
+    expect(persisted.text).toBe("");
+
+    const reloaded = makeSocket();
+    reloaded.loadStored(stored);
+    const restored = reloaded.sessions.get("s1")!.messages.find((message) => message.id === locator.id)!;
+    expect(restored._userPayloadDeferred).toBe(true);
+    expect(restored._userPayloadId).toBe(staleId);
+    expect(restored.text).toBe("");
+    sock.stop();
+    reloaded.stop();
+  });
+
   test("resend-uncertain(普通发送失败)→ 复用旧 id + attempt 递增(dedup 保护)", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();

@@ -155,6 +155,47 @@ test('getTapeRecordPayload resolves metadata with HEAD and reconstructs exact by
   expect(reconstructed.every((byte, index) => byte === source[index])).toBe(true)
 })
 
+test('getTapeRecordPayload aborts the active range when its viewport subscriber leaves', async () => {
+  const hash = 'f'.repeat(64)
+  const seenSignals: AbortSignal[] = []
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit): Promise<Response> => {
+    if (init?.signal) seenSignals.push(init.signal)
+    if (init?.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(2 * 1024 * 1024),
+          'accept-ranges': 'bytes',
+          'x-openclaude-content-sha256': hash,
+          'x-openclaude-record-id': 'record-abort',
+          'x-openclaude-record-role': 'tool',
+        },
+      })
+    }
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('aborted', 'AbortError'))
+      }, { once: true })
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-tape-abort')
+  const controller = new AbortController()
+
+  const pending = api.getTapeRecordPayload(
+    session,
+    'session-abort-1',
+    'tape-abort-1',
+    9,
+    controller.signal,
+  )
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+  controller.abort()
+
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+  expect(seenSignals).toEqual([controller.signal, controller.signal])
+})
+
 test('getUserMessagePayload uses the user sidecar URL and the same exact range contract', async () => {
   const source = new TextEncoder().encode(JSON.stringify({
     id: 'cm:user:1', role: 'user', text: '完整超长用户消息', ts: 1,

@@ -3,6 +3,7 @@ import { api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
+import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
@@ -154,12 +155,14 @@ export type UseChatSocket = {
     tapeId: string,
     recordOrdinal: number,
     expected: TapePayloadExpectation,
+    signal?: AbortSignal,
   ) => Promise<ChatMessage[] | null>;
   /** 按需读取、校验并解析一条超长 user 消息。 */
   fetchUserMessagePayload: (
     sessId: string | undefined,
     messageId: string,
     expected: TapePayloadExpectation,
+    signal?: AbortSignal,
   ) => Promise<ChatMessage[] | null>;
   /** 删除某会话的本地持久副本（与 removeSession 配套）。*/
   removePersisted: (sessId: string) => void;
@@ -635,17 +638,44 @@ export function useChatSocket(opts: {
     key: string;
     records: ChatMessage[];
   } | null>(null);
+  const deferredPayloadQueueRef = useRef<DeferredPayloadQueue<ChatMessage[]> | null>(null);
+  if (!deferredPayloadQueueRef.current) {
+    deferredPayloadQueueRef.current = new DeferredPayloadQueue<ChatMessage[]>(2);
+  }
+  useEffect(() => {
+    return () => {
+      deferredPayloadQueueRef.current?.cancelAll();
+      deferredPayloadCacheRef.current = null;
+    };
+  }, [auth, userId]);
   const fetchTapeRecordPayload = useCallback<UseChatSocket["fetchTapeRecordPayload"]>(
-    async (sessId, tapeId, recordOrdinal, expected) => {
+    async (sessId, tapeId, recordOrdinal, expected, signal) => {
       const a = authRef.current;
-      if (!a || !sessId || !tapeId || !Number.isInteger(recordOrdinal) || recordOrdinal < 0) return null;
-      try {
-        const cacheKey = `${a.snapshot().epoch}:${sessId}:${tapeId}:${recordOrdinal}:${expected.contentSha256}`;
-        if (deferredPayloadCacheRef.current?.key === cacheKey) {
-          return deferredPayloadCacheRef.current.records;
+      if (
+        signal?.aborted || !a || !sessId || !tapeId ||
+        !Number.isInteger(recordOrdinal) || recordOrdinal < 0
+      ) return null;
+      const epoch = a.snapshot().epoch;
+      const cacheKey = JSON.stringify([
+        userId ?? "",
+        epoch,
+        sessId,
+        "tape",
+        tapeId,
+        recordOrdinal,
+        expected.recordId,
+        expected.role,
+        expected.contentSha256 ?? "",
+      ]);
+      if (deferredPayloadCacheRef.current?.key === cacheKey) {
+        return deferredPayloadCacheRef.current.records;
+      }
+      return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
+        const payload = await api.getTapeRecordPayload(a, sessId, tapeId, recordOrdinal, queueSignal);
+        const records = await parseTapeRecordPayload(payload, expected, queueSignal);
+        if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
+          throw new DOMException("auth identity changed", "AbortError");
         }
-        const payload = await api.getTapeRecordPayload(a, sessId, tapeId, recordOrdinal);
-        const records = await parseTapeRecordPayload(payload, expected);
         const hydrated: ChatMessage[] = records.map((record) => ({
           ...record,
           _source: "server",
@@ -659,23 +689,34 @@ export function useChatSocket(opts: {
         }));
         deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
         return hydrated;
-      } catch {
-        return null;
-      }
+      }, signal);
     },
-    [],
+    [auth, userId],
   );
   const fetchUserMessagePayload = useCallback<UseChatSocket["fetchUserMessagePayload"]>(
-    async (sessId, messageId, expected) => {
+    async (sessId, messageId, expected, signal) => {
       const a = authRef.current;
-      if (!a || !sessId || !messageId) return null;
-      try {
-        const cacheKey = `${a.snapshot().epoch}:${sessId}:user:${messageId}:${expected.contentSha256}`;
-        if (deferredPayloadCacheRef.current?.key === cacheKey) {
-          return deferredPayloadCacheRef.current.records;
+      if (signal?.aborted || !a || !sessId || !messageId) return null;
+      const epoch = a.snapshot().epoch;
+      const cacheKey = JSON.stringify([
+        userId ?? "",
+        epoch,
+        sessId,
+        "user",
+        messageId,
+        expected.recordId,
+        expected.role,
+        expected.contentSha256 ?? "",
+      ]);
+      if (deferredPayloadCacheRef.current?.key === cacheKey) {
+        return deferredPayloadCacheRef.current.records;
+      }
+      return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
+        const payload = await api.getUserMessagePayload(a, sessId, messageId, queueSignal);
+        const records = await parseTapeRecordPayload(payload, expected, queueSignal);
+        if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
+          throw new DOMException("auth identity changed", "AbortError");
         }
-        const payload = await api.getUserMessagePayload(a, sessId, messageId);
-        const records = await parseTapeRecordPayload(payload, expected);
         const hydrated: ChatMessage[] = records.map((record) => ({
           ...record,
           _source: "server",
@@ -686,11 +727,9 @@ export function useChatSocket(opts: {
         }));
         deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
         return hydrated;
-      } catch {
-        return null;
-      }
+      }, signal);
     },
-    [],
+    [auth, userId],
   );
   const storedMaxSeq = useCallback(
     (sessId: string | undefined) => {
@@ -714,6 +753,7 @@ export function useChatSocket(opts: {
   }, []);
   const wipePersistence = useCallback(async () => {
     sigRef.current.clear();
+    deferredPayloadQueueRef.current?.cancelAll();
     deferredPayloadCacheRef.current = null;
     const st = storeRef.current;
     if (st) await st.wipe();

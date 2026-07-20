@@ -210,6 +210,37 @@ describe("lazy immutable process merge", () => {
     expect(session.messages.find((message) => message.id === "tool-2")?.text).toBe("二");
   });
 
+  test("history revision invalidates fetched rows and their cursor as one atomic view state", () => {
+    const { sock, session } = seed();
+    sock.applyExpandedTapeRecords(
+      "s1",
+      "turn-process:tape-1",
+      [srvRow({ id: "thinking-1", role: "thinking", text: "第一页", _turnTapeOrdinal: 1 })],
+      200,
+    );
+    expect(session.messages.find((message) => message.id === "thinking-1")).toBeDefined();
+    expect(session.messages.find((message) => message.id === "turn-process:tape-1"))
+      .toMatchObject({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 });
+
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [
+        srvRow({ id: "cm-1", role: "user", text: "问题", _seq: 4, _orderSeq: 4 }),
+        processControl(),
+        finalAnswer(),
+      ],
+      true,
+      5,
+      { historyRevision: 1, serverUpdatedAt: 101 },
+    );
+
+    expect(session.messages.find((message) => message.id === "thinking-1")).toBeUndefined();
+    const control = session.messages.find((message) => message.id === "turn-process:tape-1")!;
+    expect(control._turnTapeProcessExpanded).toBeUndefined();
+    expect(control._turnTapeProcessCursor).toBeUndefined();
+  });
+
   test("collapse removes fetched process rows but keeps the genuine final answer", () => {
     const { sock, session } = seed();
     sock.applyExpandedTapeRecords(

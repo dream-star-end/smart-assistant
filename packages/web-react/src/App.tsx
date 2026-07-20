@@ -775,15 +775,20 @@ export function App() {
     async (message: ChatMessage): Promise<ChatMessage | null> => {
       if (message._userPayloadDeferred !== true) return message;
       if (!activeId) return null;
-      const records = await sockRef.current?.fetchUserMessagePayload(activeId, message.id, {
-        recordId: message.id,
+      const payloadId = message._userPayloadId ?? message.id;
+      const records = await sockRef.current?.fetchUserMessagePayload(activeId, payloadId, {
+        recordId: payloadId,
         role: "user",
         ...(message._payloadSha256 ? { contentSha256: message._payloadSha256 } : {}),
       });
-      const exact = records?.find((record) => record.id === message.id && record.role === "user");
+      const exact = records?.find((record) => record.id === payloadId && record.role === "user");
       if (!exact) return null;
       return {
         ...exact,
+        // Actions target the current logical/dispatch row while payload reads
+        // continue using the immutable sidecar id above.
+        id: message.id,
+        _userPayloadId: payloadId,
         status: message.status ?? exact.status,
         _routing: exact._routing ?? message._routing,
         _sendAttempt: message._sendAttempt ?? exact._sendAttempt,
@@ -1516,11 +1521,12 @@ export function App() {
       onCollapseTape: demo ? undefined : (anchorId) => collapseTurnProcess(activeId, anchorId),
       onFetchTapeRecordPayload: demo
         ? undefined
-        : (tapeId, recordOrdinal, expected) =>
-            fetchTapeRecordPayload(activeId, tapeId, recordOrdinal, expected),
+        : (tapeId, recordOrdinal, expected, signal) =>
+            fetchTapeRecordPayload(activeId, tapeId, recordOrdinal, expected, signal),
       onFetchUserMessagePayload: demo
         ? undefined
-        : (messageId, expected) => fetchUserMessagePayload(activeId, messageId, expected),
+        : (messageId, expected, signal) =>
+            fetchUserMessagePayload(activeId, messageId, expected, signal),
       resolveRetryTarget: demo ? undefined : resolveRetryTarget,
     }),
     [
@@ -2058,6 +2064,7 @@ export function App() {
             // 消费者，随 ratings 变更穿透 MessageRenderer 的 sig-memo 重渲（无需改渲染签名）。
             <ResponseRatingProvider value={ratingCtx}>
               <MessageList
+                key={activeId}
                 messages={wsMessages}
                 sending={wsSending}
                 turnActivity={turnActivity}

@@ -15,26 +15,43 @@ type WorkerReply =
 
 const WORKER_PARSE_THRESHOLD_BYTES = 256 * 1024;
 
-async function parseOffMainThread(bytes: ArrayBuffer): Promise<WorkerReply> {
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+}
+
+async function parseOffMainThread(bytes: ArrayBuffer, signal?: AbortSignal): Promise<WorkerReply> {
+  throwIfAborted(signal);
   if (typeof Worker === "undefined" || bytes.byteLength < WORKER_PARSE_THRESHOLD_BYTES) {
     try {
-      return { ok: true, ...(await decodeTapePayload(bytes)) };
+      const decoded = await decodeTapePayload(bytes);
+      throwIfAborted(signal);
+      return { ok: true, ...decoded };
     } catch (error) {
+      if (signal?.aborted) throw error;
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
-  return new Promise<WorkerReply>((resolve) => {
+  return new Promise<WorkerReply>((resolve, reject) => {
     const worker = new Worker(new URL("../../workers/tapePayloadWorker.ts", import.meta.url), {
       type: "module",
     });
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      worker.terminate();
+      cleanup();
+      reject(new DOMException("aborted", "AbortError"));
+    };
     worker.onmessage = (event: MessageEvent<WorkerReply>) => {
       worker.terminate();
+      cleanup();
       resolve(event.data);
     };
     worker.onerror = (event) => {
       worker.terminate();
+      cleanup();
       resolve({ ok: false, error: event.message || "tape payload worker failed" });
     };
+    signal?.addEventListener("abort", onAbort, { once: true });
     worker.postMessage({ bytes }, [bytes]);
   });
 }
@@ -43,7 +60,9 @@ async function parseOffMainThread(bytes: ArrayBuffer): Promise<WorkerReply> {
 export async function parseTapeRecordPayload(
   payload: TapeRecordPayload,
   expected: TapePayloadExpectation,
+  signal?: AbortSignal,
 ): Promise<ChatMessage[]> {
+  throwIfAborted(signal);
   if (
     payload.recordId !== expected.recordId ||
     payload.role !== expected.role ||
@@ -52,7 +71,8 @@ export async function parseTapeRecordPayload(
   ) {
     throw new Error("tape payload response identity mismatch");
   }
-  const decoded = await parseOffMainThread(payload.bytes);
+  const decoded = await parseOffMainThread(payload.bytes, signal);
+  throwIfAborted(signal);
   if (!decoded.ok) throw new Error(decoded.error);
   if (
     decoded.contentSha256 !== payload.contentSha256 ||

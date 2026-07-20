@@ -23,7 +23,8 @@ ALTER TABLE client_session_turn_tapes
 ALTER TABLE client_session_turn_tape_records
   ADD COLUMN IF NOT EXISTS visible_payload BYTEA,
   ADD COLUMN IF NOT EXISTS visible_content_sha256 TEXT
-    CHECK (visible_content_sha256 IS NULL OR visible_content_sha256 ~ '^[0-9a-f]{64}$');
+    CHECK (visible_content_sha256 IS NULL OR visible_content_sha256 ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN IF NOT EXISTS model_sidecar_complete BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Private runner continuity sidecar. It is not a browser projection: the
 -- browser still reads exact immutable tape bytes. Each row stores the complete
@@ -131,8 +132,10 @@ COMMENT ON COLUMN client_session_turn_tape_records.visible_payload IS
   'Exact immutable user-visible record bytes after known private metadata is removed; never summarized or truncated.';
 COMMENT ON COLUMN client_session_turn_tape_records.visible_content_sha256 IS
   'SHA-256 of visible_payload for byte-range reassembly verification.';
+COMMENT ON COLUMN client_session_turn_tape_records.model_sidecar_complete IS
+  'True only after every private model-continuity row for this physical record is durably present; enables bounded lazy compatibility backfill.';
 COMMENT ON COLUMN client_session_turn_tapes.model_record_count IS
-  'Logical private model-continuity sidecar rows; -1 means a rolling predecessor tape needs lazy compatibility hydration.';
+  'Logical private model-continuity sidecar rows; -1 means predecessor physical records are backfilled lazily newest-first.';
 COMMENT ON TABLE client_session_turn_tape_model_records IS
   'Complete deterministic semantic text for finite-window newest-first model context reads; never used by browser history.';
 COMMENT ON TABLE client_session_user_payloads IS

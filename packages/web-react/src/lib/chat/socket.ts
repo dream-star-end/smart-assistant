@@ -2622,6 +2622,14 @@ export class ChatSocket {
       sess.messages = sess.messages.filter(
         (m) => !(m && m._clientMessageId === staleCmid && isDispatchTerminalRow(m)),
       );
+      // The new id is dispatch identity, not storage identity. A deferred
+      // payload may still exist only under the previous immutable sidecar key
+      // while this retry is offline/in flight, so retain that key in the tiny
+      // locator persisted to IndexedDB. A later server echo for `freshId`
+      // replaces it with the newly durable sidecar locator.
+      if (userMsg._userPayloadDeferred === true && !userMsg._userPayloadId) {
+        userMsg._userPayloadId = staleCmid;
+      }
       userMsg.id = freshId;
       userMsg._errorCode = undefined;
       userMsg._errorDetail = undefined;

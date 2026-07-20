@@ -1750,6 +1750,12 @@ function isLosslessTurnTapeWireBody(raw: unknown): boolean {
  *   08*  连接异常类 · 57P0* 服务 shutdown / cannot_connect_now。
  */
 function isTransientTurnTapeStorageError(err: unknown): boolean {
+  if (
+    err && typeof err === "object" &&
+    (err as { retryable?: unknown }).retryable === true
+  ) {
+    return true;
+  }
   const code =
     err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string"
       ? (err as { code: string }).code
