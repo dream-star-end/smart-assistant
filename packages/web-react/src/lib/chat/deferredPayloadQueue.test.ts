@@ -56,16 +56,18 @@ describe("DeferredPayloadQueue", () => {
     await expect(second).resolves.toBe(value);
   });
 
-  test("quick-scroll cancellation drops queued work and aborts an orphaned active fetch", async () => {
+  test("quick scroll drops unseen queued work but lets an active verified read become resident", async () => {
     const queue = new DeferredPayloadQueue<string>(1);
     const activeSubscriber = new AbortController();
     const queuedSubscriber = new AbortController();
-    let internalSignal: AbortSignal | null = null;
-    const activeRun = vi.fn((signal: AbortSignal) => new Promise<string>((_resolve, reject) => {
-      internalSignal = signal;
+    const internalSignal: { current: AbortSignal | null } = { current: null };
+    const activeGate = deferred<string>();
+    const activeRun = vi.fn((signal: AbortSignal) => new Promise<string>((resolve, reject) => {
+      internalSignal.current = signal;
       signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
         once: true,
       });
+      void activeGate.promise.then(resolve, reject);
     }));
     const queuedRun = vi.fn(async () => "queued");
 
@@ -78,7 +80,11 @@ describe("DeferredPayloadQueue", () => {
 
     activeSubscriber.abort();
     await expect(active).resolves.toBeNull();
-    await vi.waitFor(() => expect(internalSignal?.aborted).toBe(true));
+    expect(internalSignal.current?.aborted).toBe(false);
+    activeGate.resolve("resident exact payload");
+    await vi.waitFor(() => expect(queue.peek("active")).toBe("resident exact payload"));
+    await expect(queue.request("active", activeRun)).resolves.toBe("resident exact payload");
+    expect(activeRun).toHaveBeenCalledTimes(1);
   });
 
   test("failed identity can be retried as a fresh task", async () => {
@@ -90,5 +96,42 @@ describe("DeferredPayloadQueue", () => {
     await expect(queue.request("retryable", run)).resolves.toBeNull();
     await expect(queue.request("retryable", run)).resolves.toBe("complete exact payload");
     expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  test("null is not negatively cached and can be retried", async () => {
+    const queue = new DeferredPayloadQueue<string>(2);
+    const run = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce("verified payload");
+
+    await expect(queue.request("not-negative", run)).resolves.toBeNull();
+    expect(queue.peek("not-negative")).toBeNull();
+    await expect(queue.request("not-negative", run)).resolves.toBe("verified payload");
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  test("cancelAll clears residency and fences a late runner that ignores abort", async () => {
+    const queue = new DeferredPayloadQueue<string>(1);
+    const oldGate = deferred<string>();
+    const oldSignal: { current: AbortSignal | null } = { current: null };
+    const oldRun = vi.fn((signal: AbortSignal) => {
+      oldSignal.current = signal;
+      return oldGate.promise;
+    });
+    const oldRequest = queue.request("same", oldRun);
+    await vi.waitFor(() => expect(oldRun).toHaveBeenCalledTimes(1));
+
+    queue.cancelAll();
+    await expect(oldRequest).resolves.toBeNull();
+    expect(oldSignal.current?.aborted).toBe(true);
+    oldGate.resolve("stale old identity");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(queue.peek("same")).toBeNull();
+
+    await expect(queue.request("same", async () => "fresh identity")).resolves.toBe("fresh identity");
+    expect(queue.peek("same")).toBe("fresh identity");
+    queue.cancelAll();
+    expect(queue.peek("same")).toBeNull();
   });
 });

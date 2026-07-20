@@ -234,13 +234,14 @@ await check("T8 pointercancel/同轮惯性不连拉，插页像素锚定且 remo
   if (!beforeBox) throw new Error("tail anchor has no layout box before paging");
   firstAnchorTop = beforeBox.y;
 
-  await root.hover();
-  await page.mouse.wheel(0, -120);
+  // Dispatch one complete wheel burst in the same browser task. The first
+  // event creates one intent; the second is inertial continuation before the
+  // next-frame anchor capture and must not create another cursor.
+  await root.evaluate((node) => {
+    node.dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true }));
+    node.dispatchEvent(new WheelEvent("wheel", { deltaY: -80, bubbles: true }));
+  });
   await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 1, null, { timeout: 3000 });
-  // The request resolves in 40ms. A second event from the same wheel/trackpad
-  // inertia burst must not become a second cursor merely because the network
-  // was faster than the gesture.
-  await page.mouse.wheel(0, -80);
   await page.waitForTimeout(120);
   const afterInertia = await page.evaluate(() => window.__scrollTimeline.calls);
   if (JSON.stringify(afterInertia) !== JSON.stringify([200])) {

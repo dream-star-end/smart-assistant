@@ -25,7 +25,7 @@ import {
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
 import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import type { UserUpwardPagingController } from "../../lib/chat/tapePaging";
+import type { PagingClaim, UserUpwardPagingController } from "../../lib/chat/tapePaging";
 import {
   CONTINUE_PROMPT,
   childSignature,
@@ -90,12 +90,23 @@ export type CardCallbacks = {
     expected: { recordId: string; role: string; contentSha256?: string },
     signal?: AbortSignal,
   ) => Promise<ChatMessage[] | null>;
+  /** 同一页面内已校验 tape payload；虚拟行 remount 首帧直接复用。 */
+  onPeekTapeRecordPayload?: (
+    tapeId: string,
+    recordOrdinal: number,
+    expected: { recordId: string; role: string; contentSha256?: string },
+  ) => ChatMessage[] | null;
   /** 按需读取并校验一条超长 user 消息；不要求 tape id/ordinal。 */
   onFetchUserMessagePayload?: (
     messageId: string,
     expected: { recordId: string; role: string; contentSha256?: string },
     signal?: AbortSignal,
   ) => Promise<ChatMessage[] | null>;
+  /** 同一页面内已校验 user payload；虚拟行 remount 首帧直接复用。 */
+  onPeekUserMessagePayload?: (
+    messageId: string,
+    expected: { recordId: string; role: string; contentSha256?: string },
+  ) => ChatMessage[] | null;
   /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
    *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
    *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
@@ -358,6 +369,7 @@ type ViewportAnchor = {
   scroller: HTMLElement;
   key: string;
   top: number;
+  interactionVersion: number | null;
 };
 
 function virtualItemKey(element: HTMLElement): string | null {
@@ -368,7 +380,10 @@ function virtualItemKey(element: HTMLElement): string | null {
 /** Capture a real row after the process cursor. Older tape pages are inserted
  * before that row, so restoring its exact viewport offset keeps the content
  * under the user's eyes pixel-stable even when Virtuoso remeasures rows. */
-function captureViewportAnchor(sentinel: HTMLElement | null): ViewportAnchor | null {
+function captureViewportAnchor(
+  sentinel: HTMLElement | null,
+  paging: UserUpwardPagingController | undefined,
+): ViewportAnchor | null {
   const scroller = sentinel?.closest<HTMLElement>(".chat-scroll-area");
   const control = sentinel?.closest<HTMLElement>("[data-chat-virtual-key]");
   if (!scroller || !control) return null;
@@ -382,36 +397,51 @@ function captureViewportAnchor(sentinel: HTMLElement | null): ViewportAnchor | n
   if (!row) return null;
   const key = virtualItemKey(row);
   if (!key) return null;
-  return { scroller, key, top: row.getBoundingClientRect().top - viewport.top };
+  return {
+    scroller,
+    key,
+    top: row.getBoundingClientRect().top - viewport.top,
+    interactionVersion: paging?.interactionVersion() ?? null,
+  };
 }
 
 function restoreViewportAnchor(
   anchor: ViewportAnchor | null,
   paging: UserUpwardPagingController | undefined,
-): void {
-  if (!anchor || typeof requestAnimationFrame !== "function") return;
-  let frames = 0;
-  const correct = () => {
-    frames += 1;
-    const row = Array.from(
-      anchor.scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
-    ).find((candidate) => virtualItemKey(candidate) === anchor.key);
-    if (row) {
-      const currentTop = row.getBoundingClientRect().top - anchor.scroller.getBoundingClientRect().top;
-      const delta = currentTop - anchor.top;
-      if (Math.abs(delta) > 0.5) {
-        const nextTop = anchor.scroller.scrollTop + delta;
-        // Record the programmatic correction before assigning scrollTop so it
-        // can never masquerade as another upward user gesture.
-        paging?.syncScrollTop(nextTop);
-        anchor.scroller.scrollTop = nextTop;
+): Promise<void> {
+  if (!anchor || typeof requestAnimationFrame !== "function") return Promise.resolve();
+  return new Promise((resolve) => {
+    let frames = 0;
+    const correct = () => {
+      if (
+        paging && anchor.interactionVersion !== null &&
+        paging.interactionVersion() !== anchor.interactionVersion
+      ) {
+        resolve();
+        return;
       }
-    }
-    // React notification + Virtuoso measurement can span several frames.
-    // Re-apply the exact residual delta; this never fetches or hides content.
-    if (frames < 12) requestAnimationFrame(correct);
-  };
-  requestAnimationFrame(correct);
+      frames += 1;
+      const row = Array.from(
+        anchor.scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      ).find((candidate) => virtualItemKey(candidate) === anchor.key);
+      if (row) {
+        const currentTop = row.getBoundingClientRect().top - anchor.scroller.getBoundingClientRect().top;
+        const delta = currentTop - anchor.top;
+        if (Math.abs(delta) > 0.5) {
+          const nextTop = anchor.scroller.scrollTop + delta;
+          // Record the programmatic correction before assigning scrollTop so it
+          // can never masquerade as another upward user gesture.
+          paging?.syncScrollTop(nextTop);
+          anchor.scroller.scrollTop = nextTop;
+        }
+      }
+      // React notification + Virtuoso measurement can span several frames.
+      // Re-apply the exact residual delta; this never fetches or hides content.
+      if (frames < 12) requestAnimationFrame(correct);
+      else resolve();
+    };
+    requestAnimationFrame(correct);
+  });
 }
 
 export function TurnProcessCard({
@@ -446,41 +476,55 @@ export function TurnProcessCard({
   const loadPage = async (manual = false) => {
     if (!cb.onLoadOlderTape || !tapeId || complete || loadingRef.current) return;
     const cursorKey = initialized ? String(before) : "tail";
-    if (!manual) {
-      if (paging) {
-        if (!paging.begin(generation, initialized)) return;
-      } else if (requestedCursorRef.current === cursorKey) {
-        return;
-      }
+    let claim: PagingClaim | null = null;
+    if (paging) {
+      // Retry is a fresh explicit intent, but it still has to own the same
+      // controller-wide single-flight token as gesture-driven pages.
+      if (manual) paging.signalUpwardIntent();
+      claim = paging.begin(generation, initialized, manual);
+      if (!claim) return;
+    } else if (!manual && requestedCursorRef.current === cursorKey) {
+      return;
     }
     requestedCursorRef.current = cursorKey;
     loadingRef.current = true;
     setLoading(true);
     setError(false);
-    const viewportAnchor = captureViewportAnchor(sentinelRef.current);
+    const viewportAnchor = captureViewportAnchor(sentinelRef.current, paging);
+    let requestFailed = false;
     try {
       const res = await cb.onLoadOlderTape(msg.id, tapeId, before);
       if (!res.ok) {
+        requestFailed = true;
         requestedCursorRef.current = null;
         if (res.error) setError(true);
       } else {
-        restoreViewportAnchor(viewportAnchor, paging);
+        await restoreViewportAnchor(viewportAnchor, paging);
       }
     } catch {
+      requestFailed = true;
       requestedCursorRef.current = null;
       setError(true);
     } finally {
       loadingRef.current = false;
       setLoading(false);
-      paging?.settle(generation);
+      if (claim && paging) {
+        // A virtualized-away failed tail has nowhere to show its retry CTA.
+        // Re-arm only that owner so a later remount can load it; a still-
+        // mounted failure remains manual until that retry UI itself unmounts.
+        if (requestFailed && !initialized) {
+          paging.markTailFailed(claim);
+          if (sentinelRef.current === null) paging.rearmTail(claim);
+        }
+        paging.settle(claim);
+      }
     }
   };
   loadRef.current = (manual = false) => { void loadPage(manual); };
 
   // A history-revision reset reuses the same keyed control component after
-  // removing its loaded rows/cursor. Re-arm that fresh view generation so the
-  // tail loads automatically again instead of being blocked by stale refs from
-  // the prior completed generation.
+  // removing its loaded rows/cursor. Re-arm that fresh view generation so its
+  // next genuine upward intent is not blocked by stale refs.
   useEffect(() => {
     const previous = controlStateRef.current;
     if (
@@ -493,9 +537,14 @@ export function TurnProcessCard({
     controlStateRef.current = { id: msg.id, tapeId, initialized };
   }, [generation, initialized, msg.id, paging, tapeId]);
 
-  // Intersection only establishes proximity. Initialized cursors additionally
-  // require an explicit upward user epoch from the MessageList controller, so
-  // remounts, measurements and programmatic anchor corrections cannot cascade.
+  useEffect(
+    () => () => paging?.rearmFailedTail(generation),
+    [generation, paging],
+  );
+
+  // Intersection only establishes proximity. The controller admits visible
+  // initial tails one at a time; initialized older cursors additionally need a
+  // fresh upward user epoch, so remounts/layout corrections cannot cascade.
   useEffect(() => {
     const node = sentinelRef.current;
     if (!node || !canLoad || complete) return;
@@ -513,14 +562,16 @@ export function TurnProcessCard({
     }, { rootMargin: "240px 0px" });
     observer.observe(node);
     const scroller = node.closest<HTMLElement>(".chat-scroll-area");
+    const unsubscribeSettled = paging?.subscribeSettled(maybeLoad);
     scroller?.addEventListener("scroll", maybeLoad, { passive: true });
     scroller?.addEventListener("oc-upward-page-intent", maybeLoad);
     return () => {
       observer.disconnect();
+      unsubscribeSettled?.();
       scroller?.removeEventListener("scroll", maybeLoad);
       scroller?.removeEventListener("oc-upward-page-intent", maybeLoad);
     };
-  }, [canLoad, complete, generation, initialized, msg.id, tapeId]);
+  }, [canLoad, complete, generation, initialized, msg.id, paging, tapeId]);
 
   if (complete) return null;
 

@@ -1,4 +1,4 @@
-type DeferredPayloadRun<T> = (signal: AbortSignal) => Promise<T>;
+type DeferredPayloadRun<T> = (signal: AbortSignal) => Promise<T | null>;
 
 type DeferredPayloadSubscriber<T> = {
   resolve: (value: T | null) => void;
@@ -12,6 +12,7 @@ type DeferredPayloadEntry<T> = {
   controller: AbortController;
   subscribers: Set<DeferredPayloadSubscriber<T>>;
   state: "queued" | "active" | "finished";
+  generation: number;
 };
 
 /**
@@ -19,14 +20,17 @@ type DeferredPayloadEntry<T> = {
  *
  * Page size and record size remain unlimited totals: this only bounds how many
  * whole-record buffers may be downloading/parsing at once. Requests for the
- * same immutable identity share one task. Each viewport card owns a
- * subscription, so leaving overscan cancels queued work and aborts active work
- * once its last subscriber disappears.
+ * same immutable identity share one task. Successfully verified results stay
+ * resident for this page lifetime, so a virtual-row remount never replaces
+ * real content with a loader or downloads the same bytes again. There is no
+ * content/count cap: refresh, logout or an account switch destroys the cache.
  */
 export class DeferredPayloadQueue<T> {
   private readonly entries = new Map<string, DeferredPayloadEntry<T>>();
   private readonly queued: DeferredPayloadEntry<T>[] = [];
+  private readonly completed = new Map<string, T>();
   private active = 0;
+  private generation = 0;
 
   constructor(private readonly maxActive = 2) {}
 
@@ -36,6 +40,7 @@ export class DeferredPayloadQueue<T> {
     signal?: AbortSignal,
   ): Promise<T | null> {
     if (signal?.aborted) return Promise.resolve(null);
+    if (this.completed.has(key)) return Promise.resolve(this.completed.get(key)!);
 
     return new Promise<T | null>((resolve) => {
       let entry = this.entries.get(key);
@@ -46,6 +51,7 @@ export class DeferredPayloadQueue<T> {
           controller: new AbortController(),
           subscribers: new Set(),
           state: "queued",
+          generation: this.generation,
         };
         this.entries.set(key, entry);
         this.queued.push(entry);
@@ -61,13 +67,32 @@ export class DeferredPayloadQueue<T> {
     });
   }
 
+  /** Synchronous first-paint lookup for virtual rows remounting in this page. */
+  peek(key: string): T | null {
+    return this.completed.get(key) ?? null;
+  }
+
   /** Account/session teardown: no old-identity task may survive into the next view. */
   cancelAll(): void {
+    this.generation += 1;
+    this.completed.clear();
+    this.queued.length = 0;
     for (const entry of [...this.entries.values()]) {
-      for (const subscriber of [...entry.subscribers]) {
-        this.unsubscribe(entry, subscriber);
+      if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
+      for (const subscriber of entry.subscribers) {
+        if (subscriber.onAbort && subscriber.signal) {
+          subscriber.signal.removeEventListener("abort", subscriber.onAbort);
+        }
+        subscriber.resolve(null);
       }
+      entry.subscribers.clear();
+      if (entry.state === "active") {
+        this.active -= 1;
+        entry.controller.abort();
+      }
+      entry.state = "finished";
     }
+    this.pump();
   }
 
   private unsubscribe(
@@ -81,16 +106,17 @@ export class DeferredPayloadQueue<T> {
     subscriber.resolve(null);
     if (entry.subscribers.size > 0) return;
 
-    // Do not let a new subscriber attach to an already-aborted active entry.
-    if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
     if (entry.state === "queued") {
+      if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
       const index = this.queued.indexOf(entry);
       if (index >= 0) this.queued.splice(index, 1);
       entry.state = "finished";
       this.pump();
       return;
     }
-    if (entry.state === "active") entry.controller.abort();
+    // At most two already-started immutable reads may finish without a mounted
+    // subscriber. Keeping them alive is what makes quick scroll + remount
+    // resident instead of repeatedly aborting and restarting the same bytes.
   }
 
   private pump(): void {
@@ -113,6 +139,9 @@ export class DeferredPayloadQueue<T> {
     entry.state = "finished";
     this.active -= 1;
     if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
+    if (value !== null && entry.generation === this.generation) {
+      this.completed.set(entry.key, value);
+    }
     for (const subscriber of [...entry.subscribers]) {
       entry.subscribers.delete(subscriber);
       if (subscriber.onAbort && subscriber.signal) {
