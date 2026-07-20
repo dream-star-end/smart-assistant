@@ -159,6 +159,13 @@ export type UseChatSocket = {
     expected: TapePayloadExpectation,
     signal?: AbortSignal,
   ) => Promise<ChatMessage[] | null>;
+  /** Page-resident immutable tape payload for a virtual-row remount's first paint. */
+  peekTapeRecordPayload: (
+    sessId: string | undefined,
+    tapeId: string,
+    recordOrdinal: number,
+    expected: TapePayloadExpectation,
+  ) => ChatMessage[] | null;
   /** 按需读取、校验并解析一条超长 user 消息。 */
   fetchUserMessagePayload: (
     sessId: string | undefined,
@@ -166,6 +173,12 @@ export type UseChatSocket = {
     expected: TapePayloadExpectation,
     signal?: AbortSignal,
   ) => Promise<ChatMessage[] | null>;
+  /** Page-resident immutable user payload for a virtual-row remount's first paint. */
+  peekUserMessagePayload: (
+    sessId: string | undefined,
+    messageId: string,
+    expected: TapePayloadExpectation,
+  ) => ChatMessage[] | null;
   /** 删除某会话的本地持久副本（与 removeSession 配套）。*/
   removePersisted: (sessId: string) => void;
   /** 清空当前 user 命名空间（登出隐私收尾）。*/
@@ -177,6 +190,42 @@ export type UseChatSocket = {
 };
 
 const EMPTY_MESSAGES: ChatMessage[] = [];
+
+function tapePayloadCacheKey(
+  userId: string | null | undefined,
+  sessId: string,
+  tapeId: string,
+  recordOrdinal: number,
+  expected: TapePayloadExpectation,
+): string {
+  return JSON.stringify([
+    userId ?? "",
+    sessId,
+    "tape",
+    tapeId,
+    recordOrdinal,
+    expected.recordId,
+    expected.role,
+    expected.contentSha256 ?? "",
+  ]);
+}
+
+function userPayloadCacheKey(
+  userId: string | null | undefined,
+  sessId: string,
+  messageId: string,
+  expected: TapePayloadExpectation,
+): string {
+  return JSON.stringify([
+    userId ?? "",
+    sessId,
+    "user",
+    messageId,
+    expected.recordId,
+    expected.role,
+    expected.contentSha256 ?? "",
+  ]);
+}
 
 export function useChatSocket(opts: {
   auth: AuthSession | null;
@@ -691,14 +740,9 @@ export function useChatSocket(opts: {
     },
     [socket],
   );
-  // Virtuoso can unmount a large deferred row after it leaves overscan. Keep
-  // exactly the most recently decoded immutable record so scrolling back does
-  // not download and parse the same 50 MB payload again. One-entry replacement
-  // bounds memory independently of conversation length.
-  const deferredPayloadCacheRef = useRef<{
-    key: string;
-    records: ChatMessage[];
-  } | null>(null);
+  // Successfully verified immutable payloads stay resident for the page
+  // lifetime. Virtualization controls DOM cost, not whether content survives a
+  // scroll; refresh/logout/account switch is the cache boundary.
   const deferredPayloadQueueRef = useRef<DeferredPayloadQueue<ChatMessage[]> | null>(null);
   if (!deferredPayloadQueueRef.current) {
     deferredPayloadQueueRef.current = new DeferredPayloadQueue<ChatMessage[]>(2);
@@ -707,9 +751,8 @@ export function useChatSocket(opts: {
     return () => {
       tapePageLedgerRef.current.clear();
       deferredPayloadQueueRef.current?.cancelAll();
-      deferredPayloadCacheRef.current = null;
     };
-  }, [auth, userId]);
+  }, [userId]);
   const fetchTapeRecordPayload = useCallback<UseChatSocket["fetchTapeRecordPayload"]>(
     async (sessId, tapeId, recordOrdinal, expected, signal) => {
       const a = authRef.current;
@@ -718,20 +761,7 @@ export function useChatSocket(opts: {
         !Number.isInteger(recordOrdinal) || recordOrdinal < 0
       ) return null;
       const epoch = a.snapshot().epoch;
-      const cacheKey = JSON.stringify([
-        userId ?? "",
-        epoch,
-        sessId,
-        "tape",
-        tapeId,
-        recordOrdinal,
-        expected.recordId,
-        expected.role,
-        expected.contentSha256 ?? "",
-      ]);
-      if (deferredPayloadCacheRef.current?.key === cacheKey) {
-        return deferredPayloadCacheRef.current.records;
-      }
+      const cacheKey = tapePayloadCacheKey(userId, sessId, tapeId, recordOrdinal, expected);
       return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
         const payload = await api.getTapeRecordPayload(a, sessId, tapeId, recordOrdinal, queueSignal);
         const records = await parseTapeRecordPayload(payload, expected, queueSignal);
@@ -749,30 +779,29 @@ export function useChatSocket(opts: {
           _payloadBytes: undefined,
           _payloadSha256: undefined,
         }));
-        deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
         return hydrated;
       }, signal);
     },
-    [auth, userId],
+    [userId],
+  );
+  const peekTapeRecordPayload = useCallback<UseChatSocket["peekTapeRecordPayload"]>(
+    (sessId, tapeId, recordOrdinal, expected) => {
+      if (
+        !authRef.current || !sessId || !tapeId ||
+        !Number.isInteger(recordOrdinal) || recordOrdinal < 0
+      ) return null;
+      return deferredPayloadQueueRef.current!.peek(
+        tapePayloadCacheKey(userId, sessId, tapeId, recordOrdinal, expected),
+      );
+    },
+    [userId],
   );
   const fetchUserMessagePayload = useCallback<UseChatSocket["fetchUserMessagePayload"]>(
     async (sessId, messageId, expected, signal) => {
       const a = authRef.current;
       if (signal?.aborted || !a || !sessId || !messageId) return null;
       const epoch = a.snapshot().epoch;
-      const cacheKey = JSON.stringify([
-        userId ?? "",
-        epoch,
-        sessId,
-        "user",
-        messageId,
-        expected.recordId,
-        expected.role,
-        expected.contentSha256 ?? "",
-      ]);
-      if (deferredPayloadCacheRef.current?.key === cacheKey) {
-        return deferredPayloadCacheRef.current.records;
-      }
+      const cacheKey = userPayloadCacheKey(userId, sessId, messageId, expected);
       return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
         const payload = await api.getUserMessagePayload(a, sessId, messageId, queueSignal);
         const records = await parseTapeRecordPayload(payload, expected, queueSignal);
@@ -787,11 +816,19 @@ export function useChatSocket(opts: {
           _payloadBytes: undefined,
           _payloadSha256: undefined,
         }));
-        deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
         return hydrated;
       }, signal);
     },
-    [auth, userId],
+    [userId],
+  );
+  const peekUserMessagePayload = useCallback<UseChatSocket["peekUserMessagePayload"]>(
+    (sessId, messageId, expected) => {
+      if (!authRef.current || !sessId || !messageId) return null;
+      return deferredPayloadQueueRef.current!.peek(
+        userPayloadCacheKey(userId, sessId, messageId, expected),
+      );
+    },
+    [userId],
   );
   const storedMaxSeq = useCallback(
     (sessId: string | undefined) => {
@@ -817,7 +854,6 @@ export function useChatSocket(opts: {
     sigRef.current.clear();
     tapePageLedgerRef.current.clear();
     deferredPayloadQueueRef.current?.cancelAll();
-    deferredPayloadCacheRef.current = null;
     const st = storeRef.current;
     if (st) await st.wipe();
   }, []);
@@ -858,7 +894,9 @@ export function useChatSocket(opts: {
       loadOlderHistory,
       loadOlderTurnProcess,
       fetchTapeRecordPayload,
+      peekTapeRecordPayload,
       fetchUserMessagePayload,
+      peekUserMessagePayload,
       removePersisted,
       wipePersistence,
       sendRepoBind,
@@ -888,7 +926,9 @@ export function useChatSocket(opts: {
       loadOlderHistory,
       loadOlderTurnProcess,
       fetchTapeRecordPayload,
+      peekTapeRecordPayload,
       fetchUserMessagePayload,
+      peekUserMessagePayload,
       removePersisted,
       wipePersistence,
       sendRepoBind,

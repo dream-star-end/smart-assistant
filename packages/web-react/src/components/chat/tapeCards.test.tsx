@@ -173,6 +173,153 @@ describe("TurnProcessCard", () => {
       2, "turn-process:tape-1", "tape-1", 100,
     ));
   });
+
+  test("several visible initial tails load serially under one controller", async () => {
+    const observers: Array<{ trigger: () => void }> = [];
+    class FakeIntersectionObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {
+        observers.push({
+          trigger: () => this.callback(
+            [{ isIntersecting: true } as IntersectionObserverEntry],
+            this as unknown as IntersectionObserver,
+          ),
+        });
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    let finishFirst!: (value: { ok: boolean; nextCursor: null }) => void;
+    const firstPage = new Promise<{ ok: boolean; nextCursor: null }>((resolve) => {
+      finishFirst = resolve;
+    });
+    const onLoadOlderTape = vi.fn()
+      .mockReturnValueOnce(firstPage)
+      .mockResolvedValueOnce({ ok: true, nextCursor: null });
+    const paging = new UserUpwardPagingController();
+
+    render(
+      <div className="chat-scroll-area">
+        <TurnProcessCard msg={processControl()} cb={{ onLoadOlderTape }} paging={paging} />
+        <TurnProcessCard
+          msg={processControl({
+            id: "turn-process:tape-2",
+            _turnTapeId: "tape-2",
+            _turnTapeSha256: "sha-2",
+          })}
+          cb={{ onLoadOlderTape }}
+          paging={paging}
+        />
+      </div>,
+    );
+
+    act(() => observers.forEach((observer) => observer.trigger()));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+    expect(onLoadOlderTape).toHaveBeenNthCalledWith(1, "turn-process:tape-1", "tape-1", null);
+
+    await act(async () => finishFirst({ ok: true, nextCursor: null }));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
+    expect(onLoadOlderTape).toHaveBeenNthCalledWith(2, "turn-process:tape-2", "tape-2", null);
+  });
+
+  test("an initial tail that fails after virtual unmount is re-armed for remount", async () => {
+    const observers: Array<{ trigger: () => void }> = [];
+    class FakeIntersectionObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {
+        observers.push({
+          trigger: () => this.callback(
+            [{ isIntersecting: true } as IntersectionObserverEntry],
+            this as unknown as IntersectionObserver,
+          ),
+        });
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    let failUnmounted!: (value: { ok: false; error: true }) => void;
+    const firstPage = new Promise<{ ok: false; error: true }>((resolve) => {
+      failUnmounted = resolve;
+    });
+    const onLoadOlderTape = vi.fn()
+      .mockReturnValueOnce(firstPage)
+      .mockResolvedValueOnce({ ok: true, nextCursor: null });
+    const paging = new UserUpwardPagingController();
+    const mount = () => render(
+      <div className="chat-scroll-area">
+        <TurnProcessCard msg={processControl()} cb={{ onLoadOlderTape }} paging={paging} />
+      </div>,
+    );
+
+    const first = mount();
+    act(() => observers.at(-1)!.trigger());
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+    first.unmount();
+    mount();
+    act(() => observers.at(-1)!.trigger());
+    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
+    await act(async () => failUnmounted({ ok: false, error: true }));
+
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
+    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
+      2, "turn-process:tape-1", "tape-1", null,
+    );
+  });
+
+  test("a visible tail failure re-arms after its local retry UI is virtually unmounted", async () => {
+    const observers: Array<{ trigger: () => void }> = [];
+    class FakeIntersectionObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {
+        observers.push({
+          trigger: () => this.callback(
+            [{ isIntersecting: true } as IntersectionObserverEntry],
+            this as unknown as IntersectionObserver,
+          ),
+        });
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    const onLoadOlderTape = vi.fn()
+      .mockResolvedValueOnce({ ok: false, error: true })
+      .mockResolvedValueOnce({ ok: true, nextCursor: null });
+    const paging = new UserUpwardPagingController();
+    const mount = () => render(
+      <div className="chat-scroll-area">
+        <TurnProcessCard msg={processControl()} cb={{ onLoadOlderTape }} paging={paging} />
+      </div>,
+    );
+
+    const failed = mount();
+    act(() => observers.at(-1)!.trigger());
+    expect(await screen.findByRole("button", {
+      name: "更早记录加载失败，点击重试",
+    })).toBeInTheDocument();
+    failed.unmount();
+
+    mount();
+    act(() => observers.at(-1)!.trigger());
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
+    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
+      2, "turn-process:tape-1", "tape-1", null,
+    );
+  });
 });
 
 describe("deferred oversized immutable record", () => {
@@ -215,6 +362,31 @@ describe("deferred oversized immutable record", () => {
     fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
     expect(screen.getByText(/未来工具字段必须可见/)).toBeInTheDocument();
     expect(screen.queryByText(/前 4MB|内容过大|已截断/)).toBeNull();
+  });
+
+  test("a virtual remount paints a resident exact record synchronously without a loader or refetch", () => {
+    const resident: ChatMessage[] = [{
+      id: "srv-tool-large",
+      role: "tool",
+      text: "",
+      output: "页面内常驻的真实完整输出",
+      ts: 1000,
+      toolName: "Bash",
+      _completed: true,
+    }];
+    const onPeekTapeRecordPayload = vi.fn().mockReturnValue(resident);
+    const onFetchTapeRecordPayload = vi.fn();
+
+    renderMsg(deferred, { onPeekTapeRecordPayload, onFetchTapeRecordPayload });
+
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    expect(screen.queryByText("正在读取真实 Agent 记录…")).toBeNull();
+    expect(onFetchTapeRecordPayload).not.toHaveBeenCalled();
+    expect(onPeekTapeRecordPayload).toHaveBeenCalledWith(
+      "tape-1",
+      7,
+      { recordId: "srv-tool-large", role: "tool", contentSha256: "a".repeat(64) },
+    );
   });
 
   test("loads an oversized user message without requiring tape identity", async () => {

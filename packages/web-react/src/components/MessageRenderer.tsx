@@ -356,15 +356,28 @@ function DeferredTapeRecordCard({
   turnFinalAssistant,
 }: Omit<RendererProps, "sig" | "delegateCost">) {
   const ref = useRef<HTMLDivElement>(null);
-  const started = useRef(false);
-  const requestAbortRef = useRef<AbortController | null>(null);
-  const [records, setRecords] = useState<ChatMessage[] | null>(null);
-  const [failed, setFailed] = useState(false);
   const isUserPayload = message._userPayloadDeferred === true;
   const payloadId = isUserPayload ? message._userPayloadId ?? message.id : message.id;
   const payloadSha256 = message._payloadSha256;
   const tapeId = message._turnTapeId;
   const recordOrdinal = message._recordOrdinal;
+  const initialExpectation = {
+    recordId: payloadId,
+    role: message.role,
+    ...(payloadSha256 ? { contentSha256: payloadSha256 } : {}),
+  };
+  const [records, setRecords] = useState<ChatMessage[] | null>(() => {
+    if (isUserPayload) {
+      return cb.onPeekUserMessagePayload?.(payloadId, initialExpectation) ?? null;
+    }
+    if (tapeId && typeof recordOrdinal === "number") {
+      return cb.onPeekTapeRecordPayload?.(tapeId, recordOrdinal, initialExpectation) ?? null;
+    }
+    return null;
+  });
+  const started = useRef(records !== null);
+  const requestAbortRef = useRef<AbortController | null>(null);
+  const [failed, setFailed] = useState(false);
   const load = useCallback(async () => {
     if (started.current) return;
     const expected = {
@@ -854,14 +867,27 @@ export function MessageList({
     if (!scroller) return;
     let touchY: number | null = null;
     let touchUpSignaled = false;
+    let touchMomentum = false;
+    let touchIdleTimer: number | null = null;
     let wheelUpSignaled = false;
     let wheelIdleTimer: number | null = null;
+    let notifyFrame: number | null = null;
     let scrollbarPointerId: number | null = null;
     let pointerUpSignaled = false;
     const notifyRows = () => scroller.dispatchEvent(new Event("oc-upward-page-intent"));
+    const queueNotifyRows = () => {
+      if (notifyFrame !== null) return;
+      notifyFrame = window.requestAnimationFrame(() => {
+        notifyFrame = null;
+        notifyRows();
+      });
+    };
     const signalUpward = () => {
       processPaging.signalUpwardIntent();
-      notifyRows();
+      // Wheel/touch/key default scrolling runs after its input handler. Admit
+      // paging on the next frame so the viewport anchor is captured at the
+      // position the user actually reached, never at the pre-gesture offset.
+      queueNotifyRows();
     };
     const onWheel = (event: WheelEvent) => {
       // A trackpad/wheel gesture is a burst of events (including inertia), not
@@ -869,6 +895,8 @@ export function MessageList({
       if (event.deltaY < 0 && !wheelUpSignaled) {
         wheelUpSignaled = true;
         signalUpward();
+      } else {
+        processPaging.signalUserInteraction();
       }
       if (wheelIdleTimer !== null) window.clearTimeout(wheelIdleTimer);
       wheelIdleTimer = window.setTimeout(() => {
@@ -877,10 +905,17 @@ export function MessageList({
       }, 240);
     };
     const onTouchStart = (event: TouchEvent) => {
+      processPaging.signalUserInteraction();
+      touchMomentum = true;
+      if (touchIdleTimer !== null) {
+        window.clearTimeout(touchIdleTimer);
+        touchIdleTimer = null;
+      }
       touchY = event.touches[0]?.clientY ?? null;
       touchUpSignaled = false;
     };
     const onTouchMove = (event: TouchEvent) => {
+      touchMomentum = true;
       const nextY = event.touches[0]?.clientY ?? null;
       if (
         !touchUpSignaled && nextY !== null && touchY !== null &&
@@ -888,22 +923,46 @@ export function MessageList({
       ) {
         touchUpSignaled = true;
         signalUpward();
+      } else {
+        processPaging.signalUserInteraction();
       }
       touchY = nextY;
     };
     const endTouch = (event: TouchEvent) => {
       touchY = event.touches[0]?.clientY ?? null;
-      if (touchY === null) touchUpSignaled = false;
+      if (touchY === null) {
+        touchUpSignaled = false;
+        touchMomentum = true;
+        if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+        touchIdleTimer = window.setTimeout(() => {
+          touchIdleTimer = null;
+          touchMomentum = false;
+        }, 240);
+      }
     };
     const cancelTouch = () => {
       touchY = null;
       touchUpSignaled = false;
+      touchMomentum = false;
+      if (touchIdleTimer !== null) {
+        window.clearTimeout(touchIdleTimer);
+        touchIdleTimer = null;
+      }
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        !event.repeat &&
-        (event.key === "ArrowUp" || event.key === "PageUp" || event.key === "Home")
-      ) signalUpward();
+      const upward = event.key === "ArrowUp" || event.key === "PageUp" || event.key === "Home" ||
+        (event.key === " " && event.shiftKey);
+      const navigates = upward || event.key === "ArrowDown" || event.key === "PageDown" ||
+        event.key === "End" || event.key === " ";
+      if (event.repeat) {
+        if (navigates) processPaging.signalUserInteraction();
+        return;
+      }
+      if (upward) {
+        signalUpward();
+      } else if (navigates) {
+        processPaging.signalUserInteraction();
+      }
     };
     const onPointerDown = (event: PointerEvent) => {
       if (event.pointerType !== "mouse" || scrollbarPointerId !== null) return;
@@ -916,6 +975,7 @@ export function MessageList({
       if (!inScrollbarGutter) return;
       scrollbarPointerId = event.pointerId;
       pointerUpSignaled = false;
+      processPaging.signalUserInteraction();
       processPaging.syncScrollTop(scroller.scrollTop);
     };
     const endPointer = (event?: PointerEvent) => {
@@ -939,6 +999,14 @@ export function MessageList({
           notifyRows();
         }
       } else {
+        if (touchMomentum) {
+          processPaging.signalUserInteraction();
+          if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+          touchIdleTimer = window.setTimeout(() => {
+            touchIdleTimer = null;
+            touchMomentum = false;
+          }, 240);
+        }
         processPaging.syncScrollTop(scroller.scrollTop);
       }
     };
@@ -956,6 +1024,8 @@ export function MessageList({
     scroller.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       if (wheelIdleTimer !== null) window.clearTimeout(wheelIdleTimer);
+      if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+      if (notifyFrame !== null) window.cancelAnimationFrame(notifyFrame);
       scroller.removeEventListener("wheel", onWheel);
       scroller.removeEventListener("touchstart", onTouchStart);
       scroller.removeEventListener("touchmove", onTouchMove);

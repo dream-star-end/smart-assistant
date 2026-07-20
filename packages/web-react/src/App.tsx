@@ -1505,7 +1505,9 @@ export function App() {
   const {
     loadOlderTurnProcess,
     fetchTapeRecordPayload,
+    peekTapeRecordPayload,
     fetchUserMessagePayload,
+    peekUserMessagePayload,
   } = chat;
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
@@ -1521,10 +1523,18 @@ export function App() {
         ? undefined
         : (tapeId, recordOrdinal, expected, signal) =>
             fetchTapeRecordPayload(activeId, tapeId, recordOrdinal, expected, signal),
+      onPeekTapeRecordPayload: demo
+        ? undefined
+        : (tapeId, recordOrdinal, expected) =>
+            peekTapeRecordPayload(activeId, tapeId, recordOrdinal, expected),
       onFetchUserMessagePayload: demo
         ? undefined
         : (messageId, expected, signal) =>
             fetchUserMessagePayload(activeId, messageId, expected, signal),
+      onPeekUserMessagePayload: demo
+        ? undefined
+        : (messageId, expected) =>
+            peekUserMessagePayload(activeId, messageId, expected),
       resolveRetryTarget: demo ? undefined : resolveRetryTarget,
     }),
     [
@@ -1536,7 +1546,9 @@ export function App() {
       retrySend,
       loadOlderTurnProcess,
       fetchTapeRecordPayload,
+      peekTapeRecordPayload,
       fetchUserMessagePayload,
+      peekUserMessagePayload,
       activeId,
       resolveRetryTarget,
     ],
@@ -2070,7 +2082,7 @@ export function App() {
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}
                 scrollParent={chatScrollParent}
-                historyGeneration={activeSess?._historyRevision ?? "legacy"}
+                historyGeneration={`${activeId ?? "none"}::${activeSess?._historyRevision ?? "legacy"}`}
               />
             </ResponseRatingProvider>
           )}
