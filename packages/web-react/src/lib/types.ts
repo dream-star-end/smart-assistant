@@ -307,10 +307,10 @@ export type SessionDetail = {
   lastAt: number;
   messages: unknown[];
   updatedAt: number;
-  /** Projection revision paired with `maxSeq`; absent only on rolling old backends. */
+  /** History revision paired with `maxSeq`; absent only on rolling old backends. */
   historyRevision?: number;
   /** Client-local marker: incremental request hit a legacy backend and was retried full. */
-  _projectionRevisionUnsupported?: true;
+  _historyRevisionUnsupported?: true;
   isPartial: boolean;
   totalMessageCount: number;
   maxSeq: number;
@@ -331,33 +331,23 @@ export type SessionArchivePage = {
   messages: unknown[];
   hasMore: boolean;
   oldestSeq: number | null;
-  /** Projection revision captured with this page (rolling old backend may omit). */
+  /** History revision captured with this page (rolling old backend may omit). */
   historyRevision?: number;
 };
 
-/**
- * §9 折叠卷/截断记录展开:GET /api/sessions/:id/tape/:tapeId/records?cursor=<int>&limit=<int>。
- * `records` = 该 tape 的 chat-safe 投影记录一页(逐记录 ≤64KB 截断,截断处带 `_fullBytes`;绝不吐
- * exact 原始 payload);`nextCursor` = 下一页游标(null=已到末页);`total` = 该 tape 记录总数。
- * 单页 ≤200 行 / ≤1MB(server 上限)。鉴权走 (session_id,user_id,tape_id) 复合分租,越权/不存在统一 404。
- */
+/** 不可变 turn-tape 记录页。批次有界、总历史无上限。 */
 export type TapeRecordsPage = {
   records: unknown[];
   nextCursor: number | null;
   total: number;
 };
 
-/**
- * M-§9-1 超大内容"查看完整"按记录有界读:
- * GET /api/sessions/:id/tape/:tapeId/records?recordOrdinal=<n>&offset=<bytes>。
- * 返回该单条 record 的 chat-safe 展示文本一个字节窗口(`chunk`,≤256KB/请求,绝不整卷/整条 exact payload);
- * `nextOffset` = 下一窗口起始字节(null=读尽);`totalBytes` = 该记录展示文本总字节。
- * 路由层 per-user 令牌桶限频(10 req/10s,超限 429);越权/不存在/非收敛卷统一 404。
- */
-export type TapeRecordChunk = {
-  chunk: string;
-  nextOffset: number | null;
-  totalBytes: number;
+/** 单条记录的真实、脱敏后不可变 JSON payload。 */
+export type TapeRecordPayload = {
+  bytes: ArrayBuffer;
+  contentSha256: string;
+  recordId: string;
+  role: string;
 };
 
 /**

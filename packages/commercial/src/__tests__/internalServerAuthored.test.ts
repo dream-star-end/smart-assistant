@@ -505,6 +505,18 @@ describe("internalServerAuthored handler — lossless turn tape error classifica
     assert.equal(r.code, "TURN_TAPE_RETRYABLE");
   });
 
+  test("finalize: 当前物理容量不足 → 503 可重试而非永久冲突", async () => {
+    const handler = handlerThrowing("finalize", () => {
+      throw Object.assign(new Error("physical finalize capacity unavailable"), {
+        code: "OC_TURN_TAPE_FINALIZE_CAPACITY",
+        retryable: true,
+      });
+    });
+    const r = await run(handler, finalizeBody);
+    assert.equal(r.status, 503);
+    assert.equal(r.code, "TURN_TAPE_RETRYABLE");
+  });
+
   test("finalize: 校验冲突形态 → 仍 409 TURN_TAPE_CONFLICT", async () => {
     const handler = handlerThrowing("finalize", () => {
       throw new Error("lossless turn tape finalize header conflict");

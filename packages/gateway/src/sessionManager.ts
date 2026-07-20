@@ -7,6 +7,7 @@ import {
   type OpenClaudeConfig,
   appendServerAuthoredMessageDurable,
   getClientSession,
+  getEngineContextMessages,
   getMaxTurnIdx,
   indexTurn,
   MemoryDir,
@@ -50,6 +51,10 @@ import {
 import { failClosedOnRunningCasMiss } from './turnDispatchInbox.js'
 import {
   AUTHORITY_TURN_MAX_LIFETIME_MS,
+  modelHistoryRoleLabel,
+  modelHistorySemanticRole,
+  modelHistorySemanticText,
+  type ModelHistorySemanticRole,
   type TurnWaiveReason,
   type DurableAgentGroup,
   type DurableGoalUsageRecord,
@@ -248,19 +253,16 @@ export function historicalContextInjectionKey(opts: {
 export function buildHistoricalContextPrompt(
   messages: unknown[],
   currentUserText: string,
-  opts?: { maxChars?: number; maxMessages?: number },
 ): string | null {
-  const maxChars = opts?.maxChars ?? 14_000
-  const maxMessages = opts?.maxMessages ?? 40
   const currentNorm = normForCompare(currentUserText)
-  const rows: Array<{ role: 'user' | 'assistant'; text: string; status?: unknown }> = []
+  const rows: Array<{ role: ModelHistorySemanticRole; text: string; status?: unknown }> = []
   for (const raw of messages) {
     if (!raw || typeof raw !== 'object') continue
     const msg = raw as ChatHistoryMessage
     if (msg.system === true) continue
-    const role = msg.role === 'user' || msg.role === 'assistant' ? msg.role : null
+    const role = modelHistorySemanticRole(msg)
     if (!role) continue
-    const text = extractHistoryText(msg).trim()
+    const text = modelHistorySemanticText(msg).trim()
     if (!text) continue
     rows.push({ role, text, status: msg.status })
   }
@@ -275,26 +277,25 @@ export function buildHistoricalContextPrompt(
     if (!isCurrent) break
     rows.pop()
   }
-  let selected = rows.slice(-maxMessages)
-  while (selected.length > 0) {
-    const body = selected
-      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
-      .join('\n\n')
-    if (body.length <= maxChars) {
-      return [
-        '<openclaude_previous_context>',
-        'The current OpenClaude session was previously served by a different runner/provider or cannot be natively resumed. Use this transcript as prior conversation context. Do not restate it unless needed.',
-        body,
-        '</openclaude_previous_context>',
-        '',
-        '<current_user_message>',
-        currentUserText,
-        '</current_user_message>',
-      ].join('\n')
-    }
-    selected = selected.slice(1)
-  }
-  return null
+  if (rows.length === 0) return null
+  // Storage has already selected the exact contiguous semantic suffix against
+  // the executable model context window (including the current prompt and a
+  // per-record envelope allowance). Do not apply a second row/character cap
+  // here: doing so silently discarded already-approved tool/plan/goal/delegate
+  // facts at the final runner boundary.
+  const body = rows
+    .map((message) => `${modelHistoryRoleLabel(message.role)}: ${message.text}`)
+    .join('\n\n')
+  return [
+    '<openclaude_previous_context>',
+    'The current OpenClaude session was previously served by a different runner/provider or cannot be natively resumed. Use this transcript as prior conversation context. Do not restate it unless needed.',
+    body,
+    '</openclaude_previous_context>',
+    '',
+    '<current_user_message>',
+    currentUserText,
+    '</current_user_message>',
+  ].join('\n')
 }
 
 export function shouldAttemptHistoricalContextInjection(opts: {
@@ -3287,7 +3288,20 @@ export class SessionManager {
           const historyMessages =
             effectiveMasterHistoricalMessages ??
             mergePendingExternalHistory(
-              (await getClientSession(session.peerId, session.userId))?.messages ?? [],
+              (await getEngineContextMessages(
+                session.peerId,
+                session.userId ?? 'default',
+                {
+                  contextWindow:
+                    opts?.modelAuthority?.executionDescriptor.contextWindow ??
+                    (session.providerTag === 'codex' ? null : undefined),
+                  engine: session.providerTag,
+                  currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
+                  ...(opts?.replayLifecycle?.clientMessageId
+                    ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
+                    : {}),
+                },
+              )) ?? [],
             )
           const historicalPrompt = historyMessages && typeof userTextOrBlocks === 'string'
             ? buildHistoricalContextPrompt(historyMessages, userTextOrBlocks)

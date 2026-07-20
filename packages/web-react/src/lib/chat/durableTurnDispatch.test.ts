@@ -1,7 +1,7 @@
 /**
  * durable turn dispatch(RFC-v5-durable-turn-dispatch)前端行为断言。
  * 覆盖:hello 在飞身份上报、turn_state_unknown 对账+保发送态、reconcile 归属 exact 匹配、
- * REST 终态收敛(清发送态+user 行终态)、error projection 渲染/抑制、重试 clientMessageId 分流。
+ * REST 终态收敛(清发送态+user 行终态)、durable status 渲染/抑制、重试 clientMessageId 分流。
  *
  * 构造风格照 lib/chat/chat.test.ts:sess() / msgFrame() / FakeWS / makeSocket()。
  */
@@ -11,10 +11,9 @@ import { applyOutboundMessage } from "./reducer";
 import {
   collectResolvedDispatchTurnIds,
   errorPresentation,
-  isDispatchErrorProjectionRow,
   isDispatchLostCode,
   isDispatchTerminalRow,
-  isProjectionSuppressedByTerminal,
+  isTurnStatusSuppressedByTape,
 } from "./render";
 import { detectServerTerminalTurns } from "../persist";
 import { ChatSocket, messageAttemptIdempotencyKey, type ChatSocketDeps } from "./socket";
@@ -305,9 +304,16 @@ describe("reconcile turn_completed/interrupted 归属 exact 匹配 (RFC §4)", (
 
 // ═══════════════ 4. detectServerTerminalTurns + REST 终态收敛 ═══════════════
 describe("detectServerTerminalTurns (persist)", () => {
-  test("error projection 单行 → error", () => {
+  test("typed durable status 单行 → error", () => {
     const m = detectServerTerminalTurns([
-      srvRow({ id: "oc-dispatch-err:d1", _errorCode: "dispatch_lost", _clientMessageId: "cm1" }),
+      srvRow({
+        id: "turn-status:d1",
+        role: "system",
+        _turnStatusRecord: true,
+        _dispatchTerminal: true,
+        _errorCode: "dispatch_lost",
+        _clientMessageId: "cm1",
+      }),
     ]);
     expect(m.get("cm1")).toBe("error");
   });
@@ -315,9 +321,10 @@ describe("detectServerTerminalTurns (persist)", () => {
     const m = detectServerTerminalTurns([srvRow({ id: "srv-a-t1-s0", text: "答复", _clientMessageId: "cm1" })]);
     expect(m.get("cm1")).toBe("completed");
   });
-  test("completed 覆盖 error(真 tape 胜过残留投影)", () => {
+  test("completed 覆盖 error(真 tape 胜过短暂残留状态)", () => {
     const m = detectServerTerminalTurns([
-      srvRow({ id: "oc-dispatch-err:d1", _errorCode: "dispatch_lost", _clientMessageId: "cm1" }),
+      srvRow({ id: "turn-status:d1", role: "system", _turnStatusRecord: true, _dispatchTerminal: true,
+        _errorCode: "dispatch_lost", _clientMessageId: "cm1" }),
       srvRow({ id: "srv-a-t1-s0", text: "答复", _clientMessageId: "cm1" }),
     ]);
     expect(m.get("cm1")).toBe("completed");
@@ -334,7 +341,7 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     vi.unstubAllGlobals();
   });
 
-  test("error projection 到达 → 清发送态 + user 行置 error", () => {
+  test("durable failure status 到达 → 清发送态 + user 行置 error", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -348,7 +355,8 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     sock.applyServerMessages(
       "s1",
       "main",
-      [srvRow({ id: "oc-dispatch-err:d1", _seq: 2, _errorCode: "dispatch_lost", _clientMessageId: cmid })],
+      [srvRow({ id: "turn-status:d1", role: "system", _seq: 2, _turnStatusRecord: true,
+        _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: cmid })],
       true,
       2,
       { serverUpdatedAt: 100 },
@@ -398,7 +406,8 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     sock.applyServerMessages(
       "s1",
       "main",
-      [srvRow({ id: "oc-dispatch-err:dz", _seq: 2, _errorCode: "dispatch_lost", _clientMessageId: "cm-别的轮" })],
+      [srvRow({ id: "turn-status:dz", role: "system", _seq: 2, _turnStatusRecord: true,
+        _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: "cm-别的轮" })],
       true,
       2,
       { serverUpdatedAt: 100 },
@@ -408,8 +417,8 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
   });
 });
 
-// ═══════════════ 5. error projection 渲染映射 + 抑制 ═══════════════
-describe("error projection 渲染 (RFC §5)", () => {
+// ═══════════════ 5. durable status 渲染映射 + 抑制 ═══════════════
+describe("durable failure status 渲染 (RFC §5)", () => {
   test("errorPresentation dispatch_lost → 免单 tone + 未计费文案", () => {
     const p = errorPresentation("dispatch_lost", "", undefined);
     expect(p.waived).toBe(true);
@@ -421,9 +430,7 @@ describe("error projection 渲染 (RFC §5)", () => {
     expect(p.waived).toBe(true);
     expect(p.title).toBe("服务重启，本轮已中断");
   });
-  test("isDispatchErrorProjectionRow / isDispatchLostCode", () => {
-    expect(isDispatchErrorProjectionRow({ id: "oc-dispatch-err:d1" })).toBe(true);
-    expect(isDispatchErrorProjectionRow({ id: "srv-a-t1-s0" })).toBe(false);
+  test("isDispatchLostCode", () => {
     expect(isDispatchLostCode("dispatch_lost")).toBe(true);
     expect(isDispatchLostCode("SERVICE_RESTART")).toBe(true);
     expect(isDispatchLostCode("dispatch_not_accepted")).toBe(true); // MIN2
@@ -437,11 +444,9 @@ describe("error projection 渲染 (RFC §5)", () => {
     expect(p.message).toContain("未计费");
   });
   test("isDispatchTerminalRow 去枚举化重试判据(M5)", () => {
-    // ① projection id 前缀(code-agnostic:任意 error_code 都命中)。
-    expect(isDispatchTerminalRow({ id: "oc-dispatch-err:d1", _errorCode: "codex_pre_forward_abandoned" })).toBe(true);
-    // ② server 持久标记 _dispatchTerminal(非 projection 行也可携带)。
+    // ① server 持久标记 _dispatchTerminal(code-agnostic)。
     expect(isDispatchTerminalRow({ id: "srv-x", _dispatchTerminal: true })).toBe(true);
-    // ③ 不可变 tape 稳定协议码(service_restart / dispatch_not_accepted)。
+    // ② 不可变 tape 稳定协议码(service_restart / dispatch_not_accepted)。
     expect(isDispatchTerminalRow({ id: "srv-y", _errorCode: "SERVICE_RESTART" })).toBe(true);
     expect(isDispatchTerminalRow({ id: "srv-z", _errorCode: "dispatch_not_accepted" })).toBe(true);
     // 普通错误 / 无标记 → 不命中(不误伤,复用旧 id 走 dedup 保护)。
@@ -449,17 +454,19 @@ describe("error projection 渲染 (RFC §5)", () => {
     expect(isDispatchTerminalRow({ id: "srv-v" })).toBe(false);
     expect(isDispatchTerminalRow(null)).toBe(false);
   });
-  test("同 _clientMessageId 存在真 tape 生成行 → 抑制 projection(渲染层双保险)", () => {
-    const projection = srvRow({ id: "oc-dispatch-err:d1", _errorCode: "dispatch_lost", _clientMessageId: "cm1" });
+  test("同 _clientMessageId 存在真 tape 生成行 → 抑制 stale status(渲染层双保险)", () => {
+    const status = srvRow({ id: "turn-status:d1", role: "system", _turnStatusRecord: true,
+      _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: "cm1" });
     const completed = srvRow({ id: "srv-a-t1-s0", text: "答复", _clientMessageId: "cm1" });
-    const resolved = collectResolvedDispatchTurnIds([projection, completed]);
+    const resolved = collectResolvedDispatchTurnIds([status, completed]);
     expect(resolved.has("cm1")).toBe(true);
-    expect(isProjectionSuppressedByTerminal(projection, resolved)).toBe(true);
+    expect(isTurnStatusSuppressedByTape(status, resolved)).toBe(true);
   });
-  test("仅 projection(无真 tape 行)→ 不抑制,错误卡正常渲染", () => {
-    const projection = srvRow({ id: "oc-dispatch-err:d1", _errorCode: "dispatch_lost", _clientMessageId: "cm1" });
-    const resolved = collectResolvedDispatchTurnIds([projection]);
-    expect(isProjectionSuppressedByTerminal(projection, resolved)).toBe(false);
+  test("仅 durable status(无真 tape 行)→ 不抑制,状态卡正常渲染", () => {
+    const status = srvRow({ id: "turn-status:d1", role: "system", _turnStatusRecord: true,
+      _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: "cm1" });
+    const resolved = collectResolvedDispatchTurnIds([status]);
+    expect(isTurnStatusSuppressedByTape(status, resolved)).toBe(false);
   });
 });
 
@@ -470,7 +477,7 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     vi.unstubAllGlobals();
   });
 
-  test("dispatch 终态失败 → 铸新 clientMessageId(新逻辑 turn)+ 清旧轮 projection 残留", () => {
+  test("dispatch 终态失败 → 铸新 clientMessageId(新逻辑 turn)+ 清旧轮 status", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -480,12 +487,13 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     const s = sock.sessions.get("s1")!;
     const userMsg = s.messages.find((m) => m.role === "user")!;
     const oldId = userMsg.id;
-    // 模拟 dispatch 终态:发送态清空、user 行 error、projection 行到位。
+    // 模拟 dispatch 终态:发送态清空、user 行 error、durable status 到位。
     userMsg.status = "error";
     s._sendingInFlight = false;
     s._activeClientMessageId = undefined;
     s.messages.push(
-      srvRow({ id: "oc-dispatch-err:d1", _seq: 2, _errorCode: "dispatch_lost", _clientMessageId: oldId }),
+      srvRow({ id: "turn-status:d1", role: "system", _seq: 2, _turnStatusRecord: true,
+        _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: oldId }),
     );
     ws.sent.length = 0;
 
@@ -499,9 +507,61 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     // 新逻辑 turn 从 attempt 0 起,幂等键绑新 id。
     expect(inbound.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMsg.id, 0));
     expect(userMsg._sendAttempt).toBe(0);
-    // 旧轮 projection 残留被清。
-    expect(s.messages.some((m) => m.id === "oc-dispatch-err:d1")).toBe(false);
+    // 旧轮 status 被清。
+    expect(s.messages.some((m) => m.id === "turn-status:d1")).toBe(false);
     sock.stop();
+  });
+
+  test("deferred + dispatch 终态 + offline 后 reload 仍保留旧 exact sidecar locator", () => {
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    const s = sock.sessions.get("s1")!;
+    const staleId = "cm-deferred-terminal";
+    const locator = addMessage(s, "user", "", {
+      id: staleId,
+      status: "error",
+      _source: "server",
+      _payloadDeferred: true,
+      _userPayloadDeferred: true,
+      _userPayloadId: staleId,
+      _payloadBytes: 8_000_000,
+      _payloadSha256: "a".repeat(64),
+      _routing: { model: "gpt-5.6-terra", teamMode: false, effortLevel: "high" },
+      _deferredRetryEligible: true,
+    });
+    s.messages.push(srvRow({
+      id: "turn-status:deferred",
+      role: "system",
+      _turnStatusRecord: true,
+      _dispatchTerminal: true,
+      _clientMessageId: staleId,
+    }));
+    const exact = {
+      ...locator,
+      text: "旧 sidecar 中的完整超长提问",
+      _payloadDeferred: undefined,
+      _userPayloadDeferred: undefined,
+    } satisfies ChatMessage;
+
+    // No open WebSocket: the fresh dispatch cannot create its server sidecar.
+    sock.retryMessage({ sessId: "s1", msgId: staleId, agentId: "main", sourceOverride: exact });
+    expect(locator.id).not.toBe(staleId);
+    expect(locator.status).toBe("queued");
+    expect(locator._userPayloadId).toBe(staleId);
+
+    const stored = sock.toStored("s1")!;
+    const persisted = stored.messages.find((message) => message.id === locator.id)!;
+    expect(persisted._userPayloadId).toBe(staleId);
+    expect(persisted.text).toBe("");
+
+    const reloaded = makeSocket();
+    reloaded.loadStored(stored);
+    const restored = reloaded.sessions.get("s1")!.messages.find((message) => message.id === locator.id)!;
+    expect(restored._userPayloadDeferred).toBe(true);
+    expect(restored._userPayloadId).toBe(staleId);
+    expect(restored.text).toBe("");
+    sock.stop();
+    reloaded.stop();
   });
 
   test("resend-uncertain(普通发送失败)→ 复用旧 id + attempt 递增(dedup 保护)", () => {

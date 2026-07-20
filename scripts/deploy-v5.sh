@@ -659,8 +659,8 @@ if (min === undefined) {
     actual.every((v) => fs.statSync(path.join(dir, `${v}.sql`)).isFile())
   if (!immutableLegacyRelease) throw new Error('legacy migration manifest requires the exact captured predecessor')
   if (!validCapabilities) throw new Error('invalid legacy capabilities')
-  if (capabilities.includes('history-projection-revision-v1'))
-    throw new Error('legacy migration manifest cannot declare history projection capability')
+  if (capabilities.includes('history-projection-revision-v1') || capabilities.includes('direct-turn-timeline-v1'))
+    throw new Error('legacy migration manifest cannot declare a post-floor history capability')
   if (!validLegacyMigrations) throw new Error('invalid legacy requiredMigrations')
 } else {
   if (typeof min !== 'string' || !/^[0-9]{4}_[a-z0-9_]+$/.test(min))
@@ -1610,9 +1610,9 @@ recover_cutover() {
   require_mutation_lease_for_compensation "offline-cutover-recovery" || exit 86
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] recover old activation and start $V5_UNIT ($reason)"; return 0; }
   echo "⚠ 离线步骤失败，恢复旧激活面并启动旧服务：$reason" >&2
-  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$HISTORY_PROJECTION_REVISION_CAP" <<'REMOTE'
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$DIRECT_TURN_TIMELINE_CAP" <<'REMOTE'
 set -Eeuo pipefail
-root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"; history_cap="${10}"
+root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"; maintenance_lock="$9"; direct_cap="${10}"
 mkdir -p "$(dirname "$lock")"; touch "$lock"; chmod 600 "$lock"; exec 9>"$lock"; flock -x 9
 mkdir -p -m 700 "$(dirname "$marker")"; touch "$maintenance_lock"; chmod 600 "$maintenance_lock"
 exec 8>"$maintenance_lock"; flock -x 8
@@ -1702,21 +1702,21 @@ if [[ "$secure" == 1 ]]; then
     elif (.candidate_start_attempted // false) == false then "false"
     else error("invalid candidate_start_attempted") end
   ' "$bundle/state.json")"
-  # Once the candidate may have served, history_revision is an irreversible
-  # projection protocol floor. If the trusted old source is legacy but the
-  # stopped current source is capable, restore/restart current rather than
-  # silently serving stale projections from the old bundle.
+  # Once the candidate may have served, direct timeline is an irreversible UI
+  # data floor. If the trusted old source is legacy but the stopped current
+  # source is capable, restore/restart current rather than hide statuses that
+  # were written without legacy shadow rows.
   old_metadata="$bundle/source/deploy/v5/release-metadata.json"
-  old_history_capability="$(jq -er --arg c "$history_cap" '(.capabilities // []) as $caps
+  old_direct_capability="$(jq -er --arg c "$direct_cap" '(.capabilities // []) as $caps
     | if ($caps | type) != "array" then error("capabilities must be an array")
       elif (($caps | index($c)) != null) then "capable" else "incapable" end' "$old_metadata")"
-  if [[ "$candidate_start_attempted" == true && "$old_history_capability" == incapable ]]; then
+  if [[ "$candidate_start_attempted" == true && "$old_direct_capability" == incapable ]]; then
     current_metadata="$remote_src/deploy/v5/release-metadata.json"
-    current_history_capability="$(jq -er --arg c "$history_cap" '(.capabilities // []) as $caps
+    current_direct_capability="$(jq -er --arg c "$direct_cap" '(.capabilities // []) as $caps
       | if ($caps | type) != "array" then error("capabilities must be an array")
         elif (($caps | index($c)) != null) then "capable" else "incapable" end' "$current_metadata")"
-    if [[ "$current_history_capability" != incapable ]]; then
-      echo "FATAL: refusing irreversible history projection downgrade during offline recovery" >&2
+    if [[ "$current_direct_capability" != incapable ]]; then
+      echo "FATAL: refusing irreversible direct turn timeline downgrade during offline recovery" >&2
       rollback_partial 1
     fi
   fi
@@ -2728,19 +2728,19 @@ assert_release_capability_for_sessions_pg() {
 LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
 LOSSLESS_RUNTIME_BATCH_CAP="lossless-turn-runtime-batch-v1"
 LOSSLESS_RUNTIME_BATCH_ENV="LOSSLESS_TURN_TAPE_RUNTIME_BATCHING"
-HISTORY_PROJECTION_REVISION_CAP="history-projection-revision-v1"
+DIRECT_TURN_TIMELINE_CAP="direct-turn-timeline-v1"
 
-# history_revision makes projection-only mutations and authoritative removals
-# visible to incremental clients. A legacy master ignores that revision and can
-# therefore serve a stale projection. First adoption is single-master and the
-# capability floor is irreversible: even revision zero is not downgrade-safe,
-# because an offline new client may later reconnect after legacy-only writes.
-probe_release_history_projection_revision() { # $1=release; 0=present,1=absent,2=unknown
+# A direct-timeline master records verified failures only in turn_dispatches
+# and serves immutable process rows directly from the tape. A projection-era
+# master cannot display failures created after that switch, so mixed masters or
+# rollback after the new reader/writer may serve would restore the broken UX.
+# First adoption is therefore single-master and this floor is irreversible.
+probe_release_direct_turn_timeline() { # $1=release; 0=present,1=absent,2=unknown
   local reldir="$1" result="" rc=0
   if result="$(ssh "$KL_HOST" "set -e
       metadata='$reldir/deploy/v5/release-metadata.json'
       [ -r \"\$metadata\" ]
-      jq -er --arg c '$HISTORY_PROJECTION_REVISION_CAP' '(.capabilities // []) as \$caps
+      jq -er --arg c '$DIRECT_TURN_TIMELINE_CAP' '(.capabilities // []) as \$caps
         | if (\$caps | type) != \"array\" then error(\"capabilities must be an array\")
           elif ((\$caps | index(\$c)) != null) then \"capable\"
           else \"incapable\"
@@ -2758,37 +2758,37 @@ probe_release_history_projection_revision() { # $1=release; 0=present,1=absent,2
   esac
 }
 
-assert_history_projection_revision_pair() { # $1=live $2=target $3=context
+assert_direct_turn_timeline_pair() { # $1=live $2=target $3=context
   local live="$1" target="$2" context="${3:-transition}" live_rc=0 target_rc=0
-  probe_release_history_projection_revision "$live" || live_rc=$?
-  probe_release_history_projection_revision "$target" || target_rc=$?
+  probe_release_direct_turn_timeline "$live" || live_rc=$?
+  probe_release_direct_turn_timeline "$target" || target_rc=$?
   if [[ $live_rc -eq 2 || $target_rc -eq 2 ]]; then
-    echo "✗ $context 无法核验 $HISTORY_PROJECTION_REVISION_CAP(live_rc=$live_rc target_rc=$target_rc),fail-closed。" >&2
+    echo "✗ $context 无法核验 $DIRECT_TURN_TIMELINE_CAP(live_rc=$live_rc target_rc=$target_rc),fail-closed。" >&2
     return 1
   fi
   if [[ $live_rc -ne $target_rc ]]; then
-    echo "✗ $context 的 live/target history projection 代际不一致；禁止双 master 或自动 saga 回切(live_rc=$live_rc target_rc=$target_rc)。" >&2
+    echo "✗ $context 的 live/target direct timeline 代际不一致；禁止双 master 或自动 saga 回切(live_rc=$live_rc target_rc=$target_rc)。" >&2
     return 1
   fi
-  echo "  ✓ $context 的 live/target history projection 代际一致。"
+  echo "  ✓ $context 的 live/target direct timeline 代际一致。"
 }
 
-assert_history_projection_revision_offline_target() { # $1=target $2=previous; caller proved master inactive
-  prepare_history_projection_revision_activation "$1" "$2"
+assert_direct_turn_timeline_offline_target() { # $1=target $2=previous; caller proved master inactive
+  prepare_direct_turn_timeline_activation "$1" "$2"
 }
 
-prepare_history_projection_revision_activation() { # $1=target $2=current
+prepare_direct_turn_timeline_activation() { # $1=target $2=current
   local target="$1" current="$2" target_rc=0 current_rc=0
-  probe_release_history_projection_revision "$target" || target_rc=$?
+  probe_release_direct_turn_timeline "$target" || target_rc=$?
   case "$target_rc" in
     0) return 0 ;;
     2)
-      echo "✗ 目标 release 的 $HISTORY_PROJECTION_REVISION_CAP 状态不可核验:$target" >&2
+      echo "✗ 目标 release 的 $DIRECT_TURN_TIMELINE_CAP 状态不可核验:$target" >&2
       return 1 ;;
   esac
-  probe_release_history_projection_revision "$current" || current_rc=$?
+  probe_release_direct_turn_timeline "$current" || current_rc=$?
   [[ $current_rc -eq 1 ]] && return 0
-  echo "✗ 拒绝不可逆 history projection 降级:current_rc=$current_rc；旧 master 会绕过 projection revision（即使当前 revision 全为 0 也不安全）。" >&2
+  echo "✗ 拒绝不可逆 direct turn timeline 降级:current_rc=$current_rc；旧 master 无法显示新 direct 状态（即使当前没有失败行也存在首写竞态）。" >&2
   return 1
 }
 
@@ -4161,8 +4161,8 @@ assert_release_activation_compensation_compatible() {  # $1=old_release $2=candi
     fi
     echo "  ✓ 自动补偿目标 master/runtime 均具备 $LOSSLESS_TURN_TAPE_CAP(无条件检查,无首写竞态)。" >&2
   fi
-  if ! prepare_history_projection_revision_activation "$old_release" "$candidate_release"; then
-    mark_deploy_recovery_required "history projection revision prevents automatic compensation to old master:$old_release"
+  if ! prepare_direct_turn_timeline_activation "$old_release" "$candidate_release"; then
+    mark_deploy_recovery_required "direct turn timeline prevents automatic compensation to old master:$old_release"
     return 1
   fi
 }
@@ -4264,7 +4264,7 @@ activate_release() {
   [[ "$ACTIVE_SLOT" == A ]] && old_prev_file="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
   # 前端资产先于任何 live 翻转就位；失败仅留下加法式孤儿资产，无运行态变化。
   sync_assets_to_pool "$reldir" || return 1
-  prepare_history_projection_revision_activation "$reldir" "$prev" || return 1
+  prepare_direct_turn_timeline_activation "$reldir" "$prev" || return 1
   tmplink="$ACTIVE_SRC.newlink.$$"
   # A slot:同时写 .prev-release 文件(传统 lane 兼容兜底);B slot:rollback 权威在 deploy_state.previous_active_release,不写文件(不污染 A 的兜底)。
   local prev_file_cmd=""
@@ -4565,7 +4565,7 @@ activate_runtime_tuple() {
   assert_release_marker "$prev_src" || {
     echo "✗ hotcfg 激活前 exact predecessor marker 无效:$prev_src" >&2; return 1;
   }
-  assert_history_projection_revision_pair "$prev_src" "$BUILT_RELEASE" "runtime hotcfg activation" || return 1
+  assert_direct_turn_timeline_pair "$prev_src" "$BUILT_RELEASE" "runtime hotcfg activation" || return 1
   # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
   if [[ "$ACTIVE_SLOT" == A ]]; then
     old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
@@ -5740,15 +5740,15 @@ deploy() {
   if hotcfg_bundle_axis_on; then hc_bundle=1; hc_any=1; fi
   if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
   [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
-  if [[ "$hc_any" == 1 ]] && ! assert_history_projection_revision_pair "$kp_previous_release" "$BUILT_RELEASE" "runtime hotcfg activation"; then
+  if [[ "$hc_any" == 1 ]] && ! assert_direct_turn_timeline_pair "$kp_previous_release" "$BUILT_RELEASE" "runtime hotcfg activation"; then
     if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
-      echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
+      echo "✗ 首次 direct timeline capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
       exit 1
     fi
     # The hotcfg saga may automatically restore the old master after the new
     # process has served. Across this irreversible floor, first adoption uses
     # the ordinary single-master restart and leaves the runtime tuple unchanged.
-    echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
+    echo "  · 首次 direct timeline capability 升级改走普通单-master restart；runtime tuple 保持不变。"
     hc_bundle=0; hc_release=0; hc_any=0
   fi
   if [[ "$hc_any" == 1 ]]; then
@@ -6095,7 +6095,7 @@ activate_staged_inner() {
   fi
   # RFC §1.2:此处 sshk start 是 staged lane 的真正激活翻转点(unit 从停机→起旧同构状态)。翻转前
   # 活体断言远端 lease;此刻 unit 仍停(live 未改),失活即 rc=86，wrapper 明确跳过 recover_cutover。
-  assert_history_projection_revision_offline_target "$REMOTE_SRC" "$CUTOVER_ROOT/$CUTOVER_NONCE/source" || return 1
+  assert_direct_turn_timeline_offline_target "$REMOTE_SRC" "$CUTOVER_ROOT/$CUTOVER_NONCE/source" || return 1
   assert_mutation_lease_alive "activate-staged-flip" || { echo "✗ production-mutation lease 失活;crash-stop staged(unit 仍停,live 未改)" >&2; exit 86; }
   mark_cutover_candidate_start_attempted || return 1
   echo "── start openclaude-v5(同构状态一次性激活)──"
@@ -6168,12 +6168,12 @@ deploy_dist() {
     local dist_previous_release=""
     dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
     [[ -n "$dist_previous_release" ]] || { echo "✗ --dist 无法解析当前 live release" >&2; exit 1; }
-    if ! assert_history_projection_revision_pair "$dist_previous_release" "$BUILT_RELEASE" "runtime hotcfg dist activation"; then
+    if ! assert_direct_turn_timeline_pair "$dist_previous_release" "$BUILT_RELEASE" "runtime hotcfg dist activation"; then
       if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
-        echo "✗ 首次 history projection capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
+        echo "✗ 首次 direct timeline capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
         exit 1
       fi
-      echo "  · 首次 history projection capability 升级改走普通单-master restart；runtime tuple 保持不变。"
+      echo "  · 首次 direct timeline capability 升级改走普通单-master restart；runtime tuple 保持不变。"
       hc_bundle=0; hc_release=0; hc_any=0
     fi
   fi
@@ -6554,9 +6554,9 @@ rollback_runtime_tuple() {
       kp_plugin_bracket=0
     fi
   fi
-  if ! prepare_history_projection_revision_activation "$master" "$prev_src"; then
+  if ! prepare_direct_turn_timeline_activation "$master" "$prev_src"; then
     if [[ "$kp_plugin_bracket" == 1 && "$plugin_previous_exists" == 1 ]]; then
-      require_mutation_lease_for_compensation "tuple-rollback-projection-compensation" || exit 86
+      require_mutation_lease_for_compensation "tuple-rollback-timeline-compensation" || exit 86
       knowledge_planet_plugin_transition_to_release "$plugin_helper" "$prev_src" \
         && knowledge_planet_plugin_open_gate_to_release "$plugin_helper" "$prev_src" \
         || knowledge_planet_plugin_open_gate_current "$plugin_helper" \
@@ -6782,7 +6782,7 @@ capability_matrix_preflight() {
   ssh "$KL_HOST" "jq -e '(.capabilities // []) | index(\"dual-master-v1\")' '$cma'" >/dev/null 2>&1 \
     || { echo "✗ active release 未声明 dual-master-v1 —— 双 master 不兼容,拒绝 canary(active 须先经基建版升级)" >&2; return 1; }
   assert_lossless_canary_pair "$active_rel" "$candidate_rel" || return 1
-  assert_history_projection_revision_pair "$active_rel" "$candidate_rel" "canary" || return 1
+  assert_direct_turn_timeline_pair "$active_rel" "$candidate_rel" "canary" || return 1
   # ③ 版本字段兼容(MAJOR 7):bridgeFrameSchema / runtimeApi
   local key av cv
   for key in bridgeFrameSchema runtimeApi; do
@@ -7097,10 +7097,10 @@ canary() {
   assert_lossless_turn_tape_floor "$reldir"
   # cutover 后 P3 candidate 也是一条真实激活路径；不能绕过模型权威兼容地板。
   assert_model_authority_floor "$reldir"
-  # Projection generations may not be started side-by-side. First adoption
+  # Direct-timeline generations may not be started side-by-side. First adoption
   # must use the ordinary single-master restart lane.
-  assert_history_projection_revision_pair "$DS_active_release" "$reldir" "canary pre-start" || {
-    echo "✗ history projection 代际不兼容;candidate 尚未初始化/启动,回 stable" >&2
+  assert_direct_turn_timeline_pair "$DS_active_release" "$reldir" "canary pre-start" || {
+    echo "✗ direct timeline 代际不兼容;candidate 尚未初始化/启动,回 stable" >&2
     recover_canary_prep "$cand"
     exit 1
   }

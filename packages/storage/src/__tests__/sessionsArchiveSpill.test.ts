@@ -28,15 +28,59 @@ const {
   appendServerAuthoredMessage,
   ARCHIVE_CHUNK_MAX_BYTES,
   ARCHIVE_CHUNK_MAX_MSGS,
+  bumpClientSessionHistoryRevision,
   getClientSession,
   getClientSessionPartial,
   getSessionsDb,
   readArchivedMessages,
+  selectEngineContextSuffix,
   SESSION_TAIL_MIN_MSGS,
   SESSION_SOFT_TRIM_BYTES,
   SESSION_TAIL_TARGET_BYTES,
   upsertClientSession,
 } = await import('../sessionsDb.js')
+
+describe('model-context suffix selection', () => {
+  it('retains browser-visible semantic execution facts across provider switches', () => {
+    const selected = selectEngineContextSuffix([
+      { id: 'thinking', role: 'thinking', text: 'private reasoning' },
+      { id: 'tool', role: 'tool', toolName: 'Read', inputJson: { file_path: '/tmp/a' }, output: 'exact file' },
+      { id: 'plan', role: 'plan', text: 'finish release', steps: [{ step: 'deploy', status: 'completed' }] },
+      { id: 'delegate', role: 'agent-group', text: 'review', childBlocks: [{ kind: 'text', text: 'exact review' }] },
+    ])
+    assert.equal(selected.truncated, false)
+    assert.deepEqual(selected.messages.map((message) => message.id), ['tool', 'plan', 'delegate'])
+  })
+
+  it('uses remaining model window for an exact suffix of the long boundary row', () => {
+    const tail = 'STORAGE-BOUNDARY-TAIL'
+    const selected = selectEngineContextSuffix([
+      { id: 'old-long', role: 'assistant', text: `${'界'.repeat(20_000)}${tail}` },
+      { id: 'new-user', role: 'user', text: 'new question' },
+      { id: 'new-answer', role: 'assistant', text: 'new answer' },
+    ], { contextWindow: 12_000, currentUserText: 'continue' })
+    assert.equal(selected.truncated, true)
+    assert.deepEqual(selected.messages.map((message) => message.id), [
+      'old-long', 'new-user', 'new-answer',
+    ])
+    assert.match(String(selected.messages[0]?.text), /Earlier bytes.*STORAGE-BOUNDARY-TAIL/s)
+  })
+
+  it('does not leak a structured boundary row beyond the physical model window', () => {
+    const exactTail = 'TOOL-BOUNDARY-TAIL'
+    const selected = selectEngineContextSuffix([
+      {
+        id: 'long-tool',
+        role: 'tool',
+        toolName: 'Bash',
+        output: `${'界'.repeat(20_000)}${exactTail}`,
+      },
+    ], { contextWindow: 12_000, currentUserText: 'continue' })
+    assert.equal(selected.truncated, true)
+    assert.equal(selected.messages[0]?.output, undefined)
+    assert.match(String(selected.messages[0]?.text), /Earlier bytes.*TOOL-BOUNDARY-TAIL/s)
+  })
+})
 
 type Msg = {
   id: string
@@ -287,7 +331,7 @@ describe('PUT 防复活', () => {
   })
 })
 
-describe('browser chat projection (SQLite compatibility)', () => {
+describe('browser direct timeline (SQLite compatibility)', () => {
   it('legacy hot rows derive order from durable array once and freeze it on the next write', async () => {
     const sessId = 'web-legacy-order'
     await upsertClientSession({
@@ -321,9 +365,9 @@ describe('browser chat projection (SQLite compatibility)', () => {
     assert.deepEqual(frozen.map((m) => m._orderSeq), [1, 2, 3])
   })
 
-  it('exact keeps raw runtime payload while chat returns only sanitized patch/checkpoint', async () => {
+  it('timeline returns the same real runtime records as exact reads', async () => {
     await upsertClientSession({
-      id: 'web-chat-projection', userId: USER, agentId: 'main', title: 't', pinned: false,
+      id: 'web-chat-direct-tape', userId: USER, agentId: 'main', title: 't', pinned: false,
       createdAt: 1, lastAt: 2, messages: [], updatedAt: 1,
     }, 0)
     const raw = [
@@ -344,25 +388,42 @@ describe('browser chat projection (SQLite compatibility)', () => {
     const db = await getSessionsDb()
     db.prepare(
       'UPDATE client_sessions SET messages=?, message_count=?, next_seq=? WHERE id=? AND user_id=?',
-    ).run(JSON.stringify(raw), raw.length, 3, 'web-chat-projection', USER)
+    ).run(JSON.stringify(raw), raw.length, 3, 'web-chat-direct-tape', USER)
 
-    const exact = await getClientSession('web-chat-projection', USER)
+    const exact = await getClientSession('web-chat-direct-tape', USER)
     assert.equal((exact!.messages[0] as Msg)._runtimeEvent !== undefined, true)
-    const chat = await getClientSession('web-chat-projection', USER, { projection: 'chat' })
-    const chatMessages = chat!.messages as Msg[]
-    assert.equal(chatMessages.some((message) => message._runtimeEvent !== undefined), false)
-    assert.deepEqual(chatMessages.map((message) =>
-      (message._historyProjection as { kind: string }).kind), ['checkpoint', 'bash-tail'])
+    const timeline = await getClientSession('web-chat-direct-tape', USER, { view: 'timeline' })
+    const timelineMessages = timeline!.messages as Msg[]
+    assert.deepEqual(timelineMessages, exact!.messages)
 
     const partial = await getClientSessionPartial(
-      'web-chat-projection', USER, 1, {
-        projection: 'chat',
-        sinceHistoryRevision: chat!.historyRevision,
+      'web-chat-direct-tape', USER, 1, {
+        view: 'timeline',
+        sinceHistoryRevision: timeline!.historyRevision,
       },
     )
     assert.equal(partial!.isPartial, true)
     assert.equal(partial!.maxSeq, 2)
-    assert.equal((partial!.messages[0] as Msg)._historyProjection !== undefined, true)
+    assert.equal((partial!.messages[0] as Msg).id, 'raw-tail')
+    assert.equal((partial!.messages[0] as Msg)._runtimeEvent !== undefined, true)
+  })
+
+  it('external direct-timeline status invalidates the incremental cursor without adding content', async () => {
+    const sessId = 'web-history-revision'
+    await upsertClientSession({
+      id: sessId, userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: [], updatedAt: 1,
+    }, 0)
+    const before = await getClientSession(sessId, USER)
+    assert.ok(before)
+
+    assert.equal(await bumpClientSessionHistoryRevision(sessId, USER), true)
+    const after = await getClientSession(sessId, USER)
+    assert.ok(after)
+    assert.equal(after.historyRevision, (before.historyRevision ?? 0) + 1)
+    assert.ok(after.updatedAt > before.updatedAt)
+    assert.deepEqual(after.messages, [])
+    assert.equal(await bumpClientSessionHistoryRevision('missing-session', USER), false)
   })
 })
 
@@ -593,7 +654,7 @@ describe('history revision — 增量安全栅栏', () => {
     })
     assert.equal(matching?.isPartial, true)
 
-    // A normal append is represented by a fresh `_seq`, so the projection
+    // A normal append is represented by a fresh `_seq`, so the history
     // revision must stay stable and incremental mode remains useful.
     assert.equal(await upsertClientSession({
       ...full,

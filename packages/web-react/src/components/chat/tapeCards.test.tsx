@@ -1,7 +1,4 @@
-/**
- * §9 折叠卷卡(CollapseCard)+ 截断工具卡尾部组件断言。
- * MessageRenderer 对 `_tapeCollapsed` 的拦截、折叠/展开两态渲染、点击展开回调、截断"查看完整"抓取。
- */
+/** Direct timeline cards: process cursor, deferred exact record, runtime event. */
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
@@ -9,6 +6,7 @@ import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
 import { MessageRenderer } from "../MessageRenderer";
 import type { CardCallbacks } from "./cards";
+import { ResponseRatingProvider } from "./ResponseRating";
 
 afterEach(cleanup);
 beforeAll(async () => {
@@ -29,15 +27,16 @@ function renderMsg(message: ChatMessage, cb: CardCallbacks = {}) {
   );
 }
 
-function collapsedAnchor(over: Partial<ChatMessage> = {}): ChatMessage {
+function processControl(over: Partial<ChatMessage> = {}): ChatMessage {
   return {
-    id: "srv-a-t1-s0",
-    role: "assistant",
+    id: "turn-process:tape-1",
+    role: "runtime-event",
     text: "",
     ts: 1000,
     _source: "server",
-    _tapeCollapsed: true,
-    _tapeTotalBytes: 192 * 1024 * 1024,
+    _turnTapeProcess: true,
+    _turnTapeProcessCount: 873,
+    _turnTapeTotalBytes: 192 * 1024 * 1024,
     _dispatchOutcome: "completed",
     _turnTapeId: "tape-1",
     _turnTapeSha256: "sha-1",
@@ -46,139 +45,281 @@ function collapsedAnchor(over: Partial<ChatMessage> = {}): ChatMessage {
   };
 }
 
-describe("CollapseCard 折叠卡 (RFC §9.1)", () => {
-  test("折叠态:渲染「本轮完整输出 N MB，点击加载」,点击触发 onExpandTape(anchorId, tapeId, null)", async () => {
-    const onExpandTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 2 });
-    renderMsg(collapsedAnchor(), { onExpandTape });
-    expect(screen.getByText(/本轮完整输出 192\.0 MB/)).toBeInTheDocument();
+describe("TurnProcessCard", () => {
+  test("collapsed card is only a cursor over 873 true records", async () => {
+    const onExpandTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 200 });
+    renderMsg(processControl(), { onExpandTape });
+    expect(screen.getByText("Agent 调用过程（873 条），点击展开")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    await waitFor(() => expect(onExpandTape).toHaveBeenCalledWith("srv-a-t1-s0", "tape-1", null));
+    await waitFor(() => expect(onExpandTape).toHaveBeenCalledWith(
+      "turn-process:tape-1", "tape-1", null,
+    ));
   });
 
-  test("折叠 anchor 走 CollapseCard 而非 AssistantCard:即便带 usage 也不渲染评分/MetaRow", () => {
-    // 折叠 anchor 给正文 + usage(若误走 AssistantCard 会出评分/成本尾注)。
-    renderMsg(collapsedAnchor({ text: "本应折叠的摘要", usage: { traceId: "t1", costCredits: "9" } }), {});
-    // 未展开 → 只有折叠入口文案,无 markdown 正文气泡、无请求 ID 尾注。
-    expect(screen.getByText(/本轮完整输出/)).toBeInTheDocument();
-    expect(screen.queryByText("本应折叠的摘要")).not.toBeInTheDocument();
+  test("without a read callback the control is static and never invents content", () => {
+    renderMsg(processControl());
+    expect(screen.getByRole("button")).toBeDisabled();
+    expect(screen.getByText("Agent 调用过程（873 条）")).toBeInTheDocument();
   });
 
-  test("未接线 onExpandTape(demo/只读)→ 静态摘要,按钮禁用", () => {
-    renderMsg(collapsedAnchor(), {});
-    const btn = screen.getByRole("button");
-    expect(btn).toBeDisabled();
-    expect(screen.getByText(/本轮完整输出 192\.0 MB$/)).toBeInTheDocument(); // 无"，点击加载"后缀
-  });
-
-  test("展开态:渲染「已展开」+ 继续加载(游标非 null)+ 收起", () => {
+  test("expanded card pages without claiming that page size is a total limit", () => {
     const onCollapseTape = vi.fn();
-    renderMsg(collapsedAnchor({ _tapeExpanded: true, _tapeExpandCursor: 3 }), {
-      onExpandTape: vi.fn().mockResolvedValue({ ok: true }),
+    renderMsg(processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 }), {
+      onExpandTape: vi.fn().mockResolvedValue({ ok: true, nextCursor: 400 }),
       onCollapseTape,
     });
-    expect(screen.getByText(/已展开/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /继续加载更多/ })).toBeInTheDocument();
+    expect(screen.getByText(/Agent 调用过程 · 已展开 · 192\.0 MB/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续加载更多" })).toBeInTheDocument();
+    expect(screen.queryByText(/截断|省略|替换/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "收起" }));
-    expect(onCollapseTape).toHaveBeenCalledWith("srv-a-t1-s0");
+    expect(onCollapseTape).toHaveBeenCalledWith("turn-process:tape-1");
   });
 
-  test("展开态已拉全(游标 null)→ 无「继续加载」", () => {
-    renderMsg(collapsedAnchor({ _tapeExpanded: true, _tapeExpandCursor: null }), {
+  test("cursor null means every physical page is loaded", () => {
+    renderMsg(processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: null }), {
       onCollapseTape: vi.fn(),
     });
-    expect(screen.getByText(/已展开/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /继续加载/ })).not.toBeInTheDocument();
-  });
-
-  test("卷级投影截断 → 展开头提示部分省略", () => {
-    renderMsg(collapsedAnchor({ _tapeExpanded: true, _tapeExpandCursor: null, _projectionTruncated: true }), {
-      onCollapseTape: vi.fn(),
-    });
-    expect(screen.getByText(/部分记录已省略/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续加载更多" })).toBeNull();
   });
 });
 
-describe("截断工具卡尾部 (RFC §9.1)", () => {
-  function truncatedTool(over: Partial<ChatMessage> = {}): ChatMessage {
-    return {
-      id: "rec-7",
+describe("deferred oversized immutable record", () => {
+  const deferred: ChatMessage = {
+    id: "srv-tool-large",
+    role: "tool",
+    text: "",
+    ts: 1000,
+    _source: "server",
+    toolName: "Bash",
+    _turnTapeId: "tape-1",
+    _turnTapeSha256: "sha-1",
+    _recordOrdinal: 7,
+    _payloadDeferred: true,
+    _payloadBytes: 52 * 1024 * 1024,
+    _payloadSha256: "a".repeat(64),
+  };
+
+  test("loads and renders the exact record automatically near the viewport", async () => {
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([{
+      id: "srv-tool-large",
       role: "tool",
+      text: "真实完整输出",
+      output: "真实完整输出",
+      ts: 1000,
+      toolName: "Bash",
+      _completed: true,
+      futureField: { marker: "未来工具字段必须可见" },
+    } as ChatMessage & { futureField: { marker: string } }]);
+    renderMsg(deferred, { onFetchTapeRecordPayload });
+    await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledWith(
+      "tape-1",
+      7,
+      { recordId: "srv-tool-large", role: "tool", contentSha256: "a".repeat(64) },
+      expect.any(AbortSignal),
+    ));
+    await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /终端/ }));
+    expect(screen.getByText("真实完整输出")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    expect(screen.getByText(/未来工具字段必须可见/)).toBeInTheDocument();
+    expect(screen.queryByText(/前 4MB|内容过大|已截断/)).toBeNull();
+  });
+
+  test("loads an oversized user message without requiring tape identity", async () => {
+    const userLocator: ChatMessage = {
+      id: "cm:user:large",
+      role: "user",
+      text: "",
+      ts: 1000,
+      status: "replied",
+      _source: "server",
+      _payloadDeferred: true,
+      _userPayloadDeferred: true,
+      _payloadBytes: 12 * 1024 * 1024,
+      _payloadSha256: "c".repeat(64),
+    };
+    const onFetchUserMessagePayload = vi.fn().mockResolvedValue([{
+      id: "cm:user:large",
+      role: "user",
+      text: "这是用户真实提交的完整超长消息",
+      ts: 1000,
+      status: "sending",
+    } satisfies ChatMessage]);
+    renderMsg(userLocator, { onFetchUserMessagePayload });
+    await waitFor(() => expect(onFetchUserMessagePayload).toHaveBeenCalledWith(
+      "cm:user:large",
+      { recordId: "cm:user:large", role: "user", contentSha256: "c".repeat(64) },
+      expect.any(AbortSignal),
+    ));
+    expect(await screen.findByText("这是用户真实提交的完整超长消息")).toBeInTheDocument();
+    expect(screen.queryByText(/Agent 记录/)).toBeNull();
+  });
+
+  test("fresh dispatch id hydrates the immutable pre-retry user sidecar after reload", async () => {
+    const onRetrySend = vi.fn();
+    const locator: ChatMessage = {
+      id: "cm-fresh-dispatch",
+      role: "user",
+      text: "",
+      ts: 1000,
+      status: "error",
+      _source: "server",
+      _payloadDeferred: true,
+      _userPayloadDeferred: true,
+      _userPayloadId: "cm:old:sidecar",
+      _payloadBytes: 12 * 1024 * 1024,
+      _payloadSha256: "e".repeat(64),
+    };
+    const onFetchUserMessagePayload = vi.fn().mockResolvedValue([{
+      id: "cm:old:sidecar",
+      role: "user",
+      text: "刷新后仍从旧 sidecar 水合的完整内容",
+      ts: 1000,
+    } satisfies ChatMessage]);
+    renderMsg(locator, { onFetchUserMessagePayload, onRetrySend });
+    await waitFor(() => expect(onFetchUserMessagePayload).toHaveBeenCalledWith(
+      "cm:old:sidecar",
+      { recordId: "cm:old:sidecar", role: "user", contentSha256: "e".repeat(64) },
+      expect.any(AbortSignal),
+    ));
+    expect(await screen.findByText("刷新后仍从旧 sidecar 水合的完整内容")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(onRetrySend).toHaveBeenCalledWith(expect.objectContaining({
+      id: "cm-fresh-dispatch",
+      _userPayloadId: "cm:old:sidecar",
+      text: "刷新后仍从旧 sidecar 水合的完整内容",
+    }));
+  });
+
+  test("deferred final keeps current billing overlays and the final-response rating", async () => {
+    const locator: ChatMessage = {
+      id: "srv-final-large",
+      role: "assistant",
       text: "",
       ts: 1000,
       _source: "server",
+      _turnTapeId: "tape-1",
+      _turnTapeSha256: "sha-1",
+      _recordOrdinal: 9,
+      _payloadDeferred: true,
+      _payloadSha256: "d".repeat(64),
+      usage: { costCredits: "1234" },
+    };
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([{
+      id: "srv-final-large",
+      role: "assistant",
+      text: "真实完整最终回答",
+      ts: 1000,
+      _completed: true,
+      usage: { costCredits: "0", traceId: "trace-1" },
+    } satisfies ChatMessage]);
+    const callbacks = { onFetchTapeRecordPayload };
+    const view = render(
+      <ResponseRatingProvider value={{ ratings: new Map(), submit: () => {} }}>
+        <MessageRenderer
+          message={locator}
+          sig={messageSignature(locator, { isLast: true, sending: false, turnFinalAssistant: true })}
+          isLast
+          sending={false}
+          inActiveTurn
+          turnFinalAssistant
+          cb={callbacks}
+          onRespondPermission={() => {}}
+        />
+      </ResponseRatingProvider>,
+    );
+    expect(await screen.findByText("真实完整最终回答")).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 1234 积分")).toBeInTheDocument();
+    expect(screen.getByText("这条回复怎么样?")).toBeInTheDocument();
+
+    const waived = { ...locator, usage: { costCredits: "1234", waived: true } };
+    view.rerender(
+      <ResponseRatingProvider value={{ ratings: new Map(), submit: () => {} }}>
+        <MessageRenderer
+          message={waived}
+          sig={messageSignature(waived, { isLast: true, sending: false, turnFinalAssistant: true })}
+          isLast
+          sending={false}
+          inActiveTurn
+          turnFinalAssistant
+          cb={callbacks}
+          onRespondPermission={() => {}}
+        />
+      </ResponseRatingProvider>,
+    );
+    expect(await screen.findByLabelText("本轮已免单")).toBeInTheDocument();
+    expect(screen.queryByLabelText("消耗 1234 积分")).toBeNull();
+  });
+
+  test("transient failure offers retry instead of a permanent placeholder", async () => {
+    const onFetchTapeRecordPayload = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce([{
+        id: "srv-tool-large",
+        role: "tool",
+        text: "恢复后的真实输出",
+        output: "恢复后的真实输出",
+        ts: 1000,
+        toolName: "Bash",
+        _completed: true,
+      } satisfies ChatMessage]);
+    renderMsg(deferred, { onFetchTapeRecordPayload });
+    const retry = await screen.findByRole("button", { name: "真实记录加载失败，点击重试" });
+    fireEvent.click(retry);
+    await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
+  });
+
+  test("unmount outside virtual-scroll overscan cancels its payload subscription", async () => {
+    let signal: AbortSignal | undefined;
+    const onFetchTapeRecordPayload = vi.fn((
+      _tapeId: string,
+      _ordinal: number,
+      _expected: { recordId: string; role: string; contentSha256?: string },
+      requestSignal?: AbortSignal,
+    ) => {
+      signal = requestSignal;
+      return new Promise<ChatMessage[] | null>(() => {});
+    });
+    const view = renderMsg(deferred, { onFetchTapeRecordPayload });
+    await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(1));
+    expect(signal?.aborted).toBe(false);
+
+    view.unmount();
+    expect(signal?.aborted).toBe(true);
+  });
+
+  test("legacy locator without a visible hash still starts the HEAD/range loader", async () => {
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([{
+      id: "srv-tool-large",
+      role: "tool",
+      text: "旧会话真实输出",
+      output: "旧会话真实输出",
+      ts: 1000,
       toolName: "Bash",
       _completed: true,
-      output: "已截断的前 64KB 输出…",
-      _fullBytes: 5 * 1024 * 1024,
-      _turnTapeId: "tape-1",
-      ...over,
-    };
-  }
-
-  test("展开工具卡 → 尾部显示「输出已截断（共 N MB）」+ 查看完整;点击抓取并显示更完整内容", async () => {
-    const onFetchTapeRecords = vi
-      .fn()
-      .mockResolvedValue({ records: [{ id: "rec-7", role: "tool", text: "", output: "更完整的输出内容" }], nextCursor: null, total: 1 });
-    renderMsg(truncatedTool(), { onFetchTapeRecords });
-    // 工具卡默认折叠(completed),点击卡头展开卡体。
-    fireEvent.click(screen.getAllByRole("button")[0]);
-    expect(screen.getByText(/输出已截断（共 5\.0 MB）/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /查看完整/ }));
-    await waitFor(() => expect(screen.getByText("更完整的输出内容")).toBeInTheDocument());
-    expect(onFetchTapeRecords).toHaveBeenCalledWith("tape-1", null);
+    } satisfies ChatMessage]);
+    renderMsg({ ...deferred, _payloadSha256: undefined }, { onFetchTapeRecordPayload });
+    await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledWith(
+      "tape-1",
+      7,
+      { recordId: "srv-tool-large", role: "tool" },
+      expect.any(AbortSignal),
+    ));
   });
+});
 
-  test("未截断的工具记录(无 _fullBytes)→ 无截断尾部", () => {
-    renderMsg(truncatedTool({ _fullBytes: undefined }), { onFetchTapeRecords: vi.fn() });
-    fireEvent.click(screen.getAllByRole("button")[0]);
-    expect(screen.queryByText(/输出已截断/)).not.toBeInTheDocument();
-  });
-
-  // ── M6①(R3):截断记录携 `_recordOrdinal` → 走按记录分块拉取真通路(前端零改动即通)。 ──
-  test("M6① 携 _recordOrdinal → 点击查看完整走 onFetchTapeRecordChunk(按 recordOrdinal 分块)", async () => {
-    const onFetchTapeRecordChunk = vi
-      .fn()
-      .mockResolvedValueOnce({ chunk: "分块A", nextOffset: 5, totalBytes: 10 })
-      .mockResolvedValueOnce({ chunk: "分块B", nextOffset: null, totalBytes: 10 });
-    renderMsg(truncatedTool({ _recordOrdinal: 3 }), { onFetchTapeRecordChunk });
-    fireEvent.click(screen.getAllByRole("button")[0]); // 展开工具卡
-    fireEvent.click(screen.getByRole("button", { name: /查看完整/ }));
-    await waitFor(() => expect(screen.getByText("分块A分块B")).toBeInTheDocument());
-    // 关键:按 `_recordOrdinal`(=3)分块拉取,不走老 page-scan。
-    expect(onFetchTapeRecordChunk).toHaveBeenCalledWith("tape-1", 3, 0);
-    expect(onFetchTapeRecordChunk).toHaveBeenCalledWith("tape-1", 3, 5);
-  });
-
-  // ── M6②(R3):分块中途拿不到块(限频/瞬态)→ 显式「内容加载不完整」,绝不把半截冒充完整。 ──
-  test("M6② 中途 null → partial 提示「内容加载不完整」,不冒充完整", async () => {
-    const onFetchTapeRecordChunk = vi
-      .fn()
-      .mockResolvedValueOnce({ chunk: "前半段", nextOffset: 5, totalBytes: 20 })
-      .mockResolvedValueOnce(null); // 第 2 块限频/失败
-    renderMsg(truncatedTool({ _recordOrdinal: 1 }), { onFetchTapeRecordChunk });
-    fireEvent.click(screen.getAllByRole("button")[0]);
-    fireEvent.click(screen.getByRole("button", { name: /查看完整/ }));
-    await waitFor(() => expect(screen.getByText(/内容加载不完整，请稍后重试/)).toBeInTheDocument());
-    // 已拉到的半截仍展示,但明确标不完整(不显示为完整、无 error 误报)。
-    expect(screen.getByText("前半段")).toBeInTheDocument();
-    expect(screen.queryByText(/未能加载完整内容/)).not.toBeInTheDocument();
-  });
-
-  // ── M6③(R3):4MB 上限按 UTF-8 字节(TextEncoder),非 JS 字符数。 ──
-  test("M6③ 上限按 UTF-8 字节:多字节内容字节超 4MB(字符数未超)→ overflow「内容过大」", async () => {
-    // 每块 700k 个「中」= 700k JS 字符 / 2.1MB UTF-8 字节。两块 = 1.4M 字符(<4M 字符)但 4.2MB 字节(>4MB)。
-    // 旧口径按 acc.length(字符)→ 不 overflow;新口径按字节 → 第 2 块并入前越限 → overflow。
-    const block = "中".repeat(700_000);
-    const onFetchTapeRecordChunk = vi
-      .fn()
-      .mockResolvedValueOnce({ chunk: block, nextOffset: 1, totalBytes: 99 })
-      .mockResolvedValueOnce({ chunk: block, nextOffset: 2, totalBytes: 99 })
-      .mockResolvedValue({ chunk: block, nextOffset: null, totalBytes: 99 });
-    renderMsg(truncatedTool({ _recordOrdinal: 2 }), { onFetchTapeRecordChunk });
-    fireEvent.click(screen.getAllByRole("button")[0]);
-    fireEvent.click(screen.getByRole("button", { name: /查看完整/ }));
-    await waitFor(() => expect(screen.getByText(/内容过大，已展示前 4MB/)).toBeInTheDocument());
-    // 只并入了 1 块(2.1MB ≤ 4MB),第 2 块并入会越 4MB 字节 → 停在整块边界。
-    expect(onFetchTapeRecordChunk).toHaveBeenCalledTimes(2);
+describe("runtime event", () => {
+  test("raw persisted event is inspectable and never silently filtered", () => {
+    renderMsg({
+      id: "runtime-1",
+      role: "runtime-event",
+      text: "",
+      ts: 1,
+      _runtimeSource: "gateway",
+      _runtimeEvent: { type: "progress", subtype: "tool_delta", exact: "原始事件" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /progress · tool_delta/ }));
+    expect(screen.getByText(/原始事件/)).toBeInTheDocument();
   });
 });

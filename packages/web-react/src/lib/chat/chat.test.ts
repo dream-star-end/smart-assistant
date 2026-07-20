@@ -45,6 +45,7 @@ import {
 } from "./reducer";
 import {
   ChatSocket,
+  exactUserReplayPayload,
   messageAttemptIdempotencyKey,
   preciseRetryEligible,
   writeAutoContinuePreamblePref,
@@ -1220,6 +1221,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
 
   test("Agent tool_result keeps JSON result preview on completed group", () => {
     const s = sess();
+    const exactOutput = `${"x".repeat(12_000)}EXACT_AGENT_RESULT_END`;
     applyOutboundMessage(
       s,
       msgFrame({
@@ -1246,6 +1248,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
             toolUseBlockId: "spawn-json",
             blockId: "spawn-json:result",
             preview: '{"ok":true}',
+            output: exactOutput,
             isError: false,
           },
         ],
@@ -1255,6 +1258,34 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     const group = s.messages.find((m) => m.role === "agent-group");
     expect(group?._completed).toBe(true);
     expect(group?._resultPreview).toBe('{"ok":true}');
+    expect(group?.inputJson).toEqual({ description: "return json" });
+    expect(group?.output).toBe(exactOutput);
+  });
+
+  test("standalone tool_result keeps complete output even when display preview is absent", () => {
+    const s = sess();
+    const exactOutput = `${"z".repeat(12_000)}EXACT_STANDALONE_RESULT_END`;
+    const exactStructuredOutput = { future_field: { marker: "EXACT_STRUCTURED_RESULT" } };
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolName: "Bash",
+            blockId: "standalone-result",
+            output: exactOutput,
+            outputJson: exactStructuredOutput,
+            isError: false,
+          },
+        ],
+      }),
+    );
+
+    const tool = s.messages.find((m) => m.role === "tool");
+    expect(tool?.output).toBe(exactOutput);
+    expect(tool?.outputJson).toEqual(exactStructuredOutput);
   });
 
   test("adopted delegate_progress preserves completed summary on the group", () => {
@@ -1359,6 +1390,81 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(groups[0]._delegateRunId).toBe("dlg-3");
     expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "child output")).toBe(true);
     expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("delegate child tool keeps complete output instead of its shortened preview", () => {
+    const s = sess();
+    const exactOutput = `${"y".repeat(12_000)}EXACT_CHILD_TOOL_END`;
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [{
+          kind: "tool_use",
+          toolName: "delegate_task",
+          blockId: "tool-child-exact",
+          partial: false,
+          inputJson: { agentId: "hidden-reviewer", goal: "检查完整输出" },
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-child-exact",
+          agentId: "hidden-reviewer",
+          goal: "检查完整输出",
+          phase: "start",
+          text: "开始",
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-child-exact",
+          agentId: "hidden-reviewer",
+          phase: "tool",
+          block: {
+            kind: "tool_use",
+            toolName: "Read",
+            blockId: "child-read",
+            inputJson: { file_path: "/tmp/exact" },
+            partial: false,
+          },
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "dlg-child-exact",
+          agentId: "hidden-reviewer",
+          phase: "tool",
+          block: {
+            kind: "tool_result",
+            toolName: "Read",
+            toolUseBlockId: "child-read",
+            preview: "short preview",
+            output: exactOutput,
+            isError: false,
+          },
+        }],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    const child = group?.childBlocks?.find((block) => block.kind === "tool_use" && block.blockId === "child-read");
+    expect(child?.output).toBe(exactOutput);
   });
 
 
@@ -1713,6 +1819,14 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
 
   test("persisted Codex delegate tool plus progress rows collapse into one agent-group", () => {
     const s = sess();
+    const exactOutput = JSON.stringify({
+      type: "mcpToolCall",
+      id: "call_hist",
+      server: "openclaude_memory",
+      tool: "delegate_task",
+      status: "completed",
+      result: { content: [{ type: "text", text: `✅ 委派完成\n\n${"z".repeat(12_000)}EXACT_PERSISTED_DELEGATE_END` }] },
+    });
     addMessage(s, "tool", "codex:mcpToolCall", {
       id: "tool-hist",
       ts: 1,
@@ -1726,14 +1840,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
         arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
       },
       _completed: true,
-      output: JSON.stringify({
-        type: "mcpToolCall",
-        id: "call_hist",
-        server: "openclaude_memory",
-        tool: "delegate_task",
-        status: "completed",
-        result: { content: [{ type: "text", text: "✅ 委派完成\n\n最终方案" }] },
-      }),
+      output: exactOutput,
     });
     addMessage(s, "delegate-progress", "", {
       id: "progress-hist",
@@ -1754,6 +1861,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(groups[0].id).toBe("tool-hist");
     expect(groups[0]._delegateRunId).toBe("dlg-hist");
     expect(groups[0]._resultPreview).toContain("委派完成");
+    expect(groups[0].output).toBe(exactOutput);
     expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "实时输出")).toBe(true);
     expect(s._agentGroups?.get("nested-agent")).toBe("tool-hist");
     expect(s.messages.some((m) => m.role === "tool" || m.role === "delegate-progress")).toBe(false);
@@ -2072,6 +2180,19 @@ describe("preciseRetryEligible(Codex 审计 R4:精确重试完整性硬门)", ()
         }),
       ),
     ).toBe(true);
+  });
+
+  test("超大 user locator 只依据落库时的精确 sidecar 能力元数据，不把附件塞回热行", () => {
+    expect(preciseRetryEligible(base({
+      _routing: { model: "m", teamMode: false, effortLevel: null },
+      _userPayloadDeferred: true,
+      _deferredRetryEligible: true,
+    }))).toBe(true);
+    expect(preciseRetryEligible(base({
+      _routing: { model: "m", teamMode: false, effortLevel: null },
+      _userPayloadDeferred: true,
+      _deferredRetryEligible: false,
+    }))).toBe(false);
   });
 });
 
@@ -2625,6 +2746,82 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(retried.content.imageEdit.clientJobId).toBe("a".repeat(32));
   });
 
+  test("lazy oversized user retries from the exact sidecar source without hydrating the hot locator", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.ensureSession("s1", "main");
+    const session = sock.sessions.get("s1")!;
+    const locator = addMessage(session, "user", "", {
+      status: "error",
+      _userPayloadDeferred: true,
+      _payloadDeferred: true,
+      _payloadBytes: 8_000_000,
+      _payloadSha256: "a".repeat(64),
+      _routing: { model: "gpt-5.6-terra", teamMode: true, effortLevel: "max" },
+      _deferredRetryEligible: true,
+      _sendAttempt: 0,
+    });
+    const imageEdit = {
+      clientJobId: "b".repeat(32),
+      sourceIndex: 0,
+      maskIndex: 1,
+      guideIndex: 2,
+      width: 100,
+      height: 80,
+    } as const;
+    const exact: ChatMessage = {
+      ...locator,
+      text: "用户看到的原始问题",
+      _modelText: "用户看到的原始问题\n[完整模型附件提示]",
+      _media: [{ kind: "image", url: "/api/media/guide.png" }],
+      _retryMedia: [
+        { kind: "image", url: "/api/media/source.png", hidden: true },
+        { kind: "image", url: "/api/media/mask.png", hidden: true },
+        { kind: "image", url: "/api/media/guide.png" },
+      ],
+      _imageEdit: imageEdit,
+      _userPayloadDeferred: undefined,
+      _payloadDeferred: undefined,
+    };
+
+    expect(exactUserReplayPayload(exact)).toMatchObject({
+      text: "用户看到的原始问题\n[完整模型附件提示]",
+      displayText: "用户看到的原始问题",
+      imageEdit,
+    });
+    sock.retryMessage({
+      sessId: "s1",
+      msgId: locator.id,
+      agentId: "main",
+      sourceOverride: exact,
+    });
+
+    const retried = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.message")
+      .at(-1);
+    expect(retried).toMatchObject({
+      model: "gpt-5.6-terra",
+      effortLevel: "max",
+      teamMode: true,
+      content: {
+        text: "用户看到的原始问题\n[完整模型附件提示]",
+        displayText: "用户看到的原始问题",
+        imageEdit,
+      },
+    });
+    expect(retried.content.media).toHaveLength(3);
+    const stored = sock.toStored("s1")!.messages.find((message) => message.id === locator.id)!;
+    expect(stored.text).toBe("");
+    expect(stored._media).toBeUndefined();
+    expect(stored._retryMedia).toBeUndefined();
+    expect(stored._modelText).toBeUndefined();
+    expect(stored._userPayloadDeferred).toBe(true);
+  });
+
   test("optimistic localSrc: 气泡保留本地 blob 即时渲染,出站帧 + 持久化显式剥离", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -2648,6 +2845,55 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const stored = sock.toStored("s1")!;
     expect(stored.messages.find((m) => m.role === "user")?._media).toEqual([
       { kind: "image", url: "/api/media/x.png", filename: "x.png" },
+    ]);
+  });
+
+  test("master user persistence receives the complete replay contract, including hidden image-edit refs", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistUserMessage = vi.fn<NonNullable<ChatSocketDeps["persistUserMessage"]>>();
+    const sock = makeSocket({
+      ensureServerSession: async () => true,
+      persistUserMessage,
+    });
+    sock.setGateReady(true);
+    FakeWS.instances.at(-1)!.open();
+    const imageEdit = {
+      clientJobId: "c".repeat(32),
+      sourceIndex: 0,
+      maskIndex: 1,
+      guideIndex: 2,
+      width: 100,
+      height: 80,
+    } as const;
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "模型正文\n[附件提示]",
+      displayText: "模型正文",
+      media: [
+        { kind: "image", url: "/api/media/source.png", hidden: true },
+        { kind: "image", url: "/api/media/mask.png", hidden: true },
+        { kind: "image", url: "/api/media/guide.png", localSrc: "blob:guide" },
+      ],
+      imageEdit,
+      model: "gpt-5.6-sol",
+      effortLevel: "high",
+      teamMode: true,
+    });
+    await vi.waitFor(() => expect(persistUserMessage).toHaveBeenCalledTimes(1));
+    const persisted = persistUserMessage.mock.calls[0]![1];
+    expect(persisted).toMatchObject({
+      text: "模型正文",
+      _modelText: "模型正文\n[附件提示]",
+      _routing: { model: "gpt-5.6-sol", effortLevel: "high", teamMode: true },
+      _imageEdit: imageEdit,
+      _sendAttempt: 0,
+      media: [{ kind: "image", url: "/api/media/guide.png" }],
+    });
+    expect(persisted._retryMedia).toEqual([
+      { kind: "image", url: "/api/media/source.png", hidden: true },
+      { kind: "image", url: "/api/media/mask.png", hidden: true },
+      { kind: "image", url: "/api/media/guide.png" },
     ]);
   });
 
@@ -2829,7 +3075,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("stored sanitized history tail patch reapplies during IndexedDB hydration", () => {
+  test("rolling old IndexedDB substitution rows are discarded instead of mutating true records", () => {
     const sock = makeSocket();
     sock.loadStored({
       id: "s-history-patch",
@@ -2856,17 +3102,15 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
             totalBytes: 42,
             truncatedHead: false,
           },
-        },
+        } as unknown as ChatMessage,
       ],
       createdAt: 1,
       lastAt: 2,
       _maxSeq: 9,
     });
-    expect(sock.sessions.get("s-history-patch")!.messages[0]!.bashTail).toEqual({
-      tail: "restored tail",
-      totalBytes: 42,
-      truncatedHead: false,
-    });
+    const restored = sock.sessions.get("s-history-patch")!.messages;
+    expect(restored.map((message) => message.id)).toEqual(["srv-tool"]);
+    expect(restored[0]!.bashTail).toBeUndefined();
   });
 
   test("hello names every trailing user-row candidate and ignores only an image placeholder", () => {

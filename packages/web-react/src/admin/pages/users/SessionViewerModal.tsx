@@ -8,12 +8,14 @@ import type { CardCallbacks } from '../../../components/chat/cards'
 import { MediaSignProvider } from '../../../components/chat/media'
 import { Alert, Badge, Button, EmptyState, Modal } from '../../../components/ui'
 import type { ChatMessage } from '../../../lib/chat/model'
-import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
+import { DeferredPayloadQueue } from '../../../lib/chat/deferredPayloadQueue'
+import { collapseExpandedTapePage, mergeExpandedTapePage } from '../../../lib/chat/directTimeline'
+import { parseTapeRecordPayload, type TapePayloadExpectation } from '../../../lib/chat/tapePayload'
+import { adminGet, adminGetExactPayload, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { fmtInt } from './format'
 import type { UserSessionSummary } from './types'
 
 const ARCHIVE_PAGE_SIZE = 100
-const EMPTY_CARD_CALLBACKS: CardCallbacks = Object.freeze({})
 const READ_ONLY_PERMISSION: PermissionRespond = () => {}
 
 type ChatSessionPayload = {
@@ -40,6 +42,12 @@ type ArchivePayload = {
 }
 
 type MediaSignPayload = { urls: Record<string, string>; expMs: number }
+
+type TapeRecordsPayload = {
+  records: ChatMessage[]
+  nextCursor: number | null
+  total: number
+}
 
 type ScrollAnchor = { prevHeight: number; prevTop: number }
 
@@ -69,9 +77,20 @@ export function SessionViewerModal({
   const [archiveLoading, setArchiveLoading] = useState(false)
   const [archiveError, setArchiveError] = useState(false)
   const scrollRef = useRef<HTMLDivElement | null>(null)
+  const [scrollParent, setScrollParent] = useState<HTMLDivElement | null>(null)
+  const bindScroll = useCallback((node: HTMLDivElement | null) => {
+    scrollRef.current = node
+    setScrollParent((current) => current === node ? current : node)
+  }, [])
   const initialScrollPendingRef = useRef(false)
   const archiveScrollAnchorRef = useRef<ScrollAnchor | null>(null)
   const loadGenerationRef = useRef(0)
+  const expandingTapesRef = useRef<Set<string>>(new Set())
+  const deferredPayloadCacheRef = useRef<{ key: string; records: ChatMessage[] } | null>(null)
+  const deferredPayloadQueueRef = useRef<DeferredPayloadQueue<ChatMessage[]> | null>(null)
+  if (!deferredPayloadQueueRef.current) {
+    deferredPayloadQueueRef.current = new DeferredPayloadQueue<ChatMessage[]>(2)
+  }
 
   const sessionId = session?.session_id ?? null
 
@@ -85,6 +104,9 @@ export function SessionViewerModal({
     setArchiveLoading(false)
     setArchiveError(false)
     archiveScrollAnchorRef.current = null
+    expandingTapesRef.current.clear()
+    deferredPayloadQueueRef.current?.cancelAll()
+    deferredPayloadCacheRef.current = null
     initialScrollPendingRef.current = false
     if (!sessionId || !userId) {
       setLoading(false)
@@ -94,7 +116,7 @@ export function SessionViewerModal({
     setLoading(true)
     void adminGet<ChatSessionPayload>(`/sessions/${encodeURIComponent(sessionId)}`, {
       user_id: userId,
-      view: 'chat',
+      view: 'timeline',
     })
       .then((result) => {
         if (generation !== loadGenerationRef.current) return
@@ -117,6 +139,7 @@ export function SessionViewerModal({
     loadSession()
     return () => {
       loadGenerationRef.current++
+      deferredPayloadQueueRef.current?.cancelAll()
     }
   }, [loadSession])
 
@@ -197,6 +220,100 @@ export function SessionViewerModal({
     [sessionId, userId],
   )
 
+  const expandTape = useCallback<NonNullable<CardCallbacks['onExpandTape']>>(async (
+    anchorId,
+    tapeId,
+    cursor,
+  ) => {
+    if (!sessionId || !userId) return { ok: false }
+    const generation = loadGenerationRef.current
+    const guardKey = `${sessionId}:${anchorId}`
+    if (expandingTapesRef.current.has(guardKey)) return { ok: false, busy: true }
+    expandingTapesRef.current.add(guardKey)
+    try {
+      const page = await adminGet<TapeRecordsPayload>(
+        `/sessions/${encodeURIComponent(sessionId)}/tape/${encodeURIComponent(tapeId)}/records`,
+        { user_id: userId, cursor: cursor ?? undefined, limit: 200 },
+      )
+      if (generation !== loadGenerationRef.current) return { ok: false }
+      const records = Array.isArray(page.records) ? page.records : []
+      const nextCursor = typeof page.nextCursor === 'number' ? page.nextCursor : null
+      setMessages((current) => mergeExpandedTapePage(current, anchorId, records, nextCursor) ?? current)
+      return {
+        ok: true,
+        nextCursor,
+        total: typeof page.total === 'number' ? page.total : records.length,
+      }
+    } catch {
+      return { ok: false, error: true }
+    } finally {
+      expandingTapesRef.current.delete(guardKey)
+    }
+  }, [sessionId, userId])
+
+  const collapseTape = useCallback<NonNullable<CardCallbacks['onCollapseTape']>>((anchorId) => {
+    setMessages((current) => collapseExpandedTapePage(current, anchorId) ?? current)
+  }, [])
+
+  const fetchExactPayload = useCallback(async (
+    path: string,
+    cacheKey: string,
+    expected: TapePayloadExpectation,
+    signal?: AbortSignal,
+  ): Promise<ChatMessage[] | null> => {
+    if (!userId || signal?.aborted) return null
+    if (deferredPayloadCacheRef.current?.key === cacheKey) {
+      return deferredPayloadCacheRef.current.records
+    }
+    const generation = loadGenerationRef.current
+    return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
+      const payload = await adminGetExactPayload(path, { user_id: userId }, queueSignal)
+      const records = await parseTapeRecordPayload(payload, expected, queueSignal)
+      if (queueSignal.aborted || generation !== loadGenerationRef.current) {
+        throw new DOMException('session changed', 'AbortError')
+      }
+      deferredPayloadCacheRef.current = { key: cacheKey, records }
+      return records
+    }, signal)
+  }, [userId])
+
+  const fetchTapePayload = useCallback<NonNullable<CardCallbacks['onFetchTapeRecordPayload']>>((
+    tapeId,
+    recordOrdinal,
+    expected,
+    signal,
+  ) => {
+    if (!sessionId) return Promise.resolve(null)
+    return fetchExactPayload(
+      `/sessions/${encodeURIComponent(sessionId)}/tape/${encodeURIComponent(tapeId)}` +
+        `/records/${recordOrdinal}/payload`,
+      JSON.stringify([userId, sessionId, 'tape', tapeId, recordOrdinal, expected]),
+      expected,
+      signal,
+    )
+  }, [fetchExactPayload, sessionId, userId])
+
+  const fetchUserPayload = useCallback<NonNullable<CardCallbacks['onFetchUserMessagePayload']>>((
+    messageId,
+    expected,
+    signal,
+  ) => {
+    if (!sessionId) return Promise.resolve(null)
+    return fetchExactPayload(
+      `/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/payload`,
+      JSON.stringify([userId, sessionId, 'user', messageId, expected]),
+      expected,
+      signal,
+    )
+  }, [fetchExactPayload, sessionId, userId])
+
+  const cardCallbacks = useMemo<CardCallbacks>(() => ({
+    onExpandTape: expandTape,
+    onCollapseTape: collapseTape,
+    onFetchTapeRecordPayload: fetchTapePayload,
+    onFetchUserMessagePayload: fetchUserPayload,
+  }), [collapseTape, expandTape, fetchTapePayload, fetchUserPayload])
+
   const displayTitle = payload?.title || session?.title || '(无标题)'
   const recordCount = session?.message_count ?? messages.length
 
@@ -239,7 +356,7 @@ export function SessionViewerModal({
         sign={signMedia}
         authKey={sessionId && userId ? `admin-session:${userId}:${sessionId}` : null}
       >
-        <div ref={scrollRef} className="h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg">
+        <div ref={bindScroll} className="h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg">
           {loading && !payload ? (
             <MessageListSkeleton />
           ) : error ? (
@@ -259,12 +376,14 @@ export function SessionViewerModal({
             </div>
           ) : payload ? (
             <MessageList
+              key={`${userId}:${sessionId}`}
               messages={messages}
               sending={false}
               archive={archive}
-              cb={EMPTY_CARD_CALLBACKS}
+              cb={cardCallbacks}
               onRespondPermission={READ_ONLY_PERMISSION}
               readOnly
+              scrollParent={scrollParent}
             />
           ) : null}
         </div>

@@ -288,6 +288,57 @@ describe("SessionManager pending-persistence tracking", () => {
     }
   });
 
+  test("runner receives every storage-selected semantic row without a 40-row/14k recut", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeTurnRunner((r) => {
+      setImmediate(() => {
+        r.emitAssistantText("done");
+        r.emitResult("req-history-window");
+      });
+    });
+    const session = makeTurnSession(runner);
+    session.channel = "webchat";
+    session.turns = 1;
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+    const historicalMessages: Array<Record<string, unknown>> = Array.from(
+      { length: 48 },
+      (_, index) => ({
+        id: `selected-${index}`,
+        role: index % 2 === 0 ? "user" : "assistant",
+        text: `RUNNER_ROW_${index}_${"x".repeat(400)}`,
+      }),
+    );
+    historicalMessages.splice(24, 0, {
+      id: "selected-tool",
+      role: "tool",
+      text: `RUNNER_TOOL_MARKER_${"y".repeat(400)}`,
+    });
+
+    await sm.submit(
+      session,
+      "RUNNER_CURRENT_MESSAGE",
+      () => {},
+      undefined,
+      undefined,
+      "req-history-window",
+      undefined,
+      undefined,
+      { historicalMessages },
+    );
+
+    const submitted = String(runner.submitted.at(-1));
+    assert.ok(submitted.length > 14_000);
+    for (let index = 0; index < 48; index++) {
+      assert.equal(
+        submitted.split(`RUNNER_ROW_${index}_`).length - 1,
+        1,
+        `selected row ${index} must reach the runner exactly once`,
+      );
+    }
+    assert.equal(submitted.split("RUNNER_TOOL_MARKER_").length - 1, 1);
+    assert.equal(submitted.split("RUNNER_CURRENT_MESSAGE").length - 1, 1);
+  });
+
   test("awaitPendingPersistence is a no-op when set is empty", async () => {
     const sm = new SessionManager(makeConfigStub());
     const t0 = Date.now();

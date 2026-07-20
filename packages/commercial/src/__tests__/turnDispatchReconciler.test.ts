@@ -66,7 +66,7 @@ function makeFakePool(canned: Canned) {
   // ACCEPTED_UNREACHABLE_ALERT_MS 而非 stuckMs,否则求证瘫痪要等 90min+ 才首告)。
   const acceptedScanCutoffs: Date[] = []
   // 单点路由:pool.query 与事务 client.query 共用。B8 的 terminal-未通知分支走
-  // pool.connect() 单事务(SELECT … FOR UPDATE 锁行 → 重验 → 财务联查 → projection/manual),
+  // pool.connect() 单事务(SELECT … FOR UPDATE 锁行 → 重验 → 财务联查 → visible/manual),
   // 故 fake 必须提供 connect() + 事务 client。
   const route = (sql: string, params?: unknown[]) => {
     const s = sql.replace(/\s+/g, ' ')
@@ -78,7 +78,6 @@ function makeFakePool(canned: Canned) {
     }
     if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
       writes.push(s)
-      if (s.startsWith('INSERT INTO turn_dispatch_error_projections')) return { rows: [], rowCount: 1 }
       if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
       if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
       if (s.includes("status = 'terminal'")) return { rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })], rowCount: 1 }
@@ -164,7 +163,7 @@ describe('⓪ session-gone auto close(2026-07-18 e2e 残留 accepted 恒卡实�
 })
 
 describe('terminal-unnotified branch (financial safety)', () => {
-  test('not billed → error projection + client_notified, no manual_reconcile', async () => {
+  test('not billed → durable client_notified status, no manual_reconcile or shadow content write', async () => {
     const pool = makeFakePool({ terminalUnnotified: [rawRow()] })
     const alerts: unknown[] = []
     const counts = await runReconcileTick({
@@ -173,15 +172,16 @@ describe('terminal-unnotified branch (financial safety)', () => {
       enqueueAlert: (e) => alerts.push(e),
       assessBilling: async () => 'not_billed',
     })
-    assert.equal(counts.projections, 1)
+    assert.equal(counts.visibleFailures, 1)
     assert.equal(counts.notified, 1)
     assert.equal(counts.manualReconcile, 0)
-    assert.ok(pool.writes.some((w) => w.startsWith('INSERT INTO turn_dispatch_error_projections')))
+    assert.ok(pool.writes.some((w) => w.includes('client_notified = TRUE')))
+    assert.ok(!pool.writes.some((w) => w.includes('turn_dispatch_error_projections')))
     assert.ok(!pool.writes.some((w) => w.includes("status = 'manual_reconcile'")))
     assert.equal(alerts.length, 0)
   })
 
-  test('billed evidence → manual_reconcile + critical alert, never projects "not billed"', async () => {
+  test('billed evidence → manual_reconcile + critical alert, never exposes "not billed"', async () => {
     const pool = makeFakePool({ terminalUnnotified: [rawRow()] })
     const alerts: Array<{ severity?: string }> = []
     const counts = await runReconcileTick({
@@ -191,10 +191,10 @@ describe('terminal-unnotified branch (financial safety)', () => {
       assessBilling: async () => 'billed',
     })
     assert.equal(counts.manualReconcile, 1)
-    assert.equal(counts.projections, 0)
+    assert.equal(counts.visibleFailures, 0)
     assert.equal(counts.notified, 0)
     assert.ok(pool.writes.some((w) => w.includes("status = 'manual_reconcile'")))
-    assert.ok(!pool.writes.some((w) => w.startsWith('INSERT INTO turn_dispatch_error_projections')))
+    assert.ok(!pool.writes.some((w) => w.includes('client_notified = TRUE')))
     assert.equal(alerts.length, 1)
     assert.equal(alerts[0]!.severity, 'critical')
   })
@@ -206,18 +206,18 @@ describe('terminal-unnotified branch (financial safety)', () => {
       container: noContainer,
       assessBilling: async () => { throw new Error('db blip') },
     })
-    assert.equal(counts.projections, 0)
+    assert.equal(counts.visibleFailures, 0)
     assert.equal(counts.notified, 0)
     assert.equal(counts.manualReconcile, 0)
-    assert.ok(!pool.writes.some((w) => w.startsWith('INSERT INTO turn_dispatch_error_projections')))
+    assert.ok(!pool.writes.some((w) => w.includes('client_notified = TRUE')))
   })
 })
 
-describe('B-R1-1: not_accepted → abort pre-forward journal → not_billed projection', () => {
+describe('B-R1-1: not_accepted → abort pre-forward journal → durable visible status', () => {
   // 故障注入:accepted→(容器 rejected)→terminal(not_accepted),但 bridge attach 前写的
   // pre-forward inflight journal 仍在(state='inflight' 无 usage)。旧实现里 assessDispatchBilling
-  // 把它当 billed → 全进 manual、无 projection、违反 I1。修复后:③ 分支先在同一 tx 内 CAS 该
-  // journal 为永久 no-execution waiver aborted,assess 遂得 not_billed → projection。
+  // 把它当 billed → 全进 manual、用户看不到终态、违反 I1。修复后:③ 分支先在同一 tx 内 CAS 该
+  // journal 为永久 no-execution waiver aborted,assess 遂得 not_billed → 直接状态可见。
   // 用**真实** assessDispatchBilling(不注入),让 journal 状态随 abort UPDATE 真转移。
   function makeBillingFakePool(opts: { hasUsage?: boolean } = {}) {
     const writes: string[] = []
@@ -249,7 +249,6 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → not_billed proj
       }
       if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
         writes.push(s)
-        if (s.startsWith('INSERT INTO turn_dispatch_error_projections')) return { rows: [], rowCount: 1 }
         if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
         if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
         return { rows: [], rowCount: 1 }
@@ -271,7 +270,7 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → not_billed proj
     }
   }
 
-  test('inflight journal 存在 → journal aborted(永久 waiver) + projection 生成 + 非 manual + 释放 reservation', async () => {
+  test('inflight journal 存在 → journal aborted(永久 waiver) + status 可见 + 非 manual + 释放 reservation', async () => {
     const fake = makeBillingFakePool()
     const alerts: unknown[] = []
     const counts = await runReconcileTick({
@@ -284,11 +283,12 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → not_billed proj
     assert.ok(fake.journalAborted, 'pre-forward inflight journal 应被 abort 为永久 waiver')
     const abortWrite = fake.writes.find((w) => w.startsWith('UPDATE request_finalize_journal') && w.includes("state='aborted'"))
     assert.ok(abortWrite, 'abort UPDATE 应按 dispatch_id 发出')
-    // 财务判定 not_billed → projection(免单 tone),非 manual。
-    assert.equal(counts.projections, 1)
+    // 财务判定 not_billed → durable status(免单 tone),非 manual。
+    assert.equal(counts.visibleFailures, 1)
     assert.equal(counts.notified, 1)
     assert.equal(counts.manualReconcile, 0)
-    assert.ok(fake.writes.some((w) => w.startsWith('INSERT INTO turn_dispatch_error_projections')))
+    assert.ok(fake.writes.some((w) => w.includes('client_notified = TRUE')))
+    assert.ok(!fake.writes.some((w) => w.includes('turn_dispatch_error_projections')))
     assert.ok(!fake.writes.some((w) => w.includes("status = 'manual_reconcile'")))
     assert.equal(alerts.length, 0)
     // reservation 提前释放(best-effort)。
@@ -305,9 +305,9 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → not_billed proj
     })
     assert.equal(fake.journalAborted, false, 'no-usage 守卫不命中时绝不 abort journal')
     assert.equal(counts.manualReconcile, 1)
-    assert.equal(counts.projections, 0)
+    assert.equal(counts.visibleFailures, 0)
     assert.ok(fake.writes.some((w) => w.includes("status = 'manual_reconcile'")))
-    assert.ok(!fake.writes.some((w) => w.startsWith('INSERT INTO turn_dispatch_error_projections')))
+    assert.ok(!fake.writes.some((w) => w.includes('client_notified = TRUE')))
     assert.equal(alerts[0]?.severity, 'critical')
   })
 })
@@ -378,13 +378,13 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     assert.equal(counts.rejectedTerminal, 0, '不可达绝不推断终态')
     assert.equal(counts.manualReconcile, 0)
     assert.ok(!pool.writes.some((w) => w.includes("status = 'terminal'")), '不动 dispatch 状态')
-    // Codex R1 MAJOR 回归锁:扫描 cutoff 必须按 15min 取(不是 stuckMs 的 90min 下限),
-    // 否则求证系统性瘫痪(SSRF 拦死)要等 90min+ 才首告。
+    // All accepted rows are now probed so a durable typed interruption is
+    // visible on the next tick instead of waiting 15/90 minutes.
     assert.equal(pool.acceptedScanCutoffs.length >= 1, true, 'accepted 扫描必须带时间参数')
     const cutoffAge = Date.now() - pool.acceptedScanCutoffs[0]!.getTime()
     assert.ok(
-      cutoffAge > 14 * 60_000 && cutoffAge < 16 * 60_000,
-      `扫描下限必须≈15min(实际 ${Math.round(cutoffAge / 60_000)}min)`,
+      cutoffAge >= 0 && cutoffAge < 5_000,
+      `扫描下限必须≈当前时刻(实际 ${cutoffAge}ms)`,
     )
   })
 
@@ -432,6 +432,34 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     const counts = await runReconcileTick({ pool: pool as unknown as Pool, container })
     assert.equal(counts.rejectedTerminal, 0)
     assert.equal(counts.manualReconcile, 0)
+  })
+
+  test('container typed crash becomes a direct status without fabricating Agent tape', async () => {
+    const pool = makeFakePool({
+      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
+    })
+    let nudged = 0
+    const revisionBumps: Array<[string, string]> = []
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      container: {
+        ...noContainer,
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok', state: 'terminal', outcome: 'crashed',
+        }),
+      },
+      nudgeClient: () => { nudged++ },
+      bumpHistoryRevision: async (sessionId, sessionUserId) => {
+        revisionBumps.push([sessionId, sessionUserId])
+        return true
+      },
+    })
+    assert.equal(counts.visibleFailures, 1)
+    assert.equal(counts.notified, 1)
+    assert.equal(nudged, 1)
+    assert.ok(pool.writes.some((w) =>
+      w.includes("status = 'terminal'") && w.includes('failure_code = $3')))
+    assert.deepEqual(revisionBumps, [['sess-0001', 'c:42']])
   })
 })
 

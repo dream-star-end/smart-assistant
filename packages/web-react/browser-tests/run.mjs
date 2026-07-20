@@ -12,7 +12,9 @@
 //   T3 选文件后 chip 出现且非 error 态(onUpload stub → done);
 //   T4 file input 结构红线:type=file / 无 accept / 计算样式非 display:none / tabindex=-1
 //      (国产内核约束 61de46e2/de16e2be 的真浏览器断言);
-//   T5 点「+」→「设定目标」→ 目标对话框弹出(同菜单的第二入口回归对照)。
+//   T5 惰性 user sidecar 在真 viewport 水合为原文，重试收到同一份精确 payload;
+//   T6 惰性 Agent tape record 水合为真实 ToolCard，不显示 locator 替身;
+//   T7 点「+」→「设定目标」→ 目标对话框弹出(同菜单的第二入口回归对照)。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -39,6 +41,10 @@ await esbuild.build({
   format: "iife",
   outfile: bundlePath,
   jsx: "automatic",
+  // MessageRenderer pulls the production Markdown/KaTeX stylesheet graph.
+  // This component smoke asserts behavior rather than visual CSS, so keep the
+  // real React code while excluding stylesheet/font assets from the IIFE.
+  loader: { ".css": "empty" },
   define: { "process.env.NODE_ENV": '"production"' },
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
@@ -49,7 +55,7 @@ await esbuild.build({
 // 不参与本测试,故在此内联同义规则)。
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
-</style></head><body><div id="root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -138,7 +144,42 @@ await check("T4 file input 结构红线:type=file/无 accept/非 display:none/ta
   if (info.tabIndex !== -1) throw new Error(`file input tabindex=${info.tabIndex},应为 -1`);
 });
 
-await check("T5 点「+」→「设定目标」→ 目标对话框弹出", async () => {
+await check("T5 惰性 user sidecar 水合为原文且重试收到精确 payload", async () => {
+  const root = page.locator("#timeline-user-root");
+  await root.getByText("EXACT_DEFERRED_USER_MARKER").waitFor({ state: "visible", timeout: 3000 });
+  await root.getByRole("button", { name: "重试" }).click();
+  const state = await page.evaluate(() => window.__lazyTimeline);
+  if (state.userFetches !== 1) throw new Error(`user payload fetch 次数=${state.userFetches},应为 1`);
+  const expected = JSON.stringify({
+    id: "deferred-user-probe",
+    text: "EXACT_DEFERRED_USER_MARKER",
+    modelText: "EXACT_MODEL_VISIBLE_PROMPT",
+    retryFilename: "exact-retry.txt",
+  });
+  if (JSON.stringify(state.userRetry) !== expected) {
+    throw new Error(`重试未收到精确 user payload:${JSON.stringify(state.userRetry)}`);
+  }
+});
+
+await check("T6 惰性 Agent tape record 水合为真实 ToolCard", async () => {
+  const root = page.locator("#timeline-agent-root");
+  await root.getByText("终端").waitFor({ state: "visible", timeout: 3000 });
+  await root.locator("button").first().click();
+  await root.getByText("EXACT_AGENT_PROCESS_MARKER").waitFor({ state: "visible", timeout: 3000 });
+  const state = await page.evaluate(() => window.__lazyTimeline);
+  if (state.tapeFetches !== 1) throw new Error(`tape payload fetch 次数=${state.tapeFetches},应为 1`);
+  const expected = JSON.stringify({
+    tapeId: "tape-browser-probe",
+    ordinal: 7,
+    recordId: "deferred-tool-probe",
+    role: "tool",
+  });
+  if (JSON.stringify(state.tapeFetch) !== expected) {
+    throw new Error(`tape payload 定位键漂移:${JSON.stringify(state.tapeFetch)}`);
+  }
+});
+
+await check("T7 点「+」→「设定目标」→ 目标对话框弹出", async () => {
   await plusButton.click();
   const goalItem = page.getByText("设定目标");
   await goalItem.waitFor({ state: "visible", timeout: 3000 });

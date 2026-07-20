@@ -60,7 +60,7 @@ import type {
   SessionArchivePage,
   SessionDetail,
   SessionMeta,
-  TapeRecordChunk,
+  TapeRecordPayload,
   TapeRecordsPage,
   SubscriptionPlanWire,
   MySubscription,
@@ -842,6 +842,70 @@ export type ContainerPreviewTicketResponse = {
   };
 };
 
+/** Resolve legacy locators through HEAD, then assemble the immutable JSON with
+ * real byte-range requests. The 1 MiB quantum is transport backpressure, not a
+ * record-size limit; every byte is retained and verified by the payload parser. */
+export async function getExactDeferredPayload(
+  a: AuthSession,
+  url: string,
+  signal?: AbortSignal,
+): Promise<TapeRecordPayload> {
+  const head = await callWithRefresh(a, (token) =>
+    fetch(url, {
+      method: "HEAD",
+      credentials: "include",
+      headers: bearerHeaders(token),
+      signal,
+    }),
+  );
+  assertAuthResponseCurrent(head);
+  if (!head.ok) await throwApi(head);
+  const totalBytes = Number(head.headers.get("content-length"));
+  const contentSha256 = head.headers.get("x-openclaude-content-sha256") ?? "";
+  const recordId = head.headers.get("x-openclaude-record-id") ?? "";
+  const role = head.headers.get("x-openclaude-record-role") ?? "";
+  if (
+    !Number.isSafeInteger(totalBytes) || totalBytes < 1 ||
+    !/^[a-f0-9]{64}$/.test(contentSha256) ||
+    recordId.length === 0 || role.length === 0 ||
+    head.headers.get("accept-ranges")?.toLowerCase() !== "bytes"
+  ) {
+    throw new Error("invalid immutable deferred payload metadata");
+  }
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+
+  const target = new Uint8Array(totalBytes);
+  const quantum = 1024 * 1024;
+  for (let offset = 0; offset < totalBytes; offset += quantum) {
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    const end = Math.min(totalBytes, offset + quantum) - 1;
+    const res = await callWithRefresh(a, (token) =>
+      fetch(url, {
+        credentials: "include",
+        headers: { ...bearerHeaders(token), Range: `bytes=${offset}-${end}` },
+        signal,
+      }),
+    );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const chunk = new Uint8Array(await res.arrayBuffer());
+    assertAuthResponseCurrent(res);
+    if (
+      res.status !== 206 ||
+      res.headers.get("content-range") !== `bytes ${offset}-${end}/${totalBytes}` ||
+      res.headers.get("x-openclaude-content-sha256") !== contentSha256 ||
+      res.headers.get("x-openclaude-record-id") !== recordId ||
+      res.headers.get("x-openclaude-record-role") !== role ||
+      chunk.byteLength !== end - offset + 1
+    ) {
+      throw new Error("immutable deferred payload range identity mismatch");
+    }
+    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+    target.set(chunk, offset);
+  }
+  return { bytes: target.buffer, contentSha256, recordId, role };
+}
+
 export const api = {
   // ── 鉴权 ───────────────────────────────────────────────────────────
 
@@ -1440,13 +1504,13 @@ export const api = {
         || (detail.historyRevision as number) < 0
       ) {
         // A legacy backend can return a plausible `_seq` partial without the
-        // projection revision. Never retain that cursor: retry an incremental
+        // history revision. Never retain that cursor: retry an incremental
         // request once as full, and mark every legacy full so callers evict
-        // hydrated projection caches during a coordinated downgrade.
+        // hydrated history caches during a coordinated downgrade.
         if (sinceSeq > 0) {
-          return request("").then((full) => ({ ...full, _projectionRevisionUnsupported: true as const }));
+          return request("").then((full) => ({ ...full, _historyRevisionUnsupported: true as const }));
         }
-        return { ...detail, _projectionRevisionUnsupported: true as const };
+        return { ...detail, _historyRevisionUnsupported: true as const };
       }
       return detail;
     });
@@ -1525,11 +1589,7 @@ export const api = {
     );
   },
 
-  /**
-   * §9 折叠卷/截断记录分页(GET /api/sessions/:id/tape/:tapeId/records，Bearer)——展开折叠卡 /
-   * 查看截断工具输出。`cursor` 缺省(null)=首页;`limit` 默认 200、后端上限 200/≤1MB。返回 chat-safe
-   * 投影记录 + `nextCursor`(null=末页)+ `total`。越权/不存在统一 404(经 ApiError 抛,调用方吞错)。
-   */
+  /** 不可变 turn-tape 记录分页。页大小是批次，不是总内容上限。 */
   getTapeRecords: (
     a: AuthSession,
     id: string,
@@ -1551,29 +1611,33 @@ export const api = {
     );
   },
 
-  /**
-   * §9(M-§9-1)超大内容"查看完整"按记录有界读(GET /api/sessions/:id/tape/:tapeId/records?
-   * recordOrdinal=<n>&offset=<bytes>，Bearer)。返回该单条 record 的展示文本一个字节窗口
-   * (`chunk` ≤256KB，绝不整卷)+ `nextOffset`(null=读尽)+ `totalBytes`。前端分块拉取拼接
-   * (上限 4MB)。路由层 per-user 令牌桶限频超限 → 429(经 ApiError 抛);越权/不存在 → 404。
-   */
-  getTapeRecordChunk: (
+  /** 读取单条真实、脱敏后不可变 JSON；HEAD + Range，不发整条巨型响应。 */
+  getTapeRecordPayload: async (
     a: AuthSession,
     id: string,
     tapeId: string,
     recordOrdinal: number,
-    offset = 0,
-  ): Promise<TapeRecordChunk> => {
-    const params = new URLSearchParams();
-    params.set("recordOrdinal", String(recordOrdinal));
-    if (offset > 0) params.set("offset", String(offset));
-    return jsonOrThrow<TapeRecordChunk>(
-      callWithRefresh(a, (t) =>
-        fetch(
-          `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}/records?${params.toString()}`,
-          { credentials: "include", headers: bearerHeaders(t) },
-        ),
-      ),
+    signal?: AbortSignal,
+  ): Promise<TapeRecordPayload> => {
+    return getExactDeferredPayload(
+      a,
+      `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}` +
+        `/records/${recordOrdinal}/payload`,
+      signal,
+    );
+  },
+
+  /** 超长 user 行的原始 JSON。与 tape payload 共用 HEAD + Range + SHA 契约。 */
+  getUserMessagePayload: async (
+    a: AuthSession,
+    id: string,
+    messageId: string,
+    signal?: AbortSignal,
+  ): Promise<TapeRecordPayload> => {
+    return getExactDeferredPayload(
+      a,
+      `/api/sessions/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/payload`,
+      signal,
     );
   },
 
@@ -1636,7 +1700,19 @@ export const api = {
   appendUserMessage: (
     a: AuthSession,
     id: string,
-    msg: { id: string; text: string; ts: number; media?: unknown },
+    msg: {
+      id: string;
+      text: string;
+      ts: number;
+      media?: unknown;
+      _retryMedia?: unknown;
+      _imageEdit?: unknown;
+      _modelText?: string;
+      _routing?: unknown;
+      _sendAttempt?: number;
+      _isAutoRetry?: boolean;
+      _idem?: string;
+    },
   ): Promise<void> =>
     jsonOrThrow<{ ok: true }>(
       callWithRefresh(a, (t) =>

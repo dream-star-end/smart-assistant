@@ -319,7 +319,7 @@ export function deriveLosslessTurnKey(payload: V3MasterSinkWirePayload): string 
 export function buildLosslessTurnTapeRequests(
   payload: V3MasterSinkWirePayload & { agentId: string },
   now: () => number = Date.now,
-): { parts: LosslessTurnTapePartRequest[]; finalize: LosslessTurnTapeFinalizeRequest; canonical: Buffer } {
+): { finalize: LosslessTurnTapeFinalizeRequest; canonical: Buffer } {
   const createdAt = payload.createdAt ?? now()
   const turnKey = deriveLosslessTurnKey(payload)
   const canonical = serializeLosslessTurnPayload({ ...payload, createdAt, turnKey })
@@ -347,21 +347,28 @@ export function buildLosslessTurnTapeRequests(
       ? { dispatchId: payload.dispatchId, attemptNo: payload.attemptNo }
       : {}),
   } as const
-  const parts: LosslessTurnTapePartRequest[] = []
-  for (let partIndex = 0; partIndex < partCount; partIndex++) {
-    const bytes = canonical.subarray(
+  return { finalize: { ...base, action: 'finalize' }, canonical }
+}
+
+/** Yield one base64 envelope at a time. Production never retains an array of
+ * all encoded parts (which previously added ~4/3 of the whole turn again). */
+export function* iterateLosslessTurnTapeParts(
+  tape: ReturnType<typeof buildLosslessTurnTapeRequests>,
+): Generator<LosslessTurnTapePartRequest> {
+  const { action: _action, ...base } = tape.finalize
+  for (let partIndex = 0; partIndex < tape.finalize.partCount; partIndex++) {
+    const bytes = tape.canonical.subarray(
       partIndex * LOSSLESS_TURN_TAPE_PART_BYTES,
-      Math.min(canonical.length, (partIndex + 1) * LOSSLESS_TURN_TAPE_PART_BYTES),
+      Math.min(tape.canonical.length, (partIndex + 1) * LOSSLESS_TURN_TAPE_PART_BYTES),
     )
-    parts.push({
+    yield {
       ...base,
       action: 'part',
       partIndex,
       partSha256: sha256(bytes),
       data: bytes.toString('base64'),
-    })
+    }
   }
-  return { parts, finalize: { ...base, action: 'finalize' }, canonical }
 }
 
 async function postLosslessTurnTapeEnvelope(
@@ -412,7 +419,9 @@ export async function attemptSendLossless(
   deps: AttemptSendDeps,
 ): Promise<void> {
   const tape = buildLosslessTurnTapeRequests(payload, deps.now)
-  for (const part of tape.parts) await postLosslessTurnTapeEnvelope(part, deps)
+  for (const part of iterateLosslessTurnTapeParts(tape)) {
+    await postLosslessTurnTapeEnvelope(part, deps)
+  }
   await postLosslessTurnTapeEnvelope(tape.finalize, deps)
 }
 

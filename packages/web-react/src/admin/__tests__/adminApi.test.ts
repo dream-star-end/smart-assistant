@@ -113,6 +113,52 @@ describe("adminGet", () => {
   });
 });
 
+describe("adminGetExactPayload", () => {
+  test("admin scope 复用 HEAD + Range 精确读取并保留查询参数", async () => {
+    const { adminGetExactPayload } = await loadAdminApi();
+    // User API coverage already exercises multi-range reconstruction. Keep the
+    // admin authorization-path case small so jsdom is not dominated by Blob IO.
+    const source = new Uint8Array(64 * 1024 + 3).fill(7);
+    const hash = "a".repeat(64);
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      expect(url).toBe("/api/admin/sessions/web-1/messages/cm%3A1/payload?user_id=1");
+      if (init?.method === "HEAD") {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            "content-length": String(source.length),
+            "accept-ranges": "bytes",
+            "x-openclaude-content-sha256": hash,
+            "x-openclaude-record-id": "cm:1",
+            "x-openclaude-record-role": "user",
+          },
+        });
+      }
+      const range = new Headers(init?.headers).get("range")!;
+      const match = /^bytes=(\d+)-(\d+)$/.exec(range)!;
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      return new Response(source.slice(start, end + 1), {
+        status: 206,
+        headers: {
+          "content-range": `bytes ${start}-${end}/${source.length}`,
+          "x-openclaude-content-sha256": hash,
+          "x-openclaude-record-id": "cm:1",
+          "x-openclaude-record-role": "user",
+        },
+      });
+    });
+
+    const result = await adminGetExactPayload(
+      "/sessions/web-1/messages/cm%3A1/payload",
+      { user_id: 1 },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(Array.from(new Uint8Array(result.bytes))).toEqual(Array.from(source));
+    expect(result).toMatchObject({ recordId: "cm:1", role: "user", contentSha256: hash });
+  });
+});
+
 describe("adminSend", () => {
   test("带 body 时序列化 + content-type", async () => {
     const { adminSend } = await loadAdminApi();

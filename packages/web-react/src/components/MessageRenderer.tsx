@@ -5,28 +5,30 @@
  * 经 messageSignature 做 memo —— reducer 就地 mutation（同对象引用）下，React.memo 浅比较
  * 会漏渲，故以「内容签名」为比较键：变才渲、不变则稳定（复刻现网 keyed-reconcile 防闪）。
  *
- * MessageList：把会话消息流渲成卡片列表 + 流式 typing 指示 + 溢出 load-more（>100 条）。
+ * MessageList：把会话消息流渲成虚拟卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
 import { Info, Sparkles } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { Virtuoso, VirtuosoMockContext } from "react-virtuoso";
 import type { ChatMessage } from "../lib/chat/model";
 import {
   collectResolvedDispatchTurnIds,
   HIDDEN_REVIEWER_AGENT_ID,
-  isProjectionSuppressedByTerminal,
+  isTurnStatusSuppressedByTape,
   messageKind,
   messageSignature,
 } from "../lib/chat/render";
 import {
   AssistantCard,
   type CardCallbacks,
-  CollapseCard,
+  TurnProcessCard,
   DelegateProgressCard,
   GoalCard,
   PlanCard,
   SystemCard,
   ThinkingCard,
+  TurnStatusCard,
   UserCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
@@ -34,9 +36,10 @@ import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
+import { ExactToolRecordDisclosure } from "./ToolCard";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
-import { loadedArchivedMetrics, planLoadMore } from "./chat/archivePaging";
+import { loadedArchivedMetrics } from "./chat/archivePaging";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput, stripShellWrapperForDisplay } from "./tool/format";
 import { researchToolCard } from "./tool/researchCards";
@@ -83,10 +86,30 @@ export const MessageRenderer = memo(
     readOnly = false,
   }: RendererProps) {
     const ctx = { isLast, sending, turnActivity, inActiveTurn, turnFinalAssistant };
-    // §9 折叠 anchor 优先拦截(role 通常为 assistant,须在 role 分派之前):渲染折叠卷卡,而非 AssistantCard。
-    // 折叠 anchor 是"终态存在证据"入口、非正文,故不出评分卡/MetaRow(turnSegment 已排除其为末条正文)。
-    if (message._tapeCollapsed) {
-      return <CollapseCard msg={message} cb={cb} />;
+    if (message._payloadDeferred) {
+      return (
+        <DeferredTapeRecordCard
+          message={message}
+          isLast={isLast}
+          sending={sending}
+          inActiveTurn={inActiveTurn}
+          turnActivity={turnActivity}
+          turnFinalAssistant={turnFinalAssistant}
+          cb={cb}
+          onRespondPermission={onRespondPermission}
+          readOnly={readOnly}
+        />
+      );
+    }
+    // 过程控制不是 Agent 内容，只负责真实记录的惰性分页。
+    if (message._turnTapeProcess) {
+      return <TurnProcessCard msg={message} cb={cb} />;
+    }
+    if (message._turnStatusRecord) {
+      return <TurnStatusCard msg={message} cb={cb} currentTurn={inActiveTurn} />;
+    }
+    if (message.role === "runtime-event") {
+      return <RuntimeEventCard message={message} />;
     }
     switch (messageKind(message)) {
       case "user":
@@ -96,7 +119,12 @@ export const MessageRenderer = memo(
       case "thinking":
         // 单条兜底路径(直接经 MessageRenderer,如测试/非列表场景)。列表内的连续 thinking
         // 由 MessageList/coalesceTeam 合并成单张多段卡,不走这里。
-        return <ThinkingCard msgs={[message]} sig={sig} ctx={ctx} />;
+        return (
+          <TapeBackedCard>
+            <ThinkingCard msgs={[message]} sig={sig} ctx={ctx} />
+            <ExactTapeRecordDisclosure messages={[message]} label="思考" />
+          </TapeBackedCard>
+        );
       case "tool": {
         // 模型原生 imagegen(codex:imageGeneration)running → 生成占位卡(需求 C，粒子特效框);
         // 完成/失败回落 ToolCardSlot。running 判定语义与 bodies.tsx 一致(按 tool._completed/error
@@ -115,25 +143,42 @@ export const MessageRenderer = memo(
         // 既有 TodoWrite 只读紧凑卡(含步骤与完成状态),翻旧会话仍能看到当时的计划。
         if (message.toolName === "TodoWrite") {
           if (inActiveTurn && sending) return null;
-          return <ToolCardSlot message={message} onFetchTapeRecords={cb.onFetchTapeRecords} onFetchTapeRecordChunk={cb.onFetchTapeRecordChunk} />;
+          return <ToolCardSlot message={message} />;
         }
         // oc-* 研究工具:直接渲染干净的专属卡片,**去掉"终端 + 命令"外壳**(boss 反馈套壳没必要)。
         // 命令出错时 researchToolCard 返回 null → 回落 ToolCardSlot 终端卡,保证报错可见。
         const ocCmd = stripShellWrapperForDisplay(asStr(resolveToolInput(message)?.command));
         if (ocCmd) {
           const ocCard = researchToolCard(ocCmd, message);
-          if (ocCard) return <div className="px-0.5 py-1">{ocCard}</div>;
+          if (ocCard) {
+            return (
+              <div className="px-0.5 py-1">
+                {ocCard}
+                <ExactToolRecordDisclosure message={message} />
+              </div>
+            );
+          }
         }
-        return <ToolCardSlot message={message} onFetchTapeRecords={cb.onFetchTapeRecords} onFetchTapeRecordChunk={cb.onFetchTapeRecordChunk} />;
+        return <ToolCardSlot message={message} />;
       }
       case "plan":
         // structured plan steps:当前活跃段且本轮进行中 → 统一进 composer 上方的
         // PinnedTaskTracker,inline 抑制防同一计划上下重复两张卡;历史段渲染 PlanCard
         // 只读卡(含步骤与状态)。text-only plan(无 steps)恒走 inline 兜底。
         if ((message.steps?.length ?? 0) > 0 && inActiveTurn && sending) return null;
-        return <PlanCard msg={message} />;
+        return (
+          <TapeBackedCard>
+            <PlanCard msg={message} />
+            <ExactTapeRecordDisclosure messages={[message]} label="计划" />
+          </TapeBackedCard>
+        );
       case "goal":
-        return <GoalCard msg={message} />;
+        return (
+          <TapeBackedCard>
+            <GoalCard msg={message} />
+            <ExactTapeRecordDisclosure messages={[message]} label="目标" />
+          </TapeBackedCard>
+        );
       case "permission":
         return <PermissionCard msg={message} onRespond={onRespondPermission} readOnly={readOnly} />;
       case "agent-group":
@@ -143,8 +188,10 @@ export const MessageRenderer = memo(
       case "system":
         return <SystemCard msg={message} />;
       default:
-        // Unknown/future roles fail safe without an empty card.
-        return null;
+        // Immutable tape rows must remain visible even when a newer engine
+        // introduces a role this web build does not yet understand. Render
+        // the exact raw record instead of silently dropping the event.
+        return message._turnTapeId ? <RuntimeEventCard message={message} /> : null;
     }
   },
   (a, b) =>
@@ -160,7 +207,294 @@ export const MessageRenderer = memo(
     a.onRespondPermission === b.onRespondPermission,
 );
 
-const LOAD_MORE_STEP = 100;
+const RUNTIME_TEXT_STEP = 32 * 1024;
+
+function TapeBackedCard({ children }: { children: ReactNode }) {
+  return <div className="space-y-1">{children}</div>;
+}
+
+/** Readable cards retain their pre-direct-timeline UX, while the immutable
+ * source remains reachable byte-for-byte instead of being replaced by the
+ * formatted view. Serialization and mounting happen only after the click. */
+function ExactTapeRecordDisclosure({
+  messages,
+  label,
+}: {
+  messages: ChatMessage[];
+  label: string;
+}) {
+  const exactMessages = messages.filter((message) => !!message._turnTapeId);
+  const [open, setOpen] = useState(false);
+  const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
+  if (exactMessages.length === 0) return null;
+
+  const raw = exactMessages.length === 1
+    ? exactMessages[0]._eventHistory ?? exactMessages[0]
+    : exactMessages.map((message) => message._eventHistory ?? message);
+  const serialized = open ? JSON.stringify(raw, null, 2) ?? String(raw) : "";
+
+  return (
+    <div className="px-1">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="text-[11px] text-faint hover:text-muted"
+      >
+        {open ? `收起原始${label}记录` : `查看原始${label}记录`}
+      </button>
+      {open && (
+        <div className="mt-1 rounded-md border border-border bg-surface px-3 py-2">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+            {serialized.slice(0, visibleChars)}
+          </pre>
+          {visibleChars < serialized.length && (
+            <button
+              type="button"
+              onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+            >
+              继续显示原始记录
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Every persisted runtime event remains inspectable. The JSON body is
+ * progressively mounted so a multi-megabyte event never blocks a frame. */
+function RuntimeEventCard({ message }: { message: ChatMessage }) {
+  const raw = message._runtimeEvent ?? message;
+  const event = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  const eventLabel = [event.type, event.subtype].filter((part) => typeof part === "string").join(" · ");
+  const label = eventLabel || (message.role === "runtime-event"
+    ? "运行事件"
+    : `原始 Agent 记录 · ${message.role || "unknown"}`);
+  const [open, setOpen] = useState(false);
+  const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
+  const serialized = open ? JSON.stringify(raw, null, 2) : "";
+  return (
+    <div className="overflow-hidden rounded-lg border border-border bg-surface animate-in">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[12.5px] hover:bg-hover"
+      >
+        <span className="size-1.5 shrink-0 rounded-full bg-faint" />
+        <span className="min-w-0 flex-1 truncate text-muted">{label}</span>
+        {message._runtimeSource && <span className="shrink-0 text-[11px] text-faint">{message._runtimeSource}</span>}
+        <span className="text-faint">{open ? "收起" : "查看原始记录"}</span>
+      </button>
+      {open && (
+        <div className="border-t border-border px-3.5 py-2.5">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+            {serialized.slice(0, visibleChars)}
+          </pre>
+          {visibleChars < serialized.length && (
+            <button
+              type="button"
+              onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted hover:text-fg"
+            >
+              继续显示原始记录
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DeferredTapeRecordCard({
+  message,
+  isLast,
+  sending,
+  inActiveTurn,
+  turnActivity,
+  cb,
+  onRespondPermission,
+  readOnly,
+  turnFinalAssistant,
+}: Omit<RendererProps, "sig" | "delegateCost">) {
+  const ref = useRef<HTMLDivElement>(null);
+  const started = useRef(false);
+  const requestAbortRef = useRef<AbortController | null>(null);
+  const [records, setRecords] = useState<ChatMessage[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  const isUserPayload = message._userPayloadDeferred === true;
+  const payloadId = isUserPayload ? message._userPayloadId ?? message.id : message.id;
+  const payloadSha256 = message._payloadSha256;
+  const tapeId = message._turnTapeId;
+  const recordOrdinal = message._recordOrdinal;
+  const load = useCallback(async () => {
+    if (started.current) return;
+    const expected = {
+      recordId: payloadId,
+      role: message.role,
+      ...(payloadSha256 ? { contentSha256: payloadSha256 } : {}),
+    };
+    const controller = new AbortController();
+    let request: Promise<ChatMessage[] | null> | null = null;
+    if (isUserPayload) {
+      if (cb.onFetchUserMessagePayload) {
+        request = cb.onFetchUserMessagePayload(payloadId, expected, controller.signal);
+      }
+    } else {
+      if (cb.onFetchTapeRecordPayload && tapeId && typeof recordOrdinal === "number") {
+        request = cb.onFetchTapeRecordPayload(tapeId, recordOrdinal, expected, controller.signal);
+      }
+    }
+    if (!request) {
+      setFailed(true);
+      return;
+    }
+    started.current = true;
+    requestAbortRef.current = controller;
+    setFailed(false);
+    let loaded: ChatMessage[] | null = null;
+    try {
+      loaded = await request;
+    } catch {
+      loaded = null;
+    }
+    if (requestAbortRef.current === controller) requestAbortRef.current = null;
+    if (controller.signal.aborted) return;
+    if (!loaded) {
+      started.current = false;
+      setFailed(true);
+      return;
+    }
+    setRecords(loaded);
+  }, [
+    cb.onFetchTapeRecordPayload,
+    cb.onFetchUserMessagePayload,
+    isUserPayload,
+    message.role,
+    payloadId,
+    payloadSha256,
+    recordOrdinal,
+    tapeId,
+  ]);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const cancel = () => {
+      const controller = requestAbortRef.current;
+      if (!controller) return;
+      requestAbortRef.current = null;
+      started.current = false;
+      controller.abort();
+    };
+    if (typeof IntersectionObserver === "undefined") {
+      void load();
+      return cancel;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          void load();
+        }
+      },
+      { rootMargin: "600px 0px" },
+    );
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+      cancel();
+    };
+  }, [load]);
+
+  if (records) {
+    return (
+      <div className="space-y-3">
+        {records.map((record, index) => {
+          // Payload bytes are immutable, but billing/status overlays on the
+          // small locator can advance after the first viewport load. Re-merge
+          // them on every locator render so late cost/waiver/reply state stays
+          // visible without downloading the immutable body again.
+          const currentUsage = record.id === message.id && message.usage
+            ? { ...(record.usage ?? {}), ...message.usage }
+            : record.usage;
+          const hydratedRecord: ChatMessage = isUserPayload
+            ? {
+                ...record,
+                // Keep UI actions bound to the current dispatch row; the
+                // immutable fetch key remains explicit and survives reload.
+                id: message.id,
+                _userPayloadId: message._userPayloadId ?? message.id,
+                _source: "server",
+                status: message.status ?? record.status,
+                ...(currentUsage ? { usage: currentUsage } : {}),
+                _payloadDeferred: undefined,
+                _userPayloadDeferred: undefined,
+                _payloadBytes: undefined,
+                _payloadSha256: undefined,
+                _seq: message._seq,
+                _orderSeq: message._orderSeq,
+                _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+                _routing: record._routing ?? message._routing,
+                _sendAttempt: message._sendAttempt ?? record._sendAttempt,
+                _deferredRetryEligible: undefined,
+              }
+            : {
+                ...record,
+                ...(currentUsage ? { usage: currentUsage } : {}),
+                _turnTapeId: message._turnTapeId,
+                _turnTapeSha256: message._turnTapeSha256,
+                _turnTapeOrdinal: message._recordOrdinal,
+                _recordOrdinal: message._recordOrdinal,
+                _turnTapeComplete: true,
+                _turnTapeProcessLoadedFrom: message._turnTapeProcessLoadedFrom,
+                _seq: message._seq,
+                _orderSeq: message._orderSeq,
+                _clientMessageId: record._clientMessageId ?? message._clientMessageId,
+              };
+          const final = isLast && index === records.length - 1;
+          const recordIsFinalAssistant = turnFinalAssistant === true &&
+            hydratedRecord.role === "assistant" && index === records.length - 1;
+          const recordSig = messageSignature(hydratedRecord, {
+            isLast: final,
+            sending,
+            turnFinalAssistant: recordIsFinalAssistant,
+          });
+          return (
+            <MessageRenderer
+              key={hydratedRecord.id}
+              message={hydratedRecord}
+              sig={recordSig}
+              isLast={final}
+              sending={sending}
+              inActiveTurn={inActiveTurn}
+              turnActivity={turnActivity}
+              turnFinalAssistant={recordIsFinalAssistant}
+              cb={cb}
+              onRespondPermission={onRespondPermission}
+              readOnly={readOnly}
+            />
+          );
+        })}
+      </div>
+    );
+  }
+  return (
+    <div ref={ref} className="rounded-lg border border-dashed border-border bg-surface px-3.5 py-3 text-xs text-muted">
+      {failed ? (
+        <button type="button" onClick={() => void load()} className="text-danger hover:underline">
+          {isUserPayload ? "完整用户消息加载失败，点击重试" : "真实记录加载失败，点击重试"}
+        </button>
+      ) : (
+        <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
+      )}
+    </div>
+  );
+}
 
 /** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队",
  *  或"连续多个 role=thinking 行合并成的单张多段思考卡"。
@@ -348,6 +682,7 @@ export function MessageList({
   cb,
   onRespondPermission,
   readOnly = false,
+  scrollParent,
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -361,41 +696,26 @@ export function MessageList({
   onRespondPermission: PermissionRespond;
   /** 管理端等只读 surface；默认 false，用户端行为不变。 */
   readOnly?: boolean;
+  /** Existing chat scroller. When present, only viewport-adjacent rows mount. */
+  scrollParent?: HTMLElement | null;
 }) {
-  // 浏览器 chat 投影只会带净化后的 runtime checkpoint/tail patch；旧缓存仍可能含 raw
-  // runtime-event。两者都不出卡,也绝不能占掉「最近 100 条可见消息」窗口。
-  // reducer 会就地 mutation messages,这里故意每次 render 重算轻量投影,不以数组引用 memo。
-  // 权威 messages 数组从不改写/过滤,持久化与逐字节原始记录仍完整保留。
-  // 渲染层双保险(RFC §5):同 _clientMessageId 已有真 tape 生成行时,抑制该轮的 dispatch error
-  // projection 虚拟行 —— server 侧 late-tape 撤销投影(§2.4)传播到端前的竞态窗口兜底,避免
-  // 「结果已显示 + 错误卡并存」。
+  // Drop only legacy substitute rows already present in an old IndexedDB
+  // cache. Runtime events from the immutable tape are first-class renderable
+  // records and must never be filtered out.
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(messages);
   const renderableMessages = messages.filter(
     (m) =>
-      !m._historyProjection &&
-      messageKind(m) !== "unknown" &&
-      !isProjectionSuppressedByTerminal(m, resolvedDispatchTurnIds),
+      !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
+      !m.id.startsWith("projection-") &&
+      !m.id.startsWith("oc-dispatch-err:") &&
+      !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
-  // 溢出：默认只挂最近 LOAD_MORE_STEP 条**可见**消息,"加载更多历史"递增。
-  const [visible, setVisible] = useState(LOAD_MORE_STEP);
   const total = renderableMessages.length;
-  // 归档分页:tape 的一个归档 anchor 可展开成多条共享 `_seq` 的可见行。窗口裁剪扣除已加载
-  // 可见行数,归档 remaining 则从完整原始数组按 distinct `_seq` 扣 anchor 数；runtime-only tape
-  // 即使没有可见投影,也会正确推进云端游标/计数。
   const archivedThroughSeq = archive?.archivedThroughSeq ?? 0;
-  const archivedVisible = archive
-    ? loadedArchivedMetrics(renderableMessages, archivedThroughSeq)
-    : { rows: 0, anchors: 0 };
   const archivedAnchors = archive
     ? loadedArchivedMetrics(messages, archivedThroughSeq).anchors
     : 0;
-  const { sliceStart: start, button: loadMore } = planLoadMore({
-    total,
-    visible,
-    archivedLoadedRows: archivedVisible.rows,
-    archivedLoadedAnchors: archivedAnchors,
-    archivedCount: archive?.archivedCount ?? 0,
-  });
+  const archivedRemaining = Math.max(0, (archive?.archivedCount ?? 0) - archivedAnchors);
   const last = renderableMessages[total - 1];
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
@@ -413,23 +733,62 @@ export function MessageList({
     last.role !== "permission" &&
     // 生成占位卡本身即进度指示器(粒子框 + 角标),末条是占位时不再叠裸 typing 三点。
     !last._genPlaceholder;
-
-  return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
-      {/* 加载更多历史三态(§4/§5):
-          - local：本地内存还有未挂载的更早消息 → 翻内存(count 含归档未拉数)。
-          - cloud：本地翻尽且会话有未拉归档 → 从云端加载(loading/error 子态,失败点击重试)。
-          - null：无更早历史 → 不出按钮。 */}
-      {loadMore?.mode === "local" && (
-        <button
-          type="button"
-          onClick={() => setVisible((v) => v + LOAD_MORE_STEP)}
-          className="mx-auto rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
-        >
-          加载更多历史（还有 {loadMore.count} 条）
-        </button>
-      )}
-      {loadMore?.mode === "cloud" && archive && (
+  const renderItems = coalesceTeam(renderableMessages, 0, sending);
+  const itemKey = (item: RenderItem) => item.kind === "single" ? item.m.id : item.members[0].id;
+  const renderItem = (it: RenderItem) => {
+    if (it.kind === "single" && it.m._genPlaceholder) {
+      const gp = it.m._genPlaceholder;
+      const placeholderSig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
+      return (
+        <MessageBoundary messageId={it.m.id} sig={placeholderSig}>
+          <GeneratingPlaceholderCard
+            aspect={gp.aspect}
+            status={gp.status}
+            startedAt={gp.startedAt}
+            reason={gp.reason}
+          />
+        </MessageBoundary>
+      );
+    }
+    if (it.kind === "team") {
+      return (
+        <MessageBoundary messageId={it.members[0].id} sig={it.sig}>
+          <TeamPanel members={it.members} sig={it.sig} delegateCosts={it.delegateCosts} />
+        </MessageBoundary>
+      );
+    }
+    if (it.kind === "thinking") {
+      return (
+        <MessageBoundary messageId={it.members[0].id} sig={it.sig}>
+          <TapeBackedCard>
+            <ThinkingCard msgs={it.members} sig={it.sig} ctx={{ isLast: it.isLast, sending }} />
+            <ExactTapeRecordDisclosure messages={it.members} label="思考" />
+          </TapeBackedCard>
+        </MessageBoundary>
+      );
+    }
+    const turnFinalAssistant = ratingFinal[it.idx] ?? false;
+    const rowSig = messageSignature(it.m, { isLast: it.isLast, sending, turnFinalAssistant });
+    return (
+      <MessageBoundary messageId={it.m.id} sig={rowSig}>
+        <MessageRenderer
+          message={it.m}
+          sig={rowSig}
+          isLast={it.isLast}
+          sending={sending}
+          inActiveTurn={it.idx >= turnStart}
+          turnActivity={turnActivity}
+          delegateCost={it.delegateCost}
+          turnFinalAssistant={turnFinalAssistant}
+          cb={cb}
+          onRespondPermission={onRespondPermission}
+          readOnly={readOnly}
+        />
+      </MessageBoundary>
+    );
+  };
+  const historyControl = archivedRemaining > 0 && archive ? (
+    <div className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8">
         <button
           type="button"
           onClick={archive.onLoadOlder}
@@ -444,68 +803,13 @@ export function MessageList({
           ) : archive.error ? (
             <span className="text-danger">加载失败，点击重试</span>
           ) : (
-            `从云端加载更早的历史（还有 ${loadMore.remaining} 条）`
+            `向上滚动加载更早历史（还有 ${archivedRemaining} 条）`
           )}
         </button>
-      )}
-      {/* 每条消息(含团队面板)外包一层 MessageBoundary:单条渲染抛异常只降级该条,
-          不让 React 卸载整棵树白屏。key 稳定在 boundary 上;memo 比较仍由内层组件承担。 */}
-      {coalesceTeam(renderableMessages, start, sending).map((it) => {
-        // 生成占位卡(需求 C，本地专属行):拦在 MessageRenderer(memo)之前,用自算签名(含 status/
-        // startedAt/aspect)驱动 running→failed 重渲——占位状态不进 render.ts messageSignature,
-        // 走通用 memo 会漏渲失败态。coalesceTeam 已把它归为 single(role 'system' → 非面板/思考)。
-        if (it.kind === "single" && it.m._genPlaceholder) {
-          const gp = it.m._genPlaceholder;
-          const sig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
-          return (
-            <MessageBoundary key={it.m.id} messageId={it.m.id} sig={sig}>
-              <GeneratingPlaceholderCard
-                aspect={gp.aspect}
-                status={gp.status}
-                startedAt={gp.startedAt}
-                reason={gp.reason}
-              />
-            </MessageBoundary>
-          );
-        }
-        if (it.kind === "team") {
-          return (
-            <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>
-              <TeamPanel members={it.members} sig={it.sig} delegateCosts={it.delegateCosts} />
-            </MessageBoundary>
-          );
-        }
-        if (it.kind === "thinking") {
-          // 合并思考卡:key 稳定在**组内首条**消息 id(流式追加成员时不重挂,防闪);
-          // memo 由 ThinkingCard 内层 sig 比较把关(与 TeamPanel 同款)。
-          return (
-            <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>
-              <ThinkingCard msgs={it.members} sig={it.sig} ctx={{ isLast: it.isLast, sending }} />
-            </MessageBoundary>
-          );
-        }
-        // 轮末条 flag 进 sig(head)+ 同时作 prop:sig 保证翻转时穿透 memo 重渲,prop 供 ctx 渲染。
-        const turnFinalAssistant = ratingFinal[it.idx] ?? false;
-        const sig = messageSignature(it.m, { isLast: it.isLast, sending, turnFinalAssistant });
-        return (
-          <MessageBoundary key={it.m.id} messageId={it.m.id} sig={sig}>
-            <MessageRenderer
-              message={it.m}
-              sig={sig}
-              isLast={it.isLast}
-              sending={sending}
-              inActiveTurn={it.idx >= turnStart}
-              turnActivity={turnActivity}
-              delegateCost={it.delegateCost}
-              turnFinalAssistant={turnFinalAssistant}
-              cb={cb}
-              onRespondPermission={onRespondPermission}
-              readOnly={readOnly}
-            />
-          </MessageBoundary>
-        );
-      })}
-      {/* 独立本轮活动指示（末条不是自渲流式态的卡时）：裸三个点 → 阶段反馈文案。 */}
+    </div>
+  ) : null;
+  const footer = (
+    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
       {showTyping && (
         <div className="flex gap-4 animate-in">
           {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
@@ -523,6 +827,62 @@ export function MessageList({
           {transientNotice.text}
         </Alert>
       )}
+    </div>
+  );
+
+  // App/admin pass an explicit null during the callback-ref's first commit.
+  // Mounting the non-virtual fallback in that one frame would still build the
+  // entire long transcript before Virtuoso can take over. Omitted/undefined
+  // remains the lightweight test/non-scroll surface contract.
+  if (scrollParent === null) {
+    return (
+      <div className="mx-auto flex max-w-3xl items-center justify-center px-5 py-8 text-muted" role="status">
+        <Spinner size={14} />
+        <span className="ml-2 text-xs">正在准备会话…</span>
+      </div>
+    );
+  }
+
+  if (scrollParent) {
+    const virtualList = (
+      <Virtuoso
+        customScrollParent={scrollParent}
+        data={renderItems}
+        computeItemKey={(_index, item) => itemKey(item)}
+        itemContent={(_index, item) => (
+          <div className="mx-auto max-w-3xl px-5 pb-4">{renderItem(item)}</div>
+        )}
+        initialTopMostItemIndex={Math.max(0, renderItems.length - 1)}
+        increaseViewportBy={{ top: 800, bottom: 1200 }}
+        overscan={400}
+        followOutput={sending ? "auto" : false}
+        startReached={() => {
+          if (archive && archivedRemaining > 0 && !archive.loading) archive.onLoadOlder();
+        }}
+        components={{
+          Header: () => historyControl,
+          Footer: () => footer,
+        }}
+      />
+    );
+    // jsdom has no layout engine, so Virtuoso cannot infer a viewport from the
+    // real scroll parent during App integration tests. Its official mock
+    // context supplies dimensions while preserving the same virtualized data,
+    // keying and initial-tail behavior. Vite removes this branch from builds.
+    return import.meta.env.MODE === "test" ? (
+      <VirtuosoMockContext.Provider value={{ viewportHeight: 768, itemHeight: 96 }}>
+        {virtualList}
+      </VirtuosoMockContext.Provider>
+    ) : virtualList;
+  }
+
+  // Tests/non-scroll surfaces keep a simple tree; production chat uses the
+  // virtualized branch above.
+  return (
+    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
+      {historyControl}
+      {renderItems.map((item) => <div key={itemKey(item)}>{renderItem(item)}</div>)}
+      {footer}
     </div>
   );
 }

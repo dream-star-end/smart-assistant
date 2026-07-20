@@ -208,7 +208,8 @@ async function startRig(opts: {
   /** B10:容器 attest 携带 durable-turn-dispatch-v1 → 走 dispatch 受理路径。 */
   durableDispatch?: boolean;
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
-  loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
+  loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
+  hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
   loadGoalState?: (uid: bigint, sessionId: string) => Promise<unknown>;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
@@ -308,6 +309,9 @@ async function startRig(opts: {
     ...(opts.admitUserTurn ? { admitUserTurn: opts.admitUserTurn } : {}),
     ...(opts.loadMasterSessionMessages
       ? { loadMasterSessionMessages: opts.loadMasterSessionMessages }
+      : {}),
+    ...(opts.hasCompletedClientTurn
+      ? { hasCompletedClientTurn: opts.hasCompletedClientTurn }
       : {}),
     ...(opts.loadGoalState
       ? { loadGoalState: opts.loadGoalState as UserChatBridgeDeps["loadGoalState"] }
@@ -916,6 +920,8 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
           ts: 2,
         },
       ],
+      hasCompletedClientTurn: async (_uid, _sessionId, clientMessageId) =>
+        clientMessageId === "cm-b10",
     });
     try {
       const ws = await openClient(rig.port);
@@ -950,6 +956,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
 
   test("无 completed 行 → 正常受理(admitUserTurn 被调用一次,不被 dedup 误伤)", async () => {
     let admitCalls = 0;
+    let historyContext: Parameters<NonNullable<UserChatBridgeDeps["loadMasterSessionMessages"]>>[2] | null = null;
     const rig = await startRig({
       attest: "yes",
       durableDispatch: true,
@@ -957,10 +964,14 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
         admitCalls++;
         return fakeAdmittedDispatch(input.clientMessageId);
       },
-      loadMasterSessionMessages: async () => [
-        { id: "u-old", role: "user", text: "older", ts: 1 },
-        { id: "a-old", role: "assistant", text: "older answer", status: "completed", _clientMessageId: "u-old", ts: 2 },
-      ],
+      loadMasterSessionMessages: async (_uid, _sessionId, context) => {
+        historyContext = context;
+        return [
+          { id: "u-old", role: "user", text: "older", ts: 1 },
+          { id: "a-old", role: "assistant", text: "older answer", status: "completed", _clientMessageId: "u-old", ts: 2 },
+        ];
+      },
+      hasCompletedClientTurn: async () => false,
     });
     try {
       const ws = await openClient(rig.port);
@@ -974,6 +985,13 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       // dedup 只在同 clientMessageId 已 completed 时短路;此轮是新 id → 受理照常进行。
       await waitFor(() => admitCalls === 1);
       assert.equal(admitCalls, 1);
+      await waitFor(() => historyContext !== null);
+      assert.deepEqual(historyContext, {
+        contextWindow: 200_000,
+        engine: "ccb",
+        currentUserText: "hi",
+        excludeClientMessageId: "cm-fresh",
+      });
       ws.close();
     } finally {
       await stopRig(rig);

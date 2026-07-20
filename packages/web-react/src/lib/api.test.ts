@@ -79,11 +79,11 @@ test('getSession retries old incremental wire once as an unconditional full read
   expect(detail).toMatchObject({
     isPartial: false,
     messages: [{ content: 'full' }],
-    _projectionRevisionUnsupported: true,
+    _historyRevisionUnsupported: true,
   })
 })
 
-test('getSession marks an initial full response from a legacy projection backend', async () => {
+test('getSession marks an initial full response from a legacy partial-history backend', async () => {
   const fetchMock = vi.fn(async () => ok({
     id: 'web-session-1', messages: [], isPartial: false, maxSeq: 0,
   }))
@@ -93,7 +93,177 @@ test('getSession marks an initial full response from a legacy projection backend
   const detail = await api.getSession(session, 'web-session-1')
 
   expect(fetchMock).toHaveBeenCalledTimes(1)
-  expect(detail._projectionRevisionUnsupported).toBe(true)
+  expect(detail._historyRevisionUnsupported).toBe(true)
+})
+
+test('getTapeRecordPayload resolves metadata with HEAD and reconstructs exact bytes through 1 MiB ranges', async () => {
+  const source = new Uint8Array(2 * 1024 * 1024 + 17)
+  for (let index = 0; index < source.length; index += 1) source[index] = index % 251
+  const hash = 'a'.repeat(64)
+  const ranges: string[] = []
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+    if (init?.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(source.length),
+          'accept-ranges': 'bytes',
+          'x-openclaude-content-sha256': hash,
+          'x-openclaude-record-id': 'record-range',
+          'x-openclaude-record-role': 'tool',
+        },
+      })
+    }
+    const range = new Headers(init?.headers).get('range') ?? ''
+    ranges.push(range)
+    const matched = /^bytes=(\d+)-(\d+)$/.exec(range)
+    if (!matched) throw new Error(`missing range: ${range}`)
+    const start = Number(matched[1])
+    const end = Number(matched[2])
+    return new Response(source.slice(start, end + 1), {
+      status: 206,
+      headers: {
+        'content-range': `bytes ${start}-${end}/${source.length}`,
+        'x-openclaude-content-sha256': hash,
+        'x-openclaude-record-id': 'record-range',
+        'x-openclaude-record-role': 'tool',
+      },
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-tape-range')
+
+  const result = await api.getTapeRecordPayload(
+    session,
+    'session-range-1',
+    'tape-range-1',
+    7,
+  )
+  const reconstructed = new Uint8Array(result.bytes)
+  expect(fetchMock).toHaveBeenCalledTimes(4)
+  expect(ranges).toEqual([
+    'bytes=0-1048575',
+    'bytes=1048576-2097151',
+    `bytes=2097152-${source.length - 1}`,
+  ])
+  expect(result).toMatchObject({
+    contentSha256: hash,
+    recordId: 'record-range',
+    role: 'tool',
+  })
+  expect(reconstructed.length).toBe(source.length)
+  expect(reconstructed.every((byte, index) => byte === source[index])).toBe(true)
+})
+
+test('getTapeRecordPayload aborts the active range when its viewport subscriber leaves', async () => {
+  const hash = 'f'.repeat(64)
+  const seenSignals: AbortSignal[] = []
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit): Promise<Response> => {
+    if (init?.signal) seenSignals.push(init.signal)
+    if (init?.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(2 * 1024 * 1024),
+          'accept-ranges': 'bytes',
+          'x-openclaude-content-sha256': hash,
+          'x-openclaude-record-id': 'record-abort',
+          'x-openclaude-record-role': 'tool',
+        },
+      })
+    }
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('aborted', 'AbortError'))
+      }, { once: true })
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-tape-abort')
+  const controller = new AbortController()
+
+  const pending = api.getTapeRecordPayload(
+    session,
+    'session-abort-1',
+    'tape-abort-1',
+    9,
+    controller.signal,
+  )
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+  controller.abort()
+
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+  expect(seenSignals).toEqual([controller.signal, controller.signal])
+})
+
+test('getUserMessagePayload uses the user sidecar URL and the same exact range contract', async () => {
+  const source = new TextEncoder().encode(JSON.stringify({
+    id: 'cm:user:1', role: 'user', text: '完整超长用户消息', ts: 1,
+  }))
+  const hash = 'b'.repeat(64)
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    expect(url).toBe('/api/sessions/session-user-1/messages/cm%3Auser%3A1/payload')
+    if (init?.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(source.length),
+          'accept-ranges': 'bytes',
+          'x-openclaude-content-sha256': hash,
+          'x-openclaude-record-id': 'cm:user:1',
+          'x-openclaude-record-role': 'user',
+        },
+      })
+    }
+    const range = new Headers(init?.headers).get('range')
+    expect(range).toBe(`bytes=0-${source.length - 1}`)
+    return new Response(source, {
+      status: 206,
+      headers: {
+        'content-range': `bytes 0-${source.length - 1}/${source.length}`,
+        'x-openclaude-content-sha256': hash,
+        'x-openclaude-record-id': 'cm:user:1',
+        'x-openclaude-record-role': 'user',
+      },
+    })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-user-payload')
+
+  const result = await api.getUserMessagePayload(session, 'session-user-1', 'cm:user:1')
+  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(Array.from(new Uint8Array(result.bytes))).toEqual(Array.from(source))
+  expect(result).toMatchObject({
+    contentSha256: hash,
+    recordId: 'cm:user:1',
+    role: 'user',
+  })
+})
+
+test('appendUserMessage forwards the complete exact-replay metadata to master', async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ok({ ok: true }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-user-persist')
+  const message = {
+    id: 'cm-user-persist',
+    text: '显示正文',
+    ts: 123,
+    media: [{ kind: 'image', url: '/api/media/guide.png' }],
+    _retryMedia: [
+      { kind: 'image', url: '/api/media/source.png', hidden: true },
+      { kind: 'image', url: '/api/media/guide.png' },
+    ],
+    _imageEdit: { clientJobId: 'a'.repeat(32), sourceIndex: 0, guideIndex: 1 },
+    _modelText: '显示正文\n[模型附件提示]',
+    _routing: { model: 'gpt-5.6-sol', teamMode: true, effortLevel: 'high' },
+    _sendAttempt: 0,
+  }
+
+  await api.appendUserMessage(session, 'session-user-persist', message)
+
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(fetchMock.mock.calls[0]![0]).toBe('/api/sessions/session-user-persist/user-message')
+  expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toEqual(message)
 })
 
 const ME_BODY = {

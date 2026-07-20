@@ -54,7 +54,8 @@
     "0170_durable_turn_dispatch",
     "0173_client_session_model",
     "0174_selfheal_release_safety_fences",
-    "0175_client_session_history_revision"
+    "0175_client_session_history_revision",
+    "0176_direct_turn_timeline"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
@@ -64,7 +65,8 @@
     "lossless-turn-tape-v2",
     "lossless-turn-runtime-batch-v1",
     "durable-turn-dispatch-v1",
-    "history-projection-revision-v1"
+    "history-projection-revision-v1",
+    "direct-turn-timeline-v1"
   ],
   "runtimeCapabilities": ["model_authority_v1", "lossless-turn-tape-v2", "durable-turn-dispatch-v1"],
   "bridgeFrameSchema": "1",

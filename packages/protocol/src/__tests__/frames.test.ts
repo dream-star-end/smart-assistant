@@ -18,6 +18,8 @@ import {
   OutboundError,
   OutboundMessage,
   OutboundPermissionRequest,
+  isClientMessageId,
+  isPersistedClientMessageId,
 } from '../frames.js'
 
 // 共用 fixture 构造器 —— 一处构造 base frame,后续 spread 覆盖单字段验各种 trace 输入
@@ -87,9 +89,26 @@ const BAD_TRACE_CHARSET = '../etc/passwd_abc' // 含 . /
 const BAD_TRACE_SHORT = 'short' // 5 chars
 const BAD_TRACE_LONG = 'a'.repeat(65) // 65 chars
 
+describe('client message id contracts', () => {
+  it('keeps new frame ids strict while persisted readers cover legacy colon ids', () => {
+    assert.equal(isClientMessageId('a'.repeat(128)), true)
+    assert.equal(isClientMessageId('cm:user:large'), false)
+    assert.equal(isPersistedClientMessageId('a'.repeat(128)), true)
+    assert.equal(isPersistedClientMessageId('cm:user:large'), true)
+    assert.equal(isPersistedClientMessageId('a'.repeat(129)), false)
+    assert.equal(isPersistedClientMessageId(`${'a'.repeat(80)}:x`), false)
+  })
+})
+
 describe('InboundMessage schema', () => {
   it('accepts frame without traceId / clientTraceId (backward compat)', () => {
     assert.equal(Value.Check(InboundMessage, baseInbound()), true)
+  })
+  it('accepts exact browser displayText alongside a different model prompt', () => {
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      content: { text: '模型正文\n[附件提示]', displayText: '模型正文' },
+    }), true)
   })
   it('accepts valid clientTraceId', () => {
     assert.equal(

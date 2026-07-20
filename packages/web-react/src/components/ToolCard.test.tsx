@@ -41,6 +41,46 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(document.querySelector("pre")?.textContent).toContain(marker);
   });
 
+  test("结构化工具摘要不替换权威记录，超长原始输出可逐段显示到末尾", () => {
+    const marker = "EXACT_TOOL_OUTPUT_FINAL_MARKER";
+    const output = `${"x".repeat(270_000)}${marker}`;
+    render(
+      <ToolCard
+        message={{ toolName: "custom_hardcap_probe", inputJson: { value: "long" }, output, _completed: true }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button"));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    expect(document.body.textContent).not.toContain(marker);
+
+    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
+    expect(document.body.textContent).not.toContain(marker);
+    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
+    expect(document.body.textContent).toContain(marker);
+    expect(screen.queryByRole("button", { name: /继续显示原始内容/ })).not.toBeInTheDocument();
+  });
+
+  test("结构化 tool_result 的未来字段在原始完整记录中原样可见", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "custom_structured_result",
+          inputJson: { query: "test" },
+          output: "text fallback",
+          outputJson: { future_field: { marker: "EXACT_STRUCTURED_MARKER" } },
+          _completed: true,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button"));
+    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    expect(screen.getByText("原始完整记录")).toBeInTheDocument();
+    expect(document.body.textContent).toContain("EXACT_STRUCTURED_MARKER");
+  });
+
   test("Bash heredoc 失败：错误输出仍可见，非纯写命令不误标", () => {
     const command = "cat > a.ts <<'EOF'\ncontent\nEOF";
     render(
@@ -169,10 +209,14 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("bar")).toBeInTheDocument();
   });
 
-  test("无 body（无 input/output）→ 不可展开（无 aria-expanded）", () => {
+  test("无 input/output 仍可展开查看 tape 中的原始完整记录", () => {
     render(<ToolCard message={{ toolName: "Read", _completed: true }} />);
     const btn = screen.getByRole("button");
-    expect(btn).not.toHaveAttribute("aria-expanded");
+    expect(btn).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(btn);
+    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    expect(screen.getByText("原始完整记录")).toBeInTheDocument();
+    expect(document.querySelector("pre")?.textContent).toContain('"toolName": "Read"');
   });
 
   test("agent-group 子块（ChildBlock 形态）复用本组件渲染", () => {

@@ -22,16 +22,9 @@ import type { ChatMessage, ChildBlock } from "./model";
 import { friendlyBridgeErrorMessage } from "./pure";
 
 /**
- * durable turn dispatch(RFC §2.5)的 error projection 虚拟行 id 前缀。server 为「受理成功但
- * 未执行/未收尾」的 turn 铸造这条虚拟行(role 'assistant'、_errorCode ∈ dispatch 终态码、
- * _clientMessageId 指向锚点 user 行),前端按既有 error 卡渲染。
- */
-export const DISPATCH_ERROR_ROW_ID_PREFIX = "oc-dispatch-err:";
-
-/**
  * dispatch 终态错误码(免单语义:受理未执行 = 未计费 / 服务重启中断 = 已退款)。归一化小写。
  * 这些是 **server 权威的稳定协议码**:`dispatch_lost`/`dispatch_not_accepted` 由 reconciler 铸在
- * error projection 上;`service_restart` 由 gateway 写在**不可变 tape**(boot recovery synthetic
+ * durable dispatch status 上;`service_restart` 由 gateway 写在**不可变 tape**(boot recovery synthetic
  * crashed)里 —— 不可变行无法回填 master 标记,故按稳定协议码识别(非脆弱的内部 failureCode 枚举)。
  */
 export const DISPATCH_LOST_ERROR_CODES = new Set([
@@ -40,22 +33,15 @@ export const DISPATCH_LOST_ERROR_CODES = new Set([
   "service_restart",
 ]);
 
-/** 该行是否为 dispatch error projection 虚拟行(id 前缀判定,单一权威)。 */
-export function isDispatchErrorProjectionRow(m: Pick<ChatMessage, "id"> | null | undefined): boolean {
-  return typeof m?.id === "string" && m.id.startsWith(DISPATCH_ERROR_ROW_ID_PREFIX);
-}
-
-/** 归一化后是否命中 dispatch 终态错误码(仅用于稳定协议码;projection 走标记不走码)。 */
+/** 归一化后是否命中 dispatch 终态错误码。 */
 export function isDispatchLostCode(code: string | undefined | null): boolean {
   return typeof code === "string" && DISPATCH_LOST_ERROR_CODES.has(code.trim().toLowerCase());
 }
 
 /**
- * **去枚举化的重试判据单一权威(RFC §5 M5)**:该行是否证明其 turn 的 dispatch 已终态失败,
- * 需要重试铸新 clientMessageId。优先级:
- *   ① error projection 虚拟行(id 前缀,code-agnostic);
- *   ② server 持久标记 `_dispatchTerminal`(projection 恒带,未来新终态类别也带 → 前端零改动);
- *   ③ 不可变 tape 的稳定协议码(service_restart 等,gateway 写、无法回填标记的兜底)。
+ * 该行是否证明其 turn 的 dispatch 已终态失败,需要重试铸新 clientMessageId。
+ * server 持久标记 `_dispatchTerminal` 是直接状态读的权威；不可变 tape 的
+ * service_restart 稳定协议码用于旧数据兼容。
  * 前端**不**再枚举内部 failureCode(codex_pre_forward_abandoned / ERR_FRAME_TOO_BIG …)——那些
  * 都被 ① 一网打尽。
  */
@@ -63,27 +49,21 @@ export function isDispatchTerminalRow(
   m: Pick<ChatMessage, "id" | "_dispatchTerminal" | "_errorCode"> | null | undefined,
 ): boolean {
   if (!m) return false;
-  if (isDispatchErrorProjectionRow(m)) return true;
   if (m._dispatchTerminal === true) return true;
   return isDispatchLostCode(m._errorCode);
 }
 
 /**
- * 渲染层双保险(RFC §5):收集「同 _clientMessageId 已存在非 error 终态行」的 turn 集。
- * server 侧 late-tape 会撤销 projection(§2.4),这是撤销传播前竞态窗口的端上兜底 —— 真 tape
- * 展开的 server-authored 生成行(assistant/thinking/tool、无 _errorCode)一旦出现,同轮的 error
- * projection 行即被抑制,避免「结果已显示 + 错误卡并存」。
+ * 收集已有真实 tape 内容的 turn。用于在 full-sync 到达前的极短竞态窗口里
+ * 抑制过时的 verified failure 状态，避免「结果已显示 + 失败状态并存」。
  */
 export function collectResolvedDispatchTurnIds(messages: readonly ChatMessage[]): Set<string> {
   const resolved = new Set<string>();
   for (const m of messages) {
     const cmid = m?._clientMessageId;
     if (typeof cmid !== "string" || cmid.length === 0) continue;
-    if (isDispatchErrorProjectionRow(m)) continue;
-    // 折叠 anchor(§9)= 真 tape 已落库的水合入口 → tape 权威压过 dispatch error projection:
-    // 只要该轮存在折叠 anchor(任一终态),同轮的 dispatch_lost 投影即被抑制(late-tape 撤销投影
-    // 传播前的端上竞态兜底,与 detectServerTerminalTurns 的 completed 覆盖 error 口径一致)。
-    if (isCollapsedTapeAnchor(m)) {
+    if (m._turnStatusRecord) continue;
+    if (isTurnTapeProcessControl(m)) {
       resolved.add(cmid);
       continue;
     }
@@ -98,40 +78,39 @@ export function collectResolvedDispatchTurnIds(messages: readonly ChatMessage[])
   return resolved;
 }
 
-/** 该 projection 行是否应被同轮非 error 终态行抑制(渲染层调用,配合 collectResolvedDispatchTurnIds)。 */
-export function isProjectionSuppressedByTerminal(
-  m: Pick<ChatMessage, "id" | "_clientMessageId">,
+/** 该 verified status 是否应被同轮真实 tape 抑制。 */
+export function isTurnStatusSuppressedByTape(
+  m: Pick<ChatMessage, "_turnStatusRecord" | "_clientMessageId">,
   resolvedTurnIds: Set<string>,
 ): boolean {
   return (
-    isDispatchErrorProjectionRow(m) &&
+    m._turnStatusRecord === true &&
     typeof m._clientMessageId === "string" &&
     resolvedTurnIds.has(m._clientMessageId)
   );
 }
 
-// ═══════════════ §9 会话读物化投影:折叠 anchor / 截断记录 ═══════════════
+// ═══════════════ immutable turn tape lazy process controls ═══════════════
 
-/** 该行是否为折叠 anchor 行(RFC §9.1:大 tape 只回一条折叠 anchor 而非 N 条展开行)。 */
-export function isCollapsedTapeAnchor(m: Pick<ChatMessage, "_tapeCollapsed"> | null | undefined): boolean {
-  return !!m && m._tapeCollapsed === true;
+/** 该行是否为真实过程记录的惰性入口。 */
+export function isTurnTapeProcessControl(m: Pick<ChatMessage, "_turnTapeProcess"> | null | undefined): boolean {
+  return !!m && m._turnTapeProcess === true;
 }
 
 /**
- * 折叠行/展开行的**精确定位三元组键**(RFC §9.1):`_turnTapeId :: _turnTapeSha256 :: anchor id`。
- * 展开替换按此键定位,**严禁按 _seq 批量替换**——同一 _seq 上并列多条 projection 虚拟行,按 _seq 会误伤。
+ * 控制行/已加载行的精确定位三元组键。
  * tapeSha 缺省(server 未带)时以空串占位,anchor id 仍保证唯一。
  */
-export function tapeAnchorKey(
+export function turnTapeProcessKey(
   m: Pick<ChatMessage, "id" | "_turnTapeId" | "_turnTapeSha256">,
 ): string {
   return `${m._turnTapeId ?? ""}::${m._turnTapeSha256 ?? ""}::${m.id}`;
 }
 
 /**
- * 折叠 anchor 的 `_dispatchOutcome` → 终态类别(RFC §9-B1 谓词拆分)。
+ * 过程控制的 `_dispatchOutcome` → 终态类别。
  *  - completed / interrupted → 'completed':该轮**有内容**(tape 存在,含被中断的部分产出)→ 清发送态、
- *    user 行置 replied、抑制同轮 dispatch error projection;
+ *    user 行置 replied、抑制同轮过时 dispatch status;
  *  - crashed / executed_error / not_accepted → 'error':终态但失败;
  *  - 其余/缺省 → null:非终态(不作终态存在证据,不清发送态)。
  */
@@ -152,25 +131,16 @@ export function collapsedAnchorTerminalKind(
 }
 
 /**
- * 折叠 anchor 是否构成该轮"终态存在证据"(RFC §9-B1):`_tapeCollapsed ∧ _dispatchOutcome 为终态`。
- * = 参与 exact-clientMessageId 清 _sendingInFlight 与 error projection 抑制;但**不是**"内容已展开"
+ * 过程控制是否构成该轮终态存在证据。它不代表正文；正文始终是独立真实记录。
  * (评分卡/MetaRow 等需正文的门不由它触发;折叠行非"末条 assistant 正文",见 turnSegment)。
  */
 export function isCollapsedAnchorTerminalEvidence(
-  m: Pick<ChatMessage, "_tapeCollapsed" | "_dispatchOutcome"> | null | undefined,
+  m: Pick<ChatMessage, "_turnTapeProcess" | "_dispatchOutcome"> | null | undefined,
 ): boolean {
-  return isCollapsedTapeAnchor(m) && collapsedAnchorTerminalKind(m?._dispatchOutcome) !== null;
+  return isTurnTapeProcessControl(m) && collapsedAnchorTerminalKind(m?._dispatchOutcome) !== null;
 }
 
-/**
- * 该记录是否被逐记录截断(RFC §9.1)。判据 = `_fullBytes` 存在(server 截断记录时与 wire `_truncated:true`
- * 同发,但前端只认无歧义的 `_fullBytes`,避开 assistant 续写标记 `_truncated:string` 的同名歧义)。
- */
-export function isRecordTruncated(m: Pick<ChatMessage, "_fullBytes"> | null | undefined): boolean {
-  return !!m && typeof m._fullBytes === "number" && m._fullBytes > 0;
-}
-
-/** 字节数 → 人类可读("N MB"/"N KB"/"N B")。折叠卡"本轮完整输出 N"与截断卡"共 N"共用。 */
+/** 字节数 → 人类可读。 */
 export function formatTapeBytes(n: number | undefined | null): string {
   if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return "";
   if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
@@ -230,6 +200,7 @@ function textSig(t: string | undefined): string {
 
 /** 子块（agent-group childBlocks 项）渲染签名。per-child 比较的最小充分集。 */
 export function childSignature(ch: ChildBlock): string {
+  const raw = ch as ChildBlock & { error?: unknown };
   return [
     ch.kind,
     ch.blockId ?? "",
@@ -237,11 +208,27 @@ export function childSignature(ch: ChildBlock): string {
     ch.toolName ?? "",
     ch._partial ? 1 : 0,
     ch._completed ? 1 : 0,
-    ch.output ? ch.output.length : 0,
-    ch.error ? 1 : 0,
+    textSig(ch.output),
+    textSig(ch.preview),
+    textSig(ch.tail),
+    typeof raw.error === "string" ? textSig(raw.error) : raw.error ? 1 : 0,
     ch.partialJson ? ch.partialJson.length : 0,
     ch.bashTail?.totalBytes ?? 0,
+    ch.explanation ? textSig(ch.explanation) : "",
+    ch.objective ? textSig(ch.objective) : "",
+    ch.steps?.map((step) => `${step.status}:${textSig(step.step)}`).join(",") ?? "",
   ].join("|");
+}
+
+function childBlocksSignature(message: ChatMessage): string {
+  const blocks = message.childBlocks ?? [];
+  // Finalized tape payloads are immutable and already hash-addressed. Avoid
+  // walking tens of thousands of children on every unrelated UI render; the
+  // children are still all present and are progressively mounted by the card.
+  if (message._turnTapeComplete && message._turnTapeSha256) {
+    return `tape:${message._turnTapeSha256}:${blocks.length}`;
+  }
+  return blocks.map(childSignature).join(";");
 }
 
 /**
@@ -258,11 +245,11 @@ export function messageSignature(
   // 非末条,而该行自身字段未变(reducer 就地 mutate 同引用)。必须与 isLast 同放 sig head,否则
   // memo 浅比较判「无变化」漏渲、旧行评价残留。非 assistant 行恒 false(与 isLast 一样对全 role
   // 落进 head,不影响非消费方——只 AssistantCard 读它)。
-  // §9 折叠 anchor 由 MessageRenderer 拦截渲染 CollapseCard(不走 role 分派):其重渲触发字段
-  // (_tapeExpanded / _tapeExpandCursor / _tapeTotalBytes / _dispatchOutcome)不在下方 role 分支里,
+  // Process control 由 MessageRenderer 拦截渲染 TurnProcessCard(不走 role 分派):其重渲触发字段
+  // (_turnTapeProcessExpanded / _turnTapeProcessCursor / _turnTapeTotalBytes / _dispatchOutcome)不在下方 role 分支里,
   // 折进 head 保证展开态翻转、续拉游标变化时穿透 memo 重渲。非折叠行恒空片段,不影响既有签名。
-  const collapse = m._tapeCollapsed
-    ? `|tc:${m._tapeExpanded ? 1 : 0}:${m._tapeExpandCursor ?? "n"}:${m._tapeTotalBytes ?? 0}:${m._dispatchOutcome ?? ""}`
+  const collapse = m._turnTapeProcess
+    ? `|tc:${m._turnTapeProcessExpanded ? 1 : 0}:${m._turnTapeProcessCursor ?? "n"}:${m._turnTapeTotalBytes ?? 0}:${m._dispatchOutcome ?? ""}`
     : "";
   const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}${collapse}`;
   switch (m.role) {
@@ -272,6 +259,7 @@ export function messageSignature(
         textSig(m.text),
         m.usage?.traceId ?? "",
         m.usage?.costCredits ?? "",
+        m.usage?.waived ? 1 : 0,
         m._truncated ?? "",
         m._errorCode ?? "",
         m._errorDetail ? m._errorDetail.length : 0,
@@ -281,7 +269,15 @@ export function messageSignature(
         m.cronPush ? `cron:${m.cronLabel ?? ""}` : "",
       ].join("|");
     case "user":
-      return [head, textSig(m.text), m.status ?? "", (m._media?.length ?? 0)].join("|");
+      return [
+        head,
+        textSig(m.text),
+        m.status ?? "",
+        (m._media?.length ?? 0),
+        m._userPayloadDeferred ? 1 : 0,
+        m._userPayloadId ?? "",
+        m._payloadSha256 ?? "",
+      ].join("|");
     case "thinking":
       return [head, textSig(m.text)].join("|");
     case "tool":
@@ -351,7 +347,7 @@ export function messageSignature(
         m._duration ?? 0,
         m._resultPreview ? m._resultPreview.length : 0,
         m._delegate ? 1 : 0,
-        (m.childBlocks ?? []).map(childSignature).join(";"),
+        childBlocksSignature(m),
       ].join("|");
     case "delegate-progress":
       return [
@@ -365,7 +361,7 @@ export function messageSignature(
         // P5 fix(Codex):reducer 把 legacy 降级帧的流式文本 append 到同一 entry.text(entries
         // 数量/phase 不变),签名必须含 entries 文本量,否则 delegate-progress 流式文本卡住不刷。
         (m.entries ?? []).reduce((n, e) => n + (e.text ? e.text.length : 0), 0),
-        (m.childBlocks ?? []).map(childSignature).join(";"),
+        childBlocksSignature(m),
         m._adoptedInto ?? "",
       ].join("|");
     default:
@@ -588,7 +584,7 @@ export function errorPresentation(
   }
   const waiverEligible = WAIVED_ERROR_CODES.has(normalized);
   const ref = requestReference(detail, text);
-  // durable turn dispatch(RFC §5)error projection 文案。三者恒免单 tone(waived:true → 温和
+  // durable turn dispatch failure-status 文案。三者恒免单 tone(waived:true → 温和
   // ShieldCheck 卡):dispatch_lost / dispatch_not_accepted = 受理成功但从未开始执行(durable
   // not_accepted 证明,未计费);service_restart = 服务重启掐断,已生成内容无法恢复(已退款)。
   // 均非平台内部错误,不甩堆栈。dispatch_not_accepted 是 reconciler 对「容器 rejected tombstone」

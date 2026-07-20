@@ -96,6 +96,8 @@ import {
   computeDispatchRequestHash,
   isCodexEngineModel,
   isClientMessageId,
+  modelHistorySemanticRole,
+  modelHistorySemanticText,
   newTraceId,
   parseTraceIdCandidate,
   stripModelAuthorityField,
@@ -120,7 +122,6 @@ import type {
   AdmitUserTurnResult,
 } from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
-import { MASTER_HISTORY_MAX_MESSAGES, MASTER_HISTORY_MAX_CHARS } from "./masterHistoryLimits.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
 import type { ModelCatalogCache, ModelCatalogSnapshot } from "../billing/modelCatalog.js";
@@ -915,14 +916,28 @@ export interface UserChatBridgeDeps {
    * Commercial v3 authority for browser chat history lives in master's
    * SQLite, not inside the per-user container. When a browser session switches
    * between providers (e.g. DeepSeek/CCB → Codex native), the container needs
-   * a bounded transcript preamble to bridge the provider-local resume gap.
-   * The dep returns the raw master messages; this bridge strips/caps them
-   * before attaching the private `_masterHistoricalMessages` field.
+   * a model-window-selected transcript preamble to bridge the provider-local
+   * resume gap. The dep returns the selected master messages; this bridge
+   * normalizes their semantic fields before attaching the private
+   * `_masterHistoricalMessages` field, without a second content cap.
    */
   loadMasterSessionMessages?: (
     uid: bigint,
     sessionId: string,
+    options: {
+      contextWindow: number | null;
+      engine: string;
+      currentUserText: string;
+      excludeClientMessageId?: string;
+    },
   ) => Promise<unknown[] | null>;
+  /** Completion dedupe is an indexed authority check, not a reason to hydrate
+   * model history (and therefore never touches old giant tape BYTEA). */
+  hasCompletedClientTurn?: (
+    uid: bigint,
+    sessionId: string,
+    clientMessageId: string,
+  ) => Promise<boolean>;
   /** Platform GoalState injected into every accepted browser turn. */
   loadGoalState?: (uid: bigint, sessionId: string) => Promise<GoalStateSnapshot | null>;
   /** Engine notifications may update only diagnostic engine-owned fields. */
@@ -948,6 +963,10 @@ export interface UserChatBridgeDeps {
       text: string;
       ts: number;
       _media?: unknown[];
+      _retryMedia?: unknown[];
+      _imageEdit?: Record<string, unknown>;
+      _modelText?: string;
+      _routing?: { model?: string; teamMode: boolean; effortLevel: string | null };
     },
   ) => Promise<{
     applied: boolean;
@@ -1336,30 +1355,10 @@ function rawDataLen(data: RawData): number {
   return 0;
 }
 
-function extractMasterHistoryText(msg: Record<string, unknown>): string {
-  if (typeof msg.text === "string") return msg.text;
-  if (typeof msg.content === "string") return msg.content;
-  if (Array.isArray(msg.content)) {
-    return msg.content
-      .map((part) => {
-        if (part && typeof part === "object") {
-          const text = (part as { text?: unknown }).text;
-          return typeof text === "string" ? text : "";
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-  return "";
-}
-
 export function _sanitizeMasterHistoricalMessagesForFrame(
   rawMessages: unknown[],
-  opts: { maxMessages?: number; maxChars?: number; excludeClientMessageId?: string } = {},
+  opts: { excludeClientMessageId?: string } = {},
 ): Array<Record<string, unknown>> {
-  const maxMessages = opts.maxMessages ?? MASTER_HISTORY_MAX_MESSAGES;
-  const maxChars = opts.maxChars ?? MASTER_HISTORY_MAX_CHARS;
   const rows: Array<Record<string, unknown>> = [];
   for (const raw of rawMessages) {
     if (!raw || typeof raw !== "object") continue;
@@ -1368,25 +1367,18 @@ export function _sanitizeMasterHistoricalMessagesForFrame(
       opts.excludeClientMessageId &&
       (msg.id === opts.excludeClientMessageId || msg._clientMessageId === opts.excludeClientMessageId)
     ) continue;
-    const role = msg.role === "user" || msg.role === "assistant" ? msg.role : null;
+    const role = modelHistorySemanticRole(msg);
     if (!role) continue;
     if (msg.system === true) continue;
-    const text = extractMasterHistoryText(msg).trim();
-    if (!text) continue;
+    const text = modelHistorySemanticText(msg);
+    if (!text.trim()) continue;
     const out: Record<string, unknown> = { role, text };
     if (typeof msg.id === "string") out.id = msg.id;
     if (typeof msg.status === "string") out.status = msg.status;
     if (typeof msg.ts === "number") out.ts = msg.ts;
     rows.push(out);
   }
-
-  let selected = rows.slice(-maxMessages);
-  while (selected.length > 0) {
-    const chars = selected.reduce((sum, m) => sum + String(m.text ?? "").length, 0);
-    if (chars <= maxChars) break;
-    selected = selected.slice(1);
-  }
-  return selected;
+  return rows;
 }
 
 function sendErrorFrame(
@@ -2703,8 +2695,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     /** pre-forward 失败出口:CAS terminal(executed_error)+ 移除记录。fire-and-forget。
      *  B-R1-1:client_notified 一律 **false**。即便此刻 socket OPEN、也发了实时 error 帧,那只是
      *  「加速」——socket OPEN ≠ 前端已 durable 落地该终态(帧可能在途丢、页面已切走)。durable 的
-     *  「已告知」唯一由 reconciler 在 error projection 同事务置真(§2.3 ③)。绝不用瞬态 socket 态推断
-     *  client_notified,否则 fail-visible(I1)会因误判「已通知」而永不补投影。 */
+     *  「已告知」唯一由 reconciler 在权威终态事务内置真(§2.3 ③)。绝不用瞬态 socket 态推断
+     *  client_notified,否则 fail-visible(I1)会因误判「已通知」而不再补发终态。 */
     const failDispatchPreForward = (
       record: AdmittedDispatch | undefined,
       failureCode: string,
@@ -2833,6 +2825,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // onReject 在受理/goal 拒轮时回调,让 queue 协调器取消本次 dispatch grant。
       persistUserRow = true,
       onReject?: (code: string) => void,
+      historyModel: string | null = typeof frameObj.model === "string" ? frameObj.model : null,
     ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
@@ -2843,6 +2836,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const clientMessageId = isClientMessageId(frameObj.clientMessageId)
         ? frameObj.clientMessageId
         : null;
+      const frameContent = frameObj.content && typeof frameObj.content === "object"
+        ? frameObj.content as { text?: unknown }
+        : null;
+      const currentUserText = typeof frameObj.content === "string"
+        ? frameObj.content
+        : typeof frameContent?.text === "string"
+          ? frameContent.text
+          : "";
 
       // The browser's optimistic POST is intentionally not a dispatch gate.
       // Make the server-side ordering invariant explicit here instead: the
@@ -2852,7 +2853,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
       // B3(R3):本帧受理成功后落此(= 刚受理 dispatch 的 clientMessageId)。受理**之后**的任何 pre-forward
       // 失败出口(goal unavailable / sanitize 抛 / 任意异常 / 未预期早 return)必须据此 CAS terminal +
-      // drop,否则留 admitted 永续租孤儿 + 无 error projection(违反 I1)。成功交棒调用方前置空(所有权移交)。
+      // drop,否则留 admitted 永续租孤儿 + 无可见终态(违反 I1)。成功交棒调用方前置空(所有权移交)。
       let admittedThisFrame: string | null = null;
 
       // 主会话历史**只读一次**,给「dispatch 受理前 dedup」与「受理/持久化后 enrichment」共用。
@@ -2866,7 +2867,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         historyLoaded = true;
         if (!deps.loadMasterSessionMessages) return;
         try {
-          const raw = await deps.loadMasterSessionMessages(uid, peerId);
+          let contextWindow: number | null = null;
+          let engine = historyModel && isCodexEngineModel(historyModel) ? "codex" : "ccb";
+          if (authorityDeps !== undefined) {
+            if (historyModel === null) return;
+            const execution = await resolveTurnExecution(authorityDeps.catalog, historyModel);
+            contextWindow = projectContextWindowForRole(
+              execution.canonicalModel,
+              execution.descriptor.contextWindow,
+              userRole,
+            );
+            engine = execution.engine;
+          }
+          const raw = await deps.loadMasterSessionMessages(uid, peerId, {
+            contextWindow,
+            engine,
+            currentUserText,
+            ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
+          });
           if (Array.isArray(raw)) rawHistory = raw;
         } catch (err) {
           turnLog?.warn("user-chat-bridge: load master history failed", {
@@ -2877,17 +2895,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       };
       // 该 clientMessageId 是否早已产出 completed assistant 行(legacy 完成、无 dispatch;或
       // dispatch 已完成、tape 已 materialize)→ 回 dedup ack 收口。命中返 true(调用方 return null)。
-      const tryDedupCompleted = (): boolean => {
-        if (clientMessageId === null || rawHistory === null) return false;
-        const alreadyCompleted = rawHistory.some((value) => {
-          if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-          const row = value as Record<string, unknown>;
-          return row.role === "assistant" &&
-            row._clientMessageId === clientMessageId &&
-            row.status === "completed" &&
-            row._errorCode === undefined &&
-            row._isError !== true;
-        });
+      const tryDedupCompleted = async (): Promise<boolean> => {
+        if (clientMessageId === null) return false;
+        let alreadyCompleted = false;
+        if (deps.hasCompletedClientTurn) {
+          try {
+            alreadyCompleted = await deps.hasCompletedClientTurn(uid, peerId, clientMessageId);
+          } catch (err) {
+            turnLog?.warn("user-chat-bridge: completed-turn lookup failed", {
+              sessionId: peerId,
+              clientMessageId,
+              err,
+            });
+          }
+        } else if (rawHistory !== null) {
+          alreadyCompleted = rawHistory.some((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            const row = value as Record<string, unknown>;
+            return row.role === "assistant" &&
+              row._clientMessageId === clientMessageId &&
+              row.status === "completed" &&
+              row._errorCode === undefined &&
+              row._isError !== true;
+          });
+        }
         if (!alreadyCompleted) return false;
         const idempotencyKey = typeof frameObj.idempotencyKey === "string"
           ? frameObj.idempotencyKey
@@ -2914,32 +2945,60 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 走 return 不转发任何帧,故**不破坏「受理先于一切」不变量**(该不变量约束的是"转发前 user 行必须在")。
       // legacy 路径(无 admitUserTurn)不建 dispatch 行、无孤儿风险 → 保持既有「持久后再 dedup」顺序。
       if (persistUserRow && useDispatchAdmission && clientMessageId !== null) {
-        await ensureHistory();
+        // The indexed completion authority replaces the old full-history
+        // hydration. Legacy/test compositions without it rely on dispatch
+        // admission's own idempotency result instead of reading the tape here.
         if (cleaned) return null;
-        if (tryDedupCompleted()) return null;
+        if (await tryDedupCompleted()) return null;
       }
 
       // persistUserRow=false(prompt-queue lane)整块跳过:queue 协调器已建 user 行 + turn 权威,
       // 此处再走 admit/persist 会造成 turn_dispatches 与 queue lifecycle 双权威(权威源分裂)。
       if (persistUserRow && clientMessageId !== null && (useDispatchAdmission || deps.persistMasterUserMessage)) {
         const content = frameObj.content && typeof frameObj.content === "object"
-          ? frameObj.content as { text?: unknown; media?: unknown }
+          ? frameObj.content as {
+              text?: unknown;
+              displayText?: unknown;
+              media?: unknown;
+              imageEdit?: unknown;
+            }
           : {};
         const rawMedia = Array.isArray(content.media) ? content.media : [];
         const persistedMedia = rawMedia.filter((item) =>
           !item || typeof item !== "object" || (item as { hidden?: unknown }).hidden !== true);
+        const modelText = typeof frameObj.content === "string"
+          ? frameObj.content
+          : typeof content.text === "string"
+            ? content.text
+            : "";
+        const displayText = typeof content.displayText === "string"
+          ? content.displayText
+          : modelText;
+        const rawImageEdit = content.imageEdit && typeof content.imageEdit === "object" &&
+          !Array.isArray(content.imageEdit)
+          ? content.imageEdit as Record<string, unknown>
+          : undefined;
+        const routing = {
+          ...(typeof frameObj.model === "string" && frameObj.model !== ""
+            ? { model: frameObj.model }
+            : {}),
+          teamMode: frameObj.teamMode === true,
+          effortLevel: typeof frameObj.effortLevel === "string" || frameObj.effortLevel === null
+            ? frameObj.effortLevel
+            : null,
+        };
         const message = {
           id: clientMessageId,
           role: "user" as const,
-          text: typeof frameObj.content === "string"
-            ? frameObj.content
-            : typeof content.text === "string"
-              ? content.text
-              : "",
+          text: displayText,
           ts: typeof frameObj.ts === "number" && Number.isFinite(frameObj.ts)
             ? frameObj.ts
             : Date.now(),
           ...(persistedMedia.length > 0 ? { _media: persistedMedia } : {}),
+          ...(rawImageEdit && rawMedia.length > 0 ? { _retryMedia: rawMedia } : {}),
+          ...(rawImageEdit ? { _imageEdit: rawImageEdit } : {}),
+          ...(displayText !== modelText ? { _modelText: modelText } : {}),
+          _routing: routing,
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
@@ -2988,7 +3047,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
           // R4-B1:cleaned 检查**不得**早于 admitted 接管 —— admit await 期间连接可能已 cleanup,
           // 提交成功的 dispatch 若在登记前 early return 就成了孤儿 lease(admitted 永续租、无
-          // projection)。顺序铁律:先接管所有权,再判连接死活;死了立即终态化。
+          // durable status)。顺序铁律:先接管所有权,再判连接死活;死了立即终态化。
           switch (admit.kind) {
             case "admitted": {
               const d = admit.dispatch;
@@ -3144,7 +3203,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         await ensureHistory();
         // legacy 路径的 dedup 在持久之后判定(dispatch 路径已在受理前 dedup,useDispatchAdmission 分支
         // 内 tryDedupCompleted 已消费;此处仅对 legacy 生效,避免二次 dedup 同一轮)。
-        if (!useDispatchAdmission && tryDedupCompleted()) return null;
+        if (!useDispatchAdmission && await tryDedupCompleted()) return null;
         let enriched = frameObj;
         if (rawHistory !== null) {
           const historical = _sanitizeMasterHistoricalMessagesForFrame(rawHistory, {
@@ -3901,6 +3960,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               turnTraceIdCapture,
               !isPromptQueueDispatch,
               rejectPromptQueueDispatch,
+              authorityModelCapture,
             );
             // null:attachMasterTurnState 已在内部拒轮(含 dispatch 终态化 + onReject);此处直接 return。
             if (enrichedParsed === null) return;
@@ -4084,6 +4144,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               turnTraceIdCapture,
               !isPromptQueueDispatch,
               rejectPromptQueueDispatch,
+              authorityModelCapture,
             );
             if (preparedInbound === null || !isCurrentCodexTurnState(codexTurnState)) return;
             dispatchRecordB = lookupAdmittedDispatch(preparedInbound);
@@ -4795,6 +4856,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               turnTraceIdCapture,
               !isPromptQueueDispatch,
               rejectPromptQueueDispatch,
+              authorityModelCapture,
             );
             if (enrichedParsed === null) return;
             dispatchRecordC = lookupAdmittedDispatch(enrichedParsed);

@@ -20,8 +20,8 @@
 - 空列表文案"暂无会话"。
 
 ## 消息行
-- **本批已补 data-testid**(cards.tsx):user 行 wrapper=`user-row`、user 气泡=`message-text`、
-  assistant 行 wrapper=`assistant-row`、§9 折叠卡=`collapse-card`。assistant 正文仍走既有
+- **关键 data-testid**(cards.tsx):user 行 wrapper=`user-row`、user 气泡=`message-text`、
+  assistant 行 wrapper=`assistant-row`、真实过程游标=`turn-process-card`。assistant 正文仍走既有
   `.prose`(不侵入共享 Markdown 组件)。
 - **选择器双模(lib/ui.ts SEL)**:testid 优先 + 既有 class 回退,**同元素同时命中两者→union 去重**
   (绝不祖先/后代双计)。user=`[data-testid=user-row], .flex.flex-col.items-end:has(.bg-bubble)`;
@@ -43,11 +43,12 @@
 - 全局横幅 role=alert,标题"发送失败",按钮 aria-label="重试发送"。
 - 内联终态错误卡 Alert:dispatch_lost/dispatch_not_accepted → title"消息未开始处理",message 含"已确认未计费";
   service_restart → "服务重启,本轮已中断";按钮"重新尝试"(insufficient_credits→"去充值")。
-- projection 抑制:同 _clientMessageId 有真生成行 → oc-dispatch-err: 行不显示(isProjectionSuppressedByTerminal)。
+- verified turn status 只来自 `turn_dispatches`；late tape 进入 `manual_reconcile` 后状态卡不显示。
 
-## 折叠卡(§9)
-- 折叠态 button 文案 `本轮完整输出 {N MB},点击加载`;加载中"正在加载完整输出…";失败"加载失败,点击重试"。
-- 展开后分节头"…· 已展开"+"继续加载更多"+"收起";卷级截断提示"内容较多,部分记录已省略…"。
+## 真实 Agent 过程游标
+- 初始 button 文案 `Agent 调用过程（N 条），点击展开`;加载中"正在读取真实调用记录…";失败"加载失败，点击重试"。
+- 展开后分节头 `Agent 调用过程 · 已展开` + `继续加载更多` + `收起`；没有总量截断或替代卡。
+- 单条超大记录进入视口附近后从 payload 端点加载，期间显示 `正在读取真实 Agent 记录…`。
 - 勿混淆 msg._truncated(max_tokens 续写 banner,按钮"继续")。
 
 ## 历史分页

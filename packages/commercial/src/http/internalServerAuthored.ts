@@ -1750,6 +1750,12 @@ function isLosslessTurnTapeWireBody(raw: unknown): boolean {
  *   08*  连接异常类 · 57P0* 服务 shutdown / cannot_connect_now。
  */
 function isTransientTurnTapeStorageError(err: unknown): boolean {
+  if (
+    err && typeof err === "object" &&
+    (err as { retryable?: unknown }).retryable === true
+  ) {
+    return true;
+  }
   const code =
     err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string"
       ? (err as { code: string }).code
@@ -1885,7 +1891,7 @@ async function handleLosslessTurnTapeRequest(args: {
           title: "late turn tape 迟到(已告知失败却又产出计费内容)",
           body:
             `session \`${body.sessionId}\` tape \`${body.tapeId}\`:reconciler 已宣告该 turn ` +
-            `not_accepted 并向用户投影 error 卡,tape 随后到达。内容已完整 materialize(钱安全 I5),` +
+            `not_accepted 并向用户展示终态 error 卡,tape 随后到达。内容已完整 materialize(钱安全 I5),` +
             `dispatch 已转 manual_reconcile、error 卡已撤销。请人工核对计费与用户告知一致性。`,
           payload: { source: "losslessTurnTapeFinalize", kind: "late_tape", session_id: body.sessionId, tape_id: body.tapeId },
           dedupe_key: `${EVENTS.OPS_INCIDENT_OPENED}:late_tape:${body.tapeId}`,

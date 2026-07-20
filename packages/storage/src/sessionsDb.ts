@@ -14,6 +14,15 @@ import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS, type MessageUsageDelegate } from '@openclaude/protocol/teamCards'
+import {
+  availableModelHistoryTokens,
+  estimateModelHistoryTokens,
+  exactModelHistoryTextSuffix,
+  modelHistorySemanticRole,
+  modelHistorySemanticText,
+  MODEL_HISTORY_EXACT_SUFFIX_MARKER,
+  resolveModelHistoryContextWindow,
+} from '@openclaude/protocol'
 import Database from 'better-sqlite3'
 // 引擎中立的写路径决策层(RFC D6b);与本文件构成运行时环(见 clientSessionsPlan.ts 顶注)。
 import {
@@ -237,7 +246,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("UPDATE client_sessions SET deleted_at = updated_at WHERE title = '__deleted__'")
     }
   } catch { /* table just created with column already */ }
-  // Migration: projection revision for mutations that cannot be represented
+  // Migration: history revision for mutations that cannot be represented
   // by the per-message `_seq` cursor (for example an in-place waiver or a
   // client PUT that removes a previously persisted message). Incremental
   // reads are safe only when the caller presents this exact revision.
@@ -1151,7 +1160,7 @@ export interface SearchHit {
 // Returns top-N unique sessions with a snippet of the best-matching turn.
 export async function searchSessions(
   query: string,
-  limit = 5,
+  limit: number | null = 5,
   agentId?: string,
 ): Promise<SearchHit[]> {
   const db = await getSessionsDb()
@@ -1159,7 +1168,10 @@ export async function searchSessions(
   if (!cleanQuery) return []
   // If agentId provided, filter at SQL level for correctness
   const agentFilter = agentId ? 'AND m.agent_id = ?' : ''
-  const params = agentId ? [cleanQuery, agentId, limit * 4] : [cleanQuery, limit * 4]
+  const boundedLimit = limit === null ? null : Math.max(1, Math.floor(limit))
+  const params = agentId
+    ? boundedLimit === null ? [cleanQuery, agentId] : [cleanQuery, agentId, boundedLimit * 4]
+    : boundedLimit === null ? [cleanQuery] : [cleanQuery, boundedLimit * 4]
   const rows = db
     .prepare(
       `
@@ -1178,7 +1190,7 @@ export async function searchSessions(
     WHERE sessions_fts MATCH ?
     ${agentFilter}
     ORDER BY score
-    LIMIT ?
+    ${boundedLimit === null ? '' : 'LIMIT ?'}
   `,
     )
     .all(...params) as Array<{
@@ -1209,27 +1221,29 @@ export async function searchSessions(
       snippet: r.snippet,
       score: r.score,
     })
-    if (out.length >= limit) break
+    if (boundedLimit !== null && out.length >= boundedLimit) break
   }
   return out
 }
 
-// Load up to the 100 most recent turns of a session ordered by turn_idx ascending
-// (for second-pass summarization). The cap prevents loading entire large sessions into memory.
-// Note: indexTurn() inserts up to 2 FTS rows per turn (user + assistant), so LIMIT 200 rows
-// yields ~100 full turns in the common case.
 export async function loadSessionTurns(
   sessionId: string,
+  limit: number | null = 200,
 ): Promise<Array<{ role: string; content: string; turnIdx: number }>> {
   const db = await getSessionsDb()
+  const boundedLimit = limit === null ? null : Math.max(1, Math.floor(limit))
   const rows = db
     .prepare(`
       SELECT turn_idx, role, content FROM sessions_fts
       WHERE session_id = ?
       ORDER BY turn_idx DESC, rowid DESC
-      LIMIT 200
+      ${boundedLimit === null ? '' : 'LIMIT ?'}
     `)
-    .all(sessionId) as Array<{ turn_idx: number; role: string; content: string }>
+    .all(...(boundedLimit === null ? [sessionId] : [sessionId, boundedLimit])) as Array<{
+      turn_idx: number
+      role: string
+      content: string
+    }>
   // Reverse so caller receives turns in chronological order
   return rows.reverse().map((r) => ({ turnIdx: r.turn_idx, role: r.role, content: r.content }))
 }
@@ -1371,7 +1385,7 @@ export interface ClientSession {
   /** 会话级模型选择(UI 恢复提示,非执行权威;缺省 = 未显式选择 → 前端回落 default_model)。
    *  写路径:建行 PUT 可携带;既有会话经 setClientSessionModel(PATCH)。upsert 未携带时保留既有值。 */
   modelId?: string
-  /** Server-owned revision for projection changes invisible to `_seq`.
+  /** Server-owned revision for history changes invisible to `_seq`.
    * Optional on write inputs for rolling callers; every DB read populates it. */
   historyRevision?: number
   // 归档水位(热尾巴 + 归档)。读侧透传给客户端:archivedCount 用于"还有 N 条"计数与
@@ -1438,8 +1452,8 @@ export function compareMessagesByOrder(a: MessageLike, b: MessageLike): number {
       : null
   const atape = tapeOrdinal(a)
   const btape = tapeOrdinal(b)
-  const arank = a._tapeCollapsed === true ? 0 : atape !== null ? 1 : 2
-  const brank = b._tapeCollapsed === true ? 0 : btape !== null ? 1 : 2
+  const arank = a._turnTapeProcess === true ? 0 : atape !== null ? 1 : 2
+  const brank = b._turnTapeProcess === true ? 0 : btape !== null ? 1 : 2
   if (arank !== brank) return arank - brank
   if (atape !== null && btape !== null && atape !== btape) return atape - btape
   const at = typeof a?.ts === 'number' && Number.isFinite(a.ts) ? a.ts : 0
@@ -1522,7 +1536,7 @@ export function normalizeAndAssignOrderSeqs<T extends MessageLike>(
   return { messages, maxOrderSeq }
 }
 
-/** Side-effect-free lazy compatibility projection for hot rows. A later write
+/** Side-effect-free lazy compatibility derivation for hot rows. A later write
  * runs the same derivation and persists the exact same frozen values. */
 export function deriveOrderSeqsForRead<T extends MessageLike>(
   messages: readonly T[],
@@ -1552,158 +1566,13 @@ export function deriveArchivedOrderSeqsForRead<T extends MessageLike>(messages: 
     .map(({ value }) => value)
 }
 
-/** Read projection for client-session history. Exact is the durable/admin
- * surface; chat is the bounded browser presentation surface. */
+/** Read view for client-session history. `timeline` hydrates the same
+ * authoritative records for the browser; it never substitutes bounded or
+ * materialized content. */
 export type ClientSessionReadOptions = {
-  projection?: 'exact' | 'chat'
+  view?: 'exact' | 'timeline'
   /** Revision paired with `sinceSeq`; missing/mismatch forces a full read. */
   sinceHistoryRevision?: number
-}
-
-export type HistoryProjection =
-  | { kind: 'checkpoint' }
-  | {
-      kind: 'bash-tail'
-      toolUseId: string
-      parentToolUseId?: string
-      tail: string
-      totalBytes: number
-      truncatedHead: boolean
-    }
-
-const CHAT_BASH_TAIL_MAX_BYTES = 256 * 1024
-
-function utf8Tail(value: string, maxBytes: number): { value: string; truncated: boolean } {
-  const bytes = Buffer.from(value, 'utf8')
-  if (bytes.length <= maxBytes) return { value, truncated: false }
-  let start = bytes.length - maxBytes
-  // A UTF-8 continuation byte cannot begin a decoded suffix. Move to the
-  // next code-point boundary; at most three additional bytes are skipped.
-  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++
-  return { value: bytes.subarray(start).toString('utf8'), truncated: true }
-}
-
-function projectionAnchorKey(message: MessageLike): string {
-  if (typeof message._turnTapeId === 'string') return `tape:${message._turnTapeId}`
-  if (isValidOrderSeq(message._orderSeq)) return `order:${message._orderSeq}`
-  if (typeof message._seq === 'number' && Number.isFinite(message._seq)) return `seq:${message._seq}`
-  return `id:${String(message.id ?? '')}`
-}
-
-function projectionCheckpoint(message: MessageLike): MessageLike {
-  const tapeId = typeof message._turnTapeId === 'string' ? message._turnTapeId : undefined
-  const seq = typeof message._seq === 'number' && Number.isFinite(message._seq) ? message._seq : undefined
-  const orderSeq = isValidOrderSeq(message._orderSeq) ? message._orderSeq : undefined
-  const suffix = tapeId ?? (seq !== undefined ? `seq-${seq}` : String(message.id ?? 'legacy'))
-  return {
-    id: `projection-checkpoint:${suffix}`,
-    role: 'runtime-event',
-    text: '',
-    ts: typeof message.ts === 'number' ? message.ts : 0,
-    _source: 'server',
-    ...(seq !== undefined ? { _seq: seq } : {}),
-    ...(orderSeq !== undefined ? { _orderSeq: orderSeq } : {}),
-    ...(tapeId !== undefined ? { _turnTapeId: tapeId } : {}),
-    ...(typeof message._turnTapeOrdinal === 'number'
-      ? { _turnTapeOrdinal: message._turnTapeOrdinal }
-      : {}),
-    ...(typeof message._turnTapeSha256 === 'string'
-      ? { _turnTapeSha256: message._turnTapeSha256 }
-      : {}),
-    _turnTapeExpanded: true,
-    _historyProjection: { kind: 'checkpoint' } satisfies HistoryProjection,
-  }
-}
-
-/**
- * Remove exact hidden runtime frames from the browser history projection.
- * Bash tail snapshots are coalesced to one sanitized, bounded patch per tool;
- * runtime-only anchors keep one tiny checkpoint so incremental cursors advance.
- * The input is never mutated and exact callers never invoke this helper.
- */
-export function projectClientSessionMessagesForChat(messages: readonly MessageLike[]): MessageLike[] {
-  const visible: MessageLike[] = []
-  const anchors = new Map<string, MessageLike>()
-  const represented = new Set<string>()
-  const tailWinner = new Map<string, { message: MessageLike; projection: Extract<HistoryProjection, { kind: 'bash-tail' }>; order: number }>()
-
-  for (let order = 0; order < messages.length; order++) {
-    const message = messages[order]!
-    const key = projectionAnchorKey(message)
-    anchors.set(key, message)
-    if (message.role !== 'runtime-event') {
-      visible.push(message)
-      represented.add(key)
-      continue
-    }
-    const raw = message._runtimeEvent
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
-    const event = raw as Record<string, unknown>
-    if (event.type !== 'system' || event.subtype !== 'bash_output_tail') continue
-    const toolUseId = event.tool_use_id
-    if (typeof toolUseId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(toolUseId)) continue
-    const rawParentToolUseId = event.parent_tool_use_id
-    if (
-      rawParentToolUseId !== undefined &&
-      rawParentToolUseId !== null &&
-      rawParentToolUseId !== '' &&
-      (typeof rawParentToolUseId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(rawParentToolUseId))
-    ) continue
-    const parentToolUseId = typeof rawParentToolUseId === 'string' && rawParentToolUseId.length > 0
-      ? rawParentToolUseId
-      : undefined
-    const totalBytes = typeof event.total_bytes === 'number' && Number.isFinite(event.total_bytes)
-      ? Math.max(0, event.total_bytes)
-      : 0
-    const tail = utf8Tail(typeof event.tail === 'string' ? event.tail : '', CHAT_BASH_TAIL_MAX_BYTES)
-    const projection: Extract<HistoryProjection, { kind: 'bash-tail' }> = {
-      kind: 'bash-tail',
-      toolUseId,
-      ...(parentToolUseId ? { parentToolUseId } : {}),
-      tail: tail.value,
-      totalBytes,
-      truncatedHead: event.truncated_head === true || tail.truncated,
-    }
-    const target = `${parentToolUseId ?? ''}\0${toolUseId}`
-    const previous = tailWinner.get(target)
-    // Input order is the final deterministic tie-breaker. PG orders by the
-    // complete persisted chronology tuple before calling this helper.
-    if (!previous || totalBytes > previous.projection.totalBytes ||
-        (totalBytes === previous.projection.totalBytes && order > previous.order)) {
-      tailWinner.set(target, { message, projection, order })
-    }
-  }
-
-  for (const { message, projection } of tailWinner.values()) {
-    const key = projectionAnchorKey(message)
-    represented.add(key)
-    visible.push({
-      id: `projection-tail:${String(message.id ?? `${projection.parentToolUseId ?? ''}:${projection.toolUseId}`)}`,
-      role: 'runtime-event',
-      text: '',
-      ts: typeof message.ts === 'number' ? message.ts : 0,
-      _source: 'server',
-      ...(typeof message._seq === 'number' && Number.isFinite(message._seq) ? { _seq: message._seq } : {}),
-      ...(isValidOrderSeq(message._orderSeq) ? { _orderSeq: message._orderSeq } : {}),
-      ...(typeof message._turnTapeId === 'string' ? { _turnTapeId: message._turnTapeId } : {}),
-      ...(typeof message._turnTapeOrdinal === 'number'
-        ? { _turnTapeOrdinal: message._turnTapeOrdinal }
-        : {}),
-      ...(typeof message._turnTapeSha256 === 'string'
-        ? { _turnTapeSha256: message._turnTapeSha256 }
-        : {}),
-      _turnTapeExpanded: true,
-      _historyProjection: projection,
-    })
-  }
-
-  for (const [key, anchor] of anchors) {
-    if (!represented.has(key)) visible.push(projectionCheckpoint(anchor))
-  }
-  return visible
-    .map((value, index) => ({ value, index }))
-    .sort((a, b) => compareMessagesByOrder(a.value, b.value) || a.index - b.index)
-    .map(({ value }) => value)
 }
 
 /**
@@ -1732,8 +1601,9 @@ export const MAX_SESSION_BYTES = 4 * 1024 * 1024
 // 阈值关系(硬约束,勿乱调):SOFT_TRIM(2.5M) > TAIL_TARGET(2M) 且两者都 < MAX(4M)。
 // - TAIL_TARGET 留出 MAX 与它之间 2M 的余量:一次 spill 后尾巴 ≤ 2M,后续 append 有足够
 //   空间累积到下次 SOFT_TRIM 才再 spill,避免每 turn 都 spill(spill 有 chunk 写开销)。
-// - TAIL_MIN_MSGS = 64 > 兜底上下文注入窗口(bridge 48 条 / 容器 40 条):保证模型无法
-//   原生续接、走兜底注入重建上下文时,热尾巴始终 ≥ 该窗口 → spill 对模型侧零影响。
+// - TAIL_MIN_MSGS = 64:keeps a useful recent suffix in the hot row. Older
+//   content remains exact in archive chunks and model reads page those chunks
+//   until the selected model's real context window is filled.
 export const SESSION_SOFT_TRIM_BYTES = Math.floor(2.5 * 1024 * 1024) // 2.5MB
 export const SESSION_TAIL_TARGET_BYTES = 2 * 1024 * 1024 // 2MB
 export const SESSION_TAIL_MIN_MSGS = 64
@@ -1885,8 +1755,8 @@ export function _stripClientPutMessages(
   serverSideMsgs: readonly MessageLike[] = [],
 ): MessageLike[] {
   // GET expands each immutable tape record into a normal message so existing
-  // clients can render it. A client can immediately PUT that projection back.
-  // Identify projections while their server-only tape markers are still
+  // clients can render it. A client can immediately PUT that read expansion back.
+  // Identify expanded records while their server-only tape markers are still
   // present; `_stripClientPutMessage` intentionally removes those markers.
   // The complete anchor in the already-stored hot tail is the authority for
   // which tape ids are safe to discard here.
@@ -2152,8 +2022,8 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
     const cur = merged[i]
     if (!cur) { deduped.push(cur); continue }
     const g = turnGroup[i]
-    // Hydrated tape records are a read projection returned to the browser.
-    // Never copy that projection back into the hot JSON tail on a later PUT;
+    // Hydrated tape records are a read expansion returned to the browser.
+    // Never copy that expansion back into the hot JSON tail on a later PUT;
     // the complete anchor already rehydrates the same immutable records.
     if (
       (cur as { _turnTapeExpanded?: unknown })._turnTapeExpanded === true &&
@@ -3984,9 +3854,7 @@ async function _sqliteGetClientSession(
     pinned: row.pinned === 1,
     createdAt: row.created_at,
     lastAt: row.last_at,
-    messages: options.projection === 'chat'
-      ? projectClientSessionMessagesForChat(exactMessages)
-      : exactMessages,
+    messages: exactMessages,
     updatedAt: row.updated_at,
     historyRevision: row.history_revision,
     ...(row.model_id ? { modelId: row.model_id } : {}),
@@ -4030,8 +3898,8 @@ export interface ClientSessionPartial extends ClientSession {
  * row enters incremental mode and subsequent GETs honour `since`.
  *
  * Incremental mode also requires `options.sinceHistoryRevision` to equal the
- * row's server-owned projection revision. Missing/mismatch returns the full
- * hot projection so rolling old clients self-heal without a coordinated cut.
+ * row's server-owned history revision. Missing/mismatch returns the full hot
+ * timeline so rolling old clients self-heal without a coordinated cut.
  *
  * `maxSeq` is computed from the actual messages array (NOT `next_seq`); per
  * Codex review #5, `next_seq - 1` may drift in the rare schema-mismatch case.
@@ -4089,8 +3957,6 @@ async function _sqliteGetClientSessionPartial(
     isPartial = false
   }
 
-  if (options.projection === 'chat') messages = projectClientSessionMessagesForChat(messages)
-
   return {
     id: row.id,
     userId: row.user_id,
@@ -4120,8 +3986,76 @@ export interface ReadArchivedMessagesResult {
   hasMore: boolean
   /** 本页最老一条的 _orderSeq(字段名保留兼容);空页 → null。 */
   oldestSeq: number | null
-  /** Projection revision captured with this archive page. */
+  /** History revision captured with this archive page. */
   historyRevision?: number
+}
+
+/** Private model-context read. This is deliberately separate from browser
+ * history: browser rows are exact/pageable, while this read returns only the
+ * contiguous narrative suffix that can physically fit the selected model. */
+export interface EngineContextReadOptions {
+  contextWindow?: number | null
+  engine?: string
+  currentUserText?: string
+  excludeClientMessageId?: string
+}
+
+/** Filter to real browser-visible semantic records and select a contiguous
+ * exact suffix for the model execution window. Tool results, plans, goals and
+ * delegate outputs remain available across runner/provider switches;
+ * `truncated` only describes this private model input, never browser history. */
+export function selectEngineContextSuffix(
+  messages: MessageLike[],
+  options: EngineContextReadOptions = {},
+): { messages: MessageLike[]; truncated: boolean } {
+  const rows = messages.filter((message) => {
+    if (!message || modelHistorySemanticRole(message) === null) return false
+    if (message.system === true) return false
+    if (
+      options.excludeClientMessageId &&
+      (message.id === options.excludeClientMessageId ||
+        message._clientMessageId === options.excludeClientMessageId)
+    ) return false
+    return modelHistorySemanticText(message).trim().length > 0
+  })
+  const contextWindow = resolveModelHistoryContextWindow(options.contextWindow, options.engine)
+  if (contextWindow === null) return { messages: rows, truncated: false }
+
+  let remaining = availableModelHistoryTokens(contextWindow, options.currentUserText ?? '')
+  const selected: MessageLike[] = []
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!
+    const text = modelHistorySemanticText(row)
+    const rowTokens = estimateModelHistoryTokens(text) + 4
+    if (rowTokens > remaining) {
+      if (remaining > 64) {
+        const suffix = exactModelHistoryTextSuffix(
+          text,
+          Math.max(
+            0,
+            remaining - estimateModelHistoryTokens(MODEL_HISTORY_EXACT_SUFFIX_MARKER) - 4,
+          ),
+        )
+        if (suffix) {
+          const role = modelHistorySemanticRole(row)!
+          selected.unshift({
+            role,
+            text: MODEL_HISTORY_EXACT_SUFFIX_MARKER + suffix,
+            ...(typeof row.id === 'string' ? { id: row.id } : {}),
+            ...(typeof row._clientMessageId === 'string'
+              ? { _clientMessageId: row._clientMessageId }
+              : {}),
+            ...(typeof row.status === 'string' ? { status: row.status } : {}),
+            ...(typeof row.ts === 'number' ? { ts: row.ts } : {}),
+          })
+        }
+      }
+      return { messages: selected, truncated: true }
+    }
+    selected.unshift(row)
+    remaining -= rowTokens
+  }
+  return { messages: selected, truncated: false }
 }
 
 /**
@@ -4167,7 +4101,7 @@ async function _sqliteReadArchivedMessages(
     `SELECT messages FROM client_session_archive_chunks
        WHERE session_id = ? AND user_id = ? AND first_seq < ?
        ORDER BY last_seq DESC`,
-  ).all(sessId, userId, effectiveBefore) as Array<{ messages: string }>
+  ).iterate(sessId, userId, effectiveBefore) as Iterable<{ messages: string }>
 
   const pool: MessageLike[] = []
   for (const cr of chunkRows) {
@@ -4192,18 +4126,19 @@ async function _sqliteReadArchivedMessages(
     ? page[0]._orderSeq
     : null
   return {
-    messages: options.projection === 'chat' ? projectClientSessionMessagesForChat(page) : page,
+    messages: page,
     hasMore,
     oldestSeq,
     historyRevision: row.history_revision,
   }
 }
 
-/** 引擎上下文读(RFC §9)。个人版/容器无 tape 物化投影(会话正文全量内联),生成行即热行本体。
- *  返回热行原样(调用方 sanitizer 再做 48 行/18k 截断);缺省仅用于满足 ClientSessionsBackend 契约。 */
+/** 引擎上下文读(RFC §9)。个人版/容器按所选模型的真实上下文预算，从热行向归档
+ * 逐页回读；不再叠加固定消息数或字符数截断。 */
 async function _sqliteGetEngineContextMessages(
   sessionId: string,
   userId: string,
+  options: EngineContextReadOptions = {},
 ): Promise<MessageLike[] | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
@@ -4217,35 +4152,157 @@ async function _sqliteGetEngineContextMessages(
   } catch {
     msgs = []
   }
-  return deriveOrderSeqsForRead(msgs, row.archived_through_seq ?? 0)
+  let selected = selectEngineContextSuffix(
+    deriveOrderSeqsForRead(msgs, row.archived_through_seq ?? 0),
+    options,
+  )
+  if (selected.truncated) return selected.messages
+
+  // Newest-to-oldest lazy archive walk. Stop as soon as the selected model's
+  // real context window is full instead of materializing the whole session.
+  const chunks = db.prepare(
+    `SELECT messages FROM client_session_archive_chunks
+       WHERE session_id = ? AND user_id = ?
+       ORDER BY last_seq DESC`,
+  ).iterate(sessionId, userId) as Iterable<{ messages: string }>
+  for (const chunk of chunks) {
+    let archived: MessageLike[] = []
+    try {
+      const parsed = JSON.parse(chunk.messages)
+      if (Array.isArray(parsed)) archived = deriveArchivedOrderSeqsForRead(parsed as MessageLike[])
+    } catch { /* malformed legacy chunk contributes no synthetic context */ }
+    const combined = [...archived, ...selected.messages]
+    combined.sort(compareMessagesByOrder)
+    selected = selectEngineContextSuffix(combined, options)
+    if (selected.truncated) break
+  }
+  return selected.messages
 }
 
-/** 超大内容查看端点后端(RFC §9)。个人版无 tape_chat_projection 表 → 恒 null(端点回 404)。
- *
- * `recordOrdinal`/`offset`(可选,M-§9-1):单条超大记录的全量分块读定位 —— recordOrdinal 选
- * 中该卷内某条记录、offset 为其内容内的字节偏移。commercial pgBackend 是唯一有真实投影表的实现,
- * 语义由它落地;本 sqlite 桩只需**同步接口签名**(ClientSessionsBackend 类型从 sqliteBackend 派生),
- * 个人版恒 null 不改变。 */
-async function _sqliteListTapeChatProjectionRecords(
+function hasCompletedClientMessage(messages: MessageLike[], clientMessageId: string): boolean {
+  return messages.some((message) =>
+    message?.role === 'assistant' &&
+    message._clientMessageId === clientMessageId &&
+    message.status === 'completed' &&
+    message._errorCode === undefined &&
+    message._isError !== true,
+  )
+}
+
+/** Exact retry de-dup lookup. It stays in storage and never transports the
+ * whole transcript merely to answer one clientMessageId predicate. */
+async function _sqliteHasCompletedClientTurn(
+  sessionId: string,
+  userId: string,
+  clientMessageId: string,
+): Promise<boolean> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT messages FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessionId, userId) as { messages: string } | undefined
+  if (!row) return false
+  let hotContainsClientMessage = false
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (Array.isArray(parsed)) {
+      const hot = parsed as MessageLike[]
+      if (hasCompletedClientMessage(hot, clientMessageId)) return true
+      hotContainsClientMessage = hot.some((message) =>
+        message?.id === clientMessageId || message?._clientMessageId === clientMessageId)
+    }
+  } catch { /* continue through valid archive chunks */ }
+  if (hotContainsClientMessage) return false
+  const archivedId = db.prepare(
+    'SELECT 1 FROM client_session_archived_ids WHERE session_id = ? AND msg_id = ?',
+  ).get(sessionId, clientMessageId)
+  if (!archivedId) return false
+  const chunks = db.prepare(
+    `SELECT messages FROM client_session_archive_chunks
+       WHERE session_id = ? AND user_id = ? ORDER BY last_seq DESC`,
+  ).iterate(sessionId, userId) as Iterable<{ messages: string }>
+  for (const chunk of chunks) {
+    try {
+      const parsed = JSON.parse(chunk.messages)
+      if (Array.isArray(parsed) && hasCompletedClientMessage(parsed as MessageLike[], clientMessageId)) {
+        return true
+      }
+    } catch { /* continue */ }
+  }
+  return false
+}
+
+/** 不可变 turn-tape 记录分页。个人版 SQLite 没有 commercial tape 表，恒 null。 */
+async function _sqliteListTurnTapeRecords(
   _sessionId: string,
   _userId: string,
   _tapeId: string,
   _cursor: number,
   _limit: number,
-  _recordOrdinal?: number,
-  _offset?: number,
-): Promise<{ records: MessageLike[]; nextCursor: number | null; total: number } | null> {
+): Promise<{
+  records: MessageLike[]
+  nextCursor: number | null
+  total: number
+} | null> {
   return null
 }
 
-/** 同上:单条超大记录的分块读(M-§9-1 真通路)。个人版无投影表,恒 null=404。 */
-async function _sqliteReadTapeRecordChunk(
+/** 同上：读取单条用户可见不可变 JSON payload。 */
+async function _sqliteReadTapeRecordPayload(
+  _sessionId: string,
+  _userId: string,
+  _tapeId: string,
+  _recordOrdinal: number,
+  _offset = 0,
+  _length?: number,
+): Promise<{
+  payload: Buffer
+  totalBytes: number
+  offset: number
+  msgId: string
+  role: string
+  contentSha256: string
+  tapeSha256: string
+} | null> {
+  return null
+}
+
+async function _sqliteReadTapeRecordPayloadChunk(
   _sessionId: string,
   _userId: string,
   _tapeId: string,
   _recordOrdinal: number,
   _offset: number,
-): Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null> {
+  _requestedBytes?: number,
+): Promise<{
+  chunk: Buffer
+  nextOffset: number | null
+  totalBytes: number
+  start: number
+  endExclusive: number
+  msgId: string
+  role: string
+  contentSha256: string
+  tapeSha256: string
+} | null> {
+  return null
+}
+
+/** Commercial PG stores oversized user messages out-of-line. Personal SQLite
+ * never emits those locators, so its matching backend method is an empty read. */
+async function _sqliteReadUserMessagePayload(
+  _sessionId: string,
+  _userId: string,
+  _msgId: string,
+  _offset = 0,
+  _length?: number,
+): Promise<{
+  payload: Buffer
+  totalBytes: number
+  offset: number
+  msgId: string
+  role: 'user'
+  contentSha256: string
+} | null> {
   return null
 }
 
@@ -4313,6 +4370,20 @@ async function _sqliteSetClientSessionModel(id: string, userId: string, modelId:
     'UPDATE client_sessions SET model_id = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL RETURNING updated_at'
   ).get(modelId, now, id, userId) as { updated_at: number } | undefined
   return { ok: !!row, updatedAt: row ? row.updated_at : now }
+}
+
+/**
+ * Advance the browser-history revision after an external durable authority changes
+ * what the direct timeline reads (for example, a verified turn-dispatch status).
+ * This does not create or replace transcript content; it only invalidates a stale
+ * incremental read cursor so the next read sees the authoritative row.
+ */
+async function _sqliteBumpClientSessionHistoryRevision(id: string, userId: string): Promise<boolean> {
+  const db = await getSessionsDb()
+  const result = db.prepare(
+    'UPDATE client_sessions SET history_revision = history_revision + 1, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+  ).run(Date.now(), id, userId)
+  return result.changes > 0
 }
 
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
@@ -4497,11 +4568,15 @@ const sqliteBackend = {
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
-  listTapeChatProjectionRecords: _sqliteListTapeChatProjectionRecords,
-  readTapeRecordChunk: _sqliteReadTapeRecordChunk,
+  hasCompletedClientTurn: _sqliteHasCompletedClientTurn,
+  listTurnTapeRecords: _sqliteListTurnTapeRecords,
+  readTapeRecordPayload: _sqliteReadTapeRecordPayload,
+  readTapeRecordPayloadChunk: _sqliteReadTapeRecordPayloadChunk,
+  readUserMessagePayload: _sqliteReadUserMessagePayload,
   deleteClientSession: _sqliteDeleteClientSession,
   renameClientSession: _sqliteRenameClientSession,
   setClientSessionModel: _sqliteSetClientSessionModel,
+  bumpClientSessionHistoryRevision: _sqliteBumpClientSessionHistoryRevision,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
   upsertMasterClientSession: _sqliteUpsertMasterClientSession,
@@ -4604,11 +4679,20 @@ export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages']
 export const getEngineContextMessages: ClientSessionsBackend['getEngineContextMessages'] =
   (...args) => getActiveBackend().getEngineContextMessages(...args)
 
-export const listTapeChatProjectionRecords: ClientSessionsBackend['listTapeChatProjectionRecords'] =
-  (...args) => getActiveBackend().listTapeChatProjectionRecords(...args)
+export const hasCompletedClientTurn: ClientSessionsBackend['hasCompletedClientTurn'] =
+  (...args) => getActiveBackend().hasCompletedClientTurn(...args)
 
-export const readTapeRecordChunk: ClientSessionsBackend['readTapeRecordChunk'] =
-  (...args) => getActiveBackend().readTapeRecordChunk(...args)
+export const listTurnTapeRecords: ClientSessionsBackend['listTurnTapeRecords'] =
+  (...args) => getActiveBackend().listTurnTapeRecords(...args)
+
+export const readTapeRecordPayload: ClientSessionsBackend['readTapeRecordPayload'] =
+  (...args) => getActiveBackend().readTapeRecordPayload(...args)
+
+export const readTapeRecordPayloadChunk: ClientSessionsBackend['readTapeRecordPayloadChunk'] =
+  (...args) => getActiveBackend().readTapeRecordPayloadChunk(...args)
+
+export const readUserMessagePayload: ClientSessionsBackend['readUserMessagePayload'] =
+  (...args) => getActiveBackend().readUserMessagePayload(...args)
 
 export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] =
   (...args) => getActiveBackend().deleteClientSession(...args)
@@ -4618,6 +4702,9 @@ export const renameClientSession: ClientSessionsBackend['renameClientSession'] =
 
 export const setClientSessionModel: ClientSessionsBackend['setClientSessionModel'] =
   (...args) => getActiveBackend().setClientSessionModel(...args)
+
+export const bumpClientSessionHistoryRevision: ClientSessionsBackend['bumpClientSessionHistoryRevision'] =
+  (...args) => getActiveBackend().bumpClientSessionHistoryRevision(...args)
 
 export const listUnclaimedSessions: ClientSessionsBackend['listUnclaimedSessions'] =
   () => getActiveBackend().listUnclaimedSessions()

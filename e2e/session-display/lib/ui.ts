@@ -29,7 +29,7 @@ export const SEL = {
   // 已有稳定锚点
   typing: (p: Page): Locator => p.locator('[aria-label="生成中"]'),
   historySkeleton: (p: Page): Locator => p.locator('[aria-label="正在加载会话历史"]'),
-  collapseCard: (p: Page): Locator => p.getByTestId('collapse-card'),
+  turnProcessCard: (p: Page): Locator => p.getByTestId('turn-process-card'),
   teamPanel: (p: Page): Locator => p.getByTestId('team-panel'),
   permissionCard: (p: Page): Locator => p.getByTestId('permission-card'),
   // 侧栏会话项

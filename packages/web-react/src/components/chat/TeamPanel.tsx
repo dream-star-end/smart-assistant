@@ -19,8 +19,9 @@ import { memo, useEffect, useState } from "react";
 import { type ChatMessage, isServerAuthoredRow } from "../../lib/chat/model";
 import { agentTerminalStatus, childSignature, reviewVerdictBadge } from "../../lib/chat/render";
 import { cn, groupDigits } from "../../lib/utils";
+import { ExactToolRecordDisclosure } from "../ToolCard";
 import { Badge, Spinner } from "../ui";
-import { ChildBlockView } from "./AgentGroupCard";
+import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { agentDisplayName } from "./agentNames";
 
 /** 队员是否运行中:server-authored 骨架行是终态快照,永不"运行中"。 */
@@ -48,6 +49,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
   // 审查裁决徽记:仅隐藏审查员行返回非 null(PASS/未通过),与执行态徽记并列展示。
   const verdict = reviewVerdictBadge(msg);
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const [visibleChildren, setVisibleChildren] = useState(100);
   const open = userOpen ?? running;
   const children = msg.childBlocks ?? [];
   const name = memberName(msg, idx);
@@ -111,27 +113,39 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
               <Spinner size={11} /> 启动中…
             </div>
           )}
-          {/* server 骨架队员(无 childBlocks 过程树):展开态展示结果摘要 + 过程降级说明。 */}
+          {/* 无 childBlocks 的终态行仍展示其结果摘要；原始工具记录在下方按需展开。 */}
           {terminalNoChildren && (msg._resultPreview || isServerRow) && (
             <div className="space-y-1.5">
               {msg._resultPreview && (
-                <div className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-muted">
-                  {msg._resultPreview}
-                </div>
+                <ProgressivePlainText
+                  text={msg._resultPreview}
+                  className="text-[12px] leading-relaxed text-muted"
+                />
               )}
-              {isServerRow && <div className="text-[11px] text-faint">过程明细仅在发起设备可见</div>}
             </div>
           )}
-          {children.map((ch, i) => (
+          {children.slice(0, visibleChildren).map((ch, i) => (
             <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
           ))}
+          {visibleChildren < children.length && (
+            <button
+              type="button"
+              onClick={() => setVisibleChildren((value) => value + 100)}
+              className="mx-auto block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
+            >
+              继续加载过程（还有 {children.length - visibleChildren} 条）
+            </button>
+          )}
+          <ExactToolRecordDisclosure message={msg} />
         </div>
       )}
 
       {!open && !running && msg._resultPreview && (
         <div className="flex items-start gap-1.5 border-t border-border/70 px-3 py-1.5 text-[12px] text-muted">
           <Check size={12} className="mt-0.5 shrink-0 text-success" />
-          <span className="line-clamp-1">{msg._resultPreview}</span>
+          <span className="line-clamp-1">
+            {msg._resultPreview.slice(0, 500)}{msg._resultPreview.length > 500 ? "…" : ""}
+          </span>
         </div>
       )}
     </div>

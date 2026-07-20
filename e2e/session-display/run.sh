@@ -66,7 +66,7 @@ fi
 export OC_E2E_PASSWORD OC_E2E_BASE_URL
 
 log "目标=${OC_E2E_BASE_URL}  账号=${OC_E2E_EMAIL:-v5-canary@claudeai.chat}  模型=${OC_E2E_MODEL:-gpt-5.6-sol}"
-[ -n "${OC_E2E_PG_URL:-}" ] && log "§9 DB 注入:已配置 OC_E2E_PG_URL" || log "§9 DB 注入:未配置 → 用例 2/5 将 skip-with-reason"
+[ -n "${OC_E2E_PG_URL:-}" ] && log "direct-timeline DB 注入:已配置 OC_E2E_PG_URL" || log "direct-timeline DB 注入:未配置 → 用例 2/5 将 skip-with-reason"
 
 # ── 串行跑(浏览器复用 ms-playwright 缓存,免下载)────────────────────────────
 export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1

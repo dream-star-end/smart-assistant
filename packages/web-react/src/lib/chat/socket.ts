@@ -40,15 +40,13 @@ import {
   shouldApplyGoalSnapshot,
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
+import { collapseExpandedTapePage, mergeExpandedTapePage } from "./directTimeline";
 import {
-  isCollapsedTapeAnchor,
   isDispatchLostCode,
   isDispatchTerminalRow,
-  tapeAnchorKey,
 } from "./render";
 import {
   applyServerIncremental,
-  applyHistoryProjectionPatches,
   detectServerTerminalTurns,
   mergeArchivedHistory,
   mergeFullServerWins,
@@ -189,7 +187,19 @@ export type ChatSocketDeps = {
    *  带本地 client id → getSession 回带同 id,前端合并去重。best-effort。 */
   persistUserMessage?: (
     sessId: string,
-    msg: { id: string; text: string; ts: number; media?: InboundMessage["content"]["media"] },
+    msg: {
+      id: string;
+      text: string;
+      ts: number;
+      media?: InboundMessage["content"]["media"];
+      _retryMedia?: InboundMessage["content"]["media"];
+      _imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
+      _modelText?: string;
+      _routing?: ChatRoutingSnapshot;
+      _sendAttempt?: number;
+      _isAutoRetry?: boolean;
+      _idem?: string;
+    },
   ) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
@@ -259,18 +269,46 @@ function normalizeRetiredRouting(
  * 调用方语义**:手动用户气泡「重试」(legacy 行无 `_routing` 时仍回退 `_lastRouting`)不受影响。
  */
 export function preciseRetryEligible(
-  msg: Pick<ChatMessage, "_routing" | "_media" | "_retryMedia">,
+  msg: Pick<
+    ChatMessage,
+    "_routing" | "_media" | "_retryMedia" | "_userPayloadDeferred" | "_deferredRetryEligible"
+  >,
 ): boolean {
   if (!msg._routing) return false;
+  if (msg._userPayloadDeferred === true) return msg._deferredRetryEligible === true;
   const hadAttachments = (msg._media?.length ?? 0) > 0 || (msg._retryMedia?.length ?? 0) > 0;
   if (!hadAttachments) return true;
-  const source = msg._retryMedia && msg._retryMedia.length > 0 ? msg._retryMedia : msg._media;
+  const source = msg._retryMedia ?? msg._media;
   if (!source || source.length === 0) return false;
   return source.every(
     (r) =>
       (typeof r.url === "string" && r.url.length > 0) ||
       (typeof r.base64 === "string" && r.base64.length > 0),
   );
+}
+
+/** Reconstruct one exact user replay body. Retry and regenerate share this
+ * helper so model text, bubble text, attachments and image-edit descriptors
+ * cannot silently diverge. The returned data may be large and is never stored
+ * back into a deferred session locator. */
+export function exactUserReplayPayload(
+  msg: Pick<ChatMessage, "text" | "_modelText" | "_media" | "_retryMedia" | "_imageEdit">,
+): {
+  text: string;
+  displayText?: string;
+  media?: InboundMessage["content"]["media"];
+  imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
+} {
+  const displayText = msg.text ?? "";
+  const text = msg._modelText ?? displayText;
+  const sourceMedia = msg._retryMedia ?? msg._media;
+  const media = sourceMedia && sourceMedia.length > 0 ? sourceMedia : undefined;
+  return {
+    text,
+    ...(displayText !== text ? { displayText } : {}),
+    ...(media ? { media } : {}),
+    ...(msg._imageEdit ? { imageEdit: msg._imageEdit } : {}),
+  };
 }
 
 /** rAF 合并渲染的隐藏-tab 兜底间隔:rAF 在隐藏 tab 被节流到几乎不触发,用此 setTimeout
@@ -1807,9 +1845,26 @@ export class ChatSocket {
     // 同时剥离 _media 里的 localSrc：那是乐观渲染用的 blob: URL，持久化到 IndexedDB 后
     // reload 即成死链（blob 是页面生命周期内的）。剥离后重开会话的媒体回落 url 走签名管线。
     const needsLocalSrcStrip = s.messages.some((m) => m._media?.some((r) => r.localSrc));
-    let messages = s.messages.some((m) => m._genPlaceholder)
-      ? s.messages.filter((m) => !m._genPlaceholder)
+    const shouldStrip = (message: ChatMessage) =>
+      !!message._genPlaceholder ||
+      typeof message._turnTapeProcessLoadedFrom === "string" ||
+      message.id.startsWith("projection-") ||
+      message.id.startsWith("oc-dispatch-err:") ||
+      !!(message as ChatMessage & { _historyProjection?: unknown })._historyProjection;
+    let messages = s.messages.some(shouldStrip)
+      ? s.messages.filter((message) => !shouldStrip(message))
       : s.messages;
+    // Process expansion is a view concern. Persist only the tiny control row,
+    // reset to collapsed, so IndexedDB never grows with a 50 MB tool record.
+    if (messages.some((message) => message._turnTapeProcessExpanded)) {
+      messages = messages.map((message) => {
+        if (!message._turnTapeProcessExpanded) return message;
+        const clean = { ...message };
+        delete clean._turnTapeProcessExpanded;
+        delete clean._turnTapeProcessCursor;
+        return clean;
+      });
+    }
     if (needsLocalSrcStrip) {
       messages = messages.map((m) => {
         if (!m._media?.some((r) => r.localSrc)) return m;
@@ -1869,12 +1924,17 @@ export class ChatSocket {
       createdAt: stored.createdAt,
     });
     s.messages = Array.isArray(stored.messages)
-      ? stored.messages.map((message) => {
+      ? stored.messages
+        .filter((message) =>
+          !message.id.startsWith("projection-") &&
+          !message.id.startsWith("oc-dispatch-err:") &&
+          !(message as ChatMessage & { _historyProjection?: unknown })._historyProjection,
+        )
+        .map((message) => {
           const routing = normalizeRetiredRouting(message._routing);
           return routing !== message._routing ? { ...message, _routing: routing } : message;
         })
       : [];
-    applyHistoryProjectionPatches(s.messages);
     s.lastAt = typeof stored.lastAt === "number" ? stored.lastAt : s.lastAt;
     s.updatedAt = stored.updatedAt;
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
@@ -1954,10 +2014,10 @@ export class ChatSocket {
       /** 载荷的 SessionDetail.modelId(会话级模型选择,server canonical):携带时 server-wins
        *  镜像进会话态(缺省=服务端无值,保留本地,与侧栏 listSessions 合并同语义)。 */
       modelId?: string;
-      /** Projection revision paired with maxSeq; set only after payload acceptance. */
+      /** History revision paired with maxSeq; set only after payload acceptance. */
       historyRevision?: number;
-      /** Legacy backend fallback: invalidate hydrated projections on every full read. */
-      invalidateProjectionCache?: boolean;
+      /** Legacy backend fallback: invalidate hydrated history on every full read. */
+      invalidateHistoryCache?: boolean;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -1977,7 +2037,7 @@ export class ChatSocket {
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;
-    // 终态收敛(RFC §5 M5):先从载荷推导「已收尾 turn → 终态类别」。error projection(§2.5)、
+    // 终态收敛:先从载荷推导「已收尾 turn → 终态类别」。verified failure status、
     // 持久化 error 卡、真 tape 生成行都在此被识别,合并后 convergeTerminalTurns 显式清发送态 +
     // 落 user 行终态,不再依赖「completion-evidence 恰好命中」的巧合路径。
     const terminalTurns = detectServerTerminalTurns(msgs);
@@ -1988,8 +2048,8 @@ export class ChatSocket {
       incomingHistoryRevision >= 0;
     const historyRevisionChanged =
       hasHistoryRevision && incomingHistoryRevision !== s._historyRevision;
-    const invalidateProjectionCache =
-      historyRevisionChanged || (full && archive?.invalidateProjectionCache === true);
+    const invalidateHistoryCache =
+      historyRevisionChanged || (full && archive?.invalidateHistoryCache === true);
     // P1 缺席删除只在「载荷携带版本且 ≥ 水位」的 full 上授权;无版本信息的载荷照常合并但不授权
     // (缺席不可证)。活跃轮守卫:发送中的轮绝不被载荷自证清除 —— **但载荷携带该活跃轮的精确终态
     // 证据时给守卫开口**(server 权威胜),让合并按证据收敛本地乐观行,而非把已终态轮永久保护住。
@@ -2005,7 +2065,7 @@ export class ChatSocket {
           {
             deletionAuthority: hasVersion,
             activeClientMessageId,
-            invalidateProjectionCache,
+            invalidateHistoryCache,
           },
         )
       : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId, {
@@ -2049,7 +2109,7 @@ export class ChatSocket {
 
   /**
    * 终态收敛(RFC §5 M5):REST 对账载荷自证「已收尾 turn」时,显式落 user 行终态并清发送态。
-   * 覆盖 durable dispatch 下真 final 帧永不到达的丢 turn 场景(error projection / 静默收尾),
+   * 覆盖 durable dispatch 下真 final 帧永不到达的丢 turn场景(verified status / 静默收尾),
    * 不依赖既有 completion-evidence 的巧合命中。
    *  - completed:user 行 → replied;error:user 行 → error(不覆盖已 replied)。
    *  - 该 turn 恰为当前活跃在飞轮 → clearSendingState 收口("回复中"停转、drain 推进)。
@@ -2094,22 +2154,19 @@ export class ChatSocket {
   }
 
   /** Archive-page revision mismatch recovery. Bypass the ordinary debounce:
-   * the page was captured from a different projection generation, so a full
+   * the page was captured from a different history generation, so a full
    * history reconciliation is required before retrying pagination. */
   syncHistoryNow(sessId: string): void {
     void this.deps.syncSession?.(sessId);
   }
 
   /**
-   * §9 折叠卷展开:把折叠 anchor 拉回的一页 chat-safe 投影记录并入会话。**定位按 (_turnTapeId,
-   * tapeSha, anchor id) 三元组**(tapeAnchorKey),严禁按 _seq 批量替换(同 _seq 上并列多条 projection
-   * 虚拟行,按 _seq 会误伤)。折叠 anchor **保留**在 messages(标 `_tapeExpanded`,render 层切成
-   * 分节头 + 展开行),展开行为 server 权威内容水合(`_source:'server'` + `_tapeExpandedFrom`,合并保护
-   * 见 persist:P1 缺席豁免 + mergeLocalClientFields 单调保留展开标记)。
+   * 将一页真实 immutable tape records 并入过程控制行之后。定位只按
+   * (_turnTapeId,tapeSha,control id)，不会按共享 _seq 批量替换其它内容。
    *
    * **展开行共享 anchor 的 _seq/_orderSeq**(沿用"归档 anchor 展开共享 _seq"既有语义)→ 不新增
    * distinct _seq,故**不推进同步游标、不改 maxSeq/totalMessageCount 口径**(按 anchor 计不变)。
-   * 分页续拉:anchor 已展开时**追加**新页(按 id 去重),更新 `_tapeExpandCursor`(null=已拉全)。
+   * 分页续拉:anchor 已展开时**追加**新页(按 id 去重),更新 `_turnTapeProcessCursor`(null=已拉全)。
    */
   applyExpandedTapeRecords(
     sessId: string,
@@ -2119,70 +2176,28 @@ export class ChatSocket {
   ): void {
     const s = this.sessions.get(sessId);
     if (!s) return;
-    const anchorIdx = s.messages.findIndex((m) => m?.id === anchorId && isCollapsedTapeAnchor(m));
-    if (anchorIdx < 0) return; // anchor 不在(会话已切/被合并覆盖)→ 静默放弃,不误伤
-    const anchor = s.messages[anchorIdx];
-    const key = tapeAnchorKey(anchor);
-    // 会话内该 anchor 已有的展开行 id(分页续拉去重:重复页 / 重叠游标不重复插入)。
-    const existing = new Set<string>();
-    for (const m of s.messages) {
-      if (m?._tapeExpandedFrom === key && typeof m.id === "string") existing.add(m.id);
-    }
-    const mapped: ChatMessage[] = [];
-    for (const r of Array.isArray(records) ? records : []) {
-      if (!r || typeof r.id !== "string" || r.id.length === 0 || existing.has(r.id)) continue;
-      existing.add(r.id);
-      mapped.push({
-        ...r,
-        _source: "server",
-        _tapeExpandedFrom: key,
-        _turnTapeId: anchor._turnTapeId,
-        _turnTapeSha256: anchor._turnTapeSha256,
-        _turnTapeComplete: true,
-        // 展开行共享 anchor 顺序轴 → 不新增 distinct _seq(count/游标口径不变)。
-        _seq: anchor._seq,
-        _orderSeq: anchor._orderSeq,
-        _clientMessageId:
-          typeof r._clientMessageId === "string" && r._clientMessageId
-            ? r._clientMessageId
-            : anchor._clientMessageId,
-        ts: typeof r.ts === "number" && Number.isFinite(r.ts) ? r.ts : anchor.ts,
-      });
-    }
-    // 折叠 anchor 就地标记展开态(渲染态权威;随 IndexedDB persist 往返保留)。
-    anchor._tapeExpanded = true;
-    anchor._tapeExpandCursor = nextCursor;
-    if (mapped.length > 0) {
-      // 插在**该 anchor 连续展开行段之后**(anchor 或其已展开行),保证分页续拉顺序稳定、不跨轮插入。
-      let insertAt = anchorIdx + 1;
-      for (let i = anchorIdx + 1; i < s.messages.length; i++) {
-        if (s.messages[i]?._tapeExpandedFrom === key) insertAt = i + 1;
-        else break;
-      }
-      s.messages = [...s.messages.slice(0, insertAt), ...mapped, ...s.messages.slice(insertAt)];
-      s._blockIdToMsgId = new Map();
-      s._agentGroups = new Map();
-      rebuildIndexes(s);
-      normalizeDelegateCards(s);
-      normalizeGoalCards(s);
-    }
+    const next = mergeExpandedTapePage(s.messages, anchorId, records, nextCursor);
+    if (!next) return;
+    s.messages = next;
+    s._blockIdToMsgId = new Map();
+    s._agentGroups = new Map();
+    rebuildIndexes(s);
+    normalizeDelegateCards(s);
+    normalizeGoalCards(s);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }
 
   /**
-   * §9 折叠卷收起:抹掉某折叠 anchor 的展开行、还原折叠态。展开行是可再拉的只读缓存,收起纯本地
+   * Collapse one process cursor:remove fetched rows and return to the small control. The rows are reloadable, so this is local only
    * (不触 server)。游标重置 → 下次展开从首页(cursor=null)重拉。
    */
-  collapseTape(sessId: string, anchorId: string): void {
+  collapseTurnProcess(sessId: string, anchorId: string): void {
     const s = this.sessions.get(sessId);
     if (!s) return;
-    const anchor = s.messages.find((m) => m?.id === anchorId && isCollapsedTapeAnchor(m));
-    if (!anchor || anchor._tapeExpanded !== true) return;
-    const key = tapeAnchorKey(anchor);
-    anchor._tapeExpanded = false;
-    anchor._tapeExpandCursor = undefined;
-    s.messages = s.messages.filter((m) => m._tapeExpandedFrom !== key);
+    const next = collapseExpandedTapePage(s.messages, anchorId);
+    if (!next) return;
+    s.messages = next;
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
@@ -2332,7 +2347,14 @@ export class ChatSocket {
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId: p.agentId,
-      content: { text: p.text, ...(outboundMedia ? { media: outboundMedia } : {}), ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}) },
+      content: {
+        text: p.text,
+        ...(p.displayText !== undefined && p.displayText !== p.text
+          ? { displayText: p.displayText }
+          : {}),
+        ...(outboundMedia ? { media: outboundMedia } : {}),
+        ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}),
+      },
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
@@ -2345,7 +2367,7 @@ export class ChatSocket {
       // 重发走 dispatchPayload 会重新构帧,用剥离 localSrc 的版本(blob 不重发)。
       _retryMedia: p.imageEdit ? outboundMedia : undefined,
       _imageEdit: p.imageEdit,
-      _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
+      _modelText: p.displayText !== undefined && p.displayText !== p.text ? p.text : undefined,
       _routing: { ...routing },
       _sendAttempt: 0,
     });
@@ -2362,7 +2384,19 @@ export class ChatSocket {
     // 仍在);容器回传的 server-authored 助手消息走另一条链。
     {
       const sid = sess.id;
-      const um = { id: userMsg.id, text: userMsg.text, ts: userMsg.ts, media: outboundMedia?.filter((m) => m.hidden !== true) };
+      const um = {
+        id: userMsg.id,
+        text: userMsg.text,
+        ts: userMsg.ts,
+        media: outboundMedia?.filter((m) => m.hidden !== true),
+        ...(userMsg._retryMedia !== undefined ? { _retryMedia: userMsg._retryMedia } : {}),
+        ...(userMsg._imageEdit !== undefined ? { _imageEdit: userMsg._imageEdit } : {}),
+        ...(userMsg._modelText !== undefined ? { _modelText: userMsg._modelText } : {}),
+        ...(userMsg._routing !== undefined ? { _routing: userMsg._routing } : {}),
+        ...(userMsg._sendAttempt !== undefined ? { _sendAttempt: userMsg._sendAttempt } : {}),
+        ...(userMsg._isAutoRetry !== undefined ? { _isAutoRetry: userMsg._isAutoRetry } : {}),
+        ...(userMsg._idem !== undefined ? { _idem: userMsg._idem } : {}),
+      };
       void ensurePromise
         .then((ok) => {
           if ((ok || this.serverSessionEnsured.has(sid)) && this.sessions.has(sid)) {
@@ -2529,23 +2563,27 @@ export class ChatSocket {
     sessId: string;
     msgId: string;
     agentId: string;
+    /** Exact lazy-hydrated source for this dispatch only. It is deliberately
+     * not assigned into the hot session or IndexedDB locator. */
+    sourceOverride?: ChatMessage;
   }): void {
     const sess = this.sessions.get(p.sessId);
     if (!sess) return;
     const userMsg = sess.messages.find((m) => m.id === p.msgId && m.role === "user");
     if (!userMsg || userMsg.status !== "error") return;
+    const source = p.sourceOverride?.id === userMsg.id && p.sourceOverride.role === "user"
+      ? p.sourceOverride
+      : userMsg;
     // 主控建行可能在首发失败时未确保 → 幂等补一次(best-effort,不阻塞发送)。
     const agentId = sess.agentId || p.agentId;
     void this.ensureServerSessionOnce(sess, agentId);
-    const retryMedia = userMsg._retryMedia ?? userMsg._media;
-    const media = retryMedia && retryMedia.length > 0 ? retryMedia : undefined;
-    const text = userMsg._modelText ?? userMsg.text ?? "";
+    const replay = exactUserReplayPayload(source);
     // Historical rows written before message-level snapshots fall back to the session
     // snapshot; all new rows bind retry routing to the original user turn.
     // NB: the red-card precise CTA never reaches this fallback — resolveRetryTarget gates it
     // behind preciseRetryEligible (own _routing required). Only the manual user-bubble retry
     // (legacy send-failure rows) may still fall back to _lastRouting, and that path is preserved.
-    const routing = normalizeRetiredRouting(userMsg._routing ?? sess._lastRouting);
+    const routing = normalizeRetiredRouting(source._routing ?? userMsg._routing ?? sess._lastRouting);
     if (routing) {
       userMsg._routing = { ...routing };
       // Continuations belong to the retried turn, not to a later turn that last
@@ -2558,7 +2596,12 @@ export class ChatSocket {
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId,
-      content: { text, ...(media ? { media } : {}), ...(userMsg._imageEdit ? { imageEdit: userMsg._imageEdit } : {}) },
+      content: {
+        text: replay.text,
+        ...(replay.displayText !== undefined ? { displayText: replay.displayText } : {}),
+        ...(replay.media ? { media: replay.media } : {}),
+        ...(replay.imageEdit ? { imageEdit: replay.imageEdit } : {}),
+      },
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel")
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),
@@ -2567,10 +2610,10 @@ export class ChatSocket {
       ts: Date.now(),
     };
     // 重试语义分流(RFC §5):
-    //  - **dispatch 终态**(error projection / _errorCode ∈ {dispatch_lost, service_restart} 指向同轮):
+    //  - **dispatch 终态**(_dispatchTerminal / 稳定错误码指向同轮):
     //    server 已**证明该 clientMessageId 未被接受或已终态**,复用旧 id 只会撞 admitUserTurn 的
     //    previously_failed 幂等错误帧、永远起不了新 turn。故铸**新 clientMessageId = 新逻辑 turn**,
-    //    并清掉旧轮残留的 dispatch error 行(投影/错误卡)。
+    //    并清掉旧轮残留的 durable dispatch status。
     //  - 其余 **resend-uncertain**(网络失败等,不确定是否已达 server):**复用旧 id + attempt 递增**,
     //    靠 gateway inbound 幂等去重防重复计费(dedup 保护),绝不铸新 id。
     if (this.isDispatchTerminalFailure(sess, userMsg)) {
@@ -2579,6 +2622,14 @@ export class ChatSocket {
       sess.messages = sess.messages.filter(
         (m) => !(m && m._clientMessageId === staleCmid && isDispatchTerminalRow(m)),
       );
+      // The new id is dispatch identity, not storage identity. A deferred
+      // payload may still exist only under the previous immutable sidecar key
+      // while this retry is offline/in flight, so retain that key in the tiny
+      // locator persisted to IndexedDB. A later server echo for `freshId`
+      // replaces it with the newly durable sidecar locator.
+      if (userMsg._userPayloadDeferred === true && !userMsg._userPayloadId) {
+        userMsg._userPayloadId = staleCmid;
+      }
       userMsg.id = freshId;
       userMsg._errorCode = undefined;
       userMsg._errorDetail = undefined;
@@ -2596,16 +2647,16 @@ export class ChatSocket {
     }
     userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
     // 生成占位卡（需求 C）：imageEdit 重试复用同 clientJobId → 重置上次失败的占位回 running。
-    this.ensureGenPlaceholder(sess, userMsg._imageEdit, true, userMsg.id);
+    this.ensureGenPlaceholder(sess, replay.imageEdit, true, userMsg.id);
     this.dispatchPayload(sess, userMsg, payload);
   }
 
   /**
    * 该 user 行的发送失败是否源于 durable dispatch 终态(RFC §5 重试分流判据)。**去枚举化**:
-   * 判据走 server 持久标记(projection id 前缀 / `_dispatchTerminal`)+ 不可变 tape 稳定协议码,
+   * 判据走 server 持久标记 `_dispatchTerminal` + 不可变 tape 稳定协议码,
    * 而非前端枚举内部 failureCode —— 单一权威 isDispatchTerminalRow。命中任一:
    *  - user 行自身被标记 dispatch 终态(或带稳定协议码);
-   *  - 同 _clientMessageId(= user 行 id)存在 dispatch 终态行(projection / _dispatchTerminal / 稳定码)。
+   *  - 同 _clientMessageId(= user 行 id)存在 dispatch 终态行(_dispatchTerminal / 稳定码)。
    * 命中 → 重试铸新 clientMessageId;否则复用旧 id(dedup 保护)。
    */
   private isDispatchTerminalFailure(sess: ChatSession, userMsg: ChatMessage): boolean {

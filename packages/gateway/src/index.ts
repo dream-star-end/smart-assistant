@@ -50,6 +50,7 @@ export * from './rateLimit.js'
 export * from './imageEdit.js'
 export * from './bridgeApiAllowlist.js'
 export * from './containerPreview.js'
+export * from './httpRange.js'
 // V3 P1.7 slice 7c — container 侧 wechat outbound 适配器(personal 不用)。
 // cli launcher 在容器 env 全集时 `channelFactories.push(() => makeV3WechatOutboundAdapter({config}))`。
 export {

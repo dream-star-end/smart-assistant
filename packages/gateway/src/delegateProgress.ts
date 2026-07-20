@@ -176,35 +176,6 @@ export function summarizeDelegateProgressEvent(
   }
 }
 
-// 透传模式每个 string 字段的上限。解析层已对各字段硬截(inputPreview 500 / inputJson 8000 /
-// tool_result preview 3000),这里只是兜底防御,不做语义截断,故给宽上限。
-const DELEGATE_PASSTHROUGH_FIELD_CAP = 16_000
-
-/**
- * 富渲染文本清洗:剥危险控制字符(保留 \t/\n)、归一 \r\n,**不折叠空白**(否则破坏代码缩进/diff)、
- * 不 trim,超 cap 截断。区别于 sanitizeDelegateProgressText(那个会折叠多空格,适合摘要 chip 不适合富渲染)。
- */
-function sanitizeRichTextForDelegate(raw: unknown, cap = DELEGATE_PASSTHROUGH_FIELD_CAP): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: 故意匹配并剥离危险控制字符(保留 \t=09/\n=0a),富文本清洗
-  const controlStripped = String(raw ?? '').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
-  const s = controlStripped.replace(/\r\n?/g, '\n')
-  if (s.length <= cap) return s
-  return `${s.slice(0, Math.max(0, cap - 1))}…`
-}
-
-/**
- * 浅拷贝子 agent block,仅对已知自由文本字段做富文本清洗(保留缩进/换行),不丢字段、不语义截断。
- * 透传给前端 `_appendSubagentBlock` 复用主聊天富渲染。
- */
-function sanitizeBlockForDelegate(block: any): any {
-  if (!block || typeof block !== 'object') return block
-  const out: Record<string, unknown> = { ...block }
-  for (const f of ['text', 'inputPreview', 'inputJson', 'preview', 'tail']) {
-    if (typeof out[f] === 'string') out[f] = sanitizeRichTextForDelegate(out[f])
-  }
-  return out
-}
-
 /**
  * 把子 agent 的执行 block 以**完整 payload** 透传成 delegate_progress 帧(取代 summarize 的降级):
  *   - `block` 字段携带完整子 block(thinking 不再 drop、tool 输入/输出不再砍 180/800),供**新前端**
@@ -212,7 +183,9 @@ function sanitizeBlockForDelegate(block: any): any {
  *   - 同时保留 `phase`/`text`/`toolName`/`isError`(复用 summarizeDelegateProgressEvent)给**旧前端**
  *     降级显示;thinking 走 summarize 返回 null → 这里补一个 phase='thinking' 的最小帧(旧前端按
  *     phase 跳过 thinking,行为与旧版一致;新前端用 block 渲染)。
- * 只透传可渲染的 5 类块;其它(plan/start/done/error 由 caller 单独发摘要帧)返回 null。
+ * React treats these values as text rather than HTML, so the trusted engine
+ * block can be forwarded byte-for-byte. Presentation summaries remain a
+ * separate legacy field and never rewrite the authoritative `block`.
  */
 export function makeDelegateBlockPassthrough(
   event: any,
@@ -221,11 +194,12 @@ export function makeDelegateBlockPassthrough(
 ): DelegateProgressBlock | null {
   if (!event || event.kind !== 'block' || !event.block) return null
   const b = event.block as any
-  const RENDERABLE = new Set(['text', 'thinking', 'tool_use', 'tool_result', 'tool_output_tail'])
+  const RENDERABLE = new Set(['text', 'thinking', 'tool_use', 'tool_result', 'tool_output_tail', 'plan', 'goal'])
   if (!RENDERABLE.has(b.kind)) return null
   const legacy = summarizeDelegateProgressEvent(event, runId, agentId)
   const phase: DelegateProgressPhase =
-    legacy?.phase ?? (b.kind === 'thinking' ? 'thinking' : b.kind === 'text' ? 'text' : 'tool')
+    legacy?.phase ??
+    (b.kind === 'thinking' ? 'thinking' : b.kind === 'text' ? 'text' : b.kind === 'plan' || b.kind === 'goal' ? 'plan' : 'tool')
   const base: DelegateProgressBlock = legacy ?? {
     kind: 'delegate_progress',
     runId,
@@ -238,7 +212,7 @@ export function makeDelegateBlockPassthrough(
     runId,
     agentId,
     phase,
-    block: sanitizeBlockForDelegate(b),
+    block: { ...b },
   }
 }
 
@@ -356,19 +330,23 @@ export function resolveDelegateProgressRouting(args: {
  *   - 文本前缀 `↳ <一级名↳…↳本级名>: ` 让用户一眼区分这是「子 agent 的子委派」进度;
  *   - 结尾补 '\n' 便于前端把连续文本子块 coalesce 成多行而不粘连。
  *
- * 返回 null(丢弃)的两类:
- *   - thinking:嵌套子 agent 私有思考,不外泄(与 summarize 一致);
- *   - text:嵌套子 agent 的原始文本增量太碎、无法逐 delta 打标(最终结果仍在 done 行给出)。
+ * Rich blocks keep their original payload and only have the routing identity
+ * rebound to the first-level card. Synthetic lifecycle-only frames become a
+ * non-terminal text child so they cannot close the parent early.
  */
 export function toNestedDelegateProgressLine(
   source: DelegateProgressBlock,
   args: { runId: string; agentId: string; label: string },
 ): DelegateProgressBlock | null {
+  if (source.block && typeof source.block === 'object') {
+    return {
+      ...source,
+      runId: args.runId,
+      agentId: args.agentId,
+    }
+  }
   let detail: string | undefined
   switch (source.phase) {
-    case 'thinking':
-    case 'text':
-      return null
     case 'done':
       detail = source.text ? `完成:${source.text}` : '完成'
       break
@@ -381,12 +359,13 @@ export function toNestedDelegateProgressLine(
   }
   const trimmed = (detail ?? '').trim()
   if (!trimmed) return null
-  return makeDelegateProgressBlock({
+  const text = `↳ ${args.label}: ${trimmed}\n`
+  return {
+    kind: 'delegate_progress',
     runId: args.runId,
     agentId: args.agentId,
     phase: 'text',
-    text: `↳ ${args.label}: ${trimmed}\n`,
-    preserveWhitespace: true,
-    maxLen: 1_200,
-  })
+    text,
+    block: { kind: 'text', text },
+  }
 }

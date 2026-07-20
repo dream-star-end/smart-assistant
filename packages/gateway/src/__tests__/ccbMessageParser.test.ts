@@ -554,14 +554,15 @@ describe('CcbMessageParser: tool_result', () => {
     assert.equal(events.length, 1, 'should emit only once')
   })
 
-  it('truncates long previews to 3000 chars', () => {
+  it('keeps a short display preview alongside the complete authoritative output', () => {
     const { parser, events, toolUseIdToName } = createParser()
     toolUseIdToName.set('tu_6', 'Bash')
+    const output = `${'x'.repeat(5000)}EXACT_TOOL_RESULT_END`
 
     parser.parse({
       type: 'user',
       message: {
-        content: [{ type: 'tool_result', tool_use_id: 'tu_6', content: 'x'.repeat(5000) }],
+        content: [{ type: 'tool_result', tool_use_id: 'tu_6', content: output }],
       },
     } as any)
 
@@ -569,6 +570,7 @@ describe('CcbMessageParser: tool_result', () => {
     if (events[0].kind === 'block' && events[0].block.kind === 'tool_result') {
       assert.ok((events[0].block as any).preview.length <= 3001) // 3000 + '…'
       assert.ok((events[0].block as any).preview.length > 3000)
+      assert.equal((events[0].block as any).output, output)
     }
   })
 })
@@ -1004,7 +1006,7 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
   })
 
   it('retains the exact structured tool_result content alongside its text rendering', () => {
-    const { parser, getResult } = createParser()
+    const { parser, events, getResult } = createParser()
     parser.parse({
       type: 'assistant',
       message: { content: [{ type: 'tool_use', id: 'tu_struct', name: 'Read', input: {} }] },
@@ -1020,6 +1022,11 @@ describe('CcbMessageParser: top-level tools collection (Phase 1)', () => {
     } as any)
     parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
     assert.deepEqual(getResult().tools[0].outputJson, structured)
+    const liveResult = events.find(
+      (event) => event.kind === 'block' && event.block.kind === 'tool_result',
+    )
+    assert.ok(liveResult && liveResult.kind === 'block')
+    assert.deepEqual((liveResult.block as any).outputJson, structured)
   })
 
   it('retains oversized tool input values exactly', () => {

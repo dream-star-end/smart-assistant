@@ -3,7 +3,7 @@
  *
  * 入口:
  *   - GET  /api/admin/sessions/:id[?user_id=:userId&offset&limit] 旧诊断分页
- *   - GET  /api/admin/sessions/:id?user_id=:userId&view=chat      对话 UI 热尾快照
+ *   - GET  /api/admin/sessions/:id?user_id=:userId&view=timeline  对话 UI 热尾快照
  *   - GET  /api/admin/sessions/:id/archive?user_id=:userId&before&limit
  *   - POST /api/admin/sessions/:id/media-sign?user_id=:userId     目标用户媒体短签
  *
@@ -46,10 +46,18 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve as resolvePath } from "node:path";
+import { parseByteRange } from "@openclaude/gateway";
+import { isPersistedClientMessageId } from "@openclaude/protocol";
 import { HttpError, readJsonBody, sendJson } from "../util.js";
 import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
-import { getClientSession, readArchivedMessages } from "@openclaude/storage";
+import {
+  getClientSession,
+  listTurnTapeRecords,
+  readArchivedMessages,
+  readTapeRecordPayloadChunk,
+  readUserMessagePayload,
+} from "@openclaude/storage";
 import { parseBigintIdParam } from "./_shared.js";
 import { getPool } from "../../db/index.js";
 import { writeAdminAudit } from "../../admin/audit.js";
@@ -65,31 +73,58 @@ import {
 // session id 在 client_sessions 表是 TEXT PRIMARY KEY,
 // 实际格式有 UUID / web-... / nanoid 等,统一收口为字母数字 + '-_',
 // 1..128 字符。bigint extractTailId 不适用。
-const SESSION_PATH_RE = /^([A-Za-z0-9_-]{1,128})(?:\/(archive|media-sign))?$/;
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const TAPE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const COMMERCIAL_SESSION_USER_RE = /^c:[1-9][0-9]{0,18}$/;
 
-export type AdminSessionRoute = {
-  sessionId: string;
-  kind: "detail" | "archive" | "media-sign";
-};
+export type AdminSessionRoute =
+  | { sessionId: string; kind: "detail" | "archive" | "media-sign" }
+  | { sessionId: string; kind: "tape-records"; tapeId: string }
+  | { sessionId: string; kind: "tape-payload"; tapeId: string; recordOrdinal: number }
+  | { sessionId: string; kind: "user-payload"; messageId: string };
 
 export function parseAdminSessionRoute(url: URL): AdminSessionRoute {
   const tail = url.pathname.slice("/api/admin/sessions/".length);
-  const match = SESSION_PATH_RE.exec(tail);
-  if (!match) {
+  const parts = tail.split("/");
+  const sessionId = parts[0] ?? "";
+  const invalid = (): never => {
     throw new HttpError(400, "VALIDATION", "invalid session id in URL", {
       issues: [{ path: "id", message: tail }],
     });
-  }
-  return {
-    sessionId: match[1]!,
-    kind:
-      match[2] === "archive"
-        ? "archive"
-        : match[2] === "media-sign"
-          ? "media-sign"
-          : "detail",
   };
+  if (!SESSION_ID_RE.test(sessionId)) invalid();
+  if (parts.length === 1) return { sessionId, kind: "detail" };
+  if (parts.length === 2 && parts[1] === "archive") return { sessionId, kind: "archive" };
+  if (parts.length === 2 && parts[1] === "media-sign") return { sessionId, kind: "media-sign" };
+  if (parts.length === 4 && parts[1] === "tape" && parts[3] === "records") {
+    const tapeId = parts[2] ?? "";
+    if (!TAPE_ID_RE.test(tapeId)) invalid();
+    return { sessionId, kind: "tape-records", tapeId };
+  }
+  if (
+    parts.length === 6 && parts[1] === "tape" && parts[3] === "records" &&
+    parts[5] === "payload"
+  ) {
+    const tapeId = parts[2] ?? "";
+    const ordinalRaw = parts[4] ?? "";
+    const recordOrdinal = Number(ordinalRaw);
+    if (
+      !TAPE_ID_RE.test(tapeId) || !/^(0|[1-9][0-9]*)$/.test(ordinalRaw) ||
+      !Number.isSafeInteger(recordOrdinal)
+    ) invalid();
+    return { sessionId, kind: "tape-payload", tapeId, recordOrdinal };
+  }
+  if (parts.length === 4 && parts[1] === "messages" && parts[3] === "payload") {
+    let messageId = "";
+    try {
+      messageId = decodeURIComponent(parts[2] ?? "");
+    } catch {
+      invalid();
+    }
+    if (!isPersistedClientMessageId(messageId)) invalid();
+    return { sessionId, kind: "user-payload", messageId };
+  }
+  return invalid();
 }
 
 /** offset / limit 解析,失败抛 400 VALIDATION。 */
@@ -145,9 +180,104 @@ export function parseArchivePagingParams(url: URL): { before: number; limit: num
   return { before, limit };
 }
 
+export function parseTapePagingParams(url: URL): { cursor: number; limit: number } {
+  const cursorRaw = url.searchParams.get("cursor");
+  const limitRaw = url.searchParams.get("limit");
+  let cursor = 0;
+  let limit = 200;
+  if (cursorRaw != null && cursorRaw !== "") {
+    const parsed = Number(cursorRaw);
+    if (!/^(0|[1-9][0-9]*)$/.test(cursorRaw) || !Number.isSafeInteger(parsed)) {
+      throw new HttpError(400, "VALIDATION", "cursor must be a non-negative safe integer", {
+        issues: [{ path: "cursor", message: cursorRaw }],
+      });
+    }
+    cursor = parsed;
+  }
+  if (limitRaw != null && limitRaw !== "") {
+    const parsed = Number(limitRaw);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 200) {
+      throw new HttpError(400, "VALIDATION", "limit must be integer in [1, 200]", {
+        issues: [{ path: "limit", message: limitRaw }],
+      });
+    }
+    limit = parsed;
+  }
+  return { cursor, limit };
+}
+
 function scopedSessionUserId(url: URL): { rawUserId?: string; scopedUserId?: string } {
   const rawUserId = parseBigintIdParam(url.searchParams.get("user_id"), "user_id");
   return { rawUserId, scopedUserId: rawUserId ? `c:${rawUserId}` : undefined };
+}
+
+type AdminPayloadPart = {
+  bytes: Buffer;
+  offset: number;
+  totalBytes: number;
+  msgId: string;
+  role: string;
+  contentSha256: string;
+};
+
+async function serveAdminExactPayload(
+  req: IncomingMessage,
+  res: ServerResponse,
+  head: AdminPayloadPart,
+  readPart: (offset: number, length: number) => Promise<AdminPayloadPart | null>,
+): Promise<void> {
+  const rawRange = req.headers.range;
+  const rangeHeader = Array.isArray(rawRange) ? rawRange[0] : rawRange;
+  const range = parseByteRange(rangeHeader, head.totalBytes);
+  const start = range?.start ?? 0;
+  const endExclusive = range ? range.end + 1 : head.totalBytes;
+  const contentLength = Math.max(0, endExclusive - start);
+  res.writeHead(range ? 206 : 200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": contentLength,
+    "Accept-Ranges": "bytes",
+    ETag: `"${head.contentSha256}"`,
+    "X-OpenClaude-Record-Id": head.msgId,
+    "X-OpenClaude-Record-Role": head.role,
+    "X-OpenClaude-Content-Sha256": head.contentSha256,
+    ...(range ? { "Content-Range": `bytes ${start}-${endExclusive - 1}/${head.totalBytes}` } : {}),
+  });
+  if (req.method === "HEAD" || contentLength === 0) {
+    res.end();
+    return;
+  }
+  let offset = start;
+  while (offset < endExclusive && !res.destroyed) {
+    const part = await readPart(offset, Math.min(1024 * 1024, endExclusive - offset));
+    if (
+      !part || part.offset !== offset || part.bytes.length === 0 ||
+      part.offset + part.bytes.length > endExclusive ||
+      part.msgId !== head.msgId || part.role !== head.role ||
+      part.contentSha256 !== head.contentSha256 || part.totalBytes !== head.totalBytes
+    ) {
+      res.destroy(new Error("immutable admin payload changed during stream"));
+      return;
+    }
+    offset += part.bytes.length;
+    if (!res.write(part.bytes)) {
+      if (res.destroyed) return;
+      const drained = await new Promise<boolean>((resolve) => {
+        const finish = (value: boolean) => {
+          res.off("drain", onDrain);
+          res.off("close", onClose);
+          res.off("error", onClose);
+          resolve(value);
+        };
+        const onDrain = () => finish(true);
+        const onClose = () => finish(false);
+        res.once("drain", onDrain);
+        res.once("close", onClose);
+        res.once("error", onClose);
+      });
+      if (!drained) return;
+    }
+  }
+  if (!res.destroyed) res.end();
 }
 
 export async function handleAdminGetSession(
@@ -167,14 +297,127 @@ export async function handleAdminGetSession(
   // 注意 namespace:URL 接收裸 bigint,内部拼 `c:${id}` 喂 storage(避免 `c:undefined`,
   // 不带 user_id 仍走 admin override = getClientSession 的 userId 形参 undefined 分支)。
   const { scopedUserId } = scopedSessionUserId(url);
+  if (route.kind !== "tape-payload" && route.kind !== "user-payload" && req.method !== "GET") {
+    throw new HttpError(405, "METHOD_NOT_ALLOWED", "admin session reads require GET");
+  }
+
+  if (route.kind === "tape-records") {
+    const session = await getClientSession(sessionId, scopedUserId, { view: "timeline" });
+    if (!session) throw new HttpError(404, "NOT_FOUND", "session not found");
+    const { cursor, limit } = parseTapePagingParams(url);
+    const page = await listTurnTapeRecords(sessionId, session.userId, route.tapeId, cursor, limit);
+    if (!page) throw new HttpError(404, "NOT_FOUND", "turn tape not found");
+    await writeAdminAudit(getPool(), {
+      adminId: admin.id,
+      action: "sessions.read",
+      target: `session:${sessionId}`,
+      before: null,
+      after: {
+        mode: "tape-records",
+        session_id: sessionId,
+        target_user_id: session.userId,
+        scoped_user_id: scopedUserId ?? null,
+        tape_id: route.tapeId,
+        cursor,
+        limit,
+        returned_records: page.records.length,
+        next_cursor: page.nextCursor,
+        request_id: ctx.requestId,
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, page);
+    return;
+  }
+
+  if (route.kind === "tape-payload" || route.kind === "user-payload") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      throw new HttpError(405, "METHOD_NOT_ALLOWED", "payload reads require GET or HEAD");
+    }
+    const session = await getClientSession(sessionId, scopedUserId, { view: "timeline" });
+    if (!session) throw new HttpError(404, "NOT_FOUND", "session not found");
+    const readPart = route.kind === "tape-payload"
+      ? async (offset: number, length: number): Promise<AdminPayloadPart | null> => {
+          const part = await readTapeRecordPayloadChunk(
+            sessionId,
+            session.userId,
+            route.tapeId,
+            route.recordOrdinal,
+            offset,
+            length,
+          );
+          return part
+            ? {
+                bytes: part.chunk,
+                offset: part.start,
+                totalBytes: part.totalBytes,
+                msgId: part.msgId,
+                role: part.role,
+                contentSha256: part.contentSha256,
+              }
+            : null;
+        }
+      : async (offset: number, length: number): Promise<AdminPayloadPart | null> => {
+          const part = await readUserMessagePayload(
+            sessionId,
+            session.userId,
+            route.messageId,
+            offset,
+            length,
+          );
+          return part
+            ? {
+                bytes: part.payload,
+                offset: part.offset,
+                totalBytes: part.totalBytes,
+                msgId: part.msgId,
+                role: part.role,
+                contentSha256: part.contentSha256,
+              }
+            : null;
+        };
+    const head = await readPart(0, 1);
+    if (!head) throw new HttpError(404, "NOT_FOUND", "payload not found");
+    // Audit every HTTP read. A browser normally probes with HEAD before Range,
+    // but that client convention is not a security boundary: a direct Range
+    // GET must leave its own metadata-only audit row as well.
+    await writeAdminAudit(getPool(), {
+      adminId: admin.id,
+      action: "sessions.read",
+      target: `session:${sessionId}`,
+      before: null,
+      after: {
+        mode: route.kind,
+        session_id: sessionId,
+        target_user_id: session.userId,
+        scoped_user_id: scopedUserId ?? null,
+        ...(route.kind === "tape-payload"
+          ? { tape_id: route.tapeId, record_ordinal: route.recordOrdinal }
+          : { message_id: route.messageId }),
+        payload_bytes: head.totalBytes,
+        request_id: ctx.requestId,
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    await serveAdminExactPayload(req, res, head, readPart);
+    return;
+  }
 
   if (route.kind === "archive") {
     const { before, limit } = parseArchivePagingParams(url);
     // owner 必须经 storage backend 从权威会话行派生，不能信任前端 user_id；同时避免
     // HTTP 层直连 client_sessions，保持 SQLite/PG backend 的单一抽象边界。
-    const session = await getClientSession(sessionId, scopedUserId);
+    const session = await getClientSession(sessionId, scopedUserId, { view: "timeline" });
     if (!session) throw new HttpError(404, "NOT_FOUND", "session not found");
-    const page = await readArchivedMessages(sessionId, session.userId, before, limit);
+    const page = await readArchivedMessages(
+      sessionId,
+      session.userId,
+      before,
+      limit,
+      { view: "timeline" },
+    );
     await writeAdminAudit(getPool(), {
       adminId: admin.id,
       action: "sessions.read",
@@ -205,18 +448,22 @@ export async function handleAdminGetSession(
   }
 
   const view = url.searchParams.get("view");
-  if (view !== null && view !== "chat") {
-    throw new HttpError(400, "VALIDATION", "view must be chat", {
+  if (view !== null && view !== "timeline") {
+    throw new HttpError(400, "VALIDATION", "view must be timeline", {
       issues: [{ path: "view", message: view }],
     });
   }
   const { offset, limit } = parsePagingParams(url);
-  const s = await getClientSession(sessionId, scopedUserId);
+  const s = await getClientSession(
+    sessionId,
+    scopedUserId,
+    view === "timeline" ? { view: "timeline" } : undefined,
+  );
   if (!s) throw new HttpError(404, "NOT_FOUND", "session not found");
 
-  // chat 模式与用户端 GET /api/sessions/:id 同源：一次返回完整热尾（含 lossless tape
-  // hydration），更早历史只走 /archive 的 _seq 游标。禁止再按 response offset 切 tape。
-  if (view === "chat") {
+  // timeline 模式与用户端 GET /api/sessions/:id 同源：一次返回热尾里的真实
+  // user/final rows + process cursors；更早历史只走 /archive 的 _seq 游标。
+  if (view === "timeline") {
     const messages = Array.isArray(s.messages) ? s.messages : [];
     await writeAdminAudit(getPool(), {
       adminId: admin.id,
@@ -224,7 +471,7 @@ export async function handleAdminGetSession(
       target: `session:${sessionId}`,
       before: null,
       after: {
-        mode: "chat",
+        mode: "timeline",
         session_id: sessionId,
         target_user_id: s.userId,
         scoped_user_id: scopedUserId ?? null,
@@ -337,7 +584,7 @@ export async function handleAdminSignSessionMedia(
   }
   const { scopedUserId } = scopedSessionUserId(url);
   // 与 archive 相同：签名主体只取权威 session owner，URL user_id 仅用于 fail-closed scope。
-  const session = await getClientSession(route.sessionId, scopedUserId);
+  const session = await getClientSession(route.sessionId, scopedUserId, { view: "timeline" });
   if (!session || !COMMERCIAL_SESSION_USER_RE.test(session.userId)) {
     throw new HttpError(404, "NOT_FOUND", "session not found");
   }
@@ -411,7 +658,13 @@ async function readAdminArchivedWindow(
   let remaining = Math.max(0, need);
   // 防御:归档条数有界,但仍加硬上限防 storage 返回异常时死循环。
   for (let guard = 0; guard < 10_000 && remaining > 0; guard++) {
-    const page = await readArchivedMessages(sessionId, ownerUserId, before, 200);
+    const page = await readArchivedMessages(
+      sessionId,
+      ownerUserId,
+      before,
+      200,
+      { view: "timeline" },
+    );
     const msgs = Array.isArray(page.messages) ? page.messages : [];
     if (msgs.length === 0) break;
     // 本页升序(old→new)→ reverse 成 newest→oldest 拼进虚拟顺序。

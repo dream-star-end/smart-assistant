@@ -1016,6 +1016,7 @@ export class CcbMessageParser {
           isError: !!c.is_error,
           preview,
           output: fullOutput,
+          outputJson: previewRaw,
         }
         if (parentToolUseId) block.parentToolUseId = parentToolUseId
         this.onEvent({ kind: 'block', block: block as any })

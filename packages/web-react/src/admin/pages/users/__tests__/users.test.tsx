@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createHash } from 'node:crypto'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
@@ -8,15 +9,33 @@ vi.mock('chart.js/auto', () => ({
   },
 }))
 
+// jsdom has no layout engine, so render the virtual list's logical items while
+// keeping production on react-virtuoso's real viewport implementation.
+vi.mock('react-virtuoso', async () => {
+  const React = await import('react')
+  return {
+    VirtuosoMockContext: React.createContext(null),
+    Virtuoso: ({ data = [], itemContent, components = {} }: any) => React.createElement(
+      React.Fragment,
+      null,
+      components.Header ? React.createElement(components.Header) : null,
+      ...data.map((item: unknown, index: number) => itemContent(index, item)),
+      components.Footer ? React.createElement(components.Footer) : null,
+    ),
+  }
+})
+
 vi.mock('../../../lib/adminApi', () => ({
   ApiError: class ApiError extends Error {},
   adminGet: vi.fn(),
+  adminGetExactPayload: vi.fn(),
   adminSend: vi.fn(),
   adminText: vi.fn(),
 }))
 
 import { ToastProvider, TooltipProvider } from '../../../../components/ui'
-import { adminGet, adminSend, adminText } from '../../../lib/adminApi'
+import { adminGet, adminGetExactPayload, adminSend, adminText } from '../../../lib/adminApi'
+import { SessionViewerModal } from '../SessionViewerModal'
 import { UserDetailSheet } from '../UserDetailSheet'
 import UsersPage from '../index'
 
@@ -32,6 +51,17 @@ function renderPage(node: ReactNode) {
 const mockGet = adminGet as unknown as ReturnType<typeof vi.fn>
 const mockSend = adminSend as unknown as ReturnType<typeof vi.fn>
 const mockText = adminText as unknown as ReturnType<typeof vi.fn>
+const mockExactPayload = adminGetExactPayload as unknown as ReturnType<typeof vi.fn>
+
+function exactPayload(record: Record<string, unknown>) {
+  const bytes = new TextEncoder().encode(JSON.stringify(record))
+  return {
+    bytes: bytes.buffer as ArrayBuffer,
+    contentSha256: createHash('sha256').update(bytes).digest('hex'),
+    recordId: String(record.id),
+    role: String(record.role),
+  }
+}
 
 const USER1 = {
   id: '1',
@@ -225,6 +255,7 @@ beforeEach(() => {
   installFixtures()
   mockSend.mockResolvedValue({ ledger_id: '99', balance_after: '5100', audit_id: '7' })
   mockText.mockResolvedValue('id,email\n1,alice@example.com')
+  mockExactPayload.mockRejectedValue(new Error('unexpected exact payload'))
 })
 afterEach(() => {
   cleanup()
@@ -330,17 +361,17 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     expect(screen.queryByRole('button', { name: '允许' })).toBeNull()
     expect(mockGet).toHaveBeenCalledWith('/sessions/web-1', {
       user_id: '1',
-      view: 'chat',
+      view: 'timeline',
     })
 
-    fireEvent.click(screen.getByRole('button', { name: /从云端加载更早的历史/ }))
+    fireEvent.click(screen.getByRole('button', { name: /向上滚动加载更早历史/ }))
     expect(await screen.findByText('云端更早的问题')).toBeTruthy()
     expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
       user_id: '1',
       before: 0,
       limit: 100,
     })
-    expect(screen.queryByRole('button', { name: /从云端加载更早的历史/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /向上滚动加载更早历史/ })).toBeNull()
   })
 
   test('切换会话后丢弃上一会话迟到的归档响应，绝不混入当前会话', async () => {
@@ -368,7 +399,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     const sessionB = screen.getByRole('button', { name: '查看会话：会话二' })
     fireEvent.click(sessionA)
     expect(await screen.findByText('管理员看到的用户问题')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /从云端加载更早的历史/ }))
+    fireEvent.click(screen.getByRole('button', { name: /向上滚动加载更早历史/ }))
     await waitFor(() =>
       expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
         user_id: '1',
@@ -403,5 +434,89 @@ describe('UserDetailSheet — 会话只读查看器', () => {
 
     expect(screen.getByText('会话 B 的独立消息')).toBeTruthy()
     expect(screen.queryByText('不应混入 B 的 A 归档消息')).toBeNull()
+  })
+
+  test('管理员查看器可懒加载超长 user/final 正文并按页展开真实 Agent 过程', async () => {
+    const userRecord = {
+      id: 'cm:user:admin', role: 'user', text: '管理员看到的完整超长提问', ts: 1,
+    }
+    const finalRecord = {
+      id: 'srv-final-admin', role: 'assistant', text: '管理员看到的完整最终回答', ts: 3,
+    }
+    const userPayload = exactPayload(userRecord)
+    const finalPayload = exactPayload(finalRecord)
+    mockGet.mockImplementation((path: string) => {
+      if (path === '/sessions/admin-lazy') {
+        return Promise.resolve({
+          session: {
+            id: 'admin-lazy', user_id: 'c:1', agent_id: 'main', title: '懒加载会话',
+            pinned: false, created_at: 1, last_at: 3, updated_at: 3,
+            archived_count: 0, archived_through_seq: 0,
+            messages: [
+              {
+                id: userRecord.id, role: 'user', text: '', ts: 1, status: 'replied',
+                _payloadDeferred: true, _userPayloadDeferred: true,
+                _payloadSha256: userPayload.contentSha256,
+              },
+              {
+                id: 'turn-process:tape-admin', role: 'runtime-event', text: '', ts: 2,
+                _turnTapeProcess: true, _turnTapeProcessCount: 1,
+                _turnTapeId: 'tape-admin', _turnTapeSha256: 'e'.repeat(64),
+              },
+              {
+                id: finalRecord.id, role: 'assistant', text: '', ts: 3,
+                _payloadDeferred: true, _recordOrdinal: 2,
+                _turnTapeId: 'tape-admin', _turnTapeSha256: 'e'.repeat(64),
+                _payloadSha256: finalPayload.contentSha256,
+              },
+            ],
+          },
+        })
+      }
+      if (path === '/sessions/admin-lazy/tape/tape-admin/records') {
+        return Promise.resolve({
+          records: [{
+            id: 'thinking-admin', role: 'thinking', text: '管理员展开的真实思考', ts: 2,
+            _turnTapeOrdinal: 0,
+          }],
+          nextCursor: null,
+          total: 1,
+        })
+      }
+      return Promise.reject(new Error(`unexpected path ${path}`))
+    })
+    mockExactPayload.mockImplementation((path: string) => {
+      if (path.includes('/messages/')) return Promise.resolve(userPayload)
+      if (path.includes('/records/2/payload')) return Promise.resolve(finalPayload)
+      return Promise.reject(new Error(`unexpected exact path ${path}`))
+    })
+
+    renderPage(
+      <SessionViewerModal
+        session={{
+          session_id: 'admin-lazy', title: '懒加载会话', agent_id: 'main', message_count: 3,
+          created_at: '2026-07-01T00:00:00.000Z', last_at: '2026-07-01T00:00:00.000Z',
+          updated_at: '2026-07-01T00:00:00.000Z',
+        }}
+        userId="1"
+        userEmail="alice@example.com"
+        onClose={() => {}}
+      />,
+    )
+
+    expect(await screen.findByText('管理员看到的完整超长提问')).toBeTruthy()
+    expect(await screen.findByText('管理员看到的完整最终回答')).toBeTruthy()
+    expect(mockExactPayload).toHaveBeenCalledWith(
+      '/sessions/admin-lazy/messages/cm%3Auser%3Aadmin/payload',
+      { user_id: '1' },
+      expect.any(AbortSignal),
+    )
+    fireEvent.click(screen.getByRole('button', { name: /Agent 调用过程/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /已思考/ }))
+    expect(await screen.findByText(/管理员展开的真实思考/)).toBeTruthy()
+    expect(mockGet).toHaveBeenCalledWith(
+      '/sessions/admin-lazy/tape/tape-admin/records',
+      { user_id: '1', cursor: undefined, limit: 200 },
+    )
   })
 })

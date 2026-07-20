@@ -332,75 +332,6 @@ describe("persist — 历史合并纯函数", () => {
     expect(applyServerIncremental(local, [])).toBe(local);
   });
 
-  test("tail-only incremental projection updates an older local tool and stays idempotent", () => {
-    const local: ChatMessage[] = [{
-      id: "srv-tool",
-      role: "tool",
-      text: "Bash",
-      ts: 1,
-      blockId: "tool-bg",
-      bashTail: { tail: "old", totalBytes: 10, truncatedHead: false },
-    }];
-    const patch: ChatMessage = {
-      id: "projection-tail:srv-runtime",
-      role: "runtime-event",
-      text: "",
-      ts: 2,
-      _seq: 8,
-      _source: "server",
-      _historyProjection: {
-        kind: "bash-tail",
-        toolUseId: "tool-bg",
-        tail: "new tail",
-        totalBytes: 20,
-        truncatedHead: true,
-      },
-    };
-    const once = applyServerIncremental(local, [patch]);
-    expect(once.find((m) => m.id === "srv-tool")?.bashTail).toEqual({
-      tail: "new tail", totalBytes: 20, truncatedHead: true,
-    });
-    const twice = applyServerIncremental(once, [patch]);
-    expect(twice.filter((m) => m.id === patch.id)).toHaveLength(1);
-    expect(twice.find((m) => m.id === "srv-tool")?.bashTail?.totalBytes).toBe(20);
-  });
-
-  test("history projection updates a recursively nested child tool; lower byte snapshots cannot regress it", () => {
-    const group = {
-      id: "group",
-      role: "agent-group",
-      text: "team",
-      ts: 1,
-      childBlocks: [{
-        kind: "tool_use",
-        blockId: "outer",
-        childBlocks: [{
-          kind: "tool_use",
-          blockId: "child-bg",
-          bashTail: { tail: "newer", totalBytes: 30, truncatedHead: false },
-        }],
-      }],
-    } as unknown as ChatMessage;
-    const patch: ChatMessage = {
-      id: "projection-tail:child",
-      role: "runtime-event",
-      text: "",
-      ts: 2,
-      _historyProjection: {
-        kind: "bash-tail",
-        toolUseId: "child-bg",
-        parentToolUseId: "outer",
-        tail: "stale",
-        totalBytes: 20,
-        truncatedHead: false,
-      },
-    };
-    const merged = mergeFullServerWins([group, patch], []);
-    const nested = (merged[0]!.childBlocks![0] as unknown as { childBlocks: Array<{ bashTail: unknown }> })
-      .childBlocks[0]!;
-    expect(nested.bashTail).toEqual({ tail: "newer", totalBytes: 30, truncatedHead: false });
-  });
-
   test("incremental exact completion evidence removes only that turn's local fallback", () => {
     const local: ChatMessage[] = [
       { id: "m-a1", role: "assistant", text: "fallback", ts: 1, _clientMessageId: "m-user-1" },
@@ -1039,7 +970,7 @@ describe("persist — stableSortByTs 全序 property/fuzz (B4b)", () => {
       { id: "tool", role: "tool", text: "查", ts: 200, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 1 },
       { id: "answer", role: "assistant", text: "答", ts: 100, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeOrdinal: 2 },
       { id: "terminal-note", role: "assistant", text: "终态证据", ts: 0, _orderSeq: 5, _turnTapeId: "t-1" },
-      { id: "collapsed", role: "assistant", text: "本轮输出", ts: 400, _orderSeq: 5, _turnTapeId: "t-1", _tapeCollapsed: true },
+      { id: "collapsed", role: "assistant", text: "本轮输出", ts: 400, _orderSeq: 5, _turnTapeId: "t-1", _turnTapeProcess: true },
     ];
 
     expect(stableSortByTs([...input]).map((m) => m.id)).toEqual([

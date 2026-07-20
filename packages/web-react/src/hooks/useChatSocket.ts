@@ -3,6 +3,8 @@ import { api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
+import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
+import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
 import type { AuthSession } from "../lib/types";
@@ -92,6 +94,7 @@ export type UseChatSocket = {
     sessId: string;
     msgId: string;
     agentId: string;
+    sourceOverride?: ChatMessage;
   }) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
   setActiveSession: (sessId: string | undefined) => void;
@@ -121,11 +124,11 @@ export type UseChatSocket = {
     /** SessionDetail.modelId(会话级模型选择):携带时 server-wins 镜像进会话态。*/
     modelId?: string;
     historyRevision?: number;
-    invalidateProjectionCache?: boolean;
+    invalidateHistoryCache?: boolean;
   }) => void;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
-  /** Projection revision paired with storedMaxSeq; absent forces a full fallback. */
+  /** History revision paired with storedMaxSeq; absent forces a full fallback. */
   storedHistoryRevision: (sessId: string | undefined) => number | undefined;
   /**
    * 归档滚动加载：从云端拉一页更早的归档历史(getSessionArchive)并前插进会话(只前插/按 id 去重,
@@ -135,33 +138,32 @@ export type UseChatSocket = {
     sessId: string | undefined,
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   /**
-   * §9 折叠卷展开:拉 tape 记录一页(getTapeRecords)并就地展开折叠 anchor(socket.applyExpandedTapeRecords)。
+   * Lazy process expansion:read one page of true tape records and merge it by immutable ordinal.
    * `cursor` 缺省(null)=首页,续拉传上次返回的 nextCursor。并发去重(同 anchor 在飞时忽略);非抛出式契约。
    */
-  expandCollapsedTape: (
+  expandTurnProcess: (
     sessId: string | undefined,
     anchorId: string,
     tapeId: string,
     cursor?: number | null,
   ) => Promise<{ ok: boolean; nextCursor?: number | null; total?: number; busy?: boolean; error?: boolean }>;
-  /** §9 折叠卷收起(纯本地,抹展开行还原折叠态)。 */
-  collapseTape: (sessId: string | undefined, anchorId: string) => void;
-  /**
-   * §9 截断记录"查看完整":原样拉 tape 记录一页(不改会话内存,供截断工具卡内联抽屉显示更完整版本)。
-   * 失败返 null(非抛出)。
-   */
-  fetchTapeRecords: (
-    sessId: string | undefined,
-    tapeId: string,
-    cursor?: number | null,
-  ) => Promise<{ records: ChatMessage[]; nextCursor: number | null; total: number } | null>;
-  /** §9(M-§9-1)单条超大记录分块读(≤256KB/请求;失败返 null 非抛出)。 */
-  fetchTapeRecordChunk: (
+  /** Collapse the locally loaded process rows. */
+  collapseTurnProcess: (sessId: string | undefined, anchorId: string) => void;
+  /** 按需读取、校验并在 worker 中解析一条超大 immutable record。 */
+  fetchTapeRecordPayload: (
     sessId: string | undefined,
     tapeId: string,
     recordOrdinal: number,
-    offset?: number,
-  ) => Promise<{ chunk: string; nextOffset: number | null; totalBytes: number } | null>;
+    expected: TapePayloadExpectation,
+    signal?: AbortSignal,
+  ) => Promise<ChatMessage[] | null>;
+  /** 按需读取、校验并解析一条超长 user 消息。 */
+  fetchUserMessagePayload: (
+    sessId: string | undefined,
+    messageId: string,
+    expected: TapePayloadExpectation,
+    signal?: AbortSignal,
+  ) => Promise<ChatMessage[] | null>;
   /** 删除某会话的本地持久副本（与 removeSession 配套）。*/
   removePersisted: (sessId: string) => void;
   /** 清空当前 user 命名空间（登出隐私收尾）。*/
@@ -272,12 +274,12 @@ export function useChatSocket(opts: {
             Number.isSafeInteger(detail.historyRevision) &&
             detail.historyRevision >= 0 &&
             detail.historyRevision !== sess._historyRevision;
-          const projectionRepair = revisionRepair || detail._projectionRevisionUnsupported === true;
+          const historyRepair = revisionRepair || detail._historyRevisionUnsupported === true;
           // 只在 server 返回非空 tape 时合并——绝不用空结果抹掉活转录。热尾巴:透传归档水位,
           // 本地 `_seq ≤ archivedThroughSeq`的旧行才不会被"server 不认识 = 丢弃"误杀。
           // 唯一例外是 history revision 改变：即使 full 为空也必须应用，才能传播删除/清掉
           // 过期归档水合缓存；活跃轮仍由 applyServerMessages 的 active-turn guard 保护。
-          if (serverMsgs && (serverMsgs.length > 0 || detail.isPartial || projectionRepair)) {
+          if (serverMsgs && (serverMsgs.length > 0 || detail.isPartial || historyRepair)) {
             socket?.applyServerMessages(
               sessId,
               detail.agentId || sess.agentId,
@@ -290,7 +292,7 @@ export function useChatSocket(opts: {
               completedClientMessageId: context?.clientMessageId,
               serverUpdatedAt: detail.updatedAt,
               historyRevision: detail.historyRevision,
-              invalidateProjectionCache: detail._projectionRevisionUnsupported === true,
+              invalidateHistoryCache: detail._historyRevisionUnsupported === true,
               },
             );
           }
@@ -557,7 +559,7 @@ export function useChatSocket(opts: {
         serverUpdatedAt: p.serverUpdatedAt,
         modelId: p.modelId,
         historyRevision: p.historyRevision,
-        invalidateProjectionCache: p.invalidateProjectionCache,
+        invalidateHistoryCache: p.invalidateHistoryCache,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },
@@ -573,7 +575,9 @@ export function useChatSocket(opts: {
       olderHistoryFetchingRef.current.add(sessId);
       try {
         const before = socket.archiveBeforeSeq(sessId);
-        const page = await api.getSessionArchive(a, sessId, before);
+        // Roughly 20 dialogue turns per request. This is a paging quantum,
+        // not a history cap; upward scrolling keeps fetching until exhausted.
+        const page = await api.getSessionArchive(a, sessId, before, 40);
         const msgs = Array.isArray(page.messages) ? (page.messages as ChatMessage[]) : [];
         const currentHistoryRevision = socket.sessions.get(sessId)?._historyRevision;
         if (!isArchiveHistoryRevisionCompatible(currentHistoryRevision, page.historyRevision)) {
@@ -595,9 +599,9 @@ export function useChatSocket(opts: {
     },
     [socket],
   );
-  // §9 折叠卷展开并发闸(按 sessId::anchorId,同 anchor 在飞不重入)。
+  // Lazy process expansion concurrency gate (one request per control row).
   const expandingTapesRef = useRef<Set<string>>(new Set());
-  const expandCollapsedTape = useCallback<UseChatSocket["expandCollapsedTape"]>(
+  const expandTurnProcess = useCallback<UseChatSocket["expandTurnProcess"]>(
     async (sessId, anchorId, tapeId, cursor) => {
       const a = authRef.current;
       if (!a || !sessId || !anchorId || !tapeId) return { ok: false };
@@ -619,46 +623,113 @@ export function useChatSocket(opts: {
     },
     [socket],
   );
-  const collapseTape = useCallback<UseChatSocket["collapseTape"]>(
+  const collapseTurnProcess = useCallback<UseChatSocket["collapseTurnProcess"]>(
     (sessId, anchorId) => {
       if (!sessId || !anchorId) return;
-      socket.collapseTape(sessId, anchorId);
+      socket.collapseTurnProcess(sessId, anchorId);
     },
     [socket],
   );
-  const fetchTapeRecords = useCallback<UseChatSocket["fetchTapeRecords"]>(
-    async (sessId, tapeId, cursor) => {
+  // Virtuoso can unmount a large deferred row after it leaves overscan. Keep
+  // exactly the most recently decoded immutable record so scrolling back does
+  // not download and parse the same 50 MB payload again. One-entry replacement
+  // bounds memory independently of conversation length.
+  const deferredPayloadCacheRef = useRef<{
+    key: string;
+    records: ChatMessage[];
+  } | null>(null);
+  const deferredPayloadQueueRef = useRef<DeferredPayloadQueue<ChatMessage[]> | null>(null);
+  if (!deferredPayloadQueueRef.current) {
+    deferredPayloadQueueRef.current = new DeferredPayloadQueue<ChatMessage[]>(2);
+  }
+  useEffect(() => {
+    return () => {
+      deferredPayloadQueueRef.current?.cancelAll();
+      deferredPayloadCacheRef.current = null;
+    };
+  }, [auth, userId]);
+  const fetchTapeRecordPayload = useCallback<UseChatSocket["fetchTapeRecordPayload"]>(
+    async (sessId, tapeId, recordOrdinal, expected, signal) => {
       const a = authRef.current;
-      if (!a || !sessId || !tapeId) return null;
-      try {
-        const page = await api.getTapeRecords(a, sessId, tapeId, cursor ?? null);
-        return {
-          records: Array.isArray(page.records) ? (page.records as ChatMessage[]) : [],
-          nextCursor: typeof page.nextCursor === "number" ? page.nextCursor : null,
-          total: typeof page.total === "number" ? page.total : 0,
-        };
-      } catch {
-        return null;
+      if (
+        signal?.aborted || !a || !sessId || !tapeId ||
+        !Number.isInteger(recordOrdinal) || recordOrdinal < 0
+      ) return null;
+      const epoch = a.snapshot().epoch;
+      const cacheKey = JSON.stringify([
+        userId ?? "",
+        epoch,
+        sessId,
+        "tape",
+        tapeId,
+        recordOrdinal,
+        expected.recordId,
+        expected.role,
+        expected.contentSha256 ?? "",
+      ]);
+      if (deferredPayloadCacheRef.current?.key === cacheKey) {
+        return deferredPayloadCacheRef.current.records;
       }
+      return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
+        const payload = await api.getTapeRecordPayload(a, sessId, tapeId, recordOrdinal, queueSignal);
+        const records = await parseTapeRecordPayload(payload, expected, queueSignal);
+        if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
+          throw new DOMException("auth identity changed", "AbortError");
+        }
+        const hydrated: ChatMessage[] = records.map((record) => ({
+          ...record,
+          _source: "server",
+          _turnTapeId: tapeId,
+          _turnTapeOrdinal: recordOrdinal,
+          _recordOrdinal: recordOrdinal,
+          _turnTapeComplete: true,
+          _payloadDeferred: undefined,
+          _payloadBytes: undefined,
+          _payloadSha256: undefined,
+        }));
+        deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
+        return hydrated;
+      }, signal);
     },
-    [],
+    [auth, userId],
   );
-  const fetchTapeRecordChunk = useCallback<UseChatSocket["fetchTapeRecordChunk"]>(
-    async (sessId, tapeId, recordOrdinal, offset) => {
+  const fetchUserMessagePayload = useCallback<UseChatSocket["fetchUserMessagePayload"]>(
+    async (sessId, messageId, expected, signal) => {
       const a = authRef.current;
-      if (!a || !sessId || !tapeId || !Number.isInteger(recordOrdinal) || recordOrdinal < 0) return null;
-      try {
-        const r = await api.getTapeRecordChunk(a, sessId, tapeId, recordOrdinal, offset ?? 0);
-        return {
-          chunk: typeof r.chunk === "string" ? r.chunk : "",
-          nextOffset: typeof r.nextOffset === "number" ? r.nextOffset : null,
-          totalBytes: typeof r.totalBytes === "number" ? r.totalBytes : 0,
-        };
-      } catch {
-        return null;
+      if (signal?.aborted || !a || !sessId || !messageId) return null;
+      const epoch = a.snapshot().epoch;
+      const cacheKey = JSON.stringify([
+        userId ?? "",
+        epoch,
+        sessId,
+        "user",
+        messageId,
+        expected.recordId,
+        expected.role,
+        expected.contentSha256 ?? "",
+      ]);
+      if (deferredPayloadCacheRef.current?.key === cacheKey) {
+        return deferredPayloadCacheRef.current.records;
       }
+      return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
+        const payload = await api.getUserMessagePayload(a, sessId, messageId, queueSignal);
+        const records = await parseTapeRecordPayload(payload, expected, queueSignal);
+        if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
+          throw new DOMException("auth identity changed", "AbortError");
+        }
+        const hydrated: ChatMessage[] = records.map((record) => ({
+          ...record,
+          _source: "server",
+          _payloadDeferred: undefined,
+          _userPayloadDeferred: undefined,
+          _payloadBytes: undefined,
+          _payloadSha256: undefined,
+        }));
+        deferredPayloadCacheRef.current = { key: cacheKey, records: hydrated };
+        return hydrated;
+      }, signal);
     },
-    [],
+    [auth, userId],
   );
   const storedMaxSeq = useCallback(
     (sessId: string | undefined) => {
@@ -682,6 +753,8 @@ export function useChatSocket(opts: {
   }, []);
   const wipePersistence = useCallback(async () => {
     sigRef.current.clear();
+    deferredPayloadQueueRef.current?.cancelAll();
+    deferredPayloadCacheRef.current = null;
     const st = storeRef.current;
     if (st) await st.wipe();
   }, []);
@@ -720,10 +793,10 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
-      expandCollapsedTape,
-      collapseTape,
-      fetchTapeRecords,
-      fetchTapeRecordChunk,
+      expandTurnProcess,
+      collapseTurnProcess,
+      fetchTapeRecordPayload,
+      fetchUserMessagePayload,
       removePersisted,
       wipePersistence,
       sendRepoBind,
@@ -751,10 +824,10 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
-      expandCollapsedTape,
-      collapseTape,
-      fetchTapeRecords,
-      fetchTapeRecordChunk,
+      expandTurnProcess,
+      collapseTurnProcess,
+      fetchTapeRecordPayload,
+      fetchUserMessagePayload,
       removePersisted,
       wipePersistence,
       sendRepoBind,

@@ -18,6 +18,7 @@ export type ToolLike = {
   _partial?: boolean;
   _completed?: boolean;
   output?: string | null;
+  outputJson?: unknown;
   text?: string | null;
   error?: boolean;
   /** 取消态(如 Codex item status 'cancelled'):中性终态,≠ 失败,卡片显示「已取消」。 */

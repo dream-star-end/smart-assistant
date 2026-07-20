@@ -136,8 +136,8 @@ export function PermissionCard({
         </div>
       )}
       {resolved && !questions && msg.inputPreview && (
-        <div className="border-t border-border px-3.5 py-2 text-[12px] text-muted break-all">
-          {msg.inputPreview.slice(0, 200)}
+        <div className="max-h-60 overflow-auto whitespace-pre-wrap break-words border-t border-border px-3.5 py-2 text-[12px] text-muted">
+          {msg.inputPreview}
         </div>
       )}
       {resolved && msg._settledReason && msg._settledReason !== "remote" && (
@@ -421,7 +421,6 @@ function AskUserQuestionModal({
               {showOther && qs.selected.includes(OTHER) && (
                 <input
                   type="text"
-                  maxLength={2000}
                   value={qs.other}
                   autoFocus
                   onChange={(e) => setQ(q.question, { other: e.target.value })}
