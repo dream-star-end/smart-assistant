@@ -92,7 +92,7 @@ describe("visible virtual row anchor", () => {
     expect(scroller.scrollTop).toBe(300);
   });
 
-  test("首帧校正后用户滚动会取消后续帧，不再把视口拽回", async () => {
+  test("稳定平台校正后用户滚动会取消后续帧，不再把视口拽回", async () => {
     const scroller = document.createElement("div");
     const rowElement = document.createElement("div");
     rowElement.setAttribute("data-chat-virtual-key", "stable-row");
@@ -121,6 +121,8 @@ describe("visible virtual row anchor", () => {
       (callback) => frames.push(callback),
     );
 
+    frames.shift()!();
+    expect(scroller.scrollTop).toBe(100);
     frames.shift()!();
     expect(scroller.scrollTop).toBe(300);
     scroller.scrollTop = 250;
@@ -281,9 +283,18 @@ describe("visible virtual row anchor", () => {
       frames.shift()!();
       await Promise.resolve();
       expect(resolved).toBe(false);
-      expect(rowElement.getBoundingClientRect().top).toBe(120);
+      expect(scroller.scrollTop).toBe(100);
     }
 
+    // The last unmodified position must first form a two-frame plateau. Only
+    // then may one exact correction run; two aligned frames are still required.
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(rowElement.getBoundingClientRect().top).toBe(120);
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
     frames.shift()!();
     await Promise.resolve();
     expect(resolved).toBe(false);
@@ -333,7 +344,7 @@ describe("visible virtual row anchor", () => {
     expect(frames).toHaveLength(0);
   });
 
-  test("无位移时必须等同一 Virtuoso 行 data-index 改变才允许稳定结束", async () => {
+  test("Virtuoso 反向补偿时等待新平台，禁止逐帧追打后才稳定结束", async () => {
     const scroller = document.createElement("div");
     const wrapper = document.createElement("div");
     wrapper.setAttribute("data-index", "2");
@@ -373,12 +384,28 @@ describe("visible virtual row anchor", () => {
     expect(resolved).toBe(false);
 
     wrapper.setAttribute("data-index", "66");
-    for (const offset of [10, 20, 30]) {
-      layoutOffset = offset;
-      frames.shift()!();
-      await Promise.resolve();
-      expect(resolved).toBe(false);
-    }
+    layoutOffset = 48;
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(100);
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(148);
+    expect(resolved).toBe(false);
+
+    // Slow Virtuoso measurement applies the opposite 48px deviation after our
+    // first correction. Wait for that new raw plateau before correcting once.
+    layoutOffset = 0;
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(148);
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(100);
+    expect(resolved).toBe(false);
+
+    frames.shift()!();
+    await Promise.resolve();
     frames.shift()!();
     await Promise.resolve();
     expect(resolved).toBe(false);

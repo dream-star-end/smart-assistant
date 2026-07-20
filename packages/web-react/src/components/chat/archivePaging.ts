@@ -124,6 +124,8 @@ export function restoreVisibleVirtualRowAnchor(
 ): Promise<void> {
   return new Promise((resolve) => {
     let observedPrependLayout = false;
+    let lastBeforeTop: number | null = null;
+    let beforeTopStableFrames = 0;
     let stableFrames = 0;
     const correct = () => {
       if (cancelled()) {
@@ -154,7 +156,41 @@ export function restoreVisibleVirtualRowAnchor(
         observedPrependLayout = true;
       }
 
+      if (beforeTop === null) {
+        lastBeforeTop = null;
+        beforeTopStableFrames = 0;
+        stableFrames = 0;
+        correctToVisibleVirtualRowAnchor(scroller, anchor);
+        schedule(correct);
+        return;
+      }
+
+      if (lastBeforeTop !== null && Math.abs(beforeTop - lastBeforeTop) <= 0.5) {
+        beforeTopStableFrames += 1;
+      } else {
+        beforeTopStableFrames = 1;
+      }
+      lastBeforeTop = beforeTop;
+
+      // On a slow renderer Virtuoso can still be applying its own measured
+      // prepend deviation. Writing scrollTop every frame while that value is
+      // moving creates a ± one-row feedback loop. Wait for the unmodified row
+      // position to form a two-frame plateau, then make one exact correction.
+      if (!observedPrependLayout || beforeTopStableFrames < 2) {
+        stableFrames = 0;
+        schedule(correct);
+        return;
+      }
+
+      const beforeAligned = Math.abs(beforeTop - anchor.top) <= 0.5;
       const found = correctToVisibleVirtualRowAnchor(scroller, anchor);
+      if (!beforeAligned) {
+        lastBeforeTop = null;
+        beforeTopStableFrames = 0;
+        stableFrames = 0;
+        schedule(correct);
+        return;
+      }
       const row = Array.from(
         scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
       ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
@@ -163,8 +199,7 @@ export function restoreVisibleVirtualRowAnchor(
         : null;
 
       if (
-        observedPrependLayout && beforeTop !== null &&
-        Math.abs(beforeTop - anchor.top) <= 0.5 &&
+        observedPrependLayout &&
         found && currentTop !== null &&
         Math.abs(currentTop - anchor.top) <= 0.5
       ) {
