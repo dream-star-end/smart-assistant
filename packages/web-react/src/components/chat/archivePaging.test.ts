@@ -79,7 +79,13 @@ describe("visible virtual row anchor", () => {
     });
 
     const anchor = captureVisibleVirtualRowAnchor(scroller)!;
-    expect(anchor).toEqual({ key: "stable-row", top: 120, scrollTop: 100, scrollHeight: 1000 });
+    expect(anchor).toEqual({
+      key: "stable-row",
+      top: 120,
+      scrollTop: 100,
+      scrollHeight: 1000,
+      historyLayoutRevision: null,
+    });
     // 顶部归档新增 200px；同时底部 live answer 可增长任意高度，但稳定行只下移 200px。
     rowTop = 320;
     expect(correctToVisibleVirtualRowAnchor(scroller, anchor)).toBe(true);
@@ -104,7 +110,13 @@ describe("visible virtual row anchor", () => {
     let cancelled = false;
     const restoring = restoreVisibleVirtualRowAnchor(
       scroller,
-      { key: "stable-row", top: 120, scrollTop: 100, scrollHeight: 1000 },
+      {
+        key: "stable-row",
+        top: 120,
+        scrollTop: 100,
+        scrollHeight: 1000,
+        historyLayoutRevision: null,
+      },
       () => cancelled,
       (callback) => frames.push(callback),
     );
@@ -129,6 +141,7 @@ describe("visible virtual row anchor", () => {
       top: 40,
       scrollTop: 80,
       scrollHeight: 1000,
+      historyLayoutRevision: null,
     })).toBe(false);
     expect(scroller.scrollTop).toBe(1680);
   });
@@ -186,11 +199,14 @@ describe("visible virtual row anchor", () => {
     expect(rowElement.getBoundingClientRect().top).toBe(120);
   });
 
-  test("底部实时内容持续改变总高度时，已稳定的锚点不会占住恢复 FIFO", async () => {
+  test("底部实时增长不能绕过历史页 ack；ack 后已稳定锚点才释放 FIFO", async () => {
     const scroller = document.createElement("div");
+    const marker = document.createElement("div");
+    marker.setAttribute("data-chat-history-layout-revision", "page:tail");
+    marker.setAttribute("data-chat-history-layout-ack", "page:tail");
     const rowElement = document.createElement("div");
     rowElement.setAttribute("data-chat-virtual-key", "live-bottom-row");
-    scroller.appendChild(rowElement);
+    scroller.append(marker, rowElement);
     Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
     let scrollHeight = 1000;
     Object.defineProperty(scroller, "scrollHeight", { get: () => scrollHeight });
@@ -212,11 +228,20 @@ describe("visible virtual row anchor", () => {
       (callback) => frames.push(callback),
     ).then(() => { resolved = true; });
 
-    scrollHeight = 1100;
+    marker.setAttribute("data-chat-history-layout-revision", "page:older-1");
+    for (let frame = 0; frame < 20; frame += 1) {
+      scrollHeight += 100;
+      frames.shift()!();
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+    }
+
+    marker.setAttribute("data-chat-history-layout-ack", "page:older-1");
+    scrollHeight += 100;
     frames.shift()!();
     await Promise.resolve();
     expect(resolved).toBe(false);
-    scrollHeight = 1200;
+    scrollHeight += 100;
     frames.shift()!();
     await restoring;
     expect(resolved).toBe(true);
@@ -302,6 +327,51 @@ describe("visible virtual row anchor", () => {
     expect(frames).toHaveLength(1);
 
     currentGeneration = 8;
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(frames).toHaveLength(0);
+  });
+
+  test("页面 revision 必须等 Virtuoso itemsRendered 确认后才允许无位移稳定结束", async () => {
+    const scroller = document.createElement("div");
+    const marker = document.createElement("div");
+    marker.setAttribute("data-chat-history-layout-revision", "page:tail");
+    marker.setAttribute("data-chat-history-layout-ack", "page:tail");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "ack-row");
+    scroller.append(marker, rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000 });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    rowElement.getBoundingClientRect = () => ({
+      top: 120, bottom: 160, left: 0, right: 800, width: 800, height: 40,
+      x: 0, y: 120, toJSON: () => ({}),
+    });
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    marker.setAttribute("data-chat-history-layout-revision", "page:older-1");
+    for (let frame = 0; frame < 20; frame += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
+    expect(resolved).toBe(false);
+
+    marker.setAttribute("data-chat-history-layout-ack", "page:older-1");
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
     frames.shift()!();
     await restoring;
     expect(resolved).toBe(true);

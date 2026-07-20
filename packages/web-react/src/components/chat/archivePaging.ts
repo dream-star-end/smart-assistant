@@ -50,6 +50,7 @@ export type VisibleVirtualRowAnchor = {
   top: number;
   scrollTop: number;
   scrollHeight: number;
+  historyLayoutRevision: string | null;
 };
 
 /** Capture an actual rendered row instead of total scrollHeight. Bottom live
@@ -72,6 +73,9 @@ export function captureVisibleVirtualRowAnchor(
     top: row.getBoundingClientRect().top - viewport.top,
     scrollTop: scroller.scrollTop,
     scrollHeight: scroller.scrollHeight,
+    historyLayoutRevision: scroller
+      .querySelector<HTMLElement>("[data-chat-history-layout-revision]")
+      ?.getAttribute("data-chat-history-layout-revision") ?? null,
   };
 }
 
@@ -130,10 +134,23 @@ export function restoreVisibleVirtualRowAnchor(
       const beforeTop = beforeRow
         ? beforeRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
         : null;
+      const layoutMarker = scroller.querySelector<HTMLElement>(
+        "[data-chat-history-layout-revision]",
+      );
+      const currentLayoutRevision = layoutMarker?.getAttribute(
+        "data-chat-history-layout-revision",
+      ) ?? null;
+      const acknowledgedLayoutRevision = layoutMarker?.getAttribute(
+        "data-chat-history-layout-ack",
+      ) ?? null;
+      const newLayoutAcknowledged =
+        currentLayoutRevision !== null &&
+        currentLayoutRevision !== anchor.historyLayoutRevision &&
+        acknowledgedLayoutRevision === currentLayoutRevision;
       if (
+        newLayoutAcknowledged ||
         beforeTop === null ||
-        Math.abs(beforeTop - anchor.top) > 0.5 ||
-        Math.abs(scroller.scrollHeight - anchor.scrollHeight) > 0.5
+        Math.abs(beforeTop - anchor.top) > 0.5
       ) {
         observedPrependLayout = true;
       }
