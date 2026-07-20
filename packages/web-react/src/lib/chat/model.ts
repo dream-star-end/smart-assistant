@@ -278,6 +278,9 @@ export type ChatMessage = {
   _turnTapeProcessExpanded?: boolean;
   /** 已加载记录所属的过程控制键。 */
   _turnTapeProcessLoadedFrom?: string;
+  /** 一次 immutable cursor 请求的轻量客户端渲染页身份。仅用于把真实记录切成
+   *  可虚拟化小块；不折叠内容、不替代内容，也不是服务端投影。 */
+  _turnTapeProcessPageKey?: string;
   /** 下一页物理 ordinal；null=已读完。 */
   _turnTapeProcessCursor?: number | null;
   /** 历史 Bash tail 并入 agent-group 子工具后的纯展示修订号；不持久化、不替代 tape。 */

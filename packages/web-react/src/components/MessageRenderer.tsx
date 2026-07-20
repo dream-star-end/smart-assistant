@@ -10,8 +10,9 @@
  */
 import { Info, Sparkles } from "lucide-react";
 import { memo, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { Virtuoso, VirtuosoMockContext } from "react-virtuoso";
+import { Virtuoso, VirtuosoMockContext, type Components } from "react-virtuoso";
 import type { ChatMessage } from "../lib/chat/model";
+import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
   collectResolvedDispatchTurnIds,
   HIDDEN_REVIEWER_AGENT_ID,
@@ -58,6 +59,12 @@ type RendererProps = {
   /** 当前活跃会话的本轮活动快照（AssistantCard 流式空正文分支据此渲染阶段反馈）。透传，
    *  不进 memo 比较键——TurnActivity 自带 1s tick，无需靠父级重渲驱动秒数。 */
   turnActivity?: TurnActivityInfo | null;
+  /** 本轮活动状态由稳定的 MessageList footer 独占，避免行类型切换时重复挂卸。 */
+  activityInFooter?: boolean;
+  /** 服务端历史代次；隔离旧请求与同 id 的新时间线。 */
+  historyGeneration?: number | string;
+  /** 生命周期归 MessageList，而不是可卸载的虚拟行。 */
+  processPaging?: UserUpwardPagingController;
   /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
    *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
    *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
@@ -80,13 +87,23 @@ export const MessageRenderer = memo(
     sending,
     inActiveTurn,
     turnActivity,
+    activityInFooter,
+    historyGeneration,
+    processPaging,
     delegateCost,
     turnFinalAssistant,
     cb,
     onRespondPermission,
     readOnly = false,
   }: RendererProps) {
-    const ctx = { isLast, sending, turnActivity, inActiveTurn, turnFinalAssistant };
+    const ctx = {
+      isLast,
+      sending,
+      turnActivity,
+      inActiveTurn,
+      turnFinalAssistant,
+      activityInFooter,
+    };
     if (isRedundantRuntimeEnvelope(message)) return null;
     if (message._payloadDeferred) {
       return (
@@ -96,6 +113,9 @@ export const MessageRenderer = memo(
           sending={sending}
           inActiveTurn={inActiveTurn}
           turnActivity={turnActivity}
+          activityInFooter={activityInFooter}
+          historyGeneration={historyGeneration}
+          processPaging={processPaging}
           turnFinalAssistant={turnFinalAssistant}
           cb={cb}
           onRespondPermission={onRespondPermission}
@@ -105,7 +125,14 @@ export const MessageRenderer = memo(
     }
     // 过程控制不是 Agent 内容，只负责真实记录的惰性分页。
     if (message._turnTapeProcess) {
-      return <TurnProcessCard msg={message} cb={cb} />;
+      return (
+        <TurnProcessCard
+          msg={message}
+          cb={cb}
+          paging={processPaging}
+          historyGeneration={historyGeneration}
+        />
+      );
     }
     if (message._turnStatusRecord) {
       return <TurnStatusCard msg={message} cb={cb} currentTurn={inActiveTurn} />;
@@ -124,7 +151,6 @@ export const MessageRenderer = memo(
         return (
           <TapeBackedCard>
             <ThinkingCard msgs={[message]} sig={sig} ctx={ctx} />
-            <ExactTapeRecordDisclosure messages={[message]} label="思考" />
           </TapeBackedCard>
         );
       case "tool": {
@@ -204,6 +230,9 @@ export const MessageRenderer = memo(
     // 债D 委派成本来自别的行(助手行 usage.delegates),不进 message sig,单列比较,
     // 否则成本在 agent-group 完成后才到达时 memo 会跳过重渲、单卡不显示「N 积分」。
     a.delegateCost === b.delegateCost &&
+    a.activityInFooter === b.activityInFooter &&
+    a.historyGeneration === b.historyGeneration &&
+    a.processPaging === b.processPaging &&
     a.readOnly === b.readOnly &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
@@ -318,6 +347,9 @@ function DeferredTapeRecordCard({
   sending,
   inActiveTurn,
   turnActivity,
+  activityInFooter,
+  historyGeneration,
+  processPaging,
   cb,
   onRespondPermission,
   readOnly,
@@ -475,6 +507,9 @@ function DeferredTapeRecordCard({
               sending={sending}
               inActiveTurn={inActiveTurn}
               turnActivity={turnActivity}
+              activityInFooter={activityInFooter}
+              historyGeneration={historyGeneration}
+              processPaging={processPaging}
               turnFinalAssistant={recordIsFinalAssistant}
               cb={cb}
               onRespondPermission={onRespondPermission}
@@ -505,6 +540,24 @@ type RenderItem =
   | { kind: "single"; m: ChatMessage; isLast: boolean; idx: number; delegateCost?: string }
   | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> }
   | { kind: "thinking"; members: ChatMessage[]; sig: string; isLast: boolean; idx: number };
+
+function tapeRenderPageKey(message: ChatMessage | undefined): string {
+  if (!message) return "";
+  if (message._turnTapeProcessPageKey) return message._turnTapeProcessPageKey;
+  // Rows cached by the immediately preceding build do not yet carry a cursor
+  // page key. Derive a stable physical-ordinal bucket so an already-open long
+  // session becomes virtualized immediately after upgrade; this is only a UI
+  // render identity and does not alter, summarize or discard any record.
+  if (message._turnTapeProcessLoadedFrom) {
+    const ordinal = typeof message._turnTapeOrdinal === "number"
+      ? message._turnTapeOrdinal
+      : message._recordOrdinal;
+    if (typeof ordinal === "number" && Number.isFinite(ordinal)) {
+      return `${message._turnTapeProcessLoadedFrom}::legacy-bucket:${Math.floor(ordinal / 200)}`;
+    }
+  }
+  return "";
+}
 
 /**
  * 把「队长**同一并行批次**委派的多个 agent-group」聚成一个团队项(≥2 → TeamPanel;单个
@@ -551,7 +604,12 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
   // 面板成员资格:agent-group 且非隐藏审查员(审查卡恒单卡,按时序独立渲染)。
   const isPanelMember = (m: ChatMessage | undefined): boolean =>
     !!m && messageKind(m) === "agent-group" && m._delegateAgentId !== HIDDEN_REVIEWER_AGENT_ID;
-  const batchKeyOf = (absIdx: number): string => `${anchorOf[absIdx]}:${stageOf[absIdx]}`;
+  // Loaded immutable pages are independent render quanta. Never merge a team
+  // or thinking card across their boundary: doing so would change an existing
+  // virtual item's height/key when an older page arrives.
+  const tapePageKeyOf = tapeRenderPageKey;
+  const batchKeyOf = (absIdx: number): string =>
+    `${anchorOf[absIdx]}:${stageOf[absIdx]}:${tapePageKeyOf(messages[absIdx])}`;
   // 债D per-delegate 成本:队长**助手行**(role 'assistant',同一 turn 的最终答复)的
   // usage.delegates 已由 master 按 agentId 分组求和。按 turn 锚点归拢成 anchor → {agentId:
   // costCredits},供该轮团队卡/委派卡按 `_delegateAgentId` 匹配显示「· N 积分」。同一 agentId
@@ -630,9 +688,11 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
       // 非 thinking 行(assistant/tool/agent-group 等)断组。参考 render.ts unknown 跳过 + 上方
       // coalesceTeam 混排不劈裂先例。
       const members: ChatMessage[] = [];
+      const tapePageKey = tapePageKeyOf(m);
       let lastAbs = absIdx;
       for (let j = i; j < slice.length; j++) {
         const kj = messageKind(slice[j]);
+        if (tapePageKeyOf(slice[j]) !== tapePageKey) break;
         if (kj === "thinking") {
           members.push(slice[j]);
           consumedThinking.add(start + j);
@@ -656,6 +716,75 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
     items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
   }
   return items;
+}
+
+/** A physical cursor response may contain hundreds of genuine records. Keep
+ * every record in memory, but present it to Virtuoso as small stable chunks so
+ * loading an older page adds bounded items instead of invalidating thousands
+ * of measured row indices. 32 is only a render quantum, never a content cap. */
+const TAPE_VIRTUAL_CHUNK_ITEMS = 32;
+
+type VirtualItem =
+  | RenderItem
+  | { kind: "tape-page"; pageKey: string; members: RenderItem[]; key: string };
+
+type TimelineVirtuosoContext = {
+  header: ReactNode;
+  footer: ReactNode;
+};
+
+function TimelineVirtuosoHeader({ context }: { context: TimelineVirtuosoContext }) {
+  return <>{context.header}</>;
+}
+
+function TimelineVirtuosoFooter({ context }: { context: TimelineVirtuosoContext }) {
+  return <>{context.footer}</>;
+}
+
+// Component identities must stay constant. Inline Header/Footer functions make
+// react-virtuoso remount the footer on every stream delta, which was one source
+// of the user-visible "思考中" flash even when the row markup itself was stable.
+const TIMELINE_VIRTUOSO_COMPONENTS: Components<VirtualItem, TimelineVirtuosoContext> = {
+  Header: TimelineVirtuosoHeader,
+  Footer: TimelineVirtuosoFooter,
+};
+
+function renderItemKey(item: RenderItem): string {
+  return item.kind === "single" ? item.m.id : item.members[0]?.id ?? item.kind;
+}
+
+function renderItemTapePageKey(item: RenderItem): string | null {
+  if (item.kind === "single") return tapeRenderPageKey(item.m) || null;
+  const first = tapeRenderPageKey(item.members[0]);
+  return first && item.members.every((message) => tapeRenderPageKey(message) === first)
+    ? first
+    : null;
+}
+
+function chunkTapePages(items: RenderItem[]): VirtualItem[] {
+  const output: VirtualItem[] = [];
+  for (let index = 0; index < items.length;) {
+    const first = items[index]!;
+    const pageKey = renderItemTapePageKey(first);
+    if (!pageKey) {
+      output.push(first);
+      index += 1;
+      continue;
+    }
+    let end = index + 1;
+    while (end < items.length && renderItemTapePageKey(items[end]!) === pageKey) end += 1;
+    for (let offset = index; offset < end; offset += TAPE_VIRTUAL_CHUNK_ITEMS) {
+      const members = items.slice(offset, Math.min(end, offset + TAPE_VIRTUAL_CHUNK_ITEMS));
+      output.push({
+        kind: "tape-page",
+        pageKey,
+        members,
+        key: `tape-page:${pageKey}:${renderItemKey(members[0]!)}`,
+      });
+    }
+    index = end;
+  }
+  return output;
 }
 
 /**
@@ -685,6 +814,7 @@ export function MessageList({
   onRespondPermission,
   readOnly = false,
   scrollParent,
+  historyGeneration = "legacy",
 }: {
   messages: ChatMessage[];
   sending: boolean;
@@ -700,7 +830,146 @@ export function MessageList({
   readOnly?: boolean;
   /** Existing chat scroller. When present, only viewport-adjacent rows mount. */
   scrollParent?: HTMLElement | null;
+  /** Server history revision. A new revision gets a fresh paging intent owner. */
+  historyGeneration?: number | string;
 }) {
+  const pagingOwnerRef = useRef<{
+    generation: string;
+    controller: UserUpwardPagingController;
+  } | null>(null);
+  const pagingGeneration = String(historyGeneration);
+  if (!pagingOwnerRef.current || pagingOwnerRef.current.generation !== pagingGeneration) {
+    pagingOwnerRef.current = {
+      generation: pagingGeneration,
+      controller: new UserUpwardPagingController(),
+    };
+  }
+  const processPaging = pagingOwnerRef.current.controller;
+
+  // Only genuine upward input creates a paging epoch. Scroll events caused by
+  // React/Virtuoso measurement or our viewport correction merely synchronize
+  // position and can never trigger another cursor on their own.
+  useEffect(() => {
+    const scroller = scrollParent;
+    if (!scroller) return;
+    let touchY: number | null = null;
+    let touchUpSignaled = false;
+    let wheelUpSignaled = false;
+    let wheelIdleTimer: number | null = null;
+    let scrollbarPointerId: number | null = null;
+    let pointerUpSignaled = false;
+    const notifyRows = () => scroller.dispatchEvent(new Event("oc-upward-page-intent"));
+    const signalUpward = () => {
+      processPaging.signalUpwardIntent();
+      notifyRows();
+    };
+    const onWheel = (event: WheelEvent) => {
+      // A trackpad/wheel gesture is a burst of events (including inertia), not
+      // one gesture per event. Keep one epoch until the burst is idle.
+      if (event.deltaY < 0 && !wheelUpSignaled) {
+        wheelUpSignaled = true;
+        signalUpward();
+      }
+      if (wheelIdleTimer !== null) window.clearTimeout(wheelIdleTimer);
+      wheelIdleTimer = window.setTimeout(() => {
+        wheelIdleTimer = null;
+        wheelUpSignaled = false;
+      }, 240);
+    };
+    const onTouchStart = (event: TouchEvent) => {
+      touchY = event.touches[0]?.clientY ?? null;
+      touchUpSignaled = false;
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      const nextY = event.touches[0]?.clientY ?? null;
+      if (
+        !touchUpSignaled && nextY !== null && touchY !== null &&
+        nextY > touchY + 0.5
+      ) {
+        touchUpSignaled = true;
+        signalUpward();
+      }
+      touchY = nextY;
+    };
+    const endTouch = (event: TouchEvent) => {
+      touchY = event.touches[0]?.clientY ?? null;
+      if (touchY === null) touchUpSignaled = false;
+    };
+    const cancelTouch = () => {
+      touchY = null;
+      touchUpSignaled = false;
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        !event.repeat &&
+        (event.key === "ArrowUp" || event.key === "PageUp" || event.key === "Home")
+      ) signalUpward();
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse" || scrollbarPointerId !== null) return;
+      const gutter = scroller.offsetWidth - scroller.clientWidth;
+      if (gutter <= 0) return;
+      const rect = scroller.getBoundingClientRect();
+      const inScrollbarGutter =
+        event.clientX >= rect.right - gutter - 1 ||
+        event.clientX <= rect.left + gutter + 1;
+      if (!inScrollbarGutter) return;
+      scrollbarPointerId = event.pointerId;
+      pointerUpSignaled = false;
+      processPaging.syncScrollTop(scroller.scrollTop);
+    };
+    const endPointer = (event?: PointerEvent) => {
+      if (
+        scrollbarPointerId === null ||
+        (event && event.pointerId !== scrollbarPointerId)
+      ) return;
+      scrollbarPointerId = null;
+      pointerUpSignaled = false;
+      processPaging.syncScrollTop(scroller.scrollTop);
+    };
+    const onWindowBlur = () => endPointer();
+    const onScroll = () => {
+      if (scrollbarPointerId !== null) {
+        const signaled = processPaging.signalPointerScroll(
+          scroller.scrollTop,
+          !pointerUpSignaled,
+        );
+        if (signaled) {
+          pointerUpSignaled = true;
+          notifyRows();
+        }
+      } else {
+        processPaging.syncScrollTop(scroller.scrollTop);
+      }
+    };
+    processPaging.syncScrollTop(scroller.scrollTop);
+    scroller.addEventListener("wheel", onWheel, { passive: true });
+    scroller.addEventListener("touchstart", onTouchStart, { passive: true });
+    scroller.addEventListener("touchmove", onTouchMove, { passive: true });
+    scroller.addEventListener("touchend", endTouch, { passive: true });
+    scroller.addEventListener("touchcancel", cancelTouch, { passive: true });
+    scroller.addEventListener("keydown", onKeyDown);
+    scroller.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointerup", endPointer);
+    window.addEventListener("pointercancel", endPointer);
+    window.addEventListener("blur", onWindowBlur);
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      if (wheelIdleTimer !== null) window.clearTimeout(wheelIdleTimer);
+      scroller.removeEventListener("wheel", onWheel);
+      scroller.removeEventListener("touchstart", onTouchStart);
+      scroller.removeEventListener("touchmove", onTouchMove);
+      scroller.removeEventListener("touchend", endTouch);
+      scroller.removeEventListener("touchcancel", cancelTouch);
+      scroller.removeEventListener("keydown", onKeyDown);
+      scroller.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointerup", endPointer);
+      window.removeEventListener("pointercancel", endPointer);
+      window.removeEventListener("blur", onWindowBlur);
+      scroller.removeEventListener("scroll", onScroll);
+    };
+  }, [processPaging, scrollParent]);
+
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
   // their canonical immutable Agent blocks are the user-facing timeline.
@@ -713,31 +982,21 @@ export function MessageList({
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
-  const total = renderableMessages.length;
   const archivedThroughSeq = archive?.archivedThroughSeq ?? 0;
   const archivedAnchors = archive
     ? loadedArchivedMetrics(messages, archivedThroughSeq).anchors
     : 0;
   const archivedRemaining = Math.max(0, (archive?.archivedCount ?? 0) - archivedAnchors);
-  const last = renderableMessages[total - 1];
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
   const turnStart = currentTurnStartIndex(renderableMessages);
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
   const ratingFinal = turnFinalAssistantFlags(renderableMessages);
-  // typing 指示：本轮进行中、且末条不是会自渲流式态的卡（assistant/thinking 自带光标，
-  // permission 处于等待用户决策态）。
-  const showTyping =
-    sending &&
-    !!last &&
-    last.role !== "assistant" &&
-    last.role !== "thinking" &&
-    last.role !== "permission" &&
-    // 生成占位卡本身即进度指示器(粒子框 + 角标),末条是占位时不再叠裸 typing 三点。
-    !last._genPlaceholder;
   const renderItems = coalesceTeam(renderableMessages, 0, sending);
-  const itemKey = (item: RenderItem) => item.kind === "single" ? item.m.id : item.members[0].id;
+  const virtualItems = chunkTapePages(renderItems);
+  const itemKey = (item: VirtualItem): string =>
+    item.kind === "tape-page" ? item.key : renderItemKey(item);
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
@@ -764,8 +1023,11 @@ export function MessageList({
       return (
         <MessageBoundary messageId={it.members[0].id} sig={it.sig}>
           <TapeBackedCard>
-            <ThinkingCard msgs={it.members} sig={it.sig} ctx={{ isLast: it.isLast, sending }} />
-            <ExactTapeRecordDisclosure messages={it.members} label="思考" />
+            <ThinkingCard
+              msgs={it.members}
+              sig={it.sig}
+              ctx={{ isLast: it.isLast, sending, activityInFooter: sending }}
+            />
           </TapeBackedCard>
         </MessageBoundary>
       );
@@ -781,6 +1043,9 @@ export function MessageList({
           sending={sending}
           inActiveTurn={it.idx >= turnStart}
           turnActivity={turnActivity}
+          activityInFooter={sending}
+          historyGeneration={historyGeneration}
+          processPaging={processPaging}
           delegateCost={it.delegateCost}
           turnFinalAssistant={turnFinalAssistant}
           cb={cb}
@@ -790,8 +1055,45 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const historyControl = archivedRemaining > 0 && archive ? (
+  const renderVirtualItem = (item: VirtualItem) => item.kind === "tape-page" ? (
+    <div
+      data-tape-page-chunk
+      data-tape-page-key={item.pageKey}
+      data-chunk-items={item.members.length}
+    >
+      {item.members.map((member, index) => (
+        <div key={renderItemKey(member)} className={index > 0 ? "pt-4" : undefined}>
+          {renderItem(member)}
+        </div>
+      ))}
+    </div>
+  ) : renderItem(item);
+  const historyControl = archivedRemaining > 0 && archive && readOnly ? (
+    // Admin read-only viewer has no ordinary end-user scroll gesture contract;
+    // retain its explicit audit pagination action.
     <div className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8">
+      <button
+        type="button"
+        onClick={archive.onLoadOlder}
+        disabled={archive.loading}
+        aria-busy={archive.loading}
+        className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60"
+      >
+        {archive.loading
+          ? <><Spinner size={12} /> 加载中…</>
+          : archive.error
+            ? <span className="text-danger">加载失败，点击重试</span>
+            : `向上滚动加载更早历史（还有 ${archivedRemaining} 条）`}
+      </button>
+    </div>
+  ) : archivedRemaining > 0 && archive ? (
+    <div
+      className={archive.error
+        ? "mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-4"
+        : "h-px overflow-hidden"}
+      data-testid="history-page-loader"
+    >
+      {archive.error ? (
         <button
           type="button"
           onClick={archive.onLoadOlder}
@@ -799,31 +1101,28 @@ export function MessageList({
           aria-busy={archive.loading}
           className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
         >
-          {archive.loading ? (
-            <>
-              <Spinner size={12} /> 加载中…
-            </>
-          ) : archive.error ? (
-            <span className="text-danger">加载失败，点击重试</span>
-          ) : (
-            `向上滚动加载更早历史（还有 ${archivedRemaining} 条）`
-          )}
+          <span className="text-danger">更早消息加载失败，点击重试</span>
         </button>
+      ) : archive.loading ? (
+        <span className="sr-only" role="status">正在加载更早消息</span>
+      ) : null}
     </div>
   ) : null;
   const footer = (
     <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 pb-8 pt-4">
-      {showTyping && (
-        <div className="flex gap-4 animate-in">
-          {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
-          <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-            <Sparkles size={16} />
-          </Avatar>
-          <div className="min-w-0 flex-1">
-            <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
+      <div data-testid="turn-activity-footer">
+        {sending && (
+          <div className="flex gap-4">
+            {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
+            <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
+              <Sparkles size={16} />
+            </Avatar>
+            <div className="min-w-0 flex-1">
+              <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
       {/* 会话级 transient 软提示（超时软提示等，非消息卡片、不落库；刷新即消失，不与真内容矛盾）。 */}
       {transientNotice && (
         <Alert tone="info" icon={<Info size={16} />}>
@@ -850,22 +1149,25 @@ export function MessageList({
     const virtualList = (
       <Virtuoso
         customScrollParent={scrollParent}
-        data={renderItems}
+        data={virtualItems}
+        context={{ header: historyControl, footer }}
         computeItemKey={(_index, item) => itemKey(item)}
         itemContent={(_index, item) => (
-          <div className="mx-auto max-w-3xl px-5 pb-4">{renderItem(item)}</div>
+          <div
+            className="chat-virtual-item mx-auto max-w-3xl px-5 pb-4"
+            data-chat-virtual-key={itemKey(item)}
+          >
+            {renderVirtualItem(item)}
+          </div>
         )}
-        initialTopMostItemIndex={Math.max(0, renderItems.length - 1)}
+        initialTopMostItemIndex={Math.max(0, virtualItems.length - 1)}
         increaseViewportBy={{ top: 800, bottom: 1200 }}
         overscan={400}
-        followOutput={sending ? "auto" : false}
+        followOutput={false}
         startReached={() => {
           if (archive && archivedRemaining > 0 && !archive.loading) archive.onLoadOlder();
         }}
-        components={{
-          Header: () => historyControl,
-          Footer: () => footer,
-        }}
+        components={TIMELINE_VIRTUOSO_COMPONENTS}
       />
     );
     // jsdom has no layout engine, so Virtuoso cannot infer a viewport from the
@@ -884,7 +1186,11 @@ export function MessageList({
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
       {historyControl}
-      {renderItems.map((item) => <div key={itemKey(item)}>{renderItem(item)}</div>)}
+      {virtualItems.map((item) => (
+        <div key={itemKey(item)} data-chat-virtual-key={itemKey(item)}>
+          {renderVirtualItem(item)}
+        </div>
+      ))}
       {footer}
     </div>
   );

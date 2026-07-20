@@ -224,6 +224,42 @@ describe("lazy immutable process merge", () => {
     expect(session.messages.find((message) => message.id === "tool-2")?.text).toBe("二");
   });
 
+  test("each fetched page keeps a lightweight render-page identity and duplicate merges are inert", () => {
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [
+        srvRow({ id: "cm-1", role: "user", text: "问题", _seq: 4, _orderSeq: 4 }),
+        processControl(),
+        finalAnswer(),
+      ],
+      true,
+      5,
+      { historyRevision: 7, serverUpdatedAt: 100 },
+    );
+    persistSession.mockClear();
+
+    const tail = srvRow({ id: "tool-tail", role: "tool", text: "尾页", _turnTapeOrdinal: 2 });
+    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tail], 2);
+    const session = sock.sessions.get("s1")!;
+    const tailPageKey = session.messages.find((message) => message.id === "tool-tail")
+      ?._turnTapeProcessPageKey;
+    expect(tailPageKey).toContain("tail");
+
+    persistSession.mockClear();
+    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tail], 2);
+    expect(persistSession).not.toHaveBeenCalled();
+
+    const older = srvRow({ id: "thinking-old", role: "thinking", text: "更早", _turnTapeOrdinal: 1 });
+    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [older], null);
+    const olderPageKey = session.messages.find((message) => message.id === "thinking-old")
+      ?._turnTapeProcessPageKey;
+    expect(olderPageKey).toContain("before:2");
+    expect(olderPageKey).not.toBe(tailPageKey);
+  });
+
   test("CCB Bash tail continuation updates loaded tool cards without mutating immutable rows", () => {
     const { sock, session } = seed();
     session.messages.push(processControl({
