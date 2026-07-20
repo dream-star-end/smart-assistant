@@ -1505,10 +1505,9 @@ function retryableFinalizeCapacityError(reason: string): Error {
 
 /**
  * Physical-memory admission, not a product content cap. Finalization still
- * materializes one canonical JSON value, so it needs one exclusive memory
- * slot. A request that cannot run *now* is rejected as retryable instead of
- * sitting forever at the head of a process-global FIFO and blocking every
- * other user's completed turn.
+ * materializes one canonical JSON value, so concurrent preparations reserve
+ * their declared physical peaks. There is no tape-count or content cap: every
+ * tape that fits the live process/cgroup and heap budgets proceeds immediately.
  */
 export function _createPhysicalFinalizeAdmission(
   readMemory: () => PhysicalFinalizeMemorySnapshot = () => {
@@ -1522,30 +1521,36 @@ export function _createPhysicalFinalizeAdmission(
     };
   },
 ): (totalBytes: number) => () => void {
-  let active = false;
+  let reservedExternalBytes = 0;
+  let reservedHeapBytes = 0;
   return (totalBytes: number): (() => void) => {
-    if (active) throw retryableFinalizeCapacityError("another tape is materializing");
     // One canonical byte buffer plus materialized record buffers are external
     // memory; UTF-8 decoding and JSON.parse need heap. These estimates follow
     // the actual declared tape bytes and current process/cgroup capacity.
     const externalNeed = totalBytes * 3;
     const heapNeed = totalBytes * 2;
     const memory = readMemory();
+    // Outstanding reservations may not have reached the live process metrics
+    // yet, so account for every one explicitly. Some realized allocations can
+    // therefore be counted twice for a short period, but guessing which live
+    // delta belongs to this code could overcommit memory under unrelated load.
     if (
       !Number.isFinite(externalNeed) ||
       !Number.isFinite(heapNeed) ||
       heapNeed > memory.heapLimitBytes ||
-      externalNeed > memory.availableSystemBytes ||
-      heapNeed > memory.heapAvailableBytes
+      reservedExternalBytes + externalNeed > memory.availableSystemBytes ||
+      reservedHeapBytes + heapNeed > memory.heapAvailableBytes
     ) {
       throw retryableFinalizeCapacityError("current process/cgroup memory is insufficient");
     }
-    active = true;
+    reservedExternalBytes += externalNeed;
+    reservedHeapBytes += heapNeed;
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      active = false;
+      reservedExternalBytes -= externalNeed;
+      reservedHeapBytes -= heapNeed;
     };
   };
 }
