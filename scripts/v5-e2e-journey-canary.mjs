@@ -181,6 +181,7 @@ try {
   });
 
   const marker = `e2e journey canary ${Date.now().toString(36)}`;
+  let assistantRowsBefore = 0;
   await step("J4 带附件发送:消息上屏+附件区清空", async () => {
     const input = page.locator("textarea").first();
     await input.fill(`${marker}(自动冒烟,只需简短回复)`);
@@ -191,6 +192,7 @@ try {
       if (Date.now() > deadline) throw new Error("发送按钮在超时窗内未变为可用(上传未完成?)");
       await new Promise((r) => setTimeout(r, 200));
     }
+    assistantRowsBefore = await page.getByTestId("assistant-row").count();
     await send.click();
     // .first():模型回复若复读 marker 会出现第二个匹配,strict 单元素断言会误报。
     await page.getByText(marker, { exact: false }).first().waitFor({ state: "visible", timeout: STEP_TIMEOUT });
@@ -203,18 +205,30 @@ try {
     // 2026-07-18 受理竞态事故:发送失败时乐观气泡照样上屏,旧断言「上屏=成功」让新会话
     // 首发必挂的回归穿门(canary 账号当场撞到、被重试语义掩蔽后门照放绿)。送达升硬门:
     //   失败判据 = ErrorBanner 签名(发送失败 / 消息暂未安全送达),一出现立即 fail;
-    //   成功判据 =「重新生成」按钮出现(完成态 assistant 行的稳定结构钩子;J1 全新会话
-    //   基线为 0,>0 即助手回复完成)—— 覆盖 admission→执行→回传全链,假阳性面窄。
+    //   成功判据 = 新 assistant 行出现 + 流式光标消失 + composer 从「停止」恢复「发送」；
+    //   新行不得含 alert（终态错误/空轮/截断都必须 fail）。不依赖回复文案或可选操作按钮。
     const failSig = page.getByText(/发送失败|消息暂未安全送达/).first();
-    const regen = page.getByRole("button", { name: "重新生成" });
+    const assistantRows = page.getByTestId("assistant-row");
+    const send = page.getByRole("button", { name: "发送", exact: true });
     const deadline = Date.now() + TURN_WAIT_TIMEOUT;
     for (;;) {
       if ((await failSig.count()) > 0) {
         throw new Error("发送失败签名出现(消息未送达,见截图)");
       }
-      if ((await regen.count()) > 0) break;
+      if ((await assistantRows.count()) > assistantRowsBefore) {
+        const newestAssistant = assistantRows.last();
+        const responseFinished =
+          (await newestAssistant.locator(".caret-blink").count()) === 0 &&
+          (await send.count()) > 0;
+        if (responseFinished) {
+          if ((await newestAssistant.locator('[role="alert"]').count()) > 0) {
+            throw new Error("assistant 以错误/空轮/截断提示结束(非正常回复)");
+          }
+          break;
+        }
+      }
       if (Date.now() > deadline) {
-        throw new Error(`assistant 回复在 ${TURN_WAIT_TIMEOUT / 1000}s 内未完成(无失败卡亦无回复 = turn 挂起)`);
+        throw new Error(`assistant 回复在 ${TURN_WAIT_TIMEOUT / 1000}s 内未完成(无失败卡亦无完整回复 = turn 挂起)`);
       }
       await new Promise((r) => setTimeout(r, 500));
     }
