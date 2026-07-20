@@ -14,16 +14,12 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { Virtuoso, VirtuosoMockContext, type Components } from "react-virtuoso";
 import type { ChatMessage } from "../lib/chat/model";
-import {
-  turnProcessPagingGeneration,
-  UserUpwardPagingController,
-} from "../lib/chat/tapePaging";
+import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
   collectResolvedDispatchTurnIds,
   HIDDEN_REVIEWER_AGENT_ID,
@@ -35,7 +31,6 @@ import {
 import {
   AssistantCard,
   type CardCallbacks,
-  TurnProcessCard,
   DelegateProgressCard,
   GoalCard,
   PlanCard,
@@ -76,10 +71,6 @@ type RendererProps = {
   historyGeneration?: number | string;
   /** 生命周期归 MessageList，而不是可卸载的虚拟行。 */
   processPaging?: UserUpwardPagingController;
-  /** 只有当前会话最新的过程控制行可自动读取一次尾页。更早过程必须由用户点击。 */
-  autoLoadLatestProcessTail?: boolean;
-  automaticProcessLoading?: boolean;
-  automaticProcessError?: boolean;
   /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
    *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
    *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
@@ -105,9 +96,6 @@ export const MessageRenderer = memo(
     activityInFooter,
     historyGeneration,
     processPaging,
-    autoLoadLatestProcessTail = false,
-    automaticProcessLoading = false,
-    automaticProcessError = false,
     delegateCost,
     turnFinalAssistant,
     cb,
@@ -122,7 +110,7 @@ export const MessageRenderer = memo(
       turnFinalAssistant,
       activityInFooter,
     };
-    if (isRedundantRuntimeEnvelope(message)) return null;
+    if (message._timelineRecord !== true && isRedundantRuntimeEnvelope(message)) return null;
     if (message._payloadDeferred) {
       return (
         <DeferredTapeRecordCard
@@ -143,17 +131,7 @@ export const MessageRenderer = memo(
     }
     // 过程控制不是 Agent 内容，只负责真实记录的惰性分页。
     if (message._turnTapeProcess) {
-      return (
-        <TurnProcessCard
-          msg={message}
-          cb={cb}
-          paging={processPaging}
-          historyGeneration={historyGeneration}
-          autoLoadLatestTail={autoLoadLatestProcessTail}
-          automaticLoading={automaticProcessLoading}
-          automaticError={automaticProcessError}
-        />
-      );
+      return null;
     }
     if (message._turnStatusRecord) {
       return <TurnStatusCard msg={message} cb={cb} currentTurn={inActiveTurn} />;
@@ -171,7 +149,12 @@ export const MessageRenderer = memo(
         // 由 MessageList/coalesceTeam 合并成单张多段卡,不走这里。
         return (
           <TapeBackedCard>
-            <ThinkingCard msgs={[message]} sig={sig} ctx={ctx} />
+            <ThinkingCard
+              msgs={[message]}
+              sig={sig}
+              ctx={ctx}
+              alwaysExpanded={message._timelineRecord === true}
+            />
           </TapeBackedCard>
         );
       case "tool": {
@@ -240,7 +223,9 @@ export const MessageRenderer = memo(
         // Immutable tape rows must remain visible even when a newer engine
         // introduces a role this web build does not yet understand. Render
         // the exact raw record instead of silently dropping the event.
-        return message._turnTapeId ? <RuntimeEventCard message={message} /> : null;
+        return message._timelineRecord === true || message._turnTapeId
+          ? <RuntimeEventCard message={message} />
+          : null;
     }
   },
   (a, b) =>
@@ -254,9 +239,6 @@ export const MessageRenderer = memo(
     a.activityInFooter === b.activityInFooter &&
     a.historyGeneration === b.historyGeneration &&
     a.processPaging === b.processPaging &&
-    a.autoLoadLatestProcessTail === b.autoLoadLatestProcessTail &&
-    a.automaticProcessLoading === b.automaticProcessLoading &&
-    a.automaticProcessError === b.automaticProcessError &&
     a.readOnly === b.readOnly &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
@@ -509,6 +491,11 @@ function DeferredTapeRecordCard({
                 _payloadSha256: undefined,
                 _seq: message._seq,
                 _orderSeq: message._orderSeq,
+                _timelineRecord: message._timelineRecord,
+                _timelineUnitKey: message._timelineUnitKey,
+                _timelineLogicalOrdinal: message._timelineLogicalOrdinal,
+                _historyPageLoadedFrom: message._historyPageLoadedFrom,
+                _historyPageKey: message._historyPageKey,
                 _clientMessageId: record._clientMessageId ?? message._clientMessageId,
                 _routing: record._routing ?? message._routing,
                 _sendAttempt: message._sendAttempt ?? record._sendAttempt,
@@ -525,6 +512,11 @@ function DeferredTapeRecordCard({
                 _turnTapeProcessLoadedFrom: message._turnTapeProcessLoadedFrom,
                 _seq: message._seq,
                 _orderSeq: message._orderSeq,
+                _timelineRecord: message._timelineRecord,
+                _timelineUnitKey: `${message._timelineUnitKey ?? message.id}:logical:${index}`,
+                _timelineLogicalOrdinal: index,
+                _historyPageLoadedFrom: message._historyPageLoadedFrom,
+                _historyPageKey: message._historyPageKey,
                 _clientMessageId: record._clientMessageId ?? message._clientMessageId,
               };
           const final = isLast && index === records.length - 1;
@@ -580,6 +572,7 @@ type RenderItem =
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
   if (!message) return "";
+  if (message._historyPageKey) return message._historyPageKey;
   if (message._turnTapeProcessPageKey) return message._turnTapeProcessPageKey;
   // Rows cached by the immediately preceding build do not yet carry a cursor
   // page key. Derive a stable physical-ordinal bucket so an already-open long
@@ -640,7 +633,8 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
   }
   // 面板成员资格:agent-group 且非隐藏审查员(审查卡恒单卡,按时序独立渲染)。
   const isPanelMember = (m: ChatMessage | undefined): boolean =>
-    !!m && messageKind(m) === "agent-group" && m._delegateAgentId !== HIDDEN_REVIEWER_AGENT_ID;
+    !!m && m._timelineRecord !== true && messageKind(m) === "agent-group" &&
+    m._delegateAgentId !== HIDDEN_REVIEWER_AGENT_ID;
   // Loaded immutable pages are independent render quanta. Never merge a team
   // or thinking card across their boundary: doing so would change an existing
   // virtual item's height/key when an older page arrives.
@@ -682,6 +676,12 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
     const m = slice[i];
     const absIdx = start + i;
     if (consumedThinking.has(absIdx)) continue; // 已并入上方某思考卡 → 吸收跳过
+    // Persisted historical records are already the Agent's exact ordered
+    // logical stream. Never regroup, reorder or fold one record into another.
+    if (m._timelineRecord === true) {
+      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
+      continue;
+    }
     if (isPanelMember(m)) {
       const batchKey = batchKeyOf(absIdx);
       if ((teamCount.get(batchKey) ?? 0) >= 2) {
@@ -755,19 +755,12 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
   return items;
 }
 
-/** A physical cursor response may contain hundreds of genuine records. Keep
- * every record in memory, but present it to Virtuoso as small stable chunks so
- * loading an older page adds bounded items instead of invalidating thousands
- * of measured row indices. 32 is only a render quantum, never a content cap. */
-const TAPE_VIRTUAL_CHUNK_ITEMS = 32;
 // React Virtuoso uses firstItemIndex as a coordinate when items are prepended.
 // Keep a very large internal origin so every older page can move left without
 // imposing a user-visible history limit.
 const TIMELINE_VIRTUAL_INDEX_ORIGIN = Math.floor(Number.MAX_SAFE_INTEGER / 4);
 
-type VirtualItem =
-  | RenderItem
-  | { kind: "tape-page"; pageKey: string; members: RenderItem[]; key: string };
+type VirtualItem = RenderItem;
 
 type TimelineVirtuosoContext = {
   header: ReactNode;
@@ -791,62 +784,25 @@ const TIMELINE_VIRTUOSO_COMPONENTS: Components<VirtualItem, TimelineVirtuosoCont
 };
 
 function renderItemKey(item: RenderItem): string {
-  return item.kind === "single" ? item.m.id : item.members[0]?.id ?? item.kind;
-}
-
-function renderItemTapePageKey(item: RenderItem): string | null {
-  if (item.kind === "single") return tapeRenderPageKey(item.m) || null;
-  const first = tapeRenderPageKey(item.members[0]);
-  return first && item.members.every((message) => tapeRenderPageKey(message) === first)
-    ? first
-    : null;
-}
-
-function chunkTapePages(items: RenderItem[]): VirtualItem[] {
-  const output: VirtualItem[] = [];
-  for (let index = 0; index < items.length;) {
-    const first = items[index]!;
-    const pageKey = renderItemTapePageKey(first);
-    if (!pageKey) {
-      output.push(first);
-      index += 1;
-      continue;
-    }
-    let end = index + 1;
-    while (end < items.length && renderItemTapePageKey(items[end]!) === pageKey) end += 1;
-    for (let offset = index; offset < end; offset += TAPE_VIRTUAL_CHUNK_ITEMS) {
-      const members = items.slice(offset, Math.min(end, offset + TAPE_VIRTUAL_CHUNK_ITEMS));
-      output.push({
-        kind: "tape-page",
-        pageKey,
-        members,
-        key: `tape-page:${pageKey}:${renderItemKey(members[0]!)}`,
-      });
-    }
-    index = end;
-  }
-  return output;
+  return item.kind === "single"
+    ? (item.m._timelineUnitKey ?? item.m.id)
+    : item.members[0]?._timelineUnitKey ?? item.members[0]?.id ?? item.kind;
 }
 
 function renderItemMessages(item: RenderItem): ChatMessage[] {
   return item.kind === "single" ? [item.m] : item.members;
 }
 
-function virtualItemMessages(item: VirtualItem): ChatMessage[] {
-  return item.kind === "tape-page"
-    ? item.members.flatMap(renderItemMessages)
-    : renderItemMessages(item);
-}
-
 /**
- * 会话归档分页上下文(§4/§5)。App 从 chat.getSession 读会话归档水位/计数,并接线 Agent C 的
- * loadOlderHistory + 视口保持。未传(如 demo / 老测试)时按「无归档、仅本地翻页」退化,行为不变。
+ * Unified timeline paging context. Loading is an explicit-button action;
+ * scrolling only navigates already resident records.
  */
 export type MessageListArchive = {
-  /** 会话归档总条数(client_sessions.archived_count 透传);0 = 无归档。 */
-  archivedCount: number;
-  /** 归档水位线 _seq(≤ 此值的行已 spill 到归档表);判定 messages 里哪些是已拉回的归档行。 */
-  archivedThroughSeq: number;
+  /** Unified server cursor reports an older exact page. */
+  hasMore?: boolean;
+  /** Rolling-test/old-caller compatibility only. */
+  archivedCount?: number;
+  archivedThroughSeq?: number;
   /** 云端加载进行中(按钮转 loading 态、禁用)。 */
   loading: boolean;
   /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
@@ -899,32 +855,11 @@ export function MessageList({
   const [archiveQueued, setArchiveQueued] = useState(false);
   const archiveQueuedRef = useRef(false);
   const archiveQueueTokenRef = useRef(0);
-  const messagesRef = useRef(messages);
-  messagesRef.current = messages;
-  const automaticCommitWaitersRef = useRef(new Map<string, {
-    anchorId: string;
-    tapeId: string;
-    resolve: () => void;
-  }>());
-  const automaticControlStateRef = useRef<{
-    generation: string;
-    initialized: boolean;
-  } | null>(null);
-  const [automaticProcess, setAutomaticProcess] = useState<{
-    generation: string;
-    loading: boolean;
-    error: boolean;
-  } | null>(null);
 
   useEffect(() => {
     archiveQueueTokenRef.current += 1;
     archiveQueuedRef.current = false;
     setArchiveQueued(false);
-  }, [processPaging]);
-
-  useEffect(() => () => {
-    for (const waiter of automaticCommitWaitersRef.current.values()) waiter.resolve();
-    automaticCommitWaitersRef.current.clear();
   }, [processPaging]);
 
   // User input is observed only to invalidate an older click's viewport
@@ -1042,128 +977,29 @@ export function MessageList({
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       !m.id.startsWith("projection-") &&
       !m.id.startsWith("oc-dispatch-err:") &&
-      !isRedundantRuntimeEnvelope(m) &&
+      m._turnTapeProcess !== true &&
+      (m._timelineRecord === true || !isRedundantRuntimeEnvelope(m)) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
-  let latestProcessControl: ChatMessage | null = null;
-  for (let index = renderableMessages.length - 1; index >= 0; index -= 1) {
-    if (renderableMessages[index]?._turnTapeProcess === true) {
-      latestProcessControl = renderableMessages[index]!;
-      break;
-    }
-  }
-  const latestProcessGeneration = latestProcessControl
-    ? turnProcessPagingGeneration(historyGeneration, latestProcessControl)
-    : null;
-  const latestProcessInitialized = latestProcessControl?._turnTapeProcessExpanded === true;
-
-  useEffect(() => {
-    const previous = automaticControlStateRef.current;
-    if (
-      latestProcessGeneration && previous?.generation === latestProcessGeneration &&
-      previous.initialized && !latestProcessInitialized
-    ) {
-      processPaging.reset(latestProcessGeneration);
-    }
-    automaticControlStateRef.current = latestProcessGeneration
-      ? { generation: latestProcessGeneration, initialized: latestProcessInitialized }
-      : null;
-  }, [latestProcessGeneration, latestProcessInitialized, processPaging]);
-
-  // The latest process tail is owned above Virtuoso, so it starts when the
-  // session mounts even if a long final answer keeps its virtual row unmounted.
-  // A successful request retains the automatic claim until the new control
-  // state has committed through React; explicit archive/tape clicks wait in FIFO.
-  useLayoutEffect(() => {
-    for (const [generation, waiter] of automaticCommitWaitersRef.current) {
-      const current = messagesRef.current.find((message) => message.id === waiter.anchorId);
-      if (
-        current?._turnTapeProcessExpanded === true &&
-        current._turnTapeId === waiter.tapeId
-      ) {
-        automaticCommitWaitersRef.current.delete(generation);
-        waiter.resolve();
-      }
-    }
-  }, [messages, pagingGeneration]);
-
-  useEffect(() => {
-    const process = latestProcessControl;
-    const loadOlderTape = cb.onLoadOlderTape;
-    const tapeId = process?._turnTapeId;
-    const generation = latestProcessGeneration;
-    if (
-      !process || !generation || !loadOlderTape || !tapeId ||
-      latestProcessInitialized
-    ) {
-      setAutomaticProcess((current) => current?.generation === generation ? null : current);
-      return;
-    }
-
-    let disposed = false;
-    let started = false;
-    const start = () => {
-      if (disposed || started) return;
-      const claim = processPaging.begin(generation, false);
-      if (!claim) return;
-      started = true;
-      setAutomaticProcess({ generation, loading: true, error: false });
-      let resolveCommit!: () => void;
-      const committed = new Promise<void>((resolve) => { resolveCommit = resolve; });
-      automaticCommitWaitersRef.current.set(generation, {
-        anchorId: process.id,
-        tapeId,
-        resolve: resolveCommit,
-      });
-      void (async () => {
-        let failed = false;
-        try {
-          const result = await loadOlderTape(process.id, tapeId, null);
-          if (!result.ok) {
-            failed = true;
-            automaticCommitWaitersRef.current.delete(generation);
-            resolveCommit();
-          } else {
-            await committed;
-          }
-        } catch {
-          failed = true;
-          automaticCommitWaitersRef.current.delete(generation);
-          resolveCommit();
-        } finally {
-          if (!disposed) {
-            setAutomaticProcess({ generation, loading: false, error: failed });
-          }
-          processPaging.settle(claim);
-        }
-      })();
-    };
-    const unsubscribe = processPaging.subscribeSettled(start);
-    start();
-    return () => {
-      disposed = true;
-      unsubscribe();
-    };
-  }, [
-    cb.onLoadOlderTape,
-    latestProcessInitialized,
-    latestProcessGeneration,
-    processPaging,
-  ]);
-  const archivedThroughSeq = archive?.archivedThroughSeq ?? 0;
-  const archivedAnchors = archive
-    ? loadedArchivedMetrics(messages, archivedThroughSeq).anchors
+  const legacyArchivedRemaining = archive?.hasMore === undefined
+    ? Math.max(
+        0,
+        (archive?.archivedCount ?? 0) - loadedArchivedMetrics(
+          messages,
+          archive?.archivedThroughSeq ?? 0,
+        ).anchors,
+      )
     : 0;
-  const archivedRemaining = Math.max(0, (archive?.archivedCount ?? 0) - archivedAnchors);
+  const hasOlderHistory = archive?.hasMore ?? (legacyArchivedRemaining > 0);
   const requestOlderArchive = useCallback(() => {
     if (
-      !archive || archivedRemaining <= 0 || archive.loading ||
+      !archive || !hasOlderHistory || archive.loading ||
       archiveQueuedRef.current
     ) return;
     archiveQueuedRef.current = true;
     setArchiveQueued(true);
     const token = ++archiveQueueTokenRef.current;
-    const requestKey = `archive::${pagingGeneration}::${archivedThroughSeq}::${archivedAnchors}`;
+    const requestKey = `timeline::${pagingGeneration}`;
     // The new explicit navigation cancels any older tape anchor correction
     // immediately; its network task still finishes before this FIFO slot.
     processPaging.signalUserInteraction();
@@ -1174,7 +1010,7 @@ export function MessageList({
       archiveQueuedRef.current = false;
       setArchiveQueued(false);
     });
-  }, [archive, archivedAnchors, archivedRemaining, archivedThroughSeq, pagingGeneration, processPaging]);
+  }, [archive, hasOlderHistory, pagingGeneration, processPaging]);
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
   const turnStart = currentTurnStartIndex(renderableMessages);
@@ -1182,31 +1018,33 @@ export function MessageList({
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
   const ratingFinal = turnFinalAssistantFlags(renderableMessages);
   const renderItems = coalesceTeam(renderableMessages, 0, sending);
-  const virtualItems = chunkTapePages(renderItems);
-  const itemKey = (item: VirtualItem): string =>
-    item.kind === "tape-page" ? item.key : renderItemKey(item);
+  // One genuine timeline record is one Virtuoso item. Grouping a whole server
+  // page into a tall virtual row makes prepend measurements unstable: the old
+  // anchor row changes height and the viewport jumps. Virtuoso itself limits
+  // mounted DOM to the viewport, so keeping records separate adds no content
+  // cap and preserves exact per-record identity while paging backwards.
+  const virtualItems: VirtualItem[] = renderItems;
+  const itemKey = renderItemKey;
   // Give every already-loaded archive item a stable virtual coordinate. When
   // another archive page is prepended, firstItemIndex decreases by exactly the
   // number of new virtual items, so Virtuoso keeps the old viewport mounted.
   // A mixed boundary item is deliberately excluded: it replaces the previous
   // first tail item rather than adding another virtual row.
   let archivedVirtualPrefixItems = 0;
-  if (archive && archivedThroughSeq > 0) {
+  if (archive) {
     for (const item of virtualItems) {
-      const itemMessages = virtualItemMessages(item);
+      const itemMessages = renderItemMessages(item);
       if (
         itemMessages.length === 0 ||
-        !itemMessages.every((message) => {
-          const orderSeq = typeof message._orderSeq === "number"
-            ? message._orderSeq
-            : message._seq;
-          return typeof orderSeq === "number" && orderSeq <= archivedThroughSeq;
-        })
+        !itemMessages.every((message) => typeof message._historyPageLoadedFrom === "string")
       ) break;
       archivedVirtualPrefixItems += 1;
     }
   }
   const firstItemIndex = TIMELINE_VIRTUAL_INDEX_ORIGIN - archivedVirtualPrefixItems;
+  const showHistoryBoundary = hasOlderHistory || renderableMessages.some(
+    (message) => typeof message._historyPageLoadedFrom === "string",
+  );
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
@@ -1245,7 +1083,7 @@ export function MessageList({
     const turnFinalAssistant = ratingFinal[it.idx] ?? false;
     const rowSig = messageSignature(it.m, { isLast: it.isLast, sending, turnFinalAssistant });
     return (
-      <MessageBoundary messageId={it.m.id} sig={rowSig}>
+      <MessageBoundary messageId={it.m._timelineUnitKey ?? it.m.id} sig={rowSig}>
         <MessageRenderer
           message={it.m}
           sig={rowSig}
@@ -1256,17 +1094,6 @@ export function MessageList({
           activityInFooter={sending}
           historyGeneration={historyGeneration}
           processPaging={processPaging}
-          autoLoadLatestProcessTail={it.m.id === latestProcessControl?.id}
-          automaticProcessLoading={
-            it.m.id === latestProcessControl?.id &&
-            automaticProcess?.generation === latestProcessGeneration &&
-            automaticProcess.loading
-          }
-          automaticProcessError={
-            it.m.id === latestProcessControl?.id &&
-            automaticProcess?.generation === latestProcessGeneration &&
-            automaticProcess.error
-          }
           delegateCost={it.delegateCost}
           turnFinalAssistant={turnFinalAssistant}
           cb={cb}
@@ -1276,36 +1103,28 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const renderVirtualItem = (item: VirtualItem) => item.kind === "tape-page" ? (
-    <div
-      data-tape-page-chunk
-      data-tape-page-key={item.pageKey}
-      data-chunk-items={item.members.length}
-    >
-      {item.members.map((member, index) => (
-        <div key={renderItemKey(member)} className={index > 0 ? "pt-4" : undefined}>
-          {renderItem(member)}
-        </div>
-      ))}
-    </div>
-  ) : renderItem(item);
-  const historyControl = archivedRemaining > 0 && archive ? (
+  const renderVirtualItem = renderItem;
+  const historyControl = archive && showHistoryBoundary ? (
     <div
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
       data-testid="history-page-loader"
     >
       <button
         type="button"
-        onClick={requestOlderArchive}
-        disabled={archive.loading || archiveQueued}
-        aria-busy={archive.loading || archiveQueued}
+        onClick={hasOlderHistory ? requestOlderArchive : undefined}
+        disabled={!hasOlderHistory || archive.loading || archiveQueued}
+        aria-busy={hasOlderHistory && (archive.loading || archiveQueued)}
         className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
-        {archive.loading || archiveQueued
+        {!hasOlderHistory
+          ? "已到最早记录"
+          : archive.loading || archiveQueued
           ? <><Spinner size={12} /> 加载中…</>
           : archive.error
             ? <span className="text-danger">加载失败，点击重试</span>
-            : `查看更早历史记录（还有 ${archivedRemaining} 条）`}
+            : legacyArchivedRemaining > 0
+              ? `查看更早历史记录（还有 ${legacyArchivedRemaining} 条）`
+              : "查看更早历史记录"}
       </button>
     </div>
   ) : null;

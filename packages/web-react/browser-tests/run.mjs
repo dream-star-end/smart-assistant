@@ -15,9 +15,8 @@
 //   T5 惰性 user sidecar 在真 viewport 水合为原文，重试收到同一份精确 payload;
 //   T6 惰性 Agent tape record 水合为真实 ToolCard，不显示 locator 替身;
 //   T7 点「+」→「设定目标」→ 目标对话框弹出(同菜单的第二入口回归对照)。
-//   T8 长时间线向上惰性分页:pointercancel 清理、同轮惯性只取一页、虚拟 remount
-//      不重取、插页后像素锚定;
-//   T9 第二次明确点击继续下一 cursor，第一批真实记录仍常驻内存;
+//   T8 统一时间线上滑零请求，显式点击只取一页，虚拟 remount 不重取;
+//   T9 第二次明确点击继续下一不透明 cursor，已加载真实记录仍常驻;
 //   T10 真 Virtuoso 归档前插足够多行后仍锁定点击前的真实可见消息。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
@@ -230,7 +229,7 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   if (afterCancel.length !== 0) {
     throw new Error(`pointercancel 后程序滚动被误判为手势:${JSON.stringify(afterCancel)}`);
   }
-  const anchor = root.locator('[data-chat-virtual-key^="tape-page:scroll-tail-page:"]').first();
+  const anchor = root.locator('[data-chat-virtual-key="outer:200:scroll-tail-0"]');
   await anchor.waitFor({ state: "attached", timeout: 3000 });
   const beforeBox = await anchor.boundingBox();
   if (!beforeBox) throw new Error("tail anchor has no layout box before paging");
@@ -251,9 +250,12 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   await loadButton.waitFor({ state: "visible", timeout: 3000 });
   await loadButton.click();
   await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 1, null, { timeout: 3000 });
-  await page.waitForTimeout(120);
+  await page.waitForFunction(() => {
+    const button = document.querySelector("#timeline-scroll-root [data-testid='history-page-loader'] button");
+    return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
+  }, null, { timeout: 3000 });
   const afterClick = await page.evaluate(() => window.__scrollTimeline.calls);
-  if (JSON.stringify(afterClick) !== JSON.stringify([200])) {
+  if (JSON.stringify(afterClick) !== JSON.stringify(["cursor-200"])) {
     throw new Error(`单次点击未严格加载一页:${JSON.stringify(afterClick)}`);
   }
   const afterBox = await anchor.boundingBox();
@@ -261,8 +263,8 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   const delta = Math.abs(afterBox.y - firstAnchorTop);
   if (delta > 2) throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
 
-  // Force the process row out of Virtuoso overscan and back using programmatic
-  // scroll only. This is the exact production remount that used to refetch.
+  // Force the first latest record out of Virtuoso overscan and back using
+  // programmatic scroll only. A remount must never refetch a resident page.
   await page.evaluate(() => {
     const node = document.querySelector("#timeline-scroll-root .timeline-scroll-probe");
     if (!(node instanceof HTMLElement)) throw new Error("missing scroll probe");
@@ -276,7 +278,7 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   });
   await page.waitForTimeout(300);
   const state = await page.evaluate(() => window.__scrollTimeline);
-  if (JSON.stringify(state.calls) !== JSON.stringify([200])) {
+  if (JSON.stringify(state.calls) !== JSON.stringify(["cursor-200"])) {
     throw new Error(`虚拟 remount 重复请求了 cursor:${JSON.stringify(state.calls)}`);
   }
   if (state.messageCount !== 163) {
@@ -290,14 +292,14 @@ await check("T9 再次上滑仍零请求，第二次点击才继续下一 cursor
   await page.mouse.wheel(0, -120);
   await page.waitForTimeout(200);
   const afterWheel = await page.evaluate(() => window.__scrollTimeline.calls);
-  if (JSON.stringify(afterWheel) !== JSON.stringify([200])) {
+  if (JSON.stringify(afterWheel) !== JSON.stringify(["cursor-200"])) {
     throw new Error(`第二次上滑错误触发请求:${JSON.stringify(afterWheel)}`);
   }
   await root.getByRole("button", { name: "查看更早历史记录" }).click();
   await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 2, null, { timeout: 3000 });
   await page.waitForTimeout(200);
   const state = await page.evaluate(() => window.__scrollTimeline);
-  if (JSON.stringify(state.calls) !== JSON.stringify([200, 100])) {
+  if (JSON.stringify(state.calls) !== JSON.stringify(["cursor-200", "cursor-100"])) {
     throw new Error(`cursor 顺序/次数错误:${JSON.stringify(state.calls)}`);
   }
   if (state.messageCount !== 227) {
@@ -313,14 +315,17 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   if ((await page.evaluate(() => window.__archiveTimeline.calls)) !== 0) {
     throw new Error("归档会话滚到顶部时错误自动请求");
   }
-  const anchor = root.locator('[data-chat-virtual-key="archive-tail-0"]');
+  const anchor = root.locator('[data-chat-virtual-key="outer:300:archive-tail-0"]');
   await anchor.waitFor({ state: "attached", timeout: 3000 });
   const beforeBox = await anchor.boundingBox();
   if (!beforeBox) throw new Error("归档前插前缺少可见锚点");
   const button = root.getByTestId("history-page-loader").getByRole("button");
   await button.click();
   await page.waitForFunction(() => window.__archiveTimeline.mergedPages === 1, null, { timeout: 3000 });
-  await page.waitForTimeout(250);
+  await page.waitForFunction(() => {
+    const button = document.querySelector("#timeline-archive-root [data-testid='history-page-loader'] button");
+    return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
+  }, null, { timeout: 3000 });
   const afterBox = await anchor.boundingBox();
   if (!afterBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
   const delta = Math.abs(afterBox.y - beforeBox.y);

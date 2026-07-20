@@ -40,7 +40,6 @@ import {
   shouldApplyGoalSnapshot,
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
-import { mergeTapePage } from "./directTimeline";
 import {
   isDispatchLostCode,
   isDispatchTerminalRow,
@@ -50,6 +49,7 @@ import {
   detectServerTerminalTurns,
   mergeArchivedHistory,
   mergeFullServerWins,
+  mergeTimelineHistoryPage,
   type ServerTurnTerminal,
   type StoredPendingDispatch,
   type StoredSession,
@@ -1865,7 +1865,10 @@ export class ChatSocket {
     const needsLocalSrcStrip = s.messages.some((m) => m._media?.some((r) => r.localSrc));
     const shouldStrip = (message: ChatMessage) =>
       !!message._genPlaceholder ||
+      message._timelineRecord === true ||
+      message._turnTapeProcess === true ||
       typeof message._turnTapeProcessLoadedFrom === "string" ||
+      typeof message._historyPageLoadedFrom === "string" ||
       message.id.startsWith("projection-") ||
       message.id.startsWith("oc-dispatch-err:") ||
       !!(message as ChatMessage & { _historyProjection?: unknown })._historyProjection;
@@ -1955,6 +1958,9 @@ export class ChatSocket {
         .filter((message) =>
           !message.id.startsWith("projection-") &&
           !message.id.startsWith("oc-dispatch-err:") &&
+          message._timelineRecord !== true &&
+          message._turnTapeProcess !== true &&
+          typeof message._historyPageLoadedFrom !== "string" &&
           !(message as ChatMessage & { _historyProjection?: unknown })._historyProjection,
         )
         .map((message) => {
@@ -2064,11 +2070,34 @@ export class ChatSocket {
       modelId?: string;
       /** History revision paired with maxSeq; set only after payload acceptance. */
       historyRevision?: number;
+      /** Stable cursor epoch for the unified real timeline. */
+      timelineGeneration?: number;
+      timelineCursor?: string | null;
+      timelineHasMore?: boolean;
+      timelineSnapshotMaxSeq?: number;
       /** Legacy backend fallback: invalidate hydrated history on every full read. */
       invalidateHistoryCache?: boolean;
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
+    const incomingTimelineGeneration = archive?.timelineGeneration;
+    const hasTimelineGeneration =
+      typeof incomingTimelineGeneration === "number" &&
+      Number.isSafeInteger(incomingTimelineGeneration) &&
+      incomingTimelineGeneration >= 1;
+    if (!hasTimelineGeneration && msgs.some((message) => message?._turnTapeProcess === true)) {
+      // Rolling predecessor payloads need their old process-card renderer.
+      // This bundle intentionally removed that substitute, so preserve the
+      // current transcript and let the build handshake safely reload rather
+      // than accepting a payload whose Agent process would become invisible.
+      return;
+    }
+    // Controls/projection remnants from rolling predecessor caches are never
+    // part of the real transcript and must not survive a unified read.
+    msgs = msgs.filter((message) =>
+      message?._turnTapeProcess !== true &&
+      !message?.id?.startsWith("projection-") &&
+      !message?.id?.startsWith("oc-dispatch-err:"));
     const archivedThroughSeq =
       typeof archive?.archivedThroughSeq === "number" && Number.isFinite(archive.archivedThroughSeq)
         ? archive.archivedThroughSeq
@@ -2094,10 +2123,37 @@ export class ChatSocket {
       typeof incomingHistoryRevision === "number" &&
       Number.isSafeInteger(incomingHistoryRevision) &&
       incomingHistoryRevision >= 0;
-    const historyRevisionChanged =
-      hasHistoryRevision && incomingHistoryRevision !== s._historyRevision;
-    const invalidateHistoryCache =
-      historyRevisionChanged || (full && archive?.invalidateHistoryCache === true);
+    const timelineGenerationChanged = hasTimelineGeneration &&
+      s._timelineGeneration !== undefined &&
+      incomingTimelineGeneration !== s._timelineGeneration;
+    const adoptingUnifiedTimeline = hasTimelineGeneration && s._timelineGeneration === undefined;
+    const invalidateHistoryCache = adoptingUnifiedTimeline || timelineGenerationChanged ||
+      (full && archive?.invalidateHistoryCache === true);
+    let authoritativeMessages = msgs;
+    if (hasTimelineGeneration && !timelineGenerationChanged) {
+      // Ordinary append/latest-page refresh must never evict records already
+      // loaded during this page lifetime. Merge by the server's logical unit
+      // identity, with the fresh snapshot updating mutable billing/status
+      // overlays in place.
+      const byUnit = new Map<string, ChatMessage>();
+      for (const message of s.messages) {
+        if (message._timelineRecord !== true) continue;
+        const key = message._timelineUnitKey ?? `id:${message.id}`;
+        byUnit.set(key, message);
+      }
+      for (const message of msgs) {
+        const key = message._timelineUnitKey ?? `id:${message.id}`;
+        const previous = byUnit.get(key);
+        byUnit.set(key, previous?._historyPageLoadedFrom && !message._historyPageLoadedFrom
+          ? {
+              ...message,
+              _historyPageLoadedFrom: previous._historyPageLoadedFrom,
+              _historyPageKey: previous._historyPageKey,
+            }
+          : message);
+      }
+      authoritativeMessages = [...byUnit.values()];
+    }
     // P1 缺席删除只在「载荷携带版本且 ≥ 水位」的 full 上授权;无版本信息的载荷照常合并但不授权
     // (缺席不可证)。活跃轮守卫:发送中的轮绝不被载荷自证清除 —— **但载荷携带该活跃轮的精确终态
     // 证据时给守卫开口**(server 权威胜),让合并按证据收敛本地乐观行,而非把已终态轮永久保护住。
@@ -2106,7 +2162,7 @@ export class ChatSocket {
       sendingCmid && terminalTurns.has(sendingCmid) ? undefined : sendingCmid;
     s.messages = full
       ? mergeFullServerWins(
-          msgs,
+          authoritativeMessages,
           s.messages,
           archivedThroughSeq,
           archive?.completedClientMessageId,
@@ -2114,14 +2170,30 @@ export class ChatSocket {
             deletionAuthority: hasVersion,
             activeClientMessageId,
             invalidateHistoryCache,
+            adoptUnifiedTimeline: adoptingUnifiedTimeline,
           },
         )
-      : applyServerIncremental(s.messages, msgs, archive?.completedClientMessageId, {
+      : applyServerIncremental(s.messages, authoritativeMessages, archive?.completedClientMessageId, {
           activeClientMessageId,
         });
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
       s._historyRevision = incomingHistoryRevision;
+    }
+    if (hasTimelineGeneration) {
+      const hadOlderPages = (s._historyPageSerial ?? 0) > 0 && !timelineGenerationChanged;
+      s._timelineGeneration = incomingTimelineGeneration;
+      if (!hadOlderPages) {
+        s._timelineCursor = typeof archive?.timelineCursor === "string"
+          ? archive.timelineCursor
+          : null;
+        s._timelineHasMore = archive?.timelineHasMore === true;
+      }
+      if (timelineGenerationChanged) s._historyPageSerial = 0;
+      if (
+        typeof archive?.timelineSnapshotMaxSeq === "number" &&
+        Number.isSafeInteger(archive.timelineSnapshotMaxSeq)
+      ) s._timelineSnapshotMaxSeq = archive.timelineSnapshotMaxSeq;
     }
     if (archivedThroughSeq > 0) s._archivedThroughSeq = archivedThroughSeq;
     if (typeof archive?.archivedCount === "number" && Number.isFinite(archive.archivedCount)) {
@@ -2202,41 +2274,48 @@ export class ChatSocket {
     this.scheduleNotify();
   }
 
+  /** Merge exactly one user-requested older page. No persistence, eviction,
+   * scroll observer or live normalizer participates; refresh is the cache
+   * boundary and a true timeline-generation change replaces the stream. */
+  prependTimelinePage(
+    sessId: string,
+    msgs: ChatMessage[],
+    loadedFrom: string,
+    nextCursor: string | null,
+    hasMore: boolean,
+    timelineGeneration: number,
+  ): void {
+    const s = this.sessions.get(sessId);
+    if (
+      !s || s._timelineGeneration !== timelineGeneration ||
+      s._timelineCursor !== loadedFrom
+    ) return;
+    const serial = (s._historyPageSerial ?? 0) + 1;
+    const pageKey = `history-page:${timelineGeneration}:${serial}`;
+    const page = msgs.map((message) => ({
+      ...message,
+      _source: "server" as const,
+      _timelineRecord: true,
+      _historyPageLoadedFrom: loadedFrom,
+      _historyPageKey: pageKey,
+    }));
+    s.messages = mergeTimelineHistoryPage(s.messages, page);
+    s._historyPageSerial = serial;
+    s._timelineCursor = nextCursor;
+    s._timelineHasMore = hasMore && typeof nextCursor === "string" && nextCursor.length > 0;
+    s._blockIdToMsgId = new Map();
+    s._agentGroups = new Map();
+    rebuildIndexes(s);
+    // Historical rows are already the exact Agent records. Do not run
+    // delegate/goal/card normalizers that can group or rewrite them.
+    this.scheduleNotify();
+  }
+
   /** Archive-page revision mismatch recovery. Bypass the ordinary debounce:
    * the page was captured from a different history generation, so a full
    * history reconciliation is required before retrying pagination. */
   syncHistoryNow(sessId: string): void {
     void this.deps.syncSession?.(sessId);
-  }
-
-  /**
-   * 将一页真实 immutable tape records 并入过程控制行之后。定位只按
-   * (_turnTapeId,tapeSha,control id)，不会按共享 _seq 批量替换其它内容。
-   *
-   * **展开行共享 anchor 的 _seq/_orderSeq**(沿用"归档 anchor 展开共享 _seq"既有语义)→ 不新增
-   * distinct _seq,故**不推进同步游标、不改 maxSeq/totalMessageCount 口径**(按 anchor 计不变)。
-   * 分页续拉:anchor 已展开时**追加**新页(按 id 去重),更新 `_turnTapeProcessCursor`(null=已拉全)。
-   */
-  applyTapeRecordsPage(
-    sessId: string,
-    anchorId: string,
-    records: ChatMessage[],
-    nextCursor: number | null,
-  ): void {
-    const s = this.sessions.get(sessId);
-    if (!s) return;
-    const next = mergeTapePage(s.messages, anchorId, records, nextCursor);
-    if (!next || next === s.messages) return;
-    s.messages = next;
-    s._blockIdToMsgId = new Map();
-    s._agentGroups = new Map();
-    rebuildIndexes(s);
-    // Immutable lazy rows are the Agent's actual persisted transcript. Do not
-    // run live-display normalizers here: delegate normalization can rewrite or
-    // drop rows, and goal normalization collapses distinct historical events.
-    s.messages = repairPostFinalProcessOrder(s.messages);
-    this.deps.persistSession?.(sessId);
-    this.scheduleNotify();
   }
 
   /**

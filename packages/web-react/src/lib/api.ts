@@ -60,8 +60,8 @@ import type {
   SessionArchivePage,
   SessionDetail,
   SessionMeta,
+  SessionTimelinePage,
   TapeRecordPayload,
-  TapeRecordsPage,
   SubscriptionPlanWire,
   MySubscription,
   UsageQuery,
@@ -1515,7 +1515,9 @@ export const api = {
         }),
       ),
     );
-    return request(suffix).then((detail) => {
+    return request(suffix).then(async (initial) => {
+      let detail = initial;
+      let historyRevisionUnsupported = false;
       if (
         !Number.isSafeInteger(detail.historyRevision)
         || (detail.historyRevision as number) < 0
@@ -1525,11 +1527,28 @@ export const api = {
         // request once as full, and mark every legacy full so callers evict
         // hydrated history caches during a coordinated downgrade.
         if (sinceSeq > 0) {
-          return request("").then((full) => ({ ...full, _historyRevisionUnsupported: true as const }));
+          detail = await request("");
         }
-        return { ...detail, _historyRevisionUnsupported: true as const };
+        historyRevisionUnsupported = true;
       }
-      return detail;
+      if (
+        !Number.isSafeInteger(detail.timelineGeneration) ||
+        (detail.timelineGeneration as number) < 1
+      ) {
+        // New bundles must never consume the predecessor's “final locator +
+        // process control” wire: this build deliberately has no substitute
+        // process card. During an atomic release rollback, keep the current
+        // real timeline untouched; the existing WS build handshake performs
+        // the bounded safe reload to the matching predecessor bundle.
+        throw new ApiError({
+          status: 409,
+          code: "TIMELINE_CAPABILITY_MISMATCH",
+          message: "版本切换中，正在恢复匹配的会话界面。",
+        });
+      }
+      return historyRevisionUnsupported
+        ? { ...detail, _historyRevisionUnsupported: true as const }
+        : detail;
     });
   },
 
@@ -1606,46 +1625,22 @@ export const api = {
     );
   },
 
-  /** 不可变 turn-tape 记录分页。页大小是批次，不是总内容上限。 */
-  getTapeRecords: (
+  /** Explicit older-page read for the one real history timeline. No scroll
+   * observer calls this method; the user-facing top button is the sole trigger. */
+  getSessionTimelinePage: (
     a: AuthSession,
     id: string,
-    tapeId: string,
-    cursor: number | null = null,
-    limit = 200,
-  ): Promise<TapeRecordsPage> => {
-    const params = new URLSearchParams();
-    if (typeof cursor === "number" && cursor > 0) params.set("cursor", String(cursor));
+    cursor: string,
+    limit = 100,
+  ): Promise<SessionTimelinePage> => {
+    const params = new URLSearchParams({ cursor });
     if (limit > 0) params.set("limit", String(limit));
-    const qs = params.toString();
-    return jsonOrThrow<TapeRecordsPage>(
+    return jsonOrThrow<SessionTimelinePage>(
       callWithRefresh(a, (t) =>
-        fetch(
-          `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}/records${qs ? `?${qs}` : ""}`,
-          { credentials: "include", headers: bearerHeaders(t) },
-        ),
-      ),
-    );
-  },
-
-  /** 不可变 turn-tape 尾部/更早记录分页。`before` 严格 exclusive；null=尾页。
-   * 独立于旧 cursor 正向契约，保证滚动发布期间 Web/Admin 兼容。 */
-  getTapeRecordsBefore: (
-    a: AuthSession,
-    id: string,
-    tapeId: string,
-    before: number | null = null,
-    limit = 200,
-  ): Promise<TapeRecordsPage> => {
-    const params = new URLSearchParams();
-    params.set("before", typeof before === "number" ? String(before) : "tail");
-    if (limit > 0) params.set("limit", String(limit));
-    return jsonOrThrow<TapeRecordsPage>(
-      callWithRefresh(a, (t) =>
-        fetch(
-          `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}/records?${params}`,
-          { credentials: "include", headers: bearerHeaders(t) },
-        ),
+        fetch(`/api/sessions/${encodeURIComponent(id)}/timeline?${params}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
       ),
     );
   },

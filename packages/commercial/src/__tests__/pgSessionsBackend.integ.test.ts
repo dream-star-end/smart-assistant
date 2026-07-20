@@ -18,7 +18,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Pool } from "pg";
-import type { ClientSession, MessageLike } from "@openclaude/storage";
+import type { ClientSession, ClientTimelineCursor, MessageLike } from "@openclaude/storage";
 import { LOSSLESS_TURN_TAPE_PART_BYTES, LOSSLESS_TURN_TAPE_VERSION } from "@openclaude/protocol";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -35,6 +35,7 @@ import {
   resolveManualReconcile,
   scanOpenSessionGone,
 } from "../dispatch/turnDispatchStore.js";
+import { runReconcileTick } from "../dispatch/turnDispatchReconciler.js";
 import { _sanitizeMasterHistoricalMessagesForFrame } from "../ws/userChatBridge.js";
 
 const TEST_DB_URL =
@@ -54,6 +55,7 @@ const MIGRATION_0170 = path.resolve(here, "../db/migrations/0170_durable_turn_di
 const MIGRATION_0175 = path.resolve(here, "../db/migrations/0175_client_session_history_revision.sql");
 const MIGRATION_0173 = path.resolve(here, "../db/migrations/0173_client_session_model.sql");
 const MIGRATION_0176 = path.resolve(here, "../db/migrations/0176_direct_turn_timeline.sql");
+const MIGRATION_0177 = path.resolve(here, "../db/migrations/0177_unified_client_timeline.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -172,6 +174,7 @@ before(async () => {
     );
   }
   await pool.query(await readFile(MIGRATION_0176, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0177, { encoding: "utf8" }));
   migration0176EscapedNulBackfill = (
     await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
       `SELECT physical_record_count, logical_record_count, record_payload_bytes::text
@@ -351,6 +354,9 @@ describe("pgSessionsBackend contract", () => {
     let full = await backend.getClientSession(sessionId, "u-1");
     assert.ok(full);
     assert.equal(full.historyRevision, 0);
+    assert.equal(full.timelineGeneration, 1);
+    const timelineBefore = await backend.readClientTimelinePage(sessionId, "u-1", null, 1);
+    assert.ok(timelineBefore?.nextCursor, "two real records must yield one older-page cursor");
 
     assert.equal((await backend.getClientSessionPartial(sessionId, "u-1", 1))?.isPartial, false);
     assert.equal((await backend.getClientSessionPartial(sessionId, "u-1", 1, {
@@ -372,9 +378,117 @@ describe("pgSessionsBackend contract", () => {
     assert.equal(repaired.isPartial, false);
     assert.equal(repaired.historyRevision, 1);
     assert.deepEqual((repaired.messages as MessageLike[]).map((message) => message.id), ["hr-1"]);
+    await assert.rejects(
+      backend.readClientTimelinePage(sessionId, "u-1", timelineBefore!.nextCursor, 1),
+      { name: "ClientTimelineCursorStaleError" },
+    );
 
     full = await backend.getClientSession(sessionId, "u-1");
     assert.equal(full?.historyRevision, 1);
+    assert.equal(full?.timelineGeneration, 2);
+  });
+
+  maybe("timeline detail metadata and latest page share one repeatable-read snapshot", async () => {
+    const sessionId = "s-timeline-snapshot";
+    const userId = "u-timeline-snapshot";
+    await backend.upsertClientSession(mkSession({
+      id: sessionId,
+      userId,
+      messages: [{ id: "snapshot-a", role: "user", text: "A", ts: 1 }],
+      updatedAt: 100,
+    }));
+
+    const appendBetweenDetailAndPage = async (id: string, text: string) => {
+      const current = (
+        await pool.query<{ messages: string; next_seq: number; updated_at: string }>(
+          "SELECT messages,next_seq,updated_at::text FROM client_sessions WHERE id=$1 AND user_id=$2",
+          [sessionId, userId],
+        )
+      ).rows[0]!;
+      const messages = JSON.parse(current.messages) as MessageLike[];
+      const seq = current.next_seq;
+      messages.push({
+        id,
+        role: "user",
+        text,
+        ts: seq,
+        _source: "server",
+        _seq: seq,
+        _orderSeq: seq,
+      });
+      await pool.query(
+        `UPDATE client_sessions
+            SET messages=$3,message_count=$4,next_seq=$5,last_at=$6,
+                updated_at=updated_at+10,history_revision=history_revision+1,
+                timeline_generation=timeline_generation+1
+          WHERE id=$1 AND user_id=$2`,
+        [sessionId, userId, JSON.stringify(messages), messages.length, seq + 1, seq],
+      );
+    };
+
+    const backendWithInterleave = (interleave: () => Promise<void>): PgSessionsBackend => {
+      let fired = false;
+      const proxyPool = {
+        query: (...args: unknown[]) => (pool.query as (...queryArgs: unknown[]) => unknown)(...args),
+        connect: async () => {
+          const client = await pool.connect();
+          const query = client.query.bind(client) as (...queryArgs: unknown[]) => Promise<unknown>;
+          return new Proxy(client, {
+            get(target, property, receiver) {
+              if (property === "query") {
+                return async (...args: unknown[]) => {
+                  const result = await query(...args);
+                  const first = args[0] as string | { text?: string } | undefined;
+                  const sql = typeof first === "string" ? first : first?.text ?? "";
+                  if (!fired && /SELECT\s+cs\.id,\s*cs\.user_id/i.test(sql)) {
+                    fired = true;
+                    await interleave();
+                  }
+                  return result;
+                };
+              }
+              const value = Reflect.get(target, property, receiver) as unknown;
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      };
+      return createPgSessionsBackend(proxyPool as unknown as Pool, {
+        expectedGeneration: GENERATION,
+      });
+    };
+
+    const first = await backendWithInterleave(
+      () => appendBetweenDetailAndPage("snapshot-b", "B"),
+    ).getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(first);
+    assert.equal(first.timelineGeneration, 1);
+    assert.deepEqual((first.messages as MessageLike[]).map((message) => message.id), ["snapshot-a"]);
+
+    const current = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(current);
+    assert.equal(current.timelineGeneration, 2);
+    assert.ok(current.updatedAt > first.updatedAt);
+    assert.deepEqual((current.messages as MessageLike[]).map((message) => message.id), [
+      "snapshot-a", "snapshot-b",
+    ]);
+
+    const partial = await backendWithInterleave(
+      () => appendBetweenDetailAndPage("snapshot-c", "C"),
+    ).getClientSessionPartial(sessionId, userId, 0, { view: "timeline" });
+    assert.ok(partial);
+    assert.equal(partial.timelineGeneration, 2);
+    assert.equal(partial.updatedAt, current.updatedAt);
+    assert.deepEqual((partial.messages as MessageLike[]).map((message) => message.id), [
+      "snapshot-a", "snapshot-b",
+    ]);
+
+    const latest = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.equal(latest?.timelineGeneration, 3);
+    assert.ok((latest?.updatedAt ?? 0) > partial.updatedAt);
+    assert.deepEqual((latest!.messages as MessageLike[]).map((message) => message.id), [
+      "snapshot-a", "snapshot-b", "snapshot-c",
+    ]);
   });
 
   maybe("classifyClientSessions 批量区分 active/deleted/missing 并保序", async () => {
@@ -604,6 +718,21 @@ describe("pgSessionsBackend contract", () => {
     const got = await backend.getClientSession("s-arch", "u-1");
     const archived = got!.archivedCount ?? 0;
     assert.ok(archived > 0);
+    const timelinePage = await backend.readClientTimelinePage("s-arch", "u-1", null, 10);
+    assert.ok(timelinePage?.nextCursor);
+    const timelineGeneration = timelinePage!.timelineGeneration;
+    assert.deepEqual(await backend.appendServerAuthoredMessage("s-arch", "u-1", {
+      id: "a-new", role: "assistant", text: big,
+    }), { applied: true });
+    assert.ok(
+      ((await backend.getClientSession("s-arch", "u-1"))?.archivedCount ?? 0) > archived,
+      "the append must move another immutable hot prefix into archive storage",
+    );
+    const afterSpill = await backend.readClientTimelinePage(
+      "s-arch", "u-1", timelinePage!.nextCursor, 10,
+    );
+    assert.equal(afterSpill?.timelineGeneration, timelineGeneration,
+      "hot-to-archive movement must not invalidate an immutable timeline cursor");
     const page1 = await backend.readArchivedMessages("s-arch", "u-1", 0, 10);
     assert.ok(page1.messages.length <= 10);
     // 升序
@@ -1519,13 +1648,12 @@ describe("pgSessionsBackend lossless turn tape", () => {
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
     const timelineMessages = timeline.messages as MessageLike[];
-    assert.equal(timelineMessages.some((message) => message._runtimeEvent !== undefined), false,
-      "initial browser timeline must stay small until the genuine process rows are requested");
+    assert.equal(timelineMessages.some((message) => message._runtimeEvent !== undefined), true,
+      "the newest unified page directly contains the genuine runtime records");
     assert.equal(timelineMessages.filter((message) => message.role === "assistant").length, 1);
-    assert.equal(timelineMessages.filter((message) => message.role === "tool").length, 0,
-      "tool output is not copied into a second representation");
-    assert.equal(timelineMessages.filter((message) => message._turnTapeProcess === true).length, 2,
-      "the original turn and its continuation each expose a lazy cursor over their true tape rows");
+    assert.equal(timelineMessages.filter((message) => message.role === "tool").length, 1);
+    assert.equal(timelineMessages.some((message) => message._turnTapeProcess === true), false);
+    assert.equal(timelineMessages.every((message) => message._timelineRecord === true), true);
 
     const originalSeq = Math.min(...timelineMessages.flatMap((message) =>
       typeof message._seq === "number" ? [message._seq] : []));
@@ -1535,12 +1663,12 @@ describe("pgSessionsBackend lossless turn tape", () => {
       originalSeq,
       { view: "timeline", sinceHistoryRevision: timeline.historyRevision },
     );
-    assert.ok(incremental?.isPartial);
-    assert.equal((incremental.messages as MessageLike[]).some((message) => message.role === "tool"), false,
-      "tail-only incremental does not refetch the owning tape");
+    assert.equal(incremental?.isPartial, false,
+      "timeline refreshes replace only the newest unified page, never a semantic subset");
+    assert.equal((incremental!.messages as MessageLike[]).some((message) => message.role === "tool"), true);
     assert.equal((incremental.messages as MessageLike[]).some(
-      (message) => message._turnTapeProcess === true && message._turnTapeId === continuation.finalize.tapeId,
-    ), true, "incremental refresh exposes the real continuation tape cursor, not a synthetic patch");
+      (message) => message._turnTapeId === continuation.finalize.tapeId && message._runtimeEvent !== undefined,
+    ), true, "refresh returns the real continuation record, not a synthetic patch");
   });
 
   maybe("runtime-event batches reduce physical rows but exact hydration restores every logical payload", async () => {
@@ -1596,14 +1724,15 @@ describe("pgSessionsBackend lossless turn tape", () => {
       const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
       assert.ok(timeline);
       const timelineMessages = timeline.messages as MessageLike[];
-      assert.equal(timelineMessages.some((message) => message._runtimeEvent !== undefined), false);
+      assert.equal(timelineMessages.filter((message) => message._runtimeEvent !== undefined).length, 8);
       const visibleAnswer = timelineMessages.find((message) => message.role === "assistant");
-      assert.equal(visibleAnswer?._payloadDeferred, true);
-      assert.equal(
-        (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, visibleAnswer!)).text,
-        "visible answer",
+      assert.equal(visibleAnswer?.text, "visible answer");
+      assert.equal(timelineMessages.some((message) => message._turnTapeProcess === true), false);
+      assert.deepEqual(
+        timelineMessages.filter((message) => message._runtimeEvent !== undefined)
+          .map((message) => message._ocEventOrdinal),
+        runtimeEvents.map((event) => event.ordinal),
       );
-      assert.equal(timelineMessages.some((message) => message._turnTapeProcess === true), true);
       const storage = await pool.query<{ record_storage_format: number }>(
         `SELECT record_storage_format FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
@@ -2014,6 +2143,133 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(dd.kind, "deduplicated");
   });
 
+  maybe("verified status atomically invalidates unified cursors and stays immediately after its skewed user", async () => {
+    const sessionId = "s-dd-visible-status";
+    const clientMessageId = "cm-dd-visible-status";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+    const admitted = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId,
+      message: {
+        id: clientMessageId,
+        role: "user",
+        text: "future-clock user",
+        // Deliberately newer than the server terminal clock. Durable order,
+        // not clock skew, must place the verified status after this row.
+        ts: 9_000_000_000_000,
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(admitted.kind, "admitted");
+    const dispatch = (admitted as { dispatch: { dispatchId: string } }).dispatch;
+
+    const raw = (
+      await pool.query<{ messages: string; next_seq: number }>(
+        "SELECT messages,next_seq FROM client_sessions WHERE id=$1 AND user_id=$2",
+        [sessionId, CUSER],
+      )
+    ).rows[0]!;
+    const messages = JSON.parse(raw.messages) as MessageLike[];
+    for (let seq = raw.next_seq; seq < raw.next_seq + 130; seq++) {
+      messages.push({
+        id: `status-tail-${seq}`,
+        role: "assistant",
+        text: `tail ${seq}`,
+        ts: seq,
+        _source: "server",
+        _seq: seq,
+        _orderSeq: seq,
+      });
+    }
+    await pool.query(
+      `UPDATE client_sessions
+          SET messages=$3,message_count=$4,next_seq=$5,last_at=$6,updated_at=updated_at+1
+        WHERE id=$1 AND user_id=$2`,
+      [
+        sessionId,
+        CUSER,
+        JSON.stringify(messages),
+        messages.length,
+        raw.next_seq + 130,
+        raw.next_seq + 129,
+      ],
+    );
+    assert.ok(await casToTerminal(pool, {
+      dispatchId: dispatch.dispatchId,
+      outcome: "executed_error",
+      failureCode: "RESULT_RECOVERY_PENDING",
+      clientNotified: false,
+    }));
+
+    const before = await backend.readClientTimelinePage(sessionId, CUSER, null, 100);
+    assert.ok(before?.nextCursor, "long real timeline must issue an older-page cursor");
+    const identityBefore = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        "SELECT history_revision::text,timeline_generation::text FROM client_sessions WHERE id=$1 AND user_id=$2",
+        [sessionId, CUSER],
+      )
+    ).rows[0]!;
+
+    const counts = await runReconcileTick({
+      pool,
+      container: {
+        rejectIfAbsent: async () => ({ kind: "unreachable" as const, detail: "not used" }),
+        getDispatchState: async () => ({ kind: "unreachable" as const, detail: "not used" }),
+      },
+      assessBilling: async () => "not_billed",
+      now: () => Date.now(),
+    });
+    assert.equal(counts.visibleFailures, 1);
+    assert.equal(counts.notified, 1);
+
+    const identityAfter = (
+      await pool.query<{ history_revision: string; timeline_generation: string }>(
+        "SELECT history_revision::text,timeline_generation::text FROM client_sessions WHERE id=$1 AND user_id=$2",
+        [sessionId, CUSER],
+      )
+    ).rows[0]!;
+    assert.equal(BigInt(identityAfter.history_revision), BigInt(identityBefore.history_revision) + 1n);
+    assert.equal(BigInt(identityAfter.timeline_generation), BigInt(identityBefore.timeline_generation) + 1n);
+    await assert.rejects(
+      backend.readClientTimelinePage(sessionId, CUSER, before!.nextCursor, 100),
+      { name: "ClientTimelineCursorStaleError" },
+    );
+
+    let cursor: ClientTimelineCursor | null = null;
+    let hasMore = true;
+    const all: MessageLike[] = [];
+    while (hasMore) {
+      const page = await backend.readClientTimelinePage(sessionId, CUSER, cursor, 100);
+      assert.ok(page);
+      all.unshift(...page.messages);
+      cursor = page.nextCursor;
+      hasMore = page.hasMore;
+    }
+    const userIndex = all.findIndex((message) => message.id === clientMessageId);
+    const statusIndex = all.findIndex((message) => message.id === `turn-status:${dispatch.dispatchId}`);
+    assert.equal(statusIndex, userIndex + 1);
+    assert.equal(all[userIndex]!._orderSeq, all[statusIndex]!._orderSeq);
+    assert.equal(all[statusIndex]!._timelineLogicalOrdinal, 1);
+    assert.ok((all[userIndex]!.ts ?? 0) > (all[statusIndex]!.ts ?? 0),
+      "clock skew fixture must prove timestamp sorting would have been wrong");
+
+    const second = await runReconcileTick({
+      pool,
+      container: {
+        rejectIfAbsent: async () => ({ kind: "unreachable" as const, detail: "not used" }),
+        getDispatchState: async () => ({ kind: "unreachable" as const, detail: "not used" }),
+      },
+      assessBilling: async () => "not_billed",
+    });
+    assert.equal(second.visibleFailures, 0);
+    const identityReplay = (
+      await pool.query<{ timeline_generation: string }>(
+        "SELECT timeline_generation::text FROM client_sessions WHERE id=$1 AND user_id=$2",
+        [sessionId, CUSER],
+      )
+    ).rows[0]!;
+    assert.equal(identityReplay.timeline_generation, identityAfter.timeline_generation);
+  });
+
   maybe("超 4 MiB 用户消息受理为精确侧车:热行恒小、范围读无损、模型上下文仍取真实文本", async () => {
     const sessionId = "s-dd-large-user";
     const clientMessageId = "cm-dd-large-user";
@@ -2346,12 +2602,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       assert.equal(row!.clientNotified, false);
       const after = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
       assert.ok(!after!.messages.some((m) => (m as MessageLike)._turnStatusRecord === true));
-      const finalLocator = (after!.messages as MessageLike[]).find((m) => m.role === "assistant");
-      assert.equal(finalLocator?._payloadDeferred, true);
-      assert.equal(
-        (await readDeferredRecord(sessionId, CUSER, tape.finalize.tapeId, finalLocator!)).text,
-        `real ${tapeStatus} transcript`,
-      );
+      const finalRecord = (after!.messages as MessageLike[]).find((m) => m.role === "assistant");
+      assert.equal(finalRecord?.text, `real ${tapeStatus} transcript`);
+      assert.equal(finalRecord?._timelineRecord, true);
     });
   }
 
@@ -2408,12 +2661,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     const after = await backend.getClientSession("s-dd-late-3", CUSER, { view: "timeline" });
     assert.ok(!after!.messages.some((m) => (m as MessageLike)._turnStatusRecord === true),
       "late truth removes the stale failure status from the browser timeline");
-    const finalLocator = (after!.messages as MessageLike[]).find((m) => m.role === "assistant");
-    assert.equal(finalLocator?._payloadDeferred, true);
-    assert.equal(
-      (await readDeferredRecord("s-dd-late-3", CUSER, tape.finalize.tapeId, finalLocator!)).text,
-      "迟到的真回复",
-    );
+    const finalRecord = (after!.messages as MessageLike[]).find((m) => m.role === "assistant");
+    assert.equal(finalRecord?.text, "迟到的真回复");
+    assert.equal(finalRecord?._timelineRecord, true);
   });
 });
 
@@ -2672,23 +2922,18 @@ describe("pgSessionsBackend direct turn timeline", () => {
     const raceFinal = (timeline.messages as MessageLike[]).find(
       (message) => message.role === "assistant",
     );
-    assert.equal(raceFinal?._payloadDeferred, true);
-    assert.equal(
-      (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, raceFinal!)).text,
-      "race final exact",
-    );
-    assert.equal(
-      (timeline.messages as MessageLike[]).find((message) => message._turnTapeProcess === true)
-        ?._turnTapeProcessCount,
-      1,
-    );
+    assert.equal(raceFinal?.text, "race final exact");
+    assert.equal((timeline.messages as MessageLike[]).find(
+      (message) => message.role === "thinking")?.text, "race thinking");
+    assert.equal((timeline.messages as MessageLike[]).some(
+      (message) => message._turnTapeProcess === true), false);
     assert.equal(
       await backend.hasCompletedClientTurn(sessionId, userId, "cm-migration-race"),
       true,
     );
   });
 
-  maybe("timeline returns exact final/process locators and lazily exposes every semantic row", async () => {
+  maybe("unified timeline returns every latest semantic record directly and pages older physical units exactly once", async () => {
     const sessionId = "s-direct-timeline-truth";
     const userId = "u-direct-timeline-truth";
     const turnKey = "1".repeat(64);
@@ -2727,20 +2972,31 @@ describe("pgSessionsBackend direct turn timeline", () => {
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
     const initial = timeline.messages as MessageLike[];
-    const finalLocator = initial.find((message) => message.role === "assistant");
-    assert.equal(finalLocator?._payloadDeferred, true);
-    assert.equal(
-      (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, finalLocator!)).text,
-      "这是 Agent 的真实最终回答",
-    );
-    assert.equal(initial.some((message) => message.role === "thinking"), false);
-    assert.equal(initial.some((message) => message.role === "tool"), false);
-    assert.equal(initial.some((message) => message._runtimeEvent !== undefined), false);
-    const process = initial.find((message) => message._turnTapeProcess === true);
-    assert.ok(process);
-    assert.equal(process._turnTapeId, tape.finalize.tapeId);
-    assert.equal(process._turnTapeProcessCount, 3);
-    assert.equal(process._clientMessageId, "cm-direct-truth");
+    assert.deepEqual(initial.map((message) => message.role), [
+      "user", "thinking", "tool", "runtime-event", "assistant",
+    ]);
+    assert.equal(initial.find((message) => message.role === "thinking")?.text, "逐步分析真实内容");
+    assert.equal(initial.find((message) => message.role === "tool")?.text, "真实工具输出");
+    assert.equal(initial.find((message) => message.role === "assistant")?.text, "这是 Agent 的真实最终回答");
+    assert.equal(initial.some((message) => message._runtimeEvent !== undefined), true);
+    assert.equal(initial.some((message) => message._turnTapeProcess === true), false);
+    assert.ok(initial.every((message) => message._timelineRecord === true));
+
+    let cursor: ClientTimelineCursor | null = null;
+    let hasMore = true;
+    const traversed: MessageLike[] = [];
+    while (hasMore) {
+      const one = await backend.readClientTimelinePage(sessionId, userId, cursor, 2);
+      assert.ok(one);
+      traversed.unshift(...one.messages);
+      cursor = one.nextCursor;
+      hasMore = one.hasMore;
+      assert.equal(hasMore, cursor !== null);
+    }
+    assert.deepEqual(traversed.map((message) => message.role), [
+      "user", "thinking", "tool", "runtime-event", "assistant",
+    ]);
+    assert.equal(new Set(traversed.map((message) => message._timelineUnitKey)).size, traversed.length);
 
     const page = await backend.listTurnTapeRecords(
       sessionId, userId, tape.finalize.tapeId, 0, 200,
@@ -2759,7 +3015,7 @@ describe("pgSessionsBackend direct turn timeline", () => {
     ), true, "opaque audit evidence remains server-side");
   });
 
-  maybe("initial timeline shows only the billing anchor while earlier assistant segments stay in process order", async () => {
+  maybe("initial unified timeline keeps intermediate assistant, tool and final records in exact process order", async () => {
     const sessionId = "s-direct-final-anchor-only";
     const userId = "u-direct-final-anchor-only";
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
@@ -2783,13 +3039,14 @@ describe("pgSessionsBackend direct turn timeline", () => {
 
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
-    const locators = (timeline.messages as MessageLike[]).filter(
-      (message) => message._payloadDeferred === true,
-    );
-    assert.equal(locators.length, 1);
-    assert.equal((await readDeferredRecord(
-      sessionId, userId, tape.finalize.tapeId, locators[0]!,
-    )).text, "最终结论");
+    assert.deepEqual((timeline.messages as MessageLike[]).map(
+      (message) => [message.role, message.text]), [
+      ["assistant", "中间说明"],
+      ["tool", "between output"],
+      ["assistant", "最终结论"],
+    ]);
+    assert.equal((timeline.messages as MessageLike[]).some(
+      (message) => message._payloadDeferred === true || message._turnTapeProcess === true), false);
 
     const page = await backend.listTurnTapeRecords(
       sessionId, userId, tape.finalize.tapeId, 0, 200,
@@ -2799,7 +3056,8 @@ describe("pgSessionsBackend direct turn timeline", () => {
       ["assistant", "中间说明"],
       ["tool", "between output"],
     ]);
-    assert.equal(page.records.some((message) => message.id === locators[0]!.id), false);
+    assert.equal(page.records.some((message) => message.text === "最终结论"), false,
+      "the compatibility per-tape endpoint still excludes only its separately rendered billing anchor");
   });
 
   maybe("user tape API preserves future Agent fields while stripping only known private runtime data", async () => {
@@ -2870,13 +3128,10 @@ describe("pgSessionsBackend direct turn timeline", () => {
     assert.ok(page);
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
-    const finalLocator = (timeline.messages as MessageLike[]).find(
-      (message) => message._payloadDeferred === true,
+    const final = (timeline.messages as MessageLike[]).find(
+      (message) => message.role === "assistant",
     );
-    assert.ok(finalLocator);
-    const final = await readDeferredRecord(
-      sessionId, userId, tape.finalize.tapeId, finalLocator,
-    );
+    assert.ok(final);
     const wire = JSON.stringify({ page, final });
     for (const secret of [
       "BALANCE_SECRET", "PLAN_SECRET", "DEV_SECRET", "/INTERNAL/CWD/SECRET",
@@ -3083,16 +3338,28 @@ describe("pgSessionsBackend direct turn timeline", () => {
 
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     const initial = timeline!.messages as MessageLike[];
-    const finalLocator = initial.find((message) => message.role === "assistant");
-    assert.equal(finalLocator?._payloadDeferred, true);
-    assert.equal(
-      (await readDeferredRecord(sessionId, userId, tape.finalize.tapeId, finalLocator!)).text,
-      "全部过程完成",
-    );
-    assert.equal(
-      initial.find((message) => message._turnTapeProcess === true)?._turnTapeProcessCount,
-      530,
-    );
+    assert.equal(initial.length, 100, "initial selection is one bounded newest-record page");
+    assert.equal(initial.at(-1)?.role, "assistant");
+    assert.equal(initial.at(-1)?.text, "全部过程完成");
+    assert.equal(initial.some((message) => message._turnTapeProcess === true), false);
+    assert.equal(timeline!.timelineHasMore, true);
+
+    let timelineCursor: ClientTimelineCursor | null = null;
+    let timelineHasMore = true;
+    const allTimeline: MessageLike[] = [];
+    while (timelineHasMore) {
+      const timelinePage = await backend.readClientTimelinePage(
+        sessionId, userId, timelineCursor, 200,
+      );
+      assert.ok(timelinePage);
+      allTimeline.unshift(...timelinePage.messages);
+      timelineCursor = timelinePage.nextCursor;
+      timelineHasMore = timelinePage.hasMore;
+    }
+    assert.equal(allTimeline.length, 531);
+    assert.equal(new Set(allTimeline.map((message) => message._timelineUnitKey)).size, 531);
+    assert.equal(allTimeline.filter((message) => message.role === "tool").length, 530);
+    assert.equal(allTimeline.at(-1)?.text, "全部过程完成");
   });
 
   maybe("an oversized physical record streams its exact post-redaction JSON bytes with no content ceiling", async () => {
@@ -3160,7 +3427,7 @@ describe("pgSessionsBackend direct turn timeline", () => {
     ), null);
   });
 
-  maybe("timeline GET stays locator-sized across many large final answers", async () => {
+  maybe("timeline GET returns many sub-quantum final answers exactly without substitution", async () => {
     const sessionId = "s-direct-many-large-finals";
     const userId = "u-direct-many-large-finals";
     await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
@@ -3184,11 +3451,11 @@ describe("pgSessionsBackend direct turn timeline", () => {
     const wire = JSON.stringify(timeline);
     const finals = (timeline.messages as MessageLike[]).filter((message) => message.role === "assistant");
     assert.equal(finals.length, count);
-    assert.equal(finals.every((message) => message._payloadDeferred === true), true);
-    assert.ok(Buffer.byteLength(wire, "utf8") < 100_000,
-      "session GET must not amplify hot anchors into every assistant BYTEA");
-    assert.equal(wire.includes("LARGE-FINAL-0-TAIL"), false);
-    assert.equal(wire.includes(`LARGE-FINAL-${count - 1}-TAIL`), false);
+    assert.equal(finals.every((message) => message._payloadDeferred !== true), true);
+    assert.ok(Buffer.byteLength(wire, "utf8") < 8 * 1024 * 1024,
+      "one page stays inside the physical raw-byte quantum while preserving every exact answer");
+    assert.equal(wire.includes("LARGE-FINAL-0-TAIL"), true);
+    assert.equal(wire.includes(`LARGE-FINAL-${count - 1}-TAIL`), true);
   });
 
   maybe("a multi-megabyte final answer is a lazy locator whose exact bytes remain range-readable", async () => {

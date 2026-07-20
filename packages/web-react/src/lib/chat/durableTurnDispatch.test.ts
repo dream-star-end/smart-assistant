@@ -328,6 +328,41 @@ describe("detectServerTerminalTurns (persist)", () => {
     const m = detectServerTerminalTurns([srvRow({ id: "srv-a-t1-s0", text: "答复", _clientMessageId: "cm1" })]);
     expect(m.get("cm1")).toBe("completed");
   });
+  test("只有 plan/runtime-event 的 finalized tape 也能收敛丢失的 final WS", () => {
+    const m = detectServerTerminalTurns([
+      srvRow({
+        id: "plan-only",
+        role: "plan",
+        text: "完成部署",
+        _clientMessageId: "cm-plan",
+        _turnTapeComplete: true,
+        _dispatchOutcome: "completed",
+      }),
+      srvRow({
+        id: "runtime-only",
+        role: "runtime-event",
+        text: "真实运行事件",
+        _clientMessageId: "cm-interrupted",
+        _turnTapeComplete: true,
+        _dispatchOutcome: "interrupted",
+      }),
+    ]);
+    expect(m.get("cm-plan")).toBe("completed");
+    expect(m.get("cm-interrupted")).toBe("completed");
+  });
+  test("只有非正文角色的 crashed finalized tape 收敛为 error", () => {
+    const m = detectServerTerminalTurns([
+      srvRow({
+        id: "goal-crashed",
+        role: "goal",
+        text: "目标状态",
+        _clientMessageId: "cm-crashed",
+        _turnTapeComplete: true,
+        _dispatchOutcome: "crashed",
+      }),
+    ]);
+    expect(m.get("cm-crashed")).toBe("error");
+  });
   test("completed 覆盖 error(真 tape 胜过短暂残留状态)", () => {
     const m = detectServerTerminalTurns([
       srvRow({ id: "turn-status:d1", role: "system", _turnStatusRecord: true, _dispatchTerminal: true,

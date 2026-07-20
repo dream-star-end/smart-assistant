@@ -1522,7 +1522,6 @@ export function App() {
   // True tape process paging + oversized-record loading. Hook methods are stable;
   // demo/readonly surfaces leave the cursor disabled rather than inventing content.
   const {
-    loadOlderTurnProcess,
     fetchTapeRecordPayload,
     peekTapeRecordPayload,
     fetchUserMessagePayload,
@@ -1535,9 +1534,6 @@ export function App() {
       onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
       onRetrySend: demo ? undefined : retrySend,
-      onLoadOlderTape: demo
-        ? undefined
-        : (anchorId, tapeId, before) => loadOlderTurnProcess(activeId, anchorId, tapeId, before),
       onFetchTapeRecordPayload: demo
         ? undefined
         : (tapeId, recordOrdinal, expected, signal) =>
@@ -1563,7 +1559,6 @@ export function App() {
       openSettings,
       onFeedback,
       retrySend,
-      loadOlderTurnProcess,
       fetchTapeRecordPayload,
       peekTapeRecordPayload,
       fetchUserMessagePayload,
@@ -1992,13 +1987,12 @@ export function App() {
       capExpired: historyCapExpired,
     });
 
-  // 归档分页上下文(§4):归档水位/计数从会话读(ChatSession._archived*),loading/error 与加载动作在本层。
+  // 统一真实时间线分页：仅显式按钮加载，滚动绝不发请求。
   // demo / 无选中会话时不下发(MessageList 退化为纯本地翻页)。
   const messageListArchive: MessageListArchive | undefined =
     !demo && activeId
       ? {
-          archivedCount: activeSess?._archivedCount ?? 0,
-          archivedThroughSeq: activeSess?._archivedThroughSeq ?? 0,
+          hasMore: activeSess?._timelineHasMore === true,
           loading: archiveLoading,
           error: archiveError,
           onLoadOlder: onLoadOlderHistory,
@@ -2166,7 +2160,7 @@ export function App() {
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}
                 scrollParent={chatScrollParent}
-                historyGeneration={`${activeId ?? "none"}::${activeSess?._historyRevision ?? "legacy"}`}
+                historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
               />
             </ResponseRatingProvider>
           )}

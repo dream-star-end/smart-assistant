@@ -309,6 +309,13 @@ export type SessionDetail = {
   updatedAt: number;
   /** History revision paired with `maxSeq`; absent only on rolling old backends. */
   historyRevision?: number;
+  /** Cursor epoch for the one real browser timeline. */
+  timelineGeneration?: number;
+  /** Opaque exclusive cursor for the next older unified page. */
+  timelineCursor?: string | null;
+  timelineHasMore?: boolean;
+  /** Highest actual durable `_seq` in the page read snapshot. */
+  timelineSnapshotMaxSeq?: number;
   /** Client-local marker: incremental request hit a legacy backend and was retried full. */
   _historyRevisionUnsupported?: true;
   isPartial: boolean;
@@ -322,6 +329,17 @@ export type SessionDetail = {
   archivedThroughSeq?: number;
 };
 
+/** GET /api/sessions/:id/timeline — one exact chronological page containing
+ * user, thinking, tool, agent-group and assistant records at equal rank. */
+export type SessionTimelinePage = {
+  messages: unknown[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  timelineGeneration: number;
+  historyRevision: number;
+  snapshotMaxSeq: number;
+};
+
 /**
  * GET /api/sessions/:id/archive?before=<seq>&limit=<n> → 归档分页（显式点击加载更早历史）。
  * `messages` = `_orderSeq < before` 的最近 `limit` 条归档消息（升序返回）；
@@ -333,13 +351,6 @@ export type SessionArchivePage = {
   oldestSeq: number | null;
   /** History revision captured with this page (rolling old backend may omit). */
   historyRevision?: number;
-};
-
-/** 不可变 turn-tape 记录页。批次有界、总历史无上限。 */
-export type TapeRecordsPage = {
-  records: unknown[];
-  nextCursor: number | null;
-  total: number;
 };
 
 /** 单条记录的真实、脱敏后不可变 JSON payload。 */

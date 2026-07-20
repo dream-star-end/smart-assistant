@@ -292,21 +292,31 @@ describe("socket — applyServerMessages 合并 server canonical", () => {
     expect(sess._archivedCount).toBe(2);
   });
 
-  test("history revision 变化：丢弃已水合归档缓存，后续分页从当前权威重载", () => {
+  test("history revision 变化不驱逐同 timeline generation 已加载的真实记录", () => {
     const s = socket();
     const sess = s.ensureSession("s1", "main");
     const srv = (id: string, seq: number): ChatMessage =>
-      ({ id, role: "assistant", text: id, ts: seq, _source: "server", _seq: seq, _orderSeq: seq }) as ChatMessage;
+      ({
+        id, role: "assistant", text: id, ts: seq, _source: "server", _seq: seq,
+        _orderSeq: seq, _timelineRecord: true, _timelineUnitKey: `outer:${seq}:${id}`,
+      }) as ChatMessage;
     sess.messages.push(srv("a1", 1), srv("a2", 2), srv("a3", 3), srv("a4", 4));
     sess._historyRevision = 0;
+    sess._timelineGeneration = 1;
+    sess._historyPageSerial = 1;
+    sess._timelineCursor = "older-cursor";
     s.applyServerMessages("s1", "main", [srv("a3", 3), srv("a4", 4)], true, 4, {
       archivedThroughSeq: 2,
       archivedCount: 2,
       historyRevision: 1,
+      timelineGeneration: 1,
+      timelineCursor: "latest-cursor",
+      timelineHasMore: true,
       serverUpdatedAt: 10,
     });
-    expect(sess.messages.map((message) => message.id)).toEqual(["a3", "a4"]);
+    expect(sess.messages.map((message) => message.id)).toEqual(["a1", "a2", "a3", "a4"]);
     expect(sess._historyRevision).toBe(1);
+    expect(sess._timelineCursor).toBe("older-cursor");
   });
 
   test("legacy full fallback：每次丢弃无 revision 保护的已水合归档缓存", () => {
@@ -324,18 +334,28 @@ describe("socket — applyServerMessages 合并 server canonical", () => {
     expect(sess.messages.map((message) => message.id)).toEqual(["a3"]);
   });
 
-  test("history revision 变化：full 缺席会删除已持久化 client-owned 行，但保留未同步行", () => {
+  test("timeline generation 变化：full 缺席删除旧代次行，但保留未同步行", () => {
     const s = socket();
     const sess = s.ensureSession("s1", "main");
     sess.messages.push(
-      ({ id: "persisted-user", role: "user", text: "old", ts: 1, _seq: 1, _orderSeq: 1 }) as ChatMessage,
-      ({ id: "srv-answer", role: "assistant", text: "answer", ts: 2, _source: "server", _seq: 2, _orderSeq: 2 }) as ChatMessage,
+      ({
+        id: "persisted-user", role: "user", text: "old", ts: 1, _seq: 1, _orderSeq: 1,
+        _source: "server", _timelineRecord: true, _timelineUnitKey: "outer:1:persisted-user",
+      }) as ChatMessage,
+      ({
+        id: "srv-answer", role: "assistant", text: "answer", ts: 2, _source: "server", _seq: 2,
+        _orderSeq: 2, _timelineRecord: true, _timelineUnitKey: "outer:2:srv-answer",
+      }) as ChatMessage,
       ({ id: "optimistic-user", role: "user", text: "new", ts: 3 }) as ChatMessage,
     );
     sess._historyRevision = 0;
+    sess._timelineGeneration = 1;
     s.applyServerMessages("s1", "main", [
-      ({ id: "srv-answer", role: "assistant", text: "answer", ts: 2, _source: "server", _seq: 2, _orderSeq: 2 }) as ChatMessage,
-    ], true, 2, { historyRevision: 1, serverUpdatedAt: 10 });
+      ({
+        id: "srv-answer", role: "assistant", text: "answer", ts: 2, _source: "server", _seq: 2,
+        _orderSeq: 2, _timelineRecord: true, _timelineUnitKey: "outer:2:srv-answer",
+      }) as ChatMessage,
+    ], true, 2, { historyRevision: 1, timelineGeneration: 2, serverUpdatedAt: 10 });
     expect(sess.messages.map((message) => message.id)).toEqual(["srv-answer", "optimistic-user"]);
   });
 });

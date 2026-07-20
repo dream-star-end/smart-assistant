@@ -273,6 +273,18 @@ export type ChatMessage = {
   _payloadBytes?: number;
   _payloadSha256?: string;
 
+  // ── one real historical timeline (server-authored; browser memory only) ──
+  /** Exact durable record from the unified chronological history stream. */
+  _timelineRecord?: boolean;
+  /** Stable server identity for one logical visible record. */
+  _timelineUnitKey?: string;
+  /** Exact logical order inside one immutable physical tape record. */
+  _timelineLogicalOrdinal?: number;
+  /** Client page identity used only by virtualization/scroll anchoring. */
+  _historyPageKey?: string;
+  /** Opaque cursor that produced this older in-memory page. */
+  _historyPageLoadedFrom?: string;
+
   // ── 过程控制的本地展开态（仅会话内存，不写回 server）──
   /** 已开始显示真实 Agent 过程。 */
   _turnTapeProcessExpanded?: boolean;
@@ -423,6 +435,13 @@ export type ChatSession = {
   _archivedThroughSeq?: number;
   /** 已归档消息条数(会话总数 = tail + 此值)。UI"还有 N 条"与"从云端加载更早历史"按钮据此。*/
   _archivedCount?: number;
+  /** Opaque exclusive cursor for the next explicit "查看更早历史记录" click. */
+  _timelineCursor?: string | null;
+  _timelineHasMore?: boolean;
+  _timelineGeneration?: number;
+  _timelineSnapshotMaxSeq?: number;
+  /** Monotonic in-memory page number; never persisted or reused across loads. */
+  _historyPageSerial?: number;
 
   // ── turn 流式指针（就地 mutation 目标）──
   _streamingAssistant?: ChatMessage | null;
@@ -575,9 +594,14 @@ export function rebuildIndexes(sess: ChatSession): void {
   if (!sess._blockIdToMsgId) sess._blockIdToMsgId = new Map();
   if (!sess._agentGroups) sess._agentGroups = new Map();
   for (const m of sess.messages) {
-    // Lazy immutable tape rows are historical viewport data. They render like
-    // normal cards but must never become live-delta mutation targets.
-    if (typeof m._turnTapeProcessLoadedFrom === "string") continue;
+    // Every record from the unified timeline is immutable historical
+    // evidence. They render like normal cards but never become live-delta
+    // mutation targets when block ids are reused by a later turn. This covers
+    // ordinary outer/archive records as well as finalized tape records.
+    if (
+      m._timelineRecord === true ||
+      typeof m._turnTapeProcessLoadedFrom === "string"
+    ) continue;
     if (m.blockId) sess._blockIdToMsgId.set(m.blockId, m.id);
     if (m.role === "agent-group" && m.blockId) {
       sess._agentGroups.set(m.blockId, m.id);

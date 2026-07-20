@@ -114,6 +114,10 @@ import {
   getClientSession,
   getClientSessionPartial,
   readArchivedMessages,
+  readClientTimelinePage,
+  encodeClientTimelineCursor,
+  decodeClientTimelineCursor,
+  ClientTimelineCursorStaleError,
   listTurnTapeRecords,
   readTapeRecordPayloadChunk,
   readUserMessagePayload,
@@ -3842,6 +3846,52 @@ export class Gateway {
       return
     }
 
+    // One real chronological history stream. The opaque cursor can resume
+    // inside an immutable tape physical record sequence; scroll position is a
+    // UI concern and never triggers this endpoint automatically.
+    const timelineMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/timeline$/)
+    if (timelineMatch) {
+      const sessId = timelineMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const rawCursor = url.searchParams.get('cursor')
+      const cursor = rawCursor === null ? null : decodeClientTimelineCursor(rawCursor)
+      if (rawCursor !== null && cursor === null) {
+        this.sendJson(res, 400, { error: 'invalid timeline cursor' })
+        return
+      }
+      const rawLimit = Number(url.searchParams.get('limit'))
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0
+        ? Math.min(200, Math.floor(rawLimit))
+        : 100
+      readClientTimelinePage(sessId, userId, cursor, limit)
+        .then((page) => {
+          if (!page) {
+            this.sendJson(res, 404, { error: 'not found' })
+            return
+          }
+          this.sendJson(res, 200, {
+            messages: page.messages,
+            nextCursor: page.nextCursor ? encodeClientTimelineCursor(page.nextCursor) : null,
+            hasMore: page.hasMore,
+            timelineGeneration: page.timelineGeneration,
+            historyRevision: page.historyRevision,
+            snapshotMaxSeq: page.snapshotMaxSeq,
+          })
+        })
+        .catch((error) => {
+          if (error instanceof ClientTimelineCursorStaleError) {
+            this.sendJson(res, 409, { error: 'timeline cursor stale', code: 'TIMELINE_CURSOR_STALE' })
+          } else {
+            this.sendJson(res, 500, { error: 'timeline read failed' })
+          }
+        })
+      return
+    }
+
     // 归档分页端点(长会话热尾巴+归档 §2.1):GET /api/sessions/:id/archive?before=<seq>&limit=<n>
     // 与下面 /api/sessions/:id 同款按 userId 分租(readArchivedMessages 内部 WHERE user_id=?
     // → userA 永远拿不到 userB 的归档)。commercial 侧 router.ts 的 BLOCKED_FOR_USER_RULES
@@ -3887,7 +3937,12 @@ export class Gateway {
             view: 'timeline',
             sinceHistoryRevision,
           })
-            .then((s) => s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }))
+            .then((s) => s ? this.sendJson(res, 200, {
+              ...s,
+              timelineCursor: s.timelineCursor
+                ? encodeClientTimelineCursor(s.timelineCursor)
+                : null,
+            }) : this.sendJson(res, 404, { error: 'not found' }))
             .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
         } else {
           getClientSession(sessId, userId, { view: 'timeline' })
@@ -3914,9 +3969,12 @@ export class Gateway {
                 ...s,
                 isPartial: false,
                 totalMessageCount: messages.length + archivedCount,
-                maxSeq,
+                maxSeq: s.timelineSnapshotMaxSeq ?? maxSeq,
                 archivedCount,
                 archivedThroughSeq: s.archivedThroughSeq ?? 0,
+                timelineCursor: s.timelineCursor
+                  ? encodeClientTimelineCursor(s.timelineCursor)
+                  : null,
               })
             })
             .catch(() => this.sendJson(res, 500, { error: 'get failed' }))

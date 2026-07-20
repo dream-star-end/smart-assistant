@@ -67,6 +67,7 @@ describe("visible virtual row anchor", () => {
     rowElement.setAttribute("data-chat-virtual-key", "stable-row");
     scroller.appendChild(rowElement);
     Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000, writable: true });
     scroller.getBoundingClientRect = () => ({
       top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
       x: 0, y: 0, toJSON: () => ({}),
@@ -78,7 +79,7 @@ describe("visible virtual row anchor", () => {
     });
 
     const anchor = captureVisibleVirtualRowAnchor(scroller)!;
-    expect(anchor).toEqual({ key: "stable-row", top: 120 });
+    expect(anchor).toEqual({ key: "stable-row", top: 120, scrollTop: 100, scrollHeight: 1000 });
     // 顶部归档新增 200px；同时底部 live answer 可增长任意高度，但稳定行只下移 200px。
     rowTop = 320;
     expect(correctToVisibleVirtualRowAnchor(scroller, anchor)).toBe(true);
@@ -103,7 +104,7 @@ describe("visible virtual row anchor", () => {
     let cancelled = false;
     const restoring = restoreVisibleVirtualRowAnchor(
       scroller,
-      { key: "stable-row", top: 120 },
+      { key: "stable-row", top: 120, scrollTop: 100, scrollHeight: 1000 },
       () => cancelled,
       (callback) => frames.push(callback),
     );
@@ -116,6 +117,20 @@ describe("visible virtual row anchor", () => {
     await restoring;
     expect(scroller.scrollTop).toBe(250);
     expect(frames).toHaveLength(0);
+  });
+
+  test("大页前插让锚点暂时卸载时先按高度差拉回挂载区，再等待精确行校正", () => {
+    const scroller = document.createElement("div");
+    Object.defineProperty(scroller, "scrollTop", { value: 80, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 2600, writable: true });
+
+    expect(correctToVisibleVirtualRowAnchor(scroller, {
+      key: "temporarily-unmounted",
+      top: 40,
+      scrollTop: 80,
+      scrollHeight: 1000,
+    })).toBe(false);
+    expect(scroller.scrollTop).toBe(1680);
   });
 });
 

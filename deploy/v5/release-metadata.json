@@ -55,7 +55,8 @@
     "0173_client_session_model",
     "0174_selfheal_release_safety_fences",
     "0175_client_session_history_revision",
-    "0176_direct_turn_timeline"
+    "0176_direct_turn_timeline",
+    "0177_unified_client_timeline"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

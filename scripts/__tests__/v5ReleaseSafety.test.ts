@@ -2273,6 +2273,7 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.requiredMigrations.includes('0174_selfheal_release_safety_fences'))
     assert.ok(meta.requiredMigrations.includes('0175_client_session_history_revision'))
     assert.ok(meta.requiredMigrations.includes('0176_direct_turn_timeline'))
+    assert.ok(meta.requiredMigrations.includes('0177_unified_client_timeline'))
     // 容器面单独一列:release MANIFEST 只声明容器实现的能力(digest 相同 ⇒ 声明相同)
     assert.deepEqual(meta.runtimeCapabilities, [
       'model_authority_v1',

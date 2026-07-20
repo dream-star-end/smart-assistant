@@ -45,7 +45,12 @@ export function correctedScrollTop(prevHeight: number, newHeight: number, prevTo
   return prevTop + (newHeight - prevHeight);
 }
 
-export type VisibleVirtualRowAnchor = { key: string; top: number };
+export type VisibleVirtualRowAnchor = {
+  key: string;
+  top: number;
+  scrollTop: number;
+  scrollHeight: number;
+};
 
 /** Capture an actual rendered row instead of total scrollHeight. Bottom live
  * growth then cannot contaminate correction for rows prepended at the top. */
@@ -62,7 +67,12 @@ export function captureVisibleVirtualRowAnchor(
   }) ?? rows.find((candidate) => candidate.getBoundingClientRect().bottom > viewport.top);
   const key = row?.getAttribute("data-chat-virtual-key");
   if (!row || !key) return null;
-  return { key, top: row.getBoundingClientRect().top - viewport.top };
+  return {
+    key,
+    top: row.getBoundingClientRect().top - viewport.top,
+    scrollTop: scroller.scrollTop,
+    scrollHeight: scroller.scrollHeight,
+  };
 }
 
 /** Re-align one exact immutable virtual row. Returns false while Virtuoso has
@@ -74,7 +84,18 @@ export function correctToVisibleVirtualRowAnchor(
   const row = Array.from(
     scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
   ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
-  if (!row) return false;
+  if (!row) {
+    // A large prepend can temporarily move the anchor outside Virtuoso's
+    // mounted range before its per-row measurements settle. Move by the
+    // observed total-height delta as a bootstrap only; subsequent frames use
+    // the exact immutable row as soon as it remounts. This is not the final
+    // correction, so concurrent bottom growth cannot permanently skew it.
+    const heightDelta = scroller.scrollHeight - anchor.scrollHeight;
+    if (Math.abs(heightDelta) > 0.5) {
+      scroller.scrollTop = anchor.scrollTop + heightDelta;
+    }
+    return false;
+  }
   const currentTop = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
   const delta = currentTop - anchor.top;
   if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
