@@ -15,6 +15,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import {
   collectResolvedDispatchTurnIds,
   HIDDEN_REVIEWER_AGENT_ID,
+  isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
   messageKind,
   messageSignature,
@@ -86,6 +87,7 @@ export const MessageRenderer = memo(
     readOnly = false,
   }: RendererProps) {
     const ctx = { isLast, sending, turnActivity, inActiveTurn, turnFinalAssistant };
+    if (isRedundantRuntimeEnvelope(message)) return null;
     if (message._payloadDeferred) {
       return (
         <DeferredTapeRecordCard
@@ -699,15 +701,16 @@ export function MessageList({
   /** Existing chat scroller. When present, only viewport-adjacent rows mount. */
   scrollParent?: HTMLElement | null;
 }) {
-  // Drop only legacy substitute rows already present in an old IndexedDB
-  // cache. Runtime events from the immutable tape are first-class renderable
-  // records and must never be filtered out.
+  // Drop legacy substitute rows from an old IndexedDB cache and duplicate
+  // engine transport envelopes. The latter remain byte-complete in the tape;
+  // their canonical immutable Agent blocks are the user-facing timeline.
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(messages);
   const renderableMessages = messages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       !m.id.startsWith("projection-") &&
       !m.id.startsWith("oc-dispatch-err:") &&
+      !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
   const total = renderableMessages.length;

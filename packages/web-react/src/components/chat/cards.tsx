@@ -600,6 +600,12 @@ export function AssistantCard({
   const showRegenFallback = !isInsufficient && isLastTurn && !retryTarget && !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
   const showActionRow = showTopUp || showPreciseRetry || showRegenFallback || (isLastTurn && showSwitchModelHint);
+  // Finalized immutable tapes may contain a deferred runtime batch after the
+  // canonical assistant row. That transport row must still mount and decode,
+  // but it must not take the current turn's regenerate action away from the
+  // genuine final assistant. Direct/single-card callers retain the old
+  // `isLast` fallback when no turn-final annotation is available.
+  const showRegenerate = isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast);
 
   return (
     <div className="group flex gap-4 animate-in" data-testid="assistant-row">
@@ -718,7 +724,7 @@ export function AssistantCard({
 
         {/* 动作条 + meta（流式中不显示动作条，避免抖动） */}
         {!live && !hasError && msg.text && (
-          <MessageActions msg={msg} cb={cb} showRegen={ctx.isLast && !hasError} />
+          <MessageActions msg={msg} cb={cb} showRegen={showRegenerate && !hasError} />
         )}
         {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
         {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
