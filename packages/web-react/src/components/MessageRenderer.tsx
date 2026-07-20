@@ -1062,6 +1062,8 @@ export function MessageList({
   historyLayoutRevisionRef.current = historyLayoutRevision;
   const historyLayoutMarkerRef = useRef<HTMLDivElement | null>(null);
   const historyLayoutMarkerInitializedRef = useRef(false);
+  const pendingHistoryLayoutAckRef = useRef<string | null>(null);
+  const historyLayoutAckFrameRef = useRef<number | null>(null);
   const bindHistoryLayoutMarker = useCallback((node: HTMLDivElement | null) => {
     historyLayoutMarkerRef.current = node;
     if (node && !historyLayoutMarkerInitializedRef.current) {
@@ -1070,13 +1072,47 @@ export function MessageList({
     }
   }, []);
   const acknowledgeHistoryLayout = useCallback(() => {
-    const marker = historyLayoutMarkerRef.current;
-    if (
-      marker?.getAttribute("data-chat-history-layout-revision") === historyLayoutRevision
-    ) {
-      marker.setAttribute("data-chat-history-layout-ack", historyLayoutRevision);
+    if (!showHistoryBoundary) return;
+    pendingHistoryLayoutAckRef.current = historyLayoutRevision;
+    if (historyLayoutAckFrameRef.current !== null) return;
+    const publish = () => {
+      historyLayoutAckFrameRef.current = null;
+      const revision = pendingHistoryLayoutAckRef.current;
+      if (!revision || historyLayoutRevisionRef.current !== revision) {
+        pendingHistoryLayoutAckRef.current = null;
+        return;
+      }
+      const marker = historyLayoutMarkerRef.current;
+      if (marker?.getAttribute("data-chat-history-layout-revision") === revision) {
+        marker.setAttribute("data-chat-history-layout-ack", revision);
+        pendingHistoryLayoutAckRef.current = null;
+        return;
+      }
+      // react-virtuoso can publish itemsRendered from its layout effect before
+      // the stable Header ref/attribute is observable on a heavily loaded
+      // renderer. Keep this *event-bound* acknowledgement pending until that
+      // exact revision is in the DOM; a newer revision supersedes it. There is
+      // no wall-clock/frame cap and no content is admitted by this retry.
+      if (typeof requestAnimationFrame === "function") {
+        historyLayoutAckFrameRef.current = requestAnimationFrame(publish);
+      }
+    };
+    if (typeof requestAnimationFrame === "function") {
+      historyLayoutAckFrameRef.current = requestAnimationFrame(publish);
+    } else {
+      publish();
     }
-  }, [historyLayoutRevision]);
+  }, [historyLayoutRevision, showHistoryBoundary]);
+  useEffect(() => () => {
+    pendingHistoryLayoutAckRef.current = null;
+    if (
+      historyLayoutAckFrameRef.current !== null &&
+      typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(historyLayoutAckFrameRef.current);
+    }
+    historyLayoutAckFrameRef.current = null;
+  }, []);
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
