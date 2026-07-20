@@ -132,6 +132,181 @@ describe("visible virtual row anchor", () => {
     })).toBe(false);
     expect(scroller.scrollTop).toBe(1680);
   });
+
+  test("慢调度超过旧 12 帧后才前插/重挂载，也必须等真实行稳定再结束", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "slow-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    let scrollHeight = 1000;
+    Object.defineProperty(scroller, "scrollHeight", { get: () => scrollHeight });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    let prependHeight = 0;
+    rowElement.getBoundingClientRect = () => {
+      const top = 120 + prependHeight - (scroller.scrollTop - 100);
+      return {
+        top, bottom: top + 40, left: 0, right: 800, width: 800, height: 40,
+        x: 0, y: top, toJSON: () => ({}),
+      };
+    };
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    for (let frame = 0; frame < 20; frame += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
+    expect(resolved).toBe(false);
+
+    prependHeight = 1600;
+    scrollHeight = 2600;
+    rowElement.remove();
+    frames.shift()!();
+    expect(scroller.scrollTop).toBe(1700);
+    expect(resolved).toBe(false);
+
+    scroller.appendChild(rowElement);
+    for (let frame = 0; frame < 4 && !resolved; frame += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(rowElement.getBoundingClientRect().top).toBe(120);
+  });
+
+  test("底部实时内容持续改变总高度时，已稳定的锚点不会占住恢复 FIFO", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "live-bottom-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    let scrollHeight = 1000;
+    Object.defineProperty(scroller, "scrollHeight", { get: () => scrollHeight });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    rowElement.getBoundingClientRect = () => ({
+      top: 120, bottom: 160, left: 0, right: 800, width: 800, height: 40,
+      x: 0, y: 120, toJSON: () => ({}),
+    });
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    scrollHeight = 1100;
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    scrollHeight = 1200;
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
+  });
+
+  test("总高度不变但上方测量逐帧漂移时不提前结束，停止漂移后才稳定", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "drifting-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000 });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    let layoutOffset = 0;
+    rowElement.getBoundingClientRect = () => {
+      const top = 120 + layoutOffset - (scroller.scrollTop - 100);
+      return {
+        top, bottom: top + 40, left: 0, right: 800, width: 800, height: 40,
+        x: 0, y: top, toJSON: () => ({}),
+      };
+    };
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    for (const offset of [10, 20, 30]) {
+      layoutOffset = offset;
+      frames.shift()!();
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+      expect(rowElement.getBoundingClientRect().top).toBe(120);
+    }
+
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(rowElement.getBoundingClientRect().top).toBe(120);
+  });
+
+  test("锚点永久消失后 timeline generation 改变会在下一帧取消并释放调度", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "obsolete-generation-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000 });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    rowElement.getBoundingClientRect = () => ({
+      top: 120, bottom: 160, left: 0, right: 800, width: 800, height: 40,
+      x: 0, y: 120, toJSON: () => ({}),
+    });
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const capturedGeneration = 7;
+    let currentGeneration = capturedGeneration;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => currentGeneration !== capturedGeneration,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    rowElement.remove();
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(frames).toHaveLength(1);
+
+    currentGeneration = 8;
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(frames).toHaveLength(0);
+  });
 });
 
 describe("planLoadMore 按钮三态 + 切片起点", () => {

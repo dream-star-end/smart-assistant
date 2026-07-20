@@ -5,7 +5,7 @@
 //
 // stub 原则:只 stub 网络/宿主副作用(上传/发送/目标提交),不 stub 任何 UI 结构;
 // onUpload 立即 resolve → 附件 chip 无后端也能走到 done 态,CI 零外部依赖。
-import { StrictMode, useCallback, useState } from "react";
+import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
@@ -230,6 +230,17 @@ function ScrollTimelineProbe() {
       _timelineUnitKey: "outer:500:scroll-answer",
     },
   ]);
+  const pendingRestoreRef = useRef<{
+    anchor: NonNullable<ReturnType<typeof captureVisibleVirtualRowAnchor>>;
+    resolve: () => void;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const pending = pendingRestoreRef.current;
+    if (!pending || !scroller) return;
+    pendingRestoreRef.current = null;
+    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false)
+      .finally(pending.resolve);
+  }, [messages, scroller]);
   const loadOlder = useCallback(async () => {
     if (loading || !cursor) return;
     const requestedCursor = cursor;
@@ -238,15 +249,18 @@ function ScrollTimelineProbe() {
     window.__scrollTimeline.calls.push(requestedCursor);
     await new Promise((resolve) => setTimeout(resolve, 40));
     const nextCursor = requestedCursor === "cursor-200" ? "cursor-100" : null;
+    const anchored = scroller && anchor
+      ? new Promise<void>((resolve) => {
+        pendingRestoreRef.current = { anchor, resolve };
+      })
+      : Promise.resolve();
     setMessages((current) => {
       const merged = mergeTimelineHistoryPage(current, olderPage(requestedCursor));
       if (merged !== current) window.__scrollTimeline.mergedPages += 1;
       return merged;
     });
     setCursor(nextCursor);
-    if (scroller && anchor) {
-      await restoreVisibleVirtualRowAnchor(scroller, anchor, () => false);
-    }
+    await anchored;
     setLoading(false);
   }, [cursor, loading, scroller]);
   window.__scrollTimeline.messageCount = messages.length;
@@ -305,18 +319,32 @@ const archiveOlder: ChatMessage[] = Array.from({ length: 80 }, (_, index) => ({
 function ArchiveTimelineProbe() {
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>(archiveTail);
+  const pendingRestoreRef = useRef<{
+    anchor: NonNullable<ReturnType<typeof captureVisibleVirtualRowAnchor>>;
+    resolve: () => void;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const pending = pendingRestoreRef.current;
+    if (!pending || !scroller) return;
+    pendingRestoreRef.current = null;
+    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false)
+      .finally(pending.resolve);
+  }, [messages, scroller]);
   const loadOlder = useCallback(async () => {
     const anchor = scroller ? captureVisibleVirtualRowAnchor(scroller) : null;
     window.__archiveTimeline.calls += 1;
     await new Promise((resolve) => setTimeout(resolve, 40));
+    const anchored = scroller && anchor
+      ? new Promise<void>((resolve) => {
+        pendingRestoreRef.current = { anchor, resolve };
+      })
+      : Promise.resolve();
     setMessages((current) => {
       if (current[0]?.id === archiveOlder[0]?.id) return current;
       window.__archiveTimeline.mergedPages += 1;
       return mergeTimelineHistoryPage(current, archiveOlder);
     });
-    if (scroller && anchor) {
-      await restoreVisibleVirtualRowAnchor(scroller, anchor, () => false);
-    }
+    await anchored;
   }, [scroller]);
   window.__archiveTimeline.messageCount = messages.length;
   return (

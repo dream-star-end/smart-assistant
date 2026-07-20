@@ -117,16 +117,54 @@ export function restoreVisibleVirtualRowAnchor(
   },
 ): Promise<void> {
   return new Promise((resolve) => {
-    let frames = 0;
+    let observedPrependLayout = false;
+    let stableFrames = 0;
     const correct = () => {
       if (cancelled()) {
         resolve();
         return;
       }
-      correctToVisibleVirtualRowAnchor(scroller, anchor);
-      frames += 1;
-      if (frames < 12) schedule(correct);
-      else resolve();
+      const beforeRow = Array.from(
+        scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
+      const beforeTop = beforeRow
+        ? beforeRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+        : null;
+      if (
+        beforeTop === null ||
+        Math.abs(beforeTop - anchor.top) > 0.5 ||
+        Math.abs(scroller.scrollHeight - anchor.scrollHeight) > 0.5
+      ) {
+        observedPrependLayout = true;
+      }
+
+      const found = correctToVisibleVirtualRowAnchor(scroller, anchor);
+      const row = Array.from(
+        scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
+      const currentTop = row
+        ? row.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+        : null;
+
+      if (
+        observedPrependLayout && beforeTop !== null &&
+        Math.abs(beforeTop - anchor.top) <= 0.5 &&
+        found && currentTop !== null &&
+        Math.abs(currentTop - anchor.top) <= 0.5
+      ) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+      }
+      // Do not finish on an arbitrary frame budget. Under a slow scheduler the
+      // immutable row can remount after many frames; resolving before that is
+      // the exact cause of the visible history jump. Two post-layout stable
+      // frames prove the row entered the frame already mounted and aligned,
+      // rather than merely looking aligned immediately after this frame's
+      // correction. User input/session switch still terminates immediately
+      // through `cancelled`.
+      if (stableFrames >= 2) resolve();
+      else schedule(correct);
     };
     schedule(correct);
   });

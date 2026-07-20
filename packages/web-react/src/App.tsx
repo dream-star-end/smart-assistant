@@ -267,6 +267,7 @@ export function App() {
   const archiveScrollAnchorRef = useRef<{
     token: number;
     capturedScrollTop: number;
+    timelineGeneration: number | undefined;
     row: VisibleVirtualRowAnchor | null;
     ready: boolean;
     cancelled: boolean;
@@ -1724,6 +1725,7 @@ export function App() {
       ? {
         token,
         capturedScrollTop: el.scrollTop,
+        timelineGeneration: sockRef.current?.getSession(activeId)?._timelineGeneration,
         row: captureVisibleVirtualRowAnchor(el),
         ready: false,
         cancelled: false,
@@ -1767,7 +1769,10 @@ export function App() {
       settleArchiveAnchor(anchor.token);
       return;
     }
-    if (anchor.cancelled || !anchor.row) {
+    if (
+      anchor.cancelled || !anchor.row ||
+      anchor.timelineGeneration !== sockRef.current?.getSession(activeId)?._timelineGeneration
+    ) {
       settleArchiveAnchor(anchor.token);
       return;
     }
@@ -1778,7 +1783,8 @@ export function App() {
       anchor.row,
       () => {
         const current = archiveScrollAnchorRef.current;
-        return !current || current.token !== anchor.token || current.cancelled;
+        return !current || current.token !== anchor.token || current.cancelled ||
+          current.timelineGeneration !== sockRef.current?.getSession(activeId)?._timelineGeneration;
       },
     ).finally(() => settleArchiveAnchor(anchor.token));
   }, [archiveLoading, chat.version, settleArchiveAnchor]);

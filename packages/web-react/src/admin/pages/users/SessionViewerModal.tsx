@@ -55,6 +55,7 @@ type MediaSignPayload = { urls: Record<string, string>; expMs: number }
 type ScrollAnchor = {
   token: number
   capturedScrollTop: number
+  timelineGeneration: number | null
   row: VisibleVirtualRowAnchor | null
   ready: boolean
   cancelled: boolean
@@ -85,6 +86,8 @@ export function SessionViewerModal({
   const [error, setError] = useState<unknown>(null)
   const [timelineCursor, setTimelineCursor] = useState<string | null>(null)
   const [timelineGeneration, setTimelineGeneration] = useState<number | null>(null)
+  const timelineGenerationRef = useRef<number | null>(timelineGeneration)
+  timelineGenerationRef.current = timelineGeneration
   const [archiveHasMore, setArchiveHasMore] = useState(false)
   const [archiveLoading, setArchiveLoading] = useState(false)
   const [archiveError, setArchiveError] = useState(false)
@@ -177,7 +180,10 @@ export function SessionViewerModal({
     }
     const anchor = archiveScrollAnchorRef.current
     if (!anchor?.ready) return
-    if (anchor.cancelled || !anchor.row) {
+    if (
+      anchor.cancelled || !anchor.row ||
+      anchor.timelineGeneration !== timelineGeneration
+    ) {
       settleArchiveAnchor(anchor.token)
       return
     }
@@ -188,10 +194,11 @@ export function SessionViewerModal({
       anchor.row,
       () => {
         const current = archiveScrollAnchorRef.current
-        return !current || current.token !== anchor.token || current.cancelled
+        return !current || current.token !== anchor.token || current.cancelled ||
+          current.timelineGeneration !== timelineGenerationRef.current
       },
     ).finally(() => settleArchiveAnchor(anchor.token))
-  }, [archiveLoading, messages, settleArchiveAnchor])
+  }, [archiveLoading, messages, settleArchiveAnchor, timelineGeneration])
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current
@@ -231,6 +238,7 @@ export function SessionViewerModal({
       ? {
         token,
         capturedScrollTop: el.scrollTop,
+        timelineGeneration,
         row: captureVisibleVirtualRowAnchor(el),
         ready: false,
         cancelled: false,
