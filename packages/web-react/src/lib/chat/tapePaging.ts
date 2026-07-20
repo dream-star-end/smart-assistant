@@ -52,7 +52,6 @@ export class TapePageRequestLedger {
 
 type PagingGenerationState = {
   tailStarted: boolean;
-  tailFailed: boolean;
 };
 
 export type PagingClaim = {
@@ -60,25 +59,24 @@ export type PagingClaim = {
   readonly token: number;
 };
 
-/**
- * Stable per-MessageList paging intent. Virtual rows may unmount at any time;
- * keeping the gesture epoch here prevents remounts or layout scrolls from
- * cascading through several cursors without a new upward user action.
- */
+export function turnProcessPagingGeneration(
+  historyGeneration: number | string,
+  process: { id: string; _turnTapeId?: string; _turnTapeSha256?: string },
+): string {
+  return `${String(historyGeneration)}::${process.id}::${process._turnTapeId ?? ""}::${process._turnTapeSha256 ?? ""}`;
+}
+
+/** Stable per-MessageList owner for one automatic latest-tail read plus the
+ * explicit-click FIFO shared by every older archive/tape page. */
 export class UserUpwardPagingController {
-  private intentEpoch = 0;
-  private consumedEpoch = 0;
   private interactionEpoch = 0;
   private nextToken = 0;
-  private lastScrollTop: number | null = null;
   private activeClaim: PagingClaim | null = null;
+  private explicitPending = 0;
+  private explicitTail: Promise<void> = Promise.resolve();
+  private readonly explicitRequests = new Map<string, Promise<unknown>>();
   private readonly generations = new Map<string, PagingGenerationState>();
   private readonly settledListeners = new Set<() => void>();
-
-  signalUpwardIntent(): void {
-    this.intentEpoch += 1;
-    this.interactionEpoch += 1;
-  }
 
   signalUserInteraction(): void {
     this.interactionEpoch += 1;
@@ -93,39 +91,56 @@ export class UserUpwardPagingController {
     return () => this.settledListeners.delete(listener);
   }
 
-  syncScrollTop(scrollTop: number): void {
-    if (Number.isFinite(scrollTop)) this.lastScrollTop = scrollTop;
+  /**
+   * Explicit history requests share one FIFO across archive and tape pages.
+   * This keeps their independent viewport anchors from consuming each
+   * other's DOM insertion. Repeated clicks for the same immutable cursor
+   * reuse the same promise instead of adding another request.
+   */
+  runExplicit<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const existing = this.explicitRequests.get(key) as Promise<T> | undefined;
+    if (existing) return existing;
+
+    this.explicitPending += 1;
+    const waitForAutomaticTail = () => {
+      if (!this.activeClaim) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const unsubscribe = this.subscribeSettled(() => {
+          if (this.activeClaim) return;
+          unsubscribe();
+          resolve();
+        });
+      });
+    };
+    const request = this.explicitTail.then(async () => {
+      await waitForAutomaticTail();
+      return task();
+    });
+    this.explicitTail = request.then(() => undefined, () => undefined);
+    this.explicitRequests.set(key, request);
+    const release = () => {
+      if (this.explicitRequests.get(key) === request) {
+        this.explicitRequests.delete(key);
+      }
+      this.explicitPending -= 1;
+      for (const listener of [...this.settledListeners]) listener();
+    };
+    void request.then(release, release);
+    return request;
   }
 
-  signalPointerScroll(scrollTop: number, emitIntent = true): boolean {
-    if (!Number.isFinite(scrollTop)) return false;
-    const movedUp = this.lastScrollTop !== null && scrollTop < this.lastScrollTop - 0.5;
-    const moved = this.lastScrollTop !== null && Math.abs(scrollTop - this.lastScrollTop) > 0.5;
-    if (moved) this.interactionEpoch += 1;
-    if (movedUp && emitIntent) {
-      this.intentEpoch += 1;
-    }
-    this.lastScrollTop = scrollTop;
-    return movedUp && emitIntent;
-  }
-
-  begin(generation: string, initialized: boolean, manual = false): PagingClaim | null {
+  begin(generation: string, initialized: boolean): PagingClaim | null {
+    // Initialized cursors are never admitted automatically. Their visible
+    // button invokes the exact cursor request directly.
+    if (initialized) return null;
     const state = this.generations.get(generation) ?? {
       tailStarted: false,
-      tailFailed: false,
     };
     this.generations.set(generation, state);
     if (this.activeClaim) return null;
-    if (!initialized) {
-      if (state.tailStarted && !manual) return null;
-      // A visible tape tail is part of the initial history viewport and loads
-      // once automatically. The controller-wide claim still serializes tails
-      // from different turns; only older cursors require an upward gesture.
-      state.tailStarted = true;
-      state.tailFailed = false;
-    } else if (this.intentEpoch <= this.consumedEpoch) {
-      return null;
-    }
+    if (this.explicitPending > 0) return null;
+    if (state.tailStarted) return null;
+    state.tailStarted = true;
     const claim = { generation, token: ++this.nextToken };
     this.activeClaim = claim;
     return claim;
@@ -135,30 +150,7 @@ export class UserUpwardPagingController {
   settle(claim: PagingClaim): void {
     if (this.activeClaim?.token !== claim.token) return;
     this.activeClaim = null;
-    // Consume every gesture observed while this request was in flight so
-    // trackpad inertia cannot immediately admit the next physical page.
-    this.consumedEpoch = this.intentEpoch;
     for (const listener of [...this.settledListeners]) listener();
-  }
-
-  /** A failed initial-tail owner that disappeared cannot show its retry CTA. */
-  rearmTail(claim: PagingClaim): void {
-    if (this.activeClaim?.token !== claim.token) return;
-    this.generations.delete(claim.generation);
-  }
-
-  markTailFailed(claim: PagingClaim): void {
-    if (this.activeClaim?.token !== claim.token) return;
-    const state = this.generations.get(claim.generation);
-    if (state) state.tailFailed = true;
-  }
-
-  /** Local retry UI disappears with its virtual row; make the tail admissible again. */
-  rearmFailedTail(generation: string): void {
-    const state = this.generations.get(generation);
-    if (!state?.tailFailed || this.activeClaim?.generation === generation) return;
-    state.tailStarted = false;
-    state.tailFailed = false;
   }
 
   reset(generation: string): void {

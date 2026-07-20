@@ -25,7 +25,10 @@ import {
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
 import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import type { PagingClaim, UserUpwardPagingController } from "../../lib/chat/tapePaging";
+import {
+  turnProcessPagingGeneration,
+  type UserUpwardPagingController,
+} from "../../lib/chat/tapePaging";
 import {
   CONTINUE_PROMPT,
   childSignature,
@@ -362,7 +365,7 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
   );
 }
 
-// ═══════════════ 真实 Agent 过程向上惰性加载哨兵 ═══════════════
+// ═══════════════ 真实 Agent 过程显式惰性分页控制 ═══════════════
 /** 默认时间线直接渲染真实思考、工具、委派和运行事件。这个零内容哨兵只负责
  * 从 tape 尾页开始向前取更早的 immutable records；它不是 Agent 内容或摘要卡。 */
 type ViewportAnchor = {
@@ -429,9 +432,6 @@ function restoreViewportAnchor(
         const delta = currentTop - anchor.top;
         if (Math.abs(delta) > 0.5) {
           const nextTop = anchor.scroller.scrollTop + delta;
-          // Record the programmatic correction before assigning scrollTop so it
-          // can never masquerade as another upward user gesture.
-          paging?.syncScrollTop(nextTop);
           anchor.scroller.scrollTop = nextTop;
         }
       }
@@ -449,11 +449,19 @@ export function TurnProcessCard({
   cb,
   paging,
   historyGeneration = "legacy",
+  autoLoadLatestTail = false,
+  automaticLoading = false,
+  automaticError = false,
 }: {
   msg: ChatMessage;
   cb: CardCallbacks;
   paging?: UserUpwardPagingController;
   historyGeneration?: number | string;
+  /** Only the newest process control gets one automatic tail read. */
+  autoLoadLatestTail?: boolean;
+  /** MessageList owns the non-virtual automatic tail request. */
+  automaticLoading?: boolean;
+  automaticError?: boolean;
 }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
@@ -463,7 +471,7 @@ export function TurnProcessCard({
   // Production MessageList always owns the controller outside virtual rows.
   const requestedCursorRef = useRef<string | null>(null);
   const controlStateRef = useRef({ id: msg.id, tapeId: msg._turnTapeId, initialized: false });
-  const loadRef = useRef<(manual?: boolean) => void>(() => {});
+  const loadRef = useRef<() => void>(() => {});
   const initialized = msg._turnTapeProcessExpanded === true;
   const before = initialized && typeof msg._turnTapeProcessCursor === "number"
     ? msg._turnTapeProcessCursor
@@ -471,60 +479,48 @@ export function TurnProcessCard({
   const complete = initialized && msg._turnTapeProcessCursor === null;
   const tapeId = msg._turnTapeId;
   const canLoad = !!cb.onLoadOlderTape && typeof tapeId === "string" && tapeId.length > 0;
-  const generation = `${String(historyGeneration)}::${msg.id}::${tapeId ?? ""}::${msg._turnTapeSha256 ?? ""}`;
+  const generation = turnProcessPagingGeneration(historyGeneration, msg);
 
-  const loadPage = async (manual = false) => {
-    if (!cb.onLoadOlderTape || !tapeId || complete || loadingRef.current) return;
+  const loadPage = async () => {
+    const loadOlderTape = cb.onLoadOlderTape;
+    if (!loadOlderTape || !tapeId || complete || loadingRef.current) return;
     const cursorKey = initialized ? String(before) : "tail";
-    let claim: PagingClaim | null = null;
-    if (paging) {
-      // Retry is a fresh explicit intent, but it still has to own the same
-      // controller-wide single-flight token as gesture-driven pages.
-      if (manual) paging.signalUpwardIntent();
-      claim = paging.begin(generation, initialized, manual);
-      if (!claim) return;
-    } else if (!manual && requestedCursorRef.current === cursorKey) {
-      return;
-    }
+    if (!paging && requestedCursorRef.current === cursorKey) return;
     requestedCursorRef.current = cursorKey;
     loadingRef.current = true;
     setLoading(true);
     setError(false);
-    const viewportAnchor = captureViewportAnchor(sentinelRef.current, paging);
-    let requestFailed = false;
+    const requestPage = async () => {
+      // Capture only when this FIFO slot starts. Capturing at click time would
+      // make an earlier queued insertion invalidate this page's coordinates.
+      paging?.signalUserInteraction();
+      const viewportAnchor = captureViewportAnchor(sentinelRef.current, paging);
+      try {
+        const res = await loadOlderTape(msg.id, tapeId, before);
+        if (res.ok) await restoreViewportAnchor(viewportAnchor, paging);
+        return res;
+      } catch {
+        return { ok: false as const, error: true as const };
+      }
+    };
     try {
-      const res = await cb.onLoadOlderTape(msg.id, tapeId, before);
+      const res = paging
+        ? await paging.runExplicit(`${generation}::${cursorKey}`, requestPage)
+        : await requestPage();
       if (!res.ok) {
-        requestFailed = true;
         requestedCursorRef.current = null;
         if (res.error) setError(true);
-      } else {
-        await restoreViewportAnchor(viewportAnchor, paging);
       }
-    } catch {
-      requestFailed = true;
-      requestedCursorRef.current = null;
-      setError(true);
     } finally {
       loadingRef.current = false;
       setLoading(false);
-      if (claim && paging) {
-        // A virtualized-away failed tail has nowhere to show its retry CTA.
-        // Re-arm only that owner so a later remount can load it; a still-
-        // mounted failure remains manual until that retry UI itself unmounts.
-        if (requestFailed && !initialized) {
-          paging.markTailFailed(claim);
-          if (sentinelRef.current === null) paging.rearmTail(claim);
-        }
-        paging.settle(claim);
-      }
     }
   };
-  loadRef.current = (manual = false) => { void loadPage(manual); };
+  loadRef.current = () => { void loadPage(); };
 
-  // A history-revision reset reuses the same keyed control component after
-  // removing its loaded rows/cursor. Re-arm that fresh view generation so its
-  // next genuine upward intent is not blocked by stale refs.
+  // A history reset can reuse the same keyed row after removing loaded pages.
+  // Clear only this row's direct-click cursor; MessageList owns the automatic
+  // generation ledger above virtualization.
   useEffect(() => {
     const previous = controlStateRef.current;
     if (
@@ -532,64 +528,40 @@ export function TurnProcessCard({
       (previous.initialized && !initialized)
     ) {
       requestedCursorRef.current = null;
-      paging?.reset(generation);
     }
     controlStateRef.current = { id: msg.id, tapeId, initialized };
-  }, [generation, initialized, msg.id, paging, tapeId]);
-
-  useEffect(
-    () => () => paging?.rearmFailedTail(generation),
-    [generation, paging],
-  );
-
-  // Intersection only establishes proximity. The controller admits visible
-  // initial tails one at a time; initialized older cursors additionally need a
-  // fresh upward user epoch, so remounts/layout corrections cannot cascade.
-  useEffect(() => {
-    const node = sentinelRef.current;
-    if (!node || !canLoad || complete) return;
-    if (typeof IntersectionObserver === "undefined") {
-      loadRef.current(false);
-      return;
-    }
-    let visible = false;
-    const maybeLoad = () => {
-      if (visible) loadRef.current(false);
-    };
-    const observer = new IntersectionObserver((entries) => {
-      visible = entries.some((entry) => entry.isIntersecting);
-      maybeLoad();
-    }, { rootMargin: "240px 0px" });
-    observer.observe(node);
-    const scroller = node.closest<HTMLElement>(".chat-scroll-area");
-    const unsubscribeSettled = paging?.subscribeSettled(maybeLoad);
-    scroller?.addEventListener("scroll", maybeLoad, { passive: true });
-    scroller?.addEventListener("oc-upward-page-intent", maybeLoad);
-    return () => {
-      observer.disconnect();
-      unsubscribeSettled?.();
-      scroller?.removeEventListener("scroll", maybeLoad);
-      scroller?.removeEventListener("oc-upward-page-intent", maybeLoad);
-    };
-  }, [canLoad, complete, generation, initialized, msg.id, paging, tapeId]);
+  }, [initialized, msg.id, tapeId]);
 
   if (complete) return null;
+
+  const visibleError = error || (automaticError && !loading);
+  const visibleLoading = loading || automaticLoading;
 
   return (
     <div
       ref={sentinelRef}
-      className={error || !canLoad
+      className={visibleError || !canLoad || initialized || !autoLoadLatestTail
         ? "flex min-h-8 items-center justify-center py-1 text-xs text-muted"
         : "h-px overflow-hidden"}
       data-testid="turn-process-loader"
     >
-      {error ? (
-        <button type="button" className="text-danger" onClick={() => loadRef.current(true)}>
+      {visibleError ? (
+        <button type="button" className="text-danger" onClick={() => loadRef.current()}>
           更早记录加载失败，点击重试
         </button>
       ) : !canLoad ? (
         <span className="text-danger">真实记录暂时无法读取</span>
-      ) : loading ? <span className="sr-only">正在加载真实记录</span> : null}
+      ) : initialized || !autoLoadLatestTail ? (
+        <button
+          type="button"
+          onClick={() => loadRef.current()}
+          disabled={visibleLoading}
+          aria-busy={visibleLoading}
+          className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+        >
+          {visibleLoading ? <><Spinner size={12} /> 加载中…</> : "查看更早历史记录"}
+        </button>
+      ) : visibleLoading ? <span className="sr-only">正在加载真实记录</span> : null}
     </div>
   );
 }

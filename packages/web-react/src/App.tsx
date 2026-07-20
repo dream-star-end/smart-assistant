@@ -32,7 +32,11 @@ import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCe
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
-import { correctedScrollTop } from "./components/chat/archivePaging";
+import {
+  captureVisibleVirtualRowAnchor,
+  restoreVisibleVirtualRowAnchor,
+  type VisibleVirtualRowAnchor,
+} from "./components/chat/archivePaging";
 import { turnFinalAssistantFlags } from "./components/chat/turnSegment";
 import type { CardCallbacks } from "./components/chat/cards";
 import {
@@ -250,7 +254,7 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
-  // 归档「从云端加载更早历史」按钮子态(§4:加载中 / 失败可重试)。切会话时重置(见下)。
+  // 归档「查看更早历史记录」按钮子态(加载中 / 失败可重试)。切会话时重置(见下)。
   const [archiveLoading, setArchiveLoading] = useState(false);
   const [archiveError, setArchiveError] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -259,8 +263,23 @@ export function App() {
     scrollRef.current = node;
     setChatScrollParent((current) => current === node ? current : node);
   }, []);
-  // 归档前插视口锚点:点击加载前记录 scrollHeight/scrollTop,前插渲染后按高度差校正 scrollTop(见下)。
-  const archiveScrollAnchorRef = useRef<{ prevHeight: number; prevTop: number } | null>(null);
+  // 归档前插视口锚点:只有对应请求已返回后才允许消费，避免期间其它内容增长冒领锚点。
+  const archiveScrollAnchorRef = useRef<{
+    token: number;
+    capturedScrollTop: number;
+    row: VisibleVirtualRowAnchor | null;
+    ready: boolean;
+    cancelled: boolean;
+    restoring: boolean;
+    settle: () => void;
+  } | null>(null);
+  const archiveRequestTokenRef = useRef(0);
+  const settleArchiveAnchor = useCallback((token?: number) => {
+    const anchor = archiveScrollAnchorRef.current;
+    if (!anchor || (token !== undefined && anchor.token !== token)) return;
+    archiveScrollAnchorRef.current = null;
+    anchor.settle();
+  }, []);
   const stopRef = useRef(false);
   // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
   // “块级变量在声明前使用” 的 TDZ（hook 在下方调用后回填 sockRef.current）。
@@ -1657,6 +1676,18 @@ export function App() {
     const el = scrollRef.current;
     if (!el) return;
     stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    const anchor = archiveScrollAnchorRef.current;
+    if (
+      anchor && !anchor.cancelled && !anchor.restoring &&
+      Math.abs(el.scrollTop - anchor.capturedScrollTop) > 1
+    ) {
+      // 用户已经离开点击位置：响应仍须等 DOM 提交后释放 FIFO，但不再把视口拉回旧坐标。
+      anchor.cancelled = true;
+    }
+  }, [settleArchiveAnchor]);
+  const cancelArchiveCorrection = useCallback(() => {
+    const anchor = archiveScrollAnchorRef.current;
+    if (anchor) anchor.cancelled = true;
   }, []);
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
   useEffect(() => {
@@ -1664,8 +1695,13 @@ export function App() {
     scrollToChatBottom();
     setArchiveLoading(false);
     setArchiveError(false);
-    archiveScrollAnchorRef.current = null;
-  }, [activeId, scrollToChatBottom]);
+    archiveRequestTokenRef.current += 1;
+    settleArchiveAnchor();
+    return () => {
+      archiveRequestTokenRef.current += 1;
+      settleArchiveAnchor();
+    };
+  }, [activeId, scrollToChatBottom, settleArchiveAnchor]);
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
   useEffect(() => {
@@ -1673,44 +1709,84 @@ export function App() {
     scrollToChatBottom();
   }, [messages, streamText, chat.version, wsSending, scrollToChatBottom]);
 
-  // 归档「从云端加载更早历史」:前插旧消息会顶开视口,记录插入前 scrollHeight/scrollTop,
-  // 前插渲染后按高度差把 scrollTop 顶回去 → 用户视口锚定在原来那条消息,不跳。
+  // 归档「查看更早历史记录」:记录点击时屏幕里真实可见的消息行。前插渲染后持续把
+  // 该行恢复到原位置；底部仍在增长的实时 Agent 响应不会污染这次校正。
   const onLoadOlderHistory = useCallback(async () => {
     if (demo || !activeId) return;
+    settleArchiveAnchor();
+    const token = ++archiveRequestTokenRef.current;
     const el = scrollRef.current;
-    if (el) archiveScrollAnchorRef.current = { prevHeight: el.scrollHeight, prevTop: el.scrollTop };
+    let resolveAnchor: (() => void) | null = null;
+    const anchorSettled = el
+      ? new Promise<void>((resolve) => { resolveAnchor = resolve; })
+      : Promise.resolve();
+    const settle = () => {
+      const resolve = resolveAnchor;
+      resolveAnchor = null;
+      resolve?.();
+    };
+    archiveScrollAnchorRef.current = el
+      ? {
+        token,
+        capturedScrollTop: el.scrollTop,
+        row: captureVisibleVirtualRowAnchor(el),
+        ready: false,
+        cancelled: false,
+        restoring: false,
+        settle,
+      }
+      : null;
     setArchiveError(false);
     setArchiveLoading(true);
     try {
       // loadOlderHistory 是非抛出式契约:失败以 {ok:false} 返回(hasMore 不封死,可重试)。
       const res = await chat.loadOlderHistory(activeId);
+      if (archiveRequestTokenRef.current !== token) return;
       if (!res.ok) {
         setArchiveError(true);
-        archiveScrollAnchorRef.current = null;
+        settleArchiveAnchor(token);
+      } else if (res.loaded > 0) {
+        const anchor = archiveScrollAnchorRef.current;
+        if (anchor?.token === token) anchor.ready = true;
+      } else {
+        settleArchiveAnchor(token);
       }
     } catch {
+      if (archiveRequestTokenRef.current !== token) return;
       setArchiveError(true);
-      archiveScrollAnchorRef.current = null;
+      settleArchiveAnchor(token);
     } finally {
-      setArchiveLoading(false);
+      if (archiveRequestTokenRef.current === token) setArchiveLoading(false);
     }
-  }, [demo, activeId, chat]);
-  // 前插行渲染后(paint 前)校正 scrollTop;仅当内容真正变高才应用,避免其它 version bump
-  // (流式等)误触发。useLayoutEffect 先于 stick-to-bottom 的 useEffect,且此刻用户在顶部
-  // (stick=false)故不会被拽回底部。
+    // Keep the shared history FIFO occupied until this request's DOM insertion
+    // has either been anchored or deliberately cancelled by user navigation.
+    await anchorSettled;
+  }, [demo, activeId, chat, settleArchiveAnchor]);
+  // 对应归档响应完成且前插行渲染后(paint 前)才校正 scrollTop。请求在途时的 tape/live
+  // 增长没有 ready token，不能冒领这个锚点。
   useLayoutEffect(() => {
     const anchor = archiveScrollAnchorRef.current;
-    if (!anchor) return;
+    if (!anchor?.ready) return;
     const el = scrollRef.current;
     if (!el) {
-      archiveScrollAnchorRef.current = null;
+      settleArchiveAnchor(anchor.token);
       return;
     }
-    if (el.scrollHeight > anchor.prevHeight) {
-      el.scrollTop = correctedScrollTop(anchor.prevHeight, el.scrollHeight, anchor.prevTop);
-      archiveScrollAnchorRef.current = null;
+    if (anchor.cancelled || !anchor.row) {
+      settleArchiveAnchor(anchor.token);
+      return;
     }
-  }, [chat.version]);
+    if (anchor.restoring) return;
+    anchor.restoring = true;
+    void restoreVisibleVirtualRowAnchor(
+      el,
+      anchor.row,
+      () => {
+        const current = archiveScrollAnchorRef.current;
+        return !current || current.token !== anchor.token || current.cancelled;
+      },
+    ).finally(() => settleArchiveAnchor(anchor.token));
+  }, [archiveLoading, chat.version, settleArchiveAnchor]);
 
   // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
   // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
@@ -2026,7 +2102,15 @@ export function App() {
           />
         )}
 
-        <div ref={bindChatScroll} onScroll={onChatScroll} className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+        <div
+          ref={bindChatScroll}
+          onScroll={onChatScroll}
+          onWheel={cancelArchiveCorrection}
+          onTouchStart={cancelArchiveCorrection}
+          onPointerDown={cancelArchiveCorrection}
+          onKeyDown={cancelArchiveCorrection}
+          className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+        >
           {gated ? (
             <AgentGate
               phase={gate.phase}

@@ -1582,7 +1582,7 @@ export const api = {
     ).then((body) => body.goal),
 
   /**
-   * 取归档分页（GET /api/sessions/:id/archive，Bearer）——滚动加载被搬进归档 chunk 的更早历史。
+   * 取归档分页（GET /api/sessions/:id/archive，Bearer）——点击后从归档 chunk 读取一页更早历史。
    * `beforeSeq>0` → 只返 `_seq < beforeSeq` 的最近 `limit` 条（升序，上翻游标）；
    * 缺省(0) → server 从 archivedThroughSeq+1 起（最新归档页）。`limit` 默认 100、后端上限 200。
    */

@@ -3,7 +3,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { MessageList, type MessageListArchive } from '../../../components/MessageRenderer'
 import { MessageListSkeleton } from '../../../components/chat/HistorySkeleton'
 import type { PermissionRespond } from '../../../components/chat/PermissionCard'
-import { correctedScrollTop, loadedArchivedMetrics } from '../../../components/chat/archivePaging'
+import {
+  captureVisibleVirtualRowAnchor,
+  loadedArchivedMetrics,
+  restoreVisibleVirtualRowAnchor,
+  type VisibleVirtualRowAnchor,
+} from '../../../components/chat/archivePaging'
 import type { CardCallbacks } from '../../../components/chat/cards'
 import { MediaSignProvider } from '../../../components/chat/media'
 import { Alert, Badge, Button, EmptyState, Modal } from '../../../components/ui'
@@ -49,7 +54,15 @@ type TapeRecordsPayload = {
   total: number
 }
 
-type ScrollAnchor = { prevHeight: number; prevTop: number }
+type ScrollAnchor = {
+  token: number
+  capturedScrollTop: number
+  row: VisibleVirtualRowAnchor | null
+  ready: boolean
+  cancelled: boolean
+  restoring: boolean
+  settle: () => void
+}
 
 /**
  * admin 用户会话只读查看器。
@@ -84,6 +97,13 @@ export function SessionViewerModal({
   }, [])
   const initialScrollPendingRef = useRef(false)
   const archiveScrollAnchorRef = useRef<ScrollAnchor | null>(null)
+  const archiveRequestTokenRef = useRef(0)
+  const settleArchiveAnchor = useCallback((token?: number) => {
+    const anchor = archiveScrollAnchorRef.current
+    if (!anchor || (token !== undefined && anchor.token !== token)) return
+    archiveScrollAnchorRef.current = null
+    anchor.settle()
+  }, [])
   const loadGenerationRef = useRef(0)
   const expandingTapesRef = useRef<Set<string>>(new Set())
   const deferredPayloadCacheRef = useRef<{ key: string; records: ChatMessage[] } | null>(null)
@@ -95,7 +115,9 @@ export function SessionViewerModal({
   const sessionId = session?.session_id ?? null
 
   const loadSession = useCallback(() => {
+    settleArchiveAnchor()
     const generation = ++loadGenerationRef.current
+    archiveRequestTokenRef.current += 1
     setPayload(null)
     setMessages([])
     setError(null)
@@ -103,7 +125,6 @@ export function SessionViewerModal({
     setArchiveHasMore(false)
     setArchiveLoading(false)
     setArchiveError(false)
-    archiveScrollAnchorRef.current = null
     expandingTapesRef.current.clear()
     deferredPayloadQueueRef.current?.cancelAll()
     deferredPayloadCacheRef.current = null
@@ -133,18 +154,19 @@ export function SessionViewerModal({
       .finally(() => {
         if (generation === loadGenerationRef.current) setLoading(false)
       })
-  }, [sessionId, userId])
+  }, [sessionId, settleArchiveAnchor, userId])
 
   useEffect(() => {
     loadSession()
     return () => {
       loadGenerationRef.current++
+      archiveRequestTokenRef.current++
+      settleArchiveAnchor()
       deferredPayloadQueueRef.current?.cancelAll()
     }
-  }, [loadSession])
+  }, [loadSession, settleArchiveAnchor])
 
-  // 初载像用户打开会话一样落在最新消息；前插归档后按高度差校正，原可见位置不跳。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: 仅 messages 改变后 DOM 高度才已更新，loading 重渲不能提前消费 anchor。
+  // 初载像用户打开会话一样落在最新消息；只有对应归档响应 ready 后才消费前插锚点。
   useLayoutEffect(() => {
     const el = scrollRef.current
     if (!el) return
@@ -154,23 +176,65 @@ export function SessionViewerModal({
       return
     }
     const anchor = archiveScrollAnchorRef.current
-    if (!anchor) return
-    if (el.scrollHeight > anchor.prevHeight) {
-      el.scrollTop = correctedScrollTop(anchor.prevHeight, el.scrollHeight, anchor.prevTop)
+    if (!anchor?.ready) return
+    if (anchor.cancelled || !anchor.row) {
+      settleArchiveAnchor(anchor.token)
+      return
     }
-    archiveScrollAnchorRef.current = null
-  }, [messages])
+    if (anchor.restoring) return
+    anchor.restoring = true
+    void restoreVisibleVirtualRowAnchor(
+      el,
+      anchor.row,
+      () => {
+        const current = archiveScrollAnchorRef.current
+        return !current || current.token !== anchor.token || current.cancelled
+      },
+    ).finally(() => settleArchiveAnchor(anchor.token))
+  }, [archiveLoading, messages, settleArchiveAnchor])
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current
+    const anchor = archiveScrollAnchorRef.current
+    if (
+      el && anchor && !anchor.cancelled && !anchor.restoring &&
+      Math.abs(el.scrollTop - anchor.capturedScrollTop) > 1
+    ) {
+      anchor.cancelled = true
+    }
+  }, [])
+
+  const cancelArchiveCorrection = useCallback(() => {
+    const anchor = archiveScrollAnchorRef.current
+    if (anchor) anchor.cancelled = true
+  }, [])
 
   const loadOlder = useCallback(async () => {
     if (!sessionId || !userId || archiveLoading || !archiveHasMore) return
     const generation = loadGenerationRef.current
+    settleArchiveAnchor()
+    const token = ++archiveRequestTokenRef.current
     const el = scrollRef.current
-    if (el) {
-      archiveScrollAnchorRef.current = {
-        prevHeight: el.scrollHeight,
-        prevTop: el.scrollTop,
-      }
+    let resolveAnchor: (() => void) | null = null
+    const anchorSettled = el
+      ? new Promise<void>((resolve) => { resolveAnchor = resolve })
+      : Promise.resolve()
+    const settle = () => {
+      const resolve = resolveAnchor
+      resolveAnchor = null
+      resolve?.()
     }
+    archiveScrollAnchorRef.current = el
+      ? {
+        token,
+        capturedScrollTop: el.scrollTop,
+        row: captureVisibleVirtualRowAnchor(el),
+        ready: false,
+        cancelled: false,
+        restoring: false,
+        settle,
+      }
+      : null
     setArchiveLoading(true)
     setArchiveError(false)
     try {
@@ -181,18 +245,31 @@ export function SessionViewerModal({
       if (generation !== loadGenerationRef.current) return
       if (page.session_id !== sessionId) throw new Error('会话归档响应不匹配')
       const older = Array.isArray(page.messages) ? page.messages : []
-      if (older.length > 0) setMessages((current) => [...older, ...current])
+      if (older.length > 0) {
+        const anchor = archiveScrollAnchorRef.current
+        if (anchor?.token === token) anchor.ready = true
+        setMessages((current) => [...older, ...current])
+      }
       if (page.oldest_seq != null) setArchiveBefore(page.oldest_seq)
       setArchiveHasMore(page.has_more)
-      if (older.length === 0) archiveScrollAnchorRef.current = null
+      if (older.length === 0 && archiveScrollAnchorRef.current?.token === token) {
+        settleArchiveAnchor(token)
+      }
     } catch {
-      if (generation !== loadGenerationRef.current) return
-      archiveScrollAnchorRef.current = null
+      if (
+        generation !== loadGenerationRef.current ||
+        archiveRequestTokenRef.current !== token
+      ) return
+      settleArchiveAnchor(token)
       setArchiveError(true)
     } finally {
-      if (generation === loadGenerationRef.current) setArchiveLoading(false)
+      if (
+        generation === loadGenerationRef.current &&
+        archiveRequestTokenRef.current === token
+      ) setArchiveLoading(false)
     }
-  }, [archiveBefore, archiveHasMore, archiveLoading, sessionId, userId])
+    await anchorSettled
+  }, [archiveBefore, archiveHasMore, archiveLoading, sessionId, settleArchiveAnchor, userId])
 
   const archive = useMemo<MessageListArchive | undefined>(() => {
     if (!payload) return undefined
@@ -203,7 +280,7 @@ export function SessionViewerModal({
       archivedThroughSeq: payload.archived_through_seq,
       loading: archiveLoading,
       error: archiveError,
-      onLoadOlder: () => void loadOlder(),
+      onLoadOlder: loadOlder,
     }
   }, [archiveError, archiveHasMore, archiveLoading, loadOlder, messages, payload])
 
@@ -351,7 +428,15 @@ export function SessionViewerModal({
         sign={signMedia}
         authKey={sessionId && userId ? `admin-session:${userId}:${sessionId}` : null}
       >
-        <div ref={bindScroll} className="chat-scroll-area h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg">
+        <div
+          ref={bindScroll}
+          onScroll={onScroll}
+          onWheel={cancelArchiveCorrection}
+          onTouchStart={cancelArchiveCorrection}
+          onPointerDown={cancelArchiveCorrection}
+          onKeyDown={cancelArchiveCorrection}
+          className="chat-scroll-area h-full min-h-0 overflow-y-auto overflow-x-hidden bg-bg"
+        >
           {loading && !payload ? (
             <MessageListSkeleton />
           ) : error ? (

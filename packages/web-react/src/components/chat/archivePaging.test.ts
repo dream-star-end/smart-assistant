@@ -1,9 +1,12 @@
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
+  captureVisibleVirtualRowAnchor,
+  correctToVisibleVirtualRowAnchor,
   correctedScrollTop,
   loadedArchivedMetrics,
   planLoadMore,
+  restoreVisibleVirtualRowAnchor,
 } from "./archivePaging";
 
 function row(seq?: number): Pick<ChatMessage, "_seq"> {
@@ -54,6 +57,65 @@ describe("correctedScrollTop", () => {
   });
   test("高度未变 → scrollTop 不动", () => {
     expect(correctedScrollTop(1000, 1000, 300)).toBe(300);
+  });
+});
+
+describe("visible virtual row anchor", () => {
+  test("只校正顶部前插造成的行位移，不把底部 live answer 增长算进去", () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "stable-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    let rowTop = 120;
+    rowElement.getBoundingClientRect = () => ({
+      top: rowTop, bottom: rowTop + 40, left: 0, right: 800, width: 800, height: 40,
+      x: 0, y: rowTop, toJSON: () => ({}),
+    });
+
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    expect(anchor).toEqual({ key: "stable-row", top: 120 });
+    // 顶部归档新增 200px；同时底部 live answer 可增长任意高度，但稳定行只下移 200px。
+    rowTop = 320;
+    expect(correctToVisibleVirtualRowAnchor(scroller, anchor)).toBe(true);
+    expect(scroller.scrollTop).toBe(300);
+  });
+
+  test("首帧校正后用户滚动会取消后续帧，不再把视口拽回", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "stable-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    rowElement.getBoundingClientRect = () => ({
+      top: 320, bottom: 360, left: 0, right: 800, width: 800, height: 40,
+      x: 0, y: 320, toJSON: () => ({}),
+    });
+    const frames: Array<() => void> = [];
+    let cancelled = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      { key: "stable-row", top: 120 },
+      () => cancelled,
+      (callback) => frames.push(callback),
+    );
+
+    frames.shift()!();
+    expect(scroller.scrollTop).toBe(300);
+    scroller.scrollTop = 250;
+    cancelled = true;
+    frames.shift()!();
+    await restoring;
+    expect(scroller.scrollTop).toBe(250);
+    expect(frames).toHaveLength(0);
   });
 });
 
