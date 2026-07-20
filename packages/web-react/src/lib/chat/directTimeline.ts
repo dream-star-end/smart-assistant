@@ -1,5 +1,110 @@
-import type { ChatMessage } from "./model";
-import { isTurnTapeProcessControl, turnTapeProcessKey } from "./render";
+import type { BashTail, ChatMessage, ChildBlock } from "./model";
+import {
+  isCcbBashOutputTailEnvelope,
+  isTurnTapeProcessControl,
+  turnTapeProcessKey,
+} from "./render";
+
+type LoadedBashTail = BashTail & { toolUseId: string };
+
+function loadedBashTail(message: ChatMessage): LoadedBashTail | null {
+  if (!isCcbBashOutputTailEnvelope(message)) return null;
+  const raw = message._runtimeEvent as Record<string, unknown>;
+  if (typeof raw.tool_use_id !== "string" || raw.tool_use_id.length === 0) return null;
+  return {
+    toolUseId: raw.tool_use_id,
+    tail: typeof raw.tail === "string" ? raw.tail : "",
+    totalBytes: typeof raw.total_bytes === "number" && Number.isFinite(raw.total_bytes)
+      ? raw.total_bytes
+      : 0,
+    truncatedHead: raw.truncated_head === true,
+  };
+}
+
+function sameBashTail(a: BashTail | undefined, b: LoadedBashTail): boolean {
+  return !!a &&
+    a.tail === b.tail &&
+    a.totalBytes === b.totalBytes &&
+    a.truncatedHead === b.truncatedHead;
+}
+
+/**
+ * Reapply exact historical CCB Bash tail snapshots to their canonical tool
+ * cards after each lazy page merge. The raw immutable runtime rows stay in
+ * the message set for exact inspection, but are not separate chat cards.
+ *
+ * Scanning the assembled timeline makes both load orders work and also joins
+ * post-terminal continuation tapes back to a tool in the originating tape.
+ * Equal byte counts use the later timeline/ordinal snapshot; lower counts can
+ * never replace a newer live or historical tail.
+ */
+function reconcileLoadedBashTails(messages: ChatMessage[]): ChatMessage[] {
+  const latestByTool = new Map<string, LoadedBashTail>();
+  for (const message of messages) {
+    const next = loadedBashTail(message);
+    if (!next) continue;
+    const previous = latestByTool.get(next.toolUseId);
+    if (!previous || next.totalBytes >= previous.totalBytes) {
+      latestByTool.set(next.toolUseId, next);
+    }
+  }
+  if (latestByTool.size === 0) return messages;
+
+  let changed = false;
+  const reconciled = messages.map((message) => {
+    let nextMessage = message;
+    if (message.role === "tool" && typeof message.blockId === "string") {
+      const tail = latestByTool.get(message.blockId);
+      if (
+        tail &&
+        tail.totalBytes >= (message.bashTail?.totalBytes ?? 0) &&
+        !sameBashTail(message.bashTail, tail)
+      ) {
+        nextMessage = {
+          ...message,
+          bashTail: {
+            tail: tail.tail,
+            totalBytes: tail.totalBytes,
+            truncatedHead: tail.truncatedHead,
+          },
+        };
+        changed = true;
+      }
+    }
+
+    if (Array.isArray(message.childBlocks)) {
+      let childrenChanged = false;
+      const childBlocks = message.childBlocks.map((child): ChildBlock => {
+        if (child.kind !== "tool_use" || typeof child.blockId !== "string") return child;
+        const tail = latestByTool.get(child.blockId);
+        if (
+          !tail ||
+          tail.totalBytes < (child.bashTail?.totalBytes ?? 0) ||
+          sameBashTail(child.bashTail, tail)
+        ) return child;
+        childrenChanged = true;
+        return {
+          ...child,
+          bashTail: {
+            tail: tail.tail,
+            totalBytes: tail.totalBytes,
+            truncatedHead: tail.truncatedHead,
+          },
+        };
+      });
+      if (childrenChanged) {
+        nextMessage = {
+          ...nextMessage,
+          childBlocks,
+          _runtimeBashTailRevision: (message._runtimeBashTailRevision ?? 0) + 1,
+        };
+        changed = true;
+      }
+    }
+    return nextMessage;
+  });
+  return changed ? reconciled : messages;
+}
 
 /** Merge one immutable reverse physical-ordinal page around its process cursor.
  * The already-visible genuine narrative is retained byte-for-byte; fetched
@@ -76,9 +181,9 @@ export function mergeTapePage(
     .filter((message) => !isSameTapeRecord(message))
     .map((message) => message.id === sourceAnchor.id ? anchor : message);
   const controlIndex = withoutSection.findIndex((message) => message.id === sourceAnchor.id);
-  return [
+  return reconcileLoadedBashTails([
     ...withoutSection.slice(0, controlIndex + 1),
     ...mergedSection,
     ...withoutSection.slice(controlIndex + 1),
-  ];
+  ]);
 }

@@ -6,6 +6,7 @@ import {
   defaultCollapsed,
   errorLabel,
   errorPresentation,
+  isRedundantRuntimeEnvelope,
   isLive,
   messageKind,
   messageSignature,
@@ -38,6 +39,34 @@ describe("messageKind 角色分派", () => {
   test("未知 role → unknown（不出卡）", () => {
     // @ts-expect-error 故意传未知 role 验证 fail-safe
     expect(messageKind({ role: "whatever" })).toBe("unknown");
+  });
+});
+
+describe("底层 runtime 封包展示边界", () => {
+  test("CCB bash_output_tail 只更新 Bash 工具卡，不独立渲染原始消息卡", () => {
+    expect(isRedundantRuntimeEnvelope(mk("runtime-event", {
+      _runtimeSource: "ccb",
+      _runtimeEvent: {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "tool-bash",
+        tail: "真实后台输出",
+        total_bytes: 18,
+      },
+    }))).toBe(true);
+  });
+
+  test("未投影的真实 runtime 事件仍可检查", () => {
+    for (const event of [
+      { type: "tool_progress", tool_use_id: "tool-1" },
+      { type: "assistant_error", error: "exact failure" },
+      { type: "future_runtime_event", exact: true },
+    ]) {
+      expect(isRedundantRuntimeEnvelope(mk("runtime-event", {
+        _runtimeSource: "ccb",
+        _runtimeEvent: event,
+      }))).toBe(false);
+    }
   });
 });
 
@@ -181,6 +210,36 @@ describe("childSignature", () => {
     const a = childSignature({ kind: "tool_use", blockId: "b", bashTail: { tail: "a", totalBytes: 10, truncatedHead: false } });
     const b = childSignature({ kind: "tool_use", blockId: "b", bashTail: { tail: "ab", totalBytes: 20, truncatedHead: false } });
     expect(a).not.toBe(b);
+  });
+  test("bashTail 相同字节数但正文/截断态变化 → 签名变化", () => {
+    const a = childSignature({ kind: "tool_use", blockId: "b", bashTail: { tail: "旧", totalBytes: 20, truncatedHead: false } });
+    const b = childSignature({ kind: "tool_use", blockId: "b", bashTail: { tail: "新", totalBytes: 20, truncatedHead: true } });
+    expect(a).not.toBe(b);
+  });
+});
+
+describe("历史 Bash tail 展示签名", () => {
+  test("顶层工具相同 totalBytes 的后序快照仍触发重渲", () => {
+    const before = mk("tool", {
+      toolName: "Bash",
+      bashTail: { tail: "旧快照", totalBytes: 42, truncatedHead: false },
+    });
+    const after = {
+      ...before,
+      bashTail: { tail: "新快照", totalBytes: 42, truncatedHead: true },
+    };
+    expect(messageSignature(before, CTX)).not.toBe(messageSignature(after, CTX));
+  });
+
+  test("exact agent-group 的 presentation revision 穿透 tape SHA 快捷签名", () => {
+    const before = mk("agent-group", {
+      _turnTapeComplete: true,
+      _turnTapeSha256: "a".repeat(64),
+      _runtimeBashTailRevision: 1,
+      childBlocks: [{ kind: "tool_use", blockId: "child", toolName: "Bash" }],
+    });
+    const after = { ...before, _runtimeBashTailRevision: 2 };
+    expect(messageSignature(before, CTX)).not.toBe(messageSignature(after, CTX));
   });
 });
 

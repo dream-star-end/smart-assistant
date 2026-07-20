@@ -280,6 +280,8 @@ export type ChatMessage = {
   _turnTapeProcessLoadedFrom?: string;
   /** 下一页物理 ordinal；null=已读完。 */
   _turnTapeProcessCursor?: number | null;
+  /** 历史 Bash tail 并入 agent-group 子工具后的纯展示修订号；不持久化、不替代 tape。 */
+  _runtimeBashTailRevision?: number;
 
   /** 空轮 notice 标记。*/
   _emptyTurn?: boolean;

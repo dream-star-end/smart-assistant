@@ -18,7 +18,7 @@ import {
 } from "@openclaude/protocol";
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import { isServerAuthoredRow } from "./model";
-import type { ChatMessage, ChildBlock } from "./model";
+import type { BashTail, ChatMessage, ChildBlock } from "./model";
 import { friendlyBridgeErrorMessage } from "./pure";
 
 /**
@@ -200,9 +200,23 @@ export function messageKind(m: Pick<ChatMessage, "role">): MessageKind {
  *
  * This is presentation-only: no tape bytes are deleted or rewritten. Unknown
  * future roles and runtime events that are not proven duplicates remain
- * inspectable. Runtime batches contain only runtime-event rows; bash output
- * tails are explicitly excluded from batching by the tape writer.
+ * inspectable. Runtime batches contain only runtime-event rows; standalone
+ * bash output tails are reconciled into their owning Bash tool card by the
+ * direct timeline loader while the exact envelope remains in memory/tape.
  */
+export function isCcbBashOutputTailEnvelope(message: ChatMessage): boolean {
+  if (
+    message.role !== "runtime-event" ||
+    message._runtimeSource !== "ccb" ||
+    message._turnTapeProcess ||
+    message._turnStatusRecord
+  ) return false;
+  const event = message._runtimeEvent;
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  const raw = event as Record<string, unknown>;
+  return raw.type === "system" && raw.subtype === "bash_output_tail";
+}
+
 export function isRedundantRuntimeEnvelope(message: ChatMessage): boolean {
   if (
     message.role !== "runtime-event" ||
@@ -212,6 +226,8 @@ export function isRedundantRuntimeEnvelope(message: ChatMessage): boolean {
 
   if (message._runtimeSource === "codex-jsonrpc") return true;
   if (message._runtimeSource !== "ccb") return false;
+
+  if (isCcbBashOutputTailEnvelope(message)) return true;
 
   const event = message._runtimeEvent;
   if (!event || typeof event !== "object" || Array.isArray(event)) return false;
@@ -229,6 +245,13 @@ function textSig(t: string | undefined): string {
   return `${t.length}:${t.slice(-16)}`;
 }
 
+/** Bash tail 是 replace 快照；相同 totalBytes 也可能带来新的正文/截断态。 */
+function bashTailSig(tail: BashTail | undefined): string {
+  return tail
+    ? `${tail.totalBytes}:${tail.truncatedHead ? 1 : 0}:${tail.tail}`
+    : "";
+}
+
 /** 子块（agent-group childBlocks 项）渲染签名。per-child 比较的最小充分集。 */
 export function childSignature(ch: ChildBlock): string {
   const raw = ch as ChildBlock & { error?: unknown };
@@ -244,7 +267,7 @@ export function childSignature(ch: ChildBlock): string {
     textSig(ch.tail),
     typeof raw.error === "string" ? textSig(raw.error) : raw.error ? 1 : 0,
     ch.partialJson ? ch.partialJson.length : 0,
-    ch.bashTail?.totalBytes ?? 0,
+    bashTailSig(ch.bashTail),
     ch.explanation ? textSig(ch.explanation) : "",
     ch.objective ? textSig(ch.objective) : "",
     ch.steps?.map((step) => `${step.status}:${textSig(step.step)}`).join(",") ?? "",
@@ -257,7 +280,7 @@ function childBlocksSignature(message: ChatMessage): string {
   // walking tens of thousands of children on every unrelated UI render; the
   // children are still all present and are progressively mounted by the card.
   if (message._turnTapeComplete && message._turnTapeSha256) {
-    return `tape:${message._turnTapeSha256}:${blocks.length}`;
+    return `tape:${message._turnTapeSha256}:${blocks.length}:${message._runtimeBashTailRevision ?? 0}`;
   }
   return blocks.map(childSignature).join(";");
 }
@@ -322,7 +345,7 @@ export function messageSignature(
         m.partialJson ? m.partialJson.length : 0,
         m.inputJson ? 1 : 0,
         m.inputPreview ? m.inputPreview.length : 0,
-        m.bashTail?.totalBytes ?? 0,
+        bashTailSig(m.bashTail),
       ].join("|");
     case "plan":
       return [
