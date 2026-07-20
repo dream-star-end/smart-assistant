@@ -926,88 +926,48 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  test("打开会话只自动读取最新 Agent 过程尾页，更早过程必须点击", async () => {
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
-    const cb = { onLoadOlderTape };
-    const process = (id: string, tapeId: string, ts: number): ChatMessage =>
+  test("统一时间线直接展示最新思考、工具和回答，不存在过程折叠卡或隐式请求", () => {
+    const rows = [
+      mk("user", { id: "u-latest", text: "最新问题", ts: 1, _timelineRecord: true }),
+      mk("thinking", {
+        id: "thinking-latest",
+        text: "最新真实思考",
+        ts: 2,
+        _timelineRecord: true,
+        _timelineUnitKey: "tape:t:0:0:thinking-latest",
+      }),
+      mk("tool", {
+        id: "tool-latest",
+        text: "最新真实工具输出",
+        output: "最新真实工具输出",
+        toolName: "Bash",
+        _completed: true,
+        ts: 3,
+        _timelineRecord: true,
+        _timelineUnitKey: "tape:t:1:0:tool-latest",
+      }),
+      mk("assistant", {
+        id: "answer-latest",
+        text: "最新真实回答",
+        ts: 4,
+        _timelineRecord: true,
+        _timelineUnitKey: "tape:t:2:0:answer-latest",
+      }),
       mk("runtime-event", {
-        id,
-        ts,
+        id: "turn-process:stale",
         _turnTapeProcess: true,
-        _turnTapeId: tapeId,
-        _turnTapeSha256: `sha-${tapeId}`,
-      });
-    const initial = [
-      mk("user", { id: "u-old", text: "旧问题", ts: 1 }),
-      process("turn-process:old", "tape-old", 2),
-      mk("assistant", { id: "a-old", text: "旧回答", ts: 3 }),
-      mk("user", { id: "u-latest", text: "最新问题", ts: 4 }),
-      process("turn-process:latest", "tape-latest", 5),
-      mk("assistant", { id: "a-latest", text: "最新回答", ts: 6 }),
+        text: "绝不能展示",
+      }),
     ];
-    const view = render(
-      <MessageList
-        messages={initial}
-        sending={false}
-        cb={cb}
-        onRespondPermission={() => {}}
-      />,
+    render(
+      <MessageList messages={rows} sending={false} cb={{}} onRespondPermission={() => {}} />,
     );
-
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
-    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
-      1, "turn-process:latest", "tape-latest", null,
-    );
-    view.rerender(
-      <MessageList
-        messages={initial.map((message) => message.id === "turn-process:latest"
-          ? { ...message, _turnTapeProcessExpanded: true, _turnTapeProcessCursor: null }
-          : message)}
-        sending={false}
-        cb={cb}
-        onRespondPermission={() => {}}
-      />,
-    );
-    await act(async () => {});
-    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenNthCalledWith(
-      2, "turn-process:old", "tape-old", null,
-    ));
-  });
-
-  test("同 history generation 从 expanded 重置为 unexpanded 时 owner 恰好重取一页", async () => {
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
-    const cb = { onLoadOlderTape };
-    const control = mk("runtime-event", {
-      id: "turn-process:reset-same-generation",
-      _turnTapeProcess: true,
-      _turnTapeId: "tape-reset",
-      _turnTapeSha256: "sha-reset",
-    });
-    const renderListState = (message: ChatMessage) => (
-      <MessageList
-        messages={[message, mk("assistant", { id: "reset-answer", text: "最终回答" })]}
-        sending={false}
-        cb={cb}
-        onRespondPermission={() => {}}
-        historyGeneration="same-generation"
-      />
-    );
-    const view = render(renderListState(control));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
-
-    view.rerender(renderListState({
-      ...control,
-      _turnTapeProcessExpanded: true,
-      _turnTapeProcessCursor: null,
-    }));
-    await act(async () => {});
-    view.rerender(renderListState({ ...control }));
-
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
-    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
-      2, "turn-process:reset-same-generation", "tape-reset", null,
-    );
+    expect(screen.getByText("最新真实思考")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /终端/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /终端/ }));
+    expect(screen.getByText("最新真实工具输出")).toBeInTheDocument();
+    expect(screen.getByText("最新真实回答")).toBeInTheDocument();
+    expect(screen.queryByText(/Agent 调用过程|查看原始思考记录|绝不能展示/)).toBeNull();
   });
 
   test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
@@ -1025,20 +985,14 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.queryByText("m9999")).toBeNull();
   });
 
-  test("最新过程控制行远离虚拟视口时仍在会话 mount 取一页，之后滚动零新增请求", async () => {
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: false, error: true });
+  test("滚动到任意位置都不会触发历史请求", async () => {
+    const onLoadOlder = vi.fn();
     const scroller = document.createElement("div");
     scroller.className = "chat-scroll-area";
     document.body.appendChild(scroller);
     render(
       <MessageList
         messages={[
-          mk("runtime-event", {
-            id: "turn-process:far-latest",
-            _turnTapeProcess: true,
-            _turnTapeId: "tape-far-latest",
-            _turnTapeSha256: "sha-far-latest",
-          }),
           ...users(300).map((message, index) => ({
             ...message,
             id: `tail-${index}`,
@@ -1047,20 +1001,17 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
           })),
         ]}
         sending={false}
-        cb={{ onLoadOlderTape }}
+        cb={{}}
         onRespondPermission={() => {}}
         scrollParent={scroller}
         historyGeneration="far-control"
+        archive={{ ...noArchive, archivedCount: 100, archivedThroughSeq: 5, onLoadOlder }}
       />,
     );
-
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
-      "turn-process:far-latest", "tape-far-latest", null,
-    ));
     fireEvent.wheel(scroller, { deltaY: -600 });
     fireEvent.scroll(scroller, { target: { scrollTop: 0 } });
     await act(async () => {});
-    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
+    expect(onLoadOlder).not.toHaveBeenCalled();
     scroller.remove();
   });
 
@@ -1177,6 +1128,22 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(document.body.textContent).toContain(marker);
   });
 
+  test("统一时间线中的未来角色即使没有 tape id 也不会被静默丢弃", () => {
+    const marker = "EXACT_FUTURE_TIMELINE_PAYLOAD";
+    renderMsg({
+      id: "future-timeline-role-1",
+      role: "future-timeline-event" as ChatMessage["role"],
+      text: marker,
+      ts: 2,
+      _timelineRecord: true,
+      _timelineUnitKey: "outer:88:future-timeline-role-1",
+    });
+
+    expect(screen.getByText("原始 Agent 记录 · future-timeline-event")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /原始 Agent 记录/ }));
+    expect(document.body.textContent).toContain(marker);
+  });
+
   test("计划卡保留易读体验，同时可查看 immutable tape 的完整事件序列", () => {
     const marker = "EXACT_PLAN_EVENT_HISTORY_MARKER";
     renderMsg({
@@ -1242,27 +1209,16 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     scroller.remove();
   });
 
-  test("归档请求在途时过程页点击排队，响应完成后才读取真实 tape", async () => {
+  test("统一历史请求在途时按钮原位禁用，不会发起第二条分页请求", async () => {
     let finishArchive!: () => void;
     const archivePage = new Promise<void>((resolve) => { finishArchive = resolve; });
     const onLoadOlder = vi.fn(() => archivePage);
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
 
     render(
       <MessageList
-        messages={[
-          mk("runtime-event", {
-            id: "turn-process:latest",
-            _turnTapeProcess: true,
-            _turnTapeProcessExpanded: true,
-            _turnTapeProcessCursor: 10,
-            _turnTapeId: "tape-latest",
-            _turnTapeSha256: "sha-latest",
-          }),
-          mk("assistant", { id: "answer", text: "最新回答" }),
-        ]}
+        messages={[mk("assistant", { id: "answer", text: "最新回答" })]}
         sending={false}
-        cb={{ onLoadOlderTape }}
+        cb={{}}
         onRespondPermission={() => {}}
         archive={{ ...noArchive, archivedCount: 20, archivedThroughSeq: 5, onLoadOlder }}
       />,
@@ -1270,15 +1226,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录（还有 20 条）/ }));
     await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
-    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
-    await act(async () => {});
-    expect(onLoadOlderTape).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "加载中…" })).toBeDisabled();
 
     await act(async () => finishArchive());
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
-    expect(onLoadOlderTape).toHaveBeenCalledWith(
-      "turn-process:latest", "tape-latest", 10,
-    );
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
   });
 
   test("本地翻尽 + 无归档 → 无按钮", () => {
@@ -1436,7 +1387,7 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
     _turnTapeProcessPageKey: pageKey,
   } as ChatMessage);
 
-  test("物理页按有界渲染 chunk 虚拟化且绝不跨 pageKey 合并", () => {
+  test("每条真实记录各占一个虚拟项，不按物理页合并成巨型滚动项", () => {
     const pageA = Array.from({ length: 70 }, (_, index) => processRow(`a-${index}`, "page-a", index));
     const pageB = Array.from({ length: 35 }, (_, index) => processRow(`b-${index}`, "page-b", 100 + index));
     const { container } = render(
@@ -1448,12 +1399,8 @@ describe("长时间线虚拟分页与活跃状态稳定性", () => {
       />,
     );
 
-    const chunks = Array.from(container.querySelectorAll<HTMLElement>("[data-tape-page-chunk]"));
-    expect(chunks).toHaveLength(5);
-    expect(chunks.every((chunk) => Number(chunk.dataset.chunkItems) <= 32)).toBe(true);
-    expect(chunks.map((chunk) => chunk.dataset.tapePageKey)).toEqual([
-      "page-a", "page-a", "page-a", "page-b", "page-b",
-    ]);
+    expect(container.querySelector("[data-tape-page-chunk]")).not.toBeInTheDocument();
+    expect(container.querySelectorAll("[data-chat-virtual-key]")).toHaveLength(105);
     expect(screen.getByText("真实过程 a-0")).toBeInTheDocument();
     expect(screen.getByText("真实过程 b-34")).toBeInTheDocument();
   });

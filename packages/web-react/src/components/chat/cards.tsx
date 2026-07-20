@@ -7,7 +7,6 @@ import {
   AlertTriangle,
   Brain,
   ChevronRight,
-  ChevronUp,
   Check,
   Copy,
   Info,
@@ -26,10 +25,6 @@ import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol
 import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
-  turnProcessPagingGeneration,
-  type UserUpwardPagingController,
-} from "../../lib/chat/tapePaging";
-import {
   CONTINUE_PROMPT,
   childSignature,
   defaultCollapsed,
@@ -40,7 +35,7 @@ import {
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
-import { Alert, Avatar, Badge, Button, IconButton, Spinner } from "../ui";
+import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
 import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { Media } from "./media";
 import { ResponseRatingCard } from "./ResponseRating";
@@ -80,12 +75,6 @@ export type CardCallbacks = {
   onFeedback?: (ctx: FeedbackContext) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
-  /** 视口到达一轮真实过程的顶部时，按 exclusive before 拉一页更早 immutable records。 */
-  onLoadOlderTape?: (
-    anchorId: string,
-    tapeId: string,
-    before: number | null,
-  ) => Promise<{ ok: boolean; nextCursor?: number | null; error?: boolean; busy?: boolean }>;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
   onFetchTapeRecordPayload?: (
     tapeId: string,
@@ -365,207 +354,6 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
   );
 }
 
-// ═══════════════ 真实 Agent 过程显式惰性分页控制 ═══════════════
-/** 默认时间线直接渲染真实思考、工具、委派和运行事件。这个零内容哨兵只负责
- * 从 tape 尾页开始向前取更早的 immutable records；它不是 Agent 内容或摘要卡。 */
-type ViewportAnchor = {
-  scroller: HTMLElement;
-  key: string;
-  top: number;
-  interactionVersion: number | null;
-};
-
-function virtualItemKey(element: HTMLElement): string | null {
-  const key = element.dataset.chatVirtualKey;
-  return typeof key === "string" && key.length > 0 ? key : null;
-}
-
-/** Capture a real row after the process cursor. Older tape pages are inserted
- * before that row, so restoring its exact viewport offset keeps the content
- * under the user's eyes pixel-stable even when Virtuoso remeasures rows. */
-function captureViewportAnchor(
-  sentinel: HTMLElement | null,
-  paging: UserUpwardPagingController | undefined,
-): ViewportAnchor | null {
-  const scroller = sentinel?.closest<HTMLElement>(".chat-scroll-area");
-  const control = sentinel?.closest<HTMLElement>("[data-chat-virtual-key]");
-  if (!scroller || !control) return null;
-  const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"));
-  const controlIndex = rows.indexOf(control);
-  if (controlIndex < 0) return null;
-  const viewport = scroller.getBoundingClientRect();
-  const candidates = rows.slice(controlIndex + 1);
-  const row = candidates.find((candidate) => candidate.getBoundingClientRect().bottom > viewport.top)
-    ?? candidates[0];
-  if (!row) return null;
-  const key = virtualItemKey(row);
-  if (!key) return null;
-  return {
-    scroller,
-    key,
-    top: row.getBoundingClientRect().top - viewport.top,
-    interactionVersion: paging?.interactionVersion() ?? null,
-  };
-}
-
-function restoreViewportAnchor(
-  anchor: ViewportAnchor | null,
-  paging: UserUpwardPagingController | undefined,
-): Promise<void> {
-  if (!anchor || typeof requestAnimationFrame !== "function") return Promise.resolve();
-  return new Promise((resolve) => {
-    let frames = 0;
-    const correct = () => {
-      if (
-        paging && anchor.interactionVersion !== null &&
-        paging.interactionVersion() !== anchor.interactionVersion
-      ) {
-        resolve();
-        return;
-      }
-      frames += 1;
-      const row = Array.from(
-        anchor.scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
-      ).find((candidate) => virtualItemKey(candidate) === anchor.key);
-      if (row) {
-        const currentTop = row.getBoundingClientRect().top - anchor.scroller.getBoundingClientRect().top;
-        const delta = currentTop - anchor.top;
-        if (Math.abs(delta) > 0.5) {
-          const nextTop = anchor.scroller.scrollTop + delta;
-          anchor.scroller.scrollTop = nextTop;
-        }
-      }
-      // React notification + Virtuoso measurement can span several frames.
-      // Re-apply the exact residual delta; this never fetches or hides content.
-      if (frames < 12) requestAnimationFrame(correct);
-      else resolve();
-    };
-    requestAnimationFrame(correct);
-  });
-}
-
-export function TurnProcessCard({
-  msg,
-  cb,
-  paging,
-  historyGeneration = "legacy",
-  autoLoadLatestTail = false,
-  automaticLoading = false,
-  automaticError = false,
-}: {
-  msg: ChatMessage;
-  cb: CardCallbacks;
-  paging?: UserUpwardPagingController;
-  historyGeneration?: number | string;
-  /** Only the newest process control gets one automatic tail read. */
-  autoLoadLatestTail?: boolean;
-  /** MessageList owns the non-virtual automatic tail request. */
-  automaticLoading?: boolean;
-  automaticError?: boolean;
-}) {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(false);
-  const sentinelRef = useRef<HTMLDivElement>(null);
-  const loadingRef = useRef(false);
-  // Direct/single-card surfaces retain a tiny local single-flight fallback.
-  // Production MessageList always owns the controller outside virtual rows.
-  const requestedCursorRef = useRef<string | null>(null);
-  const controlStateRef = useRef({ id: msg.id, tapeId: msg._turnTapeId, initialized: false });
-  const loadRef = useRef<() => void>(() => {});
-  const initialized = msg._turnTapeProcessExpanded === true;
-  const before = initialized && typeof msg._turnTapeProcessCursor === "number"
-    ? msg._turnTapeProcessCursor
-    : null;
-  const complete = initialized && msg._turnTapeProcessCursor === null;
-  const tapeId = msg._turnTapeId;
-  const canLoad = !!cb.onLoadOlderTape && typeof tapeId === "string" && tapeId.length > 0;
-  const generation = turnProcessPagingGeneration(historyGeneration, msg);
-
-  const loadPage = async () => {
-    const loadOlderTape = cb.onLoadOlderTape;
-    if (!loadOlderTape || !tapeId || complete || loadingRef.current) return;
-    const cursorKey = initialized ? String(before) : "tail";
-    if (!paging && requestedCursorRef.current === cursorKey) return;
-    requestedCursorRef.current = cursorKey;
-    loadingRef.current = true;
-    setLoading(true);
-    setError(false);
-    const requestPage = async () => {
-      // Capture only when this FIFO slot starts. Capturing at click time would
-      // make an earlier queued insertion invalidate this page's coordinates.
-      paging?.signalUserInteraction();
-      const viewportAnchor = captureViewportAnchor(sentinelRef.current, paging);
-      try {
-        const res = await loadOlderTape(msg.id, tapeId, before);
-        if (res.ok) await restoreViewportAnchor(viewportAnchor, paging);
-        return res;
-      } catch {
-        return { ok: false as const, error: true as const };
-      }
-    };
-    try {
-      const res = paging
-        ? await paging.runExplicit(`${generation}::${cursorKey}`, requestPage)
-        : await requestPage();
-      if (!res.ok) {
-        requestedCursorRef.current = null;
-        if (res.error) setError(true);
-      }
-    } finally {
-      loadingRef.current = false;
-      setLoading(false);
-    }
-  };
-  loadRef.current = () => { void loadPage(); };
-
-  // A history reset can reuse the same keyed row after removing loaded pages.
-  // Clear only this row's direct-click cursor; MessageList owns the automatic
-  // generation ledger above virtualization.
-  useEffect(() => {
-    const previous = controlStateRef.current;
-    if (
-      previous.id !== msg.id || previous.tapeId !== tapeId ||
-      (previous.initialized && !initialized)
-    ) {
-      requestedCursorRef.current = null;
-    }
-    controlStateRef.current = { id: msg.id, tapeId, initialized };
-  }, [initialized, msg.id, tapeId]);
-
-  if (complete) return null;
-
-  const visibleError = error || (automaticError && !loading);
-  const visibleLoading = loading || automaticLoading;
-
-  return (
-    <div
-      ref={sentinelRef}
-      className={visibleError || !canLoad || initialized || !autoLoadLatestTail
-        ? "flex min-h-8 items-center justify-center py-1 text-xs text-muted"
-        : "h-px overflow-hidden"}
-      data-testid="turn-process-loader"
-    >
-      {visibleError ? (
-        <button type="button" className="text-danger" onClick={() => loadRef.current()}>
-          更早记录加载失败，点击重试
-        </button>
-      ) : !canLoad ? (
-        <span className="text-danger">真实记录暂时无法读取</span>
-      ) : initialized || !autoLoadLatestTail ? (
-        <button
-          type="button"
-          onClick={() => loadRef.current()}
-          disabled={visibleLoading}
-          aria-busy={visibleLoading}
-          className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
-        >
-          {visibleLoading ? <><Spinner size={12} /> 加载中…</> : "查看更早历史记录"}
-        </button>
-      ) : visibleLoading ? <span className="sr-only">正在加载真实记录</span> : null}
-    </div>
-  );
-}
-
 /** Durable dispatch failure rendered as status, never as Agent-authored text. */
 export function TurnStatusCard({
   msg,
@@ -841,9 +629,13 @@ export const ThinkingCard = memo(
   function ThinkingCard({
     msgs,
     ctx,
+    alwaysExpanded = false,
   }: {
     msgs: ChatMessage[];
     ctx: RenderCtx;
+    /** Historical unified-timeline rows render directly, never as a hidden
+     * "raw thinking" disclosure or collapsed substitute. */
+    alwaysExpanded?: boolean;
     /** 分组渲染签名(memo 比较键)。所有调用方必须传，否则 memo 会误判为无变化。*/
     sig?: string;
   }) {
@@ -852,7 +644,7 @@ export const ThinkingCard = memo(
     const live = isLive(msgs[msgs.length - 1] ?? { role: "thinking" }, ctx);
     const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
     // 默认折叠态权威仍走 render 层 defaultCollapsed（thinking：流式展开、完成折叠）；用户手动切换后本地锁定。
-    const collapsed = userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx);
+    const collapsed = alwaysExpanded ? false : (userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx));
     const segments = thinkingSegments(msgs.map((m) => m.text));
     // 折叠态摘要：完成后取最新段首个粗体标题；流式中保持稳定的"思考过程"
     // （不随 delta/角色切换闪烁）。
@@ -860,20 +652,27 @@ export const ThinkingCard = memo(
     const headline = live ? "思考过程" : summary ? `已思考 · ${summary}` : "已思考";
     return (
       <div className="rounded-lg border border-border bg-surface/60 animate-in">
-        <button
-          type="button"
-          onClick={() => setUserCollapsed(!collapsed)}
-          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
-        >
-          <Brain size={14} className="shrink-0 text-faint" />
-          <span className="min-w-0 truncate font-medium" title={headline}>
-            {headline}
-          </span>
-          <ChevronRight
-            size={14}
-            className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
-          />
-        </button>
+        {alwaysExpanded ? (
+          <div className="flex w-full items-center gap-2 px-3.5 py-2 text-[13px] text-muted">
+            <Brain size={14} className="shrink-0 text-faint" />
+            <span className="font-medium">思考过程</span>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setUserCollapsed(!collapsed)}
+            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
+          >
+            <Brain size={14} className="shrink-0 text-faint" />
+            <span className="min-w-0 truncate font-medium" title={headline}>
+              {headline}
+            </span>
+            <ChevronRight
+              size={14}
+              className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
+            />
+          </button>
+        )}
         {!collapsed && segments.length > 0 && (
           <div className="border-t border-border px-3.5 py-2.5">
             {segments.map((seg, i) => (
@@ -899,7 +698,7 @@ export const ThinkingCard = memo(
       </div>
     );
   },
-  (a, b) => a.sig === b.sig,
+  (a, b) => a.sig === b.sig && a.alwaysExpanded === b.alwaysExpanded,
 );
 
 // ═══════════════ plan ═══════════════

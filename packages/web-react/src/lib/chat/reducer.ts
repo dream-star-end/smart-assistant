@@ -493,12 +493,14 @@ function mergeDelegateProgressIntoGroup(sess: ChatSession, groupMsg: ChatMessage
   return true;
 }
 
-/** Viewport-loaded immutable tape rows are historical evidence, not live UI
- * state. Normalizers may operate around them but must never rewrite or remove
- * the rows themselves. */
+/** Unified timeline rows are historical evidence, not live UI state.
+ * Normalizers may operate around them but must never rewrite or remove them.
+ * The legacy marker remains recognized only while rolling caches are drained. */
 function isImmutableTapeViewportRow(message: ChatMessage): boolean {
-  return typeof message._turnTapeProcessLoadedFrom === "string" &&
-    message._turnTapeProcessLoadedFrom.length > 0;
+  return message._timelineRecord === true || (
+    typeof message._turnTapeProcessLoadedFrom === "string" &&
+    message._turnTapeProcessLoadedFrom.length > 0
+  );
 }
 
 function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): boolean {
@@ -1296,9 +1298,13 @@ export function applyOutboundMessage(
               ? { cronPush: true, cronLabel: frame.cronJob?.label }
               : {};
             Object.assign(extra, idOverride);
+            if (frameTurnOwnerId) extra._turnOwnerId = frameTurnOwnerId;
             return addMessage(sess, "assistant", "", extra);
           },
         );
+      }
+      if (frameTurnOwnerId && !sess._streamingAssistant._turnOwnerId) {
+        sess._streamingAssistant._turnOwnerId = frameTurnOwnerId;
       }
       sess._streamingAssistant.text += blockText;
       sess._streamingAssistant.completedAt = Date.now();
@@ -1313,8 +1319,14 @@ export function applyOutboundMessage(
           sess.messages,
           "thinking",
           b.messageId,
-          (idOverride) => addMessage(sess, "thinking", "", idOverride),
+          (idOverride) => addMessage(sess, "thinking", "", {
+            ...idOverride,
+            ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
+          }),
         );
+      }
+      if (frameTurnOwnerId && !sess._streamingThinking._turnOwnerId) {
+        sess._streamingThinking._turnOwnerId = frameTurnOwnerId;
       }
       sess._streamingThinking.text += blockText;
       sess._streamingThinking.completedAt = Date.now();
@@ -1330,6 +1342,7 @@ export function applyOutboundMessage(
           _partial: !!pb.partial,
           explanation: pb.explanation || "",
           steps: Array.isArray(pb.steps) ? pb.steps : [],
+          ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
         });
       } else {
         if (typeof pb.text === "string") planMsg.text = pb.text;
@@ -1337,6 +1350,7 @@ export function applyOutboundMessage(
         if (Array.isArray(pb.steps)) planMsg.steps = pb.steps;
         planMsg._partial = !!pb.partial;
         planMsg.completedAt = Date.now();
+        if (frameTurnOwnerId) planMsg._turnOwnerId = frameTurnOwnerId;
       }
     } else if (b.kind === "goal") {
       const gb = b as {
@@ -1370,6 +1384,7 @@ export function applyOutboundMessage(
         platformGoalId: gb.platformGoalId,
         platformStateRevision: gb.platformStateRevision,
         completedAt: Date.now(),
+        ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
       };
       if (!goalMsg) {
         goalMsg = addMessage(sess, "goal", objective, goalFields);
@@ -1496,6 +1511,7 @@ export function applyOutboundMessage(
         const mid = sess._blockIdToMsgId.get(tb.blockId);
         const existing = sess.messages.find((m) => m.id === mid);
         if (existing) {
+          if (frameTurnOwnerId && !existing._turnOwnerId) existing._turnOwnerId = frameTurnOwnerId;
           existing.inputPreview = tb.inputPreview || existing.inputPreview;
           // §8 partialJson offset 累加。
           const deltaResult = applyPartialJsonDelta(existing.partialJson, tb);
@@ -1524,6 +1540,7 @@ export function applyOutboundMessage(
           _completed: false,
           output: null,
           error: false,
+          ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
         });
         if (tb.blockId) sess._blockIdToMsgId?.set(tb.blockId, m.id);
       }
@@ -1546,6 +1563,7 @@ export function applyOutboundMessage(
         const groupMsgId = sess._agentGroups.get(agentToolUseId);
         const groupMsg = sess.messages.find((m) => m.id === groupMsgId);
         if (groupMsg) {
+          if (frameTurnOwnerId && !groupMsg._turnOwnerId) groupMsg._turnOwnerId = frameTurnOwnerId;
           const rawOutput = rb.output ?? rb.preview ?? "";
           const rawPreview = rb.preview ?? rawOutput;
           const preview = friendlyDelegateResultPreview(rawPreview) || (isDelegateResultWrapper(rawPreview) ? "" : rawPreview);
@@ -1563,6 +1581,7 @@ export function applyOutboundMessage(
         const mid = sess._blockIdToMsgId.get(toolUseId);
         const existing = sess.messages.find((m) => m.id === mid);
         if (existing) {
+          if (frameTurnOwnerId && !existing._turnOwnerId) existing._turnOwnerId = frameTurnOwnerId;
           existing._completed = true;
           existing.output = rb.output ?? rb.preview ?? "";
           if (rb.outputJson !== undefined) existing.outputJson = rb.outputJson;
@@ -1582,6 +1601,7 @@ export function applyOutboundMessage(
         inputJson: null,
         inputPreview: "",
         _partial: false,
+        ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
       });
       if (rb.blockId) sess._blockIdToMsgId?.set(rb.blockId, m.id);
     } else if (b.kind === "tool_output_tail") {
@@ -1639,6 +1659,7 @@ export function applyOutboundMessage(
               _emptyTurnSoft: cls.soft,
               _emptyTurnStopReason: cls.stopReason,
               _emptyTurnTargetMsgId: autoTid,
+              ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
             });
           }
         }

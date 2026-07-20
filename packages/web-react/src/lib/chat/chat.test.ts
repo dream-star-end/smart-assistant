@@ -961,6 +961,41 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s._streamingAssistant).toBeNull();
   });
 
+  test("every live Agent process role is stamped with its owning user turn", () => {
+    const s = sess();
+    const owner = "cm-owned-process";
+    addMessage(s, "user", "run", { id: owner, status: "sent" });
+    s._activeClientMessageId = owner;
+    s._sendingInFlight = true;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: owner,
+      blocks: [
+        { kind: "text", text: "answer", messageId: "live-answer" },
+        { kind: "thinking", text: "thought", messageId: "live-thinking" },
+        { kind: "plan", blockId: "owned-plan", text: "plan", steps: [] },
+        { kind: "goal", blockId: "owned-goal", objective: "goal", status: "active" },
+        { kind: "tool_use", blockId: "owned-tool", toolName: "Bash", inputJson: { command: "true" } },
+        { kind: "tool_use", blockId: "owned-agent", toolName: "Agent", inputJson: { description: "review" } },
+        {
+          kind: "delegate_progress",
+          runId: "owned-run",
+          agentId: "reviewer",
+          phase: "start",
+          goal: "review",
+          text: "started",
+        },
+      ],
+    }));
+
+    const process = s.messages.filter((message) =>
+      message.role !== "user" && message.role !== "permission" && message.role !== "system");
+    expect(new Set(process.map((message) => message.role))).toEqual(new Set([
+      "assistant", "thinking", "plan", "goal", "tool", "agent-group", "delegate-progress",
+    ]));
+    expect(process.every((message) => message._turnOwnerId === owner)).toBe(true);
+  });
+
   test("empty turn (end_turn, no answer) schedules ONE auto-continue", () => {
     const s = sess();
     const u = addMessage(s, "user", "hi", { status: "sent", ts: 1 });

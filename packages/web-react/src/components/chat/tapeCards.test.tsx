@@ -4,9 +4,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
-import { UserUpwardPagingController } from "../../lib/chat/tapePaging";
 import { MessageRenderer } from "../MessageRenderer";
-import { TurnProcessCard, type CardCallbacks } from "./cards";
+import type { CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
 
 afterEach(() => {
@@ -30,108 +29,6 @@ function renderMsg(message: ChatMessage, cb: CardCallbacks = {}) {
     />,
   );
 }
-
-function processControl(over: Partial<ChatMessage> = {}): ChatMessage {
-  return {
-    id: "turn-process:tape-1",
-    role: "runtime-event",
-    text: "",
-    ts: 1000,
-    _source: "server",
-    _turnTapeProcess: true,
-    _turnTapeProcessCount: 873,
-    _turnTapeTotalBytes: 192 * 1024 * 1024,
-    _dispatchOutcome: "completed",
-    _turnTapeId: "tape-1",
-    _turnTapeSha256: "sha-1",
-    _clientMessageId: "cm-1",
-    ...over,
-  };
-}
-
-describe("TurnProcessCard", () => {
-  test("latest-tail owner loading stays invisible and never renders a folded Agent card", () => {
-    const onLoadOlderTape = vi.fn();
-    render(
-      <TurnProcessCard
-        msg={processControl()}
-        cb={{ onLoadOlderTape }}
-        autoLoadLatestTail
-        automaticLoading
-      />,
-    );
-    expect(onLoadOlderTape).not.toHaveBeenCalled();
-    expect(screen.getByText("正在加载真实记录")).toHaveClass("sr-only");
-    expect(screen.queryByText(/Agent 调用过程|点击展开|收起/)).toBeNull();
-  });
-
-  test("without a read callback it reports unavailable without inventing Agent content", () => {
-    renderMsg(processControl());
-    expect(screen.getByText("真实记录暂时无法读取")).toBeInTheDocument();
-    expect(screen.queryByText(/Agent 调用过程/)).toBeNull();
-  });
-
-  test("an initialized cursor waits for an explicit click before requesting one older physical page", async () => {
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 100 });
-    renderMsg(processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 }), {
-      onLoadOlderTape,
-    });
-    expect(onLoadOlderTape).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
-      "turn-process:tape-1", "tape-1", 200,
-    ));
-    expect(screen.queryByText(/Agent 调用过程|继续加载更多|收起|截断|省略|替换/)).toBeNull();
-  });
-
-  test("cursor null removes the loader after every physical page is loaded", () => {
-    renderMsg(processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: null }), {
-      onLoadOlderTape: vi.fn(),
-    });
-    expect(screen.queryByTestId("turn-process-loader")).toBeNull();
-  });
-
-  test("a latest-tail owner failure exposes one explicit retry", async () => {
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
-    render(
-      <TurnProcessCard
-        msg={processControl()}
-        cb={{ onLoadOlderTape }}
-        autoLoadLatestTail
-        automaticError
-      />,
-    );
-    fireEvent.click(screen.getByRole("button", {
-      name: "更早记录加载失败，点击重试",
-    }));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
-      "turn-process:tape-1", "tape-1", null,
-    ));
-  });
-
-  test("older uninitialized/initialized controls ignore navigation signals and load only when clicked", async () => {
-    const paging = new UserUpwardPagingController();
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 100 });
-    const cb = { onLoadOlderTape };
-    const view = render(<TurnProcessCard msg={processControl()} cb={cb} paging={paging} />);
-    act(() => paging.signalUserInteraction());
-    expect(onLoadOlderTape).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenNthCalledWith(
-      1, "turn-process:tape-1", "tape-1", null,
-    ));
-
-    const second = processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 100 });
-    view.rerender(<TurnProcessCard msg={second} cb={cb} paging={paging} historyGeneration={7} />);
-    act(() => paging.signalUserInteraction());
-    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenNthCalledWith(
-      2, "turn-process:tape-1", "tape-1", 100,
-    ));
-  });
-
-});
 
 describe("deferred oversized immutable record", () => {
   const deferred: ChatMessage = {

@@ -45,7 +45,17 @@ export function correctedScrollTop(prevHeight: number, newHeight: number, prevTo
   return prevTop + (newHeight - prevHeight);
 }
 
-export type VisibleVirtualRowAnchor = { key: string; top: number };
+export type VisibleVirtualRowAnchor = {
+  key: string;
+  top: number;
+  scrollTop: number;
+  scrollHeight: number;
+  dataIndex: string | null;
+};
+
+function virtualRowDataIndex(row: HTMLElement): string | null {
+  return row.closest<HTMLElement>("[data-index]")?.getAttribute("data-index") ?? null;
+}
 
 /** Capture an actual rendered row instead of total scrollHeight. Bottom live
  * growth then cannot contaminate correction for rows prepended at the top. */
@@ -62,7 +72,13 @@ export function captureVisibleVirtualRowAnchor(
   }) ?? rows.find((candidate) => candidate.getBoundingClientRect().bottom > viewport.top);
   const key = row?.getAttribute("data-chat-virtual-key");
   if (!row || !key) return null;
-  return { key, top: row.getBoundingClientRect().top - viewport.top };
+  return {
+    key,
+    top: row.getBoundingClientRect().top - viewport.top,
+    scrollTop: scroller.scrollTop,
+    scrollHeight: scroller.scrollHeight,
+    dataIndex: virtualRowDataIndex(row),
+  };
 }
 
 /** Re-align one exact immutable virtual row. Returns false while Virtuoso has
@@ -74,7 +90,18 @@ export function correctToVisibleVirtualRowAnchor(
   const row = Array.from(
     scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
   ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
-  if (!row) return false;
+  if (!row) {
+    // A large prepend can temporarily move the anchor outside Virtuoso's
+    // mounted range before its per-row measurements settle. Move by the
+    // observed total-height delta as a bootstrap only; subsequent frames use
+    // the exact immutable row as soon as it remounts. This is not the final
+    // correction, so concurrent bottom growth cannot permanently skew it.
+    const heightDelta = scroller.scrollHeight - anchor.scrollHeight;
+    if (Math.abs(heightDelta) > 0.5) {
+      scroller.scrollTop = anchor.scrollTop + heightDelta;
+    }
+    return false;
+  }
   const currentTop = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
   const delta = currentTop - anchor.top;
   if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
@@ -96,16 +123,99 @@ export function restoreVisibleVirtualRowAnchor(
   },
 ): Promise<void> {
   return new Promise((resolve) => {
-    let frames = 0;
+    let observedPrependLayout = false;
+    let lastBeforeTop: number | null = null;
+    let beforeTopStableFrames = 0;
+    let stableFrames = 0;
     const correct = () => {
       if (cancelled()) {
         resolve();
         return;
       }
-      correctToVisibleVirtualRowAnchor(scroller, anchor);
-      frames += 1;
-      if (frames < 12) schedule(correct);
-      else resolve();
+      const beforeRow = Array.from(
+        scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
+      const beforeTop = beforeRow
+        ? beforeRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+        : null;
+      const beforeDataIndex = beforeRow ? virtualRowDataIndex(beforeRow) : null;
+      // react-virtuoso writes each mounted row's current data-array position to
+      // its outer `data-index` wrapper. A real prepend moves the same immutable
+      // row to a higher data index; bottom/live growth leaves it unchanged.
+      // This is direct DOM evidence that Virtuoso accepted the older page,
+      // unlike itemsRendered which need not fire when the visible set is stable.
+      const rowReindexed =
+        anchor.dataIndex !== null &&
+        beforeDataIndex !== null &&
+        beforeDataIndex !== anchor.dataIndex;
+      if (
+        rowReindexed ||
+        beforeTop === null ||
+        Math.abs(beforeTop - anchor.top) > 0.5
+      ) {
+        observedPrependLayout = true;
+      }
+
+      if (beforeTop === null) {
+        lastBeforeTop = null;
+        beforeTopStableFrames = 0;
+        stableFrames = 0;
+        correctToVisibleVirtualRowAnchor(scroller, anchor);
+        schedule(correct);
+        return;
+      }
+
+      if (lastBeforeTop !== null && Math.abs(beforeTop - lastBeforeTop) <= 0.5) {
+        beforeTopStableFrames += 1;
+      } else {
+        beforeTopStableFrames = 1;
+      }
+      lastBeforeTop = beforeTop;
+
+      // On a slow renderer Virtuoso can still be applying its own measured
+      // prepend deviation. Writing scrollTop every frame while that value is
+      // moving creates a ± one-row feedback loop. Wait for the unmodified row
+      // position to form a two-frame plateau, then make one exact correction.
+      if (!observedPrependLayout || beforeTopStableFrames < 2) {
+        stableFrames = 0;
+        schedule(correct);
+        return;
+      }
+
+      const beforeAligned = Math.abs(beforeTop - anchor.top) <= 0.5;
+      const found = correctToVisibleVirtualRowAnchor(scroller, anchor);
+      if (!beforeAligned) {
+        lastBeforeTop = null;
+        beforeTopStableFrames = 0;
+        stableFrames = 0;
+        schedule(correct);
+        return;
+      }
+      const row = Array.from(
+        scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+      ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
+      const currentTop = row
+        ? row.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+        : null;
+
+      if (
+        observedPrependLayout &&
+        found && currentTop !== null &&
+        Math.abs(currentTop - anchor.top) <= 0.5
+      ) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+      }
+      // Do not finish on an arbitrary frame budget. Under a slow scheduler the
+      // immutable row can remount after many frames; resolving before that is
+      // the exact cause of the visible history jump. Two post-layout stable
+      // frames prove the row entered the frame already mounted and aligned,
+      // rather than merely looking aligned immediately after this frame's
+      // correction. User input/session switch still terminates immediately
+      // through `cancelled`.
+      if (stableFrames >= 2) resolve();
+      else schedule(correct);
     };
     schedule(correct);
   });

@@ -18,6 +18,7 @@ import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, it } from 'node:test'
+import type { ClientTimelineCursor } from '../sessionsDb.js'
 
 const testHome = await mkdtemp(join(tmpdir(), 'oc-archive-spill-'))
 process.env.OPENCLAUDE_HOME = testHome
@@ -29,10 +30,13 @@ const {
   ARCHIVE_CHUNK_MAX_BYTES,
   ARCHIVE_CHUNK_MAX_MSGS,
   bumpClientSessionHistoryRevision,
+  decodeClientTimelineCursor,
+  encodeClientTimelineCursor,
   getClientSession,
   getClientSessionPartial,
   getSessionsDb,
   readArchivedMessages,
+  readClientTimelinePage,
   selectEngineContextSuffix,
   SESSION_TAIL_MIN_MSGS,
   SESSION_SOFT_TRIM_BYTES,
@@ -394,7 +398,13 @@ describe('browser direct timeline (SQLite compatibility)', () => {
     assert.equal((exact!.messages[0] as Msg)._runtimeEvent !== undefined, true)
     const timeline = await getClientSession('web-chat-direct-tape', USER, { view: 'timeline' })
     const timelineMessages = timeline!.messages as Msg[]
-    assert.deepEqual(timelineMessages, exact!.messages)
+    assert.deepEqual(
+      timelineMessages.map(({ _timelineRecord, _timelineUnitKey, ...message }) => message),
+      exact!.messages,
+    )
+    assert.equal(timelineMessages.every((message) => (
+      message._timelineRecord === true && typeof message._timelineUnitKey === 'string'
+    )), true)
 
     const partial = await getClientSessionPartial(
       'web-chat-direct-tape', USER, 1, {
@@ -402,10 +412,13 @@ describe('browser direct timeline (SQLite compatibility)', () => {
         sinceHistoryRevision: timeline!.historyRevision,
       },
     )
-    assert.equal(partial!.isPartial, true)
+    // Timeline sync always returns one complete latest record page. It must not
+    // apply the legacy `_seq` suffix filter, which could hide thinking/tools
+    // that belong beside the newest assistant response.
+    assert.equal(partial!.isPartial, false)
     assert.equal(partial!.maxSeq, 2)
-    assert.equal((partial!.messages[0] as Msg).id, 'raw-tail')
-    assert.equal((partial!.messages[0] as Msg)._runtimeEvent !== undefined, true)
+    assert.deepEqual((partial!.messages as Msg[]).map((message) => message.id), ['raw-hidden', 'raw-tail'])
+    assert.equal((partial!.messages as Msg[]).every((message) => message._runtimeEvent !== undefined), true)
   })
 
   it('external direct-timeline status invalidates the incremental cursor without adding content', async () => {
@@ -785,5 +798,87 @@ describe('deleteClientSession — 归档级联清理', () => {
     const db = await getSessionsDb()
     const n = (db.prepare('SELECT count(*) AS n FROM client_session_archive_chunks WHERE session_id = ?').get('web-del-other') as { n: number }).n
     assert.ok(n > 0, '旁会话归档不受影响')
+  })
+})
+
+describe('unified client timeline — opaque cursor and unbounded traversal', () => {
+  it('cursor codec accepts only the canonical generation/order/tape identity shape', () => {
+    const cursor = {
+      version: 1 as const,
+      timelineGeneration: 7,
+      beforeOrderSeq: 42,
+      tapeId: 'a'.repeat(64),
+      tapeSha256: 'b'.repeat(64),
+      beforeOrdinal: 3,
+    }
+    assert.deepEqual(decodeClientTimelineCursor(encodeClientTimelineCursor(cursor)), cursor)
+    for (const invalid of [
+      '',
+      Buffer.from('{}').toString('base64url'),
+      Buffer.from(JSON.stringify({ ...cursor, timelineGeneration: 0 })).toString('base64url'),
+      Buffer.from(JSON.stringify({ ...cursor, beforeOrdinal: -1 })).toString('base64url'),
+      Buffer.from(JSON.stringify({ ...cursor, tapeSha256: 'not-a-hash' })).toString('base64url'),
+    ]) assert.equal(decodeClientTimelineCursor(invalid), null)
+  })
+
+  it('walks every durable record by explicit pages with no duplicate, loss, or total ceiling', async () => {
+    const sessionId = 'web-unified-timeline-many'
+    const messages = Array.from({ length: 530 }, (_, index) => ({
+      id: `timeline-${index}`,
+      role: index % 4 === 0 ? 'thinking' : index % 4 === 1 ? 'tool' : index % 4 === 2 ? 'assistant' : 'user',
+      text: `exact-${index}`,
+      ts: 1000 + index,
+      _source: 'server',
+    }))
+    assert.equal(await upsertClientSession({
+      id: sessionId, userId: USER, agentId: 'main', title: 'timeline', pinned: false,
+      createdAt: 1, lastAt: 2, messages, updatedAt: 1000,
+    }, 0), 'applied')
+
+    let cursor: ClientTimelineCursor | null = null
+    let hasMore = true
+    const all: Msg[] = []
+    const pageSizes: number[] = []
+    while (hasMore) {
+      const page = await readClientTimelinePage(sessionId, USER, cursor, 200)
+      assert.ok(page)
+      pageSizes.push(page.messages.length)
+      all.unshift(...page.messages as Msg[])
+      cursor = page.nextCursor
+      hasMore = page.hasMore
+      assert.equal(hasMore, cursor !== null)
+    }
+    assert.deepEqual(pageSizes, [200, 200, 130])
+    assert.equal(all.length, 530)
+    assert.equal(new Set(all.map((message) => message._timelineUnitKey)).size, 530)
+    assert.equal(all[0]?.text, 'exact-0')
+    assert.equal(all.at(-1)?.text, 'exact-529')
+    assert.equal(all.every((message) => message._timelineRecord === true), true)
+  })
+
+  it('rejects an old cursor only after a verified identity change, not ordinary spill movement', async () => {
+    const sessionId = 'web-unified-timeline-generation'
+    const messages = makeMsgs(300, 11 * 1024, 'timeline-gen')
+    assert.equal(await upsertClientSession({
+      id: sessionId, userId: USER, agentId: 'main', title: 'timeline', pinned: false,
+      createdAt: 1, lastAt: 2, messages, updatedAt: 1000,
+    }, 0), 'applied')
+    const first = await readClientTimelinePage(sessionId, USER, null, 20)
+    assert.ok(first?.nextCursor)
+    const stableGeneration = first.timelineGeneration
+    const archivedBefore = (await getClientSession(sessionId, USER))?.archivedCount ?? 0
+
+    assert.deepEqual(await appendServerAuthoredMessage(sessionId, USER, {
+      id: 'timeline-gen-new', role: 'assistant', text: 'z'.repeat(800 * 1024), ts: 5000,
+    }), { applied: true })
+    assert.ok(((await getClientSession(sessionId, USER))?.archivedCount ?? 0) > archivedBefore)
+    const stillValid = await readClientTimelinePage(sessionId, USER, first.nextCursor, 20)
+    assert.equal(stillValid?.timelineGeneration, stableGeneration)
+
+    assert.equal(await bumpClientSessionHistoryRevision(sessionId, USER), true)
+    await assert.rejects(
+      readClientTimelinePage(sessionId, USER, first.nextCursor, 20),
+      { name: 'ClientTimelineCursorStaleError' },
+    )
   })
 })

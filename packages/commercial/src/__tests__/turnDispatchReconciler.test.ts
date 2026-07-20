@@ -176,6 +176,9 @@ describe('terminal-unnotified branch (financial safety)', () => {
     assert.equal(counts.notified, 1)
     assert.equal(counts.manualReconcile, 0)
     assert.ok(pool.writes.some((w) => w.includes('client_notified = TRUE')))
+    assert.ok(pool.writes.some((w) =>
+      w.includes('history_revision = history_revision + 1') &&
+      w.includes('timeline_generation = timeline_generation + 1')))
     assert.ok(!pool.writes.some((w) => w.includes('turn_dispatch_error_projections')))
     assert.ok(!pool.writes.some((w) => w.includes("status = 'manual_reconcile'")))
     assert.equal(alerts.length, 0)
@@ -439,7 +442,6 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
       acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
     })
     let nudged = 0
-    const revisionBumps: Array<[string, string]> = []
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
@@ -449,17 +451,15 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
         }),
       },
       nudgeClient: () => { nudged++ },
-      bumpHistoryRevision: async (sessionId, sessionUserId) => {
-        revisionBumps.push([sessionId, sessionUserId])
-        return true
-      },
     })
     assert.equal(counts.visibleFailures, 1)
     assert.equal(counts.notified, 1)
     assert.equal(nudged, 1)
     assert.ok(pool.writes.some((w) =>
       w.includes("status = 'terminal'") && w.includes('failure_code = $3')))
-    assert.deepEqual(revisionBumps, [['sess-0001', 'c:42']])
+    assert.ok(pool.writes.some((w) =>
+      w.includes('history_revision = history_revision + 1') &&
+      w.includes('timeline_generation = timeline_generation + 1')))
   })
 })
 

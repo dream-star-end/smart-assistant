@@ -224,6 +224,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       messages TEXT NOT NULL DEFAULT '[]',
       message_count INTEGER NOT NULL DEFAULT 0,
       history_revision INTEGER NOT NULL DEFAULT 0,
+      timeline_generation INTEGER NOT NULL DEFAULT 1,
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_client_sessions_last ON client_sessions(last_at);
@@ -244,6 +245,16 @@ export async function getSessionsDb(): Promise<Database.Database> {
       db.exec("ALTER TABLE client_sessions ADD COLUMN deleted_at INTEGER DEFAULT NULL")
       // Migrate existing __deleted__ tombstones to the new column
       db.exec("UPDATE client_sessions SET deleted_at = updated_at WHERE title = '__deleted__'")
+    }
+  } catch { /* table just created with column already */ }
+  // Browser history cursor identity. Unlike history_revision, this advances
+  // only when a durable timeline unit is removed/replaced/reordered. Ordinary
+  // append, hot/archive spill and billing overlays keep the same generation,
+  // so an already loaded cursor page remains valid for the page lifetime.
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'timeline_generation')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN timeline_generation INTEGER NOT NULL DEFAULT 1')
     }
   } catch { /* table just created with column already */ }
   // Migration: history revision for mutations that cannot be represented
@@ -1388,11 +1399,84 @@ export interface ClientSession {
   /** Server-owned revision for history changes invisible to `_seq`.
    * Optional on write inputs for rolling callers; every DB read populates it. */
   historyRevision?: number
+  /** Stable identity epoch for the browser's unified history cursor. This is
+   * deliberately independent from historyRevision: spill and mutable billing
+   * overlays do not invalidate already loaded immutable records. */
+  timelineGeneration?: number
+  /** Next exclusive cursor for the unified newest-first browser timeline. */
+  timelineCursor?: ClientTimelineCursor | null
+  /** Whether the unified timeline has an older page. */
+  timelineHasMore?: boolean
+  /** Highest actual durable `_seq` observed in the same timeline snapshot. */
+  timelineSnapshotMaxSeq?: number
   // 归档水位(热尾巴 + 归档)。读侧透传给客户端:archivedCount 用于"还有 N 条"计数与
   // "从云端加载更早历史"按钮是否出现;archivedThroughSeq 名称为滚动兼容保留,
   // 值是 `_orderSeq` 水位。旧行/无归档 → 0。
   archivedCount?: number
   archivedThroughSeq?: number
+}
+
+/**
+ * Exclusive cursor over the browser's one real chronological record stream.
+ * `beforeOrderSeq` moves between durable outer records. When `tapeId` is
+ * present, the next page first resumes inside that immutable tape at physical
+ * ordinals strictly lower than `beforeOrdinal`.
+ */
+export interface ClientTimelineCursor {
+  version: 1
+  timelineGeneration: number
+  beforeOrderSeq: number
+  tapeId?: string
+  tapeSha256?: string
+  beforeOrdinal?: number
+}
+
+export interface ClientTimelinePage {
+  /** Exact records in chronological (oldest to newest) order. */
+  messages: MessageLike[]
+  nextCursor: ClientTimelineCursor | null
+  hasMore: boolean
+  timelineGeneration: number
+  historyRevision: number
+  /** Derived from actual hot-row messages in this read snapshot. */
+  snapshotMaxSeq: number
+}
+
+export class ClientTimelineCursorStaleError extends Error {
+  constructor() {
+    super('client timeline cursor generation is stale')
+    this.name = 'ClientTimelineCursorStaleError'
+  }
+}
+
+const TIMELINE_CURSOR_TAPE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/
+const TIMELINE_CURSOR_SHA_RE = /^[0-9a-f]{64}$/
+
+/** Opaque wire form. It is integrity-checked again against the session row and
+ * immutable tape identity inside the same database snapshot. */
+export function encodeClientTimelineCursor(cursor: ClientTimelineCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url')
+}
+
+export function decodeClientTimelineCursor(raw: string): ClientTimelineCursor | null {
+  if (!raw || raw.length > 512) return null
+  try {
+    const value = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Partial<ClientTimelineCursor>
+    if (
+      value.version !== 1 ||
+      !Number.isSafeInteger(value.timelineGeneration) || (value.timelineGeneration ?? 0) < 1 ||
+      !Number.isSafeInteger(value.beforeOrderSeq) || (value.beforeOrderSeq ?? 0) < 1
+    ) return null
+    const hasTape = value.tapeId !== undefined || value.tapeSha256 !== undefined || value.beforeOrdinal !== undefined
+    if (hasTape && (
+      typeof value.tapeId !== 'string' || !TIMELINE_CURSOR_TAPE_ID_RE.test(value.tapeId) ||
+      typeof value.tapeSha256 !== 'string' || !TIMELINE_CURSOR_SHA_RE.test(value.tapeSha256) ||
+      !Number.isSafeInteger(value.beforeOrdinal) || (value.beforeOrdinal ?? -1) < 0
+    )) return null
+    return value as ClientTimelineCursor
+  } catch {
+    return null
+  }
 }
 
 export interface ClientSessionMeta {
@@ -2801,6 +2885,9 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
     const historyRevisionDelta = existing && (
       hasInvisibleHistoryMutation(oldMsgs, finalMessages, tail) || spill.archivedDelta > 0
     ) ? 1 : 0
+    const timelineGenerationDelta = existing && hasInvisibleMessageRemoval(oldMsgs, finalMessages)
+      ? 1
+      : 0
 
     // Size guard — see MAX_SESSION_BYTES(spill 后作用于 tail;tail ≤ TAIL_TARGET(2M) < 4M,
     // 理论不可达,保留作最后防线)。Buffer.byteLength 让多字节 UTF-8(中文/emoji)按落盘字节计。
@@ -2831,7 +2918,8 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
         next_seq = excluded.next_seq,
         archived_through_seq = excluded.archived_through_seq,
         archived_count = excluded.archived_count,
-        history_revision = client_sessions.history_revision + @historyRevisionDelta
+        history_revision = client_sessions.history_revision + @historyRevisionDelta,
+        timeline_generation = client_sessions.timeline_generation + @timelineGenerationDelta
       WHERE client_sessions.updated_at <= @baseSyncedAt
         AND client_sessions.user_id = @userId
     `).run({
@@ -2854,6 +2942,7 @@ async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt =
       archivedThroughSeq: spill.archivedThroughSeq,
       archivedCount: newArchivedCount,
       historyRevisionDelta,
+      timelineGenerationDelta,
     })
     if (result.changes > 0) return 'applied'
     // result.changes === 0:ON CONFLICT WHERE 因 client_sessions.updated_at > @baseSyncedAt
@@ -3832,12 +3921,13 @@ async function _sqliteGetClientSession(
 ): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
-    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
+    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, timeline_generation, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, timeline_generation, model_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
   const row = (userId ? db.prepare(sql).get(id, userId) : db.prepare(sql).get(id)) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
     archived_through_seq: number | null; archived_count: number | null; history_revision: number
+    timeline_generation: number
     model_id: string | null
   } | undefined
   if (!row) return null
@@ -3846,6 +3936,9 @@ async function _sqliteGetClientSession(
     JSON.parse(row.messages) as MessageLike[],
     archivedThroughOrderSeq,
   )
+  const timelinePage = options.view === 'timeline'
+    ? await _sqliteReadClientTimelinePage(row.id, row.user_id, null, 100)
+    : null
   return {
     id: row.id,
     userId: row.user_id,
@@ -3854,9 +3947,15 @@ async function _sqliteGetClientSession(
     pinned: row.pinned === 1,
     createdAt: row.created_at,
     lastAt: row.last_at,
-    messages: exactMessages,
+    messages: timelinePage?.messages ?? exactMessages,
     updatedAt: row.updated_at,
     historyRevision: row.history_revision,
+    timelineGeneration: timelinePage?.timelineGeneration ?? row.timeline_generation,
+    ...(timelinePage ? {
+      timelineCursor: timelinePage.nextCursor,
+      timelineHasMore: timelinePage.hasMore,
+      timelineSnapshotMaxSeq: timelinePage.snapshotMaxSeq,
+    } : {}),
     ...(row.model_id ? { modelId: row.model_id } : {}),
     // 归档水位透传(读新列,零额外 IO)。getClientSession 返回的 messages 是热尾巴;
     // 客户端据 archivedThroughSeq 判定本地已归档行的保留,据 archivedCount 显示计数。
@@ -3912,16 +4011,44 @@ async function _sqliteGetClientSessionPartial(
 ): Promise<ClientSessionPartial | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
-    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count, history_revision, timeline_generation, model_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
   ).get(id, userId) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
     archived_through_seq: number | null; archived_count: number | null; history_revision: number
+    timeline_generation: number
     model_id: string | null
   } | undefined
   if (!row) return null
   const archivedCount = row.archived_count ?? 0
   const archivedThroughSeq = row.archived_through_seq ?? 0
+
+  if (options.view === 'timeline') {
+    const page = await _sqliteReadClientTimelinePage(row.id, row.user_id, null, 100)
+    if (!page) return null
+    return {
+      id: row.id,
+      userId: row.user_id,
+      agentId: row.agent_id,
+      title: row.title,
+      pinned: row.pinned === 1,
+      createdAt: row.created_at,
+      lastAt: row.last_at,
+      messages: page.messages,
+      updatedAt: row.updated_at,
+      historyRevision: page.historyRevision,
+      timelineGeneration: page.timelineGeneration,
+      timelineCursor: page.nextCursor,
+      timelineHasMore: page.hasMore,
+      timelineSnapshotMaxSeq: page.snapshotMaxSeq,
+      ...(row.model_id ? { modelId: row.model_id } : {}),
+      totalMessageCount: page.messages.length + archivedCount,
+      maxSeq: page.snapshotMaxSeq,
+      isPartial: false,
+      archivedCount,
+      archivedThroughSeq,
+    }
+  }
 
   let allMsgs: MessageLike[] = []
   try {
@@ -4231,6 +4358,94 @@ async function _sqliteHasCompletedClientTurn(
   return false
 }
 
+/** Unified newest-first browser history for the SQLite/personal backend. It
+ * has no commercial tape table, so every durable outer message is one unit;
+ * the cursor contract remains identical to PG. */
+async function _sqliteReadClientTimelinePage(
+  sessionId: string,
+  userId: string,
+  cursor: ClientTimelineCursor | null = null,
+  limit = 100,
+): Promise<ClientTimelinePage | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    `SELECT messages, archived_through_seq, history_revision, timeline_generation
+       FROM client_sessions
+      WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+  ).get(sessionId, userId) as {
+    messages: string
+    archived_through_seq: number | null
+    history_revision: number
+    timeline_generation: number
+  } | undefined
+  if (!row) return null
+  const generation = Number.isSafeInteger(row.timeline_generation) && row.timeline_generation > 0
+    ? row.timeline_generation
+    : 1
+  if (cursor && cursor.timelineGeneration !== generation) {
+    throw new ClientTimelineCursorStaleError()
+  }
+  const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) ? limit : 100)))
+  const beforeOrderSeq = cursor?.beforeOrderSeq ?? Number.MAX_SAFE_INTEGER
+  const archivedThrough = typeof row.archived_through_seq === 'number' ? row.archived_through_seq : 0
+  let hot: MessageLike[] = []
+  try {
+    const parsed = JSON.parse(row.messages)
+    if (Array.isArray(parsed)) hot = deriveOrderSeqsForRead(parsed as MessageLike[], archivedThrough)
+  } catch { /* malformed rows expose an empty page instead of fabricated content */ }
+  let snapshotMaxSeq = 0
+  for (const message of hot) {
+    if (typeof message._seq === 'number' && Number.isSafeInteger(message._seq) && message._seq > snapshotMaxSeq) {
+      snapshotMaxSeq = message._seq
+    }
+  }
+  if (snapshotMaxSeq === 0) snapshotMaxSeq = archivedThrough
+
+  const pool: MessageLike[] = hot.filter((message) =>
+    isValidOrderSeq(message._orderSeq) && message._orderSeq < beforeOrderSeq)
+  if (pool.length <= cappedLimit && archivedThrough > 0) {
+    const chunks = db.prepare(
+      `SELECT messages FROM client_session_archive_chunks
+        WHERE session_id = ? AND user_id = ? AND first_seq < ?
+        ORDER BY last_seq DESC`,
+    ).iterate(sessionId, userId, beforeOrderSeq) as Iterable<{ messages: string }>
+    for (const chunk of chunks) {
+      try {
+        const parsed = JSON.parse(chunk.messages)
+        if (Array.isArray(parsed)) {
+          for (const message of deriveArchivedOrderSeqsForRead(parsed as MessageLike[])) {
+            if (isValidOrderSeq(message._orderSeq) && message._orderSeq < beforeOrderSeq) pool.push(message)
+          }
+        }
+      } catch { /* skip malformed immutable chunk */ }
+      if (pool.length > cappedLimit) break
+    }
+  }
+  pool.sort(compareMessagesByOrder)
+  const hasMore = pool.length > cappedLimit
+  const page = pool.slice(Math.max(0, pool.length - cappedLimit)).map((message) => ({
+    ...message,
+    _timelineRecord: true,
+    _timelineUnitKey: `outer:${String(message._orderSeq)}:${String(message.id ?? '')}`,
+  }))
+  const oldest = page[0]
+  const nextCursor = hasMore && oldest && isValidOrderSeq(oldest._orderSeq)
+    ? {
+        version: 1 as const,
+        timelineGeneration: generation,
+        beforeOrderSeq: oldest._orderSeq,
+      }
+    : null
+  return {
+    messages: page,
+    nextCursor,
+    hasMore,
+    timelineGeneration: generation,
+    historyRevision: row.history_revision,
+    snapshotMaxSeq,
+  }
+}
+
 /** 不可变 turn-tape 记录分页。个人版 SQLite 没有 commercial tape 表，恒 null。 */
 async function _sqliteListTurnTapeRecords(
   _sessionId: string,
@@ -4382,7 +4597,7 @@ async function _sqliteSetClientSessionModel(id: string, userId: string, modelId:
 async function _sqliteBumpClientSessionHistoryRevision(id: string, userId: string): Promise<boolean> {
   const db = await getSessionsDb()
   const result = db.prepare(
-    'UPDATE client_sessions SET history_revision = history_revision + 1, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    'UPDATE client_sessions SET history_revision = history_revision + 1, timeline_generation = timeline_generation + 1, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
   ).run(Date.now(), id, userId)
   return result.changes > 0
 }
@@ -4568,6 +4783,7 @@ const sqliteBackend = {
   classifyClientSessions: _sqliteClassifyClientSessions,
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
+  readClientTimelinePage: _sqliteReadClientTimelinePage,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
   hasCompletedClientTurn: _sqliteHasCompletedClientTurn,
   listTurnTapeRecords: _sqliteListTurnTapeRecords,
@@ -4676,6 +4892,9 @@ export const getClientSessionPartial: ClientSessionsBackend['getClientSessionPar
 
 export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages'] =
   (...args) => getActiveBackend().readArchivedMessages(...args)
+
+export const readClientTimelinePage: ClientSessionsBackend['readClientTimelinePage'] =
+  (...args) => getActiveBackend().readClientTimelinePage(...args)
 
 export const getEngineContextMessages: ClientSessionsBackend['getEngineContextMessages'] =
   (...args) => getActiveBackend().getEngineContextMessages(...args)

@@ -657,8 +657,17 @@ const HIST_DETAIL = {
   pinned: false,
   createdAt: 1,
   lastAt: 2,
-  messages: [{ id: 'mm1', role: 'assistant', text: '历史答复正文', ts: 1 }],
+  messages: [{
+    id: 'mm1', role: 'assistant', text: '历史答复正文', ts: 1,
+    _source: 'server', _orderSeq: 1, _timelineRecord: true,
+    _timelineUnitKey: 'outer:1:mm1',
+  }],
   updatedAt: 2,
+  historyRevision: 1,
+  timelineGeneration: 1,
+  timelineCursor: null,
+  timelineHasMore: false,
+  timelineSnapshotMaxSeq: 5,
   isPartial: false,
   totalMessageCount: 1,
   maxSeq: 5,
@@ -734,7 +743,11 @@ const OTHER_DETAIL = {
   ...HIST_DETAIL,
   id: 'webother02',
   title: '更近的会话乙',
-  messages: [{ id: 'mm2', role: 'assistant', text: '乙会话正文', ts: 3 }],
+  messages: [{
+    id: 'mm2', role: 'assistant', text: '乙会话正文', ts: 3,
+    _source: 'server', _orderSeq: 1, _timelineRecord: true,
+    _timelineUnitKey: 'outer:1:mm2',
+  }],
 }
 
 /** boot 静默续期成功 + 双历史会话的路由用 fetch mock。 */

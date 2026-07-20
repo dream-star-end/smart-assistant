@@ -53,6 +53,10 @@ import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import {
   getClientSession,
+  readClientTimelinePage,
+  encodeClientTimelineCursor,
+  decodeClientTimelineCursor,
+  ClientTimelineCursorStaleError,
   listTurnTapeRecords,
   readArchivedMessages,
   readTapeRecordPayloadChunk,
@@ -78,7 +82,7 @@ const TAPE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const COMMERCIAL_SESSION_USER_RE = /^c:[1-9][0-9]{0,18}$/;
 
 export type AdminSessionRoute =
-  | { sessionId: string; kind: "detail" | "archive" | "media-sign" }
+  | { sessionId: string; kind: "detail" | "archive" | "timeline" | "media-sign" }
   | { sessionId: string; kind: "tape-records"; tapeId: string }
   | { sessionId: string; kind: "tape-payload"; tapeId: string; recordOrdinal: number }
   | { sessionId: string; kind: "user-payload"; messageId: string };
@@ -95,6 +99,7 @@ export function parseAdminSessionRoute(url: URL): AdminSessionRoute {
   if (!SESSION_ID_RE.test(sessionId)) invalid();
   if (parts.length === 1) return { sessionId, kind: "detail" };
   if (parts.length === 2 && parts[1] === "archive") return { sessionId, kind: "archive" };
+  if (parts.length === 2 && parts[1] === "timeline") return { sessionId, kind: "timeline" };
   if (parts.length === 2 && parts[1] === "media-sign") return { sessionId, kind: "media-sign" };
   if (parts.length === 4 && parts[1] === "tape" && parts[3] === "records") {
     const tapeId = parts[2] ?? "";
@@ -423,6 +428,59 @@ export async function handleAdminGetSession(
     return;
   }
 
+  if (route.kind === "timeline") {
+    const session = await getClientSession(sessionId, scopedUserId, { view: "timeline" });
+    if (!session) throw new HttpError(404, "NOT_FOUND", "session not found");
+    const rawCursor = url.searchParams.get("cursor");
+    const cursor = rawCursor === null ? null : decodeClientTimelineCursor(rawCursor);
+    if (rawCursor !== null && cursor === null) {
+      throw new HttpError(400, "VALIDATION", "invalid timeline cursor");
+    }
+    const rawLimit = Number(url.searchParams.get("limit"));
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(200, Math.floor(rawLimit))
+      : 100;
+    let page;
+    try {
+      page = await readClientTimelinePage(sessionId, session.userId, cursor, limit);
+    } catch (error) {
+      if (error instanceof ClientTimelineCursorStaleError) {
+        throw new HttpError(409, "CONFLICT", "timeline cursor stale");
+      }
+      throw error;
+    }
+    if (!page) throw new HttpError(404, "NOT_FOUND", "session not found");
+    await writeAdminAudit(getPool(), {
+      adminId: admin.id,
+      action: "sessions.read",
+      target: `session:${sessionId}`,
+      before: null,
+      after: {
+        mode: "timeline-page",
+        session_id: sessionId,
+        target_user_id: session.userId,
+        scoped_user_id: scopedUserId ?? null,
+        limit,
+        returned_messages: page.messages.length,
+        has_more: page.hasMore,
+        timeline_generation: page.timelineGeneration,
+        request_id: ctx.requestId,
+      },
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, {
+      session_id: sessionId,
+      messages: page.messages,
+      next_cursor: page.nextCursor ? encodeClientTimelineCursor(page.nextCursor) : null,
+      has_more: page.hasMore,
+      timeline_generation: page.timelineGeneration,
+      history_revision: page.historyRevision,
+      snapshot_max_seq: page.snapshotMaxSeq,
+    });
+    return;
+  }
+
   if (route.kind === "archive") {
     const { before, limit } = parseArchivePagingParams(url);
     // owner 必须经 storage backend 从权威会话行派生，不能信任前端 user_id；同时避免
@@ -479,8 +537,8 @@ export async function handleAdminGetSession(
   );
   if (!s) throw new HttpError(404, "NOT_FOUND", "session not found");
 
-  // timeline 模式与用户端 GET /api/sessions/:id 同源：一次返回热尾里的真实
-  // user/final rows + process cursors；更早历史只走 /archive 的 _seq 游标。
+  // Timeline mode is the same exact latest page as the user surface. Thinking,
+  // tools, agent groups and final output are peers in this one stream.
   if (view === "timeline") {
     const messages = Array.isArray(s.messages) ? s.messages : [];
     await writeAdminAudit(getPool(), {
@@ -511,6 +569,10 @@ export async function handleAdminGetSession(
         last_at: s.lastAt,
         updated_at: s.updatedAt,
         messages,
+        timeline_generation: s.timelineGeneration ?? 1,
+        timeline_cursor: s.timelineCursor ? encodeClientTimelineCursor(s.timelineCursor) : null,
+        timeline_has_more: s.timelineHasMore === true,
+        timeline_snapshot_max_seq: s.timelineSnapshotMaxSeq ?? 0,
         archived_count: s.archivedCount ?? 0,
         archived_through_seq: s.archivedThroughSeq ?? 0,
       },

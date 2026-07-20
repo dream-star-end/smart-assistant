@@ -46,6 +46,7 @@ function unauthorized() {
 test('getSession pairs since cursor with history revision and omits invalid revisions', async () => {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ok({
     id: 'web-session-1', messages: [], isPartial: true, maxSeq: 42, historyRevision: 7,
+    timelineGeneration: 1,
   }))
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
   const { session } = makeSession('tok-history')
@@ -60,7 +61,7 @@ test('getSession pairs since cursor with history revision and omits invalid revi
   expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/sessions/web-session-1?since=42')
 })
 
-test('getSession retries old incremental wire once as an unconditional full read', async () => {
+test('getSession rejects an old incremental wire after one unconditional full capability check', async () => {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => {
     if (fetchMock.mock.calls.length === 1) {
       return ok({ id: 'web-session-1', messages: [], isPartial: true, maxSeq: 42 })
@@ -70,30 +71,30 @@ test('getSession retries old incremental wire once as an unconditional full read
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
   const { session } = makeSession('tok-history-legacy')
 
-  const detail = await api.getSession(session, 'web-session-1', 42, 0)
+  await expect(api.getSession(session, 'web-session-1', 42, 0)).rejects.toMatchObject({
+    status: 409,
+    code: 'TIMELINE_CAPABILITY_MISMATCH',
+  })
 
   expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
     '/api/sessions/web-session-1?since=42&since_history_revision=0',
     '/api/sessions/web-session-1',
   ])
-  expect(detail).toMatchObject({
-    isPartial: false,
-    messages: [{ content: 'full' }],
-    _historyRevisionUnsupported: true,
-  })
 })
 
-test('getSession marks an initial full response from a legacy partial-history backend', async () => {
+test('getSession rejects an initial full response without unified timeline capability', async () => {
   const fetchMock = vi.fn(async () => ok({
     id: 'web-session-1', messages: [], isPartial: false, maxSeq: 0,
   }))
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
   const { session } = makeSession('tok-history-legacy-full')
 
-  const detail = await api.getSession(session, 'web-session-1')
+  await expect(api.getSession(session, 'web-session-1')).rejects.toMatchObject({
+    status: 409,
+    code: 'TIMELINE_CAPABILITY_MISMATCH',
+  })
 
   expect(fetchMock).toHaveBeenCalledTimes(1)
-  expect(detail._historyRevisionUnsupported).toBe(true)
 })
 
 test('getTapeRecordPayload resolves metadata with a one-byte Range and reconstructs exact bytes', async () => {

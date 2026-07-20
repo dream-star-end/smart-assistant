@@ -5,11 +5,15 @@
 //
 // stub 原则:只 stub 网络/宿主副作用(上传/发送/目标提交),不 stub 任何 UI 结构;
 // onUpload 立即 resolve → 附件 chip 无后端也能走到 done 态,CI 零外部依赖。
-import { StrictMode, useCallback, useState } from "react";
+import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
-import { mergeTapePage } from "../src/lib/chat/directTimeline";
+import {
+  captureVisibleVirtualRowAnchor,
+  restoreVisibleVirtualRowAnchor,
+} from "../src/components/chat/archivePaging";
+import { mergeTimelineHistoryPage } from "../src/lib/persist";
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 
@@ -29,9 +33,17 @@ declare global {
       tapeFetch: null | { tapeId: string; ordinal: number; recordId: string; role: string };
     };
     __scrollTimeline: {
-      calls: Array<number | null>;
+      calls: string[];
       mergedPages: number;
       messageCount: number;
+      loading: boolean;
+      anchor: null | {
+        key: string;
+        top: number;
+        dataIndex: string | null;
+        scrollTop: number;
+        scrollHeight: number;
+      };
     };
     __archiveTimeline: {
       calls: number;
@@ -43,7 +55,13 @@ declare global {
 window.__sends = [];
 window.__uploads = [];
 window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userRetry: null, tapeFetch: null };
-window.__scrollTimeline = { calls: [], mergedPages: 0, messageCount: 0 };
+window.__scrollTimeline = {
+  calls: [],
+  mergedPages: 0,
+  messageCount: 0,
+  loading: false,
+  anchor: null,
+};
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
@@ -159,47 +177,39 @@ createRoot(document.getElementById("timeline-agent-root")!).render(
   </StrictMode>,
 );
 
-const processControl: ChatMessage = {
-  id: "turn-process:scroll-tape",
-  role: "runtime-event",
-  text: "",
-  ts: 2,
-  _source: "server",
-  _turnTapeProcess: true,
-  _turnTapeProcessExpanded: true,
-  _turnTapeProcessCursor: 200,
-  _turnTapeId: "scroll-tape",
-  _turnTapeSha256: "scroll-sha",
-};
-const processKey = "scroll-tape::scroll-sha::turn-process:scroll-tape";
 const initialTail: ChatMessage[] = Array.from({ length: 96 }, (_, index) => ({
   id: `scroll-tail-${index}`,
-  role: "system",
+  role: "user",
   text: `SCROLL_TAIL_${index}`,
   ts: 10 + index,
   _source: "server",
-  _turnTapeId: "scroll-tape",
-  _turnTapeSha256: "scroll-sha",
-  _turnTapeOrdinal: 200 + index,
-  _turnTapeProcessLoadedFrom: processKey,
-  _turnTapeProcessPageKey: "scroll-tail-page",
-  _turnTapeComplete: true,
+  _orderSeq: 200 + index,
+  _timelineRecord: true,
+  _timelineUnitKey: `outer:${200 + index}:scroll-tail-${index}`,
 }));
 
-function olderPage(before: number): ChatMessage[] {
-  const start = before === 200 ? 136 : 72;
+function olderPage(cursor: string): ChatMessage[] {
+  // The opaque cursor contract is strict prepend: every returned logical
+  // ordinal precedes the oldest resident tail record.
+  const start = cursor === "cursor-200" ? 134 : 70;
   return Array.from({ length: 64 }, (_, index) => ({
-    id: `scroll-old-${before}-${index}`,
-    role: "system",
-    text: `SCROLL_OLDER_${before}_${index}`,
+    id: `scroll-old-${cursor}-${index}`,
+    role: index % 3 === 0 ? "thinking" : index % 3 === 1 ? "tool" : "assistant",
+    text: `SCROLL_OLDER_${cursor}_${index}`,
     ts: start + index,
     _source: "server",
-    _turnTapeOrdinal: start + index,
+    _orderSeq: start + index,
+    _timelineRecord: true,
+    _timelineUnitKey: `outer:${start + index}:scroll-old-${cursor}-${index}`,
+    _historyPageLoadedFrom: cursor,
+    _historyPageKey: `history:${cursor}`,
   } as ChatMessage));
 }
 
 function ScrollTimelineProbe() {
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const [cursor, setCursor] = useState<string | null>("cursor-200");
+  const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "scroll-user",
@@ -208,8 +218,20 @@ function ScrollTimelineProbe() {
       ts: 1,
       status: "replied",
       _source: "server",
+      _orderSeq: 198,
+      _timelineRecord: true,
+      _timelineUnitKey: "outer:198:scroll-user",
     },
-    processControl,
+    {
+      id: "scroll-thinking",
+      role: "thinking",
+      text: "SCROLL_REAL_THINKING",
+      ts: 2,
+      _source: "server",
+      _orderSeq: 199,
+      _timelineRecord: true,
+      _timelineUnitKey: "outer:199:scroll-thinking",
+    },
     ...initialTail,
     {
       id: "scroll-answer",
@@ -217,27 +239,53 @@ function ScrollTimelineProbe() {
       text: "SCROLL_FINAL_ANSWER",
       ts: 500,
       _source: "server",
+      _orderSeq: 500,
+      _timelineRecord: true,
+      _timelineUnitKey: "outer:500:scroll-answer",
     },
   ]);
-  const loadOlder = useCallback(async (
-    anchorId: string,
-    tapeId: string,
-    before: number | null,
-  ) => {
-    window.__scrollTimeline.calls.push(before);
+  const pendingRestoreRef = useRef<{
+    anchor: NonNullable<ReturnType<typeof captureVisibleVirtualRowAnchor>>;
+    resolve: () => void;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const pending = pendingRestoreRef.current;
+    if (!pending || !scroller) return;
+    pendingRestoreRef.current = null;
+    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false)
+      .finally(pending.resolve);
+  }, [messages, scroller]);
+  const loadOlder = useCallback(async () => {
+    if (loading || !cursor) return;
+    const requestedCursor = cursor;
+    const anchor = scroller ? captureVisibleVirtualRowAnchor(scroller) : null;
+    window.__scrollTimeline.anchor = anchor ? {
+      key: anchor.key,
+      top: anchor.top,
+      dataIndex: anchor.dataIndex,
+      scrollTop: anchor.scrollTop,
+      scrollHeight: anchor.scrollHeight,
+    } : null;
+    setLoading(true);
+    window.__scrollTimeline.calls.push(requestedCursor);
     await new Promise((resolve) => setTimeout(resolve, 40));
-    if (anchorId !== processControl.id || tapeId !== processControl._turnTapeId || before === null) {
-      return { ok: false, error: true };
-    }
-    const nextCursor = before === 200 ? 100 : null;
+    const nextCursor = requestedCursor === "cursor-200" ? "cursor-100" : null;
+    const anchored = scroller && anchor
+      ? new Promise<void>((resolve) => {
+        pendingRestoreRef.current = { anchor, resolve };
+      })
+      : Promise.resolve();
     setMessages((current) => {
-      const merged = mergeTapePage(current, anchorId, olderPage(before), nextCursor);
-      if (merged && merged !== current) window.__scrollTimeline.mergedPages += 1;
-      return merged ?? current;
+      const merged = mergeTimelineHistoryPage(current, olderPage(requestedCursor));
+      if (merged !== current) window.__scrollTimeline.mergedPages += 1;
+      return merged;
     });
-    return { ok: true, nextCursor };
-  }, []);
+    setCursor(nextCursor);
+    await anchored;
+    setLoading(false);
+  }, [cursor, loading, scroller]);
   window.__scrollTimeline.messageCount = messages.length;
+  window.__scrollTimeline.loading = loading;
   return (
     <div
       ref={setScroller}
@@ -248,7 +296,13 @@ function ScrollTimelineProbe() {
       <MessageList
         messages={messages}
         sending={false}
-        cb={{ onLoadOlderTape: loadOlder }}
+        archive={{
+          hasMore: cursor !== null,
+          loading,
+          error: false,
+          onLoadOlder: loadOlder,
+        }}
+        cb={{}}
         onRespondPermission={() => {}}
         scrollParent={scroller}
         historyGeneration={7}
@@ -268,6 +322,8 @@ const archiveTail: ChatMessage[] = Array.from({ length: 120 }, (_, index) => ({
   ts: 300 + index,
   _seq: 300 + index,
   _source: "server",
+  _timelineRecord: true,
+  _timelineUnitKey: `outer:${300 + index}:archive-tail-${index}`,
 }));
 const archiveOlder: ChatMessage[] = Array.from({ length: 80 }, (_, index) => ({
   id: `archive-older-${index}`,
@@ -276,20 +332,42 @@ const archiveOlder: ChatMessage[] = Array.from({ length: 80 }, (_, index) => ({
   ts: 121 + index,
   _seq: 121 + index,
   _source: "server",
+  _timelineRecord: true,
+  _timelineUnitKey: `outer:${121 + index}:archive-older-${index}`,
+  _historyPageLoadedFrom: "archive-cursor",
+  _historyPageKey: "history:archive-cursor",
 }));
 
 function ArchiveTimelineProbe() {
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>(archiveTail);
+  const pendingRestoreRef = useRef<{
+    anchor: NonNullable<ReturnType<typeof captureVisibleVirtualRowAnchor>>;
+    resolve: () => void;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const pending = pendingRestoreRef.current;
+    if (!pending || !scroller) return;
+    pendingRestoreRef.current = null;
+    void restoreVisibleVirtualRowAnchor(scroller, pending.anchor, () => false)
+      .finally(pending.resolve);
+  }, [messages, scroller]);
   const loadOlder = useCallback(async () => {
+    const anchor = scroller ? captureVisibleVirtualRowAnchor(scroller) : null;
     window.__archiveTimeline.calls += 1;
     await new Promise((resolve) => setTimeout(resolve, 40));
+    const anchored = scroller && anchor
+      ? new Promise<void>((resolve) => {
+        pendingRestoreRef.current = { anchor, resolve };
+      })
+      : Promise.resolve();
     setMessages((current) => {
       if (current[0]?.id === archiveOlder[0]?.id) return current;
       window.__archiveTimeline.mergedPages += 1;
-      return [...archiveOlder, ...current];
+      return mergeTimelineHistoryPage(current, archiveOlder);
     });
-  }, []);
+    await anchored;
+  }, [scroller]);
   window.__archiveTimeline.messageCount = messages.length;
   return (
     <div
@@ -302,8 +380,7 @@ function ArchiveTimelineProbe() {
         messages={messages}
         sending={false}
         archive={{
-          archivedCount: 160,
-          archivedThroughSeq: 200,
+          hasMore: messages.length < 200,
           loading: false,
           error: false,
           onLoadOlder: loadOlder,

@@ -16,11 +16,10 @@
 
 import type { Pool } from 'pg'
 
-import { bumpClientSessionHistoryRevision } from '@openclaude/storage'
-
 import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
+import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   casAdmittedToRejecting,
@@ -174,8 +173,6 @@ export interface TurnDispatchReconcilerDeps {
    * 是现实:失败/离线一律无害吞掉(状态已持久,下次进会话/sync 必达)。
    */
   nudgeClient?: (uid: bigint, sessionId: string, clientMessageId: string) => void
-  /** 测试可注入;生产默认经 active sessions backend 推进直读时间线版本。 */
-  bumpHistoryRevision?: (sessionId: string, sessionUserId: string) => Promise<boolean>
   stuckThresholdMs?: number
   rejectMinAgeMs?: number
   limit?: number
@@ -313,19 +310,27 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       // typed dispatch status only; never occupy or replace the immutable tape
       // namespace. A late real finalize moves this row out of terminal and the
       // direct timeline naturally removes the status.
-      const terminal = await casToTerminal(deps.pool, {
-        dispatchId: row.dispatchId,
-        outcome: 'executed_error',
-        failureCode: 'RESULT_RECOVERY_PENDING',
-        clientNotified: true,
-        fromStatuses: ['accepted'],
-        now: now(),
-      })
+      const client = await deps.pool.connect()
+      let terminal: TurnDispatchRow | null = null
+      try {
+        await client.query('BEGIN')
+        terminal = await casToTerminal(client, {
+          dispatchId: row.dispatchId,
+          outcome: 'executed_error',
+          failureCode: 'RESULT_RECOVERY_PENDING',
+          clientNotified: true,
+          fromStatuses: ['accepted'],
+          now: now(),
+        })
+        if (terminal) await advanceVisibleTimelineIdentity(client, row)
+        await client.query('COMMIT')
+      } catch (error) {
+        try { await client.query('ROLLBACK') } catch { /* connection already broken */ }
+        throw error
+      } finally {
+        client.release()
+      }
       if (terminal) {
-        await (deps.bumpHistoryRevision ?? bumpClientSessionHistoryRevision)(
-          row.sessionId,
-          `c:${row.userId}`,
-        )
         counts.visibleFailures++
         counts.notified++
         try {
@@ -377,6 +382,17 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   }
 
   return counts
+}
+
+/** A verified user-visible status is a new durable timeline identity attached
+ * to an existing user record. Publish the status bit and invalidate every
+ * already-issued history cursor in one transaction; otherwise an older loaded
+ * page can remain permanently unaware of the new status. */
+async function advanceVisibleTimelineIdentity(
+  q: Queryable,
+  row: Pick<TurnDispatchRow, 'sessionId' | 'userId'>,
+): Promise<void> {
+  await advanceClientTimelineIdentityInTransaction(q, row.sessionId, `c:${row.userId}`)
 }
 
 /**
@@ -457,6 +473,7 @@ async function settleTerminalUnnotified(
     // 未计费 → 直接把 durable dispatch 标记为用户可见。读侧从本行生成 typed
     // status record；不再复制/改写为 assistant message。
     const notified = await markClientNotified(client, row.dispatchId)
+    if (notified) await advanceVisibleTimelineIdentity(client, row)
     await client.query('COMMIT')
     post = { kind: 'visible', notified, reservations }
     finalizeSettlePost(post, scanned, counts, enqueue, deps)

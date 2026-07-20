@@ -5,7 +5,6 @@ import { MessageListSkeleton } from '../../../components/chat/HistorySkeleton'
 import type { PermissionRespond } from '../../../components/chat/PermissionCard'
 import {
   captureVisibleVirtualRowAnchor,
-  loadedArchivedMetrics,
   restoreVisibleVirtualRowAnchor,
   type VisibleVirtualRowAnchor,
 } from '../../../components/chat/archivePaging'
@@ -14,13 +13,13 @@ import { MediaSignProvider } from '../../../components/chat/media'
 import { Alert, Badge, Button, EmptyState, Modal } from '../../../components/ui'
 import type { ChatMessage } from '../../../lib/chat/model'
 import { DeferredPayloadQueue } from '../../../lib/chat/deferredPayloadQueue'
-import { mergeTapePage } from '../../../lib/chat/directTimeline'
+import { mergeTimelineHistoryPage } from '../../../lib/persist'
 import { parseTapeRecordPayload, type TapePayloadExpectation } from '../../../lib/chat/tapePayload'
-import { adminGet, adminGetExactPayload, adminSend, apiErrorMessage } from '../../lib/adminApi'
+import { ApiError, adminGet, adminGetExactPayload, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import { fmtInt } from './format'
 import type { UserSessionSummary } from './types'
 
-const ARCHIVE_PAGE_SIZE = 100
+const HISTORY_PAGE_SIZE = 100
 const READ_ONLY_PERMISSION: PermissionRespond = () => {}
 
 type ChatSessionPayload = {
@@ -36,27 +35,27 @@ type ChatSessionPayload = {
     messages: ChatMessage[]
     archived_count: number
     archived_through_seq: number
+    timeline_generation: number
+    timeline_cursor: string | null
+    timeline_has_more: boolean
+    timeline_snapshot_max_seq: number
   }
 }
 
-type ArchivePayload = {
+type TimelinePayload = {
   session_id: string
   messages: ChatMessage[]
-  oldest_seq: number | null
+  next_cursor: string | null
   has_more: boolean
+  timeline_generation: number
 }
 
 type MediaSignPayload = { urls: Record<string, string>; expMs: number }
 
-type TapeRecordsPayload = {
-  records: ChatMessage[]
-  nextCursor: number | null
-  total: number
-}
-
 type ScrollAnchor = {
   token: number
   capturedScrollTop: number
+  timelineGeneration: number | null
   row: VisibleVirtualRowAnchor | null
   ready: boolean
   cancelled: boolean
@@ -85,7 +84,10 @@ export function SessionViewerModal({
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<unknown>(null)
-  const [archiveBefore, setArchiveBefore] = useState(0)
+  const [timelineCursor, setTimelineCursor] = useState<string | null>(null)
+  const [timelineGeneration, setTimelineGeneration] = useState<number | null>(null)
+  const timelineGenerationRef = useRef<number | null>(timelineGeneration)
+  timelineGenerationRef.current = timelineGeneration
   const [archiveHasMore, setArchiveHasMore] = useState(false)
   const [archiveLoading, setArchiveLoading] = useState(false)
   const [archiveError, setArchiveError] = useState(false)
@@ -105,7 +107,6 @@ export function SessionViewerModal({
     anchor.settle()
   }, [])
   const loadGenerationRef = useRef(0)
-  const expandingTapesRef = useRef<Set<string>>(new Set())
   const deferredPayloadCacheRef = useRef<{ key: string; records: ChatMessage[] } | null>(null)
   const deferredPayloadQueueRef = useRef<DeferredPayloadQueue<ChatMessage[]> | null>(null)
   if (!deferredPayloadQueueRef.current) {
@@ -121,11 +122,11 @@ export function SessionViewerModal({
     setPayload(null)
     setMessages([])
     setError(null)
-    setArchiveBefore(0)
+    setTimelineCursor(null)
+    setTimelineGeneration(null)
     setArchiveHasMore(false)
     setArchiveLoading(false)
     setArchiveError(false)
-    expandingTapesRef.current.clear()
     deferredPayloadQueueRef.current?.cancelAll()
     deferredPayloadCacheRef.current = null
     initialScrollPendingRef.current = false
@@ -145,7 +146,9 @@ export function SessionViewerModal({
         const nextMessages = Array.isArray(next.messages) ? next.messages : []
         setPayload(next)
         setMessages(nextMessages)
-        setArchiveHasMore((next.archived_count ?? 0) > 0)
+        setTimelineCursor(next.timeline_cursor)
+        setTimelineGeneration(next.timeline_generation)
+        setArchiveHasMore(next.timeline_has_more === true)
         initialScrollPendingRef.current = true
       })
       .catch((err) => {
@@ -177,7 +180,10 @@ export function SessionViewerModal({
     }
     const anchor = archiveScrollAnchorRef.current
     if (!anchor?.ready) return
-    if (anchor.cancelled || !anchor.row) {
+    if (
+      anchor.cancelled || !anchor.row ||
+      anchor.timelineGeneration !== timelineGeneration
+    ) {
       settleArchiveAnchor(anchor.token)
       return
     }
@@ -188,10 +194,11 @@ export function SessionViewerModal({
       anchor.row,
       () => {
         const current = archiveScrollAnchorRef.current
-        return !current || current.token !== anchor.token || current.cancelled
+        return !current || current.token !== anchor.token || current.cancelled ||
+          current.timelineGeneration !== timelineGenerationRef.current
       },
     ).finally(() => settleArchiveAnchor(anchor.token))
-  }, [archiveLoading, messages, settleArchiveAnchor])
+  }, [archiveLoading, messages, settleArchiveAnchor, timelineGeneration])
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current
@@ -210,7 +217,10 @@ export function SessionViewerModal({
   }, [])
 
   const loadOlder = useCallback(async () => {
-    if (!sessionId || !userId || archiveLoading || !archiveHasMore) return
+    if (
+      !sessionId || !userId || archiveLoading || !archiveHasMore ||
+      !timelineCursor || timelineGeneration === null
+    ) return
     const generation = loadGenerationRef.current
     settleArchiveAnchor()
     const token = ++archiveRequestTokenRef.current
@@ -228,6 +238,7 @@ export function SessionViewerModal({
       ? {
         token,
         capturedScrollTop: el.scrollTop,
+        timelineGeneration,
         row: captureVisibleVirtualRowAnchor(el),
         ready: false,
         cancelled: false,
@@ -238,29 +249,47 @@ export function SessionViewerModal({
     setArchiveLoading(true)
     setArchiveError(false)
     try {
-      const page = await adminGet<ArchivePayload>(
-        `/sessions/${encodeURIComponent(sessionId)}/archive`,
-        { user_id: userId, before: archiveBefore, limit: ARCHIVE_PAGE_SIZE },
+      const requestedCursor = timelineCursor
+      const page = await adminGet<TimelinePayload>(
+        `/sessions/${encodeURIComponent(sessionId)}/timeline`,
+        { user_id: userId, cursor: requestedCursor, limit: HISTORY_PAGE_SIZE },
       )
       if (generation !== loadGenerationRef.current) return
-      if (page.session_id !== sessionId) throw new Error('会话归档响应不匹配')
+      if (
+        page.session_id !== sessionId ||
+        page.timeline_generation !== timelineGeneration
+      ) {
+        settleArchiveAnchor(token)
+        loadSession()
+        return
+      }
       const older = Array.isArray(page.messages) ? page.messages : []
       if (older.length > 0) {
         const anchor = archiveScrollAnchorRef.current
         if (anchor?.token === token) anchor.ready = true
-        setMessages((current) => [...older, ...current])
+        const pageKey = `admin-history:${timelineGeneration}:${requestedCursor}`
+        setMessages((current) => mergeTimelineHistoryPage(current, older.map((message) => ({
+          ...message,
+          _timelineRecord: true,
+          _historyPageLoadedFrom: requestedCursor,
+          _historyPageKey: pageKey,
+        }))))
       }
-      if (page.oldest_seq != null) setArchiveBefore(page.oldest_seq)
-      setArchiveHasMore(page.has_more)
+      setTimelineCursor(page.next_cursor)
+      setArchiveHasMore(page.has_more && typeof page.next_cursor === 'string')
       if (older.length === 0 && archiveScrollAnchorRef.current?.token === token) {
         settleArchiveAnchor(token)
       }
-    } catch {
+    } catch (err) {
       if (
         generation !== loadGenerationRef.current ||
         archiveRequestTokenRef.current !== token
       ) return
       settleArchiveAnchor(token)
+      if (err instanceof ApiError && err.status === 409) {
+        loadSession()
+        return
+      }
       setArchiveError(true)
     } finally {
       if (
@@ -269,20 +298,26 @@ export function SessionViewerModal({
       ) setArchiveLoading(false)
     }
     await anchorSettled
-  }, [archiveBefore, archiveHasMore, archiveLoading, sessionId, settleArchiveAnchor, userId])
+  }, [
+    archiveHasMore,
+    archiveLoading,
+    loadSession,
+    sessionId,
+    settleArchiveAnchor,
+    timelineCursor,
+    timelineGeneration,
+    userId,
+  ])
 
   const archive = useMemo<MessageListArchive | undefined>(() => {
     if (!payload) return undefined
-    const loaded = loadedArchivedMetrics(messages, payload.archived_through_seq).anchors
     return {
-      // 后端明确已翻尽时以实际 distinct anchor 数收口，避免存量异常计数留下幽灵按钮。
-      archivedCount: archiveHasMore ? payload.archived_count : loaded,
-      archivedThroughSeq: payload.archived_through_seq,
+      hasMore: archiveHasMore,
       loading: archiveLoading,
       error: archiveError,
       onLoadOlder: loadOlder,
     }
-  }, [archiveError, archiveHasMore, archiveLoading, loadOlder, messages, payload])
+  }, [archiveError, archiveHasMore, archiveLoading, loadOlder, payload])
 
   const signMedia = useCallback(
     async (paths: string[]) => {
@@ -296,37 +331,6 @@ export function SessionViewerModal({
     },
     [sessionId, userId],
   )
-
-  const loadOlderTape = useCallback<NonNullable<CardCallbacks['onLoadOlderTape']>>(async (
-    anchorId,
-    tapeId,
-    before,
-  ) => {
-    if (!sessionId || !userId) return { ok: false }
-    const generation = loadGenerationRef.current
-    const guardKey = `${sessionId}:${anchorId}`
-    if (expandingTapesRef.current.has(guardKey)) return { ok: false, busy: true }
-    expandingTapesRef.current.add(guardKey)
-    try {
-      const page = await adminGet<TapeRecordsPayload>(
-        `/sessions/${encodeURIComponent(sessionId)}/tape/${encodeURIComponent(tapeId)}/records`,
-        { user_id: userId, before: before ?? 'tail', limit: 200 },
-      )
-      if (generation !== loadGenerationRef.current) return { ok: false }
-      const records = Array.isArray(page.records) ? page.records : []
-      const nextCursor = typeof page.nextCursor === 'number' ? page.nextCursor : null
-      setMessages((current) => mergeTapePage(current, anchorId, records, nextCursor) ?? current)
-      return {
-        ok: true,
-        nextCursor,
-        total: typeof page.total === 'number' ? page.total : records.length,
-      }
-    } catch {
-      return { ok: false, error: true }
-    } finally {
-      expandingTapesRef.current.delete(guardKey)
-    }
-  }, [sessionId, userId])
 
   const fetchExactPayload = useCallback(async (
     path: string,
@@ -381,10 +385,9 @@ export function SessionViewerModal({
   }, [fetchExactPayload, sessionId, userId])
 
   const cardCallbacks = useMemo<CardCallbacks>(() => ({
-    onLoadOlderTape: loadOlderTape,
     onFetchTapeRecordPayload: fetchTapePayload,
     onFetchUserMessagePayload: fetchUserPayload,
-  }), [fetchTapePayload, fetchUserPayload, loadOlderTape])
+  }), [fetchTapePayload, fetchUserPayload])
 
   const displayTitle = payload?.title || session?.title || '(无标题)'
   const recordCount = session?.message_count ?? messages.length
@@ -464,6 +467,7 @@ export function SessionViewerModal({
               onRespondPermission={READ_ONLY_PERMISSION}
               readOnly
               scrollParent={scrollParent}
+              historyGeneration={timelineGeneration ?? 'legacy'}
             />
           ) : null}
         </div>

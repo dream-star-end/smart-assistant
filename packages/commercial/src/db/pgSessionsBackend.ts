@@ -67,6 +67,9 @@ import {
   type ClientSessionMeta,
   type ClientSessionPartial,
   type ClientSessionReadOptions,
+  type ClientTimelineCursor,
+  type ClientTimelinePage,
+  ClientTimelineCursorStaleError,
   type ClientSessionsBackend,
   type DelegatePendingRow,
   compareMessagesByOrder,
@@ -164,6 +167,38 @@ async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Pr
       }
     }
     throw err;
+  } finally {
+    if (!destroyed) client.release();
+  }
+}
+
+/** One immutable browser page must observe the session row, archive chunks,
+ * tape identity and dispatch-status overlay from the same snapshot. */
+async function withTimelineSnapshot<T>(
+  pool: Pool,
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  let destroyed = false;
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const value = await fn(client);
+    await client.query("COMMIT");
+    return value;
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      destroyed = true;
+      try {
+        client.release(
+          rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError)),
+        );
+      } catch {
+        /* connection is already gone */
+      }
+    }
+    throw error;
   } finally {
     if (!destroyed) client.release();
   }
@@ -337,6 +372,25 @@ const FINALIZED_TAPE_PARTS_DELETE_MS = 48 * 60 * 60_000;
 // 普通 UPDATE 时用裸列)。第三个 GREATEST 参数(客户端 requested)只 upsert 用,append/patch
 // 路径无客户端值 → 用两参形态。
 const CLOCK_MS_SQL = "(floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT";
+
+/** Publish a new browser-timeline identity on the caller's existing
+ * transaction. Dispatch reconciliation uses this seam so its verified status
+ * bit and the cursor invalidation commit atomically without moving sessions
+ * table SQL outside the backend boundary. */
+export async function advanceClientTimelineIdentityInTransaction(
+  q: Pick<Pool | PoolClient, "query">,
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  await q.query(
+    `UPDATE client_sessions
+        SET history_revision = history_revision + 1,
+            timeline_generation = timeline_generation + 1,
+            updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+      WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+    [sessionId, userId],
+  );
+}
 
 // ── spill 执行(PG 方言)──────────────────────────────────────────────────────
 // 决策由 planSpillOverflow(纯)产出;这里只落库:chunk INSERT ... ON CONFLICT DO NOTHING,
@@ -680,6 +734,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_sessions", "next_seq", "integer"],
   ["client_sessions", "archived_through_seq", "integer"],
   ["client_sessions", "history_revision", "bigint"],
+  ["client_sessions", "timeline_generation", "bigint"],
   ["client_session_archive_chunks", "session_id", "text"],
   ["client_session_archive_chunks", "first_seq", "integer"],
   ["client_session_archive_chunks", "messages", "text"],
@@ -776,7 +831,7 @@ async function convergeDispatchOnFinalize(
   client: PoolClient,
   dispatchId: string,
   tapeStatus: string,
-): Promise<{ lateTape: boolean }> {
+): Promise<{ lateTape: boolean; removedVisibleStatus: boolean }> {
   const outcome =
     tapeStatus === "completed" ? "completed" :
     tapeStatus === "interrupted" ? "interrupted" : "crashed";
@@ -785,7 +840,7 @@ async function convergeDispatchOnFinalize(
     outcome,
     fromStatuses: ["admitted", "accepted", "rejecting"],
   });
-  if (converged !== null) return { lateTape: false };
+  if (converged !== null) return { lateTape: false, removedVisibleStatus: false };
   const d = await getDispatch(client, dispatchId);
   if (
     d && d.status === "terminal" && d.outcome === "executed_error" &&
@@ -804,7 +859,7 @@ async function convergeDispatchOnFinalize(
           AND failure_code='RESULT_RECOVERY_PENDING'`,
       [dispatchId, outcome],
     );
-    return { lateTape: false };
+    return { lateTape: false, removedVisibleStatus: d.clientNotified };
   }
   if (d && d.status === "terminal" && d.outcome === "not_accepted") {
     const held = await casToManualReconcile(client, {
@@ -812,9 +867,12 @@ async function convergeDispatchOnFinalize(
       conflictReason: "late_tape",
       fromStatuses: ["terminal"],
     });
-    return { lateTape: held !== null };
+    return {
+      lateTape: held !== null,
+      removedVisibleStatus: held !== null && d.clientNotified,
+    };
   }
-  return { lateTape: false };
+  return { lateTape: false, removedVisibleStatus: false };
 }
 
 export interface LosslessTurnTapeStorage {
@@ -2002,7 +2060,7 @@ async function stagePreparedLosslessTurnRecords(
 }
 
 async function readDirectTapeHeaders(
-  pool: Pool,
+  pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
   tapeIds: string[],
@@ -2108,7 +2166,7 @@ async function readDirectTapeHeaders(
 }
 
 async function readHydratedTapeRows(
-  pool: Pool,
+  pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
   tapeIds: string[],
@@ -2199,7 +2257,7 @@ async function readHydratedTapeRows(
  * payloads total gigabytes; mounted viewport rows fetch those exact bytes from
  * the range endpoint instead of amplifying one session GET. */
 async function readDirectTapeVisibleHeads(
-  pool: Pool,
+  pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
   tapeIds: string[],
@@ -2296,7 +2354,7 @@ function directTapeProcessRow(anchor: MessageLike, header: DirectTapeHeader): Me
  * bytes; the control owns the cursor for every remaining semantic record.
  */
 async function hydrateTurnTapeMessages(
-  pool: Pool,
+  pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
   messages: MessageLike[],
@@ -3494,7 +3552,7 @@ type DirectTapePageHead = {
 /** Hydrate a selected physical page without changing its paging direction.
  * The returned logical rows are always in ascending immutable ordinal order. */
 async function hydrateDirectTapePage(
-  pool: Pool,
+  pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
   tapeId: string,
@@ -3582,6 +3640,651 @@ async function hydrateDirectTapePage(
     (typeof a._recordOrdinal === "number" ? a._recordOrdinal : Number.MAX_SAFE_INTEGER) -
     (typeof b._recordOrdinal === "number" ? b._recordOrdinal : Number.MAX_SAFE_INTEGER));
   return records;
+}
+
+type UnifiedTimelineTapeHeader = {
+  tapeId: string;
+  tapeSha256: string;
+  billingAnchorId: string;
+  status: string;
+  turnKey: string;
+  clientMessageId: string | null;
+};
+
+type UnifiedTimelineTapeHead = DirectTapePageHead & {
+  tape_id: string;
+};
+
+type UnifiedTimelineSelectedUnit =
+  | {
+      kind: "outer";
+      anchor: MessageLike;
+      orderSeq: number;
+    }
+  | {
+      kind: "tape";
+      anchor: MessageLike;
+      orderSeq: number;
+      header: UnifiedTimelineTapeHeader;
+      head: UnifiedTimelineTapeHead;
+    };
+
+type UnifiedTimelineStatusRow = {
+  dispatch_id: string;
+  client_message_id: string;
+  failure_code: string | null;
+  anchor_seq: string;
+  terminal_at: Date | null;
+};
+
+function timelineOuterKey(message: MessageLike, orderSeq: number): string {
+  return `outer:${orderSeq}:${typeof message.id === "string" ? message.id : "anonymous"}`;
+}
+
+function timelineTapeKey(tapeId: string, ordinal: number, logicalIndex: number, id: unknown): string {
+  return `tape:${tapeId}:${ordinal}:${logicalIndex}:${typeof id === "string" ? id : "anonymous"}`;
+}
+
+/** Read only enough durable outer anchors to cover one physical-record page.
+ * Archive chunks are walked newest-first and stop as soon as the bounded
+ * candidate pool is full; no total-session traversal or projection is used. */
+async function readUnifiedTimelineOuterCandidates(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  hotJson: string,
+  archivedThroughSeq: number,
+  cursor: ClientTimelineCursor | null,
+  maxCandidates: number,
+): Promise<{ messages: MessageLike[]; snapshotMaxSeq: number }> {
+  let hot: MessageLike[] = [];
+  try {
+    const parsed = JSON.parse(hotJson);
+    if (Array.isArray(parsed)) {
+      hot = deriveOrderSeqsForRead(parsed as MessageLike[], archivedThroughSeq);
+    }
+  } catch {
+    throw new Error(`[pgSessions] unified timeline hot row malformed: ${sessionId}`);
+  }
+  let snapshotMaxSeq = 0;
+  for (const message of hot) {
+    if (
+      typeof message._seq === "number" && Number.isSafeInteger(message._seq) &&
+      message._seq > snapshotMaxSeq
+    ) snapshotMaxSeq = message._seq;
+  }
+  // Old rows can have no `_seq`; the archive watermark is a conservative
+  // compatibility fallback, never a fabricated next_seq-derived snapshot.
+  if (snapshotMaxSeq === 0) snapshotMaxSeq = archivedThroughSeq;
+
+  const beforeOrderSeq = cursor?.beforeOrderSeq ?? Number.MAX_SAFE_INTEGER;
+  const resumeTape = typeof cursor?.tapeId === "string";
+  const eligible = (message: MessageLike): boolean => {
+    const orderSeq = message._orderSeq;
+    if (
+      typeof orderSeq !== "number" || !Number.isSafeInteger(orderSeq) || orderSeq < 1 ||
+      message._turnTapeProcess === true
+    ) return false;
+    return orderSeq < beforeOrderSeq || (resumeTape && orderSeq === beforeOrderSeq);
+  };
+  const pool: MessageLike[] = hot.filter(eligible);
+  let beforeLastSeq: number | null = null;
+  const archiveBefore = Math.min(Number.MAX_SAFE_INTEGER, beforeOrderSeq + (resumeTape ? 1 : 0));
+  while (pool.length <= maxCandidates && archivedThroughSeq > 0) {
+    const chunks = (
+      await client.query<{ messages: string; last_seq: string }>(
+        `SELECT messages,last_seq::text
+           FROM client_session_archive_chunks
+          WHERE session_id=$1 AND user_id=$2 AND first_seq < $3
+            AND ($4::bigint IS NULL OR last_seq < $4)
+          ORDER BY last_seq DESC
+          LIMIT 4`,
+        [sessionId, userId, archiveBefore, beforeLastSeq],
+      )
+    ).rows;
+    if (chunks.length === 0) break;
+    for (const chunk of chunks) {
+      beforeLastSeq = bigIntNum(chunk.last_seq, "archive last_seq");
+      try {
+        const parsed = JSON.parse(chunk.messages);
+        if (Array.isArray(parsed)) {
+          for (const message of deriveArchivedOrderSeqsForRead(parsed as MessageLike[])) {
+            if (eligible(message)) pool.push(message);
+          }
+        }
+      } catch {
+        // Match the existing archive contract: one malformed immutable chunk
+        // does not authorize fabricated replacement content.
+      }
+      if (pool.length > maxCandidates) break;
+    }
+    if (pool.length > maxCandidates || chunks.length < 4) break;
+  }
+
+  const deduped = new Map<string, MessageLike>();
+  for (const message of pool) {
+    const orderSeq = message._orderSeq as number;
+    const key = timelineOuterKey(message, orderSeq);
+    if (!deduped.has(key)) deduped.set(key, message);
+  }
+  return {
+    messages: [...deduped.values()]
+      .sort(compareMessagesByOrder)
+      .slice(-maxCandidates)
+      .reverse(),
+    snapshotMaxSeq,
+  };
+}
+
+async function readUnifiedTimelineTapeHeaders(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  tapeIds: string[],
+): Promise<Map<string, UnifiedTimelineTapeHeader>> {
+  if (tapeIds.length === 0) return new Map();
+  const rows = (
+    await client.query<{
+      tape_id: string;
+      tape_sha256: string;
+      billing_anchor_id: string;
+      status: string;
+      turn_key: string;
+      client_message_id: string | null;
+    }>(
+      `SELECT t.tape_id,t.tape_sha256,t.billing_anchor_id,t.status,t.turn_key,
+              COALESCE(t.client_message_id,d.client_message_id) AS client_message_id
+         FROM client_session_turn_tapes t
+         LEFT JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
+        WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
+          AND t.finalized_at IS NOT NULL AND t.billing_anchor_id IS NOT NULL`,
+      [sessionId, userId, tapeIds],
+    )
+  ).rows;
+  return new Map(rows.map((row) => [row.tape_id, {
+    tapeId: row.tape_id,
+    tapeSha256: row.tape_sha256,
+    billingAnchorId: row.billing_anchor_id,
+    status: row.status,
+    turnKey: row.turn_key,
+    clientMessageId: row.client_message_id,
+  }]));
+}
+
+async function readUnifiedTimelineTapeHeads(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  requests: Array<{ tapeId: string; beforeOrdinal: number }>,
+  perTapeLimit: number,
+): Promise<Map<string, UnifiedTimelineTapeHead[]>> {
+  if (requests.length === 0) return new Map();
+  const rows = (
+    await client.query<UnifiedTimelineTapeHead>(
+      `WITH requested(tape_id,before_ordinal) AS (
+         SELECT * FROM unnest($3::text[],$4::integer[])
+       )
+       SELECT requested.tape_id,r.msg_id,r.ordinal,r.role,r.ts::text,
+              r.content_sha256,
+              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,
+              r.visible_content_sha256
+         FROM requested
+         JOIN LATERAL (
+           SELECT msg_id,ordinal,role,ts,content_sha256,payload,visible_payload,
+                  visible_content_sha256
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=requested.tape_id
+              AND ordinal < requested.before_ordinal
+            ORDER BY ordinal DESC
+            LIMIT $5
+         ) r ON TRUE
+        ORDER BY requested.tape_id,r.ordinal DESC`,
+      [
+        sessionId,
+        userId,
+        requests.map((request) => request.tapeId),
+        requests.map((request) => request.beforeOrdinal),
+        perTapeLimit,
+      ],
+    )
+  ).rows;
+  const byTape = new Map<string, UnifiedTimelineTapeHead[]>();
+  for (const row of rows) {
+    const list = byTape.get(row.tape_id) ?? [];
+    list.push(row);
+    byTape.set(row.tape_id, list);
+  }
+  return byTape;
+}
+
+async function hydrateUnifiedTimelineTapeUnits(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  units: Array<Extract<UnifiedTimelineSelectedUnit, { kind: "tape" }>>,
+): Promise<Map<string, MessageLike[]>> {
+  const result = new Map<string, MessageLike[]>();
+  if (units.length === 0) return result;
+  const tapeIds = [...new Set(units.map((unit) => unit.header.tapeId))];
+  const billingHeads = await readDirectTapeVisibleHeads(client, sessionId, userId, tapeIds);
+  const billingByTape = new Map(billingHeads.map((head) => [head.tape_id, head]));
+  const planned = units.filter((unit) =>
+    bigIntNum(unit.head.payload_bytes, "turn tape timeline payload bytes") <= TAPE_RECORD_INLINE_QUANTUM_BYTES);
+  const payloadRows = planned.length === 0
+    ? []
+    : (
+        await client.query<(DirectTapeSourceRecord & { tape_id: string })>(
+          `WITH selected(tape_id,ordinal) AS (
+             SELECT * FROM unnest($3::text[],$4::integer[])
+           )
+           SELECT r.tape_id,r.msg_id,r.ordinal,r.role,r.content_sha256,r.payload,
+                  r.visible_payload,r.visible_content_sha256
+             FROM selected
+             JOIN client_session_turn_tape_records r
+               ON r.session_id=$1 AND r.user_id=$2
+              AND r.tape_id=selected.tape_id AND r.ordinal=selected.ordinal`,
+          [
+            sessionId,
+            userId,
+            planned.map((unit) => unit.header.tapeId),
+            planned.map((unit) => unit.head.ordinal),
+          ],
+        )
+      ).rows;
+  const payloadByKey = new Map(payloadRows.map((row) => [`${row.tape_id}\0${row.ordinal}`, row]));
+
+  for (const unit of units) {
+    const { anchor, header, head } = unit;
+    const physicalKey = `${header.tapeId}\0${head.ordinal}`;
+    const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
+    const billing = billingByTape.get(header.tapeId);
+    const isBillingAnchor = head.msg_id === header.billingAnchorId;
+    const enrichment: ExactUsageEnrichment = isBillingAnchor && billing
+      ? {
+          costCredits: billing.cost_credits,
+          waiverApplied: billing.waiver_applied,
+          delegates: parseDelegateCosts(billing.delegate_costs),
+        }
+      : { costCredits: "0", waiverApplied: false, delegates: [] };
+    let logicalRecords: MessageLike[];
+    if (payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES) {
+      let deferred = deferredTapeRecord(
+        header.tapeId,
+        header.tapeSha256,
+        { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
+        payloadBytes,
+      );
+      deferred = mergeExactUsage(deferred, enrichment, isBillingAnchor);
+      logicalRecords = [deferred];
+    } else {
+      const source = payloadByKey.get(physicalKey);
+      if (!source) throw new Error(`[pgSessions] unified timeline tape record missing: ${physicalKey}`);
+      let visibleBytes: Buffer;
+      if (source.visible_payload !== null) {
+        visibleBytes = Buffer.from(source.visible_payload);
+        if (sha256Bytes(visibleBytes) !== source.visible_content_sha256) {
+          throw new Error(`[pgSessions] unified timeline visible payload hash mismatch: ${physicalKey}`);
+        }
+      } else {
+        const visible = userVisiblePhysicalPayload({
+          tape_id: header.tapeId,
+          tape_sha256: header.tapeSha256,
+          waive_reason: null,
+          waiver_applied: false,
+          msg_id: source.msg_id,
+          ordinal: source.ordinal,
+          role: source.role,
+          content_sha256: source.content_sha256,
+          payload: Buffer.from(source.payload),
+          cost_credits: "0",
+          delegate_costs: [],
+        }, header.tapeSha256, header.billingAnchorId);
+        if (!visible) throw new Error(`[pgSessions] unified timeline record malformed: ${physicalKey}`);
+        visibleBytes = visible.bytes;
+      }
+      let parsed: MessageLike;
+      try {
+        const value = JSON.parse(visibleBytes.toString("utf8"));
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("not object");
+        parsed = value as MessageLike;
+      } catch (error) {
+        throw new Error(`[pgSessions] unified timeline record JSON invalid: ${physicalKey}: ${(error as Error).message}`);
+      }
+      let hydrated: MessageLike = {
+        ...parsed,
+        _source: "server",
+        _turnTapeId: header.tapeId,
+        _turnTapeMsgId: source.msg_id,
+        _turnTapeOrdinal: source.ordinal,
+        _turnTapeSha256: header.tapeSha256,
+        _turnTapeExpanded: true,
+        _turnTapeComplete: true,
+        ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+        _orderSeq: unit.orderSeq,
+      };
+      hydrated = mergeExactUsage(hydrated, enrichment, isBillingAnchor);
+      logicalRecords = expandHydratedRuntimeBatch(
+        hydrated,
+        {
+          tape_id: header.tapeId,
+          tape_sha256: header.tapeSha256,
+          waive_reason: null,
+          waiver_applied: false,
+          msg_id: source.msg_id,
+          ordinal: source.ordinal,
+          role: source.role,
+          content_sha256: source.content_sha256,
+          payload: source.payload,
+          cost_credits: enrichment.costCredits,
+          delegate_costs: enrichment.delegates,
+        },
+        anchor,
+      ).messages;
+    }
+    logicalRecords = logicalRecords.map((record, logicalIndex) => ({
+      ...record,
+      _source: "server",
+      _turnTapeId: header.tapeId,
+      _turnTapeSha256: header.tapeSha256,
+      _turnTapeComplete: true,
+      _turnTapeOrdinal: head.ordinal,
+      _recordOrdinal: head.ordinal,
+      ...(typeof anchor._seq === "number" ? { _seq: anchor._seq } : {}),
+      _orderSeq: unit.orderSeq,
+      status: typeof record.status === "string" ? record.status : header.status,
+      // Non-display terminal evidence for the owning finalized tape. Every
+      // real record carries it so a latest page can converge a lost final WS
+      // even when the tape contains only plan/goal/runtime-event roles.
+      _dispatchOutcome: header.status,
+      _turnKey: header.turnKey,
+      ...(header.clientMessageId && typeof record._clientMessageId !== "string"
+        ? { _clientMessageId: header.clientMessageId }
+        : {}),
+      _timelineRecord: true,
+      _timelineLogicalOrdinal: logicalIndex,
+      _timelineUnitKey: timelineTapeKey(header.tapeId, head.ordinal, logicalIndex, record.id),
+    }));
+    result.set(physicalKey, logicalRecords);
+  }
+  return result;
+}
+
+async function readUnifiedTimelineStatuses(
+  client: PoolClient,
+  sessionUserId: string,
+  sessionId: string,
+  anchorSeqs: number[],
+): Promise<Map<number, MessageLike[]>> {
+  const uidMatch = /^c:([1-9][0-9]*)$/.exec(sessionUserId);
+  if (!uidMatch || anchorSeqs.length === 0) return new Map();
+  const rows = (
+    await client.query<UnifiedTimelineStatusRow>(
+      `SELECT dispatch_id,client_message_id,failure_code,anchor_seq::text,terminal_at
+         FROM turn_dispatches
+        WHERE user_id=$1 AND session_id=$2
+          AND status='terminal' AND client_notified=TRUE
+          AND outcome IN ('not_accepted','executed_error')
+          AND anchor_seq=ANY($3::bigint[])
+        ORDER BY anchor_seq,dispatch_id`,
+      [uidMatch[1], sessionId, anchorSeqs],
+    )
+  ).rows;
+  const byAnchor = new Map<number, MessageLike[]>();
+  for (const row of rows) {
+    const anchorSeq = bigIntNum(row.anchor_seq, "turn dispatch anchor_seq");
+    const list = byAnchor.get(anchorSeq) ?? [];
+    list.push({
+      id: `turn-status:${row.dispatch_id}`,
+      role: "system",
+      text: "",
+      ts: row.terminal_at?.getTime() ?? 0,
+      _source: "server",
+      _seq: anchorSeq,
+      _turnStatusRecord: true,
+      _dispatchTerminal: true,
+      _dispatchLost: true,
+      _errorCode: row.failure_code ?? "DISPATCH_LOST",
+      _clientMessageId: row.client_message_id,
+      _timelineRecord: true,
+      _timelineUnitKey: `status:${row.dispatch_id}`,
+    });
+    byAnchor.set(anchorSeq, list);
+  }
+  return byAnchor;
+}
+
+/** The browser's sole historical read path: one exact chronological stream
+ * across ordinary rows and immutable tape physical records. It never emits a
+ * process control, projection, summary or truncation substitute. */
+async function readClientTimelinePageImpl(
+  pool: Pool,
+  sessionId: string,
+  userId: string,
+  cursor: ClientTimelineCursor | null = null,
+  limit = 100,
+  snapshotClient?: PoolClient,
+): Promise<ClientTimelinePage | null> {
+  const cappedLimit = Math.max(1, Math.min(
+    TAPE_RECORD_PAGE_MAX_ROWS,
+    Number.isFinite(limit) ? Math.floor(limit) : 100,
+  ));
+  const readSnapshot = async (client: PoolClient): Promise<ClientTimelinePage | null> => {
+    const session = (
+      await client.query<{
+        messages: string;
+        archived_through_seq: number | null;
+        history_revision: string;
+        timeline_generation: string;
+      }>(
+        `SELECT messages,archived_through_seq,history_revision,timeline_generation
+           FROM client_sessions
+          WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+        [sessionId, userId],
+      )
+    ).rows[0];
+    if (!session) return null;
+    const timelineGeneration = bigIntNum(session.timeline_generation, "timeline_generation");
+    if (cursor && cursor.timelineGeneration !== timelineGeneration) {
+      throw new ClientTimelineCursorStaleError();
+    }
+    const archivedThroughSeq = bigIntNumOr(session.archived_through_seq, 0);
+    const outer = await readUnifiedTimelineOuterCandidates(
+      client,
+      sessionId,
+      userId,
+      session.messages,
+      archivedThroughSeq,
+      cursor,
+      cappedLimit + 1,
+    );
+    const tapeAnchors = outer.messages.filter((message) =>
+      message._turnTapeComplete === true &&
+      typeof message._turnTapeId === "string" &&
+      typeof message._turnTapeSha256 === "string");
+    const tapeIds = [...new Set(tapeAnchors.map((message) => message._turnTapeId as string))];
+    const headers = await readUnifiedTimelineTapeHeaders(client, sessionId, userId, tapeIds);
+    const headRequests = tapeAnchors.map((anchor) => ({
+      tapeId: anchor._turnTapeId as string,
+      beforeOrdinal: cursor?.tapeId === anchor._turnTapeId
+        ? (cursor?.beforeOrdinal ?? 0)
+        : 2_147_483_647,
+    }));
+    const headsByTape = await readUnifiedTimelineTapeHeads(
+      client,
+      sessionId,
+      userId,
+      headRequests,
+      cappedLimit + 1,
+    );
+
+    if (cursor?.tapeId) {
+      const resumeAnchor = tapeAnchors.find((anchor) =>
+        anchor._orderSeq === cursor.beforeOrderSeq && anchor._turnTapeId === cursor.tapeId);
+      const header = headers.get(cursor.tapeId);
+      if (
+        !resumeAnchor || !header ||
+        resumeAnchor._turnTapeSha256 !== cursor.tapeSha256 ||
+        header.tapeSha256 !== cursor.tapeSha256
+      ) throw new ClientTimelineCursorStaleError();
+    }
+
+    const selected: UnifiedTimelineSelectedUnit[] = [];
+    let inlineBytes = 0;
+    let hasMore = false;
+    let continuation: { anchor: MessageLike; header: UnifiedTimelineTapeHeader; beforeOrdinal: number } | null = null;
+    outerLoop: for (const anchor of outer.messages) {
+      const orderSeq = anchor._orderSeq;
+      if (typeof orderSeq !== "number" || !Number.isSafeInteger(orderSeq) || orderSeq < 1) continue;
+      if (
+        anchor._turnTapeComplete === true &&
+        typeof anchor._turnTapeId === "string" &&
+        typeof anchor._turnTapeSha256 === "string"
+      ) {
+        const header = headers.get(anchor._turnTapeId);
+        if (!header) throw new Error(`[pgSessions] unified timeline finalized tape missing: ${anchor._turnTapeId}`);
+        if (header.tapeSha256 !== anchor._turnTapeSha256) {
+          throw new Error(`[pgSessions] unified timeline tape hash mismatch: ${anchor._turnTapeId}`);
+        }
+        const heads = headsByTape.get(header.tapeId) ?? [];
+        if (heads.length === 0 && cursor?.tapeId !== header.tapeId) {
+          throw new Error(`[pgSessions] unified timeline finalized tape has no records: ${header.tapeId}`);
+        }
+        for (let index = 0; index < heads.length; index++) {
+          const head = heads[index]!;
+          const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
+          const pageBytes = payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES ? 0 : payloadBytes;
+          if (
+            selected.length >= cappedLimit ||
+            (selected.length > 0 && inlineBytes + pageBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+          ) {
+            hasMore = true;
+            const previous = selected.at(-1);
+            continuation = {
+              anchor,
+              header,
+              beforeOrdinal: previous?.kind === "tape" && previous.header.tapeId === header.tapeId
+                  ? previous.head.ordinal
+                  : head.ordinal + 1,
+            };
+            break outerLoop;
+          }
+          selected.push({ kind: "tape", anchor, orderSeq, header, head });
+          inlineBytes += pageBytes;
+          if (index + 1 < heads.length && selected.length >= cappedLimit) {
+            hasMore = true;
+            continuation = { anchor, header, beforeOrdinal: head.ordinal };
+            break outerLoop;
+          }
+        }
+        continue;
+      }
+      const pageBytes = Buffer.byteLength(JSON.stringify(anchor), "utf8");
+      if (
+        selected.length >= cappedLimit ||
+        (selected.length > 0 && inlineBytes + pageBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+      ) {
+        hasMore = true;
+        break;
+      }
+      selected.push({ kind: "outer", anchor, orderSeq });
+      inlineBytes += pageBytes;
+    }
+
+    const selectedTapeUnits = selected.filter(
+      (unit): unit is Extract<UnifiedTimelineSelectedUnit, { kind: "tape" }> => unit.kind === "tape",
+    );
+    const tapeMessages = await hydrateUnifiedTimelineTapeUnits(
+      client,
+      sessionId,
+      userId,
+      selectedTapeUnits,
+    );
+    const selectedUserSeqs = selected.flatMap((unit) =>
+      unit.kind === "outer" && unit.anchor.role === "user" &&
+      typeof unit.anchor._seq === "number" && Number.isSafeInteger(unit.anchor._seq)
+        ? [unit.anchor._seq]
+        : []);
+    const statuses = await readUnifiedTimelineStatuses(
+      client,
+      userId,
+      sessionId,
+      selectedUserSeqs,
+    );
+
+    const chronological: MessageLike[] = [];
+    for (const unit of [...selected].reverse()) {
+      if (unit.kind === "tape") {
+        const records = tapeMessages.get(`${unit.header.tapeId}\0${unit.head.ordinal}`);
+        if (!records) throw new Error(`[pgSessions] unified timeline hydrated group missing: ${unit.header.tapeId}\0${unit.head.ordinal}`);
+        chronological.push(...records);
+        continue;
+      }
+      let outerMessages: MessageLike[] = [unit.anchor];
+      if (
+        unit.anchor._turnTapeComplete !== true &&
+        typeof unit.anchor._turnTapeId === "string" &&
+        typeof unit.anchor._turnTapeSha256 === "string"
+      ) {
+        outerMessages = await hydrateTurnTapeMessages(client, sessionId, userId, [unit.anchor], { view: "exact" });
+      }
+      for (let index = 0; index < outerMessages.length; index++) {
+        const message = outerMessages[index]!;
+        chronological.push({
+          ...message,
+          _timelineRecord: true,
+          _timelineLogicalOrdinal: index,
+          _timelineUnitKey: outerMessages.length === 1
+            ? timelineOuterKey(unit.anchor, unit.orderSeq)
+            : `${timelineOuterKey(unit.anchor, unit.orderSeq)}:${index}:${String(message.id ?? "anonymous")}`,
+        });
+      }
+      if (unit.anchor.role === "user" && typeof unit.anchor._seq === "number") {
+        const unitStatuses = statuses.get(unit.anchor._seq) ?? [];
+        for (let statusIndex = 0; statusIndex < unitStatuses.length; statusIndex++) {
+          chronological.push({
+            ...unitStatuses[statusIndex]!,
+            _orderSeq: unit.orderSeq,
+            // User + verified statuses are one deterministic logical group.
+            // Never let skew between the client message clock and the server
+            // terminal clock move a status before its owning user message.
+            _timelineLogicalOrdinal: outerMessages.length + statusIndex,
+          });
+        }
+      }
+    }
+
+    let nextCursor: ClientTimelineCursor | null = null;
+    if (hasMore && selected.length > 0) {
+      const oldest = selected.at(-1)!;
+      if (continuation && oldest.kind === "tape" && oldest.header.tapeId === continuation.header.tapeId) {
+        nextCursor = {
+          version: 1,
+          timelineGeneration,
+          beforeOrderSeq: continuation.anchor._orderSeq as number,
+          tapeId: continuation.header.tapeId,
+          tapeSha256: continuation.header.tapeSha256,
+          beforeOrdinal: continuation.beforeOrdinal,
+        };
+      } else {
+        nextCursor = {
+          version: 1,
+          timelineGeneration,
+          beforeOrderSeq: oldest.orderSeq,
+        };
+      }
+    }
+    return {
+      messages: chronological,
+      nextCursor,
+      hasMore,
+      timelineGeneration,
+      historyRevision: bigIntNum(session.history_revision, "history_revision"),
+      snapshotMaxSeq: outer.snapshotMaxSeq,
+    };
+  };
+  return snapshotClient
+    ? readSnapshot(snapshotClient)
+    : withTimelineSnapshot(pool, readSnapshot);
 }
 
 /** Physical-ordinal cursor paging over the immutable tape. The separately
@@ -4351,12 +5054,13 @@ export function createPgSessionsBackend(
           if (tape.dispatch_id !== null) {
             const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
             replayLate = convergence.lateTape;
-            if (convergence.lateTape) {
+            if (convergence.removedVisibleStatus) {
               // 直接状态读以 dispatch.status 为准。late tape 改成 manual_reconcile 后 bump
               // revision，在线客户端会立刻重读并移除旧失败状态。
               await client.query(
                 `UPDATE client_sessions
                     SET history_revision=history_revision + 1,
+                        timeline_generation=timeline_generation + 1,
                         updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
                   WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
                 [request.sessionId, userId],
@@ -4605,12 +5309,17 @@ export function createPgSessionsBackend(
             nowMs,
           );
           const archivedCount = bigIntNumOr(session.archived_count, 0) + archivedDelta;
+          const timelineGenerationDelta = hasInvisibleMessageRemoval(
+            preUpgradeMessages,
+            existingMessages,
+          ) ? 1 : 0;
           await client.query(
             `UPDATE client_sessions SET
                messages=$1, message_count=$2, last_at=$3,
                updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL}),
                next_seq=$4, archived_through_seq=$5, archived_count=$6,
-               history_revision=history_revision + $9
+               history_revision=history_revision + $9,
+               timeline_generation=timeline_generation + $10
              WHERE id=$7 AND user_id=$8 AND deleted_at IS NULL`,
             [
               plan.finalJson,
@@ -4622,6 +5331,7 @@ export function createPgSessionsBackend(
               request.sessionId,
               userId,
               hasInvisibleMessageRemoval(preUpgradeMessages, plan.tail) || archivedDelta > 0 ? 1 : 0,
+              timelineGenerationDelta,
             ],
           );
         }
@@ -4728,11 +5438,12 @@ export function createPgSessionsBackend(
         if (tape.dispatch_id !== null) {
           const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
           dispatchLate = convergence.lateTape;
-          if (convergence.lateTape) {
+          if (convergence.removedVisibleStatus) {
             // 当前事务已持 session 锁；revision 让浏览器移除此前的 verified failure 状态。
             await client.query(
               `UPDATE client_sessions
                   SET history_revision=history_revision + 1,
+                      timeline_generation=timeline_generation + 1,
                       updated_at=GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
                 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
               [request.sessionId, userId],
@@ -4876,11 +5587,14 @@ export function createPgSessionsBackend(
           const historyRevisionDelta = existing && (
             hasInvisibleHistoryMutation(oldMsgs, finalMessages, tail) || archivedDelta > 0
           ) ? 1 : 0;
+          const timelineGenerationDelta = existing && hasInvisibleMessageRemoval(oldMsgs, finalMessages)
+            ? 1
+            : 0;
 
           const res = await client.query(
             `INSERT INTO client_sessions
-               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id, history_revision)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13, $15, 0)
+               (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count, model_id, history_revision, timeline_generation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, GREATEST($10, ${CLOCK_MS_SQL}), $11, $12, $13, $15, 0, 1)
              ON CONFLICT (id) DO UPDATE SET
                agent_id = EXCLUDED.agent_id,
                title = EXCLUDED.title,
@@ -4900,7 +5614,8 @@ export function createPgSessionsBackend(
                next_seq = EXCLUDED.next_seq,
                archived_through_seq = EXCLUDED.archived_through_seq,
                archived_count = EXCLUDED.archived_count,
-               history_revision = client_sessions.history_revision + $16
+               history_revision = client_sessions.history_revision + $16,
+               timeline_generation = client_sessions.timeline_generation + $17
              WHERE client_sessions.updated_at <= $14 AND client_sessions.user_id = $2`,
             [
               session.id,
@@ -4919,6 +5634,7 @@ export function createPgSessionsBackend(
               baseSyncedAt,
               session.modelId ?? null,
               historyRevisionDelta,
+              timelineGenerationDelta,
             ],
           );
           if ((res.rowCount ?? 0) > 0) return "applied";
@@ -5661,7 +6377,8 @@ export function createPgSessionsBackend(
     ): Promise<ClientSession | null> {
       const sql = userId
         ? `SELECT cs.id, cs.user_id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at,
-                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision, cs.model_id,
+                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision,
+                  cs.timeline_generation, cs.model_id,
                   COALESCE((
                     SELECT SUM(ac.message_count) FROM client_session_archive_chunks ac
                      WHERE ac.session_id=cs.id AND ac.user_id=cs.user_id
@@ -5669,15 +6386,20 @@ export function createPgSessionsBackend(
              FROM client_sessions cs
             WHERE cs.id=$1 AND cs.user_id=$2 AND cs.deleted_at IS NULL`
         : `SELECT cs.id, cs.user_id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at,
-                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision, cs.model_id,
+                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision,
+                  cs.timeline_generation, cs.model_id,
                   COALESCE((
                     SELECT SUM(ac.message_count) FROM client_session_archive_chunks ac
                      WHERE ac.session_id=cs.id AND ac.user_id=cs.user_id
                   ), 0)::text AS archived_count
              FROM client_sessions cs
             WHERE cs.id=$1 AND cs.deleted_at IS NULL`;
-      const row = (
-        await pool.query<{
+      const read = async (
+        queryable: Pool | PoolClient,
+        snapshotClient?: PoolClient,
+      ): Promise<ClientSession | null> => {
+        const row = (
+          await queryable.query<{
           id: string;
           user_id: string;
           agent_id: string;
@@ -5690,36 +6412,53 @@ export function createPgSessionsBackend(
           archived_through_seq: number | null;
           archived_count: string;
           history_revision: string;
+          timeline_generation: string;
           model_id: string | null;
-        }>(sql, userId ? [id, userId] : [id])
-      ).rows[0];
-      if (!row) return null;
-      const archivedThroughOrderSeq = bigIntNumOr(row.archived_through_seq, 0);
-      const parsedMessages = deriveOrderSeqsForRead(
-        JSON.parse(row.messages) as MessageLike[],
-        archivedThroughOrderSeq,
-      );
-      let messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
-      if (options.view === "timeline") {
-        messages = await mergeVerifiedTurnStatusRows(pool, row.user_id, row.id, messages);
-      }
-      return {
-        id: row.id,
-        userId: row.user_id,
-        agentId: row.agent_id,
-        title: row.title,
-        pinned: row.pinned === 1,
-        createdAt: bigIntNum(row.created_at, "created_at"),
-        lastAt: bigIntNum(row.last_at, "last_at"),
-        messages,
-        updatedAt: bigIntNum(row.updated_at, "updated_at"),
-        historyRevision: bigIntNum(row.history_revision, "history_revision"),
-        ...(row.model_id ? { modelId: row.model_id } : {}),
-        // archived_count 是写侧缓存计数；存量迁移曾有极少数漂移。详情读以 chunk.message_count
-        // 实际合计为准，读尽后不会留下“还有 N 条”的幽灵按钮。
-        archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
-        archivedThroughSeq: archivedThroughOrderSeq,
+          }>(sql, userId ? [id, userId] : [id])
+        ).rows[0];
+        if (!row) return null;
+        const archivedThroughOrderSeq = bigIntNumOr(row.archived_through_seq, 0);
+        const parsedMessages = deriveOrderSeqsForRead(
+          JSON.parse(row.messages) as MessageLike[],
+          archivedThroughOrderSeq,
+        );
+        const timelinePage = options.view === "timeline"
+          ? await readClientTimelinePageImpl(pool, row.id, row.user_id, null, 100, snapshotClient)
+          : null;
+        const messages = timelinePage
+          ? timelinePage.messages
+          : await hydrateTurnTapeMessages(pool, row.id, row.user_id, parsedMessages, options);
+        return {
+          id: row.id,
+          userId: row.user_id,
+          agentId: row.agent_id,
+          title: row.title,
+          pinned: row.pinned === 1,
+          createdAt: bigIntNum(row.created_at, "created_at"),
+          lastAt: bigIntNum(row.last_at, "last_at"),
+          messages,
+          updatedAt: bigIntNum(row.updated_at, "updated_at"),
+          historyRevision: timelinePage?.historyRevision ??
+            bigIntNum(row.history_revision, "history_revision"),
+          timelineGeneration: timelinePage?.timelineGeneration ??
+            bigIntNum(row.timeline_generation, "timeline_generation"),
+          ...(timelinePage
+            ? {
+                timelineCursor: timelinePage.nextCursor,
+                timelineHasMore: timelinePage.hasMore,
+                timelineSnapshotMaxSeq: timelinePage.snapshotMaxSeq,
+              }
+            : {}),
+          ...(row.model_id ? { modelId: row.model_id } : {}),
+          // archived_count 是写侧缓存计数；存量迁移曾有极少数漂移。详情读以 chunk.message_count
+          // 实际合计为准，读尽后不会留下“还有 N 条”的幽灵按钮。
+          archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
+          archivedThroughSeq: archivedThroughOrderSeq,
+        };
       };
+      return options.view === "timeline"
+        ? withTimelineSnapshot(pool, (client) => read(client, client))
+        : read(pool);
     },
 
     async classifyClientSessions(
@@ -5759,8 +6498,12 @@ export function createPgSessionsBackend(
       sinceSeq: number,
       options: ClientSessionReadOptions = {},
     ): Promise<ClientSessionPartial | null> {
-      const row = (
-        await pool.query<{
+      const read = async (
+        queryable: Pool | PoolClient,
+        snapshotClient?: PoolClient,
+      ): Promise<ClientSessionPartial | null> => {
+        const row = (
+          await queryable.query<{
           id: string;
           user_id: string;
           agent_id: string;
@@ -5773,22 +6516,58 @@ export function createPgSessionsBackend(
           archived_through_seq: number | null;
           archived_count: string;
           history_revision: string;
+          timeline_generation: string;
           model_id: string | null;
-        }>(
-          `SELECT cs.id, cs.user_id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at,
-                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision, cs.model_id,
+          }>(
+            `SELECT cs.id, cs.user_id, cs.agent_id, cs.title, cs.pinned, cs.created_at, cs.last_at,
+                  cs.messages, cs.updated_at, cs.archived_through_seq, cs.history_revision,
+                  cs.timeline_generation, cs.model_id,
                   COALESCE((
                     SELECT SUM(ac.message_count) FROM client_session_archive_chunks ac
                      WHERE ac.session_id=cs.id AND ac.user_id=cs.user_id
                   ), 0)::text AS archived_count
              FROM client_sessions cs
             WHERE cs.id=$1 AND cs.user_id=$2 AND cs.deleted_at IS NULL`,
-          [id, userId],
-        )
-      ).rows[0];
-      if (!row) return null;
-      const archivedCount = bigIntNum(row.archived_count, "archived chunk message count");
-      const archivedThroughSeq = bigIntNumOr(row.archived_through_seq, 0);
+            [id, userId],
+          )
+        ).rows[0];
+        if (!row) return null;
+        const archivedCount = bigIntNum(row.archived_count, "archived chunk message count");
+        const archivedThroughSeq = bigIntNumOr(row.archived_through_seq, 0);
+
+        if (options.view === "timeline") {
+          const page = await readClientTimelinePageImpl(
+            pool,
+            row.id,
+            row.user_id,
+            null,
+            100,
+            snapshotClient,
+          );
+          if (!page) return null;
+          return {
+            id: row.id,
+            userId: row.user_id,
+            agentId: row.agent_id,
+            title: row.title,
+            pinned: row.pinned === 1,
+            createdAt: bigIntNum(row.created_at, "created_at"),
+            lastAt: bigIntNum(row.last_at, "last_at"),
+            messages: page.messages,
+            updatedAt: bigIntNum(row.updated_at, "updated_at"),
+            historyRevision: page.historyRevision,
+            timelineGeneration: page.timelineGeneration,
+            timelineCursor: page.nextCursor,
+            timelineHasMore: page.hasMore,
+            timelineSnapshotMaxSeq: page.snapshotMaxSeq,
+            ...(row.model_id ? { modelId: row.model_id } : {}),
+            totalMessageCount: page.messages.length + archivedCount,
+            maxSeq: page.snapshotMaxSeq,
+            isPartial: false,
+            archivedCount,
+            archivedThroughSeq,
+          };
+        }
 
       let allMsgs: MessageLike[] = [];
       try {
@@ -5819,12 +6598,7 @@ export function createPgSessionsBackend(
         isPartial = false;
       }
       messages = await hydrateTurnTapeMessages(pool, row.id, row.user_id, messages, options);
-      if (options.view === "timeline") {
-        // partial 也全量并入 active verified statuses(无自有 seq,不受 since 游标裁剪;前端按 id 幂等
-        // 去重,量级 = 未决失败数,恒小)。
-        messages = await mergeVerifiedTurnStatusRows(pool, row.user_id, row.id, messages);
-      }
-      return {
+        return {
         id: row.id,
         userId: row.user_id,
         agentId: row.agent_id,
@@ -5841,7 +6615,11 @@ export function createPgSessionsBackend(
         isPartial,
         archivedCount,
         archivedThroughSeq,
+        };
       };
+      return options.view === "timeline"
+        ? withTimelineSnapshot(pool, (client) => read(client, client))
+        : read(pool);
     },
 
     async readArchivedMessages(
@@ -5912,6 +6690,15 @@ export function createPgSessionsBackend(
         });
       }
       return { messages: hydrated, hasMore, oldestSeq, historyRevision };
+    },
+
+    async readClientTimelinePage(
+      sessionId: string,
+      userId: string,
+      cursor: ClientTimelineCursor | null = null,
+      limit = 100,
+    ): Promise<ClientTimelinePage | null> {
+      return readClientTimelinePageImpl(pool, sessionId, userId, cursor, limit);
     },
 
     // ── 引擎上下文读 ─────────────────────────────────────────────────────────
@@ -6054,6 +6841,7 @@ export function createPgSessionsBackend(
       const result = await pool.query(
         `UPDATE client_sessions
             SET history_revision = history_revision + 1,
+                timeline_generation = timeline_generation + 1,
                 updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
         [id, userId],

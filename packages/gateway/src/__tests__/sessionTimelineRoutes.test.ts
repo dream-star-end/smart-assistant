@@ -12,17 +12,27 @@ const start = source.indexOf('// ── Client session sync (cross-device, multi
 const end = source.indexOf('// ── Changelog', start)
 const routes = source.slice(start, end > start ? end : start + 20_000)
 
-test('browser session full/incremental/archive routes request the direct timeline', () => {
+test('browser history uses one opaque unified timeline route', () => {
   assert.ok(start >= 0, 'client session route block not found')
   assert.match(routes, /getClientSession\(sessId, userId, \{ view: 'timeline' \}\)/)
   assert.match(routes, /getClientSessionPartial\(sessId, userId, sinceSeq, \{[\s\S]*?view: 'timeline',[\s\S]*?sinceHistoryRevision,[\s\S]*?\}\)/)
-  assert.match(routes, /readArchivedMessages\(sessId, userId, beforeSeq, limit, \{ view: 'timeline' \}\)/)
+  assert.match(routes, /const timelineMatch = url\.pathname\.match/)
+  assert.match(routes, /decodeClientTimelineCursor\(rawCursor\)/)
+  assert.match(routes, /readClientTimelinePage\(sessId, userId, cursor, limit\)/)
+  assert.match(routes, /nextCursor: page\.nextCursor \? encodeClientTimelineCursor\(page\.nextCursor\) : null/)
+  assert.match(routes, /error instanceof ClientTimelineCursorStaleError/)
+  assert.match(routes, /TIMELINE_CURSOR_STALE/)
   assert.match(routes, /url\.searchParams\.get\('since_history_revision'\)/)
   assert.match(routes, /_parseHistoryRevisionCursor\(historyRevisionRaw\)/)
   assert.match(routes, /userPayloadMatch/)
   assert.match(routes, /readUserMessagePayload\(sessId, userId, msgId, 0, 1\)/)
   assert.match(routes, /!isPersistedClientMessageId\(msgId\)/)
   assert.match(routes, /!isPersistedClientMessageId\(data\.id\)/)
+  const timelineRoute = routes.slice(
+    routes.indexOf('const timelineMatch'),
+    routes.indexOf('// 归档分页端点', routes.indexOf('const timelineMatch')),
+  )
+  assert.doesNotMatch(timelineRoute, /_turnTapeProcess|projection|listTurnTapeRecords/)
 })
 
 test('user payload routes cover canonical 128-char ids and legacy colon ids', () => {

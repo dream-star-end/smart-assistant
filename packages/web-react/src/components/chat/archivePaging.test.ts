@@ -67,6 +67,7 @@ describe("visible virtual row anchor", () => {
     rowElement.setAttribute("data-chat-virtual-key", "stable-row");
     scroller.appendChild(rowElement);
     Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000, writable: true });
     scroller.getBoundingClientRect = () => ({
       top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
       x: 0, y: 0, toJSON: () => ({}),
@@ -78,14 +79,20 @@ describe("visible virtual row anchor", () => {
     });
 
     const anchor = captureVisibleVirtualRowAnchor(scroller)!;
-    expect(anchor).toEqual({ key: "stable-row", top: 120 });
+    expect(anchor).toEqual({
+      key: "stable-row",
+      top: 120,
+      scrollTop: 100,
+      scrollHeight: 1000,
+      dataIndex: null,
+    });
     // 顶部归档新增 200px；同时底部 live answer 可增长任意高度，但稳定行只下移 200px。
     rowTop = 320;
     expect(correctToVisibleVirtualRowAnchor(scroller, anchor)).toBe(true);
     expect(scroller.scrollTop).toBe(300);
   });
 
-  test("首帧校正后用户滚动会取消后续帧，不再把视口拽回", async () => {
+  test("稳定平台校正后用户滚动会取消后续帧，不再把视口拽回", async () => {
     const scroller = document.createElement("div");
     const rowElement = document.createElement("div");
     rowElement.setAttribute("data-chat-virtual-key", "stable-row");
@@ -103,11 +110,19 @@ describe("visible virtual row anchor", () => {
     let cancelled = false;
     const restoring = restoreVisibleVirtualRowAnchor(
       scroller,
-      { key: "stable-row", top: 120 },
+      {
+        key: "stable-row",
+        top: 120,
+        scrollTop: 100,
+        scrollHeight: 1000,
+        dataIndex: null,
+      },
       () => cancelled,
       (callback) => frames.push(callback),
     );
 
+    frames.shift()!();
+    expect(scroller.scrollTop).toBe(100);
     frames.shift()!();
     expect(scroller.scrollTop).toBe(300);
     scroller.scrollTop = 250;
@@ -115,6 +130,288 @@ describe("visible virtual row anchor", () => {
     frames.shift()!();
     await restoring;
     expect(scroller.scrollTop).toBe(250);
+    expect(frames).toHaveLength(0);
+  });
+
+  test("大页前插让锚点暂时卸载时先按高度差拉回挂载区，再等待精确行校正", () => {
+    const scroller = document.createElement("div");
+    Object.defineProperty(scroller, "scrollTop", { value: 80, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 2600, writable: true });
+
+    expect(correctToVisibleVirtualRowAnchor(scroller, {
+      key: "temporarily-unmounted",
+      top: 40,
+      scrollTop: 80,
+      scrollHeight: 1000,
+      dataIndex: null,
+    })).toBe(false);
+    expect(scroller.scrollTop).toBe(1680);
+  });
+
+  test("慢调度超过旧 12 帧后才前插/重挂载，也必须等真实行稳定再结束", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "slow-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    let scrollHeight = 1000;
+    Object.defineProperty(scroller, "scrollHeight", { get: () => scrollHeight });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    let prependHeight = 0;
+    rowElement.getBoundingClientRect = () => {
+      const top = 120 + prependHeight - (scroller.scrollTop - 100);
+      return {
+        top, bottom: top + 40, left: 0, right: 800, width: 800, height: 40,
+        x: 0, y: top, toJSON: () => ({}),
+      };
+    };
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    for (let frame = 0; frame < 20; frame += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
+    expect(resolved).toBe(false);
+
+    prependHeight = 1600;
+    scrollHeight = 2600;
+    rowElement.remove();
+    frames.shift()!();
+    expect(scroller.scrollTop).toBe(1700);
+    expect(resolved).toBe(false);
+
+    scroller.appendChild(rowElement);
+    for (let frame = 0; frame < 4 && !resolved; frame += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(rowElement.getBoundingClientRect().top).toBe(120);
+  });
+
+  test("底部实时增长不能冒领 prepend；只有同一行 data-index 重排后才释放 FIFO", async () => {
+    const scroller = document.createElement("div");
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("data-index", "2");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "live-bottom-row");
+    wrapper.appendChild(rowElement);
+    scroller.appendChild(wrapper);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    let scrollHeight = 1000;
+    Object.defineProperty(scroller, "scrollHeight", { get: () => scrollHeight });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    rowElement.getBoundingClientRect = () => ({
+      top: 120, bottom: 160, left: 0, right: 800, width: 800, height: 40,
+      x: 0, y: 120, toJSON: () => ({}),
+    });
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    expect(anchor.dataIndex).toBe("2");
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    for (let frame = 0; frame < 20; frame += 1) {
+      scrollHeight += 100;
+      frames.shift()!();
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+    }
+
+    wrapper.setAttribute("data-index", "66");
+    scrollHeight += 100;
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    scrollHeight += 100;
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
+  });
+
+  test("总高度不变但上方测量逐帧漂移时不提前结束，停止漂移后才稳定", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "drifting-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000 });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    let layoutOffset = 0;
+    rowElement.getBoundingClientRect = () => {
+      const top = 120 + layoutOffset - (scroller.scrollTop - 100);
+      return {
+        top, bottom: top + 40, left: 0, right: 800, width: 800, height: 40,
+        x: 0, y: top, toJSON: () => ({}),
+      };
+    };
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    for (const offset of [10, 20, 30]) {
+      layoutOffset = offset;
+      frames.shift()!();
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+      expect(scroller.scrollTop).toBe(100);
+    }
+
+    // The last unmodified position must first form a two-frame plateau. Only
+    // then may one exact correction run; two aligned frames are still required.
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(rowElement.getBoundingClientRect().top).toBe(120);
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(rowElement.getBoundingClientRect().top).toBe(120);
+  });
+
+  test("锚点永久消失后 timeline generation 改变会在下一帧取消并释放调度", async () => {
+    const scroller = document.createElement("div");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "obsolete-generation-row");
+    scroller.appendChild(rowElement);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000 });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    rowElement.getBoundingClientRect = () => ({
+      top: 120, bottom: 160, left: 0, right: 800, width: 800, height: 40,
+      x: 0, y: 120, toJSON: () => ({}),
+    });
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    const capturedGeneration = 7;
+    let currentGeneration = capturedGeneration;
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => currentGeneration !== capturedGeneration,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    rowElement.remove();
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(frames).toHaveLength(1);
+
+    currentGeneration = 8;
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
+    expect(frames).toHaveLength(0);
+  });
+
+  test("Virtuoso 反向补偿时等待新平台，禁止逐帧追打后才稳定结束", async () => {
+    const scroller = document.createElement("div");
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("data-index", "2");
+    const rowElement = document.createElement("div");
+    rowElement.setAttribute("data-chat-virtual-key", "reindexed-row");
+    wrapper.appendChild(rowElement);
+    scroller.appendChild(wrapper);
+    Object.defineProperty(scroller, "scrollTop", { value: 100, writable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000 });
+    scroller.getBoundingClientRect = () => ({
+      top: 0, bottom: 600, left: 0, right: 800, width: 800, height: 600,
+      x: 0, y: 0, toJSON: () => ({}),
+    });
+    let layoutOffset = 0;
+    rowElement.getBoundingClientRect = () => {
+      const top = 120 + layoutOffset - (scroller.scrollTop - 100);
+      return {
+        top, bottom: top + 40, left: 0, right: 800, width: 800, height: 40,
+        x: 0, y: top, toJSON: () => ({}),
+      };
+    };
+    const anchor = captureVisibleVirtualRowAnchor(scroller)!;
+    expect(anchor.dataIndex).toBe("2");
+    const frames: Array<() => void> = [];
+    let resolved = false;
+    const restoring = restoreVisibleVirtualRowAnchor(
+      scroller,
+      anchor,
+      () => false,
+      (callback) => frames.push(callback),
+    ).then(() => { resolved = true; });
+
+    for (let frame = 0; frame < 20; frame += 1) {
+      frames.shift()!();
+      await Promise.resolve();
+    }
+    expect(resolved).toBe(false);
+
+    wrapper.setAttribute("data-index", "66");
+    layoutOffset = 48;
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(100);
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(148);
+    expect(resolved).toBe(false);
+
+    // Slow Virtuoso measurement applies the opposite 48px deviation after our
+    // first correction. Wait for that new raw plateau before correcting once.
+    layoutOffset = 0;
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(148);
+    frames.shift()!();
+    await Promise.resolve();
+    expect(scroller.scrollTop).toBe(100);
+    expect(resolved).toBe(false);
+
+    frames.shift()!();
+    await Promise.resolve();
+    frames.shift()!();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    frames.shift()!();
+    await restoring;
+    expect(resolved).toBe(true);
     expect(frames).toHaveLength(0);
   });
 });

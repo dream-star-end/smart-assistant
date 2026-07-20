@@ -1,77 +1,23 @@
-/**
- * Direct immutable timeline frontend contracts.
- * The final answer is a genuine tape record shown immediately. Process rows
- * are fetched lazily, merged by immutable id/ordinal, and never persisted as
- * a second content copy.
- */
-import { afterEach, describe, expect, test, vi } from "vitest";
-import { createSession, type ChatMessage } from "./model";
-import {
-  collapsedAnchorTerminalKind,
-  collectResolvedDispatchTurnIds,
-  formatTapeBytes,
-  isCollapsedAnchorTerminalEvidence,
-  isTurnStatusSuppressedByTape,
-  isTurnTapeProcessControl,
-  turnTapeProcessKey,
-} from "./render";
-import { detectServerTerminalTurns } from "../persist";
-import { turnFinalAssistantFlags } from "../../components/chat/turnSegment";
+/** Unified real-history frontend contracts. */
+import { describe, expect, test, vi } from "vitest";
+import type { ChatMessage } from "./model";
+import { rebuildIndexes } from "./model";
 import { ChatSocket, type ChatSocketDeps } from "./socket";
-import { applyOutboundMessage } from "./reducer";
-import type { OutboundMessageWire } from "./frames";
+import { stableSortByTs } from "../persist";
 
-function srvRow(over: Partial<ChatMessage>): ChatMessage {
-  return { id: "x", role: "assistant", text: "", ts: 1, _source: "server", ...over } as ChatMessage;
-}
-
-function liveFrame(over: Record<string, unknown>): OutboundMessageWire {
+function row(over: Partial<ChatMessage>): ChatMessage {
   return {
-    type: "outbound.message",
-    sessionKey: "agent:main:webchat:dm:s1",
-    channel: "webchat",
-    peer: { id: "s1", kind: "dm" },
-    blocks: [],
-    isFinal: false,
-    ...over,
-  } as unknown as OutboundMessageWire;
-}
-
-function processControl(over: Partial<ChatMessage> = {}): ChatMessage {
-  return srvRow({
-    id: "turn-process:tape-1",
-    role: "runtime-event",
-    text: "",
-    _seq: 5,
-    _orderSeq: 5,
-    _turnTapeProcess: true,
-    _turnTapeProcessCount: 3,
-    _turnTapeTotalBytes: 192 * 1024 * 1024,
-    _dispatchOutcome: "completed",
-    _turnTapeId: "tape-1",
-    _turnTapeSha256: "sha-1",
-    _clientMessageId: "cm-1",
-    ...over,
-  });
-}
-
-function finalAnswer(over: Partial<ChatMessage> = {}): ChatMessage {
-  return srvRow({
-    id: "srv-a-t1",
+    id: "row",
     role: "assistant",
-    text: "真实最终回答",
-    _seq: 5,
-    _orderSeq: 5,
-    _turnTapeId: "tape-1",
-    _turnTapeSha256: "sha-1",
-    _turnTapeOrdinal: 3,
-    _turnTapeComplete: true,
-    _clientMessageId: "cm-1",
+    text: "",
+    ts: 1,
+    _source: "server",
+    _timelineRecord: true,
     ...over,
-  });
+  } as ChatMessage;
 }
 
-function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
+function socket(overrides: Partial<ChatSocketDeps> = {}): ChatSocket {
   return new ChatSocket({
     getToken: () => "tok",
     getAuthEpoch: () => 0,
@@ -82,555 +28,557 @@ function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   });
 }
 
-describe("direct timeline process control", () => {
-  test("typed process control is not Agent-authored content", () => {
-    expect(isTurnTapeProcessControl(processControl())).toBe(true);
-    expect(isTurnTapeProcessControl(finalAnswer())).toBe(false);
-    expect(turnTapeProcessKey(processControl())).toBe(
-      "tape-1::sha-1::turn-process:tape-1",
-    );
+const latestPage = (): ChatMessage[] => [
+  row({
+    id: "user-latest",
+    role: "user",
+    text: "最新问题",
+    _orderSeq: 10,
+    _timelineUnitKey: "outer:10:user-latest",
+  }),
+  row({
+    id: "thinking-latest",
+    role: "thinking",
+    text: "最新真实思考",
+    _orderSeq: 11,
+    _turnTapeId: "tape-latest",
+    _turnTapeComplete: true,
+    _turnTapeOrdinal: 0,
+    _timelineLogicalOrdinal: 0,
+    _timelineUnitKey: "tape:tape-latest:0:0:thinking-latest",
+  }),
+  row({
+    id: "tool-latest",
+    role: "tool",
+    text: "最新真实工具输出",
+    toolName: "Bash",
+    _orderSeq: 11,
+    _turnTapeId: "tape-latest",
+    _turnTapeComplete: true,
+    _turnTapeOrdinal: 1,
+    _timelineLogicalOrdinal: 0,
+    _timelineUnitKey: "tape:tape-latest:1:0:tool-latest",
+  }),
+  row({
+    id: "answer-latest",
+    role: "assistant",
+    text: "最新真实回答",
+    _orderSeq: 11,
+    _turnTapeId: "tape-latest",
+    _turnTapeComplete: true,
+    _turnTapeOrdinal: 2,
+    _timelineLogicalOrdinal: 0,
+    _timelineUnitKey: "tape:tape-latest:2:0:answer-latest",
+  }),
+];
+
+const olderPage = (): ChatMessage[] => [
+  row({
+    id: "user-older",
+    role: "user",
+    text: "更早问题",
+    _orderSeq: 5,
+    _timelineUnitKey: "outer:5:user-older",
+  }),
+  row({
+    id: "thinking-older",
+    role: "thinking",
+    text: "更早真实思考",
+    _orderSeq: 6,
+    _turnTapeId: "tape-older",
+    _turnTapeComplete: true,
+    _turnTapeOrdinal: 0,
+    _timelineLogicalOrdinal: 0,
+    _timelineUnitKey: "tape:tape-older:0:0:thinking-older",
+  }),
+  row({
+    id: "answer-older",
+    role: "assistant",
+    text: "更早真实回答",
+    _orderSeq: 6,
+    _turnTapeId: "tape-older",
+    _turnTapeComplete: true,
+    _turnTapeOrdinal: 1,
+    _timelineLogicalOrdinal: 0,
+    _timelineUnitKey: "tape:tape-older:1:0:answer-older",
+  }),
+];
+
+describe("unified real timeline", () => {
+  test("latest page keeps user, thinking, tool and answer as equal chronological records", () => {
+    const s = socket();
+    s.applyServerMessages("s1", "main", [
+      ...latestPage(),
+      row({ id: "turn-process:stale", role: "runtime-event", _turnTapeProcess: true }),
+      row({ id: "projection-old", role: "system", text: "projection" }),
+    ], true, 11, {
+      timelineGeneration: 1,
+      timelineCursor: "cursor-1",
+      timelineHasMore: true,
+      timelineSnapshotMaxSeq: 11,
+      serverUpdatedAt: 1,
+    });
+
+    const session = s.sessions.get("s1")!;
+    expect(session.messages.map((message) => message.id)).toEqual([
+      "user-latest", "thinking-latest", "tool-latest", "answer-latest",
+    ]);
+    expect(session.messages.map((message) => message.role)).toEqual([
+      "user", "thinking", "tool", "assistant",
+    ]);
+    expect(session._timelineCursor).toBe("cursor-1");
+    expect(session._timelineHasMore).toBe(true);
   });
 
-  test("terminal outcome is completion evidence without pretending the control is the final answer", () => {
-    expect(collapsedAnchorTerminalKind("completed")).toBe("completed");
-    expect(collapsedAnchorTerminalKind("interrupted")).toBe("completed");
-    expect(collapsedAnchorTerminalKind("crashed")).toBe("error");
-    expect(isCollapsedAnchorTerminalEvidence(processControl())).toBe(true);
-    expect(isCollapsedAnchorTerminalEvidence(finalAnswer())).toBe(false);
+  test("predecessor process-control payload cannot replace a resident unified timeline", () => {
+    const s = socket();
+    s.applyServerMessages("s1", "main", latestPage(), true, 11, {
+      timelineGeneration: 1,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 1,
+    });
+    const before = s.sessions.get("s1")!.messages;
+
+    s.applyServerMessages("s1", "main", [
+      row({
+        id: "turn-process:legacy",
+        role: "runtime-event",
+        _timelineRecord: false,
+        _turnTapeProcess: true,
+      }),
+      row({
+        id: "legacy-final-locator",
+        role: "assistant",
+        text: "旧版最终定位行",
+        _timelineRecord: false,
+      }),
+    ], true, 12, { historyRevision: 2, serverUpdatedAt: 2 });
+
+    expect(s.sessions.get("s1")!.messages).toBe(before);
+    expect(s.sessions.get("s1")!.messages.some((message) => message.id === "legacy-final-locator")).toBe(false);
   });
 
-  test("only the genuine final assistant record receives the rating slot", () => {
-    const rows = [
-      srvRow({ id: "cm-1", role: "user", text: "问题" }),
-      processControl(),
-      finalAnswer(),
+  test("first unified generation purges predecessor cached process cards before adopting exact rows", () => {
+    const s = socket();
+    s.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "legacy cache",
+      createdAt: 1,
+      lastAt: 9,
+      messages: [
+        { id: "user-latest", role: "user", text: "最新问题", ts: 1 },
+        { id: "legacy-plan", role: "plan", text: "旧缓存计划卡", ts: 2 },
+        { id: "legacy-goal", role: "goal", text: "旧缓存目标卡", ts: 3 },
+        { id: "legacy-group", role: "agent-group", text: "旧缓存团队富卡", ts: 4, _delegateRunId: "old-run" },
+        { id: "legacy-progress", role: "delegate-progress", text: "旧缓存委派进度", ts: 5 },
+        { id: "legacy-answer", role: "assistant", text: "旧缓存回答替身", ts: 6 },
+      ],
+    });
+
+    s.applyServerMessages("s1", "main", latestPage(), true, 11, {
+      timelineGeneration: 1,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 10,
+    });
+
+    expect(s.sessions.get("s1")!.messages.map((message) => message.id)).toEqual([
+      "user-latest", "thinking-latest", "tool-latest", "answer-latest",
+    ]);
+    expect(s.sessions.get("s1")!.messages.some((message) => message.text.includes("旧缓存"))).toBe(false);
+  });
+
+  test("predecessor active cards survive first adoption with an owner, then exact terminal tape removes all of them", () => {
+    const s = socket();
+    const session = s.ensureSession("s1", "main");
+    const owner = "legacy-active-user";
+    session._sendingInFlight = true;
+    session._activeClientMessageId = owner;
+    session.messages = [
+      { id: owner, role: "user", text: "旧 bundle 正在执行", ts: 10, status: "read" },
+      { id: "legacy-active-plan", role: "plan", text: "活跃计划", ts: 11 },
+      { id: "legacy-active-goal", role: "goal", text: "活跃目标", ts: 12 },
+      { id: "legacy-active-group", role: "agent-group", text: "活跃协作", ts: 13 },
+      { id: "legacy-active-progress", role: "delegate-progress", text: "活跃进度", ts: 14 },
     ];
-    expect(turnFinalAssistantFlags(rows)).toEqual([false, false, true]);
-  });
+    rebuildIndexes(session);
 
-  test("byte formatting is metadata only", () => {
-    expect(formatTapeBytes(2 * 1024 * 1024)).toBe("2.0 MB");
-    expect(formatTapeBytes(64 * 1024)).toBe("64 KB");
-    expect(formatTapeBytes(500)).toBe("500 B");
-    expect(formatTapeBytes(0)).toBe("");
-  });
-});
-
-describe("durable status versus true tape", () => {
-  test("same-turn tape suppresses a stale typed failure status", () => {
-    const status = srvRow({
-      id: "turn-status:d1",
-      role: "system",
-      _turnStatusRecord: true,
-      _dispatchTerminal: true,
-      _errorCode: "dispatch_lost",
-      _clientMessageId: "cm-1",
+    s.applyServerMessages("s1", "main", [row({
+      id: "older-server-user",
+      role: "user",
+      text: "已完成旧轮",
+      ts: 1,
+      _orderSeq: 1,
+      _timelineUnitKey: "outer:1:older-server-user",
+    })], true, 1, {
+      timelineGeneration: 1,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 20,
     });
-    const resolved = collectResolvedDispatchTurnIds([status, processControl(), finalAnswer()]);
-    expect(resolved.has("cm-1")).toBe(true);
-    expect(isTurnStatusSuppressedByTape(status, resolved)).toBe(true);
-    expect(isTurnStatusSuppressedByTape(status, collectResolvedDispatchTurnIds([status]))).toBe(false);
-  });
 
-  test("terminal detection distinguishes status, process outcome, and real final content", () => {
-    const status = srvRow({
-      id: "turn-status:d1",
-      role: "system",
-      _turnStatusRecord: true,
-      _dispatchTerminal: true,
-      _clientMessageId: "cm-status",
+    const adopted = session.messages.filter((message) => message.id.startsWith("legacy-active-"));
+    expect(adopted.map((message) => message.id)).toEqual([
+      "legacy-active-user", "legacy-active-plan", "legacy-active-goal",
+      "legacy-active-group", "legacy-active-progress",
+    ]);
+    expect(adopted.filter((message) => message.role !== "user").every(
+      (message) => message._turnOwnerId === owner,
+    )).toBe(true);
+
+    const exact = (["plan", "goal", "agent-group", "delegate-progress"] as const)
+      .map((role, index) => row({
+        id: `exact-adopted-${role}`,
+        role,
+        text: `真实 ${role}`,
+        ts: 30 + index,
+        _orderSeq: 2,
+        _turnTapeId: "adopted-terminal-tape",
+        _turnTapeComplete: true,
+        _turnTapeOrdinal: index,
+        _timelineLogicalOrdinal: 0,
+        _timelineUnitKey: `tape:adopted-terminal-tape:${index}:0:exact-adopted-${role}`,
+        _clientMessageId: owner,
+        _dispatchOutcome: "completed",
+      }));
+    s.applyServerMessages("s1", "main", [
+      row({
+        id: owner,
+        role: "user",
+        text: "旧 bundle 正在执行",
+        ts: 10,
+        _orderSeq: 2,
+        _timelineUnitKey: `outer:2:${owner}`,
+      }),
+      ...exact,
+    ], true, 2, {
+      timelineGeneration: 1,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 30,
     });
-    expect(detectServerTerminalTurns([status]).get("cm-status")).toBe("error");
-    expect(detectServerTerminalTurns([processControl()]).get("cm-1")).toBe("completed");
-    expect(detectServerTerminalTurns([finalAnswer()]).get("cm-1")).toBe("completed");
-  });
-});
 
-describe("lazy immutable process merge", () => {
-  afterEach(() => vi.restoreAllMocks());
-
-  function seed(): { sock: ChatSocket; session: ReturnType<typeof createSession> } {
-    const sock = makeSocket();
-    sock.applyServerMessages(
-      "s1",
-      "main",
-      [
-        srvRow({ id: "cm-1", role: "user", text: "问题", _seq: 4, _orderSeq: 4 }),
-        processControl(),
-        finalAnswer(),
-      ],
-      true,
-      5,
-      { serverUpdatedAt: 100 },
-    );
-    return { sock, session: sock.sessions.get("s1")! };
-  }
-
-  test("page rows merge by true ordinal and do not duplicate the already-visible final answer", () => {
-    const { sock, session } = seed();
-    const maxSeqBefore = session._maxSeq;
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [
-        srvRow({
-          id: "runtime-0",
-          role: "runtime-event",
-          _runtimeEvent: { type: "progress", exact: true },
-          _turnTapeOrdinal: 0,
-        }),
-        srvRow({ id: "thinking-1", role: "thinking", text: "真实思考", _turnTapeOrdinal: 1 }),
-        srvRow({ id: "tool-2", role: "tool", toolName: "Bash", text: "真实工具输出", _turnTapeOrdinal: 2 }),
-        finalAnswer({ text: "page copy must not replace timeline truth" }),
-      ],
-      null,
-    );
-
-    const section = session.messages.filter((message) => message._turnTapeId === "tape-1");
-    expect(section.map((message) => message.id)).toEqual([
-      "turn-process:tape-1",
-      "runtime-0",
-      "thinking-1",
-      "tool-2",
-      "srv-a-t1",
+    expect(session.messages.some((message) => message.id.startsWith("legacy-active-") && message.role !== "user")).toBe(false);
+    expect(session.messages.filter((message) => message.id.startsWith("exact-adopted-")).map((message) => message.id)).toEqual([
+      "exact-adopted-plan", "exact-adopted-goal", "exact-adopted-agent-group",
+      "exact-adopted-delegate-progress",
     ]);
-    expect(section.filter((message) => message.id === "srv-a-t1")).toHaveLength(1);
-    expect(section.at(-1)?.text).toBe("真实最终回答");
-    expect(session._maxSeq).toBe(maxSeqBefore);
-    expect(session.messages.find((message) => message.id === "runtime-0")?._seq).toBe(5);
+    expect(session._sendingInFlight).toBe(false);
   });
 
-  test("subsequent pages insert by ordinal instead of append order", () => {
-    const { sock, session } = seed();
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [srvRow({ id: "tool-2", role: "tool", text: "二", _turnTapeOrdinal: 2 })],
-      1,
-    );
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [
-        srvRow({ id: "thinking-1", role: "thinking", text: "一", _turnTapeOrdinal: 1 }),
-        srvRow({ id: "tool-2", role: "tool", text: "duplicate", _turnTapeOrdinal: 2 }),
-      ],
-      null,
-    );
-    expect(session.messages.filter((message) => message._turnTapeId === "tape-1")
-      .map((message) => message.id)).toEqual([
-      "turn-process:tape-1", "thinking-1", "tool-2", "srv-a-t1",
+  test("finalized exact tape removes every owned live process substitute but preserves user and permission", () => {
+    const s = socket();
+    const session = s.ensureSession("s1", "main");
+    const owner = "cm-live-process";
+    session._sendingInFlight = true;
+    session._activeClientMessageId = owner;
+    session.messages = [
+      { id: owner, role: "user", text: "执行完整过程", ts: 1, status: "read" },
+      ...(["assistant", "thinking", "tool", "plan", "goal", "agent-group", "delegate-progress", "runtime-event"] as const)
+        .map((role, index) => ({
+          id: `live-${role}`,
+          role,
+          text: `本地替身 ${role}`,
+          ts: 2 + index,
+          _turnOwnerId: owner,
+          ...(role === "agent-group" ? { _delegateRunId: "live-run" } : {}),
+        } as ChatMessage)),
+      {
+        id: "live-permission",
+        role: "permission",
+        text: "Bash",
+        ts: 20,
+        _turnOwnerId: owner,
+      },
+    ];
+    rebuildIndexes(session);
+
+    const exact = (["plan", "goal", "agent-group", "runtime-event"] as const).map((role, index) => row({
+      id: `exact-${role}`,
+      role,
+      text: `真实 ${role}`,
+      ts: 30 + index,
+      _orderSeq: 2,
+      _turnTapeId: "exact-process-tape",
+      _turnTapeComplete: true,
+      _turnTapeOrdinal: index,
+      _timelineLogicalOrdinal: 0,
+      _timelineUnitKey: `tape:exact-process-tape:${index}:0:exact-${role}`,
+      _clientMessageId: owner,
+      _dispatchOutcome: "completed",
+      ...(role === "agent-group" ? { _delegateRunId: "exact-run" } : {}),
+    }));
+    s.applyServerMessages("s1", "main", [
+      row({
+        id: owner,
+        role: "user",
+        text: "执行完整过程",
+        ts: 1,
+        _orderSeq: 1,
+        _timelineUnitKey: `outer:1:${owner}`,
+      }),
+      ...exact,
+    ], true, 2, {
+      timelineGeneration: 1,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 30,
+    });
+
+    expect(session.messages.filter((message) => message.id.startsWith("live-")).map((message) => message.id)).toEqual([
+      "live-permission",
     ]);
-    expect(session.messages.find((message) => message.id === "tool-2")?.text).toBe("二");
+    expect(session.messages.filter((message) => message.id.startsWith("exact-")).map((message) => message.id)).toEqual([
+      "exact-plan", "exact-goal", "exact-agent-group", "exact-runtime-event",
+    ]);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session.messages.find((message) => message.id === owner)?.status).toBe("replied");
   });
 
-  test("each fetched page keeps a lightweight render-page identity and duplicate merges are inert", () => {
+  test("exact timeline agent/tool rows replace live delegate cards instead of being skeleton-merged", () => {
+    const s = socket();
+    const session = s.ensureSession("s1", "main");
+    session.messages = [
+      {
+        id: "live-group-different-id",
+        role: "agent-group",
+        text: "客户端富卡替身",
+        ts: 1,
+        _delegate: true,
+        _delegateRunId: "run-exact",
+        childBlocks: [{ kind: "text", text: "只存在于客户端的拼装过程" }],
+      },
+      {
+        id: "delegate-tool-same-id",
+        role: "agent-group",
+        text: "客户端转换后的工具卡",
+        ts: 2,
+        _delegate: true,
+        _delegateRunId: "run-tool",
+        childBlocks: [{ kind: "text", text: "客户端工具替身" }],
+      },
+    ];
+    rebuildIndexes(session);
+
+    const exactGroup = row({
+      id: "exact-group",
+      role: "agent-group",
+      text: "Agent 持久化的真实协作记录",
+      ts: 3,
+      _orderSeq: 10,
+      _delegateRunId: "run-exact",
+      _timelineUnitKey: "tape:exact:0:0:exact-group",
+    });
+    const exactTool = row({
+      id: "delegate-tool-same-id",
+      role: "tool",
+      text: "Agent 持久化的真实工具记录",
+      output: "exact tool output",
+      ts: 4,
+      _orderSeq: 10,
+      _turnTapeOrdinal: 1,
+      _timelineUnitKey: "tape:exact:1:0:delegate-tool-same-id",
+    });
+    const exactGoals = [
+      row({
+        id: "exact-goal-1",
+        role: "goal",
+        text: "真实目标记录一",
+        blockId: "engine-goal",
+        ts: 5,
+        _orderSeq: 11,
+        _timelineUnitKey: "outer:11:exact-goal-1",
+      }),
+      row({
+        id: "exact-goal-2",
+        role: "goal",
+        text: "真实目标记录二",
+        blockId: "engine-goal",
+        ts: 6,
+        _orderSeq: 12,
+        _timelineUnitKey: "outer:12:exact-goal-2",
+      }),
+    ];
+    s.applyServerMessages("s1", "main", [exactGroup, exactTool, ...exactGoals], true, 12, {
+      timelineGeneration: 1,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 10,
+    });
+
+    expect(session.messages).toHaveLength(4);
+    expect(session.messages.map((message) => message.id)).toEqual([
+      "exact-group", "delegate-tool-same-id", "exact-goal-1", "exact-goal-2",
+    ]);
+    expect(session.messages.map((message) => message.role)).toEqual([
+      "agent-group", "tool", "goal", "goal",
+    ]);
+    expect(session.messages[0]).toBe(exactGroup);
+    expect(session.messages[1]).toBe(exactTool);
+    expect(session.messages.every((message) => message._timelineRecord === true)).toBe(true);
+    expect(session.messages.some((message) => message.text.includes("替身"))).toBe(false);
+    expect(session._blockIdToMsgId?.has("engine-goal")).toBe(false);
+  });
+
+  test("one explicit older page remains resident, advances once, and is never persisted", () => {
     const persistSession = vi.fn();
-    const sock = makeSocket({ persistSession });
-    sock.applyServerMessages(
-      "s1",
-      "main",
-      [
-        srvRow({ id: "cm-1", role: "user", text: "问题", _seq: 4, _orderSeq: 4 }),
-        processControl(),
-        finalAnswer(),
-      ],
-      true,
-      5,
-      { historyRevision: 7, serverUpdatedAt: 100 },
-    );
+    const s = socket({ persistSession });
+    s.applyServerMessages("s1", "main", latestPage(), true, 11, {
+      timelineGeneration: 1,
+      timelineCursor: "cursor-1",
+      timelineHasMore: true,
+      serverUpdatedAt: 1,
+    });
     persistSession.mockClear();
 
-    const tail = srvRow({ id: "tool-tail", role: "tool", text: "尾页", _turnTapeOrdinal: 2 });
-    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tail], 2);
-    const session = sock.sessions.get("s1")!;
-    const tailPageKey = session.messages.find((message) => message.id === "tool-tail")
-      ?._turnTapeProcessPageKey;
-    expect(tailPageKey).toContain("tail");
-
-    persistSession.mockClear();
-    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tail], 2);
+    s.prependTimelinePage("s1", olderPage(), "cursor-1", "cursor-2", true, 1);
+    const session = s.sessions.get("s1")!;
+    expect(session.messages.map((message) => message.id)).toEqual([
+      "user-older", "thinking-older", "answer-older",
+      "user-latest", "thinking-latest", "tool-latest", "answer-latest",
+    ]);
+    expect(session.messages.slice(0, 3).every((message) =>
+      message._historyPageLoadedFrom === "cursor-1" &&
+      typeof message._historyPageKey === "string"
+    )).toBe(true);
+    expect(session._timelineCursor).toBe("cursor-2");
+    expect(session._timelineHasMore).toBe(true);
     expect(persistSession).not.toHaveBeenCalled();
 
-    const older = srvRow({ id: "thinking-old", role: "thinking", text: "更早", _turnTapeOrdinal: 1 });
-    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [older], null);
-    const olderPageKey = session.messages.find((message) => message.id === "thinking-old")
-      ?._turnTapeProcessPageKey;
-    expect(olderPageKey).toContain("before:2");
-    expect(olderPageKey).not.toBe(tailPageKey);
+    const before = session.messages;
+    s.prependTimelinePage("s1", olderPage(), "cursor-1", null, false, 1);
+    expect(session.messages).toBe(before);
+    expect(session._timelineCursor).toBe("cursor-2");
+
+    const stored = s.toStored("s1")!;
+    expect(stored.messages).toEqual([]);
   });
 
-  test("CCB Bash tail continuation updates loaded tool cards without mutating immutable rows", () => {
-    const { sock, session } = seed();
-    session.messages.push(processControl({
-      id: "turn-process:tape-tail",
-      _turnTapeId: "tape-tail",
-      _turnTapeSha256: "sha-tail",
-      _seq: 6,
-      _orderSeq: 6,
-    }));
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [
-        srvRow({
-          id: "tool-bg",
-          role: "tool",
-          toolName: "Bash",
-          blockId: "tool-bg",
-          output: "Command running in background with ID: bg-1",
-          _turnTapeOrdinal: 1,
-        }),
-        srvRow({
-          id: "agent-bg",
-          role: "agent-group",
-          childBlocks: [{
-            kind: "tool_use",
-            blockId: "child-bg",
-            toolName: "Bash",
-            output: "Command running in background with ID: bg-2",
-          }],
-          _turnTapeOrdinal: 2,
-        }),
-      ],
-      null,
-    );
-    const originalTool = session.messages.find((message) => message.id === "tool-bg")!;
-    const originalGroup = session.messages.find((message) => message.id === "agent-bg")!;
-
-    const oldTail = srvRow({
-      id: "tail-old",
-      role: "runtime-event",
-      _runtimeSource: "ccb",
-      _runtimeEvent: {
-        type: "system",
-        subtype: "bash_output_tail",
-        tool_use_id: "tool-bg",
-        tail: "旧快照",
-        total_bytes: 42,
-      },
-      _turnTapeOrdinal: 1,
+  test("reload discards every cached timeline row before a newer generation takes authority", () => {
+    const original = socket();
+    original.applyServerMessages("s1", "main", latestPage(), true, 11, {
+      timelineGeneration: 1,
+      timelineCursor: "cursor-1",
+      timelineHasMore: true,
+      serverUpdatedAt: 1,
     });
-    const latestTail = srvRow({
-      id: "tail-latest",
-      role: "runtime-event",
-      _runtimeSource: "ccb",
-      _runtimeEvent: {
-        type: "system",
-        subtype: "bash_output_tail",
-        tool_use_id: "tool-bg",
-        tail: "同字节数但更晚的真实快照",
-        total_bytes: 42,
-        truncated_head: true,
-      },
-      _turnTapeOrdinal: 2,
+    const stored = original.toStored("s1")!;
+    expect(stored.messages).toEqual([]);
+
+    // Rolling clients may already have written unified rows before this fix.
+    // The new reader must purge that cache even though old StoredSession has
+    // no timeline-generation field.
+    stored.messages = latestPage();
+    const reloaded = socket();
+    reloaded.loadStored(stored);
+    expect(reloaded.sessions.get("s1")!.messages).toEqual([]);
+
+    const replacement = [row({
+      id: "replacement-after-reload",
+      role: "assistant",
+      text: "刷新后的服务端真相",
+      _orderSeq: 20,
+      _timelineUnitKey: "outer:20:replacement-after-reload",
+    })];
+    reloaded.applyServerMessages("s1", "main", replacement, true, 20, {
+      timelineGeneration: 2,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 2,
     });
-    const childTail = srvRow({
-      id: "tail-child",
-      role: "runtime-event",
-      _runtimeSource: "ccb",
-      _runtimeEvent: {
-        type: "system",
-        subtype: "bash_output_tail",
-        tool_use_id: "child-bg",
-        parent_tool_use_id: "agent-bg",
-        tail: "子 Agent 的真实后台输出",
-        total_bytes: 31,
-      },
-      _turnTapeOrdinal: 3,
-    });
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-tail",
-      [latestTail, oldTail, childTail],
-      null,
-    );
-
-    expect(originalTool.bashTail).toBeUndefined();
-    expect(originalGroup.childBlocks?.[0]?.bashTail).toBeUndefined();
-    expect(session.messages.find((message) => message.id === "tool-bg")).not.toBe(originalTool);
-    expect(session.messages.find((message) => message.id === "tool-bg")?.bashTail).toEqual({
-      tail: "同字节数但更晚的真实快照",
-      totalBytes: 42,
-      truncatedHead: true,
-    });
-    expect(session.messages.find((message) => message.id === "agent-bg")?.childBlocks?.[0]?.bashTail)
-      .toEqual({ tail: "子 Agent 的真实后台输出", totalBytes: 31, truncatedHead: false });
-    expect(session.messages.find((message) => message.id === "agent-bg")?._runtimeBashTailRevision)
-      .toBe(1);
-    expect(session.messages.find((message) => message.id === "tail-latest")?._runtimeEvent)
-      .toEqual(latestTail._runtimeEvent);
-  });
-
-  test("reverse lazy load reconciles a Bash tail that arrives before its owning tool row", () => {
-    const { sock, session } = seed();
-    const tail = srvRow({
-      id: "tail-first",
-      role: "runtime-event",
-      _runtimeSource: "ccb",
-      _runtimeEvent: {
-        type: "system",
-        subtype: "bash_output_tail",
-        tool_use_id: "tool-later",
-        tail: "先加载的真实尾部",
-        total_bytes: 24,
-      },
-      _turnTapeOrdinal: 2,
-    });
-    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tail], 1);
-    expect(session.messages.find((message) => message.id === "tail-first")).toBeDefined();
-
-    const tool = srvRow({
-      id: "tool-later",
-      role: "tool",
-      toolName: "Bash",
-      blockId: "tool-later",
-      _turnTapeOrdinal: 1,
-    });
-    sock.applyTapeRecordsPage("s1", "turn-process:tape-1", [tool], null);
-
-    expect(tool.bashTail).toBeUndefined();
-    expect(session.messages.find((message) => message.id === "tool-later")?.bashTail).toEqual({
-      tail: "先加载的真实尾部",
-      totalBytes: 24,
-      truncatedHead: false,
-    });
-  });
-
-  test("lazy page merge keeps a local permission card before its real terminal answer", () => {
-    const { sock, session } = seed();
-    const finalIndex = session.messages.findIndex((message) => message.id === "srv-a-t1");
-    session.messages.splice(finalIndex, 0, {
-      id: "permission-local",
-      role: "permission",
-      text: "",
-      ts: 2,
-      _turnOwnerId: "cm-1",
-      _resolved: true,
-    });
-
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [srvRow({ id: "thinking-1", role: "thinking", text: "真实思考", _turnTapeOrdinal: 1 })],
-      null,
-    );
-
-    const ids = session.messages.map((message) => message.id);
-    expect(ids.indexOf("thinking-1")).toBeLessThan(ids.indexOf("permission-local"));
-    expect(ids.indexOf("permission-local")).toBeLessThan(ids.indexOf("srv-a-t1"));
-  });
-
-  test("lazy pages preserve immutable delegate and repeated goal records without display folding", () => {
-    const { sock, session } = seed();
-    const finalIndex = session.messages.findIndex((message) => message.id === "srv-a-t1");
-    session.messages.splice(finalIndex, 0, {
-      id: "local-group",
-      role: "agent-group",
-      text: "local live card",
-      ts: 2,
-      _delegate: true,
-      _delegateRunId: "run-shared",
-      _turnOwnerId: "cm-1",
-      childBlocks: [],
-    });
-
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [
-        srvRow({
-          id: "server-group",
-          role: "agent-group",
-          text: "immutable group transcript",
-          _delegateRunId: "run-shared",
-          summary: "immutable summary",
-          _turnTapeOrdinal: 0,
-        }),
-        srvRow({
-          id: "server-delegate-tool",
-          role: "tool",
-          text: "immutable delegate tool",
-          toolName: "delegate_task",
-          blockId: "delegate-block",
-          inputJson: { agentId: "coder", goal: "raw delegated task" },
-          output: "raw delegated result",
-          _turnTapeOrdinal: 1,
-        }),
-        srvRow({ id: "goal-first", role: "goal", text: "first goal event", blockId: "engine-goal", _turnTapeOrdinal: 1 }),
-        srvRow({ id: "goal-second", role: "goal", text: "second goal event", blockId: "engine-goal", _turnTapeOrdinal: 2 }),
-      ],
-      null,
-    );
-
-    const expectExactRows = () => {
-      expect(session.messages.find((message) => message.id === "server-group")).toMatchObject({
-        role: "agent-group",
-        text: "immutable group transcript",
-        summary: "immutable summary",
-        _source: "server",
-      });
-      expect(session.messages.find((message) => message.id === "server-delegate-tool")).toMatchObject({
-        role: "tool",
-        text: "immutable delegate tool",
-        output: "raw delegated result",
-        _source: "server",
-      });
-      expect(session.messages.filter((message) =>
-        message.id === "goal-first" || message.id === "goal-second"))
-        .toHaveLength(2);
-      expect(session._blockIdToMsgId?.get("delegate-block")).toBeUndefined();
-      expect(session._blockIdToMsgId?.get("engine-goal")).toBeUndefined();
-    };
-    expect(session.messages.find((message) => message.id === "local-group")).toBeDefined();
-    expectExactRows();
-
-    sock.applyServerMessages(
-      "s1",
-      "main",
-      [
-        srvRow({ id: "cm-1", role: "user", text: "问题", _seq: 4, _orderSeq: 4 }),
-        processControl(),
-        finalAnswer(),
-      ],
-      true,
-      5,
-      { serverUpdatedAt: 101 },
-    );
-    expectExactRows();
-
-    sock.prependArchivedMessages("s1", [
-      srvRow({ id: "archived-before", role: "assistant", text: "更早的真实记录", _seq: 1, _orderSeq: 1 }),
+    expect(reloaded.sessions.get("s1")!.messages.map((message) => message.id)).toEqual([
+      "replacement-after-reload",
     ]);
-    expectExactRows();
   });
 
-  test("later live turns cannot adopt, finalize, or stream into immutable lazy rows", () => {
-    const { sock, session } = seed();
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [
-        srvRow({ id: "exact-plan", role: "plan", text: "partial historical plan", _partial: true, _turnTapeOrdinal: 0 }),
-        srvRow({ id: "exact-tool", role: "tool", text: "historical tool", _completed: false, _turnTapeOrdinal: 1 }),
-        srvRow({
-          id: "exact-progress",
-          role: "delegate-progress",
-          text: "",
-          runId: "run-history",
-          agentId: "coder",
-          goal: "same goal",
-          _delegateGoal: "same goal",
-          entries: [{ phase: "text", text: "immutable progress entry", ts: 1 }],
-          _completed: false,
-          _turnTapeOrdinal: 2,
-        }),
-        srvRow({ id: "exact-assistant", role: "assistant", text: "immutable assistant", _turnTapeOrdinal: 3 }),
-        srvRow({ id: "exact-thinking", role: "thinking", text: "immutable thinking", _turnTapeOrdinal: 4 }),
-      ],
-      null,
-    );
-    session.messages.push(srvRow({ id: "cm-2", role: "user", text: "later turn", _seq: 6, _orderSeq: 6 }));
-    session._activeClientMessageId = "cm-2";
-    session._sendingInFlight = true;
-
-    applyOutboundMessage(session, liveFrame({
-      frameSeq: 1,
-      clientMessageId: "cm-2",
-      blocks: [{
-        kind: "tool_use",
-        toolName: "delegate_task",
-        blockId: "later-delegate",
-        inputJson: { agentId: "coder", goal: "same goal" },
-      }],
-    }));
-    applyOutboundMessage(session, liveFrame({
-      frameSeq: 2,
-      clientMessageId: "cm-2",
-      blocks: [{
-        kind: "delegate_progress",
-        runId: "run-history",
-        agentId: "coder",
-        goal: "same goal",
-        phase: "text",
-        text: "later live progress",
-      }],
-    }));
-    applyOutboundMessage(session, liveFrame({
-      frameSeq: 3,
-      clientMessageId: "cm-2",
-      blocks: [
-        { kind: "text", messageId: "exact-assistant", text: "must not append" },
-        { kind: "thinking", messageId: "exact-thinking", text: "must not append" },
-      ],
-    }));
-    applyOutboundMessage(session, liveFrame({
-      frameSeq: 4,
-      clientMessageId: "cm-2",
-      blocks: [],
-      isFinal: true,
-    }));
-
-    expect(session.messages.find((message) => message.id === "exact-plan"))
-      .toMatchObject({ text: "partial historical plan", _partial: true });
-    expect(session.messages.find((message) => message.id === "exact-tool"))
-      .toMatchObject({ text: "historical tool", _completed: false });
-    expect(session.messages.find((message) => message.id === "exact-progress")).toMatchObject({
-      runId: "run-history",
-      entries: [{ phase: "text", text: "immutable progress entry", ts: 1 }],
-      _completed: false,
+  test("same-generation latest refresh updates matching rows without evicting older pages or rewinding cursor", () => {
+    const s = socket();
+    s.applyServerMessages("s1", "main", latestPage(), true, 11, {
+      timelineGeneration: 1,
+      timelineCursor: "cursor-1",
+      timelineHasMore: true,
+      serverUpdatedAt: 1,
     });
-    expect(session.messages.filter((message) => message.id === "exact-assistant"))
-      .toEqual([expect.objectContaining({ text: "immutable assistant" })]);
-    expect(session.messages.filter((message) => message.id === "exact-thinking"))
-      .toEqual([expect.objectContaining({ text: "immutable thinking" })]);
+    s.prependTimelinePage("s1", olderPage(), "cursor-1", "cursor-2", true, 1);
+
+    const refreshed = latestPage().map((message) => message.id === "answer-latest"
+      ? { ...message, text: "更新后的真实回答", usage: { costCredits: "7" } }
+      : message);
+    s.applyServerMessages("s1", "main", refreshed, true, 12, {
+      timelineGeneration: 1,
+      timelineCursor: "latest-cursor-must-not-rewind",
+      timelineHasMore: true,
+      historyRevision: 9,
+      serverUpdatedAt: 2,
+    });
+
+    const session = s.sessions.get("s1")!;
+    expect(session.messages.some((message) => message.id === "thinking-older")).toBe(true);
+    expect(session.messages.find((message) => message.id === "answer-latest")).toMatchObject({
+      text: "更新后的真实回答",
+      usage: { costCredits: "7" },
+    });
+    expect(session._timelineCursor).toBe("cursor-2");
+    expect(session._historyRevision).toBe(9);
   });
 
-  test("history revision invalidates fetched rows and their cursor as one atomic view state", () => {
-    const { sock, session } = seed();
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [srvRow({ id: "thinking-1", role: "thinking", text: "第一页", _turnTapeOrdinal: 1 })],
-      200,
-    );
-    expect(session.messages.find((message) => message.id === "thinking-1")).toBeDefined();
-    expect(session.messages.find((message) => message.id === "turn-process:tape-1"))
-      .toMatchObject({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 });
+  test("a true timeline-generation change atomically replaces all loaded pages", () => {
+    const s = socket();
+    s.applyServerMessages("s1", "main", latestPage(), true, 11, {
+      timelineGeneration: 1,
+      timelineCursor: "cursor-1",
+      timelineHasMore: true,
+      serverUpdatedAt: 1,
+    });
+    s.prependTimelinePage("s1", olderPage(), "cursor-1", null, false, 1);
 
-    sock.applyServerMessages(
-      "s1",
-      "main",
-      [
-        srvRow({ id: "cm-1", role: "user", text: "问题", _seq: 4, _orderSeq: 4 }),
-        processControl(),
-        finalAnswer(),
-      ],
-      true,
-      5,
-      { historyRevision: 1, serverUpdatedAt: 101 },
-    );
+    const replacement = [row({
+      id: "replacement",
+      role: "assistant",
+      text: "新代次真实记录",
+      _orderSeq: 20,
+      _timelineUnitKey: "outer:20:replacement",
+    })];
+    s.applyServerMessages("s1", "main", replacement, true, 20, {
+      timelineGeneration: 2,
+      timelineCursor: null,
+      timelineHasMore: false,
+      serverUpdatedAt: 2,
+    });
 
-    expect(session.messages.find((message) => message.id === "thinking-1")).toBeUndefined();
-    const control = session.messages.find((message) => message.id === "turn-process:tape-1")!;
-    expect(control._turnTapeProcessExpanded).toBeUndefined();
-    expect(control._turnTapeProcessCursor).toBeUndefined();
+    const session = s.sessions.get("s1")!;
+    expect(session.messages.map((message) => message.id)).toEqual(["replacement"]);
+    expect(session._timelineGeneration).toBe(2);
+    expect(session._historyPageSerial).toBe(0);
   });
 
-  test("IndexedDB snapshot stores only the small control and genuine narrative, never fetched process copies", () => {
-    const { sock } = seed();
-    sock.applyTapeRecordsPage(
-      "s1",
-      "turn-process:tape-1",
-      [srvRow({ id: "thinking-1", role: "thinking", text: "一", _turnTapeOrdinal: 1 })],
-      2,
-    );
-    const stored = sock.toStored("s1")!;
-    expect(stored.messages.some((message) => message.id === "thinking-1")).toBe(false);
-    expect(stored.messages.find((message) => message.id === "srv-a-t1")?.text).toBe("真实最终回答");
-    const control = stored.messages.find((message) => message.id === "turn-process:tape-1")!;
-    expect(control._turnTapeProcess).toBe(true);
-    expect(control._turnTapeProcessExpanded).toBeUndefined();
-    expect(control._turnTapeProcessCursor).toBeUndefined();
+  test("physical ordinal and logical ordinal win over skewed timestamps", () => {
+    const records = [
+      row({ id: "p2", _orderSeq: 4, _turnTapeId: "t", _turnTapeOrdinal: 2, _timelineLogicalOrdinal: 0, ts: 1 }),
+      row({ id: "p1-l1", _orderSeq: 4, _turnTapeId: "t", _turnTapeOrdinal: 1, _timelineLogicalOrdinal: 1, ts: 1 }),
+      row({ id: "p1-l0", _orderSeq: 4, _turnTapeId: "t", _turnTapeOrdinal: 1, _timelineLogicalOrdinal: 0, ts: 999 }),
+      row({ id: "p0", _orderSeq: 4, _turnTapeId: "t", _turnTapeOrdinal: 0, _timelineLogicalOrdinal: 0, ts: 500 }),
+    ];
+    expect(stableSortByTs(records).map((message) => message.id)).toEqual([
+      "p0", "p1-l0", "p1-l1", "p2",
+    ]);
+  });
+
+  test("finalized timeline records never become live block mutation targets", () => {
+    const s = socket();
+    const session = s.ensureSession("s1", "main");
+    session.messages = [row({
+      id: "historical-tool",
+      role: "tool",
+      blockId: "reused-block",
+      _turnTapeComplete: true,
+      _turnTapeId: "tape-old",
+    })];
+    session._blockIdToMsgId = new Map();
+    session._agentGroups = new Map();
+    rebuildIndexes(session);
+    expect(session._blockIdToMsgId.has("reused-block")).toBe(false);
   });
 });

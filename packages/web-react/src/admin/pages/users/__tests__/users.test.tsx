@@ -175,6 +175,10 @@ function installFixtures() {
           updated_at: 4,
           archived_count: 1,
           archived_through_seq: 1,
+          timeline_generation: 1,
+          timeline_cursor: 'cursor-web-1',
+          timeline_has_more: true,
+          timeline_snapshot_max_seq: 4,
           messages: [
             {
               id: 'hot-user',
@@ -205,7 +209,7 @@ function installFixtures() {
           ],
         },
       })
-    if (path === '/sessions/web-1/archive')
+    if (path === '/sessions/web-1/timeline')
       return Promise.resolve({
         session_id: 'web-1',
         messages: [
@@ -218,8 +222,9 @@ function installFixtures() {
             status: 'sent',
           },
         ],
-        oldest_seq: 1,
+        next_cursor: null,
         has_more: false,
+        timeline_generation: 1,
       })
     if (path === '/sessions/web-2')
       return Promise.resolve({
@@ -234,6 +239,10 @@ function installFixtures() {
           updated_at: 11,
           archived_count: 0,
           archived_through_seq: 0,
+          timeline_generation: 1,
+          timeline_cursor: null,
+          timeline_has_more: false,
+          timeline_snapshot_max_seq: 1,
           messages: [
             {
               id: 'session-b-user',
@@ -366,9 +375,9 @@ describe('UserDetailSheet — 会话只读查看器', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /查看更早历史记录/ }))
     expect(await screen.findByText('云端更早的问题')).toBeTruthy()
-    expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
+    expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/timeline', {
       user_id: '1',
-      before: 0,
+      cursor: 'cursor-web-1',
       limit: 100,
     })
     expect(screen.queryByRole('button', { name: /查看更早历史记录/ })).toBeNull()
@@ -381,7 +390,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     })
     const fixtureGet = mockGet.getMockImplementation()! as (...args: any[]) => any
     mockGet.mockImplementation((path: string, params?: Record<string, unknown>) => {
-      if (path === '/sessions/web-1/archive') return delayedArchive
+      if (path === '/sessions/web-1/timeline') return delayedArchive
       return fixtureGet(path, params)
     })
 
@@ -401,9 +410,9 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     expect(await screen.findByText('管理员看到的用户问题')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /查看更早历史记录/ }))
     await waitFor(() =>
-      expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
+      expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/timeline', {
         user_id: '1',
-        before: 0,
+        cursor: 'cursor-web-1',
         limit: 100,
       }),
     )
@@ -426,8 +435,9 @@ describe('UserDetailSheet — 会话只读查看器', () => {
             status: 'sent',
           },
         ],
-        oldest_seq: 1,
+        next_cursor: null,
         has_more: false,
+        timeline_generation: 1,
       })
       await delayedArchive
     })
@@ -436,7 +446,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     expect(screen.queryByText('不应混入 B 的 A 归档消息')).toBeNull()
   })
 
-  test('归档响应在途时 tape 点击保持排队，归档 DOM 提交后才读取下一页', async () => {
+  test('历史请求在途时重复点击只发一页，真实记录提交后常驻', async () => {
     let resolveArchive!: (value: unknown) => void
     const delayedArchive = new Promise((resolve) => { resolveArchive = resolve })
     mockGet.mockImplementation((path: string) => {
@@ -446,29 +456,18 @@ describe('UserDetailSheet — 会话只读查看器', () => {
             id: 'admin-fifo', user_id: 'c:1', agent_id: 'main', title: '串行分页会话',
             pinned: false, created_at: 1, last_at: 3, updated_at: 3,
             archived_count: 1, archived_through_seq: 1,
+            timeline_generation: 7, timeline_cursor: 'cursor-fifo',
+            timeline_has_more: true, timeline_snapshot_max_seq: 3,
             messages: [
               {
-                id: 'turn-process:tape-fifo', role: 'runtime-event', text: '', ts: 2,
-                _turnTapeProcess: true, _turnTapeProcessExpanded: true,
-                _turnTapeProcessCursor: 10, _turnTapeId: 'tape-fifo',
-                _turnTapeSha256: 'f'.repeat(64),
+                id: 'fifo-answer', role: 'assistant', text: '当前最新回答', ts: 3,
+                _timelineRecord: true, _timelineUnitKey: 'hot:3',
               },
-              { id: 'fifo-answer', role: 'assistant', text: '当前最新回答', ts: 3 },
             ],
           },
         })
       }
-      if (path === '/sessions/admin-fifo/archive') return delayedArchive
-      if (path === '/sessions/admin-fifo/tape/tape-fifo/records') {
-        return Promise.resolve({
-          records: [{
-            id: 'fifo-thinking', role: 'thinking', text: '更早真实过程', ts: 1.5,
-            _turnTapeOrdinal: 9,
-          }],
-          nextCursor: null,
-          total: 1,
-        })
-      }
+      if (path === '/sessions/admin-fifo/timeline') return delayedArchive
       return Promise.reject(new Error(`unexpected path ${path}`))
     })
 
@@ -486,34 +485,97 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     )
 
     expect(await screen.findByText('当前最新回答')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /查看更早历史记录（还有 1 条）/ }))
+    const loadButton = screen.getByRole('button', { name: /查看更早历史记录/ })
+    fireEvent.click(loadButton)
+    fireEvent.click(loadButton)
     await waitFor(() => expect(mockGet).toHaveBeenCalledWith(
-      '/sessions/admin-fifo/archive',
-      { user_id: '1', before: 0, limit: 100 },
+      '/sessions/admin-fifo/timeline',
+      { user_id: '1', cursor: 'cursor-fifo', limit: 100 },
     ))
-    fireEvent.click(screen.getByRole('button', { name: '查看更早历史记录' }))
-    await act(async () => {})
-    expect(mockGet).not.toHaveBeenCalledWith(
-      '/sessions/admin-fifo/tape/tape-fifo/records',
-      expect.anything(),
-    )
+    expect(mockGet.mock.calls.filter(([path]) => path === '/sessions/admin-fifo/timeline')).toHaveLength(1)
 
     await act(async () => resolveArchive({
       session_id: 'admin-fifo',
-      messages: [{
-        id: 'fifo-archive', role: 'user', text: '归档页先提交', ts: 1, _seq: 1, status: 'sent',
-      }],
-      oldest_seq: 1,
+      messages: [
+        {
+          id: 'fifo-archive', role: 'user', text: '历史页真实问题', ts: 1,
+          _timelineRecord: true, _timelineUnitKey: 'archive:1',
+        },
+        {
+          id: 'fifo-thinking', role: 'thinking', text: '更早真实思考', ts: 2,
+          _timelineRecord: true, _timelineUnitKey: 'tape:0',
+        },
+      ],
+      next_cursor: null,
       has_more: false,
+      timeline_generation: 7,
     }))
-    expect(await screen.findByText('归档页先提交')).toBeTruthy()
-    await waitFor(() => expect(mockGet).toHaveBeenCalledWith(
-      '/sessions/admin-fifo/tape/tape-fifo/records',
-      { user_id: '1', before: 10, limit: 200 },
-    ))
+    expect(await screen.findByText('历史页真实问题')).toBeTruthy()
+    expect(await screen.findByText('更早真实思考')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /查看更早历史记录/ })).toBeNull()
   })
 
-  test('管理员查看器可懒加载超长 user/final 正文并按页展开真实 Agent 过程', async () => {
+  test('管理员时间线代次变化时自动重载最新快照，不会用失效游标反复重试', async () => {
+    let detailReads = 0
+    mockGet.mockImplementation((path: string) => {
+      if (path === '/sessions/admin-stale') {
+        detailReads += 1
+        const refreshed = detailReads > 1
+        return Promise.resolve({
+          session: {
+            id: 'admin-stale', user_id: 'c:1', agent_id: 'main', title: '代次刷新会话',
+            pinned: false, created_at: 1, last_at: refreshed ? 4 : 3, updated_at: refreshed ? 4 : 3,
+            archived_count: 1, archived_through_seq: 1,
+            timeline_generation: refreshed ? 8 : 7,
+            timeline_cursor: refreshed ? null : 'cursor-stale',
+            timeline_has_more: !refreshed, timeline_snapshot_max_seq: refreshed ? 4 : 3,
+            messages: [{
+              id: refreshed ? 'fresh-answer' : 'stale-answer',
+              role: 'assistant',
+              text: refreshed ? '代次变化后的真实最新回答' : '变化前的回答',
+              ts: refreshed ? 4 : 3,
+              _timelineRecord: true,
+              _timelineUnitKey: refreshed ? 'outer:4:fresh-answer' : 'outer:3:stale-answer',
+            }],
+          },
+        })
+      }
+      if (path === '/sessions/admin-stale/timeline') {
+        return Promise.resolve({
+          session_id: 'admin-stale',
+          messages: [],
+          next_cursor: null,
+          has_more: false,
+          timeline_generation: 8,
+        })
+      }
+      return Promise.reject(new Error(`unexpected path ${path}`))
+    })
+
+    renderPage(
+      <SessionViewerModal
+        session={{
+          session_id: 'admin-stale', title: '代次刷新会话', agent_id: 'main', message_count: 3,
+          created_at: '2026-07-01T00:00:00.000Z', last_at: '2026-07-01T00:00:00.000Z',
+          updated_at: '2026-07-01T00:00:00.000Z',
+        }}
+        userId="1"
+        userEmail="alice@example.com"
+        onClose={() => {}}
+      />,
+    )
+
+    expect(await screen.findByText('变化前的回答')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /查看更早历史记录/ }))
+
+    expect(await screen.findByText('代次变化后的真实最新回答')).toBeTruthy()
+    expect(screen.queryByText('变化前的回答')).toBeNull()
+    expect(detailReads).toBe(2)
+    expect(mockGet.mock.calls.filter(([path]) => path === '/sessions/admin-stale/timeline')).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: /查看更早历史记录/ })).toBeNull()
+  })
+
+  test('管理员查看器懒加载超长 user/final，并直接展示同页真实思考', async () => {
     const userRecord = {
       id: 'cm:user:admin', role: 'user', text: '管理员看到的完整超长提问', ts: 1,
     }
@@ -529,35 +591,28 @@ describe('UserDetailSheet — 会话只读查看器', () => {
             id: 'admin-lazy', user_id: 'c:1', agent_id: 'main', title: '懒加载会话',
             pinned: false, created_at: 1, last_at: 3, updated_at: 3,
             archived_count: 0, archived_through_seq: 0,
+            timeline_generation: 4, timeline_cursor: null,
+            timeline_has_more: false, timeline_snapshot_max_seq: 3,
             messages: [
               {
                 id: userRecord.id, role: 'user', text: '', ts: 1, status: 'replied',
                 _payloadDeferred: true, _userPayloadDeferred: true,
                 _payloadSha256: userPayload.contentSha256,
+                _timelineRecord: true, _timelineUnitKey: 'user:1',
               },
               {
-                id: 'turn-process:tape-admin', role: 'runtime-event', text: '', ts: 2,
-                _turnTapeProcess: true, _turnTapeProcessCount: 1,
-                _turnTapeId: 'tape-admin', _turnTapeSha256: 'e'.repeat(64),
+                id: 'thinking-admin', role: 'thinking', text: '管理员展开的真实思考', ts: 2,
+                _timelineRecord: true, _timelineUnitKey: 'tape:0',
               },
               {
                 id: finalRecord.id, role: 'assistant', text: '', ts: 3,
                 _payloadDeferred: true, _recordOrdinal: 2,
                 _turnTapeId: 'tape-admin', _turnTapeSha256: 'e'.repeat(64),
                 _payloadSha256: finalPayload.contentSha256,
+                _timelineRecord: true, _timelineUnitKey: 'tape:2',
               },
             ],
           },
-        })
-      }
-      if (path === '/sessions/admin-lazy/tape/tape-admin/records') {
-        return Promise.resolve({
-          records: [{
-            id: 'thinking-admin', role: 'thinking', text: '管理员展开的真实思考', ts: 2,
-            _turnTapeOrdinal: 0,
-          }],
-          nextCursor: null,
-          total: 1,
         })
       }
       return Promise.reject(new Error(`unexpected path ${path}`))
@@ -588,11 +643,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
       { user_id: '1' },
       expect.any(AbortSignal),
     )
-    fireEvent.click(await screen.findByRole('button', { name: /已思考/ }))
     expect(await screen.findByText(/管理员展开的真实思考/)).toBeTruthy()
-    expect(mockGet).toHaveBeenCalledWith(
-      '/sessions/admin-lazy/tape/tape-admin/records',
-      { user_id: '1', before: 'tail', limit: 200 },
-    )
+    expect(screen.queryByText(/Agent 调用过程|查看原始思考记录/)).toBeNull()
   })
 })

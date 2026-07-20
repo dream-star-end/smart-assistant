@@ -52,12 +52,15 @@ export function detectServerTerminalTurns(
   for (const m of serverRows) {
     const cmid = m?._clientMessageId;
     if (typeof cmid !== "string" || cmid.length === 0) continue;
-    // 过程控制按 durable dispatch outcome 分类，不把空控制行当正文。
-    if (isTurnTapeProcessControl(m)) {
+    // A finalized tape's real rows carry the same non-display outcome as the
+    // old process control. This is terminal evidence even when the tape only
+    // contains plan/goal/agent-group/runtime-event records. It never creates
+    // a substitute row or changes how the genuine record is rendered.
+    if (m._turnTapeComplete === true || isTurnTapeProcessControl(m)) {
       const kind = collapsedAnchorTerminalKind(m._dispatchOutcome);
       if (kind === "completed") completed.add(cmid);
       else if (kind === "error") errored.add(cmid);
-      continue;
+      if (kind !== null) continue;
     }
     if (
       m._turnStatusRecord === true ||
@@ -343,6 +346,23 @@ function isGeneratedRole(role: ChatMessage["role"] | undefined): boolean {
   return role === "assistant" || role === "thinking" || role === "tool";
 }
 
+/** Live presentation rows that have a one-for-one durable counterpart in a
+ * finalized Agent tape. User/permission/system rows are deliberately absent:
+ * they are not replaceable Agent-process UI. */
+function isTapeBackedAgentProcessRole(role: ChatMessage["role"] | undefined): boolean {
+  return role === "assistant" || role === "thinking" || role === "tool" ||
+    role === "plan" || role === "goal" || role === "agent-group" ||
+    role === "delegate-progress" || role === "runtime-event";
+}
+
+function turnOwnerId(message: ChatMessage): string | undefined {
+  return typeof message._turnOwnerId === "string" && message._turnOwnerId
+    ? message._turnOwnerId
+    : typeof message._clientMessageId === "string" && message._clientMessageId
+      ? message._clientMessageId
+      : undefined;
+}
+
 function validHistoryOrder(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -404,7 +424,7 @@ function buildServerTurnEvidence(serverRows: readonly ChatMessage[]): ServerTurn
   const clientMessageIds = new Set<string>();
   const turnPrefixes = new Set<string>();
   for (const m of serverRows) {
-    if (!m || m._source !== "server" || !isGeneratedRole(m.role)) continue;
+    if (!m || m._source !== "server") continue;
     // 只有 **complete tape** 的展开行才有资格作证:_turnTapeId 在 rolling per-record 兼容路径
     // (pre-release 逐行 refs)上也会被盖,单独存在不构成"整 turn 已原子落库"证明(Codex R2
     // MAJOR);_turnTapeComplete 仅由 hydration 的 complete-anchor 分支盖章。
@@ -413,6 +433,7 @@ function buildServerTurnEvidence(serverRows: readonly ChatMessage[]): ServerTurn
     if (typeof m._clientMessageId === "string" && m._clientMessageId.length > 0) {
       clientMessageIds.add(m._clientMessageId);
     }
+    if (!isGeneratedRole(m.role)) continue;
     if (typeof m.id === "string") {
       const hit =
         (m.role === "assistant" && ASSISTANT_EXPANSION_ID_RE.exec(m.id)) ||
@@ -436,16 +457,17 @@ function isCoveredStaleLocalRow(
   evidence: ServerTurnEvidence,
   activeClientMessageId: string | undefined,
 ): boolean {
-  if (m._source === "server" || !isGeneratedRole(m.role)) return false;
+  if (m._source === "server" || !isTapeBackedAgentProcessRole(m.role)) return false;
+  const ownerId = turnOwnerId(m);
   if (
     activeClientMessageId !== undefined &&
-    m._clientMessageId === activeClientMessageId
+    ownerId === activeClientMessageId
   ) {
     return false;
   }
   if (
-    typeof m._clientMessageId === "string" &&
-    evidence.clientMessageIds.has(m._clientMessageId)
+    typeof ownerId === "string" &&
+    evidence.clientMessageIds.has(ownerId)
   ) {
     return true;
   }
@@ -470,9 +492,33 @@ export function mergeFullServerWins(
      * the full payload. Archived rows are dropped for later rehydration;
      * hot rows with `_seq` propagate cross-device deletion. */
     invalidateHistoryCache?: boolean;
+    /** First adoption of the unified timeline after an old bundle/IndexedDB
+     * cache. Historical client process cards are refetchable substitutes and
+     * must not coexist with exact rows; only the genuinely active turn stays. */
+    adoptUnifiedTimeline?: boolean;
   },
 ): ChatMessage[] {
   local = repairPostFinalProcessOrder(local);
+  const legacyActiveRows = new Set<ChatMessage>();
+  if (opts?.adoptUnifiedTimeline === true && opts.activeClientMessageId) {
+    let insideActiveTurn = false;
+    local = local.map((message) => {
+      if (message.role === "user") {
+        insideActiveTurn = message.id === opts.activeClientMessageId;
+      } else if (insideActiveTurn && isTapeBackedAgentProcessRole(message.role)) {
+        // A predecessor bundle did not stamp plan/goal/team rows with an
+        // owner. Preserve the genuinely active segment during first adoption,
+        // but attach its user id now so the exact terminal tape can remove
+        // every temporary live card instead of leaving permanent duplicates.
+        const owned = turnOwnerId(message) === opts.activeClientMessageId
+          ? message
+          : { ...message, _turnOwnerId: opts.activeClientMessageId };
+        legacyActiveRows.add(owned);
+        return owned;
+      }
+      return message;
+    });
+  }
   const hasExactCompletionEvidence =
     !!completedClientMessageId &&
     server.some(
@@ -487,6 +533,7 @@ export function mergeFullServerWins(
   const serverIdsForAuthority = new Set<string>();
   for (const m of server) if (m?.id) serverIdsForAuthority.add(m.id);
   const evidence = buildServerTurnEvidence(server);
+  const exactTimelineAgentGroupRunIds = collectExactTimelineAgentGroupRunIds(server);
   // 同步权威传播(见 buildServerTurnEvidence docstring):
   //  P1(缺席判定,需 deletionAuthority=调用方已过版本护栏)—— `_source:'server'` 的本地行,
   //    full 载荷不带且高于归档水位 → server 已删除(事故清理/终态行离场),本地跟删,否则
@@ -497,6 +544,22 @@ export function mergeFullServerWins(
   //  P2(证据为正,无需版本护栏)—— 已被载荷作证覆盖 turn 的本地过期副本 → 删。
   local = local.filter((m) => {
     if (!m) return false;
+    if (
+      opts?.adoptUnifiedTimeline === true &&
+      m._timelineRecord !== true &&
+      isTapeBackedAgentProcessRole(m.role)
+    ) {
+      const ownerId = turnOwnerId(m);
+      const belongsToActiveTurn =
+        typeof opts.activeClientMessageId === "string" &&
+        (ownerId === opts.activeClientMessageId || legacyActiveRows.has(m));
+      if (!belongsToActiveTurn) return false;
+    }
+    if (
+      m._timelineRecord !== true &&
+      m.role === "agent-group" &&
+      exactTimelineAgentGroupRunIds.has(agentGroupRunId(m) ?? "")
+    ) return false;
     if (opts?.invalidateHistoryCache === true) {
       if (isArchivedServerRow(m, archivedThroughSeq)) return false;
       const persisted = typeof m._seq === "number" && Number.isSafeInteger(m._seq) && m._seq > 0;
@@ -651,8 +714,13 @@ export function applyServerIncremental(
   // 落权威库,同 turn 的本地过期副本一并清除——不依赖调用方恰好传 completedClientMessageId。
   // P1(缺席判定)不适用增量:增量载荷缺席不代表不存在。
   const incomingEvidence = buildServerTurnEvidence(incoming);
+  const exactTimelineAgentGroupRunIds = collectExactTimelineAgentGroupRunIds(incoming);
   local = local.filter(
-    (m) => m && !isCoveredStaleLocalRow(m, incomingEvidence, opts?.activeClientMessageId),
+    (m) => m && !(
+      m._timelineRecord !== true &&
+      m.role === "agent-group" &&
+      exactTimelineAgentGroupRunIds.has(agentGroupRunId(m) ?? "")
+    ) && !isCoveredStaleLocalRow(m, incomingEvidence, opts?.activeClientMessageId),
   );
   // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
   incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);
@@ -684,6 +752,27 @@ export function mergeArchivedHistory(local: ChatMessage[], archived: ChatMessage
   );
 }
 
+/** Merge one explicit unified-history page by its server logical identity.
+ * Loaded rows are never rewritten, coalesced or evicted during the page
+ * lifetime; virtualization alone controls DOM cost. */
+export function mergeTimelineHistoryPage(
+  local: ChatMessage[],
+  older: ChatMessage[],
+): ChatMessage[] {
+  if (older.length === 0) return local;
+  const keyOf = (message: ChatMessage): string =>
+    message._timelineUnitKey ?? `id:${message.id}`;
+  const existing = new Set(local.map(keyOf));
+  const add = older.filter((message) => {
+    const key = keyOf(message);
+    if (existing.has(key)) return false;
+    existing.add(key);
+    return true;
+  });
+  if (add.length === 0) return local;
+  return stableSortByTs([...add, ...local]);
+}
+
 /** `_orderSeq ≤ 归档水位` = server 已把该行搬进归档 chunk。 */
 function isArchivedServerRow(m: ChatMessage, archivedThroughSeq: number): boolean {
   const orderSeq = typeof m._orderSeq === "number" && Number.isFinite(m._orderSeq)
@@ -713,6 +802,19 @@ function collectLocalRichAgentGroupRunIds(local: ChatMessage[]): Set<string> {
   return runIds;
 }
 
+/** A unified timeline row is the exact server record, never a team-card
+ * skeleton. Its run id authorizes removing the matching live client card so
+ * the page shows one genuine record rather than a local substitute + duplicate. */
+function collectExactTimelineAgentGroupRunIds(rows: ChatMessage[]): Set<string> {
+  const runIds = new Set<string>();
+  for (const message of rows) {
+    if (message?._timelineRecord !== true || message.role !== "agent-group") continue;
+    const runId = agentGroupRunId(message);
+    if (runId) runIds.add(runId);
+  }
+  return runIds;
+}
+
 /**
  * 债A 去重:从 `rows` 中剔除「本地富卡已拥有同 runId」的 server-authored agent-group 骨架行。
  * 只针对 server 骨架(srv-* 或 _source:'server' 的 agent-group),不碰本地富卡,也不碰同 id 覆盖路径
@@ -724,6 +826,7 @@ function dropServerTeamSkeletonsOwnedLocally(rows: ChatMessage[], local: ChatMes
   if (localRunIds.size === 0) return rows;
   const kept = rows.filter((m) => {
     if (m?.role !== "agent-group" || !isServerAuthoredRow(m)) return true;
+    if (m._timelineRecord === true) return true;
     const rid = agentGroupRunId(m);
     return !(rid && localRunIds.has(rid));
   });
@@ -751,6 +854,10 @@ function mergeLocalClientFields(
   preserveTapeProcessExpansion = true,
 ): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // Unified timeline rows are exact persisted Agent records. Never transform
+  // one back into a live client team card or enrich it with cached substitute
+  // fields; server exact wins byte-for-byte at the semantic field layer.
+  if (serverMsg._timelineRecord === true) return serverMsg;
   // A turn waiver is irreversible (pending→applied only). A live waiver frame
   // may beat an older REST full response with the same message id/version, so
   // keep the applied marker monotonic while every other usage field remains
@@ -892,6 +999,11 @@ export function stableSortByTs(
         Number.isSafeInteger(m._turnTapeOrdinal) && m._turnTapeOrdinal >= 0
           ? m._turnTapeOrdinal
           : null;
+      const logicalOrdinal =
+        typeof m._timelineLogicalOrdinal === "number" &&
+        Number.isSafeInteger(m._timelineLogicalOrdinal) && m._timelineLogicalOrdinal >= 0
+          ? m._timelineLogicalOrdinal
+          : 0;
       return {
         m,
         idx,
@@ -906,6 +1018,7 @@ export function stableSortByTs(
         // 补充行置后。全是 legacy 无 ordinal 时 rank 相同，仍回退 ts/index。
         intraRank: m._turnTapeProcess === true ? 0 : tapeOrdinal !== null ? 1 : 2,
         tapeOrdinal: tapeOrdinal ?? 0,
+        logicalOrdinal,
         ts: typeof m?.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
       };
     })
@@ -917,6 +1030,7 @@ export function stableSortByTs(
       a.durableRank - b.durableRank ||
       a.intraRank - b.intraRank ||
       a.tapeOrdinal - b.tapeOrdinal ||
+      a.logicalOrdinal - b.logicalOrdinal ||
       a.ts - b.ts ||
       a.idx - b.idx)
     .map((x) => x.m);
