@@ -40,7 +40,7 @@ import {
   shouldApplyGoalSnapshot,
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
-import { collapseExpandedTapePage, mergeExpandedTapePage } from "./directTimeline";
+import { mergeTapePage } from "./directTimeline";
 import {
   isDispatchLostCode,
   isDispatchTerminalRow,
@@ -51,6 +51,7 @@ import {
   mergeArchivedHistory,
   mergeFullServerWins,
   type ServerTurnTerminal,
+  type StoredPendingDispatch,
   type StoredSession,
 } from "../persist";
 import { appUpdate } from "../appUpdate";
@@ -69,8 +70,6 @@ import {
   emptyTurnNoticeText,
   KEEPALIVE_INTERVAL_MS,
   LIVENESS_CONFIRM_MS,
-  MAX_OFFLINE_QUEUE,
-  OFFLINE_DRAIN_START_DELAY_MS,
   OFFLINE_LATCH_GRACE_MS,
   onopenSetInitialStatus,
   PROBE_TIMEOUT_KEEPALIVE_MS,
@@ -203,6 +202,9 @@ export type ChatSocketDeps = {
   ) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
+  /** 用户 turn 的 exact dispatch journal；正常浏览器在首次物理 WS send 前等待 commit。
+   * 存储不可用时 reject，由发送层显式提示并保持聊天可用。 */
+  persistSessionDurably?: (sessId: string) => Promise<void>;
   /** GitHub 仓库绑定状态帧（容器→bridge→client）。由 useRepoBinding 消费（banner/pill）。*/
   onRepoStatus?: (frame: RepoStatusWire) => void;
   /** GitHub 绑定校验失败帧（bridge→client，stale / link 失效 / 内部错）。*/
@@ -214,7 +216,8 @@ type OfflineItem = {
   sessId: string;
   payload: InboundMessage;
   msgId: string;
-  _retryCount?: number;
+  enqueuedAt: number;
+  state: "queued" | "persisting" | "awaiting_admission";
 };
 
 /** Stable key for one logical browser send attempt.  The normal minted
@@ -404,24 +407,12 @@ export class ChatSocket {
   private reconnectInFlightTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectReconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // ── 离线队列三段式（§10）──
+  // ── durable dispatch journal / per-session FIFO ──
   offlineQueue: OfflineItem[] = [];
-  private offlineQueuePending: OfflineItem[] = [];
-  private offlineDrainingCurrent: OfflineItem | null = null;
-  private offlineQueueDraining = false;
-  private offlineDrainTimer: ReturnType<typeof setTimeout> | null = null;
-  private drainTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  private drainGeneration = 0;
-  /**
-   * 本连接上 direct-send(readyState===1 快路径)出去、尚未确认送达的消息(每 session 最新一条)。
-   * 冷启时 bridge 先完成 WS 握手(前端 onopen)再查容器就绪,不就绪则 close(4503/provisioning);
-   * 这窗口内 direct-send 的消息发给了即将被 4503 关闭的连接、relay 从未建立 → **必未送达容器**,
-   * 且不在 offlineQueue 里、原 onclose re-queue 漏掉它 → 冷启首条消息丢失。onclose 若判定为
-   * provisioning(4503),把这些重排回 offlineQueue 等下次连接 drain(idempotencyKey 去重,重发安全);
-   * 非 provisioning 关闭(mid-turn heartbeat 等)则丢弃,由 hello/resume 续传机制处理,不重发防重复。
-   * 每次 onclose 清空(连接级);同 session 再 direct-send 覆盖旧条。
-   */
-  private inFlightSends = new Map<string, OfflineItem>();
+  /** One slot per peer. It remains occupied after admission until that exact
+   * turn reaches final/error/stop, while other peers may dispatch in parallel. */
+  private dispatchSlots = new Map<string, string>();
+  private dispatchPumpScheduled = false;
   /**
    * 本连接 bridge↔容器 relay 是否已确认建立(收到 sys.relay_ready 即 true)。connect/onclose 复位。
    * readiness 权威统一:冷启时 ws.onopen(握手完成)早于 relay 就绪,relay_ready 才是"可投递"的
@@ -506,8 +497,7 @@ export class ChatSocket {
     // 流式降频:turn 进行中且距上次通知不足 STREAM_NOTIFY_MS → 定时到窗口边界统一 flush
     // (跳过 rAF 路径)。完成帧最多延迟 ~120ms,可接受;非流式路径行为不变。
     // 判据必须是会话级 _sendingInFlight(turn 生命周期权威 flag,final/错误/停止都会清),
-    // 不能借用 inFlightSends —— 那是"冷启窗口 direct-send 未送达"的连接级记录:turn 完成
-    // 不清、drain 路径不记,拿它当 turn 信号会导致首次发送后永久降频/队列 turn 不降频。
+    // 不能借用发送队列 —— 队列项会跨连接保留,拿它当 turn 信号会导致排队期间永久降频。
     let turnActive = false;
     for (const s of this.sessions.values()) {
       if (s._sendingInFlight) {
@@ -575,6 +565,11 @@ export class ChatSocket {
     this.started = false;
     this.authEpoch++;
     this.cancelWsAuthRecovery();
+    // Active close bypasses the socket onclose path below (`this.ws` is
+    // cleared first). Make every physically-sent but unadmitted turn replayable
+    // before detaching the transport; a still-persisting turn keeps its one
+    // commit attempt alive.
+    this.resetUnadmittedDispatchesForReplay();
     if (this.boundOnline) window.removeEventListener("online", this.boundOnline);
     if (this.boundOffline) window.removeEventListener("offline", this.boundOffline);
     if (this.boundVisible) document.removeEventListener("visibilitychange", this.boundVisible);
@@ -588,8 +583,6 @@ export class ChatSocket {
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     if (this.reconnectInFlightTimer) clearTimeout(this.reconnectInFlightTimer);
     if (this.reconnectReconcileTimer) clearTimeout(this.reconnectReconcileTimer);
-    if (this.offlineDrainTimer) clearTimeout(this.offlineDrainTimer);
-    if (this.drainTimeoutTimer) clearTimeout(this.drainTimeoutTimer);
     // 取消挂起的 rAF 合并渲染(避免 teardown 后再 flush + dangling timer)。
     if (this.notifyRaf !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.notifyRaf);
     this.notifyRaf = null;
@@ -616,6 +609,7 @@ export class ChatSocket {
       // gate 关闭（容器休眠/订阅失效）→ 主动断开，避免对死容器烧退避。
       // 先置 this.ws=null 再 close，会让 onclose 的 stale-socket 守卫提前 return，
       // 故这里手动清掉随 ws 生命周期建立的 keepalive interval，避免泄漏。
+      this.resetUnadmittedDispatchesForReplay();
       this.clearReconnectTimers();
       if (this.keepAliveTimer) {
         clearInterval(this.keepAliveTimer);
@@ -875,6 +869,88 @@ export class ChatSocket {
     }
   }
 
+  /** A closed transport cannot deliver the admission ACK. Requeue only turns
+   * that were physically sent; a `persisting` turn retains its single commit
+   * attempt and will decide against whichever connection is current when it
+   * settles. */
+  private resetUnadmittedDispatchesForReplay(): void {
+    const touched = new Set<string>();
+    for (const item of this.offlineQueue) {
+      if (item.state !== "awaiting_admission") continue;
+      item.state = "queued";
+      touched.add(item.sessId);
+      const sess = this.sessions.get(item.sessId);
+      const message = sess?.messages.find(
+        (candidate) => candidate.role === "user" && candidate.id === item.msgId,
+      );
+      if (message) message.status = "queued";
+      if (sess?._activeClientMessageId === item.msgId) {
+        sess._sendingInFlight = false;
+        sess._activeClientMessageId = undefined;
+        clearTurnTiming(sess);
+        this.clearThinkingSafety(sess.id);
+      }
+    }
+    if (touched.size === 0) return;
+    for (const sessId of touched) this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
+  private maybePromoteToConnected(): void {
+    if (!this.ws || this.ws.readyState !== 1 || !this.relayReady) return;
+    if (this.offlineQueue.length > 0) return;
+    this.setStatus("已连接", "connected");
+  }
+
+  /** Remove one exact unacknowledged journal entry. The server's admission
+   * ACK or any exact authoritative outbound frame is the only normal path
+   * that may clear it before turn terminal. */
+  private clearPendingDispatch(sessId: string, clientMessageId: string): boolean {
+    const index = this.offlineQueue.findIndex(
+      (item) => item.sessId === sessId && item.msgId === clientMessageId,
+    );
+    if (index < 0) return false;
+    this.offlineQueue.splice(index, 1);
+    this.maybePromoteToConnected();
+    const durableClear = this.deps.persistSessionDurably?.(sessId);
+    if (durableClear) void durableClear.catch(() => {});
+    this.deps.persistSession?.(sessId);
+    return true;
+  }
+
+  /** Durable admission confirms delivery but does not finish the turn. Keep
+   * the peer slot occupied until final/error/stop so later prompts remain FIFO. */
+  private confirmDispatchAdmission(sessId: string, clientMessageId: string): boolean {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return false;
+    const pending = this.offlineQueue.find(
+      (item) => item.sessId === sessId && item.msgId === clientMessageId,
+    );
+    const ownsTurn = sess._activeClientMessageId === clientMessageId || pending !== undefined;
+    if (!ownsTurn) return false;
+    this.clearPendingDispatch(sessId, clientMessageId);
+    this.dispatchSlots.set(sessId, clientMessageId);
+    const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
+    if (user) user.status = "sent";
+    if (!sess._sendingInFlight) {
+      sess._sendingInFlight = true;
+      sess._activeClientMessageId = clientMessageId;
+      sess._turnStartedAt = Date.now();
+      this.resetThinkingSafety(sessId);
+    }
+    this.scheduleNotify();
+    return true;
+  }
+
+  /** Exact turn terminal: discard any stale unacknowledged replay, release the
+   * peer slot, and immediately make the next same-session FIFO item eligible. */
+  private finishDispatch(sessId: string, clientMessageId: string | undefined): void {
+    if (!clientMessageId) return;
+    this.clearPendingDispatch(sessId, clientMessageId);
+    if (this.dispatchSlots.get(sessId) === clientMessageId) this.dispatchSlots.delete(sessId);
+    this.kickDispatchPump();
+  }
+
   private clearSendingState(
     sess: ChatSession,
     opts: {
@@ -909,17 +985,7 @@ export class ChatSocket {
             this.reconnectInFlightSet = null;
           }
         }
-        // drain 推进（§10）。
-        if (this.offlineDrainingCurrent && this.offlineDrainingCurrent.sessId === sess.id && !isCronOrHeartbeat) {
-          if (this.drainTimeoutTimer) {
-            clearTimeout(this.drainTimeoutTimer);
-            this.drainTimeoutTimer = null;
-          }
-          this.offlineDrainingCurrent = null;
-          if (this.offlineQueuePending.length > 0) setTimeout(() => this.drainNextOfflineItem(), 500);
-          else this.offlineQueueDraining = false;
-          this.maybePromoteToConnected();
-        }
+        if (!isCronOrHeartbeat) this.finishDispatch(sess.id, clientMessageId);
         // 生成中排队的后续消息:本轮 final 已清 _sendingInFlight → 顺序发出下一条。
         if (!isCronOrHeartbeat) this.kickQueuedDrainIfIdle();
         // turn 收尾：落地完成轮（reload 不丢；游标 + 完整 tape durable）。
@@ -1079,20 +1145,6 @@ export class ChatSocket {
         }, RECONNECT_RECONCILE_GRACE_MS);
       }
 
-      // 延迟启动 drain（§10）：等 hello/resume isFinal 先到，避免误当 drain 响应。
-      if (this.offlineDrainTimer) clearTimeout(this.offlineDrainTimer);
-      if (this.offlineQueue.length > 0) {
-        this.offlineDrainTimer = setTimeout(() => {
-          this.offlineDrainTimer = null;
-          if (!this.ws || this.ws.readyState !== 1) return;
-          if (this.offlineQueue.length === 0) return;
-          this.offlineQueuePending = [...this.offlineQueue];
-          this.offlineQueue = [];
-          this.offlineQueueDraining = true;
-          this.drainGeneration++;
-          this.drainNextOfflineItem();
-        }, OFFLINE_DRAIN_START_DELAY_MS);
-      }
       this.scheduleNotify();
     };
 
@@ -1142,14 +1194,6 @@ export class ChatSocket {
       }
       if (this.ws !== ws) return; // stale socket
       this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
-      if (this.offlineDrainTimer) {
-        clearTimeout(this.offlineDrainTimer);
-        this.offlineDrainTimer = null;
-      }
-      if (this.drainTimeoutTimer) {
-        clearTimeout(this.drainTimeoutTimer);
-        this.drainTimeoutTimer = null;
-      }
       if (this.reconnectInFlightTimer) {
         clearTimeout(this.reconnectInFlightTimer);
         this.reconnectInFlightTimer = null;
@@ -1160,38 +1204,11 @@ export class ChatSocket {
         this.reconnectReconcileTimer = null;
       }
       this.setStatus("已断线", "disconnected");
-      // 保留 per-session _sendingInFlight（重连 + hello/resume 后恢复 loading）。
-      // 重排离线队列：current + pending unshift 回 offlineQueue 头部，保序（§10）。
-      const requeue: OfflineItem[] = [];
-      if (this.offlineDrainingCurrent) requeue.push(this.offlineDrainingCurrent);
-      if (this.offlineQueuePending.length > 0) requeue.push(...this.offlineQueuePending);
-      if (requeue.length > 0) this.offlineQueue.unshift(...requeue);
-      this.offlineDrainingCurrent = null;
-      this.offlineQueuePending = [];
-      this.offlineQueueDraining = false;
+      this.resetUnadmittedDispatchesForReplay();
 
       const decision = classifyClose(e.code, e.reason);
-
-      // 冷启 container-not-ready(4503/provisioning)关闭:relay 从未建立,本连接 direct-send 的
-      // 消息必未送达容器 → 重排回 offlineQueue,reconnect 后 onopen 自动 drain(idempotencyKey
-      // 去重,重发安全)。非 provisioning 关闭(mid-turn heartbeat 等)→ 丢弃,由 hello/resume
-      // 续传处理,不重发防重复。inFlightSends 每次 onclose 清空(连接级)。
-      if (this.inFlightSends.size > 0) {
-        const lostDirect = [...this.inFlightSends.values()];
-        this.inFlightSends.clear();
-        if (decision.provisioning) {
-          this.offlineQueue.unshift(...lostDirect);
-          for (const it of lostDirect) {
-            const s = this.sessions.get(it.sessId);
-            if (!s) continue;
-            const m = s.messages.find((mm) => mm.id === it.msgId);
-            if (m && m.status === "sent") m.status = "queued";
-            // 关键(Codex 审 BLOCKER):必须回退 in-flight 态,否则 drainNextOfflineItem 因
-            // _sendingInFlight===true 跳过该项;冷启 4503 下 relay 未建立、无 final/resume 清此
-            // flag → 重排进去的消息永久卡 queued 不 drain。把会话退回"待发"态让 drain 能真发。
-            this.clearSendingState(s, { clearThinking: true });
-          }
-        }
+      for (const sessId of new Set(this.offlineQueue.map((item) => item.sessId))) {
+        this.deps.persistSession?.(sessId);
       }
 
       if (decision.action === "policy" && decision.policy) {
@@ -1255,22 +1272,29 @@ export class ChatSocket {
         const frame = f as OutboundMessageWire;
         const sess = this.resolveSession(frame.peer?.id);
         if (!sess) return;
+        if (frame.clientMessageId) this.confirmDispatchAdmission(sess.id, frame.clientMessageId);
         applyOutboundMessage(sess, frame, this.effects());
         return;
       }
       case "outbound.turn_status": {
         const frame = f as OutboundTurnStatusWire;
         const sess = this.sessions.get(frame.peer?.id);
-        if (sess) applyTurnStatus(sess, frame);
+        if (sess) {
+          const clientMessageId = (frame as OutboundTurnStatusWire & { clientMessageId?: string }).clientMessageId;
+          if (clientMessageId) this.confirmDispatchAdmission(sess.id, clientMessageId);
+          applyTurnStatus(sess, frame);
+        }
         return;
       }
       case "outbound.error": {
         const frame = f as OutboundErrorWire;
         const sess = this.sessions.get(frame.peer?.id);
         if (sess) {
+          const activeClientMessageId = sess._activeClientMessageId;
           const ownsActiveTurn = !frame.clientMessageId ||
-            sess._activeClientMessageId === frame.clientMessageId;
+            activeClientMessageId === frame.clientMessageId;
           applyOutboundError(sess, frame, this.effects());
+          this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
           if (ownsActiveTurn) this.clearThinkingSafety(sess.id);
         }
         return;
@@ -1279,9 +1303,11 @@ export class ChatSocket {
         const frame = f as LegacyBridgeErrorWire;
         const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : this.firstSession();
         if (sess) {
+          const activeClientMessageId = sess._activeClientMessageId;
           const ownsActiveTurn = !frame.clientMessageId ||
-            sess._activeClientMessageId === frame.clientMessageId;
+            activeClientMessageId === frame.clientMessageId;
           applyLegacyBridgeError(sess, frame, this.effects());
+          this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
           if (ownsActiveTurn) this.clearThinkingSafety(sess.id);
           this.deps.persistSession?.(sess.id);
         }
@@ -1392,15 +1418,16 @@ export class ChatSocket {
         // readiness 权威统一:冷启时 WS 握手(onopen)早于 relay 就绪,期间发的消息经 P7.8 在离线
         // 队列等待;此处一收到就立即排空 → relay 一就绪即投递,不靠 4503 reconnect 反弹的运气/时延。
         this.relayReady = true;
-        // relay 建立 = 本连接此前 direct-send 已送达容器("relay 从未建立=必未送达"的反命题)。
-        // 清掉冷启窗口的在途记录,防后续 provisioning 关闭把已送达消息误重排(重复发送)。
-        this.inFlightSends.clear();
-        this.startOfflineDrainNow();
+        this.kickDispatchPump();
+        this.maybePromoteToConnected();
         this.flushAllRepoBinds(); // relay 就绪:补发 PUT 时 WS 未就绪而积压的仓库绑定
         return;
       }
       case "outbound.ack": {
         const frame = f as AckWire;
+        if (frame.admitted && frame.peer?.id && frame.clientMessageId) {
+          this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId);
+        }
         if (frame.deduplicated) {
           const reconciled = this.reconcileDeduplicatedTurn(frame);
           if (!reconciled && typeof frame.idempotencyKey === "string" && frame.idempotencyKey.startsWith("autocont-")) {
@@ -1437,29 +1464,17 @@ export class ChatSocket {
     const clientMessageId = frame.clientMessageId;
     if (!sessId || !clientMessageId) return false;
     const sess = this.sessions.get(sessId);
-    if (!sess || sess._activeClientMessageId !== clientMessageId) return false;
+    if (!sess) return false;
+    const owns = sess._activeClientMessageId === clientMessageId || this.offlineQueue.some(
+      (item) => item.sessId === sessId && item.msgId === clientMessageId,
+    );
+    if (!owns) return false;
 
-    const direct = this.inFlightSends.get(sessId);
-    if (direct?.msgId === clientMessageId) this.inFlightSends.delete(sessId);
-
-    let advancedDrain = false;
-    if (
-      this.offlineDrainingCurrent?.sessId === sessId &&
-      this.offlineDrainingCurrent.msgId === clientMessageId
-    ) {
-      if (this.drainTimeoutTimer) {
-        clearTimeout(this.drainTimeoutTimer);
-        this.drainTimeoutTimer = null;
-      }
-      this.offlineDrainingCurrent = null;
-      advancedDrain = true;
-    }
-
+    this.finishDispatch(sessId, clientMessageId);
     this.clearSendingState(sess, { clearThinking: true });
     const user = sess.messages.find((m) => m.role === "user" && m.id === clientMessageId);
     if (user) user.status = "sent";
     void this.deps.syncSession?.(sessId, { clientMessageId });
-    if (advancedDrain) this.nudgeDrain();
     this.scheduleNotify();
     return true;
   }
@@ -1802,7 +1817,9 @@ export class ChatSocket {
   removeSession(sessId: string): void {
     this.serverSessionEnsured.delete(sessId);
     this.serverSessionInflight.delete(sessId);
-    this.inFlightSends.delete(sessId);
+    this.dispatchSlots.delete(sessId);
+    this.offlineQueue = this.offlineQueue.filter((item) => item.sessId !== sessId);
+    this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
     this.transientNotices.delete(sessId);
     this.lastSyncAt.delete(sessId);
@@ -1820,7 +1837,8 @@ export class ChatSocket {
     // Set/Map 无条件清(即使 sessions 已空也可能有残留 ensured/inflight,Codex 审 LOW)。
     this.serverSessionEnsured.clear();
     this.serverSessionInflight.clear();
-    this.inFlightSends.clear();
+    this.dispatchSlots.clear();
+    this.offlineQueue = [];
     this.pendingRepoBind.clear();
     this.transientNotices.clear();
     this.lastSyncAt.clear();
@@ -1854,8 +1872,8 @@ export class ChatSocket {
     let messages = s.messages.some(shouldStrip)
       ? s.messages.filter((message) => !shouldStrip(message))
       : s.messages;
-    // Process expansion is a view concern. Persist only the tiny control row,
-    // reset to collapsed, so IndexedDB never grows with a 50 MB tool record.
+    // Loaded tape pages are a refetchable viewport cache. Persist only the tiny
+    // invisible cursor control so IndexedDB never grows with a 50 MB tool record.
     if (messages.some((message) => message._turnTapeProcessExpanded)) {
       messages = messages.map((message) => {
         if (!message._turnTapeProcessExpanded) return message;
@@ -1879,6 +1897,14 @@ export class ChatSocket {
         };
       });
     }
+    const pendingDispatches: StoredPendingDispatch[] = this.offlineQueue
+      .filter((item) => item.sessId === sessId)
+      .sort((a, b) => a.enqueuedAt - b.enqueuedAt)
+      .map((item) => ({
+        msgId: item.msgId,
+        payload: item.payload,
+        enqueuedAt: item.enqueuedAt,
+      }));
     return {
       id: s.id,
       agentId: s.agentId,
@@ -1905,6 +1931,7 @@ export class ChatSocket {
       _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
       ...(s._lastRouting ? { _lastRouting: { ...s._lastRouting } } : {}),
       ...(s._selectedModelId ? { _selectedModelId: s._selectedModelId } : {}),
+      ...(pendingDispatches.length > 0 ? { _pendingDispatches: pendingDispatches } : {}),
     };
   }
 
@@ -1951,7 +1978,15 @@ export class ChatSocket {
         : typeof stored._turnStartedAt === "number"
           ? stored._turnStartedAt
           : 0;
-    const inFlightFresh =
+    const storedPending = Array.isArray(stored._pendingDispatches)
+      ? stored._pendingDispatches.filter((item) =>
+          item && isClientMessageId(item.msgId) &&
+          item.payload?.type === "inbound.message" &&
+          item.payload.clientMessageId === item.msgId &&
+          item.payload.peer?.id === stored.id,
+        )
+      : [];
+    const inFlightFresh = storedPending.length === 0 &&
       stored._sendingInFlight === true &&
       inFlightReference > 0 &&
       Date.now() - inFlightReference < THINKING_SAFETY_MS;
@@ -1973,6 +2008,18 @@ export class ChatSocket {
     if (typeof stored._selectedModelId === "string" && stored._selectedModelId) {
       s._selectedModelId = stored._selectedModelId;
     }
+    for (const pending of storedPending) {
+      this.offlineQueue.push({
+        sessId: stored.id,
+        payload: pending.payload,
+        msgId: pending.msgId,
+        enqueuedAt: Number.isFinite(pending.enqueuedAt) ? pending.enqueuedAt : pending.payload.ts,
+        state: "queued",
+      });
+      const user = s.messages.find((message) => message.role === "user" && message.id === pending.msgId);
+      if (user) user.status = "queued";
+    }
+    this.offlineQueue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
@@ -1985,6 +2032,7 @@ export class ChatSocket {
     // zero-write fast path because the repair is idempotent.
     if (repairedStoredOrder) this.deps.persistSession?.(stored.id);
     if (inFlightFresh) this.resetThinkingSafety(stored.id);
+    if (storedPending.length > 0) this.kickDispatchPump();
     this.scheduleNotify();
   }
 
@@ -2130,6 +2178,7 @@ export class ChatSocket {
         // thinking-safety + persist + kick drain),避免发送态永挂。
         this.clearSendingState(s, { clearThinking: true });
       }
+      this.finishDispatch(s.id, cmid);
     }
   }
 
@@ -2168,7 +2217,7 @@ export class ChatSocket {
    * distinct _seq,故**不推进同步游标、不改 maxSeq/totalMessageCount 口径**(按 anchor 计不变)。
    * 分页续拉:anchor 已展开时**追加**新页(按 id 去重),更新 `_turnTapeProcessCursor`(null=已拉全)。
    */
-  applyExpandedTapeRecords(
+  applyTapeRecordsPage(
     sessId: string,
     anchorId: string,
     records: ChatMessage[],
@@ -2176,31 +2225,16 @@ export class ChatSocket {
   ): void {
     const s = this.sessions.get(sessId);
     if (!s) return;
-    const next = mergeExpandedTapePage(s.messages, anchorId, records, nextCursor);
+    const next = mergeTapePage(s.messages, anchorId, records, nextCursor);
     if (!next) return;
     s.messages = next;
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
-    normalizeDelegateCards(s);
-    normalizeGoalCards(s);
-    this.deps.persistSession?.(sessId);
-    this.scheduleNotify();
-  }
-
-  /**
-   * Collapse one process cursor:remove fetched rows and return to the small control. The rows are reloadable, so this is local only
-   * (不触 server)。游标重置 → 下次展开从首页(cursor=null)重拉。
-   */
-  collapseTurnProcess(sessId: string, anchorId: string): void {
-    const s = this.sessions.get(sessId);
-    if (!s) return;
-    const next = collapseExpandedTapePage(s.messages, anchorId);
-    if (!next) return;
-    s.messages = next;
-    s._blockIdToMsgId = new Map();
-    s._agentGroups = new Map();
-    rebuildIndexes(s);
+    // Immutable lazy rows are the Agent's actual persisted transcript. Do not
+    // run live-display normalizers here: delegate normalization can rewrite or
+    // drop rows, and goal normalization collapses distinct historical events.
+    s.messages = repairPostFinalProcessOrder(s.messages);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
   }
@@ -2407,30 +2441,13 @@ export class ChatSocket {
           /* 持久化失败:best-effort,跨设备该条不显,本地仍在 */
         });
     }
-    // 生成中排队(P2 易用性):本会话仍有 in-flight turn 时,后续消息不并轨直发 —— bridge 对
-    // mid-turn 并发 inbound 语义未定,且并发会重复计费。改标 queued 入本地队列,本轮 final /
-    // stop / 错误清 _sendingInFlight 后由 drain 单条顺序发出(对标 ChatGPT/Claude,见
-    // kickQueuedDrainIfIdle)。复用既有 offlineQueue:drainNextOfflineItem 本就"等本会话
-    // _sendingInFlight 结束才发",天然具备单飞 + 保序语义,无需并行第二套队列。
-    if (sess._sendingInFlight) {
-      const enqueued = this.tryEnqueueOffline({ sessId: sess.id, payload, msgId: userMsg.id });
-      userMsg.status = enqueued ? "queued" : "error";
-      this.scheduleNotify();
-      this.deps.persistSession?.(sess.id);
-      return;
-    }
     this.dispatchPayload(sess, userMsg, payload);
   }
 
-  /**
-   * 本会话 turn 结束(final / stop / 错误)后,若在线且尚有排队消息 → 启动一轮 drain 发出。
-   * startOfflineDrainNow 自带单飞 + ws 就绪守卫(空队列 / 正在 drain 时 no-op);deferred 一个
-   * macrotask,避免在 reducer 处理 final 帧的同步栈里 re-enter 发送。
-   */
+  /** 本会话 turn 结束后继续派发其下一条已持久化消息。 */
   private kickQueuedDrainIfIdle(): void {
     if (this.offlineQueue.length === 0) return;
-    if (!this.ws || this.ws.readyState !== 1) return;
-    setTimeout(() => this.startOfflineDrainNow(), 0);
+    this.kickDispatchPump();
   }
 
   /**
@@ -2510,47 +2527,16 @@ export class ChatSocket {
   }
 
   private dispatchPayload(sess: ChatSession, userMsg: ChatMessage, payload: InboundMessage): void {
-    this.clearTransientNotice(sess.id); // 新一轮发送：清上一轮遗留的 transient 软提示
-    sess._streamingAssistant = null;
-    sess._streamingThinking = null;
-    sess._blockIdToMsgId = new Map();
-    sess._agentSwitchedAt = null;
-    sess._localTeardownAt = undefined;
-
-    const hasQueuedForSess =
-      this.offlineQueue.some((i) => i.sessId === sess.id) ||
-      this.offlineQueuePending.some((i) => i.sessId === sess.id) ||
-      this.offlineDrainingCurrent?.sessId === sess.id;
-
-    let sentNow = false;
-    if (this.ws && this.ws.readyState === 1 && !hasQueuedForSess) {
-      sentNow = this.safeWsSend(JSON.stringify(payload));
-    }
-    if (sentNow) {
-      userMsg.status = "sent";
-      // 记录 direct-send 在途消息:若本连接随后 4503/provisioning 关闭(relay 从未建立 = 必未送达),
-      // onclose 会把它重排回 offlineQueue 重试,修复冷启首条消息丢失(见 inFlightSends 注释)。
-      // **仅在 relay 未就绪的冷启窗口记录**:relay 已建立时 direct-send 即时送达,记录反而是
-      // 陈旧条目 —— 此前无条件 set 且 turn 完成不清,同连接后续再遇 provisioning 关闭会把
-      // 早已处理完的旧消息重排回 offlineQueue 重复发送。
-      if (!this.relayReady) {
-        this.inFlightSends.set(sess.id, { sessId: sess.id, payload, msgId: userMsg.id });
-      }
-      sess._sendingInFlight = true;
-      sess._activeClientMessageId = userMsg.id;
-      sess._localTeardownAt = undefined;
-      sess._turnStartedAt = Date.now();
-      // 新 turn 开始：清跨 turn 计费归因状态（与 drain / auto-continue turn-start 一致）。
-      sess._pendingCostCredits = "0";
-      sess._lastFinaledAssistantId = null;
-      sess._lastFinaledAt = 0;
-      this.resetThinkingSafety(sess.id);
-    } else {
-      const enqueued = this.tryEnqueueOffline({ sessId: sess.id, payload, msgId: userMsg.id });
-      userMsg.status = enqueued ? "queued" : "error";
-    }
+    this.tryEnqueueOffline({
+      sessId: sess.id,
+      payload,
+      msgId: userMsg.id,
+      enqueuedAt: payload.ts,
+      state: "queued",
+    });
+    userMsg.status = "queued";
     this.scheduleNotify();
-    this.deps.persistSession?.(sess.id);
+    this.kickDispatchPump();
   }
 
   /**
@@ -2667,11 +2653,92 @@ export class ChatSocket {
     );
   }
 
-  /** offlineQueue 软上限（§10）。*/
+  /** Register the exact logical turn synchronously. There is intentionally no
+   * arbitrary item/byte cap: IndexedDB + per-session FIFO provide backpressure
+   * without silently rejecting user work. */
   private tryEnqueueOffline(item: OfflineItem): boolean {
-    if (this.offlineQueue.length >= MAX_OFFLINE_QUEUE) return false;
+    if (this.offlineQueue.some((candidate) =>
+      candidate.sessId === item.sessId && candidate.msgId === item.msgId)) return true;
     this.offlineQueue.push(item);
+    this.offlineQueue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
     return true;
+  }
+
+  private kickDispatchPump(): void {
+    if (this.dispatchPumpScheduled) return;
+    this.dispatchPumpScheduled = true;
+    try {
+      this.pumpPendingDispatches();
+    } finally {
+      this.dispatchPumpScheduled = false;
+    }
+  }
+
+  private pumpPendingDispatches(): void {
+    if (!this.ws || this.ws.readyState !== 1 || !this.relayReady) return;
+    for (const item of this.offlineQueue) {
+      if (item.state !== "queued") continue;
+      const sess = this.sessions.get(item.sessId);
+      if (!sess) continue;
+      const slot = this.dispatchSlots.get(item.sessId);
+      if (slot !== undefined && slot !== item.msgId) continue;
+      if (sess._sendingInFlight && sess._activeClientMessageId !== item.msgId) continue;
+      this.dispatchSlots.set(item.sessId, item.msgId);
+      item.state = "persisting";
+      const committed = this.deps.persistSessionDurably?.(item.sessId);
+      if (committed) {
+        void committed.then(
+          () => this.sendPersistedDispatch(item),
+          () => this.sendPersistedDispatch(item, false),
+        );
+      } else {
+        // Unit/SSR adapters without persistence keep their existing in-memory
+        // behavior. Production always supplies persistSessionDurably.
+        this.sendPersistedDispatch(item);
+      }
+    }
+  }
+
+  private sendPersistedDispatch(item: OfflineItem, journalCommitted = true): void {
+    if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
+    if (
+      !this.ws || this.ws.readyState !== 1 || !this.relayReady ||
+      this.dispatchSlots.get(item.sessId) !== item.msgId
+    ) {
+      item.state = "queued";
+      return;
+    }
+    if (!this.safeWsSend(JSON.stringify(item.payload))) {
+      item.state = "queued";
+      return;
+    }
+    item.state = "awaiting_admission";
+    const sess = this.sessions.get(item.sessId);
+    if (!sess) return;
+    this.clearTransientNotice(sess.id);
+    sess._streamingAssistant = null;
+    sess._streamingThinking = null;
+    sess._blockIdToMsgId = new Map();
+    sess._agentSwitchedAt = null;
+    sess._localTeardownAt = undefined;
+    const user = sess.messages.find((message) => message.role === "user" && message.id === item.msgId);
+    if (user) user.status = "sending";
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = item.msgId;
+    sess._localTeardownAt = undefined;
+    sess._turnStartedAt = Date.now();
+    sess._pendingCostCredits = "0";
+    sess._lastFinaledAssistantId = null;
+    sess._lastFinaledAt = 0;
+    this.resetThinkingSafety(sess.id);
+    if (!journalCommitted) {
+      this.setTransientNotice(
+        sess.id,
+        "当前浏览器无法保存发送恢复记录；消息仍已发送，请保持页面开启直到收到回复。",
+      );
+    }
+    this.scheduleNotify();
+    this.deps.persistSession?.(sess.id);
   }
 
   stopTurn(sessId: string): void {
@@ -2686,6 +2753,8 @@ export class ChatSocket {
         agentId: sess.agentId || this.deps.defaultAgentId || "main",
       }),
     );
+    const clientMessageId = sess._activeClientMessageId;
+    this.finishDispatch(sess.id, clientMessageId);
     // 本地立即收尾（不等后端 isFinal）。
     this.clearSendingState(sess, { clearThinking: true });
     this.clearTransientNotice(sess.id); // 用户手动停止：清 transient 软提示
@@ -2732,7 +2801,7 @@ export class ChatSocket {
   private autoContinueAfterRestart(sessId: string): void {
     const sess = this.sessions.get(sessId);
     if (!sess || sess._sendingInFlight) return;
-    if (!(this.ws && this.ws.readyState === 1)) return;
+    if (!(this.ws && this.ws.readyState === 1 && this.relayReady)) return;
     const target = [...sess.messages]
       .reverse()
       .find((m) => m && m.role === "assistant" && !m._emptyTurn && (m.text ?? "").trim().length > 0);
@@ -2763,18 +2832,7 @@ export class ChatSocket {
       _idem: idem,
     });
     payload.clientMessageId = userMsg.id;
-    const sent = this.safeWsSend(JSON.stringify(payload));
-    if (!sent) {
-      const ri = sess.messages.indexOf(userMsg);
-      if (ri >= 0) sess.messages.splice(ri, 1);
-      this.restartContinued.delete(idem);
-      return;
-    }
-    userMsg.status = "sent";
-    sess._sendingInFlight = true;
-    sess._activeClientMessageId = userMsg.id;
-    sess._localTeardownAt = undefined;
-    this.scheduleNotify();
+    this.dispatchPayload(sess, userMsg, payload);
   }
 
   // ═══════════════ 行动开场后误结束 → 极保守单次继续执行 ════════════════
@@ -2838,11 +2896,8 @@ export class ChatSocket {
       this.scheduleNotify();
     };
 
-    const hasQueued =
-      this.offlineQueue.some((i) => i.sessId === sess.id) ||
-      this.offlineQueuePending.some((i) => i.sessId === sess.id) ||
-      this.offlineDrainingCurrent?.sessId === sess.id;
-    if (!(this.ws && this.ws.readyState === 1) || hasQueued) {
+    const hasQueued = this.offlineQueue.some((item) => item.sessId === sess.id);
+    if (!(this.ws && this.ws.readyState === 1 && this.relayReady) || hasQueued) {
       insertNotice();
       return;
     }
@@ -2869,23 +2924,7 @@ export class ChatSocket {
       _idem: idem,
     });
     payload.clientMessageId = userMsg.id;
-    const sent = this.safeWsSend(JSON.stringify(payload));
-    if (!sent) {
-      const ri = sess.messages.indexOf(userMsg);
-      if (ri >= 0) sess.messages.splice(ri, 1);
-      insertNotice();
-      return;
-    }
-    userMsg.status = "sent";
-    sess._sendingInFlight = true;
-    sess._activeClientMessageId = userMsg.id;
-    sess._localTeardownAt = undefined;
-    sess._turnStartedAt = Date.now();
-    sess._pendingCostCredits = "0";
-    sess._lastFinaledAssistantId = null;
-    sess._lastFinaledAt = 0;
-    this.resetThinkingSafety(sess.id);
-    this.scheduleNotify();
+    this.dispatchPayload(sess, userMsg, payload);
   }
 
   /** dedup ack 对账：另一 tab/replay 已跑过同一 auto-continue，清乐观 in-flight。*/
@@ -2893,127 +2932,11 @@ export class ChatSocket {
     for (const sess of this.sessions.values()) {
       if (!sess.messages.some((m) => m && m._isAutoRetry && m._idem === idem)) continue;
       if (!sess._sendingInFlight) return;
+      this.finishDispatch(sess.id, sess._activeClientMessageId);
       this.clearSendingState(sess, { clearTiming: false, resetTracker: false, clearThinking: true });
       this.scheduleNotify();
       return;
     }
   }
 
-  // ═══════════════ 离线 drain（§10）═══════════════
-  private maybePromoteToConnected(): void {
-    if (!this.ws || this.ws.readyState !== 1) return;
-    if (this.offlineQueue.length > 0) return;
-    if (this.offlineQueuePending.length > 0) return;
-    if (this.offlineDrainingCurrent) return;
-    if (this.offlineQueueDraining) return;
-    this.setStatus("已连接", "connected");
-  }
-
-  private nudgeDrain(): void {
-    if (this.drainTimeoutTimer) {
-      clearTimeout(this.drainTimeoutTimer);
-      this.drainTimeoutTimer = null;
-    }
-    if (this.offlineDrainingCurrent) return;
-    if (this.offlineQueuePending.length > 0) setTimeout(() => this.drainNextOfflineItem(), 500);
-    else {
-      this.offlineQueueDraining = false;
-      this.maybePromoteToConnected();
-    }
-  }
-
-  private handleDrainTimeout(item: OfflineItem): void {
-    if (this.offlineDrainingCurrent !== item) return;
-    // 不再当失败判定：长任务/冷启动下静默清 in-flight 会让用户重发（§10）。
-    const sess = this.sessions.get(item.sessId);
-    if (sess && this.statusCls !== "connected") this.setStatus("仍在等待回复…", "connecting");
-    this.drainTimeoutTimer = setTimeout(() => this.handleDrainTimeout(item), 5 * 60_000);
-  }
-
-  /**
-   * 立即启动一轮离线队列 drain(由 sys.relay_ready 触发:relay 一就绪就发,不等 onopen 延迟
-   * 定时器/reconnect)。与 onopen 的延迟 drain 共用单飞守卫(offlineQueueDraining /
-   * offlineDrainingCurrent),不会重复 drain;队列空或未连接则 no-op。
-   */
-  private startOfflineDrainNow(): void {
-    if (!this.ws || this.ws.readyState !== 1) return;
-    if (this.offlineQueueDraining || this.offlineDrainingCurrent) return;
-    if (this.offlineQueue.length === 0) return;
-    if (this.offlineDrainTimer) {
-      clearTimeout(this.offlineDrainTimer);
-      this.offlineDrainTimer = null;
-    }
-    this.offlineQueuePending = [...this.offlineQueue];
-    this.offlineQueue = [];
-    this.offlineQueueDraining = true;
-    this.drainGeneration++;
-    this.drainNextOfflineItem();
-  }
-
-  private drainNextOfflineItem(): void {
-    const gen = this.drainGeneration;
-    const queue = this.offlineQueuePending;
-    if (!queue || queue.length === 0) {
-      this.offlineQueueDraining = false;
-      this.offlineDrainingCurrent = null;
-      this.maybePromoteToConnected();
-      return;
-    }
-    const item = queue[0];
-    const targetSess = this.sessions.get(item.sessId);
-    if (targetSess?._sendingInFlight) {
-      item._retryCount = (item._retryCount || 0) + 1;
-      if (item._retryCount > 60) {
-        queue.shift();
-        queue.push(item);
-        item._retryCount = 0;
-        const allBusy = queue.every((q) => this.sessions.get(q.sessId)?._sendingInFlight);
-        if (allBusy) {
-          setTimeout(() => {
-            if (this.drainGeneration === gen) this.drainNextOfflineItem();
-          }, 5000);
-          return;
-        }
-        this.drainNextOfflineItem();
-        return;
-      }
-      setTimeout(() => {
-        if (this.drainGeneration === gen) this.drainNextOfflineItem();
-      }, 1000);
-      return;
-    }
-    queue.shift();
-    this.offlineDrainingCurrent = item;
-    if (!this.ws || this.ws.readyState !== 1) {
-      this.offlineQueue.unshift(item, ...queue); // 保序
-      this.offlineQueuePending = [];
-      this.offlineQueueDraining = false;
-      this.offlineDrainingCurrent = null;
-      return;
-    }
-    const sent = this.safeWsSend(JSON.stringify(item.payload));
-    if (!sent) {
-      this.offlineQueue.unshift(item, ...queue); // 保序
-      this.offlineQueuePending = [];
-      this.offlineQueueDraining = false;
-      this.offlineDrainingCurrent = null;
-      return;
-    }
-    const sess = this.sessions.get(item.sessId);
-    if (sess) {
-      const msg = sess.messages.find((m) => m.id === item.msgId);
-      if (msg) msg.status = "sent";
-      sess._sendingInFlight = true;
-      sess._activeClientMessageId = item.msgId;
-      sess._localTeardownAt = undefined;
-      sess._turnStartedAt = Date.now();
-      sess._pendingCostCredits = "0";
-      sess._lastFinaledAssistantId = null;
-      sess._lastFinaledAt = 0;
-      this.resetThinkingSafety(sess.id);
-    }
-    this.drainTimeoutTimer = setTimeout(() => this.handleDrainTimeout(item), 120000);
-    if (queue.length === 0) this.offlineQueueDraining = false;
-    this.scheduleNotify();
-  }
 }

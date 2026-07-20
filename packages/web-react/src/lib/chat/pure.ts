@@ -55,7 +55,6 @@ export const TURN_STATE_UNKNOWN_SAFETY_MS = 60_000;
 /** 重连后等 replay 先赢，再 REST reconcile 的 grace（websocket.js:284）。*/
 export const RECONNECT_RECONCILE_GRACE_MS = 4000;
 /** reconnect 后延迟启动 drain，让 hello/resume isFinal 先到（websocket.js:2104）。*/
-export const OFFLINE_DRAIN_START_DELAY_MS = 3000;
 /** drain 单条 isFinal 安全网（不再当失败判定，只提示，websocket.js:1411）。*/
 export const DRAIN_ISFINAL_SAFETY_MS = 120_000;
 

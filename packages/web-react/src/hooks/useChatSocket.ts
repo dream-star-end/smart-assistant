@@ -41,7 +41,10 @@ function persistSignature(s: StoredSession): string {
   const inflightSig = s._sendingInFlight
     ? `1/${s._turnStartedAt ?? 0}/${s._lastFrameAt ?? 0}`
     : "0";
-  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${s._selectedModelId ?? ""}:${inflightSig}:${s._trackerResetAt ?? 0}:${s._trackerResetServerTs ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
+  const pendingSig = (s._pendingDispatches ?? [])
+    .map((item) => `${item.msgId}/${item.enqueuedAt}`)
+    .join(",");
+  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${s._selectedModelId ?? ""}:${inflightSig}:${pendingSig}:${s._trackerResetAt ?? 0}:${s._trackerResetServerTs ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
 }
 
 /**
@@ -138,17 +141,15 @@ export type UseChatSocket = {
     sessId: string | undefined,
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   /**
-   * Lazy process expansion:read one page of true tape records and merge it by immutable ordinal.
-   * `cursor` 缺省(null)=首页,续拉传上次返回的 nextCursor。并发去重(同 anchor 在飞时忽略);非抛出式契约。
+   * Lazy process paging:read one page of true tape records and merge it by immutable ordinal.
+   * `before` 缺省(null)=尾页,向上续拉传上次返回的 nextCursor。并发去重(同 anchor 在飞时忽略);非抛出式契约。
    */
-  expandTurnProcess: (
+  loadOlderTurnProcess: (
     sessId: string | undefined,
     anchorId: string,
     tapeId: string,
     cursor?: number | null,
   ) => Promise<{ ok: boolean; nextCursor?: number | null; total?: number; busy?: boolean; error?: boolean }>;
-  /** Collapse the locally loaded process rows. */
-  collapseTurnProcess: (sessId: string | undefined, anchorId: string) => void;
   /** 按需读取、校验并在 worker 中解析一条超大 immutable record。 */
   fetchTapeRecordPayload: (
     sessId: string | undefined,
@@ -229,6 +230,7 @@ export function useChatSocket(opts: {
   // 持久存储（按 user 命名空间）+ 立即落盘句柄 + 写盘签名（防无谓 IDB 写）。
   const storeRef = useRef<SessionStore | null>(null);
   const persistRef = useRef<(sessId: string) => void>(() => {});
+  const persistDurablyRef = useRef<(sessId: string) => Promise<void>>(async () => {});
   const sigRef = useRef<Map<string, string>>(new Map());
   // IndexedDB 注水是否完成：持久启用时，connect 须等注水完成，否则首个 hello 不带恢复的
   // 断点续传游标（restored 会话无法 auto-resume，要等下次重连才补）。
@@ -349,6 +351,7 @@ export function useChatSocket(opts: {
       },
       // resume_failed 游标推进 / isFinal turn 收尾：立即落 IndexedDB（防 reload 死循环 + 不丢轮）。
       persistSession: (sessId) => persistRef.current(sessId),
+      persistSessionDurably: (sessId) => persistDurablyRef.current(sessId),
       // GitHub 仓库绑定状态/错误帧 → 透传给 useRepoBinding（经 ref，无 stale）。
       onRepoStatus: (frame) => onRepoStatusRef.current?.(frame),
       onRepoBindError: (frame) => onRepoBindErrorRef.current?.(frame),
@@ -368,6 +371,14 @@ export function useChatSocket(opts: {
     if (!stored) return;
     sigRef.current.set(sessId, persistSignature(stored));
     void store.putSession(stored);
+  };
+  persistDurablyRef.current = async (sessId: string) => {
+    const store = storeRef.current;
+    if (!store) throw new Error("session store unavailable");
+    const stored = socket.toStored(sessId);
+    if (!stored) throw new Error("session snapshot unavailable");
+    sigRef.current.set(sessId, persistSignature(stored));
+    await store.putSessionDurably(stored);
   };
 
   // 生命周期：enabled 时 start（绑事件）；卸载/禁用时 stop（解绑 + 关 ws）。
@@ -599,34 +610,27 @@ export function useChatSocket(opts: {
     },
     [socket],
   );
-  // Lazy process expansion concurrency gate (one request per control row).
+  // Lazy reverse process paging concurrency gate (one request per control row).
   const expandingTapesRef = useRef<Set<string>>(new Set());
-  const expandTurnProcess = useCallback<UseChatSocket["expandTurnProcess"]>(
-    async (sessId, anchorId, tapeId, cursor) => {
+  const loadOlderTurnProcess = useCallback<UseChatSocket["loadOlderTurnProcess"]>(
+    async (sessId, anchorId, tapeId, before) => {
       const a = authRef.current;
       if (!a || !sessId || !anchorId || !tapeId) return { ok: false };
       const guardKey = `${sessId}::${anchorId}`;
       if (expandingTapesRef.current.has(guardKey)) return { ok: false, busy: true };
       expandingTapesRef.current.add(guardKey);
       try {
-        const page = await api.getTapeRecords(a, sessId, tapeId, cursor ?? null);
+        const page = await api.getTapeRecordsBefore(a, sessId, tapeId, before ?? null);
         const records = Array.isArray(page.records) ? (page.records as ChatMessage[]) : [];
         const nextCursor = typeof page.nextCursor === "number" ? page.nextCursor : null;
-        // applyExpandedTapeRecords 内部已 persistSession + scheduleNotify(展开态随 IndexedDB 往返保留)。
-        socket.applyExpandedTapeRecords(sessId, anchorId, records, nextCursor);
+        // applyTapeRecordsPage 内部已 persistSession + scheduleNotify；总量不封顶。
+        socket.applyTapeRecordsPage(sessId, anchorId, records, nextCursor);
         return { ok: true, nextCursor, total: typeof page.total === "number" ? page.total : records.length };
       } catch {
         return { ok: false, error: true }; // 失败:卡片保留"可重试",不封死
       } finally {
         expandingTapesRef.current.delete(guardKey);
       }
-    },
-    [socket],
-  );
-  const collapseTurnProcess = useCallback<UseChatSocket["collapseTurnProcess"]>(
-    (sessId, anchorId) => {
-      if (!sessId || !anchorId) return;
-      socket.collapseTurnProcess(sessId, anchorId);
     },
     [socket],
   );
@@ -793,8 +797,7 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
-      expandTurnProcess,
-      collapseTurnProcess,
+      loadOlderTurnProcess,
       fetchTapeRecordPayload,
       fetchUserMessagePayload,
       removePersisted,
@@ -824,8 +827,7 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       storedHistoryRevision,
       loadOlderHistory,
-      expandTurnProcess,
-      collapseTurnProcess,
+      loadOlderTurnProcess,
       fetchTapeRecordPayload,
       fetchUserMessagePayload,
       removePersisted,

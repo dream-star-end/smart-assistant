@@ -842,41 +842,53 @@ export type ContainerPreviewTicketResponse = {
   };
 };
 
-/** Resolve legacy locators through HEAD, then assemble the immutable JSON with
- * real byte-range requests. The 1 MiB quantum is transport backpressure, not a
+/** Resolve immutable metadata with a one-byte Range GET, then assemble the
+ * exact JSON with byte-range requests. A public proxy may transparently gzip a
+ * HEAD response and rewrite Content-Length/ETag; a 206 range response preserves
+ * the origin byte identity. The 1 MiB quantum is transport backpressure, not a
  * record-size limit; every byte is retained and verified by the payload parser. */
 export async function getExactDeferredPayload(
   a: AuthSession,
   url: string,
   signal?: AbortSignal,
 ): Promise<TapeRecordPayload> {
-  const head = await callWithRefresh(a, (token) =>
+  const probe = await callWithRefresh(a, (token) =>
     fetch(url, {
-      method: "HEAD",
       credentials: "include",
-      headers: bearerHeaders(token),
+      headers: { ...bearerHeaders(token), Range: "bytes=0-0" },
       signal,
     }),
   );
-  assertAuthResponseCurrent(head);
-  if (!head.ok) await throwApi(head);
-  const totalBytes = Number(head.headers.get("content-length"));
-  const contentSha256 = head.headers.get("x-openclaude-content-sha256") ?? "";
-  const recordId = head.headers.get("x-openclaude-record-id") ?? "";
-  const role = head.headers.get("x-openclaude-record-role") ?? "";
+  assertAuthResponseCurrent(probe);
+  if (!probe.ok) await throwApi(probe);
+  const rangeMatch = /^bytes 0-0\/([1-9][0-9]*)$/.exec(
+    probe.headers.get("content-range") ?? "",
+  );
+  const totalBytes = rangeMatch ? Number(rangeMatch[1]) : Number.NaN;
+  const contentSha256 = probe.headers.get("x-openclaude-content-sha256") ?? "";
+  const recordId = probe.headers.get("x-openclaude-record-id") ?? "";
+  const role = probe.headers.get("x-openclaude-record-role") ?? "";
+  const probeEncoding = probe.headers.get("content-encoding")?.toLowerCase();
   if (
+    probe.status !== 206 || (probeEncoding !== undefined && probeEncoding !== "identity") ||
     !Number.isSafeInteger(totalBytes) || totalBytes < 1 ||
     !/^[a-f0-9]{64}$/.test(contentSha256) ||
-    recordId.length === 0 || role.length === 0 ||
-    head.headers.get("accept-ranges")?.toLowerCase() !== "bytes"
+    recordId.length === 0 || role.length === 0
   ) {
+    void probe.body?.cancel().catch(() => {});
     throw new Error("invalid immutable deferred payload metadata");
+  }
+  const probeBytes = new Uint8Array(await probe.arrayBuffer());
+  assertAuthResponseCurrent(probe);
+  if (probeBytes.byteLength !== 1) {
+    throw new Error("invalid immutable deferred payload probe length");
   }
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
 
   const target = new Uint8Array(totalBytes);
+  target[0] = probeBytes[0]!;
   const quantum = 1024 * 1024;
-  for (let offset = 0; offset < totalBytes; offset += quantum) {
+  for (let offset = 1; offset < totalBytes; offset += quantum) {
     if (signal?.aborted) throw new DOMException("aborted", "AbortError");
     const end = Math.min(totalBytes, offset + quantum) - 1;
     const res = await callWithRefresh(a, (token) =>
@@ -888,17 +900,22 @@ export async function getExactDeferredPayload(
     );
     assertAuthResponseCurrent(res);
     if (!res.ok) await throwApi(res);
-    const chunk = new Uint8Array(await res.arrayBuffer());
-    assertAuthResponseCurrent(res);
+    const rangeEncoding = res.headers.get("content-encoding")?.toLowerCase();
     if (
       res.status !== 206 ||
+      (rangeEncoding !== undefined && rangeEncoding !== "identity") ||
       res.headers.get("content-range") !== `bytes ${offset}-${end}/${totalBytes}` ||
       res.headers.get("x-openclaude-content-sha256") !== contentSha256 ||
       res.headers.get("x-openclaude-record-id") !== recordId ||
-      res.headers.get("x-openclaude-record-role") !== role ||
-      chunk.byteLength !== end - offset + 1
+      res.headers.get("x-openclaude-record-role") !== role
     ) {
+      void res.body?.cancel().catch(() => {});
       throw new Error("immutable deferred payload range identity mismatch");
+    }
+    const chunk = new Uint8Array(await res.arrayBuffer());
+    assertAuthResponseCurrent(res);
+    if (chunk.byteLength !== end - offset + 1) {
+      throw new Error("immutable deferred payload range length mismatch");
     }
     if (signal?.aborted) throw new DOMException("aborted", "AbortError");
     target.set(chunk, offset);
@@ -1611,7 +1628,29 @@ export const api = {
     );
   },
 
-  /** 读取单条真实、脱敏后不可变 JSON；HEAD + Range，不发整条巨型响应。 */
+  /** 不可变 turn-tape 尾部/更早记录分页。`before` 严格 exclusive；null=尾页。
+   * 独立于旧 cursor 正向契约，保证滚动发布期间 Web/Admin 兼容。 */
+  getTapeRecordsBefore: (
+    a: AuthSession,
+    id: string,
+    tapeId: string,
+    before: number | null = null,
+    limit = 200,
+  ): Promise<TapeRecordsPage> => {
+    const params = new URLSearchParams();
+    params.set("before", typeof before === "number" ? String(before) : "tail");
+    if (limit > 0) params.set("limit", String(limit));
+    return jsonOrThrow<TapeRecordsPage>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/sessions/${encodeURIComponent(id)}/tape/${encodeURIComponent(tapeId)}/records?${params}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
+      ),
+    );
+  },
+
+  /** 读取单条真实、脱敏后不可变 JSON；Range 分块，不发整条巨型响应。 */
   getTapeRecordPayload: async (
     a: AuthSession,
     id: string,
@@ -1627,7 +1666,7 @@ export const api = {
     );
   },
 
-  /** 超长 user 行的原始 JSON。与 tape payload 共用 HEAD + Range + SHA 契约。 */
+  /** 超长 user 行的原始 JSON。与 tape payload 共用 Range + SHA 契约。 */
   getUserMessagePayload: async (
     a: AuthSession,
     id: string,

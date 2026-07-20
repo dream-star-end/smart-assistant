@@ -55,7 +55,7 @@ export function adminGet<T>(path: string, params?: AdminParams): Promise<T> {
 }
 
 /** Admin-scoped immutable payload loader. Reuses the user surface's exact
- * HEAD + 1 MiB Range + identity contract; only the URL/auth scope differs. */
+ * one-byte metadata Range + 1 MiB chunks + identity contract; only the URL/auth scope differs. */
 export function adminGetExactPayload(path: string, params?: AdminParams, signal?: AbortSignal) {
   return getExactDeferredPayload(adminSession, buildUrl(path, params), signal);
 }

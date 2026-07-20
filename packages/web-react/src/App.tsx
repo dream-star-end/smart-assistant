@@ -1503,8 +1503,7 @@ export function App() {
   // True tape process paging + oversized-record loading. Hook methods are stable;
   // demo/readonly surfaces leave the cursor disabled rather than inventing content.
   const {
-    expandTurnProcess,
-    collapseTurnProcess,
+    loadOlderTurnProcess,
     fetchTapeRecordPayload,
     fetchUserMessagePayload,
   } = chat;
@@ -1515,10 +1514,9 @@ export function App() {
       onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
       onRetrySend: demo ? undefined : retrySend,
-      onExpandTape: demo
+      onLoadOlderTape: demo
         ? undefined
-        : (anchorId, tapeId, cursor) => expandTurnProcess(activeId, anchorId, tapeId, cursor),
-      onCollapseTape: demo ? undefined : (anchorId) => collapseTurnProcess(activeId, anchorId),
+        : (anchorId, tapeId, before) => loadOlderTurnProcess(activeId, anchorId, tapeId, before),
       onFetchTapeRecordPayload: demo
         ? undefined
         : (tapeId, recordOrdinal, expected, signal) =>
@@ -1536,8 +1534,7 @@ export function App() {
       openSettings,
       onFeedback,
       retrySend,
-      expandTurnProcess,
-      collapseTurnProcess,
+      loadOlderTurnProcess,
       fetchTapeRecordPayload,
       fetchUserMessagePayload,
       activeId,

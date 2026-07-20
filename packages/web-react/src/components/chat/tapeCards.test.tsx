@@ -1,14 +1,17 @@
 /** Direct timeline cards: process cursor, deferred exact record, runtime event. */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
 import { MessageRenderer } from "../MessageRenderer";
-import type { CardCallbacks } from "./cards";
+import { TurnProcessCard, type CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 beforeAll(async () => {
   await import("../MarkdownImpl");
 });
@@ -46,40 +49,74 @@ function processControl(over: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe("TurnProcessCard", () => {
-  test("collapsed card is only a cursor over 873 true records", async () => {
-    const onExpandTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 200 });
-    renderMsg(processControl(), { onExpandTape });
-    expect(screen.getByText("Agent 调用过程（873 条），点击展开")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
-    await waitFor(() => expect(onExpandTape).toHaveBeenCalledWith(
+  test("process control automatically loads the true tail and never renders a folded Agent card", async () => {
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 200 });
+    renderMsg(processControl(), { onLoadOlderTape });
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
       "turn-process:tape-1", "tape-1", null,
     ));
+    expect(screen.queryByText(/Agent 调用过程|点击展开|收起/)).toBeNull();
   });
 
-  test("without a read callback the control is static and never invents content", () => {
+  test("without a read callback it reports unavailable without inventing Agent content", () => {
     renderMsg(processControl());
-    expect(screen.getByRole("button")).toBeDisabled();
-    expect(screen.getByText("Agent 调用过程（873 条）")).toBeInTheDocument();
+    expect(screen.getByText("真实记录暂时无法读取")).toBeInTheDocument();
+    expect(screen.queryByText(/Agent 调用过程/)).toBeNull();
   });
 
-  test("expanded card pages without claiming that page size is a total limit", () => {
-    const onCollapseTape = vi.fn();
+  test("an initialized cursor requests the next older physical page without fold controls", async () => {
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 100 });
     renderMsg(processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 }), {
-      onExpandTape: vi.fn().mockResolvedValue({ ok: true, nextCursor: 400 }),
-      onCollapseTape,
+      onLoadOlderTape,
     });
-    expect(screen.getByText(/Agent 调用过程 · 已展开 · 192\.0 MB/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "继续加载更多" })).toBeInTheDocument();
-    expect(screen.queryByText(/截断|省略|替换/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "收起" }));
-    expect(onCollapseTape).toHaveBeenCalledWith("turn-process:tape-1");
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
+      "turn-process:tape-1", "tape-1", 200,
+    ));
+    expect(screen.queryByText(/Agent 调用过程|继续加载更多|收起|截断|省略|替换/)).toBeNull();
   });
 
-  test("cursor null means every physical page is loaded", () => {
+  test("cursor null removes the loader after every physical page is loaded", () => {
     renderMsg(processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: null }), {
-      onCollapseTape: vi.fn(),
+      onLoadOlderTape: vi.fn(),
     });
-    expect(screen.queryByRole("button", { name: "继续加载更多" })).toBeNull();
+    expect(screen.queryByTestId("turn-process-loader")).toBeNull();
+  });
+
+  test("a history revision reset re-arms automatic tail loading on the same control", async () => {
+    const observers: Array<{ trigger: (intersecting: boolean) => void }> = [];
+    class FakeIntersectionObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {
+        observers.push({
+          trigger: (intersecting) => this.callback(
+            [{ isIntersecting: intersecting } as IntersectionObserverEntry],
+            this as unknown as IntersectionObserver,
+          ),
+        });
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
+    const cb = { onLoadOlderTape };
+    const view = render(<TurnProcessCard msg={processControl()} cb={cb} />);
+
+    act(() => observers.at(-1)!.trigger(true));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+    view.rerender(<TurnProcessCard msg={processControl({
+      _turnTapeProcessExpanded: true,
+      _turnTapeProcessCursor: null,
+    })} cb={cb} />);
+    view.rerender(<TurnProcessCard msg={processControl()} cb={cb} />);
+
+    act(() => observers.at(-1)!.trigger(true));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
+    expect(onLoadOlderTape).toHaveBeenNthCalledWith(2, "turn-process:tape-1", "tape-1", null);
   });
 });
 

@@ -79,6 +79,7 @@ class FakeWS {
   open() {
     this.readyState = 1;
     this.onopen?.();
+    this.onmessage?.({ data: JSON.stringify({ type: "sys.relay_ready" }) });
   }
 }
 function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
@@ -117,6 +118,12 @@ describe("hello inFlightClientMessageId (RFC §4)", () => {
     const userId = s.messages.find((m) => m.role === "user")!.id;
     expect(s._sendingInFlight).toBe(true);
     expect(s._activeClientMessageId).toBe(userId);
+    ws1.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: userId,
+    }) });
 
     // 断连 → 退避重连 → 新 ws onopen 发 hello(includeInFlight)。
     ws1.readyState = 3;
@@ -488,9 +495,8 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     const userMsg = s.messages.find((m) => m.role === "user")!;
     const oldId = userMsg.id;
     // 模拟 dispatch 终态:发送态清空、user 行 error、durable status 到位。
+    sock.stopTurn("s1");
     userMsg.status = "error";
-    s._sendingInFlight = false;
-    s._activeClientMessageId = undefined;
     s.messages.push(
       srvRow({ id: "turn-status:d1", role: "system", _seq: 2, _turnStatusRecord: true,
         _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: oldId }),
@@ -575,9 +581,8 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     const userMsg = s.messages.find((m) => m.role === "user")!;
     const oldId = userMsg.id;
     // 普通失败:无 dispatch 终态证据。
+    sock.stopTurn("s1");
     userMsg.status = "error";
-    s._sendingInFlight = false;
-    s._activeClientMessageId = undefined;
     ws.sent.length = 0;
 
     sock.retryMessage({ sessId: "s1", msgId: oldId, agentId: "main" });

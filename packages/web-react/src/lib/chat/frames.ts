@@ -186,9 +186,10 @@ export type IncidentWire = {
   ts: number;
 };
 
-/** server 已去重的 ack（drain 对账 + auto-continue 对账）。*/
+/** server durable admission / completed-dedup acknowledgement. */
 export type AckWire = {
   type: "outbound.ack";
+  admitted?: boolean;
   deduplicated?: boolean;
   idempotencyKey?: string;
   peer?: Peer;

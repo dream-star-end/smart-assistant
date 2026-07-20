@@ -570,6 +570,9 @@ export function rebuildIndexes(sess: ChatSession): void {
   if (!sess._blockIdToMsgId) sess._blockIdToMsgId = new Map();
   if (!sess._agentGroups) sess._agentGroups = new Map();
   for (const m of sess.messages) {
+    // Lazy immutable tape rows are historical viewport data. They render like
+    // normal cards but must never become live-delta mutation targets.
+    if (typeof m._turnTapeProcessLoadedFrom === "string") continue;
     if (m.blockId) sess._blockIdToMsgId.set(m.blockId, m.id);
     if (m.role === "agent-group" && m.blockId) {
       sess._agentGroups.set(m.blockId, m.id);

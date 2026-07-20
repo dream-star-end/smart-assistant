@@ -3821,7 +3821,20 @@ export class Gateway {
       const limitRaw = Number(url.searchParams.get('limit'))
       const cursor = Number.isSafeInteger(cursorRaw) && cursorRaw > 0 ? cursorRaw : 0
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 200
-      listTurnTapeRecords(sessId, userId, tapeId, cursor, limit)
+      const beforeRaw = url.searchParams.get('before')
+      let before: number | null | undefined
+      if (beforeRaw !== null) {
+        if (beforeRaw === 'tail') before = null
+        else {
+          const parsed = Number(beforeRaw)
+          if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+            this.sendJson(res, 400, { error: 'before must be tail or a positive ordinal' })
+            return
+          }
+          before = parsed
+        }
+      }
+      listTurnTapeRecords(sessId, userId, tapeId, cursor, limit, before)
         .then((result) => result
           ? this.sendJson(res, 200, result)
           : this.sendJson(res, 404, { error: 'not found' }))

@@ -975,6 +975,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
     });
     try {
       const ws = await openClient(rig.port);
+      const fc = frameCollector(ws);
       ws.send(
         inboundFrame({
           clientMessageId: "cm-fresh",
@@ -985,6 +986,11 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       // dedup 只在同 clientMessageId 已 completed 时短路;此轮是新 id → 受理照常进行。
       await waitFor(() => admitCalls === 1);
       assert.equal(admitCalls, 1);
+      const ack = await fc.next();
+      assert.equal(ack.type, "outbound.ack");
+      assert.equal(ack.admitted, true);
+      assert.equal(ack.clientMessageId, "cm-fresh");
+      assert.equal(ack.idempotencyKey, "web:cm-fresh:0");
       await waitFor(() => historyContext !== null);
       assert.deepEqual(historyContext, {
         contextWindow: 200_000,
@@ -995,6 +1001,42 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       ws.close();
     } finally {
       await stopRig(rig);
+    }
+  });
+
+  test("same logical turn already admitted/in-flight → admitted ACK, never TURN_BUSY or duplicate forward", async () => {
+    for (const kind of ["already_owned", "in_flight"] as const) {
+      const rig = await startRig({
+        attest: "yes",
+        durableDispatch: true,
+        admitUserTurn: async (input) => {
+          const admitted = fakeAdmittedDispatch(input.clientMessageId);
+          assert.equal(admitted.kind, "admitted");
+          return { kind, dispatch: admitted.dispatch };
+        },
+        hasCompletedClientTurn: async () => false,
+      });
+      try {
+        const ws = await openClient(rig.port);
+        const fc = frameCollector(ws);
+        ws.send(inboundFrame({
+          clientMessageId: `cm-${kind}`,
+          idempotencyKey: `web:cm-${kind}:0`,
+          peer: { id: "sess-b10", kind: "dm" },
+        }));
+        const ack = await fc.next();
+        assert.equal(ack.type, "outbound.ack");
+        assert.equal(ack.admitted, true);
+        assert.equal(ack.clientMessageId, `cm-${kind}`);
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        assert.equal(rig.containerSeen.some((raw) => {
+          try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }
+          catch { return false; }
+        }), false);
+        ws.close();
+      } finally {
+        await stopRig(rig);
+      }
     }
   });
 });

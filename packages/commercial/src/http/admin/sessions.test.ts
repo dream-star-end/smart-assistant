@@ -89,8 +89,8 @@ before(async () => {
       }
       return { messages: ARCHIVED_MESSAGES, oldestSeq: 8, hasMore: false }
     },
-    listTurnTapeRecords: async (sessionId, userId, tapeId, cursor, limit) => {
-      tapeCalls.push([sessionId, userId, tapeId, cursor, limit])
+    listTurnTapeRecords: async (sessionId, userId, tapeId, cursor, limit, before) => {
+      tapeCalls.push([sessionId, userId, tapeId, cursor, limit, before])
       return sessionId === SESSION.id && userId === SESSION.userId && tapeId === TAPE_ID
         ? { records: TAPE_RECORDS, nextCursor: null, total: 1 }
         : null
@@ -296,7 +296,20 @@ describe('admin session route parsing', () => {
       cursor: 400,
       limit: 25,
     })
-    for (const query of ['cursor=-1', 'cursor=01', 'cursor=1.5', 'limit=0', 'limit=201']) {
+    assert.deepEqual(parseTapePagingParams(new URL('https://x/a?before=tail&limit=50')), {
+      cursor: 0,
+      limit: 50,
+      before: null,
+    })
+    assert.deepEqual(parseTapePagingParams(new URL('https://x/a?before=401')), {
+      cursor: 0,
+      limit: 200,
+      before: 401,
+    })
+    for (const query of [
+      'cursor=-1', 'cursor=01', 'cursor=1.5', 'before=0', 'before=-1', 'before=01',
+      'before=1.5', 'limit=0', 'limit=201',
+    ]) {
       assert.throws(
         () => parseTapePagingParams(new URL(`https://x/a?${query}`)),
         (err) => err instanceof HttpError && err.status === 400,
@@ -391,7 +404,7 @@ describe('admin session chat/archive/media handlers', () => {
   test('tape records 以权威 owner 分页，admin 前端可逐页展开真实过程', async () => {
     const out = makeRes()
     await handleAdminGetSession(
-      makeReq('GET', `/api/admin/sessions/web-1/tape/${TAPE_ID}/records?user_id=1&cursor=0&limit=25`),
+      makeReq('GET', `/api/admin/sessions/web-1/tape/${TAPE_ID}/records?user_id=1&before=tail&limit=25`),
       out.res,
       ctx,
       deps,
@@ -399,7 +412,7 @@ describe('admin session chat/archive/media handlers', () => {
     const result = out.read()
     assert.equal(result.status, 200)
     assert.deepEqual(result.body, { records: TAPE_RECORDS, nextCursor: null, total: 1 })
-    assert.deepEqual(tapeCalls, [['web-1', 'c:1', TAPE_ID, 0, 25]])
+    assert.deepEqual(tapeCalls, [['web-1', 'c:1', TAPE_ID, 0, 25, null]])
   })
 
   test('tape/user payload 的 HEAD 与直接 Range GET 均审计，正文不进入 audit', async () => {

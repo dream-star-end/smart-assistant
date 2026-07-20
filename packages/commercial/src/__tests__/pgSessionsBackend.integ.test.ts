@@ -3059,6 +3059,28 @@ describe("pgSessionsBackend direct turn timeline", () => {
     assert.equal(records.some((message) => message._projectionTruncated === true), false);
     assert.equal(records.some((message) => message._tapeCollapsed === true), false);
 
+    let reverseBefore: number | null = null;
+    const reverseRecords: MessageLike[] = [];
+    const reversePageSizes: number[] = [];
+    for (;;) {
+      const page = await backend.listTurnTapeRecords(
+        sessionId, userId, tape.finalize.tapeId, 0, 10_000, reverseBefore,
+      );
+      assert.ok(page);
+      assert.equal(page.total, 530);
+      reversePageSizes.push(page.records.length);
+      reverseRecords.unshift(...page.records);
+      if (page.nextCursor === null) break;
+      if (reverseBefore !== null) assert.ok(page.nextCursor < reverseBefore);
+      reverseBefore = page.nextCursor;
+    }
+    assert.deepEqual(reversePageSizes, [200, 200, 130]);
+    assert.deepEqual(
+      reverseRecords.map((message) => message.id),
+      records.map((message) => message.id),
+      "tail-first pages restore every real record without loss, duplication, or replacement",
+    );
+
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     const initial = timeline!.messages as MessageLike[];
     const finalLocator = initial.find((message) => message.role === "assistant");

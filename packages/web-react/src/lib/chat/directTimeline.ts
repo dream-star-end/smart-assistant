@@ -1,10 +1,10 @@
 import type { ChatMessage } from "./model";
 import { isTurnTapeProcessControl, turnTapeProcessKey } from "./render";
 
-/** Merge one immutable physical-ordinal page around its process cursor.
+/** Merge one immutable reverse physical-ordinal page around its process cursor.
  * The already-visible genuine narrative is retained byte-for-byte; fetched
- * process rows are only an in-memory view and are tagged for later collapse. */
-export function mergeExpandedTapePage(
+ * process rows are only an in-memory viewport cache. */
+export function mergeTapePage(
   messages: ChatMessage[],
   anchorId: string,
   records: ChatMessage[],
@@ -81,26 +81,4 @@ export function mergeExpandedTapePage(
     ...mergedSection,
     ...withoutSection.slice(controlIndex + 1),
   ];
-}
-
-/** Remove only rows fetched through this cursor. Genuine narrative rows were
- * never tagged and therefore remain visible after collapse. */
-export function collapseExpandedTapePage(
-  messages: ChatMessage[],
-  anchorId: string,
-): ChatMessage[] | null {
-  const sourceAnchor = messages.find(
-    (message) => message?.id === anchorId && isTurnTapeProcessControl(message),
-  );
-  if (!sourceAnchor || sourceAnchor._turnTapeProcessExpanded !== true) return null;
-  const key = turnTapeProcessKey(sourceAnchor);
-  return messages
-    .filter((message) => message._turnTapeProcessLoadedFrom !== key)
-    .map((message) => message.id === sourceAnchor.id
-      ? {
-          ...message,
-          _turnTapeProcessExpanded: false,
-          _turnTapeProcessCursor: undefined,
-        }
-      : message);
 }

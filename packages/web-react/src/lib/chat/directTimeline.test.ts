@@ -18,9 +18,23 @@ import {
 import { detectServerTerminalTurns } from "../persist";
 import { turnFinalAssistantFlags } from "../../components/chat/turnSegment";
 import { ChatSocket, type ChatSocketDeps } from "./socket";
+import { applyOutboundMessage } from "./reducer";
+import type { OutboundMessageWire } from "./frames";
 
 function srvRow(over: Partial<ChatMessage>): ChatMessage {
   return { id: "x", role: "assistant", text: "", ts: 1, _source: "server", ...over } as ChatMessage;
+}
+
+function liveFrame(over: Record<string, unknown>): OutboundMessageWire {
+  return {
+    type: "outbound.message",
+    sessionKey: "agent:main:webchat:dm:s1",
+    channel: "webchat",
+    peer: { id: "s1", kind: "dm" },
+    blocks: [],
+    isFinal: false,
+    ...over,
+  } as unknown as OutboundMessageWire;
 }
 
 function processControl(over: Partial<ChatMessage> = {}): ChatMessage {
@@ -155,7 +169,7 @@ describe("lazy immutable process merge", () => {
   test("page rows merge by true ordinal and do not duplicate the already-visible final answer", () => {
     const { sock, session } = seed();
     const maxSeqBefore = session._maxSeq;
-    sock.applyExpandedTapeRecords(
+    sock.applyTapeRecordsPage(
       "s1",
       "turn-process:tape-1",
       [
@@ -188,13 +202,13 @@ describe("lazy immutable process merge", () => {
 
   test("subsequent pages insert by ordinal instead of append order", () => {
     const { sock, session } = seed();
-    sock.applyExpandedTapeRecords(
+    sock.applyTapeRecordsPage(
       "s1",
       "turn-process:tape-1",
       [srvRow({ id: "tool-2", role: "tool", text: "二", _turnTapeOrdinal: 2 })],
       1,
     );
-    sock.applyExpandedTapeRecords(
+    sock.applyTapeRecordsPage(
       "s1",
       "turn-process:tape-1",
       [
@@ -210,9 +224,198 @@ describe("lazy immutable process merge", () => {
     expect(session.messages.find((message) => message.id === "tool-2")?.text).toBe("二");
   });
 
+  test("lazy page merge keeps a local permission card before its real terminal answer", () => {
+    const { sock, session } = seed();
+    const finalIndex = session.messages.findIndex((message) => message.id === "srv-a-t1");
+    session.messages.splice(finalIndex, 0, {
+      id: "permission-local",
+      role: "permission",
+      text: "",
+      ts: 2,
+      _turnOwnerId: "cm-1",
+      _resolved: true,
+    });
+
+    sock.applyTapeRecordsPage(
+      "s1",
+      "turn-process:tape-1",
+      [srvRow({ id: "thinking-1", role: "thinking", text: "真实思考", _turnTapeOrdinal: 1 })],
+      null,
+    );
+
+    const ids = session.messages.map((message) => message.id);
+    expect(ids.indexOf("thinking-1")).toBeLessThan(ids.indexOf("permission-local"));
+    expect(ids.indexOf("permission-local")).toBeLessThan(ids.indexOf("srv-a-t1"));
+  });
+
+  test("lazy pages preserve immutable delegate and repeated goal records without display folding", () => {
+    const { sock, session } = seed();
+    const finalIndex = session.messages.findIndex((message) => message.id === "srv-a-t1");
+    session.messages.splice(finalIndex, 0, {
+      id: "local-group",
+      role: "agent-group",
+      text: "local live card",
+      ts: 2,
+      _delegate: true,
+      _delegateRunId: "run-shared",
+      _turnOwnerId: "cm-1",
+      childBlocks: [],
+    });
+
+    sock.applyTapeRecordsPage(
+      "s1",
+      "turn-process:tape-1",
+      [
+        srvRow({
+          id: "server-group",
+          role: "agent-group",
+          text: "immutable group transcript",
+          _delegateRunId: "run-shared",
+          summary: "immutable summary",
+          _turnTapeOrdinal: 0,
+        }),
+        srvRow({
+          id: "server-delegate-tool",
+          role: "tool",
+          text: "immutable delegate tool",
+          toolName: "delegate_task",
+          blockId: "delegate-block",
+          inputJson: { agentId: "coder", goal: "raw delegated task" },
+          output: "raw delegated result",
+          _turnTapeOrdinal: 1,
+        }),
+        srvRow({ id: "goal-first", role: "goal", text: "first goal event", blockId: "engine-goal", _turnTapeOrdinal: 1 }),
+        srvRow({ id: "goal-second", role: "goal", text: "second goal event", blockId: "engine-goal", _turnTapeOrdinal: 2 }),
+      ],
+      null,
+    );
+
+    const expectExactRows = () => {
+      expect(session.messages.find((message) => message.id === "server-group")).toMatchObject({
+        role: "agent-group",
+        text: "immutable group transcript",
+        summary: "immutable summary",
+        _source: "server",
+      });
+      expect(session.messages.find((message) => message.id === "server-delegate-tool")).toMatchObject({
+        role: "tool",
+        text: "immutable delegate tool",
+        output: "raw delegated result",
+        _source: "server",
+      });
+      expect(session.messages.filter((message) =>
+        message.id === "goal-first" || message.id === "goal-second"))
+        .toHaveLength(2);
+      expect(session._blockIdToMsgId?.get("delegate-block")).toBeUndefined();
+      expect(session._blockIdToMsgId?.get("engine-goal")).toBeUndefined();
+    };
+    expect(session.messages.find((message) => message.id === "local-group")).toBeDefined();
+    expectExactRows();
+
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [
+        srvRow({ id: "cm-1", role: "user", text: "问题", _seq: 4, _orderSeq: 4 }),
+        processControl(),
+        finalAnswer(),
+      ],
+      true,
+      5,
+      { serverUpdatedAt: 101 },
+    );
+    expectExactRows();
+
+    sock.prependArchivedMessages("s1", [
+      srvRow({ id: "archived-before", role: "assistant", text: "更早的真实记录", _seq: 1, _orderSeq: 1 }),
+    ]);
+    expectExactRows();
+  });
+
+  test("later live turns cannot adopt, finalize, or stream into immutable lazy rows", () => {
+    const { sock, session } = seed();
+    sock.applyTapeRecordsPage(
+      "s1",
+      "turn-process:tape-1",
+      [
+        srvRow({ id: "exact-plan", role: "plan", text: "partial historical plan", _partial: true, _turnTapeOrdinal: 0 }),
+        srvRow({ id: "exact-tool", role: "tool", text: "historical tool", _completed: false, _turnTapeOrdinal: 1 }),
+        srvRow({
+          id: "exact-progress",
+          role: "delegate-progress",
+          text: "",
+          runId: "run-history",
+          agentId: "coder",
+          goal: "same goal",
+          _delegateGoal: "same goal",
+          entries: [{ phase: "text", text: "immutable progress entry", ts: 1 }],
+          _completed: false,
+          _turnTapeOrdinal: 2,
+        }),
+        srvRow({ id: "exact-assistant", role: "assistant", text: "immutable assistant", _turnTapeOrdinal: 3 }),
+        srvRow({ id: "exact-thinking", role: "thinking", text: "immutable thinking", _turnTapeOrdinal: 4 }),
+      ],
+      null,
+    );
+    session.messages.push(srvRow({ id: "cm-2", role: "user", text: "later turn", _seq: 6, _orderSeq: 6 }));
+    session._activeClientMessageId = "cm-2";
+    session._sendingInFlight = true;
+
+    applyOutboundMessage(session, liveFrame({
+      frameSeq: 1,
+      clientMessageId: "cm-2",
+      blocks: [{
+        kind: "tool_use",
+        toolName: "delegate_task",
+        blockId: "later-delegate",
+        inputJson: { agentId: "coder", goal: "same goal" },
+      }],
+    }));
+    applyOutboundMessage(session, liveFrame({
+      frameSeq: 2,
+      clientMessageId: "cm-2",
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "run-history",
+        agentId: "coder",
+        goal: "same goal",
+        phase: "text",
+        text: "later live progress",
+      }],
+    }));
+    applyOutboundMessage(session, liveFrame({
+      frameSeq: 3,
+      clientMessageId: "cm-2",
+      blocks: [
+        { kind: "text", messageId: "exact-assistant", text: "must not append" },
+        { kind: "thinking", messageId: "exact-thinking", text: "must not append" },
+      ],
+    }));
+    applyOutboundMessage(session, liveFrame({
+      frameSeq: 4,
+      clientMessageId: "cm-2",
+      blocks: [],
+      isFinal: true,
+    }));
+
+    expect(session.messages.find((message) => message.id === "exact-plan"))
+      .toMatchObject({ text: "partial historical plan", _partial: true });
+    expect(session.messages.find((message) => message.id === "exact-tool"))
+      .toMatchObject({ text: "historical tool", _completed: false });
+    expect(session.messages.find((message) => message.id === "exact-progress")).toMatchObject({
+      runId: "run-history",
+      entries: [{ phase: "text", text: "immutable progress entry", ts: 1 }],
+      _completed: false,
+    });
+    expect(session.messages.filter((message) => message.id === "exact-assistant"))
+      .toEqual([expect.objectContaining({ text: "immutable assistant" })]);
+    expect(session.messages.filter((message) => message.id === "exact-thinking"))
+      .toEqual([expect.objectContaining({ text: "immutable thinking" })]);
+  });
+
   test("history revision invalidates fetched rows and their cursor as one atomic view state", () => {
     const { sock, session } = seed();
-    sock.applyExpandedTapeRecords(
+    sock.applyTapeRecordsPage(
       "s1",
       "turn-process:tape-1",
       [srvRow({ id: "thinking-1", role: "thinking", text: "第一页", _turnTapeOrdinal: 1 })],
@@ -241,24 +444,9 @@ describe("lazy immutable process merge", () => {
     expect(control._turnTapeProcessCursor).toBeUndefined();
   });
 
-  test("collapse removes fetched process rows but keeps the genuine final answer", () => {
-    const { sock, session } = seed();
-    sock.applyExpandedTapeRecords(
-      "s1",
-      "turn-process:tape-1",
-      [srvRow({ id: "thinking-1", role: "thinking", text: "一", _turnTapeOrdinal: 1 })],
-      null,
-    );
-    sock.collapseTurnProcess("s1", "turn-process:tape-1");
-    expect(session.messages.some((message) => message.id === "thinking-1")).toBe(false);
-    expect(session.messages.find((message) => message.id === "srv-a-t1")?.text).toBe("真实最终回答");
-    expect(session.messages.find((message) => message.id === "turn-process:tape-1")?._turnTapeProcessExpanded)
-      .toBe(false);
-  });
-
   test("IndexedDB snapshot stores only the small control and genuine narrative, never fetched process copies", () => {
     const { sock } = seed();
-    sock.applyExpandedTapeRecords(
+    sock.applyTapeRecordsPage(
       "s1",
       "turn-process:tape-1",
       [srvRow({ id: "thinking-1", role: "thinking", text: "一", _turnTapeOrdinal: 1 })],
