@@ -191,6 +191,37 @@ export function messageKind(m: Pick<ChatMessage, "role">): MessageKind {
   }
 }
 
+/**
+ * Low-level engine transport envelopes are not Agent-authored timeline blocks.
+ * The same immutable tape already contains the canonical thinking/tool/plan/
+ * delegate/assistant records produced while parsing these envelopes. Rendering
+ * both copies turns one short answer into hundreds of generic raw-event cards
+ * and can push the real final answer out of the viewport.
+ *
+ * This is presentation-only: no tape bytes are deleted or rewritten. Unknown
+ * future roles and runtime events that are not proven duplicates remain
+ * inspectable. Runtime batches contain only runtime-event rows; bash output
+ * tails are explicitly excluded from batching by the tape writer.
+ */
+export function isRedundantRuntimeEnvelope(message: ChatMessage): boolean {
+  if (
+    message.role !== "runtime-event" ||
+    message._turnTapeProcess ||
+    message._turnStatusRecord
+  ) return false;
+
+  if (message._runtimeSource === "codex-jsonrpc") return true;
+  if (message._runtimeSource !== "ccb") return false;
+
+  const event = message._runtimeEvent;
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  const raw = event as Record<string, unknown>;
+  if (["stream_event", "assistant", "user", "result"].includes(String(raw.type))) {
+    return true;
+  }
+  return raw.type === "system" && (raw.subtype === "init" || raw.subtype === "status");
+}
+
 /** 文本采样：长度 + 尾 16 字符。就地 append（长度单调增）下，长度即可探测增量；
  *  尾采样兜住"等长替换"这类非 append 编辑（现网 audit 提过的边角）。 */
 function textSig(t: string | undefined): string {

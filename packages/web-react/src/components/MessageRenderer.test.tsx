@@ -894,9 +894,19 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(screen.queryByText("m9999")).toBeNull();
   });
 
-  test("每条 runtime-event 都可检查，最终答复也保持可见", () => {
+  test("重复协议包不挤走 immutable 最终答复，非重复 runtime 仍可检查", () => {
+    const onRegenerate = vi.fn();
     const visible: ChatMessage[] = [
       mk("user", { id: "u-visible", text: "可见提问", status: "sent", ts: 1 }),
+      mk("runtime-event", {
+        id: "turn-process:tape-visible",
+        text: "",
+        ts: 1,
+        _turnTapeProcess: true,
+        _turnTapeProcessExpanded: true,
+        _turnTapeProcessCursor: null,
+        _turnTapeId: "tape-visible",
+      }),
       mk("thinking", { id: "th-visible", text: "**可见思考**", ts: 2 }),
       mk("tool", {
         id: "tool-visible",
@@ -907,22 +917,63 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
         _completed: true,
         ts: 3,
       }),
+      mk("runtime-event", {
+        id: "runtime-progress-visible",
+        text: "",
+        ts: 3.5,
+        _runtimeSource: "gateway",
+        _runtimeEvent: { type: "progress", subtype: "tool_delta", exact: "非重复运行事件" },
+      }),
       mk("assistant", { id: "a-visible", text: "可见最终答复", ts: 4 }),
     ];
-    const runtime = Array.from({ length: 120 }, (_, i) => ({
+    const runtime = Array.from({ length: 193 }, (_, i) => ({
       id: `runtime-${i}`,
       role: "runtime-event",
       text: "",
       ts: 5 + i,
-      _runtimeEvent: { type: "system", subtype: "raw_frame", index: i },
+      _runtimeSource: "ccb",
+      _runtimeEvent: { type: "stream_event", event: { index: i } },
     })) as unknown as ChatMessage[];
+    const batchLocator = mk("runtime-event", {
+      id: "srv-turn-runtime-batch-0-127-aabbccddeeff",
+      text: "",
+      ts: 300,
+      _payloadDeferred: true,
+      _turnTapeId: "tape-visible",
+      _recordOrdinal: 99,
+    });
+    const onFetchTapeRecordPayload = vi.fn().mockResolvedValue([
+      mk("runtime-event", {
+        id: "batch-duplicate",
+        _runtimeSource: "ccb",
+        _runtimeEvent: { type: "stream_event", event: { type: "message_delta" } },
+      }),
+      mk("runtime-event", {
+        id: "batch-progress",
+        _runtimeSource: "ccb",
+        _runtimeEvent: { type: "tool_progress", tool_use_id: "tool-visible", elapsed_time_seconds: 1 },
+      }),
+    ]);
 
-    renderList([...visible, ...runtime]);
+    render(
+      <MessageList
+        messages={[...visible, ...runtime, batchLocator]}
+        sending={false}
+        cb={{ onRegenerate, onFetchTapeRecordPayload }}
+        onRespondPermission={() => {}}
+      />,
+    );
 
     expect(screen.getByText("可见提问")).toBeInTheDocument();
     expect(screen.getByText("可见最终答复")).toBeInTheDocument();
     expect(screen.getByText(/已思考/)).toBeInTheDocument();
-    expect(screen.getAllByText("查看原始记录")).toHaveLength(120);
+    expect(screen.getByRole("button", { name: "重新生成" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /progress · tool_delta/ })).toBeInTheDocument();
+    return waitFor(() => {
+      expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(1);
+      expect(screen.getByRole("button", { name: /tool_progress/ })).toBeInTheDocument();
+      expect(screen.queryAllByText("查看原始记录")).toHaveLength(2);
+    });
   });
 
   test("未识别的 immutable tape 角色不会被静默丢弃", () => {
