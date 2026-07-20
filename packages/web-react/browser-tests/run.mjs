@@ -15,6 +15,9 @@
 //   T5 惰性 user sidecar 在真 viewport 水合为原文，重试收到同一份精确 payload;
 //   T6 惰性 Agent tape record 水合为真实 ToolCard，不显示 locator 替身;
 //   T7 点「+」→「设定目标」→ 目标对话框弹出(同菜单的第二入口回归对照)。
+//   T8 长时间线向上惰性分页:pointercancel 清理、同轮惯性只取一页、虚拟 remount
+//      不重取、插页后像素锚定;
+//   T9 第二次明确上滑继续下一 cursor，第一批真实记录仍常驻内存。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -45,7 +48,10 @@ await esbuild.build({
   // This component smoke asserts behavior rather than visual CSS, so keep the
   // real React code while excluding stylesheet/font assets from the IIFE.
   loader: { ".css": "empty" },
-  define: { "process.env.NODE_ENV": '"production"' },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "import.meta.env.MODE": '"production"',
+  },
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
 });
@@ -55,7 +61,8 @@ await esbuild.build({
 // 不参与本测试,故在此内联同义规则)。
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+  .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-scroll-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -184,7 +191,102 @@ await check("T7 点「+」→「设定目标」→ 目标对话框弹出", async
   const goalItem = page.getByText("设定目标");
   await goalItem.waitFor({ state: "visible", timeout: 3000 });
   await goalItem.click();
-  await page.getByRole("dialog").waitFor({ state: "visible", timeout: 3000 });
+  const dialog = page.getByRole("dialog");
+  await dialog.waitFor({ state: "visible", timeout: 3000 });
+  await page.keyboard.press("Escape");
+  await dialog.waitFor({ state: "hidden", timeout: 3000 });
+});
+
+let firstAnchorTop = 0;
+await check("T8 pointercancel/同轮惯性不连拉，插页像素锚定且 remount 不重取", async () => {
+  const root = page.locator("#timeline-scroll-root .timeline-scroll-probe");
+  await root.waitFor({ state: "visible", timeout: 3000 });
+  await page.evaluate(() => {
+    const node = document.querySelector("#timeline-scroll-root .timeline-scroll-probe");
+    if (!(node instanceof HTMLElement)) throw new Error("missing scroll probe");
+    node.scrollTop = 80;
+  });
+  await page.waitForTimeout(50);
+  const rootBox = await root.boundingBox();
+  if (!rootBox) throw new Error("scroll probe has no layout box");
+  await root.dispatchEvent("pointerdown", {
+    pointerType: "mouse",
+    pointerId: 77,
+    button: 0,
+    buttons: 1,
+    clientX: rootBox.x + rootBox.width - 1,
+    clientY: rootBox.y + 30,
+  });
+  await page.evaluate(() => {
+    window.dispatchEvent(new PointerEvent("pointercancel", { pointerType: "mouse", pointerId: 77 }));
+    const node = document.querySelector("#timeline-scroll-root .timeline-scroll-probe");
+    if (!(node instanceof HTMLElement)) throw new Error("missing scroll probe");
+    node.scrollTop = 0;
+  });
+  await page.waitForTimeout(180);
+  const afterCancel = await page.evaluate(() => window.__scrollTimeline.calls);
+  if (afterCancel.length !== 0) {
+    throw new Error(`pointercancel 后程序滚动被误判为手势:${JSON.stringify(afterCancel)}`);
+  }
+  const anchor = root.locator('[data-chat-virtual-key^="tape-page:scroll-tail-page:"]').first();
+  await anchor.waitFor({ state: "attached", timeout: 3000 });
+  const beforeBox = await anchor.boundingBox();
+  if (!beforeBox) throw new Error("tail anchor has no layout box before paging");
+  firstAnchorTop = beforeBox.y;
+
+  await root.hover();
+  await page.mouse.wheel(0, -120);
+  await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 1, null, { timeout: 3000 });
+  // The request resolves in 40ms. A second event from the same wheel/trackpad
+  // inertia burst must not become a second cursor merely because the network
+  // was faster than the gesture.
+  await page.mouse.wheel(0, -80);
+  await page.waitForTimeout(120);
+  const afterInertia = await page.evaluate(() => window.__scrollTimeline.calls);
+  if (JSON.stringify(afterInertia) !== JSON.stringify([200])) {
+    throw new Error(`同一惯性 burst 连拉了多页:${JSON.stringify(afterInertia)}`);
+  }
+  const afterBox = await anchor.boundingBox();
+  if (!afterBox) throw new Error("tail anchor disappeared after older page merge");
+  const delta = Math.abs(afterBox.y - firstAnchorTop);
+  if (delta > 2) throw new Error(`插页后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+
+  // Force the process row out of Virtuoso overscan and back using programmatic
+  // scroll only. This is the exact production remount that used to refetch.
+  await page.evaluate(() => {
+    const node = document.querySelector("#timeline-scroll-root .timeline-scroll-probe");
+    if (!(node instanceof HTMLElement)) throw new Error("missing scroll probe");
+    node.scrollTop = node.scrollHeight;
+  });
+  await page.waitForTimeout(150);
+  await page.evaluate(() => {
+    const node = document.querySelector("#timeline-scroll-root .timeline-scroll-probe");
+    if (!(node instanceof HTMLElement)) throw new Error("missing scroll probe");
+    node.scrollTop = 0;
+  });
+  await page.waitForTimeout(300);
+  const state = await page.evaluate(() => window.__scrollTimeline);
+  if (JSON.stringify(state.calls) !== JSON.stringify([200])) {
+    throw new Error(`虚拟 remount 重复请求了 cursor:${JSON.stringify(state.calls)}`);
+  }
+  if (state.messageCount !== 163) {
+    throw new Error(`首批记录未常驻:messageCount=${state.messageCount},应为163`);
+  }
+});
+
+await check("T9 新的明确上滑只继续下一 cursor，已加载记录不丢", async () => {
+  const root = page.locator("#timeline-scroll-root .timeline-scroll-probe");
+  await root.hover();
+  await page.mouse.wheel(0, -120);
+  await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 2, null, { timeout: 3000 });
+  await page.waitForTimeout(200);
+  const state = await page.evaluate(() => window.__scrollTimeline);
+  if (JSON.stringify(state.calls) !== JSON.stringify([200, 100])) {
+    throw new Error(`cursor 顺序/次数错误:${JSON.stringify(state.calls)}`);
+  }
+  if (state.messageCount !== 227) {
+    throw new Error(`第二批合并后真实记录有丢失/替换:messageCount=${state.messageCount},应为227`);
+  }
 });
 
 if (pageErrors.length > 0) {

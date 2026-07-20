@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
+import { UserUpwardPagingController } from "../../lib/chat/tapePaging";
 import { MessageRenderer } from "../MessageRenderer";
 import { TurnProcessCard, type CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
@@ -117,6 +118,60 @@ describe("TurnProcessCard", () => {
     act(() => observers.at(-1)!.trigger(true));
     await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
     expect(onLoadOlderTape).toHaveBeenNthCalledWith(2, "turn-process:tape-1", "tape-1", null);
+  });
+
+  test("production controller requires a new upward gesture for each older cursor across virtual remounts", async () => {
+    const observers: Array<{ trigger: () => void }> = [];
+    class FakeIntersectionObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {
+        observers.push({
+          trigger: () => this.callback(
+            [{ isIntersecting: true } as IntersectionObserverEntry],
+            this as unknown as IntersectionObserver,
+          ),
+        });
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    const paging = new UserUpwardPagingController();
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 100 });
+    const cb = { onLoadOlderTape };
+    const first = processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 });
+    const view = render(
+      <TurnProcessCard msg={first} cb={cb} paging={paging} historyGeneration={7} />,
+    );
+
+    act(() => observers.at(-1)!.trigger());
+    expect(onLoadOlderTape).not.toHaveBeenCalled();
+    act(() => {
+      paging.signalUpwardIntent();
+      observers.at(-1)!.trigger();
+    });
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+
+    const second = processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 100 });
+    view.rerender(<TurnProcessCard msg={second} cb={cb} paging={paging} historyGeneration={7} />);
+    act(() => observers.at(-1)!.trigger());
+    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+    render(<TurnProcessCard msg={second} cb={cb} paging={paging} historyGeneration={7} />);
+    act(() => observers.at(-1)!.trigger());
+    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
+    act(() => {
+      paging.signalUpwardIntent();
+      observers.at(-1)!.trigger();
+    });
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenNthCalledWith(
+      2, "turn-process:tape-1", "tape-1", 100,
+    ));
   });
 });
 

@@ -2226,7 +2226,7 @@ export class ChatSocket {
     const s = this.sessions.get(sessId);
     if (!s) return;
     const next = mergeTapePage(s.messages, anchorId, records, nextCursor);
-    if (!next) return;
+    if (!next || next === s.messages) return;
     s.messages = next;
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();

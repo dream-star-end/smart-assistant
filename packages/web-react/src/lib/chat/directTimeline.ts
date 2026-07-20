@@ -120,12 +120,18 @@ export function mergeTapePage(
   );
   if (anchorIndex < 0) return null;
   const sourceAnchor = messages[anchorIndex]!;
+  const key = turnTapeProcessKey(sourceAnchor);
+  const pageKey = `${key}::${sourceAnchor._turnTapeProcessExpanded === true
+    ? `before:${String(sourceAnchor._turnTapeProcessCursor)}`
+    : "tail"}`;
   const anchor: ChatMessage = {
     ...sourceAnchor,
     _turnTapeProcessExpanded: true,
     _turnTapeProcessCursor: nextCursor,
   };
-  const key = turnTapeProcessKey(sourceAnchor);
+  const anchorChanged =
+    sourceAnchor._turnTapeProcessExpanded !== true ||
+    sourceAnchor._turnTapeProcessCursor !== nextCursor;
   const isSameTapeRecord = (message: ChatMessage): boolean =>
     message.id !== sourceAnchor.id &&
     message._turnTapeId === sourceAnchor._turnTapeId &&
@@ -138,16 +144,19 @@ export function mergeTapePage(
     messages.filter((message) => !isSameTapeRecord(message)).map((message) => message.id),
   );
   const mergedSection = [...existingSection];
+  let added = false;
   for (const record of Array.isArray(records) ? records : []) {
     if (
       !record || typeof record.id !== "string" || record.id.length === 0 ||
       sectionIds.has(record.id) || idsOutsideSection.has(record.id)
     ) continue;
     sectionIds.add(record.id);
+    added = true;
     mergedSection.push({
       ...record,
       _source: "server",
       _turnTapeProcessLoadedFrom: key,
+      _turnTapeProcessPageKey: pageKey,
       _turnTapeId: sourceAnchor._turnTapeId,
       _turnTapeSha256: sourceAnchor._turnTapeSha256,
       _turnTapeComplete: true,
@@ -162,6 +171,7 @@ export function mergeTapePage(
         : sourceAnchor.ts,
     });
   }
+  if (!added && !anchorChanged) return messages;
   const originalPosition = new Map(mergedSection.map((message, index) => [message.id, index]));
   const ordinalOf = (message: ChatMessage): number =>
     typeof message._turnTapeOrdinal === "number"

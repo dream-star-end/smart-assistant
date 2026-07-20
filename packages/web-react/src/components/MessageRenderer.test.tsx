@@ -189,10 +189,25 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(screen.getByText("已送达")).toBeInTheDocument();
   });
 
-  test("thinking：流式态显示「思考中…」并展开", () => {
+  test("thinking：流式态使用稳定的「思考过程」标题并展开", () => {
     renderMsg(mk("thinking", { text: "推理中..." }), { isLast: true, sending: true });
-    expect(screen.getByText("思考中…")).toBeInTheDocument();
+    expect(screen.getByText("思考过程")).toBeInTheDocument();
     expect(screen.getByText("推理中...")).toBeInTheDocument();
+  });
+
+  test("用户时间线不暴露原始思考 JSON 入口，真实思考正文仍完整可见", () => {
+    const marker = "EXACT_VISIBLE_THINKING_BODY";
+    renderMsg(mk("thinking", {
+      id: "thinking-no-raw",
+      text: marker,
+      _turnTapeId: "tape-thinking",
+      _turnTapeComplete: true,
+      _eventHistory: [{ internal: "RAW_THINKING_JSON_MUST_NOT_BE_A_UI_ENTRY" }],
+    }));
+    fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
+    expect(screen.getByText(marker)).toBeInTheDocument();
+    expect(screen.queryByText(/查看原始思考记录/)).toBeNull();
+    expect(document.body.textContent).not.toContain("RAW_THINKING_JSON_MUST_NOT_BE_A_UI_ENTRY");
   });
 
   test("thinking：完成态截断标题保留完整悬浮文本", () => {
@@ -875,7 +890,7 @@ describe("MetaRow turn 终态门控(积分/请求ID 不得先于 turn 结束出�
   });
 });
 
-describe("MessageList 归档分页按钮三态(§4/§5)", () => {
+describe("MessageList 归档无感分页(§4/§5)", () => {
   const noArchive = { archivedCount: 0, archivedThroughSeq: 0, loading: false, error: false };
   function renderList(messages: ChatMessage[], archive?: Partial<typeof noArchive> & { onLoadOlder?: () => void }) {
     const onLoadOlder = archive?.onLoadOlder ?? (() => {});
@@ -898,9 +913,8 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(screen.getByText("m0")).toBeInTheDocument();
     expect(screen.getByText("m129")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /向上滚动加载更早历史（还有 500 条）/ })).toHaveClass(
-      "[@media(hover:none)]:min-h-11",
-    );
+    expect(screen.getByTestId("history-page-loader")).toHaveClass("h-px");
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   test("无归档时不造客户端 100 条总量上限", () => {
@@ -1071,11 +1085,10 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(screen.queryByText("绝不能展示的 checkpoint")).toBeNull();
   });
 
-  test("本地翻尽 + 有归档未拉 → 云端加载按钮,还有 M 条(§5 文案)", () => {
+  test("本地翻尽 + 有归档未拉 → 保留无感加载哨兵，不插入可见按钮", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
-    expect(
-      screen.getByRole("button", { name: /向上滚动加载更早历史（还有 500 条）/ }),
-    ).toHaveClass("[@media(hover:none)]:min-h-11");
+    expect(screen.getByTestId("history-page-loader")).toHaveClass("h-px");
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   test("本地翻尽 + 无归档 → 无按钮", () => {
@@ -1083,28 +1096,18 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  test("云端加载中 → 按钮显示「加载中…」且禁用", () => {
+  test("云端加载中 → 仅保留无布局高度的无障碍状态", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, loading: true });
-    const btn = screen.getByRole("button");
-    expect(btn).toHaveTextContent(/加载中/);
-    expect(btn).toBeDisabled();
-    // loading 时不显示 §5 文案(避免与 spinner 并存的抖动)。
-    expect(screen.queryByText(/向上滚动加载更早历史/)).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("正在加载更早消息");
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", () => {
     const onLoadOlder = vi.fn();
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, error: true, onLoadOlder });
-    const btn = screen.getByRole("button", { name: /加载失败，点击重试/ });
+    const btn = screen.getByRole("button", { name: /更早消息加载失败，点击重试/ });
     expect(btn).not.toBeDisabled();
     fireEvent.click(btn);
-    expect(onLoadOlder).toHaveBeenCalledTimes(1);
-  });
-
-  test("点击云端按钮 → 触发 onLoadOlder", () => {
-    const onLoadOlder = vi.fn();
-    renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, onLoadOlder });
-    fireEvent.click(screen.getByRole("button", { name: /向上滚动加载更早历史/ }));
     expect(onLoadOlder).toHaveBeenCalledTimes(1);
   });
 
@@ -1120,10 +1123,9 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
     // 刚拉回的归档行未被再次藏起 → arch0 / arch99 都在 DOM。
     expect(screen.getByText("arch0")).toBeInTheDocument();
     expect(screen.getByText("arch99")).toBeInTheDocument();
-    // 仍是云端态,剩余 = 500-100 = 400,无本地翻页按钮。
-    expect(
-      screen.getByRole("button", { name: /向上滚动加载更早历史（还有 400 条）/ }),
-    ).toBeInTheDocument();
+    // 仍是云端态,剩余 = 500-100 = 400；已加载行常驻，顶部仍为无感哨兵。
+    expect(screen.getByTestId("history-page-loader")).toHaveClass("h-px");
+    expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByText(/加载更多历史/)).toBeNull();
   });
 });
@@ -1148,7 +1150,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
     expect(screen.getByText(/已思考 · Creating generated tool-card-demo\.txt file/)).toBeInTheDocument();
   });
 
-  test("组内末条流式(sending)→ 整卡「思考中…」,不显示「已思考」", () => {
+  test("组内末条流式(sending)→ 整卡稳定显示「思考过程」,不显示「已思考」", () => {
     renderList(
       [
         mk("user", { id: "u1", text: "q", status: "sent" }),
@@ -1157,7 +1159,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
       ],
       true,
     );
-    expect(screen.getByText("思考中…")).toBeInTheDocument();
+    expect(screen.getByText("思考过程")).toBeInTheDocument();
     expect(screen.queryByText(/已思考/)).toBeNull();
   });
 
@@ -1222,8 +1224,132 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText("思考中…")).toBeInTheDocument();
+    expect(screen.getByText("思考过程")).toBeInTheDocument();
     expect(screen.getByText("推理中...")).toBeInTheDocument();
+  });
+});
+
+describe("长时间线虚拟分页与活跃状态稳定性", () => {
+  const processRow = (
+    id: string,
+    pageKey: string,
+    ordinal: number,
+  ): ChatMessage => ({
+    id,
+    role: "system",
+    text: `真实过程 ${id}`,
+    ts: ordinal,
+    _source: "server",
+    _turnTapeId: "tape-chunks",
+    _turnTapeOrdinal: ordinal,
+    _turnTapeProcessLoadedFrom: "tape-chunks::sha::turn-process:tape-chunks",
+    _turnTapeProcessPageKey: pageKey,
+  } as ChatMessage);
+
+  test("物理页按有界渲染 chunk 虚拟化且绝不跨 pageKey 合并", () => {
+    const pageA = Array.from({ length: 70 }, (_, index) => processRow(`a-${index}`, "page-a", index));
+    const pageB = Array.from({ length: 35 }, (_, index) => processRow(`b-${index}`, "page-b", 100 + index));
+    const { container } = render(
+      <MessageList
+        messages={[...pageA, ...pageB]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+
+    const chunks = Array.from(container.querySelectorAll<HTMLElement>("[data-tape-page-chunk]"));
+    expect(chunks).toHaveLength(5);
+    expect(chunks.every((chunk) => Number(chunk.dataset.chunkItems) <= 32)).toBe(true);
+    expect(chunks.map((chunk) => chunk.dataset.tapePageKey)).toEqual([
+      "page-a", "page-a", "page-a", "page-b", "page-b",
+    ]);
+    expect(screen.getByText("真实过程 a-0")).toBeInTheDocument();
+    expect(screen.getByText("真实过程 b-34")).toBeInTheDocument();
+  });
+
+  test("sending 期间只有一份同 DOM 活动状态，tool/thinking/assistant 切换不再闪烁", () => {
+    const user = mk("user", { id: "stable-user", text: "问题", status: "sent" });
+    const tool = mk("tool", {
+      id: "stable-tool",
+      toolName: "Bash",
+      inputJson: { command: "sleep 1" },
+      _completed: false,
+    });
+    const view = render(
+      <MessageList
+        messages={[user, tool]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    const status = screen.getByLabelText("生成中");
+    expect(screen.getAllByLabelText("生成中")).toHaveLength(1);
+
+    const thinking = mk("thinking", { id: "stable-thinking", text: "真实思考过程" });
+    view.rerender(
+      <MessageList
+        messages={[user, tool, thinking]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getAllByLabelText("生成中")).toHaveLength(1);
+    expect(screen.getByLabelText("生成中")).toBe(status);
+    expect(screen.getByText("思考过程")).toBeInTheDocument();
+
+    const assistant = mk("assistant", { id: "stable-answer", text: "正在生成正文" });
+    view.rerender(
+      <MessageList
+        messages={[user, tool, thinking, assistant]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getAllByLabelText("生成中")).toHaveLength(1);
+    expect(screen.getByLabelText("生成中")).toBe(status);
+  });
+
+  test("生产 Virtuoso Footer 组件身份稳定，stream delta 不重挂活动 DOM", async () => {
+    const scroller = document.createElement("div");
+    document.body.append(scroller);
+    const user = mk("user", { id: "virtual-user", text: "问题", status: "sent" });
+    const tool = mk("tool", {
+      id: "virtual-tool",
+      toolName: "Bash",
+      inputJson: { command: "sleep 1" },
+      _completed: false,
+    });
+    const view = render(
+      <MessageList
+        messages={[user, tool]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+      { container: scroller },
+    );
+    const status = await screen.findByLabelText("生成中");
+
+    view.rerender(
+      <MessageList
+        messages={[user, tool, mk("thinking", { id: "virtual-thinking", text: "真实思考" })]}
+        sending
+        turnActivity={{ startedAt: Date.now(), agentName: "助手" }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+      />,
+    );
+    expect(await screen.findByLabelText("生成中")).toBe(status);
   });
 });
 

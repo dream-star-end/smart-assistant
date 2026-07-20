@@ -1721,7 +1721,7 @@ export function App() {
     };
     const realign = () => {
       setVisualViewportVars();
-      if (!stickToBottomRef.current && !sending) return;
+      if (!stickToBottomRef.current) return;
       if (typeof requestAnimationFrame === "function") {
         if (raf !== null) cancelAnimationFrame(raf);
         raf = requestAnimationFrame(() => {
@@ -1758,7 +1758,7 @@ export function App() {
       document.documentElement.style.removeProperty("--oc-visual-height-85");
       document.documentElement.style.removeProperty("--oc-visual-offset-top");
     };
-  }, [inWorkspace, sending, scrollToChatBottom]);
+  }, [inWorkspace, scrollToChatBottom]);
 
   useEffect(() => {
     if (!inWorkspace) return;
@@ -2070,6 +2070,7 @@ export function App() {
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}
                 scrollParent={chatScrollParent}
+                historyGeneration={activeSess?._historyRevision ?? "legacy"}
               />
             </ResponseRatingProvider>
           )}

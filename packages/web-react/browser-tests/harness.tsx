@@ -5,10 +5,11 @@
 //
 // stub 原则:只 stub 网络/宿主副作用(上传/发送/目标提交),不 stub 任何 UI 结构;
 // onUpload 立即 resolve → 附件 chip 无后端也能走到 done 态,CI 零外部依赖。
-import { StrictMode } from "react";
+import { StrictMode, useCallback, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
-import { MessageRenderer } from "../src/components/MessageRenderer";
+import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
+import { mergeTapePage } from "../src/lib/chat/directTimeline";
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 
@@ -27,11 +28,17 @@ declare global {
       };
       tapeFetch: null | { tapeId: string; ordinal: number; recordId: string; role: string };
     };
+    __scrollTimeline: {
+      calls: Array<number | null>;
+      mergedPages: number;
+      messageCount: number;
+    };
   }
 }
 window.__sends = [];
 window.__uploads = [];
 window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userRetry: null, tapeFetch: null };
+window.__scrollTimeline = { calls: [], mergedPages: 0, messageCount: 0 };
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
   window.__uploads.push(file.name);
@@ -144,4 +151,106 @@ createRoot(document.getElementById("timeline-agent-root")!).render(
       onRespondPermission={() => {}}
     />
   </StrictMode>,
+);
+
+const processControl: ChatMessage = {
+  id: "turn-process:scroll-tape",
+  role: "runtime-event",
+  text: "",
+  ts: 2,
+  _source: "server",
+  _turnTapeProcess: true,
+  _turnTapeProcessExpanded: true,
+  _turnTapeProcessCursor: 200,
+  _turnTapeId: "scroll-tape",
+  _turnTapeSha256: "scroll-sha",
+};
+const processKey = "scroll-tape::scroll-sha::turn-process:scroll-tape";
+const initialTail: ChatMessage[] = Array.from({ length: 96 }, (_, index) => ({
+  id: `scroll-tail-${index}`,
+  role: "system",
+  text: `SCROLL_TAIL_${index}`,
+  ts: 10 + index,
+  _source: "server",
+  _turnTapeId: "scroll-tape",
+  _turnTapeSha256: "scroll-sha",
+  _turnTapeOrdinal: 200 + index,
+  _turnTapeProcessLoadedFrom: processKey,
+  _turnTapeProcessPageKey: "scroll-tail-page",
+  _turnTapeComplete: true,
+}));
+
+function olderPage(before: number): ChatMessage[] {
+  const start = before === 200 ? 136 : 72;
+  return Array.from({ length: 64 }, (_, index) => ({
+    id: `scroll-old-${before}-${index}`,
+    role: "system",
+    text: `SCROLL_OLDER_${before}_${index}`,
+    ts: start + index,
+    _source: "server",
+    _turnTapeOrdinal: start + index,
+  } as ChatMessage));
+}
+
+function ScrollTimelineProbe() {
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: "scroll-user",
+      role: "user",
+      text: "SCROLL_USER_QUESTION",
+      ts: 1,
+      status: "replied",
+      _source: "server",
+    },
+    processControl,
+    ...initialTail,
+    {
+      id: "scroll-answer",
+      role: "assistant",
+      text: "SCROLL_FINAL_ANSWER",
+      ts: 500,
+      _source: "server",
+    },
+  ]);
+  const loadOlder = useCallback(async (
+    anchorId: string,
+    tapeId: string,
+    before: number | null,
+  ) => {
+    window.__scrollTimeline.calls.push(before);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    if (anchorId !== processControl.id || tapeId !== processControl._turnTapeId || before === null) {
+      return { ok: false, error: true };
+    }
+    const nextCursor = before === 200 ? 100 : null;
+    setMessages((current) => {
+      const merged = mergeTapePage(current, anchorId, olderPage(before), nextCursor);
+      if (merged && merged !== current) window.__scrollTimeline.mergedPages += 1;
+      return merged ?? current;
+    });
+    return { ok: true, nextCursor };
+  }, []);
+  window.__scrollTimeline.messageCount = messages.length;
+  return (
+    <div
+      ref={setScroller}
+      className="chat-scroll-area timeline-scroll-probe"
+      data-testid="timeline-scroll-probe"
+      tabIndex={0}
+    >
+      <MessageList
+        messages={messages}
+        sending={false}
+        cb={{ onLoadOlderTape: loadOlder }}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration={7}
+      />
+    </div>
+  );
+}
+
+createRoot(document.getElementById("timeline-scroll-root")!).render(
+  <StrictMode><ScrollTimelineProbe /></StrictMode>,
 );

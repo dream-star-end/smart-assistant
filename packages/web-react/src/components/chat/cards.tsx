@@ -23,8 +23,9 @@ import {
   Wallet,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
-import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
+import type { UserUpwardPagingController } from "../../lib/chat/tapePaging";
 import {
   CONTINUE_PROMPT,
   childSignature,
@@ -55,6 +56,9 @@ export type RenderCtx = {
    *  评价反馈行 —— 一轮里穿插的中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
    *  缺省 false(非 assistant / 单条兜底路径不渲染评价行,与历史一致)。 */
   turnFinalAssistant?: boolean;
+  /** MessageList 以稳定 footer 独占本轮活动提示，避免 assistant/tool/thinking
+   *  角色切换时反复挂卸同一行。单卡调用方缺省仍保留原行为。 */
+  activityInFooter?: boolean;
 };
 
 /** 逐条反馈上下文（请求ID + 关联键）。P6 反馈弹窗消费；本期由 App 兜底。 */
@@ -350,19 +354,85 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
 // ═══════════════ 真实 Agent 过程向上惰性加载哨兵 ═══════════════
 /** 默认时间线直接渲染真实思考、工具、委派和运行事件。这个零内容哨兵只负责
  * 从 tape 尾页开始向前取更早的 immutable records；它不是 Agent 内容或摘要卡。 */
-export function TurnProcessCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbacks }) {
+type ViewportAnchor = {
+  scroller: HTMLElement;
+  key: string;
+  top: number;
+};
+
+function virtualItemKey(element: HTMLElement): string | null {
+  const key = element.dataset.chatVirtualKey;
+  return typeof key === "string" && key.length > 0 ? key : null;
+}
+
+/** Capture a real row after the process cursor. Older tape pages are inserted
+ * before that row, so restoring its exact viewport offset keeps the content
+ * under the user's eyes pixel-stable even when Virtuoso remeasures rows. */
+function captureViewportAnchor(sentinel: HTMLElement | null): ViewportAnchor | null {
+  const scroller = sentinel?.closest<HTMLElement>(".chat-scroll-area");
+  const control = sentinel?.closest<HTMLElement>("[data-chat-virtual-key]");
+  if (!scroller || !control) return null;
+  const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"));
+  const controlIndex = rows.indexOf(control);
+  if (controlIndex < 0) return null;
+  const viewport = scroller.getBoundingClientRect();
+  const candidates = rows.slice(controlIndex + 1);
+  const row = candidates.find((candidate) => candidate.getBoundingClientRect().bottom > viewport.top)
+    ?? candidates[0];
+  if (!row) return null;
+  const key = virtualItemKey(row);
+  if (!key) return null;
+  return { scroller, key, top: row.getBoundingClientRect().top - viewport.top };
+}
+
+function restoreViewportAnchor(
+  anchor: ViewportAnchor | null,
+  paging: UserUpwardPagingController | undefined,
+): void {
+  if (!anchor || typeof requestAnimationFrame !== "function") return;
+  let frames = 0;
+  const correct = () => {
+    frames += 1;
+    const row = Array.from(
+      anchor.scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+    ).find((candidate) => virtualItemKey(candidate) === anchor.key);
+    if (row) {
+      const currentTop = row.getBoundingClientRect().top - anchor.scroller.getBoundingClientRect().top;
+      const delta = currentTop - anchor.top;
+      if (Math.abs(delta) > 0.5) {
+        const nextTop = anchor.scroller.scrollTop + delta;
+        // Record the programmatic correction before assigning scrollTop so it
+        // can never masquerade as another upward user gesture.
+        paging?.syncScrollTop(nextTop);
+        anchor.scroller.scrollTop = nextTop;
+      }
+    }
+    // React notification + Virtuoso measurement can span several frames.
+    // Re-apply the exact residual delta; this never fetches or hides content.
+    if (frames < 12) requestAnimationFrame(correct);
+  };
+  requestAnimationFrame(correct);
+}
+
+export function TurnProcessCard({
+  msg,
+  cb,
+  paging,
+  historyGeneration = "legacy",
+}: {
+  msg: ChatMessage;
+  cb: CardCallbacks;
+  paging?: UserUpwardPagingController;
+  historyGeneration?: number | string;
+}) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const loadingRef = useRef(false);
-  const armedRef = useRef(true);
+  // Direct/single-card surfaces retain a tiny local single-flight fallback.
+  // Production MessageList always owns the controller outside virtual rows.
   const requestedCursorRef = useRef<string | null>(null);
   const controlStateRef = useRef({ id: msg.id, tapeId: msg._turnTapeId, initialized: false });
-  const scrollAnchorRef = useRef<{
-    element: HTMLElement;
-    height: number;
-    top: number;
-  } | null>(null);
   const loadRef = useRef<(manual?: boolean) => void>(() => {});
   const initialized = msg._turnTapeProcessExpanded === true;
   const before = initialized && typeof msg._turnTapeProcessCursor === "number"
@@ -371,37 +441,38 @@ export function TurnProcessCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbac
   const complete = initialized && msg._turnTapeProcessCursor === null;
   const tapeId = msg._turnTapeId;
   const canLoad = !!cb.onLoadOlderTape && typeof tapeId === "string" && tapeId.length > 0;
+  const generation = `${String(historyGeneration)}::${msg.id}::${tapeId ?? ""}::${msg._turnTapeSha256 ?? ""}`;
 
   const loadPage = async (manual = false) => {
     if (!cb.onLoadOlderTape || !tapeId || complete || loadingRef.current) return;
     const cursorKey = initialized ? String(before) : "tail";
-    if (!manual && requestedCursorRef.current === cursorKey) return;
+    if (!manual) {
+      if (paging) {
+        if (!paging.begin(generation, initialized)) return;
+      } else if (requestedCursorRef.current === cursorKey) {
+        return;
+      }
+    }
     requestedCursorRef.current = cursorKey;
     loadingRef.current = true;
     setLoading(true);
     setError(false);
-    const scroller = sentinelRef.current?.closest<HTMLElement>(".chat-scroll-area");
-    if (scroller) {
-      scrollAnchorRef.current = {
-        element: scroller,
-        height: scroller.scrollHeight,
-        top: scroller.scrollTop,
-      };
-    }
+    const viewportAnchor = captureViewportAnchor(sentinelRef.current);
     try {
       const res = await cb.onLoadOlderTape(msg.id, tapeId, before);
       if (!res.ok) {
         requestedCursorRef.current = null;
-        scrollAnchorRef.current = null;
         if (res.error) setError(true);
+      } else {
+        restoreViewportAnchor(viewportAnchor, paging);
       }
     } catch {
       requestedCursorRef.current = null;
-      scrollAnchorRef.current = null;
       setError(true);
     } finally {
       loadingRef.current = false;
       setLoading(false);
+      paging?.settle(generation);
     }
   };
   loadRef.current = (manual = false) => { void loadPage(manual); };
@@ -416,15 +487,15 @@ export function TurnProcessCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbac
       previous.id !== msg.id || previous.tapeId !== tapeId ||
       (previous.initialized && !initialized)
     ) {
-      armedRef.current = true;
       requestedCursorRef.current = null;
+      paging?.reset(generation);
     }
     controlStateRef.current = { id: msg.id, tapeId, initialized };
-  }, [initialized, msg.id, tapeId]);
+  }, [generation, initialized, msg.id, paging, tapeId]);
 
-  // Observer lifecycle is independent of cursor/loading. After one trigger it
-  // must observe a real exit before it can arm again, so a cursor re-render can
-  // never cascade through the whole tape while the sentinel stays visible.
+  // Intersection only establishes proximity. Initialized cursors additionally
+  // require an explicit upward user epoch from the MessageList controller, so
+  // remounts, measurements and programmatic anchor corrections cannot cascade.
   useEffect(() => {
     const node = sentinelRef.current;
     if (!node || !canLoad || complete) return;
@@ -432,55 +503,42 @@ export function TurnProcessCard({ msg, cb }: { msg: ChatMessage; cb: CardCallbac
       loadRef.current(false);
       return;
     }
+    let visible = false;
+    const maybeLoad = () => {
+      if (visible) loadRef.current(false);
+    };
     const observer = new IntersectionObserver((entries) => {
-      const intersecting = entries.some((entry) => entry.isIntersecting);
-      if (!intersecting) {
-        armedRef.current = true;
-        return;
-      }
-      if (!armedRef.current) return;
-      armedRef.current = false;
-      loadRef.current(false);
+      visible = entries.some((entry) => entry.isIntersecting);
+      maybeLoad();
     }, { rootMargin: "240px 0px" });
     observer.observe(node);
-    return () => observer.disconnect();
-  }, [canLoad, complete, initialized, msg.id, tapeId]);
-
-  // Loading an older page inserts rows before the previously visible page.
-  // Preserve the user's viewport by the same height-delta rule used by archive
-  // pagination; the sentinel then genuinely exits and may re-arm later.
-  useLayoutEffect(() => {
-    const anchor = scrollAnchorRef.current;
-    if (!anchor) return;
-    if (anchor.element.scrollHeight > anchor.height) {
-      anchor.element.scrollTop = anchor.top + (anchor.element.scrollHeight - anchor.height);
-      scrollAnchorRef.current = null;
-    }
-  }, [initialized, msg._turnTapeProcessCursor]);
+    const scroller = node.closest<HTMLElement>(".chat-scroll-area");
+    scroller?.addEventListener("scroll", maybeLoad, { passive: true });
+    scroller?.addEventListener("oc-upward-page-intent", maybeLoad);
+    return () => {
+      observer.disconnect();
+      scroller?.removeEventListener("scroll", maybeLoad);
+      scroller?.removeEventListener("oc-upward-page-intent", maybeLoad);
+    };
+  }, [canLoad, complete, generation, initialized, msg.id, tapeId]);
 
   if (complete) return null;
 
   return (
     <div
       ref={sentinelRef}
-      className="flex min-h-8 items-center justify-center py-1 text-xs text-muted"
+      className={error || !canLoad
+        ? "flex min-h-8 items-center justify-center py-1 text-xs text-muted"
+        : "h-px overflow-hidden"}
       data-testid="turn-process-loader"
     >
-      {loading ? (
-        <span className="inline-flex items-center gap-1.5" role="status">
-          <Spinner size={12} /> 正在加载真实记录…
-        </span>
-      ) : error ? (
+      {error ? (
         <button type="button" className="text-danger" onClick={() => loadRef.current(true)}>
           更早记录加载失败，点击重试
         </button>
-      ) : canLoad ? (
-        <button type="button" className="text-faint hover:text-muted" onClick={() => loadRef.current(true)}>
-          向上滚动加载更早记录
-        </button>
-      ) : (
+      ) : !canLoad ? (
         <span className="text-danger">真实记录暂时无法读取</span>
-      )}
+      ) : loading ? <span className="sr-only">正在加载真实记录</span> : null}
     </div>
   );
 }
@@ -632,7 +690,7 @@ export function AssistantCard({
           <ProgressiveMarkdown text={msg.text} live={live} />
         ) : hasError && presentedError?.bodyText ? (
           <ProgressiveMarkdown text={presentedError.bodyText} />
-        ) : live && !hasError ? (
+        ) : live && !hasError && !ctx.activityInFooter ? (
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
         {live && msg.text && !hasError && (
@@ -773,9 +831,10 @@ export const ThinkingCard = memo(
     // 默认折叠态权威仍走 render 层 defaultCollapsed（thinking：流式展开、完成折叠）；用户手动切换后本地锁定。
     const collapsed = userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx);
     const segments = thinkingSegments(msgs.map((m) => m.text));
-    // 折叠态摘要：完成后取最新段首个粗体标题；流式中保持"思考中…"（避免摘要随 delta 抖动）。
+    // 折叠态摘要：完成后取最新段首个粗体标题；流式中保持稳定的"思考过程"
+    // （不随 delta/角色切换闪烁）。
     const summary = live ? null : thinkingSummaryTitle(segments);
-    const headline = live ? "思考中…" : summary ? `已思考 · ${summary}` : "已思考";
+    const headline = live ? "思考过程" : summary ? `已思考 · ${summary}` : "已思考";
     return (
       <div className="rounded-lg border border-border bg-surface/60 animate-in">
         <button

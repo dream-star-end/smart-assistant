@@ -4,6 +4,7 @@ import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
+import { TapePageRequestLedger } from "../lib/chat/tapePaging";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
@@ -232,6 +233,7 @@ export function useChatSocket(opts: {
   const persistRef = useRef<(sessId: string) => void>(() => {});
   const persistDurablyRef = useRef<(sessId: string) => Promise<void>>(async () => {});
   const sigRef = useRef<Map<string, string>>(new Map());
+  const tapePageLedgerRef = useRef(new TapePageRequestLedger());
   // IndexedDB 注水是否完成：持久启用时，connect 须等注水完成，否则首个 hello 不带恢复的
   // 断点续传游标（restored 会话无法 auto-resume，要等下次重连才补）。
   const [hydrationDone, setHydrationDone] = useState(false);
@@ -289,14 +291,15 @@ export function useChatSocket(opts: {
               !detail.isPartial,
               detail.maxSeq,
               {
-              archivedThroughSeq: detail.archivedThroughSeq,
-              archivedCount: detail.archivedCount,
-              completedClientMessageId: context?.clientMessageId,
-              serverUpdatedAt: detail.updatedAt,
-              historyRevision: detail.historyRevision,
-              invalidateHistoryCache: detail._historyRevisionUnsupported === true,
+                archivedThroughSeq: detail.archivedThroughSeq,
+                archivedCount: detail.archivedCount,
+                completedClientMessageId: context?.clientMessageId,
+                serverUpdatedAt: detail.updatedAt,
+                historyRevision: detail.historyRevision,
+                invalidateHistoryCache: detail._historyRevisionUnsupported === true,
               },
             );
+            if (historyRepair) tapePageLedgerRef.current.clearSession(sessId);
           }
           sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
@@ -532,7 +535,10 @@ export function useChatSocket(opts: {
     (sessId, agentId, title) => socket.ensureServerSession(sessId, agentId, title),
     [socket],
   );
-  const removeSession = useCallback((sessId: string) => socket.removeSession(sessId), [socket]);
+  const removeSession = useCallback((sessId: string) => {
+    tapePageLedgerRef.current.clearSession(sessId);
+    socket.removeSession(sessId);
+  }, [socket]);
   const renameSession = useCallback(
     (sessId: string, title: string) => socket.renameSession(sessId, title),
     [socket],
@@ -564,6 +570,7 @@ export function useChatSocket(opts: {
 
   const mergeServerHistory = useCallback<UseChatSocket["mergeServerHistory"]>(
     (p) => {
+      const previousRevision = socket.sessions.get(p.sessId)?._historyRevision;
       socket.applyServerMessages(p.sessId, p.agentId, p.messages, p.full, p.maxSeq, {
         archivedThroughSeq: p.archivedThroughSeq,
         archivedCount: p.archivedCount,
@@ -572,6 +579,10 @@ export function useChatSocket(opts: {
         historyRevision: p.historyRevision,
         invalidateHistoryCache: p.invalidateHistoryCache,
       });
+      const currentRevision = socket.sessions.get(p.sessId)?._historyRevision;
+      if (p.invalidateHistoryCache || previousRevision !== currentRevision) {
+        tapePageLedgerRef.current.clearSession(p.sessId);
+      }
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
     },
     [socket],
@@ -610,26 +621,72 @@ export function useChatSocket(opts: {
     },
     [socket],
   );
-  // Lazy reverse process paging concurrency gate (one request per control row).
-  const expandingTapesRef = useRef<Set<string>>(new Set());
+  // Lazy reverse process paging:network single-flight + successful-cursor
+  // metadata survive virtual row unmounts, while record payloads live only in
+  // the session message array. Every response is fenced by the exact history
+  // generation captured before the request.
   const loadOlderTurnProcess = useCallback<UseChatSocket["loadOlderTurnProcess"]>(
     async (sessId, anchorId, tapeId, before) => {
       const a = authRef.current;
       if (!a || !sessId || !anchorId || !tapeId) return { ok: false };
-      const guardKey = `${sessId}::${anchorId}`;
-      if (expandingTapesRef.current.has(guardKey)) return { ok: false, busy: true };
-      expandingTapesRef.current.add(guardKey);
+      const requestedBefore = typeof before === "number" ? before : null;
+      const session = socket.sessions.get(sessId);
+      const anchor = session?.messages.find((message) => message.id === anchorId);
+      if (!session || !anchor || anchor._turnTapeId !== tapeId || anchor._turnTapeProcess !== true) {
+        return { ok: false };
+      }
+      const initialized = anchor._turnTapeProcessExpanded === true;
+      if (
+        (requestedBefore === null && initialized) ||
+        (requestedBefore !== null && (!initialized || anchor._turnTapeProcessCursor !== requestedBefore))
+      ) return { ok: false };
+      const revision = typeof session._historyRevision === "number" ? session._historyRevision : "legacy";
+      const tapeSha = anchor._turnTapeSha256 ?? "";
+      const requestKey = [
+        sessId,
+        `rev:${String(revision)}`,
+        anchorId,
+        tapeId,
+        tapeSha,
+        requestedBefore === null ? "tail" : `before:${requestedBefore}`,
+      ].join("::");
+      const gate = tapePageLedgerRef.current.begin(requestKey);
+      if (gate.kind === "completed") {
+        return { ok: true, nextCursor: gate.result.nextCursor, total: gate.result.total };
+      }
+      if (gate.kind === "busy") return { ok: false, busy: true };
+      const authEpoch = a.snapshot().epoch;
       try {
-        const page = await api.getTapeRecordsBefore(a, sessId, tapeId, before ?? null);
+        const page = await api.getTapeRecordsBefore(a, sessId, tapeId, requestedBefore);
         const records = Array.isArray(page.records) ? (page.records as ChatMessage[]) : [];
         const nextCursor = typeof page.nextCursor === "number" ? page.nextCursor : null;
+        const currentSession = socket.sessions.get(sessId);
+        const currentAnchor = currentSession?.messages.find((message) => message.id === anchorId);
+        const currentRevision = typeof currentSession?._historyRevision === "number"
+          ? currentSession._historyRevision
+          : "legacy";
+        const currentInitialized = currentAnchor?._turnTapeProcessExpanded === true;
+        const generationStillCurrent =
+          authRef.current === a && a.snapshot().epoch === authEpoch &&
+          currentRevision === revision &&
+          currentAnchor?._turnTapeProcess === true &&
+          currentAnchor._turnTapeId === tapeId &&
+          (currentAnchor._turnTapeSha256 ?? "") === tapeSha &&
+          (requestedBefore === null
+            ? !currentInitialized
+            : currentInitialized && currentAnchor._turnTapeProcessCursor === requestedBefore);
+        if (!generationStillCurrent) {
+          tapePageLedgerRef.current.fail(requestKey);
+          return { ok: false };
+        }
         // applyTapeRecordsPage 内部已 persistSession + scheduleNotify；总量不封顶。
         socket.applyTapeRecordsPage(sessId, anchorId, records, nextCursor);
-        return { ok: true, nextCursor, total: typeof page.total === "number" ? page.total : records.length };
+        const total = typeof page.total === "number" ? page.total : records.length;
+        tapePageLedgerRef.current.succeed(requestKey, { nextCursor, total });
+        return { ok: true, nextCursor, total };
       } catch {
+        tapePageLedgerRef.current.fail(requestKey);
         return { ok: false, error: true }; // 失败:卡片保留"可重试",不封死
-      } finally {
-        expandingTapesRef.current.delete(guardKey);
       }
     },
     [socket],
@@ -648,6 +705,7 @@ export function useChatSocket(opts: {
   }
   useEffect(() => {
     return () => {
+      tapePageLedgerRef.current.clear();
       deferredPayloadQueueRef.current?.cancelAll();
       deferredPayloadCacheRef.current = null;
     };
@@ -757,6 +815,7 @@ export function useChatSocket(opts: {
   }, []);
   const wipePersistence = useCallback(async () => {
     sigRef.current.clear();
+    tapePageLedgerRef.current.clear();
     deferredPayloadQueueRef.current?.cancelAll();
     deferredPayloadCacheRef.current = null;
     const st = storeRef.current;
