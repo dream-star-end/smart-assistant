@@ -135,7 +135,7 @@ export type UseChatSocket = {
   /** History revision paired with storedMaxSeq; absent forces a full fallback. */
   storedHistoryRevision: (sessId: string | undefined) => number | undefined;
   /**
-   * 归档滚动加载：从云端拉一页更早的归档历史(getSessionArchive)并前插进会话(只前插/按 id 去重,
+   * 归档点击加载：从云端拉一页更早的归档历史(getSessionArchive)并前插进会话(只前插/按 id 去重,
    * 不覆盖本地富卡)。返回本页结果供 UI 驱动"加载更多"按钮三态(loading/更多/无更多/失败可重试)。
    */
   loadOlderHistory: (
@@ -143,7 +143,7 @@ export type UseChatSocket = {
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   /**
    * Lazy process paging:read one page of true tape records and merge it by immutable ordinal.
-   * `before` 缺省(null)=尾页,向上续拉传上次返回的 nextCursor。并发去重(同 anchor 在飞时忽略);非抛出式契约。
+   * `before` 缺省(null)=尾页,点击「查看更早历史记录」续拉上次 nextCursor。并发去重(同 anchor 在飞时忽略);非抛出式契约。
    */
   loadOlderTurnProcess: (
     sessId: string | undefined,
@@ -636,7 +636,7 @@ export function useChatSocket(opts: {
     },
     [socket],
   );
-  // 归档滚动加载并发闸(同会话在途不重入,防用户连点 / 组件重渲重复拉同一页)。
+  // 归档点击加载并发闸(同会话在途不重入,防用户连点 / 组件重渲重复拉同一页)。
   const olderHistoryFetchingRef = useRef<Set<string>>(new Set());
   const loadOlderHistory = useCallback<UseChatSocket["loadOlderHistory"]>(
     async (sessId) => {
@@ -647,7 +647,7 @@ export function useChatSocket(opts: {
       try {
         const before = socket.archiveBeforeSeq(sessId);
         // Roughly 20 dialogue turns per request. This is a paging quantum,
-        // not a history cap; upward scrolling keeps fetching until exhausted.
+        // not a history cap; each explicit click fetches one more page until exhausted.
         const page = await api.getSessionArchive(a, sessId, before, 40);
         const msgs = Array.isArray(page.messages) ? (page.messages as ChatMessage[]) : [];
         const currentHistoryRevision = socket.sessions.get(sessId)?._historyRevision;

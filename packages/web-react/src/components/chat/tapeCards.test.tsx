@@ -50,12 +50,18 @@ function processControl(over: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe("TurnProcessCard", () => {
-  test("process control automatically loads the true tail and never renders a folded Agent card", async () => {
-    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 200 });
-    renderMsg(processControl(), { onLoadOlderTape });
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
-      "turn-process:tape-1", "tape-1", null,
-    ));
+  test("latest-tail owner loading stays invisible and never renders a folded Agent card", () => {
+    const onLoadOlderTape = vi.fn();
+    render(
+      <TurnProcessCard
+        msg={processControl()}
+        cb={{ onLoadOlderTape }}
+        autoLoadLatestTail
+        automaticLoading
+      />,
+    );
+    expect(onLoadOlderTape).not.toHaveBeenCalled();
+    expect(screen.getByText("正在加载真实记录")).toHaveClass("sr-only");
     expect(screen.queryByText(/Agent 调用过程|点击展开|收起/)).toBeNull();
   });
 
@@ -65,11 +71,13 @@ describe("TurnProcessCard", () => {
     expect(screen.queryByText(/Agent 调用过程/)).toBeNull();
   });
 
-  test("an initialized cursor requests the next older physical page without fold controls", async () => {
+  test("an initialized cursor waits for an explicit click before requesting one older physical page", async () => {
     const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 100 });
     renderMsg(processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 }), {
       onLoadOlderTape,
     });
+    expect(onLoadOlderTape).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
     await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
       "turn-process:tape-1", "tape-1", 200,
     ));
@@ -83,243 +91,46 @@ describe("TurnProcessCard", () => {
     expect(screen.queryByTestId("turn-process-loader")).toBeNull();
   });
 
-  test("a history revision reset re-arms automatic tail loading on the same control", async () => {
-    const observers: Array<{ trigger: (intersecting: boolean) => void }> = [];
-    class FakeIntersectionObserver {
-      constructor(private readonly callback: IntersectionObserverCallback) {
-        observers.push({
-          trigger: (intersecting) => this.callback(
-            [{ isIntersecting: intersecting } as IntersectionObserverEntry],
-            this as unknown as IntersectionObserver,
-          ),
-        });
-      }
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-      takeRecords(): IntersectionObserverEntry[] { return []; }
-      readonly root = null;
-      readonly rootMargin = "0px";
-      readonly thresholds = [0];
-    }
-    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+  test("a latest-tail owner failure exposes one explicit retry", async () => {
     const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
-    const cb = { onLoadOlderTape };
-    const view = render(<TurnProcessCard msg={processControl()} cb={cb} />);
-
-    act(() => observers.at(-1)!.trigger(true));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
-    view.rerender(<TurnProcessCard msg={processControl({
-      _turnTapeProcessExpanded: true,
-      _turnTapeProcessCursor: null,
-    })} cb={cb} />);
-    view.rerender(<TurnProcessCard msg={processControl()} cb={cb} />);
-
-    act(() => observers.at(-1)!.trigger(true));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
-    expect(onLoadOlderTape).toHaveBeenNthCalledWith(2, "turn-process:tape-1", "tape-1", null);
+    render(
+      <TurnProcessCard
+        msg={processControl()}
+        cb={{ onLoadOlderTape }}
+        autoLoadLatestTail
+        automaticError
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", {
+      name: "更早记录加载失败，点击重试",
+    }));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
+      "turn-process:tape-1", "tape-1", null,
+    ));
   });
 
-  test("production controller requires a new upward gesture for each older cursor across virtual remounts", async () => {
-    const observers: Array<{ trigger: () => void }> = [];
-    class FakeIntersectionObserver {
-      constructor(private readonly callback: IntersectionObserverCallback) {
-        observers.push({
-          trigger: () => this.callback(
-            [{ isIntersecting: true } as IntersectionObserverEntry],
-            this as unknown as IntersectionObserver,
-          ),
-        });
-      }
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-      takeRecords(): IntersectionObserverEntry[] { return []; }
-      readonly root = null;
-      readonly rootMargin = "0px";
-      readonly thresholds = [0];
-    }
-    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+  test("older uninitialized/initialized controls ignore navigation signals and load only when clicked", async () => {
     const paging = new UserUpwardPagingController();
     const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: 100 });
     const cb = { onLoadOlderTape };
-    const first = processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 200 });
-    const view = render(
-      <TurnProcessCard msg={first} cb={cb} paging={paging} historyGeneration={7} />,
-    );
-
-    act(() => observers.at(-1)!.trigger());
+    const view = render(<TurnProcessCard msg={processControl()} cb={cb} paging={paging} />);
+    act(() => paging.signalUserInteraction());
     expect(onLoadOlderTape).not.toHaveBeenCalled();
-    act(() => {
-      paging.signalUpwardIntent();
-      observers.at(-1)!.trigger();
-    });
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenNthCalledWith(
+      1, "turn-process:tape-1", "tape-1", null,
+    ));
 
     const second = processControl({ _turnTapeProcessExpanded: true, _turnTapeProcessCursor: 100 });
     view.rerender(<TurnProcessCard msg={second} cb={cb} paging={paging} historyGeneration={7} />);
-    act(() => observers.at(-1)!.trigger());
+    act(() => paging.signalUserInteraction());
     expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
-
-    view.unmount();
-    render(<TurnProcessCard msg={second} cb={cb} paging={paging} historyGeneration={7} />);
-    act(() => observers.at(-1)!.trigger());
-    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
-    act(() => {
-      paging.signalUpwardIntent();
-      observers.at(-1)!.trigger();
-    });
+    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
     await waitFor(() => expect(onLoadOlderTape).toHaveBeenNthCalledWith(
       2, "turn-process:tape-1", "tape-1", 100,
     ));
   });
 
-  test("several visible initial tails load serially under one controller", async () => {
-    const observers: Array<{ trigger: () => void }> = [];
-    class FakeIntersectionObserver {
-      constructor(private readonly callback: IntersectionObserverCallback) {
-        observers.push({
-          trigger: () => this.callback(
-            [{ isIntersecting: true } as IntersectionObserverEntry],
-            this as unknown as IntersectionObserver,
-          ),
-        });
-      }
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-      takeRecords(): IntersectionObserverEntry[] { return []; }
-      readonly root = null;
-      readonly rootMargin = "0px";
-      readonly thresholds = [0];
-    }
-    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
-    let finishFirst!: (value: { ok: boolean; nextCursor: null }) => void;
-    const firstPage = new Promise<{ ok: boolean; nextCursor: null }>((resolve) => {
-      finishFirst = resolve;
-    });
-    const onLoadOlderTape = vi.fn()
-      .mockReturnValueOnce(firstPage)
-      .mockResolvedValueOnce({ ok: true, nextCursor: null });
-    const paging = new UserUpwardPagingController();
-
-    render(
-      <div className="chat-scroll-area">
-        <TurnProcessCard msg={processControl()} cb={{ onLoadOlderTape }} paging={paging} />
-        <TurnProcessCard
-          msg={processControl({
-            id: "turn-process:tape-2",
-            _turnTapeId: "tape-2",
-            _turnTapeSha256: "sha-2",
-          })}
-          cb={{ onLoadOlderTape }}
-          paging={paging}
-        />
-      </div>,
-    );
-
-    act(() => observers.forEach((observer) => observer.trigger()));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
-    expect(onLoadOlderTape).toHaveBeenNthCalledWith(1, "turn-process:tape-1", "tape-1", null);
-
-    await act(async () => finishFirst({ ok: true, nextCursor: null }));
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
-    expect(onLoadOlderTape).toHaveBeenNthCalledWith(2, "turn-process:tape-2", "tape-2", null);
-  });
-
-  test("an initial tail that fails after virtual unmount is re-armed for remount", async () => {
-    const observers: Array<{ trigger: () => void }> = [];
-    class FakeIntersectionObserver {
-      constructor(private readonly callback: IntersectionObserverCallback) {
-        observers.push({
-          trigger: () => this.callback(
-            [{ isIntersecting: true } as IntersectionObserverEntry],
-            this as unknown as IntersectionObserver,
-          ),
-        });
-      }
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-      takeRecords(): IntersectionObserverEntry[] { return []; }
-      readonly root = null;
-      readonly rootMargin = "0px";
-      readonly thresholds = [0];
-    }
-    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
-    let failUnmounted!: (value: { ok: false; error: true }) => void;
-    const firstPage = new Promise<{ ok: false; error: true }>((resolve) => {
-      failUnmounted = resolve;
-    });
-    const onLoadOlderTape = vi.fn()
-      .mockReturnValueOnce(firstPage)
-      .mockResolvedValueOnce({ ok: true, nextCursor: null });
-    const paging = new UserUpwardPagingController();
-    const mount = () => render(
-      <div className="chat-scroll-area">
-        <TurnProcessCard msg={processControl()} cb={{ onLoadOlderTape }} paging={paging} />
-      </div>,
-    );
-
-    const first = mount();
-    act(() => observers.at(-1)!.trigger());
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
-    first.unmount();
-    mount();
-    act(() => observers.at(-1)!.trigger());
-    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
-    await act(async () => failUnmounted({ ok: false, error: true }));
-
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
-    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
-      2, "turn-process:tape-1", "tape-1", null,
-    );
-  });
-
-  test("a visible tail failure re-arms after its local retry UI is virtually unmounted", async () => {
-    const observers: Array<{ trigger: () => void }> = [];
-    class FakeIntersectionObserver {
-      constructor(private readonly callback: IntersectionObserverCallback) {
-        observers.push({
-          trigger: () => this.callback(
-            [{ isIntersecting: true } as IntersectionObserverEntry],
-            this as unknown as IntersectionObserver,
-          ),
-        });
-      }
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-      takeRecords(): IntersectionObserverEntry[] { return []; }
-      readonly root = null;
-      readonly rootMargin = "0px";
-      readonly thresholds = [0];
-    }
-    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
-    const onLoadOlderTape = vi.fn()
-      .mockResolvedValueOnce({ ok: false, error: true })
-      .mockResolvedValueOnce({ ok: true, nextCursor: null });
-    const paging = new UserUpwardPagingController();
-    const mount = () => render(
-      <div className="chat-scroll-area">
-        <TurnProcessCard msg={processControl()} cb={{ onLoadOlderTape }} paging={paging} />
-      </div>,
-    );
-
-    const failed = mount();
-    act(() => observers.at(-1)!.trigger());
-    expect(await screen.findByRole("button", {
-      name: "更早记录加载失败，点击重试",
-    })).toBeInTheDocument();
-    failed.unmount();
-
-    mount();
-    act(() => observers.at(-1)!.trigger());
-    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
-    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
-      2, "turn-process:tape-1", "tape-1", null,
-    );
-  });
 });
 
 describe("deferred oversized immutable record", () => {

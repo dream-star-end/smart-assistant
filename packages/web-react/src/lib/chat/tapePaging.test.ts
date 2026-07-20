@@ -32,8 +32,8 @@ describe("tape page request ledger", () => {
   });
 });
 
-describe("explicit upward paging intent", () => {
-  test("visible tails serialize globally, then each older page needs a new gesture", () => {
+describe("automatic latest-tail owner", () => {
+  test("uninitialized tails serialize globally, run once, and never admit initialized cursors", () => {
     const controller = new UserUpwardPagingController();
     const generation = "rev7::sha::anchor";
 
@@ -46,55 +46,73 @@ describe("explicit upward paging intent", () => {
     expect(anotherTail).not.toBeNull();
     controller.settle(anotherTail!);
     expect(controller.begin(generation, true)).toBeNull();
-
-    controller.signalUpwardIntent();
-    const first = controller.begin(generation, true);
-    expect(first).not.toBeNull();
-    expect(controller.begin("rev7::sha::another", true)).toBeNull();
-    // Momentum / repeated wheel events while the request is in flight are
-    // consumed when that request settles, rather than cascading a new page.
-    controller.signalUpwardIntent();
-    controller.signalUpwardIntent();
-    controller.settle(first!);
-    expect(controller.begin(generation, true)).toBeNull();
-
-    controller.signalUpwardIntent();
-    expect(controller.begin(generation, true)).not.toBeNull();
   });
 
-  test("programmatic scroll synchronization is not user intent and stale tokens cannot release an owner", () => {
+  test("stale tokens cannot release a fresh owner", () => {
     const controller = new UserUpwardPagingController();
     const oldGeneration = "rev7::sha::anchor";
     const freshGeneration = "rev8::sha::anchor";
 
-    controller.syncScrollTop(900);
-    controller.syncScrollTop(400);
-    expect(controller.begin(oldGeneration, true)).toBeNull();
-
-    controller.signalUpwardIntent();
     const fresh = controller.begin(freshGeneration, false)!;
     controller.reset(oldGeneration);
     controller.settle({ generation: oldGeneration, token: fresh.token + 1 });
-    // A late/wrong finally cannot consume or settle the fresh owner.
-    controller.signalUpwardIntent();
-    expect(controller.begin(oldGeneration, true)).toBeNull();
+    expect(controller.begin(oldGeneration, false)).toBeNull();
     controller.settle(fresh);
+    expect(controller.begin(oldGeneration, false)).not.toBeNull();
   });
 
-  test("manual retry is a real intent but cannot bypass another generation's in-flight claim", () => {
+  test("user interaction versions cancel stale viewport restoration without admitting pages", () => {
     const controller = new UserUpwardPagingController();
-    controller.signalUpwardIntent();
-    const active = controller.begin("turn-a", true)!;
+    expect(controller.interactionVersion()).toBe(0);
+    controller.signalUserInteraction();
+    expect(controller.interactionVersion()).toBe(1);
+    expect(controller.begin("older-cursor", true)).toBeNull();
+  });
 
-    controller.signalUpwardIntent();
-    expect(controller.begin("turn-b", true, true)).toBeNull();
-    controller.settle({ generation: "turn-b", token: active.token + 99 });
-    expect(controller.begin("turn-b", true, true)).toBeNull();
+  test("archive and tape clicks run in one deduplicated FIFO", async () => {
+    const controller = new UserUpwardPagingController();
+    const order: string[] = [];
+    let finishArchive!: () => void;
+    const archiveGate = new Promise<void>((resolve) => { finishArchive = resolve; });
 
-    controller.settle(active);
-    // The click observed while A was active was consumed with A. A new click
-    // creates the retry intent that may now own the controller.
-    controller.signalUpwardIntent();
-    expect(controller.begin("turn-b", true, true)).not.toBeNull();
+    const archive = controller.runExplicit("archive:0", async () => {
+      order.push("archive:start");
+      await archiveGate;
+      order.push("archive:end");
+      return "archive";
+    });
+    const duplicate = controller.runExplicit("archive:0", async () => "duplicate");
+    const tape = controller.runExplicit("tape:200", async () => {
+      order.push("tape:start");
+      return "tape";
+    });
+
+    expect(duplicate).toBe(archive);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(order).toEqual(["archive:start"]);
+    finishArchive();
+    await expect(archive).resolves.toBe("archive");
+    await expect(tape).resolves.toBe("tape");
+    expect(order).toEqual(["archive:start", "archive:end", "tape:start"]);
+  });
+
+  test("an explicit click waits for the active automatic tail and blocks a new one", async () => {
+    const controller = new UserUpwardPagingController();
+    const automatic = controller.begin("latest-tail", false)!;
+    let explicitStarted = false;
+    const explicit = controller.runExplicit("archive:0", async () => {
+      explicitStarted = true;
+    });
+
+    await Promise.resolve();
+    expect(explicitStarted).toBe(false);
+    expect(controller.begin("another-tail", false)).toBeNull();
+    controller.settle(automatic);
+    await explicit;
+    expect(explicitStarted).toBe(true);
+
+    const nextAutomatic = controller.begin("another-tail", false);
+    expect(nextAutomatic).not.toBeNull();
+    controller.settle(nextAutomatic!);
   });
 });

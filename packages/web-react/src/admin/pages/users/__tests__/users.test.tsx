@@ -364,14 +364,14 @@ describe('UserDetailSheet — 会话只读查看器', () => {
       view: 'timeline',
     })
 
-    fireEvent.click(screen.getByRole('button', { name: /向上滚动加载更早历史/ }))
+    fireEvent.click(screen.getByRole('button', { name: /查看更早历史记录/ }))
     expect(await screen.findByText('云端更早的问题')).toBeTruthy()
     expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
       user_id: '1',
       before: 0,
       limit: 100,
     })
-    expect(screen.queryByRole('button', { name: /向上滚动加载更早历史/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /查看更早历史记录/ })).toBeNull()
   })
 
   test('切换会话后丢弃上一会话迟到的归档响应，绝不混入当前会话', async () => {
@@ -399,7 +399,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     const sessionB = screen.getByRole('button', { name: '查看会话：会话二' })
     fireEvent.click(sessionA)
     expect(await screen.findByText('管理员看到的用户问题')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /向上滚动加载更早历史/ }))
+    fireEvent.click(screen.getByRole('button', { name: /查看更早历史记录/ }))
     await waitFor(() =>
       expect(mockGet).toHaveBeenCalledWith('/sessions/web-1/archive', {
         user_id: '1',
@@ -434,6 +434,83 @@ describe('UserDetailSheet — 会话只读查看器', () => {
 
     expect(screen.getByText('会话 B 的独立消息')).toBeTruthy()
     expect(screen.queryByText('不应混入 B 的 A 归档消息')).toBeNull()
+  })
+
+  test('归档响应在途时 tape 点击保持排队，归档 DOM 提交后才读取下一页', async () => {
+    let resolveArchive!: (value: unknown) => void
+    const delayedArchive = new Promise((resolve) => { resolveArchive = resolve })
+    mockGet.mockImplementation((path: string) => {
+      if (path === '/sessions/admin-fifo') {
+        return Promise.resolve({
+          session: {
+            id: 'admin-fifo', user_id: 'c:1', agent_id: 'main', title: '串行分页会话',
+            pinned: false, created_at: 1, last_at: 3, updated_at: 3,
+            archived_count: 1, archived_through_seq: 1,
+            messages: [
+              {
+                id: 'turn-process:tape-fifo', role: 'runtime-event', text: '', ts: 2,
+                _turnTapeProcess: true, _turnTapeProcessExpanded: true,
+                _turnTapeProcessCursor: 10, _turnTapeId: 'tape-fifo',
+                _turnTapeSha256: 'f'.repeat(64),
+              },
+              { id: 'fifo-answer', role: 'assistant', text: '当前最新回答', ts: 3 },
+            ],
+          },
+        })
+      }
+      if (path === '/sessions/admin-fifo/archive') return delayedArchive
+      if (path === '/sessions/admin-fifo/tape/tape-fifo/records') {
+        return Promise.resolve({
+          records: [{
+            id: 'fifo-thinking', role: 'thinking', text: '更早真实过程', ts: 1.5,
+            _turnTapeOrdinal: 9,
+          }],
+          nextCursor: null,
+          total: 1,
+        })
+      }
+      return Promise.reject(new Error(`unexpected path ${path}`))
+    })
+
+    renderPage(
+      <SessionViewerModal
+        session={{
+          session_id: 'admin-fifo', title: '串行分页会话', agent_id: 'main', message_count: 3,
+          created_at: '2026-07-01T00:00:00.000Z', last_at: '2026-07-01T00:00:00.000Z',
+          updated_at: '2026-07-01T00:00:00.000Z',
+        }}
+        userId="1"
+        userEmail="alice@example.com"
+        onClose={() => {}}
+      />,
+    )
+
+    expect(await screen.findByText('当前最新回答')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /查看更早历史记录（还有 1 条）/ }))
+    await waitFor(() => expect(mockGet).toHaveBeenCalledWith(
+      '/sessions/admin-fifo/archive',
+      { user_id: '1', before: 0, limit: 100 },
+    ))
+    fireEvent.click(screen.getByRole('button', { name: '查看更早历史记录' }))
+    await act(async () => {})
+    expect(mockGet).not.toHaveBeenCalledWith(
+      '/sessions/admin-fifo/tape/tape-fifo/records',
+      expect.anything(),
+    )
+
+    await act(async () => resolveArchive({
+      session_id: 'admin-fifo',
+      messages: [{
+        id: 'fifo-archive', role: 'user', text: '归档页先提交', ts: 1, _seq: 1, status: 'sent',
+      }],
+      oldest_seq: 1,
+      has_more: false,
+    }))
+    expect(await screen.findByText('归档页先提交')).toBeTruthy()
+    await waitFor(() => expect(mockGet).toHaveBeenCalledWith(
+      '/sessions/admin-fifo/tape/tape-fifo/records',
+      { user_id: '1', before: 10, limit: 200 },
+    ))
   })
 
   test('管理员查看器可懒加载超长 user/final 正文并按页展开真实 Agent 过程', async () => {

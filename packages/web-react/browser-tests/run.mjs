@@ -17,7 +17,8 @@
 //   T7 点「+」→「设定目标」→ 目标对话框弹出(同菜单的第二入口回归对照)。
 //   T8 长时间线向上惰性分页:pointercancel 清理、同轮惯性只取一页、虚拟 remount
 //      不重取、插页后像素锚定;
-//   T9 第二次明确上滑继续下一 cursor，第一批真实记录仍常驻内存。
+//   T9 第二次明确点击继续下一 cursor，第一批真实记录仍常驻内存;
+//   T10 真 Virtuoso 归档前插足够多行后仍锁定点击前的真实可见消息。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -62,7 +63,8 @@ await esbuild.build({
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-scroll-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+  #timeline-archive-root .chat-virtual-item{min-height:40px}
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -198,7 +200,7 @@ await check("T7 点「+」→「设定目标」→ 目标对话框弹出", async
 });
 
 let firstAnchorTop = 0;
-await check("T8 pointercancel/同轮惯性不连拉，插页像素锚定且 remount 不重取", async () => {
+await check("T8 上滑零请求，点击只取一页、像素锚定且 remount 不重取", async () => {
   const root = page.locator("#timeline-scroll-root .timeline-scroll-probe");
   await root.waitFor({ state: "visible", timeout: 3000 });
   await page.evaluate(() => {
@@ -234,18 +236,25 @@ await check("T8 pointercancel/同轮惯性不连拉，插页像素锚定且 remo
   if (!beforeBox) throw new Error("tail anchor has no layout box before paging");
   firstAnchorTop = beforeBox.y;
 
-  // Dispatch one complete wheel burst in the same browser task. The first
-  // event creates one intent; the second is inertial continuation before the
-  // next-frame anchor capture and must not create another cursor.
+  // A complete wheel/inertia burst is navigation only. It must reveal the
+  // explicit boundary without admitting any history request.
   await root.evaluate((node) => {
     node.dispatchEvent(new WheelEvent("wheel", { deltaY: -120, bubbles: true }));
     node.dispatchEvent(new WheelEvent("wheel", { deltaY: -80, bubbles: true }));
   });
+  await page.waitForTimeout(200);
+  const afterInertia = await page.evaluate(() => window.__scrollTimeline.calls);
+  if (afterInertia.length !== 0) {
+    throw new Error(`上滑错误触发了历史请求:${JSON.stringify(afterInertia)}`);
+  }
+  const loadButton = root.getByRole("button", { name: "查看更早历史记录" });
+  await loadButton.waitFor({ state: "visible", timeout: 3000 });
+  await loadButton.click();
   await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 1, null, { timeout: 3000 });
   await page.waitForTimeout(120);
-  const afterInertia = await page.evaluate(() => window.__scrollTimeline.calls);
-  if (JSON.stringify(afterInertia) !== JSON.stringify([200])) {
-    throw new Error(`同一惯性 burst 连拉了多页:${JSON.stringify(afterInertia)}`);
+  const afterClick = await page.evaluate(() => window.__scrollTimeline.calls);
+  if (JSON.stringify(afterClick) !== JSON.stringify([200])) {
+    throw new Error(`单次点击未严格加载一页:${JSON.stringify(afterClick)}`);
   }
   const afterBox = await anchor.boundingBox();
   if (!afterBox) throw new Error("tail anchor disappeared after older page merge");
@@ -275,10 +284,16 @@ await check("T8 pointercancel/同轮惯性不连拉，插页像素锚定且 remo
   }
 });
 
-await check("T9 新的明确上滑只继续下一 cursor，已加载记录不丢", async () => {
+await check("T9 再次上滑仍零请求，第二次点击才继续下一 cursor", async () => {
   const root = page.locator("#timeline-scroll-root .timeline-scroll-probe");
   await root.hover();
   await page.mouse.wheel(0, -120);
+  await page.waitForTimeout(200);
+  const afterWheel = await page.evaluate(() => window.__scrollTimeline.calls);
+  if (JSON.stringify(afterWheel) !== JSON.stringify([200])) {
+    throw new Error(`第二次上滑错误触发请求:${JSON.stringify(afterWheel)}`);
+  }
+  await root.getByRole("button", { name: "查看更早历史记录" }).click();
   await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 2, null, { timeout: 3000 });
   await page.waitForTimeout(200);
   const state = await page.evaluate(() => window.__scrollTimeline);
@@ -287,6 +302,32 @@ await check("T9 新的明确上滑只继续下一 cursor，已加载记录不丢
   }
   if (state.messageCount !== 227) {
     throw new Error(`第二批合并后真实记录有丢失/替换:messageCount=${state.messageCount},应为227`);
+  }
+});
+
+await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置", async () => {
+  const root = page.locator("#timeline-archive-root .timeline-scroll-probe");
+  await root.waitFor({ state: "visible", timeout: 3000 });
+  await root.evaluate((node) => { node.scrollTop = 0; });
+  await page.waitForTimeout(200);
+  if ((await page.evaluate(() => window.__archiveTimeline.calls)) !== 0) {
+    throw new Error("归档会话滚到顶部时错误自动请求");
+  }
+  const anchor = root.locator('[data-chat-virtual-key="archive-tail-0"]');
+  await anchor.waitFor({ state: "attached", timeout: 3000 });
+  const beforeBox = await anchor.boundingBox();
+  if (!beforeBox) throw new Error("归档前插前缺少可见锚点");
+  const button = root.getByTestId("history-page-loader").getByRole("button");
+  await button.click();
+  await page.waitForFunction(() => window.__archiveTimeline.mergedPages === 1, null, { timeout: 3000 });
+  await page.waitForTimeout(250);
+  const afterBox = await anchor.boundingBox();
+  if (!afterBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
+  const delta = Math.abs(afterBox.y - beforeBox.y);
+  if (delta > 2) throw new Error(`归档前插后可见锚点跳动 ${delta.toFixed(2)}px，应 ≤2px`);
+  const state = await page.evaluate(() => window.__archiveTimeline);
+  if (state.calls !== 1 || state.messageCount !== 200) {
+    throw new Error(`归档单击加载契约错误:${JSON.stringify(state)}`);
   }
 });
 

@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { applyServerIncremental } from "../lib/persist";
@@ -890,9 +890,12 @@ describe("MetaRow turn 终态门控(积分/请求ID 不得先于 turn 结束出�
   });
 });
 
-describe("MessageList 归档无感分页(§4/§5)", () => {
+describe("MessageList 归档显式分页(§4/§5)", () => {
   const noArchive = { archivedCount: 0, archivedThroughSeq: 0, loading: false, error: false };
-  function renderList(messages: ChatMessage[], archive?: Partial<typeof noArchive> & { onLoadOlder?: () => void }) {
+  function renderList(
+    messages: ChatMessage[],
+    archive?: Partial<typeof noArchive> & { onLoadOlder?: () => void | Promise<void> },
+  ) {
     const onLoadOlder = archive?.onLoadOlder ?? (() => {});
     return render(
       <MessageList
@@ -913,8 +916,7 @@ describe("MessageList 归档无感分页(§4/§5)", () => {
     renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
     expect(screen.getByText("m0")).toBeInTheDocument();
     expect(screen.getByText("m129")).toBeInTheDocument();
-    expect(screen.getByTestId("history-page-loader")).toHaveClass("h-px");
-    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.getByRole("button", { name: /查看更早历史记录（还有 500 条）/ })).toBeInTheDocument();
   });
 
   test("无归档时不造客户端 100 条总量上限", () => {
@@ -922,6 +924,90 @@ describe("MessageList 归档无感分页(§4/§5)", () => {
     expect(screen.getByText("m0")).toBeInTheDocument();
     expect(screen.getByText("m129")).toBeInTheDocument();
     expect(container.querySelector("button")).toBeNull();
+  });
+
+  test("打开会话只自动读取最新 Agent 过程尾页，更早过程必须点击", async () => {
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
+    const cb = { onLoadOlderTape };
+    const process = (id: string, tapeId: string, ts: number): ChatMessage =>
+      mk("runtime-event", {
+        id,
+        ts,
+        _turnTapeProcess: true,
+        _turnTapeId: tapeId,
+        _turnTapeSha256: `sha-${tapeId}`,
+      });
+    const initial = [
+      mk("user", { id: "u-old", text: "旧问题", ts: 1 }),
+      process("turn-process:old", "tape-old", 2),
+      mk("assistant", { id: "a-old", text: "旧回答", ts: 3 }),
+      mk("user", { id: "u-latest", text: "最新问题", ts: 4 }),
+      process("turn-process:latest", "tape-latest", 5),
+      mk("assistant", { id: "a-latest", text: "最新回答", ts: 6 }),
+    ];
+    const view = render(
+      <MessageList
+        messages={initial}
+        sending={false}
+        cb={cb}
+        onRespondPermission={() => {}}
+      />,
+    );
+
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
+      1, "turn-process:latest", "tape-latest", null,
+    );
+    view.rerender(
+      <MessageList
+        messages={initial.map((message) => message.id === "turn-process:latest"
+          ? { ...message, _turnTapeProcessExpanded: true, _turnTapeProcessCursor: null }
+          : message)}
+        sending={false}
+        cb={cb}
+        onRespondPermission={() => {}}
+      />,
+    );
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenNthCalledWith(
+      2, "turn-process:old", "tape-old", null,
+    ));
+  });
+
+  test("同 history generation 从 expanded 重置为 unexpanded 时 owner 恰好重取一页", async () => {
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
+    const cb = { onLoadOlderTape };
+    const control = mk("runtime-event", {
+      id: "turn-process:reset-same-generation",
+      _turnTapeProcess: true,
+      _turnTapeId: "tape-reset",
+      _turnTapeSha256: "sha-reset",
+    });
+    const renderListState = (message: ChatMessage) => (
+      <MessageList
+        messages={[message, mk("assistant", { id: "reset-answer", text: "最终回答" })]}
+        sending={false}
+        cb={cb}
+        onRespondPermission={() => {}}
+        historyGeneration="same-generation"
+      />
+    );
+    const view = render(renderListState(control));
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+
+    view.rerender(renderListState({
+      ...control,
+      _turnTapeProcessExpanded: true,
+      _turnTapeProcessCursor: null,
+    }));
+    await act(async () => {});
+    view.rerender(renderListState({ ...control }));
+
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(2));
+    expect(onLoadOlderTape).toHaveBeenNthCalledWith(
+      2, "turn-process:reset-same-generation", "tape-reset", null,
+    );
   });
 
   test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
@@ -937,6 +1023,45 @@ describe("MessageList 归档无感分页(§4/§5)", () => {
     expect(screen.getByRole("status")).toHaveTextContent("正在准备会话");
     expect(screen.queryByText("m0")).toBeNull();
     expect(screen.queryByText("m9999")).toBeNull();
+  });
+
+  test("最新过程控制行远离虚拟视口时仍在会话 mount 取一页，之后滚动零新增请求", async () => {
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: false, error: true });
+    const scroller = document.createElement("div");
+    scroller.className = "chat-scroll-area";
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={[
+          mk("runtime-event", {
+            id: "turn-process:far-latest",
+            _turnTapeProcess: true,
+            _turnTapeId: "tape-far-latest",
+            _turnTapeSha256: "sha-far-latest",
+          }),
+          ...users(300).map((message, index) => ({
+            ...message,
+            id: `tail-${index}`,
+            text: `很长的最终尾部 ${index}`,
+            ts: index + 2,
+          })),
+        ]}
+        sending={false}
+        cb={{ onLoadOlderTape }}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="far-control"
+      />,
+    );
+
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledWith(
+      "turn-process:far-latest", "tape-far-latest", null,
+    ));
+    fireEvent.wheel(scroller, { deltaY: -600 });
+    fireEvent.scroll(scroller, { target: { scrollTop: 0 } });
+    await act(async () => {});
+    expect(onLoadOlderTape).toHaveBeenCalledTimes(1);
+    scroller.remove();
   });
 
   test("重复协议包不挤走 immutable 最终答复，非重复 runtime 仍可检查", () => {
@@ -1085,10 +1210,75 @@ describe("MessageList 归档无感分页(§4/§5)", () => {
     expect(screen.queryByText("绝不能展示的 checkpoint")).toBeNull();
   });
 
-  test("本地翻尽 + 有归档未拉 → 保留无感加载哨兵，不插入可见按钮", () => {
-    renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
-    expect(screen.getByTestId("history-page-loader")).toHaveClass("h-px");
-    expect(screen.queryByRole("button")).toBeNull();
+  test("本地翻尽 + 有归档未拉 → 只显示显式按钮，点击才加载一页", async () => {
+    const onLoadOlder = vi.fn();
+    renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, onLoadOlder });
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录（还有 500 条）/ }));
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
+  });
+
+  test("生产虚拟滚动到顶部也不请求归档，只有点击按钮才请求", async () => {
+    const onLoadOlder = vi.fn();
+    const scroller = document.createElement("div");
+    scroller.className = "chat-scroll-area";
+    document.body.appendChild(scroller);
+    render(
+      <MessageList
+        messages={users(30)}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{ ...noArchive, archivedCount: 500, archivedThroughSeq: 5, onLoadOlder }}
+        scrollParent={scroller}
+      />,
+    );
+
+    fireEvent.scroll(scroller, { target: { scrollTop: 0 } });
+    await act(async () => {});
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录/ }));
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
+    scroller.remove();
+  });
+
+  test("归档请求在途时过程页点击排队，响应完成后才读取真实 tape", async () => {
+    let finishArchive!: () => void;
+    const archivePage = new Promise<void>((resolve) => { finishArchive = resolve; });
+    const onLoadOlder = vi.fn(() => archivePage);
+    const onLoadOlderTape = vi.fn().mockResolvedValue({ ok: true, nextCursor: null });
+
+    render(
+      <MessageList
+        messages={[
+          mk("runtime-event", {
+            id: "turn-process:latest",
+            _turnTapeProcess: true,
+            _turnTapeProcessExpanded: true,
+            _turnTapeProcessCursor: 10,
+            _turnTapeId: "tape-latest",
+            _turnTapeSha256: "sha-latest",
+          }),
+          mk("assistant", { id: "answer", text: "最新回答" }),
+        ]}
+        sending={false}
+        cb={{ onLoadOlderTape }}
+        onRespondPermission={() => {}}
+        archive={{ ...noArchive, archivedCount: 20, archivedThroughSeq: 5, onLoadOlder }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /查看更早历史记录（还有 20 条）/ }));
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
+    await act(async () => {});
+    expect(onLoadOlderTape).not.toHaveBeenCalled();
+
+    await act(async () => finishArchive());
+    await waitFor(() => expect(onLoadOlderTape).toHaveBeenCalledTimes(1));
+    expect(onLoadOlderTape).toHaveBeenCalledWith(
+      "turn-process:latest", "tape-latest", 10,
+    );
   });
 
   test("本地翻尽 + 无归档 → 无按钮", () => {
@@ -1096,19 +1286,20 @@ describe("MessageList 归档无感分页(§4/§5)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  test("云端加载中 → 仅保留无布局高度的无障碍状态", () => {
+  test("云端加载中 → 原位禁用按钮并给出明确反馈", () => {
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, loading: true });
-    expect(screen.getByRole("status")).toHaveTextContent("正在加载更早消息");
-    expect(screen.queryByRole("button")).toBeNull();
+    const button = screen.getByRole("button", { name: "加载中…" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
   });
 
-  test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", () => {
+  test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", async () => {
     const onLoadOlder = vi.fn();
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, error: true, onLoadOlder });
-    const btn = screen.getByRole("button", { name: /更早消息加载失败，点击重试/ });
+    const btn = screen.getByRole("button", { name: /加载失败，点击重试/ });
     expect(btn).not.toBeDisabled();
     fireEvent.click(btn);
-    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
   });
 
   test("拉回一页归档后不回退本地翻页:带 _seq≤水位 的前插行可见,仍是云端态", () => {
@@ -1123,9 +1314,8 @@ describe("MessageList 归档无感分页(§4/§5)", () => {
     // 刚拉回的归档行未被再次藏起 → arch0 / arch99 都在 DOM。
     expect(screen.getByText("arch0")).toBeInTheDocument();
     expect(screen.getByText("arch99")).toBeInTheDocument();
-    // 仍是云端态,剩余 = 500-100 = 400；已加载行常驻，顶部仍为无感哨兵。
-    expect(screen.getByTestId("history-page-loader")).toHaveClass("h-px");
-    expect(screen.queryByRole("button")).toBeNull();
+    // 仍是云端态,剩余 = 500-100 = 400；已加载行常驻，继续点击才取下一页。
+    expect(screen.getByRole("button", { name: /查看更早历史记录（还有 400 条）/ })).toBeInTheDocument();
     expect(screen.queryByText(/加载更多历史/)).toBeNull();
   });
 });

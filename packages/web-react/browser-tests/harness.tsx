@@ -33,12 +33,18 @@ declare global {
       mergedPages: number;
       messageCount: number;
     };
+    __archiveTimeline: {
+      calls: number;
+      mergedPages: number;
+      messageCount: number;
+    };
   }
 }
 window.__sends = [];
 window.__uploads = [];
 window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userRetry: null, tapeFetch: null };
 window.__scrollTimeline = { calls: [], mergedPages: 0, messageCount: 0 };
+window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
   window.__uploads.push(file.name);
@@ -253,4 +259,64 @@ function ScrollTimelineProbe() {
 
 createRoot(document.getElementById("timeline-scroll-root")!).render(
   <StrictMode><ScrollTimelineProbe /></StrictMode>,
+);
+
+const archiveTail: ChatMessage[] = Array.from({ length: 120 }, (_, index) => ({
+  id: `archive-tail-${index}`,
+  role: "user",
+  text: `ARCHIVE_TAIL_${index}`,
+  ts: 300 + index,
+  _seq: 300 + index,
+  _source: "server",
+}));
+const archiveOlder: ChatMessage[] = Array.from({ length: 80 }, (_, index) => ({
+  id: `archive-older-${index}`,
+  role: "user",
+  text: `ARCHIVE_OLDER_${index}`,
+  ts: 121 + index,
+  _seq: 121 + index,
+  _source: "server",
+}));
+
+function ArchiveTimelineProbe() {
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>(archiveTail);
+  const loadOlder = useCallback(async () => {
+    window.__archiveTimeline.calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    setMessages((current) => {
+      if (current[0]?.id === archiveOlder[0]?.id) return current;
+      window.__archiveTimeline.mergedPages += 1;
+      return [...archiveOlder, ...current];
+    });
+  }, []);
+  window.__archiveTimeline.messageCount = messages.length;
+  return (
+    <div
+      ref={setScroller}
+      className="chat-scroll-area timeline-scroll-probe"
+      data-testid="archive-timeline-scroll-probe"
+      tabIndex={0}
+    >
+      <MessageList
+        messages={messages}
+        sending={false}
+        archive={{
+          archivedCount: 160,
+          archivedThroughSeq: 200,
+          loading: false,
+          error: false,
+          onLoadOlder: loadOlder,
+        }}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration="archive-one-page"
+      />
+    </div>
+  );
+}
+
+createRoot(document.getElementById("timeline-archive-root")!).render(
+  <StrictMode><ArchiveTimelineProbe /></StrictMode>,
 );

@@ -323,7 +323,7 @@ export type SessionDetail = {
 };
 
 /**
- * GET /api/sessions/:id/archive?before=<seq>&limit=<n> → 归档分页（滚动加载更早历史）。
+ * GET /api/sessions/:id/archive?before=<seq>&limit=<n> → 归档分页（显式点击加载更早历史）。
  * `messages` = `_orderSeq < before` 的最近 `limit` 条归档消息（升序返回）；
  * `oldestSeq` = 本页最老 `_orderSeq`（字段名保留兼容）。
  */

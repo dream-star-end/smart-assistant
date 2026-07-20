@@ -9,10 +9,21 @@
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
 import { Info, Sparkles } from "lucide-react";
-import { memo, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { Virtuoso, VirtuosoMockContext, type Components } from "react-virtuoso";
 import type { ChatMessage } from "../lib/chat/model";
-import { UserUpwardPagingController } from "../lib/chat/tapePaging";
+import {
+  turnProcessPagingGeneration,
+  UserUpwardPagingController,
+} from "../lib/chat/tapePaging";
 import {
   collectResolvedDispatchTurnIds,
   HIDDEN_REVIEWER_AGENT_ID,
@@ -65,6 +76,10 @@ type RendererProps = {
   historyGeneration?: number | string;
   /** 生命周期归 MessageList，而不是可卸载的虚拟行。 */
   processPaging?: UserUpwardPagingController;
+  /** 只有当前会话最新的过程控制行可自动读取一次尾页。更早过程必须由用户点击。 */
+  autoLoadLatestProcessTail?: boolean;
+  automaticProcessLoading?: boolean;
+  automaticProcessError?: boolean;
   /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
    *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
    *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
@@ -90,6 +105,9 @@ export const MessageRenderer = memo(
     activityInFooter,
     historyGeneration,
     processPaging,
+    autoLoadLatestProcessTail = false,
+    automaticProcessLoading = false,
+    automaticProcessError = false,
     delegateCost,
     turnFinalAssistant,
     cb,
@@ -131,6 +149,9 @@ export const MessageRenderer = memo(
           cb={cb}
           paging={processPaging}
           historyGeneration={historyGeneration}
+          autoLoadLatestTail={autoLoadLatestProcessTail}
+          automaticLoading={automaticProcessLoading}
+          automaticError={automaticProcessError}
         />
       );
     }
@@ -233,6 +254,9 @@ export const MessageRenderer = memo(
     a.activityInFooter === b.activityInFooter &&
     a.historyGeneration === b.historyGeneration &&
     a.processPaging === b.processPaging &&
+    a.autoLoadLatestProcessTail === b.autoLoadLatestProcessTail &&
+    a.automaticProcessLoading === b.automaticProcessLoading &&
+    a.automaticProcessError === b.automaticProcessError &&
     a.readOnly === b.readOnly &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
@@ -736,6 +760,10 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
  * loading an older page adds bounded items instead of invalidating thousands
  * of measured row indices. 32 is only a render quantum, never a content cap. */
 const TAPE_VIRTUAL_CHUNK_ITEMS = 32;
+// React Virtuoso uses firstItemIndex as a coordinate when items are prepended.
+// Keep a very large internal origin so every older page can move left without
+// imposing a user-visible history limit.
+const TIMELINE_VIRTUAL_INDEX_ORIGIN = Math.floor(Number.MAX_SAFE_INTEGER / 4);
 
 type VirtualItem =
   | RenderItem
@@ -800,6 +828,16 @@ function chunkTapePages(items: RenderItem[]): VirtualItem[] {
   return output;
 }
 
+function renderItemMessages(item: RenderItem): ChatMessage[] {
+  return item.kind === "single" ? [item.m] : item.members;
+}
+
+function virtualItemMessages(item: VirtualItem): ChatMessage[] {
+  return item.kind === "tape-page"
+    ? item.members.flatMap(renderItemMessages)
+    : renderItemMessages(item);
+}
+
 /**
  * 会话归档分页上下文(§4/§5)。App 从 chat.getSession 读会话归档水位/计数,并接线 Agent C 的
  * loadOlderHistory + 视口保持。未传(如 demo / 老测试)时按「无归档、仅本地翻页」退化,行为不变。
@@ -814,7 +852,7 @@ export type MessageListArchive = {
   /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
-  onLoadOlder: () => void;
+  onLoadOlder: () => void | Promise<void>;
 };
 
 export function MessageList({
@@ -858,91 +896,70 @@ export function MessageList({
     };
   }
   const processPaging = pagingOwnerRef.current.controller;
+  const [archiveQueued, setArchiveQueued] = useState(false);
+  const archiveQueuedRef = useRef(false);
+  const archiveQueueTokenRef = useRef(0);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const automaticCommitWaitersRef = useRef(new Map<string, {
+    anchorId: string;
+    tapeId: string;
+    resolve: () => void;
+  }>());
+  const automaticControlStateRef = useRef<{
+    generation: string;
+    initialized: boolean;
+  } | null>(null);
+  const [automaticProcess, setAutomaticProcess] = useState<{
+    generation: string;
+    loading: boolean;
+    error: boolean;
+  } | null>(null);
 
-  // Only genuine upward input creates a paging epoch. Scroll events caused by
-  // React/Virtuoso measurement or our viewport correction merely synchronize
-  // position and can never trigger another cursor on their own.
+  useEffect(() => {
+    archiveQueueTokenRef.current += 1;
+    archiveQueuedRef.current = false;
+    setArchiveQueued(false);
+  }, [processPaging]);
+
+  useEffect(() => () => {
+    for (const waiter of automaticCommitWaitersRef.current.values()) waiter.resolve();
+    automaticCommitWaitersRef.current.clear();
+  }, [processPaging]);
+
+  // User input is observed only to invalidate an older click's viewport
+  // correction. It never admits a history request: scrolling, touch momentum,
+  // keyboard navigation and scrollbar dragging are navigation, not pagination.
   useEffect(() => {
     const scroller = scrollParent;
     if (!scroller) return;
-    let touchY: number | null = null;
-    let touchUpSignaled = false;
     let touchMomentum = false;
     let touchIdleTimer: number | null = null;
-    let wheelUpSignaled = false;
-    let wheelIdleTimer: number | null = null;
-    let notifyFrame: number | null = null;
     let scrollbarPointerId: number | null = null;
-    let pointerUpSignaled = false;
-    const notifyRows = () => scroller.dispatchEvent(new Event("oc-upward-page-intent"));
-    const queueNotifyRows = () => {
-      if (notifyFrame !== null) return;
-      notifyFrame = window.requestAnimationFrame(() => {
-        notifyFrame = null;
-        notifyRows();
-      });
-    };
-    const signalUpward = () => {
-      processPaging.signalUpwardIntent();
-      // Wheel/touch/key default scrolling runs after its input handler. Admit
-      // paging on the next frame so the viewport anchor is captured at the
-      // position the user actually reached, never at the pre-gesture offset.
-      queueNotifyRows();
-    };
-    const onWheel = (event: WheelEvent) => {
-      // A trackpad/wheel gesture is a burst of events (including inertia), not
-      // one gesture per event. Keep one epoch until the burst is idle.
-      if (event.deltaY < 0 && !wheelUpSignaled) {
-        wheelUpSignaled = true;
-        signalUpward();
-      } else {
-        processPaging.signalUserInteraction();
-      }
-      if (wheelIdleTimer !== null) window.clearTimeout(wheelIdleTimer);
-      wheelIdleTimer = window.setTimeout(() => {
-        wheelIdleTimer = null;
-        wheelUpSignaled = false;
-      }, 240);
-    };
-    const onTouchStart = (event: TouchEvent) => {
+    const onWheel = () => processPaging.signalUserInteraction();
+    const onTouchStart = () => {
       processPaging.signalUserInteraction();
       touchMomentum = true;
       if (touchIdleTimer !== null) {
         window.clearTimeout(touchIdleTimer);
         touchIdleTimer = null;
       }
-      touchY = event.touches[0]?.clientY ?? null;
-      touchUpSignaled = false;
     };
-    const onTouchMove = (event: TouchEvent) => {
+    const onTouchMove = () => {
       touchMomentum = true;
-      const nextY = event.touches[0]?.clientY ?? null;
-      if (
-        !touchUpSignaled && nextY !== null && touchY !== null &&
-        nextY > touchY + 0.5
-      ) {
-        touchUpSignaled = true;
-        signalUpward();
-      } else {
-        processPaging.signalUserInteraction();
-      }
-      touchY = nextY;
+      processPaging.signalUserInteraction();
     };
-    const endTouch = (event: TouchEvent) => {
-      touchY = event.touches[0]?.clientY ?? null;
-      if (touchY === null) {
-        touchUpSignaled = false;
-        touchMomentum = true;
-        if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
-        touchIdleTimer = window.setTimeout(() => {
-          touchIdleTimer = null;
-          touchMomentum = false;
-        }, 240);
-      }
+    const endTouch = () => {
+      processPaging.signalUserInteraction();
+      touchMomentum = true;
+      if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+      touchIdleTimer = window.setTimeout(() => {
+        touchIdleTimer = null;
+        touchMomentum = false;
+      }, 240);
     };
     const cancelTouch = () => {
-      touchY = null;
-      touchUpSignaled = false;
+      processPaging.signalUserInteraction();
       touchMomentum = false;
       if (touchIdleTimer !== null) {
         window.clearTimeout(touchIdleTimer);
@@ -954,15 +971,7 @@ export function MessageList({
         (event.key === " " && event.shiftKey);
       const navigates = upward || event.key === "ArrowDown" || event.key === "PageDown" ||
         event.key === "End" || event.key === " ";
-      if (event.repeat) {
-        if (navigates) processPaging.signalUserInteraction();
-        return;
-      }
-      if (upward) {
-        signalUpward();
-      } else if (navigates) {
-        processPaging.signalUserInteraction();
-      }
+      if (navigates) processPaging.signalUserInteraction();
     };
     const onPointerDown = (event: PointerEvent) => {
       if (event.pointerType !== "mouse" || scrollbarPointerId !== null) return;
@@ -974,9 +983,7 @@ export function MessageList({
         event.clientX <= rect.left + gutter + 1;
       if (!inScrollbarGutter) return;
       scrollbarPointerId = event.pointerId;
-      pointerUpSignaled = false;
       processPaging.signalUserInteraction();
-      processPaging.syncScrollTop(scroller.scrollTop);
     };
     const endPointer = (event?: PointerEvent) => {
       if (
@@ -984,33 +991,21 @@ export function MessageList({
         (event && event.pointerId !== scrollbarPointerId)
       ) return;
       scrollbarPointerId = null;
-      pointerUpSignaled = false;
-      processPaging.syncScrollTop(scroller.scrollTop);
+      processPaging.signalUserInteraction();
     };
     const onWindowBlur = () => endPointer();
     const onScroll = () => {
       if (scrollbarPointerId !== null) {
-        const signaled = processPaging.signalPointerScroll(
-          scroller.scrollTop,
-          !pointerUpSignaled,
-        );
-        if (signaled) {
-          pointerUpSignaled = true;
-          notifyRows();
-        }
-      } else {
-        if (touchMomentum) {
-          processPaging.signalUserInteraction();
-          if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
-          touchIdleTimer = window.setTimeout(() => {
-            touchIdleTimer = null;
-            touchMomentum = false;
-          }, 240);
-        }
-        processPaging.syncScrollTop(scroller.scrollTop);
+        processPaging.signalUserInteraction();
+      } else if (touchMomentum) {
+        processPaging.signalUserInteraction();
+        if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
+        touchIdleTimer = window.setTimeout(() => {
+          touchIdleTimer = null;
+          touchMomentum = false;
+        }, 240);
       }
     };
-    processPaging.syncScrollTop(scroller.scrollTop);
     scroller.addEventListener("wheel", onWheel, { passive: true });
     scroller.addEventListener("touchstart", onTouchStart, { passive: true });
     scroller.addEventListener("touchmove", onTouchMove, { passive: true });
@@ -1023,9 +1018,7 @@ export function MessageList({
     window.addEventListener("blur", onWindowBlur);
     scroller.addEventListener("scroll", onScroll, { passive: true });
     return () => {
-      if (wheelIdleTimer !== null) window.clearTimeout(wheelIdleTimer);
       if (touchIdleTimer !== null) window.clearTimeout(touchIdleTimer);
-      if (notifyFrame !== null) window.cancelAnimationFrame(notifyFrame);
       scroller.removeEventListener("wheel", onWheel);
       scroller.removeEventListener("touchstart", onTouchStart);
       scroller.removeEventListener("touchmove", onTouchMove);
@@ -1052,11 +1045,136 @@ export function MessageList({
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
+  let latestProcessControl: ChatMessage | null = null;
+  for (let index = renderableMessages.length - 1; index >= 0; index -= 1) {
+    if (renderableMessages[index]?._turnTapeProcess === true) {
+      latestProcessControl = renderableMessages[index]!;
+      break;
+    }
+  }
+  const latestProcessGeneration = latestProcessControl
+    ? turnProcessPagingGeneration(historyGeneration, latestProcessControl)
+    : null;
+  const latestProcessInitialized = latestProcessControl?._turnTapeProcessExpanded === true;
+
+  useEffect(() => {
+    const previous = automaticControlStateRef.current;
+    if (
+      latestProcessGeneration && previous?.generation === latestProcessGeneration &&
+      previous.initialized && !latestProcessInitialized
+    ) {
+      processPaging.reset(latestProcessGeneration);
+    }
+    automaticControlStateRef.current = latestProcessGeneration
+      ? { generation: latestProcessGeneration, initialized: latestProcessInitialized }
+      : null;
+  }, [latestProcessGeneration, latestProcessInitialized, processPaging]);
+
+  // The latest process tail is owned above Virtuoso, so it starts when the
+  // session mounts even if a long final answer keeps its virtual row unmounted.
+  // A successful request retains the automatic claim until the new control
+  // state has committed through React; explicit archive/tape clicks wait in FIFO.
+  useLayoutEffect(() => {
+    for (const [generation, waiter] of automaticCommitWaitersRef.current) {
+      const current = messagesRef.current.find((message) => message.id === waiter.anchorId);
+      if (
+        current?._turnTapeProcessExpanded === true &&
+        current._turnTapeId === waiter.tapeId
+      ) {
+        automaticCommitWaitersRef.current.delete(generation);
+        waiter.resolve();
+      }
+    }
+  }, [messages, pagingGeneration]);
+
+  useEffect(() => {
+    const process = latestProcessControl;
+    const loadOlderTape = cb.onLoadOlderTape;
+    const tapeId = process?._turnTapeId;
+    const generation = latestProcessGeneration;
+    if (
+      !process || !generation || !loadOlderTape || !tapeId ||
+      latestProcessInitialized
+    ) {
+      setAutomaticProcess((current) => current?.generation === generation ? null : current);
+      return;
+    }
+
+    let disposed = false;
+    let started = false;
+    const start = () => {
+      if (disposed || started) return;
+      const claim = processPaging.begin(generation, false);
+      if (!claim) return;
+      started = true;
+      setAutomaticProcess({ generation, loading: true, error: false });
+      let resolveCommit!: () => void;
+      const committed = new Promise<void>((resolve) => { resolveCommit = resolve; });
+      automaticCommitWaitersRef.current.set(generation, {
+        anchorId: process.id,
+        tapeId,
+        resolve: resolveCommit,
+      });
+      void (async () => {
+        let failed = false;
+        try {
+          const result = await loadOlderTape(process.id, tapeId, null);
+          if (!result.ok) {
+            failed = true;
+            automaticCommitWaitersRef.current.delete(generation);
+            resolveCommit();
+          } else {
+            await committed;
+          }
+        } catch {
+          failed = true;
+          automaticCommitWaitersRef.current.delete(generation);
+          resolveCommit();
+        } finally {
+          if (!disposed) {
+            setAutomaticProcess({ generation, loading: false, error: failed });
+          }
+          processPaging.settle(claim);
+        }
+      })();
+    };
+    const unsubscribe = processPaging.subscribeSettled(start);
+    start();
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [
+    cb.onLoadOlderTape,
+    latestProcessInitialized,
+    latestProcessGeneration,
+    processPaging,
+  ]);
   const archivedThroughSeq = archive?.archivedThroughSeq ?? 0;
   const archivedAnchors = archive
     ? loadedArchivedMetrics(messages, archivedThroughSeq).anchors
     : 0;
   const archivedRemaining = Math.max(0, (archive?.archivedCount ?? 0) - archivedAnchors);
+  const requestOlderArchive = useCallback(() => {
+    if (
+      !archive || archivedRemaining <= 0 || archive.loading ||
+      archiveQueuedRef.current
+    ) return;
+    archiveQueuedRef.current = true;
+    setArchiveQueued(true);
+    const token = ++archiveQueueTokenRef.current;
+    const requestKey = `archive::${pagingGeneration}::${archivedThroughSeq}::${archivedAnchors}`;
+    // The new explicit navigation cancels any older tape anchor correction
+    // immediately; its network task still finishes before this FIFO slot.
+    processPaging.signalUserInteraction();
+    void processPaging.runExplicit(requestKey, async () => {
+      await archive.onLoadOlder();
+    }).finally(() => {
+      if (archiveQueueTokenRef.current !== token) return;
+      archiveQueuedRef.current = false;
+      setArchiveQueued(false);
+    });
+  }, [archive, archivedAnchors, archivedRemaining, archivedThroughSeq, pagingGeneration, processPaging]);
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
   const turnStart = currentTurnStartIndex(renderableMessages);
@@ -1067,6 +1185,28 @@ export function MessageList({
   const virtualItems = chunkTapePages(renderItems);
   const itemKey = (item: VirtualItem): string =>
     item.kind === "tape-page" ? item.key : renderItemKey(item);
+  // Give every already-loaded archive item a stable virtual coordinate. When
+  // another archive page is prepended, firstItemIndex decreases by exactly the
+  // number of new virtual items, so Virtuoso keeps the old viewport mounted.
+  // A mixed boundary item is deliberately excluded: it replaces the previous
+  // first tail item rather than adding another virtual row.
+  let archivedVirtualPrefixItems = 0;
+  if (archive && archivedThroughSeq > 0) {
+    for (const item of virtualItems) {
+      const itemMessages = virtualItemMessages(item);
+      if (
+        itemMessages.length === 0 ||
+        !itemMessages.every((message) => {
+          const orderSeq = typeof message._orderSeq === "number"
+            ? message._orderSeq
+            : message._seq;
+          return typeof orderSeq === "number" && orderSeq <= archivedThroughSeq;
+        })
+      ) break;
+      archivedVirtualPrefixItems += 1;
+    }
+  }
+  const firstItemIndex = TIMELINE_VIRTUAL_INDEX_ORIGIN - archivedVirtualPrefixItems;
   const renderItem = (it: RenderItem) => {
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
@@ -1116,6 +1256,17 @@ export function MessageList({
           activityInFooter={sending}
           historyGeneration={historyGeneration}
           processPaging={processPaging}
+          autoLoadLatestProcessTail={it.m.id === latestProcessControl?.id}
+          automaticProcessLoading={
+            it.m.id === latestProcessControl?.id &&
+            automaticProcess?.generation === latestProcessGeneration &&
+            automaticProcess.loading
+          }
+          automaticProcessError={
+            it.m.id === latestProcessControl?.id &&
+            automaticProcess?.generation === latestProcessGeneration &&
+            automaticProcess.error
+          }
           delegateCost={it.delegateCost}
           turnFinalAssistant={turnFinalAssistant}
           cb={cb}
@@ -1138,44 +1289,24 @@ export function MessageList({
       ))}
     </div>
   ) : renderItem(item);
-  const historyControl = archivedRemaining > 0 && archive && readOnly ? (
-    // Admin read-only viewer has no ordinary end-user scroll gesture contract;
-    // retain its explicit audit pagination action.
-    <div className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8">
+  const historyControl = archivedRemaining > 0 && archive ? (
+    <div
+      className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
+      data-testid="history-page-loader"
+    >
       <button
         type="button"
-        onClick={archive.onLoadOlder}
-        disabled={archive.loading}
-        aria-busy={archive.loading}
-        className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60"
+        onClick={requestOlderArchive}
+        disabled={archive.loading || archiveQueued}
+        aria-busy={archive.loading || archiveQueued}
+        className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
       >
-        {archive.loading
+        {archive.loading || archiveQueued
           ? <><Spinner size={12} /> 加载中…</>
           : archive.error
             ? <span className="text-danger">加载失败，点击重试</span>
-            : `向上滚动加载更早历史（还有 ${archivedRemaining} 条）`}
+            : `查看更早历史记录（还有 ${archivedRemaining} 条）`}
       </button>
-    </div>
-  ) : archivedRemaining > 0 && archive ? (
-    <div
-      className={archive.error
-        ? "mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-4"
-        : "h-px overflow-hidden"}
-      data-testid="history-page-loader"
-    >
-      {archive.error ? (
-        <button
-          type="button"
-          onClick={archive.onLoadOlder}
-          disabled={archive.loading}
-          aria-busy={archive.loading}
-          className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
-        >
-          <span className="text-danger">更早消息加载失败，点击重试</span>
-        </button>
-      ) : archive.loading ? (
-        <span className="sr-only" role="status">正在加载更早消息</span>
-      ) : null}
     </div>
   ) : null;
   const footer = (
@@ -1220,6 +1351,7 @@ export function MessageList({
       <Virtuoso
         customScrollParent={scrollParent}
         data={virtualItems}
+        firstItemIndex={firstItemIndex}
         context={{ header: historyControl, footer }}
         computeItemKey={(_index, item) => itemKey(item)}
         itemContent={(_index, item) => (
@@ -1234,9 +1366,6 @@ export function MessageList({
         increaseViewportBy={{ top: 800, bottom: 1200 }}
         overscan={400}
         followOutput={false}
-        startReached={() => {
-          if (archive && archivedRemaining > 0 && !archive.loading) archive.onLoadOlder();
-        }}
         components={TIMELINE_VIRTUOSO_COMPONENTS}
       />
     );

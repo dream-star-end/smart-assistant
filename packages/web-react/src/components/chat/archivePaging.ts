@@ -14,8 +14,8 @@
 import type { ChatMessage } from "../../lib/chat/model";
 
 /**
- * 当前 messages 数组里「已从云端拉回」的归档投影统计。
- * - rows:匹配水位的投影行数,用于保证刚拉回的可见行全部挂载。
+ * 当前 messages 数组里「已从云端拉回」的真实归档记录统计。
+ * - rows:匹配水位的真实记录行数,用于保证刚拉回的可见行全部挂载。
  * - anchors:distinct `_orderSeq` 数。lossless tape 的所有展开行共享该 anchor,用于从
  *   `archivedCount` 扣除真正已加载的归档 anchor。
  * archivedThroughSeq ≤ 0 或无归档时恒 0。O(n),n 为当前会话内存行数。
@@ -43,6 +43,72 @@ export function loadedArchivedMetrics(
  */
 export function correctedScrollTop(prevHeight: number, newHeight: number, prevTop: number): number {
   return prevTop + (newHeight - prevHeight);
+}
+
+export type VisibleVirtualRowAnchor = { key: string; top: number };
+
+/** Capture an actual rendered row instead of total scrollHeight. Bottom live
+ * growth then cannot contaminate correction for rows prepended at the top. */
+export function captureVisibleVirtualRowAnchor(
+  scroller: HTMLElement,
+): VisibleVirtualRowAnchor | null {
+  const viewport = scroller.getBoundingClientRect();
+  const rows = Array.from(
+    scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+  );
+  const row = rows.find((candidate) => {
+    const rect = candidate.getBoundingClientRect();
+    return rect.bottom > viewport.top && rect.top < viewport.bottom;
+  }) ?? rows.find((candidate) => candidate.getBoundingClientRect().bottom > viewport.top);
+  const key = row?.getAttribute("data-chat-virtual-key");
+  if (!row || !key) return null;
+  return { key, top: row.getBoundingClientRect().top - viewport.top };
+}
+
+/** Re-align one exact immutable virtual row. Returns false while Virtuoso has
+ * not mounted/measured that row yet, allowing the caller to retry next frame. */
+export function correctToVisibleVirtualRowAnchor(
+  scroller: HTMLElement,
+  anchor: VisibleVirtualRowAnchor,
+): boolean {
+  const row = Array.from(
+    scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]"),
+  ).find((candidate) => candidate.getAttribute("data-chat-virtual-key") === anchor.key);
+  if (!row) return false;
+  const currentTop = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  const delta = currentTop - anchor.top;
+  if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
+  return true;
+}
+
+type FrameScheduler = (callback: () => void) => void;
+
+/** Repeat row correction while Virtuoso finishes measuring. Real user input
+ * is supplied separately through `cancelled`, so programmatic scroll events
+ * do not mask a later wheel/touch/keyboard decision. */
+export function restoreVisibleVirtualRowAnchor(
+  scroller: HTMLElement,
+  anchor: VisibleVirtualRowAnchor,
+  cancelled: () => boolean,
+  schedule: FrameScheduler = (callback) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(callback);
+    else callback();
+  },
+): Promise<void> {
+  return new Promise((resolve) => {
+    let frames = 0;
+    const correct = () => {
+      if (cancelled()) {
+        resolve();
+        return;
+      }
+      correctToVisibleVirtualRowAnchor(scroller, anchor);
+      frames += 1;
+      if (frames < 12) schedule(correct);
+      else resolve();
+    };
+    schedule(correct);
+  });
 }
 
 /** 「加载更多」按钮态(§4/§5)。 */
