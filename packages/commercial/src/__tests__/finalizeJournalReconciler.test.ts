@@ -269,6 +269,7 @@ describe('alertStuckDurableFinalizing — 老化告警 · 行状态不变', () =
     // dedupe = 行 id + 天(YYYY-MM-DD),保证同一卡死行每天最多一条
     const today = new Date().toISOString().slice(0, 10)
     assert.equal(ev.dedupe_key, `${EVENTS.OPS_DAILY_ANOMALY}:finalize_stuck:req-stuck-1:${today}`)
+    assert.equal(ev.dedupe_all_statuses, true)
     // payload 判别字段:让运维/后续拆分能区分本源与 shell 日检
     assert.equal(ev.payload?.source, 'finalizeJournalReconciler')
     assert.equal(ev.payload?.kind, 'durable_finalizing_stuck')

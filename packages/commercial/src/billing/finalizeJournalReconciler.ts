@@ -237,6 +237,7 @@ export async function alertStuckDurableFinalizing(
         alert_age_ms: alertAgeMs,
       },
       dedupe_key: `${EVENTS.OPS_DAILY_ANOMALY}:finalize_stuck:${row.requestId}:${day}`,
+      dedupe_all_statuses: true,
     })
   }
   return rows.length

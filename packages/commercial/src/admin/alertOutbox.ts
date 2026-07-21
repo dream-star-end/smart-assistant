@@ -11,6 +11,7 @@
  *     只有一条 pending/failed 行。ON CONFLICT DO NOTHING 忽略重复 enqueue。
  *   - 已 sent / suppressed 的行不参与冲突判定,即"5 分钟前发过一次,现在再发一次"不会被误挡。
  *     业务层自己控制 dedupe_key 的时间窗口编码(例如 'account_pool.all_down:2026-04-23T09:00').
+ *   - 明确设置 dedupe_all_statuses=true 的周期事件按 key 跨 sent/suppressed 状态去重。
  *
  * 静默:
  *   - enqueueAlert 时一次性查 admin_alert_silences 判定 → 命中则 status='suppressed',
@@ -47,8 +48,13 @@ export interface AlertEventInput {
    * 建议形式:`${event_type}:${target_id}:${bucket}` 例如
    *   'account_pool.all_down:all:2026-04-23T09:00'   (每 15min 桶)
    *   'payment.first_topup:user:123'                (一人一次)
-   */
+  */
   dedupe_key?: string | null;
+  /**
+   * 是否让 dedupe_key 覆盖该通道内的全部历史状态。默认 false,保留状态恢复后可用
+   * 同 key 再次告警的既有语义;只用于 key 自带时间桶且要求桶内最多发送一次的事件。
+   */
+  dedupe_all_statuses?: boolean;
 }
 
 export interface OutboxRowView {
@@ -247,8 +253,17 @@ export async function enqueueAlert(
   for (const ch of subscribed) {
     const status = silence ? "suppressed" : "pending";
     try {
-      const r = await query<{ id: string }>(
-        `INSERT INTO admin_alert_outbox(
+      const params = [
+        event.event_type,
+        event.severity,
+        event.dedupe_key ?? null,
+        event.title,
+        event.body,
+        JSON.stringify(payload),
+        ch.id,
+        status,
+      ] as const;
+      const insertSql = `INSERT INTO admin_alert_outbox(
            event_type, severity, dedupe_key, title, body, payload,
            channel_id, status, next_attempt_at
          ) VALUES (
@@ -258,19 +273,34 @@ export async function enqueueAlert(
          ON CONFLICT (channel_id, dedupe_key)
            WHERE dedupe_key IS NOT NULL AND status IN ('pending', 'failed')
            DO NOTHING
-         RETURNING id::text AS id`,
-        [
-          event.event_type,
-          event.severity,
-          event.dedupe_key ?? null,
-          event.title,
-          event.body,
-          JSON.stringify(payload),
-          ch.id,
-          status,
-        ],
-      );
-      if (r.rowCount === 0) {
+         RETURNING id::text AS id`;
+      let inserted: boolean;
+      if (event.dedupe_all_statuses === true && event.dedupe_key) {
+        inserted = await tx(async (client) => {
+          // The partial unique index intentionally permits a new row after
+          // sent/suppressed. Opt-in bucketed events need a stronger fence, so
+          // serialize the check+insert per channel/key. The existence check is
+          // a separate statement after the lock to observe a preceding commit
+          // under READ COMMITTED.
+          await client.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            [`admin-alert-dedupe:${ch.id}:${event.dedupe_key}`],
+          );
+          const existing = await client.query(
+            `SELECT 1 FROM admin_alert_outbox
+              WHERE channel_id=$1::bigint AND dedupe_key=$2
+              LIMIT 1`,
+            [ch.id, event.dedupe_key],
+          );
+          if ((existing.rowCount ?? 0) > 0) return false;
+          const r = await client.query<{ id: string }>(insertSql, [...params]);
+          return (r.rowCount ?? 0) > 0;
+        });
+      } else {
+        const r = await query<{ id: string }>(insertSql, params);
+        inserted = (r.rowCount ?? 0) > 0;
+      }
+      if (!inserted) {
         deduped++;
         continue;
       }
