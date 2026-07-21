@@ -50,6 +50,7 @@ import {
   mergeArchivedHistory,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
+  reconcileTimelineBashTailAuxiliaries,
   type ServerTurnTerminal,
   type StoredPendingDispatch,
   type StoredSession,
@@ -2176,6 +2177,7 @@ export class ChatSocket {
       : applyServerIncremental(s.messages, authoritativeMessages, archive?.completedClientMessageId, {
           activeClientMessageId,
         });
+    s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
       s._historyRevision = incomingHistoryRevision;
@@ -2300,6 +2302,7 @@ export class ChatSocket {
       _historyPageKey: pageKey,
     }));
     s.messages = mergeTimelineHistoryPage(s.messages, page);
+    s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
     s._historyPageSerial = serial;
     s._timelineCursor = nextCursor;
     s._timelineHasMore = hasMore && typeof nextCursor === "string" && nextCursor.length > 0;
@@ -2308,6 +2311,63 @@ export class ChatSocket {
     rebuildIndexes(s);
     // Historical rows are already the exact Agent records. Do not run
     // delegate/goal/card normalizers that can group or rewrite them.
+    this.scheduleNotify();
+  }
+
+  /** Replace one hidden deferred Bash-tail locator with its Range+SHA verified
+   * exact runtime record, then reconcile the owning real ToolCard. */
+  resolveTimelineAuxiliary(
+    sessId: string,
+    unitKey: string,
+    records: ChatMessage[],
+  ): void {
+    const s = this.sessions.get(sessId);
+    if (!s) return;
+    const index = s.messages.findIndex((message) =>
+      message._timelineUnitKey === unitKey &&
+      message._timelineAuxiliary === "bash-tail" &&
+      message._payloadDeferred === true);
+    if (index < 0) return;
+    const locator = s.messages[index]!;
+    const exact = records.find((message) => {
+      if (message.role !== "runtime-event") return false;
+      const event = message._runtimeEvent;
+      if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+      const raw = event as Record<string, unknown>;
+      return raw.type === "system" && raw.subtype === "bash_output_tail" &&
+        typeof raw.tool_use_id === "string" && raw.tool_use_id.length > 0;
+    });
+    const next = [...s.messages];
+    if (!exact) {
+      next.splice(index, 1);
+    } else {
+      next[index] = {
+        ...exact,
+        _source: "server",
+        _orderSeq: locator._orderSeq,
+        _seq: locator._seq,
+        _turnTapeId: locator._turnTapeId,
+        _turnTapeOrdinal: locator._turnTapeOrdinal,
+        _recordOrdinal: locator._recordOrdinal,
+        _turnTapeSha256: locator._turnTapeSha256,
+        _turnTapeComplete: true,
+        _turnKey: locator._turnKey,
+        _dispatchOutcome: locator._dispatchOutcome,
+        _clientMessageId: exact._clientMessageId ?? locator._clientMessageId,
+        _timelineRecord: true,
+        _timelineAuxiliary: "bash-tail",
+        _timelineUnitKey: unitKey,
+        _historyPageLoadedFrom: locator._historyPageLoadedFrom,
+        _historyPageKey: locator._historyPageKey,
+        _payloadDeferred: undefined,
+        _payloadBytes: undefined,
+        _payloadSha256: undefined,
+      };
+    }
+    s.messages = reconcileTimelineBashTailAuxiliaries(next);
+    s._blockIdToMsgId = new Map();
+    s._agentGroups = new Map();
+    rebuildIndexes(s);
     this.scheduleNotify();
   }
 

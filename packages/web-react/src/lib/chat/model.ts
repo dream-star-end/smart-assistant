@@ -81,6 +81,14 @@ export type MsgUsage = {
 /** Bash 实时 tail 快照（单调守卫：totalBytes 不回退）。*/
 export type BashTail = { tail: string; totalBytes: number; truncatedHead: boolean };
 
+/** Durable ordering evidence for a reconciled historical Bash tail. Equal
+ * byte counts are resolved by the real timeline axes, never page arrival. */
+export type TimelineBashTailEvidence = {
+  orderSeq: number;
+  tapeId: string;
+  ordinal: number;
+};
+
 /**
  * 生成占位卡的本地状态（需求 C）。imageEdit（编辑/评论/调整大小）提交时由
  * socket.sendMessage 注入一条**本地专属**行承载它：turn 生成期间在对话流内占位
@@ -133,6 +141,8 @@ export type ChildBlock = {
   outputJson?: unknown;
   error?: boolean;
   bashTail?: BashTail;
+  _runtimeBashTailEvidence?: TimelineBashTailEvidence;
+  childBlocks?: ChildBlock[];
   tail?: string;
   totalBytes?: number;
   truncatedHead?: boolean;
@@ -195,6 +205,8 @@ export type ChatMessage = {
   _turnOwnerId?: string;
   /** Master-authored exact logical turn key used for targeted billing updates. */
   _turnKey?: string;
+  /** A post-terminal continuation tape owns records from this earlier turn. */
+  _continuationOfTurnKey?: string;
   // ── user ──
   status?: UserMsgStatus;
   _media?: MediaRef[];
@@ -276,6 +288,9 @@ export type ChatMessage = {
   // ── one real historical timeline (server-authored; browser memory only) ──
   /** Exact durable record from the unified chronological history stream. */
   _timelineRecord?: boolean;
+  /** Hidden exact evidence used to reconcile a real visible record. It never
+   * enters virtualization or consumes a logical history slot. */
+  _timelineAuxiliary?: "bash-tail" | "terminal";
   /** Stable server identity for one logical visible record. */
   _timelineUnitKey?: string;
   /** Exact logical order inside one immutable physical tape record. */
@@ -297,6 +312,8 @@ export type ChatMessage = {
   _turnTapeProcessCursor?: number | null;
   /** 历史 Bash tail 并入 agent-group 子工具后的纯展示修订号；不持久化、不替代 tape。 */
   _runtimeBashTailRevision?: number;
+  /** Exact durable ordering proof for the currently applied Bash tail. */
+  _runtimeBashTailEvidence?: TimelineBashTailEvidence;
 
   /** 空轮 notice 标记。*/
   _emptyTurn?: boolean;

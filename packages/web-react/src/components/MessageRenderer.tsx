@@ -110,7 +110,11 @@ export const MessageRenderer = memo(
       turnFinalAssistant,
       activityInFooter,
     };
-    if (message._timelineRecord !== true && isRedundantRuntimeEnvelope(message)) return null;
+    // Runtime envelopes and hidden reconciliation evidence are audit/transport
+    // data, not conversation cards. Their genuine thinking/tool/assistant
+    // counterparts are separate equal-rank timeline records.
+    if (message._timelineAuxiliary || message.role === "runtime-event") return null;
+    if (isRedundantRuntimeEnvelope(message)) return null;
     if (message._payloadDeferred) {
       return (
         <DeferredTapeRecordCard
@@ -135,9 +139,6 @@ export const MessageRenderer = memo(
     }
     if (message._turnStatusRecord) {
       return <TurnStatusCard msg={message} cb={cb} currentTurn={inActiveTurn} />;
-    }
-    if (message.role === "runtime-event") {
-      return <RuntimeEventCard message={message} />;
     }
     switch (messageKind(message)) {
       case "user":
@@ -978,7 +979,9 @@ export function MessageList({
       !m.id.startsWith("projection-") &&
       !m.id.startsWith("oc-dispatch-err:") &&
       m._turnTapeProcess !== true &&
-      (m._timelineRecord === true || !isRedundantRuntimeEnvelope(m)) &&
+      m._timelineAuxiliary === undefined &&
+      m.role !== "runtime-event" &&
+      !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
   const legacyArchivedRemaining = archive?.hasMore === undefined
