@@ -32,6 +32,20 @@ const WORKER_BOOT_LABEL = 'com.openclaude.plugin.boot_id'
 const WORKER_SESSION_LABEL = 'com.openclaude.plugin.session_id'
 const WORKER_DIGEST_LABEL = 'com.openclaude.plugin.worker_digest'
 
+export function resolveWeiboWorkerResources(kind: 'action' | 'login'): {
+  memoryBytes: number
+  memorySwapBytes: number
+  pidsLimit: number
+  shmSizeBytes: number
+} {
+  return {
+    memoryBytes: 768 * 1024 * 1024,
+    memorySwapBytes: 768 * 1024 * 1024,
+    pidsLimit: kind === 'login' ? 256 : 128,
+    shmSizeBytes: kind === 'login' ? 256 * 1024 * 1024 : 64 * 1024 * 1024,
+  }
+}
+
 import {
   WEIBO_DRIVER_ID,
   WEIBO_DRIVER_VERSION,
@@ -517,6 +531,7 @@ export class WeiboDockerService {
         )
           throw new WeiboRuntimeError('UNAVAILABLE', 'worker input directory is unsafe')
       }
+      const resources = resolveWeiboWorkerResources(args.kind)
       container = await this.createContainerInHostSlot({
         Image: this.opts.imageId,
         User: '1000:1000',
@@ -556,11 +571,11 @@ export class WeiboDockerService {
           CapAdd: [],
           SecurityOpt: ['no-new-privileges'],
           Privileged: false,
-          Memory: args.kind === 'login' ? 768 * 1024 * 1024 : 384 * 1024 * 1024,
-          MemorySwap: args.kind === 'login' ? 768 * 1024 * 1024 : 384 * 1024 * 1024,
+          Memory: resources.memoryBytes,
+          MemorySwap: resources.memorySwapBytes,
           MemorySwappiness: 0,
           NanoCpus: 1_000_000_000,
-          PidsLimit: args.kind === 'login' ? 256 : 128,
+          PidsLimit: resources.pidsLimit,
           Tmpfs: {
             '/tmp': 'rw,nosuid,nodev,noexec,size=128m,mode=0700,uid=1000,gid=1000',
             '/state': 'rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=1000,gid=1000',
@@ -595,7 +610,7 @@ export class WeiboDockerService {
           RestartPolicy: { Name: 'no', MaximumRetryCount: 0 },
           LogConfig: { Type: 'none', Config: {} },
           AutoRemove: false,
-          ShmSize: args.kind === 'login' ? 256 * 1024 * 1024 : 64 * 1024 * 1024,
+          ShmSize: resources.shmSizeBytes,
         },
       })
       if (args.signal?.aborted) throw args.signal.reason
