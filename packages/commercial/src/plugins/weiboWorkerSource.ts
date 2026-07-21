@@ -170,6 +170,7 @@ function filteredState(state, domains, origins) {
 }
 function digest(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 function cleanText(value, max) { return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max); }
+function cleanPostText(value, max) { return cleanText(String(value || '').replace(/ \u200B{3}$/g, ''), max); }
 function countFrom(value) {
   const text = cleanText(value, 40).replace(/,/g, '');
   const match = /(\d+(?:\.\d+)?)\s*([万亿]?)/.exec(text);
@@ -351,7 +352,7 @@ async function projectPost(card, selfId, expectedUserId, expectedPostId) {
     };
   }, expectedUserId && expectedPostId ? { userId: expectedUserId, postId: expectedPostId } : null);
   if (!data) throw new Error('post');
-  const stable = { id: data.id, userId: data.userId, text: cleanText(data.text, 20000), images: data.images.map((image) => image.url) };
+  const stable = { id: data.id, userId: data.userId, text: cleanPostText(data.text, 20000), images: data.images.map((image) => image.url) };
   return {
     id: data.id,
     userId: data.userId,
