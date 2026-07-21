@@ -668,7 +668,12 @@ export function useChatSocket(opts: {
           page.hasMore,
           page.timelineGeneration,
         );
-        return { ok: true, loaded: msgs.length, hasMore: !!page.hasMore };
+        const visibleLoaded = msgs.filter((message) =>
+          message._turnTapeProcess !== true &&
+          message._timelineAuxiliary === undefined &&
+          message.role !== "runtime-event"
+        ).length;
+        return { ok: true, loaded: visibleLoaded, hasMore: !!page.hasMore };
       } catch (error) {
         if (error instanceof ApiError && error.status === 409) socket.syncHistoryNow(sessId);
         return { ok: false, loaded: 0, hasMore: true, error: true }; // 失败:保留"可重试",hasMore 不封死
@@ -721,6 +726,44 @@ export function useChatSocket(opts: {
     },
     [userId],
   );
+  const auxiliaryHydrationRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const [sessId, session] of socket.sessions) {
+      for (const message of session.messages) {
+        if (
+          message._timelineAuxiliary !== "bash-tail" ||
+          message._payloadDeferred !== true ||
+          typeof message._timelineUnitKey !== "string" ||
+          typeof message._turnTapeId !== "string" ||
+          typeof message._recordOrdinal !== "number" ||
+          !Number.isSafeInteger(message._recordOrdinal)
+        ) continue;
+        const requestKey = `${userId ?? ""}\0${sessId}\0${message._timelineUnitKey}`;
+        if (auxiliaryHydrationRef.current.has(requestKey)) continue;
+        auxiliaryHydrationRef.current.add(requestKey);
+        void fetchTapeRecordPayload(
+          sessId,
+          message._turnTapeId,
+          message._recordOrdinal,
+          {
+            recordId: message.id,
+            role: message.role,
+            ...(typeof message._payloadSha256 === "string"
+              ? { contentSha256: message._payloadSha256 }
+              : {}),
+          },
+        ).then((records) => {
+          if (records) socket.resolveTimelineAuxiliary(sessId, message._timelineUnitKey!, records);
+        }).catch(() => {
+          // The exact locator remains resident and can retry after the next
+          // history/sync event; a transient Range failure never creates a
+          // substitute ToolCard or discards the visible transcript.
+        }).finally(() => {
+          auxiliaryHydrationRef.current.delete(requestKey);
+        });
+      }
+    }
+  }, [fetchTapeRecordPayload, snap.version, socket, userId]);
   const peekTapeRecordPayload = useCallback<UseChatSocket["peekTapeRecordPayload"]>(
     (sessId, tapeId, recordOrdinal, expected) => {
       if (

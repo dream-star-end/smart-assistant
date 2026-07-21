@@ -282,7 +282,7 @@ describe("deferred oversized immutable record", () => {
 });
 
 describe("runtime event", () => {
-  test("raw persisted event is inspectable and never silently filtered", () => {
+  test("raw persisted transport/audit event never becomes a conversation card", () => {
     renderMsg({
       id: "runtime-1",
       role: "runtime-event",
@@ -291,7 +291,7 @@ describe("runtime event", () => {
       _runtimeSource: "gateway",
       _runtimeEvent: { type: "progress", subtype: "tool_delta", exact: "原始事件" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /progress · tool_delta/ }));
-    expect(screen.getByText(/原始事件/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /progress · tool_delta/ })).toBeNull();
+    expect(screen.queryByText(/原始事件/)).toBeNull();
   });
 });

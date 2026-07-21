@@ -3677,6 +3677,15 @@ type UnifiedTimelineStatusRow = {
   terminal_at: Date | null;
 };
 
+type UnifiedTimelineTapeWindow = {
+  anchor: MessageLike;
+  orderSeq: number;
+  header: UnifiedTimelineTapeHeader;
+  /** Exact half-open physical interval consumed by this browser page. */
+  lowerOrdinal: number;
+  upperOrdinal: number;
+};
+
 function timelineOuterKey(message: MessageLike, orderSeq: number): string {
   return `outer:${orderSeq}:${typeof message.id === "string" ? message.id : "anonymous"}`;
 }
@@ -3685,9 +3694,10 @@ function timelineTapeKey(tapeId: string, ordinal: number, logicalIndex: number, 
   return `tape:${tapeId}:${ordinal}:${logicalIndex}:${typeof id === "string" ? id : "anonymous"}`;
 }
 
-/** Read only enough durable outer anchors to cover one physical-record page.
- * Archive chunks are walked newest-first and stop as soon as the bounded
- * candidate pool is full; no total-session traversal or projection is used. */
+/** Read enough durable outer anchors to cover one logical browser page.
+ * Archive chunks are walked newest-first. The caller expands `maxCandidates`
+ * inside the same repeatable-read snapshot when transport-only tapes hide the
+ * next semantic record; no projection or fabricated replacement is used. */
 async function readUnifiedTimelineOuterCandidates(
   client: PoolClient,
   sessionId: string,
@@ -3696,7 +3706,7 @@ async function readUnifiedTimelineOuterCandidates(
   archivedThroughSeq: number,
   cursor: ClientTimelineCursor | null,
   maxCandidates: number,
-): Promise<{ messages: MessageLike[]; snapshotMaxSeq: number }> {
+): Promise<{ messages: MessageLike[]; snapshotMaxSeq: number; hasOlderCandidates: boolean }> {
   let hot: MessageLike[] = [];
   try {
     const parsed = JSON.parse(hotJson);
@@ -3727,10 +3737,18 @@ async function readUnifiedTimelineOuterCandidates(
     ) return false;
     return orderSeq < beforeOrderSeq || (resumeTape && orderSeq === beforeOrderSeq);
   };
-  const pool: MessageLike[] = hot.filter(eligible);
+  const deduped = new Map<string, MessageLike>();
+  const addEligible = (message: MessageLike): void => {
+    if (!eligible(message)) return;
+    const orderSeq = message._orderSeq as number;
+    const key = timelineOuterKey(message, orderSeq);
+    if (!deduped.has(key)) deduped.set(key, message);
+  };
+  for (const message of hot) addEligible(message);
   let beforeLastSeq: number | null = null;
+  let archiveExhausted = archivedThroughSeq <= 0;
   const archiveBefore = Math.min(Number.MAX_SAFE_INTEGER, beforeOrderSeq + (resumeTape ? 1 : 0));
-  while (pool.length <= maxCandidates && archivedThroughSeq > 0) {
+  while (deduped.size <= maxCandidates && !archiveExhausted) {
     const chunks = (
       await client.query<{ messages: string; last_seq: string }>(
         `SELECT messages,last_seq::text
@@ -3742,37 +3760,34 @@ async function readUnifiedTimelineOuterCandidates(
         [sessionId, userId, archiveBefore, beforeLastSeq],
       )
     ).rows;
-    if (chunks.length === 0) break;
+    if (chunks.length === 0) {
+      archiveExhausted = true;
+      break;
+    }
     for (const chunk of chunks) {
       beforeLastSeq = bigIntNum(chunk.last_seq, "archive last_seq");
       try {
         const parsed = JSON.parse(chunk.messages);
         if (Array.isArray(parsed)) {
           for (const message of deriveArchivedOrderSeqsForRead(parsed as MessageLike[])) {
-            if (eligible(message)) pool.push(message);
+            addEligible(message);
           }
         }
       } catch {
         // Match the existing archive contract: one malformed immutable chunk
         // does not authorize fabricated replacement content.
       }
-      if (pool.length > maxCandidates) break;
+      if (deduped.size > maxCandidates) break;
     }
-    if (pool.length > maxCandidates || chunks.length < 4) break;
+    if (chunks.length < 4) archiveExhausted = true;
+    if (deduped.size > maxCandidates) break;
   }
 
-  const deduped = new Map<string, MessageLike>();
-  for (const message of pool) {
-    const orderSeq = message._orderSeq as number;
-    const key = timelineOuterKey(message, orderSeq);
-    if (!deduped.has(key)) deduped.set(key, message);
-  }
+  const ordered = [...deduped.values()].sort(compareMessagesByOrder);
   return {
-    messages: [...deduped.values()]
-      .sort(compareMessagesByOrder)
-      .slice(-maxCandidates)
-      .reverse(),
+    messages: ordered.slice(-maxCandidates).reverse(),
     snapshotMaxSeq,
+    hasOlderCandidates: deduped.size > maxCandidates || !archiveExhausted,
   };
 }
 
@@ -3835,6 +3850,7 @@ async function readUnifiedTimelineTapeHeads(
              FROM client_session_turn_tape_records
             WHERE session_id=$1 AND user_id=$2 AND tape_id=requested.tape_id
               AND ordinal < requested.before_ordinal
+              AND role <> 'runtime-event'
             ORDER BY ordinal DESC
             LIMIT $5
          ) r ON TRUE
@@ -3855,6 +3871,238 @@ async function readUnifiedTimelineTapeHeads(
     byTape.set(row.tape_id, list);
   }
   return byTape;
+}
+
+/** Bash stdout tails are the sole runtime envelopes that carry a user-facing
+ * fact not already represented by a semantic tape row. They travel as hidden
+ * exact evidence and update their owning ToolCard; every other runtime
+ * envelope stays in the immutable audit tape and never consumes a browser
+ * history slot. The model sidecar is only an ordinal index. UI bytes always
+ * come from the SHA-verified visible payload path below. */
+async function readUnifiedTimelineBashTailAuxiliaries(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  windows: UnifiedTimelineTapeWindow[],
+  inlineBudgetBytes: number,
+): Promise<MessageLike[]> {
+  if (windows.length === 0) return [];
+  const heads = (
+    await client.query<(DirectTapePageHead & { tape_id: string })>(
+      `WITH requested(tape_id,lower_ordinal,upper_ordinal) AS (
+         SELECT * FROM unnest($3::text[],$4::integer[],$5::integer[])
+       )
+       SELECT requested.tape_id,r.msg_id,r.ordinal,r.role,r.ts::text,
+              r.content_sha256,
+              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,
+              r.visible_content_sha256
+         FROM requested
+         JOIN client_session_turn_tape_records r
+           ON r.session_id=$1 AND r.user_id=$2 AND r.tape_id=requested.tape_id
+          AND r.ordinal >= requested.lower_ordinal
+          AND r.ordinal < requested.upper_ordinal
+        WHERE r.role='runtime-event'
+          AND (
+            EXISTS (
+              SELECT 1 FROM client_session_turn_tape_model_records m
+               WHERE m.session_id=r.session_id AND m.user_id=r.user_id
+                 AND m.tape_id=r.tape_id AND m.physical_ordinal=r.ordinal
+                 AND m.role='tool'
+            )
+            OR (
+              r.model_sidecar_complete=FALSE
+              AND convert_from(COALESCE(r.visible_payload,r.payload),'UTF8') LIKE '%bash_output_tail%'
+            )
+          )
+        ORDER BY requested.tape_id,r.ordinal`,
+      [
+        sessionId,
+        userId,
+        windows.map((window) => window.header.tapeId),
+        windows.map((window) => window.lowerOrdinal),
+        windows.map((window) => window.upperOrdinal),
+      ],
+    )
+  ).rows;
+  const headsByTape = new Map<string, DirectTapePageHead[]>();
+  for (const head of heads) {
+    const list = headsByTape.get(head.tape_id) ?? [];
+    list.push(head);
+    headsByTape.set(head.tape_id, list);
+  }
+
+  type TailCandidate = {
+    message: MessageLike;
+    head: DirectTapePageHead;
+    window: UnifiedTimelineTapeWindow;
+    ownerTurnKey: string;
+    parentToolUseId: string;
+    toolUseId: string;
+    totalBytes: number;
+    ordinal: number;
+  };
+  const enrich = (
+    message: MessageLike,
+    head: DirectTapePageHead,
+    window: UnifiedTimelineTapeWindow,
+  ): MessageLike => ({
+    ...message,
+    _source: "server",
+    _orderSeq: window.orderSeq,
+    ...(typeof window.anchor._seq === "number" ? { _seq: window.anchor._seq } : {}),
+    _turnTapeId: window.header.tapeId,
+    _turnTapeOrdinal: head.ordinal,
+    _recordOrdinal: head.ordinal,
+    _turnTapeSha256: window.header.tapeSha256,
+    _turnTapeComplete: true,
+    _turnKey: window.header.turnKey,
+    _dispatchOutcome: window.header.status,
+    ...(window.header.clientMessageId && typeof message._clientMessageId !== "string"
+      ? { _clientMessageId: window.header.clientMessageId }
+      : {}),
+    _timelineRecord: true,
+    _timelineAuxiliary: "bash-tail",
+    _timelineUnitKey: `aux:tail:${window.header.tapeId}:${head.ordinal}`,
+  });
+  const locator = (
+    head: DirectTapePageHead,
+    window: UnifiedTimelineTapeWindow,
+  ): MessageLike => enrich(
+    deferredTapeRecord(
+      window.header.tapeId,
+      window.header.tapeSha256,
+      { ...head, content_sha256: head.visible_content_sha256 ?? undefined },
+      bigIntNum(head.payload_bytes, "turn tape timeline bash-tail payload bytes"),
+    ),
+    head,
+    window,
+  );
+  const candidateWins = (candidate: TailCandidate, previous: TailCandidate): boolean => {
+    if (candidate.totalBytes !== previous.totalBytes) return candidate.totalBytes > previous.totalBytes;
+    if (candidate.window.orderSeq !== previous.window.orderSeq) {
+      return candidate.window.orderSeq > previous.window.orderSeq;
+    }
+    const tapeOrder = candidate.window.header.tapeId.localeCompare(previous.window.header.tapeId);
+    return tapeOrder !== 0 ? tapeOrder > 0 : candidate.ordinal > previous.ordinal;
+  };
+
+  // A historical continuation can contain thousands of snapshots. Scan them
+  // in bounded DB hydration quanta, but return only the deterministic winner
+  // for each real tool. This is lossless state reconciliation, not a content
+  // cap: every candidate participates and deferred records retain their exact
+  // Range+SHA locator.
+  const winners = new Map<string, TailCandidate>();
+  const deferred: MessageLike[] = [];
+  for (const window of windows) {
+    const tapeHeads = headsByTape.get(window.header.tapeId) ?? [];
+    if (tapeHeads.length === 0) continue;
+    const inlineHeads: DirectTapePageHead[] = [];
+    let inlineBytes = 0;
+    const flush = async (): Promise<void> => {
+      if (inlineHeads.length === 0) return;
+      const selectedHeads = inlineHeads.splice(0);
+      inlineBytes = 0;
+      const hydrated = await hydrateDirectTapePage(
+        client,
+        sessionId,
+        userId,
+        window.header.tapeId,
+        window.header.tapeSha256,
+        window.header.billingAnchorId,
+        selectedHeads,
+      );
+      const headByOrdinal = new Map(selectedHeads.map((head) => [head.ordinal, head]));
+      for (const message of hydrated) {
+        const ordinal = typeof message._recordOrdinal === "number" ? message._recordOrdinal : -1;
+        const head = headByOrdinal.get(ordinal);
+        if (!head || message._payloadDeferred === true) continue;
+        const event = message._runtimeEvent;
+        if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+        const raw = event as Record<string, unknown>;
+        if (
+          raw.type !== "system" || raw.subtype !== "bash_output_tail" ||
+          typeof raw.tool_use_id !== "string" || raw.tool_use_id.length === 0
+        ) continue;
+        const ownerTurnKey = typeof message._continuationOfTurnKey === "string" &&
+            message._continuationOfTurnKey.length > 0
+          ? message._continuationOfTurnKey
+          : window.header.turnKey;
+        const parentToolUseId = typeof raw.parent_tool_use_id === "string"
+          ? raw.parent_tool_use_id
+          : "";
+        const totalBytes = typeof raw.total_bytes === "number" && Number.isFinite(raw.total_bytes)
+          ? Math.max(0, raw.total_bytes)
+          : 0;
+        const candidate: TailCandidate = {
+          message: enrich(message, head, window),
+          head,
+          window,
+          ownerTurnKey,
+          parentToolUseId,
+          toolUseId: raw.tool_use_id,
+          totalBytes,
+          ordinal,
+        };
+        const key = `${ownerTurnKey}\0${parentToolUseId ? "child" : "top"}\0${raw.tool_use_id}`;
+        const previous = winners.get(key);
+        if (!previous || candidateWins(candidate, previous)) winners.set(key, candidate);
+      }
+    };
+    for (const head of tapeHeads) {
+      const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline bash-tail payload bytes");
+      if (payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES) {
+        await flush();
+        deferred.push(locator(head, window));
+        continue;
+      }
+      if (
+        inlineHeads.length >= TAPE_RECORD_PAGE_MAX_ROWS ||
+        (inlineHeads.length > 0 && inlineBytes + payloadBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+      ) await flush();
+      inlineHeads.push(head);
+      inlineBytes += payloadBytes;
+    }
+    await flush();
+  }
+
+  let budget = Math.max(0, inlineBudgetBytes);
+  const orderedWinners = [...winners.values()].sort((a, b) => {
+    if (a.window.orderSeq !== b.window.orderSeq) return a.window.orderSeq - b.window.orderSeq;
+    const tapeOrder = a.window.header.tapeId.localeCompare(b.window.header.tapeId);
+    return tapeOrder !== 0 ? tapeOrder : a.ordinal - b.ordinal;
+  });
+  const auxiliaries = [...deferred];
+  for (const winner of orderedWinners) {
+    const bytes = Buffer.byteLength(JSON.stringify(winner.message), "utf8");
+    if (bytes <= budget) {
+      auxiliaries.push(winner.message);
+      budget -= bytes;
+    } else {
+      auxiliaries.push(locator(winner.head, winner.window));
+    }
+  }
+  return auxiliaries;
+}
+
+function unifiedTimelineTerminalAuxiliary(window: UnifiedTimelineTapeWindow): MessageLike {
+  return {
+    id: `timeline-terminal:${window.header.tapeId}`,
+    role: "system",
+    text: "",
+    ts: typeof window.anchor.ts === "number" ? window.anchor.ts : 0,
+    _source: "server",
+    ...(typeof window.anchor._seq === "number" ? { _seq: window.anchor._seq } : {}),
+    _orderSeq: window.orderSeq,
+    _turnTapeId: window.header.tapeId,
+    _turnTapeSha256: window.header.tapeSha256,
+    _turnTapeComplete: true,
+    _turnKey: window.header.turnKey,
+    _dispatchOutcome: window.header.status,
+    ...(window.header.clientMessageId ? { _clientMessageId: window.header.clientMessageId } : {}),
+    _timelineRecord: true,
+    _timelineAuxiliary: "terminal",
+    _timelineUnitKey: `aux:terminal:${window.header.tapeId}`,
+  };
 }
 
 async function hydrateUnifiedTimelineTapeUnits(
@@ -4088,106 +4336,131 @@ async function readClientTimelinePageImpl(
       throw new ClientTimelineCursorStaleError();
     }
     const archivedThroughSeq = bigIntNumOr(session.archived_through_seq, 0);
-    const outer = await readUnifiedTimelineOuterCandidates(
-      client,
-      sessionId,
-      userId,
-      session.messages,
-      archivedThroughSeq,
-      cursor,
-      cappedLimit + 1,
-    );
-    const tapeAnchors = outer.messages.filter((message) =>
-      message._turnTapeComplete === true &&
-      typeof message._turnTapeId === "string" &&
-      typeof message._turnTapeSha256 === "string");
-    const tapeIds = [...new Set(tapeAnchors.map((message) => message._turnTapeId as string))];
-    const headers = await readUnifiedTimelineTapeHeaders(client, sessionId, userId, tapeIds);
-    const headRequests = tapeAnchors.map((anchor) => ({
-      tapeId: anchor._turnTapeId as string,
-      beforeOrdinal: cursor?.tapeId === anchor._turnTapeId
-        ? (cursor?.beforeOrdinal ?? 0)
-        : 2_147_483_647,
-    }));
-    const headsByTape = await readUnifiedTimelineTapeHeads(
-      client,
-      sessionId,
-      userId,
-      headRequests,
-      cappedLimit + 1,
-    );
-
-    if (cursor?.tapeId) {
-      const resumeAnchor = tapeAnchors.find((anchor) =>
-        anchor._orderSeq === cursor.beforeOrderSeq && anchor._turnTapeId === cursor.tapeId);
-      const header = headers.get(cursor.tapeId);
-      if (
-        !resumeAnchor || !header ||
-        resumeAnchor._turnTapeSha256 !== cursor.tapeSha256 ||
-        header.tapeSha256 !== cursor.tapeSha256
-      ) throw new ClientTimelineCursorStaleError();
-    }
-
-    const selected: UnifiedTimelineSelectedUnit[] = [];
+    let candidateLimit = cappedLimit + 1;
+    let outer!: Awaited<ReturnType<typeof readUnifiedTimelineOuterCandidates>>;
+    let selected: UnifiedTimelineSelectedUnit[] = [];
+    let windows: UnifiedTimelineTapeWindow[] = [];
     let inlineBytes = 0;
     let hasMore = false;
     let continuation: { anchor: MessageLike; header: UnifiedTimelineTapeHeader; beforeOrdinal: number } | null = null;
-    outerLoop: for (const anchor of outer.messages) {
-      const orderSeq = anchor._orderSeq;
-      if (typeof orderSeq !== "number" || !Number.isSafeInteger(orderSeq) || orderSeq < 1) continue;
-      if (
-        anchor._turnTapeComplete === true &&
-        typeof anchor._turnTapeId === "string" &&
-        typeof anchor._turnTapeSha256 === "string"
-      ) {
-        const header = headers.get(anchor._turnTapeId);
-        if (!header) throw new Error(`[pgSessions] unified timeline finalized tape missing: ${anchor._turnTapeId}`);
-        if (header.tapeSha256 !== anchor._turnTapeSha256) {
-          throw new Error(`[pgSessions] unified timeline tape hash mismatch: ${anchor._turnTapeId}`);
-        }
-        const heads = headsByTape.get(header.tapeId) ?? [];
-        if (heads.length === 0 && cursor?.tapeId !== header.tapeId) {
-          throw new Error(`[pgSessions] unified timeline finalized tape has no records: ${header.tapeId}`);
-        }
-        for (let index = 0; index < heads.length; index++) {
-          const head = heads[index]!;
-          const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
-          const pageBytes = payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES ? 0 : payloadBytes;
-          if (
-            selected.length >= cappedLimit ||
-            (selected.length > 0 && inlineBytes + pageBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
-          ) {
-            hasMore = true;
-            const previous = selected.at(-1);
-            continuation = {
-              anchor,
-              header,
-              beforeOrdinal: previous?.kind === "tape" && previous.header.tapeId === header.tapeId
-                  ? previous.head.ordinal
-                  : head.ordinal + 1,
-            };
-            break outerLoop;
-          }
-          selected.push({ kind: "tape", anchor, orderSeq, header, head });
-          inlineBytes += pageBytes;
-          if (index + 1 < heads.length && selected.length >= cappedLimit) {
-            hasMore = true;
-            continuation = { anchor, header, beforeOrdinal: head.ordinal };
-            break outerLoop;
-          }
-        }
-        continue;
+
+    // Runtime transport rows and continuation-only tapes do not consume a
+    // logical history slot. Expand the outer candidate window until this page
+    // either finds the next genuine browser record or reaches the immutable
+    // beginning. Re-running inside this repeatable-read transaction preserves
+    // one snapshot while avoiding any arbitrary transcript-wide cap.
+    for (;;) {
+      outer = await readUnifiedTimelineOuterCandidates(
+        client,
+        sessionId,
+        userId,
+        session.messages,
+        archivedThroughSeq,
+        cursor,
+        candidateLimit,
+      );
+      const tapeAnchors = outer.messages.filter((message) =>
+        message._turnTapeComplete === true &&
+        typeof message._turnTapeId === "string" &&
+        typeof message._turnTapeSha256 === "string");
+      const tapeIds = [...new Set(tapeAnchors.map((message) => message._turnTapeId as string))];
+      const headers = await readUnifiedTimelineTapeHeaders(client, sessionId, userId, tapeIds);
+      const beforeByTape = new Map<string, number>();
+      for (const anchor of tapeAnchors) {
+        const tapeId = anchor._turnTapeId as string;
+        beforeByTape.set(tapeId, cursor?.tapeId === tapeId
+          ? (cursor.beforeOrdinal ?? 0)
+          : 2_147_483_647);
       }
-      const pageBytes = Buffer.byteLength(JSON.stringify(anchor), "utf8");
-      if (
-        selected.length >= cappedLimit ||
-        (selected.length > 0 && inlineBytes + pageBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
-      ) {
-        hasMore = true;
-        break;
+      const headRequests = [...beforeByTape].map(([tapeId, beforeOrdinal]) => ({ tapeId, beforeOrdinal }));
+      const headsByTape = await readUnifiedTimelineTapeHeads(
+        client,
+        sessionId,
+        userId,
+        headRequests,
+        cappedLimit + 1,
+      );
+
+      if (cursor?.tapeId) {
+        const resumeAnchor = tapeAnchors.find((anchor) =>
+          anchor._orderSeq === cursor.beforeOrderSeq && anchor._turnTapeId === cursor.tapeId);
+        const header = headers.get(cursor.tapeId);
+        if (
+          !resumeAnchor || !header ||
+          resumeAnchor._turnTapeSha256 !== cursor.tapeSha256 ||
+          header.tapeSha256 !== cursor.tapeSha256
+        ) throw new ClientTimelineCursorStaleError();
       }
-      selected.push({ kind: "outer", anchor, orderSeq });
-      inlineBytes += pageBytes;
+
+      selected = [];
+      windows = [];
+      inlineBytes = 0;
+      hasMore = false;
+      continuation = null;
+      let foundNextVisible = false;
+      outerLoop: for (const anchor of outer.messages) {
+        const orderSeq = anchor._orderSeq;
+        if (typeof orderSeq !== "number" || !Number.isSafeInteger(orderSeq) || orderSeq < 1) continue;
+        if (
+          anchor._turnTapeComplete === true &&
+          typeof anchor._turnTapeId === "string" &&
+          typeof anchor._turnTapeSha256 === "string"
+        ) {
+          const header = headers.get(anchor._turnTapeId);
+          if (!header) throw new Error(`[pgSessions] unified timeline finalized tape missing: ${anchor._turnTapeId}`);
+          if (header.tapeSha256 !== anchor._turnTapeSha256) {
+            throw new Error(`[pgSessions] unified timeline tape hash mismatch: ${anchor._turnTapeId}`);
+          }
+          const upperOrdinal = beforeByTape.get(header.tapeId) ?? 2_147_483_647;
+          const heads = headsByTape.get(header.tapeId) ?? [];
+          let oldestSelectedOrdinal: number | null = null;
+          for (const head of heads) {
+            const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
+            const pageBytes = payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES ? 0 : payloadBytes;
+            if (
+              selected.length >= cappedLimit ||
+              (selected.length > 0 && inlineBytes + pageBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+            ) {
+              foundNextVisible = true;
+              hasMore = true;
+              if (oldestSelectedOrdinal !== null) {
+                windows.push({
+                  anchor,
+                  orderSeq,
+                  header,
+                  lowerOrdinal: oldestSelectedOrdinal,
+                  upperOrdinal,
+                });
+                continuation = { anchor, header, beforeOrdinal: oldestSelectedOrdinal };
+              }
+              break outerLoop;
+            }
+            selected.push({ kind: "tape", anchor, orderSeq, header, head });
+            inlineBytes += pageBytes;
+            oldestSelectedOrdinal = head.ordinal;
+          }
+          // Fewer than cappedLimit+1 semantic heads means this entire physical
+          // interval is consumed, including any hidden Bash-tail evidence.
+          windows.push({ anchor, orderSeq, header, lowerOrdinal: 0, upperOrdinal });
+          continue;
+        }
+        // Legacy raw transport envelopes stay available through audit reads,
+        // but are not Agent conversation records and never occupy a UI page.
+        if (anchor.role === "runtime-event") continue;
+        const pageBytes = Buffer.byteLength(JSON.stringify(anchor), "utf8");
+        if (
+          selected.length >= cappedLimit ||
+          (selected.length > 0 && inlineBytes + pageBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
+        ) {
+          foundNextVisible = true;
+          hasMore = true;
+          break;
+        }
+        selected.push({ kind: "outer", anchor, orderSeq });
+        inlineBytes += pageBytes;
+      }
+      if (foundNextVisible || !outer.hasOlderCandidates) break;
+      candidateLimit = Math.max(candidateLimit + 1, candidateLimit * 2);
     }
 
     const selectedTapeUnits = selected.filter(
@@ -4199,6 +4472,14 @@ async function readClientTimelinePageImpl(
       userId,
       selectedTapeUnits,
     );
+    const bashTailAuxiliaries = await readUnifiedTimelineBashTailAuxiliaries(
+      client,
+      sessionId,
+      userId,
+      windows,
+      TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES - inlineBytes,
+    );
+    const terminalAuxiliaries = windows.map(unifiedTimelineTerminalAuxiliary);
     const selectedUserSeqs = selected.flatMap((unit) =>
       unit.kind === "outer" && unit.anchor.role === "user" &&
       typeof unit.anchor._seq === "number" && Number.isSafeInteger(unit.anchor._seq)
@@ -4252,6 +4533,36 @@ async function readClientTimelinePageImpl(
         }
       }
     }
+
+    chronological.push(...bashTailAuxiliaries, ...terminalAuxiliaries);
+    chronological.sort((a, b) => {
+      const orderSeq = (message: MessageLike): number =>
+        typeof message._orderSeq === "number" && Number.isSafeInteger(message._orderSeq)
+          ? message._orderSeq
+          : Number.MAX_SAFE_INTEGER;
+      const tapeOrdinal = (message: MessageLike): number | null =>
+        typeof message._turnTapeId === "string" && message._turnTapeId.length > 0 &&
+        typeof message._turnTapeOrdinal === "number" && Number.isSafeInteger(message._turnTapeOrdinal)
+          ? message._turnTapeOrdinal
+          : null;
+      const aTape = tapeOrdinal(a);
+      const bTape = tapeOrdinal(b);
+      const aRank = a._turnTapeProcess === true ? 0 : aTape !== null ? 1 : 2;
+      const bRank = b._turnTapeProcess === true ? 0 : bTape !== null ? 1 : 2;
+      if (orderSeq(a) === orderSeq(b) && aRank === bRank && aTape === bTape) {
+        // User + verified status share one frozen order slot, while expanded
+        // logical rows share one physical tape ordinal. In both cases the
+        // server-authored logical ordinal must win over skewed wall clocks.
+        const aLogical = typeof a._timelineLogicalOrdinal === "number" ? a._timelineLogicalOrdinal : 0;
+        const bLogical = typeof b._timelineLogicalOrdinal === "number" ? b._timelineLogicalOrdinal : 0;
+        if (aLogical !== bLogical) return aLogical - bLogical;
+      }
+      const ordered = compareMessagesByOrder(a, b);
+      if (ordered !== 0) return ordered;
+      return String(a._timelineUnitKey ?? a.id ?? "").localeCompare(
+        String(b._timelineUnitKey ?? b.id ?? ""),
+      );
+    });
 
     let nextCursor: ClientTimelineCursor | null = null;
     if (hasMore && selected.length > 0) {

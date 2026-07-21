@@ -1015,7 +1015,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     scroller.remove();
   });
 
-  test("重复协议包不挤走 immutable 最终答复，非重复 runtime 仍可检查", () => {
+  test("任何 runtime 传输审计记录都不进入会话卡片，真实 Agent 记录完整保留", () => {
     const onRegenerate = vi.fn();
     const visible: ChatMessage[] = [
       mk("user", { id: "u-visible", text: "可见提问", status: "sent", ts: 1 }),
@@ -1103,13 +1103,11 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.getByText("可见最终答复")).toBeInTheDocument();
     expect(screen.getByText(/已思考/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新生成" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /progress · tool_delta/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /progress · tool_delta/ })).toBeNull();
     expect(screen.queryByRole("button", { name: /bash_output_tail/ })).toBeNull();
-    return waitFor(() => {
-      expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(1);
-      expect(screen.getByRole("button", { name: /tool_progress/ })).toBeInTheDocument();
-      expect(screen.queryAllByText("查看原始记录")).toHaveLength(2);
-    });
+    expect(onFetchTapeRecordPayload).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /tool_progress/ })).toBeNull();
+    expect(screen.queryAllByText("查看原始记录")).toHaveLength(0);
   });
 
   test("未识别的 immutable tape 角色不会被静默丢弃", () => {

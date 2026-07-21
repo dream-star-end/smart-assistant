@@ -1648,10 +1648,14 @@ describe("pgSessionsBackend lossless turn tape", () => {
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
     const timelineMessages = timeline.messages as MessageLike[];
-    assert.equal(timelineMessages.some((message) => message._runtimeEvent !== undefined), true,
-      "the newest unified page directly contains the genuine runtime records");
-    assert.equal(timelineMessages.filter((message) => message.role === "assistant").length, 1);
-    assert.equal(timelineMessages.filter((message) => message.role === "tool").length, 1);
+    const visibleTimeline = browserVisibleTimeline(timelineMessages);
+    assert.equal(visibleTimeline.some((message) => message.role === "runtime-event"), false);
+    assert.equal(visibleTimeline.filter((message) => message.role === "assistant").length, 1);
+    assert.equal(visibleTimeline.filter((message) => message.role === "tool").length, 1);
+    const tailAuxiliary = timelineMessages.find((message) =>
+      message._timelineAuxiliary === "bash-tail" && message._runtimeEvent !== undefined);
+    assert.ok(tailAuxiliary, "exact tail travels only as hidden ToolCard reconciliation evidence");
+    assert.deepEqual(tailAuxiliary._runtimeEvent, rawTail);
     assert.equal(timelineMessages.some((message) => message._turnTapeProcess === true), false);
     assert.equal(timelineMessages.every((message) => message._timelineRecord === true), true);
 
@@ -1667,8 +1671,9 @@ describe("pgSessionsBackend lossless turn tape", () => {
       "timeline refreshes replace only the newest unified page, never a semantic subset");
     assert.equal((incremental!.messages as MessageLike[]).some((message) => message.role === "tool"), true);
     assert.equal((incremental.messages as MessageLike[]).some(
-      (message) => message._turnTapeId === continuation.finalize.tapeId && message._runtimeEvent !== undefined,
-    ), true, "refresh returns the real continuation record, not a synthetic patch");
+      (message) => message._turnTapeId === continuation.finalize.tapeId &&
+        message._timelineAuxiliary === "bash-tail" && message._runtimeEvent !== undefined,
+    ), true, "refresh returns exact hidden tail evidence, not a synthetic visible patch");
   });
 
   maybe("runtime-event batches reduce physical rows but exact hydration restores every logical payload", async () => {
@@ -1724,15 +1729,11 @@ describe("pgSessionsBackend lossless turn tape", () => {
       const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
       assert.ok(timeline);
       const timelineMessages = timeline.messages as MessageLike[];
-      assert.equal(timelineMessages.filter((message) => message._runtimeEvent !== undefined).length, 8);
+      assert.equal(timelineMessages.filter((message) => message._runtimeEvent !== undefined).length, 0,
+        "opaque runtime batches remain exact in the audit view but never become browser cards");
       const visibleAnswer = timelineMessages.find((message) => message.role === "assistant");
       assert.equal(visibleAnswer?.text, "visible answer");
       assert.equal(timelineMessages.some((message) => message._turnTapeProcess === true), false);
-      assert.deepEqual(
-        timelineMessages.filter((message) => message._runtimeEvent !== undefined)
-          .map((message) => message._ocEventOrdinal),
-        runtimeEvents.map((event) => event.ordinal),
-      );
       const storage = await pool.query<{ record_storage_format: number }>(
         `SELECT record_storage_format FROM client_session_turn_tapes
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
@@ -2736,6 +2737,11 @@ async function readDeferredRecord(
   return JSON.parse(payload.payload.toString("utf8")) as MessageLike;
 }
 
+function browserVisibleTimeline(messages: MessageLike[]): MessageLike[] {
+  return messages.filter((message) =>
+    message._timelineAuxiliary === undefined && message.role !== "runtime-event");
+}
+
 describe("pgSessionsBackend direct turn timeline", () => {
   maybe("engine context hydrates real tape-backed tool, plan, goal and delegate facts", async () => {
     const sessionId = "s-direct-engine-semantic";
@@ -2972,13 +2978,15 @@ describe("pgSessionsBackend direct turn timeline", () => {
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
     const initial = timeline.messages as MessageLike[];
-    assert.deepEqual(initial.map((message) => message.role), [
-      "user", "thinking", "tool", "runtime-event", "assistant",
+    const initialVisible = browserVisibleTimeline(initial);
+    assert.deepEqual(initialVisible.map((message) => message.role), [
+      "user", "thinking", "tool", "assistant",
     ]);
-    assert.equal(initial.find((message) => message.role === "thinking")?.text, "逐步分析真实内容");
-    assert.equal(initial.find((message) => message.role === "tool")?.text, "真实工具输出");
-    assert.equal(initial.find((message) => message.role === "assistant")?.text, "这是 Agent 的真实最终回答");
-    assert.equal(initial.some((message) => message._runtimeEvent !== undefined), true);
+    assert.equal(initialVisible.find((message) => message.role === "thinking")?.text, "逐步分析真实内容");
+    assert.equal(initialVisible.find((message) => message.role === "tool")?.text, "真实工具输出");
+    assert.equal(initialVisible.find((message) => message.role === "assistant")?.text, "这是 Agent 的真实最终回答");
+    assert.equal(initial.some((message) => message.role === "runtime-event"), false,
+      "transport/audit envelopes never enter the browser timeline");
     assert.equal(initial.some((message) => message._turnTapeProcess === true), false);
     assert.ok(initial.every((message) => message._timelineRecord === true));
 
@@ -2993,10 +3001,11 @@ describe("pgSessionsBackend direct turn timeline", () => {
       hasMore = one.hasMore;
       assert.equal(hasMore, cursor !== null);
     }
-    assert.deepEqual(traversed.map((message) => message.role), [
-      "user", "thinking", "tool", "runtime-event", "assistant",
+    assert.deepEqual(browserVisibleTimeline(traversed).map((message) => message.role), [
+      "user", "thinking", "tool", "assistant",
     ]);
-    assert.equal(new Set(traversed.map((message) => message._timelineUnitKey)).size, traversed.length);
+    const visibleUnitKeys = browserVisibleTimeline(traversed).map((message) => message._timelineUnitKey);
+    assert.equal(new Set(visibleUnitKeys).size, visibleUnitKeys.length);
 
     const page = await backend.listTurnTapeRecords(
       sessionId, userId, tape.finalize.tapeId, 0, 200,
@@ -3039,7 +3048,8 @@ describe("pgSessionsBackend direct turn timeline", () => {
 
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     assert.ok(timeline);
-    assert.deepEqual((timeline.messages as MessageLike[]).map(
+    const visible = browserVisibleTimeline(timeline.messages as MessageLike[]);
+    assert.deepEqual(visible.map(
       (message) => [message.role, message.text]), [
       ["assistant", "中间说明"],
       ["tool", "between output"],
@@ -3058,6 +3068,67 @@ describe("pgSessionsBackend direct turn timeline", () => {
     ]);
     assert.equal(page.records.some((message) => message.text === "最终结论"), false,
       "the compatibility per-tape endpoint still excludes only its separately rendered billing anchor");
+  });
+
+  maybe("transport-only continuation rows never consume logical page slots or hide the real final answer", async () => {
+    const sessionId = "s-direct-runtime-flood";
+    const userId = "u-direct-runtime-flood";
+    const originalTurnKey = "2".repeat(64);
+    const continuationTurnKey = "3".repeat(64);
+    await backend.upsertClientSession(mkSession({
+      id: sessionId,
+      userId,
+      messages: [{ id: "cm-runtime-flood", role: "user", text: "给我最终结果", ts: 1_783_944_100_000 }],
+    }));
+    await stageAndFinalize(userId, directTape(sessionId, originalTurnKey, {
+      clientMessageId: "cm-runtime-flood",
+      text: "不会被运行事件挤走的真实最终回答",
+      createdAt: 1_783_944_100_001,
+    }));
+
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
+    const continuation = buildTape({
+      sessionId,
+      agentId: "tail_runtime_flood",
+      turnIndex: 2,
+      status: "completed",
+      turnKey: continuationTurnKey,
+      continuationOfTurnKey: originalTurnKey,
+      text: "",
+      createdAt: 1_783_944_100_100,
+      runtimeEvents: Array.from({ length: 230 }, (_, index) => ({
+        ordinal: index + 1,
+        observedAt: 1_783_944_100_100 + index,
+        source: "gateway",
+        payload: { type: "progress", index },
+      })),
+    });
+    try {
+      await stageAndFinalize(userId, continuation);
+    } finally {
+      if (previousBatching === undefined) delete process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+    }
+
+    const physical = await pool.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND role='runtime-event'`,
+      [sessionId, userId, continuation.finalize.tapeId],
+    );
+    assert.equal(physical.rows[0]!.count, "230", "fixture must exceed the 200-row transport quantum");
+
+    const page = await backend.readClientTimelinePage(sessionId, userId, null, 2);
+    assert.ok(page);
+    const visible = browserVisibleTimeline(page.messages);
+    assert.deepEqual(visible.map((message) => [message.role, message.text]), [
+      ["user", "给我最终结果"],
+      ["assistant", "不会被运行事件挤走的真实最终回答"],
+    ]);
+    assert.equal(page.messages.some((message) => message.role === "runtime-event"), false);
+    assert.equal(page.hasMore, false);
+    assert.equal(page.nextCursor, null);
   });
 
   maybe("user tape API preserves future Agent fields while stripping only known private runtime data", async () => {
@@ -3338,9 +3409,10 @@ describe("pgSessionsBackend direct turn timeline", () => {
 
     const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
     const initial = timeline!.messages as MessageLike[];
-    assert.equal(initial.length, 100, "initial selection is one bounded newest-record page");
-    assert.equal(initial.at(-1)?.role, "assistant");
-    assert.equal(initial.at(-1)?.text, "全部过程完成");
+    const initialVisible = browserVisibleTimeline(initial);
+    assert.equal(initialVisible.length, 100, "initial selection is one bounded newest logical-record page");
+    assert.equal(initialVisible.at(-1)?.role, "assistant");
+    assert.equal(initialVisible.at(-1)?.text, "全部过程完成");
     assert.equal(initial.some((message) => message._turnTapeProcess === true), false);
     assert.equal(timeline!.timelineHasMore, true);
 
@@ -3356,10 +3428,11 @@ describe("pgSessionsBackend direct turn timeline", () => {
       timelineCursor = timelinePage.nextCursor;
       timelineHasMore = timelinePage.hasMore;
     }
-    assert.equal(allTimeline.length, 531);
-    assert.equal(new Set(allTimeline.map((message) => message._timelineUnitKey)).size, 531);
-    assert.equal(allTimeline.filter((message) => message.role === "tool").length, 530);
-    assert.equal(allTimeline.at(-1)?.text, "全部过程完成");
+    const allVisibleTimeline = browserVisibleTimeline(allTimeline);
+    assert.equal(allVisibleTimeline.length, 531);
+    assert.equal(new Set(allVisibleTimeline.map((message) => message._timelineUnitKey)).size, 531);
+    assert.equal(allVisibleTimeline.filter((message) => message.role === "tool").length, 530);
+    assert.equal(allVisibleTimeline.at(-1)?.text, "全部过程完成");
   });
 
   maybe("an oversized physical record streams its exact post-redaction JSON bytes with no content ceiling", async () => {

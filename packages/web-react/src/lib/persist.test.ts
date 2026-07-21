@@ -5,6 +5,8 @@ import {
   dbNameForUser,
   mergeArchivedHistory,
   mergeFullServerWins,
+  mergeTimelineHistoryPage,
+  reconcileTimelineBashTailAuxiliaries,
   SessionStore,
   stableSortByTs,
   type StoredSession,
@@ -858,6 +860,150 @@ describe("persist — 历史合并纯函数", () => {
     };
     const merged = applyServerIncremental([localRich], [incoming]);
     expect(merged.map((m) => m.id)).toEqual(["m-g", "srv-g2"]);
+  });
+});
+
+describe("persist — hidden Bash tail reconciliation", () => {
+  const auxiliary = (
+    id: string,
+    over: Partial<ChatMessage> & { totalBytes: number; tail: string },
+  ): ChatMessage => ({
+    id,
+    role: "runtime-event",
+    text: "",
+    ts: over.ts ?? 1,
+    _source: "server",
+    _timelineRecord: true,
+    _timelineAuxiliary: "bash-tail",
+    _timelineUnitKey: `aux:${id}`,
+    _turnKey: over._turnKey ?? "turn-a",
+    _turnTapeId: over._turnTapeId ?? "tape-a",
+    _recordOrdinal: over._recordOrdinal ?? 1,
+    _orderSeq: over._orderSeq ?? 1,
+    _runtimeEvent: {
+      type: "system",
+      subtype: "bash_output_tail",
+      tool_use_id: over.blockId ?? "tool-a",
+      tail: over.tail,
+      total_bytes: over.totalBytes,
+      truncated_head: false,
+    },
+    ...over,
+  });
+
+  test("latest exact evidence updates one real top-level tool and remains hidden/resident", () => {
+    const tool: ChatMessage = {
+      id: "tool-row",
+      role: "tool",
+      text: "original",
+      ts: 2,
+      blockId: "tool-a",
+      _turnKey: "turn-a",
+      _timelineRecord: true,
+      _timelineUnitKey: "tool-row",
+    };
+    const older = auxiliary("tail-old", {
+      tail: "old",
+      totalBytes: 10,
+      _orderSeq: 2,
+      _recordOrdinal: 2,
+    });
+    const latest = auxiliary("tail-new", {
+      tail: "latest exact stdout",
+      totalBytes: 20,
+      _orderSeq: 3,
+      _recordOrdinal: 3,
+    });
+
+    const reconciled = reconcileTimelineBashTailAuxiliaries([tool, latest, older]);
+    const updated = reconciled.find((message) => message.id === tool.id)!;
+    expect(updated.bashTail).toEqual({
+      tail: "latest exact stdout",
+      totalBytes: 20,
+      truncatedHead: false,
+    });
+    expect(updated._runtimeBashTailEvidence).toEqual({
+      orderSeq: 3,
+      tapeId: "tape-a",
+      ordinal: 3,
+    });
+    expect(reconciled.filter((message) => message._timelineAuxiliary === "bash-tail")).toHaveLength(2);
+    expect(reconcileTimelineBashTailAuxiliaries(reconciled)).toBe(reconciled);
+  });
+
+  test("evidence loaded first reconciles only after its older owning tool is explicitly paged", () => {
+    const tail = auxiliary("tail-first", {
+      tail: "late output",
+      totalBytes: 12,
+      _continuationOfTurnKey: "turn-owner",
+      _turnKey: "turn-continuation",
+      _orderSeq: 20,
+      _recordOrdinal: 9,
+    });
+    const wrongTurn: ChatMessage = {
+      id: "wrong-turn-tool",
+      role: "tool",
+      text: "wrong",
+      ts: 2,
+      blockId: "tool-a",
+      _turnKey: "turn-other",
+      _timelineRecord: true,
+      _timelineUnitKey: "wrong-turn-tool",
+    };
+    const beforeOwner = reconcileTimelineBashTailAuxiliaries([tail, wrongTurn]);
+    expect(beforeOwner.find((message) => message.id === wrongTurn.id)?.bashTail).toBeUndefined();
+
+    const owner: ChatMessage = {
+      id: "owner-tool",
+      role: "tool",
+      text: "owner",
+      ts: 1,
+      blockId: "tool-a",
+      _turnKey: "turn-owner",
+      _timelineRecord: true,
+      _timelineUnitKey: "owner-tool",
+    };
+    const paged = mergeTimelineHistoryPage(beforeOwner, [owner]);
+    const reconciled = reconcileTimelineBashTailAuxiliaries(paged);
+    expect(reconciled.find((message) => message.id === owner.id)?.bashTail?.tail).toBe("late output");
+    expect(reconciled.find((message) => message.id === wrongTurn.id)?.bashTail).toBeUndefined();
+  });
+
+  test("nested delegate tool tail requires the same owning turn and reconciles recursively", () => {
+    const group: ChatMessage = {
+      id: "group-a",
+      role: "agent-group",
+      text: "",
+      ts: 1,
+      _turnKey: "turn-a",
+      _delegateRunId: "parent-a",
+      childBlocks: [{
+        kind: "tool_use",
+        blockId: "child-tool",
+        childBlocks: [{ kind: "text", text: "kept" }],
+      }],
+    };
+    const tail = auxiliary("child-tail", {
+      tail: "delegate stdout",
+      totalBytes: 8,
+      blockId: "child-tool",
+      _recordOrdinal: 4,
+      _runtimeEvent: {
+        type: "system",
+        subtype: "bash_output_tail",
+        tool_use_id: "child-tool",
+        parent_tool_use_id: "parent-a",
+        tail: "delegate stdout",
+        total_bytes: 8,
+        truncated_head: false,
+      },
+    });
+
+    const reconciled = reconcileTimelineBashTailAuxiliaries([group, tail]);
+    const child = reconciled[0]!.childBlocks?.[0];
+    expect(child?.bashTail?.tail).toBe("delegate stdout");
+    expect(child?.childBlocks).toEqual([{ kind: "text", text: "kept" }]);
+    expect(reconciled[0]!._runtimeBashTailRevision).toBe(1);
   });
 });
 

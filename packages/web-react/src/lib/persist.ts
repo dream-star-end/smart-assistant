@@ -14,7 +14,13 @@
  *    无需真实 IndexedDB 即可单测核心逻辑。
  */
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
-import type { ChatMessage, ChatRoutingSnapshot } from "./chat/model";
+import type {
+  BashTail,
+  ChatMessage,
+  ChatRoutingSnapshot,
+  ChildBlock,
+  TimelineBashTailEvidence,
+} from "./chat/model";
 import type { InboundMessage } from "./chat/frames";
 import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
 import { repairPostFinalProcessOrder } from "./chat/order";
@@ -771,6 +777,202 @@ export function mergeTimelineHistoryPage(
   });
   if (add.length === 0) return local;
   return stableSortByTs([...add, ...local]);
+}
+
+type TimelineBashTailCandidate = {
+  tail: BashTail;
+  evidence: TimelineBashTailEvidence;
+  parentToolUseId: string;
+};
+
+function compareTimelineBashTailCandidates(
+  a: TimelineBashTailCandidate,
+  b: TimelineBashTailCandidate,
+): number {
+  if (a.tail.totalBytes !== b.tail.totalBytes) return a.tail.totalBytes - b.tail.totalBytes;
+  if (a.evidence.orderSeq !== b.evidence.orderSeq) return a.evidence.orderSeq - b.evidence.orderSeq;
+  const tapeOrder = a.evidence.tapeId.localeCompare(b.evidence.tapeId);
+  return tapeOrder !== 0 ? tapeOrder : a.evidence.ordinal - b.evidence.ordinal;
+}
+
+function shouldApplyTimelineBashTail(
+  current: BashTail | undefined,
+  currentEvidence: TimelineBashTailEvidence | undefined,
+  candidate: TimelineBashTailCandidate,
+): boolean {
+  if (!current) return true;
+  if (candidate.tail.totalBytes !== current.totalBytes) {
+    return candidate.tail.totalBytes > current.totalBytes;
+  }
+  if (!currentEvidence) return true;
+  const evidenceOrder = compareTimelineBashTailCandidates(candidate, {
+    tail: current,
+    evidence: currentEvidence,
+    parentToolUseId: candidate.parentToolUseId,
+  });
+  if (evidenceOrder !== 0) return evidenceOrder > 0;
+  return candidate.tail.tail !== current.tail ||
+    candidate.tail.truncatedHead !== current.truncatedHead;
+}
+
+/** Merge hidden exact Bash-tail evidence into its real ToolCard. Auxiliary
+ * rows remain resident so a later explicit older page can reveal the owning
+ * tool; they never become cards or virtualization items themselves. */
+export function reconcileTimelineBashTailAuxiliaries(
+  messages: ChatMessage[],
+): ChatMessage[] {
+  const topCandidates = new Map<string, TimelineBashTailCandidate>();
+  const childCandidates = new Map<string, Map<string, TimelineBashTailCandidate>>();
+  for (const message of messages) {
+    if (
+      message._timelineAuxiliary !== "bash-tail" ||
+      message._payloadDeferred === true ||
+      message.role !== "runtime-event"
+    ) continue;
+    const event = message._runtimeEvent;
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    const raw = event as Record<string, unknown>;
+    if (
+      raw.type !== "system" || raw.subtype !== "bash_output_tail" ||
+      typeof raw.tool_use_id !== "string" || raw.tool_use_id.length === 0 ||
+      typeof raw.total_bytes !== "number" || !Number.isFinite(raw.total_bytes) || raw.total_bytes < 0 ||
+      typeof message._orderSeq !== "number" || !Number.isSafeInteger(message._orderSeq) ||
+      typeof message._turnTapeId !== "string" || message._turnTapeId.length === 0 ||
+      typeof message._recordOrdinal !== "number" || !Number.isSafeInteger(message._recordOrdinal)
+    ) continue;
+    const ownerTurnKey = typeof message._continuationOfTurnKey === "string" &&
+        message._continuationOfTurnKey.length > 0
+      ? message._continuationOfTurnKey
+      : message._turnKey;
+    if (typeof ownerTurnKey !== "string" || ownerTurnKey.length === 0) continue;
+    const parentToolUseId = typeof raw.parent_tool_use_id === "string"
+      ? raw.parent_tool_use_id
+      : "";
+    const candidate: TimelineBashTailCandidate = {
+      tail: {
+        tail: typeof raw.tail === "string" ? raw.tail : "",
+        totalBytes: raw.total_bytes,
+        truncatedHead: raw.truncated_head === true,
+      },
+      evidence: {
+        orderSeq: message._orderSeq,
+        tapeId: message._turnTapeId,
+        ordinal: message._recordOrdinal,
+      },
+      parentToolUseId,
+    };
+    const targetKey = `${ownerTurnKey}\0${raw.tool_use_id}`;
+    if (!parentToolUseId) {
+      const previous = topCandidates.get(targetKey);
+      if (!previous || compareTimelineBashTailCandidates(candidate, previous) > 0) {
+        topCandidates.set(targetKey, candidate);
+      }
+      continue;
+    }
+    const byParent = childCandidates.get(targetKey) ?? new Map<string, TimelineBashTailCandidate>();
+    const previous = byParent.get(parentToolUseId);
+    if (!previous || compareTimelineBashTailCandidates(candidate, previous) > 0) {
+      byParent.set(parentToolUseId, candidate);
+    }
+    childCandidates.set(targetKey, byParent);
+  }
+  if (topCandidates.size === 0 && childCandidates.size === 0) return messages;
+
+  const childCandidate = (
+    ownerTurnKey: string,
+    toolUseId: string,
+    parentIds: ReadonlySet<string>,
+  ): TimelineBashTailCandidate | null => {
+    const byParent = childCandidates.get(`${ownerTurnKey}\0${toolUseId}`);
+    if (!byParent || byParent.size === 0) return null;
+    let winner: TimelineBashTailCandidate | null = null;
+    for (const [parentId, candidate] of byParent) {
+      if (!parentIds.has(parentId)) continue;
+      if (!winner || compareTimelineBashTailCandidates(candidate, winner) > 0) winner = candidate;
+    }
+    // Persisted delegate transcripts do not retain their gateway routing id.
+    // A globally unique tool_use_id plus exactly one exact parent candidate is
+    // still unambiguous; multiple unmatched parents fail closed.
+    if (!winner && byParent.size === 1) winner = byParent.values().next().value ?? null;
+    return winner;
+  };
+  const reconcileChildren = (
+    blocks: ChildBlock[],
+    ownerTurnKey: string,
+    parentIds: ReadonlySet<string>,
+  ): { blocks: ChildBlock[]; changed: boolean } => {
+    let changed = false;
+    const nextBlocks = blocks.map((block) => {
+      let next = block;
+      if (block.kind === "tool_use" && typeof block.blockId === "string") {
+        const candidate = childCandidate(ownerTurnKey, block.blockId, parentIds);
+        if (candidate && shouldApplyTimelineBashTail(
+          block.bashTail,
+          block._runtimeBashTailEvidence,
+          candidate,
+        )) {
+          next = {
+            ...next,
+            bashTail: candidate.tail,
+            _runtimeBashTailEvidence: candidate.evidence,
+          };
+          changed = true;
+        }
+      }
+      if (Array.isArray(block.childBlocks) && block.childBlocks.length > 0) {
+        const nestedParents = new Set(parentIds);
+        if (typeof block.blockId === "string" && block.blockId.length > 0) {
+          nestedParents.add(block.blockId);
+        }
+        const nested = reconcileChildren(block.childBlocks, ownerTurnKey, nestedParents);
+        if (nested.changed) {
+          next = { ...next, childBlocks: nested.blocks };
+          changed = true;
+        }
+      }
+      return next;
+    });
+    return { blocks: changed ? nextBlocks : blocks, changed };
+  };
+
+  let changed = false;
+  const reconciled = messages.map((message) => {
+    const ownerTurnKey = message._turnKey;
+    if (typeof ownerTurnKey !== "string" || ownerTurnKey.length === 0) return message;
+    let next = message;
+    if (message.role === "tool" && typeof message.blockId === "string") {
+      const candidate = topCandidates.get(`${ownerTurnKey}\0${message.blockId}`);
+      if (candidate && shouldApplyTimelineBashTail(
+        message.bashTail,
+        message._runtimeBashTailEvidence,
+        candidate,
+      )) {
+        next = {
+          ...next,
+          bashTail: candidate.tail,
+          _runtimeBashTailEvidence: candidate.evidence,
+        };
+        changed = true;
+      }
+    }
+    if (Array.isArray(message.childBlocks) && message.childBlocks.length > 0) {
+      const rootParents = new Set<string>();
+      for (const value of [message.blockId, message._delegateRunId, message.runId, message.id]) {
+        if (typeof value === "string" && value.length > 0) rootParents.add(value);
+      }
+      const children = reconcileChildren(message.childBlocks, ownerTurnKey, rootParents);
+      if (children.changed) {
+        next = {
+          ...next,
+          childBlocks: children.blocks,
+          _runtimeBashTailRevision: (message._runtimeBashTailRevision ?? 0) + 1,
+        };
+        changed = true;
+      }
+    }
+    return next;
+  });
+  return changed ? reconciled : messages;
 }
 
 /** `_orderSeq ≤ 归档水位` = server 已把该行搬进归档 chunk。 */

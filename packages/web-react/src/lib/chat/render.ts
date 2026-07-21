@@ -199,10 +199,11 @@ export function messageKind(m: Pick<ChatMessage, "role">): MessageKind {
  * and can push the real final answer out of the viewport.
  *
  * This is presentation-only: no tape bytes are deleted or rewritten. Unknown
- * future roles and runtime events that are not proven duplicates remain
- * inspectable. Runtime batches contain only runtime-event rows; standalone
- * bash output tails are reconciled into their owning Bash tool card by the
- * direct timeline loader while the exact envelope remains in memory/tape.
+ * future Agent roles remain exact fallback records, while every runtime-event
+ * stays an audit/transport row rather than a conversation card. Runtime batches
+ * contain only runtime-event rows; standalone Bash output tails are reconciled
+ * into their owning Bash tool card while the exact envelope remains in memory
+ * and in the immutable tape.
  */
 export function isCcbBashOutputTailEnvelope(message: ChatMessage): boolean {
   if (
