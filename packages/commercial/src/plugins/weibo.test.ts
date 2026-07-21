@@ -41,6 +41,7 @@ function compileWorkerPostHarness(overrides: Record<string, unknown>): {
     beforeIds: Set<string>,
   ): Promise<unknown>
   activatePostSend(send: unknown): Promise<unknown>
+  awaitPostSendReady(page: unknown, timeout: number): Promise<unknown>
 } {
   const start = WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost')
   const end = WEIBO_WORKER_SOURCE.indexOf('async function finishAction', start)
@@ -48,7 +49,7 @@ function compileWorkerPostHarness(overrides: Record<string, unknown>): {
   const names = Object.keys(overrides)
   return new Function(
     ...names,
-    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { writeAction, awaitNewestOwnPost, activatePostSend };`,
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { writeAction, awaitNewestOwnPost, activatePostSend, awaitPostSendReady };`,
   )(...names.map((name) => overrides[name])) as ReturnType<typeof compileWorkerPostHarness>
 }
 
@@ -99,14 +100,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.4.0')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.5.0')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.3.0',
-        artifactHash: '503cdef63395ce66b168765a4379f5e04f066337229ecf12a33789ce23bf1b0f',
-        execContractHash: 'b0c815f5d943a477bd2c791980370945df2977950bc80c397a5e0b8408089da4',
+        version: '1.4.0',
+        artifactHash: 'e43d0e981530dc05623fd3acf920356ef65b9a172df94c0c8f9f1c93f8a11f2c',
+        execContractHash: '328f01e5e0018bfdb2ac69343c0d0e770cb672a3d917022b5efeeaf86eb952dc',
       },
     ])
     assert.equal(
@@ -328,7 +329,7 @@ describe('official Weibo Plugin', () => {
     )
     assert.ok(
       WEIBO_WORKER_SOURCE.indexOf('await awaitDispatch();') <
-        WEIBO_WORKER_SOURCE.indexOf('await fileInput.setInputFiles(files);'),
+        WEIBO_WORKER_SOURCE.indexOf('await imageChooser.setFiles(files);'),
       'media must not be uploaded before the parent dispatch fence is armed',
     )
     const createPostStart = WEIBO_WORKER_SOURCE.indexOf("if (input.actionId === 'create_post')")
@@ -390,7 +391,7 @@ describe('official Weibo Plugin', () => {
 
     assert.deepEqual(result, { post: { id: 'new-post', owned: true, text: 'hello' } })
     assert.equal(events.filter((event) => event === 'click').length, 1)
-    assert.ok(events.indexOf('trial:30000') < events.indexOf('dispatch'))
+    assert.ok(events.indexOf('trial:250') < events.indexOf('dispatch'))
     assert.ok(events.indexOf('dispatch') < events.indexOf('trial:10000'))
     assert.ok(events.indexOf('trial:10000') < events.indexOf('click'))
   })
@@ -454,9 +455,10 @@ describe('official Weibo Plugin', () => {
         { locator: () => ({}), waitForTimeout: async () => {} },
         { actionId: 'create_post', params: { text: 'hello', mediaManifest: [] } },
       ),
-      /not actionable/,
+      /send/,
     )
-    assert.deepEqual(events, ['trial'])
+    assert.ok(events.length > 0)
+    assert.ok(events.every((event) => event === 'trial'))
   })
 
   test('create_post resolves an ambiguous click from delayed read-only observation', async () => {
@@ -510,10 +512,16 @@ describe('official Weibo Plugin', () => {
         }
       },
     }
-    const fileInput = {
-      count: async () => 1,
-      setInputFiles: async () => events.push('upload'),
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const chooserElement = {
       evaluate: async () => 1,
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => chooserElement,
     }
     const harness = compileWorkerPostHarness({
       ensureSelfId: async () => '12345',
@@ -530,13 +538,14 @@ describe('official Weibo Plugin', () => {
       uniqueVisible: async () => textarea,
       assertNoChallenge: async () => {},
       awaitDispatch: async () => events.push('dispatch'),
-      exactMenuItem: async () => send,
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? imageTrigger : send,
       cleanText: (value: unknown) => String(value).trim(),
       readFile: async () => Buffer.from('image'),
     })
     const page = {
-      locator: (selector: string) =>
-        selector === 'input[type="file"]' ? { first: () => fileInput } : {},
+      locator: () => ({}),
+      waitForEvent: async () => imageChooser,
       waitForTimeout: async () => {},
     }
 
@@ -552,9 +561,180 @@ describe('official Weibo Plugin', () => {
     )
     assert.equal(realClicks, 1)
     assert.equal(collectCount, 9)
+    assert.ok(events.indexOf('image-click') < events.indexOf('dispatch'))
     assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
     assert.ok(events.indexOf('upload') < events.indexOf('click'))
   })
+
+  test('create_post with media never dispatches when the composer image chooser is absent', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async () => null,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('unused'),
+    })
+
+    await assert.rejects(
+      harness.writeAction(
+        { locator: () => ({}), waitForTimeout: async () => {} },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media/,
+    )
+    assert.deepEqual(events, [])
+  })
+
+  test('create_post never clicks send when the chooser reports a different file count', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const imageTrigger = {
+      click: async (options: { trial?: boolean }) =>
+        events.push(options.trial ? 'image-trial' : 'image-click'),
+    }
+    const imageChooser = {
+      setFiles: async () => events.push('upload'),
+      element: () => ({ evaluate: async () => 0 }),
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async (_page: unknown, text: string) =>
+        text === '图片' ? imageTrigger : { click: async () => events.push('send') },
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+
+    await assert.rejects(
+      harness.writeAction(
+        {
+          locator: () => ({}),
+          waitForEvent: async () => imageChooser,
+          waitForTimeout: async () => {},
+        },
+        {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        },
+      ),
+      /media/,
+    )
+    assert.deepEqual(events, ['image-trial', 'image-click', 'dispatch', 'upload'])
+  })
+
+  test(
+    'real Chromium uses the lazy composer chooser and waits for delayed media readiness',
+    { timeout: 15_000 },
+    async () => {
+      const browserResolverModule = '../../../../scripts/lib/resolve-browser.mjs'
+      const { resolveBrowserExecutable } = (await import(browserResolverModule)) as {
+        resolveBrowserExecutable(): string
+      }
+      const browser = await chromium.launch({
+        executablePath: resolveBrowserExecutable(),
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      })
+      try {
+        const page = await browser.newPage()
+        await page.setContent(`<!doctype html>
+          <textarea></textarea>
+          <button id="image">图片</button>
+          <button id="send" disabled>发送</button>
+          <script>
+            window.imageClicks = 0;
+            window.sendClicks = 0;
+            document.querySelector('#image').addEventListener('click', () => {
+              window.imageClicks += 1;
+              const input = document.createElement('input');
+              input.type = 'file';
+              input.accept = 'image/*';
+              input.multiple = true;
+              input.hidden = true;
+              input.addEventListener('change', () => {
+                setTimeout(() => { document.querySelector('#send').disabled = false; }, 400);
+              });
+              document.body.append(input);
+              input.click();
+            });
+            document.querySelector('#send').addEventListener('click', () => {
+              window.sendClicks += 1;
+              const post = document.createElement('article');
+              post.dataset.id = 'new-post';
+              post.textContent = document.querySelector('textarea').value;
+              document.body.append(post);
+            });
+          </script>`)
+        let collectCount = 0
+        const harness = compileWorkerPostHarness({
+          ensureSelfId: async () => '12345',
+          gotoAuthenticated: async () => {},
+          collectPosts: async (targetPage: typeof page) => {
+            collectCount += 1
+            return targetPage.locator('article[data-id]').evaluateAll((articles) =>
+              articles.map((article) => ({
+                id: article.getAttribute('data-id'),
+                owned: true,
+                text: article.textContent?.trim() ?? '',
+              })),
+            )
+          },
+          uniqueVisible: async (locator: unknown) => locator,
+          assertNoChallenge: async () => {},
+          awaitDispatch: async () => {},
+          exactMenuItem: async (targetPage: typeof page, text: string) => {
+            const locator = targetPage.getByRole('button', { name: text, exact: true })
+            return (await locator.count()) === 1 ? locator : null
+          },
+          cleanText: (value: unknown) => String(value).trim(),
+          readFile: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+        })
+
+        const started = Date.now()
+        const result = await harness.writeAction(page, {
+          actionId: 'create_post',
+          params: {
+            text: 'hello',
+            mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+          },
+        })
+        assert.deepEqual(result, { post: { id: 'new-post', owned: true, text: 'hello' } })
+        assert.ok(Date.now() - started >= 350, 'send must wait for delayed media readiness')
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'imageClicks')), 1)
+        assert.equal(await page.evaluate(() => Reflect.get(window, 'sendClicks')), 1)
+        assert.equal(collectCount, 2)
+        await page.getByRole('button', { name: '发送', exact: true }).evaluate((button) => {
+          ;(button as HTMLButtonElement).disabled = true
+        })
+        const timeoutStarted = Date.now()
+        await assert.rejects(harness.awaitPostSendReady(page, 600), /send/)
+        const elapsed = Date.now() - timeoutStarted
+        assert.ok(elapsed >= 500, `readiness returned too early: ${elapsed}ms`)
+        assert.ok(elapsed < 1_300, `readiness exceeded its wall-clock bound: ${elapsed}ms`)
+      } finally {
+        await browser.close()
+      }
+    },
+  )
 
   test(
     'real Chromium activation skips slow navigation and observes a delayed result once',
