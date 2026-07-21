@@ -17,6 +17,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { createServer } from "node:http";
+import { request as undiciRequest } from "undici";
 import { Pool } from "pg";
 import type { ClientSession, ClientTimelineCursor, MessageLike } from "@openclaude/storage";
 import { LOSSLESS_TURN_TAPE_PART_BYTES, LOSSLESS_TURN_TAPE_VERSION } from "@openclaude/protocol";
@@ -37,6 +39,12 @@ import {
 } from "../dispatch/turnDispatchStore.js";
 import { runReconcileTick } from "../dispatch/turnDispatchReconciler.js";
 import { _sanitizeMasterHistoricalMessagesForFrame } from "../ws/userChatBridge.js";
+import {
+  makeServerAuthoredHandler,
+  SERVER_AUTHORED_PATH,
+  type ServerAuthoredStorage,
+} from "../http/internalServerAuthored.js";
+import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -90,6 +98,7 @@ before(async () => {
   }
   // 先用无 search_path 的连接建 schema。
   const admin = new Pool({ connectionString: TEST_DB_URL, max: 1 });
+  await admin.query("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public");
   await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
   await admin.query(`CREATE SCHEMA ${SCHEMA}`);
   await admin.end();
@@ -961,15 +970,49 @@ describe("pgSessionsBackend lossless turn tape", () => {
        VALUES ($1,$2,$3,$4,999,'stale-sidecar','error','stale semantic text',1,NULL,NULL)`,
       [sessionId, userId, tape.finalize.tapeId, staleOrdinal],
     );
+    await pool.query(`
+      CREATE TABLE oc_test_tape_record_updates (tape_id TEXT NOT NULL, ordinal INTEGER NOT NULL);
+      CREATE OR REPLACE FUNCTION oc_test_log_tape_record_update()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        INSERT INTO oc_test_tape_record_updates(tape_id,ordinal)
+        VALUES (NEW.tape_id,NEW.ordinal);
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER trg_oc_test_log_tape_record_update
+      AFTER UPDATE ON client_session_turn_tape_records
+      FOR EACH ROW EXECUTE FUNCTION oc_test_log_tape_record_update();
+    `);
 
-    const results = await Promise.all([
-      backend.finalizeLosslessTurnTape(userId, tape.finalize),
-      backend.finalizeLosslessTurnTape(userId, tape.finalize),
-    ]);
-    assert.deepEqual(
-      results.map((result) => result.applied).sort(),
-      ["finalized", "idempotent"],
-    );
+    try {
+      const results = await Promise.all([
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+      ]);
+      assert.deepEqual(
+        results.map((result) => result.applied).sort(),
+        ["finalized", "idempotent"],
+      );
+      const updatedOrdinals = (
+        await pool.query<{ ordinal: number }>(
+          `SELECT DISTINCT ordinal FROM oc_test_tape_record_updates
+            WHERE tape_id=$1 ORDER BY ordinal`,
+          [tape.finalize.tapeId],
+        )
+      ).rows.map((row) => row.ordinal);
+      assert.deepEqual(
+        updatedOrdinals,
+        [staleOrdinal],
+        "bulk exact summary must skip every already-correct ordinal",
+      );
+    } finally {
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_log_tape_record_update
+          ON client_session_turn_tape_records;
+        DROP FUNCTION IF EXISTS oc_test_log_tape_record_update();
+        DROP TABLE IF EXISTS oc_test_tape_record_updates;
+      `);
+    }
     const repairedRecords = (
       await pool.query<RecordSnapshot>(
         `SELECT msg_id,ordinal,role,ts::text,content_sha256,payload,visible_payload,
@@ -1013,6 +1056,654 @@ describe("pgSessionsBackend lossless turn tape", () => {
       0,
       "the pending paid component is folded exactly once",
     );
+  });
+
+  maybe("exact summary repairs every mutable record and model field it verifies", async () => {
+    const cases: Array<{
+      name: string;
+      mutate: (args: {
+        sessionId: string;
+        userId: string;
+        tapeId: string;
+        ordinal: number;
+      }) => Promise<void>;
+    }> = [
+      {
+        name: "declared raw hash",
+        mutate: async ({ sessionId, userId, tapeId, ordinal }) => {
+          await pool.query(
+            `UPDATE client_session_turn_tape_records SET content_sha256=$5
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+            [sessionId, userId, tapeId, ordinal, "f".repeat(64)],
+          );
+        },
+      },
+      {
+        name: "raw payload bytes",
+        mutate: async ({ sessionId, userId, tapeId, ordinal }) => {
+          await pool.query(
+            `UPDATE client_session_turn_tape_records SET payload=convert_to('{"corrupt":true}','UTF8')
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+            [sessionId, userId, tapeId, ordinal],
+          );
+        },
+      },
+      {
+        name: "declared visible hash",
+        mutate: async ({ sessionId, userId, tapeId, ordinal }) => {
+          await pool.query(
+            `UPDATE client_session_turn_tape_records SET visible_content_sha256=$5
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+            [sessionId, userId, tapeId, ordinal, "e".repeat(64)],
+          );
+        },
+      },
+      {
+        name: "visible payload bytes",
+        mutate: async ({ sessionId, userId, tapeId, ordinal }) => {
+          await pool.query(
+            `UPDATE client_session_turn_tape_records
+                SET visible_payload=convert_to('{"visible":"corrupt"}','UTF8')
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+            [sessionId, userId, tapeId, ordinal],
+          );
+        },
+      },
+      {
+        name: "sidecar marker",
+        mutate: async ({ sessionId, userId, tapeId, ordinal }) => {
+          await pool.query(
+            `UPDATE client_session_turn_tape_records SET model_sidecar_complete=FALSE
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
+            [sessionId, userId, tapeId, ordinal],
+          );
+        },
+      },
+      ...([
+        ["model logical identity", "logical_ordinal=logical_ordinal+1000"],
+        ["model msg id", "msg_id=msg_id||'-corrupt'"],
+        ["model role", "role='error'"],
+        ["model semantic text", "semantic_text=semantic_text||'-corrupt'"],
+        ["model token estimate", "token_estimate=token_estimate+1"],
+        ["model timestamp", "ts=COALESCE(ts,0)+1"],
+        ["model client message id", "client_message_id='corrupt-client-message'"],
+      ] as const).map(([name, assignment]) => ({
+        name,
+        mutate: async ({ sessionId, userId, tapeId, ordinal }: {
+          sessionId: string;
+          userId: string;
+          tapeId: string;
+          ordinal: number;
+        }) => {
+          await pool.query(
+            `UPDATE client_session_turn_tape_model_records SET ${assignment}
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal=$4`,
+            [sessionId, userId, tapeId, ordinal],
+          );
+        },
+      })),
+      {
+        name: "missing model row",
+        mutate: async ({ sessionId, userId, tapeId, ordinal }) => {
+          await pool.query(
+            `DELETE FROM client_session_turn_tape_model_records
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal=$4`,
+            [sessionId, userId, tapeId, ordinal],
+          );
+        },
+      },
+      {
+        name: "extra model row",
+        mutate: async ({ sessionId, userId, tapeId, ordinal }) => {
+          await pool.query(
+            `INSERT INTO client_session_turn_tape_model_records
+               (session_id,user_id,tape_id,physical_ordinal,logical_ordinal,msg_id,role,
+                semantic_text,token_estimate,ts,client_message_id)
+             VALUES ($1,$2,$3,$4,999999,'extra-model','error','extra',1,NULL,NULL)`,
+            [sessionId, userId, tapeId, ordinal],
+          );
+        },
+      },
+    ];
+
+    for (const [index, entry] of cases.entries()) {
+      const sessionId = `s-summary-field-${index}`;
+      const userId = `u-summary-field-${index}`;
+      const tape = buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: "completed",
+        turnKey: sha256(`summary-field-${index}`),
+        text: `summary field ${entry.name}`,
+        createdAt: 1_783_944_100_000 + index,
+      });
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+      }
+      await pool.query(
+        "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
+        [sessionId, userId],
+      );
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /target session row malformed/,
+      );
+      await pool.query(
+        "UPDATE client_sessions SET messages='[]' WHERE id=$1 AND user_id=$2",
+        [sessionId, userId],
+      );
+
+      const expectedRecord = (
+        await pool.query<{
+          msg_id: string;
+          role: string;
+          ts: string;
+          content_sha256: string;
+          payload: Buffer;
+          visible_payload: Buffer;
+          visible_content_sha256: string;
+          model_sidecar_complete: boolean;
+        }>(
+          `SELECT msg_id,role,ts::text,content_sha256,payload,visible_payload,
+                  visible_content_sha256,model_sidecar_complete
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            ORDER BY ordinal LIMIT 1`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!;
+      const ordinal = (
+        await pool.query<{ ordinal: number }>(
+          `SELECT physical_ordinal AS ordinal
+             FROM client_session_turn_tape_model_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            ORDER BY physical_ordinal,logical_ordinal LIMIT 1`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!.ordinal;
+      const expectedModels = (
+        await pool.query(
+          `SELECT physical_ordinal,logical_ordinal,msg_id,role,semantic_text,
+                  token_estimate,ts::text,client_message_id
+             FROM client_session_turn_tape_model_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal=$4
+            ORDER BY logical_ordinal`,
+          [sessionId, userId, tape.finalize.tapeId, ordinal],
+        )
+      ).rows;
+
+      await entry.mutate({ sessionId, userId, tapeId: tape.finalize.tapeId, ordinal });
+      assert.equal(
+        (await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+        "finalized",
+        entry.name,
+      );
+      const repairedRecord = (
+        await pool.query(
+          `SELECT msg_id,role,ts::text,content_sha256,payload,visible_payload,
+                  visible_content_sha256,model_sidecar_complete
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            ORDER BY ordinal LIMIT 1`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!;
+      const repairedModels = (
+        await pool.query(
+          `SELECT physical_ordinal,logical_ordinal,msg_id,role,semantic_text,
+                  token_estimate,ts::text,client_message_id
+             FROM client_session_turn_tape_model_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal=$4
+            ORDER BY logical_ordinal`,
+          [sessionId, userId, tape.finalize.tapeId, ordinal],
+        )
+      ).rows;
+      assert.deepEqual(repairedRecord, expectedRecord, entry.name);
+      assert.deepEqual(repairedModels, expectedModels, entry.name);
+    }
+  });
+
+  maybe("exact summary stays two bulk queries instead of one query per physical record", async () => {
+    const sessionId = "s-summary-query-count";
+    const userId = "u-summary-query-count";
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "3".repeat(64),
+      text: "bulk summary complete",
+      tools: Array.from({ length: 120 }, (_, index) => ({
+        blockId: `summary-tool-${index}`,
+        toolName: "Bash",
+        inputJson: { command: `printf ${index}` },
+        output: `summary-output-${index}`,
+        completed: true,
+        arrivedAt: 1_783_944_200_000 + index,
+      })),
+      createdAt: 1_783_944_200_500,
+    });
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await pool.query(
+      "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+    await assert.rejects(
+      backend.finalizeLosslessTurnTape(userId, tape.finalize),
+      /target session row malformed/,
+    );
+    await pool.query(
+      "UPDATE client_sessions SET messages='[]' WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+
+    let recordSummaries = 0;
+    let modelSummaries = 0;
+    const proxyPool = {
+      query: async (...args: unknown[]) => {
+        const first = args[0] as string | { text?: string } | undefined;
+        const sql = typeof first === "string" ? first : first?.text ?? "";
+        if (/AS payload_sha256/i.test(sql)) recordSummaries += 1;
+        if (/AS semantic_text_sha256/i.test(sql)) modelSummaries += 1;
+        return (pool.query as (...queryArgs: unknown[]) => Promise<unknown>)(...args);
+      },
+      connect: () => pool.connect(),
+    };
+    const observedBackend = createPgSessionsBackend(proxyPool as unknown as Pool, {
+      expectedGeneration: GENERATION,
+    });
+    assert.equal(
+      (await observedBackend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+      "finalized",
+    );
+    assert.deepEqual(
+      { recordSummaries, modelSummaries },
+      { recordSummaries: 1, modelSummaries: 1 },
+    );
+    assert.equal(
+      (await pool.query(
+        `SELECT COUNT(*)::int AS count FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )).rows[0]!.count,
+      121,
+    );
+  });
+
+  maybe("final header-lock verification rehashes bytes changed after the exact summary", async () => {
+    for (const field of ["payload", "visible_payload"] as const) {
+      const sessionId = `s-summary-toctou-${field}`;
+      const userId = `u-summary-toctou-${field}`;
+      const tape = buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: "completed",
+        turnKey: sha256(`summary-toctou-${field}`),
+        text: `summary TOCTOU ${field}`,
+        createdAt: 1_783_944_250_000,
+      });
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+      }
+      await pool.query(
+        "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
+        [sessionId, userId],
+      );
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /target session row malformed/,
+      );
+      await pool.query(
+        "UPDATE client_sessions SET messages='[]' WHERE id=$1 AND user_id=$2",
+        [sessionId, userId],
+      );
+
+      let corruptedAfterSummary = false;
+      const proxyPool = {
+        query: async (...args: unknown[]) => {
+          const result = await (pool.query as (...queryArgs: unknown[]) => Promise<unknown>)(...args);
+          const first = args[0] as string | { text?: string } | undefined;
+          const sql = typeof first === "string" ? first : first?.text ?? "";
+          if (!corruptedAfterSummary && /AS semantic_text_sha256/i.test(sql)) {
+            corruptedAfterSummary = true;
+            await pool.query(
+              `UPDATE client_session_turn_tape_records
+                  SET ${field}=convert_to('{"postSummary":"corrupt"}','UTF8')
+                WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=0`,
+              [sessionId, userId, tape.finalize.tapeId],
+            );
+          }
+          return result;
+        },
+        connect: () => pool.connect(),
+      };
+      const observedBackend = createPgSessionsBackend(proxyPool as unknown as Pool, {
+        expectedGeneration: GENERATION,
+      });
+      await assert.rejects(
+        observedBackend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /staged record manifest conflict/,
+      );
+      assert.equal(corruptedAfterSummary, true);
+      assert.equal(
+        (await pool.query<{ finalized_at: string | null }>(
+          `SELECT finalized_at::text FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0]!.finalized_at,
+        null,
+        `${field} corruption must not be finalized`,
+      );
+      assert.equal(
+        (await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+        "finalized",
+      );
+      const repaired = (
+        await pool.query<{
+          content_sha256: string;
+          payload_sha256: string;
+          visible_content_sha256: string;
+          visible_payload_sha256: string;
+        }>(
+          `SELECT content_sha256,
+                  encode(public.digest(payload,'sha256'),'hex') AS payload_sha256,
+                  visible_content_sha256,
+                  encode(public.digest(visible_payload,'sha256'),'hex') AS visible_payload_sha256
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=0`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!;
+      assert.equal(repaired.payload_sha256, repaired.content_sha256);
+      assert.equal(repaired.visible_payload_sha256, repaired.visible_content_sha256);
+    }
+  });
+
+  maybe("billing work rolls back if the terminal tape update fails, then concurrent replay charges once", async () => {
+    const sessionId = "s-finalize-billing-boundary";
+    const userId = "c:228";
+    const turnKey = "4".repeat(64);
+    const requestId = "finalize-billing-boundary";
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      requestId,
+      text: "atomic billing boundary answer",
+      createdAt: 1_783_944_300_000,
+    });
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await pool.query(
+      `INSERT INTO pending_usage_patches
+         (request_id,user_id,session_id,turn_key,cost_credits)
+       VALUES ($1,$2,'ccb-billing-boundary',$3,'344')`,
+      [requestId, userId, turnKey],
+    );
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION oc_test_fail_terminal_tape_update()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.tape_id='${tape.finalize.tapeId}' AND NEW.finalized_at IS NOT NULL THEN
+          RAISE EXCEPTION 'test terminal tape update failure';
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER trg_oc_test_fail_terminal_tape_update
+      BEFORE UPDATE ON client_session_turn_tapes
+      FOR EACH ROW EXECUTE FUNCTION oc_test_fail_terminal_tape_update();
+    `);
+    try {
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /test terminal tape update failure/,
+      );
+      assert.equal(
+        (await pool.query(
+          `SELECT 1 FROM turn_tape_cost_components
+            WHERE request_id=$1 AND user_id=$2`,
+          [requestId, userId],
+        )).rowCount,
+        0,
+        "cost component must roll back with the terminal header",
+      );
+      assert.equal(
+        (await pool.query(
+          `SELECT 1 FROM pending_usage_patches
+            WHERE request_id=$1 AND user_id=$2`,
+          [requestId, userId],
+        )).rowCount,
+        1,
+        "pending cost must remain recoverable",
+      );
+      assert.equal(
+        (await pool.query<{ finalized_at: string | null }>(
+          `SELECT finalized_at::text FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0]!.finalized_at,
+        null,
+      );
+    } finally {
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_fail_terminal_tape_update
+          ON client_session_turn_tapes;
+        DROP FUNCTION IF EXISTS oc_test_fail_terminal_tape_update();
+      `);
+    }
+
+    const results = await Promise.all([
+      backend.finalizeLosslessTurnTape(userId, tape.finalize),
+      backend.finalizeLosslessTurnTape(userId, tape.finalize),
+    ]);
+    assert.deepEqual(
+      results.map((result) => result.applied).sort(),
+      ["finalized", "idempotent"],
+    );
+    assert.deepEqual(
+      (await pool.query<{ count: string; credits: string }>(
+        `SELECT COUNT(*)::text AS count,COALESCE(SUM(cost_credits),0)::text AS credits
+           FROM turn_tape_cost_components
+          WHERE request_id=$1 AND user_id=$2`,
+        [requestId, userId],
+      )).rows[0],
+      { count: "1", credits: "344" },
+    );
+    assert.equal(
+      (await pool.query(
+        `SELECT 1 FROM pending_usage_patches
+          WHERE request_id=$1 AND user_id=$2`,
+        [requestId, userId],
+      )).rowCount,
+      0,
+    );
+  });
+
+  maybe("a real HTTP client abort does not cancel finalize and the concurrent replay is idempotent", async () => {
+    const sessionId = "s-http-abort-finalize";
+    const numericUserId = 229;
+    const userId = `c:${numericUserId}`;
+    const turnKey = "5".repeat(64);
+    const requestId = "http-abort-finalize";
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      requestId,
+      text: "commit after the HTTP client disconnects",
+      createdAt: 1_783_944_400_000,
+    });
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await pool.query(
+      `INSERT INTO pending_usage_patches
+         (request_id,user_id,session_id,turn_key,cost_credits)
+       VALUES ($1,$2,'ccb-http-abort',$3,'502')`,
+      [requestId, userId, turnKey],
+    );
+
+    const barrierKey = 1_780_178;
+    const locker = await pool.connect();
+    await locker.query("SELECT pg_advisory_lock($1)", [barrierKey]);
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION oc_test_wait_before_terminal_tape_update()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.tape_id='${tape.finalize.tapeId}' AND NEW.finalized_at IS NOT NULL THEN
+          PERFORM pg_advisory_xact_lock(${barrierKey});
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER trg_oc_test_wait_before_terminal_tape_update
+      BEFORE UPDATE ON client_session_turn_tapes
+      FOR EACH ROW EXECUTE FUNCTION oc_test_wait_before_terminal_tape_update();
+    `);
+
+    const secret = "a".repeat(64);
+    const token = `oc-v3.7.${secret}`;
+    const hostUuid = "http-abort-host";
+    const boundIp = "172.30.0.229";
+    const identityRepo = {
+      async findActiveByHostAndBoundIp(host: string, ip: string) {
+        if (host !== hostUuid || ip !== boundIp) return null;
+        return {
+          id: 7,
+          user_id: numericUserId,
+          host_uuid: hostUuid,
+          bound_ip: boundIp,
+          secret_hash: createHash("sha256").update(Buffer.from(secret, "hex")).digest(),
+        };
+      },
+    } as ContainerIdentityRepo;
+    const handler = makeServerAuthoredHandler({
+      identityRepo,
+      storage: {} as ServerAuthoredStorage,
+      losslessTurnTapeStorage: backend,
+      metric: () => undefined,
+    });
+    let handlerError: unknown;
+    const server = createServer((req, res) => {
+      void handler(req, res, { hostUuid, boundIp }).catch((err) => {
+        handlerError = err;
+        res.destroy(err as Error);
+      });
+    });
+    let lockerHeld = true;
+    let serverListening = false;
+    try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    serverListening = true;
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const url = `http://127.0.0.1:${address.port}${SERVER_AUTHORED_PATH}`;
+    const headers = {
+      "content-type": "application/json; charset=utf-8",
+      authorization: `Bearer ${token}`,
+    };
+    const body = JSON.stringify(tape.finalize);
+    const controller = new AbortController();
+    const first = undiciRequest(url, {
+      method: "POST",
+      headers,
+      body,
+      signal: controller.signal,
+    });
+
+    const waitDeadline = Date.now() + 5_000;
+    let barrierObserved = false;
+    while (Date.now() < waitDeadline) {
+      barrierObserved = Boolean((
+        await pool.query<{ waiting: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_locks
+              WHERE locktype='advisory' AND classid=0 AND objid=$1 AND NOT granted
+           ) AS waiting`,
+          [barrierKey],
+        )
+      ).rows[0]?.waiting);
+      if (barrierObserved) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(barrierObserved, true, "first finalize must reach the post-billing transaction barrier");
+
+    const replay = undiciRequest(url, { method: "POST", headers, body });
+    controller.abort();
+    await assert.rejects(first, /abort/i);
+    await locker.query("SELECT pg_advisory_unlock($1)", [barrierKey]);
+    locker.release();
+    lockerHeld = false;
+
+    const replayResponse = await replay;
+    const replayBody = JSON.parse(await replayResponse.body.text()) as {
+      ok: boolean;
+      idempotent?: boolean;
+    };
+    assert.equal(replayResponse.statusCode, 200);
+    assert.equal(replayBody.ok, true);
+    assert.equal(replayBody.idempotent, true);
+    assert.equal(handlerError, undefined);
+    assert.deepEqual(
+      (await pool.query<{ finalized: boolean; parts: string }>(
+        `SELECT finalized_at IS NOT NULL AS finalized,
+                (SELECT COUNT(*)::text FROM client_session_turn_tape_parts p
+                  WHERE p.session_id=t.session_id AND p.user_id=t.user_id AND p.tape_id=t.tape_id) AS parts
+           FROM client_session_turn_tapes t
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )).rows[0],
+      { finalized: true, parts: "0" },
+    );
+    assert.deepEqual(
+      (await pool.query<{ count: string; credits: string }>(
+        `SELECT COUNT(*)::text AS count,COALESCE(SUM(cost_credits),0)::text AS credits
+           FROM turn_tape_cost_components
+          WHERE request_id=$1 AND user_id=$2`,
+        [requestId, userId],
+      )).rows[0],
+      { count: "1", credits: "502" },
+    );
+    assert.equal(
+      (await pool.query(
+        "SELECT 1 FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
+        [requestId, userId],
+      )).rowCount,
+      0,
+    );
+    } finally {
+      if (lockerHeld) {
+        await locker.query("SELECT pg_advisory_unlock($1)", [barrierKey]);
+        locker.release();
+      }
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_wait_before_terminal_tape_update
+          ON client_session_turn_tapes;
+        DROP FUNCTION IF EXISTS oc_test_wait_before_terminal_tape_update();
+      `);
+      if (serverListening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err) => err ? reject(err) : resolve());
+          server.closeAllConnections();
+        });
+      }
+    }
   });
 
   maybe("an agent-group compatibility trigger cannot delete source parts outside its ordinal rollback", async () => {

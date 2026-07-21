@@ -2035,7 +2035,14 @@ async function stagePreparedLosslessTurnRecords(
   request: LosslessTurnTapeFinalizeRequest,
   prepared: PreparedLosslessTurnTape,
 ): Promise<void> {
+  const exactOrdinals = await readExactPreparedLosslessTurnOrdinals(
+    pool,
+    userId,
+    request,
+    prepared,
+  );
   for (let ordinal = 0; ordinal < prepared.turn.records.length; ordinal++) {
+    if (exactOrdinals.has(ordinal)) continue;
     const item = prepared.turn.records[ordinal]!;
     const visible = prepared.visible[ordinal]!;
     const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
@@ -2272,6 +2279,113 @@ async function stagePreparedLosslessTurnRecords(
     });
     if (staged !== "staged") return;
   }
+}
+
+async function readExactPreparedLosslessTurnOrdinals(
+  pool: Pool,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+  prepared: PreparedLosslessTurnTape,
+): Promise<Set<number>> {
+  type RecordSummaryRow = {
+    msg_id: string;
+    ordinal: number;
+    role: string;
+    ts: string;
+    content_sha256: string;
+    payload_sha256: string;
+    visible_content_sha256: string | null;
+    visible_payload_sha256: string | null;
+    model_sidecar_complete: boolean;
+  };
+  const records = (
+    await pool.query<RecordSummaryRow>(
+      `SELECT msg_id,ordinal,role,ts::text,content_sha256,
+              encode(public.digest(payload,'sha256'),'hex') AS payload_sha256,
+              visible_content_sha256,
+              CASE WHEN visible_payload IS NULL THEN NULL
+                   ELSE encode(public.digest(visible_payload,'sha256'),'hex') END
+                AS visible_payload_sha256,
+              model_sidecar_complete
+         FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        ORDER BY ordinal`,
+      [request.sessionId, userId, request.tapeId],
+    )
+  ).rows;
+
+  type ModelSummaryRow = {
+    physical_ordinal: number;
+    logical_ordinal: number;
+    msg_id: string;
+    role: string;
+    semantic_text_sha256: string;
+    token_estimate: number;
+    ts: string | null;
+    client_message_id: string | null;
+  };
+  const modelRows = (
+    await pool.query<ModelSummaryRow>(
+      `SELECT physical_ordinal,logical_ordinal,msg_id,role,
+              encode(public.digest(convert_to(semantic_text,'UTF8'),'sha256'),'hex')
+                AS semantic_text_sha256,
+              token_estimate,ts::text,client_message_id
+         FROM client_session_turn_tape_model_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+        ORDER BY physical_ordinal,logical_ordinal`,
+      [request.sessionId, userId, request.tapeId],
+    )
+  ).rows;
+
+  const recordsByOrdinal = new Map(records.map((row) => [row.ordinal, row]));
+  const modelsByOrdinal = new Map<number, ModelSummaryRow[]>();
+  for (const row of modelRows) {
+    const rows = modelsByOrdinal.get(row.physical_ordinal);
+    if (rows) rows.push(row);
+    else modelsByOrdinal.set(row.physical_ordinal, [row]);
+  }
+
+  const exact = new Set<number>();
+  for (let ordinal = 0; ordinal < prepared.turn.records.length; ordinal++) {
+    const item = prepared.turn.records[ordinal]!;
+    const visible = prepared.visible[ordinal]!;
+    const record = recordsByOrdinal.get(ordinal);
+    if (
+      !record ||
+      record.msg_id !== item.id ||
+      record.role !== item.role ||
+      bigIntNum(record.ts, "summarized turn tape record ts") !== item.ts ||
+      record.content_sha256 !== item.payloadSha256 ||
+      record.payload_sha256 !== item.payloadSha256 ||
+      record.visible_content_sha256 !== visible.contentSha256 ||
+      record.visible_payload_sha256 !== visible.contentSha256 ||
+      record.model_sidecar_complete !== true
+    ) {
+      continue;
+    }
+
+    const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
+    const actualModels = modelsByOrdinal.get(ordinal) ?? [];
+    if (
+      actualModels.length !== expectedModels.length ||
+      !actualModels.every((actual, index) => {
+        const expected = expectedModels[index]!;
+        return actual.physical_ordinal === expected.physicalOrdinal &&
+          actual.logical_ordinal === expected.logicalOrdinal &&
+          actual.msg_id === expected.msgId &&
+          actual.role === expected.role &&
+          actual.semantic_text_sha256 === sha256Bytes(Buffer.from(expected.semanticText, "utf8")) &&
+          actual.token_estimate === expected.tokenEstimate &&
+          (actual.ts === null ? null : bigIntNum(actual.ts, "summarized model record ts")) ===
+            expected.ts &&
+          actual.client_message_id === expected.clientMessageId;
+      })
+    ) {
+      continue;
+    }
+    exact.add(ordinal);
+  }
+  return exact;
 }
 
 async function readDirectTapeHeaders(
@@ -5598,7 +5712,7 @@ export function createPgSessionsBackend(
         const turn = prepared.turn;
 
         // Parts are immutable once staged. Recheck only their manifest while
-        // holding the tape row lock; heavyweight BYTEA IO, concatenation,
+        // holding the tape row lock; source-part BYTEA concatenation,
         // JSON.parse and user-visible/model materialization already happened
         // before this transaction.
         if (
@@ -5608,6 +5722,10 @@ export function createPgSessionsBackend(
           return { applied: "incomplete" };
         }
 
+        // The unlocked summaries above are only a staging optimization. Rehash
+        // both derived byte copies under the header lock so a row changed
+        // between summary and publication can never be finalized on the
+        // strength of stale declared hashes.
         const stagedRecords = (
           await client.query<{
             msg_id: string;
@@ -5615,11 +5733,18 @@ export function createPgSessionsBackend(
             role: string;
             ts: string;
             content_sha256: string;
+            payload_sha256: string;
             visible_content_sha256: string | null;
+            visible_payload_sha256: string | null;
             model_sidecar_complete: boolean;
           }>(
             `SELECT msg_id,ordinal,role,ts::text,content_sha256,
-                    visible_content_sha256,model_sidecar_complete
+                    encode(public.digest(payload,'sha256'),'hex') AS payload_sha256,
+                    visible_content_sha256,
+                    CASE WHEN visible_payload IS NULL THEN NULL
+                         ELSE encode(public.digest(visible_payload,'sha256'),'hex') END
+                      AS visible_payload_sha256,
+                    model_sidecar_complete
                FROM client_session_turn_tape_records
               WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
               ORDER BY ordinal`,
@@ -5639,7 +5764,9 @@ export function createPgSessionsBackend(
             actual.role !== expected.role ||
             bigIntNum(actual.ts, "staged turn tape record ts") !== expected.ts ||
             actual.content_sha256 !== expected.payloadSha256 ||
+            actual.payload_sha256 !== expected.payloadSha256 ||
             actual.visible_content_sha256 !== expectedVisible.contentSha256 ||
+            actual.visible_payload_sha256 !== expectedVisible.contentSha256 ||
             actual.model_sidecar_complete !== true
           ) {
             throw new Error("lossless turn tape staged record manifest conflict");

@@ -364,6 +364,26 @@ describe("attemptSend — multipart upload", () => {
       (error: unknown) => error instanceof V3SinkError && error.errorClass === "transient",
     );
   });
+
+  test("the attempt deadline aborts the HTTP request and remains a durable transient", async () => {
+    let signalAborted = false;
+    const fetcher = (async (_url: string, init: any) => {
+      await new Promise<never>((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => {
+          signalAborted = true;
+          reject(new DOMException("deadline", "AbortError"));
+        }, { once: true });
+      });
+      throw new Error("unreachable");
+    }) as unknown as typeof import("undici").request;
+    await assert.rejects(
+      () => attemptSend(PAYLOAD, { config: CFG, fetcher, timeoutMs: 5 }),
+      (error: unknown) => error instanceof V3SinkError &&
+        error.errorClass === "transient" &&
+        /network error/i.test(error.message),
+    );
+    assert.equal(signalAborted, true);
+  });
 });
 
 describe("makeV3MasterSink.persistOrQueue", () => {
