@@ -629,13 +629,9 @@ export const ThinkingCard = memo(
   function ThinkingCard({
     msgs,
     ctx,
-    alwaysExpanded = false,
   }: {
     msgs: ChatMessage[];
     ctx: RenderCtx;
-    /** Historical unified-timeline rows render directly, never as a hidden
-     * "raw thinking" disclosure or collapsed substitute. */
-    alwaysExpanded?: boolean;
     /** 分组渲染签名(memo 比较键)。所有调用方必须传，否则 memo 会误判为无变化。*/
     sig?: string;
   }) {
@@ -644,7 +640,7 @@ export const ThinkingCard = memo(
     const live = isLive(msgs[msgs.length - 1] ?? { role: "thinking" }, ctx);
     const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
     // 默认折叠态权威仍走 render 层 defaultCollapsed（thinking：流式展开、完成折叠）；用户手动切换后本地锁定。
-    const collapsed = alwaysExpanded ? false : (userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx));
+    const collapsed = userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx);
     const segments = thinkingSegments(msgs.map((m) => m.text));
     // 折叠态摘要：完成后取最新段首个粗体标题；流式中保持稳定的"思考过程"
     // （不随 delta/角色切换闪烁）。
@@ -652,27 +648,20 @@ export const ThinkingCard = memo(
     const headline = live ? "思考过程" : summary ? `已思考 · ${summary}` : "已思考";
     return (
       <div className="rounded-lg border border-border bg-surface/60 animate-in">
-        {alwaysExpanded ? (
-          <div className="flex w-full items-center gap-2 px-3.5 py-2 text-[13px] text-muted">
-            <Brain size={14} className="shrink-0 text-faint" />
-            <span className="font-medium">思考过程</span>
-          </div>
-        ) : (
-          <button
-            type="button"
-            onClick={() => setUserCollapsed(!collapsed)}
-            className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
-          >
-            <Brain size={14} className="shrink-0 text-faint" />
-            <span className="min-w-0 truncate font-medium" title={headline}>
-              {headline}
-            </span>
-            <ChevronRight
-              size={14}
-              className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
-            />
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => setUserCollapsed(!collapsed)}
+          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
+        >
+          <Brain size={14} className="shrink-0 text-faint" />
+          <span className="min-w-0 truncate font-medium" title={headline}>
+            {headline}
+          </span>
+          <ChevronRight
+            size={14}
+            className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
+          />
+        </button>
         {!collapsed && segments.length > 0 && (
           <div className="border-t border-border px-3.5 py-2.5">
             {segments.map((seg, i) => (
@@ -698,7 +687,7 @@ export const ThinkingCard = memo(
       </div>
     );
   },
-  (a, b) => a.sig === b.sig && a.alwaysExpanded === b.alwaysExpanded,
+  (a, b) => a.sig === b.sig,
 );
 
 // ═══════════════ plan ═══════════════

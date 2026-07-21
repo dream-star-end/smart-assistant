@@ -926,7 +926,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(container.querySelector("button")).toBeNull();
   });
 
-  test("统一时间线直接展示最新思考、工具和回答，不存在过程折叠卡或隐式请求", () => {
+  test("统一时间线保留最新思考、工具和回答，完成态思考默认折叠且可完整展开", () => {
     const rows = [
       mk("user", { id: "u-latest", text: "最新问题", ts: 1, _timelineRecord: true }),
       mk("thinking", {
@@ -962,12 +962,42 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     render(
       <MessageList messages={rows} sending={false} cb={{}} onRespondPermission={() => {}} />,
     );
+    expect(screen.queryByText("最新真实思考")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
     expect(screen.getByText("最新真实思考")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /终端/ })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /终端/ }));
     expect(screen.getByText("最新真实工具输出")).toBeInTheDocument();
     expect(screen.getByText("最新真实回答")).toBeInTheDocument();
     expect(screen.queryByText(/Agent 调用过程|查看原始思考记录|绝不能展示/)).toBeNull();
+  });
+
+  test("统一时间线思考从实时态结束后自动折叠，点击仍恢复完整正文", () => {
+    const thinking = mk("thinking", {
+      id: "thinking-live-to-complete",
+      text: "EXACT_LIVE_TO_COMPLETE_THINKING",
+      ts: 2,
+      _timelineRecord: true,
+      _timelineUnitKey: "tape:t:0:0:thinking-live-to-complete",
+    });
+    const renderState = (sending: boolean) => (
+      <MessageList
+        messages={[thinking]}
+        sending={sending}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />
+    );
+    const view = render(renderState(true));
+
+    expect(screen.getByRole("button", { name: "思考过程" })).toBeInTheDocument();
+    expect(screen.getByText("EXACT_LIVE_TO_COMPLETE_THINKING")).toBeInTheDocument();
+
+    view.rerender(renderState(false));
+
+    expect(screen.queryByText("EXACT_LIVE_TO_COMPLETE_THINKING")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
+    expect(screen.getByText("EXACT_LIVE_TO_COMPLETE_THINKING")).toBeInTheDocument();
   });
 
   test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
