@@ -9,7 +9,9 @@ const testHome = await mkdtemp(join(tmpdir(), 'oc-auto-dream-'))
 process.env.OPENCLAUDE_HOME = testHome
 
 const {
+  AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
   AutoDreamService,
+  AutoDreamStructuredOutputCollector,
   MAX_AUTO_DREAM_RUN_MS,
   formatAutoDreamReceipt,
   isAutoDreamSuccessfulTurn,
@@ -84,6 +86,90 @@ describe('validateProposal', () => {
     )
     assert.deepEqual(result.upserts, [])
     assert.deepEqual(result.deletes, [])
+  })
+
+  it('accepts multiline Markdown bodies serialized from structured output', () => {
+    const proposal = JSON.parse(valid())
+    proposal.upserts[0].body = '长期项目说明\n\n```ts\nconst stable = true\n```'
+    const result = validateProposal(JSON.stringify(proposal), memory)
+    assert.match(result.upserts[0]?.body ?? '', /```ts/)
+    assert.equal(AUTO_DREAM_PROPOSAL_JSON_SCHEMA.additionalProperties, false)
+  })
+})
+
+describe('AutoDreamStructuredOutputCollector', () => {
+  const structuredToolUse = {
+    kind: 'block',
+    block: {
+      kind: 'tool_use',
+      toolName: 'StructuredOutput',
+      inputJson: {},
+      partial: false,
+    },
+  } as const
+  const structuredToolResult = {
+    kind: 'block',
+    block: {
+      kind: 'tool_result',
+      toolName: 'StructuredOutput',
+      isError: false,
+    },
+  } as const
+
+  it('accepts internal structured-output retries and a tool_use terminal reason', () => {
+    const collector = new AutoDreamStructuredOutputCollector()
+    collector.accept({ kind: 'block', block: { kind: 'thinking', text: 'private reasoning' } })
+    collector.accept({ kind: 'block', block: { kind: 'text', text: 'ignored preamble' } })
+    collector.accept(structuredToolUse)
+    collector.accept(structuredToolResult)
+    collector.accept(structuredToolUse)
+    collector.accept(structuredToolResult)
+    const proposal = JSON.parse(valid())
+    collector.accept({
+      kind: 'final',
+      meta: { stopReason: 'tool_use', structuredOutput: proposal },
+    })
+
+    const result = validateProposal(collector.finish(), memory)
+    assert.equal(result.upserts[0]?.file, 'stable-preference.md')
+  })
+
+  it('rejects non-StructuredOutput tools even when a structured result is present', () => {
+    const collector = new AutoDreamStructuredOutputCollector()
+    collector.accept({
+      kind: 'block',
+      block: { kind: 'tool_use', toolName: 'Bash', inputJson: {}, partial: false },
+    })
+    collector.accept({
+      kind: 'final',
+      meta: { stopReason: 'tool_use', structuredOutput: JSON.parse(valid()) },
+    })
+    assert.throws(
+      () => collector.finish(),
+      /AUTO_DREAM_INVALID_EVENT_non_structured_block:tool_use/,
+    )
+  })
+
+  it('rejects missing structured output and missing or duplicate finals', () => {
+    assert.throws(
+      () => new AutoDreamStructuredOutputCollector().finish(),
+      /AUTO_DREAM_FINAL_COUNT_0/,
+    )
+
+    const missing = new AutoDreamStructuredOutputCollector()
+    missing.accept(structuredToolUse)
+    missing.accept({ kind: 'final', meta: { stopReason: 'tool_use' } })
+    assert.throws(() => missing.finish(), /AUTO_DREAM_TOOL_USE_STOP/)
+
+    const duplicate = new AutoDreamStructuredOutputCollector()
+    duplicate.accept(structuredToolUse)
+    const final = {
+      kind: 'final',
+      meta: { structuredOutput: JSON.parse(valid()) },
+    } as const
+    duplicate.accept(final)
+    duplicate.accept(final)
+    assert.throws(() => duplicate.finish(), /AUTO_DREAM_FINAL_COUNT_2/)
   })
 })
 

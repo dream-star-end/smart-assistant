@@ -609,6 +609,29 @@ describe('CcbMessageParser: result', () => {
     }
   })
 
+  it('forwards result.structured_output only on the final event that carries it', () => {
+    const withStructured = createParser()
+    const structuredOutput = { upserts: [], deletes: [], summary: 'noop' }
+    withStructured.parser.parse({
+      type: 'result',
+      total_cost_usd: 0.01,
+      usage: {},
+      structured_output: structuredOutput,
+    } as any)
+    const structuredFinal = withStructured.events.find((event) => event.kind === 'final')
+    assert.ok(structuredFinal?.kind === 'final')
+    assert.deepEqual(structuredFinal.meta?.structuredOutput, structuredOutput)
+
+    const withoutStructured = createParser()
+    withoutStructured.parser.parse({ type: 'result', total_cost_usd: 0.01, usage: {} } as any)
+    const plainFinal = withoutStructured.events.find((event) => event.kind === 'final')
+    assert.ok(plainFinal?.kind === 'final')
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(plainFinal.meta ?? {}, 'structuredOutput'),
+      false,
+    )
+  })
+
   it('ignores messages after finalization', () => {
     const { parser, events } = createParser()
 

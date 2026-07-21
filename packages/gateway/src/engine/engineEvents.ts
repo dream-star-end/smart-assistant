@@ -164,6 +164,9 @@ export interface EngineFinalMeta {
    *  | 'pause_turn' | 'refusal'. Used by sessionManager for phantom
    *  judgment and by frontend for empty-turn notice text. */
   stopReason?: string
+  /** CCB result.structured_output when the runner was started with --json-schema.
+   *  Absent for ordinary turns and engines without structured-output support. */
+  structuredOutput?: unknown
 }
 
 /**

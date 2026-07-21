@@ -17,6 +17,7 @@ import {
 } from '@openclaude/storage'
 
 import { type AutoDreamPolicy, AutoDreamPolicyClient } from './autoDreamPolicy.js'
+import type { SessionStreamEvent } from './engine/engineEvents.js'
 
 const USER_CHANNELS = new Set(['webchat', 'wechat', 'telegram'])
 const SCAN_THROTTLE_MS = 10 * 60_000
@@ -44,6 +45,113 @@ const SAFE_REPORT_SUMMARIES = new Set([
   REPORT_FAILED_NO_CHANGE,
   REPORT_FAILED_UNKNOWN,
 ])
+
+/**
+ * CCB `--json-schema` contract for the model-facing half of Auto-Dream.
+ * Cross-item and storage-dependent rules remain authoritative in
+ * validateProposal() below (aggregate body budget, duplicate/overlap checks,
+ * snapshot membership, memory safety scan and CAS apply).
+ */
+export const AUTO_DREAM_PROPOSAL_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['upserts', 'deletes', 'summary'],
+  properties: {
+    upserts: {
+      type: 'array',
+      maxItems: MAX_UPSERTS,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['file', 'name', 'description', 'type', 'body'],
+        properties: {
+          file: {
+            type: 'string',
+            pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.md$',
+          },
+          name: {
+            type: 'string',
+            maxLength: 120,
+            pattern: '^(?=.*\\S)[^\\r\\n]*$',
+          },
+          description: {
+            type: 'string',
+            maxLength: 240,
+            pattern: '^(?=.*\\S)[^\\r\\n]*$',
+          },
+          type: { type: 'string', enum: ['user', 'feedback', 'project', 'reference'] },
+          body: { type: 'string', maxLength: MAX_BODY_CHARS },
+        },
+      },
+    },
+    deletes: {
+      type: 'array',
+      maxItems: MAX_DELETES,
+      uniqueItems: true,
+      items: {
+        type: 'string',
+        pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.md$',
+      },
+    },
+    summary: { type: 'string', maxLength: MAX_REPORT_SUMMARY_CHARS },
+  },
+} as const
+
+/**
+ * Minimal event collector for the hermetic CCB structured-output turn.
+ * Free-form text is never treated as the proposal; result.structured_output
+ * is the sole authority. The only permitted tool is CCB's internal
+ * StructuredOutput tool, including repeated attempts from schema retries.
+ */
+export class AutoDreamStructuredOutputCollector {
+  private finals = 0
+  private invalidEvent: string | null = null
+  private hasStructuredOutput = false
+  private structuredOutput: unknown
+  private sawStructuredOutputTool = false
+  private stopReason: string | undefined
+
+  accept(event: SessionStreamEvent): void {
+    if (event.kind === 'block') {
+      if (event.block.kind === 'thinking' || event.block.kind === 'text') return
+      if (
+        (event.block.kind === 'tool_use' || event.block.kind === 'tool_result') &&
+        event.block.toolName === 'StructuredOutput'
+      ) {
+        this.sawStructuredOutputTool = true
+        return
+      }
+      this.invalidEvent ??= `non_structured_block:${event.block.kind}`
+      return
+    }
+    if (event.kind === 'final') {
+      this.finals++
+      this.stopReason = event.meta?.stopReason
+      if (event.meta && Object.prototype.hasOwnProperty.call(event.meta, 'structuredOutput')) {
+        this.hasStructuredOutput = true
+        this.structuredOutput = event.meta.structuredOutput
+      }
+      return
+    }
+    if (event.kind === 'turn_status') return
+    this.invalidEvent ??= event.kind
+  }
+
+  finish(): string {
+    if (this.finals !== 1) throw new Error(`AUTO_DREAM_FINAL_COUNT_${this.finals}`)
+    if (this.invalidEvent) throw new Error(`AUTO_DREAM_INVALID_EVENT_${this.invalidEvent}`)
+    if (!this.hasStructuredOutput) {
+      if (this.stopReason === 'tool_use') throw new Error('AUTO_DREAM_TOOL_USE_STOP')
+      throw new Error('AUTO_DREAM_MISSING_STRUCTURED_OUTPUT')
+    }
+    if (this.stopReason === 'tool_use' && !this.sawStructuredOutputTool) {
+      throw new Error('AUTO_DREAM_TOOL_USE_STOP')
+    }
+    const serialized = JSON.stringify(this.structuredOutput)
+    if (typeof serialized !== 'string') throw new Error('AUTO_DREAM_MISSING_STRUCTURED_OUTPUT')
+    return serialized
+  }
+}
 
 type AutoDreamStatus = 'idle' | 'running' | 'success' | 'failed'
 

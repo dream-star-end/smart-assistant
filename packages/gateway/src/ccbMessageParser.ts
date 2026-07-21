@@ -1197,6 +1197,9 @@ export class CcbMessageParser {
         totalCost: this._sessionTotals.totalCostUSD,
         turn: this._sessionTotals.turns,
         ...(stopReason !== null ? { stopReason } : {}),
+        ...(Object.prototype.hasOwnProperty.call(msg, 'structured_output')
+          ? { structuredOutput: msg.structured_output }
+          : {}),
       },
     })
     this.onFinish(this.turnResult)

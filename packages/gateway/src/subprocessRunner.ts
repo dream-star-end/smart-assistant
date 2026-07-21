@@ -666,6 +666,8 @@ export interface SubprocessRunnerOpts {
   skillEvalDraft?: { name: string; dir: string }
   /** V5 Auto-Dream one-shot isolation profile (CCB only). */
   hermeticNoTools?: boolean
+  /** CCB --json-schema contract. Currently used only by the hermetic Auto-Dream turn. */
+  structuredOutputSchema?: Readonly<Record<string, unknown>>
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -690,6 +692,7 @@ export interface SdkMessage {
   total_cost_usd?: number
   duration_ms?: number
   is_error?: boolean
+  structured_output?: unknown
 }
 
 /** Permission response from the user (sent back to CCB as control_response) */
@@ -737,6 +740,8 @@ export interface CcbCliArgsInput {
   hermeticNoTools?: boolean
   /** Explicit bare-mode settings containing only the env-backed apiKeyHelper. */
   settingsFile?: string
+  /** Static structured-output contract passed to CCB --json-schema. */
+  structuredOutputSchema?: Readonly<Record<string, unknown>>
 }
 
 /**
@@ -768,6 +773,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     workload,
     hermeticNoTools,
     settingsFile,
+    structuredOutputSchema,
   } = input
   const args: string[] = [
     runtime === 'bun' ? 'run' : '--experimental-strip-types',
@@ -811,6 +817,9 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   // and surfaces as `cc_workload=<tag>` in x-anthropic-billing-header,
   // letting Anthropic route the traffic at a lower QoS.
   if (workload) args.push('--workload', workload)
+  if (structuredOutputSchema) {
+    args.push('--json-schema', JSON.stringify(structuredOutputSchema))
+  }
   // 必须给一个 prompt placeholder,CCB stream-json 会从 stdin 接管
   args.push('')
   return args
@@ -1133,6 +1142,7 @@ export class SubprocessRunner extends EventEmitter {
       workload: this.opts.workload,
       hermeticNoTools: this.opts.hermeticNoTools,
       settingsFile: learningContext.settingsFile,
+      structuredOutputSchema: this.opts.structuredOutputSchema,
     })
 
     // ── Provider-aware auth injection ──
