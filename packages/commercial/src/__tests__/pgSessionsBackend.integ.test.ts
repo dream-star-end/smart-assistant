@@ -848,6 +848,242 @@ describe("pgSessionsBackend contract", () => {
 });
 
 describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("repairs stale partial derived rows atomically under concurrent replay without double cost", async () => {
+    const sessionId = "s-partial-derived-recovery";
+    const userId = "c:227";
+    const turnKey = "1".repeat(64);
+    const requestId = "partial-derived-cost";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey,
+      requestId,
+      text: "the complete paid answer",
+      tools: [{
+        blockId: "partial-derived-tool",
+        toolName: "Bash",
+        inputJson: { command: "printf exact" },
+        output: "exact tool output",
+        completed: true,
+      }],
+      usage: { inputTokens: 11, outputTokens: 13 },
+      createdAt: 1_783_944_000_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await pool.query(
+      `INSERT INTO pending_usage_patches
+         (request_id,user_id,session_id,turn_key,cost_credits)
+       VALUES ($1,$2,'ccb-partial-derived',$3,'207')`,
+      [requestId, userId, turnKey],
+    );
+
+    // Force the terminal transaction to roll back after per-ordinal staging,
+    // reproducing a process/release boundary with durable partial derived rows.
+    await pool.query(
+      "UPDATE client_sessions SET messages='not-json' WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+    await assert.rejects(
+      backend.finalizeLosslessTurnTape(userId, tape.finalize),
+      /target session row malformed/,
+    );
+    await pool.query(
+      "UPDATE client_sessions SET messages='[]' WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+
+    type RecordSnapshot = {
+      msg_id: string;
+      ordinal: number;
+      role: string;
+      ts: string;
+      content_sha256: string;
+      payload: Buffer;
+      visible_payload: Buffer;
+      visible_content_sha256: string;
+      model_sidecar_complete: boolean;
+    };
+    type ModelSnapshot = {
+      physical_ordinal: number;
+      logical_ordinal: number;
+      msg_id: string;
+      role: string;
+      semantic_text: string;
+      token_estimate: number;
+      ts: string | null;
+      client_message_id: string | null;
+    };
+    const expectedRecords = (
+      await pool.query<RecordSnapshot>(
+        `SELECT msg_id,ordinal,role,ts::text,content_sha256,payload,visible_payload,
+                visible_content_sha256,model_sidecar_complete
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          ORDER BY ordinal`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows;
+    const expectedModels = (
+      await pool.query<ModelSnapshot>(
+        `SELECT physical_ordinal,logical_ordinal,msg_id,role,semantic_text,
+                token_estimate,ts::text,client_message_id
+           FROM client_session_turn_tape_model_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          ORDER BY physical_ordinal,logical_ordinal`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows;
+    assert.ok(expectedRecords.length > 1);
+    assert.ok(expectedModels.length > 0);
+    const staleOrdinal = expectedModels[0]!.physical_ordinal;
+    const stalePayload = Buffer.from('{"stale":true}', "utf8");
+    await pool.query(
+      `UPDATE client_session_turn_tape_records
+          SET role='error',ts=ts+99,content_sha256=$4,payload=$5,
+              visible_payload=$5,visible_content_sha256=$4,model_sidecar_complete=TRUE
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$6`,
+      [sessionId, userId, tape.finalize.tapeId, sha256(stalePayload), stalePayload, staleOrdinal],
+    );
+    await pool.query(
+      `DELETE FROM client_session_turn_tape_model_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND physical_ordinal=$4`,
+      [sessionId, userId, tape.finalize.tapeId, staleOrdinal],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_model_records
+         (session_id,user_id,tape_id,physical_ordinal,logical_ordinal,msg_id,role,
+          semantic_text,token_estimate,ts,client_message_id)
+       VALUES ($1,$2,$3,$4,999,'stale-sidecar','error','stale semantic text',1,NULL,NULL)`,
+      [sessionId, userId, tape.finalize.tapeId, staleOrdinal],
+    );
+
+    const results = await Promise.all([
+      backend.finalizeLosslessTurnTape(userId, tape.finalize),
+      backend.finalizeLosslessTurnTape(userId, tape.finalize),
+    ]);
+    assert.deepEqual(
+      results.map((result) => result.applied).sort(),
+      ["finalized", "idempotent"],
+    );
+    const repairedRecords = (
+      await pool.query<RecordSnapshot>(
+        `SELECT msg_id,ordinal,role,ts::text,content_sha256,payload,visible_payload,
+                visible_content_sha256,model_sidecar_complete
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          ORDER BY ordinal`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows;
+    const repairedModels = (
+      await pool.query<ModelSnapshot>(
+        `SELECT physical_ordinal,logical_ordinal,msg_id,role,semantic_text,
+                token_estimate,ts::text,client_message_id
+           FROM client_session_turn_tape_model_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          ORDER BY physical_ordinal,logical_ordinal`,
+        [sessionId, userId, tape.finalize.tapeId],
+      )
+    ).rows;
+    assert.deepEqual(repairedRecords, expectedRecords);
+    assert.deepEqual(repairedModels, expectedModels);
+    assert.equal(
+      (await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+      "idempotent",
+    );
+    const billing = (
+      await pool.query<{ count: string; credits: string }>(
+        `SELECT COUNT(*)::text AS count,COALESCE(SUM(cost_credits),0)::text AS credits
+           FROM turn_tape_cost_components
+          WHERE request_id=$1 AND user_id=$2`,
+        [requestId, userId],
+      )
+    ).rows[0]!;
+    assert.deepEqual(billing, { count: "1", credits: "207" });
+    assert.equal(
+      (await pool.query(
+        "SELECT 1 FROM pending_usage_patches WHERE request_id=$1 AND user_id=$2",
+        [requestId, userId],
+      )).rowCount,
+      0,
+      "the pending paid component is folded exactly once",
+    );
+  });
+
+  maybe("an agent-group compatibility trigger cannot delete source parts outside its ordinal rollback", async () => {
+    const sessionId = "s-agent-group-trigger-rollback";
+    const userId = "u-agent-group-trigger-rollback";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "2".repeat(64),
+      text: "answer after delegated work",
+      agentGroups: [{
+        runId: "trigger-rollback-agent-group",
+        agentId: "reviewer",
+        goal: "review exact output",
+        status: "ok",
+        resultSummary: "exact delegated result",
+        completedAt: 1_783_944_000_010,
+      }],
+      createdAt: 1_783_944_000_000,
+    });
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION oc_test_delete_parts_on_agent_group()
+      RETURNS TRIGGER LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.role='agent-group' THEN
+          DELETE FROM client_session_turn_tape_parts
+           WHERE session_id=NEW.session_id AND user_id=NEW.user_id AND tape_id=NEW.tape_id;
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE TRIGGER trg_oc_test_delete_parts_on_agent_group
+      BEFORE INSERT OR UPDATE OF payload,role ON client_session_turn_tape_records
+      FOR EACH ROW EXECUTE FUNCTION oc_test_delete_parts_on_agent_group();
+    `);
+    try {
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /source parts changed during record staging/,
+      );
+      const state = (
+        await pool.query<{ finalized_at: string | null; parts: string; groups: string }>(
+          `SELECT t.finalized_at::text,
+                  (SELECT COUNT(*)::text FROM client_session_turn_tape_parts p
+                    WHERE p.session_id=t.session_id AND p.user_id=t.user_id AND p.tape_id=t.tape_id) AS parts,
+                  (SELECT COUNT(*)::text FROM client_session_turn_tape_records r
+                    WHERE r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+                      AND r.role='agent-group') AS groups
+             FROM client_session_turn_tapes t
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows[0]!;
+      assert.equal(state.finalized_at, null);
+      assert.equal(Number(state.parts), tape.parts.length, "trigger DELETE rolled back with the record");
+      assert.equal(state.groups, "0", "the trigger-mutated agent-group row also rolled back");
+    } finally {
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_delete_parts_on_agent_group
+          ON client_session_turn_tape_records;
+        DROP FUNCTION IF EXISTS oc_test_delete_parts_on_agent_group();
+      `);
+    }
+    assert.equal((await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied, "finalized");
+  });
+
   maybe("an incomplete physically impossible declaration cannot head-of-line block a complete tape", async () => {
     const incompleteSessionId = "s-incomplete-huge-tape";
     const completeSessionId = "s-complete-after-incomplete";

@@ -364,19 +364,27 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
   test('accepted 容器求证持续失败 >15min → accepted_unreachable 告警(不再静默 continue)', async () => {
     // 2026-07-18 SSRF 网段错配把求证 100% 拦死,原实现静默 continue,收敛链瘫痪 27h
     // 无告警(唯一兜底 7d open_aged)。契约:持续不可达必须走 alertWarn 出口,但不动状态。
-    const alerts: Array<{ payload?: { kind?: string } }> = []
+    const alerts: Array<{ payload?: { kind?: string }; dedupe_all_statuses?: boolean }> = []
     const pool = makeFakePool({
       acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 3 * 3_600_000) })],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: noContainer, // getDispatchState 恒 unreachable
-      enqueueAlert: (event) => alerts.push(event as { payload?: { kind?: string } }),
+      enqueueAlert: (event) => alerts.push(event as {
+        payload?: { kind?: string }
+        dedupe_all_statuses?: boolean
+      }),
     })
     assert.ok(counts.alerts >= 1, '持续不可达必须计入告警')
     assert.ok(
       alerts.some((a) => a.payload?.kind === 'accepted_unreachable'),
       'accepted_unreachable 告警必须入队',
+    )
+    assert.equal(
+      alerts.find((a) => a.payload?.kind === 'accepted_unreachable')?.dedupe_all_statuses,
+      true,
+      '按日 key 必须跨 sent 状态去重,避免每个 reconciler tick 重发',
     )
     assert.equal(counts.rejectedTerminal, 0, '不可达绝不推断终态')
     assert.equal(counts.manualReconcile, 0)

@@ -19,7 +19,12 @@ import assert from "node:assert/strict";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
-import { enqueueAlert, enqueueAlertToChannel, type AlertEventInput } from "../admin/alertOutbox.js";
+import {
+  enqueueAlert,
+  enqueueAlertToChannel,
+  markSent,
+  type AlertEventInput,
+} from "../admin/alertOutbox.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -205,6 +210,57 @@ describe("enqueueAlert — 非 critical 不镜像", () => {
     assert.equal(r.inbox_mirror, false);
     assert.equal(await outboxCount(), 1);
     assert.equal(await inboxCount(), 0, "warning 不写 inbox");
+  });
+});
+
+describe("enqueueAlert — opt-in 全状态时间桶去重", () => {
+  function dailyEvent(dedupeAllStatuses: boolean): AlertEventInput {
+    return {
+      event_type: "ops.daily_anomaly",
+      severity: "warning",
+      title: "周期异常",
+      body: "same daily anomaly",
+      dedupe_key: "ops.daily_anomaly:fixture:2026-07-21",
+      dedupe_all_statuses: dedupeAllStatuses,
+    };
+  }
+
+  test("opt-in 行 sent 后同 key 仍去重,整桶仅 1 行", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await insertChannel({ fp: "fp-all-status" });
+    assert.equal((await enqueueAlert(dailyEvent(true))).enqueued, 1);
+    const id = (
+      await query<{ id: string }>("SELECT id::text AS id FROM admin_alert_outbox")
+    ).rows[0]!.id;
+    await markSent(id);
+    const replay = await enqueueAlert(dailyEvent(true));
+    assert.equal(replay.enqueued, 0);
+    assert.equal(replay.deduped, 1);
+    assert.equal(await outboxCount(), 1);
+  });
+
+  test("默认路径 sent 后仍允许同 key 新一轮告警", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await insertChannel({ fp: "fp-default-status" });
+    assert.equal((await enqueueAlert(dailyEvent(false))).enqueued, 1);
+    const id = (
+      await query<{ id: string }>("SELECT id::text AS id FROM admin_alert_outbox")
+    ).rows[0]!.id;
+    await markSent(id);
+    assert.equal((await enqueueAlert(dailyEvent(false))).enqueued, 1);
+    assert.equal(await outboxCount(), 2);
+  });
+
+  test("并发 opt-in enqueue 由 advisory fence 收敛为 1 行", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await insertChannel({ fp: "fp-concurrent-status" });
+    const results = await Promise.all([
+      enqueueAlert(dailyEvent(true)),
+      enqueueAlert(dailyEvent(true)),
+    ]);
+    assert.equal(results.reduce((sum, result) => sum + result.enqueued, 0), 1);
+    assert.equal(results.reduce((sum, result) => sum + result.deduped, 0), 1);
+    assert.equal(await outboxCount(), 1);
   });
 });
 

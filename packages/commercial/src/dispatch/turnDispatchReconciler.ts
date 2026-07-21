@@ -632,6 +632,7 @@ function alertWarn(
       status: row.status,
     },
     dedupe_key: `${EVENTS.OPS_DAILY_ANOMALY}:turn_dispatch:${kind}:${row.dispatchId}:${day}`,
+    dedupe_all_statuses: true,
   })
 }
 
