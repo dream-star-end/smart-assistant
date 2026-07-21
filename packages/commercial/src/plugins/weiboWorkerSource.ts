@@ -1072,9 +1072,40 @@ async function awaitNewestOwnPost(page, selfId, text, beforeIds) {
   }
   return null;
 }
+async function preparePostImageChooser(page) {
+  const image = await exactMenuItem(page, '图片');
+  if (!image) throw new Error('media');
+  await image.click({ trial: true, timeout: 10_000 });
+  const [chooser] = await Promise.all([
+    page.waitForEvent('filechooser', { timeout: 10_000 }),
+    image.click({ timeout: 10_000 })
+  ]);
+  return chooser;
+}
 async function provePostSendReady(send, timeout) {
-  if (!send || await send.isDisabled().catch(() => false)) throw new Error('send');
+  if (!send) throw new Error('send');
   await send.click({ trial: true, timeout });
+}
+async function awaitPostSendReady(page, timeout) {
+  const deadline = Date.now() + timeout;
+  const attempts = Math.max(1, Math.ceil(timeout / 250));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    let remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const send = await exactMenuItem(page, '发送');
+    remaining = deadline - Date.now();
+    if (send && remaining > 0) {
+      try {
+        await provePostSendReady(send, Math.min(250, remaining));
+        return send;
+      } catch {}
+    }
+    remaining = deadline - Date.now();
+    if (attempt < attempts - 1 && remaining > 0) {
+      await page.waitForTimeout(Math.min(250, remaining));
+    }
+  }
+  throw new Error('send');
 }
 async function activatePostSend(send) {
   await provePostSendReady(send, 10_000);
@@ -1129,30 +1160,30 @@ async function writeAction(page, input) {
     if (params.text) await textarea.fill(params.text);
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await assertNoChallenge(page);
+    let imageChooser = null;
     if (manifest.length === 0) {
-      const readySend = await exactMenuItem(page, '发送');
-      await provePostSendReady(readySend, 30_000);
+      await awaitPostSendReady(page, 30_000);
+    } else {
+      imageChooser = await preparePostImageChooser(page);
     }
     await awaitDispatch();
     await assertNoChallenge(page);
     const freshTextarea = await uniqueVisible(page.locator('textarea'));
     if (!freshTextarea || cleanText(await freshTextarea.inputValue().catch(() => ''), 2000) !== cleanText(params.text || '', 2000)) throw new Error('composer');
     if (manifest.length) {
-      const fileInput = page.locator('input[type="file"]').first();
-      if (!await fileInput.count()) throw new Error('media');
+      if (!imageChooser) throw new Error('media');
       const files = [];
       try {
         for (const item of manifest) files.push({ name: item.filename, mimeType: item.mimeType, buffer: await readFile('/inputs/' + item.inputId) });
-        await fileInput.setInputFiles(files);
+        await imageChooser.setFiles(files);
       } finally {
         for (const file of files) file.buffer.fill(0);
       }
-      const selected = await fileInput.evaluate((element) => element.files ? element.files.length : 0);
+      const selected = await imageChooser.element().evaluate((node) => node.files ? node.files.length : 0);
       if (selected !== manifest.length) throw new Error('media');
-      await page.waitForTimeout(1500);
     }
     await assertNoChallenge(page);
-    const send = await exactMenuItem(page, '发送');
+    const send = await awaitPostSendReady(page, 30_000);
     const clickFailure = await activatePostSend(send);
     await page.waitForTimeout(2500);
     const post = await awaitNewestOwnPost(page, selfId, params.text || '', beforeIds);
