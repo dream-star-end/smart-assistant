@@ -15,6 +15,7 @@ import {
   classifyWeiboSetupPin,
   decodeWeiboWorkerFramesForTest,
   isOfficialWeiboPluginIdentity,
+  resolveWeiboWorkerResources,
   validateWeiboAccountState,
 } from './weibo.js'
 import { WEIBO_WORKER_SOURCE } from './weiboWorkerSource.js'
@@ -28,6 +29,21 @@ function framed(value: unknown): Buffer {
 }
 
 describe('official Weibo Plugin', () => {
+  test('gives action Chromium enough memory while preserving worker-specific limits', () => {
+    assert.deepEqual(resolveWeiboWorkerResources('action'), {
+      memoryBytes: 768 * 1024 * 1024,
+      memorySwapBytes: 768 * 1024 * 1024,
+      pidsLimit: 128,
+      shmSizeBytes: 64 * 1024 * 1024,
+    })
+    assert.deepEqual(resolveWeiboWorkerResources('login'), {
+      memoryBytes: 768 * 1024 * 1024,
+      memorySwapBytes: 768 * 1024 * 1024,
+      pidsLimit: 256,
+      shmSizeBytes: 256 * 1024 * 1024,
+    })
+  })
+
   test('pins one exact platform artifact and has no compatible predecessor', () => {
     assert.equal(WEIBO_PLUGIN_VERSION, '1.2.0')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)

@@ -710,36 +710,43 @@ describe('connectorSweeper', () => {
       [pExec.id],
     )
 
-    // ①b Plugin crash after beginExecute committed but before the DB arm:
-    // the persisted fence-required bit proves no external dispatch started.
-    const pPluginPreArm = await proposeWrite({
-      userId: uid,
-      connectionId: connection.id,
-      connectionRevision: connection.revision,
-      provider: 'notion',
-      action: 'create_page',
-      params: { parentPageId: 'e'.repeat(32), title: 'pre-arm', content: '' },
-      summary: 'plugin pre-arm crash',
-      dispatchFenceRequired: true,
-    })
-    await approveConfirmation(pPluginPreArm.id, uid)
-    assert.equal(
-      (
-        await beginExecute({
-          id: pPluginPreArm.id,
-          userId: uid,
-          connectionId: connection.id,
-          expectedProvider: 'notion',
-          expectedAction: 'create_page',
-        })
-      ).kind,
-      'ok',
-    )
-    await query(
-      `UPDATE connector_write_ledger SET started_at = now() - interval '10 minutes'
-        WHERE id = $1::uuid`,
-      [pPluginPreArm.id],
-    )
+    const mkPluginExecuting = async (title: string, age: string) => {
+      const proposal = await proposeWrite({
+        userId: uid,
+        connectionId: connection.id,
+        connectionRevision: connection.revision,
+        provider: 'notion',
+        action: 'create_page',
+        params: { parentPageId: 'e'.repeat(32), title, content: '' },
+        summary: title,
+        dispatchFenceRequired: true,
+      })
+      await approveConfirmation(proposal.id, uid)
+      assert.equal(
+        (
+          await beginExecute({
+            id: proposal.id,
+            userId: uid,
+            connectionId: connection.id,
+            expectedProvider: 'notion',
+            expectedAction: 'create_page',
+          })
+        ).kind,
+        'ok',
+      )
+      await query(
+        `UPDATE connector_write_ledger SET started_at = now() - $2::interval
+          WHERE id = $1::uuid`,
+        [proposal.id, age],
+      )
+      return proposal
+    }
+
+    // ①b Plugin 的合法长任务不能沿用 legacy 5min 阈值；只有超过当前签名合同
+    // 的完整最长管线后，pre-arm crash 才能确定收敛为 failed。
+    const pPluginSixMinutes = await mkPluginExecuting('plugin-six-minutes', '6 minutes')
+    const pPluginBoundary = await mkPluginExecuting('plugin-twenty-nine-minutes', '29 minutes')
+    const pPluginPreArm = await mkPluginExecuting('plugin-pre-arm-crash', '31 minutes')
 
     // ② 过期 pending
     const pExpired = await proposeWrite({
@@ -821,6 +828,12 @@ describe('connectorSweeper', () => {
     })
     assert.equal(preArmReplay.kind, 'replay')
     if (preArmReplay.kind === 'replay') assert.equal(preArmReplay.status, 'failed')
+    for (const proposal of [pPluginSixMinutes, pPluginBoundary]) {
+      const active = (await getLedgerRow(proposal.id, uid))!
+      assert.equal(active.dispatch_fence_required, true)
+      assert.equal(active.status, 'executing')
+      assert.notEqual(active.params_enc, null)
+    }
     const expd = (await getLedgerRow(pExpired.id, uid))!
     assert.equal(expd.status, 'expired')
     assert.equal(expd.params_enc, null)
@@ -843,6 +856,12 @@ describe('connectorSweeper', () => {
       })
     } finally {
       sweeper2.stop()
+    }
+    for (const proposal of [pPluginSixMinutes, pPluginBoundary]) {
+      assert.equal(
+        await finalizeExecute({ id: proposal.id, status: 'failed', errorCode: 'TEST_CLEANUP' }),
+        true,
+      )
     }
   })
 })

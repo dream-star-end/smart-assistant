@@ -22,7 +22,13 @@ import { getPool } from '../db/index.js'
 
 export const CONNECTOR_SWEEP_INTERVAL_MS = 60_000
 /** action 总时限 60s(outboundPolicy.TOTAL_TIMEOUT_MS)+ 缓冲 → 5min 视为 stale。 */
-export const STALE_EXECUTING_AFTER = '5 minutes'
+export const LEGACY_STALE_EXECUTING_AFTER = '5 minutes'
+/**
+ * Plugin write 的 started_at 早于媒体 staging。当前签名合同最长路径是 18 个远端媒体
+ * 各 60s 串行拉取 + 600s browser action = 28min，再留 2min 给固定开销。
+ * 未来提高签名合同的媒体数量或 action timeout 时必须同步提高本阈值。
+ */
+export const PLUGIN_STALE_EXECUTING_AFTER = '30 minutes'
 
 export interface ConnectorSweeperHandle {
   stop(): void
@@ -72,7 +78,14 @@ async function sweepOnce(
               params_enc = NULL, params_nonce = NULL
         WHERE id IN (
           SELECT id FROM connector_write_ledger
-           WHERE status = 'executing' AND started_at < now() - interval '${STALE_EXECUTING_AFTER}'
+           WHERE status = 'executing'
+             AND (
+               (dispatch_fence_required
+                 AND started_at < now() - interval '${PLUGIN_STALE_EXECUTING_AFTER}')
+               OR
+               (NOT dispatch_fence_required
+                 AND started_at < now() - interval '${LEGACY_STALE_EXECUTING_AFTER}')
+             )
            FOR UPDATE SKIP LOCKED
         )`,
     )
