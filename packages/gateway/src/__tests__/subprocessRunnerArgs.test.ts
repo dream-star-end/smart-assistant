@@ -193,6 +193,12 @@ describe('buildCcbCliArgs', () => {
   })
 
   it('hermeticNoTools emits only the explicit bare isolation surface', () => {
+    const structuredOutputSchema = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['summary'],
+      properties: { summary: { type: 'string' } },
+    }
     const args = buildCcbCliArgs({
       ...BASE,
       model: 'deepseek-v4-flash',
@@ -205,6 +211,7 @@ describe('buildCcbCliArgs', () => {
       restrictedMemorySources: true,
       workload: 'auto-dream',
       hermeticNoTools: true,
+      structuredOutputSchema,
     })
 
     assert.ok(args.includes('--bare'))
@@ -213,6 +220,10 @@ describe('buildCcbCliArgs', () => {
     assert.ok(hasFlagWithValue(args, '--settings', '/tmp/api-key-helper.json'))
     assert.ok(hasFlagWithValue(args, '--mcp-config', '/tmp/empty-mcp.json'))
     assert.ok(hasFlagWithValue(args, '--workload', 'auto-dream'))
+    assert.ok(
+      hasFlagWithValue(args, '--json-schema', JSON.stringify(structuredOutputSchema)),
+      'hermetic Auto-Dream must pass its static structured-output contract to CCB',
+    )
     for (const forbidden of [
       '--permission-mode',
       '--dangerously-skip-permissions',

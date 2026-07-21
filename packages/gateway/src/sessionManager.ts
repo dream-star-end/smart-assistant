@@ -2638,6 +2638,8 @@ export class SessionManager {
     skillEvalDraft?: { name: string; dir: string }
     /** V5 Auto-Dream one-shot isolation profile (CCB only). */
     hermeticNoTools?: boolean
+    /** Static CCB --json-schema contract for one-shot structured output. */
+    structuredOutputSchema?: Readonly<Record<string, unknown>>
     /** delegate 子会话计费归因(仅 handleDelegateTask 设置)→ runner
      *  CLAUDE_CODE_EXTRA_METADATA env → master 计费点落
      *  usage_records.mode/parent_session_id/delegate_agent_id。
@@ -2773,6 +2775,7 @@ export class SessionManager {
       skillEvalDraft: opts.skillEvalDraft,
       usageAttribution: opts.usageAttribution,
       hermeticNoTools: opts.hermeticNoTools,
+      structuredOutputSchema: opts.structuredOutputSchema,
     })
     const now = Date.now()
     const session: AgentSession = {

@@ -333,7 +333,9 @@ import {
   shouldEnableOpenClaudeVision,
 } from './mcpVisionServer.js'
 import {
+  AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
   AutoDreamService,
+  AutoDreamStructuredOutputCollector,
   formatAutoDreamReceipt,
   isAutoDreamSuccessfulTurn,
   type AutoDreamModelRun,
@@ -7572,43 +7574,18 @@ export class Gateway {
       effortLevel: 'medium',
       workload: 'auto-dream',
       hermeticNoTools: true,
+      structuredOutputSchema: AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
     })
-    let text = ''
-    let finals = 0
-    let invalidEvent: string | null = null
-    let stopReason: string | undefined
+    const collector = new AutoDreamStructuredOutputCollector()
     try {
       await this.sessions.submit(
         session,
         input.prompt,
-        (event) => {
-          if (event.kind === 'block') {
-            // Reasoning is allowed but never part of the strict JSON payload.
-            // Every other non-text block remains a hermeticity violation.
-            if (event.block.kind === 'thinking') return
-            if (event.block.kind !== 'text' || typeof event.block.text !== 'string') {
-              invalidEvent = `non_text:${event.block.kind}`
-              return
-            }
-            text += event.block.text
-            return
-          }
-          if (event.kind === 'final') {
-            finals++
-            stopReason = event.meta?.stopReason
-            return
-          }
-          if (event.kind === 'turn_status') return
-          invalidEvent = event.kind
-        },
+        (event) => collector.accept(event),
         'medium',
         model,
       )
-      if (finals !== 1) throw new Error(`AUTO_DREAM_FINAL_COUNT_${finals}`)
-      if (invalidEvent) throw new Error(`AUTO_DREAM_INVALID_EVENT_${invalidEvent}`)
-      if (stopReason === 'tool_use') throw new Error('AUTO_DREAM_TOOL_USE_STOP')
-      if (!text.trim()) throw new Error('AUTO_DREAM_EMPTY_TEXT')
-      return text.trim()
+      return collector.finish()
     } finally {
       await this.sessions.destroySession(sessionKey).catch(() => {})
     }
