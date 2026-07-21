@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { describe, test } from 'node:test'
+
+import { chromium } from 'playwright-core'
 
 import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
 import {
@@ -12,6 +15,7 @@ import {
   WEIBO_PLUGIN_CONTRACT,
   WEIBO_PLUGIN_SLUG,
   WEIBO_PLUGIN_VERSION,
+  WEIBO_SETUP_COMPATIBLE_PREDECESSORS,
   classifyWeiboSetupPin,
   decodeWeiboWorkerFramesForTest,
   isOfficialWeiboPluginIdentity,
@@ -26,6 +30,26 @@ function framed(value: unknown): Buffer {
   const header = Buffer.alloc(4)
   header.writeUInt32BE(body.length)
   return Buffer.concat([header, body])
+}
+
+function compileWorkerPostHarness(overrides: Record<string, unknown>): {
+  writeAction(page: unknown, input: unknown): Promise<unknown>
+  awaitNewestOwnPost(
+    page: unknown,
+    selfId: string,
+    text: string,
+    beforeIds: Set<string>,
+  ): Promise<unknown>
+  activatePostSend(send: unknown): Promise<unknown>
+} {
+  const start = WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost')
+  const end = WEIBO_WORKER_SOURCE.indexOf('async function finishAction', start)
+  assert.ok(start >= 0 && end > start)
+  const names = Object.keys(overrides)
+  return new Function(
+    ...names,
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { writeAction, awaitNewestOwnPost, activatePostSend };`,
+  )(...names.map((name) => overrides[name])) as ReturnType<typeof compileWorkerPostHarness>
 }
 
 describe('official Weibo Plugin', () => {
@@ -44,10 +68,17 @@ describe('official Weibo Plugin', () => {
     })
   })
 
-  test('pins one exact platform artifact and has no compatible predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.2.0')
+  test('pins the current artifact and only the exact production predecessor', () => {
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.3.0')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
+    assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
+      {
+        version: '1.2.0',
+        artifactHash: '2fc5691eb0f02845b2f1c1935e218d6ac6cebfc7d65504fcc2032927a7119924',
+        execContractHash: '78fc58c6fe19a5b4f18cb56b1cd52c8133682ddc1ac0dc1c6aaded97c885bb4d',
+      },
+    ])
     assert.equal(
       classifyWeiboSetupPin({
         version: WEIBO_PLUGIN_VERSION,
@@ -57,10 +88,28 @@ describe('official Weibo Plugin', () => {
       'current',
     )
     assert.equal(
+      classifyWeiboSetupPin(WEIBO_SETUP_COMPATIBLE_PREDECESSORS[0]),
+      'compatible-predecessor',
+    )
+    assert.equal(
       classifyWeiboSetupPin({
         version: WEIBO_PLUGIN_VERSION,
         artifactHash: '0'.repeat(64),
         execContractHash: COMPILED_WEIBO_PLUGIN.execContractHash,
+      }),
+      null,
+    )
+    assert.equal(
+      classifyWeiboSetupPin({
+        ...WEIBO_SETUP_COMPATIBLE_PREDECESSORS[0],
+        version: '1.1.0',
+      }),
+      null,
+    )
+    assert.equal(
+      classifyWeiboSetupPin({
+        ...WEIBO_SETUP_COMPATIBLE_PREDECESSORS[0],
+        execContractHash: '0'.repeat(64),
       }),
       null,
     )
@@ -252,7 +301,279 @@ describe('official Weibo Plugin', () => {
         WEIBO_WORKER_SOURCE.indexOf('await fileInput.setInputFiles(files);'),
       'media must not be uploaded before the parent dispatch fence is armed',
     )
+    const createPostStart = WEIBO_WORKER_SOURCE.indexOf("if (input.actionId === 'create_post')")
+    const createPostEnd = WEIBO_WORKER_SOURCE.indexOf(
+      "if (input.actionId === 'set_following')",
+      createPostStart,
+    )
+    const createPostSource = WEIBO_WORKER_SOURCE.slice(createPostStart, createPostEnd)
+    assert.doesNotMatch(createPostSource, /force:\s*true|\.evaluate\([^)]*\.click|keyboard\./)
+    assert.match(WEIBO_WORKER_SOURCE, /send\.click\(\{ timeout: 10_000, noWaitAfter: true \}\)/)
   })
+
+  test('create_post proves pointer actionability before dispatch and clicks exactly once', async () => {
+    const events: string[] = []
+    let collectCount = 0
+    const textarea = {
+      fill: async () => events.push('fill'),
+      inputValue: async () => 'hello',
+    }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean; timeout: number; noWaitAfter?: boolean }) => {
+        events.push(options.trial ? `trial:${options.timeout}` : 'click')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => events.push('goto'),
+      collectPosts: async () => {
+        collectCount += 1
+        events.push('collect')
+        return collectCount === 1 ? [] : [{ id: 'new-post', owned: true, text: 'hello' }]
+      },
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => events.push('challenge'),
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async () => send,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('unused'),
+    })
+    const page = {
+      locator: () => ({}),
+      waitForTimeout: async (ms: number) => events.push(`wait:${ms}`),
+    }
+
+    const result = await harness.writeAction(page, {
+      actionId: 'create_post',
+      params: { text: 'hello', mediaManifest: [] },
+    })
+
+    assert.deepEqual(result, { post: { id: 'new-post', owned: true, text: 'hello' } })
+    assert.equal(events.filter((event) => event === 'click').length, 1)
+    assert.ok(events.indexOf('trial:30000') < events.indexOf('dispatch'))
+    assert.ok(events.indexOf('dispatch') < events.indexOf('trial:10000'))
+    assert.ok(events.indexOf('trial:10000') < events.indexOf('click'))
+  })
+
+  test('create_post never dispatches or clicks when pre-dispatch trial fails', async () => {
+    const events: string[] = []
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        events.push(options.trial ? 'trial' : 'click')
+        if (options.trial) throw new Error('not actionable')
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => [],
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async () => send,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('unused'),
+    })
+
+    await assert.rejects(
+      harness.writeAction(
+        { locator: () => ({}), waitForTimeout: async () => {} },
+        { actionId: 'create_post', params: { text: 'hello', mediaManifest: [] } },
+      ),
+      /not actionable/,
+    )
+    assert.deepEqual(events, ['trial'])
+  })
+
+  test('create_post resolves an ambiguous click from delayed read-only observation', async () => {
+    let collectCount = 0
+    let realClicks = 0
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) {
+          realClicks += 1
+          throw Object.assign(new Error('click timeout'), { name: 'TimeoutError' })
+        }
+      },
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => {
+        collectCount += 1
+        return collectCount < 4 ? [] : [{ id: 'late-post', owned: true, text: 'hello' }]
+      },
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => {},
+      exactMenuItem: async () => send,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('unused'),
+    })
+
+    const result = await harness.writeAction(
+      { locator: () => ({}), waitForTimeout: async () => {} },
+      { actionId: 'create_post', params: { text: 'hello', mediaManifest: [] } },
+    )
+    assert.deepEqual(result, { post: { id: 'late-post', owned: true, text: 'hello' } })
+    assert.equal(realClicks, 1)
+    assert.equal(collectCount, 4)
+  })
+
+  test('create_post refuses duplicate observations and keeps media behind dispatch', async () => {
+    const events: string[] = []
+    let collectCount = 0
+    let realClicks = 0
+    const textarea = { fill: async () => {}, inputValue: async () => 'hello' }
+    const send = {
+      isDisabled: async () => false,
+      click: async (options: { trial?: boolean }) => {
+        if (!options.trial) {
+          realClicks += 1
+          events.push('click')
+        }
+      },
+    }
+    const fileInput = {
+      count: async () => 1,
+      setInputFiles: async () => events.push('upload'),
+      evaluate: async () => 1,
+    }
+    const harness = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      gotoAuthenticated: async () => {},
+      collectPosts: async () => {
+        collectCount += 1
+        return collectCount === 1
+          ? []
+          : [
+              { id: 'duplicate-a', owned: true, text: 'hello' },
+              { id: 'duplicate-b', owned: true, text: 'hello' },
+            ]
+      },
+      uniqueVisible: async () => textarea,
+      assertNoChallenge: async () => {},
+      awaitDispatch: async () => events.push('dispatch'),
+      exactMenuItem: async () => send,
+      cleanText: (value: unknown) => String(value).trim(),
+      readFile: async () => Buffer.from('image'),
+    })
+    const page = {
+      locator: (selector: string) =>
+        selector === 'input[type="file"]' ? { first: () => fileInput } : {},
+      waitForTimeout: async () => {},
+    }
+
+    await assert.rejects(
+      harness.writeAction(page, {
+        actionId: 'create_post',
+        params: {
+          text: 'hello',
+          mediaManifest: [{ inputId: 'asset-1', filename: 'image.png', mimeType: 'image/png' }],
+        },
+      }),
+      /result/,
+    )
+    assert.equal(realClicks, 1)
+    assert.equal(collectCount, 9)
+    assert.ok(events.indexOf('dispatch') < events.indexOf('upload'))
+    assert.ok(events.indexOf('upload') < events.indexOf('click'))
+  })
+
+  test(
+    'real Chromium activation skips slow navigation and observes a delayed result once',
+    { timeout: 20_000 },
+    async () => {
+      let clickEvents = 0
+      let profileReads = 0
+      const server = createServer((request, response) => {
+        if (request.url === '/') {
+          response.setHeader('content-type', 'text/html; charset=utf-8')
+          response.end(`<!doctype html><button id="send">发送</button><script>
+            document.querySelector('#send').addEventListener('click', () => {
+              fetch('/commit', { method: 'POST', keepalive: true });
+              location.assign('/slow');
+            });
+          </script>`)
+          return
+        }
+        if (request.url === '/commit') {
+          clickEvents += 1
+          response.end('ok')
+          return
+        }
+        if (request.url === '/slow') {
+          setTimeout(() => response.end('slow navigation'), 3_000)
+          return
+        }
+        if (request.url === '/profile') {
+          profileReads += 1
+          response.setHeader('content-type', 'text/html; charset=utf-8')
+          response.end(
+            profileReads >= 3
+              ? '<article data-id="late-post" data-owned="true">hello</article>'
+              : '<main>not visible yet</main>',
+          )
+          return
+        }
+        response.statusCode = 404
+        response.end('not found')
+      })
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+      const address = server.address()
+      assert.ok(address && typeof address === 'object')
+      const base = `http://127.0.0.1:${address.port}`
+      const browserResolverModule = '../../../../scripts/lib/resolve-browser.mjs'
+      const { resolveBrowserExecutable } = (await import(browserResolverModule)) as {
+        resolveBrowserExecutable(): string
+      }
+      const browser = await chromium.launch({
+        executablePath: resolveBrowserExecutable(),
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      })
+      try {
+        const page = await browser.newPage()
+        await page.goto(base, { waitUntil: 'domcontentloaded' })
+        const harness = compileWorkerPostHarness({
+          gotoAuthenticated: async (targetPage: typeof page) => {
+            await targetPage.goto(`${base}/profile`, { waitUntil: 'domcontentloaded' })
+          },
+          collectPosts: async (targetPage: typeof page) =>
+            targetPage.locator('article[data-id]').evaluateAll((articles) =>
+              articles.map((article) => ({
+                id: article.getAttribute('data-id'),
+                owned: article.getAttribute('data-owned') === 'true',
+                text: article.textContent?.trim() ?? '',
+              })),
+            ),
+          cleanText: (value: unknown) => String(value).trim(),
+        })
+        const started = Date.now()
+        const clickFailure = await harness.activatePostSend(
+          page.getByRole('button', { name: '发送', exact: true }),
+        )
+        assert.equal(clickFailure, null)
+        assert.ok(Date.now() - started < 2_000, 'activation must not wait for the 3s navigation')
+        const post = await harness.awaitNewestOwnPost(page, '12345', 'hello', new Set())
+        assert.deepEqual(post, { id: 'late-post', owned: true, text: 'hello' })
+        for (let attempt = 0; attempt < 20 && clickEvents === 0; attempt += 1)
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        assert.equal(clickEvents, 1)
+        assert.equal(profileReads, 3)
+      } finally {
+        await browser.close()
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        )
+      }
+    },
+  )
 
   test('strict schemas reject forged server snapshots and oversized image metadata', () => {
     const create = WEIBO_PLUGIN_CONTRACT.actions.find((action) => action.id === 'create_post')!

@@ -1063,6 +1063,27 @@ async function newestOwnPost(page, selfId, text, beforeIds) {
   const matches = posts.filter((post) => post.owned && !beforeIds.has(post.id) && post.text === cleanText(text, 20000));
   return matches.length === 1 ? matches[0] : null;
 }
+async function awaitNewestOwnPost(page, selfId, text, beforeIds) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const post = await newestOwnPost(page, selfId, text, beforeIds);
+    if (post) return post;
+    if (attempt < 7) await page.waitForTimeout(750);
+  }
+  return null;
+}
+async function provePostSendReady(send, timeout) {
+  if (!send || await send.isDisabled().catch(() => false)) throw new Error('send');
+  await send.click({ trial: true, timeout });
+}
+async function activatePostSend(send) {
+  await provePostSendReady(send, 10_000);
+  try {
+    await send.click({ timeout: 10_000, noWaitAfter: true });
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
 async function commentActionControl(root, kind) {
   await root.hover({ timeout: 10_000 });
   const nested = await root.evaluate((element) => element.classList.contains('item2'));
@@ -1107,6 +1128,10 @@ async function writeAction(page, input) {
     if (params.text) await textarea.fill(params.text);
     const manifest = Array.isArray(params.mediaManifest) ? params.mediaManifest : [];
     await assertNoChallenge(page);
+    if (manifest.length === 0) {
+      const readySend = await exactMenuItem(page, '发送');
+      await provePostSendReady(readySend, 30_000);
+    }
     await awaitDispatch();
     await assertNoChallenge(page);
     const freshTextarea = await uniqueVisible(page.locator('textarea'));
@@ -1127,12 +1152,13 @@ async function writeAction(page, input) {
     }
     await assertNoChallenge(page);
     const send = await exactMenuItem(page, '发送');
-    if (!send || await send.isDisabled().catch(() => false)) throw new Error('send');
-    await send.click({ timeout: 10_000 });
+    const clickFailure = await activatePostSend(send);
     await page.waitForTimeout(2500);
-    await assertNoChallenge(page);
-    const post = await newestOwnPost(page, selfId, params.text || '', beforeIds);
-    if (!post) throw new Error('result');
+    const post = await awaitNewestOwnPost(page, selfId, params.text || '', beforeIds);
+    if (!post) {
+      if (clickFailure) throw clickFailure;
+      throw new Error('result');
+    }
     return { post };
   }
   if (input.actionId === 'set_following') {
