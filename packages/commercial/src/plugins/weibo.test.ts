@@ -52,6 +52,36 @@ function compileWorkerPostHarness(overrides: Record<string, unknown>): {
   )(...names.map((name) => overrides[name])) as ReturnType<typeof compileWorkerPostHarness>
 }
 
+function compileWorkerPostTextHarness(): {
+  cleanPostText(value: unknown, max: number): string
+} {
+  const start = WEIBO_WORKER_SOURCE.indexOf('function cleanText')
+  const end = WEIBO_WORKER_SOURCE.indexOf('function countFrom', start)
+  assert.ok(start >= 0 && end > start)
+  return new Function(
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { cleanPostText };`,
+  )() as ReturnType<typeof compileWorkerPostTextHarness>
+}
+
+function compileWorkerProjectPostHarness(): {
+  projectPost(card: unknown, selfId: string): Promise<{ text: string }>
+} {
+  const start = WEIBO_WORKER_SOURCE.indexOf('async function projectPost')
+  const end = WEIBO_WORKER_SOURCE.indexOf('async function collectPosts', start)
+  assert.ok(start >= 0 && end > start)
+  const { cleanPostText } = compileWorkerPostTextHarness()
+  return new Function(
+    'cleanPostText',
+    'digest',
+    'countFrom',
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(start, end)}; return { projectPost };`,
+  )(
+    cleanPostText,
+    (value: unknown) => JSON.stringify(value),
+    () => 0,
+  ) as ReturnType<typeof compileWorkerProjectPostHarness>
+}
+
 describe('official Weibo Plugin', () => {
   test('gives action Chromium enough memory while preserving worker-specific limits', () => {
     assert.deepEqual(resolveWeiboWorkerResources('action'), {
@@ -69,14 +99,14 @@ describe('official Weibo Plugin', () => {
   })
 
   test('pins the current artifact and only the exact production predecessor', () => {
-    assert.equal(WEIBO_PLUGIN_VERSION, '1.3.0')
+    assert.equal(WEIBO_PLUGIN_VERSION, '1.4.0')
     assert.equal(WEIBO_DRIVER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.equal(WEIBO_LAUNCHER_VERSION, WEIBO_PLUGIN_VERSION)
     assert.deepEqual(WEIBO_SETUP_COMPATIBLE_PREDECESSORS, [
       {
-        version: '1.2.0',
-        artifactHash: '2fc5691eb0f02845b2f1c1935e218d6ac6cebfc7d65504fcc2032927a7119924',
-        execContractHash: '78fc58c6fe19a5b4f18cb56b1cd52c8133682ddc1ac0dc1c6aaded97c885bb4d',
+        version: '1.3.0',
+        artifactHash: '503cdef63395ce66b168765a4379f5e04f066337229ecf12a33789ce23bf1b0f',
+        execContractHash: 'b0c815f5d943a477bd2c791980370945df2977950bc80c397a5e0b8408089da4',
       },
     ])
     assert.equal(
@@ -314,6 +344,7 @@ describe('official Weibo Plugin', () => {
   test('create_post proves pointer actionability before dispatch and clicks exactly once', async () => {
     const events: string[] = []
     let collectCount = 0
+    const { cleanPostText } = compileWorkerPostTextHarness()
     const textarea = {
       fill: async () => events.push('fill'),
       inputValue: async () => 'hello',
@@ -330,7 +361,15 @@ describe('official Weibo Plugin', () => {
       collectPosts: async () => {
         collectCount += 1
         events.push('collect')
-        return collectCount === 1 ? [] : [{ id: 'new-post', owned: true, text: 'hello' }]
+        return collectCount === 1
+          ? []
+          : [
+              {
+                id: 'new-post',
+                owned: true,
+                text: cleanPostText('hello \u200B\u200B\u200B', 20_000),
+              },
+            ]
       },
       uniqueVisible: async () => textarea,
       assertNoChallenge: async () => events.push('challenge'),
@@ -354,6 +393,38 @@ describe('official Weibo Plugin', () => {
     assert.ok(events.indexOf('trial:30000') < events.indexOf('dispatch'))
     assert.ok(events.indexOf('dispatch') < events.indexOf('trial:10000'))
     assert.ok(events.indexOf('trial:10000') < events.indexOf('click'))
+  })
+
+  test('post text removes only the exact terminal Weibo DOM marker', () => {
+    const { cleanPostText } = compileWorkerPostTextHarness()
+    assert.equal(cleanPostText('hello', 20_000), 'hello')
+    assert.equal(cleanPostText('hel\u200Blo', 20_000), 'hel\u200Blo')
+    assert.equal(cleanPostText('hello \u200B\u200B\u200B', 20_000), 'hello')
+    assert.equal(cleanPostText('hello\u200B\u200B\u200B', 20_000), 'hello\u200B\u200B\u200B')
+    assert.equal(cleanPostText('hello \u200B\u200B', 20_000), 'hello \u200B\u200B')
+  })
+
+  test('desktop post projection removes the terminal Weibo DOM marker', async () => {
+    const { projectPost } = compileWorkerProjectPostHarness()
+    const post = await projectPost(
+      {
+        evaluate: async () => ({
+          id: 'R9JtO5slV',
+          userId: '5171571710',
+          authorName: 'OpenClaude',
+          text: 'Hello World 2026 \u200B\u200B\u200B',
+          createdAt: '2026-07-21 19:18',
+          url: 'https://weibo.com/5171571710/R9JtO5slV',
+          liked: false,
+          likeText: '',
+          commentText: '',
+          repostText: '',
+          images: [],
+        }),
+      },
+      '5171571710',
+    )
+    assert.equal(post.text, 'Hello World 2026')
   })
 
   test('create_post never dispatches or clicks when pre-dispatch trial fails', async () => {
