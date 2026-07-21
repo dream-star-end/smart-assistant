@@ -50,6 +50,7 @@ declare global {
       mergedPages: number;
       messageCount: number;
     };
+    __completeTimelineThinking: () => void;
   }
 }
 window.__sends = [];
@@ -63,6 +64,7 @@ window.__scrollTimeline = {
   anchor: null,
 };
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
+window.__completeTimelineThinking = () => {};
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
   window.__uploads.push(file.name);
@@ -174,6 +176,39 @@ createRoot(document.getElementById("timeline-agent-root")!).render(
       }}
       onRespondPermission={() => {}}
     />
+  </StrictMode>,
+);
+
+const timelineThinking: ChatMessage = {
+  id: "timeline-thinking-live",
+  role: "thinking",
+  text: "EXACT_LIVE_TIMELINE_THINKING",
+  ts: 3,
+  _source: "server",
+  _orderSeq: 3,
+  _timelineRecord: true,
+  _timelineUnitKey: "outer:3:timeline-thinking-live",
+};
+
+function TimelineThinkingProbe() {
+  const [sending, setSending] = useState(true);
+  useLayoutEffect(() => {
+    window.__completeTimelineThinking = () => setSending(false);
+    return () => { window.__completeTimelineThinking = () => {}; };
+  }, []);
+  return (
+    <MessageList
+      messages={[timelineThinking]}
+      sending={sending}
+      cb={{}}
+      onRespondPermission={() => {}}
+    />
+  );
+}
+
+createRoot(document.getElementById("timeline-thinking-root")!).render(
+  <StrictMode>
+    <TimelineThinkingProbe />
   </StrictMode>,
 );
 

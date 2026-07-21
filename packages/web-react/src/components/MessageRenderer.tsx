@@ -154,7 +154,6 @@ export const MessageRenderer = memo(
               msgs={[message]}
               sig={sig}
               ctx={ctx}
-              alwaysExpanded={message._timelineRecord === true}
             />
           </TapeBackedCard>
         );

@@ -511,6 +511,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
       timeline_generation: 7,
     }))
     expect(await screen.findByText('历史页真实问题')).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: /已思考/ }))
     expect(await screen.findByText('更早真实思考')).toBeTruthy()
     expect(screen.queryByRole('button', { name: /查看更早历史记录/ })).toBeNull()
   })
@@ -575,7 +576,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
     expect(screen.queryByRole('button', { name: /查看更早历史记录/ })).toBeNull()
   })
 
-  test('管理员查看器懒加载超长 user/final，并直接展示同页真实思考', async () => {
+  test('管理员查看器懒加载超长 user/final，并可展开同页完整真实思考', async () => {
     const userRecord = {
       id: 'cm:user:admin', role: 'user', text: '管理员看到的完整超长提问', ts: 1,
     }
@@ -643,6 +644,7 @@ describe('UserDetailSheet — 会话只读查看器', () => {
       { user_id: '1' },
       expect.any(AbortSignal),
     )
+    fireEvent.click(await screen.findByRole('button', { name: /已思考/ }))
     expect(await screen.findByText(/管理员展开的真实思考/)).toBeTruthy()
     expect(screen.queryByText(/Agent 调用过程|查看原始思考记录/)).toBeNull()
   })

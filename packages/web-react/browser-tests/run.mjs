@@ -17,7 +17,8 @@
 //   T7 点「+」→「设定目标」→ 目标对话框弹出(同菜单的第二入口回归对照)。
 //   T8 统一时间线上滑零请求，显式点击只取一页，虚拟 remount 不重取;
 //   T9 第二次明确点击继续下一不透明 cursor，已加载真实记录仍常驻;
-//   T10 真 Virtuoso 归档前插足够多行后仍锁定点击前的真实可见消息。
+//   T10 真 Virtuoso 归档前插足够多行后仍锁定点击前的真实可见消息;
+//   T11 direct-timeline 思考实时展开、完成自动折叠，受信点击后完整正文恢复。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -64,7 +65,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .chat-scroll-area{overflow-anchor:none}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -380,6 +381,21 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   if (state.calls !== 1 || state.messageCount !== 200) {
     throw new Error(`归档单击加载契约错误:${JSON.stringify(state)}`);
   }
+});
+
+await check("T11 direct-timeline 思考完成后自动折叠且可完整展开", async () => {
+  const root = page.locator("#timeline-thinking-root");
+  const body = root.getByText("EXACT_LIVE_TIMELINE_THINKING");
+  await body.waitFor({ state: "visible", timeout: 3000 });
+  await root.getByRole("button", { name: "思考过程" }).waitFor({ state: "visible", timeout: 3000 });
+
+  await page.evaluate(() => window.__completeTimelineThinking());
+
+  await body.waitFor({ state: "hidden", timeout: 3000 });
+  const completed = root.getByRole("button", { name: /已思考/ });
+  await completed.waitFor({ state: "visible", timeout: 3000 });
+  await completed.click();
+  await body.waitFor({ state: "visible", timeout: 3000 });
 });
 
 if (pageErrors.length > 0) {
