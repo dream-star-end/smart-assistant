@@ -45,6 +45,15 @@ const {
 } = await import('../sessionsDb.js')
 
 describe('model-context suffix selection', () => {
+  it('reserves CCB first-request compact headroom without shrinking native history', () => {
+    const messages = [{ id: 'long', role: 'assistant', text: '界'.repeat(20_000) }]
+    const ccb = selectEngineContextSuffix(messages, { contextWindow: 40_000, engine: 'ccb' })
+    const native = selectEngineContextSuffix(messages, { contextWindow: 40_000, engine: 'codex' })
+    assert.equal(ccb.truncated, true)
+    assert.equal(native.truncated, false)
+    assert.ok(String(ccb.messages[0]?.text).length < String(native.messages[0]?.text).length)
+  })
+
   it('retains browser-visible semantic execution facts across provider switches', () => {
     const selected = selectEngineContextSuffix([
       { id: 'thinking', role: 'thinking', text: 'private reasoning' },

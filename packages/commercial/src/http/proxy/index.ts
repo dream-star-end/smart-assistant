@@ -61,7 +61,15 @@ import {
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
-import { getDegradedProviders } from "../../admin/providerHealthGate.js";
+import {
+  getDegradedProviders,
+  getHealthDegradedProviders,
+  getProviderQuotaBlock,
+  invalidateDegradedProvidersCache,
+} from "../../admin/providerHealthGate.js";
+import {
+  claimProviderQuotaProbe,
+} from "../../admin/providerQuotaCircuit.js";
 import {
   incrAnthropicProxyReject,
   incrPrecheckCapped,
@@ -82,6 +90,7 @@ import {
   proxyBodySchema,
   enforceFieldByteBudgets,
   estimateInputTokens,
+  estimateContextInputTokens,
   estimateMaxCostBothSides,
   extractUsageAttribution,
   stripUsageAttributionKeys,
@@ -427,7 +436,7 @@ export function makeAnthropicProxyHandler(
           ? (gate.descriptor.providerId ?? undefined)
           : findRouteProviderForModel(body.model)?.id;
         if (providerId) {
-          const degradedSet = await getDegradedProviders();
+          const degradedSet = await getHealthDegradedProviders();
           if (degradedSet.has(providerId)) {
             const alts = degradedAlternatives({
               gate,
@@ -689,6 +698,35 @@ export function makeAnthropicProxyHandler(
 
       // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
       const inputTokens = estimateInputTokens(body);
+      // 角色投影窗口同时是签名计费边界。只在它比 provider 机制窗口更窄时加估算闸
+      // (当前即 kimi-k3 普通用户 512k vs Moonshot 1M);admin 机制窗不改变。
+      // vision 不能整请求跳过:estimateContextInputTokens 排除 base64、按每媒体 2k 计入。
+      const signedWindow = gate?.descriptor.contextWindow;
+      if (
+        route.kind === "static" &&
+        signedWindow != null &&
+        route.provider.maxInputTokens != null &&
+        signedWindow < route.provider.maxInputTokens
+      ) {
+        const contextInputTokens = estimateContextInputTokens(body);
+        if (contextInputTokens > signedWindow) {
+          userLog.warn("proxy_signed_context_window_exceeded", {
+            provider: route.provider.id,
+            model: body.model,
+            estimatedInputTokens: contextInputTokens,
+            limit: signedWindow,
+          });
+          incrAnthropicProxyReject("too_large");
+          sendJsonError(
+            res,
+            413,
+            "PROMPT_TOO_LONG",
+            `Prompt is too long: ${contextInputTokens} tokens > ${signedWindow} maximum`,
+            requestId,
+          );
+          return;
+        }
+      }
       // 静态 provider input 上限 guard(注册表 spec.maxInputTokens；deepseek 无 cap=undefined)。
       // 注意 inputTokens 是 estimateInputTokens 的**估算值**(JSON.length/4，非真 tokenizer)，
       // 故此 cap 是粗 guardrail：防超模型上下文窗(如 glm-5.1 200k / MiniMax-M3 512k)无声进更贵档。
@@ -710,6 +748,64 @@ export function makeAnthropicProxyHandler(
         incrAnthropicProxyReject("too_large");
         sendJsonError(res, 413, "BODY_FIELD_TOO_LARGE", "request body too large", requestId);
         return;
+      }
+
+      // Exact subscription quota blocks are evidence-based and therefore
+      // unconditional (unlike heuristic provider health). They run after auth/
+      // body/window validation but before any credit reservation. Expiry admits
+      // exactly one durable half-open probe; concurrent requests remain free.
+      let quotaProbeProviderId: string | null = null;
+      if (route.kind === "static") {
+        const providerId = route.provider.id;
+        const now = Date.now();
+        let quotaBlock = await getProviderQuotaBlock(providerId, now);
+        let blocked = quotaBlock !== null;
+        if (
+          quotaBlock &&
+          quotaBlock.retryAt <= now &&
+          (quotaBlock.probeLeaseUntil ?? 0) <= now
+        ) {
+          try {
+            const claimed = await claimProviderQuotaProbe(providerId, now);
+            invalidateDegradedProvidersCache();
+            if (claimed) {
+              blocked = false;
+              quotaProbeProviderId = providerId;
+            } else {
+              // The row may have been cleared by a successful probe between
+              // cache read and claim. Re-read once; otherwise another request won.
+              quotaBlock = await getProviderQuotaBlock(providerId, now);
+              blocked = quotaBlock !== null;
+            }
+          } catch (err) {
+            // Same fail-soft rule as provider health: DB failure cannot invent
+            // an outage. The upstream response will re-establish the block.
+            blocked = false;
+            userLog.warn("provider_quota_probe_claim_failed", { provider: providerId, err: errSummary(err) });
+          }
+        }
+        if (blocked && quotaBlock) {
+          const retryAt = Math.max(
+            quotaBlock.retryAt,
+            quotaBlock.probeLeaseUntil ?? 0,
+            now + 1_000,
+          );
+          const retryMs = retryAt - now;
+          const retrySec = Math.max(1, Math.ceil(retryMs / 1_000));
+          const degraded = await getDegradedProviders(now);
+          const alts = degradedAlternatives({ gate, pricing: deps.pricing, uid, degraded });
+          userLog.warn("proxy_provider_quota_blocked", { provider: providerId, model: body.model, retryMs });
+          sendJsonError(
+            res,
+            400,
+            "PROVIDER_QUOTA_EXHAUSTED",
+            `${providerId} 当前订阅周期额度已用完,请改用其他模型;系统会自动检测恢复`,
+            requestId,
+            { "Retry-After": String(retrySec) },
+            { provider: providerId, alternatives: alts, retry_after_ms: retryMs },
+          );
+          return;
+        }
       }
       const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
       let pre;
@@ -1133,6 +1229,7 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        quotaProbeProviderId,
         finalize,
         sessionId,
         // delegate 子会话的父客户端会话 id(web-*);普通 chat 恒 null

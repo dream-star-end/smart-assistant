@@ -60,7 +60,8 @@
     "0178_lossless_agent_group_null_guard",
     "0179_ark_plan_kimi_k3",
     "0180_refresh_tokens_rotated_to_index",
-    "0181_turn_tape_recovery_links"
+    "0181_turn_tape_recovery_links",
+    "0182_provider_quota_blocks"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -49,6 +49,7 @@ import {
   LOSSLESS_TURN_TAPE_SHA256_RE,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
   availableModelHistoryTokens,
+  modelHistoryReservedTokens,
   estimateModelHistoryTokens,
   exactModelHistoryTextSuffix,
   modelHistorySemanticRole,
@@ -3459,6 +3460,7 @@ async function computeFiniteEngineContextMessages(
     remainingTokens: availableModelHistoryTokens(
       contextWindow,
       options.currentUserText ?? "",
+      modelHistoryReservedTokens(options.engine),
     ),
     stopped: false,
     newestFirst: [],

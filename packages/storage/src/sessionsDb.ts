@@ -16,6 +16,7 @@ import { dirname } from 'node:path'
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS, type MessageUsageDelegate } from '@openclaude/protocol/teamCards'
 import {
   availableModelHistoryTokens,
+  modelHistoryReservedTokens,
   estimateModelHistoryTokens,
   exactModelHistoryTextSuffix,
   modelHistorySemanticRole,
@@ -4148,7 +4149,11 @@ export function selectEngineContextSuffix(
   const contextWindow = resolveModelHistoryContextWindow(options.contextWindow, options.engine)
   if (contextWindow === null) return { messages: rows, truncated: false }
 
-  let remaining = availableModelHistoryTokens(contextWindow, options.currentUserText ?? '')
+  let remaining = availableModelHistoryTokens(
+    contextWindow,
+    options.currentUserText ?? '',
+    modelHistoryReservedTokens(options.engine),
+  )
   const selected: MessageLike[] = []
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const row = rows[index]!

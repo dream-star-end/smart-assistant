@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { estimateModelHistoryTokens, modelHistorySemanticText } from '../modelHistory.js'
+import {
+  estimateModelHistoryTokens,
+  modelHistoryReservedTokens,
+  modelHistorySemanticText,
+} from '../modelHistory.js'
+
+test('only CCB provider-switch history reserves proactive-compaction headroom', () => {
+  assert.equal(modelHistoryReservedTokens('ccb'), 33_256)
+  assert.equal(modelHistoryReservedTokens('codex'), 256)
+  assert.equal(modelHistoryReservedTokens(undefined), 256)
+})
 
 test('tool text/output aliases appear once in semantic sidecar and token estimate', () => {
   const marker = `REAL-BASH-${'x'.repeat(64 * 1024)}-TAIL`

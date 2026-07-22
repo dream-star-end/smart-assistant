@@ -54,6 +54,16 @@ import {
   incrAnthropicProxyReject,
 } from "../../admin/metrics.js";
 import { recordProviderHealthSample } from "./providerHealthSink.js";
+import { findRouteProviderForModel } from "@openclaude/protocol";
+import {
+  clearProviderQuotaBlock,
+  isMoonshotBillingQuotaExhausted,
+  markProviderQuotaExhausted,
+  providerQuotaRetryAt,
+} from "../../admin/providerQuotaCircuit.js";
+import {
+  invalidateDegradedProvidersCache,
+} from "../../admin/providerHealthGate.js";
 
 // ─── 上下文 ────────────────────────────────────────────────────────────────
 
@@ -99,6 +109,8 @@ export interface RoundTripCtx {
   uid: bigint;
   body: ProxyBody;
   session: PreparedUpstreamSession;
+  /** Set only for the one request that atomically won an expired quota probe lease. */
+  quotaProbeProviderId: string | null;
   finalize: FinalizerHandle;
   sessionId: string | null;
   /**
@@ -150,6 +162,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     uid,
     body,
     session,
+    quotaProbeProviderId,
     finalize,
     sessionId,
     parentSessionId,
@@ -250,6 +263,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       // 防止 boss 自己客户端 bug 反复打到账号 cooldown。
       const isClientBadRequest =
         upstream.status === 400 && isAnthropicInvalidRequestError(preview);
+      const routeProvider = findRouteProviderForModel(body.model);
+      const isQuotaExhausted =
+        routeProvider?.id === "moonshot" &&
+        isMoonshotBillingQuotaExhausted(upstream.status, preview);
       const upstreamClass = isClientBadRequest
         ? "INVALID_REQUEST"
         : upstream.status === 429
@@ -276,6 +293,31 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         );
       }
       incrAnthropicProxySettle("aborted");
+      if (isQuotaExhausted && routeProvider) {
+        const retryAt = providerQuotaRetryAt(upstream.headers);
+        try {
+          await markProviderQuotaExhausted(routeProvider.id, retryAt);
+          invalidateDegradedProvidersCache();
+        } catch (quotaErr) {
+          // Fail-soft:the current exact rejection remains non-retryable even
+          // if PG is unavailable; a later request may re-establish durability.
+          userLog.warn("provider_quota_block_persist_failed", {
+            provider: routeProvider.id,
+            err: errSummary(quotaErr),
+          });
+        }
+        const retryMs = Math.max(1_000, retryAt.getTime() - Date.now());
+        sendJsonError(
+          res,
+          400,
+          "PROVIDER_QUOTA_EXHAUSTED",
+          "Moonshot 当前订阅周期额度已用完,请改用其他模型;系统会自动检测恢复",
+          requestId,
+          { "Retry-After": String(Math.max(1, Math.ceil(retryMs / 1_000))) },
+          { provider: routeProvider.id, retry_after_ms: retryMs },
+        );
+        return;
+      }
       // P3.2 健康信号:上游 5xx / 429(过载)算 provider 侧失败;4xx(含 400 客户端 body 损坏、
       // 内容策略拒绝)不归 provider 健康,避免误判(fire-and-forget,只静态 provider 记)。
       if (!isClientBadRequest && (upstream.status >= 500 || upstream.status === 429)) {
@@ -291,6 +333,19 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       recordProviderHealthSample(body.model, "upstream_5xx"); // 2xx 却无 body = provider 返回畸形
       sendJsonError(res, 502, "UPSTREAM_NO_BODY", "upstream returned no body", requestId);
       return;
+    }
+    // A half-open quota probe is complete as soon as healthy 2xx headers and
+    // a body arrive. Clear its durable block before exposing streaming bytes.
+    if (quotaProbeProviderId) {
+      try {
+        await clearProviderQuotaBlock(quotaProbeProviderId);
+        invalidateDegradedProvidersCache();
+      } catch (quotaErr) {
+        userLog.warn("provider_quota_block_clear_failed", {
+          provider: quotaProbeProviderId,
+          err: errSummary(quotaErr),
+        });
+      }
     }
     // M9 配额可见性 — 从上游响应头抽 5h/7d utilization + reset,fire-and-forget
     // UPDATE accounts。30s 进程内 throttle + SQL WHERE + 全局 cap 32 三层防护,
