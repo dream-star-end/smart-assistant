@@ -29,6 +29,7 @@ export interface StaticProviderCommercialMeta {
     | "ARK_NOT_CONFIGURED"
     | "OPENCODEGO_NOT_CONFIGURED"
     | "KIMI_NOT_CONFIGURED"
+    | "ARK_K3_NOT_CONFIGURED"
     | "MOONSHOT_NOT_CONFIGURED";
   /** 缺 key → reject metric label(须与 admin/metrics.ts ProxyRejectReason 一致) */
   readonly rejectMetricLabel:
@@ -37,6 +38,7 @@ export interface StaticProviderCommercialMeta {
     | "ark_config"
     | "opencodego_config"
     | "kimi_config"
+    | "ark_k3_config"
     | "moonshot_config";
   /**
    * 出站出口策略(commercial 部署网络拓扑语义,非 protocol 路由契约,故落本表)。
@@ -96,6 +98,13 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
     notConfiguredHttpCode: "KIMI_NOT_CONFIGURED",
     rejectMetricLabel: "kimi_config",
     // ark.cn-beijing.volces.com:火山北京端点,同 minimax/ark 必须直连(绕日本双重跨境会断流)。
+    egress: "direct",
+  },
+  "ark-k3": {
+    // 火山 Agent Plan K3 与 kimi-k2.7-code 共订阅/key，但能力和平台 model id 独立。
+    keyConfigField: "ARK_AGENT_PLAN_KEY",
+    notConfiguredHttpCode: "ARK_K3_NOT_CONFIGURED",
+    rejectMetricLabel: "ark_k3_config",
     egress: "direct",
   },
   moonshot: {

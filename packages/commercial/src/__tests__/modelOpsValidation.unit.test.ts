@@ -13,7 +13,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { effortMetaForModel, EFFORT_ENUM } from "../admin/modelOps.js";
+import { effortMetaForModel, EFFORT_ENUM, opsProviderIds } from "../admin/modelOps.js";
 import {
   normalizeDefaultEffort,
   normalizePriceCents,
@@ -27,7 +27,7 @@ describe("effortMetaForModel — protocol 推导适用性", () => {
     assert.deepEqual(effortMetaForModel("glm-5.2"), { applicable: true, allowed: ["high", "max"] });
   });
   it("capability-zero 静态(strip output_config):kimi/qwen/minimax → 不适用", () => {
-    for (const m of ["kimi-k2.7-code", "qwen3.7-max", "qwen3.7-plus", "MiniMax-M3"]) {
+    for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "qwen3.7-max", "qwen3.7-plus", "MiniMax-M3"]) {
       assert.deepEqual(effortMetaForModel(m), { applicable: false, allowed: [] }, m);
     }
   });
@@ -43,6 +43,13 @@ describe("effortMetaForModel — protocol 推导适用性", () => {
       applicable: true,
       allowed: EFFORT_ENUM,
     });
+  });
+});
+
+describe("provider ops 派生枚举", () => {
+  it("包含火山 ark-k3 与 Moonshot，默认展示名由完整类型映射守护", () => {
+    assert.ok(opsProviderIds().includes("ark-k3"));
+    assert.ok(opsProviderIds().includes("moonshot"));
   });
 });
 

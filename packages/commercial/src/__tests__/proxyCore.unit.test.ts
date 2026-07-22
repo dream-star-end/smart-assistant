@@ -148,6 +148,7 @@ interface SessionSpy {
 
 function makeSession(over: {
   endpoint?: string;
+  upstreamModel?: string;
   dispatcher?: unknown;
   shouldUpdateQuotaFromResponse?: boolean;
   accountId?: bigint | null;
@@ -160,6 +161,7 @@ function makeSession(over: {
     accountId: over.accountId ?? 1001n,
     pinnedUserId: null,
     endpoint: over.endpoint ?? "https://api.anthropic.com/v1/messages",
+    upstreamModel: over.upstreamModel ?? "claude-sonnet-4-6",
     dispatcher: over.dispatcher,
     shouldUpdateQuotaFromResponse: over.shouldUpdateQuotaFromResponse ?? false,
     applyUpstreamAuth: (headers: Record<string, string>, body: ProxyBody) => {
@@ -292,6 +294,7 @@ interface BuildCtxOpts {
   sessionOver?: Parameters<typeof makeSession>[0];
   finalizerOutcome?: Partial<FinalizeOutcome>;
   fetchImpl: (url: string, init: RequestInit) => Promise<Response>;
+  bodyModel?: string;
   sessionId?: string | null;
   parentSessionId?: string | null;
   delegateAgentId?: string | null;
@@ -305,7 +308,7 @@ function buildCtx(opts: BuildCtxOpts) {
   const session = makeSession(opts.sessionOver);
   const finalize = makeFinalize(opts.finalizerOutcome);
   const body: ProxyBody = {
-    model: "claude-sonnet-4-6",
+    model: opts.bodyModel ?? "claude-sonnet-4-6",
     max_tokens: 1024,
     messages: [{ role: "user", content: "hi" }],
   } as ProxyBody;
@@ -328,6 +331,24 @@ function buildCtx(opts: BuildCtxOpts) {
   };
   return { ctx, req, res, session, finalize };
 }
+
+describe("runUpstreamRoundTrip — platform model / upstream model 分离", () => {
+  test("平台 kimi-k3-ark 只在发往上游的 JSON 改写为 kimi-k3", async () => {
+    let sentBody: Record<string, unknown> | undefined;
+    const { ctx } = buildCtx({
+      bodyModel: "kimi-k3-ark",
+      sessionOver: { upstreamModel: "kimi-k3" },
+      fetchImpl: async (_url, init) => {
+        sentBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return sseFullResponse();
+      },
+      finalizerOutcome: { state: "committed", debitedCredits: 0n },
+    });
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(ctx.body.model, "kimi-k3-ark", "计费/授权 canonical model 不得被改写");
+    assert.equal(sentBody?.model, "kimi-k3", "仅 transport body 使用 catalog upstream model");
+  });
+});
 
 // ─── Cases ─────────────────────────────────────────────────────────────────
 

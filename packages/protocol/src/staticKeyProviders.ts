@@ -11,14 +11,21 @@
 //   - **不**含 CCB 概念(contextWindow / 能力 flag) —— CCB 因包边界(claude-code-best 非
 //     workspace 成员、零内部依赖)有自己的本地镜像表 claude-code-best/src/utils/model/staticKeyModels.ts。
 //     两表一致性由仓库根 static-key-providers.snapshot.json + 两侧测试守护漂移。
-//   - **不**改写转发的 body.model —— 全 provider 都原样透传 caller 的 model 字段；canonicalize 仅
-//     用于 pricing 查价。
+//   - catalog authority 路径由其 upstream_model_id 决定转发 model；仅 legacy/no-catalog 路径
+//     可通过 spec.upstreamModelForRequest 做精确 alias 改写。canonicalize 只用于 pricing 查价。
 //
 // DeepSeek 的 4 个 id 面**故意不同**(历史不规则，本次只忠实保留)：
 //   route 匹配=大小写敏感前缀家族 / inbound 白名单=2 个精确字面量 / capability=2 个精确字面量(在 CCB) /
 //   pricing canonicalize=不特判(原样)。因此每个关注点是独立字段，不可统一。
 
-export type StaticProviderId = 'deepseek' | 'minimax' | 'ark' | 'opencodego' | 'kimi' | 'moonshot'
+export type StaticProviderId =
+  | 'deepseek'
+  | 'minimax'
+  | 'ark'
+  | 'opencodego'
+  | 'kimi'
+  | 'ark-k3'
+  | 'moonshot'
 
 /**
  * 静态 provider key 解析表:provider id → 该 provider 的静态 key。
@@ -65,6 +72,11 @@ export interface StaticKeyProviderSpec {
    *   - ark:      'glm-5.1' / 'glm-5.2'(各自原样)
    */
   canonicalizeForPricing(modelId: string): string | null
+  /**
+   * legacy/no-catalog 路径的精确上游 model 改写。catalog hint 存在时不调用，仍以
+   * upstream_model_id 为最高权威。未声明 = 原样透传 caller 的 model。
+   */
+  upstreamModelForRequest?(modelId: string): string
   /** 转发前要 strip 的请求头(永含 'anthropic-beta'，第三方兼容层不识别 Anthropic 私有 beta) */
   readonly stripHeaders: readonly string[]
   /** 转发前要 strip 的 body 字段(CCB 对 unknown firstParty model 默认会带、兼容层会拒的字段) */
@@ -243,6 +255,31 @@ const ARK_PLAN_KIMI: StaticKeyProviderSpec = {
   supportsVision: false,
 }
 
+const ARK_PLAN_KIMI_K3: StaticKeyProviderSpec = {
+  id: 'ark-k3',
+  // 火山方舟 Agent Plan 新增 Kimi K3(2026-07-22)。与上面的 kimi-k2.7-code 共用
+  // /api/plan + ARK_AGENT_PLAN_KEY，但能力不同：K3 是 1M、多模态，且支持关闭 thinking；
+  // 所以必须是独立机制 spec，不能扩进 id='kimi' 的 256K/纯文本/恒思考语义。
+  // 平台 alias 故意叫 kimi-k3-ark，避免覆盖仍有普通用户使用的 Moonshot 官方 kimi-k3。
+  upstreamEndpoint: 'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
+  matchesRoute(modelId) {
+    return modelId.toLowerCase() === 'kimi-k3-ark'
+  },
+  inboundModelIds: ['kimi-k3-ark'],
+  canonicalizeForPricing(modelId) {
+    return modelId.toLowerCase() === 'kimi-k3-ark' ? 'kimi-k3-ark' : null
+  },
+  upstreamModelForRequest(modelId) {
+    return modelId.toLowerCase() === 'kimi-k3-ark' ? 'kimi-k3' : modelId
+  },
+  stripHeaders: ['anthropic-beta'],
+  // 2026-07-22 直连实测：thinking enabled/disabled、SSE、auto tool loop、vision 均可用；
+  // output_config.effort 虽接受但未证明改变行为，故不暴露档位并继续整体 strip。
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  maxInputTokens: 1_048_576,
+  supportsVision: true,
+}
+
 const MOONSHOT_CODING: StaticKeyProviderSpec = {
   id: 'moonshot',
   // Moonshot(月之暗面)官方「Kimi For Coding」订阅套餐的 Anthropic 兼容端点(2026-07-17 接入,
@@ -283,6 +320,7 @@ export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   ARK,
   OPENCODE_GO,
   ARK_PLAN_KIMI,
+  ARK_PLAN_KIMI_K3,
   MOONSHOT_CODING,
 ]
 
@@ -292,6 +330,7 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   ark: ARK,
   opencodego: OPENCODE_GO,
   kimi: ARK_PLAN_KIMI,
+  'ark-k3': ARK_PLAN_KIMI_K3,
   moonshot: MOONSHOT_CODING,
 }
 

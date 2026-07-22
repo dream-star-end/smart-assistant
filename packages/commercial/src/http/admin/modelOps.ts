@@ -33,6 +33,8 @@ import {
 } from "../../agent-sandbox/v3supervisor.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 import { loadConfig } from "../../config.js";
+import type { StaticProviderId } from "@openclaude/protocol";
+import { STATIC_PROVIDER_META } from "../proxy/staticProviderMeta.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { extractTailSlug, translateRangeError } from "./_shared.js";
 
@@ -45,16 +47,14 @@ function cfg(): ReturnType<typeof loadConfig> {
 
 function keyConfiguredMap(): Record<string, boolean> {
   const c = cfg();
-  return {
-    deepseek: !!c.DEEPSEEK_API_KEY,
-    minimax: !!c.MINIMAX_TOKEN_PLAN_KEY,
-    ark: !!c.ARK_CODING_PLAN_KEY,
-    opencodego: !!c.OPENCODE_GO_API_KEY,
-    kimi: !!c.ARK_AGENT_PLAN_KEY,
-    // codex 走 OAuth 账号池(claude_accounts runtime_channel='v5'),不依赖静态 env key;
-    // 这里恒 true 表示"env key 形态不适用"(池水位在 accounts tab 看)。
-    [CODEX_PROVIDER_ID]: true,
-  };
+  const out: Record<string, boolean> = {};
+  for (const id of Object.keys(STATIC_PROVIDER_META) as StaticProviderId[]) {
+    out[id] = !!c[STATIC_PROVIDER_META[id].keyConfigField];
+  }
+  // codex 走 OAuth 账号池(claude_accounts runtime_channel='v5'),不依赖静态 env key;
+  // 这里恒 true 表示"env key 形态不适用"(池水位在 accounts tab 看)。
+  out[CODEX_PROVIDER_ID] = true;
+  return out;
 }
 
 // ─── 0106 容量面:在飞快照获取 ───────────────────────────────────────
