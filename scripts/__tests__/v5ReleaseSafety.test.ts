@@ -14,6 +14,7 @@ const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
 const turnCanary = path.join(root, 'scripts/v5-smoke-turn-canary.mjs')
 const baselineEval = path.join(root, 'scripts/run-baseline-skill-evals.sh')
 const baselineWeekly = path.join(root, 'scripts/v5-baseline-evals-weekly.sh')
+const marketEval = path.join(root, 'scripts/v5-market-skill-eval.sh')
 const baselineService = path.join(root, 'deploy/v5/openclaude-v5-baseline-evals.service')
 const manualMutationLease = path.join(root, 'scripts/with-production-mutation-lease.sh')
 const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
@@ -4512,6 +4513,7 @@ wait $!
     const bin = path.join(dir, 'bin')
     const poll = path.join(dir, 'poll-count')
     const loginCount = path.join(dir, 'login-count')
+    const refreshCount = path.join(dir, 'refresh-count')
     const results = path.join(dir, 'results.jsonl')
     await mkdir(bin)
     await writeFile(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n')
@@ -4520,11 +4522,16 @@ wait $!
 set -u
 poll=${JSON.stringify(poll)}
 login_count=${JSON.stringify(loginCount)}
+refresh_count=${JSON.stringify(refreshCount)}
 args="$*"
 case "$args" in
   *'/api/auth/login'*)
     n=0; [ -f "$login_count" ] && n=$(cat "$login_count"); n=$((n+1)); printf '%s' "$n" > "$login_count"
     printf '%s\\n' '{"access_token":"tok"}'
+    ;;
+  *'/api/auth/refresh'*)
+    n=0; [ -f "$refresh_count" ] && n=$(cat "$refresh_count"); n=$((n+1)); printf '%s' "$n" > "$refresh_count"
+    printf '%s\\n' '{"access_token":"tok-refreshed"}'
     ;;
   *'/api/auth/logout'*) printf '%s\\n' '{"revoked":true}' ;;
   *'/api/skills/app-connectors/evals'*)
@@ -4535,7 +4542,12 @@ case "$args" in
   *'/api/skill-eval/run-1'*)
     n=0; [ -f "$poll" ] && n=$(cat "$poll"); n=$((n+1)); printf '%s' "$n" > "$poll"
     [ "$n" -eq 1 ] && exit 22
-    printf '%s\\n' '{"run":{"runId":"run-1","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}}'
+    case "$args" in *'Authorization: Bearer tok-refreshed'*) ;; *) exit 22 ;; esac
+    if [ "\${FAKE_MODE:-}" = incomplete ]; then
+      printf '%s\\n' '{"run":{"runId":"run-1","status":"done","benchmark":{"passRate":{"without":0.5},"verdict":"评测未完成"}}}'
+    else
+      printf '%s\\n' '{"run":{"runId":"run-1","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}}'
+    fi
     ;;
   *) exit 22 ;;
 esac
@@ -4555,10 +4567,29 @@ esac
     assert.equal(ok.status, 0, ok.stderr || ok.stdout)
     assert.match(ok.stdout, /POLL FAILED/)
     assert.match(ok.stdout, /AUTH REFRESHED/)
-    assert.equal((await readFile(loginCount, 'utf8')).trim(), '2')
+    assert.equal((await readFile(loginCount, 'utf8')).trim(), '1')
+    assert.equal((await readFile(refreshCount, 'utf8')).trim(), '1')
     const row = JSON.parse((await readFile(results, 'utf8')).trim())
     assert.equal(row.skill, 'app-connectors')
     assert.equal(row.status, 'done')
+
+    await writeFile(results, '')
+    const incomplete = spawnSync('bash', [baselineEval, 'app-connectors'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        PASSWORD: 'fixture',
+        OC_EVAL_RESULTS_FILE: results,
+        FAKE_MODE: 'incomplete',
+      },
+    })
+    assert.equal(incomplete.status, 1, incomplete.stderr || incomplete.stdout)
+    assert.match(incomplete.stdout, /INCOMPLETE BENCHMARK/)
+    const incompleteRow = JSON.parse((await readFile(results, 'utf8')).trim())
+    assert.equal(incompleteRow.status, 'done', 'JSONL 必须保留服务端权威终态')
+    assert.equal(incompleteRow.benchmark.passRate.with, undefined)
 
     await writeFile(results, '')
     const failed = spawnSync('bash', [baselineEval, 'app-connectors'], {
@@ -4580,7 +4611,92 @@ esac
     assert.match(source, /MAX_POLLS="\$\{OC_EVAL_MAX_POLLS:-360\}"/)
     assert.match(source, /seq 1 "\$MAX_POLLS"/)
     assert.match(source, /curl -sf -b "\$COOKIE_FILE" -c "\$COOKIE_FILE" -X POST/)
+    assert.match(source, /"\$V5_BASE\/api\/auth\/refresh"/)
     assert.match(source, /trap cleanup EXIT/)
+  })
+
+  test('market eval refreshes an expired bearer and cleans up with the replacement token', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-v5-market-eval-test-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    const poll = path.join(dir, 'poll-count')
+    const loginCount = path.join(dir, 'login-count')
+    const refreshCount = path.join(dir, 'refresh-count')
+    const uninstall = path.join(dir, 'uninstalled')
+    await mkdir(bin)
+    await writeFile(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n')
+    await chmod(path.join(bin, 'sleep'), 0o755)
+    await writeFile(path.join(bin, 'curl'), `#!/usr/bin/env bash
+set -u
+poll=${JSON.stringify(poll)}
+login_count=${JSON.stringify(loginCount)}
+refresh_count=${JSON.stringify(refreshCount)}
+uninstall=${JSON.stringify(uninstall)}
+args="$*"
+case "$args" in
+  *'/api/auth/login'*)
+    n=0; [ -f "$login_count" ] && n=$(cat "$login_count"); n=$((n+1)); printf '%s' "$n" > "$login_count"
+    printf '%s\\n' '{"access_token":"market-initial"}'
+    ;;
+  *'/api/auth/refresh'*)
+    n=0; [ -f "$refresh_count" ] && n=$(cat "$refresh_count"); n=$((n+1)); printf '%s' "$n" > "$refresh_count"
+    printf '%s\\n' '{"access_token":"market-refreshed"}'
+    ;;
+  *'/api/auth/logout'*) printf '%s\\n' '{"revoked":true}' ;;
+  *'/api/marketplace/installed/demo'*)
+    case "$args" in *'-X DELETE'*'Authorization: Bearer market-refreshed'*) : > "$uninstall" ;; *) exit 22 ;; esac
+    ;;
+  *'/api/marketplace/installed'*) printf '%s\\n' '{"installed":[]}' ;;
+  *'/api/marketplace/install'*) printf '%s\\n' '{"ok":true}' ;;
+  *'/api/marketplace/demo'*) printf '%s\\n' '{"detail":{"versionId":"v1","name":"Demo","kind":"skill"}}' ;;
+  *'/api/skills/demo/evals'*) printf '%s\\n' '{"evals":{"cases":[{"id":"c1"}]}}' ;;
+  *'/api/skills/demo/eval-run'*) printf '%s\\n' '{"runId":"run-market"}' ;;
+  *'/api/skills'*) printf '%s\\n' '{"skills":[]}' ;;
+  *'/api/skill-eval/run-market'*)
+    n=0; [ -f "$poll" ] && n=$(cat "$poll"); n=$((n+1)); printf '%s' "$n" > "$poll"
+    [ "$n" -eq 1 ] && exit 22
+    case "$args" in *'Authorization: Bearer market-refreshed'*) ;; *) exit 22 ;; esac
+    if [ "\${FAKE_MODE:-}" = incomplete ]; then
+      printf '%s\\n' '{"run":{"runId":"run-market","status":"done","benchmark":{"passRate":{"without":0.5},"verdict":"评测未完成"}}}'
+    else
+      printf '%s\\n' '{"run":{"runId":"run-market","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}}'
+    fi
+    ;;
+  *) exit 22 ;;
+esac
+`)
+    await chmod(path.join(bin, 'curl'), 0o755)
+
+    const result = spawnSync('bash', [marketEval, 'demo'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        PASSWORD: 'fixture',
+      },
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    assert.match(result.stdout, /AUTH REFRESHED/)
+    assert.equal((await readFile(loginCount, 'utf8')).trim(), '1')
+    assert.equal((await readFile(refreshCount, 'utf8')).trim(), '1')
+    assert.equal((await readFile(uninstall, 'utf8')).trim(), '')
+
+    await writeFile(poll, '0')
+    await rm(uninstall)
+    const incomplete = spawnSync('bash', [marketEval, 'demo'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        PASSWORD: 'fixture',
+        FAKE_MODE: 'incomplete',
+      },
+    })
+    assert.equal(incomplete.status, 1, incomplete.stderr || incomplete.stdout)
+    assert.match(incomplete.stdout, /INCOMPLETE BENCHMARK/)
+    assert.equal((await readFile(uninstall, 'utf8')).trim(), '', '失败路径仍须还原临时安装')
   })
 
   test('weekly baseline report is fail-closed on runner rc and incomplete platform coverage', async () => {
@@ -4642,19 +4758,31 @@ set -u
 [ "$PASSWORD" = fixture-secret ]
 printf '%s\\n' '{"skill":"alpha","runId":"a","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}' >> "$OC_EVAL_RESULTS_FILE"
 if [ "\${FAKE_MODE:-}" != missing ]; then
-  printf '%s\\n' '{"skill":"beta","runId":"b","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}' >> "$OC_EVAL_RESULTS_FILE"
+  if [ "\${FAKE_MODE:-}" = incomplete ]; then
+    printf '%s\\n' '{"skill":"beta","runId":"b","status":"done","benchmark":{"passRate":{"without":0.5},"verdict":"评测未完成"}}' >> "$OC_EVAL_RESULTS_FILE"
+  else
+    printf '%s\\n' '{"skill":"beta","runId":"b","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}' >> "$OC_EVAL_RESULTS_FILE"
+  fi
 fi
 [ "\${FAKE_MODE:-}" = runner-fail ] && exit 7
 exit 0
 `)
-    await writeFile(path.join(bin, 'psql'), '#!/usr/bin/env bash\ncat >/dev/null || true\nexit 0\n')
+    const psqlCapture = path.join(dir, 'psql-capture')
+    await writeFile(path.join(bin, 'psql'), '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$PSQL_CAPTURE"\ncat >> "$PSQL_CAPTURE" || true\nexit 0\n')
     await chmod(path.join(bin, 'psql'), 0o755)
+    const realPython = spawnSync('bash', ['-lc', 'command -v python3'], { encoding: 'utf8' }).stdout.trim()
+    assert.ok(realPython)
+    await writeFile(path.join(bin, 'python3'), `#!/usr/bin/env bash
+if [ "\${FAKE_MODE:-}" = extract-fail ] && [ "\${1:-}" = -c ]; then exit 9; fi
+exec ${JSON.stringify(realPython)} "$@"
+`)
+    await chmod(path.join(bin, 'python3'), 0o755)
     const password = path.join(dir, 'eval.password')
     const envFile = path.join(dir, 'commercial.env')
     await writeFile(password, 'fixture-secret\n')
     await writeFile(envFile, 'DATABASE_URL=postgres://fixture\n')
 
-    const runWeekly = (mode: string, history: string) => spawnSync('bash', [weekly], {
+    const runWeekly = (mode: string, history: string, extraEnv: Record<string, string> = {}) => spawnSync('bash', [weekly], {
       cwd: dir,
       encoding: 'utf8',
       env: {
@@ -4664,6 +4792,8 @@ exit 0
         OC_EVAL_HIST_DIR: history,
         OC_EVAL_PASSWORD_FILE: password,
         OC_EVAL_ENV_FILE: envFile,
+        PSQL_CAPTURE: psqlCapture,
+        ...extraEnv,
       },
     })
 
@@ -4674,6 +4804,24 @@ exit 0
     const runnerFail = runWeekly('runner-fail', path.join(dir, 'hist-runner-fail'))
     assert.equal(runnerFail.status, 0, runnerFail.stderr || runnerFail.stdout)
     assert.match(runnerFail.stdout, /回归异常 rc=7 problems=1 delivered=1/)
+
+    await writeFile(psqlCapture, '')
+    const incomplete = runWeekly('incomplete', path.join(dir, 'hist-incomplete'))
+    assert.equal(incomplete.status, 0, incomplete.stderr || incomplete.stdout)
+    assert.match(incomplete.stdout, /回归异常 rc=0 problems=1 delivered=1/)
+    assert.match(await readFile(psqlCapture, 'utf8'), /baseline coverage: 1\/2 done/)
+
+    const summaryFail = runWeekly('complete', path.join(dir, 'hist-summary-fail'), {
+      OC_EVAL_DROP_ALERT_PP: 'not-a-number',
+    })
+    assert.equal(summaryFail.status, 1, summaryFail.stderr || summaryFail.stdout)
+    assert.match(summaryFail.stdout, /汇总基础设施失败 → 升级 OnFailure\(exit 1\)/)
+    assert.doesNotMatch(summaryFail.stdout, /回归完成,全部正常/)
+
+    const extractFail = runWeekly('extract-fail', path.join(dir, 'hist-extract-fail'))
+    assert.equal(extractFail.status, 1, extractFail.stderr || extractFail.stdout)
+    assert.match(extractFail.stdout, /汇总基础设施失败 → 升级 OnFailure\(exit 1\)/)
+    assert.doesNotMatch(extractFail.stdout, /回归完成,全部正常/)
 
     const complete = runWeekly('complete', path.join(dir, 'hist-complete'))
     assert.equal(complete.status, 0, complete.stderr || complete.stdout)

@@ -47,13 +47,28 @@ login
 
 auth=(-H "Authorization: Bearer $TOK")
 refresh_auth() {
-  if login; then
+  local refreshed_tok
+  if refreshed_tok=$(curl -sf -b "$COOKIE_FILE" -c "$COOKIE_FILE" -X POST \
+    "$V5_BASE/api/auth/refresh" |
+    python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'); then
+    TOK="$refreshed_tok"
     auth=(-H "Authorization: Bearer $TOK")
     echo "  AUTH REFRESHED"
     return 0
   fi
   echo "  AUTH REFRESH FAILED"
   return 1
+}
+
+benchmark_complete() {
+  printf '%s' "$1" | python3 -c '
+import json, math, sys
+r = json.load(sys.stdin)["run"]
+pr = (r.get("benchmark") or {}).get("passRate") or {}
+ok = all(type(pr.get(arm)) in (int, float) and math.isfinite(pr[arm]) and 0 <= pr[arm] <= 1
+         for arm in ("without", "with"))
+sys.exit(0 if ok else 1)
+' 2>/dev/null
 }
 
 # fail 早于默认清单枚举初始化:枚举阶段(用户技能拉取失败)也要能把它置 1,
@@ -163,7 +178,16 @@ except Exception:
     fi
     status="${st%% |*}"
     case "$status" in
-      done) echo "  $st"; echo "$st" | grep -q "反而更差" && { echo "  REGRESSION"; fail=1; }; final_status=done; break ;;
+      done)
+        echo "  $st"
+        if ! benchmark_complete "$run"; then
+          echo "  INCOMPLETE BENCHMARK (without/with 两臂通过率不完整)"
+          fail=1
+        fi
+        echo "$st" | grep -q "反而更差" && { echo "  REGRESSION"; fail=1; }
+        final_status=done
+        break
+        ;;
       failed) echo "  FAILED: $st"; fail=1; final_status=failed; break ;;
     esac
   done

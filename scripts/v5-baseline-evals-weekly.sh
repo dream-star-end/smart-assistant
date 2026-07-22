@@ -90,8 +90,18 @@ touch "$RESULTS_FILE"   # 整轮零产出时也要有空文件:汇总按"空=异
 
 # 汇总 + 与上一轮对比(python 做数值,shell 只搬运)。
 EXPECTED_DIR="$SCRIPT_DIR/../packages/commercial/agent-sandbox/ccb-baseline/skills"
-summary="$(python3 - "$RESULTS_FILE" "${PREV_FILE:-}" "$DROP_ALERT_PP" "$run_rc" "$EXPECTED_DIR" <<'PY'
-import glob, json, os, sys
+summary_infra_failed=0
+if ! summary="$(python3 - "$RESULTS_FILE" "${PREV_FILE:-}" "$DROP_ALERT_PP" "$run_rc" "$EXPECTED_DIR" <<'PY'
+import glob, json, math, os, sys
+
+def valid_rate(value):
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1
+
+def complete_done(row):
+    if row.get('status') != 'done':
+        return False
+    rates = ((row.get('benchmark') or {}).get('passRate') or {})
+    return valid_rate(rates.get('without')) and valid_rate(rates.get('with'))
 
 def load(path):
     out = {}
@@ -136,10 +146,13 @@ for skill, r in sorted(cur.items()):
     if st != 'done':
         problems.append(f"{skill}: 运行未完成(status={st})")
         continue
-    if isinstance(w, (int, float)) and isinstance(wo, (int, float)) and w < wo:
+    if not valid_rate(w) or not valid_rate(wo):
+        problems.append(f"{skill}: benchmark 不完整(without/with 两臂通过率必须齐全)")
+        continue
+    if w < wo:
         problems.append(f"{skill}: 有技能反而更差({fmt(wo)}→{fmt(w)})")
     pw = ((prev.get(skill) or {}).get('benchmark') or {}).get('passRate', {}).get('with')
-    if isinstance(w, (int, float)) and isinstance(pw, (int, float)) and (pw - w) * 100 > drop_pp:
+    if valid_rate(pw) and (pw - w) * 100 > drop_pp:
         problems.append(f"{skill}: with 臂较上一轮下降 {round((pw - w) * 100)}pp({fmt(pw)}→{fmt(w)})")
 missing = [skill for skill in expected if skill not in cur]
 for skill in missing:
@@ -147,17 +160,36 @@ for skill in missing:
 for skill in expected:
     if cur_counts.get(skill, 0) > 1:
         problems.append(f'{skill}: 评测结果重复({cur_counts[skill]} 条,期望 1 条)')
-done_expected = sum(1 for skill in expected if (cur.get(skill) or {}).get('status') == 'done')
+done_expected = sum(1 for skill in expected if complete_done(cur.get(skill) or {}))
 lines.insert(0, f'- baseline coverage: {done_expected}/{len(expected)} done')
 if not cur:
     problems.append('结果文件为空(整轮评测未产出任何记录)')
 print(json.dumps({'problems': problems, 'report': '\n'.join(lines)}, ensure_ascii=False))
 PY
-)"
+)"; then
+  summary_infra_failed=1
+  summary='{"problems":["评测汇总生成失败"],"report":"- baseline coverage: unknown (汇总生成失败)"}'
+fi
 
-problems_n="$(echo "$summary" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["problems"]))')"
-report="$(echo "$summary" | python3 -c 'import sys,json;print(json.load(sys.stdin)["report"])')"
-problems_txt="$(echo "$summary" | python3 -c 'import sys,json;print("\n".join(json.load(sys.stdin)["problems"]))')"
+if ! problems_n="$(printf '%s' "$summary" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["problems"]))')"; then
+  summary_infra_failed=1
+  problems_n=1
+fi
+if ! report="$(printf '%s' "$summary" | python3 -c 'import sys,json;print(json.load(sys.stdin)["report"])')"; then
+  summary_infra_failed=1
+  report='- baseline coverage: unknown (汇总解析失败)'
+fi
+if ! problems_txt="$(printf '%s' "$summary" | python3 -c 'import sys,json;print("\n".join(json.load(sys.stdin)["problems"]))')"; then
+  summary_infra_failed=1
+  problems_txt='评测汇总解析失败'
+fi
+if [ "$summary_infra_failed" -ne 0 ]; then
+  problems_n=1
+  problems_txt="评测汇总生成/解析失败,本轮不得判为正常。
+$problems_txt"
+  report="- baseline coverage: unknown (汇总基础设施失败)
+$report"
+fi
 
 if [ "$run_rc" -ne 0 ] || [ "$problems_n" -gt 0 ]; then
   body="$problems_txt
@@ -167,9 +199,13 @@ $report"
   delivered=0
   fanout_alert baseline_evals warning "baseline-evals:$STAMP" \
     "baseline 技能评测回归异常($problems_n 项)" "$body" \
-    "{\"rc\":$run_rc,\"problems\":$problems_n}" && delivered=1
+    "{\"rc\":$run_rc,\"problems\":$problems_n,\"summaryInfraFailed\":$summary_infra_failed}" && delivered=1
   inbox_notice warning "baseline 技能评测回归异常($problems_n 项)" "$body" && delivered=1
   log "回归异常 rc=$run_rc problems=$problems_n delivered=$delivered"
+  if [ "$summary_infra_failed" -ne 0 ]; then
+    log "汇总基础设施失败 → 升级 OnFailure(exit 1)"
+    exit 1
+  fi
   if [ "$delivered" -eq 0 ]; then
     # 两通道均未确认投递 → 本单元没能自行把异常报出去,升级到 .service OnFailure 兜底
     # (与凭据缺失路径同范式:能自送才退 0,自送失败才 exit 1,避免异常被静默吞掉)。

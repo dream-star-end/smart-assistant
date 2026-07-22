@@ -24,9 +24,58 @@ SLUG="${1:?usage: v5-market-skill-eval.sh <slug>}"
 
 jqpy() { python3 -c "import sys,json;$1"; }
 
-TOK=$(curl -sf -X POST "$V5_BASE/api/auth/login" -H 'Content-Type: application/json' \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"turnstile_token\":\"x\"}" |
-  jqpy 'print(json.load(sys.stdin)["access_token"])') || { echo "login failed"; exit 2; }
+COOKIE_FILE="$(mktemp)"
+chmod 600 "$COOKIE_FILE"
+TOK=""
+auth=()
+was_installed=unknown
+installed_by_us=0
+
+login() {
+  TOK=$(curl -sf -b "$COOKIE_FILE" -c "$COOKIE_FILE" -X POST \
+    "$V5_BASE/api/auth/login" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"turnstile_token\":\"x\"}" |
+    jqpy 'print(json.load(sys.stdin)["access_token"])')
+}
+
+refresh_auth() {
+  local refreshed_tok
+  if refreshed_tok=$(curl -sf -b "$COOKIE_FILE" -c "$COOKIE_FILE" -X POST \
+    "$V5_BASE/api/auth/refresh" |
+    jqpy 'print(json.load(sys.stdin)["access_token"])'); then
+    TOK="$refreshed_tok"
+    auth=(-H "Authorization: Bearer $TOK")
+    echo "· AUTH REFRESHED"
+    return 0
+  fi
+  echo "· AUTH REFRESH FAILED"
+  return 1
+}
+
+benchmark_complete() {
+  printf '%s' "$1" | python3 -c '
+import json, math, sys
+r = json.load(sys.stdin)["run"]
+pr = (r.get("benchmark") or {}).get("passRate") or {}
+ok = all(type(pr.get(arm)) in (int, float) and math.isfinite(pr[arm]) and 0 <= pr[arm] <= 1
+         for arm in ("without", "with"))
+sys.exit(0 if ok else 1)
+' 2>/dev/null
+}
+
+cleanup() {
+  if [ "$was_installed" != "yes" ] && [ "$installed_by_us" -eq 1 ]; then
+    curl -sf -X DELETE "${auth[@]}" "$V5_BASE/api/marketplace/installed/$SLUG" >/dev/null 2>&1 \
+    && echo "· 已卸载还原(eval 账号原本未安装/安装状态未知)" \
+      || echo "· 卸载还原失败,请手工清理 eval 账号的 $SLUG"
+  fi
+  curl -sf -b "$COOKIE_FILE" -X POST "$V5_BASE/api/auth/logout" \
+    -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
+  rm -f "$COOKIE_FILE"
+}
+trap cleanup EXIT
+
+login || { echo "login failed"; exit 2; }
 auth=(-H "Authorization: Bearer $TOK")
 
 detail=$(curl -sf "${auth[@]}" "$V5_BASE/api/marketplace/$SLUG") || { echo "detail 404:$SLUG 不存在或未上架(pending 版本不支持,见脚本头注释)"; exit 2; }
@@ -43,23 +92,14 @@ was_installed=$(curl -sf "${auth[@]}" "$V5_BASE/api/marketplace/installed" |
   jqpy "print('yes' if any(i.get('slug')=='$SLUG' for i in json.load(sys.stdin).get('installed',[])) else 'no')" 2>/dev/null || echo unknown)
 
 # 只有确知"原本已装"(was_installed=yes)才在 cleanup 里保留;no 或 unknown(探测失败)
-# 且本批确实装过 → 一律卸载还原,避免探测失败时把技能泄漏留在 canary 上污染后续评测。
+# 且本批确实装过 → 一律卸载还原,避免探测失败时把技能泄漏留在 eval 账号污染后续评测。
 # installed_by_us 只在 install 成功后置 1:install 失败时 cleanup 不误删。
-installed_by_us=0
-cleanup() {
-  if [ "$was_installed" != "yes" ] && [ "$installed_by_us" -eq 1 ]; then
-    curl -sf -X DELETE "${auth[@]}" "$V5_BASE/api/marketplace/installed/$SLUG" >/dev/null 2>&1 \
-    && echo "· 已卸载还原(eval 账号原本未安装/安装状态未知)" \
-      || echo "· 卸载还原失败,请手工清理 eval 账号的 $SLUG"
-  fi
-}
-trap cleanup EXIT
 
 curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
   "$V5_BASE/api/marketplace/install" -d "{\"versionId\":\"$versionId\"}" >/dev/null \
   || { echo "install 失败"; exit 2; }
 installed_by_us=1
-echo "· 已安装到 canary,等待 hub 同步…"
+echo "· 已安装到 eval 账号,等待 hub 同步…"
 
 # 触发并等待容器 hub 同步:**同步触发点在技能列表读**(handleUserSkillsList →
 # syncMarketplaceHubForManagement),evals GET 本身不触发 —— 每轮先打一次列表。
@@ -84,7 +124,10 @@ runId=$(curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
 
 for _ in $(seq 1 120); do
   sleep 10
-  run=$(curl -sf "${auth[@]}" "$V5_BASE/api/skill-eval/$runId") || continue
+  if ! run=$(curl -sf "${auth[@]}" "$V5_BASE/api/skill-eval/$runId"); then
+    refresh_auth || true
+    continue
+  fi
   status=$(echo "$run" | jqpy 'print(json.load(sys.stdin)["run"]["status"])')
   case "$status" in
     done)
@@ -97,6 +140,10 @@ fmt = lambda x: f"{round(x * 100)}%" if isinstance(x, (int, float)) else "-"
 print(f"== 平台实测:without={fmt(pr.get('without'))} with={fmt(pr.get('with'))}")
 print(f"   verdict: {b.get('verdict', '')}")
 PY
+      if ! benchmark_complete "$run"; then
+        echo "== INCOMPLETE BENCHMARK (without/with 两臂通过率不完整)"
+        exit 1
+      fi
       verdict=$(echo "$run" | jqpy 'r=json.load(sys.stdin)["run"];print((r.get("benchmark") or {}).get("verdict",""))')
       echo "$verdict" | grep -q "反而更差" && exit 1
       exit 0
