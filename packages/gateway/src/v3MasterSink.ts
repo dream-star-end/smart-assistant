@@ -85,9 +85,9 @@ export const SERVER_AUTHORED_PATH = '/internal/v3/server-authored-message'
  * generated turn content,which is uploaded as content-addressed parts. */
 const MAX_DIAGNOSTIC_RESPONSE_BYTES = 256 * 1024
 
-/** HTTP timeout per single attempt — short enough that a hung master
- *  doesn't pile up turn callbacks; long enough that a slow first SQLite
- *  write under contention won't false-trip. 10s. */
+/** HTTP timeout per staged part. Finalize is content-sized work and has no
+ * product-level deadline: the fsynced queue remains the durable owner until
+ * the master returns an ACK. */
 const ATTEMPT_TIMEOUT_MS = 10_000
 
 /**
@@ -376,8 +376,11 @@ async function postLosslessTurnTapeEnvelope(
   deps: AttemptSendDeps,
 ): Promise<void> {
   const fetcher = deps.fetcher ?? undiciRequest
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  const isFinalize = envelope.action === 'finalize'
+  const controller = isFinalize ? null : new AbortController()
+  const timer = controller === null
+    ? null
+    : setTimeout(() => controller.abort(), deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
   let res: Awaited<ReturnType<typeof undiciRequest>>
   try {
     res = await fetcher(`${deps.config.baseUrl}${SERVER_AUTHORED_PATH}`, {
@@ -387,13 +390,22 @@ async function postLosslessTurnTapeEnvelope(
         authorization: `Bearer ${deps.config.bearer}`,
       },
       body: JSON.stringify(envelope),
-      signal: controller.signal,
+      ...(controller === null
+        ? {
+            // A large lossless tape can legitimately take minutes to verify
+            // and materialize. Undici's default headers timeout would turn
+            // that valid work into overlapping retries. Connection failures
+            // still reject normally; there is simply no content-size timer.
+            headersTimeout: 0,
+            bodyTimeout: 0,
+          }
+        : { signal: controller.signal }),
     })
   } catch (err) {
-    clearTimeout(timer)
+    if (timer !== null) clearTimeout(timer)
     throw new V3SinkError(`network error: ${err instanceof Error ? err.message : String(err)}`, 'transient')
   }
-  clearTimeout(timer)
+  if (timer !== null) clearTimeout(timer)
   let bodyText = ''
   try {
     bodyText = await readBoundedBody(res.body, MAX_DIAGNOSTIC_RESPONSE_BYTES)
