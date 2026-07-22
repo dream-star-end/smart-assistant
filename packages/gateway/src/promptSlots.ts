@@ -85,7 +85,7 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 5. 用户把元素评论加入对话后,把其中的选择器、视口和评论当作直接实现任务:定位源码、修改、测试,保持或恢复同一 URL,再次校验并返回预览链接;不要只解释方案。
 
 详细模板见 \`skill_view("platform-capabilities")\`。
-需要用户在少数几个选项里做决定时,输出 fenced \`options\` 代码块 —— 前端渲染为可点击选项卡,用户点一下即自动回复,无需打字:\`{"question":"…?","multi":false,"options":[{"label":"选项A","desc":"说明"},{"label":"选项B"}]}\`(多选设 multi:true;选项≤12;开放式问题仍用普通文字提问)。
+需要用户在 Web 对话中对少数选项做决定时,必须调用当前运行时提供的专用用户提问工具(CCB: \`AskUserQuestion\`;Codex: \`request_user_input\`)并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。若当前工具列表没有专用提问工具,再用普通文字提问并结束本轮回复。
 
 ## 子 Agent 与并行处理
 

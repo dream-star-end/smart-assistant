@@ -1758,6 +1758,11 @@ export class CodexAppServerRunner extends EventEmitter {
     // telemetry hardening 同为"无条件安全兜底"——即便 launch overrides 构建失败走
     // naked launch,原生 spawnAgent 也不会复活来绕开 delegate_task。见 helper 注释。
     const multiAgentDisableArgs = buildCodexMultiAgentDisableArgs(process.env)
+    // Codex 原生 request_user_input 默认只在 plan mode 暴露。V5 普通对话也必须
+    // 走同一条“暂停当前 turn → 专用 Ask UI → 回写答案后续跑”的交互链，不能退回
+    // busy 期间不可点击的 Markdown options 卡。与 multi-agent/telemetry 一样无条件
+    // 注入，确保 platform context 构建失败走 naked launch 时仍可提问。
+    const requestUserInputArgs = ['-c', 'features.default_mode_request_user_input=true']
     // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
     // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
     // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
@@ -1778,6 +1783,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...effortArgs,
       ...reasoningSummaryArgs,
       ...multiAgentDisableArgs,
+      ...requestUserInputArgs,
       ...telemetryArgs,
       '--listen',
       'stdio://',

@@ -54,6 +54,8 @@ declare global {
       mergedPages: number;
       messageCount: number;
     };
+    __askQuestion: { responses: unknown[] };
+    __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
   }
 }
@@ -68,6 +70,8 @@ window.__scrollTimeline = {
   anchor: null,
 };
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
+window.__askQuestion = { responses: [] };
+window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
@@ -124,6 +128,45 @@ function FeedbackProbe() {
 createRoot(document.getElementById("feedback-root")!).render(
   <StrictMode><FeedbackProbe /></StrictMode>,
 );
+
+const activeAskQuestion: ChatMessage = {
+  id: "active-ask-question",
+  role: "permission",
+  text: "AskUserQuestion",
+  ts: 5,
+  toolName: "AskUserQuestion",
+  requestId: "ask-active-r1",
+  inputJson: {
+    questions: [
+      {
+        header: "画面风格",
+        question: "画面风格选哪种?",
+        multiSelect: false,
+        options: [
+          { label: "仿古画卷2.5D", description: "推荐，接近原画美感" },
+          { label: "全3D低多边形", description: "偏现代游戏风格" },
+        ],
+      },
+    ],
+  },
+  _resolved: false,
+};
+
+window.__mountAskQuestion = () => {
+  createRoot(document.getElementById("ask-question-root")!).render(
+    <StrictMode>
+      <MessageRenderer
+        message={activeAskQuestion}
+        sig="active-ask-question"
+        isLast
+        sending
+        inActiveTurn
+        cb={{}}
+        onRespondPermission={(response) => window.__askQuestion.responses.push(response)}
+      />
+    </StrictMode>,
+  );
+};
 
 const deferredUser: ChatMessage = {
   id: "deferred-user-probe",
