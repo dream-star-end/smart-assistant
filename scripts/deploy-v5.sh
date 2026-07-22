@@ -34,6 +34,7 @@
 #   scripts/deploy-v5.sh --activate-staged --cutover-nonce=NONCE
 #   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart(收尾追加一次非阻断 real-turn canary)
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
+#   scripts/deploy-v5.sh --install-monitor # 原子安装独立于 A/B slot 的 host monitor bundle
 #   scripts/deploy-v5.sh --reclaim-mutation-lease
 #                                  # 回收陈旧的 kl-mirror production-mutation lease:读远端 fencing meta →
 #                                  # kill -0 校验 holder → 仅当陈旧(holder 不存在 / 超 TTL)才清锁,否则拒绝并打印持有者。
@@ -100,6 +101,8 @@ CUTOVER_ROOT="/var/lib/openclaude-v5/cutovers"
 CUTOVER_LOCK="/var/lib/openclaude-v5/cutover.lock"
 MAINTENANCE_MARKER="/run/openclaude-v5/planned-maintenance.json"
 MAINTENANCE_LOCK="/run/openclaude-v5/planned-maintenance.lock"
+V5_MONITOR_ROOT="/opt/openclaude/v5-monitor"
+V5_MONITOR_STATE="/var/lib/openclaude-v5/monitor-state.json"
 # kl-mirror production-mutation lease(RFC-v5-selfheal-batch1b §1.2)。独立于 planned-maintenance
 # marker 的一把远端 flock:每个写 lane 在进入任何 lane 逻辑前统一取得,持有到收尾。自愈
 # host-action wrapper 用 flock -n 竞同一把锁,拿不到即让路(exit 66)——消除 marker 的
@@ -241,6 +244,7 @@ for arg in "$@"; do
       ;;
     --census-ccb-baseline) MODE="baseline-census" ;;
     --remount-ccb-baseline) MODE="baseline-remount" ;;
+    --install-monitor) MODE="install-monitor" ;;
     --dist) MODE="dist" ;;
     --prepare-offline-cutover) MODE="prepare-offline-cutover" ;;
     --offline-recycle) MODE="offline-recycle" ;;
@@ -370,6 +374,68 @@ install_v5_slot_units() {
       systemctl start '$V5_BASELINE_PORT_GUARD_SOCKET'
     fi" || return 1
   assert_v5_baseline_port_guard
+}
+
+# 高频 monitor 是 host ops surface，不属于 A/B master release。固定版本目录 + current
+# 指针让 active slot 切换/回滚都不会把 timer 带回旧脚本；安装仍只走本脚本的部署锁、
+# production-mutation lease 与 mutation supervisor。
+install_v5_host_monitor() {
+  echo "══ v5 host monitor bundle 原子安装(A/B 独立)══"
+  local local_stage remote_stage monitor_sha rc=0
+  local_stage="$(mktemp -d "${TMPDIR:-/tmp}/oc-v5-monitor-stage.XXXXXX")" || return 1
+  for file in scripts/v5-monitor.sh scripts/v5-alert-fail.sh scripts/v5-alert-fanout.sql \
+    scripts/v5-monitor-host-install-remote.sh \
+    deploy/v5/openclaude-v5-monitor.service deploy/v5/openclaude-v5-monitor.timer \
+    deploy/v5/openclaude-v5-alert-fail@.service; do
+    [[ -f "$REPO_ROOT/$file" ]] || {
+      echo "✗ monitor bundle 缺文件:$file" >&2
+      rm -rf -- "$local_stage"
+      return 1
+    }
+    cp -a -- "$REPO_ROOT/$file" "$local_stage/$(basename "$file")"
+  done
+  chmod 0755 "$local_stage/v5-monitor.sh" "$local_stage/v5-alert-fail.sh" \
+    "$local_stage/v5-monitor-host-install-remote.sh"
+  chmod 0644 "$local_stage/v5-alert-fanout.sql" "$local_stage"/*.service "$local_stage"/*.timer
+  (
+    cd "$local_stage"
+    sha256sum v5-monitor.sh v5-alert-fail.sh v5-alert-fanout.sql \
+      v5-monitor-host-install-remote.sh \
+      openclaude-v5-monitor.service openclaude-v5-monitor.timer \
+      openclaude-v5-alert-fail@.service > SHA256SUMS
+  )
+  monitor_sha="$(sha256sum "$local_stage/SHA256SUMS" | awk '{print $1}')"
+  remote_stage="/var/lib/openclaude-v5/.monitor-stage-${monitor_sha}-$$"
+
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] ship monitor-$monitor_sha → $KL_HOST:$V5_MONITOR_ROOT/releases/monitor-$monitor_sha"
+    echo "  [dry-run] stop+drain timer/monitor/alert-fail → exact pool-state migration → atomically install current+units → live oneshot → restore timer"
+    rm -rf -- "$local_stage"
+    return 0
+  fi
+
+  if ! ssh "$KL_HOST" "rm -rf -- '$remote_stage' && install -d -m 0700 '$remote_stage'" \
+      || ! rsync -az --chmod=F600,D700 "$local_stage/" "$KL_HOST:$remote_stage/"; then
+    echo "✗ monitor bundle staging 上传失败" >&2
+    ssh "$KL_HOST" "rm -rf -- '$remote_stage'" >/dev/null 2>&1 || true
+    rm -rf -- "$local_stage"
+    return 1
+  fi
+  rm -rf -- "$local_stage"
+
+  if ssh "$KL_HOST" bash "$remote_stage/v5-monitor-host-install-remote.sh" \
+      "$remote_stage" "$V5_MONITOR_ROOT" "$monitor_sha" "$V5_MONITOR_STATE"; then
+    rc=0
+  else
+    rc=$?
+    echo "✗ host monitor 原子安装失败" >&2
+  fi
+  if [[ "$rc" == 86 ]]; then
+    echo "FATAL:monitor 安装回滚未完整收敛；保留远端 stage=$remote_stage 与 mutation in-flight marker 供 --recover 裁决" >&2
+  else
+    ssh "$KL_HOST" "rm -rf -- '$remote_stage'" >/dev/null 2>&1 || true
+  fi
+  return "$rc"
 }
 
 strip_shared_baseline_env_keys() {
@@ -8032,6 +8098,7 @@ run_selected_mode() { # [mode]
     knowledge-planet-verify) knowledge_planet_plugin_verify_user ;;
     baseline-census) run_ccb_baseline_remount census ;;
     baseline-remount) run_ccb_baseline_remount remount ;;
+    install-monitor) install_v5_host_monitor ;;
     deploy)    deploy ;;
     dist)      deploy_dist ;;
     model-authority-preflight) model_authority_preflight ;;
