@@ -254,6 +254,11 @@ describe('admin session route parsing', () => {
       parseAdminSessionRoute(new URL(`https://x/api/admin/sessions/web-1/tape/${TAPE_ID}/records`)),
       { sessionId: 'web-1', kind: 'tape-records', tapeId: TAPE_ID },
     )
+    const sourceTapeId = 'a'.repeat(64)
+    assert.deepEqual(
+      parseAdminSessionRoute(new URL(`https://x/api/admin/sessions/web-1/tape/${sourceTapeId}/recovery`)),
+      { sessionId: 'web-1', kind: 'tape-recovery', tapeId: sourceTapeId },
+    )
     assert.deepEqual(
       parseAdminSessionRoute(new URL(`https://x/api/admin/sessions/web-1/tape/${TAPE_ID}/records/3/payload`)),
       { sessionId: 'web-1', kind: 'tape-payload', tapeId: TAPE_ID, recordOrdinal: 3 },

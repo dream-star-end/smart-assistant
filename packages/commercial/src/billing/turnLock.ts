@@ -33,3 +33,19 @@ export async function lockTurnBillingKeys(
   }
   return keys
 }
+
+/** Serialize lossless tape publication for one or more logical turns. */
+export async function lockTurnPersistenceKeys(
+  client: PoolClient,
+  userKey: string,
+  turnKeys: ReadonlyArray<string | null | undefined>,
+): Promise<string[]> {
+  const keys = [...new Set(turnKeys.filter((v): v is string => typeof v === 'string'))].sort()
+  for (const turnKey of keys) {
+    assertCanonicalTurnKey(turnKey)
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+      `oc_sarm:${userKey}:turn:${turnKey}`,
+    ])
+  }
+  return keys
+}

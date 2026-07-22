@@ -108,7 +108,11 @@ import {
 } from "../http/losslessTurnTape.js";
 import { bumpGoalUsageSnapshotForTape } from "../goal/goalStateService.js";
 import { ensurePendingTurnWaiverInTransaction } from "../billing/refund.js";
-import { lockTurnBillingKeys, numericCommercialUserId } from "../billing/turnLock.js";
+import {
+  lockTurnBillingKeys,
+  lockTurnPersistenceKeys,
+  numericCommercialUserId,
+} from "../billing/turnLock.js";
 import {
   admitDispatch,
   type AdmitDispatchResult,
@@ -771,6 +775,10 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
   ["client_session_user_payloads", "model_token_estimate", "integer"],
   ["server_authored_turn_anchor_map", "turn_key", "text"],
   ["turn_tape_cost_components", "request_id", "text"],
+  ["turn_tape_recovery_links", "source_tape_id", "text"],
+  ["turn_tape_recovery_links", "recovery_tape_id", "text"],
+  ["turn_tape_recovery_links", "source_turn_key", "text"],
+  ["turn_tape_recovery_links", "recovery_turn_key", "text"],
   ["session_goals", "session_id", "text"],
   ["session_goals", "goal_id", "uuid"],
   ["session_goals", "state_revision", "bigint"],
@@ -1127,6 +1135,11 @@ type ExactUsageEnrichment = {
   delegates: Array<{ agentId: string; costCredits: string }>;
 };
 
+type RecoverySourceUsage = {
+  costCredits: string;
+  delegates: Array<{ agentId: string; costCredits: string }>;
+};
+
 function parseDelegateCosts(value: unknown): Array<{ agentId: string; costCredits: string }> {
   return Array.isArray(value)
     ? value.flatMap((item) => {
@@ -1138,6 +1151,54 @@ function parseDelegateCosts(value: unknown): Array<{ agentId: string; costCredit
           : [];
       })
     : [];
+}
+
+async function readRecoverySourceUsage(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  tapeId: string,
+  billingAnchorId: string,
+): Promise<RecoverySourceUsage> {
+  const row = (
+    await client.query<{ cost_credits: string; delegates: unknown }>(
+      `WITH components AS (
+         SELECT cost_credits::numeric AS cost_credits,delegate_agent_id
+           FROM turn_tape_cost_components
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND billing_anchor_id=$4
+       ), grouped AS (
+         SELECT delegate_agent_id,SUM(cost_credits)::text AS cost_credits
+           FROM components WHERE delegate_agent_id IS NOT NULL
+          GROUP BY delegate_agent_id
+       )
+       SELECT COALESCE((SELECT SUM(cost_credits)::text FROM components),'0') AS cost_credits,
+              COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                                'agentId',delegate_agent_id,'costCredits',cost_credits)
+                                ORDER BY delegate_agent_id) FROM grouped),'[]'::jsonb) AS delegates`,
+      [sessionId, userId, tapeId, billingAnchorId],
+    )
+  ).rows[0];
+  return {
+    costCredits: row?.cost_credits ?? "0",
+    delegates: parseDelegateCosts(row?.delegates),
+  };
+}
+
+function assertRecoveryUsageFallback(
+  usage: Record<string, unknown> | undefined,
+  source: RecoverySourceUsage,
+): void {
+  if (!usage || usage.costCredits !== source.costCredits || !Array.isArray(usage.delegates)) {
+    throw new Error("turn tape recovery usage fallback does not match source costs");
+  }
+  const delegates = parseDelegateCosts(usage.delegates);
+  if (
+    delegates.length !== usage.delegates.length ||
+    JSON.stringify([...delegates].sort((a, b) => a.agentId.localeCompare(b.agentId))) !==
+      JSON.stringify(source.delegates)
+  ) {
+    throw new Error("turn tape recovery delegate fallback does not match source costs");
+  }
 }
 
 /** 把可变计费叠加并入行 usage。与今日 hydrateTapeRecord 内联合并逐字节等价:key 顺序
@@ -1603,6 +1664,53 @@ type LosslessTurnTapeHeaderRow = {
   waive_reason: string | null;
   finalized_at: string | null;
 };
+
+type TurnTapeRecoveryLinkRow = {
+  source_tape_id: string;
+  recovery_tape_id: string;
+  source_tape_sha256: string;
+  recovery_tape_sha256: string;
+  source_turn_key: string;
+  recovery_turn_key: string;
+};
+
+class TurnTapeRecoveryLockUpgrade extends Error {
+  constructor(readonly link: TurnTapeRecoveryLinkRow) {
+    super("turn tape recovery requires dual turn locks");
+    this.name = "TurnTapeRecoveryLockUpgrade";
+  }
+}
+
+function sameTurnTapeRecoveryLink(
+  left: TurnTapeRecoveryLinkRow,
+  right: TurnTapeRecoveryLinkRow,
+): boolean {
+  return left.source_tape_id === right.source_tape_id &&
+    left.recovery_tape_id === right.recovery_tape_id &&
+    left.source_tape_sha256 === right.source_tape_sha256 &&
+    left.recovery_tape_sha256 === right.recovery_tape_sha256 &&
+    left.source_turn_key === right.source_turn_key &&
+    left.recovery_turn_key === right.recovery_turn_key;
+}
+
+async function readTurnTapeRecoveryLink(
+  runner: Pool | PoolClient,
+  sessionId: string,
+  userId: string,
+  recoveryTapeId: string,
+  forUpdate = false,
+): Promise<TurnTapeRecoveryLinkRow | null> {
+  return (
+    await runner.query<TurnTapeRecoveryLinkRow>(
+      `SELECT source_tape_id,recovery_tape_id,source_tape_sha256,recovery_tape_sha256,
+              source_turn_key,recovery_turn_key
+         FROM turn_tape_recovery_links
+        WHERE session_id=$1 AND user_id=$2 AND recovery_tape_id=$3
+        ${forUpdate ? "FOR UPDATE" : ""}`,
+      [sessionId, userId, recoveryTapeId],
+    )
+  ).rows[0] ?? null;
+}
 
 type PreparedModelSidecar = {
   physicalOrdinal: number;
@@ -2592,10 +2700,18 @@ async function readHydratedTapeRows(
               COALESCE((
                 SELECT SUM(exact_cost.cost_credits)::text
                   FROM (
-                    SELECT c.cost_credits::numeric AS cost_credits
-                      FROM turn_tape_cost_components c
-                     WHERE c.user_id=r.user_id AND c.session_id=r.session_id
-                       AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                        SELECT c.cost_credits::numeric AS cost_credits
+                          FROM turn_tape_cost_components c
+                         WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                           AND (
+                             (recovery.source_tape_id IS NULL
+                               AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id)
+                             OR
+                             (recovery.source_tape_id IS NOT NULL
+                               AND r.msg_id=t.billing_anchor_id
+                               AND c.tape_id=recovery.source_tape_id
+                               AND c.billing_anchor_id=source_tape.billing_anchor_id)
+                           )
                     UNION ALL
                     SELECT p.cost_credits::numeric AS cost_credits
                       FROM pending_usage_patches p
@@ -2618,7 +2734,15 @@ async function readHydratedTapeRows(
                         SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
                           FROM turn_tape_cost_components c
                          WHERE c.user_id=r.user_id AND c.session_id=r.session_id
-                           AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                           AND (
+                             (recovery.source_tape_id IS NULL
+                               AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id)
+                             OR
+                             (recovery.source_tape_id IS NOT NULL
+                               AND r.msg_id=t.billing_anchor_id
+                               AND c.tape_id=recovery.source_tape_id
+                               AND c.billing_anchor_id=source_tape.billing_anchor_id)
+                           )
                         UNION ALL
                         SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
                           FROM pending_usage_patches p
@@ -2633,6 +2757,12 @@ async function readHydratedTapeRows(
          FROM client_session_turn_tape_records r
          JOIN client_session_turn_tapes t
            ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+         LEFT JOIN turn_tape_recovery_links recovery
+           ON recovery.session_id=r.session_id AND recovery.user_id=r.user_id
+          AND recovery.recovery_tape_id=r.tape_id
+         LEFT JOIN client_session_turn_tapes source_tape
+           ON source_tape.session_id=recovery.session_id AND source_tape.user_id=recovery.user_id
+          AND source_tape.tape_id=recovery.source_tape_id
         WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
           ${roleClause}
           ${recordClause}
@@ -2667,10 +2797,18 @@ async function readDirectTapeVisibleHeads(
               COALESCE((
                 SELECT SUM(exact_cost.cost_credits)::text
                   FROM (
-                    SELECT c.cost_credits::numeric AS cost_credits
-                      FROM turn_tape_cost_components c
-                     WHERE c.user_id=r.user_id AND c.session_id=r.session_id
-                       AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                        SELECT c.cost_credits::numeric AS cost_credits
+                          FROM turn_tape_cost_components c
+                         WHERE c.user_id=r.user_id AND c.session_id=r.session_id
+                           AND (
+                             (recovery.source_tape_id IS NULL
+                               AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id)
+                             OR
+                             (recovery.source_tape_id IS NOT NULL
+                               AND r.msg_id=t.billing_anchor_id
+                               AND c.tape_id=recovery.source_tape_id
+                               AND c.billing_anchor_id=source_tape.billing_anchor_id)
+                           )
                     UNION ALL
                     SELECT p.cost_credits::numeric AS cost_credits
                       FROM pending_usage_patches p
@@ -2692,7 +2830,15 @@ async function readDirectTapeVisibleHeads(
                         SELECT c.delegate_agent_id, c.cost_credits::numeric AS cost_credits
                           FROM turn_tape_cost_components c
                          WHERE c.user_id=r.user_id AND c.session_id=r.session_id
-                           AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id
+                           AND (
+                             (recovery.source_tape_id IS NULL
+                               AND c.tape_id=r.tape_id AND c.billing_anchor_id=r.msg_id)
+                             OR
+                             (recovery.source_tape_id IS NOT NULL
+                               AND r.msg_id=t.billing_anchor_id
+                               AND c.tape_id=recovery.source_tape_id
+                               AND c.billing_anchor_id=source_tape.billing_anchor_id)
+                           )
                         UNION ALL
                         SELECT p.delegate_agent_id, p.cost_credits::numeric AS cost_credits
                           FROM pending_usage_patches p
@@ -2706,6 +2852,12 @@ async function readDirectTapeVisibleHeads(
          FROM client_session_turn_tape_records r
          JOIN client_session_turn_tapes t
            ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+         LEFT JOIN turn_tape_recovery_links recovery
+           ON recovery.session_id=r.session_id AND recovery.user_id=r.user_id
+          AND recovery.recovery_tape_id=r.tape_id
+         LEFT JOIN client_session_turn_tapes source_tape
+           ON source_tape.session_id=recovery.session_id AND source_tape.user_id=recovery.user_id
+          AND source_tape.tape_id=recovery.source_tape_id
         WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=ANY($3::text[])
           AND r.msg_id=t.billing_anchor_id
         ORDER BY r.tape_id, r.ordinal`,
@@ -5680,14 +5832,27 @@ export function createPgSessionsBackend(
         }
       }
       let result: LosslessTurnTapeFinalizeResult;
+      let recoveryLockHint = await readTurnTapeRecoveryLink(
+        pool,
+        request.sessionId,
+        userId,
+        request.tapeId,
+      );
       try {
-        result = await withTx(pool, async (client): Promise<LosslessTurnTapeFinalizeResult> => {
-        // Serializes "cost parks while tape finalizes" on the logical turn.
-        await requestAdvisoryXactLock(client, userId, `turn:${request.turnKey}`);
+        for (let lockAttempt = 0; ; lockAttempt++) {
+          try {
+            result = await withTx(pool, async (client): Promise<LosslessTurnTapeFinalizeResult> => {
+        // Recovery publication must serialize both immutable logical turns in
+        // the same lexical order as authorization and billing settlement.
+        await lockTurnPersistenceKeys(client, userId, recoveryLockHint
+          ? [request.turnKey, recoveryLockHint.source_turn_key]
+          : [request.turnKey]);
         // Shared with rolling lease renewal and every settlement/refund path:
         // once a terminal anchor commits, no renewal can race past its check.
         if (billingUserId !== null) {
-          await lockTurnBillingKeys(client, billingUserId, [request.turnKey]);
+          await lockTurnBillingKeys(client, billingUserId, recoveryLockHint
+            ? [request.turnKey, recoveryLockHint.source_turn_key]
+            : [request.turnKey]);
         }
         const session = (
           await client.query<SessionWriteRow>(
@@ -5699,8 +5864,29 @@ export function createPgSessionsBackend(
         if (!session) return { applied: "session_not_found" };
         if (session.deleted_at !== null) return { applied: "session_deleted" };
 
-        const tape = (
+        const recoveryLink = await readTurnTapeRecoveryLink(
+          client,
+          request.sessionId,
+          userId,
+          request.tapeId,
+          true,
+        );
+        if (!recoveryLockHint && recoveryLink) {
+          throw new TurnTapeRecoveryLockUpgrade(recoveryLink);
+        }
+        if (recoveryLockHint && (!recoveryLink || !sameTurnTapeRecoveryLink(recoveryLockHint, recoveryLink))) {
+          throw new Error("turn tape recovery authorization changed during finalize");
+        }
+        if (recoveryLink && (
+          recoveryLink.recovery_turn_key !== request.turnKey ||
+          recoveryLink.recovery_tape_sha256 !== request.tapeSha256
+        )) {
+          throw new Error("turn tape recovery request identity conflict");
+        }
+
+        const tapeRows = (
           await client.query<{
+            tape_id: string;
             agent_id: string;
             turn_index: number;
             status: string;
@@ -5712,21 +5898,71 @@ export function createPgSessionsBackend(
             waive_reason: string | null;
             finalized_at: string | null;
             engine_billings: unknown;
+            billing_anchor_id: string | null;
             dispatch_id: string | null;
             attempt_no: number | null;
+            client_message_id: string | null;
           }>(
-            `SELECT agent_id, turn_index, status, turn_key, tape_sha256,
+            `SELECT tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
                     total_bytes, part_count, created_at, waive_reason, finalized_at, engine_billings,
-                    dispatch_id, attempt_no
+                    billing_anchor_id,dispatch_id,attempt_no,client_message_id
                FROM client_session_turn_tapes
-              WHERE session_id = $1 AND user_id = $2 AND tape_id = $3
-              FOR UPDATE`,
-            [request.sessionId, userId, request.tapeId],
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
+              ORDER BY tape_id FOR UPDATE`,
+            [
+              request.sessionId,
+              userId,
+              recoveryLink ? [request.tapeId, recoveryLink.source_tape_id] : [request.tapeId],
+            ],
           )
-        ).rows[0];
+        ).rows;
+        const tapeById = new Map(tapeRows.map((row) => [row.tape_id, row]));
+        const tape = tapeById.get(request.tapeId);
         if (!tape) return { applied: "incomplete" };
         if (!sameLosslessTurnTapeHeader(tape, request)) {
           throw new Error("lossless turn tape finalize header conflict");
+        }
+        const recoverySourceTape = recoveryLink
+          ? tapeById.get(recoveryLink.source_tape_id)
+          : undefined;
+        if (recoveryLink && (
+          !recoverySourceTape ||
+          recoverySourceTape.finalized_at === null ||
+          recoverySourceTape.status !== "crashed" ||
+          tape.status !== "completed" ||
+          recoverySourceTape.tape_sha256 !== recoveryLink.source_tape_sha256 ||
+          recoverySourceTape.turn_key !== recoveryLink.source_turn_key ||
+          recoverySourceTape.billing_anchor_id === null ||
+          recoverySourceTape.dispatch_id === null ||
+          recoverySourceTape.agent_id !== tape.agent_id ||
+          recoverySourceTape.turn_index !== tape.turn_index ||
+          recoverySourceTape.created_at !== tape.created_at
+        )) {
+          throw new Error("turn tape recovery source identity conflict");
+        }
+        if (recoveryLink) {
+          const sourceDispatch = await client.query(
+            `SELECT 1 FROM turn_dispatches
+              WHERE dispatch_id=$1 AND user_id=$2 AND session_id=$3 AND agent_id=$4
+                AND status='terminal' AND outcome='crashed'
+              LIMIT 1 FOR UPDATE`,
+            [
+              recoverySourceTape!.dispatch_id,
+              numericCommercialUserId(userId),
+              request.sessionId,
+              recoverySourceTape!.agent_id,
+            ],
+          );
+          if ((sourceDispatch.rowCount ?? 0) !== 1) {
+            throw new Error("turn tape recovery source dispatch is no longer an authoritative crash");
+          }
+        }
+        if (recoveryLink && (
+          request.waiveReason !== undefined || request.dispatchId !== undefined ||
+          request.attemptNo !== undefined || tape.waive_reason !== null ||
+          tape.dispatch_id !== null || tape.attempt_no !== null
+        )) {
+          throw new Error("turn tape recovery header is not content-only");
         }
         if (tape.finalized_at !== null) {
           // Rolling-upgrade/ACK-loss replay: the terminal anchor may already
@@ -5879,6 +6115,50 @@ export function createPgSessionsBackend(
         }
         const modelRecordCount = preparedModelRecordCount;
 
+        let existingMessages: MessageLike[];
+        try {
+          const parsed = JSON.parse(session.messages);
+          if (!Array.isArray(parsed)) throw new Error("not array");
+          existingMessages = parsed as MessageLike[];
+        } catch {
+          throw new Error("lossless turn tape target session row malformed");
+        }
+
+        if (recoveryLink) {
+          if (
+            request.waiveReason !== undefined || request.dispatchId !== undefined ||
+            request.attemptNo !== undefined || tape.waive_reason !== null ||
+            tape.dispatch_id !== null || tape.attempt_no !== null ||
+            tape.client_message_id !== null || turn.payload.waiveReason !== undefined ||
+            turn.payload.clientMessageId !== undefined || turn.payload.requestId !== undefined ||
+            turn.payload.goalId !== undefined || turn.payload.goalStateRevision !== undefined ||
+            turn.engineBillings.length !== 0
+          ) {
+            throw new Error("turn tape recovery payload is not content-only");
+          }
+          const source = recoverySourceTape!;
+          if (turn.billingAnchorId !== source.billing_anchor_id) {
+            throw new Error("turn tape recovery billing anchor does not match source");
+          }
+          const sourceAnchors = existingMessages.filter(
+            (message) => message?._turnTapeId === recoveryLink.source_tape_id,
+          );
+          if (
+            sourceAnchors.length !== 1 || sourceAnchors[0]?._turnTapeComplete !== true ||
+            sourceAnchors[0]?.id !== source.billing_anchor_id
+          ) {
+            throw new Error("turn tape recovery source no longer owns one complete hot anchor");
+          }
+          const sourceUsage = await readRecoverySourceUsage(
+            client,
+            request.sessionId,
+            userId,
+            recoveryLink.source_tape_id,
+            source.billing_anchor_id!,
+          );
+          assertRecoveryUsageFallback(turn.payload.usage, sourceUsage);
+        }
+
         // The marker and terminal materialization commit (or roll back)
         // together. Settlement uses the same advisory key, so after this
         // transaction becomes visible it cannot create a new debit.
@@ -5921,6 +6201,9 @@ export function createPgSessionsBackend(
             ],
           )
         ).rows;
+        if (recoveryLink && pending.length > 0) {
+          throw new Error("turn tape recovery has pending financial rows");
+        }
         for (const cost of pending) {
           const inserted = await client.query(
             `INSERT INTO turn_tape_cost_components
@@ -5985,14 +6268,6 @@ export function createPgSessionsBackend(
         // line and are merged during hydration. Segment/tool count therefore
         // cannot recreate the hot-row byte cap.
 
-        let existingMessages: MessageLike[];
-        try {
-          const parsed = JSON.parse(session.messages);
-          if (!Array.isArray(parsed)) throw new Error("not array");
-          existingMessages = parsed as MessageLike[];
-        } catch {
-          throw new Error("lossless turn tape target session row malformed");
-        }
         const allRecordIds = [...new Set([
           ...turn.logicalRecordIds,
           ...turn.records.map((item) => item.id),
@@ -6180,7 +6455,16 @@ export function createPgSessionsBackend(
           engineBillings: turn.engineBillings.map((billing) => structuredClone(billing)),
           ...(dispatchLate ? { dispatchLateTape: true } : {}),
         };
-        });
+            });
+            break;
+          } catch (error) {
+            if (error instanceof TurnTapeRecoveryLockUpgrade && lockAttempt === 0) {
+              recoveryLockHint = error.link;
+              continue;
+            }
+            throw error;
+          }
+        }
       } finally {
         releaseFinalizeAdmission?.();
       }
@@ -6219,6 +6503,7 @@ export function createPgSessionsBackend(
               "client_session_user_payloads",
               "server_authored_turn_anchor_map",
               "turn_tape_cost_components",
+              "turn_tape_recovery_links",
               "session_goals",
               "wechat_bindings",
             ],
@@ -7533,6 +7818,7 @@ export function createPgSessionsBackend(
         // 指向该会话的 delegate pending(防永不 drain 的孤儿)。
         await client.query("DELETE FROM client_session_archive_chunks WHERE session_id = $1", [id]);
         await client.query("DELETE FROM client_session_archived_ids WHERE session_id = $1", [id]);
+        await client.query("DELETE FROM turn_tape_recovery_links WHERE session_id = $1", [id]);
         await client.query("DELETE FROM client_session_turn_tapes WHERE session_id = $1", [id]);
         await client.query("DELETE FROM pending_usage_patches WHERE parent_session_id = $1", [id]);
         // Keep dispatch evidence so the reconciler can close any execution that

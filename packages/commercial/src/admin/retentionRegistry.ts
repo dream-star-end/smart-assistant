@@ -80,6 +80,7 @@ export const DURABLE_TABLES: readonly string[] = [
   "client_session_turn_tape_model_records",
   "client_session_turn_tape_records",
   "client_session_turn_tapes",
+  "turn_tape_recovery_links",
   "client_session_user_payloads",
   "client_sessions",
   "codex_route_contexts",
