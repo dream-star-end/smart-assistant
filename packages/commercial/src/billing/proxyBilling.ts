@@ -53,6 +53,10 @@ import {
   loadSettledUsageAttribution,
   stageUsageCostLocatorInBillingTransaction,
 } from "../db/pgSessionsBackend.js";
+import {
+  verifySponsorshipForSettlement,
+  type VerificationSponsorshipSnapshot,
+} from "./verificationSponsorship.js";
 
 export { loadUsageAttributionCredits } from "../db/pgSessionsBackend.js";
 
@@ -143,6 +147,8 @@ export interface FinalizeContext {
    */
   dispatchId?: string | null;
   attemptNo?: number | null;
+  /** Release-bound test sponsorship admitted before provider work. */
+  verificationSponsorship?: VerificationSponsorshipSnapshot | null;
 }
 
 export interface FinalizeOutcome {
@@ -481,6 +487,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         authority: ctx.authority ?? null,
         dispatchId: ctx.dispatchId ?? null,
         attemptNo: ctx.attemptNo ?? null,
+        verificationSponsorship: ctx.verificationSponsorship ?? null,
       });
     } catch (err) {
       ctx.log.error("proxy_finalize_settle_db_failed", {
@@ -733,6 +740,7 @@ export async function settleUsageAndLedger(
      */
     dispatchId?: string | null;
     attemptNo?: number | null;
+    verificationSponsorship?: VerificationSponsorshipSnapshot | null;
   },
 ): Promise<SettleResult> {
   const client = await pool.connect();
@@ -756,14 +764,25 @@ export async function settleUsageAndLedger(
       );
       turnWaived = (waived.rowCount ?? 0) > 0;
     }
-    const settledCostCredits = turnWaived ? 0n : args.costCredits;
+    const verificationSponsored = await verifySponsorshipForSettlement(
+      client,
+      args.verificationSponsorship,
+    );
+    const settledCostCredits = turnWaived || verificationSponsored ? 0n : args.costCredits;
     const settledSnapshotJson = turnWaived
       ? JSON.stringify({
           ...(JSON.parse(args.snapshotJson) as Record<string, unknown>),
           waived: "turn_auto_waive",
           wouldHaveCharged: args.costCredits.toString(),
         })
-      : args.snapshotJson;
+      : verificationSponsored
+        ? JSON.stringify({
+            ...(JSON.parse(args.snapshotJson) as Record<string, unknown>),
+            waived: "verification_sponsorship",
+            verificationRunId: args.verificationSponsorship!.runId,
+            wouldHaveCharged: args.costCredits.toString(),
+          })
+        : args.snapshotJson;
     // org 归属解析(0112 企业版):tx 内、锁前一次索引点查。成员在某 active org 语境 →
     // 打戳 usage_records.org_id(**与扣费桶解耦**:只看成员是否在 org,无论钱从哪个桶扣);
     // billing_enabled=true 才让 org 钱包参与扣费(下面 spendTwoBucket 传 orgId)。
@@ -781,9 +800,10 @@ export async function settleUsageAndLedger(
            price_snapshot, cost_credits, session_id, parent_session_id,
            delegate_agent_id, request_id, status, org_id,
            execution_revision, projection_revision, security_epoch, authority_kind,
-           turn_key, parent_turn_key, dispatch_id, attempt_no)
+           turn_key, parent_turn_key, dispatch_id, attempt_no,
+           verification_run_id, would_have_cost_credits)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22, $23, $24)
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
@@ -814,6 +834,8 @@ export async function settleUsageAndLedger(
           // 0170 durable-turn dispatch 身份(双引擎收敛的唯一 usage_records 写入点)。
           args.dispatchId ?? null,
           args.attemptNo ?? null,
+          verificationSponsored ? args.verificationSponsorship!.runId : null,
+          verificationSponsored ? args.costCredits.toString() : null,
         ],
       );
       usageId = BigInt(ins.rows[0]!.id);

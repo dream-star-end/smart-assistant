@@ -5,9 +5,9 @@
 //   OC_E2E_BASE_URL       目标环境 HTTP 根(如 http://127.0.0.1:18790,run.sh 建隧道后注入)
 //   OC_E2E_PASSWORD       canary/预发专用账号密码(单一权威在 kl-mirror,run.sh 经 ssh 读)
 // 选填:
-//   OC_E2E_EMAIL          默认 v5-canary@claudeai.chat
+//   OC_E2E_EMAIL          固定 v5-evals@claudeai.chat(run.sh 拒绝其它身份)
 //   OC_E2E_TURNSTILE      默认 "bypass"(bypass 环境占位串;AuthGate BYPASS_TOKEN 同值)
-//   OC_E2E_MODEL          默认 gpt-5.6-sol(codex 引擎,与部署 smoke 同盲区面)
+//   OC_E2E_MATRIX_MODEL   runner 内部变量；只允许固定的 Luna / DeepSeek V4 Flash
 //   OC_E2E_TURN_TIMEOUT   单轮回复上限 ms,默认 120000
 //   OC_E2E_PG_URL         direct-timeline 注入/种子用 PG 连接串(仅预发;缺省 → 依赖用例 skip)
 //   OC_E2E_SESSION_PREFIX 种子会话 id 前缀,默认 e2e-(便于批量清理)
@@ -34,23 +34,36 @@ export interface E2EConfig {
   sessionPrefix: string;
 }
 
+const FIXED_MODELS = new Set(['gpt-5.6-luna', 'deepseek-v4-flash']);
+
 let cached: E2EConfig | null = null;
 
 export function config(): E2EConfig {
   if (cached) return cached;
+  if (process.env.OC_E2E_MODEL) {
+    throw new Error('[e2e/env] OC_E2E_MODEL 已废止；验证矩阵固定为 gpt-5.6-luna + deepseek-v4-flash');
+  }
   const baseUrl = required('OC_E2E_BASE_URL').replace(/\/+$/, '');
+  const model = required('OC_E2E_MATRIX_MODEL');
+  if (!FIXED_MODELS.has(model)) {
+    throw new Error(`[e2e/env] 非法矩阵模型 ${model}；只允许 gpt-5.6-luna / deepseek-v4-flash`);
+  }
   cached = {
     baseUrl,
     wsBase: baseUrl.replace(/^http/, 'ws'),
-    email: process.env.OC_E2E_EMAIL?.trim() || 'v5-canary@claudeai.chat',
+    email: process.env.OC_E2E_EMAIL?.trim() || 'v5-evals@claudeai.chat',
     password: required('OC_E2E_PASSWORD'),
     turnstile: process.env.OC_E2E_TURNSTILE?.trim() || 'bypass',
-    model: process.env.OC_E2E_MODEL?.trim() || 'gpt-5.6-sol',
+    model,
     turnTimeoutMs: Number(process.env.OC_E2E_TURN_TIMEOUT ?? 120_000),
     pgUrl: process.env.OC_E2E_PG_URL?.trim() || null,
     sessionPrefix: process.env.OC_E2E_SESSION_PREFIX?.trim() || 'e2e-',
   };
   return cached;
+}
+
+export function directTimelineRequired(): boolean {
+  return process.env.OC_E2E_REQUIRE_DIRECT_TIMELINE === '1';
 }
 
 /** 生成一个带 e2e- 前缀、满足 [A-Za-z0-9_-]{8,50} 的会话 id(便于清理与追溯)。 */

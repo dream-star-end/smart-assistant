@@ -80,6 +80,7 @@ import {
   SettlementCommitOutcomeUnknownError,
   type SettleResult,
 } from "./proxyBilling.js";
+import type { VerificationSponsorshipSnapshot } from "./verificationSponsorship.js";
 
 /** Journal marker written for Codex turns whose exact final billing evidence
  * is carried by the immutable v2 turn tape. The reconciler excludes these
@@ -152,6 +153,7 @@ export interface CodexFinalizeContext {
    */
   dispatchId?: string | null;
   attemptNo?: number | null;
+  verificationSponsorship?: VerificationSponsorshipSnapshot | null;
   // v5(M1b):不再携带 accountId —— codex 记账 usage_records.account_id 恒写
   // SQL NULL(0044 SET NULL FK 语义,与 deepseek/minimax 静态 provider 同型),
   // 不再用 v3 的 `accountId=0n` 假账号占位。
@@ -323,6 +325,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
             authority: ctx.authority ?? null,
             dispatchId: ctx.dispatchId ?? null,
             attemptNo: ctx.attemptNo ?? null,
+            verificationSponsorship: ctx.verificationSponsorship ?? null,
           });
         } catch (err) {
           if (!(err instanceof SettlementCommitOutcomeUnknownError)) {

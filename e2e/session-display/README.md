@@ -1,120 +1,118 @@
-# 会话展示 e2e 防回归套件（session-display）
+# V5 固定双模型端到端防回归门
 
-针对"会话展示"类回归（静默丢 turn / 重登后大会话白屏 / 终态收敛错位 / 分页死循环 /
-重发双回复）建立的 Playwright e2e 硬门。真浏览器（受信事件）驱动，断言基于**用户可见
-行为**（卡片文案 / 元素状态 / testid），辅以 API 校验；超时一律轮询、无死 sleep。
+本目录是普通 V5 candidate 的发布硬门。它把近期已发生的 P0/P1 问题映射到自动化
+回归，并在候选 slot 上以两个真实底座串行执行完整 Playwright 套件：
 
-行为契约来源：durable dispatch + immutable turn tape 的直接时间线。选择器/契约地图见
-本目录 `SELECTORS.md`（写 spec 的唯一依据）。
+| 底座 | 固定模型 | 身份 |
+|---|---|---|
+| Codex | `gpt-5.6-luna` | `v5-evals@claudeai.chat` |
+| CC/CCB | `deepseek-v4-flash` | `v5-evals@claudeai.chat` |
 
-> 独立依赖域：本套件在 `e2e/session-display/` 自带 `package.json` + `node_modules`，
-> **不动仓库根 node_modules**，不进 root workspaces。浏览器复用机器上的 ms-playwright
-> 缓存（`@playwright/test@1.60` → chromium-1223，已缓存，安装/运行均免下载）。
+模型和身份不可由调用者覆盖。旧变量 `OC_E2E_MODEL` 会直接报错；`run.sh` 内部固定
+`OC_E2E_MATRIX_MODEL`，并设置 `CI=1` 禁止 `.only`。任一模型出现失败、跳过或 flaky，
+runner 立即非零退出，`deploy-v5.sh --canary` 在同一 production-mutation lease 内先执行
+官方 `--abort` 逻辑，再验收 exact stable predecessor、runtime tuple、真实 turn 与 V3 inactive。
 
-## 用例清单
+## 事故与用例权威
 
-| # | spec | 说明 | tag | 依赖 |
-|---|------|------|-----|------|
-| 1 | `01-login-relogin-display` | 登录→建会话→发消息收回复→登出→重登→列表含该会话+打开消息完整（user/assistant 行齐、顺序对） | `@smoke` | 真 turn |
-| 2 | `02-large-session-open` | 大会话打开首屏可交互 < 3s；真实最终答复直出，2 MiB 工具记录惰性展开 | `@smoke` | **迁移 0176**（未部署→skip） |
-| 3 | `03-reconnect-inflight` | 发消息后立即断 WS→恢复→回复到达 **或** 明确失败卡+重试；**绝不永久静默** | — | 真 turn |
-| 4 | `04-terminal-reconcile` | 回复中途刷新页面→终态正确收敛（spinner 不永挂；回复/失败卡二选一） | `@smoke` | 真 turn |
-| 5 | `05-turn-status` | 注入 verified terminal(not_accepted)→状态卡+重试；late-tape manual_reconcile 不显示 | — | **迁移 0176 + DB 注入**（否则 skip） |
-| 6 | `06-archive-paging` | 归档逐页拉取：无重复行 / 空页不谎报 hasMore / 游标严格递减 / 有限步终止 | — | 无（负例亦可自验） |
-| 7 | `07-resend-dedup` | 同 clientMessageId 协议级双发→不出双回复、不双计费（服务端幂等 `web:<cmid>:0`） | — | 真 turn(WS) |
-| 8 | `08-post-final-process-order` | 原始 IDB poison + `?since=2` 空增量→过程卡回到 final 前、写回 IDB、二次 reload 稳定 | — | canary + 浏览器路由拦截 |
+- `incidents.json`：近期 P0/P1 的事故 ID、症状、根修 commit 与回归证据。
+- `scripts/check-v5-incident-regressions.ts`：CI/部署前检查事故 ID 唯一、根修仍在 HEAD 血缘、
+  证据文件存在、每个事故有 browser/live/deploy proof，且每个 live spec 都被事故引用。
+- `SELECTORS.md`：UI 选择器与直接时间线契约。
 
-`@smoke` 子集（1/2/4）供部署门用：`./run.sh --grep @smoke`。用例 2 未部署迁移 0176 时自动 skip，
-不会把 smoke 门判红。
+```bash
+npm run check:v5:incidents
+```
 
-## 环境矩阵
+删除事故、删除 spec、改换模型或把 direct-timeline 依赖改回 skip，都会使门禁失败。
 
-目标环境**全部经 env 注入**，零硬编码账号密码。套件从部署发起机运行，经 ssh 隧道访问
-远端 master（远端无浏览器）。
+## 完整用例
 
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `OC_E2E_BASE_URL` | —（隧道模式自动设） | 直达 HTTP 根；设了就**不建隧道** |
-| `OC_E2E_SSH_HOST` | `kl-hk` | 隧道目标主机（预发） |
-| `OC_E2E_REMOTE_PORT` | `18795` | 远端 app 端口（kl-hk 预发直达 app=18795；生产 kl-mirror=18790） |
-| `OC_E2E_PASSWORD` | — | 账号密码（优先）；或 `OC_E2E_PASSWORD_FILE`（本地文件） |
-| `OC_E2E_PW_HOST` | `kl-mirror` | 密码单一权威主机（经 ssh 读 `/root/.secrets/v5-canary.password`） |
-| `OC_E2E_EMAIL` | `v5-canary@claudeai.chat` | canary/预发专用账号（**绝不用真实用户**） |
-| `OC_E2E_TURNSTILE` | `bypass` | bypass 环境占位串（AuthGate `BYPASS_TOKEN` 同值） |
-| `OC_E2E_MODEL` | `gpt-5.6-sol` | turn 模型；可换更快模型加速 |
-| `OC_E2E_TURN_TIMEOUT` | `120000` | 单轮回复上限 ms |
-| `OC_E2E_TTI_BUDGET_MS` | `3000` | 用例 2 首屏可交互预算 |
-| `OC_E2E_PG_URL` | — | direct-timeline 注入/种子 PG 连接串（**仅预发**）；缺省→用例 2/5 skip-with-reason |
-| `OC_E2E_PG_USER_ID` | `c:<numericUserId>` | 注入时 `client_sessions.user_id` 形态覆盖 |
-| `OC_E2E_RETRIES` | `0` | flake 容忍（部署门建议 1） |
+| # | spec | 核心契约 |
+|---|---|---|
+| 1 | `01-login-relogin-display` | 登录、真 turn、登出重登后消息完整且顺序不变 |
+| 2 | `02-large-session-open` | 大会话首屏可交互、真实答案直出、工具记录惰性展开 |
+| 3 | `03-reconnect-inflight` | 断线恢复后必有完成或明确失败，绝不永久静默 |
+| 4 | `04-terminal-reconcile` | 中途刷新后 spinner 收敛到回复或错误终态 |
+| 5 | `05-turn-status` | verified terminal 状态可见，late-tape manual reconcile 不泄漏 |
+| 6 | `06-archive-paging` | 分页无重复、游标递减、空页/hasMore 诚实、有限步终止 |
+| 7 | `07-resend-dedup` | 同 clientMessageId 双发不双回复、不双计费 |
+| 8 | `08-post-final-process-order` | poisoned IDB + 空增量后过程仍在 final 前且写回稳定 |
+| 9 | `09-fixed-model-billing-evidence` | 精确模型、durable dispatch/tape 终态、验证赞助零扣费与名义成本留证 |
 
-### 目标环境现状（2026-07-18）
+发布门强制 `OC_E2E_REQUIRE_DIRECT_TIMELINE=1`。用例 2/5 所需 PG 注入不可用时不是
+skip，而是整门失败。
 
-- 需要带 DB 注入的用例时，目标环境必须已完成迁移 0176，并显式提供只指向 canary/预发库的
-  `OC_E2E_PG_URL`；没有注入通道时用例 2/5 会明确 skip。
+## 验证赞助不是用户额度
 
-## 运行
+`v5-evals` 的“无限验证额度”由 release-bound sponsorship 实现，不靠伪造巨大余额：
+
+1. deploy 为 exact candidate release、generation、slot、`v5-evals` 和随机 `e2e-*` 会话
+   前缀创建短期 `verification_runs`；
+2. 只有 Luna/DeepSeek 两个固定模型，且 request 的 user/session/release/generation 全部匹配，
+   才在上游工作开始前写不可变 `verification_sponsored_requests`；
+3. 结算事务再次核对该行，`usage_records.cost_credits=0`，同时保留
+   `would_have_cost_credits` 和 `verification_run_id`；
+4. 缺失、过期、串号或篡改证据一律走普通计费。普通 `v5-canary` smoke 仍真实计费。
+
+这使验证可以长期反复运行，同时不会给真实用户、任意模型或任意会话授予免单能力。
+
+## 运行方式
+
+依赖域独立在本目录，浏览器复用主机 ms-playwright 缓存：
 
 ```bash
 cd e2e/session-display
-PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install     # 首次；装进本目录 node_modules
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci
 
-# 默认打 kl-hk 预发（需预发已具备账号/direct-timeline，见上）
+# 官方 candidate 门（默认经 kl-mirror 建 HTTP + PG 隧道并读取 v5-evals 密码）
+OC_E2E_REMOTE_PORT=18795 ./run.sh
+
+# 已有直达 candidate 和 PG 隧道时
+OC_E2E_BASE_URL=http://127.0.0.1:18795 \
+OC_E2E_PG_URL='postgresql://…' \
+OC_E2E_PASSWORD='…' \
 ./run.sh
-
-# 只跑 smoke 子集（部署门）
-./run.sh --grep @smoke
-
-# 打生产 canary 自验
-OC_E2E_SSH_HOST=kl-mirror OC_E2E_REMOTE_PORT=18790 ./run.sh
-
-# 跑单条
-./run.sh 03-reconnect-inflight.spec.ts
-./run.sh 08-post-final-process-order.spec.ts
-
-# 已有直达地址（不建隧道）
-OC_E2E_BASE_URL=http://127.0.0.1:18790 OC_E2E_PASSWORD=… ./run.sh
 ```
 
-`run.sh`：校验依赖 → 建隧道（或直达）→ 读密码 → 隧道就绪轮询 → 串行跑 → 汇总
-PASS/FAIL/SKIP + skip 原因。报告落 `reports/html/index.html`（`npm run report` 打开）、
-`reports/results.json`。
+生产发布不手工调用 runner；`scripts/deploy-v5.sh --canary` 会在 candidate Caddy 验证后
+运行完整矩阵并持久化 `release_verification_evidence`。`--finalize` 缺 exact
+release/generation 证据时先 abort。报告按模型隔离：
 
-## 数据安全与清理
+涉及 egress/计费代码时，canary 使用 `--egress`：脚本只在矩阵执行窗口临时切换到 candidate
+egress，成功后恢复 predecessor；master finalize 成为 stable 后再从 durable transition 激活
+同一份已测试 egress，失败则回退两面。
 
-- 只用注入的 **canary/预发专用账号**，断言全部作用于该账号自己的会话（鉴权分租），
-  `setOffline`/`reload` 只影响本浏览器页，对服务端与他人零影响。
-- 种子会话一律 `e2e-` 前缀（`OC_E2E_SESSION_PREFIX` 可改），每条用例注册 `track()`
-  → 结束自动 `DELETE`；direct-timeline 注入额外 `cleanupSeed()` 清 dispatch/tape。
-
-## 接部署门（建议接线点）
-
-`@smoke` 子集是硬门候选，与既有两道门互补：
-- `scripts/v5-smoke-turn-canary.mjs`（WS 三信号）——协议层；
-- `scripts/v5-e2e-journey-canary.mjs`（附件/目标旅程）——UI 交互层；
-- **本套件 `@smoke`**——会话**展示/持久化/重连收敛**层（既有门的盲区）。
-
-推荐接线（`v5-commercial-deploy` 部署后 smoke 阶段，参照 journey canary 的失败语义）：
-
-```bash
-# 部署机上、部署后 smoke 阶段
-( cd e2e/session-display && OC_E2E_SSH_HOST=kl-mirror OC_E2E_REMOTE_PORT=18790 \
-    OC_E2E_RETRIES=1 ./run.sh --grep @smoke )
-# 退出码非 0 = 门失败。第一期建议 fail-loud **不进自动回滚链**（UI 断言有文案/选择器
-# 漂移的假阳性面，与 journey canary 同档），跑稳（连续两周零假阳性）后再升级进
-# validation_failure 链。紧急豁免用显式开关（不默认关）。
+```text
+reports/gpt-5_6-luna/{results.json,junit.xml,html/}
+reports/deepseek-v4-flash/{results.json,junit.xml,html/}
 ```
 
-落到预发回归：部署预发（含 0176）→ 隧道预发 PG 设 `OC_E2E_PG_URL` →
-`./run.sh`（用例 2/5 转为真跑）。
+## 环境变量
 
-## 维护须知
+| 变量 | 默认/约束 | 用途 |
+|---|---|---|
+| `OC_E2E_BASE_URL` | 未设则自动建隧道 | candidate HTTP 根 |
+| `OC_E2E_SSH_HOST` | `kl-mirror` | HTTP 隧道主机 |
+| `OC_E2E_REMOTE_PORT` | `18795` | candidate slot 端口；deploy 会传真实 slot port |
+| `OC_E2E_REMOTE_ENV` | `/etc/openclaude/commercial-v5.env` | 只用于远端读取 DB URL |
+| `OC_E2E_PW_HOST` | `kl-mirror` | 密码/PG 隧道主机 |
+| `OC_E2E_PASSWORD` | 未设则读 root-only secret | v5-evals 密码 |
+| `OC_E2E_PG_URL` | 未设则自动建 PG 隧道 | direct timeline 与证据查询 |
+| `OC_E2E_SESSION_PREFIX` | deploy 随机生成 | release-bound sponsorship 会话前缀 |
+| `OC_E2E_RETRIES` | deploy 固定 `0` | 不接受 flaky 重试假绿 |
+| `OC_E2E_TURN_TIMEOUT` | `120000` | 单轮上限 ms |
 
-- 关键节点已在 `packages/web-react` 补 `data-testid`：`user-row` / `assistant-row` /
-  `message-text`（user 气泡）/ `turn-process-card`（真实过程游标）/ `team-panel` /
-  `permission-card`。assistant 正文仍走既有稳定
-  `.prose`（避免侵入共享 `Markdown` 组件）。改这些组件时保持 testid。
-- 文案类断言（状态卡"消息未开始处理/已确认未计费"、过程游标"Agent 调用过程…"）来自直接时间线
-  契约；前端改文案需同步 `lib/ui.ts` 的 `TEXT`/选择器。
-- DB 注入（`lib/seed.ts`）依据迁移 0176/0147/0134 的 schema；只允许在 canary/预发库运行，
-  能力不匹配时用例会 skip-on-seed-failure，不制造假失败。
+`OC_E2E_EMAIL`、`OC_E2E_MATRIX_MODEL` 仅由 runner 设置；调用者不应传。密码、DB URL、
+token 不得写入仓库或报告。
+
+## 数据安全与维护
+
+- 所有会话均使用随机 `e2e-*` 前缀并在 fixture 收尾删除；注入仅作用于 v5-evals 自身。
+- 两个模型串行执行，避免同账号会话/计费证据互相干扰。
+- 修改高频 UI 节点时保留 `user-row`、`assistant-row`、`message-text`、
+  `turn-process-card`、`team-panel`、`permission-card` 等稳定 testid。
+- 新出现的 P0/P1 必须先把根因修复映射进 `incidents.json`，补最低层行为回归，并在适合的
+  browser/live/deploy 层证明用户路径；不得只记事故不加自动门。
+- 紧急止血可按 `docs/V5_DEV_PLAYBOOK.md` 的 dx-declared emergency lane 跳过本矩阵，
+  但 durable debt 会阻断后续普通生产变更，直到测试、单一 Codex PASS、受保护 CI/PR 全部关账。

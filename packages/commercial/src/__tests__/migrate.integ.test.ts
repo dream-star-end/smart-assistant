@@ -30,6 +30,12 @@ let pgAvailable = false;
 /** 所有商业化表 + schema_migrations。用 DROP ... CASCADE,顺序无所谓,
  *  但仍列全,方便未来新增迁移时保持清理同步。 */
 const COMMERCIAL_TABLES = [
+  "emergency_containment_debts",
+  "emergency_containment_authorizations",
+  "release_egress_transitions",
+  "release_verification_evidence",
+  "verification_sponsored_requests",
+  "verification_runs",
   "provider_quota_blocks",
   "prompt_queue_item_attachments",
   "prompt_queue_mutations",
@@ -274,6 +280,57 @@ describe("migrate.runMigrations", () => {
       /0179 kimi-k3-ark catalog verification failed/,
       "reapplying 0179 must fail closed when an existing live catalog row has drifted",
     );
+  });
+
+  test("0183/0184 activate hidden Luna and create release-bound verification fences", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await runMigrations();
+
+    const luna = await query<{
+      state: string;
+      enabled: boolean;
+      visibility: string;
+      default_effort: string;
+      capability_profile: Record<string, unknown>;
+    }>(
+      `SELECT c.state,p.enabled,p.visibility,p.default_effort,c.capability_profile
+         FROM model_catalog c
+         JOIN model_pricing p ON p.model_id=c.model_id
+        WHERE c.model_id='gpt-5.6-luna' AND c.state='active'`,
+    );
+    assert.deepEqual(luna.rows, [{
+      state: "active",
+      enabled: true,
+      visibility: "hidden",
+      default_effort: "medium",
+      capability_profile: {
+        ccb: { capability_zero: false, supports_thinking: false },
+        reasoning: {
+          supported: ["low", "medium", "high", "xhigh", "max"],
+          codex_model_default: "medium",
+        },
+        supports_vision: true,
+      },
+    }]);
+
+    const tables = await query<{ table_name: string }>(
+      `SELECT table_name FROM information_schema.tables
+        WHERE table_schema='public'
+          AND table_name IN (
+            'verification_runs','verification_sponsored_requests',
+            'release_verification_evidence','release_egress_transitions',
+            'emergency_containment_authorizations','emergency_containment_debts'
+          )
+        ORDER BY table_name`,
+    );
+    assert.deepEqual(tables.rows.map((row) => row.table_name), [
+      "emergency_containment_authorizations",
+      "emergency_containment_debts",
+      "release_egress_transitions",
+      "release_verification_evidence",
+      "verification_runs",
+      "verification_sponsored_requests",
+    ]);
   });
 
   test("bad migration rolls back that migration's DDL (0001 stays, 0002 doesn't)", async (t) => {

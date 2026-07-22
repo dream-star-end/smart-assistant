@@ -4,7 +4,7 @@
 // 回归目标:大会话 20s 白屏 / 挂历史 22-31s。
 
 import { test, expect } from '../fixtures';
-import { config, mintSessionId } from '../lib/env';
+import { config, directTimelineRequired, mintSessionId } from '../lib/env';
 import { SeedUnavailable, requireDirectTimeline, seedLargeSession, cleanupSeed } from '../lib/seed';
 import { loginViaUi, SEL } from '../lib/ui';
 
@@ -20,6 +20,7 @@ test('@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 过程惰性�
     requireDirectTimeline();
   } catch (err) {
     if (err instanceof SeedUnavailable) {
+      if (directTimelineRequired()) throw err;
       test.skip(true, `direct-timeline 未部署,跳过大会话用例:${err.message}`);
       return;
     }

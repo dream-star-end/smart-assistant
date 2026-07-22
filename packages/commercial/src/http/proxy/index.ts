@@ -40,6 +40,7 @@ import {
   makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
+import { admitVerificationSponsorship } from "../../billing/verificationSponsorship.js";
 import { getDispatchByBillingRequestId } from "../../dispatch/turnDispatchStore.js";
 import { checkRateLimit } from "../../middleware/rateLimit.js";
 import {
@@ -1031,7 +1032,7 @@ export function makeAnthropicProxyHandler(
       // 判「未计费」发免单卡)。故:反查抛错(DB 抖动)→ 503 可重试拒绝;反查无行(签名 id 却查不到
       // dispatch,硬不一致)→ 409 拒绝。绝不 `.catch(()=>null)` 降级。legacy / 非 dispatch 请求
       // (gate 无 billingRequestId)才走 null 跳过。
-      let dispatchIdentity: { dispatchId: string; attemptNo: number } | null = null;
+      let dispatchIdentity: { dispatchId: string; attemptNo: number; sessionId: string } | null = null;
       if (gate?.billingRequestId) {
         const rejectDispatchFailClosed = async (
           status: number,
@@ -1073,6 +1074,23 @@ export function makeAnthropicProxyHandler(
           );
           return;
         }
+      }
+
+      let verificationSponsorship;
+      try {
+        verificationSponsorship = await admitVerificationSponsorship(deps.pgPool, {
+          requestId,
+          userId: uid,
+          model: body.model,
+          sessionId: dispatchIdentity?.sessionId ?? null,
+        });
+      } catch (err) {
+        await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
+        session.zeroizeSecrets();
+        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+        userLog.error("verification_sponsorship_admission_failed", { err: errSummary(err) });
+        sendJsonError(res, 503, "VERIFICATION_SPONSORSHIP_UNAVAILABLE", "billing verification unavailable", requestId);
+        return;
       }
 
       // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
@@ -1213,6 +1231,7 @@ export function makeAnthropicProxyHandler(
           // settle 时 usage_records.dispatch_id/attempt_no 写 NULL。
           dispatchId: dispatchIdentity?.dispatchId ?? null,
           attemptNo: dispatchIdentity?.attemptNo ?? null,
+          verificationSponsorship,
         },
       );
 
