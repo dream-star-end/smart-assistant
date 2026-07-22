@@ -5,16 +5,18 @@
  * firing/resolved/边界阈值。
  *
  * 不覆盖的东西:
- *   - collectRuleSnapshot() 读 DB → 走 integ test(暂未写,见 backlog)
+ *   - collectRuleSnapshot() 的完整真 DB 路径 → 走 integ test(暂未写,见 backlog)
  *   - runRulesOnce() 带 transitionRuleState / enqueueAlert 副作用 → integ
  *
  * 这里锁住"相同输入永远给相同 outcome"的行为 —— 改阈值 / 改规则 / 加新规则时,
  * 相关测试必须同步更新,防止静默回归。
  */
 
-import { describe, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
+import type { Pool } from "pg";
 import {
+  collectRuleSnapshot,
   ruleAccountPoolNotConfigured,
   ruleAccountPoolAllDown,
   ruleAccountPoolLowCapacity,
@@ -25,6 +27,11 @@ import {
   type RuleSnapshot,
 } from "../admin/alertRules.js";
 import { EVENTS } from "../admin/alertEvents.js";
+import { resetPool, setPoolOverride } from "../db/index.js";
+
+afterEach(async () => {
+  await resetPool();
+});
 
 /** 构造一个"全绿"的基准 snapshot,测试只覆盖感兴趣字段 */
 function baseSnapshot(overrides: Partial<RuleSnapshot> = {}): RuleSnapshot {
@@ -43,6 +50,30 @@ function baseSnapshot(overrides: Partial<RuleSnapshot> = {}): RuleSnapshot {
     ...overrides,
   };
 }
+
+test("collectRuleSnapshot 只统计 v5 账号池", async () => {
+  const pool = {
+    async query(sql: string) {
+      if (sql.includes("FROM claude_accounts")) {
+        assert.match(sql, /WHERE runtime_channel = 'v5'/);
+        return {
+          rows: [{ id: "57", health_score: 100, status: "active" }],
+        };
+      }
+      if (sql.includes("FROM system_settings")) return { rows: [] };
+      return { rows: [{ n: "0" }] };
+    },
+    async end() {},
+  } as unknown as Pool;
+  setPoolOverride(pool);
+
+  const snapshot = await collectRuleSnapshot();
+
+  assert.deepEqual(snapshot.accountHealth, [
+    { account_id: "57", health_score: 100, status: "active" },
+  ]);
+  assert.equal(ruleAccountPoolLowCapacity.evaluate(snapshot).firing, false);
+});
 
 describe("ruleAccountPoolNotConfigured", () => {
   test("firing 当账号池为空", () => {

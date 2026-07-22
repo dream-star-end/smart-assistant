@@ -67,7 +67,9 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
 
   try {
     const r = await query<{ id: string; health_score: number; status: string }>(
-      "SELECT id::text AS id, health_score, status FROM claude_accounts ORDER BY claude_accounts.id",
+      `SELECT id::text AS id, health_score, status FROM claude_accounts
+        WHERE runtime_channel = 'v5'
+        ORDER BY claude_accounts.id`,
     );
     accountHealth = r.rows.map((row) => ({
       account_id: row.id,
