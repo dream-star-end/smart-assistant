@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "scope": "V5 user-visible and production-safety P0/P1 regressions recorded from 2026-07-17 through 2026-07-23",
+  "scope": "V5 user-visible P0/P1 regressions recorded from 2026-07-17 through 2026-07-23",
   "fixedLiveMatrix": [
     {
       "engine": "codex",
@@ -421,19 +421,6 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chatCreateTemplates.test.ts"
-        }
-      ]
-    },
-    {
-      "id": "INC-20260723-ALERT-CROSS-CHANNEL",
-      "occurredAt": "2026-07-23",
-      "severity": "P1",
-      "symptom": "V3 账号被错误计入 V5 容量告警，导致无真实 V5 用户影响的误报警。",
-      "rootFixCommit": "f4beb1e6",
-      "regressions": [
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/__tests__/alertRules.test.ts"
         }
       ]
     }

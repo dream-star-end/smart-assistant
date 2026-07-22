@@ -7373,10 +7373,10 @@ finalize_ready_egress_transition() {
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] activate ready egress transition after stable master commit"; return 0; }
   ds_snapshot
   [[ "$DS_phase" == stable ]] || return 0
-  local row release predecessor current count
+  local row release predecessor current count transition_generation="$DS_generation"
   row="$(ds_exec <<SQL
 SELECT release_id || '|' || predecessor_release FROM release_egress_transitions
- WHERE release_id='$(ds_lit "$DS_active_release")' AND generation=$DS_generation AND status='ready';
+ WHERE release_id='$(ds_lit "$DS_active_release")' AND generation=$transition_generation AND status='ready';
 SQL
 )"
   [[ -n "$row" ]] || return 0
@@ -7388,7 +7388,7 @@ SQL
       rollback
       ds_exec <<SQL >/dev/null
 UPDATE release_egress_transitions SET status='rolled_back',activated_at=NULL
- WHERE release_id='$(ds_lit "$release")' AND generation=$DS_generation AND status='ready';
+ WHERE release_id='$(ds_lit "$release")' AND generation=$transition_generation AND status='ready';
 SQL
       return 1
     fi
@@ -7400,25 +7400,29 @@ SQL
   count="$(ds_exec <<SQL
 WITH changed AS (
   UPDATE release_egress_transitions SET status='active',activated_at=NOW()
-   WHERE release_id='$(ds_lit "$release")' AND generation=$DS_generation AND status='ready'
+   WHERE release_id='$(ds_lit "$release")' AND generation=$transition_generation AND status='ready'
    RETURNING 1
 ) SELECT count(*) FROM changed;
 SQL
 )"
   if [[ "$count" != 1 ]]; then
-    echo "✗ egress activation evidence CAS failed；第一动作=恢复 egress predecessor 后官方 rollback" >&2
+    echo "✗ egress activation evidence CAS failed；第一动作=官方 rollback，随后恢复 egress predecessor" >&2
+    rollback || return 1
     activate_egress_release "$predecessor" "$release" || return 1
-    rollback
+    ds_exec <<SQL >/dev/null
+UPDATE release_egress_transitions SET status='rolled_back',activated_at=NULL
+ WHERE release_id='$(ds_lit "$release")' AND generation=$transition_generation AND status='ready';
+SQL
     return 1
   fi
   resolve_active_lane
   smoke "$ACTIVE_PORT" || {
-    echo "✗ egress handoff 后 smoke failed；第一动作=官方 rollback" >&2
+    echo "✗ egress handoff 后 smoke failed；第一动作=官方 rollback，随后恢复 egress predecessor" >&2
+    rollback || return 1
     activate_egress_release "$predecessor" "$release" || return 1
-    rollback
     ds_exec <<SQL >/dev/null
 UPDATE release_egress_transitions SET status='rolled_back',activated_at=NULL
- WHERE release_id='$(ds_lit "$release")' AND generation=$DS_generation AND status='active';
+ WHERE release_id='$(ds_lit "$release")' AND generation=$transition_generation AND status='active';
 SQL
     return 1
   }

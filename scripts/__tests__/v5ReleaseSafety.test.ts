@@ -4906,6 +4906,26 @@ wait $!
       'egress must activate only after the master candidate has committed stable',
     )
 
+    const handoffStart = source.indexOf('\nfinalize_ready_egress_transition()')
+    const handoffEnd = source.indexOf('\nassert_v3_inactive()', handoffStart)
+    const handoff = source.slice(handoffStart, handoffEnd)
+    const casFailure = handoff.slice(
+      handoff.indexOf('egress activation evidence CAS failed'),
+      handoff.indexOf('resolve_active_lane'),
+    )
+    assert.ok(
+      casFailure.indexOf('rollback || return 1') <
+        casFailure.indexOf('activate_egress_release "$predecessor" "$release"'),
+      'post-stable egress evidence anomaly must issue official master rollback before egress diagnosis/repair',
+    )
+    const smokeFailure = handoff.slice(handoff.indexOf('egress handoff 后 smoke failed'))
+    assert.ok(
+      smokeFailure.indexOf('rollback || return 1') <
+        smokeFailure.indexOf('activate_egress_release "$predecessor" "$release"'),
+      'post-stable egress smoke anomaly must issue official master rollback before egress repair',
+    )
+    assert.match(handoff, /transition_generation="\$DS_generation"/)
+
     const sourced = spawnSync('bash', ['-c',
       'V5_DEPLOY_SOURCE_ONLY=1 source "$1" --dry-run; declare -F close_emergency_debt set_luna_visibility run_candidate_release_verification >/dev/null',
       'bash', deploy,

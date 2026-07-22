@@ -8,8 +8,26 @@
 DO $$
 DECLARE
   luna_state TEXT;
+  luna_entry BIGINT;
+  luna_lock INTEGER;
   operator_id BIGINT;
   target RECORD;
+  desired_profile CONSTANT JSONB := '{
+    "supports_vision": true,
+    "reasoning": {
+      "supported": ["low","medium","high","xhigh","max"],
+      "codex_model_default": "medium"
+    },
+    "ccb": {"capability_zero": false, "supports_thinking": false}
+  }'::jsonb;
+  legacy_profile CONSTANT JSONB := '{
+    "supports_vision": false,
+    "reasoning": {
+      "supported": ["low","medium","high","xhigh","max"],
+      "codex_model_default": "medium"
+    },
+    "ccb": {"capability_zero": false, "supports_thinking": false}
+  }'::jsonb;
 BEGIN
   SELECT state INTO luna_state
     FROM model_catalog
@@ -20,17 +38,34 @@ BEGIN
      AND upstream_model_id IS NULL
      AND context_window IS NULL
      AND capability_schema_version = 1
-     AND capability_profile = '{
-       "supports_vision": true,
-       "reasoning": {
-         "supported": ["low","medium","high","xhigh","max"],
-         "codex_model_default": "medium"
-       },
-       "ccb": {"capability_zero": false, "supports_thinking": false}
-     }'::jsonb;
+     AND capability_profile = desired_profile;
 
   IF luna_state IS NULL THEN
-    RAISE EXCEPTION '0183 requires the exact staged/active gpt-5.6-luna descriptor';
+    -- Fresh databases only have 0143's legacy Luna descriptor. Production already has the
+    -- reviewed vision-capable version staged through the catalog API. Accept exactly those two
+    -- predecessor shapes: on a fresh database create the same immutable catalog version via the
+    -- guarded switch procedure; any other drift remains fail-closed.
+    SELECT entry_id,state,lock_version INTO luna_entry,luna_state,luna_lock
+      FROM model_catalog
+     WHERE model_id='gpt-5.6-luna'
+       AND state IN ('active','disabled')
+       AND engine='codex'
+       AND provider_id='codex'
+       AND upstream_model_id IS NULL
+       AND context_window IS NULL
+       AND capability_schema_version=1
+       AND capability_profile=legacy_profile
+     ORDER BY entry_id DESC LIMIT 1;
+    IF luna_entry IS NULL THEN
+      RAISE EXCEPTION '0183 requires the exact staged vision descriptor or legacy Luna predecessor';
+    END IF;
+    PERFORM fn_model_switch_version(
+      'gpt-5.6-luna','codex','codex',NULL,NULL,desired_profile,1,NULL,luna_lock
+    );
+    SELECT state INTO luna_state
+      FROM model_catalog
+     WHERE model_id='gpt-5.6-luna' AND state IN ('staged','active')
+       AND capability_profile=desired_profile;
   END IF;
   IF luna_state = 'staged' THEN
     PERFORM fn_model_activate('gpt-5.6-luna', NULL);
