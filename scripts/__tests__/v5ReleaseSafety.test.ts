@@ -13,6 +13,11 @@ const deploy = path.join(root, 'scripts/deploy-v5.sh')
 const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
 const turnCanary = path.join(root, 'scripts/v5-smoke-turn-canary.mjs')
 const sessionDisplayRunner = path.join(root, 'e2e/session-display/run.sh')
+const sessionDisplayFixtures = path.join(root, 'e2e/session-display/fixtures.ts')
+const sessionDisplayApi = path.join(root, 'e2e/session-display/lib/api.ts')
+const sessionDisplayUi = path.join(root, 'e2e/session-display/lib/ui.ts')
+const sessionDisplayLargeTest = path.join(root, 'e2e/session-display/tests/02-large-session-open.spec.ts')
+const sessionDisplayStatusTest = path.join(root, 'e2e/session-display/tests/05-turn-status.spec.ts')
 const incidentManifest = path.join(root, 'e2e/session-display/incidents.json')
 const baselineEval = path.join(root, 'scripts/run-baseline-skill-evals.sh')
 const baselineWeekly = path.join(root, 'scripts/v5-baseline-evals-weekly.sh')
@@ -4852,10 +4857,15 @@ wait $!
   })
 
   test('candidate release gate is fixed-model, zero-skip, evidenced, and aborts before diagnosis', async () => {
-    const [source, runner, manifestRaw] = await Promise.all([
+    const [source, runner, manifestRaw, fixtures, api, ui, largeTest, statusTest] = await Promise.all([
       readFile(deploy, 'utf8'),
       readFile(sessionDisplayRunner, 'utf8'),
       readFile(incidentManifest, 'utf8'),
+      readFile(sessionDisplayFixtures, 'utf8'),
+      readFile(sessionDisplayApi, 'utf8'),
+      readFile(sessionDisplayUi, 'utf8'),
+      readFile(sessionDisplayLargeTest, 'utf8'),
+      readFile(sessionDisplayStatusTest, 'utf8'),
     ])
     const manifest = JSON.parse(manifestRaw)
     assert.deepEqual(manifest.fixedLiveMatrix, [
@@ -4873,6 +4883,23 @@ wait $!
     assert.match(runner, /if\(fail\|\|skip\|\|flaky\)/)
     assert.match(runner, /\[ -z "\$\{OC_E2E_MODEL:-\}" \] \|\| die "OC_E2E_MODEL 已废止；模型矩阵不可覆盖"/)
     assert.doesNotMatch(runner, /OC_E2E_MODEL:-[a-z0-9]/)
+    assert.match(fixtures, /api: \[async \(\{\}, use\) => \{[\s\S]*scope: 'worker'/)
+    assert.match(fixtures, /sharedContext: \[async \(\{ browser \}, use\) => \{[\s\S]*scope: 'worker'/)
+    assert.match(fixtures, /page: async \(\{ sharedContext \}, use\) => \{[\s\S]*sharedContext\.newPage\(\)/)
+    assert.match(fixtures, /finally \{[\s\S]*sharedContext\.setOffline\(false\)[\s\S]*page\.close\(\)/)
+    assert.doesNotMatch(fixtures, /token: \[[\s\S]*scope: 'worker'/, 'token 必须逐测试取当前安全 TTL')
+    assert.match(api, /minimumRemainingMs = cfg\.turnTimeoutMs \* 2 \+ 90_000/)
+    assert.match(api, /this\.cachedLogin\.accessExp \* 1000 - Date\.now\(\) > minimumRemainingMs/)
+    assert.match(ui, /name: \/\^\(\?:重试\|重新尝试\|重试发送\)\$\//)
+    assert.match(ui, /name: '重试', exact: true/)
+    assert.match(ui, /cookie\.name === 'oc_rt'/)
+    assert.match(ui, /expect\.poll\([\s\S]*timeout: 70_000[\s\S]*\.not\.toBe\('pending'\)/)
+    assert.match(statusTest, /SEL\.retryExactBtn\(page\)[\s\S]*\.toHaveCount\(1\)/)
+    assert.match(largeTest, /page\.waitForResponse\(/)
+    assert.match(largeTest, /request\.headers\(\)\.range === 'bytes=0-0'/)
+    assert.match(largeTest, /expect\(probe\.status\(\)[\s\S]*\.toBe\(206\)/)
+    assert.match(largeTest, /SEL\.turnProcessCard\(page\)[\s\S]*\.toHaveCount\(0\)/)
+    assert.match(largeTest, /E2E_TOOL_FINAL_MARKER/)
     const loopbackBypass = runner.indexOf('export NO_PROXY=')
     const lowercaseLoopbackBypass = runner.indexOf('export no_proxy=')
     const readinessProbe = runner.indexOf('for i in $(seq 1 40);')

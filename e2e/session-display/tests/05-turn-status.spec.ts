@@ -55,9 +55,7 @@ test('verified turn status:未计费状态展示 + late-tape 状态不显示', a
     // 可见:未计费错误卡文案 + 重试。
     await expect(page.getByText(TEXT.dispatchLostTitle).first()).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(TEXT.notCharged).first()).toBeVisible();
-    const retryable =
-      (await SEL.retryInlineBtn(page).count()) > 0 || (await SEL.retryBannerBtn(page).count()) > 0;
-    expect(retryable, '未计费错误卡应可重试').toBeTruthy();
+    await expect(SEL.retryExactBtn(page), 'not_accepted 用户行必须给出明确“重试”动作').toHaveCount(1);
 
     // 直接状态读只返回 terminal + client_notified；manual_reconcile 不冒充丢失。
     await expect(

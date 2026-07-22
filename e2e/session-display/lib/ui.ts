@@ -36,8 +36,9 @@ export const SEL = {
   selectedSession: (p: Page): Locator => p.locator('[aria-current="true"]'),
   // 错误卡
   errorBanner: (p: Page): Locator => p.getByRole('alert'),
-  retryBannerBtn: (p: Page): Locator => p.getByRole('button', { name: '重试发送' }),
-  retryInlineBtn: (p: Page): Locator => p.getByRole('button', { name: '重新尝试' }),
+  retryExactBtn: (p: Page): Locator => p.getByRole('button', { name: '重试', exact: true }),
+  retryActionBtn: (p: Page): Locator =>
+    p.getByRole('button', { name: /^(?:重试|重新尝试|重试发送)$/ }),
   // 历史分页(本地/云端两种文案)
   loadMoreLocal: (p: Page): Locator => p.getByRole('button', { name: /加载更多历史/ }),
   loadMoreCloud: (p: Page): Locator => p.getByRole('button', { name: /从云端加载更早的历史/ }),
@@ -56,8 +57,21 @@ export async function loginViaUi(page: Page): Promise<void> {
   const cfg = config();
   await page.goto(`${cfg.baseUrl}/`, { waitUntil: 'domcontentloaded' });
 
-  // 已在工作区(session 复用)则直接返回。
-  if (await SEL.composer(page).isVisible().catch(() => false)) return;
+  // 共享 context 的新页面若带真实 HttpOnly refresh cookie，会先静默续登。只在确有
+  // cookie 时等待 boot 收敛到工作区或明确登录面，避免与合法的慢 refresh 竞态。
+  const hasRefreshCookie = (await page.context().cookies())
+    .some((cookie) => cookie.name === 'oc_rt');
+  if (hasRefreshCookie) {
+    await expect.poll(async () => {
+      if (await SEL.composer(page).isVisible().catch(() => false)) return 'workspace';
+      if (
+        await SEL.emailInput(page).isVisible().catch(() => false) ||
+        await SEL.loginOpenBtn(page).isVisible().catch(() => false)
+      ) return 'auth';
+      return 'pending';
+    }, { timeout: 70_000 }).not.toBe('pending');
+    if (await SEL.composer(page).isVisible().catch(() => false)) return;
+  }
 
   // 营销页 → 打开 AuthGate(若邮箱框未直接出现)。
   if (!(await SEL.emailInput(page).isVisible().catch(() => false))) {
@@ -134,8 +148,7 @@ export async function waitForTurnSettled(
     const hasError =
       (await page.getByText(TEXT.dispatchLostTitle).count()) > 0 ||
       (await page.getByText(TEXT.serviceRestart).count()) > 0 ||
-      (await SEL.retryInlineBtn(page).count()) > 0 ||
-      (await SEL.retryBannerBtn(page).count()) > 0;
+      (await SEL.retryActionBtn(page).count()) > 0;
     if (hasError) return 'error';
 
     const typingGone = (await SEL.typing(page).count()) === 0;

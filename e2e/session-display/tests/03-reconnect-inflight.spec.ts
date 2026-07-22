@@ -41,9 +41,8 @@ test('断线重连:回复到达或明确失败,绝不永久静默', async ({ pag
   expect(['reply', 'error']).toContain(outcome);
 
   if (outcome === 'error') {
-    // 失败必须可重试(横幅"重试发送" 或 内联"重新尝试")。
-    const retryable =
-      (await SEL.retryBannerBtn(page).count()) > 0 || (await SEL.retryInlineBtn(page).count()) > 0;
+    // 失败必须给出任一产品定义的明确重试动作。
+    const retryable = (await SEL.retryActionBtn(page).count()) > 0;
     expect(retryable, '失败态必须给出重试入口').toBeTruthy();
   } else {
     await expect(SEL.assistantRows(page).locator('.prose').filter({ hasText: /\S/ }).first()).toBeVisible();
