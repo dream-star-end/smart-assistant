@@ -6,9 +6,9 @@
 // 部署后的 UI 层验收门:
 //   J1 UI 登录(真实表单;依赖线上 turnstile_bypass=true,同 turn canary 的 bypass 前提)
 //   J2 附件全链:「+」菜单 → 添加附件 → filechooser 真实弹出 → 真实上传 → chip done
-//   J3 目标入口:「+」菜单 → 设定目标 → 对话框弹出
+//   J3 目标全链:「+」菜单 → 创建目标 → active 可见 → 清除并恢复未设置
 //   J4 带附件发送:消息上屏 + 附件区清空
-//   J5 送达硬断言:失败签名(发送失败/消息暂未安全送达)零容忍 + 助手回复完成
+//   J5 送达硬断言:失败签名零容忍 + 助手回复完成且最终正文含附件秘密探针
 //      (2026-07-18 受理竞态事故裁定:乐观上屏≠送达 —— 旧 J4 只断言上屏,新会话首发
 //      必挂的回归穿门而过;WS smoke turn 走的不是 UI 发送路径,盖不住这一层。J5 等一轮
 //      真回复,与 smoke turn 的等待窗有意冗余 —— 两者路径不同,冗余即覆盖)
@@ -152,6 +152,7 @@ try {
   });
 
   const probeName = `e2e-journey-${Date.now().toString(36)}.txt`;
+  const probeToken = `OC_ATTACH_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   await step("J2 附件全链:菜单→filechooser→真实上传→chip done", async () => {
     await page.getByRole("button", { name: "更多选项" }).click();
     const attachItem = page.getByText("添加附件");
@@ -161,7 +162,7 @@ try {
       attachItem.click(),
     ]);
     const probePath = join(mkdtempSync(join(tmpdir(), "oc-e2e-")), probeName);
-    writeFileSync(probePath, `v5 e2e journey attach probe ${new Date().toISOString()}\n`);
+    writeFileSync(probePath, `${probeToken}\n`);
     await chooser.setFiles(probePath);
     // chip 出现 + 真实上传完成(done 态没有重试按钮;上传中发送按钮禁用,enabled=done 活体信号)。
     await page.getByRole("button", { name: `移除 ${probeName}` }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
@@ -170,21 +171,29 @@ try {
     }
   });
 
-  await step("J3 目标入口:菜单→设定目标→对话框弹出", async () => {
+  await step("J3 目标全链:菜单→创建→active 可见→清除", async () => {
     await page.getByRole("button", { name: "更多选项" }).click();
     const goalItem = page.getByText("设定目标");
     await goalItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await goalItem.click();
-    await page.getByRole("dialog").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    const dialog = page.getByRole("dialog");
+    await dialog.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    const goalMarker = `e2e-goal-${Date.now().toString(36)}`;
+    await dialog.getByPlaceholder("这次会话要达成什么？").fill(goalMarker);
+    await dialog.getByRole("button", { name: "开始目标" }).click();
+    await dialog.getByRole("button", { name: /清除/ }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await dialog.getByText("进行中", { exact: true }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await dialog.getByRole("button", { name: /清除/ }).click();
+    await dialog.getByRole("button", { name: "开始目标" }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await page.keyboard.press("Escape");
-    await page.getByRole("dialog").waitFor({ state: "hidden", timeout: STEP_TIMEOUT });
+    await dialog.waitFor({ state: "hidden", timeout: STEP_TIMEOUT });
   });
 
   const marker = `e2e journey canary ${Date.now().toString(36)}`;
   let assistantRowsBefore = 0;
   await step("J4 带附件发送:消息上屏+附件区清空", async () => {
     const input = page.locator("textarea").first();
-    await input.fill(`${marker}(自动冒烟,只需简短回复)`);
+    await input.fill(`${marker}(自动冒烟)。请读取附件第一行，并只把第一行原样回复；不要猜测、不要描述文件名。`);
     const send = page.getByRole("button", { name: "发送" });
     // 上传若未完成发送键保持禁用;等它可用(附件 done 的第二重信号)。
     const deadline = Date.now() + STEP_TIMEOUT;
@@ -201,7 +210,7 @@ try {
     }
   });
 
-  await step("J5 送达硬断言:失败卡零容忍+助手回复完成", async () => {
+  await step("J5 送达硬断言:失败卡零容忍+最终正文含附件探针", async () => {
     // 2026-07-18 受理竞态事故:发送失败时乐观气泡照样上屏,旧断言「上屏=成功」让新会话
     // 首发必挂的回归穿门(canary 账号当场撞到、被重试语义掩蔽后门照放绿)。送达升硬门:
     //   失败判据 = ErrorBanner 签名(发送失败 / 消息暂未安全送达),一出现立即 fail;
@@ -224,6 +233,10 @@ try {
           if ((await newestAssistant.locator('[role="alert"]').count()) > 0) {
             throw new Error("assistant 以错误/空轮/截断提示结束(非正常回复)");
           }
+          const finalBody = (await newestAssistant.locator(".prose").last().textContent())?.trim() ?? "";
+          if (!finalBody.includes(probeToken)) {
+            throw new Error("assistant 最终正文未包含附件秘密探针(附件未送达 Agent、未读取或回复不完整)");
+          }
           break;
         }
       }
@@ -234,7 +247,7 @@ try {
     }
   });
 
-  console.log("e2e-journey: 旅程全过(登录/附件/目标/发送/送达)");
+  console.log("e2e-journey: 旅程全过(登录/附件读取/目标创建清除/发送/送达)");
   await browser.close();
   cleanupTunnel();
   process.exit(0);

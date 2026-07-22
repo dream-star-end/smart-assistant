@@ -5,7 +5,7 @@
 // smoke 硬门补上这个盲区:登录 canary → PUT 建会话(复刻前端行为,勿删,
 // 纯 WS 新会话另有 master 侧 goal NOT_FOUND 语义)→ WS inbound.message →
 // **三信号齐全**才算成功(收紧后,不再"见任一 text block 即过"):
-//   ① sawText  —— 至少一个非空 text block(引擎真出了正文);
+//   ① exactText——最终正文精确为“2”(引擎真执行了题目,而非任意占位文本);
 //   ② sawFinal —— outbound.message{isFinal:true} 干净收尾帧(webchat turn 终止契约);
 //   ③ sawCost  —— outbound.cost_charged 计费到账(REQUIRE_COST=0 才放宽)。
 // error 帧(outbound.error/outbound.turn_error/error)= 立即失败。
@@ -76,23 +76,32 @@ if (!put.ok) {
 }
 
 // TURN_OK 判据(2026-07-17 收紧):不再"见任一 text block 即过"。三条硬信号缺一不可——
-//   sawText  = 至少一个非空 text block(引擎真出了正文);
+//   exactText= isFinal 帧最终正文精确为“2”(引擎真执行了题目,不是任意占位正文);
 //   sawFinal = 收到干净收尾帧 outbound.message{isFinal:true}(webchat 的 turn 终止契约,
 //              bridge userChatBridge.ts:4582;不是靠"静默即判终"这种弱信号);
 //   sawCost  = 收尾后广播 outbound.cost_charged(计费真到账;REQUIRE_COST=0 才放宽)。
 // 错误帧(outbound.error / outbound.turn_error / error)= 立即失败。
-let sawText = false
-let sawFinal = false
-let sawCost = false
-let sawError = null
 const wsBase = BASE.replace(/^http/, 'ws')
-
-const criteriaMet = () => sawText && sawFinal && (sawCost || !REQUIRE_COST)
 
 const attempt = () => new Promise((resolve) => {
   const ws = new WebSocket(`${wsBase}/ws/user-chat-bridge`, ['bearer', token])
+  let sawText = false
+  let sawFinal = false
+  let sawCost = false
+  let sawError = null
+  let answerText = ''
+  let finalText = ''
   let silence
-  const finish = (r) => { clearTimeout(silence); try { ws.close() } catch {}; resolve(r) }
+  let settled = false
+  const exactText = () => finalText === '2'
+  const criteriaMet = () => exactText() && sawFinal && (sawCost || !REQUIRE_COST)
+  const finish = (reason) => {
+    if (settled) return
+    settled = true
+    clearTimeout(silence)
+    try { ws.close() } catch {}
+    resolve({ reason, sawText, sawFinal, sawCost, sawError, finalText })
+  }
   const resetSilence = () => {
     clearTimeout(silence)    // 冷启动/长思考兜底:静默兜底关连接,真正判成靠下方三信号
     silence = setTimeout(() => finish('silence'), SILENCE_MS)
@@ -114,9 +123,17 @@ const attempt = () => new Promise((resolve) => {
     try { f = JSON.parse(ev.data) } catch { return }
     if (f.type === 'outbound.message') {
       for (const b of f.blocks ?? []) {
-        if (b.kind === 'text' && b.text?.trim()) sawText = true
+        if (b.kind === 'text' && b.text?.trim()) {
+          sawText = true
+          answerText += b.text
+        }
       }
-      if (f.isFinal === true) sawFinal = true   // 干净收尾信号(cost_charged 在其后广播)
+      if (f.isFinal === true) {
+        sawFinal = true   // 干净收尾信号(cost_charged 在其后广播)
+        // WebChat 正常路径会先逐块流正文,再发 blocks=[] 的 final 终止帧；
+        // final-with-content 的早拒绝路径也存在。两者都按本次连接累积出的最终正文断言。
+        finalText = answerText.trim()
+      }
       if (f.error) sawError = JSON.stringify(f.error).slice(0, 300)
     }
     if (f.type === 'outbound.cost_charged') sawCost = true
@@ -131,13 +148,14 @@ const attempt = () => new Promise((resolve) => {
 })
 
 for (let i = 1; i <= ATTEMPTS; i++) {
-  const r = await attempt()
-  if (sawError) { console.error(`turn-canary: TURN_FAILED ${sawError}`); process.exit(1) }
-  if (criteriaMet()) {
-    console.log(`turn-canary: TURN_OK model=${MODEL} text=${sawText} final=${sawFinal} cost_charged=${sawCost}`)
+  const result = await attempt()
+  if (result.sawError) { console.error(`turn-canary: TURN_FAILED ${result.sawError}`); process.exit(1) }
+  const criteriaMet = result.finalText === '2' && result.sawFinal && (result.sawCost || !REQUIRE_COST)
+  if (criteriaMet) {
+    console.log(`turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost}`)
     process.exit(0)
   }
-  if (r === 'closed' && !sawText && !sawFinal) {
+  if (result.reason === 'closed' && !result.sawText && !result.sawFinal) {
     // bridge 在容器冷启动期间会直接关连接("container not ready",可能发生在
     // sys 帧之后):只要还没出任何正文/收尾信号,close 一律视为冷启动重连。真正的
     // turn 失败由错误帧显式暴露,turn 出了一半再断则落到下面的硬失败(不当冷启动重试)。
@@ -147,10 +165,11 @@ for (let i = 1; i <= ATTEMPTS; i++) {
   }
   // 出了部分信号但判据不齐 = 真故障,精确点名缺哪一条,不再重试掩盖。
   const missing = []
-  if (!sawText) missing.push('text')
-  if (!sawFinal) missing.push('final(isFinal 收尾帧)')
-  if (REQUIRE_COST && !sawCost) missing.push('cost_charged(计费到账)')
-  console.error(`turn-canary: TURN_INCOMPLETE after attempt ${i} (resolve=${r}; 缺:${missing.join(', ') || '<none>'}; text=${sawText} final=${sawFinal} cost=${sawCost})`)
+  if (!result.sawText) missing.push('text')
+  else if (result.finalText !== '2') missing.push(`exact_text(期望“2”,实际${JSON.stringify(result.finalText).slice(0, 120)})`)
+  if (!result.sawFinal) missing.push('final(isFinal 收尾帧)')
+  if (REQUIRE_COST && !result.sawCost) missing.push('cost_charged(计费到账)')
+  console.error(`turn-canary: TURN_INCOMPLETE after attempt ${i} (resolve=${result.reason}; 缺:${missing.join(', ') || '<none>'}; final=${result.sawFinal} cost=${result.sawCost})`)
   process.exit(1)
 }
 console.error('turn-canary: retries exhausted (container never became ready)')
