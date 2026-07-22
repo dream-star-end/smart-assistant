@@ -2,7 +2,8 @@
 
 ## Mandatory Code Review Workflow (BLOCKING)
 
-**Every code modification MUST follow this workflow. NO exceptions.**
+**Every code modification MUST follow this workflow, except the narrowly scoped V5 P0
+emergency lane below.**
 
 1. **Plan** — Write out the modification plan: what to change, how, impact scope
 2. **Codex Review Plan** — Send plan to Codex for review. Wait for approval before writing any code
@@ -10,9 +11,56 @@
 4. **Codex Review Code** — Send the full diff to Codex for review: correctness, edge cases, side effects
 5. **Iterate** — If Codex finds issues, fix and re-submit until clean
 
-**If you skip this workflow and write code directly, you are violating a direct instruction from boss.**
+**If you skip this workflow outside the explicit exceptions below and write code directly,
+you are violating a direct instruction from boss.**
 
-Exception: single-line typo fixes.
+Exceptions:
+- single-line typo fixes;
+- the dx-declared V5 P0 emergency lane below. This exception does **not** apply to personal/master
+  product code, so the Personal Dev Instance First Rule remains absolute.
+
+### Dx-declared V5 P0 emergency lane (BLOCKING)
+
+This two-phase lane exists only when dx explicitly states that V5 production is causing ongoing
+real-user, financial, or security harm **and** explicitly orders the smallest containment fix to
+ship first with review/tests backfilled afterward. An agent may not self-declare this exception.
+
+Phase 1 may skip pre-implementation Codex review, new regression tests, the full test suite, and
+normal protected-branch CI. Everything else remains mandatory:
+
+1. Establish a reproduced or production-proven root cause and make only the smallest containment
+   diff in an isolated worktree based on current V5 canonical HEAD. No refactor, adjacent audit,
+   speculative defense, or duplicate reviewer.
+2. Commit and push the exact task branch first so the production commit has remote provenance.
+3. Confirm V5 canonical is clean, contains no unrelated undeployed commits, can fast-forward to
+   that exact pushed commit, and no other production-mutation owner exists. Only then may canonical
+   fast-forward locally and deploy through the official `scripts/deploy-v5.sh` canary/finalize path;
+   never change branch protection, force-push, rsync, or hand-edit runtime state.
+4. Worktree isolation, the official mutation lease, data/billing invariants, V5 abnormal-signal
+   abort/rollback discipline, smoke, and V3-inactive verification are never waived.
+5. After production is stable, immediately add the regression test, run one independent full-diff
+   Codex review and required CI/PR, then align canonical with the protected merge. Until that debt
+   is closed, report only "containment is live"; do not claim the task or root fix is complete.
+
+If root cause, canonical fast-forward, remote provenance, or the unique mutation owner cannot be
+proved, do not improvise a bypass: state the single blocker immediately.
+
+## Diagnostic intent and V5 production mutation boundary (BLOCKING)
+
+- “看下 / 啥问题 / 是否正常 / 先告诉我根因 / 单纯定位” authorizes read-only diagnosis only.
+  Do not deploy, abort/rollback, restart, kill processes, clear markers, or write production data
+  until dx explicitly asks to fix, deploy, recover, or roll back.
+- A user problem that already existed when diagnosis began does not become a rollout anomaly merely
+  because another 0% canary is present. Rollback-first applies to signals newly observed or worsened
+  while validating that rollout. Derive the active unit/port from `deploy_state.active_slot`; never
+  hard-code an A/B health target.
+- The sole production-mutation owner is the process actually holding the official remote
+  production-mutation flock, corroborated by the lease fencing meta holder identity/`deploy_id`;
+  separately, that invocation's saved nonce must match its in-flight marker/sentinel. Do not compare
+  `deploy_id` with the marker nonce: they are different identifiers. Another session must not issue
+  a competing `--abort`, `--rollback`, or `--recover`. Takeover is allowed only after the holder exits,
+  the flock is released, and official state/marker recovery selects the next command. If ownership
+  cannot be proved, remain read-only and report it.
 
 ### Codex Review ≠ Blind Acceptance
 
