@@ -8,7 +8,11 @@ import { pollUntil } from '../lib/poll';
 import { driveTurn } from '../lib/ws';
 
 type Evidence = {
+  request_id: string;
   model: string;
+  usage_session_id: string;
+  dispatch_id: string;
+  attempt_no: number;
   cost: string;
   nominal: string;
   run_id: string;
@@ -37,7 +41,11 @@ test('@release-gate fixed model route + durable terminal + sponsored billing evi
     model: cfg.model,
   });
   expect(put.ok, `putSession failed: ${put.status} ${put.text.slice(0, 160)}`).toBeTruthy();
+  const usageIdBefore = queryScalar(
+    `SELECT COALESCE(max(id),0)::text FROM usage_records WHERE user_id=${userId}`,
+  );
 
+  track(sid, { expectTurn: true });
   const turn = await driveTurn({
     token,
     sessionId: sid,
@@ -53,7 +61,11 @@ test('@release-gate fixed model route + durable terminal + sponsored billing evi
       const raw = queryScalar(`
         SELECT COALESCE((
           SELECT json_build_object(
+            'request_id',ur.request_id,
             'model',ur.model,
+            'usage_session_id',ur.session_id,
+            'dispatch_id',ur.dispatch_id::text,
+            'attempt_no',ur.attempt_no,
             'cost',ur.cost_credits::text,
             'nominal',ur.would_have_cost_credits::text,
             'run_id',ur.verification_run_id::text,
@@ -77,6 +89,10 @@ test('@release-gate fixed model route + durable terminal + sponsored billing evi
   );
 
   expect(evidence.model).toBe(cfg.model);
+  expect(evidence.request_id).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+  expect(evidence.usage_session_id).toBe(sid);
+  expect(evidence.dispatch_id).toMatch(/^[0-9a-f-]{36}$/);
+  expect(evidence.attempt_no).toBeGreaterThanOrEqual(1);
   expect(evidence.cost).toBe('0');
   expect(BigInt(evidence.nominal), 'nominal cost must remain auditable').toBeGreaterThan(0n);
   expect(evidence.run_id).toMatch(/^[0-9a-f-]{36}$/);
@@ -84,4 +100,10 @@ test('@release-gate fixed model route + durable terminal + sponsored billing evi
   expect(evidence.outcome).toBe('completed');
   expect(evidence.finalized).toBeTruthy();
   expect(evidence.remaining_parts).toBe(0);
+  const unbound = queryScalar(`
+    SELECT count(*)::text FROM usage_records
+     WHERE id>${usageIdBefore} AND user_id=${userId} AND model=${sqlText(cfg.model)}
+       AND (verification_run_id IS NULL OR dispatch_id IS NULL OR attempt_no IS NULL)
+  `);
+  expect(unbound, '本轮之后不得出现未赞助或未绑定 dispatch 的固定模型 usage').toBe('0');
 });

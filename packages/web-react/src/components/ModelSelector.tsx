@@ -158,6 +158,7 @@ export function ModelSelector({
           return (
             <DropdownMenuItem
               key={m.id}
+              data-model-id={m.id}
               disabled={degraded}
               onSelect={degraded ? undefined : () => onSelect(m.id)}
               className="justify-between"

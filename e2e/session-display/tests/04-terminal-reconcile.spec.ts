@@ -8,6 +8,7 @@ import { pollUntil } from '../lib/poll';
 import {
   loginViaUi,
   openSession,
+  selectExactModel,
   sendMessage,
   waitForTurnSettled,
   waitForHistoryLoaded,
@@ -24,6 +25,8 @@ test('@smoke 回复中途刷新:终态正确收敛,spinner 不永挂', async ({ 
 
   await loginViaUi(page);
   await openSession(page, sid);
+  await selectExactModel(page, cfg.model);
+  track(sid, { expectTurn: true });
   await sendMessage(page, `e2e-reconcile-${uniq} 请简短回复一句话`);
   await expect(SEL.userRows(page).filter({ hasText: `e2e-reconcile-${uniq}` })).toHaveCount(1);
 

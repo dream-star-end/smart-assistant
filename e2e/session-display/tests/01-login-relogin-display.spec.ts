@@ -8,6 +8,7 @@ import {
   loginViaUi,
   logoutViaUi,
   openSession,
+  selectExactModel,
   sendMessage,
   waitForTurnSettled,
   waitForHistoryLoaded,
@@ -30,6 +31,8 @@ test('@smoke login → 会话 → 发送 → 重登后展示完整且顺序正�
   // ── 首次登录 + 打开会话 + 真实发送一轮 ──────────────────────────────────
   await loginViaUi(page);
   await openSession(page, sid);
+  await selectExactModel(page, cfg.model);
+  track(sid, { expectTurn: true });
   await sendMessage(page, marker);
 
   const outcome1 = await waitForTurnSettled(page);

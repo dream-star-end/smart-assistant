@@ -83,6 +83,7 @@ import {
   type CodexFinalizeHandle,
 } from "../billing/codexFinalizer.js";
 import {
+  bindAuthorityTurnDispatch,
   admitVerificationSponsorship,
   parseVerificationSponsorshipSnapshot,
   serializeVerificationSponsorshipSnapshot,
@@ -4907,6 +4908,40 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             if (enrichedParsed === null) return;
             dispatchRecordC = lookupAdmittedDispatch(enrichedParsed);
+            const authorityTurnId = authorityExec === null
+              ? undefined
+              : authorityDeps!.signer.mintAuthorityTurnId();
+            if (authorityTurnId !== undefined && dispatchRecordC !== undefined) {
+              try {
+                if (!deps.pgPool) throw new Error("authority turn dispatch binding requires pgPool");
+                await bindAuthorityTurnDispatch(deps.pgPool, {
+                  authorityTurnId,
+                  dispatchId: dispatchRecordC.dispatchId,
+                  userId: uid,
+                  sessionId: dispatchRecordC.sessionId,
+                  dispatchModel: typeof enrichedParsed.model === "string" ? enrichedParsed.model : null,
+                  canonicalModel: authorityExec!.canonicalModel,
+                  attemptNo: dispatchRecordC.attemptNo,
+                  ownerId: connId,
+                  leaseEpoch: dispatchRecordC.leaseEpoch,
+                });
+              } catch (err) {
+                turnLogCapture?.error("user-chat-bridge: authority turn dispatch binding failed", {
+                  err,
+                  dispatchId: dispatchRecordC.dispatchId,
+                });
+                rejectPromptQueueDispatch("DURABLE_DISPATCH_UNAVAILABLE");
+                failDispatchPreForward(dispatchRecordC, "authority_turn_dispatch_unavailable");
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(
+                    userWs,
+                    "DURABLE_DISPATCH_UNAVAILABLE",
+                    "durable dispatch attribution unavailable, retry this turn shortly",
+                  );
+                }
+                return;
+              }
+            }
             // 签发边界(MAJOR-2):CCB turn 的计费在 egress 逐请求结算,此处无预扣/无 journal
             // → 无需补偿;但 epoch 重读一样不能省 —— 拿过时快照签出的票 lease 长达 50min,
             // 会让「刚被 admin 撤销的模型」在这条 turn 里继续跑到 egress 的下一次 fence 才拦下。
@@ -4918,6 +4953,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 // egress gate 据此反查 dispatch 身份写 usage_records.dispatch_id/attempt_no(否则
                 // CCB 计费行丢失 turn↔dispatch 关联)。legacy(无 dispatch 记录)→ undefined 不带。
                 ...(dispatchRecordC ? { billingRequestId: dispatchRecordC.billingRequestId } : {}),
+                ...(authorityTurnId === undefined ? {} : { authorityTurnId }),
                 log: turnLogCapture,
                 onReject: rejectPromptQueueDispatch,
               });

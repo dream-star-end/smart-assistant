@@ -18,6 +18,7 @@ test('resend-dedup:同 clientMessageId 重发不出双回复/不双计费', asyn
   expect(put.ok).toBeTruthy();
 
   // 协议级:同一连接连发两帧,cmid 与 idempotencyKey 完全相同 → 服务端应去重为单 turn。
+  track(sid, { expectTurn: true });
   const result = await driveTurn({
     token,
     sessionId: sid,
