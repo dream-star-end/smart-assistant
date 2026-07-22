@@ -17,7 +17,7 @@ import {
 afterEach(cleanup);
 
 function tool(partial: Partial<ToolLike>): ToolLike {
-  return { output: undefined, error: false, ...partial } as ToolLike;
+  return { output: undefined, error: false, _completed: true, ...partial } as ToolLike;
 }
 
 // 后端 WebSearchTool.mapToolResultToToolResultBlockParam 的真实文本形状。
@@ -97,18 +97,17 @@ describe("oc-web 抽取卡(researchToolCard)", () => {
     expect(screen.getByText("已截断")).toBeInTheDocument();
   });
 
-  test("空输出 / 出错 → 通用卡兜底(不回落裸终端泄漏 $ command)", () => {
+  test("空输出 / 出错 → 友好正文兜底(不回落裸终端泄漏 $ command)", () => {
     // 兜底反转:oc-* 命令一律给干净卡(专属卡判空/出错 → GenericOcCard),绝不外露原始命令。
     const empty = researchToolCard("oc-web extract https://x.com", tool({ output: undefined }));
     expect(empty).not.toBeNull();
     const { container } = render(<div>{empty}</div>);
-    expect(screen.getByText("网页/文档提取")).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText("操作已完成。")).toBeInTheDocument();
     expect(container.textContent).not.toContain("oc-web extract");
     cleanup();
     const errored = researchToolCard("oc-web extract https://x.com", tool({ output: "x", error: true }));
     expect(errored).not.toBeNull();
     render(<div>{errored}</div>);
-    expect(screen.getByText("执行失败")).toBeInTheDocument();
+    expect(screen.getByText("x")).toHaveClass("text-danger");
   });
 });

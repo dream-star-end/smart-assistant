@@ -488,12 +488,12 @@ function BrowserBody({ op, input, tool }: BodyProps & { op: string }) {
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        className="mt-1.5 block break-all rounded-md border border-border bg-hover px-3 py-2 text-xs text-accent hover:bg-accent-soft"
+        className="block break-all rounded-lg bg-info-soft px-3 py-2.5 text-[12.5px] font-medium text-info outline-none transition-colors hover:bg-info-soft/80 focus-visible:ring-2 focus-visible:ring-ring"
       >
         {url}
       </a>
     ) : (
-      <div className="mt-1.5 block break-all rounded-md border border-border bg-hover px-3 py-2 text-xs text-muted">
+      <div className="block break-all rounded-lg bg-hover px-3 py-2.5 text-xs text-muted">
         {url}
       </div>
     );
@@ -501,12 +501,40 @@ function BrowserBody({ op, input, tool }: BodyProps & { op: string }) {
     const code = asStr(input?.code) || asStr(input?.function);
     if (code) head = <Pre>{code.slice(0, 1500)}</Pre>;
   } else if (input) {
-    head = <KvList obj={input} skip={["_meta"]} />;
+    const target = asStr(input.element) || asStr(input.ref);
+    const text = asStr(input.text);
+    const key = asStr(input.key);
+    const option = asStr(input.values) || asStr(input.value);
+    const useful = [
+      target ? { label: "目标", value: target } : null,
+      text ? { label: op === "browser_wait_for" ? "等待内容" : "文本", value: text } : null,
+      key ? { label: "按键", value: key } : null,
+      option ? { label: "选项", value: option } : null,
+    ].filter((row): row is { label: string; value: string } => !!row);
+    head = useful.length > 0 ? (
+      <dl className="grid gap-2 sm:grid-cols-2">
+        {useful.map((row) => (
+          <div key={row.label} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
+            <dt className="text-[11px] font-medium text-faint">{row.label}</dt>
+            <dd className="mt-0.5 break-words text-[12.5px] text-fg">{row.value}</dd>
+          </div>
+        ))}
+      </dl>
+    ) : <KvList obj={input} skip={["_meta"]} />;
   }
+  const screenshotPath = op === "browser_take_screenshot"
+    ? asStr(input?.filename) || asStr(input?.path) || /(?:\/[^\s"']+\.(?:png|jpe?g|webp))/i.exec(asStr(tool.output))?.[1] || ""
+    : "";
+  const safeScreenshot = screenshotPath ? safeArtifactSrc(screenshotPath) : null;
   return (
     <>
       {head}
-      <OutputBlock output={tool.output} />
+      {safeScreenshot && (
+        <div className="mt-2.5 overflow-hidden rounded-lg bg-code p-2">
+          <SignedImg src={safeScreenshot} alt="页面截图" className="max-h-64 rounded-md object-contain" />
+        </div>
+      )}
+      {!safeScreenshot && <OutputBlock output={tool.output} />}
     </>
   );
 }

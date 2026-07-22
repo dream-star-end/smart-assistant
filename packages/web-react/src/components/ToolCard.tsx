@@ -22,8 +22,15 @@ import { Check, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { cn } from "../lib/utils";
 import { ToolBody } from "./tool/bodies";
-import { normalizeToolForDisplay, type ToolLike } from "./tool/format";
-import { resolveToolMeta, toolSummary } from "./tool/meta";
+import { buildToolDetailSections, ToolResultDetails } from "./tool/details";
+import {
+  asStr,
+  detectShellFileWrites,
+  normalizeToolForDisplay,
+  stripShellWrapperForDisplay,
+  type ToolLike,
+} from "./tool/format";
+import { detectOcCli, resolveToolMeta, toolSummary } from "./tool/meta";
 import { Badge, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
@@ -37,76 +44,6 @@ const TONE_TILE: Record<string, string> = {
   neutral: "bg-hover text-muted",
 };
 
-const RAW_TEXT_STEP = 128 * 1024;
-
-function rawText(value: unknown): string {
-  if (typeof value === "string") return value;
-  return JSON.stringify(value, null, 2) ?? String(value);
-}
-
-function hasExactRecord(message: ToolLike): boolean {
-  return !!message && typeof message === "object";
-}
-
-function ProgressiveRawText({ label, text }: { label: string; text: string }) {
-  const [visibleChars, setVisibleChars] = useState(RAW_TEXT_STEP);
-  const visible = Math.min(visibleChars, text.length);
-
-  return (
-    <section>
-      <div className="mb-1 text-[11px] font-medium text-faint">{label}</div>
-      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg">
-        {text.slice(0, visible)}
-      </pre>
-      {visible < text.length && (
-        <button
-          type="button"
-          onClick={() => setVisibleChars((value) => value + RAW_TEXT_STEP)}
-          className="mx-auto mt-2 block rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
-        >
-          继续显示原始内容（还有 {(text.length - visible).toLocaleString()} 个字符）
-        </button>
-      )}
-    </section>
-  );
-}
-
-/**
- * 结构化工具卡只负责易读展示；这里始终保留 tape 中的原始输入/输出作为权威记录。
- * 长内容按固定步长逐段挂载，但没有总量上限，也不会用摘要替换原文。
- */
-function ExactToolRecord({ message }: { message: ToolLike }) {
-  return (
-    <div className="mt-3 border-t border-border pt-3">
-      <ProgressiveRawText label="原始完整记录" text={rawText(message)} />
-    </div>
-  );
-}
-
-/** Reusable for specialized cards that intentionally omit the generic tool shell. */
-export function ExactToolRecordDisclosure({ message }: { message: ToolLike }) {
-  const [showExact, setShowExact] = useState(false);
-  if (!hasExactRecord(message)) return null;
-  return (
-    <>
-      <button
-        type="button"
-        onClick={() => setShowExact((value) => !value)}
-        aria-expanded={showExact}
-        className="mt-3 flex items-center gap-1.5 text-xs text-muted hover:text-fg"
-      >
-        <ChevronRight
-          size={13}
-          aria-hidden="true"
-          className={cn("transition-transform", showExact && "rotate-90")}
-        />
-        {showExact ? "收起原始完整记录" : "查看原始完整记录"}
-      </button>
-      {showExact && <ExactToolRecord message={message} />}
-    </>
-  );
-}
-
 export function ToolCard({ message }: { message: ToolLike }) {
   const display = normalizeToolForDisplay(message);
   const name = display.name;
@@ -117,28 +54,56 @@ export function ToolCard({ message }: { message: ToolLike }) {
   const summary = toolSummary(name, input);
 
   const completed = !!renderTool._completed;
-  const isError = !!renderTool.error;
+  const outputText = typeof renderTool.output === "string" ? renderTool.output : "";
+  // 部分 CLI 会以 exit 0 返回语义失败（Playwright 的 markdown Error、网页反爬阻断）。
+  // 这些明确形状应进入用户可见状态，而不是显示绿色完成。
+  const reportedError = name === "Bash" && /^#{1,6}\s*Error\b/m.test(outputText);
+  const isBlocked = name === "Bash" && /(?:^|\n)oc-web:\s*blocked:/i.test(outputText);
+  const isError = !!renderTool.error || reportedError;
   // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
   const isCancelled = !isError && !!renderTool.cancelled;
-  const isRunning = !completed && !isError && !isCancelled;
-  const statusLabel = isRunning ? "运行中" : isError ? "失败" : isCancelled ? "已取消" : "完成";
+  const isRunning = !completed && !isError && !isBlocked && !isCancelled;
+  const statusLabel = isRunning
+    ? "运行中"
+    : isError
+      ? "失败"
+      : isBlocked
+        ? "受阻"
+        : isCancelled
+          ? "已取消"
+          : "完成";
 
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
-  const hasExact = hasExactRecord(message);
-  const hasBody = hasInput || hasOutput || isError || hasExact;
+  const command = name === "Bash" ? stripShellWrapperForDisplay(asStr(input?.command)) : "";
+  const isOcTool = !!command && !!detectOcCli(command) && !detectShellFileWrites(command);
+  // 详情必须以原始持久化消息为权威；Codex wrapper 的语义归一化会精简 input/output，
+  // 若从 renderTool 构建会静默丢掉未来字段。oc-* 仍按产品规则隐藏 shell 命令。
+  const detailSections = buildToolDetailSections(message, {
+    hideInput: isOcTool,
+    hiddenCommand: isOcTool ? command : undefined,
+  });
+  const hasBody = hasInput || hasOutput || isError || isBlocked || detailSections.length > 0;
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
-  const [open, setOpen] = useState(() => isRunning);
+  // 状态只决定首次挂载；之后用户的展开选择始终为权威，流式状态迁移不强制跳动。
+  const isConfirmation = outputText.includes('"confirmation_required"');
+  const [open, setOpen] = useState(() => isRunning || isError || isBlocked || isConfirmation);
 
   return (
     <div
       className={cn(
         // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
         // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
-        "overflow-hidden rounded-lg border bg-surface",
-        isRunning ? "border-accent-soft" : "border-border",
+        "overflow-hidden rounded-xl border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
+        isError
+          ? "border-danger/30"
+          : isBlocked
+            ? "border-warning/35"
+            : isRunning
+              ? "border-accent/25"
+              : "border-border hover:border-border-strong",
       )}
     >
       <button
@@ -146,35 +111,40 @@ export function ToolCard({ message }: { message: ToolLike }) {
         onClick={() => hasBody && setOpen((o) => !o)}
         aria-expanded={hasBody ? open : undefined}
         className={cn(
-          "flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left",
-          hasBody && "cursor-pointer hover:bg-hover",
+          "flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+          hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/70",
         )}
       >
         <span
           className={cn(
-            "flex size-6 shrink-0 items-center justify-center rounded-md",
+            "flex size-7 shrink-0 items-center justify-center rounded-lg",
             isError ? "bg-danger-soft text-danger" : TONE_TILE[meta.tone ?? "accent"],
           )}
         >
-          <Icon size={13} />
+          <Icon size={14} />
         </span>
-        <span className="shrink-0 text-[13px] font-medium text-fg">{meta.label}</span>
+        <span className="shrink-0 text-[13px] font-semibold text-fg">{meta.label}</span>
         {summary && (
           <span className="min-w-0 truncate font-mono text-xs text-muted" title={summary}>
             {summary}
           </span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-2">
-          {/* running/done 的 spinner/✓ 是 aria-hidden，需 sr-only 播报状态；error/cancelled 的 Badge 自带可见文案，无需重复。 */}
-          {!isError && !isCancelled && <span className="sr-only">{statusLabel}</span>}
+          {/* 运行态 spinner 是 aria-hidden，需 sr-only 播报；其余状态均有可见 Badge 文案。 */}
+          {isRunning && <span className="sr-only">{statusLabel}</span>}
           {isRunning ? (
             <Spinner size={13} className="text-accent" />
           ) : isError ? (
             <Badge tone="danger">失败</Badge>
+          ) : isBlocked ? (
+            <Badge tone="warning">受阻</Badge>
           ) : isCancelled ? (
             <Badge tone="neutral">已取消</Badge>
           ) : (
-            <Check size={14} className="text-success" aria-hidden="true" />
+            <Badge tone="success" className="gap-1.5">
+              <Check size={11} aria-hidden="true" />
+              完成
+            </Badge>
           )}
           {hasBody && (
             <ChevronRight
@@ -186,9 +156,9 @@ export function ToolCard({ message }: { message: ToolLike }) {
         </span>
       </button>
       {open && hasBody && (
-        <div className="border-t border-border px-3.5 py-2.5 [&>*:first-child]:mt-0">
+        <div className="border-t border-border/80 bg-bg/35 px-3.5 py-3 [&>*:first-child]:mt-0">
           <ToolBody name={name} input={input} tool={renderTool} />
-          {hasExact && <ExactToolRecordDisclosure message={message} />}
+          <ToolResultDetails sections={detailSections} />
         </div>
       )}
     </div>

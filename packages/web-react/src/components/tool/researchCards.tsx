@@ -43,7 +43,7 @@ import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } fro
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
 import { connectorToolCard } from "./connectorCards";
 import { asArr, asStr, detectShellFileWrites, isSafeHttpUrl, type ToolLike } from "./format";
-import { detectOcCli, OC_TOOLS, type OcCli } from "./meta";
+import { detectOcCli, type OcCli } from "./meta";
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
 
@@ -161,14 +161,20 @@ function CardShell({ icon, title, subtitle, children }: {
   children: ReactNode;
 }) {
   return (
-    <div className="mt-1.5 rounded-md border border-border bg-surface">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
-        <span className="text-accent">{icon}</span>
-        <span className="font-medium text-sm text-fg">{title}</span>
-        {subtitle && <span className="text-xs text-faint">{subtitle}</span>}
+    <section className="space-y-2.5">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
+          {icon}
+        </span>
+        <span className="min-w-0 truncate text-[12.5px] font-semibold text-fg">{title}</span>
+        {subtitle && (
+          <span className="ml-auto shrink-0 rounded-full bg-hover px-2 py-0.5 text-[11px] font-medium text-faint">
+            {subtitle}
+          </span>
+        )}
       </div>
-      <div className="px-3 py-2">{children}</div>
-    </div>
+      <div>{children}</div>
+    </section>
   );
 }
 
@@ -756,6 +762,38 @@ interface MarketItem {
   version?: string;
 }
 
+function MarketItems({ items }: { items: MarketItem[] }) {
+  const [visible, setVisible] = useState(8);
+  const shown = Math.min(visible, items.length);
+  return (
+    <>
+      <ul className="flex flex-col divide-y divide-border/80">
+        {items.slice(0, shown).map((it, i) => (
+          <li key={it.slug || `${i}`} className="py-2.5 first:pt-0 last:pb-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[13px] font-medium text-fg">{asStr(it.name) || asStr(it.slug)}</span>
+              {it.kind && <Chip>{it.kind === "agent" ? "智能体" : it.kind === "plugin" ? "插件" : "技能"}</Chip>}
+              {it.version && <Chip>v{asStr(it.version)}</Chip>}
+            </div>
+            {it.description && (
+              <div className="mt-1 line-clamp-2 text-xs leading-relaxed text-faint">{asStr(it.description)}</div>
+            )}
+          </li>
+        ))}
+      </ul>
+      {shown < items.length && (
+        <button
+          type="button"
+          onClick={() => setVisible((value) => value + 12)}
+          className="mt-2.5 min-h-8 rounded-full bg-hover px-3 text-xs font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          查看更多（还有 {items.length - shown} 项）
+        </button>
+      )}
+    </>
+  );
+}
+
 function MarketCard({ tool }: { tool: ToolLike }) {
   const text = outputText(tool);
   let items: MarketItem[] = [];
@@ -772,20 +810,51 @@ function MarketCard({ tool }: { tool: ToolLike }) {
   if (items.length === 0) return null;
   return (
     <CardShell icon={<Package className="size-4" />} title="技能市场" subtitle={`${items.length} 项`}>
-      <ul className="flex flex-col divide-y divide-border">
-        {items.slice(0, 30).map((it, i) => (
-          <li key={it.slug || `${i}`} className="py-2 first:pt-0 last:pb-0">
-            <div className="flex items-center gap-2">
-              <span className="text-[13px] text-fg">{asStr(it.name) || asStr(it.slug)}</span>
-              {it.kind && <Chip>{it.kind === "agent" ? "智能体" : "技能"}</Chip>}
-              {it.version && <Chip>v{asStr(it.version)}</Chip>}
-            </div>
-            {it.description && (
-              <div className="mt-0.5 line-clamp-2 text-xs text-faint">{asStr(it.description)}</div>
-            )}
-          </li>
-        ))}
-      </ul>
+      <MarketItems items={items} />
+    </CardShell>
+  );
+}
+
+function marketCommand(command: string): { action: string; target: string } {
+  const match = /(?:^|[;&|]\s*)oc-market\s+([\w-]+)(?:\s+(?:--slug\s+)?("[^"]+"|'[^']+'|[^\s;&|]+))?/i.exec(command);
+  return {
+    action: (match?.[1] ?? "").toLowerCase(),
+    target: (match?.[2] ?? "").replace(/^["']|["']$/g, ""),
+  };
+}
+
+function MarketToolCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
+  const { action, target } = marketCommand(command);
+  if (action === "search" || action === "installed") return MarketCard({ tool });
+  if (action === "detail") {
+    const detail = looseJson(outputText(tool));
+    if (detail) {
+      return (
+        <CardShell icon={<Package className="size-4" />} title="市场能力详情">
+          <MarketItems items={[detail as MarketItem]} />
+        </CardShell>
+      );
+    }
+  }
+  const title: Record<string, string> = {
+    install: "安装市场能力",
+    uninstall: "卸载市场能力",
+    "publish-skill": "发布技能",
+    "publish-agent": "发布智能体",
+  };
+  if (!title[action]) return null;
+  return (
+    <CardShell icon={<Package className="size-4" />} title={title[action]} subtitle={target || undefined}>
+      <div className={cn(
+        "rounded-lg px-3 py-2.5 text-[13px] leading-relaxed",
+        tool._completed ? "bg-success-soft text-success" : "bg-accent-soft text-accent",
+      )}>
+        {tool._completed
+          ? target
+            ? `已完成对「${target}」的操作。`
+            : "市场操作已完成。"
+          : "正在处理市场操作…"}
+      </div>
     </CardShell>
   );
 }
@@ -894,6 +963,23 @@ function firstParagraph(md: string): string {
 
 /** oc-web 抽取 → 摘要富卡 + 折叠全文;无正文 → null(回落通用 BashBody)。 */
 function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
+  const raw = outputText(tool);
+  const blocked = raw?.match(/(?:^|\n)oc-web:\s*blocked:\s*([^\n]+)/i);
+  if (blocked) {
+    const reason = blocked[1]?.replace(/^blocked_phrase:/i, "").trim();
+    return (
+      <CardShell icon={<AlertTriangle className="size-4" />} title="网页提取受阻">
+        <div className="rounded-lg bg-warning-soft px-3 py-2.5">
+          <div className="text-[13px] font-medium text-warning">站点阻止了自动内容提取</div>
+          <div className="mt-1 text-xs leading-relaxed text-muted">
+            {reason?.toLowerCase().includes("cloudflare")
+              ? "该页面启用了 Cloudflare 访问保护，可改用浏览器方式打开并读取页面。"
+              : "页面拒绝了自动抓取，可尝试使用浏览器访问。"}
+          </div>
+        </div>
+      </CardShell>
+    );
+  }
   const content = ocWebContent(tool);
   if (!content) return null;
   const { body, url, truncated } = content;
@@ -947,6 +1033,38 @@ function stripCommandEcho(text: string): string {
   return text.replace(/^\s*\$ .*(?:\r?\n|$)/, "").replace(/^\s+/, "");
 }
 
+function stripExternalEnvelope(text: string): string {
+  return text
+    .replace(/^\[外部内容开始[^\n]*\]\s*/u, "")
+    .replace(/\s*\[外部内容结束\]\s*$/u, "")
+    .trim();
+}
+
+function FriendlyObjectPreview({ value }: { value: Record<string, unknown> }) {
+  const rows = Object.entries(value).slice(0, 6);
+  if (rows.length === 0) return <div className="text-xs text-faint">没有返回内容。</div>;
+  return (
+    <dl className="grid gap-2 sm:grid-cols-2">
+      {rows.map(([key, item]) => (
+        <div key={key} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
+          <dt className="text-[11px] font-medium text-faint">{key.replaceAll("_", " ")}</dt>
+          <dd className="mt-0.5 break-words text-[12.5px] leading-relaxed text-fg">
+            {typeof item === "string"
+              ? firstParagraph(item)
+              : typeof item === "number" || typeof item === "boolean"
+                ? String(item)
+                : Array.isArray(item)
+                  ? `${item.length} 项`
+                  : item && typeof item === "object"
+                    ? `${Object.keys(item).length} 个字段`
+                    : "—"}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
 /** 折叠的"详细输出/错误详情"(默认收起;展开也只显示 stdout 正文,已剥离命令回显)。 */
 function OutputDetails({ text, label }: { text: string | null; label: string }) {
   const clean = text ? stripCommandEcho(text).trim() : "";
@@ -978,14 +1096,29 @@ function PromptChip({ text }: { text: string }) {
  * (不泄漏 `$ command`)。用该工具 OC_TOOLS 的图标/标签 + 干净状态行 + 可选折叠详细输出。
  */
 function GenericOcCard({ cli, tool, error }: { cli: OcCli; tool: ToolLike; error?: boolean }) {
-  const meta = OC_TOOLS[cli];
-  const Icon = meta.icon;
   const out = outputText(tool);
+  const clean = out ? stripExternalEnvelope(stripCommandEcho(out)).trim() : "";
+  let object: Record<string, unknown> | null = null;
+  if (clean.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(clean);
+      if (isRecord(parsed)) object = parsed;
+    } catch {
+      /* 文本预览兜底 */
+    }
+  }
   return (
-    <CardShell icon={<Icon className="size-4" />} title={meta.label}>
-      <div className={cn("text-xs", error ? "text-danger" : "text-success")}>{error ? "执行失败" : "已完成"}</div>
-      <OutputDetails text={out} label={error ? "错误详情" : "详细输出"} />
-    </CardShell>
+    <div className={cn("rounded-lg px-3 py-2.5", error ? "bg-danger-soft" : "bg-hover/70") }>
+      {object ? (
+        <FriendlyObjectPreview value={object} />
+      ) : clean ? (
+        <div className={cn("whitespace-pre-wrap break-words text-[13px] leading-relaxed", error ? "text-danger" : "text-fg") }>
+          {firstParagraph(clean)}
+        </div>
+      ) : (
+        <div className="text-xs text-faint">{error ? "工具执行失败，请展开结果详情查看原因。" : "操作已完成。"}</div>
+      )}
+    </div>
   );
 }
 
@@ -1244,7 +1377,6 @@ function BrowserCliCard({ command, tool }: { command: string; tool: ToolLike }):
       icon={BROWSER_ACTIONS[subs[0]].icon}
       title={subs.map((s) => BROWSER_ACTIONS[s].title).join(" · ")}
     >
-      <div className={cn("text-xs", error ? "text-danger" : "text-success")}>{error ? "失败" : "已完成"}</div>
       {reason && <div className="mt-1 break-words text-xs text-danger">{reason.slice(0, 200)}</div>}
       {pageTitle && <div className="mt-1.5 text-[13px] leading-snug text-fg">{pageTitle}</div>}
       {url && (
@@ -1324,7 +1456,7 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   // 网页/文档提取(输出是抽取的 markdown 正文,非 JSON)。
   "oc-web": (_c, t) => OcWebExtractCard({ tool: t }),
   // 技能市场。
-  "oc-market": (_c, t) => MarketCard({ tool: t }),
+  "oc-market": (c, t) => MarketToolCard({ command: c, tool: t }),
   // 本批新增的 4 个专属卡。
   "oc-vision": (c, t) => VisionCliCard({ command: c, tool: t }),
   "oc-memory": (c, t) => MemoryCliCard({ command: c, tool: t }),
@@ -1333,9 +1465,9 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   "oc-browser": (c, t) => BrowserCliCard({ command: c, tool: t }),
   // 应用连接器:输出含 confirmation_required 触发对象 → 写操作确认卡(human-in-the-loop);
   // 其余输出(list/读操作)→ null 兜底 GenericOcCard。实现在 connectorCards.tsx。
-  "oc-connect": (_c, t) => connectorToolCard(t),
+  "oc-connect": (_c, t) => connectorToolCard(t, { embedded: true }),
   // 市场 Plugin 使用与应用连接器相同的确认账本输出契约。
-  "oc-plugin": (_c, t) => connectorToolCard(t),
+  "oc-plugin": (_c, t) => connectorToolCard(t, { embedded: true }),
 };
 
 /**

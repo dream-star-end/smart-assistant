@@ -41,7 +41,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(document.querySelector("pre")?.textContent).toContain(marker);
   });
 
-  test("结构化工具摘要不替换权威记录，超长原始输出可逐段显示到末尾", () => {
+  test("结构化工具摘要不替换权威结果，超长详情可逐段显示到末尾", () => {
     const marker = "EXACT_TOOL_OUTPUT_FINAL_MARKER";
     const output = `${"x".repeat(270_000)}${marker}`;
     render(
@@ -52,17 +52,18 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
 
     fireEvent.click(screen.getByRole("button"));
     expect(document.body.textContent).not.toContain(marker);
-    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
+    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
     expect(document.body.textContent).not.toContain(marker);
 
-    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
-    expect(document.body.textContent).not.toContain(marker);
-    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
+    while (screen.queryByRole("button", { name: /继续显示/ })) {
+      fireEvent.click(screen.getByRole("button", { name: /继续显示/ }));
+    }
     expect(document.body.textContent).toContain(marker);
-    expect(screen.queryByRole("button", { name: /继续显示原始内容/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /继续显示/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
-  test("结构化 tool_result 的未来字段在原始完整记录中原样可见", () => {
+  test("结构化 tool_result 的未来字段在结果详情中可见", () => {
     render(
       <ToolCard
         message={{
@@ -76,9 +77,10 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
 
     fireEvent.click(screen.getByRole("button"));
-    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
-    expect(screen.getByText("原始完整记录")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
+    expect(screen.getByText("结构化结果")).toBeInTheDocument();
     expect(document.body.textContent).toContain("EXACT_STRUCTURED_MARKER");
+    expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
   test("Bash heredoc 失败：错误输出仍可见，非纯写命令不误标", () => {
@@ -96,7 +98,6 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
     expect(screen.getByText("写入文件")).toBeInTheDocument();
     expect(screen.getByText("失败")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("写入文件命令失败")).toBeInTheDocument();
     expect(document.querySelector("pre")?.textContent).toContain("Permission denied");
     cleanup();
@@ -209,14 +210,12 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("bar")).toBeInTheDocument();
   });
 
-  test("无 input/output 仍可展开查看 tape 中的原始完整记录", () => {
+  test("无 input/output 时不制造空详情入口", () => {
     render(<ToolCard message={{ toolName: "Read", _completed: true }} />);
     const btn = screen.getByRole("button");
-    expect(btn).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(btn);
-    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
-    expect(screen.getByText("原始完整记录")).toBeInTheDocument();
-    expect(document.querySelector("pre")?.textContent).toContain('"toolName": "Read"');
+    expect(btn).not.toHaveAttribute("aria-expanded");
+    expect(screen.queryByRole("button", { name: "结果详情" })).not.toBeInTheDocument();
+    expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
   test("agent-group 子块（ChildBlock 形态）复用本组件渲染", () => {
@@ -234,6 +233,70 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     const pre = document.querySelector("pre");
     expect(pre?.textContent).toContain("$ pwd");
     expect(pre?.textContent).toContain("/home");
+  });
+
+  test("AI 市场调用使用统一外壳、动作化标题与渐进结果列表", () => {
+    const results = Array.from({ length: 10 }, (_, index) => ({
+      slug: `skill-${index + 1}`,
+      name: `能力 ${index + 1}`,
+      kind: "skill",
+      description: `能力说明 ${index + 1}`,
+    }));
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-market search design" },
+          output: JSON.stringify(results),
+          _completed: true,
+        }}
+      />,
+    );
+    const header = screen.getByRole("button", { name: /搜索 AI 市场.*design.*完成/ });
+    expect(container.querySelectorAll(".rounded-xl.border")).toHaveLength(1);
+    fireEvent.click(header);
+    expect(screen.getByText("能力 1")).toBeInTheDocument();
+    expect(screen.queryByText("能力 9")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /查看更多/ }));
+    expect(screen.getByText("能力 10")).toBeInTheDocument();
+    expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
+  });
+
+  test("浏览器调用使用统一状态与友好动作正文", () => {
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-browser click --element '登录按钮' --ref e12" },
+          output: "Clicked element e12",
+          _completed: true,
+        }}
+      />,
+    );
+    const header = screen.getByRole("button", { name: /点击页面.*登录按钮.*完成/ });
+    expect(container.querySelectorAll(".rounded-xl.border")).toHaveLength(1);
+    fireEvent.click(header);
+    expect(screen.getAllByText("点击页面").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/登录按钮/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText(/oc-browser click/)).not.toBeInTheDocument();
+  });
+
+  test("网页反爬阻断显示受阻而非绿色完成，并默认展开原因", () => {
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-web extract https://blocked.example" },
+          output: "oc-web: blocked: Cloudflare challenge",
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("受阻")).toBeInTheDocument();
+    expect(screen.getByText("站点阻止了自动内容提取")).toBeInTheDocument();
+    expect(screen.getByText(/Cloudflare 访问保护/)).toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).not.toBeInTheDocument();
+    expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
   test("Codex MCP skill_search 解包为记忆工具卡，不展示 wrapper JSON", () => {
@@ -283,6 +346,71 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(text).not.toContain("structuredContent");
   });
 
+  test("Codex wrapper 的未来持久化字段仍可在结果详情中按需查看", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_future",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "inProgress",
+      arguments: { query: "browser", futureArgument: "FUTURE_INPUT_MARKER" },
+    };
+    const completed = {
+      ...started,
+      status: "completed",
+      result: { content: [{ type: "text", text: "Found 0 matching skill(s)" }] },
+      futureResult: { marker: "FUTURE_OUTPUT_MARKER" },
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /技能检索/ }));
+    expect(document.body.textContent).not.toContain("FUTURE_OUTPUT_MARKER");
+    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
+    expect(document.body.textContent).toContain("FUTURE_INPUT_MARKER");
+    expect(document.body.textContent).toContain("FUTURE_OUTPUT_MARKER");
+  });
+
+  test("Codex dynamic oc-* wrapper 保留未来结果但不泄漏 shell 命令", () => {
+    const secretCommand = "oc-market search design --secret never-show";
+    const started = {
+      type: "dynamicToolCall",
+      id: "dynamic_oc",
+      name: "Bash",
+      status: "inProgress",
+      arguments: { command: secretCommand },
+    };
+    const completed = {
+      ...started,
+      status: "completed",
+      result: { content: [{ type: "text", text: "[]" }] },
+      futureResult: { marker: "SAFE_FUTURE_MARKER" },
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:dynamicToolCall",
+          inputJson: started,
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /搜索 AI 市场/ }));
+    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
+    expect(document.body.textContent).toContain("SAFE_FUTURE_MARKER");
+    expect(document.body.textContent).not.toContain(secretCommand);
+    expect(document.body.textContent).not.toContain("never-show");
+    expect(document.body.textContent).toContain("[已隐藏的工具命令]");
+  });
+
   test("Codex MCP failed web-context 显示友好标签、参数与错误文本", () => {
     const started = {
       type: "mcpToolCall",
@@ -310,7 +438,6 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
     expect(screen.getByText("网页提取")).toBeInTheDocument();
     expect(screen.getByText("失败")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("url")).toBeInTheDocument();
     expect(screen.getAllByText("https://example.com").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/Invalid IP address/)).toBeInTheDocument();
@@ -511,7 +638,6 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("生成图片")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText(/imageGeneration failed: quota exceeded/)).toBeInTheDocument();
     const text = document.body.textContent || "";
     expect(text).not.toContain("ig_error");
@@ -695,7 +821,6 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
         }}
       />,
     );
-    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText(title)).toBeInTheDocument();
     expect(document.body.textContent || "").toContain(output);
     if (misleading) expect(document.body.textContent || "").not.toContain(misleading);

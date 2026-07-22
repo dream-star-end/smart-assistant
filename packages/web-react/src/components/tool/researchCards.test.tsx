@@ -25,7 +25,7 @@ const LIT_JSON = JSON.stringify({
 });
 
 function tool(partial: Partial<ToolLike>): ToolLike {
-  return { output: undefined, error: false, ...partial } as ToolLike;
+  return { output: undefined, error: false, _completed: true, ...partial } as ToolLike;
 }
 
 describe("researchToolCard 分派", () => {
@@ -52,28 +52,27 @@ describe("researchToolCard 分派", () => {
     expect(researchToolCard("echo oc-lit", tool({ output: LIT_JSON }))).toBeNull();
   });
 
-  test("出错的调用 → 通用失败卡(danger,折叠错误详情,绝不裸露 $ command)", () => {
+  test("出错的调用 → 通用错误正文(danger,外层状态由 ToolCard 统一承载)", () => {
     const node = researchToolCard('oc-lit search "x"', tool({ output: "boom: quota exceeded", error: true }));
     expect(node).not.toBeNull();
     const { container } = render(<div>{node}</div>);
-    expect(screen.getByText("文献检索")).toBeInTheDocument();
-    expect(screen.getByText("执行失败")).toBeInTheDocument();
-    // 错误详情默认折叠;命令本身不出现在卡内。
+    expect(screen.getByText("boom: quota exceeded")).toHaveClass("text-danger");
+    // 命令本身不出现在语义正文内。
     expect(container.textContent).not.toContain("oc-lit search");
     expect(container.textContent).not.toContain("$ ");
   });
 
-  test("输出非 JSON / 空 → 通用完成卡(不回落裸终端,不泄漏命令)", () => {
+  test("输出非 JSON / 空 → 友好正文兜底(不回落裸终端,不泄漏命令)", () => {
     const n1 = researchToolCard('oc-lit search "x"', tool({ output: "command not found" }));
     expect(n1).not.toBeNull();
     const { container } = render(<div>{n1}</div>);
-    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText("command not found")).toBeInTheDocument();
     expect(container.textContent).not.toContain("oc-lit search");
     cleanup();
     const n2 = researchToolCard('oc-lit search "x"', tool({ output: undefined }));
-    expect(n2).not.toBeNull(); // 仍是通用卡(只有状态行,无详细输出)
+    expect(n2).not.toBeNull();
     render(<div>{n2}</div>);
-    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText("操作已完成。")).toBeInTheDocument();
   });
 
   test("前导日志 + 尾随 JSON 也能宽松解析", () => {
@@ -276,12 +275,12 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText("智能体")).toBeInTheDocument();
   });
 
-  test("oc-market install(非 list 输出)→ 通用完成卡(不泄漏命令)", () => {
+  test("oc-market install(非 list 输出)→ 动作化市场反馈(不泄漏命令)", () => {
     const node = researchToolCard("oc-market install x", tool({ output: '{"ok":true}' }));
     expect(node).not.toBeNull();
     const { container } = render(<div>{node}</div>);
-    expect(screen.getByText("AI 市场")).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText("安装市场能力")).toBeInTheDocument();
+    expect(screen.getByText("已完成对「x」的操作。")).toBeInTheDocument();
     expect(container.textContent).not.toContain("oc-market install");
   });
 
@@ -340,13 +339,12 @@ describe("渐进披露:截断输出仍渲染已加载条目", () => {
     expect(screen.getByText(/仅展示已加载的前 2 条/)).toBeInTheDocument();
   });
 
-  test("连第一条都没完整 → 通用完成卡兜底(不回落裸终端泄漏命令)", () => {
+  test("连第一条都没完整 → 保留已加载文本兜底(不回落裸终端泄漏命令)", () => {
     const truncated = '{"sources":[{"id":"s1","title":"only partial obj no close';
     const node = researchToolCard('oc-lit search "x"', tool({ output: truncated }));
     expect(node).not.toBeNull();
     render(<div>{node}</div>);
-    expect(screen.getByText("文献检索")).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText(truncated)).toBeInTheDocument();
   });
 
   test("未截断输出不显示部分加载提示", () => {
@@ -357,12 +355,11 @@ describe("渐进披露:截断输出仍渲染已加载条目", () => {
 });
 
 describe("兜底反转:oc-* 绝不泄漏原始命令", () => {
-  test("未注册 body 的 oc-*(oc-web-context)→ 通用卡,不裸露命令", () => {
+  test("未注册 body 的 oc-*(oc-web-context)→ 友好正文兜底,不裸露命令", () => {
     const node = researchToolCard("oc-web-context extract https://x.com", tool({ output: "some helper output" }));
     expect(node).not.toBeNull();
     const { container } = render(<div>{node}</div>);
-    expect(screen.getByText("网页/文档解析")).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText("some helper output")).toBeInTheDocument();
     expect(container.textContent).not.toContain("oc-web-context extract");
   });
 
@@ -392,7 +389,7 @@ describe("4 个新专属卡", () => {
     expect(container.textContent).not.toContain("oc-vision understand");
   });
 
-  test("oc-memory memory 子命令已退役 → 干净的兜底记忆卡,不裸露命令", () => {
+  test("oc-memory memory 子命令已退役 → 干净的兜底正文,不裸露命令", () => {
     // 核心记忆改 memdir 文件写入,memory 子命令后端提示 + exit2;前端 MemoryCliCard 返回 null
     // → researchToolCard 兜底 GenericOcCard(OC_TOOLS['oc-memory'] 标签「记忆」),绝不泄漏原始命令。
     const { container } = render(
@@ -403,7 +400,7 @@ describe("4 个新专属卡", () => {
         )}
       </div>,
     );
-    expect(screen.getByText("记忆")).toBeInTheDocument();
+    expect(screen.getByText("Core 记忆已改为直接编辑文件")).toBeInTheDocument();
     expect(container.textContent).not.toContain("oc-memory memory");
     expect(container.textContent).not.toContain("--action");
   });
@@ -453,7 +450,7 @@ describe("4 个新专属卡", () => {
     expect(screen.getByText(/任务号 abc123/)).toBeInTheDocument();
   });
 
-  test("oc-browser navigate → 打开网页卡(URL 链接 + 状态,无原始 stdout)", () => {
+  test("oc-browser navigate → 打开网页语义正文(URL 链接,无原始 stdout)", () => {
     const { container } = render(
       <div>
         {researchToolCard(
@@ -463,7 +460,6 @@ describe("4 个新专属卡", () => {
       </div>,
     );
     expect(screen.getByText("打开网页")).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
     expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
     // navigate 不展示原始 a11y dump。
     expect(container.textContent).not.toContain("huge a11y tree");
@@ -516,7 +512,6 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
       </div>,
     );
     expect(screen.getByText("打开网页 · 页面快照")).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
     expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
     // 任一 verb 为 snapshot → 快照折叠区可见。
     expect(screen.getByText("查看页面快照")).toBeInTheDocument();
@@ -532,7 +527,7 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
     expect(screen.queryByText(/huge a11y tree/)).toBeNull();
   });
 
-  test("tool.error → 仍走浏览器专属卡:失败 + 首个 Error 行 danger + 完整输出折叠", () => {
+  test("tool.error → 仍走浏览器专属正文:首个 Error 行 danger + 完整输出折叠", () => {
     render(
       <div>
         {researchToolCard(
@@ -542,25 +537,22 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
       </div>,
     );
     expect(screen.getByText("截图")).toBeInTheDocument();
-    expect(screen.getByText("失败")).toBeInTheDocument();
     const reason = screen.getByText(/^Error: File access denied/);
     expect(reason.className).toContain("text-danger");
     expect(reason.textContent).not.toContain("### Error"); // 标头已剥
     expect(screen.getByText("错误详情")).toBeInTheDocument(); // 完整输出进折叠区
   });
 
-  test("输出含 ### Error(Bash exit 0 未标 error)也按失败渲染并给原因", () => {
+  test("输出含 ### Error(Bash exit 0 未标 error)也给出 danger 原因", () => {
     render(
       <div>{researchToolCard("oc-browser navigate --url https://bad.example", tool({ output: BROWSER_ERR }))}</div>,
     );
-    expect(screen.getByText("失败")).toBeInTheDocument();
     expect(screen.getByText(/^Error: File access denied/).className).toContain("text-danger");
-    expect(screen.queryByText("已完成")).toBeNull();
   });
 
-  test("非 oc-browser 的失败仍走通用失败卡(不受 error-aware 白名单影响)", () => {
+  test("非 oc-browser 的失败仍走通用错误正文(不受 error-aware 白名单影响)", () => {
     const node = researchToolCard('oc-lit search "x"', tool({ output: "boom", error: true }));
     render(<div>{node}</div>);
-    expect(screen.getByText("执行失败")).toBeInTheDocument();
+    expect(screen.getByText("boom")).toHaveClass("text-danger");
   });
 });

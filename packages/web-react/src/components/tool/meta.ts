@@ -285,6 +285,99 @@ export function humanizeOp(op: string): string {
   return (op || "").replace(/_/g, " ").trim();
 }
 
+function commandOp(command: string, cli: string): string {
+  const match = new RegExp(`(?:^|[\\n;&|]\\s*)${cli.replace("-", "\\-")}\\s+([\\w-]+)`, "i").exec(command);
+  return (match?.[1] ?? "").toLowerCase();
+}
+
+function commandFlag(command: string, flag: string): string {
+  const match = new RegExp(`(?:^|\\s)--${flag}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`).exec(command);
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
+}
+
+function displayDomain(value: string): string {
+  try {
+    return new URL(value).hostname.replace(/^www\./, "");
+  } catch {
+    return value.slice(0, 60);
+  }
+}
+
+function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
+  const base = OC_TOOLS[cli];
+  const op = commandOp(command, cli);
+  if (cli === "oc-browser") {
+    const map: Record<string, ToolMeta> = {
+      navigate: { icon: Globe, label: "打开网页", tone: "info" },
+      snapshot: { icon: AppWindow, label: "读取页面", tone: "info" },
+      click: { icon: MousePointer2, label: "点击页面", tone: "info" },
+      type: { icon: Keyboard, label: "输入文本", tone: "info" },
+      "press-key": { icon: Keyboard, label: "按键", tone: "info" },
+      screenshot: { icon: Camera, label: "网页截图", tone: "info" },
+      "wait-for": { icon: Clock, label: "等待页面", tone: "info" },
+    };
+    return map[op] ?? base;
+  }
+  if (cli === "oc-market") {
+    const labels: Record<string, string> = {
+      search: "搜索 AI 市场",
+      installed: "已安装能力",
+      detail: "查看市场详情",
+      install: "安装市场能力",
+      uninstall: "卸载市场能力",
+      "publish-skill": "发布技能",
+      "publish-agent": "发布智能体",
+    };
+    return labels[op] ? { ...base, label: labels[op] } : base;
+  }
+  if (cli === "oc-plugin") {
+    const labels: Record<string, string> = {
+      list: "可用市场插件",
+      catalog: "搜索市场插件",
+      call: "调用市场插件",
+    };
+    return labels[op] ? { ...base, label: labels[op] } : base;
+  }
+  if (cli === "oc-connect") {
+    const labels: Record<string, string> = {
+      list: "已连接应用",
+      catalog: "搜索应用连接",
+      call: "调用应用连接",
+    };
+    return labels[op] ? { ...base, label: labels[op] } : base;
+  }
+  if (cli === "oc-web") return { ...base, label: "提取网页内容" };
+  return base;
+}
+
+function ocCommandSummary(cli: OcCli, command: string): string {
+  const op = commandOp(command, cli);
+  if (cli === "oc-browser") {
+    const url = commandFlag(command, "url");
+    if (url) return displayDomain(url);
+    return (
+      commandFlag(command, "element") ||
+      commandFlag(command, "text").slice(0, 60) ||
+      commandFlag(command, "key") ||
+      op
+    );
+  }
+  if (cli === "oc-web") {
+    const url = commandFlag(command, "url") || command.match(/https?:\/\/[^\s'";|]+/)?.[0] || "";
+    return url ? displayDomain(url) : "";
+  }
+  const invocation = new RegExp(`${cli.replace("-", "\\-")}\\s+${op}\\s+([^\\s;&|]+)(?:\\s+([^\\s;&|]+))?`, "i").exec(command);
+  if (cli === "oc-plugin" || cli === "oc-connect") {
+    if (op === "call") return [invocation?.[1], invocation?.[2]?.replaceAll("_", " ")].filter(Boolean).join(" · ");
+    if (op === "catalog") return invocation?.[1]?.replace(/^["']|["']$/g, "") ?? "";
+    return "";
+  }
+  if (cli === "oc-market") {
+    return invocation?.[1]?.replace(/^["']|["']$/g, "") ?? "";
+  }
+  return "";
+}
+
 /**
  * 为工具名解析图标 + 标签（处理 MCP 名）。
  * 优先级：builtin > MCP per-op > MCP server 兜底 > 通用扳手。
@@ -305,7 +398,7 @@ export function resolveToolMeta(
     const cli = detectOcCli(command);
     if (cli) {
       const ocMeta = OC_TOOLS[cli as OcCli];
-      if (ocMeta) return ocMeta;
+      if (ocMeta) return ocCommandMeta(cli as OcCli, command);
     }
   }
   // 原生 Write/Edit 写入记忆文件 → 重标「记忆更新」(body 仍按 Write/Edit 走 diff 展示)。
@@ -350,9 +443,9 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
         const first = shortPath(fileWrite.paths[0]);
         return fileWrite.paths.length > 1 ? `${first} +${fileWrite.paths.length - 1}` : first;
       }
-      // oc-* CLI:语义已在 header 标签(OC_TOOLS),摘要留空——不外露子命令/路径/参数等
-      // 原始命令内容(boss:卡片内不显示原始命令执行内容)。
-      if (detectOcCli(cmd)) return "";
+      // oc-* CLI 只展示解析后的动作/对象，不回显原始 shell 命令及 params。
+      const cli = detectOcCli(cmd);
+      if (cli) return ocCommandSummary(cli as OcCli, cmd);
       return (asStr(input.description) || cmd.split("\n")[0]).slice(0, 60);
     }
     case "Edit":

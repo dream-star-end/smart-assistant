@@ -249,7 +249,13 @@ function StatusBadge({ status }: { status: string }) {
 
 // ── 确认卡本体 ──────────────────────────────────────────────────────────────
 
-export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTrigger }) {
+export function ConnectorConfirmCard({
+  trigger,
+  embedded = false,
+}: {
+  trigger: ConnectorConfirmTrigger;
+  embedded?: boolean;
+}) {
   const { connectorConfirm } = useToolCardActions();
   const { sendUserText } = useChatInteraction();
   // 服务端权威详情（GET /api/connectors/confirmations/:id）：挂载即强制拉取，是**唯一**
@@ -352,9 +358,14 @@ export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTri
   );
 
   return (
-    <div className="mt-1.5 rounded-md border border-warning/40 bg-surface">
+    <div
+      className={cn(
+        "rounded-lg",
+        embedded ? "bg-warning-soft/60" : "mt-1.5 border border-warning/40 bg-surface",
+      )}
+    >
       {/* 头部：盾牌警示 + 动作中文名（服务端）+ 状态徽标 */}
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <div className={cn("flex min-h-10 items-center gap-2 px-3 py-2", !embedded && "border-b border-border")}>
         <span className="text-warning">
           <ShieldAlert className="size-4" />
         </span>
@@ -464,8 +475,11 @@ export function ConnectorConfirmCard({ trigger }: { trigger: ConnectorConfirmTri
  * 兜底 GenericOcCard，list/读操作结果走折叠详细输出，不泄漏命令）。
  * key 用确认 id：同一条历史消息重渲时 state 保持，不同确认互不串态。
  */
-export function connectorToolCard(tool: ToolLike): ReactNode | null {
+export function connectorToolCard(
+  tool: ToolLike,
+  options: { embedded?: boolean } = {},
+): ReactNode | null {
   const trigger = parseOcConnectConfirmation(toolOutputText(tool));
   if (!trigger) return null;
-  return <ConnectorConfirmCard key={trigger.id} trigger={trigger} />;
+  return <ConnectorConfirmCard key={trigger.id} trigger={trigger} embedded={options.embedded} />;
 }
