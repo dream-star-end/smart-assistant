@@ -3081,6 +3081,420 @@ describe("pgSessionsBackend lossless turn tape", () => {
     ), true, "refresh returns exact hidden tail evidence, not a synthetic visible patch");
   });
 
+  maybe("partially staged format-2 tapes convert from immutable parts and finalize as exact format 3", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    const sessionId = "s-lossless-runtime-batch-convert";
+    const userId = "u-lossless-runtime-batch-convert";
+    const runtimeEvents = Array.from({ length: 260 }, (_, ordinal) => ({
+      ordinal: ordinal + 1,
+      observedAt: 1_783_944_050_000 + ordinal,
+      source: "gateway",
+      payload: { type: "raw-progress", ordinal, exact: `value-${ordinal}` },
+    }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "7".repeat(64),
+      text: "visible answer after format conversion",
+      createdAt: 1_783_944_050_000,
+      runtimeEvents,
+    });
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
+    try {
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION oc_test_fail_partial_format_two()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.tape_id='${tape.finalize.tapeId}' AND NEW.ordinal=129 THEN
+            RAISE EXCEPTION 'leave a committed format-2 batch';
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER trg_oc_test_fail_partial_format_two
+        BEFORE INSERT ON client_session_turn_tape_records
+        FOR EACH ROW EXECUTE FUNCTION oc_test_fail_partial_format_two();
+      `);
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /leave a committed format-2 batch/,
+      );
+      assert.deepEqual(
+        (await pool.query<{ record_storage_format: number; records: string; finalized: boolean }>(
+          `SELECT t.record_storage_format,COUNT(r.*)::text AS records,
+                  t.finalized_at IS NOT NULL AS finalized
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format,t.finalized_at`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0],
+        { record_storage_format: 2, records: "128", finalized: false },
+      );
+      await pool.query(
+        `INSERT INTO client_session_turn_tape_model_records
+           (session_id,user_id,tape_id,physical_ordinal,logical_ordinal,msg_id,role,
+            semantic_text,token_estimate,ts,client_message_id)
+         SELECT session_id,user_id,tape_id,ordinal,0,msg_id,'assistant',
+                'conversion rollback sentinel',1,ts,NULL
+           FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=0`,
+        [sessionId, userId, tape.finalize.tapeId],
+      );
+
+      await pool.query(`
+        DROP TRIGGER trg_oc_test_fail_partial_format_two
+          ON client_session_turn_tape_records;
+        DROP FUNCTION oc_test_fail_partial_format_two();
+        CREATE OR REPLACE FUNCTION oc_test_fail_format_conversion()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.tape_id='${tape.finalize.tapeId}'
+             AND OLD.record_storage_format=2 AND NEW.record_storage_format=3 THEN
+            RAISE EXCEPTION 'roll back format conversion';
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER trg_oc_test_fail_format_conversion
+        BEFORE UPDATE OF record_storage_format ON client_session_turn_tapes
+        FOR EACH ROW EXECUTE FUNCTION oc_test_fail_format_conversion();
+      `);
+      process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /roll back format conversion/,
+      );
+      assert.deepEqual(
+        (await pool.query<{
+          record_storage_format: number;
+          records: string;
+          models: string;
+          parts: string;
+        }>(
+          `SELECT t.record_storage_format,COUNT(DISTINCT r.ordinal)::text AS records,
+                  COUNT(DISTINCT m.logical_ordinal)::text AS models,
+                  COUNT(DISTINCT p.part_index)::text AS parts
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+             LEFT JOIN client_session_turn_tape_model_records m
+               ON m.session_id=t.session_id AND m.user_id=t.user_id AND m.tape_id=t.tape_id
+             LEFT JOIN client_session_turn_tape_parts p
+               ON p.session_id=t.session_id AND p.user_id=t.user_id AND p.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0],
+        { record_storage_format: 2, records: "128", models: "1", parts: "1" },
+      );
+      await pool.query(`
+        DROP TRIGGER trg_oc_test_fail_format_conversion
+          ON client_session_turn_tapes;
+        DROP FUNCTION oc_test_fail_format_conversion();
+      `);
+      assert.deepEqual(
+        await backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        { applied: "finalized", recordCount: 4, engineBillings: [] },
+      );
+      assert.deepEqual(
+        (await pool.query<{ record_storage_format: number; records: string; finalized: boolean }>(
+          `SELECT t.record_storage_format,COUNT(r.*)::text AS records,
+                  t.finalized_at IS NOT NULL AS finalized
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format,t.finalized_at`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0],
+        { record_storage_format: 3, records: "4", finalized: true },
+      );
+      const exact = await backend.getClientSession(sessionId, userId);
+      assert.ok(exact);
+      assert.deepEqual(
+        (exact.messages as MessageLike[])
+          .filter((message) => message.role === "runtime-event")
+          .map((message) => message._runtimeEvent),
+        runtimeEvents.map((event) => event.payload),
+      );
+      assert.equal(
+        (exact.messages as MessageLike[]).find((message) => message.role === "assistant")?.text,
+        "visible answer after format conversion",
+      );
+    } finally {
+      if (previousBatching === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_fail_partial_format_two
+          ON client_session_turn_tape_records;
+        DROP FUNCTION IF EXISTS oc_test_fail_partial_format_two();
+        DROP TRIGGER IF EXISTS trg_oc_test_fail_format_conversion
+          ON client_session_turn_tapes;
+        DROP FUNCTION IF EXISTS oc_test_fail_format_conversion();
+      `);
+    }
+  });
+
+  maybe("a stale format-2 writer is fenced before its next batch after a format-3 claim", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    const sessionId = "s-lossless-runtime-batch-stale-writer";
+    const userId = "u-lossless-runtime-batch-stale-writer";
+    const advisoryKey = 784_509_237;
+    const runtimeEvents = Array.from({ length: 260 }, (_, ordinal) => ({
+      ordinal: ordinal + 1,
+      observedAt: 1_783_944_060_000 + ordinal,
+      source: "gateway",
+      payload: { type: "stale-writer-progress", ordinal },
+    }));
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "4".repeat(64),
+      text: "visible answer after stale writer fencing",
+      createdAt: 1_783_944_060_000,
+      runtimeEvents,
+    });
+    const staleBackend = createPgSessionsBackend(pool, { expectedGeneration: GENERATION });
+    const convertingBackend = createPgSessionsBackend(pool, { expectedGeneration: GENERATION });
+    const locker = await pool.connect();
+    let staleFinalize: Promise<unknown> | null = null;
+    let convertingFinalize: Promise<unknown> | null = null;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
+    try {
+      await locker.query("SELECT pg_advisory_lock($1)", [advisoryKey]);
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION oc_test_pause_stale_format_two()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.tape_id='${tape.finalize.tapeId}' AND NEW.ordinal=0 THEN
+            PERFORM pg_advisory_xact_lock(${advisoryKey});
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER trg_oc_test_pause_stale_format_two
+        BEFORE INSERT ON client_session_turn_tape_records
+        FOR EACH ROW EXECUTE FUNCTION oc_test_pause_stale_format_two();
+      `);
+
+      staleFinalize = staleBackend.finalizeLosslessTurnTape(userId, tape.finalize);
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const waiting = Number((await pool.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pg_locks
+            WHERE locktype='advisory' AND granted=FALSE AND objid=$1`,
+          [advisoryKey],
+        )).rows[0]!.count);
+        if (waiting > 0) break;
+        if (attempt === 99) assert.fail("stale writer did not reach the advisory barrier");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+      convertingFinalize = convertingBackend.finalizeLosslessTurnTape(userId, tape.finalize);
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const waiting = Number((await pool.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pg_stat_activity
+            WHERE datname=current_database() AND wait_event_type='Lock'
+              AND query LIKE '%client_session_turn_tapes%'`,
+        )).rows[0]!.count);
+        if (waiting > 0) break;
+        if (attempt === 99) assert.fail("format-3 claimant did not queue behind the stale writer");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]);
+      const [staleResult, convertingResult] = await Promise.allSettled([
+        staleFinalize,
+        convertingFinalize,
+      ]);
+      assert.equal(staleResult.status, "rejected");
+      assert.match(
+        (staleResult as PromiseRejectedResult).reason.message,
+        /materialization format changed during staging/,
+      );
+      assert.deepEqual(convertingResult, {
+        status: "fulfilled",
+        value: { applied: "finalized", recordCount: 4, engineBillings: [] },
+      });
+      assert.deepEqual(
+        (await pool.query<{ record_storage_format: number; records: string }>(
+          `SELECT t.record_storage_format,COUNT(r.*)::text AS records
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0],
+        { record_storage_format: 3, records: "4" },
+      );
+    } finally {
+      await locker.query("SELECT pg_advisory_unlock($1)", [advisoryKey]).catch(() => undefined);
+      locker.release();
+      await Promise.allSettled(
+        [staleFinalize, convertingFinalize].filter((promise): promise is Promise<unknown> =>
+          promise !== null),
+      );
+      if (previousBatching === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_pause_stale_format_two
+          ON client_session_turn_tape_records;
+        DROP FUNCTION IF EXISTS oc_test_pause_stale_format_two();
+      `);
+    }
+  });
+
+  maybe("a format-3 pin survives a failed stage and ignores a later flag disable", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    const sessionId = "s-lossless-runtime-batch-pin";
+    const userId = "u-lossless-runtime-batch-pin";
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "6".repeat(64),
+      text: "pinned answer",
+      createdAt: 1_783_944_075_000,
+      runtimeEvents: Array.from({ length: 8 }, (_, ordinal) => ({
+        ordinal,
+        observedAt: 1_783_944_075_000 + ordinal,
+        source: "gateway",
+        payload: { type: "pinned-progress", ordinal },
+      })),
+    });
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+    try {
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION oc_test_fail_pinned_format_three()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.tape_id='${tape.finalize.tapeId}' THEN
+            RAISE EXCEPTION 'fail after format-3 pin';
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER trg_oc_test_fail_pinned_format_three
+        BEFORE INSERT ON client_session_turn_tape_records
+        FOR EACH ROW EXECUTE FUNCTION oc_test_fail_pinned_format_three();
+      `);
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /fail after format-3 pin/,
+      );
+      assert.deepEqual(
+        (await pool.query<{ record_storage_format: number; records: string }>(
+          `SELECT t.record_storage_format,COUNT(r.*)::text AS records
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0],
+        { record_storage_format: 3, records: "0" },
+      );
+      await pool.query(`
+        DROP TRIGGER trg_oc_test_fail_pinned_format_three
+          ON client_session_turn_tape_records;
+        DROP FUNCTION oc_test_fail_pinned_format_three();
+      `);
+      process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
+      assert.deepEqual(
+        await backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        { applied: "finalized", recordCount: 2, engineBillings: [] },
+      );
+      assert.equal(
+        (await pool.query<{ record_storage_format: number }>(
+          `SELECT record_storage_format FROM client_session_turn_tapes
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0]!.record_storage_format,
+        3,
+      );
+    } finally {
+      if (previousBatching === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_fail_pinned_format_three
+          ON client_session_turn_tape_records;
+        DROP FUNCTION IF EXISTS oc_test_fail_pinned_format_three();
+      `);
+    }
+  });
+
+  maybe("a finalized format-2 tape remains immutable when batching is later enabled", async () => {
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    const sessionId = "s-lossless-finalized-format-two";
+    const userId = "u-lossless-finalized-format-two";
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "5".repeat(64),
+      text: "immutable format two",
+      createdAt: 1_783_944_087_000,
+      runtimeEvents: Array.from({ length: 8 }, (_, ordinal) => ({
+        ordinal,
+        observedAt: 1_783_944_087_000 + ordinal,
+        source: "gateway",
+        payload: { type: "legacy-progress", ordinal },
+      })),
+    });
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
+    try {
+      assert.equal((await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied, "finalized");
+      process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";
+      assert.deepEqual(
+        await backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        { applied: "idempotent", recordCount: 9, engineBillings: [] },
+      );
+      assert.deepEqual(
+        (await pool.query<{ record_storage_format: number; records: string; parts: string }>(
+          `SELECT t.record_storage_format,COUNT(DISTINCT r.ordinal)::text AS records,
+                  COUNT(DISTINCT p.part_index)::text AS parts
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+             LEFT JOIN client_session_turn_tape_parts p
+               ON p.session_id=t.session_id AND p.user_id=t.user_id AND p.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.record_storage_format`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0],
+        { record_storage_format: 2, records: "9", parts: "0" },
+      );
+    } finally {
+      if (previousBatching === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+    }
+  });
+
   maybe("runtime-event batches reduce physical rows but exact hydration restores every logical payload", async () => {
     const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
     process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "1";

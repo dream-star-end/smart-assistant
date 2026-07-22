@@ -1837,6 +1837,13 @@ describe('v5 release safety lanes', () => {
     assert.notEqual(invoke('error', 'incapable').status, 0, 'unknown DB state must fail closed')
 
     const source = await readFile(deploy, 'utf8')
+    const runtimeLibSource = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
+    assert.match(source, /WHERE record_storage_format >= 3/,
+      'an unfinalized format-3 pin must arm the deploy rollback floor')
+    assert.doesNotMatch(source, /WHERE finalized_at IS NOT NULL AND record_storage_format >= 3/)
+    assert.match(runtimeLibSource, /WHERE record_storage_format >= 3/,
+      'hotcfg rollback must honor an unfinalized format-3 pin')
+    assert.doesNotMatch(runtimeLibSource, /WHERE finalized_at IS NOT NULL AND record_storage_format >= 3/)
     const start = source.indexOf('enable_runtime_tape_batching()')
     const end = source.indexOf('\n# 自动回切', start)
     const enableBody = source.slice(start, end)

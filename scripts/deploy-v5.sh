@@ -2938,8 +2938,9 @@ assert_lossless_runtime_batch_capability() {
 }
 
 # Tri-state storage floor. The explicit opt-in closes the first-write race;
-# record_storage_format=3 keeps the floor irreversible after the flag is ever
-# removed or an env file is restored. 0=armed, 1=definitively inactive,
+# any format-3 pin keeps the floor irreversible after the flag is ever removed
+# or an env file is restored, including an unfinalized tape that must resume
+# with the same writer format. 0=armed, 1=definitively inactive,
 # 2=unknown (production callers fail closed).
 probe_lossless_runtime_batch_floor() {
   local state="" rc=0
@@ -2949,7 +2950,7 @@ probe_lossless_runtime_batch_floor() {
       test -n \"\${DATABASE_URL:-}\" || exit 22
       psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT EXISTS (
         SELECT 1 FROM client_session_turn_tapes
-         WHERE finalized_at IS NOT NULL AND record_storage_format >= 3
+         WHERE record_storage_format >= 3
       )::text\"" 2>/dev/null)"; then
     rc=0
   else

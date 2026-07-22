@@ -544,7 +544,7 @@ function isBashTailRuntimeRecord(item: LosslessTurnRecord): boolean {
     (event as Record<string, unknown>).subtype === "bash_output_tail";
 }
 
-function runtimeBatchingEnabled(): boolean {
+export function isLosslessRuntimeBatchingEnabled(): boolean {
   const raw = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING?.trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "on";
 }
@@ -552,11 +552,12 @@ function runtimeBatchingEnabled(): boolean {
 function batchRuntimeEventRecords(
   records: LosslessTurnRecord[],
   prefix: string,
+  enabled: boolean,
 ): {
   records: LosslessTurnRecord[];
   runtimeBatchManifestSha256?: string;
 } {
-  if (!runtimeBatchingEnabled()) return { records };
+  if (!enabled) return { records };
   const physical: LosslessTurnRecord[] = [];
   const batchDescriptors: Array<{
     batchId: string;
@@ -663,7 +664,10 @@ function batchRuntimeEventRecords(
 }
 
 /** Converts one complete canonical payload into immutable UI message records. */
-export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn {
+export function materializeLosslessTurn(
+  raw: unknown,
+  options: { runtimeBatching?: boolean } = {},
+): MaterializedLosslessTurn {
   const body = parseLosslessTurnPayload(raw);
   const baseTs = body.createdAt;
   const tools = body.tools ?? [];
@@ -912,7 +916,11 @@ export function materializeLosslessTurn(raw: unknown): MaterializedLosslessTurn 
   });
   const logicalRecordIds = records.map((item) => item.id);
   const logicalRecordCount = records.length;
-  const batched = batchRuntimeEventRecords(records, prefix);
+  const batched = batchRuntimeEventRecords(
+    records,
+    prefix,
+    options.runtimeBatching ?? isLosslessRuntimeBatchingEnabled(),
+  );
   const billingAnchorId = assistantRecords.at(-1)?.id ?? batched.records.at(-1)!.id;
   const engineBillings = [
     ...(body.engineBilling ? [structuredClone(body.engineBilling)] : []),
