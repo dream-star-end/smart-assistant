@@ -1,96 +1,116 @@
 #!/usr/bin/env bash
-# 会话展示 e2e runner:env 校验 → (可选)建 ssh 隧道 → 串行跑 → 汇总。
-# 目标环境全部经 env 注入,零硬编码账号密码。
-#
-# 用法:
-#   ./run.sh                      # 默认:隧道到 kl-hk 预发(18795),密码取自 kl-mirror
-#   ./run.sh --grep @smoke        # 只跑部署门 smoke 子集(用例 1/2/4)
-#   OC_E2E_SSH_HOST=kl-mirror OC_E2E_REMOTE_PORT=18790 ./run.sh   # 打生产 canary(自验用)
-#   OC_E2E_BASE_URL=http://127.0.0.1:18790 ./run.sh              # 已有直达地址,不建隧道
-#
-# 关键 env(详见 README 环境矩阵):
-#   OC_E2E_BASE_URL     直达 HTTP 根;设了就不建隧道
-#   OC_E2E_SSH_HOST     隧道目标主机(默认 kl-hk)     OC_E2E_REMOTE_PORT  远端端口(默认 18795)
-#   OC_E2E_PASSWORD     账号密码(优先);或 OC_E2E_PASSWORD_FILE(本地文件)
-#   OC_E2E_PW_HOST      密码单一权威主机(默认 kl-mirror,经 ssh 读 v5-canary.password)
-#   OC_E2E_EMAIL/MODEL/PG_URL/SECTION9 …  见 README
+# V5 candidate regression gate. The live matrix and identity are intentionally immutable:
+#   Codex = gpt-5.6-luna; CCB = deepseek-v4-flash; account = v5-evals.
+# The ordinary billable v5-canary smoke remains scripts/v5-smoke-turn-canary.mjs.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 log() { printf '\033[36m[e2e]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31m[e2e] ERROR:\033[0m %s\n' "$*" >&2; exit 2; }
+free_port() {
+  node -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{const p=s.address().port;s.close(()=>console.log(p))})"
+}
 
-# ── 依赖校验 ─────────────────────────────────────────────────────────────────
 command -v node >/dev/null || die "缺少 node"
-[ -d node_modules/@playwright/test ] || die "playwright 未安装:先 (cd $(pwd) && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install)"
+command -v psql >/dev/null || die "缺少 psql（candidate gate 不允许跳过 direct timeline）"
+command -v openssl >/dev/null || die "缺少 openssl"
+[ -d node_modules/@playwright/test ] || die "playwright 未安装:先 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install"
+[ -z "${OC_E2E_MODEL:-}" ] || die "OC_E2E_MODEL 已废止；模型矩阵不可覆盖"
 
-TUNNEL_PID=""
-cleanup() { [ -n "$TUNNEL_PID" ] && kill "$TUNNEL_PID" 2>/dev/null || true; }
+export OC_E2E_EMAIL="v5-evals@claudeai.chat"
+export OC_E2E_REQUIRE_DIRECT_TIMELINE=1
+export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+export CI=1
+
+PIDS=()
+cleanup() {
+  local pid
+  for pid in "${PIDS[@]:-}"; do [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; done
+}
 trap cleanup EXIT INT TERM
 
-# ── 目标地址:直达 or ssh 隧道 ────────────────────────────────────────────────
+SSH_HOST="${OC_E2E_SSH_HOST:-kl-mirror}"
+PW_HOST="${OC_E2E_PW_HOST:-kl-mirror}"
+
 if [ -n "${OC_E2E_BASE_URL:-}" ]; then
-  log "直达目标:$OC_E2E_BASE_URL(不建隧道)"
+  log "直达目标:${OC_E2E_BASE_URL}"
 else
-  SSH_HOST="${OC_E2E_SSH_HOST:-kl-hk}"
   REMOTE_PORT="${OC_E2E_REMOTE_PORT:-18795}"
-  LOCAL_PORT="$(node -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{const p=s.address().port;s.close(()=>console.log(p))})")"
-  log "建隧道 127.0.0.1:${LOCAL_PORT} → ${SSH_HOST}:${REMOTE_PORT}"
+  LOCAL_PORT="$(free_port)"
+  log "建 HTTP 隧道 127.0.0.1:${LOCAL_PORT} → ${SSH_HOST}:127.0.0.1:${REMOTE_PORT}"
   ssh -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ConnectTimeout=10 \
     -L "${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}" "$SSH_HOST" &
-  TUNNEL_PID=$!
+  PIDS+=("$!")
   export OC_E2E_BASE_URL="http://127.0.0.1:${LOCAL_PORT}"
-  # 隧道就绪轮询(不死 sleep):public/config 可达即就绪。
-  for i in $(seq 1 40); do
-    if curl -sf -m 3 "${OC_E2E_BASE_URL}/api/public/config" >/dev/null 2>&1; then break; fi
-    kill -0 "$TUNNEL_PID" 2>/dev/null || die "ssh 隧道进程已退出(检查 ssh ${SSH_HOST} 是否可达)"
-    [ "$i" = "40" ] && die "隧道就绪超时:${OC_E2E_BASE_URL} 不可达"
-    sleep 0.5
-  done
-  log "隧道就绪:$OC_E2E_BASE_URL"
 fi
 
-# ── 密码:显式 > 本地文件 > ssh 读单一权威 ────────────────────────────────────
+for i in $(seq 1 40); do
+  if curl -sf -m 3 "${OC_E2E_BASE_URL}/api/public/config" >/dev/null 2>&1; then break; fi
+  [ "$i" = 40 ] && die "目标就绪超时:${OC_E2E_BASE_URL}"
+  sleep 0.5
+done
+
 if [ -z "${OC_E2E_PASSWORD:-}" ]; then
-  if [ -n "${OC_E2E_PASSWORD_FILE:-}" ] && [ -f "${OC_E2E_PASSWORD_FILE}" ]; then
-    OC_E2E_PASSWORD="$(tr -d '\n' < "${OC_E2E_PASSWORD_FILE}")"
+  if [ -n "${OC_E2E_PASSWORD_FILE:-}" ] && [ -f "$OC_E2E_PASSWORD_FILE" ]; then
+    OC_E2E_PASSWORD="$(tr -d '\n' < "$OC_E2E_PASSWORD_FILE")"
   else
-    PW_HOST="${OC_E2E_PW_HOST:-kl-mirror}"
-    PW_FILE="${OC_E2E_CANARY_PW_FILE:-/root/.secrets/v5-canary.password}"
-    log "经 ssh ${PW_HOST} 读密码单一权威(${PW_FILE})"
-    OC_E2E_PASSWORD="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$PW_HOST" "cat ${PW_FILE}" | tr -d '\n')" \
-      || die "无法读取 canary 密码(ssh ${PW_HOST} ${PW_FILE})"
+    PW_FILE="${OC_E2E_EVALS_PW_FILE:-/root/.secrets/v5-evals.password}"
+    log "经 ssh ${PW_HOST} 读 v5-evals 密码单一权威"
+    OC_E2E_PASSWORD="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$PW_HOST" "cat '$PW_FILE'" | tr -d '\n')" \
+      || die "无法读取 ${PW_FILE}"
   fi
 fi
-[ -n "${OC_E2E_PASSWORD:-}" ] || die "OC_E2E_PASSWORD 为空:无法登录"
+[ -n "${OC_E2E_PASSWORD:-}" ] || die "OC_E2E_PASSWORD 为空"
 export OC_E2E_PASSWORD OC_E2E_BASE_URL
 
-log "目标=${OC_E2E_BASE_URL}  账号=${OC_E2E_EMAIL:-v5-canary@claudeai.chat}  模型=${OC_E2E_MODEL:-gpt-5.6-sol}"
-[ -n "${OC_E2E_PG_URL:-}" ] && log "direct-timeline DB 注入:已配置 OC_E2E_PG_URL" || log "direct-timeline DB 注入:未配置 → 用例 2/5 将 skip-with-reason"
-
-# ── 串行跑(浏览器复用 ms-playwright 缓存,免下载)────────────────────────────
-export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-set +e
-./node_modules/.bin/playwright test "$@"
-RC=$?
-set -e
-
-echo
-log "═══ 汇总 ═══"
-if [ -f reports/results.json ]; then
-  node -e '
-    const r=require("./reports/results.json");
-    let pass=0,fail=0,skip=0,flaky=0;
-    const walk=(s)=>{(s.suites||[]).forEach(walk);(s.specs||[]).forEach(sp=>sp.tests.forEach(t=>{
-      const st=t.results.at(-1)?.status; const ok=t.status;
-      if(ok==="skipped")skip++; else if(ok==="expected")pass++; else if(ok==="flaky")flaky++; else fail++;
-      const tag = ok==="skipped"?"SKIP":ok==="expected"?"PASS":ok==="flaky"?"FLAKY":"FAIL";
-      const reason=t.results.at(-1)?.errors?.[0]?.message||t.annotations?.find(a=>a.type==="skip")?.description||"";
-      console.log(`  [${tag}] ${sp.title}${reason?"  — "+String(reason).split("\n")[0].slice(0,120):""}`);
-    }))};
-    (r.suites||[]).forEach(walk);
-    console.log(`\n  PASS=${pass} FAIL=${fail} SKIP=${skip} FLAKY=${flaky}`);
-  ' 2>/dev/null || log "(无法解析 reports/results.json)"
+if [ -z "${OC_E2E_PG_URL:-}" ]; then
+  V5_ENV="${OC_E2E_REMOTE_ENV:-/etc/openclaude/commercial-v5.env}"
+  DB_URL="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$PW_HOST" \
+    "set -a; . '$V5_ENV'; printf '%s' \"\$DATABASE_URL\"")" || die "无法读取远端 DATABASE_URL"
+  [ -n "$DB_URL" ] || die "远端 DATABASE_URL 为空"
+  read -r DB_HOST DB_PORT < <(DB_URL="$DB_URL" node -e '
+    const u=new URL(process.env.DB_URL); process.stdout.write(`${u.hostname} ${u.port||5432}`)
+  ')
+  PG_LOCAL_PORT="$(free_port)"
+  log "建 PG 隧道 127.0.0.1:${PG_LOCAL_PORT} → ${PW_HOST}:${DB_HOST}:${DB_PORT}"
+  ssh -N -o ExitOnForwardFailure=yes -o BatchMode=yes -o ConnectTimeout=10 \
+    -L "${PG_LOCAL_PORT}:${DB_HOST}:${DB_PORT}" "$PW_HOST" &
+  PIDS+=("$!")
+  export OC_E2E_PG_URL="$(DB_URL="$DB_URL" PG_LOCAL_PORT="$PG_LOCAL_PORT" node -e '
+    const u=new URL(process.env.DB_URL); u.hostname="127.0.0.1"; u.port=process.env.PG_LOCAL_PORT;
+    process.stdout.write(u.toString())
+  ')"
 fi
-log "HTML 报告:reports/html/index.html  (npm run report 打开)"
-exit $RC
+
+for i in $(seq 1 40); do
+  if psql "$OC_E2E_PG_URL" -X -tAc 'SELECT 1' >/dev/null 2>&1; then break; fi
+  [ "$i" = 40 ] && die "PG 隧道/连接就绪超时"
+  sleep 0.5
+done
+
+if [ -z "${OC_E2E_SESSION_PREFIX:-}" ]; then
+  export OC_E2E_SESSION_PREFIX="e2e-$(openssl rand -hex 12)-"
+fi
+[[ "$OC_E2E_SESSION_PREFIX" =~ ^e2e-[a-z0-9]+-$ ]] || die "OC_E2E_SESSION_PREFIX 非法"
+
+MATRIX=(gpt-5.6-luna deepseek-v4-flash)
+for model in "${MATRIX[@]}"; do
+  export OC_E2E_MATRIX_MODEL="$model"
+  key="${model//[^a-zA-Z0-9_-]/_}"
+  rm -rf "reports/$key" "test-results/$key"
+  log "运行固定矩阵模型=$model 目标=$OC_E2E_BASE_URL 身份=$OC_E2E_EMAIL"
+  if ! ./node_modules/.bin/playwright test "$@"; then
+    log "模型 $model 失败；立即停止矩阵，让 deploy-v5 在同一 mutation lease 内官方 abort"
+    exit 1
+  fi
+  RESULTS_FILE="reports/$key/results.json" node -e '
+    const r=require("./"+process.env.RESULTS_FILE); let pass=0,fail=0,skip=0,flaky=0;
+    const walk=s=>{(s.suites||[]).forEach(walk);(s.specs||[]).forEach(sp=>sp.tests.forEach(t=>{
+      if(t.status==="skipped")skip++; else if(t.status==="expected")pass++; else if(t.status==="flaky")flaky++; else fail++;
+    }))}; (r.suites||[]).forEach(walk);
+    console.log(`[e2e] ${process.env.RESULTS_FILE}: PASS=${pass} FAIL=${fail} SKIP=${skip} FLAKY=${flaky}`);
+    if(fail||skip||flaky) process.exit(1);
+  ' || die "$model 报告包含 FAIL/SKIP/FLAKY"
+done
+
+log "固定双模型矩阵全部通过（Luna/Codex + DeepSeek V4 Flash/CCB）"

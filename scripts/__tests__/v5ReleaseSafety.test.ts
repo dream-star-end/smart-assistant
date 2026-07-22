@@ -12,6 +12,8 @@ const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
 const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
 const turnCanary = path.join(root, 'scripts/v5-smoke-turn-canary.mjs')
+const sessionDisplayRunner = path.join(root, 'e2e/session-display/run.sh')
+const incidentManifest = path.join(root, 'e2e/session-display/incidents.json')
 const baselineEval = path.join(root, 'scripts/run-baseline-skill-evals.sh')
 const baselineWeekly = path.join(root, 'scripts/v5-baseline-evals-weekly.sh')
 const marketEval = path.join(root, 'scripts/v5-market-skill-eval.sh')
@@ -4551,7 +4553,11 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       'reclaim 必须跳过本地 deploy lock 获取',
     )
     assert.match(source, /reclaim-mutation-lease\) ;;\n {2}# knowledge-planet-verify/, 'reclaim 必须跳过全局 mutation lease 获取')
-    assert.match(source, /"\$MODE" != "reclaim-mutation-lease" \]\]; then\n {2}assert_no_deploy_recovery_marker/, 'reclaim 必须能在 recovery marker 存在时照跑')
+    assert.match(
+      source,
+      /"\$MODE" != "reclaim-mutation-lease" && "\$MODE" != "hide-luna" \]\]; then\n {2}assert_no_deploy_recovery_marker/,
+      'reclaim 必须能在 recovery marker 存在时照跑',
+    )
   })
 
   test('mutation holder releases its flock after its session parent is SIGKILLed', async () => {
@@ -4843,6 +4849,96 @@ wait $!
     assert.match(source, /getByRole\("button", \{ name: "开始目标" \}\)\.click\(\)/)
     assert.match(source, /getByRole\("button", \{ name: \/清除\/ \}\)\.click\(\)/)
     assert.doesNotMatch(source, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
+  })
+
+  test('candidate release gate is fixed-model, zero-skip, evidenced, and aborts before diagnosis', async () => {
+    const [source, runner, manifestRaw] = await Promise.all([
+      readFile(deploy, 'utf8'),
+      readFile(sessionDisplayRunner, 'utf8'),
+      readFile(incidentManifest, 'utf8'),
+    ])
+    const manifest = JSON.parse(manifestRaw)
+    assert.deepEqual(manifest.fixedLiveMatrix, [
+      { engine: 'codex', model: 'gpt-5.6-luna' },
+      { engine: 'ccb', model: 'deepseek-v4-flash' },
+    ])
+    assert.match(runner, /MATRIX=\(gpt-5\.6-luna deepseek-v4-flash\)/)
+    assert.match(runner, /OC_E2E_EMAIL="v5-evals@claudeai\.chat"/)
+    assert.match(runner, /OC_E2E_REQUIRE_DIRECT_TIMELINE=1/)
+    assert.match(runner, /export CI=1/)
+    assert.match(runner, /if\(fail\|\|skip\|\|flaky\)/)
+    assert.match(runner, /\[ -z "\$\{OC_E2E_MODEL:-\}" \] \|\| die "OC_E2E_MODEL 已废止；模型矩阵不可覆盖"/)
+    assert.doesNotMatch(runner, /OC_E2E_MODEL:-[a-z0-9]/)
+
+    const canaryStart = source.indexOf('\ncanary() {')
+    const canaryEnd = source.indexOf('\n# 内部账号 allowlist', canaryStart)
+    const canary = source.slice(canaryStart, canaryEnd)
+    const routingVerify = canary.indexOf('v5-caddy-apply.sh" --verify')
+    const egressPreflight = canary.indexOf('begin_candidate_egress_transition', routingVerify)
+    const fixedGate = canary.indexOf('run_candidate_release_verification', routingVerify)
+    const failure = canary.indexOf('candidate regression gate failed', fixedGate)
+    const abort = canary.indexOf('\n    abort', failure)
+    const closeFailed = canary.indexOf('close_release_verification_run failed', abort)
+    const recoveryVerify = canary.indexOf('verify_stable_predecessor_after_gate_failure', closeFailed)
+    assert.ok(
+      routingVerify >= 0 && egressPreflight > routingVerify && fixedGate > egressPreflight && failure > fixedGate && abort > failure &&
+        closeFailed > abort && recoveryVerify > closeFailed,
+      'candidate gate failure must issue official abort first, then close evidence and verify predecessor',
+    )
+    assert.match(source, /release_verification_evidence/)
+    assert.match(source, /npm run check:v5:incidents/)
+    assert.match(source, /expected_generation/)
+    assert.match(source, /gate failure abort 后 runtime tuple 未恢复 exact predecessor/)
+    assert.match(source, /gate failure abort 后 egress 未恢复 exact predecessor/)
+    assert.match(source, /release_egress_transitions/)
+
+    const finalizeStart = source.indexOf('\nfinalize() {')
+    const finalizeEnd = source.indexOf('\n# finalize step1', finalizeStart)
+    const finalize = source.slice(finalizeStart, finalizeEnd)
+    assert.match(finalize, /assert_release_verification_evidence/)
+    assert.match(finalize, /缺 exact release\/generation fixed-matrix evidence；第一动作=官方 abort/)
+    assert.ok(
+      finalize.indexOf('assert_release_verification_evidence') < finalize.indexOf('knowledge_planet_plugin_assert_release_compatible'),
+      'finalize evidence gate must run before other candidate investigation/gates',
+    )
+    assert.ok(
+      finalize.indexOf('finalize_run_steps') < finalize.indexOf('finalize_ready_egress_transition'),
+      'egress must activate only after the master candidate has committed stable',
+    )
+
+    const sourced = spawnSync('bash', ['-c',
+      'V5_DEPLOY_SOURCE_ONLY=1 source "$1" --dry-run; declare -F close_emergency_debt set_luna_visibility run_candidate_release_verification >/dev/null',
+      'bash', deploy,
+    ], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    assert.equal(sourced.status, 0, sourced.stderr || sourced.stdout)
+  })
+
+  test('dx-declared emergency containment skips only the full gate and leaves durable blocking debt', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /--emergency-containment=\*/)
+    assert.match(source, /--emergency-approval=\*/)
+    assert.match(source, /--emergency-commit=\*/)
+    assert.match(source, /assert_emergency_source_provenance/)
+    assert.match(source, /git ls-remote --heads origin/)
+    assert.match(source, /MUTATION_DEPLOY_ID="\$deploy_id"/)
+    assert.match(source, /INSERT INTO emergency_containment_debts/)
+    assert.match(source, /open emergency containment debt=.*所有非恢复生产变更被阻断/)
+    assert.match(source, /abort\|rollback\|recover\|hide-luna\) return 0/)
+    assert.match(source, /--close-emergency-debt=\*/)
+    assert.match(source, /codexReview!=='PASS'/)
+    assert.match(source, /regressionTests!=='PASS'/)
+    assert.match(source, /j\.ci!=='PASS'/)
+    assert.match(source, /j\.commit!==process\.argv\[3\]/)
+
+    const canaryStart = source.indexOf('\ncanary() {')
+    const canaryEnd = source.indexOf('\n# 内部账号 allowlist', canaryStart)
+    const canary = source.slice(canaryStart, canaryEnd)
+    const emergencyBranch = canary.indexOf('dx-declared emergency containment')
+    const fullGate = canary.indexOf('run_candidate_release_verification')
+    assert.ok(emergencyBranch >= 0 && fullGate > emergencyBranch)
+    assert.match(canary, /if \[\[ -n "\$EMERGENCY_INCIDENT" \]\]; then[\s\S]*elif ! run_candidate_release_verification/)
+    assert.match(source, /publish-luna\) set_luna_visibility public/)
+    assert.match(source, /Luna public 只允许 stable active exact release\/generation/)
   })
 
   test('real-turn canary requires exact answer and keeps reconnect signals attempt-local', async () => {

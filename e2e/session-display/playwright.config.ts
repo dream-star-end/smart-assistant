@@ -5,6 +5,11 @@ import { defineConfig, devices } from '@playwright/test';
 // 浏览器复用 ms-playwright 缓存里的 chromium(@playwright/test@1.60 → chromium-1223,已缓存,免下载)。
 
 const TURN_TIMEOUT = Number(process.env.OC_E2E_TURN_TIMEOUT ?? 120_000);
+const MATRIX_MODEL = process.env.OC_E2E_MATRIX_MODEL;
+if (MATRIX_MODEL !== 'gpt-5.6-luna' && MATRIX_MODEL !== 'deepseek-v4-flash') {
+  throw new Error('OC_E2E_MATRIX_MODEL must be the fixed Luna/DeepSeek matrix member');
+}
+const REPORT_KEY = MATRIX_MODEL.replace(/[^a-zA-Z0-9_-]/g, '_');
 
 export default defineConfig({
   testDir: './tests',
@@ -16,11 +21,12 @@ export default defineConfig({
   timeout: TURN_TIMEOUT * 2 + 60_000,
   expect: { timeout: 15_000 },
   // 报告目录与测试产物目录(outputDir,默认 test-results)分离,避免 HTML reporter 清空产物。
-  outputDir: 'test-results',
+  outputDir: `test-results/${REPORT_KEY}`,
   reporter: [
     ['list'],
-    ['json', { outputFile: 'reports/results.json' }],
-    ['html', { outputFolder: 'reports/html', open: 'never' }],
+    ['json', { outputFile: `reports/${REPORT_KEY}/results.json` }],
+    ['junit', { outputFile: `reports/${REPORT_KEY}/junit.xml` }],
+    ['html', { outputFolder: `reports/${REPORT_KEY}/html`, open: 'never' }],
   ],
   use: {
     baseURL: process.env.OC_E2E_BASE_URL,

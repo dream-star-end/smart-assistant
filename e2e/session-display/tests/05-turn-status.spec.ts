@@ -3,7 +3,7 @@
 // 未部署迁移 0176 / 无注入通道 → skip-with-reason。
 
 import { test, expect } from '../fixtures';
-import { config, mintSessionId } from '../lib/env';
+import { config, directTimelineRequired, mintSessionId } from '../lib/env';
 import { SeedUnavailable, requireDirectTimeline, seedTurnStatuses, cleanupSeed } from '../lib/seed';
 import { loginViaUi, openSession, SEL, TEXT } from '../lib/ui';
 import { mintClientMessageId } from '../lib/ws';
@@ -15,6 +15,7 @@ test('verified turn status:未计费状态展示 + late-tape 状态不显示', a
   try {
     requireDirectTimeline();
   } catch (err) {
+    if (directTimelineRequired()) throw err;
     test.skip(true, `direct-timeline/注入通道不可用,跳过状态用例:${(err as Error).message}`);
     return;
   }
@@ -65,6 +66,7 @@ test('verified turn status:未计费状态展示 + late-tape 状态不显示', a
     ).toHaveCount(1);
   } catch (err) {
     if (err instanceof SeedUnavailable) {
+      if (directTimelineRequired()) throw err;
       test.skip(true, `direct-timeline 注入失败,跳过:${err.message}`);
       return;
     }

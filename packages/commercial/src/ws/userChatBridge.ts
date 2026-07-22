@@ -82,6 +82,11 @@ import {
   permanentCodexWaiverReason,
   type CodexFinalizeHandle,
 } from "../billing/codexFinalizer.js";
+import {
+  admitVerificationSponsorship,
+  parseVerificationSponsorshipSnapshot,
+  serializeVerificationSponsorshipSnapshot,
+} from "../billing/verificationSponsorship.js";
 import type { TokenUsage } from "../billing/calculator.js";
 import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
@@ -4342,6 +4347,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // durable dispatch:复用受理铸的稳定 billingRequestId 作 server requestId
               // (接管跨 attempt 稳定;journal/票据/结算全绑同一值)。
               const requestId = dispatchRecordB ? dispatchRecordB.billingRequestId : ensureRequestIdServerSide();
+              let verificationSponsorship;
+              try {
+                verificationSponsorship = await admitVerificationSponsorship(pgPool, {
+                  requestId,
+                  userId: uid,
+                  model: effectiveModel,
+                  sessionId: peerIdForAcquire,
+                });
+              } catch (err) {
+                turnLogCapture?.error("user-chat-bridge: verification sponsorship admission failed", { err });
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendTurnErrorFrame("CODEX_BILLING", "billing verification unavailable");
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              if (!isCurrentCodexTurnState(codexTurnState)) {
+                releaseAcquiredSlotForFailure();
+                return;
+              }
               // 先铸 turnId 再落 journal；随后签票必须复用同一值，并把 billingRequestId
               // 绑到 requestId。这样进程崩溃后只读 journal 也能复原“哪张票对应哪笔账”。
               const authorityTurnId = authorityExec !== null
@@ -4421,6 +4446,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     // 已复合 agent override 的最终价格。跨 bridge 恢复必须用这份
                     // server-owned 快照，不能在结算时回读已换代的 cache/override。
                     billingPricing: serializeBillingPricing(derivedPricing),
+                    ...(verificationSponsorship === null
+                      ? {}
+                      : { verificationSponsorship: serializeVerificationSponsorshipSnapshot(verificationSponsorship) }),
                     // P0 修复(2026-07-03)— 跨桥 settle 需要:billing 帧到达新桥
                     // (旧桥已关)时,journal ctx 是恢复 settle 的唯一权威上下文,
                     // traceId 让跨桥的 cost_charged 广播 / billing 日志仍钉回本
@@ -4566,6 +4594,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     // attempt_no(与 journal 列一致)。legacy turn(无 dispatch)→ null。
                     dispatchId: dispatchRecordB?.dispatchId ?? null,
                     attemptNo: dispatchRecordB?.attemptNo ?? null,
+                    verificationSponsorship,
                   });
                   snapState = { kind: "handle", handle };
                   return handle;
@@ -6411,6 +6440,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             derivedPricing,
             reservation,
             authority: recoveredAuthority,
+            verificationSponsorship: parseVerificationSponsorshipSnapshot(ctx.verificationSponsorship),
             dispatchId: crossBridgeDispatchId,
             attemptNo: crossBridgeAttemptNo,
           });

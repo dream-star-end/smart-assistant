@@ -22,6 +22,7 @@ import {
   makeCodexFinalizer,
   permanentCodexWaiverReason,
 } from "./codexFinalizer.js";
+import { parseVerificationSponsorshipSnapshot } from "./verificationSponsorship.js";
 import { parseBillingPricing } from "./persistedBillingPricing.js";
 import type { PricingCache } from "./pricing.js";
 import {
@@ -323,6 +324,7 @@ export async function settleDurableCodexBilling(
     authority,
     dispatchId,
     attemptNo,
+    verificationSponsorship: parseVerificationSponsorshipSnapshot(ctx.verificationSponsorship),
   });
   try {
     await finalizer.commit(usageFromFrame(frame), frame.status, {

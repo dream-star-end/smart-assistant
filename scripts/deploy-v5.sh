@@ -218,6 +218,9 @@ ENABLE_BUNDLE_FLAG=0; ENABLE_RELEASE_FLAG=0
 DISABLE_BUNDLE_FLAG=0; DISABLE_RELEASE_FLAG=0
 # --emergency-tuple 的显式候选(R2-M1;空=取当前 env 现值)
 EMERG_IMAGE=""; EMERG_IMAGE_ID=""; EMERG_BUNDLE=""
+# dx-declared P0 containment lane. These values are invalid unless supplied as one exact set.
+EMERGENCY_INCIDENT=""; EMERGENCY_APPROVAL=""; EMERGENCY_COMMIT=""
+EMERGENCY_CLOSE_INCIDENT=""; PROTECTED_MERGE_SHA=""; CI_EVIDENCE_FILE=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
@@ -271,6 +274,14 @@ for arg in "$@"; do
     --drain-ws) DRAIN_WS=1 ;;
     --abort) MODE="abort" ;;
     --recover) MODE="recover" ;;
+    --emergency-containment=*) EMERGENCY_INCIDENT="${arg#*=}" ;;
+    --emergency-approval=*) EMERGENCY_APPROVAL="${arg#*=}" ;;
+    --emergency-commit=*) EMERGENCY_COMMIT="${arg#*=}" ;;
+    --close-emergency-debt=*) MODE="close-emergency-debt"; EMERGENCY_CLOSE_INCIDENT="${arg#*=}" ;;
+    --protected-merge-sha=*) PROTECTED_MERGE_SHA="${arg#*=}" ;;
+    --ci-evidence-file=*) CI_EVIDENCE_FILE="${arg#*=}" ;;
+    --publish-luna) MODE="publish-luna" ;;
+    --hide-luna) MODE="hide-luna" ;;
     --cutover-nonce=*) CUTOVER_NONCE="${arg#*=}" ;;
     --target-image=*) CUTOVER_TARGET_IMAGE="${arg#*=}" ;;
     # egress split(2026-07-02):openclaude-v5-egress 持有在飞 LLM 流,默认部署
@@ -280,6 +291,24 @@ for arg in "$@"; do
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done
+if [[ -n "$EMERGENCY_INCIDENT$EMERGENCY_APPROVAL$EMERGENCY_COMMIT" ]]; then
+  [[ -n "$EMERGENCY_INCIDENT" && -n "$EMERGENCY_APPROVAL" && -n "$EMERGENCY_COMMIT" ]] \
+    || { echo "✗ emergency containment 必须同时提供 incident/approval/exact commit" >&2; exit 2; }
+  [[ "$MODE" == canary || "$MODE" == finalize ]] \
+    || { echo "✗ emergency containment 参数只允许 --canary / --finalize" >&2; exit 2; }
+  [[ "$EMERGENCY_INCIDENT" =~ ^INC-[0-9]{8}-[A-Z0-9-]{3,40}$ ]] \
+    || { echo "✗ emergency incident id 非法:$EMERGENCY_INCIDENT" >&2; exit 2; }
+  [[ ${#EMERGENCY_APPROVAL} -ge 8 && ${#EMERGENCY_APPROVAL} -le 256 ]] \
+    || { echo "✗ emergency approval ref 长度需 8..256" >&2; exit 2; }
+  [[ "$EMERGENCY_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+    || { echo "✗ emergency exact commit 必须是 40 位小写 sha" >&2; exit 2; }
+fi
+if [[ "$MODE" == close-emergency-debt ]]; then
+  [[ "$EMERGENCY_CLOSE_INCIDENT" =~ ^INC-[0-9]{8}-[A-Z0-9-]{3,40}$ ]] \
+    || { echo "✗ --close-emergency-debt incident id 非法" >&2; exit 2; }
+  [[ "$PROTECTED_MERGE_SHA" =~ ^[0-9a-f]{40}$ && -f "$CI_EVIDENCE_FILE" ]] \
+    || { echo "✗ close debt 需要 --protected-merge-sha=<40sha> + --ci-evidence-file=<json>" >&2; exit 2; }
+fi
 [[ "$MODE" == "rollback" && ! "$ROLLBACK_N" =~ ^[1-5]$ ]] && { echo "✗ --rollback=N 需 N∈1..5" >&2; exit 2; }
 [[ "$MODE" == "promote" && ! "$PROMOTE_PCT" =~ ^([0-9]|[1-9][0-9]|100)$ ]] && { echo "✗ --promote=<pct> 需 pct∈0..100" >&2; exit 2; }
 [[ "$MODE" == "knowledge-planet-verify" && ! "$KNOWLEDGE_PLANET_VERIFY_USER" =~ ^[1-9][0-9]{0,15}$ ]] \
@@ -863,6 +892,8 @@ MUTATION_LEASE_TTL_START=""
 MUTATION_LEASE_TTL_PGID=""  # 独立 PGID，outer 整组 STOP/KILL 时 deadline 仍推进
 MUTATION_LEASE_ACTIVE=0     # 1=已持有,cleanup 需释放
 MUTATION_LEASE_BYPASSED=0   # 1=OC_V5_SKIP_MUTATION_LEASE 紧急旁路,活性断言直接放行
+MUTATION_DEPLOY_ID=""       # 与 lease fencing meta 的 deploy_id 同值；不是 lane marker nonce
+MUTATION_HOLDER_IDENTITY=""
 KNOWLEDGE_PLANET_VERIFY_HOLDER_OWNED=0
 MUTATION_LANE_PID=""
 MUTATION_LANE_START=""
@@ -1196,6 +1227,8 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] acquire production-mutation lease @ $KL_HOST:$PRODUCTION_MUTATION_LOCK(后台 ssh flock -w ${lease_wait} fd 9,读 LEASED,超时 ${poll_ceiling}s)"
     MUTATION_LEASE_ACTIVE=1
+    MUTATION_DEPLOY_ID="000000000000000000000000"
+    MUTATION_HOLDER_IDENTITY="dry-run"
     return 0
   fi
   local out got=0 waited=0 remote_script ttl_isolated=0 holder_isolated=0 i
@@ -1345,6 +1378,8 @@ done"
     echo "  稍后重试或核查 $KL_HOST:$PRODUCTION_MUTATION_LOCK。紧急旁路(仅 runbook 记载):OC_V5_SKIP_MUTATION_LEASE=1。" >&2
     return 1
   fi
+  MUTATION_DEPLOY_ID="$deploy_id"
+  MUTATION_HOLDER_IDENTITY="$holder_host:$$:$MODE"
   echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,本地安全 TTL ${local_ttl}s,远端 holder 硬 TTL ${lease_ttl}s,deploy_id=$deploy_id)"
   return 0
 }
@@ -7099,8 +7134,469 @@ vip_control_gate() {
 }
 
 # ═════════ lane: --canary ═════════
+assert_emergency_source_provenance() {
+  [[ -n "$EMERGENCY_INCIDENT" ]] || return 0
+  local head remote_refs
+  head="$(git rev-parse HEAD)"
+  [[ "$BR" == "feat/v5-aurora-rewrite" ]] \
+    || { echo "✗ emergency lane 只允许 canonical feat/v5-aurora-rewrite" >&2; return 1; }
+  [[ "$head" == "$EMERGENCY_COMMIT" ]] \
+    || { echo "✗ emergency exact commit != canonical HEAD($EMERGENCY_COMMIT != $head)" >&2; return 1; }
+  [[ -z "$(git status --porcelain)" ]] \
+    || { echo "✗ emergency canonical 必须 clean" >&2; return 1; }
+  remote_refs="$(env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
+    git ls-remote --heads origin 2>/dev/null || true)"
+  grep -Eq "^${EMERGENCY_COMMIT}[[:space:]]+refs/heads/" <<<"$remote_refs" \
+    || { echo "✗ emergency commit 未证明已 push 到 origin 任一 task branch" >&2; return 1; }
+  [[ "$MUTATION_LEASE_BYPASSED" != 1 && -n "$MUTATION_DEPLOY_ID" && -n "$MUTATION_HOLDER_IDENTITY" ]] \
+    || { echo "✗ emergency lane 禁止 mutation lease 旁路，且必须取得 fencing identity" >&2; return 1; }
+  echo "  ✓ emergency provenance:canonical clean/exact HEAD/remote branch/mutation holder"
+}
+
+authorize_emergency_debt() {
+  [[ -n "$EMERGENCY_INCIDENT" ]] || return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] consume durable emergency authorization/debt"; return 0; }
+  assert_emergency_source_provenance || return 1
+  local nonce nonce_hash
+  nonce="$(openssl rand -hex 32)"; nonce_hash="$(printf '%s' "$nonce" | sha256sum | awk '{print $1}')"
+  ds_exec <<SQL >/dev/null
+INSERT INTO emergency_containment_debts(
+  incident_id,approval_ref,exact_commit,deploy_id,holder_identity,authorization_nonce_hash
+) VALUES (
+  '$(ds_lit "$EMERGENCY_INCIDENT")','$(ds_lit "$EMERGENCY_APPROVAL")','$EMERGENCY_COMMIT',
+  '$MUTATION_DEPLOY_ID','$(ds_lit "$MUTATION_HOLDER_IDENTITY")','$nonce_hash'
+) ON CONFLICT (incident_id) DO NOTHING;
+SQL
+  local authorized
+  authorized="$(ds_exec <<SQL
+SELECT count(*) FROM emergency_containment_debts
+ WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='open'
+   AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND exact_commit='$EMERGENCY_COMMIT';
+SQL
+)"
+  [[ "$authorized" == 1 ]] \
+    || { echo "✗ emergency durable authorization 与 incident/approval/commit 不一致" >&2; return 1; }
+  echo "  ✓ emergency authorization durably consumed/resumed:$EMERGENCY_INCIDENT deploy_id=$MUTATION_DEPLOY_ID"
+}
+
+bind_emergency_candidate_release() {
+  local release="$1"
+  [[ -n "$EMERGENCY_INCIDENT" ]] || return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] bind emergency debt → $release"; return 0; }
+  ds_exec <<SQL >/dev/null
+UPDATE emergency_containment_debts
+   SET candidate_release='$(ds_lit "$release")'
+ WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='open'
+   AND exact_commit='$EMERGENCY_COMMIT' AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")'
+   AND candidate_release IS NULL;
+SQL
+  local bound
+  bound="$(ds_exec <<SQL
+SELECT count(*) FROM emergency_containment_debts
+ WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='open'
+   AND exact_commit='$EMERGENCY_COMMIT' AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")'
+   AND candidate_release='$(ds_lit "$release")';
+SQL
+)"
+  [[ "$bound" == 1 ]] || { echo "✗ emergency debt 未绑定 exact candidate release" >&2; return 1; }
+}
+
+assert_emergency_debt_gate() {
+  [[ "$DRY" == 1 ]] && return 0
+  local open_id
+  open_id="$(ds_exec <<'SQL'
+SELECT coalesce((SELECT incident_id FROM emergency_containment_debts WHERE status='open'),'');
+SQL
+)"
+  if [[ -z "$open_id" ]]; then
+    [[ "$MODE" != finalize || -z "$EMERGENCY_INCIDENT" ]] \
+      || { echo "✗ emergency finalize 缺 durable open debt" >&2; return 1; }
+    return 0
+  fi
+  case "$MODE" in
+    abort|rollback|recover|hide-luna) return 0 ;;
+    close-emergency-debt)
+      [[ "$open_id" == "$EMERGENCY_CLOSE_INCIDENT" ]] \
+        || { echo "✗ open debt=$open_id，不允许关闭其它 incident" >&2; return 1; }
+      return 0 ;;
+    canary|finalize)
+      [[ -n "$EMERGENCY_INCIDENT" && "$open_id" == "$EMERGENCY_INCIDENT" ]] \
+        || { echo "✗ open emergency debt=$open_id；非同一 emergency lane 禁止发布" >&2; return 1; }
+      return 0 ;;
+    *) echo "✗ open emergency containment debt=$open_id；补测试/Codex/CI/protected merge 并关闭前，所有非恢复生产变更被阻断" >&2; return 1 ;;
+  esac
+}
+
+assert_emergency_finalize_authorized() {
+  [[ -n "$EMERGENCY_INCIDENT" ]] || return 1
+  local ok
+  ok="$(ds_exec <<SQL
+SELECT count(*) FROM emergency_containment_debts
+ WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='open'
+   AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND exact_commit='$EMERGENCY_COMMIT'
+   AND candidate_release='$(ds_lit "$DS_candidate_release")';
+SQL
+)"
+  [[ "$ok" == 1 ]] || { echo "✗ emergency finalize authorization 与 durable debt/candidate 不一致" >&2; return 1; }
+}
+
+VERIFICATION_RUN_ID=""
+VERIFICATION_SESSION_PREFIX=""
+create_release_verification_run() {
+  local release="$1" generation="$2" prefix row
+  prefix="e2e-$(openssl rand -hex 12)-"
+  row="$(ds_exec <<SQL
+WITH eval_user AS (
+  SELECT id FROM users WHERE email='v5-evals@claudeai.chat' AND credits > 0
+), ready AS (
+  SELECT (SELECT count(*) FROM eval_user)=1
+     AND EXISTS (SELECT 1 FROM model_catalog WHERE model_id='gpt-5.6-luna' AND state='active'
+                  AND engine='codex' AND provider_id='codex')
+     AND EXISTS (SELECT 1 FROM model_pricing WHERE model_id='gpt-5.6-luna'
+                  AND enabled IS TRUE AND visibility='hidden')
+     AND (SELECT count(*) FROM model_pricing p,eval_user u
+           WHERE p.model_id IN ('gpt-5.6-luna','deepseek-v4-flash') AND p.enabled IS TRUE
+             AND (p.visibility='public' OR EXISTS (
+               SELECT 1 FROM model_visibility_grants g
+                WHERE g.user_id=u.id AND g.model_id=p.model_id
+             )))=2 AS ok
+), ins AS (
+  INSERT INTO verification_runs(
+    token_hash,user_id,session_prefix,allowed_models,expected_release,
+    expected_generation,approval_ref,expires_at
+  )
+  SELECT encode(public.digest(convert_to('$prefix','UTF8'),'sha256'),'hex'),u.id,'$prefix',
+         ARRAY['deepseek-v4-flash','gpt-5.6-luna']::text[],
+         '$(ds_lit "$release")',$generation,'deploy:$(ds_lit "$OP")',NOW()+INTERVAL '90 minutes'
+    FROM eval_user u,ready r WHERE r.ok
+  RETURNING id::text,session_prefix
+)
+SELECT id || '|' || session_prefix FROM ins;
+SQL
+)" || return 1
+  [[ -n "$row" ]] || {
+    echo "✗ v5-evals/Luna hidden activation/two model grants/positive precheck balance 不完整" >&2
+    return 1
+  }
+  IFS='|' read -r VERIFICATION_RUN_ID VERIFICATION_SESSION_PREFIX <<<"$row"
+  [[ "$VERIFICATION_RUN_ID" =~ ^[0-9a-f-]{36}$ && "$VERIFICATION_SESSION_PREFIX" =~ ^e2e-[a-z0-9]+-$ ]] \
+    || { echo "✗ verification run identity 非法:$row" >&2; return 1; }
+  echo "  ✓ verification run=$VERIFICATION_RUN_ID prefix=$VERIFICATION_SESSION_PREFIX"
+}
+
+close_release_verification_run() {
+  local status="$1"
+  [[ -n "$VERIFICATION_RUN_ID" ]] || return 0
+  ds_exec <<SQL >/dev/null
+UPDATE verification_runs SET status='$status',closed_at=NOW()
+ WHERE id='$VERIFICATION_RUN_ID' AND status='active';
+SQL
+}
+
+current_egress_release() {
+  ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true
+}
+
+begin_candidate_egress_transition() { # <candidate-release> <generation>
+  local release="$1" generation="$2" predecessor current
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] test candidate egress then restore exact predecessor"; return 0; }
+  predecessor="$CAPTURED_EGRESS_PREDECESSOR"
+  current="$(current_egress_release)"
+  [[ -n "$predecessor" && "$current" == "$predecessor" ]] \
+    || { echo "✗ candidate egress predecessor drift(expected=$predecessor actual=${current:-<none>})" >&2; return 1; }
+  assert_release_marker "$predecessor" egress || return 1
+  ds_exec <<SQL >/dev/null
+INSERT INTO release_egress_transitions(release_id,generation,predecessor_release,status)
+VALUES ('$(ds_lit "$release")',$generation,'$(ds_lit "$predecessor")','testing');
+SQL
+  if ! activate_egress_release "$release" "$predecessor"; then
+    ds_exec <<SQL >/dev/null
+UPDATE release_egress_transitions SET status='rolled_back'
+ WHERE release_id='$(ds_lit "$release")' AND generation=$generation AND status='testing';
+SQL
+    return 1
+  fi
+  echo "  ✓ candidate tests are now using egress=$release (predecessor durably pinned)"
+}
+
+complete_candidate_egress_transition() { # <candidate-release> <generation>
+  local release="$1" generation="$2" predecessor count
+  [[ "$DRY" == 1 ]] && return 0
+  predecessor="$(ds_exec <<SQL
+SELECT predecessor_release FROM release_egress_transitions
+ WHERE release_id='$(ds_lit "$release")' AND generation=$generation AND status='testing';
+SQL
+)"
+  [[ -n "$predecessor" ]] || { echo "✗ candidate egress testing row missing" >&2; return 1; }
+  activate_egress_release "$predecessor" "$release" || return 1
+  count="$(ds_exec <<SQL
+WITH changed AS (
+  UPDATE release_egress_transitions SET status='ready',ready_at=NOW()
+   WHERE release_id='$(ds_lit "$release")' AND generation=$generation AND status='testing'
+   RETURNING 1
+) SELECT count(*) FROM changed;
+SQL
+)"
+  [[ "$count" == 1 ]] || { echo "✗ candidate egress ready CAS failed" >&2; return 1; }
+  echo "  ✓ egress restored to predecessor; exact candidate transition is ready for post-finalize activation"
+}
+
+rollback_egress_transition_for_generation() { # <generation>
+  local generation="$1" row release predecessor current count
+  [[ "$DRY" == 1 ]] && return 0
+  row="$(ds_exec <<SQL
+SELECT release_id || '|' || predecessor_release FROM release_egress_transitions
+ WHERE generation=$generation AND status IN ('testing','ready');
+SQL
+)"
+  [[ -n "$row" ]] || return 0
+  IFS='|' read -r release predecessor <<<"$row"
+  current="$(current_egress_release)"
+  if [[ "$current" == "$release" ]]; then
+    activate_egress_release "$predecessor" "$release" || return 1
+  elif [[ "$current" != "$predecessor" ]]; then
+    echo "✗ abort 后 egress cwd 无法裁决(expected target=$release or predecessor=$predecessor actual=${current:-<none>})" >&2
+    return 1
+  fi
+  count="$(ds_exec <<SQL
+WITH changed AS (
+  UPDATE release_egress_transitions SET status='rolled_back',activated_at=NULL
+   WHERE generation=$generation AND status IN ('testing','ready') RETURNING 1
+) SELECT count(*) FROM changed;
+SQL
+)"
+  [[ "$count" == 1 ]] || { echo "✗ egress rollback transition CAS failed" >&2; return 1; }
+  echo "  ✓ egress transition rolled back to exact predecessor=$predecessor"
+}
+
+finalize_ready_egress_transition() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] activate ready egress transition after stable master commit"; return 0; }
+  ds_snapshot
+  [[ "$DS_phase" == stable ]] || return 0
+  local row release predecessor current count
+  row="$(ds_exec <<SQL
+SELECT release_id || '|' || predecessor_release FROM release_egress_transitions
+ WHERE release_id='$(ds_lit "$DS_active_release")' AND generation=$DS_generation AND status='ready';
+SQL
+)"
+  [[ -n "$row" ]] || return 0
+  IFS='|' read -r release predecessor <<<"$row"
+  current="$(current_egress_release)"
+  if [[ "$current" == "$predecessor" ]]; then
+    if ! activate_egress_release "$release" "$predecessor"; then
+      echo "✗ stable release egress activation failed；第一动作=官方 rollback" >&2
+      rollback
+      ds_exec <<SQL >/dev/null
+UPDATE release_egress_transitions SET status='rolled_back',activated_at=NULL
+ WHERE release_id='$(ds_lit "$release")' AND generation=$DS_generation AND status='ready';
+SQL
+      return 1
+    fi
+  elif [[ "$current" != "$release" ]]; then
+    echo "✗ stable egress handoff cwd unknown；第一动作=官方 rollback" >&2
+    rollback
+    return 1
+  fi
+  count="$(ds_exec <<SQL
+WITH changed AS (
+  UPDATE release_egress_transitions SET status='active',activated_at=NOW()
+   WHERE release_id='$(ds_lit "$release")' AND generation=$DS_generation AND status='ready'
+   RETURNING 1
+) SELECT count(*) FROM changed;
+SQL
+)"
+  if [[ "$count" != 1 ]]; then
+    echo "✗ egress activation evidence CAS failed；第一动作=恢复 egress predecessor 后官方 rollback" >&2
+    activate_egress_release "$predecessor" "$release" || return 1
+    rollback
+    return 1
+  fi
+  resolve_active_lane
+  smoke "$ACTIVE_PORT" || {
+    echo "✗ egress handoff 后 smoke failed；第一动作=官方 rollback" >&2
+    activate_egress_release "$predecessor" "$release" || return 1
+    rollback
+    ds_exec <<SQL >/dev/null
+UPDATE release_egress_transitions SET status='rolled_back',activated_at=NULL
+ WHERE release_id='$(ds_lit "$release")' AND generation=$DS_generation AND status='active';
+SQL
+    return 1
+  }
+  echo "  ✓ stable master + egress activated from exact tested release=$release"
+}
+
+assert_v3_inactive() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] assert openclaude-v3 inactive"; return 0; }
+  local state
+  state="$(ssh "$KL_HOST" "systemctl is-active openclaude-v3 2>/dev/null || true")"
+  [[ "$state" == inactive || "$state" == failed || "$state" == unknown || -z "$state" ]] \
+    || { echo "✗ V3 必须 inactive，当前=$state" >&2; return 1; }
+  echo "  ✓ V3 inactive"
+}
+
+verify_stable_predecessor_after_gate_failure() {
+  local predecessor="$1" predecessor_runtime_tuple="$2" predecessor_egress="${3:-}" current_runtime_tuple current_egress
+  ds_snapshot
+  [[ "$DS_phase" == stable && "$DS_active_release" == "$predecessor" ]] \
+    || { echo "✗ E2E failure abort 后未恢复 exact stable predecessor" >&2; return 1; }
+  current_runtime_tuple="$(model_authority_runtime_tuple)" || return 1
+  [[ "$current_runtime_tuple" == "$predecessor_runtime_tuple" ]] \
+    || { echo "✗ gate failure abort 后 runtime tuple 未恢复 exact predecessor" >&2; return 1; }
+  if [[ -n "$predecessor_egress" ]]; then
+    current_egress="$(current_egress_release)"
+    [[ "$current_egress" == "$predecessor_egress" ]] \
+      || { echo "✗ gate failure abort 后 egress 未恢复 exact predecessor" >&2; return 1; }
+  fi
+  resolve_active_lane
+  smoke "$ACTIVE_PORT" || return 1
+  assert_v3_inactive || return 1
+  echo "  ✓ abort 验收:stable predecessor/runtime health/real turn/V3 inactive"
+}
+
+run_candidate_release_verification() {
+  local cand="$1" release="$2" generation="$3" incident_sha result_sha
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] fixed Luna/DeepSeek live E2E + zero-skip evidence"; return 0; }
+  npm run check:v5:incidents || return 1
+  create_release_verification_run "$release" "$generation" || return 1
+  rm -rf "$REPO_ROOT/e2e/session-display/reports" "$REPO_ROOT/e2e/session-display/test-results"
+  if [[ ! -x "$REPO_ROOT/e2e/session-display/node_modules/.bin/playwright" ]]; then
+    echo "── 安装隔离 Playwright gate 依赖(浏览器下载禁用)──"
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix "$REPO_ROOT/e2e/session-display" || return 1
+  fi
+  echo "── candidate 固定 live matrix:Luna/Codex + DeepSeek V4 Flash/CCB ──"
+  if ! timeout 1800 env \
+      OC_E2E_SSH_HOST="$KL_HOST" OC_E2E_PW_HOST="$KL_HOST" \
+      OC_E2E_REMOTE_PORT="$(slot_port "$cand")" \
+      OC_E2E_REMOTE_ENV="$V5_ENV" \
+      OC_E2E_SESSION_PREFIX="$VERIFICATION_SESSION_PREFIX" \
+      OC_E2E_RETRIES=0 \
+      "$REPO_ROOT/e2e/session-display/run.sh"; then
+    return 1
+  fi
+  incident_sha="$(sha256sum "$REPO_ROOT/e2e/session-display/incidents.json" | awk '{print $1}')"
+  result_sha="$(find "$REPO_ROOT/e2e/session-display/reports" -type f -print0 \
+    | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+  ds_exec <<SQL >/dev/null
+UPDATE verification_runs SET status='closed',closed_at=NOW()
+ WHERE id='$VERIFICATION_RUN_ID' AND status='active';
+INSERT INTO release_verification_evidence(
+  release_id,generation,run_id,model_matrix,incident_manifest_sha256,result_sha256
+) SELECT '$(ds_lit "$release")',$generation,'$VERIFICATION_RUN_ID',
+         ARRAY['deepseek-v4-flash','gpt-5.6-luna']::text[],'$incident_sha','$result_sha'
+ WHERE EXISTS (SELECT 1 FROM verification_runs WHERE id='$VERIFICATION_RUN_ID' AND status='closed');
+SQL
+  local evidence
+  evidence="$(ds_exec <<SQL
+SELECT count(*) FROM release_verification_evidence
+ WHERE release_id='$(ds_lit "$release")' AND generation=$generation AND run_id='$VERIFICATION_RUN_ID';
+SQL
+)"
+  [[ "$evidence" == 1 ]] || { echo "✗ verification evidence 未持久化" >&2; return 1; }
+  echo "  ✓ candidate evidence persisted release=$release generation=$generation run=$VERIFICATION_RUN_ID"
+}
+
+assert_release_verification_evidence() {
+  [[ "$DRY" == 1 ]] && return 0
+  local count
+  count="$(ds_exec <<SQL
+SELECT count(*) FROM release_verification_evidence e
+JOIN verification_runs r ON r.id=e.run_id
+ WHERE e.release_id='$(ds_lit "$DS_candidate_release")' AND e.generation=$DS_generation
+   AND e.model_matrix=ARRAY['deepseek-v4-flash','gpt-5.6-luna']::text[]
+   AND r.status='closed';
+SQL
+)" || return 1
+  [[ "$count" == 1 ]]
+}
+
+close_emergency_debt() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] validate protected merge/Codex/tests/CI evidence and close debt"; return 0; }
+  local evidence origin_head
+  [[ "$BR" == feat/v5-aurora-rewrite && -z "$(git status --porcelain)" ]] \
+    || { echo "✗ emergency debt 只能从 clean canonical branch 关闭" >&2; return 1; }
+  env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
+    git fetch origin feat/v5-aurora-rewrite || return 1
+  evidence="$(node - "$CI_EVIDENCE_FILE" "$PROTECTED_MERGE_SHA" <<'NODE'
+const fs=require('node:fs'); const p=process.argv[2]; const j=JSON.parse(fs.readFileSync(p,'utf8'));
+if (j.schema!==1 || j.codexReview!=='PASS' || j.regressionTests!=='PASS' || j.ci!=='PASS' ||
+    j.protectedBranch!=='feat/v5-aurora-rewrite' || j.commit!==process.argv[3] ||
+    typeof j.ciUrl!=='string' || !/^https:\/\//.test(j.ciUrl)) {
+  throw new Error('evidence must prove Codex PASS + regression PASS + CI PASS + protected branch URL');
+}
+process.stdout.write(JSON.stringify(j));
+NODE
+)" || return 1
+  git merge-base --is-ancestor "$PROTECTED_MERGE_SHA" HEAD \
+    || { echo "✗ protected merge sha 不在 canonical HEAD 血缘" >&2; return 1; }
+  origin_head="$(git rev-parse origin/feat/v5-aurora-rewrite 2>/dev/null || true)"
+  [[ "$origin_head" == "$PROTECTED_MERGE_SHA" ]] \
+    || { echo "✗ origin protected branch head($origin_head) != protected merge sha($PROTECTED_MERGE_SHA)" >&2; return 1; }
+  ds_exec <<SQL >/dev/null
+UPDATE emergency_containment_debts
+   SET status='closed',closed_at=NOW(),protected_merge_sha='$PROTECTED_MERGE_SHA',
+       ci_evidence='$(ds_lit "$evidence")'::jsonb
+ WHERE incident_id='$(ds_lit "$EMERGENCY_CLOSE_INCIDENT")' AND status='open';
+SQL
+  local closed
+  closed="$(ds_exec <<SQL
+SELECT count(*) FROM emergency_containment_debts
+ WHERE incident_id='$(ds_lit "$EMERGENCY_CLOSE_INCIDENT")' AND status='closed'
+   AND protected_merge_sha='$PROTECTED_MERGE_SHA';
+SQL
+)"
+  [[ "$closed" == 1 ]] || { echo "✗ emergency debt closure CAS 未命中" >&2; return 1; }
+  echo "✓ emergency debt closed:$EMERGENCY_CLOSE_INCIDENT protected=$PROTECTED_MERGE_SHA"
+}
+
+set_luna_visibility() { # public|hidden
+  local visibility="$1" evidence_count=0
+  [[ "$visibility" == public || "$visibility" == hidden ]] || return 2
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] set Luna visibility=$visibility with pricing.patch audit"; return 0; }
+  ds_snapshot
+  if [[ "$visibility" == public ]]; then
+    ds_assert_phase stable
+    evidence_count="$(ds_exec <<SQL
+SELECT count(*) FROM release_verification_evidence e
+JOIN verification_runs r ON r.id=e.run_id
+ WHERE e.release_id='$(ds_lit "$DS_active_release")' AND e.generation=$DS_generation
+   AND r.status='closed';
+SQL
+)"
+    [[ "$evidence_count" == 1 ]] \
+      || { echo "✗ Luna public 只允许 stable active exact release/generation 已有双模型证据后执行" >&2; return 1; }
+  fi
+  local changed
+  changed="$(ds_exec <<SQL
+WITH admin AS (
+  SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1
+), before_row AS (
+  SELECT jsonb_build_object('visibility',visibility,'enabled',enabled) AS value
+    FROM model_pricing WHERE model_id='gpt-5.6-luna'
+), updated AS (
+  UPDATE model_pricing SET visibility='$visibility',enabled=TRUE,lock_version=lock_version+1,updated_at=NOW()
+   WHERE model_id='gpt-5.6-luna'
+     AND EXISTS (SELECT 1 FROM admin)
+     AND EXISTS (SELECT 1 FROM before_row)
+     AND EXISTS (SELECT 1 FROM model_catalog WHERE model_id='gpt-5.6-luna' AND state='active'
+                  AND engine='codex' AND provider_id='codex')
+   RETURNING jsonb_build_object('visibility',visibility,'enabled',enabled) AS value
+), audited AS (
+  INSERT INTO admin_audit(admin_id,action,target,before,after)
+  SELECT admin.id,'pricing.patch','model:gpt-5.6-luna',before_row.value,updated.value
+    FROM admin,before_row,updated RETURNING 1
+)
+SELECT count(*) FROM audited;
+SQL
+)" || return 1
+  [[ "$changed" == 1 ]] || { echo "✗ Luna visibility/audit transaction 未命中" >&2; return 1; }
+  echo "✓ Luna visibility=$visibility（pricing trigger 已通知 master/egress caches）"
+}
+
 canary() {
   echo "══ v5 --canary(蓝绿双 master 起手;RFC D5)══"
+  if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+    authorize_emergency_debt || exit 1
+  fi
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
   [[ "$DRY" == 1 ]] || assert_release_marker "$(bg_current_release "$ACTIVE_SRC")"
@@ -7114,6 +7610,12 @@ canary() {
   fi
   ds_snapshot
   ds_assert_phase stable
+  local predecessor_release="$DS_active_release" predecessor_runtime_tuple
+  if [[ "$DRY" == 1 ]]; then
+    predecessor_runtime_tuple='{"dry_run":true}'
+  else
+    predecessor_runtime_tuple="$(model_authority_runtime_tuple)" || exit 1
+  fi
   # BLOCKER 6:canary 起手断言 active_release 非 NULL 且目录存在(seed=NULL;基建版须先跑一次传统
   # deploy 校准 active_release)。否则 capability preflight 会拿假/空 active release 做兼容比较。
   if [[ "$DRY" != 1 ]]; then
@@ -7158,6 +7660,7 @@ canary() {
   knowledge_planet_plugin_assert_release_compatible "$reldir" "$reldir" \
     || echo "⚠ canary candidate 的 Knowledge Planet 插件制品与 DB 已审批版本不一致:candidate lane 上该插件将 RUNTIME_UNAVAILABLE(active lane 不受影响,运行时按内容 pin);canary 不因此阻断(2026-07-17 纠偏)" >&2
   ds_cas_or_die "candidate_release='$(ds_lit "$reldir")', transition_step=1" 1 "built candidate_release=$reldir"
+  bind_emergency_candidate_release "$reldir" || exit 1
 
   # candidate release 的 capability 门(与 active 激活同一 sessions-pg 门,复用)
   assert_release_capability_for_sessions_pg "$reldir"
@@ -7201,10 +7704,38 @@ canary() {
   echo "── 内部账号验证(lane cookie 命中 candidate)──"
   KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" CADDY_HTTP_PORT="$CADDY_HTTP_PORT" \
     bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify $([[ "$DRY" == 1 ]] && echo --dry-run) || {
-    echo "✗ canary READY 验证失败(默认未命中 active / lane cookie 未命中健康 candidate)。candidate 已 READY 但不可服务。" >&2
-    echo "  用 deploy-v5.sh --abort 撤下 candidate,或核查 candidate 健康后重跑 --canary。" >&2
+    echo "✗ canary READY 验证失败；第一动作=同一 mutation lease 内官方 abort" >&2
+    abort
+    verify_stable_predecessor_after_gate_failure "$predecessor_release" "$predecessor_runtime_tuple" "$CAPTURED_EGRESS_PREDECESSOR" \
+      || { echo "FATAL:Caddy gate failure 后 stable predecessor 验收未通过" >&2; exit 1; }
     exit 1
   }
+  if [[ "$RESTART_EGRESS" == 1 ]] \
+    && ! begin_candidate_egress_transition "$reldir" "$DS_generation"; then
+    echo "✗ candidate egress preflight failed；第一动作=官方 abort" >&2
+    abort
+    verify_stable_predecessor_after_gate_failure "$predecessor_release" "$predecessor_runtime_tuple" "$CAPTURED_EGRESS_PREDECESSOR" \
+      || { echo "FATAL:egress preflight failure 后 stable predecessor 验收未通过" >&2; exit 1; }
+    exit 1
+  fi
+  if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+    echo "  ⚠ dx-declared emergency containment:跳过 full candidate regression matrix；止血稳定后 durable debt 将阻断后续普通发布"
+  elif ! run_candidate_release_verification "$cand" "$reldir" "$DS_generation"; then
+    echo "✗ candidate regression gate failed；第一动作=同一 mutation lease 内官方 abort" >&2
+    abort
+    close_release_verification_run failed || true
+    verify_stable_predecessor_after_gate_failure "$predecessor_release" "$predecessor_runtime_tuple" "$CAPTURED_EGRESS_PREDECESSOR" \
+      || { echo "FATAL:E2E failure 后 stable predecessor 验收未通过" >&2; exit 1; }
+    exit 1
+  fi
+  if [[ "$RESTART_EGRESS" == 1 ]] \
+    && ! complete_candidate_egress_transition "$reldir" "$DS_generation"; then
+    echo "✗ candidate egress predecessor restore/evidence failed；第一动作=官方 abort" >&2
+    abort
+    verify_stable_predecessor_after_gate_failure "$predecessor_release" "$predecessor_runtime_tuple" "$CAPTURED_EGRESS_PREDECESSOR" \
+      || { echo "FATAL:egress restore failure 后 stable predecessor 验收未通过" >&2; exit 1; }
+    exit 1
+  fi
   echo "✓ --canary 完成(gen=$((DS_generation)) candidate=$cand percent=0 allowlist=内部)。放量:deploy-v5.sh --promote=<pct>"
 }
 
@@ -7291,6 +7822,19 @@ SQL
 finalize() {
   echo "══ v5 --finalize(cohort 收敛 + master 交接;RFC D5 七步;可 resume)══"
   ds_snapshot
+  if [[ "$DS_phase" == canary || "$DS_phase" == finalizing ]]; then
+    if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+      if ! assert_emergency_finalize_authorized; then
+        echo "✗ emergency authorization mismatch；第一动作=官方 abort" >&2
+        abort
+        exit 1
+      fi
+    elif ! assert_release_verification_evidence; then
+      echo "✗ candidate 缺 exact release/generation fixed-matrix evidence；第一动作=官方 abort" >&2
+      abort
+      exit 1
+    fi
+  fi
   local cand old kp_candidate_release
   kp_candidate_release="$DS_candidate_release"
   [[ "$DRY" == 1 || -n "$kp_candidate_release" ]] \
@@ -7352,6 +7896,8 @@ finalize() {
       ;;
   esac
   finalize_run_steps "$cand" "$old"
+  finalize_ready_egress_transition || exit 1
+  echo "✓ --finalize 全部完成:master/egress 已收敛到 exact tested release。"
 }
 
 # finalize step1..7 主体(每步 `-lt N` 幂等守卫;fresh 全跑,resume 从断点前滚)。$1=cand $2=old。
@@ -7484,7 +8030,7 @@ finalize_run_steps() {
     # 收敛后 Caddy re-render(此刻 active=cand,无 candidate → 回 seed 形态,默认→新 active)
     caddy_render_reload
   fi
-  echo "✓ --finalize 完成:active_slot=$cand(原 candidate 已成新主+leader+VIP),旧 slot=$old 已停。"
+  echo "  ✓ master finalize steps 完成:active_slot=$cand(原 candidate 已成新主+leader+VIP),旧 slot=$old 已停。"
 }
 
 # ═════════ lane: --abort ═════════
@@ -7575,6 +8121,7 @@ abort_continue() {
   if [[ "$DRY" == 1 || "$DS_transition_step" -lt 4 ]]; then
     ds_cas_or_die "phase='stable', candidate_slot=NULL, candidate_release=NULL, cohort_percent=0, transition_step=0, operation_id=NULL" 4 "abort commit → stable (old active=$old)"
   fi
+  rollback_egress_transition_for_generation "$DS_generation" || return 1
   echo "✓ --abort 完成:回退到旧 active_slot=$old;candidate=$cand 已停。cohort cookie 靠 generation 失配自动失效。"
 }
 
@@ -7590,7 +8137,8 @@ recover() {
   fi
   case "$p" in
     stable)
-      echo "  · phase=stable:无进行中操作,无需恢复。" ;;
+      echo "  · phase=stable:检查是否有 master 已提交但 egress 尚待激活的 durable transition。"
+      finalize_ready_egress_transition ;;
     canary)
       if [[ "$s" -lt "$DS_STEP_CANARY_READY" ]]; then
         echo "  · canary<READY(准备期,candidate 对流量不可见)→ §8:stop/清本 operation 产物 → 回 stable(零影响)"
@@ -8123,6 +8671,9 @@ run_selected_mode() { # [mode]
     finalize)  finalize ;;
     abort)     abort ;;
     recover)   recover ;;
+    close-emergency-debt) close_emergency_debt ;;
+    publish-luna) set_luna_visibility public ;;
+    hide-luna) set_luna_visibility hidden ;;
     *) echo "✗ 未知 mode:$selected_mode" >&2; return 2 ;;
   esac
 }
@@ -8240,7 +8791,7 @@ fi
 # 任一历史部署若留下 state/runtime 无法裁决的持久标记，所有后续写 lane 必须停住，避免用新
 # 发布覆盖现场证据。只读 smoke 仍允许，供人工诊断；dry-run 不访问远端。
 # reclaim 必须在 marker 存在时照样能跑(它正是清理陈旧锁的救援手段)。
-if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "reclaim-mutation-lease" ]]; then
+if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MODE" != "reclaim-mutation-lease" && "$MODE" != "hide-luna" ]]; then
   assert_no_deploy_recovery_marker || exit 1
 fi
 
@@ -8259,6 +8810,14 @@ case "$MODE" in
   *) acquire_production_mutation_lease || exit 3 ;;
 esac
 
+# Durable containment debt is checked only after the real mutation lease has been acquired.
+# Recovery/rollback/abort and Luna-hide compensation remain available; every other write lane
+# is fenced until the exact protected merge + Codex/tests/CI evidence closes the debt.
+case "$MODE" in
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify) ;;
+  *) assert_emergency_debt_gate || exit 1 ;;
+esac
+
 # Legacy marker 兼容权只在会 build/flip/放量 master release 的 invocation 建立：此刻本地
 # deploy lock 与远端 mutation lease 均已持有，而 run_mutation_lane_supervised 尚未 arm
 # in-flight marker，故这是任何 release/state/unit 写入前的唯一可信捕获点。
@@ -8267,7 +8826,11 @@ case "$MODE" in
     capture_trusted_release_predecessor || exit 1
     [[ "$RESTART_EGRESS" != 1 ]] || capture_trusted_egress_predecessor || exit 1
     ;;
-  dist|rollback|canary|promote|finalize|abort|recover)
+  canary)
+    capture_trusted_release_predecessor || exit 1
+    [[ "$RESTART_EGRESS" != 1 ]] || capture_trusted_egress_predecessor || exit 1
+    ;;
+  dist|rollback|promote|finalize|abort|recover)
     capture_trusted_release_predecessor || exit 1 ;;
   migrate-bluegreen)
     # 首次实目录迁移没有 predecessor marker；已是 symlink 的幂等重跑则必须也在

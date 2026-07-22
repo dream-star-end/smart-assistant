@@ -317,6 +317,79 @@ CADDY_HTTP_PORT=18081 KL_HOST=kl-hk bash scripts/deploy-v5.sh --canary
 # 老 bundle(无 governor)收到帧会忽略 → 需一次手动刷新 bootstrap 到新 bundle,之后自愈。
 ```
 
+### 4.2a 固定双模型事故回归门、Luna 发布与 P0 止血债务
+
+普通 P3 candidate 在 Caddy lane 验证后，必须由 `e2e/session-display/run.sh` 串行跑完
+`gpt-5.6-luna`/Codex 与 `deepseek-v4-flash`/CCB 两个真实底座。身份固定为
+`v5-evals@claudeai.chat`，完整 live suite 不允许 `FAIL/SKIP/FLAKY/.only`；事故清单权威是
+`e2e/session-display/incidents.json`，CI 与部署前均执行 `npm run check:v5:incidents`。
+任一失败时脚本在同一 mutation lease 内先官方 abort，再核对 exact stable predecessor、
+runtime tuple、真实 Agent turn 与 V3 inactive，之后才允许调查。
+带 `--egress` 的 canary 会把全局 egress 临时切到 candidate release 跑矩阵，随后恢复 exact
+predecessor 并持久化 `release_egress_transitions=ready`；master finalize 提交 stable 后才激活
+该 exact tested egress。若进程恰在两步之间中断，`--recover` 按 durable transition 收敛，
+激活失败则先恢复旧 egress 并官方 rollback master。
+
+迁移 `0183_luna_verification_runs` 先把 Luna 激活为 hidden，并建立 exact
+release/generation/session-prefix 绑定的验证赞助。只有上述测试身份、两个固定模型和本次
+verification run 命中的请求才零扣费；每笔仍在 `usage_records` 保存名义成本与 run ID。
+普通用户与 `v5-canary` 不享受此赞助。`0184_emergency_containment_debt` 建立紧急止血债务门。
+两个迁移按 §4.5 在线 apply 并用旧 stable smoke 后，才可进入本批 canary。
+
+```bash
+# 普通发布：--canary 自动跑固定矩阵并写 exact release/generation evidence；缺证据的
+# --finalize 会先 abort。涉及 commercial egress/计费代码时必须带 --egress。
+bash scripts/deploy-v5.sh --canary --egress
+bash scripts/deploy-v5.sh --finalize
+
+# Luna 只在 stable active 与当前 generation 已有双模型证据后公开；该操作有 admin_audit。
+bash scripts/deploy-v5.sh --publish-luna
+
+# Luna 公开后若出现新异常：先按 deploy_state 官方 rollback，恢复稳定后再隐藏目录入口。
+bash scripts/deploy-v5.sh --hide-luna
+```
+
+**dx-declared P0 exception** 只在 dx 同时明确“线上正持续造成真实用户/资金/安全损失”与
+“最小止血立即上线、审查/用例事后补”时启用。它只跳过固定双模型 full matrix，不跳过
+worktree、远端 commit provenance、clean canonical exact HEAD、production-mutation lease、
+官方 canary/finalize、异常先 abort、计费/数据不变量、smoke 与 V3 inactive：
+
+```bash
+INC=INC-20260723-EXACT-SYMPTOM
+SHA=$(git rev-parse HEAD) # 必须已 push 到 origin task branch，且 canonical 正好 fast-forward 到它
+APPROVAL='dx:<可审计的明确止血指令引用>'
+
+bash scripts/deploy-v5.sh --canary --egress \
+  --emergency-containment="$INC" --emergency-approval="$APPROVAL" --emergency-commit="$SHA"
+bash scripts/deploy-v5.sh --finalize \
+  --emergency-containment="$INC" --emergency-approval="$APPROVAL" --emergency-commit="$SHA"
+```
+
+首次调用会持久化 exact incident/approval/commit/deploy holder 并绑定 candidate release。
+止血稳定后 open debt 会阻断所有普通生产写 lane；仅 `abort/rollback/recover/hide-luna` 与
+同一 incident 的收敛仍可执行。立即补回归、单一 Codex full-diff PASS、受保护 PR/CI，
+canonical 与 origin protected head 对齐后，用以下 schema 的 root-only JSON 关账：
+
+```json
+{
+  "schema": 1,
+  "commit": "<protected merge 40-char sha>",
+  "protectedBranch": "feat/v5-aurora-rewrite",
+  "codexReview": "PASS",
+  "regressionTests": "PASS",
+  "ci": "PASS",
+  "ciUrl": "https://github.com/<owner>/<repo>/actions/runs/<run>"
+}
+```
+
+```bash
+bash scripts/deploy-v5.sh --close-emergency-debt="$INC" \
+  --protected-merge-sha="<same protected merge sha>" \
+  --ci-evidence-file="/root/<root-only-evidence>.json"
+```
+
+债务关闭前只能汇报“止血已上线”，不得称根治完成。
+
 **CCB baseline 存量容器收敛**（仅 baseline 内容变化或修复历史漏挂时执行）：先确认
 `deploy_state.phase=stable`，按当前 active slot 选择 unit（A=`openclaude-v5.service`，
 B=`openclaude-v5-b.service`），先 dry-run 再真实执行。工具只处理
@@ -491,7 +564,7 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 
 ### 4.6b 上线后核验清单
 - [ ] `/version` = 预期 commit;smoke 通过(含 OC_EGRESS_SPLIT=1 时 egress 无条件断言)
-- [ ] v3 `/healthz` 正常(零影响红线)
+- [ ] `openclaude-v3` 保持 inactive(绝不因 V5 任务启动/重启个人版或 V3)
 - [ ] 前端特征串在 dist 产物里 grep 得到
 - [ ] 有容器 on-demand 起来且用新镜像 tag(`docker ps`)
 - [ ] 涉及移动端的改动 → 提请 boss 真机(iPhone Safari / 鸿蒙 ArkWeb)验证

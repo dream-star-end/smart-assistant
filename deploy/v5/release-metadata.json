@@ -61,7 +61,9 @@
     "0179_ark_plan_kimi_k3",
     "0180_refresh_tokens_rotated_to_index",
     "0181_turn_tape_recovery_links",
-    "0182_provider_quota_blocks"
+    "0182_provider_quota_blocks",
+    "0183_luna_verification_runs",
+    "0184_emergency_containment_debt"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -477,14 +477,18 @@ export async function getDispatchForUpdate(
 export async function getDispatchByBillingRequestId(
   q: Queryable,
   billingRequestId: string,
-): Promise<Pick<TurnDispatchRow, 'dispatchId' | 'attemptNo'> | null> {
-  const res = await q.query<{ dispatch_id: string; attempt_no: number }>(
-    `SELECT dispatch_id, attempt_no FROM turn_dispatches WHERE billing_request_id = $1`,
+): Promise<Pick<TurnDispatchRow, 'dispatchId' | 'attemptNo' | 'sessionId'> | null> {
+  const res = await q.query<{ dispatch_id: string; attempt_no: number; session_id: string }>(
+    `SELECT dispatch_id, attempt_no, session_id FROM turn_dispatches WHERE billing_request_id = $1`,
     [billingRequestId],
   )
   return res.rows.length === 0
     ? null
-    : { dispatchId: res.rows[0]!.dispatch_id, attemptNo: res.rows[0]!.attempt_no }
+    : {
+        dispatchId: res.rows[0]!.dispatch_id,
+        attemptNo: res.rows[0]!.attempt_no,
+        sessionId: res.rows[0]!.session_id,
+      }
 }
 
 export async function getDispatchByLogicalKey(

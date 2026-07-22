@@ -40,6 +40,7 @@ import {
 import type { TokenUsage } from "../billing/calculator.js";
 import { getPool } from "../db/index.js";
 import { generatePersona } from "../account-pool/persona.js";
+import { admitVerificationSponsorship } from "../billing/verificationSponsorship.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -695,5 +696,127 @@ describe("settleUsageAndLedger (integ)", () => {
       [uid.toString()],
     );
     assert.equal(led.rows[0].c, "0");
+  });
+
+  test("release-bound verification sponsorship preserves nominal cost and never debits", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("v5-evals@example.com", 1000n);
+    const sessionPrefix = "e2e-aaaaaaaaaaaaaaaaaaaa-";
+    const sessionId = `${sessionPrefix}deepseek`;
+    await query(
+      `UPDATE deploy_state
+          SET generation=7, phase='stable', active_slot='A', active_release='/srv/rel-sponsored-test',
+              candidate_slot=NULL, candidate_release=NULL
+        WHERE singleton=true`,
+    );
+    await query(
+      `INSERT INTO verification_runs
+         (token_hash,user_id,session_prefix,allowed_models,expected_release,
+          expected_generation,approval_ref,expires_at)
+       VALUES (encode(public.digest(convert_to($1,'UTF8'),'sha256'),'hex'),$2,$1,
+               ARRAY['deepseek-v4-flash','gpt-5.6-luna']::text[],
+               '/srv/rel-sponsored-test',7,'test:verification',NOW()+INTERVAL '10 minutes')`,
+      [sessionPrefix, uid.toString()],
+    );
+
+    const sponsorship = await admitVerificationSponsorship(getPool(), {
+      requestId: "req-sponsored-1",
+      userId: uid,
+      model: "deepseek-v4-flash",
+      sessionId,
+    });
+    assert.ok(sponsorship);
+
+    const result = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-sponsored-1",
+      model: "deepseek-v4-flash",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 300n,
+      status: "success",
+      sessionId,
+      verificationSponsorship: sponsorship,
+    });
+    assert.equal(result.ledgerId, null);
+    assert.equal(result.debitedCredits, null);
+
+    const row = await query<{
+      cost_credits: string;
+      would_have_cost_credits: string;
+      verification_run_id: string;
+      price_snapshot: Record<string, unknown>;
+    }>(
+      `SELECT cost_credits::text,would_have_cost_credits::text,
+              verification_run_id::text,price_snapshot
+         FROM usage_records WHERE id=$1`,
+      [result.usageId.toString()],
+    );
+    assert.equal(row.rows[0].cost_credits, "0");
+    assert.equal(row.rows[0].would_have_cost_credits, "300");
+    assert.equal(row.rows[0].verification_run_id, sponsorship.runId);
+    assert.equal(row.rows[0].price_snapshot.waived, "verification_sponsorship");
+
+    const balance = await query<{ credits: string }>(
+      "SELECT credits::text FROM users WHERE id=$1",
+      [uid.toString()],
+    );
+    assert.equal(balance.rows[0].credits, "1000");
+  });
+
+  test("tampered verification snapshot fails closed to ordinary billing", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("v5-evals-tamper@example.com", 1000n);
+    const prefix = "e2e-bbbbbbbbbbbbbbbbbbbb-";
+    const sessionId = `${prefix}codex`;
+    await query(
+      `UPDATE deploy_state
+          SET generation=8,phase='stable',active_slot='A',active_release='/srv/rel-tamper-test',
+              candidate_slot=NULL,candidate_release=NULL
+        WHERE singleton=true`,
+    );
+    await query(
+      `INSERT INTO verification_runs
+         (token_hash,user_id,session_prefix,allowed_models,expected_release,
+          expected_generation,approval_ref,expires_at)
+       VALUES (encode(public.digest(convert_to($1,'UTF8'),'sha256'),'hex'),$2,$1,
+               ARRAY['deepseek-v4-flash','gpt-5.6-luna']::text[],
+               '/srv/rel-tamper-test',8,'test:tamper',NOW()+INTERVAL '10 minutes')`,
+      [prefix, uid.toString()],
+    );
+    const sponsorship = await admitVerificationSponsorship(getPool(), {
+      requestId: "req-sponsored-tamper",
+      userId: uid,
+      model: "gpt-5.6-luna",
+      sessionId,
+    });
+    assert.ok(sponsorship);
+
+    const result = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-sponsored-tamper",
+      model: "gpt-5.6-luna",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 300n,
+      status: "success",
+      sessionId,
+      verificationSponsorship: { ...sponsorship, releaseId: "/srv/rel-forged" },
+    });
+    assert.equal(result.debitedCredits, 300n);
+    assert.ok(result.ledgerId);
+    const row = await query<{
+      cost: string;
+      run_id: string | null;
+      nominal: string | null;
+    }>(
+      `SELECT cost_credits::text AS cost,verification_run_id::text AS run_id,
+              would_have_cost_credits::text AS nominal
+         FROM usage_records WHERE id=$1`,
+      [result.usageId.toString()],
+    );
+    assert.deepEqual(row.rows[0], { cost: "300", run_id: null, nominal: null });
   });
 });

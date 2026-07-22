@@ -1,0 +1,441 @@
+{
+  "schema": 1,
+  "scope": "V5 user-visible and production-safety P0/P1 regressions recorded from 2026-07-17 through 2026-07-23",
+  "fixedLiveMatrix": [
+    {
+      "engine": "codex",
+      "model": "gpt-5.6-luna"
+    },
+    {
+      "engine": "ccb",
+      "model": "deepseek-v4-flash"
+    }
+  ],
+  "incidents": [
+    {
+      "id": "INC-20260717-HISTORY-STUCK",
+      "occurredAt": "2026-07-17",
+      "severity": "P0",
+      "symptom": "重登或增量同步后历史缓存失去权威，真实会话内容不可见或长期等待。",
+      "rootFixCommit": "e6f89f7e",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260718-FIRST-TURN-REJECTED",
+      "occurredAt": "2026-07-18",
+      "severity": "P0",
+      "symptom": "新会话首条消息在受理时因 session_not_found 确定失败。",
+      "rootFixCommit": "9cbbb1df",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260718-DISPATCH-LOST",
+      "occurredAt": "2026-07-18",
+      "severity": "P0",
+      "symptom": "会话消失后的 durable dispatch 未自动结案，用户轮次悬挂且状态不可见。",
+      "rootFixCommit": "8a655b2c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnDispatchReconciler.test.ts"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/05-turn-status.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260718-ZERO-TERMINAL",
+      "occurredAt": "2026-07-18",
+      "severity": "P0",
+      "symptom": "tape 信封缺 dispatch 身份，已完成轮次无法收敛为 terminal。",
+      "rootFixCommit": "5b243bcb",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/v3MasterSink.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260718-RESEND-DUPLICATE",
+      "occurredAt": "2026-07-18",
+      "severity": "P0",
+      "symptom": "断线重发或快速双发争抢 Codex turn ownership，可能产生双回复或重复计费。",
+      "rootFixCommit": "f53dd893",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridgeCodexBilling.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/07-resend-dedup.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260718-ATTACH-NOOP",
+      "occurredAt": "2026-07-18",
+      "severity": "P1",
+      "symptom": "点击添加附件后菜单同步卸载，文件选择器未打开。",
+      "rootFixCommit": "1ebb9e07",
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-e2e-journey-canary.mjs"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260719-PROCESS-AFTER-FINAL",
+      "occurredAt": "2026-07-19",
+      "severity": "P1",
+      "symptom": "重连/历史恢复后 Agent 过程卡出现在最终答案之后。",
+      "rootFixCommit": "575fcf42",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260719-POISONED-IDB-ORDER",
+      "occurredAt": "2026-07-19",
+      "severity": "P0",
+      "symptom": "本地 poisoned IndexedDB 与空增量响应结合后把过程卡持久化到 final 之后。",
+      "rootFixCommit": "5e4f0481",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/order.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260721-LAZY-TIMELINE-LOSS",
+      "occurredAt": "2026-07-21",
+      "severity": "P0",
+      "symptom": "超长会话懒加载丢失真实时间线内容、滚动锚点漂移或无法继续翻页。",
+      "rootFixCommit": "e198a9f8",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/02-large-session-open.spec.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/06-archive-paging.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260720-BASH-TAIL-HIDDEN",
+      "occurredAt": "2026-07-20",
+      "severity": "P1",
+      "symptom": "精确时间线迁移后 Bash 输出尾部没有合并回工具卡，用户看不到结果。",
+      "rootFixCommit": "f3261725",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/directTimeline.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/02-large-session-open.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260721-RUNTIME-RAW-LEAK",
+      "occurredAt": "2026-07-21",
+      "severity": "P1",
+      "symptom": "runtime transport/audit 原始行泄漏到逻辑 Agent 时间线并消耗分页槽位。",
+      "rootFixCommit": "02737240",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/tapeCards.test.tsx"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/02-large-session-open.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260721-HISTORICAL-THINKING-OPEN",
+      "occurredAt": "2026-07-21",
+      "severity": "P1",
+      "symptom": "历史 thinking 卡被强制展开且用户无法正常折叠。",
+      "rootFixCommit": "0f416b5c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260721-STAGED-FINALIZE-STUCK",
+      "occurredAt": "2026-07-21",
+      "severity": "P0",
+      "symptom": "已 staged 的 tape finalize 滞留，dispatch 不终态且 retry 文件持续堆积。",
+      "rootFixCommit": "5790a7e6",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/finalizeJournalReconciler.test.ts"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260722-FINALIZE-GLOBAL-BLOCK",
+      "occurredAt": "2026-07-22",
+      "severity": "P0",
+      "symptom": "全局 tape finalize blocker 使一个超大轮次阻塞其它用户完成与计费收敛。",
+      "rootFixCommit": "f48441b5",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/pgSessionsFinalizeSingleflight.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/v3MasterSink.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260721-WEIBO-IMAGE-BROKEN",
+      "occurredAt": "2026-07-21",
+      "severity": "P1",
+      "symptom": "微博插件图片附件上传链路失效。",
+      "rootFixCommit": "efabb603",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/plugins/weibo.test.ts"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-e2e-journey-canary.mjs"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260721-WEIBO-WORKER-OOM",
+      "occurredAt": "2026-07-21",
+      "severity": "P0",
+      "symptom": "微博 worker 处理大图片时 OOM，用户任务中断。",
+      "rootFixCommit": "869fb3c9",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/plugins/weibo.test.ts"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/connectorsStore.integ.test.ts"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-e2e-journey-canary.mjs"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260723-KIMI-QUOTA-EXHAUSTED",
+      "occurredAt": "2026-07-23",
+      "severity": "P0",
+      "symptom": "耗尽的 Kimi provider 未熔断，用户持续命中确定失败上游。",
+      "rootFixCommit": "7476df04",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/admin/providerQuotaCircuit.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.test.ts"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/migrate.integ.test.ts"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-e2e-journey-canary.mjs"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260723-PG-NUL-SIDECAR",
+      "occurredAt": "2026-07-23",
+      "severity": "P0",
+      "symptom": "模型 sidecar 文本含 NUL 时 PostgreSQL 写入失败，完整时间线无法落库。",
+      "rootFixCommit": "7904bcf9",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260723-RUNTIME-FINALIZE-UNBOUNDED",
+      "occurredAt": "2026-07-23",
+      "severity": "P0",
+      "symptom": "lossless runtime tape finalize 无界占用资源，可能拖垮候选或在线轮次。",
+      "rootFixCommit": "5ade39bf",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/losslessTurnTape.test.ts"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260723-ASK-MARKDOWN-DEADEND",
+      "occurredAt": "2026-07-23",
+      "severity": "P1",
+      "symptom": "Agent 在普通对话中退回不可交互的 Markdown 选项，用户无法通过专用 Ask UI 继续轮次。",
+      "rootFixCommit": "cd6b7f71",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/platformPrompts.test.ts"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chatCreateTemplates.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260723-ALERT-CROSS-CHANNEL",
+      "occurredAt": "2026-07-23",
+      "severity": "P1",
+      "symptom": "V3 账号被错误计入 V5 容量告警，导致无真实 V5 用户影响的误报警。",
+      "rootFixCommit": "f4beb1e6",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/alertRules.test.ts"
+        }
+      ]
+    }
+  ]
+}
