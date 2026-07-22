@@ -43,6 +43,7 @@
 - 全局横幅 role=alert,标题"发送失败",按钮 aria-label="重试发送"。
 - 内联终态错误卡 Alert:dispatch_lost/dispatch_not_accepted → title"消息未开始处理",message 含"已确认未计费";
   service_restart → "服务重启,本轮已中断";按钮"重新尝试"(insufficient_credits→"去充值")。
+- not_accepted 用户消息行的重发按钮可访问名固定为精确"重试"。
 - verified turn status 只来自 `turn_dispatches`；late tape 进入 `manual_reconcile` 后状态卡不显示。
 
 ## 真实 Agent 过程游标

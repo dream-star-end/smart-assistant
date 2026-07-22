@@ -8,6 +8,7 @@ export interface LoginResult {
   token: string;
   userId: string;
   credits: string;
+  accessExp: number;
 }
 
 export interface SessionListItem {
@@ -40,11 +41,18 @@ export interface TapeRecordsPage {
 
 export class Api {
   private base = config().baseUrl;
+  private cachedLogin: LoginResult | null = null;
 
   async login(): Promise<LoginResult> {
     const cfg = config();
-    // 登录端点有限流(每账号短窗)。逐条用例各登录一次,serial 跑本不该撞;但仍对 429
-    // 做退避重试,防共享 canary 账号被其它门/并发短暂占满限流(轮询退避,非死 sleep)。
+    // 每条用例拿到的 token 必须覆盖其完整上限与 teardown；不足才重新登录。
+    // Api 是 worker-scoped，所以正常 9 条矩阵只消耗一次登录额度。
+    const minimumRemainingMs = cfg.turnTimeoutMs * 2 + 90_000;
+    if (this.cachedLogin && this.cachedLogin.accessExp * 1000 - Date.now() > minimumRemainingMs) {
+      return this.cachedLogin;
+    }
+    // 登录端点有限流(每账号短窗)。缓存需要续期时仍对 429 做退避重试，防共享
+    // canary 账号被其它门/并发短暂占满限流(轮询退避,非死 sleep)。
     let lastText = '';
     for (let attempt = 0; attempt < 4; attempt++) {
       const res = await fetch(`${this.base}/api/auth/login`, {
@@ -54,7 +62,14 @@ export class Api {
       });
       if (res.ok) {
         const j: any = await res.json();
-        return { token: j.access_token, userId: String(j.user?.id ?? ''), credits: String(j.user?.credits ?? '') };
+        const result = {
+          token: j.access_token,
+          userId: String(j.user?.id ?? ''),
+          credits: String(j.user?.credits ?? ''),
+          accessExp: Number(j.access_exp),
+        };
+        this.cachedLogin = result;
+        return result;
       }
       lastText = (await res.text()).slice(0, 200);
       if (res.status !== 429) throw new Error(`[api] login ${res.status}: ${lastText}`);
