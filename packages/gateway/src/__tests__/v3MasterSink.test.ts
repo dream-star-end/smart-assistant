@@ -384,6 +384,44 @@ describe("attemptSend — multipart upload", () => {
     );
     assert.equal(signalAborted, true);
   });
+
+  test("finalize has no content-size deadline while parts keep the bounded signal", async () => {
+    let finalizeInit: any;
+    let releaseFinalize!: () => void;
+    const finalizeBarrier = new Promise<void>((resolve) => { releaseFinalize = resolve; });
+    const fetcher = (async (_url: string, init: any) => {
+      const action = JSON.parse(init.body).action;
+      if (action === "finalize") {
+        finalizeInit = init;
+        await finalizeBarrier;
+      } else {
+        assert.ok(init.signal instanceof AbortSignal, "part retains its bounded deadline signal");
+        assert.equal(init.headersTimeout, undefined);
+        assert.equal(init.bodyTimeout, undefined);
+      }
+      return {
+        statusCode: 200,
+        headers: {},
+        trailers: {},
+        opaque: undefined,
+        context: {},
+        body: {
+          async *[Symbol.asyncIterator]() { yield Buffer.from('{"ok":true}', "utf8"); },
+        } as any,
+      };
+    }) as unknown as typeof import("undici").request;
+
+    const sending = attemptSend(PAYLOAD, { config: CFG, fetcher, timeoutMs: 5 });
+    for (let i = 0; i < 100 && finalizeInit === undefined; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(finalizeInit, "finalize envelope reached the fetcher");
+    assert.equal(finalizeInit.signal, undefined, "finalize must not inherit the part AbortSignal");
+    assert.equal(finalizeInit.headersTimeout, 0);
+    assert.equal(finalizeInit.bodyTimeout, 0);
+    releaseFinalize();
+    await sending;
+  });
 });
 
 describe("makeV3MasterSink.persistOrQueue", () => {
