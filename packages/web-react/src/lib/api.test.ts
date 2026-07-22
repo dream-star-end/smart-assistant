@@ -805,6 +805,81 @@ test('submitFeedback sends only the allowlisted settings payload with Bearer aut
   })
 })
 
+test('submitFeedback rebuilds the message payload and drops every non-allowlisted field', async () => {
+  const fetchMock = vi.fn(async () => ok({ ok: true, id: '902' }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session } = makeSession('tok-message-feedback')
+  const input = {
+    category: 'response',
+    description: '工具失败',
+    version: 'must-not-send',
+    requestId: 'trace-1',
+    sessionId: 'session-1',
+    conversation: 'must-not-send',
+    meta: {
+      source: 'message',
+      messageId: 'message-1',
+      role: 'assistant',
+      errorCode: 'UPSTREAM_TIMEOUT',
+      reason: '工具失败',
+      responseExcerpt: '可见回复摘录',
+      locale: 'must-not-send',
+      timezone: 'must-not-send',
+      stack: 'must-not-send',
+      url: 'must-not-send',
+    },
+  } as unknown as Parameters<typeof api.submitFeedback>[1]
+
+  await expect(api.submitFeedback(session, input)).resolves.toEqual({ ok: true, id: '902' })
+  const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+  expect(JSON.parse(String(init.body))).toEqual({
+    category: 'response',
+    description: '工具失败',
+    request_id: 'trace-1',
+    session_id: 'session-1',
+    meta: {
+      source: 'message',
+      message_id: 'message-1',
+      role: 'assistant',
+      error_code: 'UPSTREAM_TIMEOUT',
+      reason: '工具失败',
+      response_excerpt: '可见回复摘录',
+    },
+  })
+})
+
+test('submitFeedback refreshes and replays when a supplied Bearer is expired', async () => {
+  const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+    const calls = fetchMock.mock.calls.length
+    if (String(url).includes('/api/auth/refresh')) {
+      return ok({ access_token: 'tok-feedback-new', access_exp: 999, remember: true })
+    }
+    return calls === 1 ? authErr(401, 'UNAUTHORIZED', 'expired') : ok({ ok: true, id: '903' })
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+  const { session, token } = makeSession('tok-feedback-old')
+  await expect(api.submitFeedback(session, {
+    category: 'bug',
+    description: '短反馈',
+    meta: { source: 'settings' },
+  })).resolves.toEqual({ ok: true, id: '903' })
+
+  expect(token()).toBe('tok-feedback-new')
+  expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+    '/api/feedback',
+    '/api/auth/refresh',
+    '/api/feedback',
+  ])
+  expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('authorization')).toBe(
+    'Bearer tok-feedback-old',
+  )
+  expect(new Headers(fetchMock.mock.calls[2]?.[1]?.headers).get('authorization')).toBe(
+    'Bearer tok-feedback-new',
+  )
+})
+
 test('a failed refresh calls onExpired exactly once and surfaces the original error', async () => {
   let refreshCalls = 0
   const fetchMock = vi.fn(async (url: string) => {

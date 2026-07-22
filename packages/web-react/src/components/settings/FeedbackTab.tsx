@@ -1,10 +1,11 @@
 import { CheckCircle2, MessageSquareText, ShieldCheck } from 'lucide-react'
-import { type FormEvent, useRef, useState } from 'react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { type FeedbackCategory, api, apiErrorMessage } from '../../lib/api'
+import { reportClientFriction } from '../../lib/clientFriction'
 import type { AuthSession } from '../../lib/types'
+import { cn } from '../../lib/utils'
 import { Alert, Button, Spinner, Textarea, alertVariants } from '../ui'
 
-export const FEEDBACK_DESCRIPTION_MIN = 15
 export const FEEDBACK_DESCRIPTION_MAX = 10_000
 
 const CATEGORY_OPTIONS: Array<{ value: FeedbackCategory; label: string }> = [
@@ -16,6 +17,61 @@ const CATEGORY_OPTIONS: Array<{ value: FeedbackCategory; label: string }> = [
 
 const DESCRIPTION_HELP_ID = 'settings-feedback-description-help'
 const DESCRIPTION_ERROR_ID = 'settings-feedback-description-error'
+const DRAFT_VERSION = 1
+
+type FeedbackDraft = {
+  version: typeof DRAFT_VERSION
+  category: FeedbackCategory
+  description: string
+}
+
+function draftKey(userId: string): string {
+  return `oc.feedback.settings.v${DRAFT_VERSION}.${userId}`
+}
+
+function readDraft(userId: string): Omit<FeedbackDraft, 'version'> {
+  try {
+    const parsed = JSON.parse(
+      sessionStorage.getItem(draftKey(userId)) ?? 'null',
+    ) as Partial<FeedbackDraft> | null
+    const category = parsed?.category
+    if (
+      parsed?.version === DRAFT_VERSION &&
+      typeof category === 'string' &&
+      CATEGORY_OPTIONS.some((option) => option.value === category) &&
+      typeof parsed.description === 'string' &&
+      parsed.description.length <= FEEDBACK_DESCRIPTION_MAX
+    ) {
+      return { category, description: parsed.description }
+    }
+  } catch {
+    // sessionStorage may be unavailable in privacy-restricted WebViews; draft persistence is best-effort.
+  }
+  return { category: 'bug', description: '' }
+}
+
+function writeDraft(userId: string, category: FeedbackCategory, description: string): void {
+  try {
+    if (!description) {
+      sessionStorage.removeItem(draftKey(userId))
+      return
+    }
+    sessionStorage.setItem(
+      draftKey(userId),
+      JSON.stringify({ version: DRAFT_VERSION, category, description } satisfies FeedbackDraft),
+    )
+  } catch {
+    // Best-effort only; feedback submission itself must remain available.
+  }
+}
+
+function clearDraft(userId: string): void {
+  try {
+    sessionStorage.removeItem(draftKey(userId))
+  } catch {
+    // ignore unavailable storage
+  }
+}
 
 function currentBuildId(): string | undefined {
   const value = document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content.trim()
@@ -32,23 +88,58 @@ function feedbackMeta() {
 }
 
 /** 设置中心反馈分区：只发送用户主动填写的正文与最小环境元数据，不附带任何对话内容。 */
-export function FeedbackTab({ auth }: { auth: AuthSession }) {
-  const [category, setCategory] = useState<FeedbackCategory>('bug')
-  const [description, setDescription] = useState('')
+export function FeedbackTab({ auth, userId }: { auth: AuthSession; userId: string }) {
+  const [initialDraft] = useState(() => readDraft(userId))
+  const [category, setCategory] = useState<FeedbackCategory>(initialDraft.category)
+  const [description, setDescription] = useState(initialDraft.description)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<{ message: string; field: boolean } | null>(null)
   const [submittedId, setSubmittedId] = useState<string | null>(null)
   const submittingRef = useRef(false)
+  const loadedUserRef = useRef(userId)
+  const skipNextPersistRef = useRef(false)
+  const telemetryIdRef = useRef<string | null>(null)
 
   const trimmed = description.trim()
+
+  useEffect(() => {
+    if (loadedUserRef.current === userId) return
+    const next = readDraft(userId)
+    loadedUserRef.current = userId
+    skipNextPersistRef.current = true
+    setCategory(next.category)
+    setDescription(next.description)
+    setError(null)
+    setSubmittedId(null)
+  }, [userId])
+
+  useEffect(() => {
+    if (skipNextPersistRef.current) {
+      skipNextPersistRef.current = false
+      return
+    }
+    writeDraft(userId, category, description)
+  }, [userId, category, description])
+
+  useEffect(() => {
+    telemetryIdRef.current = reportClientFriction(
+      {
+        surface: 'feedback',
+        stage: 'settings_open',
+        code: 'SETTINGS_OPENED',
+        outcome: 'succeeded',
+      },
+      auth.snapshot().token,
+    )
+  }, [auth])
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (submittingRef.current) return
 
-    if (trimmed.length < FEEDBACK_DESCRIPTION_MIN) {
+    if (!trimmed) {
       setError({
-        message: `请至少填写 ${FEEDBACK_DESCRIPTION_MIN} 个字符，说明发生了什么以及你的期望。`,
+        message: '请填写反馈内容。',
         field: true,
       })
       return
@@ -64,6 +155,27 @@ export function FeedbackTab({ auth }: { auth: AuthSession }) {
     submittingRef.current = true
     setSubmitting(true)
     setError(null)
+    const telemetryId =
+      telemetryIdRef.current ??
+      reportClientFriction(
+        {
+          surface: 'feedback',
+          stage: 'settings_open',
+          code: 'SETTINGS_OPENED',
+          outcome: 'succeeded',
+        },
+        auth.snapshot().token,
+      )
+    reportClientFriction(
+      {
+        eventId: telemetryId,
+        surface: 'feedback',
+        stage: 'submit',
+        code: 'SUBMIT',
+        outcome: 'pending',
+      },
+      auth.snapshot().token,
+    )
     try {
       const result = await api.submitFeedback(auth, {
         category,
@@ -72,11 +184,32 @@ export function FeedbackTab({ auth }: { auth: AuthSession }) {
         meta: feedbackMeta(),
       })
       setSubmittedId(result.id)
+      clearDraft(userId)
+      reportClientFriction(
+        {
+          eventId: telemetryId,
+          surface: 'feedback',
+          stage: 'submit',
+          code: 'SUBMIT',
+          outcome: 'succeeded',
+        },
+        auth.snapshot().token,
+      )
     } catch (cause) {
       setError({
         message: apiErrorMessage(cause, '提交反馈失败，请稍后重试'),
         field: false,
       })
+      reportClientFriction(
+        {
+          eventId: telemetryId,
+          surface: 'feedback',
+          stage: 'submit',
+          code: 'SUBMIT',
+          outcome: 'failed',
+        },
+        auth.snapshot().token,
+      )
     } finally {
       submittingRef.current = false
       setSubmitting(false)
@@ -88,6 +221,15 @@ export function FeedbackTab({ auth }: { auth: AuthSession }) {
     setDescription('')
     setError(null)
     setSubmittedId(null)
+    telemetryIdRef.current = reportClientFriction(
+      {
+        surface: 'feedback',
+        stage: 'settings_open',
+        code: 'SETTINGS_OPENED',
+        outcome: 'succeeded',
+      },
+      auth.snapshot().token,
+    )
   }
 
   return (
@@ -126,25 +268,27 @@ export function FeedbackTab({ auth }: { auth: AuthSession }) {
         </div>
       ) : (
         <form className="mt-5" aria-label="反馈表单" aria-busy={submitting} onSubmit={submit}>
-          <label
-            className="block text-[12.5px] font-medium text-fg"
-            htmlFor="settings-feedback-category"
-          >
-            反馈类型
-          </label>
-          <select
-            id="settings-feedback-category"
-            value={category}
-            onChange={(event) => setCategory(event.target.value as FeedbackCategory)}
-            disabled={submitting}
-            className="mt-2 h-10 w-full rounded-lg border border-border bg-surface px-3.5 text-base text-fg outline-none transition-[border-color,box-shadow] focus:border-accent focus:ring-2 focus:ring-ring disabled:opacity-50 md:text-sm"
-          >
-            {CATEGORY_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+          <fieldset disabled={submitting}>
+            <legend className="block text-[12.5px] font-medium text-fg">反馈类型</legend>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {CATEGORY_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={category === option.value}
+                  onClick={() => setCategory(option.value)}
+                  className={cn(
+                    'rounded-full border px-3 py-1.5 text-[12.5px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+                    category === option.value
+                      ? 'border-accent/50 bg-accent-soft text-accent'
+                      : 'border-border text-muted hover:border-accent/40 hover:text-fg',
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
 
           <label
             className="mt-4 block text-[12.5px] font-medium text-fg"
@@ -172,7 +316,7 @@ export function FeedbackTab({ auth }: { auth: AuthSession }) {
             id={DESCRIPTION_HELP_ID}
             className="mt-1.5 flex items-center justify-between gap-3 text-[11.5px] text-faint"
           >
-            <span>至少 {FEEDBACK_DESCRIPTION_MIN} 个字符</span>
+            <span>草稿仅保存在当前账号的本标签页</span>
             <span>
               {description.length.toLocaleString('zh-CN')} /{' '}
               {FEEDBACK_DESCRIPTION_MAX.toLocaleString('zh-CN')}

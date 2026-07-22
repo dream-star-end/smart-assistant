@@ -491,19 +491,36 @@ export type ResponseRatingInput = {
 /** 会话已评回读结果：messageId → {rating, tags}（不含 comment）。 */
 export type SessionRatingsMap = Record<string, { rating: "up" | "down"; tags: string[] }>;
 
-/** 设置中心自由文本反馈。身份关联沿用后端 best-effort Bearer 语义。 */
+/** 自由文本反馈：设置页与消息级入口用判别联合隔离各自允许发送的上下文。 */
 export type FeedbackCategory = "bug" | "feature" | "ux" | "other";
 
-export type FeedbackSubmitInput = {
-  category: FeedbackCategory;
-  description: string;
-  version?: string;
-  meta?: {
-    source: "settings";
-    locale?: string;
-    timezone?: string;
-  };
+type FeedbackEnvironment = {
+  locale?: string;
+  timezone?: string;
 };
+
+export type FeedbackSubmitInput =
+  | {
+      category: FeedbackCategory;
+      description: string;
+      version?: string;
+      meta: FeedbackEnvironment & { source: "settings" };
+    }
+  | {
+      category: "response";
+      description: string;
+      requestId?: string;
+      sessionId?: string;
+      meta: {
+        source: "message";
+        messageId: string;
+        role: string;
+        errorCode?: string;
+        reason?: string;
+        /** 只有用户在弹窗中明确保持勾选时才存在。 */
+        responseExcerpt?: string;
+      };
+    };
 
 export type FeedbackSubmitResult = { ok: true; id: string };
 
@@ -1136,10 +1153,9 @@ export const api = {
     ),
 
   /**
-   * 设置中心自由文本反馈（POST /api/feedback）。该公共端点允许匿名提交；Bearer 只用于
-   * best-effort 关联 user_id，因此过期 token 仍可能由后端按匿名反馈接收，不能把
-   * callWithRefresh 当作身份关联保证。显式重建 body，避免未来调用方意外夹带会话正文、
-   * request_id 或诊断堆栈。
+   * 自由文本反馈（POST /api/feedback）。缺 Bearer 的公共调用仍可匿名；浏览器登录态提供
+   * 无效 Bearer 时后端返回 401，callWithRefresh 刷新重放，避免把登录用户静默记成匿名。
+   * 两种 source 分支分别重建 payload，消息上下文不会意外泄漏到设置反馈，反之亦然。
    */
   submitFeedback: (
     a: AuthSession,
@@ -1151,20 +1167,35 @@ export const api = {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({
-            category: input.category,
-            description: input.description,
-            ...(input.version ? { version: input.version } : {}),
-            ...(input.meta
+          body: JSON.stringify(
+            input.category !== "response"
               ? {
+                  category: input.category,
+                  description: input.description,
+                  ...(input.version ? { version: input.version } : {}),
                   meta: {
-                    source: input.meta.source,
+                    source: "settings",
                     ...(input.meta.locale ? { locale: input.meta.locale } : {}),
                     ...(input.meta.timezone ? { timezone: input.meta.timezone } : {}),
                   },
                 }
-              : {}),
-          }),
+              : {
+                  category: "response",
+                  description: input.description,
+                  ...(input.requestId ? { request_id: input.requestId } : {}),
+                  ...(input.sessionId ? { session_id: input.sessionId } : {}),
+                  meta: {
+                    source: "message",
+                    message_id: input.meta.messageId,
+                    role: input.meta.role,
+                    ...(input.meta.errorCode ? { error_code: input.meta.errorCode } : {}),
+                    ...(input.meta.reason ? { reason: input.meta.reason } : {}),
+                    ...(input.meta.responseExcerpt
+                      ? { response_excerpt: input.meta.responseExcerpt }
+                      : {}),
+                  },
+                },
+          ),
         }),
       ),
     ),

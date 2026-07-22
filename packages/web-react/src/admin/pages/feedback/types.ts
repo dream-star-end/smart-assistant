@@ -60,6 +60,7 @@ export interface DownRatingRow {
 export interface ResponseRatingsResp {
   stats: ResponseRatingStats;
   down_ratings: {
+    source: "explicit" | "implicit" | "all";
     rows: DownRatingRow[];
     next_before_created_at: string | null;
     next_before_id: string | null;

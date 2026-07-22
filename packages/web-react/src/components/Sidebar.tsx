@@ -1,4 +1,4 @@
-import { BookOpen, Building2, LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
+import { BookOpen, Building2, LayoutGrid, LogOut, MessageSquareText, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -18,6 +18,7 @@ export function Sidebar({
   onCollapse,
   onLogout,
   onOpenAccount,
+  onOpenFeedback,
   onOpenManage,
   onOpenMarketplace,
   onOpenTutorial,
@@ -36,6 +37,8 @@ export function Sidebar({
   onCollapse?: () => void;
   onLogout?: () => void;
   onOpenAccount?: () => void;
+  /** 打开设置中心的反馈分区。省略则不渲染入口（demo）。 */
+  onOpenFeedback?: () => void;
   /** 打开管理中心（记忆/定时任务/技能）。省略则不渲染入口（demo）。 */
   onOpenManage?: () => void;
   /** 打开 AI 市场（技能/智能体）。省略则不渲染入口（demo）。 */
@@ -246,6 +249,18 @@ export function Sidebar({
             </span>
           </span>
         </button>
+        {onOpenFeedback && (
+          <button
+            type="button"
+            data-product-feature={PRODUCT_CAPABILITIES.feedback.id}
+            onClick={onOpenFeedback}
+            aria-label="反馈与帮助"
+            title="反馈与帮助"
+            className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+          >
+            <MessageSquareText size={16} />
+          </button>
+        )}
         {onLogout && (
           <button
             data-product-control

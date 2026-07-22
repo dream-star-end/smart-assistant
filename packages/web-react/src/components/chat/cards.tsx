@@ -59,7 +59,7 @@ export type RenderCtx = {
   activityInFooter?: boolean;
 };
 
-/** 逐条反馈上下文（请求ID + 关联键）。P6 反馈弹窗消费；本期由 App 兜底。 */
+/** 逐条反馈上下文（请求ID + 关联键 + 可见短摘录），由消息反馈弹窗按白名单消费。 */
 export type FeedbackContext = {
   traceId: string | null;
   messageId: string;

@@ -369,6 +369,83 @@ describe("commercial HTTP router (integ)", () => {
     assert.equal((j as Record<string, { code: string }>).error.code, "INVALID_JSON");
   });
 
+  test("feedback: anonymous stays anonymous, invalid Bearer is 401, valid Bearer binds user, short nonblank is accepted", async (t) => {
+    if (skipIfMissing(t)) return;
+
+    const anonymous = await postJson("/api/feedback", {
+      category: "bug",
+      description: "好",
+      meta: { source: "settings" },
+    });
+    assert.equal(anonymous.status, 200, JSON.stringify(anonymous.json));
+
+    const invalid = await postJson(
+      "/api/feedback",
+      { category: "bug", description: "无效 token 不得静默匿名" },
+      { Authorization: "Bearer expired-or-invalid" },
+    );
+    assert.equal(invalid.status, 401, JSON.stringify(invalid.json));
+
+    const insertedUser = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, email_verified)
+       VALUES ('feedback-user@example.com', 'x', true) RETURNING id::text AS id`,
+    );
+    const userId = insertedUser.rows[0].id;
+    const access = (await signAccess({ sub: userId, role: "user" }, JWT_SECRET)).token;
+    const linked = await postJson(
+      "/api/feedback",
+      { category: "response", description: "短", request_id: "trace-feedback-1" },
+      { Authorization: `Bearer ${access}` },
+    );
+    assert.equal(linked.status, 200, JSON.stringify(linked.json));
+
+    const rows = await query<{ user_id: string | null; description: string }>(
+      "SELECT user_id::text AS user_id, description FROM feedback ORDER BY id",
+    );
+    assert.deepEqual(rows.rows, [
+      { user_id: null, description: "好" },
+      { user_id: userId, description: "短" },
+    ]);
+  });
+
+  test("admin response-ratings source defaults explicit, supports implicit/all, rejects unknown", async (t) => {
+    if (skipIfMissing(t)) return;
+    const insertedAdmin = await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, email_verified, role)
+       VALUES ('ratings-admin@example.com', 'x', true, 'admin') RETURNING id::text AS id`,
+    );
+    const userId = insertedAdmin.rows[0].id;
+    await query(
+      `INSERT INTO response_rating
+         (user_id, session_id, message_id, trace_id, model, rating, tags, comment)
+       VALUES
+         ($1::bigint, 's1', 'explicit-message', 'trace-explicit', 'model-a', 'down', ARRAY['不准确'], '显式反馈'),
+         ($1::bigint, 's1', 'implicit-message', 'trace-implicit', 'model-a', 'down', ARRAY['implicit','中途打断'], '隐式信号')`,
+      [userId],
+    );
+    const adminToken = (await signAccess({ sub: userId, role: "admin" }, JWT_SECRET)).token;
+    const headers = { Authorization: `Bearer ${adminToken}` };
+
+    const explicit = await getJson("/api/admin/response-ratings", headers);
+    assert.equal(explicit.status, 200, JSON.stringify(explicit.json));
+    const explicitRows = (explicit.json.down_ratings as { rows: Array<{ comment: string }>; source: string });
+    assert.equal(explicitRows.source, "explicit");
+    assert.deepEqual(explicitRows.rows.map((row) => row.comment), ["显式反馈"]);
+
+    const implicit = await getJson("/api/admin/response-ratings?source=implicit", headers);
+    assert.equal(implicit.status, 200, JSON.stringify(implicit.json));
+    const implicitRows = implicit.json.down_ratings as { rows: Array<{ comment: string }>; source: string };
+    assert.equal(implicitRows.source, "implicit");
+    assert.deepEqual(implicitRows.rows.map((row) => row.comment), ["隐式信号"]);
+
+    const all = await getJson("/api/admin/response-ratings?source=all", headers);
+    assert.equal(all.status, 200, JSON.stringify(all.json));
+    assert.equal((all.json.down_ratings as { rows: unknown[] }).rows.length, 2);
+
+    const invalid = await getJson("/api/admin/response-ratings?source=surprise", headers);
+    assert.equal(invalid.status, 400, JSON.stringify(invalid.json));
+  });
+
   test("register CONFLICT → 409", async (t) => {
     if (skipIfMissing(t)) return;
     await postJson("/api/auth/register", {

@@ -76,18 +76,33 @@ describe("FeedbackPage · 反馈队列", () => {
   });
 
   test("点开行 → 详情抽屉 → 确认处理命中 ack 端点", async () => {
-    adminGet.mockResolvedValue({
-      rows: [fb()],
-      next_before_created_at: null,
-      next_before_id: null,
-    });
+    adminGet
+      .mockResolvedValueOnce({
+        rows: [fb()],
+        next_before_created_at: null,
+        next_before_id: null,
+      })
+      .mockResolvedValueOnce({
+        trace: {
+          trace_id: "req-abc-123456",
+          user_id: "42",
+          username: "Alice",
+          session_key: "session-1",
+          agent_id: "main",
+          model: "glm-5.2",
+          created_at: new Date().toISOString(),
+        },
+      });
     adminSend.mockResolvedValue({ feedback: fb({ status: "acked" }) });
 
     renderPage(<FeedbackPage />);
 
     fireEvent.click(await screen.findByText("页面加载很慢"));
-    // 抽屉独有的「反查命令」区
-    expect(await screen.findByText("反查命令")).toBeInTheDocument();
+    const lookup = await screen.findByRole("button", { name: "一键反查" });
+    fireEvent.click(lookup);
+    expect(await screen.findByText("session-1")).toBeInTheDocument();
+    expect(screen.getByText("glm-5.2")).toBeInTheDocument();
+    expect(adminGet).toHaveBeenLastCalledWith("/trace/req-abc-123456");
 
     fireEvent.click(screen.getByRole("button", { name: /确认处理/ }));
     await waitFor(() =>
@@ -136,6 +151,7 @@ describe("FeedbackPage · 响应评分", () => {
           by_model: [{ model: "glm-5.2", up: 5, down: 1, total: 6, up_rate: 0.8333 }],
         },
         down_ratings: {
+          source: "explicit",
           rows: [
             {
               id: "9",
@@ -161,7 +177,53 @@ describe("FeedbackPage · 响应评分", () => {
     expect(await screen.findByText("答非所问")).toBeInTheDocument();
     expect(adminGet).toHaveBeenCalledWith(
       "/response-ratings",
-      expect.objectContaining({ limit: 50 }),
+      expect.objectContaining({ limit: 50, source: "explicit" }),
+    );
+  });
+
+  test("最近差评默认显式来源，切换隐式后重置并按新来源拉取", async () => {
+    adminGet.mockImplementation((path: string, query?: Record<string, unknown>) => {
+      if (path === "/feedback") {
+        return Promise.resolve({ rows: [], next_before_created_at: null, next_before_id: null });
+      }
+      const source = query?.source === "implicit" ? "implicit" : "explicit";
+      return Promise.resolve({
+        stats: {
+          overall: { up: 1, down: 1, total: 2, up_rate: 0.5 },
+          last_7d: { up: 1, down: 1, total: 2, up_rate: 0.5 },
+          last_30d: { up: 1, down: 1, total: 2, up_rate: 0.5 },
+          by_model: [],
+        },
+        down_ratings: {
+          source,
+          rows: [
+            {
+              id: source === "implicit" ? "2" : "1",
+              model: null,
+              tags: source === "implicit" ? ["implicit", "中途打断"] : ["不准确"],
+              comment: source === "implicit" ? "隐式信号" : "显式反馈",
+              trace_id: null,
+              session_id: null,
+              created_at: new Date().toISOString(),
+              username: "Bob",
+            },
+          ],
+          next_before_created_at: null,
+          next_before_id: null,
+        },
+      });
+    });
+
+    renderPage(<FeedbackPage />);
+    fireEvent.click(screen.getByRole("tab", { name: "响应评分" }));
+    expect(await screen.findByText("显式反馈")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("差评来源"), { target: { value: "implicit" } });
+    expect(await screen.findByText("隐式信号")).toBeInTheDocument();
+    expect(screen.queryByText("显式反馈")).not.toBeInTheDocument();
+    expect(adminGet).toHaveBeenLastCalledWith(
+      "/response-ratings",
+      expect.objectContaining({ source: "implicit", before_id: undefined }),
     );
   });
 });

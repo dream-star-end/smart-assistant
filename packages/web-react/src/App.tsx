@@ -38,7 +38,8 @@ import {
   type VisibleVirtualRowAnchor,
 } from "./components/chat/archivePaging";
 import { turnFinalAssistantFlags } from "./components/chat/turnSegment";
-import type { CardCallbacks } from "./components/chat/cards";
+import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
+import { MessageFeedbackDialog } from "./components/chat/MessageFeedbackDialog";
 import {
   type RatingEntry,
   type ResponseRatingCtx,
@@ -238,6 +239,8 @@ export function App() {
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
+  const [messageFeedback, setMessageFeedback] = useState<FeedbackContext | null>(null);
+  const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
@@ -1431,22 +1434,13 @@ export function App() {
   // send/stopTurn 只经 ref 调用，故它们的引用不被本回调的重建牵动。
   sendImplicitRatingRef.current = sendImplicitRating;
 
-  // 逐条反馈（P6 反馈弹窗的占位接线）：暂以复制诊断串兜底（请求ID + 关联键），
-  // 让用户/运维能立即把可追溯上下文交出去；P6 落地后替换为带上下文的反馈弹窗。
-  const onFeedback = useCallback(
-    (ctx: { traceId: string | null; messageId: string; role: string; errorCode: string | null }) => {
-      const diag = [
-        ctx.traceId ? `请求ID: ${ctx.traceId}` : null,
-        `消息: ${ctx.messageId}`,
-        activeId ? `会话: ${activeId}` : null,
-        ctx.errorCode ? `错误码: ${ctx.errorCode}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n");
-      void navigator.clipboard?.writeText(diag).catch(() => {});
-    },
-    [activeId],
-  );
+  // 逐条反馈：打开显式反馈弹窗。上下文发送白名单由 MessageFeedbackDialog 收口，
+  // 不再把诊断串静默写入剪贴板。
+  const onFeedback = useCallback((ctx: FeedbackContext) => {
+    messageFeedbackTriggerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setMessageFeedback(ctx);
+  }, []);
   // 工具卡上下文动作（记忆/技能/定时任务卡上的「打开…」按钮 + 连接器写操作确认卡的
   // 鉴权动作）。稳定引用经 context 注入，不污染 ToolCard 数据契约。demo 无网络 → 不提供
   //（按钮自动隐藏 / 确认卡降级纯展示）。authRef 是稳定 ref，不入依赖。
@@ -1610,9 +1604,15 @@ export function App() {
   const ratingCtx: ResponseRatingCtx | null = useMemo(
     () =>
       ratingsEnabled
-        ? { ratings: sessionRatings, submit: onRateResponse, nudgeId: ratingNudgeId }
+        ? {
+            ratings: sessionRatings,
+            submit: onRateResponse,
+            nudgeId: ratingNudgeId,
+            sessionId: activeId,
+            getToken: () => authRef.current?.snapshot().token,
+          }
         : null,
-    [ratingsEnabled, sessionRatings, onRateResponse, ratingNudgeId],
+    [ratingsEnabled, sessionRatings, onRateResponse, ratingNudgeId, activeId],
   );
 
   // 方案 a：sending true→false（本轮完成）沿检测 → 若为高成本 turn 且轮末条 assistant 未被评过，
@@ -2013,6 +2013,7 @@ export function App() {
     user,
     credits: user?.credits ?? null,
     onOpenAccount: demo ? undefined : () => openSettings(),
+    onOpenFeedback: demo ? undefined : () => openSettings("feedback"),
     onNew: newSession,
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
@@ -2066,6 +2067,10 @@ export function App() {
             setMobileNavOpen(false);
           }}
           onCollapse={() => setMobileNavOpen(false)}
+          onOpenFeedback={() => {
+            setMobileNavOpen(false);
+            openSettings("feedback");
+          }}
         />
       </Sheet>
 
@@ -2272,6 +2277,19 @@ export function App() {
             }}
           />
         </LazyBoundary>
+      )}
+
+      {!demo && auth && (
+        <MessageFeedbackDialog
+          open={messageFeedback !== null}
+          auth={auth}
+          sessionId={activeId ?? null}
+          context={messageFeedback}
+          returnFocus={messageFeedbackTriggerRef.current}
+          onOpenChange={(open) => {
+            if (!open) setMessageFeedback(null);
+          }}
+        />
       )}
 
       <InboxDialog

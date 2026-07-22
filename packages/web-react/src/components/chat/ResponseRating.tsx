@@ -14,10 +14,12 @@
  *
  * 门控：Context 为 null（demo / 未登录）时整卡渲染 null —— 未登录用户天然隐藏
  * （后端 response-rating 端点强制 JWT，未登录会 401）。是否为「有正文、非 error 的
- * assistant 回复」由挂载点 AssistantCard 判定，本组件不重复。
+ * assistant 回复」由挂载点 AssistantCard 判定，本组件不重复。点赞一步完成；点踩立即记录并
+ * 展开可选原因，用户无需为了提交差评再完成第二步。
  */
 import { ThumbsDown, ThumbsUp } from "lucide-react";
-import { createContext, type ReactNode, useContext, useState } from "react";
+import { createContext, type ReactNode, useContext, useRef, useState } from "react";
+import { reportClientFriction } from "../../lib/clientFriction";
 import { cn } from "../../lib/utils";
 import { Button, IconButton } from "../ui";
 
@@ -39,6 +41,10 @@ export type ResponseRatingCtx = {
   /** 方案 a：需一次性脉冲高亮引导的评分行 messageId（高成本 turn 完成后 App 下发，4s 自熄）。
    *  可选字段，向后兼容既有消费方；仅命中且未评的卡加脉冲类，绝不表示"已选态"。*/
   nudgeId?: string | null;
+  /** 仅用于无文本体验遥测关联，不参与评分业务提交。 */
+  sessionId?: string | null;
+  /** 现场读取内存 access token，避免 refresh 后闭包持有旧 token。 */
+  getToken?: () => string | null | undefined;
 };
 
 const Ctx = createContext<ResponseRatingCtx | null>(null);
@@ -58,8 +64,16 @@ export function useResponseRating(): ResponseRatingCtx | null {
 }
 
 // 标签集（≤8/个≤32 由后端兜底，这里都是短词，天然合规）。
-const DOWN_TAGS = ["不准确", "太慢", "答非所问", "格式乱"] as const;
-const UP_TAGS = ["准确", "有帮助", "简洁"] as const;
+const DOWN_TAGS = [
+  "不准确",
+  "没完成",
+  "没按要求",
+  "工具失败",
+  "太慢",
+  "太啰嗦",
+  "格式问题",
+  "其他",
+] as const;
 
 /** 单个可切换标签 Chip —— 复用仓内既有 chip 视觉（PublishPanel 同款），不发明新样式。*/
 function TagChip({
@@ -132,6 +146,7 @@ export function ResponseRatingCard({
   const [expanded, setExpanded] = useState(false);
   const [tags, setTags] = useState<string[]>([]);
   const [comment, setComment] = useState("");
+  const telemetryIdRef = useRef<string | null>(null);
 
   // 禁用（demo / 未登录）→ 整卡不渲染。放在所有 hook 之后以满足 hooks 规则。
   if (!ctx) return null;
@@ -141,12 +156,23 @@ export function ResponseRatingCard({
   // 脉冲高亮门控:仅当本卡是被引导的那条(nudgeId 命中)且**尚未评过**时点亮 —— 已评用户不再打扰。
   const nudged = ctx.nudgeId === messageId && !rating;
 
-  // 点 thumb：立即静默提交（只带 rating），乐观置已评；同时就地展开细节区。
-  // 改评（thumb 切换）时用被点 thumb 已有的标签回填，同 thumb 则沿用其标签。
+  // 点 thumb：立即静默提交（只带 rating），乐观置已评。点赞保持极轻单行；点踩才展开
+  // 可选原因，避免满意用户还要完成第二步。
   const clickThumb = (r: ResponseRatingValue) => {
     setTags(committed?.rating === r ? (committed.tags ?? []) : []);
     setComment("");
-    setExpanded(true);
+    setExpanded(r === "down");
+    telemetryIdRef.current = reportClientFriction(
+      {
+        surface: "feedback",
+        stage: "rating_clicked",
+        code: r === "up" ? "RATING_UP" : "RATING_DOWN",
+        outcome: "succeeded",
+        traceId: traceId ?? undefined,
+        sessionId: ctx.sessionId ?? undefined,
+      },
+      ctx.getToken?.(),
+    );
     ctx.submit({ messageId, rating: r, traceId });
   };
 
@@ -159,17 +185,33 @@ export function ResponseRatingCard({
   const submitDetail = () => {
     if (!rating) return;
     ctx.submit({ messageId, rating, traceId, tags, comment: comment.trim() || undefined });
+    reportClientFriction(
+      {
+        eventId: telemetryIdRef.current ?? undefined,
+        surface: "feedback",
+        stage: "rating_detail_saved",
+        code: "RATING_DETAIL_SAVED",
+        outcome: "succeeded",
+        traceId: traceId ?? undefined,
+        sessionId: ctx.sessionId ?? undefined,
+      },
+      ctx.getToken?.(),
+    );
     setExpanded(false);
   };
-
-  const tagOptions = rating === "down" ? DOWN_TAGS : UP_TAGS;
 
   return (
     // oc-rating-nudge:纯 box-shadow/border-radius 脉冲(见 styles.css),无布局位移、
     // respect prefers-reduced-motion、暗色自适应；未命中/已评时不加,布局与常态完全一致。
     <div className={cn("mt-1 flex flex-col gap-2", nudged && "oc-rating-nudge")}>
       <div className="flex items-center gap-1.5 text-[12px] text-faint">
-        <span>{rating ? "谢谢反馈" : "这条回复怎么样?"}</span>
+        <span>
+          {expanded && rating === "down"
+            ? "已记录，可选补充原因"
+            : rating
+              ? "谢谢反馈"
+              : "这条回复怎么样?"}
+        </span>
         <div className="flex items-center gap-0.5">
           <ThumbButton kind="up" selected={rating === "up"} onClick={() => clickThumb("up")} />
           <ThumbButton kind="down" selected={rating === "down"} onClick={() => clickThumb("down")} />
@@ -179,7 +221,7 @@ export function ResponseRatingCard({
       {expanded && rating && (
         <div className="flex flex-col gap-2.5 rounded-lg border border-border bg-surface/60 px-3 py-2.5 animate-in">
           <div className="flex flex-wrap gap-1.5">
-            {tagOptions.map((t) => (
+            {DOWN_TAGS.map((t) => (
               <TagChip key={t} label={t} active={tags.includes(t)} onClick={() => toggleTag(t)} />
             ))}
           </div>
@@ -188,12 +230,12 @@ export function ResponseRatingCard({
               value={comment}
               onChange={(e) => setComment(e.target.value)}
               maxLength={500}
-              placeholder={rating === "down" ? "补充说说哪里不好（可选）" : "还有什么可以更好？（可选）"}
+              placeholder="补充说说哪里不好（可选）"
               // text-base（≥16px）防 iOS 聚焦整页放大，md+ 回落紧凑字号（与 Input 原语同策略）。
               className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-base text-fg outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring md:text-[13px]"
             />
             <Button size="sm" variant="secondary" shape="pill" onClick={submitDetail}>
-              提交
+              保存补充
             </Button>
           </div>
         </div>
