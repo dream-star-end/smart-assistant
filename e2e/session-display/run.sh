@@ -21,6 +21,9 @@ export OC_E2E_EMAIL="v5-evals@claudeai.chat"
 export OC_E2E_REQUIRE_DIRECT_TIMELINE=1
 export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 export CI=1
+# The deploy host has a loopback HTTP proxy; SSH-forwarded candidate traffic must not enter it.
+export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}"
 
 PIDS=()
 cleanup() {
