@@ -21,6 +21,7 @@ const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
 const monitorHostInstaller = path.join(root, 'scripts/v5-monitor-host-install-remote.sh')
+const monitorService = path.join(root, 'deploy/v5/openclaude-v5-monitor.service')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
 const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
 const anthropicProxy = path.join(root, 'packages/commercial/src/http/proxy/index.ts')
@@ -3815,6 +3816,54 @@ esac
 }
 
 describe('v5 host monitor independent atomic installer', () => {
+  test('systemd monitor holds the production mutation shared lock and cleanly skips on conflict', async () => {
+    const unit = await readFile(monitorService, 'utf8')
+    const execLine = unit.split('\n').find((line) => line.startsWith('ExecStart='))
+    assert.equal(
+      execLine,
+      'ExecStart=/usr/bin/flock --shared --nonblock --conflict-exit-code 0 /run/openclaude-v5/production-mutation.lock /usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh',
+    )
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-mutation-lock-')); dirs.push(dir)
+    const lock = path.join(dir, 'production-mutation.lock')
+    const holderReady = path.join(dir, 'holder-ready')
+    const holderRelease = path.join(dir, 'holder-release')
+    const payloadRan = path.join(dir, 'payload-ran')
+    const payload = path.join(dir, 'monitor-payload.sh')
+    await writeFile(payload, `#!/bin/bash\ntouch '${payloadRan}'\n`)
+
+    const holder = spawn('/usr/bin/flock', [
+      '--exclusive', lock, '/usr/bin/bash', '-c',
+      `touch '${holderReady}'; while [[ ! -e '${holderRelease}' ]]; do sleep 0.02; done`,
+    ])
+    try {
+      assert.equal(
+        await waitUntilManualLease(
+          () => readFile(holderReady).then(() => true).catch(() => false),
+          5_000,
+        ),
+        true,
+        'exclusive mutation lock holder did not start',
+      )
+      const skipped = spawnSync('/usr/bin/flock', [
+        '--shared', '--nonblock', '--conflict-exit-code', '0', lock,
+        '/usr/bin/bash', payload,
+      ])
+      assert.equal(skipped.status, 0, skipped.stderr?.toString())
+      await assert.rejects(readFile(payloadRan), /ENOENT/, 'conflicting monitor payload must not run')
+    } finally {
+      await writeFile(holderRelease, '')
+      assert.equal(await waitForChildExit(holder, 5_000), true, 'exclusive lock holder did not exit')
+    }
+
+    const ran = spawnSync('/usr/bin/flock', [
+      '--shared', '--nonblock', '--conflict-exit-code', '0', lock,
+      '/usr/bin/bash', payload,
+    ])
+    assert.equal(ran.status, 0, ran.stderr?.toString())
+    assert.equal(await readFile(payloadRan, 'utf8'), '')
+  })
+
   test('official mode is wired through the shared mutation locks without selecting an A/B slot', async () => {
     const source = await readFile(deploy, 'utf8')
     assert.match(source, /--install-monitor\) MODE="install-monitor"/)

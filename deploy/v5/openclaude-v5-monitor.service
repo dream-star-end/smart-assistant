@@ -17,6 +17,10 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/openclaude/v5-monitor/current
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh
+# Monitor and every production mutation share one lock.  A running monitor holds
+# a shared lease for its whole probe/write cycle; an active deploy holds the
+# exclusive lease, so this timer occurrence exits successfully without probing,
+# state changes, notifications, or OnFailure noise.
+ExecStart=/usr/bin/flock --shared --nonblock --conflict-exit-code 0 /run/openclaude-v5/production-mutation.lock /usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh
 # 脚本自己写监控日志;stdout/stderr 进 journal 仅兜底脚本本身报错
 TimeoutStartSec=90
