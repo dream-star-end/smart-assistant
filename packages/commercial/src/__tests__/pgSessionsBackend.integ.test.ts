@@ -38,6 +38,7 @@ import {
   scanOpenSessionGone,
 } from "../dispatch/turnDispatchStore.js";
 import { runReconcileTick } from "../dispatch/turnDispatchReconciler.js";
+import { authorizeTurnTapeRecovery } from "../admin/turnTapeRecovery.js";
 import { _sanitizeMasterHistoricalMessagesForFrame } from "../ws/userChatBridge.js";
 import {
   makeServerAuthoredHandler,
@@ -64,6 +65,7 @@ const MIGRATION_0175 = path.resolve(here, "../db/migrations/0175_client_session_
 const MIGRATION_0173 = path.resolve(here, "../db/migrations/0173_client_session_model.sql");
 const MIGRATION_0176 = path.resolve(here, "../db/migrations/0176_direct_turn_timeline.sql");
 const MIGRATION_0177 = path.resolve(here, "../db/migrations/0177_unified_client_timeline.sql");
+const MIGRATION_0181 = path.resolve(here, "../db/migrations/0181_turn_tape_recovery_links.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -184,6 +186,24 @@ before(async () => {
   }
   await pool.query(await readFile(MIGRATION_0176, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0177, { encoding: "utf8" }));
+  await pool.query(`
+    CREATE TABLE users (id BIGINT PRIMARY KEY);
+    INSERT INTO users(id) VALUES (1)
+  `);
+  await pool.query(await readFile(MIGRATION_0181, { encoding: "utf8" }));
+  await pool.query(`
+    CREATE TABLE admin_audit (
+      id BIGSERIAL PRIMARY KEY,
+      admin_id BIGINT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT,
+      before JSONB,
+      after JSONB,
+      ip INET,
+      user_agent TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
   migration0176EscapedNulBackfill = (
     await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
       `SELECT physical_record_count, logical_record_count, record_payload_bytes::text
@@ -243,7 +263,7 @@ beforeEach(async () => {
   await pool.query(
     `TRUNCATE client_sessions, client_session_archive_chunks, client_session_archived_ids,
              server_authored_request_map, pending_usage_patches, turn_waivers,
-             wechat_bindings CASCADE`,
+             wechat_bindings, admin_audit CASCADE`,
   );
 });
 
@@ -857,6 +877,357 @@ describe("pgSessionsBackend contract", () => {
 });
 
 describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("authorized recovery atomically replaces the source anchor while preserving source billing", async () => {
+    const sessionId = "s-tape-recovery";
+    const userId = "c:241";
+    const createdAt = 1_784_394_447_612;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+
+    const source = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "crashed",
+      turnKey: "1".repeat(64),
+      text: "synthetic crash placeholder",
+      createdAt,
+    });
+    const sourceDispatchId = randomUUID();
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,241,$2,'recovery-source-message','main','gpt-5.6-sol',$3,$4,
+               'admitted','recovery-test',NOW() + INTERVAL '1 minute')`,
+      [sourceDispatchId, sessionId, "a".repeat(64), `recovery-billing-${sourceDispatchId}`],
+    );
+    for (const part of source.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes, {
+        dispatchId: sourceDispatchId,
+        attemptNo: 1,
+      });
+    }
+    const sourceFinalize = { ...source.finalize, dispatchId: sourceDispatchId, attemptNo: 1 };
+    assert.equal((await backend.finalizeLosslessTurnTape(userId, sourceFinalize)).applied, "finalized");
+    const sourceHeader = (
+      await pool.query<{ billing_anchor_id: string }>(
+        `SELECT billing_anchor_id FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, source.finalize.tapeId],
+      )
+    ).rows[0]!;
+    await pool.query(
+      `INSERT INTO turn_tape_cost_components
+         (request_id,user_id,session_id,tape_id,billing_anchor_id,cost_credits,delegate_agent_id,updated_at)
+       VALUES
+         ('recovery-root',$1,$2,$3,$4,'9',NULL,1),
+         ('recovery-delegate',$1,$2,$3,$4,'3','reviewer',1)`,
+      [userId, sessionId, source.finalize.tapeId, sourceHeader.billing_anchor_id],
+    );
+
+    const recovery = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "2".repeat(64),
+      text: "the recovered complete answer",
+      usage: {
+        costCredits: "12",
+        delegates: [{ agentId: "reviewer", costCredits: "3" }],
+      },
+      createdAt,
+    });
+    for (const part of recovery.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    // Force the exact race where finalize's unlocked hint sees no link, then
+    // authorization commits while finalize waits on its first turn lock.
+    const blocker = await pool.connect();
+    const recoveryLockKey = `oc_sarm:${userId}:turn:${recovery.finalize.turnKey}`;
+    await blocker.query("SELECT pg_advisory_lock(hashtextextended($1,0))", [recoveryLockKey]);
+    const finalize = backend.finalizeLosslessTurnTape(userId, recovery.finalize);
+    try {
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        waiting = (await pool.query<{ waiting: boolean }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_locks
+              WHERE locktype='advisory' AND granted=FALSE
+           ) AS waiting`,
+        )).rows[0]?.waiting ?? false;
+        if (waiting) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(waiting, true, "finalize must reach the no-hint single-lock path");
+      await pool.query(
+        `INSERT INTO turn_tape_recovery_links
+           (session_id,user_id,source_tape_id,recovery_tape_id,
+            source_tape_sha256,recovery_tape_sha256,source_turn_key,recovery_turn_key,
+            authorized_by,reason,created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'held_retry_conflict',1)`,
+        [
+          sessionId,
+          userId,
+          source.finalize.tapeId,
+          recovery.finalize.tapeId,
+          source.finalize.tapeSha256,
+          recovery.finalize.tapeSha256,
+          source.finalize.turnKey,
+          recovery.finalize.turnKey,
+        ],
+      );
+    } finally {
+      await blocker.query("SELECT pg_advisory_unlock(hashtextextended($1,0))", [recoveryLockKey]);
+      blocker.release();
+    }
+
+    assert.deepEqual(await finalize, {
+      applied: "finalized",
+      recordCount: 1,
+      engineBillings: [],
+    });
+    const costs = await pool.query<{
+      tape_id: string;
+      count: string;
+      credits: string;
+    }>(
+      `SELECT tape_id,COUNT(*)::text AS count,SUM(cost_credits)::text AS credits
+         FROM turn_tape_cost_components WHERE session_id=$1 AND user_id=$2
+        GROUP BY tape_id`,
+      [sessionId, userId],
+    );
+    assert.deepEqual(costs.rows, [{ tape_id: source.finalize.tapeId, count: "2", credits: "12" }]);
+
+    const hot = (
+      await pool.query<{ messages: string }>(
+        "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2",
+        [sessionId, userId],
+      )
+    ).rows[0]!;
+    const anchors = JSON.parse(hot.messages) as MessageLike[];
+    assert.equal(anchors.length, 1);
+    assert.equal(anchors[0]?._turnTapeId, recovery.finalize.tapeId);
+    const hydrated = await backend.getClientSession(sessionId, userId);
+    const answer = (hydrated!.messages as MessageLike[]).find((message) => message.role === "assistant")!;
+    assert.equal(answer.text, "the recovered complete answer");
+    assert.deepEqual(answer.usage, {
+      costCredits: "12",
+      delegates: [{ agentId: "reviewer", costCredits: "3" }],
+    });
+    const storedRecovery = (
+      await pool.query<{ usage: unknown; payload: Buffer }>(
+        `SELECT t.usage,r.visible_payload AS payload
+           FROM client_session_turn_tapes t
+           JOIN client_session_turn_tape_records r
+             ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            AND r.msg_id=t.billing_anchor_id
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+        [sessionId, userId, recovery.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.deepEqual(storedRecovery.usage, {
+      costCredits: "12",
+      delegates: [{ agentId: "reviewer", costCredits: "3" }],
+    });
+    assert.deepEqual(JSON.parse(storedRecovery.payload.toString("utf8")).usage, storedRecovery.usage);
+
+    assert.deepEqual(
+      await backend.appendCostCredits(
+        "recovery-late",
+        userId,
+        "5",
+        "ccb-recovery-late",
+        null,
+        null,
+        source.finalize.turnKey,
+      ),
+      { applied: "patched" },
+    );
+    const hydratedAfterLateCost = await backend.getClientSession(sessionId, userId);
+    const answerAfterLateCost = (hydratedAfterLateCost!.messages as MessageLike[])
+      .find((message) => message.role === "assistant")!;
+    assert.deepEqual(answerAfterLateCost.usage, {
+      costCredits: "17",
+      delegates: [{ agentId: "reviewer", costCredits: "3" }],
+    });
+    assert.deepEqual(
+      (await pool.query<{ tape_id: string; count: string; credits: string }>(
+        `SELECT tape_id,COUNT(*)::text AS count,SUM(cost_credits)::text AS credits
+           FROM turn_tape_cost_components WHERE session_id=$1 AND user_id=$2
+          GROUP BY tape_id`,
+        [sessionId, userId],
+      )).rows,
+      [{ tape_id: source.finalize.tapeId, count: "3", credits: "17" }],
+    );
+
+    await assert.rejects(
+      pool.query(
+        `DELETE FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+        [sessionId, userId, source.finalize.tapeId],
+      ),
+      /turn_tape_recovery_links/,
+    );
+    assert.equal(await backend.deleteClientSession(sessionId, userId), true);
+    assert.equal(
+      (await pool.query("SELECT 1 FROM turn_tape_recovery_links WHERE session_id=$1", [sessionId])).rowCount,
+      0,
+    );
+    assert.equal(
+      (await pool.query("SELECT 1 FROM client_session_turn_tapes WHERE session_id=$1", [sessionId])).rowCount,
+      0,
+    );
+  });
+
+  maybe("recovery fails closed on pending cost and a changed source anchor", async () => {
+    const sessionId = "s-tape-recovery-reject";
+    const userId = "c:242";
+    const createdAt = 1_784_394_447_613;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const source = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "crashed",
+      turnKey: "3".repeat(64),
+      text: "synthetic crash placeholder",
+      createdAt,
+    });
+    const sourceDispatchId = randomUUID();
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,242,$2,'recovery-reject-source-message','main','gpt-5.6-sol',$3,$4,
+               'admitted','recovery-test',NOW() + INTERVAL '1 minute')`,
+      [sourceDispatchId, sessionId, "b".repeat(64), `recovery-billing-${sourceDispatchId}`],
+    );
+    for (const part of source.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes, {
+        dispatchId: sourceDispatchId,
+        attemptNo: 1,
+      });
+    }
+    const sourceFinalize = { ...source.finalize, dispatchId: sourceDispatchId, attemptNo: 1 };
+    assert.equal((await backend.finalizeLosslessTurnTape(userId, sourceFinalize)).applied, "finalized");
+
+    const recovery = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "4".repeat(64),
+      text: "full held retry",
+      usage: { costCredits: "0", delegates: [] },
+      createdAt,
+    });
+    for (const part of recovery.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+    const authorization = {
+        sessionId,
+        userId,
+        sourceTapeId: source.finalize.tapeId,
+        recoveryTapeId: recovery.finalize.tapeId,
+        sourceTapeSha256: source.finalize.tapeSha256,
+        recoveryTapeSha256: recovery.finalize.tapeSha256,
+        reason: "held_retry_conflict" as const,
+      };
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET status='completed'
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, source.finalize.tapeId],
+    );
+    await assert.rejects(
+      authorizeTurnTapeRecovery(authorization, { adminId: 1 }, pool),
+      /requires a billed, dispatch-backed crashed source/,
+    );
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET status='crashed'
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, source.finalize.tapeId],
+    );
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET status='crashed'
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, recovery.finalize.tapeId],
+    );
+    await assert.rejects(
+      authorizeTurnTapeRecovery(authorization, { adminId: 1 }, pool),
+      /and a completed staged tape/,
+    );
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET status='completed'
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, recovery.finalize.tapeId],
+    );
+    await assert.rejects(
+      authorizeTurnTapeRecovery(authorization, { adminId: 999 }, pool),
+      (error: unknown) => (error as { code?: string }).code === "23503",
+    );
+    assert.equal(
+      await authorizeTurnTapeRecovery(authorization, { adminId: 1 }, pool),
+      "authorized",
+    );
+    assert.equal(
+      await authorizeTurnTapeRecovery(authorization, { adminId: 1 }, pool),
+      "idempotent",
+    );
+    assert.equal(
+      (await pool.query(
+        "SELECT 1 FROM admin_audit WHERE action='turn_tape.recover' AND target=$1",
+        [`session:${sessionId}`],
+      )).rowCount,
+      1,
+    );
+    await pool.query(
+      "UPDATE turn_dispatches SET outcome='completed' WHERE dispatch_id=$1",
+      [sourceDispatchId],
+    );
+    await assert.rejects(
+      backend.finalizeLosslessTurnTape(userId, recovery.finalize),
+      /source dispatch is no longer an authoritative crash/,
+    );
+    await pool.query(
+      "UPDATE turn_dispatches SET outcome='crashed' WHERE dispatch_id=$1",
+      [sourceDispatchId],
+    );
+    await pool.query(
+      `INSERT INTO pending_usage_patches
+         (request_id,user_id,turn_key,cost_credits,created_at)
+       VALUES ('recovery-pending',$1,$2,'1',1)`,
+      [userId, recovery.finalize.turnKey],
+    );
+    await assert.rejects(
+      backend.finalizeLosslessTurnTape(userId, recovery.finalize),
+      /pending financial rows/,
+    );
+    await pool.query(
+      "DELETE FROM pending_usage_patches WHERE request_id='recovery-pending' AND user_id=$1",
+      [userId],
+    );
+    await pool.query(
+      "UPDATE client_sessions SET messages='[]' WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+    await assert.rejects(
+      backend.finalizeLosslessTurnTape(userId, recovery.finalize),
+      /source no longer owns one complete hot anchor/,
+    );
+    const state = (
+      await pool.query<{ finalized: boolean; costs: string }>(
+        `SELECT t.finalized_at IS NOT NULL AS finalized,
+                (SELECT COUNT(*)::text FROM turn_tape_cost_components c
+                  WHERE c.session_id=t.session_id AND c.user_id=t.user_id AND c.tape_id=t.tape_id) AS costs
+           FROM client_session_turn_tapes t
+          WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3`,
+        [sessionId, userId, recovery.finalize.tapeId],
+      )
+    ).rows[0]!;
+    assert.deepEqual(state, { finalized: false, costs: "0" });
+  });
+
   maybe("record staging commits complete 128-row batches and replays only the rolled-back batch", async () => {
     const sessionId = "s-record-stage-batches";
     const userId = "c:231";

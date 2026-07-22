@@ -6,6 +6,8 @@
  *   - GET  /api/admin/sessions/:id?user_id=:userId&view=timeline  对话 UI 热尾快照
  *   - GET  /api/admin/sessions/:id/archive?user_id=:userId&before&limit
  *   - POST /api/admin/sessions/:id/media-sign?user_id=:userId     目标用户媒体短签
+ *   - POST /api/admin/sessions/:id/tape/:source/recovery?user_id=:userId
+ *                                                            授权一次无损 tape 恢复
  *
  * 鉴权:
  *   - requireAdminVerifyDb(每次 DB 复核 admin 角色)
@@ -66,6 +68,10 @@ import { parseBigintIdParam } from "./_shared.js";
 import { getPool } from "../../db/index.js";
 import { writeAdminAudit } from "../../admin/audit.js";
 import {
+  authorizeTurnTapeRecovery,
+  TurnTapeRecoveryError,
+} from "../../admin/turnTapeRecovery.js";
+import {
   DEFAULT_SIGN_TTL_MS,
   buildOpaqueMediaFileUrl,
   buildOpaqueSignedUrl,
@@ -85,6 +91,7 @@ export type AdminSessionRoute =
   | { sessionId: string; kind: "detail" | "archive" | "timeline" | "media-sign" }
   | { sessionId: string; kind: "tape-records"; tapeId: string }
   | { sessionId: string; kind: "tape-payload"; tapeId: string; recordOrdinal: number }
+  | { sessionId: string; kind: "tape-recovery"; tapeId: string }
   | { sessionId: string; kind: "user-payload"; messageId: string };
 
 export function parseAdminSessionRoute(url: URL): AdminSessionRoute {
@@ -105,6 +112,11 @@ export function parseAdminSessionRoute(url: URL): AdminSessionRoute {
     const tapeId = parts[2] ?? "";
     if (!TAPE_ID_RE.test(tapeId)) invalid();
     return { sessionId, kind: "tape-records", tapeId };
+  }
+  if (parts.length === 4 && parts[1] === "tape" && parts[3] === "recovery") {
+    const tapeId = parts[2] ?? "";
+    if (!TAPE_ID_RE.test(tapeId)) invalid();
+    return { sessionId, kind: "tape-recovery", tapeId };
   }
   if (
     parts.length === 6 && parts[1] === "tape" && parts[3] === "records" &&
@@ -654,13 +666,48 @@ export async function handleAdminSignSessionMedia(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
-  if (!deps.mediaSignKey) {
-    throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
-  }
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const route = parseAdminSessionRoute(url);
+  if (route.kind === "tape-recovery") {
+    const { rawUserId, scopedUserId } = scopedSessionUserId(url);
+    if (!rawUserId || !scopedUserId) {
+      throw new HttpError(400, "VALIDATION", "user_id is required for tape recovery");
+    }
+    const body = (await readJsonBody(req)) as Record<string, unknown> | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new HttpError(400, "VALIDATION", "body must be a JSON object");
+    }
+    if (body.reason !== "held_retry_conflict") {
+      throw new HttpError(400, "VALIDATION", "invalid recovery reason");
+    }
+    try {
+      const result = await authorizeTurnTapeRecovery({
+        sessionId: route.sessionId,
+        userId: scopedUserId,
+        sourceTapeId: route.tapeId,
+        recoveryTapeId: String(body.recovery_tape_id ?? ""),
+        sourceTapeSha256: String(body.source_tape_sha256 ?? ""),
+        recoveryTapeSha256: String(body.recovery_tape_sha256 ?? ""),
+        reason: body.reason,
+      }, {
+        adminId: admin.id,
+        ip: ctx.clientIp,
+        userAgent: ctx.userAgent,
+      });
+      sendJson(res, 200, { result });
+      return;
+    } catch (error) {
+      if (!(error instanceof TurnTapeRecoveryError)) throw error;
+      if (error.code === "not_found") throw new HttpError(404, "NOT_FOUND", error.message);
+      if (error.code === "invalid") throw new HttpError(400, "VALIDATION", error.message);
+      throw new HttpError(409, "CONFLICT", error.message);
+    }
+  }
   if (route.kind !== "media-sign") {
     throw new HttpError(405, "METHOD_NOT_ALLOWED", "admin session detail and archive require GET");
+  }
+  if (!deps.mediaSignKey) {
+    throw new HttpError(503, "SIGN_DISABLED", "media signed URL not configured");
   }
   const { scopedUserId } = scopedSessionUserId(url);
   // 与 archive 相同：签名主体只取权威 session owner，URL user_id 仅用于 fail-closed scope。

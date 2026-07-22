@@ -1291,6 +1291,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     //   GET  /api/admin/sessions/:id[?user_id=:userId]
     //   GET  /api/admin/sessions/:id/archive?user_id=:userId&before&limit
     //   POST /api/admin/sessions/:id/media-sign?user_id=:userId
+    //   POST /api/admin/sessions/:id/tape/:source/recovery?user_id=:userId
     //   - rendering session_id 是 TEXT(UUID/nanoid),handler 自带正则校验
     //   - 只写不含正文/媒体路径的 sessions.read admin_audit
     //   - 详见 admin/sessions.ts header comment

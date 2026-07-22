@@ -72,6 +72,10 @@ const WHITELIST = new Set<string>([
   // **只读 JOIN deleted_at**(判定"会话已软删")——不写六表、不绕 ownership fence;放 backend
   // 反而把 goal 域的离场语义搬进 sessions backend,内聚更差。写入面仍只经白名单 backend。
   "packages/commercial/src/admin/auditRetention.ts",
+  // 超管历史 tape 恢复必须在同一事务内锁住 session 热锚点、source/recovery tapes、
+  // crashed dispatch 和两侧计费 key，再写审计授权；这里只直读 session/archived-id
+  // 权威作 ownership/anchor fence，拆成普通 backend 调用会丢失该原子边界。
+  "packages/commercial/src/admin/turnTapeRecovery.ts",
   // 07-18 债偿:turn dispatch reconciler ⓪ 臂(会话亡自动结案)。与 auditRetention 同构:对
   // client_sessions 仅**只读 LEFT JOIN**(id+user_id 归属 + deleted_at 墓碑,判定"用户面已
   // 消失"的 open dispatch)——不写六表;dispatch 域的离场判定放 sessions backend 反而内聚更差。
