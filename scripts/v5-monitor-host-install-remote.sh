@@ -148,7 +148,7 @@ trap 'exit 129' HUP
   || { echo "FATAL:monitor bundle identity 与 SHA256SUMS 不一致" >&2; exit 1; }
 bash -n "$stage/v5-monitor.sh" "$stage/v5-alert-fail.sh"
 grep -Fqx 'WorkingDirectory=/opt/openclaude/v5-monitor/current' "$stage/$monitor_unit"
-grep -Fqx 'ExecStart=/usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh' "$stage/$monitor_unit"
+grep -Fqx 'ExecStart=/usr/bin/flock --shared --nonblock --conflict-exit-code 0 /run/openclaude-v5/production-mutation.lock /usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh' "$stage/$monitor_unit"
 grep -Fqx 'WorkingDirectory=/opt/openclaude/v5-monitor/current' "$stage/$alert_unit"
 grep -Fqx 'ExecStart=/usr/bin/bash /opt/openclaude/v5-monitor/current/v5-alert-fail.sh %i' "$stage/$alert_unit"
 systemd-analyze verify "$stage/$monitor_unit" "$stage/$timer_unit" "$stage/$alert_unit"
