@@ -55,7 +55,9 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
 **给较弱模型的三条铁律**(Fable 退场后尤其重要):
 1. **不猜,先取证**。任何"应该是 X"都要用命令验证(git log / 线上 grep / 实跑测试)。本手册每个流程都带验证命令,照抄。
 2. **改前找权威源**。v5 大量问题源于双权威(两份清单/两套机制/两处 seed)。动手前先问:这个数据/行为的单一权威在哪?若发现第二份,先收敛再改。
-3. **完成的定义 = 测试实跑通过 + Codex PASS + 按 §4 分类部署 + smoke 通过**。缺一项就不许说"已完成"。
+3. **常规完成的定义 = 测试实跑通过 + Codex PASS + 按 §4 分类部署 + smoke 通过**。缺一项就不许说
+   “已完成”。dx 显式 P0 emergency lane 可在 Phase 1 后只说“止血已上线”；补测、单一 Codex
+   审查和受保护 CI/PR 未关账前，不得说任务或根治完成。
 
 ---
 
@@ -467,6 +469,22 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 全量现网后告别"随改随发"。规则(可按运营数据调整):
 - **常规批次攒窗口发**:非紧急改动合并 canonical 后不立即部署,攒到当日发版窗口(默认每日 1-2 个,北京时间午后/晚间)一次上线;一窗一条面向用户 changelog(改动可感知时)。
 - **hotfix 例外**:现网事故/计费错账/安全面可即时发,但仍必须走 deploy-v5.sh+smoke,并在下一窗口补 changelog。
+- **dx 显式 P0 两阶段止血**:仅当 dx 明确确认当前存在真实用户/资金/安全持续损失,并明确要求
+  “最小止血先上线、审查和用例事后补”时可启用;agent 不得自行推断。Phase 1 只允许已证实根因的
+  最小 diff:从当前 canonical HEAD 建隔离 worktree,先把 exact commit push 到任务分支留远端证据;
+  canonical 必须 clean、无夹带未部署 commit、可 fast-forward 到该 exact commit,且不存在另一个
+  production mutation owner,方可本地 fast-forward 并仅通过官方 canary/finalize 上线。不得临时放宽
+  branch protection、force-push、rsync 或手改运行态;mutation lease、计费/数据不变量、异常先回退、
+  smoke、V3 inactive 永不豁免。稳定后立即补复现用例、单一 Codex full-diff 审查和受保护 CI/PR,
+  再让 canonical 对齐远端 merge;此前只能说“止血已上线”,不能说完成/根治。
+- **生产 mutation 唯一 owner**:以实际持有官方远端 production-mutation flock,且 lease fencing meta
+  中 holder identity/`deploy_id` 可佐证的进程为权威;另行验证该 invocation 保存的 nonce 与其
+  in-flight marker/sentinel 匹配,禁止拿不同标识的 `deploy_id` 与 marker nonce 互比。已有 owner 时
+  其它会话不得竞争 abort/rollback/recover;仅在 holder 退出、flock 释放后按 deploy_state/marker
+  走官方 recovery 接管。无法证明 owner 时只读上报。
+- **只读诊断边界**:“看下/定位/是否正常/先告诉根因”不得触发部署、回退、重启、清 marker 或写库;
+  任务开始前已存在的故障不因另一条 0% canary 自动成为发布异常。健康探测先由
+  `deploy_state.active_slot` 推导 active unit/port,禁止固定 A/B 端口。
 - **P0 stop-the-line**:已定性且未关闭的 P0 存续期间,同一故障域/子系统禁止再合入或上线功能批;只允许诊断、修复与验证该 P0 的改动。例外必须由 boss 明确批准,不能靠临时放宽 branch protection 绕过。
 - **发版门**:check:v5 全绿(typecheck+gateway+mcp-memory+storage+web-react+commercial 基线集 diff)+生效面矩阵分类;镜像面改动放量前 canary(agent uid)。
 - **单日多批合并**:允许(canonical 持续集成),但部署窗口是节流阀;并行会话共用窗口,部署前必 fetch 核对 tip 与镜像 tag,避免互覆(07-06 教训:egress 面被并行部署漏掉)。
