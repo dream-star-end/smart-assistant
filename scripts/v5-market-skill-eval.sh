@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v5-market-skill-eval.sh — 市场技能的平台实测复跑(审核者一键,agent 能力批债②首迭代)。
 #
-# 对**已上架(active)**的市场技能:用 canary 账号临时安装 → 跑一轮 baseline 评测
+# 对**已上架(active)**的市场技能:用独立 eval 账号临时安装 → 跑一轮 baseline 评测
 # (with/without,bundle 自带 evals)→ 打印平台实测通过率与 verdict → 若本来未安装则卸载
 # 还原。用于核验发布者自报 benchmark 的可信度(详情页"发布者实测"徽章只是自报,平台
 # 不背书;本脚本给审核者一个实测口径)。
@@ -12,13 +12,13 @@
 #   - 实测结果仅输出到终端/退出码,不回写 DB(verified 徽章链路=后续批次)。
 #
 # 用法:
-#   PASSWORD=$(cat /root/.secrets/v5-canary.password) \
+#   PASSWORD=$(cat /root/.secrets/v5-evals.password) \
 #     scripts/v5-market-skill-eval.sh <slug>
 #   退出码:0=技能有效/持平;1=有技能反而更差或运行失败;2=用法/前置错误(无 evals 等)。
 set -uo pipefail
 
 V5_BASE="${V5_BASE:-http://127.0.0.1:18790}"
-EMAIL="${EMAIL:-v5-canary@claudeai.chat}"
+EMAIL="${EMAIL:-v5-evals@claudeai.chat}"
 : "${PASSWORD:?PASSWORD required}"
 SLUG="${1:?usage: v5-market-skill-eval.sh <slug>}"
 
@@ -49,8 +49,8 @@ installed_by_us=0
 cleanup() {
   if [ "$was_installed" != "yes" ] && [ "$installed_by_us" -eq 1 ]; then
     curl -sf -X DELETE "${auth[@]}" "$V5_BASE/api/marketplace/installed/$SLUG" >/dev/null 2>&1 \
-      && echo "· 已卸载还原(canary 原本未安装/安装状态未知)" \
-      || echo "· 卸载还原失败,请手工清理 canary 的 $SLUG"
+    && echo "· 已卸载还原(eval 账号原本未安装/安装状态未知)" \
+      || echo "· 卸载还原失败,请手工清理 eval 账号的 $SLUG"
   fi
 }
 trap cleanup EXIT

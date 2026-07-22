@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v5-baseline-evals-weekly.sh — baseline 技能评测的周期回归管道(systemd timer 入口)。
 #
-# 每周对全部带 evals 的平台 baseline 技能跑一轮 with/without 评测(canary 账号,
+# 每周对全部带 evals 的平台 baseline 技能跑一轮 with/without 评测(独立 eval 账号,
 # 平台自担成本,锁 deepseek-v4-pro),结果 JSONL 落 /var/lib/openclaude-v5/baseline-evals/,
 # 并与上一轮对比:
 #   - 运行失败 / FETCH FAILED / verdict"反而更差" → warning 告警(经 admin_alert_outbox,
@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${OC_EVAL_ENV_FILE:-/etc/openclaude/commercial-v5.env}"
 FANOUT_SQL="${OC_EVAL_FANOUT_SQL:-$SCRIPT_DIR/v5-alert-fanout.sql}"
 HIST_DIR="${OC_EVAL_HIST_DIR:-/var/lib/openclaude-v5/baseline-evals}"
-CANARY_PW_FILE="${OC_EVAL_CANARY_PW_FILE:-/root/.secrets/v5-canary.password}"
+EVAL_PW_FILE="${OC_EVAL_PASSWORD_FILE:-/root/.secrets/v5-evals.password}"
 LOCK_FILE="/var/lock/oc-v5-baseline-evals.lock"
 DROP_ALERT_PP="${OC_EVAL_DROP_ALERT_PP:-10}"
 
@@ -62,12 +62,12 @@ if ! flock -n 9; then
   exit 0
 fi
 
-if [ ! -r "$CANARY_PW_FILE" ]; then
+if [ ! -r "$EVAL_PW_FILE" ]; then
   fanout_alert baseline_evals warning "baseline-evals:cred" \
-    "baseline 评测:canary 凭据缺失" \
-    "读不到 $CANARY_PW_FILE,周期回归无法运行。重置 canary(uid=247)密码并写入该文件。" '{}'
-  inbox_notice warning "baseline 评测:canary 凭据缺失" \
-    "读不到 $CANARY_PW_FILE,周期回归无法运行。重置 canary(uid=247)密码并写入该文件。"
+    "baseline 评测:eval 凭据缺失" \
+    "读不到 $EVAL_PW_FILE,周期回归无法运行。重置独立 eval 账号密码并写入该文件。" '{}'
+  inbox_notice warning "baseline 评测:eval 凭据缺失" \
+    "读不到 $EVAL_PW_FILE,周期回归无法运行。重置独立 eval 账号密码并写入该文件。"
   exit 1
 fi
 
@@ -78,8 +78,8 @@ PREV_FILE="$(ls -1 "$HIST_DIR"/run-*.jsonl 2>/dev/null | sort | tail -1 || true)
 
 log "开始周期回归 → $RESULTS_FILE(上一轮:${PREV_FILE:-无})"
 OC_EVAL_RESULTS_FILE="$RESULTS_FILE" \
-  EMAIL="${OC_EVAL_CANARY_EMAIL:-v5-canary@claudeai.chat}" \
-  PASSWORD="$(cat "$CANARY_PW_FILE")" \
+  EMAIL="${OC_EVAL_EMAIL:-v5-evals@claudeai.chat}" \
+  PASSWORD="$(cat "$EVAL_PW_FILE")" \
   bash "$SCRIPT_DIR/run-baseline-skill-evals.sh" > "$HIST_DIR/run-$STAMP.log" 2>&1
 run_rc=$?
 touch "$RESULTS_FILE"   # 整轮零产出时也要有空文件:汇总按"空=异常"告警而不是脚本自身炸掉
@@ -89,13 +89,15 @@ touch "$RESULTS_FILE"   # 整轮零产出时也要有空文件:汇总按"空=异
 { ls -1 "$HIST_DIR"/run-*.log 2>/dev/null || true; } | sort | head -n -12 | xargs -r rm -f --
 
 # 汇总 + 与上一轮对比(python 做数值,shell 只搬运)。
-summary="$(python3 - "$RESULTS_FILE" "${PREV_FILE:-}" "$DROP_ALERT_PP" <<'PY'
-import json, sys
+EXPECTED_DIR="$SCRIPT_DIR/../packages/commercial/agent-sandbox/ccb-baseline/skills"
+summary="$(python3 - "$RESULTS_FILE" "${PREV_FILE:-}" "$DROP_ALERT_PP" "$run_rc" "$EXPECTED_DIR" <<'PY'
+import glob, json, os, sys
 
 def load(path):
     out = {}
+    counts = {}
     if not path:
-        return out
+        return out, counts
     try:
         with open(path, encoding='utf-8') as f:
             for line in f:
@@ -106,14 +108,23 @@ def load(path):
                     r = json.loads(line)
                 except Exception:
                     continue
-                out[r.get('skill', '?')] = r
+                skill = r.get('skill', '?')
+                out[skill] = r
+                counts[skill] = counts.get(skill, 0) + 1
     except FileNotFoundError:
         pass
-    return out
+    return out, counts
 
-cur, prev = load(sys.argv[1]), load(sys.argv[2] if len(sys.argv) > 2 else '')
+cur, cur_counts = load(sys.argv[1])
+prev, _ = load(sys.argv[2] if len(sys.argv) > 2 else '')
 drop_pp = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
+run_rc = int(sys.argv[4])
+expected_dir = sys.argv[5]
+expected = sorted(os.path.basename(os.path.dirname(os.path.dirname(p)))
+                  for p in glob.glob(os.path.join(expected_dir, '*/evals/evals.json')))
 problems, lines = [], []
+if run_rc != 0:
+    problems.append(f'runner 非零退出(rc={run_rc})')
 for skill, r in sorted(cur.items()):
     st = r.get('status')
     b = r.get('benchmark') or {}
@@ -130,6 +141,14 @@ for skill, r in sorted(cur.items()):
     pw = ((prev.get(skill) or {}).get('benchmark') or {}).get('passRate', {}).get('with')
     if isinstance(w, (int, float)) and isinstance(pw, (int, float)) and (pw - w) * 100 > drop_pp:
         problems.append(f"{skill}: with 臂较上一轮下降 {round((pw - w) * 100)}pp({fmt(pw)}→{fmt(w)})")
+missing = [skill for skill in expected if skill not in cur]
+for skill in missing:
+    problems.append(f'{skill}: 缺少评测结果')
+for skill in expected:
+    if cur_counts.get(skill, 0) > 1:
+        problems.append(f'{skill}: 评测结果重复({cur_counts[skill]} 条,期望 1 条)')
+done_expected = sum(1 for skill in expected if (cur.get(skill) or {}).get('status') == 'done')
+lines.insert(0, f'- baseline coverage: {done_expected}/{len(expected)} done')
 if not cur:
     problems.append('结果文件为空(整轮评测未产出任何记录)')
 print(json.dumps({'problems': problems, 'report': '\n'.join(lines)}, ensure_ascii=False))

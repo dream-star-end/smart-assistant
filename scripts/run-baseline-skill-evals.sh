@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # run-baseline-skill-evals.sh — 平台 baseline 技能的评测回归(部署 checklist / CI 用)。
 #
-# 在 canary 账号的容器上,对**带 evals 的技能**逐个跑一轮 baseline 评测(with/without),
+# 在独立 eval 账号的容器上,对**带 evals 的技能**逐个跑一轮 baseline 评测(with/without),
 # 任何一项 verdict 为「有技能反而更差」或运行失败 → 非零退出(阻断发版)。
 #
-# 成本:跑在 canary 账号(平台自担),锁 deepseek-v4-pro;技能数 × 用例数 决定消耗。
+# 成本:跑在 eval 账号(平台自担),锁 deepseek-v4-pro;技能数 × 用例数 决定消耗。
 # 用法:
-#   V5_BASE=http://127.0.0.1:18790 EMAIL=v5-canary@claudeai.chat PASSWORD=... \
+#   V5_BASE=http://127.0.0.1:18790 EMAIL=v5-evals@claudeai.chat PASSWORD=... \
 #     scripts/run-baseline-skill-evals.sh [skill1 skill2 ...]
 #   不传技能名 = 遍历该账号可见技能里所有带 evals 的。
 #   OC_EVAL_RESULTS_FILE=<path> 时,每个技能完成后追加一行机器可读 JSONL
@@ -15,14 +15,46 @@
 set -euo pipefail
 
 V5_BASE="${V5_BASE:-http://127.0.0.1:18790}"
-EMAIL="${EMAIL:-v5-canary@claudeai.chat}"
+EMAIL="${EMAIL:-v5-evals@claudeai.chat}"
+MAX_POLLS="${OC_EVAL_MAX_POLLS:-360}" # 每 10s 一次；默认单技能最多等 60min
 : "${PASSWORD:?PASSWORD required}"
 
-TOK=$(curl -sf -X POST "$V5_BASE/api/auth/login" -H 'Content-Type: application/json' \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"turnstile_token\":\"x\"}" |
-  python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+append_result_stub() { # <skill> <runId> <status>
+  [ -n "${OC_EVAL_RESULTS_FILE:-}" ] || return 0
+  python3 - "$1" "$2" "$3" >> "$OC_EVAL_RESULTS_FILE" <<'PY'
+import json, sys
+print(json.dumps({"skill": sys.argv[1], "runId": sys.argv[2] or None,
+                  "status": sys.argv[3], "benchmark": None}, ensure_ascii=False))
+PY
+}
+
+COOKIE_FILE="$(mktemp)"
+chmod 600 "$COOKIE_FILE"
+TOK=""
+login() {
+  TOK=$(curl -sf -b "$COOKIE_FILE" -c "$COOKIE_FILE" -X POST \
+    "$V5_BASE/api/auth/login" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"turnstile_token\":\"x\"}" |
+    python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+}
+cleanup() {
+  curl -sf -b "$COOKIE_FILE" -X POST "$V5_BASE/api/auth/logout" \
+    -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
+  rm -f "$COOKIE_FILE"
+}
+trap cleanup EXIT
+login
 
 auth=(-H "Authorization: Bearer $TOK")
+refresh_auth() {
+  if login; then
+    auth=(-H "Authorization: Bearer $TOK")
+    echo "  AUTH REFRESHED"
+    return 0
+  fi
+  echo "  AUTH REFRESH FAILED"
+  return 1
+}
 
 # fail 早于默认清单枚举初始化:枚举阶段(用户技能拉取失败)也要能把它置 1,
 # 且不能被后置的重复初始化清零(fail-closed)。
@@ -71,10 +103,12 @@ for name in "${skills[@]}"; do
   for attempt in 1 2 3; do
     evals=$(curl -sf "${auth[@]}" "$V5_BASE/api/skills/$name/evals") && break
     evals=""
+    refresh_auth || true
     [ "$attempt" -lt 3 ] && sleep 15
   done
   if [ -z "$evals" ]; then
     echo "== eval $name: FETCH FAILED (evals GET 3 次均失败,非'无 evals')"
+    append_result_stub "$name" "" "fetch_failed"
     fail=1
     continue
   fi
@@ -91,31 +125,57 @@ except Exception:
 ' 2>/dev/null) || cases="PARSE_ERR"
   if [ "$cases" = "PARSE_ERR" ]; then
     echo "== eval $name: PARSE FAILED (evals 响应非合法 JSON/结构异常,非'无 evals')"
+    append_result_stub "$name" "" "parse_failed"
     fail=1
     continue
   fi
   [ "$cases" -eq 0 ] && continue
   echo "== eval $name ($cases cases) =="
-  runId=$(curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
-    "$V5_BASE/api/skills/$name/eval-run" -d '{"mode":"baseline"}' |
-    python3 -c 'import sys,json;print(json.load(sys.stdin)["runId"])') || { echo "  start failed"; fail=1; continue; }
+  runId=""
+  for attempt in 1 2; do
+    if runId=$(curl -sf -X POST "${auth[@]}" -H 'Content-Type: application/json' \
+      "$V5_BASE/api/skills/$name/eval-run" -d '{"mode":"baseline"}' |
+      python3 -c 'import sys,json;print(json.load(sys.stdin)["runId"])'); then
+      break
+    fi
+    runId=""
+    refresh_auth || true
+  done
+  if [ -z "$runId" ]; then
+    echo "  start failed"
+    append_result_stub "$name" "" "start_failed"
+    fail=1
+    continue
+  fi
   final_status=""
-  for _ in $(seq 1 120); do
+  run=""
+  for _ in $(seq 1 "$MAX_POLLS"); do
     sleep 10
-    st=$(curl -sf "${auth[@]}" "$V5_BASE/api/skill-eval/$runId" |
-      python3 -c 'import sys,json;r=json.load(sys.stdin)["run"];print(r["status"], "|", (r.get("benchmark") or {}).get("verdict",""))')
+    if ! run=$(curl -sf "${auth[@]}" "$V5_BASE/api/skill-eval/$runId"); then
+      echo "  POLL FAILED (HTTP/鉴权失败,刷新登录态后继续等待)"
+      refresh_auth || true
+      continue
+    fi
+    if ! st=$(printf '%s' "$run" |
+      python3 -c 'import sys,json;r=json.load(sys.stdin)["run"];print(r["status"], "|", (r.get("benchmark") or {}).get("verdict",""))'); then
+      echo "  POLL PARSE FAILED (瞬态响应异常,继续等待)"
+      continue
+    fi
     status="${st%% |*}"
     case "$status" in
       done) echo "  $st"; echo "$st" | grep -q "反而更差" && { echo "  REGRESSION"; fail=1; }; final_status=done; break ;;
       failed) echo "  FAILED: $st"; fail=1; final_status=failed; break ;;
     esac
   done
-  [ -n "$final_status" ] || { echo "  TIMEOUT (20min 未终态)"; fail=1; final_status=timeout; }
+  [ -n "$final_status" ] || { echo "  TIMEOUT ($((MAX_POLLS * 10))s 未终态)"; fail=1; final_status=timeout; }
   if [ -n "${OC_EVAL_RESULTS_FILE:-}" ]; then
-    curl -sf "${auth[@]}" "$V5_BASE/api/skill-eval/$runId" |
+    if [ "$final_status" != "timeout" ] && [ -n "$run" ] && printf '%s' "$run" |
       python3 -c 'import sys,json;r=json.load(sys.stdin)["run"];print(json.dumps({"skill":sys.argv[1],"runId":r.get("runId"),"status":r.get("status"),"benchmark":r.get("benchmark")},ensure_ascii=False))' "$name" \
-      >> "$OC_EVAL_RESULTS_FILE" ||
-      printf '{"skill":"%s","runId":"%s","status":"%s","benchmark":null}\n' "$name" "$runId" "$final_status" >> "$OC_EVAL_RESULTS_FILE"
+      >> "$OC_EVAL_RESULTS_FILE"; then
+      :
+    else
+      append_result_stub "$name" "$runId" "$final_status"
+    fi
   fi
 done
 exit $fail

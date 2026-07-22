@@ -11,6 +11,10 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
 const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
+const turnCanary = path.join(root, 'scripts/v5-smoke-turn-canary.mjs')
+const baselineEval = path.join(root, 'scripts/run-baseline-skill-evals.sh')
+const baselineWeekly = path.join(root, 'scripts/v5-baseline-evals-weekly.sh')
+const baselineService = path.join(root, 'deploy/v5/openclaude-v5-baseline-evals.service')
 const manualMutationLease = path.join(root, 'scripts/with-production-mutation-lease.sh')
 const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
@@ -4481,6 +4485,198 @@ wait $!
     assert.match(source, /newestAssistant\.locator\("\.caret-blink"\)/)
     assert.match(source, /getByRole\("button", \{ name: "发送", exact: true \}\)/)
     assert.match(source, /newestAssistant\.locator\('\[role="alert"\]'\)/)
+    assert.match(source, /writeFileSync\(probePath, `\$\{probeToken\}\\n`\)/)
+    assert.match(source, /finalBody\.includes\(probeToken\)/)
+    assert.match(source, /getByRole\("button", \{ name: "开始目标" \}\)\.click\(\)/)
+    assert.match(source, /getByRole\("button", \{ name: \/清除\/ \}\)\.click\(\)/)
     assert.doesNotMatch(source, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
+  })
+
+  test('real-turn canary requires exact answer and keeps reconnect signals attempt-local', async () => {
+    const source = await readFile(turnCanary, 'utf8')
+    const attemptAt = source.indexOf('const attempt = () => new Promise')
+    assert.ok(attemptAt >= 0)
+    const beforeAttempt = source.slice(0, attemptAt)
+    assert.doesNotMatch(beforeAttempt, /let saw(Text|Final|Cost|Error)/)
+    assert.match(source.slice(attemptAt), /let answerText = ''/)
+    assert.match(source.slice(attemptAt), /answerText \+= b\.text/)
+    assert.match(source.slice(attemptAt), /finalText = answerText\.trim\(\)/)
+    assert.match(source.slice(attemptAt), /let finalText = ''/)
+    assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText \}\)/)
+    assert.match(source, /result\.finalText === '2'/)
+  })
+
+  test('baseline eval tolerates transient poll failure and records terminal result', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-v5-eval-test-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    const poll = path.join(dir, 'poll-count')
+    const loginCount = path.join(dir, 'login-count')
+    const results = path.join(dir, 'results.jsonl')
+    await mkdir(bin)
+    await writeFile(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n')
+    await chmod(path.join(bin, 'sleep'), 0o755)
+    await writeFile(path.join(bin, 'curl'), `#!/usr/bin/env bash
+set -u
+poll=${JSON.stringify(poll)}
+login_count=${JSON.stringify(loginCount)}
+args="$*"
+case "$args" in
+  *'/api/auth/login'*)
+    n=0; [ -f "$login_count" ] && n=$(cat "$login_count"); n=$((n+1)); printf '%s' "$n" > "$login_count"
+    printf '%s\\n' '{"access_token":"tok"}'
+    ;;
+  *'/api/auth/logout'*) printf '%s\\n' '{"revoked":true}' ;;
+  *'/api/skills/app-connectors/evals'*)
+    [ "\${FAKE_MODE:-}" = fetch-fail ] && exit 22
+    printf '%s\\n' '{"evals":{"cases":[{"id":"c1"}]}}'
+    ;;
+  *'/api/skills/app-connectors/eval-run'*) printf '%s\\n' '{"runId":"run-1"}' ;;
+  *'/api/skill-eval/run-1'*)
+    n=0; [ -f "$poll" ] && n=$(cat "$poll"); n=$((n+1)); printf '%s' "$n" > "$poll"
+    [ "$n" -eq 1 ] && exit 22
+    printf '%s\\n' '{"run":{"runId":"run-1","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}}'
+    ;;
+  *) exit 22 ;;
+esac
+`)
+    await chmod(path.join(bin, 'curl'), 0o755)
+
+    const ok = spawnSync('bash', [baselineEval, 'app-connectors'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        PASSWORD: 'fixture',
+        OC_EVAL_RESULTS_FILE: results,
+      },
+    })
+    assert.equal(ok.status, 0, ok.stderr || ok.stdout)
+    assert.match(ok.stdout, /POLL FAILED/)
+    assert.match(ok.stdout, /AUTH REFRESHED/)
+    assert.equal((await readFile(loginCount, 'utf8')).trim(), '2')
+    const row = JSON.parse((await readFile(results, 'utf8')).trim())
+    assert.equal(row.skill, 'app-connectors')
+    assert.equal(row.status, 'done')
+
+    await writeFile(results, '')
+    const failed = spawnSync('bash', [baselineEval, 'app-connectors'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        PASSWORD: 'fixture',
+        OC_EVAL_RESULTS_FILE: results,
+        FAKE_MODE: 'fetch-fail',
+      },
+    })
+    assert.equal(failed.status, 1, failed.stderr || failed.stdout)
+    const failureRow = JSON.parse((await readFile(results, 'utf8')).trim())
+    assert.equal(failureRow.status, 'fetch_failed')
+
+    const source = await readFile(baselineEval, 'utf8')
+    assert.match(source, /MAX_POLLS="\$\{OC_EVAL_MAX_POLLS:-360\}"/)
+    assert.match(source, /seq 1 "\$MAX_POLLS"/)
+    assert.match(source, /curl -sf -b "\$COOKIE_FILE" -c "\$COOKIE_FILE" -X POST/)
+    assert.match(source, /trap cleanup EXIT/)
+  })
+
+  test('weekly baseline report is fail-closed on runner rc and incomplete platform coverage', async () => {
+    const source = await readFile(baselineWeekly, 'utf8')
+    const service = await readFile(baselineService, 'utf8')
+    assert.match(source, /v5-evals@claudeai\.chat/)
+    assert.match(source, /runner 非零退出\(rc=\{run_rc\}\)/)
+    assert.match(source, /glob\.glob\(os\.path\.join\(expected_dir, '\*\/evals\/evals\.json'\)\)/)
+    assert.match(source, /缺少评测结果/)
+    assert.match(source, /baseline coverage: \{done_expected\}\/\{len\(expected\)\} done/)
+    assert.match(service, /TimeoutStartSec=43200/, '9 个技能 × 单技能 60min 后必须保留汇总余量')
+  })
+
+  test('repository baseline eval inventory is the reviewed nine-skill set', async () => {
+    const baselineSkills = path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline/skills')
+    const entries = await readdir(baselineSkills, { withFileTypes: true })
+    const actual: string[] = []
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      try {
+        await readFile(path.join(baselineSkills, entry.name, 'evals/evals.json'), 'utf8')
+        actual.push(entry.name)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      }
+    }
+    assert.deepEqual(actual.sort(), [
+      'app-connectors',
+      'document-writing',
+      'memory-management',
+      'office-pdf',
+      'office-spreadsheet',
+      'scheduled-tasks',
+      'scientific-figures',
+      'skill-search',
+      'web-context',
+    ])
+  })
+
+  test('weekly baseline behavior requires one done result for every repository eval skill', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-v5-weekly-eval-test-'))
+    dirs.push(dir)
+    const scriptsDir = path.join(dir, 'scripts')
+    const bin = path.join(dir, 'bin')
+    const skillsDir = path.join(dir, 'packages/commercial/agent-sandbox/ccb-baseline/skills')
+    await mkdir(scriptsDir, { recursive: true })
+    await mkdir(bin)
+    for (const skill of ['alpha', 'beta']) {
+      const evalDir = path.join(skillsDir, skill, 'evals')
+      await mkdir(evalDir, { recursive: true })
+      await writeFile(path.join(evalDir, 'evals.json'), '{"cases":[{}]}')
+    }
+    const weekly = path.join(scriptsDir, 'v5-baseline-evals-weekly.sh')
+    await cp(baselineWeekly, weekly)
+    await writeFile(path.join(scriptsDir, 'v5-alert-fanout.sql'), '-- fixture\n')
+    await writeFile(path.join(scriptsDir, 'run-baseline-skill-evals.sh'), `#!/usr/bin/env bash
+set -u
+[ "$EMAIL" = v5-evals@claudeai.chat ]
+[ "$PASSWORD" = fixture-secret ]
+printf '%s\\n' '{"skill":"alpha","runId":"a","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}' >> "$OC_EVAL_RESULTS_FILE"
+if [ "\${FAKE_MODE:-}" != missing ]; then
+  printf '%s\\n' '{"skill":"beta","runId":"b","status":"done","benchmark":{"passRate":{"without":0.5,"with":1},"verdict":"技能有效"}}' >> "$OC_EVAL_RESULTS_FILE"
+fi
+[ "\${FAKE_MODE:-}" = runner-fail ] && exit 7
+exit 0
+`)
+    await writeFile(path.join(bin, 'psql'), '#!/usr/bin/env bash\ncat >/dev/null || true\nexit 0\n')
+    await chmod(path.join(bin, 'psql'), 0o755)
+    const password = path.join(dir, 'eval.password')
+    const envFile = path.join(dir, 'commercial.env')
+    await writeFile(password, 'fixture-secret\n')
+    await writeFile(envFile, 'DATABASE_URL=postgres://fixture\n')
+
+    const runWeekly = (mode: string, history: string) => spawnSync('bash', [weekly], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        FAKE_MODE: mode,
+        OC_EVAL_HIST_DIR: history,
+        OC_EVAL_PASSWORD_FILE: password,
+        OC_EVAL_ENV_FILE: envFile,
+      },
+    })
+
+    const missing = runWeekly('missing', path.join(dir, 'hist-missing'))
+    assert.equal(missing.status, 0, missing.stderr || missing.stdout)
+    assert.match(missing.stdout, /回归异常 rc=0 problems=1 delivered=1/)
+
+    const runnerFail = runWeekly('runner-fail', path.join(dir, 'hist-runner-fail'))
+    assert.equal(runnerFail.status, 0, runnerFail.stderr || runnerFail.stdout)
+    assert.match(runnerFail.stdout, /回归异常 rc=7 problems=1 delivered=1/)
+
+    const complete = runWeekly('complete', path.join(dir, 'hist-complete'))
+    assert.equal(complete.status, 0, complete.stderr || complete.stdout)
+    assert.match(complete.stdout, /回归完成,全部正常/)
   })
 })

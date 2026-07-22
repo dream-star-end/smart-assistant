@@ -32,12 +32,12 @@ https://claudeai.chat/?v5key=e487aa73f63e9767bdc1b30ea634055d2cd6aa36a8c2e861
 - 打开后会自动跳到 `https://claudeai.chat/` 并显示**全新 Aurora 界面**(落地页)。
 - 浏览器会种一个 cookie(`oc_v5`,存 30 天),之后你正常访问 `claudeai.chat` 都是 v5,不用再带 key。
 
-## 二、测试账号(已充 5 万积分)
+## 二、测试账号(发布 canary 专用)
 
 | | |
 |---|---|
 | 邮箱 | `v5-canary@claudeai.chat` |
-| 密码 | `V5canaryTest2026x` |
+| 密码 | 不写入仓库；由部署机 root 从 `/root/.secrets/v5-canary.password` 读取 |
 
 ## 三、建议验收路径
 
