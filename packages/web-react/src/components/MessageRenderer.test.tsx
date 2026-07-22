@@ -562,9 +562,15 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
   });
 
   test("单条 agent-group → 退化回 AgentGroupCard,不出团队面板", () => {
-    renderList([g("g1", "独立任务")]);
+    renderList([g("g1", "独立任务", {
+      _completed: true,
+      childBlocks: [{ kind: "text", text: "独立任务真实过程" }],
+    })]);
     expect(screen.queryByText(/团队协作/)).not.toBeInTheDocument();
     expect(screen.getByText("独立任务")).toBeInTheDocument(); // AgentGroupCard 头部
+    fireEvent.click(screen.getByText("独立任务"));
+    expect(screen.getByText("独立任务真实过程")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始完整记录" })).not.toBeInTheDocument();
   });
 
   test("被其它消息夹断的 agent-group → 不聚合(各自独立卡)", () => {

@@ -11,7 +11,6 @@ import { memo, useState } from "react";
 import { type ChatMessage, type ChildBlock, isServerAuthoredRow } from "../../lib/chat/model";
 import { agentTerminalStatus, childSignature, reviewVerdictBadge } from "../../lib/chat/render";
 import { cn, groupDigits } from "../../lib/utils";
-import { ExactToolRecordDisclosure } from "../ToolCard";
 import { Badge, Spinner } from "../ui";
 import { Markdown } from "../Markdown";
 import { ToolCardSlot } from "./toolCardSlot";
@@ -253,7 +252,6 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
               继续加载过程（还有 {children.length - visibleChildren} 条）
             </button>
           )}
-          <ExactToolRecordDisclosure message={msg} />
         </div>
       )}
 
