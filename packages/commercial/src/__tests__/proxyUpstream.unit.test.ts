@@ -40,6 +40,7 @@ const DEEPSEEK_ROUTE = { kind: "static" as const, provider: getStaticProvider("d
 const MINIMAX_ROUTE = { kind: "static" as const, provider: getStaticProvider("minimax") };
 const ARK_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark") };
 const OPENCODEGO_ROUTE = { kind: "static" as const, provider: getStaticProvider("opencodego") };
+const ARK_K3_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark-k3") };
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
@@ -147,6 +148,14 @@ describe("selectUpstreamRoute", () => {
       if (r.kind === "static") assert.equal(r.provider.id, "opencodego");
     }
   });
+  test("kimi-k3-ark → static/ark-k3 + legacy upstream rewrite", () => {
+    const r = selectUpstreamRoute("kimi-k3-ark");
+    assert.equal(r.kind, "static");
+    if (r.kind === "static") {
+      assert.equal(r.provider.id, "ark-k3");
+      assert.equal(r.upstreamModel, "kimi-k3");
+    }
+  });
   test("其它 model → kind=oauth", () => {
     assert.deepEqual(selectUpstreamRoute("claude-sonnet-4-6"), { kind: "oauth" });
     assert.deepEqual(selectUpstreamRoute("gpt-5"), { kind: "oauth" });
@@ -172,6 +181,10 @@ describe("validateUpstreamConfig", () => {
       kind: "static_not_configured",
       providerId: "ark",
     });
+    assert.deepEqual(validateUpstreamConfig(ARK_K3_ROUTE, {}), {
+      kind: "static_not_configured",
+      providerId: "ark-k3",
+    });
   });
   test("static 路由 + 有自己的 key → null(放行)", () => {
     assert.equal(
@@ -184,6 +197,10 @@ describe("validateUpstreamConfig", () => {
     );
     assert.equal(
       validateUpstreamConfig(ARK_ROUTE, { staticProviderKeys: { ark: "ark-key" } }),
+      null,
+    );
+    assert.equal(
+      validateUpstreamConfig(ARK_K3_ROUTE, { staticProviderKeys: { "ark-k3": "ark-plan-key" } }),
       null,
     );
   });

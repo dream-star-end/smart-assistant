@@ -20,6 +20,7 @@ import {
   STATIC_KEY_INBOUND_MODEL_IDS,
   findRouteProviderForModel,
   getStaticProvider,
+  type StaticProviderId,
 } from '../staticKeyProviders.js'
 
 describe('staticKeyProviders — matchesRoute', () => {
@@ -73,6 +74,13 @@ describe('staticKeyProviders — matchesRoute', () => {
     // 两家 kimi 上游的路由面必须互斥:k2.7 → 火山 'kimi',k3 → 官方 'moonshot'
     assert.equal(getStaticProvider('kimi').matchesRoute('kimi-k3'), false)
   })
+  it('ark-k3 只匹配平台 alias kimi-k3-ark，不抢 Moonshot 官方 kimi-k3', () => {
+    const arkK3 = getStaticProvider('ark-k3')
+    assert.equal(arkK3.matchesRoute('kimi-k3-ark'), true)
+    assert.equal(arkK3.matchesRoute('Kimi-K3-Ark'), true)
+    assert.equal(arkK3.matchesRoute('kimi-k3'), false)
+    assert.equal(getStaticProvider('moonshot').matchesRoute('kimi-k3-ark'), false)
+  })
 })
 
 describe('staticKeyProviders — findRouteProviderForModel', () => {
@@ -84,6 +92,7 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('qwen3.7-max')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-plus')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
+    assert.equal(findRouteProviderForModel('kimi-k3-ark')?.id, 'ark-k3')
     assert.equal(findRouteProviderForModel('kimi-k3')?.id, 'moonshot')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
@@ -106,6 +115,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'qwen3.7-plus',
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
+    assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
     assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
@@ -118,6 +128,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'qwen3.7-max',
       'qwen3.7-plus',
       'kimi-k2.7-code',
+      'kimi-k3-ark',
       'kimi-k3',
     ])
   })
@@ -162,6 +173,12 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(ms.canonicalizeForPricing('kimi-k3'), 'kimi-k3')
     assert.equal(ms.canonicalizeForPricing('Kimi-K3'), 'kimi-k3')
     assert.equal(ms.canonicalizeForPricing('kimi-k2.7-code'), null)
+  })
+  it('ark-k3 pricing 保持平台 alias；legacy transport 精确改写为上游 kimi-k3', () => {
+    const arkK3 = getStaticProvider('ark-k3')
+    assert.equal(arkK3.canonicalizeForPricing('Kimi-K3-Ark'), 'kimi-k3-ark')
+    assert.equal(arkK3.canonicalizeForPricing('kimi-k3'), null)
+    assert.equal(arkK3.upstreamModelForRequest?.('Kimi-K3-Ark'), 'kimi-k3')
   })
 })
 
@@ -232,6 +249,23 @@ describe('staticKeyProviders — strip / endpoint', () => {
       'kimi 与 minimax 同 Agent Plan 端点(同订阅同 key,独立 spec)',
     )
   })
+  it('ark-k3 共用 Agent Plan 端点，但为 1M/vision 且保留 disabled thinking', () => {
+    const arkK3 = getStaticProvider('ark-k3')
+    assert.deepEqual([...arkK3.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...arkK3.stripBodyFields], [
+      'output_config',
+      'context_management',
+      'service_tier',
+    ])
+    assert.equal(arkK3.stripBodyFields.includes('thinking'), false)
+    assert.equal(arkK3.stripDisabledThinking, undefined)
+    assert.equal(arkK3.maxInputTokens, 1_048_576)
+    assert.equal(arkK3.supportsVision, true)
+    assert.equal(
+      arkK3.upstreamEndpoint,
+      'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
+    )
+  })
 })
 
 describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
@@ -241,6 +275,7 @@ describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
     assert.equal(getStaticProvider('minimax').authScheme, undefined)
     assert.equal(getStaticProvider('ark').authScheme, undefined)
     assert.equal(getStaticProvider('kimi').authScheme, undefined)
+    assert.equal(getStaticProvider('ark-k3').authScheme, undefined)
   })
 })
 
@@ -251,6 +286,7 @@ describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜�
     assert.equal(getStaticProvider('minimax').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('ark').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('opencodego').stripDisabledThinking, undefined)
+    assert.equal(getStaticProvider('ark-k3').stripDisabledThinking, undefined)
   })
 })
 
@@ -264,6 +300,7 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
     assert.equal(getStaticProvider('minimax').allowedOutputConfigEfforts, undefined)
     assert.equal(getStaticProvider('opencodego').allowedOutputConfigEfforts, undefined)
     assert.equal(getStaticProvider('kimi').allowedOutputConfigEfforts, undefined)
+    assert.equal(getStaticProvider('ark-k3').allowedOutputConfigEfforts, undefined)
   })
   it('硬约束:声明 allowedOutputConfigEfforts 的 provider 不能把 output_config 放进 stripBodyFields', () => {
     for (const p of STATIC_KEY_PROVIDERS) {
@@ -279,8 +316,10 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
 })
 
 describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
-  it('minimax(MiniMax-M3)=true;deepseek/ark/opencodego/kimi(纯文本)=false', () => {
+  it('minimax/ark-k3/moonshot=true;deepseek/ark/opencodego/kimi(纯文本)=false', () => {
     assert.equal(getStaticProvider('minimax').supportsVision, true)
+    assert.equal(getStaticProvider('ark-k3').supportsVision, true)
+    assert.equal(getStaticProvider('moonshot').supportsVision, true)
     assert.equal(getStaticProvider('deepseek').supportsVision ?? false, false)
     assert.equal(getStaticProvider('ark').supportsVision ?? false, false)
     // opencodego 2026-07-05 实测 image block → 400 InvalidParameter,纯文本接入。
@@ -312,7 +351,7 @@ describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
       'provider id 集/顺序漂移 —— 更新 snapshot 或 registry',
     )
     for (const sp of snap.providers) {
-      const p = getStaticProvider(sp.id as 'deepseek' | 'minimax' | 'ark' | 'opencodego' | 'kimi')
+      const p = getStaticProvider(sp.id as StaticProviderId)
       assert.deepEqual([...p.inboundModelIds], sp.inboundModelIds, `${sp.id} inboundModelIds 漂移`)
       assert.equal(p.maxInputTokens ?? null, sp.maxInputTokens, `${sp.id} maxInputTokens 漂移`)
       assert.equal(p.upstreamEndpoint, sp.upstreamEndpoint, `${sp.id} upstreamEndpoint 漂移`)

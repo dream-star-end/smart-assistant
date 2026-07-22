@@ -56,6 +56,11 @@ describe("glm-5.1 (Ark) thinking capability", () => {
     expect(modelSupportsThinking("GLM-5.2")).toBe(true);
   });
 
+  test("kimi-k3-ark(火山 Agent Plan K3)thinking=true、adaptive=false", () => {
+    expect(modelSupportsThinking("kimi-k3-ark")).toBe(true);
+    expect(modelSupportsAdaptiveThinking("kimi-k3-ark")).toBe(false);
+  });
+
   test("glm-5.1/glm-5.2 不支持 adaptive thinking → CCB 走 enabled+budget(Ark 实测可用的格式)", () => {
     expect(modelSupportsAdaptiveThinking("glm-5.1")).toBe(false);
     expect(modelSupportsAdaptiveThinking("glm-5.2")).toBe(false);

@@ -15,6 +15,7 @@ import {
   PLATFORM_REASONING_EFFORTS,
   STATIC_KEY_PROVIDERS,
   modelReasoningPolicy,
+  type StaticProviderId,
 } from "@openclaude/protocol";
 import { STATIC_PROVIDER_META } from "../http/proxy/staticProviderMeta.js";
 import { query, tx } from "../db/queries.js";
@@ -53,8 +54,10 @@ const PROVIDER_DEFAULT_DISPLAY: Record<string, string> = {
   ark: "火山方舟 Coding Plan(GLM)",
   opencodego: "OpenCode Go(Zen 网关)",
   kimi: "火山方舟 Agent Plan(Kimi)",
+  "ark-k3": "火山方舟 Agent Plan(Kimi K3)",
+  moonshot: "Moonshot 官方(Kimi For Coding)",
   [CODEX_PROVIDER_ID]: "ChatGPT 订阅(Codex / GPT-5.6)",
-};
+} satisfies Record<StaticProviderId | typeof CODEX_PROVIDER_ID, string>;
 
 export function opsProviderIds(): string[] {
   return [...STATIC_KEY_PROVIDERS.map((p) => p.id), CODEX_PROVIDER_ID];

@@ -117,6 +117,7 @@ const STATIC_PROVIDER_IDS: ReadonlySet<string> = new Set<StaticProviderId>([
   "ark",
   "opencodego",
   "kimi",
+  "ark-k3",
   "moonshot",
 ]);
 
@@ -149,7 +150,11 @@ export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): Ups
     };
   }
   const provider = findRouteProviderForModel(model);
-  return provider ? { kind: "static", provider } : { kind: "oauth" };
+  if (!provider) return { kind: "oauth" };
+  const upstreamModel = provider.upstreamModelForRequest?.(model);
+  return upstreamModel === undefined
+    ? { kind: "static", provider }
+    : { kind: "static", provider, upstreamModel };
 }
 
 // ─── 能力上限(catalog capability ⊆ provider 机制上限)────────────────────────

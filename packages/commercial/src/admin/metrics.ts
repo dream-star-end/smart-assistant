@@ -570,6 +570,8 @@ export type ProxyRejectReason =
   | "opencodego_config"
   // 火山 Agent Plan Kimi(kimi-k2.7-code,2026-07-06):缺 ARK_AGENT_PLAN_KEY 时独立打点(与 minimax 共 key 不共标签)。
   | "kimi_config"
+  // 火山 Agent Plan Kimi K3(kimi-k3-ark,2026-07-22):同 key、独立 provider/标签，便于与 K2.7 区分。
+  | "ark_k3_config"
   // Moonshot 官方 Kimi For Coding(kimi-k3,2026-07-17):缺 MOONSHOT_CODING_PLAN_KEY 时独立打点。
   | "moonshot_config"
   // glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置(火山方舟 Coding Plan 文本路由 503)

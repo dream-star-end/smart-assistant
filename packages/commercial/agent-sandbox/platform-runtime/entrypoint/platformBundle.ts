@@ -54,6 +54,8 @@ export const KNOWN_SEED_PROVIDERS: readonly string[] = [
   "ark",
   "opencodego",
   "kimi",
+  // 火山方舟 Agent Plan Kimi K3(kimi-k3-ark,2026-07-22)。
+  "ark-k3",
   // Moonshot 官方 Kimi For Coding(kimi-k3,2026-07-17)。
   "moonshot",
   // 引擎路由 pin(非静态 key provider):gateway registry 按 provider==='codex-native' 硬 pin codex engine。

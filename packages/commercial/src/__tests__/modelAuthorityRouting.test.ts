@@ -31,6 +31,7 @@ import {
   type PickUpstreamDeps,
 } from "../http/proxy/upstream.js";
 import { rootLogger } from "../logging/logger.js";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 
 const log = rootLogger.child({ subsys: "modelAuthorityRouting.test" });
 
@@ -41,7 +42,12 @@ const NOOP_DEPS: PickUpstreamDeps = {
     },
     release: async () => {},
   },
-  staticProviderKeys: { ark: "ark-key", deepseek: "ds-key", minimax: "mm-key" },
+  staticProviderKeys: {
+    ark: "ark-key",
+    deepseek: "ds-key",
+    minimax: "mm-key",
+    "ark-k3": "ark-plan-key",
+  },
 };
 
 function body(model: string) {
@@ -67,6 +73,34 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
       upstreamModelId: "glm-5.2-0715",
     });
     assert.equal(route.kind === "static" && route.upstreamModel, "glm-5.2-0715");
+  });
+
+  test("ark-k3 catalog descriptor 直接选机制，不依赖 alias matchesRoute", async () => {
+    const route = selectUpstreamRoute("catalog-name-that-does-not-match", {
+      providerId: "ark-k3",
+      upstreamModelId: "kimi-k3",
+    });
+    assert.equal(route.kind, "static");
+    assert.equal(route.kind === "static" && route.provider.id, "ark-k3");
+    const r = await pickUpstream(NOOP_DEPS, body("kimi-k3-ark"), route, log);
+    assert.ok(r.ok);
+    assert.equal(r.session.endpoint, "https://ark.cn-beijing.volces.com/api/plan/v1/messages");
+    assert.equal(r.session.upstreamModel, "kimi-k3");
+    assert.equal(r.session.dispatcher, directEgressDispatcher());
+
+    const headers: Record<string, string> = { "anthropic-beta": "should-strip" };
+    const requestBody = {
+      model: "kimi-k3-ark",
+      output_config: { effort: "high" },
+      context_management: { edits: [] },
+      service_tier: "auto",
+      thinking: { type: "disabled" },
+    } as unknown as Parameters<typeof r.session.applyUpstreamAuth>[1];
+    r.session.applyUpstreamAuth(headers, requestBody, log);
+    assert.equal(headers.authorization, "Bearer ark-plan-key");
+    assert.equal(headers["anthropic-beta"], undefined);
+    assert.equal((requestBody as { output_config?: unknown }).output_config, undefined);
+    assert.deepEqual((requestBody as { thinking?: unknown }).thinking, { type: "disabled" });
   });
 
   test("provider_id='anthropic' / null → OAuth 池", () => {
@@ -115,6 +149,15 @@ describe("PreparedUpstreamSession.upstreamModel", () => {
     assert.ok(r.ok);
     assert.equal(r.session.upstreamModel, "glm-5.2");
   });
+
+  test("static:ark alias 无 hint也只在 transport 改写为 kimi-k3", async () => {
+    const route = selectUpstreamRoute("kimi-k3-ark");
+    assert.equal(route.kind === "static" && route.provider.id, "ark-k3");
+    assert.equal(route.kind === "static" && route.upstreamModel, "kimi-k3");
+    const r = await pickUpstream(NOOP_DEPS, body("kimi-k3-ark"), route, log);
+    assert.ok(r.ok);
+    assert.equal(r.session.upstreamModel, "kimi-k3");
+  });
 });
 
 describe("能力上限:catalog capability ⊆ provider 机制上限", () => {
@@ -157,6 +200,14 @@ describe("能力上限:catalog capability ⊆ provider 机制上限", () => {
       ) ?? "",
       /beyond provider mechanism limit/,
     );
+  });
+
+  test("ark-k3 机制 ceiling = vision=true / efforts=[]", () => {
+    const ceiling = providerCapabilityCeiling(
+      selectUpstreamRoute("kimi-k3-ark", { providerId: "ark-k3", upstreamModelId: "kimi-k3" }),
+    );
+    assert.equal(ceiling.supportsVision, true);
+    assert.deepEqual([...(ceiling.efforts ?? [])], []);
   });
 
   test("deepseek(无白名单、不 strip output_config)→ 无 effort 机制限制", () => {
