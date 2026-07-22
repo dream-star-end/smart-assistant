@@ -166,6 +166,8 @@ export async function startEgress(): Promise<void> {
     opencodego: cfg.OPENCODE_GO_API_KEY,
     // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
     kimi: cfg.ARK_AGENT_PLAN_KEY,
+    // 2026-07-22:火山 Agent Plan Kimi K3(kimi-k3-ark),同订阅/key、独立能力机制。
+    "ark-k3": cfg.ARK_AGENT_PLAN_KEY,
     // 2026-07-17:Moonshot 官方 Kimi For Coding(kimi-k3),独立订阅独立 key。
     moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
   };

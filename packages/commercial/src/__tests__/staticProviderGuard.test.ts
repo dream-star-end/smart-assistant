@@ -18,7 +18,7 @@ import {
   STATIC_PROVIDER_META,
 } from "../http/proxy/staticProviderMeta.js";
 import { PLATFORM_DEFAULT_MODEL } from "../platformDefaults.js";
-import { findRouteProviderForModel } from "@openclaude/protocol";
+import { findRouteProviderForModel, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 
 // 跟随权威推导默认模型的 provider 与 key 字段(当前 glm-5.2 → ark → ARK_CODING_PLAN_KEY)。
 const defaultProvider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
@@ -80,5 +80,17 @@ describe("assertPlatformDefaultModelConfigured", () => {
       /\btry\s*\{/,
       "guard 调用与 makeAnthropicProxyHandler 之间必须有 try{ —— 即 guard 在 internal-proxy try 之外(之前)",
     );
+  });
+});
+
+describe("STATIC_PROVIDER_META 完整性", () => {
+  test("覆盖每个 protocol provider；ark-k3 使用独立错误/metric 与共享 Agent Plan key", () => {
+    assert.deepEqual(Object.keys(STATIC_PROVIDER_META), STATIC_KEY_PROVIDERS.map((p) => p.id));
+    assert.deepEqual(STATIC_PROVIDER_META["ark-k3"], {
+      keyConfigField: "ARK_AGENT_PLAN_KEY",
+      notConfiguredHttpCode: "ARK_K3_NOT_CONFIGURED",
+      rejectMetricLabel: "ark_k3_config",
+      egress: "direct",
+    });
   });
 });

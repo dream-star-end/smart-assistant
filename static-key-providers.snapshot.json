@@ -47,6 +47,15 @@
       "supportsVision": false
     },
     {
+      "id": "ark-k3",
+      "inboundModelIds": ["kimi-k3-ark"],
+      "maxInputTokens": 1048576,
+      "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/plan/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 1048576,
+      "supportsVision": true
+    },
+    {
       "id": "moonshot",
       "inboundModelIds": ["kimi-k3"],
       "maxInputTokens": 1048576,

@@ -7,7 +7,7 @@ import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
-import { getAuthorityModelCapabilities, isArkGlmModel, isArkPlanKimiModel, isCapabilityZeroStaticModel, isMoonshotKimiK3Model, isOpencodeQwenModel } from './model/staticKeyModels.js'
+import { getAuthorityModelCapabilities, isArkGlmModel, isArkPlanKimiK3Model, isArkPlanKimiModel, isCapabilityZeroStaticModel, isMoonshotKimiK3Model, isOpencodeQwenModel } from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type ThinkingConfig =
@@ -119,6 +119,10 @@ export function modelSupportsThinking(model: string): boolean {
   // 接受 thinking:{type:enabled,budget_tokens}(同走 enabled+budget 分支)。注意它不支持
   // disabled(火山 400),master 侧 spec.stripDisabledThinking 删参兜底。
   if (isArkPlanKimiModel(model)) {
+    return true
+  }
+  // kimi-k3-ark(火山 Agent Plan K3)支持 enabled+budget，且 disabled 也真实生效。
+  if (isArkPlanKimiK3Model(model)) {
     return true
   }
   // kimi-k3(Moonshot 官方 Kimi For Coding)是思考模型 —— 同在 isCapabilityZeroStaticModel
