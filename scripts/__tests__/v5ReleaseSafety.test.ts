@@ -4896,10 +4896,20 @@ wait $!
     const finalizeEnd = source.indexOf('\n# finalize step1', finalizeStart)
     const finalize = source.slice(finalizeStart, finalizeEnd)
     assert.match(finalize, /assert_release_verification_evidence/)
+    assert.ok(
+      finalize.indexOf('assert_release_verification_evidence') <
+        finalize.indexOf('reconcile_testing_egress_transition "$DS_generation"'),
+      'missing release evidence must trigger official abort before any egress recovery action',
+    )
     assert.match(finalize, /缺 exact release\/generation fixed-matrix evidence；第一动作=官方 abort/)
     assert.ok(
       finalize.indexOf('assert_release_verification_evidence') < finalize.indexOf('knowledge_planet_plugin_assert_release_compatible'),
       'finalize evidence gate must run before other candidate investigation/gates',
+    )
+    assert.ok(
+      finalize.indexOf('reconcile_testing_egress_transition "$DS_generation"') <
+        finalize.indexOf('knowledge_planet_plugin_assert_release_compatible'),
+      'finalize must restore a crash-left testing egress transition before candidate handoff gates',
     )
     assert.ok(
       finalize.indexOf('finalize_run_steps') < finalize.indexOf('finalize_ready_egress_transition'),
@@ -4925,9 +4935,20 @@ wait $!
       'post-stable egress smoke anomaly must issue official master rollback before egress repair',
     )
     assert.match(handoff, /transition_generation="\$DS_generation"/)
+    const reconcileStart = source.indexOf('\nreconcile_testing_egress_transition()')
+    const reconcileEnd = source.indexOf('\nrollback_egress_transition_for_generation()', reconcileStart)
+    const reconcile = source.slice(reconcileStart, reconcileEnd)
+    assert.match(reconcile, /status='testing'/)
+    assert.match(reconcile, /activate_egress_release "\$predecessor" "\$release"/)
+    assert.match(reconcile, /status='ready',ready_at=NOW\(\)/)
+    const recoverStart = source.indexOf('\nrecover() {')
+    const recoverEnd = source.indexOf('\n# ═', recoverStart + 1)
+    const recover = source.slice(recoverStart, recoverEnd)
+    assert.match(recover, /canary≥READY:[\s\S]*reconcile_testing_egress_transition "\$DS_generation"/)
+    assert.match(recover, /testing egress recovery failed；第一动作=官方 abort[\s\S]*\n          abort/)
 
     const sourced = spawnSync('bash', ['-c',
-      'V5_DEPLOY_SOURCE_ONLY=1 source "$1" --dry-run; declare -F close_emergency_debt set_luna_visibility run_candidate_release_verification >/dev/null',
+      'V5_DEPLOY_SOURCE_ONLY=1 source "$1" --dry-run; declare -F close_emergency_debt record_emergency_authorization consume_emergency_authorization set_luna_visibility run_candidate_release_verification reconcile_testing_egress_transition >/dev/null',
       'bash', deploy,
     ], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
     assert.equal(sourced.status, 0, sourced.stderr || sourced.stdout)
@@ -4936,11 +4957,18 @@ wait $!
   test('dx-declared emergency containment skips only the full gate and leaves durable blocking debt', async () => {
     const source = await readFile(deploy, 'utf8')
     assert.match(source, /--emergency-containment=\*/)
+    assert.match(source, /--authorize-emergency=\*/)
     assert.match(source, /--emergency-approval=\*/)
     assert.match(source, /--emergency-commit=\*/)
+    assert.match(source, /--emergency-approval-evidence=\*/)
+    assert.match(source, /APPROVE_P0_CONTAINMENT/)
+    assert.match(source, /ongoingRealUserFinancialOrSecurityHarm/)
+    assert.match(source, /smallestContainmentFirst/)
     assert.match(source, /assert_emergency_source_provenance/)
     assert.match(source, /git ls-remote --heads origin/)
     assert.match(source, /MUTATION_DEPLOY_ID="\$deploy_id"/)
+    assert.match(source, /INSERT INTO emergency_containment_authorizations/)
+    assert.match(source, /status='consumed',consumed_at=NOW\(\)/)
     assert.match(source, /INSERT INTO emergency_containment_debts/)
     assert.match(source, /open emergency containment debt=.*所有非恢复生产变更被阻断/)
     assert.match(source, /abort\|rollback\|recover\|hide-luna\) return 0/)
@@ -4953,10 +4981,20 @@ wait $!
     const canaryStart = source.indexOf('\ncanary() {')
     const canaryEnd = source.indexOf('\n# 内部账号 allowlist', canaryStart)
     const canary = source.slice(canaryStart, canaryEnd)
+    assert.match(canary, /consume_emergency_authorization/)
+    assert.doesNotMatch(canary, /record_emergency_authorization/)
     const emergencyBranch = canary.indexOf('dx-declared emergency containment')
     const fullGate = canary.indexOf('run_candidate_release_verification')
     assert.ok(emergencyBranch >= 0 && fullGate > emergencyBranch)
     assert.match(canary, /if \[\[ -n "\$EMERGENCY_INCIDENT" \]\]; then[\s\S]*elif ! run_candidate_release_verification/)
+    const finalizeStart = source.indexOf('\nfinalize() {')
+    const finalizeEnd = source.indexOf('\n# finalize step1', finalizeStart)
+    const finalize = source.slice(finalizeStart, finalizeEnd)
+    assert.ok(
+      finalize.indexOf('assert_emergency_source_provenance') <
+        finalize.indexOf('assert_emergency_finalize_authorized'),
+      'every emergency finalize/resume must re-pin clean canonical exact HEAD and remote provenance',
+    )
     assert.match(source, /publish-luna\) set_luna_visibility public/)
     assert.match(source, /Luna public 只允许 stable active exact release\/generation/)
   })

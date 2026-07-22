@@ -31,6 +31,7 @@ let pgAvailable = false;
  *  但仍列全,方便未来新增迁移时保持清理同步。 */
 const COMMERCIAL_TABLES = [
   "emergency_containment_debts",
+  "emergency_containment_authorizations",
   "release_egress_transitions",
   "release_verification_evidence",
   "verification_sponsored_requests",
@@ -318,11 +319,12 @@ describe("migrate.runMigrations", () => {
           AND table_name IN (
             'verification_runs','verification_sponsored_requests',
             'release_verification_evidence','release_egress_transitions',
-            'emergency_containment_debts'
+            'emergency_containment_authorizations','emergency_containment_debts'
           )
         ORDER BY table_name`,
     );
     assert.deepEqual(tables.rows.map((row) => row.table_name), [
+      "emergency_containment_authorizations",
       "emergency_containment_debts",
       "release_egress_transitions",
       "release_verification_evidence",

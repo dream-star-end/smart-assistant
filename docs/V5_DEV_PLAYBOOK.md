@@ -328,7 +328,8 @@ runtime tuple、真实 Agent turn 与 V3 inactive，之后才允许调查。
 带 `--egress` 的 canary 会把全局 egress 临时切到 candidate release 跑矩阵，随后恢复 exact
 predecessor 并持久化 `release_egress_transitions=ready`；master finalize 提交 stable 后才激活
 该 exact tested egress。若进程恰在两步之间中断，`--recover` 按 durable transition 收敛，
-激活失败则先恢复旧 egress 并官方 rollback master。
+`testing` 未收敛时 finalize 会先恢复 exact predecessor 再转 `ready`；post-stable 异常则第一动作
+官方 rollback master，随后恢复旧 egress。
 
 迁移 `0183_luna_verification_runs` 先把 Luna 激活为 hidden，并建立 exact
 release/generation/session-prefix 绑定的验证赞助。只有上述测试身份、两个固定模型和本次
@@ -359,13 +360,35 @@ INC=INC-20260723-EXACT-SYMPTOM
 SHA=$(git rev-parse HEAD) # 必须已 push 到 origin task branch，且 canonical 正好 fast-forward 到它
 APPROVAL='dx:<可审计的明确止血指令引用>'
 
+# 必须先用独立 invocation 记录 dx 的一次性明确批准；canary 只能消费，不能自建授权。
+# JSON 只接受以下精确语义，文件须 root-only 保存。
+cat > /root/v5-emergency-approval.json <<JSON
+{
+  "schema": 1,
+  "approver": "dx",
+  "decision": "APPROVE_P0_CONTAINMENT",
+  "ongoingRealUserFinancialOrSecurityHarm": true,
+  "smallestContainmentFirst": true,
+  "incidentId": "$INC",
+  "exactCommit": "$SHA",
+  "approvalRef": "$APPROVAL",
+  "approvedAt": "$(date -u +%FT%TZ)"
+}
+JSON
+chmod 600 /root/v5-emergency-approval.json
+bash scripts/deploy-v5.sh --authorize-emergency="$INC" \
+  --emergency-approval="$APPROVAL" --emergency-commit="$SHA" \
+  --emergency-approval-evidence=/root/v5-emergency-approval.json
+
 bash scripts/deploy-v5.sh --canary --egress \
   --emergency-containment="$INC" --emergency-approval="$APPROVAL" --emergency-commit="$SHA"
 bash scripts/deploy-v5.sh --finalize \
   --emergency-containment="$INC" --emergency-approval="$APPROVAL" --emergency-commit="$SHA"
 ```
 
-首次调用会持久化 exact incident/approval/commit/deploy holder 并绑定 candidate release。
+预授权 invocation 会把 dx approval evidence 哈希、exact incident/commit 与 admin audit 独立落库；
+canary 在真实 mutation lease 下原子消费该 one-shot authorization，生成 debt 并绑定 candidate release。
+canary/finalize 每次都重新核对 clean canonical exact HEAD 与远端 commit provenance。
 止血稳定后 open debt 会阻断所有普通生产写 lane；仅 `abort/rollback/recover/hide-luna` 与
 同一 incident 的收敛仍可执行。立即补回归、单一 Codex full-diff PASS、受保护 PR/CI，
 canonical 与 origin protected head 对齐后，用以下 schema 的 root-only JSON 关账：

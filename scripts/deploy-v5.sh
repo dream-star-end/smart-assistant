@@ -220,6 +220,7 @@ DISABLE_BUNDLE_FLAG=0; DISABLE_RELEASE_FLAG=0
 EMERG_IMAGE=""; EMERG_IMAGE_ID=""; EMERG_BUNDLE=""
 # dx-declared P0 containment lane. These values are invalid unless supplied as one exact set.
 EMERGENCY_INCIDENT=""; EMERGENCY_APPROVAL=""; EMERGENCY_COMMIT=""
+EMERGENCY_APPROVAL_EVIDENCE=""
 EMERGENCY_CLOSE_INCIDENT=""; PROTECTED_MERGE_SHA=""; CI_EVIDENCE_FILE=""
 for arg in "$@"; do
   case "$arg" in
@@ -274,9 +275,11 @@ for arg in "$@"; do
     --drain-ws) DRAIN_WS=1 ;;
     --abort) MODE="abort" ;;
     --recover) MODE="recover" ;;
+    --authorize-emergency=*) MODE="authorize-emergency"; EMERGENCY_INCIDENT="${arg#*=}" ;;
     --emergency-containment=*) EMERGENCY_INCIDENT="${arg#*=}" ;;
     --emergency-approval=*) EMERGENCY_APPROVAL="${arg#*=}" ;;
     --emergency-commit=*) EMERGENCY_COMMIT="${arg#*=}" ;;
+    --emergency-approval-evidence=*) EMERGENCY_APPROVAL_EVIDENCE="${arg#*=}" ;;
     --close-emergency-debt=*) MODE="close-emergency-debt"; EMERGENCY_CLOSE_INCIDENT="${arg#*=}" ;;
     --protected-merge-sha=*) PROTECTED_MERGE_SHA="${arg#*=}" ;;
     --ci-evidence-file=*) CI_EVIDENCE_FILE="${arg#*=}" ;;
@@ -294,14 +297,21 @@ done
 if [[ -n "$EMERGENCY_INCIDENT$EMERGENCY_APPROVAL$EMERGENCY_COMMIT" ]]; then
   [[ -n "$EMERGENCY_INCIDENT" && -n "$EMERGENCY_APPROVAL" && -n "$EMERGENCY_COMMIT" ]] \
     || { echo "✗ emergency containment 必须同时提供 incident/approval/exact commit" >&2; exit 2; }
-  [[ "$MODE" == canary || "$MODE" == finalize ]] \
-    || { echo "✗ emergency containment 参数只允许 --canary / --finalize" >&2; exit 2; }
+  [[ "$MODE" == canary || "$MODE" == finalize || "$MODE" == authorize-emergency ]] \
+    || { echo "✗ emergency 参数只允许独立 --authorize-emergency / --canary / --finalize" >&2; exit 2; }
   [[ "$EMERGENCY_INCIDENT" =~ ^INC-[0-9]{8}-[A-Z0-9-]{3,40}$ ]] \
     || { echo "✗ emergency incident id 非法:$EMERGENCY_INCIDENT" >&2; exit 2; }
   [[ ${#EMERGENCY_APPROVAL} -ge 8 && ${#EMERGENCY_APPROVAL} -le 256 ]] \
     || { echo "✗ emergency approval ref 长度需 8..256" >&2; exit 2; }
   [[ "$EMERGENCY_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
     || { echo "✗ emergency exact commit 必须是 40 位小写 sha" >&2; exit 2; }
+fi
+if [[ "$MODE" == authorize-emergency ]]; then
+  [[ -f "$EMERGENCY_APPROVAL_EVIDENCE" ]] \
+    || { echo "✗ --authorize-emergency 需要 --emergency-approval-evidence=<dx approval json>" >&2; exit 2; }
+elif [[ -n "$EMERGENCY_APPROVAL_EVIDENCE" ]]; then
+  echo "✗ approval evidence 只允许在独立 --authorize-emergency invocation 中使用" >&2
+  exit 2
 fi
 if [[ "$MODE" == close-emergency-debt ]]; then
   [[ "$EMERGENCY_CLOSE_INCIDENT" =~ ^INC-[0-9]{8}-[A-Z0-9-]{3,40}$ ]] \
@@ -7153,30 +7163,97 @@ assert_emergency_source_provenance() {
   echo "  ✓ emergency provenance:canonical clean/exact HEAD/remote branch/mutation holder"
 }
 
-authorize_emergency_debt() {
+record_emergency_authorization() {
   [[ -n "$EMERGENCY_INCIDENT" ]] || return 0
-  [[ "$DRY" == 1 ]] && { echo "  [dry-run] consume durable emergency authorization/debt"; return 0; }
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] independently record dx emergency approval bound to exact commit"; return 0; }
   assert_emergency_source_provenance || return 1
-  local nonce nonce_hash
+  local evidence_hash authorized evidence_uid evidence_mode
+  evidence_uid="$(stat -c '%u' "$EMERGENCY_APPROVAL_EVIDENCE" 2>/dev/null || true)"
+  evidence_mode="$(stat -c '%a' "$EMERGENCY_APPROVAL_EVIDENCE" 2>/dev/null || true)"
+  [[ "$evidence_uid" == 0 && "$evidence_mode" =~ ^[46]00$ ]] \
+    || { echo "✗ emergency approval evidence 必须 root-owned 且 group/other 无权限(0400/0600)" >&2; return 1; }
+  node - "$EMERGENCY_APPROVAL_EVIDENCE" "$EMERGENCY_INCIDENT" "$EMERGENCY_COMMIT" "$EMERGENCY_APPROVAL" <<'NODE'
+const fs=require('node:fs');
+const [path,incident,commit,approvalRef]=process.argv.slice(2);
+const j=JSON.parse(fs.readFileSync(path,'utf8'));
+if (j.schema!==1 || j.approver!=='dx' || j.decision!=='APPROVE_P0_CONTAINMENT' ||
+    j.ongoingRealUserFinancialOrSecurityHarm!==true || j.smallestContainmentFirst!==true ||
+    j.incidentId!==incident || j.exactCommit!==commit || j.approvalRef!==approvalRef ||
+    typeof j.approvedAt!=='string' || !Number.isFinite(Date.parse(j.approvedAt))) {
+  throw new Error('approval evidence must bind dx + ongoing harm + smallest containment + incident/commit/ref');
+}
+NODE
+  evidence_hash="$(sha256sum "$EMERGENCY_APPROVAL_EVIDENCE" | awk '{print $1}')" || return 1
+  authorized="$(ds_exec <<SQL
+WITH admin AS (
+  SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1
+), ins AS (
+  INSERT INTO emergency_containment_authorizations(
+    incident_id,approval_ref,exact_commit,approval_evidence_sha256,authorized_by
+  )
+  SELECT '$(ds_lit "$EMERGENCY_INCIDENT")','$(ds_lit "$EMERGENCY_APPROVAL")','$EMERGENCY_COMMIT',
+         '$evidence_hash',admin.id FROM admin
+  ON CONFLICT (incident_id) DO NOTHING
+  RETURNING authorized_by
+), audited AS (
+  INSERT INTO admin_audit(admin_id,action,target,before,after)
+  SELECT authorized_by,'emergency_containment.authorize','incident:$(ds_lit "$EMERGENCY_INCIDENT")',NULL,
+         jsonb_build_object('incident_id','$(ds_lit "$EMERGENCY_INCIDENT")','exact_commit','$EMERGENCY_COMMIT',
+                            'approval_ref','$(ds_lit "$EMERGENCY_APPROVAL")','evidence_sha256','$evidence_hash')
+    FROM ins RETURNING 1
+)
+SELECT count(*) FROM (
+  SELECT 1 FROM ins
+  UNION ALL
+  SELECT 1 FROM emergency_containment_authorizations
+   WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='authorized'
+     AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND exact_commit='$EMERGENCY_COMMIT'
+     AND approval_evidence_sha256='$evidence_hash'
+) matched;
+SQL
+)" || return 1
+  [[ "$authorized" == 1 ]] \
+    || { echo "✗ emergency pre-authorization 与 incident/approval/commit/evidence 不一致" >&2; return 1; }
+  echo "✓ emergency pre-authorization recorded:$EMERGENCY_INCIDENT evidence=$evidence_hash"
+}
+
+consume_emergency_authorization() {
+  [[ -n "$EMERGENCY_INCIDENT" ]] || return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] consume pre-existing one-shot emergency authorization into durable debt"; return 0; }
+  assert_emergency_source_provenance || return 1
+  local nonce nonce_hash authorized
   nonce="$(openssl rand -hex 32)"; nonce_hash="$(printf '%s' "$nonce" | sha256sum | awk '{print $1}')"
   ds_exec <<SQL >/dev/null
+WITH consumed AS (
+  UPDATE emergency_containment_authorizations
+     SET status='consumed',consumed_at=NOW(),consumed_deploy_id='$MUTATION_DEPLOY_ID',
+         consumed_holder_identity='$(ds_lit "$MUTATION_HOLDER_IDENTITY")'
+   WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='authorized'
+     AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND exact_commit='$EMERGENCY_COMMIT'
+   RETURNING *
+)
 INSERT INTO emergency_containment_debts(
-  incident_id,approval_ref,exact_commit,deploy_id,holder_identity,authorization_nonce_hash
-) VALUES (
-  '$(ds_lit "$EMERGENCY_INCIDENT")','$(ds_lit "$EMERGENCY_APPROVAL")','$EMERGENCY_COMMIT',
-  '$MUTATION_DEPLOY_ID','$(ds_lit "$MUTATION_HOLDER_IDENTITY")','$nonce_hash'
-) ON CONFLICT (incident_id) DO NOTHING;
+  incident_id,approval_ref,exact_commit,approval_evidence_sha256,
+  deploy_id,holder_identity,authorization_nonce_hash
+)
+SELECT incident_id,approval_ref,exact_commit,approval_evidence_sha256,
+       '$MUTATION_DEPLOY_ID','$(ds_lit "$MUTATION_HOLDER_IDENTITY")','$nonce_hash'
+  FROM consumed
+ON CONFLICT (incident_id) DO NOTHING;
 SQL
-  local authorized
   authorized="$(ds_exec <<SQL
-SELECT count(*) FROM emergency_containment_debts
- WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='open'
-   AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND exact_commit='$EMERGENCY_COMMIT';
+SELECT count(*)
+  FROM emergency_containment_authorizations a
+  JOIN emergency_containment_debts d USING(incident_id)
+ WHERE a.incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND a.status='consumed' AND d.status='open'
+   AND a.approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND a.exact_commit='$EMERGENCY_COMMIT'
+   AND d.approval_ref=a.approval_ref AND d.exact_commit=a.exact_commit
+   AND d.approval_evidence_sha256=a.approval_evidence_sha256;
 SQL
 )"
   [[ "$authorized" == 1 ]] \
-    || { echo "✗ emergency durable authorization 与 incident/approval/commit 不一致" >&2; return 1; }
-  echo "  ✓ emergency authorization durably consumed/resumed:$EMERGENCY_INCIDENT deploy_id=$MUTATION_DEPLOY_ID"
+    || { echo "✗ 缺少独立预授权，或 authorization/debt 与 incident/approval/commit 不一致" >&2; return 1; }
+  echo "  ✓ pre-authorized emergency durably consumed/resumed:$EMERGENCY_INCIDENT deploy_id=$MUTATION_DEPLOY_ID"
 }
 
 bind_emergency_candidate_release() {
@@ -7231,10 +7308,14 @@ assert_emergency_finalize_authorized() {
   [[ -n "$EMERGENCY_INCIDENT" ]] || return 1
   local ok
   ok="$(ds_exec <<SQL
-SELECT count(*) FROM emergency_containment_debts
- WHERE incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND status='open'
-   AND approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND exact_commit='$EMERGENCY_COMMIT'
-   AND candidate_release='$(ds_lit "$DS_candidate_release")';
+SELECT count(*)
+  FROM emergency_containment_debts d
+  JOIN emergency_containment_authorizations a USING(incident_id)
+ WHERE d.incident_id='$(ds_lit "$EMERGENCY_INCIDENT")' AND d.status='open' AND a.status='consumed'
+   AND d.approval_ref='$(ds_lit "$EMERGENCY_APPROVAL")' AND d.exact_commit='$EMERGENCY_COMMIT'
+   AND d.candidate_release='$(ds_lit "$DS_candidate_release")'
+   AND d.approval_ref=a.approval_ref AND d.exact_commit=a.exact_commit
+   AND d.approval_evidence_sha256=a.approval_evidence_sha256;
 SQL
 )"
   [[ "$ok" == 1 ]] || { echo "✗ emergency finalize authorization 与 durable debt/candidate 不一致" >&2; return 1; }
@@ -7339,6 +7420,35 @@ SQL
 )"
   [[ "$count" == 1 ]] || { echo "✗ candidate egress ready CAS failed" >&2; return 1; }
   echo "  ✓ egress restored to predecessor; exact candidate transition is ready for post-finalize activation"
+}
+
+reconcile_testing_egress_transition() { # <generation>
+  local generation="$1" row release predecessor current count
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] reconcile testing egress → exact predecessor + ready"; return 0; }
+  row="$(ds_exec <<SQL
+SELECT release_id || '|' || predecessor_release FROM release_egress_transitions
+ WHERE generation=$generation AND status='testing';
+SQL
+)" || return 1
+  [[ -n "$row" ]] || return 0
+  IFS='|' read -r release predecessor <<<"$row"
+  current="$(current_egress_release)"
+  if [[ "$current" == "$release" ]]; then
+    activate_egress_release "$predecessor" "$release" || return 1
+  elif [[ "$current" != "$predecessor" ]]; then
+    echo "✗ testing egress cwd 无法裁决(expected candidate=$release or predecessor=$predecessor actual=${current:-<none>})" >&2
+    return 1
+  fi
+  count="$(ds_exec <<SQL
+WITH changed AS (
+  UPDATE release_egress_transitions SET status='ready',ready_at=NOW()
+   WHERE release_id='$(ds_lit "$release")' AND generation=$generation AND status='testing'
+   RETURNING 1
+) SELECT count(*) FROM changed;
+SQL
+)" || return 1
+  [[ "$count" == 1 ]] || { echo "✗ testing egress → ready CAS failed" >&2; return 1; }
+  echo "  ✓ crash-safe egress reconcile:predecessor restored, transition ready generation=$generation"
 }
 
 rollback_egress_transition_for_generation() { # <generation>
@@ -7599,7 +7709,7 @@ SQL
 canary() {
   echo "══ v5 --canary(蓝绿双 master 起手;RFC D5)══"
   if [[ -n "$EMERGENCY_INCIDENT" ]]; then
-    authorize_emergency_debt || exit 1
+    consume_emergency_authorization || exit 1
   fi
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
@@ -7828,13 +7938,18 @@ finalize() {
   ds_snapshot
   if [[ "$DS_phase" == canary || "$DS_phase" == finalizing ]]; then
     if [[ -n "$EMERGENCY_INCIDENT" ]]; then
-      if ! assert_emergency_finalize_authorized; then
+      if ! assert_emergency_source_provenance || ! assert_emergency_finalize_authorized; then
         echo "✗ emergency authorization mismatch；第一动作=官方 abort" >&2
         abort
         exit 1
       fi
     elif ! assert_release_verification_evidence; then
       echo "✗ candidate 缺 exact release/generation fixed-matrix evidence；第一动作=官方 abort" >&2
+      abort
+      exit 1
+    fi
+    if ! reconcile_testing_egress_transition "$DS_generation"; then
+      echo "✗ testing egress transition 无法收敛；第一动作=官方 abort" >&2
       abort
       exit 1
     fi
@@ -8152,7 +8267,13 @@ recover() {
           ds_cas_or_die "phase='stable', transition_step=0, operation_id=NULL" 0 "recover canary<READY (no candidate) → stable"
         fi
       else
-        echo "  · canary≥READY:§8=candidate 死则重启 unit 或 --abort;活则继续 --promote/--finalize(operator 裁决)"
+        echo "  · canary≥READY:先收敛可能遗留的 testing egress transition，再由 operator 裁决"
+        if ! reconcile_testing_egress_transition "$DS_generation"; then
+          echo "✗ testing egress recovery failed；第一动作=官方 abort" >&2
+          abort
+          exit 1
+        fi
+        echo "  · §8=candidate 死则重启 unit 或 --abort;活则继续 --promote/--finalize(operator 裁决)"
         [[ -n "$cand" ]] && candidate_self_check "$cand" || true
         echo "  → 请据 candidate 健康决定:deploy-v5.sh --promote=<pct> / --finalize / --abort"
       fi ;;
@@ -8675,6 +8796,7 @@ run_selected_mode() { # [mode]
     finalize)  finalize ;;
     abort)     abort ;;
     recover)   recover ;;
+    authorize-emergency) record_emergency_authorization ;;
     close-emergency-debt) close_emergency_debt ;;
     publish-luna) set_luna_visibility public ;;
     hide-luna) set_luna_visibility hidden ;;
