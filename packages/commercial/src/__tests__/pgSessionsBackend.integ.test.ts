@@ -857,6 +857,113 @@ describe("pgSessionsBackend contract", () => {
 });
 
 describe("pgSessionsBackend lossless turn tape", () => {
+  maybe("record staging commits complete 128-row batches and replays only the rolled-back batch", async () => {
+    const sessionId = "s-record-stage-batches";
+    const userId = "c:231";
+    const tape = buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "9".repeat(64),
+      text: "",
+      createdAt: 1_783_944_500_000,
+      runtimeEvents: Array.from({ length: 130 }, (_, index) => ({
+        ordinal: index + 1,
+        observedAt: 1_783_944_500_000 + index,
+        source: "gateway",
+        payload: { type: "batch-boundary", index },
+      })),
+    });
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(userId, part.request, part.bytes);
+    }
+
+    const previousBatching = process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+    process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = "0";
+    try {
+      await pool.query(`
+        CREATE OR REPLACE FUNCTION oc_test_fail_second_record_batch()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.tape_id='${tape.finalize.tapeId}' AND NEW.ordinal=129 THEN
+            RAISE EXCEPTION 'fail second record batch';
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER trg_oc_test_fail_second_record_batch
+        BEFORE INSERT ON client_session_turn_tape_records
+        FOR EACH ROW EXECUTE FUNCTION oc_test_fail_second_record_batch();
+      `);
+      await assert.rejects(
+        backend.finalizeLosslessTurnTape(userId, tape.finalize),
+        /fail second record batch/,
+      );
+      assert.equal(
+        (await pool.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count
+             FROM client_session_turn_tape_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0]!.count,
+        "128",
+        "ordinal 128 must roll back with the failed second batch",
+      );
+      await pool.query(`
+        DROP TRIGGER trg_oc_test_fail_second_record_batch
+          ON client_session_turn_tape_records;
+        DROP FUNCTION oc_test_fail_second_record_batch();
+        CREATE TABLE oc_test_record_batch_replay (ordinal INTEGER NOT NULL);
+        CREATE OR REPLACE FUNCTION oc_test_log_record_batch_replay()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+          INSERT INTO oc_test_record_batch_replay(ordinal) VALUES (NEW.ordinal);
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER trg_oc_test_log_record_batch_replay
+        AFTER INSERT OR UPDATE ON client_session_turn_tape_records
+        FOR EACH ROW EXECUTE FUNCTION oc_test_log_record_batch_replay();
+      `);
+
+      assert.equal(
+        (await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+        "finalized",
+      );
+      assert.deepEqual(
+        (await pool.query<{ ordinal: number }>(
+          "SELECT DISTINCT ordinal FROM oc_test_record_batch_replay ORDER BY ordinal",
+        )).rows.map((row) => row.ordinal),
+        [128, 129],
+        "the exact-summary replay must skip the committed first batch",
+      );
+      assert.deepEqual(
+        (await pool.query<{ count: string; finalized: boolean }>(
+          `SELECT COUNT(r.*)::text AS count,(t.finalized_at IS NOT NULL) AS finalized
+             FROM client_session_turn_tapes t
+             LEFT JOIN client_session_turn_tape_records r
+               ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+            WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=$3
+            GROUP BY t.finalized_at`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )).rows[0],
+        { count: "130", finalized: true },
+      );
+    } finally {
+      if (previousBatching === undefined) delete process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING;
+      else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_oc_test_fail_second_record_batch
+          ON client_session_turn_tape_records;
+        DROP FUNCTION IF EXISTS oc_test_fail_second_record_batch();
+        DROP TRIGGER IF EXISTS trg_oc_test_log_record_batch_replay
+          ON client_session_turn_tape_records;
+        DROP FUNCTION IF EXISTS oc_test_log_record_batch_replay();
+        DROP TABLE IF EXISTS oc_test_record_batch_replay;
+      `);
+    }
+  });
+
   maybe("repairs stale partial derived rows atomically under concurrent replay without double cost", async () => {
     const sessionId = "s-partial-derived-recovery";
     const userId = "c:227";

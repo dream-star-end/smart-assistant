@@ -819,6 +819,49 @@ export type LosslessTurnTapeFinalizeResult =
     }
   | { applied: "session_not_found" | "session_deleted" | "incomplete" };
 
+export function _createFinalizeSingleflight<T>(): (
+  key: string,
+  run: () => Promise<T>,
+) => { promise: Promise<T>; shared: boolean } {
+  const inFlight = new Map<string, Promise<T>>();
+  return (key, run) => {
+    const existing = inFlight.get(key);
+    if (existing) return { promise: existing, shared: true };
+    const promise = Promise.resolve().then(run);
+    inFlight.set(key, promise);
+    const cleanup = () => {
+      if (inFlight.get(key) === promise) inFlight.delete(key);
+    };
+    void promise.then(cleanup, cleanup);
+    return { promise, shared: false };
+  };
+}
+
+/** Fixed-field JSON avoids delimiter collisions and makes every immutable
+ * header field part of the coalescing identity. A conflicting reuse of the
+ * same tapeId therefore still reaches PostgreSQL and keeps its 409 semantics. */
+export function _losslessFinalizeSingleflightKey(
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+): string {
+  return JSON.stringify([
+    userId,
+    request.sessionId,
+    request.tapeId,
+    request.agentId,
+    request.turnIndex,
+    request.status,
+    request.turnKey,
+    request.tapeSha256,
+    request.totalBytes,
+    request.partCount,
+    request.createdAt,
+    request.waiveReason ?? null,
+    request.dispatchId ?? null,
+    request.attemptNo ?? null,
+  ]);
+}
+
 /**
  * finalize 收敛 dispatch(RFC §2.4)。仅当 tape header 带 dispatch_id 时调用(legacy tape 跳过)。
  *   - 非终态(admitted/accepted/rejecting)→ CAS terminal,outcome 映射 tape.status;
@@ -2029,6 +2072,21 @@ async function prepareLosslessTurnTapeOutsideLocks(
   };
 }
 
+export const LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE = 128;
+
+export function _losslessTurnRecordStageBatches(
+  recordCount: number,
+  exactOrdinals: ReadonlySet<number>,
+): number[][] {
+  const pending = Array.from({ length: recordCount }, (_value, ordinal) => ordinal)
+    .filter((ordinal) => !exactOrdinals.has(ordinal));
+  const batches: number[][] = [];
+  for (let start = 0; start < pending.length; start += LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE) {
+    batches.push(pending.slice(start, start + LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE));
+  }
+  return batches;
+}
+
 async function stagePreparedLosslessTurnRecords(
   pool: Pool,
   userId: string,
@@ -2041,15 +2099,12 @@ async function stagePreparedLosslessTurnRecords(
     request,
     prepared,
   );
-  for (let ordinal = 0; ordinal < prepared.turn.records.length; ordinal++) {
-    if (exactOrdinals.has(ordinal)) continue;
-    const item = prepared.turn.records[ordinal]!;
-    const visible = prepared.visible[ordinal]!;
-    const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
+  for (const batch of _losslessTurnRecordStageBatches(prepared.turn.records.length, exactOrdinals)) {
     const staged = await withTx(pool, async (client): Promise<"staged" | "finalized" | "missing"> => {
-      // Every derived record is independently retryable, but publication is
-      // serialized on the immutable source-tape header. A completed tape is
-      // never rewritten by a later release's materializer.
+      // One immutable-header lock covers a bounded batch rather than one
+      // transaction per physical record. This preserves every per-record
+      // verification below while avoiding tens of thousands of header-lock
+      // transactions for runtime-event-heavy turns.
       const tape = (
         await client.query<LosslessTurnTapeHeaderRow>(
           `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,
@@ -2065,6 +2120,11 @@ async function stagePreparedLosslessTurnRecords(
         throw new Error("lossless turn tape finalize header conflict");
       }
       if (tape.finalized_at !== null) return "finalized";
+
+      for (const ordinal of batch) {
+      const item = prepared.turn.records[ordinal]!;
+      const visible = prepared.visible[ordinal]!;
+      const expectedModels = preparedModelSidecarsForOrdinal(ordinal, item.id, visible);
 
       type StagedRecordRow = {
         msg_id: string;
@@ -2275,6 +2335,7 @@ async function stagePreparedLosslessTurnRecords(
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal=$4`,
         [request.sessionId, userId, request.tapeId, ordinal],
       );
+      }
       return "staged";
     });
     if (staged !== "staged") return;
@@ -5342,6 +5403,7 @@ export function createPgSessionsBackend(
   options: PgSessionsBackendOptions,
 ): PgSessionsBackend {
   const expectedGeneration = options.expectedGeneration;
+  const finalizeSingleflight = _createFinalizeSingleflight<LosslessTurnTapeFinalizeResult>();
 
   const backend: PgSessionsBackend = {
     async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
@@ -5571,6 +5633,9 @@ export function createPgSessionsBackend(
       userId: string,
       request: LosslessTurnTapeFinalizeRequest,
     ): Promise<LosslessTurnTapeFinalizeResult> {
+      const flight = finalizeSingleflight(
+        _losslessFinalizeSingleflightKey(userId, request),
+        async (): Promise<LosslessTurnTapeFinalizeResult> => {
       let goalUsageChanged = false;
       // Personal/test namespaces also use this backend in some deployments,
       // but only `c:<uid>` sessions participate in commercial settlement.
@@ -6123,6 +6188,12 @@ export function createPgSessionsBackend(
         await notifyGoalUsageChanges(options.onGoalUsageChanged, [{ userId, sessionId: request.sessionId }]);
       }
       return result;
+        },
+      );
+      const completed = await flight.promise;
+      return flight.shared && completed.applied === "finalized"
+        ? { ...completed, applied: "idempotent" }
+        : completed;
     },
     // ── probe(D5)──────────────────────────────────────────────────────────
     async probeSessionsDb(): Promise<{ ok: true } | { ok: false; error: string }> {
