@@ -4868,6 +4868,8 @@ wait $!
     assert.match(runner, /export CI=1/)
     assert.match(runner, /export NO_PROXY="127\.0\.0\.1,localhost\$\{NO_PROXY:\+,\$NO_PROXY\}"/)
     assert.match(runner, /export no_proxy="127\.0\.0\.1,localhost\$\{no_proxy:\+,\$no_proxy\}"/)
+    assert.ok(runner.includes('const u=new URL(process.env.DB_URL); console.log(`${u.hostname} ${u.port||5432}`)'))
+    assert.ok(!runner.includes('process.stdout.write(`${u.hostname} ${u.port||5432}`)'))
     assert.match(runner, /if\(fail\|\|skip\|\|flaky\)/)
     assert.match(runner, /\[ -z "\$\{OC_E2E_MODEL:-\}" \] \|\| die "OC_E2E_MODEL 已废止；模型矩阵不可覆盖"/)
     assert.doesNotMatch(runner, /OC_E2E_MODEL:-[a-z0-9]/)

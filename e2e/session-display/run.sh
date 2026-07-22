@@ -72,7 +72,7 @@ if [ -z "${OC_E2E_PG_URL:-}" ]; then
     "set -a; . '$V5_ENV'; printf '%s' \"\$DATABASE_URL\"")" || die "无法读取远端 DATABASE_URL"
   [ -n "$DB_URL" ] || die "远端 DATABASE_URL 为空"
   read -r DB_HOST DB_PORT < <(DB_URL="$DB_URL" node -e '
-    const u=new URL(process.env.DB_URL); process.stdout.write(`${u.hostname} ${u.port||5432}`)
+    const u=new URL(process.env.DB_URL); console.log(`${u.hostname} ${u.port||5432}`)
   ')
   PG_LOCAL_PORT="$(free_port)"
   log "建 PG 隧道 127.0.0.1:${PG_LOCAL_PORT} → ${PW_HOST}:${DB_HOST}:${DB_PORT}"
