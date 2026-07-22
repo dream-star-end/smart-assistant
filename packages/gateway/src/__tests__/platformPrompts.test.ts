@@ -276,6 +276,13 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       ),
     )
   })
+  it('选择题使用运行时专用 Ask 工具，不再把 options 富块当交互入口', () => {
+    const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+    assert.ok(prompt.includes('AskUserQuestion'))
+    assert.ok(prompt.includes('request_user_input'))
+    assert.ok(prompt.includes('不要输出 fenced `options` 代码块'))
+    assert.ok(prompt.includes('并等待回答'))
+  })
   it('原生容器网站预览 SOP 覆盖常驻 prompt、Codex 基线与平台 skill', () => {
     const sources = {
       prompt: _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,

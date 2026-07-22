@@ -185,6 +185,10 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
       h.spawnCalls[0].args.includes('model_reasoning_effort="xhigh"'),
       `spawn argv should use GPT-5.6-Sol default effort xhigh: ${h.spawnCalls[0].args.join(" ")}`,
     );
+    assert.ok(
+      h.spawnCalls[0].args.includes("features.default_mode_request_user_input=true"),
+      `default mode must expose request_user_input: ${h.spawnCalls[0].args.join(" ")}`,
+    );
     assert.deepEqual(h.spawnCalls[0].args.slice(-2), ["--listen", "stdio://"]);
     const initParams = init.params as { clientInfo?: { name?: string }; capabilities?: { experimentalApi?: boolean } };
     assert.equal(initParams.clientInfo?.name, "openclaude-gateway");
