@@ -211,9 +211,13 @@ export function FeedbackQueue() {
       </div>
 
       <FeedbackDetailSheet
+        key={active?.id ?? "closed"}
         row={active}
         open={sheetOpen}
-        onOpenChange={setSheetOpen}
+        onOpenChange={(nextOpen) => {
+          setSheetOpen(nextOpen);
+          if (!nextOpen) setActive(null);
+        }}
         onAcked={patchRow}
       />
     </div>

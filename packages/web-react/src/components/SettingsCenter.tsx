@@ -233,7 +233,13 @@ export function SettingsCenter({
 
                 {section === "feedback" && (
                   <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.feedback.id}>
-                    <FeedbackTab auth={auth} />
+                    {user ? (
+                      <FeedbackTab auth={auth} userId={user.id} />
+                    ) : (
+                      <p className="px-5 py-10 text-center text-[13px] text-faint">
+                        正在加载账号信息…
+                      </p>
+                    )}
                   </div>
                 )}
 

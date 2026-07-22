@@ -8,6 +8,7 @@
 import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
+import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
@@ -18,6 +19,7 @@ import {
 import { mergeTimelineHistoryPage } from "../src/lib/persist";
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
+import { createMemoryAuthSession } from "../src/lib/authSession";
 
 declare global {
   interface Window {
@@ -84,6 +86,43 @@ createRoot(document.getElementById("root")!).render(
       onGoalAction={async () => {}}
     />
   </StrictMode>,
+);
+
+const feedbackAuth = createMemoryAuthSession(() => {}, "browser-feedback-token");
+function FeedbackProbe() {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLElement | null>(null);
+  return (
+    <>
+      <button
+        type="button"
+        onClick={(event) => {
+          triggerRef.current = event.currentTarget;
+          setOpen(true);
+        }}
+      >
+        打开消息反馈
+      </button>
+      <MessageFeedbackDialog
+        open={open}
+        onOpenChange={setOpen}
+        auth={feedbackAuth}
+        sessionId="browser-session"
+        context={{
+          traceId: "browser-trace",
+          messageId: "browser-message",
+          role: "assistant",
+          errorCode: null,
+          textPreview: "BROWSER_FEEDBACK_EXCERPT",
+        }}
+        returnFocus={triggerRef.current}
+      />
+    </>
+  );
+}
+
+createRoot(document.getElementById("feedback-root")!).render(
+  <StrictMode><FeedbackProbe /></StrictMode>,
 );
 
 const deferredUser: ChatMessage = {

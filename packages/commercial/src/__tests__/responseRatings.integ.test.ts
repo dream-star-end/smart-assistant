@@ -13,7 +13,7 @@ import { after, before, describe, test } from 'node:test'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
-import { listSessionRatings, upsertResponseRating } from '../responseRatings.js'
+import { listDownRatings, listSessionRatings, upsertResponseRating } from '../responseRatings.js'
 import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
@@ -106,5 +106,37 @@ describe('implicit rating upsert semantics (PG)', () => {
     assert.equal(map['m-imp'], undefined)
     assert.deepEqual(map['m-exp'], { rating: 'down', tags: ['不准确'] })
     assert.deepEqual(map['m1'], { rating: 'up', tags: ['准确'] })
+  })
+
+  test('listDownRatings 默认仅显式，并可切换 implicit / all 来源', async (t) => {
+    if (!pgAvailable) return t.skip('no PG fixture')
+    await upsertResponseRating(
+      base({
+        messageId: 'm-source-explicit',
+        rating: 'down',
+        tags: ['没完成'],
+        comment: 'EXPLICIT_SOURCE_MARKER',
+      }),
+    )
+    await upsertResponseRating(
+      base({
+        messageId: 'm-source-implicit',
+        rating: 'down',
+        tags: ['implicit', '中途打断'],
+        comment: 'IMPLICIT_SOURCE_MARKER',
+      }),
+    )
+
+    const explicit = await listDownRatings({ limit: 200 })
+    assert.equal(explicit.rows.some((row) => row.comment === 'EXPLICIT_SOURCE_MARKER'), true)
+    assert.equal(explicit.rows.some((row) => row.comment === 'IMPLICIT_SOURCE_MARKER'), false)
+
+    const implicit = await listDownRatings({ source: 'implicit', limit: 200 })
+    assert.equal(implicit.rows.some((row) => row.comment === 'EXPLICIT_SOURCE_MARKER'), false)
+    assert.equal(implicit.rows.some((row) => row.comment === 'IMPLICIT_SOURCE_MARKER'), true)
+
+    const all = await listDownRatings({ source: 'all', limit: 200 })
+    assert.equal(all.rows.some((row) => row.comment === 'EXPLICIT_SOURCE_MARKER'), true)
+    assert.equal(all.rows.some((row) => row.comment === 'IMPLICIT_SOURCE_MARKER'), true)
   })
 })

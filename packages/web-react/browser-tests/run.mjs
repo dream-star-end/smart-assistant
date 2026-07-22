@@ -21,6 +21,7 @@
 //   T11 direct-timeline 思考实时展开、完成自动折叠，受信点击后完整正文恢复。
 //   T12 单 Agent 卡和团队队员卡不显示冗余原始记录入口，实际过程仍可见。
 //   T13 工具卡头部满足 44px、键盘可展开/折叠，市场长列表可继续加载且移动宽度不溢出。
+//   T14 消息反馈弹窗真浏览器焦点陷阱与关闭后焦点归还。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -68,7 +69,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
   #tool-card-polish-root .min-h-11{min-height:2.75rem}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -445,6 +446,20 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   if (await root.getByText("查看原始完整记录").count() !== 0) {
     throw new Error("美化后的工具卡仍出现原始完整记录文案");
   }
+});
+
+await check("T14 消息反馈弹窗关闭后把焦点还给原消息动作", async () => {
+  const trigger = page.getByRole("button", { name: "打开消息反馈" });
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "反馈这条回复" });
+  await dialog.waitFor({ state: "visible", timeout: 3000 });
+  if (!(await page.getByLabel("附上以上回复摘录，帮助定位问题").isChecked())) {
+    throw new Error("当前回复摘录未以用户可见勾选态呈现");
+  }
+  await dialog.getByRole("button", { name: "关闭" }).click();
+  await dialog.waitFor({ state: "hidden", timeout: 3000 });
+  const focused = await trigger.evaluate((node) => document.activeElement === node);
+  if (!focused) throw new Error("关闭反馈弹窗后焦点没有归还原消息动作");
 });
 
 if (pageErrors.length > 0) {

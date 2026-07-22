@@ -1,8 +1,9 @@
-import { Check, X } from "lucide-react";
+import { Check, Search, X } from "lucide-react";
 import { useState } from "react";
-import { Badge, Button, IconButton, Sheet, useToast } from "../../../components/ui";
-import { CopyChip, KeyValue } from "../../components";
-import { adminSend, apiErrorMessage } from "../../lib/adminApi";
+import { Alert, Badge, Button, IconButton, Sheet, useToast } from "../../../components/ui";
+import { CopyChip, KeyValue, TimeAgo } from "../../components";
+import { ApiError, adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
+import type { TraceInfo, TraceLookupResp } from "../audit/types";
 import { FEEDBACK_STATUS_LABELS, FEEDBACK_STATUS_TONE, type FeedbackRow } from "./types";
 
 function fmt(ts: string | null): string {
@@ -12,7 +13,7 @@ function fmt(ts: string | null): string {
 }
 
 /**
- * 反馈详情抽屉（右侧 Sheet）：完整描述 + 上下文 + meta（JSON pretty）+ 反查命令，
+ * 反馈详情抽屉（右侧 Sheet）：完整描述 + 上下文 + meta（JSON pretty）+ 请求ID在线反查，
  * open 态可就地确认处理（POST /feedback/:id/ack）。ack 成功回传更新后的行给父组件就地打补丁。
  */
 export function FeedbackDetailSheet({
@@ -28,6 +29,13 @@ export function FeedbackDetailSheet({
 }) {
   const toast = useToast();
   const [busy, setBusy] = useState(false);
+  const [traceBusy, setTraceBusy] = useState(false);
+  const [traceResult, setTraceResult] = useState<
+    | { status: "found"; trace: TraceInfo }
+    | { status: "notfound" }
+    | { status: "error"; message: string }
+    | null
+  >(null);
 
   const ack = async () => {
     if (!row) return;
@@ -48,11 +56,28 @@ export function FeedbackDetailSheet({
     }
   };
 
+  const lookupTrace = async () => {
+    if (!row?.request_id || traceBusy) return;
+    setTraceBusy(true);
+    setTraceResult(null);
+    try {
+      const data = await adminGet<TraceLookupResp>(
+        `/trace/${encodeURIComponent(row.request_id)}`,
+      );
+      setTraceResult({ status: "found", trace: data.trace });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) {
+        setTraceResult({ status: "notfound" });
+      } else {
+        setTraceResult({ status: "error", message: apiErrorMessage(e, "请求失败") });
+      }
+    } finally {
+      setTraceBusy(false);
+    }
+  };
+
   const metaText =
     row?.meta && Object.keys(row.meta).length > 0 ? JSON.stringify(row.meta, null, 2) : "（无 meta）";
-  const grepCmd = row?.request_id
-    ? `journalctl -u openclaude --since "1 hour ago" | grep "${row.request_id}"`
-    : "# 此反馈无 request_id，无法 grep";
 
   return (
     <Sheet
@@ -150,12 +175,60 @@ export function FeedbackDetailSheet({
               </pre>
             </div>
 
-            <div className="mt-4">
-              <p className="mb-1.5 text-[12px] font-medium text-faint">反查命令</p>
-              <pre className="overflow-auto whitespace-pre-wrap break-all select-all rounded-lg border border-border bg-surface px-3 py-2 font-mono text-[11.5px] text-muted">
-                {grepCmd}
-              </pre>
-            </div>
+            {row.request_id && (
+              <div className="mt-4">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <p className="text-[12px] font-medium text-faint">请求归属</p>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={traceBusy}
+                    onClick={lookupTrace}
+                  >
+                    <Search size={14} />
+                    {traceBusy ? "反查中…" : "一键反查"}
+                  </Button>
+                </div>
+                {traceResult?.status === "found" && (
+                  <div className="divide-y divide-border rounded-lg border border-border bg-surface px-3 py-1">
+                    <KeyValue
+                      label="用户"
+                      value={
+                        <span>
+                          {traceResult.trace.username ? `${traceResult.trace.username} ` : ""}
+                          <CopyChip
+                            value={traceResult.trace.user_id}
+                            label={`#${traceResult.trace.user_id}`}
+                          />
+                        </span>
+                      }
+                    />
+                    <KeyValue
+                      label="会话"
+                      value={<CopyChip value={traceResult.trace.session_key} />}
+                    />
+                    <KeyValue
+                      label="Agent"
+                      value={traceResult.trace.agent_id ?? <span className="text-faint">—</span>}
+                    />
+                    <KeyValue
+                      label="模型"
+                      value={traceResult.trace.model ?? <span className="text-faint">—</span>}
+                    />
+                    <KeyValue
+                      label="时间"
+                      value={<TimeAgo value={traceResult.trace.created_at} />}
+                    />
+                  </div>
+                )}
+                {traceResult?.status === "notfound" && (
+                  <Alert tone="warning">没有找到该请求ID对应的 turn trace。</Alert>
+                )}
+                {traceResult?.status === "error" && (
+                  <Alert tone="danger">反查失败：{traceResult.message}</Alert>
+                )}
+              </div>
+            )}
           </div>
 
           {row.status === "open" && (

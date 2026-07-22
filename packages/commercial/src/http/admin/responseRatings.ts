@@ -11,13 +11,22 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { sendJson } from "../util.js";
+import { HttpError, sendJson } from "../util.js";
 import { requireAdmin } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { parseBigintIdParam, parseIsoTimestamp, parsePositiveInt } from "./_shared.js";
 import { getResponseRatingStats, listDownRatings } from "../../responseRatings.js";
 
 const DOWN_MAX_LIMIT = 200;
+type DownRatingSource = "explicit" | "implicit" | "all";
+
+export function parseDownRatingSource(value: string | null): DownRatingSource {
+  if (value === null || value === "") return "explicit";
+  if (value === "explicit" || value === "implicit" || value === "all") return value;
+  throw new HttpError(400, "VALIDATION", "invalid source", {
+    issues: [{ path: "source", message: value }],
+  });
+}
 
 export async function handleAdminResponseRatings(
   req: IncomingMessage,
@@ -34,6 +43,7 @@ export async function handleAdminResponseRatings(
   );
   const beforeId = parseBigintIdParam(url.searchParams.get("before_id"), "before_id");
   const limit = parsePositiveInt(url.searchParams.get("limit"), "limit", DOWN_MAX_LIMIT);
+  const source = parseDownRatingSource(url.searchParams.get("source"));
 
   const [stats, down] = await Promise.all([
     getResponseRatingStats(),
@@ -41,12 +51,14 @@ export async function handleAdminResponseRatings(
       before_created_at: beforeCreatedAt,
       before_id: beforeId,
       limit,
+      source,
     }),
   ]);
 
   sendJson(res, 200, {
     stats,
     down_ratings: {
+      source,
       rows: down.rows,
       next_before_created_at: down.next_before_created_at,
       next_before_id: down.next_before_id,

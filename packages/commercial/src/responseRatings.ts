@@ -222,6 +222,8 @@ export interface ListDownRatingsInput {
   before_created_at?: string;
   before_id?: string;
   limit?: number;
+  /** explicit=用户主动点踩；implicit=行为弱信号；all=两者。默认只看显式。 */
+  source?: "explicit" | "implicit" | "all";
 }
 
 export interface ListDownRatingsResult {
@@ -239,6 +241,17 @@ export async function listDownRatings(
   const limit = Math.min(Math.max(1, input.limit ?? DOWN_DEFAULT_LIMIT), DOWN_MAX_LIMIT);
   const where: string[] = ["r.rating = 'down'"];
   const params: unknown[] = [];
+
+  const source = input.source ?? "explicit";
+  if (source !== "all") {
+    params.push(IMPLICIT_RATING_TAG);
+    const implicitTag = `$${params.length}`;
+    where.push(
+      source === "implicit"
+        ? `${implicitTag} = ANY(r.tags)`
+        : `NOT (${implicitTag} = ANY(r.tags))`,
+    );
+  }
 
   if (input.before_created_at && input.before_id) {
     params.push(input.before_created_at);

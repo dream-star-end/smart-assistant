@@ -22,6 +22,7 @@ import type {
 } from "./types";
 
 const PAGE_SIZE = 50;
+type DownRatingSource = "explicit" | "implicit" | "all";
 
 function pct(rate: number | null): string {
   return rate === null ? "—" : `${(rate * 100).toFixed(1)}%`;
@@ -50,9 +51,15 @@ export function ResponseRatings() {
     id: null,
   });
   const [done, setDone] = useState(false);
+  const [source, setSource] = useState<DownRatingSource>("explicit");
+  const requestSeqRef = useRef(0);
 
   const fetchPage = useCallback(async (isFirst: boolean) => {
+    const requestSeq = isFirst ? ++requestSeqRef.current : requestSeqRef.current;
     if (isFirst) {
+      cursorRef.current = { createdAt: null, id: null };
+      setDownRows([]);
+      setDone(false);
       setLoading(true);
       setError(null);
     } else {
@@ -63,19 +70,24 @@ export function ResponseRatings() {
         limit: PAGE_SIZE,
         before_created_at: isFirst ? undefined : cursorRef.current.createdAt,
         before_id: isFirst ? undefined : cursorRef.current.id,
+        source,
       });
+      if (requestSeq !== requestSeqRef.current) return;
       if (isFirst) setStats(resp.stats);
       const d = resp.down_ratings;
       cursorRef.current = { createdAt: d.next_before_created_at, id: d.next_before_id };
       setDone(!d.next_before_created_at || !d.next_before_id);
       setDownRows((prev) => (isFirst ? d.rows : [...prev, ...d.rows]));
     } catch (e) {
+      if (requestSeq !== requestSeqRef.current) return;
       setError(e instanceof Error ? e : new Error(String(e)));
     } finally {
-      setLoading(false);
-      setLoadingMore(false);
+      if (requestSeq === requestSeqRef.current) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
     }
-  }, []);
+  }, [source]);
 
   useEffect(() => {
     void fetchPage(true);
@@ -247,7 +259,32 @@ export function ResponseRatings() {
         </SectionCard>
       </div>
 
-      <SectionCard title="最近差评" hint="rating=down，可复制 trace_id 反查全链路" bodyClassName="px-0 py-0">
+      <SectionCard
+        title="最近差评"
+        hint={
+          source === "explicit"
+            ? "用户主动点踩，可复制 trace_id 反查全链路"
+            : source === "implicit"
+              ? "中途打断、改写重发等行为弱信号"
+              : "显式点踩与行为弱信号"
+        }
+        action={
+          <select
+            aria-label="差评来源"
+            value={source}
+            onChange={(event) => {
+              requestSeqRef.current += 1;
+              setSource(event.target.value as DownRatingSource);
+            }}
+            className="h-8 rounded-md border border-border bg-surface px-2.5 text-[12px] text-fg outline-none focus:border-accent focus:ring-2 focus:ring-ring"
+          >
+            <option value="explicit">用户主动点踩</option>
+            <option value="implicit">行为弱信号</option>
+            <option value="all">全部差评</option>
+          </select>
+        }
+        bodyClassName="px-0 py-0"
+      >
         <DataTable
           columns={downColumns}
           rows={downRows}

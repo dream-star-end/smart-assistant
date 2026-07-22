@@ -1871,8 +1871,9 @@ export async function handleClearSession(
 //
 // 用户反馈入库。匿名 / 已登录均可:
 //   - **user_id 关联**:仅认 Bearer token(避免 cookie-only 提交被 CSRF 误绑作者)
-//   - 匿名 / 过期 / 伪造 → user_id = null
-// 限流 5/min/IP。description 必填(15..10000),meta 必须为 object 且 JSON ≤ 8KB。
+//   - 完全不带 Bearer → 匿名；显式提供无效/过期 Bearer → 401，让登录前端刷新后重放，
+//     避免把已登录用户的反馈静默记成匿名。
+// 限流 5/min/IP。description trim 后非空且 ≤10000，meta 必须为 object 且 JSON ≤ 8KB。
 // admin 通过 GET /api/admin/feedback + POST /api/admin/feedback/:id/ack 后台流转。
 //
 // **没有文件 fallback**(与个人版 gateway/server.ts:1325 不同):commercial 全栈
@@ -1887,13 +1888,15 @@ export async function handleSubmitFeedback(
   const cfg = deps.rateLimits?.feedback ?? DEFAULT_RATE_LIMITS.feedback;
   await enforceRateLimit(deps, cfg, ctx.clientIp);
 
-  // **仅 Bearer 关联 user_id**(Codex 审:cookie 关联会被 CSRF 误绑)。
-  // 没 token / 校验失败 → 匿名,不抛错,gateway 行为兼容。
-  const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, "") ?? "";
+  // **仅 Bearer 关联 user_id**(Codex 审:cookie 关联会被 CSRF 误绑)。缺 header 仍允许匿名；
+  // 但只要调用方显式给了 Authorization，校验失败就必须 401，供 callWithRefresh 恢复身份。
+  const authorization = req.headers.authorization;
+  const authHeader = authorization?.replace(/^Bearer\s+/, "") ?? "";
   let userId: string | null = null;
-  if (authHeader) {
+  if (authorization) {
     const claims = verifyCommercialJwtSync(authHeader, deps.jwtSecret);
-    if (claims) userId = claims.sub;
+    if (!claims) throw new HttpError(401, "UNAUTHORIZED", "invalid or expired access token");
+    userId = claims.sub;
   }
 
   const body = (await readJsonBody(req)) as Record<string, unknown> | undefined;
@@ -1903,9 +1906,9 @@ export async function handleSubmitFeedback(
 
   const description =
     typeof body.description === "string" ? body.description.trim() : "";
-  if (description.length < 15) {
-    throw new HttpError(400, "VALIDATION", "反馈描述至少需要 15 个字符", {
-      issues: [{ path: "description", message: "min 15 chars" }],
+  if (description.length === 0) {
+    throw new HttpError(400, "VALIDATION", "请填写反馈内容", {
+      issues: [{ path: "description", message: "required" }],
     });
   }
   if (description.length > 10_000) {

@@ -30,7 +30,7 @@ test('设置中心可发现反馈分区并进入真实反馈表单', () => {
     <SettingsCenter
       open
       auth={auth}
-      user={null}
+      user={{ id: 'feedback-user', displayName: '反馈用户', roles: ['user'], role: 'user' }}
       theme="light"
       onClose={() => {}}
       onSetTheme={() => {}}
@@ -44,7 +44,7 @@ test('设置中心可发现反馈分区并进入真实反馈表单', () => {
 
   fireEvent.click(feedbackTab)
   expect(screen.getByRole('form', { name: '反馈表单' })).toBeInTheDocument()
-  expect(screen.getByLabelText('反馈类型')).toBeInTheDocument()
+  expect(screen.getByRole('group', { name: '反馈类型' })).toBeInTheDocument()
   expect(screen.getByLabelText('反馈内容')).toBeInTheDocument()
   expect(screen.getByRole('button', { name: '关闭' })).toHaveClass('[@media(hover:none)]:size-11')
   expect(screen.getByRole('dialog')).toHaveClass('oc-center-dialog', 'max-h-[85vh]', 'max-h-[85dvh]')

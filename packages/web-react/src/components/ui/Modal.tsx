@@ -20,6 +20,7 @@ export function Modal({
   bodyClassName,
   hideClose,
   onEscapeKeyDown,
+  onCloseAutoFocus,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -34,6 +35,8 @@ export function Modal({
   hideClose?: boolean;
   /** Optional layered-Escape handler. Omit to keep Radix's default close behavior. */
   onEscapeKeyDown?: RD.DialogContentProps["onEscapeKeyDown"];
+  /** Controlled dialogs opened by an external action can explicitly restore that action's focus. */
+  onCloseAutoFocus?: RD.DialogContentProps["onCloseAutoFocus"];
 }) {
   // Description 仅在 title 存在时渲染;否则显式断开 Radix 默认 aria-describedby,避免悬空引用。
   const hasDescription = Boolean(title && description);
@@ -44,6 +47,7 @@ export function Modal({
         <RD.Content
           {...(hasDescription ? {} : { "aria-describedby": undefined })}
           onEscapeKeyDown={onEscapeKeyDown}
+          onCloseAutoFocus={onCloseAutoFocus}
           // max-h 用 dvh 收口移动端浏览器动态工具栏(地址栏展开时 88vh 会溢出可视视口)。
           // 桌面 dvh≡vh 故零回退;调用方仍可用自己的 max-h 覆盖(单类,tailwind-merge 后者覆盖)。
           // 注:此处**不**并列 max-h-[88vh] 双回退——className 走 cn(tailwind-merge),同属性

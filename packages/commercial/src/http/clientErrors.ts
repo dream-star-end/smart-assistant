@@ -107,12 +107,17 @@ export async function handleClientErrorReport(
     });
   });
 
-  ctx.log.warn("client_friction_report", {
+  const logFields = {
     uid: claims?.sub ?? null,
     surface: report.surface,
     stage: report.stage,
     code: report.code,
     outcome: report.outcome,
-  });
+  };
+  if (report.outcome === "failed") {
+    ctx.log.warn("client_friction_report", logFields);
+  } else {
+    ctx.log.info("client_friction_report", logFields);
+  }
   sendJson(res, 200, { ok: true });
 }
