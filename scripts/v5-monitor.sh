@@ -20,6 +20,8 @@
 # 用法:
 #   bash scripts/v5-monitor.sh              # 正常跑(timer 调用)
 #   bash scripts/v5-monitor.sh --dry-run    # 只打印,不写状态、不发站内信
+#   bash scripts/v5-monitor.sh --migrate-obsolete-pool-state
+#                                             # 官方安装器专用:仅迁移已确认废弃的 pool 误报状态
 #   V5MON_SKIP=http_v3,pool bash ...        # 静默指定检查项(逗号分隔,见文档)
 #
 # ── 自愈检测桥(bash⇄TS 契约,两侧改动必须同步)────────────────────
@@ -98,12 +100,23 @@ CLIENT_4XX_THRESHOLD="${V5MON_CLIENT_4XX_THRESHOLD:-50}"     # 同 client×route
 CLIENT_4XX_SCAN_LINES="${V5MON_CLIENT_4XX_SCAN_LINES:-8000}" # http_error 回看行数上限(bound 日志扫描)
 
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+MIGRATE_OBSOLETE_POOL_STATE=0
+case "${1:-}" in
+  "") ;;
+  --dry-run) DRY_RUN=1 ;;
+  --migrate-obsolete-pool-state) MIGRATE_OBSOLETE_POOL_STATE=1 ;;
+  *) echo "未知参数:${1:-}" >&2; exit 2 ;;
+esac
 
 NOW="$(date +%s)"
 ts() { TZ=Asia/Shanghai date '+%F %T'; }   # 告警/日志统一北京时间
 # 兜底通道:全量落 /var/log/openclaude-v5-monitor.log;--dry-run 只打印不落盘
-log() { if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] $*"; else echo "$(ts) $*" >> "$LOG_FILE"; fi; }
+log() {
+  if [[ "$MIGRATE_OBSOLETE_POOL_STATE" == 1 ]]; then return 0
+  elif [[ "$DRY_RUN" == 1 ]]; then echo "[dry-run] $*"
+  else echo "$(ts) $*" >> "$LOG_FILE"
+  fi
+}
 
 # ───────────────────────────────────────────────
 # 检查项(每项:CHECK_ST[name]=ok|bad,CHECK_DETAIL[name]=一句话)
@@ -435,6 +448,36 @@ check_client_4xx_storm
 OLD_STATE='{"checks":{}}'
 [ -s "$STATE_FILE" ] && OLD_STATE="$(cat "$STATE_FILE" 2>/dev/null || echo '{"checks":{}}')"
 echo "$OLD_STATE" | jq -e . >/dev/null 2>&1 || OLD_STATE='{"checks":{}}'   # 状态文件损坏 → 当首轮
+
+# 官方 host-monitor 安装器的一次性精确迁移。旧 pool 计数阈值曾把健康容器池记成 bad；
+# 新语义已改为身份标签 + 磁盘/内存容量。该模式只接受“历史唯一 bad=pool 且本轮所有检查
+# 都 ok”，并从同一轮不可变 CHECK_ST 快照直接改状态。它在任何 fanout/condition/inbox
+# 分支之前退出，因此不能被当作通用告警静默开关，也不会吞掉并发出现的真实异常。
+if [[ "$MIGRATE_OBSOLETE_POOL_STATE" == 1 ]]; then
+  current_bad=()
+  for name in "${CHECK_NAMES[@]}"; do
+    [[ "${CHECK_ST[$name]}" == ok ]] || current_bad+=("$name")
+  done
+  mapfile -t old_bad < <(jq -r '.checks // {} | to_entries[] | select(.value.status == "bad") | .key' <<<"$OLD_STATE" | sort)
+  if [[ "${#current_bad[@]}" != 0 || "${#old_bad[@]}" != 1 || "${old_bad[0]:-}" != pool ]]; then
+    printf '拒绝迁移 obsolete pool state:current_bad=[%s] old_bad=[%s]\n' \
+      "${current_bad[*]:-}" "${old_bad[*]:-}" >&2
+    exit 3
+  fi
+  mkdir -p "$(dirname "$STATE_FILE")"
+  migrated_state="$(jq '.checks.pool = {status:"ok", since:0, last_alert:0}' <<<"$OLD_STATE")"
+  state_tmp="$(mktemp "${STATE_FILE}.tmp.XXXXXX")"
+  if [[ -f "$STATE_FILE" ]]; then
+    chown --reference="$STATE_FILE" "$state_tmp"
+    chmod --reference="$STATE_FILE" "$state_tmp"
+  else
+    chmod 0600 "$state_tmp"
+  fi
+  printf '%s\n' "$migrated_state" | jq . > "$state_tmp"
+  mv "$state_tmp" "$STATE_FILE"
+  echo "$(ts) MIGRATION obsolete pool count-threshold state bad→ok (no alert side effects)" >> "$LOG_FILE"
+  exit 0
+fi
 
 SKIP=",${V5MON_SKIP:-},"
 NEW_STATE='{"checks":{}}'

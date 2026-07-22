@@ -5,8 +5,8 @@
 #
 # 自监(方案 §2.3-3):脚本自身崩/超时/非 0 退出时,OnFailure 拉起 alert-fail 模板,
 # 对本单元做 outbox+inbox 双写告警(见 openclaude-v5-alert-fail@.service)。
-# 注意:该 OnFailure 依赖 openclaude-v5-alert-fail@.service 已在 kl-mirror 手动安装
-# (与本单元同一部署纪律,不随 deploy-v5.sh 分发)。
+# monitor 与 alert-fail 由官方 deploy-v5.sh --install-monitor 安装成独立 host bundle，
+# 不跟随 A/B master slot，避免 active slot 切换后继续执行旧脚本。
 [Unit]
 Description=OpenClaude v5 monitor (health probes, every 2min)
 After=network.target
@@ -15,8 +15,8 @@ OnFailure=openclaude-v5-alert-fail@%n.service
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/opt/openclaude/openclaude-v5
+WorkingDirectory=/opt/openclaude/v5-monitor/current
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/usr/bin/bash scripts/v5-monitor.sh
+ExecStart=/usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh
 # 脚本自己写监控日志;stdout/stderr 进 journal 仅兜底脚本本身报错
 TimeoutStartSec=90

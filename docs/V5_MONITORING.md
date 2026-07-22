@@ -2,7 +2,7 @@
 
 > ops 极简哲学:两个 systemd timer + 两个 bash 脚本,不引外部监控系统。
 > 告警首选 v5 站内信(发给 boss),全量兜底落 `/var/log/openclaude-v5-monitor.log`。
-> 最后校准:2026-07-13。
+> 最后校准:2026-07-22。
 
 ## 组成
 
@@ -15,22 +15,29 @@
 | `/var/lib/openclaude-v5/monitor-state.json` | 探活去重状态(每项 status/since/last_alert) |
 | `/var/log/openclaude-v5-monitor.log` | 兜底日志:每轮摘要 + 全部告警正文 + 发送成败 |
 
-## 安装(kl-mirror,一次性)
+## 安装与更新(kl-mirror)
 
 ```bash
-# 前置:脚本随 deploy-v5.sh rsync 到 /opt/openclaude/openclaude-v5/scripts/;单元文件手动装
-cd /opt/openclaude/openclaude-v5
-cp deploy/v5/openclaude-v5-monitor.service deploy/v5/openclaude-v5-monitor.timer \
-   deploy/v5/openclaude-v5-daily.service   deploy/v5/openclaude-v5-daily.timer   /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now openclaude-v5-monitor.timer openclaude-v5-daily.timer
+# 只能从 canonical 走官方 lane；不要手动 cp/rsync 单元或脚本。
+cd /opt/openclaude/openclaude-v5-aurora
+scripts/deploy-v5.sh --install-monitor
 
 # 验证
-systemctl list-timers 'openclaude-v5-*'          # 两个 timer 排上了
-bash scripts/v5-monitor.sh --dry-run             # 手跑一轮,全部 serving/宿主项应全 ok
+systemctl cat openclaude-v5-monitor.service      # 必须指向 /opt/openclaude/v5-monitor/current
+systemctl list-timers 'openclaude-v5-*'          # timer 排上了
+/opt/openclaude/v5-monitor/current/v5-monitor.sh --dry-run  # serving/宿主项应全 ok
 bash scripts/v5-daily-check.sh --dry-run         # 日报正文预览(不发信)
 tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(...项全过)"
 ```
+
+高频 monitor 是独立的 host ops bundle：制品位于
+`/opt/openclaude/v5-monitor/releases/monitor-<sha>`，`current` 原子指向当前版本，
+不跟随 A/B master slot。安装器持有与生产部署相同的 mutation lease，停止并排空 timer、
+monitor oneshot 与 alert-fail 后才切换；失败会恢复原 unit、指针、状态和 timer。
+
+2026-07-22 从旧“容器数 >20”阈值迁移时，安装器只允许历史唯一 bad key 为 `pool`
+且新脚本同轮全部检查为 ok；专用迁移路径不调用 fanout/condition/inbox。任何其他历史或
+当前异常都拒绝静默迁移。不要手工调用 `--migrate-obsolete-pool-state`。
 
 依赖:`bash / curl / jq / psql / sqlite3 / docker / systemctl / df / iconv`,kl-mirror 全都有。
 
@@ -96,7 +103,9 @@ scripts/v5-monitor.sh:      DISK_MAX_PCT / MEM_MIN_AVAIL_PCT / REALERT_SECS
 scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_MIN_SAMPLES / CACHE_SAMPLE_MIN_INPUT / CACHE_MIN_RECORDS / CACHE_ABSOLUTE_LOW_BPS / CACHE_REGRESSION_LOW_BPS / CACHE_DROP_MIN_BPS
 ```
 
-注意:脚本经 `deploy-v5.sh` rsync 分发,**线上直接改会被下次部署覆盖** —— 改阈值要改在仓里(worktree → canonical → 部署),和其他 v5 代码同纪律。
+注意:高频脚本经 `deploy-v5.sh --install-monitor` 分发到独立 host bundle，**线上直接改无效且禁止**。
+改阈值要在仓里完成 worktree → review → canonical，再走官方安装 lane；普通 A/B master 发布
+不会切换 monitor 版本。日检仍按其既有独立单元纪律维护。
 
 ## 计划维护与静默
 

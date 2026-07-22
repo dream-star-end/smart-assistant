@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -20,6 +20,7 @@ const manualMutationLease = path.join(root, 'scripts/with-production-mutation-le
 const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
+const monitorHostInstaller = path.join(root, 'scripts/v5-monitor-host-install-remote.sh')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
 const caddyApply = path.join(root, 'scripts/v5-caddy-apply.sh')
 const anthropicProxy = path.join(root, 'packages/commercial/src/http/proxy/index.ts')
@@ -3496,6 +3497,8 @@ describe('v5 release safety lanes', () => {
 })
 
 interface MonitorFixtureOptions {
+  args?: string[]
+  allHealthy?: boolean
   markerMode?: number
   checkV3?: boolean
   marker?: Record<string, unknown>
@@ -3537,6 +3540,8 @@ function schema2Marker(overrides: Record<string, unknown> = {}) {
 
 async function monitorFixture(options: MonitorFixtureOptions = {}) {
   const {
+    args = ['--dry-run'],
+    allHealthy = false,
     markerMode = 0o600,
     checkV3 = false,
     marker = schema1Marker(),
@@ -3545,7 +3550,7 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     conditions = false,
     schema1Manifest = true,
     deployState = { phase: 'stable', step: 0, active: 'A' },
-    healthyHttpPorts = [],
+    healthyHttpPorts = allHealthy ? [18790] : [],
     dockerRows = [],
     dockerPsFails = false,
   } = options
@@ -3570,20 +3575,27 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
   }
   await writeFile(path.join(dir, 'setup'), '')
   spawnSync('mkdir', ['-p', bin])
+  const psqlCalls = path.join(dir, 'psql-calls')
   const scripts: Record<string, string> = {
-    systemctl: `#!/bin/sh\ncase "$2" in openclaude-v5${egressBad ? '|openclaude-v5-egress' : ''}) echo inactive; exit 3;; *) echo active;; esac\n`,
+    systemctl: allHealthy
+      ? '#!/bin/sh\necho active\n'
+      : `#!/bin/sh\ncase "$2" in openclaude-v5${egressBad ? '|openclaude-v5-egress' : ''}) echo inactive; exit 3;; *) echo active;; esac\n`,
     curl: `#!/bin/sh
 case "$*" in
   ${egressBad ? '' : '*18892*) echo \'{"ok":true,"role":"egress"}\';;'}
   ${healthyHttpPorts.map((port) => `*${port}*) echo '{"ok":true,"channel":"v5"}';;`).join('\n  ')}
+  ${allHealthy ? '*127.0.0.1/healthz*) echo \'{"ok":true,"channel":"v5"}\';;' : ''}
   *) echo refused >&2; exit 7;;
 esac
 `,
     psql: deployState === 'error'
       ? '#!/bin/sh\necho database-down >&2; exit 2\n'
       : `#!/bin/sh
+printf '%s\\n' "$*" >> '${psqlCalls}'
 case "$*" in
   *"FROM deploy_state"*) printf '%s\\n' '${deployState.phase}|${deployState.step}|${deployState.active}|${deployState.candidate ?? ''}' ;;
+  ${allHealthy ? '*product_friction_events*) printf \'0|0\\n\' ;;' : ''}
+  ${allHealthy ? '*marketplace_skill_listings*) printf \'t\\n\' ;;' : ''}
   *) exit 0 ;;
 esac
 `,
@@ -3600,11 +3612,13 @@ esac
   for (const [name, body] of Object.entries(scripts)) {
     await writeFile(path.join(bin, name), body); await chmod(path.join(bin, name), 0o755)
   }
-  const result = run(monitor, ['--dry-run'], {
+  const statePath = path.join(dir, 'state')
+  const logPath = path.join(dir, 'log')
+  const result = run(monitor, args, {
     PATH: `${bin}:${process.env.PATH}`,
     V5MON_ENV_FILE: path.join(dir, 'env'),
-    V5MON_STATE_FILE: path.join(dir, 'state'),
-    V5MON_LOG_FILE: path.join(dir, 'log'),
+    V5MON_STATE_FILE: statePath,
+    V5MON_LOG_FILE: logPath,
     V5MON_MEMINFO: path.join(dir, 'meminfo'),
     V5MON_MAINTENANCE_FILE: path.join(dir, 'marker'),
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
@@ -3612,8 +3626,252 @@ esac
     V5MON_CHECK_V3: checkV3 ? '1' : '0',
     V5MON_CONDITIONS: conditions ? '1' : '0',
   })
-  return result
+  return Object.assign(result, { statePath, logPath, psqlCalls })
 }
+
+describe('v5 monitor obsolete pool state migration', () => {
+  const healthyRow = 'openclaude/openclaude-runtime:v5-ccb-test|1|v5|1'
+
+  test('migrates only the obsolete pool bad state without notification writes', async () => {
+    const result = await monitorFixture({
+      args: ['--migrate-obsolete-pool-state'],
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      state: {
+        checks: {
+          pool: { status: 'bad', since: 123, last_alert: 456 },
+          mem: { status: 'ok', since: 0, last_alert: 0 },
+        },
+        preserved: { revision: 7 },
+      },
+    })
+    assert.equal(result.status, 0, result.stderr)
+    const migrated = JSON.parse(await readFile(result.statePath, 'utf8'))
+    assert.deepEqual(migrated.checks.pool, { status: 'ok', since: 0, last_alert: 0 })
+    assert.deepEqual(migrated.checks.mem, { status: 'ok', since: 0, last_alert: 0 })
+    assert.deepEqual(migrated.preserved, { revision: 7 })
+    const calls = await readFile(result.psqlCalls, 'utf8')
+    assert.doesNotMatch(calls, /INSERT INTO|write_alert_condition|v5-alert-fanout\.sql/)
+    assert.match(await readFile(result.logPath, 'utf8'), /MIGRATION obsolete pool count-threshold state bad→ok/)
+  })
+
+  test('rejects another historical bad key and leaves state byte-identical', async () => {
+    const original = JSON.stringify({ checks: { pool: { status: 'bad' }, image: { status: 'bad' } } })
+    const result = await monitorFixture({
+      args: ['--migrate-obsolete-pool-state'],
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      state: JSON.parse(original),
+    })
+    assert.equal(result.status, 3, result.stderr)
+    assert.equal(await readFile(result.statePath, 'utf8'), original)
+    await assert.rejects(readFile(result.logPath, 'utf8'), /ENOENT/)
+  })
+
+  test('rejects a current bad check and leaves state byte-identical', async () => {
+    const original = JSON.stringify({ checks: { pool: { status: 'bad', since: 1, last_alert: 2 } } })
+    const result = await monitorFixture({
+      args: ['--migrate-obsolete-pool-state'],
+      allHealthy: true,
+      dockerRows: ['openclaude/openclaude-runtime:v5-ccb-test||v5|1'],
+      state: JSON.parse(original),
+    })
+    assert.equal(result.status, 3, result.stderr)
+    assert.equal(await readFile(result.statePath, 'utf8'), original)
+    await assert.rejects(readFile(result.logPath, 'utf8'), /ENOENT/)
+  })
+})
+
+interface MonitorHostInstallOptions {
+  failMonitorStart?: boolean
+  failTimerStop?: boolean
+  busyMonitor?: boolean
+  invalidCurrent?: boolean
+  invalidState?: boolean
+  failUnitBackup?: boolean
+}
+
+async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}) {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-host-install-')); dirs.push(dir)
+  const stage = path.join(dir, 'stage')
+  const hostRoot = path.join(dir, 'host-monitor')
+  const systemdDir = path.join(dir, 'systemd')
+  const backupRoot = path.join(dir, 'backups')
+  const bin = path.join(dir, 'bin')
+  const stateFile = path.join(dir, 'monitor-state.json')
+  const envFile = path.join(dir, 'commercial-v5.env')
+  const monitorLog = path.join(dir, 'monitor.log')
+  const actions = path.join(dir, 'systemctl-actions')
+  const timerStopped = path.join(dir, 'timer-stopped')
+  const alertActive = path.join(dir, 'alert-active')
+  await Promise.all([mkdir(stage), mkdir(systemdDir), mkdir(backupRoot), mkdir(bin)])
+  for (const source of [
+    'scripts/v5-monitor.sh',
+    'scripts/v5-alert-fail.sh',
+    'scripts/v5-alert-fanout.sql',
+    'scripts/v5-monitor-host-install-remote.sh',
+    'deploy/v5/openclaude-v5-monitor.service',
+    'deploy/v5/openclaude-v5-monitor.timer',
+    'deploy/v5/openclaude-v5-alert-fail@.service',
+  ]) {
+    await cp(path.join(root, source), path.join(stage, path.basename(source)))
+  }
+  const checksum = spawnSync('bash', ['-c', [
+    'sha256sum v5-monitor.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
+    'openclaude-v5-monitor.service openclaude-v5-monitor.timer',
+    'openclaude-v5-alert-fail@.service',
+  ].join(' ')], { cwd: stage, encoding: 'utf8' })
+  assert.equal(checksum.status, 0, checksum.stderr)
+  await writeFile(path.join(stage, 'SHA256SUMS'), checksum.stdout)
+  const bundleSha = createHash('sha256').update(checksum.stdout).digest('hex')
+  await writeFile(envFile, 'OC_RUNTIME_IMAGE=test/runtime:v5\nDATABASE_URL=postgres://unused\n')
+  const originalState = JSON.stringify({
+    checks: {
+      pool: { status: 'bad', since: 123, last_alert: 456 },
+      mem: { status: 'ok', since: 0, last_alert: 0 },
+    },
+  })
+  await writeFile(stateFile, originalState)
+  if (options.invalidState) {
+    await rm(stateFile)
+    await symlink(path.join(dir, 'state-target'), stateFile)
+  }
+  await mkdir(path.join(hostRoot, 'releases', 'monitor-old'), { recursive: true })
+  if (options.invalidCurrent) await writeFile(path.join(hostRoot, 'current'), 'not-a-symlink')
+  else await symlink('releases/monitor-old', path.join(hostRoot, 'current'))
+  for (const unit of [
+    'openclaude-v5-monitor.service',
+    'openclaude-v5-monitor.timer',
+    'openclaude-v5-alert-fail@.service',
+  ]) await writeFile(path.join(systemdDir, unit), `old:${unit}\n`)
+
+  const commands: Record<string, string> = {
+    'systemd-analyze': '#!/bin/sh\nexit 0\n',
+    systemctl: `#!/bin/sh
+printf '%s\\n' "$*" >> '${actions}'
+cmd="$1"; shift
+if [ "\${1:-}" = --quiet ]; then shift; fi
+unit="\${1:-}"
+case "$cmd:$unit" in
+  is-active:openclaude-v5-monitor.timer) [ -f '${timerStopped}' ] && exit 3; echo active; exit 0 ;;
+  is-active:openclaude-v5-monitor.service) [ "\${BUSY_MONITOR:-0}" = 1 ] && { echo active; exit 0; }; exit 3 ;;
+  is-active:*) echo active; exit 0 ;;
+  stop:openclaude-v5-monitor.timer) [ "\${FAIL_TIMER_STOP:-0}" = 1 ] && exit 1; touch '${timerStopped}'; exit 0 ;;
+  start:openclaude-v5-monitor.timer) rm -f '${timerStopped}'; exit 0 ;;
+  start:openclaude-v5-monitor.service) [ "\${FAIL_MONITOR_START:-0}" = 1 ] && { touch '${alertActive}'; exit 1; }; exit 0 ;;
+  stop:openclaude-v5-alert-fail@openclaude-v5-monitor.service.service) rm -f '${alertActive}'; exit 0 ;;
+  list-jobs:*) [ -f '${alertActive}' ] && printf '1 openclaude-v5-alert-fail@openclaude-v5-monitor.service.service start running\\n'; exit 0 ;;
+  list-units:*) [ -f '${alertActive}' ] && printf 'openclaude-v5-alert-fail@openclaude-v5-monitor.service.service loaded active running test\\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+    curl: `#!/bin/sh
+case "$*" in *18892*) echo '{"ok":true,"role":"egress"}' ;; *) echo '{"ok":true,"channel":"v5"}' ;; esac
+`,
+    psql: `#!/bin/sh
+case "$*" in
+  *"FROM deploy_state"*) printf 'stable|0|A|\\n' ;;
+  *product_friction_events*) printf '0|0\\n' ;;
+  *marketplace_skill_listings*) printf 't\\n' ;;
+  *) printf '7|11\\n' ;;
+esac
+`,
+    df: '#!/bin/sh\necho "Use%"; echo "10%"\n',
+    docker: `#!/bin/sh
+case "$1" in images) echo test/runtime:v5 ;; ps) echo 'openclaude/openclaude-runtime:v5-ccb-test|1|v5|1' ;; esac
+`,
+  }
+  for (const [name, source] of Object.entries(commands)) {
+    await writeFile(path.join(bin, name), source)
+    await chmod(path.join(bin, name), 0o755)
+  }
+  if (options.failUnitBackup) {
+    await writeFile(path.join(bin, 'cp'), `#!/bin/sh
+case "$*" in
+  *${systemdDir}/openclaude-v5-monitor.service*${backupRoot}/.monitor-backup.*) exit 1 ;;
+  *) exec /bin/cp "$@" ;;
+esac
+`)
+    await chmod(path.join(bin, 'cp'), 0o755)
+  }
+  const result = run(monitorHostInstaller, [stage, hostRoot, bundleSha, stateFile], {
+    PATH: `${bin}:${process.env.PATH}`,
+    FAIL_MONITOR_START: options.failMonitorStart ? '1' : '0',
+    FAIL_TIMER_STOP: options.failTimerStop ? '1' : '0',
+    BUSY_MONITOR: options.busyMonitor ? '1' : '0',
+    OC_V5_SYSTEMD_DIR: systemdDir,
+    OC_V5_MONITOR_ENV: envFile,
+    OC_V5_MONITOR_LOG: monitorLog,
+    OC_V5_MONITOR_BACKUP_ROOT: backupRoot,
+    OC_V5_MONITOR_DRAIN_ATTEMPTS: '3',
+    OC_V5_MONITOR_DRAIN_SLEEP_SECONDS: '0',
+    V5MON_MEMINFO: '/proc/meminfo',
+    V5MON_MAIL_LOG: path.join(dir, 'missing-app.log'),
+    V5MON_MAINTENANCE_FILE: path.join(dir, 'missing-maintenance.json'),
+    V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
+    V5MON_CUTOVER_ROOT: path.join(dir, 'cutovers'),
+  })
+  return { result, dir, hostRoot, systemdDir, stateFile, monitorLog, actions, alertActive, bundleSha, originalState }
+}
+
+describe('v5 host monitor independent atomic installer', () => {
+  test('official mode is wired through the shared mutation locks without selecting an A/B slot', async () => {
+    const source = await readFile(deploy, 'utf8')
+    assert.match(source, /--install-monitor\) MODE="install-monitor"/)
+    assert.match(source, /install-monitor\) install_v5_host_monitor/)
+    const start = source.indexOf('install_v5_host_monitor()')
+    const end = source.indexOf('\nstrip_shared_baseline_env_keys()', start)
+    assert.ok(start >= 0 && end > start)
+    const body = source.slice(start, end)
+    assert.match(body, /v5-monitor-host-install-remote\.sh/)
+    assert.doesNotMatch(body, /slot_(src|unit|port)|active_slot/)
+    assert.match(source, /\*\) acquire_production_mutation_lease \|\| exit 3/)
+    assert.match(source, /\*\)\n\s*run_mutation_lane_supervised run_selected_mode "\$MODE"/)
+  })
+
+  test('installs a versioned bundle, migrates pool exactly, and restores the active timer', async () => {
+    const fixture = await monitorHostInstallFixture()
+    assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    assert.equal(JSON.parse(await readFile(fixture.stateFile, 'utf8')).checks.pool.status, 'ok')
+    assert.match(await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'), /\/opt\/openclaude\/v5-monitor\/current/)
+    const actions = await readFile(fixture.actions, 'utf8')
+    assert.ok(actions.indexOf('stop openclaude-v5-monitor.timer') < actions.indexOf('start openclaude-v5-monitor.service'))
+    assert.ok(actions.indexOf('start openclaude-v5-monitor.service') < actions.lastIndexOf('start openclaude-v5-monitor.timer'))
+    assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-OK host monitor/)
+  })
+
+  test('restores units, pointer, state, and timer when activation fails', async () => {
+    const fixture = await monitorHostInstallFixture({ failMonitorStart: true })
+    assert.notEqual(fixture.result.status, 0)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+    assert.equal(await readFile(fixture.stateFile, 'utf8'), fixture.originalState)
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'),
+      'old:openclaude-v5-monitor.service\n',
+    )
+    assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer/)
+    assert.doesNotMatch(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer[\s\S]*stop openclaude-v5-alert-fail@/)
+    await assert.rejects(readFile(fixture.alertActive, 'utf8'), /ENOENT/)
+    assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-ROLLBACK host monitor/)
+  })
+
+  for (const [name, options] of [
+    ['timer stop failure', { failTimerStop: true }],
+    ['drain timeout', { busyMonitor: true }],
+    ['invalid current', { invalidCurrent: true }],
+    ['invalid state', { invalidState: true }],
+    ['unit backup failure', { failUnitBackup: true }],
+  ] as const) {
+    test(`${name} restores the originally active timer`, async () => {
+      const fixture = await monitorHostInstallFixture(options)
+      assert.notEqual(fixture.result.status, 0)
+      const actions = await readFile(fixture.actions, 'utf8')
+      assert.match(actions, /start openclaude-v5-monitor.timer/)
+      assert.match(actions.trim().split('\n').at(-1) ?? '', /is-active --quiet openclaude-v5-monitor.timer/)
+    })
+  }
+})
 
 describe('v5 monitor container identity capacity semantics', () => {
   const validRow = (uid: number) => `openclaude/openclaude-runtime:v5-ccb-test|1|v5|${uid}`
