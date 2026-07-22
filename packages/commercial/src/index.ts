@@ -4521,7 +4521,9 @@ export async function registerCommercial(
     });
   }
 
-  // 审计体系整改批 — 审计/事件表统一 retention sweeper(24h tick,unref,boot 不立即跑)。
+  // 审计体系整改批 — 审计/事件表统一 retention sweeper(boot 立即异步跑一轮,随后 24h tick)。
+  // V5 经常因正常发版重启；若只从每次启动重新计满 24h，refresh_tokens 等已登记
+  // retention 的死行会永久饥饿。runOnStart 不阻塞 gateway 启动，单表失败仍由 sweeper 隔离。
   // 政策注册表=admin/auditRetention.ts(security_events 180d/agent_audit 90d/
   // compute_host_audit 90d/turn_traces 90d/rate_limit_events 30d;admin_audit 显式
   // 永久,不允许出现在删除政策)。shared 域:删的是共享审计表,仅 leader 运行。
@@ -4530,7 +4532,11 @@ export async function registerCommercial(
       name: "auditRetentionSweep",
       domain: "shared",
       start: () => {
-        const h = trackScheduler("auditRetentionSweep", "shared", startAuditRetentionSweeper());
+        const h = trackScheduler(
+          "auditRetentionSweep",
+          "shared",
+          startAuditRetentionSweeper({ runOnStart: true }),
+        );
         return { stop: () => h.stop() };
       },
     });

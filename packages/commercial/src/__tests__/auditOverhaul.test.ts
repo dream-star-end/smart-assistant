@@ -9,6 +9,7 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { redactSensitive, SENSITIVE_KEY_RE } from "../admin/auditRedact.js";
 import {
@@ -215,6 +216,15 @@ describe("writeAdminAuditBestEffort — mode 政策执行点", () => {
 });
 
 describe("auditRetention — 政策注册表与 sweeper", () => {
+  test("production registration runs the daily sweeper once on boot", () => {
+    const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+    assert.match(
+      source,
+      /startAuditRetentionSweeper\(\s*\{\s*runOnStart:\s*true\s*\}\s*\)/,
+      "frequent deploy restarts must not starve the 24h retention policies",
+    );
+  });
+
   test("默认政策:admin_audit 永不在删除政策;核心事件表全覆盖", () => {
     const tables = AUDIT_RETENTION_POLICIES.map((p) => p.table);
     assert.ok(!tables.includes("admin_audit"));
@@ -283,6 +293,41 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
     } finally {
       h.stop();
     }
+  });
+
+  test("runOnStart 与手动 tick 单飞；stop 等待在飞删除退出", async () => {
+    let releaseFirst!: () => void;
+    let markEntered!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    let calls = 0;
+    const h = startAuditRetentionSweeper({
+      runOnStart: true,
+      purgeFn: async () => {
+        calls += 1;
+        if (calls === 1) {
+          markEntered();
+          await firstGate;
+        }
+        return 1;
+      },
+      sessionGoalsPurgeFn: async () => 0,
+    });
+
+    await entered;
+    const startupTick = h.runNow();
+    const overlappingTick = h.runNow();
+    assert.equal(startupTick, overlappingTick);
+
+    let drained = false;
+    const stop = h.stop().then(() => { drained = true; });
+    await Promise.resolve();
+    assert.equal(drained, false, "stop must not release the leader while DELETE is in flight");
+    releaseFirst();
+    await Promise.all([startupTick, overlappingTick, stop]);
+    assert.equal(drained, true);
+    assert.equal(calls, 1, "overlapping ticks must share the same in-flight sweep");
+    assert.deepEqual(await h.runNow(), {});
   });
 
   test("session_goals purge 抛错时不阻断其余,onError 收到 'session_goals'(批D D3)", async () => {

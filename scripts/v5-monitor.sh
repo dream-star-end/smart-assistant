@@ -7,8 +7,9 @@
 #     2. HTTP 探活:全部 serving lane healthz("ok":true + channel=v5)、egress("role":"egress")、
 #        公网 Caddy route；v3 已退役，只有 V5MON_CHECK_V3=1 才探测
 #     3. 磁盘 / 与 /var 使用率 >85% 告警;内存 available <10% 告警
-#     4. 容器池:v5-ccb 容器数 >20 告警(异常暴涨);OC_RUNTIME_IMAGE 指向的镜像
-#        必须存在于 docker images(防 tag 漂移 → 起容器全挂)
+#     4. 容器池:运行中的 v5-ccb 必须全部带 managed/channel/uid 身份标签；容量由
+#        上面的磁盘与 MemAvailable 检查负责。OC_RUNTIME_IMAGE 指向的镜像必须存在于
+#        docker images(防 tag 漂移 → 起容器全挂)
 #   告警去重:状态文件记录每项上次状态,只在翻转(好→坏 / 坏→好=恢复)时发告警,
 #   坏状态持续时每 6 小时重复提醒一次。
 #
@@ -79,7 +80,6 @@ fi
 
 DISK_MAX_PCT=85        # / 与 /var 使用率上限(%)
 MEM_MIN_AVAIL_PCT=10   # MemAvailable/MemTotal 下限(%)
-POOL_MAX=20            # v5-ccb 容器数上限(线上稳态 ~1-5,>20 = 回收失灵/被刷)
 REALERT_SECS=21600     # 坏状态持续时的重复提醒间隔(6h)
 CURL_TIMEOUT=5
 DS_STEP_CANARY_READY="${DS_STEP_CANARY_READY:-10}"
@@ -160,13 +160,24 @@ check_mem() {
 }
 
 check_pool() {
-  local imgs n
-  if ! imgs="$(docker ps --format '{{.Image}}' 2>&1)"; then   # docker 挂了 ≠ 容器数 0
-    record pool bad "docker ps 失败:$(echo "$imgs" | head -c 120)"; return
+  local rows image managed channel uid n=0 invalid=0 detail=""
+  if ! rows="$(docker ps --format '{{.Image}}|{{.Label "com.openclaude.v3.managed"}}|{{.Label "com.openclaude.runtime_channel"}}|{{.Label "com.openclaude.v3.uid"}}' 2>&1)"; then
+    # docker 挂了 ≠ 容器数 0
+    record pool bad "docker ps 失败:$(echo "$rows" | head -c 120)"; return
   fi
-  n="$(echo "$imgs" | grep -c 'v5-ccb' || true)"
-  if [ "$n" -gt "$POOL_MAX" ]; then record pool bad "v5-ccb 容器数 ${n}(阈值 ${POOL_MAX})"
-  else record pool ok "v5-ccb 容器数 ${n}"; fi
+  while IFS='|' read -r image managed channel uid; do
+    [[ "$image" == *v5-ccb* ]] || continue
+    n=$((n+1))
+    if [[ "$managed" != 1 || "$channel" != v5 || ! "$uid" =~ ^[1-9][0-9]*$ ]]; then
+      invalid=$((invalid+1))
+      detail+=" image=${image:-<empty>} managed=${managed:-<empty>} channel=${channel:-<empty>} uid=${uid:-<empty>};"
+    fi
+  done <<<"$rows"
+  if [ "$invalid" -gt 0 ]; then
+    record pool bad "${invalid}/${n} 个 v5-ccb 容器身份标签异常:${detail}"
+  else
+    record pool ok "v5-ccb managed 容器 ${n} 个(容量由 disk/mem 检查判定)"
+  fi
 }
 
 check_image() {

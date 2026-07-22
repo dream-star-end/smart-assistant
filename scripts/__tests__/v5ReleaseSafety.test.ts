@@ -3505,6 +3505,8 @@ interface MonitorFixtureOptions {
   schema1Manifest?: boolean
   deployState?: { phase: string; step: number; active: string; candidate?: string } | 'error'
   healthyHttpPorts?: number[]
+  dockerRows?: string[]
+  dockerPsFails?: boolean
 }
 
 function schema1Marker(overrides: Record<string, unknown> = {}) {
@@ -3544,6 +3546,8 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     schema1Manifest = true,
     deployState = { phase: 'stable', step: 0, active: 'A' },
     healthyHttpPorts = [],
+    dockerRows = [],
+    dockerPsFails = false,
   } = options
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-')); dirs.push(dir)
   const bin = path.join(dir, 'bin'); await writeFile(path.join(dir, 'meminfo'), 'MemTotal: 1000 kB\nMemAvailable: 900 kB\n')
@@ -3584,7 +3588,14 @@ case "$*" in
 esac
 `,
     df: '#!/bin/sh\necho "Use%"; echo "10%"\n',
-    docker: '#!/bin/sh\ncase "$1" in images) echo test/runtime:v5;; ps) :;; esac\n',
+    docker: `#!/bin/sh
+case "$1" in
+  images) echo test/runtime:v5 ;;
+  ps) ${dockerPsFails
+    ? 'echo docker-unavailable >&2; exit 1'
+    : dockerRows.map((row) => `printf '%s\\n' '${row}'`).join('; ') || ':'} ;;
+esac
+`,
   }
   for (const [name, body] of Object.entries(scripts)) {
     await writeFile(path.join(bin, name), body); await chmod(path.join(bin, name), 0o755)
@@ -3603,6 +3614,33 @@ esac
   })
   return result
 }
+
+describe('v5 monitor container identity capacity semantics', () => {
+  const validRow = (uid: number) => `openclaude/openclaude-runtime:v5-ccb-test|1|v5|${uid}`
+
+  test('21 correctly managed containers are healthy; capacity has no arbitrary count ceiling', async () => {
+    const result = await monitorFixture({
+      dockerRows: Array.from({ length: 21 }, (_, index) => validRow(index + 1)),
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /pool\s+ok\s+v5-ccb managed 容器 21 个/)
+    assert.doesNotMatch(result.stdout, /EVENT ❌ \*\*pool\*\*/)
+  })
+
+  test('a v5-ccb container with missing identity labels is unhealthy', async () => {
+    const result = await monitorFixture({
+      dockerRows: [validRow(1), 'openclaude/openclaude-runtime:v5-ccb-test||v5|247'],
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /EVENT ❌ \*\*pool\*\* 1\/2 个 v5-ccb 容器身份标签异常/)
+  })
+
+  test('docker ps failure remains a pool failure', async () => {
+    const result = await monitorFixture({ dockerPsFails: true })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /EVENT ❌ \*\*pool\*\* docker ps 失败/)
+  })
+})
 
 describe('v5 monitor planned-maintenance scope', () => {
   test('monitor validates and consumes one marker snapshot under the shared lock', async () => {
