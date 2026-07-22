@@ -1,11 +1,12 @@
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations, MigrationIntegrityError } from "../db/migrate.js";
+import { PricingCache } from "../billing/pricing.js";
 
 /**
  * T-02 迁移系统集成测试。
@@ -160,6 +161,117 @@ describe("migrate.runMigrations", () => {
       "SELECT COUNT(*)::text AS cnt FROM schema_migrations",
     );
     assert.equal(cnt.rows[0].cnt, String(before), "schema_migrations count unchanged");
+  });
+
+  test("0179 seeds admin-only Ark K3 with the official K3 pricing", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await runMigrations();
+
+    const catalog = await query<{
+      engine: string;
+      provider_id: string;
+      upstream_model_id: string;
+      context_window: number;
+      capability_profile: Record<string, unknown>;
+      capability_schema_version: number;
+      state: string;
+    }>(
+      `SELECT engine, provider_id, upstream_model_id, context_window,
+              capability_profile, capability_schema_version, state
+         FROM model_catalog
+        WHERE model_id = 'kimi-k3-ark'`,
+    );
+    assert.equal(catalog.rows.length, 1);
+    assert.equal(catalog.rows[0].engine, "ccb");
+    assert.equal(catalog.rows[0].provider_id, "ark-k3");
+    assert.equal(catalog.rows[0].upstream_model_id, "kimi-k3");
+    assert.equal(catalog.rows[0].context_window, 1_048_576);
+    assert.equal(catalog.rows[0].capability_schema_version, 1);
+    assert.equal(catalog.rows[0].state, "active");
+    assert.deepEqual(catalog.rows[0].capability_profile, {
+      supports_vision: true,
+      reasoning: { supported: [], codex_model_default: null },
+      ccb: { capability_zero: true, supports_thinking: true },
+    });
+
+    const pricing = await query<{
+      model_id: string;
+      display_name: string;
+      input_per_mtok: string;
+      output_per_mtok: string;
+      cache_read_per_mtok: string;
+      cache_write_per_mtok: string;
+      multiplier: string;
+      enabled: boolean;
+      sort_order: number;
+      visibility: string;
+    }>(
+      `SELECT model_id, display_name,
+              input_per_mtok::text, output_per_mtok::text,
+              cache_read_per_mtok::text, cache_write_per_mtok::text,
+              multiplier::text, enabled, sort_order, visibility
+         FROM model_pricing
+        WHERE model_id IN ('kimi-k3', 'kimi-k3-ark')
+        ORDER BY model_id`,
+    );
+    assert.equal(pricing.rows.length, 2);
+    const source = pricing.rows.find((row) => row.model_id === "kimi-k3")!;
+    const target = pricing.rows.find((row) => row.model_id === "kimi-k3-ark")!;
+    assert.equal(target.display_name, "Kimi K3（火山 Agent Plan）");
+    for (const field of [
+      "input_per_mtok",
+      "output_per_mtok",
+      "cache_read_per_mtok",
+      "cache_write_per_mtok",
+      "multiplier",
+      "enabled",
+    ] as const) {
+      assert.equal(target[field], source[field], field);
+    }
+    assert.equal(target.sort_order, 89);
+    assert.equal(target.visibility, "admin");
+
+    const cache = new PricingCache();
+    await cache.load();
+    try {
+      assert.ok(
+        cache.listForUser({ role: "admin", grantedModelIds: new Set() })
+          .some((model) => model.id === "kimi-k3-ark"),
+      );
+      assert.ok(
+        !cache.listForUser({ role: "user", grantedModelIds: new Set() })
+          .some((model) => model.id === "kimi-k3-ark"),
+      );
+    } finally {
+      await cache.shutdown();
+    }
+
+    const live = await query<{ lock_version: number }>(
+      `SELECT lock_version
+         FROM model_catalog
+        WHERE model_id = 'kimi-k3-ark' AND state = 'active'`,
+    );
+    await query(
+      `SELECT fn_model_switch_version(
+         'kimi-k3-ark', 'ccb', 'moonshot', 'kimi-k3', 1048576,
+         '{
+           "supports_vision": true,
+           "reasoning": { "supported": [], "codex_model_default": null },
+           "ccb": { "capability_zero": true, "supports_thinking": true }
+         }'::jsonb,
+         1, NULL, $1
+       )`,
+      [live.rows[0].lock_version],
+    );
+    const migrationSql = await readFile(
+      new URL("../db/migrations/0179_ark_plan_kimi_k3.sql", import.meta.url),
+      "utf8",
+    );
+    await assert.rejects(
+      query(migrationSql),
+      /0179 kimi-k3-ark catalog verification failed/,
+      "reapplying 0179 must fail closed when an existing live catalog row has drifted",
+    );
   });
 
   test("bad migration rolls back that migration's DDL (0001 stays, 0002 doesn't)", async (t) => {
