@@ -20,6 +20,7 @@
 //   T10 真 Virtuoso 归档前插足够多行后仍锁定点击前的真实可见消息;
 //   T11 direct-timeline 思考实时展开、完成自动折叠，受信点击后完整正文恢复。
 //   T12 单 Agent 卡和团队队员卡不显示冗余原始记录入口，实际过程仍可见。
+//   T13 工具卡头部满足 44px、键盘可展开/折叠，市场长列表可继续加载且移动宽度不溢出。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -66,7 +67,8 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .chat-scroll-area{overflow-anchor:none}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+  #tool-card-polish-root .min-h-11{min-height:2.75rem}
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -416,8 +418,32 @@ await check("T12 Agent 卡不显示冗余原始记录入口且真实过程可见
   }
 
   const tool = page.locator("#timeline-agent-root");
-  if (await tool.getByRole("button", { name: "查看原始完整记录" }).count() !== 1) {
-    throw new Error("通用 ToolCard 的原始完整记录入口被误删");
+  if (await tool.getByRole("button", { name: "查看原始完整记录" }).count() !== 0) {
+    throw new Error("通用 ToolCard 仍显示查看原始完整记录");
+  }
+});
+
+await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
+  const root = page.locator("#tool-card-polish-root");
+  const header = root.getByRole("button", { name: /搜索 AI 市场.*browser.*完成/ });
+  await header.waitFor({ state: "visible", timeout: 3000 });
+  const box = await header.boundingBox();
+  if (!box || box.height < 44) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
+
+  await header.focus();
+  await header.press("Enter");
+  await root.getByText("浏览器能力 1").waitFor({ state: "visible", timeout: 3000 });
+  if (await root.getByText("浏览器能力 9").count() !== 0) throw new Error("市场列表未按需渐进展示");
+  await root.getByRole("button", { name: /查看更多/ }).click();
+  await root.getByText("浏览器能力 10").waitFor({ state: "visible", timeout: 3000 });
+
+  await header.focus();
+  await header.press("Space");
+  await root.getByText("浏览器能力 1").waitFor({ state: "hidden", timeout: 3000 });
+  const width = await root.evaluate((node) => ({ client: node.clientWidth, scroll: node.scrollWidth }));
+  if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
+  if (await root.getByText("查看原始完整记录").count() !== 0) {
+    throw new Error("美化后的工具卡仍出现原始完整记录文案");
   }
 });
 

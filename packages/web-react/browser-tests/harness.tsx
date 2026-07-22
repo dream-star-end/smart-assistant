@@ -9,6 +9,7 @@ import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "reac
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
+import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
 import {
   captureVisibleVirtualRowAnchor,
@@ -217,6 +218,27 @@ const teamAgentCard: ChatMessage = {
 createRoot(document.getElementById("team-agent-card-root")!).render(
   <StrictMode>
     <TeamPanel members={[teamAgentCard]} sig="team-agent-card-probe" />
+  </StrictMode>,
+);
+
+const marketItems = Array.from({ length: 10 }, (_, index) => ({
+  slug: `browser-skill-${index + 1}`,
+  name: `浏览器能力 ${index + 1}`,
+  kind: "skill",
+  description: `适合场景 ${index + 1}`,
+}));
+createRoot(document.getElementById("tool-card-polish-root")!).render(
+  <StrictMode>
+    <div style={{ width: 360, maxWidth: "100%" }}>
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: "oc-market search browser" },
+          output: JSON.stringify(marketItems),
+          _completed: true,
+        }}
+      />
+    </div>
   </StrictMode>,
 );
 

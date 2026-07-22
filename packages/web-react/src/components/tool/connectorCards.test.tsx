@@ -189,7 +189,8 @@ describe("connectorToolCard 分派", () => {
       output: '{"user":{"id":"1"}}',
     });
     render(<div>{readCard}</div>);
-    expect(screen.getByText("市场插件")).toBeInTheDocument();
+    expect(screen.getByText("user")).toBeInTheDocument();
+    expect(screen.getByText("1 个字段")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "确认执行" })).not.toBeInTheDocument();
   });
 });

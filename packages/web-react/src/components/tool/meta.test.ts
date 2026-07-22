@@ -173,25 +173,36 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(detectOcCli("ls -la")).toBeNull();
     expect(detectOcCli(undefined)).toBeNull();
   });
-  test("resolveToolMeta(Bash, oc-web) → 网页/文档提取 + Globe", () => {
+  test("resolveToolMeta(Bash, oc-web) → 动作化网页提取标签", () => {
     const m = resolveToolMeta("Bash", { command: 'oc-web extract "https://x.com"' });
-    expect(m.label).toBe("网页/文档提取");
+    expect(m.label).toBe("提取网页内容");
     expect(m.tone).toBe("info");
   });
   test("resolveToolMeta(Bash, 普通命令) → 终端(回退)", () => {
     expect(resolveToolMeta("Bash", { command: "ls -la" }).label).toBe("终端");
     expect(resolveToolMeta("Bash").label).toBe("终端");
   });
-  test("toolSummary(Bash, oc-*) 留空:语义在 header 标签,不外露原始命令/路径/参数", () => {
-    // boss 硬需求:卡片内不显示原始命令执行内容 → header 摘要一律置空。
+  test("toolSummary(Bash, oc-*) 只展示安全语义摘要，不外露原始命令", () => {
     expect(
       toolSummary("Bash", {
         command: 'oc-web extract "https://www.woshipm.com/x" --max-chars 8000 2>&1 | head -150',
       }),
-    ).toBe("");
+    ).toBe("woshipm.com");
     expect(toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" })).toBe("");
     expect(toolSummary("Bash", { command: "oc-vision understand /home/agent/img.png --prompt 'x'" })).toBe("");
     expect(toolSummary("Bash", { command: "mmx image generate 'a cat' -o /out.png" })).toBe("");
+  });
+  test("oc-browser / oc-market 根据动作提供友好标签和摘要", () => {
+    expect(resolveToolMeta("Bash", { command: "oc-browser navigate --url https://example.com/a" }).label).toBe(
+      "打开网页",
+    );
+    expect(toolSummary("Bash", { command: "oc-browser navigate --url https://example.com/a" })).toBe(
+      "example.com",
+    );
+    expect(resolveToolMeta("Bash", { command: "oc-browser click --element '登录按钮'" }).label).toBe("点击页面");
+    expect(toolSummary("Bash", { command: "oc-browser click --element '登录按钮'" })).toBe("登录按钮");
+    expect(resolveToolMeta("Bash", { command: "oc-market search image" }).label).toBe("搜索 AI 市场");
+    expect(toolSummary("Bash", { command: "oc-market search image" })).toBe("image");
   });
 });
 

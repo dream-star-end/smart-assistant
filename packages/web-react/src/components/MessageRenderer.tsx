@@ -44,13 +44,11 @@ import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
-import { ExactToolRecordDisclosure } from "./ToolCard";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
 import { loadedArchivedMetrics } from "./chat/archivePaging";
 import { MessageBoundary } from "./MessageBoundary";
-import { asStr, resolveToolInput, stripShellWrapperForDisplay } from "./tool/format";
-import { researchToolCard } from "./tool/researchCards";
+import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, Avatar, Spinner } from "./ui";
 
 type RendererProps = {
@@ -176,20 +174,6 @@ export const MessageRenderer = memo(
         if (message.toolName === "TodoWrite") {
           if (inActiveTurn && sending) return null;
           return <ToolCardSlot message={message} />;
-        }
-        // oc-* 研究工具:直接渲染干净的专属卡片,**去掉"终端 + 命令"外壳**(boss 反馈套壳没必要)。
-        // 命令出错时 researchToolCard 返回 null → 回落 ToolCardSlot 终端卡,保证报错可见。
-        const ocCmd = stripShellWrapperForDisplay(asStr(resolveToolInput(message)?.command));
-        if (ocCmd) {
-          const ocCard = researchToolCard(ocCmd, message);
-          if (ocCard) {
-            return (
-              <div className="px-0.5 py-1">
-                {ocCard}
-                <ExactToolRecordDisclosure message={message} />
-              </div>
-            );
-          }
         }
         return <ToolCardSlot message={message} />;
       }
