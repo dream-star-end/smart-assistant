@@ -4094,6 +4094,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     const sessionId = "s-dd-large-user";
     const clientMessageId = "cm-dd-large-user";
     const text = `LARGE-USER-HEAD\n${"超长用户真实正文😀".repeat(300_000)}\nLARGE-USER-TAIL`;
+    const exactModelText = "MODEL-VISIBLE\u0000EXACT-PROMPT";
     assert.ok(Buffer.byteLength(text, "utf8") > 4 * 1024 * 1024);
     await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
     const admitted = await backend.admitUserTurn(admitInput({
@@ -4104,7 +4105,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         id: clientMessageId,
         role: "user",
         text,
-        _modelText: "MODEL-VISIBLE-EXACT-PROMPT",
+        _modelText: exactModelText,
         ts: 1_783_950_000_123,
         _media: [{ kind: "image", url: "/api/media/guide.png" }],
         _retryMedia: [
@@ -4175,7 +4176,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(decoded.id, clientMessageId);
     assert.equal(decoded.role, "user");
     assert.equal(decoded.text, text);
-    assert.equal(decoded._modelText, "MODEL-VISIBLE-EXACT-PROMPT");
+    assert.equal(decoded._modelText, exactModelText);
     assert.equal(decoded._source, "server");
     assert.deepEqual(decoded._retryMedia, [
       { kind: "image", url: "/api/media/source.png", hidden: true },
@@ -4203,8 +4204,25 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     });
     assert.equal(modelContext?.length, 1);
     assert.equal(modelContext?.[0]?.role, "user");
-    assert.equal(modelContext?.[0]?.text, "MODEL-VISIBLE-EXACT-PROMPT");
+    assert.equal(modelContext?.[0]?.text, "MODEL-VISIBLE\\u0000EXACT-PROMPT");
+    assert.equal(modelContext?.[0]?.text?.includes("\u0000"), false);
     assert.equal((modelContext?.[0] as MessageLike)._userPayloadDeferred, undefined);
+
+    const finiteModelContext = await backend.getEngineContextMessages(sessionId, CUSER, {
+      contextWindow: 2_000,
+    });
+    assert.equal(finiteModelContext?.length, 1);
+    assert.equal(finiteModelContext?.[0]?.text, "MODEL-VISIBLE\\u0000EXACT-PROMPT");
+    assert.equal(finiteModelContext?.[0]?.text?.includes("\u0000"), false);
+    const sidecar = (
+      await pool.query<{ text_payload: string }>(
+        `SELECT text_payload FROM client_session_user_payloads
+          WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+        [sessionId, CUSER, clientMessageId],
+      )
+    ).rows[0]!.text_payload;
+    assert.equal(sidecar, "MODEL-VISIBLE\\u0000EXACT-PROMPT");
+    assert.equal(sidecar.includes("\u0000"), false);
   });
 
   maybe("tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据", async () => {
@@ -4562,6 +4580,85 @@ function browserVisibleTimeline(messages: MessageLike[]): MessageLike[] {
 }
 
 describe("pgSessionsBackend direct turn timeline", () => {
+  maybe("actual NUL finalizes and backfills PostgreSQL model sidecars without changing exact tape bytes", async () => {
+    const sessionId = "s-direct-nul-model-sidecar";
+    const userId = "u-direct-nul-model-sidecar";
+    const exactToolOutput = "TOOL-BEFORE\u0000TOOL-AFTER";
+    const exactAnswer = "ANSWER-BEFORE\u0000ANSWER-AFTER";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "0".repeat(64), {
+      text: exactAnswer,
+      tools: [{
+        blockId: "nul-sidecar-tool",
+        toolName: "Bash",
+        inputJson: { command: "cat binary-output" },
+        output: exactToolOutput,
+        completed: true,
+      }],
+    });
+    await stageAndFinalize(userId, tape);
+    assert.equal(
+      (await backend.finalizeLosslessTurnTape(userId, tape.finalize)).applied,
+      "idempotent",
+    );
+
+    const assertSafeSidecars = async (): Promise<void> => {
+      const rows = (
+        await pool.query<{ role: string; semantic_text: string }>(
+          `SELECT role,semantic_text
+             FROM client_session_turn_tape_model_records
+            WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+            ORDER BY physical_ordinal,logical_ordinal`,
+          [sessionId, userId, tape.finalize.tapeId],
+        )
+      ).rows;
+      assert.deepEqual(rows.map((row) => row.role), ["tool", "assistant"]);
+      assert.equal(rows.every((row) => !row.semantic_text.includes("\u0000")), true);
+      assert.equal(rows.every((row) => row.semantic_text.includes("\\u0000")), true);
+    };
+    await assertSafeSidecars();
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    const exactMessages = timeline?.messages as MessageLike[];
+    assert.equal(exactMessages.find((message) => message.role === "tool")?.output, exactToolOutput);
+    assert.equal(exactMessages.find((message) => message.role === "assistant")?.text, exactAnswer);
+
+    const finite = await backend.getEngineContextMessages(sessionId, userId, {
+      contextWindow: 2_000,
+    });
+    assert.deepEqual(finite?.map((message) => message.role), ["tool", "assistant"]);
+    assert.equal(finite?.every((message) =>
+      typeof message.text === "string" && !message.text.includes("\u0000")), true);
+    assert.equal(finite?.every((message) =>
+      typeof message.text === "string" && message.text.includes("\\u0000")), true);
+
+    await pool.query(
+      `DELETE FROM client_session_turn_tape_model_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    await pool.query(
+      `UPDATE client_session_turn_tape_records
+          SET model_sidecar_complete=FALSE
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    await pool.query(
+      `UPDATE client_session_turn_tapes SET model_record_count=-1
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [sessionId, userId, tape.finalize.tapeId],
+    );
+    const rebuilt = await backend.getEngineContextMessages(sessionId, userId, {
+      contextWindow: 2_000,
+    });
+    assert.deepEqual(rebuilt?.map((message) => message.role), ["tool", "assistant"]);
+    assert.equal(rebuilt?.every((message) =>
+      typeof message.text === "string" && !message.text.includes("\u0000")), true);
+    assert.equal(rebuilt?.every((message) =>
+      typeof message.text === "string" && message.text.includes("\\u0000")), true);
+    await assertSafeSidecars();
+  });
+
   maybe("engine context hydrates real tape-backed tool, plan, goal and delegate facts", async () => {
     const sessionId = "s-direct-engine-semantic";
     const userId = "u-direct-engine-semantic";

@@ -466,6 +466,13 @@ interface SessionWriteRow {
 
 const USER_MESSAGE_INLINE_BYTES = 256 * 1024;
 
+/** PostgreSQL TEXT cannot store U+0000. Exact user-visible bytes remain in the
+ * authoritative BYTEA payloads; only model-continuity sidecars use this
+ * reversible visible escape. */
+function pgModelSidecarText(text: string): string {
+  return text.replaceAll("\u0000", "\\u0000");
+}
+
 function deferredUserReplayMetadata(message: MessageLike): MessageLike {
   const rawRouting = message._routing && typeof message._routing === "object" &&
     !Array.isArray(message._routing)
@@ -516,7 +523,8 @@ async function deferOversizedUserMessage(
   const exact = { ...message, _source: "server" };
   const payload = Buffer.from(JSON.stringify(exact), "utf8");
   if (payload.length <= USER_MESSAGE_INLINE_BYTES) return message;
-  const modelText = typeof message._modelText === "string" ? message._modelText : message.text;
+  const exactModelText = typeof message._modelText === "string" ? message._modelText : message.text;
+  const modelText = pgModelSidecarText(exactModelText);
   const contentSha256 = sha256Bytes(payload);
   const inserted = await client.query(
     `INSERT INTO client_session_user_payloads
@@ -1954,7 +1962,7 @@ function modelContinuityRecords(records: MessageLike[]): UserVisiblePhysicalPayl
   for (let logicalOrdinal = 0; logicalOrdinal < records.length; logicalOrdinal++) {
     const record = records[logicalOrdinal]!;
     let role: string | null = modelHistorySemanticRole(record);
-    let semanticText = modelHistorySemanticText(record).replace(/\u0000/g, "\\u0000");
+    let semanticText = modelHistorySemanticText(record);
     if (!role && record.role === "runtime-event") {
       const event = record._runtimeEvent;
       if (event && typeof event === "object" && !Array.isArray(event)) {
@@ -1975,6 +1983,7 @@ function modelContinuityRecords(records: MessageLike[]): UserVisiblePhysicalPayl
         }
       }
     }
+    semanticText = pgModelSidecarText(semanticText);
     if (!role || semanticText.trim().length === 0) continue;
     out.push({
       logicalOrdinal,
