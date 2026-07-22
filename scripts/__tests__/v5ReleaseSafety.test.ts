@@ -4866,9 +4866,21 @@ wait $!
     assert.match(runner, /OC_E2E_EMAIL="v5-evals@claudeai\.chat"/)
     assert.match(runner, /OC_E2E_REQUIRE_DIRECT_TIMELINE=1/)
     assert.match(runner, /export CI=1/)
+    assert.match(runner, /export NO_PROXY="127\.0\.0\.1,localhost\$\{NO_PROXY:\+,\$NO_PROXY\}"/)
+    assert.match(runner, /export no_proxy="127\.0\.0\.1,localhost\$\{no_proxy:\+,\$no_proxy\}"/)
     assert.match(runner, /if\(fail\|\|skip\|\|flaky\)/)
     assert.match(runner, /\[ -z "\$\{OC_E2E_MODEL:-\}" \] \|\| die "OC_E2E_MODEL 已废止；模型矩阵不可覆盖"/)
     assert.doesNotMatch(runner, /OC_E2E_MODEL:-[a-z0-9]/)
+    const loopbackBypass = runner.indexOf('export NO_PROXY=')
+    const lowercaseLoopbackBypass = runner.indexOf('export no_proxy=')
+    const readinessProbe = runner.indexOf('for i in $(seq 1 40);')
+    const playwrightStart = runner.indexOf('./node_modules/.bin/playwright test')
+    assert.ok(
+      loopbackBypass >= 0 && lowercaseLoopbackBypass >= 0 &&
+        readinessProbe > loopbackBypass && readinessProbe > lowercaseLoopbackBypass &&
+        playwrightStart > loopbackBypass && playwrightStart > lowercaseLoopbackBypass,
+      'loopback proxy bypass must be active before candidate readiness and Playwright matrix traffic',
+    )
 
     const canaryStart = source.indexOf('\ncanary() {')
     const canaryEnd = source.indexOf('\n# 内部账号 allowlist', canaryStart)
