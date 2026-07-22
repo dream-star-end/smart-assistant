@@ -1840,7 +1840,7 @@ function modelContinuityRecords(records: MessageLike[]): UserVisiblePhysicalPayl
   for (let logicalOrdinal = 0; logicalOrdinal < records.length; logicalOrdinal++) {
     const record = records[logicalOrdinal]!;
     let role: string | null = modelHistorySemanticRole(record);
-    let semanticText = modelHistorySemanticText(record);
+    let semanticText = modelHistorySemanticText(record).replace(/\u0000/g, "\\u0000");
     if (!role && record.role === "runtime-event") {
       const event = record._runtimeEvent;
       if (event && typeof event === "object" && !Array.isArray(event)) {
