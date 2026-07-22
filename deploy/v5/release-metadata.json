@@ -63,7 +63,8 @@
     "0181_turn_tape_recovery_links",
     "0182_provider_quota_blocks",
     "0183_luna_verification_runs",
-    "0184_emergency_containment_debt"
+    "0184_emergency_containment_debt",
+    "0185_authority_turn_dispatches"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
