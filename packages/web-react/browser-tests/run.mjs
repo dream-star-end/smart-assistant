@@ -19,6 +19,7 @@
 //   T9 第二次明确点击继续下一不透明 cursor，已加载真实记录仍常驻;
 //   T10 真 Virtuoso 归档前插足够多行后仍锁定点击前的真实可见消息;
 //   T11 direct-timeline 思考实时展开、完成自动折叠，受信点击后完整正文恢复。
+//   T12 单 Agent 卡和团队队员卡不显示冗余原始记录入口，实际过程仍可见。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -65,7 +66,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .chat-scroll-area{overflow-anchor:none}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -396,6 +397,28 @@ await check("T11 direct-timeline 思考完成后自动折叠且可完整展开",
   await completed.waitFor({ state: "visible", timeout: 3000 });
   await completed.click();
   await body.waitFor({ state: "visible", timeout: 3000 });
+});
+
+await check("T12 Agent 卡不显示冗余原始记录入口且真实过程可见", async () => {
+  const single = page.locator("#single-agent-card-root");
+  await single.getByText("SINGLE_AGENT_CARD").click();
+  await single.getByText("SINGLE_AGENT_PROCESS_MARKER").waitFor({ state: "visible", timeout: 3000 });
+  if (await single.getByRole("button", { name: "查看原始完整记录" }).count() !== 0) {
+    throw new Error("单 Agent 卡仍显示查看原始完整记录");
+  }
+
+  const team = page.locator("#team-agent-card-root");
+  await team.getByText("团队协作 · 1 个智能体").click();
+  await team.getByText("TEAM_AGENT_CARD").click();
+  await team.getByText("TEAM_AGENT_PROCESS_MARKER").waitFor({ state: "visible", timeout: 3000 });
+  if (await team.getByRole("button", { name: "查看原始完整记录" }).count() !== 0) {
+    throw new Error("团队队员卡仍显示查看原始完整记录");
+  }
+
+  const tool = page.locator("#timeline-agent-root");
+  if (await tool.getByRole("button", { name: "查看原始完整记录" }).count() !== 1) {
+    throw new Error("通用 ToolCard 的原始完整记录入口被误删");
+  }
 });
 
 if (pageErrors.length > 0) {

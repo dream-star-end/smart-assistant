@@ -122,9 +122,7 @@ describe("TeamPanel 团队协作面板", () => {
     expect(screen.getByText("team-child-204")).toBeInTheDocument();
   });
 
-  test("队员卡可逐段查看真实工具记录直到最后一个字符", () => {
-    const marker = "EXACT_TEAM_RECORD_FINAL_MARKER";
-    const output = `${"x".repeat(270_000)}${marker}`;
+  test("队员卡不显示冗余原始记录入口，真实过程仍可查看", () => {
     render(
       <TeamPanel
         members={[
@@ -132,23 +130,17 @@ describe("TeamPanel 团队协作面板", () => {
             _delegateAgentId: "长任务队员",
             _delegateGoal: "保留完整记录",
             _completed: true,
-            inputJson: { goal: "保留完整记录" },
-            output,
+            childBlocks: [{ kind: "text", text: "真实队员过程" }],
           }),
         ]}
-        sig="exact-record"
+        sig="no-redundant-raw-record"
       />,
     );
 
     fireEvent.click(screen.getByText("团队协作 · 1 个智能体"));
     fireEvent.click(screen.getByText("长任务队员"));
-    fireEvent.click(screen.getByRole("button", { name: "查看原始完整记录" }));
-    expect(document.body.textContent).not.toContain(marker);
-    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
-    expect(document.body.textContent).not.toContain(marker);
-    fireEvent.click(screen.getByRole("button", { name: /继续显示原始内容/ }));
-    expect(document.body.textContent).toContain(marker);
-    expect(screen.queryByRole("button", { name: /继续显示原始内容/ })).not.toBeInTheDocument();
+    expect(screen.getByText("真实队员过程")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始完整记录" })).not.toBeInTheDocument();
   });
 
   test("服务端完整 transcript 的结果、计划与终态事件均不被丢弃", () => {

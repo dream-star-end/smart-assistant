@@ -19,7 +19,6 @@ import { memo, useEffect, useState } from "react";
 import { type ChatMessage, isServerAuthoredRow } from "../../lib/chat/model";
 import { agentTerminalStatus, childSignature, reviewVerdictBadge } from "../../lib/chat/render";
 import { cn, groupDigits } from "../../lib/utils";
-import { ExactToolRecordDisclosure } from "../ToolCard";
 import { Badge, Spinner } from "../ui";
 import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { agentDisplayName } from "./agentNames";
@@ -113,7 +112,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
               <Spinner size={11} /> 启动中…
             </div>
           )}
-          {/* 无 childBlocks 的终态行仍展示其结果摘要；原始工具记录在下方按需展开。 */}
+          {/* 无 childBlocks 的终态行仍展示其结果摘要。 */}
           {terminalNoChildren && (msg._resultPreview || isServerRow) && (
             <div className="space-y-1.5">
               {msg._resultPreview && (
@@ -136,7 +135,6 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
               继续加载过程（还有 {children.length - visibleChildren} 条）
             </button>
           )}
-          <ExactToolRecordDisclosure message={msg} />
         </div>
       )}
 

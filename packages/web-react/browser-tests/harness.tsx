@@ -9,6 +9,7 @@ import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "reac
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
+import { TeamPanel } from "../src/components/chat/TeamPanel";
 import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
@@ -176,6 +177,46 @@ createRoot(document.getElementById("timeline-agent-root")!).render(
       }}
       onRespondPermission={() => {}}
     />
+  </StrictMode>,
+);
+
+const singleAgentCard: ChatMessage = {
+  id: "single-agent-card-probe",
+  role: "agent-group",
+  text: "SINGLE_AGENT_CARD",
+  ts: 3,
+  _completed: true,
+  childBlocks: [{ kind: "text", text: "SINGLE_AGENT_PROCESS_MARKER" }],
+};
+
+createRoot(document.getElementById("single-agent-card-root")!).render(
+  <StrictMode>
+    <MessageRenderer
+      message={singleAgentCard}
+      sig="single-agent-card-probe"
+      isLast
+      sending={false}
+      inActiveTurn
+      cb={{}}
+      onRespondPermission={() => {}}
+    />
+  </StrictMode>,
+);
+
+const teamAgentCard: ChatMessage = {
+  id: "team-agent-card-probe",
+  role: "agent-group",
+  text: "TEAM_AGENT_GOAL",
+  ts: 4,
+  _delegate: true,
+  _delegateAgentId: "TEAM_AGENT_CARD",
+  _completed: true,
+  childBlocks: [{ kind: "text", text: "TEAM_AGENT_PROCESS_MARKER" }],
+};
+
+createRoot(document.getElementById("team-agent-card-root")!).render(
+  <StrictMode>
+    <TeamPanel members={[teamAgentCard]} sig="team-agent-card-probe" />
   </StrictMode>,
 );
 
