@@ -413,6 +413,38 @@ describe("materializeLosslessTurn", () => {
     }
   });
 
+  test("a 50k-event turn keeps every logical event while bounding physical records", () => {
+    const runtimeEvents = Array.from({ length: 50_000 }, (_, ordinal) => ({
+      ordinal,
+      observedAt: 1_783_944_020_000 + ordinal,
+      source: "ccb" as const,
+      payload: { type: "progress", ordinal, exact: `payload-${ordinal}` },
+    }));
+    const turn = materializeLosslessTurn({
+      sessionId: "web-lossless-50k",
+      agentId: "main",
+      turnIndex: 103,
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "the exact visible answer",
+      createdAt: 1_783_944_020_000,
+      runtimeEvents,
+    }, { runtimeBatching: true });
+
+    assert.equal(turn.logicalRecordCount, 50_001);
+    assert.ok(turn.records.length <= Math.ceil(runtimeEvents.length / 128) + 1);
+    assert.equal(
+      turn.records
+        .map((record) => record.payload._runtimeEventBatch)
+        .filter((batch): batch is Record<string, unknown> =>
+          !!batch && typeof batch === "object" && !Array.isArray(batch))
+        .reduce((sum, batch) => sum + Number(batch.logicalCount), 0),
+      50_000,
+    );
+    assert.equal(turn.records.at(-1)?.payload.text, "the exact visible answer");
+    assert.match(turn.runtimeBatchManifestSha256!, /^[0-9a-f]{64}$/);
+  });
+
   test("materializes an uncapped visible assistant row for an error-only paid turn", () => {
     const detail = "provider exact error detail\n".repeat(20_000);
     const turn = materializeLosslessTurn({

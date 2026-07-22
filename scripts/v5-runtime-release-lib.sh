@@ -966,7 +966,8 @@ oc_hotcfg_assert_master_runtime_batch_capability() {
 }
 
 # 0=armed, 1=definitively inactive, 2=unknown. The env opt-in closes the
-# first-write race; persisted format-3 rows keep the reader floor irreversible.
+# first-write race; any persisted format-3 pin keeps the reader/writer floor
+# irreversible, including an unfinalized tape that must resume in format 3.
 oc_hotcfg_probe_runtime_batch_floor() {
   local env_file="$1" state="" rc=0
   [ -r "$env_file" ] || return 2
@@ -978,7 +979,7 @@ oc_hotcfg_probe_runtime_batch_floor() {
     case "${LOSSLESS_TURN_TAPE_RUNTIME_BATCHING:-}" in 1|true|TRUE|on|ON) printf true; exit 0 ;; esac
     [ -n "${DATABASE_URL:-}" ] || exit 22
     psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc \
-      "SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE finalized_at IS NOT NULL AND record_storage_format >= 3)::text" 2>/dev/null
+      "SELECT EXISTS (SELECT 1 FROM client_session_turn_tapes WHERE record_storage_format >= 3)::text" 2>/dev/null
   )" || rc=$?
   state="$(printf '%s' "$state" | tr -d '[:space:]')"
   [ "$rc" -eq 0 ] && [ "$state" = true ] && return 0

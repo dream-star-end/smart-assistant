@@ -104,6 +104,7 @@ import {
 } from "@openclaude/storage";
 import {
   computeGoalTokensUsed,
+  isLosslessRuntimeBatchingEnabled,
   materializeLosslessTurn,
   type LosslessTurnRecord,
 } from "../http/losslessTurnTape.js";
@@ -1659,7 +1660,10 @@ type PreparedLosslessTurnTape = {
   visible: UserVisiblePhysicalPayload[];
   partManifest: Array<{ partIndex: number; partSha256: string; payloadBytes: number }>;
   recordPayloadBytes: number;
+  recordStorageFormat: LosslessTurnTapeStorageFormat;
 };
+
+type LosslessTurnTapeStorageFormat = 2 | 3;
 
 type LosslessTurnTapeHeaderRow = {
   agent_id: string;
@@ -1672,6 +1676,7 @@ type LosslessTurnTapeHeaderRow = {
   created_at: string;
   waive_reason: string | null;
   finalized_at: string | null;
+  record_storage_format: number;
 };
 
 type TurnTapeRecoveryLinkRow = {
@@ -2078,40 +2083,23 @@ async function prepareLosslessTurnTapeOutsideLocks(
   pool: Pool,
   userId: string,
   request: LosslessTurnTapeFinalizeRequest,
+  recordStorageFormat: LosslessTurnTapeStorageFormat,
 ): Promise<PreparedLosslessTurnTape | null> {
   const header = (
-    await pool.query<{
-      agent_id: string;
-      turn_index: number;
-      status: string;
-      turn_key: string;
-      tape_sha256: string;
-      total_bytes: string;
-      part_count: number;
-      created_at: string;
-      waive_reason: string | null;
-      finalized_at: string | null;
-    }>(
+    await pool.query<LosslessTurnTapeHeaderRow>(
       `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,
-              part_count,created_at,waive_reason,finalized_at
+              part_count,created_at,waive_reason,finalized_at,record_storage_format
          FROM client_session_turn_tapes
         WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
       [request.sessionId, userId, request.tapeId],
     )
   ).rows[0];
   if (!header || header.finalized_at !== null) return null;
-  if (
-    header.agent_id !== request.agentId ||
-    header.turn_index !== request.turnIndex ||
-    header.status !== request.status ||
-    header.turn_key !== request.turnKey ||
-    header.tape_sha256 !== request.tapeSha256 ||
-    bigIntNum(header.total_bytes, "turn_tape.total_bytes") !== request.totalBytes ||
-    header.part_count !== request.partCount ||
-    bigIntNum(header.created_at, "turn_tape.created_at") !== request.createdAt ||
-    header.waive_reason !== (request.waiveReason ?? null)
-  ) {
+  if (!sameLosslessTurnTapeHeader(header, request)) {
     throw new Error("lossless turn tape finalize header conflict");
+  }
+  if (header.record_storage_format !== recordStorageFormat) {
+    throw new Error("lossless turn tape materialization format changed during prepare");
   }
 
   const canonical = Buffer.allocUnsafe(request.totalBytes);
@@ -2149,7 +2137,9 @@ async function prepareLosslessTurnTapeOutsideLocks(
   } catch (err) {
     throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
   }
-  const turn = materializeLosslessTurn(rawPayload);
+  const turn = materializeLosslessTurn(rawPayload, {
+    runtimeBatching: recordStorageFormat === 3,
+  });
   if (
     turn.payload.sessionId !== request.sessionId ||
     turn.payload.agentId !== request.agentId ||
@@ -2187,7 +2177,59 @@ async function prepareLosslessTurnTapeOutsideLocks(
       (sum, record) => sum + record.payloadBytes.length,
       0,
     ),
+    recordStorageFormat,
   };
+}
+
+async function claimLosslessTurnTapeStorageFormat(
+  pool: Pool,
+  userId: string,
+  request: LosslessTurnTapeFinalizeRequest,
+): Promise<LosslessTurnTapeStorageFormat | null> {
+  return withTx(pool, async (client) => {
+    const tape = (
+      await client.query<LosslessTurnTapeHeaderRow>(
+        `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,
+                part_count,created_at,waive_reason,finalized_at,record_storage_format
+           FROM client_session_turn_tapes
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+          FOR UPDATE`,
+        [request.sessionId, userId, request.tapeId],
+      )
+    ).rows[0];
+    if (!tape || tape.finalized_at !== null) return null;
+    if (!sameLosslessTurnTapeHeader(tape, request)) {
+      throw new Error("lossless turn tape finalize header conflict");
+    }
+    if (tape.record_storage_format !== 2 && tape.record_storage_format !== 3) {
+      throw new Error("lossless turn tape storage format is invalid");
+    }
+    if (tape.record_storage_format === 3 || !isLosslessRuntimeBatchingEnabled()) {
+      return tape.record_storage_format;
+    }
+
+    // The canonical parts remain the immutable authority until publication.
+    // Derived rows of an unfinalized format-2 attempt are not browser-visible,
+    // billed or dispatch-terminal. Replace them atomically before pinning the
+    // tape so retries can adopt lossless runtime batches without mixed rows.
+    await client.query(
+      `DELETE FROM client_session_turn_tape_model_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [request.sessionId, userId, request.tapeId],
+    );
+    await client.query(
+      `DELETE FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [request.sessionId, userId, request.tapeId],
+    );
+    await client.query(
+      `UPDATE client_session_turn_tapes
+          SET record_storage_format=3
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [request.sessionId, userId, request.tapeId],
+    );
+    return 3;
+  });
 }
 
 export const LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE = 128;
@@ -2226,7 +2268,7 @@ async function stagePreparedLosslessTurnRecords(
       const tape = (
         await client.query<LosslessTurnTapeHeaderRow>(
           `SELECT agent_id,turn_index,status,turn_key,tape_sha256,total_bytes,
-                  part_count,created_at,waive_reason,finalized_at
+                  part_count,created_at,waive_reason,finalized_at,record_storage_format
              FROM client_session_turn_tapes
             WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
             FOR UPDATE`,
@@ -2238,6 +2280,9 @@ async function stagePreparedLosslessTurnRecords(
         throw new Error("lossless turn tape finalize header conflict");
       }
       if (tape.finalized_at !== null) return "finalized";
+      if (tape.record_storage_format !== prepared.recordStorageFormat) {
+        throw new Error("lossless turn tape materialization format changed during staging");
+      }
 
       for (const ordinal of batch) {
       const item = prepared.turn.records[ordinal]!;
@@ -5823,7 +5868,19 @@ export function createPgSessionsBackend(
       if (readyForPreparation) {
         releaseFinalizeAdmission = acquireFinalizeMemoryAdmission(request.totalBytes);
         try {
-          prepared = await prepareLosslessTurnTapeOutsideLocks(pool, userId, request);
+          const recordStorageFormat = await claimLosslessTurnTapeStorageFormat(
+            pool,
+            userId,
+            request,
+          );
+          prepared = recordStorageFormat === null
+            ? null
+            : await prepareLosslessTurnTapeOutsideLocks(
+                pool,
+                userId,
+                request,
+                recordStorageFormat,
+              );
           if (prepared) {
             preparedModelRecordCount = preparedModelSidecarManifest(prepared).length;
             await stagePreparedLosslessTurnRecords(
@@ -5908,6 +5965,7 @@ export function createPgSessionsBackend(
             created_at: string;
             waive_reason: string | null;
             finalized_at: string | null;
+            record_storage_format: number;
             engine_billings: unknown;
             billing_anchor_id: string | null;
             dispatch_id: string | null;
@@ -5915,7 +5973,8 @@ export function createPgSessionsBackend(
             client_message_id: string | null;
           }>(
             `SELECT tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
-                    total_bytes, part_count, created_at, waive_reason, finalized_at, engine_billings,
+                    total_bytes, part_count, created_at, waive_reason, finalized_at,
+                    record_storage_format,engine_billings,
                     billing_anchor_id,dispatch_id,attempt_no,client_message_id
                FROM client_session_turn_tapes
               WHERE session_id=$1 AND user_id=$2 AND tape_id=ANY($3::text[])
@@ -6021,6 +6080,9 @@ export function createPgSessionsBackend(
         }
 
         if (!prepared) return { applied: "incomplete" };
+        if (tape.record_storage_format !== prepared.recordStorageFormat) {
+          throw new Error("lossless turn tape materialization format changed before publication");
+        }
         const turn = prepared.turn;
 
         // Parts are immutable once staged. Recheck only their manifest while
@@ -6417,7 +6479,7 @@ export function createPgSessionsBackend(
             turn.payload.parentTurnKey ?? null,
             JSON.stringify(turn.engineBillings),
             Date.now(),
-            turn.runtimeBatchManifestSha256 ? 3 : 2,
+            prepared.recordStorageFormat,
             turn.payload.goalId ?? null,
             turn.payload.goalStateRevision ?? null,
             goalTokensUsed,
