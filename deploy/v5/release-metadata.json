@@ -57,7 +57,8 @@
     "0175_client_session_history_revision",
     "0176_direct_turn_timeline",
     "0177_unified_client_timeline",
-    "0178_lossless_agent_group_null_guard"
+    "0178_lossless_agent_group_null_guard",
+    "0179_ark_plan_kimi_k3"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
