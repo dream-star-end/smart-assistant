@@ -6,7 +6,7 @@
  * 覆盖:
  *   - body schema (strict, 拒绝 unknown 字段, 拒绝 stream:false, max_tokens 范围)
  *   - 字节预算 (messages/system/tools 单字段超限 → 413)
- *   - estimateInputTokens (chars/4)
+ *   - estimateInputTokens (ASCII /4 + non-ASCII code point)
  *   - estimateMaxCostBothSides (input + output 双侧用 output 单价)
  *   - buildSafeUpstreamHeaders (anthropic-version 严格 / anthropic-beta allowlist)
  *   - ConcurrencyLimiter (per-key cap + release 释放)
@@ -23,6 +23,7 @@ import {
   proxyBodySchema,
   enforceFieldByteBudgets,
   estimateInputTokens,
+  estimateContextInputTokens,
   estimateMaxCostBothSides,
   buildSafeUpstreamHeaders,
   ConcurrencyLimiter,
@@ -336,6 +337,41 @@ describe("estimateInputTokens", () => {
       tools: [{ name: "y", description: "a".repeat(1000) }],
     });
     assert.ok(big > small, "system+tools 应增加 token 估算");
+  });
+
+  test("中文按 code point 保守计数,不再按 UTF-16 length/4 低估", () => {
+    const ascii = estimateInputTokens({
+      model: "x", max_tokens: 1, messages: [{ role: "user", content: "a".repeat(100) }],
+    });
+    const chinese = estimateInputTokens({
+      model: "x", max_tokens: 1, messages: [{ role: "user", content: "界".repeat(100) }],
+    });
+    assert.ok(chinese > ascii * 2, `ascii=${ascii} chinese=${chinese}`);
+  });
+
+  test("signed-window estimator excludes vision base64 but charges bounded media tokens", () => {
+    const body = {
+      model: "vision", max_tokens: 1, messages: [{ role: "user", content: [{
+        type: "tool_result", tool_use_id: "t1", content: [{
+          type: "image", source: { type: "base64", media_type: "image/png", data: "a".repeat(500_000) },
+        }],
+      }] }],
+    } as ProxyBody;
+    const raw = estimateInputTokens(body);
+    const bounded = estimateContextInputTokens(body);
+    assert.ok(raw > 100_000);
+    assert.ok(bounded >= 2_000 && bounded < 3_000, `bounded=${bounded}`);
+  });
+
+  test("signed-window estimator ties base64 document cost to decoded bytes", () => {
+    const body = {
+      model: "vision", max_tokens: 1, messages: [{ role: "user", content: [{
+        type: "document",
+        source: { type: "base64", media_type: "application/pdf", data: "a".repeat(800_000) },
+      }] }],
+    } as ProxyBody;
+    const bounded = estimateContextInputTokens(body);
+    assert.ok(bounded >= 600_000 && bounded < 610_000, `bounded=${bounded}`);
   });
 });
 
@@ -1382,6 +1418,17 @@ describe("stripNonTextContentBlocks", () => {
       /const modelSupportsVision = gate[\s\S]{0,200}capabilityProfile\.supportsVision/,
       "modelSupportsVision 必须优先取 catalog descriptor 的 per-model capability",
     );
+  });
+
+  test("index.ts:signed context guard includes vision and runs before preCheck reservation", () => {
+    const indexPath = fileURLToPath(new URL("../http/proxy/index.ts", import.meta.url));
+    const src = readFileSync(indexPath, "utf-8");
+    const estimateIdx = src.indexOf("const contextInputTokens = estimateContextInputTokens(body)");
+    const guardIdx = src.indexOf('"PROMPT_TOO_LONG"', estimateIdx);
+    const reserveIdx = src.indexOf("const totalMaxCost = estimateMaxCostBothSides", guardIdx);
+    assert.ok(estimateIdx >= 0 && guardIdx > estimateIdx && reserveIdx > guardIdx);
+    assert.match(src.slice(Math.max(0, estimateIdx - 600), estimateIdx), /signedWindow < route\.provider\.maxInputTokens/);
+    assert.doesNotMatch(src.slice(Math.max(0, estimateIdx - 600), estimateIdx), /!modelSupportsVision/);
   });
 
   test("provider-bound retry sanitizer lowers the retry body without mutating persistent history", () => {

@@ -30,6 +30,7 @@ let pgAvailable = false;
 /** 所有商业化表 + schema_migrations。用 DROP ... CASCADE,顺序无所谓,
  *  但仍列全,方便未来新增迁移时保持清理同步。 */
 const COMMERCIAL_TABLES = [
+  "provider_quota_blocks",
   "prompt_queue_item_attachments",
   "prompt_queue_mutations",
   "prompt_queue_items",
@@ -138,6 +139,7 @@ describe("migrate.runMigrations", () => {
       "prompt_queue_items",
       "prompt_queue_item_attachments",
       "prompt_queue_mutations",
+      "provider_quota_blocks",
       "schema_migrations",
     ]) {
       assert.ok(tables.has(expected), `table ${expected} missing`);

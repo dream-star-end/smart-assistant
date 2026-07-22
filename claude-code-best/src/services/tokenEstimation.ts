@@ -26,6 +26,8 @@ import { isToolReferenceBlock } from '../utils/toolSearch.js'
 import { getAPIMetadata, getExtraBodyParams } from './api/claude.js'
 import { getAnthropicClient } from './api/client.js'
 import { withTokenCountVCR } from './vcr.js'
+import { roughTokenCountEstimation } from './roughTokenEstimate.js'
+export { roughTokenCountEstimation } from './roughTokenEstimate.js'
 
 // Minimal values for token counting with thinking enabled
 // API constraint: max_tokens must be greater than thinking.budget_tokens
@@ -198,13 +200,6 @@ export async function countMessagesTokensWithAPI(
       return null
     }
   })
-}
-
-export function roughTokenCountEstimation(
-  content: string,
-  bytesPerToken: number = 4,
-): number {
-  return Math.round(content.length / bytesPerToken)
 }
 
 /**

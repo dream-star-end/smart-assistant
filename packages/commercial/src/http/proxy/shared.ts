@@ -571,19 +571,43 @@ export function isUuidLike(s: string): boolean {
  * 估算 input token 数(保守口径,宁可高估)。
  *
  * MVP 不引入完整 tokenizer(`@anthropic-ai/tokenizer` 增加依赖体积),用
- * "JSON.stringify(messages + system + tools).length / 4" 兜底。2026-05-06 移除
+ * ASCII 4 chars/token、非 ASCII code point 1 token 的保守估算兜底。2026-05-06 移除
  * preCheck ceiling 之后,估算偏大不再导致 402;只影响 PreCheckResult.originalMaxCost
  * 字段值(metric/log 用)和 cap-to-balance 的 capped 标记判定。
  *
- * 字符数除以 4 是社区经验值(英文偏低估;中文偏高估,反正都向上对我们安全)。
+ * 该口径与 Moonshot 官方 Kimi Code 客户端的 transient estimate 一致；它用于
+ * compaction/preflight，不冒充 provider tokenizer 的精确计数。
  */
 export function estimateInputTokens(body: ProxyBody): number {
-  let chars = 0;
-  chars += JSON.stringify(body.messages).length;
-  if (body.system !== undefined) chars += JSON.stringify(body.system).length;
-  if (body.tools !== undefined) chars += JSON.stringify(body.tools).length;
-  if (body.stop_sequences !== undefined) chars += JSON.stringify(body.stop_sequences).length;
-  return Math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE);
+  let tokens = estimateSerializedTokens(body.messages);
+  if (body.system !== undefined) tokens += estimateSerializedTokens(body.system);
+  if (body.tools !== undefined) tokens += estimateSerializedTokens(body.tools);
+  if (body.stop_sequences !== undefined) tokens += estimateSerializedTokens(body.stop_sequences);
+  return tokens;
+}
+
+function estimateSerializedTokens(value: unknown): number {
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const char of JSON.stringify(value)) {
+    if (char.codePointAt(0)! <= 0x7f) ascii++;
+    else nonAscii++;
+  }
+  return Math.ceil(ascii / CHARS_PER_TOKEN_ESTIMATE) + nonAscii;
+}
+
+/**
+ * Signed execution-window estimate. Vision bodies must not count base64 as
+ * text, but they also must not bypass the window gate. Reuse the existing
+ * copy-on-write media traversal (including nested tool_result blocks), then
+ * charge the same bounded 2k floor per image as CCB. Base64 documents use
+ * decoded byte size as a conservative content-linked estimate instead of a
+ * flat media floor, so a large PDF cannot look like a single tiny image.
+ */
+export function estimateContextInputTokens(body: ProxyBody): number {
+  const stripped = stripNonTextContentBlocks(body.messages);
+  return estimateInputTokens({ ...body, messages: stripped.messages as ProxyBody["messages"] }) +
+    stripped.imagesStripped * 2_000 + stripped.documentTokensEstimated;
 }
 
 /**
@@ -1270,9 +1294,11 @@ export function stripNonTextContentBlocks(messages: unknown[]): {
   messages: unknown[];
   imagesStripped: number;
   documentsStripped: number;
+  documentTokensEstimated: number;
 } {
   let imagesStripped = 0;
   let documentsStripped = 0;
+  let documentTokensEstimated = 0;
   let outer: unknown[] | null = null;
 
   const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -1288,6 +1314,16 @@ export function stripNonTextContentBlocks(messages: unknown[]): {
     }
     if (block.type === "document") {
       documentsStripped++;
+      const source = isRecord(block.source) ? block.source : null;
+      const data = source && typeof source.data === "string" ? source.data : null;
+      if (source?.type === "base64" && data) {
+        const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+        documentTokensEstimated += Math.max(2_000, Math.floor(data.length * 3 / 4) - padding);
+      } else if (data) {
+        documentTokensEstimated += Math.max(2_000, estimateSerializedTokens(data));
+      } else {
+        documentTokensEstimated += 2_000;
+      }
       return { type: "text", text: "[document omitted: this model accepts text input only]" };
     }
     return null;
@@ -1343,6 +1379,7 @@ export function stripNonTextContentBlocks(messages: unknown[]): {
     messages: outer ?? messages,
     imagesStripped,
     documentsStripped,
+    documentTokensEstimated,
   };
 }
 

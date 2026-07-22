@@ -121,6 +121,7 @@ describe("full migration suite", () => {
       "prompt_queue_items",
       "prompt_queue_item_attachments",
       "prompt_queue_mutations",
+      "provider_quota_blocks",
       "plugin_automation_controls",
       "plugin_automation_rules",
       "plugin_automation_runs",

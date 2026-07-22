@@ -234,11 +234,9 @@ export function resolveModelHistoryContextWindow(
     : null
 }
 
-/** Tokens available to prior conversation after the bytes already known at
- * this layer. Do not guess a fixed system/tool/output reserve here: CCB adds
- * those later, so the final proxy composition boundary accounts for their
- * actual serialized request instead. Native runners retain their own context
- * manager. */
+/** Tokens available to prior conversation after bytes and runner-specific
+ * headroom already known at this layer. The final proxy composition boundary
+ * still enforces the signed request window. */
 export function availableModelHistoryTokens(
   contextWindow: number,
   currentUserText: string,
@@ -249,6 +247,18 @@ export function availableModelHistoryTokens(
     contextWindow - estimateModelHistoryTokens(currentUserText) -
       Math.max(0, Math.floor(additionalReservedTokens)),
   )
+}
+
+/**
+ * CCB reconstructs provider-switch history as a new user message. On that
+ * first request there is no previous API usage row, so its proactive compact
+ * check can only estimate the reconstructed message itself; the system/tool
+ * envelope is added later. Keep the same 20k summary-output + 13k compact
+ * buffer that CCB reserves, plus the existing 256-token transport allowance.
+ * Native runners own their own context manager and retain the old allowance.
+ */
+export function modelHistoryReservedTokens(engine?: string): number {
+  return engine === 'ccb' ? 33_256 : 256
 }
 
 /** Return a Unicode-safe exact suffix that fits the approximate token budget. */

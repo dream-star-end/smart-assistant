@@ -27,7 +27,7 @@
  * anthropicProxy.integ.test.ts;那里的 mock 更重。
  */
 
-import { describe, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -37,6 +37,7 @@ import type { PreparedUpstreamSession } from "../http/proxy/upstream.js";
 import type { ProxyBody, UsageObservation } from "../http/proxy/shared.js";
 import type { FinalizerHandle, FinalizeOutcome } from "../billing/proxyBilling.js";
 import { rootLogger } from "../logging/logger.js";
+import { _setProviderQuotaRunnerForTest } from "../admin/providerQuotaCircuit.js";
 
 const log = rootLogger.child({ subsys: "proxyCore.unit.test" });
 
@@ -295,6 +296,7 @@ interface BuildCtxOpts {
   finalizerOutcome?: Partial<FinalizeOutcome>;
   fetchImpl: (url: string, init: RequestInit) => Promise<Response>;
   bodyModel?: string;
+  quotaProbeProviderId?: string | null;
   sessionId?: string | null;
   parentSessionId?: string | null;
   delegateAgentId?: string | null;
@@ -323,6 +325,7 @@ function buildCtx(opts: BuildCtxOpts) {
     uid: 7n,
     body,
     session: session.session,
+    quotaProbeProviderId: opts.quotaProbeProviderId ?? null,
     finalize: finalize.finalize,
     sessionId: opts.sessionId ?? null,
     parentSessionId: opts.parentSessionId ?? null,
@@ -331,6 +334,8 @@ function buildCtx(opts: BuildCtxOpts) {
   };
   return { ctx, req, res, session, finalize };
 }
+
+afterEach(() => _setProviderQuotaRunnerForTest(undefined));
 
 describe("runUpstreamRoundTrip — platform model / upstream model 分离", () => {
   test("平台 kimi-k3-ark 只在发往上游的 JSON 改写为 kimi-k3", async () => {
@@ -462,6 +467,45 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     assert.equal(session.zeroizeCount, 1);
   });
 
+  test("Moonshot billing-cycle 403 → durable block + non-retryable 400,且不扣费", async () => {
+    const sql: string[] = [];
+    _setProviderQuotaRunnerForTest({
+      async query(statement) {
+        sql.push(statement);
+        return { rows: [], rowCount: 1 } as never;
+      },
+    });
+    const preview = JSON.stringify({
+      error: { message: "You've reached your usage limit for this billing cycle" },
+    });
+    const { ctx, res, finalize } = buildCtx({
+      bodyModel: "kimi-k3",
+      sessionOver: { upstreamModel: "kimi-k3" },
+      fetchImpl: async () => new Response(preview, { status: 403, headers: { "Retry-After": "120" } }),
+    });
+
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(finalize.failCalls.length, 1);
+    assert.equal(finalize.commitCalls.length, 0);
+    assert.equal(res.statusCode, 400);
+    assert.equal((JSON.parse(res.bodyText()) as { error: { code: string } }).error.code, "PROVIDER_QUOTA_EXHAUSTED");
+    assert.equal(res.responseHeaders["retry-after"], "120");
+    assert.equal(sql.filter((statement) => statement.includes("INSERT INTO provider_quota_blocks")).length, 1);
+  });
+
+  test("Moonshot unrelated 403 retains generic 502 behavior", async () => {
+    const { ctx, res, finalize } = buildCtx({
+      bodyModel: "kimi-k3",
+      sessionOver: { upstreamModel: "kimi-k3" },
+      fetchImpl: async () => new Response('{"error":{"message":"access policy rejected"}}', { status: 403 }),
+    });
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(finalize.failCalls.length, 1);
+    assert.equal(res.statusCode, 502);
+    assert.equal((JSON.parse(res.bodyText()) as { error: { code: string } }).error.code, "UPSTREAM_ERROR");
+  });
+
   test("上游 400 invalid_request_error → finalize.failClient(豁免健康分)", async () => {
     const preview = JSON.stringify({
       type: "error",
@@ -508,6 +552,33 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
 });
 
 describe("runUpstreamRoundTrip — happy path commit + post-commit", () => {
+  test("half-open probe 2xx clears durable block before first streamed byte", async () => {
+    const events: string[] = [];
+    _setProviderQuotaRunnerForTest({
+      async query(statement) {
+        if (statement.includes("DELETE FROM provider_quota_blocks")) events.push("clear");
+        return { rows: [], rowCount: 1 } as never;
+      },
+    });
+    const { ctx, res } = buildCtx({
+      bodyModel: "kimi-k3",
+      quotaProbeProviderId: "moonshot",
+      sessionOver: { upstreamModel: "kimi-k3" },
+      fetchImpl: async () => sseFullResponse(),
+      finalizerOutcome: { state: "committed", debitedCredits: 0n },
+    });
+    const originalWrite = res.write.bind(res);
+    res.write = (chunk) => {
+      events.push("stream");
+      return originalWrite(chunk);
+    };
+
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(events[0], "clear");
+    assert.ok(events.includes("stream"));
+  });
+
   test("debited>0 → appendCostCredits 先 + broadcastToUser 后(顺序锁)", async () => {
     const events: string[] = [];
     const persistCalls: Array<{ rid: string; uid: string; cents: string }> = [];
@@ -761,6 +832,7 @@ describe("runUpstreamRoundTrip — stream / fetch error 分支", () => {
       uid: 7n,
       body,
       session: session.session,
+      quotaProbeProviderId: null,
       finalize: finalize.finalize,
       sessionId: null,
       parentSessionId: null,

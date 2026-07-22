@@ -6,7 +6,11 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, test } from "node:test";
 import type { QueryResult } from "pg";
-import { getDegradedProviders, _resetGateForTest } from "./providerHealthGate.js";
+import {
+  getDegradedProviders,
+  getProviderQuotaBlock,
+  _resetGateForTest,
+} from "./providerHealthGate.js";
 
 type OpsRow = {
   provider_id: string;
@@ -14,6 +18,8 @@ type OpsRow = {
   health_mode: string;
   degraded_since: Date | null;
   degrade_reason: string | null;
+  quota_retry_at?: Date | null;
+  quota_probe_lease_until?: Date | null;
 };
 
 function runnerReturning(rows: OpsRow[], counter?: { n: number }) {
@@ -82,5 +88,48 @@ describe("getDegradedProviders — fail-soft", () => {
     ]));
     const set = await getDegradedProviders(1000 + 20_000, throwingRunner()); // 越 TTL 触发读 → 抛 → 回退旧缓存
     assert.equal(set.has("minimax"), true);
+  });
+});
+
+describe("getDegradedProviders — exact quota block", () => {
+  const base: OpsRow = {
+    provider_id: "moonshot",
+    health_status: "healthy",
+    health_mode: "auto",
+    degraded_since: null,
+    degrade_reason: null,
+    quota_retry_at: new Date(20_000),
+    quota_probe_lease_until: null,
+  };
+
+  test("active quota annotates degraded; expired row remains visible for half-open claim", async () => {
+    const active = await getDegradedProviders(10_000, runnerReturning([base]));
+    assert.equal(active.has("moonshot"), true);
+    _resetGateForTest();
+    const expired = await getDegradedProviders(30_000, runnerReturning([base]));
+    assert.equal(expired.has("moonshot"), false);
+    assert.deepEqual(
+      await getProviderQuotaBlock("moonshot", 30_000, runnerReturning([base])),
+      { retryAt: 20_000, probeLeaseUntil: null },
+    );
+  });
+
+  test("quota-only provider is read even when sparse provider_ops has no row", async () => {
+    let statement = "";
+    const runner = {
+      async query(sql: string) {
+        statement = sql;
+        return { rows: [base], rowCount: 1 } as unknown as QueryResult;
+      },
+    };
+    const set = await getDegradedProviders(10_000, runner);
+    assert.equal(set.has("moonshot"), true);
+    assert.match(statement, /FULL OUTER JOIN provider_quota_blocks/);
+  });
+
+  test("active probe lease keeps concurrent requests blocked after retry_at", async () => {
+    const row = { ...base, quota_probe_lease_until: new Date(40_000) };
+    const set = await getDegradedProviders(30_000, runnerReturning([row]));
+    assert.equal(set.has("moonshot"), true);
   });
 });
