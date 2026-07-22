@@ -149,14 +149,15 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
 export const AUDIT_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export interface AuditRetentionSweeperHandle {
-  stop(): void;
+  /** 停止新 tick，并等待当前 tick 离开共享数据域。 */
+  stop(): Promise<void>;
   /** 测试/运维用:立即跑一轮,返回 per-table 删除行数。 */
   runNow(): Promise<Record<string, number>>;
 }
 
 export interface AuditRetentionSweeperOptions {
   intervalMs?: number;
-  /** 测试用:首次 boot 立即跑(默认 false,boot 后等 intervalMs,避免启动风暴)。 */
+  /** 首次 boot 立即异步跑一轮(默认 false；不会阻塞 gateway 启动)。 */
   runOnStart?: boolean;
   onError?: (table: string, err: unknown) => void;
   /** env 覆盖串,默认读 process.env.COMMERCIAL_AUDIT_RETENTION_OVERRIDES。 */
@@ -261,6 +262,7 @@ export function startAuditRetentionSweeper(
     (() => sweepTerminalSessionGoals((sql, params) => query(sql, params)));
   const policies = resolveRetentionPolicies(opts.overrides);
   let stopped = false;
+  let inflight: Promise<Record<string, number>> | null = null;
 
   async function runOneTick(): Promise<Record<string, number>> {
     const deleted: Record<string, number> = {};
@@ -293,19 +295,32 @@ export function startAuditRetentionSweeper(
     return deleted;
   }
 
+  function runSerializedTick(): Promise<Record<string, number>> {
+    if (stopped) return Promise.resolve({});
+    if (inflight) return inflight;
+    const tick = runOneTick();
+    inflight = tick;
+    void tick.then(
+      () => { if (inflight === tick) inflight = null; },
+      () => { if (inflight === tick) inflight = null; },
+    );
+    return tick;
+  }
+
   const timer = setInterval(() => {
     if (stopped) return;
-    void runOneTick();
+    void runSerializedTick();
   }, interval);
   if (typeof timer.unref === "function") timer.unref();
 
-  if (opts.runOnStart) void runOneTick();
+  if (opts.runOnStart) void runSerializedTick();
 
   return {
-    stop() {
+    async stop() {
       stopped = true;
       clearInterval(timer);
+      if (inflight) await inflight;
     },
-    runNow: runOneTick,
+    runNow: runSerializedTick,
   };
 }

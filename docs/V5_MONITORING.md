@@ -51,7 +51,7 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 | `http_v3` | `GET 127.0.0.1:18789/healthz` | 非 `"ok":true` | v3 已退役，默认不运行；仅显式 `V5MON_CHECK_V3=1` 时保留兼容检查 |
 | `disk_root` / `disk_var` | `df /` 与 `df /var` 使用率 | >85% | PG/docker/日志都在盘上;85% 留出扩容反应时间(线上当前 73%) |
 | `mem` | MemAvailable/MemTotal | <10% | OOM 前兆;容器池机器内存吃紧会连环 OOM kill |
-| `pool` | `docker ps` 中 v5-ccb 镜像容器数 | >20 | 灰度期稳态 ~1-5;>20 = 回收失灵或被刷。docker daemon 不响应也在此项报 |
+| `pool` | 运行中 v5-ccb 的 managed/channel/uid 身份标签 | 任一缺失/漂移，或 docker daemon 不响应 | 容器数量随真实用户增长，不设任意硬上限；实际容量由 `disk_root`/`disk_var`/`mem` 判定，合成 canary 也按同一身份契约纳管 |
 | `image` | `OC_RUNTIME_IMAGE`(env)必须在 `docker images` | 不存在 | tag 漂移(镜像被误删/env 手滑)→ 起新容器全挂,平时无症状,出事才发现 |
 
 Serving lane 派生矩阵：`stable` 与 `canary step<READY(10)` 只看 active；`canary
@@ -92,7 +92,7 @@ active。`deploy_state` 读取失败或字段非法时，独立 `deploy_state` c
 全部阈值是两个脚本顶部的显式常量,改完无需 reload(oneshot 每次全新执行):
 
 ```
-scripts/v5-monitor.sh:      DISK_MAX_PCT / MEM_MIN_AVAIL_PCT / POOL_MAX / REALERT_SECS
+scripts/v5-monitor.sh:      DISK_MAX_PCT / MEM_MIN_AVAIL_PCT / REALERT_SECS
 scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_MIN_SAMPLES / CACHE_SAMPLE_MIN_INPUT / CACHE_MIN_RECORDS / CACHE_ABSOLUTE_LOW_BPS / CACHE_REGRESSION_LOW_BPS / CACHE_DROP_MIN_BPS
 ```
 
