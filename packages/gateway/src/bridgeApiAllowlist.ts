@@ -84,6 +84,24 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/agents/:id/auto-dream-optimizer',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/auto-dream-optimizer$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agents/:id/auto-dream-optimizer/cancel',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/auto-dream-optimizer\/cancel$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agents/:id/auto-dream-optimizer/proposals/:proposalId/:action',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/auto-dream-optimizer\/proposals\/[0-9a-f]{32}\/(apply|dismiss)$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/agents/:id/skills',
     re: /^\/api\/agents\/[^/]+\/skills$/,
     methods: M('GET'),

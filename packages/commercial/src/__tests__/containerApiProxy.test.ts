@@ -93,6 +93,36 @@ describe('containerApiProxy', () => {
     assert.equal(matchContainerApiProxyRoute('/api/agents', 'POST'), false)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/user', 'PUT'), true)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/message', 'POST'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer', 'POST'), true)
+    assert.equal(
+      matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer/cancel', 'POST'),
+      true,
+    )
+    for (const action of ['apply', 'dismiss']) {
+      assert.equal(
+        matchContainerApiProxyRoute(
+          `/api/agents/main/auto-dream-optimizer/proposals/${'a'.repeat(32)}/${action}`,
+          'POST',
+        ),
+        true,
+      )
+    }
+    assert.equal(
+      matchContainerApiProxyRoute('/api/agents/main/auto-dream-optimizer/cancel', 'GET'),
+      false,
+    )
+    assert.equal(
+      matchContainerApiProxyRoute(
+        `/api/agents/main/auto-dream-optimizer/proposals/${'a'.repeat(31)}/apply`,
+        'POST',
+      ),
+      false,
+    )
+    assert.equal(
+      matchContainerApiProxyRoute('/api/agents/main./auto-dream-optimizer', 'POST'),
+      false,
+    )
     // v5 轻量组队:旧团队路由已从容器代理 allowlist 移除(浏览器→容器不再放行)。
     assert.equal(matchContainerApiProxyRoute('/api/agent-teams', 'GET'), false)
     assert.equal(matchContainerApiProxyRoute('/api/agent-teams/dev_team', 'DELETE'), false)
