@@ -21,6 +21,7 @@ import {
   Tag,
   Users,
   Wrench,
+  WandSparkles,
   type LucideIcon,
 } from "lucide-react";
 import { type ComponentType, type LazyExoticComponent, lazy } from "react";
@@ -89,6 +90,7 @@ export const adminPages: AdminPage[] = [
   { key: "modelGrants", title: "用户模型授权", group: "财务与商业", desc: "按用户放行特殊模型", icon: ShieldCheck, Component: lz(() => import("./pages/modelGrants")) },
   // ── 用户触达 ──
   { key: "feedback", title: "反馈", group: "用户触达", desc: "用户问题、优先级和确认", icon: MessageSquare, Component: lz(() => import("./pages/feedback")) },
+  { key: "autoDreamFindings", title: "平台优化发现", group: "用户触达", desc: "Auto‑Dream 匿名聚合的平台改进建议", icon: WandSparkles, Component: lz(() => import("./pages/autoDreamFindings")) },
   { key: "inbox", title: "站内信", group: "用户触达", desc: "发送、历史和触达记录", icon: Mail, Component: lz(() => import("./pages/inbox")) },
   { key: "marketplace", title: "技能市场", group: "用户触达", desc: "审核投稿、上架和下架", icon: Store, Component: lz(() => import("./pages/marketplace")) },
   // ── 系统运营 ──

@@ -290,7 +290,7 @@ export class AutoDreamService {
       })
     })
     const policy = await this.policyClient.get()
-    if (!policy.enabled) return
+    if (!policy.enabled || policy.mode !== 'legacy_memory_v1') return
     try {
       await this.maybeRun(trigger, policy)
     } catch (err) {
@@ -415,7 +415,12 @@ export class AutoDreamService {
     // fresh read so opt-out, plan loss, or an unavailable admin model takes
     // effect before lastAttemptAt advances.
     const freshPolicy = await this.policyClient.get({ fresh: true })
-    if (!freshPolicy.enabled || sessionCount < freshPolicy.minNewSessions) return
+    if (
+      !freshPolicy.enabled ||
+      freshPolicy.mode !== 'legacy_memory_v1' ||
+      sessionCount < freshPolicy.minNewSessions
+    )
+      return
 
     // Attempt-claim phase: concurrent gateway processes may have scanned in
     // parallel, but only one can advance lastAttemptAt and own this attemptId.

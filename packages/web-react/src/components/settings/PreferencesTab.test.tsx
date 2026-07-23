@@ -33,22 +33,24 @@ describe("PreferencesTab · Auto-Dream", () => {
     expect(apiKeysSection).toHaveBeenCalledTimes(1);
   });
 
-  test("不显示整理模型身份，并提供可感知结果入口", async () => {
+  test("显示 Terra 全面审计范围，并提供优化建议入口", async () => {
     vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
     const openMemory = vi.fn();
 
     render(
       <PreferencesTab
         auth={auth}
-        prefs={{ auto_dream_enabled: true }}
+        prefs={{ auto_optimizer_enabled: true }}
         autoDream={
           {
             eligible: true,
             available: true,
             enabled: true,
+            optimizer_enabled: true,
+            legacy_enabled: false,
             effective: true,
             minimum_plan_code: "max",
-            min_interval_hours: 24,
+            min_interval_hours: 168,
             min_new_sessions: 5,
             // 模拟滚动发布期间旧响应仍带字段；UI 也不能显示。
             model_id: "deepseek-v4-flash",
@@ -63,12 +65,48 @@ describe("PreferencesTab · Auto-Dream", () => {
       />,
     );
 
-    expect(screen.queryByText("整理模型")).not.toBeInTheDocument();
+    expect(screen.getByText(/GPT‑5.6 Terra 结合平台功能与技能/)).toBeInTheDocument();
     expect(screen.queryByText(/DeepSeek V4 Flash|deepseek-v4-flash/)).not.toBeInTheDocument();
-    expect(screen.getByText(/每次正常结束都会生成可见的梦境报告/)).toBeInTheDocument();
+    expect(screen.getByText(/所有用户内容和功能设置修改都先展示差异/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "查看整理记录" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看优化建议" }));
     expect(openMemory).toHaveBeenCalledTimes(1);
+  });
+
+  test("开启全面优化前必须确认审计、计费和匿名上报", async () => {
+    vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+    const onPatch = vi.fn(async () => {});
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{}}
+        autoDream={{
+          eligible: true,
+          available: true,
+          enabled: false,
+          optimizer_enabled: false,
+          legacy_enabled: false,
+          effective: false,
+          minimum_plan_code: "max",
+          min_interval_hours: 168,
+          min_new_sessions: 5,
+        }}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={onPatch}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("switch", { name: "Auto-Dream" }));
+    expect(screen.getByText("开启 Auto‑Dream 全面优化？")).toBeInTheDocument();
+    expect(screen.getByText(/匿名平台优化发现/)).toBeInTheDocument();
+    expect(onPatch).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "同意并开启" }));
+    await vi.waitFor(() =>
+      expect(onPatch).toHaveBeenCalledWith({ auto_optimizer_enabled: true }),
+    );
   });
 
   test("不可用提示也不解释后台模型身份", () => {

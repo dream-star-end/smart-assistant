@@ -14,6 +14,7 @@ export type PrefsView = {
   wechat_show_tool_calls?: boolean;
   wechat_proactive_push?: boolean;
   auto_dream_enabled?: boolean;
+  auto_optimizer_enabled?: boolean;
   hotkeys?: Record<string, string>;
 };
 
@@ -21,6 +22,8 @@ export type AutoDreamFeatureView = {
   eligible: boolean;
   available: boolean;
   enabled: boolean;
+  optimizer_enabled?: boolean;
+  legacy_enabled?: boolean;
   effective: boolean;
   minimum_plan_code: string;
   min_interval_hours: number;
@@ -55,6 +58,12 @@ export function extractAutoDreamFeature(snap: unknown): AutoDreamFeatureView | n
     eligible: row.eligible,
     available: row.available,
     enabled: row.enabled,
+    ...(typeof row.optimizer_enabled === "boolean"
+      ? { optimizer_enabled: row.optimizer_enabled }
+      : {}),
+    ...(typeof row.legacy_enabled === "boolean"
+      ? { legacy_enabled: row.legacy_enabled }
+      : {}),
     effective: row.effective,
     minimum_plan_code: row.minimum_plan_code,
     min_interval_hours: row.min_interval_hours,

@@ -57,6 +57,8 @@ async function makeHarness(
     withFakeProc?: boolean
     fakeProcNeverCloses?: boolean
     model?: string
+    hermeticNoTools?: boolean
+    structuredOutputSchema?: Readonly<Record<string, unknown>>
   } = {},
 ): Promise<Harness> {
   const baseTmp = await mkdtemp(join(tmpdir(), 'codex-aps-'))
@@ -66,6 +68,8 @@ async function makeHarness(
     cwd: baseTmp,
     resumeSessionId: opts.resumeSessionId,
     model: opts.model,
+    hermeticNoTools: opts.hermeticNoTools,
+    structuredOutputSchema: opts.structuredOutputSchema,
   })
   const messages: any[] = []
   const errors: any[] = []
@@ -245,6 +249,26 @@ describe('CodexAppServerRunner turn/start params', () => {
     h.runner.setEffortLevel('turbo')
     const invalidParams = (h.runner as any).buildTurnStartParams('hi')
     assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
+    await h.cleanup()
+  })
+
+  it('enforces no-network read-only execution and structured output for hermetic audits', async () => {
+    const schema = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['summary'],
+      properties: { summary: { type: 'string' } },
+    } as const
+    const h = await makeHarness({
+      model: 'gpt-5.6-terra',
+      hermeticNoTools: true,
+      structuredOutputSchema: schema,
+    })
+    const params = (h.runner as any).buildTurnStartParams('audit')
+    assert.deepEqual(params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+    assert.deepEqual(params.outputSchema, schema)
+    assert.equal((params.collaborationMode as any).settings.model, 'gpt-5.6-terra')
+    assert.equal((h.runner as any)._applyRepoBindingFromSnapshot(null).startsWith(tmpdir()), true)
     await h.cleanup()
   })
 })

@@ -45,6 +45,7 @@ import type {
   PutMemoryResult,
   MemoryIndexResponse,
   AutoDreamReportResponse,
+  AutoDreamOptimizerState,
   MemoryFileContent,
   PutMemoryFileResult,
   PaymentOrder,
@@ -2219,6 +2220,60 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t),
         }),
+      ),
+    ),
+
+  getAutoDreamOptimizer: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<AutoDreamOptimizerState>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/auto-dream-optimizer`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  runAutoDreamOptimizer: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<AutoDreamOptimizerState>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/auto-dream-optimizer`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: "{}",
+        }),
+      ),
+    ),
+
+  cancelAutoDreamOptimizer: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<AutoDreamOptimizerState>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/auto-dream-optimizer/cancel`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: "{}",
+        }),
+      ),
+    ),
+
+  mutateAutoDreamProposal: (
+    a: AuthSession,
+    agentId: string,
+    proposalId: string,
+    action: "apply" | "dismiss",
+  ) =>
+    jsonOrThrow<AutoDreamOptimizerState>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/agents/${encodeURIComponent(agentId)}/auto-dream-optimizer/proposals/${proposalId}/${action}`,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: bearerHeaders(t, true),
+            body: "{}",
+          },
+        ),
       ),
     ),
 

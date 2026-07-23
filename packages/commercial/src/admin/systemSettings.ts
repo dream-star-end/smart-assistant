@@ -278,7 +278,7 @@ export const KEY_META: Record<
   },
   auto_dream_model: {
     kind: "model",
-    description: "Auto-Dream 后台记忆整理模型（仅可选择 active/public/CCB 模型）",
+    description: "Auto-Dream 全面优化审计模型（固定使用 active/public 的 GPT‑5.6 Terra）",
   },
 };
 

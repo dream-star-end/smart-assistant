@@ -5,13 +5,15 @@ import type { AuthSession } from "../lib/types";
 import { CronPanel } from "./manage/CronPanel";
 import { LibraryPanel } from "./manage/LibraryPanel";
 import { MemoryPanel } from "./manage/MemoryPanel";
+import { OptimizationPanel } from "./manage/OptimizationPanel";
 import { SkillsPanel } from "./manage/SkillsPanel";
 import { ConnectorsTab } from "./settings/ConnectorsTab";
 import { Tabs } from "./ui";
 
-export type ManageTab = "memory" | "cron" | "skills" | "connectors" | "library";
+export type ManageTab = "optimization" | "memory" | "cron" | "skills" | "connectors" | "library";
 
 const TABS: { id: ManageTab; label: string; featureId: ProductFeatureId }[] = [
+  { id: "optimization", label: "全面优化", featureId: PRODUCT_CAPABILITIES.memory.id },
   { id: "memory", label: "记忆", featureId: PRODUCT_CAPABILITIES.memory.id },
   { id: "cron", label: "定时任务", featureId: PRODUCT_CAPABILITIES.schedules.id },
   { id: "skills", label: "技能", featureId: PRODUCT_CAPABILITIES.skills.id },
@@ -85,6 +87,11 @@ export function ManageCenter({
               <p className="px-5 py-10 text-center text-[13px] text-faint">请先登录。</p>
             ) : (
               <>
+                {tab === "optimization" && (
+                  <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
+                    <OptimizationPanel auth={auth} agentId={agentId} agents={agents} />
+                  </div>
+                )}
                 {tab === "memory" && (
                   <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
                     <MemoryPanel auth={auth} agentId={agentId} agents={agents} />

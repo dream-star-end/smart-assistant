@@ -48,6 +48,18 @@ export const paths = {
   // unlink or atomically replace it (doing so would split the lock domain).
   agentAutoDreamState: (agentId: string) => join(HOME, 'agents', agentId, 'auto-dream-state.json'),
   agentAutoDreamLock: (agentId: string) => join(HOME, 'agents', agentId, 'auto-dream.lock'),
+  agentAutoDreamOptimizerState: (agentId: string) =>
+    join(HOME, 'agents', agentId, 'auto-dream-optimizer-state.json'),
+  agentAutoDreamOptimizerLock: (agentId: string) =>
+    join(HOME, 'agents', agentId, 'auto-dream-optimizer.lock'),
+  agentAutoDreamOptimizerRunLock: (agentId: string) =>
+    join(HOME, 'agents', agentId, 'auto-dream-optimizer-run.lock'),
+  agentAutoDreamOptimizerActions: (agentId: string) =>
+    join(HOME, 'agents', agentId, 'auto-dream-optimizer-actions.json'),
+  agentAutoDreamOptimizerBilling: (agentId: string) =>
+    join(HOME, 'agents', agentId, 'auto-dream-optimizer-billing.json'),
+  agentAutoDreamOptimizerFindings: (agentId: string) =>
+    join(HOME, 'agents', agentId, 'auto-dream-optimizer-findings.json'),
   // Skills system (L3): per-agent skill directory.
   // NOTE: with the user-level shared skill library (see sharedSkillsDir below),
   // this per-agent dir is a read-only "legacy" overlay layer kept only for

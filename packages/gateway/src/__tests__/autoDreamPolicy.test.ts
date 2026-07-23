@@ -8,6 +8,7 @@ describe('parseAutoDreamPolicy', () => {
     assert.deepEqual(
       parseAutoDreamPolicy({
         enabled: true,
+        mode: 'legacy_memory_v1',
         modelId: 'deepseek-v4-flash',
         modelName: 'DeepSeek V4 Flash',
         minIntervalHours: 24,
@@ -15,6 +16,7 @@ describe('parseAutoDreamPolicy', () => {
       }),
       {
         enabled: true,
+        mode: 'legacy_memory_v1',
         modelId: 'deepseek-v4-flash',
         modelName: 'DeepSeek V4 Flash',
         minIntervalHours: 24,
@@ -40,6 +42,7 @@ describe('parseAutoDreamPolicy', () => {
 describe('AutoDreamPolicyClient freshness', () => {
   const enabled = {
     enabled: true,
+    mode: 'legacy_memory_v1',
     modelId: 'deepseek-v4-flash',
     modelName: 'DeepSeek V4 Flash',
     minIntervalHours: 24,

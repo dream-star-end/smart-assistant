@@ -279,6 +279,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         delegationDepth: opts.delegationDepth,
         sessionId: opts.sessionId,
         getRepoSnapshot: opts.getRepoSnapshot,
+        hermeticNoTools: opts.hermeticNoTools,
+        structuredOutputSchema: opts.structuredOutputSchema,
       })
     // 常驻 stdout 路由(每 session 恰一个)。'activity' 先于 parse emit,对 parser
     // 会忽略的帧同样计活 —— 与 CcbAdapter / 旧 handleMessage 时序逐条对齐。

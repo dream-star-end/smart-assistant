@@ -99,12 +99,17 @@ import {
   TaskStore,
   buildAgentSkillStore,
   buildUserSkillStore,
+  parseFrontmatter,
   validateSkillAgentScope,
   paths,
   readAgentsConfig,
   readConfig,
   searchSessions,
   loadSessionTurns,
+  loadSessionEvents,
+  loadSessionUsage,
+  listAutoDreamAuditSessions,
+  listAutoDreamSuccessfulSessionsBetween,
   syncMarketplaceHub,
   writeAgentsConfig,
   writeConfig,
@@ -341,6 +346,15 @@ import {
   isAutoDreamSuccessfulTurn,
   type AutoDreamModelRun,
 } from './autoDream.js'
+import {
+  AUTO_DREAM_OPTIMIZER_JSON_SCHEMA,
+  AutoDreamOptimizerService,
+  type AutoDreamAuditDataset,
+  type AutoDreamOptimizerModelRun,
+  type AutoDreamOptimizerProposal,
+} from './autoDreamOptimizer.js'
+import { AutoDreamOptimizerClient } from './autoDreamOptimizerClient.js'
+import { AutoDreamPolicyClient, type AutoDreamOptimizerPolicy } from './autoDreamPolicy.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -533,7 +547,7 @@ export function resolveSyntheticTurnModel(
 //      → 保持 fail-closed)同向,只是把"晚期 guard 拒"提前成结构化错误。
 
 /** 本地路径的 turn 语义分类(决定 codex 意图怎么处理,见上方真值表)。 */
-export type LocalTurnKind = 'synthetic' | 'turn' | 'prewarm'
+export type LocalTurnKind = 'synthetic' | 'turn' | 'prewarm' | 'auto_dream'
 
 /** 本地路径判定结果:该 turn 的 canonical 模型 + engine(= getOrCreate/submit 的同源入参)。 */
 export interface LocalExecutionDecision {
@@ -568,7 +582,7 @@ export function decideLocalExecution(args: {
   const env = args.env ?? process.env
 
   // ① provider 硬 pin:engine 恒 codex,换模型无效 → 本地 turn 一律拒(prewarm 除外)。
-  if (agent.provider === 'codex-native' && kind !== 'prewarm') {
+  if (agent.provider === 'codex-native' && kind !== 'prewarm' && kind !== 'auto_dream') {
     throw new LocalExecutionRejected(
       'DELEGATE_CODEX_UNSUPPORTED',
       `agent '${agent.id}' is pinned to the codex engine, which cannot run on a local ` +
@@ -588,7 +602,9 @@ export function decideLocalExecution(args: {
     if (engine !== 'codex') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
 
     // codex 意图(engine 取自投影,不看 baked)。
-    if (kind === 'prewarm') return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+    if (kind === 'prewarm' || kind === 'auto_dream') {
+      return { canonicalModel, engine, supportsVision: descriptor.supportsVision }
+    }
     if (kind === 'turn') {
       throw new LocalExecutionRejected(
         'DELEGATE_CODEX_UNSUPPORTED',
@@ -1424,12 +1440,104 @@ export function _parseHistoryRevisionCursor(raw: string | null): number | undefi
   return Number.isSafeInteger(parsed) ? parsed : undefined
 }
 
+/** Transport paging only: every source character is retained in one chunk. */
+function splitAuditEvidence(label: string, content: string, chunkChars = 96_000): string[] {
+  if (content.length === 0) {
+    return [JSON.stringify({ evidenceLabel: label, fragmentIndex: 1, fragmentCount: 1, content: '' })]
+  }
+  const fragments: string[] = []
+  for (let offset = 0; offset < content.length; ) {
+    let end = Math.min(content.length, offset + chunkChars)
+    if (
+      end < content.length &&
+      end > offset &&
+      content.charCodeAt(end - 1) >= 0xd800 &&
+      content.charCodeAt(end - 1) <= 0xdbff
+    ) {
+      end--
+    }
+    fragments.push(content.slice(offset, end))
+    offset = end
+  }
+  return fragments.map((fragment, index) =>
+    JSON.stringify({
+      evidenceLabel: label,
+      fragmentIndex: index + 1,
+      fragmentCount: fragments.length,
+      content: fragment,
+    }),
+  )
+}
+
+const AUTO_DREAM_SCHEDULE_KEYS = new Set([
+  'id',
+  'agent',
+  'schedule',
+  'prompt',
+  'deliver',
+  'enabled',
+  'oneshot',
+  'label',
+  'createdAt',
+])
+
+/**
+ * Auto-Dream may only create local, user-visible schedules. External delivery
+ * targets remain a guided/manual action because model-authored peer IDs are
+ * not an authority for proactive outbound delivery.
+ */
+export function normalizeAutoDreamSchedule(
+  raw: string,
+  agentId: string,
+  jobId: string,
+): import('./cron.js').CronJob {
+  const parsed = JSON.parse(raw) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('AUTO_DREAM_SCHEDULE_INVALID')
+  }
+  const row = parsed as Record<string, unknown>
+  if (Object.keys(row).some((key) => !AUTO_DREAM_SCHEDULE_KEYS.has(key))) {
+    throw new Error('AUTO_DREAM_SCHEDULE_UNKNOWN_FIELD')
+  }
+  if (
+    typeof row.schedule !== 'string' ||
+    row.schedule.length < 1 ||
+    row.schedule.length > 128 ||
+    typeof row.prompt !== 'string' ||
+    row.prompt.length < 1 ||
+    row.prompt.length > 32_000 ||
+    (row.deliver !== undefined && row.deliver !== 'local') ||
+    (row.enabled !== undefined && typeof row.enabled !== 'boolean') ||
+    (row.oneshot !== undefined && typeof row.oneshot !== 'boolean') ||
+    (row.label !== undefined &&
+      (typeof row.label !== 'string' || row.label.length < 1 || row.label.length > 500)) ||
+    (row.createdAt !== undefined &&
+      (typeof row.createdAt !== 'number' ||
+        !Number.isSafeInteger(row.createdAt) ||
+        row.createdAt < 0))
+  ) {
+    throw new Error('AUTO_DREAM_SCHEDULE_INVALID')
+  }
+  return {
+    id: jobId,
+    agent: agentId,
+    schedule: row.schedule,
+    prompt: row.prompt,
+    deliver: 'local',
+    ...(typeof row.enabled === 'boolean' ? { enabled: row.enabled } : {}),
+    ...(typeof row.oneshot === 'boolean' ? { oneshot: row.oneshot } : {}),
+    ...(typeof row.label === 'string' ? { label: row.label } : {}),
+    ...(typeof row.createdAt === 'number' ? { createdAt: row.createdAt } : {}),
+  }
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
   private router: Router
   private sessions: SessionManager
   private autoDream: AutoDreamService
+  private autoDreamOptimizer: AutoDreamOptimizerService
   private cron: CronScheduler | null = null
   private webhookRouter: WebhookRouter | null = null
   private _taskStore = new TaskStore()
@@ -1761,6 +1869,19 @@ export class Gateway {
     this.autoDream = new AutoDreamService({
       runModel: (input) => this._runAutoDreamModel(input),
       notifyResult: (report) => postInboxMessage(formatAutoDreamReceipt(report)),
+      log: (event, fields) => this.log.info(event, fields),
+    })
+    const optimizerClient = new AutoDreamOptimizerClient()
+    this.autoDreamOptimizer = new AutoDreamOptimizerService({
+      loadAuditDataset: (input) => this._loadAutoDreamAuditDataset(input),
+      runModel: (input) => this._runAutoDreamOptimizerModel(input, optimizerClient),
+      finishModelRun: (input) =>
+        this.sessions
+          .destroySession(`auto-dream-optimizer:${input.runId}:reduce`)
+          .then(() => undefined),
+      hydrateProposals: (input) => this._hydrateAutoDreamOptimizerProposals(input),
+      reportPlatformFindings: (input) => optimizerClient.reportFindings(input),
+      applyProposal: (input) => this._applyAutoDreamOptimizerProposal(input, optimizerClient),
       log: (event, fields) => this.log.info(event, fields),
     })
     this._containerPreview = new ContainerPreviewHandler({
@@ -4240,6 +4361,37 @@ export class Gateway {
       this.handleAutoDreamReport(req, res, autoDreamReportMatch[1]).catch((err) =>
         this.sendInternalError(res, err),
       )
+      return
+    }
+    const optimizerMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-optimizer$/,
+    )
+    if (optimizerMatch) {
+      this.handleAutoDreamOptimizer(req, res, optimizerMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    const optimizerCancelMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-optimizer\/cancel$/,
+    )
+    if (optimizerCancelMatch) {
+      this.handleAutoDreamOptimizerCancel(req, res, optimizerCancelMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    const optimizerProposalMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-optimizer\/proposals\/([0-9a-f]{32})\/(apply|dismiss)$/,
+    )
+    if (optimizerProposalMatch) {
+      this.handleAutoDreamOptimizerProposal(
+        req,
+        res,
+        optimizerProposalMatch[1],
+        optimizerProposalMatch[2],
+        optimizerProposalMatch[3] as 'apply' | 'dismiss',
+      ).catch((err) => this.sendInternalError(res, err))
       return
     }
     // 单条记忆文件 CRUD(memdir)::file 用宽松 [^/]+ 捕获,handler 内 basename+MEMORY_FILE_RE 双保险。
@@ -6950,6 +7102,51 @@ export class Gateway {
     this.sendJson(res, 200, await this.autoDream.getPublicStatus(agentId))
   }
 
+  private async handleAutoDreamOptimizer(
+    req: IncomingMessage,
+    res: ServerResponse,
+    agentId: string,
+  ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+    if (req.method === 'GET') {
+      this.sendJson(res, 200, await this.autoDreamOptimizer.getPublicState(agentId))
+      return
+    }
+    if (req.method === 'POST') {
+      this.sendJson(res, 202, await this.autoDreamOptimizer.startManual(agentId))
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  private async handleAutoDreamOptimizerCancel(
+    req: IncomingMessage,
+    res: ServerResponse,
+    agentId: string,
+  ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    this.sendJson(res, 202, await this.autoDreamOptimizer.cancel(agentId))
+  }
+
+  private async handleAutoDreamOptimizerProposal(
+    req: IncomingMessage,
+    res: ServerResponse,
+    agentId: string,
+    proposalId: string,
+    action: 'apply' | 'dismiss',
+  ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    this.sendJson(
+      res,
+      200,
+      action === 'apply'
+        ? await this.autoDreamOptimizer.apply(agentId, proposalId)
+        : await this.autoDreamOptimizer.dismiss(agentId, proposalId),
+    )
+  }
+
   // GET    /api/agents/:id/memory/files/:file → { file, content, version } | 404
   // PUT    /api/agents/:id/memory/files/:file  body { content, version? } → { ok, version } | 409 | 400
   // DELETE /api/agents/:id/memory/files/:file → { ok } | 404
@@ -7608,6 +7805,497 @@ export class Gateway {
       // 评测会话一次性:立即销毁,释放子进程/pids;失败不影响结果。
       await this.sessions.destroySession(sessionKey).catch(() => {})
     }
+  }
+
+  private async _loadAutoDreamAuditDataset(input: {
+    agentId: string
+    afterSeq: number | null
+    policy: AutoDreamOptimizerPolicy
+  }): Promise<AutoDreamAuditDataset> {
+    const successWindow = await listAutoDreamSuccessfulSessionsBetween({
+      agentId: input.agentId,
+      channels: ['webchat', 'wechat', 'telegram'],
+      afterSeq: input.afterSeq ?? 0,
+    })
+    const sessions =
+      input.afterSeq === null
+        ? await listAutoDreamAuditSessions(input.agentId)
+        : successWindow.sessions.map((row) => ({
+            id: row.id,
+            agentId: row.agentId,
+            channel: row.channel,
+            peerId: '',
+            title: '',
+            startedAt: row.completedAt,
+            lastAt: row.completedAt,
+            turnCount: 0,
+            totalCostUSD: 0,
+          }))
+    const byId = new Map(sessions.map((row) => [row.id, row]))
+    const pages: string[] = []
+    const memory = new MemoryDir(input.agentId)
+    await memory.ensureMigrated()
+    const memoryRows = await memory.list()
+    const memoryContent = await Promise.all(
+      memoryRows.map(async (row) => ({
+        file: row.file,
+        type: row.type,
+        content: (await memory.read(row.file))?.content ?? '',
+      })),
+    )
+    const skills = await buildAgentSkillStore(input.agentId).list({ includePlatform: true })
+    const skillContent = await Promise.all(
+      skills.map(async (skill) => {
+        const content = await buildAgentSkillStore(input.agentId).view(skill.name)
+        return {
+          name: skill.name,
+          layer: skill.layer,
+          description: skill.description,
+          content: content && typeof content !== 'string' ? content.rawContent : '',
+        }
+      }),
+    )
+    const profile = await readUserProfile()
+    const persona = await readFile(paths.agentClaudeMd(input.agentId), 'utf8').catch(() => '')
+    const cronJobs = this.cron
+      ? (await this.cron.listJobs()).filter((job) => job.agent === input.agentId)
+      : []
+    const platformContext = {
+      auditContract: {
+        consent: 'optimizer_v2',
+        applyRequiresUserConfirmation: true,
+        platformFindingsAutoReportedAnonymously: true,
+      },
+      capabilities: [
+        'multi-channel chat and durable sessions',
+        'memory and shared user profile',
+        'custom and marketplace skills',
+        'agent persona and rules',
+        'plugins/connectors and marketplace',
+        'scheduled tasks and reminders',
+        'model/default effort/preferences',
+        'goals, files, browser, research and office tools',
+      ],
+      preferences: input.policy.auditContext?.preferences ?? {},
+      installedPlugins: input.policy.auditContext?.installedPlugins ?? [],
+      memories: memoryContent,
+      userProfile: profile.text,
+      agentPersonaAndRules: persona,
+      skills: skillContent,
+      schedules: cronJobs,
+      proposalTargetRules: {
+        memory: 'targetId=memory/<file>.md; before/after must be exact complete file text',
+        profile: 'targetId=profile; before/after must be exact complete user profile text',
+        skill: 'targetId=skill/<name>; before/after must be exact complete SKILL.md',
+        ruleOrPersona:
+          'targetId=agent-persona; before/after must be exact complete agent CLAUDE.md',
+        preference:
+          'targetId must be an existing safe preference key shown in this page; before/after must be JSON.stringify(current/desired value)',
+        schedule:
+          'targetId=schedule/<existing-id or new>; before/after must be complete CronJob JSON',
+        platformSkills:
+          'platform/baseline skills are read-only; do not propose skill.upsert/delete for those names',
+      },
+    }
+    pages.push(...splitAuditEvidence('platform-context', JSON.stringify(platformContext)))
+
+    for (const meta of byId.values()) {
+      const [turns, events, usage] = await Promise.all([
+        loadSessionTurns(meta.id, null),
+        loadSessionEvents(meta.id),
+        loadSessionUsage(meta.id),
+      ])
+      pages.push(
+        ...splitAuditEvidence(
+          `session:${createHash('sha256').update(meta.id).digest('hex').slice(0, 16)}`,
+          JSON.stringify({
+            session: {
+              channel: meta.channel,
+              title: meta.title,
+              startedAt: meta.startedAt,
+              lastAt: meta.lastAt,
+              turnCount: meta.turnCount,
+            },
+            turns,
+            events: events.map(({ peerId: _peerId, ...event }) => event),
+            usage,
+          }),
+        ),
+      )
+    }
+    return {
+      pages,
+      sessionsReviewed: byId.size,
+      throughSeq: successWindow.throughSeq,
+    }
+  }
+
+  private async _runAutoDreamOptimizerModel(
+    input: AutoDreamOptimizerModelRun,
+    client: AutoDreamOptimizerClient,
+  ): Promise<string> {
+    const admission = await client.admit(input)
+    const cfg = await this._getAgentsConfig()
+    const sourceAgent =
+      cfg.agents.find((row) => row.id === input.agentId) ??
+      cfg.agents.find((row) => row.id === cfg.default)
+    if (!sourceAgent) {
+      await client.abandon(admission.requestId).catch(() => {})
+      throw new Error('AUTO_DREAM_AGENT_NOT_FOUND')
+    }
+    const agent: AgentDef = {
+      ...sourceAgent,
+      model: input.model,
+      provider: undefined,
+      runnerKind: undefined,
+      persona: undefined,
+      cwd: undefined,
+      mcpServers: [],
+      toolsets: [],
+    }
+    const execution = await resolveLocalExecutionIfEnforced({
+      agent,
+      kind: 'auto_dream',
+      model: input.model,
+      defaultModel: this.deps.config.defaults.model,
+    })
+    if (execution && execution.engine !== 'codex') {
+      await client.abandon(admission.requestId).catch(() => {})
+      throw new Error('AUTO_DREAM_MODEL_NOT_CODEX')
+    }
+    const model = execution?.canonicalModel ?? input.model
+    const sessionKey =
+      input.phase === 'map'
+        ? `auto-dream-optimizer:${input.callId}`
+        : `auto-dream-optimizer:${input.runId}:reduce`
+    const session = await this.sessions.getOrCreate({
+      sessionKey,
+      agent,
+      ...localExecutionOverride(execution),
+      channel: 'auto-dream',
+      peerId: sessionKey,
+      effortLevel: 'max',
+      workload: 'auto-dream',
+      hermeticNoTools: true,
+      structuredOutputSchema: AUTO_DREAM_OPTIMIZER_JSON_SCHEMA,
+    })
+    const text = new Map<string, string>()
+    const order: string[] = []
+    let finals = 0
+    let invalidEvent: string | null = null
+    let billing: import('@openclaude/protocol').DurableCodexBilling | null = null
+    let stagedBilling = false
+    let completed = false
+    try {
+      await this.sessions.submit(
+        session,
+        input.prompt,
+        (event) => {
+          if (event.kind === 'block') {
+            if (event.block.kind === 'thinking') return
+            if (event.block.kind === 'text') {
+              const id = event.block.messageId ?? 'output'
+              if (!text.has(id)) order.push(id)
+              text.set(id, `${text.get(id) ?? ''}${event.block.text ?? ''}`)
+              return
+            }
+            invalidEvent ??= `block:${event.block.kind}`
+            return
+          }
+          if (event.kind === 'codex_billing') {
+            if (billing) {
+              invalidEvent ??= 'multiple_billing'
+            } else {
+              billing = { ...event }
+              delete (billing as { kind?: string }).kind
+            }
+            return
+          }
+          if (event.kind === 'final') {
+            finals++
+            return
+          }
+          if (event.kind === 'turn_status') return
+          if (event.kind === 'error') invalidEvent ??= 'error'
+          else invalidEvent ??= event.kind
+        },
+        'max',
+        model,
+        admission.requestId,
+        undefined,
+        'default',
+        { codexRoute: admission.routeFrame },
+      )
+      if (billing) {
+        const stage = await client.stageBilling(input.agentId, billing)
+        stagedBilling = true
+        await client.settleStaged(input.agentId, billing, stage)
+      }
+      if (!billing) throw new Error('AUTO_DREAM_MISSING_BILLING')
+      if (finals !== 1) throw new Error(`AUTO_DREAM_FINAL_COUNT_${finals}`)
+      if (invalidEvent) throw new Error(`AUTO_DREAM_INVALID_EVENT_${invalidEvent}`)
+      const output = order.map((id) => text.get(id) ?? '').join('').trim()
+      if (!output) throw new Error('AUTO_DREAM_EMPTY_OUTPUT')
+      completed = true
+      return output
+    } finally {
+      if (!billing && !stagedBilling) await client.abandon(admission.requestId).catch(() => {})
+      if (input.phase === 'map' || !completed) {
+        await this.sessions.destroySession(sessionKey).catch(() => {})
+      }
+    }
+  }
+
+  private async _hydrateAutoDreamOptimizerProposals(input: {
+    runId: string
+    agentId: string
+    proposals: AutoDreamOptimizerProposal[]
+  }): Promise<AutoDreamOptimizerProposal[]> {
+    const policy = await new AutoDreamPolicyClient().get({ fresh: true })
+    if (!policy.enabled || policy.mode !== 'optimizer_v2') {
+      throw new Error('AUTO_DREAM_OPTIMIZER_NOT_ENABLED')
+    }
+    const [profile, persona, jobs] = await Promise.all([
+      readUserProfile(),
+      readFile(paths.agentClaudeMd(input.agentId), 'utf8').catch(() => ''),
+      this.cron ? this.cron.listJobs() : Promise.resolve([]),
+    ])
+    const skillStore = buildAgentSkillStore(input.agentId)
+    const userSkills = new Map(
+      (await skillStore.list({ includePlatform: false })).map((skill) => [skill.name, skill]),
+    )
+    const preferenceSnapshot = policy.auditContext?.preferences ?? {}
+    const hydrated: AutoDreamOptimizerProposal[] = []
+
+    for (const proposal of input.proposals) {
+      let targetId = proposal.targetId
+      let before = ''
+      let after = proposal.after
+      if (proposal.action === 'profile.replace') {
+        before = profile.text
+      } else if (proposal.action === 'memory.upsert' || proposal.action === 'memory.delete') {
+        const file = proposal.targetId.replace(/^memory\//, '')
+        const current = await new MemoryDir(input.agentId).read(file)
+        if (proposal.action === 'memory.delete') {
+          if (!current) continue
+          after = ''
+        }
+        before = current?.content ?? ''
+      } else if (proposal.action === 'skill.upsert' || proposal.action === 'skill.delete') {
+        const name = proposal.targetId.replace(/^skill\//, '')
+        const metadata = userSkills.get(name)
+        if (metadata && !metadata.writable) continue
+        const current = await skillStore.view(name, undefined, { includePlatform: false })
+        if (proposal.action === 'skill.delete') {
+          if (!current || typeof current === 'string') continue
+          after = ''
+        }
+        before = current && typeof current !== 'string' ? current.rawContent : ''
+      } else if (
+        proposal.action === 'rule.replace' ||
+        proposal.action === 'agent.persona.replace'
+      ) {
+        before = persona
+      } else if (proposal.action === 'preference.patch') {
+        const key = proposal.targetId.slice('preferences.'.length)
+        const current = Object.prototype.hasOwnProperty.call(preferenceSnapshot, key)
+          ? preferenceSnapshot[key]
+          : null
+        before = JSON.stringify(current)
+      } else if (
+        proposal.action === 'schedule.upsert' ||
+        proposal.action === 'schedule.delete'
+      ) {
+        const requestedId = proposal.targetId.replace(/^schedule\//, '')
+        const jobId =
+          requestedId === 'new'
+            ? `auto-dream-${createHash('sha256')
+                .update(`${input.runId}\0${proposal.after}`)
+                .digest('hex')
+                .slice(0, 24)}`
+            : requestedId
+        if (jobs.some((job) => job.id === jobId && job.agent !== input.agentId)) continue
+        const current = jobs.find((job) => job.id === jobId && job.agent === input.agentId)
+        if (proposal.action === 'schedule.delete') {
+          if (!current) continue
+          after = ''
+        } else {
+          try {
+            after = JSON.stringify(normalizeAutoDreamSchedule(after, input.agentId, jobId))
+          } catch {
+            continue
+          }
+        }
+        before = current ? JSON.stringify(current) : ''
+        targetId = `schedule/${jobId}`
+      } else if (proposal.action === 'plugin.install' || proposal.action === 'manual.review') {
+        before = ''
+      } else {
+        continue
+      }
+
+      const fingerprint = createHash('sha256')
+        .update(`${proposal.action}\0${targetId}\0${before}\0${after}`)
+        .digest('hex')
+      hydrated.push({
+        ...proposal,
+        id: createHash('sha256')
+          .update(`${input.runId}\0${hydrated.length}\0${fingerprint}`)
+          .digest('hex')
+          .slice(0, 32),
+        fingerprint,
+        targetId,
+        before,
+        after,
+        beforeFingerprint: createHash('sha256').update(before).digest('hex'),
+      })
+    }
+    return hydrated
+  }
+
+  private async _applyAutoDreamOptimizerProposal(
+    input: { agentId: string; proposal: AutoDreamOptimizerProposal },
+    client: AutoDreamOptimizerClient,
+  ): Promise<{ ok: true; result?: string } | { ok: false; conflict: string }> {
+    const { agentId, proposal } = input
+    if (proposal.action === 'preference.patch') {
+      return await client.applyMasterProposal(proposal)
+    }
+    if (proposal.action === 'profile.replace') {
+      const current = await readUserProfile()
+      if (current.text === proposal.after) return { ok: true, result: 'profile already applied' }
+      if (createHash('sha256').update(current.text).digest('hex') !== proposal.beforeFingerprint) {
+        return { ok: false, conflict: '用户画像已在审计后发生变化。' }
+      }
+      const result = await writeUserProfile(proposal.after, current.version)
+      return result.ok
+        ? { ok: true, result: 'profile applied' }
+        : { ok: false, conflict: 'conflict' in result ? '用户画像已发生变化。' : result.error }
+    }
+    if (proposal.action === 'memory.upsert' || proposal.action === 'memory.delete') {
+      const file = proposal.targetId.replace(/^memory\//, '')
+      if (!MEMORY_FILE_RE.test(file)) throw new Error('AUTO_DREAM_MEMORY_TARGET_INVALID')
+      const store = new MemoryDir(agentId)
+      const current = await store.read(file)
+      const currentText = current?.content ?? ''
+      if (proposal.action === 'memory.upsert' && currentText === proposal.after) {
+        return { ok: true, result: 'memory already applied' }
+      }
+      if (proposal.action === 'memory.delete' && !current) {
+        return { ok: true, result: 'memory already deleted' }
+      }
+      if (createHash('sha256').update(currentText).digest('hex') !== proposal.beforeFingerprint) {
+        return { ok: false, conflict: '该记忆已在审计后发生变化。' }
+      }
+      if (proposal.action === 'memory.delete') {
+        if (!current) return { ok: true, result: 'memory already deleted' }
+        const result = await store.applyBatchCas({
+          upserts: [],
+          deletes: [{ file, expectedVersion: current.version }],
+        })
+        return result.ok
+          ? { ok: true, result: 'memory deleted' }
+          : { ok: false, conflict: '该记忆已发生变化。' }
+      }
+      const result = await store.write(file, proposal.after, current?.version ?? null)
+      return result.ok
+        ? { ok: true, result: 'memory applied' }
+        : { ok: false, conflict: '该记忆已发生变化。' }
+    }
+    if (proposal.action === 'skill.upsert' || proposal.action === 'skill.delete') {
+      const name = proposal.targetId.replace(/^skill\//, '')
+      const store = buildAgentSkillStore(agentId)
+      const current = await store.view(name, undefined, { includePlatform: false })
+      const currentText = current && typeof current !== 'string' ? current.rawContent : ''
+      if (proposal.action === 'skill.delete' && !current) {
+        return { ok: true, result: 'skill already deleted' }
+      }
+      if (proposal.action === 'skill.upsert' && current && typeof current !== 'string') {
+        const desired = parseFrontmatter(proposal.after)
+        const currentParsed = parseFrontmatter(current.rawContent)
+        if (
+          desired.body === currentParsed.body &&
+          desired.meta.description === currentParsed.meta.description &&
+          JSON.stringify(desired.meta.tags ?? []) === JSON.stringify(currentParsed.meta.tags ?? []) &&
+          JSON.stringify(desired.meta.related_skills ?? []) ===
+            JSON.stringify(currentParsed.meta.related_skills ?? [])
+        ) {
+          return { ok: true, result: 'skill already applied' }
+        }
+      }
+      if (createHash('sha256').update(currentText).digest('hex') !== proposal.beforeFingerprint) {
+        return { ok: false, conflict: '该技能已在审计后发生变化。' }
+      }
+      if (proposal.action === 'skill.delete') {
+        const removed = await store.delete(name)
+        return removed.ok
+          ? { ok: true, result: 'skill deleted' }
+          : { ok: false, conflict: removed.error ?? '技能删除失败。' }
+      }
+      const parsed = parseFrontmatter(proposal.after)
+      const description =
+        typeof parsed.meta.description === 'string' ? parsed.meta.description : ''
+      const saved = await store.save(
+        {
+          name,
+          description,
+          version: parsed.meta.version,
+          tags: parsed.meta.tags,
+          related_skills: parsed.meta.related_skills,
+        },
+        parsed.body,
+      )
+      return saved.ok
+        ? { ok: true, result: 'skill applied' }
+        : { ok: false, conflict: saved.error ?? '技能保存失败。' }
+    }
+    if (proposal.action === 'rule.replace' || proposal.action === 'agent.persona.replace') {
+      if (proposal.targetId !== 'agent-persona') {
+        throw new Error('AUTO_DREAM_PERSONA_TARGET_INVALID')
+      }
+      const path = paths.agentClaudeMd(agentId)
+      const current = await readFile(path, 'utf8').catch(() => '')
+      if (current === proposal.after) return { ok: true, result: 'agent rules already applied' }
+      if (createHash('sha256').update(current).digest('hex') !== proposal.beforeFingerprint) {
+        return { ok: false, conflict: 'Agent 规则已在审计后发生变化。' }
+      }
+      await mkdir(dirname(path), { recursive: true })
+      const tmp = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
+      await writeFile(tmp, proposal.after, { mode: 0o600 })
+      await rename(tmp, path)
+      return { ok: true, result: 'agent rules applied' }
+    }
+    if (proposal.action === 'schedule.upsert' || proposal.action === 'schedule.delete') {
+      if (!this.cron) throw new Error('AUTO_DREAM_CRON_UNAVAILABLE')
+      const requestedId = proposal.targetId.replace(/^schedule\//, '')
+      const jobId = requestedId === 'new' ? `auto-dream-${proposal.id}` : requestedId
+      const jobs = await this.cron.listJobs()
+      const current = jobs.find((job) => job.id === jobId && job.agent === agentId)
+      if (jobs.some((job) => job.id === jobId && job.agent !== agentId)) {
+        throw new Error('AUTO_DREAM_SCHEDULE_TARGET_OWNED_BY_ANOTHER_AGENT')
+      }
+      const currentText = current ? JSON.stringify(current) : ''
+      let desired: import('./cron.js').CronJob | undefined
+      if (proposal.action === 'schedule.delete' && !current) {
+        return { ok: true, result: 'schedule already deleted' }
+      }
+      if (proposal.action === 'schedule.upsert') {
+        desired = normalizeAutoDreamSchedule(proposal.after, agentId, jobId)
+        const desiredText = JSON.stringify(desired)
+        if (currentText === desiredText) return { ok: true, result: 'schedule already applied' }
+      }
+      if (createHash('sha256').update(currentText).digest('hex') !== proposal.beforeFingerprint) {
+        return { ok: false, conflict: '该定时任务已在审计后发生变化。' }
+      }
+      if (proposal.action === 'schedule.delete') {
+        await this.cron.removeJob(jobId)
+        return { ok: true, result: 'schedule deleted' }
+      }
+      if (!desired) throw new Error('AUTO_DREAM_SCHEDULE_INVALID')
+      await this.cron.addJob(desired)
+      return { ok: true, result: 'schedule applied' }
+    }
+    throw new Error('AUTO_DREAM_ACTION_UNSUPPORTED')
   }
 
   /**
@@ -14039,6 +14727,15 @@ export class Gateway {
         void this.autoDream.maybeSchedule(autoDreamTrigger).catch((err) => {
           this.log.warn('auto_dream_background_failed', { agentId: agent.id }, err)
         })
+        void this.autoDreamOptimizer
+          .maybeSchedule({
+            agentId: agent.id,
+            sessionKey,
+            channel: frame.channel,
+          })
+          .catch((err) => {
+            this.log.warn('auto_dream_optimizer_background_failed', { agentId: agent.id }, err)
+          })
       }
     }
     if (liveWechatAdapter) {

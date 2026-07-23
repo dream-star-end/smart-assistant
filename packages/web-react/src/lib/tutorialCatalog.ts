@@ -561,14 +561,14 @@ export const TUTORIAL_TOPICS = {
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",
-    contentVersion: 2,
+    contentVersion: 4,
     intro:
-      "长期记忆保存你的身份、偏好、反馈、项目和参考信息，并按智能体隔离。你可以在管理中心逐条查看、编辑或删除。Auto-Dream 会在允许时整理近期经验、提出记忆变更并生成可审阅报告。",
-    outcome: "减少反复交代背景，让助手在长期使用中保持一致并持续改进。",
+      "长期记忆按智能体隔离保存稳定信息。新版 Auto-Dream 使用 GPT‑5.6 Terra，在你明确同意后结合 V5 平台能力和技能，全面审计相关会话、操作与日志，并提出记忆、设置、技能、规则、Agent、插件和定时任务等优化建议。",
+    outcome: "不只整理记忆，而是在保留用户控制权的前提下持续优化整个智能体工作环境。",
     scenarios: [
       "记住职业与沟通偏好",
-      "保存长期项目背景",
-      "复盘近期反馈并清理过时记忆",
+      "发现设置、技能或规则与实际用法不匹配",
+      "识别应新增插件、定时任务或平台能力的重复需求",
     ],
     steps: [
       {
@@ -584,15 +584,18 @@ export const TUTORIAL_TOPICS = {
         body: "信息变化时直接编辑或删除旧条目，避免新旧事实冲突。",
       },
       {
-        title: "审阅 Auto-Dream",
-        body: "开启后查看梦境报告里的新增、更新和清理记录，确认它是否符合你的真实情况。",
+        title: "开启并审阅全面优化",
+        body: "先确认数据范围、计费和匿名平台发现上报方式，再到管理中心 → 全面优化逐项查看 Diff；内容和设置经你确认才应用，平台发现仅上报去内容、去身份的分类与计数。",
       },
     ],
     tips: [
       "只记长期稳定、未来会复用的信息。",
-      "项目结束后删除或更新项目记忆，回答会更干净。",
+      "建议冲突时先重新审计，不要覆盖审计后由你手动修改的内容。",
     ],
-    cautions: ["不要把密码、密钥、身份证号等秘密写进长期记忆。"],
+    cautions: [
+      "全面审计按 GPT‑5.6 Terra 实际用量计费；执行环境禁用工具和网络。",
+      "不要把密码、密钥、身份证号等秘密写进长期记忆。",
+    ],
     example:
       "请记住：我负责 B2B SaaS 产品，写方案时优先给结论和可量化指标，不要用空泛营销词。",
     media: "memory-auto-dream",
@@ -600,7 +603,7 @@ export const TUTORIAL_TOPICS = {
   },
   "schedules-reminders": {
     featureId: "schedules-reminders",
-    contentVersion: 2,
+    contentVersion: 4,
     intro:
       "定时任务让智能体在未来某个时间自动执行提示词，并把结果送到网页对话或其他已配置通道。既支持一次性提醒，也支持工作日、每周、每月等周期计划；管理中心可暂停、编辑和删除。",
     outcome: "把重复的信息整理、提醒和例行检查交给系统自动完成。",
@@ -620,7 +623,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "在管理中心维护",
-        body: "查看下一次执行时间，按需暂停、修改计划或删除不再需要的任务。",
+        body: "查看下一次执行时间，按需暂停、修改或删除任务；Auto-Dream 根据重复需求提出的调整也必须先看完整配置差异并确认。",
       },
     ],
     tips: [
@@ -637,7 +640,7 @@ export const TUTORIAL_TOPICS = {
   },
   "skills-training": {
     featureId: "skills-training",
-    contentVersion: 2,
+    contentVersion: 4,
     intro:
       "技能是一套在特定场景自动启用的可复用工作流程，包含说明、参考资料、脚本和评测用例。管理中心可查看市场安装和个人自建的技能，编辑自己的技能，运行评测，并让训练流程基于失败案例提出改进草稿。",
     outcome: "把一次成功做法固化成稳定流程，并用评测防止后续修改退化。",
@@ -661,7 +664,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "审阅训练草稿",
-        body: "AI 训练只生成候选改动；比较差异、留下评论并确认后再合并。",
+        body: "AI 训练和 Auto-Dream 全面审计都只生成技能候选改动；结合真实使用比较完整 Diff、留下评论并确认后再合并。",
       },
     ],
     tips: [

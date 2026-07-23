@@ -787,6 +787,39 @@ export type AutoDreamReportResponse = {
   lastReport?: AutoDreamLastReport;
 };
 
+export type AutoDreamOptimizerProposal = {
+  id: string;
+  fingerprint: string;
+  category: string;
+  action: string;
+  title: string;
+  reason: string;
+  targetId: string;
+  before: string;
+  after: string;
+  beforeFingerprint: string;
+  state: "pending" | "applied" | "dismissed" | "conflict";
+  createdAt: string;
+  appliedAt?: string;
+  error?: string;
+};
+
+export type AutoDreamOptimizerState = {
+  schemaVersion: 2;
+  status: "idle" | "running" | "success" | "failed" | "cancelled";
+  runId?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  lastSuccessAt?: string;
+  sessionsProcessedThroughSeq?: number;
+  sessionsReviewed: number;
+  pagesReviewed: number;
+  summary?: string;
+  error?: string;
+  cancelRequestedAt?: string;
+  proposals: AutoDreamOptimizerProposal[];
+};
+
 /** 技能列表项（GET /api/skills 的 skills 项）。 */
 export type SkillSummary = {
   name: string;

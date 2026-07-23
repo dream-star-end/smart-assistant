@@ -190,6 +190,10 @@ export interface CodexAppServerRunnerOpts {
    *  内部读 `_repoWorkspace.getRepoSnapshot(sessionId)`。返 null = 无绑定;
    *  返 ready = 已绑定可用;返 cloning/failed/pending = 不可用,运行时回退 opts.cwd。 */
   getRepoSnapshot?: (sessionId: string) => RepoSnapshot | null
+  /** One-shot audit isolation: empty cwd, no platform prompt/MCP/tools/network. */
+  hermeticNoTools?: boolean
+  /** Codex app-server turn/start structured output contract. */
+  structuredOutputSchema?: Readonly<Record<string, unknown>>
 }
 
 interface QueuedTurn {
@@ -1119,6 +1123,7 @@ export class CodexAppServerRunner extends EventEmitter {
    *  in `ensureSpawned()` whenever a fresh app-server process needs platform
    *  context, cleaned on `shutdown()` and on proc close. */
   private sessionDir: string | null = null
+  private hermeticDir: string | null = null
   /** Cached overrides for the lifetime of the current proc. Cleared together
    *  with `sessionDir` so the next post-shutdown spawn lazy-rebuilds. */
   private cachedOverrides: CodexLaunchOverrides | null = null
@@ -1316,6 +1321,7 @@ export class CodexAppServerRunner extends EventEmitter {
     try {
       return this.opts.getRepoSnapshot(this.opts.sessionId)
     } catch (err) {
+      if (this.opts.hermeticNoTools) throw err
       log.warn(
         'getRepoSnapshot threw; treating as no-bind',
         { sessionKey: this.opts.sessionKey, err: (err as Error).message },
@@ -1328,6 +1334,11 @@ export class CodexAppServerRunner extends EventEmitter {
    *  ready+workspaceDir → 用 workspaceDir + 记录 binding;其它 → 回退 opts.cwd
    *  + binding=null。返回值是 spawn / thread/start / thread/resume 都用的 cwd。 */
   private _applyRepoBindingFromSnapshot(snap: RepoSnapshot | null): string {
+    if (this.opts.hermeticNoTools) {
+      this._boundRepoBinding = null
+      if (!this.hermeticDir) this.hermeticDir = mkdtempSync(join(tmpdir(), 'oc-codex-hermetic-'))
+      return this.hermeticDir
+    }
     if (snap?.status === 'ready' && snap.workspaceDir) {
       this._boundRepoBinding = {
         selectionVersion: snap.selectionVersion,
@@ -1464,6 +1475,7 @@ export class CodexAppServerRunner extends EventEmitter {
   private async ensureLaunchOverrides(
     repoSnap: RepoSnapshot | null,
   ): Promise<CodexLaunchOverrides | null> {
+    if (this.opts.hermeticNoTools) return null
     if (!this.opts.config) return null
     if (this.cachedOverrides && this.sessionDir) return this.cachedOverrides
     // Cache miss with an existing sessionDir means updateConfig invalidated
@@ -1536,6 +1548,19 @@ export class CodexAppServerRunner extends EventEmitter {
       this.sessionDir = null
     }
     this.cachedOverrides = null
+  }
+
+  private cleanupHermeticDir(): void {
+    if (!this.hermeticDir) return
+    try {
+      rmSync(this.hermeticDir, { recursive: true, force: true })
+    } catch (err) {
+      log.warn('codex hermetic cwd cleanup failed', {
+        sessionKey: this.opts.sessionKey,
+        err: (err as Error).message,
+      })
+    }
+    this.hermeticDir = null
   }
 
   async start(): Promise<void> {
@@ -1668,6 +1693,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // overrides reference after we rmSync the dir would point codex at a
     // deleted file on respawn.
     this.cleanupLaunchOverrides()
+    this.cleanupHermeticDir()
     this.shuttingDown = false
   }
 
@@ -1728,8 +1754,24 @@ export class CodexAppServerRunner extends EventEmitter {
     // buildCodexLaunchOverrides 内 buildPromptContext 的 REPO slot。
     let argvOverrides: string[] = []
     try {
-      const overrides = await this.ensureLaunchOverrides(repoSnap)
-      if (overrides) argvOverrides = overrides.argvOverrides
+      if (this.opts.hermeticNoTools) {
+        argvOverrides = [
+          '-c', 'mcp_servers={}',
+          '-c', 'features.shell_tool=false',
+          '-c', 'features.unified_exec=false',
+          '-c', 'features.apps=false',
+          '-c', 'features.plugins=false',
+          '-c', 'features.browser_use=false',
+          '-c', 'features.browser_use_external=false',
+          '-c', 'features.computer_use=false',
+          '-c', 'features.image_generation=false',
+          '-c', 'features.multi_agent=false',
+          '-c', 'features.multi_agent_v2=false',
+        ]
+      } else {
+        const overrides = await this.ensureLaunchOverrides(repoSnap)
+        if (overrides) argvOverrides = overrides.argvOverrides
+      }
     } catch (err) {
       log.warn(
         'codex app-server launch overrides build failed; spawning without platform context',
@@ -2392,9 +2434,14 @@ export class CodexAppServerRunner extends EventEmitter {
         },
       },
       sandboxPolicy:
-        mode === 'plan' ? { type: 'readOnly', networkAccess: true } : { type: 'dangerFullAccess' },
+        this.opts.hermeticNoTools
+          ? { type: 'readOnly', networkAccess: false }
+          : mode === 'plan'
+            ? { type: 'readOnly', networkAccess: true }
+            : { type: 'dangerFullAccess' },
     }
     if (this.opts.model) params.model = this.opts.model
+    if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
     return params
   }
 
@@ -3096,7 +3143,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
     const res = (await this.sendRequest('thread/start', {
       approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
+      sandbox: this.opts.hermeticNoTools ? 'read-only' : 'danger-full-access',
       cwd: effectiveCwd,
       ...(this.opts.model ? { model: this.opts.model } : {}),
     })) as { thread?: { id?: string } } | undefined

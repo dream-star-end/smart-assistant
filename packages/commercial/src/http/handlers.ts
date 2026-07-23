@@ -1333,7 +1333,11 @@ export async function handleGetMyPreferences(
   const { getPreferences } = await import("../user/preferences.js");
   const { getAutoDreamFeature } = await import("../user/autoDream.js");
   const snap = await getPreferences(user.id);
-  const autoDream = await getAutoDreamFeature(user.id, snap.prefs.auto_dream_enabled === true);
+  const autoDream = await getAutoDreamFeature(
+    user.id,
+    snap.prefs.auto_dream_enabled === true,
+    snap.prefs.auto_optimizer_enabled === true,
+  );
   sendJson(res, 200, { ...snap, features: { auto_dream: autoDream } });
 }
 
@@ -1349,7 +1353,8 @@ export async function handlePatchMyPreferences(
     throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
   }
   const requestedAutoDream = (body as Record<string, unknown>).auto_dream_enabled;
-  if (requestedAutoDream === true) {
+  const requestedOptimizer = (body as Record<string, unknown>).auto_optimizer_enabled;
+  if (requestedAutoDream === true || requestedOptimizer === true) {
     const { getAutoDreamFeature } = await import("../user/autoDream.js");
     const feature = await getAutoDreamFeature(user.id, true);
     if (!feature.eligible) {
@@ -1359,11 +1364,19 @@ export async function handlePatchMyPreferences(
       throw new HttpError(503, "AUTO_DREAM_UNAVAILABLE", "Auto-Dream model is unavailable");
     }
   }
+  const { normalizeAutoDreamPreferencePatch } = await import("../user/autoDream.js");
+  const effectiveBody = normalizeAutoDreamPreferencePatch(body as Record<string, unknown>);
+  // V2 and V1 are mutually exclusive. Turning on V2 first turns the legacy
+  // auto-mutating path off, so rolling back to an older runtime remains safe.
   const { patchPreferences, PreferencesError } = await import("../user/preferences.js");
   try {
-    const snap = await patchPreferences(user.id, body);
+    const snap = await patchPreferences(user.id, effectiveBody);
     const { getAutoDreamFeature } = await import("../user/autoDream.js");
-    const autoDream = await getAutoDreamFeature(user.id, snap.prefs.auto_dream_enabled === true);
+    const autoDream = await getAutoDreamFeature(
+      user.id,
+      snap.prefs.auto_dream_enabled === true,
+      snap.prefs.auto_optimizer_enabled === true,
+    );
     sendJson(res, 200, { ...snap, features: { auto_dream: autoDream } });
   } catch (err) {
     if (err instanceof PreferencesError) {

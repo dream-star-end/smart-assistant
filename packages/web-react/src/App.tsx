@@ -2275,7 +2275,7 @@ export function App() {
             onPreferencesChange={applyConversationPreferences}
             onOpenMemory={() => {
               setSettingsOpen(false);
-              openManage("memory");
+              openManage("optimization");
             }}
           />
         </LazyBoundary>

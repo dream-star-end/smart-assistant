@@ -222,6 +222,7 @@ describe('AutoDreamService cadence', () => {
       policyClient: {
         get: async () => ({
           enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
           modelId: 'deepseek-v4-flash',
           modelName: 'DeepSeek V4 Flash',
           minIntervalHours: 24,
@@ -289,6 +290,7 @@ describe('AutoDreamService cadence', () => {
       policyClient: {
         get: async () => ({
           enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
           modelId: 'deepseek-v4-flash',
           modelName: 'DeepSeek V4 Flash',
           minIntervalHours: 24,
@@ -323,6 +325,7 @@ describe('AutoDreamService cadence', () => {
           if (options?.fresh) return { enabled: false as const }
           return {
             enabled: true as const,
+            mode: 'legacy_memory_v1' as const,
             modelId: 'deepseek-v4-flash',
             modelName: 'DeepSeek V4 Flash',
             minIntervalHours: 24,
@@ -362,6 +365,7 @@ describe('AutoDreamService cadence', () => {
       policyClient: {
         get: async () => ({
           enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
           modelId: 'deepseek-v4-flash',
           modelName: 'DeepSeek V4 Flash',
           minIntervalHours: 24,
@@ -405,6 +409,7 @@ describe('AutoDreamService cadence', () => {
       policyClient: {
         get: async () => ({
           enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
           modelId: 'deepseek-v4-flash',
           modelName: 'DeepSeek V4 Flash',
           minIntervalHours: 24,
@@ -464,6 +469,7 @@ describe('AutoDreamService cadence', () => {
       policyClient: {
         get: async () => ({
           enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
           modelId: 'deepseek-v4-flash',
           modelName: 'DeepSeek V4 Flash',
           minIntervalHours: 24,
@@ -524,6 +530,7 @@ describe('AutoDreamService cadence', () => {
       policyClient: {
         get: async () => ({
           enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
           modelId: 'private-model-id',
           modelName: 'Private Model Name',
           minIntervalHours: 24,
@@ -609,6 +616,7 @@ describe('AutoDreamService cadence', () => {
       policyClient: {
         get: async () => ({
           enabled: true as const,
+          mode: 'legacy_memory_v1' as const,
           modelId: 'hidden-model',
           modelName: 'Hidden Model',
           minIntervalHours: 24,
@@ -697,6 +705,7 @@ describe('AutoDreamService cadence', () => {
         policyClient: {
           get: async () => ({
             enabled: true as const,
+            mode: 'legacy_memory_v1' as const,
             modelId: 'private-model',
             modelName: 'Private Model',
             minIntervalHours: 24,
