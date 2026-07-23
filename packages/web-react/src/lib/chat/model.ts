@@ -11,6 +11,7 @@
  */
 import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
+import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { InboundMessage, MediaRef } from "./frames";
 
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
@@ -215,6 +216,8 @@ export type ChatMessage = {
   _imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
   /** 含附件的完整模型可见文本（regen 用）。*/
   _modelText?: string;
+  /** 用户发送时冻结的精确引用快照；渲染与重试都复用同一份。 */
+  _replyTo?: MessageReplyQuote;
   /** 首发时的路由快照；重试旧消息时不能被后续 turn 的选择覆盖。*/
   _routing?: ChatRoutingSnapshot;
   /** Stable logical-send attempt. Reconnect/offline replay keeps the current

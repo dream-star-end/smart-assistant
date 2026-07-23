@@ -114,6 +114,38 @@ describe("F2 「+」按钮闭合态目标角标", () => {
   });
 });
 
+describe("消息引用 Composer 预览", () => {
+  const replyTo = {
+    messageId: "assistant-quote",
+    role: "assistant" as const,
+    text: "这是完整的被引用回答",
+  };
+
+  test("预览可取消且不改正文", () => {
+    const onCancelReply = vi.fn();
+    render(<Composer onSend={() => {}} replyTo={replyTo} onCancelReply={onCancelReply} />);
+    const textarea = screen.getByPlaceholderText("给 OpenClaude 发消息…");
+    fireEvent.change(textarea, { target: { value: "当前问题" } });
+    expect(screen.getByText("正在引用 OpenClaude")).toBeInTheDocument();
+    expect(screen.getByText(replyTo.text)).toHaveClass("line-clamp-2");
+    fireEvent.click(screen.getByRole("button", { name: "取消引用" }));
+    expect(onCancelReply).toHaveBeenCalledTimes(1);
+    expect(textarea).toHaveValue("当前问题");
+  });
+
+  test("发送把当前正文与精确引用分别交给发送链并清除引用", () => {
+    const onSend = vi.fn();
+    const onCancelReply = vi.fn();
+    render(<Composer onSend={onSend} replyTo={replyTo} onCancelReply={onCancelReply} />);
+    fireEvent.change(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+      target: { value: "请解释这一段" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(onSend).toHaveBeenCalledWith("请解释这一段", undefined, replyTo);
+    expect(onCancelReply).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("AttachChip（附件 chip 上传失败重试）", () => {
   test("error 态且持有 File + onRetry → 显示「重试」，点击回调复用重传入口", () => {
     const onRetry = vi.fn();

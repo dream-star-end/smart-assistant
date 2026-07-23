@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
+import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
@@ -61,9 +62,11 @@ export function Composer({
   goal,
   onSetGoal,
   onGoalAction,
+  replyTo,
+  onCancelReply,
 }: {
-  /** 发送：text + 可选已上传媒体（图片/文件等）。 */
-  onSend: (text: string, media?: MediaRef[]) => void;
+  /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
+  onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
   busy?: boolean;
   onStop?: () => void;
   disabled?: boolean;
@@ -84,6 +87,10 @@ export function Composer({
   onSetGoal?: (input: GoalSetInput) => Promise<void>;
   /** 目标状态流转（暂停/继续/完成/清除）。 */
   onGoalAction?: (action: "pause" | "resume" | "complete" | "clear") => Promise<void>;
+  /** 当前会话 Composer 正在引用的精确消息快照。 */
+  replyTo?: MessageReplyQuote | null;
+  /** 取消当前引用，不影响已输入正文和附件。 */
+  onCancelReply?: () => void;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -118,7 +125,7 @@ export function Composer({
   // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟(reload 会丢 useState 里的
   // 草稿,composer 草稿当前不持久化)。ref 镜像 state 让探针零依赖渲染闭包。
   const draftBusyRef = useRef(false);
-  draftBusyRef.current = value.trim().length > 0 || attachments.length > 0;
+  draftBusyRef.current = value.trim().length > 0 || attachments.length > 0 || !!replyTo;
   useEffect(() => appUpdate.registerBusyProbe(() => draftBusyRef.current), []);
 
   const makePreview = useCallback((file: File): string => {
@@ -149,6 +156,11 @@ export function Composer({
     requestAnimationFrame(() => ref.current?.focus());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefill?.nonce]);
+
+  useEffect(() => {
+    if (!replyTo) return;
+    requestAnimationFrame(() => ref.current?.focus());
+  }, [replyTo]);
 
   const onVoiceText = useCallback((text: string) => {
     setVoiceMsg(null);
@@ -199,10 +211,11 @@ export function Composer({
     // 发出(对标 ChatGPT/Claude),用户不再干等。并轨安全由 service 侧保证——排队项只在
     // 本会话 _sendingInFlight 清除后才真正下发,绝不 mid-turn 并发送(见 socket.dispatchPayload)。
     if (disabled || !canSend) return;
-    onSend(value.trim(), doneMedia.length ? doneMedia : undefined);
+    onSend(value.trim(), doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
     setValue("");
     for (const a of attachments) revoke(a.previewUrl);
     setAttachments([]);
+    onCancelReply?.();
   };
 
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
@@ -273,6 +286,28 @@ export function Composer({
           "focus-within:border-border-strong",
         )}
       >
+        {replyTo && (
+          <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
+            <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
+              <div className="mb-0.5 text-[11px] font-medium text-muted">
+                正在引用 {replyTo.role === "assistant" ? "OpenClaude" : "你"}
+              </div>
+              <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 text-fg/75">
+                {replyTo.text}
+              </div>
+            </div>
+            <IconButton
+              aria-label="取消引用"
+              title="取消引用"
+              size="sm"
+              shape="square"
+              className="shrink-0 [@media(hover:none)]:size-11"
+              onClick={onCancelReply}
+            >
+              <X size={15} />
+            </IconButton>
+          </div>
+        )}
         {/* 附件 chips */}
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-2 px-3.5 pt-3">

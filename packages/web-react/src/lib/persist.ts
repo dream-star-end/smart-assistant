@@ -1093,6 +1093,9 @@ function mergeLocalClientFields(
       ...(localMsg._retryMedia !== undefined ? { _retryMedia: localMsg._retryMedia } : {}),
       ...(localMsg._imageEdit !== undefined ? { _imageEdit: localMsg._imageEdit } : {}),
       ...(localMsg._modelText !== undefined ? { _modelText: localMsg._modelText } : {}),
+      ...(serverMsg._replyTo === undefined && localMsg._replyTo !== undefined
+        ? { _replyTo: localMsg._replyTo }
+        : {}),
       ...(localMsg._routing !== undefined ? { _routing: localMsg._routing } : {}),
     };
     return Object.keys(localFields).length > 0 ? { ...serverMsg, ...localFields } : serverMsg;

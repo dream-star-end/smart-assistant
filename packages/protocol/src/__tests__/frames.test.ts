@@ -110,6 +110,34 @@ describe('InboundMessage schema', () => {
       content: { text: '模型正文\n[附件提示]', displayText: '模型正文' },
     }), true)
   })
+  it('accepts an exact reply snapshot and rejects malformed reply identities', () => {
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      replyToId: 'assistant-1',
+      content: {
+        text: '请解释这一段',
+        replyTo: {
+          messageId: 'assistant-1',
+          role: 'assistant',
+          text: '完整历史回答',
+        },
+      },
+    }), true)
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      content: {
+        text: 'bad role',
+        replyTo: { messageId: 'assistant-1', role: 'tool', text: 'x' },
+      },
+    }), false)
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      content: {
+        text: 'bad id',
+        replyTo: { messageId: 'line\nbreak', role: 'assistant', text: 'x' },
+      },
+    }), false)
+  })
   it('accepts valid clientTraceId', () => {
     assert.equal(
       Value.Check(InboundMessage, { ...(baseInbound() as object), clientTraceId: VALID_TRACE }),

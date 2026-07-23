@@ -102,9 +102,11 @@ import {
   computeDispatchRequestHash,
   isCodexEngineModel,
   isClientMessageId,
+  formatMessageReplyPrompt,
   modelHistorySemanticRole,
   modelHistorySemanticText,
   newTraceId,
+  normalizeMessageReplyQuote,
   parseTraceIdCandidate,
   stripModelAuthorityField,
   type ModelAuthorityBundle,
@@ -112,6 +114,7 @@ import {
   type ModelExecutionDescriptor,
   type TraceIdIssue,
   type GoalStateSnapshot,
+  type MessageReplyQuote,
   type DispatchRequestContent,
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
@@ -972,6 +975,7 @@ export interface UserChatBridgeDeps {
       _retryMedia?: unknown[];
       _imageEdit?: Record<string, unknown>;
       _modelText?: string;
+      _replyTo?: MessageReplyQuote;
       _routing?: { model?: string; teamMode: boolean; effortLevel: string | null };
     },
   ) => Promise<{
@@ -2843,13 +2847,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         ? frameObj.clientMessageId
         : null;
       const frameContent = frameObj.content && typeof frameObj.content === "object"
-        ? frameObj.content as { text?: unknown }
+        ? frameObj.content as { text?: unknown; replyTo?: unknown }
         : null;
-      const currentUserText = typeof frameObj.content === "string"
+      const replyTo = normalizeMessageReplyQuote(frameContent?.replyTo);
+      const currentUserText = formatMessageReplyPrompt(
+        typeof frameObj.content === "string"
         ? frameObj.content
         : typeof frameContent?.text === "string"
           ? frameContent.text
-          : "";
+          : "",
+        replyTo,
+      );
       const sendAdmissionAck = (): void => {
         if (clientMessageId === null) return;
         const idempotencyKey = typeof frameObj.idempotencyKey === "string"
@@ -2982,6 +2990,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               displayText?: unknown;
               media?: unknown;
               imageEdit?: unknown;
+              replyTo?: unknown;
             }
           : {};
         const rawMedia = Array.isArray(content.media) ? content.media : [];
@@ -3019,6 +3028,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(rawImageEdit && rawMedia.length > 0 ? { _retryMedia: rawMedia } : {}),
           ...(rawImageEdit ? { _imageEdit: rawImageEdit } : {}),
           ...(displayText !== modelText ? { _modelText: modelText } : {}),
+          ...(replyTo ? { _replyTo: replyTo } : {}),
           _routing: routing,
         };
         if (useDispatchAdmission && deps.admitUserTurn) {

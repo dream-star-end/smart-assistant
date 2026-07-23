@@ -21,7 +21,11 @@ import { createServer } from "node:http";
 import { request as undiciRequest } from "undici";
 import { Pool } from "pg";
 import type { ClientSession, ClientTimelineCursor, MessageLike } from "@openclaude/storage";
-import { LOSSLESS_TURN_TAPE_PART_BYTES, LOSSLESS_TURN_TAPE_VERSION } from "@openclaude/protocol";
+import {
+  formatMessageReplyPrompt,
+  LOSSLESS_TURN_TAPE_PART_BYTES,
+  LOSSLESS_TURN_TAPE_VERSION,
+} from "@openclaude/protocol";
 import { createHash, randomUUID } from "node:crypto";
 import {
   createPgSessionsBackend,
@@ -4095,6 +4099,13 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     const clientMessageId = "cm-dd-large-user";
     const text = `LARGE-USER-HEAD\n${"超长用户真实正文😀".repeat(300_000)}\nLARGE-USER-TAIL`;
     const exactModelText = "MODEL-VISIBLE\u0000EXACT-PROMPT";
+    const replyTo = {
+      messageId: "assistant-before-large-user",
+      role: "assistant" as const,
+      text: `QUOTE-HEAD\n${"被引用的完整历史回答".repeat(30_000)}\nQUOTE-TAIL`,
+    };
+    const expectedModelText = formatMessageReplyPrompt(exactModelText, replyTo)
+      .replaceAll("\u0000", "\\u0000");
     assert.ok(Buffer.byteLength(text, "utf8") > 4 * 1024 * 1024);
     await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
     const admitted = await backend.admitUserTurn(admitInput({
@@ -4106,6 +4117,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         role: "user",
         text,
         _modelText: exactModelText,
+        _replyTo: replyTo,
         ts: 1_783_950_000_123,
         _media: [{ kind: "image", url: "/api/media/guide.png" }],
         _retryMedia: [
@@ -4177,6 +4189,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(decoded.role, "user");
     assert.equal(decoded.text, text);
     assert.equal(decoded._modelText, exactModelText);
+    assert.deepEqual(decoded._replyTo, replyTo);
     assert.equal(decoded._source, "server");
     assert.deepEqual(decoded._retryMedia, [
       { kind: "image", url: "/api/media/source.png", hidden: true },
@@ -4204,15 +4217,15 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     });
     assert.equal(modelContext?.length, 1);
     assert.equal(modelContext?.[0]?.role, "user");
-    assert.equal(modelContext?.[0]?.text, "MODEL-VISIBLE\\u0000EXACT-PROMPT");
+    assert.equal(modelContext?.[0]?.text, expectedModelText);
     assert.equal(modelContext?.[0]?.text?.includes("\u0000"), false);
     assert.equal((modelContext?.[0] as MessageLike)._userPayloadDeferred, undefined);
 
     const finiteModelContext = await backend.getEngineContextMessages(sessionId, CUSER, {
-      contextWindow: 2_000,
+      contextWindow: 1_000_000,
     });
     assert.equal(finiteModelContext?.length, 1);
-    assert.equal(finiteModelContext?.[0]?.text, "MODEL-VISIBLE\\u0000EXACT-PROMPT");
+    assert.equal(finiteModelContext?.[0]?.text, expectedModelText);
     assert.equal(finiteModelContext?.[0]?.text?.includes("\u0000"), false);
     const sidecar = (
       await pool.query<{ text_payload: string }>(
@@ -4221,8 +4234,19 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         [sessionId, CUSER, clientMessageId],
       )
     ).rows[0]!.text_payload;
-    assert.equal(sidecar, "MODEL-VISIBLE\\u0000EXACT-PROMPT");
+    assert.equal(sidecar, expectedModelText);
     assert.equal(sidecar.includes("\u0000"), false);
+
+    const refreshedBackend = createPgSessionsBackend(pool, { expectedGeneration: GENERATION });
+    const refreshedMetadata = await refreshedBackend.readUserMessagePayload(
+      sessionId, CUSER, clientMessageId, 0, 0,
+    );
+    assert.equal(refreshedMetadata?.contentSha256, metadata.contentSha256);
+    assert.equal(refreshedMetadata?.totalBytes, metadata.totalBytes);
+    const refreshedContext = await refreshedBackend.getEngineContextMessages(sessionId, CUSER, {
+      contextWindow: null,
+    });
+    assert.equal(refreshedContext?.[0]?.text, expectedModelText);
   });
 
   maybe("tape-state 单 statement 同时返回租户内 tape + dispatch lease 证据", async () => {

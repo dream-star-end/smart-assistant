@@ -523,8 +523,7 @@ async function deferOversizedUserMessage(
   const exact = { ...message, _source: "server" };
   const payload = Buffer.from(JSON.stringify(exact), "utf8");
   if (payload.length <= USER_MESSAGE_INLINE_BYTES) return message;
-  const exactModelText = typeof message._modelText === "string" ? message._modelText : message.text;
-  const modelText = pgModelSidecarText(exactModelText);
+  const modelText = pgModelSidecarText(modelHistorySemanticText(message));
   const contentSha256 = sha256Bytes(payload);
   const inserted = await client.query(
     `INSERT INTO client_session_user_payloads

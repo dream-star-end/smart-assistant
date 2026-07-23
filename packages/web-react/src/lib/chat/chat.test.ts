@@ -3109,6 +3109,49 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     ]);
   });
 
+  test("reply snapshot is sent and persisted once without duplicating it into current model text", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistUserMessage = vi.fn<NonNullable<ChatSocketDeps["persistUserMessage"]>>();
+    const sock = makeSocket({
+      ensureServerSession: async () => true,
+      persistUserMessage,
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const replyTo = {
+      messageId: "assistant-exact",
+      role: "assistant" as const,
+      text: "完整历史回答",
+    };
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "请解释这一段",
+      replyTo,
+    });
+
+    const inbound = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.message");
+    expect(inbound.content).toEqual({ text: "请解释这一段", replyTo });
+    expect(inbound.replyToId).toBe(replyTo.messageId);
+
+    const user = sock.sessions.get("s1")!.messages.find((message) => message.role === "user")!;
+    expect(user).toMatchObject({ text: "请解释这一段", _replyTo: replyTo });
+    expect(user._modelText).toBeUndefined();
+    await vi.waitFor(() => expect(persistUserMessage).toHaveBeenCalledTimes(1));
+    expect(persistUserMessage.mock.calls[0]![1]).toMatchObject({
+      text: "请解释这一段",
+      _replyTo: replyTo,
+    });
+    expect(persistUserMessage.mock.calls[0]![1]._modelText).toBeUndefined();
+    expect(sock.toStored("s1")!.messages.find((message) => message.role === "user")).toMatchObject({
+      text: "请解释这一段",
+      _replyTo: replyTo,
+    });
+  });
+
   test("send persists optimistic user row + in-flight marker immediately", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const persistSession = vi.fn();

@@ -53,6 +53,8 @@ import {
   isCodexEngineModel,
   isClientMessageId,
   isPersistedClientMessageId,
+  formatMessageReplyPrompt,
+  normalizeMessageReplyQuote,
   shouldServeInline,
   stripDispatchAuthorityField,
   type PromptQueueMutationFrame,
@@ -3750,6 +3752,7 @@ export class Gateway {
           _retryMedia?: unknown
           _imageEdit?: unknown
           _modelText?: unknown
+          _replyTo?: unknown
           _routing?: unknown
           _sendAttempt?: unknown
           _isAutoRetry?: unknown
@@ -3777,6 +3780,7 @@ export class Gateway {
                 : {}),
             }
           : undefined
+        const replyTo = normalizeMessageReplyQuote(data._replyTo)
         const msg = {
           id: data.id,
           role: 'user' as const,
@@ -3791,6 +3795,7 @@ export class Gateway {
             ? { _imageEdit: data._imageEdit }
             : {}),
           ...(typeof data._modelText === 'string' ? { _modelText: data._modelText } : {}),
+          ...(replyTo ? { _replyTo: replyTo } : {}),
           ...(routing ? { _routing: routing } : {}),
           ...(typeof data._sendAttempt === 'number' && Number.isSafeInteger(data._sendAttempt) && data._sendAttempt >= 0
             ? { _sendAttempt: data._sendAttempt }
@@ -13445,7 +13450,10 @@ export class Gateway {
     // ── Multimodal handling ──
     // Save all uploaded media to local disk and inject descriptive prompt hints
     // so the agent knows how to access them via MCP tools or Read.
-    const text = frame.content.text ?? ''
+    const text = formatMessageReplyPrompt(
+      frame.content.text ?? '',
+      normalizeMessageReplyQuote(frame.content.replyTo),
+    )
     const media = frame.content.media ?? []
     const rawImageEdit = frame.content.imageEdit
     const externalTurnGuard = rawImageEdit
