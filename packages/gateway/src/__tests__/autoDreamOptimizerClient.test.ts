@@ -22,6 +22,45 @@ function response(statusCode: number, body: unknown) {
 }
 
 describe('AutoDreamOptimizerClient platform finding outbox', () => {
+  it('whitelists admission fields when passed a runtime-shaped object with a large prompt', async () => {
+    let admissionBody = ''
+    const fetcher = (async (url: string, options: { body: string }) => {
+      assert.equal(new URL(url).pathname, '/internal/v3/auto-dream/admit')
+      admissionBody = options.body
+      return response(200, {
+        requestId: '9'.repeat(32),
+        engineSessionId: 'engine-session',
+        routeFrame: { baseUrl: 'https://relay.invalid' },
+      })
+    }) as any
+    const client = new AutoDreamOptimizerClient(
+      {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'https://master.invalid',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: 'container-token',
+      },
+      fetcher,
+    )
+    const runtimeInput = {
+      runId: '00000000-0000-4000-8000-000000000000',
+      callId: '00000000-0000-4000-8000-000000000000:0',
+      agentId: 'main',
+      model: 'gpt-5.6-terra',
+      phase: 'map',
+      prompt: 'x'.repeat(129 * 1024),
+    }
+    assert.ok(Buffer.byteLength(JSON.stringify(runtimeInput)) > 128 * 1024)
+
+    await client.admit(runtimeInput)
+
+    assert.ok(Buffer.byteLength(admissionBody) < 128 * 1024)
+    assert.deepEqual(JSON.parse(admissionBody), {
+      runId: runtimeInput.runId,
+      callId: runtimeInput.callId,
+      agentId: runtimeInput.agentId,
+      model: runtimeInput.model,
+    })
+  })
+
   it('durably resumes acknowledged batches with the same run id before a new admission', async () => {
     const calls: Array<{ path: string; body: Record<string, unknown> }> = []
     let rejectFirstFinding = true

@@ -61,7 +61,12 @@ export class AutoDreamOptimizerClient {
   }): Promise<AutoDreamAdmission> {
     await this.retryPending(input.agentId)
     await this.flushPendingFindings(input.agentId)
-    const result = await this.post(ADMIT_PATH, input)
+    const result = await this.post(ADMIT_PATH, {
+      runId: input.runId,
+      callId: input.callId,
+      agentId: input.agentId,
+      model: input.model,
+    })
     if (
       typeof result.requestId !== 'string' ||
       !/^[0-9a-f]{32}$/.test(result.requestId) ||
