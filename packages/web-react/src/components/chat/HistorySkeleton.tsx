@@ -12,6 +12,7 @@ import { Avatar, Skeleton } from "../ui";
  * 判定信号（shouldShowHistorySkeleton）刻意不新造状态机 / 不改 reducer：
  *  - 有缓存消息（wsMessages 非空）→ 绝不显示骨架（避免与真内容打架 / 闪烁）；
  *  - 有 in-flight turn（sending）→ 走既有 typing 指示，不是历史加载；
+ *  - canonical history 请求仍在途 → 骨架跟随真实请求，不受固定 cap 误伤；
  *  - 侧栏 meta 已知 messageCount>0 → 确知有历史 → 骨架直到内容到达（capExpired 安全兜底）；
  *  - meta 未知（深链 / listSessions 未落定）→ 800ms 兜底窗（graceExpired）后放行 EmptyState。
  */
@@ -24,6 +25,8 @@ export function shouldShowHistorySkeleton(p: {
   cachedCount: number;
   /** 本轮进行中（wsSending）。 */
   sending: boolean;
+  /** 当前活动会话的 canonical history 请求是否仍在途。 */
+  loading: boolean;
   /** 侧栏 meta 已知的历史消息数；0=未知或确为空。 */
   knownMessageCount: number;
   /** 是否权威已知该会话 meta（listSessions 已落定且命中列表）。 */
@@ -36,6 +39,7 @@ export function shouldShowHistorySkeleton(p: {
   if (!p.selected || p.gated) return false;
   if (p.cachedCount > 0) return false; // 有缓存消息 → 绝不骨架
   if (p.sending) return false; // 有 in-flight turn → 走 typing 指示
+  if (p.loading) return true; // 真请求仍在途时固定 cap 不得伪装成 EmptyState
   if (p.knownMessageCount > 0) return !p.capExpired; // 确知有历史 → 骨架至到达/兜底
   if (p.metaKnown) return false; // 权威已知为空会话 → 直接 EmptyState
   return !p.graceExpired; // meta 未知（深链/列表未落定）→ 800ms 兜底窗

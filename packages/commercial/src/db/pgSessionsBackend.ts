@@ -1453,6 +1453,21 @@ function expandHydratedRuntimeBatch(
 const TAPE_RECORD_PAGE_MAX_ROWS = 200;
 const TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES = 8 * 1024 * 1024;
 const TAPE_RECORD_INLINE_QUANTUM_BYTES = 1024 * 1024;
+// Tool output is commonly binary-ish/base64-rich and dominates cold-history
+// responses even when every individual record is below the general 1 MiB
+// threshold. Unified browser history already has an exact Range+SHA viewport
+// hydration path, so keep medium tool bodies out of the first response while
+// leaving assistant/thinking text on the existing inline contract. This is a
+// per-record transport quantum, never a content or total-history cap.
+const UNIFIED_TIMELINE_TOOL_INLINE_QUANTUM_BYTES = 128 * 1024;
+
+function deferUnifiedTimelinePayload(role: string, payloadBytes: number): boolean {
+  return payloadBytes > (
+    role === "tool"
+      ? UNIFIED_TIMELINE_TOOL_INLINE_QUANTUM_BYTES
+      : TAPE_RECORD_INLINE_QUANTUM_BYTES
+  );
+}
 
 interface DirectTapeSourceRecord {
   msg_id: string;
@@ -4715,7 +4730,10 @@ async function hydrateUnifiedTimelineTapeUnits(
   const billingHeads = await readDirectTapeVisibleHeads(client, sessionId, userId, tapeIds);
   const billingByTape = new Map(billingHeads.map((head) => [head.tape_id, head]));
   const planned = units.filter((unit) =>
-    bigIntNum(unit.head.payload_bytes, "turn tape timeline payload bytes") <= TAPE_RECORD_INLINE_QUANTUM_BYTES);
+    !deferUnifiedTimelinePayload(
+      unit.head.role,
+      bigIntNum(unit.head.payload_bytes, "turn tape timeline payload bytes"),
+    ));
   const payloadRows = planned.length === 0
     ? []
     : (
@@ -4753,7 +4771,7 @@ async function hydrateUnifiedTimelineTapeUnits(
         }
       : { costCredits: "0", waiverApplied: false, delegates: [] };
     let logicalRecords: MessageLike[];
-    if (payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES) {
+    if (deferUnifiedTimelinePayload(head.role, payloadBytes)) {
       let deferred = deferredTapeRecord(
         header.tapeId,
         header.tapeSha256,
@@ -5014,7 +5032,9 @@ async function readClientTimelinePageImpl(
           let oldestSelectedOrdinal: number | null = null;
           for (const head of heads) {
             const payloadBytes = bigIntNum(head.payload_bytes, "turn tape timeline payload bytes");
-            const pageBytes = payloadBytes > TAPE_RECORD_INLINE_QUANTUM_BYTES ? 0 : payloadBytes;
+            const pageBytes = deferUnifiedTimelinePayload(head.role, payloadBytes)
+              ? 0
+              : payloadBytes;
             if (
               selected.length >= cappedLimit ||
               (selected.length > 0 && inlineBytes + pageBytes > TAPE_RECORD_PAGE_RAW_QUANTUM_BYTES)
