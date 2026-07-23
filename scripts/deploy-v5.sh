@@ -7483,6 +7483,20 @@ finalize_ready_egress_transition() {
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] activate ready egress transition after stable master commit"; return 0; }
   ds_snapshot
   [[ "$DS_phase" == stable ]] || return 0
+  # finalize step7 has already changed the active slot/release, but this shell
+  # still carries the pre-finalize ACTIVE_STATE_* cache. Refresh it before any
+  # post-commit failure can call rollback, and before smoke chooses a port.
+  ACTIVE_STATE_LOADED=0
+  if ! resolve_active_lane; then
+    echo "✗ stable handoff active lane refresh failed；第一动作=官方 rollback" >&2
+    rollback || return 1
+    return 1
+  fi
+  if ! assert_release_required_migrations "$DS_active_release"; then
+    echo "✗ stable active release migration contract failed；第一动作=官方 rollback" >&2
+    rollback || return 1
+    return 1
+  fi
   local row release predecessor current count transition_generation="$DS_generation"
   row="$(ds_exec <<SQL
 SELECT release_id || '|' || predecessor_release FROM release_egress_transitions
@@ -7525,7 +7539,6 @@ UPDATE release_egress_transitions SET status='rolled_back',activated_at=NULL
 SQL
     return 1
   fi
-  resolve_active_lane
   smoke "$ACTIVE_PORT" || {
     echo "✗ egress handoff 后 smoke failed；第一动作=官方 rollback，随后恢复 egress predecessor" >&2
     rollback || return 1
@@ -8190,6 +8203,7 @@ abort_continue() {
   [[ "$DRY" == 1 ]] || {
     [[ -n "$old_release" ]] || { echo "✗ abort 无法解析旧 slot release:$old_src" >&2; return 1; }
     assert_release_marker "$old_release" || return 1
+    assert_release_required_migrations "$old_release" || return 1
   }
   image_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
   runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
@@ -8905,9 +8919,15 @@ fi
 # 在任何 release/symlink/unit/Caddy/状态机副作用前统一 fail-closed。
 # reclaim 是纯远端 lease 救援(不建 release、不写 DB),且必须能在有 recovery marker / 迁移未就绪时照跑,
 # 故一并跳过下面三道写前门。
-if [[ "$MODE" != "smoke" && "$MODE" != "bootstrap" && "$MODE" != "reclaim-mutation-lease" ]]; then
-  assert_repo_required_migrations || exit 1
-fi
+# Recovery/compensation must not depend on forward migrations declared only by
+# today's checkout. Those lanes validate the immutable target release instead
+# (abort/rollback/recover), or execute Luna's self-contained fail-closed audit
+# transaction (hide-luna). This keeps rollback available when canonical moves
+# ahead of the currently deployed schema.
+case "$MODE" in
+  smoke|bootstrap|reclaim-mutation-lease|abort|rollback|recover|hide-luna) ;;
+  *) assert_repo_required_migrations || exit 1 ;;
+esac
 # Smoke 也必须验证应用角色真能使用已记账的 0151 对象；bootstrap 在 env 建好后
 # 于 4.5 步单独执行。其余模式在任何远端状态副作用前统一 fail-closed。
 if [[ "$MODE" != "bootstrap" && "$MODE" != "reclaim-mutation-lease" ]]; then

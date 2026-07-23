@@ -984,7 +984,7 @@ describe('v5 release safety lanes', () => {
     assert.match(source, /safely cleared expired schema1 marker/)
   })
 
-  test('requiredMigrations gate includes deploy_state and precedes every write dispatch', async () => {
+  test('requiredMigrations gate covers forward writes while recovery stays target-scoped', async () => {
     const metadata = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8')) as {
       minimumRequiredMigration: string
       requiredMigrations: string[]
@@ -1005,11 +1005,85 @@ describe('v5 release safety lanes', () => {
     assert.ok(gateAt > 0 && dispatchAt > gateAt, '统一迁移门必须在模式 dispatch 前')
     assert.match(source, /activate_release\(\)[\s\S]*assert_release_required_migrations "\$reldir"/)
     assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*assert_release_required_migrations "\$master"/)
+    assert.match(source, /abort_continue\(\)[\s\S]*assert_release_required_migrations "\$old_release"/)
 
     const dry = run(deploy, ['--dry-run'])
     assert.equal(dry.status, 0, dry.stderr || dry.stdout)
     const combined = dry.stdout + dry.stderr
     assert.ok(combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'))
+    for (const mode of ['--abort', '--rollback', '--recover', '--hide-luna']) {
+      const recovery = run(deploy, ['--dry-run', mode])
+      assert.equal(recovery.status, 0, `${mode}: ${recovery.stderr || recovery.stdout}`)
+      assert.doesNotMatch(
+        recovery.stdout + recovery.stderr,
+        /校验 requiredMigrations 已全部记录/,
+        `${mode} must not depend on forward migrations declared only by current HEAD`,
+      )
+    }
+  })
+
+  test('post-finalize egress handoff refreshes the committed active lane before smoke or rollback', () => {
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=0',
+      'SCENARIO=success',
+      'calls=()',
+      'ds_load() {',
+      '  DS_generation=42; DS_phase=stable; DS_active_slot=B; DS_candidate_slot=""',
+      '  DS_active_release=/rel/newB; DS_candidate_release=""; DS_desired_leader_slot=B',
+      '  DS_desired_control_slot=B; DS_cohort_percent=0; DS_cohort_salt=s',
+      '  DS_transition_step=0; DS_operation_id=""; DS_lock_version=51',
+      '  DS_previous_active_release=/rel/oldA',
+      '}',
+      'ds_snapshot() { ds_load; }',
+      'ds_exec() {',
+      '  local sql; sql="$(cat)"',
+      '  if [[ "$sql" == *"SELECT release_id ||"* ]]; then printf "%s\\n" "/rel/newB|/rel/egress-old"',
+      '  elif [[ "$sql" == *"status=\'active\'"* && "$sql" == *"SELECT count(*)"* ]]; then printf "1\\n"',
+      '  fi',
+      '}',
+      'current_egress_release() { printf "%s\\n" /rel/egress-old; }',
+      'activate_egress_release() { calls+=("activate:$1:$2"); }',
+      'assert_release_required_migrations() {',
+      '  calls+=("migration:$1")',
+      '  [[ "$1" == /rel/newB && "$SCENARIO" != migration-fail ]]',
+      '}',
+      'smoke() {',
+      '  calls+=("smoke:$1:$ACTIVE_SLOT:$ACTIVE_STATE_RELEASE")',
+      '  [[ "$SCENARIO" != smoke-fail ]]',
+      '}',
+      'rollback() { calls+=("rollback:$ACTIVE_SLOT:$ACTIVE_STATE_RELEASE:$ACTIVE_STATE_PREVIOUS_RELEASE"); }',
+      'run_case() {',
+      '  SCENARIO="$1"; calls=()',
+      '  ACTIVE_STATE_LOADED=1; ACTIVE_SLOT=A; ACTIVE_SRC=/slot/a; ACTIVE_UNIT=unit-a; ACTIVE_PORT=18790',
+      '  ACTIVE_STATE_PHASE=finalizing; ACTIVE_STATE_RELEASE=/rel/oldA; ACTIVE_STATE_PREVIOUS_RELEASE=/rel/older',
+      '  if finalize_ready_egress_transition; then rc=0; else rc=$?; fi',
+      '  printf "%s|rc=%s|%s\\n" "$SCENARIO" "$rc" "${calls[*]}"',
+      '}',
+      'run_case success',
+      'run_case smoke-fail',
+      'run_case migration-fail',
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+    })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(
+      result.stdout,
+      /success\|rc=0\|migration:\/rel\/newB activate:\/rel\/newB:\/rel\/egress-old smoke:18795:B:\/rel\/newB/,
+    )
+    assert.match(
+      result.stdout,
+      /smoke-fail\|rc=1\|migration:\/rel\/newB activate:\/rel\/newB:\/rel\/egress-old smoke:18795:B:\/rel\/newB rollback:B:\/rel\/newB:\/rel\/oldA activate:\/rel\/egress-old:\/rel\/newB/,
+    )
+    assert.match(
+      result.stdout,
+      /migration-fail\|rc=1\|migration:\/rel\/newB rollback:B:\/rel\/newB:\/rel\/oldA/,
+    )
   })
 
   test('requiredMigrations manifest is exact for the target release archive, including rollback fixtures', async () => {
@@ -4960,9 +5034,18 @@ wait $!
     const handoffStart = source.indexOf('\nfinalize_ready_egress_transition()')
     const handoffEnd = source.indexOf('\nassert_v3_inactive()', handoffStart)
     const handoff = source.slice(handoffStart, handoffEnd)
+    const refresh = handoff.indexOf('ACTIVE_STATE_LOADED=0')
+    const resolve = handoff.indexOf('resolve_active_lane', refresh)
+    const migration = handoff.indexOf('assert_release_required_migrations "$DS_active_release"', resolve)
+    const transitionQuery = handoff.indexOf('release_egress_transitions', migration)
+    assert.ok(
+      refresh >= 0 && resolve > refresh && migration > resolve && transitionQuery > migration,
+      'post-step7 active cache refresh and target migration gate must precede every egress effect',
+    )
+    const casFailureStart = handoff.indexOf('egress activation evidence CAS failed')
     const casFailure = handoff.slice(
-      handoff.indexOf('egress activation evidence CAS failed'),
-      handoff.indexOf('resolve_active_lane'),
+      casFailureStart,
+      handoff.indexOf('smoke "$ACTIVE_PORT"', casFailureStart),
     )
     assert.ok(
       casFailure.indexOf('rollback || return 1') <
