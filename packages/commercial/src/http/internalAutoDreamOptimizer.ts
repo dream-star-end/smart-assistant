@@ -21,6 +21,7 @@ const PATHS = new Set([
   AUTO_DREAM_OPTIMIZER_ACTION_PATH,
 ])
 const MAX_BODY_BYTES = 128 * 1024
+const LEGACY_ADMIT_MAX_BODY_BYTES = 1024 * 1024
 
 export interface AutoDreamOptimizerIdentity {
   userId: number
@@ -117,7 +118,10 @@ export function makeAutoDreamOptimizerHandler(deps: {
       return
     }
     try {
-      const body = await readBody(req)
+      const body = await readBody(
+        req,
+        path === AUTO_DREAM_OPTIMIZER_ADMIT_PATH ? LEGACY_ADMIT_MAX_BODY_BYTES : MAX_BODY_BYTES,
+      )
       const result = await runtime.handle({
         path,
         identity: { userId: identity.userId, containerId: identity.containerId },
@@ -144,13 +148,16 @@ function send(res: ServerResponse, status: number, body: unknown, requestId: str
   res.end(JSON.stringify({ ...(body as object), requestId }))
 }
 
-async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readBody(
+  req: IncomingMessage,
+  maxBodyBytes: number,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let total = 0
   for await (const raw of req) {
     const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
     total += chunk.length
-    if (total > MAX_BODY_BYTES) throw new Error('AUTO_DREAM_INVALID_BODY_SIZE')
+    if (total > maxBodyBytes) throw new Error('AUTO_DREAM_INVALID_BODY_SIZE')
     chunks.push(chunk)
   }
   const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown
