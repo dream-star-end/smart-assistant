@@ -62,6 +62,13 @@ interface ObservableSdkGateway {
   reconnect: { isExhausted(): boolean }
 }
 
+class QqGenerationCleanupError extends Error {
+  constructor(message: string, options: ErrorOptions) {
+    super(message, options)
+    this.name = 'QqGenerationCleanupError'
+  }
+}
+
 /**
  * qqbot-nodejs 1.0.4 does not surface fatal close/reconnect exhaustion from start().
  * Keep the version-specific inspection isolated here: an unknown shape is terminal,
@@ -111,6 +118,7 @@ export function makeQqBotService(args: {
   gatewayTerminal?: (bot: QQBot) => boolean
   gatewayHealthPollMs?: number
   restartDelayMs?: number
+  generationStopTimeoutMs?: number
   onFatal?: (reason: string, err: unknown) => void
 }): QqBotService {
   const log = (args.logger ?? rootLogger).child({ subsys: 'qqBot' })
@@ -119,6 +127,7 @@ export function makeQqBotService(args: {
   const gatewayTerminal = args.gatewayTerminal ?? isQqSdkGatewayTerminal
   const healthPollMs = args.gatewayHealthPollMs ?? 5_000
   const restartDelayMs = args.restartDelayMs ?? 5_000
+  const generationStopTimeoutMs = args.generationStopTimeoutMs ?? 10_000
   let desiredRunning = false
   let active: QqBotGeneration | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
@@ -271,11 +280,17 @@ export function makeQqBotService(args: {
       generation.stopping = true
       instance.off('message', generation.onMessage)
       instance.stop()
-      await withTimeout(
-        generation.runPromise,
-        10_000,
-        'QQ gateway failed-start cleanup timeout',
-      )
+      try {
+        await withTimeout(
+          generation.runPromise,
+          generationStopTimeoutMs,
+          'QQ gateway failed-start cleanup timeout',
+        )
+      } catch (cleanupErr) {
+        throw new QqGenerationCleanupError('QQ gateway failed-start cleanup did not finish', {
+          cause: cleanupErr,
+        })
+      }
       throw err
     }
   }
@@ -288,13 +303,20 @@ export function makeQqBotService(args: {
       generation.monitor = null
     }
     generation.bot.off('message', generation.onMessage)
-    if (generation.worker) {
-      const worker = generation.worker
-      generation.worker = null
-      await worker.stop()
+    const cleanup = async () => {
+      if (generation.worker) {
+        const worker = generation.worker
+        generation.worker = null
+        await worker.stop()
+      }
+      generation.bot.stop()
+      await generation.runPromise
     }
-    generation.bot.stop()
-    await withTimeout(generation.runPromise, 10_000, 'QQ gateway stop timeout')
+    try {
+      await withTimeout(cleanup(), generationStopTimeoutMs, 'QQ generation stop timeout')
+    } catch (err) {
+      throw new QqGenerationCleanupError('QQ generation did not stop cleanly', { cause: err })
+    }
   }
 
   function scheduleRetry(): void {
@@ -328,6 +350,7 @@ export function makeQqBotService(args: {
     try {
       activate(await startGeneration())
     } catch (err) {
+      if (err instanceof QqGenerationCleanupError) throw err
       log.error('gateway_restart_failed', {
         reason,
         errMessage: err instanceof Error ? err.message : String(err),

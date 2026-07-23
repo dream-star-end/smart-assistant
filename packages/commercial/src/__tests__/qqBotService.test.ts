@@ -78,6 +78,42 @@ test('QQ gateway requests only C2C intent and fully recreates a terminal SDK gen
   assert.equal(bots[1]!.stopped, true)
 })
 
+test('terminal generation cleanup timeout fail-stops without creating another generation', async () => {
+  const bots: FakeBot[] = []
+  const fatalReasons: string[] = []
+  const service = makeQqBotService({
+    pool: {} as Pool,
+    config: {
+      appId: 'app',
+      appSecret: 'secret',
+      entryUrl: 'https://example.test/bot',
+      bindingHmacSecret: 'binding-secret',
+    },
+    dispatcher: {} as InboundDispatcher,
+    botFactory: () => {
+      const bot = new FakeBot()
+      bots.push(bot)
+      return bot as unknown as import('@tencent-connect/qqbot-nodejs').QQBot
+    },
+    outboxWorkerFactory: () => ({
+      kick() {},
+      stop: () => new Promise<void>(() => {}),
+    }),
+    gatewayTerminal: (bot) => (bot as unknown as FakeBot).terminal,
+    gatewayHealthPollMs: 5,
+    generationStopTimeoutMs: 20,
+    onFatal: (reason) => fatalReasons.push(reason),
+  })
+
+  await service.start()
+  bots[0]!.terminal = true
+  await waitFor(() => fatalReasons.length === 1)
+  assert.deepEqual(fatalReasons, ['qq_gateway_restart_cleanup_failed'])
+  assert.equal(bots.length, 1)
+
+  await service.stop()
+})
+
 async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 1_000
   while (!predicate()) {
