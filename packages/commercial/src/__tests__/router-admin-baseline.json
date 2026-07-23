@@ -752,6 +752,18 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/auto-dream-findings",
+    "handler": "handleAdminListAutoDreamFindings"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/auto-dream-findings/",
+    "handler": "handleAdminUpdateAutoDreamFinding"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/response-ratings",
     "handler": "handleAdminResponseRatings"
   },

@@ -118,13 +118,13 @@
       "sourceHash": "61c6247fc88f036e7ff86a75a8cd4b310a4f8f5ac664def5130a194e6cb12ae0"
     },
     "memory-auto-dream": {
-      "contentHash": "273c90b8279e25138ccd2f58b5001015f9c0e29e189b5c46da2e67cdde9c5ccc",
-      "contentVersion": 2,
+      "contentHash": "31c9b6ac09bb5ef4fbdda32937036b985d0c057bc66e0159547fcedb426b01ae",
+      "contentVersion": 4,
       "mediaHash": "ea8238104ece9dd33f817cc09a1abfe79a0e5aea0e27fcdc196278087b44dce1",
       "mediaKey": "memory-auto-dream",
       "mediaVersion": 3,
       "registryHash": "d6eedd237f502594cdeabe6703344d61ca8d511710e70ed1b9a56e2827d33fee",
-      "sourceHash": "9ab1920dd0c28e6c1857b78faf2ec9b0a06ff276d90598987d3c833bcbe51e41"
+      "sourceHash": "dd82f2ab0a3d9681524de0eaa209bacceda0af34fca5a78ccf16b9f02ea162ae"
     },
     "models-reasoning": {
       "contentHash": "94ae018d06f7ed3aa73106d60050dca4fef067d96738c87476f44fab0e9ec8df",
@@ -154,13 +154,13 @@
       "sourceHash": "d0dc54bb3794427ee88c4f2e6c1b9a4a455e4e9fa36c0d2ea590b9a7ab4108dc"
     },
     "schedules-reminders": {
-      "contentHash": "81a065232b158b58c37c5f0e3d336ee81628fceaf50eb3dac1cd9b21de4c26fa",
-      "contentVersion": 2,
+      "contentHash": "8a998eca2fdcc6a90e1216892d2f4a7c3dab42d5874178689f92a7e94c8e4fd3",
+      "contentVersion": 4,
       "mediaHash": "240f98f76eb862376c66510f45832bb7cc994b992b3eab76ab61fb05d8e66991",
       "mediaKey": "schedules-reminders",
       "mediaVersion": 3,
       "registryHash": "7bd425366e0f70cbf2e087a5e133fd7e2b6a4c1bb789b629d26e9580f6f4bde9",
-      "sourceHash": "6c329d0cf07d72390609421476163b35f659068b2ee08f4d4fa2e85ff55b3c57"
+      "sourceHash": "13b1ee3700b1ded615e5f00bbb07756006ffcc609613739e53ad7e8db4234c9f"
     },
     "sessions-history": {
       "contentHash": "17d175caa9213dcb846f7e1ef45022548e6cbedf6c712498eb2d47582b8ba796",
@@ -172,13 +172,13 @@
       "sourceHash": "6a0cfad627ca6a2d0d9db3120b69472889c70f42fd4b12f2dc64b37d9d12338d"
     },
     "skills-training": {
-      "contentHash": "7f801204941bbada10f2b3679932fd0bf05186effcc1b4afd73a2a1d853d8592",
-      "contentVersion": 2,
+      "contentHash": "e2153ef7ccb7bbd46b3ddcfac3368e004dfff463d95c1f9f805d75c4a06846e2",
+      "contentVersion": 4,
       "mediaHash": "c71747f458c6e4284c6a154a5865f4db74e1da3ce71f5d313cc63b8a9862a27e",
       "mediaKey": "skills-training",
       "mediaVersion": 3,
       "registryHash": "8a53ced07b08480a052d6a3cd4e63e74341c8944a071aa1a47f49c8e2aa75772",
-      "sourceHash": "a90e70cb7386e820d15b915299cf1c7a4a8d6455c1124b58aad455a9fb364b66"
+      "sourceHash": "e162a0eff24e56eadf51b24e5a1c39140180649f0f00419dce6735a3e7591ad7"
     },
     "team-mode": {
       "contentHash": "5bfb8dc3c9acea3f609cec878403dbbe4585529df38ddfd420d30957ca5632b1",

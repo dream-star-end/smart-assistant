@@ -20,6 +20,7 @@
  *   wechat_show_tool_calls : boolean
  *   wechat_proactive_push  : boolean —— 定时任务/提醒主动推送到微信(未设 + 已绑微信视为开)
  *   auto_dream_enabled     : boolean —— Max+ 用户显式开启的 V5 原生后台记忆整理
+ *   auto_optimizer_enabled : boolean —— 已接受 V2 全面审计与匿名平台发现上报同意
  *   hotkeys         : Record<string, string>(最多 32 条,key/value <= 64 chars)
  *
  * 不做的:
@@ -56,6 +57,7 @@ export const PreferencesSchema = z
     wechat_show_tool_calls: z.boolean().optional(),
     wechat_proactive_push: z.boolean().optional(),
     auto_dream_enabled: z.boolean().optional(),
+    auto_optimizer_enabled: z.boolean().optional(),
     hotkeys: hotkeysSchema.optional(),
   })
   .strict();
@@ -76,6 +78,7 @@ export const PreferencesPatchSchema = z
     wechat_show_tool_calls: z.boolean().nullable().optional(),
     wechat_proactive_push: z.boolean().nullable().optional(),
     auto_dream_enabled: z.boolean().nullable().optional(),
+    auto_optimizer_enabled: z.boolean().nullable().optional(),
     hotkeys: hotkeysSchema.nullable().optional(),
   })
   .strict();

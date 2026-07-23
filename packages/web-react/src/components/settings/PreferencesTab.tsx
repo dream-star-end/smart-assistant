@@ -14,7 +14,7 @@ import {
   type PrefsView,
 } from "../../lib/modelPreferences";
 import { cn } from "../../lib/utils";
-import { Alert, Input, Switch } from "../ui";
+import { Alert, Button, Input, Modal, Switch } from "../ui";
 import { ApiKeysSection } from "./ApiKeysSection";
 import { EFFORT_OPTIONS } from "./labels";
 import { QqBindingCard } from "./QqBindingCard";
@@ -73,6 +73,8 @@ export function PreferencesTab({
 }) {
   const [models, setModels] = useState<PublicModel[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [optimizerConsentOpen, setOptimizerConsentOpen] = useState(false);
+  const [optimizerConsentSaving, setOptimizerConsentSaving] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -207,16 +209,17 @@ export function PreferencesTab({
                 </span>
               </div>
               <p className="mt-1 text-[12.5px] leading-relaxed text-muted">
-                在你完成新的对话后，后台归纳跨会话偏好、反馈与长期信息，让记忆保持精炼、准确。
+                GPT‑5.6 Terra 结合平台功能与技能，全面审计会话、操作和日志，给出记忆、设置、技能、规则、Agent、插件与定时任务优化建议。
               </p>
             </div>
             {autoDream?.enabled || (autoDream?.eligible && autoDream.available) ? (
               <Switch
                 aria-label="Auto-Dream"
-                checked={autoDream?.enabled === true}
+                checked={autoDream?.optimizer_enabled === true}
                 onCheckedChange={(checked) => {
                   if (checked && (!autoDream?.eligible || !autoDream.available)) return;
-                  void patch({ auto_dream_enabled: checked });
+                  if (checked) setOptimizerConsentOpen(true);
+                  else void patch({ auto_optimizer_enabled: false });
                 }}
               />
             ) : (
@@ -228,19 +231,19 @@ export function PreferencesTab({
             <div className="flex items-start gap-2 text-[11.5px] leading-relaxed text-faint">
               <span className="mt-0.5 size-1.5 shrink-0 rounded-full bg-accent/70" />
               <span>
-                至多每 {autoDream?.min_interval_hours ?? 24} 小时运行一次；累计至少 {autoDream?.min_new_sessions ?? 5} 个新会话才会触发。整理按实际用量扣除积分。
+                至多每 {autoDream?.min_interval_hours ?? 168} 小时运行一次；累计至少 {autoDream?.min_new_sessions ?? 5} 个新会话才会触发。审计按实际用量扣除积分。
               </span>
             </div>
             <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
               <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-muted">
-                每次正常结束都会生成可见的梦境报告；即使没有产生新记忆，也会说明结果。
+                所有用户内容和功能设置修改都先展示差异并由你确认；功能设置支持一键应用。
               </p>
               <button
                 type="button"
                 onClick={onOpenMemory}
                 className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-[12px] font-medium text-fg outline-none transition-colors hover:border-accent hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
               >
-                查看整理记录
+                查看优化建议
               </button>
             </div>
             {autoDream && !autoDream.eligible && (
@@ -260,9 +263,68 @@ export function PreferencesTab({
                 Auto‑Dream 当前暂不可用，功能已安全暂停。
               </p>
             )}
+            {autoDream?.legacy_enabled && !autoDream.optimizer_enabled && (
+              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-[12px] text-warning">
+                你当前仍在使用旧版记忆整理。打开上方开关并确认后，将安全升级到全面优化；旧版自动改记忆会同时关闭。
+              </p>
+            )}
           </div>
         </div>
       </div>
+
+      <Modal
+        open={optimizerConsentOpen}
+        onOpenChange={(open) => !optimizerConsentSaving && setOptimizerConsentOpen(open)}
+        title="开启 Auto‑Dream 全面优化？"
+        description="请确认审计范围、计费和平台发现上报方式"
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              disabled={optimizerConsentSaving}
+              onClick={() => setOptimizerConsentOpen(false)}
+            >
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              disabled={optimizerConsentSaving}
+              onClick={async () => {
+                setOptimizerConsentSaving(true);
+                try {
+                  await patch({ auto_optimizer_enabled: true });
+                  setOptimizerConsentOpen(false);
+                } finally {
+                  setOptimizerConsentSaving(false);
+                }
+              }}
+            >
+              {optimizerConsentSaving && <span className="size-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" />}
+              同意并开启
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-[13px] leading-relaxed text-muted">
+          <p>
+            开启后，GPT‑5.6 Terra 会在独立、无工具、无网络的隔离环境中读取你在 V5 内保留的相关会话、操作日志、用量，以及当前记忆、技能、规则、Agent、插件和定时任务配置。
+          </p>
+          <div className="rounded-xl border border-border bg-surface p-3">
+            <p className="font-medium text-fg">你始终拥有最终决定权</p>
+            <ul className="mt-1.5 list-disc space-y-1 pl-4">
+              <li>不会根据模型输出直接修改任何用户内容或设置。</li>
+              <li>内容调整会打开前后差异弹窗；设置调整提供明确的一键确认。</li>
+              <li>每次模型审计按实际用量扣除积分，可随时关闭。</li>
+            </ul>
+          </div>
+          <div className="rounded-xl border border-accent/20 bg-accent-soft p-3">
+            <p className="font-medium text-fg">匿名平台优化发现</p>
+            <p className="mt-1">
+              如果发现需要平台方改进的问题，会自动向管理员后台上报闭集分类、影响和建议的匿名聚合信息；不会上报原始会话、日志正文、工具参数、凭证或可识别个人内容，也不会自动替平台执行修改或向其他用户发通知。
+            </p>
+          </div>
+        </div>
+      </Modal>
 
       {/* 通知 */}
       <div className="border-t border-border px-5 py-4">

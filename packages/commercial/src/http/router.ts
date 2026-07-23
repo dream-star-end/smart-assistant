@@ -107,6 +107,10 @@ import {
 } from './admin/export.js'
 import { handleAdminAckFeedback, handleAdminListFeedback } from './admin/feedback.js'
 import {
+  handleAdminListAutoDreamFindings,
+  handleAdminUpdateAutoDreamFinding,
+} from './admin/autoDreamFindings.js'
+import {
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
   handleAdminGetInboxEmailConfig,
@@ -1246,6 +1250,12 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
     { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },
     { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminAckFeedback },
+    { method: 'GET', path: '/api/admin/auto-dream-findings', handler: handleAdminListAutoDreamFindings },
+    {
+      method: 'PATCH',
+      pathPrefix: '/api/admin/auto-dream-findings/',
+      handler: handleAdminUpdateAutoDreamFinding,
+    },
     // 2026-07-08 响应评分 admin —— 按模型好评率统计 + 差评明细(复合游标分页)
     { method: 'GET', path: '/api/admin/response-ratings', handler: handleAdminResponseRatings },
     // 站内信(in-app messages)用户侧

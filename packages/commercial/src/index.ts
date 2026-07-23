@@ -34,7 +34,7 @@ import {
   type SlotRelayLocal,
 } from "./deploy/slotRelay.js";
 import type { TLSSocket } from "node:tls";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { isIPv4 } from "node:net";
 import type { Duplex } from "node:stream";
 import * as fs from "node:fs";
@@ -311,6 +311,20 @@ import {
   makeAutoDreamPolicyHandler,
   type AutoDreamPolicyHandler,
 } from "./http/internalAutoDreamPolicy.js";
+import {
+  AUTO_DREAM_OPTIMIZER_ABANDON_PATH,
+  AUTO_DREAM_OPTIMIZER_ACTION_PATH,
+  AUTO_DREAM_OPTIMIZER_ADMIT_PATH,
+  AUTO_DREAM_OPTIMIZER_FINDINGS_PATH,
+  AUTO_DREAM_OPTIMIZER_SETTLE_PATH,
+  isAutoDreamOptimizerInternalPath,
+  makeAutoDreamOptimizerHandler,
+  type AutoDreamOptimizerRuntime,
+} from "./http/internalAutoDreamOptimizer.js";
+import {
+  applyAutoDreamPreferenceAction,
+  reportAutoDreamPlatformFindings,
+} from "./autoDream/optimizerStore.js";
 import {
   CRON_INDEX_PATH,
   makeCronIndexHandler,
@@ -1629,6 +1643,9 @@ export async function registerCommercial(
   // 这层 ref 把"路由表"(dispatchInternal)与"broker 实例"装配顺序解耦,与
   // bridgeBroadcastRef 同型:proxy 闭包总读 ref.current,broker 未就绪时短路 404 不 throw。
   const wechatBrokerRef: { current: WechatBroker | null } = { current: null };
+  const autoDreamOptimizerRuntimeRef: { current: AutoDreamOptimizerRuntime | null } = {
+    current: null,
+  };
   // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
   // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
   const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
@@ -2014,6 +2031,10 @@ export async function registerCommercial(
       const autoDreamPolicyHandler: AutoDreamPolicyHandler = makeAutoDreamPolicyHandler({
         identityRepo,
       });
+      const autoDreamOptimizerHandler = makeAutoDreamOptimizerHandler({
+        identityRepo,
+        runtimeRef: autoDreamOptimizerRuntimeRef,
+      });
       // 平台官方**科研** agent 的幂等 seed —— v5-native 露出(市场为 agent 露出单一权威,
       // 不走 v3 seed/team)。**仅当 research_config 已开启时 seed**(关闭时科研能力本就 503,
       // 避免装到只会报错的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只 log
@@ -2238,6 +2259,9 @@ export async function registerCommercial(
         }
         if (path === AUTO_DREAM_POLICY_PATH) {
           return autoDreamPolicyHandler(req, res, ctx);
+        }
+        if (isAutoDreamOptimizerInternalPath(path)) {
+          return autoDreamOptimizerHandler(req, res, ctx, path);
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);
@@ -3936,6 +3960,270 @@ export async function registerCommercial(
     });
 
     return { kind: "ready", requestId, routeFrame: route.routeFrame };
+  };
+
+  // ─── Auto-Dream V2 Terra: master-owned admission, billing and reporting ──
+  type AutoDreamCodexSnapshot = {
+    reservation: ReservationHandle;
+    finalizer: CodexFinalizeHandle;
+    routeToken: string;
+    userId: bigint;
+    containerId: number;
+    engineSessionId: string;
+    timeout: NodeJS.Timeout;
+  };
+  const autoDreamCodexTurns = new Map<string, AutoDreamCodexSnapshot>();
+
+  const requireAutoDreamString = (
+    body: Record<string, unknown>,
+    key: string,
+    re: RegExp,
+  ): string => {
+    const value = body[key];
+    if (typeof value !== "string" || !re.test(value)) {
+      throw new Error(`AUTO_DREAM_INVALID_${key.toUpperCase()}`);
+    }
+    return value;
+  };
+
+  autoDreamOptimizerRuntimeRef.current = {
+    handle: async ({ path, identity, body }) => {
+      const userId = BigInt(identity.userId);
+      if (path === AUTO_DREAM_OPTIMIZER_ADMIT_PATH) {
+        const runId = requireAutoDreamString(body, "runId", /^[0-9a-f-]{36}$/);
+        const callId = requireAutoDreamString(body, "callId", /^[0-9a-f-]{36}:\d{1,8}$/);
+        const agentId = requireAutoDreamString(body, "agentId", /^[A-Za-z0-9_-]{1,64}$/);
+        const model = requireAutoDreamString(body, "model", /^gpt-5\.6-terra$/);
+        const { getAutoDreamPolicy } = await import("./user/autoDream.js");
+        const policy = await getAutoDreamPolicy(userId);
+        if (
+          !policy.enabled ||
+          policy.mode !== "optimizer_v2" ||
+          policy.modelId !== model
+        ) {
+          throw new Error("AUTO_DREAM_INVALID_POLICY");
+        }
+        const route = await createWechatApiRelayRoute({
+          containerId: identity.containerId,
+          userId,
+          modelId: model,
+        });
+        if (!route) throw new Error("AUTO_DREAM_ROUTE_UNAVAILABLE");
+        const basePricing = pricing.get(model);
+        if (!basePricing) {
+          expireCodexRouteToken(route.token, "auto_dream_pricing_missing");
+          throw new Error("AUTO_DREAM_PRICING_UNAVAILABLE");
+        }
+        const agentMul = await getAgentCostMultiplier(getPool(), agentId);
+        const derivedPricing: ModelPricing = {
+          ...basePricing,
+          multiplier: composeMultiplier(basePricing.multiplier, agentMul),
+        };
+        const requestId = newCodexRequestId();
+        const maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
+        let precheck: Awaited<ReturnType<typeof preCheckWithCost>>;
+        try {
+          precheck = await preCheckWithCost(preCheckRedis, { userId, requestId, maxCost });
+        } catch (err) {
+          expireCodexRouteToken(route.token, "auto_dream_precheck_failed");
+          throw err;
+        }
+        const engineSessionId = deriveEngineSessionId(
+          `auto-dream:${identity.userId}:${identity.containerId}:${agentId}`,
+        );
+        try {
+          const admitted = await startInflightJournal(getPool(), {
+            requestId,
+            userId,
+            containerId: BigInt(identity.containerId),
+            model,
+            precheckCredits: precheck.maxCost,
+            ctxJson: {
+              agentId,
+              runId,
+              callId,
+              source: "auto_dream_optimizer",
+              durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
+              billingPricing: serializeBillingPricing(derivedPricing),
+              engineSessionId,
+            },
+          });
+          if (!admitted) throw new Error("AUTO_DREAM_JOURNAL_CONFLICT");
+        } catch (err) {
+          await releasePreCheck(preCheckRedis, precheck.reservation).catch(() => {});
+          expireCodexRouteToken(route.token, "auto_dream_journal_failed");
+          throw err;
+        }
+        const finalizer = makeCodexFinalizer({
+          pgPool: getPool(),
+          preCheckRedis,
+          userId,
+          requestId,
+          engineSessionId,
+          model,
+          derivedPricing,
+          reservation: precheck.reservation,
+        });
+        const timeout = setTimeout(() => {
+          const live = autoDreamCodexTurns.get(requestId);
+          if (!live) return;
+          autoDreamCodexTurns.delete(requestId);
+          expireCodexRouteToken(live.routeToken, "auto_dream_admission_expired");
+          void releasePreCheck(preCheckRedis, live.reservation).catch(() => {});
+        }, readCodexSessionMaxMs());
+        timeout.unref?.();
+        autoDreamCodexTurns.set(requestId, {
+          reservation: precheck.reservation,
+          finalizer,
+          routeToken: route.token,
+          userId,
+          containerId: identity.containerId,
+          engineSessionId,
+          timeout,
+        });
+        return {
+          requestId,
+          engineSessionId,
+          routeFrame: route.routeFrame,
+        };
+      }
+      if (path === AUTO_DREAM_OPTIMIZER_FINDINGS_PATH) {
+        const runId = requireAutoDreamString(body, "runId", /^[0-9a-f-]{36}$/);
+        const agentId = requireAutoDreamString(body, "agentId", /^[A-Za-z0-9_-]{1,64}$/);
+        const { getAutoDreamPolicy } = await import("./user/autoDream.js");
+        const policy = await getAutoDreamPolicy(userId);
+        if (!policy.enabled || policy.mode !== "optimizer_v2") {
+          throw new Error("AUTO_DREAM_INVALID_POLICY");
+        }
+        return await reportAutoDreamPlatformFindings(getPool(), {
+          subjectHash: createHmac("sha256", jwtSecret)
+            .update(`auto-dream-platform-finding-user\0${identity.userId}`)
+            .digest("hex"),
+          agentId,
+          runId,
+          model: policy.modelId,
+          findings: body.findings,
+        });
+      }
+      if (path === AUTO_DREAM_OPTIMIZER_ACTION_PATH) {
+        const action = requireAutoDreamString(body, "action", /^preference\.patch$/);
+        void action;
+        return await applyAutoDreamPreferenceAction(getPool(), {
+          userId: identity.userId,
+          proposalId: requireAutoDreamString(body, "proposalId", /^[0-9a-f]{32}$/),
+          targetId: requireAutoDreamString(
+            body,
+            "targetId",
+            /^preferences\.[a-z_]{1,64}$/,
+          ),
+          beforeFingerprint: requireAutoDreamString(
+            body,
+            "beforeFingerprint",
+            /^[0-9a-f]{64}$/,
+          ),
+          after:
+            typeof body.after === "string" && body.after.length <= 32_000
+              ? body.after
+              : (() => {
+                  throw new Error("AUTO_DREAM_INVALID_AFTER");
+                })(),
+        });
+      }
+
+      const requestId = requireAutoDreamString(body, "requestId", /^[0-9a-f]{32}$/);
+      const journal = await getPool().query<{
+        user_id: string;
+        container_id: string | null;
+        ctx: Record<string, unknown> | null;
+      }>(
+        `SELECT user_id::text,container_id::text,ctx
+           FROM request_finalize_journal WHERE request_id=$1`,
+        [requestId],
+      );
+      const journalRow = journal.rows[0];
+      if (
+        !journalRow ||
+        journalRow.user_id !== String(identity.userId) ||
+        journalRow.container_id !== String(identity.containerId) ||
+        journalRow.ctx?.source !== "auto_dream_optimizer"
+      ) {
+        throw new Error("AUTO_DREAM_INVALID_JOURNAL_IDENTITY");
+      }
+
+      if (path === AUTO_DREAM_OPTIMIZER_SETTLE_PATH) {
+        const usage =
+          body.usage && typeof body.usage === "object" && !Array.isArray(body.usage)
+            ? body.usage as Record<string, unknown>
+            : {};
+        const safe = (value: unknown): number =>
+          typeof value === "number" && Number.isFinite(value) && value > 0
+            ? Math.trunc(value)
+            : 0;
+        const status = body.status === "success" ? "success" : "error";
+        await settleDurableCodexBilling(
+          {
+            pgPool: getPool(),
+            preCheckRedis,
+            pricing,
+            logger: rootLogger.child({ subsys: "autoDreamDurableCodexBilling" }),
+          },
+          userId,
+          {
+            requestId,
+            engineSessionId:
+              typeof journalRow.ctx.engineSessionId === "string"
+                ? journalRow.ctx.engineSessionId
+                : deriveEngineSessionId(`auto-dream:${identity.userId}:${identity.containerId}:main`),
+            status,
+            durationMs: safe(body.durationMs),
+            usage: {
+              input_tokens: safe(usage.input_tokens),
+              output_tokens: safe(usage.output_tokens),
+              reasoning_output_tokens: safe(usage.reasoning_output_tokens),
+              cache_read_input_tokens: safe(usage.cache_read_input_tokens),
+              cache_creation_input_tokens: safe(usage.cache_creation_input_tokens),
+            },
+            ...(body.terminalCode === "USER_CANCELLED" || body.terminalCode === "CODEX_ERROR"
+              ? { terminalCode: body.terminalCode }
+              : {}),
+            ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits as any } : {}),
+          },
+        );
+        const live = autoDreamCodexTurns.get(requestId);
+        if (live) {
+          autoDreamCodexTurns.delete(requestId);
+          clearTimeout(live.timeout);
+          expireCodexRouteToken(live.routeToken, "auto_dream_billing_settled");
+        }
+        return { settled: true };
+      }
+      if (path === AUTO_DREAM_OPTIMIZER_ABANDON_PATH) {
+        const live = autoDreamCodexTurns.get(requestId);
+        if (live) {
+          autoDreamCodexTurns.delete(requestId);
+          clearTimeout(live.timeout);
+          try {
+            await live.finalizer.fail("auto_dream_abandoned", "INTERNAL_ERROR");
+          } finally {
+            expireCodexRouteToken(live.routeToken, "auto_dream_abandoned");
+          }
+        } else {
+          const { abortInflightJournal } = await import("./billing/proxyBilling.js");
+          await abortInflightJournal(
+            getPool(),
+            requestId,
+            "auto_dream_abandoned",
+            "INTERNAL_ERROR",
+          );
+          await releasePreCheck(preCheckRedis, {
+            userId: String(identity.userId),
+            requestId,
+          }).catch(() => {});
+        }
+        return { abandoned: true };
+      }
+      throw new Error("AUTO_DREAM_INVALID_PATH");
+    },
   };
 
   // ─── V5 QQ Official Bot ────────────────────────────────────────────────

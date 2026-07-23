@@ -84,6 +84,7 @@ export const ADMIN_AUDIT_ACTIONS = {
 
   // ── 反馈/收件箱────────────────────────────────────────────────────
   "feedback.ack": { kind: "write", mode: "tx" },
+  "auto_dream_finding.status": { kind: "write", mode: "tx" },
   "inbox.create": { kind: "write", mode: "best-effort" },
   "inbox.delete": { kind: "write", mode: "best-effort" },
 

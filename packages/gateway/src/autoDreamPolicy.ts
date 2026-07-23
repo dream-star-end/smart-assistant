@@ -9,11 +9,20 @@ export type AutoDreamPolicy =
   | { enabled: false }
   | {
       enabled: true
+      mode: 'legacy_memory_v1' | 'optimizer_v2'
       modelId: string
       modelName: string
       minIntervalHours: number
       minNewSessions: number
+      auditContext?: {
+        preferences: Record<string, unknown>
+        installedPlugins: Array<{ slug: string; kind: string }>
+      }
     }
+
+export type AutoDreamOptimizerPolicy = Exclude<AutoDreamPolicy, { enabled: false }> & {
+  mode: 'optimizer_v2'
+}
 
 export interface AutoDreamPolicyClientDeps {
   env?: NodeJS.ProcessEnv
@@ -108,11 +117,58 @@ export function parseAutoDreamPolicy(raw: unknown): AutoDreamPolicy {
     row.minNewSessions > 100
   )
     return { enabled: false }
+  const mode =
+    row.mode === 'optimizer_v2'
+      ? 'optimizer_v2'
+      : row.mode === 'legacy_memory_v1' || row.mode === undefined
+        ? 'legacy_memory_v1'
+        : null
+  if (mode === null) return { enabled: false }
+  let auditContext:
+    | {
+        preferences: Record<string, unknown>
+        installedPlugins: Array<{ slug: string; kind: string }>
+      }
+    | undefined
+  if (mode === 'optimizer_v2') {
+    const rawContext = row.auditContext
+    if (!rawContext || typeof rawContext !== 'object' || Array.isArray(rawContext)) {
+      return { enabled: false }
+    }
+    const context = rawContext as Record<string, unknown>
+    if (
+      !context.preferences ||
+      typeof context.preferences !== 'object' ||
+      Array.isArray(context.preferences) ||
+      !Array.isArray(context.installedPlugins)
+    )
+      return { enabled: false }
+    const installedPlugins: Array<{ slug: string; kind: string }> = []
+    for (const plugin of context.installedPlugins) {
+      if (!plugin || typeof plugin !== 'object' || Array.isArray(plugin)) return { enabled: false }
+      const item = plugin as Record<string, unknown>
+      if (
+        typeof item.slug !== 'string' ||
+        !/^[a-z0-9][a-z0-9-]{0,95}$/.test(item.slug) ||
+        typeof item.kind !== 'string' ||
+        item.kind.length < 1 ||
+        item.kind.length > 40
+      )
+        return { enabled: false }
+      installedPlugins.push({ slug: item.slug, kind: item.kind })
+    }
+    auditContext = {
+      preferences: context.preferences as Record<string, unknown>,
+      installedPlugins,
+    }
+  }
   return {
     enabled: true,
+    mode,
     modelId: row.modelId,
     modelName: row.modelName,
     minIntervalHours: row.minIntervalHours,
     minNewSessions: row.minNewSessions,
+    ...(auditContext ? { auditContext } : {}),
   }
 }
