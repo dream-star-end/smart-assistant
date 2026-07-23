@@ -158,7 +158,7 @@ function send(res: ServerResponse, status: number, body: unknown, requestId: str
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.setHeader('Cache-Control', 'no-store')
-  res.end(JSON.stringify({ ...(body as object), requestId }))
+  res.end(JSON.stringify({ requestId, ...(body as object) }))
 }
 
 async function readBody(
