@@ -40,7 +40,12 @@ import {
   makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
-import { admitVerificationSponsorship } from "../../billing/verificationSponsorship.js";
+import {
+  resolveAuthorityTurnDispatchSponsorship,
+  admitVerificationSponsorship,
+  isVerificationModel,
+  type VerificationSponsorshipSnapshot,
+} from "../../billing/verificationSponsorship.js";
 import { getDispatchByBillingRequestId } from "../../dispatch/turnDispatchStore.js";
 import { checkRateLimit } from "../../middleware/rateLimit.js";
 import {
@@ -1020,7 +1025,7 @@ export function makeAnthropicProxyHandler(
       // actually used by this immutable turnKey. Prompt/response content is
       // never written to the journal.
       const attribution = extractUsageAttribution(body.metadata);
-      const sessionId = attribution.sessionId;
+      let sessionId = attribution.sessionId;
 
       // 0170 durable-turn dispatch 身份(RFC-v5-durable-turn-dispatch §3 CCB 段 / §7 项 10)。
       // gate 生效且 authority envelope 携带 **server 签名的** billingRequestId 时(= 本请求在
@@ -1033,21 +1038,21 @@ export function makeAnthropicProxyHandler(
       // dispatch,硬不一致)→ 409 拒绝。绝不 `.catch(()=>null)` 降级。legacy / 非 dispatch 请求
       // (gate 无 billingRequestId)才走 null 跳过。
       let dispatchIdentity: { dispatchId: string; attemptNo: number; sessionId: string } | null = null;
+      const rejectDispatchFailClosed = async (
+        status: number,
+        code: string,
+        message: string,
+        rejectKey: ProxyRejectReason,
+      ): Promise<void> => {
+        await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
+        session.zeroizeSecrets();
+        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
+          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
+        });
+        incrAnthropicProxyReject(rejectKey);
+        sendJsonError(res, status, code, message, requestId);
+      };
       if (gate?.billingRequestId) {
-        const rejectDispatchFailClosed = async (
-          status: number,
-          code: string,
-          message: string,
-          rejectKey: ProxyRejectReason,
-        ): Promise<void> => {
-          await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
-          session.zeroizeSecrets();
-          await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-            userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-          });
-          incrAnthropicProxyReject(rejectKey);
-          sendJsonError(res, status, code, message, requestId);
-        };
         try {
           dispatchIdentity = await getDispatchByBillingRequestId(deps.pgPool, gate.billingRequestId);
         } catch (err) {
@@ -1076,14 +1081,53 @@ export function makeAnthropicProxyHandler(
         }
       }
 
-      let verificationSponsorship;
+      let verificationSponsorship: VerificationSponsorshipSnapshot | null = null;
       try {
-        verificationSponsorship = await admitVerificationSponsorship(deps.pgPool, {
-          requestId,
-          userId: uid,
-          model: body.model,
-          sessionId: dispatchIdentity?.sessionId ?? null,
-        });
+        if (
+          !gate?.billingRequestId &&
+          gate?.authorityKind === "bridge_signed" &&
+          gate.authorityTurnId !== null
+        ) {
+          const leaseAdmission = await resolveAuthorityTurnDispatchSponsorship(deps.pgPool, {
+            requestId,
+            userId: uid,
+            model: body.model,
+            canonicalModel: gate.canonicalModel,
+            authorityTurnId: gate.authorityTurnId,
+          });
+          if (leaseAdmission.kind === "conflict") {
+            userLog.error("verification_sponsorship_identity_conflict", {
+              reason: leaseAdmission.reason,
+              authorityTurnId: gate.authorityTurnId,
+            });
+            await rejectDispatchFailClosed(
+              409,
+              "VERIFICATION_SPONSORSHIP_CONFLICT",
+              "billing verification identity conflict",
+              "verification_sponsorship_conflict",
+            );
+            return;
+          }
+          if (leaseAdmission.kind === "admitted") {
+            dispatchIdentity = leaseAdmission.dispatchIdentity;
+            verificationSponsorship = leaseAdmission.sponsorship;
+          } else if (leaseAdmission.kind === "ineligible") {
+            dispatchIdentity = leaseAdmission.dispatchIdentity;
+            if (isVerificationModel(body.model)) {
+              userLog.warn("verification_sponsorship_ineligible", {
+                reason: leaseAdmission.reason,
+                authorityTurnId: gate.authorityTurnId,
+              });
+            }
+          }
+        } else {
+          verificationSponsorship = await admitVerificationSponsorship(deps.pgPool, {
+            requestId,
+            userId: uid,
+            model: body.model,
+            sessionId: dispatchIdentity?.sessionId ?? null,
+          });
+        }
       } catch (err) {
         await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
         session.zeroizeSecrets();
@@ -1092,6 +1136,9 @@ export function makeAnthropicProxyHandler(
         sendJsonError(res, 503, "VERIFICATION_SPONSORSHIP_UNAVAILABLE", "billing verification unavailable", requestId);
         return;
       }
+      // Dispatch identity is server-owned and therefore wins over container metadata for billing
+      // attribution.  This also makes lease-only verification evidence join the exact session.
+      if (dispatchIdentity !== null) sessionId = dispatchIdentity.sessionId;
 
       // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
       //

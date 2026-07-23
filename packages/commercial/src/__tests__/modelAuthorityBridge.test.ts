@@ -49,6 +49,7 @@ import {
 import { AuthoritySigner } from "../ws/authoritySigner.js";
 import { AuthorityKeyCensus } from "../ws/authorityKeyCensus.js";
 import type { AdmitUserTurnInput, AdmitUserTurnResult } from "../db/pgSessionsBackend.js";
+import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import {
   ModelCatalogSnapshot,
   type ModelCatalogCache,
@@ -185,6 +186,8 @@ interface Rig {
   census: AuthorityKeyCensus;
   /** 签发边界 epoch 直读的返回值(测试可中途改,模拟 admin 安全写)。 */
   epochAtSign: { value: bigint; fail?: boolean };
+  receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }>;
+  deferredPoolErrors: Error[];
 }
 
 async function startRig(opts: {
@@ -207,6 +210,8 @@ async function startRig(opts: {
   keyIds?: "real" | "legacy" | "stale";
   /** B10:容器 attest 携带 durable-turn-dispatch-v1 → 走 dispatch 受理路径。 */
   durableDispatch?: boolean;
+  /** M7 专用:容器不回 dispatch receipt，让 admitted lease 保持在 bridge drain map。 */
+  holdDispatchReceipt?: boolean;
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
@@ -220,6 +225,114 @@ async function startRig(opts: {
   const census = new AuthorityKeyCensus();
   const epochAtSign: { value: bigint; fail?: boolean } = { value: 12n };
   const keyIdsMode = opts.keyIds ?? "real";
+  const receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }> = [];
+  const deferredPoolErrors: Error[] = [];
+  let admittedForAuthorityBinding: TurnDispatchRow | null = null;
+  let authorityBinding: {
+    authority_turn_id: string;
+    user_id: string;
+    dispatch_model: string | null;
+    canonical_model: string;
+    session_id: string;
+    dispatch_id: string;
+    attempt_no: number;
+  } | null = null;
+
+  const admitUserTurn = opts.admitUserTurn
+    ? async (input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> => {
+        const result = await opts.admitUserTurn!(input);
+        if ("dispatch" in result) admittedForAuthorityBinding = result.dispatch;
+        return result;
+      }
+    : undefined;
+
+  // durable 正常路径必须像生产一样具备 authority turn -> dispatch 的事务绑定。
+  // 故障用例显式传入的 pgPool 保持原样；此默认桩对未知 SQL 直接失败，避免宽松 mock
+  // 把新增身份约束或查询悄悄吞掉。
+  const defaultDurablePgPool = opts.durableDispatch && opts.pgPool === undefined
+    ? {
+        query: async (sql: string, params: unknown[] = []) => {
+          if (/SELECT status FROM users WHERE id/.test(sql)) return { rows: [] };
+          if (/FROM github_session_workspaces/.test(sql)) return { rows: [] };
+          if (/(INSERT INTO|UPDATE) turn_traces/.test(sql)) return { rows: [], rowCount: 0 };
+          if (/UPDATE turn_dispatches/.test(sql) && /SET status = 'accepted'/.test(sql)) {
+            try {
+              const d = admittedForAuthorityBinding;
+              assert.ok(d, "dispatch receipt CAS must follow an admitted dispatch");
+              assert.equal(params[0], d.dispatchId);
+              assert.equal(params[1], d.leaseEpoch);
+              receiptCasCalls.push({ dispatchId: d.dispatchId, leaseEpoch: d.leaseEpoch });
+              return { rows: [], rowCount: 0 };
+            } catch (err) {
+              deferredPoolErrors.push(err as Error);
+              throw err;
+            }
+          }
+          const err = new Error(`unexpected durable rig pool query: ${sql}`);
+          deferredPoolErrors.push(err);
+          throw err;
+        },
+        connect: async () => ({
+          query: async (sql: string, params: unknown[] = []) => {
+            if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+            if (/FROM turn_dispatches/.test(sql) && /FOR UPDATE/.test(sql)) {
+              const d = admittedForAuthorityBinding;
+              assert.ok(d, "authority binding must follow an admitted dispatch");
+              assert.equal(params[0], d.dispatchId);
+              return {
+                rows: [{
+                  user_id: d.userId.toString(),
+                  session_id: d.sessionId,
+                  model: d.model,
+                  attempt_no: d.attemptNo,
+                  status: d.status,
+                  owner_id: d.ownerId,
+                  lease_epoch: String(d.leaseEpoch),
+                  lease_until: d.leaseUntil,
+                }],
+              };
+            }
+            if (/INSERT INTO authority_turn_dispatches/.test(sql)) {
+              const d = admittedForAuthorityBinding;
+              assert.ok(d, "authority binding insert must follow an admitted dispatch");
+              assert.equal(params[3], d.model);
+              assert.deepEqual(params.slice(1), [
+                d.userId.toString(),
+                d.model,
+                d.model,
+                d.sessionId,
+                d.dispatchId,
+                d.attemptNo,
+              ]);
+              authorityBinding = {
+                authority_turn_id: String(params[0]),
+                user_id: d.userId.toString(),
+                dispatch_model: d.model,
+                canonical_model: String(params[3]),
+                session_id: d.sessionId,
+                dispatch_id: d.dispatchId,
+                attempt_no: d.attemptNo,
+              };
+              return { rows: [] };
+            }
+            if (/FROM authority_turn_dispatches/.test(sql)) {
+              assert.ok(authorityBinding, "authority binding select must follow insert");
+              assert.deepEqual(params, [
+                authorityBinding.authority_turn_id,
+                authorityBinding.dispatch_id,
+                authorityBinding.attempt_no,
+              ]);
+              return { rows: [authorityBinding] };
+            }
+            const err = new Error(`unexpected authority binding client query: ${sql}`);
+            deferredPoolErrors.push(err);
+            throw err;
+          },
+          release: () => {},
+        }),
+      }
+    : undefined;
+  const pgPool = opts.pgPool ?? defaultDurablePgPool;
 
   const containerWss = new WebSocketServer({ port: 0 });
   await new Promise<void>((r) => containerWss.once("listening", () => r()));
@@ -272,9 +385,26 @@ async function startRig(opts: {
     if (opts.attestDelayMs) setTimeout(sendAttest, opts.attestDelayMs);
     else sendAttest();
     ws.on("message", (data) => {
-      containerSeen.push(
-        typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8") : "",
-      );
+      const raw = typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8") : "";
+      containerSeen.push(raw);
+      if (opts.durableDispatch && !opts.holdDispatchReceipt) {
+        let parsed: { type?: unknown } | null = null;
+        try { parsed = JSON.parse(raw) as { type?: unknown }; } catch { /* non-JSON frame */ }
+        if (parsed?.type === "inbound.message") {
+          const d = admittedForAuthorityBinding;
+          assert.ok(d, "dispatch receipt must follow an admitted dispatch");
+          ws.send(JSON.stringify({
+            type: "outbound.control.turn_dispatch_receipt",
+            sessionId: d.sessionId,
+            clientMessageId: d.clientMessageId,
+            dispatchId: d.dispatchId,
+            attemptNo: d.attemptNo,
+            state: "queued",
+            outcome: null,
+            ts: Date.now(),
+          }));
+        }
+      }
     });
   });
 
@@ -306,7 +436,7 @@ async function startRig(opts: {
     }),
     containerConnectTimeoutMs: 1500,
     ...(modelAuthority ? { modelAuthority } : {}),
-    ...(opts.admitUserTurn ? { admitUserTurn: opts.admitUserTurn } : {}),
+    ...(admitUserTurn ? { admitUserTurn } : {}),
     ...(opts.loadMasterSessionMessages
       ? { loadMasterSessionMessages: opts.loadMasterSessionMessages }
       : {}),
@@ -318,9 +448,9 @@ async function startRig(opts: {
       : {}),
     // B3(R3):注入 pgPool 时必须补齐 codex 计费三件套(bridge fail-closed 校验);glm-5.2(CCB)
     // 在 goal 失败(转发前)短路,故 preCheckRedis/pricing 永不被调用,空桩即可满足类型。
-    ...(opts.pgPool
+    ...(pgPool
       ? {
-          pgPool: opts.pgPool as UserChatBridgeDeps["pgPool"],
+          pgPool: pgPool as UserChatBridgeDeps["pgPool"],
           preCheckRedis: {
             atomicReserve: async () => ({ ok: true }),
             release: async () => {},
@@ -337,13 +467,26 @@ async function startRig(opts: {
   await new Promise<void>((r) => gateway.listen(0, "127.0.0.1", () => r()));
   const port = (gateway.address() as { port: number }).port;
 
-  return { gateway, bridge, port, containerWss, containerSeen, recycled, signer, census, epochAtSign };
+  return {
+    gateway,
+    bridge,
+    port,
+    containerWss,
+    containerSeen,
+    recycled,
+    signer,
+    census,
+    epochAtSign,
+    receiptCasCalls,
+    deferredPoolErrors,
+  };
 }
 
 async function stopRig(rig: Rig): Promise<void> {
   await rig.bridge.shutdown();
   await new Promise<void>((r) => rig.containerWss.close(() => r()));
   await new Promise<void>((r) => rig.gateway.close(() => r()));
+  assert.deepEqual(rig.deferredPoolErrors, [], "durable rig must not swallow deferred pgPool failures");
 }
 
 async function openClient(port: number, role: "user" | "admin" = "user"): Promise<WebSocket> {
@@ -865,20 +1008,20 @@ describe("bridge 模型执行权威 — keyring census(轮换步骤② gate)", (
 // B10 — dispatch 路径 legacy-completed dedup 在受理之前(不留孤儿 admitted dispatch)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function fakeAdmittedDispatch(clientMessageId: string): AdmitUserTurnResult {
+function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
   const now = new Date();
   return {
     kind: "admitted",
     takeover: false,
     dispatch: {
-      dispatchId: "11111111-1111-4111-8111-111111111111",
-      userId: BigInt(UID),
-      sessionId: "sess-b10",
-      clientMessageId,
-      agentId: "main",
-      model: "glm-5.2",
-      requestHash: "h".repeat(64),
-      billingRequestId: "br-b10",
+      dispatchId: input.dispatchId,
+      userId: input.uid,
+      sessionId: input.sessionId,
+      clientMessageId: input.clientMessageId,
+      agentId: input.agentId,
+      model: input.model,
+      requestHash: input.requestHash,
+      billingRequestId: input.billingRequestId,
       attemptNo: 1,
       status: "admitted",
       outcome: null,
@@ -887,7 +1030,7 @@ function fakeAdmittedDispatch(clientMessageId: string): AdmitUserTurnResult {
       resolution: null,
       resolvedAt: null,
       clientNotified: false,
-      ownerId: "conn-b10",
+      ownerId: input.ownerId,
       leaseEpoch: 1,
       leaseUntil: new Date(now.getTime() + 90_000),
       anchorSeq: 5n,
@@ -907,7 +1050,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       durableDispatch: true,
       admitUserTurn: async (input) => {
         admitCalls++;
-        return fakeAdmittedDispatch(input.clientMessageId);
+        return fakeAdmittedDispatch(input);
       },
       loadMasterSessionMessages: async () => [
         { id: "cm-b10", role: "user", text: "do once", ts: 1 },
@@ -956,13 +1099,15 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
 
   test("无 completed 行 → 正常受理(admitUserTurn 被调用一次,不被 dedup 误伤)", async () => {
     let admitCalls = 0;
+    let dispatchId: string | null = null;
     let historyContext: Parameters<NonNullable<UserChatBridgeDeps["loadMasterSessionMessages"]>>[2] | null = null;
     const rig = await startRig({
       attest: "yes",
       durableDispatch: true,
       admitUserTurn: async (input) => {
         admitCalls++;
-        return fakeAdmittedDispatch(input.clientMessageId);
+        dispatchId = input.dispatchId;
+        return fakeAdmittedDispatch(input);
       },
       loadMasterSessionMessages: async (_uid, _sessionId, context) => {
         historyContext = context;
@@ -998,6 +1143,12 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
         currentUserText: "hi",
         excludeClientMessageId: "cm-fresh",
       });
+      await waitFor(() => rig.containerSeen.some((raw) => {
+        try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }
+        catch { return false; }
+      }));
+      await waitFor(() => rig.receiptCasCalls.length === 1);
+      assert.equal(rig.receiptCasCalls[0]?.dispatchId, dispatchId);
       ws.close();
     } finally {
       await stopRig(rig);
@@ -1010,7 +1161,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
         attest: "yes",
         durableDispatch: true,
         admitUserTurn: async (input) => {
-          const admitted = fakeAdmittedDispatch(input.clientMessageId);
+          const admitted = fakeAdmittedDispatch(input);
           assert.equal(admitted.kind, "admitted");
           return { kind, dispatch: admitted.dispatch };
         },
@@ -1046,7 +1197,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
 // ─────────────────────────────────────────────────────────────────────────────
 describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(executed_error)+ 不转发", () => {
   test("goal 读失败(非 NOT_FOUND)→ 受理后终态化:casToTerminal(executed_error) + drop + 无转发", async () => {
-    const DISPATCH_ID = "11111111-1111-4111-8111-111111111111"; // fakeAdmittedDispatch 固定值
+    let dispatchId: string | null = null;
     const queries: Array<{ sql: string; params: unknown[] }> = [];
     // mock pgPool:捕获所有 query,统一回空;user 状态查空 → 不拦(fail-open)。
     const pgPool = {
@@ -1062,7 +1213,8 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       pgPool,
       admitUserTurn: async (input) => {
         admitCalls++;
-        return fakeAdmittedDispatch(input.clientMessageId);
+        dispatchId = input.dispatchId;
+        return fakeAdmittedDispatch(input);
       },
       // goal 读抛非 NOT_FOUND 错 → resolveTurnGoalState 判 unavailable → 受理后拒轮。
       loadGoalState: async () => {
@@ -1101,12 +1253,12 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
           (q) =>
             /UPDATE turn_dispatches/.test(q.sql) &&
             /status = 'terminal'/.test(q.sql) &&
-            q.params[0] === DISPATCH_ID &&
+            q.params[0] === dispatchId &&
             q.params[1] === "executed_error",
         ),
       );
       const casQ = queries.find(
-        (q) => /status = 'terminal'/.test(q.sql) && q.params[0] === DISPATCH_ID && q.params[1] === "executed_error",
+        (q) => /status = 'terminal'/.test(q.sql) && q.params[0] === dispatchId && q.params[1] === "executed_error",
       )!;
       // failureCode 明确(goal 出口),clientNotified=false(durable「已通知」只由 reconciler 置真)。
       assert.equal(casQ.params[2], "goal_state_unavailable", "failure_code = goal_state_unavailable");
@@ -1135,7 +1287,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         return { rows: [], rowCount: 1 };
       },
     };
-    const DISPATCH_ID = "11111111-1111-4111-8111-111111111111"; // fakeAdmittedDispatch 固定值
+    let dispatchId: string | null = null;
     let admitCalls = 0;
     let releaseAdmit: (() => void) | null = null;
     const admitGate = new Promise<void>((r) => { releaseAdmit = r; });
@@ -1145,9 +1297,10 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       pgPool,
       admitUserTurn: async (input) => {
         admitCalls++;
+        dispatchId = input.dispatchId;
         // 受控暂停:让 cleanup 发生在 admit await 期间(R4-B1 的精确竞态窗)。
         await admitGate;
-        return fakeAdmittedDispatch(input.clientMessageId);
+        return fakeAdmittedDispatch(input);
       },
     });
     try {
@@ -1171,7 +1324,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
           (q) =>
             /UPDATE turn_dispatches/.test(q.sql) &&
             /status = 'terminal'/.test(q.sql) &&
-            q.params[0] === DISPATCH_ID &&
+            q.params[0] === dispatchId &&
             q.params[1] === "executed_error" &&
             q.params[2] === "bridge_closed_during_admission",
         ),
@@ -1242,8 +1395,9 @@ describe("M7 drain 窗口:有 admitted dispatch → max(billing, dispatch)（非
     const rig = await startRig({
       attest: "yes",
       durableDispatch: true,
+      holdDispatchReceipt: true,
       // admit 成功且不失败 goal → dispatch 保持 admitted(mock 容器不发 receipt/terminal,不掉出 map)。
-      admitUserTurn: async (input) => fakeAdmittedDispatch(input.clientMessageId),
+      admitUserTurn: async (input) => fakeAdmittedDispatch(input),
     });
     // 捕获 bridge→容器 socket 的 close 时刻(drain 结束时 finalCleanup 关它)。
     let containerCloseAt = 0;

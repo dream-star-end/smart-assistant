@@ -56,3 +56,31 @@ export function runSql(sql: string): string {
 export function queryScalar(sql: string): string {
   return psql(sql, { tuplesOnly: true }).trim();
 }
+
+function sqlText(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+/** 发布门最终权威：该用例 exact session 产生了 turn，且每个 durable dispatch 都是固定模型。 */
+export function assertSessionDispatchModel(userId: string, sessionId: string, model: string): void {
+  if (!/^[1-9][0-9]*$/.test(userId)) throw new Error(`[pg] invalid user id ${userId}`);
+  const raw = queryScalar(`
+    SELECT COALESCE(json_agg(json_build_object(
+      'dispatch_id',dispatch_id::text,
+      'model',model,
+      'attempt_no',attempt_no
+    ) ORDER BY admitted_at)::text,'[]')
+      FROM turn_dispatches
+     WHERE user_id=${userId} AND session_id=${sqlText(sessionId)}
+  `);
+  const rows = JSON.parse(raw) as Array<{ dispatch_id: string; model: string | null; attempt_no: number }>;
+  if (rows.length === 0) {
+    throw new Error(`[pg] fixed-model guard: session ${sessionId} 没有实际 dispatch`);
+  }
+  const drift = rows.filter((row) => row.model !== model);
+  if (drift.length > 0) {
+    throw new Error(
+      `[pg] fixed-model guard: session ${sessionId} expected=${model} drift=${JSON.stringify(drift)}`,
+    );
+  }
+}

@@ -599,7 +599,8 @@ export type ProxyRejectReason =
   // 反查 dispatch 身份失败 —— lookup 抛错(DB 抖动,503 可重试)/ 无行(签名 id 却无 dispatch,
   // 409 硬不一致)。绝不静默按 legacy 计费(会丢 turn↔dispatch 关联 → 财务联查失灵)。
   | "dispatch_lookup_failed"
-  | "dispatch_row_missing";
+  | "dispatch_row_missing"
+  | "verification_sponsorship_conflict";
 export function incrAnthropicProxyReject(reason: ProxyRejectReason): void {
   anthropicProxyReject.inc({ reason });
 }

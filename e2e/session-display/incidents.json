@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "scope": "V5 user-visible P0/P1 regressions recorded from 2026-07-17 through 2026-07-23",
+  "scope": "V5 user-visible and release-gate P0/P1 regressions recorded from 2026-07-17 through 2026-07-23",
   "fixedLiveMatrix": [
     {
       "engine": "codex",
@@ -421,6 +421,56 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chatCreateTemplates.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260723-LEASE-DISPATCH-UNLINKED",
+      "occurredAt": "2026-07-23",
+      "severity": "P0",
+      "symptom": "旧 runtime 的 lease-only CCB 请求丢失 durable dispatch 身份，计费与 tape 证据无法精确关联。",
+      "rootFixCommit": "5f2f96b7",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/settleUsage.integ.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/verificationSponsorshipWiring.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260723-E2E-MODEL-DRIFT",
+      "occurredAt": "2026-07-23",
+      "severity": "P1",
+      "symptom": "发布验证预建会话的模型被前端默认态覆盖，名义上的 Luna/Flash 矩阵实际运行其它模型。",
+      "rootFixCommit": "5f2f96b7",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ModelSelector.test.tsx"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/verificationSponsorshipWiring.test.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts"
         }
       ]
     }

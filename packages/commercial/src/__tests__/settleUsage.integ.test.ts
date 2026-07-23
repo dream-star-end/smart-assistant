@@ -40,7 +40,12 @@ import {
 import type { TokenUsage } from "../billing/calculator.js";
 import { getPool } from "../db/index.js";
 import { generatePersona } from "../account-pool/persona.js";
-import { admitVerificationSponsorship } from "../billing/verificationSponsorship.js";
+import {
+  resolveAuthorityTurnDispatchSponsorship,
+  admitVerificationSponsorship,
+  bindAuthorityTurnDispatch,
+  VerificationSponsorshipInvariantError,
+} from "../billing/verificationSponsorship.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -144,6 +149,71 @@ async function createUser(email: string, credits = 0n): Promise<bigint> {
     [email, credits.toString()],
   );
   return BigInt(r.rows[0].id);
+}
+
+async function createVerificationCcbTurn(input: {
+  email: string;
+  prefix: string;
+  generation: number;
+  authorityTurnId: string;
+}): Promise<{
+  uid: bigint;
+  sessionId: string;
+  dispatchId: string;
+  ownerId: string;
+  runId: string;
+  binding: Awaited<ReturnType<typeof bindAuthorityTurnDispatch>>;
+}> {
+  const uid = await createUser(input.email, 1000n);
+  const sessionId = `${input.prefix}ccb`;
+  const release = `/srv/rel-lease-${input.generation}`;
+  const dispatchId = `00000000-0000-4000-8000-${String(input.generation).padStart(12, "0")}`;
+  const ownerId = `owner-${input.generation}`;
+  await query(
+    `UPDATE deploy_state
+        SET generation=$1,phase='stable',active_slot='A',active_release=$2,
+            candidate_slot=NULL,candidate_release=NULL
+      WHERE singleton=true`,
+    [input.generation, release],
+  );
+  const run = await query<{ id: string }>(
+    `INSERT INTO verification_runs
+       (token_hash,user_id,session_prefix,allowed_models,expected_release,
+        expected_generation,approval_ref,expires_at)
+     VALUES (encode(public.digest(convert_to($1,'UTF8'),'sha256'),'hex'),$2,$1,
+             ARRAY['deepseek-v4-flash','gpt-5.6-luna']::text[],$3,$4,
+             'test:lease-sponsorship',NOW()+INTERVAL '10 minutes')
+     RETURNING id::text`,
+    [input.prefix, uid.toString(), release, input.generation],
+  );
+  await query(
+    `INSERT INTO turn_dispatches
+       (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+        billing_request_id,attempt_no,status,owner_id,lease_epoch,lease_until)
+     VALUES ($1,$2,$3,$4,'main','deepseek-v4-flash',$5,$6,1,'admitted',$7,0,
+             NOW()+INTERVAL '90 seconds')`,
+    [
+      dispatchId,
+      uid.toString(),
+      sessionId,
+      `cmid-${input.generation}`,
+      "a".repeat(64),
+      `billing-${input.generation}`,
+      ownerId,
+    ],
+  );
+  const binding = await bindAuthorityTurnDispatch(getPool(), {
+    authorityTurnId: input.authorityTurnId,
+    dispatchId,
+    userId: uid,
+    sessionId,
+    dispatchModel: "deepseek-v4-flash",
+    canonicalModel: "deepseek-v4-flash",
+    attemptNo: 1,
+    ownerId,
+    leaseEpoch: 0,
+  });
+  return { uid, sessionId, dispatchId, ownerId, runId: run.rows[0].id, binding };
 }
 
 /** 创建一个最小可用的 egress_proxies 行,返回 id。
@@ -818,5 +888,223 @@ describe("settleUsageAndLedger (integ)", () => {
       [result.usageId.toString()],
     );
     assert.deepEqual(row.rows[0], { cost: "300", run_id: null, nominal: null });
+  });
+
+  test("lease-only CCB sponsorship restores exact dispatch and sponsors multiple upstream requests", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const turn = await createVerificationCcbTurn({
+      email: "v5-evals-lease@example.com",
+      prefix: "e2e-cccccccccccccccccccc-",
+      generation: 21,
+      authorityTurnId: "c".repeat(32),
+    });
+
+    const first = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "lease-request-1",
+      userId: turn.uid,
+      model: "deepseek-v4-flash",
+      canonicalModel: "deepseek-v4-flash",
+      authorityTurnId: turn.binding.authorityTurnId,
+    });
+    const second = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "lease-request-2",
+      userId: turn.uid,
+      model: "deepseek-v4-flash",
+      canonicalModel: "deepseek-v4-flash",
+      authorityTurnId: turn.binding.authorityTurnId,
+    });
+    assert.equal(first.kind, "admitted");
+    assert.equal(second.kind, "admitted");
+    if (first.kind !== "admitted" || second.kind !== "admitted") return;
+    assert.deepEqual(first.dispatchIdentity, {
+      dispatchId: turn.dispatchId,
+      attemptNo: 1,
+      sessionId: turn.sessionId,
+    });
+    assert.equal(second.dispatchIdentity.dispatchId, turn.dispatchId);
+
+    const result = await settleUsageAndLedger(getPool(), {
+      userId: turn.uid,
+      accountId: null,
+      requestId: first.sponsorship.requestId,
+      model: "deepseek-v4-flash",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 300n,
+      status: "success",
+      sessionId: turn.sessionId,
+      dispatchId: turn.dispatchId,
+      attemptNo: 1,
+      verificationSponsorship: first.sponsorship,
+    });
+    const evidence = await query<{
+      cost: string; nominal: string; dispatch_id: string; attempt_no: number; run_id: string;
+    }>(
+      `SELECT cost_credits::text AS cost,would_have_cost_credits::text AS nominal,
+              dispatch_id::text,attempt_no,verification_run_id::text AS run_id
+         FROM usage_records WHERE id=$1`,
+      [result.usageId.toString()],
+    );
+    assert.deepEqual(evidence.rows[0], {
+      cost: "0",
+      nominal: "300",
+      dispatch_id: turn.dispatchId,
+      attempt_no: 1,
+      run_id: first.sponsorship.runId,
+    });
+    const requestCount = await query<{ count: string }>(
+      "SELECT count(*)::text FROM verification_sponsored_requests WHERE run_id=$1",
+      [first.sponsorship.runId],
+    );
+    assert.equal(requestCount.rows[0].count, "2");
+  });
+
+  test("ordinary lease-only CCB request restores durable dispatch without sponsorship", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("ordinary-lease@example.com", 1000n);
+    const dispatchId = "00000000-0000-4000-8000-000000000024";
+    const sessionId = "ordinary-lease-session";
+    await query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,model,request_hash,
+          billing_request_id,attempt_no,status,owner_id,lease_epoch,lease_until)
+       VALUES ($1,$2,$3,'cmid-ordinary','main',NULL,$4,'billing-ordinary',1,
+               'admitted','owner-ordinary',0,NOW()+INTERVAL '90 seconds')`,
+      [dispatchId, uid.toString(), sessionId, "b".repeat(64)],
+    );
+    const binding = await bindAuthorityTurnDispatch(getPool(), {
+      authorityTurnId: "4".repeat(32),
+      dispatchId,
+      userId: uid,
+      sessionId,
+      dispatchModel: null,
+      canonicalModel: "glm-5.2",
+      attemptNo: 1,
+      ownerId: "owner-ordinary",
+      leaseEpoch: 0,
+    });
+    const resolved = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "ordinary-lease-request",
+      userId: uid,
+      model: "glm-5.2",
+      canonicalModel: "glm-5.2",
+      authorityTurnId: binding.authorityTurnId,
+    });
+    assert.equal(resolved.kind, "ineligible");
+    if (resolved.kind === "ineligible") {
+      assert.deepEqual(resolved.dispatchIdentity, { dispatchId, attemptNo: 1, sessionId });
+    }
+    const sponsored = await query<{ count: string }>(
+      "SELECT count(*)::text FROM verification_sponsored_requests WHERE request_id='ordinary-lease-request'",
+    );
+    assert.equal(sponsored.rows[0].count, "0");
+  });
+
+  test("verification turn mapping rejects dispatch mismatch and concurrent turn-id reuse", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const turn = await createVerificationCcbTurn({
+      email: "v5-evals-conflict@example.com",
+      prefix: "e2e-dddddddddddddddddddd-",
+      generation: 22,
+      authorityTurnId: "d".repeat(32),
+    });
+
+    await assert.rejects(
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "e".repeat(32),
+        dispatchId: turn.dispatchId,
+        userId: turn.uid,
+        sessionId: `${turn.sessionId}-wrong`,
+        dispatchModel: "deepseek-v4-flash",
+        canonicalModel: "deepseek-v4-flash",
+        attemptNo: 1,
+        ownerId: turn.ownerId,
+        leaseEpoch: 0,
+      }),
+      VerificationSponsorshipInvariantError,
+    );
+    await query("DELETE FROM authority_turn_dispatches WHERE dispatch_id=$1", [turn.dispatchId]);
+
+    const contenders = await Promise.allSettled([
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "f".repeat(32),
+        dispatchId: turn.dispatchId,
+        userId: turn.uid,
+        sessionId: turn.sessionId,
+        dispatchModel: "deepseek-v4-flash",
+        canonicalModel: "deepseek-v4-flash",
+        attemptNo: 1,
+        ownerId: turn.ownerId,
+        leaseEpoch: 0,
+      }),
+      bindAuthorityTurnDispatch(getPool(), {
+        authorityTurnId: "1".repeat(32),
+        dispatchId: turn.dispatchId,
+        userId: turn.uid,
+        sessionId: turn.sessionId,
+        dispatchModel: "deepseek-v4-flash",
+        canonicalModel: "deepseek-v4-flash",
+        attemptNo: 1,
+        ownerId: turn.ownerId,
+        leaseEpoch: 0,
+      }),
+    ]);
+    assert.equal(contenders.filter((x) => x.status === "fulfilled").length, 1);
+    assert.equal(contenders.filter((x) => x.status === "rejected").length, 1);
+    assert.ok(contenders.some(
+      (x) => x.status === "rejected" && x.reason instanceof VerificationSponsorshipInvariantError,
+    ));
+    const count = await query<{ count: string }>(
+      "SELECT count(*)::text FROM authority_turn_dispatches WHERE dispatch_id=$1",
+      [turn.dispatchId],
+    );
+    assert.equal(count.rows[0].count, "1");
+  });
+
+  test("lease-only mapping distinguishes missing, identity conflict, and expired-run billing", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const turn = await createVerificationCcbTurn({
+      email: "v5-evals-expired@example.com",
+      prefix: "e2e-eeeeeeeeeeeeeeeeeeee-",
+      generation: 23,
+      authorityTurnId: "2".repeat(32),
+    });
+    const missing = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "lease-missing",
+      userId: turn.uid,
+      model: "deepseek-v4-flash",
+      canonicalModel: "deepseek-v4-flash",
+      authorityTurnId: "3".repeat(32),
+    });
+    assert.deepEqual(missing, { kind: "missing" });
+
+    const conflict = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "lease-conflict",
+      userId: turn.uid + 1n,
+      model: "deepseek-v4-flash",
+      canonicalModel: "deepseek-v4-flash",
+      authorityTurnId: turn.binding.authorityTurnId,
+    });
+    assert.equal(conflict.kind, "conflict");
+
+    await query(
+      "UPDATE verification_runs SET status='failed',closed_at=NOW() WHERE id=$1",
+      [turn.runId],
+    );
+    const expired = await resolveAuthorityTurnDispatchSponsorship(getPool(), {
+      requestId: "lease-expired",
+      userId: turn.uid,
+      model: "deepseek-v4-flash",
+      canonicalModel: "deepseek-v4-flash",
+      authorityTurnId: turn.binding.authorityTurnId,
+    });
+    assert.equal(expired.kind, "ineligible");
+    if (expired.kind === "ineligible") {
+      assert.equal(expired.dispatchIdentity.dispatchId, turn.dispatchId);
+    }
+    const sponsored = await query<{ count: string }>(
+      "SELECT count(*)::text FROM verification_sponsored_requests WHERE request_id='lease-expired'",
+    );
+    assert.equal(sponsored.rows[0].count, "0");
   });
 });

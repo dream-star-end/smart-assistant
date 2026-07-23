@@ -5,7 +5,7 @@
 import { test, expect } from '../fixtures';
 import { config, mintSessionId } from '../lib/env';
 import { pollUntil } from '../lib/poll';
-import { loginViaUi, openSession, sendMessage, waitForTurnSettled, SEL } from '../lib/ui';
+import { loginViaUi, openSession, selectExactModel, sendMessage, waitForTurnSettled, SEL } from '../lib/ui';
 
 test('断线重连:回复到达或明确失败,绝不永久静默', async ({ page, api, token, track }) => {
   const cfg = config();
@@ -17,6 +17,8 @@ test('断线重连:回复到达或明确失败,绝不永久静默', async ({ pag
 
   await loginViaUi(page);
   await openSession(page, sid);
+  await selectExactModel(page, cfg.model);
+  track(sid, { expectTurn: true });
   await sendMessage(page, `e2e-reconnect-${uniq} 请只回复:OK`);
 
   // user 行应立即上屏(乐观态)。

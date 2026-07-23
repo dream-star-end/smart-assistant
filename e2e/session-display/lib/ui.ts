@@ -118,6 +118,23 @@ export async function openSession(page: Page, sessionId: string): Promise<void> 
   await waitForHistoryLoaded(page);
 }
 
+/** 通过真实顶栏选择器固定本轮模型；exact model id 是后端目录 ID，不依赖展示名。 */
+export async function selectExactModel(page: Page, modelId: string): Promise<void> {
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(modelId)) {
+    throw new Error(`[ui] 非法 model id: ${modelId}`);
+  }
+  const trigger = page.getByRole('button', { name: '选择对话模型' });
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+  const item = page.locator(`[data-model-id="${modelId}"]`);
+  await expect(item, `模型菜单缺少 exact id ${modelId}`).toHaveCount(1);
+  await expect(item).toBeVisible();
+  const label = ((await item.locator('span').first().innerText()) || '').trim();
+  if (!label) throw new Error(`[ui] 模型 ${modelId} 缺少可见标签`);
+  await item.click();
+  await expect(trigger).toContainText(label);
+}
+
 /** 历史加载完成判据:骨架屏消失 ∧ (出现任一消息行 或 明确空态 composer 就绪)。 */
 export async function waitForHistoryLoaded(page: Page): Promise<void> {
   await expect(SEL.historySkeleton(page)).toHaveCount(0, { timeout: 20_000 });

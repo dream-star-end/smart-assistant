@@ -3,11 +3,13 @@
 
 import { test as base, type BrowserContext, type Page } from '@playwright/test';
 import { Api } from './lib/api';
+import { config } from './lib/env';
+import { assertSessionDispatchModel } from './lib/pg';
 
 export interface TestFixtures {
   token: string;
   /** 注册需要清理的会话 id(测试结束自动 DELETE)。 */
-  track: (sessionId: string) => void;
+  track: (sessionId: string, opts?: { expectTurn?: boolean }) => void;
   page: Page;
 }
 
@@ -40,14 +42,25 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     await use(token);
   },
   track: async ({ api, token }, use) => {
-    const ids: string[] = [];
-    await use((id: string) => {
-      if (!ids.includes(id)) ids.push(id);
+    const ids = new Map<string, boolean>();
+    await use((id: string, opts?: { expectTurn?: boolean }) => {
+      ids.set(id, (ids.get(id) ?? false) || opts?.expectTurn === true);
     });
-    // teardown:逐个删,失败不阻塞(会话可能已被前序步骤删除)。
-    for (const id of ids) {
-      await api.deleteSession(token, id).catch(() => {});
+    let guardError: unknown;
+    try {
+      const userId = await api.currentUserId(token);
+      for (const [id, expectTurn] of ids) {
+        if (expectTurn) assertSessionDispatchModel(userId, id, config().model);
+      }
+    } catch (err) {
+      guardError = err;
+    } finally {
+      // guard 失败也必须清理，不把验证会话留在线上。
+      for (const id of ids.keys()) {
+        await api.deleteSession(token, id).catch(() => {});
+      }
     }
+    if (guardError) throw guardError;
   },
 });
 

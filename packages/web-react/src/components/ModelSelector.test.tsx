@@ -65,6 +65,13 @@ describe("ModelSelector 团队模式诚信显示", () => {
     expect(screen.queryByText(/队长引擎/)).toBeNull();
   });
 
+  it("菜单项暴露后端 exact model id，供发布门稳定选模", async () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />);
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    await screen.findAllByRole("menuitem");
+    expect(document.querySelector('[data-model-id="deepseek-v4"]')).toHaveTextContent("DeepSeek-V4");
+  });
+
   it("团队态：模型仍可选择（onSelect 照常上抛,作为关闭团队模式后的记忆）", async () => {
     const onSelect = vi.fn();
     render(
