@@ -210,6 +210,7 @@ export function App() {
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
+  const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
   const [messages, setMessages] = useState<Message[]>(demo ? DEMO_MESSAGES : []);
@@ -1081,24 +1082,32 @@ export function App() {
     })();
   }, [demo, inWorkspace, auth, user, confirmDialog, refreshMe, toast]);
 
-  // 进入登录页（view=app 且未认证）时拉一次公开配置：决定 AuthGate 是否渲染真 Turnstile
-  // widget。停在首页（home）/demo/已登录均不拉，避免无谓请求（与无网络测试用例兼容）。
+  // 进入登录页（view=app 且未认证）时拉公开配置：决定 AuthGate 是否渲染真 Turnstile
+  // widget。短暂失败自动重试；停在首页（home）/demo/已登录均不拉。
   useEffect(() => {
     if (demo || authed || view !== "app") return;
+    void publicCfgRetryNonce;
     let cancelled = false;
+    let retryTimer: number | undefined;
     api
       .getPublicConfig()
       .then((c) => {
-        if (!cancelled) setPublicCfg(c);
+        if (!cancelled) {
+          setPublicCfg(c);
+        }
       })
       .catch(() => {
-        /* 拿不到 config：publicCfg 维持 null → AuthGate fail-closed（bypass 未知，禁用登录，
-         * 绝不发占位 token）。生产（bypass 关闭）下 config 拉取失败时不会用假 token 蒙混登录。 */
+        if (!cancelled) {
+          /* 拿不到 config：publicCfg 维持 null → AuthGate fail-closed（bypass 未知时点击只
+           * 登记 intent，绝不发占位 token）。短暂失败自动恢复，不形成永久灰锁。 */
+          retryTimer = window.setTimeout(() => setPublicCfgRetryNonce((n) => n + 1), 1000);
+        }
       });
     return () => {
       cancelled = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, [demo, authed, view]);
+  }, [demo, authed, view, publicCfgRetryNonce]);
 
   // 进入工作区后拉取模型列表（公开端点；登录态带 Bearer 走 grants 视图）。失败不阻断
   // 对话前置——选择器降级为「暂无可用模型」，对话仍可在订阅就绪后进行。
@@ -1964,6 +1973,7 @@ export function App() {
         onCycleTheme={cycle}
         turnstileBypass={publicCfg?.turnstileBypass}
         turnstileSiteKey={publicCfg?.turnstileSiteKey}
+        onRetryPublicConfig={() => setPublicCfgRetryNonce((n) => n + 1)}
         allowRegistration={publicCfg?.allowRegistration ?? true}
         requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
         initialMode={authMode}
