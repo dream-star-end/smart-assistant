@@ -51,10 +51,12 @@
  */
 
 import { randomBytes } from "node:crypto"
+import { join } from "node:path"
 import { request as undiciRequest } from "undici"
 
 import type { ChannelAdapter, ChannelContext } from "@openclaude/plugin-sdk"
 import type { OutboundCodexBilling, OutboundMessage } from "@openclaude/protocol"
+import { paths } from "@openclaude/storage"
 
 import { createLogger } from "./logger.js"
 import {
@@ -121,6 +123,7 @@ export function readV3WechatOutboundConfig(
 
 export interface AttemptSendDeps {
   config: V3WechatOutboundConfig
+  path?: string
   /** Override only for tests — real callers use undici。 */
   fetcher?: typeof undiciRequest
   /** Override only for tests。 */
@@ -135,7 +138,7 @@ export async function attemptSend(
   payload: V3WechatOutboundPostPayload,
   deps: AttemptSendDeps,
 ): Promise<void> {
-  const url = `${deps.config.baseUrl}${WECHAT_OUTBOUND_PATH}`
+  const url = `${deps.config.baseUrl}${deps.path ?? WECHAT_OUTBOUND_PATH}`
   const fetcher = deps.fetcher ?? undiciRequest
   const timeoutMs = deps.timeoutMs ?? ATTEMPT_TIMEOUT_MS
 
@@ -263,6 +266,7 @@ function buildWirePayload(
   out: OutboundMessage,
   cfg: V3WechatOutboundConfig,
   now: number,
+  channel: "wechat" | "qqbot" = "wechat",
 ): V3WechatSinkWirePayload | { error: string } {
   const sessionId = out.peer?.id ?? ""
   if (!WSESS_RE.test(sessionId)) {
@@ -300,7 +304,7 @@ function buildWirePayload(
 
   const payload: V3WechatSinkWirePayload = {
     sessionId,
-    channel: "wechat",
+    channel,
     outboundId,
     peer: {
       kind: out.peer.kind === "group" ? "group" : "dm",
@@ -373,6 +377,10 @@ export interface V3WechatOutboundDeps {
   attemptSendImpl?: typeof attemptSend
   /** Override only for tests。 */
   now?: () => number
+  channel?: "wechat" | "qqbot"
+  adapterId?: "v3-wechat-outbound" | "v3-qqbot-outbound"
+  outboundPath?: string
+  queueDir?: string
 }
 
 /**
@@ -392,19 +400,24 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
   const cfg = deps.config
   const attempt = deps.attemptSendImpl ?? attemptSend
   const now = deps.now ?? (() => Date.now())
+  const channel = deps.channel ?? "wechat"
+  const adapterId = deps.adapterId ?? "v3-wechat-outbound"
+  const channelLabel = channel === "qqbot" ? "QQ" : "WeChat"
+  const outboundPath = deps.outboundPath ?? WECHAT_OUTBOUND_PATH
 
   const retryQueue: V3WechatRetryQueue =
     deps.retryQueue ??
     makeV3WechatRetryQueue({
-      attemptSend: (p) => attempt(p, { config: cfg }),
+      attemptSend: (p) => attempt(p, { config: cfg, path: outboundPath }),
       now,
+      ...(deps.queueDir ? { dir: deps.queueDir } : {}),
     })
 
   let ctx: ChannelContext | null = null
 
   const adapter: ChannelAdapter = {
-    id: "v3-wechat-outbound",
-    name: "v3-wechat-outbound",
+    id: adapterId,
+    name: adapterId,
     type: "channel" as const,
 
     async init(c) {
@@ -412,24 +425,24 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
       // boot drain — 上次 shutdown 留盘的 entry 立刻尝试一遍
       retryQueue.kick()
       retryQueue.startPeriodic()
-      c.log.info("[v3-wechat-outbound] adapter initialized")
+      c.log.info(`[${adapterId}] adapter initialized`)
     },
 
     async send(out: OutboundMessage) {
       const maybeBilling = out as unknown
       let payload: V3WechatOutboundPostPayload
       if (isCodexBillingFrame(maybeBilling)) {
-        if (maybeBilling.channel !== "wechat" && maybeBilling.channel !== "webchat") return
+        if (maybeBilling.channel !== channel && maybeBilling.channel !== "webchat") return
         const built = buildCodexBillingPayload(maybeBilling)
         if ("error" in built) {
           throw new Error(`cannot durably stage codex billing frame: ${built.error}`)
         }
         payload = built
       } else {
-        if (out.channel !== "wechat" && out.channel !== "webchat") return
-        const built = buildWirePayload(out, cfg, now())
+        if (out.channel !== channel && out.channel !== "webchat") return
+        const built = buildWirePayload(out, cfg, now(), channel)
         if ("error" in built) {
-          throw new Error(`cannot durably stage WeChat output: ${built.error}`)
+          throw new Error(`cannot durably stage ${channelLabel} output: ${built.error}`)
         }
         payload = built
       }
@@ -449,8 +462,20 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
     async shutdown() {
       // Codex slice 7c plan v3 reminder #2:只停周期 drain,send() 仍可 enqueue
       retryQueue.stopPeriodic()
-      if (ctx) ctx.log.info("[v3-wechat-outbound] adapter shutdown (drain stopped, enqueue still active)")
+      if (ctx) ctx.log.info(`[${adapterId}] adapter shutdown (drain stopped, enqueue still active)`)
     },
   }
   return adapter
+}
+
+export function makeV3QqbotOutboundAdapter(
+  deps: Omit<V3WechatOutboundDeps, "channel" | "adapterId" | "outboundPath" | "queueDir">,
+): ChannelAdapter {
+  return makeV3WechatOutboundAdapter({
+    ...deps,
+    channel: "qqbot",
+    adapterId: "v3-qqbot-outbound",
+    outboundPath: "/internal/v3/qq-outbound",
+    queueDir: join(paths.home, "v3-qqbot-retry.d"),
+  })
 }

@@ -446,6 +446,18 @@ import { makeSaveWechatMediaToUserUploads } from "./wechat/imageIngest.js";
 import { makeWechatOutboundMediaResolver } from "./wechat/outboundMedia.js";
 import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
 import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
+import { readQqBotConfig } from "./qqbot/config.js";
+import {
+  makeQqBotService,
+  qqInboundChannelProfile,
+  type QqBotService,
+} from "./qqbot/service.js";
+import {
+  QQ_OUTBOUND_PATH,
+  QQ_PROACTIVE_PATH,
+  makeQqOutboundReceiver,
+  makeQqProactiveReceiver,
+} from "./qqbot/receiver.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
@@ -1620,6 +1632,12 @@ export async function registerCommercial(
   // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
   // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
   const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
+  const qqOutboundRef: {
+    current: ReturnType<typeof makeQqOutboundReceiver> | null;
+  } = { current: null };
+  const qqProactiveRef: {
+    current: ReturnType<typeof makeQqProactiveReceiver> | null;
+  } = { current: null };
   // v1.0.120 feat/codex-disable-rebind:fanoutDeps 依赖 v3Deps.putRemoteCodexAuth,
   // 必须在 v3Deps 装配后才能赋值;但 proxy / codex token refresh
   // handler / commercialHttpDeps 在更早就要拿到 trigger 闭包,故用 ref 打破先后。
@@ -2259,6 +2277,30 @@ export async function registerCommercial(
             return Promise.resolve();
           }
           return proactive(req, res, ctx);
+        }
+        if (path === QQ_OUTBOUND_PATH) {
+          const receiver = qqOutboundRef.current;
+          if (!receiver) {
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "QQ_BOT_NOT_ASSEMBLED", message: "QQ Bot not assembled" },
+            }));
+            return Promise.resolve();
+          }
+          return receiver(req, res, ctx);
+        }
+        if (path === QQ_PROACTIVE_PATH) {
+          const receiver = qqProactiveRef.current;
+          if (!receiver) {
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "QQ_BOT_NOT_ASSEMBLED", message: "QQ Bot not assembled" },
+            }));
+            return Promise.resolve();
+          }
+          return receiver(req, res, ctx);
         }
         return internalProxyHandler!(req, res, ctx);
       };
@@ -3896,6 +3938,69 @@ export async function registerCommercial(
     return { kind: "ready", requestId, routeFrame: route.routeFrame };
   };
 
+  // ─── V5 QQ Official Bot ────────────────────────────────────────────────
+  // One platform bot is owned by the LeaderBundle.  HTTP binding/internal
+  // receivers remain stateless on both slots and write the shared PG tables;
+  // only the leader owns Tencent's gateway connection and outbox sends.
+  const qqConfig = readQqBotConfig(process.env);
+  let qqBotService: QqBotService | undefined;
+  if (qqConfig) {
+    if (!bridgeSecret) {
+      throw new Error("QQ Bot is configured but the container bridge secret is unavailable");
+    }
+    const qqDispatcher = makeInboundDispatcher({
+      pgPool: getPool(),
+      resolveContainerEndpoint,
+      bridgeSecret,
+      resolveModel: async (bindingUserId) => {
+        const uid = BigInt(bindingUserId);
+        const [prefs, authz] = await Promise.all([
+          getPreferences(uid),
+          loadUserModelAuthz(uid),
+        ]);
+        return pickWechatInboundModel({
+          preferredModel: prefs.prefs.default_model,
+          visibleModels: pricing.listForUser(authz),
+          canUseModel: (modelId) => canUseModel({ pricing }, { ...authz, modelId }),
+          allowedModels: ALLOWED_INBOUND_MODELS,
+        });
+      },
+      prepareCodexTurn: prepareWechatCodexTurn,
+      failCodexTurn: failWechatCodexTurn,
+      upsertMasterClientSession,
+      softDeleteMasterSession: async (sessionId, userId) => {
+        await softDeleteMasterSession(sessionId, userId);
+      },
+      transport: makeNodeHttpContainerTransport(),
+      channel: qqInboundChannelProfile(),
+    });
+    qqBotService = makeQqBotService({
+      pool: getPool(),
+      config: qqConfig,
+      dispatcher: qqDispatcher,
+    });
+    const qqIdentityRepo = createPgIdentityRepo();
+    qqOutboundRef.current = makeQqOutboundReceiver({
+      pool: getPool(),
+      identityRepo: qqIdentityRepo,
+      handleCodexBilling: handleWechatCodexBilling,
+      onQueued: () => qqBotService?.kickOutbox(),
+    });
+    qqProactiveRef.current = makeQqProactiveReceiver({
+      pool: getPool(),
+      identityRepo: qqIdentityRepo,
+      onQueued: () => qqBotService?.kickOutbox(),
+    });
+    leaderBundle.add({
+      name: "qqBot",
+      domain: "shared",
+      start: async () => {
+        await qqBotService!.start();
+        return { stop: () => qqBotService!.stop() };
+      },
+    });
+  }
+
   // ─── P1.7 slice 7c — WeChat broker 装配 ───────────────────────────────────
   //
   // 装配条件:WECHAT_BROKER_ENABLED=1 + bridgeSecret 已加载(对称要求 — broker 给
@@ -4532,11 +4637,7 @@ export async function registerCommercial(
       name: "auditRetentionSweep",
       domain: "shared",
       start: () => {
-        const h = trackScheduler(
-          "auditRetentionSweep",
-          "shared",
-          startAuditRetentionSweeper({ runOnStart: true }),
-        );
+        const h = trackScheduler("auditRetentionSweep", "shared", startAuditRetentionSweeper({ runOnStart: true }));
         return { stop: () => h.stop() };
       },
     });

@@ -65,7 +65,8 @@
     "0183_luna_verification_runs",
     "0184_emergency_containment_debt",
     "0185_authority_turn_dispatches",
-    "0186_ark_k3_public"
+    "0186_ark_k3_public",
+    "0187_qq_bot_channel"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
@@ -78,7 +79,11 @@
     "history-projection-revision-v1",
     "direct-turn-timeline-v1"
   ],
-  "runtimeCapabilities": ["model_authority_v1", "lossless-turn-tape-v2", "durable-turn-dispatch-v1"],
+  "runtimeCapabilities": [
+    "model_authority_v1",
+    "lossless-turn-tape-v2",
+    "durable-turn-dispatch-v1"
+  ],
   "bridgeFrameSchema": "1",
   "runtimeApi": "1"
 }

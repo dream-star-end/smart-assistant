@@ -1376,6 +1376,77 @@ export async function handlePatchMyPreferences(
   }
 }
 
+// ─── QQ Official Bot binding ─────────────────────────────────────────────
+
+export async function handleGetMyQqBinding(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const [{ getPool }, { readQqBotConfig }, { getQqBindingView }] = await Promise.all([
+    import("../db/index.js"),
+    import("../qqbot/config.js"),
+    import("../qqbot/store.js"),
+  ]);
+  const config = readQqBotConfig();
+  if (!config) {
+    sendJson(res, 200, { available: false, bound: false });
+    return;
+  }
+  const view = await getQqBindingView(getPool(), user.id);
+  sendJson(res, 200, {
+    available: true,
+    entry_url: config.entryUrl,
+    ...view,
+  });
+}
+
+export async function handleStartMyQqBinding(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const [{ getPool }, { readQqBotConfig }, { createBindCode }] = await Promise.all([
+    import("../db/index.js"),
+    import("../qqbot/config.js"),
+    import("../qqbot/store.js"),
+  ]);
+  const config = readQqBotConfig();
+  if (!config) {
+    throw new HttpError(503, "QQ_BOT_UNAVAILABLE", "QQ Bot is not configured");
+  }
+  const token = await createBindCode(
+    getPool(),
+    user.id,
+    config.bindingHmacSecret,
+  );
+  sendJson(res, 200, {
+    available: true,
+    entry_url: config.entryUrl,
+    bind_code: token.code,
+    expires_at: token.expiresAt,
+  });
+}
+
+export async function handleDeleteMyQqBinding(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const [{ getPool }, { unbindQq }] = await Promise.all([
+    import("../db/index.js"),
+    import("../qqbot/store.js"),
+  ]);
+  const unbound = await unbindQq(getPool(), user.id);
+  sendJson(res, 200, { ok: true, unbound });
+}
+
 // ─── GET /api/me/usage (「使用消耗统计」前端弹窗) ──────────────────────
 //
 // 鉴权:Bearer access JWT(同 /api/me)。返回当前用户在 usage_records / credit_ledger

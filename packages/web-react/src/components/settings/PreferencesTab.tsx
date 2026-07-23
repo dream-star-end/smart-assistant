@@ -17,6 +17,7 @@ import { cn } from "../../lib/utils";
 import { Alert, Input, Switch } from "../ui";
 import { ApiKeysSection } from "./ApiKeysSection";
 import { EFFORT_OPTIONS } from "./labels";
+import { QqBindingCard } from "./QqBindingCard";
 
 const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
   { value: "light", label: "浅色", icon: Sun },
@@ -266,6 +267,9 @@ export function PreferencesTab({
       {/* 通知 */}
       <div className="border-t border-border px-5 py-4">
         <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">通知</div>
+        <div className="mb-3">
+          <QqBindingCard auth={auth} prefs={prefs} onPatch={patch} />
+        </div>
         {NOTIF_FIELDS.map((f) => (
           <label key={String(f.key)} className="flex items-center justify-between gap-3 py-2">
             <span className="min-w-0">

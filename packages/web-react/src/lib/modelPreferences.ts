@@ -10,6 +10,7 @@ export type PrefsView = {
   default_effort?: PreferenceEffort;
   notify_email?: boolean;
   notify_telegram?: boolean;
+  qq_proactive_push?: boolean;
   wechat_show_tool_calls?: boolean;
   wechat_proactive_push?: boolean;
   auto_dream_enabled?: boolean;

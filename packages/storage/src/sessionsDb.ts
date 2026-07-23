@@ -4702,7 +4702,7 @@ async function _sqliteUpsertMasterClientSession(input: {
   sessionId: string
   userId: string
   agentId: string
-  originChannel: 'wechat'
+  originChannel: 'wechat' | 'qqbot'
   title: string
   createdAt: number
   lastAt: number

@@ -8021,7 +8021,7 @@ export function createPgSessionsBackend(
       sessionId: string;
       userId: string;
       agentId: string;
-      originChannel: "wechat";
+      originChannel: "wechat" | "qqbot";
       title: string;
       createdAt: number;
       lastAt: number;

@@ -111,6 +111,22 @@ import type {
 import { normalizeOrgPlan, normalizeOrgSubscription } from './orgBilling'
 import { reportClientFriction } from './clientFriction'
 
+export type QqBindingStatus = {
+  available: boolean
+  bound: boolean
+  entry_url?: string
+  maskedOpenid?: string
+  boundAt?: number
+  lastInteractionAt?: number
+}
+
+export type QqBindingStart = {
+  available: true
+  entry_url: string
+  bind_code: string
+  expires_at: number
+}
+
 /**
  * v5 商业版前端网络层。
  *
@@ -1148,6 +1164,39 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(patch),
+        }),
+      ),
+    ),
+
+  getQqBinding: (a: AuthSession) =>
+    jsonOrThrow<QqBindingStatus>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/qq-binding", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  startQqBinding: (a: AuthSession) =>
+    jsonOrThrow<QqBindingStart>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/qq-binding/start", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: "{}",
+        }),
+      ),
+    ),
+
+  deleteQqBinding: (a: AuthSession) =>
+    jsonOrThrow<{ ok: boolean; unbound: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/qq-binding", {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
         }),
       ),
     ),
