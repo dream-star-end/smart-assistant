@@ -276,6 +276,16 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       ),
     )
   })
+  it('普通模式子 Agent 文案使用平台真实委派通道', () => {
+    const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+    for (const tool of ['delegate_task', 'delegate_tasks', 'send_to_agent']) {
+      assert.ok(prompt.includes(tool), `普通模式提示缺真实委派工具: ${tool}`)
+    }
+    assert.ok(prompt.includes('即使未开启团队模式'))
+    assert.ok(prompt.includes('按收益机会式委派'))
+    assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
+    assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
+  })
   it('选择题使用运行时专用 Ask 工具，不再把 options 富块当交互入口', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     assert.ok(prompt.includes('AskUserQuestion'))
