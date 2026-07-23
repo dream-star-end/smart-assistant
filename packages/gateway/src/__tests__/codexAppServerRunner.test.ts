@@ -860,6 +860,99 @@ describe('handleNotification — item/reasoning/* (codex-ui-unify thinking surfa
 })
 
 describe('handleNotification — item/completed', () => {
+  it('exports the final completed agent message as structured output instead of streamed retry debris', async () => {
+    const schema = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['summary'],
+      properties: { summary: { type: 'string' } },
+    } as const
+    const h = await makeHarness({ structuredOutputSchema: schema })
+    ;(h.runner as any).activeTurnId = 't-structured'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/agentMessage/delta',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-structured',
+        itemId: 'draft',
+        delta: '{"summary":"abandoned"',
+      },
+    })
+    const final = { summary: 'authoritative' }
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-structured',
+        item: {
+          id: 'final',
+          type: 'agentMessage',
+          text: JSON.stringify(final),
+        },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+
+    ;(h.runner as any).emitResult({
+      durationMs: 1,
+      ok: true,
+      text: (h.runner as any).currentAssistantBuf,
+      stopReason: 'end_turn',
+    })
+    const result = h.messages.at(-1)
+    assert.equal(result.result, '{"summary":"abandoned"')
+    assert.deepEqual(result.structured_output, final)
+    await h.cleanup()
+  })
+
+  it('fails closed on a malformed final structured item and clears it at the next attempt', async () => {
+    const h = await makeHarness({
+      structuredOutputSchema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['summary'],
+        properties: { summary: { type: 'string' } },
+      },
+    })
+    ;(h.runner as any).activeTurnId = 't-structured-invalid'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-structured-invalid',
+        item: { id: 'valid', type: 'agentMessage', text: '{"summary":"valid"}' },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+    assert.equal((h.runner as any).hasCurrentStructuredOutput, true)
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-structured-invalid',
+        item: { id: 'invalid', type: 'agentMessage', text: '{"summary":' },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+    ;(h.runner as any).emitResult({ durationMs: 1, ok: true, text: 'ignored' })
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(h.messages.at(-1), 'structured_output'),
+      false,
+    )
+
+    ;(h.runner as any).hasCurrentStructuredOutput = true
+    ;(h.runner as any).currentStructuredOutput = { summary: 'stale' }
+    ;(h.runner as any).resetAttemptState()
+    assert.equal((h.runner as any).hasCurrentStructuredOutput, false)
+    assert.equal((h.runner as any).currentStructuredOutput, undefined)
+    await h.cleanup()
+  })
+
   it('commandExecution → tool_result with exit code 0 (no error)', async () => {
     const h = await makeHarness()
     ;(h.runner as any).activeTurnId = 't-cmd'

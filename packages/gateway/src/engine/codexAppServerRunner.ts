@@ -467,6 +467,10 @@ interface RunnerMessage {
     }>
   }
   result?: string
+  /** Parsed final agentMessage for turns started with outputSchema. The
+   * stream may contain abandoned schema-attempt deltas, so only the completed
+   * item is authoritative. */
+  structured_output?: unknown
   total_cost_usd?: number
   duration_ms?: number
   is_error?: boolean
@@ -1016,6 +1020,11 @@ export class CodexAppServerRunner extends EventEmitter {
    *  imageGeneration savedPath emissions against text the model already
    *  surfaced via deltas. */
   private currentAssistantBuf = ''
+  /** Authoritative completed agentMessage for an outputSchema turn. Codex may
+   *  stream an abandoned schema attempt before its final valid JSON item, so
+   *  the concatenated delta buffer cannot be parsed as structured output. */
+  private hasCurrentStructuredOutput = false
+  private currentStructuredOutput: unknown
   /** Accumulated raw plan draft for codex item/plan/delta notifications. */
   private currentPlanDraft = ''
   /** Per-turn collaboration mode. SessionManager resets it before every submit. */
@@ -3081,7 +3090,24 @@ export class CodexAppServerRunner extends EventEmitter {
       )
       return
     }
-    if (itemType === 'agentMessage' || itemType === 'reasoning') {
+    if (itemType === 'agentMessage') {
+      if (this.opts.structuredOutputSchema) {
+        this.hasCurrentStructuredOutput = false
+        this.currentStructuredOutput = undefined
+        if (typeof item.text === 'string') {
+          try {
+            this.currentStructuredOutput = JSON.parse(item.text)
+            this.hasCurrentStructuredOutput = true
+          } catch {
+            // Final result omits structured_output; the caller's structured
+            // output collector then fails closed instead of parsing deltas.
+          }
+        }
+      }
+      // Already streamed via deltas; no separate tool_result needed.
+      return
+    }
+    if (itemType === 'reasoning') {
       // Already streamed via deltas; no separate tool_result needed.
       return
     }
@@ -3196,6 +3222,8 @@ export class CodexAppServerRunner extends EventEmitter {
     this.currentTurnCompleter = null
     this.activeTurnId = null
     this.currentAssistantBuf = ''
+    this.hasCurrentStructuredOutput = false
+    this.currentStructuredOutput = undefined
     this.currentPlanDraft = ''
     this.reasoningItemState.clear()
     this.emittedToolUseIds.clear()
@@ -3799,6 +3827,9 @@ export class CodexAppServerRunner extends EventEmitter {
       result: opts.ok ? (opts.text ?? '') : (opts.error ?? 'codex error'),
       usage: opts.usage,
       requestId: opts.requestId,
+      ...(opts.ok && this.hasCurrentStructuredOutput
+        ? { structured_output: this.currentStructuredOutput }
+        : {}),
       ...(opts.rateLimits ? { rateLimits: opts.rateLimits } : {}),
       ...(opts.stopReason ? { stop_reason: opts.stopReason } : {}),
       ...(!opts.ok

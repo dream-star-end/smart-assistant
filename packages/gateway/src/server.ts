@@ -7984,9 +7984,7 @@ export class Gateway {
       hermeticNoTools: true,
       structuredOutputSchema: AUTO_DREAM_OPTIMIZER_JSON_SCHEMA,
     })
-    const text = new Map<string, string>()
-    const order: string[] = []
-    let finals = 0
+    const structuredOutput = new AutoDreamStructuredOutputCollector()
     let invalidEvent: string | null = null
     let billing: import('@openclaude/protocol').DurableCodexBilling | null = null
     let stagedBilling = false
@@ -7996,17 +7994,6 @@ export class Gateway {
         session,
         input.prompt,
         (event) => {
-          if (event.kind === 'block') {
-            if (event.block.kind === 'thinking') return
-            if (event.block.kind === 'text') {
-              const id = event.block.messageId ?? 'output'
-              if (!text.has(id)) order.push(id)
-              text.set(id, `${text.get(id) ?? ''}${event.block.text ?? ''}`)
-              return
-            }
-            invalidEvent ??= `block:${event.block.kind}`
-            return
-          }
           if (event.kind === 'codex_billing') {
             if (billing) {
               invalidEvent ??= 'multiple_billing'
@@ -8016,13 +8003,7 @@ export class Gateway {
             }
             return
           }
-          if (event.kind === 'final') {
-            finals++
-            return
-          }
-          if (event.kind === 'turn_status') return
-          if (event.kind === 'error') invalidEvent ??= 'error'
-          else invalidEvent ??= event.kind
+          structuredOutput.accept(event)
         },
         'max',
         model,
@@ -8037,10 +8018,8 @@ export class Gateway {
         await client.settleStaged(input.agentId, billing, stage)
       }
       if (!billing) throw new Error('AUTO_DREAM_MISSING_BILLING')
-      if (finals !== 1) throw new Error(`AUTO_DREAM_FINAL_COUNT_${finals}`)
       if (invalidEvent) throw new Error(`AUTO_DREAM_INVALID_EVENT_${invalidEvent}`)
-      const output = order.map((id) => text.get(id) ?? '').join('').trim()
-      if (!output) throw new Error('AUTO_DREAM_EMPTY_OUTPUT')
+      const output = structuredOutput.finish()
       completed = true
       return output
     } finally {
