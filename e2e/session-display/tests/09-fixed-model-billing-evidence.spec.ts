@@ -11,6 +11,7 @@ type Evidence = {
   request_id: string;
   model: string;
   usage_session_id: string;
+  dispatch_session_id: string;
   dispatch_id: string;
   attempt_no: number;
   cost: string;
@@ -64,6 +65,7 @@ test('@release-gate fixed model route + durable terminal + sponsored billing evi
             'request_id',ur.request_id,
             'model',ur.model,
             'usage_session_id',ur.session_id,
+            'dispatch_session_id',d.session_id,
             'dispatch_id',ur.dispatch_id::text,
             'attempt_no',ur.attempt_no,
             'cost',ur.cost_credits::text,
@@ -76,7 +78,7 @@ test('@release-gate fixed model route + durable terminal + sponsored billing evi
                                 WHERE p.session_id=t.session_id AND p.user_id=t.user_id AND p.tape_id=t.tape_id)
           )::text
           FROM usage_records ur
-          JOIN turn_dispatches d ON d.dispatch_id=ur.dispatch_id
+          JOIN turn_dispatches d ON d.dispatch_id=ur.dispatch_id AND d.attempt_no=ur.attempt_no
           JOIN client_session_turn_tapes t ON t.dispatch_id=d.dispatch_id AND t.attempt_no=d.attempt_no
           WHERE ur.user_id=${userId} AND d.session_id=${sqlText(sid)}
             AND ur.model=${sqlText(cfg.model)} AND ur.verification_run_id IS NOT NULL
@@ -90,7 +92,12 @@ test('@release-gate fixed model route + durable terminal + sponsored billing evi
 
   expect(evidence.model).toBe(cfg.model);
   expect(evidence.request_id).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
-  expect(evidence.usage_session_id).toBe(sid);
+  expect(evidence.dispatch_session_id).toBe(sid);
+  if (cfg.model === 'gpt-5.6-luna') {
+    expect(evidence.usage_session_id).toMatch(/^oceng-[0-9a-f]{48}$/);
+  } else {
+    expect(evidence.usage_session_id).toBe(sid);
+  }
   expect(evidence.dispatch_id).toMatch(/^[0-9a-f-]{36}$/);
   expect(evidence.attempt_no).toBeGreaterThanOrEqual(1);
   expect(evidence.cost).toBe('0');
