@@ -64,7 +64,8 @@
     "0182_provider_quota_blocks",
     "0183_luna_verification_runs",
     "0184_emergency_containment_debt",
-    "0185_authority_turn_dispatches"
+    "0185_authority_turn_dispatches",
+    "0186_ark_k3_public"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -171,7 +171,7 @@ describe("migrate.runMigrations", () => {
     assert.equal(cnt.rows[0].cnt, String(before), "schema_migrations count unchanged");
   });
 
-  test("0179 seeds admin-only Ark K3 with the official K3 pricing", async (t) => {
+  test("0179/0186 publishes Ark K3 with the official K3 pricing", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
 
@@ -225,7 +225,7 @@ describe("migrate.runMigrations", () => {
     assert.equal(pricing.rows.length, 2);
     const source = pricing.rows.find((row) => row.model_id === "kimi-k3")!;
     const target = pricing.rows.find((row) => row.model_id === "kimi-k3-ark")!;
-    assert.equal(target.display_name, "Kimi K3（火山 Agent Plan）");
+    assert.equal(target.display_name, "Kimi K3（ark）");
     for (const field of [
       "input_per_mtok",
       "output_per_mtok",
@@ -237,7 +237,7 @@ describe("migrate.runMigrations", () => {
       assert.equal(target[field], source[field], field);
     }
     assert.equal(target.sort_order, 89);
-    assert.equal(target.visibility, "admin");
+    assert.equal(target.visibility, "public");
 
     const cache = new PricingCache();
     await cache.load();
@@ -247,7 +247,7 @@ describe("migrate.runMigrations", () => {
           .some((model) => model.id === "kimi-k3-ark"),
       );
       assert.ok(
-        !cache.listForUser({ role: "user", grantedModelIds: new Set() })
+        cache.listForUser({ role: "user", grantedModelIds: new Set() })
           .some((model) => model.id === "kimi-k3-ark"),
       );
     } finally {
