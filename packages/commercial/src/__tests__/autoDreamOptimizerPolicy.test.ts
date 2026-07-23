@@ -32,10 +32,18 @@ describe('Auto-Dream V2 rollback preference boundary', () => {
 })
 
 describe('Auto-Dream V2 Codex route admission', () => {
-  it('uses an empty provider override for official OAuth', () => {
+  it('routes official OAuth through the container loopback relay', () => {
     assert.deepEqual(projectAutoDreamCodexRoute({ kind: 'official_oauth' }), {
       token: null,
-      routeFrame: {},
+      routeFrame: {
+        modelProvider: 'oc_chatgpt_official',
+        baseUrl: 'http://127.0.0.1:18789/internal/v3/codex-relay/backend-api/codex',
+        providerName: 'OpenAI (OpenClaude relay)',
+        wireApi: 'responses',
+        preferredAuthMethod: 'chatgpt',
+        disableResponseStorage: true,
+        requiresOpenaiAuth: true,
+      },
     })
   })
 
