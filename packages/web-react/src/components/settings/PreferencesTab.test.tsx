@@ -18,6 +18,27 @@ afterEach(() => {
   apiKeysSection.mockClear();
 });
 
+describe("PreferencesTab · 对话行为", () => {
+  test("不再提供自动继续执行设置", () => {
+    vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
+    render(
+      <PreferencesTab
+        auth={auth}
+        prefs={{}}
+        autoDream={null}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async () => {}}
+        onUpgrade={() => {}}
+        onOpenMemory={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("switch", { name: "自动继续执行" })).not.toBeInTheDocument();
+    expect(screen.queryByText("自动继续执行")).not.toBeInTheDocument();
+  });
+});
+
 describe("PreferencesTab · Auto-Dream", () => {
   test("API Key 管理只为管理员挂载", () => {
     vi.spyOn(api, "getPublicModels").mockResolvedValue([]);

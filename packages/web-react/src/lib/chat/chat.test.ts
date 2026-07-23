@@ -16,7 +16,6 @@ import {
   normalizeBridgeErrorCode,
   onopenSetInitialStatus,
   parsePartialJson,
-  shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
 import {
@@ -47,7 +46,6 @@ import {
   exactUserReplayPayload,
   messageAttemptIdempotencyKey,
   preciseRetryEligible,
-  writeAutoContinuePreamblePref,
   type ChatSocketDeps,
 } from "./socket";
 import type {
@@ -164,71 +162,6 @@ describe("classifyEmptyTurn / shouldAutoContinueEmptyTurn", () => {
       { id: "u2", role: "user", _isAutoRetry: true },
     ];
     expect(shouldAutoContinueEmptyTurn({ messages: withAuto, targetMsgId: "u1", stopReason: "end_turn" })).toBe(false);
-  });
-  test("action-preamble recovery is deliberately strict", () => {
-    expect(shouldAutoContinueActionPreamble({
-      messages: [
-        { id: "u1", role: "user", text: "修一下" },
-        { id: "a1", role: "assistant", text: "好的，我现在检查并修复这个问题。" },
-      ],
-      targetMsgId: "u1",
-      stopReason: "end_turn",
-    })).toBe(true);
-    expect(shouldAutoContinueActionPreamble({
-      messages: [
-        { id: "u1", role: "user" },
-        { id: "a1", role: "assistant", text: "I'll inspect the logs and fix it now." },
-      ],
-      targetMsgId: "u1",
-      stopReason: "end_turn",
-    })).toBe(true);
-    for (const messages of [
-      [
-        { id: "u1", role: "user" },
-        { id: "a1", role: "assistant", text: "我现在检查，可以吗？" },
-      ],
-      [
-        { id: "u1", role: "user" },
-        { id: "a1", role: "assistant", text: "已经检查完成，结果正常。" },
-      ],
-      [
-        { id: "u1", role: "user" },
-        { id: "a1", role: "assistant", text: "我来检查。" },
-        { id: "tool", role: "tool", text: "real work already happened" },
-      ],
-      [
-        { id: "u1", role: "user" },
-        { id: "thinking", role: "thinking", text: "reasoning" },
-        { id: "a1", role: "assistant", text: "我来检查。" },
-      ],
-    ]) {
-      expect(shouldAutoContinueActionPreamble({
-        messages,
-        targetMsgId: "u1",
-        stopReason: "end_turn",
-      })).toBe(false);
-    }
-    expect(shouldAutoContinueActionPreamble({
-      messages: [
-        { id: "u1", role: "user" },
-        { id: "a1", role: "assistant", text: "我来检查。" },
-      ],
-      targetMsgId: "u1",
-      stopReason: "max_tokens",
-    })).toBe(false);
-  });
-
-  test("F5 用户偏好关闭（enabled:false）拒绝续写；省略/true 保持默认开", () => {
-    const matching = [
-      { id: "u1", role: "user", text: "修一下" },
-      { id: "a1", role: "assistant", text: "好的，我现在检查并修复这个问题。" },
-    ];
-    // 默认（省略 enabled）：内容命中 → 开（现行为不变）。
-    expect(shouldAutoContinueActionPreamble({ messages: matching, targetMsgId: "u1", stopReason: "end_turn" })).toBe(true);
-    // 显式开：同默认。
-    expect(shouldAutoContinueActionPreamble({ messages: matching, targetMsgId: "u1", stopReason: "end_turn", enabled: true })).toBe(true);
-    // 显式关：即便内容命中也不自动续写（仅提示，不替用户扣费）。
-    expect(shouldAutoContinueActionPreamble({ messages: matching, targetMsgId: "u1", stopReason: "end_turn", enabled: false })).toBe(false);
   });
 });
 
@@ -3918,7 +3851,7 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     expect(autocont.idempotencyKey).toBe(`autocont-s1-${userMsg.id}`);
   });
 
-  test("short action promise end_turn continues once without blocking user flow", () => {
+  test("short action promise end_turn does not start another paid turn", () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -3932,7 +3865,9 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
       model: "gpt-5.6-sol",
       effortLevel: "high",
     });
-    const original = sock.sessions.get("s1")!.messages.find((m) => m.role === "user")!;
+    const inboundCountBeforeFinal = ws.sent
+      .map((data) => JSON.parse(data))
+      .filter((payload) => payload.type === "inbound.message").length;
     ws.onmessage?.({
       data: JSON.stringify({
         type: "outbound.message",
@@ -3948,73 +3883,15 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     });
     vi.advanceTimersByTime(10);
     const sent = ws.sent.map((data) => JSON.parse(data));
-    const continuation = sent.find((payload) =>
-      payload.idempotencyKey === `autocont-preamble-s1-${original.id}`);
-    expect(continuation).toBeTruthy();
-    expect(continuation.model).toBe("gpt-5.6-sol");
-    expect(continuation.effortLevel).toBe("high");
-    expect(continuation.content.text).toContain("直接继续完成");
-    expect(sock.sessions.get("s1")!.messages.some((message) =>
-      message.role === "user" && message.text === "↻ 自动继续执行")).toBe(true);
-
-    // Replayed duplicate final is rejected by frameSeq and cannot create a
-    // second paid continuation.
-    ws.onmessage?.({
-      data: JSON.stringify({
-        type: "outbound.message",
-        sessionKey: "agent:main:webchat:dm:s1",
-        channel: "webchat",
-        peer: { id: "s1", kind: "dm" },
-        frameSeq: 1,
-        isFinal: true,
-        ts: 9e12,
-        blocks: [{ kind: "text", text: "好的，我现在检查并修复这个问题。" }],
-        meta: { stopReason: "end_turn" },
-      }),
-    });
-    vi.advanceTimersByTime(10);
-    expect(ws.sent.map((data) => JSON.parse(data)).filter((payload) =>
-      String(payload.idempotencyKey ?? "").startsWith("autocont-preamble-")).length).toBe(1);
-  });
-
-  test("F5 用户关闭「自动继续执行」偏好 → preamble 命中也不自动续写（不替用户扣费）", () => {
-    vi.useFakeTimers();
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    writeAutoContinuePreamblePref(false); // 设备级偏好：关闭
-    try {
-      const sock = makeSocket();
-      sock.setGateReady(true);
-      const ws = FakeWS.instances.at(-1)!;
-      ws.open();
-      sock.sendMessage({
-        sessId: "s1",
-        agentId: "main",
-        text: "检查问题",
-        model: "gpt-5.6-sol",
-        effortLevel: "high",
-      });
-      ws.onmessage?.({
-        data: JSON.stringify({
-          type: "outbound.message",
-          sessionKey: "agent:main:webchat:dm:s1",
-          channel: "webchat",
-          peer: { id: "s1", kind: "dm" },
-          frameSeq: 1,
-          isFinal: true,
-          ts: 9e12,
-          blocks: [{ kind: "text", text: "好的，我现在检查并修复这个问题。" }],
-          meta: { stopReason: "end_turn" },
-        }),
-      });
-      vi.advanceTimersByTime(10);
-      const sent = ws.sent.map((data) => JSON.parse(data));
-      // 关闭后：不发起 preamble 续写，也不落地「↻ 自动继续执行」披露行。
-      expect(sent.some((p) => String(p.idempotencyKey ?? "").startsWith("autocont-preamble-"))).toBe(false);
-      expect(sock.sessions.get("s1")!.messages.some((m) =>
-        m.role === "user" && m.text === "↻ 自动继续执行")).toBe(false);
-    } finally {
-      writeAutoContinuePreamblePref(true); // 复原默认开，避免泄漏到其它用例
-    }
+    expect(sent.filter((payload) => payload.type === "inbound.message")).toHaveLength(inboundCountBeforeFinal);
+    expect(sent.some((payload) =>
+      String(payload.idempotencyKey ?? "").startsWith("autocont-preamble-"))).toBe(false);
+    const session = sock.sessions.get("s1")!;
+    expect(session.messages.some((message) =>
+      message.role === "user" && message.text === "↻ 自动继续执行")).toBe(false);
+    expect(session.messages.some((message) =>
+      message.role === "assistant" && message.text === "好的，我现在检查并修复这个问题。")).toBe(true);
+    expect(session._sendingInFlight).toBe(false);
   });
 
   test("合成续写复用被中断 turn 的路由字段(model/teamMode)——缺失会被 codex 计费闸拒", () => {

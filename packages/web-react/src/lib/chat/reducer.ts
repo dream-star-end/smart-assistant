@@ -24,7 +24,6 @@ import {
   normalizeBridgeErrorCode,
   REPORT_EXEMPT_TURN_ERR_CODES,
   safeBridgeErrorDetail,
-  shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
 import {
@@ -77,8 +76,6 @@ export type FrameEffects = {
   onLiveFrame?: (sess: ChatSession) => void;
   /** 空轮 end_turn → deferred(setTimeout 0) 自动续写。*/
   scheduleAutoContinue?: (sessId: string, targetMsgId: string, cls: EmptyTurnDecision) => void;
-  /** 仅行动承诺式短开场后 end_turn → 单次继续执行。 */
-  schedulePreambleContinue?: (sessId: string, targetMsgId: string) => void;
   /** 商业版余额刷新（cost_charged / insufficient_credits）。*/
   refreshBalance?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
@@ -1627,16 +1624,6 @@ export function applyOutboundMessage(
   if (frame.isFinal) {
     // 空轮分类（block 渲染后；deferred 到这里）。
     if (deferredEmptyNotice) {
-      if (
-        effects.schedulePreambleContinue &&
-        shouldAutoContinueActionPreamble({
-          messages: sess.messages,
-          targetMsgId: deferredEmptyNotice.targetMsgId,
-          stopReason: deferredEmptyNotice.stopReason,
-        })
-      ) {
-        effects.schedulePreambleContinue(sess.id, deferredEmptyNotice.targetMsgId);
-      }
       const cls = classifyEmptyTurn({
         messages: sess.messages,
         targetMsgId: deferredEmptyNotice.targetMsgId,
