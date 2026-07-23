@@ -8133,8 +8133,10 @@ export class Gateway {
         }
         before = current ? JSON.stringify(current) : ''
         targetId = `schedule/${jobId}`
-      } else if (proposal.action === 'plugin.install' || proposal.action === 'manual.review') {
+      } else if (proposal.action === 'plugin.install') {
         before = ''
+      } else if (proposal.action === 'manual.review') {
+        before = proposal.before
       } else {
         continue
       }
