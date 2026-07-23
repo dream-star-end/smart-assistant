@@ -372,6 +372,88 @@ describe('AutoDreamOptimizerService', () => {
     assert.match(report.findings[0]?.evidenceHash ?? '', /^[0-9a-f]{64}$/)
   })
 
+  it('keeps an unsupported Terra target as guided review and still reports its platform finding', async () => {
+    const prompts: Array<{ phase: string; prompt: string }> = []
+    const reported: Array<{ findings: Array<{ capabilityId: string }> }> = []
+    let applyCalls = 0
+    const service = new AutoDreamOptimizerService({
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages: ['production evidence for short response latency'],
+        sessionsReviewed: 9,
+        throughSeq: 32,
+      }),
+      runModel: async (input) => {
+        prompts.push({ phase: input.phase, prompt: input.prompt })
+        if (input.phase === 'map') {
+          return JSON.stringify({
+            summary: '发现短回复路由优化候选。',
+            done: true,
+            userProposals: [
+              {
+                category: 'setting',
+                action: 'preference.patch',
+                targetId: 'model-routing.short-response',
+                title: '短回复场景路由候选',
+                reason: '多个短回复场景存在不必要的等待。',
+                before: '{"enabled":false}',
+                after: '{"enabled":true}',
+              },
+            ],
+            platformFindings: [
+              {
+                taxonomy: 'performance',
+                capabilityId: 'short_response_latency',
+                severity: 'medium',
+                signalCount: 4,
+              },
+            ],
+          })
+        }
+        return JSON.stringify({
+          summary: input.phase === 'synthesis' ? '综合完成。' : '已纳入。',
+          done: true,
+          userProposals: [],
+          platformFindings: [],
+        })
+      },
+      hydrateProposals: async ({ proposals }) => proposals,
+      reportPlatformFindings: async (input) => {
+        reported.push(input)
+      },
+      applyProposal: async () => {
+        applyCalls++
+        return { ok: true }
+      },
+    })
+
+    const state = await service.run('terra-target-contract', true)
+    assert.equal(state.status, 'success')
+    assert.equal(state.proposals.length, 1)
+    assert.equal(state.proposals[0]?.action, 'manual.review')
+    assert.equal(state.proposals[0]?.category, 'setting')
+    assert.equal(state.proposals[0]?.targetId, 'model-routing.short-response')
+    assert.equal(state.proposals[0]?.title, '短回复场景路由候选')
+    assert.equal(state.proposals[0]?.reason, '多个短回复场景存在不必要的等待。')
+    assert.equal(state.proposals[0]?.before, '{"enabled":false}')
+    assert.equal(state.proposals[0]?.after, '{"enabled":true}')
+    assert.equal(reported.length, 1)
+    assert.equal(reported[0]?.findings[0]?.capabilityId, 'short_response_latency')
+    assert.match(
+      prompts.find((row) => row.phase === 'map')?.prompt ?? '',
+      /preferences\.default_effort.*action=manual\.review/s,
+    )
+    assert.match(
+      prompts.find((row) => row.phase === 'synthesis')?.prompt ?? '',
+      /preferences\.default_effort.*action=manual\.review/s,
+    )
+    await assert.rejects(
+      () => service.apply('terra-target-contract', state.proposals[0]!.id),
+      /AUTO_DREAM_PROPOSAL_REQUIRES_GUIDED_ACTION/,
+    )
+    assert.equal(applyCalls, 0)
+  })
+
   it('recovers a prepared local action after mutation-before-receipt crash', async () => {
     let desiredApplied = false
     let calls = 0
