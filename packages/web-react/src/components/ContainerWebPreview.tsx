@@ -4,6 +4,7 @@ import {
   type ContainerPreviewClientMessage,
   type ContainerPreviewElementTarget,
   type ContainerPreviewViewport,
+  normalizeContainerPreviewViewport,
 } from '@openclaude/protocol/containerPreview'
 import {
   ArrowLeft,
@@ -51,6 +52,13 @@ import { Modal } from './ui'
 
 type ToolMode = 'interact' | 'comment'
 type PreviewSurface = 'none' | 'textComposer' | 'commentsDrawer' | 'draftEditor'
+type PreviewDevice = 'desktop' | 'mobile'
+
+type AccessProfile = {
+  sourceUrl: string
+  device: PreviewDevice
+  viewport: ContainerPreviewViewport
+}
 
 type CommentDraft = {
   target: ContainerPreviewElementTarget
@@ -81,6 +89,31 @@ const PHASE_LABEL: Record<string, string> = {
 }
 const MAX_ANNOTATIONS = 20
 
+function readAccessProfile(sourceUrl: string): AccessProfile {
+  if (typeof window === 'undefined') {
+    return {
+      sourceUrl,
+      device: 'desktop',
+      viewport: CONTAINER_PREVIEW_DESKTOP_VIEWPORT,
+    }
+  }
+  const mobile =
+    typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 767px)').matches
+      : window.innerWidth <= 767
+  const visualViewport = window.visualViewport
+  return {
+    sourceUrl,
+    device: mobile ? 'mobile' : 'desktop',
+    viewport: normalizeContainerPreviewViewport({
+      width: visualViewport?.width ?? window.innerWidth,
+      height: visualViewport?.height ?? window.innerHeight,
+      deviceScaleFactor: mobile ? window.devicePixelRatio : 1,
+      isMobile: mobile,
+    }),
+  }
+}
+
 export function ContainerWebPreview({
   open,
   sourceUrl,
@@ -94,7 +127,10 @@ export function ContainerWebPreview({
   onClose: () => void
   onUseComments: (prompt: string) => void
 }) {
-  const [device, setDevice] = useState<'desktop' | 'mobile'>('desktop')
+  const [accessProfile, setAccessProfile] = useState<AccessProfile>(() =>
+    readAccessProfile(sourceUrl),
+  )
+  const [device, setDevice] = useState<PreviewDevice>(accessProfile.device)
   const [mode, setMode] = useState<ToolMode>('interact')
   const [surface, setSurface] = useState<PreviewSurface>('none')
   const [reconnectKey, setReconnectKey] = useState(0)
@@ -107,7 +143,7 @@ export function ContainerWebPreview({
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
-  const [directScale, setDirectScale] = useState(1)
+  const [directScale, setDirectScale] = useState({ x: 1, y: 1 })
   const textInputRef = useRef<HTMLInputElement>(null)
   const commentActionRef = useRef<HTMLButtonElement>(null)
   const commentCountRef = useRef<HTMLButtonElement>(null)
@@ -126,7 +162,6 @@ export function ContainerWebPreview({
   const draftRef = useRef(draft)
   const modeRef = useRef(mode)
   const surfaceRef = useRef(surface)
-  const sourceUrlRef = useRef(sourceUrl)
 
   annotationsRef.current = annotations
   draftRef.current = draft
@@ -134,12 +169,13 @@ export function ContainerWebPreview({
   surfaceRef.current = surface
 
   const viewport = useMemo<ContainerPreviewViewport>(
-    () => ({
-      ...(device === 'mobile'
-        ? CONTAINER_PREVIEW_MOBILE_VIEWPORT
-        : CONTAINER_PREVIEW_DESKTOP_VIEWPORT),
-    }),
-    [device],
+    () =>
+      device === accessProfile.device
+        ? accessProfile.viewport
+        : device === 'mobile'
+          ? CONTAINER_PREVIEW_MOBILE_VIEWPORT
+          : CONTAINER_PREVIEW_DESKTOP_VIEWPORT,
+    [accessProfile, device],
   )
 
   const drawFrame = useCallback((frame: ContainerPreviewFrame) => {
@@ -205,7 +241,7 @@ export function ContainerWebPreview({
     auth,
     url: sourceUrl,
     viewport,
-    enabled: open,
+    enabled: open && accessProfile.sourceUrl === sourceUrl,
     reconnectKey,
     iframeRef,
     onFrame: drawFrame,
@@ -214,25 +250,28 @@ export function ContainerWebPreview({
 
   useEffect(() => {
     if (session.transport !== 'direct') {
-      setDirectScale(1)
+      setDirectScale({ x: 1, y: 1 })
       return
     }
     const node = viewportRef.current
     if (!node) return
     const update = () => {
-      const width = node.getBoundingClientRect().width
-      if (width > 0) setDirectScale(width / viewport.width)
+      const { width, height } = node.getBoundingClientRect()
+      if (width <= 0 || height <= 0) return
+      const next = { x: width / viewport.width, y: height / viewport.height }
+      setDirectScale((current) => (current.x === next.x && current.y === next.y ? current : next))
     }
     update()
     const observer = new ResizeObserver(update)
     observer.observe(node)
     return () => observer.disconnect()
-  }, [session.transport, viewport.width])
+  }, [session.transport, viewport.height, viewport.width])
 
   useEffect(() => {
-    if (sourceUrlRef.current === sourceUrl) return
-    sourceUrlRef.current = sourceUrl
-    setDevice('desktop')
+    if (accessProfile.sourceUrl === sourceUrl) return
+    const nextProfile = readAccessProfile(sourceUrl)
+    setAccessProfile(nextProfile)
+    setDevice(nextProfile.device)
     setMode('interact')
     setSurface('none')
     setAnnotations([])
@@ -242,7 +281,7 @@ export function ContainerWebPreview({
     setTextInput('')
     setFrameStats(null)
     setReconnectKey((value) => value + 1)
-  }, [sourceUrl])
+  }, [accessProfile.sourceUrl, sourceUrl])
 
   useEffect(() => {
     const event = session.selection
@@ -604,6 +643,8 @@ export function ContainerWebPreview({
 
   const aspect = viewport.width / viewport.height
   const previewWidth = `min(${device === 'mobile' ? '430px' : '1280px'}, 100%, calc((100dvh - 168px) * ${aspect}))`
+  const fillsClientViewport =
+    accessProfile.sourceUrl === sourceUrl && device === accessProfile.device
   const displayTitle = session.navigation?.title || session.ready?.title || '容器内网页'
   const displayUrl = session.navigation?.url || sourceUrl
   const hasError = Boolean(session.error || (session.phase === 'closed' && !session.error))
@@ -631,7 +672,7 @@ export function ContainerWebPreview({
       }}
       srTitle="容器网页预览与元素评论"
       hideClose
-      className="h-[100dvh] max-h-[100dvh] w-screen max-w-none rounded-none border-0 bg-[#0c0c11]"
+      className="left-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-screen max-w-none translate-x-0 translate-y-0 rounded-none border-0 bg-[#0c0c11]"
       bodyClassName="overflow-hidden p-0"
     >
       <div
@@ -771,7 +812,12 @@ export function ContainerWebPreview({
           </header>
         )}
 
-        <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-2 pb-[calc(88px+env(safe-area-inset-bottom))] pt-[calc(76px+env(safe-area-inset-top))] sm:px-6 sm:pb-24 sm:pt-20">
+        <main
+          className={cn(
+            'relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-2 pb-[calc(88px+env(safe-area-inset-bottom))] pt-[calc(76px+env(safe-area-inset-top))] sm:px-6 sm:pb-24 sm:pt-20',
+            fillsClientViewport && 'absolute inset-0 p-0 sm:p-0',
+          )}
+        >
           {!hasError && (
             <PreviewStatus
               phase={session.phase}
@@ -782,13 +828,20 @@ export function ContainerWebPreview({
           )}
           <div
             ref={viewportRef}
+            data-testid="container-preview-viewport"
+            data-fullscreen={fillsClientViewport}
             className={cn(
               'preview-viewport relative max-h-full max-w-full overflow-hidden',
-              device === 'mobile' ? 'rounded-[28px]' : 'rounded-xl',
+              !fillsClientViewport && (device === 'mobile' ? 'rounded-[28px]' : 'rounded-xl'),
+              fillsClientViewport && 'size-full max-h-none max-w-none rounded-none border-0',
               mode === 'comment' && ready && 'preview-viewport-selecting',
               hasError && 'preview-viewport-error',
             )}
-            style={{ aspectRatio: `${viewport.width} / ${viewport.height}`, width: previewWidth }}
+            style={
+              fillsClientViewport
+                ? { width: '100%', height: '100%' }
+                : { aspectRatio: `${viewport.width} / ${viewport.height}`, width: previewWidth }
+            }
           >
             {session.transport === 'direct' && session.directUrl ? (
               <>
@@ -805,7 +858,7 @@ export function ContainerWebPreview({
                   style={{
                     width: `${viewport.width}px`,
                     height: `${viewport.height}px`,
-                    transform: `scale(${directScale})`,
+                    transform: `scale(${directScale.x}, ${directScale.y})`,
                     transformOrigin: 'top left',
                   }}
                   onError={session.useLegacyFallback}

@@ -2420,6 +2420,7 @@ export function App() {
       {containerPreviewUrl && (
         <LazyBoundary fallback={<DialogFallback />}>
           <ContainerWebPreview
+            key={containerPreviewUrl}
             open
             sourceUrl={containerPreviewUrl}
             auth={auth}
