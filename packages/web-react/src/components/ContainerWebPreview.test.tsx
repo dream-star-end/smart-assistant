@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest'
 import type { ContainerPreviewClientMessage } from '@openclaude/protocol/containerPreview'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { createMemoryAuthSession } from '../lib/authSession'
@@ -40,6 +40,8 @@ const previewMock = vi.hoisted(() => ({
   send: vi.fn<(message: ContainerPreviewClientMessage) => boolean>(() => true),
   useLegacyFallback: vi.fn(),
   calls: [] as Array<{
+    enabled: boolean
+    url: string
     viewport: { isMobile: boolean; width: number; height: number }
     reconnectKey: number
   }>,
@@ -47,6 +49,8 @@ const previewMock = vi.hoisted(() => ({
 
 vi.mock('../hooks/useContainerPreview', () => ({
   useContainerPreview: (input: {
+    enabled: boolean
+    url: string
     viewport: { isMobile: boolean; width: number; height: number }
     reconnectKey: number
   }) => {
@@ -86,16 +90,18 @@ const cardTarget: Target = {
 }
 
 function PreviewHarness({
+  sourceUrl = 'http://localhost:3000/',
   onClose = () => {},
   onUseComments = () => {},
 }: {
+  sourceUrl?: string
   onClose?: () => void
   onUseComments?: (prompt: string) => void
 }) {
   return (
     <ContainerWebPreview
       open
-      sourceUrl="http://localhost:3000/"
+      sourceUrl={sourceUrl}
       auth={auth}
       onClose={onClose}
       onUseComments={onUseComments}
@@ -120,9 +126,41 @@ function setCanvasRect(canvas: HTMLElement, width = 1280, height = 800) {
   })
 }
 
+function setClientViewport(width: number, height: number) {
+  Object.defineProperties(window, {
+    innerWidth: { configurable: true, value: width },
+    innerHeight: { configurable: true, value: height },
+    visualViewport: {
+      configurable: true,
+      value: {
+        width,
+        height,
+        offsetTop: 0,
+        offsetLeft: 0,
+        addEventListener() {},
+        removeEventListener() {},
+      },
+    },
+    matchMedia: {
+      configurable: true,
+      value: (query: string) => ({
+        matches: query === '(max-width: 767px)' && width <= 767,
+        media: query,
+        onchange: null,
+        addListener() {},
+        removeListener() {},
+        addEventListener() {},
+        removeEventListener() {},
+        dispatchEvent: () => true,
+      }),
+    },
+  })
+}
+
 afterEach(cleanup)
 
 beforeEach(() => {
+  setClientViewport(1280, 800)
   previewMock.phase = 'ready'
   previewMock.transport = 'legacy'
   previewMock.directUrl = null
@@ -142,6 +180,72 @@ beforeEach(() => {
 })
 
 describe('ContainerWebPreview immersive UI', () => {
+  test('automatically uses a mobile viewport and fills the visible screen on mobile access', () => {
+    setClientViewport(390, 844)
+    render(<PreviewHarness />)
+
+    expect(previewMock.calls.at(-1)).toMatchObject({
+      enabled: true,
+      url: 'http://localhost:3000/',
+      viewport: { isMobile: true, width: 390, height: 844 },
+    })
+    expect(screen.getByRole('button', { name: '移动预览' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('dialog')).toHaveClass('left-0', 'translate-x-0', 'translate-y-0')
+    expect(screen.getByTestId('container-preview-viewport')).toHaveAttribute(
+      'data-fullscreen',
+      'true',
+    )
+    expect(screen.getByTestId('container-preview-viewport')).toHaveStyle({
+      width: '100%',
+      height: '100%',
+    })
+  })
+
+  test('automatically uses a desktop viewport and fills the visible screen on PC access', () => {
+    setClientViewport(1440, 900)
+    render(<PreviewHarness />)
+
+    expect(previewMock.calls.at(-1)).toMatchObject({
+      enabled: true,
+      viewport: { isMobile: false, width: 1440, height: 900 },
+    })
+    expect(screen.getByRole('button', { name: '桌面预览' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('container-preview-viewport')).toHaveAttribute(
+      'data-fullscreen',
+      'true',
+    )
+  })
+
+  test('keeps the opposite-device simulator framed and resets atomically for a new URL', async () => {
+    setClientViewport(390, 844)
+    const view = render(<PreviewHarness />)
+
+    fireEvent.click(screen.getByRole('button', { name: '桌面预览' }))
+    expect(previewMock.calls.at(-1)?.viewport).toMatchObject({
+      isMobile: false,
+      width: 1280,
+      height: 800,
+    })
+    expect(screen.getByTestId('container-preview-viewport')).toHaveAttribute(
+      'data-fullscreen',
+      'false',
+    )
+
+    view.rerender(<PreviewHarness sourceUrl="http://localhost:4173/" />)
+    expect(
+      previewMock.calls.some(
+        (call) => call.url === 'http://localhost:4173/' && call.enabled === false,
+      ),
+    ).toBe(true)
+    await waitFor(() => {
+      expect(previewMock.calls.at(-1)).toMatchObject({
+        enabled: true,
+        url: 'http://localhost:4173/',
+        viewport: { isMobile: true, width: 390, height: 844 },
+      })
+    })
+  })
+
   test('renders the isolated native iframe and exposes an explicit compatibility fallback', () => {
     previewMock.transport = 'direct'
     previewMock.directUrl =
@@ -166,6 +270,52 @@ describe('ContainerWebPreview immersive UI', () => {
       fireEvent.click(screen.getByRole('button', { name: '切换兼容预览' }))
       expect(previewMock.useLegacyFallback).toHaveBeenCalledTimes(1)
     } finally {
+      globalThis.ResizeObserver = OriginalResizeObserver
+    }
+  })
+
+  test('scales the direct iframe on both axes when the fullscreen surface exceeds protocol bounds', async () => {
+    setClientViewport(2560, 1080)
+    previewMock.transport = 'legacy'
+    previewMock.directUrl = null
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      right: 2560,
+      bottom: 1080,
+      x: 0,
+      y: 0,
+      width: 2560,
+      height: 1080,
+      toJSON: () => {},
+    })
+    const OriginalResizeObserver = globalThis.ResizeObserver
+    globalThis.ResizeObserver = class {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() {
+        this.callback([], this as unknown as ResizeObserver)
+      }
+      disconnect() {}
+      unobserve() {}
+    }
+    try {
+      const view = render(<PreviewHarness />)
+      expect(previewMock.calls.at(-1)?.viewport).toMatchObject({
+        isMobile: false,
+        width: 1920,
+        height: 1080,
+      })
+      previewMock.transport = 'direct'
+      previewMock.directUrl =
+        'https://alpha-preview.trycloudflare.com/__oc_preview_bootstrap?ticket=secret'
+      view.rerender(<PreviewHarness />)
+      await waitFor(() => {
+        expect(screen.getByTitle('容器内网页原生预览')).toHaveStyle({
+          transform: 'scale(1.3333333333333333, 1)',
+        })
+      })
+    } finally {
+      rect.mockRestore()
       globalThis.ResizeObserver = OriginalResizeObserver
     }
   })

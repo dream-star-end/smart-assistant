@@ -22,15 +22,18 @@
 //   T12 单 Agent 卡和团队队员卡不显示冗余原始记录入口，实际过程仍可见。
 //   T13 工具卡头部满足 44px、键盘可展开/折叠，市场长列表可继续加载且移动宽度不溢出。
 //   T14 消息反馈弹窗真浏览器焦点陷阱与关闭后焦点归还；
-//   T15 活动 turn 中 AskUserQuestion 专用 UI 在移动视口仍可点选并提交。
+//   T15 活动 turn 中 AskUserQuestion 专用 UI 在移动视口仍可点选并提交;
+//   T16/T17 容器网页预览按访问端自动选择移动/桌面并铺满真实可视区。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
 import { createRequire } from "node:module";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import tailwindcss from "@tailwindcss/vite";
+import { build as viteBuild } from "vite";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 
 const require_ = createRequire(import.meta.url);
@@ -61,10 +64,49 @@ await esbuild.build({
   logLevel: "silent",
 });
 
+const previewBundlePath = join(outDir, "preview-harness.js");
+await esbuild.build({
+  entryPoints: [join(HERE, "preview-harness.tsx")],
+  bundle: true,
+  format: "iife",
+  outfile: previewBundlePath,
+  jsx: "automatic",
+  loader: { ".css": "empty" },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "import.meta.env.MODE": '"production"',
+  },
+  alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
+  logLevel: "silent",
+});
+const previewCssDir = join(outDir, "preview-css");
+await viteBuild({
+  root: join(HERE, ".."),
+  configFile: false,
+  logLevel: "silent",
+  plugins: [tailwindcss()],
+  build: {
+    outDir: previewCssDir,
+    emptyOutDir: true,
+    cssCodeSplit: false,
+    rollupOptions: {
+      input: join(HERE, "preview-styles.ts"),
+      output: {
+        entryFileNames: "preview-styles.js",
+        assetFileNames: "preview-styles[extname]",
+      },
+    },
+  },
+});
+const previewCssFile = readdirSync(previewCssDir).find((name) => name.endsWith(".css"));
+if (!previewCssFile) throw new Error("browser-tests: 预览 production CSS 构建失败");
+const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${readFileSync(join(previewCssDir, previewCssFile), "utf8")}</style></head><body><div id="root"></div><script>${readFileSync(previewBundlePath, "utf8")}</script></body></html>`;
+
 // 最小 CSS:只放断言依赖的规则。sr-only 与 tailwind 语义一致 —— T4 要用计算样式
 // 证明 input 非 display:none(display:none 会让国产内核吞掉激活,tailwind 构建产物
 // 不参与本测试,故在此内联同义规则)。
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+  html,body{margin:0;overflow:hidden}
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
   .chat-scroll-area{overflow-anchor:none}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
@@ -497,6 +539,66 @@ await check("T15 活动 turn 中专用 Ask UI 在移动端可点选并提交", a
   if (JSON.stringify(response) !== JSON.stringify(expected)) {
     throw new Error(`Ask UI 回传漂移:${JSON.stringify(response)}`);
   }
+});
+
+async function assertContainerPreviewFillsViewport(expectedDevice, width, height, top = 0) {
+  const dialog = page.getByRole("dialog", { name: "容器网页预览与元素评论" });
+  await dialog.waitFor({ state: "visible", timeout: 3000 });
+  const active = dialog.getByRole("button", { name: `${expectedDevice}预览` });
+  if ((await active.getAttribute("aria-pressed")) !== "true") {
+    throw new Error(`访问端未自动选择${expectedDevice}预览`);
+  }
+  const viewport = dialog.getByTestId("container-preview-viewport");
+  const box = await viewport.boundingBox();
+  if (!box) throw new Error("容器预览没有可测量画布");
+  if (
+    Math.abs(box.x) > 1 ||
+    Math.abs(box.y - top) > 1 ||
+    Math.abs(box.width - width) > 1 ||
+    Math.abs(box.height - height) > 1
+  ) {
+    throw new Error(`容器预览未铺满:${JSON.stringify(box)}，期望 0,${top} ${width}×${height}`);
+  }
+  if ((await viewport.getAttribute("data-fullscreen")) !== "true") {
+    throw new Error("匹配访问端的预览未进入 fullscreen 布局");
+  }
+  const closeBox = await dialog.getByRole("button", { name: "关闭网页预览" }).boundingBox();
+  if (!closeBox || closeBox.width < 44 || closeBox.height < 44) {
+    throw new Error(`关闭控件触控尺寸不足:${JSON.stringify(closeBox)}`);
+  }
+  const overflow = await dialog.evaluate((node) => {
+    const shell = node.querySelector(".preview-shell");
+    return {
+      dialog: node.scrollWidth > node.clientWidth,
+      shell: shell instanceof HTMLElement && shell.scrollWidth > shell.clientWidth,
+    };
+  });
+  if (overflow.dialog || overflow.shell) {
+    throw new Error(`全屏预览自身产生横向溢出:${JSON.stringify(overflow)}`);
+  }
+}
+
+await check("T16 移动访问自动选择移动预览并铺满带偏移的动态可视区", async () => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setContent(previewHtml);
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty("--oc-visual-offset-top", "24px");
+    document.documentElement.style.setProperty("--oc-visual-height", "780px");
+    window.__mountContainerPreview();
+  });
+  await assertContainerPreviewFillsViewport("移动", 390, 780, 24);
+  await page.evaluate(() => window.__unmountContainerPreview());
+});
+
+await check("T17 PC 访问自动选择桌面预览并铺满 1440×900 可视区", async () => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.evaluate(() => {
+    document.documentElement.style.removeProperty("--oc-visual-offset-top");
+    document.documentElement.style.removeProperty("--oc-visual-height");
+    window.__mountContainerPreview();
+  });
+  await assertContainerPreviewFillsViewport("桌面", 1440, 900);
+  await page.evaluate(() => window.__unmountContainerPreview());
 });
 
 if (pageErrors.length > 0) {
