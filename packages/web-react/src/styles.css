@@ -295,6 +295,31 @@ body {
   padding-top: max(10px, env(safe-area-inset-top)); pointer-events: none;
 }
 .preview-floating-header > * { pointer-events: auto; }
+.preview-controls-enter { animation: preview-controls-enter 160ms var(--ease-standard); }
+@keyframes preview-controls-enter {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+.preview-bottom-layer.preview-controls-enter { animation-name: preview-controls-enter-bottom; }
+@keyframes preview-controls-enter-bottom {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.preview-controls-reveal {
+  position: absolute; z-index: 45;
+  top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+  pointer-events: none;
+}
+.preview-controls-reveal .preview-icon-button {
+  pointer-events: auto; border-color: color-mix(in srgb, var(--preview-border) 76%, transparent);
+  background: color-mix(in srgb, var(--preview-surface) 72%, transparent);
+  color: color-mix(in srgb, var(--preview-fg) 70%, transparent);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
+}
+.preview-controls-reveal .preview-icon-button:hover,
+.preview-controls-reveal .preview-icon-button:focus-visible {
+  border-color: var(--preview-border-strong); background: var(--preview-elevated); color: var(--preview-fg);
+}
 .preview-header-row { min-width: 0; }
 .preview-icon-button {
   display: flex; width: 44px; height: 44px; flex: 0 0 auto; align-items: center; justify-content: center;
