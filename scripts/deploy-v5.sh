@@ -18,6 +18,8 @@
 #   scripts/deploy-v5.sh --bootstrap   # 首次:建源码树/HOME/openclaude.json/env/unit + 拷依赖 + 起服务
 #   scripts/deploy-v5.sh               # 增量部署:快照 + rsync 源码 + restart v5 + smoke
 #   scripts/deploy-v5.sh --with-dist   # 代码+前端两生效面、【单次】重启(首选;两段式成对重启会二次掐断在途 turn)
+#   scripts/deploy-v5.sh --runtime-image=REF --runtime-image-id=sha256:...
+#                                  # 在线切换已构建 slim image；完整 tuple 由 hotcfg joint saga 原子提交
 #   scripts/deploy-v5.sh --with-dist --defer-knowledge-planet-upgrade
 #                                  # 一次性先上线知识星球扫码 UI；保留旧 v1.0 执行 pin，扫码后再走正常升级
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
@@ -218,6 +220,9 @@ ENABLE_BUNDLE_FLAG=0; ENABLE_RELEASE_FLAG=0
 DISABLE_BUNDLE_FLAG=0; DISABLE_RELEASE_FLAG=0
 # --emergency-tuple 的显式候选(R2-M1;空=取当前 env 现值)
 EMERG_IMAGE=""; EMERG_IMAGE_ID=""; EMERG_BUNDLE=""
+# 普通 deploy 的在线 slim image 切换候选。只作为 build_runtime_release 的输入，
+# 绝不预写线上 env；四键仍由 hotcfg joint saga 一次提交。
+TARGET_RUNTIME_IMAGE=""; TARGET_RUNTIME_IMAGE_ID=""
 # dx-declared P0 containment lane. These values are invalid unless supplied as one exact set.
 EMERGENCY_INCIDENT=""; EMERGENCY_APPROVAL=""; EMERGENCY_COMMIT=""
 EMERGENCY_APPROVAL_EVIDENCE=""
@@ -239,6 +244,8 @@ for arg in "$@"; do
     --image=*) EMERG_IMAGE="${arg#*=}" ;;
     --image-id=*) EMERG_IMAGE_ID="${arg#*=}" ;;
     --bundle=*) EMERG_BUNDLE="${arg#*=}" ;;
+    --runtime-image=*) TARGET_RUNTIME_IMAGE="${arg#*=}" ;;
+    --runtime-image-id=*) TARGET_RUNTIME_IMAGE_ID="${arg#*=}" ;;
     --bootstrap) MODE="bootstrap" ;;
     --migrate-bluegreen) MODE="migrate-bluegreen" ;;
     --smoke) MODE="smoke" ;;
@@ -353,6 +360,18 @@ if [[ -n "$EMERG_IMAGE$EMERG_IMAGE_ID" && "$MODE" != "emergency-tuple" && "$DISA
 fi
 if [[ "$DISABLE_RELEASE_FLAG" == 1 && ( ( -n "$EMERG_IMAGE" && -z "$EMERG_IMAGE_ID" ) || ( -z "$EMERG_IMAGE" && -n "$EMERG_IMAGE_ID" ) ) ]]; then
   echo "✗ --disable-runtime-release 的 --image=/--image-id= 必须成对出现(ID 钉死,防 tag 漂移;单传 --image-id 会被静默忽略故拒)" >&2; exit 2
+fi
+if [[ -n "$TARGET_RUNTIME_IMAGE$TARGET_RUNTIME_IMAGE_ID" ]]; then
+  [[ "$MODE" == "deploy" ]] \
+    || { echo "✗ --runtime-image/--runtime-image-id 只允许普通 deploy" >&2; exit 2; }
+  [[ -n "$TARGET_RUNTIME_IMAGE" && -n "$TARGET_RUNTIME_IMAGE_ID" ]] \
+    || { echo "✗ --runtime-image/--runtime-image-id 必须成对提供" >&2; exit 2; }
+  [[ "$TARGET_RUNTIME_IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] \
+    || { echo "✗ --runtime-image 格式非法" >&2; exit 2; }
+  [[ "$TARGET_RUNTIME_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || { echo "✗ --runtime-image-id 必须是 sha256:64位小写hex" >&2; exit 2; }
+  [[ "$DISABLE_RELEASE_FLAG" != 1 ]] \
+    || { echo "✗ 在线 slim image 切换不能同时 --disable-runtime-release" >&2; exit 2; }
 fi
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
@@ -4529,6 +4548,48 @@ hotcfg_history_present() {
   ssh "$KL_HOST" "test -s '$OC_HOTCFG_HISTORY'" 2>/dev/null
 }
 
+# 在线 slim runtime image 切换前置门。目标镜像必须先完成不可变构建，且 durable
+# override 已随 protected commit 合并；这里只读核验，不预写 V5_ENV。真正切换仍由
+# activate_runtime_tuple → oc_hotcfg_activate_saga 原子提交完整 tuple。
+assert_target_runtime_image_ready() {
+  [[ -n "$TARGET_RUNTIME_IMAGE" ]] || return 0
+  local -a pinned=()
+  local inspect actual_id source_commit embed_source
+  mapfile -t pinned < <(grep -E '^OC_RUNTIME_IMAGE=' "$REPO_ROOT/deploy/v5/commercial-v5.env.overrides" || true)
+  [[ ${#pinned[@]} == 1 && "${pinned[0]#OC_RUNTIME_IMAGE=}" == "$TARGET_RUNTIME_IMAGE" ]] || {
+    echo "✗ repo overrides 必须唯一且精确钉住 --runtime-image（先合并 durable config）" >&2
+    return 1
+  }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 核验 target runtime image ID/slim label/source ancestor，随后以该 ID 构建 release 并由 joint saga 原子激活"
+    return 0
+  fi
+  hotcfg_release_axis_on || {
+    echo "✗ --runtime-image 要求 runtime release hotcfg 轴已开启（或本次显式 --enable-runtime-release）" >&2
+    return 1
+  }
+  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}' '$TARGET_RUNTIME_IMAGE'" 2>/dev/null)" || {
+    echo "✗ 目标 runtime image 不存在或 inspect 失败:$TARGET_RUNTIME_IMAGE" >&2
+    return 1
+  }
+  IFS='|' read -r actual_id source_commit embed_source <<<"$inspect"
+  [[ "$actual_id" == "$TARGET_RUNTIME_IMAGE_ID" ]] || {
+    echo "✗ 目标 runtime image immutable ID 漂移(expected=$TARGET_RUNTIME_IMAGE_ID actual=${actual_id:-<none>})" >&2
+    return 1
+  }
+  [[ "$embed_source" == 0 ]] || {
+    echo "✗ --runtime-image 在线切换只接受 slim image(oc.runtime.embed_source=0)" >&2
+    return 1
+  }
+  [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
+    && git -C "$REPO_ROOT" cat-file -e "${source_commit}^{commit}" 2>/dev/null \
+    && git -C "$REPO_ROOT" merge-base --is-ancestor "$source_commit" HEAD || {
+    echo "✗ 目标 runtime image source_commit 不是 canonical HEAD 的可验证 ancestor:${source_commit:-<none>}" >&2
+    return 1
+  }
+  echo "  ✓ target runtime image 已钉死(ref=$TARGET_RUNTIME_IMAGE id=$TARGET_RUNTIME_IMAGE_ID source=$source_commit slim=1)"
+}
+
 # ── 1. build_platform_bundle:从**钉死的** BUILT_RELEASE 内 platform-runtime/ 组装 → 落 bundles/<rev> ──
 # 源必须取本次 deploy 已建的不可变 master release(而非 live 树),与 VERSION/archive 同 sha 自洽。
 BUILT_BUNDLE_REV=""
@@ -4600,10 +4661,20 @@ build_runtime_release() {
     BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-dryrunrelease"; RUNTIME_IMAGE_REF="dry"; RUNTIME_IMAGE_ID="sha256:dry"; return 0
   fi
   hotcfg_ship_lib || return 1
-  RUNTIME_IMAGE_REF="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
-  [[ -n "$RUNTIME_IMAGE_REF" ]] || { echo "✗ env 缺 OC_RUNTIME_IMAGE(release 依赖目标镜像装依赖)" >&2; return 1; }
-  RUNTIME_IMAGE_ID="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$RUNTIME_IMAGE_REF'" 2>/dev/null)" \
-    || { echo "✗ 目标 runtime 镜像不存在(须先 build-image 并写入 env): $RUNTIME_IMAGE_REF" >&2; return 1; }
+  if [[ -n "$TARGET_RUNTIME_IMAGE" ]]; then
+    RUNTIME_IMAGE_REF="$TARGET_RUNTIME_IMAGE"
+    RUNTIME_IMAGE_ID="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$RUNTIME_IMAGE_REF'" 2>/dev/null)" \
+      || { echo "✗ 目标 runtime 镜像不存在:$RUNTIME_IMAGE_REF" >&2; return 1; }
+    [[ "$RUNTIME_IMAGE_ID" == "$TARGET_RUNTIME_IMAGE_ID" ]] || {
+      echo "✗ runtime release 构建前目标 image ID 漂移(expected=$TARGET_RUNTIME_IMAGE_ID actual=${RUNTIME_IMAGE_ID:-<none>})" >&2
+      return 1
+    }
+  else
+    RUNTIME_IMAGE_REF="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
+    [[ -n "$RUNTIME_IMAGE_REF" ]] || { echo "✗ env 缺 OC_RUNTIME_IMAGE(release 依赖目标镜像装依赖)" >&2; return 1; }
+    RUNTIME_IMAGE_ID="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$RUNTIME_IMAGE_REF'" 2>/dev/null)" \
+      || { echo "✗ 目标 runtime 镜像不存在(须先 build-image 并写入 env): $RUNTIME_IMAGE_REF" >&2; return 1; }
+  fi
   local prev; prev="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_RELEASE=' '$V5_ENV' | tail -n1 | cut -d= -f2-" 2>/dev/null || true)"
   nonce="$(openssl rand -hex 8)"
   raw="$OC_HOTCFG_RELEASES_ROOT/.raw-$nonce"; staging="$OC_HOTCFG_RELEASES_ROOT/.staging-$nonce"
@@ -5805,6 +5876,8 @@ deploy() {
   # BLOCKER 4:解析 active slot(A/B;蓝绿 finalize 后可能是 B)→ 后续 build/activate/smoke 全 slot-aware。
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
+  # 必须早于 build_release 后的 baseline 安全迁移、插件门和任何 live mutation。
+  assert_target_runtime_image_ready || exit 1
   local egress_prev_release="" kp_previous_release=""
   local kp_previous_plugin_version_id="" kp_setup_plugin_version_id="" kp_had_previous_plugin=0
   kp_previous_release="$(bg_current_release "$ACTIVE_SRC")"
