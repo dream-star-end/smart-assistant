@@ -226,13 +226,18 @@ describe("lossless v2 turn tape", () => {
       ...PAYLOAD,
       turnKey: "b".repeat(64),
       waiveReason: "platform_authority_expired",
+      usage: { model: "kimi-k3-ark" },
     });
     assert.equal(tape.finalize.waiveReason, "platform_authority_expired");
+    assert.equal(tape.finalize.model, "kimi-k3-ark");
     assert.ok([...iterateLosslessTurnTapeParts(tape)].every(
-      (part) => part.waiveReason === "platform_authority_expired",
+      (part) =>
+        part.waiveReason === "platform_authority_expired" &&
+        part.model === "kimi-k3-ark",
     ));
     const canonical = JSON.parse(tape.canonical.toString("utf8"));
     assert.equal(canonical.waiveReason, "platform_authority_expired");
+    assert.equal(canonical.usage.model, "kimi-k3-ark");
   });
 });
 

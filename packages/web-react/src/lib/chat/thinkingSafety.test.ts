@@ -73,6 +73,18 @@ function anySent(pred: (d: string) => boolean): boolean {
   return FakeWS.instances.some((w) => w.sent.some(pred));
 }
 
+function admitLatest(sock: ChatSocket, ws: FakeWS, sessId = "s1"): void {
+  const clientMessageId = [...sock.sessions.get(sessId)!.messages]
+    .reverse()
+    .find((message) => message.role === "user")!.id;
+  ws.onmessage?.({ data: JSON.stringify({
+    type: "outbound.ack",
+    admitted: true,
+    peer: { id: sessId, kind: "dm" },
+    clientMessageId,
+  }) });
+}
+
 describe("thinking-safety liveness 分流（S3）", () => {
   afterEach(() => {
     FakeWS.instances = [];
@@ -88,8 +100,10 @@ describe("thinking-safety liveness 分流（S3）", () => {
     const persistSession = vi.fn();
     const sock = makeSocket({ persistSession });
     sock.setGateReady(true);
-    FakeWS.instances.at(-1)!.open();
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    admitLatest(sock, ws);
     const s = sock.sessions.get("s1")!;
     const msgCountBefore = s.messages.length;
 
@@ -121,9 +135,9 @@ describe("thinking-safety liveness 分流（S3）", () => {
     expect(s.messages.some((m) => m._emptyTurn)).toBe(false);
     expect(anySent((d) => d.includes("inbound.control.stop"))).toBe(false);
     expect(sock.getTransientNotice("s1")).toBeNull();
-    expect(s._sendingInFlight).toBe(false);
+    expect(s._sendingInFlight).toBeFalsy();
     expect(s.messages.find((message) => message.role === "user")?.status).toBe("queued");
-    expect(sock.toStored("s1")?._pendingDispatches).toHaveLength(1);
+    expect(sock.offlineQueue.filter((item) => item.sessId === "s1")).toHaveLength(1);
     expect(FakeWS.instances.length).toBeGreaterThan(1); // 死链已触发 close→reconnect
     sock.stop();
   });
@@ -143,8 +157,10 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
-    FakeWS.instances.at(-1)!.open();
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    admitLatest(sock, ws);
 
     vi.advanceTimersByTime(THINKING_SAFETY_MS + 2000);
     expect(sock.getTransientNotice("s1")).not.toBeNull(); // 已设置
@@ -162,8 +178,10 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
-    FakeWS.instances.at(-1)!.open();
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    admitLatest(sock, ws);
     vi.advanceTimersByTime(THINKING_SAFETY_MS + 2000);
     expect(sock.getTransientNotice("s1")).not.toBeNull();
 
@@ -200,7 +218,7 @@ describe("retryMessage：发送失败原地重发", () => {
     // 不新增气泡（原地复用同一条）；物理 send 后仍等待 durable admission。
     expect(s.messages.filter((m) => m.role === "user").length).toBe(userCountBefore);
     expect(userMsg.status).toBe("sending");
-    expect(s._sendingInFlight).toBe(true);
+    expect(s._sendingInFlight).toBeFalsy();
     // 重发帧复用 clientMessageId，只把持久化 attempt 从 0 精确推进到 1。
     const inbound = ws.sent.find((d) => d.includes('"inbound.message"'))!;
     expect(inbound).toBeTruthy();
@@ -216,6 +234,7 @@ describe("retryMessage：发送失败原地重发", () => {
       clientMessageId: userMsg.id,
     }) });
     expect(userMsg.status).toBe("sent");
+    expect(s._sendingInFlight).toBe(true);
   });
 
   test("非 error 消息 → no-op", () => {

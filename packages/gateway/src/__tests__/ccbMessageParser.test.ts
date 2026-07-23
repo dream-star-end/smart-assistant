@@ -896,6 +896,45 @@ describe('CcbMessageParser: system', () => {
       if (ev.kind === 'turn_status') assert.equal(ev.status, null)
     }
   })
+
+  it('maps native CCB api_retry into the controlled retrying turn status', () => {
+    const { parser, events } = createParser()
+    const before = Date.now()
+    parser.parse({
+      type: 'system',
+      subtype: 'api_retry',
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 597.47,
+      error: 'unknown',
+    } as any)
+    const after = Date.now()
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'turn_status')
+    if (events[0].kind === 'turn_status') {
+      if (typeof events[0].status === 'object' && events[0].status) {
+        assert.equal(events[0].status.status, 'retrying')
+        assert.equal(events[0].status.retry.attempt, 1)
+        assert.equal(events[0].status.retry.max, 10)
+        assert.equal(events[0].status.retry.delayMs, 597)
+        assert.ok(events[0].status.retry.retryAt >= before + 597)
+        assert.ok(events[0].status.retry.retryAt <= after + 598)
+      } else assert.fail('expected retrying object status')
+    }
+  })
+
+  it('ignores malformed native CCB api_retry metadata', () => {
+    const { parser, events } = createParser()
+    for (const raw of [
+      { attempt: 0, max_retries: 10, retry_delay_ms: 1 },
+      { attempt: Number.NaN, max_retries: 10, retry_delay_ms: 1 },
+      { attempt: 1, max_retries: 0, retry_delay_ms: 1 },
+      { attempt: 1, max_retries: 10, retry_delay_ms: -1 },
+    ]) {
+      parser.parse({ type: 'system', subtype: 'api_retry', ...raw } as any)
+    }
+    assert.equal(events.length, 0)
+  })
 })
 
 // ── Phase 1: durable tools[] collection on TurnResult ──

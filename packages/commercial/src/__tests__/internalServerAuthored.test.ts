@@ -400,6 +400,73 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
     assert.equal(finalizeCalls, 3);
     assert.equal(applyCalls, 3);
   });
+
+  test("records one provider timeout only for a newly finalized exact idle_timeout", async () => {
+    const seen = new Set<string>();
+    const health: Array<{ model: string; kind: string }> = [];
+    const handler = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: fakeStorage(async () => ({ applied: true })),
+      losslessTurnTapeStorage: {
+        async stageLosslessTurnTapePart() {
+          return { applied: "stored" };
+        },
+        async finalizeLosslessTurnTape(_userId, body) {
+          const applied = seen.has(body.tapeId) ? "idempotent" : "finalized";
+          seen.add(body.tapeId);
+          return { applied, recordCount: 1, engineBillings: [] };
+        },
+      },
+      async applyTurnWaiver() {
+        return {
+          waiverId: "1",
+          newlyApplied: false,
+          refundedCredits: 0n,
+          recordCount: 0,
+          totalAfter: 100n,
+          inboxMessageId: "1",
+        };
+      },
+      recordProviderHealth(model, kind) {
+        health.push({ model, kind });
+      },
+    });
+    const base: LosslessTurnTapeFinalizeRequest = {
+      protocolVersion: LOSSLESS_TURN_TAPE_VERSION,
+      action: "finalize",
+      sessionId: "web-test1",
+      agentId: "main",
+      turnIndex: 1,
+      status: "interrupted",
+      turnKey: "a".repeat(64),
+      tapeId: "b".repeat(64),
+      tapeSha256: "e".repeat(64),
+      totalBytes: 1,
+      partCount: 1,
+      createdAt: 1_783_944_000_000,
+      model: "kimi-k3-ark",
+      waiveReason: "idle_timeout",
+    };
+    for (const body of [
+      base,
+      base,
+      {
+        ...base,
+        turnKey: "c".repeat(64),
+        tapeId: "d".repeat(64),
+        waiveReason: "no_response" as const,
+      },
+    ]) {
+      const out = makeRes();
+      await handler(
+        makeReq({ body: JSON.stringify(body), auth: `Bearer ${VALID_TOKEN}` }),
+        out.res,
+        CTX,
+      );
+      assert.equal(out.rec.status, 200);
+    }
+    assert.deepEqual(health, [{ model: "kimi-k3-ark", kind: "timeout" }]);
+  });
 });
 
 // 止血批 A · A3:turn tape 落库错误的瞬态 vs 永久分类。瞬态(statement timeout / 死锁 /

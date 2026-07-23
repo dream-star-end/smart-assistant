@@ -7,9 +7,10 @@
  *   - **只治理静态 provider**(findRouteProviderForModel 命中):OAuth/claude 由 account-pool
  *     健康体系(ACCOUNT_POOL_ALL_DOWN)追踪,不在此重复,亦规避最热路径写放大;
  *     codex/gpt-5.5 走独立 relay,不经本 finalizer。
- *   - 进程:v5 拓扑下 core.ts 由 egress 独占执行 → 样本从 egress 直写 PG(同 latencyProber
- *     模式),不走 master cost-event 通道(健康样本无钱包/广播语义)。**部署改此文件必须
- *     deploy-v5.sh --egress。**
+ *   - 进程:v5 拓扑下 proxy settle 样本由 egress 写；master 的 lossless-tape finalize
+ *     另用同一 sink 补 gateway 已证明的 idle-timeout 样本。二者各有进程内 buffer、都直写
+ *     PG，不走 cost-event 通道（健康样本无钱包/广播语义）。部署改运行逻辑时须同时评估
+ *     master 与 egress 轴。
  *
  * 纪律(信号层绝不影响在飞流):record 是同步 fire-and-forget(只入内存 buffer + 排定
  * flush,不 await、不 throw);实际 INSERT 在 unref 定时器里批量执行,写失败静默丢批只 warn。

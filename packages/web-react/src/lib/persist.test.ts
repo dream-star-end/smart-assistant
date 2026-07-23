@@ -9,6 +9,7 @@ import {
   reconcileTimelineBashTailAuxiliaries,
   SessionStore,
   stableSortByTs,
+  type StoredPendingDispatch,
   type StoredSession,
 } from "./persist";
 
@@ -25,7 +26,7 @@ function msg(id: string, text = ""): ChatMessage {
 
 // ─── 最小内存 IDBFactory（仅覆盖 IdbKV 用到的窄 API） ────────────────────────
 function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
-  type Entry = { stores: Map<string, Map<string, unknown>> };
+  type Entry = { version: number; stores: Map<string, Map<string, unknown>> };
   const dbs = new Map<string, Entry>();
   // biome-ignore lint/suspicious/noExplicitAny: 测试桩，刻意松散
   const fire = (o: any, ev: string, ...a: any[]) => {
@@ -55,16 +56,38 @@ function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
       put: (v: unknown, k: string) => makeReq(() => void map.set(k, v), settled),
       delete: (k: string) => makeReq(() => void map.delete(k), settled),
       clear: () => makeReq(() => void map.clear(), settled),
+      openCursor: () => {
+        // biome-ignore lint/suspicious/noExplicitAny: 测试桩
+        const req: any = { onsuccess: null, onerror: null, result: undefined };
+        const keys = [...map.keys()];
+        let index = 0;
+        const advance = () => {
+          const key = keys[index++];
+          req.result = key === undefined
+            ? null
+            : {
+                key,
+                get value() { return map.get(key); },
+                update: (value: unknown) => makeReq(() => void map.set(key, value)),
+                continue: () => queueMicrotask(advance),
+              };
+          fire(req, "success");
+        };
+        queueMicrotask(advance);
+        return req;
+      },
     };
   }
   // biome-ignore lint/suspicious/noExplicitAny: 测试桩
   const factory: any = {
-    open(name: string) {
+    open(name: string, version = 1) {
       // biome-ignore lint/suspicious/noExplicitAny: 测试桩
       const req: any = { onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null };
       const isNew = !dbs.has(name);
-      if (isNew) dbs.set(name, { stores: new Map() });
+      if (isNew) dbs.set(name, { version: 0, stores: new Map() });
       const entry = dbs.get(name)!;
+      const oldVersion = entry.version;
+      const upgrading = version > oldVersion;
       // biome-ignore lint/suspicious/noExplicitAny: 测试桩
       const db: any = {
         objectStoreNames: { contains: (n: string) => entry.stores.has(n) },
@@ -96,10 +119,24 @@ function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
       };
       req.result = db;
       queueMicrotask(() => {
-        if (isNew) fire(req, "upgradeneeded");
+        if (upgrading) {
+          req.transaction = db.transaction();
+          fire(req, "upgradeneeded", { oldVersion });
+          entry.version = version;
+          setTimeout(() => fire(req, "success"), 0);
+          return;
+        }
         fire(req, "success");
       });
       return req;
+    },
+    seedV1(name: string, sessions: StoredSession[]) {
+      const store = new Map<string, unknown>();
+      for (const session of sessions) store.set(session.id, session);
+      dbs.set(name, {
+        version: 1,
+        stores: new Map([["sessions", store]]),
+      });
     },
   };
   return factory as IDBFactory;
@@ -1221,6 +1258,21 @@ describe("persist — 命名空间", () => {
 });
 
 describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
+  const pending = (sessId: string, msgId: string): StoredPendingDispatch => ({
+    msgId,
+    enqueuedAt: 10,
+    payload: {
+      type: "inbound.message",
+      idempotencyKey: `web:${msgId}:0`,
+      channel: "webchat",
+      peer: { id: sessId, kind: "dm" },
+      agentId: "main",
+      clientMessageId: msgId,
+      content: { text: "exact" },
+      ts: 10,
+    },
+  });
+
   test("durable put waits for readwrite transaction completion", async () => {
     let releaseCommit!: () => void;
     const gate = new Promise<void>((resolve) => { releaseCommit = resolve; });
@@ -1252,6 +1304,66 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
 
     await store.wipe();
     expect(await store.getAll()).toEqual([]);
+  });
+
+  test("multi-tab stale session writes cannot erase or resurrect the exact journal", async () => {
+    const f = fakeIDBFactory();
+    const first = new SessionStore("tabs", f);
+    const stale = new SessionStore("tabs", f);
+    await first.putSession(stored("s1", { title: "fresh" }));
+    await first.putPendingDispatch("s1", pending("s1", "m-exact"));
+
+    // A stale tab overwrites the whole session cache without any journal.
+    await stale.putSession(stored("s1", { title: "stale" }));
+    expect(await first.getPendingDispatches()).toEqual([
+      expect.objectContaining({ sessId: "s1", msgId: "m-exact" }),
+    ]);
+    expect((await first.getAllForHydration())[0]?._pendingDispatches).toEqual([
+      expect.objectContaining({ msgId: "m-exact" }),
+    ]);
+
+    await first.deletePendingDispatch("s1", "m-exact");
+    await stale.putSession(stored("s1", {
+      _pendingDispatches: [pending("s1", "m-exact")],
+    }));
+    expect(await first.getPendingDispatches()).toEqual([]);
+    expect((await first.getAllForHydration())[0]?._pendingDispatches).toBeUndefined();
+  });
+
+  test("v1 versionchange atomically migrates and scrubs inline pending dispatches", async () => {
+    const f = fakeIDBFactory() as IDBFactory & {
+      seedV1: (name: string, sessions: StoredSession[]) => void;
+    };
+    f.seedV1(dbNameForUser("migrate"), [
+      stored("s1", { _pendingDispatches: [pending("s1", "m-v1")] }),
+    ]);
+    const store = new SessionStore("migrate", f);
+    const hydrated = await store.getAllForHydration();
+    expect(hydrated[0]?._pendingDispatches).toEqual([
+      expect.objectContaining({ msgId: "m-v1" }),
+    ]);
+    expect((await store.getSession("s1"))?._pendingDispatches).toBeUndefined();
+    expect(await store.getPendingDispatches()).toEqual([
+      expect.objectContaining({ sessId: "s1", msgId: "m-v1" }),
+    ]);
+  });
+
+  test("journal-only crash window reconstructs the exact visible user turn", async () => {
+    const store = new SessionStore("journal-only", fakeIDBFactory());
+    await store.putPendingDispatch("s-orphan", pending("s-orphan", "m-orphan"));
+    const hydrated = await store.getAllForHydration();
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]).toMatchObject({
+      id: "s-orphan",
+      agentId: "main",
+      _pendingDispatches: [expect.objectContaining({ msgId: "m-orphan" })],
+      messages: [{
+        id: "m-orphan",
+        role: "user",
+        text: "exact",
+        status: "queued",
+      }],
+    });
   });
 
   test("按 user 命名空间隔离：user B 读不到 user A 的会话（隐私）", async () => {
@@ -1286,6 +1398,7 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
     const store = new SessionStore("u1"); // 不注入 factory，jsdom 无 global indexedDB
     await expect(store.putSession(stored("x"))).resolves.toBeUndefined();
     await expect(store.putSessionDurably(stored("x"))).rejects.toThrow("indexeddb unavailable");
+    await expect(store.putPendingDispatch("x", pending("x", "m-x"))).rejects.toThrow("indexeddb unavailable");
     expect(await store.getSession("x")).toBeUndefined();
     expect(await store.getAll()).toEqual([]);
     await expect(store.wipe()).resolves.toBeUndefined();

@@ -547,12 +547,30 @@ export class CcbMessageParser {
     //   - `status` — coarse non-streaming turn phase (currently only
     //     `'compacting' | null`). Mapped to a controlled enum and surfaced
     //     as `kind: 'turn_status'`; server.ts wraps into `outbound.turn_status`.
+    //   - `api_retry` — native CCB upstream retry notice, normalized into the
+    //     same controlled retrying shape already used by the Codex runner.
     //     CCB raw status string is **not** transparently forwarded — only the
     //     mapped values cross the protocol boundary.
     if (msg.type === 'system') {
       if (raw.subtype === 'bash_output_tail') {
         const block = bashOutputTailBlock(raw)
         if (block) this.onEvent({ kind: 'block', block })
+      } else if (raw.subtype === 'api_retry') {
+        const delayMs = raw.retry_delay_ms
+        const retry = normalizeTurnRetry({
+          attempt: raw.attempt,
+          max: raw.max_retries,
+          delayMs,
+          retryAt: typeof delayMs === 'number' && Number.isFinite(delayMs)
+            ? Date.now() + Math.max(0, delayMs)
+            : Number.NaN,
+        })
+        if (retry) {
+          this.onEvent({
+            kind: 'turn_status',
+            status: { status: 'retrying', retry },
+          })
+        }
       } else if (raw.subtype === 'status') {
         // 受控枚举:CCB SDKStatus 有 'compacting' | null(coreSchemas.ts:1268);
         // codex runner 另注入 fake-SDK `status:'retrying'` + retry 载荷(自动重试

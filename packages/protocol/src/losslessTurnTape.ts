@@ -68,6 +68,9 @@ export interface LosslessTurnTapePartRequest {
   status: 'completed' | 'interrupted' | 'crashed'
   /** 终态携带即要求 master 原子封账并异步完成退款+定向站内信。 */
   waiveReason?: TurnWaiveReason
+  /** Executed model copied from the hashed canonical payload. Master uses it
+   * only to attribute exact idle-timeout health evidence. */
+  model?: string
   turnKey: string
   tapeId: string
   tapeSha256: string
@@ -93,6 +96,8 @@ export interface LosslessTurnTapeFinalizeRequest {
   status: 'completed' | 'interrupted' | 'crashed'
   /** 与每个 part 同值；finalize 事务以它创建 pending 免单封账标记。 */
   waiveReason?: TurnWaiveReason
+  /** Same immutable execution-model metadata carried on every part. */
+  model?: string
   turnKey: string
   tapeId: string
   tapeSha256: string

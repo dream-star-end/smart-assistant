@@ -42,10 +42,7 @@ function persistSignature(s: StoredSession): string {
   const inflightSig = s._sendingInFlight
     ? `1/${s._turnStartedAt ?? 0}/${s._lastFrameAt ?? 0}`
     : "0";
-  const pendingSig = (s._pendingDispatches ?? [])
-    .map((item) => `${item.msgId}/${item.enqueuedAt}`)
-    .join(",");
-  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${s._selectedModelId ?? ""}:${inflightSig}:${pendingSig}:${s._trackerResetAt ?? 0}:${s._trackerResetServerTs ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
+  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${s._selectedModelId ?? ""}:${inflightSig}:${s._trackerResetAt ?? 0}:${s._trackerResetServerTs ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
 }
 
 /**
@@ -274,7 +271,6 @@ export function useChatSocket(opts: {
   // 持久存储（按 user 命名空间）+ 立即落盘句柄 + 写盘签名（防无谓 IDB 写）。
   const storeRef = useRef<SessionStore | null>(null);
   const persistRef = useRef<(sessId: string) => void>(() => {});
-  const persistDurablyRef = useRef<(sessId: string) => Promise<void>>(async () => {});
   const sigRef = useRef<Map<string, string>>(new Map());
   // IndexedDB 注水是否完成：持久启用时，connect 须等注水完成，否则首个 hello 不带恢复的
   // 断点续传游标（restored 会话无法 auto-resume，要等下次重连才补）。
@@ -387,19 +383,18 @@ export function useChatSocket(opts: {
       persistSessionModel: (sessId, modelId) => {
         queueModelPatchRef.current?.(sessId, modelId);
       },
-      // 跨设备持久化用户消息(行已由 ensureServerSession 建)。best-effort,失败静默。
-      persistUserMessage: async (sessId, msg) => {
-        const a = authRef.current;
-        if (!a) return;
-        try {
-          await api.appendUserMessage(a, sessId, msg);
-        } catch {
-          /* best-effort:本地 + IndexedDB 仍在,仅跨设备该条不显 */
-        }
-      },
       // resume_failed 游标推进 / isFinal turn 收尾：立即落 IndexedDB（防 reload 死循环 + 不丢轮）。
       persistSession: (sessId) => persistRef.current(sessId),
-      persistSessionDurably: (sessId) => persistDurablyRef.current(sessId),
+      persistPendingDispatch: async (sessId, item) => {
+        const store = storeRef.current;
+        if (!store) throw new Error("session store unavailable");
+        await store.putPendingDispatch(sessId, item);
+      },
+      deletePendingDispatch: async (sessId, msgId) => {
+        const store = storeRef.current;
+        if (!store) return;
+        await store.deletePendingDispatch(sessId, msgId);
+      },
       // GitHub 仓库绑定状态/错误帧 → 透传给 useRepoBinding（经 ref，无 stale）。
       onRepoStatus: (frame) => onRepoStatusRef.current?.(frame),
       onRepoBindError: (frame) => onRepoBindErrorRef.current?.(frame),
@@ -420,15 +415,6 @@ export function useChatSocket(opts: {
     sigRef.current.set(sessId, persistSignature(stored));
     void store.putSession(stored);
   };
-  persistDurablyRef.current = async (sessId: string) => {
-    const store = storeRef.current;
-    if (!store) throw new Error("session store unavailable");
-    const stored = socket.toStored(sessId);
-    if (!stored) throw new Error("session snapshot unavailable");
-    sigRef.current.set(sessId, persistSignature(stored));
-    await store.putSessionDurably(stored);
-  };
-
   // 生命周期：enabled 时 start（绑事件）；卸载/禁用时 stop（解绑 + 关 ws）。
   useEffect(() => {
     if (!enabled || !auth) {
@@ -495,7 +481,7 @@ export function useChatSocket(opts: {
     };
     const hydrationTimer = setTimeout(releaseHydration, 3000); // IDB 卡住兜底,不无限等
     void store
-      .getAll()
+      .getAllForHydration()
       .then((all) => {
         if (cancelled) return;
         for (const stored of all) socket.loadStored(stored);
@@ -568,9 +554,9 @@ export function useChatSocket(opts: {
   const isSending = useCallback(
     (sessId: string | undefined) => {
       void snap.version;
-      return !!(sessId && snap.sessions.get(sessId)?._sendingInFlight);
+      return !!(sessId && socket.isSessionBusy(sessId));
     },
-    [snap],
+    [snap, socket],
   );
 
   const ensureSession = useCallback((sessId: string, agentId: string, title?: string) => {
