@@ -28,7 +28,7 @@ async function putStored(page: Page, userId: string, snapshot: StoredSnapshot): 
   await page.evaluate(
     async ({ dbName, value }) => {
       await new Promise<void>((resolve, reject) => {
-        const request = indexedDB.open(dbName, 1);
+        const request = indexedDB.open(dbName);
         request.onupgradeneeded = () => {
           if (!request.result.objectStoreNames.contains('sessions')) {
             request.result.createObjectStore('sessions');
@@ -55,7 +55,7 @@ async function getStored(page: Page, userId: string, sessionId: string): Promise
   return page.evaluate(
     async ({ dbName, key }) =>
       new Promise<StoredSnapshot | null>((resolve, reject) => {
-        const request = indexedDB.open(dbName, 1);
+        const request = indexedDB.open(dbName);
         request.onerror = () => reject(request.error ?? new Error('open IndexedDB failed'));
         request.onsuccess = () => {
           const db = request.result;
