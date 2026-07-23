@@ -2348,6 +2348,116 @@ describe('v5 release safety lanes', () => {
     }
   })
 
+  test('online slim runtime image switch is paired, provenance-bound, and feeds the target immutable ID into release finalization', async () => {
+    const image = 'openclaude/openclaude-runtime:v5-ccb-fcd3d67de4d0-slim'
+    const imageId = `sha256:${'8'.repeat(64)}`
+    const sourceCommit = 'fcd3d67de4d0678381aa50213be260fcf90010d5'
+    for (const args of [
+      [`--runtime-image=${image}`],
+      [`--runtime-image-id=${imageId}`],
+      [`--runtime-image=bad image`, `--runtime-image-id=${imageId}`],
+      [`--runtime-image=${image}`, '--runtime-image-id=sha256:bad'],
+      ['--smoke', `--runtime-image=${image}`, `--runtime-image-id=${imageId}`],
+    ]) {
+      const rejected = run(deploy, args)
+      assert.equal(rejected.status, 2, rejected.stdout + rejected.stderr)
+    }
+
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-image-switch-')); dirs.push(dir)
+    await mkdir(path.join(dir, 'deploy/v5'), { recursive: true })
+    await writeFile(
+      path.join(dir, 'deploy/v5/commercial-v5.env.overrides'),
+      `OC_RUNTIME_IMAGE=${image}\n`,
+    )
+    const capture = path.join(dir, 'finalize.args')
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `REPO_ROOT='${dir}'`,
+      `TARGET_RUNTIME_IMAGE='${image}'`,
+      `TARGET_RUNTIME_IMAGE_ID='${imageId}'`,
+      'DRY=0',
+      'git() {',
+      '  case "$*" in',
+      `    *"cat-file -e ${sourceCommit}^"*) return 0 ;;`,
+      `    *"merge-base --is-ancestor ${sourceCommit} HEAD"*) return "\${ANCESTOR_RC:-0}" ;;`,
+      '    *"rev-parse HEAD"*) printf "%s\\n" pinned-commit ;;',
+      '    *"show pinned-commit:deploy/v5/release-metadata.json"*) printf "%s\\n" "$PINNED_METADATA" ;;',
+      '    *"archive --format=tar pinned-commit"*) : ;;',
+      '    *) return 97 ;;',
+      '  esac',
+      '}',
+      'hotcfg_release_axis_on() { return 0; }',
+      'hotcfg_ship_lib() { :; }',
+      'ssh() {',
+      '  if [[ "$*" == *"docker image inspect"* && "$*" == *"source_commit"* ]]; then',
+      `    printf '%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" "\${SOURCE_COMMIT:-${sourceCommit}}" "\${EMBED_SOURCE:-0}"`,
+      '  elif [[ "$*" == *"docker image inspect"* ]]; then',
+      `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
+      '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
+      '    printf "%s\\n" /runtime/prev',
+      '  else',
+      '    cat >/dev/null || true',
+      '  fi',
+      '}',
+      'assert_target_runtime_image_ready',
+      'hotcfg_rmt() { printf "%s\\n" "$@" >"$CAPTURE"; printf "%s\\n" "$OC_HOTCFG_RELEASES_ROOT/rel-test"; }',
+      'build_runtime_release',
+    ].join('\n')
+    const invoke = (env: NodeJS.ProcessEnv = {}) => spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        CAPTURE: capture,
+        PINNED_METADATA: JSON.stringify({
+          runtimeCapabilities: ['model_authority_v1', 'future.runtime-cap'],
+        }),
+        ...env,
+      },
+    })
+
+    const valid = invoke()
+    assert.equal(valid.status, 0, valid.stderr || valid.stdout)
+    const args = (await readFile(capture, 'utf8')).trim().split('\n')
+    assert.equal(args[0], 'oc_hotcfg_finalize_release')
+    assert.equal(args[2], imageId)
+
+    for (const [env, pattern] of [
+      [{ ACTUAL_ID: `sha256:${'9'.repeat(64)}` }, /immutable ID 漂移/],
+      [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
+      [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
+    ] as const) {
+      await writeFile(capture, '')
+      const rejected = invoke(env)
+      assert.notEqual(rejected.status, 0, rejected.stdout + rejected.stderr)
+      assert.match(rejected.stderr, pattern)
+      assert.equal(await readFile(capture, 'utf8'), '', 'preflight failure must precede release finalization')
+    }
+
+    const source = await readFile(deploy, 'utf8')
+    const preflight = source.slice(
+      source.indexOf('assert_target_runtime_image_ready()'),
+      source.indexOf('\n# ── 1. build_platform_bundle', source.indexOf('assert_target_runtime_image_ready()')),
+    )
+    const deployBody = source.slice(source.indexOf('deploy() {'), source.indexOf('\n# ───────────────────────── offline recycle'))
+    assert.doesNotMatch(preflight, /sed -i|OC_RUNTIME_IMAGE=.*>>|oc_hotcfg_env_write_tuple/)
+    assert.ok(
+      deployBody.indexOf('assert_target_runtime_image_ready') < deployBody.indexOf('prepare_live_baseline_safety'),
+      'target image provenance must be checked before live baseline/plugin mutations',
+    )
+    assert.match(
+      source,
+      /if \[\[ -n "\$TARGET_RUNTIME_IMAGE" \]\]; then[\s\S]*RUNTIME_IMAGE_REF="\$TARGET_RUNTIME_IMAGE"[\s\S]*RUNTIME_IMAGE_ID=.*docker image inspect/,
+    )
+    assert.match(
+      source,
+      /hotcfg_rmt oc_hotcfg_activate_saga[\s\S]*"\$image" "\$image_id" "\$release" "\$bundle_val"/,
+    )
+  })
+
   test('release metadata declares authority plus lossless persistence capabilities', async () => {
     const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
     const source = await readFile(deploy, 'utf8')
