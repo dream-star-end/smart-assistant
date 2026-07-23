@@ -25,6 +25,7 @@
 //   T15 活动 turn 中 AskUserQuestion 专用 UI 在移动视口仍可点选并提交;
 //   T16/T17 容器网页预览按访问端自动选择移动/桌面、铺满真实可视区，空闲后收起
 //      chrome，且独立“…”入口不会吞掉 iframe 页面交互。
+//   T18 消息“引用”动作把精确目标送入 Composer，可取消；再次引用后随当前正文发送。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -123,7 +124,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
   #tool-card-polish-root .min-h-11{min-height:2.75rem}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -157,7 +158,10 @@ async function check(name, fn) {
   }
 }
 
-const plusButton = page.getByRole("button", { name: "更多选项" });
+const primaryComposer = page.locator("#root");
+const plusButton = primaryComposer.getByRole("button", { name: "更多选项" });
+// DropdownMenuContent renders in a body-level portal. Scope only the trigger
+// to the primary composer; the menu item itself must be located from the page.
 const attachItem = page.getByText("添加附件");
 
 await check("T1 点「+」→「添加附件」→ filechooser 真实弹出", async () => {
@@ -549,6 +553,34 @@ await check("T15 活动 turn 中专用 Ask UI 在移动端可点选并提交", a
   };
   if (JSON.stringify(response) !== JSON.stringify(expected)) {
     throw new Error(`Ask UI 回传漂移:${JSON.stringify(response)}`);
+  }
+});
+
+await check("T18 点助手“引用”→预览可取消→再次引用后随正文发送", async () => {
+  const root = page.locator("#message-quote-root");
+  const quote = root.getByRole("button", { name: "引用" });
+  await quote.click();
+  await root.getByText("正在引用 OpenClaude").waitFor({ state: "visible", timeout: 3000 });
+  await root.getByText("这是需要被引用的完整回答").last().waitFor({ state: "visible", timeout: 3000 });
+  await root.getByRole("button", { name: "取消引用" }).click();
+  if (await root.getByText("正在引用 OpenClaude").count()) {
+    throw new Error("取消后引用预览仍存在");
+  }
+  await quote.click();
+  const composer = root.getByPlaceholder("给 OpenClaude 发消息…");
+  await composer.fill("请重点解释这一段");
+  await root.getByRole("button", { name: "发送" }).click();
+  const sends = await page.evaluate(() => window.__messageQuote.sends);
+  const expected = [{
+    text: "请重点解释这一段",
+    replyTo: {
+      messageId: "assistant-quote-probe",
+      role: "assistant",
+      text: "这是需要被引用的完整回答",
+    },
+  }];
+  if (JSON.stringify(sends) !== JSON.stringify(expected)) {
+    throw new Error(`引用发送参数不完整:${JSON.stringify(sends)}`);
   }
 });
 

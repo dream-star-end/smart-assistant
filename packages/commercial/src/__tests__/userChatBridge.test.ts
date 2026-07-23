@@ -40,6 +40,7 @@ import {
   SCANSCI_PAPER_HINT_MARKER,
 } from "../ws/paperIntentHint.js";
 import { GoalStateError } from "../goal/goalStateService.js";
+import { formatMessageReplyPrompt } from "@openclaude/protocol";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
@@ -1112,6 +1113,11 @@ describe("userChatBridge — model authorization", () => {
 
   test("authoritative user row is persisted before history load and current logical turn is excluded", async () => {
     const order: string[] = [];
+    const replyTo = {
+      messageId: "a-old",
+      role: "assistant" as const,
+      text: "older answer",
+    };
     const rig = await startRig({
       persistMasterUserMessage: async (uid, sessionId, message) => {
         assert.equal(uid, 205n);
@@ -1119,6 +1125,7 @@ describe("userChatBridge — model authorization", () => {
         assert.equal(message.id, "m-current-turn");
         assert.equal(message.text, "continue safely");
         assert.equal(message._modelText, "continue safely\n[attachment text]");
+        assert.deepEqual(message._replyTo, replyTo);
         assert.deepEqual(message._media, [
           { kind: "file", url: "/api/media/visible.txt" },
         ]);
@@ -1130,8 +1137,12 @@ describe("userChatBridge — model authorization", () => {
         order.push("persist");
         return { applied: true };
       },
-      loadMasterSessionMessages: async () => {
+      loadMasterSessionMessages: async (_uid, _sessionId, options) => {
         assert.deepEqual(order, ["persist"]);
+        assert.equal(
+          options.currentUserText,
+          formatMessageReplyPrompt("continue safely\n[attachment text]", replyTo),
+        );
         order.push("history");
         return [
           { id: "u-old", role: "user", text: "older question", ts: 1 },
@@ -1164,6 +1175,7 @@ describe("userChatBridge — model authorization", () => {
             { kind: "file", url: "/api/media/visible.txt" },
             { kind: "file", url: "/api/media/hidden.txt", hidden: true },
           ],
+          replyTo,
         },
       }));
       const forwarded = await forwardedP;
@@ -1172,6 +1184,7 @@ describe("userChatBridge — model authorization", () => {
         { id: "u-old", role: "user", text: "older question", ts: 1 },
         { id: "a-old", role: "assistant", text: "older answer", status: "completed", ts: 2 },
       ]);
+      assert.deepEqual((forwarded.content as { replyTo?: unknown }).replyTo, replyTo);
       ws.close();
       await waitClose(ws);
     } finally {

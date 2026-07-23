@@ -15,6 +15,7 @@ import {
   ShieldCheck,
   Sparkles,
   MessageSquare,
+  Quote,
   Square,
   Target,
   Type,
@@ -75,6 +76,8 @@ export type CardCallbacks = {
   onFeedback?: (ctx: FeedbackContext) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
+  /** 把 user / assistant 消息的精确快照带回 Composer。 */
+  onQuote?: (msg: ChatMessage) => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
   onFetchTapeRecordPayload?: (
     tapeId: string,
@@ -276,6 +279,18 @@ function MessageActions({
         icon={<Type size={15} />}
       />
       <SpeakButton getText={() => stripMarkdown(msg.text || "")} />
+      {cb.onQuote && (
+        <IconButton
+          aria-label="引用"
+          title="引用"
+          size="sm"
+          shape="square"
+          className="[@media(hover:none)]:size-11"
+          onClick={() => cb.onQuote?.(msg)}
+        >
+          <Quote size={15} />
+        </IconButton>
+      )}
       {showRegen && cb.onRegenerate && (
         <IconButton
           aria-label="重新生成"
@@ -313,6 +328,28 @@ const USER_STATUS_LABEL: Record<string, string> = {
   replied: "已回复",
   error: "发送失败",
 };
+
+function ReplyQuoteBlock({
+  role,
+  text,
+}: {
+  role: "user" | "assistant";
+  text: string;
+}) {
+  return (
+    <div
+      className="mb-2 border-l-2 border-fg/20 pl-2.5 text-left text-fg/70"
+      data-testid="message-reply-quote"
+    >
+      <div className="mb-0.5 text-[11px] font-medium">
+        {role === "assistant" ? "OpenClaude" : "你"}
+      </div>
+      <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5">
+        {text}
+      </div>
+    </div>
+  );
+}
 // 叶子卡一律不 memo:重渲防抖的唯一权威是上层 MessageRenderer 的 messageSignature 比较层。
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
@@ -320,11 +357,14 @@ const USER_STATUS_LABEL: Record<string, string> = {
 export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) {
   const status = msg.status;
   return (
-    <div className="flex flex-col items-end animate-in" data-testid="user-row">
+    <div className="group flex flex-col items-end animate-in" data-testid="user-row">
       <div
         className="max-w-[78%] whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg"
         data-testid="message-text"
       >
+        {msg._replyTo && (
+          <ReplyQuoteBlock role={msg._replyTo.role} text={msg._replyTo.text} />
+        )}
         {msg.text}
       </div>
       {msg._media && msg._media.length > 0 && (
@@ -348,6 +388,20 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
               <RotateCcw size={11} /> 重试
             </button>
           )}
+        </div>
+      )}
+      {status !== "sending" && status !== "queued" && status !== "error" && cb?.onQuote && (
+        <div className="mt-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
+          <IconButton
+            aria-label="引用"
+            title="引用"
+            size="sm"
+            shape="square"
+            className="[@media(hover:none)]:size-11"
+            onClick={() => cb.onQuote?.(msg)}
+          >
+            <Quote size={15} />
+          </IconButton>
         </div>
       )}
     </div>

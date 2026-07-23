@@ -65,13 +65,15 @@ function makeGateway(events: any[], delivered: any[] = []): any {
     start: () => ({}),
     complete: () => {},
   }
+  gateway.submittedPayloads = []
   gateway.sessions = {
     getOrCreate: async () => ({
       agentId: 'main',
       currentTurnStatus: null,
       runner: { sendPermissionResponse: () => {} },
     }),
-    submit: async (_session: unknown, _payload: string, onEvent: (e: any) => void) => {
+    submit: async (_session: unknown, payload: string, onEvent: (e: any) => void) => {
+      gateway.submittedPayloads.push(payload)
       for (const e of events) onEvent(e)
     },
     // team-durability — dispatchInbound 的客户 turn 计数/迟到产物钩子(fake no-op)
@@ -83,6 +85,28 @@ function makeGateway(events: any[], delivered: any[] = []): any {
   }
   return gateway
 }
+
+test('message reply snapshot is derived into the engine prompt without replacing current text', async () => {
+  const gateway = makeGateway([])
+  const frame = makeFrame() as any
+  frame.content = {
+    text: '请解释这一段',
+    replyTo: {
+      messageId: 'assistant-42',
+      role: 'assistant',
+      text: '完整历史回答',
+    },
+  }
+
+  await gateway.dispatchInbound(frame)
+
+  assert.deepEqual(gateway.submittedPayloads, [[
+    '[被引用的历史消息｜发送者：助手｜消息ID：assistant-42｜原文字符数：6]',
+    '完整历史回答',
+    '[用户当前消息]',
+    '请解释这一段',
+  ].join('\n')])
+})
 
 function liveEvents(): any[] {
   return [

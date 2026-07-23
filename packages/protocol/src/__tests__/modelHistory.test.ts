@@ -5,6 +5,10 @@ import {
   modelHistoryReservedTokens,
   modelHistorySemanticText,
 } from '../modelHistory.js'
+import {
+  formatMessageReplyPrompt,
+  normalizeMessageReplyQuote,
+} from '../messageReply.js'
 
 test('only CCB provider-switch history reserves proactive-compaction headroom', () => {
   assert.equal(modelHistoryReservedTokens('ccb'), 33_256)
@@ -45,4 +49,39 @@ test('user continuity uses the exact model-visible prompt rather than bubble pre
     }),
     '请看附件\n[attachment: exact extracted text]',
   )
+})
+
+test('reply snapshots normalize through an allow-list and share one deterministic model envelope', () => {
+  const quote = normalizeMessageReplyQuote({
+    messageId: 'assistant-42',
+    role: 'assistant',
+    text: '完整历史回答',
+    injected: 'must not persist',
+  })
+  assert.deepEqual(quote, {
+    messageId: 'assistant-42',
+    role: 'assistant',
+    text: '完整历史回答',
+  })
+  const expected = [
+    '[被引用的历史消息｜发送者：助手｜消息ID：assistant-42｜原文字符数：6]',
+    '完整历史回答',
+    '[用户当前消息]',
+    '请解释这一段',
+  ].join('\n')
+  assert.equal(formatMessageReplyPrompt('请解释这一段', quote), expected)
+  assert.equal(
+    modelHistorySemanticText({
+      id: 'user-reply',
+      role: 'user',
+      text: '请解释这一段',
+      _replyTo: quote,
+    }),
+    expected,
+  )
+  assert.equal(normalizeMessageReplyQuote({
+    messageId: 'line\nbreak',
+    role: 'assistant',
+    text: 'x',
+  }), undefined)
 })

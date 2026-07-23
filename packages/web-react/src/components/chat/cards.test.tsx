@@ -45,6 +45,43 @@ describe("F3 UserCard 发送失败重试命中区", () => {
   });
 });
 
+describe("消息引用动作与已发送引用块", () => {
+  test("助手消息提供 44px 触控引用动作并回传原消息", () => {
+    const onQuote = vi.fn();
+    const message = { id: "a-quote", role: "assistant", text: "完整回答", ts: 1 } as ChatMessage;
+    render(
+      <AssistantCard
+        msg={message}
+        ctx={{ isLast: true, sending: false, inActiveTurn: true }}
+        cb={{ onQuote }}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "引用" });
+    expect(button).toHaveClass("[@media(hover:none)]:size-11");
+    fireEvent.click(button);
+    expect(onQuote).toHaveBeenCalledWith(message);
+  });
+
+  test("用户气泡展示完整引用快照的两行视觉块，并可继续被引用", () => {
+    const onQuote = vi.fn();
+    const message = userMsg({
+      status: "sent",
+      text: "请解释这一段",
+      _replyTo: {
+        messageId: "a-old",
+        role: "assistant",
+        text: "不会在数据层截断的完整历史回答",
+      },
+    });
+    render(<UserCard msg={message} cb={{ onQuote }} />);
+    expect(screen.getByText("OpenClaude")).toBeInTheDocument();
+    const quoteText = screen.getByText("不会在数据层截断的完整历史回答");
+    expect(quoteText).toHaveClass("line-clamp-2");
+    fireEvent.click(screen.getByRole("button", { name: "引用" }));
+    expect(onQuote).toHaveBeenCalledWith(message);
+  });
+});
+
 describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
   test("可重试码 + _clientMessageId 命中原 user 行 → 显示精确「重试」(不显「重新尝试」)", () => {
     const onRetrySend = vi.fn();

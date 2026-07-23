@@ -1823,6 +1823,7 @@ export const api = {
       _retryMedia?: unknown;
       _imageEdit?: unknown;
       _modelText?: string;
+      _replyTo?: unknown;
       _routing?: unknown;
       _sendAttempt?: number;
       _isAutoRetry?: boolean;

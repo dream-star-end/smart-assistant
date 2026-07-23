@@ -1,6 +1,7 @@
 import { type Static, Type } from '@sinclair/typebox'
 import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
+import { MessageReplyQuote } from './messageReply.js'
 
 // ───────────────────────────────────────────────
 // V3 S12e — trace id schema fragment
@@ -118,6 +119,9 @@ export const InboundMessage = Type.Object({
      * identity or the model input. */
     displayText: Type.Optional(Type.String()),
     media: Type.Optional(Type.Array(MediaRef)),
+    /** Exact reply snapshot. The gateway derives model-visible reply context
+     * on demand; clients must not duplicate this text into content.text. */
+    replyTo: Type.Optional(MessageReplyQuote),
     /** A user-authored, visual selection for a precise image edit. Indices
      * address content.media; the gateway resolves and validates every file,
      * then replaces this client descriptor with a server-owned job id. */

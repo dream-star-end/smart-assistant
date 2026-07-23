@@ -5,6 +5,10 @@
  * they are not browser-history limits. The browser timeline remains exact and
  * independently pageable.
  */
+import {
+  formatMessageReplyPrompt,
+  normalizeMessageReplyQuote,
+} from './messageReply.js'
 
 /** Codex app-server 0.144 reports this executable window for the deployed
  * native runner. A null catalog value means "runner-owned", not infinite. */
@@ -143,7 +147,14 @@ export function modelHistorySemanticText(value: unknown): string {
   const body = textContent(message)
   switch (role) {
     case 'user':
-      appendSection(parts, '', typeof message._modelText === 'string' ? message._modelText : body)
+      appendSection(
+        parts,
+        '',
+        formatMessageReplyPrompt(
+          typeof message._modelText === 'string' ? message._modelText : body,
+          normalizeMessageReplyQuote(message._replyTo),
+        ),
+      )
       break
     case 'assistant':
       appendSection(parts, '', body)
