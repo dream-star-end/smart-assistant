@@ -161,8 +161,7 @@ async function loginViaUi() {
   fireEvent.click(landingLogin) // Landing 登录 → AuthGate
   fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
   fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
-  // AuthGate fail-closed：公开配置（turnstile_bypass）加载完前登录按钮禁用。等其就绪再提交
-  // （生产同样：登录页拉到 config 后按钮才可点）。
+  // 正常路径等公开配置（turnstile_bypass）就绪后提交；异常路径另有“点一次后自动恢复”用例。
   const submit = screen.getByRole('button', { name: '登录' })
   await waitFor(() => expect(submit).not.toBeDisabled())
   await act(async () => {
@@ -250,6 +249,38 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const call = fetchMock.mock.calls.find(([url]) => String(url) === '/api/auth/login')
     expect(call).toBeTruthy()
     expect((call![1] as RequestInit).credentials).toBe('include')
+  })
+
+  test('公开安全配置首次失败时点一次登录，自动恢复后完成登录', async () => {
+    let configCalls = 0
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/public/config')) {
+        configCalls += 1
+        return configCalls === 1
+          ? errJson(503, { error: { code: 'UPSTREAM_UNAVAILABLE', message: 'temporary outage' } })
+          : PUBLIC_CONFIG
+      }
+      if (u.includes('/api/auth/login')) return LOGIN_OK
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '登录' }))
+    fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
+
+    await waitFor(() => expect(configCalls).toBe(1))
+    const login = screen.getByRole('button', { name: '登录' })
+    expect(login).not.toBeDisabled()
+    fireEvent.click(login)
+    await waitFor(() => expect(configCalls).toBe(2))
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    const loginCalls = fetchMock.mock.calls.filter(([url]) => String(url) === '/api/auth/login')
+    expect(loginCalls).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: /重试.*配置/ })).not.toBeInTheDocument()
   })
 
   test('boot silent refresh: 有效 refresh cookie → 免登录直接恢复工作区', async () => {

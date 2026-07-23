@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApiError } from "../lib/api";
 import { LEGAL_DOCS, TERMS_VERSION } from "../lib/legal";
@@ -8,13 +9,16 @@ import { AuthGate } from "./AuthGate";
 // ---------------------------------------------------------------------------
 // P6 Turnstile 门控（AuthGate，三态 fail-closed）：
 //  - bypass=true（canary）→ 不渲染 widget，登录发占位 'bypass'。
-//  - bypass=undefined（config 未就绪/失败）→ 不渲染 widget，但禁用登录、绝不发占位 token。
+//  - bypass=undefined（config 未就绪/失败）→ 可登记一次登录意图，但绝不提前提交/发占位 token。
 //  - bypass=false（生产）→ 渲染真实 widget，token 拿到前禁用登录（硬 cutover blocker）。
 //    注：headless 无法完成真实 CF 挑战，这里只验证「渲染 + 禁用 gating」，token 流转
 //    待 canary 关闭 bypass 后浏览器侧验证。
 // ---------------------------------------------------------------------------
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  window.turnstile = undefined;
+});
 
 const base = { theme: "light" as const, onCycleTheme: () => {} };
 
@@ -48,15 +52,46 @@ describe("AuthGate — Turnstile gating", () => {
     expect(screen.getByRole("link", { name: "《隐私政策》" })).toHaveAttribute("href", "/privacy");
   });
 
-  test("config 未就绪（bypass=undefined）：fail-closed，禁用登录，绝不发占位 token", () => {
+  test("config 未就绪：按钮不永久灰锁，点一次后等待配置并恰好登录一次", async () => {
     const onLogin = vi.fn();
-    render(<AuthGate {...base} onLogin={onLogin} />); // 不传 turnstileBypass（config 未加载/失败）
+    const retry = vi.fn();
+    const { rerender } = render(
+      <StrictMode>
+        <AuthGate {...base} onLogin={onLogin} onRetryPublicConfig={retry} />
+      </StrictMode>,
+    );
     expect(screen.queryByTestId("turnstile-widget")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("正在准备登录");
     fill();
     const btn = screen.getByRole("button", { name: /登录/ });
-    expect(btn).toBeDisabled(); // config 未知不放行（生产不会用假 token 登录）
+    expect(btn).not.toBeDisabled();
     fireEvent.click(btn);
+    expect(retry).toHaveBeenCalledTimes(1);
     expect(onLogin).not.toHaveBeenCalled();
+    rerender(
+      <StrictMode>
+        <AuthGate
+          {...base}
+          onLogin={onLogin}
+          onRetryPublicConfig={retry}
+          turnstileBypass={true}
+        />
+      </StrictMode>,
+    );
+    await waitFor(() =>
+      expect(onLogin).toHaveBeenCalledWith("a@b.com", "password123", "bypass"),
+    );
+    rerender(
+      <StrictMode>
+        <AuthGate
+          {...base}
+          onLogin={onLogin}
+          onRetryPublicConfig={retry}
+          turnstileBypass={true}
+        />
+      </StrictMode>,
+    );
+    expect(onLogin).toHaveBeenCalledTimes(1);
   });
 
   test("bypass=false：渲染真实 widget，token 拿到前禁用登录", () => {
@@ -69,6 +104,73 @@ describe("AuthGate — Turnstile gating", () => {
     const btn = screen.getByRole("button", { name: /登录/ });
     expect(btn).toBeDisabled(); // 无 token，绝不放行
     fireEvent.click(btn);
+    expect(onLogin).not.toHaveBeenCalled();
+  });
+
+  test("config 未知时点登录，随后真实 widget token 到达后恰好提交一次", async () => {
+    const onLogin = vi.fn();
+    const retry = vi.fn();
+    const renderWidget = vi.fn(
+      (
+        _el: HTMLElement,
+        opts: {
+          callback: (token: string) => void;
+        },
+      ) => {
+        opts.callback("real-token");
+        return "widget-1";
+      },
+    );
+    window.turnstile = {
+      render: renderWidget,
+      remove: vi.fn(),
+      reset: vi.fn(),
+    };
+    const { rerender } = render(
+      <AuthGate {...base} onLogin={onLogin} onRetryPublicConfig={retry} />,
+    );
+    fill();
+    fireEvent.click(screen.getByRole("button", { name: "登录" }));
+    expect(onLogin).not.toHaveBeenCalled();
+
+    rerender(
+      <AuthGate
+        {...base}
+        onLogin={onLogin}
+        onRetryPublicConfig={retry}
+        turnstileBypass={false}
+        turnstileSiteKey="0xSITEKEY"
+      />,
+    );
+    await waitFor(() =>
+      expect(onLogin).toHaveBeenCalledWith("a@b.com", "password123", "real-token"),
+    );
+    expect(onLogin).toHaveBeenCalledTimes(1);
+  });
+
+  test("离开登录模式后，迟到的 config 不会消费旧登录意图", async () => {
+    const onLogin = vi.fn();
+    const { rerender } = render(
+      <AuthGate
+        {...base}
+        onLogin={onLogin}
+        onRegister={vi.fn()}
+        onRetryPublicConfig={vi.fn()}
+      />,
+    );
+    fill();
+    fireEvent.click(screen.getByRole("button", { name: "登录" }));
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    rerender(
+      <AuthGate
+        {...base}
+        onLogin={onLogin}
+        onRegister={vi.fn()}
+        onRetryPublicConfig={vi.fn()}
+        turnstileBypass={true}
+      />,
+    );
+    await act(async () => {});
     expect(onLogin).not.toHaveBeenCalled();
   });
 });

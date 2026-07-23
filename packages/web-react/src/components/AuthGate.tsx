@@ -32,13 +32,14 @@ export function AuthGate({
   onCycleTheme,
   turnstileBypass,
   turnstileSiteKey,
+  onRetryPublicConfig,
   allowRegistration = true,
   requireEmailVerified = false,
   initialMode = "login",
   resetToken,
 }: {
   // 第三参为 Turnstile token：canary(bypass=true)发占位串 'bypass'；生产(bypass=false)为真
-  // widget token；config 未就绪(undefined)时 fail-closed（按钮禁用，绝不提交，绝不发占位）。
+  // widget token；config 未就绪(undefined)时点击只登记登录意图，绝不提交或发占位 token。
   onLogin: (email: string, password: string, turnstileToken: string) => void;
   /** 注册（返回 verifyEmailSent 决定是否进入验证步）。 */
   onRegister?: (input: {
@@ -68,6 +69,8 @@ export function AuthGate({
   turnstileBypass?: boolean;
   /** GET /api/public/config 的 turnstile_site_key（!bypass 时 render widget）。*/
   turnstileSiteKey?: string;
+  /** 登录意图发生时立即重新加载公开安全配置，不改变或绕过现有 Turnstile 门禁。 */
+  onRetryPublicConfig?: () => void;
   /** 是否允许注册（公开配置 allow_registration）；false 时隐藏注册入口。 */
   allowRegistration?: boolean;
   /** 是否强制邮箱验证后才能登录（公开配置 require_email_verified）。 */
@@ -87,6 +90,9 @@ export function AuthGate({
   const [newPwConfirm, setNewPwConfirm] = useState("");
   // 真实 Turnstile token（仅 !bypass 且 widget onSuccess 后非空）。
   const [token, setToken] = useState<string | null>(null);
+  // config 未知时允许用户点一次登录：凭据快照等安全配置/token 就绪后恰好消费一次。
+  const pendingLoginRef = useRef<{ email: string; password: string } | null>(null);
+  const [loginPending, setLoginPending] = useState(false);
   // 非 login 子流程的自管 loading / 错误 / 成功提示（login 仍用上层 loading/error props）。
   const [busy, setBusy] = useState(false);
   const [localErr, setLocalErr] = useState<string | null>(null);
@@ -105,10 +111,16 @@ export function AuthGate({
   const modeNeedsTurnstile = mode === "login" || mode === "register" || mode === "forgot";
   const turnstileReady = bypassKnown && (turnstileBypass === true || !!token);
 
+  function clearPendingLogin() {
+    pendingLoginRef.current = null;
+    setLoginPending(false);
+  }
+
   // 切换模式：复位瞬时态（token/错误/提示/busy），保留已填的 email/password 便于衔接。
   // opGen 递增 → 让任何在途异步提交的迟到回调失效（防旧请求劫持新模式）。
   function go(next: AuthMode) {
     opGen.current += 1;
+    clearPendingLogin();
     setMode(next);
     setLocalErr(null);
     setNotice(null);
@@ -151,10 +163,30 @@ export function AuthGate({
   const busyNow = mode === "login" ? !!loading : busy;
   const shownErr = mode === "login" ? error || localErr : localErr;
 
+  // config 未知时用户已点登录：等待 bypass 或真 widget token 就绪后，先原子消费 intent
+  // 再提交。ref 先清空可抵御 StrictMode/effect 重跑，绝不重复登录。
+  useEffect(() => {
+    if (mode !== "login" || busyNow || !turnstileReady || !submitToken) return;
+    const pending = pendingLoginRef.current;
+    if (!pending) return;
+    pendingLoginRef.current = null;
+    setLoginPending(false);
+    onLogin(pending.email, pending.password, submitToken);
+  }, [mode, busyNow, turnstileReady, submitToken, onLogin]);
+
   // ── 各模式提交 ───────────────────────────────────────────────────────────
   function submitLogin() {
-    if (busyNow || !email.trim() || !password || !turnstileReady || !submitToken) return;
-    onLogin(email.trim(), password, submitToken);
+    const normalizedEmail = email.trim();
+    if (busyNow || loginPending || !normalizedEmail || !password) return;
+    if (!turnstileReady || !submitToken) {
+      if (!bypassKnown) {
+        pendingLoginRef.current = { email: normalizedEmail, password };
+        setLoginPending(true);
+        onRetryPublicConfig?.();
+      }
+      return;
+    }
+    onLogin(normalizedEmail, password, submitToken);
   }
 
   async function submitRegister() {
@@ -314,6 +346,14 @@ export function AuthGate({
       />
     </div>
   );
+  const turnstileGate = modeNeedsTurnstile && !bypassKnown ? (
+    <output className="flex items-center justify-center gap-2 text-[13px] text-muted">
+      <Spinner size={15} />
+      <span>正在准备登录…</span>
+    </output>
+  ) : (
+    widget
+  );
 
   const errBox = shownErr && (
     <div
@@ -422,15 +462,21 @@ export function AuthGate({
               </Button>
             )}
             {noticeBox}
-            {widget}
+            {turnstileGate}
 
             <Button
               type="submit"
               variant="primary"
-              disabled={busyNow || !email.trim() || !password || !turnstileReady}
+              disabled={
+                busyNow ||
+                loginPending ||
+                !email.trim() ||
+                !password ||
+                (bypassKnown && !turnstileReady)
+              }
               className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
             >
-              {busyNow ? <Spinner size={17} /> : (<>登录<ArrowRight size={16} /></>)}
+              {busyNow || loginPending ? <Spinner size={17} /> : (<>登录<ArrowRight size={16} /></>)}
             </Button>
 
             {allowRegistration && onRegister && (
@@ -515,7 +561,7 @@ export function AuthGate({
             </label>
 
             {errBox}
-            {widget}
+            {turnstileGate}
 
             <Button
               type="submit"
@@ -618,7 +664,7 @@ export function AuthGate({
                 </label>
 
                 {errBox}
-                {widget}
+                {turnstileGate}
 
                 <Button
                   type="submit"
