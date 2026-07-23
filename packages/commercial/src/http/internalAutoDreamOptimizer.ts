@@ -35,6 +35,39 @@ export interface AutoDreamOptimizerRuntime {
   }): Promise<Record<string, unknown>>
 }
 
+export type AutoDreamCodexRouteDecision =
+  | {
+      kind: 'api_relay'
+      token: string
+      baseUrl: string
+      modelProvider: string
+      providerName?: string | null
+      wireApi?: string | null
+      preferredAuthMethod?: string | null
+      disableResponseStorage?: boolean | null
+    }
+  | { kind: 'official_oauth' }
+  | { kind: 'unavailable' }
+
+export function projectAutoDreamCodexRoute(route: AutoDreamCodexRouteDecision | null): {
+  token: string | null
+  routeFrame: Record<string, unknown>
+} | null {
+  if (!route || route.kind === 'unavailable') return null
+  if (route.kind === 'official_oauth') return { token: null, routeFrame: {} }
+  return {
+    token: route.token,
+    routeFrame: {
+      baseUrl: route.baseUrl,
+      modelProvider: route.modelProvider,
+      providerName: route.providerName ?? null,
+      wireApi: route.wireApi ?? 'responses',
+      preferredAuthMethod: route.preferredAuthMethod ?? 'apikey',
+      disableResponseStorage: route.disableResponseStorage ?? true,
+    },
+  }
+}
+
 export type AutoDreamOptimizerHandler = (
   req: IncomingMessage,
   res: ServerResponse,

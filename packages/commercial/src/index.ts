@@ -319,6 +319,7 @@ import {
   AUTO_DREAM_OPTIMIZER_SETTLE_PATH,
   isAutoDreamOptimizerInternalPath,
   makeAutoDreamOptimizerHandler,
+  projectAutoDreamCodexRoute,
   type AutoDreamOptimizerRuntime,
 } from "./http/internalAutoDreamOptimizer.js";
 import {
@@ -3966,7 +3967,7 @@ export async function registerCommercial(
   type AutoDreamCodexSnapshot = {
     reservation: ReservationHandle;
     finalizer: CodexFinalizeHandle;
-    routeToken: string;
+    routeToken: string | null;
     userId: bigint;
     containerId: number;
     engineSessionId: string;
@@ -4003,11 +4004,13 @@ export async function registerCommercial(
         ) {
           throw new Error("AUTO_DREAM_INVALID_POLICY");
         }
-        const route = await createWechatApiRelayRoute({
-          containerId: identity.containerId,
-          userId,
-          modelId: model,
-        });
+        const route = projectAutoDreamCodexRoute(
+          await createCommercialCodexRoute({
+            containerId: identity.containerId,
+            userId,
+            modelId: model,
+          }),
+        );
         if (!route) throw new Error("AUTO_DREAM_ROUTE_UNAVAILABLE");
         const basePricing = pricing.get(model);
         if (!basePricing) {
