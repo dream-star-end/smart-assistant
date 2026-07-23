@@ -55,6 +55,7 @@ export * from './httpRange.js'
 // cli launcher 在容器 env 全集时 `channelFactories.push(() => makeV3WechatOutboundAdapter({config}))`。
 export {
   makeV3WechatOutboundAdapter,
+  makeV3QqbotOutboundAdapter,
   readV3WechatOutboundConfig,
   type V3WechatOutboundConfig,
 } from './v3WechatOutbound.js'

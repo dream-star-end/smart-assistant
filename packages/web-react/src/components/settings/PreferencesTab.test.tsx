@@ -8,6 +8,7 @@ import { PreferencesTab } from "./PreferencesTab";
 
 const apiKeysSection = vi.hoisted(() => vi.fn(() => null));
 vi.mock("./ApiKeysSection", () => ({ ApiKeysSection: apiKeysSection }));
+vi.mock("./QqBindingCard", () => ({ QqBindingCard: () => null }));
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 

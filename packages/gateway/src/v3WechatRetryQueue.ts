@@ -70,7 +70,7 @@ export function defaultQueueDir(): string {
  */
 export interface V3WechatSinkWirePayload {
   sessionId: string
-  channel: 'wechat'
+  channel: 'wechat' | 'qqbot'
   agentId?: string
   outboundId: string
   peer: {
@@ -433,7 +433,7 @@ function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   // outboundReceiver BodySchema regex 直接拒(400 INVALID_BODY = fatal),提前在
   // shape guard 截,避免 drainer 反复 POST 注定 400 的请求。
   if (typeof p.sessionId !== 'string' || !/^wsess-[0-9a-f]{16}$/.test(p.sessionId)) return false
-  if (p.channel !== 'wechat') return false
+  if (p.channel !== 'wechat' && p.channel !== 'qqbot') return false
   if (p.agentId !== undefined) {
     if (typeof p.agentId !== 'string') return false
     if (p.agentId.length === 0 || p.agentId.length > 64) return false

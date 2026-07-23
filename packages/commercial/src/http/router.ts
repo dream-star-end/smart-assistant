@@ -242,6 +242,8 @@ import {
   handleCountMyInboxUnread,
   handleCreateSession,
   handleDeleteResearchLibraryDoc,
+  handleDeleteMyQqBinding,
+  handleGetMyQqBinding,
   handleGetMyPreferences,
   handleGetMyUsage,
   handleGetMyUsageReport,
@@ -262,6 +264,7 @@ import {
   handleRequestPasswordReset,
   handleResendVerification,
   handleSubmitFeedback,
+  handleStartMyQqBinding,
   handleUploadResearchLibraryDoc,
   handleVerifyEmail,
 } from './handlers.js'
@@ -648,6 +651,9 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
     { method: 'GET', path: '/api/me/preferences', handler: handleGetMyPreferences },
     { method: 'PATCH', path: '/api/me/preferences', handler: handlePatchMyPreferences },
+    { method: 'GET', path: '/api/me/qq-binding', handler: handleGetMyQqBinding },
+    { method: 'POST', path: '/api/me/qq-binding/start', handler: handleStartMyQqBinding },
+    { method: 'DELETE', path: '/api/me/qq-binding', handler: handleDeleteMyQqBinding },
     // 使用消耗统计(含 summary / sessions 分页 / ledger 分页 / savings)
     { method: 'GET', path: '/api/me/usage', handler: handleGetMyUsage },
     // 用量报表聚合(前端画图表):summary + 趋势 + 按模型 + 流水。exact path,与上面

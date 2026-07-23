@@ -268,7 +268,7 @@ export interface InboundDispatcherDeps {
     sessionId: WechatSessionId
     userId: string
     agentId: string
-    originChannel: "wechat"
+    originChannel: "wechat" | "qqbot"
     title: string
     createdAt: number
     lastAt: number
@@ -324,6 +324,47 @@ export interface InboundDispatcherDeps {
   /** 注入便于测试。默认 crypto.randomUUID()。 */
   newRequestId?: () => string
   logger?: Logger
+  /**
+   * Optional external-channel profile.  Omitted keeps the historical WeChat
+   * behavior byte-for-byte; QQ supplies all routing/session functions as one
+   * profile so no WeChat constant can leak into the QQ path.
+   */
+  channel?: {
+    id: "wechat" | "qqbot"
+    originChannel: "wechat" | "qqbot"
+    inboundPath: string
+    compensatePath: string
+    stopPath: string
+    defaultSessionTitle: string
+    decorateInboundText: (text: string) => string
+    getCurrentSessionId: (
+      conn: PgConn,
+      bindingUserId: string,
+    ) => Promise<WechatSessionId | null>
+    getCurrentSessionPointer: (
+      conn: PgConn,
+      bindingUserId: string,
+    ) => Promise<{ sessionId: WechatSessionId; agentId?: string } | null>
+    setCurrentSessionId: (
+      conn: PgConn,
+      bindingUserId: string,
+      sessionId: WechatSessionId,
+      now: number,
+      agentId?: string,
+    ) => Promise<boolean>
+    markRunningSession: (
+      conn: PgConn,
+      bindingUserId: string,
+      sessionId: WechatSessionId,
+      runId: string,
+      agentId: string | undefined,
+      now: number,
+    ) => Promise<void>
+    listRunningSessions: (
+      conn: PgConn,
+      bindingUserId: string,
+    ) => Promise<Array<{ sessionId: WechatSessionId; runId: string; agentId?: string }>>
+  }
 }
 
 export interface InboundDispatcher {
@@ -334,7 +375,21 @@ export interface InboundDispatcher {
 // ─── 实现 ──────────────────────────────────────────────────────────────────
 
 export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispatcher {
-  const log = (deps.logger ?? rootLogger).child({ subsys: "wechatInboundDispatcher" })
+  const channel = deps.channel ?? {
+    id: "wechat" as const,
+    originChannel: "wechat" as const,
+    inboundPath: WECHAT_INBOUND_CONTAINER_PATH,
+    compensatePath: WECHAT_INBOUND_COMPENSATE_PATH,
+    stopPath: WECHAT_STOP_CONTAINER_PATH,
+    defaultSessionTitle: DEFAULT_SESSION_TITLE,
+    decorateInboundText: withWechatChannelHints,
+    getCurrentSessionId,
+    getCurrentSessionPointer,
+    setCurrentSessionId,
+    markRunningSession,
+    listRunningSessions,
+  }
+  const log = (deps.logger ?? rootLogger).child({ subsys: `${channel.id}InboundDispatcher` })
   const now = deps.now ?? (() => Date.now())
   const newSessionId = deps.newSessionId ?? (() => newWechatSessionId())
   const newRequestId = deps.newRequestId ?? defaultRequestId
@@ -407,7 +462,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       // ── 2) pointer lookup or allocate ─────────────────────────────────
       let current: WechatSessionId | null
       try {
-        current = await getCurrentSessionId(deps.pgPool, evt.bindingUserId)
+        current = await channel.getCurrentSessionId(deps.pgPool, evt.bindingUserId)
       } catch (err) {
         reqLog.error("pointer_read_failed", {
           errMessage: (err as Error)?.message ?? String(err),
@@ -430,7 +485,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       // 内 createdAt / lastAt 错开 1 ms(测试 `createdAt === lastAt` 断言依赖)。
       const dispatchNow = now()
       const nonce = computeInboundNonce(deps.bridgeSecret, endpoint.containerId)
-      const sessionTitle = deriveSessionTitle(evt.text)
+      const sessionTitle = deriveSessionTitle(evt.text, channel.defaultSessionTitle)
       const model = await resolveModelForDispatch(evt.bindingUserId, deps.resolveModel, reqLog)
       let preparedCodexTurn: Extract<PrepareWechatCodexTurnResult, { kind: "ready" }> | null = null
       if (model?.startsWith("gpt-") && deps.prepareCodexTurn) {
@@ -498,7 +553,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       // 不传:sessionMeta(容器侧 client_sessions 由 sessionManager.handleResult 路径
       // 自己写;master 侧 client_sessions 是 dispatcher Step 2a 直接 upsertMasterClient
       // Session,不经 wire body),traceId(用 x-request-id header 关联)。
-      const dispatchText = withWechatChannelHints(evt.text)
+      const dispatchText = channel.decorateInboundText(evt.text)
       const wireBody = {
         userId: MASTER_USER_PREFIX + evt.bindingUserId,
         peer: { kind: "dm" as const, id: sessionId, displayName: evt.senderId },
@@ -524,6 +579,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
 
       const step1 = await postStep1WithRetry(
         deps.transport,
+        channel.inboundPath,
         endpoint,
         wireHeaders,
         wireJson,
@@ -605,7 +661,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       if (step1Accepted.started !== false && step1Accepted.completed !== true) {
         if (step1Accepted.runId) {
           try {
-            await markRunningSession(
+            await channel.markRunningSession(
               deps.pgPool,
               evt.bindingUserId,
               sessionId,
@@ -632,7 +688,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
             sessionId,
             userId: MASTER_USER_PREFIX + evt.bindingUserId,
             agentId: routedAgentId,
-            originChannel: "wechat",
+            originChannel: channel.originChannel,
             title: sessionTitle,
             createdAt: dispatchNow,
             lastAt: dispatchNow,
@@ -650,6 +706,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
             requestId,
             compensateTimeoutMs,
             reqLog,
+            channel.compensatePath,
           )
           return {
             kind: "step2_failed",
@@ -663,7 +720,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       // ── 5) Step 2b: PG wechat_session_pointer 写 ──────────────────────
       if (shouldSetCurrentPointer) {
         try {
-          const applied = await setCurrentSessionId(
+          const applied = await channel.setCurrentSessionId(
             deps.pgPool,
             evt.bindingUserId,
             sessionId,
@@ -694,6 +751,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
               requestId,
               compensateTimeoutMs,
               reqLog,
+              channel.compensatePath,
             )
             // 同时撤 master sqlite Step 2a 写
             try {
@@ -751,7 +809,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
 
       let targets: Array<{ sessionId: WechatSessionId; runId: string; agentId?: string }> = []
       try {
-        targets = await listRunningSessions(deps.pgPool, evt.bindingUserId)
+        targets = await channel.listRunningSessions(deps.pgPool, evt.bindingUserId)
       } catch (err) {
         reqLog.error("stop_running_sessions_read_failed", {
           errMessage: (err as Error)?.message ?? String(err),
@@ -761,9 +819,9 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         // pointer below and let the container scan live runners by wsess.
       }
 
-      let pointer: Awaited<ReturnType<typeof getCurrentSessionPointer>> | null = null
+      let pointer: { sessionId: WechatSessionId; agentId?: string } | null = null
       try {
-        pointer = await getCurrentSessionPointer(deps.pgPool, evt.bindingUserId)
+        pointer = await channel.getCurrentSessionPointer(deps.pgPool, evt.bindingUserId)
       } catch (err) {
         reqLog.error("stop_pointer_read_failed", {
           errMessage: (err as Error)?.message ?? String(err),
@@ -857,7 +915,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         })
         const stopRes = await postWithRetry(
           deps.transport,
-          WECHAT_STOP_CONTAINER_PATH,
+          channel.stopPath,
           endpoint,
           headers,
           bodyJson,
@@ -949,6 +1007,7 @@ async function resolveModelForDispatch(
 
 async function postStep1WithRetry(
   transport: ContainerTransport,
+  path: string,
   endpoint: { host: string; port: number; tunnel?: unknown },
   headers: Record<string, string>,
   bodyJson: string,
@@ -958,7 +1017,7 @@ async function postStep1WithRetry(
 ): Promise<{ kind: "transport_error"; errMessage: string } | { kind: "ok"; response: { status: number; bodyText: string; headers?: Record<string, string> } }> {
   return postWithRetry(
     transport,
-    WECHAT_INBOUND_CONTAINER_PATH,
+    path,
     endpoint,
     headers,
     bodyJson,
@@ -1014,6 +1073,7 @@ async function tryCompensation(
   requestId: string,
   timeoutMs: number,
   log: Logger,
+  compensatePath: string,
 ): Promise<"ok" | "failed"> {
   // 容器侧 handler 必须 idempotent + always-200(per Codex r2 plan review)。
   // dispatcher 这边:transport 错 → "failed";200 body 含 `ok:false` → "failed"。
@@ -1039,7 +1099,7 @@ async function tryCompensation(
   try {
     const res = await transport.post(
       endpoint,
-      WECHAT_INBOUND_COMPENSATE_PATH,
+      compensatePath,
       headers,
       bodyJson,
       timeoutMs,
@@ -1195,11 +1255,11 @@ function clamp(n: number, lo: number, hi: number): number {
  *
  * 不用 `slice(0, 30)`(会在 UTF-16 surrogate pair 中间切断,出乱码)。
  */
-function deriveSessionTitle(text: string): string {
+function deriveSessionTitle(text: string, fallback = DEFAULT_SESSION_TITLE): string {
   const trimmed = text.trim()
-  if (trimmed.length === 0) return DEFAULT_SESSION_TITLE
+  if (trimmed.length === 0) return fallback
   const codePoints = Array.from(trimmed)
-  if (codePoints.length === 0) return DEFAULT_SESSION_TITLE
+  if (codePoints.length === 0) return fallback
   return codePoints.slice(0, 30).join("")
 }
 

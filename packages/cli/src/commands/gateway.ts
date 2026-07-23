@@ -4,6 +4,7 @@ import {
   Gateway,
   log,
   makeV3WechatOutboundAdapter,
+  makeV3QqbotOutboundAdapter,
   readV3WechatOutboundConfig,
   type CommercialHook,
 } from '@openclaude/gateway'
@@ -209,7 +210,9 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   const v3WxOut = readV3WechatOutboundConfig(process.env)
   if (v3WxOut) {
     channelFactories.push(() => makeV3WechatOutboundAdapter({ config: v3WxOut }))
+    channelFactories.push(() => makeV3QqbotOutboundAdapter({ config: v3WxOut }))
     console.log('[cli] v3 wechat outbound adapter wired (container mode)')
+    console.log('[cli] v3 qqbot outbound adapter wired (container mode)')
   }
 
   gw = new Gateway({ config, agentsConfig, webRoot, staticMode, channelFactories, commercial })

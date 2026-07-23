@@ -194,6 +194,7 @@ import {
   isUserInitiatedCronJob,
 } from './cron.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
+import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
 import { parseDocument } from './documentParser.js'
 import {
@@ -353,6 +354,7 @@ import {
 const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_FOR_OAUTH || '2.1.888'} (external, cli)`
 
 const V3_WECHAT_OUTBOUND_ADAPTER_ID = 'v3-wechat-outbound'
+const V3_QQBOT_OUTBOUND_ADAPTER_ID = 'v3-qqbot-outbound'
 const WECHAT_FINAL_EMPTY_TEXT =
   '✅ 任务已完成，但这轮没有生成可直接发送到微信的文本结果。请打开实时过程链接查看详细过程。'
 
@@ -2200,6 +2202,7 @@ export class Gateway {
     // Start cron scheduler for reflection jobs (L3)
     // Smart delivery: push to last active channel, fallback to all webchat clients
     const wechatProactiveCfg = readV3WechatProactiveConfig()
+    const qqProactiveCfg = readV3QqProactiveConfig()
     this.cron = new CronScheduler(config, this.sessions, async (text, job, delivery) => {
       const agentId = job.agent
       const stableDeliveryId = delivery?.deliveryId ?? cronDeliveryId(
@@ -2213,6 +2216,20 @@ export class Gateway {
       // 据结果决定:微信接管→不重复 web;绑定但会话过期→回退 web 并标注;其它→正常 web。
       // 刻意不读 lastActiveChannel(其纯内存、重启即失、微信条目永不恢复)。
       let deliverText = text
+      if (qqProactiveCfg && isUserInitiatedCronJob(job)) {
+        const result = await sendV3QqProactive({
+          config: qqProactiveCfg,
+          text,
+          outboundId: stableDeliveryId,
+        })
+        if (result.kind === 'delivered') return
+        if (result.kind === 'failure' && result.retryable) {
+          throw Object.assign(new Error(result.code), {
+            code: result.code,
+            retryable: true,
+          })
+        }
+      }
       if (wechatProactiveCfg && isUserInitiatedCronJob(job)) {
         const result = await sendV3WechatProactive({
           config: wechatProactiveCfg,
@@ -3178,6 +3195,21 @@ export class Gateway {
       })
       return
     }
+    if (url.pathname === '/internal/v3/qq-inbound' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleWechatInbound(req, res, 'qqbot').catch((err) => {
+        this.log.error('qq-inbound handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
 
     // 容器侧 WeChat inbound 补偿端点。master broker 的 inboundDispatcher Step 2
     // 失败时调本端点撤销 Step 1 写入的 client_sessions row。
@@ -3204,6 +3236,21 @@ export class Gateway {
       })
       return
     }
+    if (url.pathname === '/internal/v3/qq-inbound-compensate' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleWechatInboundCompensate(req, res).catch((err) => {
+        this.log.error('qq-inbound-compensate handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 200, { ok: true, deleted: false, errMessage: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
 
     // v3 WeChat `/stop` bridge. Master broker resolves the current wsess and
     // POSTs here so the container can interrupt the in-process runner. Same
@@ -3216,6 +3263,21 @@ export class Gateway {
       }
       this.handleWechatStop(req, res).catch((err) => {
         this.log.error('wechat-stop handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+    if (url.pathname === '/internal/v3/qq-stop' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleWechatStop(req, res).catch((err) => {
+        this.log.error('qq-stop handler crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
         } else {
@@ -4912,7 +4974,11 @@ export class Gateway {
     this.sendJson(res, 200, buildTurnDispatchStateResponse(row))
   }
 
-  private async handleWechatInbound(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async handleWechatInbound(
+    req: IncomingMessage,
+    res: ServerResponse,
+    source: 'wechat' | 'qqbot' = 'wechat',
+  ): Promise<void> {
     const MAX_INBOUND_BODY = 256 * 1024
     let raw: string
     try {
@@ -5051,7 +5117,11 @@ export class Gateway {
     // link can attach to the same runner.  Only the rate-limit bucket remains
     // WeChat-scoped; lastActive must stay webchat/wsess so cron/webhook/
     // inter-agent pushes continue to reach the linked browser session.
-    ;(frame as any)._rateLimitChannel = 'wechat'
+    if (source === 'qqbot') {
+      ;(frame as any)._rateLimitChannel = 'qqbot'
+    } else {
+      ;(frame as any)._rateLimitChannel = 'wechat'
+    }
 
     // V3 broker → 容器 outbound 回路。
     //
@@ -5068,16 +5138,21 @@ export class Gateway {
     // adapter 缺失 = 容器装配错误,broker 不该 POST 到没装 adapter 的容器:
     // 503 fail-closed 让 broker retry queue 视为 transient + 让运维看 log 找到
     // "adapter not registered"。不修改 dispatchInbound 通用行为,其他 channel 不受影响。
-    const v3OutboundAdapter = this.channels.get('v3-wechat-outbound')
+    const outboundAdapterId =
+      source === 'qqbot' ? V3_QQBOT_OUTBOUND_ADAPTER_ID : V3_WECHAT_OUTBOUND_ADAPTER_ID
+    const v3OutboundAdapter =
+      source === 'qqbot'
+        ? this.channels.get(V3_QQBOT_OUTBOUND_ADAPTER_ID)
+        : this.channels.get('v3-wechat-outbound')
     if (!v3OutboundAdapter) {
       this.log.error(
-        'handleWechatInbound: v3-wechat-outbound adapter not registered; refusing dispatch',
+        `handleWechatInbound: ${outboundAdapterId} adapter not registered; refusing dispatch`,
         { userId, peerId, idempotencyKey },
       )
       this.sendJson(res, 503, {
         error: {
-          code: 'V3_WECHAT_OUTBOUND_NOT_WIRED',
-          message: 'container missing v3-wechat-outbound adapter; outbound cannot return to master',
+          code: source === 'qqbot' ? 'V3_QQBOT_OUTBOUND_NOT_WIRED' : 'V3_WECHAT_OUTBOUND_NOT_WIRED',
+          message: `container missing ${outboundAdapterId} adapter; outbound cannot return to master`,
         },
       })
       return
@@ -5190,7 +5265,7 @@ export class Gateway {
         blocks: [
           {
             kind: 'text' as const,
-            text: `[error] 微信任务启动后失败：${errMessage.slice(0, 300) || 'unknown error'}`,
+            text: `[error] ${source === 'qqbot' ? 'QQ' : '微信'}任务启动后失败：${errMessage.slice(0, 300) || 'unknown error'}`,
           },
         ],
         isFinal: true,
@@ -12626,7 +12701,9 @@ export class Gateway {
     // (normal webchat channel/ring) and send only the final/error text back
     // through the v3-wechat-outbound adapter.
     const aggregatedBlocks: typeof out.blocks = []
-    const liveWechatAdapter = adapter?.id === V3_WECHAT_OUTBOUND_ADAPTER_ID
+    const liveWechatAdapter =
+      adapter?.id === V3_WECHAT_OUTBOUND_ADAPTER_ID ||
+      adapter?.id === V3_QQBOT_OUTBOUND_ADAPTER_ID
     let liveWechatSendQueue: Promise<void> = Promise.resolve()
     let liveWechatSeq = 0
     const liveOutboundBase =
