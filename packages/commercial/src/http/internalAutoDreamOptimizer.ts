@@ -55,7 +55,20 @@ export function projectAutoDreamCodexRoute(route: AutoDreamCodexRouteDecision | 
   routeFrame: Record<string, unknown>
 } | null {
   if (!route || route.kind === 'unavailable') return null
-  if (route.kind === 'official_oauth') return { token: null, routeFrame: {} }
+  if (route.kind === 'official_oauth') {
+    return {
+      token: null,
+      routeFrame: {
+        modelProvider: 'oc_chatgpt_official',
+        baseUrl: 'http://127.0.0.1:18789/internal/v3/codex-relay/backend-api/codex',
+        providerName: 'OpenAI (OpenClaude relay)',
+        wireApi: 'responses',
+        preferredAuthMethod: 'chatgpt',
+        disableResponseStorage: true,
+        requiresOpenaiAuth: true,
+      },
+    }
+  }
   return {
     token: route.token,
     routeFrame: {
