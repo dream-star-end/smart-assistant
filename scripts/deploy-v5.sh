@@ -7334,7 +7334,7 @@ WITH eval_user AS (
      AND EXISTS (SELECT 1 FROM model_catalog WHERE model_id='gpt-5.6-luna' AND state='active'
                   AND engine='codex' AND provider_id='codex')
      AND EXISTS (SELECT 1 FROM model_pricing WHERE model_id='gpt-5.6-luna'
-                  AND enabled IS TRUE AND visibility='hidden')
+                  AND enabled IS TRUE AND visibility IN ('hidden','public'))
      AND (SELECT count(*) FROM model_pricing p,eval_user u
            WHERE p.model_id IN ('gpt-5.6-luna','deepseek-v4-flash') AND p.enabled IS TRUE
              AND (p.visibility='public' OR EXISTS (
@@ -7356,7 +7356,7 @@ SELECT id || '|' || session_prefix FROM ins;
 SQL
 )" || return 1
   [[ -n "$row" ]] || {
-    echo "✗ v5-evals/Luna hidden activation/two model grants/positive precheck balance 不完整" >&2
+    echo "✗ v5-evals/Luna activation/two accessible models/positive precheck balance 不完整" >&2
     return 1
   }
   IFS='|' read -r VERIFICATION_RUN_ID VERIFICATION_SESSION_PREFIX <<<"$row"

@@ -4930,6 +4930,113 @@ wait $!
     assert.doesNotMatch(source, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
   })
 
+  test('release verification accepts public Luna and keeps hidden Luna grant-gated', (t) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
+    const schema = `oc_release_verification_${process.pid}_${Date.now()}`
+    const psql = (sql: string, searchPath = false) => spawnSync(
+      'psql',
+      [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ...(searchPath ? { PGOPTIONS: `-c search_path=${schema},public` } : {}),
+        },
+      },
+    )
+
+    const setup = psql(`
+      CREATE EXTENSION IF NOT EXISTS pgcrypto;
+      CREATE SCHEMA ${schema};
+      CREATE TABLE ${schema}.users (
+        id BIGINT PRIMARY KEY,
+        email TEXT NOT NULL,
+        credits BIGINT NOT NULL
+      );
+      CREATE TABLE ${schema}.model_catalog (
+        model_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        engine TEXT NOT NULL,
+        provider_id TEXT NOT NULL
+      );
+      CREATE TABLE ${schema}.model_pricing (
+        model_id TEXT PRIMARY KEY,
+        enabled BOOLEAN NOT NULL,
+        visibility TEXT NOT NULL
+      );
+      CREATE TABLE ${schema}.model_visibility_grants (
+        user_id BIGINT NOT NULL,
+        model_id TEXT NOT NULL
+      );
+      CREATE TABLE ${schema}.verification_runs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        token_hash TEXT NOT NULL,
+        user_id BIGINT NOT NULL,
+        session_prefix TEXT NOT NULL,
+        allowed_models TEXT[] NOT NULL,
+        expected_release TEXT NOT NULL,
+        expected_generation BIGINT NOT NULL,
+        approval_ref TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL
+      );
+      INSERT INTO ${schema}.users(id,email,credits)
+      VALUES (626,'v5-evals@claudeai.chat',100);
+      INSERT INTO ${schema}.model_catalog(model_id,state,engine,provider_id)
+      VALUES ('gpt-5.6-luna','active','codex','codex');
+      INSERT INTO ${schema}.model_pricing(model_id,enabled,visibility)
+      VALUES ('gpt-5.6-luna',TRUE,'public'),('deepseek-v4-flash',TRUE,'public');
+    `)
+    assert.equal(setup.status, 0, setup.stderr || setup.stdout)
+
+    t.after(() => {
+      const cleanup = psql(`DROP SCHEMA IF EXISTS ${schema} CASCADE`)
+      assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout)
+    })
+
+    const runGate = () => spawnSync(
+      'bash',
+      ['-c', [
+        'set -euo pipefail',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'create_release_verification_run /rel/test 42',
+      ].join('\n')],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          DS_MODE: 'local',
+          DS_DATABASE_URL: databaseUrl,
+          PGOPTIONS: `-c search_path=${schema},public`,
+        },
+      },
+    )
+
+    const publicLuna = runGate()
+    assert.equal(publicLuna.status, 0, publicLuna.stderr || publicLuna.stdout)
+    assert.match(publicLuna.stdout, /verification run=/)
+
+    const hideAndGrant = psql(`
+      UPDATE model_pricing SET visibility='hidden' WHERE model_id='gpt-5.6-luna';
+      INSERT INTO model_visibility_grants(user_id,model_id) VALUES (626,'gpt-5.6-luna');
+    `, true)
+    assert.equal(hideAndGrant.status, 0, hideAndGrant.stderr || hideAndGrant.stdout)
+    const hiddenGrantedLuna = runGate()
+    assert.equal(hiddenGrantedLuna.status, 0, hiddenGrantedLuna.stderr || hiddenGrantedLuna.stdout)
+
+    const removeGrant = psql(
+      "DELETE FROM model_visibility_grants WHERE user_id=626 AND model_id='gpt-5.6-luna'",
+      true,
+    )
+    assert.equal(removeGrant.status, 0, removeGrant.stderr || removeGrant.stdout)
+    const hiddenWithoutGrant = runGate()
+    assert.notEqual(hiddenWithoutGrant.status, 0)
+    assert.match(hiddenWithoutGrant.stderr, /two accessible models/)
+  })
+
   test('candidate release gate is fixed-model, zero-skip, evidenced, and aborts before diagnosis', async () => {
     const [source, runner, manifestRaw, fixtures, api, ui, largeTest, statusTest] = await Promise.all([
       readFile(deploy, 'utf8'),
