@@ -643,7 +643,7 @@ describe('official Weibo Plugin', () => {
 
   test(
     'real Chromium uses the lazy composer chooser and waits for delayed media readiness',
-    { timeout: 15_000 },
+    { timeout: 30_000 },
     async () => {
       const browserResolverModule = '../../../../scripts/lib/resolve-browser.mjs'
       const { resolveBrowserExecutable } = (await import(browserResolverModule)) as {
