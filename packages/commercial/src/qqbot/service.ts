@@ -279,8 +279,8 @@ export function makeQqBotService(args: {
     } catch (err) {
       generation.stopping = true
       instance.off('message', generation.onMessage)
-      instance.stop()
       try {
+        instance.stop()
         await withTimeout(
           generation.runPromise,
           generationStopTimeoutMs,
@@ -328,6 +328,10 @@ export function makeQqBotService(args: {
         try {
           activate(await startGeneration())
         } catch (err) {
+          if (err instanceof QqGenerationCleanupError) {
+            failStop('qq_gateway_retry_cleanup_failed', err)
+            return
+          }
           log.error('gateway_restart_failed', {
             errMessage: err instanceof Error ? err.message : String(err),
           })

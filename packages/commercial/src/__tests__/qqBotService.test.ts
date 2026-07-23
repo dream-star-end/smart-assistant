@@ -19,14 +19,21 @@ class FakeBot extends EventEmitter {
     this.settleStart = resolve
   })
 
+  constructor(private readonly mode: 'ready' | 'error' | 'error-stuck' = 'ready') {
+    super()
+  }
+
   async start(): Promise<void> {
-    queueMicrotask(() => this.emit('ready', {}))
+    queueMicrotask(() => {
+      if (this.mode === 'ready') this.emit('ready', {})
+      else this.emit('error', new Error('startup failed'))
+    })
     return this.running
   }
 
   stop(): void {
     this.stopped = true
-    this.settleStart()
+    if (this.mode !== 'error-stuck') this.settleStart()
   }
 
   async sendText(_target: ReplyTarget, _text: string): Promise<unknown> {
@@ -111,6 +118,46 @@ test('terminal generation cleanup timeout fail-stops without creating another ge
   assert.deepEqual(fatalReasons, ['qq_gateway_restart_cleanup_failed'])
   assert.equal(bots.length, 1)
 
+  await service.stop()
+})
+
+test('failed-start cleanup timeout during scheduled retry fail-stops without a fourth generation', async () => {
+  const bots: FakeBot[] = []
+  const fatalReasons: string[] = []
+  const service = makeQqBotService({
+    pool: {} as Pool,
+    config: {
+      appId: 'app',
+      appSecret: 'secret',
+      entryUrl: 'https://example.test/bot',
+      bindingHmacSecret: 'binding-secret',
+    },
+    dispatcher: {} as InboundDispatcher,
+    botFactory: () => {
+      const mode = bots.length === 0 ? 'ready' : bots.length === 1 ? 'error' : 'error-stuck'
+      const bot = new FakeBot(mode)
+      bots.push(bot)
+      return bot as unknown as import('@tencent-connect/qqbot-nodejs').QQBot
+    },
+    outboxWorkerFactory: () => ({
+      kick() {},
+      async stop() {},
+    }),
+    gatewayTerminal: (bot) => (bot as unknown as FakeBot).terminal,
+    gatewayHealthPollMs: 5,
+    restartDelayMs: 5,
+    generationStopTimeoutMs: 20,
+    onFatal: (reason) => fatalReasons.push(reason),
+  })
+
+  await service.start()
+  bots[0]!.terminal = true
+  await waitFor(() => fatalReasons.length === 1)
+  assert.deepEqual(fatalReasons, ['qq_gateway_retry_cleanup_failed'])
+  assert.equal(bots.length, 3)
+
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(bots.length, 3)
   await service.stop()
 })
 
