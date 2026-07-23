@@ -473,6 +473,19 @@
           "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts"
         }
       ]
+    },
+    {
+      "id": "INC-20260723-FINALIZE-STALE-ACTIVE",
+      "occurredAt": "2026-07-23",
+      "severity": "P0",
+      "symptom": "finalize step7 后继续复用旧 active lane 缓存，egress smoke 与异常 rollback 指向已停止的旧槽位；当前 HEAD 的前向迁移还可能阻断官方恢复命令。",
+      "rootFixCommit": "b9a1773c",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts"
+        }
+      ]
     }
   ]
 }
