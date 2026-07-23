@@ -60,8 +60,6 @@ import { appUpdate } from "../appUpdate";
 import {
   AUTO_CONTINUE_DISPLAY,
   contextRebuiltNotice,
-  PREAMBLE_CONTINUE_DISPLAY,
-  PREAMBLE_CONTINUE_PROMPT,
   RESTART_CONTINUE_DISPLAY,
   RESTART_CONTINUE_PROMPT,
   backoffDelay,
@@ -80,7 +78,6 @@ import {
   RECONNECT_RECONCILE_GRACE_MS,
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
-  shouldAutoContinueActionPreamble,
   shouldAutoContinueEmptyTurn,
   SYNC_DEBOUNCE_MS,
   THINKING_SAFETY_MS,
@@ -114,36 +111,6 @@ import { DEFAULT_CODEX_ENGINE_MODEL, isClientMessageId } from "@openclaude/proto
 import type { RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
-
-/**
- * 「自动继续执行」用户偏好(客户端设备级,localStorage)——权威源集中此处。
- *
- * 背景:模型给出「行动承诺式开场白」(如「好的,我现在检查并修复」)后误 end_turn 时,
- * socket 会**替用户再自动发起一轮**(auto-continue,按实际用量扣积分)。这是替用户扣费的
- * 自动动作,给用户一个可关的开关。默认**开**(不改变现行为);仅当用户显式关闭才落地 "0"。
- * 偏好面板(设置入口)与 autoContinueActionPreamble(消费方)共用同一 key 与读写,避免双份
- * magic string。localStorage 不可用(SSR/隐私模式)时读回退默认开、写 best-effort 不抛。
- */
-export const AUTO_CONTINUE_PREAMBLE_PREF_KEY = "oc_v5_auto_continue_preamble";
-
-/** 读「自动继续执行」偏好:缺省(未设置)= 开;仅显式 "0" 为关。 */
-export function readAutoContinuePreamblePref(): boolean {
-  try {
-    return localStorage.getItem(AUTO_CONTINUE_PREAMBLE_PREF_KEY) !== "0";
-  } catch {
-    return true;
-  }
-}
-
-/** 写「自动继续执行」偏好:开=清键(回归默认),关=落地 "0"。best-effort。 */
-export function writeAutoContinuePreamblePref(enabled: boolean): void {
-  try {
-    if (enabled) localStorage.removeItem(AUTO_CONTINUE_PREAMBLE_PREF_KEY);
-    else localStorage.setItem(AUTO_CONTINUE_PREAMBLE_PREF_KEY, "0");
-  } catch {
-    // best-effort:写失败不影响内存决策(下次读回退默认开)
-  }
-}
 
 export type ChatSocketDeps = {
   /** 当前内存态 access JWT（WS 子协议鉴权用）。*/
@@ -1015,9 +982,6 @@ export class ChatSocket {
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
-      },
-      schedulePreambleContinue: (sessId, targetMsgId) => {
-        setTimeout(() => this.autoContinueActionPreamble(sessId, targetMsgId), 0);
       },
       scheduleRestartContinue: (sessId) => {
         setTimeout(() => this.autoContinueAfterRestart(sessId), 0);
@@ -2980,46 +2944,6 @@ export class ChatSocket {
       _isAutoRetry: true,
       _modelText: RESTART_CONTINUE_PROMPT,
       _idem: idem,
-    });
-    payload.clientMessageId = userMsg.id;
-    this.dispatchPayload(sess, userMsg, payload);
-  }
-
-  // ═══════════════ 行动开场后误结束 → 极保守单次继续执行 ════════════════
-  private autoContinueActionPreamble(sessId: string, targetMsgId: string): void {
-    const sess = this.sessions.get(sessId);
-    if (!sess || sess._sendingInFlight) return;
-    if (!shouldAutoContinueActionPreamble({
-      messages: sess.messages,
-      targetMsgId,
-      stopReason: "end_turn",
-      // 用户可在偏好面板关闭这项「替你多跑一轮」的自动动作;关闭后仅提示,不自动续写。
-      enabled: readAutoContinuePreamblePref(),
-    })) return;
-    const idem = `autocont-preamble-${sessId}-${targetMsgId}`;
-
-    const routing = sess._lastRouting;
-    const payload: InboundMessage = {
-      type: "inbound.message",
-      idempotencyKey: idem,
-      channel: "webchat",
-      peer: { id: sess.id, kind: "dm" },
-      agentId: sess.agentId || this.deps.defaultAgentId || "main",
-      content: { text: PREAMBLE_CONTINUE_PROMPT },
-      ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel")
-        ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
-        : {}),
-      ...(routing?.model ? { model: routing.model } : {}),
-      ...(routing?.teamMode ? { teamMode: true } : {}),
-      ts: Date.now(),
-    };
-    const userMsg = addMessage(sess, "user", PREAMBLE_CONTINUE_DISPLAY, {
-      status: "sending",
-      _isAutoRetry: true,
-      _modelText: PREAMBLE_CONTINUE_PROMPT,
-      _idem: idem,
-      ...(routing ? { _routing: { ...routing } } : {}),
-      _sendAttempt: 0,
     });
     payload.clientMessageId = userMsg.id;
     this.dispatchPayload(sess, userMsg, payload);
