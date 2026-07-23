@@ -1,6 +1,6 @@
 {
-  "entries": 22,
-  "headAuditSha256": "ba393a400e97da6ba76cd36bb88f32da9c1f2870950e3d4e3aed91bd1e7908ec",
-  "historySha256": "6738a2d33bfa2ec0c83ce5865b5e70a6b2df4f73e9bb4b8feab09ac1f9c64100",
+  "entries": 24,
+  "headAuditSha256": "5b35d3155100ac88b4c050e7345adec7502730624f9278e02d711a684fa3c2ed",
+  "historySha256": "66d5c602b07cff8e257d22815dcb4582cc23f12b83f7b806229acbb22e0289b0",
   "schema": 1
 }

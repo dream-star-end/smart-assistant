@@ -18,6 +18,7 @@ import {
   Loader2,
   MessageSquarePlus,
   Monitor,
+  MoreHorizontal,
   RefreshCw,
   RotateCw,
   Send,
@@ -88,6 +89,7 @@ const PHASE_LABEL: Record<string, string> = {
   closed: '连接已断开',
 }
 const MAX_ANNOTATIONS = 20
+const CONTROLS_AUTO_HIDE_MS = 3_000
 
 function readAccessProfile(sourceUrl: string): AccessProfile {
   if (typeof window === 'undefined') {
@@ -140,9 +142,14 @@ export function ContainerWebPreview({
   const [announcement, setAnnouncement] = useState('')
   const [textInput, setTextInput] = useState('')
   const [frameStats, setFrameStats] = useState<FrameStats | null>(null)
+  const [controlsVisible, setControlsVisible] = useState(true)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
+  const topControlsRef = useRef<HTMLElement>(null)
+  const bottomControlsRef = useRef<HTMLDivElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [directScale, setDirectScale] = useState({ x: 1, y: 1 })
   const textInputRef = useRef<HTMLInputElement>(null)
   const commentActionRef = useRef<HTMLButtonElement>(null)
@@ -177,6 +184,8 @@ export function ContainerWebPreview({
           : CONTAINER_PREVIEW_DESKTOP_VIEWPORT,
     [accessProfile, device],
   )
+  const fillsClientViewport =
+    accessProfile.sourceUrl === sourceUrl && device === accessProfile.device
 
   const drawFrame = useCallback((frame: ContainerPreviewFrame) => {
     pendingFrameRef.current = frame
@@ -247,6 +256,62 @@ export function ContainerWebPreview({
     onFrame: drawFrame,
   })
   const ready = session.phase === 'ready'
+  const controlsAutoHideEligible =
+    open && fillsClientViewport && ready && mode === 'interact' && surface === 'none'
+
+  const clearControlsTimer = useCallback(() => {
+    if (!controlsTimerRef.current) return
+    clearTimeout(controlsTimerRef.current)
+    controlsTimerRef.current = null
+  }, [])
+
+  const controlsContainFocus = useCallback(() => {
+    const active = document.activeElement
+    return (
+      active instanceof HTMLElement &&
+      (topControlsRef.current?.contains(active) || bottomControlsRef.current?.contains(active))
+    )
+  }, [])
+
+  const scheduleControlsHide = useCallback(() => {
+    clearControlsTimer()
+    if (!controlsAutoHideEligible) return
+    controlsTimerRef.current = setTimeout(() => {
+      controlsTimerRef.current = null
+      if (controlsContainFocus()) return
+      setControlsVisible(false)
+    }, CONTROLS_AUTO_HIDE_MS)
+  }, [clearControlsTimer, controlsAutoHideEligible, controlsContainFocus])
+
+  const keepControlsVisible = useCallback(() => {
+    setControlsVisible(true)
+    scheduleControlsHide()
+  }, [scheduleControlsHide])
+
+  const revealControls = useCallback(() => {
+    keepControlsVisible()
+    requestAnimationFrame(() => closeButtonRef.current?.focus())
+  }, [keepControlsVisible])
+
+  const handleControlsFocus = useCallback(() => {
+    clearControlsTimer()
+  }, [clearControlsTimer])
+
+  const handleControlsBlur = useCallback(() => {
+    requestAnimationFrame(() => {
+      if (!controlsContainFocus()) scheduleControlsHide()
+    })
+  }, [controlsContainFocus, scheduleControlsHide])
+
+  useEffect(() => {
+    clearControlsTimer()
+    if (!controlsAutoHideEligible) {
+      setControlsVisible(true)
+      return
+    }
+    if (controlsVisible) scheduleControlsHide()
+    return clearControlsTimer
+  }, [clearControlsTimer, controlsAutoHideEligible, controlsVisible, scheduleControlsHide])
 
   useEffect(() => {
     if (session.transport !== 'direct') {
@@ -269,6 +334,8 @@ export function ContainerWebPreview({
 
   useEffect(() => {
     if (accessProfile.sourceUrl === sourceUrl) return
+    clearControlsTimer()
+    setControlsVisible(true)
     const nextProfile = readAccessProfile(sourceUrl)
     setAccessProfile(nextProfile)
     setDevice(nextProfile.device)
@@ -281,7 +348,7 @@ export function ContainerWebPreview({
     setTextInput('')
     setFrameStats(null)
     setReconnectKey((value) => value + 1)
-  }, [accessProfile.sourceUrl, sourceUrl])
+  }, [accessProfile.sourceUrl, clearControlsTimer, sourceUrl])
 
   useEffect(() => {
     const event = session.selection
@@ -368,6 +435,7 @@ export function ContainerWebPreview({
   )
 
   const reconnect = (nextDevice = device) => {
+    keepControlsVisible()
     setDevice(nextDevice)
     setFrameStats(null)
     frameTimesRef.current = []
@@ -643,8 +711,6 @@ export function ContainerWebPreview({
 
   const aspect = viewport.width / viewport.height
   const previewWidth = `min(${device === 'mobile' ? '430px' : '1280px'}, 100%, calc((100dvh - 168px) * ${aspect}))`
-  const fillsClientViewport =
-    accessProfile.sourceUrl === sourceUrl && device === accessProfile.device
   const displayTitle = session.navigation?.title || session.ready?.title || '容器内网页'
   const displayUrl = session.navigation?.url || sourceUrl
   const hasError = Boolean(session.error || (session.phase === 'closed' && !session.error))
@@ -670,6 +736,10 @@ export function ContainerWebPreview({
           leaveCommentMode()
         }
       }}
+      onOpenAutoFocus={(event) => {
+        event.preventDefault()
+        requestAnimationFrame(() => previewFocusTarget()?.focus())
+      }}
       srTitle="容器网页预览与元素评论"
       hideClose
       className="left-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-screen max-w-none translate-x-0 translate-y-0 rounded-none border-0 bg-[#0c0c11]"
@@ -678,13 +748,22 @@ export function ContainerWebPreview({
       <div
         className="preview-shell relative flex h-full min-h-0 flex-col overflow-hidden"
         data-product-feature={PRODUCT_CAPABILITIES.containerPreview.id}
+        data-controls-visible={controlsVisible}
       >
         <div className="preview-ambient pointer-events-none absolute inset-0" />
 
-        {mode === 'interact' ? (
-          <header className="preview-floating-header">
+        {mode === 'interact' && controlsVisible && (
+          <header
+            ref={topControlsRef}
+            className="preview-floating-header preview-controls-enter"
+            onPointerDownCapture={keepControlsVisible}
+            onKeyDownCapture={keepControlsVisible}
+            onFocusCapture={handleControlsFocus}
+            onBlurCapture={handleControlsBlur}
+          >
             <div className="preview-header-row mx-auto flex w-full max-w-[1600px] items-center gap-2 px-2 sm:px-4">
               <button
+                ref={closeButtonRef}
                 type="button"
                 onClick={onClose}
                 aria-label="关闭网页预览"
@@ -765,7 +844,10 @@ export function ContainerWebPreview({
               {session.transport === 'direct' && (
                 <button
                   type="button"
-                  onClick={session.useLegacyFallback}
+                  onClick={() => {
+                    keepControlsVisible()
+                    session.useLegacyFallback()
+                  }}
                   aria-label="切换兼容预览"
                   title="兼容模式（远程浏览器）"
                   className="preview-icon-button"
@@ -775,7 +857,9 @@ export function ContainerWebPreview({
               )}
             </div>
           </header>
-        ) : (
+        )}
+
+        {mode === 'comment' && (
           <header className="preview-floating-header">
             <div className="preview-header-row mx-auto grid w-full max-w-[1100px] grid-cols-[auto_1fr_auto] items-center gap-2 px-2 sm:px-4">
               <button
@@ -812,13 +896,27 @@ export function ContainerWebPreview({
           </header>
         )}
 
+        {mode === 'interact' && surface === 'none' && !controlsVisible && (
+          <div className="preview-controls-reveal">
+            <button
+              type="button"
+              aria-label="显示预览控制"
+              aria-expanded="false"
+              onClick={revealControls}
+              className="preview-icon-button"
+            >
+              <MoreHorizontal size={20} />
+            </button>
+          </div>
+        )}
+
         <main
           className={cn(
             'relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-2 pb-[calc(88px+env(safe-area-inset-bottom))] pt-[calc(76px+env(safe-area-inset-top))] sm:px-6 sm:pb-24 sm:pt-20',
             fillsClientViewport && 'absolute inset-0 p-0 sm:p-0',
           )}
         >
-          {!hasError && (
+          {!hasError && (!ready || controlsVisible) && (
             <PreviewStatus
               phase={session.phase}
               ready={ready}
@@ -985,8 +1083,15 @@ export function ContainerWebPreview({
           )}
         </main>
 
-        {mode === 'interact' && surface === 'none' && (
-          <div className="preview-bottom-layer">
+        {mode === 'interact' && surface === 'none' && controlsVisible && (
+          <div
+            ref={bottomControlsRef}
+            className="preview-bottom-layer preview-controls-enter"
+            onPointerDownCapture={keepControlsVisible}
+            onKeyDownCapture={keepControlsVisible}
+            onFocusCapture={handleControlsFocus}
+            onBlurCapture={handleControlsBlur}
+          >
             <div className="preview-action-dock" aria-label="网页预览工具">
               <PreviewActionButton
                 active

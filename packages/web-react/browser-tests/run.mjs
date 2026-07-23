@@ -23,7 +23,8 @@
 //   T13 工具卡头部满足 44px、键盘可展开/折叠，市场长列表可继续加载且移动宽度不溢出。
 //   T14 消息反馈弹窗真浏览器焦点陷阱与关闭后焦点归还；
 //   T15 活动 turn 中 AskUserQuestion 专用 UI 在移动视口仍可点选并提交;
-//   T16/T17 容器网页预览按访问端自动选择移动/桌面并铺满真实可视区。
+//   T16/T17 容器网页预览按访问端自动选择移动/桌面、铺满真实可视区，空闲后收起
+//      chrome，且独立“…”入口不会吞掉 iframe 页面交互。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -76,6 +77,16 @@ await esbuild.build({
     "process.env.NODE_ENV": '"production"',
     "import.meta.env.MODE": '"production"',
   },
+  plugins: [
+    {
+      name: "container-preview-ready-stub",
+      setup(build) {
+        build.onResolve({ filter: /useContainerPreview$/ }, () => ({
+          path: join(HERE, "stubs", "useContainerPreview.ts"),
+        }));
+      },
+    },
+  ],
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
 });
@@ -562,10 +573,6 @@ async function assertContainerPreviewFillsViewport(expectedDevice, width, height
   if ((await viewport.getAttribute("data-fullscreen")) !== "true") {
     throw new Error("匹配访问端的预览未进入 fullscreen 布局");
   }
-  const closeBox = await dialog.getByRole("button", { name: "关闭网页预览" }).boundingBox();
-  if (!closeBox || closeBox.width < 44 || closeBox.height < 44) {
-    throw new Error(`关闭控件触控尺寸不足:${JSON.stringify(closeBox)}`);
-  }
   const overflow = await dialog.evaluate((node) => {
     const shell = node.querySelector(".preview-shell");
     return {
@@ -576,9 +583,54 @@ async function assertContainerPreviewFillsViewport(expectedDevice, width, height
   if (overflow.dialog || overflow.shell) {
     throw new Error(`全屏预览自身产生横向溢出:${JSON.stringify(overflow)}`);
   }
+
+  const reveal = dialog.getByRole("button", { name: "显示预览控制" });
+  await reveal.waitFor({ state: "visible", timeout: 4500 });
+  if (await dialog.getByRole("button", { name: "关闭网页预览" }).count()) {
+    throw new Error("空闲后顶部控制栏仍在遮挡预览");
+  }
+  if (await dialog.getByRole("button", { name: "评论" }).count()) {
+    throw new Error("空闲后底部工具栏仍在遮挡预览");
+  }
+
+  const revealBox = await reveal.boundingBox();
+  if (
+    !revealBox ||
+    revealBox.width < 44 ||
+    revealBox.height < 44 ||
+    revealBox.x < 0 ||
+    revealBox.y < top ||
+    revealBox.x + revealBox.width > width + 1 ||
+    revealBox.y + revealBox.height > top + height + 1
+  ) {
+    throw new Error(`控制唤醒按钮尺寸或安全区位置不合格:${JSON.stringify(revealBox)}`);
+  }
+
+  const previewFrame = dialog.frameLocator("iframe");
+  await previewFrame.getByRole("button", { name: "预览页面测试按钮" }).click();
+  if ((await previewFrame.locator("body").getAttribute("data-clicked")) !== "true") {
+    throw new Error("收起控件后 iframe 页面没有收到真实点击");
+  }
+  if (await dialog.getByRole("button", { name: "关闭网页预览" }).count()) {
+    throw new Error("点击预览页面意外展开了控制栏");
+  }
+
+  await reveal.click();
+  const closeBox = await dialog.getByRole("button", { name: "关闭网页预览" }).boundingBox();
+  if (!closeBox || closeBox.width < 44 || closeBox.height < 44) {
+    throw new Error(`恢复后的关闭控件触控尺寸不足:${JSON.stringify(closeBox)}`);
+  }
+  await dialog.getByRole("button", { name: `${expectedDevice}预览` }).waitFor({
+    state: "visible",
+    timeout: 1000,
+  });
+  await dialog.getByRole("button", { name: "评论" }).waitFor({
+    state: "visible",
+    timeout: 1000,
+  });
 }
 
-await check("T16 移动访问自动选择移动预览并铺满带偏移的动态可视区", async () => {
+await check("T16 移动全屏预览空闲收起控件且不吞页面触控", async () => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.setContent(previewHtml);
   await page.evaluate(() => {
@@ -590,7 +642,7 @@ await check("T16 移动访问自动选择移动预览并铺满带偏移的动态
   await page.evaluate(() => window.__unmountContainerPreview());
 });
 
-await check("T17 PC 访问自动选择桌面预览并铺满 1440×900 可视区", async () => {
+await check("T17 PC 全屏预览空闲收起控件且可按需恢复", async () => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.evaluate(() => {
     document.documentElement.style.removeProperty("--oc-visual-offset-top");

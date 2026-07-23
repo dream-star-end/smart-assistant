@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest'
 import type { ContainerPreviewClientMessage } from '@openclaude/protocol/containerPreview'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { createMemoryAuthSession } from '../lib/authSession'
@@ -90,17 +90,19 @@ const cardTarget: Target = {
 }
 
 function PreviewHarness({
+  open = true,
   sourceUrl = 'http://localhost:3000/',
   onClose = () => {},
   onUseComments = () => {},
 }: {
+  open?: boolean
   sourceUrl?: string
   onClose?: () => void
   onUseComments?: (prompt: string) => void
 }) {
   return (
     <ContainerWebPreview
-      open
+      open={open}
       sourceUrl={sourceUrl}
       auth={auth}
       onClose={onClose}
@@ -157,7 +159,10 @@ function setClientViewport(width: number, height: number) {
   })
 }
 
-afterEach(cleanup)
+afterEach(() => {
+  vi.useRealTimers()
+  cleanup()
+})
 
 beforeEach(() => {
   setClientViewport(1280, 800)
@@ -214,6 +219,82 @@ describe('ContainerWebPreview immersive UI', () => {
       'data-fullscreen',
       'true',
     )
+  })
+
+  test('auto-hides fullscreen controls without consuming page input and restores them on demand', () => {
+    vi.useFakeTimers()
+    setClientViewport(390, 844)
+    render(<PreviewHarness />)
+
+    const canvas = screen.getByLabelText('可交互网页画面')
+    setCanvasRect(canvas, 390, 844)
+    canvas.focus()
+    act(() => vi.advanceTimersByTime(3_001))
+
+    expect(screen.queryByRole('button', { name: '关闭网页预览' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '评论' })).not.toBeInTheDocument()
+    const reveal = screen.getByRole('button', { name: '显示预览控制' })
+    expect(reveal).toHaveClass('preview-icon-button')
+
+    previewMock.send.mockClear()
+    fireEvent.pointerDown(canvas, {
+      pointerId: 11,
+      pointerType: 'touch',
+      clientX: 170,
+      clientY: 420,
+    })
+    fireEvent.pointerUp(canvas, {
+      pointerId: 11,
+      pointerType: 'touch',
+      clientX: 170,
+      clientY: 420,
+    })
+    expect(previewMock.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'preview.pointer', action: 'click', x: 170, y: 420 }),
+    )
+    expect(screen.queryByRole('button', { name: '关闭网页预览' })).not.toBeInTheDocument()
+
+    fireEvent.click(reveal)
+    act(() => vi.advanceTimersByTime(16))
+    const close = screen.getByRole('button', { name: '关闭网页预览' })
+    expect(close).toHaveFocus()
+    expect(screen.getByRole('button', { name: '评论' })).toBeEnabled()
+
+    act(() => vi.advanceTimersByTime(3_001))
+    expect(close).toBeInTheDocument()
+
+    canvas.focus()
+    act(() => vi.advanceTimersByTime(16))
+    act(() => vi.advanceTimersByTime(3_001))
+    expect(screen.queryByRole('button', { name: '关闭网页预览' })).not.toBeInTheDocument()
+  })
+
+  test('keeps controls visible outside the idle fullscreen state and resets on reopen', () => {
+    vi.useFakeTimers()
+    setClientViewport(390, 844)
+    previewMock.phase = 'loading'
+    previewMock.ready = null
+    const view = render(<PreviewHarness />)
+    act(() => vi.advanceTimersByTime(5_000))
+    expect(screen.getByRole('button', { name: '关闭网页预览' })).toBeInTheDocument()
+
+    previewMock.phase = 'ready'
+    previewMock.ready = { url: 'http://localhost:3000/', title: 'Demo app' }
+    view.rerender(<PreviewHarness />)
+    fireEvent.click(screen.getByRole('button', { name: '桌面预览' }))
+    act(() => vi.advanceTimersByTime(5_000))
+    expect(screen.getByRole('button', { name: '关闭网页预览' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '移动预览' }))
+    const canvas = screen.getByLabelText('可交互网页画面')
+    canvas.focus()
+    act(() => vi.advanceTimersByTime(3_001))
+    expect(screen.getByRole('button', { name: '显示预览控制' })).toBeInTheDocument()
+
+    view.rerender(<PreviewHarness open={false} />)
+    act(() => vi.runOnlyPendingTimers())
+    view.rerender(<PreviewHarness />)
+    expect(screen.getByRole('button', { name: '关闭网页预览' })).toBeInTheDocument()
   })
 
   test('keeps the opposite-device simulator framed and resets atomically for a new URL', async () => {
