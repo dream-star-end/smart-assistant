@@ -525,7 +525,17 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
-    sock.sendMessage({ sessId: "s1", agentId: "main", text: "会丢的消息" });
+    const replyTo = {
+      messageId: "assistant-before-retry",
+      role: "assistant" as const,
+      text: "必须随新 turn 原样保留的完整引用",
+    };
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "会丢的消息",
+      replyTo,
+    });
     const s = sock.sessions.get("s1")!;
     const userMsg = s.messages.find((m) => m.role === "user")!;
     const oldId = userMsg.id;
@@ -545,6 +555,11 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     const inbound = ws.sent.map((raw) => JSON.parse(raw)).find((f) => f.type === "inbound.message");
     expect(inbound.clientMessageId).toBe(userMsg.id);
     expect(inbound.clientMessageId).not.toBe(oldId);
+    expect(inbound.replyToId).toBe(replyTo.messageId);
+    expect(inbound.content).toEqual({
+      text: "会丢的消息",
+      replyTo,
+    });
     // 新逻辑 turn 从 attempt 0 起,幂等键绑新 id。
     expect(inbound.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMsg.id, 0));
     expect(userMsg._sendAttempt).toBe(0);

@@ -9,6 +9,7 @@
  * ping-pong watchdog、hello + 三层断点续传、safeWsSend 2MB 背压、离线队列三段式
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
+import type { MessageReplyQuote } from "@openclaude/protocol";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -195,6 +196,7 @@ export type ChatSocketDeps = {
       _retryMedia?: InboundMessage["content"]["media"];
       _imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
       _modelText?: string;
+      _replyTo?: MessageReplyQuote;
       _routing?: ChatRoutingSnapshot;
       _sendAttempt?: number;
       _isAutoRetry?: boolean;
@@ -296,12 +298,13 @@ export function preciseRetryEligible(
  * cannot silently diverge. The returned data may be large and is never stored
  * back into a deferred session locator. */
 export function exactUserReplayPayload(
-  msg: Pick<ChatMessage, "text" | "_modelText" | "_media" | "_retryMedia" | "_imageEdit">,
+  msg: Pick<ChatMessage, "text" | "_modelText" | "_media" | "_retryMedia" | "_imageEdit" | "_replyTo">,
 ): {
   text: string;
   displayText?: string;
   media?: InboundMessage["content"]["media"];
   imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
+  replyTo?: MessageReplyQuote;
 } {
   const displayText = msg.text ?? "";
   const text = msg._modelText ?? displayText;
@@ -312,6 +315,7 @@ export function exactUserReplayPayload(
     ...(displayText !== text ? { displayText } : {}),
     ...(media ? { media } : {}),
     ...(msg._imageEdit ? { imageEdit: msg._imageEdit } : {}),
+    ...(msg._replyTo ? { replyTo: msg._replyTo } : {}),
   };
 }
 
@@ -2486,6 +2490,7 @@ export class ChatSocket {
     displayText?: string;
     media?: InboundMessage["content"]["media"];
     imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
+    replyTo?: MessageReplyQuote;
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
@@ -2527,7 +2532,9 @@ export class ChatSocket {
           : {}),
         ...(outboundMedia ? { media: outboundMedia } : {}),
         ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}),
+        ...(p.replyTo ? { replyTo: p.replyTo } : {}),
       },
+      ...(p.replyTo ? { replyToId: p.replyTo.messageId } : {}),
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
@@ -2541,6 +2548,7 @@ export class ChatSocket {
       _retryMedia: p.imageEdit ? outboundMedia : undefined,
       _imageEdit: p.imageEdit,
       _modelText: p.displayText !== undefined && p.displayText !== p.text ? p.text : undefined,
+      _replyTo: p.replyTo,
       _routing: { ...routing },
       _sendAttempt: 0,
     });
@@ -2565,6 +2573,7 @@ export class ChatSocket {
         ...(userMsg._retryMedia !== undefined ? { _retryMedia: userMsg._retryMedia } : {}),
         ...(userMsg._imageEdit !== undefined ? { _imageEdit: userMsg._imageEdit } : {}),
         ...(userMsg._modelText !== undefined ? { _modelText: userMsg._modelText } : {}),
+        ...(userMsg._replyTo !== undefined ? { _replyTo: userMsg._replyTo } : {}),
         ...(userMsg._routing !== undefined ? { _routing: userMsg._routing } : {}),
         ...(userMsg._sendAttempt !== undefined ? { _sendAttempt: userMsg._sendAttempt } : {}),
         ...(userMsg._isAutoRetry !== undefined ? { _isAutoRetry: userMsg._isAutoRetry } : {}),
@@ -2726,7 +2735,9 @@ export class ChatSocket {
         ...(replay.displayText !== undefined ? { displayText: replay.displayText } : {}),
         ...(replay.media ? { media: replay.media } : {}),
         ...(replay.imageEdit ? { imageEdit: replay.imageEdit } : {}),
+        ...(replay.replyTo ? { replyTo: replay.replyTo } : {}),
       },
+      ...(replay.replyTo ? { replyToId: replay.replyTo.messageId } : {}),
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel")
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),

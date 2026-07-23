@@ -1,5 +1,9 @@
 import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { isCodexEngineModel } from "@openclaude/protocol";
+import {
+  isCodexEngineModel,
+  normalizeMessageReplyQuote,
+  type MessageReplyQuote,
+} from "@openclaude/protocol";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
@@ -168,6 +172,15 @@ function DialogFallback() {
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 
+function replyQuoteText(message: ChatMessage): string {
+  if (message.text.trim()) return message.text;
+  const media = message._media ?? [];
+  if (media.some((item) => item.kind === "image")) return media.length > 1 ? `[${media.length} 张图片]` : "[图片]";
+  const first = media[0];
+  if (first?.filename) return `[文件：${first.filename}]`;
+  return media.length > 0 ? "[附件]" : "";
+}
+
 /** 隐式负反馈的成因标签（随 implicit down 一并上报，仅供后端归因，用户不可见）。 */
 type ImplicitReason = "中途打断" | "改写重发";
 
@@ -258,6 +271,10 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [messageReplyTarget, setMessageReplyTarget] = useState<{
+    sessionId: string;
+    quote: MessageReplyQuote;
+  } | null>(null);
   // 归档「查看更早历史记录」按钮子态(加载中 / 失败可重试)。切会话时重置(见下)。
   const [archiveLoading, setArchiveLoading] = useState(false);
   const [archiveError, setArchiveError] = useState(false);
@@ -531,6 +548,7 @@ export function App() {
       media?: MediaRef[],
       imageEdit?: InboundMessage["content"]["imageEdit"],
       displayText?: string,
+      replyTo?: MessageReplyQuote,
     ) => {
       setChatError(null);
       const visibleText = displayText ?? text;
@@ -613,6 +631,7 @@ export function App() {
         ),
         media,
         imageEdit,
+        replyTo,
         teamMode: teamLeaderTurn,
       });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
@@ -1539,6 +1558,23 @@ export function App() {
       onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
       onRetrySend: demo ? undefined : retrySend,
+      onQuote: demo || !activeId
+        ? undefined
+        : (message) => {
+            if (message.role !== "user" && message.role !== "assistant") return;
+            const text = replyQuoteText(message);
+            if (!text) return;
+            const quote = normalizeMessageReplyQuote({
+              messageId: message.id,
+              role: message.role,
+              text,
+            });
+            if (!quote) return;
+            setMessageReplyTarget({
+              sessionId: activeId,
+              quote,
+            });
+          },
       onFetchTapeRecordPayload: demo
         ? undefined
         : (tapeId, recordOrdinal, expected, signal) =>
@@ -1564,14 +1600,19 @@ export function App() {
       openSettings,
       onFeedback,
       retrySend,
+      activeId,
       fetchTapeRecordPayload,
       peekTapeRecordPayload,
       fetchUserMessagePayload,
       peekUserMessagePayload,
-      activeId,
       resolveRetryTarget,
     ],
   );
+
+  const composerReplyTo =
+    messageReplyTarget && messageReplyTarget.sessionId === activeId
+      ? messageReplyTarget.quote
+      : null;
 
   // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。
   // 依赖用**派生布尔**（非 user 对象，refreshMe 换引用不误触发清空）+ activeId。切会话先清
@@ -2219,7 +2260,9 @@ export function App() {
             />
           )}
           <Composer
-            onSend={send}
+            onSend={(text, media, replyTo) =>
+              send(text, media, undefined, undefined, replyTo)
+            }
             busy={sending}
             onStop={stopTurn}
             disabled={gated}
@@ -2227,6 +2270,8 @@ export function App() {
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
+            replyTo={composerReplyTo}
+            onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
             goal={activeSess?.goalState}

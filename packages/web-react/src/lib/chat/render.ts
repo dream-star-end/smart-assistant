@@ -329,6 +329,9 @@ export function messageSignature(
         textSig(m.text),
         m.status ?? "",
         (m._media?.length ?? 0),
+        m._replyTo
+          ? `${m._replyTo.messageId}:${m._replyTo.role}:${textSig(m._replyTo.text)}`
+          : "",
         m._userPayloadDeferred ? 1 : 0,
         m._userPayloadId ?? "",
         m._payloadSha256 ?? "",

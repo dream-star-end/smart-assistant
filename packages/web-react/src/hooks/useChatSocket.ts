@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import type { MessageReplyQuote } from "@openclaude/protocol";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
@@ -87,6 +88,7 @@ export type UseChatSocket = {
     displayText?: string;
     media?: InboundMessage["content"]["media"];
     imageEdit?: InboundMessage["content"]["imageEdit"];
+    replyTo?: MessageReplyQuote;
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;

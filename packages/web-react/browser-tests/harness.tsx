@@ -55,6 +55,12 @@ declare global {
       messageCount: number;
     };
     __askQuestion: { responses: unknown[] };
+    __messageQuote: {
+      sends: Array<{
+        text: string;
+        replyTo?: { messageId: string; role: "user" | "assistant"; text: string };
+      }>;
+    };
     __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
   }
@@ -71,6 +77,7 @@ window.__scrollTimeline = {
 };
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
 window.__askQuestion = { responses: [] };
+window.__messageQuote = { sends: [] };
 window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
 
@@ -127,6 +134,59 @@ function FeedbackProbe() {
 
 createRoot(document.getElementById("feedback-root")!).render(
   <StrictMode><FeedbackProbe /></StrictMode>,
+);
+
+type QuoteProbe = {
+  messageId: string;
+  role: "user" | "assistant";
+  text: string;
+};
+
+const quoteAssistant: ChatMessage = {
+  id: "assistant-quote-probe",
+  role: "assistant",
+  text: "这是需要被引用的完整回答",
+  ts: 1,
+};
+
+function MessageQuoteProbe() {
+  const [replyTo, setReplyTo] = useState<QuoteProbe | null>(null);
+  return (
+    <>
+      <MessageRenderer
+        message={quoteAssistant}
+        sig="assistant-quote-probe"
+        isLast
+        sending={false}
+        inActiveTurn
+        turnFinalAssistant
+        cb={{
+          onQuote: (message: ChatMessage) => setReplyTo({
+            messageId: message.id,
+            role: message.role as "user" | "assistant",
+            text: message.text,
+          }),
+        } as never}
+        onRespondPermission={() => {}}
+      />
+      <Composer
+        {...({
+          onSend: (text: string, _media?: MediaRef[], quote?: QuoteProbe) => {
+            window.__messageQuote.sends.push({
+              text,
+              ...(quote ? { replyTo: quote } : {}),
+            });
+          },
+          replyTo,
+          onCancelReply: () => setReplyTo(null),
+        } as React.ComponentProps<typeof Composer>)}
+      />
+    </>
+  );
+}
+
+createRoot(document.getElementById("message-quote-root")!).render(
+  <StrictMode><MessageQuoteProbe /></StrictMode>,
 );
 
 const activeAskQuestion: ChatMessage = {

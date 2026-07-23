@@ -287,6 +287,11 @@ test('appendUserMessage forwards the complete exact-replay metadata to master', 
     ],
     _imageEdit: { clientJobId: 'a'.repeat(32), sourceIndex: 0, guideIndex: 1 },
     _modelText: '显示正文\n[模型附件提示]',
+    _replyTo: {
+      messageId: 'assistant-before',
+      role: 'assistant',
+      text: '被引用的完整回答',
+    },
     _routing: { model: 'gpt-5.6-sol', teamMode: true, effortLevel: 'high' },
     _sendAttempt: 0,
   }
