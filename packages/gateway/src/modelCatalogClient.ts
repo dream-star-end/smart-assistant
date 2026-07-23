@@ -37,6 +37,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { request as undiciRequest } from 'undici'
+import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
 
 export const MODEL_CATALOG_PATH = '/internal/v3/model-catalog'
 export const MODEL_CATALOG_EPOCH_PATH = '/internal/v3/model-catalog-epoch'
@@ -193,7 +194,20 @@ export class ModelCatalogClient {
   private readonly log: (event: string, fields: Record<string, unknown>) => void
 
   constructor(deps: ModelCatalogClientDeps = {}) {
-    this.env = deps.env ?? process.env
+    const sourceEnv = deps.env ?? process.env
+    let resolvedEnv = sourceEnv
+    try {
+      const endpoint = resolveConnectorEndpoint(sourceEnv)
+      resolvedEnv = {
+        ...sourceEnv,
+        [ENV_MASTER_URL]: endpoint.masterBaseUrl,
+        [ENV_CONTAINER_TOKEN]: endpoint.containerToken,
+      }
+    } catch {
+      // Personal/non-container paths intentionally remain unconfigured. The caller
+      // still fails closed through `configured`/ModelCatalogUnavailableError.
+    }
+    this.env = resolvedEnv
     this.fetcher = deps.fetcher ?? undiciRequest
     this.now = deps.now ?? Date.now
     this.lkgPath = deps.lkgPath ?? defaultLkgPath(this.env)

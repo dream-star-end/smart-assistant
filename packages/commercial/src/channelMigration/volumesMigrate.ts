@@ -17,6 +17,8 @@
 // codex 卷跳过(v5 已删 codex)。
 
 import { spawn } from "node:child_process";
+import { lchown, lstat, readdir } from "node:fs/promises";
+import { join } from "node:path";
 import type Docker from "dockerode";
 import {
   V3_MANAGED_LABEL_KEY,
@@ -157,6 +159,42 @@ function rsyncDir(srcDir: string, destDir: string): Promise<number> {
 }
 
 /**
+ * V3 的历史 shared-skill 提升脚本曾以 root 运行，令 `data/skills` 及其内容成为
+ * root:root。V3→V5 的 rsync 必须保留其它用户文件的 numeric owner，但在 V5 data
+ * 边界把这一个明确可写子树恢复成容器 agent(1000:1000)所有。
+ *
+ * 根 `skills` 若是 symlink 则 fail-closed；树内 symlink 只 lchown link 本身且不遍历，
+ * 避免宿主 root 跟随用户链接改到 volume 外。
+ */
+export async function normalizeMigratedSkillOwnership(
+  dataMount: string,
+  uid = 1000,
+  gid = 1000,
+): Promise<void> {
+  const skillsRoot = join(dataMount, "skills");
+  let rootStat: Awaited<ReturnType<typeof lstat>>;
+  try {
+    rootStat = await lstat(skillsRoot);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`v5 shared skills root is not a real directory: ${skillsRoot}`);
+  }
+
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const target = join(dir, entry.name);
+      if (entry.isDirectory()) await walk(target);
+      await lchown(target, uid, gid);
+    }
+  };
+  await walk(skillsRoot);
+  await lchown(skillsRoot, uid, gid);
+}
+
+/**
  * 迁移单用户全部卷(v3 → v5)。须在 v5 master(self host)上运行,且该用户 v3 容器已停。
  * @param userId 纯数字 user_id。
  * @param deps   docker 实例 + 本机 selfHostUuid。
@@ -207,6 +245,9 @@ export async function migrateUserVolumes(
         throw new Error(`v5 卷 ${v5Volume} 建后仍无 Mountpoint,无法拷贝`);
       }
       const bytes = await rsyncDir(v3Mount, v5Mount);
+      if (role === "data") {
+        await normalizeMigratedSkillOwnership(v5Mount);
+      }
       roles.push({ role, v3Volume, v5Volume, copied: true, bytes });
     }
 
