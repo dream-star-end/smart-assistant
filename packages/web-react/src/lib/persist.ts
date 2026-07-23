@@ -42,6 +42,10 @@ export type StoredPendingDispatch = {
   enqueuedAt: number;
 };
 
+export type StoredPendingDispatchRecord = StoredPendingDispatch & {
+  sessId: string;
+};
+
 /**
  * 从 server 载荷推导「已收尾 turn → 终态类别」映射(clientMessageId 键)。socket.applyServerMessages
  * 据此**显式收敛**:清发送态 + user 行置 replied/error(不依赖 completion-evidence 巧合路径)。
@@ -86,9 +90,16 @@ export function detectServerTerminalTurns(
   return out;
 }
 
-/** IndexedDB schema 版本 + 唯一对象存储名。*/
-const DB_VERSION = 1;
-const STORE = "sessions";
+/** IndexedDB schema v2 separates the exact outbound journal from stale-able
+ * whole-session snapshots. A second tab may overwrite its cache, but it can
+ * no longer erase another tab's unacknowledged send. */
+const DB_VERSION = 2;
+const SESSION_STORE = "sessions";
+const PENDING_DISPATCH_STORE = "pending_dispatches";
+
+function pendingDispatchKey(sessId: string, msgId: string): string {
+  return `${sessId}\0${msgId}`;
+}
 
 /**
  * 持久化的会话快照。**刻意只持久 reducer 产出的稳定数据 + 断点续传游标**，剥离流式
@@ -147,10 +158,9 @@ function resolveFactory(explicit?: IDBFactory): IDBFactory | null {
   }
 }
 
-/**
- * 极薄的 IndexedDB key→value 适配器（单 store）。所有方法在无 IndexedDB 时静默降级，
- * 任何底层 request 错误都 resolve 成空值（不 reject）——持久化失败绝不冒泡打断 UI。
- */
+/** Thin multi-store IndexedDB adapter. Session-cache methods remain
+ * best-effort; exact journal mutations reject unless their transaction
+ * commits, which is the physical-send fence. */
 class IdbKV {
   private readonly dbName: string;
   private readonly factory: IDBFactory | null;
@@ -164,30 +174,94 @@ class IdbKV {
   private openDb(): Promise<IDBDatabase | null> {
     if (this.dbp) return this.dbp;
     const f = this.factory;
-    if (!f) {
-      this.dbp = Promise.resolve(null);
-      return this.dbp;
-    }
-    this.dbp = new Promise<IDBDatabase | null>((resolve) => {
+    if (!f) return Promise.resolve(null);
+
+    let opening!: Promise<IDBDatabase | null>;
+    opening = new Promise<IDBDatabase | null>((resolve) => {
+      let settled = false;
+      const finish = (db: IDBDatabase | null) => {
+        if (settled) {
+          db?.close();
+          return;
+        }
+        settled = true;
+        resolve(db);
+      };
       let req: IDBOpenDBRequest;
       try {
         req = f.open(this.dbName, DB_VERSION);
       } catch {
-        resolve(null);
+        finish(null);
         return;
       }
-      req.onupgradeneeded = () => {
+      req.onupgradeneeded = (event) => {
         const db = req.result;
-        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+        const tx = req.transaction;
+        const oldVersion = typeof event?.oldVersion === "number" ? event.oldVersion : 0;
+        const sessions = db.objectStoreNames.contains(SESSION_STORE)
+          ? tx?.objectStore(SESSION_STORE)
+          : db.createObjectStore(SESSION_STORE);
+        const pending = db.objectStoreNames.contains(PENDING_DISPATCH_STORE)
+          ? tx?.objectStore(PENDING_DISPATCH_STORE)
+          : db.createObjectStore(PENDING_DISPATCH_STORE);
+        // v1 kept the journal inside a whole-session value. Move and scrub it
+        // in this versionchange transaction so hydration cannot re-import a
+        // dispatch already deleted from the v2 store.
+        if (
+          oldVersion < 2 && sessions && pending &&
+          typeof sessions.openCursor === "function"
+        ) {
+          const cursorReq = sessions.openCursor();
+          cursorReq.onsuccess = () => {
+            const cursor = cursorReq.result;
+            if (!cursor) return;
+            const value = cursor.value as StoredSession;
+            const legacy = Array.isArray(value?._pendingDispatches)
+              ? value._pendingDispatches
+              : [];
+            for (const item of legacy) {
+              if (
+                item && typeof value?.id === "string" && value.id &&
+                typeof item.msgId === "string" && item.msgId
+              ) {
+                pending.put(
+                  { sessId: value.id, ...item } satisfies StoredPendingDispatchRecord,
+                  pendingDispatchKey(value.id, item.msgId),
+                );
+              }
+            }
+            if (Object.prototype.hasOwnProperty.call(value ?? {}, "_pendingDispatches")) {
+              const { _pendingDispatches: legacyPending, ...clean } = value;
+              void legacyPending;
+              cursor.update(clean);
+            }
+            cursor.continue();
+          };
+        }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
-      req.onblocked = () => resolve(null);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => {
+          db.close();
+          if (this.dbp === opening) this.dbp = null;
+        };
+        finish(db);
+      };
+      req.onerror = () => finish(null);
+      // Wait for the older tab to close. New-code connections close
+      // themselves on versionchange; a genuinely old v1 tab remains a visible
+      // "saving send record" wait instead of bypassing the physical-send fence.
+      req.onblocked = () => {};
     });
-    return this.dbp;
+    this.dbp = opening;
+    void opening.then((db) => {
+      if (!db && this.dbp === opening) this.dbp = null;
+    });
+    return opening;
   }
 
   private run<T>(
+    storeName: string,
     mode: IDBTransactionMode,
     make: (store: IDBObjectStore) => IDBRequest<T>,
   ): Promise<T | undefined> {
@@ -200,8 +274,8 @@ class IdbKV {
           }
           let req: IDBRequest<T>;
           try {
-            const tx = db.transaction(STORE, mode);
-            req = make(tx.objectStore(STORE));
+            const tx = db.transaction(storeName, mode);
+            req = make(tx.objectStore(storeName));
           } catch {
             resolve(undefined);
             return;
@@ -212,10 +286,10 @@ class IdbKV {
     );
   }
 
-  /** Strict write used only for the outbound dispatch journal. Unlike the
-   * existing best-effort helpers, this resolves at transaction commit and
-   * rejects when IndexedDB is unavailable or the transaction cannot commit. */
-  private putCommitted(key: string, value: unknown): Promise<void> {
+  private mutateCommitted<T>(
+    storeName: string,
+    mutate: (store: IDBObjectStore) => IDBRequest<T>,
+  ): Promise<void> {
     return this.openDb().then((db) => {
       if (!db) throw new Error("indexeddb unavailable");
       return new Promise<void>((resolve, reject) => {
@@ -226,8 +300,8 @@ class IdbKV {
           reject(reason instanceof Error ? reason : new Error("indexeddb transaction failed"));
         };
         try {
-          const tx = db.transaction(STORE, "readwrite");
-          const req = tx.objectStore(STORE).put(value, key);
+          const tx = db.transaction(storeName, "readwrite");
+          const req = mutate(tx.objectStore(storeName));
           req.onerror = () => fail(req.error);
           tx.onerror = () => fail(tx.error);
           tx.onabort = () => fail(tx.error);
@@ -243,23 +317,39 @@ class IdbKV {
     });
   }
 
-  get<T>(key: string): Promise<T | undefined> {
-    return this.run<T>("readonly", (s) => s.get(key) as IDBRequest<T>);
+  get<T>(storeName: string, key: string): Promise<T | undefined> {
+    return this.run<T>(storeName, "readonly", (s) => s.get(key) as IDBRequest<T>);
   }
-  getAll<T>(): Promise<T[]> {
-    return this.run<T[]>("readonly", (s) => s.getAll() as IDBRequest<T[]>).then((r) => r ?? []);
+  getAll<T>(storeName: string): Promise<T[]> {
+    return this.run<T[]>(storeName, "readonly", (s) => s.getAll() as IDBRequest<T[]>).then((r) => r ?? []);
   }
-  put(key: string, value: unknown): Promise<unknown> {
-    return this.run("readwrite", (s) => s.put(value, key));
+  put(storeName: string, key: string, value: unknown): Promise<unknown> {
+    return this.run(storeName, "readwrite", (s) => s.put(value, key));
   }
-  putDurably(key: string, value: unknown): Promise<void> {
-    return this.putCommitted(key, value);
+  putDurably(storeName: string, key: string, value: unknown): Promise<void> {
+    return this.mutateCommitted(storeName, (s) => s.put(value, key));
   }
-  delete(key: string): Promise<unknown> {
-    return this.run("readwrite", (s) => s.delete(key));
+  delete(storeName: string, key: string): Promise<unknown> {
+    return this.run(storeName, "readwrite", (s) => s.delete(key));
   }
-  clear(): Promise<unknown> {
-    return this.run("readwrite", (s) => s.clear());
+  deleteDurably(storeName: string, key: string): Promise<void> {
+    return this.mutateCommitted(storeName, (s) => s.delete(key));
+  }
+  async clearAll(): Promise<void> {
+    const db = await this.openDb();
+    if (!db) return;
+    await new Promise<void>((resolve) => {
+      try {
+        const tx = db.transaction([SESSION_STORE, PENDING_DISPATCH_STORE], "readwrite");
+        tx.objectStore(SESSION_STORE).clear();
+        tx.objectStore(PENDING_DISPATCH_STORE).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
+      } catch {
+        resolve();
+      }
+    });
   }
   close(): void {
     const p = this.dbp;
@@ -1261,30 +1351,124 @@ export class SessionStore {
 
   async putSession(s: StoredSession): Promise<void> {
     if (this.dead || !s?.id) return;
-    await this.kv.put(s.id, s);
+    await this.kv.put(SESSION_STORE, s.id, s);
   }
-  /** Dispatch-journal write: success means the readwrite transaction committed. */
+  /** Whole-session durable write. It deliberately cannot mutate the exact
+   * pending-dispatch store. */
   async putSessionDurably(s: StoredSession): Promise<void> {
     if (this.dead) throw new Error("session store is closed");
     if (!s?.id) throw new Error("session id is required");
-    await this.kv.putDurably(s.id, s);
+    await this.kv.putDurably(SESSION_STORE, s.id, s);
+  }
+  /** Exact journal write: success means its own readwrite transaction committed. */
+  async putPendingDispatch(sessId: string, item: StoredPendingDispatch): Promise<void> {
+    if (this.dead) throw new Error("session store is closed");
+    if (!sessId || !item?.msgId) throw new Error("pending dispatch identity is required");
+    await this.kv.putDurably(
+      PENDING_DISPATCH_STORE,
+      pendingDispatchKey(sessId, item.msgId),
+      { sessId, ...item } satisfies StoredPendingDispatchRecord,
+    );
+  }
+  async deletePendingDispatch(sessId: string, msgId: string): Promise<void> {
+    if (this.dead || !sessId || !msgId) return;
+    await this.kv.deleteDurably(PENDING_DISPATCH_STORE, pendingDispatchKey(sessId, msgId));
+  }
+  async getPendingDispatches(): Promise<StoredPendingDispatchRecord[]> {
+    if (this.dead) return [];
+    return this.kv.getAll<StoredPendingDispatchRecord>(PENDING_DISPATCH_STORE);
+  }
+  /** Hydration-only view: merge the independent journal into session values
+   * in memory without ever writing it back into the sessions store. */
+  async getAllForHydration(): Promise<StoredSession[]> {
+    const [sessions, pending] = await Promise.all([this.getAll(), this.getPendingDispatches()]);
+    const bySession = new Map<string, StoredPendingDispatch[]>();
+    for (const item of pending) {
+      if (!item || typeof item.sessId !== "string") continue;
+      const list = bySession.get(item.sessId) ?? [];
+      list.push({ msgId: item.msgId, payload: item.payload, enqueuedAt: item.enqueuedAt });
+      bySession.set(item.sessId, list);
+    }
+    const hydrated = sessions.map((session) => {
+      const items = bySession.get(session.id);
+      bySession.delete(session.id);
+      const { _pendingDispatches: legacyPending, ...clean } = session;
+      void legacyPending;
+      if (!items?.length) return clean;
+      items.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+      return { ...clean, _pendingDispatches: items };
+    });
+    // The exact journal commits before the physical send and before the
+    // best-effort whole-session cache write. A crash in that narrow window may
+    // leave only journal rows; reconstruct the genuine user bubble directly
+    // from their lossless payload so the replay remains visible and stoppable.
+    for (const [sessId, items] of bySession) {
+      items.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+      const first = items[0]!;
+      const messages = items.map((item): ChatMessage => {
+        const payload = item.payload;
+        const media = payload.content.media;
+        const displayText = payload.content.displayText ?? payload.content.text ?? "";
+        const attemptMatch = /:(\d+)$/.exec(payload.idempotencyKey);
+        const attempt = attemptMatch ? Number(attemptMatch[1]) : 0;
+        return {
+          id: item.msgId,
+          role: "user",
+          text: displayText,
+          ts: payload.ts,
+          status: "queued",
+          ...(displayText !== payload.content.text ? { _modelText: payload.content.text } : {}),
+          ...(media ? { _media: media.filter((entry) => entry.hidden !== true) } : {}),
+          ...(payload.content.imageEdit && media ? { _retryMedia: media } : {}),
+          ...(payload.content.imageEdit ? { _imageEdit: payload.content.imageEdit } : {}),
+          ...(payload.content.replyTo ? { _replyTo: payload.content.replyTo } : {}),
+          _routing: {
+            model: payload.model,
+            teamMode: payload.teamMode === true,
+            effortLevel: payload.effortLevel ?? null,
+          },
+          _sendAttempt: Number.isSafeInteger(attempt) && attempt >= 0 ? attempt : 0,
+        };
+      });
+      const firstPayload = first.payload;
+      const firstText = firstPayload.content.displayText ?? firstPayload.content.text ?? "";
+      const routing = messages.at(-1)!._routing!;
+      hydrated.push({
+        id: sessId,
+        agentId: firstPayload.agentId ?? "main",
+        title: firstText.trim().slice(0, 40) || "新对话",
+        messages,
+        createdAt: first.enqueuedAt,
+        lastAt: items.at(-1)!.enqueuedAt,
+        _lastRouting: routing,
+        ...(routing.model ? { _selectedModelId: routing.model } : {}),
+        _pendingDispatches: items,
+      });
+    }
+    return hydrated;
   }
   getSession(id: string): Promise<StoredSession | undefined> {
     if (this.dead) return Promise.resolve(undefined);
-    return this.kv.get<StoredSession>(id);
+    return this.kv.get<StoredSession>(SESSION_STORE, id);
   }
   getAll(): Promise<StoredSession[]> {
     if (this.dead) return Promise.resolve([]);
-    return this.kv.getAll<StoredSession>();
+    return this.kv.getAll<StoredSession>(SESSION_STORE);
   }
   async deleteSession(id: string): Promise<void> {
     if (this.dead) return;
-    await this.kv.delete(id);
+    await this.kv.delete(SESSION_STORE, id);
+    const pending = await this.getPendingDispatches();
+    await Promise.all(
+      pending
+        .filter((item) => item.sessId === id)
+        .map((item) => this.deletePendingDispatch(id, item.msgId)),
+    );
   }
   /** 清空本 user 命名空间（登出/隐私收尾）。同步置 dead 防 wipe 与 final flush 竞态。*/
   async wipe(): Promise<void> {
     this.dead = true;
-    await this.kv.clear();
+    await this.kv.clearAll();
   }
   close(): void {
     this.kv.close();

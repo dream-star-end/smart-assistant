@@ -16,7 +16,12 @@ import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
 } from "../src/components/chat/archivePaging";
-import { mergeTimelineHistoryPage } from "../src/lib/persist";
+import {
+  mergeTimelineHistoryPage,
+  SessionStore,
+  type StoredPendingDispatch,
+  type StoredSession,
+} from "../src/lib/persist";
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 import { createMemoryAuthSession } from "../src/lib/authSession";
@@ -63,6 +68,10 @@ declare global {
     };
     __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
+    __runPendingDispatchJournalProbe: () => Promise<{
+      survivedStaleWrite: boolean;
+      resistedResurrection: boolean;
+    }>;
   }
 }
 window.__sends = [];
@@ -80,6 +89,48 @@ window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
 window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
+window.__runPendingDispatchJournalProbe = async () => {
+  const userId = `browser-journal-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const first = new SessionStore(userId);
+  const stale = new SessionStore(userId);
+  const session: StoredSession = {
+    id: "browser-journal-session",
+    agentId: "main",
+    title: "fresh",
+    messages: [],
+    createdAt: 1,
+    lastAt: 1,
+  };
+  const pending: StoredPendingDispatch = {
+    msgId: "browser-journal-message",
+    enqueuedAt: 2,
+    payload: {
+      type: "inbound.message",
+      idempotencyKey: "web:browser-journal-message:0",
+      channel: "webchat",
+      peer: { id: session.id, kind: "dm" },
+      agentId: "main",
+      clientMessageId: "browser-journal-message",
+      content: { text: "EXACT_BROWSER_JOURNAL_PAYLOAD" },
+      ts: 2,
+    },
+  };
+
+  await first.putSessionDurably(session);
+  await first.putPendingDispatch(session.id, pending);
+  await stale.putSessionDurably({ ...session, title: "stale-without-journal" });
+  const survivedStaleWrite =
+    (await first.getAllForHydration())[0]?._pendingDispatches?.[0]?.msgId === pending.msgId;
+
+  await first.deletePendingDispatch(session.id, pending.msgId);
+  await stale.putSessionDurably({ ...session, _pendingDispatches: [pending] });
+  const resistedResurrection =
+    (await first.getAllForHydration())[0]?._pendingDispatches === undefined;
+
+  await first.wipe();
+  stale.close();
+  return { survivedStaleWrite, resistedResurrection };
+};
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
   window.__uploads.push(file.name);

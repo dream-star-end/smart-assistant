@@ -26,6 +26,7 @@
 //   T16/T17 容器网页预览按访问端自动选择移动/桌面、铺满真实可视区，空闲后收起
 //      chrome，且独立“…”入口不会吞掉 iframe 页面交互。
 //   T18 消息“引用”动作把精确目标送入 Composer，可取消；再次引用后随当前正文发送。
+//   T19 真 IndexedDB 多标签陈旧快照不能抹除或复活 exact pending-dispatch journal。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
@@ -138,7 +139,13 @@ try {
 const page = await browser.newPage();
 const pageErrors = [];
 page.on("pageerror", (err) => pageErrors.push(String(err)));
-await page.setContent(html);
+const harnessUrl = "http://127.0.0.1/__openclaude_browser_tests__";
+await page.route(harnessUrl, (route) => route.fulfill({
+  status: 200,
+  contentType: "text/html",
+  body: html,
+}));
+await page.goto(harnessUrl);
 
 let failed = 0;
 let caseIndex = 0;
@@ -581,6 +588,16 @@ await check("T18 点助手“引用”→预览可取消→再次引用后随正
   }];
   if (JSON.stringify(sends) !== JSON.stringify(expected)) {
     throw new Error(`引用发送参数不完整:${JSON.stringify(sends)}`);
+  }
+});
+
+await check("T19 真 IndexedDB 多标签陈旧快照不抹除/复活发送日志", async () => {
+  const result = await page.evaluate(() => window.__runPendingDispatchJournalProbe());
+  if (!result.survivedStaleWrite) {
+    throw new Error("陈旧 whole-session 写入抹除了 exact pending-dispatch journal");
+  }
+  if (!result.resistedResurrection) {
+    throw new Error("已 ACK 删除的 exact pending-dispatch 被陈旧快照复活");
   }
 });
 

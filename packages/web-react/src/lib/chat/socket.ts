@@ -151,30 +151,12 @@ export type ChatSocketDeps = {
    *  建行确认后的竞态收敛补写(见 ensureServerSessionOnce)——受理路径会先于 ensure PUT
    *  幂等建行(PR#126),PUT 随体的 modelId 竞态输掉时靠本回调落地。 */
   persistSessionModel?: (sessId: string, modelId: string) => Promise<void> | void;
-  /** 跨设备持久化「用户发送的消息」到 master(POST /api/sessions/:id/user-message)。
-   *  带本地 client id → getSession 回带同 id,前端合并去重。best-effort。 */
-  persistUserMessage?: (
-    sessId: string,
-    msg: {
-      id: string;
-      text: string;
-      ts: number;
-      media?: InboundMessage["content"]["media"];
-      _retryMedia?: InboundMessage["content"]["media"];
-      _imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
-      _modelText?: string;
-      _replyTo?: MessageReplyQuote;
-      _routing?: ChatRoutingSnapshot;
-      _sendAttempt?: number;
-      _isAutoRetry?: boolean;
-      _idem?: string;
-    },
-  ) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
-  /** 用户 turn 的 exact dispatch journal；正常浏览器在首次物理 WS send 前等待 commit。
-   * 存储不可用时 reject，由发送层显式提示并保持聊天可用。 */
-  persistSessionDurably?: (sessId: string) => Promise<void>;
+  /** Exact outbound journal. Production waits for one committed row before
+   * the first physical WS send and exact-deletes it only after authority ACK. */
+  persistPendingDispatch?: (sessId: string, item: StoredPendingDispatch) => Promise<void>;
+  deletePendingDispatch?: (sessId: string, msgId: string) => Promise<void>;
   /** GitHub 仓库绑定状态帧（容器→bridge→client）。由 useRepoBinding 消费（banner/pill）。*/
   onRepoStatus?: (frame: RepoStatusWire) => void;
   /** GitHub 绑定校验失败帧（bridge→client，stale / link 失效 / 内部错）。*/
@@ -385,6 +367,7 @@ export class ChatSocket {
    * turn reaches final/error/stop, while other peers may dispatch in parallel. */
   private dispatchSlots = new Map<string, string>();
   private dispatchPumpScheduled = false;
+  private dispatchJournalRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /**
    * 本连接 bridge↔容器 relay 是否已确认建立(收到 sys.relay_ready 即 true)。connect/onclose 复位。
    * readiness 权威统一:冷启时 ws.onopen(握手完成)早于 relay 就绪,relay_ready 才是"可投递"的
@@ -420,10 +403,10 @@ export class ChatSocket {
     // 版本握手 busy 探针:任一会话有在飞 turn → 软刷新推迟(governor 每 5s 重估)。
     // 在飞权威 = _sendingInFlight(团队/委派 turn 同样置位),与 hello/resume 恢复
     // loading 用的是同一字段,不另造第二真值源。
-    appUpdate.registerBusyProbe(() => {
-      for (const s of this.sessions.values()) if (s._sendingInFlight) return true;
-      return false;
-    });
+    appUpdate.registerBusyProbe(() =>
+      this.offlineQueue.length > 0 ||
+      [...this.sessions.values()].some((session) => session._sendingInFlight),
+    );
   }
 
   // ═══════════════ 订阅 ═══════════════
@@ -435,6 +418,13 @@ export class ChatSocket {
   };
 
   getSnapshot = (): ChatSnapshot => this.snapshot;
+
+  /** Composer busy/stop affordance includes pre-admission journal work, while
+   * TurnActivity still keys only off server-admitted `_sendingInFlight`. */
+  isSessionBusy(sessId: string): boolean {
+    return !!this.sessions.get(sessId)?._sendingInFlight ||
+      this.offlineQueue.some((item) => item.sessId === sessId);
+  }
 
   private rebuildSnapshot(): void {
     this.snapshot = {
@@ -770,7 +760,10 @@ export class ChatSocket {
   // ═══════════════ transient 软提示（会话级、非持久，S3）═══════════════
   private setTransientNotice(sessId: string, text: string): void {
     const s = this.sessions.get(sessId);
-    if (!s || !s._sendingInFlight) return; // 仅在 turn 仍进行时提示
+    if (
+      !s ||
+      (!s._sendingInFlight && !this.offlineQueue.some((item) => item.sessId === sessId))
+    ) return; // admitted turn 或受理前安全发送阶段
     const prev = this.transientNotices.get(sessId);
     if (prev && prev.text === text) {
       prev.ts = Date.now(); // 同文案仅刷新时间，不触发无谓重渲
@@ -883,8 +876,12 @@ export class ChatSocket {
     );
     if (index < 0) return false;
     this.offlineQueue.splice(index, 1);
+    const retryKey = `${sessId}\0${clientMessageId}`;
+    const retryTimer = this.dispatchJournalRetryTimers.get(retryKey);
+    if (retryTimer) clearTimeout(retryTimer);
+    this.dispatchJournalRetryTimers.delete(retryKey);
     this.maybePromoteToConnected();
-    const durableClear = this.deps.persistSessionDurably?.(sessId);
+    const durableClear = this.deps.deletePendingDispatch?.(sessId, clientMessageId);
     if (durableClear) void durableClear.catch(() => {});
     this.deps.persistSession?.(sessId);
     return true;
@@ -905,9 +902,18 @@ export class ChatSocket {
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
     if (user) user.status = "sent";
     if (!sess._sendingInFlight) {
+      this.clearTransientNotice(sess.id);
+      sess._streamingAssistant = null;
+      sess._streamingThinking = null;
+      sess._blockIdToMsgId = new Map();
+      sess._agentSwitchedAt = null;
+      sess._localTeardownAt = undefined;
       sess._sendingInFlight = true;
       sess._activeClientMessageId = clientMessageId;
       sess._turnStartedAt = Date.now();
+      sess._pendingCostCredits = "0";
+      sess._lastFinaledAssistantId = null;
+      sess._lastFinaledAt = 0;
       this.resetThinkingSafety(sessId);
     }
     this.scheduleNotify();
@@ -1787,7 +1793,15 @@ export class ChatSocket {
     this.serverSessionEnsured.delete(sessId);
     this.serverSessionInflight.delete(sessId);
     this.dispatchSlots.delete(sessId);
+    const removed = this.offlineQueue.filter((item) => item.sessId === sessId);
     this.offlineQueue = this.offlineQueue.filter((item) => item.sessId !== sessId);
+    for (const item of removed) {
+      void this.deps.deletePendingDispatch?.(sessId, item.msgId).catch(() => {});
+      const key = `${sessId}\0${item.msgId}`;
+      const timer = this.dispatchJournalRetryTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.dispatchJournalRetryTimers.delete(key);
+    }
     this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
     this.transientNotices.delete(sessId);
@@ -1808,6 +1822,8 @@ export class ChatSocket {
     this.serverSessionInflight.clear();
     this.dispatchSlots.clear();
     this.offlineQueue = [];
+    for (const timer of this.dispatchJournalRetryTimers.values()) clearTimeout(timer);
+    this.dispatchJournalRetryTimers.clear();
     this.pendingRepoBind.clear();
     this.transientNotices.clear();
     this.lastSyncAt.clear();
@@ -1869,14 +1885,6 @@ export class ChatSocket {
         };
       });
     }
-    const pendingDispatches: StoredPendingDispatch[] = this.offlineQueue
-      .filter((item) => item.sessId === sessId)
-      .sort((a, b) => a.enqueuedAt - b.enqueuedAt)
-      .map((item) => ({
-        msgId: item.msgId,
-        payload: item.payload,
-        enqueuedAt: item.enqueuedAt,
-      }));
     return {
       id: s.id,
       agentId: s.agentId,
@@ -1903,7 +1911,6 @@ export class ChatSocket {
       _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
       ...(s._lastRouting ? { _lastRouting: { ...s._lastRouting } } : {}),
       ...(s._selectedModelId ? { _selectedModelId: s._selectedModelId } : {}),
-      ...(pendingDispatches.length > 0 ? { _pendingDispatches: pendingDispatches } : {}),
     };
   }
 
@@ -2465,9 +2472,9 @@ export class ChatSocket {
     // 未加载等)不清空既有选择。
     if (p.model) sess._selectedModelId = p.model;
     // 主控 session 建行(每会话一次):必须在容器跑完 turn 回传 authored 消息之前落地,
-    // 否则 session_not_found 风暴。ensurePromise:用于把"用户消息持久化"排在主控建行之后
-    // (行须先存在,否则 append 404)。
-    const ensurePromise = this.ensureServerSessionOnce(sess, p.agentId);
+    // 否则 session_not_found 风暴。用户行不再走独立 HTTP append：WS
+    // admitUserTurn 在同一事务里落 user row + turn_dispatches，避免出现有消息无 dispatch。
+    void this.ensureServerSessionOnce(sess, p.agentId);
     // 路由字段快照:合成续写(服务重启/空轮)复用同一路由,保证桥的 codex 分类
     // (server requestId 注入/preCheck)与被中断 turn 一致。
     const routing = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
@@ -2524,35 +2531,6 @@ export class ChatSocket {
     // assistant 消息原位渲染），turn error 转 failed。**不持久化**（toStored 显式剥离）、不进
     // server 历史 → 重开会话不留孤儿卡（reducer 回放路径无此行）。
     this.ensureGenPlaceholder(sess, p.imageEdit, false, userMsg.id);
-    // 跨设备持久化用户消息:行确保存在后,带本地 client id POST 给 master(getSession 回带同
-    // id → 合并天然去重,不与本地乐观 user 重复)。best-effort:失败不影响发送(本地 + IndexedDB
-    // 仍在);容器回传的 server-authored 助手消息走另一条链。
-    {
-      const sid = sess.id;
-      const um = {
-        id: userMsg.id,
-        text: userMsg.text,
-        ts: userMsg.ts,
-        media: outboundMedia?.filter((m) => m.hidden !== true),
-        ...(userMsg._retryMedia !== undefined ? { _retryMedia: userMsg._retryMedia } : {}),
-        ...(userMsg._imageEdit !== undefined ? { _imageEdit: userMsg._imageEdit } : {}),
-        ...(userMsg._modelText !== undefined ? { _modelText: userMsg._modelText } : {}),
-        ...(userMsg._replyTo !== undefined ? { _replyTo: userMsg._replyTo } : {}),
-        ...(userMsg._routing !== undefined ? { _routing: userMsg._routing } : {}),
-        ...(userMsg._sendAttempt !== undefined ? { _sendAttempt: userMsg._sendAttempt } : {}),
-        ...(userMsg._isAutoRetry !== undefined ? { _isAutoRetry: userMsg._isAutoRetry } : {}),
-        ...(userMsg._idem !== undefined ? { _idem: userMsg._idem } : {}),
-      };
-      void ensurePromise
-        .then((ok) => {
-          if ((ok || this.serverSessionEnsured.has(sid)) && this.sessions.has(sid)) {
-            return this.deps.persistUserMessage?.(sid, um);
-          }
-        })
-        .catch(() => {
-          /* 持久化失败:best-effort,跨设备该条不显,本地仍在 */
-        });
-    }
     this.dispatchPayload(sess, userMsg, payload);
   }
 
@@ -2799,21 +2777,51 @@ export class ChatSocket {
       if (sess._sendingInFlight && sess._activeClientMessageId !== item.msgId) continue;
       this.dispatchSlots.set(item.sessId, item.msgId);
       item.state = "persisting";
-      const committed = this.deps.persistSessionDurably?.(item.sessId);
+      this.setTransientNotice(sess.id, "正在安全保存发送记录，保存完成后立即发送…");
+      const committed = this.deps.persistPendingDispatch?.(item.sessId, {
+        msgId: item.msgId,
+        payload: item.payload,
+        enqueuedAt: item.enqueuedAt,
+      });
       if (committed) {
         void committed.then(
           () => this.sendPersistedDispatch(item),
-          () => this.sendPersistedDispatch(item, false),
+          () => this.handleDispatchJournalFailure(item),
         );
       } else {
         // Unit/SSR adapters without persistence keep their existing in-memory
-        // behavior. Production always supplies persistSessionDurably.
+        // behavior. Production always supplies persistPendingDispatch.
         this.sendPersistedDispatch(item);
       }
     }
   }
 
-  private sendPersistedDispatch(item: OfflineItem, journalCommitted = true): void {
+  private handleDispatchJournalFailure(item: OfflineItem): void {
+    if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
+    item.state = "queued";
+    const sess = this.sessions.get(item.sessId);
+    const user = sess?.messages.find(
+      (message) => message.role === "user" && message.id === item.msgId,
+    );
+    if (user) user.status = "queued";
+    if (sess) {
+      this.setTransientNotice(
+        sess.id,
+        "消息尚未发送：正在等待浏览器保存发送恢复记录，可点击停止取消。",
+      );
+    }
+    const key = `${item.sessId}\0${item.msgId}`;
+    if (!this.dispatchJournalRetryTimers.has(key)) {
+      const timer = setTimeout(() => {
+        this.dispatchJournalRetryTimers.delete(key);
+        this.kickDispatchPump();
+      }, 1000);
+      this.dispatchJournalRetryTimers.set(key, timer);
+    }
+    this.scheduleNotify();
+  }
+
+  private sendPersistedDispatch(item: OfflineItem): void {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
     if (
       !this.ws || this.ws.readyState !== 1 || !this.relayReady ||
@@ -2829,28 +2837,13 @@ export class ChatSocket {
     item.state = "awaiting_admission";
     const sess = this.sessions.get(item.sessId);
     if (!sess) return;
-    this.clearTransientNotice(sess.id);
-    sess._streamingAssistant = null;
-    sess._streamingThinking = null;
-    sess._blockIdToMsgId = new Map();
-    sess._agentSwitchedAt = null;
-    sess._localTeardownAt = undefined;
     const user = sess.messages.find((message) => message.role === "user" && message.id === item.msgId);
     if (user) user.status = "sending";
-    sess._sendingInFlight = true;
+    // Correlation identity is safe before admission and lets a terminal frame
+    // that omits its optional clientMessageId still bind to this exact turn.
+    // The user-visible thinking clock remains off until authority confirms.
     sess._activeClientMessageId = item.msgId;
-    sess._localTeardownAt = undefined;
-    sess._turnStartedAt = Date.now();
-    sess._pendingCostCredits = "0";
-    sess._lastFinaledAssistantId = null;
-    sess._lastFinaledAt = 0;
-    this.resetThinkingSafety(sess.id);
-    if (!journalCommitted) {
-      this.setTransientNotice(
-        sess.id,
-        "当前浏览器无法保存发送恢复记录；消息仍已发送，请保持页面开启直到收到回复。",
-      );
-    }
+    this.clearTransientNotice(sess.id);
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
   }
@@ -2858,20 +2851,41 @@ export class ChatSocket {
   stopTurn(sessId: string): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
-    if (!this.ws || this.ws.readyState !== 1) return; // 断线时 stop 由服务端重连后恢复
-    this.safeWsSend(
-      JSON.stringify({
-        type: "inbound.control.stop",
-        channel: "webchat",
-        peer: { id: sess.id, kind: "dm" },
-        agentId: sess.agentId || this.deps.defaultAgentId || "main",
-      }),
-    );
+    const pending = this.offlineQueue.filter((item) => item.sessId === sessId);
+    if (!sess._sendingInFlight && pending.length === 0) return;
+    // If a turn is already admitted, Stop applies to that turn only; prompts
+    // the user queued behind it remain FIFO work and dispatch next. Before
+    // admission, Stop cancels every still-local item because none is active.
+    const cancelPending = sess._sendingInFlight ? [] : pending;
+    const mayHaveReachedServer =
+      sess._sendingInFlight || pending.some((item) => item.state === "awaiting_admission");
+    if (mayHaveReachedServer && this.ws?.readyState === 1) {
+      this.safeWsSend(
+        JSON.stringify({
+          type: "inbound.control.stop",
+          channel: "webchat",
+          peer: { id: sess.id, kind: "dm" },
+          agentId: sess.agentId || this.deps.defaultAgentId || "main",
+        }),
+      );
+    }
     const clientMessageId = sess._activeClientMessageId;
-    this.finishDispatch(sess.id, clientMessageId);
+    for (const item of cancelPending) {
+      this.clearPendingDispatch(sess.id, item.msgId);
+      const user = sess.messages.find(
+        (message) => message.role === "user" && message.id === item.msgId,
+      );
+      if (user && user.status !== "sent") {
+        user.status = "error";
+        user._errorDetail = "发送已取消";
+      }
+    }
+    if (clientMessageId) this.finishDispatch(sess.id, clientMessageId);
+    this.dispatchSlots.delete(sess.id);
     // 本地立即收尾（不等后端 isFinal）。
     this.clearSendingState(sess, { clearThinking: true });
     this.clearTransientNotice(sess.id); // 用户手动停止：清 transient 软提示
+    this.kickDispatchPump();
     this.scheduleNotify();
   }
 

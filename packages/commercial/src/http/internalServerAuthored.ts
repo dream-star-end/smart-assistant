@@ -72,6 +72,7 @@ import {
 } from "@openclaude/protocol";
 import type { DispatchAdmissionBackend, LosslessTurnTapeStorage } from "../db/pgSessionsBackend.js";
 import type { TurnWaiverInput, TurnWaiverResult } from "../billing/refund.js";
+import { recordProviderHealthSample } from "./proxy/providerHealthSink.js";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
 import { enqueueAlert } from "../admin/alertOutbox.js";
@@ -516,6 +517,8 @@ export interface ServerAuthoredHandlerDeps {
   applyTurnWaiver?: (input: TurnWaiverInput) => Promise<TurnWaiverResult>;
   /** Best-effort live projection after the durable receipt commits. */
   broadcastToUser?: (uid: bigint, payload: Record<string, unknown>) => void;
+  /** Synchronous fire-and-forget signal hook; override only for tests. */
+  recordProviderHealth?: (model: string, kind: "timeout") => void;
   logger?: Logger;
   /** Override only for tests; real callers use Date.now via default. */
   now?: () => number;
@@ -682,6 +685,7 @@ export function makeServerAuthoredHandler(
           settleCodexBilling: deps.settleCodexBilling,
           applyTurnWaiver: deps.applyTurnWaiver,
           broadcastToUser: deps.broadcastToUser,
+          recordProviderHealth: deps.recordProviderHealth ?? recordProviderHealthSample,
           userLog,
           metric,
         });
@@ -1706,6 +1710,7 @@ const LosslessTapeBaseSchema = z.object({
     "platform_authority_expired",
     "turn_limit",
   ] satisfies readonly TurnWaiveReason[]).optional(),
+  model: z.string().min(1).max(256).optional(),
   turnKey: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
   tapeId: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
   tapeSha256: z.string().regex(LOSSLESS_TURN_TAPE_SHA256_RE),
@@ -1782,6 +1787,7 @@ async function handleLosslessTurnTapeRequest(args: {
   settleCodexBilling?: (userId: bigint, billing: DurableCodexBilling) => Promise<void>;
   applyTurnWaiver?: (input: TurnWaiverInput) => Promise<TurnWaiverResult>;
   broadcastToUser?: (uid: bigint, payload: Record<string, unknown>) => void;
+  recordProviderHealth?: (model: string, kind: "timeout") => void;
   userLog: Logger;
   metric: (outcome: V3SinkPersistOutcome, role?: V3SinkPersistRole) => void;
 }): Promise<void> {
@@ -1880,6 +1886,18 @@ async function handleLosslessTurnTapeRequest(args: {
       }
       if (result.applied !== "finalized" && result.applied !== "idempotent") {
         throw new Error("unexpected lossless turn tape finalize result");
+      }
+      // Egress correctly classifies a downstream client abort as `aborted`
+      // (excluded from provider judgement). Only the gateway's exact
+      // LIVENESS_TIMEOUT waiver proves that this abort was actually caused by
+      // a silent upstream. Record once at the first immutable finalize; broad
+      // `no_response` and ordinary user cancellation remain excluded.
+      if (
+        result.applied === "finalized" &&
+        body.waiveReason === "idle_timeout" &&
+        body.model
+      ) {
+        args.recordProviderHealth?.(body.model, "timeout");
       }
       // late true tape(RFC §2.4):reconciler 已宣告 not_accepted、error 卡已投影,tape 迟到。
       // storage 已在同一 tx 撤 projection + 转 dispatch → manual_reconcile,内容仍完整 materialize
