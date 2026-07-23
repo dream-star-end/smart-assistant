@@ -41,6 +41,7 @@ const QqOutboundSchema = z
       })
       .strict(),
     blocks: z.array(z.object({ kind: z.string() }).passthrough()).min(1),
+    createdAt: z.number().int().positive().optional(),
     isFinal: z.boolean().optional(),
     traceId: z.string().regex(ID_RE).optional(),
   })
