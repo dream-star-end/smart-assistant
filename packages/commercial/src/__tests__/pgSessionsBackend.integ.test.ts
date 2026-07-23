@@ -5416,6 +5416,62 @@ describe("pgSessionsBackend direct turn timeline", () => {
     ), null);
   });
 
+  maybe("unified cold history defers medium tool bodies but keeps final answers inline and exact", async () => {
+    const sessionId = "s-direct-medium-tool";
+    const userId = "u-direct-medium-tool";
+    const mediumTail = "-MEDIUM-TOOL-EXACT-TAIL";
+    const mediumOutput = `${"0123456789abcdef".repeat(20_000)}${mediumTail}`;
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "9".repeat(64), {
+      tools: [
+        {
+          blockId: "small-tool",
+          toolName: "Bash",
+          inputJson: { command: "printf small" },
+          output: "small exact output",
+          completed: true,
+        },
+        {
+          blockId: "medium-tool",
+          toolName: "Bash",
+          inputJson: { command: "produce-medium-output" },
+          output: mediumOutput,
+          completed: true,
+        },
+      ],
+      text: "final answer stays inline",
+    });
+    await stageAndFinalize(userId, tape);
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(timeline);
+    const messages = timeline.messages as MessageLike[];
+    const tools = messages.filter((message) => message.role === "tool");
+    assert.equal(tools.length, 2);
+    const deferred = tools.find((message) => message._payloadDeferred === true);
+    const inline = tools.find((message) => message._payloadDeferred !== true);
+    assert.ok(deferred, "the medium tool body travels as an exact lazy locator");
+    assert.ok(inline, "small tool output remains inline for immediate rendering");
+    assert.ok(Number(deferred._payloadBytes ?? 0) > 128 * 1024);
+    assert.ok(Number(deferred._payloadBytes ?? 0) < 1024 * 1024);
+    assert.equal(JSON.stringify(timeline).includes(mediumTail), false);
+    assert.equal(
+      messages.some((message) =>
+        message.role === "assistant" &&
+        message.text === "final answer stays inline" &&
+        message._payloadDeferred !== true),
+      true,
+    );
+
+    const decoded = await readDeferredRecord(
+      sessionId,
+      userId,
+      tape.finalize.tapeId,
+      deferred,
+    );
+    assert.equal(decoded.text, mediumOutput);
+  });
+
   maybe("timeline GET returns many sub-quantum final answers exactly without substitution", async () => {
     const sessionId = "s-direct-many-large-finals";
     const userId = "u-direct-many-large-finals";

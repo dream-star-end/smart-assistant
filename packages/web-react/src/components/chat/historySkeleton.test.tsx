@@ -12,6 +12,7 @@ function base(over: Partial<Parameters<typeof shouldShowHistorySkeleton>[0]> = {
     gated: false,
     cachedCount: 0,
     sending: false,
+    loading: false,
     knownMessageCount: 0,
     metaKnown: false,
     graceExpired: false,
@@ -37,6 +38,19 @@ describe("shouldShowHistorySkeleton（冷会话骨架判定）", () => {
 
   test("有 in-flight turn(sending) → 走 typing 指示，不显示骨架", () => {
     expect(shouldShowHistorySkeleton(base({ sending: true }))).toBe(false);
+  });
+
+  test("canonical history 仍在途 → 即使固定 cap 已过也继续显示骨架", () => {
+    expect(
+      shouldShowHistorySkeleton(base({
+        loading: true,
+        knownMessageCount: 6,
+        metaKnown: true,
+        capExpired: true,
+      })),
+    ).toBe(true);
+    expect(shouldShowHistorySkeleton(base({ loading: true, cachedCount: 1 }))).toBe(false);
+    expect(shouldShowHistorySkeleton(base({ loading: true, sending: true }))).toBe(false);
   });
 
   test("确知有历史(messageCount>0) → 无缓存时显示，直到内容到达/安全兜底", () => {

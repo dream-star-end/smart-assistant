@@ -126,6 +126,8 @@ export type UseSessionList = {
   reset: () => void;
   /** listSessions 已落定（成功或失败）：URL 深链恢复据此判定"会话确实不存在"。 */
   serverListSettled: boolean;
+  /** 当前活动会话的 canonical history 请求仍在途。用于避免慢响应期间误显空会话。 */
+  historyLoading: boolean;
 };
 
 /**
@@ -153,7 +155,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   //  - historyFetchedAtRef：上次拉取时刻，HISTORY_REFETCH_COOLDOWN_MS 内不重拉。
   // 冷却过后允许重拉：sinceSeq 增量 + server-wins 合并幂等、重拉无副作用，这样切回前台/
   // 重连后重新选中会话能增量补齐（旧的永久守卫会让锁屏后再选中的会话拿不到新内容）。
-  const historyFetchingRef = useRef<Set<string>>(new Set());
+  const historyFetchingRef = useRef<Map<string, number>>(new Map());
+  const historyRequestTokenRef = useRef(0);
+  const [historyLoadingTokens, setHistoryLoadingTokens] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const historyFetchedAtRef = useRef<Map<string, number>>(new Map());
   // 登录后是否已自动选中"上次会话"（仅做一次：避免覆盖用户随后的显式新建/切换/删除）。
   const autoSelectedRef = useRef(false);
@@ -231,7 +237,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       if (historyFetchingRef.current.has(id)) return; // 并发中：不重入
       const lastAt = historyFetchedAtRef.current.get(id) ?? 0;
       if (Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
-      historyFetchingRef.current.add(id);
+      const requestToken = ++historyRequestTokenRef.current;
+      historyFetchingRef.current.set(id, requestToken);
+      setHistoryLoadingTokens((current) => {
+        const next = new Map(current);
+        next.set(id, requestToken);
+        return next;
+      });
       try {
         const sinceSeq = cbRef.current.sockRef.current?.storedMaxSeq(id) ?? 0;
         const sinceHistoryRevision = cbRef.current.sockRef.current?.storedHistoryRevision(id);
@@ -241,8 +253,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           sinceSeq,
           sinceHistoryRevision,
         );
-        // 登出/换号守卫：await 期间用户已变 → 丢弃，绝不污染当前会话/新用户 IndexedDB。
-        if (userIdRef.current !== owner) return;
+        // await 期间换号、reset 或删除会话 → 丢弃旧响应，绝不污染当前会话/IndexedDB。
+        if (
+          userIdRef.current !== owner ||
+          historyFetchingRef.current.get(id) !== requestToken
+        ) return;
         const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
         // 会话模型陈旧载荷拦截:pending 意图存续/低于已确认写水位的 detail,其 modelId
         // 不应用(消息合并照常 —— socket 有自己的版本护栏)。
@@ -282,9 +297,21 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         // 404 = 本地新建/未同步会话，无 server 历史（正常）：打冷却戳，避免每次重选都空打 404，
         // 但仍非永久（会话后续被 server 持久化后，冷却过去可正常增量拉到）。其他错误不打戳 →
         // 允许下次重选立即重试。
-        if (e instanceof ApiError && e.status === 404) historyFetchedAtRef.current.set(id, Date.now());
+        if (
+          e instanceof ApiError &&
+          e.status === 404 &&
+          historyFetchingRef.current.get(id) === requestToken
+        ) historyFetchedAtRef.current.set(id, Date.now());
       } finally {
-        historyFetchingRef.current.delete(id);
+        if (historyFetchingRef.current.get(id) === requestToken) {
+          historyFetchingRef.current.delete(id);
+        }
+        setHistoryLoadingTokens((current) => {
+          if (current.get(id) !== requestToken) return current;
+          const next = new Map(current);
+          next.delete(id);
+          return next;
+        });
       }
     },
     // modelPayloadFresh 为稳定 useCallback([]),入 deps 仅为满足 lint,不改重建时机。
@@ -410,6 +437,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     cbRef.current.onDeleteSession?.(s.id);
     historyFetchedAtRef.current.delete(s.id);
     historyFetchingRef.current.delete(s.id);
+    setHistoryLoadingTokens((current) => {
+      if (!current.has(s.id)) return current;
+      const next = new Map(current);
+      next.delete(s.id);
+      return next;
+    });
     modelSyncRef.current.delete(s.id);
     if (!demo) {
       cbRef.current.sockRef.current?.removeSession(s.id);
@@ -428,6 +461,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const reset = useCallback(() => {
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
+    setHistoryLoadingTokens(new Map());
     modelSyncRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     setSessions([]);
@@ -448,5 +482,6 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     deleteSessionConfirm,
     reset,
     serverListSettled,
+    historyLoading: activeId !== undefined && historyLoadingTokens.has(activeId),
   };
 }

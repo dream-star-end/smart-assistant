@@ -425,6 +425,7 @@ export function App() {
     deleteSessionConfirm,
     reset: resetSessionList,
     serverListSettled,
+    historyLoading,
   } = useSessionList({
     demo,
     auth,
@@ -1989,6 +1990,7 @@ export function App() {
       sending: wsSending,
       knownMessageCount: activeMeta?.messageCount ?? 0,
       metaKnown: serverListSettled && !!activeMeta,
+      loading: historyLoading,
       graceExpired: historyGraceExpired,
       capExpired: historyCapExpired,
     });
