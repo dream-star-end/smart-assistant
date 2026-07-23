@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { type Server, createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -69,7 +69,11 @@ beforeEach(() => {
   captured = []
 })
 
-function runCli(entry: string, args: string[]): Promise<RunResult> {
+function runCli(
+  entry: string,
+  args: string[],
+  envOverrides: Record<string, string | undefined> = {},
+): Promise<RunResult> {
   return new Promise((done, reject) => {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
@@ -77,6 +81,10 @@ function runCli(entry: string, args: string[]): Promise<RunResult> {
       OPENCLAUDE_V3_CONTAINER_TOKEN: TOKEN,
       NO_PROXY: '127.0.0.1,localhost',
       no_proxy: '127.0.0.1,localhost',
+    }
+    for (const [key, value] of Object.entries(envOverrides)) {
+      if (value === undefined) delete env[key]
+      else env[key] = value
     }
     for (const key of [
       'HTTP_PROXY',
@@ -113,6 +121,43 @@ function assertBearer(): void {
 }
 
 describe('research oc-* CLI public operations against a loopback master', () => {
+  test('scrubbed Codex env uses the paired container-auth file without mixing a partial env', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-research-auth-'))
+    const openclaudeHome = join(work, '.openclaude')
+    mkdirSync(openclaudeHome)
+    writeFileSync(
+      join(openclaudeHome, 'container-auth.json'),
+      JSON.stringify({ masterBaseUrl: baseUrl, containerToken: TOKEN }),
+      { mode: 0o600 },
+    )
+    try {
+      let result = await runCli('packages/gateway/src/ocLitCli.ts', ['search', 'paired-file'], {
+        OPENCLAUDE_HOME: openclaudeHome,
+        OPENCLAUDE_V3_MASTER_BASE_URL: undefined,
+        OPENCLAUDE_V3_CONTAINER_TOKEN: undefined,
+        OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: undefined,
+      })
+      assert.equal(result.code, 0, result.stderr)
+
+      // A base-only ambient channel must not be combined with the file token. The
+      // resolver falls back to the complete file pair, so this still reaches baseUrl.
+      result = await runCli('packages/gateway/src/ocLitCli.ts', ['search', 'partial-env'], {
+        OPENCLAUDE_HOME: openclaudeHome,
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:9',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: undefined,
+        OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: undefined,
+      })
+      assert.equal(result.code, 0, result.stderr)
+      assert.deepEqual(
+        captured.map((request) => request.url),
+        ['/v3/research/lit/search', '/v3/research/lit/search'],
+      )
+      assertBearer()
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
   test('oc-cite verify/format/check/fix map to exact routes and bodies', async () => {
     const work = mkdtempSync(join(tmpdir(), 'oc-cite-e2e-'))
     const manifest = join(work, 'manifest.json')

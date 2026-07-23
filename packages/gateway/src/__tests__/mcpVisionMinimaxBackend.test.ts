@@ -6,9 +6,9 @@ import { after, before, describe, it } from 'node:test'
 import { STATIC_KEY_PROVIDERS } from '@openclaude/protocol'
 import {
   LOCAL_CATALOG_HEADER,
+  type ModelCatalogClient,
   ModelCatalogUnavailableError,
   _setModelCatalogClientForTests,
-  type ModelCatalogClient,
 } from '../modelCatalogClient.js'
 
 const home = mkdtempSync(join(tmpdir(), 'oc-vision-mm-'))
@@ -191,6 +191,51 @@ describe('runMinimaxVision', () => {
     assert.equal(content[0].source.media_type, 'image/png')
     assert.ok(typeof content[0].source.data === 'string' && content[0].source.data.length > 0)
     assert.equal(content[1].type, 'text')
+  })
+
+  it('scrubbed Codex shell uses paired container-auth.json for proxy URL and bearer', async () => {
+    const p = join(uploads, 'paired.png')
+    writeFileSync(p, PNG)
+    const authHome = join(home, 'paired-auth')
+    mkdirSync(authHome, { recursive: true })
+    writeFileSync(
+      join(authHome, 'container-auth.json'),
+      JSON.stringify({
+        masterBaseUrl: 'http://paired.internal:18791',
+        containerToken: 'oc-v5.paired',
+      }),
+      { mode: 0o600 },
+    )
+    let seenUrl = ''
+    let seenAuthorization = ''
+    await withEnv(
+      {
+        OPENCLAUDE_HOME: authHome,
+        ANTHROPIC_BASE_URL: undefined,
+        OPENCLAUDE_V3_MASTER_BASE_URL: undefined,
+        OPENCLAUDE_V3_CONTAINER_TOKEN: undefined,
+        OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: undefined,
+      },
+      async () => {
+        const orig = globalThis.fetch
+        globalThis.fetch = (async (url: unknown, init: RequestInit) => {
+          seenUrl = String(url)
+          seenAuthorization = String((init.headers as Record<string, string>).authorization)
+          return new Response(
+            'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}\n\ndata: [DONE]\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        }) as typeof fetch
+        try {
+          const input = vision.resolveVisionInput({ image_file: p })
+          assert.equal(await vision.runMinimaxVisionForTest(input), 'ok')
+        } finally {
+          globalThis.fetch = orig
+        }
+      },
+    )
+    assert.equal(seenUrl, 'http://paired.internal:18791/v1/messages')
+    assert.equal(seenAuthorization, 'Bearer oc-v5.paired')
   })
 
   it('上游非 2xx → 抛错(不 fallback)', async () => {

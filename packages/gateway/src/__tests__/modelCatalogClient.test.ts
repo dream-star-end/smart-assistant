@@ -14,7 +14,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
@@ -76,7 +76,9 @@ function fakeFetcher(opts: {
 }) {
   // biome-ignore lint/suspicious/noExplicitAny: 测试桩
   return (async (url: string): Promise<any> => {
-    const path = url.includes(MODEL_CATALOG_EPOCH_PATH) ? MODEL_CATALOG_EPOCH_PATH : MODEL_CATALOG_PATH
+    const path = url.includes(MODEL_CATALOG_EPOCH_PATH)
+      ? MODEL_CATALOG_EPOCH_PATH
+      : MODEL_CATALOG_PATH
     opts.calls?.push({ path })
     const spec = path === MODEL_CATALOG_EPOCH_PATH ? opts.epoch : opts.catalog
     if (spec === 'network-error' || spec === undefined) {
@@ -102,6 +104,48 @@ function tmpLkg(): { path: string; cleanup: () => void } {
 }
 
 describe('modelCatalogClient — 新鲜快照', () => {
+  test('scrubbed env resolves one paired container-auth file for catalog URL and bearer', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'oc-catalog-auth-'))
+    const openclaudeHome = join(work, '.openclaude')
+    mkdirSync(openclaudeHome)
+    writeFileSync(
+      join(openclaudeHome, 'container-auth.json'),
+      JSON.stringify({
+        masterBaseUrl: 'http://paired.invalid:18791',
+        containerToken: 'oc-v5.paired',
+      }),
+      { mode: 0o600 },
+    )
+    let seenUrl = ''
+    let seenAuthorization = ''
+    const client = new ModelCatalogClient({
+      env: {
+        OPENCLAUDE_HOME: openclaudeHome,
+        // Partial direct credentials must never mix with the file token.
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'http://partial.invalid:9',
+      },
+      lkgPath: join(work, 'lkg.json'),
+      fetcher: (async (url: string, init: { headers?: { authorization?: string } }) => {
+        seenUrl = url
+        seenAuthorization = init.headers?.authorization ?? ''
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(CATALOG_BODY))
+          })(),
+        }
+      }) as any,
+    })
+    try {
+      assert.equal(client.configured, true)
+      await client.getView()
+      assert.equal(seenUrl, `http://paired.invalid:18791${MODEL_CATALOG_PATH}`)
+      assert.equal(seenAuthorization, 'Bearer oc-v5.paired')
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
   test('首次拉取成功 → view 可用;TTL 内二次调用不再打网络', async () => {
     const calls: Call[] = []
     const lkg = tmpLkg()
@@ -224,7 +268,10 @@ describe('modelCatalogClient — LKG + epoch 协议', () => {
     const client = new ModelCatalogClient({
       env: ENV,
       lkgPath: lkg.path,
-      fetcher: fakeFetcher({ epoch: 'network-error', catalog: { status: 200, body: CATALOG_BODY } }),
+      fetcher: fakeFetcher({
+        epoch: 'network-error',
+        catalog: { status: 200, body: CATALOG_BODY },
+      }),
     })
     await assert.rejects(() => client.getView(), ModelCatalogUnavailableError)
     lkg.cleanup()
@@ -310,7 +357,10 @@ describe('modelCatalogClient — fail-closed(无 baked 回落)', () => {
       env: ENV,
       lkgPath: lkg.path,
       fetcher: fakeFetcher({
-        catalog: { status: 200, body: { models: [{ model_id: 'x' }], projection_revision: 'r', security_epoch: '1' } },
+        catalog: {
+          status: 200,
+          body: { models: [{ model_id: 'x' }], projection_revision: 'r', security_epoch: '1' },
+        },
       }),
     })
     await assert.rejects(() => client.getView(), ModelCatalogUnavailableError)

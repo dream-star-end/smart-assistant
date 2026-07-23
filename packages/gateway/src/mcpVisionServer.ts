@@ -34,6 +34,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { DEFAULT_CODEX_ENGINE_MODEL, findRouteProviderForModel } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 import { LOCAL_CATALOG_HEADER, getLocalCatalogToken } from './modelCatalogClient.js'
+import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
 
 const TOOL_NAME = 'understand_image'
 const DEFAULT_MODEL = DEFAULT_CODEX_ENGINE_MODEL
@@ -62,7 +63,9 @@ const DEFAULT_MINIMAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 const MINIMAX_MAX_IMAGE_HARD_CAP = 6 * 1024 * 1024
 
 function visionBackend(): 'minimax' | 'codex' {
-  return process.env.OPENCLAUDE_VISION_BACKEND?.trim().toLowerCase() === 'codex' ? 'codex' : 'minimax'
+  return process.env.OPENCLAUDE_VISION_BACKEND?.trim().toLowerCase() === 'codex'
+    ? 'codex'
+    : 'minimax'
 }
 
 export const OPENCLAUDE_VISION_MCP_ID = 'openclaude-vision'
@@ -353,11 +356,12 @@ type RefreshConfig = {
 
 function commercialRefreshConfig(): RefreshConfig | null {
   if (process.env.OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED === '1') return null
-  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
-  const token =
-    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim() ||
-    readContainerTokenFromFile(process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE)
-  if (!base || !token) return null
+  let endpoint: { masterBaseUrl: string; containerToken: string }
+  try {
+    endpoint = resolveConnectorEndpoint(process.env)
+  } catch {
+    return null
+  }
   const timeoutMs = parseBoundedInt(
     process.env.OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS,
     DEFAULT_REFRESH_TIMEOUT_MS,
@@ -365,20 +369,9 @@ function commercialRefreshConfig(): RefreshConfig | null {
     MAX_REFRESH_TIMEOUT_MS,
   )
   return {
-    url: `${base.replace(/\/+$/, '')}${CODEX_TOKEN_REFRESH_PATH}`,
-    token,
+    url: `${endpoint.masterBaseUrl}${CODEX_TOKEN_REFRESH_PATH}`,
+    token: endpoint.containerToken,
     timeoutMs,
-  }
-}
-
-function readContainerTokenFromFile(file: string | undefined): string | undefined {
-  const p = file?.trim()
-  if (!p) return undefined
-  try {
-    const token = readFileSync(p, 'utf8').trim()
-    return token || undefined
-  } catch {
-    return undefined
   }
 }
 
@@ -728,21 +721,6 @@ function mediaTypeForExtension(ext: RasterImageExtension): string {
   }
 }
 
-// 读容器身份 bearer(oc-v3.<id>.<secret>)。**优先 token file**(避免 raw token 出现在 Codex MCP
-// env argv —— 见 codexLaunchOverrides 的 v3-container-token 文件机制),回退 raw env。
-// 与 ANTHROPIC_AUTH_TOKEN 同值(v3supervisor 注入);minimax 上游 key 始终留 master,不进容器。
-function readContainerBearer(): string | undefined {
-  const file = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE?.trim()
-  if (file) {
-    try {
-      const t = readFileSync(file, 'utf8').trim()
-      if (t) return t
-    } catch {}
-  }
-  const raw = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
-  return raw || undefined
-}
-
 // 解析 Anthropic SSE(master proxy 强制 stream:true,返回 text/event-stream),拼接 text_delta。
 // 只取 content_block_delta 的 text_delta(忽略 MiniMax-M3 的 thinking_delta);**见到 error 事件一律抛**(不返回 partial)。
 async function readAnthropicSseText(resp: Response): Promise<string> {
@@ -808,10 +786,24 @@ async function readAnthropicSseText(resp: Response): Promise<string> {
 async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
   const release = acquireVisionLock(input.timeoutMs)
   try {
-    const baseUrl = process.env.ANTHROPIC_BASE_URL?.trim()
-    if (!baseUrl) throw new Error('minimax vision backend unavailable: ANTHROPIC_BASE_URL unset')
-    const bearer = readContainerBearer()
-    if (!bearer) throw new Error('minimax vision backend unavailable: container token unset')
+    let endpoint: { masterBaseUrl: string; containerToken: string }
+    try {
+      const endpointEnv: NodeJS.ProcessEnv = {
+        ...process.env,
+        // Supervisor injects both values with the same internal proxy base. CCB keeps
+        // ANTHROPIC_BASE_URL; scrubbed Codex shells fall back to container-auth.json.
+        OPENCLAUDE_V3_MASTER_BASE_URL:
+          process.env.ANTHROPIC_BASE_URL ?? process.env.OPENCLAUDE_V3_MASTER_BASE_URL,
+      }
+      // Preserve the vision MCP's existing token-file priority: Codex injection puts
+      // the safe file path in env and must not accidentally select a stale raw token.
+      if (process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE?.trim()) {
+        endpointEnv.OPENCLAUDE_V3_CONTAINER_TOKEN = undefined
+      }
+      endpoint = resolveConnectorEndpoint(endpointEnv)
+    } catch {
+      throw new Error('minimax vision backend unavailable: container endpoint unavailable')
+    }
     // 模型权威批次(0143/0144)enforce 后,anthropic proxy 的 /v1/messages 要求
     // bridge authority 或 `x-oc-local-catalog` 二选一。vision 调用不属于任何 bridge
     // turn(容器内工具自发起),与 cron/synthetic/delegate 同为**本地路径** —— 走同一
@@ -858,7 +850,7 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
         },
       ],
     }
-    const url = `${baseUrl.replace(/\/+$/, '')}/v1/messages`
+    const url = `${endpoint.masterBaseUrl}/v1/messages`
     // **timer 覆盖 fetch + SSE body 读取全程**(不是只到响应头):reader.read() 若卡住,
     // controller.abort() 会中断它,避免无限挂住 MCP tool 和 acquireVisionLock(Codex diff review #1)。
     const controller = new AbortController()
@@ -868,7 +860,7 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          authorization: `Bearer ${bearer}`,
+          authorization: `Bearer ${endpoint.containerToken}`,
           'anthropic-version': '2023-06-01',
           [LOCAL_CATALOG_HEADER]: catalogToken,
         },

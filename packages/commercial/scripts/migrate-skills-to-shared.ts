@@ -35,7 +35,18 @@
 
 import { randomUUID } from 'node:crypto'
 import { type Dirent, existsSync, lstatSync } from 'node:fs'
-import { cp, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import {
+  cp,
+  lchown,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { dirname, join, sep } from 'node:path'
 import {
   MAX_SKILL_NAME_LENGTH,
@@ -62,6 +73,46 @@ interface PlanItem {
 interface Ledger {
   version: 1
   processed: Record<string, { action: string; target?: string; ts: string }>
+}
+
+async function homeOwner(home: string): Promise<{ uid: number; gid: number }> {
+  const owner = await stat(home)
+  return { uid: owner.uid, gid: owner.gid }
+}
+
+/** Root-run migration must publish user-writable files without following symlinks. */
+async function alignOwnershipWithHome(home: string, target: string): Promise<void> {
+  if (typeof process.getuid !== 'function' || process.getuid() !== 0) return
+  const owner = await homeOwner(home)
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const child = join(dir, entry.name)
+      if (entry.isDirectory()) await walk(child)
+      await lchown(child, owner.uid, owner.gid)
+    }
+  }
+  const targetStat = lstatSync(target)
+  if (targetStat.isDirectory() && !targetStat.isSymbolicLink()) await walk(target)
+  await lchown(target, owner.uid, owner.gid)
+}
+
+async function assertSharedRootSafe(home: string, root: string): Promise<void> {
+  const rootStat = lstatSync(root)
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`shared skills root is not a real directory: ${root}`)
+  }
+  const [realRoot, realHome] = await Promise.all([realpath(root), realpath(home)])
+  if (realRoot !== realHome && !realRoot.startsWith(realHome + sep)) {
+    throw new Error(`shared skills root escapes home: ${realRoot}`)
+  }
+}
+
+async function ensureSharedRoot(home: string): Promise<string> {
+  const root = join(home, 'skills')
+  await mkdir(root, { recursive: true })
+  await assertSharedRootSafe(home, root)
+  await alignOwnershipWithHome(home, root)
+  return root
 }
 
 function parseArgs(argv: string[]): { home: string; apply: boolean } {
@@ -330,11 +381,12 @@ async function hasSymlinkInside(dir: string): Promise<boolean> {
 
 /** Atomically persist the ledger (temp + rename) so reruns are crash-safe. */
 async function writeLedger(home: string, ledger: Ledger): Promise<void> {
-  const dir = join(home, 'skills')
-  await mkdir(dir, { recursive: true })
+  const dir = await ensureSharedRoot(home)
   const tmp = join(dir, `.skill-migration-ledger.json.tmp-${randomUUID()}`)
   await writeFile(tmp, JSON.stringify(ledger, null, 2))
-  await rename(tmp, join(dir, '.skill-migration-ledger.json'))
+  const ledgerPath = join(dir, '.skill-migration-ledger.json')
+  await rename(tmp, ledgerPath)
+  await alignOwnershipWithHome(home, ledgerPath)
 }
 
 async function migrateOne(home: string, it: PlanItem): Promise<void> {
@@ -343,8 +395,7 @@ async function migrateOne(home: string, it: PlanItem): Promise<void> {
   if (await hasSymlinkInside(it.srcDir)) {
     throw new Error('skill dir contains a symlink; refusing to migrate')
   }
-  const sharedRoot = join(home, 'skills')
-  await mkdir(sharedRoot, { recursive: true })
+  const sharedRoot = await ensureSharedRoot(home)
   const realShared = await realpath(sharedRoot)
   const dest = join(sharedRoot, it.target as string)
   if (existsSync(dest)) throw new Error(`dest already exists: ${dest}`)
@@ -362,6 +413,7 @@ async function migrateOne(home: string, it: PlanItem): Promise<void> {
       const newMeta = { ...meta, name: it.target as string }
       await writeFile(md, `${formatFrontmatter(newMeta as any)}\n\n${body.trim()}\n`)
     }
+    await alignOwnershipWithHome(home, tmpDest)
     const realTmp = await realpath(tmpDest)
     if (!realTmp.startsWith(realShared + sep)) throw new Error('temp dir escapes shared root')
     await rename(tmpDest, dest)
@@ -401,6 +453,13 @@ function clampName(name: string): string {
 async function main(): Promise<void> {
   const { home, apply } = parseArgs(process.argv)
   console.log(`[migrate-skills] home=${home} mode=${apply ? 'APPLY' : 'dry-run'}`)
+
+  // Validate before buildPlan/ledger reads:an existing shared-root symlink must not
+  // let this host-root utility read or write outside the user's volume. Dry-run
+  // remains write-free when the shared root does not exist.
+  const sharedRoot = join(home, 'skills')
+  if (apply) await ensureSharedRoot(home)
+  else if (existsSync(sharedRoot)) await assertSharedRootSafe(home, sharedRoot)
 
   const agentsDir = join(home, 'agents')
   if (existsSync(agentsDir)) {
