@@ -53,6 +53,28 @@ describe('bridge API allowlist', () => {
       null,
     )
     assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/auto-dream-optimizer', 'GET')?.label,
+      '/api/agents/:id/auto-dream-optimizer',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/auto-dream-optimizer', 'POST')?.label,
+      '/api/agents/:id/auto-dream-optimizer',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/auto-dream-optimizer/cancel', 'POST')
+        ?.label,
+      '/api/agents/:id/auto-dream-optimizer/cancel',
+    )
+    for (const action of ['apply', 'dismiss'] as const) {
+      assert.equal(
+        matchCommercialContainerApiProxy(
+          `/api/agents/main/auto-dream-optimizer/proposals/${'a'.repeat(32)}/${action}`,
+          'POST',
+        )?.label,
+        '/api/agents/:id/auto-dream-optimizer/proposals/:proposalId/:action',
+      )
+    }
+    assert.equal(
       matchCommercialContainerApiProxy('/api/agents/main/skills/foo', 'DELETE')?.label,
       '/api/agents/:id/skills/:name',
     )
@@ -178,6 +200,25 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/agents/main/auto-dream-report/extra', 'GET'),
       null,
     )
+    for (const path of [
+      '/api/agents/main/auto-dream-optimizer/cancel',
+      `/api/agents/main/auto-dream-optimizer/proposals/${'a'.repeat(32)}/apply`,
+    ]) {
+      assert.equal(matchCommercialContainerApiProxy(path, 'GET'), null)
+    }
+    for (const path of [
+      '/api/agents/main./auto-dream-optimizer',
+      '/api/agents/ma%2Fin/auto-dream-optimizer',
+      '/api/agents/ma%5Cin/auto-dream-optimizer',
+      '/api/agents//auto-dream-optimizer',
+      '/api/agents/main/extra/auto-dream-optimizer',
+      `/api/agents/main/auto-dream-optimizer/proposals/${'a'.repeat(31)}/apply`,
+      `/api/agents/main/auto-dream-optimizer/proposals/${'A'.repeat(32)}/apply`,
+      `/api/agents/main/auto-dream-optimizer/proposals/${'a'.repeat(32)}/approve`,
+      `/api/agents/main/auto-dream-optimizer/proposals/${'a'.repeat(32)}/apply/extra`,
+    ]) {
+      assert.equal(matchCommercialContainerApiProxy(path, 'POST'), null, path)
+    }
     assert.equal(matchCommercialContainerApiProxy('/api/agent-teams/dev_team/run', 'POST'), null)
     // finalize 不代理（只容器内 leader MCP 调；用户请求由 commercial block 表 403）。
     assert.equal(matchCommercialContainerApiProxy('/api/team-runs/trun-abc/finalize', 'POST'), null)

@@ -203,6 +203,18 @@ describe("BLOCKED_FOR_USER_RULES — user role → 403", () => {
     { path: "/api/agents/main/memory/files/some-fact.md", method: "GET" },
     { path: "/api/agents/main/memory/files/some-fact.md", method: "PUT" },
     { path: "/api/agents/main/memory/files/some-fact.md", method: "DELETE" },
+    // Auto-Dream Optimizer 正常走 container proxy；缺少 proxy deps 时不能落到 host singleton
+    { path: "/api/agents/main/auto-dream-optimizer", method: "GET" },
+    { path: "/api/agents/main/auto-dream-optimizer", method: "POST" },
+    { path: "/api/agents/main/auto-dream-optimizer/cancel", method: "POST" },
+    {
+      path: `/api/agents/main/auto-dream-optimizer/proposals/${"a".repeat(32)}/apply`,
+      method: "POST",
+    },
+    {
+      path: `/api/agents/main/auto-dream-optimizer/proposals/${"a".repeat(32)}/dismiss`,
+      method: "POST",
+    },
     { path: "/api/agents/main/skills", method: "GET" },
     { path: "/api/agents/main/skills", method: "POST" },
     { path: "/api/agents/main/skills/my-skill", method: "GET" },

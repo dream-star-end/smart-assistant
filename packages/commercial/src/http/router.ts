@@ -406,6 +406,20 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
     re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|files\/[^/]+)$/,
     label: '/api/agents/:id/memory/*',
   },
+  // Auto-Dream Optimizer 读写用户容器内的审计/建议状态并可应用已确认的变更。
+  // 正常请求先由 containerApiProxy 转发；这里全方法拦截仅作 host singleton 兜底。
+  {
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/auto-dream-optimizer$/,
+    label: '/api/agents/:id/auto-dream-optimizer',
+  },
+  {
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/auto-dream-optimizer\/cancel$/,
+    label: '/api/agents/:id/auto-dream-optimizer/cancel',
+  },
+  {
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/auto-dream-optimizer\/proposals\/[0-9a-f]{32}\/(apply|dismiss)$/,
+    label: '/api/agents/:id/auto-dream-optimizer/proposals/:proposalId/:action',
+  },
   { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/agents/:id/skills' },
   // 用户级共享技能库(host singleton 存储);付费用户只能经 container proxy 操作自己容器
   { re: /^\/api\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/skills' },
