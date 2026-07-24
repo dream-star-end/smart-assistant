@@ -151,7 +151,7 @@ export function OptimizationPanel({
     <div className="flex flex-col">
       <PanelHeader
         title="全面优化"
-        hint="GPT‑5.6 Terra 结合平台能力与技能，审计会话、操作和日志；所有用户内容修改都先征求确认。"
+        hint="DeepSeek V4 Flash 结合平台能力与技能，审计会话、操作和日志；所有用户内容修改都先征求确认。"
         action={
           agents.length > 1 ? (
             <select

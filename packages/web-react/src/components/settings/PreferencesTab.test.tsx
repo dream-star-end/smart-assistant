@@ -54,7 +54,7 @@ describe("PreferencesTab · Auto-Dream", () => {
     expect(apiKeysSection).toHaveBeenCalledTimes(1);
   });
 
-  test("显示 Terra 全面审计范围，并提供优化建议入口", async () => {
+  test("显示 DeepSeek 全面审计范围，并提供优化建议入口", async () => {
     vi.spyOn(api, "getPublicModels").mockResolvedValue([]);
     const openMemory = vi.fn();
 
@@ -86,8 +86,8 @@ describe("PreferencesTab · Auto-Dream", () => {
       />,
     );
 
-    expect(screen.getByText(/GPT‑5.6 Terra 结合平台功能与技能/)).toBeInTheDocument();
-    expect(screen.queryByText(/DeepSeek V4 Flash|deepseek-v4-flash/)).not.toBeInTheDocument();
+    expect(screen.getByText(/DeepSeek V4 Flash 结合平台功能与技能/)).toBeInTheDocument();
+    expect(screen.queryByText(/deepseek-v4-flash/)).not.toBeInTheDocument();
     expect(screen.getByText(/所有用户内容和功能设置修改都先展示差异/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "查看优化建议" }));

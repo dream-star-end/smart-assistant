@@ -67,7 +67,8 @@
     "0185_authority_turn_dispatches",
     "0186_ark_k3_public",
     "0187_qq_bot_channel",
-    "0188_auto_dream_optimizer"
+    "0188_auto_dream_optimizer",
+    "0189_auto_dream_deepseek_v4_flash"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -202,7 +202,7 @@ export function PreferencesTab({
                 </span>
               </div>
               <p className="mt-1 text-[12.5px] leading-relaxed text-muted">
-                GPT‑5.6 Terra 结合平台功能与技能，全面审计会话、操作和日志，给出记忆、设置、技能、规则、Agent、插件与定时任务优化建议。
+                DeepSeek V4 Flash 结合平台功能与技能，全面审计会话、操作和日志，给出记忆、设置、技能、规则、Agent、插件与定时任务优化建议。
               </p>
             </div>
             {autoDream?.enabled || (autoDream?.eligible && autoDream.available) ? (
@@ -300,7 +300,7 @@ export function PreferencesTab({
       >
         <div className="space-y-3 text-[13px] leading-relaxed text-muted">
           <p>
-            开启后，GPT‑5.6 Terra 会在独立、无工具、无网络的隔离环境中读取你在 V5 内保留的相关会话、操作日志、用量，以及当前记忆、技能、规则、Agent、插件和定时任务配置。
+            开启后，DeepSeek V4 Flash 会在独立、无工具、无网络的隔离环境中读取你在 V5 内保留的相关会话、操作日志、用量，以及当前记忆、技能、规则、Agent、插件和定时任务配置。
           </p>
           <div className="rounded-xl border border-border bg-surface p-3">
             <p className="font-medium text-fg">你始终拥有最终决定权</p>
