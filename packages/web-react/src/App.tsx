@@ -75,7 +75,11 @@ import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
-import { exactUserReplayPayload, preciseRetryEligible } from "./lib/chat/socket";
+import {
+  exactUserReplayPayload,
+  interruptedContinuationTarget,
+  preciseRetryEligible,
+} from "./lib/chat/socket";
 import {
   findRewriteTarget,
   findStopTarget,
@@ -1542,6 +1546,27 @@ export function App() {
     [demo, activeId],
   );
 
+  const resolveInterruptedContinuation = useCallback(
+    (error: ChatMessage): ChatMessage | undefined => {
+      if (demo || !activeId) return undefined;
+      const msgs = sockRef.current?.getMessages(activeId) ?? [];
+      return interruptedContinuationTarget(msgs, error, activeId)?.user;
+    },
+    [demo, activeId],
+  );
+
+  const continueInterrupted = useCallback(
+    (error: ChatMessage) => {
+      if (demo || !activeId) return;
+      sockRef.current?.continueInterruptedTurn({
+        sessId: activeId,
+        errorMessageId: error.id,
+        agentId: agent.id,
+      });
+    },
+    [demo, activeId, agent.id],
+  );
+
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
   // True tape process paging + oversized-record loading. Hook methods are stable;
   // demo/readonly surfaces leave the cursor disabled rather than inventing content.
@@ -1558,6 +1583,8 @@ export function App() {
       onTopUp: demo ? undefined : () => openSettings(),
       onFeedback,
       onRetrySend: demo ? undefined : retrySend,
+      onContinueInterrupted: demo ? undefined : continueInterrupted,
+      resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
       onQuote: demo || !activeId
         ? undefined
         : (message) => {
@@ -1600,6 +1627,8 @@ export function App() {
       openSettings,
       onFeedback,
       retrySend,
+      continueInterrupted,
+      resolveInterruptedContinuation,
       activeId,
       fetchTapeRecordPayload,
       peekTapeRecordPayload,

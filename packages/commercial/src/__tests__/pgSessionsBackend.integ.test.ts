@@ -25,6 +25,7 @@ import {
   formatMessageReplyPrompt,
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_VERSION,
+  turnRecoveryIdentity,
 } from "@openclaude/protocol";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -3943,6 +3944,430 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       ...over,
     };
   }
+
+  async function seedRecoverableSource(args: {
+    sessionId: string;
+    sourceClientMessageId: string;
+    automaticRecovery?: boolean;
+    record?: MessageLike;
+    tapeStatus?: "completed" | "crashed" | "interrupted";
+  }): Promise<void> {
+    const tapeId = sha256(`recoverable-tape\0${args.sessionId}\0${args.sourceClientMessageId}`);
+    const turnKey = sha256(`recoverable-turn\0${args.sessionId}\0${args.sourceClientMessageId}`);
+    await backend.upsertClientSession(mkSession({
+      id: args.sessionId,
+      userId: CUSER,
+      messages: [
+        {
+          id: args.sourceClientMessageId,
+          role: "user",
+          text: "source",
+          ts: 1,
+          _routing: { model: "gpt-5.6-sol", effortLevel: null, teamMode: false },
+          ...(args.automaticRecovery ? { _automaticRecovery: true } : {}),
+        },
+      ] as MessageLike[],
+    }));
+    await backend.appendServerAuthoredMessage(args.sessionId, CUSER, {
+      id: `err-${args.sourceClientMessageId}`,
+      role: "assistant",
+      text: "temporary upstream failure",
+      ts: 2,
+      _turnTapeId: tapeId,
+      _clientMessageId: args.sourceClientMessageId,
+      _errorCode: "upstream_failed",
+    });
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,client_message_id)
+       VALUES ($1,$2,$3,'main',1,$4,$5,$6,1,1,1,1,$7)`,
+      [
+        args.sessionId,
+        CUSER,
+        tapeId,
+        args.tapeStatus ?? "crashed",
+        turnKey,
+        sha256(tapeId),
+        args.sourceClientMessageId,
+      ],
+    );
+    const record = args.record ?? {
+      id: `thinking-${args.sourceClientMessageId}`,
+      role: "thinking",
+      text: "durable process",
+      ts: 2,
+      _clientMessageId: args.sourceClientMessageId,
+    };
+    const payload = Buffer.from(JSON.stringify(record), "utf8");
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+       VALUES ($1,$2,$3,$4,0,$5,$6,$7,$8)`,
+      [
+        args.sessionId,
+        CUSER,
+        tapeId,
+        record.id,
+        record.role,
+        record.ts,
+        sha256(payload),
+        payload,
+      ],
+    );
+  }
+
+  maybe("recovery admission atomically persists lineage and fences a second automatic hop", async () => {
+    const sessionId = "s-dd-recovery";
+    const sourceClientMessageId = "cm-dd-recovery-source";
+    await seedRecoverableSource({ sessionId, sourceClientMessageId });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "automatic checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+    const replayedAfterAckLoss = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-replay-${identity.clientMessageId}`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "automatic checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+      },
+    }));
+    assert.ok(
+      replayedAfterAckLoss.kind === "already_owned" ||
+      replayedAfterAckLoss.kind === "in_flight",
+      `recovery ACK-loss replay must retain the existing dispatch, got ${replayedAfterAckLoss.kind}`,
+    );
+    const stored = await backend.getClientSession(sessionId, CUSER);
+    const recoveryRow = (stored?.messages as MessageLike[] | undefined)?.find(
+      (message) => message.id === identity.clientMessageId,
+    );
+    assert.equal(recoveryRow?._recoveryOfClientMessageId, sourceClientMessageId);
+    assert.equal(recoveryRow?._recoveryMode, "checkpoint");
+    assert.equal(recoveryRow?._automaticRecovery, true);
+
+    await casToTerminal(pool, {
+      dispatchId: (recovered as { dispatch: { dispatchId: string } }).dispatch.dispatchId,
+      outcome: "executed_error",
+      failureCode: "upstream_failed",
+      clientNotified: true,
+    });
+    await backend.appendServerAuthoredMessage(sessionId, CUSER, {
+      id: `err-${identity.clientMessageId}`,
+      role: "assistant",
+      text: "temporary upstream failure",
+      ts: 4,
+      _source: "server",
+      _clientMessageId: identity.clientMessageId,
+      _errorCode: "upstream_failed",
+    });
+    const secondTapeId = sha256(`recoverable-tape\0${sessionId}\0${identity.clientMessageId}`);
+    await pool.query(
+      `INSERT INTO client_session_turn_tapes
+         (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
+          total_bytes,part_count,created_at,finalized_at,client_message_id)
+       VALUES ($1,$2,$3,'main',2,'crashed',$4,$5,1,1,1,1,$6)`,
+      [
+        sessionId,
+        CUSER,
+        secondTapeId,
+        sha256(`recoverable-turn\0${sessionId}\0${identity.clientMessageId}`),
+        sha256(secondTapeId),
+        identity.clientMessageId,
+      ],
+    );
+    const secondIdentity = turnRecoveryIdentity(sessionId, identity.clientMessageId);
+    const second = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: secondIdentity.clientMessageId,
+      billingRequestId: `brq-${secondIdentity.clientMessageId}`,
+      message: {
+        id: secondIdentity.clientMessageId,
+        role: "user",
+        text: "must not run",
+        ts: 5,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId: identity.clientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+      },
+    }));
+    assert.deepEqual(second, {
+      kind: "recovery_conflict",
+      reason: "automatic_hop_exhausted",
+    });
+  });
+
+  maybe("newer ordinary user and recovery serialize under one session-row lock", async () => {
+    const sessionId = "s-dd-recovery-race";
+    const sourceClientMessageId = "cm-dd-recovery-race-source";
+    await seedRecoverableSource({ sessionId, sourceClientMessageId });
+    const recoveryIdentity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const [ordinary, recovery] = await Promise.all([
+      backend.admitUserTurn(admitInput({
+        sessionId,
+        clientMessageId: "cm-dd-recovery-race-newer",
+        billingRequestId: "brq-cm-dd-recovery-race-newer",
+        message: {
+          id: "cm-dd-recovery-race-newer",
+          role: "user",
+          text: "new user intent",
+          ts: 4,
+        } as MessageLike & { id: string },
+      })),
+      backend.admitUserTurn(admitInput({
+        sessionId,
+        clientMessageId: recoveryIdentity.clientMessageId,
+        billingRequestId: `brq-${recoveryIdentity.clientMessageId}`,
+        message: {
+          id: recoveryIdentity.clientMessageId,
+          role: "user",
+          text: "automatic checkpoint",
+          ts: 3,
+        } as MessageLike & { id: string },
+        recovery: {
+          sourceClientMessageId,
+          mode: "checkpoint",
+          automatic: true,
+        },
+      })),
+    ]);
+    assert.equal(ordinary.kind, "admitted");
+    assert.ok(
+      recovery.kind === "admitted" || recovery.kind === "recovery_conflict",
+      `unexpected recovery outcome: ${recovery.kind}`,
+    );
+    const stored = await backend.getClientSession(sessionId, CUSER);
+    const userIds = (stored!.messages as MessageLike[])
+      .filter((message) => message.role === "user")
+      .map((message) => message.id);
+    assert.deepEqual(
+      userIds,
+      recovery.kind === "admitted"
+        ? [sourceClientMessageId, recoveryIdentity.clientMessageId, "cm-dd-recovery-race-newer"]
+        : [sourceClientMessageId, "cm-dd-recovery-race-newer"],
+    );
+  });
+
+  maybe("automatic recovery revalidates authoritative tape actions and leaves unsafe checkpoints manual", async () => {
+    const cases: Array<{ suffix: string; record: MessageLike }> = [
+      {
+        suffix: "incomplete-tool",
+        record: {
+          id: "tool-incomplete",
+          role: "tool",
+          text: "",
+          ts: 2,
+          _completed: false,
+        },
+      },
+      {
+        suffix: "unknown-outcome",
+        record: {
+          id: "tool-unknown",
+          role: "tool",
+          text: "",
+          ts: 2,
+          _completed: true,
+          outputJson: { outcome: "unknown" },
+        },
+      },
+      {
+        suffix: "permission",
+        record: {
+          id: "permission-pending",
+          role: "permission",
+          text: "",
+          ts: 2,
+          _resolved: false,
+        },
+      },
+      {
+        suffix: "runtime-incomplete",
+        record: {
+          id: "runtime-incomplete",
+          role: "runtime-event",
+          text: "",
+          ts: 2,
+          _runtimeEvent: { type: "tool_progress", outcome: "incomplete" },
+        },
+      },
+    ];
+    for (const testCase of cases) {
+      const sessionId = `s-dd-recovery-unsafe-${testCase.suffix}`;
+      const sourceClientMessageId = `cm-dd-recovery-unsafe-${testCase.suffix}`;
+      await seedRecoverableSource({
+        sessionId,
+        sourceClientMessageId,
+        record: testCase.record,
+      });
+      const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+      const recoveryInput = admitInput({
+        sessionId,
+        clientMessageId: identity.clientMessageId,
+        billingRequestId: `brq-${identity.clientMessageId}`,
+        message: {
+          id: identity.clientMessageId,
+          role: "user",
+          text: "checkpoint",
+          ts: 3,
+        } as MessageLike & { id: string },
+        recovery: {
+          sourceClientMessageId,
+          mode: "checkpoint",
+          automatic: true,
+        },
+      });
+      assert.deepEqual(await backend.admitUserTurn(recoveryInput), {
+        kind: "recovery_conflict",
+        reason: "automatic_checkpoint_unsafe",
+      });
+      const stored = await backend.getClientSession(sessionId, CUSER);
+      assert.equal(
+        (stored!.messages as MessageLike[]).some((message) => message.id === identity.clientMessageId),
+        false,
+      );
+      const dispatch = await pool.query(
+        "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
+        [UID, sessionId, identity.clientMessageId],
+      );
+      assert.equal(dispatch.rowCount, 0);
+    }
+
+    const manualSessionId = "s-dd-recovery-unsafe-manual";
+    const manualSourceId = "cm-dd-recovery-unsafe-manual";
+    await seedRecoverableSource({
+      sessionId: manualSessionId,
+      sourceClientMessageId: manualSourceId,
+      record: {
+        id: "tool-manual",
+        role: "tool",
+        text: "",
+        ts: 2,
+        _completed: true,
+        outputJson: { outcome: "unknown" },
+      },
+    });
+    const manualIdentity = turnRecoveryIdentity(manualSessionId, manualSourceId);
+    const manual = await backend.admitUserTurn(admitInput({
+      sessionId: manualSessionId,
+      clientMessageId: manualIdentity.clientMessageId,
+      billingRequestId: `brq-${manualIdentity.clientMessageId}`,
+      message: {
+        id: manualIdentity.clientMessageId,
+        role: "user",
+        text: "manual checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId: manualSourceId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.equal(manual.kind, "admitted");
+  });
+
+  maybe("completed source tape cannot be contradicted by a recovery frame", async () => {
+    const sessionId = "s-dd-recovery-completed";
+    const sourceClientMessageId = "cm-dd-recovery-completed-source";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      tapeStatus: "completed",
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    assert.deepEqual(await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "must not run",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+      },
+    })), {
+      kind: "recovery_conflict",
+      reason: "source_tape_completed",
+    });
+  });
+
+  maybe("verified not-accepted source can replay exactly without inventing a tape", async () => {
+    const sessionId = "s-dd-recovery-not-accepted";
+    const sourceClientMessageId = "cm-dd-recovery-not-accepted-source";
+    await backend.upsertClientSession(mkSession({
+      id: sessionId,
+      userId: CUSER,
+      messages: [],
+    }));
+    const source = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "exact replay source",
+        ts: 1,
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(source.kind, "admitted");
+    await casToTerminal(pool, {
+      dispatchId: (source as { dispatch: { dispatchId: string } }).dispatch.dispatchId,
+      outcome: "not_accepted",
+      failureCode: "model_authority_unavailable",
+      clientNotified: true,
+    });
+
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "exact replay source",
+        ts: 2,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "replay",
+        automatic: true,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
 
   maybe("受理冲突表:fresh admitted → 同键 lease 活 already_owned → 异 hash immutable_conflict → 终态 completed dedup", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-dd-admit-1", userId: CUSER }));

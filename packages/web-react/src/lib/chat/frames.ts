@@ -191,6 +191,9 @@ export type AckWire = {
   type: "outbound.ack";
   admitted?: boolean;
   deduplicated?: boolean;
+  /** Master atomically rejected a stale/unsafe recovery child. The browser
+   * removes only that deterministic optimistic row and keeps the old tape. */
+  recoverySkipped?: boolean;
   idempotencyKey?: string;
   peer?: Peer;
   clientMessageId?: string;

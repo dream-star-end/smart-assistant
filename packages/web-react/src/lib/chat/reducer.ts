@@ -72,6 +72,9 @@ export type FrameEffects = {
   ) => void;
   /** service_restart 中断 final:调度自动续写(socket 决定是否真续,见其守卫)。 */
   scheduleRestartContinue?: (sessId: string) => void;
+  /** Terminal recoverable error: sync the finalized exact tape, then let the
+   * socket attempt one safety-gated checkpoint/replay child turn. */
+  scheduleAutomaticRecovery?: (sessId: string, clientMessageId?: string) => void;
   /** 非 final 且 in-flight：socket 重置 thinking-safety（证明后端活着）。*/
   onLiveFrame?: (sess: ChatSession) => void;
   /** 空轮 end_turn → deferred(setTimeout 0) 自动续写。*/
@@ -1829,6 +1832,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     });
   }
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
+  effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
 }
 
 // ═══════════════ legacy bridge error（type:'error'）═══════════════
@@ -1874,6 +1878,7 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   }
   effects.persistSession?.(sess.id);
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
+  effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
 }
 
 // ═══════════════ resume_failed（§4 第三层）═══════════════

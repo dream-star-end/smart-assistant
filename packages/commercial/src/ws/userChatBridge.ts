@@ -109,6 +109,7 @@ import {
   normalizeMessageReplyQuote,
   parseTraceIdCandidate,
   stripModelAuthorityField,
+  turnRecoveryIdentity,
   type ModelAuthorityBundle,
   type ModelAuthorityEngine,
   type ModelExecutionDescriptor,
@@ -2847,8 +2848,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         ? frameObj.clientMessageId
         : null;
       const frameContent = frameObj.content && typeof frameObj.content === "object"
-        ? frameObj.content as { text?: unknown; replyTo?: unknown }
+        ? frameObj.content as { text?: unknown; replyTo?: unknown; recovery?: unknown }
         : null;
+      const rawRecovery = frameContent?.recovery;
+      const recovery =
+        rawRecovery && typeof rawRecovery === "object" && !Array.isArray(rawRecovery)
+          ? rawRecovery as Record<string, unknown>
+          : null;
       const replyTo = normalizeMessageReplyQuote(frameContent?.replyTo);
       const currentUserText = formatMessageReplyPrompt(
         typeof frameObj.content === "string"
@@ -2873,12 +2879,58 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }));
         } catch { /* durable admission remains replayable */ }
       };
+      const sendRecoverySkippedAck = (): void => {
+        if (clientMessageId === null) return;
+        const idempotencyKey = typeof frameObj.idempotencyKey === "string"
+          ? frameObj.idempotencyKey
+          : undefined;
+        try {
+          userWs.send(JSON.stringify({
+            type: "outbound.ack",
+            recoverySkipped: true,
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+            peer: { id: peerId, kind: "dm" },
+            clientMessageId,
+          }));
+        } catch { /* the skipped optimistic row is also removable after REST sync */ }
+      };
+      let validatedRecovery: AdmitUserTurnInput["recovery"];
+      if (rawRecovery !== undefined) {
+        const sourceClientMessageId = recovery?.sourceClientMessageId;
+        const mode = recovery?.mode;
+        const automatic = recovery?.automatic;
+        const keys = recovery ? Object.keys(recovery) : [];
+        const identity = typeof sourceClientMessageId === "string"
+          ? turnRecoveryIdentity(peerId, sourceClientMessageId)
+          : null;
+        if (
+          clientMessageId === null ||
+          !isClientMessageId(sourceClientMessageId) ||
+          (mode !== "checkpoint" && mode !== "replay") ||
+          typeof automatic !== "boolean" ||
+          keys.some((key) => !["sourceClientMessageId", "mode", "automatic"].includes(key)) ||
+          identity?.clientMessageId !== clientMessageId ||
+          identity?.idempotencyKey !== frameObj.idempotencyKey
+        ) {
+          turnLog?.warn("user-chat-bridge: invalid recovery lineage", {
+            sessionId: peerId,
+            clientMessageId,
+          });
+          sendRecoverySkippedAck();
+          return null;
+        }
+        validatedRecovery = { sourceClientMessageId, mode, automatic };
+      }
 
       // The browser's optimistic POST is intentionally not a dispatch gate.
       // Make the server-side ordering invariant explicit here instead: the
       // authoritative user row must exist before route/acquire/precheck/
       // journal/history injection or any physical forward can happen.
       const useDispatchAdmission = containerHasDurableDispatch && deps.admitUserTurn !== undefined;
+      if (validatedRecovery && !useDispatchAdmission) {
+        sendRecoverySkippedAck();
+        return null;
+      }
 
       // B3(R3):本帧受理成功后落此(= 刚受理 dispatch 的 clientMessageId)。受理**之后**的任何 pre-forward
       // 失败出口(goal unavailable / sanitize 抛 / 任意异常 / 未预期早 return)必须据此 CAS terminal +
@@ -3063,6 +3115,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               dispatchId,
               ownerId: connId,
               message,
+              ...(validatedRecovery ? { recovery: validatedRecovery } : {}),
             });
           } catch (err) {
             turnLog?.error("user-chat-bridge: dispatch admission threw", {
@@ -3162,6 +3215,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 "message content changed for the same id",
                 { peerId, clientMessageId },
               );
+              return null;
+            case "recovery_conflict":
+              turnLog?.info("user-chat-bridge: recovery skipped after atomic lineage check", {
+                sessionId: peerId,
+                clientMessageId,
+                reason: admit.reason,
+              });
+              sendRecoverySkippedAck();
               return null;
             case "session_not_found":
             case "session_deleted":

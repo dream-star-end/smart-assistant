@@ -24,6 +24,7 @@ import {
   verifyAuthority,
   verifyTurnLease,
   assertLeaseMatchesAuthority,
+  turnRecoveryIdentity,
 } from "@openclaude/protocol";
 
 import {
@@ -1188,6 +1189,142 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       } finally {
         await stopRig(rig);
       }
+    }
+  });
+});
+
+describe("bridge automatic recovery lineage", () => {
+  test("valid deterministic lineage reaches atomic admission and preserves control metadata", async () => {
+    const sessionId = "sess-recovery-valid";
+    const sourceClientMessageId = "cm-source-valid";
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    let admittedInput: AdmitUserTurnInput | null = null;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      hasCompletedClientTurn: async () => false,
+      admitUserTurn: async (input) => {
+        admittedInput = input;
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const frames = frameCollector(ws);
+      ws.send(inboundFrame({
+        clientMessageId: identity.clientMessageId,
+        idempotencyKey: identity.idempotencyKey,
+        peer: { id: sessionId, kind: "dm" },
+        content: {
+          text: "continue",
+          recovery: {
+            sourceClientMessageId,
+            mode: "checkpoint",
+            automatic: true,
+          },
+        },
+      }));
+      const ack = await frames.next();
+      assert.equal(ack.admitted, true);
+      await waitFor(() => admittedInput !== null);
+      assert.deepEqual(admittedInput!.recovery, {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+      });
+      await waitFor(() => rig.containerSeen.some((raw) => {
+        try {
+          const frame = JSON.parse(raw) as { type?: string; content?: { recovery?: unknown } };
+          return frame.type === "inbound.message" && frame.content?.recovery !== undefined;
+        } catch {
+          return false;
+        }
+      }));
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("atomic conflict returns scoped recoverySkipped ACK and never forwards", async () => {
+    const sessionId = "sess-recovery-conflict";
+    const sourceClientMessageId = "cm-source-conflict";
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    let admitCalls = 0;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      hasCompletedClientTurn: async () => false,
+      admitUserTurn: async () => {
+        admitCalls++;
+        return { kind: "recovery_conflict", reason: "source_not_latest" };
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const frames = frameCollector(ws);
+      ws.send(inboundFrame({
+        clientMessageId: identity.clientMessageId,
+        idempotencyKey: identity.idempotencyKey,
+        peer: { id: sessionId, kind: "dm" },
+        content: {
+          text: "continue",
+          recovery: {
+            sourceClientMessageId,
+            mode: "checkpoint",
+            automatic: true,
+          },
+        },
+      }));
+      const ack = await frames.next();
+      assert.equal(admitCalls, 1);
+      assert.equal(ack.type, "outbound.ack");
+      assert.equal(ack.recoverySkipped, true);
+      assert.equal(ack.clientMessageId, identity.clientMessageId);
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.equal(rig.containerSeen.some((raw) => {
+        try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }
+        catch { return false; }
+      }), false);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("forged recovery identity is rejected before admission", async () => {
+    let admitCalls = 0;
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      hasCompletedClientTurn: async () => false,
+      admitUserTurn: async (input) => {
+        admitCalls++;
+        return fakeAdmittedDispatch(input);
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      const frames = frameCollector(ws);
+      ws.send(inboundFrame({
+        clientMessageId: "m-recover-forged",
+        idempotencyKey: "recover-turn-forged",
+        peer: { id: "sess-recovery-forged", kind: "dm" },
+        content: {
+          text: "continue",
+          recovery: {
+            sourceClientMessageId: "cm-source-forged",
+            mode: "checkpoint",
+            automatic: true,
+          },
+        },
+      }));
+      const ack = await frames.next();
+      assert.equal(ack.recoverySkipped, true);
+      assert.equal(admitCalls, 0);
+      ws.close();
+    } finally {
+      await stopRig(rig);
     }
   });
 });

@@ -368,6 +368,33 @@ export function pickIdleTimeoutMs(
   return IDLE_TIMEOUT_DEFAULT_MS
 }
 
+function throwIfLogicalTurnCancelled(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new Error('logical turn cancelled')
+}
+
+function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  throwIfLogicalTurnCancelled(signal)
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new Error('logical turn cancelled'),
+      )
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 /**
  * 触发 v3MasterSink server-authored 持久化的 channel 白名单。
  *
@@ -3090,6 +3117,8 @@ export class SessionManager {
     let memoryTurnBarrier: KernelFileLock | undefined
     let replayLifecycleStarted = false
     let unhandledTurnError: unknown | undefined
+    const logicalTurnAbort = new AbortController()
+    let logicalTurnRun: Promise<void> | null = null
     if (queueTurn) {
       this._promptQueueExecutions.add(session)
       this._promptQueueExecutionKeys.add(session.sessionKey)
@@ -3354,7 +3383,9 @@ export class SessionManager {
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
           if (Date.now() - logicalTurnStartedAt >= AUTHORITY_TURN_MAX_LIFETIME_MS) {
-            reject(new TurnHardLimitError())
+            const error = new TurnHardLimitError()
+            logicalTurnAbort.abort(error)
+            reject(error)
             return
           }
           const idleMs = Date.now() - session.runner.lastActivityAt
@@ -3366,24 +3397,30 @@ export class SessionManager {
             session.providerTag,
           )
           if (idleMs > threshold) {
-            reject(new TurnIdleTimeoutError(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
+            const error = new TurnIdleTimeoutError(
+              `idle timeout (${Math.round(idleMs / 1000)}s no output)`,
+            )
+            logicalTurnAbort.abort(error)
+            reject(error)
           }
         }, CHECK_INTERVAL)
       })
+      logicalTurnRun = this.runOneTurnWithRetry(
+        session,
+        runnerPayload,
+        onEvent,
+        requestId,
+        traceId,
+        opts?.collabAgentPolicy,
+        opts?.modelAuthority,
+        opts?.replayLifecycle?.clientMessageId,
+        opts?.dispatchContext,
+        opts?.queueLifecycle,
+        logicalTurnAbort.signal,
+      )
       try {
         await Promise.race([
-          this.runOneTurnWithRetry(
-            session,
-            runnerPayload,
-            onEvent,
-            requestId,
-            traceId,
-            opts?.collabAgentPolicy,
-            opts?.modelAuthority,
-            opts?.replayLifecycle?.clientMessageId,
-            opts?.dispatchContext,
-            opts?.queueLifecycle,
-          ),
+          logicalTurnRun,
           livenessPromise,
         ])
       } finally {
@@ -3413,6 +3450,9 @@ export class SessionManager {
         } else {
           onEvent({ kind: 'error', error: reason })
         }
+        await logicalTurnRun?.catch((runErr) => {
+          if (runErr !== logicalTurnAbort.signal.reason) throw runErr
+        })
         log.error(
           'idle timeout, interrupted',
           { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
@@ -3434,6 +3474,9 @@ export class SessionManager {
         } else {
           onEvent({ kind: 'error', error: reason })
         }
+        await logicalTurnRun?.catch((runErr) => {
+          if (runErr !== logicalTurnAbort.signal.reason) throw runErr
+        })
         log.warn('turn hard limit reached, interrupted', {
           sessionKey: session.sessionKey,
           ...(traceId ? { traceId } : {}),
@@ -3519,6 +3562,9 @@ export class SessionManager {
         traceId?: string
       }): Promise<void>
     },
+    /** Platform liveness/hard-limit cancellation for the complete logical
+     * turn. This fence sits above individual EngineTurnRun generations. */
+    logicalTurnSignal?: AbortSignal,
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -3665,6 +3711,7 @@ export class SessionManager {
     }
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      throwIfLogicalTurnCancelled(logicalTurnSignal)
       try {
         await this._runOneTurn(
           session,
@@ -3687,6 +3734,10 @@ export class SessionManager {
         )
         return // success
       } catch (err: any) {
+        // Liveness owns the terminal outcome for the complete logical turn.
+        // Never let an interrupted EngineTurnRun escape into another gateway
+        // retry attempt while the timeout path is persisting its exact tape.
+        throwIfLogicalTurnCancelled(logicalTurnSignal)
         const msg = err?.message ?? String(err)
 
         // Phantom turn: CCB 返回了不调模型的空 result(usage/cost/blocks 全为 0)。
@@ -3700,6 +3751,7 @@ export class SessionManager {
           // shutdown → 下次 submit() 会自动 respawn 一个干净的 CCB 进程。
           // 子进程重启时 runner 的 'spawn' 事件会自动把 _lastCcbCumulativeCost 归零。
           await session.runner.shutdown()
+          throwIfLogicalTurnCancelled(logicalTurnSignal)
           if (phantomRetryUsed) {
             // New adapters persist and resolve the terminal phantom inside
             // _runOneTurn. Keep a visible fallback for legacy test doubles.
@@ -3742,6 +3794,7 @@ export class SessionManager {
           // Shutdown subprocess — next submit() auto-restarts with fresh config.
           // Runner 'spawn' listener resets _lastCcbCumulativeCost automatically.
           await session.runner.shutdown()
+          throwIfLogicalTurnCancelled(logicalTurnSignal)
           if (attempt >= MAX_RETRIES) throw err
           emitRetryStatus(
             '\n\n🔄 认证已过期,正在刷新凭据并重试...\n',
@@ -3766,7 +3819,7 @@ export class SessionManager {
           `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n`,
           'TRANSIENT_RETRY',
         )
-        await new Promise((r) => setTimeout(r, delay))
+        await waitForRetryDelay(delay, logicalTurnSignal)
       }
     }
   }

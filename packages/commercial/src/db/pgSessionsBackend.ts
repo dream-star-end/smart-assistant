@@ -48,6 +48,7 @@ import {
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_SHA256_RE,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
+  assessTurnRecoveryTape,
   availableModelHistoryTokens,
   modelHistoryReservedTokens,
   estimateModelHistoryTokens,
@@ -55,6 +56,8 @@ import {
   modelHistorySemanticRole,
   modelHistorySemanticText,
   resolveModelHistoryContextWindow,
+  supportsAutomaticTurnRecovery,
+  turnRecoveryIdentity,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
@@ -970,6 +973,13 @@ export interface AdmitUserTurnInput {
   ownerId: string;
   /** 要幂等 append 的 user 消息行。 */
   message: MessageLike & { id: string };
+  /** Master-validated recovery lineage. The PG transaction revalidates it
+   * under the same session-row lock used by ordinary user appends. */
+  recovery?: {
+    sourceClientMessageId: string;
+    mode: "checkpoint" | "replay";
+    automatic: boolean;
+  };
   leaseTtlMs?: number;
   now?: number;
 }
@@ -978,6 +988,7 @@ export type AdmitUserTurnResult =
   | AdmitDispatchResult
   | { kind: "session_not_found" }
   | { kind: "session_deleted" }
+  | { kind: "recovery_conflict"; reason: string }
   | { kind: "append_error"; reason: string };
 
 export type TurnTapeDispatchState = "none" | "partial" | "finalized";
@@ -5635,6 +5646,141 @@ export function createPgSessionsBackend(
   const backend: PgSessionsBackend = {
     async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
       return withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
+        let message = input.message;
+        if (input.recovery) {
+          const expected = turnRecoveryIdentity(
+            input.sessionId,
+            input.recovery.sourceClientMessageId,
+          );
+          if (expected.clientMessageId !== input.clientMessageId) {
+            return { kind: "recovery_conflict", reason: "identity_mismatch" };
+          }
+          const locked = (
+            await client.query<{ messages: string; deleted_at: string | null }>(
+              `SELECT messages, deleted_at
+                 FROM client_sessions
+                WHERE id=$1 AND user_id=$2
+                FOR UPDATE`,
+              [input.sessionId, input.sessionUserId],
+            )
+          ).rows[0];
+          if (!locked) return { kind: "session_not_found" };
+          if (locked.deleted_at !== null) return { kind: "session_deleted" };
+          let current: MessageLike[];
+          try {
+            const parsed = JSON.parse(locked.messages);
+            if (!Array.isArray(parsed)) throw new Error("not array");
+            current = parsed as MessageLike[];
+          } catch {
+            return { kind: "recovery_conflict", reason: "session_history_malformed" };
+          }
+          const existingRecovery = current.find((item) =>
+            item?.role === "user" && item.id === input.clientMessageId);
+          if (existingRecovery) {
+            if (
+              existingRecovery._recoveryOfClientMessageId !== input.recovery.sourceClientMessageId ||
+              existingRecovery._recoveryMode !== input.recovery.mode ||
+              existingRecovery._automaticRecovery !== input.recovery.automatic
+            ) {
+              return { kind: "recovery_conflict", reason: "identity_reused" };
+            }
+            message = {
+              ...input.message,
+              _recoveryOfClientMessageId: input.recovery.sourceClientMessageId,
+              _recoveryMode: input.recovery.mode,
+              _automaticRecovery: input.recovery.automatic,
+            };
+          } else {
+            const latestUser = [...current].reverse().find((item) => item?.role === "user");
+            if (!latestUser || latestUser.id !== input.recovery.sourceClientMessageId) {
+              return { kind: "recovery_conflict", reason: "source_not_latest" };
+            }
+            if (input.recovery.automatic && latestUser._automaticRecovery === true) {
+              return { kind: "recovery_conflict", reason: "automatic_hop_exhausted" };
+            }
+            const sourceIndex = current.lastIndexOf(latestUser);
+            const recoverableTapeError = current.slice(sourceIndex + 1).some((item) =>
+              item?.role === "assistant" &&
+              item._clientMessageId === input.recovery?.sourceClientMessageId &&
+              supportsAutomaticTurnRecovery(String(item._errorCode ?? "")));
+            const dispatchFailure = (
+              await client.query<{ outcome: string; failure_code: string | null }>(
+                `SELECT outcome, failure_code
+                   FROM turn_dispatches
+                  WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3
+                    AND status='terminal'
+                  LIMIT 1`,
+                [input.uid, input.sessionId, input.recovery.sourceClientMessageId],
+              )
+            ).rows[0];
+            if (
+              !recoverableTapeError &&
+              !supportsAutomaticTurnRecovery(dispatchFailure?.failure_code ?? "")
+            ) {
+              return { kind: "recovery_conflict", reason: "source_not_recoverable" };
+            }
+            const finalized = (
+              await client.query<{ tape_id: string; status: string }>(
+                `SELECT tape_id,status
+                   FROM client_session_turn_tapes
+                  WHERE session_id=$1 AND user_id=$2
+                    AND client_message_id=$3
+                    AND finalized_at IS NOT NULL
+                  ORDER BY finalized_at DESC,tape_id
+                  LIMIT 1`,
+                [
+                  input.sessionId,
+                  input.sessionUserId,
+                  input.recovery.sourceClientMessageId,
+                ],
+              )
+            ).rows[0];
+            if (finalized) {
+              if (finalized.status !== "crashed" && finalized.status !== "interrupted") {
+                return { kind: "recovery_conflict", reason: "source_tape_completed" };
+              }
+              const recordRows = (
+                await client.query<{ payload: Buffer }>(
+                  `SELECT payload
+                     FROM client_session_turn_tape_records
+                    WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+                    ORDER BY ordinal`,
+                  [input.sessionId, input.sessionUserId, finalized.tape_id],
+                )
+              ).rows;
+              const records: unknown[] = [];
+              try {
+                for (const row of recordRows) {
+                  const record = JSON.parse(Buffer.from(row.payload).toString("utf8"));
+                  if (!record || typeof record !== "object" || Array.isArray(record)) {
+                    throw new Error("not an object");
+                  }
+                  records.push(record);
+                }
+              } catch {
+                return { kind: "recovery_conflict", reason: "source_tape_malformed" };
+              }
+              const assessment = assessTurnRecoveryTape(records);
+              if (assessment.mode !== input.recovery.mode) {
+                return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
+              }
+              if (input.recovery.automatic && !assessment.checkpointSafe) {
+                return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
+              }
+            } else if (
+              input.recovery.mode !== "replay" ||
+              dispatchFailure?.outcome !== "not_accepted"
+            ) {
+              return { kind: "recovery_conflict", reason: "source_not_safely_replayable" };
+            }
+            message = {
+              ...input.message,
+              _recoveryOfClientMessageId: input.recovery.sourceClientMessageId,
+              _recoveryMode: input.recovery.mode,
+              _automaticRecovery: input.recovery.automatic,
+            };
+          }
+        }
         // 0) 幂等建行:用户首条消息本身就是「会话存在」的权威。前端 ensureServerSession 的
         //    PUT 是 fire-and-forget、与 WS 首帧天然竞态(legacy persist 路径靠 [0,50,150]ms
         //    重试吸收;受理路径「受理先于一切」撞库更早,不建行则新会话首条消息必
@@ -5642,18 +5788,20 @@ export function createPgSessionsBackend(
         //    不动 —— 归属与墓碑仍由下方 append 的 (id,user_id)/deleted_at 核对裁定,
         //    session_not_found / session_deleted 语义不变,不会跨用户建行或复活墓碑。
         //    后到的 ensure PUT(baseSyncedAt=0)命中本行 → rejected_stale 空操作,不 clobber。
-        await client.query(
-          `INSERT INTO client_sessions (id, user_id, agent_id, title, created_at, last_at, updated_at)
-           VALUES ($1, $2, $3, DEFAULT, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL})
-           ON CONFLICT (id) DO NOTHING`,
-          [input.sessionId, input.sessionUserId, input.agentId],
-        );
+        if (!input.recovery) {
+          await client.query(
+            `INSERT INTO client_sessions (id, user_id, agent_id, title, created_at, last_at, updated_at)
+             VALUES ($1, $2, $3, DEFAULT, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL})
+             ON CONFLICT (id) DO NOTHING`,
+            [input.sessionId, input.sessionUserId, input.agentId],
+          );
+        }
         // 1) 幂等 append user 行(既有 id 幂等)。
         const appended = await pgAppendServerAuthoredCore(
           client,
           input.sessionId,
           input.sessionUserId,
-          input.message,
+          message,
         );
         if (!appended.applied) {
           if (appended.reason === "session_not_found") return { kind: "session_not_found" };

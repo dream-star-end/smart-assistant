@@ -32,6 +32,12 @@ export type TurnErrorCta =
 export interface TurnErrorSemantics {
   /** 瞬时错误:同请求稍后重试有意义(自动重试资格的必要非充分条件)。 */
   retryable: boolean
+  /**
+   * 允许在服务端 exact tape 已终态、checkpoint 安全门通过后自动恢复一次。
+   * 与 retryable 分开：认证、持久化准入或外部副作用结果未知等场景即便手动
+   * 重试有意义，也不能由客户端自行自动执行。
+   */
+  automaticRecovery?: true
   cta: TurnErrorCta
   /**
    * 帧携带的服务端 message 允许直接展示给用户(白名单;展示侧仍须过
@@ -59,42 +65,42 @@ export interface TurnErrorSemantics {
 export const TURN_ERROR_TAXONOMY = {
   // ── 计费/配额 ────────────────────────────────────────────
   insufficient_credits: { retryable: false, cta: 'topup', expected: true, reportable: false },
-  rate_limited: { retryable: true, cta: 'retry', expected: true },
+  rate_limited: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
 
   // ── 上游模型服务(errorClassify / codex runner 分类产物)────
   /** 新增:模型容量满载("at capacity"/overloaded/model busy 词族)。 */
-  model_capacity: { retryable: true, cta: 'retry_or_switch', expected: true },
-  upstream_failed: { retryable: true, cta: 'retry' },
+  model_capacity: { retryable: true, automaticRecovery: true, cta: 'retry_or_switch', expected: true },
+  upstream_failed: { retryable: true, automaticRecovery: true, cta: 'retry' },
   /** 上游请求超时(errorClassify 词族;历史前端码 upstream_timeout 归并于此)。 */
-  upstream_timeout: { retryable: true, cta: 'retry' },
-  network_error: { retryable: true, cta: 'retry' },
+  upstream_timeout: { retryable: true, automaticRecovery: true, cta: 'retry' },
+  network_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   context_too_long: { retryable: false, cta: 'none' },
   bad_request: { retryable: false, cta: 'none' },
 
   // ── 引擎/平台执行 ────────────────────────────────────────
-  engine_error: { retryable: true, cta: 'retry' },
-  internal_error: { retryable: true, cta: 'retry' },
+  engine_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
+  internal_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   auth_error: { retryable: false, cta: 'relogin' },
-  service_restart: { retryable: true, cta: 'retry', expected: true },
+  service_restart: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
   session_persist_unavailable: { retryable: true, cta: 'retry' },
   stopped: { retryable: false, cta: 'none', expected: true, reportable: false },
   user_cancelled: { retryable: false, cta: 'none', expected: true, reportable: false },
-  runner_crashed: { retryable: true, cta: 'retry' },
+  runner_crashed: { retryable: true, automaticRecovery: true, cta: 'retry' },
 
   // ── 免单类(tape 大写码归一化后落这里;waive 查询仍用大写原值)──
-  model_authority_expired: { retryable: false, cta: 'retry', waivable: true },
-  liveness_timeout: { retryable: false, cta: 'retry', waivable: true },
-  idle_timeout: { retryable: false, cta: 'retry', waivable: true },
-  no_response: { retryable: false, cta: 'retry', waivable: true },
-  phantom_turn: { retryable: false, cta: 'retry', waivable: true },
+  model_authority_expired: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
+  liveness_timeout: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
+  idle_timeout: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
+  no_response: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
+  phantom_turn: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
   turn_limit: { retryable: false, cta: 'none', waivable: true },
 
   // ── 模型权威 gate 拒帧(bridge/egress)─────────────────────
   model_config_changed_retry_turn: { retryable: false, cta: 'retry', expected: true, reportable: false },
   model_not_available: { retryable: false, cta: 'switch_model', expected: true, reportable: false },
   unresolved_agent_model: { retryable: false, cta: 'switch_model' },
-  model_authority_unavailable: { retryable: true, cta: 'retry' },
-  model_catalog_unavailable: { retryable: true, cta: 'retry' },
+  model_authority_unavailable: { retryable: true, automaticRecovery: true, cta: 'retry' },
+  model_catalog_unavailable: { retryable: true, automaticRecovery: true, cta: 'retry' },
   unauthorized_model: { retryable: false, cta: 'switch_model', expected: true, reportable: false },
 
   // ── 连接/环境(bridge error 帧码归一化产物)────────────────
@@ -103,9 +109,9 @@ export const TURN_ERROR_TAXONOMY = {
   conn_kicked: { retryable: true, cta: 'none', expected: true, reportable: false },
   /** 运行环境已重建:重试无效,必须刷新页面(服务端 message 指路,可信展示)。 */
   container_outdated: { retryable: false, cta: 'refresh', allowPublicServerMessage: true },
-  err_container: { retryable: true, cta: 'retry' },
-  err_container_timeout: { retryable: true, cta: 'retry' },
-  err_internal: { retryable: true, cta: 'retry' },
+  err_container: { retryable: true, automaticRecovery: true, cta: 'retry' },
+  err_container_timeout: { retryable: true, automaticRecovery: true, cta: 'retry' },
+  err_internal: { retryable: true, automaticRecovery: true, cta: 'retry' },
   forbidden: { retryable: false, cta: 'none' },
   err_frame_too_big: { retryable: false, cta: 'none' },
   bad_json: { retryable: false, cta: 'none' },
@@ -115,18 +121,18 @@ export const TURN_ERROR_TAXONOMY = {
   // ── 媒体/子系统(服务端已产出用户向原因,白名单展示)────────
   /** 图片生成/编辑上游拒绝(含审核拦截:服务端 message 说明换图/改词)。 */
   image_upstream_rejected: { retryable: false, cta: 'none', allowPublicServerMessage: true },
-  image_server_busy: { retryable: true, cta: 'retry', expected: true },
-  voice_upstream_error: { retryable: true, cta: 'retry' },
-  voice_timeout: { retryable: true, cta: 'retry' },
+  image_server_busy: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
+  voice_upstream_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
+  voice_timeout: { retryable: true, automaticRecovery: true, cta: 'retry' },
 
   // ── 遗留兼容(新 bridge 不再发射;归一化仍认,防旧 master 回滚窗残帧)──
   codex_turn_busy: { retryable: true, cta: 'none', expected: true, reportable: false },
-  codex_pool_busy: { retryable: true, cta: 'retry', expected: true, reportable: false },
-  codex_route_unavailable: { retryable: true, cta: 'retry', expected: true, reportable: false },
-  codex_container_recycled: { retryable: true, cta: 'retry', expected: true, reportable: false },
+  codex_pool_busy: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
+  codex_route_unavailable: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
+  codex_container_recycled: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
   codex_billing: { retryable: true, cta: 'retry' },
   /** 历史前端码(与 upstream_failed 语义重复,仅存量会话水合可见)。 */
-  upstream_error: { retryable: true, cta: 'retry' },
+  upstream_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
 } as const satisfies Record<string, TurnErrorSemantics>
 
 export type TurnErrorCode = keyof typeof TURN_ERROR_TAXONOMY
@@ -180,6 +186,156 @@ export function isKnownTurnErrorCode(code: string): code is TurnErrorCode {
 export function turnErrorSemantics(code: string): TurnErrorSemantics {
   if (isKnownTurnErrorCode(code)) return TURN_ERROR_TAXONOMY[code]
   return { retryable: false, cta: 'none' }
+}
+
+/** Exact automatic-recovery policy. Unknown and merely-manually-retryable
+ * codes stay false. */
+export function supportsAutomaticTurnRecovery(code: string): boolean {
+  return turnErrorSemantics(normalizeTurnErrorCode(code)).automaticRecovery === true
+}
+
+function stableTurnRecoveryHash(value: string): string {
+  let hash = 0xcbf29ce484222325n
+  for (let i = 0; i < value.length; i++) {
+    hash ^= BigInt(value.charCodeAt(i))
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n)
+  }
+  return hash.toString(36)
+}
+
+/** Browser/master shared deterministic identity for one recovery child of one
+ * failed client turn. Durable admission, not a tab-local TTL, owns dedup. */
+export function turnRecoveryIdentity(
+  sessionId: string,
+  sourceClientMessageId: string,
+): { clientMessageId: string; idempotencyKey: string } {
+  const hash = stableTurnRecoveryHash(`${sessionId}\0${sourceClientMessageId}`)
+  return {
+    clientMessageId: `m-recover-${hash}`,
+    idempotencyKey: `recover-turn-${hash}`,
+  }
+}
+
+const NON_TERMINAL_RECOVERY_STATES = new Set([
+  'in_progress',
+  'executing',
+  'incomplete',
+  'pending',
+  'queued',
+  'unknown',
+])
+
+function containsNonTerminalRecoveryState(
+  value: unknown,
+  seen: Set<unknown> = new Set(),
+): boolean {
+  if (typeof value === 'string') {
+    return /["']?(?:kind|status|outcome)["']?\s*[:=]\s*["']?(?:in_progress|executing|incomplete|pending|queued|unknown)\b/i
+      .test(value)
+  }
+  if (!value || typeof value !== 'object' || seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) {
+    return value.some((item) => containsNonTerminalRecoveryState(item, seen))
+  }
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      /^(?:kind|status|outcome)$/i.test(key) &&
+      typeof nested === 'string' &&
+      NON_TERMINAL_RECOVERY_STATES.has(nested.toLowerCase())
+    ) {
+      return true
+    }
+    if (containsNonTerminalRecoveryState(nested, seen)) return true
+  }
+  return false
+}
+
+function recoveryChildToolsAreTerminal(value: unknown): boolean {
+  if (!Array.isArray(value)) return true
+  return value.every((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return true
+    const child = item as Record<string, unknown>
+    if (
+      child.kind === 'tool_use' &&
+      (child._completed !== true || containsNonTerminalRecoveryState(child))
+    ) {
+      return false
+    }
+    return recoveryChildToolsAreTerminal(child.childBlocks)
+  })
+}
+
+function isDurableRecoveryProcessRecord(record: Record<string, unknown>): boolean {
+  const role = record.role
+  if (
+    role === 'thinking' ||
+    role === 'tool' ||
+    role === 'agent-group' ||
+    role === 'delegate-progress' ||
+    role === 'permission' ||
+    role === 'runtime-event'
+  ) {
+    return true
+  }
+  return (
+    role === 'assistant' &&
+    !record._errorCode &&
+    typeof record.text === 'string' &&
+    record.text.trim().length > 0
+  )
+}
+
+function recoveryRecordIsSafe(record: Record<string, unknown>): boolean {
+  if (
+    (
+      record.role === 'tool' ||
+      record.role === 'agent-group' ||
+      record.role === 'delegate-progress' ||
+      record.role === 'permission' ||
+      record.role === 'runtime-event'
+    ) &&
+    containsNonTerminalRecoveryState(record)
+  ) {
+    return false
+  }
+  if (record.role === 'permission' && record._resolved !== true) return false
+  if (
+    record.role === 'tool' &&
+    record._completed !== true
+  ) {
+    return false
+  }
+  if (
+    (record.role === 'agent-group' || record.role === 'delegate-progress') &&
+    (
+      record._completed !== true ||
+      !recoveryChildToolsAreTerminal(record.childBlocks)
+    )
+  ) {
+    return false
+  }
+  return true
+}
+
+/**
+ * Browser and master shared assessment of exact finalized tape records.
+ * The browser uses it for UX; the master repeats it over authoritative PG
+ * bytes before admission, so forged recovery metadata cannot make an unknown
+ * external outcome executable.
+ */
+export function assessTurnRecoveryTape(records: readonly unknown[]): {
+  mode: 'checkpoint' | 'replay'
+  checkpointSafe: boolean
+} {
+  const structured = records.filter(
+    (record): record is Record<string, unknown> =>
+      !!record && typeof record === 'object' && !Array.isArray(record),
+  )
+  return {
+    mode: structured.some(isDurableRecoveryProcessRecord) ? 'checkpoint' : 'replay',
+    checkpointSafe: structured.every(recoveryRecordIsSafe),
+  }
 }
 
 /** 派生集合(前端 EXPECTED_TURN_ERR_CODES / WAIVED_ERROR_CODES 的权威源)。 */

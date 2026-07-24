@@ -153,6 +153,38 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     // 末轮 + 兜底可用 → 「重新尝试」保留。
     expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
   });
+
+  test("末轮 idle timeout 且有 durable 断点 → 优先显示「从断点继续」", () => {
+    const onContinueInterrupted = vi.fn();
+    const error = errMsg({
+      _errorCode: "LIVENESS_TIMEOUT",
+      _clientMessageId: "u1",
+      usage: { waived: true },
+    });
+    renderErr(error, {
+      onRegenerate: vi.fn(),
+      onContinueInterrupted,
+      resolveInterruptedContinuation: () => retryableUser,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "从断点继续" }));
+    expect(onContinueInterrupted).toHaveBeenCalledWith(error);
+    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+  });
+
+  test("early terminal 后还有同轮过程（非页面尾行）→ marker 不取得续跑 CTA", () => {
+    render(
+      <AssistantCard
+        msg={errMsg({ _errorCode: "idle_timeout", _clientMessageId: "u1" })}
+        ctx={{ isLast: false, sending: false, inActiveTurn: true }}
+        cb={{
+          onRegenerate: vi.fn(),
+          onContinueInterrupted: vi.fn(),
+          resolveInterruptedContinuation: () => retryableUser,
+        }}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
+  });
 });
 
 describe("AssistantCard 重发按钮末轮门控(Codex 审计 R5)", () => {
