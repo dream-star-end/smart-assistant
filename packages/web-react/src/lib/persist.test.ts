@@ -3,6 +3,7 @@ import type { ChatMessage } from "./chat/model";
 import {
   applyServerIncremental,
   dbNameForUser,
+  dispatchDbNameForUser,
   mergeArchivedHistory,
   mergeFullServerWins,
   mergeTimelineHistoryPage,
@@ -10,6 +11,7 @@ import {
   SessionStore,
   stableSortByTs,
   type StoredPendingDispatch,
+  type StoredPendingDispatchRecord,
   type StoredSession,
 } from "./persist";
 
@@ -24,8 +26,20 @@ function msg(id: string, text = ""): ChatMessage {
   return { id, role: "assistant", text, ts: 1 };
 }
 
+type InspectableIDBFactory = IDBFactory & {
+  seedV1: (name: string, sessions: StoredSession[]) => void;
+  seedV2: (
+    name: string,
+    sessions: StoredSession[],
+    pending?: StoredPendingDispatchRecord[],
+  ) => void;
+  rawPut: (name: string, storeName: string, key: string, value: unknown) => void;
+  versionOf: (name: string) => number | undefined;
+  values: (name: string, storeName: string) => unknown[];
+};
+
 // ─── 最小内存 IDBFactory（仅覆盖 IdbKV 用到的窄 API） ────────────────────────
-function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
+function fakeIDBFactory(commitGate?: Promise<void>): InspectableIDBFactory {
   type Entry = { version: number; stores: Map<string, Map<string, unknown>> };
   const dbs = new Map<string, Entry>();
   // biome-ignore lint/suspicious/noExplicitAny: 测试桩，刻意松散
@@ -80,16 +94,18 @@ function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
   }
   // biome-ignore lint/suspicious/noExplicitAny: 测试桩
   const factory: any = {
-    open(name: string, version = 1) {
+    open(name: string, version?: number) {
       // biome-ignore lint/suspicious/noExplicitAny: 测试桩
       const req: any = { onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null };
       const isNew = !dbs.has(name);
       if (isNew) dbs.set(name, { version: 0, stores: new Map() });
       const entry = dbs.get(name)!;
       const oldVersion = entry.version;
-      const upgrading = version > oldVersion;
+      const requestedVersion = version ?? (oldVersion || 1);
+      const upgrading = requestedVersion > oldVersion;
       // biome-ignore lint/suspicious/noExplicitAny: 测试桩
       const db: any = {
+        get version() { return entry.version; },
         objectStoreNames: { contains: (n: string) => entry.stores.has(n) },
         createObjectStore: (n: string) => {
           entry.stores.set(n, new Map());
@@ -119,10 +135,15 @@ function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
       };
       req.result = db;
       queueMicrotask(() => {
+        if (version !== undefined && version < oldVersion) {
+          req.error = new Error("VersionError");
+          fire(req, "error");
+          return;
+        }
         if (upgrading) {
           req.transaction = db.transaction();
           fire(req, "upgradeneeded", { oldVersion });
-          entry.version = version;
+          entry.version = requestedVersion;
           setTimeout(() => fire(req, "success"), 0);
           return;
         }
@@ -138,8 +159,40 @@ function fakeIDBFactory(commitGate?: Promise<void>): IDBFactory {
         stores: new Map([["sessions", store]]),
       });
     },
+    seedV2(
+      name: string,
+      sessions: StoredSession[],
+      pending: StoredPendingDispatchRecord[] = [],
+    ) {
+      const sessionStore = new Map<string, unknown>();
+      const pendingStore = new Map<string, unknown>();
+      for (const session of sessions) sessionStore.set(session.id, session);
+      for (const item of pending) {
+        pendingStore.set(`${item.sessId}\0${item.msgId}`, item);
+      }
+      dbs.set(name, {
+        version: 2,
+        stores: new Map([
+          ["sessions", sessionStore],
+          ["pending_dispatches", pendingStore],
+        ]),
+      });
+    },
+    rawPut(name: string, storeName: string, key: string, value: unknown) {
+      const entry = dbs.get(name);
+      if (!entry) throw new Error(`missing db ${name}`);
+      const store = entry.stores.get(storeName);
+      if (!store) throw new Error(`missing store ${storeName}`);
+      store.set(key, value);
+    },
+    versionOf(name: string) {
+      return dbs.get(name)?.version;
+    },
+    values(name: string, storeName: string) {
+      return [...(dbs.get(name)?.stores.get(storeName)?.values() ?? [])];
+    },
   };
-  return factory as IDBFactory;
+  return factory as InspectableIDBFactory;
 }
 
 function stored(id: string, over: Partial<StoredSession> = {}): StoredSession {
@@ -1251,6 +1304,7 @@ describe("persist — 热尾巴/归档合并", () => {
 describe("persist — 命名空间", () => {
   test("dbNameForUser: sanitize 非法字符 + 不同 user 不同 DB", () => {
     expect(dbNameForUser("u1")).toBe("ocv5_sessions__u1");
+    expect(dispatchDbNameForUser("u1")).toBe("ocv5_dispatches__u1");
     expect(dbNameForUser("a@b.com")).toBe("ocv5_sessions__a_b_com");
     expect(dbNameForUser("u1")).not.toBe(dbNameForUser("u2"));
     expect(dbNameForUser(null)).toBe("ocv5_sessions__anon");
@@ -1288,6 +1342,25 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
     expect(resolved).toBe(true);
   });
 
+  test("wipe waits for an already-started journal commit before clearing its payload", async () => {
+    let releaseCommit!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+    const f = fakeIDBFactory(gate);
+    const store = new SessionStore("wipe-inflight", f);
+    const write = store.putPendingDispatch("s1", pending("s1", "m-inflight"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    let wiped = false;
+    const wipe = store.wipe().then(() => { wiped = true; });
+    await Promise.resolve();
+    expect(wiped).toBe(false);
+
+    releaseCommit();
+    await Promise.all([write, wipe]);
+    expect(f.values(dispatchDbNameForUser("wipe-inflight"), "pending_dispatches")).toEqual([]);
+  });
+
   test("put → get → getAll → delete → wipe", async () => {
     const f = fakeIDBFactory();
     const store = new SessionStore("u1", f);
@@ -1323,17 +1396,19 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
     ]);
 
     await first.deletePendingDispatch("s1", "m-exact");
-    await stale.putSession(stored("s1", {
-      _pendingDispatches: [pending("s1", "m-exact")],
-    }));
+    // Simulate an old v1 tab that still writes the inline journal after ACK.
+    f.rawPut(
+      dbNameForUser("tabs"),
+      "sessions",
+      "s1",
+      stored("s1", { _pendingDispatches: [pending("s1", "m-exact")] }),
+    );
     expect(await first.getPendingDispatches()).toEqual([]);
     expect((await first.getAllForHydration())[0]?._pendingDispatches).toBeUndefined();
   });
 
-  test("v1 versionchange atomically migrates and scrubs inline pending dispatches", async () => {
-    const f = fakeIDBFactory() as IDBFactory & {
-      seedV1: (name: string, sessions: StoredSession[]) => void;
-    };
+  test("v1 sessions stay v1 while inline pending hydrates into the separate journal view", async () => {
+    const f = fakeIDBFactory();
     f.seedV1(dbNameForUser("migrate"), [
       stored("s1", { _pendingDispatches: [pending("s1", "m-v1")] }),
     ]);
@@ -1346,6 +1421,91 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
     expect(await store.getPendingDispatches()).toEqual([
       expect.objectContaining({ sessId: "s1", msgId: "m-v1" }),
     ]);
+    await store.putPendingDispatch("s1", pending("s1", "m-new"));
+    expect(f.versionOf(dbNameForUser("migrate"))).toBe(1);
+    expect(f.versionOf(dispatchDbNameForUser("migrate"))).toBe(1);
+  });
+
+  test("an existing v2 session DB opens versionlessly and its legacy journal hydrates", async () => {
+    const f = fakeIDBFactory();
+    f.seedV2(
+      dbNameForUser("existing-v2"),
+      [stored("s1")],
+      [{ sessId: "s1", ...pending("s1", "m-v2") }],
+    );
+    const store = new SessionStore("existing-v2", f);
+    expect((await store.getAllForHydration())[0]?._pendingDispatches).toEqual([
+      expect.objectContaining({ msgId: "m-v2" }),
+    ]);
+    expect(f.versionOf(dbNameForUser("existing-v2"))).toBe(2);
+  });
+
+  test("settling one legacy inline identity preserves its unresolved sibling", async () => {
+    const f = fakeIDBFactory();
+    f.seedV1(dbNameForUser("inline-siblings"), [
+      stored("s1", {
+        _pendingDispatches: [
+          pending("s1", "m-done"),
+          pending("s1", "m-still-pending"),
+        ],
+      }),
+    ]);
+    const store = new SessionStore("inline-siblings", f);
+    await store.deletePendingDispatch("s1", "m-done");
+    expect((await store.getAllForHydration())[0]?._pendingDispatches).toEqual([
+      expect.objectContaining({ msgId: "m-still-pending" }),
+    ]);
+  });
+
+  test("settled tombstones fence legacy v2, delete-session, and wipe stale writers", async () => {
+    const f = fakeIDBFactory();
+    const userId = "settled-fence";
+    f.seedV2(
+      dbNameForUser(userId),
+      [stored("s1", { _pendingDispatches: [pending("s1", "m-settled")] })],
+      [{ sessId: "s1", ...pending("s1", "m-settled") }],
+    );
+    const store = new SessionStore(userId, f);
+    await store.deletePendingDispatch("s1", "m-settled");
+
+    f.rawPut(
+      dbNameForUser(userId),
+      "pending_dispatches",
+      "s1\0m-settled",
+      { sessId: "s1", ...pending("s1", "m-settled") },
+    );
+    expect(await store.getPendingDispatches()).toEqual([]);
+
+    await store.deleteSession("s1");
+    f.rawPut(
+      dbNameForUser(userId),
+      "sessions",
+      "s1",
+      stored("s1", { _pendingDispatches: [pending("s1", "m-settled")] }),
+    );
+    expect((await new SessionStore(userId, f).getAllForHydration())[0]?._pendingDispatches)
+      .toBeUndefined();
+
+    const beforeWipe = new SessionStore("wipe-fence", f);
+    await beforeWipe.putSession(stored("s2", {
+      _pendingDispatches: [pending("s2", "m-wipe")],
+    }));
+    // New writes scrub inline journals, so seed the old-tab value directly.
+    f.rawPut(
+      dbNameForUser("wipe-fence"),
+      "sessions",
+      "s2",
+      stored("s2", { _pendingDispatches: [pending("s2", "m-wipe")] }),
+    );
+    await beforeWipe.wipe();
+    f.rawPut(
+      dbNameForUser("wipe-fence"),
+      "sessions",
+      "s2",
+      stored("s2", { _pendingDispatches: [pending("s2", "m-wipe")] }),
+    );
+    expect((await new SessionStore("wipe-fence", f).getAllForHydration())[0]?._pendingDispatches)
+      .toBeUndefined();
   });
 
   test("journal-only crash window reconstructs the exact visible user turn", async () => {

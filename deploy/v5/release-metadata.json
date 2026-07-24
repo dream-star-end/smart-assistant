@@ -78,7 +78,8 @@
     "lossless-turn-runtime-batch-v1",
     "durable-turn-dispatch-v1",
     "history-projection-revision-v1",
-    "direct-turn-timeline-v1"
+    "direct-turn-timeline-v1",
+    "web-storage-rollback-safe-v1"
   ],
   "runtimeCapabilities": [
     "model_authority_v1",

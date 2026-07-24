@@ -2859,6 +2859,63 @@ LOSSLESS_TURN_TAPE_CAP="lossless-turn-tape-v2"
 LOSSLESS_RUNTIME_BATCH_CAP="lossless-turn-runtime-batch-v1"
 LOSSLESS_RUNTIME_BATCH_ENV="LOSSLESS_TURN_TAPE_RUNTIME_BATCHING"
 DIRECT_TURN_TIMELINE_CAP="direct-turn-timeline-v1"
+WEB_STORAGE_ROLLBACK_CAP="web-storage-rollback-safe-v1"
+
+# Browser-local schema changes outlive a release rollback. The bridge release
+# keeps the monolithic session DB versionless and moves the dispatch journal to
+# a separate DB. After two bridge generations are both in the official
+# active/previous lineage, never activate an older frontend that explicitly
+# opens the session DB at a lower version.
+probe_release_web_storage_rollback_capability() { # $1=release; 0=present,1=absent,2=unknown
+  local reldir="$1" result="" rc=0
+  if result="$(ssh "$KL_HOST" "set -e
+      metadata='$reldir/deploy/v5/release-metadata.json'
+      [ -r \"\$metadata\" ]
+      jq -er --arg c '$WEB_STORAGE_ROLLBACK_CAP' '(.capabilities // []) as \$caps
+        | if (\$caps | type) != \"array\" then error(\"capabilities must be an array\")
+          elif ((\$caps | index(\$c)) != null) then \"capable\"
+          else \"incapable\"
+          end' \"\$metadata\"" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  result="$(printf '%s' "$result" | tr -d '[:space:]')"
+  [[ $rc -eq 0 ]] || return 2
+  case "$result" in
+    capable) return 0 ;;
+    incapable) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+assert_web_storage_rollback_transition() { # $1=current $2=official previous $3=target $4=context
+  local current="$1" previous="$2" target="$3" context="${4:-activation}"
+  local current_rc=0 previous_rc=1 target_rc=0
+  [[ "$DRY" == 1 ]] && {
+    echo "  [dry-run] 跳过 browser storage rollback 地板($context)"
+    return 0
+  }
+  probe_release_web_storage_rollback_capability "$current" || current_rc=$?
+  if [[ -n "$previous" ]]; then
+    previous_rc=0
+    probe_release_web_storage_rollback_capability "$previous" || previous_rc=$?
+  fi
+  probe_release_web_storage_rollback_capability "$target" || target_rc=$?
+  if [[ $current_rc -eq 2 || $previous_rc -eq 2 || $target_rc -eq 2 ]]; then
+    echo "✗ $context 无法核验 $WEB_STORAGE_ROLLBACK_CAP(current=$current_rc previous=$previous_rc target=$target_rc),fail-closed。" >&2
+    return 1
+  fi
+  if [[ $current_rc -eq 0 && $previous_rc -eq 0 ]]; then
+    if [[ $target_rc -ne 0 ]]; then
+      echo "✗ $context 拒绝 browser storage 代际降级:active+previous 已建立安全地板，目标缺 '$WEB_STORAGE_ROLLBACK_CAP':$target" >&2
+      return 1
+    fi
+    echo "  ✓ browser storage rollback 地板:active/previous/target 均兼容。"
+    return 0
+  fi
+  echo "  · browser storage bridge 地板尚未建立(active_rc=$current_rc previous_rc=$previous_rc)；保留首轮官方回退路径。"
+}
 
 # A direct-timeline master records verified failures only in turn_dispatches
 # and serves immutable process rows directly from the tape. A projection-era
@@ -4270,6 +4327,12 @@ enable_runtime_tape_batching() {
 assert_release_activation_compensation_compatible() {  # $1=old_release $2=candidate_release
   local old_release="$1" candidate_release="$2" image_id runtime_release
   require_mutation_lease_for_compensation "release-activation-compensation" || exit 86
+  assert_web_storage_rollback_transition \
+    "$old_release" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$old_release" \
+    "release activation compensation" || {
+    mark_deploy_recovery_required "browser storage rollback 地板拒绝旧 master:$old_release"
+    return 1
+  }
   if ! assert_lossless_runtime_batch_floor "$old_release"; then
     mark_deploy_recovery_required "lossless writer 已可能对外服务,runtime-event batch 地板拒绝旧 master:$old_release"
     return 1
@@ -4389,6 +4452,8 @@ activate_release() {
   assert_model_authority_floor "$reldir"
   prev="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev" ]] || { echo "✗ 无法解析 active slot 当前 release，拒绝激活。" >&2; return 1; }
+  assert_web_storage_rollback_transition \
+    "$prev" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$reldir" "release activation" || return 1
   assert_release_marker "$prev" || {
     echo "✗ 激活前无法证明 exact predecessor 可安全补偿:$prev" >&2; return 1;
   }
@@ -4745,6 +4810,9 @@ activate_runtime_tuple() {
   local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
   prev_src="$(bg_current_release "$ACTIVE_SRC")"
   [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
+  assert_web_storage_rollback_transition \
+    "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$BUILT_RELEASE" \
+    "runtime hotcfg master activation" || return 1
   assert_release_marker "$prev_src" || {
     echo "✗ hotcfg 激活前 exact predecessor marker 无效:$prev_src" >&2; return 1;
   }
@@ -6406,8 +6474,21 @@ rollback() {
       echo "  [dry-run] hotcfg rollback(slot=$ACTIVE_SLOT):N=1 以 state.previous 为 master 权威(P3 master-only 则保留当前 tuple)→slot-aware saga+三态 state commit/reconcile"
       return 0
     fi
-    local kp_rollback_helper kp_rollback_target
+    local kp_rollback_helper kp_rollback_target storage_rollback_target storage_history_row
     kp_rollback_helper="$(bg_current_release "$ACTIVE_SRC")"
+    if [[ "$ROLLBACK_N" == 1 ]]; then
+      storage_rollback_target="${ACTIVE_STATE_PREVIOUS_RELEASE:-$ACTIVE_STATE_RELEASE}"
+    else
+      storage_history_row="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$OC_HOTCFG_HISTORY" "$((ROLLBACK_N + 1))")"
+      storage_rollback_target="$(jq -r '.masterRelease // ""' <<<"$storage_history_row")"
+    fi
+    [[ -n "$storage_rollback_target" ]] || {
+      echo "✗ tuple rollback 无法预解析 browser storage 目标，拒绝写 maintenance marker。" >&2
+      exit 1
+    }
+    assert_web_storage_rollback_transition \
+      "$ACTIVE_STATE_RELEASE" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$storage_rollback_target" \
+      "tuple rollback preflight" || exit 1
     begin_planned_maintenance rollback 0
     if ! assert_mutation_lease_alive "rollback-tuple-flip"; then
       echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
@@ -6493,6 +6574,8 @@ rollback() {
   runtime_release="$(remote_env_get OC_RUNTIME_RELEASE)"
   assert_lossless_explicit_rollback_target \
     "$live_master" "$target" "$image_id" "$runtime_release" || exit 1
+  assert_web_storage_rollback_transition \
+    "$live_master" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$target" "explicit rollback" || exit 1
   begin_planned_maintenance rollback 0
   if ! assert_mutation_lease_alive "rollback-flip"; then
     echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
@@ -6682,6 +6765,9 @@ rollback_runtime_tuple() {
   assert_release_marker "$master" || return 1
   assert_release_required_migrations "$master" || return 1
   assert_release_baseline_security "$master" || return 1
+  assert_web_storage_rollback_transition \
+    "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$master" \
+    "tuple rollback exact target" || return 1
   # Current-capable/unknown → target reader+actual writer are proved without a
   # DB observation, before any history/state/env/symlink mutation. This closes
   # "floor query=false → concurrent first finalize → rollback".
@@ -7874,6 +7960,12 @@ canary() {
     recover_canary_prep "$cand"
     exit 1
   }
+  assert_web_storage_rollback_transition \
+    "$DS_active_release" "${DS_previous_active_release:-}" "$reldir" "canary pre-start" || {
+    echo "✗ browser storage rollback 地板不兼容;candidate 尚未初始化/启动,回 stable" >&2
+    recover_canary_prep "$cand"
+    exit 1
+  }
   # assets → union 池(candidate 与 active 前端 chunk 并集,跨 lane 可得)
   sync_assets_to_pool "$reldir"
 
@@ -8286,6 +8378,8 @@ abort_continue() {
   # Must run before Caddy can route a single request back to old. The canary
   # preflight already closes the first-tape race; this fresh fail-closed check
   # also protects abort/recover after tapes exist.
+  assert_web_storage_rollback_transition \
+    "$old_release" "${DS_previous_active_release:-}" "$old_release" "canary abort" || return 1
   assert_lossless_turn_tape_floor "$old_src"
   assert_lossless_runtime_tuple_floor "$image_id" "$runtime_release"
   # MAJOR 1:**先** Caddy 摘 matcher + 默认回旧 slot(aborting 态 default→old)+ reload + verify_routing 断言,

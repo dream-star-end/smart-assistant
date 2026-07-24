@@ -1743,6 +1743,7 @@ describe('v5 release safety lanes', () => {
       'ACTIVE_PORT=19999',
       'RELEASES_ROOT=/fixture/releases',
       'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$1"; }',
+      'assert_web_storage_rollback_transition() { :; }',
       'ssh() {',
       '  case "$*" in',
       '    *"record_storage_format"*) printf "%s\\n" false; return 0 ;;',
@@ -1792,6 +1793,7 @@ describe('v5 release safety lanes', () => {
       'assert_release_capability_for_sessions_pg() { :; }',
       'assert_lossless_turn_tape_floor() { :; }',
       'assert_model_authority_floor() { :; }',
+      'assert_web_storage_rollback_transition() { :; }',
       'bg_current_release() { printf "%s\\n" /release/old; }',
       'sync_assets_to_pool() { :; }',
       'run() { :; }',
@@ -1886,6 +1888,86 @@ describe('v5 release safety lanes', () => {
     assert.match(invoke().stdout, /RC:1/)
     await writeFile(metadata, JSON.stringify({ capabilities: 'lossless-turn-tape-v2' }))
     assert.match(invoke().stdout, /RC:2/)
+  })
+
+  test('browser storage bridge keeps first rollback open, then rejects legacy after two capable generations', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-web-storage-floor-')); dirs.push(dir)
+    const legacy = path.join(dir, 'legacy')
+    const capableA = path.join(dir, 'capable-a')
+    const capableB = path.join(dir, 'capable-b')
+    const malformed = path.join(dir, 'malformed')
+    for (const release of [legacy, capableA, capableB, malformed]) {
+      await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
+    }
+    await writeFile(path.join(legacy, 'deploy/v5/release-metadata.json'),
+      JSON.stringify({ capabilities: [] }))
+    for (const release of [capableA, capableB]) {
+      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'),
+        JSON.stringify({ capabilities: ['web-storage-rollback-safe-v1'] }))
+    }
+    await writeFile(path.join(malformed, 'deploy/v5/release-metadata.json'),
+      JSON.stringify({ capabilities: 'web-storage-rollback-safe-v1' }))
+
+    const invoke = (current: string, previous: string, target: string) => {
+      const harness = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        'DRY=0; KL_HOST=fake',
+        'ssh() { shift; bash -c "$1"; }',
+        'assert_web_storage_rollback_transition "$CURRENT" "$PREVIOUS" "$TARGET" test',
+      ].join('\n')
+      return spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', CURRENT: current, PREVIOUS: previous, TARGET: target },
+      })
+    }
+
+    assert.equal(invoke(legacy, legacy, capableA).status, 0)
+    assert.equal(invoke(capableA, legacy, legacy).status, 0,
+      'first bridge generation must retain the official legacy rollback path')
+    const blocked = invoke(capableA, capableB, legacy)
+    assert.notEqual(blocked.status, 0)
+    assert.match(blocked.stderr, /拒绝 browser storage 代际降级/)
+    assert.equal(invoke(capableA, capableB, capableB).status, 0)
+    assert.notEqual(invoke(capableA, capableB, malformed).status, 0)
+  })
+
+  test('browser storage floor runs before live traffic, maintenance, and symlink mutations', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const activate = source.slice(
+      source.indexOf('activate_release() {'),
+      source.indexOf('\n# 传统 deploy/rollback', source.indexOf('activate_release() {')),
+    )
+    assert.ok(
+      activate.indexOf('assert_web_storage_rollback_transition')
+        < activate.indexOf('sync_assets_to_pool "$reldir"'),
+    )
+
+    const rollback = source.slice(
+      source.indexOf('rollback() {'),
+      source.indexOf('\n# tuple 感知回滚', source.indexOf('rollback() {')),
+    )
+    const tuplePreflight = rollback.indexOf('"tuple rollback preflight"')
+    assert.ok(tuplePreflight >= 0 && tuplePreflight < rollback.indexOf('begin_planned_maintenance rollback 0'))
+    const explicitPreflight = rollback.indexOf('"explicit rollback"')
+    assert.ok(explicitPreflight >= 0 &&
+      explicitPreflight < rollback.indexOf('begin_planned_maintenance rollback 0', explicitPreflight))
+
+    const canary = source.slice(
+      source.indexOf('canary() {'),
+      source.indexOf('\n# ═════════', source.indexOf('canary() {') + 1),
+    )
+    assert.ok(
+      canary.indexOf('"canary pre-start"') < canary.indexOf('sync_assets_to_pool "$reldir"'),
+    )
+
+    const abort = source.slice(
+      source.indexOf('abort_continue() {'),
+      source.indexOf('\n# ═════════ --recover', source.indexOf('abort_continue() {')),
+    )
+    assert.ok(abort.indexOf('"canary abort"') < abort.indexOf('caddy_render_reload'))
   })
 
   test('runtime-event batch format has a distinct master capability and durable rollback floor', async () => {
@@ -2471,6 +2553,7 @@ describe('v5 release safety lanes', () => {
     assert.ok(meta.capabilities.includes('lossless-turn-runtime-batch-v1'))
     assert.ok(meta.capabilities.includes('history-projection-revision-v1'))
     assert.ok(meta.capabilities.includes('direct-turn-timeline-v1'))
+    assert.ok(meta.capabilities.includes('web-storage-rollback-safe-v1'))
     assert.ok(meta.requiredMigrations.includes('0157_lossless_runtime_batches'))
     assert.ok(meta.requiredMigrations.includes('0164_admin_audit_model_admin_grant'))
     assert.ok(meta.requiredMigrations.includes('0166_prompt_queue'))
