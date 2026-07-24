@@ -669,6 +669,46 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(tool?._partial).toBe(false);
   });
 
+  test("Codex fileChange cumulative snapshots update one live tool card in place", () => {
+    const s = sess();
+    const firstChanges = [{ path: "/tmp/live.ts", kind: { type: "update" }, diff: "-old\n+new" }];
+    const latestChanges = [{ path: "/tmp/live.ts", kind: { type: "update" }, diff: "-old\n+new\n+more" }];
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      blocks: [{
+        kind: "tool_use",
+        toolName: "Edit",
+        blockId: "patch-live-1",
+        messageId: "srv-tool-patch-live-1",
+        partial: true,
+        inputJson: { file_path: "/tmp/live.ts", kind: "update", changes: firstChanges },
+      }],
+    }));
+    const first = s.messages.find((m) => m.role === "tool" && m.blockId === "patch-live-1");
+    expect(first?.id).toBe("srv-tool-patch-live-1");
+    expect(first?._partial).toBe(true);
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      blocks: [{
+        kind: "tool_use",
+        toolName: "Edit",
+        blockId: "patch-live-1",
+        partial: true,
+        inputJson: { file_path: "/tmp/live.ts", kind: "update", changes: latestChanges },
+      }],
+    }));
+    const cards = s.messages.filter((m) => m.role === "tool" && m.blockId === "patch-live-1");
+    expect(cards).toHaveLength(1);
+    expect(cards[0].id).toBe(first?.id);
+    expect(cards[0].inputJson).toEqual({
+      file_path: "/tmp/live.ts",
+      kind: "update",
+      changes: latestChanges,
+    });
+    expect(cards[0]._partial).toBe(true);
+  });
+
   test("tool partial offset mismatch drops buffer (no torn JSON)", () => {
     const s = sess();
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, blocks: [{ kind: "tool_use", toolName: "Edit", blockId: "t1", partial: true, partialJsonDelta: '{"a"', partialJsonOffset: 0 }] }));
