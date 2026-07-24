@@ -301,4 +301,76 @@ describe('AutoDreamOptimizerClient platform finding outbox', () => {
     await assert.rejects(() => client.retryPending('billing-corrupt'), SyntaxError)
     assert.equal(await readFile(path, 'utf8'), '{not-json')
   })
+
+  it('serializes concurrent billing journals and retries only the request whose first settlement failed', async () => {
+    const failedRequestId = '4'.repeat(32)
+    const successfulSettlements = new Map<string, number>()
+    const settlementAttempts = new Map<string, number>()
+    let failOnce = true
+    const fetcher = (async (url: string, options: { body: string }) => {
+      assert.equal(new URL(url).pathname, '/internal/v3/auto-dream/settle')
+      const billing = JSON.parse(options.body) as { requestId: string }
+      settlementAttempts.set(
+        billing.requestId,
+        (settlementAttempts.get(billing.requestId) ?? 0) + 1,
+      )
+      if (billing.requestId === failedRequestId && failOnce) {
+        failOnce = false
+        throw new Error('injected first settlement failure')
+      }
+      successfulSettlements.set(
+        billing.requestId,
+        (successfulSettlements.get(billing.requestId) ?? 0) + 1,
+      )
+      return response(200, { settled: true })
+    }) as any
+    const env = {
+      OPENCLAUDE_V3_MASTER_BASE_URL: 'https://master.invalid',
+      OPENCLAUDE_V3_CONTAINER_TOKEN: 'container-token',
+    }
+    const agentId = 'billing-concurrent'
+    const billings = ['2', '3', '4', '5'].map((digit, index) => ({
+      requestId: digit.repeat(32),
+      engineSessionId: `engine-${index}`,
+      status: 'success' as const,
+      durationMs: 100,
+      usage: { input_tokens: index + 1, output_tokens: 1 },
+    }))
+    const client = new AutoDreamOptimizerClient(env, fetcher)
+    const stages = await Promise.all(
+      billings.map(async (billing) => ({
+        billing,
+        stage: await client.stageBilling(agentId, billing),
+      })),
+    )
+    const firstSettlements = await Promise.allSettled(
+      stages.map(({ billing, stage }) => client.settleStaged(agentId, billing, stage)),
+    )
+    assert.equal(firstSettlements.filter((result) => result.status === 'rejected').length, 1)
+    const pending = JSON.parse(
+      await readFile(paths.agentAutoDreamOptimizerBilling(agentId), 'utf8'),
+    ) as { pending: Array<{ requestId: string }> }
+    assert.deepEqual(
+      pending.pending.map((billing) => billing.requestId),
+      [failedRequestId],
+    )
+
+    const restarted = new AutoDreamOptimizerClient(env, fetcher)
+    await restarted.retryPending(agentId)
+    const drained = JSON.parse(
+      await readFile(paths.agentAutoDreamOptimizerBilling(agentId), 'utf8'),
+    ) as { pending: unknown[] }
+    assert.deepEqual(drained.pending, [])
+    for (const billing of billings) {
+      assert.equal(successfulSettlements.get(billing.requestId), 1)
+    }
+    assert.equal(settlementAttempts.get(failedRequestId), 2)
+    for (const billing of billings.filter((row) => row.requestId !== failedRequestId)) {
+      assert.equal(settlementAttempts.get(billing.requestId), 1)
+    }
+
+    const afterRecoveryCalls = [...settlementAttempts.entries()]
+    await restarted.retryPending(agentId)
+    assert.deepEqual([...settlementAttempts.entries()], afterRecoveryCalls)
+  })
 })

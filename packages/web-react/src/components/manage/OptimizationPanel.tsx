@@ -29,6 +29,22 @@ const CATEGORY_LABELS: Record<string, string> = {
   plugin: '插件',
 }
 
+type AutoDreamOptimizerProgress = {
+  stage: 'loading' | 'mapping' | 'reducing' | 'synthesizing' | 'finalizing'
+  sessionsTotal: number
+  evidencePagesTotal: number
+  evidencePagesReviewed: number
+  mapBatchesTotal: number
+  mapBatchesCompleted: number
+  reducePagesTotal: number
+  reducePagesCompleted: number
+  synthesisPagesCompleted: number
+}
+
+type AutoDreamOptimizerLiveState = AutoDreamOptimizerState & {
+  progress?: AutoDreamOptimizerProgress
+}
+
 export function OptimizationPanel({
   auth,
   agentId,
@@ -42,7 +58,7 @@ export function OptimizationPanel({
   const effectiveAgent = agents.some((agent) => agent.id === selectedAgent)
     ? selectedAgent
     : agentId
-  const [state, setState] = useState<AutoDreamOptimizerState | null>(null)
+  const [state, setState] = useState<AutoDreamOptimizerLiveState | null>(null)
   const [loading, setLoading] = useState(true)
   const [running, setRunning] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -193,6 +209,9 @@ export function OptimizationPanel({
                   {state.pagesReviewed} 个审计分片
                 </p>
               )}
+              {state?.status === 'running' && state.progress && (
+                <AuditProgress progress={state.progress} stopping={!!state.cancelRequestedAt} />
+              )}
             </div>
             {state?.status === 'running' ? (
               <Button
@@ -311,6 +330,51 @@ export function OptimizationPanel({
           onDismiss={() => void mutate(selected, 'dismiss')}
         />
       )}
+    </div>
+  )
+}
+
+function AuditProgress({
+  progress,
+  stopping,
+}: {
+  progress: AutoDreamOptimizerProgress
+  stopping: boolean
+}) {
+  const stageText = {
+    loading: '正在整理会话、操作、日志和平台能力',
+    mapping: `正在分析证据 ${progress.evidencePagesReviewed}/${progress.evidencePagesTotal}（模型批次 ${progress.mapBatchesCompleted}/${progress.mapBatchesTotal}）`,
+    reducing: `正在跨页归并 ${progress.reducePagesCompleted}/${progress.reducePagesTotal}`,
+    synthesizing: `正在生成完整建议（已综合 ${progress.synthesisPagesCompleted} 页）`,
+    finalizing: '正在核对当前设置并生成确认项',
+  }[progress.stage]
+  const determinate = progress.evidencePagesTotal > 0
+  const percent = determinate
+    ? Math.min(100, (progress.evidencePagesReviewed / progress.evidencePagesTotal) * 100)
+    : 0
+
+  return (
+    <div className="mt-3" aria-live="polite">
+      <div className="flex items-center justify-between gap-3 text-[11.5px] text-muted">
+        <span>{stopping ? '正在等待当前批次安全结束' : stageText}</span>
+        {progress.sessionsTotal > 0 && <span>{progress.sessionsTotal} 个会话</span>}
+      </div>
+      <div
+        role="progressbar"
+        aria-label="全面审计进度"
+        aria-valuemin={0}
+        aria-valuemax={determinate ? progress.evidencePagesTotal : undefined}
+        aria-valuenow={determinate ? progress.evidencePagesReviewed : undefined}
+        tabIndex={0}
+        className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-border/70"
+      >
+        <div
+          className={`h-full rounded-full bg-accent transition-[width] duration-500 ${
+            determinate ? '' : 'w-1/3 animate-pulse'
+          }`}
+          style={determinate ? { width: `${percent}%` } : undefined}
+        />
+      </div>
     </div>
   )
 }
