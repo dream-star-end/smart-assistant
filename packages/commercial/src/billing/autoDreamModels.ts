@@ -1,11 +1,12 @@
 import { getModelCatalogCache } from './modelCatalogRuntime.js'
 
 export const TERRA_AUTO_DREAM_MODEL = 'gpt-5.6-terra'
-export const DEFAULT_AUTO_DREAM_MODEL = TERRA_AUTO_DREAM_MODEL
-export const LEGACY_AUTO_DREAM_MODEL = 'deepseek-v4-flash'
+export const DEEPSEEK_AUTO_DREAM_MODEL = 'deepseek-v4-flash'
+export const DEFAULT_AUTO_DREAM_MODEL = DEEPSEEK_AUTO_DREAM_MODEL
+export const LEGACY_AUTO_DREAM_MODEL = DEEPSEEK_AUTO_DREAM_MODEL
 const AUTO_DREAM_OPTIMIZER_ENGINES = new Map<string, 'codex' | 'ccb'>([
   [TERRA_AUTO_DREAM_MODEL, 'codex'],
-  [LEGACY_AUTO_DREAM_MODEL, 'ccb'],
+  [DEEPSEEK_AUTO_DREAM_MODEL, 'ccb'],
 ])
 
 export interface AutoDreamModelOption {
@@ -21,7 +22,7 @@ export function isAutoDreamOptimizerModel(
   return canonicalModel === modelId && AUTO_DREAM_OPTIMIZER_ENGINES.get(modelId) === engine
 }
 
-/** Stage-A compatibility: Terra stays default while V2 learns the CCB model. */
+/** Auto-Dream V2 defaults to DeepSeek while retaining Terra rollback compatibility. */
 export async function listAutoDreamModelOptions(): Promise<AutoDreamModelOption[]> {
   const cache = await getModelCatalogCache()
   const snapshot = await cache.assertFresh()

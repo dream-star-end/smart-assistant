@@ -3964,7 +3964,7 @@ export async function registerCommercial(
     return { kind: "ready", requestId, routeFrame: route.routeFrame };
   };
 
-  // ─── Auto-Dream V2 Terra: master-owned admission, billing and reporting ──
+  // ─── Auto-Dream V2 optimizer: master-owned policy, actions and reporting ──
   type AutoDreamCodexSnapshot = {
     reservation: ReservationHandle;
     finalizer: CodexFinalizeHandle;
