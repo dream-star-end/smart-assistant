@@ -1,14 +1,27 @@
 import { getModelCatalogCache } from './modelCatalogRuntime.js'
 
-export const DEFAULT_AUTO_DREAM_MODEL = 'gpt-5.6-terra'
+export const TERRA_AUTO_DREAM_MODEL = 'gpt-5.6-terra'
+export const DEFAULT_AUTO_DREAM_MODEL = TERRA_AUTO_DREAM_MODEL
 export const LEGACY_AUTO_DREAM_MODEL = 'deepseek-v4-flash'
+const AUTO_DREAM_OPTIMIZER_ENGINES = new Map<string, 'codex' | 'ccb'>([
+  [TERRA_AUTO_DREAM_MODEL, 'codex'],
+  [LEGACY_AUTO_DREAM_MODEL, 'ccb'],
+])
 
 export interface AutoDreamModelOption {
   value: string
   label: string
 }
 
-/** Auto-Dream V2 is deliberately pinned to the active, billable Terra model. */
+export function isAutoDreamOptimizerModel(
+  modelId: string,
+  canonicalModel: string,
+  engine: string,
+): boolean {
+  return canonicalModel === modelId && AUTO_DREAM_OPTIMIZER_ENGINES.get(modelId) === engine
+}
+
+/** Stage-A compatibility: Terra stays default while V2 learns the CCB model. */
 export async function listAutoDreamModelOptions(): Promise<AutoDreamModelOption[]> {
   const cache = await getModelCatalogCache()
   const snapshot = await cache.assertFresh()
@@ -18,19 +31,18 @@ export async function listAutoDreamModelOptions(): Promise<AutoDreamModelOption[
     const pricing = snapshot.billingPricingFor(id)
     if (!descriptor || !pricing) continue
     if (
-      descriptor.engine !== 'codex' ||
-      descriptor.canonicalModel !== DEFAULT_AUTO_DREAM_MODEL ||
+      !isAutoDreamOptimizerModel(id, descriptor.canonicalModel, descriptor.engine) ||
       pricing.visibility !== 'public'
     )
       continue
     out.push({ value: descriptor.canonicalModel, label: pricing.display_name })
   }
-  return out.sort((a, b) => a.label.localeCompare(b.label, 'zh-CN') || a.value.localeCompare(b.value))
+  return out.sort(
+    (a, b) => a.label.localeCompare(b.label, 'zh-CN') || a.value.localeCompare(b.value),
+  )
 }
 
-export async function resolveAutoDreamModel(
-  modelId: string,
-): Promise<AutoDreamModelOption | null> {
+export async function resolveAutoDreamModel(modelId: string): Promise<AutoDreamModelOption | null> {
   const models = await listAutoDreamModelOptions()
   return models.find((row) => row.value === modelId) ?? null
 }
@@ -56,6 +68,6 @@ export async function resolveLegacyAutoDreamModel(): Promise<AutoDreamModelOptio
 
 export async function assertAutoDreamModelSelectable(modelId: string): Promise<void> {
   if (!(await resolveAutoDreamModel(modelId))) {
-    throw new Error(`auto-dream model '${modelId}' is not the active public Terra model`)
+    throw new Error(`auto-dream model '${modelId}' is not an active public optimizer model`)
   }
 }

@@ -35,6 +35,7 @@ describe('AutoDreamOptimizerService', () => {
         throughSeq: 9,
       }),
       runModel: async (input) => {
+        assert.equal(input.userId, 'user-42')
         phases.push(input.phase)
         if (input.phase === 'map') {
           assert.match(input.prompt, /platform skills and settings/)
@@ -86,7 +87,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    const state = await service.run('reduce', true)
+    const state = await service.run('reduce', 'user-42', true)
     assert.deepEqual(phases, ['map', 'reduce_ingest', 'synthesis'])
     assert.equal(finished, 1)
     assert.equal(state.summary, 'cross-page synthesis')
@@ -145,7 +146,7 @@ describe('AutoDreamOptimizerService', () => {
       mapBatchChars: 1,
     })
 
-    const state = await service.run('lossless-pagination', true)
+    const state = await service.run('lossless-pagination', 'user-42', true)
     assert.equal(synthesisPage, 2)
     assert.equal(state.proposals.length, 193)
     assert.equal(
@@ -254,7 +255,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    const state = await service.run('scale-686', true)
+    const state = await service.run('scale-686', 'user-42', true)
     assert.equal(state.status, 'success')
     assert.equal(maxActive, 4)
     assert.deepEqual(decodedByBatch.flat(), pages)
@@ -328,7 +329,7 @@ describe('AutoDreamOptimizerService', () => {
     }
     const service = new AutoDreamOptimizerService(deps)
     const canceller = new AutoDreamOptimizerService(deps)
-    const run = service.run('cancel-progress', true)
+    const run = service.run('cancel-progress', 'user-42', true)
     await started
     const initial = await service.getPublicState('cancel-progress')
     assert.deepEqual(initial.progress, {
@@ -411,7 +412,7 @@ describe('AutoDreamOptimizerService', () => {
       mapBatchChars: 1,
     })
 
-    const run = service.run('failure-settle', true)
+    const run = service.run('failure-settle', 'user-42', true)
     await allStarted
     failFirst()
     await new Promise((resolve) => setTimeout(resolve, 20))
@@ -492,7 +493,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    const run = service.run('progress-stages', true)
+    const run = service.run('progress-stages', 'user-42', true)
     await mapEntered
     assert.equal((await service.getPublicState('progress-stages')).progress?.stage, 'mapping')
     releaseMap()
@@ -544,7 +545,7 @@ describe('AutoDreamOptimizerService', () => {
     const service = new AutoDreamOptimizerService(deps)
     const canceller = new AutoDreamOptimizerService(deps)
 
-    const run = service.run('cancel-finalizing', true)
+    const run = service.run('cancel-finalizing', 'user-42', true)
     await hydrationEntered
     assert.equal((await service.getPublicState('cancel-finalizing')).progress?.stage, 'finalizing')
     const cancelling = await canceller.cancel('cancel-finalizing')
@@ -607,7 +608,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    const state = await service.run('fixed-point', true)
+    const state = await service.run('fixed-point', 'user-42', true)
     assert.equal(synthesisCalls, 1)
     assert.equal(state.status, 'success')
     assert.equal(state.proposals.length, 1)
@@ -664,7 +665,7 @@ describe('AutoDreamOptimizerService', () => {
       },
     })
 
-    const run = service.run('user-cancel', true)
+    const run = service.run('user-cancel', 'user-42', true)
     await started
     const cancelling = await canceller.cancel('user-cancel')
     assert.equal(cancelling.status, 'running')
@@ -711,7 +712,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    const state = await service.startManual(agentId)
+    const state = await service.startManual(agentId, 'user-42')
     assert.equal(state.status, 'cancelled')
     assert.equal(state.cancelRequestedAt, undefined)
     assert.equal(modelCalls, 0)
@@ -764,7 +765,7 @@ describe('AutoDreamOptimizerService', () => {
       },
     })
 
-    const state = await service.run('main', true)
+    const state = await service.run('main', 'user-42', true)
     assert.equal(state.status, 'success')
     assert.equal(state.proposals.length, 1)
     assert.equal(state.proposals[0]?.state, 'pending')
@@ -827,7 +828,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    const state = await service.run('derived-admin-findings', true)
+    const state = await service.run('derived-admin-findings', 'user-42', true)
     assert.equal(state.status, 'success')
     assert.equal(state.proposals.length, proposals.length)
     assert.equal(reported.length, 1)
@@ -898,7 +899,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    const state = await service.run('explicit-derived-dedupe', true)
+    const state = await service.run('explicit-derived-dedupe', 'user-42', true)
     assert.equal(state.status, 'success')
     assert.equal(reported.length, 1)
     assert.equal(reported[0]?.findings.length, 1)
@@ -961,7 +962,7 @@ describe('AutoDreamOptimizerService', () => {
       },
     })
 
-    const state = await service.run('terra-target-contract', true)
+    const state = await service.run('terra-target-contract', 'user-42', true)
     assert.equal(state.status, 'success')
     assert.equal(state.proposals.length, 1)
     assert.equal(state.proposals[0]?.action, 'manual.review')
@@ -1026,7 +1027,7 @@ describe('AutoDreamOptimizerService', () => {
         return { ok: true, result: 'already applied' }
       },
     })
-    const initial = await service.run('recover', true)
+    const initial = await service.run('recover', 'user-42', true)
     const id = initial.proposals[0]!.id
     await assert.rejects(() => service.apply('recover', id), /simulated crash/)
     const recovered = await service.apply('recover', id)
@@ -1068,7 +1069,7 @@ describe('AutoDreamOptimizerService', () => {
       applyProposal: async () => ({ ok: true }),
     })
 
-    await service.run('privacy', true)
+    await service.run('privacy', 'user-42', true)
     assert.equal(reported[0]?.findings[0]?.problem, '聚合信号显示现有使用路径存在重复阻力。')
     assert.equal(
       reported[0]?.findings[0]?.recommendation,
@@ -1110,7 +1111,7 @@ describe('AutoDreamOptimizerService', () => {
       reportPlatformFindings: async () => {},
       applyProposal: async () => ({ ok: true }),
     })
-    const state = await restarted.run('stale', true)
+    const state = await restarted.run('stale', 'user-42', true)
     assert.equal(state.status, 'success')
     assert.equal(state.summary, 'recovered')
   })

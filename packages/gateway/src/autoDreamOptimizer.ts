@@ -257,6 +257,7 @@ export interface AutoDreamOptimizerModelRun {
   runId: string
   callId: string
   agentId: string
+  userId: string
   model: string
   prompt: string
   phase: 'map' | 'reduce_ingest' | 'synthesis'
@@ -293,6 +294,7 @@ export interface AutoDreamOptimizerDeps {
 
 export interface AutoDreamOptimizerTrigger {
   agentId: string
+  userId: string
   sessionKey: string
   channel: string
 }
@@ -327,10 +329,10 @@ export class AutoDreamOptimizerService {
     const state = await readOptimizerState(trigger.agentId)
     const last = parseTime(state.lastSuccessAt)
     if (last !== null && this.now() - last < policy.minIntervalHours * 60 * 60_000) return
-    await this.run(trigger.agentId, false)
+    await this.run(trigger.agentId, trigger.userId, false)
   }
 
-  async run(agentId: string, manual: boolean): Promise<OptimizerState> {
+  async run(agentId: string, userId: string, manual: boolean): Promise<OptimizerState> {
     const policy = await this.policyClient.get({ fresh: true })
     if (!isV2Policy(policy)) throw new Error('AUTO_DREAM_OPTIMIZER_NOT_ENABLED')
     if (this.activeRuns.has(agentId)) return await readOptimizerState(agentId)
@@ -436,6 +438,7 @@ export class AutoDreamOptimizerService {
                   runId,
                   callId: `${runId}:${index}`,
                   agentId,
+                  userId,
                   model: policy.modelId,
                   prompt: buildAuditPrompt(batch, index, auditBatches.length, dataset.pages.length),
                   phase: 'map',
@@ -498,6 +501,7 @@ export class AutoDreamOptimizerService {
               runId,
               callId: `${runId}:${auditBatches.length + index}`,
               agentId,
+              userId,
               model: policy.modelId,
               prompt: buildReduceIngestPrompt(
                 manifestFragments[index]!,
@@ -545,6 +549,7 @@ export class AutoDreamOptimizerService {
               runId,
               callId: `${runId}:${auditBatches.length + manifestFragments.length + cursor}`,
               agentId,
+              userId,
               model: policy.modelId,
               prompt: buildSynthesisPagePrompt({
                 cursor,
@@ -653,7 +658,7 @@ export class AutoDreamOptimizerService {
   }
 
   /** Starts a user-requested audit without holding the HTTP request for a long model run. */
-  async startManual(agentId: string): Promise<OptimizerState> {
+  async startManual(agentId: string, userId: string): Promise<OptimizerState> {
     const policy = await this.policyClient.get({ fresh: true })
     if (!isV2Policy(policy)) throw new Error('AUTO_DREAM_OPTIMIZER_NOT_ENABLED')
     const current = await readOptimizerState(agentId)
@@ -661,7 +666,7 @@ export class AutoDreamOptimizerService {
       return await this.convergeOrphanedCancellation(agentId)
     }
     if (current.status === 'running' && this.activeRuns.has(agentId)) return current
-    void this.run(agentId, true).catch((err) => {
+    void this.run(agentId, userId, true).catch((err) => {
       this.log('auto-dream-optimizer-start-failed', {
         agentId,
         error: safeError(err),
