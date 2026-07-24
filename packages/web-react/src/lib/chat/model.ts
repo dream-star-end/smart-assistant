@@ -133,6 +133,8 @@ export type ChildBlock = {
   toolUseBlockId?: string;
   inputPreview?: string;
   inputJson?: unknown;
+  /** Browser-only revision for structured tool input snapshots. */
+  _inputRevision?: number;
   partialJson?: string;
   preview?: string;
   isError?: boolean;
@@ -348,6 +350,8 @@ export type ChatMessage = {
   toolName?: string;
   inputPreview?: string;
   inputJson?: unknown;
+  /** Browser-only revision for structured tool input snapshots. */
+  _inputRevision?: number;
   /** 流式累加 partial JSON（final 后必 delete）。*/
   partialJson?: string;
   _partial?: boolean;

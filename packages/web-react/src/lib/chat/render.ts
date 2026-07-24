@@ -268,6 +268,7 @@ export function childSignature(ch: ChildBlock): string {
     textSig(ch.tail),
     typeof raw.error === "string" ? textSig(raw.error) : raw.error ? 1 : 0,
     ch.partialJson ? ch.partialJson.length : 0,
+    ch._inputRevision ?? 0,
     bashTailSig(ch.bashTail),
     ch.explanation ? textSig(ch.explanation) : "",
     ch.objective ? textSig(ch.objective) : "",
@@ -348,6 +349,7 @@ export function messageSignature(
         m.error ? 1 : 0,
         m.partialJson ? m.partialJson.length : 0,
         m.inputJson ? 1 : 0,
+        m._inputRevision ?? 0,
         m.inputPreview ? m.inputPreview.length : 0,
         bashTailSig(m.bashTail),
       ].join("|");

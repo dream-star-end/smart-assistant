@@ -56,6 +56,7 @@ import type {
   OutboundPermissionRequestWire,
   OutboundPermissionSettledWire,
 } from "./frames";
+import { childSignature, messageSignature } from "./render";
 
 // ─── helpers ──────────────────────────────────────────────────────────
 function sess(id = "s1", agentId = "main") {
@@ -687,6 +688,8 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     const first = s.messages.find((m) => m.role === "tool" && m.blockId === "patch-live-1");
     expect(first?.id).toBe("srv-tool-patch-live-1");
     expect(first?._partial).toBe(true);
+    expect(first?._inputRevision).toBe(1);
+    const firstSignature = messageSignature(first!, { isLast: true, sending: true });
 
     applyOutboundMessage(s, msgFrame({
       frameSeq: 2,
@@ -701,12 +704,96 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     const cards = s.messages.filter((m) => m.role === "tool" && m.blockId === "patch-live-1");
     expect(cards).toHaveLength(1);
     expect(cards[0].id).toBe(first?.id);
+    expect(cards[0]._inputRevision).toBe(2);
+    expect(messageSignature(cards[0], { isLast: true, sending: true })).not.toBe(firstSignature);
     expect(cards[0].inputJson).toEqual({
       file_path: "/tmp/live.ts",
       kind: "update",
       changes: latestChanges,
     });
     expect(cards[0]._partial).toBe(true);
+  });
+
+  test("delegate child structured snapshots update one tool and both child/parent signatures", () => {
+    const s = sess();
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      blocks: [{
+        kind: "tool_use",
+        toolName: "delegate_task",
+        blockId: "delegate-live-patch",
+        partial: false,
+        inputJson: { agentId: "hidden-reviewer", goal: "stream a patch" },
+      }],
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "delegate-live-patch-run",
+        agentId: "hidden-reviewer",
+        goal: "stream a patch",
+        phase: "start",
+        text: "开始",
+      }],
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 3,
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "delegate-live-patch-run",
+        agentId: "hidden-reviewer",
+        phase: "tool",
+        block: {
+          kind: "tool_use",
+          blockId: "child-live-patch",
+          toolName: "Write",
+          partial: true,
+          inputJson: {
+            file_path: "/tmp/child.ts",
+            kind: "add",
+            changes: [{ path: "/tmp/child.ts", kind: { type: "add" }, diff: "first" }],
+          },
+        },
+      }],
+    }));
+
+    const group = s.messages.find((m) => m.role === "agent-group")!;
+    const child = group.childBlocks!.find((block) => block.blockId === "child-live-patch")!;
+    const firstChildSignature = childSignature(child);
+    const firstParentSignature = messageSignature(group, { isLast: true, sending: true });
+    expect(child._inputRevision).toBe(1);
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 4,
+      blocks: [{
+        kind: "delegate_progress",
+        runId: "delegate-live-patch-run",
+        agentId: "hidden-reviewer",
+        phase: "tool",
+        block: {
+          kind: "tool_use",
+          blockId: "child-live-patch",
+          toolName: "Write",
+          partial: true,
+          inputJson: {
+            file_path: "/tmp/child.ts",
+            kind: "add",
+            changes: [{ path: "/tmp/child.ts", kind: { type: "add" }, diff: "first\nsecond" }],
+          },
+        },
+      }],
+    }));
+
+    const latestChildren = group.childBlocks!.filter((block) => block.blockId === "child-live-patch");
+    expect(latestChildren).toHaveLength(1);
+    expect(latestChildren[0]).toBe(child);
+    expect(latestChildren[0]._inputRevision).toBe(2);
+    expect(childSignature(latestChildren[0])).not.toBe(firstChildSignature);
+    expect(messageSignature(group, { isLast: true, sending: true })).not.toBe(firstParentSignature);
+    expect(latestChildren[0].inputJson).toMatchObject({
+      changes: [{ diff: "first\nsecond" }],
+    });
   });
 
   test("tool partial offset mismatch drops buffer (no torn JSON)", () => {

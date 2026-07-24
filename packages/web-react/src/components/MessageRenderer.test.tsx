@@ -95,6 +95,48 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(document.body.textContent).toContain("新后台输出");
   });
 
+  test("已挂载 Write 卡按 structured input revision 实时刷新同一张 diff", () => {
+    const tool = mk("tool", {
+      id: "live-write-snapshot",
+      toolName: "Write",
+      _partial: true,
+      _inputRevision: 1,
+      inputJson: {
+        file_path: "/tmp/live.txt",
+        kind: "add",
+        changes: [{ path: "/tmp/live.txt", kind: { type: "add" }, diff: "LINE-0001" }],
+      },
+    });
+    const view = renderMsg(tool, { sending: true });
+    expect(document.body.textContent).toContain("LINE-0001");
+    expect(screen.getAllByText("写入文件")).toHaveLength(1);
+
+    tool.inputJson = {
+      file_path: "/tmp/live.txt",
+      kind: "add",
+      changes: [{
+        path: "/tmp/live.txt",
+        kind: { type: "add" },
+        diff: "LINE-0001\nLINE-0002",
+      }],
+    };
+    tool._inputRevision = 2;
+    view.rerender(
+      <MessageRenderer
+        message={tool}
+        sig={messageSignature(tool, { isLast: true, sending: true })}
+        isLast
+        sending
+        inActiveTurn
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+
+    expect(document.body.textContent).toContain("LINE-0002");
+    expect(screen.getAllByText("写入文件")).toHaveLength(1);
+  });
+
   test("assistant：超长终态正文逐段挂载且最终字符可达", () => {
     const marker = "EXACT_ASSISTANT_FINAL_MARKER";
     renderMsg(mk("assistant", { text: `${"x".repeat(270_000)}${marker}` }));

@@ -348,7 +348,10 @@ function appendSubagentBlock(
       const dr = applyPartialJsonDelta(existing.partialJson, block);
       if (dr.action === "set") existing.partialJson = dr.value;
       else if (dr.action === "drop") delete existing.partialJson;
-      if (block.inputJson !== undefined && block.inputJson !== null) existing.inputJson = block.inputJson;
+      if (block.inputJson !== undefined && block.inputJson !== null) {
+        existing.inputJson = block.inputJson;
+        existing._inputRevision = (existing._inputRevision ?? 0) + 1;
+      }
       existing._partial = !!block.partial;
       if (!block.partial) delete existing.partialJson;
       if (block.toolName) existing.toolName = block.toolName;
@@ -363,6 +366,7 @@ function appendSubagentBlock(
         toolName: block.toolName || "unknown",
         inputPreview: block.inputPreview || "",
         inputJson: block.inputJson != null ? block.inputJson : null,
+        ...(block.inputJson != null ? { _inputRevision: 1 } : {}),
         ...(initialPartialJson !== undefined ? { partialJson: initialPartialJson } : {}),
         _partial: !!block.partial,
         _completed: false,
@@ -1517,7 +1521,10 @@ export function applyOutboundMessage(
           const deltaResult = applyPartialJsonDelta(existing.partialJson, tb);
           if (deltaResult.action === "set") existing.partialJson = deltaResult.value;
           else if (deltaResult.action === "drop") delete existing.partialJson;
-          if (tb.inputJson) existing.inputJson = tb.inputJson;
+          if (tb.inputJson !== undefined && tb.inputJson !== null) {
+            existing.inputJson = tb.inputJson;
+            existing._inputRevision = (existing._inputRevision ?? 0) + 1;
+          }
           existing._partial = !!tb.partial;
           if (!tb.partial) {
             delete existing.partialJson;
@@ -1532,6 +1539,7 @@ export function applyOutboundMessage(
           blockId: tb.blockId,
           inputPreview: tb.inputPreview || "",
           inputJson: tb.inputJson || null,
+          ...(tb.inputJson != null ? { _inputRevision: 1 } : {}),
           partialJson: (() => {
             const r = applyPartialJsonDelta(null, tb);
             return r.action === "set" ? r.value : undefined;
