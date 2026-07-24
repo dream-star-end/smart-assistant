@@ -2727,13 +2727,11 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       .toEqual({ label: "已连接", cls: "connected" }));
   });
 
-  test("journal storage failure blocks physical send, warns, then retries the exact commit", async () => {
+  test("journal storage failure sends once with neutral confirmation until durable admission", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     let rejectCommit!: (error: Error) => void;
     const failedCommit = new Promise<void>((_resolve, reject) => { rejectCommit = reject; });
-    const persistPendingDispatch = vi.fn()
-      .mockImplementationOnce(() => failedCommit)
-      .mockResolvedValue(undefined);
+    const persistPendingDispatch = vi.fn(() => failedCommit);
     const sock = makeSocket({ persistPendingDispatch });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
@@ -2742,18 +2740,15 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "wait for safe storage" });
     const user = sock.sessions.get("s1")!.messages.find((message) => message.role === "user")!;
     rejectCommit(new Error("quota"));
-    await vi.waitFor(() => expect(sock.getTransientNotice("s1")?.text ?? "").toContain("消息尚未发送"));
-    expect(ws.sent.some((raw) => {
+    await vi.waitFor(() => expect(ws.sent.filter((raw) => {
       const frame = JSON.parse(raw);
       return frame.type === "inbound.message" && frame.clientMessageId === user.id;
-    })).toBe(false);
-    expect(user.status).toBe("queued");
-
-    await vi.waitFor(() => expect(ws.sent.some((raw) => {
-      const frame = JSON.parse(raw);
-      return frame.type === "inbound.message" && frame.clientMessageId === user.id;
-    })).toBe(true), { timeout: 2500 });
-    expect(persistPendingDispatch).toHaveBeenCalledTimes(2);
+    })).toHaveLength(1));
+    expect(persistPendingDispatch).toHaveBeenCalledTimes(1);
+    expect(sock.getTransientNotice("s1")?.text).toBe("正在确认发送…");
+    expect(sock.getTransientNotice("s1")?.text).not.toContain("浏览器");
+    expect(user.status).toBe("sending");
+    expect(sock.sessions.get("s1")?._sendingInFlight).toBeFalsy();
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.ack",
       admitted: true,
@@ -2761,6 +2756,34 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       clientMessageId: user.id,
     }) });
     expect(user.status).toBe("sent");
+    expect(sock.sessions.get("s1")?._sendingInFlight).toBe(true);
+    expect(sock.getTransientNotice("s1")).toBeNull();
+  });
+
+  test("journal-less unadmitted send reconnects with the exact same identity", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistPendingDispatch = vi.fn().mockRejectedValue(new Error("storage disabled"));
+    const sock = makeSocket({ persistPendingDispatch });
+    sock.setGateReady(true);
+    const first = FakeWS.instances.at(-1)!;
+    first.open();
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "same logical send" });
+    await vi.waitFor(() => expect(first.sent.some((raw) =>
+      JSON.parse(raw).type === "inbound.message")).toBe(true));
+    const firstFrame = first.sent.map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.message");
+
+    first.close(1006, "network lost before ack");
+    sock.connect();
+    const second = FakeWS.instances.at(-1)!;
+    second.open();
+    await vi.waitFor(() => expect(second.sent.filter((raw) =>
+      JSON.parse(raw).type === "inbound.message")).toHaveLength(1));
+    const replay = second.sent.map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.message");
+    expect(replay.clientMessageId).toBe(firstFrame.clientMessageId);
+    expect(replay.idempotencyKey).toBe(firstFrame.idempotencyKey);
   });
 
   test("a pending journal commit survives reconnect without a racing second attempt", async () => {

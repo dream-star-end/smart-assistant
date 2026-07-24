@@ -367,7 +367,6 @@ export class ChatSocket {
    * turn reaches final/error/stop, while other peers may dispatch in parallel. */
   private dispatchSlots = new Map<string, string>();
   private dispatchPumpScheduled = false;
-  private dispatchJournalRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /**
    * 本连接 bridge↔容器 relay 是否已确认建立(收到 sys.relay_ready 即 true)。connect/onclose 复位。
    * readiness 权威统一:冷启时 ws.onopen(握手完成)早于 relay 就绪,relay_ready 才是"可投递"的
@@ -876,10 +875,6 @@ export class ChatSocket {
     );
     if (index < 0) return false;
     this.offlineQueue.splice(index, 1);
-    const retryKey = `${sessId}\0${clientMessageId}`;
-    const retryTimer = this.dispatchJournalRetryTimers.get(retryKey);
-    if (retryTimer) clearTimeout(retryTimer);
-    this.dispatchJournalRetryTimers.delete(retryKey);
     this.maybePromoteToConnected();
     const durableClear = this.deps.deletePendingDispatch?.(sessId, clientMessageId);
     if (durableClear) void durableClear.catch(() => {});
@@ -1797,10 +1792,6 @@ export class ChatSocket {
     this.offlineQueue = this.offlineQueue.filter((item) => item.sessId !== sessId);
     for (const item of removed) {
       void this.deps.deletePendingDispatch?.(sessId, item.msgId).catch(() => {});
-      const key = `${sessId}\0${item.msgId}`;
-      const timer = this.dispatchJournalRetryTimers.get(key);
-      if (timer) clearTimeout(timer);
-      this.dispatchJournalRetryTimers.delete(key);
     }
     this.maybePromoteToConnected();
     this.pendingRepoBind.delete(sessId);
@@ -1822,8 +1813,6 @@ export class ChatSocket {
     this.serverSessionInflight.clear();
     this.dispatchSlots.clear();
     this.offlineQueue = [];
-    for (const timer of this.dispatchJournalRetryTimers.values()) clearTimeout(timer);
-    this.dispatchJournalRetryTimers.clear();
     this.pendingRepoBind.clear();
     this.transientNotices.clear();
     this.lastSyncAt.clear();
@@ -2777,7 +2766,7 @@ export class ChatSocket {
       if (sess._sendingInFlight && sess._activeClientMessageId !== item.msgId) continue;
       this.dispatchSlots.set(item.sessId, item.msgId);
       item.state = "persisting";
-      this.setTransientNotice(sess.id, "正在安全保存发送记录，保存完成后立即发送…");
+      this.setTransientNotice(sess.id, "正在发送…");
       const committed = this.deps.persistPendingDispatch?.(item.sessId, {
         msgId: item.msgId,
         payload: item.payload,
@@ -2798,30 +2787,12 @@ export class ChatSocket {
 
   private handleDispatchJournalFailure(item: OfflineItem): void {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
-    item.state = "queued";
-    const sess = this.sessions.get(item.sessId);
-    const user = sess?.messages.find(
-      (message) => message.role === "user" && message.id === item.msgId,
-    );
-    if (user) user.status = "queued";
-    if (sess) {
-      this.setTransientNotice(
-        sess.id,
-        "消息尚未发送：正在等待浏览器保存发送恢复记录，可点击停止取消。",
-      );
-    }
-    const key = `${item.sessId}\0${item.msgId}`;
-    if (!this.dispatchJournalRetryTimers.has(key)) {
-      const timer = setTimeout(() => {
-        this.dispatchJournalRetryTimers.delete(key);
-        this.kickDispatchPump();
-      }, 1000);
-      this.dispatchJournalRetryTimers.set(key, timer);
-    }
-    this.scheduleNotify();
+    // Local recovery storage is an enhancement, not a delivery gate. Keep the
+    // exact in-memory identity until the server ACK and send immediately.
+    this.sendPersistedDispatch(item, false);
   }
 
-  private sendPersistedDispatch(item: OfflineItem): void {
+  private sendPersistedDispatch(item: OfflineItem, journalCommitted = true): void {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
     if (
       !this.ws || this.ws.readyState !== 1 || !this.relayReady ||
@@ -2843,7 +2814,8 @@ export class ChatSocket {
     // that omits its optional clientMessageId still bind to this exact turn.
     // The user-visible thinking clock remains off until authority confirms.
     sess._activeClientMessageId = item.msgId;
-    this.clearTransientNotice(sess.id);
+    if (journalCommitted) this.clearTransientNotice(sess.id);
+    else this.setTransientNotice(sess.id, "正在确认发送…");
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
   }

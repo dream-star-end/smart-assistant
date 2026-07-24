@@ -90,12 +90,13 @@ export function detectServerTerminalTurns(
   return out;
 }
 
-/** IndexedDB schema v2 separates the exact outbound journal from stale-able
- * whole-session snapshots. A second tab may overwrite its cache, but it can
- * no longer erase another tab's unacknowledged send. */
-const DB_VERSION = 2;
+/** The session cache stays on whichever schema version already exists. The
+ * exact outbound journal has its own DB so a frontend rollback never opens an
+ * already-upgraded session DB with a lower explicit version. */
+const DISPATCH_DB_VERSION = 1;
 const SESSION_STORE = "sessions";
 const PENDING_DISPATCH_STORE = "pending_dispatches";
+const SETTLED_DISPATCH_STORE = "settled_dispatches";
 
 function pendingDispatchKey(sessId: string, msgId: string): string {
   return `${sessId}\0${msgId}`;
@@ -164,11 +165,20 @@ function resolveFactory(explicit?: IDBFactory): IDBFactory | null {
 class IdbKV {
   private readonly dbName: string;
   private readonly factory: IDBFactory | null;
+  private readonly version: number | undefined;
+  private readonly storesToCreate: readonly string[];
   private dbp: Promise<IDBDatabase | null> | null = null;
 
-  constructor(dbName: string, factory?: IDBFactory) {
+  constructor(
+    dbName: string,
+    storesToCreate: readonly string[],
+    factory?: IDBFactory,
+    version?: number,
+  ) {
     this.dbName = dbName;
     this.factory = resolveFactory(factory);
+    this.version = version;
+    this.storesToCreate = storesToCreate;
   }
 
   private openDb(): Promise<IDBDatabase | null> {
@@ -189,54 +199,17 @@ class IdbKV {
       };
       let req: IDBOpenDBRequest;
       try {
-        req = f.open(this.dbName, DB_VERSION);
+        req = this.version === undefined
+          ? f.open(this.dbName)
+          : f.open(this.dbName, this.version);
       } catch {
         finish(null);
         return;
       }
-      req.onupgradeneeded = (event) => {
+      req.onupgradeneeded = () => {
         const db = req.result;
-        const tx = req.transaction;
-        const oldVersion = typeof event?.oldVersion === "number" ? event.oldVersion : 0;
-        const sessions = db.objectStoreNames.contains(SESSION_STORE)
-          ? tx?.objectStore(SESSION_STORE)
-          : db.createObjectStore(SESSION_STORE);
-        const pending = db.objectStoreNames.contains(PENDING_DISPATCH_STORE)
-          ? tx?.objectStore(PENDING_DISPATCH_STORE)
-          : db.createObjectStore(PENDING_DISPATCH_STORE);
-        // v1 kept the journal inside a whole-session value. Move and scrub it
-        // in this versionchange transaction so hydration cannot re-import a
-        // dispatch already deleted from the v2 store.
-        if (
-          oldVersion < 2 && sessions && pending &&
-          typeof sessions.openCursor === "function"
-        ) {
-          const cursorReq = sessions.openCursor();
-          cursorReq.onsuccess = () => {
-            const cursor = cursorReq.result;
-            if (!cursor) return;
-            const value = cursor.value as StoredSession;
-            const legacy = Array.isArray(value?._pendingDispatches)
-              ? value._pendingDispatches
-              : [];
-            for (const item of legacy) {
-              if (
-                item && typeof value?.id === "string" && value.id &&
-                typeof item.msgId === "string" && item.msgId
-              ) {
-                pending.put(
-                  { sessId: value.id, ...item } satisfies StoredPendingDispatchRecord,
-                  pendingDispatchKey(value.id, item.msgId),
-                );
-              }
-            }
-            if (Object.prototype.hasOwnProperty.call(value ?? {}, "_pendingDispatches")) {
-              const { _pendingDispatches: legacyPending, ...clean } = value;
-              void legacyPending;
-              cursor.update(clean);
-            }
-            cursor.continue();
-          };
+        for (const storeName of this.storesToCreate) {
+          if (!db.objectStoreNames.contains(storeName)) db.createObjectStore(storeName);
         }
       };
       req.onsuccess = () => {
@@ -248,9 +221,6 @@ class IdbKV {
         finish(db);
       };
       req.onerror = () => finish(null);
-      // Wait for the older tab to close. New-code connections close
-      // themselves on versionchange; a genuinely old v1 tab remains a visible
-      // "saving send record" wait instead of bypassing the physical-send fence.
       req.onblocked = () => {};
     });
     this.dbp = opening;
@@ -335,14 +305,45 @@ class IdbKV {
   deleteDurably(storeName: string, key: string): Promise<void> {
     return this.mutateCommitted(storeName, (s) => s.delete(key));
   }
-  async clearAll(): Promise<void> {
+  settleDispatchDurably(key: string, settledAt: number): Promise<void> {
+    return this.openDb().then((db) => {
+      if (!db) throw new Error("indexeddb unavailable");
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const fail = (reason: unknown) => {
+          if (settled) return;
+          settled = true;
+          reject(reason instanceof Error ? reason : new Error("indexeddb transaction failed"));
+        };
+        try {
+          const tx = db.transaction(
+            [PENDING_DISPATCH_STORE, SETTLED_DISPATCH_STORE],
+            "readwrite",
+          );
+          tx.objectStore(SETTLED_DISPATCH_STORE).put({ key, settledAt }, key);
+          tx.objectStore(PENDING_DISPATCH_STORE).delete(key);
+          tx.onerror = () => fail(tx.error);
+          tx.onabort = () => fail(tx.error);
+          tx.oncomplete = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+        } catch (error) {
+          fail(error);
+        }
+      });
+    });
+  }
+  async clearStores(storeNames: readonly string[]): Promise<void> {
     const db = await this.openDb();
     if (!db) return;
+    const existing = storeNames.filter((storeName) => db.objectStoreNames.contains(storeName));
+    if (existing.length === 0) return;
     await new Promise<void>((resolve) => {
       try {
-        const tx = db.transaction([SESSION_STORE, PENDING_DISPATCH_STORE], "readwrite");
-        tx.objectStore(SESSION_STORE).clear();
-        tx.objectStore(PENDING_DISPATCH_STORE).clear();
+        const tx = db.transaction(existing, "readwrite");
+        for (const storeName of existing) tx.objectStore(storeName).clear();
         tx.oncomplete = () => resolve();
         tx.onerror = () => resolve();
         tx.onabort = () => resolve();
@@ -367,6 +368,10 @@ export function dbNameForUser(userId: string | null | undefined): string {
     .replace(/[^a-zA-Z0-9_-]/g, "_")
     .slice(0, 80);
   return `ocv5_sessions__${safe}`;
+}
+
+export function dispatchDbNameForUser(userId: string | null | undefined): string {
+  return dbNameForUser(userId).replace("ocv5_sessions__", "ocv5_dispatches__");
 }
 
 /**
@@ -1338,7 +1343,9 @@ export function stableSortByTs(
  */
 export class SessionStore {
   readonly userId: string;
-  private readonly kv: IdbKV;
+  private readonly sessionsKv: IdbKV;
+  private readonly dispatchKv: IdbKV;
+  private readonly pendingJournalWrites = new Set<Promise<void>>();
   // wipe 后置 dead：让随后到来的 flush/debounce 写（如登出 teardown 的 final flush）变 no-op，
   // 否则 live 会话会被重新写回刚清空的命名空间 → 击穿隐私 wipe。store 实例随即丢弃，
   // 同用户再登录会另建新实例（alive）。
@@ -1346,42 +1353,107 @@ export class SessionStore {
 
   constructor(userId: string, factory?: IDBFactory) {
     this.userId = userId;
-    this.kv = new IdbKV(dbNameForUser(userId), factory);
+    // No explicit version: opening an existing v1 or v2 session cache never
+    // attempts a downgrade. New databases get only the cache store.
+    this.sessionsKv = new IdbKV(dbNameForUser(userId), [SESSION_STORE], factory);
+    this.dispatchKv = new IdbKV(
+      dispatchDbNameForUser(userId),
+      [PENDING_DISPATCH_STORE, SETTLED_DISPATCH_STORE],
+      factory,
+      DISPATCH_DB_VERSION,
+    );
   }
 
   async putSession(s: StoredSession): Promise<void> {
     if (this.dead || !s?.id) return;
-    await this.kv.put(SESSION_STORE, s.id, s);
+    const { _pendingDispatches: legacyPending, ...clean } = s;
+    void legacyPending;
+    await this.sessionsKv.put(SESSION_STORE, s.id, clean);
   }
   /** Whole-session durable write. It deliberately cannot mutate the exact
    * pending-dispatch store. */
   async putSessionDurably(s: StoredSession): Promise<void> {
     if (this.dead) throw new Error("session store is closed");
     if (!s?.id) throw new Error("session id is required");
-    await this.kv.putDurably(SESSION_STORE, s.id, s);
+    const { _pendingDispatches: legacyPending, ...clean } = s;
+    void legacyPending;
+    await this.sessionsKv.putDurably(SESSION_STORE, s.id, clean);
   }
   /** Exact journal write: success means its own readwrite transaction committed. */
   async putPendingDispatch(sessId: string, item: StoredPendingDispatch): Promise<void> {
     if (this.dead) throw new Error("session store is closed");
     if (!sessId || !item?.msgId) throw new Error("pending dispatch identity is required");
-    await this.kv.putDurably(
+    const write = this.dispatchKv.putDurably(
       PENDING_DISPATCH_STORE,
       pendingDispatchKey(sessId, item.msgId),
       { sessId, ...item } satisfies StoredPendingDispatchRecord,
     );
+    this.pendingJournalWrites.add(write);
+    try {
+      await write;
+    } finally {
+      this.pendingJournalWrites.delete(write);
+    }
   }
   async deletePendingDispatch(sessId: string, msgId: string): Promise<void> {
     if (this.dead || !sessId || !msgId) return;
-    await this.kv.deleteDurably(PENDING_DISPATCH_STORE, pendingDispatchKey(sessId, msgId));
+    const key = pendingDispatchKey(sessId, msgId);
+    await this.dispatchKv.settleDispatchDurably(key, Date.now());
+    // Bridge releases can coexist with the earlier v2 store. The durable
+    // tombstone above is the stale-writer fence; these are only cleanup.
+    await this.sessionsKv.deleteDurably(PENDING_DISPATCH_STORE, key).catch(() => {});
+    const session = await this.sessionsKv.get<StoredSession>(SESSION_STORE, sessId);
+    if (session?._pendingDispatches?.some((item) => item.msgId === msgId)) {
+      const { _pendingDispatches: legacyPending, ...clean } = session;
+      const remaining = legacyPending.filter((item) => item.msgId !== msgId);
+      await this.sessionsKv.put(
+        SESSION_STORE,
+        sessId,
+        remaining.length > 0 ? { ...clean, _pendingDispatches: remaining } : clean,
+      );
+    }
   }
+
+  private async collectPendingDispatches(
+    sessions?: StoredSession[],
+  ): Promise<StoredPendingDispatchRecord[]> {
+    const sessionRows = sessions ?? await this.sessionsKv.getAll<StoredSession>(SESSION_STORE);
+    const [pending, legacyV2, settled] = await Promise.all([
+      this.dispatchKv.getAll<StoredPendingDispatchRecord>(PENDING_DISPATCH_STORE),
+      this.sessionsKv.getAll<StoredPendingDispatchRecord>(PENDING_DISPATCH_STORE),
+      this.dispatchKv.getAll<{ key?: string }>(SETTLED_DISPATCH_STORE),
+    ]);
+    const settledKeys = new Set(
+      settled.flatMap((item) => typeof item?.key === "string" ? [item.key] : []),
+    );
+    const unresolved = new Map<string, StoredPendingDispatchRecord>();
+    const add = (item: StoredPendingDispatchRecord) => {
+      if (
+        !item || typeof item.sessId !== "string" || !item.sessId ||
+        typeof item.msgId !== "string" || !item.msgId
+      ) return;
+      const key = pendingDispatchKey(item.sessId, item.msgId);
+      if (!settledKeys.has(key) && !unresolved.has(key)) unresolved.set(key, item);
+    };
+    for (const item of pending) add(item);
+    for (const item of legacyV2) add(item);
+    for (const session of sessionRows) {
+      if (!session?.id || !Array.isArray(session._pendingDispatches)) continue;
+      for (const item of session._pendingDispatches) add({ sessId: session.id, ...item });
+    }
+    return [...unresolved.values()].sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+  }
+
   async getPendingDispatches(): Promise<StoredPendingDispatchRecord[]> {
     if (this.dead) return [];
-    return this.kv.getAll<StoredPendingDispatchRecord>(PENDING_DISPATCH_STORE);
+    return this.collectPendingDispatches();
   }
   /** Hydration-only view: merge the independent journal into session values
    * in memory without ever writing it back into the sessions store. */
   async getAllForHydration(): Promise<StoredSession[]> {
-    const [sessions, pending] = await Promise.all([this.getAll(), this.getPendingDispatches()]);
+    if (this.dead) return [];
+    const sessions = await this.sessionsKv.getAll<StoredSession>(SESSION_STORE);
+    const pending = await this.collectPendingDispatches(sessions);
     const bySession = new Map<string, StoredPendingDispatch[]>();
     for (const item of pending) {
       if (!item || typeof item.sessId !== "string") continue;
@@ -1449,28 +1521,53 @@ export class SessionStore {
   }
   getSession(id: string): Promise<StoredSession | undefined> {
     if (this.dead) return Promise.resolve(undefined);
-    return this.kv.get<StoredSession>(SESSION_STORE, id);
+    return this.sessionsKv.get<StoredSession>(SESSION_STORE, id).then((session) => {
+      if (!session) return undefined;
+      const { _pendingDispatches: legacyPending, ...clean } = session;
+      void legacyPending;
+      return clean;
+    });
   }
-  getAll(): Promise<StoredSession[]> {
-    if (this.dead) return Promise.resolve([]);
-    return this.kv.getAll<StoredSession>(SESSION_STORE);
+  async getAll(): Promise<StoredSession[]> {
+    if (this.dead) return [];
+    const sessions = await this.sessionsKv.getAll<StoredSession>(SESSION_STORE);
+    return sessions.map((session) => {
+      const { _pendingDispatches: legacyPending, ...clean } = session;
+      void legacyPending;
+      return clean;
+    });
   }
   async deleteSession(id: string): Promise<void> {
     if (this.dead) return;
-    await this.kv.delete(SESSION_STORE, id);
     const pending = await this.getPendingDispatches();
     await Promise.all(
       pending
         .filter((item) => item.sessId === id)
         .map((item) => this.deletePendingDispatch(id, item.msgId)),
     );
+    await this.sessionsKv.delete(SESSION_STORE, id);
   }
   /** 清空本 user 命名空间（登出/隐私收尾）。同步置 dead 防 wipe 与 final flush 竞态。*/
   async wipe(): Promise<void> {
     this.dead = true;
-    await this.kv.clearAll();
+    await Promise.allSettled([...this.pendingJournalWrites]);
+    const pending = await this.collectPendingDispatches();
+    await Promise.allSettled(
+      pending.map((item) =>
+        this.dispatchKv.settleDispatchDurably(
+          pendingDispatchKey(item.sessId, item.msgId),
+          Date.now(),
+        )),
+    );
+    // Settled identities contain no payload and deliberately survive logout:
+    // an old v1 tab may still write an acknowledged inline journal back later.
+    await Promise.all([
+      this.sessionsKv.clearStores([SESSION_STORE, PENDING_DISPATCH_STORE]),
+      this.dispatchKv.clearStores([PENDING_DISPATCH_STORE]),
+    ]);
   }
   close(): void {
-    this.kv.close();
+    this.sessionsKv.close();
+    this.dispatchKv.close();
   }
 }
