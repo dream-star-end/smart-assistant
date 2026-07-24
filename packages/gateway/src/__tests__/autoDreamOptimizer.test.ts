@@ -7,7 +7,9 @@ import { describe, it } from 'node:test'
 const testHome = await mkdtemp(join(tmpdir(), 'oc-auto-dream-optimizer-'))
 process.env.OPENCLAUDE_HOME = testHome
 
-const { AutoDreamOptimizerService } = await import('../autoDreamOptimizer.js')
+const { AutoDreamOptimizerService, packAutoDreamAuditPages } = await import(
+  '../autoDreamOptimizer.js'
+)
 const { paths } = await import('@openclaude/storage')
 
 const enabledPolicy = {
@@ -34,6 +36,8 @@ describe('AutoDreamOptimizerService', () => {
       runModel: async (input) => {
         phases.push(input.phase)
         if (input.phase === 'map') {
+          assert.match(input.prompt, /platform skills and settings/)
+          assert.match(input.prompt, /session actions and logs/)
           return JSON.stringify({
             summary: `mapped ${phases.length}`,
             done: true,
@@ -82,7 +86,7 @@ describe('AutoDreamOptimizerService', () => {
     })
 
     const state = await service.run('reduce', true)
-    assert.deepEqual(phases, ['map', 'map', 'reduce_ingest', 'synthesis'])
+    assert.deepEqual(phases, ['map', 'reduce_ingest', 'synthesis'])
     assert.equal(finished, 1)
     assert.equal(state.summary, 'cross-page synthesis')
     assert.equal(state.proposals[0]?.before, 'authoritative current rules')
@@ -137,6 +141,7 @@ describe('AutoDreamOptimizerService', () => {
       hydrateProposals: async ({ proposals }) => proposals,
       reportPlatformFindings: async () => {},
       applyProposal: async () => ({ ok: true }),
+      mapBatchChars: 1,
     })
 
     const state = await service.run('lossless-pagination', true)
@@ -150,6 +155,406 @@ describe('AutoDreamOptimizerService', () => {
       state.proposals.some((proposal) => proposal.targetId === 'memory/synthesis-1-0.md'),
       true,
     )
+  })
+
+  it('packs arbitrary evidence with reversible JSON framing without truncating oversized pages', () => {
+    const pages = [
+      '',
+      '--- evidence page boundary ---',
+      '"quoted"\\nline',
+      '\ud800',
+      '🙂',
+      'x'.repeat(257),
+    ]
+    const batches = packAutoDreamAuditPages(pages, 64)
+    const decoded = batches.flatMap((batch) => {
+      const framed = JSON.parse(batch.framedEvidence) as { evidencePages: string[] }
+      assert.equal(framed.evidencePages.length, batch.sourcePageCount)
+      return framed.evidencePages
+    })
+    assert.deepEqual(decoded, pages)
+    assert.ok(
+      batches.some((batch) => batch.framedEvidence.length > 64),
+      'an oversized source page must pass through intact instead of being truncated',
+    )
+  })
+
+  it('losslessly batches a 686-page audit, runs at concurrency four, and reduces map output in source order', async () => {
+    const pages = Array.from({ length: 686 }, (_, index) =>
+      JSON.stringify({ index, content: `${index}:`.padEnd(2_048, String(index % 10)) }),
+    )
+    const expectedBatches = packAutoDreamAuditPages(pages)
+    assert.ok(expectedBatches.length < 80)
+    const decodedByBatch: string[][] = []
+    const callIds = new Set<string>()
+    const reducePrompts: string[] = []
+    let active = 0
+    let maxActive = 0
+    let releaseFirstWave!: () => void
+    const firstWave = new Promise<void>((resolve) => {
+      releaseFirstWave = resolve
+    })
+    const service = new AutoDreamOptimizerService({
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages,
+        sessionsReviewed: 949,
+        throughSeq: 686,
+      }),
+      runModel: async (input) => {
+        assert.equal(callIds.has(input.callId), false)
+        callIds.add(input.callId)
+        if (input.phase === 'map') {
+          const batchIndex = Number(input.callId.split(':').at(-1))
+          const framed = JSON.parse(input.prompt.slice(input.prompt.lastIndexOf('\n\n') + 2)) as {
+            evidencePages: string[]
+          }
+          decodedByBatch[batchIndex] = framed.evidencePages
+          active++
+          maxActive = Math.max(maxActive, active)
+          if (maxActive === 4) releaseFirstWave()
+          if (batchIndex < 4) await firstWave
+          active--
+          return JSON.stringify({
+            summary: `batch-${batchIndex}`,
+            done: true,
+            userProposals: [
+              {
+                category: 'memory',
+                action: 'memory.upsert',
+                title: `batch-${batchIndex}`,
+                reason: 'retained batch signal',
+                targetId: `memory/batch-${batchIndex}.md`,
+                before: '',
+                after: `batch-${batchIndex}`,
+              },
+            ],
+            platformFindings: [],
+          })
+        }
+        if (input.phase === 'reduce_ingest') {
+          reducePrompts.push(input.prompt)
+          return JSON.stringify({
+            summary: 'ingested',
+            done: true,
+            userProposals: [],
+            platformFindings: [],
+          })
+        }
+        return JSON.stringify({
+          summary: 'complete',
+          done: true,
+          userProposals: [],
+          platformFindings: [],
+        })
+      },
+      hydrateProposals: async ({ proposals }) => proposals,
+      reportPlatformFindings: async () => {},
+      applyProposal: async () => ({ ok: true }),
+    })
+
+    const state = await service.run('scale-686', true)
+    assert.equal(state.status, 'success')
+    assert.equal(maxActive, 4)
+    assert.deepEqual(decodedByBatch.flat(), pages)
+    assert.equal(state.pagesReviewed, 686)
+    assert.equal(state.sessionsReviewed, 949)
+    assert.equal(state.proposals.length, expectedBatches.length)
+    const reduceText = reducePrompts.join('')
+    const positions = expectedBatches.map((_, index) =>
+      reduceText.indexOf(`"summary":"batch-${index}"`),
+    )
+    for (let index = 0; index < positions.length; index++) {
+      assert.ok(positions[index]! >= 0, `batch ${index} must be present in reduce input`)
+      if (index > 0) {
+        assert.ok(
+          positions[index - 1]! < positions[index]!,
+          `batch ${index - 1} must precede batch ${index} in reduce input`,
+        )
+      }
+    }
+  })
+
+  it('publishes monotonic live progress and stops scheduling after cancellation while in-flight batches settle', async () => {
+    let startedCount = 0
+    let active = 0
+    let finishedModelRun = false
+    const releases: Array<() => void> = []
+    let bothStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      bothStarted = resolve
+    })
+    const deps: ConstructorParameters<typeof AutoDreamOptimizerService>[0] = {
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages: ['one', 'two', 'three', 'four'],
+        sessionsReviewed: 4,
+        throughSeq: 4,
+      }),
+      runModel: async ({ phase }) => {
+        assert.equal(phase, 'map')
+        active++
+        startedCount++
+        if (startedCount === 2) bothStarted()
+        await new Promise<void>((resolve) => releases.push(resolve))
+        active--
+        return JSON.stringify({
+          summary: `done-${startedCount}`,
+          done: true,
+          userProposals: [
+            {
+              category: 'memory',
+              action: 'memory.upsert',
+              title: `done-${startedCount}`,
+              reason: 'completed before cancellation converged',
+              targetId: `memory/done-${startedCount}.md`,
+              before: '',
+              after: 'retained',
+            },
+          ],
+          platformFindings: [],
+        })
+      },
+      finishModelRun: async () => {
+        assert.equal(active, 0)
+        finishedModelRun = true
+      },
+      hydrateProposals: async ({ proposals }) => proposals,
+      reportPlatformFindings: async () => {},
+      applyProposal: async () => ({ ok: true }),
+      mapConcurrency: 2,
+      mapBatchChars: 1,
+    }
+    const service = new AutoDreamOptimizerService(deps)
+    const canceller = new AutoDreamOptimizerService(deps)
+    const run = service.run('cancel-progress', true)
+    await started
+    const initial = await service.getPublicState('cancel-progress')
+    assert.deepEqual(initial.progress, {
+      stage: 'mapping',
+      sessionsTotal: 4,
+      evidencePagesTotal: 4,
+      evidencePagesReviewed: 0,
+      mapBatchesTotal: 4,
+      mapBatchesCompleted: 0,
+      reducePagesTotal: 0,
+      reducePagesCompleted: 0,
+      synthesisPagesCompleted: 0,
+    })
+
+    await canceller.cancel('cancel-progress')
+    releases.shift()!()
+    while (
+      (await service.getPublicState('cancel-progress')).progress?.evidencePagesReviewed !== 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    releases.shift()!()
+    const state = await run
+    assert.equal(startedCount, 2)
+    assert.equal(finishedModelRun, true)
+    assert.equal(state.status, 'cancelled')
+    assert.equal(state.pagesReviewed, 2)
+    assert.equal(state.progress, undefined)
+  })
+
+  it('waits for every in-flight model lifecycle before failing and never schedules another batch', async () => {
+    let startedCount = 0
+    let active = 0
+    let failFirst!: () => void
+    let releaseOthers!: () => void
+    let markAllStarted!: () => void
+    const firstFailure = new Promise<void>((resolve) => {
+      failFirst = resolve
+    })
+    const othersRelease = new Promise<void>((resolve) => {
+      releaseOthers = resolve
+    })
+    const allStarted = new Promise<void>((resolve) => {
+      markAllStarted = resolve
+    })
+    let cleanupActive = -1
+    const service = new AutoDreamOptimizerService({
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages: Array.from({ length: 8 }, (_, index) => `page-${index}`),
+        sessionsReviewed: 8,
+        throughSeq: 8,
+      }),
+      runModel: async ({ callId }) => {
+        const index = Number(callId.split(':').at(-1))
+        active++
+        startedCount++
+        if (startedCount === 4) markAllStarted()
+        if (index === 0) {
+          await firstFailure
+          active--
+          throw new Error('injected model lifecycle failure')
+        }
+        await othersRelease
+        active--
+        return JSON.stringify({
+          summary: `settled-${index}`,
+          done: true,
+          userProposals: [],
+          platformFindings: [],
+        })
+      },
+      finishModelRun: async () => {
+        cleanupActive = active
+      },
+      hydrateProposals: async ({ proposals }) => proposals,
+      reportPlatformFindings: async () => {},
+      applyProposal: async () => ({ ok: true }),
+      mapConcurrency: 4,
+      mapBatchChars: 1,
+    })
+
+    const run = service.run('failure-settle', true)
+    await allStarted
+    failFirst()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal((await service.getPublicState('failure-settle')).status, 'running')
+    releaseOthers()
+    const state = await run
+    assert.equal(state.status, 'failed')
+    assert.match(state.error ?? '', /injected model lifecycle failure/)
+    assert.equal(startedCount, 4)
+    assert.equal(cleanupActive, 0)
+    assert.equal(state.progress?.evidencePagesReviewed, 3)
+  })
+
+  it('persists each audit stage before entering its model or hydration work', async () => {
+    let enterMap!: () => void
+    let releaseMap!: () => void
+    let enterReduce!: () => void
+    let releaseReduce!: () => void
+    let enterSynthesis!: () => void
+    let releaseSynthesis!: () => void
+    let enterHydration!: () => void
+    let releaseHydration!: () => void
+    const mapEntered = new Promise<void>((resolve) => {
+      enterMap = resolve
+    })
+    const mapRelease = new Promise<void>((resolve) => {
+      releaseMap = resolve
+    })
+    const reduceEntered = new Promise<void>((resolve) => {
+      enterReduce = resolve
+    })
+    const reduceRelease = new Promise<void>((resolve) => {
+      releaseReduce = resolve
+    })
+    const synthesisEntered = new Promise<void>((resolve) => {
+      enterSynthesis = resolve
+    })
+    const synthesisRelease = new Promise<void>((resolve) => {
+      releaseSynthesis = resolve
+    })
+    const hydrationEntered = new Promise<void>((resolve) => {
+      enterHydration = resolve
+    })
+    const hydrationRelease = new Promise<void>((resolve) => {
+      releaseHydration = resolve
+    })
+    const service = new AutoDreamOptimizerService({
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages: ['one'],
+        sessionsReviewed: 1,
+        throughSeq: 1,
+      }),
+      runModel: async ({ phase }) => {
+        if (phase === 'map') {
+          enterMap()
+          await mapRelease
+        } else if (phase === 'reduce_ingest') {
+          enterReduce()
+          await reduceRelease
+        } else {
+          enterSynthesis()
+          await synthesisRelease
+        }
+        return JSON.stringify({
+          summary: phase,
+          done: true,
+          userProposals: [],
+          platformFindings: [],
+        })
+      },
+      hydrateProposals: async ({ proposals }) => {
+        enterHydration()
+        await hydrationRelease
+        return proposals
+      },
+      reportPlatformFindings: async () => {},
+      applyProposal: async () => ({ ok: true }),
+    })
+
+    const run = service.run('progress-stages', true)
+    await mapEntered
+    assert.equal((await service.getPublicState('progress-stages')).progress?.stage, 'mapping')
+    releaseMap()
+    await reduceEntered
+    assert.equal((await service.getPublicState('progress-stages')).progress?.stage, 'reducing')
+    releaseReduce()
+    await synthesisEntered
+    assert.equal((await service.getPublicState('progress-stages')).progress?.stage, 'synthesizing')
+    releaseSynthesis()
+    await hydrationEntered
+    assert.equal((await service.getPublicState('progress-stages')).progress?.stage, 'finalizing')
+    releaseHydration()
+    const state = await run
+    assert.equal(state.status, 'success')
+    assert.equal(state.progress, undefined)
+  })
+
+  it('linearizes a cancellation during finalizing before the success commit', async () => {
+    let enterHydration!: () => void
+    let releaseHydration!: () => void
+    const hydrationEntered = new Promise<void>((resolve) => {
+      enterHydration = resolve
+    })
+    const hydrationRelease = new Promise<void>((resolve) => {
+      releaseHydration = resolve
+    })
+    const deps: ConstructorParameters<typeof AutoDreamOptimizerService>[0] = {
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages: ['one'],
+        sessionsReviewed: 1,
+        throughSeq: 99,
+      }),
+      runModel: async ({ phase }) =>
+        JSON.stringify({
+          summary: phase,
+          done: true,
+          userProposals: [],
+          platformFindings: [],
+        }),
+      hydrateProposals: async ({ proposals }) => {
+        enterHydration()
+        await hydrationRelease
+        return proposals
+      },
+      reportPlatformFindings: async () => {},
+      applyProposal: async () => ({ ok: true }),
+    }
+    const service = new AutoDreamOptimizerService(deps)
+    const canceller = new AutoDreamOptimizerService(deps)
+
+    const run = service.run('cancel-finalizing', true)
+    await hydrationEntered
+    assert.equal((await service.getPublicState('cancel-finalizing')).progress?.stage, 'finalizing')
+    const cancelling = await canceller.cancel('cancel-finalizing')
+    assert.ok(cancelling.cancelRequestedAt)
+    releaseHydration()
+    const state = await run
+    assert.equal(state.status, 'cancelled')
+    assert.equal(state.pagesReviewed, 1)
+    assert.equal(state.sessionsProcessedThroughSeq, undefined)
+    assert.equal(state.progress, undefined)
+    assert.match(state.summary ?? '', /停止前产生的建议/)
   })
 
   it('stops a done=false synthesis page with no new signal and preserves earlier paid results', async () => {
