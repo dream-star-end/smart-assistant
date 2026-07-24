@@ -110,6 +110,31 @@ describe('InboundMessage schema', () => {
       content: { text: '模型正文\n[附件提示]', displayText: '模型正文' },
     }), true)
   })
+  it('accepts complete recovery lineage and rejects partial lineage', () => {
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      clientMessageId: 'm-recover-abc',
+      content: {
+        text: 'continue',
+        recovery: {
+          sourceClientMessageId: 'cm-source',
+          mode: 'checkpoint',
+          automatic: true,
+        },
+      },
+    }), true)
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      clientMessageId: 'm-recover-abc',
+      content: {
+        text: 'continue',
+        recovery: {
+          sourceClientMessageId: 'cm-source',
+          mode: 'checkpoint',
+        },
+      },
+    }), false)
+  })
   it('accepts an exact reply snapshot and rejects malformed reply identities', () => {
     assert.equal(Value.Check(InboundMessage, {
       ...(baseInbound() as object),

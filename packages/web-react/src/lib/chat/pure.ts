@@ -347,8 +347,10 @@ export const RESTART_CONTINUE_PROMPT =
   "你上一条回复因服务重启被中断。请从中断处继续输出剩余内容,不要重复已经输出的部分,直接接着写。";
 export const RESTART_CONTINUE_DISPLAY = "↻ 服务重启中断,自动续写";
 export const INTERRUPTED_CONTINUE_PROMPT =
-  "继续完成刚才被中断的任务。先检查本会话中已经完成的步骤和已有结果，从断点继续；不要重复已经执行的操作、不要重复已经输出的内容。";
+  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续；不要重新执行已经完成的步骤，不要重复已经输出的内容。若外部写操作的结果仍不明确，不得重复提交，先核对状态或向用户说明。";
 export const INTERRUPTED_CONTINUE_DISPLAY = "↻ 从断点继续";
+export const AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY = "↻ 自动从断点继续";
+export const AUTOMATIC_RECOVERY_REPLAY_DISPLAY = "↻ 自动重试";
 
 export function isAutoContinueMsg(m: {
   _isAutoRetry?: boolean;

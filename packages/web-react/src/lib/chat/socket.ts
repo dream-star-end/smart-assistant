@@ -42,7 +42,6 @@ import {
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
 import {
-  errorPresentation,
   isDispatchLostCode,
   isDispatchTerminalRow,
 } from "./render";
@@ -60,6 +59,8 @@ import {
 import { appUpdate } from "../appUpdate";
 import {
   AUTO_CONTINUE_DISPLAY,
+  AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
+  AUTOMATIC_RECOVERY_REPLAY_DISPLAY,
   contextRebuiltNotice,
   INTERRUPTED_CONTINUE_DISPLAY,
   INTERRUPTED_CONTINUE_PROMPT,
@@ -111,9 +112,12 @@ import type {
 } from "./frames";
 import { incidentStore } from "../incidentStore";
 import {
+  assessTurnRecoveryTape,
   DEFAULT_CODEX_ENGINE_MODEL,
   isClientMessageId,
   normalizeTurnErrorCode,
+  supportsAutomaticTurnRecovery,
+  turnRecoveryIdentity,
 } from "@openclaude/protocol";
 import type { RefreshOutcome } from "../types";
 
@@ -194,15 +198,6 @@ export function messageAttemptIdempotencyKey(clientMessageId: string, attempt: n
   return `webh:${hash.toString(36)}:${safeAttempt}`;
 }
 
-function stableContinuationHash(value: string): string {
-  let hash = 0xcbf29ce484222325n;
-  for (let i = 0; i < value.length; i++) {
-    hash ^= BigInt(value.charCodeAt(i));
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-  }
-  return hash.toString(36);
-}
-
 /** Durable browser identity for exactly one continuation of an interrupted
  * turn. Independent tabs and reloads must mint the same id so the existing
  * durable dispatch inbox, not a short client TTL, owns exactly-once admission. */
@@ -210,30 +205,25 @@ export function interruptedContinuationIdentity(
   sessionId: string,
   interruptedClientMessageId: string,
 ): { clientMessageId: string; idempotencyKey: string } {
-  const hash = stableContinuationHash(`${sessionId}\0${interruptedClientMessageId}`);
-  return {
-    clientMessageId: `m-cont-${hash}`,
-    idempotencyKey: `continue-interrupted-${hash}`,
-  };
+  return turnRecoveryIdentity(sessionId, interruptedClientMessageId);
 }
 
 export type InterruptedContinuationTarget = {
   user: ChatMessage;
+  error: ChatMessage;
+  mode: "checkpoint" | "replay";
   clientMessageId: string;
   idempotencyKey: string;
 };
 
-/** Resolve a truthful checkpoint continuation from already-loaded durable
- * rows. No large tape payload is fetched merely to advertise a CTA. */
-export function interruptedContinuationTarget(
+function baseTurnRecoveryTarget(
   messages: ChatMessage[],
   error: ChatMessage,
   sessionId: string,
-): InterruptedContinuationTarget | undefined {
+): { user: ChatMessage; error: ChatMessage; rows: ChatMessage[] } | undefined {
   const normalizedCode = normalizeTurnErrorCode(error._errorCode);
-  if (normalizedCode !== "idle_timeout" && normalizedCode !== "liveness_timeout") {
-    return undefined;
-  }
+  if (!supportsAutomaticTurnRecovery(normalizedCode)) return undefined;
+  if (error._source !== "server" && !error._turnTapeId) return undefined;
   const interruptedClientMessageId = error._clientMessageId;
   if (!interruptedClientMessageId) return undefined;
   const userIndex = messages.findIndex(
@@ -242,6 +232,8 @@ export function interruptedContinuationTarget(
   if (userIndex < 0) return undefined;
   const user = messages[userIndex];
   if (!user._routing) return undefined;
+  const errorIndex = messages.indexOf(error);
+  if (errorIndex <= userIndex) return undefined;
   if (messages.slice(userIndex + 1).some((message) => message.role === "user")) {
     return undefined;
   }
@@ -251,27 +243,69 @@ export function interruptedContinuationTarget(
       (message) =>
         message.id === identity.clientMessageId ||
         message._idem === identity.idempotencyKey ||
-        message._continuationOfClientMessageId === interruptedClientMessageId,
+        message._continuationOfClientMessageId === interruptedClientMessageId ||
+        message._recoveryOfClientMessageId === interruptedClientMessageId,
     )
   ) {
     return undefined;
   }
-  const hasDurableProcess = messages.slice(userIndex + 1).some((message) => {
-    if (message._source !== "server" && !message._turnTapeId) return false;
-    if (message.role === "thinking" || message.role === "tool") return true;
-    if (message.role !== "assistant") return false;
-    if (!message._errorCode) return message.text.trim().length > 0;
-    return (
-      (errorPresentation(
-        message._errorCode,
-        message.text,
-        message._errorDetail,
-        message.usage?.waived === true,
-      ).bodyText?.trim().length ?? 0) > 0
-    );
-  });
-  if (!hasDurableProcess) return undefined;
-  return { user, ...identity };
+  return { user, error, rows: messages.slice(userIndex + 1, errorIndex) };
+}
+
+/** Manual fallback for a durable interrupted turn. It stays visible when an
+ * unresolved external side effect blocks automatic recovery. */
+export function interruptedContinuationTarget(
+  messages: ChatMessage[],
+  error: ChatMessage,
+  sessionId: string,
+): InterruptedContinuationTarget | undefined {
+  const base = baseTurnRecoveryTarget(messages, error, sessionId);
+  if (!base) return undefined;
+  const durableRows = base.rows.filter(
+    (message) => message._source === "server" || !!message._turnTapeId,
+  );
+  if (assessTurnRecoveryTape(durableRows).mode !== "checkpoint") return undefined;
+  return {
+    user: base.user,
+    error: base.error,
+    mode: "checkpoint",
+    ...interruptedContinuationIdentity(sessionId, base.user.id),
+  };
+}
+
+/** Automatic recovery is deliberately stricter than the manual CTA: exact
+ * durable rows only, one outer hop, and no unresolved tool/permission state. */
+export function automaticTurnRecoveryTarget(
+  messages: ChatMessage[],
+  error: ChatMessage,
+  sessionId: string,
+): InterruptedContinuationTarget | undefined {
+  const base = baseTurnRecoveryTarget(messages, error, sessionId);
+  if (
+    !base ||
+    base.user._automaticRecovery === true ||
+    (base.user._source !== "server" && !base.user._turnTapeId)
+  ) {
+    return undefined;
+  }
+  const durableRows = base.rows.filter(
+    (message) => message._source === "server" || !!message._turnTapeId,
+  );
+  const assessment = assessTurnRecoveryTape(durableRows);
+  const mode = assessment.mode;
+  if (!assessment.checkpointSafe) return undefined;
+  if (
+    mode === "replay" &&
+    (base.user._userPayloadDeferred === true || !preciseRetryEligible(base.user))
+  ) {
+    return undefined;
+  }
+  return {
+    user: base.user,
+    error: base.error,
+    mode,
+    ...interruptedContinuationIdentity(sessionId, base.user.id),
+  };
 }
 
 export type ChatSnapshot = {
@@ -371,6 +405,9 @@ export class ChatSocket {
   /** 建行 PUT 在途的会话 id→共享 Promise。发送与“先设目标”并发时必须等待同一
    * 结果，不能让后到调用者把“已有请求在途”误判成建行失败。 */
   private serverSessionInflight = new Map<string, Promise<boolean>>();
+  /** One browser-side reconciliation worker per failed logical turn. The
+   * deterministic recovery id remains the cross-tab/reload dedup authority. */
+  private automaticRecoveryPending = new Set<string>();
 
   // ── 订阅 / 批量 notify ──
   private listeners = new Set<() => void>();
@@ -1074,6 +1111,9 @@ export class ChatSocket {
       scheduleRestartContinue: (sessId) => {
         setTimeout(() => this.autoContinueAfterRestart(sessId), 0);
       },
+      scheduleAutomaticRecovery: (sessId, clientMessageId) => {
+        setTimeout(() => void this.autoRecoverTerminalTurn(sessId, clientMessageId), 0);
+      },
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
@@ -1482,6 +1522,10 @@ export class ChatSocket {
       }
       case "outbound.ack": {
         const frame = f as AckWire;
+        if (frame.recoverySkipped) {
+          this.reconcileSkippedRecovery(frame);
+          return;
+        }
         if (frame.admitted && frame.peer?.id && frame.clientMessageId) {
           this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId);
         }
@@ -1532,6 +1576,32 @@ export class ChatSocket {
     const user = sess.messages.find((m) => m.role === "user" && m.id === clientMessageId);
     if (user) user.status = "sent";
     void this.deps.syncSession?.(sessId, { clientMessageId });
+    this.scheduleNotify();
+    return true;
+  }
+
+  /** Atomic master lineage rejection: remove only the deterministic recovery
+   * child. The original user/process/error tape remains untouched and visible. */
+  private reconcileSkippedRecovery(frame: AckWire): boolean {
+    const sessId = frame.peer?.id;
+    const clientMessageId = frame.clientMessageId;
+    if (!sessId || !clientMessageId) return false;
+    const sess = this.sessions.get(sessId);
+    if (!sess) return false;
+    const userIndex = sess.messages.findIndex((message) =>
+      message.role === "user" &&
+      message.id === clientMessageId &&
+      message._isAutoRetry === true &&
+      !!message._recoveryOfClientMessageId);
+    if (userIndex < 0) return false;
+    this.finishDispatch(sessId, clientMessageId);
+    if (sess._activeClientMessageId === clientMessageId) {
+      this.clearSendingState(sess, { clearThinking: true, persist: false });
+    }
+    sess.messages = sess.messages.filter((message, index) =>
+      index !== userIndex &&
+      message._genPlaceholder?.afterUserMsgId !== clientMessageId);
+    this.deps.persistSession?.(sessId);
     this.scheduleNotify();
     return true;
   }
@@ -2270,6 +2340,20 @@ export class ChatSocket {
     // 终态收敛(RFC §5 M5):载荷自证已收尾的 turn → 清发送态 + 落 user 行终态(显式,不巧合)。
     this.convergeTerminalTurns(s, terminalTurns);
     this.scheduleNotify();
+    const tailRecoverableError = [...s.messages].reverse().find((message) =>
+      message.role === "assistant" &&
+      !!message._errorCode &&
+      (message._source === "server" || !!message._turnTapeId) &&
+      supportsAutomaticTurnRecovery(message._errorCode));
+    if (tailRecoverableError) {
+      setTimeout(
+        () => void this.autoRecoverTerminalTurn(
+          s.id,
+          tailRecoverableError._clientMessageId,
+        ),
+        0,
+      );
+    }
     // Login/reload can open WS before REST history arrives. If that initial
     // shell hello had no user-row identity it can only produce a generic
     // resume_failed. Once full history exposes trailing persisted user rows,
@@ -2705,6 +2789,108 @@ export class ChatSocket {
     this.kickDispatchPump();
   }
 
+  private dispatchTurnRecovery(
+    sess: ChatSession,
+    target: InterruptedContinuationTarget,
+    agentId: string,
+    automatic: boolean,
+  ): void {
+    if (sess._sendingInFlight) return;
+    const routing = normalizeRetiredRouting(target.user._routing);
+    if (!routing) return;
+    const resolvedAgentId = sess.agentId || agentId;
+    void this.ensureServerSessionOnce(sess, resolvedAgentId);
+    const replay = target.mode === "replay"
+      ? exactUserReplayPayload(target.user)
+      : null;
+    const modelText = replay?.text ?? INTERRUPTED_CONTINUE_PROMPT;
+    const displayText = automatic
+      ? target.mode === "checkpoint"
+        ? AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY
+        : AUTOMATIC_RECOVERY_REPLAY_DISPLAY
+      : INTERRUPTED_CONTINUE_DISPLAY;
+    const content: InboundMessage["content"] = {
+      text: modelText,
+      displayText,
+      ...(replay?.media ? { media: replay.media } : {}),
+      ...(replay?.imageEdit ? { imageEdit: replay.imageEdit } : {}),
+      ...(replay?.replyTo ? { replyTo: replay.replyTo } : {}),
+      recovery: {
+        sourceClientMessageId: target.user.id,
+        mode: target.mode,
+        automatic,
+      },
+    };
+    const payload: InboundMessage = {
+      type: "inbound.message",
+      idempotencyKey: target.idempotencyKey,
+      channel: "webchat",
+      peer: { id: sess.id, kind: "dm" },
+      agentId: resolvedAgentId,
+      content,
+      ...(replay?.replyTo ? { replyToId: replay.replyTo.messageId } : {}),
+      ...(Object.prototype.hasOwnProperty.call(routing, "effortLevel")
+        ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
+        : {}),
+      ...(routing.model ? { model: routing.model } : {}),
+      ...(routing.teamMode ? { teamMode: true } : {}),
+      ts: Date.now(),
+      clientMessageId: target.clientMessageId,
+    };
+    const userMsg = addMessage(sess, "user", displayText, {
+      id: target.clientMessageId,
+      status: "sending",
+      _isAutoRetry: true,
+      _modelText: modelText,
+      ...(replay?.media ? { _media: replay.media } : {}),
+      ...(replay?.imageEdit ? { _imageEdit: replay.imageEdit } : {}),
+      ...(replay?.replyTo ? { _replyTo: replay.replyTo } : {}),
+      _idem: target.idempotencyKey,
+      _routing: { ...routing },
+      _continuationOfClientMessageId: target.user.id,
+      _recoveryOfClientMessageId: target.user.id,
+      _recoveryMode: target.mode,
+      _automaticRecovery: automatic,
+    });
+    sess._lastRouting = { ...routing };
+    if (replay?.imageEdit) {
+      this.ensureGenPlaceholder(sess, replay.imageEdit, true, userMsg.id);
+    }
+    this.dispatchPayload(sess, userMsg, payload);
+  }
+
+  private async autoRecoverTerminalTurn(
+    sessId: string,
+    clientMessageId?: string,
+  ): Promise<void> {
+    const pendingKey = `${sessId}\0${clientMessageId ?? "tail"}`;
+    if (this.automaticRecoveryPending.has(pendingKey)) return;
+    this.automaticRecoveryPending.add(pendingKey);
+    try {
+      await this.deps.syncSession?.(
+        sessId,
+        clientMessageId ? { clientMessageId } : undefined,
+      );
+      const sess = this.sessions.get(sessId);
+      if (!sess || sess._sendingInFlight) return;
+      const error = [...sess.messages].reverse().find((message) =>
+        message.role === "assistant" &&
+        !!message._errorCode &&
+        (clientMessageId === undefined || message._clientMessageId === clientMessageId));
+      if (!error) return;
+      const target = automaticTurnRecoveryTarget(sess.messages, error, sess.id);
+      if (!target) return;
+      this.dispatchTurnRecovery(
+        sess,
+        target,
+        sess.agentId || this.deps.defaultAgentId || "main",
+        true,
+      );
+    } finally {
+      this.automaticRecoveryPending.delete(pendingKey);
+    }
+  }
+
   /** Continue one interrupted, already-executed turn without replaying its
    * original prompt or attachments. The old tape remains immutable; this
    * appends a separately admitted user turn in the same native session. */
@@ -2721,35 +2907,7 @@ export class ChatSocket {
     if (!error) return;
     const target = interruptedContinuationTarget(sess.messages, error, sess.id);
     if (!target) return;
-    const routing = normalizeRetiredRouting(target.user._routing);
-    if (!routing) return;
-    void this.ensureServerSessionOnce(sess, sess.agentId || p.agentId);
-    const payload: InboundMessage = {
-      type: "inbound.message",
-      idempotencyKey: target.idempotencyKey,
-      channel: "webchat",
-      peer: { id: sess.id, kind: "dm" },
-      agentId: sess.agentId || p.agentId,
-      content: { text: INTERRUPTED_CONTINUE_PROMPT },
-      ...(Object.prototype.hasOwnProperty.call(routing, "effortLevel")
-        ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
-        : {}),
-      ...(routing.model ? { model: routing.model } : {}),
-      ...(routing.teamMode ? { teamMode: true } : {}),
-      ts: Date.now(),
-      clientMessageId: target.clientMessageId,
-    };
-    const userMsg = addMessage(sess, "user", INTERRUPTED_CONTINUE_DISPLAY, {
-      id: target.clientMessageId,
-      status: "sending",
-      _isAutoRetry: true,
-      _modelText: INTERRUPTED_CONTINUE_PROMPT,
-      _idem: target.idempotencyKey,
-      _routing: { ...routing },
-      _continuationOfClientMessageId: target.user.id,
-    });
-    sess._lastRouting = { ...routing };
-    this.dispatchPayload(sess, userMsg, payload);
+    this.dispatchTurnRecovery(sess, target, p.agentId, false);
   }
 
   /**

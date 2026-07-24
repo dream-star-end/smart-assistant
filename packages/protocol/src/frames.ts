@@ -156,6 +156,16 @@ export const InboundMessage = Type.Object({
         height: Type.Integer({ minimum: 1, maximum: 8192 }),
       }),
     ),
+    /** A visible child turn that resumes one finalized exact tape, or exactly
+     * replays a verified not-accepted dispatch. Master validates lineage
+     * atomically; container model input consumes only `text`. */
+    recovery: Type.Optional(
+      Type.Object({
+        sourceClientMessageId: ClientMessageId,
+        mode: Type.Union([Type.Literal('checkpoint'), Type.Literal('replay')]),
+        automatic: Type.Boolean(),
+      }),
+    ),
   }),
   replyToId: Type.Optional(Type.String()),
   // Effort/reasoning-depth override for this session (一般来自 Web 前端的"编码模式/科研模式/GPT思考深度" pill)。
