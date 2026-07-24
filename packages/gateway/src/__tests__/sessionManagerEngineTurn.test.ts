@@ -191,6 +191,44 @@ function submitWithReplayLifecycle(
   );
 }
 
+test("logical-turn cancellation fences the gateway retry loop above one EngineTurnRun", async () => {
+  const sm = new SessionManager(makeConfigStub());
+  const runner = new FakeCcbRunner(() => {});
+  const session = makeSession(runner);
+  const controller = new AbortController();
+  const timeout = Object.assign(new Error("idle timeout"), { code: "TURN_IDLE_TIMEOUT" });
+  let attempts = 0;
+  const original = (sm as unknown as { _runOneTurn: unknown })._runOneTurn;
+  (sm as unknown as { _runOneTurn: () => Promise<void> })._runOneTurn = async () => {
+    attempts += 1;
+    controller.abort(timeout);
+    throw new Error("AbortError: upstream attempt aborted");
+  };
+  try {
+    await assert.rejects(
+      (sm as unknown as {
+        runOneTurnWithRetry: (...args: unknown[]) => Promise<void>;
+      }).runOneTurnWithRetry(
+        session,
+        "hello",
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        controller.signal,
+      ),
+      (error) => error === timeout,
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    (sm as unknown as { _runOneTurn: unknown })._runOneTurn = original;
+  }
+});
+
 describe("tool.called structured metadata", () => {
   test("parser result metadata reaches the observability event unchanged", async () => {
     const sm = new SessionManager(makeConfigStub());

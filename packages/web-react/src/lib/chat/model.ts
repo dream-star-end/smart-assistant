@@ -226,6 +226,8 @@ export type ChatMessage = {
   _isAutoRetry?: boolean;
   /** auto-continue 的确定性 idempotencyKey（dedup ack 对账）。*/
   _idem?: string;
+  /** The interrupted user turn this deterministic continuation resumes. */
+  _continuationOfClientMessageId?: string;
 
   // ── assistant / 通用 ──
   usage?: MsgUsage;

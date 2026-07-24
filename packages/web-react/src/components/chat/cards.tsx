@@ -76,6 +76,10 @@ export type CardCallbacks = {
   onFeedback?: (ctx: FeedbackContext) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   onRetrySend?: (msg: ChatMessage) => void;
+  /** Resume an executed interrupted turn as one new, deduplicated user turn. */
+  onContinueInterrupted?: (error: ChatMessage) => void;
+  /** Truthful checkpoint gate: original routing + durable process evidence. */
+  resolveInterruptedContinuation?: (error: ChatMessage) => ChatMessage | undefined;
   /** 把 user / assistant 消息的精确快照带回 Composer。 */
   onQuote?: (msg: ChatMessage) => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
@@ -519,10 +523,26 @@ export function AssistantCard({
   // 造第二套轮判定。历史中间错误卡:不显示任何重发按钮(标题/正文/详情照旧)。
   // 「去充值」是导航非重发,不受此门控。
   const isLastTurn = ctx.inActiveTurn === true;
+  const interruptedContinuationTarget =
+    isLastTurn && ctx.isLast
+      ? cb.resolveInterruptedContinuation?.(msg)
+      : undefined;
+  const showInterruptedContinuation =
+    !!interruptedContinuationTarget && !!cb.onContinueInterrupted;
   const showPreciseRetry = !isInsufficient && isLastTurn && !!retryTarget;
-  const showRegenFallback = !isInsufficient && isLastTurn && !retryTarget && !!cb.onRegenerate;
+  const showRegenFallback =
+    !isInsufficient &&
+    isLastTurn &&
+    !showInterruptedContinuation &&
+    !retryTarget &&
+    !!cb.onRegenerate;
   const showTopUp = isInsufficient && !!cb.onTopUp;
-  const showActionRow = showTopUp || showPreciseRetry || showRegenFallback || (isLastTurn && showSwitchModelHint);
+  const showActionRow =
+    showTopUp ||
+    showInterruptedContinuation ||
+    showPreciseRetry ||
+    showRegenFallback ||
+    (isLastTurn && showSwitchModelHint);
   // Finalized immutable tapes may contain a deferred runtime batch after the
   // canonical assistant row. That transport row must still mount and decode,
   // but it must not take the current turn's regenerate action away from the
@@ -619,6 +639,15 @@ export function AssistantCard({
                     // insufficient_credits「去充值」= 导航非重发,不受末轮门控。
                     <Button size="sm" variant="accent" shape="pill" onClick={cb.onTopUp}>
                       <Wallet size={14} /> 去充值
+                    </Button>
+                  ) : showInterruptedContinuation ? (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      shape="pill"
+                      onClick={() => cb.onContinueInterrupted?.(msg)}
+                    >
+                      <RotateCcw size={14} /> 从断点继续
                     </Button>
                   ) : showPreciseRetry ? (
                     // 末轮 + 精确路径可用:优先精确重发原轮(复用原 payload 含附件),不走 onRegenerate。

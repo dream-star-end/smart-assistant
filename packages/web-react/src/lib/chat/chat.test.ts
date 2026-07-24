@@ -44,6 +44,8 @@ import {
 import {
   ChatSocket,
   exactUserReplayPayload,
+  interruptedContinuationIdentity,
+  interruptedContinuationTarget,
   messageAttemptIdempotencyKey,
   preciseRetryEligible,
   type ChatSocketDeps,
@@ -2163,6 +2165,80 @@ describe("preciseRetryEligible(Codex 审计 R4:精确重试完整性硬门)", ()
   });
 });
 
+describe("interruptedContinuationTarget (durable 断点续跑)", () => {
+  const routing = { model: "kimi-k3-ark", teamMode: false, effortLevel: "high" as const };
+  const rows = (): ChatMessage[] => [
+    {
+      id: "u-interrupted",
+      role: "user",
+      text: "发布这张图",
+      ts: 1,
+      status: "read",
+      _routing: routing,
+      _media: [{ kind: "image", url: "https://example.test/original.png" }],
+    },
+    {
+      id: "thinking-1",
+      role: "thinking",
+      text: "已经完成图片处理",
+      ts: 2,
+      _source: "server",
+      _turnTapeId: "tape-1",
+      _clientMessageId: "u-interrupted",
+    },
+    {
+      id: "error-1",
+      role: "assistant",
+      text: "",
+      ts: 3,
+      _source: "server",
+      _turnTapeId: "tape-1",
+      _clientMessageId: "u-interrupted",
+      _errorCode: "LIVENESS_TIMEOUT",
+      usage: { waived: true },
+    },
+  ];
+
+  test("刷新后 user status 非 error，仍凭原 routing + durable process 给出断点目标", () => {
+    const messages = rows();
+    const target = interruptedContinuationTarget(messages, messages[2], "s1");
+    expect(target?.user.id).toBe("u-interrupted");
+    expect(target?.clientMessageId).toMatch(/^m-cont-[A-Za-z0-9_-]+$/);
+  });
+
+  test("只有 user + terminal，或过程尚非 durable 时，不承诺断点续跑", () => {
+    const messages = rows();
+    messages.splice(1, 1);
+    expect(interruptedContinuationTarget(messages, messages[1], "s1")).toBeUndefined();
+    messages.splice(1, 0, {
+      id: "local-thinking",
+      role: "thinking",
+      text: "仅本地乐观过程",
+      ts: 2,
+      _clientMessageId: "u-interrupted",
+    });
+    expect(interruptedContinuationTarget(messages, messages[2], "s1")).toBeUndefined();
+  });
+
+  test("已有后继 user/continuation 时旧错误不再可续，且 identity 跨实例稳定", () => {
+    const first = interruptedContinuationIdentity("s1", "u-interrupted");
+    const second = interruptedContinuationIdentity("s1", "u-interrupted");
+    const other = interruptedContinuationIdentity("s1", "u-other");
+    expect(first).toEqual(second);
+    expect(first.clientMessageId).not.toBe(other.clientMessageId);
+    const messages = rows();
+    messages.push({
+      id: first.clientMessageId,
+      role: "user",
+      text: "↻ 从断点继续",
+      ts: 4,
+      _idem: first.idempotencyKey,
+      _continuationOfClientMessageId: "u-interrupted",
+    });
+    expect(interruptedContinuationTarget(messages, messages[2], "s1")).toBeUndefined();
+  });
+});
+
 describe("applyCostWaived (turn 免单退款)", () => {
   test("迟到的 A 轮免单只修改精确 turnKey，不碰更新的 B 轮或无归属 pending", () => {
     const s = sess();
@@ -2531,6 +2607,138 @@ function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
     ...overrides,
   });
 }
+
+describe("ChatSocket interrupted continuation", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+  });
+
+  test("追加确定性 continuation，不改旧过程、不重传原 prompt/附件，重复点击只发一次", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const session = sock.ensureSession("s1", "main");
+    session.messages.push(
+      {
+        id: "u-interrupted",
+        role: "user",
+        text: "原始任务",
+        ts: 1,
+        status: "read",
+        _routing: { model: "kimi-k3-ark", teamMode: true, effortLevel: "high" },
+        _media: [{ kind: "image", url: "https://example.test/original.png" }],
+      },
+      {
+        id: "tool-1",
+        role: "tool",
+        text: "ImageEdit",
+        ts: 2,
+        _source: "server",
+        _turnTapeId: "tape-1",
+        _clientMessageId: "u-interrupted",
+      },
+      {
+        id: "error-1",
+        role: "assistant",
+        text: "",
+        ts: 3,
+        _source: "server",
+        _turnTapeId: "tape-1",
+        _clientMessageId: "u-interrupted",
+        _errorCode: "idle_timeout",
+        usage: { waived: true },
+      },
+    );
+    const before = session.messages.map((message) => structuredClone(message));
+
+    sock.continueInterruptedTurn({ sessId: "s1", errorMessageId: "error-1", agentId: "main" });
+    sock.continueInterruptedTurn({ sessId: "s1", errorMessageId: "error-1", agentId: "main" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(session.messages.slice(0, before.length)).toEqual(before);
+    expect(session.messages).toHaveLength(before.length + 1);
+    const continuation = session.messages.at(-1)!;
+    const identity = interruptedContinuationIdentity("s1", "u-interrupted");
+    expect(continuation).toMatchObject({
+      id: identity.clientMessageId,
+      role: "user",
+      text: "↻ 从断点继续",
+      _idem: identity.idempotencyKey,
+      _continuationOfClientMessageId: "u-interrupted",
+      _routing: { model: "kimi-k3-ark", teamMode: true, effortLevel: "high" },
+    });
+    const payloads = ws.sent
+      .map((raw) => JSON.parse(raw) as Record<string, any>)
+      .filter((payload) => payload.type === "inbound.message");
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]).toMatchObject({
+      clientMessageId: identity.clientMessageId,
+      idempotencyKey: identity.idempotencyKey,
+      model: "kimi-k3-ark",
+      teamMode: true,
+      effortLevel: "high",
+      content: { text: expect.stringContaining("从断点继续") },
+    });
+    expect(payloads[0].content.media).toBeUndefined();
+    expect(payloads[0].content.text).not.toContain("原始任务");
+    sock.stop();
+  });
+
+  test("两个独立 tab 对同一中断轮生成相同 durable identity", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sockets = [makeSocket(), makeSocket()];
+    for (const sock of sockets) {
+      sock.setGateReady(true);
+      const ws = FakeWS.instances.at(-1)!;
+      ws.open();
+      const session = sock.ensureSession("s1", "main");
+      session.messages.push(
+        {
+          id: "u-interrupted",
+          role: "user",
+          text: "task",
+          ts: 1,
+          status: "read",
+          _routing: { model: "kimi-k3-ark", teamMode: false },
+        },
+        {
+          id: "thinking-1",
+          role: "thinking",
+          text: "progress",
+          ts: 2,
+          _source: "server",
+          _turnTapeId: "tape-1",
+          _clientMessageId: "u-interrupted",
+        },
+        {
+          id: "error-1",
+          role: "assistant",
+          text: "",
+          ts: 3,
+          _source: "server",
+          _turnTapeId: "tape-1",
+          _clientMessageId: "u-interrupted",
+          _errorCode: "LIVENESS_TIMEOUT",
+        },
+      );
+      sock.continueInterruptedTurn({ sessId: "s1", errorMessageId: "error-1", agentId: "main" });
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    const wires = FakeWS.instances.map((ws) =>
+      ws.sent
+        .map((raw) => JSON.parse(raw) as Record<string, any>)
+        .find((payload) => payload.type === "inbound.message"),
+    );
+    expect(wires[0]?.clientMessageId).toBe(wires[1]?.clientMessageId);
+    expect(wires[0]?.idempotencyKey).toBe(wires[1]?.idempotencyKey);
+    sockets.forEach((sock) => sock.stop());
+  });
+});
 
 describe("ChatSocket 1008 auth recovery", () => {
   afterEach(() => {

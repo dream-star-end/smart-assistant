@@ -42,6 +42,7 @@ import {
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
 import {
+  errorPresentation,
   isDispatchLostCode,
   isDispatchTerminalRow,
 } from "./render";
@@ -60,6 +61,8 @@ import { appUpdate } from "../appUpdate";
 import {
   AUTO_CONTINUE_DISPLAY,
   contextRebuiltNotice,
+  INTERRUPTED_CONTINUE_DISPLAY,
+  INTERRUPTED_CONTINUE_PROMPT,
   RESTART_CONTINUE_DISPLAY,
   RESTART_CONTINUE_PROMPT,
   backoffDelay,
@@ -107,7 +110,11 @@ import type {
   RepoStatusWire,
 } from "./frames";
 import { incidentStore } from "../incidentStore";
-import { DEFAULT_CODEX_ENGINE_MODEL, isClientMessageId } from "@openclaude/protocol";
+import {
+  DEFAULT_CODEX_ENGINE_MODEL,
+  isClientMessageId,
+  normalizeTurnErrorCode,
+} from "@openclaude/protocol";
 import type { RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
@@ -185,6 +192,84 @@ export function messageAttemptIdempotencyKey(clientMessageId: string, attempt: n
     hash = BigInt.asUintN(64, hash * 0x100000001b3n);
   }
   return `webh:${hash.toString(36)}:${safeAttempt}`;
+}
+
+function stableContinuationHash(value: string): string {
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= BigInt(value.charCodeAt(i));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(36);
+}
+
+/** Durable browser identity for exactly one continuation of an interrupted
+ * turn. Independent tabs and reloads must mint the same id so the existing
+ * durable dispatch inbox, not a short client TTL, owns exactly-once admission. */
+export function interruptedContinuationIdentity(
+  sessionId: string,
+  interruptedClientMessageId: string,
+): { clientMessageId: string; idempotencyKey: string } {
+  const hash = stableContinuationHash(`${sessionId}\0${interruptedClientMessageId}`);
+  return {
+    clientMessageId: `m-cont-${hash}`,
+    idempotencyKey: `continue-interrupted-${hash}`,
+  };
+}
+
+export type InterruptedContinuationTarget = {
+  user: ChatMessage;
+  clientMessageId: string;
+  idempotencyKey: string;
+};
+
+/** Resolve a truthful checkpoint continuation from already-loaded durable
+ * rows. No large tape payload is fetched merely to advertise a CTA. */
+export function interruptedContinuationTarget(
+  messages: ChatMessage[],
+  error: ChatMessage,
+  sessionId: string,
+): InterruptedContinuationTarget | undefined {
+  const normalizedCode = normalizeTurnErrorCode(error._errorCode);
+  if (normalizedCode !== "idle_timeout" && normalizedCode !== "liveness_timeout") {
+    return undefined;
+  }
+  const interruptedClientMessageId = error._clientMessageId;
+  if (!interruptedClientMessageId) return undefined;
+  const userIndex = messages.findIndex(
+    (message) => message.role === "user" && message.id === interruptedClientMessageId,
+  );
+  if (userIndex < 0) return undefined;
+  const user = messages[userIndex];
+  if (!user._routing) return undefined;
+  if (messages.slice(userIndex + 1).some((message) => message.role === "user")) {
+    return undefined;
+  }
+  const identity = interruptedContinuationIdentity(sessionId, interruptedClientMessageId);
+  if (
+    messages.some(
+      (message) =>
+        message.id === identity.clientMessageId ||
+        message._idem === identity.idempotencyKey ||
+        message._continuationOfClientMessageId === interruptedClientMessageId,
+    )
+  ) {
+    return undefined;
+  }
+  const hasDurableProcess = messages.slice(userIndex + 1).some((message) => {
+    if (message._source !== "server" && !message._turnTapeId) return false;
+    if (message.role === "thinking" || message.role === "tool") return true;
+    if (message.role !== "assistant") return false;
+    if (!message._errorCode) return message.text.trim().length > 0;
+    return errorPresentation(
+      message._errorCode,
+      message.text,
+      message._errorDetail,
+      message.usage?.waived === true,
+    ).bodyText?.trim().length > 0;
+  });
+  if (!hasDurableProcess) return undefined;
+  return { user, ...identity };
 }
 
 export type ChatSnapshot = {
@@ -2616,6 +2701,53 @@ export class ChatSocket {
     userMsg.status = "queued";
     this.scheduleNotify();
     this.kickDispatchPump();
+  }
+
+  /** Continue one interrupted, already-executed turn without replaying its
+   * original prompt or attachments. The old tape remains immutable; this
+   * appends a separately admitted user turn in the same native session. */
+  continueInterruptedTurn(p: {
+    sessId: string;
+    errorMessageId: string;
+    agentId: string;
+  }): void {
+    const sess = this.sessions.get(p.sessId);
+    if (!sess || sess._sendingInFlight) return;
+    const error = sess.messages.find(
+      (message) => message.id === p.errorMessageId && message.role === "assistant",
+    );
+    if (!error) return;
+    const target = interruptedContinuationTarget(sess.messages, error, sess.id);
+    if (!target) return;
+    const routing = normalizeRetiredRouting(target.user._routing);
+    if (!routing) return;
+    void this.ensureServerSessionOnce(sess, sess.agentId || p.agentId);
+    const payload: InboundMessage = {
+      type: "inbound.message",
+      idempotencyKey: target.idempotencyKey,
+      channel: "webchat",
+      peer: { id: sess.id, kind: "dm" },
+      agentId: sess.agentId || p.agentId,
+      content: { text: INTERRUPTED_CONTINUE_PROMPT },
+      ...(Object.prototype.hasOwnProperty.call(routing, "effortLevel")
+        ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
+        : {}),
+      ...(routing.model ? { model: routing.model } : {}),
+      ...(routing.teamMode ? { teamMode: true } : {}),
+      ts: Date.now(),
+      clientMessageId: target.clientMessageId,
+    };
+    const userMsg = addMessage(sess, "user", INTERRUPTED_CONTINUE_DISPLAY, {
+      id: target.clientMessageId,
+      status: "sending",
+      _isAutoRetry: true,
+      _modelText: INTERRUPTED_CONTINUE_PROMPT,
+      _idem: target.idempotencyKey,
+      _routing: { ...routing },
+      _continuationOfClientMessageId: target.user.id,
+    });
+    sess._lastRouting = { ...routing };
+    this.dispatchPayload(sess, userMsg, payload);
   }
 
   /**
