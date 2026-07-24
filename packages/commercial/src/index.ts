@@ -55,6 +55,7 @@ import { createCommercialHandler, type CommercialHandler } from "./http/router.j
 import { deriveMediaSignKey } from "./http/mediaSign.js";
 import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
 import { deriveWechatLiveLinkKey } from "./wechat/liveShare.js";
+import { loadKmsKey, zeroBuffer } from "./crypto/keys.js";
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
@@ -4098,15 +4099,21 @@ export async function registerCommercial(
         if (!policy.enabled || policy.mode !== "optimizer_v2") {
           throw new Error("AUTO_DREAM_INVALID_POLICY");
         }
-        return await reportAutoDreamPlatformFindings(getPool(), {
-          subjectHash: createHmac("sha256", jwtSecret)
-            .update(`auto-dream-platform-finding-user\0${identity.userId}`)
-            .digest("hex"),
-          agentId,
-          runId,
-          model: policy.modelId,
-          findings: body.findings,
-        });
+        const pseudonymKey = loadKmsKey();
+        try {
+          return await reportAutoDreamPlatformFindings(getPool(), {
+            subjectHash: createHmac("sha256", jwtSecret)
+              .update(`auto-dream-platform-finding-user\0${identity.userId}`)
+              .digest("hex"),
+            agentId,
+            runId,
+            model: policy.modelId,
+            findings: body.findings,
+            pseudonymKey,
+          });
+        } finally {
+          zeroBuffer(pseudonymKey);
+        }
       }
       if (path === AUTO_DREAM_OPTIMIZER_ACTION_PATH) {
         const action = requireAutoDreamString(body, "action", /^preference\.patch$/);

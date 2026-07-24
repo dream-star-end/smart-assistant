@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 
 import type { Pool, PoolClient } from 'pg'
 
@@ -25,6 +25,8 @@ const PREFERENCE_KEYS = new Set([
   'wechat_proactive_push',
   'hotkeys',
 ])
+const DERIVED_CAPABILITY = /^auto_dream\.(platform|runtime|routing|integration)\.[0-9a-f]{32}$/
+const SAFE_NIBBLE_ALPHABET = 'abcdefijmnqtuvwy'
 
 export interface PlatformFindingInput {
   taxonomy: string
@@ -46,19 +48,21 @@ export async function reportAutoDreamPlatformFindings(
     runId: string
     model: string
     findings: unknown
+    pseudonymKey: Uint8Array
   },
 ): Promise<{ accepted: number }> {
   if (
     !/^[0-9a-f-]{36}$/.test(input.runId) ||
     !/^[0-9a-f]{64}$/.test(input.subjectHash) ||
-    input.model.length > 64
+    input.model.length > 64 ||
+    input.pseudonymKey.length !== 32
   ) {
     throw new Error('AUTO_DREAM_INVALID_FINDING_ENVELOPE')
   }
   if (!Array.isArray(input.findings) || input.findings.length > 128) {
     throw new Error('AUTO_DREAM_INVALID_FINDINGS')
   }
-  const findings = input.findings.map(validateFinding)
+  const findings = input.findings.map((finding) => validateFinding(finding, input.pseudonymKey))
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -319,7 +323,7 @@ async function markConflict(
   )
 }
 
-function validateFinding(raw: unknown): PlatformFindingInput {
+function validateFinding(raw: unknown, pseudonymKey: Uint8Array): PlatformFindingInput {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('AUTO_DREAM_INVALID_FINDING')
   }
@@ -329,7 +333,6 @@ function validateFinding(raw: unknown): PlatformFindingInput {
     if (typeof value !== 'string' || value.length < 1 || value.length > max) {
       throw new Error('AUTO_DREAM_INVALID_FINDING')
     }
-    if (containsSensitive(value)) throw new Error('AUTO_DREAM_INVALID_FINDING_SENSITIVE')
     return value
   }
   const taxonomy = text('taxonomy', 40)
@@ -348,7 +351,7 @@ function validateFinding(raw: unknown): PlatformFindingInput {
   ) {
     throw new Error('AUTO_DREAM_INVALID_FINDING')
   }
-  return {
+  const original: PlatformFindingInput = {
     taxonomy,
     capabilityId,
     severity: severity as PlatformFindingInput['severity'],
@@ -359,6 +362,36 @@ function validateFinding(raw: unknown): PlatformFindingInput {
     signalCount: row.signalCount,
     evidenceHash,
   }
+  if (findingHash(original) !== evidenceHash) {
+    throw new Error('AUTO_DREAM_INVALID_FINDING_HASH')
+  }
+
+  const alias = capabilityAlias(capabilityId, pseudonymKey)
+  const finding =
+    alias === capabilityId
+      ? original
+      : {
+          ...original,
+          capabilityId: alias,
+          title: replaceCapability(original.title, capabilityId, alias),
+          problem: replaceCapability(original.problem, capabilityId, alias),
+          impact: replaceCapability(original.impact, capabilityId, alias),
+          recommendation: replaceCapability(original.recommendation, capabilityId, alias),
+          evidenceHash: '',
+        }
+  if (
+    [
+      finding.capabilityId,
+      finding.title,
+      finding.problem,
+      finding.impact,
+      finding.recommendation,
+    ].some(containsSensitive)
+  ) {
+    throw new Error('AUTO_DREAM_INVALID_FINDING_SENSITIVE')
+  }
+  finding.evidenceHash = findingHash(finding)
+  return finding
 }
 
 function containsSensitive(value: string): boolean {
@@ -370,6 +403,31 @@ function containsSensitive(value: string): boolean {
     /(?:完整会话|原始日志|工具参数|提示词全文|身份证|银行卡|access[_ -]?token|refresh[_ -]?token)/i.test(
       value,
     )
+  )
+}
+
+function capabilityAlias(capabilityId: string, key: Uint8Array): string {
+  const derived = DERIVED_CAPABILITY.exec(capabilityId)
+  if (!derived && !containsSensitive(capabilityId)) return capabilityId
+  const digest = createHmac('sha256', key)
+    .update('auto-dream-capability-v1\0')
+    .update(capabilityId)
+    .digest('hex')
+  const safe = digest
+    .slice(0, 32)
+    .split('')
+    .map((nibble) => SAFE_NIBBLE_ALPHABET[Number.parseInt(nibble, 16)])
+    .join('')
+  return derived ? `auto_dream.${derived[1]}.${safe}` : `auto_dream.finding.${safe}`
+}
+
+function replaceCapability(value: string, capabilityId: string, alias: string): string {
+  return value.split(capabilityId).join(alias)
+}
+
+function findingHash(finding: Omit<PlatformFindingInput, 'signalCount' | 'evidenceHash'>): string {
+  return hash(
+    `${finding.taxonomy}\0${finding.capabilityId}\0${finding.title}\0${finding.problem}\0${finding.impact}\0${finding.recommendation}`,
   )
 }
 
