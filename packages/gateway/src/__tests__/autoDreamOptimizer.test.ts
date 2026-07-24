@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -775,6 +776,134 @@ describe('AutoDreamOptimizerService', () => {
     assert.equal(report.findings[0]?.title, '易用性阻力 · manage.skills')
     assert.equal(report.findings[0]?.problem, '聚合信号显示现有使用路径存在重复阻力。')
     assert.match(report.findings[0]?.evidenceHash ?? '', /^[0-9a-f]{64}$/)
+  })
+
+  it('derives anonymous admin findings from surfaced platform-owned manual reviews', async () => {
+    const reported: Array<{
+      findings: Array<{
+        taxonomy: string
+        capabilityId: string
+        title: string
+        problem: string
+        recommendation: string
+        signalCount: number
+      }>
+    }> = []
+    const sensitiveTarget = `platform/alice-medical-condition-${'0123456789abcdef'.repeat(10)}`
+    const proposals = [
+      ['skill', 'platform/browser-cli-argument-contract'],
+      ['agent', 'runtime/session-lifecycle/post-completion-crash'],
+      ['setting', 'routing/model-context-cache-policy'],
+      ['plugin', 'integration/authorized-social-publishing-and-inbox'],
+      ['setting', sensitiveTarget],
+      ['skill', 'skill/user-owned-review'],
+    ].map(([category, targetId], index) => ({
+      category,
+      action: 'manual.review',
+      title: index === 4 ? 'Alice medical condition' : `platform proposal ${index}`,
+      reason: index === 4 ? 'private user evidence' : `reason ${index}`,
+      targetId,
+      before: '',
+      after: '',
+    }))
+    const service = new AutoDreamOptimizerService({
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages: ['production-shaped platform optimization evidence'],
+        sessionsReviewed: 204,
+        throughSeq: 206,
+      }),
+      runModel: async (input) =>
+        JSON.stringify({
+          summary: input.phase === 'synthesis' ? '综合完成。' : '发现平台优化候选。',
+          done: true,
+          userProposals: input.phase === 'map' ? proposals : [],
+          platformFindings: [],
+        }),
+      hydrateProposals: async ({ proposals: rows }) => rows,
+      reportPlatformFindings: async (input) => {
+        reported.push(input)
+      },
+      applyProposal: async () => ({ ok: true }),
+    })
+
+    const state = await service.run('derived-admin-findings', true)
+    assert.equal(state.status, 'success')
+    assert.equal(state.proposals.length, proposals.length)
+    assert.equal(reported.length, 1)
+    assert.deepEqual(
+      reported[0]?.findings.map((finding) => finding.taxonomy),
+      ['capability_gap', 'reliability', 'performance', 'plugin_ecosystem', 'capability_gap'],
+    )
+    assert.equal(reported[0]?.findings.length, 5)
+    for (const finding of reported[0]!.findings) {
+      assert.match(
+        finding.capabilityId,
+        /^auto_dream\.(platform|runtime|routing|integration)\.[0-9a-f]{32}$/,
+      )
+      assert.equal(finding.signalCount, 1)
+      const adminCopy = JSON.stringify(finding)
+      assert.doesNotMatch(adminCopy, /browser-cli|alice|medical|private user evidence/i)
+    }
+  })
+
+  it('does not duplicate a derived finding when Terra explicitly returned its anonymous capability', async () => {
+    const targetId = 'routing/model-context-cache-policy'
+    const capabilityId = `auto_dream.routing.${createHash('sha256')
+      .update(targetId)
+      .digest('hex')
+      .slice(0, 32)}`
+    const reported: Array<{ findings: Array<{ capabilityId: string; signalCount: number }> }> = []
+    const service = new AutoDreamOptimizerService({
+      policyClient: { get: async () => enabledPolicy } as any,
+      loadAuditDataset: async () => ({
+        pages: ['explicit and derived finding evidence'],
+        sessionsReviewed: 5,
+        throughSeq: 11,
+      }),
+      runModel: async (input) =>
+        JSON.stringify({
+          summary: '发现路由性能改进。',
+          done: true,
+          userProposals:
+            input.phase === 'map'
+              ? [
+                  {
+                    category: 'setting',
+                    action: 'manual.review',
+                    title: '审查上下文缓存',
+                    reason: '重复证据支持',
+                    targetId,
+                    before: '',
+                    after: '',
+                  },
+                ]
+              : [],
+          platformFindings:
+            input.phase === 'map'
+              ? [
+                  {
+                    taxonomy: 'performance',
+                    capabilityId,
+                    severity: 'medium',
+                    signalCount: 7,
+                  },
+                ]
+              : [],
+        }),
+      hydrateProposals: async ({ proposals }) => proposals,
+      reportPlatformFindings: async (input) => {
+        reported.push(input)
+      },
+      applyProposal: async () => ({ ok: true }),
+    })
+
+    const state = await service.run('explicit-derived-dedupe', true)
+    assert.equal(state.status, 'success')
+    assert.equal(reported.length, 1)
+    assert.equal(reported[0]?.findings.length, 1)
+    assert.equal(reported[0]?.findings[0]?.capabilityId, capabilityId)
+    assert.equal(reported[0]?.findings[0]?.signalCount, 7)
   })
 
   it('keeps an unsupported Terra target as guided review and still reports its platform finding', async () => {

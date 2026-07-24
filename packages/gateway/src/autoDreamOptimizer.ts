@@ -31,6 +31,12 @@ const PLATFORM_TAXONOMY = new Set([
   'skill_quality',
   'plugin_ecosystem',
 ])
+const DERIVED_PLATFORM_SCOPE_TAXONOMY = {
+  platform: 'capability_gap',
+  runtime: 'reliability',
+  routing: 'performance',
+  integration: 'plugin_ecosystem',
+} as const
 const USER_ACTIONS = new Set([
   'memory.upsert',
   'memory.delete',
@@ -583,7 +589,7 @@ export class AutoDreamOptimizerService {
           )
           const mapFindings = dedupeFindings(completedMapResults.flatMap((row) => row.findings))
           const mapFindingHashes = new Set(mapFindings.map((row) => row.evidenceHash))
-          const cleanFindings = [
+          const explicitFindings = [
             ...mapFindings,
             ...dedupeFindings(
               synthesisResults
@@ -591,6 +597,10 @@ export class AutoDreamOptimizerService {
                 .filter((row) => !mapFindingHashes.has(row.evidenceHash)),
             ),
           ]
+          const cleanFindings = dedupeFindings([
+            ...explicitFindings,
+            ...derivePlatformFindings(hydratedProposals, explicitFindings),
+          ])
           if (cleanFindings.length > 0) {
             await this.deps.reportPlatformFindings({ runId, agentId, findings: cleanFindings })
           }
@@ -1286,6 +1296,31 @@ function platformFindingCopy(
     impact,
     recommendation: `结合匿名聚合信号审查 ${capabilityId}，验证根因后规划最小充分改进。`,
   }
+}
+
+function derivePlatformFindings(
+  proposals: AutoDreamOptimizerProposal[],
+  explicitFindings: AutoDreamPlatformFinding[],
+): AutoDreamPlatformFinding[] {
+  const explicitCapabilityIds = new Set(explicitFindings.map((finding) => finding.capabilityId))
+  const derived: AutoDreamPlatformFinding[] = []
+  for (const proposal of proposals) {
+    if (proposal.action !== 'manual.review') continue
+    const match = /^(platform|runtime|routing|integration)\//.exec(proposal.targetId)
+    if (!match) continue
+    const scope = match[1] as keyof typeof DERIVED_PLATFORM_SCOPE_TAXONOMY
+    const capabilityId = `auto_dream.${scope}.${hash(proposal.targetId).slice(0, 32)}`
+    if (explicitCapabilityIds.has(capabilityId)) continue
+    derived.push(
+      sanitizePlatformFinding({
+        taxonomy: DERIVED_PLATFORM_SCOPE_TAXONOMY[scope],
+        capabilityId,
+        severity: 'medium',
+        signalCount: 1,
+      }),
+    )
+  }
+  return dedupeFindings(derived)
 }
 
 function dedupeProposals(rows: AutoDreamOptimizerProposal[]): AutoDreamOptimizerProposal[] {
