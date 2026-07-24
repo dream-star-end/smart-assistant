@@ -7118,7 +7118,11 @@ export class Gateway {
       return
     }
     if (req.method === 'POST') {
-      this.sendJson(res, 202, await this.autoDreamOptimizer.startManual(agentId))
+      this.sendJson(
+        res,
+        202,
+        await this.autoDreamOptimizer.startManual(agentId, this.getUserId(req)),
+      )
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -7939,15 +7943,11 @@ export class Gateway {
     input: AutoDreamOptimizerModelRun,
     client: AutoDreamOptimizerClient,
   ): Promise<string> {
-    const admission = await client.admit(input)
     const cfg = await this._getAgentsConfig()
     const sourceAgent =
       cfg.agents.find((row) => row.id === input.agentId) ??
       cfg.agents.find((row) => row.id === cfg.default)
-    if (!sourceAgent) {
-      await client.abandon(admission.requestId).catch(() => {})
-      throw new Error('AUTO_DREAM_AGENT_NOT_FOUND')
-    }
+    if (!sourceAgent) throw new Error('AUTO_DREAM_AGENT_NOT_FOUND')
     const agent: AgentDef = {
       ...sourceAgent,
       model: input.model,
@@ -7964,26 +7964,43 @@ export class Gateway {
       model: input.model,
       defaultModel: this.deps.config.defaults.model,
     })
-    if (execution && execution.engine !== 'codex') {
-      await client.abandon(admission.requestId).catch(() => {})
-      throw new Error('AUTO_DREAM_MODEL_NOT_CODEX')
-    }
     const model = execution?.canonicalModel ?? input.model
+    const expectedEngine =
+      model === 'gpt-5.6-terra'
+        ? 'codex'
+        : model === 'deepseek-v4-flash'
+          ? 'ccb'
+          : null
+    const engine = execution?.engine ?? expectedEngine
+    if (!expectedEngine || engine !== expectedEngine) {
+      throw new Error('AUTO_DREAM_MODEL_ENGINE_MISMATCH')
+    }
+    const admission =
+      engine === 'codex'
+        ? await client.admit(input)
+        : await client.retryPending(input.agentId).then(() => null)
     const sessionKey =
       input.phase === 'map'
         ? `auto-dream-optimizer:${input.callId}`
         : `auto-dream-optimizer:${input.runId}:reduce`
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent,
-      ...localExecutionOverride(execution),
-      channel: 'auto-dream',
-      peerId: sessionKey,
-      effortLevel: 'max',
-      workload: 'auto-dream',
-      hermeticNoTools: true,
-      structuredOutputSchema: AUTO_DREAM_OPTIMIZER_JSON_SCHEMA,
-    })
+    let session: Awaited<ReturnType<SessionManager['getOrCreate']>>
+    try {
+      session = await this.sessions.getOrCreate({
+        sessionKey,
+        agent,
+        ...localExecutionOverride(execution),
+        channel: 'auto-dream',
+        peerId: sessionKey,
+        ...(engine === 'ccb' ? { userId: input.userId } : {}),
+        effortLevel: 'max',
+        workload: 'auto-dream',
+        hermeticNoTools: true,
+        structuredOutputSchema: AUTO_DREAM_OPTIMIZER_JSON_SCHEMA,
+      })
+    } catch (err) {
+      if (admission) await client.abandon(admission.requestId).catch(() => {})
+      throw err
+    }
     const structuredOutput = new AutoDreamStructuredOutputCollector()
     let invalidEvent: string | null = null
     let billing: import('@openclaude/protocol').DurableCodexBilling | null = null
@@ -7995,6 +8012,10 @@ export class Gateway {
         input.prompt,
         (event) => {
           if (event.kind === 'codex_billing') {
+            if (!admission) {
+              invalidEvent ??= 'unexpected_billing'
+              return
+            }
             if (billing) {
               invalidEvent ??= 'multiple_billing'
             } else {
@@ -8007,23 +8028,25 @@ export class Gateway {
         },
         'max',
         model,
-        admission.requestId,
+        admission?.requestId,
         undefined,
         'default',
-        { codexRoute: admission.routeFrame },
+        admission ? { codexRoute: admission.routeFrame } : undefined,
       )
-      if (billing) {
+      if (admission && billing) {
         const stage = await client.stageBilling(input.agentId, billing)
         stagedBilling = true
         await client.settleStaged(input.agentId, billing, stage)
       }
-      if (!billing) throw new Error('AUTO_DREAM_MISSING_BILLING')
+      if (admission && !billing) throw new Error('AUTO_DREAM_MISSING_BILLING')
       if (invalidEvent) throw new Error(`AUTO_DREAM_INVALID_EVENT_${invalidEvent}`)
       const output = structuredOutput.finish()
       completed = true
       return output
     } finally {
-      if (!billing && !stagedBilling) await client.abandon(admission.requestId).catch(() => {})
+      if (admission && !billing && !stagedBilling) {
+        await client.abandon(admission.requestId).catch(() => {})
+      }
       if (input.phase === 'map' || !completed) {
         await this.sessions.destroySession(sessionKey).catch(() => {})
       }
@@ -14719,6 +14742,7 @@ export class Gateway {
         void this.autoDreamOptimizer
           .maybeSchedule({
             agentId: agent.id,
+            userId: activeUserId,
             sessionKey,
             channel: frame.channel,
           })
