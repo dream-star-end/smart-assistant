@@ -1401,6 +1401,71 @@ describe('handleNotification — turn/completed', () => {
 })
 
 describe('handleNotification — early-arriving turn-scoped notifications (Codex review #019dde20 MAJOR 3)', () => {
+  it('patchUpdated adopts the in-flight turn and emits only validated cumulative file-change snapshots', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    runner.threadId = 'thr-patch'
+    runner.activeTurnId = null
+    runner.currentTurnCompleter = { resolve: () => {}, reject: () => {} }
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/fileChange/patchUpdated',
+      params: {
+        threadId: 'thr-other',
+        turnId: 't-patch',
+        itemId: 'fc-other',
+        changes: [{ path: '/tmp/wrong.ts', kind: { type: 'add' } }],
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/fileChange/patchUpdated',
+      params: {
+        threadId: 'thr-patch',
+        turnId: 't-patch',
+        itemId: 'fc-empty',
+        changes: [],
+      },
+    })
+    assert.equal(h.messages.length, 0)
+
+    const changes = [
+      { path: '/tmp/live.ts', kind: { type: 'update' }, diff: '@@\\n-old\\n+new' },
+    ]
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/fileChange/patchUpdated',
+      params: {
+        threadId: 'thr-patch',
+        turnId: 't-patch',
+        itemId: 'fc-live',
+        changes,
+      },
+    })
+
+    assert.equal(runner.activeTurnId, 't-patch')
+    assert.equal(runner.attemptHadToolOrPermission, true)
+    assert.equal(runner.emittedToolUseIds.has('fc-live'), true)
+    assert.deepEqual(h.messages, [
+      {
+        type: 'openclaude_tool_snapshot',
+        session_id: 'thr-patch',
+        tool: {
+          id: 'fc-live',
+          name: 'Edit',
+          input: {
+            file_path: '/tmp/live.ts',
+            kind: 'update',
+            changes,
+          },
+          inputPreview: '{"file_path":"/tmp/live.ts","kind":"update"}',
+        },
+      },
+    ])
+    await h.cleanup()
+  })
+
   it('first delta arriving while turn/start response is still in flight: adopts turnId from notification', async () => {
     // Scenario: the runner has SENT turn/start but is still awaiting the
     // response. activeTurnId is null but currentTurnCompleter is set. A

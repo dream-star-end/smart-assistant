@@ -189,6 +189,10 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
       h.spawnCalls[0].args.includes("features.default_mode_request_user_input=true"),
       `default mode must expose request_user_input: ${h.spawnCalls[0].args.join(" ")}`,
     );
+    assert.ok(
+      h.spawnCalls[0].args.includes("features.apply_patch_streaming_events=true"),
+      `Codex file changes must stream while the patch is generated: ${h.spawnCalls[0].args.join(" ")}`,
+    );
     assert.deepEqual(h.spawnCalls[0].args.slice(-2), ["--listen", "stdio://"]);
     const initParams = init.params as { clientInfo?: { name?: string }; capabilities?: { experimentalApi?: boolean } };
     assert.equal(initParams.clientInfo?.name, "openclaude-gateway");
@@ -309,6 +313,134 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
 });
 
 describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
+  test("fileChange patchUpdated 累计快照实时更新同一工具卡，且 final 前不触发工具桥接/等待", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h, {
+      toolMessageIdFactory: (toolUseId) => `srv-tool-${toolUseId}`,
+    });
+    await waitForRequest(h, "turn/start");
+    const p = h.proc();
+    const tid = { threadId: "thr-new-1", turnId: "turn-1" };
+    const firstChanges = [
+      {
+        path: "/tmp/live.ts",
+        kind: { type: "update" },
+        diff: "@@\n-old\n+new",
+      },
+    ];
+    const latestChanges = [
+      {
+        path: "/tmp/live.ts",
+        kind: { type: "update" },
+        diff: "@@\n-old\n+new\n+still generating",
+      },
+    ];
+
+    p.notify("item/fileChange/patchUpdated", {
+      ...tid,
+      itemId: "patch-live-1",
+      changes: firstChanges,
+    });
+    p.notify("item/fileChange/patchUpdated", {
+      ...tid,
+      itemId: "patch-live-1",
+      changes: latestChanges,
+    });
+
+    const partialBlocks = h.events.filter(
+      (event): event is Extract<EngineEvent, { kind: "block" }> =>
+        event.kind === "block"
+        && (event.block as { kind?: string; blockId?: string; partial?: boolean }).kind === "tool_use"
+        && (event.block as { blockId?: string }).blockId === "patch-live-1",
+    );
+    assert.equal(partialBlocks.length, 2);
+    assert.deepEqual(
+      partialBlocks.map((event) => ({
+        messageId: (event.block as { messageId?: string }).messageId,
+        partial: (event.block as { partial?: boolean }).partial,
+        changes: (event.block as { inputJson?: { changes?: unknown } }).inputJson?.changes,
+      })),
+      [
+        {
+          messageId: "srv-tool-patch-live-1",
+          partial: true,
+          changes: firstChanges,
+        },
+        {
+          messageId: "srv-tool-patch-live-1",
+          partial: true,
+          changes: latestChanges,
+        },
+      ],
+    );
+    assert.equal(
+      h.events.some((event) => event.kind === "tool_use_detected"),
+      false,
+      "partial UI snapshots must not trigger host tool bridges",
+    );
+    assert.equal(h.adapter.pendingToolCalls, 0, "partial UI snapshots must not gate turn completion");
+
+    const partialSnapshot = turn.getPartialSnapshot();
+    assert.equal(partialSnapshot.completedTools.length, 1);
+    assert.equal(partialSnapshot.completedTools[0].completed, false);
+    assert.equal(partialSnapshot.completedTools[0].toolName, "Edit");
+    assert.deepEqual(
+      (partialSnapshot.completedTools[0].inputJson as { changes?: unknown }).changes,
+      latestChanges,
+      "crash persistence keeps the latest exact cumulative snapshot",
+    );
+    assert.equal(
+      partialSnapshot.runtimeEvents.some(
+        (event) => {
+          const payload = event.payload as { type?: string; method?: string } | null;
+          return payload?.type === "openclaude_tool_snapshot"
+            || payload?.method === "item/fileChange/patchUpdated";
+        },
+      ),
+      false,
+      "cumulative snapshots must not create an O(n²) durable runtime tape",
+    );
+
+    p.notify("item/started", {
+      ...tid,
+      item: {
+        id: "patch-live-1",
+        type: "fileChange",
+        changes: latestChanges,
+      },
+    });
+    assert.equal(
+      h.events.filter((event) => event.kind === "tool_use_detected").length,
+      1,
+      "the native final tool_use establishes formal pending/bridge state exactly once",
+    );
+    assert.equal(h.adapter.pendingToolCalls, 1);
+
+    p.notify("item/completed", {
+      ...tid,
+      item: {
+        id: "patch-live-1",
+        type: "fileChange",
+        changes: latestChanges,
+      },
+    });
+    await waitFor(() => h.events.some((event) => event.kind === "tool_result_detected"));
+    assert.equal(h.adapter.pendingToolCalls, 0);
+    p.notify("turn/completed", {
+      threadId: "thr-new-1",
+      turn: { id: "turn-1", status: "completed" },
+    });
+
+    const summary = await turn.summary;
+    assert.ok(summary);
+    assert.equal(summary.tools.length, 1);
+    assert.equal(summary.tools[0].completed, undefined);
+    assert.deepEqual(
+      (summary.tools[0].inputJson as { changes?: unknown }).changes,
+      latestChanges,
+    );
+  });
+
   test("完整 turn:delta→text / reasoning→thinking / commandExecution→Bash / fileChange→Write / plan / tokenUsage→TurnSummary + billing", async () => {
     const h = makeHarness();
     const totals = makeTotals(0);

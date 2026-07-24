@@ -1814,6 +1814,12 @@ export class CodexAppServerRunner extends EventEmitter {
     // busy 期间不可点击的 Markdown options 卡。与 multi-agent/telemetry 一样无条件
     // 注入，确保 platform context 构建失败走 naked launch 时仍可提问。
     const requestUserInputArgs = ['-c', 'features.default_mode_request_user_input=true']
+    // Codex 0.144 can parse a model-authored apply_patch while its custom-tool
+    // input is still arriving and emit cumulative structured
+    // `item/fileChange/patchUpdated` snapshots. Without this feature the first
+    // fileChange item is only visible after the complete patch has been
+    // generated, which leaves large edits looking frozen for minutes.
+    const applyPatchStreamingArgs = ['-c', 'features.apply_patch_streaming_events=true']
     // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
     // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
     // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
@@ -1835,6 +1841,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...reasoningSummaryArgs,
       ...multiAgentDisableArgs,
       ...requestUserInputArgs,
+      ...applyPatchStreamingArgs,
       ...telemetryArgs,
       '--listen',
       'stdio://',
@@ -2272,12 +2279,22 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private handleLine(line: string): void {
+    const msg = _classifyJsonRpcLine(line)
     // Preserve the exact app-server JSON-RPC object before any UI projection,
     // filtering or normalization. The per-turn parser stores this opaque event
     // in the immutable tape, so command exit codes, full file-change objects,
     // collaboration payloads, reasoning items and future protocol fields all
     // survive refresh even when the compact UI card shows only a summary.
-    if (this.currentTurnCompleter || this.activeTurnId) {
+    //
+    // patchUpdated is the one deliberate exception: every notification is a
+    // cumulative copy of the same growing patch, so appending all copies would
+    // make the tape O(N²). Its latest exact snapshot is retained separately by
+    // CcbMessageParser for crash/interrupt persistence, and the native final
+    // fileChange item remains in this raw tape.
+    if (
+      (this.currentTurnCompleter || this.activeTurnId)
+      && !(msg.kind === 'notification' && msg.method === 'item/fileChange/patchUpdated')
+    ) {
       let payload: unknown
       try {
         payload = JSON.parse(line)
@@ -2286,7 +2303,6 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       this.emit('runtime_event', payload)
     }
-    const msg = _classifyJsonRpcLine(line)
     if (msg.kind === 'unknown') {
       this.emit('parse_error', { line, error: 'unknown JSON-RPC shape' })
       return
@@ -2608,6 +2624,55 @@ export class CodexAppServerRunner extends EventEmitter {
           type: 'content_block_delta',
           index: 0,
           delta: { type: 'thinking_delta', thinking: '\n\n' },
+        },
+      } as unknown as RunnerMessage)
+      return
+    }
+    if (method === 'item/fileChange/patchUpdated') {
+      const notificationThreadId = typeof p.threadId === 'string' ? p.threadId : ''
+      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
+      const changes = Array.isArray(p.changes)
+        ? p.changes.filter(
+            (change): change is Record<string, unknown> =>
+              Boolean(change) && typeof change === 'object' && !Array.isArray(change),
+          )
+        : []
+      if (
+        !this.currentTurnCompleter
+        || !this.threadId
+        || notificationThreadId !== this.threadId
+        || !itemId
+        || changes.length === 0
+      ) {
+        return
+      }
+      const first = changes[0]
+      const kind =
+        first.kind && typeof first.kind === 'object' && !Array.isArray(first.kind)
+          ? (first.kind as Record<string, unknown>).type
+          : undefined
+      const toolName = kind === 'add' ? 'Write' : 'Edit'
+      const filePath = typeof first.path === 'string' ? first.path : ''
+      const input = {
+        file_path: filePath,
+        kind: typeof kind === 'string' ? kind : undefined,
+        changes,
+      }
+      // This is an observable tool boundary, so a rejected turn/start must
+      // never retry and duplicate content the user has already seen. It also
+      // counts as an emitted tool_use for orphan-result pairing, while the
+      // parser's dedicated snapshot path deliberately avoids formal pending
+      // tool counts/bridges until Codex emits the native final item.
+      this.attemptHadToolOrPermission = true
+      this.emittedToolUseIds.add(itemId)
+      this.emit('message', {
+        type: 'openclaude_tool_snapshot',
+        session_id: this.threadId,
+        tool: {
+          id: itemId,
+          name: toolName,
+          input,
+          inputPreview: JSON.stringify({ file_path: filePath, kind }),
         },
       } as unknown as RunnerMessage)
       return

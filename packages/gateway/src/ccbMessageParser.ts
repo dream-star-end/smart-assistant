@@ -206,6 +206,18 @@ export class CcbMessageParser {
     string,
     { toolName: string; inputJson: unknown; inputPreview: string }
   >()
+  /**
+   * Latest cumulative Codex `item/fileChange/patchUpdated` snapshot for a
+   * tool that has not reached its native final tool_use yet. This is separate
+   * from pendingToolUses: a UI snapshot must not increment pendingToolCalls,
+   * trigger host bridges, or count as a formally started tool. It does,
+   * however, belong in crash/interrupt snapshots so paid model output already
+   * shown to the user is not lost on authoritative hydration.
+   */
+  private transientToolSnapshots = new Map<
+    string,
+    { toolName: string; inputJson: unknown; inputPreview: string }
+  >()
   /** Top-level tools that have completed (both tool_use and tool_result seen)
    *  within this turn, in arrival order of the tool_result. Surfaced in the
    *  TurnResult.tools field at turn end so SessionManager can persist them
@@ -227,21 +239,30 @@ export class CcbMessageParser {
     const pendingIds = new Set([
       ...this.streamingToolUses.keys(),
       ...this.pendingToolUses.keys(),
+      ...this.transientToolSnapshots.keys(),
     ])
     for (const toolUseId of pendingIds) {
       if (completedIds.has(toolUseId)) continue
       const streamed = this.streamingToolUses.get(toolUseId)
       const pending = this.pendingToolUses.get(toolUseId)
-      const toolName = pending?.toolName ?? streamed?.name ?? this.toolUseIdToName.get(toolUseId) ?? 'unknown'
+      const transient = this.transientToolSnapshots.get(toolUseId)
+      const toolName =
+        pending?.toolName
+        ?? transient?.toolName
+        ?? streamed?.name
+        ?? this.toolUseIdToName.get(toolUseId)
+        ?? 'unknown'
       const partialInputJson = streamed?.partialJson
       const meta = this.toolUseMeta.get(toolUseId)
       snapshots.push(_snapshotToolEntry({
         toolUseId,
         blockId: toolUseId,
         toolName,
-        inputJson: pending?.inputJson ?? null,
+        inputJson: pending?.inputJson ?? transient?.inputJson ?? null,
         inputPreview:
-          pending?.inputPreview ?? (partialInputJson === undefined ? '' : partialInputJson.slice(0, 500)),
+          pending?.inputPreview
+          ?? transient?.inputPreview
+          ?? (partialInputJson === undefined ? '' : partialInputJson.slice(0, 500)),
         output: '',
         isError: false,
         durationMs: meta ? Math.max(0, Math.round(performance.now() - meta.startAt)) : 0,
@@ -449,6 +470,14 @@ export class CcbMessageParser {
       return
     }
     try {
+      // Gateway-authored cumulative Codex file-change snapshots are a live UI
+      // projection, not raw engine protocol events. Keep only the latest exact
+      // structured snapshot below instead of copying every cumulative version
+      // into runtimeEvents (which would turn an N-byte patch into O(N²) tape).
+      if ((msg as any)?.type === 'openclaude_tool_snapshot') {
+        this._handleTransientToolSnapshot(msg)
+        return
+      }
       this.captureRuntimeEvent(msg)
       this._parseInner(msg)
     } catch (err) {
@@ -656,6 +685,36 @@ export class CcbMessageParser {
         permissionSuggestions: request.permission_suggestions,
       },
     })
+  }
+
+  private _handleTransientToolSnapshot(msg: SdkMessage): void {
+    const tool = (msg as any).tool
+    if (!tool || typeof tool !== 'object') return
+    const id = typeof tool.id === 'string' ? tool.id : ''
+    const name = typeof tool.name === 'string' ? tool.name : ''
+    if (!id || !name || !tool.input || typeof tool.input !== 'object' || Array.isArray(tool.input)) {
+      return
+    }
+    const existed = this.transientToolSnapshots.has(id)
+    const inputPreview =
+      typeof tool.inputPreview === 'string' ? tool.inputPreview : JSON.stringify(tool.input).slice(0, 500)
+    this.toolUseIdToName.set(id, name)
+    this.transientToolSnapshots.set(id, {
+      toolName: name,
+      inputJson: tool.input,
+      inputPreview,
+    })
+    if (!existed) this._markToolBoundary(id)
+    const block: Record<string, unknown> = {
+      kind: 'tool_use',
+      blockId: id,
+      toolName: name,
+      inputPreview,
+      inputJson: tool.input,
+      partial: true,
+    }
+    if (this.toolMessageIdFactory) block.messageId = this.toolMessageIdFactory(id)
+    this.onEvent({ kind: 'block', block: block as OutboundContentBlock })
   }
 
   /** Fix B — common code for the two main-agent tool_use observation sites
@@ -930,6 +989,10 @@ export class CcbMessageParser {
             inputPreview: inputStr.slice(0, 500),
           })
         }
+        // Establish the native final pending snapshot before retiring the
+        // transient one, so every synchronous observation sees at least one
+        // authoritative input record for this tool id.
+        this.transientToolSnapshots.delete(c.id)
         const streamed = this.streamingToolUses.get(c.id)
         const block: Record<string, unknown> = {
           kind: 'tool_use',
@@ -1053,6 +1116,7 @@ export class CcbMessageParser {
           // input. This is rare but we still want to record the result.
           const pending = this.pendingToolUses.get(useId)
           if (pending) this.pendingToolUses.delete(useId)
+          const transient = this.transientToolSnapshots.get(useId)
           // V3 v7.1 — exclude the `Agent` tool from the durable server-authored
           // TOOL snapshot. The web client renders Agent tools as
           // `role: 'agent-group'` cards owning a `childBlocks` tree (subagent
@@ -1093,8 +1157,8 @@ export class CcbMessageParser {
                 toolUseId: useId,
                 blockId: useId,
                 toolName,
-                inputJson: pending?.inputJson ?? {},
-                inputPreview: pending?.inputPreview ?? '',
+                inputJson: pending?.inputJson ?? transient?.inputJson ?? {},
+                inputPreview: pending?.inputPreview ?? transient?.inputPreview ?? '',
                 output: fullOutput,
                 outputJson: previewRaw,
                 isError: !!c.is_error,
@@ -1105,6 +1169,7 @@ export class CcbMessageParser {
               }),
             )
           }
+          this.transientToolSnapshots.delete(useId)
           if (this.onToolResult) {
             const exitCode = isToolExitCode(c.exit_code) ? c.exit_code : undefined
             const terminationReason = isToolTerminationReason(c.termination_reason)
