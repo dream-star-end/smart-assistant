@@ -261,12 +261,14 @@ export function interruptedContinuationTarget(
     if (message.role === "thinking" || message.role === "tool") return true;
     if (message.role !== "assistant") return false;
     if (!message._errorCode) return message.text.trim().length > 0;
-    return errorPresentation(
-      message._errorCode,
-      message.text,
-      message._errorDetail,
-      message.usage?.waived === true,
-    ).bodyText?.trim().length > 0;
+    return (
+      (errorPresentation(
+        message._errorCode,
+        message.text,
+        message._errorDetail,
+        message.usage?.waived === true,
+      ).bodyText?.trim().length ?? 0) > 0
+    );
   });
   if (!hasDurableProcess) return undefined;
   return { user, ...identity };

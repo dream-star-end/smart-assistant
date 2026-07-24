@@ -98,6 +98,12 @@ export type UseChatSocket = {
     agentId: string;
     sourceOverride?: ChatMessage;
   }) => void;
+  /** 在保留原有过程的前提下，为超时中断轮次追加一条幂等续接消息。*/
+  continueInterruptedTurn: (p: {
+    sessId: string;
+    errorMessageId: string;
+    agentId: string;
+  }) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
   setActiveSession: (sessId: string | undefined) => void;
   /** Apply REST/WS platform goal snapshots to the live session model. */
@@ -581,6 +587,10 @@ export function useChatSocket(opts: {
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
   const retryMessage = useCallback<UseChatSocket["retryMessage"]>((p) => socket.retryMessage(p), [socket]);
+  const continueInterruptedTurn = useCallback<UseChatSocket["continueInterruptedTurn"]>(
+    (p) => socket.continueInterruptedTurn(p),
+    [socket],
+  );
   const setActiveSession = useCallback((sessId: string | undefined) => socket.setActiveSession(sessId), [socket]);
   const setGoalState = useCallback<UseChatSocket["setGoalState"]>(
     (sessId, goal) => socket.setGoalState(sessId, goal),
@@ -851,6 +861,7 @@ export function useChatSocket(opts: {
       send,
       stop,
       retryMessage,
+      continueInterruptedTurn,
       setActiveSession,
       setGoalState,
       getTransientNotice,
@@ -882,6 +893,7 @@ export function useChatSocket(opts: {
       send,
       stop,
       retryMessage,
+      continueInterruptedTurn,
       setActiveSession,
       setGoalState,
       getTransientNotice,
