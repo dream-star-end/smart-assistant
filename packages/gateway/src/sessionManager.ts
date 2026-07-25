@@ -2239,7 +2239,11 @@ export class SessionManager {
    * callback releases both the lock and reconnect-visible activity count. */
   async beginExternalTurn(
     session: AgentSession,
-    opts?: { queueTurn?: boolean; queueExecutionFence?: PromptQueueExecutionFence },
+    opts?: {
+      queueTurn?: boolean
+      queueExecutionFence?: PromptQueueExecutionFence
+      clientMessageId?: string
+    },
   ): Promise<{
     signal: AbortSignal
     finish: (outcome: 'completed' | 'errored') => void
@@ -2287,6 +2291,9 @@ export class SessionManager {
       throw err
     }
     session._externalTurnAbort = controller
+    if (opts?.clientMessageId) {
+      session._runningClientMessageId = opts.clientMessageId
+    }
     let finished = false
     return {
       signal: controller.signal,
@@ -2294,6 +2301,9 @@ export class SessionManager {
         if (finished) return
         finished = true
         if (session._externalTurnAbort === controller) session._externalTurnAbort = undefined
+        if (session._runningClientMessageId === opts?.clientMessageId) {
+          session._runningClientMessageId = undefined
+        }
         session._currentTurnKey = undefined
         this.endClientTurn(session, outcome)
         if (queueTurn) {
@@ -4968,6 +4978,14 @@ export class SessionManager {
   interruptExact(sessionKey: string, turnKey: string): boolean {
     const session = this.sessions.get(sessionKey)
     if (!session || session._currentTurnKey !== turnKey) return false
+    return this.interrupt(sessionKey)
+  }
+
+  /** Browser Stop fence: only interrupt the turn that owns this exact
+   * clientMessageId.  A stale Stop can never kill a newer turn. */
+  interruptClientTurn(sessionKey: string, clientMessageId: string): boolean {
+    const session = this.sessions.get(sessionKey)
+    if (!session || session._runningClientMessageId !== clientMessageId) return false
     return this.interrupt(sessionKey)
   }
 

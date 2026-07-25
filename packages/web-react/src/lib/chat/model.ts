@@ -507,6 +507,15 @@ export type ChatSession = {
   _turnStatus?: TurnStatusState | null;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
+  /** Agent frozen when the active turn was dispatched.  `agentId` is the
+   * current selector and may change before the old turn is stopped. */
+  _activeAgentId?: string;
+  /** User Stop preserves ordinary queued prompts but prevents any implicit
+   * drain.  A later explicit send/retry resumes the FIFO. */
+  _dispatchPaused?: boolean;
+  /** Persistent fence for automatic continuation/recovery lineages stopped by
+   * the user.  Server history sync must not erase this browser-owned intent. */
+  _cancelledAutomaticRecoveryIds?: Record<string, true>;
   _isFirstTurnAfterReady?: boolean;
   _liveStreamBroken?: boolean;
 
