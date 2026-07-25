@@ -1192,6 +1192,9 @@ function mergeLocalClientFields(
         ? { _replyTo: localMsg._replyTo }
         : {}),
       ...(localMsg._routing !== undefined ? { _routing: localMsg._routing } : {}),
+      ...(localMsg._automaticRecoveryAttempted === true
+        ? { _automaticRecoveryAttempted: true }
+        : {}),
     };
     return Object.keys(localFields).length > 0 ? { ...serverMsg, ...localFields } : serverMsg;
   }

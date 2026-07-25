@@ -284,6 +284,7 @@ export function automaticTurnRecoveryTarget(
   if (
     !base ||
     base.user._automaticRecovery === true ||
+    base.user._automaticRecoveryAttempted === true ||
     (base.user._source !== "server" && !base.user._turnTapeId)
   ) {
     return undefined;
@@ -2837,6 +2838,9 @@ export class ChatSocket {
       ts: Date.now(),
       clientMessageId: target.clientMessageId,
     };
+    if (automatic) {
+      target.user._automaticRecoveryAttempted = true;
+    }
     const userMsg = addMessage(sess, "user", displayText, {
       id: target.clientMessageId,
       status: "sending",
