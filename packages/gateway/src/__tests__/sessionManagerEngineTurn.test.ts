@@ -726,6 +726,86 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("Codex context overflow visibly rebuilds a smaller exact history suffix without backoff", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const internals = sm as unknown as {
+        _resumeMap: Map<string, string>;
+        _resumeMapTimestamps: Map<string, number>;
+        _resumeMapProvider: Map<string, string>;
+        _saveResumeMap: () => void;
+      };
+      internals._saveResumeMap = () => {};
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          if (submits === 1) {
+            r.result({
+              is_error: true,
+              subtype: "error_during_execution",
+              result: "Codex ran out of room in the model's context window.",
+              errorClass: "context_too_long",
+            });
+            return;
+          }
+          r.text("continued");
+          r.result({ stop_reason: "end_turn" });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        providerTag: "codex",
+        ccbSessionId: "thread-full-1",
+      } as Partial<AgentSession>);
+      internals._resumeMap.set(session.sessionKey, "thread-full-1");
+      internals._resumeMapTimestamps.set(session.sessionKey, Date.now());
+      internals._resumeMapProvider.set(session.sessionKey, "codex");
+      const historicalMessages = [
+        {
+          id: `srv-${session.peerId}-${session.agentId}-t1`,
+          role: "assistant",
+          text: `exact-history-${"x".repeat(16_000)}-tail`,
+          status: "completed",
+        },
+      ];
+
+      await sm.submit(
+        session,
+        "继续原任务",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "c".repeat(32),
+        undefined,
+        undefined,
+        { historicalMessages },
+      );
+
+      assert.equal(submits, 2);
+      assert.equal(runner.submittedInputs[0], "继续原任务");
+      assert.match(String(runner.submittedInputs[1]), /<openclaude_previous_context>/);
+      assert.match(String(runner.submittedInputs[1]), /-tail/);
+      assert.match(String(runner.submittedInputs[1]), /<current_user_message>\n继续原任务/);
+      assert.ok(
+        events.some((event) =>
+          event.kind === "block" &&
+          event.block.kind === "text" &&
+          event.block.text.includes("正在整理历史并继续 (1/3)")),
+      );
+      assert.equal(events.filter((event) => event.kind === "error").length, 0);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.match(captured.payloads[0]!.text, /continued$/);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop during retry backoff prevents the next continue attempt", async () => {
     const sm = new SessionManager(makeConfigStub());
     (sm as unknown as { _transientRetryDelayMs: () => number })
