@@ -3299,13 +3299,31 @@ export class SessionManager {
       const effectiveMasterHistoricalMessages = masterHistoricalMessages
         ? mergePendingExternalHistory(masterHistoricalMessages)
         : null
-      const providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag)
+      let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag)
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
         peerId: session.peerId,
         agentId: session.agentId,
         hasProviderResumeId: !!providerResumeId,
       })
+      if (providerResumeId && injectionKey !== null) {
+        log.warn('master history gap invalidated native resume before context rebuild', {
+          sessionKey: session.sessionKey,
+          provider: session.providerTag,
+          injectionKey,
+        })
+        await session.runner.shutdown()
+        this._resumeMap.delete(session.sessionKey)
+        this._resumeMapTimestamps.delete(session.sessionKey)
+        this._resumeMapProvider.delete(session.sessionKey)
+        this._resumeMapLastCost.delete(session.sessionKey)
+        session.ccbSessionId = null
+        session.runner.clearSessionId?.()
+        this._saveResumeMap()
+        session._historicalContextInjected = false
+        session._historicalContextInjectedKey = undefined
+        providerResumeId = undefined
+      }
       if (
         shouldAttemptHistoricalContextInjection({
           alreadyInjected: session._historicalContextInjected,
@@ -4349,6 +4367,23 @@ export class SessionManager {
             )
             settle(() => reject(new Error('STALE_RESUME_ID: Previous session file missing; next submit will start fresh')))
             return
+          }
+
+          if (result?.errorClass === 'context_too_long' && session.providerTag === 'codex') {
+            log.warn('codex context window exhausted; clearing native resume for next turn', {
+              sessionKey: session.sessionKey,
+              ...(traceId ? { traceId } : {}),
+            })
+            await runner.shutdown()
+            this._resumeMap.delete(session.sessionKey)
+            this._resumeMapTimestamps.delete(session.sessionKey)
+            this._resumeMapProvider.delete(session.sessionKey)
+            this._resumeMapLastCost.delete(session.sessionKey)
+            session.ccbSessionId = null
+            runner.clearSessionId?.()
+            this._saveResumeMap()
+            session._historicalContextInjected = false
+            session._historicalContextInjectedKey = undefined
           }
 
           // Detect auth error — roll back counters and reject. 分类逻辑(isError +

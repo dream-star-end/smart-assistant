@@ -23,6 +23,7 @@ export type ClassifiedErrorCode =
   | 'rate_limited'
   | 'model_capacity'
   | 'upstream_failed'
+  | 'context_too_long'
   | 'unknown'
 
 export interface ClassifiedError {
@@ -56,6 +57,11 @@ const PATTERNS: Array<{
     re: /(?:\b429\b|rate[_ ]?limit(?:ed)?|RATE_LIMITED)/i,
     code: 'rate_limited',
     message: '当前账号被限流,请稍后再试',
+  },
+  {
+    re: /ran out of room in the model(?:'|’)s context window|context window (?:was )?exceeded/i,
+    code: 'context_too_long',
+    message: '上下文长度超过模型上限',
   },
   // 模型容量满载 —— 上游"at capacity"/overloaded/model busy 词族。与 upstream_failed
   // 的区别是语义可行动:同模型稍后可用、换模型立即可用(taxonomy cta=retry_or_switch)。

@@ -240,6 +240,7 @@ async function send(ws: WebSocket, peerId: string): Promise<Record<string, unkno
       content: { text: "hi" },
       ts: Date.now(),
       model: MODEL,
+      clientMessageId: `cm_${peerId}`,
     }),
   );
   await new Promise((r) => setTimeout(r, 300));
@@ -319,6 +320,7 @@ describe("bridge grants checker · epoch fence(R1 BLOCKER-1)", () => {
       ["UNAUTHORIZED_MODEL"],
       "撤权后必须在**同一个连接**上立刻拒帧(不等 30s 周期刷新)",
     );
+    assert.equal(ws.readyState, WebSocket.OPEN, "turn 级撤权拒绝不能关闭整条用户 WS");
     assert.equal(
       forwardedInbound(rig.containerSeen).length,
       forwardedBefore,

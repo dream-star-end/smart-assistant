@@ -265,11 +265,12 @@ export function availableModelHistoryTokens(
  * first request there is no previous API usage row, so its proactive compact
  * check can only estimate the reconstructed message itself; the system/tool
  * envelope is added later. Keep the same 20k summary-output + 13k compact
- * buffer that CCB reserves, plus the existing 256-token transport allowance.
- * Native runners own their own context manager and retain the old allowance.
+ * buffer that the runners need, plus the existing 256-token transport
+ * allowance. A rebuilt Codex thread also needs this headroom: otherwise its
+ * first compact request can itself exceed the window.
  */
 export function modelHistoryReservedTokens(engine?: string): number {
-  return engine === 'ccb' ? 33_256 : 256
+  return engine === 'ccb' || engine === 'codex' ? 33_256 : 256
 }
 
 /** Return a Unicode-safe exact suffix that fits the approximate token budget. */

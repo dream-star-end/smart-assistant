@@ -889,6 +889,7 @@ export const OutboundError = Type.Object({
     Type.Literal('rate_limited'),
     Type.Literal('model_capacity'),
     Type.Literal('upstream_failed'),
+    Type.Literal('context_too_long'),
   ]),
   /** 简短人类文案,前端直接渲染。 */
   message: Type.String(),

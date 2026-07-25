@@ -3880,6 +3880,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               effectiveModel !== null &&
               !modelCheckerHandle.isAllowed(effectiveModel)
             ) {
+              const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
+              const peerId = peerObj && typeof peerObj === "object" && typeof peerObj.id === "string"
+                ? peerObj.id
+                : null;
+              const clientMessageId = isClientMessageId(
+                (parsed as { clientMessageId?: unknown }).clientMessageId,
+              )
+                ? (parsed as { clientMessageId: string }).clientMessageId
+                : null;
               rejectPromptQueueDispatch("UNAUTHORIZED_MODEL");
               bridgeLog?.info("user-chat-bridge: model not authorized", {
                 modelId: effectiveModel,
@@ -3889,10 +3898,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 userWs,
                 "UNAUTHORIZED_MODEL",
                 `model not authorized for current user: ${effectiveModel}`,
+                { peerId, clientMessageId },
               );
-              try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "unauthorized_model"); } catch { /* */ }
-              // 策略拒绝 → force final;此前无 codex inflight(本帧才进 acquire 路径),无 drain 价值
-              cleanup("client_close", true);
               return;
             }
             effectiveModelForFrame = effectiveModel;
