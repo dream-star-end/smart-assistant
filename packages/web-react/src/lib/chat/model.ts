@@ -235,6 +235,9 @@ export type ChatMessage = {
   _recoveryOfClientMessageId?: string;
   _recoveryMode?: "checkpoint" | "replay";
   _automaticRecovery?: boolean;
+  /** Client-local one-shot fence for the source turn. Server rejection must
+   * not make a full-session sync schedule the same automatic recovery again. */
+  _automaticRecoveryAttempted?: boolean;
 
   // ── assistant / 通用 ──
   usage?: MsgUsage;
