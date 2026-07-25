@@ -237,6 +237,10 @@ export const InboundControlStop = Type.Object({
   channel: Type.String(),
   peer: Peer,
   agentId: Type.Optional(Type.String()),
+  /** Exact browser turn identity.  This prevents an assistant switch from
+   * redirecting Stop to the newly selected assistant while the old turn is
+   * still running. */
+  clientMessageId: Type.Optional(ClientMessageId),
 })
 export type InboundControlStop = Static<typeof InboundControlStop>
 

@@ -1030,6 +1030,10 @@ export class ChatSocket {
       sess._localTeardownAt = undefined;
       sess._sendingInFlight = true;
       sess._activeClientMessageId = clientMessageId;
+      sess._activeAgentId =
+        typeof pending?.payload.agentId === "string" && pending.payload.agentId
+          ? pending.payload.agentId
+          : sess.agentId;
       sess._turnStartedAt = Date.now();
       sess._pendingCostCredits = "0";
       sess._lastFinaledAssistantId = null;
@@ -1060,6 +1064,7 @@ export class ChatSocket {
   ): void {
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
+    sess._activeAgentId = undefined;
     if (opts.clearTiming !== false) clearTurnTiming(sess);
     if (opts.resetTracker !== false) resetReplyTracker(sess);
     sess._localTeardownAt = typeof sess._trackerResetAt === "number" ? sess._trackerResetAt : Date.now();
@@ -2046,6 +2051,13 @@ export class ChatSocket {
       ...(s._sendingInFlight && isClientMessageId(s._activeClientMessageId)
         ? { _activeClientMessageId: s._activeClientMessageId }
         : {}),
+      ...(s._sendingInFlight && s._activeAgentId
+        ? { _activeAgentId: s._activeAgentId }
+        : {}),
+      ...(s._dispatchPaused ? { _dispatchPaused: true } : {}),
+      ...(s._cancelledAutomaticRecoveryIds
+        ? { _cancelledAutomaticRecoveryIds: { ...s._cancelledAutomaticRecoveryIds } }
+        : {}),
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
@@ -2124,9 +2136,19 @@ export class ChatSocket {
       s._activeClientMessageId = isClientMessageId(stored._activeClientMessageId)
         ? stored._activeClientMessageId
         : undefined;
+      s._activeAgentId =
+        typeof stored._activeAgentId === "string" && stored._activeAgentId
+          ? stored._activeAgentId
+          : undefined;
       s._turnStartedAt = typeof stored._turnStartedAt === "number" ? stored._turnStartedAt : Date.now();
       s._lastFrameAt = typeof stored._lastFrameAt === "number" ? stored._lastFrameAt : undefined;
     }
+    s._dispatchPaused = stored._dispatchPaused === true;
+    s._cancelledAutomaticRecoveryIds =
+      stored._cancelledAutomaticRecoveryIds &&
+      typeof stored._cancelledAutomaticRecoveryIds === "object"
+        ? { ...stored._cancelledAutomaticRecoveryIds }
+        : undefined;
     s._trackerResetAt = typeof stored._trackerResetAt === "number" ? stored._trackerResetAt : undefined;
     s._trackerResetServerTs =
       typeof stored._trackerResetServerTs === "number" ? stored._trackerResetServerTs : undefined;
@@ -2161,7 +2183,7 @@ export class ChatSocket {
     // zero-write fast path because the repair is idempotent.
     if (repairedStoredOrder) this.deps.persistSession?.(stored.id);
     if (inFlightFresh) this.resetThinkingSafety(stored.id);
-    if (storedPending.length > 0) this.kickDispatchPump();
+    if (storedPending.length > 0 && !s._dispatchPaused) this.kickDispatchPump();
     this.scheduleNotify();
   }
 
@@ -2542,6 +2564,14 @@ export class ChatSocket {
   switchAgent(sessId: string, agentId: string): void {
     const sess = this.sessions.get(sessId);
     if (!sess || !agentId || sess.agentId === agentId) return;
+    if (
+      sess._sendingInFlight ||
+      this.offlineQueue.some((item) => item.sessId === sessId)
+    ) {
+      // Stop is bound to the old turn before the selector is overwritten.
+      // This also cascades through the old captain's team delegation tree.
+      this.stopTurn(sessId);
+    }
     sess.agentId = agentId;
     sess._agentSwitchedAt = Date.now();
     resetReplyTracker(sess);
@@ -2628,6 +2658,9 @@ export class ChatSocket {
     teamMode?: boolean;
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
+    // An explicit user send is the resume gesture for ordinary prompts that a
+    // previous Stop intentionally left queued.
+    sess._dispatchPaused = false;
     // 会话级模型选择定格:首发/换模发送都把当前有效模型落为会话选择(建行 PUT 在下面
     // 读它随体携带,故必须先于 ensureServerSessionOnce 写入)。p.model 缺省(模型列表
     // 未加载等)不清空既有选择。
@@ -2797,6 +2830,12 @@ export class ChatSocket {
     automatic: boolean,
   ): void {
     if (sess._sendingInFlight) return;
+    if (
+      automatic &&
+      sess._cancelledAutomaticRecoveryIds?.[target.user.id] === true
+    ) {
+      return;
+    }
     const routing = normalizeRetiredRouting(target.user._routing);
     if (!routing) return;
     const resolvedAgentId = sess.agentId || agentId;
@@ -2876,7 +2915,7 @@ export class ChatSocket {
         clientMessageId ? { clientMessageId } : undefined,
       );
       const sess = this.sessions.get(sessId);
-      if (!sess || sess._sendingInFlight) return;
+      if (!sess || sess._sendingInFlight || sess._dispatchPaused) return;
       const error = [...sess.messages].reverse().find((message) =>
         message.role === "assistant" &&
         !!message._errorCode &&
@@ -2884,6 +2923,7 @@ export class ChatSocket {
       if (!error) return;
       const target = automaticTurnRecoveryTarget(sess.messages, error, sess.id);
       if (!target) return;
+      if (sess._cancelledAutomaticRecoveryIds?.[target.user.id] === true) return;
       this.dispatchTurnRecovery(
         sess,
         target,
@@ -2905,6 +2945,7 @@ export class ChatSocket {
   }): void {
     const sess = this.sessions.get(p.sessId);
     if (!sess || sess._sendingInFlight) return;
+    sess._dispatchPaused = false;
     const error = sess.messages.find(
       (message) => message.id === p.errorMessageId && message.role === "assistant",
     );
@@ -2930,6 +2971,7 @@ export class ChatSocket {
   }): void {
     const sess = this.sessions.get(p.sessId);
     if (!sess) return;
+    sess._dispatchPaused = false;
     const userMsg = sess.messages.find((m) => m.id === p.msgId && m.role === "user");
     if (!userMsg || userMsg.status !== "error") return;
     const source = p.sourceOverride?.id === userMsg.id && p.sourceOverride.role === "user"
@@ -3057,6 +3099,7 @@ export class ChatSocket {
       if (item.state !== "queued") continue;
       const sess = this.sessions.get(item.sessId);
       if (!sess) continue;
+      if (sess._dispatchPaused) continue;
       const slot = this.dispatchSlots.get(item.sessId);
       if (slot !== undefined && slot !== item.msgId) continue;
       if (sess._sendingInFlight && sess._activeClientMessageId !== item.msgId) continue;
@@ -3110,6 +3153,10 @@ export class ChatSocket {
     // that omits its optional clientMessageId still bind to this exact turn.
     // The user-visible thinking clock remains off until authority confirms.
     sess._activeClientMessageId = item.msgId;
+    sess._activeAgentId =
+      typeof item.payload.agentId === "string" && item.payload.agentId
+        ? item.payload.agentId
+        : sess.agentId;
     if (journalCommitted) this.clearTransientNotice(sess.id);
     else this.setTransientNotice(sess.id, "正在确认发送…");
     this.scheduleNotify();
@@ -3121,23 +3168,86 @@ export class ChatSocket {
     if (!sess) return;
     const pending = this.offlineQueue.filter((item) => item.sessId === sessId);
     if (!sess._sendingInFlight && pending.length === 0) return;
-    // If a turn is already admitted, Stop applies to that turn only; prompts
-    // the user queued behind it remain FIFO work and dispatch next. Before
-    // admission, Stop cancels every still-local item because none is active.
-    const cancelPending = sess._sendingInFlight ? [] : pending;
+    const slottedClientMessageId = this.dispatchSlots.get(sessId);
+    const activeClientMessageId =
+      sess._activeClientMessageId ??
+      slottedClientMessageId ??
+      pending[0]?.msgId;
+    const activeItem = activeClientMessageId
+      ? pending.find((item) => item.msgId === activeClientMessageId)
+      : undefined;
+    const activeUser = activeClientMessageId
+      ? sess.messages.find(
+          (message) =>
+            message.role === "user" && message.id === activeClientMessageId,
+        )
+      : undefined;
+    const cancelIds = new Set<string>();
+    if (activeItem) cancelIds.add(activeItem.msgId);
+    for (const item of pending) {
+      const user = sess.messages.find(
+        (message) => message.role === "user" && message.id === item.msgId,
+      );
+      if (user?._isAutoRetry === true || user?._automaticRecovery === true) {
+        cancelIds.add(item.msgId);
+      }
+    }
+
+    const cancelledLineageIds = new Set<string>();
+    const addCancelledLineage = (user: ChatMessage | undefined) => {
+      if (!user) return;
+      cancelledLineageIds.add(user.id);
+      if (user._recoveryOfClientMessageId) {
+        cancelledLineageIds.add(user._recoveryOfClientMessageId);
+      }
+      if (user._continuationOfClientMessageId) {
+        cancelledLineageIds.add(user._continuationOfClientMessageId);
+      }
+    };
+    addCancelledLineage(activeUser);
+    for (const item of pending) {
+      if (!cancelIds.has(item.msgId)) continue;
+      addCancelledLineage(
+        sess.messages.find(
+          (message) => message.role === "user" && message.id === item.msgId,
+        ),
+      );
+    }
+    if (cancelledLineageIds.size > 0) {
+      sess._cancelledAutomaticRecoveryIds = {
+        ...(sess._cancelledAutomaticRecoveryIds ?? {}),
+      };
+      for (const id of cancelledLineageIds) {
+        sess._cancelledAutomaticRecoveryIds[id] = true;
+      }
+    }
+
+    const cancelPending = pending.filter((item) => cancelIds.has(item.msgId));
+    const preservedManual = pending.filter((item) => !cancelIds.has(item.msgId));
+    // Stop never implicitly submits work queued behind the stopped turn.
+    // It remains visible and durable until the user's next explicit send/retry.
+    sess._dispatchPaused = preservedManual.length > 0;
     const mayHaveReachedServer =
-      sess._sendingInFlight || pending.some((item) => item.state === "awaiting_admission");
+      sess._sendingInFlight ||
+      activeItem?.state === "awaiting_admission";
     if (mayHaveReachedServer && this.ws?.readyState === 1) {
       this.safeWsSend(
         JSON.stringify({
           type: "inbound.control.stop",
           channel: "webchat",
           peer: { id: sess.id, kind: "dm" },
-          agentId: sess.agentId || this.deps.defaultAgentId || "main",
+          agentId:
+            sess._activeAgentId ||
+            activeItem?.payload.agentId ||
+            sess.agentId ||
+            this.deps.defaultAgentId ||
+            "main",
+          ...(activeClientMessageId
+            ? { clientMessageId: activeClientMessageId }
+            : {}),
         }),
       );
     }
-    const clientMessageId = sess._activeClientMessageId;
     for (const item of cancelPending) {
       this.clearPendingDispatch(sess.id, item.msgId);
       const user = sess.messages.find(
@@ -3145,15 +3255,19 @@ export class ChatSocket {
       );
       if (user && user.status !== "sent") {
         user.status = "error";
-        user._errorDetail = "发送已取消";
+        user._errorDetail =
+          user._isAutoRetry === true || user._automaticRecovery === true
+            ? "自动重试已停止"
+            : "发送已取消";
       }
     }
-    if (clientMessageId) this.finishDispatch(sess.id, clientMessageId);
+    if (activeClientMessageId) {
+      this.finishDispatch(sess.id, activeClientMessageId);
+    }
     this.dispatchSlots.delete(sess.id);
     // 本地立即收尾（不等后端 isFinal）。
     this.clearSendingState(sess, { clearThinking: true });
     this.clearTransientNotice(sess.id); // 用户手动停止：清 transient 软提示
-    this.kickDispatchPump();
     this.scheduleNotify();
   }
 
@@ -3196,12 +3310,18 @@ export class ChatSocket {
   private restartContinued = new Set<string>();
   private autoContinueAfterRestart(sessId: string): void {
     const sess = this.sessions.get(sessId);
-    if (!sess || sess._sendingInFlight) return;
+    if (!sess || sess._sendingInFlight || sess._dispatchPaused) return;
     if (!(this.ws && this.ws.readyState === 1 && this.relayReady)) return;
     const target = [...sess.messages]
       .reverse()
       .find((m) => m && m.role === "assistant" && !m._emptyTurn && (m.text ?? "").trim().length > 0);
     if (!target) return; // 没有被截断的内容 → 保持"请重新发送"提示
+    if (
+      target._clientMessageId &&
+      sess._cancelledAutomaticRecoveryIds?.[target._clientMessageId] === true
+    ) {
+      return;
+    }
     if (typeof target.ts === "number" && Date.now() - target.ts > 10 * 60_000) return;
     const idem = `autocont-restart-${sessId}-${target.id}`;
     if (this.restartContinued.has(idem)) return;
@@ -3224,6 +3344,13 @@ export class ChatSocket {
     const userMsg = addMessage(sess, "user", RESTART_CONTINUE_DISPLAY, {
       status: "sending",
       _isAutoRetry: true,
+      _automaticRecovery: true,
+      ...(target._clientMessageId
+        ? {
+            _recoveryOfClientMessageId: target._clientMessageId,
+            _continuationOfClientMessageId: target._clientMessageId,
+          }
+        : {}),
       _modelText: RESTART_CONTINUE_PROMPT,
       _idem: idem,
     });
@@ -3235,9 +3362,16 @@ export class ChatSocket {
   private autoContinueEmptyTurn(sessId: string, targetMsgId: string, cls: EmptyTurnDecision): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
-    if (sess._sendingInFlight) return; // 旧 final teardown 后已有新 turn → 放弃
+    if (sess._sendingInFlight || sess._dispatchPaused) return; // 旧 final teardown 后已有新 turn → 放弃
     const idx = sess.messages.findIndex((m) => m && m.id === targetMsgId);
     if (idx < 0) return;
+    const target = sess.messages[idx];
+    if (
+      target._clientMessageId &&
+      sess._cancelledAutomaticRecoveryIds?.[target._clientMessageId] === true
+    ) {
+      return;
+    }
     if (!shouldAutoContinueEmptyTurn({ messages: sess.messages, targetMsgId, stopReason: "end_turn" })) return;
 
     const insertNotice = () => {
@@ -3276,6 +3410,13 @@ export class ChatSocket {
     const userMsg = addMessage(sess, "user", AUTO_CONTINUE_DISPLAY, {
       status: "sending",
       _isAutoRetry: true,
+      _automaticRecovery: true,
+      ...(target._clientMessageId
+        ? {
+            _recoveryOfClientMessageId: target._clientMessageId,
+            _continuationOfClientMessageId: target._clientMessageId,
+          }
+        : {}),
       _modelText: AUTO_CONTINUE_PROMPT,
       _idem: idem,
     });

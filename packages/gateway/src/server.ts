@@ -11936,6 +11936,7 @@ export class Gateway {
     peer: { id: string; kind: 'dm' | 'group' }
     agentId?: string
     sessionKey?: string
+    clientMessageId?: string
   }): Promise<boolean> {
     let sessionKey = frame.sessionKey
     const explicitStopAgentId = sessionKey?.split(':')[1] ?? frame.agentId
@@ -11943,12 +11944,43 @@ export class Gateway {
       this.log.warn('interrupt hidden system agent rejected', { agentId: explicitStopAgentId })
       return false
     }
+    const safePeerId = frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')
+    const suffix = `:${frame.channel}:${frame.peer.kind}:${safePeerId}`
+    const clientMessageId = isClientMessageId(frame.clientMessageId)
+      ? frame.clientMessageId
+      : undefined
+
+    // Exact browser identity is authoritative across assistant switches. Scan
+    // the peer's live agent sessions and interrupt only the matching owner,
+    // then cascade through the captain's delegate/reviewer tree.
+    if (clientMessageId) {
+      for (const live of this.sessions.list()) {
+        if (!live.sessionKey.endsWith(suffix)) continue
+        const selfInterrupted = this.sessions.interruptClientTurn(
+          live.sessionKey,
+          clientMessageId,
+        )
+        if (!selfInterrupted) continue
+        const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+        const ok = selfInterrupted || delegateInterrupted
+        this.log.info('interrupt', {
+          sessionKey: live.sessionKey,
+          clientMessageId,
+          ok,
+        })
+        return ok
+      }
+      this.log.info('interrupt', {
+        sessionKey: `*${suffix}`,
+        clientMessageId,
+        ok: false,
+      })
+      return false
+    }
     if (!sessionKey) {
       if (frame.agentId) {
         sessionKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
       } else {
-        const safePeerId = frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')
-        const suffix = `:${frame.channel}:${frame.peer.kind}:${safePeerId}`
         let interrupted = false
         for (const live of this.sessions.list()) {
           if (!live.sessionKey.endsWith(suffix)) continue
@@ -11973,7 +12005,18 @@ export class Gateway {
     }
     const selfInterrupted = this.sessions.interrupt(sessionKey)
     const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
-    const ok = selfInterrupted || delegateInterrupted
+    let ok = selfInterrupted || delegateInterrupted
+    // Compatibility containment for already-open clients: if their selector
+    // changed before Stop, the legacy frame names the new agent. Only on a
+    // direct miss do we fall back to the existing peer-wide stop behavior.
+    if (!ok && frame.agentId) {
+      for (const live of this.sessions.list()) {
+        if (!live.sessionKey.endsWith(suffix)) continue
+        const fallbackSelf = this.sessions.interrupt(live.sessionKey)
+        const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
+        ok = fallbackSelf || fallbackDelegates || ok
+      }
+    }
     this.log.info('interrupt', { sessionKey, ok })
     return ok
   }
@@ -13464,6 +13507,7 @@ export class Gateway {
       ? await this.sessions.beginExternalTurn(session, {
           queueTurn: Boolean(promptQueueLifecycle),
           ...(promptQueueExecutionFence ? { queueExecutionFence: promptQueueExecutionFence } : {}),
+          ...(safeClientMessageId ? { clientMessageId: safeClientMessageId } : {}),
         })
       : null
     let externalTurnCompleted = false

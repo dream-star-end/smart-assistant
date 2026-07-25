@@ -3113,6 +3113,66 @@ describe("ChatSocket interrupted continuation", () => {
     });
     sock.stop();
   });
+
+  test("user Stop persistently fences automatic recovery even after server history sync", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({
+      sessId: "s-stop-recovery",
+      agentId: "main",
+      text: "long task",
+      model: "kimi-k3-ark",
+    });
+    const session = sock.sessions.get("s-stop-recovery")!;
+    const user = session.messages.find((message) => message.role === "user")!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s-stop-recovery", kind: "dm" },
+      clientMessageId: user.id,
+    }) });
+    sock.stopTurn("s-stop-recovery");
+    ws.sent.length = 0;
+
+    user._source = "server";
+    user.status = "error";
+    session.messages.push(
+      {
+        id: "thinking-after-stop",
+        role: "thinking",
+        text: "partial",
+        ts: 2,
+        _source: "server",
+        _turnTapeId: "tape-after-stop",
+        _clientMessageId: user.id,
+      },
+      {
+        id: "error-after-stop",
+        role: "assistant",
+        text: "",
+        ts: 3,
+        _source: "server",
+        _turnTapeId: "tape-after-stop",
+        _clientMessageId: user.id,
+        _errorCode: "model_capacity",
+      },
+    );
+    await (sock as any).autoRecoverTerminalTurn("s-stop-recovery", user.id);
+    expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(false);
+
+    const stored = sock.toStored("s-stop-recovery")!;
+    expect(stored._cancelledAutomaticRecoveryIds?.[user.id]).toBe(true);
+    const reloaded = makeSocket();
+    reloaded.loadStored(stored);
+    expect(
+      reloaded.sessions.get("s-stop-recovery")?._cancelledAutomaticRecoveryIds?.[user.id],
+    ).toBe(true);
+    sock.stop();
+    reloaded.stop();
+  });
 });
 
 describe("ChatSocket 1008 auth recovery", () => {
@@ -3913,7 +3973,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(retry).toMatchObject({ model: "gpt-5.6-sol", effortLevel: null });
   });
 
-  test("生成中(busy)再发 → 入队 queued 不并轨;turn 结束后 drain 自动发出", async () => {
+  test("生成中(busy)再发 → Stop 保留但暂停 queued；下一次显式发送才恢复 FIFO", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -3938,11 +3998,50 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(s.messages.find((m) => m.text === "second")?.status).toBe("queued");
     expect(ws.sent.filter((d) => d.includes('"inbound.message"')).length).toBe(1);
 
-    // 本轮结束(此处以 stop 收尾)→ 立即释放 FIFO slot 并发出下一条。
+    // 用户 Stop 只停止当前轮，后面的手动消息保留但绝不自动发出。
     sock.stopTurn("s1");
     expect(s._sendingInFlight).toBeFalsy();
+    expect(ws.sent.some((d) => d.includes('"inbound.message"') && d.includes("second"))).toBe(false);
+    expect(s.messages.find((m) => m.text === "second")?.status).toBe("queued");
+    expect(sock.toStored("s1")?._dispatchPaused).toBe(true);
+
+    // 下一次用户主动发送是明确恢复动作：旧 queued 仍按 FIFO 先发，新消息排在后面。
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "third" });
     expect(ws.sent.some((d) => d.includes('"inbound.message"') && d.includes("second"))).toBe(true);
     expect(s.messages.find((m) => m.text === "second")?.status).toBe("sending");
+    expect(s.messages.find((m) => m.text === "third")?.status).toBe("queued");
+    sock.stop();
+  });
+
+  test("切换助手先用旧 agent + exact clientMessageId 停止原 turn", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const s = sock.sessions.get("s1")!;
+    const clientMessageId = s.messages.find((message) => message.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+    ws.sent.length = 0;
+
+    sock.switchAgent("s1", "coding-assistant");
+
+    const stop = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .find((frame) => frame.type === "inbound.control.stop");
+    expect(stop).toMatchObject({
+      agentId: "main",
+      clientMessageId,
+      peer: { id: "s1", kind: "dm" },
+    });
+    expect(s.agentId).toBe("coding-assistant");
+    expect(s._sendingInFlight).toBe(false);
     sock.stop();
   });
 
