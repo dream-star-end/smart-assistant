@@ -10,9 +10,9 @@ import {
   normalizeMessageReplyQuote,
 } from '../messageReply.js'
 
-test('only CCB provider-switch history reserves proactive-compaction headroom', () => {
+test('CCB and Codex rebuilt history reserve proactive-compaction headroom', () => {
   assert.equal(modelHistoryReservedTokens('ccb'), 33_256)
-  assert.equal(modelHistoryReservedTokens('codex'), 256)
+  assert.equal(modelHistoryReservedTokens('codex'), 33_256)
   assert.equal(modelHistoryReservedTokens(undefined), 256)
 })
 

@@ -2921,9 +2921,10 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       containerWs.on("message", () => { containerGotFrame = true; });
 
       const errP = waitJsonFrameOfType(ws, "error");
-      const closedP = new Promise<number>((r) => ws.once("close", (code) => r(code)));
       ws.send(JSON.stringify({
         type: "inbound.message",
+        peer: { id: "team-policy-peer", kind: "dm" },
+        clientMessageId: "team-policy-message",
         agentId: "main",
         teamMode: true,
         content: "hi",
@@ -2931,12 +2932,14 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
 
       const err = await errP;
       assert.equal(err.code, "UNAUTHORIZED_MODEL");
-      const closeCode = await closedP;
-      assert.equal(closeCode, 4507, "unauthorized forced GPT must use product-policy close");
+      assert.deepEqual(err.peer, { id: "team-policy-peer", kind: "dm" });
+      assert.equal(err.clientMessageId, "team-policy-message");
       await new Promise((r) => setTimeout(r, 50));
+      assert.equal(ws.readyState, WebSocket.OPEN, "turn policy rejection must not reconnect the whole bridge");
       assert.equal(containerGotFrame, false, "unauthorized forced GPT must not reach container");
       assert.equal(rig.binding.acquireCalls, 0);
       assert.equal(rig.poolCtrl.journalRows.size, 0);
+      ws.close();
     } finally {
       await stopRig(rig);
     }

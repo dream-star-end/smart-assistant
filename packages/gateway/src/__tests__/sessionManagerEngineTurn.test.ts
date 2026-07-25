@@ -54,6 +54,8 @@ class FakeCcbRunner extends EventEmitter {
 
   async shutdown(): Promise<void> {}
 
+  clearSessionId(): void {}
+
   async waitForOutputDrain(): Promise<void> {}
 
   async submit(): Promise<void> {
@@ -964,6 +966,149 @@ describe("crash/interrupt partial persistence", () => {
     } finally {
       setV3MasterSinkSingleton(null);
     }
+  });
+
+  test("Codex context_too_long 终态清掉 native resume,下一轮不复用已耗尽 thread", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const internals = sm as unknown as {
+        _resumeMap: Map<string, string>;
+        _resumeMapTimestamps: Map<string, number>;
+        _resumeMapProvider: Map<string, string>;
+        _resumeMapLastCost: Map<string, number>;
+        _saveResumeMap: () => void;
+      };
+      internals._saveResumeMap = () => {};
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Codex ran out of room in the model's context window.",
+            errorClass: "context_too_long",
+          });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        providerTag: "codex",
+        ccbSessionId: "thread-full-1",
+        _historicalContextInjected: true,
+        _historicalContextInjectedKey: "master:srv-peer-main-t8",
+      } as Partial<AgentSession>);
+      internals._resumeMap.set(session.sessionKey, "thread-full-1");
+      internals._resumeMapTimestamps.set(session.sessionKey, Date.now());
+      internals._resumeMapProvider.set(session.sessionKey, "codex");
+      internals._resumeMapLastCost.set(session.sessionKey, 1);
+
+      let shutdowns = 0;
+      session.runner.shutdown = async () => { shutdowns += 1; };
+      let clears = 0;
+      const originalClear = session.runner.clearSessionId.bind(session.runner);
+      session.runner.clearSessionId = () => {
+        clears += 1;
+        originalClear();
+      };
+
+      await runOneTurn(sm, session, events);
+
+      assert.equal(shutdowns, 1);
+      assert.equal(clears, 1);
+      assert.equal(session.ccbSessionId, null);
+      assert.equal(internals._resumeMap.has(session.sessionKey), false);
+      assert.equal(internals._resumeMapTimestamps.has(session.sessionKey), false);
+      assert.equal(internals._resumeMapProvider.has(session.sessionKey), false);
+      assert.equal(internals._resumeMapLastCost.has(session.sessionKey), false);
+      assert.equal(session._historicalContextInjected, false);
+      assert.equal(session._historicalContextInjectedKey, undefined);
+      assert.ok(
+        events.some((event) =>
+          event.kind === "error" && event.errorClass === "context_too_long"),
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("跨 agent master 历史缺口先废弃 Codex native resume,再向新 thread 注入历史", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const internals = sm as unknown as {
+      _resumeMap: Map<string, string>;
+      _resumeMapTimestamps: Map<string, number>;
+      _resumeMapProvider: Map<string, string>;
+      _resumeMapLastCost: Map<string, number>;
+      _saveResumeMap: () => void;
+      runOneTurnWithRetry: (
+        session: AgentSession,
+        payload: string,
+        ...rest: unknown[]
+      ) => Promise<void>;
+    };
+    internals._saveResumeMap = () => {};
+    const runner = new FakeCcbRunner(() => {});
+    const session = makeSession(runner, {
+      channel: "webchat",
+      peerId: "cross-agent-peer",
+      providerTag: "codex",
+      ccbSessionId: "thread-before-gap",
+      turns: 1,
+      _historicalContextInjected: true,
+      _historicalContextInjectedKey: "master:srv-cross-agent-peer-codex-t7",
+    } as Partial<AgentSession>);
+    internals._resumeMap.set(session.sessionKey, "thread-before-gap");
+    internals._resumeMapTimestamps.set(session.sessionKey, Date.now());
+    internals._resumeMapProvider.set(session.sessionKey, "codex");
+    internals._resumeMapLastCost.set(session.sessionKey, 1);
+
+    let shutdowns = 0;
+    session.runner.shutdown = async () => { shutdowns += 1; };
+    let clears = 0;
+    const originalClear = session.runner.clearSessionId.bind(session.runner);
+    session.runner.clearSessionId = () => {
+      clears += 1;
+      originalClear();
+    };
+    let submittedPayload = "";
+    internals.runOneTurnWithRetry = async (_session, payload) => {
+      submittedPayload = payload;
+    };
+
+    await sm.submit(
+      session,
+      "继续刚才的回答",
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        historicalMessages: [
+          { role: "user", id: "u-1", text: "问题" },
+          {
+            role: "assistant",
+            id: "srv-cross-agent-peer-office-assistant-t8",
+            text: "另一个 agent 的最新回答",
+          },
+        ],
+      },
+    );
+
+    assert.equal(shutdowns, 1);
+    assert.equal(clears, 1);
+    assert.equal(session.ccbSessionId, null);
+    assert.equal(internals._resumeMap.has(session.sessionKey), false);
+    assert.equal(internals._resumeMapProvider.has(session.sessionKey), false);
+    assert.match(submittedPayload, /另一个 agent 的最新回答/);
+    assert.match(submittedPayload, /<current_user_message>\n继续刚才的回答/);
+    assert.equal(
+      session._historicalContextInjectedKey,
+      "master:srv-cross-agent-peer-office-assistant-t8",
+    );
   });
 
   test("runner error waits for drained late output instead of freezing an early partial", async () => {

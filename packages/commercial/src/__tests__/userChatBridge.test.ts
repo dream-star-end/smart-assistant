@@ -911,7 +911,7 @@ describe("userChatBridge — tunnel routing (regression)", () => {
 // ------- 0049 模型授权(plan v3 review v1/v2 follow-up)----------------------
 
 describe("userChatBridge — model authorization", () => {
-  test("inbound.message 带 model 且未授权 → close(PRODUCT_POLICY 4507)", async () => {
+  test("inbound.message 带 model 且未授权 → 精确拒帧且保持连接,避免重连重放", async () => {
     const allowed = new Set<string>(["claude-opus-4-7"]); // gpt-5.6-sol 不在
     const rig = await startRig({
       loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
@@ -922,13 +922,19 @@ describe("userChatBridge — model authorization", () => {
       await new Promise<void>((r) => ws.once("open", () => r()));
 
       const fc = frameCollector(ws);
-      const closeP = waitClose(ws);
-      ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.6-sol" }));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "model-policy-peer", kind: "dm" },
+        clientMessageId: "model-policy-message",
+        model: "gpt-5.6-sol",
+      }));
       const err = await nextBusinessFrame(fc);
       assert.equal(err.code, "UNAUTHORIZED_MODEL");
-      const closed = await closeP;
-      // 模型未授权=用户可调整的产品策略 → 4507(1008 会被前端误判为登录过期,见 CLOSE_BRIDGE 注释)
-      assert.equal(closed.code, CLOSE_BRIDGE.PRODUCT_POLICY);
+      assert.deepEqual(err.peer, { id: "model-policy-peer", kind: "dm" });
+      assert.equal(err.clientMessageId, "model-policy-message");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(ws.readyState, WebSocket.OPEN, "turn 级策略拒绝不能关闭用户整条 WS");
+      ws.close();
     } finally {
       await stopRig(rig);
     }
@@ -1386,13 +1392,19 @@ describe("userChatBridge — model authorization", () => {
 
       // 3) 第二帧不带 model,但 lastSeenModelId='gpt-5.6-sol' → 应该被拦
       const fc = frameCollector(ws);
-      const closeP = waitClose(ws);
-      ws.send(JSON.stringify({ type: "inbound.message", n: 2 }));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        peer: { id: "revoked-model-peer", kind: "dm" },
+        clientMessageId: "revoked-model-message",
+        n: 2,
+      }));
       const err = await nextBusinessFrame(fc);
       assert.equal(err.code, "UNAUTHORIZED_MODEL");
-      const closed = await closeP;
-      // 同上:模型授权撤销=产品策略 close(4507),非登录态 1008
-      assert.equal(closed.code, CLOSE_BRIDGE.PRODUCT_POLICY);
+      assert.deepEqual(err.peer, { id: "revoked-model-peer", kind: "dm" });
+      assert.equal(err.clientMessageId, "revoked-model-message");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(ws.readyState, WebSocket.OPEN);
+      ws.close();
     } finally {
       await stopRig(rig);
     }

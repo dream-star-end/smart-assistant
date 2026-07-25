@@ -35,6 +35,14 @@ describe('classifyRunError', () => {
     assert.equal(r.code, 'rate_limited')
   })
 
+  it('context_too_long: Codex exact context exhaustion error', () => {
+    const r = classifyRunError(
+      "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+    )
+    assert.equal(r.code, 'context_too_long')
+    assert.equal(r.message, '上下文长度超过模型上限')
+  })
+
   it('upstream_failed: 502', () => {
     const r = classifyRunError('Anthropic returned 502 Bad Gateway')
     assert.equal(r.code, 'upstream_failed')
