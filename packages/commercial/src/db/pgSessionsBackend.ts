@@ -3536,10 +3536,17 @@ async function computeFiniteEngineContextMessages(
   options: EngineContextReadOptions,
 ): Promise<MessageLike[]> {
   const state: FiniteModelContextState = {
-    remainingTokens: availableModelHistoryTokens(
-      contextWindow,
-      options.currentUserText ?? "",
-      modelHistoryReservedTokens(options.engine),
+    // Codex rebuilds history as one synthetic user message. Its stored token
+    // estimate is intentionally approximate (ASCII chars / 4), which can
+    // undercount dense code/JSON by up to 4x and make recovery loop forever on
+    // contextWindowExceeded. Budget that estimate at its byte-level worst case;
+    // the complete tape remains stored and older records stay retrievable.
+    remainingTokens: Math.floor(
+      availableModelHistoryTokens(
+        contextWindow,
+        options.currentUserText ?? "",
+        modelHistoryReservedTokens(options.engine),
+      ) / (options.engine === "codex" ? 4 : 1),
     ),
     stopped: false,
     newestFirst: [],
