@@ -106,7 +106,7 @@ describe('oc-browser real Unix socket CLI transport', () => {
               {
                 argv: ['click', '--ref', 'e1', '--element', 'Submit'],
                 tool: 'browser_click',
-                args: { ref: 'e1', element: 'Submit' },
+                args: { target: 'e1', element: 'Submit' },
               },
               {
                 argv: [
@@ -120,7 +120,7 @@ describe('oc-browser real Unix socket CLI transport', () => {
                   '--submit',
                 ],
                 tool: 'browser_type',
-                args: { ref: 'e2', element: 'Search', text: 'OpenClaude', submit: true },
+                args: { target: 'e2', element: 'Search', text: 'OpenClaude', submit: true },
               },
               {
                 argv: ['press-key', '--key', 'Enter'],
@@ -153,6 +153,52 @@ describe('oc-browser real Unix socket CLI transport', () => {
               requests,
               cases.map(({ tool, args }) => ({ tool, args })),
             )
+          } finally {
+            await new Promise<void>((done) => server.close(() => done()))
+          }
+        },
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('MCP tool-level errors fail the shell command without losing structured JSON', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-browser-cli-tool-error-'))
+    const agentId = 'tool-error-e2e'
+    try {
+      await withEnv(
+        {
+          OPENCLAUDE_OC_BROWSER_ROOT: root,
+          OPENCLAUDE_AGENT_ID: agentId,
+        },
+        async () => {
+          mkdirSync(ocBrowserAgentDir(agentId), { recursive: true })
+          const socketPath = ocBrowserSocketPath(agentId)
+          const response = {
+            ok: true,
+            result: {
+              isError: true,
+              content: [
+                { type: 'text', text: '### Error' },
+                { type: 'text', text: 'invalid browser target' },
+              ],
+            },
+          }
+          const server = createNetServer((socket) => {
+            socket.once('data', () => socket.end(`${JSON.stringify(response)}\n`))
+          })
+          await new Promise<void>((done) => server.listen(socketPath, done))
+          try {
+            const textResult = await runOcBrowser(['snapshot'])
+            assert.equal(textResult.exitCode, 1)
+            assert.equal(textResult.stdout, '')
+            assert.equal(textResult.stderr, 'oc-browser: ### Error\ninvalid browser target\n')
+
+            const jsonResult = await runOcBrowser(['snapshot', '--json'])
+            assert.equal(jsonResult.exitCode, 1)
+            assert.equal(jsonResult.stderr, '')
+            assert.deepEqual(JSON.parse(jsonResult.stdout), response)
           } finally {
             await new Promise<void>((done) => server.close(() => done()))
           }
