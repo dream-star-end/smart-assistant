@@ -25,6 +25,7 @@
 
 import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type Docker from "dockerode";
@@ -34,12 +35,16 @@ import {
   makeV3EnsureRunning,
   ENSURE_RUNNING_DEFAULTS,
   buildReadinessOpts,
+  requestRuntimeRecycleDrain,
 } from "../agent-sandbox/v3ensureRunning.js";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 import {
   V3_CONTAINER_PORT,
   type V3SupervisorDeps,
+  type V3ContainerStatus,
 } from "../agent-sandbox/v3supervisor.js";
+import { computeInboundNonce } from "../bridgeSecret.js";
+import type { TunnelDialOptions } from "../compute-pool/nodeAgentClient.js";
 
 // ───────────────────────────────────────────────────────────────────────
 //  Fakes —— ensureRunning 通过 supervisor.* helpers 调 docker/pool。
@@ -381,6 +386,135 @@ const fixedNow = () => 1_000_000;
 //  Tests
 // ───────────────────────────────────────────────────────────────────────
 
+test("remote runtime drain 经 node-agent tunnel 保留 Docker path 与数值容器鉴权语义", async () => {
+  const pool = new FakePool();
+  const { docker } = makeDocker();
+  const bridgeSecret = "remote-drain-secret";
+  const deps = makeDeps(docker, pool as unknown as Pool, { bridgeSecret });
+  const status = {
+    containerId: 77,
+    userId: 9,
+    boundIp: "172.31.0.9",
+    port: V3_CONTAINER_PORT,
+    dockerContainerId: "docker-remote-77",
+    state: "running",
+    hostId: "22222222-2222-2222-2222-222222222222",
+    lastWsActivity: new Date(),
+  } satisfies V3ContainerStatus;
+
+  for (const [httpCode, expected] of [
+    [200, "accepted"],
+    [409, "busy"],
+    [503, "failed"],
+  ] as const) {
+    const psk = Buffer.from("a1b2c3d4", "hex");
+    let destroyed = false;
+    const capturedDialOptions: TunnelDialOptions[] = [];
+    const socket = new EventEmitter() as EventEmitter & { destroy(): void };
+    socket.destroy = () => { destroyed = true; };
+
+    const result = await requestRuntimeRecycleDrain(deps, status, 100, {
+      resolveTarget: async () => ({
+        hostId: status.hostId,
+        host: "remote.example",
+        agentPort: 9443,
+        expectedFingerprint: "aa".repeat(32),
+        psk,
+        requireFingerprint: true,
+      }),
+      dialTunnel: async (options) => {
+        capturedDialOptions.push(options);
+        setTimeout(() => socket.emit("data", Buffer.from(`HTTP/1.1 ${httpCode} Result\r\n`)), 0);
+        return socket as never;
+      },
+    });
+
+    const dialOptions = capturedDialOptions[0];
+    assert.ok(dialOptions);
+    assert.equal(result, expected);
+    assert.equal(dialOptions.containerInternalId, "docker-remote-77");
+    assert.equal(
+      dialOptions.pathAndQuery,
+      `/internal/v3/runtime-recycle-drain?port=${V3_CONTAINER_PORT}`,
+    );
+    assert.equal(dialOptions.headers?.["x-openclaude-container-id"], "77");
+    assert.equal(
+      dialOptions.headers?.["x-openclaude-inbound-nonce"],
+      computeInboundNonce(bridgeSecret, 77),
+    );
+    assert.equal(destroyed, true);
+    assert.ok(psk.every((byte) => byte === 0), "temporary node-agent PSK must be cleared");
+  }
+});
+
+test("remote runtime drain 超时 fail-closed 且销毁 tunnel", async () => {
+  const pool = new FakePool();
+  const { docker } = makeDocker();
+  const deps = makeDeps(docker, pool as unknown as Pool, { bridgeSecret: "secret" });
+  const status = {
+    containerId: 78,
+    userId: 10,
+    boundIp: "172.31.0.10",
+    port: V3_CONTAINER_PORT,
+    dockerContainerId: "docker-remote-78",
+    state: "running",
+    hostId: "33333333-3333-3333-3333-333333333333",
+    lastWsActivity: null,
+  } satisfies V3ContainerStatus;
+  let destroyed = false;
+  const socket = new EventEmitter() as EventEmitter & { destroy(): void };
+  socket.destroy = () => { destroyed = true; };
+
+  const result = await requestRuntimeRecycleDrain(deps, status, 5, {
+    resolveTarget: async () => ({
+      hostId: status.hostId,
+      host: "remote.example",
+      agentPort: 9443,
+      expectedFingerprint: "bb".repeat(32),
+      psk: Buffer.from("abcd", "hex"),
+      requireFingerprint: true,
+    }),
+    dialTunnel: async () => socket as never,
+  });
+
+  assert.equal(result, "failed");
+  assert.equal(destroyed, true);
+});
+
+test("remote runtime drain 的总预算覆盖悬停的 tunnel 建连", async () => {
+  const pool = new FakePool();
+  const { docker } = makeDocker();
+  const deps = makeDeps(docker, pool as unknown as Pool, { bridgeSecret: "secret" });
+  const status = {
+    containerId: 79,
+    userId: 11,
+    boundIp: "172.31.0.11",
+    port: V3_CONTAINER_PORT,
+    dockerContainerId: "docker-remote-79",
+    state: "running",
+    hostId: "44444444-4444-4444-4444-444444444444",
+    lastWsActivity: null,
+  } satisfies V3ContainerStatus;
+  const psk = Buffer.from("abcd", "hex");
+  const startedAt = Date.now();
+
+  const result = await requestRuntimeRecycleDrain(deps, status, 10, {
+    resolveTarget: async () => ({
+      hostId: status.hostId,
+      host: "remote.example",
+      agentPort: 9443,
+      expectedFingerprint: "cc".repeat(32),
+      psk,
+      requireFingerprint: true,
+    }),
+    dialTunnel: () => new Promise<never>(() => {}),
+  });
+
+  assert.equal(result, "failed");
+  assert.ok(Date.now() - startedAt < 250, "hung TLS dial must not consume its independent 10s timeout");
+  assert.ok(psk.every((byte) => byte === 0), "timed-out node-agent PSK must be cleared");
+});
+
 describe("makeV3EnsureRunning", () => {
   // 基线 fail-closed 默认启用;ensureRunning 走 provision 路径的用例不关心基线内容,
   // 设 OC_V3_CCB_BASELINE_OPTIONAL=1 降级为 warn+skip,避免 CcbBaselineMissing。
@@ -436,7 +570,7 @@ describe("makeV3EnsureRunning", () => {
     assert.ok(captured.containersCreated >= 1, "应用新镜像 provision 新容器");
   });
 
-  test("v5 stale image + 活动不足 30 分钟 → 延期并 warm 复用", async () => {
+  test("v5 stale image + 最近有 WS 活动但无在途 turn → drain accepted 后回收", async () => {
       const pool = new FakePool();
       const row = pool.preInsertActive(111, "172.31.1.11", "dockerid-pre-111");
       const now = 2_000_000;
@@ -453,17 +587,20 @@ describe("makeV3EnsureRunning", () => {
         runtimeChannelForTest: "v5",
         requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "accepted"; },
       });
-      const ep = await ensureRunning(111n);
-      assert.equal(ep.coldStart, false);
-      assert.equal(drainCalls, 0);
-      assert.equal(captured.stopped, 0);
+      await assert.rejects(ensureRunning(111n), (err) => {
+        assert.ok(err instanceof ContainerUnreadyError);
+        assert.equal(err.reason, "provisioning");
+        return true;
+      });
+      assert.equal(drainCalls, 1);
+      assert.ok(captured.stopped >= 1);
   });
 
-  test("v5 stale image + 恰好 30 分钟 + drain accepted → 回收", async () => {
+  test("v5 stale image + 最近有 WS 活动但仍有在途 turn → drain busy 后延期", async () => {
       const pool = new FakePool();
       const row = pool.preInsertActive(112, "172.31.1.12", "dockerid-pre-112");
       const now = 2_000_000;
-      row.last_ws_activity = new Date(now - 30 * 60_000);
+      row.last_ws_activity = new Date(now - 60_000);
       const { docker, captured } = makeDocker({
         inspectState: "running",
         containerImage: "openclaude/openclaude-runtime:old",
@@ -474,15 +611,12 @@ describe("makeV3EnsureRunning", () => {
         probeWsUpgrade: async () => true,
         now: () => now,
         runtimeChannelForTest: "v5",
-        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "accepted"; },
+        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "busy"; },
       });
-      await assert.rejects(ensureRunning(112n), (err) => {
-        assert.ok(err instanceof ContainerUnreadyError);
-        assert.equal(err.reason, "provisioning");
-        return true;
-      });
+      const ep = await ensureRunning(112n);
+      assert.equal(ep.coldStart, false);
       assert.equal(drainCalls, 1);
-      assert.ok(captured.stopped >= 1);
+      assert.equal(captured.stopped, 0);
   });
 
   test("v5 stale image + NULL 活动 + drain busy/failure → 延期", async () => {

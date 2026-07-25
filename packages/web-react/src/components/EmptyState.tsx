@@ -5,11 +5,11 @@ import { Button } from "./ui";
 
 export function EmptyState({
   agent,
-  onPick,
+  onPrefill,
   onChangeAgent,
 }: {
   agent: Agent;
-  onPick: (text: string) => void;
+  onPrefill: (text: string) => void;
   onChangeAgent: () => void;
 }) {
   return (
@@ -32,7 +32,7 @@ export function EmptyState({
         {(agent.starters ?? []).map((s) => (
           <button
             key={s}
-            onClick={() => onPick(s)}
+            onClick={() => onPrefill(s)}
             className="group rounded-xl border border-border bg-surface p-3.5 text-left text-[14px] leading-relaxed text-muted outline-none transition-[transform,box-shadow,border-color,color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:text-fg hover:shadow-soft focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
           >
             {s}

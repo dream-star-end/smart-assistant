@@ -112,6 +112,7 @@ export async function getUsersStats(): Promise<UsersStatsResult> {
 //   verified            email_verified = TRUE
 //   first_topup         EXISTS credit_ledger reason='topup' delta>0
 //   first_request       EXISTS usage_records (任意一次)
+//   first_success       EXISTS usage_records status='success'(至少拿到一次成功结果)
 //
 // 留存窗口(D1 = 注册次日 24h 内有 usage_records,Asia/Shanghai 自然日):
 //   d1_window: created_at_day + INTERVAL '1 day' .. + INTERVAL '2 days'
@@ -135,6 +136,8 @@ export interface FunnelStatsResult {
   first_topup: number;
   /** cohort 中至少有 1 条 usage_records 的人数。 */
   first_request: number;
+  /** cohort 中至少有 1 条 status='success' usage_records 的人数。 */
+  first_success: number;
   /** D1 留存合格分母 — D1 窗口已完整结束的 cohort 子集(created_day < tz0 - 1d)。 */
   eligible_for_d1: number;
   /** D7 留存合格分母 — D7 窗口已完整结束的 cohort 子集(created_day < tz0 - 7d)。 */
@@ -162,6 +165,7 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
     verified: string;
     first_topup: string;
     first_request: string;
+    first_success: string;
     eligible_for_d1: string;
     eligible_for_d7: string;
     d1_retained: string;
@@ -196,6 +200,10 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
          ) AS has_request,
          EXISTS (
            SELECT 1 FROM usage_records ur
+           WHERE ur.user_id = c.id AND ur.status = 'success'
+         ) AS has_success,
+         EXISTS (
+           SELECT 1 FROM usage_records ur
            WHERE ur.user_id = c.id
              AND ur.created_at >= c.created_day + INTERVAL '1 day'
              AND ur.created_at <  c.created_day + INTERVAL '2 days'
@@ -213,6 +221,7 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
        COUNT(*) FILTER (WHERE email_verified)::text                   AS verified,
        COUNT(*) FILTER (WHERE has_topup)::text                        AS first_topup,
        COUNT(*) FILTER (WHERE has_request)::text                      AS first_request,
+       COUNT(*) FILTER (WHERE has_success)::text                      AS first_success,
        COUNT(*) FILTER (WHERE created_day < (SELECT tz0 - INTERVAL '1 day' FROM params))::text             AS eligible_for_d1,
        COUNT(*) FILTER (WHERE created_day < (SELECT tz0 - INTERVAL '7 days' FROM params))::text             AS eligible_for_d7,
        COUNT(*) FILTER (WHERE d1_hit AND created_day < (SELECT tz0 - INTERVAL '1 day' FROM params))::text   AS d1_retained,
@@ -222,7 +231,7 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
   );
 
   const u = r.rows[0] ?? {
-    cohort_total: "0", verified: "0", first_topup: "0", first_request: "0",
+    cohort_total: "0", verified: "0", first_topup: "0", first_request: "0", first_success: "0",
     eligible_for_d1: "0", eligible_for_d7: "0", d1_retained: "0", d7_retained: "0",
   };
   return {
@@ -231,6 +240,7 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
     verified: Number(u.verified),
     first_topup: Number(u.first_topup),
     first_request: Number(u.first_request),
+    first_success: Number(u.first_success),
     eligible_for_d1: Number(u.eligible_for_d1),
     eligible_for_d7: Number(u.eligible_for_d7),
     d1_retained: Number(u.d1_retained),

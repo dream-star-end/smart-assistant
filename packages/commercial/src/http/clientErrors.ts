@@ -18,7 +18,7 @@ import { verifyCommercialJwtSync } from "../auth/jwtSync.js";
 import { recordProductFrictionEvent, type FrictionOutcome } from "../productFriction/events.js";
 
 const SAFE_LOWER = /^[a-z0-9_]{1,48}$/;
-const SAFE_CODE = /^[A-Z0-9_]{1,64}$/;
+const SAFE_CODE = /^[A-Za-z0-9_]{1,64}$/;
 const OUTCOMES = new Set<FrictionOutcome>([
   "pending", "failed", "recovered", "succeeded", "abandoned", "cancelled",
 ]);
