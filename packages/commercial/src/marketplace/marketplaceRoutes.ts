@@ -14,6 +14,8 @@ import { ConnectorSpecError } from '../connectors/spec/types.js'
 
 import { writeAdminAuditBestEffort } from '../admin/audit.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
+import { isSignalTrafficFilter, signalTrafficFilterValue } from '../analytics/signalTraffic.js'
+import { query } from '../db/queries.js'
 import { requireAuth } from '../http/auth.js'
 import { HttpError, clientIpOf, readJsonBody, sendJson, userAgentOf } from '../http/util.js'
 import {
@@ -791,13 +793,117 @@ export async function handleMarketplaceUninstall(
   // 平台预设与全能助手同级,不可卸载(sync 侧也会恒下发,卸了只会状态漂移)。
   if ((await platformPresetAgentSlugs()).includes(slug))
     throw new HttpError(400, 'PRESET_AGENT', '平台预设智能体不可卸载')
+  const body = (await readJsonBody(req, 4 * 1024)) as { reason?: unknown } | undefined
+  const reason = typeof body?.reason === 'string' ? body.reason : 'prefer_not_say'
+  if (
+    ![
+      'not_needed',
+      'poor_quality',
+      'missing_capability',
+      'install_error',
+      'other',
+      'prefer_not_say',
+    ].includes(reason)
+  ) {
+    throw new HttpError(400, 'BAD_UNINSTALL_REASON', 'invalid uninstall reason')
+  }
   // P2.2 will also remove the on-disk hub copy; this records the soft-uninstall.
   try {
-    const ok = await recordUninstall(uid(user), slug)
+    const ok = await recordUninstall(
+      uid(user),
+      slug,
+      reason as Parameters<typeof recordUninstall>[2],
+    )
     sendJson(res, 200, { ok })
   } catch (e) {
     throw mapMarketplaceError(e)
   }
+}
+
+// ── GET /api/admin/marketplace/funnel ─────────────────────────────────────
+export async function handleAdminMarketplaceFunnel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
+  const traffic = url.searchParams.get('traffic_class') ?? 'production_user'
+  if (!isSignalTrafficFilter(traffic)) {
+    throw new HttpError(400, 'VALIDATION', 'invalid traffic_class')
+  }
+  const trafficClass = signalTrafficFilterValue(traffic)
+  const [browser, installs, usage, uninstalls] = await Promise.all([
+    query<{ stage: string; users: string; events: string }>(
+      `SELECT e.stage,
+              COUNT(DISTINCT e.user_id)::text AS users,
+              COUNT(*)::text AS events
+         FROM product_friction_events e
+         JOIN users u ON u.id=e.user_id
+        WHERE e.surface='marketplace'
+          AND e.stage IN ('catalog_exposure','detail_view')
+          AND e.outcome='succeeded'
+          AND e.created_at >= NOW() - INTERVAL '30 days'
+          AND ($1::text IS NULL OR u.signal_traffic_class=$1)
+        GROUP BY e.stage`,
+      [trafficClass],
+    ),
+    query<{ users: string; installs: string }>(
+      `SELECT COUNT(DISTINCT i.user_id)::text AS users,
+              COUNT(*)::text AS installs
+         FROM marketplace_installs i
+         JOIN users u ON u.id=i.user_id
+        WHERE i.installed_at >= NOW() - INTERVAL '30 days'
+          AND ($1::text IS NULL OR u.signal_traffic_class=$1)`,
+      [trafficClass],
+    ),
+    query<{ first_use_users: string; used_pairs: string; repeat_pairs: string }>(
+      `WITH pairs AS (
+         SELECT e.user_id,e.slug,COUNT(*)::int AS uses
+           FROM marketplace_skill_usage_events e
+           JOIN users u ON u.id=e.user_id
+          WHERE e.created_at >= NOW() - INTERVAL '30 days'
+            AND ($1::text IS NULL OR u.signal_traffic_class=$1)
+          GROUP BY e.user_id,e.slug
+       )
+       SELECT COUNT(DISTINCT user_id)::text AS first_use_users,
+              COUNT(*)::text AS used_pairs,
+              COUNT(*) FILTER (WHERE uses >= 2)::text AS repeat_pairs
+         FROM pairs`,
+      [trafficClass],
+    ),
+    query<{ reason: string; count: string }>(
+      `SELECT COALESCE(i.uninstall_reason,'prefer_not_say') AS reason,
+              COUNT(*)::text AS count
+         FROM marketplace_installs i
+         JOIN users u ON u.id=i.user_id
+        WHERE i.uninstalled_at >= NOW() - INTERVAL '30 days'
+          AND ($1::text IS NULL OR u.signal_traffic_class=$1)
+        GROUP BY COALESCE(i.uninstall_reason,'prefer_not_say')
+        ORDER BY COUNT(*) DESC`,
+      [trafficClass],
+    ),
+  ])
+  const browserByStage = new Map(browser.rows.map((row) => [row.stage, row]))
+  sendJson(res, 200, {
+    window: '30d',
+    traffic_class: traffic,
+    funnel: {
+      exposure_users: Number(browserByStage.get('catalog_exposure')?.users ?? 0),
+      exposure_events: Number(browserByStage.get('catalog_exposure')?.events ?? 0),
+      detail_users: Number(browserByStage.get('detail_view')?.users ?? 0),
+      detail_events: Number(browserByStage.get('detail_view')?.events ?? 0),
+      install_users: Number(installs.rows[0]?.users ?? 0),
+      installs: Number(installs.rows[0]?.installs ?? 0),
+      first_use_users: Number(usage.rows[0]?.first_use_users ?? 0),
+      used_pairs: Number(usage.rows[0]?.used_pairs ?? 0),
+      repeat_pairs: Number(usage.rows[0]?.repeat_pairs ?? 0),
+    },
+    uninstall_reasons: uninstalls.rows.map((row) => ({
+      reason: row.reason,
+      count: Number(row.count),
+    })),
+  })
 }
 
 // ── GET /api/admin/marketplace/pending ─────────────────────────────────────

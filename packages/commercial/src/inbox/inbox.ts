@@ -31,6 +31,7 @@ import {
 export type Audience = "all" | "user";
 export type Level = "info" | "notice" | "promo" | "warning";
 export const LEVELS: readonly Level[] = ["info", "notice", "promo", "warning"];
+export type InboxCategory = "user" | "automation" | "billing" | "operations" | "marketing";
 
 export interface InboxMessage {
   id: string;
@@ -96,6 +97,9 @@ const createSchema = z
     title: z.string().min(1).max(200),
     body_md: z.string().min(1).max(16384),
     level: z.enum(["info", "notice", "promo", "warning"]).optional(),
+    category: z
+      .enum(["user", "automation", "billing", "operations", "marketing"])
+      .optional(),
     expires_at: z.string().datetime({ offset: true }).optional(),
     // Plan C:勾选后同事务给 audience 对应的 active+email_verified 用户写
     // inbox_email_jobs 快照,worker drain 后异步发邮件。详见 0065 migration 注释。
@@ -389,8 +393,13 @@ export async function createInboxMessage(
       created_at: Date;
       expires_at: Date | null;
     }>(
-      `INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by, expires_at)
-       VALUES ($1, $2::bigint, $3, $4, COALESCE($5, 'info'), $6::bigint, $7::timestamptz)
+      `INSERT INTO inbox_messages
+         (audience, user_id, title, body_md, level, category, created_by, expires_at)
+       VALUES (
+         $1, $2::bigint, $3, $4, COALESCE($5, 'info'),
+         COALESCE($6, CASE WHEN $5='promo' THEN 'marketing' ELSE 'user' END),
+         $7::bigint, $8::timestamptz
+       )
        RETURNING id::text AS id, audience, user_id::text AS user_id, title, body_md, level,
                  created_by::text AS created_by, created_at, expires_at`,
       [
@@ -399,6 +408,7 @@ export async function createInboxMessage(
         v.title,
         richBody.bodyMd,
         v.level ?? null,
+        v.category ?? null,
         String(adminId),
         v.expires_at ?? null,
       ],
@@ -435,8 +445,12 @@ export async function createInboxMessage(
       expires_at: Date | null;
     }>(
       `INSERT INTO inbox_messages
-         (audience, user_id, title, body_md, level, created_by, expires_at, notify_email)
-       VALUES ($1, $2::bigint, $3, $4, COALESCE($5, 'info'), $6::bigint, $7::timestamptz, $8)
+         (audience, user_id, title, body_md, level, category, created_by, expires_at, notify_email)
+       VALUES (
+         $1, $2::bigint, $3, $4, COALESCE($5, 'info'),
+         COALESCE($6, CASE WHEN $5='promo' THEN 'marketing' ELSE 'user' END),
+         $7::bigint, $8::timestamptz, $9
+       )
        RETURNING id::text AS id, audience, user_id::text AS user_id, title, body_md, level,
                  created_by::text AS created_by, created_at, expires_at`,
       [
@@ -445,6 +459,7 @@ export async function createInboxMessage(
         v.title,
         richBody.bodyMd,
         v.level ?? null,
+        v.category ?? null,
         String(adminId),
         v.expires_at ?? null,
         notifyEmail,
@@ -554,11 +569,18 @@ export async function createInboxMessage(
 export interface AdminListInput {
   limit?: number;
   offset?: number;
+  category?: InboxCategory | null;
 }
 
 export interface AdminInboxRow extends InboxMessage, InboxEmailFields {
   read_count: number;
   recipients: number;
+  category: InboxCategory;
+  thread_key: string | null;
+  thread_count: number;
+  source_type: string | null;
+  source_id: string | null;
+  source_phase: string | null;
 }
 
 export interface AdminListResult {
@@ -613,6 +635,12 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
     email_send_status: EmailSendStatus;
     email_sent_at: Date | null;
     email_summary: unknown;
+    category: InboxCategory;
+    thread_key: string | null;
+    thread_count: number;
+    source_type: string | null;
+    source_id: string | null;
+    source_phase: string | null;
   }>(
     `SELECT m.id::text AS id,
             m.audience,
@@ -627,6 +655,19 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
             m.email_send_status,
             m.email_sent_at,
             m.email_summary,
+            m.category,
+            m.thread_key,
+            m.source_type,
+            m.source_id::text AS source_id,
+            m.source_phase,
+            CASE
+              WHEN m.thread_key IS NULL THEN 1
+              ELSE (
+                SELECT COUNT(*)::int
+                  FROM inbox_messages threaded
+                 WHERE threaded.thread_key=m.thread_key
+              )
+            END AS thread_count,
             COALESCE((SELECT COUNT(*)::int FROM inbox_message_reads r WHERE r.message_id = m.id), 0) AS read_count,
             CASE WHEN m.audience = 'user' THEN 1
                  ELSE COALESCE(
@@ -634,12 +675,18 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
                      WHERE u.status = 'active' AND u.created_at <= m.created_at), 0)
             END AS recipients
        FROM inbox_messages m
+      WHERE ($3::text IS NULL OR m.category=$3)
       ORDER BY m.created_at DESC, m.id DESC
       LIMIT $1 OFFSET $2`,
-    [limit, offset],
+    [limit, offset, input.category ?? null],
   );
 
-  const totalRes = await query<{ n: number }>(`SELECT COUNT(*)::int AS n FROM inbox_messages`);
+  const totalRes = await query<{ n: number }>(
+    `SELECT COUNT(*)::int AS n
+       FROM inbox_messages
+      WHERE ($1::text IS NULL OR category=$1)`,
+    [input.category ?? null],
+  );
 
   return {
     messages: listRes.rows.map((row) => ({
@@ -658,6 +705,12 @@ export async function adminListInbox(input: AdminListInput): Promise<AdminListRe
       email_send_status: row.email_send_status,
       email_sent_at: row.email_sent_at ? row.email_sent_at.toISOString() : null,
       email_summary: normalizeEmailSummary(row.email_summary),
+      category: row.category,
+      thread_key: row.thread_key,
+      thread_count: row.thread_count,
+      source_type: row.source_type,
+      source_id: row.source_id,
+      source_phase: row.source_phase,
     })),
     total: totalRes.rows[0]?.n ?? 0,
   };

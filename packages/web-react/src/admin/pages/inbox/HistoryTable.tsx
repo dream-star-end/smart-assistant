@@ -16,6 +16,7 @@ import {
   KeyValue,
   Pagination,
   SectionCard,
+  SelectFilter,
   TimeAgo,
 } from "../../components";
 import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
@@ -23,11 +24,19 @@ import {
   EMAIL_STATUS_META,
   INBOX_LEVEL_LABELS,
   INBOX_LEVEL_TONE,
+  type InboxCategory,
   type InboxMessage,
   type MessagesResp,
 } from "./types";
 
 const PAGE_SIZE = 50;
+const CATEGORY_LABEL: Record<InboxCategory, string> = {
+  user: "用户沟通",
+  automation: "自动化",
+  billing: "计费",
+  operations: "运维",
+  marketing: "营销",
+};
 
 /** 邮件状态徽章：未开启邮件推送显 "—"，否则 status + sent/total（tooltip 展开明细）。 */
 function EmailChip({ m }: { m: InboxMessage }) {
@@ -71,6 +80,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
   const [offset, setOffset] = useState(0);
   const [detail, setDetail] = useState<InboxMessage | null>(null);
   const [detailMode, setDetailMode] = useState<"preview" | "source">("preview");
+  const [category, setCategory] = useState<InboxCategory | "">("");
 
   const openDetail = (message: InboxMessage) => {
     setDetail(message);
@@ -81,20 +91,23 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
     setLoading(true);
     setError(null);
     try {
-      const r = await adminGet<MessagesResp>("/messages", { limit: PAGE_SIZE, offset });
+      const r = await adminGet<MessagesResp>("/messages", {
+        limit: PAGE_SIZE,
+        offset,
+        category: category || undefined,
+      });
       setData(r);
     } catch (e) {
       setError(e instanceof Error ? e : new Error(String(e)));
     } finally {
       setLoading(false);
     }
-  }, [offset]);
+  }, [offset, category]);
 
   // offset / 外部 reloadKey（发送后）变化即重拉。
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [offset, reloadKey]);
+  }, [load, reloadKey]);
 
   const del = async (m: InboxMessage) => {
     const ok = await confirm({
@@ -128,6 +141,12 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       render: (m) => <Badge tone={INBOX_LEVEL_TONE[m.level]}>{INBOX_LEVEL_LABELS[m.level] ?? m.level}</Badge>,
     },
     {
+      key: "category",
+      title: "分类",
+      width: 88,
+      render: (m) => <Badge tone="neutral">{CATEGORY_LABEL[m.category]}</Badge>,
+    },
+    {
       key: "title",
       title: "标题",
       render: (m) => (
@@ -149,7 +168,7 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
     },
     {
       key: "read",
-      title: "已读 / 收件人",
+      title: "站内已读",
       width: 110,
       align: "right",
       cellClassName: "tabular-nums text-muted",
@@ -184,6 +203,23 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
       bodyClassName="px-0 py-0"
     >
       {confirmEl}
+      <div className="border-b border-border px-4 py-3">
+        <SelectFilter
+          label="分类"
+          value={category}
+          options={[
+            { label: "全部分类", value: "" },
+            ...Object.entries(CATEGORY_LABEL).map(([value, label]) => ({
+              value: value as InboxCategory,
+              label,
+            })),
+          ]}
+          onChange={(value) => {
+            setOffset(0);
+            setCategory(value as InboxCategory | "");
+          }}
+        />
+      </div>
       {error ? (
         <div className="px-5 py-4">
           <p className="text-[13px] text-danger">加载失败：{apiErrorMessage(error, "加载失败")}</p>
@@ -236,9 +272,24 @@ export function HistoryTable({ reloadKey }: { reloadKey: number }) {
                 value={detail.expires_at ? <TimeAgo value={detail.expires_at} /> : "永不过期"}
               />
               <KeyValue
-                label="已读 / 收件人"
+                label="站内已读 / 收件人"
                 value={`${detail.read_count} / ${detail.recipients}`}
               />
+              <KeyValue label="分类" value={CATEGORY_LABEL[detail.category]} />
+              {detail.thread_key && (
+                <KeyValue
+                  label="线程"
+                  value={`${detail.thread_key}（共 ${detail.thread_count} 条）`}
+                />
+              )}
+              {detail.source_type && (
+                <KeyValue
+                  label="来源"
+                  value={[detail.source_type, detail.source_id, detail.source_phase]
+                    .filter(Boolean)
+                    .join(" / ")}
+                />
+              )}
               {detail.notify_email && (
                 <KeyValue label="邮件推送" value={<EmailChip m={detail} />} />
               )}

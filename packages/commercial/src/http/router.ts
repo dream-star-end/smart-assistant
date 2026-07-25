@@ -31,6 +31,7 @@ import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplaceAiReviews,
   handleAdminMarketplaceFeatured,
+  handleAdminMarketplaceFunnel,
   handleAdminMarketplacePending,
   handleAdminMarketplaceReview,
   handleAdminMarketplaceReviewBatch,
@@ -752,6 +753,11 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       method: 'POST',
       path: '/api/marketplace/publish',
       handler: (req, res) => handleMarketplacePublish(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/marketplace/funnel',
+      handler: (req, res) => handleAdminMarketplaceFunnel(req, res, deps),
     },
     {
       method: 'GET',

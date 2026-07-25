@@ -30,12 +30,23 @@ const STATUS_OPTIONS: { label: string; value: FeedbackStatus | "" }[] = [
   { label: "已确认", value: "acked" },
   { label: "已关闭", value: "closed" },
 ];
+const TRAFFIC_OPTIONS = [
+  { label: "真实用户", value: "production_user" },
+  { label: "全部流量", value: "all" },
+  { label: "内部管理员", value: "internal_admin" },
+  { label: "合成灰度", value: "synthetic_canary" },
+  { label: "E2E", value: "e2e" },
+];
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** 反馈队列：KPI + 状态构成环图 + 过滤 + 复合游标翻页表；行点开右侧详情抽屉可确认处理。 */
 export function FeedbackQueue() {
-  const [filters, setFilters] = useState<FeedbackFilters>({ status: "", userId: "" });
+  const [filters, setFilters] = useState<FeedbackFilters>({
+    status: "",
+    userId: "",
+    trafficClass: "production_user",
+  });
   const { rows, loading, loadingMore, error, done, loadMore, refresh, patchRow } =
     useFeedbackQueue(filters);
 
@@ -105,6 +116,16 @@ export function FeedbackQueue() {
         ),
     },
     {
+      key: "traffic_class",
+      title: "流量",
+      width: 92,
+      render: (r) => (
+        <Badge tone={r.traffic_class === "production_user" ? "success" : "neutral"}>
+          {r.traffic_class === "production_user" ? "真实用户" : r.traffic_class}
+        </Badge>
+      ),
+    },
+    {
       key: "description",
       title: "内容摘要",
       render: (r) => (
@@ -163,6 +184,12 @@ export function FeedbackQueue() {
               value={filters.userId}
               onChange={(userId) => setFilters((f) => ({ ...f, userId }))}
               placeholder="user_id 过滤"
+            />
+            <SelectFilter
+              label="流量"
+              value={filters.trafficClass}
+              options={TRAFFIC_OPTIONS}
+              onChange={(trafficClass) => setFilters((f) => ({ ...f, trafficClass }))}
             />
             <Button variant="ghost" size="sm" onClick={refresh} className="gap-1.5">
               <RefreshCw size={14} />

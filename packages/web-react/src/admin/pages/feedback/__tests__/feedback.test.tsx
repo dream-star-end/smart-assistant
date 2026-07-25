@@ -43,6 +43,7 @@ function fb(over: Partial<FeedbackRow> = {}): FeedbackRow {
     handled_by: null,
     handled_at: null,
     created_at: new Date().toISOString(),
+    traffic_class: "production_user",
     ...over,
   };
 }
@@ -145,10 +146,47 @@ describe("FeedbackPage · 响应评分", () => {
       // /response-ratings
       return Promise.resolve({
         stats: {
-          overall: { up: 8, down: 2, total: 10, up_rate: 0.8 },
-          last_7d: { up: 3, down: 1, total: 4, up_rate: 0.75 },
-          last_30d: { up: 8, down: 2, total: 10, up_rate: 0.8 },
-          by_model: [{ model: "glm-5.2", up: 5, down: 1, total: 6, up_rate: 0.8333 }],
+          overall: {
+            up: 8,
+            down: 2,
+            total: 10,
+            up_rate: 0.8,
+            ci95_low: 0.49,
+            ci95_high: 0.943,
+            sample_note: "small_sample",
+          },
+          last_7d: {
+            up: 3,
+            down: 1,
+            total: 4,
+            up_rate: 0.75,
+            ci95_low: 0.301,
+            ci95_high: 0.954,
+            sample_note: "small_sample",
+          },
+          last_30d: {
+            up: 8,
+            down: 2,
+            total: 10,
+            up_rate: 0.8,
+            ci95_low: 0.49,
+            ci95_high: 0.943,
+            sample_note: "small_sample",
+          },
+          by_model: [{
+            model: "glm-5.2",
+            up: 5,
+            down: 1,
+            total: 6,
+            up_rate: 0.8333,
+            ci95_low: 0.436,
+            ci95_high: 0.97,
+            sample_note: "small_sample",
+          }],
+          rating_users: 4,
+          completed_turns: { last_7d: 40, last_30d: 100 },
+          explicit_coverage: { last_7d: 0.1, last_30d: 0.1 },
+          implicit_per_100_completed_turns: { last_7d: 2.5, last_30d: 3 },
         },
         down_ratings: {
           source: "explicit",
@@ -162,6 +200,7 @@ describe("FeedbackPage · 响应评分", () => {
               session_id: null,
               created_at: new Date().toISOString(),
               username: "Bob",
+              traffic_class: "production_user",
             },
           ],
           next_before_created_at: null,
@@ -174,6 +213,8 @@ describe("FeedbackPage · 响应评分", () => {
     fireEvent.click(screen.getByRole("tab", { name: "响应评分" }));
 
     expect(await screen.findByText("总好评率")).toBeInTheDocument();
+    expect(screen.getByText("30 天显式覆盖率")).toBeInTheDocument();
+    expect(screen.getByText("3/百 turn")).toBeInTheDocument();
     expect(await screen.findByText("答非所问")).toBeInTheDocument();
     expect(adminGet).toHaveBeenCalledWith(
       "/response-ratings",
@@ -189,10 +230,38 @@ describe("FeedbackPage · 响应评分", () => {
       const source = query?.source === "implicit" ? "implicit" : "explicit";
       return Promise.resolve({
         stats: {
-          overall: { up: 1, down: 1, total: 2, up_rate: 0.5 },
-          last_7d: { up: 1, down: 1, total: 2, up_rate: 0.5 },
-          last_30d: { up: 1, down: 1, total: 2, up_rate: 0.5 },
+          overall: {
+            up: 1,
+            down: 1,
+            total: 2,
+            up_rate: 0.5,
+            ci95_low: 0.095,
+            ci95_high: 0.905,
+            sample_note: "small_sample",
+          },
+          last_7d: {
+            up: 1,
+            down: 1,
+            total: 2,
+            up_rate: 0.5,
+            ci95_low: 0.095,
+            ci95_high: 0.905,
+            sample_note: "small_sample",
+          },
+          last_30d: {
+            up: 1,
+            down: 1,
+            total: 2,
+            up_rate: 0.5,
+            ci95_low: 0.095,
+            ci95_high: 0.905,
+            sample_note: "small_sample",
+          },
           by_model: [],
+          rating_users: 1,
+          completed_turns: { last_7d: 2, last_30d: 2 },
+          explicit_coverage: { last_7d: 1, last_30d: 1 },
+          implicit_per_100_completed_turns: { last_7d: 0, last_30d: 0 },
         },
         down_ratings: {
           source,
@@ -206,6 +275,7 @@ describe("FeedbackPage · 响应评分", () => {
               session_id: null,
               created_at: new Date().toISOString(),
               username: "Bob",
+              traffic_class: "production_user",
             },
           ],
           next_before_created_at: null,

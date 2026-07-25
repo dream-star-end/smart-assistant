@@ -16,6 +16,7 @@
 
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
+import type { SignalTrafficClass } from "../analytics/signalTraffic.js";
 
 // ─── Row types ─────────────────────────────────────────────────────
 
@@ -35,6 +36,7 @@ export interface FeedbackRowView {
   created_at: Date;
   // 用户信息(JOIN users),便于 admin 一眼看到是谁;deleted/未注册返回 null
   username: string | null;
+  traffic_class: SignalTrafficClass;
 }
 
 const FEEDBACK_COLS = `
@@ -52,7 +54,8 @@ const FEEDBACK_COLS = `
   f.handled_at,
   f.created_at,
   -- users 表无 username 列;display_name 可空,用 email 兜底
-  COALESCE(u.display_name, u.email) AS username
+  COALESCE(u.display_name, u.email) AS username,
+  COALESCE(u.signal_traffic_class, 'production_user') AS traffic_class
 `;
 
 // ─── List ──────────────────────────────────────────────────────────
@@ -64,6 +67,7 @@ export interface ListFeedbackInput {
   before_created_at?: string; // ISO timestamp
   before_id?: string; // bigint as string
   limit?: number;
+  trafficClass?: SignalTrafficClass | null;
 }
 
 export interface ListFeedbackResult {
@@ -89,6 +93,11 @@ export async function listFeedback(input: ListFeedbackInput = {}): Promise<ListF
     params.push(input.user_id);
     where.push(`f.user_id = $${params.length}::bigint`);
   }
+  params.push(input.trafficClass ?? null);
+  const trafficIdx = params.length;
+  where.push(
+    `($${trafficIdx}::text IS NULL OR COALESCE(u.signal_traffic_class, 'production_user')=$${trafficIdx})`,
+  );
   if (input.before_created_at && input.before_id) {
     params.push(input.before_created_at);
     const a = `$${params.length}::timestamptz`;

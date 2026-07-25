@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
@@ -10,6 +10,7 @@ const adminMarketplacePending = vi.fn();
 const adminMarketplaceAiReviews = vi.fn();
 const searchMarketplace = vi.fn();
 const setMarketplaceFeatured = vi.fn();
+const adminGet = vi.fn();
 vi.mock("../../../../lib/api", () => ({
   api: {
     adminMarketplacePending: (...a: unknown[]) => adminMarketplacePending(...a),
@@ -18,6 +19,14 @@ vi.mock("../../../../lib/api", () => ({
     setMarketplaceFeatured: (...a: unknown[]) => setMarketplaceFeatured(...a),
   },
 }));
+vi.mock("../../../lib/adminApi", async () => {
+  const actual =
+    await vi.importActual<typeof import("../../../lib/adminApi")>("../../../lib/adminApi");
+  return {
+    ...actual,
+    adminGet: (...a: unknown[]) => adminGet(...a),
+  };
+});
 
 import MarketplacePage from "../index";
 
@@ -34,6 +43,21 @@ beforeEach(() => {
   adminMarketplaceAiReviews.mockReset().mockResolvedValue([]);
   searchMarketplace.mockReset().mockResolvedValue({ results: [] });
   setMarketplaceFeatured.mockReset().mockResolvedValue({ ok: true });
+  adminGet.mockReset().mockResolvedValue({
+    traffic_class: "production_user",
+    funnel: {
+      exposure_users: 12,
+      exposure_events: 20,
+      detail_users: 8,
+      detail_events: 10,
+      install_users: 5,
+      installs: 6,
+      first_use_users: 4,
+      used_pairs: 4,
+      repeat_pairs: 2,
+    },
+    uninstall_reasons: [{ reason: "missing_capability", count: 1 }],
+  });
 });
 afterEach(cleanup);
 
@@ -46,6 +70,19 @@ describe("MarketplacePage", () => {
     // ReviewPanel 内的 AI 审批记录折叠区 + 下架 kill-switch
     expect(screen.getByText("AI 审批记录")).toBeInTheDocument();
     expect(screen.getByText(/下架已上架条目/)).toBeInTheDocument();
+  });
+
+  test("使用漏斗默认只拉真实用户并展示阶段与卸载原因", async () => {
+    renderPage(<MarketplacePage />);
+    fireEvent.click(screen.getByRole("tab", { name: "使用漏斗" }));
+
+    expect(await screen.findByText("目录曝光用户")).toBeInTheDocument();
+    expect(await screen.findByText("缺少能力 · 1")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(adminGet).toHaveBeenCalledWith("/marketplace/funnel", {
+        traffic_class: "production_user",
+      }),
+    );
   });
 
   test("切到「精选管理」tab → 挂载 FeaturedPanel(空目录空态)", async () => {

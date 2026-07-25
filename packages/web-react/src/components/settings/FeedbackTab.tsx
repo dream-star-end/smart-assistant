@@ -88,13 +88,24 @@ function feedbackMeta() {
 }
 
 /** 设置中心反馈分区：只发送用户主动填写的正文与最小环境元数据，不附带任何对话内容。 */
-export function FeedbackTab({ auth, userId }: { auth: AuthSession; userId: string }) {
+export function FeedbackTab({
+  auth,
+  userId,
+  context,
+}: {
+  auth: AuthSession
+  userId: string
+  context?: { sessionId: string | null; requestId: string | null }
+}) {
   const [initialDraft] = useState(() => readDraft(userId))
   const [category, setCategory] = useState<FeedbackCategory>(initialDraft.category)
   const [description, setDescription] = useState(initialDraft.description)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<{ message: string; field: boolean } | null>(null)
   const [submittedId, setSubmittedId] = useState<string | null>(null)
+  const [includeContext, setIncludeContext] = useState(
+    Boolean(context?.sessionId || context?.requestId),
+  )
   const submittingRef = useRef(false)
   const loadedUserRef = useRef(userId)
   const skipNextPersistRef = useRef(false)
@@ -181,6 +192,8 @@ export function FeedbackTab({ auth, userId }: { auth: AuthSession; userId: strin
         category,
         description: trimmed,
         version: currentBuildId(),
+        ...(includeContext && context?.requestId ? { requestId: context.requestId } : {}),
+        ...(includeContext && context?.sessionId ? { sessionId: context.sessionId } : {}),
         meta: feedbackMeta(),
       })
       setSubmittedId(result.id)
@@ -323,6 +336,24 @@ export function FeedbackTab({ auth, userId }: { auth: AuthSession; userId: strin
             </span>
           </div>
 
+          {(context?.sessionId || context?.requestId) && (
+            <label className="mt-3 flex items-start gap-2 rounded-lg border border-border bg-elevated px-3 py-2.5 text-[12px] text-muted">
+              <input
+                type="checkbox"
+                checked={includeContext}
+                disabled={submitting}
+                onChange={(event) => setIncludeContext(event.target.checked)}
+                className="mt-0.5 size-4 accent-[var(--color-accent)]"
+              />
+              <span>
+                <span className="block font-medium text-fg">附带当前会话定位信息</span>
+                <span className="mt-0.5 block text-faint">
+                  仅附带会话 ID 和最近回复的请求 ID，不包含对话正文或工具记录。
+                </span>
+              </span>
+            </label>
+          )}
+
           {error && (
             <Alert
               id={error.field ? DESCRIPTION_ERROR_ID : undefined}
@@ -348,7 +379,7 @@ export function FeedbackTab({ auth, userId }: { auth: AuthSession; userId: strin
       <div className="mt-4 flex items-start gap-2 text-[11.5px] leading-relaxed text-faint">
         <ShieldCheck size={14} className="mt-0.5 shrink-0" />
         <p>
-          仅发送你填写的内容、反馈类型和基础环境信息，不会自动附带对话内容。反馈会由团队查看，但不承诺逐条回复。
+          仅发送你填写的内容、反馈类型和基础环境信息；即使附带定位信息，也不会发送对话内容。反馈会由团队查看，但不承诺逐条回复。
         </p>
       </div>
     </div>

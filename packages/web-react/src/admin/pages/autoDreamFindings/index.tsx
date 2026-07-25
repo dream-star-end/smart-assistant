@@ -17,6 +17,8 @@ type Finding = {
   status: 'new' | 'triaged' | 'planned' | 'resolved' | 'dismissed'
   occurrence_count: string
   affected_user_count: string
+  run_count: string
+  evidence_confidence: 'single_source' | 'corroborated'
   first_seen_at: string
   last_seen_at: string
   last_model: string
@@ -35,6 +37,9 @@ export default function AutoDreamFindingsPage() {
   const [rows, setRows] = useState<Finding[]>([])
   const [total, setTotal] = useState(0)
   const [status, setStatus] = useState('all')
+  const [traffic, setTraffic] = useState('production_user')
+  const [model, setModel] = useState('current')
+  const [resolvedModel, setResolvedModel] = useState<string | null>(null)
   const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(true)
   const [updating, setUpdating] = useState(false)
@@ -45,19 +50,25 @@ export default function AutoDreamFindingsPage() {
     setLoading(true)
     setError(null)
     try {
-      const result = await adminGet<{ rows: Finding[]; total: number }>('/auto-dream-findings', {
-        status,
-        limit: 100,
-        offset: page * 100,
-      })
+      const result = await adminGet<{ rows: Finding[]; total: number; model: string | null }>(
+        '/auto-dream-findings',
+        {
+          status,
+          traffic_class: traffic,
+          model,
+          limit: 100,
+          offset: page * 100,
+        },
+      )
       setRows(result.rows)
       setTotal(result.total)
+      setResolvedModel(result.model)
     } catch (err) {
       setError(apiErrorMessage(err, '无法加载平台优化发现'))
     } finally {
       setLoading(false)
     }
-  }, [page, status])
+  }, [model, page, status, traffic])
 
   useEffect(() => {
     void load()
@@ -86,6 +97,16 @@ export default function AutoDreamFindingsPage() {
             {row.capability_id} · {row.taxonomy}
           </div>
         </div>
+      ),
+    },
+    {
+      key: 'evidence_confidence',
+      title: '证据',
+      width: 96,
+      render: (row) => (
+        <Badge tone={row.evidence_confidence === 'corroborated' ? 'success' : 'neutral'}>
+          {row.evidence_confidence === 'corroborated' ? '多源印证' : '单一来源'}
+        </Badge>
       ),
     },
     {
@@ -138,6 +159,31 @@ export default function AutoDreamFindingsPage() {
         desc={`${meta.desc} · 共 ${total} 项`}
         actions={
           <div className="flex items-center gap-2">
+            <select
+              value={traffic}
+              onChange={(event) => {
+                setTraffic(event.target.value)
+                setPage(0)
+              }}
+              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg"
+            >
+              <option value="production_user">真实用户</option>
+              <option value="all">全部流量</option>
+              <option value="internal_admin">内部管理员</option>
+              <option value="synthetic_canary">合成灰度</option>
+              <option value="e2e">E2E</option>
+            </select>
+            <select
+              value={model}
+              onChange={(event) => {
+                setModel(event.target.value)
+                setPage(0)
+              }}
+              className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg"
+            >
+              <option value="current">当前模型{resolvedModel ? ` · ${resolvedModel}` : ''}</option>
+              <option value="all">全部模型（含历史）</option>
+            </select>
             <select
               value={status}
               onChange={(event) => {
@@ -196,7 +242,7 @@ export default function AutoDreamFindingsPage() {
           open
           onOpenChange={(open) => !open && setSelected(null)}
           title={selected.title}
-          description={`${selected.capability_id} · ${selected.affected_user_count} 位用户`}
+          description={`${selected.capability_id} · ${selected.affected_user_count} 位用户 · ${selected.run_count} 次运行`}
           className="max-w-2xl"
           footer={
             <>
@@ -235,6 +281,14 @@ export default function AutoDreamFindingsPage() {
             <Field title="问题" value={selected.problem} />
             <Field title="用户影响" value={selected.impact} />
             <Field title="建议" value={selected.recommendation} />
+            <Field
+              title="证据置信"
+              value={
+                selected.evidence_confidence === 'corroborated'
+                  ? '来自至少 2 位匿名用户、2 次独立运行；与严重级别分开判断。'
+                  : '当前仅有单一来源；保留信号但不据此放大结论。'
+              }
+            />
             <p className="text-xs text-faint">
               仅展示匿名闭集摘要，不含用户 ID、原始会话、日志正文、工具参数或凭证。
             </p>

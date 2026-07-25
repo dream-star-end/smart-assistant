@@ -41,8 +41,9 @@ import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import {
   type CreateMessagePayload,
   type EmailConfig,
-  type InboxAudience,
   INBOX_LEVEL_LABELS,
+  type InboxAudience,
+  type InboxCategory,
   type InboxLevel,
 } from './types'
 
@@ -59,6 +60,13 @@ const EDITOR_TABS = [
 const LEVEL_OPTIONS: { label: string; value: InboxLevel }[] = (
   Object.keys(INBOX_LEVEL_LABELS) as InboxLevel[]
 ).map((level) => ({ label: INBOX_LEVEL_LABELS[level], value: level }))
+const CATEGORY_OPTIONS: { label: string; value: InboxCategory }[] = [
+  { label: '用户沟通', value: 'user' },
+  { label: '自动化', value: 'automation' },
+  { label: '计费', value: 'billing' },
+  { label: '运维', value: 'operations' },
+  { label: '营销', value: 'marketing' },
+]
 
 const USER_ID_RE = /^[1-9]\d{0,19}$/
 const ACCEPTED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
@@ -95,7 +103,12 @@ function fileToBase64(file: File): Promise<string> {
 }
 
 function imageAlt(filename: string): string {
-  return filename.replace(/[\[\]\\\r\n]/g, ' ').replace(/\s+/g, ' ').trim() || '图片'
+  return (
+    filename
+      .replace(/[\[\]\\\r\n]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim() || '图片'
+  )
 }
 
 /** 站内信发送卡：富 Markdown 编辑、图片上传、图表模板与实时卡片预览。 */
@@ -111,6 +124,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
   const [title, setTitle] = useState('')
   const [body, setBody] = useState('')
   const [level, setLevel] = useState<InboxLevel>('info')
+  const [category, setCategory] = useState<InboxCategory>('user')
   const [expires, setExpires] = useState('')
   const [notifyEmail, setNotifyEmail] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -297,6 +311,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         title: trimmedTitle,
         body_md: body,
         level,
+        category,
       }
       if (audience === 'user') payload.user_id = userId.trim()
       if (expiresAt) payload.expires_at = expiresAt
@@ -523,6 +538,9 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
         )}
 
         <div className="flex flex-wrap gap-4">
+          <Field label="消息分类">
+            <SelectFilter value={category} options={CATEGORY_OPTIONS} onChange={setCategory} />
+          </Field>
           <Field label="级别">
             <SelectFilter value={level} options={LEVEL_OPTIONS} onChange={setLevel} />
           </Field>

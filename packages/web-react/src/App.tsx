@@ -924,6 +924,15 @@ export function App() {
 
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
+  const settingsFeedbackContext = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.role === "assistant" && message.traceId) {
+        return { sessionId: activeId ?? null, requestId: message.traceId };
+      }
+    }
+    return { sessionId: activeId ?? null, requestId: null };
+  }, [activeId, messages]);
 
   const tutorialActionContext = useMemo(
     () => ({
@@ -2361,6 +2370,7 @@ export function App() {
             onSetTheme={setTheme}
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
+            feedbackContext={settingsFeedbackContext}
             onOpenMemory={() => {
               setSettingsOpen(false);
               openManage("optimization");

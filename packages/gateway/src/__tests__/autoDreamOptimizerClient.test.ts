@@ -21,6 +21,20 @@ function response(statusCode: number, body: unknown) {
   }
 }
 
+function finding(capabilityId: string) {
+  return {
+    taxonomy: 'usability_friction',
+    capabilityId,
+    severity: 'medium' as const,
+    title: `易用性阻力 · ${capabilityId}`,
+    problem: '聚合信号显示现有使用路径存在重复阻力。',
+    impact: '可能增加完成任务的步骤。',
+    recommendation: `结合匿名聚合信号审查 ${capabilityId}，验证根因后规划最小充分改进。`,
+    signalCount: 1,
+    evidenceHash: 'b'.repeat(64),
+  }
+}
+
 describe('AutoDreamOptimizerClient platform finding outbox', () => {
   it('whitelists admission fields when passed a runtime-shaped object with a large prompt', async () => {
     let admissionBody = ''
@@ -128,6 +142,132 @@ describe('AutoDreamOptimizerClient platform finding outbox', () => {
       await readFile(paths.agentAutoDreamOptimizerFindings('main'), 'utf8'),
     ) as { pending: unknown[] }
     assert.deepEqual(drained.pending, [])
+  })
+
+  it('persists independent raw/theme cursors and never replays acknowledged raw batches', async () => {
+    const calls: Array<Record<string, unknown>> = []
+    let rejectFirstTheme = true
+    const fetcher = (async (url: string, options: { body: string }) => {
+      const path = new URL(url).pathname
+      const body = JSON.parse(options.body) as Record<string, unknown>
+      if (path.endsWith('/findings')) {
+        calls.push(body)
+        if ((body.findings as unknown[]).length > 0 && rejectFirstTheme) {
+          rejectFirstTheme = false
+          throw new Error('theme outage after raw acknowledgement')
+        }
+      }
+      if (path.endsWith('/admit')) {
+        return response(200, {
+          requestId: '7'.repeat(32),
+          engineSessionId: 'engine-session',
+          routeFrame: { baseUrl: 'https://relay.invalid' },
+        })
+      }
+      return response(200, { accepted: 1 })
+    }) as any
+    const client = new AutoDreamOptimizerClient(
+      {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'https://master.invalid',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: 'container-token',
+      },
+      fetcher,
+    )
+    const agentId = 'raw-theme-cursors'
+    const rawFindings = Array.from({ length: 129 }, (_, index) => finding(`manage.raw.${index}`))
+    const findings = Array.from({ length: 129 }, (_, index) => finding(`manage.theme.${index}`))
+    await client.reportFindings({
+      runId: '00000000-0000-4000-8000-000000000011',
+      agentId,
+      findings,
+      rawFindings,
+    })
+    const queued = JSON.parse(
+      await readFile(paths.agentAutoDreamOptimizerFindings(agentId), 'utf8'),
+    ) as {
+      schemaVersion: number
+      pending: Array<{ nextOffset: number; rawNextOffset: number }>
+    }
+    assert.equal(queued.schemaVersion, 2)
+    assert.equal(queued.pending[0]?.nextOffset, 0)
+    assert.equal(queued.pending[0]?.rawNextOffset, 129)
+
+    await client.admit({
+      runId: '00000000-0000-4000-8000-000000000012',
+      callId: '00000000-0000-4000-8000-000000000012:0',
+      agentId,
+      model: 'gpt-5.6-terra',
+    })
+    const rawCalls = calls.filter((body) => (body.rawFindings as unknown[]).length > 0)
+    const themeCalls = calls.filter((body) => (body.findings as unknown[]).length > 0)
+    assert.deepEqual(
+      rawCalls.map((body) => (body.rawFindings as unknown[]).length),
+      [128, 1],
+    )
+    assert.deepEqual(
+      themeCalls.map((body) => (body.findings as unknown[]).length),
+      [128, 128, 1],
+    )
+    const drained = JSON.parse(
+      await readFile(paths.agentAutoDreamOptimizerFindings(agentId), 'utf8'),
+    ) as { schemaVersion: number; pending: unknown[] }
+    assert.equal(drained.schemaVersion, 2)
+    assert.deepEqual(drained.pending, [])
+  })
+
+  it('migrates a durable v1 theme-only queue before retrying it', async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const fetcher = (async (url: string, options: { body: string }) => {
+      const path = new URL(url).pathname
+      const body = JSON.parse(options.body) as Record<string, unknown>
+      if (path.endsWith('/findings')) calls.push(body)
+      if (path.endsWith('/admit')) {
+        return response(200, {
+          requestId: '8'.repeat(32),
+          engineSessionId: 'engine-session',
+          routeFrame: { baseUrl: 'https://relay.invalid' },
+        })
+      }
+      return response(200, { accepted: 1 })
+    }) as any
+    const agentId = 'legacy-finding-queue'
+    const path = paths.agentAutoDreamOptimizerFindings(agentId)
+    await mkdir(join(path, '..'), { recursive: true })
+    await writeFile(
+      path,
+      JSON.stringify({
+        schemaVersion: 1,
+        pending: [
+          {
+            runId: '00000000-0000-4000-8000-000000000013',
+            agentId,
+            findings: [finding('manage.legacy')],
+            nextOffset: 0,
+          },
+        ],
+      }),
+    )
+    const client = new AutoDreamOptimizerClient(
+      {
+        OPENCLAUDE_V3_MASTER_BASE_URL: 'https://master.invalid',
+        OPENCLAUDE_V3_CONTAINER_TOKEN: 'container-token',
+      },
+      fetcher,
+    )
+    await client.admit({
+      runId: '00000000-0000-4000-8000-000000000014',
+      callId: '00000000-0000-4000-8000-000000000014:0',
+      agentId,
+      model: 'gpt-5.6-terra',
+    })
+    assert.equal(calls.length, 1)
+    assert.equal((calls[0]?.findings as unknown[]).length, 1)
+    assert.deepEqual(calls[0]?.rawFindings, [])
+    const migrated = JSON.parse(await readFile(path, 'utf8')) as {
+      schemaVersion: number
+      pending: unknown[]
+    }
+    assert.deepEqual(migrated, { schemaVersion: 2, pending: [] })
   })
 
   it('settles directly with master when the local billing journal cannot be staged', async () => {

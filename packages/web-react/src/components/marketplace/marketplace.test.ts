@@ -106,6 +106,15 @@ test("uninstallMarketplace DELETEs the installed slug", async () => {
   const init = fetchMock.mock.calls[0][1] as RequestInit;
   expect(String(url)).toBe("/api/marketplace/installed/my-skill");
   expect(init.method).toBe("DELETE");
+  expect(JSON.parse(String(init.body))).toEqual({ reason: "prefer_not_say" });
+});
+
+test("uninstallMarketplace sends the optional reason", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ok({ ok: true }));
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+  await api.uninstallMarketplace(session(), "my-skill", "missing_capability");
+  const init = fetchMock.mock.calls[0][1] as RequestInit;
+  expect(JSON.parse(String(init.body))).toEqual({ reason: "missing_capability" });
 });
 
 test("publishMarketplace surfaces a 422 scan block as ApiError with riskFlags on .body", async () => {

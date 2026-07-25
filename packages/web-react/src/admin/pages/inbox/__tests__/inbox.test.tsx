@@ -39,6 +39,12 @@ function msg(over: Partial<InboxMessage> = {}): InboxMessage {
     email_send_status: null,
     email_sent_at: null,
     email_summary: null,
+    category: "user",
+    thread_key: null,
+    thread_count: 1,
+    source_type: null,
+    source_id: null,
+    source_phase: null,
     ...over,
   };
 }
@@ -79,6 +85,7 @@ describe("InboxPage", () => {
     expect(await screen.findByText("系统维护通知")).toBeInTheDocument();
     // 邮件 worker=stub 提示
     expect(await screen.findByText(/stub mailer/)).toBeInTheDocument();
+    expect(screen.getByText("站内已读")).toBeInTheDocument();
   });
 
   test("发送 → 确认弹窗 → 命中 POST /messages", async () => {
@@ -106,7 +113,26 @@ describe("InboxPage", () => {
           title: "上线公告",
           body_md: "正文内容",
           level: "info",
+          category: "user",
         }),
+      ),
+    );
+  });
+
+  test("历史分类筛选会重置分页并传 category", async () => {
+    stubApi();
+    renderPage(<InboxPage />);
+    await screen.findByText("系统维护通知");
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: /分类.*全部分类/ }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "自动化" }));
+    await waitFor(() =>
+      expect(adminGet).toHaveBeenCalledWith(
+        "/messages",
+        expect.objectContaining({ offset: 0, category: "automation" }),
       ),
     );
   });

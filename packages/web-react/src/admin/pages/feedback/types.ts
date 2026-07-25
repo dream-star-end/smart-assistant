@@ -18,6 +18,7 @@ export interface FeedbackRow {
   handled_by: string | null;
   handled_at: string | null;
   created_at: string;
+  traffic_class: "production_user" | "internal_admin" | "synthetic_canary" | "e2e";
 }
 
 export interface FeedbackListResp {
@@ -33,6 +34,9 @@ export interface RatingBucket {
   total: number;
   /** up / total（0..1）；total=0 时为 null。 */
   up_rate: number | null;
+  ci95_low: number | null;
+  ci95_high: number | null;
+  sample_note: "no_sample" | "small_sample" | "observed";
 }
 
 export interface ModelRatingStat extends RatingBucket {
@@ -44,6 +48,10 @@ export interface ResponseRatingStats {
   last_7d: RatingBucket;
   last_30d: RatingBucket;
   by_model: ModelRatingStat[];
+  rating_users: number;
+  completed_turns: { last_7d: number; last_30d: number };
+  explicit_coverage: { last_7d: number | null; last_30d: number | null };
+  implicit_per_100_completed_turns: { last_7d: number | null; last_30d: number | null };
 }
 
 export interface DownRatingRow {
@@ -55,12 +63,14 @@ export interface DownRatingRow {
   session_id: string | null;
   created_at: string;
   username: string | null;
+  traffic_class: "production_user" | "internal_admin" | "synthetic_canary" | "e2e";
 }
 
 export interface ResponseRatingsResp {
   stats: ResponseRatingStats;
   down_ratings: {
     source: "explicit" | "implicit" | "all";
+    traffic_class: string;
     rows: DownRatingRow[];
     next_before_created_at: string | null;
     next_before_id: string | null;

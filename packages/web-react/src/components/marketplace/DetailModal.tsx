@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, apiErrorMessage } from '../../lib/api'
+import { reportClientFriction } from '../../lib/clientFriction'
 import { formatInstallCount, marketTrySkillPrefill } from '../../lib/marketplace'
 import type {
   AuthSession,
@@ -275,6 +276,15 @@ export function DetailModal({
     ])
       .then(([d, a]) => {
         if (!alive) return
+        reportClientFriction(
+          {
+            surface: 'marketplace',
+            stage: 'detail_view',
+            code: 'DETAIL_VIEW',
+            outcome: 'succeeded',
+          },
+          auth.snapshot().token,
+        )
         setDetail(d)
         setAgents(
           a.length

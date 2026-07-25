@@ -353,9 +353,10 @@ export async function applyTurnWaiver(
         : `由于${reasonCopy}，本轮已自动免单。本轮没有实际扣除积分，你可以回到原会话重新尝试。`
     const inbox = await client.query<{ id: string }>(
       `INSERT INTO inbox_messages
-         (audience,user_id,title,body_md,level,created_by,notify_email,
+         (audience,user_id,title,body_md,level,category,thread_key,created_by,notify_email,
           source_type,source_id,source_phase)
-       SELECT 'user',$1,'本轮已自动免单',$2,'notice',a.id,FALSE,
+       SELECT 'user',$1,'本轮已自动免单',$2,'notice','billing',
+              'billing:user:' || $1::text,a.id,FALSE,
               'turn_waive',$3::bigint,'receipt'
          FROM (
            SELECT id FROM users

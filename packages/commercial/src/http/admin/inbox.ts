@@ -42,6 +42,12 @@ function serializeAdminInboxMessage(
     created_by: m.created_by,
     created_at: m.created_at,
     expires_at: m.expires_at,
+    ...("category" in m ? { category: m.category } : {}),
+    ...("thread_key" in m ? { thread_key: m.thread_key } : {}),
+    ...("thread_count" in m ? { thread_count: m.thread_count } : {}),
+    ...("source_type" in m ? { source_type: m.source_type } : {}),
+    ...("source_id" in m ? { source_id: m.source_id } : {}),
+    ...("source_phase" in m ? { source_phase: m.source_phase } : {}),
   };
 }
 
@@ -160,8 +166,17 @@ export async function handleAdminListInbox(
   const sp = url.searchParams;
   const limit = parsePositiveInt(sp.get("limit"), "limit", 100);
   const offset = parseNonNegativeInt(sp.get("offset"), "offset");
+  const categoryRaw = sp.get("category");
+  const categories = ["user", "automation", "billing", "operations", "marketing"] as const;
+  if (categoryRaw && !(categories as readonly string[]).includes(categoryRaw)) {
+    throw new HttpError(400, "VALIDATION", "invalid category");
+  }
   const { adminListInbox } = await import("../../inbox/inbox.js");
-  const r = await adminListInbox({ limit, offset });
+  const r = await adminListInbox({
+    limit,
+    offset,
+    category: (categoryRaw || null) as import("../../inbox/inbox.js").InboxCategory | null,
+  });
   sendJson(res, 200, {
     messages: r.messages.map((m) => ({
       ...serializeAdminInboxMessage(m),

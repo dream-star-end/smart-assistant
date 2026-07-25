@@ -2010,7 +2010,7 @@ export async function handleSubmitFeedback(
   }
 
   const category = strField(body.category, 32) ?? "general";
-  const requestId = strField(body.request_id, 128);
+  let requestId = strField(body.request_id, 128);
   const version = strField(body.version, 32);
   const sessionId = strField(body.session_id, 64);
   const userAgent =
@@ -2030,6 +2030,24 @@ export async function handleSubmitFeedback(
       });
     }
     meta = body.meta as Record<string, unknown>;
+  }
+
+  if (!userId) {
+    requestId = null;
+  } else if (requestId) {
+    const owned = await query<{ trace_id: string }>(
+      `SELECT trace_id
+         FROM turn_traces
+        WHERE trace_id=$1
+          AND user_id=$2::bigint
+          AND (
+            $3::text IS NULL
+            OR session_key LIKE '%:webchat:dm:' || regexp_replace($3, '[^a-zA-Z0-9_-]', '_', 'g')
+          )
+        LIMIT 1`,
+      [requestId, userId, sessionId],
+    );
+    requestId = owned.rows[0]?.trace_id ?? null;
   }
 
   const r = await insertFeedback({

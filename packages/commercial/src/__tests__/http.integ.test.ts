@@ -375,6 +375,7 @@ describe("commercial HTTP router (integ)", () => {
     const anonymous = await postJson("/api/feedback", {
       category: "bug",
       description: "好",
+      request_id: "anonymous-untrusted-trace",
       meta: { source: "settings" },
     });
     assert.equal(anonymous.status, 200, JSON.stringify(anonymous.json));
@@ -391,20 +392,34 @@ describe("commercial HTTP router (integ)", () => {
        VALUES ('feedback-user@example.com', 'x', true) RETURNING id::text AS id`,
     );
     const userId = insertedUser.rows[0].id;
+    await query(
+      `INSERT INTO turn_traces(trace_id,user_id,session_key,agent_id,model)
+       VALUES ('trace-feedback-1',$1::bigint,$2,'main','test-model')`,
+      [userId, `c:${userId}:main:webchat:dm:feedback-session`],
+    );
     const access = (await signAccess({ sub: userId, role: "user" }, JWT_SECRET)).token;
     const linked = await postJson(
       "/api/feedback",
-      { category: "response", description: "短", request_id: "trace-feedback-1" },
+      {
+        category: "response",
+        description: "短",
+        request_id: "trace-feedback-1",
+        session_id: "feedback-session",
+      },
       { Authorization: `Bearer ${access}` },
     );
     assert.equal(linked.status, 200, JSON.stringify(linked.json));
 
-    const rows = await query<{ user_id: string | null; description: string }>(
-      "SELECT user_id::text AS user_id, description FROM feedback ORDER BY id",
+    const rows = await query<{
+      user_id: string | null;
+      description: string;
+      request_id: string | null;
+    }>(
+      "SELECT user_id::text AS user_id,description,request_id FROM feedback ORDER BY id",
     );
     assert.deepEqual(rows.rows, [
-      { user_id: null, description: "好" },
-      { user_id: userId, description: "短" },
+      { user_id: null, description: "好", request_id: null },
+      { user_id: userId, description: "短", request_id: "trace-feedback-1" },
     ]);
   });
 
@@ -414,7 +429,13 @@ describe("commercial HTTP router (integ)", () => {
       `INSERT INTO users(email, password_hash, email_verified, role)
        VALUES ('ratings-admin@example.com', 'x', true, 'admin') RETURNING id::text AS id`,
     );
-    const userId = insertedAdmin.rows[0].id;
+    const adminId = insertedAdmin.rows[0].id;
+    const insertedUser = await query<{ id: string }>(
+      `INSERT INTO users(email,password_hash,email_verified)
+       VALUES ('ratings-user@example.com','x',true)
+       RETURNING id::text AS id`,
+    );
+    const userId = insertedUser.rows[0].id;
     await query(
       `INSERT INTO response_rating
          (user_id, session_id, message_id, trace_id, model, rating, tags, comment)
@@ -423,7 +444,13 @@ describe("commercial HTTP router (integ)", () => {
          ($1::bigint, 's1', 'implicit-message', 'trace-implicit', 'model-a', 'down', ARRAY['implicit','中途打断'], '隐式信号')`,
       [userId],
     );
-    const adminToken = (await signAccess({ sub: userId, role: "admin" }, JWT_SECRET)).token;
+    await query(
+      `INSERT INTO response_rating
+         (user_id,session_id,message_id,model,rating,tags,comment)
+       VALUES ($1::bigint,'s1','admin-noise','model-a','down',ARRAY['不准确'],'管理员噪音')`,
+      [adminId],
+    );
+    const adminToken = (await signAccess({ sub: adminId, role: "admin" }, JWT_SECRET)).token;
     const headers = { Authorization: `Bearer ${adminToken}` };
 
     const explicit = await getJson("/api/admin/response-ratings", headers);

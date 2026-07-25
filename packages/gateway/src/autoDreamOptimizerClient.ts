@@ -25,11 +25,13 @@ interface FindingQueueEntry {
   runId: string
   agentId: string
   findings: AutoDreamPlatformFinding[]
+  rawFindings: AutoDreamPlatformFinding[]
   nextOffset: number
+  rawNextOffset: number
 }
 
 interface FindingQueue {
-  schemaVersion: 1
+  schemaVersion: 2
   pending: FindingQueueEntry[]
 }
 
@@ -148,14 +150,23 @@ export class AutoDreamOptimizerClient {
     runId: string
     agentId: string
     findings: AutoDreamPlatformFinding[]
+    rawFindings?: AutoDreamPlatformFinding[]
   }): Promise<void> {
     await this.withAgentSerial(this.findingSerial, input.agentId, async () => {
       const queue = await readFindingQueue(input.agentId)
       const existing = queue.pending.find((row) => row.runId === input.runId)
       if (existing) {
         existing.findings = input.findings
+        existing.rawFindings = input.rawFindings ?? []
       } else {
-        queue.pending.push({ ...input, nextOffset: 0 })
+        queue.pending.push({
+          runId: input.runId,
+          agentId: input.agentId,
+          findings: input.findings,
+          rawFindings: input.rawFindings ?? [],
+          nextOffset: 0,
+          rawNextOffset: 0,
+        })
       }
       await writeFindingQueue(input.agentId, queue)
       try {
@@ -288,12 +299,24 @@ export class AutoDreamOptimizerClient {
     const queue = await readFindingQueue(agentId)
     while (queue.pending.length > 0) {
       const entry = queue.pending[0]!
+      while (entry.rawNextOffset < entry.rawFindings.length) {
+        const batch = entry.rawFindings.slice(entry.rawNextOffset, entry.rawNextOffset + 128)
+        await this.post(FINDINGS_PATH, {
+          runId: entry.runId,
+          agentId: entry.agentId,
+          findings: [],
+          rawFindings: batch,
+        })
+        entry.rawNextOffset += batch.length
+        await writeFindingQueue(agentId, queue)
+      }
       while (entry.nextOffset < entry.findings.length) {
         const batch = entry.findings.slice(entry.nextOffset, entry.nextOffset + 128)
         await this.post(FINDINGS_PATH, {
           runId: entry.runId,
           agentId: entry.agentId,
           findings: batch,
+          rawFindings: [],
         })
         entry.nextOffset += batch.length
         await writeFindingQueue(agentId, queue)
@@ -394,13 +417,62 @@ async function readFindingQueue(agentId: string): Promise<FindingQueue> {
   try {
     const raw = JSON.parse(
       await readFile(paths.agentAutoDreamOptimizerFindings(agentId), 'utf8'),
-    ) as Partial<FindingQueue> | undefined
-    if (raw?.schemaVersion !== 1 || !Array.isArray(raw.pending)) {
+    ) as
+      | Partial<FindingQueue>
+      | {
+          schemaVersion?: 1
+          pending?: Array<{
+            runId?: unknown
+            agentId?: unknown
+            findings?: unknown
+            nextOffset?: unknown
+          }>
+        }
+      | undefined
+    if (!raw || !Array.isArray(raw.pending)) {
       throw new Error('AUTO_DREAM_FINDING_QUEUE_INVALID')
     }
-    return { schemaVersion: 1, pending: raw.pending }
+    if (raw.schemaVersion === 2) {
+      const pending = raw.pending as FindingQueueEntry[]
+      if (
+        pending.some(
+          (entry) =>
+            !Array.isArray(entry.findings) ||
+            !Array.isArray(entry.rawFindings) ||
+            !Number.isInteger(entry.nextOffset) ||
+            !Number.isInteger(entry.rawNextOffset),
+        )
+      ) {
+        throw new Error('AUTO_DREAM_FINDING_QUEUE_INVALID')
+      }
+      return { schemaVersion: 2, pending }
+    }
+    if (raw.schemaVersion === 1) {
+      const legacy = raw.pending as Array<{
+        runId: string
+        agentId: string
+        findings: AutoDreamPlatformFinding[]
+        nextOffset: number
+      }>
+      if (
+        legacy.some(
+          (entry) => !Array.isArray(entry.findings) || !Number.isInteger(entry.nextOffset),
+        )
+      ) {
+        throw new Error('AUTO_DREAM_FINDING_QUEUE_INVALID')
+      }
+      return {
+        schemaVersion: 2,
+        pending: legacy.map((entry) => ({
+          ...entry,
+          rawFindings: [],
+          rawNextOffset: 0,
+        })),
+      }
+    }
+    throw new Error('AUTO_DREAM_FINDING_QUEUE_INVALID')
   } catch (err) {
-    if (isNotFound(err)) return { schemaVersion: 1, pending: [] }
+    if (isNotFound(err)) return { schemaVersion: 2, pending: [] }
     throw err
   }
 }
