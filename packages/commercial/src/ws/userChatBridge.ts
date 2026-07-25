@@ -2892,6 +2892,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             peer: { id: peerId, kind: "dm" },
             clientMessageId,
           }));
+          // Re-announce after the ACK has released the old client's local
+          // dispatch slot. A stale bundle trapped in this rejected-recovery
+          // loop can then hit the existing update governor's safe point and
+          // reload instead of remaining permanently "busy".
+          const feBuild = deps.getFrontendBuildId?.();
+          if (feBuild) {
+            userWs.send(JSON.stringify({ type: "sys.frontend_build", build: feBuild }));
+          }
         } catch { /* the skipped optimistic row is also removable after REST sync */ }
       };
       let validatedRecovery: AdmitUserTurnInput["recovery"];

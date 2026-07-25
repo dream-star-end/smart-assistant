@@ -2997,7 +2997,10 @@ describe("ChatSocket interrupted continuation", () => {
     );
     await Promise.resolve();
 
-    expect(session.messages.slice(0, oldRows.length)).toEqual(oldRows);
+    expect(session.messages.slice(0, oldRows.length)).toEqual([
+      { ...oldRows[0], _automaticRecoveryAttempted: true },
+      ...oldRows.slice(1),
+    ]);
     const recovery = session.messages.at(-1)!;
     expect(recovery).toMatchObject({
       text: "↻ 自动从断点继续",
@@ -3029,8 +3032,32 @@ describe("ChatSocket interrupted continuation", () => {
         clientMessageId: recovery.id,
       }),
     });
-    expect(session.messages).toEqual(oldRows);
+    expect(session.messages).toEqual([
+      { ...oldRows[0], _automaticRecoveryAttempted: true },
+      ...oldRows.slice(1),
+    ]);
     expect(session._sendingInFlight).toBe(false);
+    const sentRecoveries = () => ws.sent
+      .map((raw) => JSON.parse(raw) as Record<string, any>)
+      .filter((payload) => payload.type === "inbound.message").length;
+    expect(sentRecoveries()).toBe(1);
+
+    sock.applyServerMessages(
+      "s-auto-checkpoint",
+      "main",
+      structuredClone(oldRows),
+      true,
+      undefined,
+      { serverUpdatedAt: 10 },
+    );
+    expect(session.messages[0]._automaticRecoveryAttempted).toBe(true);
+    await (sock as any).autoRecoverTerminalTurn(
+      "s-auto-checkpoint",
+      "u-auto-checkpoint",
+    );
+    await Promise.resolve();
+    expect(sentRecoveries()).toBe(1);
+    expect(sock.toStored("s-auto-checkpoint")?.messages[0]._automaticRecoveryAttempted).toBe(true);
     sock.stop();
   });
 

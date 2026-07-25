@@ -216,6 +216,7 @@ async function startRig(opts: {
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   hasCompletedClientTurn?: UserChatBridgeDeps["hasCompletedClientTurn"];
+  getFrontendBuildId?: UserChatBridgeDeps["getFrontendBuildId"];
   loadGoalState?: (uid: bigint, sessionId: string) => Promise<unknown>;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
@@ -444,6 +445,9 @@ async function startRig(opts: {
     ...(opts.hasCompletedClientTurn
       ? { hasCompletedClientTurn: opts.hasCompletedClientTurn }
       : {}),
+    ...(opts.getFrontendBuildId
+      ? { getFrontendBuildId: opts.getFrontendBuildId }
+      : {}),
     ...(opts.loadGoalState
       ? { loadGoalState: opts.loadGoalState as UserChatBridgeDeps["loadGoalState"] }
       : {}),
@@ -501,7 +505,10 @@ async function openClient(port: number, role: "user" | "admin" = "user"): Promis
 }
 
 /** 持久收帧器(避免背靠背双帧丢帧竞态;见 userChatBridge.test.ts 同款注释)。 */
-function frameCollector(ws: WebSocket): { next: () => Promise<Record<string, unknown>> } {
+function frameCollector(
+  ws: WebSocket,
+  includeSystem = false,
+): { next: () => Promise<Record<string, unknown>> } {
   const queue: Record<string, unknown>[] = [];
   const waiters: Array<(f: Record<string, unknown>) => void> = [];
   ws.on("message", (data) => {
@@ -509,7 +516,7 @@ function frameCollector(ws: WebSocket): { next: () => Promise<Record<string, unk
     let obj: Record<string, unknown>;
     try { obj = JSON.parse(s) as Record<string, unknown>; } catch { return; }
     // sys.* 是 bridge 的带外信号(cold_start / relay_ready / frontend_build),不是业务帧。
-    if (typeof obj.type === "string" && obj.type.startsWith("sys.")) return;
+    if (!includeSystem && typeof obj.type === "string" && obj.type.startsWith("sys.")) return;
     const w = waiters.shift();
     if (w) w(obj);
     else queue.push(obj);
@@ -1251,9 +1258,14 @@ describe("bridge automatic recovery lineage", () => {
     const sourceClientMessageId = "cm-source-conflict";
     const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
     let admitCalls = 0;
+    let buildProbeCalls = 0;
     const rig = await startRig({
       attest: "yes",
       durableDispatch: true,
+      // First call is the accept-time handshake; returning null there lets
+      // this assertion isolate the post-rejection re-announcement.
+      getFrontendBuildId: () =>
+        ++buildProbeCalls === 1 ? null : "a1b2c3d4e5f60718",
       hasCompletedClientTurn: async () => false,
       admitUserTurn: async () => {
         admitCalls++;
@@ -1262,7 +1274,7 @@ describe("bridge automatic recovery lineage", () => {
     });
     try {
       const ws = await openClient(rig.port);
-      const frames = frameCollector(ws);
+      const frames = frameCollector(ws, true);
       ws.send(inboundFrame({
         clientMessageId: identity.clientMessageId,
         idempotencyKey: identity.idempotencyKey,
@@ -1276,11 +1288,16 @@ describe("bridge automatic recovery lineage", () => {
           },
         },
       }));
-      const ack = await frames.next();
+      let ack = await frames.next();
+      while (ack.type !== "outbound.ack") ack = await frames.next();
       assert.equal(admitCalls, 1);
       assert.equal(ack.type, "outbound.ack");
       assert.equal(ack.recoverySkipped, true);
       assert.equal(ack.clientMessageId, identity.clientMessageId);
+      let build = await frames.next();
+      while (build.type !== "sys.frontend_build") build = await frames.next();
+      assert.equal(build.type, "sys.frontend_build");
+      assert.equal(build.build, "a1b2c3d4e5f60718");
       await new Promise((resolve) => setTimeout(resolve, 40));
       assert.equal(rig.containerSeen.some((raw) => {
         try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }
