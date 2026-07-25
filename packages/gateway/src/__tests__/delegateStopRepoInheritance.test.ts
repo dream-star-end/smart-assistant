@@ -144,6 +144,24 @@ test('stop interrupts active delegate children for the stopped parent session', 
   )
 })
 
+test('exact browser Stop finds the old assistant turn and cascades through its team tree', () => {
+  assert.match(
+    SESSION_MANAGER_TS,
+    /interruptClientTurn\([\s\S]*_runningClientMessageId\s*!==\s*clientMessageId[\s\S]*return this\.interrupt\(sessionKey\)/,
+    'SessionManager must reject stale turn ids and interrupt only the exact browser turn owner',
+  )
+  assert.match(
+    handleStop,
+    /if \(clientMessageId\)[\s\S]*live\.sessionKey\.endsWith\(suffix\)[\s\S]*interruptClientTurn\([\s\S]*live\.sessionKey[\s\S]*clientMessageId[\s\S]*\)/,
+    'Stop must scan the peer across assistants by exact clientMessageId',
+  )
+  assert.match(
+    handleStop,
+    /if \(clientMessageId\)[\s\S]*_interruptDelegationsForParent\(live\.sessionKey\)/,
+    'an exact leader Stop must cascade to active delegates and hidden reviewer descendants',
+  )
+})
+
 test('delegate handler wires the unified additive toolset resolver (no fatal intersection)', () => {
   // The resolver logic itself lives in toolsetIntent.ts and is exercised
   // behaviorally by resolveDelegateToolsets.test.ts; here we only guard the

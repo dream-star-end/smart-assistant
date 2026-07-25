@@ -13,6 +13,7 @@ import { describe, it } from 'node:test'
 import { Value } from '@sinclair/typebox/value'
 
 import {
+  InboundControlStop,
   InboundMessage,
   OutboundCodexBilling,
   OutboundError,
@@ -97,6 +98,24 @@ describe('client message id contracts', () => {
     assert.equal(isPersistedClientMessageId('cm:user:large'), true)
     assert.equal(isPersistedClientMessageId('a'.repeat(129)), false)
     assert.equal(isPersistedClientMessageId(`${'a'.repeat(80)}:x`), false)
+  })
+
+  it('binds Stop to an optional exact clientMessageId without breaking legacy frames', () => {
+    const legacy = {
+      type: 'inbound.control.stop',
+      channel: 'webchat',
+      peer,
+      agentId: 'main',
+    }
+    assert.equal(Value.Check(InboundControlStop, legacy), true)
+    assert.equal(Value.Check(InboundControlStop, {
+      ...legacy,
+      clientMessageId: 'm-stop-exact-1',
+    }), true)
+    assert.equal(Value.Check(InboundControlStop, {
+      ...legacy,
+      clientMessageId: 'bad:colon',
+    }), false)
   })
 })
 
