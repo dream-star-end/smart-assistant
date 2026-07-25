@@ -2090,6 +2090,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let bufferedCU = 0; // container → user 待发字节
     let cause: BridgeCloseCause = "internal_error";
     let cleaned = false;
+    const skippedRecoveryIds = new Set<string>();
     // Bridge TTFT:首个 user→container 帧 ↔ 首个 container→user 帧。
     // - firstUserFrameAtMs 由 onUserMessage / earlyMessages replay 第一次进入时设置
     // - firstContainerFrameAtMs 仅作 dedupe(确保只 observe 一次)
@@ -2885,6 +2886,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ? frameObj.idempotencyKey
           : undefined;
         try {
+          if (skippedRecoveryIds.has(clientMessageId)) {
+            userWs.send(JSON.stringify({
+              type: "outbound.message",
+              sessionKey: `recovery:${peerId}`,
+              channel: "webchat",
+              peer: { id: peerId, kind: "dm" },
+              clientMessageId,
+              blocks: [{
+                kind: "text",
+                text: "已停止重复恢复。你可以直接继续发送消息。",
+              }],
+              isFinal: true,
+            }));
+            turnLog?.info("user-chat-bridge: stopped legacy rejected-recovery retry loop", {
+              sessionId: peerId,
+              clientMessageId,
+            });
+            return;
+          }
+          skippedRecoveryIds.add(clientMessageId);
           userWs.send(JSON.stringify({
             type: "outbound.ack",
             recoverySkipped: true,

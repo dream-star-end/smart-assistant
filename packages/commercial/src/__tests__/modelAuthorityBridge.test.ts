@@ -1298,6 +1298,29 @@ describe("bridge automatic recovery lineage", () => {
       while (build.type !== "sys.frontend_build") build = await frames.next();
       assert.equal(build.type, "sys.frontend_build");
       assert.equal(build.build, "a1b2c3d4e5f60718");
+      ws.send(inboundFrame({
+        clientMessageId: identity.clientMessageId,
+        idempotencyKey: identity.idempotencyKey,
+        peer: { id: sessionId, kind: "dm" },
+        content: {
+          text: "continue",
+          recovery: {
+            sourceClientMessageId,
+            mode: "checkpoint",
+            automatic: true,
+          },
+        },
+      }));
+      let terminal = await frames.next();
+      while (terminal.type !== "outbound.message") terminal = await frames.next();
+      assert.equal(admitCalls, 2);
+      assert.equal(terminal.clientMessageId, identity.clientMessageId);
+      assert.deepEqual(terminal.peer, { id: sessionId, kind: "dm" });
+      assert.deepEqual(terminal.blocks, [{
+        kind: "text",
+        text: "已停止重复恢复。你可以直接继续发送消息。",
+      }]);
+      assert.equal(terminal.isFinal, true);
       await new Promise((resolve) => setTimeout(resolve, 40));
       assert.equal(rig.containerSeen.some((raw) => {
         try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }
