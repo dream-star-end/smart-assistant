@@ -806,6 +806,67 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("Codex context overflow after observable work never replays the user turn", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.toolPair("tool-write", "Bash", "write completed");
+          r.text("work already started");
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Codex ran out of room in the model's context window.",
+            errorClass: "context_too_long",
+          });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        providerTag: "codex",
+        ccbSessionId: "thread-full-after-work",
+      } as Partial<AgentSession>);
+
+      await sm.submit(
+        session,
+        "执行一次写操作",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "e".repeat(32),
+        undefined,
+        undefined,
+        {
+          historicalMessages: [{
+            id: `srv-${session.peerId}-${session.agentId}-t1`,
+            role: "assistant",
+            text: `history-${"x".repeat(16_000)}-tail`,
+            status: "completed",
+          }],
+        },
+      );
+
+      assert.equal(runner.submittedInputs.length, 1);
+      assert.match(String(runner.submittedInputs[0]), /执行一次写操作/);
+      assert.equal(
+        events.some((event) =>
+          event.kind === "block" &&
+          event.block.kind === "text" &&
+          event.block.text.includes("正在整理历史并继续")),
+        false,
+      );
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "context_too_long");
+      assert.equal(captured.payloads[0]!.tools?.length, 1);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop during retry backoff prevents the next continue attempt", async () => {
     const sm = new SessionManager(makeConfigStub());
     (sm as unknown as { _transientRetryDelayMs: () => number })

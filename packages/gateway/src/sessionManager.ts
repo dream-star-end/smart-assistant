@@ -4535,15 +4535,38 @@ export class SessionManager {
 
           const transientErrorClass =
             result?.errorClass ?? classifyRunError(result?.errorDetail).code
+          const contextOverflowHasUsage =
+            result !== null &&
+            (
+              result.usage.cost !== 0 ||
+              result.usage.inputTokens !== 0 ||
+              result.usage.outputTokens !== 0 ||
+              result.usage.cacheReadTokens !== 0 ||
+              result.usage.cacheCreationTokens !== 0 ||
+              Object.values(terminalEngineBilling?.usage ?? {}).some(
+                (value) => typeof value === 'number' && value !== 0,
+              )
+            )
+          const contextOverflowIsSafeToRetry =
+            result !== null &&
+            transientErrorClass === 'context_too_long' &&
+            session.providerTag === 'codex' &&
+            turnBlockCount === 0 &&
+            turnPermissionCount === 0 &&
+            turnToolCallCount === 0 &&
+            structuredBlocks.length === 0 &&
+            result.assistantText.length === 0 &&
+            result.thinkingText.length === 0 &&
+            result.assistantSegments.length === 0 &&
+            result.thinkingSegments.length === 0 &&
+            result.tools.length === 0 &&
+            !contextOverflowHasUsage
           if (
             result?.isError &&
             retryTransientErrors &&
             (
               TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass) ||
-              (
-                transientErrorClass === 'context_too_long' &&
-                session.providerTag === 'codex'
-              )
+              contextOverflowIsSafeToRetry
             )
           ) {
             retryRuntimeEvents.push(
