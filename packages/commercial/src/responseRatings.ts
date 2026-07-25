@@ -9,6 +9,7 @@
 
 import { query } from "./db/queries.js";
 import { incrImplicitRatingOverridden } from "./admin/metrics.js";
+import type { SignalTrafficClass } from "./analytics/signalTraffic.js";
 
 // ─── 用户侧:upsert 一条评分 ──────────────────────────────────────────
 
@@ -47,6 +48,7 @@ export function isImplicitRating(tags: string[]): boolean {
  */
 export async function upsertResponseRating(input: UpsertResponseRatingInput): Promise<void> {
   const incomingImplicit = isImplicitRating(input.tags);
+  const traceId = await resolveResponseRatingTrace(input);
   // existing CTE 在 upsert 之前对同一 (user,message) 读旧行的隐式态(语句快照 → 读到的是
   // 旧值,看不到 upserted 的写入);upserted 保持原 INSERT..ON CONFLICT 语义不变,
   // RETURNING 1 让 did_write 反映"确有写入"(隐式来件命中显式行时 WHERE 为假 → 0 行 → false)。
@@ -77,7 +79,7 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
       input.userId,
       input.sessionId,
       input.messageId,
-      input.traceId,
+      traceId,
       input.model,
       input.rating,
       input.tags, // node-pg 把 JS string[] 序列化为 PG text[] 字面量
@@ -92,6 +94,43 @@ export async function upsertResponseRating(input: UpsertResponseRatingInput): Pr
   if (!incomingImplicit && row?.did_write === true && row.was_implicit === true) {
     incrImplicitRatingOverridden();
   }
+}
+
+async function resolveResponseRatingTrace(
+  input: Pick<
+    UpsertResponseRatingInput,
+    "userId" | "sessionId" | "messageId" | "traceId"
+  >,
+): Promise<string | null> {
+  const result = await query<{ trace_id: string }>(
+    `WITH candidates AS (
+       SELECT t.trace_id, 0 AS priority
+         FROM turn_traces t
+        WHERE $4::text IS NOT NULL
+          AND t.trace_id=$4
+          AND t.user_id=$1::bigint
+          AND (
+            $2::text IS NULL
+            OR t.session_key LIKE '%:webchat:dm:' || regexp_replace($2, '[^a-zA-Z0-9_-]', '_', 'g')
+          )
+       UNION ALL
+       SELECT convert_from(r.payload,'UTF8')::jsonb #>> '{usage,traceId}' AS trace_id,
+              1 AS priority
+         FROM client_session_turn_tape_records r
+        WHERE $2::text IS NOT NULL
+          AND r.user_id='c:' || $1::text
+          AND r.session_id=$2
+          AND r.msg_id=$3
+     )
+     SELECT c.trace_id
+       FROM candidates c
+       JOIN turn_traces t ON t.trace_id=c.trace_id AND t.user_id=$1::bigint
+      WHERE c.trace_id IS NOT NULL
+      ORDER BY c.priority
+      LIMIT 1`,
+    [input.userId, input.sessionId, input.messageId, input.traceId],
+  );
+  return result.rows[0]?.trace_id ?? null;
 }
 
 // ─── 用户侧:按会话回读该用户所有评分(前端"已评状态"恢复)──────────────
@@ -130,6 +169,9 @@ export interface RatingBucket {
   total: number;
   /** up / total(0..1),保留 4 位小数;total=0 时为 null。 */
   up_rate: number | null;
+  ci95_low: number | null;
+  ci95_high: number | null;
+  sample_note: "no_sample" | "small_sample" | "observed";
 }
 
 export interface ModelRatingStat extends RatingBucket {
@@ -141,19 +183,41 @@ export interface ResponseRatingStats {
   last_7d: RatingBucket;
   last_30d: RatingBucket;
   by_model: ModelRatingStat[];
+  rating_users: number;
+  completed_turns: { last_7d: number; last_30d: number };
+  explicit_coverage: { last_7d: number | null; last_30d: number | null };
+  implicit_per_100_completed_turns: { last_7d: number | null; last_30d: number | null };
 }
 
 function toBucket(up: number, down: number): RatingBucket {
   const total = up + down;
+  let ci95Low: number | null = null;
+  let ci95High: number | null = null;
+  if (total > 0) {
+    const z = 1.96;
+    const rate = up / total;
+    const denominator = 1 + (z * z) / total;
+    const center = (rate + (z * z) / (2 * total)) / denominator;
+    const margin =
+      (z / denominator) *
+      Math.sqrt((rate * (1 - rate)) / total + (z * z) / (4 * total * total));
+    ci95Low = Math.round(Math.max(0, center - margin) * 1e4) / 1e4;
+    ci95High = Math.round(Math.min(1, center + margin) * 1e4) / 1e4;
+  }
   return {
     up,
     down,
     total,
     up_rate: total > 0 ? Math.round((up / total) * 1e4) / 1e4 : null,
+    ci95_low: ci95Low,
+    ci95_high: ci95High,
+    sample_note: total === 0 ? "no_sample" : total < 30 ? "small_sample" : "observed",
   };
 }
 
-export async function getResponseRatingStats(): Promise<ResponseRatingStats> {
+export async function getResponseRatingStats(
+  trafficClass: SignalTrafficClass | null = "production_user",
+): Promise<ResponseRatingStats> {
   // 一次扫表算出 overall + 7d + 30d 三个窗口的 up/down(条件聚合,走 created_at / model_rating 索引)。
   // 满意度口径只统计显式评分:隐式弱信号(中途打断/改写重发)不进 up_rate,防止把
   // "用户拿到所需后主动停止"这类中性行为计成不满意。
@@ -164,17 +228,36 @@ export async function getResponseRatingStats(): Promise<ResponseRatingStats> {
     down_7d: number;
     up_30d: number;
     down_30d: number;
+    rating_users: number;
+    implicit_7d: number;
+    implicit_30d: number;
   }>(
     `SELECT
-       COUNT(*) FILTER (WHERE rating = 'up')::int   AS up_all,
-       COUNT(*) FILTER (WHERE rating = 'down')::int AS down_all,
-       COUNT(*) FILTER (WHERE rating = 'up'   AND created_at >= NOW() - INTERVAL '7 days')::int  AS up_7d,
-       COUNT(*) FILTER (WHERE rating = 'down' AND created_at >= NOW() - INTERVAL '7 days')::int  AS down_7d,
-       COUNT(*) FILTER (WHERE rating = 'up'   AND created_at >= NOW() - INTERVAL '30 days')::int AS up_30d,
-       COUNT(*) FILTER (WHERE rating = 'down' AND created_at >= NOW() - INTERVAL '30 days')::int AS down_30d
-     FROM response_rating
-     WHERE NOT ($1 = ANY(tags))`,
-    [IMPLICIT_RATING_TAG],
+       COUNT(*) FILTER (WHERE NOT ($1 = ANY(r.tags)) AND r.rating = 'up')::int   AS up_all,
+       COUNT(*) FILTER (WHERE NOT ($1 = ANY(r.tags)) AND r.rating = 'down')::int AS down_all,
+       COUNT(*) FILTER (
+         WHERE NOT ($1 = ANY(r.tags)) AND r.rating = 'up'
+           AND r.created_at >= NOW() - INTERVAL '7 days'
+       )::int AS up_7d,
+       COUNT(*) FILTER (
+         WHERE NOT ($1 = ANY(r.tags)) AND r.rating = 'down'
+           AND r.created_at >= NOW() - INTERVAL '7 days'
+       )::int AS down_7d,
+       COUNT(*) FILTER (
+         WHERE NOT ($1 = ANY(r.tags)) AND r.rating = 'up'
+           AND r.created_at >= NOW() - INTERVAL '30 days'
+       )::int AS up_30d,
+       COUNT(*) FILTER (
+         WHERE NOT ($1 = ANY(r.tags)) AND r.rating = 'down'
+           AND r.created_at >= NOW() - INTERVAL '30 days'
+       )::int AS down_30d,
+       COUNT(DISTINCT r.user_id) FILTER (WHERE NOT ($1 = ANY(r.tags)))::int AS rating_users,
+       COUNT(*) FILTER (WHERE $1 = ANY(r.tags) AND r.created_at >= NOW() - INTERVAL '7 days')::int AS implicit_7d,
+       COUNT(*) FILTER (WHERE $1 = ANY(r.tags) AND r.created_at >= NOW() - INTERVAL '30 days')::int AS implicit_30d
+     FROM response_rating r
+     JOIN users u ON u.id=r.user_id
+     WHERE ($2::text IS NULL OR u.signal_traffic_class=$2)`,
+    [IMPLICIT_RATING_TAG, trafficClass],
   );
   const w = windows.rows[0] ?? {
     up_all: 0,
@@ -183,24 +266,58 @@ export async function getResponseRatingStats(): Promise<ResponseRatingStats> {
     down_7d: 0,
     up_30d: 0,
     down_30d: 0,
+    rating_users: 0,
+    implicit_7d: 0,
+    implicit_30d: 0,
   };
 
   const byModel = await query<{ model: string | null; up: number; down: number }>(
-    `SELECT model,
-       COUNT(*) FILTER (WHERE rating = 'up')::int   AS up,
-       COUNT(*) FILTER (WHERE rating = 'down')::int AS down
-     FROM response_rating
-     WHERE NOT ($1 = ANY(tags))
-     GROUP BY model
-     ORDER BY (COUNT(*)) DESC, model ASC NULLS LAST`,
-    [IMPLICIT_RATING_TAG],
+    `SELECT r.model,
+       COUNT(*) FILTER (WHERE r.rating = 'up')::int   AS up,
+       COUNT(*) FILTER (WHERE r.rating = 'down')::int AS down
+     FROM response_rating r
+     JOIN users u ON u.id=r.user_id
+     WHERE NOT ($1 = ANY(r.tags))
+       AND ($2::text IS NULL OR u.signal_traffic_class=$2)
+     GROUP BY r.model
+     ORDER BY (COUNT(*)) DESC, r.model ASC NULLS LAST`,
+    [IMPLICIT_RATING_TAG, trafficClass],
   );
+  const completed = await query<{ turns_7d: number; turns_30d: number }>(
+    `SELECT
+       COUNT(*) FILTER (
+         WHERE t.created_at >= EXTRACT(EPOCH FROM NOW() - INTERVAL '7 days') * 1000
+       )::int AS turns_7d,
+       COUNT(*) FILTER (
+         WHERE t.created_at >= EXTRACT(EPOCH FROM NOW() - INTERVAL '30 days') * 1000
+       )::int AS turns_30d
+     FROM client_session_turn_tapes t
+     JOIN users u ON t.user_id='c:' || u.id::text
+     WHERE t.status='completed'
+       AND t.finalized_at IS NOT NULL
+       AND ($1::text IS NULL OR u.signal_traffic_class=$1)`,
+    [trafficClass],
+  );
+  const turns7d = completed.rows[0]?.turns_7d ?? 0;
+  const turns30d = completed.rows[0]?.turns_30d ?? 0;
+  const ratio = (value: number, denominator: number): number | null =>
+    denominator > 0 ? Math.round((value / denominator) * 1e4) / 1e4 : null;
 
   return {
     overall: toBucket(w.up_all, w.down_all),
     last_7d: toBucket(w.up_7d, w.down_7d),
     last_30d: toBucket(w.up_30d, w.down_30d),
     by_model: byModel.rows.map((m) => ({ model: m.model, ...toBucket(m.up, m.down) })),
+    rating_users: w.rating_users,
+    completed_turns: { last_7d: turns7d, last_30d: turns30d },
+    explicit_coverage: {
+      last_7d: ratio(w.up_7d + w.down_7d, turns7d),
+      last_30d: ratio(w.up_30d + w.down_30d, turns30d),
+    },
+    implicit_per_100_completed_turns: {
+      last_7d: turns7d > 0 ? Math.round((w.implicit_7d / turns7d) * 10000) / 100 : null,
+      last_30d: turns30d > 0 ? Math.round((w.implicit_30d / turns30d) * 10000) / 100 : null,
+    },
   };
 }
 
@@ -215,6 +332,7 @@ export interface DownRatingRow {
   session_id: string | null;
   created_at: string; // ISO
   username: string | null; // JOIN users:display_name ?? email
+  traffic_class: SignalTrafficClass;
 }
 
 export interface ListDownRatingsInput {
@@ -224,6 +342,7 @@ export interface ListDownRatingsInput {
   limit?: number;
   /** explicit=用户主动点踩；implicit=行为弱信号；all=两者。默认只看显式。 */
   source?: "explicit" | "implicit" | "all";
+  trafficClass?: SignalTrafficClass | null;
 }
 
 export interface ListDownRatingsResult {
@@ -252,6 +371,9 @@ export async function listDownRatings(
         : `NOT (${implicitTag} = ANY(r.tags))`,
     );
   }
+  params.push(input.trafficClass ?? null);
+  const trafficIdx = params.length;
+  where.push(`($${trafficIdx}::text IS NULL OR u.signal_traffic_class=$${trafficIdx})`);
 
   if (input.before_created_at && input.before_id) {
     params.push(input.before_created_at);
@@ -270,10 +392,24 @@ export async function listDownRatings(
       r.model,
       r.tags,
       r.comment,
-      r.trace_id,
+      COALESCE(
+        r.trace_id,
+        (
+          SELECT convert_from(tape.payload,'UTF8')::jsonb #>> '{usage,traceId}'
+            FROM client_session_turn_tape_records tape
+            JOIN turn_traces trace
+              ON trace.trace_id=convert_from(tape.payload,'UTF8')::jsonb #>> '{usage,traceId}'
+             AND trace.user_id=r.user_id
+           WHERE tape.user_id='c:' || r.user_id::text
+             AND tape.session_id=r.session_id
+             AND tape.msg_id=r.message_id
+           LIMIT 1
+        )
+      ) AS trace_id,
       r.session_id,
       r.created_at,
-      COALESCE(u.display_name, u.email) AS username
+      COALESCE(u.display_name, u.email) AS username,
+      u.signal_traffic_class AS traffic_class
     FROM response_rating r
     LEFT JOIN users u ON u.id = r.user_id
     WHERE ${where.join(" AND ")}
@@ -290,6 +426,7 @@ export async function listDownRatings(
     session_id: string | null;
     created_at: Date;
     username: string | null;
+    traffic_class: SignalTrafficClass;
   }>(sql, params);
 
   const hasMore = r.rows.length > limit;
@@ -305,6 +442,7 @@ export async function listDownRatings(
       session_id: row.session_id,
       created_at: row.created_at.toISOString(),
       username: row.username,
+      traffic_class: row.traffic_class,
     })),
     next_before_created_at: hasMore && last ? last.created_at.toISOString() : null,
     next_before_id: hasMore && last ? last.id : null,

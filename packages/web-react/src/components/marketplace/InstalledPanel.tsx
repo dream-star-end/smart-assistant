@@ -12,7 +12,24 @@ import { api, apiErrorMessage } from "../../lib/api";
 import { updateAvailable } from "../../lib/marketplace";
 import type { AuthSession, MarketplaceInstalled, MarketplaceMyAgent } from "../../lib/types";
 import { AgentScopePicker, AgentScopeSummary, normalizeAgentScope } from "../AgentScopePicker";
-import { Alert, Badge, Button, EmptyState, Modal, Spinner, useConfirm } from "../ui";
+import { Alert, Badge, Button, EmptyState, Modal, Spinner } from "../ui";
+
+type UninstallReason =
+  | "not_needed"
+  | "poor_quality"
+  | "missing_capability"
+  | "install_error"
+  | "other"
+  | "prefer_not_say";
+
+const UNINSTALL_REASON_OPTIONS: Array<{ value: UninstallReason; label: string }> = [
+  { value: "prefer_not_say", label: "不说明" },
+  { value: "not_needed", label: "暂时不需要" },
+  { value: "poor_quality", label: "效果不好" },
+  { value: "missing_capability", label: "缺少我需要的能力" },
+  { value: "install_error", label: "安装或使用有问题" },
+  { value: "other", label: "其他" },
+];
 
 /**
  * 我的已安装：列出当前安装的技能/智能体,可卸载;有新上架版本的给「更新」按钮
@@ -35,7 +52,13 @@ export function InstalledPanel({
   const [editing, setEditing] = useState<MarketplaceInstalled | null>(null);
   const [editScope, setEditScope] = useState<string[]>(["main"]);
   const [reload, setReload] = useState(0);
-  const [confirmDialog, confirmDialogEl] = useConfirm();
+  const [pendingUninstall, setPendingUninstall] = useState<{
+    slug: string;
+    name: string;
+    isAgent: boolean;
+  } | null>(null);
+  const [uninstallReason, setUninstallReason] =
+    useState<UninstallReason>("prefer_not_say");
   const connectorCount = rows?.filter((r) => r.kind === "connector").length ?? 0;
   const visibleRows = rows?.filter((r) => r.kind !== "connector") ?? null;
 
@@ -72,30 +95,21 @@ export function InstalledPanel({
     };
   }, [auth, reload]);
 
-  const uninstall = useCallback(
-    async (slug: string, name: string, isAgent: boolean) => {
-      const ok = await confirmDialog({
-        title: `卸载${isAgent ? "智能体" : "技能"}「${name}」?`,
-        body: isAgent
-          ? "智能体会被移除；仅由它自动带来的 Skill 会退出。Plugin 是用户级能力，会保留到你在插件管理中主动卸载。"
-          : "卸载后将不再可用；其他智能体对它的依赖会明确显示为未就绪。",
-        confirmText: "卸载",
-        danger: true,
-      });
-      if (!ok) return;
-      setBusy(slug);
-      setErr(null);
-      try {
-        await api.uninstallMarketplace(auth, slug);
-        setReload((n) => n + 1);
-      } catch (e) {
-        setErr(apiErrorMessage(e, "卸载失败"));
-      } finally {
-        setBusy(null);
-      }
-    },
-    [auth, confirmDialog],
-  );
+  const uninstall = useCallback(async () => {
+    if (!pendingUninstall) return;
+    setBusy(pendingUninstall.slug);
+    setErr(null);
+    try {
+      await api.uninstallMarketplace(auth, pendingUninstall.slug, uninstallReason);
+      setPendingUninstall(null);
+      setUninstallReason("prefer_not_say");
+      setReload((n) => n + 1);
+    } catch (e) {
+      setErr(apiErrorMessage(e, "卸载失败"));
+    } finally {
+      setBusy(null);
+    }
+  }, [auth, pendingUninstall, uninstallReason]);
 
   // 更新 = 安装 listing 当前上架版本。latestVersionId 可能在打开面板后又变化,
   // 以后端 install 校验为准:失败(非当前版本)则报错并刷新列表。
@@ -146,7 +160,53 @@ export function InstalledPanel({
 
   return (
     <div className="flex flex-col">
-      {confirmDialogEl}
+      <Modal
+        open={pendingUninstall !== null}
+        onOpenChange={(open) => {
+          if (!open && busy === null) setPendingUninstall(null);
+        }}
+        title={
+          pendingUninstall
+            ? `卸载${pendingUninstall.isAgent ? "智能体" : "技能"}「${pendingUninstall.name}」?`
+            : undefined
+        }
+        description={
+          pendingUninstall?.isAgent
+            ? "智能体会被移除；仅由它自动带来的 Skill 会退出。Plugin 会保留到你主动卸载。"
+            : "卸载后将不再可用；其他智能体对它的依赖会明确显示为未就绪。"
+        }
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              disabled={busy !== null}
+              onClick={() => setPendingUninstall(null)}
+            >
+              取消
+            </Button>
+            <Button variant="danger" disabled={busy !== null} onClick={() => void uninstall()}>
+              {busy !== null && <Loader2 size={14} className="animate-spin" />}
+              卸载
+            </Button>
+          </>
+        }
+      >
+        <label className="block text-[12.5px] text-muted">
+          原因（可不说明）
+          <select
+            value={uninstallReason}
+            disabled={busy !== null}
+            onChange={(event) => setUninstallReason(event.target.value as UninstallReason)}
+            className="mt-2 w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg"
+          >
+            {UNINSTALL_REASON_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </Modal>
       <Modal
         open={!!editing}
         onOpenChange={(o) => !o && setEditing(null)}
@@ -302,7 +362,14 @@ export function InstalledPanel({
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => uninstall(r.slug, r.name, r.kind === "agent")}
+                  onClick={() => {
+                    setUninstallReason("prefer_not_say");
+                    setPendingUninstall({
+                      slug: r.slug,
+                      name: r.name,
+                      isAgent: r.kind === "agent",
+                    });
+                  }}
                   disabled={busy === r.slug}
                   aria-label="卸载"
                 >

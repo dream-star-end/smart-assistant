@@ -848,13 +848,16 @@ describe('AutoDreamOptimizerService', () => {
     }
   })
 
-  it('does not duplicate a derived finding when Terra explicitly returned its anonymous capability', async () => {
+  it('keeps a map signal raw while surfacing the matching derived theme once', async () => {
     const targetId = 'routing/model-context-cache-policy'
     const capabilityId = `auto_dream.routing.${createHash('sha256')
       .update(targetId)
       .digest('hex')
       .slice(0, 32)}`
-    const reported: Array<{ findings: Array<{ capabilityId: string; signalCount: number }> }> = []
+    const reported: Array<{
+      findings: Array<{ capabilityId: string; signalCount: number }>
+      rawFindings: Array<{ capabilityId: string; signalCount: number }>
+    }> = []
     const service = new AutoDreamOptimizerService({
       policyClient: { get: async () => enabledPolicy } as any,
       loadAuditDataset: async () => ({
@@ -904,12 +907,18 @@ describe('AutoDreamOptimizerService', () => {
     assert.equal(reported.length, 1)
     assert.equal(reported[0]?.findings.length, 1)
     assert.equal(reported[0]?.findings[0]?.capabilityId, capabilityId)
-    assert.equal(reported[0]?.findings[0]?.signalCount, 7)
+    assert.equal(reported[0]?.findings[0]?.signalCount, 1)
+    assert.equal(reported[0]?.rawFindings.length, 1)
+    assert.equal(reported[0]?.rawFindings[0]?.capabilityId, capabilityId)
+    assert.equal(reported[0]?.rawFindings[0]?.signalCount, 7)
   })
 
   it('keeps an unsupported Terra target as guided review and still reports its platform finding', async () => {
     const prompts: Array<{ phase: string; prompt: string }> = []
-    const reported: Array<{ findings: Array<{ capabilityId: string }> }> = []
+    const reported: Array<{
+      findings: Array<{ capabilityId: string }>
+      rawFindings: Array<{ capabilityId: string }>
+    }> = []
     let applyCalls = 0
     const service = new AutoDreamOptimizerService({
       policyClient: { get: async () => enabledPolicy } as any,
@@ -973,7 +982,8 @@ describe('AutoDreamOptimizerService', () => {
     assert.equal(state.proposals[0]?.before, '{"enabled":false}')
     assert.equal(state.proposals[0]?.after, '{"enabled":true}')
     assert.equal(reported.length, 1)
-    assert.equal(reported[0]?.findings[0]?.capabilityId, 'short_response_latency')
+    assert.equal(reported[0]?.findings.length, 0)
+    assert.equal(reported[0]?.rawFindings[0]?.capabilityId, 'short.response.latency')
     assert.match(
       prompts.find((row) => row.phase === 'map')?.prompt ?? '',
       /preferences\.default_effort.*action=manual\.review/s,
@@ -1036,7 +1046,10 @@ describe('AutoDreamOptimizerService', () => {
   })
 
   it('discards model-authored text before automatically reporting a platform finding', async () => {
-    const reported: Array<{ findings: Array<{ problem: string; recommendation: string }> }> = []
+    const reported: Array<{
+      findings: Array<{ problem: string; recommendation: string }>
+      rawFindings: Array<{ problem: string; recommendation: string }>
+    }> = []
     const service = new AutoDreamOptimizerService({
       policyClient: { get: async () => enabledPolicy } as any,
       loadAuditDataset: async () => ({
@@ -1070,9 +1083,9 @@ describe('AutoDreamOptimizerService', () => {
     })
 
     await service.run('privacy', 'user-42', true)
-    assert.equal(reported[0]?.findings[0]?.problem, '聚合信号显示现有使用路径存在重复阻力。')
+    assert.equal(reported[0]?.rawFindings[0]?.problem, '聚合信号显示现有使用路径存在重复阻力。')
     assert.equal(
-      reported[0]?.findings[0]?.recommendation,
+      reported[0]?.rawFindings[0]?.recommendation,
       '结合匿名聚合信号审查 settings.navigation，验证根因后规划最小充分改进。',
     )
   })

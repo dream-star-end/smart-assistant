@@ -3,6 +3,7 @@ import { createHash, createHmac } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
 
 import { writeAdminAudit } from '../admin/audit.js'
+import type { SignalTrafficClass } from '../analytics/signalTraffic.js'
 
 const TAXONOMY = new Set([
   'capability_gap',
@@ -48,9 +49,11 @@ export async function reportAutoDreamPlatformFindings(
     runId: string
     model: string
     findings: unknown
+    rawFindings?: unknown
+    trafficClass?: SignalTrafficClass
     pseudonymKey: Uint8Array
   },
-): Promise<{ accepted: number }> {
+): Promise<{ accepted: number; rawAccepted: number }> {
   if (
     !/^[0-9a-f-]{36}$/.test(input.runId) ||
     !/^[0-9a-f]{64}$/.test(input.subjectHash) ||
@@ -62,10 +65,44 @@ export async function reportAutoDreamPlatformFindings(
   if (!Array.isArray(input.findings) || input.findings.length > 128) {
     throw new Error('AUTO_DREAM_INVALID_FINDINGS')
   }
+  if (
+    input.rawFindings !== undefined &&
+    (!Array.isArray(input.rawFindings) || input.rawFindings.length > 128)
+  ) {
+    throw new Error('AUTO_DREAM_INVALID_RAW_FINDINGS')
+  }
   const findings = input.findings.map((finding) => validateFinding(finding, input.pseudonymKey))
+  const rawFindings = (input.rawFindings ?? []).map((finding) =>
+    validateFinding(finding, input.pseudonymKey),
+  )
+  const trafficClass = input.trafficClass
+  if (rawFindings.length > 0 && trafficClass === undefined) {
+    throw new Error('AUTO_DREAM_RAW_FINDINGS_REQUIRE_TRAFFIC_CLASS')
+  }
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    for (const finding of rawFindings) {
+      await client.query(
+        `INSERT INTO auto_dream_platform_raw_signals
+           (subject_hash,run_id,agent_hash,evidence_hash,taxonomy,capability_id,severity,
+            signal_count,model,traffic_class)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (subject_hash,run_id,agent_hash,evidence_hash) DO NOTHING`,
+        [
+          input.subjectHash,
+          input.runId,
+          hash(input.agentId),
+          finding.evidenceHash,
+          finding.taxonomy,
+          finding.capabilityId,
+          finding.severity,
+          finding.signalCount,
+          input.model,
+          trafficClass!,
+        ],
+      )
+    }
     for (const finding of findings) {
       const fingerprint = hash(
         `${finding.taxonomy}\0${finding.capabilityId}\0${finding.title}\0${finding.problem}\0${finding.impact}\0${finding.recommendation}`,
@@ -103,20 +140,39 @@ export async function reportAutoDreamPlatformFindings(
         ],
       )
       const findingId = upsert.rows[0]!.id
-      await client.query(
-        `INSERT INTO auto_dream_platform_finding_occurrences
-           (finding_id,subject_hash,run_id,agent_hash,signal_count,evidence_hash)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (finding_id,subject_hash,run_id) DO NOTHING`,
-        [
-          findingId,
-          input.subjectHash,
-          input.runId,
-          hash(input.agentId),
-          finding.signalCount,
-          finding.evidenceHash,
-        ],
-      )
+      if (trafficClass === undefined) {
+        await client.query(
+          `INSERT INTO auto_dream_platform_finding_occurrences
+             (finding_id,subject_hash,run_id,agent_hash,signal_count,evidence_hash)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           ON CONFLICT (finding_id,subject_hash,run_id) DO NOTHING`,
+          [
+            findingId,
+            input.subjectHash,
+            input.runId,
+            hash(input.agentId),
+            finding.signalCount,
+            finding.evidenceHash,
+          ],
+        )
+      } else {
+        await client.query(
+          `INSERT INTO auto_dream_platform_finding_occurrences
+             (finding_id,subject_hash,run_id,agent_hash,signal_count,evidence_hash,model,traffic_class)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (finding_id,subject_hash,run_id) DO NOTHING`,
+          [
+            findingId,
+            input.subjectHash,
+            input.runId,
+            hash(input.agentId),
+            finding.signalCount,
+            finding.evidenceHash,
+            input.model,
+            trafficClass,
+          ],
+        )
+      }
       await client.query(
         `UPDATE auto_dream_platform_findings f
             SET occurrence_count=(
@@ -135,7 +191,7 @@ export async function reportAutoDreamPlatformFindings(
       )
     }
     await client.query('COMMIT')
-    return { accepted: findings.length }
+    return { accepted: findings.length, rawAccepted: rawFindings.length }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
     throw err
@@ -234,28 +290,76 @@ export async function applyAutoDreamPreferenceAction(
 
 export async function listAutoDreamPlatformFindings(
   pool: Pool,
-  input: { status?: string; limit: number; offset: number },
-): Promise<{ rows: Record<string, unknown>[]; total: number }> {
+  input: {
+    status?: string
+    limit: number
+    offset: number
+    trafficClass: SignalTrafficClass | null
+    model: 'current' | 'all' | string
+  },
+): Promise<{ rows: Record<string, unknown>[]; total: number; model: string | null }> {
   const status = input.status && input.status !== 'all' ? input.status : null
+  const currentModel =
+    input.model === 'current'
+      ? ((
+          await pool.query<{ model: string }>(
+            `SELECT value #>> '{}' AS model
+               FROM system_settings
+              WHERE key='auto_dream_model'`,
+          )
+        ).rows[0]?.model ?? null)
+      : input.model === 'all'
+        ? null
+        : input.model
+  const params = [status, input.trafficClass, currentModel, input.limit, input.offset]
+  const evidenceCte = `
+    WITH evidence AS (
+      SELECT o.finding_id,
+             SUM(o.signal_count)::text AS occurrence_count,
+             COUNT(DISTINCT o.subject_hash)::text AS affected_user_count,
+             COUNT(DISTINCT o.run_id)::text AS run_count,
+             MAX(o.created_at) AS filtered_last_seen_at,
+             MAX(o.model) AS filtered_last_model
+        FROM auto_dream_platform_finding_occurrences o
+       WHERE ($2::text IS NULL OR o.traffic_class=$2)
+         AND ($3::text IS NULL OR o.model=$3)
+       GROUP BY o.finding_id
+    )
+  `
   const [rows, count] = await Promise.all([
     pool.query(
-      `SELECT id::text,fingerprint,taxonomy,capability_id,severity,title,problem,impact,
-              recommendation,status,occurrence_count::text,affected_user_count::text,
-              first_seen_at,last_seen_at,last_model,last_run_id::text,updated_at
-         FROM auto_dream_platform_findings
-        WHERE ($1::text IS NULL OR status=$1)
-        ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-                 last_seen_at DESC
-        LIMIT $2 OFFSET $3`,
-      [status, input.limit, input.offset],
+      `${evidenceCte}
+       SELECT f.id::text,f.fingerprint,f.taxonomy,f.capability_id,f.severity,f.title,f.problem,
+              f.impact,f.recommendation,f.status,e.occurrence_count,e.affected_user_count,
+              e.run_count,f.first_seen_at,e.filtered_last_seen_at AS last_seen_at,
+              e.filtered_last_model AS last_model,f.last_run_id::text,f.updated_at,
+              CASE
+                WHEN e.affected_user_count::bigint >= 2 AND e.run_count::bigint >= 2
+                  THEN 'corroborated'
+                ELSE 'single_source'
+              END AS evidence_confidence
+         FROM auto_dream_platform_findings f
+         JOIN evidence e ON e.finding_id=f.id
+        WHERE ($1::text IS NULL OR f.status=$1)
+        ORDER BY CASE f.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                 e.filtered_last_seen_at DESC
+        LIMIT $4 OFFSET $5`,
+      params,
     ),
     pool.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM auto_dream_platform_findings
-        WHERE ($1::text IS NULL OR status=$1)`,
-      [status],
+      `${evidenceCte}
+       SELECT COUNT(*)::text AS count
+         FROM auto_dream_platform_findings f
+         JOIN evidence e ON e.finding_id=f.id
+        WHERE ($1::text IS NULL OR f.status=$1)`,
+      params.slice(0, 3),
     ),
   ])
-  return { rows: rows.rows, total: Number(count.rows[0]?.count ?? 0) }
+  return {
+    rows: rows.rows,
+    total: Number(count.rows[0]?.count ?? 0),
+    model: currentModel,
+  }
 }
 
 export async function updateAutoDreamPlatformFindingStatus(

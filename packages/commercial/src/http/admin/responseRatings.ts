@@ -16,6 +16,10 @@ import { requireAdmin } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { parseBigintIdParam, parseIsoTimestamp, parsePositiveInt } from "./_shared.js";
 import { getResponseRatingStats, listDownRatings } from "../../responseRatings.js";
+import {
+  isSignalTrafficFilter,
+  signalTrafficFilterValue,
+} from "../../analytics/signalTraffic.js";
 
 const DOWN_MAX_LIMIT = 200;
 type DownRatingSource = "explicit" | "implicit" | "all";
@@ -44,14 +48,20 @@ export async function handleAdminResponseRatings(
   const beforeId = parseBigintIdParam(url.searchParams.get("before_id"), "before_id");
   const limit = parsePositiveInt(url.searchParams.get("limit"), "limit", DOWN_MAX_LIMIT);
   const source = parseDownRatingSource(url.searchParams.get("source"));
+  const traffic = url.searchParams.get("traffic_class") ?? "production_user";
+  if (!isSignalTrafficFilter(traffic)) {
+    throw new HttpError(400, "VALIDATION", "invalid traffic_class");
+  }
+  const trafficClass = signalTrafficFilterValue(traffic);
 
   const [stats, down] = await Promise.all([
-    getResponseRatingStats(),
+    getResponseRatingStats(trafficClass),
     listDownRatings({
       before_created_at: beforeCreatedAt,
       before_id: beforeId,
       limit,
       source,
+      trafficClass,
     }),
   ]);
 
@@ -59,6 +69,7 @@ export async function handleAdminResponseRatings(
     stats,
     down_ratings: {
       source,
+      traffic_class: traffic,
       rows: down.rows,
       next_before_created_at: down.next_before_created_at,
       next_before_id: down.next_before_id,

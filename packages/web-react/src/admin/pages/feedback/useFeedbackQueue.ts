@@ -7,6 +7,7 @@ const PAGE_SIZE = 50;
 export type FeedbackFilters = {
   status: FeedbackStatus | "";
   userId: string;
+  trafficClass: string;
 };
 
 export type FeedbackQueueState = {
@@ -41,9 +42,6 @@ export function useFeedbackQueue(filters: FeedbackFilters): FeedbackQueueState {
     id: null,
   });
   const seqRef = useRef(0);
-  const filtersRef = useRef(filters);
-  filtersRef.current = filters;
-
   const fetchPage = useCallback(async (isFirst: boolean) => {
     const mySeq = seqRef.current;
     if (isFirst) {
@@ -53,11 +51,11 @@ export function useFeedbackQueue(filters: FeedbackFilters): FeedbackQueueState {
       setLoadingMore(true);
     }
     try {
-      const f = filtersRef.current;
       const resp = await adminGet<FeedbackListResp>("/feedback", {
         limit: PAGE_SIZE,
-        status: f.status || undefined,
-        user_id: f.userId || undefined,
+        status: filters.status || undefined,
+        user_id: filters.userId || undefined,
+        traffic_class: filters.trafficClass,
         before_created_at: isFirst ? undefined : cursorRef.current.createdAt,
         before_id: isFirst ? undefined : cursorRef.current.id,
       });
@@ -77,7 +75,7 @@ export function useFeedbackQueue(filters: FeedbackFilters): FeedbackQueueState {
         setLoadingMore(false);
       }
     }
-  }, []);
+  }, [filters.status, filters.userId, filters.trafficClass]);
 
   // filters 变化 → 重置游标 + 重拉首页。
   useEffect(() => {
@@ -85,8 +83,7 @@ export function useFeedbackQueue(filters: FeedbackFilters): FeedbackQueueState {
     cursorRef.current = { createdAt: null, id: null };
     setDone(false);
     void fetchPage(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.status, filters.userId]);
+  }, [fetchPage]);
 
   const loadMore = useCallback(() => {
     if (done || loadingMore || loading) return;

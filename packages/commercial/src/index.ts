@@ -327,6 +327,7 @@ import {
   applyAutoDreamPreferenceAction,
   reportAutoDreamPlatformFindings,
 } from "./autoDream/optimizerStore.js";
+import { getUserSignalTrafficClass } from "./analytics/signalTraffic.js";
 import {
   CRON_INDEX_PATH,
   makeCronIndexHandler,
@@ -2131,8 +2132,10 @@ export async function registerCommercial(
             }
             const inserted = await getPool().query(
               `INSERT INTO inbox_messages
-                 (audience,user_id,title,body_md,level,created_by,source_type,source_id,source_phase)
-               SELECT 'user',$1,$2,$3,$4,$5,'cron_delivery',$1,$6
+                 (audience,user_id,title,body_md,level,category,thread_key,created_by,
+                  source_type,source_id,source_phase)
+               SELECT 'user',$1,$2,$3,$4,'automation','cron:user:' || $1::text,$5,
+                      'cron_delivery',$1,$6
                 WHERE EXISTS (
                   SELECT 1 FROM users WHERE id=$1 AND status='active'
                 )
@@ -4115,6 +4118,8 @@ export async function registerCommercial(
             runId,
             model: policy.modelId,
             findings: body.findings,
+            rawFindings: body.rawFindings,
+            trafficClass: await getUserSignalTrafficClass(identity.userId, getPool()),
             pseudonymKey,
           });
         } finally {

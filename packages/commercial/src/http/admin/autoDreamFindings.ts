@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { requireAdmin, requireAdminVerifyDb } from '../../admin/requireAdmin.js'
+import { isSignalTrafficFilter, signalTrafficFilterValue } from '../../analytics/signalTraffic.js'
 import {
   listAutoDreamPlatformFindings,
   updateAutoDreamPlatformFindingStatus,
@@ -24,7 +25,21 @@ export async function handleAdminListAutoDreamFindings(
   if (!STATUSES.has(status)) throw new HttpError(400, 'VALIDATION', 'invalid status')
   const limit = parsePositiveInt(url.searchParams.get('limit'), 'limit', 200) ?? 50
   const offset = parseNonNegativeInt(url.searchParams.get('offset'), 'offset') ?? 0
-  const result = await listAutoDreamPlatformFindings(getPool(), { status, limit, offset })
+  const traffic = url.searchParams.get('traffic_class') ?? 'production_user'
+  if (!isSignalTrafficFilter(traffic)) {
+    throw new HttpError(400, 'VALIDATION', 'invalid traffic_class')
+  }
+  const model = url.searchParams.get('model') ?? 'current'
+  if (model !== 'current' && model !== 'all' && !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(model)) {
+    throw new HttpError(400, 'VALIDATION', 'invalid model')
+  }
+  const result = await listAutoDreamPlatformFindings(getPool(), {
+    status,
+    limit,
+    offset,
+    trafficClass: signalTrafficFilterValue(traffic),
+    model,
+  })
   sendJson(res, 200, result)
 }
 

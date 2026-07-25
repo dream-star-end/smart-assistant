@@ -49,6 +49,7 @@ export function SettingsCenter({
   onRefreshMe,
   onPreferencesChange,
   onOpenMemory,
+  feedbackContext,
   initialSection = "account",
 }: {
   open: boolean;
@@ -65,6 +66,7 @@ export function SettingsCenter({
   onPreferencesChange?: (prefs: PrefsView, patch?: Record<string, unknown>) => void;
   /** 从 Auto-Dream 偏好卡跳转到管理中心的记忆/梦境报告。 */
   onOpenMemory: () => void;
+  feedbackContext?: { sessionId: string | null; requestId: string | null };
   /** 教程等外部入口可直达具体分区；普通设置入口默认账户页。 */
   initialSection?: SettingsSection;
 }) {
@@ -234,7 +236,7 @@ export function SettingsCenter({
                 {section === "feedback" && (
                   <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.feedback.id}>
                     {user ? (
-                      <FeedbackTab auth={auth} userId={user.id} />
+                      <FeedbackTab auth={auth} userId={user.id} context={feedbackContext} />
                     ) : (
                       <p className="px-5 py-10 text-center text-[13px] text-faint">
                         正在加载账号信息…

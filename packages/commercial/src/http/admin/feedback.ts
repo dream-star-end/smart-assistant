@@ -21,6 +21,10 @@ import {
   parseIsoTimestamp,
   parseBigintIdParam,
 } from "./_shared.js";
+import {
+  isSignalTrafficFilter,
+  signalTrafficFilterValue,
+} from "../../analytics/signalTraffic.js";
 
 // ─── /api/admin/feedback (P1-2 反馈管理) ──────────────────────────
 
@@ -54,6 +58,7 @@ function serializeFeedbackRow(row: FeedbackRowView): Record<string, unknown> {
     handled_by: row.handled_by,
     handled_at: row.handled_at?.toISOString() ?? null,
     created_at: row.created_at.toISOString(),
+    traffic_class: row.traffic_class,
   };
 }
 
@@ -70,12 +75,17 @@ export async function handleAdminListFeedback(
   const beforeCreatedAt = parseIsoTimestamp(url.searchParams.get("before_created_at"), "before_created_at");
   const beforeId = parseBigintIdParam(url.searchParams.get("before_id"), "before_id");
   const limit = parsePositiveInt(url.searchParams.get("limit"), "limit", FEEDBACK_MAX_LIMIT);
+  const traffic = url.searchParams.get("traffic_class") ?? "production_user";
+  if (!isSignalTrafficFilter(traffic)) {
+    throw new HttpError(400, "VALIDATION", "invalid traffic_class");
+  }
   const r = await listFeedback({
     status,
     user_id: userId,
     before_created_at: beforeCreatedAt,
     before_id: beforeId,
     limit,
+    trafficClass: signalTrafficFilterValue(traffic),
   });
   sendJson(res, 200, {
     rows: r.rows.map(serializeFeedbackRow),

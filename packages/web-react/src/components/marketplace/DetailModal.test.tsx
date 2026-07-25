@@ -7,6 +7,7 @@ import { createMemoryAuthSession } from "../../lib/authSession";
 const getMarketplaceDetail = vi.fn();
 const listMyAgents = vi.fn();
 const installMarketplace = vi.fn();
+const reportClientFriction = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/api", () => ({
   ApiError: class ApiError extends Error {},
   api: {
@@ -15,6 +16,7 @@ vi.mock("../../lib/api", () => ({
     installMarketplace: (...a: unknown[]) => installMarketplace(...a),
   },
 }));
+vi.mock("../../lib/clientFriction", () => ({ reportClientFriction }));
 // 富介绍走既有 <Markdown>(懒加载真实实现)。测试里用轻量桩直出文本,避免异步 chunk flake。
 vi.mock("../Markdown", () => ({
   Markdown: ({ children }: { children: string }) => <div data-testid="md">{children}</div>,
@@ -66,6 +68,14 @@ test("详情页人向重排:适用场景 / 效果 / 详细介绍 / 分类徽章�
   expect(screen.getByText("这是富介绍正文段落")).toBeInTheDocument();
   // 分类 label 徽章
   expect(screen.getByText("办公文档")).toBeInTheDocument();
+  expect(reportClientFriction).toHaveBeenCalledWith(
+    expect.objectContaining({
+      surface: "marketplace",
+      stage: "detail_view",
+      outcome: "succeeded",
+    }),
+    "tok",
+  );
 });
 
 test("公开详情即使收到旧服务端 riskFlags 也不展示内部扫描诊断", async () => {

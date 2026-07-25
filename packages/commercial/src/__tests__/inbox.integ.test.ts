@@ -477,10 +477,19 @@ describe("inbox DB ops (integ)", () => {
 
   test("adminListInbox read_count / recipients", async (t) => {
     if (skipIfNoPg(t)) return;
-    const m1 = await createInboxMessage(admin, { audience: "all", title: "a1", body_md: "x" });
+    const m1 = await createInboxMessage(admin, {
+      audience: "all", title: "a1", body_md: "x", category: "marketing",
+    });
     const m2 = await createInboxMessage(admin, {
       audience: "user", user_id: alice.toString(), title: "a2", body_md: "x",
+      category: "automation",
     });
+    await query(
+      `UPDATE inbox_messages
+          SET thread_key=$2,source_type='cron_delivery',source_id=$3,source_phase='delivery-1'
+        WHERE id=$1`,
+      [m2.id, `cron:user:${alice.toString()}`, alice.toString()],
+    );
     await markRead(alice, m1.id);
     await markRead(bob, m1.id);
     await markRead(alice, m2.id);
@@ -491,8 +500,19 @@ describe("inbox DB ops (integ)", () => {
     assert.equal(byId.get(m1.id)!.read_count, 2);
     assert.equal(byId.get(m2.id)!.read_count, 1);
     assert.equal(byId.get(m2.id)!.recipients, 1);
+    assert.equal(byId.get(m2.id)!.category, "automation");
+    assert.equal(byId.get(m2.id)!.thread_key, `cron:user:${alice.toString()}`);
+    assert.equal(byId.get(m2.id)!.thread_count, 1);
+    assert.equal(byId.get(m2.id)!.source_type, "cron_delivery");
     // recipients='all' 至少应该有 admin/alice/bob 3 个 active
     assert.ok(byId.get(m1.id)!.recipients >= 3);
+
+    const filtered = await adminListInbox({ limit: 10, category: "automation" });
+    assert.equal(filtered.total, 1);
+    assert.deepEqual(
+      filtered.messages.map((message) => message.id),
+      [m2.id],
+    );
   });
 
   test("JWT 用户在 DB 中不存在 → 看不到任何广播(失败闭合)", async (t) => {

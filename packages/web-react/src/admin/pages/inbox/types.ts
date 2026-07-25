@@ -4,6 +4,7 @@ import { INBOX_LEVEL_META, type InboxLevelTone } from "../../../lib/inboxLevels"
 
 export type InboxAudience = "all" | "user";
 export type InboxLevel = "info" | "notice" | "promo" | "warning";
+export type InboxCategory = "user" | "automation" | "billing" | "operations" | "marketing";
 export type EmailSendStatus = "queued" | "done" | "partial" | "interrupted";
 
 export interface EmailSummary {
@@ -30,6 +31,12 @@ export interface InboxMessage {
   email_send_status: EmailSendStatus | null;
   email_sent_at: string | null;
   email_summary: EmailSummary | null;
+  category: InboxCategory;
+  thread_key: string | null;
+  thread_count: number;
+  source_type: string | null;
+  source_id: string | null;
+  source_phase: string | null;
 }
 
 export interface MessagesResp {
@@ -47,6 +54,7 @@ export interface CreateMessagePayload {
   title: string;
   body_md: string;
   level: InboxLevel;
+  category?: InboxCategory;
   user_id?: string;
   expires_at?: string;
   notify_email?: boolean;

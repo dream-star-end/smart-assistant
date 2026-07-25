@@ -886,8 +886,15 @@ describe('marketplaceDb (integ)', () => {
     const { versionId } = await publishSkillVersion(buildPublish('removable', owner))
     await reviewVersion({ versionId, reviewerUserId: admin, approve: true })
     await installApprovedVersion({ userId: installer, versionId })
-    assert.equal(await recordUninstall(installer, 'removable'), true)
+    assert.equal(await recordUninstall(installer, 'removable', 'missing_capability'), true)
     assert.equal((await listInstalled(installer)).length, 0)
+    const uninstall = await query<{ uninstall_reason: string | null }>(
+      `SELECT uninstall_reason
+         FROM marketplace_installs
+        WHERE user_id=$1 AND uninstalled_at IS NOT NULL`,
+      [installer],
+    )
+    assert.deepEqual(uninstall.rows, [{ uninstall_reason: 'missing_capability' }])
     // idempotent: a second uninstall reports no active row
     assert.equal(await recordUninstall(installer, 'removable'), false)
   })

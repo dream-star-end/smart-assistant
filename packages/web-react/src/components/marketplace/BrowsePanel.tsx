@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
+import { reportClientFriction } from "../../lib/clientFriction";
 import {
   benchmarkBadgeLabel,
   formatInstallCount,
@@ -226,6 +227,17 @@ export function BrowsePanel({
       try {
         const result = await api.searchMarketplace(auth, debouncedQ, kind);
         if (seq !== cardRequestSeq.current) return;
+        if (result.results.length > 0) {
+          reportClientFriction(
+            {
+              surface: "marketplace",
+              stage: "catalog_exposure",
+              code: "CATALOG_EXPOSURE",
+              outcome: "succeeded",
+            },
+            auth.snapshot().token,
+          );
+        }
         // 信任服务端顺序:目录态已按 featured_rank/热度排好,搜索态是相关度排序。
         setCards(result.results);
       } catch (cause) {

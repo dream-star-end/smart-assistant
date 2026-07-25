@@ -37,6 +37,7 @@ const DERIVED_PLATFORM_SCOPE_TAXONOMY = {
   routing: 'performance',
   integration: 'plugin_ecosystem',
 } as const
+const DERIVED_CAPABILITY = /^auto_dream\.(platform|runtime|routing|integration)\.[0-9a-f]{32}$/
 const USER_ACTIONS = new Set([
   'memory.upsert',
   'memory.delete',
@@ -281,6 +282,7 @@ export interface AutoDreamOptimizerDeps {
     runId: string
     agentId: string
     findings: AutoDreamPlatformFinding[]
+    rawFindings: AutoDreamPlatformFinding[]
   }) => Promise<void>
   applyProposal: (input: {
     agentId: string
@@ -593,21 +595,18 @@ export class AutoDreamOptimizerService {
             }),
           )
           const mapFindings = dedupeFindings(completedMapResults.flatMap((row) => row.findings))
-          const mapFindingHashes = new Set(mapFindings.map((row) => row.evidenceHash))
-          const explicitFindings = [
-            ...mapFindings,
-            ...dedupeFindings(
-              synthesisResults
-                .flatMap((row) => row.findings)
-                .filter((row) => !mapFindingHashes.has(row.evidenceHash)),
-            ),
-          ]
+          const explicitFindings = dedupeFindings(synthesisResults.flatMap((row) => row.findings))
           const cleanFindings = dedupeFindings([
             ...explicitFindings,
             ...derivePlatformFindings(hydratedProposals, explicitFindings),
           ])
-          if (cleanFindings.length > 0) {
-            await this.deps.reportPlatformFindings({ runId, agentId, findings: cleanFindings })
+          if (cleanFindings.length > 0 || mapFindings.length > 0) {
+            await this.deps.reportPlatformFindings({
+              runId,
+              agentId,
+              findings: cleanFindings,
+              rawFindings: mapFindings,
+            })
           }
           const summary = [
             ...synthesisResults.map((row) => row.summary).filter(Boolean),
@@ -1222,10 +1221,13 @@ function sanitizePlatformFinding(entry: unknown): AutoDreamPlatformFinding {
   const item = entry as Record<string, unknown>
   const taxonomy = boundedString(item.taxonomy, 40)
   if (!PLATFORM_TAXONOMY.has(taxonomy)) throw new Error('AUTO_DREAM_PLATFORM_TAXONOMY_INVALID')
-  const capabilityId = boundedString(item.capabilityId, 96)
-  if (!/^[a-z0-9][a-z0-9._-]{0,95}$/.test(capabilityId)) {
+  const rawCapabilityId = boundedString(item.capabilityId, 96).toLowerCase()
+  if (!/^[a-z0-9][a-z0-9._-]{0,95}$/.test(rawCapabilityId)) {
     throw new Error('AUTO_DREAM_PLATFORM_CAPABILITY_INVALID')
   }
+  const capabilityId = DERIVED_CAPABILITY.test(rawCapabilityId)
+    ? rawCapabilityId
+    : rawCapabilityId.replace(/[._-]+/g, '.')
   const severity = boundedString(item.severity, 10)
   if (!['low', 'medium', 'high'].includes(severity)) {
     throw new Error('AUTO_DREAM_PLATFORM_SEVERITY_INVALID')

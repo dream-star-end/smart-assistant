@@ -6,7 +6,9 @@ import {
   ChartCard,
   CopyChip,
   DataTable,
+  FilterBar,
   SectionCard,
+  SelectFilter,
   StatCard,
   StatCardRow,
   TimeAgo,
@@ -17,6 +19,7 @@ import { adminGet, apiErrorMessage } from "../../lib/adminApi";
 import type {
   DownRatingRow,
   ModelRatingStat,
+  RatingBucket,
   ResponseRatingStats,
   ResponseRatingsResp,
 } from "./types";
@@ -29,11 +32,21 @@ function pct(rate: number | null): string {
 }
 
 /** 好评率 → 语义色：≥90% 绿，≥70% 黄，其余红；无样本灰。 */
-function rateTone(rate: number | null): "success" | "warning" | "danger" | "neutral" {
-  if (rate === null) return "neutral";
+function rateTone(
+  rate: number | null,
+  sampleNote?: "no_sample" | "small_sample" | "observed",
+): "success" | "warning" | "danger" | "neutral" {
+  if (rate === null || sampleNote === "small_sample" || sampleNote === "no_sample") return "neutral";
   if (rate >= 0.9) return "success";
   if (rate >= 0.7) return "warning";
   return "danger";
+}
+
+function interval(bucket: RatingBucket | undefined): string {
+  if (!bucket || bucket.ci95_low === null || bucket.ci95_high === null) return "无可用区间";
+  return `95% CI ${pct(bucket.ci95_low)}–${pct(bucket.ci95_high)}${
+    bucket.sample_note === "small_sample" ? " · 样本较少" : ""
+  }`;
 }
 
 /**
@@ -52,6 +65,7 @@ export function ResponseRatings() {
   });
   const [done, setDone] = useState(false);
   const [source, setSource] = useState<DownRatingSource>("explicit");
+  const [traffic, setTraffic] = useState("production_user");
   const requestSeqRef = useRef(0);
 
   const fetchPage = useCallback(async (isFirst: boolean) => {
@@ -71,6 +85,7 @@ export function ResponseRatings() {
         before_created_at: isFirst ? undefined : cursorRef.current.createdAt,
         before_id: isFirst ? undefined : cursorRef.current.id,
         source,
+        traffic_class: traffic,
       });
       if (requestSeq !== requestSeqRef.current) return;
       if (isFirst) setStats(resp.stats);
@@ -87,7 +102,7 @@ export function ResponseRatings() {
         setLoadingMore(false);
       }
     }
-  }, [source]);
+  }, [source, traffic]);
 
   useEffect(() => {
     void fetchPage(true);
@@ -135,7 +150,12 @@ export function ResponseRatings() {
       title: "好评率",
       align: "right",
       width: 96,
-      render: (m) => <Badge tone={rateTone(m.up_rate)}>{pct(m.up_rate)}</Badge>,
+      render: (m) => (
+        <Badge tone={rateTone(m.up_rate, m.sample_note)} title={interval(m)}>
+          {pct(m.up_rate)}
+          {m.sample_note === "small_sample" ? " · 样本少" : ""}
+        </Badge>
+      ),
     },
   ];
 
@@ -179,6 +199,16 @@ export function ResponseRatings() {
       render: (r) => <span className="truncate text-[12px] text-muted">{r.username ?? "—"}</span>,
     },
     {
+      key: "traffic_class",
+      title: "流量",
+      width: 88,
+      render: (r) => (
+        <Badge tone={r.traffic_class === "production_user" ? "success" : "neutral"}>
+          {r.traffic_class === "production_user" ? "真实用户" : r.traffic_class}
+        </Badge>
+      ),
+    },
+    {
       key: "trace_id",
       title: "trace",
       width: 130,
@@ -203,13 +233,27 @@ export function ResponseRatings() {
 
   return (
     <div className="flex flex-col gap-4">
+      <FilterBar>
+        <SelectFilter
+          label="流量"
+          value={traffic}
+          options={[
+            { label: "真实用户", value: "production_user" },
+            { label: "全部流量", value: "all" },
+            { label: "内部管理员", value: "internal_admin" },
+            { label: "合成灰度", value: "synthetic_canary" },
+            { label: "E2E", value: "e2e" },
+          ]}
+          onChange={setTraffic}
+        />
+      </FilterBar>
       <StatCardRow>
         <StatCard
           label="总好评率"
           value={loading ? "…" : pct(overall?.up_rate ?? null)}
           icon={TrendingUp}
-          tone={rateTone(overall?.up_rate ?? null)}
-          hint={`共 ${overall?.total ?? 0} 条评分`}
+          tone={rateTone(overall?.up_rate ?? null, overall?.sample_note)}
+          hint={`${overall ? interval(overall) : "加载中"} · ${stats?.rating_users ?? 0} 位用户`}
           loading={loading}
         />
         <StatCard
@@ -230,8 +274,32 @@ export function ResponseRatings() {
           label="近 7 天好评率"
           value={loading ? "…" : pct(stats?.last_7d.up_rate ?? null)}
           icon={TrendingUp}
-          tone={rateTone(stats?.last_7d.up_rate ?? null)}
-          hint={`共 ${stats?.last_7d.total ?? 0} 条`}
+          tone={rateTone(stats?.last_7d.up_rate ?? null, stats?.last_7d.sample_note)}
+          hint={`${stats ? interval(stats.last_7d) : "加载中"} · ${stats?.last_7d.total ?? 0} 条`}
+          loading={loading}
+        />
+      </StatCardRow>
+      <StatCardRow>
+        <StatCard
+          label="30 天显式覆盖率"
+          value={loading ? "…" : pct(stats?.explicit_coverage.last_30d ?? null)}
+          icon={TrendingUp}
+          tone="neutral"
+          hint={`${stats?.last_30d.total ?? 0} 条评分 / ${stats?.completed_turns.last_30d ?? 0} 个完成 turn`}
+          loading={loading}
+        />
+        <StatCard
+          label="30 天隐式弱信号"
+          value={
+            loading
+              ? "…"
+              : stats?.implicit_per_100_completed_turns.last_30d == null
+                ? "—"
+                : `${stats.implicit_per_100_completed_turns.last_30d}/百 turn`
+          }
+          icon={ThumbsDown}
+          tone="neutral"
+          hint="不计入好评率，仅用于辅助判断"
           loading={loading}
         />
       </StatCardRow>

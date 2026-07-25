@@ -7,6 +7,7 @@ import { createMemoryAuthSession } from "../../lib/authSession";
 // api 网络层全 mock —— 只验证 BrowsePanel 的分区/筛选片行为,不打真实网络。
 const searchMarketplace = vi.fn();
 const listMarketplaceInstalled = vi.fn();
+const reportClientFriction = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/api", () => ({
   api: {
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
@@ -14,6 +15,7 @@ vi.mock("../../lib/api", () => ({
   },
   apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
 }));
+vi.mock("../../lib/clientFriction", () => ({ reportClientFriction }));
 vi.mock("./DetailModal", () => ({
   DetailModal: ({ slug, onClose }: { slug: string | null; onClose: () => void }) =>
     slug ? (
@@ -56,6 +58,14 @@ test("空查询渲染分区视图:平台精选 + 分类分区 + 未分类兜底"
   expect(await screen.findByRole("heading", { name: "平台精选" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "办公文档" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "数据分析" })).toBeInTheDocument();
+  expect(reportClientFriction).toHaveBeenCalledWith(
+    expect.objectContaining({
+      surface: "marketplace",
+      stage: "catalog_exposure",
+      outcome: "succeeded",
+    }),
+    "tok",
+  );
   // 无分类卡片进入「未分类」兜底分区
   expect(screen.getByRole("heading", { name: "未分类" })).toBeInTheDocument();
 });
@@ -103,6 +113,7 @@ test("空目录时给空态,不渲染分区/筛选片", async () => {
   render(<BrowsePanel auth={auth} />);
   expect(await screen.findByText("市场还没有上架的技能")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "全部" })).not.toBeInTheDocument();
+  expect(reportClientFriction).not.toHaveBeenCalled();
 });
 
 test("市场首次加载失败可原地重试并恢复目录", async () => {

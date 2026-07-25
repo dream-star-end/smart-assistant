@@ -83,6 +83,29 @@ describe('FeedbackTab', () => {
     expect(payload).not.toHaveProperty('request_id')
   })
 
+  test('默认附带当前会话定位 ID，取消勾选后不发送', async () => {
+    const context = { sessionId: 'session-42', requestId: 'trace-42' }
+    const view = render(<FeedbackTab auth={auth} userId="u1" context={context} />)
+    expect(screen.getByRole('checkbox', { name: /附带当前会话定位信息/ })).toBeChecked()
+    fireEvent.change(screen.getByLabelText('反馈内容'), { target: { value: '带定位反馈' } })
+    fireEvent.click(screen.getByRole('button', { name: '提交反馈' }))
+    await screen.findByRole('status')
+    expect(submitFeedback.mock.calls[0]?.[1]).toMatchObject({
+      sessionId: 'session-42',
+      requestId: 'trace-42',
+    })
+
+    submitFeedback.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: '再提一条' }))
+    view.rerender(<FeedbackTab auth={auth} userId="u1" context={context} />)
+    fireEvent.click(screen.getByRole('checkbox', { name: /附带当前会话定位信息/ }))
+    fireEvent.change(screen.getByLabelText('反馈内容'), { target: { value: '不带定位反馈' } })
+    fireEvent.click(screen.getByRole('button', { name: '提交反馈' }))
+    await waitFor(() => expect(submitFeedback).toHaveBeenCalledTimes(1))
+    expect(submitFeedback.mock.calls[0]?.[1]).not.toHaveProperty('sessionId')
+    expect(submitFeedback.mock.calls[0]?.[1]).not.toHaveProperty('requestId')
+  })
+
   test('10000 字符边界可提交，Textarea 同步限制最大长度', async () => {
     render(<FeedbackTab auth={auth} userId="u1" />)
     const input = screen.getByLabelText('反馈内容')

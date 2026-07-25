@@ -521,6 +521,8 @@ export type FeedbackSubmitInput =
       category: FeedbackCategory;
       description: string;
       version?: string;
+      requestId?: string;
+      sessionId?: string;
       meta: FeedbackEnvironment & { source: "settings" };
     }
   | {
@@ -1223,6 +1225,8 @@ export const api = {
                   category: input.category,
                   description: input.description,
                   ...(input.version ? { version: input.version } : {}),
+                  ...(input.requestId ? { request_id: input.requestId } : {}),
+                  ...(input.sessionId ? { session_id: input.sessionId } : {}),
                   meta: {
                     source: "settings",
                     ...(input.meta.locale ? { locale: input.meta.locale } : {}),
@@ -2814,13 +2818,24 @@ export const api = {
     ).then((b) => b.installed || []),
 
   /** 卸载（DELETE /api/marketplace/installed/:slug）。 */
-  uninstallMarketplace: (a: AuthSession, slug: string) =>
+  uninstallMarketplace: (
+    a: AuthSession,
+    slug: string,
+    reason:
+      | "not_needed"
+      | "poor_quality"
+      | "missing_capability"
+      | "install_error"
+      | "other"
+      | "prefer_not_say" = "prefer_not_say",
+  ) =>
     jsonOrThrow<{ ok: boolean }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/marketplace/installed/${encodeURIComponent(slug)}`, {
           method: "DELETE",
           credentials: "include",
-          headers: bearerHeaders(t),
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ reason }),
         }),
       ),
     ),

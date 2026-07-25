@@ -2690,7 +2690,17 @@ export async function updateInstalledAgentScope(
   })
 }
 
-export async function recordUninstall(userId: number, slug: string): Promise<boolean> {
+export async function recordUninstall(
+  userId: number,
+  slug: string,
+  reason:
+    | 'not_needed'
+    | 'poor_quality'
+    | 'missing_capability'
+    | 'install_error'
+    | 'other'
+    | 'prefer_not_say' = 'prefer_not_say',
+): Promise<boolean> {
   const located = await query<{ version_id: string; kind: ArtifactKind }>(
     `SELECT i.version_id::text, l.kind
        FROM marketplace_installs i
@@ -2803,8 +2813,10 @@ export async function recordUninstall(userId: number, slug: string): Promise<boo
         throw new MarketplaceError('INSTALL_CONFLICT', '请先在管理中心解绑该连接器的全部账号')
     }
     await query(
-      'UPDATE marketplace_installs SET uninstalled_at = NOW() WHERE id = $1',
-      [installId],
+      `UPDATE marketplace_installs
+          SET uninstalled_at = NOW(), uninstall_reason=$2
+        WHERE id = $1`,
+      [installId, reason],
       c,
     )
     if (listing.kind === 'agent') {
