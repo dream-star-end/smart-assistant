@@ -81,6 +81,45 @@ async function seedLegacyAgent(slug: string, owner: number): Promise<void> {
   await approvePlatformVersion(slug, '1.0.0', marketplaceArtifactHash(raw))
 }
 
+/** 模拟 Stage A 稳定版已批准的编程助手,用于验证升级与回滚重新指针。 */
+async function seedHistoricalCodingAssistant(owner: number): Promise<string> {
+  const manifest = {
+    name: '编程助手',
+    description: '编程助手历史版本',
+    tags: ['编程', '代码'],
+    version: '1.0.1',
+    model: 'kimi-k2.7-code',
+    toolsets: ['core'],
+    skillDeps: [],
+    persona: '你是编程助手。',
+  }
+  const raw = JSON.stringify(manifest)
+  const artifactHash = marketplaceArtifactHash(raw)
+  await publishSkillVersion({
+    slug: 'coding-assistant',
+    ownerUserId: owner,
+    version: manifest.version,
+    name: manifest.name,
+    description: manifest.description,
+    tags: manifest.tags,
+    rawSkillMd: null,
+    rawArtifact: raw,
+    manifest,
+    kind: 'agent',
+    artifactHash,
+    embeddingHash: skillContentHash({
+      name: manifest.name,
+      description: manifest.description,
+      tags: manifest.tags,
+    }),
+    riskFlags: [],
+    policyVersion: 1,
+    submittedBy: owner,
+  })
+  await approvePlatformVersion('coding-assistant', manifest.version, artifactHash)
+  return artifactHash
+}
+
 async function createAdmin(email: string): Promise<number> {
   const r = await query<{ id: string }>(
     "INSERT INTO users(email, password_hash, credits, role, status) VALUES ($1,'stub',0,'admin','active') RETURNING id::text AS id",
@@ -333,10 +372,10 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     assert.deepEqual(
       await listCurrentAgentDefaults(GENERAL_SLUGS),
       {
-        'coding-assistant': { version: '1.0.1', model: 'kimi-k2.7-code' },
+        'coding-assistant': { version: '1.0.2', model: 'glm-5.2' },
         'office-assistant': { version: '1.0.1', model: 'MiniMax-M3' },
       },
-      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 Kimi K2.7 Code)',
+      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 GLM-5.2 Coding Plan)',
     )
 
     // kind 隔离:通用 agent 不进 skill 目录。
@@ -357,6 +396,55 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     assert.deepEqual(second.seeded, [], '第二次不应重复发布')
     assert.deepEqual(second.skipped.sort(), [...GENERAL_SLUGS].sort(), '第二次应全部 skip')
     assert.deepEqual(second.errors, [])
+  })
+
+  test('领导者重新 seed 会走完整幂等路径把 current 指回自身版本', async (t) => {
+    if (skip(t)) return
+    const admin = await createAdmin('admin@x.com')
+    const historicalHash = await seedHistoricalCodingAssistant(admin)
+    assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
+      'coding-assistant': { version: '1.0.1', model: 'kimi-k2.7-code' },
+    })
+
+    const upgraded = await seedPlatformGeneralAgents({ listPublicModels })
+    assert.deepEqual(upgraded.errors, [])
+    assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
+      'coding-assistant': { version: '1.0.2', model: 'glm-5.2' },
+    })
+
+    const versionsAfterUpgrade = await query<{ version: string; status: string }>(
+      `SELECT version, status
+         FROM marketplace_skill_versions
+        WHERE slug = 'coding-assistant'
+        ORDER BY version`,
+    )
+    assert.deepEqual(versionsAfterUpgrade.rows, [
+      { version: '1.0.1', status: 'approved' },
+      { version: '1.0.2', status: 'approved' },
+    ])
+
+    // 模拟另一 release 取得领导权并把共享 current 指向自己的版本；随后重新调用当前 release
+    // 的真实 seed 入口，覆盖 validate/scan/DUPLICATE_VERSION/approve 全链，而非直接重指回来。
+    await approvePlatformVersion('coding-assistant', '1.0.1', historicalHash)
+    assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
+      'coding-assistant': { version: '1.0.1', model: 'kimi-k2.7-code' },
+    })
+
+    const reacquired = await seedPlatformGeneralAgents({ listPublicModels })
+    assert.deepEqual(reacquired.errors, [])
+    assert.ok(reacquired.skipped.includes('coding-assistant'), '已存在版本应走 DUPLICATE 幂等分支')
+    assert.deepEqual(await listCurrentAgentDefaults(['coding-assistant']), {
+      'coding-assistant': { version: '1.0.2', model: 'glm-5.2' },
+    })
+    assert.equal(
+      (
+        await query<{ n: string }>(
+          "SELECT count(*)::text AS n FROM marketplace_skill_versions WHERE slug = 'coding-assistant'",
+        )
+      ).rows[0].n,
+      '2',
+      '重新 seed 只重指 current,两个不可变版本都应保留',
+    )
   })
 
   test('两条入口叠加:市场同时有科研助手 + 办公助手 + 编程助手(互不干扰)', async (t) => {
