@@ -1243,6 +1243,11 @@ export async function registerCommercial(
       warn: (m, meta) => rootLogger.warn(m, { subsys: "leaderBundle", meta }),
     },
   });
+  // 平台 preset 的 current_approved_version_id 是双 slot 共享 PG 状态，不能由 0% standby
+  // candidate 在进程启动时 eager 改写。真正的实现会在 pricing/marketplace 依赖装配完成后
+  // 赋给此闭包，并仅由 leadership acquire 路径 await；旧 slot 在 abort/rollback 后重新
+  // acquire 时也会按其 release 自带定义幂等重指 current，形成确定性补偿。
+  let seedPlatformAgentsForLeadership: () => Promise<void> = async () => {};
   // desired watch(5s 轮询缓存):lease 读 desired_leader_slot,控制口读 desired_control_slot。仅 v5 需要。
   let deployDesiredWatch: DesiredWatch | undefined;
   let leaderLease: LeaderLeaseController | undefined;
@@ -1263,7 +1268,10 @@ export async function registerCommercial(
       callbacks: {
         // BLOCKER 1:onAcquire=bundle start-all-or-fail;required 成员起不来 → start() reject →
         // lease step-down + onFatal(fail-stop)。onFence 返回 {drained,stuck};drained:false → lease fail-stop。
-        onAcquire: () => leaderBundle.start(),
+        onAcquire: async () => {
+          await leaderBundle.start();
+          await seedPlatformAgentsForLeadership();
+        },
         onFence: (reason) => {
           rootLogger.warn(`[leaderLease] fence → stopAndDrain bundle(${reason})`, { subsys: "leaderLease" });
           return leaderBundle.stopAndDrain();
@@ -2037,42 +2045,40 @@ export async function registerCommercial(
         identityRepo,
         runtimeRef: autoDreamOptimizerRuntimeRef,
       });
-      // 平台官方**科研** agent 的幂等 seed —— v5-native 露出(市场为 agent 露出单一权威,
-      // 不走 v3 seed/team)。**仅当 research_config 已开启时 seed**(关闭时科研能力本就 503,
-      // 避免装到只会报错的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只 log
-      // 不阻断启动;幂等,重启可反复跑。
-      void (async () => {
-        try {
-          const rc = await getResearchConfigPublic();
-          if (!rc.enabled) return;
-          const seeded = await seedPlatformResearchAgents({
-            listPublicModels: () => pricing.listPublic(),
-          });
-          console.log(
-            "[commercial] platform research agents seed:",
-            JSON.stringify(seeded),
-          );
-        } catch (err) {
-          console.error("[commercial] seedPlatformResearchAgents failed:", err);
-        }
-      })();
-      // 平台官方**通用** agent(办公助手 + 编程助手)的幂等 seed。能力全走容器内已就绪的
-      // 本地能力(办公:oc-docx/oc-slides/oc-xlsx/oc-pdf/mmx;编程:内置 Read/Edit/Bash/Grep
-      // + git/node/python),不依赖 research_config,故**无条件** seed;仍受 marketplaceAgentsEnabled
-      // 的 v5 渠道门控(v3 渠道 install/search 侧滤掉)。v3 不含本调用 → 不会 seed。fire-and-forget,幂等。
-      void (async () => {
-        try {
-          const seeded = await seedPlatformGeneralAgents({
-            listPublicModels: () => pricing.listPublic(),
-          });
-          console.log(
-            "[commercial] platform general agents seed:",
-            JSON.stringify(seeded),
-          );
-        } catch (err) {
-          console.error("[commercial] seedPlatformGeneralAgents failed:", err);
-        }
-      })();
+      // 平台 preset seed 会写双 slot 共享的 marketplace current 指针，必须跟随唯一
+      // leadership，而非 candidate process startup。初次 acquire / finalize 接管 / abort
+      // 后旧 slot re-acquire 都 await 同一幂等逻辑；单个 seed 仍沿用原 fail-soft 语义。
+      if (runtimeChannel === "v5") {
+        seedPlatformAgentsForLeadership = async () => {
+          // 平台官方**科研** agent：仅 research_config 开启时 seed。
+          try {
+            const rc = await getResearchConfigPublic();
+            if (rc.enabled) {
+              const seeded = await seedPlatformResearchAgents({
+                listPublicModels: () => pricing.listPublic(),
+              });
+              console.log(
+                "[commercial] platform research agents seed:",
+                JSON.stringify(seeded),
+              );
+            }
+          } catch (err) {
+            console.error("[commercial] seedPlatformResearchAgents failed:", err);
+          }
+          // 平台官方**通用** agent(办公助手 + 编程助手)：不依赖 research_config，无条件 seed。
+          try {
+            const seeded = await seedPlatformGeneralAgents({
+              listPublicModels: () => pricing.listPublic(),
+            });
+            console.log(
+              "[commercial] platform general agents seed:",
+              JSON.stringify(seeded),
+            );
+          } catch (err) {
+            console.error("[commercial] seedPlatformGeneralAgents failed:", err);
+          }
+        };
+      }
       // 声明式**默认连接器**(notion/feishu/github)的幂等 seed —— 走完整 securityApprove 审计
       // 路径落 security_approved,catalog 才有可绑连接器、用户/agent 才发现得到。无此调用则生产
       // 目录为空(整套端到端不成立)。fire-and-forget,失败只 log 不阻断启动;幂等,重启可反复跑。
@@ -5570,6 +5576,7 @@ export async function registerCommercial(
     leaderLease!.start();
   } else if (controlPlaneEnabled) {
     await leaderBundle.start();
+    await seedPlatformAgentsForLeadership();
   }
 
   return {
