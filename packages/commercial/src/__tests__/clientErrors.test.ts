@@ -47,6 +47,16 @@ describe("client friction normalization", () => {
     assert.equal(JSON.stringify(normalized).includes("DO_NOT_PERSIST"), false);
   });
 
+  test("keeps lowercase semantic error codes used by the browser contract", () => {
+    const normalized = normalizeClientFrictionReport({
+      surface: "chat",
+      stage: "recovery",
+      code: "context_too_long",
+      outcome: "failed",
+    }, "fallback");
+    assert.equal(normalized.code, "context_too_long");
+  });
+
   test("invalid tokens collapse to bounded defaults", () => {
     const normalized = normalizeClientFrictionReport({
       surface: "../../raw",

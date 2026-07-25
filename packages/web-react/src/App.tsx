@@ -2209,7 +2209,11 @@ export function App() {
             // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
             <MessageListSkeleton />
           ) : showEmpty ? (
-            <EmptyState agent={agent} onPick={send} onChangeAgent={() => setPickerOpen(true)} />
+            <EmptyState
+              agent={agent}
+              onPrefill={(text) => setComposerPrefill({ text, nonce: Date.now() })}
+              onChangeAgent={() => setPickerOpen(true)}
+            />
           ) : demo ? (
             <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
               {messages.map((m, i) =>

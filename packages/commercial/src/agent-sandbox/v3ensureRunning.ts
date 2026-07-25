@@ -63,7 +63,12 @@ import {
 } from "../compute-pool/nodeScheduler.js";
 import { DataHostUnavailableError, NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
 import { getHostById, setQuarantined } from "../compute-pool/queries.js";
-import { hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
+import {
+  dialTunnelSocket,
+  hostRowToTarget,
+  type NodeAgentTarget,
+  type TunnelDialOptions,
+} from "../compute-pool/nodeAgentClient.js";
 import { promoteOnce } from "../compute-pool/imagePromote.js";
 import { observeContainerEnsureDuration } from "../admin/metrics.js";
 import { isV5Channel } from "../runtimeChannel.js";
@@ -160,21 +165,114 @@ export function classifyRuntimeArtifactFailure(
       return null;
   }
 }
-const V5_STALE_IMAGE_IDLE_MS = 30 * 60_000;
 const V5_RECYCLE_DRAIN_TIMEOUT_MS = 1_500;
 
 export type RuntimeRecycleDrainResult = "accepted" | "busy" | "failed";
 
+export interface RuntimeRecycleDrainRequestOptions {
+  resolveTarget?: (hostId: string) => Promise<NodeAgentTarget>;
+  dialTunnel?: (options: TunnelDialOptions) => ReturnType<typeof dialTunnelSocket>;
+}
+
+function readRuntimeRecycleStatus(
+  socket: NodeJS.EventEmitter & { destroy(): void },
+  timeoutMs: number,
+): Promise<number | null> {
+  return new Promise((resolve) => {
+    let buf = "";
+    let settled = false;
+    const done = (status: number | null): void => {
+      if (settled) return;
+      settled = true;
+      socket.removeListener("data", onData);
+      socket.removeListener("error", onError);
+      socket.removeListener("close", onClose);
+      clearTimeout(timer);
+      resolve(status);
+    };
+    const onData = (chunk: Buffer): void => {
+      buf += chunk.toString("utf8");
+      const newline = buf.indexOf("\r\n");
+      if (newline < 0) {
+        if (buf.length > 16 * 1024) done(null);
+        return;
+      }
+      const match = /^HTTP\/\d\.\d (\d{3}) /.exec(buf.slice(0, newline));
+      done(match ? Number.parseInt(match[1]!, 10) : null);
+    };
+    const onError = (): void => done(null);
+    const onClose = (): void => done(null);
+    const timer = setTimeout(() => done(null), timeoutMs);
+    socket.on("data", onData);
+    socket.on("error", onError);
+    socket.on("close", onClose);
+  });
+}
+
 /** Authenticated v5 host→container turn-drain handshake. */
-export function requestRuntimeRecycleDrain(
+export async function requestRuntimeRecycleDrain(
   deps: V3SupervisorDeps,
   status: V3ContainerStatus,
   timeoutMs = V5_RECYCLE_DRAIN_TIMEOUT_MS,
+  options: RuntimeRecycleDrainRequestOptions = {},
 ): Promise<RuntimeRecycleDrainResult> {
   const bridgeSecret = deps.bridgeSecret;
-  if (!bridgeSecret || isRemoteHost(status.hostId, deps.selfHostId)) {
-    return Promise.resolve("failed");
+  if (!bridgeSecret) return "failed";
+
+  if (isRemoteHost(status.hostId, deps.selfHostId)) {
+    const resolveTarget = options.resolveTarget ?? defaultResolveBridgeTunnelTarget;
+    const dialTunnel = options.dialTunnel ?? dialTunnelSocket;
+    let target: NodeAgentTarget | null = null;
+    let socket: Awaited<ReturnType<typeof dialTunnelSocket>> | null = null;
+    let pendingDial: ReturnType<typeof dialTunnelSocket> | null = null;
+    let connectTimer: NodeJS.Timeout | null = null;
+    try {
+      target = await resolveTarget(status.hostId as string);
+      pendingDial = dialTunnel({
+        target,
+        method: "POST",
+        containerInternalId: status.dockerContainerId,
+        pathAndQuery: `/internal/v3/runtime-recycle-drain?port=${V3_CONTAINER_PORT}`,
+        headers: {
+          "x-openclaude-container-id": String(status.containerId),
+          "x-openclaude-inbound-nonce": computeInboundNonce(
+            bridgeSecret,
+            status.containerId,
+          ),
+          "content-length": "0",
+        },
+        connectTimeoutMs: timeoutMs,
+      });
+      socket = await Promise.race([
+        pendingDial,
+        new Promise<never>((_, reject) => {
+          connectTimer = setTimeout(
+            () => reject(new Error("runtime recycle tunnel connect timeout")),
+            timeoutMs,
+          );
+        }),
+      ]);
+      const code = await readRuntimeRecycleStatus(socket, timeoutMs);
+      if (code === 200) return "accepted";
+      if (code === 409) return "busy";
+      return "failed";
+    } catch {
+      // dialTunnelSocket 的底层 TLS 目前有独立上限。外层预算先返回 warm reuse；
+      // 若迟到 socket 最终建立，立即销毁，绝不让超时握手悬挂或被后续复用。
+      if (!socket && pendingDial) {
+        void pendingDial.then(
+          (lateSocket) => { try { lateSocket.destroy(); } catch { /* */ } },
+          () => {},
+        );
+      }
+      return "failed";
+    } finally {
+      if (connectTimer) clearTimeout(connectTimer);
+      try { socket?.destroy(); } catch { /* */ }
+      try { target?.psk?.fill(0); } catch { /* */ }
+    }
   }
+
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result: RuntimeRecycleDrainResult): void => {
@@ -493,7 +591,6 @@ export function makeV3EnsureRunning(
   const resolveBridgeTunnelTarget =
     options.resolveBridgeTunnelTarget ?? defaultResolveBridgeTunnelTarget;
   const drainRuntime = options.requestRuntimeRecycleDrain ?? requestRuntimeRecycleDrain;
-  const wallNow = options.now ?? Date.now;
   const applyV5StalePolicy = options.runtimeChannelForTest
     ? options.runtimeChannelForTest === "v5"
     : isV5Channel();
@@ -553,7 +650,8 @@ export function makeV3EnsureRunning(
     // boot_hash 任一 != desired → 视作过期,不复用,落到下方 (2b) stopAndRemove + 用 deps.image +
     // 当前 tuple 重建。根治"存量长活容器一直跑旧镜像/旧源码/旧 entrypoint-seed,要等 idle 回收
     // 或 crash 才换新版"的问题。desired 三元组全空(v3 常态)→ 退化为旧 tag imageStale,行为同旧。
-    // 既有 v5 drain / 最近活跃延迟状态机**不动**,只换判定输入(imageStale → runtimeStale)。
+    // v5 只以 turn-drain 结果决定是否回收:WS 最近有活动不等于正在跑 turn,不能让长连
+    // 用户永久停在旧 runtime；drain 的 ingress/session/durable 三闸会保护真实在途工作。
     const runtimeStale = status
       ? computeRuntimeStale(status, deps, desiredRuntime)
       : { stale: false, reasons: [] as string[] };
@@ -563,20 +661,7 @@ export function makeV3EnsureRunning(
     if (runtimeStale.stale && applyV5StalePolicy) {
       const force = options.forceStaleImageRecycle
         ?? process.env.OC_V5_FORCE_STALE_IMAGE_RECYCLE === "1";
-      const lastActivityMs = status?.lastWsActivity?.getTime();
-      const recentlyActive =
-        !force &&
-        typeof lastActivityMs === "number" &&
-        wallNow() - lastActivityMs < V5_STALE_IMAGE_IDLE_MS;
-      if (recentlyActive) {
-        recycleStaleImage = false;
-        console.info("[v3ensureRunning] stale-image recycle deferred", {
-          uid,
-          reason: "recent_activity",
-          staleReasons: runtimeStale.reasons,
-          idleMs: Math.max(0, wallNow() - (lastActivityMs as number)),
-        });
-      } else if (!force && status) {
+      if (!force && status) {
         const drainResult = await drainRuntime(deps, status);
         if (drainResult !== "accepted") {
           recycleStaleImage = false;

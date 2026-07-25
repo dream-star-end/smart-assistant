@@ -43,6 +43,7 @@ export type FunnelStats = {
   verified: number
   first_topup: number
   first_request: number
+  first_success: number
   eligible_for_d1: number
   eligible_for_d7: number
   d1_retained: number

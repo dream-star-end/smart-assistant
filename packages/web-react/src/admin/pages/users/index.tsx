@@ -333,7 +333,7 @@ export default function UsersPage() {
         </h2>
         <RangePreset value={funnelDays} onChange={setFunnelDays} />
       </div>
-      <StatCardRow className="lg:grid-cols-6">
+      <StatCardRow className="lg:grid-cols-7">
         <FunnelKpi
           label="cohort 总数"
           value={funnel.data?.cohort_total}
@@ -359,6 +359,13 @@ export default function UsersPage() {
           value={funnel.data?.first_request}
           of={funnel.data?.cohort_total}
           loading={funnel.loading && !funnel.data}
+        />
+        <FunnelKpi
+          label="首次成功"
+          value={funnel.data?.first_success}
+          of={funnel.data?.cohort_total}
+          loading={funnel.loading && !funnel.data}
+          tone="success"
         />
         <RetentionKpi
           label="D1 留存"
@@ -530,23 +537,23 @@ function FunnelChart({
     ref,
     (t) =>
       barConfig(t, {
-        labels: ['cohort 总数', '已验证', '首次充值', '首次请求'],
+        labels: ['cohort 总数', '已验证', '首次请求', '首次成功'],
         series: [
           {
             label: `最近 ${days} 天`,
             data: [
               data?.cohort_total ?? 0,
               data?.verified ?? 0,
-              data?.first_topup ?? 0,
               data?.first_request ?? 0,
+              data?.first_success ?? 0,
             ],
           },
         ],
       }),
-    [data?.cohort_total, data?.verified, data?.first_topup, data?.first_request, loading, error],
+    [data?.cohort_total, data?.verified, data?.first_request, data?.first_success, loading, error],
   )
   return (
-    <ChartCard title="转化漏斗" hint={`最近 ${days} 天 · cohort → 验证 → 充值 → 请求`} height={220}>
+    <ChartCard title="激活漏斗" hint={`最近 ${days} 天 · cohort → 验证 → 请求 → 成功结果`} height={220}>
       {loading ? (
         <div className="h-full w-full animate-pulse rounded-lg bg-hover" />
       ) : error ? (

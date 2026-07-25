@@ -206,6 +206,12 @@ export const MAIN_AGENT: Agent = {
   icon: Sparkles,
   grad: 'from-emerald-500 to-teal-600',
   description: '通用全能智能体，内置工具齐全，可随时从市场加装技能与更多智能体。',
+  starters: [
+    '帮我查清一个问题，并列出可靠来源',
+    '把这段内容改得更清晰、专业',
+    '帮我把一个目标拆成可执行的步骤',
+    '分析我上传的文件，提炼重点和待办',
+  ],
   isDefault: true,
   installed: true,
   ready: true,
