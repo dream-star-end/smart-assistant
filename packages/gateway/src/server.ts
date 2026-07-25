@@ -76,7 +76,7 @@ import {
   type PromptQueueSessionContext,
   type PromptQueueTurnLifecycle,
 } from './promptQueueCoordinator.js'
-import type { PromptQueueExecutionFence } from './sessionManager.js'
+import type { AgentSession, PromptQueueExecutionFence } from './sessionManager.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
@@ -9392,6 +9392,26 @@ export class Gateway {
     }
   }
 
+  /**
+   * A synchronous delegate_task keeps every ancestor runner blocked inside the
+   * tool call. Raw child adapter activity is therefore real liveness for the
+   * complete delegate subtree, even though it is not parent stdout. Refresh the
+   * existing ancestor sessions only; a genuinely silent subtree still reaches
+   * the normal idle watchdog.
+   */
+  private _markDelegateAncestorActivity(parentSessionKey: string | undefined): void {
+    const seen = new Set<string>()
+    const now = Date.now()
+    let sessionKey = parentSessionKey
+    for (let depth = 0; sessionKey && depth < 5 && !seen.has(sessionKey); depth++) {
+      seen.add(sessionKey)
+      const ancestor = this.sessions.getByKey(sessionKey)
+      if (!ancestor) return
+      ancestor.runner.lastActivityAt = Math.max(ancestor.runner.lastActivityAt, now)
+      sessionKey = ancestor.parentSessionKey
+    }
+  }
+
   private _interruptDelegationsForParent(
     parentSessionKey: string,
     visited = new Set<string>(),
@@ -9797,7 +9817,8 @@ export class Gateway {
     const durableRuntimeEvents: DurableRuntimeEvent[] = []
     const durableEngineBillings: DurableCodexBilling[] = []
     const durableGoalUsageRecords: DurableGoalUsageRecord[] = []
-    let session
+    let session: AgentSession
+    let detachAncestorActivity: (() => void) | undefined
     try {
       session = await this.sessions.getOrCreate({
         sessionKey,
@@ -9827,6 +9848,10 @@ export class Gateway {
       session._platformGoal = delegateParent?.platformGoal
         ? structuredClone(delegateParent.platformGoal)
         : null
+      const handleChildActivity = () =>
+        this._markDelegateAncestorActivity(delegateParent?.sessionKey)
+      session.runner.on?.('activity', handleChildActivity)
+      detachAncestorActivity = () => session.runner.off?.('activity', handleChildActivity)
       // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
       session.progressRunId = progressRunId
       if (streamProgress) {
@@ -10074,6 +10099,7 @@ export class Gateway {
       this._runLog.complete(_dlgRun, { status: 'failed', error })
     } finally {
       clearTimeoutTimer()
+      detachAncestorActivity?.()
       // F4:委派子会话 bg bash 的后终态 tail 经 per-session 串行链**异步**持久化,其入
       // _durableDelegateRuntimeEvents 收集器发生在持久化 acked|queued **之后**;下方
       // 摘取该收集器构造 DurableAgentGroup 前,必须 await 该链(且在清收集器引用之前),

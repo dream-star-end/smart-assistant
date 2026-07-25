@@ -5720,15 +5720,9 @@ export function createPgSessionsBackend(
                 [input.uid, input.sessionId, input.recovery.sourceClientMessageId],
               )
             ).rows[0];
-            if (
-              !recoverableTapeError &&
-              !supportsAutomaticTurnRecovery(dispatchFailure?.failure_code ?? "")
-            ) {
-              return { kind: "recovery_conflict", reason: "source_not_recoverable" };
-            }
             const finalized = (
-              await client.query<{ tape_id: string; status: string }>(
-                `SELECT tape_id,status
+              await client.query<{ tape_id: string; status: string; waive_reason: string | null }>(
+                `SELECT tape_id,status,waive_reason
                    FROM client_session_turn_tapes
                   WHERE session_id=$1 AND user_id=$2
                     AND client_message_id=$3
@@ -5742,6 +5736,16 @@ export function createPgSessionsBackend(
                 ],
               )
             ).rows[0];
+            const recoverableFinalizedWaiver =
+              (finalized?.status === "crashed" || finalized?.status === "interrupted") &&
+              supportsAutomaticTurnRecovery(finalized.waive_reason ?? "");
+            if (
+              !recoverableTapeError &&
+              !supportsAutomaticTurnRecovery(dispatchFailure?.failure_code ?? "") &&
+              !recoverableFinalizedWaiver
+            ) {
+              return { kind: "recovery_conflict", reason: "source_not_recoverable" };
+            }
             if (finalized) {
               if (finalized.status !== "crashed" && finalized.status !== "interrupted") {
                 return { kind: "recovery_conflict", reason: "source_tape_completed" };
