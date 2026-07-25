@@ -738,6 +738,12 @@ function combineRetryAssistantOutput(
   }
 }
 
+const TRANSIENT_RETRY_ERROR_CODES = new Set([
+  'rate_limited',
+  'model_capacity',
+  'upstream_failed',
+])
+
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
 
@@ -3146,6 +3152,9 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      // Browser Stop must own the complete logical turn, including the gap
+      // between engine attempts while an automatic retry is backing off.
+      session._externalTurnAbort = logicalTurnAbort
       if (opts?.replayLifecycle) {
         replayLifecycleStarted = true
         session._runningClientMessageId = opts.replayLifecycle.clientMessageId
@@ -3546,6 +3555,9 @@ export class SessionManager {
           ) {
             session._runningClientMessageId = undefined
           }
+          if (session._externalTurnAbort === logicalTurnAbort) {
+            session._externalTurnAbort = undefined
+          }
           session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
           session._currentTurnKey = undefined
           session._currentDispatch = undefined
@@ -3595,7 +3607,6 @@ export class SessionManager {
     logicalTurnSignal?: AbortSignal,
   ): Promise<void> {
     const MAX_RETRIES = 3
-    const BASE_DELAY = 2000
     // PHANTOM_TURN 用独立计数器,不和 transient 共用 attempt budget。
     // 第 0 次 phantom → 重启子进程 + retry 1 次;第 1 次还是 phantom → 终态 error,不再重试。
     let phantomRetryUsed = false
@@ -3715,6 +3726,10 @@ export class SessionManager {
     // prepend them to the terminal attempt's snapshot.
     const retryRuntimeEvents: DurableRuntimeEvent[] = []
     const retryAssistantSegments: SegmentRecord[] = []
+    const retryThinkingSegments: SegmentRecord[] = []
+    const retryTools: TurnToolEntry[] = []
+    const retryStructuredBlocks: Array<Record<string, unknown>> = []
+    let retryInput = userTextOrBlocks
     const emitRetryStatus = (text: string, code: string): void => {
       const block: OutboundContentBlock = {
         kind: 'text',
@@ -3743,7 +3758,7 @@ export class SessionManager {
       try {
         await this._runOneTurn(
           session,
-          userTextOrBlocks,
+          retryInput,
           onEvent,
           requestId,
           traceId,
@@ -3756,9 +3771,13 @@ export class SessionManager {
           modelAuthority,
           retryRuntimeEvents,
           retryAssistantSegments,
+          retryThinkingSegments,
+          retryTools,
+          retryStructuredBlocks,
           queueLifecycle?.queueTurn === true,
           attempt < MAX_RETRIES,
           !phantomRetryUsed,
+          attempt < MAX_RETRIES,
         )
         return // success
       } catch (err: any) {
@@ -3832,9 +3851,12 @@ export class SessionManager {
         }
 
         // Only retry on transient errors (rate limit, server error, network)
-        const isTransient = /529|503|502|504|ECONNRESET|ETIMEDOUT|rate.limit|overloaded|AbortError|operation was aborted|timed?\s*out/i.test(msg)
+        const errorClass = classifyRunError(msg).code
+        const isTransient =
+          TRANSIENT_RETRY_ERROR_CODES.has(errorClass) ||
+          /AbortError|operation was aborted|timed?\s*out/i.test(msg)
         if (!isTransient || attempt >= MAX_RETRIES) throw err
-        const delay = BASE_DELAY * 2 ** attempt + Math.random() * 1000
+        const delay = this._transientRetryDelayMs(attempt)
         log.warn('transient error, retrying', {
           sessionKey: session.sessionKey,
           attempt: attempt + 1,
@@ -3847,9 +3869,16 @@ export class SessionManager {
           `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n`,
           'TRANSIENT_RETRY',
         )
+        // Match the only recovery action a user would take: continue the same
+        // engine session. Codex/CC own tool and conversation continuation.
+        retryInput = '继续'
         await waitForRetryDelay(delay, logicalTurnSignal)
       }
     }
+  }
+
+  private _transientRetryDelayMs(attempt: number): number {
+    return 2000 * 2 ** attempt + Math.random() * 1000
   }
 
   // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
@@ -3891,6 +3920,10 @@ export class SessionManager {
     retryRuntimeEvents: DurableRuntimeEvent[] = [],
     /** User-visible retry notices already emitted before this attempt. */
     retryAssistantSegments: SegmentRecord[] = [],
+    /** User-visible process from earlier transient attempts in this turn. */
+    retryThinkingSegments: SegmentRecord[] = [],
+    retryTools: TurnToolEntry[] = [],
+    retryStructuredBlocks: Array<Record<string, unknown>> = [],
     /** True only for a claimed PG queue turn; propagated to runner-local
      * backlog guards and never changes engine semantics. */
     queueTurn = false,
@@ -3898,6 +3931,8 @@ export class SessionManager {
     retryAuthErrors = true,
     /** Whether an empty phantom result may reject for its one clean-process try. */
     retryPhantomErrors = true,
+    /** Whether a normal transient error result may enter another attempt. */
+    retryTransientErrors = false,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -3988,6 +4023,15 @@ export class SessionManager {
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
       let observedFinalMeta: EngineFinalMeta | undefined
+      let terminalEngineBilling: EngineBillingEvent | undefined
+      let terminalBillingFlushed = false
+      const flushTerminalBilling = () => {
+        if (!terminalEngineBilling || terminalBillingFlushed) return
+        terminalBillingFlushed = true
+        const billing = structuredClone(terminalEngineBilling)
+        session._durableDelegateEngineBillings?.push(structuredClone(billing))
+        onEvent({ kind: 'codex_billing', ...billing })
+      }
       const handleEngineEvent = (e: EngineEvent) => {
         // CCB 私有 detected 事件(原 parser onToolUse/onToolResult 回调的升格形态):
         // cron 桥接 + tool.called 指标属 engine 中立编排,在此就地消费,**不进**
@@ -4088,15 +4132,13 @@ export class SessionManager {
       //     turnPermissionCount,phantom 判定不把 billing 当"输出"(旧语义)。
       //   - `!detached` guard:turn 已 idle/error 收尾后不再补发,防二次 settle。
       //   - CCB(billingMode:'proxy')永不 emit 'billing',本 listener 是 no-op。
-      let terminalEngineBilling: EngineBillingEvent | undefined
       const handleBilling = (b: EngineBillingEvent) => {
         if (detached) return
-        // The live bridge frame is only a latency optimization: its outbound
-        // ring is bounded and may be gone after a reconnect. Keep an exact
-        // immutable copy in the same turn tape before terminal persistence.
+        // Do not let a transient attempt's error billing claim the logical
+        // request before a later successful retry. finalize/partial persistence
+        // flushes exactly the one terminal attempt; the tape remains the
+        // durable fallback for a lost live frame.
         terminalEngineBilling = structuredClone(b)
-        session._durableDelegateEngineBillings?.push(structuredClone(b))
-        onEvent({ kind: 'codex_billing', ...b })
       }
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
@@ -4184,6 +4226,7 @@ export class SessionManager {
         partialPersistencePromise = (async () => {
           let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
           detach()
+          flushTerminalBilling()
           const snap = turn?.getPartialSnapshot() ?? {
             assistantText: '',
             thinkingText: '',
@@ -4204,6 +4247,20 @@ export class SessionManager {
             snap.assistantSegments,
             Date.now(),
           )
+          const partialThinking = combineRetryAssistantOutput(
+            retryThinkingSegments,
+            snap.thinkingText,
+            snap.thinkingSegments,
+            Date.now(),
+          )
+          const partialTools = [
+            ...retryTools.map((tool) => structuredClone(tool)),
+            ...snap.completedTools,
+          ]
+          const partialStructuredBlocks = [
+            ...retryStructuredBlocks.map((block) => structuredClone(block)),
+            ...structuredBlocks,
+          ]
           if (session._durableDelegateRuntimeEvents) {
             session._durableDelegateRuntimeEvents.push(
               ...terminalRuntimeEvents.map((event) => structuredClone(event)),
@@ -4225,7 +4282,9 @@ export class SessionManager {
                 ...(waiveReason ? { waiveReason } : {}),
                 ...(session._currentDispatch ? { dispatch: session._currentDispatch } : {}),
                 text: partialAssistant.text,
-                ...(snap.thinkingText.length > 0 ? { thinkingText: snap.thinkingText } : {}),
+                ...(partialThinking.text.length > 0
+                  ? { thinkingText: partialThinking.text }
+                  : {}),
                 status,
                 errorCode,
                 errorDetail: reason,
@@ -4238,15 +4297,17 @@ export class SessionManager {
                 }),
                 ...(requestId ? { requestId } : {}),
                 ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
-                ...(snap.completedTools.length > 0 ? { tools: snap.completedTools } : {}),
+                ...(partialTools.length > 0 ? { tools: partialTools } : {}),
                 ...(partialAssistant.segments.length > 0
                   ? { assistantSegments: partialAssistant.segments }
                   : {}),
-                ...(snap.thinkingSegments.length > 0
-                  ? { thinkingSegments: snap.thinkingSegments }
+                ...(partialThinking.segments.length > 0
+                  ? { thinkingSegments: partialThinking.segments }
                   : {}),
                 ...(partialAgentGroups.length > 0 ? { agentGroups: partialAgentGroups } : {}),
-                ...(structuredBlocks.length > 0 ? { structuredBlocks } : {}),
+                ...(partialStructuredBlocks.length > 0
+                  ? { structuredBlocks: partialStructuredBlocks }
+                  : {}),
                 runtimeEvents: terminalRuntimeEvents,
                 ...(terminalEngineBilling !== undefined
                   ? { engineBilling: terminalEngineBilling }
@@ -4407,6 +4468,54 @@ export class SessionManager {
             session.turns = prevTurns
             session._lastCcbCumulativeCost = prevLastCcbCost
             settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
+            return
+          }
+
+          const transientErrorClass =
+            result?.errorClass ?? classifyRunError(result?.errorDetail).code
+          if (
+            result?.isError &&
+            retryTransientErrors &&
+            TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass)
+          ) {
+            retryRuntimeEvents.push(
+              ...result.runtimeEvents.map((event) => structuredClone(event)),
+            )
+            const attemptAssistantSegments = result.assistantSegments.length > 0
+              ? result.assistantSegments
+              : result.assistantText.length > 0
+                ? [{ index: 0, text: result.assistantText, ts: Date.now() }]
+                : []
+            retryAssistantSegments.push(
+              ...attemptAssistantSegments.map((segment, index) => ({
+                ...segment,
+                index: retryAssistantSegments.length + index,
+              })),
+            )
+            const attemptThinkingSegments = result.thinkingSegments.length > 0
+              ? result.thinkingSegments
+              : result.thinkingText.length > 0
+                ? [{ index: 0, text: result.thinkingText, ts: Date.now() }]
+                : []
+            retryThinkingSegments.push(
+              ...attemptThinkingSegments.map((segment, index) => ({
+                ...segment,
+                index: retryThinkingSegments.length + index,
+              })),
+            )
+            retryTools.push(...result.tools.map((tool) => structuredClone(tool)))
+            retryStructuredBlocks.push(
+              ...structuredBlocks.map((block) => structuredClone(block)),
+            )
+            session.totalCostUSD = prevCostUSD
+            session.turns = prevTurns
+            session._lastCcbCumulativeCost = prevLastCcbCost
+            // The failed attempt is free and must not claim the shared
+            // request/turn identity before the terminal attempt.
+            terminalEngineBilling = undefined
+            settle(() => reject(new Error(
+              result.errorDetail ?? `${transientErrorClass}: transient model failure`,
+            )))
             return
           }
 
@@ -4575,12 +4684,27 @@ export class SessionManager {
           // Update session accumulators from turn result
           if (result) {
             terminalPersistenceClaim = 'complete'
+            flushTerminalBilling()
             const completedAssistant = combineRetryAssistantOutput(
               retryAssistantSegments,
               result.assistantText,
               result.assistantSegments,
               Date.now(),
             )
+            const completedThinking = combineRetryAssistantOutput(
+              retryThinkingSegments,
+              result.thinkingText,
+              result.thinkingSegments,
+              Date.now(),
+            )
+            const completedTools = [
+              ...retryTools.map((tool) => structuredClone(tool)),
+              ...result.tools,
+            ]
+            const completedStructuredBlocks = [
+              ...retryStructuredBlocks.map((block) => structuredClone(block)),
+              ...structuredBlocks,
+            ]
             session.totalInputTokens += result.usage.inputTokens
             session.totalOutputTokens += result.usage.outputTokens
             session.totalCacheReadTokens += result.usage.cacheReadTokens
@@ -4642,15 +4766,14 @@ export class SessionManager {
             // 死信 IO,所以由 MASTER_SINK_PERSIST_CHANNELS 拒。它们的 turn 跟踪走
             // sessions_meta / event_log 路径(已存在,不在本 if 内)。
             const completedHasAssistant = completedAssistant.text.length > 0
-            const completedHasThinking =
-              !!result.thinkingText && result.thinkingText.length > 0
+            const completedHasThinking = completedThinking.text.length > 0
             // Tools-only turn is rare but real: a turn that emits tool_use
             // blocks, runs them, and ends without producing further assistant
             // text or thinking. We still need to persist the tool snapshots
             // so refresh recovery has something to render. Without this,
             // tool rows would only land when assistantText|thinkingText is
             // also non-empty — losing the durability fix in the rare case.
-            const completedHasTools = !!result.tools && result.tools.length > 0
+            const completedHasTools = completedTools.length > 0
             // P2 债A — drain the leader session's buffered team cards. Drained
             // unconditionally (take-and-clear) so a completed turn never leaks
             // its delegations into the next turn's persist, even if the persist
@@ -4660,7 +4783,7 @@ export class SessionManager {
             // persists its team cards.
             const completedAgentGroups = this.drainPendingAgentGroups(session)
             const completedHasAgentGroups = completedAgentGroups.length > 0
-            const completedHasStructuredBlocks = structuredBlocks.length > 0
+            const completedHasStructuredBlocks = completedStructuredBlocks.length > 0
             const completedRuntimeEvents = [
               ...retryRuntimeEvents.map((event) => structuredClone(event)),
               ...result.runtimeEvents,
@@ -4689,7 +4812,7 @@ export class SessionManager {
             ) {
               const peerId = session.peerId
               const assistantText = completedAssistant.text
-              const thinkingText = result.thinkingText ?? ''
+              const thinkingText = completedThinking.text
               const turnIndex = session.turns
               // Phase 0.4 P1-3 (tightened): use `session.userId` directly when
               // we have it — this lets `appendServerAuthoredMessageDurable`
@@ -4762,17 +4885,19 @@ export class SessionManager {
                         'engine reported an error',
                     }
                   : {}),
-                ...(completedHasTools ? { tools: result.tools } : {}),
+                ...(completedHasTools ? { tools: completedTools } : {}),
                 // Fix B (2026-05-25) — per-segment durable rows. Plan §3.5.1.
                 ...(completedAssistant.segments.length > 0
                   ? { assistantSegments: completedAssistant.segments }
                   : {}),
-                ...(result.thinkingSegments.length > 0
-                  ? { thinkingSegments: result.thinkingSegments }
+                ...(completedThinking.segments.length > 0
+                  ? { thinkingSegments: completedThinking.segments }
                   : {}),
                 // P2 债A — team cards drained above.
                 ...(completedHasAgentGroups ? { agentGroups: completedAgentGroups } : {}),
-                ...(completedHasStructuredBlocks ? { structuredBlocks } : {}),
+                ...(completedHasStructuredBlocks
+                  ? { structuredBlocks: completedStructuredBlocks }
+                  : {}),
                 ...(completedHasRuntimeEvents ? { runtimeEvents: completedRuntimeEvents } : {}),
                 ...(terminalEngineBilling !== undefined
                   ? { engineBilling: terminalEngineBilling }
