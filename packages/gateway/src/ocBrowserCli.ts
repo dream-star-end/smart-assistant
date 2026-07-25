@@ -37,14 +37,14 @@ const SUBCOMMANDS: Record<string, SubcommandSpec> = {
   click: {
     tool: 'browser_click',
     flags: {
-      ref: { kind: 'string', required: true, arg: 'ref' },
+      ref: { kind: 'string', required: true, arg: 'target' },
       element: { kind: 'string', required: true, arg: 'element' },
     },
   },
   type: {
     tool: 'browser_type',
     flags: {
-      ref: { kind: 'string', required: true, arg: 'ref' },
+      ref: { kind: 'string', required: true, arg: 'target' },
       element: { kind: 'string', required: true, arg: 'element' },
       text: { kind: 'string', required: true, arg: 'text' },
       submit: { kind: 'boolean', arg: 'submit' },
@@ -263,13 +263,29 @@ export async function runOcBrowser(argv: string[]): Promise<OcBrowserCliResult> 
 }
 
 function formatResponse(res: OcBrowserResponse, asJson: boolean): OcBrowserCliResult {
+  const toolError = res.ok && isMcpToolError(res.result)
   if (asJson) {
-    return { exitCode: res.ok ? 0 : 1, stdout: `${JSON.stringify(res)}\n`, stderr: '' }
+    return {
+      exitCode: res.ok && !toolError ? 0 : 1,
+      stdout: `${JSON.stringify(res)}\n`,
+      stderr: '',
+    }
   }
   if (!res.ok) return { exitCode: 1, stdout: '', stderr: `oc-browser: ${res.error}\n` }
   // The daemon returns the MCP tool result; surface its text content for humans.
   const text = extractText(res.result)
+  if (toolError) {
+    return {
+      exitCode: 1,
+      stdout: '',
+      stderr: `oc-browser: ${text ?? JSON.stringify(res.result)}\n`,
+    }
+  }
   return { exitCode: 0, stdout: text ? `${text}\n` : `${JSON.stringify(res.result)}\n`, stderr: '' }
+}
+
+function isMcpToolError(result: unknown): boolean {
+  return !!result && typeof result === 'object' && (result as { isError?: unknown }).isError === true
 }
 
 function extractText(result: unknown): string | null {

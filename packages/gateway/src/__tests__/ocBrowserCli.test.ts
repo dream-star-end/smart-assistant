@@ -48,14 +48,14 @@ describe('parseOcBrowserCommand — tool/arg mapping', () => {
   it('click --ref --element', () => {
     const p = ok(['click', '--ref', 'e5', '--element', 'Submit button'])
     assert.equal(p.tool, 'browser_click')
-    assert.deepEqual(p.args, { ref: 'e5', element: 'Submit button' })
+    assert.deepEqual(p.args, { target: 'e5', element: 'Submit button' })
   })
   it('click missing --element → usage (2)', () =>
     assert.match(err(['click', '--ref', 'e5'], 2).message, /requires --element/))
 
   it('type with --submit boolean', () => {
     const p = ok(['type', '--ref', 'e1', '--element', 'box', '--text', 'hi', '--submit'])
-    assert.deepEqual(p.args, { ref: 'e1', element: 'box', text: 'hi', submit: true })
+    assert.deepEqual(p.args, { target: 'e1', element: 'box', text: 'hi', submit: true })
   })
   it('boolean flag given a value → usage (2)', () =>
     assert.match(
