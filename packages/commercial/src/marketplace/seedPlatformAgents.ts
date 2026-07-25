@@ -180,12 +180,11 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       description:
         '一站式编程助手:读懂现有代码库、规划并精确改动、跑测试/构建/lint 自我验证、定位并根治 bug、写测试与自审代码——从需求或报错到「验证通过的可用代码」,一个对话端到端完成。',
       tags: ['编程', '代码', '调试', '测试', 'code-review', '重构'],
-      // 1.0.1(2026-07-06):默认模型 glm-5.2 → kimi-k2.7-code(boss 指示)。kimi-k2.7-code 是
-      // 编程特化旗舰(火山 Agent Plan 托管,provider 'kimi',256k 窗,恒思考),多轮工具循环 e2e
-      // 已真机验证。**改 body 必须 bump version**:approvePlatformVersion 的 artifact hash
+      // 1.0.2(2026-07-25):kimi-k2.7-code 的火山 Agent Plan 订阅失效,切回火山 Coding Plan
+      // 的 glm-5.2。**改 body 必须 bump version**:approvePlatformVersion 的 artifact hash
       // 守卫会拒批同版本不同 body(DUPLICATE_VERSION 吞掉→hash 不一致→current 永不前移)。
-      version: '1.0.1',
-      model: 'kimi-k2.7-code',
+      version: '1.0.2',
+      model: 'glm-5.2',
       toolsets: ['core'],
       capabilities: [],
       skillDeps: [],
