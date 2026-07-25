@@ -11,6 +11,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateTeamCard.test.ts
  */
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
@@ -40,6 +41,8 @@ function makeGateway(opts: {
   buffered: Array<{ sessionKey: string; group: DurableAgentGroup }>
   directDelegate: any
   getOrCreateCalls: any[]
+  parentSession: any
+  childRunners: any[]
 } {
   const buffered: Array<{ sessionKey: string; group: DurableAgentGroup }> = []
   const getOrCreateCalls: any[] = []
@@ -51,6 +54,7 @@ function makeGateway(opts: {
     userId: '1',
     repoSessionId: undefined,
     _currentTurnKey: 'a'.repeat(64),
+    runner: { lastActivityAt: 1 },
   }
   const directDelegate = {
     sessionKey: DIRECT_DELEGATE_KEY,
@@ -65,6 +69,7 @@ function makeGateway(opts: {
     _durableDelegateTranscript: [] as unknown[],
     _durableDelegateRuntimeEvents: [] as unknown[],
     _durableDelegateEngineBillings: [] as unknown[],
+    runner: { lastActivityAt: 1 },
   }
   const gw = Object.create(Gateway.prototype) as any
   gw._shuttingDown = false
@@ -93,6 +98,7 @@ function makeGateway(opts: {
     ],
   })
   gw._runLog = { start: () => ({}), complete: () => {} }
+  const childRunners: any[] = []
   gw.sessions = {
     // F4 — 生产在此 flush 折叠链(drain 期把 acked|queued 的 tail 落进收集器);fake
     // 转调 opts.onFlushTailFolding(默认 no-op)。补上此方法后 server 的 F4 调用不再
@@ -109,15 +115,19 @@ function makeGateway(opts: {
     interrupt: () => false,
     getOrCreate: async (input: any) => {
       getOrCreateCalls.push(input)
+      const runner = Object.assign(new EventEmitter(), {
+        lastActivityAt: 1,
+        engineId: 'ccb',
+        interrupt: () => opts.onInterrupt?.(),
+        shutdown: async () => { await opts.onShutdown?.() },
+        waitForOutputDrain: async () => { await opts.onWaitForOutputDrain?.() },
+        sendPermissionResponse: () => {},
+      })
+      childRunners.push(runner)
       return {
         agentId: input.agent?.id ?? 'coding-assistant',
         currentTurnStatus: null,
-        runner: {
-          interrupt: () => opts.onInterrupt?.(),
-          shutdown: async () => { await opts.onShutdown?.() },
-          waitForOutputDrain: async () => { await opts.onWaitForOutputDrain?.() },
-          sendPermissionResponse: () => {},
-        },
+        runner,
       }
     },
     submit: opts.submit,
@@ -129,7 +139,7 @@ function makeGateway(opts: {
   }
   gw.delivered = [] as any[]
   gw.deliver = (out: any) => gw.delivered.push(out)
-  return { gw, buffered, directDelegate, getOrCreateCalls }
+  return { gw, buffered, directDelegate, getOrCreateCalls, parentSession, childRunners }
 }
 
 async function delegate(
@@ -158,6 +168,64 @@ function taskBody(extra: Record<string, unknown> = {}): Record<string, unknown> 
     ...extra,
   }
 }
+
+describe('handleDelegateTask — child activity keeps synchronous ancestors live', () => {
+  it('first-level child raw activity refreshes the webchat parent and listener is turn-scoped', async () => {
+    let releaseSubmit!: () => void
+    let markSubmitStarted!: () => void
+    const submitStarted = new Promise<void>((resolve) => { markSubmitStarted = resolve })
+    const submitGate = new Promise<void>((resolve) => { releaseSubmit = resolve })
+    const { gw, parentSession, childRunners } = makeGateway({
+      submit: async (_s, _p, onEvent) => {
+        markSubmitStarted()
+        await submitGate
+        onEvent({ kind: 'block', block: { kind: 'text', text: '完成' } })
+        onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+      },
+    })
+
+    const pending = delegate(gw, 'coding-assistant', taskBody())
+    await submitStarted
+    assert.equal(childRunners.length, 1)
+    childRunners[0].emit('activity')
+    assert.ok(parentSession.runner.lastActivityAt > 1, 'child activity must refresh root liveness')
+
+    releaseSubmit()
+    assert.equal((await pending).status, 200)
+    assert.equal(childRunners[0].listenerCount('activity'), 0, 'listener must detach at delegate end')
+    parentSession.runner.lastActivityAt = 7
+    childRunners[0].emit('activity')
+    assert.equal(parentSession.runner.lastActivityAt, 7, 'late child activity must not leak across turns')
+  })
+
+  it('nested child raw activity refreshes both direct delegate and webchat root', async () => {
+    let releaseSubmit!: () => void
+    let markSubmitStarted!: () => void
+    const submitStarted = new Promise<void>((resolve) => { markSubmitStarted = resolve })
+    const submitGate = new Promise<void>((resolve) => { releaseSubmit = resolve })
+    const { gw, parentSession, directDelegate, childRunners } = makeGateway({
+      nested: true,
+      submit: async (_s, _p, onEvent) => {
+        markSubmitStarted()
+        await submitGate
+        onEvent({ kind: 'block', block: { kind: 'text', text: '完成' } })
+        onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+      },
+    })
+
+    const pending = delegate(gw, 'researcher', taskBody({
+      sourceAgent: 'coding-assistant',
+      parentSessionKey: DIRECT_DELEGATE_KEY,
+    }))
+    await submitStarted
+    childRunners[0].emit('activity')
+    assert.ok(directDelegate.runner.lastActivityAt > 1, 'nested activity must refresh direct parent')
+    assert.ok(parentSession.runner.lastActivityAt > 1, 'nested activity must reach the webchat root')
+
+    releaseSubmit()
+    assert.equal((await pending).status, 200)
+  })
+})
 
 describe('handleDelegateTask — server-authored 团队卡 buffering (P2 债A)', () => {
   it('成功委派 → 收尾 buffer status "ok" + resultSummary=输出,挂到父 webchat 会话', async () => {

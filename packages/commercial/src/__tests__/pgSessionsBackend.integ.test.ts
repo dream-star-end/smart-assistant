@@ -3949,8 +3949,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     sessionId: string;
     sourceClientMessageId: string;
     automaticRecovery?: boolean;
+    inlineError?: boolean;
     record?: MessageLike;
     tapeStatus?: "completed" | "crashed" | "interrupted";
+    waiveReason?: "idle_timeout" | "turn_limit" | null;
   }): Promise<void> {
     const tapeId = sha256(`recoverable-tape\0${args.sessionId}\0${args.sourceClientMessageId}`);
     const turnKey = sha256(`recoverable-turn\0${args.sessionId}\0${args.sourceClientMessageId}`);
@@ -3968,20 +3970,33 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         },
       ] as MessageLike[],
     }));
-    await backend.appendServerAuthoredMessage(args.sessionId, CUSER, {
-      id: `err-${args.sourceClientMessageId}`,
-      role: "assistant",
-      text: "temporary upstream failure",
-      ts: 2,
-      _turnTapeId: tapeId,
-      _clientMessageId: args.sourceClientMessageId,
-      _errorCode: "upstream_failed",
-    });
+    await backend.appendServerAuthoredMessage(
+      args.sessionId,
+      CUSER,
+      args.inlineError === false
+        ? {
+            id: `anchor-${args.sourceClientMessageId}`,
+            role: "assistant",
+            ts: 2,
+            _turnTapeId: tapeId,
+            _turnTapeComplete: true,
+            _turnTapeRecordCount: 1,
+          }
+        : {
+            id: `err-${args.sourceClientMessageId}`,
+            role: "assistant",
+            text: "temporary upstream failure",
+            ts: 2,
+            _turnTapeId: tapeId,
+            _clientMessageId: args.sourceClientMessageId,
+            _errorCode: "upstream_failed",
+          },
+    );
     await pool.query(
       `INSERT INTO client_session_turn_tapes
          (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
-          total_bytes,part_count,created_at,finalized_at,client_message_id)
-       VALUES ($1,$2,$3,'main',1,$4,$5,$6,1,1,1,1,$7)`,
+          total_bytes,part_count,created_at,finalized_at,client_message_id,waive_reason)
+       VALUES ($1,$2,$3,'main',1,$4,$5,$6,1,1,1,1,$7,$8)`,
       [
         args.sessionId,
         CUSER,
@@ -3990,6 +4005,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         turnKey,
         sha256(tapeId),
         args.sourceClientMessageId,
+        args.waiveReason ?? null,
       ],
     );
     const record = args.record ?? {
@@ -4016,6 +4032,121 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       ],
     );
   }
+
+  maybe("lossless anchor recovery trusts interrupted tape waiver without hot error metadata", async () => {
+    const sessionId = "s-dd-recovery-lossless-waiver";
+    const sourceClientMessageId = "cm-dd-recovery-lossless-waiver";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      inlineError: false,
+      tapeStatus: "interrupted",
+      waiveReason: "idle_timeout",
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const recovered = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "manual checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: false,
+      },
+    }));
+    assert.equal(recovered.kind, "admitted");
+  });
+
+  maybe("lossless waiver recovery retains automatic checkpoint safety gate", async () => {
+    const sessionId = "s-dd-recovery-lossless-unsafe";
+    const sourceClientMessageId = "cm-dd-recovery-lossless-unsafe";
+    await seedRecoverableSource({
+      sessionId,
+      sourceClientMessageId,
+      inlineError: false,
+      tapeStatus: "interrupted",
+      waiveReason: "idle_timeout",
+      record: {
+        id: "tool-lossless-unsafe",
+        role: "tool",
+        text: "",
+        ts: 2,
+        _completed: false,
+      },
+    });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    assert.deepEqual(
+      await backend.admitUserTurn(admitInput({
+        sessionId,
+        clientMessageId: identity.clientMessageId,
+        billingRequestId: `brq-${identity.clientMessageId}`,
+        message: {
+          id: identity.clientMessageId,
+          role: "user",
+          text: "automatic checkpoint",
+          ts: 3,
+        } as MessageLike & { id: string },
+        recovery: {
+          sourceClientMessageId,
+          mode: "checkpoint",
+          automatic: true,
+        },
+      })),
+      {
+        kind: "recovery_conflict",
+        reason: "automatic_checkpoint_unsafe",
+      },
+    );
+  });
+
+  maybe("lossless tape waiver recovery rejects completed, missing, and non-recoverable waivers", async () => {
+    const cases = [
+      { suffix: "completed", tapeStatus: "completed" as const, waiveReason: "idle_timeout" as const },
+      { suffix: "missing", tapeStatus: "interrupted" as const, waiveReason: null },
+      { suffix: "turn-limit", tapeStatus: "interrupted" as const, waiveReason: "turn_limit" as const },
+    ];
+    for (const testCase of cases) {
+      const sessionId = `s-dd-recovery-lossless-${testCase.suffix}`;
+      const sourceClientMessageId = `cm-dd-recovery-lossless-${testCase.suffix}`;
+      await seedRecoverableSource({
+        sessionId,
+        sourceClientMessageId,
+        inlineError: false,
+        tapeStatus: testCase.tapeStatus,
+        waiveReason: testCase.waiveReason,
+      });
+      const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+      assert.deepEqual(
+        await backend.admitUserTurn(admitInput({
+          sessionId,
+          clientMessageId: identity.clientMessageId,
+          billingRequestId: `brq-${identity.clientMessageId}`,
+          message: {
+            id: identity.clientMessageId,
+            role: "user",
+            text: "must not run",
+            ts: 3,
+          } as MessageLike & { id: string },
+          recovery: {
+            sourceClientMessageId,
+            mode: "checkpoint",
+            automatic: false,
+          },
+        })),
+        {
+          kind: "recovery_conflict",
+          reason: "source_not_recoverable",
+        },
+        testCase.suffix,
+      );
+    }
+  });
 
   maybe("recovery admission atomically persists lineage and fences a second automatic hop", async () => {
     const sessionId = "s-dd-recovery";
