@@ -47,6 +47,12 @@ export interface InboxMessage {
 
 export interface InboxMessageView extends InboxMessage {
   read: boolean;
+  category: InboxCategory;
+  thread_key: string | null;
+  thread_count: number;
+  source_type: string | null;
+  source_id: string | null;
+  source_phase: string | null;
 }
 
 /** Plan C — 邮件群发状态汇总(jsonb).每条 inbox_messages 一份. */
@@ -191,6 +197,19 @@ export async function listMyInbox(input: ListMyInboxInput): Promise<ListMyInboxR
            m.created_by::text AS created_by,
            m.created_at,
            m.expires_at,
+           m.category,
+           m.thread_key,
+           CASE
+             WHEN m.thread_key IS NULL THEN 1
+             ELSE (
+               SELECT COUNT(*)::int
+                 FROM inbox_messages threaded
+                WHERE threaded.thread_key=m.thread_key
+             )
+           END AS thread_count,
+           m.source_type,
+           m.source_id::text AS source_id,
+           m.source_phase,
            (r.user_id IS NOT NULL) AS read
       FROM inbox_messages m
       LEFT JOIN inbox_message_reads r
@@ -211,6 +230,12 @@ export async function listMyInbox(input: ListMyInboxInput): Promise<ListMyInboxR
     created_by: string;
     created_at: Date;
     expires_at: Date | null;
+    category: InboxCategory;
+    thread_key: string | null;
+    thread_count: number;
+    source_type: string | null;
+    source_id: string | null;
+    source_phase: string | null;
     read: boolean;
   }>(listSql, [userId, limit, offset]);
 
@@ -236,6 +261,12 @@ export async function listMyInbox(input: ListMyInboxInput): Promise<ListMyInboxR
       created_at: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
       expires_at:
         row.expires_at instanceof Date ? row.expires_at.toISOString() : (row.expires_at as string | null),
+      category: row.category,
+      thread_key: row.thread_key,
+      thread_count: row.thread_count,
+      source_type: row.source_type,
+      source_id: row.source_id,
+      source_phase: row.source_phase,
       read: row.read === true,
     })),
     unread_count: countRes.rows[0]?.n ?? 0,

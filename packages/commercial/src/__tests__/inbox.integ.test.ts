@@ -757,6 +757,78 @@ describe("inbox HTTP (integ)", () => {
     assert.equal(((await c2.json()) as { unread_count: number }).unread_count, 0);
   });
 
+  test("GET /api/me/messages 返回用户侧分类和线程元数据", async (t) => {
+    if (skipIfNoPg(t) || !redis || !server) { t.skip("fixtures"); return; }
+    const first = await createInboxMessage(admin, {
+      audience: "user",
+      user_id: alice.toString(),
+      title: "automation-1",
+      body_md: "B1",
+      category: "automation",
+    });
+    const second = await createInboxMessage(admin, {
+      audience: "user",
+      user_id: alice.toString(),
+      title: "automation-2",
+      body_md: "B2",
+      category: "automation",
+    });
+    const normal = await createInboxMessage(admin, {
+      audience: "user",
+      user_id: alice.toString(),
+      title: "normal",
+      body_md: "B3",
+    });
+    const threadKey = `cron:user:${alice.toString()}`;
+    await query(
+      `UPDATE inbox_messages
+          SET thread_key=$2,
+              source_type='cron_delivery',
+              source_id=$3,
+              source_phase=CASE WHEN id=$1::bigint THEN 'delivery-1' ELSE 'delivery-2' END
+        WHERE id IN ($1::bigint, $4::bigint)`,
+      [first.id, threadKey, alice.toString(), second.id],
+    );
+    await markRead(alice, first.id);
+
+    const response = await fetch(`${baseUrl}/api/me/messages`, {
+      headers: { authorization: `Bearer ${aliceToken}` },
+    });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      messages: Array<{
+        id: string;
+        read: boolean;
+        category: string;
+        thread_key: string | null;
+        thread_count: number;
+        source_type: string | null;
+        source_id: string | null;
+        source_phase: string | null;
+      }>;
+      unread_count: number;
+    };
+    const byId = new Map(body.messages.map((message) => [message.id, message]));
+    for (const id of [first.id, second.id]) {
+      assert.equal(byId.get(id)!.category, "automation");
+      assert.equal(byId.get(id)!.thread_key, threadKey);
+      assert.equal(byId.get(id)!.thread_count, 2);
+      assert.equal(byId.get(id)!.source_type, "cron_delivery");
+      assert.equal(byId.get(id)!.source_id, alice.toString());
+    }
+    assert.equal(byId.get(first.id)!.source_phase, "delivery-1");
+    assert.equal(byId.get(second.id)!.source_phase, "delivery-2");
+    assert.equal(byId.get(first.id)!.read, true);
+    assert.equal(byId.get(second.id)!.read, false);
+    assert.equal(byId.get(normal.id)!.category, "user");
+    assert.equal(byId.get(normal.id)!.thread_key, null);
+    assert.equal(byId.get(normal.id)!.thread_count, 1);
+    assert.equal(byId.get(normal.id)!.source_type, null);
+    assert.equal(byId.get(normal.id)!.source_id, null);
+    assert.equal(byId.get(normal.id)!.source_phase, null);
+    assert.equal(body.unread_count, 2);
+  });
+
   test("POST /api/me/messages/:id/read 不可见 → 404", async (t) => {
     if (skipIfNoPg(t) || !redis || !server) { t.skip("fixtures"); return; }
     const bob = await makeUser(`bob-h-${Date.now()}@inbox.test`);
