@@ -253,6 +253,7 @@ export function historicalContextInjectionKey(opts: {
 export function buildHistoricalContextPrompt(
   messages: unknown[],
   currentUserText: string,
+  maxHistoryChars?: number,
 ): string | null {
   const currentNorm = normForCompare(currentUserText)
   const rows: Array<{ role: ModelHistorySemanticRole; text: string; status?: unknown }> = []
@@ -280,12 +281,23 @@ export function buildHistoricalContextPrompt(
   if (rows.length === 0) return null
   // Storage has already selected the exact contiguous semantic suffix against
   // the executable model context window (including the current prompt and a
-  // per-record envelope allowance). Do not apply a second row/character cap
-  // here: doing so silently discarded already-approved tool/plan/goal/delegate
-  // facts at the final runner boundary.
-  const body = rows
+  // per-record envelope allowance). The normal path does not apply a second
+  // cap here. maxHistoryChars is reserved for a provider-confirmed context
+  // rejection, where the same turn immediately retries with an exact suffix.
+  let body = rows
     .map((message) => `${modelHistoryRoleLabel(message.role)}: ${message.text}`)
     .join('\n\n')
+  if (
+    typeof maxHistoryChars === 'number' &&
+    Number.isSafeInteger(maxHistoryChars) &&
+    maxHistoryChars > 0 &&
+    body.length > maxHistoryChars
+  ) {
+    let start = body.length - maxHistoryChars
+    const first = body.charCodeAt(start)
+    if (first >= 0xdc00 && first <= 0xdfff && start > 0) start -= 1
+    body = `[Earlier history remains stored and can be retrieved when needed.]\n${body.slice(start)}`
+  }
   return [
     '<openclaude_previous_context>',
     'The current OpenClaude session was previously served by a different runner/provider or cannot be natively resumed. Use this transcript as prior conversation context. Do not restate it unless needed.',
@@ -3318,6 +3330,27 @@ export class SessionManager {
       const effectiveMasterHistoricalMessages = masterHistoricalMessages
         ? mergePendingExternalHistory(masterHistoricalMessages)
         : null
+      const contextOverflowHistoryChars = effectiveMasterHistoricalMessages?.reduce<number>(
+        (total, raw) => {
+          if (!raw || typeof raw !== 'object') return total
+          const msg = raw as ChatHistoryMessage
+          if (msg.system === true || !modelHistorySemanticRole(msg)) return total
+          return total + modelHistorySemanticText(msg).length
+        },
+        0,
+      ) ?? 0
+      const contextOverflowRetryInputs =
+        effectiveMasterHistoricalMessages &&
+        typeof userTextOrBlocks === 'string' &&
+        contextOverflowHistoryChars > 0
+          ? [4, 16, 64]
+              .map((divisor) => buildHistoricalContextPrompt(
+                effectiveMasterHistoricalMessages,
+                userTextOrBlocks,
+                Math.max(1, Math.ceil(contextOverflowHistoryChars / divisor)),
+              ))
+              .filter((prompt): prompt is string => prompt !== null)
+          : []
       let providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag)
       const injectionKey = historicalContextInjectionKey({
         messages: effectiveMasterHistoricalMessages,
@@ -3454,6 +3487,7 @@ export class SessionManager {
         opts?.dispatchContext,
         opts?.queueLifecycle,
         logicalTurnAbort.signal,
+        contextOverflowRetryInputs,
       )
       try {
         await Promise.race([
@@ -3605,6 +3639,9 @@ export class SessionManager {
     /** Platform liveness/hard-limit cancellation for the complete logical
      * turn. This fence sits above individual EngineTurnRun generations. */
     logicalTurnSignal?: AbortSignal,
+    /** Fresh-thread prompts with progressively smaller exact history suffixes.
+     * Used only after a real Codex context-window rejection. */
+    contextOverflowRetryInputs: string[] = [],
   ): Promise<void> {
     const MAX_RETRIES = 3
     // PHANTOM_TURN 用独立计数器,不和 transient 共用 attempt budget。
@@ -3730,6 +3767,7 @@ export class SessionManager {
     const retryTools: TurnToolEntry[] = []
     const retryStructuredBlocks: Array<Record<string, unknown>> = []
     let retryInput = userTextOrBlocks
+    let contextOverflowRetryIndex = 0
     const emitRetryStatus = (text: string, code: string): void => {
       const block: OutboundContentBlock = {
         kind: 'text',
@@ -3850,8 +3888,32 @@ export class SessionManager {
           continue
         }
 
-        // Only retry on transient errors (rate limit, server error, network)
         const errorClass = classifyRunError(msg).code
+        // A full Codex native thread is recoverable: immediately rebuild it
+        // from a smaller exact master-history suffix. Surface progress to the
+        // user and do not add transient backoff latency.
+        if (
+          errorClass === 'context_too_long' &&
+          session.providerTag === 'codex' &&
+          attempt < MAX_RETRIES &&
+          contextOverflowRetryIndex < contextOverflowRetryInputs.length
+        ) {
+          contextOverflowRetryIndex += 1
+          retryInput = contextOverflowRetryInputs[contextOverflowRetryIndex - 1]!
+          log.warn('codex context window exhausted; rebuilding with smaller history', {
+            sessionKey: session.sessionKey,
+            attempt: contextOverflowRetryIndex,
+            maxRetries: MAX_RETRIES,
+            ...(traceId ? { traceId } : {}),
+          })
+          emitRetryStatus(
+            `\n\n🧭 会话上下文较长，正在整理历史并继续 (${contextOverflowRetryIndex}/${MAX_RETRIES})...\n`,
+            'CONTEXT_REBUILD_RETRY',
+          )
+          continue
+        }
+
+        // Only retry on transient errors (rate limit, server error, network)
         const isTransient =
           TRANSIENT_RETRY_ERROR_CODES.has(errorClass) ||
           /AbortError|operation was aborted|timed?\s*out/i.test(msg)
@@ -4473,10 +4535,39 @@ export class SessionManager {
 
           const transientErrorClass =
             result?.errorClass ?? classifyRunError(result?.errorDetail).code
+          const contextOverflowHasUsage =
+            result !== null &&
+            (
+              result.usage.cost !== 0 ||
+              result.usage.inputTokens !== 0 ||
+              result.usage.outputTokens !== 0 ||
+              result.usage.cacheReadTokens !== 0 ||
+              result.usage.cacheCreationTokens !== 0 ||
+              Object.values(terminalEngineBilling?.usage ?? {}).some(
+                (value) => typeof value === 'number' && value !== 0,
+              )
+            )
+          const contextOverflowIsSafeToRetry =
+            result !== null &&
+            transientErrorClass === 'context_too_long' &&
+            session.providerTag === 'codex' &&
+            turnBlockCount === 0 &&
+            turnPermissionCount === 0 &&
+            turnToolCallCount === 0 &&
+            structuredBlocks.length === 0 &&
+            result.assistantText.length === 0 &&
+            result.thinkingText.length === 0 &&
+            result.assistantSegments.length === 0 &&
+            result.thinkingSegments.length === 0 &&
+            result.tools.length === 0 &&
+            !contextOverflowHasUsage
           if (
             result?.isError &&
             retryTransientErrors &&
-            TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass)
+            (
+              TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass) ||
+              contextOverflowIsSafeToRetry
+            )
           ) {
             retryRuntimeEvents.push(
               ...result.runtimeEvents.map((event) => structuredClone(event)),

@@ -5108,6 +5108,38 @@ describe("pgSessionsBackend direct turn timeline", () => {
     await assertSafeSidecars();
   });
 
+  maybe("Codex rebuilt history budgets dense ASCII at its byte-level worst case", async () => {
+    const sessionId = "s-direct-codex-history-safety";
+    const userId = "u-direct-codex-history-safety";
+    const exactTail = "CODEX-HISTORY-TAIL";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const tape = directTape(sessionId, "9".repeat(64), {
+      text: "final answer",
+      tools: [{
+        blockId: "dense-ascii-tool",
+        toolName: "Bash",
+        inputJson: { command: "cat dense.json" },
+        output: `DENSE-HEAD-${"x".repeat(40_000)}-${exactTail}`,
+        completed: true,
+      }],
+    });
+    await stageAndFinalize(userId, tape);
+
+    const ccb = await backend.getEngineContextMessages(sessionId, userId, {
+      contextWindow: 40_000,
+      engine: "ccb",
+    });
+    const codex = await backend.getEngineContextMessages(sessionId, userId, {
+      contextWindow: 40_000,
+      engine: "codex",
+    });
+    const ccbTool = String(ccb?.find((message) => message.role === "tool")?.text ?? "");
+    const codexTool = String(codex?.find((message) => message.role === "tool")?.text ?? "");
+    assert.ok(codexTool.length < ccbTool.length / 2);
+    assert.match(codexTool, new RegExp(exactTail));
+    assert.equal(codex?.at(-1)?.text, "final answer");
+  });
+
   maybe("engine context hydrates real tape-backed tool, plan, goal and delegate facts", async () => {
     const sessionId = "s-direct-engine-semantic";
     const userId = "u-direct-engine-semantic";
