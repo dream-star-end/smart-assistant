@@ -43,6 +43,7 @@ type FakeExitInfo = { code: number | null; signal: string | null; crashed: boole
 
 class FakeCcbRunner extends EventEmitter {
   lastActivityAt = Date.now();
+  readonly submittedInputs: unknown[] = [];
 
   constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
     super();
@@ -58,7 +59,8 @@ class FakeCcbRunner extends EventEmitter {
 
   async waitForOutputDrain(): Promise<void> {}
 
-  async submit(): Promise<void> {
+  async submit(input?: unknown): Promise<void> {
+    this.submittedInputs.push(input);
     this.onSubmit(this);
   }
 
@@ -545,6 +547,272 @@ describe("crash/interrupt partial persistence", () => {
       assert.ok(events.some((event) =>
         event.kind === "block" && event.block.kind === "text" && event.block.text === retryText
       ));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("capacity failure automatically continues up to three times and persists one exact paid turn", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      const requestId = "e".repeat(32);
+      let submits = 0;
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        const attempt = submits;
+        setImmediate(() => {
+          session.runner.emit("billing", {
+            requestId,
+            turnKey: session._currentTurnKey!,
+            engineSessionId: `oceng-${String(attempt).repeat(48)}`,
+            status: attempt <= 3 ? "error" : "success",
+            durationMs: attempt,
+            usage: { input_tokens: attempt, output_tokens: attempt <= 3 ? 0 : 4 },
+          });
+          if (attempt <= 3) {
+            r.thinking(`attempt ${attempt} thinking`);
+            r.text(`attempt ${attempt} process`);
+            r.toolPair(`retry-tool-${attempt}`, "Bash", `attempt ${attempt} output`);
+            r.plan({
+              blockId: `retry-plan-${attempt}`,
+              text: `attempt ${attempt} plan`,
+              partial: false,
+            });
+            r.result({
+              is_error: true,
+              subtype: "error_during_execution",
+              result: "Selected model is at capacity. Please try a different model.",
+              errorClass: "model_capacity",
+            });
+            return;
+          }
+          r.text("retry succeeded");
+          r.result({ stop_reason: "end_turn", usage: { input_tokens: 8, output_tokens: 4 } });
+        });
+      });
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _durableDelegateEngineBillings: [],
+      } as Partial<AgentSession>);
+
+      await sm.submit(
+        session,
+        "finish the task",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        requestId,
+      );
+
+      assert.equal(submits, 4, "initial attempt + exactly three automatic retries");
+      assert.deepEqual(runner.submittedInputs, [
+        "finish the task",
+        "继续",
+        "继续",
+        "继续",
+      ]);
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "completed");
+      assert.ok(payload.text.includes("attempt 1 process"));
+      assert.ok(payload.text.includes("attempt 2 process"));
+      assert.ok(payload.text.includes("attempt 3 process"));
+      assert.ok(payload.text.endsWith("retry succeeded"));
+      assert.deepEqual(
+        payload.thinkingSegments?.map((segment) => segment.text),
+        ["attempt 1 thinking", "attempt 2 thinking", "attempt 3 thinking"],
+      );
+      assert.deepEqual(
+        payload.tools?.map((tool) => tool.output),
+        ["attempt 1 output", "attempt 2 output", "attempt 3 output"],
+      );
+      assert.deepEqual(
+        payload.structuredBlocks?.map((block) => block.text),
+        ["attempt 1 plan", "attempt 2 plan", "attempt 3 plan"],
+      );
+      assert.equal(
+        payload.runtimeEvents?.filter((event) =>
+          (event.payload as { type?: unknown }).type === "retry_status"
+        ).length,
+        3,
+      );
+      assert.deepEqual(payload.engineBilling, {
+        requestId,
+        turnKey: payload.turnKey,
+        engineSessionId: `oceng-${"4".repeat(48)}`,
+        status: "success",
+        durationMs: 4,
+        usage: { input_tokens: 4, output_tokens: 4 },
+      });
+      assert.equal(
+        events.filter((event) => event.kind === "codex_billing").length,
+        1,
+        "failed attempts must not settle the shared request",
+      );
+      assert.deepEqual(
+        session._durableDelegateEngineBillings,
+        [payload.engineBilling],
+        "delegate billing buffer contains only the terminal attempt",
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("capacity failure stops after the third retry and emits only the terminal error billing", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      const requestId = "f".repeat(32);
+      let submits = 0;
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        const attempt = submits;
+        setImmediate(() => {
+          session.runner.emit("billing", {
+            requestId,
+            turnKey: session._currentTurnKey!,
+            engineSessionId: `oceng-${String(attempt).repeat(48)}`,
+            status: "error",
+            durationMs: attempt,
+            usage: { input_tokens: attempt, output_tokens: 0 },
+          });
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Selected model is at capacity. Please try a different model.",
+            errorClass: "model_capacity",
+          });
+        });
+      });
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _durableDelegateEngineBillings: [],
+      } as Partial<AgentSession>);
+
+      await sm.submit(
+        session,
+        "finish the task",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        requestId,
+      );
+
+      assert.equal(submits, 4);
+      assert.deepEqual(runner.submittedInputs, ["finish the task", "继续", "继续", "继续"]);
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.errorCode, "model_capacity");
+      assert.equal(payload.engineBilling?.engineSessionId, `oceng-${"4".repeat(48)}`);
+      assert.equal(events.filter((event) => event.kind === "codex_billing").length, 1);
+      assert.equal(events.filter((event) => event.kind === "error").length, 1);
+      assert.deepEqual(session._durableDelegateEngineBillings, [payload.engineBilling]);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop during retry backoff prevents the next continue attempt", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    (sm as unknown as { _transientRetryDelayMs: () => number })
+      ._transientRetryDelayMs = () => 60_000;
+    let submits = 0;
+    let retryNotice!: () => void;
+    const retrying = new Promise<void>((resolve) => { retryNotice = resolve; });
+    const runner = new FakeCcbRunner((r) => {
+      submits++;
+      setImmediate(() => r.result({
+        is_error: true,
+        subtype: "error_during_execution",
+        result: "Selected model is at capacity. Please try a different model.",
+        errorClass: "model_capacity",
+      }));
+    });
+    const session = makeSession(runner);
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      session.sessionKey,
+      session,
+    );
+    const clientMessageId = "msg-stop-retry";
+    const completion = sm.submit(
+      session,
+      "finish the task",
+      (event) => {
+        if (
+          event.kind === "block" &&
+          event.block.kind === "text" &&
+          event.block.text.includes("自动重试")
+        ) {
+          retryNotice();
+        }
+      },
+      undefined,
+      undefined,
+      "2".repeat(32),
+      undefined,
+      undefined,
+      {
+        replayLifecycle: {
+          clientMessageId,
+          onStart: () => {},
+          onBeforeRelease: () => {},
+          onEnd: () => {},
+        },
+      },
+    );
+
+    await retrying;
+    assert.equal(sm.interruptClientTurn(session.sessionKey, clientMessageId), true);
+    await assert.rejects(completion, /abort/i);
+    assert.equal(submits, 1);
+    assert.deepEqual(runner.submittedInputs, ["finish the task"]);
+    assert.equal(session._externalTurnAbort, undefined);
+  });
+
+  test("non-retryable engine failures remain one attempt", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => r.result({
+          is_error: true,
+          subtype: "error_during_execution",
+          result: "insufficient credits, balance too low",
+          errorClass: "insufficient_credits",
+        }));
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await sm.submit(
+        session,
+        "paid request",
+        () => {},
+        undefined,
+        undefined,
+        "1".repeat(32),
+      );
+
+      assert.deepEqual(runner.submittedInputs, ["paid request"]);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "insufficient_credits");
     } finally {
       setV3MasterSinkSingleton(null);
     }
