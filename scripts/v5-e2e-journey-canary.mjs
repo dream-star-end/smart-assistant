@@ -131,6 +131,11 @@ try {
 
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
 const page = await context.newPage();
+// Turnstile 装载探针:只看"有没有去拉 api.js",不看 DOM —— 理由见 J1 里的长注释。
+let turnstileScriptRequested = false;
+page.on("request", (req) => {
+  if (req.url().includes("challenges.cloudflare.com/turnstile")) turnstileScriptRequested = true;
+});
 let stepName = "init";
 async function step(name, fn) {
   stepName = name;
@@ -156,18 +161,27 @@ try {
       return r.ok ? await r.json() : null;
     });
     if (!publicConfig) fatal(1, "J1 读 /api/public/config 失败");
-    // 人机验证在生产是**无条件强制**的(不存在"暂时关掉"的开关),所以这两条断言
-    // 也无条件:turnstile_bypass 必须为 false、登录表单必须真的挂上 Cloudflare widget。
-    // 它们同时充当"全局旁路是否被偷偷打开"的活体探针 —— 旁路一旦回来,前端会走占位
-    // token 路径、widget 消失,本门立刻红。
+    // 人机验证在生产是**无条件强制**的(不存在"暂时关掉"的开关),所以断言也无条件。
+    //
+    // 判据一:服务端真相 —— turnstile_bypass 必须为 false。旁路一旦被偷偷打开,这里立刻红。
     if (publicConfig.turnstile_bypass === true) {
       fatal(1, "J1 生产返回 turnstile_bypass=true —— 人机验证被旁路(安全回归)");
     }
-    await page
-      .locator('iframe[src*="challenges.cloudflare.com"]')
-      .first()
-      .waitFor({ state: "attached", timeout: STEP_TIMEOUT })
-      .catch(() => fatal(1, "J1 登录表单未挂载 Turnstile widget —— 真实用户的人机验证缺失"));
+    // 判据二:前端确实在装 widget —— 断言页面请求了 Turnstile 的 api.js。
+    //
+    // 【为什么不断言 iframe/DOM,踩过两个坑】
+    //   ① 选择器不成立:Turnstile 的 iframe `src` 属性通常是 about:blank / blob,
+    //      真实 URL 在内部,`iframe[src*="challenges.cloudflare.com"]` 即使在公网也匹配不到。
+    //   ② 环境结构性不可满足:本旅程经 ssh 隧道访问 http://127.0.0.1:<port>,而 Turnstile
+    //      sitekey 是**按域名限制**的 —— 实测该路径下 Cloudflare 报 `Error: 110200`
+    //      (域名不在白名单),widget 无法正常渲染。在这里断言 widget 可用是错的。
+    //   同期公网真实域名实测:widget 正常渲染、turnstile_bypass=false —— 真实用户不受影响。
+    //
+    // 请求 api.js 这一条既域名无关(隧道下照样发出)、又能抓住真正的回归类:
+    // 前端不再渲染 widget(比如有人把占位 token 路径改成默认)。
+    if (!turnstileScriptRequested) {
+      fatal(1, "J1 登录表单未请求 Turnstile api.js —— 前端可能已不再渲染人机验证 widget");
+    }
 
     // ── 登录本体走 API,不走表单 ──────────────────────────────────────────
     // 为什么不填表单点登录:widget 会对 headless 浏览器出交互式挑战(这正是它该做的),
