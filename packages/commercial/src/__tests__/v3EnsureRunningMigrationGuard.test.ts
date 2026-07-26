@@ -20,12 +20,12 @@
  * Phase 2 完工硬门:本文件不允许 ship 时仍含 `test.todo`(R6.11 dev plan 硬要求)。
  */
 
-import { describe, test, before, after, beforeEach } from "node:test";
+import { describe, test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import type Docker from "dockerode";
-import { createPool, closePool, setPoolOverride, resetPool, getPool } from "../db/index.js";
+import { getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
-import { runMigrations } from "../db/migrate.js";
+import { useDedicatedTestDatabase } from "./helpers/db.js";
 import {
   createPlannedMigration,
   markPhase,
@@ -43,72 +43,18 @@ import {
 } from "../agent-sandbox/v3supervisor.js";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 
-const TEST_DB_URL =
-  process.env.TEST_DATABASE_URL ??
-  "postgres://test:test@127.0.0.1:55432/openclaude_test";
-const REQUIRE_TEST_DB =
-  process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
+/**
+ * 隔离策略:**专属库** openclaude_v3erg_test(见 helpers/db.ts:useDedicatedTestDatabase)。
+ * 原先对共享库 openclaude_test 做 DROP/CREATE SCHEMA public,与同法的
+ * v3MigrationLedger / v3MigrationReconciler 在文件级并发下互撞 42P06,
+ * before hookFailed → 整文件 cancelled(长期挂 known-failures)。改专属库后零共享面。
+ */
+const db = useDedicatedTestDatabase("openclaude_v3erg_test");
 
-function assertTestDatabase(url: string): void {
-  let dbName: string;
-  try {
-    dbName = new URL(url).pathname.replace(/^\//, "");
-  } catch {
-    throw new Error(`invalid TEST_DATABASE_URL: ${url}`);
-  }
-  if (!dbName.endsWith("_test")) {
-    throw new Error(`refusing to reset non-test database: ${dbName}`);
-  }
-}
-
-async function cleanCommercialSchema(): Promise<void> {
-  assertTestDatabase(TEST_DB_URL);
-  await query("DROP SCHEMA IF EXISTS public CASCADE");
-  await query("CREATE SCHEMA public");
-  await query("GRANT ALL ON SCHEMA public TO public");
-}
-
-let pgAvailable = false;
 let hostUuid = ""; // self host(agent_container 落在这台)
 let hostUuidB = ""; // 迁移目标 host(给 createPlannedMigration 用)
 let containerId = 0n;
 const TEST_UID = 1n;
-
-async function probePg(): Promise<boolean> {
-  const p = createPool({
-    connectionString: TEST_DB_URL,
-    max: 2,
-    connectionTimeoutMillis: 1500,
-  });
-  try {
-    await p.query("SELECT 1");
-    await p.end();
-    return true;
-  } catch {
-    try { await p.end(); } catch { /* ignore */ }
-    return false;
-  }
-}
-
-before(async () => {
-  pgAvailable = await probePg();
-  if (!pgAvailable) {
-    if (REQUIRE_TEST_DB) throw new Error("Postgres test fixture required");
-    return;
-  }
-  await resetPool();
-  const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
-  setPoolOverride(pool);
-  await cleanCommercialSchema();
-  await runMigrations();
-});
-
-after(async () => {
-  if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
-    await closePool();
-  }
-});
 
 /**
  * 每个 test:
@@ -118,7 +64,7 @@ after(async () => {
  *   - 种 1 个 active agent_container 给 TEST_UID
  */
 beforeEach(async () => {
-  if (!pgAvailable) return;
+  if (!db.available) return;
   await query("TRUNCATE TABLE agent_migrations RESTART IDENTITY CASCADE");
   await query("DELETE FROM agent_containers");
   await query("DELETE FROM users WHERE id = 1");
@@ -163,8 +109,7 @@ beforeEach(async () => {
 });
 
 function skipIfNoPg(t: { skip: (r: string) => void }): boolean {
-  if (!pgAvailable) { t.skip("pg not available"); return true; }
-  return false;
+  return db.skipIfUnavailable(t);
 }
 
 /** open phase 子集 — markPhase 编译期排除终态,这里同步收窄 */

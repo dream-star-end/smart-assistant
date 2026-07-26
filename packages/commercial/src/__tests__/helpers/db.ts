@@ -1,5 +1,8 @@
+import { after, before } from "node:test";
+import { Client } from "pg";
 import { query, type QueryRunner } from "../../db/queries.js";
-import { getPool } from "../../db/index.js";
+import { closePool, createPool, getPool, resetPool, setPoolOverride } from "../../db/index.js";
+import { runMigrations } from "../../db/migrate.js";
 
 /**
  * 测试专用 DB helper。
@@ -68,4 +71,124 @@ export async function resetTestSchemaForTest(
   }
   await query("DROP SCHEMA public CASCADE", [], runner);
   await query("CREATE SCHEMA public", [], runner);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+//  每文件一库(dedicated database per test file)
+// ───────────────────────────────────────────────────────────────────────
+
+/** 基准连接串:既是"管理连接"(建/删库),也是默认库名的来源。 */
+const BASE_TEST_DB_URL =
+  process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
+
+/** 与 gate 脚本同一判据:CI 或 REQUIRE_TEST_DB=1 时,PG 不可达必须 fail-loud。 */
+const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
+
+/** 库名硬约束:小写标识符 + 必须 `_test` 结尾(拼进 DDL,不能有注入面)。 */
+const DEDICATED_DB_NAME = /^[a-z][a-z0-9_]*_test$/;
+
+function withDatabase(url: string, dbName: string): string {
+  const u = new URL(url);
+  u.pathname = `/${dbName}`;
+  return u.toString();
+}
+
+async function adminExec(sql: string): Promise<void> {
+  const c = new Client({ connectionString: BASE_TEST_DB_URL, connectionTimeoutMillis: 1500 });
+  await c.connect();
+  try {
+    await c.query(sql);
+  } finally {
+    await c.end();
+  }
+}
+
+export interface DedicatedTestDatabase {
+  /** PG fixture 是否可达。false 时(且非 REQUIRE_TEST_DB)套件应逐 test skip。 */
+  readonly available: boolean;
+  /** 本文件专属库的连接串。 */
+  readonly url: string;
+  /** `if (db.skipIfUnavailable(t)) return;` 惯用法。 */
+  skipIfUnavailable(t: { skip: (reason: string) => void }): boolean;
+}
+
+/**
+ * 给**单个测试文件**开一个专属数据库,并把全局 pool 指过去;文件跑完删库。
+ *
+ * 动机(2026-07-26,本批):v3MigrationLedger / v3MigrationReconciler /
+ * v3EnsureRunningMigrationGuard 三个文件各自对**共享**的 openclaude_test 做
+ * `DROP SCHEMA public CASCADE; CREATE SCHEMA public`。commercial unit 套件 300+
+ * 文件由 node:test 并发调度(默认按 CPU 数并行跑文件),三者一旦重叠,
+ * 后者的 `CREATE SCHEMA public` 会撞上前者刚建好的 schema → `42P06 schema "public"
+ * already exists`,before 钩子直接 hookFailed,整文件的 test 变 cancelled。
+ * 这就是这三个文件长期躺在 .github/known-failures/commercial-unit.txt 里的原因
+ * —— 不是产品坏,是夹具互相毒化,代价是 6 条 ledger 契约(open-migration 闸门)
+ * 完全没有门禁。
+ *
+ * 正解仓内已有先例:org 系 7 个文件用"每文件一库"(orgBilling.test.ts / orgEnterprise
+ * .test.ts)长期全绿。本函数把那段样板收成单一权威,避免第 8、9 份复制体各自漂移。
+ *
+ * 语义:
+ *   - 注册 root 级 before/after —— 必须在测试文件**顶层**调用(与其它 before 的
+ *     相对顺序 = 注册顺序,请第一个调)。
+ *   - before:探活 → DROP/CREATE DATABASE → setPoolOverride(专属库) → runMigrations()
+ *   - after :closePool → DROP DATABASE(尽力而为,失败不影响退出码)
+ *   - PG 不可达:REQUIRE_TEST_DB 下抛(fail-loud,不静默变绿);否则 available=false。
+ */
+export function useDedicatedTestDatabase(dbName: string): DedicatedTestDatabase {
+  if (!DEDICATED_DB_NAME.test(dbName)) {
+    throw new Error(
+      `useDedicatedTestDatabase: 库名必须匹配 ${DEDICATED_DB_NAME} (小写 + _test 结尾),收到 ${JSON.stringify(dbName)}`,
+    );
+  }
+  const url = withDatabase(BASE_TEST_DB_URL, dbName);
+  let available = false;
+
+  const terminateBackends = `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+     WHERE datname = '${dbName}' AND pid <> pg_backend_pid()`;
+
+  before(async () => {
+    try {
+      await adminExec("SELECT 1");
+      available = true;
+    } catch {
+      available = false;
+    }
+    if (!available) {
+      if (REQUIRE_TEST_DB) {
+        throw new Error(
+          `Postgres test fixture required (${BASE_TEST_DB_URL}) —— REQUIRE_TEST_DB/CI 下不允许静默 skip`,
+        );
+      }
+      return;
+    }
+    await adminExec(terminateBackends).catch(() => {});
+    await adminExec(`DROP DATABASE IF EXISTS ${dbName}`);
+    await adminExec(`CREATE DATABASE ${dbName} TEMPLATE template0`);
+
+    await resetPool();
+    setPoolOverride(createPool({ connectionString: url, max: 5 }));
+    await runMigrations();
+  });
+
+  after(async () => {
+    if (!available) return;
+    await closePool();
+    await adminExec(terminateBackends).catch(() => {});
+    await adminExec(`DROP DATABASE IF EXISTS ${dbName}`).catch(() => {});
+  });
+
+  return {
+    get available() {
+      return available;
+    },
+    url,
+    skipIfUnavailable(t: { skip: (reason: string) => void }): boolean {
+      if (!available) {
+        t.skip(`pg not available (${BASE_TEST_DB_URL})`);
+        return true;
+      }
+      return false;
+    },
+  };
 }
