@@ -1,0 +1,30 @@
+# commercial-integ 存量失败基线(顶层 test/suite 名,一行一条)
+#
+# 用法与 commercial-unit.txt 同源:.github/scripts/commercial-integ-gate.sh 的
+# G1 判据是"失败集 ⊆ 本清单",只有清单之外的**新增**失败才让门红。
+# 注意 G2(skipped==0)/ G3(executed>=min-tests)/ G4(plan 完整)**不接受任何豁免** ——
+# 本清单只能豁免"已知的具体断言失败",不能豁免"根本没跑"。
+#
+# ── 这些条目是怎么来的 ────────────────────────────────────────────────────────
+# 2026-07-26 门禁审计:integ 层在 CI / deploy / playbook 三处都不跑,110 个文件
+# 1549 个用例一年零执行。本批把它接成真门,第一次真跑 PR 门第一梯队(22 文件 /
+# 476 用例)就暴露了下面这批存量红。它们**在本批之前就已经是红的**,不是本批引入。
+#
+# 每一条都必须写清根因与分类,并且都是**待偿还的债,不是永久豁免**。
+# 修好一条就删一行(门会 warning 提示 stale 条目)。
+#
+# ── 分类:测试腐化(产品行为正确,测试没跟上)────────────────────────────────
+#
+# full migration suite
+#   两处腐化:(a) `seed: key model pricing and topup rows exist` 硬编码 topup_plans
+#   行数 4,而迁移链现在种 8 条(¥38 订阅 Lite 等档位后来加的);(b)
+#   `agent_containers unique user_id` 直接 INSERT 不带 secret_hash,而后来的迁移
+#   把该列改成 NOT NULL → `null value in column "secret_hash" violates not-null`。
+
+# ── 本文件 = pr-3 分片专属基线(2026-07-26 拆分)────────────────────────────
+# 为什么拆:三片共用一份基线时,counts 上界只能取三片最大值,等于把零失败的分片
+#   也放宽到最松的那一片。本片 CI 实测 # tests 119 / # fail 3(顶层 2 条)。
+# 真值来源 = CI artifact commercial-integ-tap-pr-3(铁律:基线真值只认 CI,不认本机)。
+
+full migration suite
+retention 反向对账门(连库跑全量迁移)
