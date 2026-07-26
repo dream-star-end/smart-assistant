@@ -14,6 +14,11 @@
 #        failed_units(任何 systemd 单元 failed —— 整类替代"逐个单元配 OnFailure")、
 #        backup_fresh(本地每日备份新鲜度;kl-hk 异地容灾退役后这是唯一数据保护)、
 #        mem_oversubscribe(容器 memory limit 合计 / 物理内存 超售倍数)
+#     6. 合成旅程/表面探针结果(2026-07-26 批7):probe_turn / probe_e2e / probe_spa /
+#        probe_version / probe_channels。探针本体是独立 timer(scripts/v5-probe-run.sh),
+#        本脚本**只读**它们写的 $PROBE_DIR/<probe>.json,把 fail / 结果陈旧 / "一直跳过"
+#        三种情形接进下面同一套去重+重提+恢复+condition 管道 —— 探针侧绝不另起第二条
+#        通知通道(去重、静默、维护窗口这些语义只允许有一份权威)。
 #   告警去重:状态文件记录每项上次状态,只在翻转(好→坏 / 坏→好=恢复)时发告警,
 #   坏状态持续时每 6 小时重复提醒一次。
 #
@@ -96,7 +101,25 @@ REALERT_SECS=21600     # 坏状态持续时的重复提醒间隔(6h)
 CURL_TIMEOUT=5
 DS_STEP_CANARY_READY="${DS_STEP_CANARY_READY:-10}"
 MAIL_ERR_WINDOW_SECS="${V5MON_MAIL_ERR_WINDOW:-1800}"  # 邮件发送失败回看窗口(30min)
-MAIL_LOG="${V5MON_MAIL_LOG:-/var/log/openclaude-v5.log}"
+# ── master 日志 lane(2026-07-26 P0:日志类探针的权威源不对称)────────────────
+# 背景:mail / client_4xx_storm 两项此前硬编码 A 槽日志 /var/log/openclaude-v5.log,
+# 而 openclaude-v5-b.service 明确 `append:/var/log/openclaude-v5-b.log`(实测两文件
+# 并存,-b 有 43MB)。check_serving_masters 早就按 deploy_state 派生 serving slot,
+# **但日志路径没跟着派生** → 蓝绿切到 B 之后这两项读的是闲置槽的静默旧日志 → 恒判 ok。
+# 这两项恰恰是为两起最痛的静默事故补的盲区(Resend 断 24h、/api/media-signed 410×381),
+# 等于回归修复本身在一半发布形态下失效。
+#
+# 收口方式:日志消费统一走 master_log_lanes() —— 取**全部**存在且可读的 master lane
+# (A/B),不猜单一路径。三条理由:
+#   ① canary step≥10 / finalizing step<6 / aborting step<2 三个窗口里 A、B **同时**
+#      在服务真实流量,只读"primary"会漏掉另一条 lane 上的真实失败;
+#   ② 两项判据都带时间窗过滤(30min / 10min),闲置槽的陈旧行天然落在窗外 → 读它无害
+#      (闲置槽的 unit 已 stop,不再产生新行);
+#   ③ 不依赖 deploy_state 可裁决 —— 少一个"状态不可读就瞎了"的失败模式。
+# 同时保留硬不变量:若 deploy_state 已裁出 primary slot,而**该 slot 的日志不可读**,
+# 判 bad(这正是本次事故的反向守卫:读到的只有闲置槽 = 判定不可信,不许冒充 ok)。
+MASTER_LOG_A="${V5MON_MASTER_LOG_A:-${V5MON_MAIL_LOG:-/var/log/openclaude-v5.log}}"
+MASTER_LOG_B="${V5MON_MASTER_LOG_B:-/var/log/openclaude-v5-b.log}"
 TURN_ERR_WINDOW_SECS="${V5MON_TURN_ERR_WINDOW:-600}"   # turn 失败回看窗口(10min)
 TURN_ERR_MIN_USERS="${V5MON_TURN_ERR_MIN_USERS:-2}"    # 多用户阈:≥N 个用户同窗失败
 TURN_ERR_MIN_EVENTS="${V5MON_TURN_ERR_MIN_EVENTS:-3}"  # 多用户阈:且总失败 ≥N 次
@@ -214,6 +237,55 @@ check_image() {
   fi
 }
 
+# master 日志 lane 解析(见 MASTER_LOG_A/B 处的长注释)。
+# 打印每行 "<slot> <path>",只含**存在且可读**的 lane;一个都没有 = 数据源缺失。
+master_log_lanes() {
+  local slot path
+  for slot in A B; do
+    case "$slot" in A) path="$MASTER_LOG_A" ;; B) path="$MASTER_LOG_B" ;; esac
+    [ -n "$path" ] && [ -r "$path" ] && printf '%s %s\n' "$slot" "$path"
+  done
+}
+
+# 日志类探针的共同前置:解析 lane 并落 LOG_LANE_PATHS/LOG_LANE_NOTE,或给出 bad 理由。
+# 返回 1 = 数据源不可信,调用方必须 record bad(绝不 record ok —— "真的没问题"与
+# "我根本没看"必须区分,这是 2026-07-26 审计点名的三处 `record ... ok "(跳过)"`)。
+LOG_LANE_PATHS=(); LOG_LANE_NOTE=""; LOG_LANE_ERROR=""
+resolve_log_lanes() {
+  local lanes slot path
+  LOG_LANE_PATHS=(); LOG_LANE_NOTE=""; LOG_LANE_ERROR=""
+  lanes="$(master_log_lanes)"
+  if [ -z "$lanes" ]; then
+    LOG_LANE_ERROR="没有任何可读的 master 日志(A=$MASTER_LOG_A B=$MASTER_LOG_B)—— 数据源缺失,无法判定"
+    return 1
+  fi
+  while read -r slot path; do
+    [ -n "$path" ] || continue
+    LOG_LANE_PATHS+=("$path")
+    LOG_LANE_NOTE+="${LOG_LANE_NOTE:+,}$slot"
+  done <<EOF
+$lanes
+EOF
+  # 硬不变量:deploy_state 已裁出 serving primary 时,该 slot 的日志必须真的读到了。
+  # 否则说明我们读的只是闲置槽 → 判定不可信(= 2026-07-26 事故的反向守卫)。
+  if [ -n "$MON_PRIMARY_SLOT" ] && [[ ",$LOG_LANE_NOTE," != *",$MON_PRIMARY_SLOT,"* ]]; then
+    LOG_LANE_ERROR="serving slot=$MON_PRIMARY_SLOT 的 master 日志不可读(只读到 lane=$LOG_LANE_NOTE)—— 读的是闲置槽,判定不可信"
+    return 1
+  fi
+  LOG_LANE_NOTE="lane=$LOG_LANE_NOTE${MON_PRIMARY_SLOT:+ serving=$MON_PRIMARY_SLOT}"
+}
+
+# 逐 lane 施加 tail 上限后再拼接。**不能**对拼接流施加 tail:行数多的那条 lane 会把
+# 另一条 lane 的近期行整体挤出窗口(实测闲置 B 槽日志 43MB),那就从"没看"变成了
+# "看了却没看见" —— 同一类失效换了个面。窗口过滤在下游按行内 ts 做,顺序无关。
+grep_lanes_tail() { # <grep-pattern> <tail-n>
+  local f hits
+  for f in "${LOG_LANE_PATHS[@]}"; do
+    hits="$(grep -a -h -e "$1" "$f" 2>/dev/null | tail -n "$2")"
+    [ -n "$hits" ] && printf '%s\n' "$hits"
+  done
+}
+
 check_mail() {
   # 邮件通道:master 日志 30min 窗口内出现 [mail-resend-error] → 告警。
   # 前缀契约 = packages/commercial/src/auth/mail.ts createResendMailer 失败日志,
@@ -221,9 +293,9 @@ check_mail() {
   # 验证码全丢(register 吞错降级),无告警无人知 → 用日志留痕 + 本检查补盲区。
   # 日志按天轮转,跨轮转最多丢一次恢复沿,可接受。
   local recent n last ts_iso ep
-  if [ ! -r "$MAIL_LOG" ]; then record mail ok "邮件通道:$MAIL_LOG 不可读(跳过)"; return; fi
-  recent="$(grep -a '\[mail-resend-error\]' "$MAIL_LOG" 2>/dev/null | tail -20)"
-  if [ -z "$recent" ]; then record mail ok "邮件通道:无失败记录"; return; fi
+  if ! resolve_log_lanes; then record mail bad "邮件通道:${LOG_LANE_ERROR}"; return; fi
+  recent="$(grep_lanes_tail '\[mail-resend-error\]' 20)"
+  if [ -z "$recent" ]; then record mail ok "邮件通道:无失败记录(${LOG_LANE_NOTE})"; return; fi
   n=0; last=""
   while IFS= read -r line; do
     ts_iso="$(printf '%s' "$line" | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')"
@@ -234,9 +306,9 @@ check_mail() {
 $recent
 EOF
   if [ "$n" -gt 0 ]; then
-    record mail bad "邮件发送失败 ${n} 条(${MAIL_ERR_WINDOW_SECS}s 内,注册/找回密码受影响):$(printf '%s' "$last" | tail -c 200)"
+    record mail bad "邮件发送失败 ${n} 条(${MAIL_ERR_WINDOW_SECS}s 内,注册/找回密码受影响;${LOG_LANE_NOTE}):$(printf '%s' "$last" | tail -c 200)"
   else
-    record mail ok "邮件通道:窗口内无失败"
+    record mail ok "邮件通道:窗口内无失败(${LOG_LANE_NOTE})"
   fi
 }
 
@@ -249,7 +321,8 @@ check_turn_failures() {
   # 部署重启窗口的瞬时 turn 中断由 planned-maintenance marker 静默(deploy 侧
   # begin_planned_maintenance checks 列表含 turn_failures,两侧同步)。
   local row events users
-  if [ -z "$DBURL" ]; then record turn_failures ok "turn 失败率:无 DATABASE_URL(跳过)"; return; fi
+  # 数据源不可读 → bad,绝不 ok:"窗口内没有失败"与"我根本没查"是两件事(2026-07-26 审计)。
+  if [ -z "$DBURL" ]; then record turn_failures bad "turn 失败率:$ENV_FILE 里读不到 DATABASE_URL —— 未做任何判定"; return; fi
   if ! row="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
       "SELECT count(*), count(DISTINCT user_id)
          FROM product_friction_events
@@ -274,7 +347,7 @@ check_kp_plugin() {
   # 未吊销的当前版本)。任一不满足 = listing 对用户休眠(门被悄悄关闭/撤下/版本漂移/签名缺失),
   # 用户无法发布到知识星球却全链路健康端点全绿 → 本探针补盲区。仅只读 EXISTS。
   local serving
-  if [ -z "$DBURL" ]; then record kp_plugin ok "KP 插件:无 DATABASE_URL(跳过)"; return; fi
+  if [ -z "$DBURL" ]; then record kp_plugin bad "KP 插件:$ENV_FILE 里读不到 DATABASE_URL —— 未做任何判定"; return; fi
   if ! serving="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -c "
     SELECT EXISTS (
       SELECT 1
@@ -328,11 +401,11 @@ check_client_4xx_storm() {
   # (router.ts 每条 HttpError 打 {"msg":"http_error","status":4xx,"route":...,"clientIp":...,"ts":...})。
   # ts 是 ISO8601 UTC(Z),与 date -u 生成的截止串按**字典序**比较即等价于时间比较,免逐行 date -d。
   local cutoff_iso recent top
-  if [ ! -r "$MAIL_LOG" ]; then record client_4xx_storm ok "4xx 风暴:$MAIL_LOG 不可读(跳过)"; return; fi
+  if ! resolve_log_lanes; then record client_4xx_storm bad "4xx 风暴:${LOG_LANE_ERROR}"; return; fi
   cutoff_iso="$(date -u -d "@$((NOW - CLIENT_4XX_WINDOW_SECS))" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo '')"
-  if [ -z "$cutoff_iso" ]; then record client_4xx_storm ok "4xx 风暴:无法计算窗口截止(跳过)"; return; fi
-  recent="$(grep -a '"msg":"http_error"' "$MAIL_LOG" 2>/dev/null | tail -n "$CLIENT_4XX_SCAN_LINES")"
-  if [ -z "$recent" ]; then record client_4xx_storm ok "4xx 风暴:窗口内无 http_error"; return; fi
+  if [ -z "$cutoff_iso" ]; then record client_4xx_storm bad "4xx 风暴:无法计算窗口截止(date 不可用)—— 未做任何判定"; return; fi
+  recent="$(grep_lanes_tail '"msg":"http_error"' "$CLIENT_4XX_SCAN_LINES")"
+  if [ -z "$recent" ]; then record client_4xx_storm ok "4xx 风暴:窗口内无 http_error(${LOG_LANE_NOTE})"; return; fi
   # awk 分组计数:窗口内 + 4xx,按 clientIp|route 聚合取最大值;超阈打印 "max\tkey\tstatus"。
   top="$(printf '%s\n' "$recent" | awk -v cutoff="$cutoff_iso" -v thr="$CLIENT_4XX_THRESHOLD" '
     {
@@ -354,7 +427,7 @@ check_client_4xx_storm() {
     IFS=$'\t' read -r n mk mst <<<"$top"
     record client_4xx_storm bad "客户端 4xx 风暴:${mk%%|*} 对 ${mk#*|} 在 ${CLIENT_4XX_WINDOW_SECS}s 内 ${n} 次 4xx(样本 status=${mst},阈值 ${CLIENT_4XX_THRESHOLD})——签名过期/权限退化/路由异常无人知(2026-07-17 /api/media-signed 410×381 盲区)"
   else
-    record client_4xx_storm ok "客户端 4xx 风暴:窗口内无单 client×route 超阈"
+    record client_4xx_storm ok "客户端 4xx 风暴:窗口内无单 client×route 超阈(${LOG_LANE_NOTE})"
   fi
 }
 
@@ -507,6 +580,9 @@ slot_health_url() { case "$1" in A) echo "$V5_HEALTH_URL" ;; B) echo "$V5_B_HEAL
 # PG/状态损坏时绝不猜 A：独立 deploy_state key 告警，generic v5 保留最后已知状态，
 # candidate 记 not-serving；绝不把“状态不可读”冒充服务故障触发自动部署修复。
 MON_PHASE=""; MON_STEP=""; MON_ACTIVE=""; MON_CANDIDATE=""; MON_STATE_UNAVAILABLE=0
+# 本轮裁定出的主 serving slot(A|B;'' = deploy_state 不可裁决)。日志类探针拿它做
+# "serving lane 的日志必须真的被读到"这条硬不变量,见 resolve_log_lanes。
+MON_PRIMARY_SLOT=""
 load_serving_state() {
   local row
   [[ -n "$DBURL" ]] || { CHECK_DETAIL[deploy_state_error]="DATABASE_URL missing"; return 1; }
@@ -549,6 +625,8 @@ check_serving_masters() {
     aborting:*)
       (( MON_STEP < 2 )) && secondary="$MON_CANDIDATE" ;;
   esac
+  # 同一份派生结果同时喂给日志类探针(单一权威:serving lane 只在这里裁定一次)。
+  MON_PRIMARY_SLOT="$primary"
 
   unit="$(slot_unit "$primary")"; url="$(slot_health_url "$primary")"
   check_service svc_v5 "$unit"
@@ -585,17 +663,37 @@ check_severity() {
 
 # fan-out 一个事件到 admin_alert_outbox(psql 直插共享 SQL 模板)。
 # 失败只记日志,绝不 return 非 0 阻断后续检查项。--dry-run 只打印。
+#
+# 投递结果如实回报(2026-07-26 P0):共享 SQL 末尾打印 `fanout targets=N inserted=N
+# suppressed=N`,本函数据此区分三种结局 —— 此前无论落 0 行还是 N 行都打印 FANOUT-OK,
+# 于是 severity=info 的事件(唯一通道 severity_min='warning' → 恒零通道)在推送侧
+# 蒸发了整整一个建库周期而日志显示"成功"。targets=0 现在打 FANOUT-ZERO。
 fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_json>
+  FANOUT_LAST_TARGETS=""   # 调用方可读:''=未执行/不可判,数字=本次匹配到的通道数
   if [ "$DRY_RUN" = 1 ]; then log "FANOUT[dry] $1 sev=$2 dedupe=$3"; return 0; fi
   if [ -z "$DBURL" ]; then log "FANOUT-SKIP 读不到 DATABASE_URL($ENV_FILE) event=$1"; return 0; fi
   if [ ! -f "$FANOUT_SQL" ]; then log "FANOUT-SKIP 找不到 $FANOUT_SQL event=$1"; return 0; fi
-  if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
+  local out targets inserted
+  # -tAq:只要那一行结果(无表头/无对齐/无 INSERT 命令标签)。2>&1 让失败原因进 out。
+  if ! out="$(psql "$DBURL" -tAq -v ON_ERROR_STOP=1 \
        -v event_type="$1" -v severity="$2" -v dedupe_key="$3" \
        -v title="$4" -v body="$5" -v payload="$6" \
-       -f "$FANOUT_SQL" >/dev/null 2>&1; then
-    log "FANOUT-OK $1 sev=$2"
+       -f "$FANOUT_SQL" 2>&1)"; then
+    log "FANOUT-FAIL $1 sev=$2(outbox 未落,inbox/日志仍有留痕):$(printf '%s' "$out" | tr '\n' ' ' | head -c 160)"
+    return 0
+  fi
+  targets="$(printf '%s' "$out" | sed -n 's/.*fanout targets=\([0-9]\{1,\}\).*/\1/p' | head -1)"
+  inserted="$(printf '%s' "$out" | sed -n 's/.*inserted=\([0-9]\{1,\}\).*/\1/p' | head -1)"
+  FANOUT_LAST_TARGETS="$targets"
+  if [ -z "$targets" ]; then
+    # 模板被改/输出形状变了:不能猜成功(那正是本次要根治的"谎报 OK")。
+    log "FANOUT-UNKNOWN $1 sev=$2 —— 共享 SQL 未回报投递计数(模板被改?):$(printf '%s' "$out" | tr '\n' ' ' | head -c 160)"
+  elif [ "$targets" = 0 ]; then
+    log "FANOUT-ZERO $1 sev=$2 —— 零通道订阅(severity 门槛/enabled/activation_status),推送侧收不到;站内信仍有留痕"
+  elif [ "${inserted:-0}" = 0 ]; then
+    log "FANOUT-DEDUP $1 sev=$2 targets=$targets(全部命中幂等去重,未新建行)"
   else
-    log "FANOUT-FAIL $1 sev=$2(outbox 未落,inbox/日志仍有留痕)"
+    log "FANOUT-OK $1 sev=$2 targets=$targets inserted=$inserted"
   fi
 }
 
@@ -803,12 +901,19 @@ for name in "${CHECK_NAMES[@]}"; do
   else
     if [ "$prev" = bad ]; then                        # 坏 → 好:恢复告警
       EVENTS+=("✅ **$name** 已恢复(异常持续 $(( (NOW - since) / 60 )) 分钟):$detail")
-      fanout_alert "ops.monitor_recovered" "info" \
+      # severity = **被解决的那个告警**的 severity(不是 info)。
+      # 2026-07-26 P0:恢复通知此前恒发 info,而线上唯一可投递通道 severity_min='warning'
+      # → rank(info)=0 >= 1 恒假 → `ops.monitor_recovered` 建库至今 0 行:值班看到红色
+      # 永远等不到绿色。severity 描述的是"这条告警有多重要",而恢复通知属于同一条告警的
+      # 收尾(Alertmanager 的 resolved 通知同样沿用原告警的路由标签),因此必须跟随
+      # check_severity;区分 firing/resolved 靠 event_type 与 payload.kind,不靠降级 severity。
+      sev="$(check_severity "$name")"
+      fanout_alert "ops.monitor_recovered" "$sev" \
         "ops.monitor_recovered:${name}:${NOW}" \
         "[v5监控] ${name} 已恢复" \
         "✅ **${name}** 已恢复(异常持续 $(( (NOW - since) / 60 )) 分钟):${detail}" \
-        "$(jq -nc --arg c "$name" --arg d "$detail" --arg h "$HOSTFQDN" \
-             '{source:"v5-monitor",check:$c,detail:$d,severity:"info",host:$h,kind:"recovered"}')"
+        "$(jq -nc --arg c "$name" --arg d "$detail" --arg s "$sev" --arg h "$HOSTFQDN" \
+             '{source:"v5-monitor",check:$c,detail:$d,severity:$s,host:$h,kind:"recovered"}')"
     fi
     since=0; last_alert=0
   fi

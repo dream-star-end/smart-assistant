@@ -97,17 +97,37 @@ FANOUT_SQL="${V5DAY_FANOUT_SQL:-$SCRIPT_DIR/v5-alert-fanout.sql}"
 HOSTFQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
 
 # fan-out 一个事件到 admin_alert_outbox;失败只记日志,不阻断。--dry-run 只打印。
+#
+# 投递结果如实回报(2026-07-26 P0,与 v5-monitor.sh 同构):共享 SQL 末尾打印
+# `fanout targets=N inserted=N suppressed=N`。此前无论落几行都打印 FANOUT-OK,于是
+# `ops.daily_report`(severity=info)撞上"唯一通道 severity_min=warning"这条恒假门槛,
+# 建库至今在 admin_alert_outbox **0 行** —— 推送侧从来没有过一次"监控还活着"的心跳,
+# 而日志天天显示成功。FANOUT_LAST_TARGETS 供调用方把这个事实写进日报正文。
+FANOUT_LAST_TARGETS=""
 fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_json>
+  FANOUT_LAST_TARGETS=""
   if [ "$DRY_RUN" = 1 ]; then log "FANOUT[dry] $1 sev=$2 dedupe=$3"; return 0; fi
   if [ -z "$DBURL" ]; then log "FANOUT-SKIP 读不到 DATABASE_URL($ENV_FILE) event=$1"; return 0; fi
   if [ ! -f "$FANOUT_SQL" ]; then log "FANOUT-SKIP 找不到 $FANOUT_SQL event=$1"; return 0; fi
-  if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
+  local out targets inserted
+  if ! out="$(psql "$DBURL" -tAq -v ON_ERROR_STOP=1 \
        -v event_type="$1" -v severity="$2" -v dedupe_key="$3" \
        -v title="$4" -v body="$5" -v payload="$6" \
-       -f "$FANOUT_SQL" >/dev/null 2>&1; then
-    log "FANOUT-OK $1 sev=$2"
+       -f "$FANOUT_SQL" 2>&1)"; then
+    log "FANOUT-FAIL $1 sev=$2(outbox 未落,inbox/日志仍有留痕):$(printf '%s' "$out" | tr '\n' ' ' | head -c 160)"
+    return 0
+  fi
+  targets="$(printf '%s' "$out" | sed -n 's/.*fanout targets=\([0-9]\{1,\}\).*/\1/p' | head -1)"
+  inserted="$(printf '%s' "$out" | sed -n 's/.*inserted=\([0-9]\{1,\}\).*/\1/p' | head -1)"
+  FANOUT_LAST_TARGETS="$targets"
+  if [ -z "$targets" ]; then
+    log "FANOUT-UNKNOWN $1 sev=$2 —— 共享 SQL 未回报投递计数(模板被改?):$(printf '%s' "$out" | tr '\n' ' ' | head -c 160)"
+  elif [ "$targets" = 0 ]; then
+    log "FANOUT-ZERO $1 sev=$2 —— 零通道订阅(severity 门槛/enabled/activation_status),推送侧收不到;站内信仍有留痕"
+  elif [ "${inserted:-0}" = 0 ]; then
+    log "FANOUT-DEDUP $1 sev=$2 targets=$targets(全部命中幂等去重,未新建行)"
   else
-    log "FANOUT-FAIL $1 sev=$2(outbox 未落,inbox/日志仍有留痕)"
+    log "FANOUT-OK $1 sev=$2 targets=$targets inserted=$inserted"
   fi
 }
 
@@ -383,6 +403,18 @@ fanout_daily() {
   fi
 }
 fanout_daily
+
+# 心跳零投递如实写进日报正文(2026-07-26 P0)。日报正身就是"监控还活着"的正向心跳,
+# 而它 severity=info,撞上"唯一可投递通道 severity_min=warning"这条恒假门槛时**推送侧
+# 收不到任何东西**:值班侧因此无法用"心跳缺失"判断监控整体死亡。
+# 这里刻意只做"如实陈述",不把心跳升级成 warning —— 把常规日报伪装成告警会训练值班
+# 忽略 warning,代价比收益大。真正的修法是给至少一个通道配 severity_min='info'
+# (运维动作,见 docs/V5_MONITORING.md);配好后本行自动消失。
+if [ "${FANOUT_LAST_TARGETS:-}" = 0 ]; then
+  BODY+=$'\n'"> ⚠️ 心跳未推送:本条日报(info)匹配到 **0** 个可投递通道 —— 推送侧没有任何正向心跳,监控整体死亡时无法靠\"心跳缺失\"察觉。修法:给一个 admin_alert_channels 通道配 severity_min='info'(见 docs/V5_MONITORING.md)。"$'\n'
+  BODY="$(echo "$BODY" | head -c 16000 | iconv -f UTF-8 -t UTF-8 -c)"
+  log "HEARTBEAT-NOT-PUSHED ops.daily_report 匹配 0 个通道(已写入日报正文)"
+fi
 
 if [ "$DRY_RUN" = 1 ]; then
   echo "── dry-run:将发送站内信 ─────────────"
