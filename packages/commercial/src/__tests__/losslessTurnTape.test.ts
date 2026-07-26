@@ -130,6 +130,87 @@ describe("materializeLosslessTurn", () => {
     }
   });
 
+  test("persists each card exact model-call token attribution through durable records", () => {
+    const call = (callId: string, targetId: string, totalTokens: number) => ({
+      callId,
+      targetIds: [targetId],
+      usage: { totalTokens },
+    });
+    const turn = materializeLosslessTurn({
+      sessionId: "web-lossless-123",
+      agentId: "main",
+      turnIndex: 14,
+      clientMessageId: "m-user-call-usage",
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "answer",
+      thinkingText: "thinking",
+      createdAt: 1_783_944_000_000,
+      thinkingSegments: [{
+        index: 0,
+        text: "thinking",
+        ts: 1_783_944_000_001,
+        _callUsage: call(
+          "a1-ccb-1",
+          "srv-web-lossless-123-main-t14-thinking-s0",
+          12_345,
+        ),
+      }],
+      tools: [{
+        toolUseId: "tool-call-usage",
+        blockId: "tool-call-usage",
+        toolName: "Read",
+        inputJson: { file: "x" },
+        inputPreview: "x",
+        output: "done",
+        isError: false,
+        durationMs: 1,
+        ts: 1_783_944_000_002,
+        _callUsage: call("a1-ccb-2", "tool-call-usage", 123_456),
+      }],
+      structuredBlocks: [{
+        kind: "plan",
+        blockId: "plan-call-usage",
+        text: "plan",
+        partial: false,
+        _ocObservedAt: 1_783_944_000_003,
+        _callUsage: call("a1-ccb-3", "plan-call-usage", 234_567),
+      }],
+      assistantSegments: [{
+        index: 0,
+        text: "answer",
+        ts: 1_783_944_000_004,
+        _callUsage: call(
+          "a1-ccb-4",
+          "srv-web-lossless-123-main-t14-s0",
+          345_678,
+        ),
+      }],
+    });
+
+    const byRole = new Map(turn.records.map((record) => [record.role, record.payload]));
+    assert.deepEqual(byRole.get("thinking")?._callUsage, call(
+      "a1-ccb-1",
+      "srv-web-lossless-123-main-t14-thinking-s0",
+      12_345,
+    ));
+    assert.deepEqual(byRole.get("tool")?._callUsage, call(
+      "a1-ccb-2",
+      "tool-call-usage",
+      123_456,
+    ));
+    assert.deepEqual(byRole.get("plan")?._callUsage, call(
+      "a1-ccb-3",
+      "plan-call-usage",
+      234_567,
+    ));
+    assert.deepEqual(byRole.get("assistant")?._callUsage, call(
+      "a1-ccb-4",
+      "srv-web-lossless-123-main-t14-s0",
+      345_678,
+    ));
+  });
+
   test("keeps every plan/goal update and materializes the final readable record without caps", () => {
     const hugeDetail = "完整结构化细节😀".repeat(20_000);
     const planUpdates = Array.from({ length: 80 }, (_, index) => ({

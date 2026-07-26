@@ -57,6 +57,7 @@ import type {
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
   OutboundTurnUsageWire,
+  OutboundCallUsageWire,
 } from "./frames";
 
 const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000;
@@ -1572,6 +1573,7 @@ export function applyOutboundMessage(
         planMsg.completedAt = Date.now();
         if (frameTurnOwnerId) planMsg._turnOwnerId = frameTurnOwnerId;
       }
+      sess._blockIdToMsgId?.set(blockId, planMsg.id);
     } else if (b.kind === "goal") {
       const gb = b as {
         objective?: string;
@@ -2036,6 +2038,19 @@ export function applyTurnUsage(sess: ChatSession, frame: OutboundTurnUsageWire):
     ...(partialJsonByBlock ? { _partialJsonByBlock: partialJsonByBlock } : {}),
     _estimatedUtf8Bytes: 0,
   };
+}
+
+// ═══════════════ outbound.call_usage（单次模型调用 → 自身卡片）═══════════════
+export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire): void {
+  if (!acceptFrameSeq(sess, frame)) return;
+  if (!frame.clientMessageId || sess._activeClientMessageId !== frame.clientMessageId) return;
+  markFrameReceived(sess);
+  for (const targetId of frame.call.targetIds) {
+    const messageId = sess._blockIdToMsgId?.get(targetId) ?? targetId;
+    const msg = sess.messages.find((candidate) => candidate.id === messageId);
+    if (!msg) continue;
+    msg._callUsage = structuredClone(frame.call);
+  }
 }
 
 // ═══════════════ outbound.error 双帧（§11）═══════════════

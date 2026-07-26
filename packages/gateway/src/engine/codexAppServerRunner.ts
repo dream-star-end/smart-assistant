@@ -11,6 +11,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  type CallTokenUsageSnapshot,
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
@@ -1122,6 +1123,14 @@ export class CodexAppServerRunner extends EventEmitter {
    *  生命周期:per-turn。runTurn 顶部清空,shutdown 清空——codex 每 turn 重排 item
    *  id,跨 turn 保留会既泄漏又可能与新 turn 的 id 撞车漏发 tool_use。 */
   private emittedToolUseIds = new Set<string>()
+  /** Per-turn model-call attribution. Item notifications bind to an epoch
+   * synchronously (first-write-wins) before async item handlers run. */
+  private callUsageEpoch = 0
+  private itemCallUsageEpoch = new Map<string, number>()
+  private callUsageByEpoch = new Map<
+    number,
+    { callId: string; targetIds: Set<string>; usage?: TurnTokenUsageSnapshot }
+  >()
 
   /** Per-reasoning-item state for `item/reasoning/*` notifications. Both raw
    * text and summary deltas are paid model output and are therefore emitted
@@ -1330,6 +1339,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.priorTurnTotal = null
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    this.resetCallUsageAttribution()
     this.syncedPlatformGoalSignature = null
     this.syncedPlatformGoal = null
     this.cleanupLaunchOverrides()
@@ -1710,6 +1720,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // rejects the completer, so killed-turn tokens are billed to this turn.
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    this.resetCallUsageAttribution()
     // Tear down the per-spawn launch overrides so the next post-shutdown
     // submit() rebuilds against a fresh sessionDir. Re-using a stale
     // overrides reference after we rmSync the dir would point codex at a
@@ -2416,7 +2427,7 @@ export class CodexAppServerRunner extends EventEmitter {
     explanation?: string
     steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
     partial?: boolean
-  }): void {
+  }, callTargetId?: string): void {
     // Scope the plan card identity to the current Codex turn. The frontend
     // uses blockId as the stable update key; a process-wide "codex-plan"
     // key made separate turns fight over one card and made multi-client
@@ -2427,11 +2438,13 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emit('message', {
       type: 'openclaude_plan',
       session_id: this.threadId,
+      ...(callTargetId ? { openclaude_call_target_id: callTargetId } : {}),
       plan: {
         blockId: planBlockId,
         ...plan,
       },
     } as unknown as RunnerMessage)
+    if (callTargetId) this.recordCallUsageTarget(callTargetId)
   }
 
   private emitGoalBlock(goal: CodexGoalBlock): void {
@@ -2543,25 +2556,34 @@ export class CodexAppServerRunner extends EventEmitter {
     if (method === 'item/agentMessage/delta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
+      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
+      if (itemId) this.bindItemCallUsageEpoch(itemId)
       // turn-retry 台账:assistant 正文 delta 是对外可观测输出边界 → 置位。
       this.attemptHadObservableOutput = true
       this.currentAssistantBuf += delta
       this.emit('message', {
         type: 'stream_event',
         session_id: this.threadId,
+        ...(itemId ? { openclaude_call_target_id: itemId } : {}),
         event: {
           type: 'content_block_delta',
           index: 0,
           delta: { type: 'text_delta', text: delta },
         },
       } as unknown as RunnerMessage)
+      if (itemId) this.recordCallUsageTarget(itemId)
       return
     }
     if (method === 'item/plan/delta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
+      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
+      if (itemId) this.bindItemCallUsageEpoch(itemId)
       this.currentPlanDraft += delta
-      this.emitPlanBlock({ text: this.currentPlanDraft, partial: true })
+      this.emitPlanBlock(
+        { text: this.currentPlanDraft, partial: true },
+        itemId || undefined,
+      )
       return
     }
     if (method === 'turn/plan/updated') {
@@ -2584,7 +2606,8 @@ export class CodexAppServerRunner extends EventEmitter {
         .filter((s): s is { step: string; status: 'pending' | 'inProgress' | 'completed' } =>
           Boolean(s),
         )
-      this.emitPlanBlock({ explanation, steps, partial: true })
+      const planBlockId = `codex-plan-${this.activeTurnId ?? 'pending'}`
+      this.emitPlanBlock({ explanation, steps, partial: true }, planBlockId)
       return
     }
     // Reasoning streaming: codex emits raw `textDelta` (chain-of-thought) OR
@@ -2603,6 +2626,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.attemptHadObservableOutput = true
       const itemId = typeof p.itemId === 'string' ? p.itemId : ''
       if (itemId) {
+        this.bindItemCallUsageEpoch(itemId)
         const st = this.reasoningItemState.get(itemId) ?? { sawContent: false }
         st.sawContent = true
         this.reasoningItemState.set(itemId, st)
@@ -2610,12 +2634,14 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emit('message', {
         type: 'stream_event',
         session_id: this.threadId,
+        ...(itemId ? { openclaude_call_target_id: itemId } : {}),
         event: {
           type: 'content_block_delta',
           index: 0,
           delta: { type: 'thinking_delta', thinking: delta },
         },
       } as unknown as RunnerMessage)
+      if (itemId) this.recordCallUsageTarget(itemId)
       return
     }
     // Summary parts are structural model events. Avoid only a leading empty
@@ -2633,12 +2659,14 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emit('message', {
         type: 'stream_event',
         session_id: this.threadId,
+        openclaude_call_target_id: itemId,
         event: {
           type: 'content_block_delta',
           index: 0,
           delta: { type: 'thinking_delta', thinking: '\n\n' },
         },
       } as unknown as RunnerMessage)
+      this.recordCallUsageTarget(itemId)
       return
     }
     if (method === 'item/fileChange/patchUpdated') {
@@ -2678,6 +2706,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // tool counts/bridges until Codex emits the native final item.
       this.attemptHadToolOrPermission = true
       this.emittedToolUseIds.add(itemId)
+      this.bindItemCallUsageEpoch(itemId)
       this.emit('message', {
         type: 'openclaude_tool_snapshot',
         session_id: this.threadId,
@@ -2688,9 +2717,11 @@ export class CodexAppServerRunner extends EventEmitter {
           inputPreview: JSON.stringify({ file_path: filePath, kind }),
         },
       } as unknown as RunnerMessage)
+      this.recordCallUsageTarget(itemId)
       return
     }
     if (method === 'item/started') {
+      this.bindItemCallUsageEpochFromItem(p.item)
       this.handleItemStarted(p.item)
       return
     }
@@ -2701,6 +2732,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // imageGeneration's base64 writeFile (or any other async item path)
       // can race past the result frame, leaving the UI with empty output.
       const itemUnk = p.item
+      this.bindItemCallUsageEpochFromItem(itemUnk)
       const itemId =
         itemUnk && typeof itemUnk === 'object'
           ? typeof (itemUnk as Record<string, unknown>).id === 'string'
@@ -2788,6 +2820,10 @@ export class CodexAppServerRunner extends EventEmitter {
       const tu = p.tokenUsage as Record<string, unknown> | undefined
       if (!tu) return
       const total = _coerceTokenBreakdown(tu.total)
+      const duplicateTotal =
+        this.activeTurnTotal !== null && this.sameTokenBreakdown(this.activeTurnTotal, total)
+      const last = _coerceTokenBreakdown(tu.last)
+      this.recordCallUsageSnapshot(last, duplicateTotal)
       // Bootstrap baseline on the FIRST notification of a fresh runner
       // instance attached to a thread with prior history (e.g. server hot-
       // reload mid-conversation, sessionManager constructs a new
@@ -2800,7 +2836,6 @@ export class CodexAppServerRunner extends EventEmitter {
       // impossible given current sessionManager wiring) would undercount;
       // accepted defensive trade-off.
       if (this.priorTurnTotal === null && this.activeTurnTotal === null) {
-        const last = _coerceTokenBreakdown(tu.last)
         this.priorTurnTotal = _subtractTokenBreakdown(total, last)
       }
       this.activeTurnTotal = total
@@ -3262,6 +3297,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.priorTurnTotal = null
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    this.resetCallUsageAttribution()
     this.syncedPlatformGoalSignature = null
     this.syncedPlatformGoal = null
     // sessionManager listens for this and writes the new id (+ provider tag)
@@ -3313,6 +3349,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.collabSpawnReceivers.clear()
     this.completedCollabSpawnResults.clear()
     this.currentTurnUsage = null
+    this.resetCallUsageAttribution()
     this.attemptHadObservableOutput = false
     this.attemptHadToolOrPermission = false
     this.attemptEmittedTerminal = false
@@ -3326,6 +3363,12 @@ export class CodexAppServerRunner extends EventEmitter {
       b.cachedInputTokens === 0 &&
       b.reasoningOutputTokens === 0
     )
+  }
+
+  private resetCallUsageAttribution(): void {
+    this.callUsageEpoch = 0
+    this.itemCallUsageEpoch.clear()
+    this.callUsageByEpoch.clear()
   }
 
   /** consumeActiveTurnUsage 口径下,本 attempt 是否零 usage —— **不 consume**
@@ -3788,6 +3831,71 @@ export class CodexAppServerRunner extends EventEmitter {
         content: [{ type: 'tool_use', id, name, input }],
       },
     } satisfies RunnerMessage)
+    this.recordCallUsageTarget(id)
+  }
+
+  private bindItemCallUsageEpochFromItem(item: unknown): void {
+    if (!item || typeof item !== 'object') return
+    const id = (item as Record<string, unknown>).id
+    if (typeof id === 'string' && id) this.bindItemCallUsageEpoch(id)
+  }
+
+  private bindItemCallUsageEpoch(itemId: string): number {
+    const existing = this.itemCallUsageEpoch.get(itemId)
+    if (existing !== undefined) return existing
+    const epoch = this.callUsageEpoch
+    this.itemCallUsageEpoch.set(itemId, epoch)
+    return epoch
+  }
+
+  private callUsageRecord(epoch: number): {
+    callId: string
+    targetIds: Set<string>
+    usage?: TurnTokenUsageSnapshot
+  } {
+    let record = this.callUsageByEpoch.get(epoch)
+    if (!record) {
+      record = { callId: `codex-${epoch + 1}`, targetIds: new Set() }
+      this.callUsageByEpoch.set(epoch, record)
+    }
+    return record
+  }
+
+  private emitCallUsageEpoch(epoch: number): void {
+    const record = this.callUsageByEpoch.get(epoch)
+    if (!record?.usage || record.targetIds.size === 0) return
+    const call: CallTokenUsageSnapshot = {
+      callId: record.callId,
+      targetIds: [...record.targetIds],
+      usage: { ...record.usage },
+    }
+    this.emit('call_usage', call)
+  }
+
+  private recordCallUsageTarget(itemId: string): void {
+    const epoch = this.bindItemCallUsageEpoch(itemId)
+    const record = this.callUsageRecord(epoch)
+    const before = record.targetIds.size
+    record.targetIds.add(itemId)
+    if (record.targetIds.size !== before) this.emitCallUsageEpoch(epoch)
+  }
+
+  private recordCallUsageSnapshot(last: CodexTokenBreakdown, duplicateTotal: boolean): void {
+    const epoch = duplicateTotal ? Math.max(0, this.callUsageEpoch - 1) : this.callUsageEpoch
+    const record = this.callUsageRecord(epoch)
+    record.usage = _codexTurnUsageSnapshot(last)
+    this.emitCallUsageEpoch(epoch)
+    if (!duplicateTotal) this.callUsageEpoch++
+  }
+
+  private sameTokenBreakdown(a: CodexTokenBreakdown, b: CodexTokenBreakdown): boolean {
+    return (
+      a.cachedInputTokens === b.cachedInputTokens &&
+      a.inputTokens === b.inputTokens &&
+      a.outputTokens === b.outputTokens &&
+      a.reasoningOutputTokens === b.reasoningOutputTokens &&
+      a.totalTokens === b.totalTokens
+    )
   }
 
   /** V5 CG(2026-07-10)— tool_use/tool_result 成对不变量的唯一守卫点(见

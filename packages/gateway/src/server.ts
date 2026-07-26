@@ -30,6 +30,7 @@ import {
   type InboundFrame,
   type InboundMessage,
   type OutboundCodexBilling,
+  type OutboundCallUsage,
   type OutboundError,
   type OutboundMessage,
   type OutboundTurnStatus,
@@ -14363,6 +14364,15 @@ export class Gateway {
           usage: e.usage,
         }
         this.deliver(usageFrame, adapter)
+      } else if (e.kind === 'call_usage') {
+        if (!out.clientMessageId) return
+        const usageFrame: OutboundCallUsage & { _userId?: string } = {
+          type: 'outbound.call_usage',
+          ..._inheritOutboundRouting(out),
+          clientMessageId: out.clientMessageId,
+          call: e.call,
+        }
+        this.deliver(usageFrame, adapter)
       } else if (e.kind === 'final') {
         leaderFinalCount++
         // Plan 2 — turn 终态前先清 turn_status cache。CCB 正常关 compact 会先
@@ -14917,6 +14927,7 @@ export class Gateway {
       | OutboundCodexBilling
       | OutboundTurnStatus
       | OutboundTurnUsage
+      | OutboundCallUsage
       | SysContextRebuilt,
     adapter?: ChannelAdapter,
   ): void {
@@ -14950,6 +14961,7 @@ export class Gateway {
     const isSideband =
       wire.type === 'outbound.turn_status' ||
       wire.type === 'outbound.turn_usage' ||
+      wire.type === 'outbound.call_usage' ||
       wire.type === 'sys.context_rebuilt'
     if (adapter && !isSideband) {
       adapter.send(wire as OutboundMessage).catch((err) =>
@@ -14994,6 +15006,7 @@ export class Gateway {
       const isProgressFrame =
         wire.type === 'outbound.turn_status' ||
         wire.type === 'outbound.turn_usage' ||
+        wire.type === 'outbound.call_usage' ||
         (wire.type === 'outbound.message' &&
           Array.isArray(blocks) &&
           blocks.length > 0 &&

@@ -30,7 +30,11 @@
  *     这里收口保证 codex 路径永远命中 scrub,与 buildCodexEnv 的 env scrub 成对。
  */
 import { EventEmitter } from 'node:events'
-import type { GoalStateSnapshot, TurnTokenUsageSnapshot } from '@openclaude/protocol'
+import type {
+  CallTokenUsageSnapshot,
+  GoalStateSnapshot,
+  TurnTokenUsageSnapshot,
+} from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import { createLogger } from '../logger.js'
@@ -88,8 +92,84 @@ interface CodexTurnContext {
   parser: CcbMessageParser
   lastErrorText: string | null
   onEvent: (event: EngineEvent) => void
+  cardTargetsByKernelTarget: Map<string, Set<string>>
+  latestCallUsageById: Map<string, CallTokenUsageSnapshot>
   turnKey?: string
   usageAttribution?: UsageAttributionTag
+}
+
+function resolveCallUsageTargets(
+  ctx: CodexTurnContext,
+  call: CallTokenUsageSnapshot,
+): CallTokenUsageSnapshot {
+  const targetIds = new Set<string>()
+  for (const targetId of call.targetIds) {
+    const cardTargets = ctx.cardTargetsByKernelTarget.get(targetId)
+    if (cardTargets?.size) {
+      for (const cardTarget of cardTargets) targetIds.add(cardTarget)
+    } else {
+      // Tool item ids and plan block ids are already durable card ids.
+      targetIds.add(targetId)
+    }
+  }
+  return {
+    ...structuredClone(call),
+    targetIds: [...targetIds],
+  }
+}
+
+function observeKernelCardTarget(
+  ctx: CodexTurnContext,
+  msg: Record<string, unknown>,
+): void {
+  const kernelTarget =
+    typeof msg.openclaude_call_target_id === 'string'
+      ? msg.openclaude_call_target_id
+      : ''
+  if (!kernelTarget) return
+  let cardTarget: string | undefined
+  if (msg.type === 'stream_event') {
+    const event =
+      msg.event && typeof msg.event === 'object'
+        ? msg.event as Record<string, unknown>
+        : undefined
+    const delta =
+      event?.delta && typeof event.delta === 'object'
+        ? event.delta as Record<string, unknown>
+        : undefined
+    if (delta?.type === 'text_delta') {
+      const segment = ctx.parser.assistantSegments.at(-1)
+      if (segment && ctx.parser.assistantMessageId) {
+        cardTarget = `${ctx.parser.assistantMessageId}-s${segment.index}`
+      }
+    } else if (delta?.type === 'thinking_delta') {
+      const segment = ctx.parser.thinkingSegments.at(-1)
+      if (segment && ctx.parser.thinkingMessageId) {
+        cardTarget = `${ctx.parser.thinkingMessageId}-s${segment.index}`
+      }
+    }
+  } else if (msg.type === 'openclaude_plan') {
+    const plan =
+      msg.plan && typeof msg.plan === 'object'
+        ? msg.plan as Record<string, unknown>
+        : undefined
+    if (typeof plan?.blockId === 'string' && plan.blockId) cardTarget = plan.blockId
+  }
+  if (!cardTarget) return
+  let targets = ctx.cardTargetsByKernelTarget.get(kernelTarget)
+  if (!targets) {
+    targets = new Set()
+    ctx.cardTargetsByKernelTarget.set(kernelTarget, targets)
+  }
+  const before = targets.size
+  targets.add(cardTarget)
+  if (targets.size === before) return
+  // A late-visible segment/plan must receive an already-observed exact usage.
+  for (const call of ctx.latestCallUsageById.values()) {
+    if (call.targetIds.includes(kernelTarget)) {
+      ctx.onEvent({ kind: 'call_usage', call: resolveCallUsageTargets(ctx, call) })
+    }
+  }
 }
 
 function buildTurnSummary(result: TurnResult, ctx: CodexTurnContext): TurnSummary {
@@ -325,7 +405,12 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         }
       }
       // fake-SDK RunnerMessage 是 SdkMessage 子集(内核注释明示),cast 内聚在此。
-      turn?.parser.parse(msg as unknown as SdkMessage)
+      if (turn) {
+        turn.parser.parse(msg as unknown as SdkMessage)
+        // Parser has now chosen the exact segment/block id. Bind the kernel
+        // item id to that durable card before the runner emits call_usage.
+        observeKernelCardTarget(turn, msg)
+      }
     })
     this.kernel.on('runtime_event', (payload: unknown) => {
       this.emit('activity')
@@ -337,6 +422,13 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       const turn = this._activeTurn
       if (!turn || turn.parser.finalized) return
       turn.onEvent({ kind: 'usage', usage })
+    })
+    this.kernel.on('call_usage', (call: CallTokenUsageSnapshot) => {
+      this.emit('activity')
+      const turn = this._activeTurn
+      if (!turn || turn.parser.finalized) return
+      turn.latestCallUsageById.set(call.callId, structuredClone(call))
+      turn.onEvent({ kind: 'call_usage', call: resolveCallUsageTargets(turn, call) })
     })
     this.kernel.on('session_id', (id: string) => {
       this._threadId = typeof id === 'string' && id ? id : null
@@ -364,6 +456,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       parser: null as unknown as CcbMessageParser,
       lastErrorText: null,
       onEvent: params.onEvent,
+      cardTargetsByKernelTarget: new Map(),
+      latestCallUsageById: new Map(),
       ...(params.turnKey ? { turnKey: params.turnKey } : {}),
       ...(params.usageAttribution
         ? { usageAttribution: { ...params.usageAttribution } }

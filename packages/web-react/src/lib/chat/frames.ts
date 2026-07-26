@@ -18,6 +18,7 @@
  * 故这里不纳入消费联合；inbound 仍保留 protocol 的 model/effortLevel 顶层字段语义。
  */
 import type {
+  CallTokenUsageSnapshot,
   InboundControlStop,
   InboundMessage,
   InboundPermissionResponse,
@@ -28,6 +29,7 @@ import type {
   InboundPromptQueueReorder,
   MediaRef,
   OutboundActiveTurnReplayStart,
+  OutboundCallUsage,
   OutboundContentBlock,
   OutboundError,
   OutboundMessage,
@@ -51,6 +53,7 @@ export type {
   InboundPromptQueueReorder,
   MediaRef,
   OutboundContentBlock,
+  CallTokenUsageSnapshot,
   Peer,
   PromptQueueSnapshot,
   TurnTokenUsageSnapshot,
@@ -103,6 +106,7 @@ export type OutboundResumeFailedWire = OutboundResumeFailed & WireRuntimeFields;
 export type OutboundActiveTurnReplayStartWire = OutboundActiveTurnReplayStart;
 export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
 export type OutboundTurnUsageWire = OutboundTurnUsage & WireRuntimeFields;
+export type OutboundCallUsageWire = OutboundCallUsage & WireRuntimeFields;
 
 /** legacy bridge error 帧（`type:'error'`，protocol 未建模）。*/
 export type LegacyBridgeErrorWire = {
@@ -242,6 +246,7 @@ export type OutboundWire =
   | OutboundActiveTurnReplayStartWire
   | OutboundTurnStatusWire
   | OutboundTurnUsageWire
+  | OutboundCallUsageWire
   | PromptQueueSnapshot
   | LegacyBridgeErrorWire
   | CostChargedWire

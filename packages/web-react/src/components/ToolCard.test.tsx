@@ -19,20 +19,31 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByTitle("ls -la")).toHaveClass("truncate");
   });
 
-  test("涉及 token 的工具卡实时替换本轮消耗快照", () => {
+  test("涉及 token 的工具卡用紧凑数字实时替换自己的调用消耗", () => {
     const message = {
       toolName: "Bash",
       inputJson: { command: "sleep 1" },
       _completed: false,
     };
     const { rerender } = render(
-      <ToolCard message={message} tokenUsage={{ totalTokens: 128 }} />,
+      <ToolCard message={message} tokenUsage={{ totalTokens: 128, callId: "ccb-1" }} />,
     );
-    expect(screen.getByText("本轮 128 token")).toBeInTheDocument();
+    expect(screen.getByText("128")).toBeInTheDocument();
 
-    rerender(<ToolCard message={message} tokenUsage={{ totalTokens: 2048 }} />);
-    expect(screen.getByText("本轮 2,048 token")).toBeInTheDocument();
-    expect(screen.queryByText("本轮 128 token")).not.toBeInTheDocument();
+    rerender(<ToolCard message={message} tokenUsage={{ totalTokens: 2048, callId: "ccb-1" }} />);
+    expect(screen.getByText("2.05k")).toBeInTheDocument();
+    expect(screen.queryByText("128")).not.toBeInTheDocument();
+  });
+
+  test("同一次模型调用产出多张卡时明确显示共享 token，不伪造均分", () => {
+    render(
+      <ToolCard
+        message={{ toolName: "Bash", inputJson: { command: "pwd" }, _completed: true }}
+        tokenUsage={{ totalTokens: 123_456, callId: "ccb-2", shared: true }}
+      />,
+    );
+    expect(screen.getByText("共123k")).toBeInTheDocument();
+    expect(screen.getByLabelText("同一次模型调用由多张卡片共享，共 123,456 token")).toBeInTheDocument();
   });
 
   test("Bash heredoc 纯写文件：显示写入文件语义卡，展开仍保留原始命令", () => {

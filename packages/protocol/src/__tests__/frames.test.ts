@@ -15,6 +15,7 @@ import { Value } from '@sinclair/typebox/value'
 import {
   InboundControlStop,
   InboundMessage,
+  OutboundCallUsage,
   OutboundCodexBilling,
   OutboundError,
   OutboundMessage,
@@ -477,6 +478,60 @@ describe('OutboundPermissionRequest schema', () => {
       Value.Check(OutboundPermissionRequest, {
         ...(baseOutboundPermissionRequest() as object),
         clientMessageId: 'contains spaces',
+      }),
+      false,
+    )
+  })
+})
+
+describe('OutboundCallUsage schema', () => {
+  const valid = {
+    type: 'outbound.call_usage',
+    sessionKey: 'agent:main:webchat:dm:p1',
+    channel: 'webchat',
+    peer,
+    clientMessageId: 'm-user-1',
+    call: {
+      callId: 'a1-ccb-1',
+      targetIds: ['tool-use-1', 'assistant-s0'],
+      usage: {
+        totalTokens: 123456,
+        inputTokens: 120000,
+        outputTokens: 3456,
+      },
+    },
+  }
+
+  it('accepts one exact model call mapped to one or more durable card targets', () => {
+    assert.equal(Value.Check(OutboundCallUsage, valid), true)
+  })
+
+  it('rejects missing call identity, targets, or invalid token counts', () => {
+    assert.equal(
+      Value.Check(OutboundCallUsage, {
+        ...valid,
+        call: { ...valid.call, callId: undefined },
+      }),
+      false,
+    )
+    assert.equal(
+      Value.Check(OutboundCallUsage, {
+        ...valid,
+        call: { ...valid.call, targetIds: undefined },
+      }),
+      false,
+    )
+    assert.equal(
+      Value.Check(OutboundCallUsage, {
+        ...valid,
+        call: { ...valid.call, targetIds: [] },
+      }),
+      false,
+    )
+    assert.equal(
+      Value.Check(OutboundCallUsage, {
+        ...valid,
+        call: { ...valid.call, usage: { totalTokens: -1 } },
       }),
       false,
     )

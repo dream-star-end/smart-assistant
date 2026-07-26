@@ -68,7 +68,7 @@ import {
 } from '@openclaude/protocol'
 
 import { createLogger } from './logger.js'
-import type { TurnToolEntry } from './ccbMessageParser.js'
+import type { SegmentRecord, TurnToolEntry } from './ccbMessageParser.js'
 import type { DurableRuntimeEvent } from './engine/engineEvents.js'
 import type { V3MasterRetryQueue, V3MasterRetryEntry } from './v3MasterRetryQueue.js'
 
@@ -219,10 +219,10 @@ export interface V3MasterSinkWirePayload {
    *  When absent (old gateway, legacy callers), master falls back to the
    *  single-row `text` field above.
    *  Plan: docs/wip/fixb-per-segment-row-id-PLAN.md §3.5.1. */
-  assistantSegments?: Array<{ index: number; text: string; ts: number; eventOrdinal?: number }>
+  assistantSegments?: SegmentRecord[]
   /** Fix B (2026-05-25) — same per-segment treatment for thinking rows
    *  (`srv-...-tN-thinking-s${idx}`). */
-  thinkingSegments?: Array<{ index: number; text: string; ts: number; eventOrdinal?: number }>
+  thinkingSegments?: SegmentRecord[]
   /** P2 债A — completed delegations (team cards) for this leader turn. Buffered
    *  on the parent session as delegates finish and drained with the turn-end
    *  persist. Master writes each as a server-authored `role: 'agent-group'`

@@ -547,6 +547,18 @@ export const TurnTokenUsageSnapshot = Type.Object({
 })
 export type TurnTokenUsageSnapshot = Static<typeof TurnTokenUsageSnapshot>
 
+/**
+ * Exact usage of one engine model call plus every visible top-level card that
+ * call produced. Multiple targets deliberately share the same callId and
+ * usage; consumers must de-duplicate by callId rather than summing cards.
+ */
+export const CallTokenUsageSnapshot = Type.Object({
+  callId: Type.String({ minLength: 1 }),
+  targetIds: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+  usage: TurnTokenUsageSnapshot,
+})
+export type CallTokenUsageSnapshot = Static<typeof CallTokenUsageSnapshot>
+
 export const OutboundContentBlock = Type.Union([
   Type.Object({
     kind: Type.Literal('text'),
@@ -1093,6 +1105,20 @@ export const OutboundTurnUsage = Type.Object({
 })
 export type OutboundTurnUsage = Static<typeof OutboundTurnUsage>
 
+// Exact per-model-call usage for the cards named by targetIds. This is a
+// progress sideband; the same snapshot is embedded into the immutable turn
+// tape for refresh/re-login recovery.
+export const OutboundCallUsage = Type.Object({
+  type: Type.Literal('outbound.call_usage'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  clientMessageId: ClientMessageId,
+  call: CallTokenUsageSnapshot,
+  traceId: Type.Optional(TraceIdString),
+})
+export type OutboundCallUsage = Static<typeof OutboundCallUsage>
+
 // ───────────────────────────────────────────────
 // SysContextRebuilt — 上下文重建提示帧(长会话热尾巴+归档,boss 硬指标 3)。
 //
@@ -1206,6 +1232,7 @@ export const AnyFrame = Type.Union([
   OutboundCodexBilling,
   OutboundTurnStatus,
   OutboundTurnUsage,
+  OutboundCallUsage,
   PromptQueueSnapshot,
   SysContextRebuilt,
   SysIncident,

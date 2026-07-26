@@ -50,6 +50,7 @@ import {
 } from './v3MasterSink.js'
 import { failClosedOnRunningCasMiss } from './turnDispatchInbox.js'
 import {
+  type CallTokenUsageSnapshot,
   AUTHORITY_TURN_MAX_LIFETIME_MS,
   modelHistoryRoleLabel,
   modelHistorySemanticRole,
@@ -915,9 +916,9 @@ function persistServerAuthoredTurnOutcome(args: {
    *  segment (`srv-...-tN-s${idx}`). Legacy/personal path keeps single-row
    *  behavior (only the live stream gets segment ids; refresh-recovery on
    *  personal version stays single-row). Plan §3.5.1. */
-  assistantSegments?: { index: number; text: string; ts: number }[]
+  assistantSegments?: SegmentRecord[]
   /** Fix B (2026-05-25) — same per-segment treatment for thinking rows. */
-  thinkingSegments?: { index: number; text: string; ts: number }[]
+  thinkingSegments?: SegmentRecord[]
   /** P2 债A — completed delegations (team cards) for this turn, drained from
    *  the leader session's `_pendingAgentGroups` buffer. v3 sink path forwards
    *  to master which writes each as a server-authored `role: 'agent-group'`
@@ -3829,6 +3830,7 @@ export class SessionManager {
           attempt < MAX_RETRIES,
           !phantomRetryUsed,
           attempt < MAX_RETRIES,
+          attempt,
         )
         return // success
       } catch (err: any) {
@@ -4008,6 +4010,8 @@ export class SessionManager {
     retryPhantomErrors = true,
     /** Whether a normal transient error result may enter another attempt. */
     retryTransientErrors = false,
+    /** Zero-based retry attempt; names call ids so frozen attempts never collide. */
+    attemptOrdinal = 0,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -4019,6 +4023,42 @@ export class SessionManager {
     // merely the last card projection) so a disconnected browser is never the
     // sole durable copy.
     const structuredBlocks: Array<Record<string, unknown>> = []
+    const callUsageByTarget = new Map<string, CallTokenUsageSnapshot>()
+    const freezeCall = (call: CallTokenUsageSnapshot): CallTokenUsageSnapshot =>
+      structuredClone(call)
+    const freezeTools = (tools: readonly TurnToolEntry[]): TurnToolEntry[] =>
+      tools.map((tool) => {
+        const call = callUsageByTarget.get(tool.blockId)
+        return {
+          ...structuredClone(tool),
+          ...(call ? { _callUsage: freezeCall(call) } : {}),
+        }
+      })
+    const freezeSegments = (
+      segments: readonly SegmentRecord[],
+      messageIdBase: string | undefined,
+    ): SegmentRecord[] =>
+      segments.map((segment) => {
+        const targetId = messageIdBase
+          ? `${messageIdBase}-s${segment.index}`
+          : undefined
+        const call = targetId ? callUsageByTarget.get(targetId) : undefined
+        return {
+          ...structuredClone(segment),
+          ...(call ? { _callUsage: freezeCall(call) } : {}),
+        }
+      })
+    const freezeStructuredBlocks = (
+      blocks: readonly Record<string, unknown>[],
+    ): Array<Record<string, unknown>> =>
+      blocks.map((block) => {
+        const targetId = typeof block.blockId === 'string' ? block.blockId : undefined
+        const call = targetId ? callUsageByTarget.get(targetId) : undefined
+        return {
+          ...structuredClone(block),
+          ...(call ? { _callUsage: freezeCall(call) } : {}),
+        }
+      })
     const onPostTerminalRuntimeEvent = (
       event: DurableRuntimeEvent,
       block: OutboundContentBlock,
@@ -4166,6 +4206,17 @@ export class SessionManager {
               ? { terminationReason: tr.terminationReason }
               : {}),
           }))
+          return
+        }
+        if (e.kind === 'call_usage') {
+          const call: CallTokenUsageSnapshot = {
+            ...structuredClone(e.call),
+            callId: `a${attemptOrdinal + 1}-${e.call.callId}`,
+          }
+          for (const targetId of call.targetIds) {
+            callUsageByTarget.set(targetId, call)
+          }
+          onEvent({ kind: 'call_usage', call })
           return
         }
         if (
@@ -4319,22 +4370,22 @@ export class SessionManager {
           const partialAssistant = combineRetryAssistantOutput(
             retryAssistantSegments,
             snap.assistantText,
-            snap.assistantSegments,
+            freezeSegments(snap.assistantSegments, assistantMessageId),
             Date.now(),
           )
           const partialThinking = combineRetryAssistantOutput(
             retryThinkingSegments,
             snap.thinkingText,
-            snap.thinkingSegments,
+            freezeSegments(snap.thinkingSegments, thinkingMessageId),
             Date.now(),
           )
           const partialTools = [
             ...retryTools.map((tool) => structuredClone(tool)),
-            ...snap.completedTools,
+            ...freezeTools(snap.completedTools),
           ]
           const partialStructuredBlocks = [
             ...retryStructuredBlocks.map((block) => structuredClone(block)),
-            ...structuredBlocks,
+            ...freezeStructuredBlocks(structuredBlocks),
           ]
           if (session._durableDelegateRuntimeEvents) {
             session._durableDelegateRuntimeEvents.push(
@@ -4585,8 +4636,10 @@ export class SessionManager {
             retryRuntimeEvents.push(
               ...result.runtimeEvents.map((event) => structuredClone(event)),
             )
-            const attemptAssistantSegments = result.assistantSegments.length > 0
-              ? result.assistantSegments
+            const frozenAttemptAssistantSegments =
+              freezeSegments(result.assistantSegments, assistantMessageId)
+            const attemptAssistantSegments = frozenAttemptAssistantSegments.length > 0
+              ? frozenAttemptAssistantSegments
               : result.assistantText.length > 0
                 ? [{ index: 0, text: result.assistantText, ts: Date.now() }]
                 : []
@@ -4596,8 +4649,10 @@ export class SessionManager {
                 index: retryAssistantSegments.length + index,
               })),
             )
-            const attemptThinkingSegments = result.thinkingSegments.length > 0
-              ? result.thinkingSegments
+            const frozenAttemptThinkingSegments =
+              freezeSegments(result.thinkingSegments, thinkingMessageId)
+            const attemptThinkingSegments = frozenAttemptThinkingSegments.length > 0
+              ? frozenAttemptThinkingSegments
               : result.thinkingText.length > 0
                 ? [{ index: 0, text: result.thinkingText, ts: Date.now() }]
                 : []
@@ -4607,9 +4662,9 @@ export class SessionManager {
                 index: retryThinkingSegments.length + index,
               })),
             )
-            retryTools.push(...result.tools.map((tool) => structuredClone(tool)))
+            retryTools.push(...freezeTools(result.tools))
             retryStructuredBlocks.push(
-              ...structuredBlocks.map((block) => structuredClone(block)),
+              ...freezeStructuredBlocks(structuredBlocks),
             )
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
@@ -4792,22 +4847,22 @@ export class SessionManager {
             const completedAssistant = combineRetryAssistantOutput(
               retryAssistantSegments,
               result.assistantText,
-              result.assistantSegments,
+              freezeSegments(result.assistantSegments, assistantMessageId),
               Date.now(),
             )
             const completedThinking = combineRetryAssistantOutput(
               retryThinkingSegments,
               result.thinkingText,
-              result.thinkingSegments,
+              freezeSegments(result.thinkingSegments, thinkingMessageId),
               Date.now(),
             )
             const completedTools = [
               ...retryTools.map((tool) => structuredClone(tool)),
-              ...result.tools,
+              ...freezeTools(result.tools),
             ]
             const completedStructuredBlocks = [
               ...retryStructuredBlocks.map((block) => structuredClone(block)),
-              ...structuredBlocks,
+              ...freezeStructuredBlocks(structuredBlocks),
             ]
             session.totalInputTokens += result.usage.inputTokens
             session.totalOutputTokens += result.usage.outputTokens

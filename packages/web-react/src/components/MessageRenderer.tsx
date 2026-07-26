@@ -55,6 +55,9 @@ import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, Avatar, Spinner } from "./ui";
 import {
   delegateTokenUsage,
+  displayCallTokenUsage,
+  type DisplayTokenUsage,
+  groupedCallTokenUsage,
   tokenUsageSignature,
   tokenUsageSnapshot,
 } from "./chat/tokenUsage";
@@ -77,8 +80,8 @@ type RendererProps = {
   historyGeneration?: number | string;
   /** 生命周期归 MessageList，而不是可卸载的虚拟行。 */
   processPaging?: UserUpwardPagingController;
-  /** Turn-level display shared by every token-producing card in this turn. */
-  tokenUsage?: LiveTurnTokenUsageSnapshot;
+  /** Exact call usage for this card, or the final assistant's turn fallback. */
+  tokenUsage?: DisplayTokenUsage;
   /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
    *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
    *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
@@ -572,7 +575,7 @@ type RenderItem =
       isLast: boolean;
       idx: number;
       delegateCost?: string;
-      tokenUsage?: LiveTurnTokenUsageSnapshot;
+      tokenUsage?: DisplayTokenUsage;
     }
   | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> }
   | {
@@ -581,7 +584,7 @@ type RenderItem =
       sig: string;
       isLast: boolean;
       idx: number;
-      tokenUsage?: LiveTurnTokenUsageSnapshot;
+      tokenUsage?: DisplayTokenUsage;
     };
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
@@ -650,22 +653,29 @@ function coalesceTeam(
       stage++;
     }
   }
-  // Final/history truth comes from the immutable tape's usage-bearing anchor.
-  // The active browser turn temporarily overrides that same stable user anchor
-  // with its exact-or-explicitly-estimated live display.
-  const tokenUsageByAnchor = new Map<number, LiveTurnTokenUsageSnapshot>();
-  for (let i = 0; i < total; i++) {
-    const usage = tokenUsageSnapshot(messages[i]?.usage);
-    if (usage) tokenUsageByAnchor.set(anchorOf[i], usage);
-  }
+  // A card only displays the model call that actually produced it. The
+  // turn-wide snapshot remains a fallback for the final assistant row; it is
+  // never projected onto every tool/thinking card.
+  let liveFallbackIdx = -1;
   if (liveTurnUsage) {
     const liveAnchor = messages.findIndex(
       (message) => message.role === "user" && message.id === liveTurnUsage.clientMessageId,
     );
-    if (liveAnchor >= 0) tokenUsageByAnchor.set(liveAnchor, { ...liveTurnUsage.usage });
+    if (liveAnchor >= 0) {
+      for (let i = liveAnchor + 1; i < total && messages[i]?.role !== "user"; i++) {
+        if (messages[i]?.role === "assistant") liveFallbackIdx = i;
+      }
+    }
   }
-  const turnUsageFor = (absIdx: number): LiveTurnTokenUsageSnapshot | undefined =>
-    tokenUsageByAnchor.get(anchorOf[absIdx]);
+  const tokenUsageFor = (
+    absIdx: number,
+    message: ChatMessage,
+  ): DisplayTokenUsage | undefined =>
+    displayCallTokenUsage(message._callUsage) ??
+    tokenUsageSnapshot(message.usage) ??
+    (absIdx === liveFallbackIdx && liveTurnUsage
+      ? { ...liveTurnUsage.usage }
+      : undefined);
   // 面板成员资格:agent-group 且非隐藏审查员(审查卡恒单卡,按时序独立渲染)。
   const isPanelMember = (m: ChatMessage | undefined): boolean =>
     !!m && m._timelineRecord !== true && messageKind(m) === "agent-group" &&
@@ -719,7 +729,7 @@ function coalesceTeam(
         m,
         isLast: absIdx === total - 1,
         idx: absIdx,
-        tokenUsage: turnUsageFor(absIdx),
+        tokenUsage: tokenUsageFor(absIdx, m),
       });
       continue;
     }
@@ -758,7 +768,7 @@ function coalesceTeam(
         isLast: absIdx === total - 1,
         idx: absIdx,
         delegateCost: costFor(absIdx, m),
-        tokenUsage: turnUsageFor(absIdx),
+        tokenUsage: tokenUsageFor(absIdx, m),
       });
       continue;
     }
@@ -770,7 +780,7 @@ function coalesceTeam(
         isLast: absIdx === total - 1,
         idx: absIdx,
         delegateCost: costFor(absIdx, m),
-        tokenUsage: turnUsageFor(absIdx),
+        tokenUsage: tokenUsageFor(absIdx, m),
       });
       continue;
     }
@@ -801,14 +811,15 @@ function coalesceTeam(
       // 后到成员/流式完成时 memo 正常重渲防漏渲)。key 用首条成员 id → 流式追加成员时稳定不重挂。
       const sig = members
         .map((mm, k) => messageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
-        .join("||") + `|tu:${tokenUsageSignature(turnUsageFor(absIdx))}`;
+        .join("||");
+      const thinkingUsage = groupedCallTokenUsage(members.map((member) => member._callUsage));
       items.push({
         kind: "thinking",
         members,
-        sig,
+        sig: `${sig}|tu:${tokenUsageSignature(thinkingUsage)}`,
         isLast: groupIsLast,
         idx: absIdx,
-        tokenUsage: turnUsageFor(absIdx),
+        tokenUsage: thinkingUsage,
       });
       continue;
     }
@@ -817,7 +828,7 @@ function coalesceTeam(
       m,
       isLast: absIdx === total - 1,
       idx: absIdx,
-      tokenUsage: turnUsageFor(absIdx),
+      tokenUsage: tokenUsageFor(absIdx, m),
     });
   }
   return items;

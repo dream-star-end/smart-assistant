@@ -18,11 +18,10 @@
  * 流式：input 经 normalizeToolForDisplay/resolveToolInput 优先 inputJson、其次容错解析 partialJson —— Edit/Write
  * 的 diff/内容据此边流边渲；_completed 后切完整 inputJson。
  */
-import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { cn } from "../lib/utils";
-import { TokenUsageBadge } from "./chat/tokenUsage";
+import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/bodies";
 import {
   type ToolLike,
@@ -47,7 +46,7 @@ export function ToolCard({
   tokenUsage,
 }: {
   message: ToolLike;
-  tokenUsage?: TurnTokenUsageSnapshot;
+  tokenUsage?: DisplayTokenUsage;
 }) {
   const display = normalizeToolForDisplay(message);
   const name = display.name;

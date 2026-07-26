@@ -28,6 +28,7 @@ import {
   shouldApplyGoalSnapshot,
 } from "./model";
 import {
+  applyCallUsage,
   applyCostCharged,
   applyCostWaived,
   applyLegacyBridgeError,
@@ -370,6 +371,22 @@ function turnUsageFrame(over: AnyFrame): Parameters<typeof applyTurnUsage>[1] {
   } as unknown as Parameters<typeof applyTurnUsage>[1];
 }
 
+function callUsageFrame(over: AnyFrame): Parameters<typeof applyCallUsage>[1] {
+  return {
+    type: "outbound.call_usage",
+    sessionKey: "agent:main:webchat:dm:s1",
+    channel: "webchat",
+    peer: { id: "s1", kind: "dm" },
+    clientMessageId: "u1",
+    call: {
+      callId: "a1-ccb-1",
+      targetIds: ["tool-block-1"],
+      usage: { totalTokens: 1 },
+    },
+    ...over,
+  } as unknown as Parameters<typeof applyCallUsage>[1];
+}
+
 describe("applyTurnStatus retrying 判别联合", () => {
   test("status=retrying → _turnStatus 建模为 {kind,attempt,max,retryAt}", () => {
     const s = sess();
@@ -618,6 +635,123 @@ describe("applyTurnUsage 实时 token 权威快照", () => {
       outputTokens: 7,
     });
     expect(s._liveTurnUsage).toBeUndefined();
+  });
+});
+
+describe("applyCallUsage 每张卡片调用 token 快照", () => {
+  test("按 durable blockId 绑定工具卡并实时替换同一次调用的绝对值", () => {
+    const s = sess();
+    s._activeClientMessageId = "u1";
+    const tool = addMessage(s, "tool", "", {
+      id: "tool-message-1",
+      blockId: "tool-block-1",
+      toolName: "Bash",
+    });
+    s._blockIdToMsgId?.set("tool-block-1", tool.id);
+
+    applyCallUsage(s, callUsageFrame({
+      frameSeq: 1,
+      call: {
+        callId: "a1-ccb-1",
+        targetIds: ["tool-block-1"],
+        usage: { totalTokens: 128 },
+      },
+    }));
+    expect(tool._callUsage).toEqual({
+      callId: "a1-ccb-1",
+      targetIds: ["tool-block-1"],
+      usage: { totalTokens: 128 },
+    });
+
+    applyCallUsage(s, callUsageFrame({
+      frameSeq: 2,
+      call: {
+        callId: "a1-ccb-1",
+        targetIds: ["tool-block-1"],
+        usage: { totalTokens: 2_048 },
+      },
+    }));
+    expect(tool._callUsage?.usage.totalTokens).toBe(2_048);
+  });
+
+  test("同一次调用的并行卡片共享完整 exact 值，不做伪均分", () => {
+    const s = sess();
+    s._activeClientMessageId = "u1";
+    const first = addMessage(s, "thinking", "分析一", { id: "thinking-1" });
+    const second = addMessage(s, "thinking", "分析二", { id: "thinking-2" });
+    applyCallUsage(s, callUsageFrame({
+      frameSeq: 1,
+      call: {
+        callId: "a1-codex-1",
+        targetIds: [first.id, second.id],
+        usage: { totalTokens: 123_456 },
+      },
+    }));
+    expect(first._callUsage?.usage.totalTokens).toBe(123_456);
+    expect(second._callUsage).toEqual(first._callUsage);
+  });
+
+  test("按 plan blockId 贯穿绑定实时 plan 卡，而非只在刷新后恢复", () => {
+    const s = sess();
+    s._activeClientMessageId = "u1";
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: "u1",
+      blocks: [{
+        kind: "plan",
+        blockId: "codex-plan-turn-1",
+        explanation: "执行计划",
+        steps: [{ step: "实现", status: "inProgress" }],
+      }],
+    }));
+    const plan = s.messages.find((message) => message.role === "plan");
+    expect(plan?.id).not.toBe("codex-plan-turn-1");
+
+    applyCallUsage(s, callUsageFrame({
+      frameSeq: 2,
+      call: {
+        callId: "a1-codex-1",
+        targetIds: ["codex-plan-turn-1"],
+        usage: { totalTokens: 12_345 },
+      },
+    }));
+    expect(plan?._callUsage).toEqual({
+      callId: "a1-codex-1",
+      targetIds: ["codex-plan-turn-1"],
+      usage: { totalTokens: 12_345 },
+    });
+  });
+
+  test("忽略跨 turn 与重复 frameSeq 的归属帧", () => {
+    const s = sess();
+    s._activeClientMessageId = "u1";
+    const tool = addMessage(s, "tool", "", { id: "tool-block-1", toolName: "Bash" });
+    applyCallUsage(s, callUsageFrame({
+      frameSeq: 1,
+      call: {
+        callId: "a1-ccb-1",
+        targetIds: [tool.id],
+        usage: { totalTokens: 64 },
+      },
+    }));
+    applyCallUsage(s, callUsageFrame({
+      frameSeq: 1,
+      call: {
+        callId: "a1-ccb-1",
+        targetIds: [tool.id],
+        usage: { totalTokens: 999 },
+      },
+    }));
+    applyCallUsage(s, callUsageFrame({
+      frameSeq: 2,
+      clientMessageId: "other-turn",
+      call: {
+        callId: "a1-ccb-2",
+        targetIds: [tool.id],
+        usage: { totalTokens: 777 },
+      },
+    }));
+    expect(tool._callUsage?.usage.totalTokens).toBe(64);
   });
 });
 

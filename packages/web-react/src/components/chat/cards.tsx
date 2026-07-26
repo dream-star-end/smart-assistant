@@ -23,7 +23,6 @@ import {
   Wallet,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
-import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
@@ -42,7 +41,11 @@ import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { Media } from "./media";
 import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
-import { delegateTokenUsage, TokenUsageBadge } from "./tokenUsage";
+import {
+  delegateTokenUsage,
+  TokenUsageBadge,
+  type DisplayTokenUsage,
+} from "./tokenUsage";
 
 /** 渲染上下文。turnActivity=当前活跃会话本轮活动快照（流式空正文分支的阶段反馈源）。*/
 export type RenderCtx = {
@@ -489,7 +492,7 @@ export function AssistantCard({
   msg: ChatMessage;
   ctx: RenderCtx;
   cb: CardCallbacks;
-  tokenUsage?: TurnTokenUsageSnapshot;
+  tokenUsage?: DisplayTokenUsage;
 }) {
   const live = isLive(msg, ctx);
   const hasError = !!msg._errorCode;
@@ -725,7 +728,7 @@ export const ThinkingCard = memo(
   }: {
     msgs: ChatMessage[];
     ctx: RenderCtx;
-    tokenUsage?: TurnTokenUsageSnapshot;
+    tokenUsage?: DisplayTokenUsage;
     /** 分组渲染签名(memo 比较键)。所有调用方必须传，否则 memo 会误判为无变化。*/
     sig?: string;
   }) {
@@ -800,7 +803,7 @@ export function PlanCard({
   tokenUsage,
 }: {
   msg: ChatMessage;
-  tokenUsage?: TurnTokenUsageSnapshot;
+  tokenUsage?: DisplayTokenUsage;
 }) {
   const steps = msg.steps ?? [];
   return (
