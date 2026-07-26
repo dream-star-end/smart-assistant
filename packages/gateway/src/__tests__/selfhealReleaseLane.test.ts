@@ -76,7 +76,16 @@ function buildFixture(root: string, proofVerdictJson: string): Fixture {
 
   // Base commit — includes a committed deploy-v5.sh stub so the worktree is CLEAN.
   mkdirSync(join(work, 'scripts'))
-  writeFileSync(join(work, 'scripts', 'deploy-v5.sh'), '#!/usr/bin/env bash\nexit 0\n')
+  writeFileSync(
+    join(work, 'scripts', 'deploy-v5.sh'),
+    [
+      '#!/usr/bin/env bash',
+      '[ "${OC_V5_DEPLOY_LOCK_FD:-}" = 200 ] || exit 91',
+      '[ "${OC_V5_SELFHEAL_RELEASE_REQUEST_ID:-}" = rrid-test-1 ] || exit 92',
+      'exit 0',
+      '',
+    ].join('\n'),
+  )
   writeFileSync(join(work, 'app.txt'), 'base\n')
   git(work, 'add', '-A')
   git(work, 'commit', '-m', 'base')

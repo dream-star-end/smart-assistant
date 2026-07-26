@@ -197,7 +197,9 @@ log "invoking deploy: $canonicalRepo/scripts/deploy-v5.sh ${deployArgs[*]:-}"
 set +e
 (
   cd "$canonicalRepo" \
-  && OC_V5_DEPLOY_LOCK_FD=200 bash "$canonicalRepo/scripts/deploy-v5.sh" ${deployArgs[@]+"${deployArgs[@]}"}
+  && OC_V5_DEPLOY_LOCK_FD=200 \
+     OC_V5_SELFHEAL_RELEASE_REQUEST_ID="$rrid" \
+     bash "$canonicalRepo/scripts/deploy-v5.sh" ${deployArgs[@]+"${deployArgs[@]}"}
 ) 1>&2
 deploy_exit=$?
 set -e
