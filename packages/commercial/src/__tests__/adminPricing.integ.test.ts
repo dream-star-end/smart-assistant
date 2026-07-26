@@ -45,36 +45,13 @@ import {
   transitionProductFrictionEventIfPresent,
 } from "../productFriction/events.js";
 import { createPgSessionsBackend } from "../db/pgSessionsBackend.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const JWT_SECRET = "z".repeat(64);
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "product_friction_events",
-  "image_generation_attempts",
-  "image_generation_usage_records",
-  "github_session_workspaces",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
 
 let pgAvailable = false;
 let redis: IORedis | null = null;
@@ -108,7 +85,7 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
   // Production injects this backend in the composition root. This handler
   // integration test builds the router directly, so mirror that one-time
@@ -117,6 +94,16 @@ before(async () => {
   setClientSessionsBackend(createPgSessionsBackend(pool, { expectedGeneration: 0 }));
 
   redis = await probeRedis();
+
+  // fixture fail-closed:缺 Redis 时此前静默降级(整份套件的 HTTP 路径不装配),
+
+  // 于是"绿"只证明了没跑。REQUIRE_TEST_DB/CI 下必须红 —— 2026-07-26 门禁审计。
+
+  if (!redis && REQUIRE_TEST_DB) {
+
+    throw new Error("Redis test fixture required (TEST_REDIS_URL) — refusing to silently degrade");
+
+  }
   if (redis) {
     const handler = createCommercialHandler({
       jwtSecret: JWT_SECRET,
@@ -151,7 +138,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    try { await resetTestSchemaForTest(); } catch { /* */ }
     await closePool();
   }
 });

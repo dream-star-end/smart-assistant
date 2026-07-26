@@ -12,6 +12,7 @@ import { query, tx } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import { loadCatalogSnapshot } from "../billing/modelCatalog.js";
 import { PricingCache } from "../billing/pricing.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * 模型权威批次 · 切片 1 — DB 层集成测试(真实 PG)。
@@ -61,14 +62,7 @@ async function probe(): Promise<boolean> {
 }
 
 async function dropSchema(): Promise<void> {
-  const rows = await query<{ table_name: string }>(
-    `SELECT table_name FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
-  );
-  if (rows.rows.length > 0) {
-    const quoted = rows.rows.map((r) => `"${r.table_name.replaceAll('"', '""')}"`).join(", ");
-    await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
-  }
+  await resetTestSchemaForTest();
 }
 
 before(async () => {

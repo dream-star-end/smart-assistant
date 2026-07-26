@@ -2,7 +2,9 @@
  * B3 集成:findCodexDisableDrift 的真 SQL —— 准确选出"state=active 容器绑在
  * provider=codex 且 status<>active 账号上"的漂移行,且不误选健康/异类行。
  *
- * 本地:TEST_DATABASE_URL=postgres://octest:octest@127.0.0.1:5432/openclaude_commercial_test \
+ * 本地(仓内标准 fixture,见 packages/commercial/README.md;此处此前写的是
+ * octest@5432/openclaude_commercial_test,那套 fixture 早已不存在):
+ *      TEST_DATABASE_URL=postgres://test:test@127.0.0.1:55432/openclaude_test \
  *      REQUIRE_TEST_DB=1 npx tsx --test codexDisableDrift.integ.test.ts
  */
 

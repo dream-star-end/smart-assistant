@@ -31,6 +31,12 @@ import {
 const TEST_IMAGE = process.env.AGENT_TEST_IMAGE ?? "alpine:3.19";
 const TEST_NETWORK = "agent-net-test";
 
+// fixture fail-closed(2026-07-26 审计):docker 不可用时本文件此前整份静默 skip,
+// 于是"supervisor 下发给 daemon 的参数是否正确"这件事在任何环境下都没被验证过。
+// 与 PG 侧的 REQUIRE_TEST_DB 同构:CI 上(GitHub runner 自带 dockerd)缺 docker
+// 必须红;本地开发机没 docker 时仍允许 skip,显式 REQUIRE_TEST_DOCKER=1 可强制。
+const REQUIRE_TEST_DOCKER = process.env.CI === "true" || process.env.REQUIRE_TEST_DOCKER === "1";
+
 let dockerAvailable = false;
 let docker: Docker | null = null;
 
@@ -68,7 +74,15 @@ before(async () => {
   // T-52:每个 createContainer 都需要一个 host 目录容纳 RPC socket。integ 跑在
   // 普通用户权限下也要能 mkdir;tmp 目录已被当前进程拥有,chown 即便失败也无妨。
   rpcRoot = mkdtempSync(join(tmpdir(), "agent-rpc-integ-"));
-  if (!socketExists()) return;
+  if (!socketExists()) {
+    if (REQUIRE_TEST_DOCKER) {
+      throw new Error(
+        "[agentSupervisor.integ] REQUIRE_TEST_DOCKER=1(或 CI=true)但 /var/run/docker.sock 不存在 —— " +
+          "容器供给契约未被验证,拒绝静默通过",
+      );
+    }
+    return;
+  }
   try {
     docker = new Docker();
     await docker.ping();
@@ -78,6 +92,11 @@ before(async () => {
     dockerAvailable = true;
     testUid = 90_000_000 + Math.floor(Math.random() * 1_000_000);
   } catch (err) {
+    if (REQUIRE_TEST_DOCKER) {
+      throw new Error(
+        `[agentSupervisor.integ] REQUIRE_TEST_DOCKER=1(或 CI=true)但 docker 不可用:${(err as Error).message}`,
+      );
+    }
     // 拉镜像网络不通也算不可用,skip
     // eslint-disable-next-line no-console
     console.warn("[agentSupervisor.integ] docker unavailable:", (err as Error).message);

@@ -1,0 +1,150 @@
+name: Aurora v5 integ nightly
+
+# 夜跑梯队(.github/integ-tiers/nightly-*.txt)。
+#
+# 为什么跟 PR 门分开:这 87 个文件覆盖管理面、连接器、自愈、账号池、单条 migration
+# 回放等,价值真实但(a)墙钟太长、(b)对外部上游/docker 更敏感。放进 PR 阻塞路径
+# 会重演 PR#131 —— integ job 撞 45min 全局 timeout,把合并卡死 8 天。
+# 这里失败 = 开工单,不阻塞任何 PR。
+#
+# 分层判据与登记规则见 .github/integ-tiers/README.md;
+# "新增 integ 文件必须被某梯队收录"由 npm run lint:integ-tiers 在 PR 门上守。
+
+on:
+  schedule:
+    # 每日 19:00 UTC = 次日 03:00 沪时(低峰,和技能评测回归 04:30 错开)
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: '只跑某一片(留空 = 全部 nightly-*)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-integ-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: integ ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [nightly-1, nightly-2, nightly-3, nightly-4, nightly-5]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI: 'true'
+      REQUIRE_TEST_DB: '1'
+      # nightly-5 含 agentSupervisor.integ(要 dockerd,GitHub runner 自带)。
+      # 缺 docker 时它现在会 throw 而不是静默 skip —— 见该文件 REQUIRE_TEST_DOCKER。
+      REQUIRE_TEST_DOCKER: '1'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+      TEST_REDIS_URL: redis://127.0.0.1:56379/0
+
+    steps:
+      - name: Skip non-selected shard
+        id: pick
+        shell: bash
+        run: |
+          want='${{ github.event.inputs.shard }}'
+          if [[ -n "$want" && "$want" != '${{ matrix.shard }}' ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.pick.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: steps.pick.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.pick.outputs.run == 'true'
+        run: npm ci
+
+      - name: Wait for test fixtures
+        if: steps.pick.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if docker exec '${{ job.services.postgres.id }}' pg_isready -U test -d openclaude_test; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Postgres did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          for i in {1..30}; do
+            if docker exec '${{ job.services.redis.id }}' redis-cli ping; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Redis did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run integ shard ${{ matrix.shard }}
+        if: steps.pick.outputs.run == 'true'
+        env:
+          TAP_OUT: commercial-integ-${{ matrix.shard }}.tap
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB" \
+            "REQUIRE_TEST_DOCKER=$REQUIRE_TEST_DOCKER" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            "TEST_REDIS_URL=$TEST_REDIS_URL" \
+            "TAP_OUT=$TAP_OUT" \
+            bash .github/scripts/commercial-integ-gate.sh '${{ matrix.shard }}'
+
+      - name: Upload TAP output
+        if: always() && steps.pick.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: commercial-integ-tap-${{ matrix.shard }}
+          path: commercial-integ-${{ matrix.shard }}.tap
+          if-no-files-found: error
+          retention-days: 14

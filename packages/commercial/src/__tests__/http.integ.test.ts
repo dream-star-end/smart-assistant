@@ -13,6 +13,7 @@ import { warmupLoginDummyHash } from "../auth/login.js";
 import { setSystemSetting } from "../admin/systemSettings.js";
 import { _resetAllowRegistrationCacheForTests } from "../http/handlers.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-16 集成:把 createCommercialHandler 装到一个真 http.Server 上,跑端到端
@@ -29,28 +30,17 @@ const TEST_REDIS_URL =
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "system_settings",
-  "schema_migrations",
-];
-
 const JWT_SECRET = "y".repeat(64);
+
+/** 把 system_settings.allow_registration 摆回 true(见 beforeEach 的 TRUNCATE CASCADE 注释)。 */
+async function seedAllowRegistration(): Promise<void> {
+  await query(
+    `INSERT INTO system_settings(key, value, updated_at)
+     VALUES ('allow_registration', 'true'::jsonb, NOW())
+     ON CONFLICT (key) DO UPDATE
+       SET value = EXCLUDED.value, updated_at = NOW()`,
+  );
+}
 
 class CapturingMailer implements Mailer {
   readonly sent: MailMessage[] = [];
@@ -103,21 +93,16 @@ before(async () => {
     await resetPool();
     const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
     setPoolOverride(pool);
-    await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+    await resetTestSchemaForTest();
     await runMigrations();
     await warmupLoginDummyHash();
     // 2026-05-25:DEFAULTS.allow_registration 翻 false(生产关停)。这套 HTTP
     // 集成 case 大量用 POST /api/auth/register 走打通流;handler 前置门会先于
     // rate-limit / 业务逻辑判定 allow_registration,默认 false 会让所有 register
-    // 路径直接 403 REGISTRATION_DISABLED。UPSERT row=true 让 row 命中覆盖默认,
-    // beforeEach 不 TRUNCATE system_settings(见 COMMERCIAL_TABLES 列表也没动)→
-    // 单次设置全套共享。
-    await query(
-      `INSERT INTO system_settings(key, value, updated_at)
-       VALUES ('allow_registration', 'true'::jsonb, NOW())
-       ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value, updated_at = NOW()`,
-    );
+    // 路径直接 403 REGISTRATION_DISABLED。UPSERT row=true 让 row 命中覆盖默认。
+    // 注意种子必须在 beforeEach 里**每次重种**(见那里的注释),这里只是让
+    // before 阶段的断言也有一致起点。
+    await seedAllowRegistration();
   } else if (REQUIRE_TEST_DB) {
     throw new Error("Postgres test fixture required");
   }
@@ -169,7 +154,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
+    try { await resetTestSchemaForTest(); } catch { /* ignore */ }
     await closePool();
   }
 });
@@ -177,6 +162,14 @@ after(async () => {
 beforeEach(async () => {
   if (!pgAvailable || !redis) return;
   await query("TRUNCATE TABLE refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  // 2026-07-26:上面这条 TRUNCATE ... CASCADE 会**连带清空 system_settings** ——
+  // 它有 `updated_by BIGINT REFERENCES users(id)`(0016_system_settings.sql),
+  // 而 PG 的 TRUNCATE CASCADE 会把所有引用被截断表的表一起截断。before 钩子里那次
+  // "单次设置全套共享"的 allow_registration=true 因此活不过第一个 beforeEach。
+  // 2026-05-25 DEFAULTS.allow_registration 翻 false 之后,本文件所有走 register 的
+  // case 就一直 403 REGISTRATION_DISABLED —— 两个月没人发现,因为整个 integ 层
+  // 在 CI/deploy/playbook 三处都不跑(2026-07-26 门禁审计)。种子挪到这里。
+  await seedAllowRegistration();
   await redis.flushdb();
   mailer.sent.length = 0;
 });
@@ -246,6 +239,34 @@ function parseSetCookie(setCookieHeaders: string[], name: string): null | {
     return { value, attrs, flags };
   }
   return null;
+}
+
+/**
+ * 等到某个 scope 的 blocked rate_limit_events 行出现。
+ *
+ * 为什么需要它:429 的**拒绝**是同步的,审计事件落库不是。单次同步查询会间歇性读到 0 行
+ * (CI 实测:同一提交一次绿一次红,而请求日志里 429 明明已出现)。轮询而不是固定 sleep ——
+ * sleep 把竞态藏起来,且在慢机器上照样翻车。
+ *
+ * 它只影响**什么时候读**,不放宽读到的结果:调用方仍然自己断言精确条数。
+ * 抽成 helper 是因为同一根因在本文件里已经出现两处(A6 与 tight-limit),
+ * 第三处迟早会再犯 —— 消灭一类,不是补两个单点。
+ */
+async function waitForBlockedRateLimitEvents(scope: string, expected: number): Promise<number> {
+  for (let i = 0; i < 50; i += 1) {
+    const { rows } = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
+      [scope],
+    );
+    const cnt = Number(rows[0]?.cnt ?? 0);
+    if (cnt >= expected) return cnt;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const { rows } = await query<{ cnt: string }>(
+    "SELECT COUNT(*)::text AS cnt FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
+    [scope],
+  );
+  return Number(rows[0]?.cnt ?? 0);
 }
 
 describe("commercial HTTP router (integ)", () => {
@@ -659,6 +680,7 @@ describe("commercial HTTP router (integ)", () => {
       assert.ok(r4.headers.get("retry-after"));
       // rate_limit_events 落库:scope=verify_email_smoke_email,key=sha256 前缀
       // (绝不是明文 email)
+      await waitForBlockedRateLimitEvents("verify_email_smoke_email", 1);
       const ev = await query<{ key: string }>(
         "SELECT key FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
         ["verify_email_smoke_email"],
@@ -721,11 +743,8 @@ describe("commercial HTTP router (integ)", () => {
       });
       assert.equal(r.status, 429);
       assert.ok(r.headers.get("retry-after"));
-      const ev = await query<{ cnt: string }>(
-        "SELECT COUNT(*)::text AS cnt FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
-        ["register_tight"],
-      );
-      assert.equal(ev.rows[0].cnt, "1", "blocked event must be recorded");
+      const blocked = await waitForBlockedRateLimitEvents("register_tight", 1);
+      assert.equal(String(blocked), "1", "blocked event must be recorded");
     } finally {
       await new Promise<void>((resolve) => tightServer.close(() => resolve()));
     }

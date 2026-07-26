@@ -180,13 +180,41 @@ describe('V5 durable development release queue', () => {
       'a fresh process must observe the durable active+pin state',
     )
 
+    // 2026-07-26 角色分离:base 在你 active 期间前进是**常态**(所有会话共享这棵开发树),
+    // 不该作废你的 job —— 旧语义要求 HEAD 逐字节等于 pinned,于是别人合一个 PR 就把你
+    // 顶掉,而你占着唯一 active 槽让别人 acquire 恒返回 75(双向死锁,已真实发生)。
+    // 新语义:pinned 仍是 HEAD 的祖先 → 放行,发布内容按 pinned 取源(deploy 侧
+    // resolve_release_source_commit,由本文件的 "pinned SHA …" 契约测试锁死配对)。
     await writeFile(path.join(fixture.repo, 'value.txt'), 'drift\n')
     fixture.git('commit', '-am', 'drift')
+    const advanced = fixture.invoke(['assert', '--id', first])
     assert.equal(
-      fixture.invoke(['assert', '--id', first]).status,
-      2,
-      'deploy authorization must fail closed when canonical HEAD drifts',
+      advanced.status,
+      0,
+      `base 前进(pinned 仍是祖先)不得作废 active job:${advanced.stderr || advanced.stdout}`,
     )
+    assert.match(
+      advanced.stdout,
+      /canonical 已前进/,
+      '放行时必须显式说明"发布内容按 pinned 取源",否则操作者会以为发的是 HEAD',
+    )
+
+    // 但 fail-closed 的核心不能丢:pinned **不在** HEAD 历史里 = pin 错了 / commit 被
+    // 改写,那才是真正必须拒绝的场景(否则就会按一个不属于 canonical 的 commit 发布)。
+    const baseBranch = fixture.git('rev-parse', '--abbrev-ref', 'HEAD').trim()
+    const orphanBranch = 'orphan-history'
+    fixture.git('checkout', '-q', '--orphan', orphanBranch)
+    fixture.git('commit', '-q', '--allow-empty', '-m', 'unrelated history')
+    const orphaned = fixture.invoke(['assert', '--id', first])
+    assert.equal(
+      orphaned.status,
+      2,
+      'pinned 不在当前历史里时必须 fail closed(否则会发布一个不属于 canonical 的 commit)',
+    )
+    assert.match(orphaned.stderr, /不在 canonical 历史里/)
+    // 回到原分支:orphan 分支没有前序引用,`checkout -` 在这里不可用,必须用显式名字。
+    fixture.git('checkout', '-q', baseBranch)
+    fixture.git('branch', '-D', orphanBranch)
     fixture.git('reset', '--hard', fixture.candidate)
     assert.equal(
       fixture.invoke([
@@ -465,6 +493,50 @@ describe('V5 durable development release queue', () => {
     assert.ok(lock >= 0 && gate > lock, 'release queue gate must run after the real local deploy lock')
     assert.ok(gate < migrationGate, 'release queue gate must run before migration probes')
     assert.ok(gate < productionLease, 'release queue gate must run before the remote mutation lease')
+  })
+
+  test('pinned SHA — not the shared worktree HEAD — decides what gets released', async () => {
+    // 角色分离(2026-07-26)的成对契约。canonical 这棵树同时是"所有会话共享、随 base
+    // 前进的开发 checkout"和"必须钉死的发布源";把后者从工作树活状态里摘出来之后,
+    // 下面两半**必须同时存在**:
+    //   · queue.assert 放宽为"pinned 是 HEAD 的祖先"(否则别人合一个 PR 就作废你的 job,
+    //     而你占着唯一 active 槽 → 双向死锁);
+    //   · deploy 按 pinned 显式取源(否则放宽 assert 就等于允许发出未 pin 的代码)。
+    // 只留一半是净损失,所以这条测试把两半锁在一起。
+    const queueSrc = await readFile(releaseQueue, 'utf8')
+    const deploySrc = await readFile(deploy, "utf8")
+
+    assert.match(
+      queueSrc,
+      /merge-base --is-ancestor "\$pinned" "\$current"/,
+      'queue.assert 必须用祖先关系判定 pinned,而不是与共享工作树 HEAD 逐字节相等',
+    )
+    assert.match(queueSrc, /^\s*pinned-sha\)/m, 'queue 必须提供只读的 pinned-sha 出口供 deploy 取值')
+
+    assert.match(
+      deploySrc,
+      /resolve_release_source_commit\(\)\s*\{/,
+      'deploy 必须有「发布源 commit」的单一权威函数',
+    )
+    assert.match(
+      deploySrc,
+      /full_sha="\$\(resolve_release_source_commit\)"/,
+      'build_release 必须经该函数取源,不得直接 rev-parse HEAD',
+    )
+    // build_release / build_platform_bundle 是 tuple 的两半,必须同源 —— 否则
+    // release 按 pinned、bundle 按 HEAD,tuple 作为原子回滚单元就不再自洽。
+    assert.match(
+      deploySrc,
+      /full_sha="\$\{BUILT_RELEASE_SOURCE_COMMIT:-\$\(resolve_release_source_commit\)\}"/,
+      'build_platform_bundle 必须与 build_release 同源',
+    )
+    const buildRelease = deploySrc.indexOf('build_release() {')
+    const strayHeadRead = deploySrc.indexOf('full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"', buildRelease)
+    assert.equal(
+      strayHeadRead,
+      -1,
+      'build_release 之后不得再出现直接读 HEAD 的 full_sha 赋值(会绕过 pinned 取源)',
+    )
   })
 
   test('selfheal inherited-lock bypass requires exact durable rrid, approved HEAD and cgroup scope', async () => {
@@ -4382,6 +4454,7 @@ case "$*" in
   ${egressBad ? '' : '*18892*) echo \'{"ok":true,"role":"egress"}\';;'}
   ${healthyHttpPorts.map((port) => `*${port}*) echo '{"ok":true,"channel":"v5"}';;`).join('\n  ')}
   ${allHealthy ? '*127.0.0.1/healthz*) echo \'{"ok":true,"channel":"v5"}\';;' : ''}
+  *api.github.com*) echo '{"workflow_runs":[{"status":"completed","conclusion":"success","head_sha":"0000000000000000000000000000000000000000"}]}';;
   *) echo refused >&2; exit 7;;
 esac
 `,
@@ -4571,7 +4644,11 @@ case "$cmd:$unit" in
 esac
 `,
     curl: `#!/bin/sh
-case "$*" in *18892*) echo '{"ok":true,"role":"egress"}' ;; *) echo '{"ok":true,"channel":"v5"}' ;; esac
+case "$*" in
+  *18892*) echo '{"ok":true,"role":"egress"}' ;;
+  *api.github.com*) echo '{"workflow_runs":[{"status":"completed","conclusion":"success","head_sha":"0000000000000000000000000000000000000000"}]}' ;;
+  *) echo '{"ok":true,"channel":"v5"}' ;;
+esac
 `,
     psql: `#!/bin/sh
 case "$*" in
@@ -5853,6 +5930,9 @@ wait $!
     assert.match(monitor, /check_gate_waivers\(\)/, 'monitor 缺门禁豁免债务探针')
     assert.match(monitor, /^check_gate_waivers$/m, 'monitor 探针未接进主流程')
     // 断言"gate_waivers 出现在 warning 分级行内",而不是"它必须是行尾最后一项" ——
+    // (2026-07-26 两个并行批各自撞上并各自修了这条:加 ci_base_red 和加 friction_pipeline
+    //  都会把原断言打红。这里取"先切 check_severity 函数体、再找该函数内的 warning 分支"
+    //  的版本 —— 全文件找第一个 `) echo warning` 行会在别处出现同模式时取错。)
     // 后者会让任何人再往该行追加一项(如 friction_pipeline)时误红,把一条正确的
     // 改动判成回归。这里取该 case 分支整行再判包含,语义等价且不脆。
     const sevBody = monitor.slice(

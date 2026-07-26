@@ -108,6 +108,11 @@ before(async () => {
   } catch {
     redis = null;
   }
+  // fixture fail-closed:缺 Redis 时此前静默降级(整份套件的 HTTP 路径不装配),
+  // 于是"绿"只证明了没跑。REQUIRE_TEST_DB/CI 下必须红 —— 2026-07-26 门禁审计。
+  if (!redis && REQUIRE_TEST_DB) {
+    throw new Error("Redis test fixture required (TEST_REDIS_URL) — refusing to silently degrade");
+  }
   if (!redis) return;
 
   const handler = createCommercialHandler({

@@ -130,6 +130,11 @@ try {
 
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
 const page = await context.newPage();
+// Turnstile 装载探针:只看"有没有去拉 api.js",不看 DOM —— 理由见 J1 里的长注释。
+let turnstileScriptRequested = false;
+page.on("request", (req) => {
+  if (req.url().includes("challenges.cloudflare.com/turnstile")) turnstileScriptRequested = true;
+});
 let stepName = "init";
 async function step(name, fn) {
   stepName = name;
@@ -155,19 +160,26 @@ try {
       return r.ok ? await r.json() : null;
     });
     if (!publicConfig) fatal(1, "J1 读 /api/public/config 失败");
-    // 强制态下才断言 widget 存在。turnstile_bypass=true 有两种合法来源:dev/CI 的全局
-    // 测试旁路,以及产品配置 TURNSTILE_ENFORCE=0(2026-07-26 起线上暂为此态,因为 CF
-    // widget 仍是 Managed 交互模式,会让真实用户多一次勾选 —— 详见 config.ts 的债与
-    // 偿还条件)。所以这里**不能**无条件断言 bypass 必须为 false,否则暂关期间门恒红。
-    // 断言仍有价值:一旦线上翻回强制,widget 缺失就会被这道门抓住。
+    // 人机验证的**强制与否是产品配置**(TURNSTILE_ENFORCE),两种状态都合法,所以断言
+    // 必须先读服务端真相再决定断什么 —— 无条件断言会在关闭态让部署门恒红。
     if (publicConfig.turnstile_bypass === true) {
-      console.log("e2e-journey: · turnstile 当前不强制(bypass=true),跳过 widget 形态断言");
+      console.log("e2e-journey: · turnstile 当前不强制(bypass=true),跳过 widget 装载断言");
     } else {
-      await page
-        .locator('iframe[src*="challenges.cloudflare.com"]')
-        .first()
-        .waitFor({ state: "attached", timeout: STEP_TIMEOUT })
-        .catch(() => fatal(1, "J1 强制态下登录表单未挂载 Turnstile widget —— 真实用户的人机验证缺失"));
+      // 强制态:断言前端确实在装 widget —— 判据是"页面请求了 Turnstile 的 api.js"。
+      //
+      // 【为什么不断言 iframe/DOM,踩过两个坑】
+      //   ① 选择器不成立:Turnstile 的 iframe `src` 属性通常是 about:blank / blob,真实
+      //      URL 在内部,`iframe[src*="challenges.cloudflare.com"]` 即使在公网也匹配不到。
+      //   ② 环境结构性不可满足:本旅程经 ssh 隧道访问 http://127.0.0.1:<port>,而 Turnstile
+      //      sitekey 按域名限制 —— 实测该路径下 Cloudflare 报 `Error: 110200`(域名不在
+      //      白名单)。在这里断言 widget 可用是错的。
+      //   同期公网真实域名实测:widget 正常渲染 —— 真实用户不受影响,是断言写错了。
+      //
+      // 请求 api.js 这一条既域名无关(隧道下照样发出)、又能抓住真正的回归类:
+      // 前端不再渲染 widget(比如有人把占位 token 路径改成默认)。
+      if (!turnstileScriptRequested) {
+        fatal(1, "J1 强制态下未请求 Turnstile api.js —— 前端可能已不再渲染人机验证 widget");
+      }
     }
 
     // ── 登录本体走 API,不走表单 ──────────────────────────────────────────

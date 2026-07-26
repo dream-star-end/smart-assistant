@@ -403,6 +403,47 @@ check_client_4xx_storm() {
   fi
 }
 
+check_ci_base_red() {
+  # canonical 分支 CI 变红(2026-07-26 关掉分支保护 strict 后的配套告警)。
+  #
+  # 背景:strict=true 要求"分支必须与 base 同步才能合",在多会话并行开发下会让每合
+  # 一个 PR 其余全部作废重跑(实测一个 PR 为此白跑 4 轮 CI)。关掉它换来吞吐,代价是
+  # 失去"合并前必须与 base 同步"这层保护 —— 两个 PR 各自绿、合起来红的**语义冲突**
+  # 会直接进 base。v5-ci.yml 本来就有 push 触发,会在 base 上重跑一轮,缺的只是
+  # "跑红了有人知道"这个出口。这项探针就是那个出口。
+  #
+  # 仓库是 public,GitHub REST 匿名可读(实测 kl-mirror 直连 200),不需要 token。
+  # severity=warning:base 红不等于线上挂(线上跑的是已部署 release),但它意味着
+  # **下一次发布的源是坏的**,必须在发布前被看见。
+  local api out rc conclusion status sha
+  api="https://api.github.com/repos/${V5MON_CI_REPO:-dream-star-end/smart-assistant}/actions/runs"
+  api="${api}?branch=$(printf '%s' "${V5MON_CI_BRANCH:-feat/v5-aurora-rewrite}" | sed 's|/|%2F|g')&event=push&per_page=1"
+  out="$(curl -s -m "${V5MON_CI_TIMEOUT:-15}" -H 'Accept: application/vnd.github+json' "$api" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    # 取不到 ≠ 没问题。数据源不可用必须自己发声,不能复用 ok(这正是 mail/4xx 探针
+    # "日志不可读就 record ok" 的老毛病,别再犯一次)。
+    record ci_base_red bad "canonical CI 状态取不到(curl rc=$rc):$(printf '%s' "$out" | head -c 120)"
+    return
+  fi
+  conclusion="$(printf '%s' "$out" | jq -r '.workflow_runs[0].conclusion // ""' 2>/dev/null)"
+  status="$(printf '%s' "$out" | jq -r '.workflow_runs[0].status // ""' 2>/dev/null)"
+  sha="$(printf '%s' "$out" | jq -r '.workflow_runs[0].head_sha // ""' 2>/dev/null | cut -c1-8)"
+  if [ -z "$status" ]; then
+    record ci_base_red bad "canonical CI 响应无法解析(jq 取不到 status)"; return
+  fi
+  if [ "$status" != "completed" ]; then
+    record ci_base_red ok "canonical CI 运行中(sha=$sha status=$status)"; return
+  fi
+  case "$conclusion" in
+    success|skipped|neutral)
+      record ci_base_red ok "canonical CI 绿(sha=$sha conclusion=$conclusion)" ;;
+    "")
+      record ci_base_red bad "canonical CI 已结束但无 conclusion(sha=$sha)——状态不可判" ;;
+    *)
+      record ci_base_red bad "canonical CI 红(sha=$sha conclusion=$conclusion)——base 上的下一次发布源是坏的;strict 已关,语义冲突只能靠这条探针发现" ;;
+  esac
+}
+
 check_failed_units() {
   # systemd 单元静默失败(整类根治,不是单点补丁)。背景:2026-07-26 审计发现异地容灾
   # v5-dr-sync.service / v5-dr-volumes.service 连败 43 小时无人知晓,根因是这两个单元的
@@ -582,7 +623,7 @@ check_severity() {
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化;
     # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警;
     # 门禁豁免债务 = 已上线版本有未验证面 + 下次发布被阻断,不是全站故障但必须常驻可见。均按 warning。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers|friction_pipeline) echo warning ;;
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers|ci_base_red|friction_pipeline) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -618,6 +659,7 @@ check_friction_pipeline
 check_kp_plugin
 check_gate_waivers
 check_client_4xx_storm
+check_ci_base_red
 check_failed_units
 check_backup_fresh
 check_mem_oversubscribe

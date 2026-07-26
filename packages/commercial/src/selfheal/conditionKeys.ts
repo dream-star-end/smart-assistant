@@ -44,6 +44,9 @@ export function opsMonitorKey(check: string): string {
  */
 export const OPS_MONITOR_CHECKS: readonly string[] = [
   "backup_fresh",
+  // canonical 分支 CI 变红(2026-07-26 关 strict 后的配套告警出口:
+  // 语义冲突进 base 后,靠这条探针发现"下一次发布的源是坏的")。
+  "ci_base_red",
   "client_4xx_storm",
   "deploy_state",
   "disk_root",
