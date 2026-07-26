@@ -3970,7 +3970,10 @@ describe('v5 release safety lanes', () => {
     assert.equal(production.status, 0, production.stderr)
     assert.equal(
       createHash('sha256').update(production.stdout).digest('hex'),
-      '60c9853f4b3bca511bf9f2cd6fad50dade596b99fb2f487f7dd0227919cc9d7b',
+      // 2026-07-26 安全整改:seed 渲染新增 `@sourcemap path *.map` + `handle @sourcemap { respond 404 }`
+      // (必须排在 handle /assets/* 之前),golden 随之更新。改 golden 时必须同时看
+      // 下面那条 sourcemap 顺序断言 —— 只更 hash 不看内容等于把门关了。
+      '092968ddbf488b962deda83870584c155aa20f9042cc5620275d9d591dd9022d',
     )
     assert.doesNotMatch(production.stdout, /\tbind /)
 
@@ -4310,6 +4313,9 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     dockerPsFails = false,
   } = options
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-')); dirs.push(dir)
+  // 夹具内的"健康备份"目录:一个 mtime=当下的子目录即满足 backup_fresh 的新鲜度判据。
+  const backupDir = path.join(dir, 'backups')
+  spawnSync('mkdir', ['-p', path.join(backupDir, 'v5-fixture-fresh')])
   const bin = path.join(dir, 'bin'); await writeFile(path.join(dir, 'meminfo'), 'MemTotal: 1000 kB\nMemAvailable: 900 kB\n')
   await writeFile(path.join(dir, 'env'), 'OC_RUNTIME_IMAGE=test/runtime:v5\nDATABASE_URL=postgres://unused\n')
   await writeFile(path.join(dir, 'state'), JSON.stringify(state))
@@ -4375,6 +4381,11 @@ esac
     V5MON_STATE_FILE: statePath,
     V5MON_LOG_FILE: logPath,
     V5MON_MEMINFO: path.join(dir, 'meminfo'),
+    // 2026-07-26 新增 check_backup_fresh(critical):把备份目录指向夹具内的新鲜副本。
+    // 不指的话,夹具里 /var/backups/openclaude-v5 不存在 → backup_fresh 恒 bad,会挡住
+    // "obsolete pool 一次性迁移"那条"本轮必须全绿"的前置(该前置是刻意的 fail-closed,
+    // 不能为了让测试过就把它放宽 —— 那等于把迁移模式变成通用告警静默开关)。
+    V5MON_BACKUP_DIR: backupDir,
     V5MON_MAINTENANCE_FILE: path.join(dir, 'marker'),
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
     V5MON_CUTOVER_ROOT: cutoverRoot,
@@ -4459,6 +4470,9 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   const actions = path.join(dir, 'systemctl-actions')
   const timerStopped = path.join(dir, 'timer-stopped')
   const alertActive = path.join(dir, 'alert-active')
+  // 夹具内的"健康备份"目录(见下方 V5MON_BACKUP_DIR)。
+  const installBackupDir = path.join(dir, 'host-backups')
+  spawnSync('mkdir', ['-p', path.join(installBackupDir, 'v5-fixture-fresh')])
   await Promise.all([mkdir(stage), mkdir(systemdDir), mkdir(backupRoot), mkdir(bin)])
   for (const source of [
     'scripts/v5-monitor.sh',
@@ -4561,6 +4575,10 @@ esac
     OC_V5_MONITOR_DRAIN_ATTEMPTS: '3',
     OC_V5_MONITOR_DRAIN_SLEEP_SECONDS: '0',
     V5MON_MEMINFO: '/proc/meminfo',
+    // check_backup_fresh(2026-07-26 新增,critical)读绝对路径 /var/backups/openclaude-v5。
+    // 夹具指向自己的新鲜备份目录:安装门是"任何 bad 就拒装",不指的话开发机上备份陈旧
+    // 就恒红,且这条恒红与被测行为无关。安装器已支持透传该覆盖(去掉了硬编码生产假设)。
+    V5MON_BACKUP_DIR: installBackupDir,
     V5MON_MAIL_LOG: path.join(dir, 'missing-app.log'),
     V5MON_MAINTENANCE_FILE: path.join(dir, 'missing-maintenance.json'),
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
@@ -4674,6 +4692,47 @@ describe('v5 host monitor independent atomic installer', () => {
       assert.match(actions.trim().split('\n').at(-1) ?? '', /is-active --quiet openclaude-v5-monitor.timer/)
     })
   }
+})
+
+describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
+  // 三个探针根治的是"静默失败"这一整类。背景:异地容灾 v5-dr-sync/v5-dr-volumes 连败
+  // 43 小时无人知晓,根因是这两个单元的 OnFailure= 是空的。逐个单元补 OnFailure 只能救
+  // 已知的那几个,新单元照样漏 —— 所以改成"本机存在任何 failed 单元"就报。
+  // 契约:函数存在 + 进调用列表 + 进 check_severity 分级。三者缺一,探针就是死代码
+  // (漏分级会落到默认 warning,backup_fresh 必须是 critical)。
+  test('failed_units / backup_fresh / mem_oversubscribe are defined, invoked and graded', async () => {
+    const source = await readFile(monitor, 'utf8')
+    for (const name of ['failed_units', 'backup_fresh', 'mem_oversubscribe']) {
+      assert.ok(source.includes(`check_${name}() {`), `check_${name} 函数缺失`)
+      assert.match(
+        source,
+        new RegExp(`^check_${name}$`, 'm'),
+        `check_${name} 未进末尾的检查项调用列表(定义了不调 = 死代码)`,
+      )
+    }
+    const sevStart = source.indexOf('check_severity() {')
+    assert.ok(sevStart >= 0, 'check_severity 缺失')
+    const sevEnd = source.indexOf('\n}', sevStart)
+    const sev = source.slice(sevStart, sevEnd)
+    const criticalLine = sev.split('\n').find((l) => l.includes('echo critical')) ?? ''
+    const warningLine = sev.split('\n').find((l) => l.includes('echo warning') && l.includes('|')) ?? ''
+    // backup_fresh = critical:异地容灾退役后本地备份是唯一数据保护,停摆 = 零保护
+    assert.match(criticalLine, /backup_fresh/, 'backup_fresh 必须是 critical')
+    assert.match(warningLine, /failed_units/, 'failed_units 必须显式分级(否则只靠默认分支)')
+    assert.match(warningLine, /mem_oversubscribe/, 'mem_oversubscribe 必须显式分级')
+  })
+
+  // docker inspect 必须一次传全部容器 ID:每 2 分钟一轮的探针不能在循环里逐个调。
+  test('mem_oversubscribe inspects all containers in one docker call', async () => {
+    const source = await readFile(monitor, 'utf8')
+    const start = source.indexOf('check_mem_oversubscribe() {')
+    const fn = source.slice(start, source.indexOf('\n}', start))
+    assert.match(fn, /docker inspect --format '\{\{\.HostConfig\.Memory\}\}' \$ids/)
+    assert.doesNotMatch(fn, /for .* in \$ids/, '禁止在循环里逐个 docker inspect')
+    // docker 调用失败必须 fail-loud,不能静默当作"没有超售"
+    assert.match(fn, /docker ps 失败/)
+    assert.match(fn, /docker inspect 取 HostConfig\.Memory 失败/)
+  })
 })
 
 describe('v5 monitor container identity capacity semantics', () => {
@@ -5586,6 +5645,99 @@ wait $!
       assert.ok(
         gateAt > windowStart && gateAt < exitAt,
         `出口「${exitMarker}」的 E2E 门未落在 end_planned_maintenance 与完成 echo 之间`,
+      )
+    }
+  })
+
+  // 2026-07-26 安全整改:sourcemap 封堵四层防护的契约锁。
+  // 事故实测:https://claudeai.chat/assets/main-*.js.map 公网 200、901KB、含 72 个源文件
+  // 完整 sourcesContent(等于全量源码泄漏)。四层里任意一层被后人改回去都不会报错,
+  // 只会静默重新泄漏 —— 所以四层各自上断言。
+  test('sourcemap sealing is enforced at all four layers', async () => {
+    // 第一层:vite 不写 sourceMappingURL 指针
+    const vite = await readFile(path.join(root, 'packages/web-react/vite.config.ts'), 'utf8')
+    assert.match(
+      vite,
+      /sourcemap:\s*["']hidden["']/,
+      'vite build.sourcemap 必须是 hidden(true 会写出 sourceMappingURL 指针)',
+    )
+
+    const source = await readFile(deploy, 'utf8')
+
+    // 第二层:资产池同步排除 *.map(不进 Caddy 直服目录)
+    const syncStart = source.indexOf('sync_assets_to_pool() {')
+    assert.ok(syncStart >= 0, 'sync_assets_to_pool 函数缺失')
+    const syncEnd = source.indexOf('\n}', syncStart)
+    const syncFn = source.slice(syncStart, syncEnd)
+    assert.match(
+      syncFn,
+      /rsync -a --exclude='\*\.map'/,
+      '资产池同步必须排除 *.map,否则 sourcemap 直接进公网直服目录',
+    )
+
+    // 第四层:部署活体门(第三层是 Caddy,由 caddy golden + 顺序断言覆盖)
+    const fnStart = source.indexOf('\nsmoke_sourcemap_sealed() {')
+    assert.ok(fnStart >= 0, 'smoke_sourcemap_sealed 函数缺失')
+    const fnEnd = source.indexOf('\n}', fnStart)
+    const fn = source.slice(fnStart, fnEnd)
+    assert.match(fn, /\[dry-run\]/, '缺 dry-run 分支')
+    assert.match(fn, /CADDY_HTTP_PORT/, '必须走可配端口,不许硬编码 :80')
+    assert.match(fn, /Host: claudeai\.chat/, '必须带 Host 头经 Caddy 探测(拦截规则在 Caddy 层)')
+    assert.match(fn, /if ! ssh /, '远端 heredoc 的退出码必须接(不接 = fail-open)')
+    // 配置层断言:没有它,池子被清空后 curl 探测退化成"文件本来就不存在 → 404" = 空断言
+    assert.match(fn, /handle @sourcemap/, '必须断言 live Caddyfile 真有拦截块')
+    assert.match(fn, /map_line.*-ge.*assets_line|-ge "\$assets_line"/, '必须断言拦截块排在 /assets 之前')
+    assert.match(fn, /= "000"/, 'curl 连不上必须与"拿到 200"分开判,探测本身坏了也要 fail-loud')
+    assert.match(fn, /return 1/, '门失败必须返回非零')
+
+    // 接线契约:四个成功出口各一处,且都在 end_planned_maintenance 之后
+    const calls = source.match(/smoke_sourcemap_sealed \|\| exit 1/g) ?? []
+    assert.equal(calls.length, 4, `期望 4 个成功出口接线,实际 ${calls.length}`)
+    for (const exitMarker of [
+      'knowledge-planet=setup-first)。"',
+      'knowledge-planet=zero-touch)。"',
+      '"✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
+      '"✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
+    ]) {
+      const exitAt = source.indexOf(exitMarker)
+      assert.ok(exitAt >= 0, `成功出口标记缺失: ${exitMarker}`)
+      const windowStart = source.lastIndexOf('end_planned_maintenance', exitAt)
+      const gateAt = source.lastIndexOf('smoke_sourcemap_sealed || exit 1', exitAt)
+      assert.ok(
+        gateAt > windowStart && gateAt < exitAt,
+        `出口「${exitMarker}」的 sourcemap 门未落在 end_planned_maintenance 与完成 echo 之间`,
+      )
+    }
+  })
+
+  // 第三层:Caddy 渲染里 *.map 拦截必须存在,且**排在 /assets 直服之前**。
+  // handle 块按书写顺序互斥求值,排后面等于永不命中 —— 只断言"存在"会漏掉这类静默失效。
+  test('Caddy render blocks *.map before serving the assets pool', () => {
+    for (const [label, env] of [
+      ['production', { CADDY_HTTP_PORT: undefined }],
+      ['staging', { CADDY_HTTP_PORT: '18081' }],
+    ] as const) {
+      const rendered = run(caddyApply, ['--render', '--dry-run'], env)
+      assert.equal(rendered.status, 0, `${label}: ${rendered.stderr}`)
+      // 非引号 heredoc 里混进反引号/命令替换会被真的执行 —— 首版就踩过,这里钉死
+      assert.doesNotMatch(
+        rendered.stderr,
+        /command not found/,
+        `${label}: Caddy 模板 heredoc 里有被 shell 执行掉的命令替换`,
+      )
+      const mapAt = rendered.stdout.indexOf('handle @sourcemap')
+      const assetsAt = rendered.stdout.indexOf('handle /assets/*')
+      assert.ok(mapAt >= 0, `${label}: 渲染结果缺 handle @sourcemap`)
+      assert.ok(assetsAt >= 0, `${label}: 渲染结果缺 handle /assets/*`)
+      assert.ok(
+        mapAt < assetsAt,
+        `${label}: handle @sourcemap 必须排在 handle /assets/* 之前(map=${mapAt} assets=${assetsAt})`,
+      )
+      assert.match(rendered.stdout, /@sourcemap path \*\.map/, `${label}: matcher 形态不对`)
+      assert.match(
+        rendered.stdout.slice(mapAt, assetsAt),
+        /respond 404/,
+        `${label}: @sourcemap 块内缺 respond 404`,
       )
     }
   })

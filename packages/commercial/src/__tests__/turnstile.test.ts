@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { verifyTurnstile, TurnstileError } from "../auth/turnstile.js";
+import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "../auth/turnstile.js";
 
 function fakeFetch(handler: (url: string, init: RequestInit) => Response | Promise<Response>): typeof fetch {
   return ((url: string, init: RequestInit) => Promise.resolve(handler(url, init))) as unknown as typeof fetch;
@@ -75,5 +75,76 @@ describe("auth.turnstile.verifyTurnstile", () => {
     assert.match(capturedBody, /remoteip=1\.2\.3\.4/);
     assert.match(capturedBody, /response=token/);
     assert.match(capturedBody, /secret=secret/);
+  });
+});
+
+/**
+ * resolveTurnstileBypass —— 旁路判定的单一权威(2026-07-26 安全整改)。
+ *
+ * 背景:生产 env 曾长期挂着 TURNSTILE_TEST_BYPASS=1,注册/登录/找回密码三个公开入口的
+ * 人机验证全站失效。之所以摘不掉,是因为 4 条生产自动化(e2e-journey / smoke-turn /
+ * baseline-evals / market-skill-eval)都在发占位 token。整改把"旁路"从环境级降到账号级。
+ *
+ * 这些用例锁的是**作用域收敛**:白名单只对指定邮箱生效,任何其他账号一律走真实校验。
+ */
+describe("auth.turnstile.resolveTurnstileBypass", () => {
+  const ACCOUNTS = ["v5-canary@claudeai.chat", "v5-evals@claudeai.chat"] as const;
+
+  test("全局旁路为真时直接放行(dev/CI 语义,生产由 config fail-closed 拦死)", () => {
+    assert.equal(resolveTurnstileBypass({ globalBypass: true }), true);
+    // 全局旁路优先级最高:即使没有白名单、没有邮箱也放行
+    assert.equal(
+      resolveTurnstileBypass({ globalBypass: true, bypassAccounts: [], accountEmail: null }),
+      true,
+    );
+  });
+
+  test("命中白名单的账号放行", () => {
+    assert.equal(
+      resolveTurnstileBypass({ bypassAccounts: ACCOUNTS, accountEmail: "v5-canary@claudeai.chat" }),
+      true,
+    );
+  });
+
+  test("白名单比对忽略大小写与首尾空白", () => {
+    for (const variant of ["  V5-Canary@ClaudeAI.chat  ", "V5-CANARY@CLAUDEAI.CHAT", " v5-canary@claudeai.chat"]) {
+      assert.equal(
+        resolveTurnstileBypass({ bypassAccounts: ACCOUNTS, accountEmail: variant }),
+        true,
+        `variant=${JSON.stringify(variant)} 应命中`,
+      );
+    }
+    // 白名单侧同样容忍未规范化的配置(防绕过 config 直接构造 deps 的调用方静默失配)
+    assert.equal(
+      resolveTurnstileBypass({ bypassAccounts: ["  V5-Canary@ClaudeAI.chat "], accountEmail: "v5-canary@claudeai.chat" }),
+      true,
+    );
+  });
+
+  test("未命中白名单的账号一律不放行 —— 这是真实用户的路径", () => {
+    for (const email of ["someone@example.com", "v5-canary@evil.com", "v5-canary@claudeai.chat.evil.com", ""]) {
+      assert.equal(
+        resolveTurnstileBypass({ bypassAccounts: ACCOUNTS, accountEmail: email }),
+        false,
+        `email=${JSON.stringify(email)} 不应放行`,
+      );
+    }
+  });
+
+  test("白名单为空/未配时任何账号都不放行(缺省即最严)", () => {
+    assert.equal(resolveTurnstileBypass({ accountEmail: "v5-canary@claudeai.chat" }), false);
+    assert.equal(
+      resolveTurnstileBypass({ bypassAccounts: [], accountEmail: "v5-canary@claudeai.chat" }),
+      false,
+    );
+  });
+
+  test("accountEmail 缺失/非字符串时不放行(不能靠 undefined 撞进白名单)", () => {
+    assert.equal(resolveTurnstileBypass({ bypassAccounts: ACCOUNTS }), false);
+    assert.equal(resolveTurnstileBypass({ bypassAccounts: ACCOUNTS, accountEmail: null }), false);
+    assert.equal(
+      resolveTurnstileBypass({ bypassAccounts: ACCOUNTS, accountEmail: undefined }),
+      false,
+    );
   });
 });

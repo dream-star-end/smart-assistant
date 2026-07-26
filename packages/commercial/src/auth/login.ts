@@ -32,7 +32,7 @@ import { query, tx } from "../db/queries.js";
 import { getBalanceBreakdown } from "../billing/spend.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "./jwt.js";
-import { verifyTurnstile, TurnstileError } from "./turnstile.js";
+import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
 import {
   lockRefreshFamily,
   lockRefreshMutationForTokenHash,
@@ -159,7 +159,10 @@ export interface LoginDeps {
   jwtSecret: string | Uint8Array;
   /** turnstile secret(env);bypass 模式可不传 */
   turnstileSecret?: string;
+  /** 全局旁路(env TURNSTILE_TEST_BYPASS),仅 dev/CI;生产由 config.ts fail-closed 拦死 */
   turnstileBypass?: boolean;
+  /** 账号级旁路白名单(env TURNSTILE_BYPASS_ACCOUNTS),生产给自动化账号留的合法通道 */
+  turnstileBypassAccounts?: readonly string[];
   /** 测试可注入 fetch(传给 turnstile) */
   fetchImpl?: typeof fetch;
   /**
@@ -224,11 +227,18 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
   const input = parsed.data;
 
   // 2) Turnstile
+  // 旁路判定收口到 resolveTurnstileBypass(单一权威),login 只消费结果。
+  const turnstileBypass = resolveTurnstileBypass({
+    globalBypass: deps.turnstileBypass,
+    bypassAccounts: deps.turnstileBypassAccounts,
+    accountEmail: input.email,
+    route: "POST /api/auth/login",
+  });
   let turnstileOk = false;
   try {
     turnstileOk = await verifyTurnstile(input.turnstile_token, deps.turnstileSecret, {
       remoteIp: deps.remoteIp,
-      bypass: deps.turnstileBypass === true,
+      bypass: turnstileBypass,
       fetchImpl: deps.fetchImpl,
     });
   } catch (err) {
