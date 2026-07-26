@@ -120,8 +120,12 @@ describe("ui primitives", () => {
     expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("100");
   });
 
-  it("Skeleton renders a pulse placeholder", () => {
+  it("Skeleton renders a *visible* shimmer placeholder", () => {
+    // 断言 bg-skeleton 而非旧的 bg-hover:后者在浅色主题下对白底 ≈1.05:1,骨架屏等于隐形。
+    // 动效也从 animate-pulse 换成复用 styles.css 的 oc-shimmer 扫光。
     const { container } = render(<Skeleton className="h-4 w-20" />);
-    expect((container.firstChild as HTMLElement).className).toContain("animate-pulse");
+    const el = container.firstChild as HTMLElement;
+    expect(el.className).toContain("bg-skeleton");
+    expect(el.className).toContain("after:animate-[oc-shimmer_1.4s_ease-in-out_infinite]");
   });
 });

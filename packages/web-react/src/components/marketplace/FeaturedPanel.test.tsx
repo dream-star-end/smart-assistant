@@ -12,6 +12,7 @@ vi.mock("../../lib/api", () => ({
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
     setMarketplaceFeatured: (...a: unknown[]) => setMarketplaceFeatured(...a),
   },
+  apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
 }));
 
 import { FeaturedPanel } from "./FeaturedPanel";
@@ -55,7 +56,7 @@ test("合并技能+智能体两源,按 rank 升序在前、非精选按使用数
   expect(searchMarketplace).toHaveBeenCalledTimes(2);
 });
 
-test("改 rank 输入并保存 → 调 setMarketplaceFeatured(slug, 数字) 并刷新目录", async () => {
+test("改 rank 输入并保存 → 调 setMarketplaceFeatured(slug, 数字),原地回写不整表刷新", async () => {
   mockCatalog([card("plain", { name: "待精选技能", users30d: 3 })]);
 
   render(<FeaturedPanel auth={auth} />);
@@ -69,8 +70,43 @@ test("改 rank 输入并保存 → 调 setMarketplaceFeatured(slug, 数字) 并�
   await waitFor(() => expect(setMarketplaceFeatured).toHaveBeenCalledTimes(1));
   expect(setMarketplaceFeatured.mock.calls[0][1]).toBe("plain");
   expect(setMarketplaceFeatured.mock.calls[0][2]).toBe(5);
-  // 成功即刷新(再拉两源)
-  await waitFor(() => expect(searchMarketplace).toHaveBeenCalledTimes(4));
+  // 改造前:成功即整表 reload → 整页闪白 + 刚编辑的那行被重排到顶部,管理员得自己重新找。
+  // 现在:原地回写该行(徽章即时更新),不再重拉目录;顺序留到用户主动点「刷新」时重排。
+  expect(await screen.findByText(/精选 #5/)).toBeInTheDocument();
+  expect(searchMarketplace).toHaveBeenCalledTimes(2);
+  // 保存后草稿与服务端值一致 → 按钮回到禁用态
+  expect(screen.getByRole("button", { name: "保存 待精选技能 精选排序" })).toBeDisabled();
+});
+
+test("保存失败:错误落在发起它的那一行(不再只写进几屏之外的页顶 Alert)", async () => {
+  mockCatalog([card("plain", { name: "待精选技能" })]);
+  setMarketplaceFeatured.mockRejectedValueOnce(new Error("boom"));
+
+  render(<FeaturedPanel auth={auth} />);
+  await screen.findByText("待精选技能");
+
+  fireEvent.change(screen.getByLabelText("待精选技能 精选排序"), { target: { value: "3" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存 待精选技能 精选排序" }));
+
+  const rowAlert = await screen.findByText("保存失败");
+  expect(rowAlert).toHaveAttribute("role", "alert");
+  expect(rowAlert.closest("li")).not.toBeNull(); // 就在那一行里,不在页顶
+  expect(screen.getByLabelText("待精选技能 精选排序")).toHaveAttribute("aria-invalid", "true");
+});
+
+test("工具条筛选:仅精选 / 按名称过滤只影响展示,不重新拉数据", async () => {
+  mockCatalog(
+    [card("feat", { name: "已精选技能", featuredRank: 1 }), card("plain", { name: "普通技能" })],
+    [],
+  );
+
+  render(<FeaturedPanel auth={auth} />);
+  await screen.findByText("已精选技能");
+
+  fireEvent.click(screen.getByRole("tab", { name: "仅精选" }));
+  await waitFor(() => expect(screen.queryByText("普通技能")).not.toBeInTheDocument());
+  expect(screen.getByText("已精选技能")).toBeInTheDocument();
+  expect(searchMarketplace).toHaveBeenCalledTimes(2); // 纯前端过滤
 });
 
 test("清空 rank(留空)保存 → featuredRank=null(取消精选)", async () => {

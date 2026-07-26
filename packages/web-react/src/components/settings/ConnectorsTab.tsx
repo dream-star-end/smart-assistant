@@ -1,4 +1,17 @@
-import { ArrowUpCircle, Check, ExternalLink, Pencil, QrCode, Store, Trash2, X } from 'lucide-react'
+import {
+  AlertTriangle,
+  ArrowUpCircle,
+  Check,
+  CheckCircle2,
+  ExternalLink,
+  Pencil,
+  Plug,
+  QrCode,
+  Settings2,
+  Store,
+  Trash2,
+  X,
+} from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { ApiError, api, apiErrorMessage } from '../../lib/api'
 import {
@@ -23,7 +36,26 @@ import {
   isOauthAuthMode,
 } from "../../lib/connectors";
 import type { AuthSession } from "../../lib/types";
-import { Alert, Button, IconButton, Input, Modal, Spinner, Switch, useConfirm } from "../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  EmptyState,
+  Field,
+  IconButton,
+  Input,
+  ListSkeleton,
+  Modal,
+  PanelHeader,
+  Sheet,
+  Skeleton,
+  Spinner,
+  Switch,
+  TimeAgo,
+  useConfirm,
+  useToast,
+} from "../ui";
 import { KnowledgePlanetAutomationPanel } from './KnowledgePlanetAutomationPanel'
 
 /** 把 ApiError 的机器码映射为中文（无码/未知码走 apiErrorMessage 收口：后端中文直显、
@@ -42,6 +74,46 @@ function managedSetupFailureText(
     return '微博触发了安全验证，本次授权已安全停止。请先在微博 App 完成安全验证并确认账号可正常使用，再重新授权；若仍反复出现，请稍后再试。'
   return '本次授权未完成，请重试。'
 }
+
+/**
+ * Plugin 账号状态的**唯一判据**（颜色与文案同源）。
+ *
+ * 改造前颜色由 `account.executable` 决定、文案由 `account.status` 决定，两条判据不同源：
+ * `status==='error' && executable===true` 时界面会渲染出绿色的「需重新授权」——
+ * 颜色说没事、文字说要重来。这里把 status 定为最高优先判据，executable / 版本差异
+ * 只在 status==='active' 时细分，渲染侧统一吃返回值，不再各自算一遍。
+ *
+ * `needsReauth` 表示"重新扫码授权可以修好它"——只有这一类才在账号行内给出重新授权出口，
+ * 「需先更新」这种要走更新流程的不给（否则扫完码还是不能用）。
+ */
+export type PluginAccountState = {
+  tone: 'success' | 'warning' | 'danger'
+  label: string
+  needsReauth: boolean
+}
+
+export function pluginAccountState(
+  account: Pick<RuntimePluginAccount, 'status' | 'executable' | 'versionId'>,
+  plugin: Pick<RuntimePluginCatalogEntry, 'updateAvailable' | 'installedCurrent' | 'versionId'>,
+): PluginAccountState {
+  if (account.status === 'error')
+    return { tone: 'danger', label: '需重新授权', needsReauth: true }
+  if (account.executable) return { tone: 'success', label: '可用', needsReauth: false }
+  if (plugin.updateAvailable) return { tone: 'warning', label: '需先更新', needsReauth: false }
+  if (plugin.installedCurrent && account.versionId !== plugin.versionId)
+    return { tone: 'warning', label: '需重新授权', needsReauth: true }
+  return { tone: 'warning', label: '当前不可用', needsReauth: false }
+}
+
+/**
+ * 卡片内提示：**反馈必须渲染在发起它的那个容器里**。
+ *
+ * 改造前所有成功/失败都收敛到面板最顶部两个 Alert，而这是一个能滚很长的列表 ——
+ * 在第 6 张卡片上切写入开关，提示渲染在滚动容器顶部，视口里什么都不会变，
+ * 观感就是"点了没反应"。现在按 slug 定位到卡片内渲染；顶部 Alert 只留整表加载失败。
+ * 会让当前容器消失的操作（解绑 / 卸载 / 更新后重排）走 toast，不留在原地。
+ */
+type CardNotice = { slug: string; tone: 'success' | 'warning' | 'danger'; text: string }
 
 /** oauth2_byoa provider 未下发 formFields 时的兜底字段（契约 body 键 clientId/clientSecret）。 */
 const DEFAULT_OAUTH_FIELDS: ConnectorFormField[] = [
@@ -94,14 +166,21 @@ export function ConnectorsTab({
   const [runtimeCatalog, setRuntimeCatalog] = useState<RuntimePluginCatalogEntry[]>([])
   const [runtimeAccounts, setRuntimeAccounts] = useState<RuntimePluginAccount[]>([])
   const [loading, setLoading] = useState(true)
+  /** 顶部 Alert 只承载「整表读不到」这一类全局态；其余反馈就地渲染在卡片内。 */
   const [err, setErr] = useState<string | null>(null)
-  const [success, setSuccess] = useState<string | null>(null)
+  const [cardNotice, setCardNotice] = useState<CardNotice | null>(null)
   /** 打开 v1 绑定弹层的 provider（github 不走弹层，直接跳 OAuth）。 */
   const [bindFor, setBindFor] = useState<ConnectorProvider | null>(null);
   /** 打开声明式绑定弹层的 catalog 条目。 */
   const [bindDeclFor, setBindDeclFor] = useState<DeclarativeCatalogEntry | null>(null)
   const [setupRuntimeFor, setSetupRuntimeFor] = useState<RuntimePluginCatalogEntry | null>(null)
   const [confirm, confirmEl] = useConfirm()
+  const toast = useToast()
+  const noticeFor = useCallback(
+    (slug: string) => (cardNotice?.slug === slug ? cardNotice : null),
+    [cardNotice],
+  )
+  const dismissNotice = useCallback(() => setCardNotice(null), [])
 
   const reload = useCallback(() => {
     let alive = true;
@@ -128,7 +207,7 @@ export function ConnectorsTab({
       })
       .catch((e) => {
         // 仅 v1 会 reject 到此（声明式已各自 catch 降级）。
-        if (alive) setErr(errText(e, "加载应用连接失败"));
+        if (alive) setErr(errText(e, "暂时读不到你的应用连接，请稍后重试。"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -137,6 +216,12 @@ export function ConnectorsTab({
       alive = false;
     };
   }, [auth]);
+
+  /** 整表读不到时的可重入重试（v1 目录是硬依赖，失败即空白，必须给出口）。 */
+  const retry = useCallback(() => {
+    setLoading(true)
+    reload()
+  }, [reload])
 
   useEffect(() => reload(), [reload]);
 
@@ -150,14 +235,23 @@ export function ConnectorsTab({
       (item) => item.provider === autoAuthorizePluginSlug && !item.executable,
     )
     onAutoAuthorizeConsumed?.()
-    setSuccess(null)
+    setCardNotice(null)
     setErr(null)
     if (account) {
-      setSuccess(`${plugin?.label ?? 'Plugin'}账号已授权，无需重复扫码。`)
+      setCardNotice({
+        slug: autoAuthorizePluginSlug,
+        tone: 'success',
+        text: `${plugin?.label ?? 'Plugin'}账号已授权，无需重复扫码。`,
+      })
       return
     }
     if (staleAccount) {
-      setErr('现有 Plugin 账号已失效；请先在下方解绑，再更新并重新扫码授权。')
+      // 失效不再让用户先走一遍破坏性解绑：账号行内就有「重新扫码授权」，这里只做定位指引。
+      setCardNotice({
+        slug: autoAuthorizePluginSlug,
+        tone: 'warning',
+        text: `${plugin?.label ?? 'Plugin'}账号的登录已失效，点击账号行上的「重新扫码授权」即可恢复。`,
+      })
       return
     }
     if (plugin?.installedCurrent && plugin.available) {
@@ -248,7 +342,13 @@ export function ConnectorsTab({
           .then((r) => {
             window.location.href = r.authorizeUrl;
           })
-          .catch((e) => setErr(errText(e, "发起 GitHub 授权失败")));
+          .catch((e) =>
+            setCardNotice({
+              slug: p.id,
+              tone: "danger",
+              text: errText(e, "发起 GitHub 授权失败"),
+            }),
+          );
         return;
       }
       setBindFor(p);
@@ -269,12 +369,15 @@ export function ConnectorsTab({
       try {
         if (conn.system === "declarative") await api.unbindDeclarativeConnector(auth, conn.id);
         else await api.deleteConnector(auth, conn.id);
+        // 行会消失 → 反馈不能留在原地，走 toast。
+        toast(`已解绑「${name}」`, "success");
         reload();
       } catch (e) {
-        setErr(errText(e, "解绑失败"));
+        // 失败时行还在 → 就地渲染在这张卡片里。
+        setCardNotice({ slug: conn.provider, tone: "danger", text: errText(e, "解绑失败") });
       }
     },
-    [auth, confirm, reload],
+    [auth, confirm, reload, toast],
   );
 
   const relink = useCallback(
@@ -302,7 +405,7 @@ export function ConnectorsTab({
         await api.renameConnector(auth, conn.id, displayName);
         reload();
       } catch (e) {
-        setErr(errText(e, "重命名失败"));
+        setCardNotice({ slug: conn.provider, tone: "danger", text: errText(e, "重命名失败") });
       }
     },
     [auth, reload],
@@ -311,15 +414,16 @@ export function ConnectorsTab({
   const updateMarketConnector = useCallback(
     async (c: DeclarativeManagementConnector) => {
       if (!c.latestVersionId) return;
-      setErr(null);
+      setCardNotice(null);
       try {
         await api.installMarketplace(auth, c.latestVersionId);
+        toast(`「${c.label}」已更新到 v${c.latestVersion ?? ""}`.trim(), "success");
         reload();
       } catch (e) {
-        setErr(errText(e, "更新 API 插件失败"));
+        setCardNotice({ slug: c.slug, tone: "danger", text: errText(e, "更新 API 插件失败") });
       }
     },
-    [auth, reload],
+    [auth, reload, toast],
   );
 
   const uninstallMarketConnector = useCallback(
@@ -332,15 +436,16 @@ export function ConnectorsTab({
         danger: true,
       });
       if (!ok) return;
-      setErr(null);
+      setCardNotice(null);
       try {
         await api.uninstallMarketplace(auth, c.slug);
+        toast(`已卸载「${c.label}」`, "success");
         reload();
       } catch (e) {
-        setErr(errText(e, "卸载 API 插件失败"));
+        setCardNotice({ slug: c.slug, tone: "danger", text: errText(e, "卸载 API 插件失败") });
       }
     },
-    [auth, confirm, reload],
+    [auth, confirm, reload, toast],
   );
 
   const revokeRuntimeAccount = useCallback(
@@ -353,13 +458,48 @@ export function ConnectorsTab({
         danger: true,
       })
       if (!ok) return
-      setSuccess(null)
+      setCardNotice(null)
       setErr(null)
       try {
         await api.revokePluginAccount(auth, account.id)
+        toast(`已解绑「${name}」`, 'success')
         reload()
       } catch (e) {
-        setErr(errText(e, '解绑 Plugin 账号失败'))
+        setCardNotice({
+          slug: account.provider,
+          tone: 'danger',
+          text: errText(e, '解绑 Plugin 账号失败'),
+        })
+      }
+    },
+    [auth, confirm, reload, toast],
+  )
+
+  /**
+   * 失效账号的恢复出口：解绑旧凭据 → 直接串上扫码弹层。
+   * 改造前授权按钮只在 `accounts.length === 0` 时渲染，一旦账号存在就永远不再出现，
+   * 用户唯一的"出路"是先走一遍破坏性解绑二次确认 —— 那是死胡同，不是恢复流程。
+   */
+  const reauthorizeRuntimeAccount = useCallback(
+    async (account: RuntimePluginAccount, plugin: RuntimePluginCatalogEntry) => {
+      const ok = await confirm({
+        title: `重新授权「${plugin.label}」?`,
+        body: '将替换当前已失效的登录状态，旧凭据会被销毁。随后会打开扫码弹层，扫码完成即恢复。',
+        confirmText: '重新扫码授权',
+      })
+      if (!ok) return
+      setCardNotice(null)
+      setErr(null)
+      try {
+        await api.revokePluginAccount(auth, account.id)
+        setSetupRuntimeFor(plugin)
+        reload()
+      } catch (e) {
+        setCardNotice({
+          slug: plugin.slug,
+          tone: 'danger',
+          text: errText(e, '重新授权失败，请稍后重试'),
+        })
       }
     },
     [auth, confirm, reload],
@@ -368,16 +508,26 @@ export function ConnectorsTab({
   const updateRuntimePlugin = useCallback(
     async (plugin: RuntimePluginCatalogEntry, accountCount: number) => {
       if (!plugin.latestVersionId || !plugin.updateAvailable || accountCount > 0) return
-      setSuccess(null)
+      setCardNotice(null)
       setErr(null)
       try {
         await api.installMarketplace(auth, plugin.latestVersionId)
+        toast(
+          plugin.installed
+            ? `「${plugin.label}」已更新到 v${plugin.latestVersion ?? ''}`.trim()
+            : `「${plugin.label}」已重新安装`,
+          'success',
+        )
         reload()
       } catch (e) {
-        setErr(errText(e, plugin.installed ? '更新 Plugin 失败' : '重新安装 Plugin 失败'))
+        setCardNotice({
+          slug: plugin.slug,
+          tone: 'danger',
+          text: errText(e, plugin.installed ? '更新 Plugin 失败' : '重新安装 Plugin 失败'),
+        })
       }
     },
-    [auth, reload],
+    [auth, reload, toast],
   )
 
   const uninstallRuntimePlugin = useCallback(
@@ -390,135 +540,215 @@ export function ConnectorsTab({
         danger: true,
       })
       if (!ok) return
-      setSuccess(null)
+      setCardNotice(null)
       setErr(null)
       try {
         await api.uninstallMarketplace(auth, plugin.slug)
+        toast(`已卸载「${plugin.label}」`, 'success')
         reload()
       } catch (e) {
-        setErr(errText(e, '卸载 Plugin 失败'))
+        setCardNotice({ slug: plugin.slug, tone: 'danger', text: errText(e, '卸载 Plugin 失败') })
       }
     },
-    [auth, confirm, reload],
+    [auth, confirm, reload, toast],
   )
 
-  if (loading) {
+  /**
+   * 卡片按**连接状态**分两组，而不是按后端分层（运行时 / 声明式 / v1）。
+   * 后端分层对用户没有意义；用户心里只有"哪些已经能用了 / 还能加什么"。
+   * 已连接组内失效的排最前 —— 需要处理的东西必须先被看见。
+   */
+  const pluginCards = runtimeCatalog.map((plugin) => {
+    const accounts = runtimeAccounts.filter((account) => account.provider === plugin.slug)
+    return {
+      kind: 'plugin' as const,
+      key: plugin.slug,
+      plugin,
+      accounts,
+      connected: accounts.length > 0,
+      broken: accounts.filter((account) => pluginAccountState(account, plugin).tone !== 'success')
+        .length,
+    }
+  })
+  const providerCards = unified.map((u) => {
+    const connections =
+      u.system === 'declarative'
+        ? [...(declConnsBySlug.get(u.slug) ?? []), ...(v1ConnsBySlug.get(u.slug) ?? [])]
+        : (v1ConnsBySlug.get(u.slug) ?? [])
+    return {
+      kind: 'provider' as const,
+      key: u.slug,
+      u,
+      connections,
+      connected: connections.length > 0,
+      broken: connections.filter((c) => c.status === 'error').length,
+    }
+  })
+  type CatalogCard = (typeof pluginCards)[number] | (typeof providerCards)[number]
+  const allCards: CatalogCard[] = [...pluginCards, ...providerCards]
+  const connectedCards = allCards.filter((c) => c.connected).sort((a, b) => b.broken - a.broken)
+  const availableCards = allCards.filter((c) => !c.connected)
+  // 只有两组都非空才出组标题 —— 单组时标题是纯噪音。
+  const grouped = connectedCards.length > 0 && availableCards.length > 0
+
+  const renderCard = (card: CatalogCard) => {
+    if (card.kind !== 'plugin') return renderProviderCard(card)
     return (
-      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-faint">
-        <Spinner /> 加载应用连接…
-      </div>
-    );
+      <RuntimePluginCard
+        key={card.key}
+        auth={auth}
+        plugin={card.plugin}
+        accounts={card.accounts}
+        notice={noticeFor(card.plugin.slug)}
+        onDismissNotice={dismissNotice}
+        onAuthorize={() => {
+          setCardNotice(null)
+          setErr(null)
+          setSetupRuntimeFor(card.plugin)
+        }}
+        onUpdate={() => updateRuntimePlugin(card.plugin, card.accounts.length)}
+        onUninstall={() => uninstallRuntimePlugin(card.plugin, card.accounts.length)}
+        onRevoke={(account) => revokeRuntimeAccount(account)}
+        onReauthorize={(account) => reauthorizeRuntimeAccount(account, card.plugin)}
+        onWriteAccessChanged={(enabled) => {
+          setErr(null)
+          setCardNotice({
+            slug: card.plugin.slug,
+            tone: 'success',
+            text: enabled
+              ? `${card.plugin.label}写入能力已开启；默认仍需在对话中逐次确认，免逐次确认需另行同意。${card.plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
+              : `${card.plugin.label}写入能力已关闭。`,
+          })
+          reload()
+        }}
+        onWriteAccessError={(error) =>
+          setCardNotice({
+            slug: card.plugin.slug,
+            tone: 'danger',
+            text: errText(error, '切换 Plugin 写入能力失败'),
+          })
+        }
+        onWritePreapprovalChanged={(enabled) => {
+          setErr(null)
+          setCardNotice({
+            slug: card.plugin.slug,
+            tone: 'success',
+            text: enabled
+              ? `${card.plugin.label}“免逐次确认”已开启；Agent 可直接执行所有已开放写入动作，不再展示确认卡。${card.plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
+              : `${card.plugin.label}“免逐次确认”已关闭；后续写入恢复逐次确认。`,
+          })
+          reload()
+        }}
+        onWritePreapprovalError={(error) =>
+          setCardNotice({
+            slug: card.plugin.slug,
+            tone: 'danger',
+            text: errText(error, '切换 Plugin 免逐次确认失败'),
+          })
+        }
+      />
+    )
+  }
+
+  const renderProviderCard = (card: Extract<CatalogCard, { kind: 'provider' }>) => {
+    const u = card.u
+    const management = u.system === 'declarative' ? u.management : undefined
+    return (
+      <ProviderCard
+        key={card.key}
+        slug={u.slug}
+        label={u.label}
+        description={u.description}
+        capabilityLabel={
+          u.system === 'declarative'
+            ? u.decl
+              ? declarativeCapabilityLabel(u.decl.actions)
+              : '当前不可用'
+            : connectorCapabilityLabel(u.slug)
+        }
+        connections={card.connections}
+        notice={noticeFor(u.slug)}
+        onDismissNotice={dismissNotice}
+        onBind={() => startBind(u)}
+        canBind={management ? management.canBind : true}
+        management={management}
+        onOpenMarketplace={onOpenMarketplace}
+        onUpdate={management ? () => updateMarketConnector(management) : undefined}
+        onUninstallMarket={management ? () => uninstallMarketConnector(management) : undefined}
+        onUnbind={unbind}
+        onRename={rename}
+        onRelink={(c) => relink(u, c)}
+      />
+    )
   }
 
   return (
     <div className="flex flex-col">
-      <div className="px-5 pt-4">
-        <p className="text-[12.5px] leading-relaxed text-faint">
-          绑定你的应用账号后，AI 助手即可在对话中访问这些应用；写入类操作默认会先在对话里
-          向你逐次确认。个别支持的 Plugin 可由你另行授权免逐次确认。
-        </p>
-        <div className="mt-2 flex items-center justify-between gap-2">
-          <span className="text-[11.5px] text-faint">
-            官方预装、市场安装与已绑定账号在这里统一管理。
-          </span>
-          {onOpenMarketplace && (
+      <PanelHeader
+        title="插件账号"
+        hint="绑定应用账号后，AI 助手即可在对话中访问它们；写入操作默认逐次确认，个别 Plugin 可另行授权免逐次确认。"
+        action={
+          onOpenMarketplace && (
             <Button size="sm" variant="secondary" onClick={onOpenMarketplace}>
               <Store size={13} /> 去市场添加
             </Button>
-          )}
-        </div>
+          )
+        }
+      />
+
+      <div className="flex flex-col gap-3 px-4 pb-4">
         {err && (
-          <Alert tone="danger" className="mt-3 text-[12.5px]">
+          <Alert
+            tone="danger"
+            density="compact"
+            action={
+              data === null ? (
+                <Button size="sm" variant="secondary" onClick={retry}>
+                  重试
+                </Button>
+              ) : onOpenMarketplace ? (
+                <Button size="sm" variant="secondary" onClick={onOpenMarketplace}>
+                  <Store size={13} /> 去市场
+                </Button>
+              ) : undefined
+            }
+            onDismiss={data === null ? undefined : () => setErr(null)}
+          >
             {err}
           </Alert>
         )}
-        {success && (
-          <Alert tone="success" className="mt-3 text-[12.5px]">
-            {success}
-          </Alert>
-        )}
-      </div>
 
-      <div className="flex flex-col gap-3 px-5 py-4">
-        {runtimeCatalog.map((plugin) => {
-          const accounts = runtimeAccounts.filter((account) => account.provider === plugin.slug)
-          return (
-            <RuntimePluginCard
-              key={plugin.slug}
-              auth={auth}
-              plugin={plugin}
-              accounts={accounts}
-              onAuthorize={() => {
-                setSuccess(null)
-                setErr(null)
-                setSetupRuntimeFor(plugin)
-              }}
-              onUpdate={() => void updateRuntimePlugin(plugin, accounts.length)}
-              onUninstall={() => void uninstallRuntimePlugin(plugin, accounts.length)}
-              onRevoke={(account) => void revokeRuntimeAccount(account)}
-              onWriteAccessChanged={(enabled) => {
-                setErr(null)
-                setSuccess(
-                  enabled
-                    ? `${plugin.label}写入能力已开启；默认仍需在对话中逐次确认，免逐次确认需另行同意。${plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
-                    : `${plugin.label}写入能力已关闭。`,
-                )
-                reload()
-              }}
-              onWriteAccessError={(error) => setErr(errText(error, '切换 Plugin 写入能力失败'))}
-              onWritePreapprovalChanged={(enabled) => {
-                setErr(null)
-                setSuccess(
-                  enabled
-                    ? `${plugin.label}“免逐次确认”已开启；Agent 可直接执行所有已开放写入动作，不再展示确认卡。${plugin.slug === 'knowledge-planet' ? '无人值守自动回复仍由独立开关控制。' : ''}`
-                    : `${plugin.label}“免逐次确认”已关闭；后续写入恢复逐次确认。`,
-                )
-                reload()
-              }}
-              onWritePreapprovalError={(error) =>
-                setErr(errText(error, '切换 Plugin 免逐次确认失败'))
-              }
-            />
-          )
-        })}
-        {unified.map((u) => (
-          <ProviderCard
-            key={u.slug}
-            slug={u.slug}
-            label={u.label}
-            description={u.description}
-            capabilityLabel={
-              u.system === "declarative"
-                ? u.decl
-                  ? declarativeCapabilityLabel(u.decl.actions)
-                  : "当前不可用"
-                : connectorCapabilityLabel(u.slug)
-            }
-            connections={
-              u.system === "declarative"
-                ? [...(declConnsBySlug.get(u.slug) ?? []), ...(v1ConnsBySlug.get(u.slug) ?? [])]
-                : (v1ConnsBySlug.get(u.slug) ?? [])
-            }
-            onBind={() => startBind(u)}
-            canBind={u.system === "v1" || u.management.canBind}
-            management={u.system === "declarative" ? u.management : undefined}
-            onUpdate={
-              u.system === "declarative"
-                ? () => void updateMarketConnector(u.management)
-                : undefined
-            }
-            onUninstallMarket={
-              u.system === "declarative"
-                ? () => void uninstallMarketConnector(u.management)
-                : undefined
-            }
-            onUnbind={unbind}
-            onRename={rename}
-            onRelink={(c) => relink(u, c)}
-          />
-        ))}
-        {data && unified.length === 0 && runtimeCatalog.length === 0 && (
-          <p className="py-6 text-center text-[13px] text-faint">暂无可绑定的应用。</p>
+        {loading ? (
+          <ListSkeleton rows={3} />
+        ) : (
+          <>
+            {grouped && (
+              <div className="px-1 text-caption font-medium text-muted">
+                已连接（{connectedCards.length}）
+              </div>
+            )}
+            {connectedCards.map(renderCard)}
+            {grouped && (
+              <div className="px-1 pt-1 text-caption font-medium text-muted">
+                可添加（{availableCards.length}）
+              </div>
+            )}
+            {availableCards.map(renderCard)}
+            {!err && allCards.length === 0 && (
+              <EmptyState
+                icon={Plug}
+                title="还没有可用的应用连接"
+                hint="从 AI 市场安装连接器或 Plugin 后，就能把邮箱、网盘、笔记等账号交给助手使用。"
+                action={
+                  onOpenMarketplace && (
+                    <Button size="sm" variant="accent" onClick={onOpenMarketplace}>
+                      <Store size={13} /> 去市场看看
+                    </Button>
+                  )
+                }
+              />
+            )}
+          </>
         )}
       </div>
 
@@ -548,11 +778,15 @@ export function ConnectorsTab({
         onBound={(agentReady) => {
           setErr(null)
           const label = setupRuntimeFor?.label ?? 'Plugin'
-          setSuccess(
-            agentReady
-              ? `${label}账号已授权，Agent 现在可以直接读取相关内容；写入能力默认关闭。`
-              : `${label}登录信息已加密保存；系统完成 Plugin 升级后会自动启用。`,
-          )
+          // 授权结果落在**那张卡片上**：弹层关掉后用户回到列表，提示就在他刚授权的那张卡里。
+          if (setupRuntimeFor)
+            setCardNotice({
+              slug: setupRuntimeFor.slug,
+              tone: 'success',
+              text: agentReady
+                ? `${label}账号已授权，Agent 现在可以直接读取相关内容；写入能力默认关闭。`
+                : `${label}登录信息已加密保存；系统完成 Plugin 升级后会自动启用。`,
+            })
           reload()
         }}
       />
@@ -565,10 +799,13 @@ function RuntimePluginCard({
   auth,
   plugin,
   accounts,
+  notice,
+  onDismissNotice,
   onAuthorize,
   onUpdate,
   onUninstall,
   onRevoke,
+  onReauthorize,
   onWriteAccessChanged,
   onWriteAccessError,
   onWritePreapprovalChanged,
@@ -577,10 +814,14 @@ function RuntimePluginCard({
   auth: AuthSession
   plugin: RuntimePluginCatalogEntry
   accounts: RuntimePluginAccount[]
+  /** 本卡片的就地反馈（成功/失败都渲染在这里，不再飞到面板顶部）。 */
+  notice: CardNotice | null
+  onDismissNotice: () => void
   onAuthorize: () => void
-  onUpdate: () => void
-  onUninstall: () => void
-  onRevoke: (account: RuntimePluginAccount) => void
+  onUpdate: () => Promise<void>
+  onUninstall: () => Promise<void>
+  onRevoke: (account: RuntimePluginAccount) => Promise<void>
+  onReauthorize: (account: RuntimePluginAccount) => Promise<void>
   onWriteAccessChanged: (enabled: boolean) => void
   onWriteAccessError: (error: unknown) => void
   onWritePreapprovalChanged: (enabled: boolean) => void
@@ -599,6 +840,25 @@ function RuntimePluginCard({
   const [preapprovalChecked, setPreapprovalChecked] = useState(false)
   const [preapprovalError, setPreapprovalError] = useState<string | null>(null)
   const [writeBusyId, setWriteBusyId] = useState<string | null>(null)
+  /** 卡片级异步动作的忙态键（`update` / `uninstall` / `revoke:<id>` / `reauth:<id>`）。 */
+  const [busyAction, setBusyAction] = useState<string | null>(null)
+  /** 自动回复配置面板（从账号行里外提，见下方 Sheet）。 */
+  const [automationAccount, setAutomationAccount] = useState<RuntimePluginAccount | null>(null)
+
+  const runAction = async (key: string, action: () => Promise<void>) => {
+    if (busyAction) return
+    setBusyAction(key)
+    try {
+      await action()
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  const accountStates = accounts.map((account) => pluginAccountState(account, plugin))
+  const brokenCount = accountStates.filter((state) => state.tone !== 'success').length
+  /** 账号存在时更新/卸载会被后端拒（登录状态与新版本不匹配），把原因写成可见文字而非 title。 */
+  const blockedByAccounts = accounts.length > 0
 
   const disableWrite = async (account: RuntimePluginAccount) => {
     if (writeBusyId) return
@@ -680,56 +940,67 @@ function RuntimePluginCard({
     }
   }
   return (
-    <div className="rounded-xl border border-border bg-surface p-3.5">
+    <Card className="p-3.5">
       <div className="flex items-start gap-3">
         <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
           <Icon size={18} />
         </span>
         <div className="min-w-0 flex-1">
+          {/* 标题行只放身份与能力标注；连接状态单独成行，避免四类信息平铺争夺注意力。 */}
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[14px] font-medium text-fg">{plugin.label}</span>
-            <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-muted">
+            <span className="text-section font-medium text-fg">{plugin.label}</span>
+            <Badge tone="neutral" size="sm">
               {writeCount > 0 ? '可读写' : '只读'}
-            </span>
+            </Badge>
             {plugin.installed ? (
-              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+              <Badge tone="accent" size="sm">
                 市场已安装 · v{plugin.installedVersion}
-              </span>
+              </Badge>
             ) : (
-              <span className="rounded-full bg-warning-soft px-2 py-0.5 text-[10.5px] text-warning">
+              <Badge tone="warning" size="sm">
                 历史账号 · 当前未安装
-              </span>
+              </Badge>
             )}
             {plugin.updateAvailable && plugin.latestVersion && (
-              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+              <Badge tone="accent" size="sm">
                 {plugin.installed ? `可更新 v${plugin.latestVersion}` : '可重新安装'}
-              </span>
+              </Badge>
             )}
             {plugin.pluginType === 'managed-browser' && (
-              <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
+              <Badge tone="neutral" size="sm">
                 隔离运行
-              </span>
-            )}
-            {accounts.length > 0 && (
-              <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
-                已授权
-              </span>
+              </Badge>
             )}
           </div>
-          <p className="mt-0.5 text-[12px] leading-snug text-faint">{plugin.description}</p>
-          <p className="mt-1 text-[11px] text-faint">
+          <p className="mt-0.5 text-meta leading-snug text-faint">{plugin.description}</p>
+          <p className="mt-1 text-caption text-faint">
             {readCount} 项读取能力{writeCount > 0 ? ` · ${writeCount} 项写入能力（默认关闭）` : ''}
             {plugin.accountMode === 'none' ? ' · 无需账号' : ' · 账号登录状态加密保存'}
           </p>
+          {accounts.length > 0 && (
+            <div className="mt-1.5">
+              {brokenCount > 0 ? (
+                <Badge tone="warning">
+                  <AlertTriangle size={11} aria-hidden="true" />
+                  {brokenCount} 个账号待处理
+                </Badge>
+              ) : (
+                <Badge tone="success">
+                  <CheckCircle2 size={11} aria-hidden="true" />
+                  已授权
+                </Badge>
+              )}
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
           {plugin.updateAvailable && (
             <Button
               variant="primary"
               size="sm"
-              onClick={onUpdate}
-              disabled={accounts.length > 0}
-              title={accounts.length > 0 ? '请先解绑 Plugin 账号再更新' : undefined}
+              onClick={() => void runAction('update', onUpdate)}
+              loading={busyAction === 'update'}
+              disabled={blockedByAccounts || busyAction !== null}
             >
               <ArrowUpCircle size={13} /> {plugin.installed ? '更新' : '重新安装'}
             </Button>
@@ -740,7 +1011,6 @@ function RuntimePluginCard({
               size="sm"
               onClick={onAuthorize}
               disabled={!canSelfAuthorize}
-              title={canSelfAuthorize ? authorizeLabel : '该 Plugin 暂未提供自助授权流程'}
             >
               <QrCode size={13} /> {canSelfAuthorize ? authorizeLabel : '暂不可授权'}
             </Button>
@@ -750,23 +1020,48 @@ function RuntimePluginCard({
               variant="ghost"
               size="sm"
               className="text-danger"
-              onClick={onUninstall}
-              disabled={accounts.length > 0}
-              title={accounts.length > 0 ? '请先解绑 Plugin 账号' : '卸载 Plugin'}
+              onClick={() => void runAction('uninstall', onUninstall)}
+              loading={busyAction === 'uninstall'}
+              disabled={blockedByAccounts || busyAction !== null}
             >
               <Trash2 size={13} /> 卸载
             </Button>
           )}
         </div>
       </div>
+      {/* 禁用原因写成可见文字：title 属性在触屏上永远不出现，键盘与读屏用户也读不到。 */}
+      {blockedByAccounts && (plugin.updateAvailable || plugin.installed) && (
+        <p className="mt-2 text-caption text-warning">
+          更新或卸载前需先解绑下方账号：重装会让已保存的登录状态失配。
+        </p>
+      )}
+      {plugin.accountMode === 'required' &&
+        accounts.length === 0 &&
+        plugin.installedCurrent &&
+        !canSelfAuthorize && (
+          <p className="mt-2 text-caption text-faint">
+            该 Plugin 暂未提供自助授权流程，请在对话中让助手引导完成绑定。
+          </p>
+        )}
+      {notice && (
+        <Alert
+          tone={notice.tone}
+          density="compact"
+          className="mt-2"
+          onDismiss={onDismissNotice}
+        >
+          {notice.text}
+        </Alert>
+      )}
       {!plugin.available && (
-        <Alert tone="warning" className="mt-2 text-[11.5px]">
+        <Alert tone="warning" density="compact" className="mt-2">
           该 Plugin 当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号或卸载。
         </Alert>
       )}
       {accounts.length > 0 && (
         <ul className="mt-3 flex flex-col divide-y divide-border border-t border-border pt-1">
-          {accounts.map((account) => {
+          {accounts.map((account, index) => {
+            const accountState = accountStates[index] ?? pluginAccountState(account, plugin)
             const writePolicyStale =
               account.writeControl !== null &&
               account.writeControl.acceptedVersion !== null &&
@@ -779,27 +1074,38 @@ function RuntimePluginCard({
                 account.writeControl.preapproval.disclaimerVersion
             return (
               <li key={account.id} className="flex flex-wrap items-center gap-2 py-2">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13px] text-fg">
+                <div className="min-w-0 flex-1 basis-40">
+                  <div className="truncate text-body text-fg">
                     {account.displayName || plugin.label}
                   </div>
-                  {account.accountHint && (
-                    <div className="truncate text-[11px] text-faint">{account.accountHint}</div>
-                  )}
+                  <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+                    {/* 颜色与文案同源（pluginAccountState），不再出现"绿色的需重新授权"。 */}
+                    <Badge tone={accountState.tone} size="sm">
+                      {accountState.tone === 'success' ? (
+                        <CheckCircle2 size={11} aria-hidden="true" />
+                      ) : (
+                        <AlertTriangle size={11} aria-hidden="true" />
+                      )}
+                      {accountState.label}
+                    </Badge>
+                    {account.accountHint && (
+                      <span className="truncate text-caption text-faint">{account.accountHint}</span>
+                    )}
+                  </div>
                 </div>
-                <span className={account.executable ? 'text-[11px] text-success' : 'text-[11px] text-warning'}>
-                  {account.status === 'error'
-                    ? '需重新授权'
-                    : account.executable
-                      ? '可用'
-                      : plugin.updateAvailable
-                        ? '需先更新'
-                        : plugin.installedCurrent && account.versionId !== plugin.versionId
-                          ? '需重新授权'
-                          : '当前不可用'}
-                </span>
+                {accountState.needsReauth && canSelfAuthorize && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => void runAction(`reauth:${account.id}`, () => onReauthorize(account))}
+                    loading={busyAction === `reauth:${account.id}`}
+                    disabled={busyAction !== null}
+                  >
+                    <QrCode size={13} /> 重新扫码授权
+                  </Button>
+                )}
                 {account.writeControl && (
-                  <div className="flex items-center gap-2 text-[11.5px] text-muted">
+                  <div className="flex items-center gap-2 text-caption text-muted">
                     <span className={writePolicyStale ? 'text-warning' : undefined}>
                       {writePolicyStale
                         ? '写入条款已更新，需重新同意'
@@ -823,21 +1129,23 @@ function RuntimePluginCard({
                     />
                   </div>
                 )}
-                <Button
-                  variant="ghost"
+                <IconButton
+                  variant="danger"
                   size="sm"
-                  className="text-danger"
-                  onClick={() => onRevoke(account)}
+                  aria-label="解绑"
+                  title="解绑"
+                  disabled={busyAction !== null}
+                  onClick={() => void runAction(`revoke:${account.id}`, () => onRevoke(account))}
                 >
-                  <Trash2 size={13} /> 解绑
-                </Button>
+                  {busyAction === `revoke:${account.id}` ? <Spinner size={14} /> : <Trash2 size={14} />}
+                </IconButton>
                 {account.writeControl?.preapproval?.available && (
-                  <div className="basis-full rounded-lg border border-border bg-hover/50 px-3 py-2">
+                  <Card tone="sunken" padding="sm" className="basis-full">
                     <div className="flex flex-wrap items-center gap-2">
-                      <div className="min-w-0 flex-1">
-                        <div className="text-[11.5px] font-medium text-fg">免逐次确认</div>
+                      <div className="min-w-0 flex-1 basis-40">
+                        <div className="text-caption font-medium text-fg">免逐次确认</div>
                         <div
-                          className={`mt-0.5 text-[10.5px] leading-relaxed ${
+                          className={`mt-0.5 text-caption leading-relaxed ${
                             preapprovalPolicyStale ? 'text-warning' : 'text-faint'
                           }`}
                         >
@@ -848,7 +1156,7 @@ function RuntimePluginCard({
                               : '开启后，Agent 直接执行写入，不展示确认卡；默认关闭。'}
                         </div>
                       </div>
-                      <span className="text-[11px] text-muted">
+                      <span className="text-caption text-muted">
                         {preapprovalPolicyStale
                           ? '需重新同意'
                           : account.writeControl.preapproval.enabled
@@ -874,12 +1182,27 @@ function RuntimePluginCard({
                         }}
                       />
                     </div>
-                  </div>
+                  </Card>
                 )}
+                {/* 自动回复外提：账号行只留一行摘要 + 入口，847 行的规则子系统去 Sheet 里展开。 */}
                 {plugin.slug === 'knowledge-planet' && account.status === 'active' && (
-                  <div className="basis-full">
-                    <KnowledgePlanetAutomationPanel auth={auth} account={account} />
-                  </div>
+                  <Card tone="sunken" padding="sm" className="basis-full">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="min-w-0 flex-1 basis-40">
+                        <div className="text-caption font-medium text-fg">无人值守自动回复</div>
+                        <div className="mt-0.5 text-caption leading-relaxed text-faint">
+                          按规则自动回复星球里的新主题与提问；默认关闭，需单独同意免责声明。
+                        </div>
+                      </div>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => setAutomationAccount(account)}
+                      >
+                        <Settings2 size={13} /> 配置
+                      </Button>
+                    </div>
+                  </Card>
                 )}
               </li>
             )
@@ -914,21 +1237,27 @@ function RuntimePluginCard({
             <Button
               variant="primary"
               size="sm"
-              disabled={!consentChecked || writeBusyId != null}
+              loading={writeBusyId != null}
+              disabled={!consentChecked}
               onClick={() => void enableWrite()}
             >
-              {writeBusyId ? '正在开启…' : '同意并开启'}
+              同意并开启
             </Button>
           </>
         }
       >
         {consentAccount?.writeControl && (
           <div className="flex flex-col gap-3">
-            {consentError && <Alert tone="danger">{consentError}</Alert>}
-            <Alert tone="warning" className="text-[12px] leading-relaxed">
+            {/* 失败提示留在弹层内 —— 渲染到面板顶部会被这层遮罩整个盖住。 */}
+            {consentError && (
+              <Alert tone="danger" density="compact">
+                {consentError}
+              </Alert>
+            )}
+            <Alert tone="warning" density="compact" className="leading-relaxed">
               {consentAccount.writeControl.disclaimerText}
             </Alert>
-            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border p-3 text-[12px] leading-relaxed text-muted">
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border p-3 text-meta leading-relaxed text-muted">
               <input
                 type="checkbox"
                 className="mt-0.5 size-4 accent-accent"
@@ -968,21 +1297,26 @@ function RuntimePluginCard({
             <Button
               variant="primary"
               size="sm"
-              disabled={!preapprovalChecked || writeBusyId != null}
+              loading={writeBusyId != null}
+              disabled={!preapprovalChecked}
               onClick={() => void enablePreapproval()}
             >
-              {writeBusyId ? '正在开启…' : '同意并开启'}
+              同意并开启
             </Button>
           </>
         }
       >
         {preapprovalAccount?.writeControl?.preapproval && (
           <div className="flex flex-col gap-3">
-            {preapprovalError && <Alert tone="danger">{preapprovalError}</Alert>}
-            <Alert tone="warning" className="text-[12px] leading-relaxed">
+            {preapprovalError && (
+              <Alert tone="danger" density="compact">
+                {preapprovalError}
+              </Alert>
+            )}
+            <Alert tone="warning" density="compact" className="leading-relaxed">
               {preapprovalAccount.writeControl.preapproval.disclaimerText}
             </Alert>
-            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border p-3 text-[12px] leading-relaxed text-muted">
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border p-3 text-meta leading-relaxed text-muted">
               <input
                 type="checkbox"
                 className="mt-0.5 size-4 accent-accent"
@@ -994,7 +1328,41 @@ function RuntimePluginCard({
           </div>
         )}
       </Modal>
-    </div>
+      {/*
+        自动回复配置面板：从账号 <li> 里外提到贴底抽屉。
+        原来的层级是 管理中心 → 插件账号 Tab → 插件卡片 → 账号行 → 自动回复子系统，
+        四层缩进里还塞着规则列表、免责声明、运行记录与多个弹层；现在它有了自己的标题与呼吸空间。
+      */}
+      <Sheet
+        open={automationAccount != null}
+        onOpenChange={(open) => {
+          if (!open) setAutomationAccount(null)
+        }}
+        side="bottom"
+        srTitle={`${plugin.label}自动回复设置`}
+      >
+        <div className="flex items-start justify-between gap-3 px-4 pb-2 pt-3">
+          <div className="min-w-0">
+            <h3 className="text-title font-semibold text-fg">{plugin.label}自动回复设置</h3>
+            <p className="mt-0.5 truncate text-caption text-muted">
+              账号：{automationAccount?.displayName || automationAccount?.accountHint || plugin.label}
+            </p>
+          </div>
+          <IconButton
+            aria-label="关闭自动回复设置"
+            size="sm"
+            onClick={() => setAutomationAccount(null)}
+          >
+            <X size={16} />
+          </IconButton>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
+          {automationAccount && (
+            <KnowledgePlanetAutomationPanel auth={auth} account={automationAccount} />
+          )}
+        </div>
+      </Sheet>
+    </Card>
   )
 }
 
@@ -1238,24 +1606,21 @@ function ManagedBrowserSetupDialog({
             <Button
               variant="ghost"
               size="sm"
-              disabled={cancelling || setup?.status === 'finalizing'}
+              loading={cancelling}
+              disabled={setup?.status === 'finalizing'}
               onClick={() => void close()}
             >
-              {cancelling
-                ? '正在取消…'
-                : setup?.status === 'finalizing'
-                  ? '正在安全保存…'
-                  : '取消'}
+              {setup?.status === 'finalizing' ? '正在安全保存…' : '取消'}
             </Button>
           )}
           {!setup && (
             <Button
               variant="primary"
               size="sm"
-              disabled={starting}
+              loading={starting}
               onClick={() => void start()}
             >
-              <QrCode size={13} /> {starting ? '正在生成二维码…' : '同意并生成二维码'}
+              <QrCode size={13} /> 同意并生成二维码
             </Button>
           )}
           {terminalFailure && (
@@ -1272,9 +1637,9 @@ function ManagedBrowserSetupDialog({
       }
     >
       <div className="flex flex-col gap-3">
-        {error && <Alert tone="danger">{error}</Alert>}
+        {error && <Alert tone="danger" density="compact">{error}</Alert>}
         {!setup && (
-          <div className="rounded-lg bg-hover px-3 py-2.5 text-[12px] leading-relaxed text-muted">
+          <div className="rounded-lg bg-hover px-3 py-2.5 text-meta leading-relaxed text-muted">
             点击“同意并生成二维码”即表示你同意使用{scanner}扫码保存{label}
             登录状态。登录状态仅保存在服务端加密账号库中；Plugin
             只访问固定域名白名单。扫码本身不会开启发布能力，写入需在账号卡片中另行同意并开启，且每次执行仍需确认。
@@ -1299,14 +1664,16 @@ function ManagedBrowserSetupDialog({
               return (
                 <li
                   key={stepLabel}
-                  className={`flex min-w-0 flex-col items-center gap-1 text-center text-[10.5px] ${
+                  className={`flex min-w-0 flex-col items-center gap-1 text-center text-caption ${
                     complete || active ? 'text-accent' : 'text-faint'
                   }`}
                 >
                   <span
                     className={`flex size-5 items-center justify-center rounded-full border ${
                       complete
-                        ? 'border-accent bg-accent text-white'
+                        ? // accent-fg 才是 accent 底上的可读前景（暗色主题下 accent 是浅紫，
+                          // 白色对勾会糊掉）；与 Button 的 accent 变体同一套判据。
+                          'border-accent bg-accent text-accent-fg'
                         : active
                           ? 'border-accent bg-accent-soft'
                           : 'border-border'
@@ -1321,38 +1688,45 @@ function ManagedBrowserSetupDialog({
           </ol>
         )}
         {setup?.status === 'waiting_for_scan' && (
-          <div className="flex min-h-64 flex-col items-center justify-center gap-3 rounded-xl border border-border bg-white p-4">
+          // 白底卡**只包二维码图像**：二维码必须在白底上才扫得动，但任何跟随主题的
+          // token 文字落在写死的白底上都会失联（暗色 --muted 对白底约 1.5:1）。
+          // 说明文字与链接一律留在主题面上，扫码这条一次性关键路径才不会失去指引。
+          <div className="flex flex-col items-center gap-3">
             {qrUrl ? (
-              <>
+              <div className="flex justify-center rounded-xl border border-border bg-white p-4">
                 <img
                   src={qrUrl}
                   alt={isWeibo ? '微博登录二维码' : '知识星球微信登录二维码'}
                   className="size-56 object-contain"
                 />
-                <a
-                  href={qrUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-[12px] text-accent hover:underline"
-                >
-                  <ExternalLink size={12} /> 单独打开二维码
-                </a>
-              </>
+              </div>
             ) : (
-              <div className="flex items-center gap-2 text-[12.5px] text-muted">
-                <Spinner /> 正在加载二维码…
+              <div className="flex min-h-64 w-full items-center justify-center rounded-xl border border-border bg-hover p-4">
+                <Skeleton className="size-56 rounded-lg" />
               </div>
             )}
-            <output className="text-center text-[12px] text-muted" aria-live="polite">
+            <output className="text-center text-meta text-muted" aria-live="polite">
               {setupPhase === 'generating_qr'
                 ? `正在安全生成${scanner}二维码，通常需要几秒…`
-                : `二维码已生成 · 请使用${scanner}扫码，并在手机上确认登录`}
+                : qrUrl
+                  ? `二维码已生成 · 请使用${scanner}扫码，并在手机上确认登录`
+                  : '正在加载二维码…'}
             </output>
+            {qrUrl && (
+              <a
+                href={qrUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-meta text-accent hover:underline"
+              >
+                <ExternalLink size={12} /> 单独打开二维码
+              </a>
+            )}
           </div>
         )}
         {setup?.status === 'finalizing' && (
           <output
-            className="flex items-center justify-center gap-2 py-12 text-[13px] text-muted"
+            className="flex items-center justify-center gap-2 py-12 text-body text-muted"
             aria-live="polite"
           >
             <Spinner />{' '}
@@ -1384,9 +1758,12 @@ function ProviderCard({
   description,
   capabilityLabel,
   connections,
+  notice,
+  onDismissNotice,
   onBind,
   canBind = true,
   management,
+  onOpenMarketplace,
   onUpdate,
   onUninstallMarket,
   onUnbind,
@@ -1398,73 +1775,113 @@ function ProviderCard({
   description: string;
   capabilityLabel: string;
   connections: UnifiedConnection[];
+  /** 本卡片的就地反馈（见 CardNotice 注释）。 */
+  notice: CardNotice | null;
+  onDismissNotice: () => void;
   onBind: () => void;
   canBind?: boolean;
   management?: DeclarativeManagementConnector;
-  onUpdate?: () => void;
-  onUninstallMarket?: () => void;
-  onUnbind: (conn: UnifiedConnection) => void;
+  onOpenMarketplace?: () => void;
+  onUpdate?: () => Promise<void>;
+  onUninstallMarket?: () => Promise<void>;
+  onUnbind: (conn: UnifiedConnection) => Promise<void>;
   onRename: (conn: ConnectorConnection, displayName: string) => void;
   onRelink: (conn: UnifiedConnection) => void;
 }) {
   const Icon = connectorIcon(slug);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const runAction = async (key: string, action: () => Promise<void>) => {
+    if (busyAction) return;
+    setBusyAction(key);
+    try {
+      await action();
+    } finally {
+      setBusyAction(null);
+    }
+  };
+  const broken = connections.filter((c) => c.status === "error").length;
+  const orphanInstall = management?.installation === "orphan";
   return (
-    <div className="rounded-xl border border-border bg-surface p-3.5">
+    <Card className="p-3.5">
       <div className="flex items-start gap-3">
         <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
           <Icon size={18} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[14px] font-medium text-fg">{label}</span>
-            <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-muted">
+            <span className="text-section font-medium text-fg">{label}</span>
+            <Badge tone="neutral" size="sm">
               {capabilityLabel}
-            </span>
+            </Badge>
             {management?.installation === "default" && (
-              <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
+              <Badge tone="accent" size="sm">
                 官方预装
-              </span>
+              </Badge>
             )}
             {management?.installation === "marketplace" && (
-              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+              <Badge tone="accent" size="sm">
                 市场已安装{management.installedVersion ? ` · v${management.installedVersion}` : ""}
-              </span>
+              </Badge>
             )}
-            {management?.installation === "orphan" && (
-              <span className="rounded-full bg-warning-soft px-2 py-0.5 text-[10.5px] text-warning">
+            {orphanInstall && (
+              <Badge tone="warning" size="sm">
                 历史绑定 · 当前未安装
-              </span>
+              </Badge>
             )}
             {management?.updateAvailable && management.latestVersion && (
-              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[10.5px] text-accent">
+              <Badge tone="accent" size="sm">
                 可更新 v{management.latestVersion}
-              </span>
-            )}
-            {connections.length > 0 && (
-              <span className="rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] text-success">
-                已绑定 {connections.length} 个账号
-              </span>
+              </Badge>
             )}
           </div>
-          <p className="mt-0.5 text-[12px] leading-snug text-faint">{description}</p>
+          <p className="mt-0.5 text-meta leading-snug text-faint">{description}</p>
+          {/* 连接状态单独成行：卡片头不能永远绿着，失效必须一眼看得见。 */}
+          {connections.length > 0 && (
+            <div className="mt-1.5">
+              {broken > 0 ? (
+                <Badge tone="warning">
+                  <AlertTriangle size={11} aria-hidden="true" />
+                  {broken} 个账号需重新绑定
+                </Badge>
+              ) : (
+                <Badge tone="success">
+                  <CheckCircle2 size={11} aria-hidden="true" />
+                  已绑定 {connections.length} 个账号
+                </Badge>
+              )}
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
           {management?.updateAvailable && onUpdate && (
-            <Button variant="primary" size="sm" onClick={onUpdate}>
+            <Button
+              variant="primary"
+              size="sm"
+              loading={busyAction === "update"}
+              disabled={busyAction !== null}
+              onClick={() => void runAction("update", onUpdate)}
+            >
               <ArrowUpCircle size={13} /> 更新
             </Button>
           )}
-          <Button variant="secondary" size="sm" onClick={onBind} disabled={!canBind}>
-            {canBind ? (connections.length > 0 ? "添加账号" : "绑定") : "不可绑定"}
-          </Button>
+          {/* 不可绑定的历史安装给真出路（去市场重装），而不是一个灰掉且没有解释的按钮。 */}
+          {!canBind && orphanInstall && onOpenMarketplace ? (
+            <Button variant="secondary" size="sm" onClick={onOpenMarketplace}>
+              <Store size={13} /> 去市场安装
+            </Button>
+          ) : (
+            <Button variant="secondary" size="sm" onClick={onBind} disabled={!canBind}>
+              {canBind ? (connections.length > 0 ? "添加账号" : "绑定") : "不可绑定"}
+            </Button>
+          )}
           {management?.installation === "marketplace" && onUninstallMarket && (
             <Button
               variant="ghost"
               size="sm"
               className="text-danger"
-              onClick={onUninstallMarket}
-              disabled={management.connectionCount > 0}
-              title={management.connectionCount > 0 ? "请先解绑全部账号" : "卸载 API 插件"}
+              loading={busyAction === "uninstall"}
+              disabled={management.connectionCount > 0 || busyAction !== null}
+              onClick={() => void runAction("uninstall", onUninstallMarket)}
             >
               <Trash2 size={13} /> 卸载
             </Button>
@@ -1472,8 +1889,24 @@ function ProviderCard({
         </div>
       </div>
 
+      {/* 禁用原因写成可见文字（title 在触屏/读屏上等于不存在）。 */}
+      {management?.installation === "marketplace" && management.connectionCount > 0 && (
+        <p className="mt-2 text-caption text-warning">卸载前需先解绑下方全部账号。</p>
+      )}
+      {!canBind && !orphanInstall && (
+        <p className="mt-2 text-caption text-faint">
+          该连接器当前不可绑定；等它在市场恢复可用后即可继续添加账号。
+        </p>
+      )}
+
+      {notice && (
+        <Alert tone={notice.tone} density="compact" className="mt-2" onDismiss={onDismissNotice}>
+          {notice.text}
+        </Alert>
+      )}
+
       {management && !management.available && (
-        <Alert tone="warning" className="mt-2 text-[11.5px]">
+        <Alert tone="warning" density="compact" className="mt-2">
           该 API 插件当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号。
         </Alert>
       )}
@@ -1492,7 +1925,7 @@ function ProviderCard({
           ))}
         </ul>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -1508,12 +1941,13 @@ function ConnectionRow({
   conn: UnifiedConnection;
   /** 是否支持改名（声明式后端无 rename → 传 false 隐藏铅笔与行内编辑）。 */
   canRename?: boolean;
-  onUnbind: (conn: UnifiedConnection) => void;
+  onUnbind: (conn: UnifiedConnection) => Promise<void>;
   onRename: (conn: ConnectorConnection, displayName: string) => void;
   onRelink: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(conn.displayName);
+  const [unbinding, setUnbinding] = useState(false);
   const needsRelink = connectorNeedsRelink(conn);
   const hasError = conn.status === "error";
 
@@ -1533,7 +1967,7 @@ function ConnectionRow({
               onChange={(e) => setName(e.target.value)}
               maxLength={64}
               aria-label="备注名"
-              className="h-8 max-w-56 md:text-[13px]"
+              className="h-8 max-w-56"
               onKeyDown={(e) => {
                 if (e.key === "Enter") save();
                 if (e.key === "Escape") {
@@ -1560,7 +1994,7 @@ function ConnectionRow({
           </div>
         ) : (
           <div className="flex min-w-0 items-center gap-1.5">
-            <span className="truncate text-[13px] text-fg">
+            <span className="truncate text-body text-fg">
               {conn.displayName || conn.accountHint || "未命名连接"}
             </span>
             {canRename && (
@@ -1570,14 +2004,42 @@ function ConnectionRow({
             )}
           </div>
         )}
-        <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11.5px] text-faint">
-          {conn.accountHint && <span className="truncate">{conn.accountHint}</span>}
-          {!hasError && <span className="text-success">正常</span>}
-          {needsRelink && <span className="text-warning">需要重新绑定</span>}
+        {/* 状态升级为徽章（原来是三段同字号同粗细的裸文字，只靠颜色区分）；
+            账号提示与绑定时间降一层做元信息行，不再与状态争同一行。 */}
+        <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+          {!hasError && (
+            <Badge tone="success" size="sm">
+              <CheckCircle2 size={11} aria-hidden="true" />
+              正常
+            </Badge>
+          )}
+          {needsRelink && (
+            <Badge tone="warning" size="sm">
+              <AlertTriangle size={11} aria-hidden="true" />
+              需要重新绑定
+            </Badge>
+          )}
           {hasError && !needsRelink && (
-            <span className="text-danger">{connectorErrorText(conn.lastErrorCode)}</span>
+            <Badge tone="danger" size="sm">
+              <AlertTriangle size={11} aria-hidden="true" />
+              连接异常
+            </Badge>
+          )}
+          {conn.accountHint && (
+            <span className="truncate text-caption text-faint">{conn.accountHint}</span>
+          )}
+          {conn.createdAt && (
+            <span className="text-caption text-faint">
+              绑定于 <TimeAgo value={conn.createdAt} format="short" tooltip={false} />
+            </span>
           )}
         </div>
+        {/* 具体错误是一句话而不是标签：单独成行才能换行，塞进 nowrap 徽章会在窄屏顶破行。 */}
+        {hasError && !needsRelink && (
+          <p className="mt-0.5 text-caption text-danger">
+            {connectorErrorText(conn.lastErrorCode)}
+          </p>
+        )}
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
         {needsRelink && (
@@ -1587,11 +2049,17 @@ function ConnectionRow({
         )}
         <IconButton
           size="sm"
+          variant="danger"
           aria-label="解绑"
-          className="text-danger"
-          onClick={() => onUnbind(conn)}
+          title="解绑"
+          disabled={unbinding}
+          onClick={() => {
+            if (unbinding) return;
+            setUnbinding(true);
+            void onUnbind(conn).finally(() => setUnbinding(false));
+          }}
         >
-          <Trash2 size={14} />
+          {unbinding ? <Spinner size={14} /> : <Trash2 size={14} />}
         </IconButton>
       </div>
     </li>
@@ -1686,10 +2154,11 @@ function BindDialog({
             <Button
               variant="primary"
               size="sm"
-              disabled={submitting || missingRequired}
+              loading={submitting}
+              disabled={missingRequired}
               onClick={() => void submit()}
             >
-              {submitting ? "提交中…" : isOauth ? "前往授权" : "绑定"}
+              {isOauth ? "前往授权" : "绑定"}
             </Button>
           </>
         )
@@ -1700,7 +2169,7 @@ function BindDialog({
           {helps.length > 0 && (
             <div className="rounded-lg bg-hover px-3 py-2.5">
               {helps.map((f) => (
-                <div key={f.key} className="text-[12px] leading-relaxed text-muted">
+                <div key={f.key} className="text-meta leading-relaxed text-muted">
                   {f.helpText}
                   {f.helpUrl && (
                     <a
@@ -1718,18 +2187,15 @@ function BindDialog({
             </div>
           )}
 
+          {/* 提交失败就地渲染在弹层内 —— 面板顶部的 Alert 会被这层遮罩整个盖住。 */}
           {err && (
-            <Alert tone="danger" className="text-[12.5px]">
+            <Alert tone="danger" density="compact">
               {err}
             </Alert>
           )}
 
           {fields.map((f) => (
-            <label key={f.key} className="flex flex-col gap-1">
-              <span className="text-[12.5px] text-muted">
-                {f.label}
-                {f.required && <span className="ml-0.5 text-danger">*</span>}
-              </span>
+            <Field key={f.key} label={f.label} required={f.required}>
               <Input
                 type={f.type === "password" ? "password" : f.type === "url" ? "url" : "text"}
                 value={values[f.key] ?? ""}
@@ -1737,18 +2203,17 @@ function BindDialog({
                 autoComplete="off"
                 onChange={(e) => setValues((prev) => ({ ...prev, [f.key]: e.target.value }))}
               />
-            </label>
+            </Field>
           ))}
 
-          <label className="flex flex-col gap-1">
-            <span className="text-[12.5px] text-muted">备注名（可选）</span>
+          <Field label="备注名（可选）">
             <Input
               value={displayName}
               maxLength={64}
               placeholder="如：工作邮箱"
               onChange={(e) => setDisplayName(e.target.value)}
             />
-          </label>
+          </Field>
         </div>
       )}
     </Modal>
@@ -1855,10 +2320,11 @@ function DeclarativeBindDialog({
             <Button
               variant="primary"
               size="sm"
-              disabled={submitting || missingRequired}
+              loading={submitting}
+              disabled={missingRequired}
               onClick={() => void submit()}
             >
-              {submitting ? "提交中…" : isOauth ? "前往授权" : "绑定"}
+              {isOauth ? "前往授权" : "绑定"}
             </Button>
           </>
         )
@@ -1867,7 +2333,7 @@ function DeclarativeBindDialog({
       {entry && (
         <div className="flex flex-col gap-3">
           {err && (
-            <Alert tone="danger" className="text-[12.5px]">
+            <Alert tone="danger" density="compact">
               {err}
             </Alert>
           )}
@@ -1875,11 +2341,7 @@ function DeclarativeBindDialog({
           {sources.map((s) => {
             const meta = bindFieldMeta(s);
             return (
-              <label key={s} className="flex flex-col gap-1">
-                <span className="text-[12.5px] text-muted">
-                  {meta.label}
-                  <span className="ml-0.5 text-danger">*</span>
-                </span>
+              <Field key={s} label={meta.label} required>
                 <Input
                   type={meta.type === "password" ? "password" : "text"}
                   value={values[s] ?? ""}
@@ -1887,19 +2349,18 @@ function DeclarativeBindDialog({
                   autoComplete="off"
                   onChange={(e) => setValues((prev) => ({ ...prev, [s]: e.target.value }))}
                 />
-              </label>
+              </Field>
             );
           })}
 
-          <label className="flex flex-col gap-1">
-            <span className="text-[12.5px] text-muted">备注名（可选）</span>
+          <Field label="备注名（可选）">
             <Input
               value={displayName}
               maxLength={64}
               placeholder="如：工作账号"
               onChange={(e) => setDisplayName(e.target.value)}
             />
-          </label>
+          </Field>
         </div>
       )}
     </Modal>

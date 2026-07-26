@@ -60,3 +60,18 @@ describe("Sidebar 管理后台入口（平台超管）", () => {
     expect(screen.queryByRole("button", { name: "反馈与帮助" })).toBeNull();
   });
 });
+
+describe("Sidebar 管理中心入口副标题", () => {
+  it("无待办时展示与实际分区对齐的速览文案", () => {
+    renderSidebar({ onOpenManage: () => {} });
+    const entry = screen.getByRole("button", { name: /管理中心/ });
+    expect(entry).toHaveTextContent("记忆 · 技能 · 定时 · 插件");
+  });
+
+  it("有待确认建议时改用数量徽章（Auto‑Dream 在侧栏的唯一曝光）", () => {
+    renderSidebar({ onOpenManage: () => {}, optimizerPending: 3 });
+    const entry = screen.getByRole("button", { name: /管理中心/ });
+    expect(entry).toHaveTextContent("3 项待确认");
+    expect(entry).not.toHaveTextContent("记忆 · 技能 · 定时 · 插件");
+  });
+});

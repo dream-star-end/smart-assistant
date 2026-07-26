@@ -33,6 +33,15 @@ const DIFF_RUN: SkillTrainRun = {
   evalRunId: null,
 };
 
+const DRAFT_SUMMARY = {
+  name: "coding-suite",
+  op: "update" as const,
+  baseVersion: "1",
+  rationale: "改进理由",
+  authoredBy: "ai" as const,
+  updatedAt: "t",
+};
+
 const DRAFT_DETAIL: SkillDraftDetail = {
   draft: {
     meta: { name: "coding-suite", description: "d" },
@@ -56,16 +65,7 @@ describe("SkillTrainSection 训练 run 重入", () => {
   test("挂载时从列表找回 diff_ready run → 恢复提示条与草稿入口", async () => {
     vi.spyOn(api, "listSkillTrainRuns").mockResolvedValue([DIFF_RUN]);
     vi.spyOn(api, "getSkillTrainRun").mockResolvedValue(DIFF_RUN);
-    vi.spyOn(api, "listSkillDrafts").mockResolvedValue([
-      {
-        name: "coding-suite",
-        op: "update",
-        baseVersion: "1",
-        rationale: "改进理由",
-        authoredBy: "ai",
-        updatedAt: "t",
-      },
-    ]);
+    vi.spyOn(api, "listSkillDrafts").mockResolvedValue([DRAFT_SUMMARY]);
     vi.spyOn(api, "getSkillDraft").mockResolvedValue(DRAFT_DETAIL);
 
     render(<SkillTrainSection auth={auth} skillName="coding-suite" rates={null} />);
@@ -75,6 +75,66 @@ describe("SkillTrainSection 训练 run 重入", () => {
     // diff 入口恢复：草稿视图的合并按钮可见。
     expect(await screen.findByText(/合并到技能库/)).toBeInTheDocument();
     expect(screen.getByText("草稿:coding-suite")).toBeInTheDocument();
+  });
+
+  test("合并成功(已扣积分):给出留在原地的成功说明,并通知外层失效正文缓存", async () => {
+    vi.spyOn(api, "listSkillTrainRuns").mockResolvedValue([DIFF_RUN]);
+    vi.spyOn(api, "getSkillTrainRun").mockResolvedValue(DIFF_RUN);
+    vi.spyOn(api, "listSkillDrafts").mockResolvedValue([DRAFT_SUMMARY]);
+    vi.spyOn(api, "getSkillDraft").mockResolvedValue(DRAFT_DETAIL);
+    const merge = vi
+      .spyOn(api, "mergeSkillTrainRun")
+      .mockResolvedValue({ ok: true, results: [{ name: "coding-suite", ok: true }] });
+    const onSkillChanged = vi.fn();
+
+    render(
+      <SkillTrainSection
+        auth={auth}
+        skillName="coding-suite"
+        rates={null}
+        onSkillChanged={onSkillChanged}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /合并到技能库/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "合并" }));
+
+    await waitFor(() => expect(merge).toHaveBeenCalledWith(auth, "r1"));
+    // 合并后整块 run UI 卸载 —— 成功反馈必须落在「卸载后仍然存在」的地方。
+    expect(await screen.findByText(/已合并到技能库,可在「正文」页签查看新版本/)).toBeInTheDocument();
+    expect(onSkillChanged).toHaveBeenCalledTimes(1);
+  });
+
+  test("多份草稿:可逐份切换审阅,合并确认框列出全部将写入项并标注未查看", async () => {
+    vi.spyOn(api, "listSkillTrainRuns").mockResolvedValue([DIFF_RUN]);
+    vi.spyOn(api, "getSkillTrainRun").mockResolvedValue(DIFF_RUN);
+    vi.spyOn(api, "listSkillDrafts").mockResolvedValue([
+      DRAFT_SUMMARY,
+      { ...DRAFT_SUMMARY, name: "second-skill", op: "create" },
+    ]);
+    const getDraft = vi.spyOn(api, "getSkillDraft").mockImplementation(
+      async (_a, _r, name) =>
+        ({
+          ...DRAFT_DETAIL,
+          draft: { ...DRAFT_DETAIL.draft, record: { ...DRAFT_DETAIL.draft.record, name } },
+        }) as SkillDraftDetail,
+    );
+    vi.spyOn(api, "mergeSkillTrainRun").mockResolvedValue({ ok: true, results: [] });
+
+    render(<SkillTrainSection auth={auth} skillName="coding-suite" rates={null} />);
+
+    // 只看过第 1 份 → 合并确认框必须点破「另外 1 份你还没看过」。
+    fireEvent.click(await screen.findByRole("button", { name: /合并到技能库/ }));
+    expect(await screen.findByText("其中 1 项你还没查看。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    // 切到第 2 份草稿 → 拉详情并标记已查看。
+    fireEvent.click(await screen.findByRole("tab", { name: /second-skill/ }));
+    await waitFor(() => expect(getDraft).toHaveBeenCalledWith(auth, "r1", "second-skill"));
+    fireEvent.click(await screen.findByRole("button", { name: /合并到技能库/ }));
+    await waitFor(() =>
+      expect(screen.queryByText(/你还没查看。$/)).not.toBeInTheDocument(),
+    );
   });
 
   test("无可恢复 run 时保持现状（不显示恢复提示）", async () => {
@@ -177,6 +237,25 @@ describe("SkillEvalSection AI 生成用例", () => {
     expect(
       await screen.findByText("该技能有评测或生成任务在进行中,请稍后再试"),
     ).toBeInTheDocument();
+  });
+
+  test("每日自动回归(持续扣费)保存失败 → 开关回滚,不停在「显示开着、实际没开」", async () => {
+    vi.spyOn(api, "getSkillEvals").mockResolvedValue(
+      evalsResp([{ id: "case-1", prompt: "t", assertions: ["a"] }]),
+    );
+    const put = vi.spyOn(api, "putSkillEvals").mockRejectedValue(new Error("boom"));
+
+    render(<SkillEvalSection auth={auth} skillName="s" rates={null} />);
+
+    const sw = await screen.findByRole("switch");
+    expect(sw).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(sw);
+    fireEvent.click(await screen.findByRole("button", { name: /开启并接受每日消耗/ }));
+
+    await waitFor(() => expect(put).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "false"),
+    );
   });
 
   test("生成中:禁用「运行评测」与「补充生成」,显示进度", async () => {

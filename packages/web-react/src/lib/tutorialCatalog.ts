@@ -286,7 +286,7 @@ export const TUTORIAL_TOPICS = {
   },
   "web-research": {
     featureId: "web-research",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
       "智能体可以搜索公开网页、提取页面与文档、检索论文并整理引用。文献库用于保存你主动上传并完成解析的研究资料；回答中的来源卡片可打开核对，适合需要时效性和证据链的任务。",
     outcome: "得到带来源、能回查的调研结论，而不是只有一段无法验证的概括。",
@@ -310,7 +310,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "沉淀到文献库",
-        body: "把会反复使用的论文或资料上传到管理中心 → 文献库，后续研究可继续引用。",
+        body: "把会反复使用的论文或资料上传到管理中心 → 文献，后续研究可继续引用。",
       },
     ],
     tips: [
@@ -561,7 +561,7 @@ export const TUTORIAL_TOPICS = {
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",
-    contentVersion: 5,
+    contentVersion: 6,
     intro:
       "长期记忆按智能体隔离保存稳定信息。新版 Auto-Dream 使用 DeepSeek V4 Flash，在你明确同意后结合 V5 平台能力和技能，全面审计相关会话、操作与日志，并提出记忆、设置、技能、规则、Agent、插件和定时任务等优化建议。",
     outcome: "不只整理记忆，而是在保留用户控制权的前提下持续优化整个智能体工作环境。",
@@ -585,7 +585,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "开启并审阅全面优化",
-        body: "先确认数据范围、计费和匿名平台发现上报方式，再到管理中心 → 全面优化逐项查看 Diff；内容和设置经你确认才应用，平台发现仅上报去内容、去身份的分类与计数。",
+        body: "先确认数据范围、计费和匿名平台发现上报方式，再到管理中心 → 优化逐项查看 Diff；内容和设置经你确认才应用，平台发现仅上报去内容、去身份的分类与计数。",
       },
     ],
     tips: [

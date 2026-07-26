@@ -81,8 +81,11 @@ test("分类筛选片只渲染有条目的分类(+全部/未分类)", async () =
   expect(screen.getByRole("button", { name: "办公文档" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "数据分析" })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "未分类" })).toBeInTheDocument();
-  expect(screen.getByRole("region", { name: "市场分类，可横向滚动" })).toHaveAttribute("tabindex", "0");
-  expect(screen.getByText("左右滑动查看更多分类")).toHaveClass("sm:hidden");
+  const chips = screen.getByRole("region", { name: "市场分类，可横向滚动" });
+  expect(chips).toHaveAttribute("tabindex", "0");
+  expect(chips).toHaveClass("overflow-x-auto", "snap-x");
+  // 「可以左右滑」改由右缘渐隐暗示,不再常驻一行小字吃掉移动端 24px
+  expect(screen.queryByText("左右滑动查看更多分类")).not.toBeInTheDocument();
   // 没有条目的分类不出 chip
   expect(screen.queryByRole("button", { name: "编程开发" })).not.toBeInTheDocument();
 });
@@ -156,7 +159,7 @@ test("卡片:users30d=0/缺省 → 沿用安装数「N 人在用」", async () =
   expect(screen.queryByText(/30天/)).not.toBeInTheDocument();
 });
 
-test("卡片:rating 非 null → 中性「👍 M/N」徽章带真实反馈 title", async () => {
+test("卡片:rating 非 null → 「M/N」信号(lucide 图标,样本量进无障碍名而非 hover title)", async () => {
   searchMarketplace.mockResolvedValue({
     results: [
       card("rated", { name: "被评技能", category: "office-docs", rating: { up: 7, down: 1 } }),
@@ -166,9 +169,11 @@ test("卡片:rating 非 null → 中性「👍 M/N」徽章带真实反馈 title
   listMarketplaceInstalled.mockResolvedValue([]);
 
   render(<BrowsePanel auth={auth} />);
-  const badge = await screen.findByText("👍 7/8");
-  expect(badge).toBeInTheDocument();
-  expect(badge).toHaveAttribute("title", "来自 8 次真实使用的反馈");
+  // 原生 title 在触屏上根本触发不了,样本量说明改由 aria-label 承载
+  const signal = await screen.findByLabelText("好评 7/8，来自 8 次真实使用的反馈");
+  expect(signal).toHaveTextContent("7/8");
+  // emoji 不跟随 currentColor、跨平台字形差异大 —— UI chrome 里不再出现
+  expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
 });
 
 test("卡片:rating=null/缺省(服务端已按样本阈值收口)→ 不渲染评分徽章", async () => {
@@ -182,19 +187,24 @@ test("卡片:rating=null/缺省(服务端已按样本阈值收口)→ 不渲染�
 
   render(<BrowsePanel auth={auth} />);
   await screen.findByText("无评分");
-  expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/次真实使用的反馈/)).not.toBeInTheDocument();
 });
 
-test("AI 导购入口:浏览态(空查询)不渲染操作行,不挤占分区视图", async () => {
+test("AI 导购入口:浏览态(空查询)也常驻在头带,点击带默认预填", async () => {
   searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
   listMarketplaceInstalled.mockResolvedValue([]);
+  const onAsk = vi.fn();
 
-  render(<BrowsePanel auth={auth} onAskAiInChat={() => {}} />);
+  render(<BrowsePanel auth={auth} onAskAiInChat={onAsk} />);
   await screen.findByRole("heading", { name: "平台精选" });
-  expect(screen.queryByRole("button", { name: /让 AI 帮我找并装好/ })).not.toBeInTheDocument();
+
+  // 最需要导购的正是"还不知道自己要装什么"的浏览态用户 —— 入口不能等敲了查询词才出现
+  fireEvent.click(screen.getByRole("button", { name: "AI 帮我挑" }));
+  expect(onAsk).toHaveBeenCalledTimes(1);
+  expect(onAsk.mock.calls[0][0]).toContain("适合我的技能");
 });
 
-test("AI 导购入口:有查询词 → 结果区顶部出操作行,点击回调带预填(含查询词)", async () => {
+test("AI 导购入口:有查询词 → 头带入口带上查询词预填", async () => {
   searchMarketplace.mockResolvedValue({
     results: [card("t", { name: "翻译技能", category: "office-docs" })],
     method: "keyword",
@@ -205,13 +215,14 @@ test("AI 导购入口:有查询词 → 结果区顶部出操作行,点击回调�
   render(<BrowsePanel auth={auth} onAskAiInChat={onAsk} />);
   fireEvent.change(screen.getByPlaceholderText(/搜索技能/), { target: { value: "翻译" } });
 
-  const btn = await screen.findByRole("button", { name: /让 AI 帮我找并装好/ });
-  fireEvent.click(btn);
+  // 等防抖落到查询词(入口一直在,变的只是它带走的预填内容)
+  await waitFor(() => expect(searchMarketplace.mock.calls.at(-1)?.[1]).toBe("翻译"));
+  fireEvent.click(screen.getByRole("button", { name: "AI 帮我挑" }));
   expect(onAsk).toHaveBeenCalledTimes(1);
   expect(onAsk.mock.calls[0][0]).toContain("我想要:翻译");
 });
 
-test("AI 导购入口:查询无结果(空态)仍给操作行(AI 可现场解决)", async () => {
+test("AI 导购入口:查询无结果 → 空态给「让 AI 帮我找」与「清空搜索」两个出口", async () => {
   searchMarketplace.mockResolvedValue({ results: [], method: "keyword" });
   listMarketplaceInstalled.mockResolvedValue([]);
   const onAsk = vi.fn();
@@ -219,13 +230,17 @@ test("AI 导购入口:查询无结果(空态)仍给操作行(AI 可现场解决)
   render(<BrowsePanel auth={auth} onAskAiInChat={onAsk} />);
   fireEvent.change(screen.getByPlaceholderText(/搜索技能/), { target: { value: "不存在的东西" } });
 
-  const btn = await screen.findByRole("button", { name: /让 AI 帮我找并装好/ });
+  const btn = await screen.findByRole("button", { name: /让 AI 帮我找/ });
   expect(screen.getByText("没有匹配的技能")).toBeInTheDocument();
   fireEvent.click(btn);
   expect(onAsk.mock.calls[0][0]).toContain("不存在的东西");
+
+  // 空态必须有下一步动作:清空搜索直接回到目录
+  fireEvent.click(screen.getByRole("button", { name: "清空搜索" }));
+  await waitFor(() => expect(screen.getByPlaceholderText(/搜索技能/)).toHaveValue(""));
 });
 
-test("AI 导购入口:未传 onAskAiInChat → 即便有查询词也不渲染操作行", async () => {
+test("AI 导购入口:未传 onAskAiInChat → 不渲染入口", async () => {
   searchMarketplace.mockResolvedValue({
     results: [card("t", { name: "翻译技能", category: "office-docs" })],
     method: "keyword",
@@ -235,7 +250,82 @@ test("AI 导购入口:未传 onAskAiInChat → 即便有查询词也不渲染操
   render(<BrowsePanel auth={auth} />);
   fireEvent.change(screen.getByPlaceholderText(/搜索技能/), { target: { value: "翻译" } });
   await screen.findByText("翻译技能");
-  expect(screen.queryByRole("button", { name: /让 AI 帮我找并装好/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /AI 帮我/ })).not.toBeInTheDocument();
+});
+
+test("类目 Tabs:选中态可读,切换回调把存储层 kind 交回壳层", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  const onKindChange = vi.fn();
+
+  render(<BrowsePanel auth={auth} kind="skill" onKindChange={onKindChange} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+
+  // 走 Tabs 原语:有 tablist/aria-selected/方向键导航,不再是三个裸 button
+  expect(screen.getByRole("tab", { name: "技能" })).toHaveAttribute("aria-selected", "true");
+  fireEvent.click(screen.getByRole("tab", { name: "插件" }));
+  expect(onKindChange).toHaveBeenCalledWith("connector");
+});
+
+test("目录不再硬截断:装满一页给「加载更多」,点击按 +50 重新拉取", async () => {
+  const many = Array.from({ length: 50 }, (_, i) =>
+    card(`s${i}`, { name: `技能 ${i}`, category: "office-docs" }),
+  );
+  searchMarketplace.mockResolvedValue({ results: many, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  await screen.findByRole("heading", { name: "办公文档" });
+  expect(searchMarketplace.mock.calls[0][3]).toBe(50);
+  expect(screen.getByText(/共 50 个技能/)).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
+  await waitFor(() => expect(searchMarketplace.mock.calls.at(-1)?.[3]).toBe(100));
+});
+
+test("目录未装满一页 → 不出现「加载更多」", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+  expect(screen.queryByRole("button", { name: "加载更多" })).not.toBeInTheDocument();
+});
+
+test("分区视图:精选卡不在所属分类区重复出现(同一屏不出现两张同名卡)", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+
+  expect(screen.getAllByText("PPT 生成器")).toHaveLength(1);
+  // 分类区仍在(同类的非精选条目照常展示)
+  expect(screen.getByRole("heading", { name: "办公文档" })).toBeInTheDocument();
+  expect(screen.getByText("Word 排版")).toBeInTheDocument();
+
+  // 点进该分类的平铺视图时,精选条目仍属于这个分类(成员数如实)
+  fireEvent.click(screen.getByRole("button", { name: "办公文档" }));
+  await waitFor(() => expect(screen.getByText("PPT 生成器")).toBeInTheDocument());
+  expect(screen.getByText("Word 排版")).toBeInTheDocument();
+});
+
+test("静默校准失败不打扰:保留旧列表 + 头带给重试,不弹红条", async () => {
+  searchMarketplace
+    .mockResolvedValueOnce({ results: CATALOG, method: "all" })
+    .mockRejectedValueOnce(new Error("network blip"));
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+
+  window.dispatchEvent(new Event("focus"));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "同步失败，点击重试" })).toBeInTheDocument(),
+  );
+  // 用户什么都没点,不该跳出整条红色错误把内容往下推
+  expect(screen.queryByText("加载市场失败")).not.toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "平台精选" })).toBeInTheDocument();
 });
 
 test("审核 revision 变化与窗口重新聚焦都会重新拉取目录", async () => {

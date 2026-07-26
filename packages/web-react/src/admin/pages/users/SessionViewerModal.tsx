@@ -424,7 +424,10 @@ export function SessionViewerModal({
           )}
         </span>
       }
-      className="h-[calc(100dvh-2rem)] max-h-[56rem] max-w-5xl bg-bg sm:w-[calc(100vw-3rem)]"
+      // 高度上限走 --oc-center-max-h 而不是 max-h-*:.oc-center-dialog 是未分层的普通 CSS
+      // 规则,其 max-height 打得过 @layer utilities 里的工具类,写 max-h-[56rem] 会被它
+      // 压回 85dvh(会话查看器要的是接近全屏)。变量参与 min() 运算,可视区兜底仍生效。
+      className="h-[calc(100dvh-2rem)] [--oc-center-max-h:56rem] max-w-5xl bg-bg sm:w-[calc(100vw-3rem)]"
       bodyClassName="overflow-hidden p-0"
     >
       <MediaSignProvider

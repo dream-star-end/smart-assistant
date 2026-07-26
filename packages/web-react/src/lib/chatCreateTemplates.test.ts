@@ -19,7 +19,7 @@ describe('connector chat creation template', () => {
     expect(template).toContain('publishCommand')
     expect(template).toContain('重新确认')
     expect(template).toContain('AI 自动审核')
-    expect(template).toContain('管理中心 → 插件账号')
+    expect(template).toContain('管理中心 → 插件')
     expect(template).toContain('市场 → 发现')
     expect(template).not.toContain('--security-decision-file')
     expect(template).not.toContain('平台人工审核')
