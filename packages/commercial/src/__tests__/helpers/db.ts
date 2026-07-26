@@ -1,4 +1,8 @@
+import { mkdtemp, readdir, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { after, before } from "node:test";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { query, type QueryRunner } from "../../db/queries.js";
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from "../../db/index.js";
@@ -210,3 +214,57 @@ export async function resetAndMigrateTestSchema(runner?: QueryRunner): Promise<v
   await resetTestSchemaForTest(runner);
   await runMigrations();
 }
+
+/**
+ * 重放**真实迁移链**到 `beforeVersion` 之前(不含),把库停在"待应用这条迁移"的
+ * 真实前置状态,然后由调用方 apply 被测的那一条。
+ *
+ * 动机(2026-07-26 审计):13 个 migrationXXXX.integ 里有 10 个不重放迁移链 ——
+ * 它们在测试里手搓前置表(`CREATE TABLE system_settings (key TEXT PRIMARY KEY,
+ * value JSONB NOT NULL, ...)`)再 apply 单条 SQL。前置表的形状**由测试自己定义**,
+ * 于是真 schema 一漂(某列改 NOT NULL、加约束、改类型),迁移在生产会炸,而测试
+ * 照绿 —— 这类测试守的是"我写的 DDL 和我写的 DDL 一致",不是"这条迁移能落到真库上"。
+ *
+ * 实现:不改 runMigrations 的生产签名,而是用一个只含 `< beforeVersion` 的
+ * symlink 目录喂给它。symlink 零拷贝;migrate 的完整性校验(applied 必须都能在 dir
+ * 里找到文件)在子集目录下仍然成立。
+ *
+ * @param beforeVersion 被测迁移的版本前缀,如 `"0189"`(含 4 位数字即可)。
+ */
+export async function resetAndMigrateBefore(beforeVersion: string): Promise<string> {
+  if (!/^\d{4}/.test(beforeVersion)) {
+    throw new Error(`resetAndMigrateBefore: 版本前缀必须以 4 位数字开头,收到 ${JSON.stringify(beforeVersion)}`);
+  }
+  await resetTestSchemaForTest();
+  const dir = await migrationsDirBefore(beforeVersion);
+  await runMigrations({ dir });
+  return dir;
+}
+
+/** 内部:生产迁移目录。与 migrate.ts 的 defaultMigrationsDir 同源(相对模块位置,非 cwd)。 */
+function productionMigrationsDir(): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "db", "migrations");
+}
+
+/**
+ * 造一个临时目录,symlink 进所有 version < `beforeVersion` 的迁移 .sql。
+ * 同一前缀在同一进程内复用同一个目录(migration 测试通常在 before 里调一次)。
+ */
+async function migrationsDirBefore(beforeVersion: string): Promise<string> {
+  const cached = subsetDirCache.get(beforeVersion);
+  if (cached) return cached;
+  const src = productionMigrationsDir();
+  const out = await mkdtemp(path.join(tmpdir(), `oc-migrations-before-${beforeVersion}-`));
+  const files = (await readdir(src)).filter((f) => f.endsWith(".sql")).sort();
+  const kept = files.filter((f) => f.slice(0, 4) < beforeVersion.slice(0, 4));
+  if (kept.length === 0) {
+    throw new Error(
+      `resetAndMigrateBefore(${beforeVersion}): 没有任何早于该版本的迁移文件 —— 前缀写错了?`,
+    );
+  }
+  for (const f of kept) await symlink(path.join(src, f), path.join(out, f));
+  subsetDirCache.set(beforeVersion, out);
+  return out;
+}
+
+const subsetDirCache = new Map<string, string>();
