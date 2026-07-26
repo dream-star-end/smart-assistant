@@ -1,7 +1,6 @@
 import { useMemo } from 'react'
 import { useRegisterOverlay } from '../../context/overlayContext.js'
-import type { InputEvent } from '../../ink/events/input-event.js'
-import { useInput } from '../../ink.js'
+import { type InputEvent, useInput } from '@anthropic/ink'
 import { useKeybindings } from '../../keybindings/useKeybinding.js'
 import {
   normalizeFullWidthDigits,
@@ -256,7 +255,7 @@ export const useSelectInput = <T>({
           disableSelection !== 'numeric' &&
           /^[0-9]+$/.test(normalizedInput)
         ) {
-          const index = parseInt(normalizedInput) - 1
+          const index = parseInt(normalizedInput, 10) - 1
           if (index >= 0 && index < state.options.length) {
             const selectedOption = state.options[index]!
             if (selectedOption.disabled === true) {

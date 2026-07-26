@@ -1,12 +1,13 @@
-import React, { useCallback, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { getModeFromInput } from 'src/components/PromptInput/inputModes.js';
 import { useNotifications } from 'src/context/notifications.js';
 import { ConfigurableShortcutHint } from '../components/ConfigurableShortcutHint.js';
 import { FOOTER_TEMPORARY_STATUS_TIMEOUT } from '../components/PromptInput/Notifications.js';
 import { getHistory } from '../history.js';
-import { Text } from '../ink.js';
+import { Text } from '@anthropic/ink';
 import type { PromptInputMode } from '../types/textInputTypes.js';
 import type { HistoryEntry, PastedContent } from '../utils/config.js';
+
 export type HistoryMode = PromptInputMode;
 
 // Load history entries in chunks to reduce disk reads on rapid keypresses
@@ -16,7 +17,8 @@ const HISTORY_CHUNK_SIZE = 10;
 // Mode filter is included to ensure we don't mix filtered and unfiltered caches
 let pendingLoad: Promise<HistoryEntry[]> | null = null;
 let pendingLoadTarget = 0;
-let pendingLoadModeFilter: HistoryMode | undefined = undefined;
+let pendingLoadModeFilter: HistoryMode | undefined;
+
 async function loadHistoryEntries(minCount: number, modeFilter?: HistoryMode): Promise<HistoryEntry[]> {
   // Round up to next chunk to avoid repeated small reads
   const target = Math.ceil(minCount / HISTORY_CHUNK_SIZE) * HISTORY_CHUNK_SIZE;
@@ -52,6 +54,7 @@ async function loadHistoryEntries(minCount: number, modeFilter?: HistoryMode): P
     }
     return entries;
   })();
+
   try {
     return await pendingLoad;
   } finally {
@@ -60,7 +63,14 @@ async function loadHistoryEntries(minCount: number, modeFilter?: HistoryMode): P
     pendingLoadModeFilter = undefined;
   }
 }
-export function useArrowKeyHistory(onSetInput: (value: string, mode: HistoryMode, pastedContents: Record<number, PastedContent>) => void, currentInput: string, pastedContents: Record<number, PastedContent>, setCursorOffset?: (offset: number) => void, currentMode?: HistoryMode): {
+
+export function useArrowKeyHistory(
+  onSetInput: (value: string, mode: HistoryMode, pastedContents: Record<number, PastedContent>) => void,
+  currentInput: string,
+  pastedContents: Record<number, PastedContent>,
+  setCursorOffset?: (offset: number) => void,
+  currentMode?: HistoryMode,
+): {
   historyIndex: number;
   setHistoryIndex: (index: number) => void;
   onHistoryUp: () => void;
@@ -69,14 +79,11 @@ export function useArrowKeyHistory(onSetInput: (value: string, mode: HistoryMode
   dismissSearchHint: () => void;
 } {
   const [historyIndex, setHistoryIndex] = useState(0);
-  const [lastShownHistoryEntry, setLastShownHistoryEntry] = useState<(HistoryEntry & {
-    mode?: HistoryMode;
-  }) | undefined>(undefined);
+  const [lastShownHistoryEntry, setLastShownHistoryEntry] = useState<
+    (HistoryEntry & { mode?: HistoryMode }) | undefined
+  >(undefined);
   const hasShownSearchHintRef = useRef(false);
-  const {
-    addNotification,
-    removeNotification
-  } = useNotifications();
+  const { addNotification, removeNotification } = useNotifications();
 
   // Cache loaded history entries
   const historyCache = useRef<HistoryEntry[]>([]);
@@ -101,46 +108,73 @@ export function useArrowKeyHistory(onSetInput: (value: string, mode: HistoryMode
   currentInputRef.current = currentInput;
   pastedContentsRef.current = pastedContents;
   currentModeRef.current = currentMode;
-  const setInputWithCursor = useCallback((value: string, mode: HistoryMode, contents: Record<number, PastedContent>, cursorToStart = false): void => {
-    onSetInput(value, mode, contents);
-    setCursorOffset?.(cursorToStart ? 0 : value.length);
-  }, [onSetInput, setCursorOffset]);
-  const updateInput = useCallback((input: HistoryEntry | undefined, cursorToStart_0 = false): void => {
-    if (!input || !input.display) return;
-    const mode_0 = getModeFromInput(input.display);
-    const value_0 = mode_0 === 'bash' ? input.display.slice(1) : input.display;
-    setInputWithCursor(value_0, mode_0, input.pastedContents ?? {}, cursorToStart_0);
-  }, [setInputWithCursor]);
+
+  const setInputWithCursor = useCallback(
+    (value: string, mode: HistoryMode, contents: Record<number, PastedContent>, cursorToStart = false): void => {
+      onSetInput(value, mode, contents);
+      setCursorOffset?.(cursorToStart ? 0 : value.length);
+    },
+    [onSetInput, setCursorOffset],
+  );
+
+  const updateInput = useCallback(
+    (input: HistoryEntry | undefined, cursorToStart = false): void => {
+      if (!input || !input.display) return;
+
+      const mode = getModeFromInput(input.display);
+      const value = mode === 'bash' ? input.display.slice(1) : input.display;
+
+      setInputWithCursor(value, mode, input.pastedContents ?? {}, cursorToStart);
+    },
+    [setInputWithCursor],
+  );
+
   const showSearchHint = useCallback((): void => {
     addNotification({
       key: 'search-history-hint',
-      jsx: <Text dimColor>
-          <ConfigurableShortcutHint action="history:search" context="Global" fallback="ctrl+r" description="search history" />
-        </Text>,
+      jsx: (
+        <Text dimColor>
+          <ConfigurableShortcutHint
+            action="history:search"
+            context="Global"
+            fallback="ctrl+r"
+            description="search history"
+          />
+        </Text>
+      ),
       priority: 'immediate',
-      timeoutMs: FOOTER_TEMPORARY_STATUS_TIMEOUT
+      timeoutMs: FOOTER_TEMPORARY_STATUS_TIMEOUT,
     });
   }, [addNotification]);
+
   const onHistoryUp = useCallback((): void => {
     // Capture and increment synchronously to handle rapid keypresses
     const targetIndex = historyIndexRef.current;
     historyIndexRef.current++;
+
     const inputAtPress = currentInputRef.current;
     const pastedContentsAtPress = pastedContentsRef.current;
     const modeAtPress = currentModeRef.current;
+
     if (targetIndex === 0) {
       initialModeFilterRef.current = modeAtPress === 'bash' ? modeAtPress : undefined;
 
       // Save draft synchronously using refs for the latest values
       // This ensures we capture the draft before any async operations or re-renders
       const hasInput = inputAtPress.trim() !== '';
-      setLastShownHistoryEntry(hasInput ? {
-        display: inputAtPress,
-        pastedContents: pastedContentsAtPress,
-        mode: modeAtPress
-      } : undefined);
+      setLastShownHistoryEntry(
+        hasInput
+          ? {
+              display: inputAtPress,
+              pastedContents: pastedContentsAtPress,
+              mode: modeAtPress,
+            }
+          : undefined,
+      );
     }
+
     const modeFilter = initialModeFilterRef.current;
+
     void (async () => {
       const neededCount = targetIndex + 1; // How many entries we need
 
@@ -169,6 +203,7 @@ export function useArrowKeyHistory(onSetInput: (value: string, mode: HistoryMode
         // Keep the draft intact - user stays on their current input
         return;
       }
+
       const newIndex = targetIndex + 1;
       setHistoryIndex(newIndex);
       updateInput(historyCache.current[targetIndex], true);
@@ -180,6 +215,7 @@ export function useArrowKeyHistory(onSetInput: (value: string, mode: HistoryMode
       }
     })();
   }, [updateInput, showSearchHint]);
+
   const onHistoryDown = useCallback((): boolean => {
     // Use the ref for consistent reads
     const currentIndex = historyIndexRef.current;
@@ -205,6 +241,7 @@ export function useArrowKeyHistory(onSetInput: (value: string, mode: HistoryMode
     }
     return currentIndex <= 0;
   }, [lastShownHistoryEntry, updateInput, setInputWithCursor]);
+
   const resetHistory = useCallback((): void => {
     setLastShownHistoryEntry(undefined);
     setHistoryIndex(0);
@@ -214,15 +251,17 @@ export function useArrowKeyHistory(onSetInput: (value: string, mode: HistoryMode
     historyCache.current = [];
     historyCacheModeFilter.current = undefined;
   }, [removeNotification]);
+
   const dismissSearchHint = useCallback((): void => {
     removeNotification('search-history-hint');
   }, [removeNotification]);
+
   return {
     historyIndex,
     setHistoryIndex,
     onHistoryUp,
     onHistoryDown,
     resetHistory,
-    dismissSearchHint
+    dismissSearchHint,
   };
 }

@@ -1,11 +1,12 @@
 import {
   type AnsiCode,
+  type Char,
   ansiCodesToString,
   reduceAnsiCodes,
   tokenize,
   undoAnsiCodes,
 } from '@alcalzone/ansi-tokenize'
-import { stringWidth } from '../ink/stringWidth.js'
+import { stringWidth } from '@anthropic/ink'
 
 // A code is an "end code" if its code equals its endCode (e.g., hyperlink close)
 function isEndCode(code: AnsiCode): boolean {
@@ -43,7 +44,13 @@ export default function sliceAnsi(
     // pass start/end in display cells (via stringWidth), so position must
     // track the same units.
     const width =
-      token.type === 'ansi' ? 0 : token.type === 'char' ? (token.fullWidth ? 2 : stringWidth(token.value)) : 0
+      token.type === 'ansi'
+        ? 0
+        : token.type === 'char'
+          ? token.fullWidth
+            ? 2
+            : stringWidth(token.value)
+          : 0
 
     // Break AFTER trailing zero-width marks — a combining mark attaches to
     // the preceding base char, so "भा" (भ + ा, 1 display cell) sliced at
@@ -77,7 +84,7 @@ export default function sliceAnsi(
       }
 
       if (include) {
-        result += (token as any).value
+        result += (token as Char).value
       }
 
       position += width

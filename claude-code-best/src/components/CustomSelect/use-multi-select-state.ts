@@ -1,9 +1,7 @@
 import { useCallback, useState } from 'react'
 import { isDeepStrictEqual } from 'util'
 import { useRegisterOverlay } from '../../context/overlayContext.js'
-import type { InputEvent } from '../../ink/events/input-event.js'
-// eslint-disable-next-line custom-rules/prefer-use-keybindings -- raw space/arrow multiselect input
-import { useInput } from '../../ink.js'
+import { type InputEvent, useInput } from '@anthropic/ink'
 import {
   normalizeFullWidthDigits,
   normalizeFullWidthSpace,
@@ -383,7 +381,7 @@ export function useMultiSelectState<T>({
 
       // Handle numeric keys (1-9) for direct selection
       if (!hideIndexes && /^[0-9]+$/.test(normalizedInput)) {
-        const index = parseInt(normalizedInput) - 1
+        const index = parseInt(normalizedInput, 10) - 1
         if (index >= 0 && index < options.length) {
           const value = options[index]!.value
           const newValues = selectedValues.includes(value)

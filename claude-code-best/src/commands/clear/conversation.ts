@@ -4,12 +4,18 @@
  */
 import { feature } from 'bun:bundle'
 import { randomUUID, type UUID } from 'crypto'
+import { getReplBridgeHandle } from '../../bridge/replBridgeHandle.js'
 import {
   getLastMainRequestId,
   getOriginalCwd,
   getSessionId,
   regenerateSessionId,
+  resetCostState,
+  setLastAPIRequest,
+  setLastAPIRequestMessages,
+  setLastClassifierRequests,
 } from '../../bootstrap/state.js'
+import type { SDKStatusMessage } from '../../entrypoints/sdk/coreTypes.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -23,6 +29,7 @@ import {
 import { isLocalShellTask } from '../../tasks/LocalShellTask/guards.js'
 import { asAgentId } from '../../types/ids.js'
 import type { Message } from '../../types/message.js'
+import { saveCacheSafeParams } from '../../utils/cacheSafeParamsSlot.js'
 import { createEmptyAttributionState } from '../../utils/commitAttribution.js'
 import type { FileStateCache } from '../../utils/fileStateCache.js'
 import {
@@ -45,6 +52,21 @@ import {
 } from '../../utils/task/diskOutput.js'
 import { getCurrentWorktreeSession } from '../../utils/worktree.js'
 import { clearSessionCaches } from './caches.js'
+
+function notifyRemoteConversationCleared(): void {
+  const handle = getReplBridgeHandle()
+  if (!handle) return
+  handle.markTranscriptReset?.()
+
+  const message: SDKStatusMessage = {
+    type: 'status',
+    subtype: 'status',
+    status: 'conversation_cleared',
+    message: 'conversation_cleared',
+    uuid: randomUUID(),
+  }
+  handle.writeSdkMessages([message])
+}
 
 export async function clearConversation({
   setMessages,
@@ -107,6 +129,7 @@ export async function clearConversation({
   }
 
   setMessages(() => [])
+  notifyRemoteConversationCleared()
 
   // Clear context-blocked flag so proactive ticks resume after /clear
   if (feature('PROACTIVE') || feature('KAIROS')) {
@@ -125,6 +148,20 @@ export async function clearConversation({
   // tasks (invoked skills, pending permission callbacks, dump state, cache-break
   // tracking) is retained so those agents keep functioning.
   clearSessionCaches(preservedAgentIds)
+
+  // Clear large STATE-held data that outlives the message array.
+  // lastAPIRequestMessages can hold the full post-compaction conversation
+  // (hundreds of KB–MB) for /share; resetCostState clears modelUsage.
+  setLastAPIRequest(null)
+  setLastAPIRequestMessages(null)
+  setLastClassifierRequests(null)
+  resetCostState()
+
+  // Drop the post-turn CacheSafeParams snapshot: it holds the pre-clear
+  // conversation's full message history. The session-id check in
+  // getLastCacheSafeParams would reject it anyway after regenerateSessionId
+  // below, but clearing here releases the memory immediately.
+  saveCacheSafeParams(null)
 
   setCwd(getOriginalCwd())
   readFileState.clear()

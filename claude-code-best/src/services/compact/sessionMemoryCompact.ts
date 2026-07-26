@@ -17,7 +17,7 @@ import { getSessionMemoryPath } from '../../utils/permissions/filesystem.js'
 import { processSessionStartHooks } from '../../utils/sessionStart.js'
 import { getTranscriptPath } from '../../utils/sessionStorage.js'
 import { tokenCountFromLastAPIResponse } from '../../utils/tokens.js'
-import { extractDiscoveredToolNames } from '../../utils/toolSearch.js'
+import { extractDiscoveredToolNames } from '../../utils/searchExtraTools.js'
 import {
   getDynamicConfig_BLOCKS_ON_INIT,
   getFeatureValue_CACHED_MAY_BE_STALE,
@@ -134,11 +134,13 @@ async function initSessionMemoryCompactConfig(): Promise<void> {
  */
 export function hasTextBlocks(message: Message): boolean {
   if (message.type === 'assistant') {
-    const content = message.message.content
-    return Array.isArray(content) && content.some(block => block.type === 'text')
+    const content = message.message!.content
+    return (
+      Array.isArray(content) && content.some(block => block.type === 'text')
+    )
   }
   if (message.type === 'user') {
-    const content = message.message.content
+    const content = message.message!.content
     if (typeof content === 'string') {
       return content.length > 0
     }
@@ -156,7 +158,7 @@ function getToolResultIds(message: Message): string[] {
   if (message.type !== 'user') {
     return []
   }
-  const content = message.message.content
+  const content = message.message!.content
   if (!Array.isArray(content)) {
     return []
   }
@@ -176,7 +178,7 @@ function hasToolUseWithIds(message: Message, toolUseIds: Set<string>): boolean {
   if (message.type !== 'assistant') {
     return false
   }
-  const content = message.message.content
+  const content = message.message!.content
   if (!Array.isArray(content)) {
     return false
   }
@@ -251,8 +253,8 @@ export function adjustIndexToPreserveAPIInvariants(
     const toolUseIdsInKeptRange = new Set<string>()
     for (let i = adjustedIndex; i < messages.length; i++) {
       const msg = messages[i]!
-      if (msg.type === 'assistant' && Array.isArray(msg.message.content)) {
-        for (const block of msg.message.content) {
+      if (msg.type === 'assistant' && Array.isArray(msg.message!.content)) {
+        for (const block of msg.message!.content) {
           if (block.type === 'tool_use') {
             toolUseIdsInKeptRange.add(block.id)
           }
@@ -273,9 +275,9 @@ export function adjustIndexToPreserveAPIInvariants(
         // Remove found tool_use_ids from the set
         if (
           message.type === 'assistant' &&
-          Array.isArray(message.message.content)
+          Array.isArray(message.message!.content)
         ) {
-          for (const block of message.message.content) {
+          for (const block of message.message!.content) {
             if (block.type === 'tool_use' && neededToolUseIds.has(block.id)) {
               neededToolUseIds.delete(block.id)
             }
@@ -290,8 +292,8 @@ export function adjustIndexToPreserveAPIInvariants(
   const messageIdsInKeptRange = new Set<string>()
   for (let i = adjustedIndex; i < messages.length; i++) {
     const msg = messages[i]!
-    if (msg.type === 'assistant' && msg.message.id) {
-      messageIdsInKeptRange.add(msg.message.id)
+    if (msg.type === 'assistant' && msg.message!.id) {
+      messageIdsInKeptRange.add(msg.message!.id)
     }
   }
 
@@ -301,8 +303,8 @@ export function adjustIndexToPreserveAPIInvariants(
     const message = messages[i]!
     if (
       message.type === 'assistant' &&
-      message.message.id &&
-      messageIdsInKeptRange.has(message.message.id)
+      message.message!.id &&
+      messageIdsInKeptRange.has(message.message!.id)
     ) {
       // This message has the same message.id as one in the kept range
       // Include it so thinking blocks can be properly merged

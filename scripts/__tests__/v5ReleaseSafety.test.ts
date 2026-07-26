@@ -2616,6 +2616,41 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(legacyToLegacy.stdout, /RUNTIME_PROVED/)
   })
 
+  test('ccb dist build fail-closes on await-using leakage (2026-05-22 crash-loop 机制化)', async () => {
+    const runtimeLib = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
+    const start = runtimeLib.indexOf('oc_hotcfg_build_ccb_dist()')
+    const body = runtimeLib.slice(start, runtimeLib.indexOf('oc_hotcfg_finalize_release()', start))
+    assert.ok(start >= 0 && body.length > 0, 'oc_hotcfg_build_ccb_dist 函数体未找到')
+
+    // build.ts pin 了 target='node' 让 Bun 把 `await using` 降级成 ES2022 try/finally。
+    // 该 pin 一旦被上游合并覆盖回 'bun'(或 bun 默认 target 漂移),dist 会残留
+    // `await using` 字面量 → 容器 Node 22 的 V8 直接 SyntaxError,CCB 子进程在读第一行
+    // stdin 前就 exit 1 = **全量用户 crash-loop**(v1.0.194 实发)。当年只 pin 了源码侧,
+    // 构建期无门禁,同类回归会再次直达生产 —— 这个门就是补上的那一层。
+    // 断言**整条命令形态**而不是分别断言两个片段:`--include='*.js'` 和 `await using` 都
+    // 会在本函数的解释性注释里出现,分开断言会被注释满足 → 命令被改坏也照样绿
+    // (2026-07-26 写这个测试时用红绿对照实测踩到)。
+    // 同时这条断言覆盖三件事:门存在、只扫 .js(source map 内嵌原始源码文本,扫进去会
+    // 100% 误报钉死部署门)、正则本体未被削弱。
+    assert.match(
+      body,
+      /grep -rlE --include='\*\.js' '\(\^\|\[\^A-Za-z0-9_\$\]\)await\[\[:space:\]\]\+using\[\[:space:\]\]'/,
+      "await-using 门的 grep 必须是 --include='*.js' + 完整边界正则(同一条命令内)",
+    )
+
+    // fail-closed:命中必须 die,不能只打日志放行。
+    assert.ok(
+      body.indexOf('await[[:space:]]+using') < body.indexOf('oc_hotcfg__die "ccb dist 残留'),
+      'await-using 门必须 fail-closed(die),不能降级成告警',
+    )
+
+    // 门必须排在 dist 拷回 staging 之前,否则坏产物已经进 release 了。
+    assert.ok(
+      body.indexOf('oc_hotcfg__die "ccb dist 残留') < body.indexOf('cp -a "$ccb_build/dist"'),
+      'await-using 门必须在 dist 拷回 staging 之前执行',
+    )
+  })
+
   test('lossless floor covers canary first-write race, abort, and actual runtime tuples', async () => {
     const source = await readFile(deploy, 'utf8')
     const runtimeLib = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
