@@ -9822,6 +9822,15 @@ esac
 case "$MODE" in
   smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify) ;;
   abort|rollback|recover|hide-luna|authorize-emergency|close-emergency-debt) ;;
+  # 逃生/回滚/观测 lane 同样永不被阻断(2026-07-26 主控复核补齐):
+  #   · emergency-tuple / activate-emergency-tuple = 逃生镜像的登记与激活(R2-M1/R3-B1)。
+  #     它们**无法**用 --emergency-containment 旁路(EMERGENCY_INCIDENT 只接受
+  #     --authorize-emergency / --canary / --finalize,见入参校验),所以不在这里显式放行
+  #     就等于「有未偿门禁债时逃生通道被自我否决」—— 与 smoke_turn_canary_advisory
+  #     恒返回 0 的设计意图直接冲突。
+  #   · disable-model-authority = 步骤 4 的显式回滚(关 flag),回退性质。
+  #   · install-monitor = 纯 host 观测面安装,不碰用户流量;有未偿债务时更需要监控在线。
+  emergency-tuple|activate-emergency-tuple|disable-model-authority|install-monitor) ;;
   *)
     if [[ -n "$EMERGENCY_INCIDENT" ]]; then
       echo "  · dx-declared emergency containment lane:跳过门禁豁免债务闸(止血优先;debt 仍在,普通发布仍被阻断)"

@@ -5780,12 +5780,30 @@ wait $!
       source.indexOf('# Legacy marker 兼容权只在会 build/flip/放量 master release'),
     )
     assert.ok(gateBlock.length > 0, '门禁豁免债务闸未挂载')
-    for (const recoveryLane of ['abort', 'rollback', 'recover', 'hide-luna']) {
+    // 逃生 lane 无法用 --emergency-containment 旁路(EMERGENCY_INCIDENT 只接受
+    // --authorize-emergency / --canary / --finalize),所以必须逐条显式放行。
+    for (const recoveryLane of [
+      'abort',
+      'rollback',
+      'recover',
+      'hide-luna',
+      'emergency-tuple',
+      'activate-emergency-tuple',
+      'disable-model-authority',
+      'install-monitor',
+    ]) {
       assert.ok(
         new RegExp(`(^\\s*|\\|)${recoveryLane}(\\||\\))`, 'm').test(gateBlock),
-        `恢复 lane ${recoveryLane} 必须在放行集合里 —— 新门绝不许挡住回退路径`,
+        `恢复/逃生 lane ${recoveryLane} 必须在放行集合里 —— 新门绝不许挡住回退路径`,
       )
     }
+    // 反向锁:emergency 参数的适用范围一旦扩大(让逃生 lane 能带 --emergency-containment),
+    // 上面的显式放行才可以收缩;在那之前这条断言保证两处语义不会各自漂移。
+    assert.match(
+      source,
+      /\[\[ "\$MODE" == canary \|\| "\$MODE" == finalize \|\| "\$MODE" == authorize-emergency \]\]/,
+      'emergency 参数适用范围变了 → 债务闸放行集合必须同步复审',
+    )
     assert.ok(
       gateBlock.indexOf('assert_no_open_gate_waivers') <
         gateBlock.indexOf('record_declared_gate_waivers'),
