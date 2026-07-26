@@ -236,3 +236,20 @@ describe('OptimizationPanel 状态与历史', () => {
     expect(within(dialog).getAllByRole('button', { name: '关闭' }).length).toBeGreaterThan(0)
   })
 })
+
+describe('OptimizationPanel touch targets', () => {
+  test('「已处理建议」折叠头在触屏下撑到 44px（summary 是真正接收点击的元素）', async () => {
+    vi.spyOn(api, 'getAutoDreamOptimizer').mockResolvedValue(
+      idleState({
+        proposals: [proposal({ state: 'applied', appliedAt: new Date().toISOString() })],
+      }),
+    )
+
+    renderPanel()
+
+    const summary = (await screen.findByText(/查看已处理建议（1）/)).closest('summary')
+    expect(summary).not.toBeNull()
+    // py-2 + text-meta 行高只有 ~32px:给父容器加内距不会扩大 summary 自己的命中区。
+    expect(summary).toHaveClass('[@media(hover:none)]:min-h-11')
+  })
+})

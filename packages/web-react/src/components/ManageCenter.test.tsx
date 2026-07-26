@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import { DEFAULT_MANAGE_TAB, MANAGE_TABS, type ManageTab } from '../lib/manageTabs'
+import { expectAriaControlsResolvable } from '../test/ariaControls'
 import { ManageCenter } from './ManageCenter'
 
 afterEach(cleanup)
@@ -68,6 +69,17 @@ test('tablist 与面板建立 aria 关联，键盘可聚焦内容区', () => {
   const skillsTab = screen.getByRole('tab', { name: '技能' })
   expect(skillsTab).toHaveAttribute('id', 'manage-tab-skills')
   expect(skillsTab).toHaveAttribute('aria-controls', 'manage-panel-skills')
+})
+
+test('六个分区只挂一个面板，其余 tab 不得留悬空 aria-controls', () => {
+  // 壳体是「只渲染当前面板」的典型:6 个 tab 共用一个 tabpanel 容器。
+  // 若每个 tab 都落 aria-controls,另外 5 个就都指向不存在的节点 —— DOM 上看不出异常,
+  // 读屏的「跳到被控元素」却会静默失败。
+  renderShell({ tab: 'skills' })
+  expect(screen.getAllByRole('tabpanel')).toHaveLength(1)
+  expect(screen.getByRole('tab', { name: '定时' })).not.toHaveAttribute('aria-controls')
+  expect(screen.getByRole('tab', { name: '记忆' })).not.toHaveAttribute('aria-controls')
+  expectAriaControlsResolvable()
 })
 
 test('有待确认建议时「优化」Tab 挂计数徽标，为 0 则不渲染噪声', () => {

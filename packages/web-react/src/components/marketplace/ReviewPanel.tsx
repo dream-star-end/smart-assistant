@@ -432,18 +432,25 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                     )}
                   >
                     <div className="flex flex-wrap items-start gap-2 px-3.5 py-3">
-                      <input
-                        type="checkbox"
-                        className="mt-1 accent-accent"
-                        checked={selected.has(r.versionId)}
-                        onChange={(e) => toggleOne(r.versionId, e.currentTarget.checked)}
-                        aria-label={`选择 ${r.name}`}
-                      />
+                      {/* 触控靶必须挂在**真正接收点击的元素**上:裸 checkbox 的命中区只有
+                          十几像素,而卡片的 px-3.5/py-3 扩的是卡片、不是 input。故用 label
+                          包住它撑到 44×44(点 label 即切换)。桌面端 hover 可用,渲染零变化。 */}
+                      <label className="flex shrink-0 items-start justify-center [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11">
+                        <input
+                          type="checkbox"
+                          className="mt-1 accent-accent"
+                          checked={selected.has(r.versionId)}
+                          onChange={(e) => toggleOne(r.versionId, e.currentTarget.checked)}
+                          aria-label={`选择 ${r.name}`}
+                        />
+                      </label>
                       <button
                         type="button"
                         onClick={() => setOpen(isOpen ? null : r.versionId)}
                         aria-expanded={isOpen}
-                        aria-controls={`review-detail-${r.versionId}`}
+                        // 详情区展开才挂载 → 收起时不落 aria-controls(悬空 IDREF 在读屏
+                        // 上是静默失败,与 SkillsPanel/Tabs 同一条约定)。
+                        aria-controls={isOpen ? `review-detail-${r.versionId}` : undefined}
                         className="flex min-w-0 flex-1 basis-48 items-start gap-2 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
                       >
                         <ChevronRight
@@ -581,7 +588,8 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                                 }
                               />
                             </Field>
-                            <label className="flex items-start gap-2 text-meta leading-relaxed text-fg">
+                            {/* label 即点击目标:窄屏折行不保证够 44px,显式兜底。 */}
+                            <label className="flex items-start gap-2 text-meta leading-relaxed text-fg [@media(hover:none)]:min-h-11">
                               <input
                                 type="checkbox"
                                 className="mt-0.5 accent-accent"
@@ -648,7 +656,9 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                         {r.rawBundle &&
                           Object.entries(r.rawBundle).map(([path, content]) => (
                             <details key={path} className="mt-2">
-                              <summary className="cursor-pointer rounded-md font-mono text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring">
+                              {/* 同上:summary 自己就是点击目标,一行 text-caption ≈16px。
+                                  只加 min-h(不改 display),原生展开三角保持可见。 */}
+                              <summary className="cursor-pointer rounded-md font-mono text-caption text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11">
                                 附属文件：{path}（{content.length} 字）
                               </summary>
                               <pre
@@ -709,8 +719,10 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        aria-controls="ai-review-log"
-        className="flex w-full items-center gap-1.5 rounded-md text-left text-body font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        // 同上:记录区展开才挂载,收起时不落 IDREF。
+        aria-controls={open ? "ai-review-log" : undefined}
+        // 手写折叠头(非 Button 原语)→ 触控靶兜不到它:一行 text-body 只有 ~20px 高。
+        className="flex w-full items-center gap-1.5 rounded-md text-left text-body font-medium text-fg outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
         <ChevronRight
           size={15}

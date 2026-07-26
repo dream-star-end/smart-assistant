@@ -51,6 +51,10 @@ const TAB_ID_BASE = "memory-section";
  * 3. **加载失败不渲染编辑器**:正文加载失败时 baseline.version 为空,旧实现仍渲染可编辑
  *    Textarea,用户敲几个字保存就会以无 If-Match 的写把服务端真实记忆整体覆盖(纯 UI 造成的
  *    数据丢失路径)。现在加载失败只给「重试」出口,且 save 入口对空 version 硬拦。
+ *    **核心记忆与用户画像必须同门禁**:两块记忆都是"读—改—写"的整体覆盖式写入,门禁只装一边
+ *    等于没装。区别只在第二道防线的判据 —— 核心记忆的文件必然已存在(从列表点进来的),空
+ *    version 只可能是没读到,可以硬拦;用户画像是**可以不存在**的单文档,首次创建与旧后端都会
+ *    合法地给出空 version,所以判据必须是「这次 GET 成功过」(loaded)而不是「有 version」。
  */
 export function MemoryPanel({
   auth,
@@ -1281,17 +1285,32 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
   const [baseline, setBaseline] = useState<{ text: string; version: string }>({ text: "", version: "" });
   const [limit, setLimit] = useState(0); // 字符预算（来自 GET）；0 = 不强制。
   const [loading, setLoading] = useState(true);
+  /**
+   * 本轮 GET 真的成功过 —— 渲染编辑器的**唯一**许可。
+   *
+   * 不能用 `baseline.version` 代替:画像是可以尚不存在的单文档,首次创建与不发令牌的旧后端
+   * 都会合法地返回空 version(见 MemoryDocResponse.version 的注释),按 version 判会把正常的
+   * "第一次写画像"一起堵死。也不能用 `!loadErr` 代替:那是 deny-list,状态机漏一个分支就重新
+   * 敞开盲写口 —— 这里取 allow-list,未知状态一律不给编辑器。
+   */
+  const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // 与 MemoryFileEditor 同构:loadErr 挡住编辑器(读失败=不知道服务端有什么),
+  // err 是保存失败,贴在编辑器内原地展示。两者混用一个 state 就是本 P0 的根因。
+  const [loadErr, setLoadErr] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null); // 冲突刷新提示（info，非报错）。
   const [serverLatest, setServerLatest] = useState<string | null>(null); // 冲突后服务端最新画像(供查看)。
   const [reloadKey, setReloadKey] = useState(0);
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
   useEffect(() => {
     void reloadKey;
     let alive = true;
     setLoading(true);
+    setLoaded(false);
+    setLoadErr(null);
     setErr(null);
     setNotice(null);
     setServerLatest(null);
@@ -1303,9 +1322,10 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
         setText(t);
         setBaseline({ text: t, version: d.version ?? "" });
         setLimit(typeof d.limit === "number" ? d.limit : 0);
+        setLoaded(true);
       })
       .catch((e) => {
-        if (alive) setErr(apiErrorMessage(e, "加载用户画像失败"));
+        if (alive) setLoadErr(apiErrorMessage(e, "加载用户画像失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -1321,6 +1341,13 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
   const overLimit = limit > 0 && text.length > limit;
 
   const save = useCallback(async () => {
+    // 第二道防线（第一道是"没 loaded 就不渲染编辑器"，所以这条从 UI 走不到）。留着是因为
+    // 第一道是渲染分支、第二道是网络出口:将来谁把保存按钮挪出这个分支，盲写口不会跟着重开。
+    // 判据是"读成功过"而不是"有 version":空 version 的合法首次创建必须放行,读失败必须拦死。
+    if (!loaded) {
+      setErr("用户画像尚未加载完成，请先重新加载再保存。");
+      return;
+    }
     setSaving(true);
     setErr(null);
     setNotice(null);
@@ -1342,7 +1369,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
     } finally {
       setSaving(false);
     }
-  }, [auth, agentId, text, baseline.version]);
+  }, [auth, agentId, text, baseline.version, loaded]);
 
   /** 放弃我的修改：载入服务端最新画像（基线已在 409 分支刷新，dirty 随之归零）。 */
   const loadLatest = useCallback(() => {
@@ -1361,19 +1388,6 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
         <p className="text-caption text-muted">关于你的背景信息，切换智能体不会改变这里。</p>
       </div>
 
-      {err && (
-        <Alert
-          tone="danger"
-          density="compact"
-          action={
-            <Button size="sm" variant="secondary" onClick={() => setReloadKey((k) => k + 1)}>
-              重试
-            </Button>
-          }
-        >
-          {err}
-        </Alert>
-      )}
       {notice && (
         <Alert tone="info" density="compact" onDismiss={() => setNotice(null)}>
           <p>{notice}</p>
@@ -1402,8 +1416,27 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
           <span className="sr-only">加载中…</span>
           <Skeleton className="h-32 w-full rounded-lg" />
         </output>
+      ) : !loaded ? (
+        // 读失败(或任何"没读成功"的状态)只给重试出口。渲染出可编辑框 = 邀请用户用一段
+        // 凭空敲出来的文本整体覆盖服务端上真实存在的画像。
+        <Alert
+          tone="danger"
+          title="没能读到你的用户画像"
+          action={
+            <Button size="sm" variant="secondary" onClick={reload}>
+              重试
+            </Button>
+          }
+        >
+          {loadErr ?? "加载用户画像失败"}（可能是智能体正在启动）。为避免覆盖你已有的画像，加载成功前不能编辑。
+        </Alert>
       ) : (
         <>
+          {err && (
+            <Alert tone="danger" density="compact" onDismiss={() => setErr(null)}>
+              {err}
+            </Alert>
+          )}
           <Textarea
             value={text}
             onChange={(e) => setText(e.target.value)}

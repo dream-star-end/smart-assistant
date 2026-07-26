@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ApiError, api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
@@ -31,6 +31,13 @@ function deferred<T>() {
     resolve = res;
   });
   return { promise, resolve };
+}
+
+/** 冲干净整条 promise 链（对账里 async 包装的 await 有多个微任务跳）后再断言。 */
+async function flush() {
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
 }
 
 const ACTIVE: CronJob = {
@@ -201,5 +208,77 @@ describe("CronPanel 空态与表单", () => {
     expect(screen.queryByRole("button", { name: "创建任务" })).not.toBeInTheDocument();
     expect(screen.queryByText("加载中…")).not.toBeInTheDocument();
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+  });
+});
+
+/**
+ * 后台对账是**整表覆盖**，而它在飞的时候界面还能继续变。没有顺序栅栏时，一张过期快照
+ * 既能复活已删任务，也能把更早的状态盖回更新的乐观值上。
+ */
+describe("CronPanel 后台对账的顺序栅栏", () => {
+  test("启停后删除：迟到的旧对账快照不得把已删任务写回列表", async () => {
+    const stale = deferred<CronJob[]>();
+    let calls = 0;
+    const list = vi.spyOn(api, "listCron").mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return [ACTIVE];
+      // 第 2 次 = 启停成功后发出的对账，慢；它拍到的还是「删除之前」的表。
+      if (calls === 2) return stale.promise;
+      return [];
+    });
+    vi.spyOn(api, "updateCron").mockResolvedValue({ ok: true });
+    const del = vi.spyOn(api, "deleteCron").mockResolvedValue({ ok: true });
+    mountPanel();
+
+    // ① 启停成功 → 发出慢速对账
+    fireEvent.click(await screen.findByRole("switch", { name: "启用「每日早报」" }));
+    expect(await screen.findByText("已停用「每日早报」")).toBeInTheDocument();
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+
+    // ② 用户随即删除该任务，行正确移除
+    fireEvent.click(screen.getByRole("button", { name: "删除「每日早报」" }));
+    fireEvent.click(await screen.findByRole("button", { name: "删除" }));
+    await waitFor(() => expect(del).toHaveBeenCalledWith(auth, "j1"));
+    await waitFor(() => expect(screen.queryByText("每日早报")).not.toBeInTheDocument());
+
+    // ③ 旧对账这才返回：栅栏必须整体丢弃它，任务不得复活
+    stale.resolve([ACTIVE]);
+    await flush();
+    expect(screen.queryByText("每日早报")).not.toBeInTheDocument();
+    expect(screen.getByText("还没有定时任务")).toBeInTheDocument();
+  });
+
+  test("两次启停的对账响应乱序：先发的旧快照不得盖掉较新的结果", async () => {
+    const firstReconcile = deferred<CronJob[]>();
+    const secondReconcile = deferred<CronJob[]>();
+    let calls = 0;
+    const list = vi.spyOn(api, "listCron").mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return [ACTIVE];
+      if (calls === 2) return firstReconcile.promise;
+      if (calls === 3) return secondReconcile.promise;
+      return [ACTIVE];
+    });
+    vi.spyOn(api, "updateCron").mockResolvedValue({ ok: true });
+    mountPanel();
+
+    fireEvent.click(await screen.findByRole("switch", { name: "启用「每日早报」" }));
+    expect(await screen.findByText("已停用「每日早报」")).toBeInTheDocument();
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole("switch", { name: "启用「每日早报」" }));
+    expect(await screen.findByText("已启用「每日早报」")).toBeInTheDocument();
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
+
+    // 较新的那次对账先落地：这是当前真值
+    secondReconcile.resolve([{ ...ACTIVE, enabled: true }]);
+    await flush();
+    expect(screen.getByText("启用中")).toBeInTheDocument();
+
+    // 较早发出的对账后到（乱序）：必须被丢弃，不能把状态倒回「已停用」
+    firstReconcile.resolve([{ ...ACTIVE, enabled: false }]);
+    await flush();
+    expect(screen.getByText("启用中")).toBeInTheDocument();
+    expect(screen.queryByText("已停用")).not.toBeInTheDocument();
   });
 });

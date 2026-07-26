@@ -81,12 +81,18 @@ const EDGE_MASK: Record<string, string | undefined> = {
  * roving tabindex(选中项可 Tab 聚焦,其余 -1)+ 左右 / Home / End 键盘导航。
  * 面板由调用方按 value 条件渲染,本组件只管 tablist。视觉为分段药丸(segmented)。
  *
- * ── 本次下沉进原语的三个真实缺陷 ─────────────────────────────────────
+ * ── 本次下沉进原语的四个真实缺陷 ─────────────────────────────────────
  * 1. 窄屏溢出不可见:见 tabListVariants 注释(新增 layout="grid")。
  * 2. 外部改 value 时选中项可能在视口外(OAuth 回跳直接切 tab),用户看到"所有 tab 都没选中"
  *    的迷惑态 —— 现在选中项会自动 scrollIntoView 居中,并给横滚容器加边缘渐隐。
  * 3. ArrowUp/ArrowDown 被劫持:横向 tablist 上按 ↓ 的用户意图是滚页而不是切 tab
  *    (WAI-ARIA 也只为 horizontal tablist 规定左右键)。已移除上下键分支。
+ * 4. 悬空 aria-controls:`idBase` 一度给**每个** tab 都落 `aria-controls`,而调用方普遍
+ *    只渲染当前面板(`{tab === 'x' && <Panel/>}`),于是未选中的 tab 全部指向不存在的节点。
+ *    面板挂没挂只有调用方知道、原语无从验证 —— 故把它变成**由调用方声明**的输入
+ *    (`mountedPanels`),默认取"只有选中项的面板挂载"这个仓内实况。与 SkillsPanel /
+ *    DetailModal 的既有约定同构:「面板没挂就不落 aria-controls,指向不存在的节点
+ *    在读屏上是静默失败」。机器验收见 test/ariaControls.ts 的通用不变量。
  */
 export function Tabs({
   value,
@@ -94,6 +100,7 @@ export function Tabs({
   items,
   layout = "scroll",
   idBase,
+  mountedPanels,
   className,
   "aria-label": ariaLabel,
 }: {
@@ -108,6 +115,17 @@ export function Tabs({
    * 辅助技术才能在 tab ↔ 面板之间建立关联。不传则两个属性都不落(向后兼容)。
    */
   idBase?: string;
+  /**
+   * 此刻**真的在 DOM 里**的面板 value 集合(只在 idBase 存在时有意义):
+   * 只有列进来的 tab 才会落 `aria-controls`,其余的不落 —— 悬空 IDREF 比没有更糟。
+   *
+   * 不传 = `[value]`,即"只渲染当前面板"这一仓内最普遍的形态(ManageCenter /
+   * MarketplaceCenter / MemoryPanel / PublishPanel 都是它)。
+   * - 常挂全部面板(非当前项 `hidden`)→ 传全部 value;
+   * - 惰性挂载并保活(SkillEditor 的评测/训练)→ 传 `已访问 ∪ 常挂` 的实际集合;
+   * - 加载态/错误态下一个面板都没渲染 → 传 `[]`。
+   */
+  mountedPanels?: readonly string[];
   className?: string;
   "aria-label"?: string;
 }) {
@@ -188,6 +206,8 @@ export function Tabs({
     >
       {items.map((it, i) => {
         const active = it.value === value;
+        // 面板真的挂载了才落 aria-controls(默认只有选中项挂载)。见组件头注释第 4 条。
+        const panelMounted = mountedPanels ? mountedPanels.includes(it.value) : active;
         return (
           <button
             key={it.value}
@@ -197,7 +217,7 @@ export function Tabs({
             type="button"
             role="tab"
             id={idBase ? `${idBase}-tab-${it.value}` : undefined}
-            aria-controls={idBase ? `${idBase}-panel-${it.value}` : undefined}
+            aria-controls={idBase && panelMounted ? `${idBase}-panel-${it.value}` : undefined}
             data-product-feature={it.featureId}
             aria-selected={active}
             tabIndex={active ? 0 : -1}

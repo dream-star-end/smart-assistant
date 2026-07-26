@@ -439,49 +439,123 @@ function emptyConnectorDraft(): ConnectorDraft {
   };
 }
 
-/** 草稿是否已被写过 —— 覆盖写(导入 / 回填)前必须据此二次确认。 */
-function metaDirty(meta: HumanMetaDraft): boolean {
-  return Boolean(
-    meta.category ||
-      meta.humanMd.trim() ||
-      meta.useCases.some((s) => s.trim()) ||
-      meta.outcomeExamples.some((s) => s.trim()),
-  );
-}
-function isSkillDirty(d: SkillDraft): boolean {
-  return Boolean(
-    d.name.trim() || d.description.trim() || d.body.trim() || d.files.length > 0 || metaDirty(d.meta),
-  );
-}
-function isAgentDirty(d: AgentDraft): boolean {
-  return Boolean(
-    d.name.trim() ||
-      d.description.trim() ||
-      d.persona.trim() ||
-      d.capabilityDeps.length > 0 ||
-      metaDirty(d.meta),
-  );
-}
-function isConnectorDirty(d: ConnectorDraft): boolean {
-  return Boolean(d.specJson.trim() || d.decisionJson.trim() || metaDirty(d.meta));
+// ── 覆盖写前的"草稿是否已被写过" ─────────────────────────────────────────────
+//
+// 旧实现是**每种草稿各写一份手写字段白名单**(`d.name.trim() || d.description.trim() || …`)。
+// 白名单天生漏字段:skill 漏 slug/version/tags/benchmark、agent 漏 slug/version/tags/
+// avatarEmoji/model/toolsets、connector 漏 version/tags —— 用户只改过这些字段时,
+// 「载入这次提交继续修改」/「从我的技能导入」直接覆盖写,**连确认都不弹**,内容静默消失。
+// 更糟的是白名单的缺项没有任何机制能发现:类型系统看不见它,新增字段时也没人被提醒回来补。
+//
+// 现在把脏判定收进草稿句柄本身:句柄持有**基线**(初始值 + 系统写入的默认值),脏 = 当前值
+// 与基线的规范化结构比较。新增字段自动纳入,不再有清单要维护。
+
+/**
+ * 内容比较用的规范化:抹掉"用户看不见的差异"——首尾空白、空串、空数组、null。
+ * 这样「点了『添加场景』但一个字没打」「把名称打了又删干净」都不算已填写,
+ * 而任何**真的留下了内容**的字段一定会被算进来。
+ */
+function normalizeContent(v: unknown): unknown {
+  if (typeof v === "string") {
+    const t = v.trim();
+    return t === "" ? undefined : t;
+  }
+  if (Array.isArray(v)) {
+    const items = v.map(normalizeContent).filter((x) => x !== undefined);
+    return items.length > 0 ? items : undefined;
+  }
+  if (v !== null && typeof v === "object") {
+    const entries = Object.entries(v as Record<string, unknown>)
+      .map(([k, val]) => [k, normalizeContent(val)] as const)
+      .filter(([, val]) => val !== undefined)
+      // 键序归一:草稿到处 spread,键的插入顺序不该影响"有没有改过"的判定。
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+  }
+  return v === null ? undefined : v;
 }
 
-/** 草稿句柄:值 + 局部更新 + 整体重置。表单组件只拿句柄,不再自己持有内容状态。 */
-type DraftApi<T> = {
+function sameContent(a: unknown, b: unknown): boolean {
+  return JSON.stringify(normalizeContent(a) ?? null) === JSON.stringify(normalizeContent(b) ?? null);
+}
+
+/**
+ * 不算"用户填写的内容"的内部标记字段:只记录交互状态(如 slug 是否被手动改过)。
+ * 用 `as const` + `keyof T` 约束 —— 字段改名时调用处会直接编译不过,不会静默失效。
+ */
+const INTERACTION_FLAGS = ["slugTouched"] as const;
+const NO_INTERACTION_FLAGS = [] as const;
+
+/** 草稿句柄:值 + 局部更新 + 整体重置 + 相对基线的脏判定。表单组件只拿句柄。 */
+type DraftApi<T extends object> = {
   value: T;
+  /** 用户写入:只动值,基线不动 —— 于是它会被算作"已填写"。 */
   set: (patch: Partial<T> | ((cur: T) => Partial<T>)) => void;
+  /**
+   * 系统写入的默认值(如模型下拉自动选中首项):同时推进基线。
+   * 用 `set` 会让一张**空白表单**也被判成脏,于是每次回填都要用户白点一次确认。
+   */
+  seed: (patch: Partial<T> | ((cur: T) => Partial<T>)) => void;
   reset: () => void;
+  /**
+   * 相对基线是否已被写入内容。传 keys 则只看这几个字段 —— 给"只覆盖部分字段"的
+   * 写入方(技能导入)用:它不碰商品信息,就不该因为用户填了分类而问一句废话。
+   */
+  isDirty: (keys?: readonly (keyof T & string)[]) => boolean;
 };
 
-function useDraft<T extends object>(create: () => T): DraftApi<T> {
-  const [value, setValue] = useState<T>(create);
+function useDraft<T extends object>(
+  create: () => T,
+  interactionFlags: readonly (keyof T & string)[] = NO_INTERACTION_FLAGS,
+): DraftApi<T> {
+  const [state, setState] = useState<{ value: T; baseline: T }>(() => {
+    const v = create();
+    return { value: v, baseline: v };
+  });
   const createRef = useRef(create);
   createRef.current = create;
+
   const set = useCallback((patch: Partial<T> | ((cur: T) => Partial<T>)) => {
-    setValue((cur) => ({ ...cur, ...(typeof patch === "function" ? patch(cur) : patch) }));
+    setState((s) => ({
+      ...s,
+      value: { ...s.value, ...(typeof patch === "function" ? patch(s.value) : patch) },
+    }));
   }, []);
-  const reset = useCallback(() => setValue(createRef.current()), []);
-  return useMemo(() => ({ value, set, reset }), [value, set, reset]);
+  const seed = useCallback((patch: Partial<T> | ((cur: T) => Partial<T>)) => {
+    setState((s) => {
+      const p = typeof patch === "function" ? patch(s.value) : patch;
+      return { value: { ...s.value, ...p }, baseline: { ...s.baseline, ...p } };
+    });
+  }, []);
+  const reset = useCallback(() => {
+    setState(() => {
+      const v = createRef.current();
+      return { value: v, baseline: v };
+    });
+  }, []);
+
+  const changed = useMemo(() => {
+    const skip = new Set<string>(interactionFlags);
+    const value = state.value as Record<string, unknown>;
+    const baseline = state.baseline as Record<string, unknown>;
+    const out = new Set<string>();
+    for (const k of new Set([...Object.keys(value), ...Object.keys(baseline)])) {
+      if (skip.has(k)) continue;
+      if (!sameContent(value[k], baseline[k])) out.add(k);
+    }
+    return out;
+  }, [state, interactionFlags]);
+
+  const isDirty = useCallback(
+    (keys?: readonly (keyof T & string)[]) =>
+      keys ? keys.some((k) => changed.has(k)) : changed.size > 0,
+    [changed],
+  );
+
+  return useMemo(
+    () => ({ value: state.value, set, seed, reset, isDirty }),
+    [state.value, set, seed, reset, isDirty],
+  );
 }
 
 /** 上一次成功提交的内容快照(每 kind 一条),供「被拒后载入这次提交继续修改」复用。 */
@@ -530,8 +604,8 @@ export function PublishPanel({
   onMutePublishTransition?: (versionId: string, muted: boolean) => void;
 }) {
   const [kind, setKind] = useState<PublishKind>("skill");
-  const skill = useDraft(emptySkillDraft);
-  const agent = useDraft(emptyAgentDraft);
+  const skill = useDraft(emptySkillDraft, INTERACTION_FLAGS);
+  const agent = useDraft(emptyAgentDraft, INTERACTION_FLAGS);
   const connector = useDraft(emptyConnectorDraft);
   // null = 跟随"有待办自动展开";true/false = 用户或完成态显式指定过。
   const [publishesOpen, setPublishesOpen] = useState<boolean | null>(null);
@@ -559,12 +633,14 @@ export function PublishPanel({
   const refillFromPublish = useCallback(
     async (r: MarketplaceMyPublish) => {
       const target = publishKindOf(r);
+      // 回填是**整份**覆盖(有快照就整份换,没快照就重置成空表单 + 名称/标识),
+      // 所以问的是"这张草稿有没有被写过任何内容",不限定字段。
       const dirty =
         target === "skill"
-          ? isSkillDirty(skill.value)
+          ? skill.isDirty()
           : target === "agent"
-            ? isAgentDirty(agent.value)
-            : isConnectorDirty(connector.value);
+            ? agent.isDirty()
+            : connector.isDirty();
       if (dirty) {
         const go = await confirmDialog({
           title: "用这次提交的内容覆盖当前表单？",
@@ -719,6 +795,20 @@ const SKILL_ID = {
   meta: "publish-skill-meta",
 } as const;
 
+/**
+ * 「从我的技能导入」会写入的全部字段 —— 与下方 importSkill 里的 draft.set 一一对应。
+ * 商品信息(meta)与版本号导入**不碰**,故不在此列:只填过分类的用户不该被问一句废话。
+ */
+const IMPORT_OVERWRITES = [
+  "name",
+  "slug",
+  "description",
+  "tags",
+  "body",
+  "files",
+  "benchmark",
+] as const satisfies readonly (keyof SkillDraft)[];
+
 function SkillPublishForm({
   auth,
   draft,
@@ -761,11 +851,13 @@ function SkillPublishForm({
   }, [auth, skillsReload]);
 
   const importSkill = async (sk: SkillSummary) => {
-    // 导入会整份覆盖名称 / 正文 / 附属文件 —— 已有内容时必须先确认,一次误点不能吃掉草稿。
-    if (d.name.trim() || d.body.trim() || d.files.length > 0) {
+    // 导入会覆盖 IMPORT_OVERWRITES 里的每一个字段(不含商品信息)—— 其中任何一个已被
+    // 用户写过就必须先确认,一次误点不能吃掉草稿。字段清单直接来自下面的 draft.set,
+    // 两处改一处必改:漏一个就是"用户写的内容被静默替换"。
+    if (draft.isDirty(IMPORT_OVERWRITES)) {
       const go = await confirmDialog({
         title: `用「${sk.name}」覆盖当前内容？`,
-        body: "已填写的名称、描述、正文与附属文件会被这次导入替换，不可撤销。",
+        body: "已填写的名称、标识、描述、标签、正文与附属文件会被这次导入替换，不可撤销。",
         confirmText: "覆盖导入",
         danger: true,
       });
@@ -1247,7 +1339,7 @@ function AgentPublishForm({
   const [flags, setFlags] = useState<MarketplaceRiskFlag[]>([]);
   const [ok, setOk] = useState(false);
 
-  const setDraft = draft.set;
+  const seedDraft = draft.seed;
   // biome-ignore lint/correctness/useExhaustiveDependencies: dataReload 是「重试」的触发器,不是被读取的值
   useEffect(() => {
     let alive = true;
@@ -1259,7 +1351,8 @@ function AgentPublishForm({
         if (!alive) return;
         setModels(ms);
         setModelsState("ready");
-        setDraft((cur) => (cur.model ? {} : { model: ms[0]?.id ?? "" }));
+        // seed 而非 set:这是系统替用户选的默认项,不能让一张空白表单变成"已填写"。
+        seedDraft((cur) => (cur.model ? {} : { model: ms[0]?.id ?? "" }));
       })
       .catch(() => alive && setModelsState("error"));
     Promise.all([
@@ -1299,7 +1392,7 @@ function AgentPublishForm({
     return () => {
       alive = false;
     };
-  }, [auth, dataReload, setDraft]);
+  }, [auth, dataReload, seedDraft]);
 
   const toggleToolset = (v: string) =>
     draft.set((cur) => ({

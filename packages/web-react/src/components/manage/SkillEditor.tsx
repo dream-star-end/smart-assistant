@@ -65,6 +65,11 @@ const AUX_PREFIXES = ["references/", "assets/", "evals/", "scripts/"];
 const SKILL_MD = "SKILL.md";
 const ID_BASE = "skill-workbench";
 
+/** 适用范围快照比对(顺序有意义:normalizeAgentScope 已经定序去重)。 */
+function sameScope(a: readonly string[], b: readonly string[]) {
+  return a.length === b.length && a.every((id, i) => id === b[i]);
+}
+
 export type WorkbenchTab = "body" | "files" | "evals" | "train" | "history";
 
 const DEFAULT_AGENT: MarketplaceMyAgent = {
@@ -109,11 +114,28 @@ export function SkillEditor({
   const [newPathErr, setNewPathErr] = useState<string | null>(null);
 
   // SKILL.md 编辑态(描述 + 正文 + 适用范围)。
-  const [desc, setDesc] = useState("");
-  const [body, setBody] = useState("");
+  // 三者都配 ref:保存请求在途时输入框仍然可编,响应回来后要拿"此刻的值"跟提交快照比对,
+  // 走 state 只能读到发起保存那一次渲染的闭包旧值(见 save() 的提交快照一节)。
+  const [desc, setDescState] = useState("");
+  const descRef = useRef("");
+  const [body, setBodyState] = useState("");
+  const bodyRef = useRef("");
   const [agents, setAgents] = useState<MarketplaceMyAgent[]>([]);
-  const [scopeIds, setScopeIds] = useState<string[]>(["main"]);
+  const [scopeIds, setScopeIdsState] = useState<string[]>(["main"]);
+  const scopeIdsRef = useRef<string[]>(["main"]);
   const [scopeDirty, setScopeDirtyState] = useState(false);
+  const setDesc = useCallback((v: string) => {
+    descRef.current = v;
+    setDescState(v);
+  }, []);
+  const setBody = useCallback((v: string) => {
+    bodyRef.current = v;
+    setBodyState(v);
+  }, []);
+  const setScopeIds = useCallback((v: string[]) => {
+    scopeIdsRef.current = v;
+    setScopeIdsState(v);
+  }, []);
 
   // ── per-path 草稿模型 ────────────────────────────────────────────────────
   // fileDrafts:辅助文件的当前编辑内容(首次读取即入,之后**不再重拉**);
@@ -184,13 +206,19 @@ export function SkillEditor({
   const writable = detail?.writable === true;
   const scopeEditable = writable && detail?.layer === "shared";
 
+  // load 的代际号:refresh 可能被保存/删文件/训练合并/重试同时触发,响应乱序回来时
+  // 只认最后一次发起的那一份 —— 否则更早发出的旧快照会盖掉更新的服务端内容。
+  const loadSeqRef = useRef(0);
+
   /**
    * mode="reset"  :打开工作台 —— 服务端值是唯一权威,清空全部本地草稿。
    * mode="refresh":保存/删文件/恢复之后的对齐 —— **只覆盖没有本地草稿的部分**,
-   *                绝不静默吃掉用户尚未保存的输入。
+   *                绝不静默吃掉用户尚未保存的输入。dirty 判定读 ref,是"响应到达那一刻"
+   *                的真实状态(请求在途时用户完全可能又敲了新内容)。
    */
   const load = useCallback(
     (mode: "reset" | "refresh") => {
+      const seq = ++loadSeqRef.current;
       setLoading(true);
       setErr(null);
       Promise.all([
@@ -198,6 +226,7 @@ export function SkillEditor({
         api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[]),
       ])
         .then(([d, a]) => {
+          if (seq !== loadSeqRef.current) return;
           setDetail(d);
           setAgents(a.length ? a : [DEFAULT_AGENT]);
           if (mode === "reset" || !dirtyRef.current.has(SKILL_MD)) {
@@ -208,10 +237,15 @@ export function SkillEditor({
             setScopeIds(normalizeAgentScope(d.agentIds));
           }
         })
-        .catch((e) => setErr(apiErrorMessage(e, "加载技能失败")))
-        .finally(() => setLoading(false));
+        .catch((e) => {
+          if (seq !== loadSeqRef.current) return;
+          setErr(apiErrorMessage(e, "加载技能失败"));
+        })
+        .finally(() => {
+          if (seq === loadSeqRef.current) setLoading(false);
+        });
     },
-    [auth, skillName],
+    [auth, skillName, setBody, setDesc, setScopeIds],
   );
 
   // 打开:全量重置(包括草稿)。关闭后再开永远从服务端权威态起步。
@@ -296,46 +330,86 @@ export function SkillEditor({
 
   const pendingCount = dirtyPaths.size + (scopeDirty && !dirtyPaths.has(SKILL_MD) ? 1 : 0);
 
+  /**
+   * 保存。**保存期间编辑器刻意不冻结**(网络慢时锁住输入框比丢改动更劝退),所以
+   * "提交了什么"必须在发请求之前定格,响应回来后只有 **当前内容仍等于提交快照**
+   * 才允许清 dirty。否则:点保存 → 继续敲 → 旧请求 200 → 新内容被标成"已保存",
+   * 关窗/刷新时静默蒸发(用户视角:明明存过,内容却回退了)。
+   *
+   * 一并守住的两条:
+   *  · 提交体一律取自快照(descRef/bodyRef/scopeIdsRef 在点保存那一刻的值),
+   *    不会出现"半截旧半截新"的混合正文;
+   *  · 保存 SKILL.md 后的 `load("refresh")` 只在对应字段已经不脏时才回填(load 内的
+   *    ref 判定),所以请求期间敲进去的新输入不会被服务端旧内容盖掉。
+   */
   const save = async () => {
-    const paths = [...dirtyPaths];
-    if (paths.length === 0 && !scopeDirty) return;
+    // dirty 集合读 ref 而不是 state:重试保存按钮可能在 state 落地前触发。
+    const paths = [...dirtyRef.current];
+    const scopeWasDirty = scopeDirtyRef.current;
+    if (paths.length === 0 && !scopeWasDirty) return;
     setSaving(true);
     setSaveErr(null);
-    const okPaths: string[] = [];
+
+    // ── 提交快照 ──────────────────────────────────────────────────────────
+    const submittedFiles = new Map<string, string>();
+    for (const p of paths) {
+      if (p !== SKILL_MD) submittedFiles.set(p, fileDraftsRef.current[p] ?? "");
+    }
+    const submittedDesc = descRef.current;
+    const submittedBody = bodyRef.current;
+    const submittedScope = scopeIdsRef.current;
+    const scopeUnchanged = () => sameScope(scopeIdsRef.current, submittedScope);
+
+    // cleanPaths:落库 **且** 此后没再改动 → 可以清 dirty;
+    // 落库但内容又变了的路径不进这个数组,继续保持脏(用户再点一次保存即可)。
+    const cleanPaths: string[] = [];
     const failedPaths: string[] = [];
+    let savedSkillMd = false;
+    let scopeSaved = false;
     let firstErr: string | null = null;
+    // 适用范围能否搭 SKILL.md 的车一起提交(不可编辑时不带 agentIds,得单独走一次)。
+    const scopeRidesWithBody = paths.includes(SKILL_MD) && scopeEditable;
+
     for (const p of paths) {
       try {
         if (p === SKILL_MD) {
           await api.updateSkill(auth, skillName, {
-            description: desc.trim(),
-            body,
+            description: submittedDesc.trim(),
+            body: submittedBody,
             tags: detail?.tags,
-            ...(scopeEditable ? { agentIds: scopeIds } : {}),
+            ...(scopeEditable ? { agentIds: submittedScope } : {}),
           });
+          savedSkillMd = true;
+          if (descRef.current === submittedDesc && bodyRef.current === submittedBody) {
+            cleanPaths.push(p);
+          }
         } else {
-          await api.putSkillFile(auth, skillName, p, fileDraftsRef.current[p] ?? "");
-          // 已落库 → 草稿即为服务端内容,后续切回无需重拉。
-          putDraft(p, fileDraftsRef.current[p] ?? "");
+          const content = submittedFiles.get(p) ?? "";
+          await api.putSkillFile(auth, skillName, p, content);
+          // 草稿本来就等于提交内容(或已被用户改得更新),这里绝不回写 ——
+          // 回写会把"请求期间敲进去的新内容"覆盖成快照,是第二条丢改动的路径。
+          if ((fileDraftsRef.current[p] ?? "") === content) cleanPaths.push(p);
         }
-        okPaths.push(p);
       } catch (e) {
         failedPaths.push(p);
         firstErr = firstErr ?? apiErrorMessage(e, `保存 ${p === SKILL_MD ? "正文" : p} 失败`);
       }
     }
-    // 只改了适用范围(正文没动)时单独提交一次。
-    if (!paths.includes(SKILL_MD) && scopeDirty) {
+
+    if (scopeWasDirty && !scopeRidesWithBody) {
+      // 只改了适用范围(或正文脏但该技能不允许改归属)时单独提交一次。
       try {
-        await api.updateSkill(auth, skillName, { agentIds: scopeIds });
-        setScopeDirty(false);
+        await api.updateSkill(auth, skillName, { agentIds: submittedScope });
+        scopeSaved = true;
       } catch (e) {
         firstErr = firstErr ?? apiErrorMessage(e, "保存适用智能体失败");
       }
-    } else if (okPaths.includes(SKILL_MD)) {
-      setScopeDirty(false);
+    } else if (scopeWasDirty && savedSkillMd) {
+      scopeSaved = true;
     }
-    clearDirty(okPaths);
+    if (scopeSaved && scopeUnchanged()) setScopeDirty(false);
+
+    clearDirty(cleanPaths);
     setSaving(false);
     if (firstErr) {
       setSaveErr(
@@ -346,7 +420,8 @@ export function SkillEditor({
     setSaved(true);
     setTimeout(() => setSaved(false), 1800);
     onChanged();
-    if (okPaths.includes(SKILL_MD)) load("refresh");
+    // 版本号/文件列表要跟上;正文与适用范围的回填由 load("refresh") 自己按 dirty 兜。
+    if (savedSkillMd) load("refresh");
   };
 
   const createFile = async () => {

@@ -1,7 +1,9 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import type { AuthSession } from "../../lib/types";
+import { TooltipProvider } from "../ui";
+import type { AuthSession, MarketplaceMyPublish } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
 
 const listSkills = vi.fn();
@@ -11,6 +13,9 @@ const getPublicModels = vi.fn();
 const listMarketplaceInstalled = vi.fn();
 const getDeclarativeManagement = vi.fn();
 const publishMarketplaceAgent = vi.fn();
+const getSkill = vi.fn();
+const getSkillFile = vi.fn();
+const getSkillEvals = vi.fn();
 vi.mock("../../lib/api", () => ({
   ApiError: class ApiError extends Error {},
   api: {
@@ -21,6 +26,9 @@ vi.mock("../../lib/api", () => ({
     listMarketplaceInstalled: (...a: unknown[]) => listMarketplaceInstalled(...a),
     getDeclarativeManagement: (...a: unknown[]) => getDeclarativeManagement(...a),
     publishMarketplaceAgent: (...a: unknown[]) => publishMarketplaceAgent(...a),
+    getSkill: (...a: unknown[]) => getSkill(...a),
+    getSkillFile: (...a: unknown[]) => getSkillFile(...a),
+    getSkillEvals: (...a: unknown[]) => getSkillEvals(...a),
   },
 }));
 
@@ -186,4 +194,140 @@ test("智能体可从已安装 Skill / Plugin 选择必需或可选组合能力"
   expect(plugin).not.toHaveTextContent("可选 ·");
   expect(screen.getByRole("button", { name: /Skill · 写作 Skill/ })).toBeInTheDocument();
   expect(screen.getByRole("button", { name: /Plugin · Notion/ })).toBeInTheDocument();
+});
+
+// ── 覆盖草稿前的二次确认 ──────────────────────────────────────────────────────
+// 旧实现用**手写字段白名单**判"草稿是否已被写过":skill 只看 name/description/body/files、
+// agent 只看 name/description/persona/capabilityDeps、connector 只看两段 JSON。用户只改过
+// 白名单外的字段(版本号 / 标签 / 模型 / 工具集 / 头像 / slug / benchmark…)时,「载入这次
+// 提交继续修改」不弹确认、直接覆盖 —— 内容被静默吃掉。下面每条都锁一个当年漏掉的字段。
+
+/** 覆盖确认弹层的正文:出现即代表"覆盖前问过用户"。 */
+const OVERWRITE_CONFIRM = "当前表单里已填写的内容会被替换，不可撤销。";
+
+/** 「我的发布」里的 TimeAgo 依赖 TooltipProvider(镜像 main.tsx 的根 Provider 树)。 */
+function renderPanel(node: ReactElement) {
+  return render(<TooltipProvider>{node}</TooltipProvider>);
+}
+
+function rejectedRow(over: Partial<MarketplaceMyPublish>): MarketplaceMyPublish {
+  return {
+    versionId: "ver-1",
+    slug: "academic-translate",
+    kind: "skill",
+    version: "1.0.0",
+    name: "学术翻译",
+    status: "rejected",
+    reviewNote: "正文太短",
+    createdAt: "2026-07-20T02:00:00.000Z",
+    isCurrent: false,
+    listingState: "active",
+    ...over,
+  };
+}
+
+test("技能:只改过版本号与标签,载入旧提交前也必须二次确认", async () => {
+  listSkills.mockResolvedValue([]);
+
+  renderPanel(<PublishPanel auth={auth} publishes={[rejectedRow({})]} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+
+  // 白名单外的两个字段:版本号 + 标签。
+  fireEvent.change(screen.getByPlaceholderText("1.0.0"), { target: { value: "2.3.0" } });
+  fireEvent.change(screen.getByPlaceholderText("翻译, 学术"), { target: { value: "翻译, 学术" } });
+
+  fireEvent.click(screen.getByRole("button", { name: "载入这次提交继续修改" }));
+
+  expect(await screen.findByText(OVERWRITE_CONFIRM)).toBeInTheDocument();
+  // 取消 = 一个字都不许动。
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  await waitFor(() => expect(screen.getByPlaceholderText("1.0.0")).toHaveValue("2.3.0"));
+  expect(screen.getByPlaceholderText("翻译, 学术")).toHaveValue("翻译, 学术");
+});
+
+test("智能体:只改过工具集,载入旧提交前也必须二次确认", async () => {
+  listSkills.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  renderPanel(
+    <PublishPanel auth={auth} publishes={[rejectedRow({ kind: "agent", name: "法律顾问" })]} />,
+  );
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  await screen.findByPlaceholderText("例：法律顾问");
+
+  fireEvent.click(screen.getByRole("checkbox", { name: /浏览器/ }));
+
+  fireEvent.click(screen.getByRole("button", { name: "载入这次提交继续修改" }));
+
+  expect(await screen.findByText(OVERWRITE_CONFIRM)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  await waitFor(() =>
+    expect(screen.getByRole("checkbox", { name: /浏览器/ })).toBeChecked(),
+  );
+});
+
+test("智能体:模型是系统自动选中的默认项,空白表单不该被当成「已填写」", async () => {
+  listSkills.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  renderPanel(
+    <PublishPanel auth={auth} publishes={[rejectedRow({ kind: "agent", name: "法律顾问" })]} />,
+  );
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  // 模型下拉已被系统写入首项(seed) —— 这不是用户填的内容。
+  await screen.findByRole("option", { name: "GLM" });
+
+  fireEvent.click(screen.getByRole("button", { name: "载入这次提交继续修改" }));
+
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("例：法律顾问")).toHaveValue("法律顾问"),
+  );
+  expect(screen.queryByText(OVERWRITE_CONFIRM)).toBeNull();
+});
+
+test("插件:只改过版本号,载入旧提交前也必须二次确认", async () => {
+  listSkills.mockResolvedValue([]);
+
+  renderPanel(
+    <PublishPanel auth={auth} publishes={[rejectedRow({ kind: "connector", name: "我的插件" })]} />,
+  );
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.click(screen.getByRole("tab", { name: "发布插件" }));
+
+  fireEvent.change(await screen.findByPlaceholderText("1.0.0"), { target: { value: "1.4.2" } });
+
+  fireEvent.click(screen.getByRole("button", { name: "载入这次提交继续修改" }));
+
+  expect(await screen.findByText(OVERWRITE_CONFIRM)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  await waitFor(() => expect(screen.getByPlaceholderText("1.0.0")).toHaveValue("1.4.2"));
+});
+
+test("从我的技能导入:只填过一句话描述也必须先确认(导入会整份覆盖描述与标签)", async () => {
+  listSkills.mockResolvedValue([
+    { name: "学术翻译", description: "技能自带描述", tags: ["翻译"], writable: true },
+  ]);
+  getSkill.mockResolvedValue({ body: "# 导入的正文", files: [] });
+
+  render(<PublishPanel auth={auth} />);
+  await screen.findByRole("button", { name: "学术翻译" });
+
+  fireEvent.change(screen.getByPlaceholderText(/把中文学术论文翻译成地道英文/), {
+    target: { value: "我自己写的描述" },
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "学术翻译" }));
+
+  expect(await screen.findByText(/已填写的名称/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText(/把中文学术论文翻译成地道英文/)).toHaveValue(
+      "我自己写的描述",
+    ),
+  );
+  expect(getSkill).not.toHaveBeenCalled();
 });

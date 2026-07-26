@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceMyPublish } from "../lib/types";
 import { createMemoryAuthSession } from "../lib/authSession";
+import { expectAriaControlsResolvable } from "../test/ariaControls";
 
 const monitor = vi.hoisted(() => ({
   emit: null as null | ((transition: { previousStatus: "pending"; publish: MarketplaceMyPublish }) => void),
@@ -187,6 +188,31 @@ test("未登录态给带出口的空态,而不是一行居中灰字", () => {
   expect(screen.getByText("登录后即可浏览市场")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "去登录" }));
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("四个分区只挂一个面板,其余 tab 不得留悬空 aria-controls", () => {
+  // 与管理中心同构:壳层只渲染当前面板。未选中的 tab 若也落 aria-controls,
+  // IDREF 就指向不存在的节点 —— 视觉/快照全绿,读屏侧静默失败。
+  render(
+    <MarketplaceCenter
+      open
+      tab="browse"
+      auth={auth}
+      isAdmin
+      onTabChange={() => {}}
+      onClose={() => {}}
+    />,
+  );
+
+  expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  expect(screen.getByRole("tab", { name: "发现" })).toHaveAttribute(
+    "aria-controls",
+    "marketplace-panel-browse",
+  );
+  for (const name of ["已安装", "发布", "审核"]) {
+    expect(screen.getByRole("tab", { name })).not.toHaveAttribute("aria-controls");
+  }
+  expectAriaControlsResolvable();
 });
 
 test("发布通知:留在滚动区外、多条时给剩余计数、可逐条关闭", () => {

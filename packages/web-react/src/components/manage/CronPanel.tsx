@@ -10,7 +10,15 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { api, apiErrorMessage } from "../../lib/api";
 import {
   buildSchedule,
@@ -206,6 +214,30 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     };
   }, []);
 
+  /**
+   * 列表纪元（epoch）：`jobs` 的本地版本号，也是后台对账的**顺序栅栏**。
+   *
+   * 对账是**整表覆盖**（`setJobs(fresh)`），而它在飞的时候界面还能继续变：
+   *   ① 启停成功 → 发出一次慢速 listCron；② 用户随即删除该任务，行正确移除；
+   *   ③ 旧 listCron 才返回 —— 它拍到的是「删除之前」的表，无栅栏就会把已删任务整行写回（复活）。
+   * 多次启停/编辑的对账响应乱序同理：先发的旧快照后到，会盖掉更新的结果。
+   *
+   * 规则（单一权威）：**任何本地写 `jobs` 都推进 epoch**（整表重载 / 乐观启停 / 失败回滚 /
+   * 删除 / 新建 / 保存），**每次对账发起也推进一次并捕获自己的号**；响应回来时若号已不等于
+   * 当前 epoch，说明期间发生过更新的本地写或更新的对账 —— 这张快照**整体丢弃**。
+   *
+   * 为什么是「整体丢弃」而不是按行合并：过期快照里「某行不存在」既可能是它本来就没有，
+   * 也可能是它当时还没被创建；把负向事实（删除）与字段缺失混在一起合并，只会换一种方式复活。
+   * 用 ref 而非 state：写完必须**同步**可见，`void reconcile()` 紧接在 setState 之后执行。
+   */
+  const epoch = useRef(0);
+
+  /** 本地写 `jobs` 的唯一入口：推进 epoch（令一切在飞的对账失效）+ 落态。 */
+  const commitJobs = useCallback((next: SetStateAction<CronJob[] | null>) => {
+    epoch.current += 1;
+    setJobs(next);
+  }, []);
+
   useEffect(() => {
     let alive = true;
     setLoading(true);
@@ -213,7 +245,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     api
       .listCron(auth)
       .then((j) => {
-        if (alive) setJobs(j);
+        if (alive) commitJobs(j);
       })
       .catch((e) => {
         if (alive) setErr(apiErrorMessage(e, "加载定时任务失败"));
@@ -224,7 +256,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     return () => {
       alive = false;
     };
-  }, [auth, reload]);
+  }, [auth, commitJobs, reload]);
 
   /** 首屏重试：唯一还会把面板塌回骨架的入口（此时本来也没有内容可保留）。 */
   const refresh = useCallback(() => setReload((n) => n + 1), []);
@@ -232,11 +264,17 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   /**
    * 后台对账：写成功后静默重拉，只为回填 nextRunAt（后端算的，前端无法乐观推导）。
    * 刻意不动 loading、不报错 —— 界面上已是乐观值，对账失败下次进面板自然纠正。
+   *
+   * 落地前必须过 epoch 栅栏（见上）：被丢弃的那次对账不做补偿重拉，因为**能让它失效的
+   * 只有更新的本地写或更新的对账**，两者要么本身就是当前真值、要么会带回更新的整表。
    */
   const reconcile = useCallback(async () => {
+    const ticket = (epoch.current += 1);
     try {
       const fresh = await api.listCron(auth);
-      if (mounted.current) setJobs(fresh);
+      // 注意：这里刻意直接 setJobs 而非 commitJobs —— 服务端快照落地不是本地写，
+      // 推进 epoch 会把与它同轮的其它在飞对账误杀。
+      if (mounted.current && epoch.current === ticket) setJobs(fresh);
     } catch {
       /* 静默 */
     }
@@ -248,9 +286,12 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     );
   }, []);
 
-  const patchJob = useCallback((id: string, patch: Partial<CronJob>) => {
-    setJobs((cur) => cur?.map((j) => (j.id === id ? { ...j, ...patch } : j)) ?? cur);
-  }, []);
+  const patchJob = useCallback(
+    (id: string, patch: Partial<CronJob>) => {
+      commitJobs((cur) => cur?.map((j) => (j.id === id ? { ...j, ...patch } : j)) ?? cur);
+    },
+    [commitJobs],
+  );
 
   const toggle = useCallback(
     async (job: CronJob) => {
@@ -288,7 +329,9 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       markPending(job.id, true);
       try {
         await api.deleteCron(auth, job.id);
-        setJobs((cur) => cur?.filter((j) => j.id !== job.id) ?? cur);
+        // 走 commitJobs：删除是最不能被旧快照翻案的一种本地写（复活一条已删任务
+        // 比丢一次 nextRunAt 回填严重得多），必须让所有在飞的对账立刻失效。
+        commitJobs((cur) => cur?.filter((j) => j.id !== job.id) ?? cur);
         setEditingId((cur) => (cur === job.id ? null : cur));
         toast(`已删除「${name}」`, "success");
       } catch (e) {
@@ -297,7 +340,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         if (mounted.current) markPending(job.id, false);
       }
     },
-    [auth, confirmDialog, markPending, toast],
+    [auth, commitJobs, confirmDialog, markPending, toast],
   );
 
   const startCreate = useCallback((seed?: FormSeed) => {
@@ -321,13 +364,13 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       setCreateSeed(null);
       // 后端按创建顺序返回（gateway listJobs 直读 yaml 顺序），故追加到末尾即与对账结果一致。
       if (saved) {
-        setJobs((cur) => (cur ? [...cur, saved] : [saved]));
+        commitJobs((cur) => (cur ? [...cur, saved] : [saved]));
         setHighlightId(saved.id);
       }
       toast("已创建定时任务", "success");
       void reconcile();
     },
-    [reconcile, toast],
+    [commitJobs, reconcile, toast],
   );
 
   const handleUpdated = useCallback(

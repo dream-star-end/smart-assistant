@@ -5,6 +5,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceAiReview, MarketplacePending } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import { ToastProvider, TooltipProvider } from "../ui";
+import { expectAriaControlsResolvable } from "../../test/ariaControls";
 
 // api 网络层全 mock —— 只验证 ReviewPanel 与契约交互(待审 AI 意见区 + AI 审批记录折叠区)。
 const adminMarketplacePending = vi.fn();
@@ -207,4 +208,66 @@ test("AI 审批记录折叠区:展开后拉取并展示 approved/rejected 记录
   expect(screen.getByText("被拒技能")).toBeInTheDocument();
   expect(screen.getByText("已批准")).toBeInTheDocument();
   expect(screen.getByText("已拒绝")).toBeInTheDocument();
+});
+
+test("触控靶:待审勾选框、AI 记录折叠头、功能验收确认都由真正接收点击的元素撑到 44px", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({
+      kind: "connector",
+      name: "某 API 插件",
+      manifest: { proposedSecurityDecision: {} },
+      rawBundle: { "evals/case.md": "case" },
+    }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+
+  // ① 逐行勾选框:裸 input 的命中区只有十几像素,外层卡片的 px-3.5/py-3 扩的是卡片、
+  //    不是 input 自己的命中区 —— 必须由包住它的 label 撑到 44×44。
+  const box = await screen.findByRole("checkbox", { name: "选择 某 API 插件" });
+  const boxTarget = box.closest("label");
+  expect(boxTarget).not.toBeNull();
+  expect(boxTarget).toHaveClass(
+    "[@media(hover:none)]:min-h-11",
+    "[@media(hover:none)]:min-w-11",
+  );
+
+  // ② 「功能验收」确认:label 即点击目标,窄屏折行未必够 44px,显式兜底。
+  fireEvent.click(screen.getByRole("button", { name: "展开审查" }));
+  const verify = await screen.findByRole("checkbox", { name: /真实功能验收/ });
+  expect(verify.closest("label")).toHaveClass("[@media(hover:none)]:min-h-11");
+
+  // ③ 展开区的附属文件折叠头(<summary> 无内距,只有一行 text-caption ≈16px)。
+  expect(screen.getByText(/附属文件：evals\/case\.md/).closest("summary")).toHaveClass(
+    "[@media(hover:none)]:min-h-11",
+  );
+
+  // ④ AI 审批记录折叠头是手写 button(不是 Button 原语),原语的触控靶兜不到它。
+  expect(screen.getByRole("button", { name: /AI 审批记录/ })).toHaveClass(
+    "[@media(hover:none)]:min-h-11",
+  );
+});
+
+test("折叠态不落悬空 aria-controls:待审详情与 AI 记录都是展开才挂载", async () => {
+  adminMarketplacePending.mockResolvedValue([pending()]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  renderPanel(<ReviewPanel auth={auth} />);
+  await screen.findByText("示例技能");
+
+  // 收起状态:两处折叠区的容器都不在 DOM 里,IDREF 必须一并撤掉
+  //(与 Tabs/SkillsPanel 同一条约定:悬空 IDREF 在读屏上是静默失败)。
+  expect(screen.getByRole("button", { name: /示例技能/ })).not.toHaveAttribute("aria-controls");
+  expect(screen.getByRole("button", { name: /AI 审批记录/ })).not.toHaveAttribute("aria-controls");
+  expectAriaControlsResolvable();
+
+  // 展开后 IDREF 必须补回来,并且解析得到真实节点。
+  fireEvent.click(screen.getByText("示例技能"));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: /示例技能/ })).toHaveAttribute("aria-controls"),
+  );
+  expectAriaControlsResolvable();
 });

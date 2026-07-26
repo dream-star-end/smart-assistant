@@ -540,7 +540,9 @@ export function OptimizationPanel({
 
       {history.length > 0 && (
         <details className="group">
-          <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-lg py-2 text-meta font-medium text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+          {/* summary 自己就是点击目标:py-2 + text-meta 行高只有 ~32px,
+              给外层加内距扩不出它的命中区,触屏下显式补到 44px。 */}
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-lg py-2 text-meta font-medium text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden [@media(hover:none)]:min-h-11">
             <ChevronRight
               size={14}
               aria-hidden="true"

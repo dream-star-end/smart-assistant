@@ -1005,7 +1005,10 @@ export function DetailModal({
                   </span>
                 )}
                 <details>
-                  <summary className="cursor-pointer rounded-md text-meta text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring">
+                  {/* 触控档只加 min-h + py,**不**套 flex/list-none:这几处折叠区靠原生
+                      marker(三角)指示"可展开",去掉它就只剩一行看不出能点的文字。
+                      summary 是 list-item,min-height 照常生效,整行可点。 */}
+                  <summary className="cursor-pointer rounded-md text-meta text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2">
                     查看发布者提交的技术声明
                   </summary>
                   <CodeScroll label="发布者提交的技术声明" className="mt-2 max-h-72">
@@ -1022,7 +1025,7 @@ export function DetailModal({
                 open={!hasStorefront}
                 className={cn(cardVariants({ tone: 'sunken' }), 'overflow-hidden')}
               >
-                <summary className="cursor-pointer select-none rounded-md px-3 py-2 text-section font-semibold text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+                <summary className="cursor-pointer select-none rounded-md px-3 py-2 text-section font-semibold text-fg outline-none hover:text-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-3">
                   {hasStorefront
                     ? '技术详情（SKILL.md 原文）'
                     : '技能说明（发布者未填写商品介绍，以下为原文）'}

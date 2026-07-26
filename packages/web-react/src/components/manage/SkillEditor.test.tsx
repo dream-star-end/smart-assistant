@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
-import type { AuthSession, SkillDetail } from "../../lib/types";
+import type { AuthSession, MarketplaceMyAgent, SkillDetail } from "../../lib/types";
 import { SkillEditor } from "./SkillEditor";
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
@@ -24,11 +24,11 @@ const DETAIL: SkillDetail = {
   files: ["SKILL.md", "references/a.md", "references/b.md"],
 };
 
-function mount(detail: SkillDetail = DETAIL) {
+function mount(detail: SkillDetail = DETAIL, agents: MarketplaceMyAgent[] = []) {
   const onClose = vi.fn();
   const onChanged = vi.fn();
-  vi.spyOn(api, "getSkill").mockResolvedValue(detail);
-  vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+  const getSkill = vi.spyOn(api, "getSkill").mockResolvedValue(detail);
+  vi.spyOn(api, "listMyAgents").mockResolvedValue(agents);
   vi.spyOn(api, "getSkillHistory").mockResolvedValue({ history: [], writable: true });
   const getFile = vi
     .spyOn(api, "getSkillFile")
@@ -42,7 +42,7 @@ function mount(detail: SkillDetail = DETAIL) {
       onChanged={onChanged}
     />,
   );
-  return { onClose, onChanged, getFile };
+  return { onClose, onChanged, getFile, getSkill };
 }
 
 /** 切到「文件」页签并选中一个辅助文件。 */
@@ -127,6 +127,152 @@ describe("技能工作台 per-path 草稿模型(P0:改动不再静默丢失)", (
     // 仍然脏 → 保存按钮继续可用,用户可原地重试。
     expect(screen.getByRole("button", { name: "保存（1）" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "重试保存" })).toBeInTheDocument();
+  });
+});
+
+/** 手动控制 resolve 时机的 promise —— 用来把"请求在途"这一段真正撑开。 */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * 等这一轮保存彻底走完(footer 保存按钮退出忙态),不预设"走完之后按钮该是什么文案"。
+ * 名字必须锚定开头:左树里"a.md 有未保存的修改"也含「保存」二字。
+ */
+async function settleSave() {
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: /^(保存|已保存)/ })).not.toHaveAttribute("aria-busy"),
+  );
+}
+
+describe("技能工作台保存竞态(请求在途继续编辑)", () => {
+  test("正文:旧请求成功既不清 dirty、也不让 refresh 用旧服务端内容覆盖新输入", async () => {
+    const d = deferred<{ ok: boolean }>();
+    const update = vi.spyOn(api, "updateSkill").mockReturnValue(d.promise);
+    const { getSkill } = mount();
+
+    fireEvent.change(await screen.findByDisplayValue("原始正文"), { target: { value: "第一版" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    // 提交的是点保存那一刻的快照。
+    expect(update).toHaveBeenCalledWith(
+      auth,
+      "写作助手",
+      expect.objectContaining({ body: "第一版" }),
+    );
+
+    // 请求还在途中,用户继续敲(编辑器刻意不冻结)。
+    fireEvent.change(screen.getByDisplayValue("第一版"), { target: { value: "第二版" } });
+    const getSkillCalls = getSkill.mock.calls.length;
+    d.resolve({ ok: true });
+    await settleSave();
+
+    // 「第二版」从未提交过 → 必须仍然是脏的,而不是被标成"已保存"。
+    expect(screen.getByRole("button", { name: "保存（1）" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "已保存" })).not.toBeInTheDocument();
+    // 保存后的 refresh(服务端仍是「原始正文」)绝不能把在途输入冲掉。
+    await waitFor(() => expect(getSkill.mock.calls.length).toBeGreaterThan(getSkillCalls));
+    expect(screen.getByDisplayValue("第二版")).toBeInTheDocument();
+  });
+
+  test("辅助文件:旧请求成功不把请求期间敲进去的新内容标成已保存", async () => {
+    const d = deferred<{ ok: boolean }>();
+    const putFile = vi.spyOn(api, "putSkillFile").mockReturnValue(d.promise);
+    mount();
+
+    await pickAux(/^a\.md/);
+    fireEvent.change(await screen.findByDisplayValue("references/a.md 服务端内容"), {
+      target: { value: "第一版 a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    await waitFor(() =>
+      expect(putFile).toHaveBeenCalledWith(auth, "写作助手", "references/a.md", "第一版 a"),
+    );
+
+    fireEvent.change(screen.getByDisplayValue("第一版 a"), { target: { value: "第二版 a" } });
+    d.resolve({ ok: true });
+    await settleSave();
+
+    expect(screen.getByRole("button", { name: "保存（1）" })).toBeEnabled();
+    // 左树圆点(读屏可访问名)也必须继续标脏。
+    expect(screen.getByRole("button", { name: "a.md 有未保存的修改" })).toBeInTheDocument();
+    expect(screen.getByDisplayValue("第二版 a")).toBeInTheDocument();
+  });
+
+  test("适用智能体:旧请求成功不清掉请求期间改出来的新归属", async () => {
+    const d = deferred<{ ok: boolean }>();
+    const update = vi.spyOn(api, "updateSkill").mockReturnValue(d.promise);
+    mount(DETAIL, [
+      { id: "main", slug: "main", name: "全能助手", description: "", installed: true, isDefault: true },
+      { id: "writer", slug: "writer", name: "写手", description: "", installed: true },
+    ]);
+
+    fireEvent.click(await screen.findByRole("button", { name: /写手/ }));
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    await waitFor(() =>
+      expect(update).toHaveBeenCalledWith(
+        auth,
+        "写作助手",
+        expect.objectContaining({ agentIds: ["main", "writer"] }),
+      ),
+    );
+
+    // 请求在途时又改回去 → 与已提交的快照不一致。
+    fireEvent.click(screen.getByRole("button", { name: /写手/ }));
+    d.resolve({ ok: true });
+    await settleSave();
+
+    expect(screen.getByRole("button", { name: "保存（1）" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /写手/ })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  test("并发 refresh 乱序返回:只认最后一次发起的那份服务端快照", async () => {
+    vi.spyOn(api, "updateSkill").mockResolvedValue({ ok: true });
+    mount();
+    await screen.findByDisplayValue("原始正文");
+
+    // 初次加载已完成 → 接管后续 refresh 的 getSkill,手动控制返回顺序。
+    const pending: Array<(d: SkillDetail) => void> = [];
+    vi.spyOn(api, "getSkill").mockImplementation(
+      () => new Promise<SkillDetail>((res) => pending.push(res)),
+    );
+
+    fireEvent.change(screen.getByDisplayValue("原始正文"), { target: { value: "A" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    await waitFor(() => expect(pending).toHaveLength(1)); // 保存后的 refresh #1
+
+    fireEvent.change(await screen.findByDisplayValue("A"), { target: { value: "B" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    await waitFor(() => expect(pending).toHaveLength(2)); // 保存后的 refresh #2
+
+    // 后发的先回,先发的后回(慢链路上很常见)。
+    pending[1]({ ...DETAIL, version: "5", body: "服务端 v5" });
+    await screen.findByDisplayValue("服务端 v5");
+    pending[0]({ ...DETAIL, version: "4", body: "服务端 v4" });
+
+    await settleSave();
+    expect(screen.getByDisplayValue("服务端 v5")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("服务端 v4")).not.toBeInTheDocument();
+    expect(screen.getByText(/正文\(v5;/)).toBeInTheDocument();
+  });
+
+  test("保存期间没再动过的路径照常清干净(不因为加了快照校验就永远脏)", async () => {
+    const d = deferred<{ ok: boolean }>();
+    const update = vi.spyOn(api, "updateSkill").mockReturnValue(d.promise);
+    mount();
+
+    fireEvent.change(await screen.findByDisplayValue("原始正文"), { target: { value: "只改一次" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    d.resolve({ ok: true });
+
+    expect(await screen.findByRole("button", { name: "已保存" })).toBeDisabled();
   });
 });
 

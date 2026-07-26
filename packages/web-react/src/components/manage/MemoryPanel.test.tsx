@@ -640,4 +640,50 @@ describe("MemoryPanel · 用户画像（单文本编辑）", () => {
     fireEvent.click(retry);
     expect(await screen.findByDisplayValue("恢复的画像")).toBeInTheDocument();
   });
+
+  test("P0：画像 GET 失败后不渲染编辑器，敲不进内容也发不出无 version 的盲写 PUT", async () => {
+    mockIndex([]);
+    const get = vi
+      .spyOn(api, "getMemory")
+      .mockRejectedValue(new ApiError({ status: 503, message: "container starting" }));
+    const put = vi.spyOn(api, "putMemory").mockResolvedValue({ ok: true, version: "u9" });
+
+    renderPanel();
+    openProfileTab();
+
+    expect(await screen.findByText(/没能读到你的用户画像/)).toBeInTheDocument();
+    // 编辑器整体不渲染：没有可编辑控件，也没有保存入口 —— 盲写路径在结构上就不存在
+    // （查询用 role=textbox 而非 getByLabelText：tabpanel 的 aria-labelledby 也叫「用户画像」）
+    expect(screen.queryByRole("textbox", { name: "用户画像" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "保存" })).not.toBeInTheDocument();
+    expect(put).not.toHaveBeenCalled();
+
+    // 重试成功后恢复可编辑，且写入带上真实 version
+    get.mockResolvedValue({ target: "user", text: "服务端真实画像", version: "u1", limit: 4000 });
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    const box = (await screen.findByDisplayValue("服务端真实画像")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "服务端真实画像 + 我的补充" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put.mock.calls[0][4]).toBe("u1");
+  });
+
+  test("GET 成功但没有 version（首次创建 / 旧后端）仍可编辑并创建", async () => {
+    mockIndex([]);
+    // 读成功 = 已知服务端权威态（这里是"还没有画像"），空 version 不该被当成读失败。
+    vi.spyOn(api, "getMemory").mockResolvedValue({ target: "user", text: "", limit: 4000 });
+    const put = vi.spyOn(api, "putMemory").mockResolvedValue({ ok: true, version: "u1" });
+
+    renderPanel();
+    openProfileTab();
+
+    const box = (await screen.findByRole("textbox", { name: "用户画像" })) as HTMLTextAreaElement;
+    expect(screen.queryByText(/没能读到你的用户画像/)).not.toBeInTheDocument();
+    fireEvent.change(box, { target: { value: "称呼：dx" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(put).toHaveBeenCalled());
+    expect(put.mock.calls[0][3]).toBe("称呼：dx");
+    expect(put.mock.calls[0][4]).toBeUndefined(); // 首次创建不做版本校验
+  });
 });
