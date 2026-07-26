@@ -14,7 +14,8 @@
     "./modelAuthority": "./src/modelAuthority.ts",
     "./goalState": "./src/goalState.ts",
     "./containerPreview": "./src/containerPreview.ts",
-    "./containerPreviewAuth": "./src/containerPreviewAuth.ts"
+    "./containerPreviewAuth": "./src/containerPreviewAuth.ts",
+    "./turnErrorTaxonomy": "./src/turnErrorTaxonomy.ts"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"

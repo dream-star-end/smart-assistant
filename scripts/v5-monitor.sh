@@ -101,6 +101,10 @@ TURN_ERR_WINDOW_SECS="${V5MON_TURN_ERR_WINDOW:-600}"   # turn 失败回看窗口
 TURN_ERR_MIN_USERS="${V5MON_TURN_ERR_MIN_USERS:-2}"    # 多用户阈:≥N 个用户同窗失败
 TURN_ERR_MIN_EVENTS="${V5MON_TURN_ERR_MIN_EVENTS:-3}"  # 多用户阈:且总失败 ≥N 次
 TURN_ERR_SOLO_EVENTS="${V5MON_TURN_ERR_SOLO:-8}"       # 单源阈:单窗总失败 ≥N 次
+# turn 失败**主信号**阈值(权威=usage_records,服务端真相,不经前端遥测管道)。
+# 30 天基线错误率 0.53%,20% 是"结构性故障"级别;min_total 防低流量下单条失败刷成 100%。
+TURN_ERR_RATE_PCT="${V5MON_TURN_ERR_RATE_PCT:-20}"     # 错误率上限(%)
+TURN_ERR_RATE_MIN_TOTAL="${V5MON_TURN_ERR_RATE_MIN_TOTAL:-10}"  # 窗内最少样本数
 # KP 官方托管浏览器插件版本(= KNOWLEDGE_PLANET_PLUGIN_VERSION;插件 bump 版本时同步本值)。
 KP_PLUGIN_VERSION="${V5MON_KP_VERSION:-1.5.0}"
 # 客户端 4xx 风暴:同一 clientIp × route 在窗口内 >阈值 次 4xx。背景:2026-07-17 /api/media-signed
@@ -241,30 +245,71 @@ EOF
 }
 
 check_turn_failures() {
-  # turn 失败率:product_friction_events 短窗内 stage=turn_error/outcome=failed
-  # 聚合超阈值 → 告警。背景:2026-07-17 goal 功能致 codex 引擎无目标会话每轮必挂,
-  # 健康端点全绿、无任何 turn 级监控,boss 比平台先发现 → 本检查补盲区。
-  # outcome=failed 不含 recovered(用户重试成功即自愈,不算持续故障);
-  # 阈值语义:多用户同窗失败 = 平台性故障;单用户刷高量 = 也值得看一眼。
-  # 部署重启窗口的瞬时 turn 中断由 planned-maintenance marker 静默(deploy 侧
-  # begin_planned_maintenance checks 列表含 turn_failures,两侧同步)。
-  local row events users
+  # turn 失败率。**主信号权威 = usage_records**(服务端在计费同事务写的真相),
+  # 不再以 product_friction_events 为准。
+  #
+  # 为什么换(2026-07-26 审计实锤):friction 表的 code 列曾被 `^[A-Z0-9_]$` CHECK 约束,
+  # 而 turn 错误码在 protocol taxonomy 里**全是小写** —— 于是凡是被正确分类的错误
+  # (upstream_failed / model_capacity / engine_error …)INSERT 全部违反约束、被
+  # clientErrors 的 .catch() 静默吞掉。线上实测:30 天 431 条 friction 事件里
+  # `code ~ '[a-z]'` = 0 条,而同期 usage_records error 有 91 条。
+  # 也就是说这道"turn 级监控"对**结构性故障**是失明的 —— 它只看得见前端没带 code
+  # 的那批。约束已由 0192 放宽,但主信号仍应取服务端真相:前端遥测是尽力而为的
+  # 旁路,不该承担"聊天主链路是否在挂"这种判定。
+  #
+  # friction 表降级为下钻维度(看是哪一类错误),由 check_friction_pipeline 保证它自己没坏。
+  # 部署重启窗口由 planned-maintenance marker 静默(deploy 侧 checks 列表含 turn_failures)。
+  local row total errs pct
   if [ -z "$DBURL" ]; then record turn_failures ok "turn 失败率:无 DATABASE_URL(跳过)"; return; fi
   if ! row="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
-      "SELECT count(*), count(DISTINCT user_id)
-         FROM product_friction_events
-        WHERE stage = 'turn_error' AND outcome = 'failed'
-          AND updated_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})" 2>&1)"; then
+      "SELECT count(*),
+              count(*) FILTER (WHERE status <> 'success')
+         FROM usage_records
+        WHERE created_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})" 2>&1)"; then
     record turn_failures bad "turn 失败率:psql 查询失败:$(echo "$row" | head -c 120)"; return
   fi
-  IFS='|' read -r events users <<<"$row"
-  [[ "$events" =~ ^[0-9]+$ && "$users" =~ ^[0-9]+$ ]] || {
+  IFS='|' read -r total errs <<<"$row"
+  [[ "$total" =~ ^[0-9]+$ && "$errs" =~ ^[0-9]+$ ]] || {
     record turn_failures bad "turn 失败率:查询返回非法行:$(echo "$row" | head -c 120)"; return; }
-  if { [ "$users" -ge "$TURN_ERR_MIN_USERS" ] && [ "$events" -ge "$TURN_ERR_MIN_EVENTS" ]; } \
-     || [ "$events" -ge "$TURN_ERR_SOLO_EVENTS" ]; then
-    record turn_failures bad "turn 失败 ${events} 次/${users} 个用户(${TURN_ERR_WINDOW_SECS}s 窗,阈值 ${TURN_ERR_MIN_USERS}用户×${TURN_ERR_MIN_EVENTS}次 或单源${TURN_ERR_SOLO_EVENTS}次)——聊天主链路可能故障"
+  if [ "$total" -lt "$TURN_ERR_RATE_MIN_TOTAL" ]; then
+    record turn_failures ok "turn 失败率:窗内仅 ${total} 轮(<${TURN_ERR_RATE_MIN_TOTAL},样本不足不判)"
+    return
+  fi
+  pct=$(( errs * 100 / total ))
+  if [ "$pct" -ge "$TURN_ERR_RATE_PCT" ]; then
+    record turn_failures bad "turn 错误率 ${pct}%(${errs}/${total},${TURN_ERR_WINDOW_SECS}s 窗,阈值 ${TURN_ERR_RATE_PCT}%)——聊天主链路可能故障"
   else
-    record turn_failures ok "turn 失败率:${events} 次/${users} 用户(窗口内,未超阈)"
+    record turn_failures ok "turn 错误率 ${pct}%(${errs}/${total},窗口内,未超阈)"
+  fi
+}
+
+check_friction_pipeline() {
+  # 遥测管道**自身**的元监控。判据:同一窗口内 usage_records 有错误、而
+  # product_friction_events 一条 turn_error 都没有 → 前端上报链路或落库约束坏了。
+  #
+  # 为什么需要:2026-07-26 之前,DB 的大小写 CHECK 把全部有效分类拒了整整一个月,
+  # 日志里只有一句无信息量的 `client_friction_persist_failed`,没有任何告警 ——
+  # **监控本身静默失效,而所有面板照常绿**。这一项就是防这类"看着有数据、其实全丢"。
+  #
+  # 只在服务端确实有错误可上报时才判(否则零错误期恒告警);阈值与主信号共用窗口。
+  local row errs frictions
+  if [ -z "$DBURL" ]; then record friction_pipeline ok "遥测管道:无 DATABASE_URL(跳过)"; return; fi
+  if ! row="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
+      "SELECT (SELECT count(*) FROM usage_records
+                WHERE created_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})
+                  AND status <> 'success'),
+              (SELECT count(*) FROM product_friction_events
+                WHERE updated_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})
+                  AND stage = 'turn_error')" 2>&1)"; then
+    record friction_pipeline bad "遥测管道:psql 查询失败:$(echo "$row" | head -c 120)"; return
+  fi
+  IFS='|' read -r errs frictions <<<"$row"
+  [[ "$errs" =~ ^[0-9]+$ && "$frictions" =~ ^[0-9]+$ ]] || {
+    record friction_pipeline bad "遥测管道:查询返回非法行:$(echo "$row" | head -c 120)"; return; }
+  if [ "$errs" -ge "$TURN_ERR_RATE_MIN_TOTAL" ] && [ "$frictions" -eq 0 ]; then
+    record friction_pipeline bad "遥测管道疑似断裂:窗内 usage_records 有 ${errs} 条错误,product_friction_events 却零条 turn_error —— 查 client_friction_persist_failed 日志的 errorClass"
+  else
+    record friction_pipeline ok "遥测管道:usage_records 错误 ${errs} / friction turn_error ${frictions}(窗口内)"
   fi
 }
 
@@ -537,7 +582,7 @@ check_severity() {
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化;
     # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警;
     # 门禁豁免债务 = 已上线版本有未验证面 + 下次发布被阻断,不是全站故障但必须常驻可见。均按 warning。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers) echo warning ;;
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers|friction_pipeline) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -569,6 +614,7 @@ check_pool
 check_image
 check_mail
 check_turn_failures
+check_friction_pipeline
 check_kp_plugin
 check_gate_waivers
 check_client_4xx_storm

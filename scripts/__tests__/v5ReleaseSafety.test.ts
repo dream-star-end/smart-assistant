@@ -4391,6 +4391,7 @@ esac
 printf '%s\\n' "$*" >> '${psqlCalls}'
 case "$*" in
   *"FROM deploy_state"*) printf '%s\\n' '${deployState.phase}|${deployState.step}|${deployState.active}|${deployState.candidate ?? ''}' ;;
+  ${allHealthy ? '*usage_records*) printf \'0|0\\n\' ;;' : ''}
   ${allHealthy ? '*product_friction_events*) printf \'0|0\\n\' ;;' : ''}
   ${allHealthy ? '*marketplace_skill_listings*) printf \'t\\n\' ;;' : ''}
   *) exit 0 ;;
@@ -4755,6 +4756,31 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     assert.match(criticalLine, /backup_fresh/, 'backup_fresh 必须是 critical')
     assert.match(warningLine, /failed_units/, 'failed_units 必须显式分级(否则只靠默认分支)')
     assert.match(warningLine, /mem_oversubscribe/, 'mem_oversubscribe 必须显式分级')
+  })
+
+  // turn 失败主信号必须取服务端真相(usage_records),不能再以前端遥测表为准。
+  test('turn failure alerting reads usage_records, with a friction-pipeline meta monitor', async () => {
+    const source = await readFile(monitor, 'utf8')
+    const start = source.indexOf('check_turn_failures() {')
+    assert.ok(start >= 0, 'check_turn_failures 缺失')
+    const fn = source.slice(start, source.indexOf('\n}', start))
+    assert.match(fn, /FROM usage_records/, 'turn 主信号必须查 usage_records(服务端真相)')
+    assert.doesNotMatch(
+      fn,
+      /FROM product_friction_events/,
+      'turn 主信号不得再以 product_friction_events 为准(依赖前端上报链路 + DB 约束,曾整月静默失效)',
+    )
+    assert.match(fn, /TURN_ERR_RATE_MIN_TOTAL/, '必须有最小样本门,防低流量下单条失败刷成 100%')
+
+    const metaStart = source.indexOf('check_friction_pipeline() {')
+    assert.ok(metaStart >= 0, 'check_friction_pipeline 缺失(遥测管道自身无人看守)')
+    const meta = source.slice(metaStart, source.indexOf('\n}', metaStart))
+    assert.match(meta, /FROM usage_records/)
+    assert.match(meta, /FROM product_friction_events/)
+
+    assert.match(source, /^check_friction_pipeline$/m, 'check_friction_pipeline 未进调用列表')
+    const sev = source.slice(source.indexOf('check_severity() {'), source.indexOf('\n}', source.indexOf('check_severity() {')))
+    assert.match(sev, /friction_pipeline/, 'friction_pipeline 必须显式分级')
   })
 
   // docker inspect 必须一次传全部容器 ID:每 2 分钟一轮的探针不能在循环里逐个调。
@@ -5826,8 +5852,20 @@ wait $!
     const monitor = await readFile(path.join(root, 'scripts/v5-monitor.sh'), 'utf8')
     assert.match(monitor, /check_gate_waivers\(\)/, 'monitor 缺门禁豁免债务探针')
     assert.match(monitor, /^check_gate_waivers$/m, 'monitor 探针未接进主流程')
-    assert.match(monitor, /gate_waivers\) echo warning|client_4xx_storm\|gate_waivers\) echo warning/,
-      'monitor 未给 gate_waivers 分级')
+    // 断言"gate_waivers 出现在 warning 分级行内",而不是"它必须是行尾最后一项" ——
+    // 后者会让任何人再往该行追加一项(如 friction_pipeline)时误红,把一条正确的
+    // 改动判成回归。这里取该 case 分支整行再判包含,语义等价且不脆。
+    const sevBody = monitor.slice(
+      monitor.indexOf('check_severity() {'),
+      monitor.indexOf('\n}', monitor.indexOf('check_severity() {')),
+    )
+    const warningBranch = sevBody
+      .split('\n')
+      .find((l) => l.includes('echo warning ;;') && !l.trim().startsWith('*)'))
+    assert.ok(
+      warningBranch?.includes('gate_waivers'),
+      `monitor 未给 gate_waivers 分级(warning 分支=${warningBranch ?? '<未找到>'})`,
+    )
     assert.match(monitor, /GATE_WAIVER_DIR=.*\.gate-waivers/, 'monitor 与 deploy 的 marker 目录必须同路径')
   })
 
