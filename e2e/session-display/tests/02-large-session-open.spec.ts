@@ -57,7 +57,13 @@ test('@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录�
     await expect(page.getByText('e2e 首屏可见的真实最终答复')).toBeVisible({ timeout: 15_000 });
     const probe = await payloadProbe;
     expect(probe.status(), '真实大记录必须走 206 Range payload 端点').toBe(206);
-    await expect(SEL.turnProcessCard(page), '旧过程投影不得替代真实 logical record').toHaveCount(0);
+    // 正向对照代替原来的 `turnProcessCard toHaveCount(0)`:那个 testid 在
+    // packages/web-react 里从来不存在(2026-07-26 审计核实),断言恒真。真正要证明的是
+    // "首屏拿到的是真实 logical record",于是直接断言真实 assistant 行有正文。
+    await expect(
+      SEL.assistantRows(page).locator('.prose').filter({ hasText: /\S/ }).first(),
+      '首屏必须是真实 logical record(有正文的 assistant 行)',
+    ).toBeVisible({ timeout: 15_000 });
 
     const tool = page.getByRole('button', { name: /^终端\s+e2e-long-output\s+完成$/ });
     await expect(tool, '真实 Bash 工具记录应在 payload 水合后可见').toBeVisible({ timeout: 15_000 });

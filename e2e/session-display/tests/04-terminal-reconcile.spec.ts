@@ -43,14 +43,25 @@ test('@smoke 回复中途刷新:终态正确收敛,spinner 不永挂', async ({ 
   await page.reload({ waitUntil: 'domcontentloaded' });
   await waitForHistoryLoaded(page);
 
-  // 终态必收敛:回复 or 失败卡,二选一;spinner 不永挂(waitForTurnSettled 超时=永挂=失败)。
+  // 终态必收敛。本用例只是 page.reload(),**不断网**(真断网场景在 03),刷新页面又是
+  // 最常见的用户动作 —— 收敛结果就应当稳定是 reply。原来接受 'error' 通过,等于把
+  // "刷新一下回复就没了"这条用户可见故障写进了合格线。
   const outcome = await waitForTurnSettled(page, { timeoutMs: Math.max(90_000, cfg.turnTimeoutMs) });
-  expect(['reply', 'error']).toContain(outcome);
+  expect(outcome, '仅刷新页面(未断网)时,终态必须收敛为真实回复').toBe('reply');
 
   // typing 指示最终必须消失(收敛证据)。
   await expect(SEL.typing(page)).toHaveCount(0, { timeout: 10_000 });
 
-  // API 佐证:该 user 消息对应有终态(assistant 回复 或 error 标记),不静默悬挂。
+  // API 佐证:必须真有 assistant 终态正文,而不是"服务端至少有 user 行"——
+  // 第 30 行刚通过 UI 发过消息,`messages.length >= 1` 近似恒真,证明不了任何收敛。
   const detail = await api.getSession(token, sid);
-  expect(detail.messages.length, '服务端应至少有 user 行').toBeGreaterThanOrEqual(1);
+  const userRows = detail.messages.filter((m: any) => m.role === 'user');
+  expect(userRows.length, '服务端应有本轮 user 行').toBeGreaterThanOrEqual(1);
+  const assistantFinals = detail.messages.filter(
+    (m: any) => m.role === 'assistant' && String(m.text ?? '').trim(),
+  );
+  expect(
+    assistantFinals.length,
+    `服务端应存在 assistant 终态正文(实际 ${detail.messages.length} 条消息、${assistantFinals.length} 条有正文的 assistant)`,
+  ).toBeGreaterThanOrEqual(1);
 });

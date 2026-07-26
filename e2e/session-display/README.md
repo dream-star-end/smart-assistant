@@ -111,7 +111,8 @@ token 不得写入仓库或报告。
 - 所有会话均使用随机 `e2e-*` 前缀并在 fixture 收尾删除；注入仅作用于 v5-evals 自身。
 - 两个模型串行执行，避免同账号会话/计费证据互相干扰。
 - 修改高频 UI 节点时保留 `user-row`、`assistant-row`、`message-text`、
-  `turn-process-card`、`team-panel`、`permission-card` 等稳定 testid。
+  `team-panel`、`permission-card` 等稳定 testid(改名会让 e2e 断言失效;
+  scripts/check-v5-e2e-selectors.ts 会在 CI 静态校验它们真实存在)。
 - 新出现的 P0/P1 必须先把根因修复映射进 `incidents.json`，补最低层行为回归，并在适合的
   browser/live/deploy 层证明用户路径；不得只记事故不加自动门。
 - 紧急止血可按 `docs/V5_DEV_PLAYBOOK.md` 的 dx-declared emergency lane 跳过本矩阵，
