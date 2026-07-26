@@ -17,6 +17,7 @@ import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
+import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
 import {
@@ -108,6 +109,13 @@ declare global {
       pushRemainingFrames: () => number;
       frameCount: () => number;
     };
+    /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
+    __modelFixture: {
+      markers: Record<string, string>;
+      ids: Record<string, string>;
+    };
+    /** T23 ModelSelector.onSelect 真实收到的 model id(顺序即点击顺序)。 */
+    __modelPicks: string[];
     __runPendingDispatchJournalProbe: () => Promise<{
       survivedStaleWrite: boolean;
       resistedResurrection: boolean;
@@ -134,6 +142,7 @@ window.__replayFixture = {
   expectedRoles: EXPECTED_TIMELINE_ROLES,
 };
 window.__replay = { sent: [], sending: false, rows: [] };
+window.__modelPicks = [];
 window.__replayDrive = {
   openTurn: async () => {
     throw new Error("replay probe 未挂载");
@@ -907,3 +916,42 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
     frameCount: () => frames.length,
   };
 }
+
+// ── T23 会话内切模型(唯一入口)──────────────────────────────────────────────
+//
+// ModelSelector 是会话内换模型的唯一入口,候选项是 Radix DropdownMenuItem —— 而
+// 2026-07-18 附件事故的根因类别正是"菜单项在受信点击派发过程中被同步卸载,杀死
+// post-dispatch 副作用",对**任何** DropdownMenuItem 内的副作用都成立。jsdom 的
+// fireEvent 不走 Radix 的 pointerdown→pointerup→select 真实序列,这一类物理上测不出。
+//
+// 这里 mount 的是生产组件本体;onSelect 回填 selectedId 与线上 App 的 selectModel
+// 同构(用户可见事实 = 点完之后顶栏显示的就是新模型)。
+const MODEL_MARKERS = {
+  current: "MODEL_CURRENT_ALPHA",
+  target: "MODEL_TARGET_BETA",
+  degraded: "MODEL_DEGRADED_GAMMA",
+} as const;
+const MODEL_IDS = { current: "m-alpha", target: "m-beta", degraded: "m-gamma" } as const;
+window.__modelFixture = { markers: { ...MODEL_MARKERS }, ids: { ...MODEL_IDS } };
+
+function ModelSelectorProbe() {
+  const [selectedId, setSelectedId] = useState<string>(MODEL_IDS.current);
+  return (
+    <ModelSelector
+      models={[
+        { id: MODEL_IDS.current, display_name: MODEL_MARKERS.current },
+        { id: MODEL_IDS.target, display_name: MODEL_MARKERS.target },
+        { id: MODEL_IDS.degraded, display_name: MODEL_MARKERS.degraded, degraded: true },
+      ]}
+      selectedId={selectedId}
+      onSelect={(id) => {
+        window.__modelPicks.push(id);
+        setSelectedId(id);
+      }}
+    />
+  );
+}
+
+createRoot(document.getElementById("model-selector-root")!).render(
+  <StrictMode><ModelSelectorProbe /></StrictMode>,
+);

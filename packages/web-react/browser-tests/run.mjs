@@ -136,7 +136,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -886,6 +886,73 @@ await check("T22 Enter 发送 / Shift+Enter 换行 / IME 组合中回车不误�
     throw new Error(`发送载荷文本不精确: ${JSON.stringify(sends[sends.length - 1])}`);
   }
   if (await value() !== "") throw new Error("发送后草稿未清空");
+});
+
+// ── T23 会话内切模型 ─────────────────────────────────────────────────────────
+// 用户可见事实:点顶栏模型名 → 菜单弹出 → 点另一个模型 → 真的切过去(菜单关闭、
+// 顶栏显示新模型、上层收到精确 model id);标了「暂不可用」的模型点不动、也不会被
+// 静默切过去。前半段守的是 2026-07-18 附件事故那一类(Radix 菜单项受信点击的
+// post-dispatch 副作用被同步卸载杀死),jsdom 的 fireEvent 走不出这条真实序列。
+await check("T23 顶栏切模型:受信点选生效并回显,降级模型点不动", async () => {
+  const fixture = await page.evaluate(() => window.__modelFixture);
+  const { markers, ids } = fixture;
+  const modelRoot = page.locator("#model-selector-root");
+  const trigger = modelRoot.getByRole("button", { name: "选择对话模型" });
+  await trigger.waitFor({ state: "visible", timeout: 3000 });
+  if (!(await trigger.textContent())?.includes(markers.current)) {
+    throw new Error(`触发器未显示当前模型: ${JSON.stringify(await trigger.textContent())}`);
+  }
+
+  // ① 受信点击展开:三个候选都在,降级项带「暂不可用」徽记(用户看得见为什么不能选)。
+  await trigger.click();
+  const targetItem = page.getByRole("menuitem", { name: new RegExp(markers.target) });
+  const degradedItem = page.getByRole("menuitem", { name: new RegExp(markers.degraded) });
+  await targetItem.waitFor({ state: "visible", timeout: 3000 });
+  await degradedItem.waitFor({ state: "visible", timeout: 3000 });
+  if (!(await degradedItem.textContent())?.includes("暂不可用")) {
+    throw new Error("降级模型没有「暂不可用」徽记(用户无从判断为何选不了)");
+  }
+
+  // ② 点另一个模型:上层收到精确 id、菜单关闭、触发器回显新模型。
+  //    这三件事都是 select 之后才发生的副作用 —— 菜单项在派发中被卸载就会全丢。
+  await targetItem.click();
+  await targetItem.waitFor({ state: "hidden", timeout: 3000 });
+  const picks = await page.evaluate(() => window.__modelPicks);
+  if (JSON.stringify(picks) !== JSON.stringify([ids.target])) {
+    throw new Error(`onSelect 收到的 model id 不精确: ${JSON.stringify(picks)}`);
+  }
+  const afterLabel = await trigger.textContent();
+  if (!afterLabel?.includes(markers.target)) {
+    throw new Error(`切换后触发器仍未回显新模型: ${JSON.stringify(afterLabel)}`);
+  }
+
+  // ③ 降级模型:真浏览器里点不动(生产 CSS data-[disabled]:pointer-events-none),
+  //    受信点击落在菜单容器上 → 不切模型、也不误关菜单。
+  await trigger.click();
+  await degradedItem.waitFor({ state: "visible", timeout: 3000 });
+  const degradedState = await degradedItem.evaluate((el) => ({
+    ariaDisabled: el.getAttribute("aria-disabled"),
+    pointerEvents: getComputedStyle(el).pointerEvents,
+  }));
+  if (degradedState.ariaDisabled !== "true") {
+    throw new Error("降级模型未对读屏/键盘用户暴露 aria-disabled");
+  }
+  if (degradedState.pointerEvents !== "none") {
+    throw new Error(`降级模型仍可接收指针事件: pointer-events=${degradedState.pointerEvents}`);
+  }
+  const box = await degradedItem.boundingBox();
+  if (!box) throw new Error("降级模型不可见");
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  const picksAfter = await page.evaluate(() => window.__modelPicks);
+  if (picksAfter.length !== picks.length) {
+    throw new Error(`点降级模型把会话切过去了: ${JSON.stringify(picksAfter)}`);
+  }
+  await degradedItem.waitFor({ state: "visible", timeout: 1000 });
+  await page.keyboard.press("Escape");
+  await degradedItem.waitFor({ state: "hidden", timeout: 3000 });
+  if (!(await trigger.textContent())?.includes(markers.target)) {
+    throw new Error("降级项交互后触发器显示的模型被改掉了");
+  }
 });
 
 async function assertContainerPreviewFillsViewport(page, expectedDevice, width, height, top = 0) {

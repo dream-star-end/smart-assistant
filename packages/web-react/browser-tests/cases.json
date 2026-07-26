@@ -23,6 +23,7 @@
     { "id": "T19", "proves": "真 IndexedDB 下多标签陈旧快照既不抹除也不复活 pending-dispatch 日志" },
     { "id": "T20", "proves": "预览用例跑完后主 harness 页面仍完好(防 setContent 摧毁共享页面导致后续缺席断言恒真)" },
     { "id": "T21", "proves": "真 WS 帧经真 ChatSocket 消化后驱动真时间线:条目数与顺序、工具卡真实命令与输出、思考卡实时展开→终态自动折叠→可再展开、终态清发送态(补 jsdom 单测与 stub 卡片之间那段无人守的链)" },
-    { "id": "T22", "proves": "Enter 发送 / Shift+Enter 换行 / 中文 IME 组合中回车不误发(jsdom 里 isComposing 物理恒 false,只有真浏览器组合态能证明)" }
+    { "id": "T22", "proves": "Enter 发送 / Shift+Enter 换行 / 中文 IME 组合中回车不误发(jsdom 里 isComposing 物理恒 false,只有真浏览器组合态能证明)" },
+    { "id": "T23", "proves": "顶栏切模型:受信点选后上层收到精确 model id、菜单关闭、触发器回显新模型;降级模型点不动也不会被静默切过去" }
   ]
 }
