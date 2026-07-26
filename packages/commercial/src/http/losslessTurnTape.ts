@@ -480,6 +480,17 @@ export function computeGoalTokensUsed(payload: LosslessTurnPayload): number {
   for (const field of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"] as const) {
     add(payload.usage?.[field], `usage.${field}`);
   }
+  const rootTotalTokens = payload.usage?.totalTokens;
+  if (
+    rootTotalTokens !== undefined
+    && (
+      typeof rootTotalTokens !== "number"
+      || !Number.isSafeInteger(rootTotalTokens)
+      || rootTotalTokens < 0
+    )
+  ) {
+    throw new Error("turn tape payload usage.totalTokens must be a non-negative safe integer");
+  }
   let delegateRecordCount = 0;
   for (let groupIndex = 0; groupIndex < (payload.agentGroups ?? []).length; groupIndex++) {
     const records = payload.agentGroups![groupIndex]!.goalUsageRecords;

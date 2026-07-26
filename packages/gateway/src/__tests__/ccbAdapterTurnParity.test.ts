@@ -177,6 +177,7 @@ describe("CcbAdapter turn parity", () => {
       "block:tool_result",
       "tool_result_detected", // onToolResult 在 tool_result block 之后
       "block:text",
+      "usage",
       "final",
     ]);
 
@@ -222,6 +223,7 @@ describe("CcbAdapter turn parity", () => {
       outputTokens: 5,
       cacheReadTokens: 2,
       cacheCreationTokens: 1,
+      totalTokens: 18,
     });
     // 成本 delta 基线:totals ref 被 parser 直接 mutate(逐字节不变语义)
     assert.equal(totals._lastCcbCumulativeCost, 0.08);

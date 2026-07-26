@@ -22,6 +22,7 @@ import { cn, groupDigits } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
 import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { agentDisplayName } from "./agentNames";
+import { TokenUsageBadge, addTokenUsage, delegateTokenUsage } from "./tokenUsage";
 
 /** 队员是否运行中:server-authored 骨架行是终态快照,永不"运行中"。 */
 function memberRunning(msg: ChatMessage): boolean {
@@ -54,6 +55,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
   const name = memberName(msg, idx);
   const goal = msg._delegateGoal || msg.text || "";
   const terminalNoChildren = !running && children.length === 0;
+  const tokenUsage = delegateTokenUsage(msg);
 
   return (
     <div className="overflow-hidden rounded-lg border border-border/70 bg-bg">
@@ -100,6 +102,7 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
             </Badge>
           )}
           {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
+          <TokenUsageBadge usage={tokenUsage} label="子 Agent" />
           {cost && <span className="text-[11px] font-medium text-faint">{groupDigits(cost)} 积分</span>}
           <ChevronRight size={14} className={cn("text-faint transition-transform", open && "rotate-90")} />
         </span>
@@ -124,7 +127,12 @@ function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost
             </div>
           )}
           {children.slice(0, visibleChildren).map((ch, i) => (
-            <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
+            <ChildBlockView
+              key={`${i}-${ch.blockId ?? ch.kind}`}
+              child={ch}
+              sig={childSignature(ch)}
+              tokenUsage={tokenUsage}
+            />
           ))}
           {visibleChildren < children.length && (
             <button
@@ -170,6 +178,7 @@ export const TeamPanel = memo(
     const timedOut = terminal.filter((m) => agentTerminalStatus(m).tone === "warning").length;
     const done = terminal.length - failed - timedOut;
     const allDone = running === 0;
+    const teamTokenUsage = addTokenUsage(members.map(delegateTokenUsage));
     const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
     // 「曾经活跃过」高水位锁存:面板若在用户眼前从运行跑到完成,保持展开(继续展示各队员结果),
     // 不自动收起——否则会卸载队员行、吞掉用户手动展开的内容。只有「一进来就全完成」的历史
@@ -204,6 +213,7 @@ export const TeamPanel = memo(
             {done > 0 && <span className="text-success">✓ {done} 完成</span>}
             {failed > 0 && <span className="text-danger">✕ {failed} 失败</span>}
             {timedOut > 0 && <span className="text-warning">⏱ {timedOut} 超时</span>}
+            <TokenUsageBadge usage={teamTokenUsage} label="合计" />
             <ChevronRight size={15} className={cn("text-faint transition-transform", !collapsed && "rotate-90")} />
           </span>
         </button>

@@ -24,6 +24,7 @@ import type {
   DurableRuntimeEvent,
   OutboundContentBlock,
   ToolTerminationReason,
+  TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
 import type { ClassifiedErrorCode } from '../errorClassify.js'
 export type { DurableRuntimeEvent } from '@openclaude/protocol'
@@ -157,6 +158,7 @@ export interface EngineFinalMeta {
   outputTokens?: number
   cacheReadTokens?: number
   cacheCreationTokens?: number
+  totalTokens?: number
   totalCost?: number
   turn?: number
   /** Anthropic API stop_reason, extracted from CCB result row.
@@ -175,6 +177,7 @@ export interface EngineFinalMeta {
  */
 export type EngineContentEvent =
   | { kind: 'block'; block: OutboundContentBlock }
+  | { kind: 'usage'; usage: TurnTokenUsageSnapshot }
   | { kind: 'final'; meta?: EngineFinalMeta }
   // 审计 R3:error 事件可携带 runner 现场预分类的 errorClass(codex classifyRunError
   // 产物;CCB 缺省不带)。server.ts 据此直接按码组 outbound.error,省一次原文正则;
@@ -262,6 +265,7 @@ export interface TurnSummary {
     outputTokens: number
     cacheReadTokens: number
     cacheCreationTokens: number
+    totalTokens: number
   }
   assistantText: string
   thinkingText: string

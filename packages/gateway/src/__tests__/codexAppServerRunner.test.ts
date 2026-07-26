@@ -2905,6 +2905,8 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
     // reflect the LATEST frame (idempotent snapshot); priorTurnTotal must
     // remain at the bootstrap value so the eventual delta = full turn usage.
     const h = await makeHarness()
+    const liveUsage: Array<Record<string, number>> = []
+    h.runner.on('usage', (usage) => liveUsage.push(usage))
     ;(h.runner as any).activeTurnId = 't-multi'
     const send = (totalIn: number, totalOut: number) => {
       feed(h.runner, {
@@ -2935,6 +2937,11 @@ describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', (
     assert.deepEqual(runner.activeTurnTotal.outputTokens, 800)
     // baseline must NOT shift on subsequent frames
     assert.deepEqual(runner.priorTurnTotal, baselineAfterFirst)
+    assert.deepEqual(liveUsage, [
+      { totalTokens: 100, inputTokens: 50, outputTokens: 50, cacheReadTokens: 0 },
+      { totalTokens: 300, inputTokens: 150, outputTokens: 150, cacheReadTokens: 0 },
+      { totalTokens: 700, inputTokens: 350, outputTokens: 350, cacheReadTokens: 0 },
+    ])
     await h.cleanup()
   })
 
@@ -3052,6 +3059,7 @@ describe('shutdown — token state cleared (PR1 v1.0.65 A.2)', () => {
       cache_read_input_tokens: 0,
       cache_creation_input_tokens: 0,
       reasoning_output_tokens: 0,
+      total_tokens: 0,
     })
     assert.equal(result.billing_terminal_code, 'CODEX_ERROR')
     await h.runner.shutdown()

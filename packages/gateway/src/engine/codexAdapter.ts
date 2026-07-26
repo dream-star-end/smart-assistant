@@ -30,7 +30,7 @@
  *     这里收口保证 codex 路径永远命中 scrub,与 buildCodexEnv 的 env scrub 成对。
  */
 import { EventEmitter } from 'node:events'
-import type { GoalStateSnapshot } from '@openclaude/protocol'
+import type { GoalStateSnapshot, TurnTokenUsageSnapshot } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import { createLogger } from '../logger.js'
@@ -87,6 +87,7 @@ const CODEX_PHANTOM_SIGNALS: Readonly<PhantomSignals> = Object.freeze({
 interface CodexTurnContext {
   parser: CcbMessageParser
   lastErrorText: string | null
+  onEvent: (event: EngineEvent) => void
   turnKey?: string
   usageAttribution?: UsageAttributionTag
 }
@@ -100,6 +101,7 @@ function buildTurnSummary(result: TurnResult, ctx: CodexTurnContext): TurnSummar
       outputTokens: result.outputTokens,
       cacheReadTokens: result.cacheReadTokens,
       cacheCreationTokens: result.cacheCreationTokens,
+      totalTokens: result.totalTokens,
     },
     assistantText: result.assistantText,
     thinkingText: result.thinkingText,
@@ -330,6 +332,12 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       const turn = this._routeTurn
       turn?.parser.captureRuntimeEvent(payload, 'codex-jsonrpc')
     })
+    this.kernel.on('usage', (usage: TurnTokenUsageSnapshot) => {
+      this.emit('activity')
+      const turn = this._activeTurn
+      if (!turn || turn.parser.finalized) return
+      turn.onEvent({ kind: 'usage', usage })
+    })
     this.kernel.on('session_id', (id: string) => {
       this._threadId = typeof id === 'string' && id ? id : null
       this.emit('session_id', id)
@@ -355,6 +363,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     const ctx: CodexTurnContext = {
       parser: null as unknown as CcbMessageParser,
       lastErrorText: null,
+      onEvent: params.onEvent,
       ...(params.turnKey ? { turnKey: params.turnKey } : {}),
       ...(params.usageAttribution
         ? { usageAttribution: { ...params.usageAttribution } }

@@ -35,9 +35,11 @@ import type {
   OutboundPermissionSettled,
   OutboundResumeFailed,
   OutboundTurnStatus,
+  OutboundTurnUsage,
   Peer,
   PromptQueueMutationFrame,
   PromptQueueSnapshot,
+  TurnTokenUsageSnapshot,
 } from "@openclaude/protocol/frames";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 
@@ -51,6 +53,7 @@ export type {
   OutboundContentBlock,
   Peer,
   PromptQueueSnapshot,
+  TurnTokenUsageSnapshot,
 };
 
 // ─── runtime-augmented 公共片段 ──────────────────────────────────────
@@ -99,6 +102,7 @@ export type OutboundPermissionSettledWire = OutboundPermissionSettled & WireRunt
 export type OutboundResumeFailedWire = OutboundResumeFailed & WireRuntimeFields;
 export type OutboundActiveTurnReplayStartWire = OutboundActiveTurnReplayStart;
 export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
+export type OutboundTurnUsageWire = OutboundTurnUsage & WireRuntimeFields;
 
 /** legacy bridge error 帧（`type:'error'`，protocol 未建模）。*/
 export type LegacyBridgeErrorWire = {
@@ -237,6 +241,7 @@ export type OutboundWire =
   | OutboundResumeFailedWire
   | OutboundActiveTurnReplayStartWire
   | OutboundTurnStatusWire
+  | OutboundTurnUsageWire
   | PromptQueueSnapshot
   | LegacyBridgeErrorWire
   | CostChargedWire

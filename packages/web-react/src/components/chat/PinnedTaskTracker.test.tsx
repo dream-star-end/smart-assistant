@@ -139,6 +139,18 @@ describe("PinnedTaskTracker 交互", () => {
     expect(screen.queryByText("任务一")).toBeNull();
   });
 
+  test("任务 HUD 实时替换本轮 token 快照", () => {
+    const view = render(
+      <PinnedTaskTracker todos={TODOS} active tokenUsage={{ totalTokens: 64 }} />,
+    );
+    expect(screen.getByText("本轮 64 token")).toBeInTheDocument();
+    view.rerender(
+      <PinnedTaskTracker todos={TODOS} active tokenUsage={{ totalTokens: 96 }} />,
+    );
+    expect(screen.getByText("本轮 96 token")).toBeInTheDocument();
+    expect(screen.queryByText("本轮 64 token")).not.toBeInTheDocument();
+  });
+
   test("空任务 → 不渲染", () => {
     const { container } = render(<PinnedTaskTracker todos={[]} active={true} />);
     expect(container.firstChild).toBeNull();

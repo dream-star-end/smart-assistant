@@ -1084,6 +1084,7 @@ describe("crash/interrupt partial persistence", () => {
         outputTokens: 3,
         cacheReadTokens: 2,
         cacheCreationTokens: 1,
+        totalTokens: 13,
         turn: 1,
       });
       assert.equal(p.tools?.length, 1);

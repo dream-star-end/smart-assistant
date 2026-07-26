@@ -892,6 +892,7 @@ function persistServerAuthoredTurnOutcome(args: {
     outputTokens?: number
     cacheReadTokens?: number
     cacheCreationTokens?: number
+    totalTokens?: number
     model?: string
     turn?: number
     /** Master-owned per-turn canonical traceId (see V3MasterSinkWirePayload).
@@ -1166,6 +1167,17 @@ function terminalUsageForPersistence(args: {
   model?: string
 }): NonNullable<V3MasterSinkPayload['usage']> {
   const billingUsage = args.billing?.usage
+  const billingTotal = [
+    billingUsage?.input_tokens,
+    billingUsage?.output_tokens,
+    billingUsage?.cache_read_input_tokens,
+    billingUsage?.cache_creation_input_tokens,
+    billingUsage?.reasoning_output_tokens,
+  ].reduce<number | undefined>((total, value) => {
+    const safe = safeUsageCounter(value)
+    return safe === undefined ? total : (total ?? 0) + safe
+  }, undefined)
+  const totalTokens = safeUsageCounter(args.finalMeta?.totalTokens) ?? billingTotal
   return {
     inputTokens:
       safeUsageCounter(args.finalMeta?.inputTokens) ?? safeUsageCounter(billingUsage?.input_tokens) ?? 0,
@@ -1179,6 +1191,7 @@ function terminalUsageForPersistence(args: {
       safeUsageCounter(args.finalMeta?.cacheCreationTokens) ??
       safeUsageCounter(billingUsage?.cache_creation_input_tokens) ??
       0,
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
     ...(args.model ? { model: args.model } : {}),
     turn: args.turnIndex,
     ...(args.traceId ? { traceId: args.traceId } : {}),
@@ -4954,6 +4967,7 @@ export class SessionManager {
                   outputTokens: result.usage.outputTokens,
                   cacheReadTokens: result.usage.cacheReadTokens,
                   cacheCreationTokens: result.usage.cacheCreationTokens,
+                  totalTokens: result.usage.totalTokens,
                   ...(session.model ? { model: session.model } : {}),
                   turn: turnIndex,
                   // Surface the master-owned per-turn traceId so the web UI can

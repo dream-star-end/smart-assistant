@@ -618,7 +618,13 @@ describe("materializeLosslessTurn", () => {
       createdAt: 1_783_944_000_000,
       goalId: "11111111-1111-4111-8111-111111111111",
       goalStateRevision: 4,
-      usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheCreationTokens: 1 },
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 2,
+        cacheCreationTokens: 1,
+        totalTokens: 999,
+      },
       agentGroups: [{
         runId: "dlg-root",
         agentId: "worker",
@@ -631,7 +637,11 @@ describe("materializeLosslessTurn", () => {
         ],
       }],
     });
+    // totalTokens is the display authority and may include extra engine
+    // categories; goal accounting remains the established disjoint component
+    // sum and must not double-count it.
     assert.equal(computeGoalTokensUsed(turn.payload), 36);
+    assert.equal(turn.payload.usage?.totalTokens, 999);
     const duplicate = structuredClone(turn.payload);
     (duplicate.agentGroups![0]!.goalUsageRecords as Array<Record<string, unknown>>).push(
       structuredClone((duplicate.agentGroups![0]!.goalUsageRecords as Array<Record<string, unknown>>)[0]!),

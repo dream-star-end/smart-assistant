@@ -1362,6 +1362,7 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
         usage: {
           inputTokens: 100,
           outputTokens: 50,
+          totalTokens: 155,
           turn: 1,
           traceId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
         },
@@ -1373,6 +1374,7 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     assert.deepEqual(capturedUsage, {
       inputTokens: 100,
       outputTokens: 50,
+      totalTokens: 155,
       turn: 1,
       traceId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
     });

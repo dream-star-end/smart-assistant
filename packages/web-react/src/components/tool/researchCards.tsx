@@ -1116,7 +1116,7 @@ function GenericOcCard({ cli, tool, error }: { cli: OcCli; tool: ToolLike; error
           {firstParagraph(clean)}
         </div>
       ) : (
-        <div className="text-xs text-faint">{error ? "工具执行失败，请展开结果详情查看原因。" : "操作已完成。"}</div>
+        <div className="text-xs text-faint">{error ? "工具执行失败，请查看卡片内错误信息。" : "操作已完成。"}</div>
       )}
     </div>
   );

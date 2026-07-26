@@ -530,6 +530,23 @@ export type InboundFrame = Static<typeof InboundFrame>
 // CCB emits this on every SDK message (see parent_tool_use_id in the CCB
 // core schemas). Supports nesting naturally — grand-child subagents carry
 // their direct parent's tool_use_id.
+/**
+ * Authoritative absolute token snapshot for one logical turn/run.
+ *
+ * Component counters stay optional because engines expose different token
+ * categories. `totalTokens` remains the engine-authoritative total and may
+ * include categories (for example Codex reasoning tokens) not represented by
+ * the four Anthropic-compatible component fields.
+ */
+export const TurnTokenUsageSnapshot = Type.Object({
+  totalTokens: Type.Integer({ minimum: 0 }),
+  inputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  outputTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  cacheReadTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+  cacheCreationTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+})
+export type TurnTokenUsageSnapshot = Static<typeof TurnTokenUsageSnapshot>
+
 export const OutboundContentBlock = Type.Union([
   Type.Object({
     kind: Type.Literal('text'),
@@ -691,6 +708,7 @@ export const OutboundContentBlock = Type.Union([
       Type.Literal('thinking'),
       Type.Literal('plan'),
       Type.Literal('tool'),
+      Type.Literal('usage'),
       Type.Literal('done'),
       Type.Literal('error'),
     ]),
@@ -704,6 +722,11 @@ export const OutboundContentBlock = Type.Union([
     // 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),
     // 供新前端复用主聊天富渲染。gateway 已 sanitize,前端按子块 kind 渲染;旧前端忽略此字段。
     block: Type.Optional(Type.Unknown()),
+    /** Nested routing may rebind `runId` to the visible first-level card.
+     * This identity remains the exact child execution whose absolute snapshot
+     * must be overwritten rather than accumulated. */
+    usageRunId: Type.Optional(Type.String()),
+    usage: Type.Optional(TurnTokenUsageSnapshot),
   }),
   // Snapshot of a long-running bash command's tail output. Snapshot
   // semantics: the consumer REPLACES its prior tail buffer with `tail`
@@ -755,6 +778,7 @@ export const OutboundMessage = Type.Object({
       outputTokens: Type.Optional(Type.Number()),
       cacheReadTokens: Type.Optional(Type.Number()),
       cacheCreationTokens: Type.Optional(Type.Number()),
+      totalTokens: Type.Optional(Type.Number()),
       totalCost: Type.Optional(Type.Number()),
       turn: Type.Optional(Type.Number()),
       // Anthropic stop_reason, extracted from CCB result row. Used by the
@@ -1055,6 +1079,21 @@ export const OutboundTurnStatus = Type.Union([
 export type OutboundTurnStatus = Static<typeof OutboundTurnStatus>
 
 // ───────────────────────────────────────────────
+// OutboundTurnUsage — authoritative live token usage for one exact browser turn.
+// Progress-only: final outbound.message.meta remains the durable authority.
+// ───────────────────────────────────────────────
+export const OutboundTurnUsage = Type.Object({
+  type: Type.Literal('outbound.turn_usage'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  clientMessageId: ClientMessageId,
+  usage: TurnTokenUsageSnapshot,
+  traceId: Type.Optional(TraceIdString),
+})
+export type OutboundTurnUsage = Static<typeof OutboundTurnUsage>
+
+// ───────────────────────────────────────────────
 // SysContextRebuilt — 上下文重建提示帧(长会话热尾巴+归档,boss 硬指标 3)。
 //
 // 触发时机:引擎**无法原生续接**(切引擎 / 非原生 resume),gateway 走"最近 N
@@ -1166,6 +1205,7 @@ export const AnyFrame = Type.Union([
   OutboundError,
   OutboundCodexBilling,
   OutboundTurnStatus,
+  OutboundTurnUsage,
   PromptQueueSnapshot,
   SysContextRebuilt,
   SysIncident,

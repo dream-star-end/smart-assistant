@@ -8,6 +8,7 @@
  * MessageList：把会话消息流渲成虚拟卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
+import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Info, Sparkles } from "lucide-react";
 import {
   memo,
@@ -50,6 +51,11 @@ import { loadedArchivedMetrics } from "./chat/archivePaging";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { Alert, Avatar, Spinner } from "./ui";
+import {
+  delegateTokenUsage,
+  tokenUsageSignature,
+  tokenUsageSnapshot,
+} from "./chat/tokenUsage";
 
 type RendererProps = {
   message: ChatMessage;
@@ -69,6 +75,8 @@ type RendererProps = {
   historyGeneration?: number | string;
   /** 生命周期归 MessageList，而不是可卸载的虚拟行。 */
   processPaging?: UserUpwardPagingController;
+  /** Exact turn-level snapshot shared by every token-producing card in this turn. */
+  tokenUsage?: TurnTokenUsageSnapshot;
   /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
    *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
    *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
@@ -94,6 +102,7 @@ export const MessageRenderer = memo(
     activityInFooter,
     historyGeneration,
     processPaging,
+    tokenUsage,
     delegateCost,
     turnFinalAssistant,
     cb,
@@ -124,6 +133,7 @@ export const MessageRenderer = memo(
           activityInFooter={activityInFooter}
           historyGeneration={historyGeneration}
           processPaging={processPaging}
+          tokenUsage={tokenUsage}
           turnFinalAssistant={turnFinalAssistant}
           cb={cb}
           onRespondPermission={onRespondPermission}
@@ -142,7 +152,7 @@ export const MessageRenderer = memo(
       case "user":
         return <UserCard msg={message} cb={cb} />;
       case "assistant":
-        return <AssistantCard msg={message} ctx={ctx} cb={cb} />;
+        return <AssistantCard msg={message} ctx={ctx} cb={cb} tokenUsage={tokenUsage} />;
       case "thinking":
         // 单条兜底路径(直接经 MessageRenderer,如测试/非列表场景)。列表内的连续 thinking
         // 由 MessageList/coalesceTeam 合并成单张多段卡,不走这里。
@@ -152,6 +162,7 @@ export const MessageRenderer = memo(
               msgs={[message]}
               sig={sig}
               ctx={ctx}
+              tokenUsage={tokenUsage}
             />
           </TapeBackedCard>
         );
@@ -173,9 +184,9 @@ export const MessageRenderer = memo(
         // 既有 TodoWrite 只读紧凑卡(含步骤与完成状态),翻旧会话仍能看到当时的计划。
         if (message.toolName === "TodoWrite") {
           if (inActiveTurn && sending) return null;
-          return <ToolCardSlot message={message} />;
+          return <ToolCardSlot message={message} tokenUsage={tokenUsage} />;
         }
-        return <ToolCardSlot message={message} />;
+        return <ToolCardSlot message={message} tokenUsage={tokenUsage} />;
       }
       case "plan":
         // structured plan steps:当前活跃段且本轮进行中 → 统一进 composer 上方的
@@ -184,7 +195,7 @@ export const MessageRenderer = memo(
         if ((message.steps?.length ?? 0) > 0 && inActiveTurn && sending) return null;
         return (
           <TapeBackedCard>
-            <PlanCard msg={message} />
+            <PlanCard msg={message} tokenUsage={tokenUsage} />
             <ExactTapeRecordDisclosure messages={[message]} label="计划" />
           </TapeBackedCard>
         );
@@ -217,6 +228,7 @@ export const MessageRenderer = memo(
     // 段归属变化(新 user 消息推进边界)不体现在 sig 里,必须单独参与比较,
     // 否则上一轮的 TodoWrite/plan 卡在跨轮时不会从"抑制"切到"只读卡"。
     a.inActiveTurn === b.inActiveTurn &&
+    a.tokenUsage?.totalTokens === b.tokenUsage?.totalTokens &&
     // 债D 委派成本来自别的行(助手行 usage.delegates),不进 message sig,单列比较,
     // 否则成本在 agent-group 完成后才到达时 memo 会跳过重渲、单卡不显示「N 积分」。
     a.delegateCost === b.delegateCost &&
@@ -340,6 +352,7 @@ function DeferredTapeRecordCard({
   activityInFooter,
   historyGeneration,
   processPaging,
+  tokenUsage,
   cb,
   onRespondPermission,
   readOnly,
@@ -523,6 +536,7 @@ function DeferredTapeRecordCard({
               activityInFooter={activityInFooter}
               historyGeneration={historyGeneration}
               processPaging={processPaging}
+              tokenUsage={tokenUsage}
               turnFinalAssistant={recordIsFinalAssistant}
               cb={cb}
               onRespondPermission={onRespondPermission}
@@ -550,9 +564,23 @@ function DeferredTapeRecordCard({
  *  或"连续多个 role=thinking 行合并成的单张多段思考卡"。
  *  delegateCost / delegateCosts = 债D per-delegate 成本(见 coalesceTeam)。 */
 type RenderItem =
-  | { kind: "single"; m: ChatMessage; isLast: boolean; idx: number; delegateCost?: string }
+  | {
+      kind: "single";
+      m: ChatMessage;
+      isLast: boolean;
+      idx: number;
+      delegateCost?: string;
+      tokenUsage?: TurnTokenUsageSnapshot;
+    }
   | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> }
-  | { kind: "thinking"; members: ChatMessage[]; sig: string; isLast: boolean; idx: number };
+  | {
+      kind: "thinking";
+      members: ChatMessage[];
+      sig: string;
+      isLast: boolean;
+      idx: number;
+      tokenUsage?: TurnTokenUsageSnapshot;
+    };
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
   if (!message) return "";
@@ -593,7 +621,12 @@ function tapeRenderPageKey(message: ChatMessage | undefined): string {
  * 才能找到该轮真正的边界。面板渲染在该批次**首个** agent-group 的位置,后续同批成员被吸收;
  * 夹在成员之间的非 agent-group 行仍按各自位置渲染(可能落到面板之后,属可接受的次序取舍)。
  */
-function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean): RenderItem[] {
+function coalesceTeam(
+  messages: ChatMessage[],
+  start: number,
+  sending: boolean,
+  liveTurnUsage?: { clientMessageId: string; usage: TurnTokenUsageSnapshot },
+): RenderItem[] {
   const total = messages.length;
   const slice = messages.slice(start);
   // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1;
@@ -615,6 +648,22 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
       stage++;
     }
   }
+  // Final/history truth comes from the immutable tape's usage-bearing anchor.
+  // The active exact browser turn temporarily overrides that same stable user
+  // anchor with the live absolute snapshot.
+  const tokenUsageByAnchor = new Map<number, TurnTokenUsageSnapshot>();
+  for (let i = 0; i < total; i++) {
+    const usage = tokenUsageSnapshot(messages[i]?.usage);
+    if (usage) tokenUsageByAnchor.set(anchorOf[i], usage);
+  }
+  if (liveTurnUsage) {
+    const liveAnchor = messages.findIndex(
+      (message) => message.role === "user" && message.id === liveTurnUsage.clientMessageId,
+    );
+    if (liveAnchor >= 0) tokenUsageByAnchor.set(liveAnchor, { ...liveTurnUsage.usage });
+  }
+  const turnUsageFor = (absIdx: number): TurnTokenUsageSnapshot | undefined =>
+    tokenUsageByAnchor.get(anchorOf[absIdx]);
   // 面板成员资格:agent-group 且非隐藏审查员(审查卡恒单卡,按时序独立渲染)。
   const isPanelMember = (m: ChatMessage | undefined): boolean =>
     !!m && m._timelineRecord !== true && messageKind(m) === "agent-group" &&
@@ -663,7 +712,13 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
     // Persisted historical records are already the Agent's exact ordered
     // logical stream. Never regroup, reorder or fold one record into another.
     if (m._timelineRecord === true) {
-      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
+      items.push({
+        kind: "single",
+        m,
+        isLast: absIdx === total - 1,
+        idx: absIdx,
+        tokenUsage: turnUsageFor(absIdx),
+      });
       continue;
     }
     if (isPanelMember(m)) {
@@ -688,19 +743,33 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
           sig: members
             .map(
               (mm, k) =>
-                `${messageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}`,
+                `${messageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}|du:${tokenUsageSignature(delegateTokenUsage(mm))}`,
             )
             .join("||"),
           delegateCosts,
         });
         continue;
       }
-      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx, delegateCost: costFor(absIdx, m) });
+      items.push({
+        kind: "single",
+        m,
+        isLast: absIdx === total - 1,
+        idx: absIdx,
+        delegateCost: costFor(absIdx, m),
+        tokenUsage: turnUsageFor(absIdx),
+      });
       continue;
     }
     if (messageKind(m) === "agent-group") {
       // 面板外的 agent-group(隐藏审查员卡/独居成员):单卡按时序渲染,委派成本徽记照常。
-      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx, delegateCost: costFor(absIdx, m) });
+      items.push({
+        kind: "single",
+        m,
+        isLast: absIdx === total - 1,
+        idx: absIdx,
+        delegateCost: costFor(absIdx, m),
+        tokenUsage: turnUsageFor(absIdx),
+      });
       continue;
     }
     if (messageKind(m) === "thinking") {
@@ -730,11 +799,24 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
       // 后到成员/流式完成时 memo 正常重渲防漏渲)。key 用首条成员 id → 流式追加成员时稳定不重挂。
       const sig = members
         .map((mm, k) => messageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
-        .join("||");
-      items.push({ kind: "thinking", members, sig, isLast: groupIsLast, idx: absIdx });
+        .join("||") + `|tu:${tokenUsageSignature(turnUsageFor(absIdx))}`;
+      items.push({
+        kind: "thinking",
+        members,
+        sig,
+        isLast: groupIsLast,
+        idx: absIdx,
+        tokenUsage: turnUsageFor(absIdx),
+      });
       continue;
     }
-    items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
+    items.push({
+      kind: "single",
+      m,
+      isLast: absIdx === total - 1,
+      idx: absIdx,
+      tokenUsage: turnUsageFor(absIdx),
+    });
   }
   return items;
 }
@@ -798,6 +880,7 @@ export type MessageListArchive = {
 export function MessageList({
   messages,
   sending,
+  liveTurnUsage,
   turnActivity,
   transientNotice,
   archive,
@@ -809,6 +892,8 @@ export function MessageList({
 }: {
   messages: ChatMessage[];
   sending: boolean;
+  /** Active exact browser turn's authoritative absolute token snapshot. */
+  liveTurnUsage?: { clientMessageId: string; usage: TurnTokenUsageSnapshot };
   /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
   turnActivity?: TurnActivityInfo | null;
   /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
@@ -1003,7 +1088,7 @@ export function MessageList({
   // 每条消息是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。按全量 messages 下标对齐,
   // 单一权威在 turnSegment.ts(与 turnStart / coalesceTeam 同源的 user=轮边界判定,不另造第二套)。
   const ratingFinal = turnFinalAssistantFlags(renderableMessages);
-  const renderItems = coalesceTeam(renderableMessages, 0, sending);
+  const renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
   // One genuine timeline record is one Virtuoso item. Grouping a whole server
   // page into a tall virtual row makes prepend measurements unstable: the old
   // anchor row changes height and the viewport jumps. Virtuoso itself limits
@@ -1061,13 +1146,16 @@ export function MessageList({
               msgs={it.members}
               sig={it.sig}
               ctx={{ isLast: it.isLast, sending, activityInFooter: sending }}
+              tokenUsage={it.tokenUsage}
             />
           </TapeBackedCard>
         </MessageBoundary>
       );
     }
     const turnFinalAssistant = ratingFinal[it.idx] ?? false;
-    const rowSig = messageSignature(it.m, { isLast: it.isLast, sending, turnFinalAssistant });
+    const rowSig =
+      messageSignature(it.m, { isLast: it.isLast, sending, turnFinalAssistant }) +
+      `|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}`;
     return (
       <MessageBoundary messageId={it.m._timelineUnitKey ?? it.m.id} sig={rowSig}>
         <MessageRenderer
@@ -1080,6 +1168,7 @@ export function MessageList({
           activityInFooter={sending}
           historyGeneration={historyGeneration}
           processPaging={processPaging}
+          tokenUsage={it.tokenUsage}
           delegateCost={it.delegateCost}
           turnFinalAssistant={turnFinalAssistant}
           cb={cb}

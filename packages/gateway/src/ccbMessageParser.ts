@@ -8,6 +8,7 @@
 import { performance } from 'node:perf_hooks'
 import {
   type OutboundContentBlock,
+  type TurnTokenUsageSnapshot,
   isToolExitCode,
   isToolTerminationReason,
 } from '@openclaude/protocol'
@@ -96,6 +97,7 @@ export interface TurnResult {
   outputTokens: number
   cacheReadTokens: number
   cacheCreationTokens: number
+  totalTokens: number
   assistantText: string
   /** Main-agent thinking text accumulated this turn from thinking_delta
    *  events without semantic truncation. Empty string when the
@@ -144,6 +146,62 @@ export interface TurnResult {
   thinkingSegments: SegmentRecord[]
   /** Exact ordered engine/protocol messages observed during this turn. */
   runtimeEvents: DurableRuntimeEvent[]
+}
+
+const TOKEN_USAGE_KEYS = {
+  inputTokens: 'input_tokens',
+  outputTokens: 'output_tokens',
+  cacheReadTokens: 'cache_read_input_tokens',
+  cacheCreationTokens: 'cache_creation_input_tokens',
+} as const
+
+function safeTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined
+}
+
+function tokenUsagePatch(raw: unknown): Partial<TurnTokenUsageSnapshot> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const obj = raw as Record<string, unknown>
+  const patch: Partial<TurnTokenUsageSnapshot> = {}
+  for (const [field, key] of Object.entries(TOKEN_USAGE_KEYS) as Array<
+    [keyof typeof TOKEN_USAGE_KEYS, (typeof TOKEN_USAGE_KEYS)[keyof typeof TOKEN_USAGE_KEYS]]
+  >) {
+    const value = safeTokenCount(obj[key])
+    if (value !== undefined) patch[field] = value
+  }
+  const total = safeTokenCount(obj.total_tokens)
+  if (total !== undefined) patch.totalTokens = total
+  return Object.keys(patch).length > 0 ? patch : null
+}
+
+function mergeTokenUsage(
+  base: TurnTokenUsageSnapshot,
+  patch: Partial<TurnTokenUsageSnapshot>,
+): TurnTokenUsageSnapshot {
+  const merged = { ...base, ...patch }
+  if (patch.totalTokens === undefined) {
+    merged.totalTokens =
+      (merged.inputTokens ?? 0) +
+      (merged.outputTokens ?? 0) +
+      (merged.cacheReadTokens ?? 0) +
+      (merged.cacheCreationTokens ?? 0)
+  }
+  return merged
+}
+
+function addTokenUsage(
+  left: TurnTokenUsageSnapshot,
+  right: TurnTokenUsageSnapshot,
+): TurnTokenUsageSnapshot {
+  const out: TurnTokenUsageSnapshot = { totalTokens: left.totalTokens + right.totalTokens }
+  for (const field of Object.keys(TOKEN_USAGE_KEYS) as Array<keyof typeof TOKEN_USAGE_KEYS>) {
+    const a = left[field]
+    const b = right[field]
+    if (a !== undefined || b !== undefined) out[field] = (a ?? 0) + (b ?? 0)
+  }
+  return out
 }
 
 /** Full-authority durable tool snapshot. UI preview fields may be short, but
@@ -323,6 +381,11 @@ export class CcbMessageParser {
   /** Exact raw messages retained without projection or size/count limits. */
   public runtimeEvents: DurableRuntimeEvent[] = []
   private readonly nextDurableEventOrdinal: () => number
+  /** CCB may make several model calls in one agentic turn. Stream usage is a
+   * per-call absolute snapshot, so completed calls and the current call stay
+   * separate until the result row supplies the authoritative turn aggregate. */
+  private completedCallUsage: TurnTokenUsageSnapshot = { totalTokens: 0 }
+  private currentCallUsage: TurnTokenUsageSnapshot | null = null
 
   private onEvent: (e: SessionStreamEvent) => void
   private onToolUse?: (tool: DetectedToolUse) => void
@@ -742,6 +805,32 @@ export class CcbMessageParser {
     const ev = (msg as any).event
     if (!ev || typeof ev !== 'object') return
 
+    if (ev.type === 'message_start') {
+      this._settleCurrentCallUsage()
+      this.currentCallUsage = { totalTokens: 0 }
+      const patch = tokenUsagePatch(ev.message?.usage)
+      if (patch) {
+        this.currentCallUsage = mergeTokenUsage(this.currentCallUsage, patch)
+        this._emitLiveTokenUsage()
+      }
+      return
+    }
+    if (ev.type === 'message_delta') {
+      const patch = tokenUsagePatch(ev.usage)
+      if (patch) {
+        this.currentCallUsage = mergeTokenUsage(
+          this.currentCallUsage ?? { totalTokens: 0 },
+          patch,
+        )
+        this._emitLiveTokenUsage()
+      }
+      return
+    }
+    if (ev.type === 'message_stop') {
+      this._settleCurrentCallUsage()
+      return
+    }
+
     // Helper: only include parentToolUseId in emitted blocks when it exists.
     // Keeps main-agent blocks byte-identical to the pre-change wire format
     // (no extra field = old clients behave as before).
@@ -922,7 +1011,19 @@ export class CcbMessageParser {
       }
       return
     }
-    // message_start / message_delta / message_stop: ignore
+  }
+
+  private _settleCurrentCallUsage(): void {
+    if (!this.currentCallUsage) return
+    this.completedCallUsage = addTokenUsage(this.completedCallUsage, this.currentCallUsage)
+    this.currentCallUsage = null
+  }
+
+  private _emitLiveTokenUsage(): void {
+    if (!this.currentCallUsage) return
+    const usage = addTokenUsage(this.completedCallUsage, this.currentCallUsage)
+    if (usage.totalTokens <= 0) return
+    this.onEvent({ kind: 'usage', usage })
   }
 
   private _handleAssistant(msg: SdkMessage, parentToolUseId?: string): void {
@@ -1193,6 +1294,16 @@ export class CcbMessageParser {
 
   private _handleResult(msg: SdkMessage): void {
     const usage = (msg as any).usage ?? {}
+    const finalUsagePatch = tokenUsagePatch(usage)
+    const finalUsage = finalUsagePatch
+      ? mergeTokenUsage({ totalTokens: 0 }, finalUsagePatch)
+      : null
+    if (finalUsage && finalUsage.totalTokens > 0) {
+      // CCB result.usage is the authoritative aggregate for the complete
+      // agentic turn. It deliberately replaces any provisional multi-call
+      // accumulator instead of being added to it.
+      this.onEvent({ kind: 'usage', usage: finalUsage })
+    }
     // CCB's `total_cost_usd` is the **process-cumulative** cost from
     // `getTotalCost()` (cost-tracker.ts), not a per-turn delta. Compute the
     // per-turn cost ourselves from the cumulative. If the cumulative dropped
@@ -1251,6 +1362,12 @@ export class CcbMessageParser {
       outputTokens: usage.output_tokens ?? 0,
       cacheReadTokens: usage.cache_read_input_tokens ?? 0,
       cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+      totalTokens:
+        finalUsage?.totalTokens ??
+        ((usage.input_tokens ?? 0) +
+          (usage.output_tokens ?? 0) +
+          (usage.cache_read_input_tokens ?? 0) +
+          (usage.cache_creation_input_tokens ?? 0)),
       assistantText: this.assistantBuf,
       thinkingText: this.thinkingBuf,
       isError,
@@ -1277,6 +1394,7 @@ export class CcbMessageParser {
         outputTokens: usage.output_tokens,
         cacheReadTokens: usage.cache_read_input_tokens,
         cacheCreationTokens: usage.cache_creation_input_tokens,
+        ...(finalUsage ? { totalTokens: finalUsage.totalTokens } : {}),
         totalCost: this._sessionTotals.totalCostUSD,
         turn: this._sessionTotals.turns,
         ...(stopReason !== null ? { stopReason } : {}),

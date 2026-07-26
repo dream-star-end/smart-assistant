@@ -176,6 +176,7 @@ export interface V3MasterSinkWirePayload {
     outputTokens?: number
     cacheReadTokens?: number
     cacheCreationTokens?: number
+    totalTokens?: number
     model?: string
     turn?: number
     /** Master-owned per-turn canonical traceId (generated at inbound.message
