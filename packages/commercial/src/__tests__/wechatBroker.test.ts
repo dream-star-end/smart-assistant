@@ -331,12 +331,22 @@ async function flushMicrotasks(rounds = 3): Promise<void> {
 // ─── 1. lifecycle ──────────────────────────────────────────────────────────
 
 describe("wechatBroker — lifecycle", () => {
-  test("start() 启动后 stop() 能干净停下来,不抛", async () => {
-    const broker = makeWechatBroker(makeDeps())
+  test("start() 启动后 stop() 能干净停下来:停后不再有 reconcile tick", async () => {
+    // 原来只有 `assert.ok(true) // 走到这里没抛即可` —— 用例名说"干净停下来",
+    // 断言却只覆盖"不抛"。stop() 漏清 timer(会话泄漏/停不掉的经典形态)照样绿。
+    // 现在用 allMasterWsessRows spy 锁真语义:stop() 之后 tick 计数必须冻结。
+    const allRows = makeAllMasterWsessRows([])
+    const broker = makeWechatBroker(
+      makeDeps({ allMasterWsessRows: allRows.fn, reconcileIntervalMs: 5 }),
+    )
     broker.start()
+    await new Promise((r) => setTimeout(r, 40))
+    const ticksWhileRunning = allRows.spy.calls
+    assert.ok(ticksWhileRunning > 0, "启动后 reconcile 必须真的跑起来(否则本用例空过)")
     await broker.stop()
-    // 走到这里没抛即可。
-    assert.ok(true)
+    const ticksAtStop = allRows.spy.calls
+    await new Promise((r) => setTimeout(r, 40))
+    assert.equal(allRows.spy.calls, ticksAtStop, "stop() 之后不得再有 reconcile tick")
   })
 
   test("start() 是幂等的:连续 start 两次不会双开 timer", async () => {
@@ -433,18 +443,29 @@ describe("wechatBroker — lifecycle", () => {
     assert.equal(allRows.spy.calls, 0)
   })
 
-  test("stop() 不抛即使 start() 未被调用过", async () => {
+  test("冒烟:stop() 在从未 start() 的 broker 上不抛", async () => {
+    // 纯 "不抛" 契约,没有可观测副作用可断言 —— 用例名如实标成冒烟,
+    // 不再用 assert.ok(true) 装成"有覆盖"。
     const broker = makeWechatBroker(makeDeps())
-    await broker.stop()
-    assert.ok(true)
+    await assert.doesNotReject(() => broker.stop())
   })
 
-  test("stop() 多次连续调用也不抛(幂等)", async () => {
-    const broker = makeWechatBroker(makeDeps())
+  test("stop() 幂等:重复 stop 不抛,且不会把已停的 broker 重新拉起", async () => {
+    const allRows = makeAllMasterWsessRows([])
+    const broker = makeWechatBroker(
+      makeDeps({ allMasterWsessRows: allRows.fn, reconcileIntervalMs: 5 }),
+    )
     broker.start()
+    await new Promise((r) => setTimeout(r, 30))
     await broker.stop()
-    await broker.stop()
-    assert.ok(true)
+    await assert.doesNotReject(() => broker.stop())
+    const ticksAfterSecondStop = allRows.spy.calls
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(
+      allRows.spy.calls,
+      ticksAfterSecondStop,
+      "第二次 stop() 不得意外触发重启路径(stoppingPromise/restartRequested 双 flag)",
+    )
   })
 
   test("start/stop race:start() 在 stop() inFlight 期间调入 → await stop 完成后 broker 已重启", async () => {
@@ -1795,12 +1816,25 @@ describe("wechatBroker — housekeeping", () => {
   })
 
   test("runHousekeeping 抛 → broker 不崩,后续 tick 仍可继续", async () => {
-    // pool 在 housekeeping 第一条 SQL(releaseStaleSending UPDATE)就抛
+    // 2026-07-26:本用例原来只有 `assert.ok(true) // 没崩即过` —— 用例名承诺的两件事
+    // (① 注入的失败真被触发 ② 失败后 housekeeping 循环没死)一件都没验。只要
+    // scheduleHousekeeping 的 finally 重排被删掉,或注入的 SQL 匹配漂了(空过),
+    // 它照样绿。下面把两件事都变成硬断言。
+    //
+    // 注入点精确到 housekeeping 的第一条 SQL:releaseStaleSending 的
+    // `UPDATE wechat_outbox SET status='queued'`(outboxStore.ts)。不匹配泛的
+    // `UPDATE wechat_outbox` —— 那会把 outboxWorker.pickOne 的 status='sending'
+    // 也算进来,谁先谁后不确定。
+    const HOUSEKEEPING_SQL = /UPDATE wechat_outbox SET[\s\S]+status\s*=\s*'queued'/i
     let firstHouseError = true
+    let housekeepingAttempts = 0
     const respond = (sql: string): { rows: Record<string, unknown>[]; rowCount: number | null } => {
-      if (firstHouseError && /UPDATE wechat_outbox/i.test(sql)) {
-        firstHouseError = false
-        throw new Error("simulated pool failure")
+      if (HOUSEKEEPING_SQL.test(sql)) {
+        housekeepingAttempts += 1
+        if (firstHouseError) {
+          firstHouseError = false
+          throw new Error("simulated pool failure")
+        }
       }
       if (/SELECT current_session_id FROM wechat_session_pointer/i.test(sql)) {
         return { rows: [], rowCount: 0 }
@@ -1818,13 +1852,22 @@ describe("wechatBroker — housekeeping", () => {
     const broker = makeWechatBroker(
       makeDeps({
         pool,
-        housekeepingIntervalMs: 60_000,
+        // 小间隔:才能在本用例窗口内观察到"下一 tick"确实排上了。
+        housekeepingIntervalMs: 5,
         reconcileIntervalMs: 60_000,
       }),
     )
     broker.start()
-    await new Promise((r) => setTimeout(r, 20))
+    await new Promise((r) => setTimeout(r, 80))
     await broker.stop()
-    assert.ok(true) // 没崩即过
+    assert.equal(
+      firstHouseError,
+      false,
+      "注入的 housekeeping 失败必须真被触发,否则本用例是空过",
+    )
+    assert.ok(
+      housekeepingAttempts >= 2,
+      `第一次 tick 抛之后 housekeeping 必须继续排下一轮,实际只跑了 ${housekeepingAttempts} 次`,
+    )
   })
 })
