@@ -1021,16 +1021,17 @@ await check("T24 mermaid 有效语法真出 SVG、半截语法回退可读源码
   }
   if (brokenState.svgs !== 0) throw new Error("无效 mermaid 仍渲染了图(应只回退源码)");
 
-  // ③ mermaid 对坏输入调 render 会把 "Syntax error" 图注入 <body> 顶层并残留;
-  //    生产代码靠 parse 先挡,这里守住它不被改回去(用户会看到一个飘在页面上的红叉图)。
-  const strays = await page.evaluate(() => {
-    const roots = Array.from(document.querySelectorAll("body > svg, body > div[id^='dmermaid']"));
-    return roots.map((el) => el.id || el.tagName.toLowerCase());
-  });
-  const DIAG = await page.evaluate(() => Array.from(document.body.children).map((el) => `${el.tagName.toLowerCase()}#${el.id}.${String(el.className).slice(0,40)}`));
-  throw new Error("DIAGNOSTIC body children: " + JSON.stringify(DIAG));
+  // ③ 富块不许往 <body> 顶层塞节点。mermaid 对坏输入调 render 会把 "Syntax error"
+  //    图挂到 body 上并残留(用户看到一个飘在页面上的红叉图),生产代码靠先 parse 挡住。
+  //    这里不认 mermaid 的内部命名(实现细节,换版本就漂),只认"body 顶层多出了不属于
+  //    harness 挂载点的东西"—— 实测:摘掉 parse 守卫,这里就多出一个 div#dmmdrj。
+  const strays = await page.evaluate(() =>
+    Array.from(document.body.children)
+      .filter((el) => el.tagName !== "SCRIPT" && el.id !== "root" && !el.id.endsWith("-root"))
+      .map((el) => `${el.tagName.toLowerCase()}#${el.id || "(no-id)"}`),
+  );
   if (strays.length > 0) {
-    throw new Error(`mermaid 把错误图注入了 <body> 顶层: ${JSON.stringify(strays)}`);
+    throw new Error(`markdown 富块把节点注入了 <body> 顶层: ${JSON.stringify(strays)}`);
   }
 });
 

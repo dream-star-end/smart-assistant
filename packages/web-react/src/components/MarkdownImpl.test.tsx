@@ -84,8 +84,9 @@ test('GFM 长表格使用可聚焦滚动区，且同段代码块与公式保持�
 
 // ── 代码高亮 ────────────────────────────────────────────────────────
 // 助手回复 99% 经 markdown,但高亮此前零断言(全仓 grep hljs 零命中):高亮塌成纯文本
-// 是用户直接看得见的回归。mermaid 刻意不在 jsdom 断言 —— 它要真 SVG 布局,jsdom 下只能
-// 等一个多兆动态 import 的 parse,在负载机上必然抖;那条覆盖属于真浏览器套件(见 followups)。
+// 是用户直接看得见的回归。mermaid 刻意不在 jsdom 断言 —— "图出来了"要真 SVG 布局才量得到,
+// jsdom 里只能等一个多兆动态 import 的 parse,在负载机上必然抖。那条覆盖在真浏览器套件:
+// browser-tests 的 T24(有效语法出带节点文案的 SVG / 半截语法回退源码 / 不注错误图进 body)。
 describe('MarkdownImpl 代码高亮', () => {
   test('围栏代码块真的产出 highlight.js token 元素，而不是塌成纯文本', () => {
     const source = ['```ts', 'const answer: number = 42', '```'].join('\n')
