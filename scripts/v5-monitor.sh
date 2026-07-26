@@ -5,7 +5,7 @@
 #   每 2 分钟(openclaude-v5-monitor.timer)跑一轮检查:
 #     1. systemd:deploy_state 派生的 serving A/B master / openclaude-v5-egress 必须 active
 #     2. HTTP 探活:全部 serving lane healthz("ok":true + channel=v5)、egress("role":"egress")、
-#        公网 Caddy route；v3 已退役，只有 V5MON_CHECK_V3=1 才探测
+#        公网 Caddy route（v3 已于 2026-07-08 彻底下线，不再有任何 v3 探测项）
 #     3. 磁盘 / 与 /var 使用率 >85% 告警;内存 available <10% 告警
 #     4. 容器池:运行中的 v5-ccb 必须全部带 managed/channel/uid 身份标签；容量由
 #        上面的磁盘与 MemAvailable 检查负责。OC_RUNTIME_IMAGE 指向的镜像必须存在于
@@ -26,7 +26,7 @@
 #   bash scripts/v5-monitor.sh --dry-run    # 只打印,不写状态、不发站内信
 #   bash scripts/v5-monitor.sh --migrate-obsolete-pool-state
 #                                             # 官方安装器专用:仅迁移已确认废弃的 pool 误报状态
-#   V5MON_SKIP=http_v3,pool bash ...        # 静默指定检查项(逗号分隔,见文档)
+#   V5MON_SKIP=pool,image bash ...          # 静默指定检查项(逗号分隔,见文档)
 #
 # ── 自愈检测桥(bash⇄TS 契约,两侧改动必须同步)────────────────────
 #   每轮 check 结束后额外把每项检查投影成 alert condition(检测状态单一权威):
@@ -68,7 +68,6 @@ BACKUP_DIR="${V5MON_BACKUP_DIR:-/var/backups/openclaude-v5}"
 V5_HEALTH_URL="${V5MON_V5_URL:-http://127.0.0.1:18790/healthz}"
 V5_B_HEALTH_URL="${V5MON_V5_B_URL:-http://127.0.0.1:18795/healthz}"
 EGRESS_HEALTH_URL="${V5MON_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
-V3_HEALTH_URL="${V5MON_V3_URL:-http://127.0.0.1:18789/healthz}"
 PUBLIC_HEALTH_URL="${V5MON_PUBLIC_URL:-http://127.0.0.1/healthz}"
 MAINTENANCE_FILE="${V5MON_MAINTENANCE_FILE:-/run/openclaude-v5/planned-maintenance.json}"
 MAINTENANCE_LOCK="${V5MON_MAINTENANCE_LOCK:-/run/openclaude-v5/planned-maintenance.lock}"
@@ -511,7 +510,8 @@ check_severity() {
   case "$1" in
     # backup_fresh = critical:kl-hk 异地容灾 2026-07-26 退役后,本地每日备份是唯一数据
     # 保护面,它停摆 = 数据零保护(且和 mail 一样属于"静默数天才被发现"的历史故障形态)。
-    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures|backup_fresh) echo critical ;;
+    # http_v3 已随 v3 通道彻底下线(2026-07-08)从名单摘除,不再占 critical 位。
+    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|public_route|pool|image|mail|turn_failures|backup_fresh) echo critical ;;
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化;
     # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警。均按 warning。
     disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe) echo warning ;;
@@ -539,9 +539,6 @@ check_serving_masters
 check_service svc_egress openclaude-v5-egress
 check_http http_egress "$EGRESS_HEALTH_URL" '.ok == true and .role == "egress"'  "egress health"
 check_public_route
-if [[ "${V5MON_CHECK_V3:-0}" == 1 ]]; then
-  check_http http_v3 "$V3_HEALTH_URL" '.ok == true' "v3 healthz(显式启用)"
-fi
 check_disk disk_root /
 check_disk disk_var  /var
 check_mem

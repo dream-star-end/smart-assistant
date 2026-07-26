@@ -55,7 +55,6 @@ monitor oneshot 与 alert-fail 后才切换；失败会恢复原 unit、指针�
 | `http_candidate_v5` | candidate 真实 serving 时独立 GET 其 healthz | 同上；不 serving 时记 `ok/not-serving` | 双 lane 独立故障边，候选坏不会被 active 正常掩盖；不会误命中 `http_v5` 的全站自动修复 policy |
 | `http_egress` | `GET 172.31.0.1:18892/internal/v5/egress-health` | 非 `"ok":true` + `role:"egress"` | 容器出站面探活(容器网段视角) |
 | `public_route` | `Host: claudeai.chat GET 127.0.0.1/healthz` | 非 `"ok":true` + `channel:"v5"` | 覆盖 Caddy→v5 的真实公网路由，能直接发现 Cloudflare 502 的源头 |
-| `http_v3` | `GET 127.0.0.1:18789/healthz` | 非 `"ok":true` | v3 已退役，默认不运行；仅显式 `V5MON_CHECK_V3=1` 时保留兼容检查 |
 | `disk_root` / `disk_var` | `df /` 与 `df /var` 使用率 | >85% | PG/docker/日志都在盘上;85% 留出扩容反应时间(线上当前 73%) |
 | `mem` | MemAvailable/MemTotal | <10% | OOM 前兆;容器池机器内存吃紧会连环 OOM kill |
 | `failed_units` | `systemctl list-units --state=failed` | 有任何 failed 单元 | **整类根治**:单元级 `OnFailure=` 只能救已配的那几个,新单元照样漏。2026-07-26 实测:DR 两个单元连败 43 小时无人知晓,根因就是 `OnFailure=` 为空。有了本项,新单元零配置自动纳入监控 |

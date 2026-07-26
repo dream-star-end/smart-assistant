@@ -32,7 +32,12 @@ const WORKFLOW_PATH = ".github/workflows/v5-ci.yml";
 const DOC_PATH = "docs/V5_CI.md";
 
 export interface ParityProblem {
-  kind: "npm-script-drift" | "workspace-run-in-ci" | "unexpanded-matrix" | "doc-job-drift";
+  kind:
+    | "npm-script-drift"
+    | "workspace-run-in-ci"
+    | "unexpanded-matrix"
+    | "doc-job-drift"
+    | "artifact-contract";
   message: string;
 }
 
@@ -132,12 +137,78 @@ function sorted(s: Iterable<string>): string[] {
   return [...new Set(s)].sort();
 }
 
+/**
+ * upload-artifact 的 fail-closed 契约。
+ *
+ * 从 packages/commercial/src/__tests__/v5CiWorkflow.test.ts 迁过来(2026-07-26):
+ * 那个测试用正则匹配 YAML 的**缩进列数**(`^ {10}path: …`),把 6 空格改成 4 空格
+ * 就红 —— 典型的"重构必红、价值不高"。同一条不变量在这里按解析后的 YAML 结构断言,
+ * 与排版无关。
+ *
+ * 保住的事实:
+ *   ① 每个 upload-artifact 步骤都必须 `if-no-files-found: error` —— 否则产物丢了
+ *      job 照样绿,门只剩套件名、没有断言详情可查(commercial-unit 尤其致命);
+ *   ② commercial-unit 的 TAP 写入路径与上传路径必须是**同一个** env 变量,
+ *      不能一边写 a.tap 一边传 b.tap。
+ */
+export function checkArtifactContract(yamlText: string): ParityProblem[] {
+  const doc = parseYaml(yamlText) as { jobs?: Record<string, any> };
+  const problems: ParityProblem[] = [];
+  let uploadSteps = 0;
+  for (const [jobKey, job] of Object.entries(doc.jobs ?? {})) {
+    const steps: any[] = Array.isArray(job?.steps) ? job.steps : [];
+    for (const step of steps) {
+      const uses = typeof step?.uses === "string" ? step.uses : "";
+      if (!uses.startsWith("actions/upload-artifact")) continue;
+      uploadSteps += 1;
+      const withBlock = step?.with ?? {};
+      if (String(withBlock["if-no-files-found"] ?? "") !== "error") {
+        problems.push({
+          kind: "artifact-contract",
+          message:
+            `job ${jobKey} 的 upload-artifact 步骤缺 \`if-no-files-found: error\` —— ` +
+            `产物丢失必须让 job 红,否则门只报套件名、丢掉真实断言详情。`,
+        });
+      }
+    }
+  }
+  if (uploadSteps === 0) {
+    problems.push({
+      kind: "artifact-contract",
+      message:
+        "workflow 里一个 upload-artifact 步骤都没有 —— commercial-unit 的 TAP 产物是" +
+        "门禁的唯一取证材料,不能删。",
+    });
+  }
+
+  // commercial-unit:TAP_OUT 与上传 path 必须引用同一个 env 变量。
+  const cu = (doc.jobs ?? {})["commercial-unit"];
+  if (cu) {
+    const steps: any[] = Array.isArray(cu.steps) ? cu.steps : [];
+    const runner = steps.find((s) => typeof s?.run === "string" && s.run.includes("test:commercial:unit:gate"));
+    const uploader = steps.find((s) => typeof s?.uses === "string" && s.uses.startsWith("actions/upload-artifact"));
+    const tapOut = String(runner?.env?.TAP_OUT ?? "");
+    const uploadPath = String(uploader?.with?.path ?? "");
+    if (tapOut === "" || uploadPath === "" || tapOut !== uploadPath) {
+      problems.push({
+        kind: "artifact-contract",
+        message:
+          `commercial-unit 的 TAP 写入路径与上传路径必须同源,实测 ` +
+          `TAP_OUT=${tapOut || "<missing>"} vs upload path=${uploadPath || "<missing>"}。` +
+          `两者都应引用同一个 job env(当前是 COMMERCIAL_UNIT_TAP)。`,
+      });
+    }
+  }
+  return problems;
+}
+
 export function checkParity(opts: {
   workflowYaml: string;
   packageJson: string;
   docMarkdown: string;
 }): ParityProblem[] {
   const { jobs, problems } = readWorkflowJobs(opts.workflowYaml);
+  problems.push(...checkArtifactContract(opts.workflowYaml));
   const ciScripts = new Set<string>();
   for (const job of jobs) {
     for (const run of job.runs) {

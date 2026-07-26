@@ -7,11 +7,16 @@
  *
  * ── bash ⇄ TS 契约(跨语言同源,改一侧必同步另一侧)─────────────────────
  *   scripts/v5-monitor.sh 每轮对 serving-lane + 宿主检查直接 `SELECT write_alert_condition(...)`,
- *   其 condition key 派生规则 = `ops.monitor:<check_name>`(check_name ∈ svc_v5/svc_egress/
- *   svc_candidate_v5/http_v5/http_candidate_v5/http_egress/public_route/disk_root/disk_var/
- *   mem/pool/image/mail[,http_v3])。
- *   本文件的 OPS_MONITOR_PREFIX / opsMonitorKey 是该规则的 TS 侧权威;monitor.sh 文件头
- *   有对应登记。policy seed(0133/0135)的 `ops.monitor:*` prefix 行依赖此规则。
+ *   其 condition key 派生规则 = `ops.monitor:<check_name>`。
+ *   本文件的 OPS_MONITOR_PREFIX / opsMonitorKey / OPS_MONITOR_CHECKS 是该规则的 TS 侧权威;
+ *   monitor.sh 文件头有对应登记。policy seed(0133/0135)的 `ops.monitor:*` prefix 行依赖此规则。
+ *
+ *   2026-07-26:此前 check 名单只写在**注释**里,于是它悄悄漂了 4 个
+ *   (turn_failures / kp_plugin / client_4xx_storm / deploy_state 在 TS 侧从未登记),
+ *   而 http_v3 在 v3 于 2026-07-08 下线后仍留在两侧。注释不是契约 —— 现在名单是
+ *   导出常量 OPS_MONITOR_CHECKS,并由
+ *   packages/commercial/src/__tests__/opsMonitorConditionContract.test.ts
+ *   直接解析 v5-monitor.sh 的 check_severity 分支做集合相等断言,漂一个就红。
  *
  * ── key 域一览(与 incident_policies seed 对齐)───────────────────────────
  *   ops.monitor:<check>                — shell 探测(probe;0133+0135 seed prefix)
@@ -28,6 +33,34 @@ export const OPS_MONITOR_PREFIX = "ops.monitor:";
 export function opsMonitorKey(check: string): string {
   return `${OPS_MONITOR_PREFIX}${check}`;
 }
+
+/**
+ * v5-monitor.sh 的检查项全集(bash 侧权威 = 该脚本 check_severity 的 case 分支)。
+ *
+ * 加/删一个检查项 = 改 monitor.sh 的 check_severity + 改这里,两处同步;
+ * opsMonitorConditionContract 测试会做集合相等断言,漏改一侧当场红。
+ * 这个名单同时告诉自愈侧"哪些 ops.monitor:* key 是合法的",避免 policy seed
+ * 写了一个永远不会被点亮的 key(providerHealthScheduler 就踩过同类坑)。
+ */
+export const OPS_MONITOR_CHECKS: readonly string[] = [
+  "client_4xx_storm",
+  "deploy_state",
+  "disk_root",
+  "disk_var",
+  "http_candidate_v5",
+  "http_egress",
+  "http_v5",
+  "image",
+  "kp_plugin",
+  "mail",
+  "mem",
+  "pool",
+  "public_route",
+  "svc_candidate_v5",
+  "svc_egress",
+  "svc_v5",
+  "turn_failures",
+];
 
 /** provider 降级 key 前缀(0135 seed:`health.provider_degraded:` prefix policy)。 */
 export const PROVIDER_DEGRADED_PREFIX = "health.provider_degraded:";

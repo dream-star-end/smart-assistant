@@ -251,8 +251,10 @@ export function lintFileDetailed(relPath: string, source: string): LintFileResul
       scanFrom = span.startLine;
       scanTo = span.endLine + 1;
     } else if (span !== null) {
-      // 多腿语句:逐处 ±窗口,裁剪到语句范围内 —— 一条腿的 state 不替另一条腿背书。
-      scanFrom = Math.max(span.startLine, idx - (STATE_WINDOW_LINES - 1));
+      // 多腿语句(多 CTE / UNION):退回原来的**向下** N 行窗口,裁剪到语句范围内。
+      // 一条腿的 state 不替另一条腿背书。这里刻意不往上看:CTE 腿里 WHERE 一定在
+      // FROM 之后,往上看就会读到**上一条腿**的谓词,正是要避免的那种背书。
+      scanFrom = idx;
       scanTo = Math.min(span.endLine + 1, idx + STATE_WINDOW_LINES);
     } else {
       // 不在字面量里(注释 / 拼接片段):沿用原「本行 + 后 N-1 行」窗口。

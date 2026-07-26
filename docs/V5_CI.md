@@ -31,7 +31,14 @@ check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集
 
 注意:`check:v5` 是 v5 的质量门,**不含** biome lint(`npm run lint`,当前 3657 error
 存量,见「已知风险」)/ integ 测试 / `test:web` / `lint:undefined-refs`(后两者只服务
-个人版 `packages/web`,v5 运行时一行都不加载);v3 / 个人版的全量门仍是 `npm run check`。
+`packages/web`);v3 / 个人版的全量门仍是 `npm run check`。
+
+`packages/web` 的作用面**不是"v5 完全不加载"那么简单**,见
+`packages/web/README.md`:v5 master 注入 `OC_RUNTIME_CHANNEL=v5` → web root =
+`packages/web-react/dist`,本包确实不加载;但 master **有意不**向用户容器注入该 env
+(v3supervisor 明确注释:它会改变 in-container CLI 的 web-root 语义),所以容器里
+CLI 落到默认 `v3` 分支、`packages/web/public` 就是容器的 web root。
+因此本轮只把它移出 v5 门禁范围,**没有**把它加进任何生产分发排除清单。
 
 ### CI parity 门(`scripts/check-ci-parity.ts`)
 
@@ -83,9 +90,12 @@ commercial-unit TAP artifact:`1..1067` / `# tests 4696 / # pass 4590 / # fail 61
 | F | stale 条目(基线里本轮没失败的)→ CI 里红 | 基线单调递减,不给未来的真回归预留豁免 |
 | G | runner 非零退出时,只有 A–F 全过才放行;若 TAP 显示零失败零取消却非零退出 → 红 | 非零退出不会被"没有新失败"顺手洗白 |
 
-严格档:`CI=true` 时默认开(判据 C、F 是红)。本地默认宽松档(C、F 降为 warning),
-因为基线是**按 CI 环境校准**的 —— docker mock / fixture 差异会让本地失败集与 CI 不同。
-本地想跑严格档:`KNOWN_FAILURES_STRICT=1`。A / B / D / E / G 两档下都是硬红。
+严格档:`CI=true` 时默认开(判据 **B、C、F** 是红)。本地默认宽松档(这三条降为
+warning),因为它们都依赖"判绿环境 = CI"这个前提:CI 以 root + PG + Redis 跑,
+commercial unit 里 16 个文件的 `{ skip: !IS_ROOT … }` 环境门在那里全部命中真跑
+(实测 `# skipped 0`),而开发机非 root 必然 skip 几条;基线失败集同样按 CI 的
+docker mock 行为校准。本地想跑严格档:`KNOWN_FAILURES_STRICT=1`。
+A / D / E / G 两档下都是硬红 —— 截断就是截断,新失败就是新失败,禁豁免就是禁豁免。
 
 门自身的红绿对照锁在 `scripts/__tests__/knownFailuresGate.test.ts`(随 `test:v5:ops`
 在 CI 跑):每条判据都有"该拦的输入确实 exit 1"和"修好后 exit 0"两侧用例。

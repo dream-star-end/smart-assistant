@@ -19,8 +19,9 @@
 #   A. TAP 完整性 —— 必须有顶层 plan 行 `1..N`,且 N == 实际顶层测试点数;
 #      必须有 `# tests / # pass / # fail / # cancelled / # skipped` 汇总行。
 #      这一条堵死洞 ②:kill/OOM 的 TAP 尾部一定缺 plan 或缺汇总行。
-#   B. `# skipped` 必须为 0 —— fixture 没起来时整套会静默 skip,
+#   B. `# skipped` 必须为 0 —— fixture 没起来时整套会静默 skip 且 node 退 0,
 #      "全 skip 也算绿"是最典型的假绿。当前 CI 实测 skipped=0,现在就钉死。
+#      (与 C/F 同为严格档判据:CI 硬红,本地 warning —— 见下方严格档说明。)
 #   C. `# fail` / `# cancelled` 不得超过 counts 基线(见 <baseline>.counts)。
 #      这一条把灵敏度从 19 个顶层名提到 4696 个测试点,且不用改基线粒度。
 #      低于基线 → warning 提示收紧。
@@ -34,10 +35,12 @@
 #      且 plan 完整且计数未超基线"。另外补一条:exit != 0 但 TAP 显示零失败零取消
 #      → 非测试失败(退出钩子 / force-exit / 段错误),红。
 #
-# 严格档开关:CI=true 时默认严格(stale = 红,计数超标 = 红)。
+# 严格档开关:CI=true 时默认严格(skipped / 计数超标 / stale 都是红)。
 #   本地想跑严格档:KNOWN_FAILURES_STRICT=1。
-#   本地默认宽松档:stale 与计数只 warning;A/B/D/E/G 在两档下都是硬红
-#   —— 那几条与环境无关(截断就是截断,全 skip 就是全 skip)。
+#   本地默认宽松档:B / C / F 降为 warning —— 这三条都依赖"判绿环境 = CI"这个前提
+#   (root 权限、PG/Redis fixture、docker mock 行为),开发机上必然与 CI 不同。
+#   A / D / E / G 在两档下都是硬红 —— 那几条与环境无关:截断就是截断,
+#   新失败就是新失败,核心契约禁豁免就是禁豁免。
 #
 # 提取规则(与清单生成命令保持一字不差,见 docs/V5_CI.md):
 #   grep '^not ok' | sed 's/^not ok [0-9]* - //' | sort -u
@@ -152,8 +155,12 @@ for key in tests pass fail cancelled skipped; do
 done
 
 # ── B. skipped 必须为 0 ──────────────────────────────────────────────────────
+# 严格档(CI)硬红。本地降为 warning:commercial unit 里有 16 个文件用
+# `{ skip: !IS_ROOT ? '…' : false }` 之类的环境门,CI 以 root + PG + Redis 跑
+# 时全部命中真跑(实测 # skipped 0),普通开发机非 root 必然 skip 几条。
+# 判绿的权威环境是 CI,那里一个 skip 都不许有。
 if [[ -n "$sum_skipped" && "$sum_skipped" -ne 0 ]]; then
-  note_fail "TAP 报告 # skipped $sum_skipped —— v5 门禁不接受任何 skip(fixture 没起来时整套会静默 skip,那是最典型的假绿)。把 skip 改成硬失败,或把用例真正跑起来。"
+  note_strict "TAP 报告 # skipped $sum_skipped —— 判绿环境(CI)不接受任何 skip:fixture 没起来时整套会静默 skip 且 node 还退 0,那是最典型的假绿。把 skip 改成硬失败,或把 fixture 真正起起来。"
 fi
 
 # ── C. 计数基线 ──────────────────────────────────────────────────────────────
