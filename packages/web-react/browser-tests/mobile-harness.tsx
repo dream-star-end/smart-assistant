@@ -13,6 +13,11 @@
 //      看不见,而"看不见"在 jsdom 与单组件用例里都测不出来;
 //   ③ 发送区可用:「+」菜单能弹、发送按钮能点、文本原样送出。
 //
+// 覆盖边界(别高估这道门):被守的是**组件 + production CSS**在 390px 下的表现
+// (ChatHeader / Composer / MessageList / 各类卡片 / markdown)。App.tsx 那层外壳
+// 类名在这里是复刻的三行 flex 结构 —— 它自己漂了本用例不会红。真要连外壳一起守,
+// 得让 App 把聊天页外壳抽成可挂载组件,那是另一档改动(见交付说明的 followups)。
+//
 // stub 原则同主 harness:只 stub 网络/宿主副作用,不 stub 任何 UI 结构。
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
