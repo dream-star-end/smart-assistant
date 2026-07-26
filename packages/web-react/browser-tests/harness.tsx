@@ -244,7 +244,10 @@ const activeAskQuestion: ChatMessage = {
   id: "active-ask-question",
   role: "permission",
   text: "AskUserQuestion",
-  ts: 5,
+  // 待审批 permission 卡的自动弹框有存活上界(PermissionCard 的 PENDING_PERMISSION_TTL_MS:
+  // 超过服务端 TTL 的未决卡按孤儿处理、不再自动弹),故这里必须给新鲜时间戳,
+  // 否则测的就不是「活动 turn 中的待答问答」这个真实场景。
+  ts: Date.now(),
   toolName: "AskUserQuestion",
   requestId: "ask-active-r1",
   inputJson: {
