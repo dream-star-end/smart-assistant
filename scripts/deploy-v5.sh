@@ -211,7 +211,7 @@ assert_overrides_no_remove_keys() {
   [ "$bad" = 0 ] || exit 1
 }
 
-DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0
+DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0
 DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
@@ -270,6 +270,7 @@ for arg in "$@"; do
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
     # 陈旧 production-mutation lease 回收(C1):只读探测 + 条件清理,不抢任何本地/全局锁。
+    --allow-unverified-ci) ALLOW_UNVERIFIED_CI=1 ;;
     --reclaim-mutation-lease) MODE="reclaim-mutation-lease" ;;
     # 模型权威(方案 §7 步 4/5)。preflight 是四面活体门,cutover 是不可逆地板。
     --model-authority-preflight) MODE="model-authority-preflight" ;;
@@ -1071,15 +1072,18 @@ begin_planned_maintenance() { # <deploy|dist|rollback> <include-egress:0|1>
     return 0
   fi
 
-  if ! result="$(ssh "$KL_HOST" bash -s -- \
+  local bpm_rc=0
+  result="$(ssh "$KL_HOST" bash -s -- \
       "$MAINTENANCE_MARKER" "$MAINTENANCE_LOCK" "$maintenance_mode" \
-      "$target_commit" "$nonce" "$include_egress" "${ACTIVE_UNIT:-$V5_UNIT}" "${ACTIVE_PORT:-$V5_PORT}" "$CUTOVER_ROOT" "$CADDY_HTTP_PORT" <<'REMOTE'
+      "$target_commit" "$nonce" "$include_egress" "${ACTIVE_UNIT:-$V5_UNIT}" "${ACTIVE_PORT:-$V5_PORT}" "$CUTOVER_ROOT" "$CADDY_HTTP_PORT" \
+      "$([[ "${OC_DEPLOY_ONTO_UNHEALTHY:-0}" == 1 ]] && echo 1 || echo 0)" <<'REMOTE'
 set -Eeuo pipefail
 marker="$1"; lock="$2"; mode="$3"; target_commit="$4"; nonce="$5"; include_egress="$6"
-v5_unit="$7"; v5_port="$8"; cutover_root="$9"; caddy_http_port="${10}"; ttl=180
+v5_unit="$7"; v5_port="$8"; cutover_root="$9"; caddy_http_port="${10}"; onto_unhealthy="${11}"; ttl=180
 [[ "$mode" =~ ^(deploy|dist|rollback)$ && "$target_commit" =~ ^[0-9a-f]{40}$ &&
    "$nonce" =~ ^[0-9a-f]{32}$ && "$include_egress" =~ ^[01]$ ]] || exit 2
 [[ "$caddy_http_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( caddy_http_port <= 65535 )) || exit 2
+[[ "$onto_unhealthy" =~ ^[01]$ ]] || exit 2
 mkdir -p -m 700 "$(dirname "$marker")"
 touch "$lock"; chmod 600 "$lock"
 exec 9>"$lock"; flock -x 9
@@ -1150,6 +1154,22 @@ if [[ -f "$marker" ]]; then
     exit 0
   fi
 fi
+# 2026-07-26(审计 11)fail-closed 收紧。原语义:「没有任何健康检查通过 → SKIPPED,部署继续」。
+# 注意 healthy 里 turn_failures 是**无条件**加入的,所以 `#healthy == 0` 其实永远不成立 ——
+# 真正的洞是:svc_v5/http_v5 全挂时 healthy=(turn_failures),marker 照样 SET、部署照样往下叠。
+# 「服务当前就是全挂的」是最不该盲目叠加新 release 的时刻:一旦叠上去,回退目标的健康性也
+# 失去了基线,事后分不清是旧版本挂的还是新版本挂的。
+# 判据:被替换的那一面(svc_v5 + http_v5)必须此刻健康,否则拒绝。
+# 【绝不挡住恢复路径】① mode=rollback 永远放行 —— 在坏服务上回退正是救援本身;
+#                    ② 冷启动/已知故障态可由操作者用 OC_DEPLOY_ONTO_UNHEALTHY=1 明示确认,
+#                       该确认会写进 maintenance marker(onto_unhealthy=true)留痕。
+missing_core=()
+is_healthy svc_v5 || missing_core+=(svc_v5)
+is_healthy http_v5 || missing_core+=(http_v5)
+if (( ${#missing_core[@]} > 0 )) && [[ "$mode" != rollback && "$onto_unhealthy" != 1 ]]; then
+  echo "UNHEALTHY:${missing_core[*]}" >&2
+  exit 21
+fi
 if (( ${#healthy[@]} == 0 )); then
   echo "SKIPPED:no currently healthy checks"
   exit 0
@@ -1162,12 +1182,22 @@ jq -n --arg host "$(hostname -f)" --arg nonce "$nonce" --arg kind deploy \
   --arg mode "$mode" --arg target_commit "$target_commit" \
   --argjson started_at "$started_at" --argjson deadline "$deadline" \
   --argjson checks "$checks_json" \
+  --argjson onto_unhealthy "$([[ ${#missing_core[@]} -gt 0 ]] && echo true || echo false)" \
   '{schema:2,host:$host,nonce:$nonce,kind:$kind,mode:$mode,target_commit:$target_commit,
-    started_at:$started_at,deadline:$deadline,checks:$checks}' >"$tmp"
+    started_at:$started_at,deadline:$deadline,checks:$checks,onto_unhealthy:$onto_unhealthy}' >"$tmp"
 chmod 600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$marker"
 echo "SET:$nonce:${healthy[*]}"
 REMOTE
-  )"; then
+  )" || bpm_rc=$?
+  if [[ "$bpm_rc" == 21 ]]; then
+    echo "✗ 拒绝在不健康的现网上叠加新 release(mode=$maintenance_mode):svc_v5/http_v5 此刻不健康。" >&2
+    echo "  服务当前就是挂的 —— 叠上去以后连「回退目标是否健康」的基线都没有了,事后分不清是旧版本挂的还是新版本挂的。" >&2
+    echo "  先查清现网为何不健康;若确认是预期冷启动/已知故障且就是要用部署来修:" >&2
+    echo "    · 修的是刚上线的版本 → 用 scripts/deploy-v5.sh --rollback(rollback lane 永远放行)" >&2
+    echo "    · 确实要在坏态上叠新版本 → OC_DEPLOY_ONTO_UNHEALTHY=1 明示确认(会写进 maintenance marker 留痕)" >&2
+    return 1
+  fi
+  if [[ "$bpm_rc" != 0 ]]; then
     echo "✗ 无法开启 planned-maintenance；保留现有 marker，拒绝冒险覆盖" >&2
     return 1
   fi
@@ -2216,6 +2246,163 @@ assert_no_deploy_recovery_marker() {
   fi
 }
 
+# ═══════════════ durable gate waiver:门禁豁免 = 一次性可记账债务 ═══════════════
+# 2026-07-26 出口矩阵审计的架构主线。此前 V5_SMOKE_TURN=0 / V5_SMOKE_E2E=0 /
+# OC_FINALIZE_SKIP_EGRESS_GATE / OC_CAPMATRIX_COMPAT / V5_CANARY_REQUIRE_COST=0 这五个
+# 豁免都是「一条 env + 一句 echo」就把门整个关掉:不落任何持久证据、monitor 看不见、
+# 下一次发布照跑不误 —— 豁免强度比门本身还高,方向是反的。
+#
+# 仓内已有正确形态:emergency lane 跳过回归矩阵会写 emergency_containment_debts,并由
+# assert_emergency_debt_gate 阻断后续所有普通生产写 lane。本机制与之同构,只是载体用
+# 远端持久 marker(与 DEPLOY_RECOVERY_MARKER 同一 idiom:root-only 目录 + base64 回读校验),
+# 不引入新表/新迁移:
+#   ① 用掉豁免 → record_gate_waiver 在 kl-mirror 写持久 marker(写不成功 = 不给豁免);
+#   ② monitor 的 check_gate_waivers 看得见并告警;
+#   ③ assert_no_open_gate_waivers 阻断下一次普通生产写 lane —— 只放行"能真跑该门把债
+#      还上"的 lane,且那条 lane 不许再次带同一豁免 env(禁止连环跳);
+#   ④ 门真跑并通过 → clear_gate_waiver 自动销账。
+# 【红线】恢复 lane(abort/rollback/recover/reclaim/smoke/hide-luna/emergency containment)
+# 永不被本机制阻断 —— 回退路径永远优先于任何新门。
+GATE_WAIVER_DIR="$RELEASES_ROOT/.gate-waivers"
+GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification"
+
+# 每个 key 的「还债 lane」= 会真跑该门的 mode。不在此列的普通写 lane 一律被阻断。
+gate_waiver_repay_modes() { # <key>
+  case "$1" in
+    smoke-turn)           echo "deploy dist canary promote finalize" ;;
+    e2e-journey)          echo "deploy dist canary finalize" ;;
+    canary-turn-cost)     echo "deploy dist canary promote finalize" ;;
+    finalize-egress-gate) echo "canary promote finalize" ;;
+    capmatrix-compat)     echo "canary" ;;
+    ci-verification)      echo "deploy dist canary" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 本次调用是否仍带着该豁免(带着 = 禁止用它来还债)。
+gate_waiver_env_active() { # <key>
+  case "$1" in
+    smoke-turn)           [[ "${V5_SMOKE_TURN:-1}" != 1 ]] ;;
+    e2e-journey)          [[ "${V5_SMOKE_E2E:-1}" != 1 ]] ;;
+    canary-turn-cost)     [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] ;;
+    finalize-egress-gate) [[ "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 1 ]] ;;
+    capmatrix-compat)     [[ -n "${OC_CAPMATRIX_COMPAT:-}" ]] ;;
+    # ci-verification 有意**不**参与「禁止连环跳过」:CI 证据取不到的常见原因是 gh 未装/
+    # 未认证/网络不通,那是环境故障而非操作者偷懒。若把它也纳入连环跳禁令,一次 gh 故障就会
+    # 让「必须带 --allow-unverified-ci 才能发」与「带了就被闸挡住」互锁,连热修都发不出去。
+    # 债务照样落库、照样在 monitor 常驻、照样阻断不跑该门的 lane,只是不制造死锁。
+    ci-verification)      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 登记豁免债务。写入/回读失败 = fail-closed 返回非零 → 调用方把门当成"没被豁免"处理并失败,
+# 绝不出现"豁免生效但没人记账"的静默洞。
+record_gate_waiver() { # <key> <reason>
+  local key="$1" reason="$2" payload encoded
+  gate_waiver_repay_modes "$key" >/dev/null || {
+    echo "✗ 未注册的门禁豁免 key=$key(必须先登记进 GATE_WAIVER_KEYS + gate_waiver_repay_modes)" >&2
+    return 1
+  }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] record durable gate waiver key=$key reason=$reason"
+    return 0
+  fi
+  payload="$(printf 'key=%s\nmode=%s\nreason=%s\nrecorded_at=%s\nhost=%s\ndeploy_id=%s\ncommit=%s\nrepay_modes=%s\n' \
+    "$key" "$MODE" "$reason" "$(date -Is)" "$(hostname -f 2>/dev/null || hostname)" \
+    "${MUTATION_DEPLOY_ID:-<none>}" "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo '<unknown>')" \
+    "$(gate_waiver_repay_modes "$key")")"
+  encoded="$(printf '%s' "$payload" | base64 -w0)"
+  if ! ssh "$KL_HOST" bash -s -- "$GATE_WAIVER_DIR" "$key" "$encoded" <<'REMOTE'
+set -Eeuo pipefail
+dir="$1"; key="$2"; encoded="$3"; marker="$dir/$key"; tmp="$marker.tmp.$$"
+umask 077
+mkdir -p -m 700 "$dir"
+printf '%s' "$encoded" | base64 -d >"$tmp"
+chmod 600 "$tmp"
+sync -f "$tmp" || sync
+mv -f "$tmp" "$marker"
+sync -f "$dir" || sync
+[[ "$(base64 -w0 <"$marker")" == "$encoded" ]]
+REMOTE
+  then
+    echo "✗ 门禁豁免债务写入/回读失败:$KL_HOST:$GATE_WAIVER_DIR/$key —— 豁免不成立,门保持强制。" >&2
+    return 1
+  fi
+  echo "  ⚠ 门禁豁免已登记为 durable debt:key=$key($reason)" >&2
+  echo "    marker=$KL_HOST:$GATE_WAIVER_DIR/$key;下一次普通发布必须真跑该门才能销账。" >&2
+  return 0
+}
+
+# 门真跑并通过后销账。清理失败只告警:残留 marker 只会**多**阻断普通 lane(永不影响回退),
+# 属安全方向,不因此判部署失败。
+clear_gate_waiver() { # <key>
+  local key="$1"
+  [[ "$DRY" == 1 ]] && return 0
+  ssh -n "$KL_HOST" "test -e '$GATE_WAIVER_DIR/$key'" 2>/dev/null || return 0
+  if ssh -n "$KL_HOST" "rm -f '$GATE_WAIVER_DIR/$key'"; then
+    echo "  ✓ 门禁豁免债务已销账(门真跑通过):key=$key"
+  else
+    echo "⚠ 门禁豁免债务销账失败(marker 残留,只会多阻断普通 lane):$GATE_WAIVER_DIR/$key" >&2
+  fi
+  return 0
+}
+
+# 单点闸:与 assert_emergency_debt_gate 同一位置挂载(lease 取得之后)。
+assert_no_open_gate_waivers() {
+  [[ "$DRY" == 1 ]] && return 0
+  local open_keys key modes blocked=0
+  if ! open_keys="$(ssh -n "$KL_HOST" "ls -1 '$GATE_WAIVER_DIR' 2>/dev/null || true")"; then
+    echo "✗ 无法读取门禁豁免债务目录 $KL_HOST:$GATE_WAIVER_DIR(ssh/远端故障);fail-closed 拒绝发布。" >&2
+    return 1
+  fi
+  [[ -n "$open_keys" ]] || return 0
+  while read -r key; do
+    [[ -n "$key" ]] || continue
+    if ! modes="$(gate_waiver_repay_modes "$key")"; then
+      echo "✗ 未知门禁豁免债务 key=$key(marker 被手写?)。人工核对后移除:$KL_HOST:$GATE_WAIVER_DIR/$key" >&2
+      blocked=1; continue
+    fi
+    ssh -n "$KL_HOST" "sed -n '1,8p' '$GATE_WAIVER_DIR/$key'" 2>/dev/null | sed 's/^/    /' >&2 || true
+    if ! grep -qw -- "$MODE" <<<"$modes"; then
+      echo "✗ 未偿还的门禁豁免债务 key=$key:本 lane($MODE)不会真跑该门,禁止发布。" >&2
+      echo "  先走能还债的 lane($modes)让门真跑一次;回退 lane(abort/rollback/recover)不受本闸影响。" >&2
+      blocked=1; continue
+    fi
+    if gate_waiver_env_active "$key"; then
+      echo "✗ 未偿还的门禁豁免债务 key=$key,而本次调用仍带着同一豁免 env —— 禁止连环跳过。" >&2
+      echo "  去掉豁免 env 让门真跑一次即自动销账。" >&2
+      blocked=1; continue
+    fi
+    echo "  · 门禁豁免债务 key=$key 待偿还;本 lane($MODE)将真跑该门,通过后自动销账。"
+  done <<<"$open_keys"
+  [[ "$blocked" == 0 ]]
+}
+
+# 入口单点记账:本次调用声明了哪些豁免 env,就在**任何构建/翻转副作用之前**把债记上。
+# 为什么不在每个使用点分别记:OC_FINALIZE_SKIP_EGRESS_GATE 与 OC_CAPMATRIX_COMPAT 分散在
+# 5+ 个只读 helper(_egress_num_or_die 一次 finalize 会被调 10 次、_capmatrix_version_compat
+# 每个 key 一次),分别记 = 重复 ssh + 权威分裂。豁免的权威语义是「操作者声明要跳过这道门」,
+# 所以记账点就是声明点 = lane 入口。fail-closed:记不上就不给跑(否则又回到"豁免无痕")。
+record_declared_gate_waivers() {
+  local key modes rc=0
+  for key in $GATE_WAIVER_KEYS; do
+    gate_waiver_env_active "$key" || continue
+    # 本 lane 根本不跑该门时,豁免它是空操作(如在 deploy lane 设 OC_CAPMATRIX_COMPAT ——
+    # capability matrix 只在 canary 跑)。空操作不该欠债,否则一次操作者笔误会凭空阻断下次发布。
+    modes="$(gate_waiver_repay_modes "$key")" || { rc=1; continue; }
+    if ! grep -qw -- "$MODE" <<<"$modes"; then
+      echo "  · 忽略与本 lane 无关的豁免声明 key=$key(本 lane=$MODE 不跑该门;它只在 $modes 生效)"
+      continue
+    fi
+    record_gate_waiver "$key" "lane 入口声明豁免(mode=$MODE)" || rc=1
+  done
+  [[ "$rc" == 0 ]] || {
+    echo "✗ 门禁豁免债务登记失败 —— 拒绝以「无痕豁免」的方式发布。去掉豁免 env 让门真跑,或修复 $KL_HOST 记账通路。" >&2
+    return 1
+  }
+}
+
 # ── 传统 deploy/dist/rollback 的严格状态快照 ──
 # 0135 必须先于 P3 基建版部署 apply；从此 deploy_state 是 active slot/release 的唯一权威。
 # 查询失败、零行、非法字段一律在 build/symlink/systemd 等副作用前拒绝，绝不再把“PG 故障”
@@ -2729,11 +2916,81 @@ REMOTE
     "$staging" "$reldir" "$full_sha" "$short_sha" "$built_at" "$RELEASE_COMPLETE_SCHEMA_VERSION"
 }
 
+# ══════════ 部署与 CI 绿的机械绑定(2026-07-26;审计 9)══════════
+# 背景:`grep -n "gh run|gh api|check-runs|conclusion" scripts/deploy-v5.sh` 此前**零命中** ——
+# 分支保护只管「能不能合进 canonical」,完全不管「部署的是哪个 commit」。仓内已有走 hotfix
+# 分支绕过 CI 直接部署的先例(2026-07-17 kimi-k3 上线)。本门把两者机械绑定:即将被 build 成
+# release 的那个 commit,其**必需** check 必须全 success,否则要显式 --allow-unverified-ci 并记账。
+#
+# 判定口径故意只认 required_status_checks.contexts(分支保护的权威必需集),不把可选/实验 job
+# 的红当成阻断 —— 否则一个 flaky 可选 job 就能卡死正常发布。
+CI_PROTECTED_BRANCH="${CI_PROTECTED_BRANCH:-feat/v5-aurora-rewrite}"
+_gh_api() { env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy gh api "$@"; }
+assert_ci_green_for_source_commit() { # <full sha>
+  local sha="$1" required runs missing="" bad="" ctx line name status conclusion
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "✗ CI 门:source commit 非法:$sha" >&2; return 1; }
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 校验 $sha 的 required checks(分支保护 $CI_PROTECTED_BRANCH 的 contexts)全 success"
+    return 0
+  fi
+  # 【绝不挡住止血】dx-declared emergency containment lane 天然是「CI 还没跑完就要上」的场景,
+  # 它已有更强的独立约束(canonical clean + exact HEAD + 已 push 到 origin + dx 审批证据 +
+  # emergency_containment_debts 阻断后续所有普通发布)。在这里再加一道 CI 门只会把止血拦死。
+  if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+    echo "  · dx-declared emergency containment lane:跳过 CI 绿门(止血优先;containment debt 已阻断后续普通发布)"
+    return 0
+  fi
+  echo "── CI 绿门:$sha 的必需 check 必须全 success ──"
+  local unverifiable=""
+  required="$(_gh_api "repos/{owner}/{repo}/branches/$(printf '%s' "$CI_PROTECTED_BRANCH" | sed 's|/|%2F|g')/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null || true)"
+  if [[ -z "$required" ]]; then
+    unverifiable="无法取得分支保护的 required contexts(gh 未装/未认证/无权限/网络不通)"
+  else
+    runs="$(_gh_api --paginate "repos/{owner}/{repo}/commits/$sha/check-runs" \
+      --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+    if [[ -z "$runs" ]]; then
+      unverifiable="commit $sha 上查不到任何 check-run(未 push?未触发 CI?)"
+    else
+      while IFS= read -r ctx; do
+        [[ -n "$ctx" ]] || continue
+        line="$(awk -F'\t' -v n="$ctx" '$1==n{print; exit}' <<<"$runs")"
+        if [[ -z "$line" ]]; then missing="$missing $ctx"; continue; fi
+        IFS=$'\t' read -r name status conclusion <<<"$line"
+        if [[ "$status" != completed ]]; then
+          bad="$bad $ctx(status=$status)"
+        elif [[ ! "$conclusion" =~ ^(success|skipped|neutral)$ ]]; then
+          bad="$bad $ctx(conclusion=$conclusion)"
+        fi
+      done <<<"$required"
+    fi
+  fi
+  if [[ -z "$unverifiable" && -z "$missing" && -z "$bad" ]]; then
+    echo "  ✓ required checks 全绿($(tr '\n' ' ' <<<"$required"))"
+    clear_gate_waiver ci-verification
+    return 0
+  fi
+  echo "✗ CI 绿门未通过(commit=$sha)" >&2
+  [[ -z "$unverifiable" ]] || echo "   · 证据不可得:$unverifiable" >&2
+  [[ -z "$missing" ]] || echo "   · 缺失的必需 check:$missing" >&2
+  [[ -z "$bad" ]] || echo "   · 未成功的必需 check:$bad" >&2
+  if [[ "$ALLOW_UNVERIFIED_CI" != 1 ]]; then
+    echo "   分支保护只管「合进 canonical」,不管「部署哪个 commit」—— 本门是第二道。" >&2
+    echo "   先把 CI 跑绿再部署;确需带红上线(热修/CI 自身故障)用 --allow-unverified-ci(会登记 durable debt)。" >&2
+    return 1
+  fi
+  record_gate_waiver ci-verification \
+    "--allow-unverified-ci 放行未验证 CI 的 commit=$sha(${unverifiable:-未绿:${missing}${bad}})" || return 1
+  echo "  ⚠ --allow-unverified-ci 已放行,债务已登记;CI 恢复后重跑一次普通发布即自动销账。" >&2
+  return 0
+}
+
 build_release() {
   BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""; DIST_BUILD_ID=""
   local full_sha short_sha ts staging reldir cur
   full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   BUILT_RELEASE_SOURCE_COMMIT="$full_sha"
+  # 审计 9:build_release 是「哪个 commit 会变成线上 release」的唯一收口点,CI 绿门挂在这里。
+  assert_ci_green_for_source_commit "$full_sha" || return 1
   short_sha="$(git -C "$REPO_ROOT" rev-parse --short "$full_sha")"   # 从 full_sha 派生,不二次读 HEAD(R2#2:消两读竞态)
   ts="$(date -u +%Y%m%d-%H%M%S)"
   cur="$(bg_current_release)"
@@ -4127,6 +4384,9 @@ enable_model_authority() {
     echo "✗ observation 无法持久化，已完成全量安全回滚；禁止无证据运行后 cutover" >&2
     exit 1
   fi
+  # 审计 10:enable 只有 smoke,不证明「请求能穿过 epoch fence 出正文」—— 而这条 flag 改的正是
+  # 模型判定源。非阻断真 turn:失败不自动回滚(observation 已开始,回滚有自身流程),但必须留证据。
+  smoke_turn_canary_advisory "$(bg_current_release "$ACTIVE_SRC")" "model-authority enable"
   echo "✓ $MODEL_AUTHORITY_FLAG_KEY=1 已生效(判定源 = catalog),observation 已开始。"
 }
 
@@ -4316,13 +4576,30 @@ enable_runtime_tape_batching() {
       || ! assert_lossless_runtime_batch_floor "$active"; then
     echo "✗ batching 开启未通过健康门；恢复 flag=0 并重启同一 capable release。" >&2
     require_mutation_lease_for_compensation "runtime-batching-compensation" || exit 86
-    remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 0 || true
-    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" || true
-    smoke "$ACTIVE_PORT" || true
+    # 2026-07-26(审计 10):这三步此前各挂一个 `|| true`,把恢复结果整个吞掉 —— 操作者只看到
+    # 一句「未通过健康门」+ rc=1,无法区分「已安全回到 flag=0 且服务健康」与「回退了但服务已挂」。
+    # 改法:逐步取回退出码 + 明确判词;恢复本体绝不因此被阻断(每一步都跑完,不 early return),
+    # 但恢复未确认时落 durable recovery marker,让下一次普通发布停在现场而不是往损坏态上叠新版本。
+    local batch_recover_failed=""
+    remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 0 || batch_recover_failed="env flag 未能置回 0"
+    ssh "$KL_HOST" "systemctl restart '$ACTIVE_UNIT'" \
+      || batch_recover_failed="${batch_recover_failed:+$batch_recover_failed; }restart $ACTIVE_UNIT 失败"
+    smoke "$ACTIVE_PORT" \
+      || batch_recover_failed="${batch_recover_failed:+$batch_recover_failed; }恢复后 smoke 未通过"
     end_planned_maintenance
+    if [[ -n "$batch_recover_failed" ]]; then
+      echo "✗✗ batching 恢复未确认:$batch_recover_failed" >&2
+      echo "   现网可能处于 flag/进程状态未知态,须人工核对后再发布。" >&2
+      mark_deploy_recovery_required "runtime tape batching enable failed and recovery unconfirmed: $batch_recover_failed"
+    else
+      echo "  ✓ 已确认回到 flag=0 且服务健康(batching 未开启,现网与操作前一致)"
+    fi
     return 1
   fi
   end_planned_maintenance
+  # 审计 10:本 flag 改的是**会话正文的物理存储格式**,smoke 只证明进程起来了。非阻断真 turn
+  # 至少证明「新格式下还能写出并读回一条完整 turn」。
+  smoke_turn_canary_advisory "$active" "runtime-tape-batching enable"
   echo "✓ runtime-event batching 已安全开启(active+previous reader 均兼容 format 3)。"
 }
 
@@ -4950,6 +5227,10 @@ activate_emergency_tuple() {
     "$restart_cmd" "$smoke_cmd" "" "" "$prev_src" "$prev_src" \
     "" "" "$DEPLOY_RECOVERY_MARKER" "tuple-only" \
     || { echo "✗ emergency 激活 saga 失败,已自动回滚" >&2; exit 1; }
+  # 审计 10:逃生通道换掉的正是「执行 agent turn 的容器镜像」,而此前唯一证据是 hotcfg saga 里的
+  # 三字段 healthz —— master 的 /healthz 根本不经过容器。挂**非阻断**真 turn:不给逃生通道加阻断门
+  # (那会把救援自我否决),但「逃生成功」必须有活体证据,而不是只证明 master 进程还活着。
+  smoke_turn_canary_advisory "$prev_src" "emergency-tuple 激活"
   echo "✓ emergency tuple 已激活(image=$image release=<empty> bundle=$rev);存量容器按 runtimeStale 滚动。"
 }
 
@@ -5125,6 +5406,10 @@ dist_handshake_smoke() {
     return 1
   }
   echo "  ✓ 线上 oc-build: $live_id"
+  # 2026-07-26(审计 8②③):版本字符串对上 ≠ 页面能加载。资产是**加法式** rsync 进 union 池的,
+  # 一次部分失败就是用户白屏而握手照样绿;admin.html 更是 vite 第二入口且**故意不注入 oc-build**,
+  # 只校验 index.html 时 admin 后台整体白屏可以带门全绿上线。故握手必须连带资产可达性一起判。
+  verify_asset_surface "$sport" || return 1
 }
 
 # ───────────────────────── smoke:健康 + 隔离断言 ─────────────────────────
@@ -5490,14 +5775,43 @@ knowledge_planet_plugin_smoke_gate() { # <pinned master release>
 # 100% turn 必挂时,健康端点/调度器 smoke 全绿——没有任何门跑过真 turn。
 # 失败 = 与 full smoke 同级的强校验失败(走对称补偿回滚)。V5_SMOKE_TURN=0 可跳过
 # (紧急场景明示豁免;默认必跑)。
-smoke_turn_canary() { # <pinned master release>
-  local release="$1"
+smoke_turn_canary() { # <pinned master release> [port] [model]
+  local release="$1" port="${2:-$ACTIVE_PORT}" model="${3:-${V5_TURN_MODEL:-}}"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] real-turn canary(codex 引擎全链路)@ $release"
+    echo "  [dry-run] real-turn canary(model=${model:-<script default>})@ $release port=$port"
     return 0
   fi
-  echo "── smoke:canary 真 turn(codex 引擎全链路,port=$ACTIVE_PORT)──"
-  ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${ACTIVE_PORT}' timeout 300 node scripts/v5-smoke-turn-canary.mjs"
+  echo "── smoke:canary 真 turn(model=${model:-<script default>},port=$port)──"
+  ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${port}' ${model:+V5_TURN_MODEL='$model'} timeout 300 node scripts/v5-smoke-turn-canary.mjs"
+}
+
+# ══════════ 双引擎真 turn 矩阵(2026-07-26;审计 13)══════════
+# 旧 deploy lane 的真 turn 只跑 v5-smoke-turn-canary.mjs 默认模型(gpt-5.6-sol / codex 引擎),
+# CCB(claude)引擎在 deploy 与 --dist 通道零真 turn 覆盖 —— 与 canary 的固定 live 矩阵
+# (Codex/gpt-5.6-luna + CCB/deepseek-v4-flash)不对齐。此处对齐成双引擎各一 turn。
+# 每个 turn 的判成仍是 v5-smoke-turn-canary.mjs 的三信号(exactText='2' + isFinal + cost_charged)。
+V5_TURN_ENGINE_MATRIX_DEFAULT="gpt-5.6-sol deepseek-v4-flash"
+smoke_turn_matrix() { # <pinned master release> [port]
+  local release="$1" port="${2:-$ACTIVE_PORT}" model models
+  if [[ "${V5_SMOKE_TURN:-1}" != 1 ]]; then
+    record_gate_waiver smoke-turn "V5_SMOKE_TURN=0 关闭了双引擎真 turn 矩阵(mode=$MODE release=$release)" || return 1
+    echo "  · 双引擎真 turn 矩阵已显式豁免(V5_SMOKE_TURN=0;已登记 durable debt,下次普通发布必须真跑)"
+    return 0
+  fi
+  if [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]]; then
+    record_gate_waiver canary-turn-cost "V5_CANARY_REQUIRE_COST=0 关闭了真 turn 的计费到账断言(mode=$MODE)" || return 1
+  fi
+  models="${V5_TURN_MODELS:-$V5_TURN_ENGINE_MATRIX_DEFAULT}"
+  echo "── 双引擎真 turn 矩阵(models=$models,port=$port)──"
+  for model in $models; do
+    smoke_turn_canary "$release" "$port" "$model" || {
+      echo "✗ 真 turn 矩阵失败(model=$model port=$port):引擎未出正文/未收尾/未计费。" >&2
+      return 1
+    }
+  done
+  clear_gate_waiver smoke-turn
+  [[ "${V5_CANARY_REQUIRE_COST:-1}" == 0 ]] || clear_gate_waiver canary-turn-cost
+  echo "  ✓ 双引擎真 turn 矩阵全部通过($models)"
 }
 
 # 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。背景:「点击添加附件无反应」
@@ -5506,31 +5820,120 @@ smoke_turn_canary() { # <pinned master release>
 # UI 登录 → 附件全链(filechooser 弹出+真实上传)→ 目标入口 → 带附件发送上屏。
 # 脚本自建 ssh 隧道访问 $ACTIVE_PORT(kl-mirror 无浏览器;隧道由 node 进程管理,
 # libuv spawn 不继承部署锁 fd,不会占住 /var/lock/oc-v5-deploy.lock)。
-# 失败语义(第一期):fail-loud 非零退出 = 部署判定失败,但**不进 validation 自动回滚链**
-# —— UI 断言存在文案/选择器漂移的假阳性面,整 release 自动回滚代价不对称;连续两周零
-# 假阳性后升级进 validation_failure 链(升级时同步 v5ReleaseSafety 断言)。
-# 调用位置 = 各成功出口 end_planned_maintenance 之后(维护标记已清,UI 无维护态干扰)。
-# V5_SMOKE_E2E=0 显式豁免(紧急场景;默认必跑)。
-smoke_e2e_journey() {
-  [[ "${V5_SMOKE_E2E:-1}" == 1 ]] || { echo "  · E2E 旅程门已显式豁免(V5_SMOKE_E2E=0)"; return 0; }
+# 失败语义(2026-07-26 升级,第一期裁定到期):第一期(2026-07-18)约定「fail-loud 但不进
+# validation 自动回滚链,连续两周零假阳性后升级」。到 2026-07-26 已满 8 天且零假阳性记录,
+# 且第一期形态被审计判定为无效门 —— 四个调用点全在 end_planned_maintenance **之后**,
+# 新版本已经 live 且失败只 `|| exit 1`,坏版本照样在线服务真实用户,把「20 小时才被报障」
+# 缩短成「脚本 4 分钟后打印红字」而已。现升级为:与 full smoke / 真 turn 同级的强校验,
+# 进 validation_failure 对称补偿链(deploy/dist),或走官方 abort 路径(canary/finalize)。
+# 假阳性逃生口 = V5_SMOKE_E2E=0,但它现在会登记 durable debt 并阻断下一次普通发布。
+# V5_E2E_REMOTE_PORT 目标端口参数化:candidate lane 对 candidate 私有端口跑,切流前发现问题。
+smoke_e2e_journey() { # [port]
+  local port="${1:-$ACTIVE_PORT}"
+  if [[ "${V5_SMOKE_E2E:-1}" != 1 ]]; then
+    record_gate_waiver e2e-journey "V5_SMOKE_E2E=0 关闭了真浏览器 J1-J5 旅程门(mode=$MODE)" || return 1
+    echo "  · E2E 旅程门已显式豁免(V5_SMOKE_E2E=0;已登记 durable debt,下次普通发布必须真跑)"
+    return 0
+  fi
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] E2E journey canary(真浏览器用户旅程)"
+    echo "  [dry-run] E2E journey canary(真浏览器用户旅程,port=$port)"
     return 0
   fi
   # 依赖活体探测:部署树 node_modules 必须已含 playwright-core(合并本批后需 npm install)。
   # 缺失 = fail-loud 指引,绝不静默跳过(浏览器缺失→跳过 = fail-open,正是本门要消灭的洞)。
   if [[ ! -d "$REPO_ROOT/node_modules/playwright-core" ]]; then
     echo "✗✗ E2E 旅程门依赖缺失:$REPO_ROOT/node_modules/playwright-core 不存在。" >&2
-    echo "   在部署树执行 npm install 后重试;紧急豁免用 V5_SMOKE_E2E=0(需事后补跑)。" >&2
+    echo "   在部署树执行 npm install 后重试;紧急豁免用 V5_SMOKE_E2E=0(会登记 durable debt)。" >&2
     return 1
   fi
-  echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送,remote port=$ACTIVE_PORT)──"
-  if ! V5_E2E_REMOTE_PORT="$ACTIVE_PORT" timeout 240 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
+  echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送,remote port=$port)──"
+  if ! V5_E2E_REMOTE_PORT="$port" timeout 240 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
     echo "✗✗ E2E 旅程门失败:用户可感知路径疑似回归(登录/附件/目标/发送其一)。" >&2
-    echo "   部署已落地但判定失败 —— 核查失败截图(/tmp/e2e-journey-fail-*.png);" >&2
-    echo "   确认回归则 scripts/deploy-v5.sh --rollback;确认假阳性则修 journey 脚本断言并登记。" >&2
+    echo "   核查失败截图(/tmp/e2e-journey-fail-*.png);本门已进补偿链,调用方会走对称回滚/abort。" >&2
+    echo "   确认假阳性则修 journey 脚本断言并登记;紧急放行用 V5_SMOKE_E2E=0(会登记 durable debt)。" >&2
     return 1
   fi
+  clear_gate_waiver e2e-journey   # 门真跑通过 → 自动销账
+}
+
+# ══════════ 最小功能核(2026-07-26 出口矩阵整改;审计 1)══════════
+# 【判据】任何一条会改变用户流量走向的 lane,过门之后必须能证明同一组用户可见事实:
+#   ① 真 turn:双引擎(codex + ccb)各一条,三信号判成(正文精确、干净收尾、计费到账);
+#   ② 真浏览器旅程 J1-J5:UI 登录 / 附件全链 / 目标入口 / 发送 / 送达上屏。
+# 旧状态是出口矩阵残缺:journey 只挂 deploy 与 dist 的成功出口,candidate 回归矩阵只挂
+# canary lane,于是「canary→promote→finalize」这条 playbook 声明的普通发布通道全程不跑
+# journey,而日常首选的 deploy/--with-dist 完全不跑 candidate 回归矩阵 —— 每次上线都有
+# 一半 E2E 没执行过。此处收口成**一个函数**,各 lane 复用,禁止各 lane 各写一套。
+# 适用 lane:deploy / --dist / canary READY / promote / finalize / activate-emergency-tuple(非阻断)。
+minimum_functional_core() { # <lane-label> <pinned release> <port>
+  local lane="$1" release="$2" port="$3"
+  echo "══ 最小功能核(lane=$lane,release=$release,port=$port)══"
+  smoke_turn_matrix "$release" "$port" || {
+    echo "✗ 最小功能核失败(lane=$lane):真 turn 矩阵未通过。" >&2; return 1; }
+  smoke_e2e_journey "$port" || {
+    echo "✗ 最小功能核失败(lane=$lane):E2E 用户旅程未通过。" >&2; return 1; }
+  echo "  ✓ 最小功能核通过(lane=$lane):双引擎真 turn + J1-J5 旅程"
+}
+
+# ══════════ 公网面 + 资产面验证(2026-07-26;审计 8)══════════
+# 背景三个盲区:
+#  ① deploy/--dist 的成功出口没有任何一层经 Caddy 公网入口验证 —— smoke 全程 ssh 打
+#     127.0.0.1:port,journey 走 ssh 隧道直连 master 端口。Caddy 落错 slot / 配置漂移
+#     不会被任何门发现。verify_routing 现成(带 Host 头打 CADDY_HTTP_PORT,断言 ok:true
+#     且响应 slot == 期望 slot),接上即可。
+#  ② dist_handshake_smoke 只 curl `/` 抓 index.html 的 oc-build meta,不证明它引用的
+#     哈希 JS 能 200。资产是加法式 rsync 进 union 池,一次部分失败 = 用户白屏而握手照样绿。
+#  ③ admin.html 是 vite 第二入口且**故意不注入 oc-build**,dist 握手只校验 index.html
+#     → admin 后台整体白屏可以带门全绿上线。
+# ②③ 的修法收在 verify_asset_surface,并**并入 dist_handshake_smoke** —— 那样 deploy/--dist/
+# finalize 三个握手点一次到位,不用每条 lane 各记得挂一遍。
+verify_public_surface() { # <lane-label>
+  local lane="$1"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 公网面验证(Caddy Host 头 → 期望 slot)+ 资产面验证(index.html 首个 /assets/*.js + /admin.html)"
+    return 0
+  fi
+  echo "── 公网面验证(经 Caddy $CADDY_HTTP_PORT,断言 ok:true ∧ slot=期望;lane=$lane)──"
+  KL_HOST="$KL_HOST" V5_ENV="$V5_ENV" ASSETS_POOL="$V5_ASSETS_POOL" CADDY_HTTP_PORT="$CADDY_HTTP_PORT" \
+    bash "$SCRIPT_DIR/v5-caddy-apply.sh" --verify || {
+    echo "✗ 公网面验证失败:Caddy 入口未确认落到期望 slot(公网用户看到的可能不是刚部署的这一份)。" >&2
+    return 1
+  }
+  # 资产面通常并在 dist_handshake_smoke 里(它有 DIST_BUILD_ID 权威);不带 --with-dist 的普通
+  # deploy 不跑握手,资产可达性就落在这里补上(release 里那份 dist 仍是用户真正加载的那份)。
+  [[ "$WITH_DIST" == 1 ]] || verify_asset_surface "${ACTIVE_PORT:-$V5_PORT}" || return 1
+}
+
+# 资产可达性:解析线上 index.html 首个 /assets/*.js → GET 断言 200 + JS Content-Type;
+# 再断言 /admin.html 200 且其首个 /assets/*.js 可达(admin 是第二入口,不带 oc-build)。
+verify_asset_surface() { # <port>
+  local port="$1"
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 资产可达性断言(index.html + admin.html 各自首个 /assets/*.js)"; return 0; }
+  echo "── 资产面验证(哈希 chunk 真能 200;union 池加法同步的部分失败=白屏但握手绿)──"
+  local page asset code ctype
+  for page in / /admin.html; do
+    local html
+    html="$(ssh -n "$KL_HOST" "curl -fsS --max-time 10 'http://127.0.0.1:${port}${page}'" 2>/dev/null)" || {
+      echo "✗ 资产面验证:GET $page 失败(port=$port)——入口 HTML 不可达。" >&2
+      return 1
+    }
+    asset="$(grep -o '/assets/[A-Za-z0-9._-]*\.js' <<<"$html" | head -1)"
+    [[ -n "$asset" ]] || {
+      echo "✗ 资产面验证:$page 未引用任何 /assets/*.js(vite 产物残缺/入口 HTML 不是构建产物)。" >&2
+      return 1
+    }
+    code="$(ssh -n "$KL_HOST" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 'http://127.0.0.1:${port}${asset}'" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] || {
+      echo "✗ 资产面验证:$page 引用的 $asset HTTP=$code(≠200)—— 用户拿到 HTML 但 JS 404 = 白屏。" >&2
+      return 1
+    }
+    ctype="$(ssh -n "$KL_HOST" "curl -s -o /dev/null -w '%{content_type}' --max-time 10 'http://127.0.0.1:${port}${asset}'" 2>/dev/null || true)"
+    grep -qiE 'javascript|ecmascript' <<<"$ctype" || {
+      echo "✗ 资产面验证:$asset Content-Type=$ctype 不是 JS —— SPA fallback 把 404 兜成了 index.html。" >&2
+      return 1
+    }
+    echo "  ✓ $page → $asset 200 ($ctype)"
+  done
 }
 
 # 2026-07-26 安全整改:sourcemap 封堵活体门(第四层)。前三层是"配置对了应该没事"
@@ -5618,18 +6021,23 @@ REMOTE
 # 的真 turn 只做"回滚后引擎是否真能出正文"的健康观测:失败只大声告警,**绝不**反向翻回
 # 已成功的回滚(回滚往往正是在引擎已坏时执行,再拿 turn 结果当门会把救援自我否决)。
 # V5_SMOKE_TURN=0 显式豁免(与 deploy 侧同一开关)。
-smoke_turn_canary_advisory() { # <pinned master release>
-  local release="$1"
+# 2026-07-26(审计 10)第二参数化 lane 标签:逃生/单轴翻转通道(emergency tuple、model
+# authority epoch fence、runtime tape batching)改的正是「agent turn 能不能出正文」这条链,
+# 但它们此前只有健康端点级证据(master 的 /healthz 根本不经过容器)。给它们挂**非阻断**真 turn:
+# 逃生通道不该被新门挡住(那会把救援自我否决),但「逃生成功」本身必须留下证据而不是全凭健康端点。
+smoke_turn_canary_advisory() { # <pinned master release> [lane-label]
+  local release="$1" lane="${2:-rollback}"
   [[ "${V5_SMOKE_TURN:-1}" == 1 ]] || { echo "  · real-turn canary 已显式豁免(V5_SMOKE_TURN=0)"; return 0; }
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] real-turn canary(rollback 后·非阻断)@ $release"
+    echo "  [dry-run] real-turn canary($lane 后·非阻断)@ $release"
     return 0
   fi
-  echo "── rollback 后 real-turn canary(非阻断观测,port=$ACTIVE_PORT)──"
+  echo "── $lane 后 real-turn canary(非阻断观测,port=$ACTIVE_PORT)──"
   if smoke_turn_canary "$release"; then
-    echo "  ✓ rollback 后 real-turn canary 通过(引擎可出正文且计费到账)。"
+    echo "  ✓ $lane 后 real-turn canary 通过(引擎可出正文且计费到账)。"
   else
-    echo "⚠⚠ rollback 后 real-turn canary 未通过(非阻断:回滚已落地,不翻回)。引擎可能仍不健康,请人工核查 turn 主链路。" >&2
+    echo "⚠⚠ $lane 后 real-turn canary 未通过(非阻断:$lane 已落地,不翻回)。引擎可能仍不健康,请人工核查 turn 主链路。" >&2
+    echo "   健康端点绿 ≠ agent turn 能出正文(2026-07-17 goal 事故正是这一对);release=$release port=$ACTIVE_PORT。" >&2
   fi
   return 0
 }
@@ -6222,13 +6630,21 @@ deploy() {
   if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
     validation_failure="full master smoke failed"
   fi
-  if [[ -z "$validation_failure" && "$DRY" != 1 && "${V5_SMOKE_TURN:-1}" == 1 ]] \
-    && ! smoke_turn_canary "$BUILT_RELEASE"; then
-    validation_failure="real-turn canary failed(codex 引擎真 turn 未出正文)"
+  # 2026-07-26:真 turn 升级为双引擎矩阵,且 E2E 旅程门从「end_planned_maintenance 之后
+  # 裸 exit 1」上移进本 validation 链 —— 失败走与 full smoke 同一条对称补偿(回旧 source/
+  # 账号版本),不再把坏版本留在线上只打印红字。
+  if [[ -z "$validation_failure" && "$DRY" != 1 ]] \
+    && ! minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"; then
+    validation_failure="minimum functional core failed(双引擎真 turn / J1-J5 用户旅程)"
   fi
   if [[ -z "$validation_failure" && "$WITH_DIST" == 1 ]] \
     && ! dist_handshake_smoke "$ACTIVE_PORT"; then
     validation_failure="frontend build handshake failed"
+  fi
+  # 公网面 + 资产面(审计 8):smoke/journey 都直连 master 端口,Caddy 落错 slot 与
+  # 哈希 chunk/admin.html 不可达此前均无门。同样进对称补偿链。
+  if [[ -z "$validation_failure" && "$DRY" != 1 ]] && ! verify_public_surface deploy; then
+    validation_failure="public/asset surface verification failed(Caddy 入口 slot 或 /assets|/admin.html 不可达)"
   fi
   if [[ -z "$validation_failure" && "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     echo "── Knowledge Planet Plugin:扫码 UI 已就绪，恢复旧 v1.0 listing gate──"
@@ -6260,7 +6676,6 @@ deploy() {
     echo "  ✓ setup-first 完成：扫码实时感知已上线；Plugin/安装仍钉旧 v1.0，等待用户在界面绑定"
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
-    smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
@@ -6270,7 +6685,6 @@ deploy() {
     echo "  · Knowledge Planet:零接触部署(门未关/classify 降级),跳过 seed;promotion 顺延至下次部署或显式 verify lane"
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
-    smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=zero-touch)。"
@@ -6291,7 +6705,6 @@ deploy() {
   fi
   end_planned_maintenance
   smoke_sourcemap_sealed || exit 1
-  smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
   echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -6496,6 +6909,12 @@ deploy_dist() {
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
   WITH_DIST=1   # 蓝绿:前端变更=建含新 dist 的完整 release + 原子翻转(同 deploy,一次重启)
+  # 2026-07-26 审计 3:--dist 此前零补偿(smoke/handshake 失败 = set -e 裸退出,坏前端保持 live)。
+  # 对称补偿的前提是**翻转前**钉死回退点,故 previous release 提前到任何 build/flip 之前捕获。
+  local dist_previous_release=""
+  dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
+  [[ "$DRY" == 1 || -n "$dist_previous_release" ]] \
+    || { echo "✗ --dist 无法解析当前 live release(无回退点),拒绝翻转" >&2; exit 1; }
   build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
   knowledge_planet_plugin_assert_release_compatible "$BUILT_RELEASE" "$BUILT_RELEASE" \
     || echo "⚠ --dist 目标的 Knowledge Planet 插件制品与 DB 已审批版本不一致:插件将 RUNTIME_UNAVAILABLE 直至验证晋升;--dist 不因此阻断(2026-07-17 纠偏)" >&2
@@ -6508,9 +6927,6 @@ deploy_dist() {
   if hotcfg_release_axis_on; then hc_release=1; hc_any=1; fi
   [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]] && hc_any=1
   if [[ "$hc_any" == 1 ]]; then
-    local dist_previous_release=""
-    dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"
-    [[ -n "$dist_previous_release" ]] || { echo "✗ --dist 无法解析当前 live release" >&2; exit 1; }
     if ! assert_direct_turn_timeline_pair "$dist_previous_release" "$BUILT_RELEASE" "runtime hotcfg dist activation"; then
       if [[ "$DISABLE_BUNDLE_FLAG" == 1 || "$DISABLE_RELEASE_FLAG" == 1 ]]; then
         echo "✗ 首次 direct timeline capability 升级不能与 hotcfg disable 轴变更合并；先完成普通单-master deploy。" >&2
@@ -6534,17 +6950,71 @@ deploy_dist() {
   if [[ "$hc_any" == 1 ]]; then
     activate_runtime_tuple || { echo "✗ tuple 激活失败(saga 已自动回滚)" >&2; exit 1; }
   else
-    activate_release "$BUILT_RELEASE"
+    activate_release "$BUILT_RELEASE" || {
+      end_planned_maintenance || true
+      echo "✗ --dist release 激活失败(activate_release 已自恢复旧运行面)" >&2
+      exit 1
+    }
   fi
-  [[ "$DRY" == 1 ]] || smoke "$ACTIVE_PORT"
-  dist_handshake_smoke "$ACTIVE_PORT"
+  # ── validation 链(与 deploy() 对称;审计 3)──────────────────────────────
+  # --dist 走 build_release 构建的是整棵源码树 = 完整后端部署,不只前端;此前它既没有
+  # 真 turn 硬门,失败也零补偿。现补齐:full smoke → 最小功能核(双引擎真 turn + J1-J5)
+  # → dist 版本握手 → 公网/资产面,任一失败走 compensate_dist_activation 回旧 release。
+  local dist_validation_failure=""
+  if [[ "$DRY" != 1 ]] && ! smoke "$ACTIVE_PORT"; then
+    dist_validation_failure="full master smoke failed"
+  fi
+  if [[ -z "$dist_validation_failure" && "$DRY" != 1 ]] \
+    && ! minimum_functional_core dist "$BUILT_RELEASE" "$ACTIVE_PORT"; then
+    dist_validation_failure="minimum functional core failed(双引擎真 turn / J1-J5 用户旅程)"
+  fi
+  if [[ -z "$dist_validation_failure" ]] && ! dist_handshake_smoke "$ACTIVE_PORT"; then
+    dist_validation_failure="frontend build handshake failed"
+  fi
+  if [[ -z "$dist_validation_failure" && "$DRY" != 1 ]] && ! verify_public_surface dist; then
+    dist_validation_failure="public/asset surface verification failed(Caddy 入口 slot 或 /assets|/admin.html 不可达)"
+  fi
+  if [[ -n "$dist_validation_failure" ]]; then
+    echo "✗ --dist 强校验失败:$dist_validation_failure;开始对称补偿(回 $dist_previous_release)" >&2
+    compensate_dist_activation "$BUILT_RELEASE" "$dist_previous_release" "$hc_any" \
+      || { mark_deploy_recovery_required "--dist validation failed and activation compensation failed: $dist_validation_failure"; exit 1; }
+    end_planned_maintenance || true
+    echo "✗ --dist 强校验失败；已确认回到旧 release,前端变更未生效" >&2
+    exit 1
+  fi
   end_planned_maintenance
   # dist(纯前端)是 UI 回归的最高发面(2026-07-18 附件事故即 --dist 上线),E2E 旅程门必跑。
   smoke_sourcemap_sealed || exit 1
-  smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
   echo "✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
+}
+
+# --dist 的对称补偿(审计 3)。**复用**既有机制,不造第二套:hotcfg 面走 rollback_runtime_tuple
+# 反向一步(与 knowledge_planet_compensate_setup_first 同形参),非 hotcfg 面走 activate_release
+# 回旧 release(与 knowledge_planet_compensate_deploy 同一路径)。--dist 从不关插件执行门,
+# 故 defer_plugin_open=1 + plugin_previous_exists=0,绝不在补偿里去碰插件 pin。
+compensate_dist_activation() { # <candidate release> <previous release> <hotcfg:0|1>
+  local candidate="$1" previous="$2" hotcfg="$3" failed=0
+  require_mutation_lease_for_compensation "dist-activation-compensation" || exit 86
+  [[ "$hotcfg" =~ ^[01]$ ]] || { echo "✗ dist compensation hotcfg 标志非法:$hotcfg" >&2; return 2; }
+  [[ -n "$previous" ]] || { echo "✗ dist compensation 缺 previous release 回退点" >&2; return 2; }
+  echo "── --dist 对称补偿:回到 $previous(hotcfg=$hotcfg)──"
+  if [[ "$hotcfg" == 1 ]]; then
+    if ! rollback_runtime_tuple 1 1 "$candidate" 0; then
+      failed=1
+    elif ! smoke "$ACTIVE_PORT"; then
+      failed=1
+    fi
+  else
+    if ! activate_release "$previous"; then
+      failed=1
+    elif ! smoke "$ACTIVE_PORT"; then
+      failed=1
+    fi
+  fi
+  [[ "$failed" == 0 ]] && echo "  ✓ --dist 补偿完成:旧 release 已回到 live 并通过 smoke"
+  return "$failed"
 }
 
 # ───────────────────────── rollback ─────────────────────────
@@ -7173,6 +7643,8 @@ capability_matrix_preflight() {
     echo "✗ sw.js 一有一无(active 存在=$swa_ex / candidate 存在=$swb_ex)—— 新增/移除 SW = origin-global 行为变更,必须走协调全量发布而非 cohort 灰度。拒绝 canary。" >&2; return 1
   fi
   echo "  ✓ capability matrix 通过"
+  # 只有在**没有**声明兼容表的情况下真跑通过(= 所有版本字段本来就相等)才销账。
+  [[ -n "${OC_CAPMATRIX_COMPAT:-}" ]] || clear_gate_waiver capmatrix-compat
 }
 
 # 同步某 release 的 dist/assets → 共享 union 池(加法式)+ 14 天 GC(保护双在役+回滚代;RFC §2)。
@@ -7372,6 +7844,9 @@ egress_gate_conservation() {
   [[ $((enq-EGR_START_ENQ)) -eq $((sent-EGR_START_SENT)) ]] || { echo "✗ enqueuedΔ=$((enq-EGR_START_ENQ)) ≠ sentΔ=$((sent-EGR_START_SENT))(交接窗有事件未送达)" >&2; return 1; }
   [[ "$exp" == "$EGR_START_EXP" && "$ovf" == "$EGR_START_OVF" ]] || { echo "✗ expired/overflow 增长(exp $EGR_START_EXP→$exp / ovf $EGR_START_OVF→$ovf)" >&2; return 1; }
   echo "  ✓ egress 计数守恒"
+  # 计费守恒门在**没有豁免**的情况下真跑通过 → 销账(带着 OC_FINALIZE_SKIP_EGRESS_GATE 跑出来的
+  # 「通过」不算数:门里有多处 || 放行分支,那不是证据)。
+  [[ "${OC_FINALIZE_SKIP_EGRESS_GATE:-0}" == 1 ]] || clear_gate_waiver finalize-egress-gate
 }
 # VIP owner + control-probe 门槛(RFC D3;$1=candidate_slot)。
 vip_control_gate() {
@@ -8124,6 +8599,22 @@ canary() {
       || { echo "FATAL:egress restore failure 后 stable predecessor 验收未通过" >&2; exit 1; }
     exit 1
   fi
+  # ── canary READY 最小功能核(2026-07-26;审计 5)────────────────────────────
+  # canary 的全部意义就是「放量前发现问题」,但此前它自己不跑一个真 turn:regression matrix
+  # 跑的是 session-display 的 9 个 spec,不含 v5-smoke-turn-canary 的三信号真 turn(exactText
+  # +isFinal+cost_charged),也不含 J1-J5 真浏览器旅程。percent=0 时 candidate 不承接任何真实
+  # 用户流量,此处跑功能核的成本≈零,却是放量前最强的用户可见事实证据。
+  # 失败语义与本 lane 其它门**完全一致**:同一 mutation lease 内官方 abort + stable predecessor
+  # 验收(不新造「READY 但中毒」这种状态机外的第三态);放量侧另有 promote 的 candidate 探针兜底。
+  if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+    echo "  ⚠ dx-declared emergency containment:跳过 canary READY 最小功能核;止血稳定后 durable debt 将阻断后续普通发布"
+  elif ! minimum_functional_core "canary-ready" "$reldir" "$(slot_port "$cand")"; then
+    echo "✗ canary READY 最小功能核失败(真 turn / J1-J5 旅程);第一动作=同一 mutation lease 内官方 abort" >&2
+    abort
+    verify_stable_predecessor_after_gate_failure "$predecessor_release" "$predecessor_runtime_tuple" "$CAPTURED_EGRESS_PREDECESSOR" \
+      || { echo "FATAL:功能核 failure 后 stable predecessor 验收未通过" >&2; exit 1; }
+    exit 1
+  fi
   echo "✓ --canary 完成(gen=$((DS_generation)) candidate=$cand percent=0 allowlist=内部)。放量:deploy-v5.sh --promote=<pct>"
 }
 
@@ -8160,8 +8651,8 @@ promote() {
   echo "══ v5 --promote=$PROMOTE_PCT(cohort 放量;RFC D5)══"
   ds_snapshot
   ds_assert_phase canary
+  local promote_candidate="$DS_candidate_release"
   if [[ "$DRY" != 1 ]]; then
-    local promote_candidate="$DS_candidate_release"
     [[ "$promote_candidate" == /* ]] || promote_candidate="$RELEASES_ROOT/$promote_candidate"
     assert_release_marker "$promote_candidate" || exit 1
     assert_release_marker "$(bg_current_release "$(slot_src "$DS_active_slot")")" || exit 1
@@ -8169,6 +8660,29 @@ promote() {
   [[ "$DRY" == 1 || "$DS_transition_step" -ge "$DS_STEP_CANARY_READY" ]] || { echo "✗ canary 未到 READY(step=$DS_transition_step),不能放量" >&2; exit 1; }
   new_operation_id promote
   assert_mutation_lease_alive "promote" || { echo "✗ production-mutation lease 失活;放量 crash-stop(cohort_percent 未改)" >&2; exit 86; }
+  # ── promote 前的 candidate 活体探针(2026-07-26;审计 6)────────────────────
+  # 此前 promote() 整函数只有一条 cohort_percent CAS,之后 echo「观察面=人工」。可**真实用户
+  # 暴露正是从 promote 才开始**:canary READY 到 promote 之间可能隔了几小时,candidate 完全
+  # 可能已 OOM 重启/lease 抖动/引擎凭据过期。抬 percent 之前必须重新证明 candidate 还能出正文。
+  # 【为什么不是 vip_control_gate】审计建议复用 vip_control_gate,但按实际代码它断言
+  # `state=leader ∧ vip=owner` —— 那是 finalize step4 交接**之后**的不变量;canary 期
+  # candidate 恒为 standby + VIP released,挂 vip_control_gate 会让每一次正常放量都失败。
+  # 故此处用同一 lane 自己的就绪不变量 wait_for_candidate_ready(standby+VIP released)。
+  # 【为什么不跑 journey】J1-J5 已在同一 candidate release 的 canary READY 跑过;promote
+  # 新增的风险面是「candidate 自 READY 以来是否退化」,一条三信号真 turn 即可判定,且多档
+  # 放量(5→25→50)不会被浏览器旅程拖成分钟级。
+  if [[ "$DRY" != 1 ]]; then
+    wait_for_candidate_ready "$DS_candidate_slot" 60 || {
+      echo "✗ promote 前 candidate($DS_candidate_slot)未处于 standby+VIP released:拒绝放量(cohort_percent 未改)。" >&2
+      echo "  candidate 已不健康 → 走官方 --abort 回退,不要在坏 candidate 上放量。" >&2
+      exit 1
+    }
+    smoke_turn_matrix "$promote_candidate" "$(slot_port "$DS_candidate_slot")" || {
+      echo "✗ promote 前 candidate 真 turn 矩阵失败:拒绝放量(cohort_percent 未改)。" >&2
+      echo "  candidate 引擎已不能出正文/收尾/计费 → 走官方 --abort 回退。" >&2
+      exit 1
+    }
+  fi
   ds_cas_or_die "cohort_percent=$PROMOTE_PCT, operation_id='$OP'" "$DS_STEP_CANARY_READY" "promote percent=$PROMOTE_PCT"
   echo "  · percent=$PROMOTE_PCT(在线用户下次 /api/me 重评;观察面=双 slot healthz + 错误日志 diff + 计费一致性抽查)"
   echo "✓ --promote 完成。continue:--promote=<更高> / --finalize / --abort"
@@ -8296,11 +8810,13 @@ finalize() {
 # finalize step1..7 主体(每步 `-lt N` 幂等守卫;fresh 全跑,resume 从断点前滚)。$1=cand $2=old。
 finalize_run_steps() {
   local cand="$1" old="$2"
+  # candidate_release 在 precommit 功能门也要用(见⑥⑦),故提到函数作用域顶层。
+  local candidate_release=""
 
   # 独立 --finalize 是新 shell，不能依赖 --canary 时的内存变量。始终从 deploy_state 钉死的
   # candidate_release 读取期望 dist build id，且在停旧 slot / commit stable 前做严格握手。
   if [[ "$DRY" != 1 ]]; then
-    local candidate_release="$DS_candidate_release"
+    candidate_release="$DS_candidate_release"
     [[ -n "$candidate_release" ]] || {
       echo "✗ finalize 缺 candidate_release，无法建立 dist 版本权威" >&2
       exit 1
@@ -8400,12 +8916,19 @@ finalize_run_steps() {
     fi
     # fresh step5 与 resume step6 都在 commit stable 前跑完整 leader smoke + release/dist 握手。
     # 任一失败都保留/拉起旧 slot 并进入 aborting，不制造“已切换但命令判失败”的终态。
+    # 2026-07-26(审计 4):finalize 是 candidate 变成吃 100% 流量的 stable 的**不可逆点**,
+    # 而此前提交前只有 smoke + dist_handshake_smoke —— 两者都是健康端点/版本字符串级证据。
+    # 2026-07-17 goal 事故的教训正是「健康端点全绿 + codex 引擎 100% turn 必挂」。此处补最小
+    # 功能核(双引擎三信号真 turn + J1-J5 真浏览器旅程)。失败仍走既有 aborting 补偿路径,
+    # 旧 unit 拉起 + abort_continue,恢复路径一字未动。
     if [[ "$DRY" != 1 ]]; then
-      echo "── 提交 stable 前完整 smoke + candidate release/dist 握手 ──"
-      if ! smoke "$(slot_port "$cand")" || ! dist_handshake_smoke "$(slot_port "$cand")"; then
-        echo "✗ finalize 提交前 smoke/版本握手失败 → 转 aborting，保留恢复路径" >&2
+      echo "── 提交 stable 前完整 smoke + 最小功能核 + candidate release/dist 握手 ──"
+      if ! smoke "$(slot_port "$cand")" \
+        || ! minimum_functional_core finalize-precommit "$candidate_release" "$(slot_port "$cand")" \
+        || ! dist_handshake_smoke "$(slot_port "$cand")"; then
+        echo "✗ finalize 提交前 smoke/功能核/版本握手失败 → 转 aborting，保留恢复路径" >&2
         require_mutation_lease_for_compensation "finalize-precommit-compensation" || exit 86
-        ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit smoke/dist handshake FAILED → aborting"
+        ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit functional gate FAILED → aborting"
         sshk "systemctl start $(slot_unit "$old") 2>/dev/null || true"
         abort_continue "$old" "$cand"
         exit 1
@@ -9292,6 +9815,32 @@ esac
 case "$MODE" in
   smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify) ;;
   *) assert_emergency_debt_gate || exit 1 ;;
+esac
+
+# 门禁豁免债务闸(2026-07-26):与 emergency debt 同一挂载点、同一放行集合语义。
+# 恢复/回退 lane 与 dx-declared containment lane 永不被阻断(回退优先于任何新门)。
+case "$MODE" in
+  smoke|baseline-census|model-authority-preflight|model-authority-observation-status|reclaim-mutation-lease|knowledge-planet-verify) ;;
+  abort|rollback|recover|hide-luna|authorize-emergency|close-emergency-debt) ;;
+  # 逃生/回滚/观测 lane 同样永不被阻断(2026-07-26 主控复核补齐):
+  #   · emergency-tuple / activate-emergency-tuple = 逃生镜像的登记与激活(R2-M1/R3-B1)。
+  #     它们**无法**用 --emergency-containment 旁路(EMERGENCY_INCIDENT 只接受
+  #     --authorize-emergency / --canary / --finalize,见入参校验),所以不在这里显式放行
+  #     就等于「有未偿门禁债时逃生通道被自我否决」—— 与 smoke_turn_canary_advisory
+  #     恒返回 0 的设计意图直接冲突。
+  #   · disable-model-authority = 步骤 4 的显式回滚(关 flag),回退性质。
+  #   · install-monitor = 纯 host 观测面安装,不碰用户流量;有未偿债务时更需要监控在线。
+  emergency-tuple|activate-emergency-tuple|disable-model-authority|install-monitor) ;;
+  *)
+    if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+      echo "  · dx-declared emergency containment lane:跳过门禁豁免债务闸(止血优先;debt 仍在,普通发布仍被阻断)"
+    else
+      assert_no_open_gate_waivers || exit 1
+    fi
+    # 记账在闸之后:闸负责「上一次的债还没还清就别发」,记账负责「这一次声明的豁免必须留痕」。
+    # 顺序反了会把本次刚写的 marker 当成上次的旧债自我阻塞。
+    record_declared_gate_waivers || exit 1
+    ;;
 esac
 
 # Legacy marker 兼容权只在会 build/flip/放量 master release 的 invocation 建立：此刻本地
