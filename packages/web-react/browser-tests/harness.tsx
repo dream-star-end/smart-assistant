@@ -16,6 +16,7 @@ import {
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
+import { Markdown } from "../src/components/Markdown";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
 import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
@@ -954,4 +955,21 @@ function ModelSelectorProbe() {
 
 createRoot(document.getElementById("model-selector-root")!).render(
   <StrictMode><ModelSelectorProbe /></StrictMode>,
+);
+
+// ── T24 markdown 富块(mermaid)────────────────────────────────────────────────
+//
+// 助手回复 99% 经 markdown,而 MarkdownImpl 里 ```mermaid 走的是完全独立的分支
+// (dynamic import → parse → render → dangerouslySetInnerHTML)。它此前**零测试**:
+// jsdom 没有 SVG 布局,mermaid 在那里既画不出图也量不了,只能在真浏览器里证明。
+// 两个用户可见事实:①语法有效 → 真出图;②流式半截/语法错 → 回退可读源码,
+// 既不白屏、也不留"渲染中"占位、更不把 mermaid 的错误图注入 <body>。
+const MERMAID_OK = ["```mermaid", "graph TD; MERMAIDOKSTART-->MERMAIDOKEND;", "```"].join("\n");
+const MERMAID_BROKEN = ["```mermaid", "MERMAIDBROKENSOURCE {{{ not a diagram", "```"].join("\n");
+
+createRoot(document.getElementById("markdown-rich-root")!).render(
+  <StrictMode>
+    <div data-testid="mermaid-ok"><Markdown>{MERMAID_OK}</Markdown></div>
+    <div data-testid="mermaid-broken"><Markdown>{MERMAID_BROKEN}</Markdown></div>
+  </StrictMode>,
 );

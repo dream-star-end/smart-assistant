@@ -29,6 +29,8 @@
 //   T18 消息“引用”动作把精确目标送入 Composer，可取消；再次引用后随当前正文发送。
 //   T19 真 IndexedDB 多标签陈旧快照不能抹除或复活 exact pending-dispatch journal;
 //   T20 预览用例跑完后主 harness 页面仍完好(防 setContent 摧毁共享页面把后续缺席断言变恒真)。
+//   T21 及以后的用例不在此重复罗列 —— 一条用例证明什么,以 cases.json 的 proves 为准
+//      (两处各写一份必然漂移;下面那条"单一权威"的规则同样约束本注释)。
 //
 // 用例清单的单一权威是同目录 cases.json:实际执行的 T 编号集合必须 ⊇ 清单,
 // 删/漏一条即红(过去删掉任意一段 check() 照样 exit 0)。新增用例必须同步登记。
@@ -97,6 +99,24 @@ await esbuild.build({
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
 });
+
+// 移动整页(T25)也要独立页面:主 harness 的脚手架 CSS 盖掉了 #root 的全屏定位与
+// body 的 overflow:hidden,在那上面问"整页横向溢出"只会量到别人的挂载根。
+const mobileBundlePath = join(outDir, "mobile-harness.js");
+await esbuild.build({
+  entryPoints: [join(HERE, "mobile-harness.tsx")],
+  bundle: true,
+  format: "iife",
+  outfile: mobileBundlePath,
+  jsx: "automatic",
+  loader: { ".css": "empty" },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "import.meta.env.MODE": '"production"',
+  },
+  alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
+  logLevel: "silent",
+});
 const previewCssDir = join(outDir, "preview-css");
 await viteBuild({
   root: join(HERE, ".."),
@@ -124,6 +144,9 @@ if (!previewCssFile) throw new Error("browser-tests: 预览 production CSS 构�
 // .chat-scroll-area 规则,T8 照过)。现在 T4/T8/T13 断言的就是线上那份 CSS。
 const productionCss = readFileSync(join(previewCssDir, previewCssFile), "utf8");
 const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(previewBundlePath, "utf8")}</script></body></html>`;
+// 移动整页(T25):与线上 index.html 同构 —— 同一份 production CSS、同一条 viewport meta、
+// 单一 #root 挂载点,**零测试脚手架样式**(加一条覆盖就等于把被测的布局改掉了)。
+const mobileHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(mobileBundlePath, "utf8")}</script></body></html>`;
 
 // 主 harness = production CSS + 测试脚手架。脚手架放在 production CSS 之后。
 // 唯一被脚手架遮蔽的生产规则是 #root 的全屏 fixed 定位与 body 的 overflow:hidden ——
@@ -136,7 +159,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -955,6 +978,62 @@ await check("T23 顶栏切模型:受信点选生效并回显,降级模型点不�
   }
 });
 
+// ── T24 markdown 富块:mermaid ────────────────────────────────────────────────
+// 助手回复几乎全部经 markdown,而 ```mermaid 是 MarkdownImpl 里一条完全独立的分支
+// (dynamic import → parse → render → dangerouslySetInnerHTML),此前零测试。
+// jsdom 没有 SVG 布局,画不出也量不了 —— 只有真浏览器能证明"图真的出来了"。
+await check("T24 mermaid 有效语法真出 SVG、半截语法回退可读源码不白屏", async () => {
+  const ok = page.getByTestId("mermaid-ok");
+  const broken = page.getByTestId("mermaid-broken");
+
+  // ① 有效图:等到真 <svg> 落地(动态 import mermaid + render 是异步的,轮询等落定)。
+  const svg = ok.locator("svg");
+  await svg.waitFor({ state: "attached", timeout: 20000 });
+  const okState = await ok.evaluate((el) => {
+    const node = el.querySelector("svg");
+    const rect = node?.getBoundingClientRect();
+    return {
+      text: (el.textContent ?? "").trim(),
+      width: rect?.width ?? 0,
+      height: rect?.height ?? 0,
+      svgText: node?.textContent ?? "",
+    };
+  });
+  if (okState.text.includes("图表渲染中")) throw new Error("有效 mermaid 仍卡在渲染中占位");
+  if (okState.width < 10 || okState.height < 10) {
+    throw new Error(`mermaid SVG 没有真实尺寸: ${okState.width}×${okState.height}(用户看到的是空白框)`);
+  }
+  // 出的是这张图,不是随便一个 <svg>(节点文案来自源码)。
+  if (!okState.svgText.includes("MERMAIDOKSTART") || !okState.svgText.includes("MERMAIDOKEND")) {
+    throw new Error(`mermaid 出的图不含源码里的节点: ${JSON.stringify(okState.svgText.slice(0, 120))}`);
+  }
+
+  // ② 半截/无效语法:回退成可读源码,不留占位、不白屏。
+  await broken.locator("pre").waitFor({ state: "visible", timeout: 20000 });
+  const brokenState = await broken.evaluate((el) => ({
+    text: (el.textContent ?? "").trim(),
+    pre: el.querySelector("pre")?.textContent ?? "",
+    svgs: el.querySelectorAll("svg").length,
+  }));
+  if (brokenState.text.includes("图表渲染中")) throw new Error("无效 mermaid 永远停在渲染中占位");
+  if (!brokenState.pre.includes("MERMAIDBROKENSOURCE")) {
+    throw new Error(`无效 mermaid 未回退出原始源码: ${JSON.stringify(brokenState.pre.slice(0, 120))}`);
+  }
+  if (brokenState.svgs !== 0) throw new Error("无效 mermaid 仍渲染了图(应只回退源码)");
+
+  // ③ mermaid 对坏输入调 render 会把 "Syntax error" 图注入 <body> 顶层并残留;
+  //    生产代码靠 parse 先挡,这里守住它不被改回去(用户会看到一个飘在页面上的红叉图)。
+  const strays = await page.evaluate(() => {
+    const roots = Array.from(document.querySelectorAll("body > svg, body > div[id^='dmermaid']"));
+    return roots.map((el) => el.id || el.tagName.toLowerCase());
+  });
+  const DIAG = await page.evaluate(() => Array.from(document.body.children).map((el) => `${el.tagName.toLowerCase()}#${el.id}.${String(el.className).slice(0,40)}`));
+  throw new Error("DIAGNOSTIC body children: " + JSON.stringify(DIAG));
+  if (strays.length > 0) {
+    throw new Error(`mermaid 把错误图注入了 <body> 顶层: ${JSON.stringify(strays)}`);
+  }
+});
+
 async function assertContainerPreviewFillsViewport(page, expectedDevice, width, height, top = 0) {
   const dialog = page.getByRole("dialog", { name: "容器网页预览与元素评论" });
   await dialog.waitFor({ state: "visible", timeout: 3000 });
@@ -1073,6 +1152,127 @@ await check("T17 PC 全屏预览空闲收起控件且可按需恢复", async () 
   await assertContainerPreviewFillsViewport(previewPage, "桌面", 1440, 900);
   await previewPage.evaluate(() => window.__unmountContainerPreview());
 });
+
+// ── T25 移动整页布局 ─────────────────────────────────────────────────────────
+// 已有的移动覆盖(T13 工具卡 375px / T15 Ask UI / T16 预览)都是单组件,整页的
+// 顶栏拥挤与正文横向溢出**没人看**。而聊天滚动区是 overflow-x-hidden:超出视口的
+// 内容不是"可以滑过去看",是**直接被裁掉、用户永远看不到**。
+const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+const mobilePage = await mobileContext.newPage();
+watchRuntimeErrors(mobilePage, "mobile");
+const mobileUrl = "http://127.0.0.1/__openclaude_browser_mobile__";
+await mobilePage.route("**/*", serveBuiltAsset);
+await mobilePage.route(mobileUrl, (route) => route.fulfill({
+  status: 200,
+  contentType: "text/html",
+  body: mobileHtml,
+}));
+await mobilePage.goto(mobileUrl);
+
+await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁、发送区可用", async () => {
+  screenshotPage = mobilePage;
+  const scroll = mobilePage.getByTestId("mobile-chat-scroll");
+  await scroll.waitFor({ state: "visible", timeout: 5000 });
+  // 正文渲染完(markdown 懒块 + 工具卡)再量几何:轮询只改"什么时候读",不放宽"读到什么"。
+  await mobilePage.getByText("MOBILE_ASSISTANT_TAIL_MARKER").waitFor({ state: "visible", timeout: 10000 });
+
+  // ① 整页不产生横向滚动(线上 body/#root 都是 overflow:hidden,这里量的是布局本身)。
+  const pageWidth = await mobilePage.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+  }));
+  if (pageWidth.scrollWidth > pageWidth.clientWidth + 1) {
+    throw new Error(`整页横向溢出: scrollWidth=${pageWidth.scrollWidth} > clientWidth=${pageWidth.clientWidth}`);
+  }
+
+  // ② 聊天区里超出视口的内容必须落在自己的横向滚动区内(那是"能滑着看完"),
+  //    否则就是被 overflow-x-hidden 裁掉的不可达内容。
+  const clipped = await mobilePage.evaluate(() => {
+    const vw = document.documentElement.clientWidth;
+    const scroller = document.querySelector('[data-testid="mobile-chat-scroll"]');
+    if (!scroller) return { error: "找不到聊天滚动区" };
+    const scrollable = (el) => {
+      const ox = getComputedStyle(el).overflowX;
+      return ox === "auto" || ox === "scroll";
+    };
+    const offenders = [];
+    for (const el of scroller.querySelectorAll("*")) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) continue;
+      if (r.left >= -1 && r.right <= vw + 1) continue;
+      // 自己或某层祖先是显式横向滚动区,且该滚动区本身在视口内 → 用户滑得到,放行。
+      let host = el;
+      let reachable = false;
+      while (host && host !== scroller) {
+        if (scrollable(host)) {
+          const hr = host.getBoundingClientRect();
+          if (hr.left >= -1 && hr.right <= vw + 1) {
+            reachable = true;
+            break;
+          }
+        }
+        host = host.parentElement;
+      }
+      if (reachable) continue;
+      offenders.push({
+        tag: el.tagName.toLowerCase(),
+        cls: String(el.className).slice(0, 80),
+        left: Math.round(r.left),
+        right: Math.round(r.right),
+        text: (el.textContent ?? "").trim().slice(0, 60),
+      });
+    }
+    return { vw, count: offenders.length, sample: offenders.slice(0, 4) };
+  });
+  if (clipped.error) throw new Error(clipped.error);
+  if (clipped.count > 0) {
+    throw new Error(
+      `聊天区有 ${clipped.count} 处内容溢出视口且不在横向滚动区内(移动端被裁掉看不见): ` +
+        JSON.stringify(clipped.sample),
+    );
+  }
+
+  // ③ 顶栏四个入口全在视口内(挤爆时最先被推出去的就是右侧主题/铃铛)。
+  const headerEntries = [
+    ["打开菜单", "汉堡(唯一的移动侧栏入口)"],
+    ["站内信", "站内信"],
+    ["账户与计费", "余额"],
+    ["选择对话模型", "模型选择器"],
+  ];
+  for (const [label, human] of headerEntries) {
+    const box = await mobilePage.getByRole("button", { name: label }).boundingBox();
+    if (!box) throw new Error(`顶栏「${human}」不可见`);
+    if (box.x < 0 || box.x + box.width > 390 + 1) {
+      throw new Error(`顶栏「${human}」被挤出视口: x=${Math.round(box.x)} w=${Math.round(box.width)}`);
+    }
+  }
+
+  // ④ 三个关键入口真的按得动(受信点击 + 可观测结果),不是"渲染出来就算"。
+  await mobilePage.getByRole("button", { name: "打开菜单" }).click();
+  if ((await mobilePage.evaluate(() => window.__mobilePage.navOpens)) !== 1) {
+    throw new Error("移动端汉堡点了没反应(侧栏抽屉打不开)");
+  }
+  await mobilePage.getByRole("button", { name: "更多选项" }).click();
+  const attach = mobilePage.getByRole("menuitem", { name: "添加附件" });
+  await attach.waitFor({ state: "visible", timeout: 3000 });
+  await mobilePage.keyboard.press("Escape");
+  await attach.waitFor({ state: "hidden", timeout: 3000 });
+
+  const box = await mobilePage.getByRole("textbox").boundingBox();
+  if (!box) throw new Error("输入框不可见");
+  await mobilePage.getByRole("textbox").fill("MOBILE_SEND_MARKER");
+  const send = mobilePage.getByRole("button", { name: "发送" });
+  const sendBox = await send.boundingBox();
+  if (!sendBox) throw new Error("发送按钮不可见");
+  if (sendBox.x + sendBox.width > 390 + 1) {
+    throw new Error(`发送按钮被挤出视口: right=${Math.round(sendBox.x + sendBox.width)}`);
+  }
+  await send.click();
+  const sends = await mobilePage.evaluate(() => window.__mobilePage.sends);
+  if (JSON.stringify(sends) !== JSON.stringify([{ text: "MOBILE_SEND_MARKER", mediaCount: 0 }])) {
+    throw new Error(`移动端发送结果漂移: ${JSON.stringify(sends)}`);
+  }
+});
 screenshotPage = page;
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
@@ -1102,6 +1302,7 @@ if (tailErrors.length > 0) {
 }
 
 await previewContext.close();
+await mobileContext.close();
 await browser.close();
 console.log(
   failed === 0
