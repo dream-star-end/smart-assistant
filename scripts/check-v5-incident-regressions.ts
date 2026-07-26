@@ -41,7 +41,19 @@ const PROOF_PENDING_BASELINE = 9;
 // 这道门只检查**起点之后**的历史:起点之前的 fix(v5) commit 没有 Incident trailer
 // 约定,回溯要求会让门天天红且无法补救(commit message 不可改写)。起点写死在这里,
 // 不随 manifest 变动;要前移起点=一次显式决定。
-const TRAILER_GATE_START = "cfa210cc29bbfc41d9cc0e953e357cc036e7a98b";
+// 2026-07-26 更正(一次显式的起点前移,理由记录如下):
+//   原值 cfa210cc… 是 feat/v5-gate-live-evidence **rebase 前**的 commit。该分支在合入
+//   canonical 前被 rebase 了 4 次,原 SHA 随之消失 → 起点不可达 → 门走 WARN 分支静默
+//   跳过。也就是说:门从落地那一刻起就没有检查过任何东西。
+//   在门失效的那段窗口里,门禁批自己又写了 3 个 fix(v5) commit(d514c700 / e1f5383e /
+//   fcb30ef3,均为门禁基建,非用户可见修复)。它们已合入 canonical,commit message
+//   不可改写,而本门对"缺 trailer"不接受 waiver(waiver 只兜 `Incident: none`)——
+//   对它们回溯要求 trailer 会让门永久红且无法补救,正是本常量注释一开始就要避免的情形。
+//   因此把起点前移到 caaa49475(门禁五批全部合入后的 canonical HEAD):**门从此刻起
+//   对所有新 commit 生效**,不追溯它自己失效期间的产物。
+// **写死 SHA 的门天生怕 rebase**:所以下面的"起点不可达"分支已从 WARN 跳过改成
+// fail-closed(仅浅克隆例外),下次再失效会立刻红,而不是安静地什么都不检查。
+const TRAILER_GATE_START = "caaa494750da120bc978fb056dafacc894efacf2";
 const TRAILER_GATE_SURFACES = [
   "packages/gateway/",
   "packages/commercial/",
@@ -134,9 +146,31 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     return { status: "wired", runner: `deploy-v5.sh → ${base}` };
   }
   if (layer === "integration") {
-    // 已知缺口:integ 套件当前既不在 CI 也不在部署门里(另有 agent 正在把 integ 接进 CI)。
-    // 标 pending 而不是直接红:天天红不带来信息;但 pending 层不许充当事故的 proof 证据。
-    return { status: "pending", runner: "npm run test:commercial:integ(尚未接入 CI/部署门)" };
+    // 2026-07-26:integ 已分梯队接进 CI(PR 门 pr-1/2/3 + 夜跑 nightly-*),所以这里
+    // 不再一律 pending,而是按**该文件真实属于哪个梯队**判定 —— 登记了一条没有任何
+    // 梯队收录的 integ 证据,等于它永远不会跑,必须红。
+    const tierDir = join(ROOT, ".github/integ-tiers");
+    const tiers = existsSync(tierDir) ? readdirSync(tierDir).filter((f) => f.endsWith(".txt")) : [];
+    if (tiers.length === 0) fail("integ 梯队清单目录缺失(.github/integ-tiers),integration 层 runner 不可判");
+    const owning = tiers.filter((f) =>
+      readFileSync(join(tierDir, f), "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"))
+        .some((entry) => entry === path || entry.endsWith(`/${path.split("/").pop()}`)),
+    );
+    if (owning.length === 0) {
+      fail(`${path} 未被任何 integ 梯队收录(.github/integ-tiers/*.txt),这条证据永远不会跑`);
+    }
+    const shard = owning[0].replace(/\.txt$/, "");
+    if (shard.startsWith("pr-")) {
+      if (!CI_WORKFLOW.includes("test:commercial:integ:shard")) {
+        fail("CI workflow 未调用 test:commercial:integ:shard,integ PR 门映射已失效");
+      }
+      return { status: "wired", runner: `CI job commercial-integ (${shard})` };
+    }
+    // 夜跑梯队:确实会跑,但发现延迟到次日,不能当作 PR 门级证据。
+    return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
   // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
   if (/^packages\/gateway\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
@@ -308,8 +342,29 @@ function checkTrailerClosure(): number {
     git("cat-file", "-e", `${TRAILER_GATE_START}^{commit}`);
     execFileSync("git", ["merge-base", "--is-ancestor", TRAILER_GATE_START, "HEAD"], { cwd: ROOT });
   } catch {
-    // 浅克隆 / 起点尚未合入本分支:不冒充检查过(fail-closed 只针对能看见的历史)。
-    process.stdout.write("[incident-regressions] WARN: trailer 闭环门起点不可达(浅克隆?),本次跳过该门\n");
+    // 起点不可达有两种原因,必须区别对待 —— 此前一律 WARN 跳过,等于把
+    // "门失效" 伪装成 "门通过"(2026-07-26 实测:分支 rebase 后原 SHA 消失,
+    // 整道门安静地什么都没查)。
+    //   · 真·浅克隆:历史确实取不到,跳过是唯一选择(但要说清楚)。
+    //   · 完整克隆却找不到起点:起点写错了或被 rebase 冲掉 → 这是门坏了,必须红。
+    const shallow = (() => {
+      try {
+        return git("rev-parse", "--is-shallow-repository").trim() === "true";
+      } catch {
+        return false;
+      }
+    })();
+    if (shallow) {
+      process.stdout.write(
+        "[incident-regressions] WARN: 浅克隆,trailer 闭环门起点不可达,本次跳过该门\n",
+      );
+      return 0;
+    }
+    fail(
+      `trailer 闭环门起点 ${TRAILER_GATE_START.slice(0, 12)} 在完整克隆里不可达 —— ` +
+        "起点写错或已被 rebase 冲掉,这道门当前什么都没在检查。" +
+        "修法:把 TRAILER_GATE_START 改成本分支真实存在的祖先 commit(见该常量上方注释)。",
+    );
     return 0;
   }
   const waivers = parseWaivers();
