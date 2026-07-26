@@ -4,9 +4,14 @@
  * 基于 T-16 `requireAuth`,额外校验 claims.role === 'admin'。非 admin → 403
  * FORBIDDEN(和 401 分开:401 表示 token 无效,403 表示 token 合法但越权)。
  *
- * `requireAdmin`(JWT-only):不查 DB。role 写进 access JWT(24h TTL),
- * 即使 DB 里刚撤掉 admin 角色,最坏 24 小时内仍可通过。用于纯读路由,
+ * `requireAdmin`(JWT-only):不查 DB。role 写进 access JWT
+ * (TTL 权威 = `auth/jwt.ts` 的 `ACCESS_TOKEN_TTL_SECONDS`,现为 **15min**),
+ * 即使 DB 里刚撤掉 admin 角色,最坏在该 TTL 内仍可通过。用于纯读路由,
  * 读了数据没直接业务影响、且希望省一次 DB roundtrip。
+ *
+ * ⚠️ 本段原文写的是 "24h TTL",与代码实际值差了 96 倍,且**已骗过一次安全审计**
+ * (2026-07-26 审计据此把 requireAdmin 的暴露窗口评成一天)。改 TTL 时必须同步此处;
+ * 更好的做法是别在注释里复述常量值,只指向 ACCESS_TOKEN_TTL_SECONDS。
  *
  * `requireAdminVerifyDb`(JWT + DB):JWT 先过,再 `SELECT role, status`
  * 确认 DB 里当前仍是 active admin。用于任何"能动账/动钱/动账号池/改配置"
