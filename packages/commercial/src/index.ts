@@ -4736,6 +4736,9 @@ export async function registerCommercial(
           container_internal_id: string | null;
           host_uuid: string | null;
         }>(
+          // lint-agent-containers-sql: allow — 回收路径必须能看到任意 state 的行,
+          // 目的就是把它 stop+remove;行只喂 stopAndRemoveV3Container,
+          // 不进任何用户可见视图 / 计费聚合。
           "SELECT id, container_internal_id, host_uuid FROM agent_containers WHERE id = $1",
           [containerId],
         );
