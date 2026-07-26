@@ -22,11 +22,10 @@
  *   - INV-3 / INV-5(ensureRunning 闸门 + SQL shape)→ v3EnsureRunningMigrationGuard.test.ts
  */
 
-import { describe, test, before, after, beforeEach } from "node:test";
+import { describe, test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
-import { runMigrations } from "../db/migrate.js";
+import { useDedicatedTestDatabase } from "./helpers/db.js";
 import {
   createPlannedMigration,
   markPhase,
@@ -41,71 +40,22 @@ import {
   type MigrationPhase,
 } from "../agent-sandbox/v3migrationLedger.js";
 
-const TEST_DB_URL =
-  process.env.TEST_DATABASE_URL ??
-  "postgres://test:test@127.0.0.1:55432/openclaude_test";
-const REQUIRE_TEST_DB =
-  process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
+/**
+ * 隔离策略:**专属库** openclaude_v3ml_test(见 helpers/db.ts:useDedicatedTestDatabase)。
+ *
+ * 此前本文件对共享库 openclaude_test 做 `DROP SCHEMA public CASCADE; CREATE SCHEMA public`
+ * —— 与 v3MigrationReconciler / v3EnsureRunningMigrationGuard 两个同法文件在
+ * node:test 的文件级并发下互撞(实测报错随竞态落点而变:42P06 already exists /
+ * no schema has been selected to create in / schema_migrations does not exist),
+ * before 钩子 hookFailed → 整文件 cancelled。三者因此长期挂在
+ * .github/known-failures/commercial-unit.txt 上,ledger 的 open-migration 闸门
+ * 契约实际无门禁。改专属库后各跑各的,零共享面。
+ */
+const db = useDedicatedTestDatabase("openclaude_v3ml_test");
 
-function assertTestDatabase(url: string): void {
-  let dbName: string;
-  try {
-    dbName = new URL(url).pathname.replace(/^\//, "");
-  } catch {
-    throw new Error(`invalid TEST_DATABASE_URL: ${url}`);
-  }
-  if (!dbName.endsWith("_test")) {
-    throw new Error(`refusing to reset non-test database: ${dbName}`);
-  }
-}
-
-async function cleanCommercialSchema(): Promise<void> {
-  assertTestDatabase(TEST_DB_URL);
-  await query("DROP SCHEMA IF EXISTS public CASCADE");
-  await query("CREATE SCHEMA public");
-  await query("GRANT ALL ON SCHEMA public TO public");
-}
-
-let pgAvailable = false;
 let hostUuidA = ""; // 旧 host
 let hostUuidB = ""; // 新 host
 let containerId = 0n;
-
-async function probePg(): Promise<boolean> {
-  const p = createPool({
-    connectionString: TEST_DB_URL,
-    max: 2,
-    connectionTimeoutMillis: 1500,
-  });
-  try {
-    await p.query("SELECT 1");
-    await p.end();
-    return true;
-  } catch {
-    try { await p.end(); } catch { /* ignore */ }
-    return false;
-  }
-}
-
-before(async () => {
-  pgAvailable = await probePg();
-  if (!pgAvailable) {
-    if (REQUIRE_TEST_DB) throw new Error("Postgres test fixture required");
-    return;
-  }
-  await resetPool();
-  const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
-  setPoolOverride(pool);
-  await cleanCommercialSchema();
-  await runMigrations();
-});
-
-after(async () => {
-  if (pgAvailable) {
-    try { await cleanCommercialSchema(); } catch { /* ignore */ }
-    await closePool();
-  }
-});
 
 /**
  * 每个 test 重置 agent_migrations + 重建 host A/B + 一个 agent_containers active 行。
@@ -116,7 +66,7 @@ after(async () => {
  * 'self' host 由 0030 migration seed 已存在,本测试只增加 host B 一行。
  */
 beforeEach(async () => {
-  if (!pgAvailable) return;
+  if (!db.available) return;
   await query("TRUNCATE TABLE agent_migrations RESTART IDENTITY CASCADE");
   await query("DELETE FROM agent_containers");
   await query("DELETE FROM users WHERE id = 1");
@@ -167,8 +117,7 @@ beforeEach(async () => {
 });
 
 function skipIfNoPg(t: { skip: (r: string) => void }): boolean {
-  if (!pgAvailable) { t.skip("pg not available"); return true; }
-  return false;
+  return db.skipIfUnavailable(t);
 }
 
 function planned() {

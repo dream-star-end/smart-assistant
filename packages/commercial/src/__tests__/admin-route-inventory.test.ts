@@ -14,81 +14,30 @@
  * - 正则匹配 method/path|pathPrefix/handler 三段式,数组顺序保留
  *   (admin route prefix 优先级敏感,见 §0.3 R2/R3/R4 注释)
  *
- * 更新 baseline:
- *   UPDATE_BASELINE=1 npx tsx --test packages/commercial/src/__tests__/admin-route-inventory.test.ts
+ * **本文件只读**(2026-07-26 收紧):提取器与 baseline 写入器都搬去
+ * `packages/commercial/scripts/admin-route-inventory.ts`。此前这里留过一个
+ * 环境变量逃生门 —— 设上它,测试就会改写自己的期望值然后通过,快照门等于没有;
+ * 而且"会写文件的测试"在只读工作区还会引入一类与被测对象无关的失败。
+ * 下面第二条用例把"只读"本身钉成硬断言(故意不写出那个变量名,见其注释)。
+ *
+ * 更新 baseline(唯一入口,改动会进 git diff 被 review):
+ *   npm run baseline:admin-routes
  */
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROUTER_TS = path.resolve(__dirname, "../http/router.ts");
-const BASELINE_JSON = path.resolve(__dirname, "router-admin-baseline.json");
-
-interface AdminRoute {
-  method: string;
-  pathKind: "path" | "pathPrefix";
-  pathValue: string;
-  handler: string;
-}
-
-/**
- * 从 handler 表达式解析出"这条路由实际执行谁"的权威函数名。
- *
- * 两种形态都必须入清单,否则新增 admin 路由改内联形式即可绕过快照门(盲区):
- *  1) 裸标识符:      `handleX`                              → "handleX"
- *  2) 内联箭头:      `(req, res) => handleX(req, res, deps)` → "handleX"
- *     含条件派发:    `(req,res) => c ? handleA(...) : handleB(...)` → "handleA|handleB"
- *
- * 内联箭头体是纯表达式(三元/调用,不含语句块 `{}`),故目标函数名 = 所有被调用为
- * `identifier(req, ...)` 的标识符(按源码顺序去重;多目标用 '|' 连接)。
- */
-function normalizeHandler(expr: string): string {
-  const trimmed = expr.trim();
-  // 裸标识符:原样(与历史 baseline 兼容)。
-  if (/^\w+$/.test(trimmed)) return trimmed;
-  // 内联箭头:抽出所有 `handleX(req` 形态的被调目标函数名。
-  const targets: string[] = [];
-  for (const c of trimmed.matchAll(/(\w+)\s*\(\s*req\b/g)) targets.push(c[1]!);
-  const uniq = [...new Set(targets)];
-  if (uniq.length === 0) {
-    // 箭头体里没有 `handleX(req,...)` 目标 —— 抛错让维护者显式处理,绝不静默塞空
-    // 字符串(那会重新制造盲区,正是本次要根治的一类问题)。
-    throw new Error(`admin route 内联 handler 无法解析目标函数: ${expr}`);
-  }
-  return uniq.join("|");
-}
-
-function extractAdminRoutes(src: string): AdminRoute[] {
-  // 跨行匹配 { method: 'X', (path|pathPrefix): '/api/admin/...', handler: <expr> }
-  // 注意:
-  // - handler <expr> 可为裸标识符,也可为内联箭头(marketplace admin 全族 + 未来新增)。
-  //   内联箭头体不含 '}'(纯表达式),故用 [^}] 非贪婪收尾到路由对象的闭合花括号,
-  //   再交给 normalizeHandler 抽出目标函数名 —— 消除"内联形式逃逸 baseline"盲区。
-  // - 属性顺序 method → path|pathPrefix → handler 在 router.ts 内一致,handler 恒为末字段。
-  // - \s* 匹配跨行空白
-  const re =
-    /\{\s*method:\s*'([A-Z]+)'\s*,\s*(path|pathPrefix):\s*'(\/api\/admin[^']*)'\s*,\s*handler:\s*([^}]*?)\s*,?\s*\}/g;
-
-  const out: AdminRoute[] = [];
-  for (const m of src.matchAll(re)) {
-    out.push({
-      method: m[1]!,
-      pathKind: m[2]! as "path" | "pathPrefix",
-      pathValue: m[3]!,
-      handler: normalizeHandler(m[4]!),
-    });
-  }
-  return out;
-}
+import {
+  BASELINE_JSON,
+  ROUTER_TS,
+  extractAdminRoutes,
+  currentAdminRoutes,
+  readBaseline,
+} from "../../scripts/admin-route-inventory.js";
 
 describe("admin-route-inventory (S3 PoC hard gate #1)", () => {
   test("router.ts /api/admin/* routes match baseline byte-equal", () => {
-    const src = fs.readFileSync(ROUTER_TS, "utf8");
-    const current = extractAdminRoutes(src);
+    const current = currentAdminRoutes();
 
     // sanity:不应为空,否则正则坏了或 router.ts 被清空
     assert.ok(
@@ -96,32 +45,38 @@ describe("admin-route-inventory (S3 PoC hard gate #1)", () => {
       `extractAdminRoutes 抓到 ${current.length} 条 admin routes,< 50 怀疑正则失效;router.ts 路径=${ROUTER_TS}`,
     );
 
-    const updateMode = process.env.UPDATE_BASELINE === "1";
-
-    if (updateMode) {
-      const json = JSON.stringify(current, null, 2) + "\n";
-      fs.writeFileSync(BASELINE_JSON, json, "utf8");
-      console.log(
-        `[UPDATE_BASELINE] wrote ${current.length} admin routes to ${BASELINE_JSON}`,
-      );
-      return;
-    }
-
-    if (!fs.existsSync(BASELINE_JSON)) {
-      assert.fail(
-        `baseline 不存在: ${BASELINE_JSON}\n` +
-          `首次运行用: UPDATE_BASELINE=1 npx tsx --test ${path.relative(process.cwd(), __filename)}`,
-      );
-    }
-
-    const baseline = JSON.parse(fs.readFileSync(BASELINE_JSON, "utf8")) as AdminRoute[];
+    const baseline = readBaseline();
+    assert.ok(
+      baseline !== null,
+      `baseline 不存在: ${BASELINE_JSON}\n首次生成用: npm run baseline:admin-routes`,
+    );
 
     // method + pathKind + pathValue + handler + 数组顺序 byte-equal
     assert.deepStrictEqual(
       current,
       baseline,
-      "admin routes inventory 与 baseline 不一致 — S3 拆分破坏了 router.ts 的 admin route 集合或顺序。" +
-        "如果是有意修改,跑 UPDATE_BASELINE=1 重新钉基线;否则查 router.ts diff",
+      "admin routes inventory 与 baseline 不一致 — router.ts 的 admin route 集合或顺序被改动。" +
+        "如果是有意修改,跑 `npm run baseline:admin-routes` 重钉基线(改动会进 git diff 供 review);否则查 router.ts diff",
+    );
+  });
+
+  test("本文件保持只读:无 env 分支、无文件写入(元不变量)", () => {
+    // 快照门的价值全在"测试自己改不动期望值"。历史上这里有过一个 env 逃生门,
+    // 一设就让测试重写 baseline 后通过 —— 门等于没有。这条锁住"门没被再次掏空"。
+    //
+    // needle 故意用拼接构造:直接写字面量的话,这条断言的源码自己就会命中自己。
+    const forbidden = [
+      ["UPDATE", "_BASELINE"].join(""),
+      ["process", ".env"].join(""),
+      ["write", "FileSync"].join(""),
+      ["append", "FileSync"].join(""),
+    ];
+    const self = fs.readFileSync(new URL(import.meta.url), "utf8");
+    const hits = forbidden.filter((needle) => self.includes(needle));
+    assert.deepEqual(
+      hits,
+      [],
+      `快照测试必须只读:不得出现 ${hits.join(" / ")};重钉基线走 npm run baseline:admin-routes`,
     );
   });
 
