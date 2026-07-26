@@ -31,8 +31,12 @@
 # 目标是清单单调递减、最终删空:清单越短,门越灵敏(粒度是顶层 suite,一行在册 =
 # 该 suite 内部所有子测试的新增失败都被豁免)。
 #
-# 下一条为负载敏感 flaky(2026-07-11 观测到,近轮未复现;若长期不再出现可删):
-assertPlatformDefaultModelConfigured
+# 2026-07-26 移出清单:assertPlatformDefaultModelConfigured 同时被登记进核心契约禁豁免
+#   清单(core-contract-suites.txt)—— 它守的是"平台默认模型 key 缺失必须 boot fail-loud",
+#   缺失的后果是全员默认模型静默 503(2026-07-16 有先例)。它此前以"负载敏感 flaky"
+#   留在豁免里,但主干 run 30190800591 的 TAP artifact 显示它已不再失败。
+#   核心契约不接受豁免:真 flaky 就修 flaky,不能拿一条"用户当场看得见"的守卫换安静。
+#   (这条矛盾是新加的门自检用例自己抓出来的,不是人工发现。)
 # 2026-07-11 登记:本机补长驻 octest-redis(56379)后首次暴露——该 metrics 测试在 redis
 # 可达时走到新分支稳定失败;基线树(aurora@1f4bef5c)同法复现 11/12 同一子测,非在途
 # 分支引入。修掉后删除本行。
