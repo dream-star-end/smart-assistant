@@ -756,7 +756,7 @@ describe('v5 release safety lanes', () => {
     )
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
-    const turnCanary = body.indexOf('smoke_turn_canary "$BUILT_RELEASE"')
+    const turnCanary = body.indexOf('minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"')
     const zeroTouch = body.indexOf('knowledge-planet=zero-touch')
     const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
     const maintenanceEnd = body.indexOf('end_planned_maintenance', seed)
@@ -768,8 +768,8 @@ describe('v5 release safety lanes', () => {
         activation > previousPluginClassifier &&
         fullSmoke > activation,
     )
-    // 真 turn canary 强校验紧随 full smoke(2026-07-17 goal 事故门禁补强);
-    // 零接触收尾分支必须在 seed 之前(门未关/未审批 → 不 seed 直接完成)。
+    // 最小功能核(双引擎真 turn + J1-J5 旅程)紧随 full smoke(2026-07-17 goal 事故 +
+    // 2026-07-26 出口矩阵整改);零接触收尾分支必须在 seed 之前(门未关/未审批 → 不 seed 直接完成)。
     assert.ok(turnCanary > fullSmoke && zeroTouch > turnCanary && seed > zeroTouch && maintenanceEnd > seed)
     // advisory gate 必须校验 stdout JSON 契约,不依赖 tsx 退出码(fail-open 历史教训)。
     assert.match(source, /advisory == "knowledge-planet"/)
@@ -4085,7 +4085,8 @@ describe('v5 release safety lanes', () => {
     assert.equal(result.status, 0, result.stderr || result.stdout)
     const args = await readFile(fixture.sshLog, 'utf8')
     const remoteBody = await readFile(fixture.sshStdinLog, 'utf8')
-    assert.match(args, /\/var\/lib\/openclaude-v5\/cutovers 18081\n$/)
+    // 末位 0/1 = OC_DEPLOY_ONTO_UNHEALTHY 确认位(2026-07-26 审计 11 新增);默认 0 = fail-closed。
+    assert.match(args, /\/var\/lib\/openclaude-v5\/cutovers 18081 0\n$/)
     assert.match(remoteBody, /http:\/\/127\.0\.0\.1:\$\{caddy_http_port\}\/healthz/)
   })
 
@@ -5646,43 +5647,365 @@ wait $!
     )
   })
 
-  // 2026-07-18 附件事故门禁补强:E2E 用户旅程门(真浏览器)。
-  // 契约:deploy 三个成功出口 + dist 出口都必须在 end_planned_maintenance 之后、
-  // 完成 echo 之前调 `smoke_e2e_journey || exit 1`(fail-loud;不进 validation 自动
-  // 回滚链是第一期显式裁定,升级时改本断言)。函数本体必须:依赖缺失 fail-loud
-  // (playwright-core 探测,禁静默跳过)+ V5_SMOKE_E2E=0 显式豁免 + dry-run 分支。
-  test('E2E journey gate wired at every success exit and fails loud', async () => {
+  // 2026-07-18 附件事故门禁补强 + 2026-07-26 出口矩阵整改:E2E 用户旅程门(真浏览器)。
+  // 【升级前】四个调用点全在 end_planned_maintenance **之后**,失败只 `|| exit 1` —— 新版本
+  // 已经 live 且不回滚,坏版本照样在线服务真实用户。第一期显式裁定「连续两周零假阳性后升级」,
+  // 到 2026-07-26 已到期。
+  // 【升级后契约】journey 不再单独接在成功出口,而是并入 minimum_functional_core,由各 lane
+  // 的 validation/abort 补偿链驱动:deploy/dist 走对称补偿回旧 release,canary/finalize 走
+  // 官方 abort。函数本体仍必须:依赖缺失 fail-loud(playwright-core 探测,禁静默跳过)+
+  // V5_SMOKE_E2E=0 豁免必须落 durable debt + dry-run 分支 + 目标端口参数化。
+  // 审计 10/11:逃生 / 单轴翻转 lane 的活体证据,与「不在损坏态上叠加新 release」。
+  test('escape and single-axis lanes carry advisory turn evidence and refuse stacking on a broken service', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // ① 三条 lane 各挂一次非阻断真 turn(逃生通道不加阻断门,但「成功」必须有活体证据)。
+    for (const [lane, anchor] of [
+      ['emergency-tuple 激活', '✓ emergency tuple 已激活'],
+      ['model-authority enable', '✓ $MODEL_AUTHORITY_FLAG_KEY=1 已生效'],
+      ['runtime-tape-batching enable', '✓ runtime-event batching 已安全开启'],
+    ] as const) {
+      const advisoryAt = source.indexOf(`smoke_turn_canary_advisory "`)
+      assert.ok(advisoryAt >= 0)
+      const successAt = source.indexOf(anchor)
+      assert.ok(successAt >= 0, `找不到成功出口锚点:${anchor}`)
+      const gateAt = source.lastIndexOf(`" "${lane}"`, successAt)
+      assert.ok(
+        gateAt >= 0 && successAt - gateAt < 600,
+        `lane「${lane}」的成功出口前缺非阻断真 turn(健康端点绿 ≠ agent turn 能出正文)`,
+      )
+    }
+    // advisory 必须真的非阻断(逃生通道加阻断门 = 把救援自我否决)。
+    const advisoryFn = source.slice(
+      source.indexOf('\nsmoke_turn_canary_advisory() {'),
+      source.indexOf('\n# 2026-07-17 架构纠偏'),
+    )
+    assert.match(advisoryFn, /\n  return 0\n\}/, 'advisory 真 turn 必须恒返回 0(非阻断)')
+    assert.equal(
+      (advisoryFn.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n').match(/return [1-9]/g) ?? []).length,
+      0,
+      'advisory 真 turn 不得有任何非零返回路径 —— 给逃生通道加阻断门 = 把救援自我否决',
+    )
+
+    // ② tape batching 补偿路径不得再用 `|| true` 吞掉恢复结果:操作者必须能区分
+    //    「已安全回到 flag=0 且健康」与「回退了但服务已挂」。
+    const batching = source.slice(
+      source.indexOf('\nenable_runtime_tape_batching() {'),
+      source.indexOf('\n# 自动回切的 lossless 能力门'),
+    )
+    const compensation = batching.slice(batching.indexOf('require_mutation_lease_for_compensation "runtime-batching-compensation"'))
+    const compensationCode = compensation
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .join('\n')
+    assert.equal(
+      (compensationCode.match(/\|\| true/g) ?? []).length,
+      0,
+      'batching 补偿三步不得用 || true 吞掉恢复结果',
+    )
+    assert.match(compensation, /batch_recover_failed/, '补偿必须逐步取退出码并汇总判词')
+    assert.match(compensation, /mark_deploy_recovery_required/, '恢复未确认必须落 durable marker 阻断下次发布')
+    assert.match(compensation, /✓ 已确认回到 flag=0 且服务健康/, '恢复确认必须有明确判词')
+
+    // ③ begin_planned_maintenance 不得在 svc_v5/http_v5 全挂时继续叠加新 release;
+    //    但 rollback lane 与显式确认永远放行(新门绝不许挡住恢复路径)。
+    const bpm = source.slice(
+      source.indexOf('\nbegin_planned_maintenance() {'),
+      source.indexOf('\nend_planned_maintenance() {'),
+    )
+    assert.match(bpm, /is_healthy svc_v5 \|\| missing_core\+=\(svc_v5\)/)
+    assert.match(bpm, /is_healthy http_v5 \|\| missing_core\+=\(http_v5\)/)
+    assert.match(
+      bpm,
+      /\[\[ "\$mode" != rollback && "\$onto_unhealthy" != 1 \]\]/,
+      'rollback lane 与显式确认必须永远放行(在坏服务上回退正是救援本身)',
+    )
+    assert.match(bpm, /exit 21/, 'fail-closed 必须用独立 rc 让本地侧给出可操作指引')
+    assert.match(bpm, /bpm_rc" == 21/, '本地侧必须翻译 rc=21')
+    assert.match(bpm, /OC_DEPLOY_ONTO_UNHEALTHY/, '必须提供明示确认逃生口')
+    assert.match(bpm, /onto_unhealthy:\$onto_unhealthy/, '强行叠加必须写进 maintenance marker 留痕')
+  })
+
+  // 门禁豁免 = durable debt(2026-07-26 出口矩阵整改的架构主线;审计 7)。
+  // 此前五个豁免 env 都是「一条 env + 一句 echo」把门整个关掉:不落持久证据、monitor 看不见、
+  // 下一次发布照跑不误 —— 豁免强度比门本身还高。本断言把它掰正后的形态钉死,防止回退。
+  test('gate waivers are durable debts that block the next ordinary release', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // ① 五个豁免 env 全部登记进注册表,且各有还债 lane。
+    assert.match(
+      source,
+      /GATE_WAIVER_KEYS="smoke-turn e2e-journey finalize-egress-gate capmatrix-compat canary-turn-cost ci-verification"/,
+      '所有豁免 key 必须全在单一注册表里(新增豁免 env/旗标必须同步登记)',
+    )
+    for (const [key, env] of [
+      ['smoke-turn', 'V5_SMOKE_TURN'],
+      ['e2e-journey', 'V5_SMOKE_E2E'],
+      ['canary-turn-cost', 'V5_CANARY_REQUIRE_COST'],
+      ['finalize-egress-gate', 'OC_FINALIZE_SKIP_EGRESS_GATE'],
+      ['capmatrix-compat', 'OC_CAPMATRIX_COMPAT'],
+    ] as const) {
+      const envFn = source.slice(
+        source.indexOf('\ngate_waiver_env_active() {'),
+        source.indexOf('\nrecord_gate_waiver() {'),
+      )
+      assert.ok(
+        new RegExp(`^\\s*${key}\\)[^\\n]*\\b${env}\\b`, 'm').test(envFn),
+        `豁免 key=${key} 未绑定到 env ${env}(gate_waiver_env_active 缺分支)`,
+      )
+      assert.ok(
+        new RegExp(`^\\s*${key}\\)\\s+echo "`, 'm').test(source),
+        `豁免 key=${key} 未登记还债 lane(gate_waiver_repay_modes 缺分支)`,
+      )
+    }
+    // ② 记账失败 = fail-closed(绝不出现「豁免生效但没人记账」)。
+    const record = source.slice(
+      source.indexOf('\nrecord_gate_waiver() {'),
+      source.indexOf('\nclear_gate_waiver() {'),
+    )
+    assert.match(record, /base64 -w0 <"\$marker"\)" == "\$encoded"/, 'marker 必须写后回读校验')
+    assert.match(record, /门禁豁免债务写入\/回读失败[\s\S]*return 1/, '写入失败必须返回非零让门保持强制')
+    const declared = source.slice(
+      source.indexOf('\nrecord_declared_gate_waivers() {'),
+      source.indexOf('\n# ── 传统 deploy/dist/rollback 的严格状态快照'),
+    )
+    assert.match(declared, /for key in \$GATE_WAIVER_KEYS/, '入口记账必须遍历整个注册表')
+    assert.match(declared, /return 1/, '入口记账失败必须拒绝发布')
+    // ③ 闸的挂载点与放行集合:恢复/回退 lane 永不被阻断(回退优先于任何新门)。
+    const gateBlock = source.slice(
+      source.indexOf('# 门禁豁免债务闸(2026-07-26)'),
+      source.indexOf('# Legacy marker 兼容权只在会 build/flip/放量 master release'),
+    )
+    assert.ok(gateBlock.length > 0, '门禁豁免债务闸未挂载')
+    for (const recoveryLane of ['abort', 'rollback', 'recover', 'hide-luna']) {
+      assert.ok(
+        new RegExp(`(^\\s*|\\|)${recoveryLane}(\\||\\))`, 'm').test(gateBlock),
+        `恢复 lane ${recoveryLane} 必须在放行集合里 —— 新门绝不许挡住回退路径`,
+      )
+    }
+    assert.ok(
+      gateBlock.indexOf('assert_no_open_gate_waivers') <
+        gateBlock.indexOf('record_declared_gate_waivers'),
+      '必须先查旧债再记新债(反了会把本次刚写的 marker 当旧债自我阻塞)',
+    )
+    // ④ 每个 key 都有真跑通过后的自动销账点,且销账不得在带着同一豁免 env 时发生。
+    assert.match(source, /clear_gate_waiver smoke-turn/)
+    assert.match(source, /clear_gate_waiver e2e-journey/)
+    assert.match(
+      source,
+      /\[\[ "\$\{OC_FINALIZE_SKIP_EGRESS_GATE:-0\}" == 1 \]\] \|\| clear_gate_waiver finalize-egress-gate/,
+      '带着 OC_FINALIZE_SKIP_EGRESS_GATE 跑出来的「通过」不是证据,不得销账',
+    )
+    assert.match(
+      source,
+      /\[\[ -n "\$\{OC_CAPMATRIX_COMPAT:-\}" \]\] \|\| clear_gate_waiver capmatrix-compat/,
+      '带着 OC_CAPMATRIX_COMPAT 跑出来的「兼容」不是证据,不得销账',
+    )
+    // ⑤ monitor 必须看得见(否则债务只在部署输出里闪一下就没人知道)。
+    const monitor = await readFile(path.join(root, 'scripts/v5-monitor.sh'), 'utf8')
+    assert.match(monitor, /check_gate_waivers\(\)/, 'monitor 缺门禁豁免债务探针')
+    assert.match(monitor, /^check_gate_waivers$/m, 'monitor 探针未接进主流程')
+    assert.match(monitor, /gate_waivers\) echo warning|client_4xx_storm\|gate_waivers\) echo warning/,
+      'monitor 未给 gate_waivers 分级')
+    assert.match(monitor, /GATE_WAIVER_DIR=.*\.gate-waivers/, 'monitor 与 deploy 的 marker 目录必须同路径')
+  })
+
+  // 公网面 + 资产面(审计 8)。此前 deploy/--dist 的成功出口没有任何一层经 Caddy 公网入口验证
+  // (smoke 全程 ssh 打 127.0.0.1:port,journey 走 ssh 隧道直连 master 端口),而 dist 握手只
+  // 抓 index.html 的 oc-build meta —— 哈希 chunk 404 / admin.html 白屏都能带门全绿上线。
+  test('public entry and asset reachability are verified before a lane is declared successful', async () => {
+    const source = await readFile(deploy, 'utf8')
+    // ① 公网面:带 Host 头经 Caddy 打,断言 ok:true ∧ slot=期望(verify_routing 现成)。
+    const pub = source.slice(
+      source.indexOf('\nverify_public_surface() {'),
+      source.indexOf('\n# 资产可达性'),
+    )
+    assert.match(pub, /v5-caddy-apply\.sh" --verify/, '公网面必须走 verify_routing')
+    assert.match(pub, /CADDY_HTTP_PORT="\$CADDY_HTTP_PORT"/, '必须打 Caddy 入口端口而非 master 端口')
+    assert.match(pub, /return 1/, '公网面失败必须非零')
+    // ② 资产面:index.html 与 admin.html 各自首个 /assets/*.js 必须 200 且是 JS
+    //    (SPA fallback 会把 404 兜成 index.html,只看状态码不够)。
+    const asset = source.slice(
+      source.indexOf('\nverify_asset_surface() {'),
+      source.indexOf('\n# C5:rollback 收尾后的 real-turn canary'),
+    )
+    assert.match(asset, /for page in \/ \/admin\.html/, 'admin.html 是第二入口,必须单独校验')
+    assert.match(asset, /\/assets\/\[A-Za-z0-9\._-\]\*\\\.js/, '必须解析 index/admin 引用的哈希 chunk')
+    assert.match(asset, /'%\{http_code\}'/, '必须断言 chunk HTTP 状态码')
+    assert.match(asset, /javascript\|ecmascript/, '必须断言 Content-Type 是 JS(防 SPA fallback 假绿)')
+    // ③ 资产面并入 dist 握手 → deploy/--dist/finalize 三个握手点一次到位。
+    const handshake = source.slice(
+      source.indexOf('\ndist_handshake_smoke() {'),
+      source.indexOf('\n# ───────────────────────── smoke:健康 + 隔离断言'),
+    )
+    assert.match(handshake, /verify_asset_surface "\$sport" \|\| return 1/, 'dist 握手必须连带资产可达性')
+    // ④ deploy 与 --dist 的 validation 链都必须过公网面,且失败进补偿链(不是裸退出)。
+    for (const [lane, marker] of [
+      ['deploy', 'validation_failure="public/asset surface verification failed'],
+      ['dist', 'dist_validation_failure="public/asset surface verification failed'],
+    ] as const) {
+      assert.ok(source.includes(`verify_public_surface ${lane}`), `${lane} 未挂公网面验证`)
+      assert.ok(source.includes(marker), `${lane} 的公网面失败必须写 validation_failure 进补偿链`)
+    }
+  })
+
+  // 部署与 CI 绿的机械绑定(审计 9)。分支保护只管「合进 canonical」,不管「部署哪个 commit」;
+  // 仓内已有走 hotfix 分支绕过 CI 直接部署的先例。本断言锁死第二道门的存在与挂载点。
+  test('the commit being built into a release must have green required CI checks', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const fn = source.slice(
+      source.indexOf('\nassert_ci_green_for_source_commit() {'),
+      source.indexOf('\nbuild_release() {'),
+    )
+    assert.ok(fn.length > 0, 'CI 绿门函数缺失')
+    // 判定源必须是分支保护的 required contexts(不是「所有 check 全绿」:一个 flaky 可选 job
+    // 就能卡死正常发布),并逐个比对 commit 的 check-run 结论。
+    assert.match(fn, /protection\/required_status_checks/, '必须以分支保护的必需集为判定口径')
+    assert.match(fn, /commits\/\$sha\/check-runs/, '必须查的是被构建的那个 commit 的 check-run')
+    assert.match(fn, /\^\(success\|skipped\|neutral\)\$/, 'conclusion 白名单必须显式')
+    assert.match(fn, /unverifiable=/, '证据取不到必须与「取到且是红的」一样进阻断分支')
+    // 逃生口必须显式且记账。
+    assert.match(fn, /ALLOW_UNVERIFIED_CI" != 1/, '缺显式逃生旗标判定')
+    assert.match(fn, /record_gate_waiver ci-verification[\s\S]*\|\| return 1/, '逃生必须登记 durable debt 且记账失败即拒绝')
+    assert.match(fn, /clear_gate_waiver ci-verification/, '全绿必须自动销账')
+    assert.match(source, /--allow-unverified-ci\) ALLOW_UNVERIFIED_CI=1/, '缺 CLI 旗标')
+    assert.match(source, /ALLOW_UNVERIFIED_CI=0/, 'ALLOW_UNVERIFIED_CI 必须默认关(fail-closed)')
+    // 挂载点 = build_release 里 source commit 钉死之后、任何远端写之前。
+    const build = source.slice(
+      source.indexOf('\nbuild_release() {'),
+      source.indexOf('mkdir -p \'$staging\''),
+    )
+    const pin = build.indexOf('BUILT_RELEASE_SOURCE_COMMIT="$full_sha"')
+    const gate = build.indexOf('assert_ci_green_for_source_commit "$full_sha" || return 1')
+    assert.ok(pin >= 0 && gate > pin, 'CI 绿门必须挂在 build_release 里 source commit 钉死之后')
+    // ci-verification 有意不参与连环跳禁令(gh 故障会互锁),这条要留在代码里防被"顺手统一"。
+    const envFn = source.slice(
+      source.indexOf('\ngate_waiver_env_active() {'),
+      source.indexOf('\nrecord_gate_waiver() {'),
+    )
+    assert.match(envFn, /ci-verification\)\s+return 1 ;;/,
+      'ci-verification 不得参与连环跳禁令,否则一次 gh 故障就锁死所有发布(含热修)')
+  })
+
+  test('E2E journey gate is part of the shared minimum functional core and fails loud', async () => {
     const source = await readFile(deploy, 'utf8')
     // 函数本体契约。
-    const fnStart = source.indexOf('\nsmoke_e2e_journey() {')
-    assert.ok(fnStart >= 0, 'smoke_e2e_journey 函数缺失')
+    const fnStart = source.indexOf('\nsmoke_e2e_journey() { # [port]')
+    assert.ok(fnStart >= 0, 'smoke_e2e_journey 函数缺失或未参数化目标端口')
     const fnEnd = source.indexOf('\n}', fnStart)
     const fn = source.slice(fnStart, fnEnd)
     assert.match(fn, /V5_SMOKE_E2E:-1/, '缺 V5_SMOKE_E2E 豁免开关')
+    assert.match(
+      fn,
+      /record_gate_waiver e2e-journey [^\n]*\|\| return 1/,
+      'V5_SMOKE_E2E=0 豁免必须登记 durable debt,且登记失败即门保持强制',
+    )
     assert.match(fn, /node_modules\/playwright-core/, '缺依赖活体探测(缺失必须 fail-loud 而非静默跳过)')
     assert.match(fn, /return 1/, '依赖缺失/旅程失败必须返回非零')
     assert.match(fn, /\[dry-run\]/, '缺 dry-run 分支')
     assert.match(fn, /v5-e2e-journey-canary\.mjs/, '未调用旅程脚本')
-    // 接线契约:调用形态必须是 `smoke_e2e_journey || exit 1`(裸调用在管道/条件上下文
-    // 会被 set -e 放过 = fail-open),且四个成功出口(deploy setup-first/zero-touch/主路径
-    // + dist)各一处、全部位于对应 end_planned_maintenance 之后。
-    const calls = source.match(/smoke_e2e_journey \|\| exit 1/g) ?? []
-    assert.equal(calls.length, 4, `期望 4 个成功出口接线,实际 ${calls.length}`)
-    for (const exitMarker of [
-      'knowledge-planet=setup-first)。"',
-      'knowledge-planet=zero-touch)。"',
-      '"✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
-      '"✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"',
-    ]) {
-      const exitAt = source.indexOf(exitMarker)
-      assert.ok(exitAt >= 0, `成功出口标记缺失: ${exitMarker}`)
-      const windowStart = source.lastIndexOf('end_planned_maintenance', exitAt)
-      const gateAt = source.lastIndexOf('smoke_e2e_journey || exit 1', exitAt)
-      assert.ok(
-        gateAt > windowStart && gateAt < exitAt,
-        `出口「${exitMarker}」的 E2E 门未落在 end_planned_maintenance 与完成 echo 之间`,
-      )
+    assert.match(fn, /V5_E2E_REMOTE_PORT="\$port"/, '旅程必须打调用方指定的端口(candidate lane 切流前跑)')
+    // 旧的「成功出口裸接 || exit 1」形态必须彻底消失 —— 它正是本次整改要消灭的无效门。
+    assert.equal(
+      (source.match(/smoke_e2e_journey \|\| exit 1/g) ?? []).length,
+      0,
+      '不得再在成功出口(切流之后)裸接 journey:失败必须进补偿/abort 链',
+    )
+    // 唯一合法调用点 = 最小功能核内部。
+    const coreStart = source.indexOf('\nminimum_functional_core() {')
+    assert.ok(coreStart >= 0, 'minimum_functional_core 缺失')
+    const coreEnd = source.indexOf('\n}', coreStart)
+    const core = source.slice(coreStart, coreEnd)
+    assert.match(core, /smoke_turn_matrix "\$release" "\$port" \|\|/, '最小功能核缺双引擎真 turn')
+    assert.match(core, /smoke_e2e_journey "\$port" \|\|/, '最小功能核缺 J1-J5 旅程')
+    const journeyCalls = source.match(/^\s*smoke_e2e_journey\b/gm) ?? []
+    assert.equal(
+      journeyCalls.length,
+      2,
+      `journey 只允许「函数定义 + 最小功能核内一处调用」,实际 ${journeyCalls.length} 处`,
+    )
+  })
+
+  // 出口矩阵(审计 1/2/3/4/5/6):每条会改变用户流量走向的 lane 都必须过同一个最小功能核,
+  // 且必须挂在**切流之前**或**能回退的补偿链里**。本断言锁死挂载点,防止再退回残缺矩阵。
+  test('minimum functional core is wired into every traffic-shifting lane', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const slice = (fnHeader: string, nextHeader: string) => {
+      const a = source.indexOf(fnHeader)
+      assert.ok(a >= 0, `找不到 ${fnHeader}`)
+      const b = source.indexOf(nextHeader, a)
+      assert.ok(b > a, `找不到 ${fnHeader} 的结束锚点 ${nextHeader}`)
+      return source.slice(a, b)
     }
+
+    // ① deploy:进 validation_failure 对称补偿链(失败 → 回旧 source/账号版本)。
+    const deployBody = slice('\ndeploy() {', '\n# ───────────────────────── offline recycle')
+    const deployCore = deployBody.indexOf('minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"')
+    const deployCompensate = deployBody.indexOf('knowledge_planet_compensate_deploy')
+    assert.ok(deployCore >= 0, 'deploy 未挂最小功能核')
+    assert.match(
+      deployBody.slice(deployCore - 220, deployCore + 220),
+      /validation_failure="minimum functional core failed/,
+      'deploy 的最小功能核失败必须写 validation_failure(进补偿链),不得裸 exit',
+    )
+    assert.ok(deployCompensate > deployCore, 'deploy 的补偿链必须在最小功能核之后')
+
+    // ② --dist:补齐真 turn 硬门 + 对称补偿(此前是零补偿的 set -e 裸退出)。
+    const distBody = slice('\ndeploy_dist() {', '\ncompensate_dist_activation() {')
+    assert.match(distBody, /minimum_functional_core dist "\$BUILT_RELEASE" "\$ACTIVE_PORT"/)
+    assert.match(distBody, /dist_validation_failure="minimum functional core failed/)
+    const distPrevCapture = distBody.indexOf('dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"')
+    const distFlip = distBody.indexOf('activate_release "$BUILT_RELEASE"')
+    assert.ok(distPrevCapture >= 0 && distFlip > distPrevCapture, '--dist 回退点必须在翻转前钉死')
+    assert.match(
+      distBody,
+      /compensate_dist_activation "\$BUILT_RELEASE" "\$dist_previous_release" "\$hc_any"/,
+      '--dist 校验失败必须走对称补偿',
+    )
+    // 补偿必须复用既有机制,不得另造一套。
+    const distCompensate = slice('\ncompensate_dist_activation() {', '\n# ───────────────────────── rollback')
+    assert.match(distCompensate, /require_mutation_lease_for_compensation "dist-activation-compensation"/)
+    assert.match(distCompensate, /rollback_runtime_tuple 1 1 "\$candidate" 0/)
+    assert.match(distCompensate, /activate_release "\$previous"/)
+
+    // ③ canary READY:percent=0 不碰真实流量,成本极低,却是放量前唯一的功能证据。
+    const canaryBody = slice('\ncanary() {', '\n_internal_allowlist_sql() {')
+    const canaryCore = canaryBody.indexOf('minimum_functional_core "canary-ready"')
+    assert.ok(canaryCore >= 0, 'canary READY 后未跑最小功能核')
+    assert.ok(
+      canaryBody.indexOf('✓ --canary 完成') > canaryCore,
+      'canary 的最小功能核必须在完成 echo 之前',
+    )
+
+    // ④ promote:真实用户暴露从 promote 才开始;CAS 抬 percent 之前必须先探 candidate。
+    // 探针不能用 vip_control_gate —— 它断言 state=leader ∧ vip=owner,那是 finalize step4
+    // 交接后的不变量;canary 期 candidate 恒为 standby,挂它会让每次正常放量都失败。用本
+    // lane 自己的就绪不变量 wait_for_candidate_ready + 一条三信号真 turn。
+    const promoteBody = slice('\npromote() {', '\negress_baseline_journal_fragment() {')
+    const promoteGate = promoteBody.indexOf('wait_for_candidate_ready "$DS_candidate_slot"')
+    const promoteTurn = promoteBody.indexOf('smoke_turn_matrix "$promote_candidate"')
+    const promoteCas = promoteBody.indexOf('ds_cas_or_die "cohort_percent=$PROMOTE_PCT')
+    assert.ok(promoteGate >= 0 && promoteTurn >= 0 && promoteCas >= 0, 'promote 缺 candidate 探针')
+    assert.ok(
+      promoteGate < promoteCas && promoteTurn < promoteCas,
+      'promote 的 candidate 探针必须在抬 cohort_percent 之前(放量后再探等于没探)',
+    )
+    assert.ok(
+      !/vip_control_gate "\$DS_candidate_slot"/.test(promoteBody),
+      'promote 不得用 vip_control_gate 做探针(canary 期 candidate 是 standby,必然失败=挡住正常放量)',
+    )
+
+    // ⑤ finalize:不可逆点之前补功能门,失败转 aborting 保留恢复路径。
+    const finalizeBody = slice('\nfinalize_run_steps() {', '\n# ═════════ lane: --abort ═════════')
+    const finalizeCore = finalizeBody.indexOf('minimum_functional_core finalize-precommit')
+    const finalizeStop = finalizeBody.indexOf('sshk "systemctl stop $(slot_unit "$old")"')
+    const finalizeCommit = finalizeBody.indexOf("active_slot='$cand', previous_active_release=active_release")
+    assert.ok(finalizeCore >= 0, 'finalize 提交前未跑最小功能核')
+    assert.ok(finalizeCore < finalizeStop && finalizeCore < finalizeCommit,
+      'finalize 的功能门必须在 stop 旧 unit / commit stable 之前')
+    assert.match(
+      finalizeBody.slice(finalizeCore, finalizeCore + 900),
+      /ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit/,
+      'finalize 功能门失败必须转 aborting 保留恢复路径',
+    )
   })
 
   // 2026-07-26 安全整改:sourcemap 封堵四层防护的契约锁。

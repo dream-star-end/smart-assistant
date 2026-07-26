@@ -71,6 +71,8 @@ EGRESS_HEALTH_URL="${V5MON_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egres
 PUBLIC_HEALTH_URL="${V5MON_PUBLIC_URL:-http://127.0.0.1/healthz}"
 MAINTENANCE_FILE="${V5MON_MAINTENANCE_FILE:-/run/openclaude-v5/planned-maintenance.json}"
 MAINTENANCE_LOCK="${V5MON_MAINTENANCE_LOCK:-/run/openclaude-v5/planned-maintenance.lock}"
+# 门禁豁免债务目录(deploy-v5.sh 的 GATE_WAIVER_DIR 单一权威路径;两侧改动必须同步)。
+GATE_WAIVER_DIR="${V5MON_GATE_WAIVER_DIR:-/opt/openclaude/openclaude-v5-releases/.gate-waivers}"
 CUTOVER_ROOT="${V5MON_CUTOVER_ROOT:-/var/lib/openclaude-v5/cutovers}"
 
 # 统一告警管道(方案 §2.3-2):除站内信外,发告警时 psql 直插 admin_alert_outbox,
@@ -301,6 +303,26 @@ check_kp_plugin() {
   esac
 }
 
+check_gate_waivers() {
+  # 门禁豁免债务探针(2026-07-26 出口矩阵整改):部署门被 env 显式豁免时,deploy-v5.sh
+  # 会在 GATE_WAIVER_DIR 落一个持久 marker。此前这类豁免只在部署输出里 echo 一行就消失,
+  # 事后无人知道「上线的这个版本其实没跑过真 turn / 没跑过 E2E 旅程 / 没过计费守恒门」。
+  # 本探针让它常驻可见:有未偿还债务 = 现网 active 版本存在未验证面,须尽快补跑门销账。
+  local open_keys count
+  if [ ! -d "$GATE_WAIVER_DIR" ]; then
+    record gate_waivers ok "门禁豁免债务:无(目录不存在)"; return
+  fi
+  if ! open_keys="$(ls -1 "$GATE_WAIVER_DIR" 2>&1)"; then
+    record gate_waivers bad "门禁豁免债务:读 $GATE_WAIVER_DIR 失败:$(echo "$open_keys" | head -c 120)"; return
+  fi
+  open_keys="$(echo "$open_keys" | tr '\n' ' ' | sed 's/ *$//')"
+  if [ -z "$open_keys" ]; then
+    record gate_waivers ok "门禁豁免债务:无未偿还项"; return
+  fi
+  count="$(echo "$open_keys" | wc -w | tr -d ' ')"
+  record gate_waivers bad "门禁豁免债务未偿还 ${count} 项:${open_keys} —— 现网 active 版本有未验证的门禁面(真 turn/E2E 旅程/计费守恒等),且下一次普通发布已被阻断;补跑对应门即自动销账"
+}
+
 check_client_4xx_storm() {
   # 客户端 4xx 重试风暴:同一 clientIp × route 在窗口内 >阈值 次 4xx。数据源 = 结构化 app 日志
   # (router.ts 每条 HttpError 打 {"msg":"http_error","status":4xx,"route":...,"clientIp":...,"ts":...})。
@@ -513,8 +535,9 @@ check_severity() {
     # http_v3 已随 v3 通道彻底下线(2026-07-08)从名单摘除,不再占 critical 位。
     deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|public_route|pool|image|mail|turn_failures|backup_fresh) echo critical ;;
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化;
-    # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警。均按 warning。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe) echo warning ;;
+    # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警;
+    # 门禁豁免债务 = 已上线版本有未验证面 + 下次发布被阻断,不是全站故障但必须常驻可见。均按 warning。
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -547,6 +570,7 @@ check_image
 check_mail
 check_turn_failures
 check_kp_plugin
+check_gate_waivers
 check_client_4xx_storm
 check_failed_units
 check_backup_fresh
