@@ -1,0 +1,20 @@
+# Incident trailer 闭环门的生效锚点(marker 文件)
+#
+# 门的生效起点 = **本文件被 git 添加的那个 commit**,由 checker 运行时计算:
+#     git log --diff-filter=A --format=%H -- e2e/session-display/incident-trailer-enforced-from
+#
+# 为什么不写死 SHA(2026-07-26 连踩两次):
+#   ① 写死的 SHA 怕 rebase:门第一次落地时起点钉的是分支 rebase 前的 commit,
+#      分支合入前被 rebase 4 次,SHA 消失 → 门走"起点不可达"分支静默跳过,
+#      从落地起一次都没跑过。
+#   ② 写死的 SHA 还怕并行合入:把起点校准到"我写代码时的 HEAD"之后,其他会话
+#      在我的 PR 排队期间合入的 commit 就落在起点之后,而他们当时无从知晓这个
+#      新要求 —— 门会拦住无辜的人,而且每次排队都重演。
+#
+# 运行时自算同时解决两条:文件在哪个 commit 被添加,门就从那个 commit 之后生效。
+# rebase 改变 SHA 无影响(重新算就是新的),门未合入时算不出起点(自动不生效)。
+#
+# 【不要重命名本文件】锚点靠 `--diff-filter=A` 从历史里找"它是哪次被添加的",
+# 所以即便把文件删掉,锚点依然算得出(历史里的添加记录还在)—— 但改名会让
+# checker 找不到添加记录,退化成"门尚未生效"而静默不检查。
+# 算得出锚点却在完整克隆里不可达(历史被重写)时,checker fail-closed 报红。

@@ -37,23 +37,27 @@ const ASSERTION_DEBT_BASELINE = 37;
  */
 const PROOF_PENDING_BASELINE = 9;
 
-// ── Incident trailer 闭环门的生效起点 ───────────────────────────────────────
-// 这道门只检查**起点之后**的历史:起点之前的 fix(v5) commit 没有 Incident trailer
-// 约定,回溯要求会让门天天红且无法补救(commit message 不可改写)。起点写死在这里,
-// 不随 manifest 变动;要前移起点=一次显式决定。
-// 2026-07-26 更正(一次显式的起点前移,理由记录如下):
-//   原值 cfa210cc… 是 feat/v5-gate-live-evidence **rebase 前**的 commit。该分支在合入
-//   canonical 前被 rebase 了 4 次,原 SHA 随之消失 → 起点不可达 → 门走 WARN 分支静默
-//   跳过。也就是说:门从落地那一刻起就没有检查过任何东西。
-//   在门失效的那段窗口里,门禁批自己又写了 3 个 fix(v5) commit(d514c700 / e1f5383e /
-//   fcb30ef3,均为门禁基建,非用户可见修复)。它们已合入 canonical,commit message
-//   不可改写,而本门对"缺 trailer"不接受 waiver(waiver 只兜 `Incident: none`)——
-//   对它们回溯要求 trailer 会让门永久红且无法补救,正是本常量注释一开始就要避免的情形。
-//   因此把起点前移到 caaa49475(门禁五批全部合入后的 canonical HEAD):**门从此刻起
-//   对所有新 commit 生效**,不追溯它自己失效期间的产物。
-// **写死 SHA 的门天生怕 rebase**:所以下面的"起点不可达"分支已从 WARN 跳过改成
-// fail-closed(仅浅克隆例外),下次再失效会立刻红,而不是安静地什么都不检查。
-const TRAILER_GATE_START = "caaa494750da120bc978fb056dafacc894efacf2";
+// ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
+// 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
+//   ① 怕 rebase:门首次落地时起点钉的是分支 rebase 前的 commit,分支合入前被
+//      rebase 4 次 → SHA 消失 → 走"起点不可达"分支静默跳过,从落地起一次没跑过;
+//   ② 怕并行合入:校准到"我写代码时的 HEAD"之后,其他会话在我 PR 排队期间合入的
+//      commit 就落在起点之后,而他们无从知晓这个新要求 —— 门拦住无辜的人,且每次
+//      排队都重演(2026-07-26 实测拦到了别人的 0191 模型接入 commit)。
+// 运行时自算同时解决两条,详见 marker 文件自身的注释。
+const TRAILER_GATE_MARKER = "e2e/session-display/incident-trailer-enforced-from";
+function resolveTrailerGateStart(): string | null {
+  let out: string;
+  try {
+    out = git("log", "--diff-filter=A", "--format=%H", "--", TRAILER_GATE_MARKER);
+  } catch {
+    return null;
+  }
+  // 同一路径可能被删后重加:取最早那次添加。
+  const commits = out.split("\n").map((line) => line.trim()).filter(Boolean);
+  return commits.length > 0 ? commits[commits.length - 1] : null;
+}
+
 const TRAILER_GATE_SURFACES = [
   "packages/gateway/",
   "packages/commercial/",
@@ -338,9 +342,17 @@ function parseWaivers(): Map<string, Waiver> {
 }
 
 function checkTrailerClosure(): number {
+  const start = resolveTrailerGateStart();
+  if (start === null) {
+    // marker 尚未提交 = 门本身还没合入 → 还没到生效的时候,不冒充检查过。
+    process.stdout.write(
+      "[incident-regressions] trailer 闭环门尚未生效(marker 未提交),本次跳过\n",
+    );
+    return 0;
+  }
   try {
-    git("cat-file", "-e", `${TRAILER_GATE_START}^{commit}`);
-    execFileSync("git", ["merge-base", "--is-ancestor", TRAILER_GATE_START, "HEAD"], { cwd: ROOT });
+    git("cat-file", "-e", `${start}^{commit}`);
+    execFileSync("git", ["merge-base", "--is-ancestor", start, "HEAD"], { cwd: ROOT });
   } catch {
     // 起点不可达有两种原因,必须区别对待 —— 此前一律 WARN 跳过,等于把
     // "门失效" 伪装成 "门通过"(2026-07-26 实测:分支 rebase 后原 SHA 消失,
@@ -361,15 +373,14 @@ function checkTrailerClosure(): number {
       return 0;
     }
     fail(
-      `trailer 闭环门起点 ${TRAILER_GATE_START.slice(0, 12)} 在完整克隆里不可达 —— ` +
-        "起点写错或已被 rebase 冲掉,这道门当前什么都没在检查。" +
-        "修法:把 TRAILER_GATE_START 改成本分支真实存在的祖先 commit(见该常量上方注释)。",
+      `trailer 闭环门锚点 ${start.slice(0, 12)}(${TRAILER_GATE_MARKER} 的引入 commit)在完整克隆里不可达 —— ` +
+        "这道门当前什么都没在检查。marker 文件被删/被重写历史都会导致这个状态。",
     );
     return 0;
   }
   const waivers = parseWaivers();
   const today = new Date().toISOString().slice(0, 10);
-  const log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", `${TRAILER_GATE_START}..HEAD`);
+  const log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", `${start}..HEAD`);
   let checked = 0;
   for (const entry of log.split("\x1e").map((line) => line.trim()).filter(Boolean)) {
     const [sha, subject, body = ""] = entry.split("\x1f");
