@@ -37,7 +37,11 @@ test('resend-dedup:同 clientMessageId 重发不出双回复/不双计费', asyn
   // (下方 API user 行=1 亦是证据);此处仅记录,不硬断言拒绝路径(不同引擎/构建机制不同)。
   if (benign.length > 0) console.log(`[dedup] 第二帧被去重拒绝(预期): ${benign[0].slice(0, 120)}`);
 
-  // 绝不双计费:cost_charged 至多 1 次(免单套餐可能 0 次)。
+  // 上界断言必须配下界:只写"≤1"时,一条回复都没有(0 回复/0 计费)照样判绿,
+  // 而 INC-20260718-RESEND-DUPLICATE 的邻域故障恰恰是"turn 被去重成零"。先证明这一轮
+  // 真的跑完了(拿到 final 帧),再断"恰好一次"。(对照 09 的 exact 断言写法。)
+  expect(result.sawFinal, '本轮必须真的收到 final 帧(否则"不双回复"是因为一条都没有)').toBeTruthy();
+  // 绝不双计费:cost_charged 至多 1 次(免单套餐可能 0 次,故此处仍是上界)。
   expect(result.costCount, `重复帧导致了 ${result.costCount} 次计费(应 ≤ 1)`).toBeLessThanOrEqual(1);
 
   // API 佐证:该 cmid 只落 1 条 user 行、至多 1 条 assistant 回复(无双回复)。
@@ -47,12 +51,12 @@ test('resend-dedup:同 clientMessageId 重发不出双回复/不双计费', asyn
   );
   expect(userMatches.length, '同 cmid 应只有 1 条 user 行(去重)').toBe(1);
   const assistantMsgs = detail.messages.filter((m: any) => m.role === 'assistant' && String(m.text ?? '').trim());
-  expect(assistantMsgs.length, '不应出现双回复').toBeLessThanOrEqual(1);
+  expect(assistantMsgs.length, '应恰好 1 条 assistant 回复(0 条=turn 被吞,2 条=双回复)').toBe(1);
 
   // UI 佐证:打开会话,marker 的 user 行恰 1、assistant 正文行至多 1。
   await loginViaUi(page);
   await openSession(page, sid);
   await expect(SEL.userRows(page).filter({ hasText: `e2e-dedup-${uniq}` })).toHaveCount(1);
   const assistantRowCount = await SEL.assistantRows(page).locator('.prose').filter({ hasText: /\S/ }).count();
-  expect(assistantRowCount, 'UI 不应出现双回复').toBeLessThanOrEqual(1);
+  expect(assistantRowCount, 'UI 上应恰好 1 条 assistant 正文行(0 条=回复没上屏,2 条=双回复)').toBe(1);
 });

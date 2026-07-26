@@ -21,8 +21,10 @@
 
 ## 消息行
 - **关键 data-testid**(cards.tsx):user 行 wrapper=`user-row`、user 气泡=`message-text`、
-  assistant 行 wrapper=`assistant-row`、真实过程游标=`turn-process-card`。assistant 正文仍走既有
-  `.prose`(不侵入共享 Markdown 组件)。
+  assistant 行 wrapper=`assistant-row`。assistant 正文仍走既有 `.prose`(不侵入共享 Markdown 组件)。
+  ~~`turn-process-card`~~ 已删除:该 testid 从未在 packages/web-react 里实现过,靠它做的
+  `toHaveCount(0)` 负例断言恒真(2026-07-26 审计)。**新增 testid 必须先落到产品组件**,
+  `npm run check:v5:e2e-selectors` 会在 CI 静态校验 e2e 用到的每个 testid/aria-label 真实存在。
 - **选择器双模(lib/ui.ts SEL)**:testid 优先 + 既有 class 回退,**同元素同时命中两者→union 去重**
   (绝不祖先/后代双计)。user=`[data-testid=user-row], .flex.flex-col.items-end:has(.bg-bubble)`;
   assistant=`[data-testid=assistant-row], .group.flex.gap-4:has(.prose)`。故套件对"含 testid 的

@@ -1,6 +1,6 @@
 {
-  "schema": 1,
-  "scope": "V5 user-visible and release-gate P0/P1 regressions recorded from 2026-07-17 through 2026-07-23",
+  "schema": 2,
+  "scope": "V5 user-visible and release-gate P0/P1 regressions from 2026-07-17 onward. 每条证据必须写清 layer(在哪一层跑)+ path + assertion(该产物内部的精确锚点); checker 校验锚点真在文件里、layer↔路径形态一致、layer 能映射到真 runner、并要求 rootFixCommit/coverageCommits 至少动过一条登记的证据。",
   "fixedLiveMatrix": [
     {
       "engine": "codex",
@@ -25,11 +25,13 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts"
+          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
+          "assertion": "@smoke login → 会话 → 发送 → 重登后展示完整且顺序正确"
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts"
+          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
+          "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
         }
       ]
     },
@@ -46,11 +48,13 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts"
+          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
+          "assertion": "@smoke login → 会话 → 发送 → 重登后展示完整且顺序正确"
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
+          "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
       ]
     },
@@ -71,7 +75,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/05-turn-status.spec.ts"
+          "path": "e2e/session-display/tests/05-turn-status.spec.ts",
+          "assertion": "verified turn status:未计费状态展示 + late-tape 状态不显示"
         }
       ]
     },
@@ -88,11 +93,13 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts"
+          "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts",
+          "assertion": "@smoke 回复中途刷新:终态正确收敛,spinner 不永挂"
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
+          "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
       ]
     },
@@ -113,7 +120,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/07-resend-dedup.spec.ts"
+          "path": "e2e/session-display/tests/07-resend-dedup.spec.ts",
+          "assertion": "resend-dedup:同 clientMessageId 重发不出双回复/不双计费"
         }
       ]
     },
@@ -125,12 +133,24 @@
       "rootFixCommit": "1ebb9e07",
       "regressions": [
         {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/composerAttach.test.tsx",
+          "assertion": "点击附件 label 原生转发一次 click 到 file input（Radix 未吞掉默认激活）"
+        },
+        {
           "layer": "browser",
-          "path": "packages/web-react/src/components/composerAttach.test.tsx"
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T1 点「+」→「添加附件」→ filechooser 真实弹出"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T4 file input 结构红线:type=file/无 accept/非 display:none/tabindex=-1"
         },
         {
           "layer": "deploy-gate",
-          "path": "scripts/v5-e2e-journey-canary.mjs"
+          "path": "scripts/v5-e2e-journey-canary.mjs",
+          "assertion": "J2 附件全链:菜单→filechooser→真实上传→chip done"
         }
       ]
     },
@@ -147,7 +167,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts"
+          "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts",
+          "assertion": "poisoned IDB + empty incremental：过程卡在最终答复前且修复可持久化"
         }
       ]
     },
@@ -164,7 +185,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts"
+          "path": "e2e/session-display/tests/08-post-final-process-order.spec.ts",
+          "assertion": "poisoned IDB + empty incremental：过程卡在最终答复前且修复可持久化"
         }
       ]
     },
@@ -181,15 +203,23 @@
         },
         {
           "layer": "browser",
-          "path": "packages/web-react/browser-tests/run.mjs"
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T8 上滑零请求，点击只取一页、像素锚定且 remount 不重取"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T10 归档前插跨出虚拟挂载区仍保持原消息像素位置"
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/02-large-session-open.spec.ts"
+          "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
+          "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/06-archive-paging.spec.ts"
+          "path": "e2e/session-display/tests/06-archive-paging.spec.ts",
+          "assertion": "归档分页:无重复行 / 无空页死循环 / 游标收敛"
         }
       ]
     },
@@ -210,7 +240,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/02-large-session-open.spec.ts"
+          "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
+          "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
         }
       ]
     },
@@ -231,7 +262,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/02-large-session-open.spec.ts"
+          "path": "e2e/session-display/tests/02-large-session-open.spec.ts",
+          "assertion": "@smoke 大会话打开 < 3s 可交互 + 真实答复直出 + 工具记录惰性水合"
         }
       ]
     },
@@ -248,7 +280,8 @@
         },
         {
           "layer": "browser",
-          "path": "packages/web-react/browser-tests/run.mjs"
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T11 direct-timeline 思考完成后自动折叠且可完整展开"
         }
       ]
     },
@@ -269,7 +302,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
+          "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
       ]
     },
@@ -290,7 +324,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
+          "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
       ]
     },
@@ -302,14 +337,14 @@
       "rootFixCommit": "efabb603",
       "regressions": [
         {
-          "layer": "integration",
+          "layer": "unit",
           "path": "packages/commercial/src/plugins/weibo.test.ts"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-e2e-journey-canary.mjs"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "唯一 proof 证据原本填 scripts/v5-e2e-journey-canary.mjs,而该脚本只有 J1-J5 登录/附件/目标/发送/送达,与微博图片链路零关系(2026-07-26 审计),已移除充数证据;真活体证据待补(需要 Weibo 连接器的可重放沙箱)。",
+        "since": "2026-07-26"
+      }
     },
     {
       "id": "INC-20260721-WEIBO-WORKER-OOM",
@@ -319,18 +354,18 @@
       "rootFixCommit": "869fb3c9",
       "regressions": [
         {
-          "layer": "integration",
+          "layer": "unit",
           "path": "packages/commercial/src/plugins/weibo.test.ts"
         },
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/connectorsStore.integ.test.ts"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-e2e-journey-canary.mjs"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "同上:原 deploy-gate 证据与微博 worker OOM 无关,已移除;活体证据待补(需要大图 OOM 的可控复现路径)。",
+        "since": "2026-07-26"
+      }
     },
     {
       "id": "INC-20260723-KIMI-QUOTA-EXHAUSTED",
@@ -350,12 +385,12 @@
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/migrate.integ.test.ts"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-e2e-journey-canary.mjs"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "同上:原 deploy-gate 证据(J1-J5 旅程)不含任何 provider 配额熔断断言,已移除;活体证据待补(需要可注入的配额耗尽 provider)。",
+        "since": "2026-07-26"
+      }
     },
     {
       "id": "INC-20260723-PG-NUL-SIDECAR",
@@ -370,7 +405,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
+          "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
       ]
     },
@@ -395,7 +431,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
+          "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
       ]
     },
@@ -416,7 +453,8 @@
         },
         {
           "layer": "browser",
-          "path": "packages/web-react/browser-tests/run.mjs"
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T15 活动 turn 中专用 Ask UI 在移动端可点选并提交"
         },
         {
           "layer": "unit",
@@ -441,7 +479,8 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts"
+          "path": "e2e/session-display/tests/09-fixed-model-billing-evidence.spec.ts",
+          "assertion": "@release-gate fixed model route + durable terminal + sponsored billing evidence"
         }
       ]
     },
@@ -462,15 +501,18 @@
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts"
+          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
+          "assertion": "@smoke login → 会话 → 发送 → 重登后展示完整且顺序正确"
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts"
+          "path": "e2e/session-display/tests/03-reconnect-inflight.spec.ts",
+          "assertion": "断线重连:回复到达或明确失败,绝不永久静默"
         },
         {
           "layer": "live-e2e",
-          "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts"
+          "path": "e2e/session-display/tests/04-terminal-reconcile.spec.ts",
+          "assertion": "@smoke 回复中途刷新:终态正确收敛,spinner 不永挂"
         }
       ]
     },
@@ -482,8 +524,140 @@
       "rootFixCommit": "b9a1773c",
       "regressions": [
         {
-          "layer": "deploy-gate",
+          "layer": "unit",
           "path": "scripts/__tests__/v5ReleaseSafety.test.ts"
+        }
+      ],
+      "proofPending": {
+        "reason": "证据 scripts/__tests__/v5ReleaseSafety.test.ts 实际在 CI job v5-ops 里跑,属 unit 层(此前误标 deploy-gate);部署门内的活体证据待补。",
+        "since": "2026-07-26"
+      }
+    },
+    {
+      "id": "INC-20260725-USER-IMPACT-LOOPS",
+      "occurredAt": "2026-07-25",
+      "severity": "P0",
+      "symptom": "禁用模型的 turn 触发未按 turn 作用域的 UNAUTHORIZED_MODEL,整条用户 bridge 被关闭,重连重放反复命中同一拒绝;跨 agent 历史被叠加进已有 Codex 原生 resume 线程,耗尽上下文窗口后又复用被污染线程。",
+      "rootFixCommit": "29503944",
+      "coverageCommits": [
+        "0b928cb5",
+        "cc33f30d"
+      ],
+      "proofPending": {
+        "reason": "containment 走紧急通道先上线,回归只补到 unit 层;禁用模型/上下文耗尽两条路径尚无 live-e2e 或真浏览器证据(需要可注入的禁用模型与超长会话夹具)。",
+        "since": "2026-07-26"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "inbound.message 带 model 且未授权 → 精确拒帧且保持连接,避免重连重放"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "context_too_long: Codex exact context exhaustion error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/sessionsArchiveSpill.test.ts",
+          "assertion": "reserves first-request compact headroom for rebuilt CCB and Codex history"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260725-RECOVERY-RETRY-LOOP",
+      "occurredAt": "2026-07-25",
+      "severity": "P0",
+      "symptom": "上下文耗尽的 turn 落成 ENGINE_ERROR 被前端当作可自动恢复;master 原子拒绝为 source_not_recoverable 后,REST 全量同步又暴露同一 source 错误并无限次重新排程。",
+      "rootFixCommit": "83681d59",
+      "coverageCommits": [
+        "8f04bb2d"
+      ],
+      "proofPending": {
+        "reason": "恢复围栏的跨刷新持久化目前只有 unit 覆盖;真实浏览器/live 会话里的『失败轮不再无限自动重试』尚无活体证据。",
+        "since": "2026-07-26"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "atomic conflict returns scoped recoverySkipped ACK and never forwards"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "automatic checkpoint keeps the exact old tape and skipped ACK removes only its optimistic child"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260725-LEGACY-RECOVERY-LOOP",
+      "occurredAt": "2026-07-25",
+      "severity": "P0",
+      "symptom": "旧版前端 bundle 持续重发同一 rejected-recovery 帧,单条 WebSocket 上无限重试。",
+      "rootFixCommit": "40281ce9",
+      "coverageCommits": [
+        "d7817e40"
+      ],
+      "proofPending": {
+        "reason": "『旧 bundle 重复冲突帧在第二次即终止』只有 bridge 协议层 unit 覆盖;陈旧 bundle 的真实浏览器复现尚无活体夹具。",
+        "since": "2026-07-26"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "atomic conflict returns scoped recoverySkipped ACK and never forwards"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260725-STOP-RETRY-LINEAGE",
+      "occurredAt": "2026-07-25",
+      "severity": "P0",
+      "symptom": "切换助手后浏览器端 Stop 被重定向到新助手,原 turn continue 不掉;自动恢复/空回复/重启续跑的后代轮次也不受用户取消约束。",
+      "rootFixCommit": "6796ff82",
+      "coverageCommits": [
+        "d007c3d7"
+      ],
+      "proofPending": {
+        "reason": "Stop 血缘目前由 gateway/web-react unit 覆盖;真浏览器受信点击 Stop 的活体用例待补(browser-tests 尚无 Stop 场景)。",
+        "since": "2026-07-26"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "user Stop persistently fences automatic recovery even after server history sync"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateStopRepoInheritance.test.ts",
+          "assertion": "exact browser Stop finds the old assistant turn and cascades through its team tree"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260725-CONTEXT-OVERFLOW",
+      "occurredAt": "2026-07-25",
+      "severity": "P0",
+      "symptom": "超长 Codex 会话在 provider 确认 context_too_long 后没有重建更小的历史后缀,用户轮次确定失败;重放又可能重复已产生副作用的轮次。",
+      "rootFixCommit": "e5f5abe3",
+      "coverageCommits": [
+        "4617f2a5",
+        "30f2ed7a",
+        "edef2d27"
+      ],
+      "proofPending": {
+        "reason": "上下文重建当前只有 gateway unit 覆盖;『超长会话仍能继续对话』的 live-e2e 证据待补(需要能稳定造出超窗会话的夹具)。",
+        "since": "2026-07-26"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "Codex context overflow visibly rebuilds a smaller exact history suffix without backoff"
         }
       ]
     }

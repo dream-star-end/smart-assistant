@@ -29,7 +29,6 @@ export const SEL = {
   // 已有稳定锚点
   typing: (p: Page): Locator => p.locator('[aria-label="生成中"]'),
   historySkeleton: (p: Page): Locator => p.locator('[aria-label="正在加载会话历史"]'),
-  turnProcessCard: (p: Page): Locator => p.getByTestId('turn-process-card'),
   teamPanel: (p: Page): Locator => p.getByTestId('team-panel'),
   permissionCard: (p: Page): Locator => p.getByTestId('permission-card'),
   // 侧栏会话项
@@ -150,9 +149,24 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
   await SEL.sendBtn(page).click();
 }
 
+/** 当前页面上的终态错误指示计数(内联错误卡 + 重试按钮)。 */
+async function errorIndicatorCount(page: Page): Promise<number> {
+  const [dispatchLost, restarted, retry] = await Promise.all([
+    page.getByText(TEXT.dispatchLostTitle).count(),
+    page.getByText(TEXT.serviceRestart).count(),
+    SEL.retryActionBtn(page).count(),
+  ]);
+  return dispatchLost + restarted + retry;
+}
+
 /**
  * 等一轮 assistant 回复到终态:typing("生成中")消失 ∧ 至少一条 assistant 行有正文,
- * 或出现终态错误卡。返回 'reply' | 'error'。轮询实现,不死 sleep。
+ * 或**本轮新出现**终态错误卡。返回 'reply' | 'error'。轮询实现,不死 sleep。
+ *
+ * 为什么要基线(2026-07-26 审计):fixtures 的 sharedContext 是 worker scope,9 条用例
+ * 共用一个 BrowserContext。原实现循环第一件事就是"页面上存在任意重试按钮 → 判 error",
+ * 于是上一条用例遗留的错误卡会让本轮在 turn 还没开始时立刻返回 'error' —— 在接受
+ * error 的用例里就是隐蔽假绿。现在只认"相对进入时基线新增"的错误指示。
  */
 export async function waitForTurnSettled(
   page: Page,
@@ -160,13 +174,10 @@ export async function waitForTurnSettled(
 ): Promise<'reply' | 'error'> {
   const timeout = opts.timeoutMs ?? config().turnTimeoutMs;
   const deadline = Date.now() + timeout;
+  const errorBaseline = await errorIndicatorCount(page);
   for (;;) {
-    // 终态错误卡(内联 or 横幅)
-    const hasError =
-      (await page.getByText(TEXT.dispatchLostTitle).count()) > 0 ||
-      (await page.getByText(TEXT.serviceRestart).count()) > 0 ||
-      (await SEL.retryActionBtn(page).count()) > 0;
-    if (hasError) return 'error';
+    // 终态错误卡(内联 or 横幅):必须比进入时更多,才算本轮产生的错误。
+    if ((await errorIndicatorCount(page)) > errorBaseline) return 'error';
 
     const typingGone = (await SEL.typing(page).count()) === 0;
     const assistantWithText =

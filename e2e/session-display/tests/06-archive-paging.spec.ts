@@ -76,6 +76,16 @@ test('归档分页:无重复行 / 无空页死循环 / 游标收敛', async ({ p
   await openSession(page, targetSid);
 
   const cloudBtn = SEL.loadMoreCloud(page);
+  // 覆盖可见性:UI 逐页分支只在"账号里恰好存在带归档的会话"时执行 —— 在纯验证账号
+  // (fixtures 每条用例结束即删会话)上它从不执行,报告里却看不出来。把执行与否写进
+  // annotation,让"这条分支这次没跑"在 gate 产物里可见,而不是静默冒充覆盖。
+  // TODO(gate-audit-2026-07-26):补一个能主动造出归档会话的 seed 夹具,把分支变成必跑。
+  test.info().annotations.push({
+    type: 'archive-ui-paging',
+    description: archivedSid && total > 0
+      ? `executed (archivedSid=${archivedSid}, archivedRows=${total})`
+      : 'NOT EXECUTED — 账号内没有带归档的会话,本次只跑了 API 层不变量',
+  });
   if (archivedSid && total > 0) {
     let clicks = 0;
     let prevRows = -1;
