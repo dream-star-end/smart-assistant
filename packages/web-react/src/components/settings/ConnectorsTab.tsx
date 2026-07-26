@@ -33,6 +33,16 @@ function errText(e: unknown, fallback: string): string {
   return apiErrorMessage(e, fallback);
 }
 
+function managedSetupFailureText(
+  isWeibo: boolean,
+  setup: Pick<KnowledgePlanetSetupView, 'status' | 'errorCode'>,
+): string {
+  if (setup.status === 'expired') return '二维码已过期，请重新授权。'
+  if (isWeibo && setup.errorCode === 'UPSTREAM_FAILED')
+    return '微博触发了安全验证，本次授权已安全停止。请先在微博 App 完成安全验证并确认账号可正常使用，再重新授权；若仍反复出现，请稍后再试。'
+  return '本次授权未完成，请重试。'
+}
+
 /** oauth2_byoa provider 未下发 formFields 时的兜底字段（契约 body 键 clientId/clientSecret）。 */
 const DEFAULT_OAUTH_FIELDS: ConnectorFormField[] = [
   { key: "clientId", label: "Client ID", type: "text", required: true },
@@ -1359,9 +1369,7 @@ function ManagedBrowserSetupDialog({
           </Alert>
         )}
         {terminalFailure && (
-          <Alert tone="warning">
-            {setup.status === 'expired' ? '二维码已过期，请重新授权。' : '本次授权未完成，请重试。'}
-          </Alert>
+          <Alert tone="warning">{managedSetupFailureText(isWeibo, setup)}</Alert>
         )}
       </div>
     </Modal>

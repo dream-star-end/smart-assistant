@@ -1184,6 +1184,53 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
   })
 
+  test('微博安全验证失败时给出可操作指引，未知失败仍使用通用兜底', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [weiboPlugin()], accounts: [] })
+    mockedWeiboStart.mockResolvedValueOnce({
+      sessionId: '34343434-3434-4434-8434-343434343434',
+      status: 'failed',
+      phase: 'failed',
+      qrReady: false,
+      agentReady: true,
+      createdAt: '2026-07-25T23:18:46.000Z',
+      expiresAt: '2026-07-25T23:22:46.000Z',
+      errorCode: 'UPSTREAM_FAILED',
+    })
+
+    const { unmount } = render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('微博')
+    fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
+    let dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(
+      await within(dialog).findByText(/微博触发了安全验证.*请先在微博 App 完成安全验证/),
+    ).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: '重新授权' })).toBeEnabled()
+
+    unmount()
+    mockedWeiboStart.mockResolvedValueOnce({
+      sessionId: '35353535-3535-4535-8535-353535353535',
+      status: 'failed',
+      phase: 'failed',
+      qrReady: false,
+      agentReady: true,
+      createdAt: '2026-07-25T23:19:46.000Z',
+      expiresAt: '2026-07-25T23:23:46.000Z',
+      errorCode: 'UNKNOWN_FAILURE',
+    })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('微博')
+    fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
+    dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(await within(dialog).findByText('本次授权未完成，请重试。')).toBeInTheDocument()
+    expect(within(dialog).queryByText(/UNKNOWN_FAILURE/)).not.toBeInTheDocument()
+  })
+
   test('知识星球二维码 revision 更新时替换过期图片并回收旧 object URL', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
