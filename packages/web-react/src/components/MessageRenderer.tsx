@@ -8,7 +8,6 @@
  * MessageList：把会话消息流渲成虚拟卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Info, Sparkles } from "lucide-react";
 import {
   memo,
@@ -19,7 +18,10 @@ import {
   useState,
 } from "react";
 import { Virtuoso, VirtuosoMockContext, type Components } from "react-virtuoso";
-import type { ChatMessage } from "../lib/chat/model";
+import type {
+  ChatMessage,
+  LiveTurnTokenUsageSnapshot,
+} from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
   collectResolvedDispatchTurnIds,
@@ -75,8 +77,8 @@ type RendererProps = {
   historyGeneration?: number | string;
   /** 生命周期归 MessageList，而不是可卸载的虚拟行。 */
   processPaging?: UserUpwardPagingController;
-  /** Exact turn-level snapshot shared by every token-producing card in this turn. */
-  tokenUsage?: TurnTokenUsageSnapshot;
+  /** Turn-level display shared by every token-producing card in this turn. */
+  tokenUsage?: LiveTurnTokenUsageSnapshot;
   /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
    *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
    *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
@@ -570,7 +572,7 @@ type RenderItem =
       isLast: boolean;
       idx: number;
       delegateCost?: string;
-      tokenUsage?: TurnTokenUsageSnapshot;
+      tokenUsage?: LiveTurnTokenUsageSnapshot;
     }
   | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> }
   | {
@@ -579,7 +581,7 @@ type RenderItem =
       sig: string;
       isLast: boolean;
       idx: number;
-      tokenUsage?: TurnTokenUsageSnapshot;
+      tokenUsage?: LiveTurnTokenUsageSnapshot;
     };
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
@@ -625,7 +627,7 @@ function coalesceTeam(
   messages: ChatMessage[],
   start: number,
   sending: boolean,
-  liveTurnUsage?: { clientMessageId: string; usage: TurnTokenUsageSnapshot },
+  liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot },
 ): RenderItem[] {
   const total = messages.length;
   const slice = messages.slice(start);
@@ -649,9 +651,9 @@ function coalesceTeam(
     }
   }
   // Final/history truth comes from the immutable tape's usage-bearing anchor.
-  // The active exact browser turn temporarily overrides that same stable user
-  // anchor with the live absolute snapshot.
-  const tokenUsageByAnchor = new Map<number, TurnTokenUsageSnapshot>();
+  // The active browser turn temporarily overrides that same stable user anchor
+  // with its exact-or-explicitly-estimated live display.
+  const tokenUsageByAnchor = new Map<number, LiveTurnTokenUsageSnapshot>();
   for (let i = 0; i < total; i++) {
     const usage = tokenUsageSnapshot(messages[i]?.usage);
     if (usage) tokenUsageByAnchor.set(anchorOf[i], usage);
@@ -662,7 +664,7 @@ function coalesceTeam(
     );
     if (liveAnchor >= 0) tokenUsageByAnchor.set(liveAnchor, { ...liveTurnUsage.usage });
   }
-  const turnUsageFor = (absIdx: number): TurnTokenUsageSnapshot | undefined =>
+  const turnUsageFor = (absIdx: number): LiveTurnTokenUsageSnapshot | undefined =>
     tokenUsageByAnchor.get(anchorOf[absIdx]);
   // 面板成员资格:agent-group 且非隐藏审查员(审查卡恒单卡,按时序独立渲染)。
   const isPanelMember = (m: ChatMessage | undefined): boolean =>
@@ -892,8 +894,8 @@ export function MessageList({
 }: {
   messages: ChatMessage[];
   sending: boolean;
-  /** Active exact browser turn's authoritative absolute token snapshot. */
-  liveTurnUsage?: { clientMessageId: string; usage: TurnTokenUsageSnapshot };
+  /** Active browser turn's live token display; estimates are explicitly marked. */
+  liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot };
   /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
   turnActivity?: TurnActivityInfo | null;
   /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/

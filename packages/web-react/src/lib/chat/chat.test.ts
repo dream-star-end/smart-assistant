@@ -439,13 +439,123 @@ describe("applyTurnStatus retrying 判别联合", () => {
 });
 
 describe("applyTurnUsage 实时 token 权威快照", () => {
+  test("上游暂无 exact usage 时按真实流式增量显示约数，exact 到达后重新锚定", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "abcd", { id: "u1", status: "sent" });
+    s._activeClientMessageId = user.id;
+    s._sendingInFlight = true;
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: user.id,
+      blocks: [{ kind: "thinking", text: "efgh" }],
+    }));
+    const first = s._liveTurnUsage?.usage.totalTokens ?? 0;
+    expect(s._liveTurnUsage?.usage.estimated).toBe(true);
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      clientMessageId: user.id,
+      blocks: [{ kind: "text", text: "ijklmnop" }],
+    }));
+    const second = s._liveTurnUsage?.usage.totalTokens ?? 0;
+    expect(second).toBeGreaterThan(first);
+
+    applyTurnUsage(s, turnUsageFrame({
+      frameSeq: 3,
+      clientMessageId: user.id,
+      usage: { totalTokens: 100, inputTokens: 90, outputTokens: 10 },
+    }));
+    expect(s._liveTurnUsage?.usage).toMatchObject({
+      totalTokens: 100,
+      inputTokens: 90,
+      outputTokens: 10,
+    });
+    expect(s._liveTurnUsage?.usage.estimated).toBeUndefined();
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 4,
+      clientMessageId: user.id,
+      blocks: [{ kind: "text", text: "qrst" }],
+    }));
+    expect(s._liveTurnUsage?.usage).toMatchObject({
+      totalTokens: 101,
+      inputTokens: 90,
+      outputTokens: 10,
+      estimated: true,
+    });
+  });
+
+  test("累计 tool input 快照只计算正向增量，重复 frameSeq 与跨 turn 帧不计", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "run", { id: "u1", status: "sent" });
+    s._activeClientMessageId = user.id;
+    s._sendingInFlight = true;
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: user.id,
+      blocks: [{
+        kind: "tool_use",
+        blockId: "tool-live",
+        toolName: "Bash",
+        partialJsonDelta: "{\"command\":\"echo",
+        partialJsonOffset: 0,
+        partial: true,
+      }],
+    }));
+    const first = s._liveTurnUsage?.usage.totalTokens ?? 0;
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 2,
+      clientMessageId: user.id,
+      blocks: [{
+        kind: "tool_use",
+        blockId: "tool-live",
+        toolName: "Bash",
+        partialJsonDelta: "{\"command\":\"echo",
+        partialJsonOffset: 0,
+        partial: true,
+      }],
+    }));
+    expect(s._liveTurnUsage?.usage.totalTokens).toBe(first);
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 3,
+      clientMessageId: user.id,
+      blocks: [{
+        kind: "tool_use",
+        blockId: "tool-live",
+        toolName: "Bash",
+        inputJson: { command: "echo ok" },
+        partial: false,
+      }],
+    }));
+    const completed = s._liveTurnUsage?.usage.totalTokens ?? 0;
+    expect(completed).toBeGreaterThanOrEqual(first);
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 3,
+      clientMessageId: user.id,
+      blocks: [{ kind: "text", text: "duplicate" }],
+    }));
+    expect(s._liveTurnUsage?.usage.totalTokens).toBe(completed);
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 4,
+      clientMessageId: "other-turn",
+      blocks: [{ kind: "text", text: "stale" }],
+    }));
+    expect(s._liveTurnUsage?.usage.totalTokens).toBe(completed);
+  });
+
   test("只替换当前 exact turn，忽略 stale turn，并随终态清理", () => {
     const s = sess();
     s._activeClientMessageId = "u1";
     s._sendingInFlight = true;
 
     applyTurnUsage(s, turnUsageFrame({ frameSeq: 1, usage: { totalTokens: 128 } }));
-    expect(s._liveTurnUsage).toEqual({
+    expect(s._liveTurnUsage).toMatchObject({
       clientMessageId: "u1",
       usage: { totalTokens: 128 },
     });
@@ -485,6 +595,9 @@ describe("applyTurnUsage 实时 token 权威快照", () => {
         partial: false,
       }],
     }));
+    expect(s._liveTurnUsage?.usage).toMatchObject({
+      estimated: true,
+    });
     applyTurnUsage(s, turnUsageFrame({
       frameSeq: 2,
       clientMessageId: user.id,

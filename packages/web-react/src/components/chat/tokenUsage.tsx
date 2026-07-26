@@ -1,8 +1,13 @@
 import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
-import type { ChatMessage, ChildBlock, MsgUsage } from "../../lib/chat/model";
+import type {
+  ChatMessage,
+  ChildBlock,
+  LiveTurnTokenUsageSnapshot,
+  MsgUsage,
+} from "../../lib/chat/model";
 import { groupDigits } from "../../lib/utils";
 
-type UsageLike = Partial<TurnTokenUsageSnapshot> | MsgUsage | null | undefined;
+type UsageLike = Partial<LiveTurnTokenUsageSnapshot> | MsgUsage | null | undefined;
 
 function safeCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
@@ -10,7 +15,7 @@ function safeCount(value: unknown): number | undefined {
     : undefined;
 }
 
-export function tokenUsageSnapshot(usage: UsageLike): TurnTokenUsageSnapshot | undefined {
+export function tokenUsageSnapshot(usage: UsageLike): LiveTurnTokenUsageSnapshot | undefined {
   if (!usage) return undefined;
   const inputTokens = safeCount(usage.inputTokens);
   const outputTokens = safeCount(usage.outputTokens);
@@ -29,6 +34,7 @@ export function tokenUsageSnapshot(usage: UsageLike): TurnTokenUsageSnapshot | u
     ...(outputTokens !== undefined ? { outputTokens } : {}),
     ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
     ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
+    ...("estimated" in usage && usage.estimated === true ? { estimated: true } : {}),
   };
 }
 
@@ -82,7 +88,9 @@ export function delegateTokenUsage(msg: ChatMessage): TurnTokenUsageSnapshot | u
 }
 
 export function tokenUsageSignature(usage: TurnTokenUsageSnapshot | undefined): string {
-  return usage ? String(usage.totalTokens) : "";
+  if (!usage) return "";
+  const estimated = (usage as LiveTurnTokenUsageSnapshot).estimated === true;
+  return `${usage.totalTokens}:${estimated ? "estimated" : "exact"}`;
 }
 
 export function TokenUsageBadge({
@@ -96,7 +104,7 @@ export function TokenUsageBadge({
   if (!exact) return null;
   return (
     <span className="whitespace-nowrap text-[11px] font-medium tabular-nums text-faint">
-      {label} {groupDigits(String(exact.totalTokens))} token
+      {label} {exact.estimated ? "约 " : ""}{groupDigits(String(exact.totalTokens))} token
     </span>
   );
 }
