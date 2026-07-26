@@ -9,9 +9,10 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
-import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
-import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type { MessageReplyQuote } from "@openclaude/protocol";
+import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
+import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
+import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
 import type { InboundMessage, MediaRef } from "./frames";
 
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
@@ -62,6 +63,9 @@ export type MsgUsage = {
   outputTokens?: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  /** Engine-authoritative total; includes token categories not represented by
+   * the component counters (for example Codex reasoning output). */
+  totalTokens?: number;
   totalCost?: number;
   turn?: number;
   stopReason?: string;
@@ -376,6 +380,8 @@ export type ChatMessage = {
   _teamFallback?: boolean;
   /** agent-group ↔ delegate-progress run 绑定键（双向 adopt，§7）。*/
   _delegateRunId?: string;
+  /** Browser-only absolute snapshots keyed by the exact nested delegate run. */
+  _delegateUsageByRun?: Record<string, TurnTokenUsageSnapshot>;
   _duration?: number;
   _resultPreview?: string;
   _isError?: boolean;
@@ -510,6 +516,11 @@ export type ChatSession = {
   /** Agent frozen when the active turn was dispatched.  `agentId` is the
    * current selector and may change before the old turn is stopped. */
   _activeAgentId?: string;
+  /** Current exact browser turn's authoritative live token snapshot. */
+  _liveTurnUsage?: {
+    clientMessageId: string;
+    usage: TurnTokenUsageSnapshot;
+  };
   /** User Stop preserves ordinary queued prompts but prevents any implicit
    * drain.  A later explicit send/retry resumes the FIFO. */
   _dispatchPaused?: boolean;
@@ -609,6 +620,7 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._lastFrameAt = undefined;
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
+  sess._liveTurnUsage = undefined;
 }
 
 export function resetReplyTracker(sess: ChatSession): void {

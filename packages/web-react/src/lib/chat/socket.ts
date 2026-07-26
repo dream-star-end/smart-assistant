@@ -20,6 +20,7 @@ import {
   applyPermissionSettled,
   applyResumeFailed,
   applyTurnStatus,
+  applyTurnUsage,
   AUTO_CONTINUE_PROMPT,
   expireGenPlaceholdersAgainstServerRows,
   normalizeDelegateCards,
@@ -105,6 +106,7 @@ import type {
   OutboundActiveTurnReplayStartWire,
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
+  OutboundTurnUsageWire,
   OutboundWire,
   GoalSnapshotWire,
   RepoBindErrorWire,
@@ -1386,6 +1388,15 @@ export class ChatSocket {
           const clientMessageId = (frame as OutboundTurnStatusWire & { clientMessageId?: string }).clientMessageId;
           if (clientMessageId) this.confirmDispatchAdmission(sess.id, clientMessageId);
           applyTurnStatus(sess, frame);
+        }
+        return;
+      }
+      case "outbound.turn_usage": {
+        const frame = f as OutboundTurnUsageWire;
+        const sess = this.sessions.get(frame.peer?.id);
+        if (sess) {
+          this.confirmDispatchAdmission(sess.id, frame.clientMessageId);
+          applyTurnUsage(sess, frame);
         }
         return;
       }

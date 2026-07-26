@@ -19,6 +19,22 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByTitle("ls -la")).toHaveClass("truncate");
   });
 
+  test("涉及 token 的工具卡实时替换本轮消耗快照", () => {
+    const message = {
+      toolName: "Bash",
+      inputJson: { command: "sleep 1" },
+      _completed: false,
+    };
+    const { rerender } = render(
+      <ToolCard message={message} tokenUsage={{ totalTokens: 128 }} />,
+    );
+    expect(screen.getByText("本轮 128 token")).toBeInTheDocument();
+
+    rerender(<ToolCard message={message} tokenUsage={{ totalTokens: 2048 }} />);
+    expect(screen.getByText("本轮 2,048 token")).toBeInTheDocument();
+    expect(screen.queryByText("本轮 128 token")).not.toBeInTheDocument();
+  });
+
   test("Bash heredoc 纯写文件：显示写入文件语义卡，展开仍保留原始命令", () => {
     const command = "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
     render(<ToolCard message={{ toolName: "Bash", inputJson: { command }, _completed: true, output: "ok" }} />);
@@ -41,7 +57,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(document.querySelector("pre")?.textContent).toContain(marker);
   });
 
-  test("结构化工具摘要不替换权威结果，超长详情可逐段显示到末尾", () => {
+  test("超长通用结果不再生成结果详情入口", () => {
     const marker = "EXACT_TOOL_OUTPUT_FINAL_MARKER";
     const output = `${"x".repeat(270_000)}${marker}`;
     render(
@@ -52,18 +68,11 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
 
     fireEvent.click(screen.getByRole("button"));
     expect(document.body.textContent).not.toContain(marker);
-    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
-    expect(document.body.textContent).not.toContain(marker);
-
-    while (screen.queryByRole("button", { name: /继续显示/ })) {
-      fireEvent.click(screen.getByRole("button", { name: /继续显示/ }));
-    }
-    expect(document.body.textContent).toContain(marker);
-    expect(screen.queryByRole("button", { name: /继续显示/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "结果详情" })).not.toBeInTheDocument();
     expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
-  test("结构化 tool_result 的未来字段在结果详情中可见", () => {
+  test("结构化 tool_result 的附加字段不生成结果详情入口", () => {
     render(
       <ToolCard
         message={{
@@ -77,9 +86,8 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
 
     fireEvent.click(screen.getByRole("button"));
-    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
-    expect(screen.getByText("结构化结果")).toBeInTheDocument();
-    expect(document.body.textContent).toContain("EXACT_STRUCTURED_MARKER");
+    expect(screen.queryByRole("button", { name: "结果详情" })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("EXACT_STRUCTURED_MARKER");
     expect(screen.queryByText("查看原始完整记录")).not.toBeInTheDocument();
   });
 
@@ -346,7 +354,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(text).not.toContain("structuredContent");
   });
 
-  test("Codex wrapper 的未来持久化字段仍可在结果详情中按需查看", () => {
+  test("Codex wrapper 的附加持久化字段不生成结果详情入口", () => {
     const started = {
       type: "mcpToolCall",
       id: "call_future",
@@ -373,12 +381,13 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /技能检索/ }));
     expect(document.body.textContent).not.toContain("FUTURE_OUTPUT_MARKER");
-    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
+    // Input remains part of the semantic tool body; only the generic result
+    // disclosure (and its raw future output fields) is removed.
     expect(document.body.textContent).toContain("FUTURE_INPUT_MARKER");
-    expect(document.body.textContent).toContain("FUTURE_OUTPUT_MARKER");
+    expect(screen.queryByRole("button", { name: "结果详情" })).not.toBeInTheDocument();
   });
 
-  test("Codex dynamic oc-* wrapper 保留未来结果但不泄漏 shell 命令", () => {
+  test("Codex dynamic oc-* wrapper 不生成结果详情且不泄漏 shell 命令", () => {
     const secretCommand = "oc-market search design --secret never-show";
     const started = {
       type: "dynamicToolCall",
@@ -404,11 +413,10 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /搜索 AI 市场/ }));
-    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
-    expect(document.body.textContent).toContain("SAFE_FUTURE_MARKER");
+    expect(screen.queryByRole("button", { name: "结果详情" })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("SAFE_FUTURE_MARKER");
     expect(document.body.textContent).not.toContain(secretCommand);
     expect(document.body.textContent).not.toContain("never-show");
-    expect(document.body.textContent).toContain("[已隐藏的工具命令]");
   });
 
   test("Codex MCP failed web-context 显示友好标签、参数与错误文本", () => {

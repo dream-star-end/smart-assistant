@@ -23,6 +23,7 @@ import {
   Wallet,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
+import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
@@ -41,6 +42,7 @@ import { ChildBlockView, ProgressivePlainText } from "./AgentGroupCard";
 import { Media } from "./media";
 import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
+import { delegateTokenUsage, TokenUsageBadge } from "./tokenUsage";
 
 /** 渲染上下文。turnActivity=当前活跃会话本轮活动快照（流式空正文分支的阶段反馈源）。*/
 export type RenderCtx = {
@@ -482,10 +484,12 @@ export function AssistantCard({
   msg,
   ctx,
   cb,
+  tokenUsage,
 }: {
   msg: ChatMessage;
   ctx: RenderCtx;
   cb: CardCallbacks;
+  tokenUsage?: TurnTokenUsageSnapshot;
 }) {
   const live = isLive(msg, ctx);
   const hasError = !!msg._errorCode;
@@ -674,6 +678,11 @@ export function AssistantCard({
           </Alert>
         )}
 
+        {tokenUsage && tokenUsage.totalTokens > 0 && (
+          <div className="mt-2">
+            <TokenUsageBadge usage={tokenUsage} />
+          </div>
+        )}
         {/* 动作条 + meta（流式中不显示动作条，避免抖动） */}
         {!live && !hasError && msg.text && (
           <MessageActions msg={msg} cb={cb} showRegen={showRegenerate && !hasError} />
@@ -712,9 +721,11 @@ export const ThinkingCard = memo(
   function ThinkingCard({
     msgs,
     ctx,
+    tokenUsage,
   }: {
     msgs: ChatMessage[];
     ctx: RenderCtx;
+    tokenUsage?: TurnTokenUsageSnapshot;
     /** 分组渲染签名(memo 比较键)。所有调用方必须传，否则 memo 会误判为无变化。*/
     sig?: string;
   }) {
@@ -740,6 +751,7 @@ export const ThinkingCard = memo(
           <span className="min-w-0 truncate font-medium" title={headline}>
             {headline}
           </span>
+          <TokenUsageBadge usage={tokenUsage} />
           <ChevronRight
             size={14}
             className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
@@ -770,7 +782,9 @@ export const ThinkingCard = memo(
       </div>
     );
   },
-  (a, b) => a.sig === b.sig,
+  (a, b) =>
+    a.sig === b.sig &&
+    a.tokenUsage?.totalTokens === b.tokenUsage?.totalTokens,
 );
 
 // ═══════════════ plan ═══════════════
@@ -781,7 +795,13 @@ const STEP_DOT: Record<string, string> = {
 };
 // 不外包 memo:只收 {msg} + reducer 就地 mutate → 默认浅比较永不重渲(plan 步骤流式更新会丢)。
 // 重渲由上层 MessageRenderer 的 messageSignature memo 把关。
-export function PlanCard({ msg }: { msg: ChatMessage }) {
+export function PlanCard({
+  msg,
+  tokenUsage,
+}: {
+  msg: ChatMessage;
+  tokenUsage?: TurnTokenUsageSnapshot;
+}) {
   const steps = msg.steps ?? [];
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
@@ -795,6 +815,7 @@ export function PlanCard({ msg }: { msg: ChatMessage }) {
         >
           {msg.text || "执行计划"}
         </span>
+        <TokenUsageBadge usage={tokenUsage} />
         {msg._partial && <Badge tone="accent">编制中</Badge>}
       </div>
       <div className="px-3.5 py-2.5">
@@ -849,6 +870,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const [visibleChildren, setVisibleChildren] = useState(100);
   const [visibleEntries, setVisibleEntries] = useState(100);
   const collapsed = userCollapsed ?? done;
+  const tokenUsage = delegateTokenUsage(msg);
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
       <button
@@ -862,6 +884,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
         </span>
         <span className="min-w-0 truncate text-[13px] font-medium text-fg">{msg.text || "委派子任务"}</span>
         <span className="ml-auto flex items-center gap-2">
+          <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {done ? (
             <Badge tone={msg._isError ? "danger" : "success"}>{msg._isError ? "失败" : "完成"}</Badge>
           ) : (
@@ -876,7 +899,12 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
       {!collapsed && children.length > 0 && (
         <div className="space-y-2 border-t border-border px-3.5 py-2.5">
           {children.slice(0, visibleChildren).map((ch, i) => (
-            <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
+            <ChildBlockView
+              key={`${i}-${ch.blockId ?? ch.kind}`}
+              child={ch}
+              sig={childSignature(ch)}
+              tokenUsage={tokenUsage}
+            />
           ))}
           {visibleChildren < children.length && (
             <button

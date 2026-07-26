@@ -165,6 +165,7 @@ function buildTurnSummary(result: TurnResult, telemetry: TelemetryChannel): Turn
       outputTokens: result.outputTokens,
       cacheReadTokens: result.cacheReadTokens,
       cacheCreationTokens: result.cacheCreationTokens,
+      totalTokens: result.totalTokens,
     },
     assistantText: errorKind === 'model_authority' ? '' : result.assistantText,
     thinkingText: result.thinkingText,

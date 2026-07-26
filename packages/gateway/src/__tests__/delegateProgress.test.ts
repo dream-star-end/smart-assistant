@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import {
   makeDelegateBlockPassthrough,
   makeDelegateProgressBlock,
+  makeDelegateUsageProgressBlock,
   normalizeDelegateGoalKey,
   sanitizeDelegateProgressText,
   summarizeDelegateProgressEvent,
@@ -128,6 +129,23 @@ describe('delegate progress sanitization', () => {
       text: 'partial output',
     })
     assert.equal('goal' in block, false)
+  })
+
+  it('carries one exact child run absolute usage snapshot without text projection', () => {
+    const block = makeDelegateUsageProgressBlock({
+      runId: 'visible-run',
+      usageRunId: 'exact-child-run',
+      agentId: 'researcher',
+      usage: { totalTokens: 321, inputTokens: 300, outputTokens: 21 },
+    })
+    assert.deepEqual(block, {
+      kind: 'delegate_progress',
+      runId: 'visible-run',
+      usageRunId: 'exact-child-run',
+      agentId: 'researcher',
+      phase: 'usage',
+      usage: { totalTokens: 321, inputTokens: 300, outputTokens: 21 },
+    })
   })
 })
 

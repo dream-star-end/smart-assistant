@@ -9,11 +9,13 @@
  * 数据来自上层从 wsMessages 提取的最新顶层 TodoWrite todos 或 Codex structured plan steps
  * (replace 语义,最后一次=权威)。
  */
+import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronDown, ChevronUp, Circle, ListChecks, LoaderCircle } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
 import { asArr, asStr, resolveToolInput } from "../tool/format";
+import { TokenUsageBadge } from "./tokenUsage";
 import { currentTurnStartIndex } from "./turnSegment";
 
 export type TodoItem = { content: string; status: string; activeForm?: string };
@@ -100,7 +102,15 @@ function TodoRow({ t, compact }: { t: TodoItem; compact?: boolean }) {
   );
 }
 
-export function PinnedTaskTracker({ todos, active }: { todos: TodoItem[]; active: boolean }) {
+export function PinnedTaskTracker({
+  todos,
+  active,
+  tokenUsage,
+}: {
+  todos: TodoItem[];
+  active: boolean;
+  tokenUsage?: TurnTokenUsageSnapshot;
+}) {
   const total = todos.length;
   const doneCount = todos.filter(isDone).length;
   const hasIncomplete = todos.some((t) => !isDone(t));
@@ -171,6 +181,7 @@ export function PinnedTaskTracker({ todos, active }: { todos: TodoItem[]; active
             </span>
           )}
           {expanded && <span className="flex-1" />}
+          <TokenUsageBadge usage={tokenUsage} />
           {expanded ? (
             <ChevronDown className="size-4 shrink-0 text-faint" />
           ) : (

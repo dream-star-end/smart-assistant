@@ -11,9 +11,11 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  isToolExitCode,
   type GoalStateSnapshot,
   type ToolTerminationReason,
+  type TurnTokenUsageSnapshot,
+  isToolExitCode,
+  turnErrorSemantics,
 } from '@openclaude/protocol'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { type CodexLaunchOverrides, buildCodexLaunchOverrides } from '../codexLaunchOverrides.js'
@@ -33,7 +35,6 @@ import {
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
-import { turnErrorSemantics } from '@openclaude/protocol'
 import type { CollabAgentPolicy } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
@@ -485,6 +486,7 @@ interface RunnerMessage {
     cache_read_input_tokens?: number
     cache_creation_input_tokens?: number
     reasoning_output_tokens?: number
+    total_tokens?: number
   }
   /** Issue A v1.0.108 — codex `account/rateLimits/updated` 快照(0..100% pct + ISO
    *  reset)。仅 codex result 帧带,sessionManager 透传到 outbound.codex_billing
@@ -587,6 +589,7 @@ export function _codexUsageToAnthropicShape(turn: CodexTokenBreakdown): {
   cache_read_input_tokens: number
   cache_creation_input_tokens: number
   reasoning_output_tokens: number
+  total_tokens: number
 } {
   return {
     input_tokens: Math.max(0, turn.inputTokens - turn.cachedInputTokens),
@@ -594,6 +597,16 @@ export function _codexUsageToAnthropicShape(turn: CodexTokenBreakdown): {
     cache_read_input_tokens: turn.cachedInputTokens,
     cache_creation_input_tokens: 0,
     reasoning_output_tokens: turn.reasoningOutputTokens,
+    total_tokens: turn.totalTokens,
+  }
+}
+
+function _codexTurnUsageSnapshot(turn: CodexTokenBreakdown): TurnTokenUsageSnapshot {
+  return {
+    totalTokens: turn.totalTokens,
+    inputTokens: Math.max(0, turn.inputTokens - turn.cachedInputTokens),
+    outputTokens: turn.outputTokens,
+    cacheReadTokens: turn.cachedInputTokens,
   }
 }
 
@@ -2791,6 +2804,9 @@ export class CodexAppServerRunner extends EventEmitter {
         this.priorTurnTotal = _subtractTokenBreakdown(total, last)
       }
       this.activeTurnTotal = total
+      const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
+      const delta = _subtractTokenBreakdown(total, baseline)
+      if (delta.totalTokens > 0) this.emit('usage', _codexTurnUsageSnapshot(delta))
       return
     }
     if (method === 'account/rateLimits/updated') {
@@ -3867,6 +3883,7 @@ export class CodexAppServerRunner extends EventEmitter {
       cache_read_input_tokens?: number
       cache_creation_input_tokens?: number
       reasoning_output_tokens?: number
+      total_tokens?: number
     }
     /** PR2 v1.0.66 — caller(runTurn)从 closure 拿;不读 instance 字段防 race。 */
     requestId?: string

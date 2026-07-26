@@ -18,19 +18,17 @@
  * 流式：input 经 normalizeToolForDisplay/resolveToolInput 优先 inputJson、其次容错解析 partialJson —— Edit/Write
  * 的 diff/内容据此边流边渲；_completed 后切完整 inputJson。
  */
+import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { cn } from "../lib/utils";
+import { TokenUsageBadge } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/bodies";
-import { buildToolDetailSections, ToolResultDetails } from "./tool/details";
 import {
-  asStr,
-  detectShellFileWrites,
-  normalizeToolForDisplay,
-  stripShellWrapperForDisplay,
   type ToolLike,
+  normalizeToolForDisplay,
 } from "./tool/format";
-import { detectOcCli, resolveToolMeta, toolSummary } from "./tool/meta";
+import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { Badge, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
@@ -44,7 +42,13 @@ const TONE_TILE: Record<string, string> = {
   neutral: "bg-hover text-muted",
 };
 
-export function ToolCard({ message }: { message: ToolLike }) {
+export function ToolCard({
+  message,
+  tokenUsage,
+}: {
+  message: ToolLike;
+  tokenUsage?: TurnTokenUsageSnapshot;
+}) {
   const display = normalizeToolForDisplay(message);
   const name = display.name;
   const input = display.input;
@@ -75,15 +79,7 @@ export function ToolCard({ message }: { message: ToolLike }) {
 
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
-  const command = name === "Bash" ? stripShellWrapperForDisplay(asStr(input?.command)) : "";
-  const isOcTool = !!command && !!detectOcCli(command) && !detectShellFileWrites(command);
-  // 详情必须以原始持久化消息为权威；Codex wrapper 的语义归一化会精简 input/output，
-  // 若从 renderTool 构建会静默丢掉未来字段。oc-* 仍按产品规则隐藏 shell 命令。
-  const detailSections = buildToolDetailSections(message, {
-    hideInput: isOcTool,
-    hiddenCommand: isOcTool ? command : undefined,
-  });
-  const hasBody = hasInput || hasOutput || isError || isBlocked || detailSections.length > 0;
+  const hasBody = hasInput || hasOutput || isError || isBlocked;
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
@@ -130,6 +126,7 @@ export function ToolCard({ message }: { message: ToolLike }) {
           </span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-2">
+          <TokenUsageBadge usage={tokenUsage} />
           {/* 运行态 spinner 是 aria-hidden，需 sr-only 播报；其余状态均有可见 Badge 文案。 */}
           {isRunning && <span className="sr-only">{statusLabel}</span>}
           {isRunning ? (
@@ -158,7 +155,6 @@ export function ToolCard({ message }: { message: ToolLike }) {
       {open && hasBody && (
         <div className="border-t border-border/80 bg-bg/35 px-3.5 py-3 [&>*:first-child]:mt-0">
           <ToolBody name={name} input={input} tool={renderTool} />
-          <ToolResultDetails sections={detailSections} />
         </div>
       )}
     </div>

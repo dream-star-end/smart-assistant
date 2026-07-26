@@ -294,6 +294,7 @@ const BodySchema = z
         outputTokens: z.number().int().min(0).optional(),
         cacheReadTokens: z.number().int().min(0).optional(),
         cacheCreationTokens: z.number().int().min(0).optional(),
+        totalTokens: z.number().int().min(0).optional(),
         model: z.string().max(128).optional(),
         turn: z.number().int().min(0).optional(),
         // Master-owned per-turn canonical traceId (gateway folds it in from
@@ -411,6 +412,7 @@ export type ServerAuthoredMessageInput = {
     outputTokens?: number;
     cacheReadTokens?: number;
     cacheCreationTokens?: number;
+    totalTokens?: number;
     model?: string;
     turn?: number;
     /** Master-owned per-turn canonical traceId, folded into the persisted

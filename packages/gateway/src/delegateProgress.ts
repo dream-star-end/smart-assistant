@@ -1,3 +1,5 @@
+import type { TurnTokenUsageSnapshot } from '@openclaude/protocol'
+
 const DEFAULT_TEXT_LIMIT = 800
 const TOOL_PREVIEW_LIMIT = 180
 
@@ -7,6 +9,7 @@ export type DelegateProgressPhase =
   | 'thinking'
   | 'plan'
   | 'tool'
+  | 'usage'
   | 'done'
   | 'error'
 
@@ -24,12 +27,32 @@ export type DelegateProgressBlock = {
    * 不做摘要折叠 / 截断改写,保持与队长 tool_use input.goal 同源以便精确匹配。
    */
   goal?: string
+  /** Absolute usage snapshot for one exact child execution. `runId` may be
+   * rebound to a first-level visible card; this id never changes. */
+  usageRunId?: string
+  usage?: TurnTokenUsageSnapshot
   /**
    * 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),供新前端
    * 复用主聊天富渲染(`_appendSubagentBlock`)。旧前端不读此字段、走 `text`/`phase` 降级,两侧兼容。
    * 仅「透传模式」(makeDelegateBlockPassthrough)产生;start/done/error/plan 仍是纯摘要帧无 block。
    */
   block?: unknown
+}
+
+export function makeDelegateUsageProgressBlock(args: {
+  runId: string
+  usageRunId: string
+  agentId: string
+  usage: TurnTokenUsageSnapshot
+}): DelegateProgressBlock {
+  return {
+    kind: 'delegate_progress',
+    runId: args.runId,
+    usageRunId: args.usageRunId,
+    agentId: args.agentId,
+    phase: 'usage',
+    usage: { ...args.usage },
+  }
 }
 
 export function sanitizeDelegateProgressText(
@@ -338,6 +361,13 @@ export function toNestedDelegateProgressLine(
   source: DelegateProgressBlock,
   args: { runId: string; agentId: string; label: string },
 ): DelegateProgressBlock | null {
+  if (source.phase === 'usage' && source.usage && source.usageRunId) {
+    return {
+      ...source,
+      runId: args.runId,
+      agentId: args.agentId,
+    }
+  }
   if (source.block && typeof source.block === 'object') {
     return {
       ...source,

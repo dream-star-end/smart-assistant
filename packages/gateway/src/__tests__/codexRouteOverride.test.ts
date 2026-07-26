@@ -281,7 +281,14 @@ class FakeRouteRunner extends EventEmitter {
     return {
       submitted: Promise.resolve(),
       summary: Promise.resolve({
-        usage: { cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+        usage: {
+          cost: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          totalTokens: 0,
+        },
         assistantText: '',
         thinkingText: '',
         assistantSegments: [],

@@ -67,9 +67,8 @@ describe("deferred oversized immutable record", () => {
     await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /终端/ }));
     expect(screen.getByText("真实完整输出")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "结果详情" }));
-    expect(screen.getByText("附加结果")).toBeInTheDocument();
-    expect(screen.getByText(/未来工具字段必须可见/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "结果详情" })).toBeNull();
+    expect(screen.queryByText(/未来工具字段必须可见/)).toBeNull();
     expect(screen.queryByText("查看原始完整记录")).toBeNull();
     expect(screen.queryByText(/前 4MB|内容过大|已截断/)).toBeNull();
   });

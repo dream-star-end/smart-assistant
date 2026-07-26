@@ -33,6 +33,7 @@ import {
   type OutboundError,
   type OutboundMessage,
   type OutboundTurnStatus,
+  type OutboundTurnUsage,
   type SysContextRebuilt,
   type Peer,
   type AgentGroupStatus,
@@ -206,6 +207,7 @@ import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
 import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
+  makeDelegateUsageProgressBlock,
   makeDelegateBlockPassthrough,
   resolveDelegateProgressRouting,
   toNestedDelegateProgressLine,
@@ -9973,7 +9975,14 @@ export class Gateway {
               e.usage?.cache_creation_input_tokens ?? ownGoalUsageRecord?.cacheCreationTokens ?? 0,
           }
         }
-        const progressBlock = makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
+        const progressBlock = e.kind === 'usage'
+          ? makeDelegateUsageProgressBlock({
+              runId: progressRunId,
+              usageRunId: progressRunId,
+              agentId: targetAgentId,
+              usage: e.usage,
+            })
+          : makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
         if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
         if (!timedOut) {
           if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
@@ -14342,6 +14351,18 @@ export class Gateway {
           out.blocks.push(e.block)
           this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
         }
+      } else if (e.kind === 'usage') {
+        // Exact browser-turn progress only. Without the browser-authored
+        // clientMessageId there is no safe card/turn owner, so do not emit an
+        // ambiguous session-wide counter.
+        if (!out.clientMessageId) return
+        const usageFrame: OutboundTurnUsage & { _userId?: string } = {
+          type: 'outbound.turn_usage',
+          ..._inheritOutboundRouting(out),
+          clientMessageId: out.clientMessageId,
+          usage: e.usage,
+        }
+        this.deliver(usageFrame, adapter)
       } else if (e.kind === 'final') {
         leaderFinalCount++
         // Plan 2 — turn 终态前先清 turn_status cache。CCB 正常关 compact 会先
@@ -14895,6 +14916,7 @@ export class Gateway {
       | OutboundError
       | OutboundCodexBilling
       | OutboundTurnStatus
+      | OutboundTurnUsage
       | SysContextRebuilt,
     adapter?: ChannelAdapter,
   ): void {
@@ -14926,7 +14948,9 @@ export class Gateway {
     // 形状 for (b of out.blocks))会抛。sys.context_rebuilt 同 turn_status:webchat-only
     // UX 提示帧,跳过 adapter 只走 WS(非 webchat channel 找不到 ws client → noop)。
     const isSideband =
-      wire.type === 'outbound.turn_status' || wire.type === 'sys.context_rebuilt'
+      wire.type === 'outbound.turn_status' ||
+      wire.type === 'outbound.turn_usage' ||
+      wire.type === 'sys.context_rebuilt'
     if (adapter && !isSideband) {
       adapter.send(wire as OutboundMessage).catch((err) =>
         this.log.error('adapter send failed', { channel: adapter.name }, err),
@@ -14969,6 +14993,7 @@ export class Gateway {
       const blocks = (wire as { blocks?: Array<{ kind?: string }> }).blocks
       const isProgressFrame =
         wire.type === 'outbound.turn_status' ||
+        wire.type === 'outbound.turn_usage' ||
         (wire.type === 'outbound.message' &&
           Array.isArray(blocks) &&
           blocks.length > 0 &&

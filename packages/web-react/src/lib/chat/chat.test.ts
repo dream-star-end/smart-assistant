@@ -37,6 +37,7 @@ import {
   applyPermissionSettled,
   applyResumeFailed,
   applyTurnStatus,
+  applyTurnUsage,
   normalizeDelegateCards,
   normalizeGoalCards,
   type FrameEffects,
@@ -357,6 +358,18 @@ function turnStatusFrame(over: AnyFrame): Parameters<typeof applyTurnStatus>[1] 
   } as unknown as Parameters<typeof applyTurnStatus>[1];
 }
 
+function turnUsageFrame(over: AnyFrame): Parameters<typeof applyTurnUsage>[1] {
+  return {
+    type: "outbound.turn_usage",
+    sessionKey: "agent:main:webchat:dm:s1",
+    channel: "webchat",
+    peer: { id: "s1", kind: "dm" },
+    clientMessageId: "u1",
+    usage: { totalTokens: 1 },
+    ...over,
+  } as unknown as Parameters<typeof applyTurnUsage>[1];
+}
+
 describe("applyTurnStatus retrying 判别联合", () => {
   test("status=retrying → _turnStatus 建模为 {kind,attempt,max,retryAt}", () => {
     const s = sess();
@@ -422,6 +435,76 @@ describe("applyTurnStatus retrying 判别联合", () => {
       isFinal: false,
     } as never);
     expect(s._turnStatus).toBeNull();
+  });
+});
+
+describe("applyTurnUsage 实时 token 权威快照", () => {
+  test("只替换当前 exact turn，忽略 stale turn，并随终态清理", () => {
+    const s = sess();
+    s._activeClientMessageId = "u1";
+    s._sendingInFlight = true;
+
+    applyTurnUsage(s, turnUsageFrame({ frameSeq: 1, usage: { totalTokens: 128 } }));
+    expect(s._liveTurnUsage).toEqual({
+      clientMessageId: "u1",
+      usage: { totalTokens: 128 },
+    });
+
+    applyTurnUsage(s, turnUsageFrame({
+      frameSeq: 2,
+      clientMessageId: "stale-turn",
+      usage: { totalTokens: 999 },
+    }));
+    expect(s._liveTurnUsage?.usage.totalTokens).toBe(128);
+
+    applyTurnUsage(s, turnUsageFrame({ frameSeq: 3, usage: { totalTokens: 256 } }));
+    expect(s._liveTurnUsage?.usage.totalTokens).toBe(256);
+
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 4,
+      clientMessageId: "u1",
+      blocks: [],
+      isFinal: true,
+    }));
+    expect(s._liveTurnUsage).toBeUndefined();
+  });
+
+  test("tool-only turn 的 final durable meta 接棒实时快照", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "run", { id: "u1", status: "sent" });
+    s._activeClientMessageId = user.id;
+    s._sendingInFlight = true;
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 1,
+      clientMessageId: user.id,
+      blocks: [{
+        kind: "tool_use",
+        blockId: "tool-usage",
+        toolName: "Bash",
+        inputJson: { command: "pwd" },
+        partial: false,
+      }],
+    }));
+    applyTurnUsage(s, turnUsageFrame({
+      frameSeq: 2,
+      clientMessageId: user.id,
+      usage: { totalTokens: 40 },
+    }));
+    applyOutboundMessage(s, msgFrame({
+      frameSeq: 3,
+      clientMessageId: user.id,
+      blocks: [],
+      isFinal: true,
+      meta: { totalTokens: 42, inputTokens: 35, outputTokens: 7 },
+    }));
+
+    const tool = s.messages.find((message) => message.role === "tool");
+    expect(tool?.usage).toMatchObject({
+      totalTokens: 42,
+      inputTokens: 35,
+      outputTokens: 7,
+    });
+    expect(s._liveTurnUsage).toBeUndefined();
   });
 });
 
@@ -1133,6 +1216,85 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(groups[0]._delegateRunId).toBe("dlg-1");
     expect(groups[0]._turnOwnerId).toBe(user.id);
     expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
+  });
+
+  test("delegate usage is absolute per exact child run and survives standalone adoption", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "visible-run",
+          agentId: "hidden-reviewer",
+          phase: "start",
+          goal: "审查草稿",
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "visible-run",
+          usageRunId: "nested-run",
+          agentId: "coding-assistant",
+          phase: "usage",
+          usage: { totalTokens: 10 },
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "visible-run",
+          usageRunId: "nested-run",
+          agentId: "coding-assistant",
+          phase: "usage",
+          usage: { totalTokens: 25 },
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [{
+          kind: "delegate_progress",
+          runId: "visible-run",
+          usageRunId: "visible-run",
+          agentId: "hidden-reviewer",
+          phase: "usage",
+          usage: { totalTokens: 40 },
+        }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 5,
+        blocks: [{
+          kind: "tool_use",
+          toolName: "delegate_task",
+          blockId: "tool-usage-adopt",
+          partial: false,
+          inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+        }],
+      }),
+    );
+
+    const group = s.messages.find((message) => message.role === "agent-group");
+    expect(group?._delegateUsageByRun).toEqual({
+      "nested-run": { totalTokens: 25 },
+      "visible-run": { totalTokens: 40 },
+    });
+    expect(s.messages.some((message) => message.role === "delegate-progress")).toBe(false);
   });
 
   test("fan-out delegate_tasks: 各 runId 物化独立 agent-group(非 delegate-progress), server 行折叠不重复", () => {

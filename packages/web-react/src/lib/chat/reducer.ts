@@ -56,6 +56,7 @@ import type {
   OutboundPermissionSettledWire,
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
+  OutboundTurnUsageWire,
 } from "./frames";
 
 const COST_CHARGED_LAST_FINAL_TTL_MS = 60_000;
@@ -480,6 +481,12 @@ function mergeDelegateProgressIntoGroup(sess: ChatSession, groupMsg: ChatMessage
   }
   if (standalone.summary && !groupMsg._resultPreview) groupMsg._resultPreview = String(standalone.summary).slice(0, 200);
   if (standalone.summary && groupMsg.output == null) groupMsg.output = String(standalone.summary);
+  if (standalone._delegateUsageByRun) {
+    groupMsg._delegateUsageByRun = {
+      ...(groupMsg._delegateUsageByRun ?? {}),
+      ...standalone._delegateUsageByRun,
+    };
+  }
   if (standalone.error || standalone._isError) groupMsg._isError = true;
   if (standalone._completed && !groupMsg._completed) groupMsg._completed = true;
   if (standalone.completedAt && !groupMsg.completedAt) groupMsg.completedAt = standalone.completedAt;
@@ -762,18 +769,31 @@ type DelegateProgressBlock = {
   kind: "delegate_progress";
   runId: string;
   agentId: string;
-  phase: "start" | "text" | "thinking" | "plan" | "tool" | "done" | "error";
+  phase: "start" | "text" | "thinking" | "plan" | "tool" | "usage" | "done" | "error";
   text?: string;
   toolName?: string;
   isError?: boolean;
   goal?: string;
   block?: OutboundContentBlock;
+  usageRunId?: string;
+  usage?: NonNullable<ChatSession["_liveTurnUsage"]>["usage"];
 };
+
+function applyDelegateUsageSnapshot(msg: ChatMessage, block: DelegateProgressBlock): boolean {
+  if (block.phase !== "usage" || !block.usageRunId || !block.usage) return false;
+  msg._delegateUsageByRun = {
+    ...(msg._delegateUsageByRun ?? {}),
+    [block.usageRunId]: { ...block.usage },
+  };
+  return true;
+}
 
 /** 把一个 delegate_progress 帧落到已绑定的 agent-group 富卡(done/error → 终态;block → 富子块;
  *  legacy text → 降级子块)。fan-out 物化的组与既有单数委派组共用同一套落地语义。 */
 function applyDelegatePhaseToGroup(sess: ChatSession, groupMsg: ChatMessage, block: DelegateProgressBlock): void {
-  if (block.phase === "done" || block.phase === "error") {
+  if (applyDelegateUsageSnapshot(groupMsg, block)) {
+    return;
+  } else if (block.phase === "done" || block.phase === "error") {
     groupMsg._completed = true;
     groupMsg.completedAt = Date.now();
     if (block.text && !groupMsg._resultPreview) groupMsg._resultPreview = String(block.text).slice(0, 200);
@@ -868,7 +888,9 @@ function handleDelegateProgressBlock(
     msg.goal = block.goal;
     msg._delegateGoal = normalizeDelegateGoalKey(block.goal);
   }
-  if (block.phase === "done" || block.phase === "error") {
+  if (applyDelegateUsageSnapshot(msg, block)) {
+    // Usage is a replaceable absolute snapshot, not a visible transcript row.
+  } else if (block.phase === "done" || block.phase === "error") {
     msg._completed = true;
     msg.completedAt = Date.now();
     msg.error = block.phase === "error" || !!block.isError;
@@ -1665,8 +1687,21 @@ export function applyOutboundMessage(
       deferredEmptyNotice = null;
     }
 
-    // 合 frame.meta 进 _streamingAssistant.usage + drain 早到 cost_charged。
-    if (frame.meta && sess._streamingAssistant) {
+    // 合 frame.meta 进本轮持久 usage anchor。普通正文优先落 streaming
+    // assistant；tool-only / thinking-only / agent-group-only 轮则落 exact
+    // owner 下最后一条生成记录，确保实时 counter 在 final 后由 durable meta
+    // 无缝接棒，刷新也能从 immutable tape 重建。
+    const usageTarget = sess._streamingAssistant ?? (
+      frameTurnOwnerId
+        ? [...sess.messages].reverse().find((message) =>
+            message.role !== "user" &&
+            message.role !== "system" &&
+            message.role !== "permission" &&
+            (message._clientMessageId === frameTurnOwnerId ||
+              message._turnOwnerId === frameTurnOwnerId))
+        : undefined
+    );
+    if (frame.meta && usageTarget) {
       const usagePatch: ChatMessage["usage"] = { ...frame.meta };
       if (typeof frame.traceId === "string" && frame.traceId) usagePatch.traceId = frame.traceId;
       try {
@@ -1678,9 +1713,11 @@ export function applyOutboundMessage(
       } catch {
         sess._pendingCostCredits = "0";
       }
-      sess._streamingAssistant.usage = { ...(sess._streamingAssistant.usage || {}), ...usagePatch };
-      sess._lastFinaledAssistantId = sess._streamingAssistant.id;
-      sess._lastFinaledAt = Date.now();
+      usageTarget.usage = { ...(usageTarget.usage || {}), ...usagePatch };
+      if (usageTarget.role === "assistant") {
+        sess._lastFinaledAssistantId = usageTarget.id;
+        sess._lastFinaledAt = Date.now();
+      }
     }
     // session-level token 累计。
     if (frame.meta) {
@@ -1783,6 +1820,17 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
   } else {
     sess._turnStatus = null;
   }
+}
+
+// ═══════════════ outbound.turn_usage（权威实时 token 快照）═══════════════
+export function applyTurnUsage(sess: ChatSession, frame: OutboundTurnUsageWire): void {
+  if (!acceptFrameSeq(sess, frame)) return;
+  if (!frame.clientMessageId || sess._activeClientMessageId !== frame.clientMessageId) return;
+  markFrameReceived(sess);
+  sess._liveTurnUsage = {
+    clientMessageId: frame.clientMessageId,
+    usage: { ...frame.usage },
+  };
 }
 
 // ═══════════════ outbound.error 双帧（§11）═══════════════

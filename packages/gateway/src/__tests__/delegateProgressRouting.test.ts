@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import {
   type DelegateChainSession,
   makeDelegateProgressBlock,
+  makeDelegateUsageProgressBlock,
   resolveDelegateProgressRouting,
   toNestedDelegateProgressLine,
 } from '../delegateProgress.js'
@@ -340,6 +341,26 @@ describe('toNestedDelegateProgressLine — 嵌套 rich block 原样挂卡，纯�
     assert.equal(line?.runId, 'R1')
     assert.equal(line?.phase, 'text')
     assert.equal((line?.block as any)?.text, exact)
+  })
+
+  it('nested usage rebinds only the visible card and preserves exact child identity', () => {
+    const line = toNestedDelegateProgressLine(
+      makeDelegateUsageProgressBlock({
+        runId: 'R2',
+        usageRunId: 'R2',
+        agentId: 'coder',
+        usage: { totalTokens: 88 },
+      }),
+      args,
+    )
+    assert.deepEqual(line, {
+      kind: 'delegate_progress',
+      runId: 'R1',
+      usageRunId: 'R2',
+      agentId: 'coder',
+      phase: 'usage',
+      usage: { totalTokens: 88 },
+    })
   })
 
   it('空 detail → null(无可展示内容)', () => {

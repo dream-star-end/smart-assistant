@@ -521,6 +521,8 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
       "tool_result_detected",
       "block:plan",
       "block:text",
+      "usage", // thread/tokenUsage/updated live snapshot
+      "usage", // result.usage authoritative terminal replacement
       "final",
     ]);
     const toolBlocks = h.events.filter(
@@ -562,6 +564,7 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
     assert.equal(summary.usage.inputTokens, 200);
     assert.equal(summary.usage.outputTokens, 40);
     assert.equal(summary.usage.cacheReadTokens, 100);
+    assert.equal(summary.usage.totalTokens, 340);
   });
 
   test("webSearch / mcpToolCall item → codex:<type> 工具卡(前端通用降级契约)", async () => {

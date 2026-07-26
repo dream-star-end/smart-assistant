@@ -577,6 +577,85 @@ describe('CcbMessageParser: tool_result', () => {
 
 // ── Result / finalization ──
 describe('CcbMessageParser: result', () => {
+  it('emits absolute live snapshots across model calls and lets result usage replace them', () => {
+    const { parser, events, getResult } = createParser()
+
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'message_start',
+        message: {
+          usage: {
+            input_tokens: 10,
+            cache_read_input_tokens: 4,
+          },
+        },
+      },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'message_delta',
+        usage: { output_tokens: 3 },
+      },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: { type: 'message_stop' },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'message_start',
+        message: {
+          usage: {
+            input_tokens: 20,
+            cache_read_input_tokens: 5,
+          },
+        },
+      },
+    } as any)
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'message_delta',
+        usage: { output_tokens: 8 },
+      },
+    } as any)
+    parser.parse({
+      type: 'result',
+      total_cost_usd: 0.01,
+      usage: {
+        input_tokens: 100,
+        output_tokens: 40,
+        cache_read_input_tokens: 20,
+        cache_creation_input_tokens: 10,
+      },
+    } as any)
+
+    const snapshots = events
+      .filter((event): event is Extract<SessionStreamEvent, { kind: 'usage' }> =>
+        event.kind === 'usage')
+      .map((event) => event.usage)
+    assert.deepEqual(snapshots, [
+      { totalTokens: 14, inputTokens: 10, cacheReadTokens: 4 },
+      { totalTokens: 17, inputTokens: 10, outputTokens: 3, cacheReadTokens: 4 },
+      { totalTokens: 42, inputTokens: 30, outputTokens: 3, cacheReadTokens: 9 },
+      { totalTokens: 50, inputTokens: 30, outputTokens: 11, cacheReadTokens: 9 },
+      {
+        totalTokens: 170,
+        inputTokens: 100,
+        outputTokens: 40,
+        cacheReadTokens: 20,
+        cacheCreationTokens: 10,
+      },
+    ])
+    assert.equal(getResult().totalTokens, 170)
+    const final = events.find((event) => event.kind === 'final')
+    assert.ok(final?.kind === 'final')
+    assert.equal(final.meta?.totalTokens, 170)
+  })
+
   it('emits final event and calls onFinish with turn result', () => {
     const { parser, events, getFinished, getResult } = createParser()
 
@@ -598,6 +677,7 @@ describe('CcbMessageParser: result', () => {
     assert.equal(result.cost, 0.05)
     assert.equal(result.inputTokens, 1000)
     assert.equal(result.outputTokens, 200)
+    assert.equal(result.totalTokens, 1200)
     assert.equal(result.assistantText, 'answer')
 
     // Should have emitted a 'final' event

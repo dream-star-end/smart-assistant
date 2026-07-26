@@ -2260,6 +2260,7 @@ export function App() {
                 key={activeId}
                 messages={wsMessages}
                 sending={wsSending}
+                liveTurnUsage={activeSess?._liveTurnUsage}
                 turnActivity={turnActivity}
                 transientNotice={transientNotice}
                 archive={messageListArchive}
@@ -2276,7 +2277,13 @@ export function App() {
         <div className="shrink-0 composer-safe-b">
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务时组件自渲染 null。 */}
-          {!demo && !gated && <PinnedTaskTracker todos={extractLatestTodos(wsMessages)} active={wsSending} />}
+          {!demo && !gated && (
+            <PinnedTaskTracker
+              todos={extractLatestTodos(wsMessages)}
+              active={wsSending}
+              tokenUsage={activeSess?._liveTurnUsage?.usage}
+            />
+          )}
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>

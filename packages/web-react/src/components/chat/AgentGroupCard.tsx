@@ -6,6 +6,7 @@
  *    （子块字段与 tool 消息同形）。reducer 已把子 agent 嵌套 Agent 扁平进同一组（最多两层）。
  *  - 防闪：每个子块按 childSignature memo，完成的子块不随后续子块流式而重建。
  */
+import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
 import { Check, ChevronRight, Clock, Users, X } from "lucide-react";
 import { memo, useState } from "react";
 import { type ChatMessage, type ChildBlock, isServerAuthoredRow } from "../../lib/chat/model";
@@ -14,6 +15,7 @@ import { cn, groupDigits } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
 import { Markdown } from "../Markdown";
 import { ToolCardSlot } from "./toolCardSlot";
+import { delegateTokenUsage, TokenUsageBadge } from "./tokenUsage";
 
 /** 终态图标(与 agentTerminalStatus tone 对齐):完成→Users、失败→X、超时→Clock。 */
 export function TerminalIcon({ tone, size }: { tone: "success" | "danger" | "warning"; size: number }) {
@@ -118,7 +120,14 @@ function RawChildEventView({ child }: { child: ChildBlock }) {
 }
 
 export const ChildBlockView = memo(
-  function ChildBlockView({ child }: { child: ChildBlock; sig: string }) {
+  function ChildBlockView({
+    child,
+    tokenUsage,
+  }: {
+    child: ChildBlock;
+    sig: string;
+    tokenUsage?: TurnTokenUsageSnapshot;
+  }) {
     const [visibleChars, setVisibleChars] = useState(64 * 1024);
     if (child.kind === "text") {
       if (!child.text) return null;
@@ -159,7 +168,7 @@ export const ChildBlockView = memo(
       const nested = /^Agent$/i.test(child.toolName || "");
       return (
         <div className={cn(nested && "border-l-2 border-accent/30 pl-2")}>
-          <ToolCardSlot message={child} />
+          <ToolCardSlot message={child} tokenUsage={tokenUsage} />
         </div>
       );
     }
@@ -168,7 +177,7 @@ export const ChildBlockView = memo(
     // on the live reducer's combined tool card representation.
     return <RawChildEventView child={child} />;
   },
-  (a, b) => a.sig === b.sig,
+  (a, b) => a.sig === b.sig && a.tokenUsage?.totalTokens === b.tokenUsage?.totalTokens,
 );
 
 // 不外包 memo:本卡只收 {msg, delegateCost},而 reducer 就地 mutate(msg 引用不变)→ 默认浅比较会永不
@@ -187,6 +196,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
   const [visibleChildren, setVisibleChildren] = useState(100);
   const collapsed = userCollapsed ?? (!!msg._completed || isServerRow);
   const children = msg.childBlocks ?? [];
+  const tokenUsage = delegateTokenUsage(msg);
   const terminalNoChildren = !running && children.length === 0;
 
   return (
@@ -212,6 +222,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
             </Badge>
           )}
           {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
+          <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {delegateCost && (
             <span className="text-[11px] font-medium text-faint">{groupDigits(delegateCost)} 积分</span>
           )}
@@ -241,7 +252,12 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
             </div>
           )}
           {children.slice(0, visibleChildren).map((ch, i) => (
-            <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
+            <ChildBlockView
+              key={`${i}-${ch.blockId ?? ch.kind}`}
+              child={ch}
+              sig={childSignature(ch)}
+              tokenUsage={tokenUsage}
+            />
           ))}
           {visibleChildren < children.length && (
             <button

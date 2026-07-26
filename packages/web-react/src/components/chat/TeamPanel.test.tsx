@@ -11,6 +11,34 @@ function member(id: string, extra: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe("TeamPanel 团队协作面板", () => {
+  test("头部聚合且每个成员实时显示自己的绝对 token 快照", () => {
+    const members = [
+      member("a", {
+        _delegateAgentId: "队员甲",
+        _completed: false,
+        _delegateUsageByRun: { "run-a": { totalTokens: 100 } },
+      }),
+      member("b", {
+        _delegateAgentId: "队员乙",
+        _completed: false,
+        childBlocks: [{ kind: "final", meta: { totalTokens: 50 } }],
+      }),
+    ];
+    const view = render(<TeamPanel members={members} sig="tokens-1" />);
+    expect(screen.getByText("合计 150 token")).toBeInTheDocument();
+    expect(screen.getByText("子 Agent 100 token")).toBeInTheDocument();
+    expect(screen.getByText("子 Agent 50 token")).toBeInTheDocument();
+
+    const updated = [
+      { ...members[0], _delegateUsageByRun: { "run-a": { totalTokens: 180 } } },
+      members[1],
+    ];
+    view.rerender(<TeamPanel members={updated} sig="tokens-2" />);
+    expect(screen.getByText("合计 230 token")).toBeInTheDocument();
+    expect(screen.getByText("子 Agent 180 token")).toBeInTheDocument();
+    expect(screen.queryByText("合计 150 token")).not.toBeInTheDocument();
+  });
+
   test("头部显示队员数 + 运行中/完成/失败 概览;活跃默认展开队员", () => {
     const members = [
       member("a", { _delegateAgentId: "前端工程师", _delegateGoal: "做登录页", _completed: false }),

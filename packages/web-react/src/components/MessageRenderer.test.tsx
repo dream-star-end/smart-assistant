@@ -588,6 +588,77 @@ describe("permission 审批", () => {
   });
 });
 
+describe("MessageList 本轮 token 实时展示", () => {
+  test("同一轮所有 token 卡共享权威快照并实时替换", () => {
+    const messages: ChatMessage[] = [
+      mk("user", { id: "u-live-token", text: "继续" }),
+      mk("thinking", { id: "th-live-token", text: "分析中" }),
+      mk("tool", {
+        id: "tool-live-token",
+        toolName: "Bash",
+        inputJson: { command: "pwd" },
+        _completed: false,
+      }),
+      mk("assistant", { id: "a-live-token", text: "阶段结果" }),
+      mk("plan", { id: "plan-live-token", text: "下一步计划" }),
+    ];
+    const view = render(
+      <MessageList
+        messages={messages}
+        sending
+        liveTurnUsage={{
+          clientMessageId: "u-live-token",
+          usage: { totalTokens: 128 },
+        }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getAllByText("本轮 128 token")).toHaveLength(4);
+
+    view.rerender(
+      <MessageList
+        messages={messages}
+        sending
+        liveTurnUsage={{
+          clientMessageId: "u-live-token",
+          usage: { totalTokens: 256 },
+        }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getAllByText("本轮 256 token")).toHaveLength(4);
+    expect(screen.queryByText("本轮 128 token")).not.toBeInTheDocument();
+  });
+
+  test("历史轮从 durable usage anchor 恢复同轮卡片 token", () => {
+    const messages: ChatMessage[] = [
+      mk("user", { id: "u-history-token", text: "运行" }),
+      mk("tool", {
+        id: "tool-history-token",
+        toolName: "Bash",
+        inputJson: { command: "pwd" },
+        _completed: true,
+      }),
+      mk("assistant", {
+        id: "a-history-token",
+        text: "完成",
+        usage: { totalTokens: 333 },
+      }),
+    ];
+    render(
+      <MessageList
+        messages={messages}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getAllByText("本轮 333 token")).toHaveLength(2);
+  });
+});
+
 describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
   function g(id: string, text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
     return { id, role: "agent-group", text, ts: 1000, _delegate: true, ...extra };
