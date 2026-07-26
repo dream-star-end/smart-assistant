@@ -58,6 +58,17 @@ export const modalContentVariants = cva(
           "oc-center-dialog left-1/2 top-1/2 max-h-[88dvh] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border",
         fullscreen:
           "bottom-0 left-0 right-0 top-0 h-auto max-h-none w-full max-w-none translate-x-0 translate-y-0 rounded-none border-0 border-border md:bottom-auto md:left-1/2 md:right-auto md:top-1/2 md:max-h-[88dvh] md:w-[calc(100vw-2rem)] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-xl md:border",
+        /**
+         * 定位完全交给调用方:本轴一个类都不输出(连 oc-center-dialog 也不挂)。
+         *
+         * 给的是 ContainerWebPreview 这类「所有断点都铺满、且要用 visualViewport 变量
+         * 精确控位」的场景 —— 它既不能用 center(会被未分层的 .oc-center-dialog 顶掉
+         * top/max-height),也不能用 fullscreen(那条带 md: 桌面回落,会在桌面把弹层
+         * 拉回居中,而全屏预览在桌面同样要铺满)。
+         * 2026-07-26 实测:Modal 补挂 oc-center-dialog 后,browser-tests T16/T17 立刻转红
+         * (jsdom 的 2119 个用例全绿 —— CSS 层叠 jsdom 根本不算,交互面必须真浏览器验)。
+         */
+        none: "",
         // 贴底抽屉:窄屏从底部升起(顶部圆角 + 安全区内边距),md 起回到居中弹层。
         sheet:
           "bottom-0 left-0 right-0 top-auto h-auto max-h-[85dvh] w-full max-w-none translate-x-0 translate-y-0 rounded-b-none rounded-t-2xl border border-b-0 border-border pb-[env(safe-area-inset-bottom)] md:bottom-auto md:left-1/2 md:right-auto md:top-1/2 md:max-h-[88dvh] md:w-[calc(100vw-2rem)] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-b-xl md:rounded-t-xl md:border-b md:pb-0",

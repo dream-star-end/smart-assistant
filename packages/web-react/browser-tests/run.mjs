@@ -46,6 +46,15 @@ const { chromium } = require_("playwright-core");
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ARTIFACTS = process.env.OC_BROWSER_TEST_ARTIFACTS ?? tmpdir();
 
+/**
+ * 触控靶下限。设计目标是 44px,但**不能拿 44 去严格比较** `boundingBox()` 的返回值:
+ * 它是浏览器布局算出的浮点数,2026-07-26 实测同一个 CSS `height: 44px` 的按钮在连续
+ * 三次运行中出现过一次 `43.999996185302734`(其余两次是精确 44),严格 `< 44` 因此会偶发
+ * 误报,把真浏览器门变成 flaky 门 —— 而 flaky 门最终会被人忽略,等于没有门。
+ * 取 43.5 留半像素容差:任何真实不达标的档位(40 / 36 / 32 / 28px)依然拦得住。
+ */
+const TOUCH_MIN = 43.5;
+
 // ── bundle ──────────────────────────────────────────────────────────────────
 const outDir = mkdtempSync(join(tmpdir(), "oc-browser-tests-"));
 const bundlePath = join(outDir, "harness.js");
@@ -494,7 +503,7 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   const header = root.getByRole("button", { name: /搜索 AI 市场.*browser.*完成/ });
   await header.waitFor({ state: "visible", timeout: 3000 });
   const box = await header.boundingBox();
-  if (!box || box.height < 44) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
+  if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
 
   await header.focus();
   await header.press("Enter");
@@ -645,8 +654,8 @@ async function assertContainerPreviewFillsViewport(expectedDevice, width, height
   const revealBox = await reveal.boundingBox();
   if (
     !revealBox ||
-    revealBox.width < 44 ||
-    revealBox.height < 44 ||
+    revealBox.width < TOUCH_MIN ||
+    revealBox.height < TOUCH_MIN ||
     revealBox.x < 0 ||
     revealBox.y < top ||
     revealBox.x + revealBox.width > width + 1 ||
@@ -666,7 +675,7 @@ async function assertContainerPreviewFillsViewport(expectedDevice, width, height
 
   await reveal.click();
   const closeBox = await dialog.getByRole("button", { name: "关闭网页预览" }).boundingBox();
-  if (!closeBox || closeBox.width < 44 || closeBox.height < 44) {
+  if (!closeBox || closeBox.width < TOUCH_MIN || closeBox.height < TOUCH_MIN) {
     throw new Error(`恢复后的关闭控件触控尺寸不足:${JSON.stringify(closeBox)}`);
   }
   await dialog.getByRole("button", { name: `${expectedDevice}预览` }).waitFor({

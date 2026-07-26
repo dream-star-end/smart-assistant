@@ -742,6 +742,11 @@ export function ContainerWebPreview({
       }}
       srTitle="容器网页预览与元素评论"
       hideClose
+      // mobile="none":本弹层在**所有断点**都要铺满可视视口,且靠 visualViewport 变量
+      // 精确控位(iOS 地址栏/键盘显隐时 dvh 会抖)。既不能用默认的 center —— 未分层的
+      // .oc-center-dialog 会顶掉下面的 top/max-h;也不能用 fullscreen —— 那条带 md:
+      // 桌面回落会把它拉回居中。定位权威留在这里。
+      mobile="none"
       className="left-0 top-[var(--oc-visual-offset-top,0px)] h-[var(--oc-visual-height,100dvh)] max-h-[var(--oc-visual-height,100dvh)] w-screen max-w-none translate-x-0 translate-y-0 rounded-none border-0 bg-[#0c0c11]"
       bodyClassName="overflow-hidden p-0"
     >
@@ -1232,6 +1237,10 @@ export function ContainerWebPreview({
             onOpenChange={(next) => !next && closeCommentsDrawer()}
             srTitle="网页评论列表"
             hideClose
+            // 同上:定位权威在 styles.css 的 .preview-comments-modal(窄屏贴底抽屉 /
+            // md+ 右侧抽屉)。它与 .oc-center-dialog 同为未分层规则、同特异性,而后者
+            // 写在 styles.css 更靠后 —— 挂上就会被后写者顶掉,弹层弹回屏幕中央。
+            mobile="none"
             className="preview-comments-modal"
             bodyClassName="overflow-hidden p-0"
           >
