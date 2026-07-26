@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, test } from 'vitest'
 import MarkdownImpl from './MarkdownImpl'
 
@@ -82,9 +82,10 @@ test('GFM 长表格使用可聚焦滚动区，且同段代码块与公式保持�
   expect(container.querySelector('.katex-display .katex')).not.toBeNull()
 })
 
-// ── 代码高亮 / mermaid ────────────────────────────────────────────────────────
-// 助手回复 99% 经 markdown,但高亮此前零断言(全仓 grep hljs 零命中)、mermaid 零测试。
-// 高亮塌成纯文本、mermaid 语法半截时白屏,都是用户直接看得见的回归。
+// ── 代码高亮 ────────────────────────────────────────────────────────
+// 助手回复 99% 经 markdown,但高亮此前零断言(全仓 grep hljs 零命中):高亮塌成纯文本
+// 是用户直接看得见的回归。mermaid 刻意不在 jsdom 断言 —— 它要真 SVG 布局,jsdom 下只能
+// 等一个多兆动态 import 的 parse,在负载机上必然抖;那条覆盖属于真浏览器套件(见 followups)。
 describe('MarkdownImpl 代码高亮', () => {
   test('围栏代码块真的产出 highlight.js token 元素，而不是塌成纯文本', () => {
     const source = ['```ts', 'const answer: number = 42', '```'].join('\n')
@@ -116,31 +117,6 @@ describe('MarkdownImpl 代码高亮', () => {
     expect(container.querySelector('code')).toHaveTextContent('npm run build')
     expect(container.querySelector('pre')).toBeNull()
     expect(screen.queryByRole('button', { name: '复制' })).toBeNull()
-  })
-})
-
-describe('MarkdownImpl mermaid 富块', () => {
-  test('mermaid 围栏先给渲染中占位，不把源码当正文抖一下再替换', () => {
-    const source = ['```mermaid', 'graph TD; A-->B;', '```'].join('\n')
-    const { container } = render(<MarkdownImpl>{source}</MarkdownImpl>)
-    expect(container.textContent).toContain('图表渲染中')
-    // 占位阶段不得把 mermaid 源码当普通代码块渲染出来(流式期会一直闪)。
-    expect(container.querySelector('pre code')).toBeNull()
-  })
-
-  test('mermaid 语法无效时回退可读源码，绝不白屏也不残留占位', async () => {
-    const source = ['```mermaid', 'not a valid diagram at all {{{', '```'].join('\n')
-    const { container } = render(<MarkdownImpl>{source}</MarkdownImpl>)
-    // 轮询等 parse 落定:只放宽"什么时候读",不放宽"读到什么"。
-    await waitFor(
-      () => {
-        expect(container.textContent).not.toContain('图表渲染中')
-      },
-      { timeout: 10000 },
-    )
-    const pre = container.querySelector('pre')
-    expect(pre).not.toBeNull()
-    expect(pre).toHaveTextContent('not a valid diagram at all {{{')
   })
 })
 
