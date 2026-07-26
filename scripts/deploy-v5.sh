@@ -2933,6 +2933,13 @@ assert_ci_green_for_source_commit() { # <full sha>
     echo "  [dry-run] 校验 $sha 的 required checks(分支保护 $CI_PROTECTED_BRANCH 的 contexts)全 success"
     return 0
   fi
+  # 【绝不挡住止血】dx-declared emergency containment lane 天然是「CI 还没跑完就要上」的场景,
+  # 它已有更强的独立约束(canonical clean + exact HEAD + 已 push 到 origin + dx 审批证据 +
+  # emergency_containment_debts 阻断后续所有普通发布)。在这里再加一道 CI 门只会把止血拦死。
+  if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+    echo "  · dx-declared emergency containment lane:跳过 CI 绿门(止血优先;containment debt 已阻断后续普通发布)"
+    return 0
+  fi
   echo "── CI 绿门:$sha 的必需 check 必须全 success ──"
   local unverifiable=""
   required="$(_gh_api "repos/{owner}/{repo}/branches/$(printf '%s' "$CI_PROTECTED_BRANCH" | sed 's|/|%2F|g')/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null || true)"

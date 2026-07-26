@@ -5871,6 +5871,11 @@ wait $!
     assert.match(fn, /ALLOW_UNVERIFIED_CI" != 1/, '缺显式逃生旗标判定')
     assert.match(fn, /record_gate_waiver ci-verification[\s\S]*\|\| return 1/, '逃生必须登记 durable debt 且记账失败即拒绝')
     assert.match(fn, /clear_gate_waiver ci-verification/, '全绿必须自动销账')
+    assert.match(
+      fn,
+      /if \[\[ -n "\$EMERGENCY_INCIDENT" \]\]; then[\s\S]{0,300}?return 0/,
+      'dx-declared emergency containment lane 必须放行 —— 止血场景天然「CI 还没跑完就要上」,再加一道门会把止血拦死',
+    )
     assert.match(source, /--allow-unverified-ci\) ALLOW_UNVERIFIED_CI=1/, '缺 CLI 旗标')
     assert.match(source, /ALLOW_UNVERIFIED_CI=0/, 'ALLOW_UNVERIFIED_CI 必须默认关(fail-closed)')
     // 挂载点 = build_release 里 source commit 钉死之后、任何远端写之前。
