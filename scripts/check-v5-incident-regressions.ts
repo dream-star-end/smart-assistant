@@ -37,11 +37,27 @@ const ASSERTION_DEBT_BASELINE = 37;
  */
 const PROOF_PENDING_BASELINE = 9;
 
-// ── Incident trailer 闭环门的生效起点 ───────────────────────────────────────
-// 这道门只检查**起点之后**的历史:起点之前的 fix(v5) commit 没有 Incident trailer
-// 约定,回溯要求会让门天天红且无法补救(commit message 不可改写)。起点写死在这里,
-// 不随 manifest 变动;要前移起点=一次显式决定。
-const TRAILER_GATE_START = "cfa210cc29bbfc41d9cc0e953e357cc036e7a98b";
+// ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
+// 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
+//   ① 怕 rebase:门首次落地时起点钉的是分支 rebase 前的 commit,分支合入前被
+//      rebase 4 次 → SHA 消失 → 走"起点不可达"分支静默跳过,从落地起一次没跑过;
+//   ② 怕并行合入:校准到"我写代码时的 HEAD"之后,其他会话在我 PR 排队期间合入的
+//      commit 就落在起点之后,而他们无从知晓这个新要求 —— 门拦住无辜的人,且每次
+//      排队都重演(2026-07-26 实测拦到了别人的 0191 模型接入 commit)。
+// 运行时自算同时解决两条,详见 marker 文件自身的注释。
+const TRAILER_GATE_MARKER = "e2e/session-display/incident-trailer-enforced-from";
+function resolveTrailerGateStart(): string | null {
+  let out: string;
+  try {
+    out = git("log", "--diff-filter=A", "--format=%H", "--", TRAILER_GATE_MARKER);
+  } catch {
+    return null;
+  }
+  // 同一路径可能被删后重加:取最早那次添加。
+  const commits = out.split("\n").map((line) => line.trim()).filter(Boolean);
+  return commits.length > 0 ? commits[commits.length - 1] : null;
+}
+
 const TRAILER_GATE_SURFACES = [
   "packages/gateway/",
   "packages/commercial/",
@@ -134,9 +150,31 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     return { status: "wired", runner: `deploy-v5.sh → ${base}` };
   }
   if (layer === "integration") {
-    // 已知缺口:integ 套件当前既不在 CI 也不在部署门里(另有 agent 正在把 integ 接进 CI)。
-    // 标 pending 而不是直接红:天天红不带来信息;但 pending 层不许充当事故的 proof 证据。
-    return { status: "pending", runner: "npm run test:commercial:integ(尚未接入 CI/部署门)" };
+    // 2026-07-26:integ 已分梯队接进 CI(PR 门 pr-1/2/3 + 夜跑 nightly-*),所以这里
+    // 不再一律 pending,而是按**该文件真实属于哪个梯队**判定 —— 登记了一条没有任何
+    // 梯队收录的 integ 证据,等于它永远不会跑,必须红。
+    const tierDir = join(ROOT, ".github/integ-tiers");
+    const tiers = existsSync(tierDir) ? readdirSync(tierDir).filter((f) => f.endsWith(".txt")) : [];
+    if (tiers.length === 0) fail("integ 梯队清单目录缺失(.github/integ-tiers),integration 层 runner 不可判");
+    const owning = tiers.filter((f) =>
+      readFileSync(join(tierDir, f), "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"))
+        .some((entry) => entry === path || entry.endsWith(`/${path.split("/").pop()}`)),
+    );
+    if (owning.length === 0) {
+      fail(`${path} 未被任何 integ 梯队收录(.github/integ-tiers/*.txt),这条证据永远不会跑`);
+    }
+    const shard = owning[0].replace(/\.txt$/, "");
+    if (shard.startsWith("pr-")) {
+      if (!CI_WORKFLOW.includes("test:commercial:integ:shard")) {
+        fail("CI workflow 未调用 test:commercial:integ:shard,integ PR 门映射已失效");
+      }
+      return { status: "wired", runner: `CI job commercial-integ (${shard})` };
+    }
+    // 夜跑梯队:确实会跑,但发现延迟到次日,不能当作 PR 门级证据。
+    return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
   // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
   if (/^packages\/gateway\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
@@ -304,20 +342,56 @@ function parseWaivers(): Map<string, Waiver> {
 }
 
 function checkTrailerClosure(): number {
+  const start = resolveTrailerGateStart();
+  if (start === null) {
+    // marker 尚未提交 = 门本身还没合入 → 还没到生效的时候,不冒充检查过。
+    process.stdout.write(
+      "[incident-regressions] trailer 闭环门尚未生效(marker 未提交),本次跳过\n",
+    );
+    return 0;
+  }
   try {
-    git("cat-file", "-e", `${TRAILER_GATE_START}^{commit}`);
-    execFileSync("git", ["merge-base", "--is-ancestor", TRAILER_GATE_START, "HEAD"], { cwd: ROOT });
+    git("cat-file", "-e", `${start}^{commit}`);
+    execFileSync("git", ["merge-base", "--is-ancestor", start, "HEAD"], { cwd: ROOT });
   } catch {
-    // 浅克隆 / 起点尚未合入本分支:不冒充检查过(fail-closed 只针对能看见的历史)。
-    process.stdout.write("[incident-regressions] WARN: trailer 闭环门起点不可达(浅克隆?),本次跳过该门\n");
+    // 起点不可达有两种原因,必须区别对待 —— 此前一律 WARN 跳过,等于把
+    // "门失效" 伪装成 "门通过"(2026-07-26 实测:分支 rebase 后原 SHA 消失,
+    // 整道门安静地什么都没查)。
+    //   · 真·浅克隆:历史确实取不到,跳过是唯一选择(但要说清楚)。
+    //   · 完整克隆却找不到起点:起点写错了或被 rebase 冲掉 → 这是门坏了,必须红。
+    const shallow = (() => {
+      try {
+        return git("rev-parse", "--is-shallow-repository").trim() === "true";
+      } catch {
+        return false;
+      }
+    })();
+    if (shallow) {
+      process.stdout.write(
+        "[incident-regressions] WARN: 浅克隆,trailer 闭环门起点不可达,本次跳过该门\n",
+      );
+      return 0;
+    }
+    fail(
+      `trailer 闭环门锚点 ${start.slice(0, 12)}(${TRAILER_GATE_MARKER} 的引入 commit)在完整克隆里不可达 —— ` +
+        "这道门当前什么都没在检查。marker 文件被删/被重写历史都会导致这个状态。",
+    );
     return 0;
   }
   const waivers = parseWaivers();
   const today = new Date().toISOString().slice(0, 10);
-  const log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", `${TRAILER_GATE_START}..HEAD`);
+  // 拓扑范围不够:CI 检出的是 PR 的 **merge ref**(base + head 的合并态),于是 base 侧
+  // 在本 PR 排队期间新合入的 commit 与 head 侧的锚点 commit 是并行两支 —— 它们不是锚点
+  // 的祖先,`start..HEAD` 会把它们一并捞进来,门于是拦住别人的提交(2026-07-26 实测拦到
+  // 另一会话的 0191 commit)。再叠加时间维度:早于锚点的提交一律不判,因为那些作者在
+  // 提交时这道门还不存在。
+  const anchorTs = Number(git("log", "-1", "--format=%ct", start));
+  const log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1f%ct%x1e", `${start}..HEAD`);
   let checked = 0;
   for (const entry of log.split("\x1e").map((line) => line.trim()).filter(Boolean)) {
-    const [sha, subject, body = ""] = entry.split("\x1f");
+    const [sha, subject, body = "", committedAt = ""] = entry.split("\x1f");
+    // 并行合入的旧提交:锚点之后(拓扑)但早于锚点(时间)→ 门当时还不存在,不判。
+    if (Number.isFinite(anchorTs) && Number(committedAt) < anchorTs) continue;
     if (!/^fix\(v5\)/.test(subject)) continue;
     const touched = commitFiles(sha);
     if (!touched.some((file) => TRAILER_GATE_SURFACES.some((prefix) => file.startsWith(prefix)))) continue;

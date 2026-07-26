@@ -1,5 +1,12 @@
 {
   "schema": 1,
   "scope": "Incident trailer 闭环门的豁免簿。凡 subject 匹配 ^fix(v5) 且触碰 packages/{gateway,commercial,web-react,protocol,storage} 的 commit,都必须在 trailer 写 `Incident: INC-YYYYMMDD-SLUG`;确实与任何事故无关的,写 `Incident: none (<理由>)` 并在此登记一条 waiver。waiver 必须带审批引用与到期日,过期即门红 —— 它是有时限的例外,不是永久出口。",
-  "waivers": []
+  "waivers": [
+    {
+      "commit": "d031d0278",
+      "reason": "门禁基建自身的修复(trailer 门起点重指 + 不可达改 fail-closed / integ runner 按梯队实判 / 新增 check_ci_base_red 探针),不对应任何线上用户可见事故。它触碰 packages/commercial/src/selfheal/conditionKeys.ts 仅因 bash⇄TS 契约要求新探针必须两侧同步登记。",
+      "approvedBy": "dx 2026-07-26 门禁整改批(债务批,PR#256)",
+      "expiresAt": "2026-08-26"
+    }
+  ]
 }

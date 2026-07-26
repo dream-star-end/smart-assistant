@@ -241,6 +241,34 @@ function parseSetCookie(setCookieHeaders: string[], name: string): null | {
   return null;
 }
 
+/**
+ * 等到某个 scope 的 blocked rate_limit_events 行出现。
+ *
+ * 为什么需要它:429 的**拒绝**是同步的,审计事件落库不是。单次同步查询会间歇性读到 0 行
+ * (CI 实测:同一提交一次绿一次红,而请求日志里 429 明明已出现)。轮询而不是固定 sleep ——
+ * sleep 把竞态藏起来,且在慢机器上照样翻车。
+ *
+ * 它只影响**什么时候读**,不放宽读到的结果:调用方仍然自己断言精确条数。
+ * 抽成 helper 是因为同一根因在本文件里已经出现两处(A6 与 tight-limit),
+ * 第三处迟早会再犯 —— 消灭一类,不是补两个单点。
+ */
+async function waitForBlockedRateLimitEvents(scope: string, expected: number): Promise<number> {
+  for (let i = 0; i < 50; i += 1) {
+    const { rows } = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
+      [scope],
+    );
+    const cnt = Number(rows[0]?.cnt ?? 0);
+    if (cnt >= expected) return cnt;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const { rows } = await query<{ cnt: string }>(
+    "SELECT COUNT(*)::text AS cnt FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
+    [scope],
+  );
+  return Number(rows[0]?.cnt ?? 0);
+}
+
 describe("commercial HTTP router (integ)", () => {
   test("end-to-end: register → login → GET /api/me returns user", async (t) => {
     if (skipIfMissing(t)) return;
@@ -652,6 +680,7 @@ describe("commercial HTTP router (integ)", () => {
       assert.ok(r4.headers.get("retry-after"));
       // rate_limit_events 落库:scope=verify_email_smoke_email,key=sha256 前缀
       // (绝不是明文 email)
+      await waitForBlockedRateLimitEvents("verify_email_smoke_email", 1);
       const ev = await query<{ key: string }>(
         "SELECT key FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
         ["verify_email_smoke_email"],
@@ -714,11 +743,8 @@ describe("commercial HTTP router (integ)", () => {
       });
       assert.equal(r.status, 429);
       assert.ok(r.headers.get("retry-after"));
-      const ev = await query<{ cnt: string }>(
-        "SELECT COUNT(*)::text AS cnt FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
-        ["register_tight"],
-      );
-      assert.equal(ev.rows[0].cnt, "1", "blocked event must be recorded");
+      const blocked = await waitForBlockedRateLimitEvents("register_tight", 1);
+      assert.equal(String(blocked), "1", "blocked event must be recorded");
     } finally {
       await new Promise<void>((resolve) => tightServer.close(() => resolve()));
     }
