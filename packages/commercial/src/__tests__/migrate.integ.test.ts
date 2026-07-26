@@ -7,6 +7,7 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations, MigrationIntegrityError } from "../db/migrate.js";
 import { PricingCache } from "../billing/pricing.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-02 迁移系统集成测试。
@@ -29,43 +30,11 @@ let pgAvailable = false;
 
 /** 所有商业化表 + schema_migrations。用 DROP ... CASCADE,顺序无所谓,
  *  但仍列全,方便未来新增迁移时保持清理同步。 */
-const COMMERCIAL_TABLES = [
-  "emergency_containment_debts",
-  "emergency_containment_authorizations",
-  "release_egress_transitions",
-  "release_verification_evidence",
-  "verification_sponsored_requests",
-  "verification_runs",
-  "provider_quota_blocks",
-  "prompt_queue_item_attachments",
-  "prompt_queue_mutations",
-  "prompt_queue_items",
-  "prompt_queue_heads",
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
-
 async function cleanCommercialSchema(): Promise<void> {
   // DROP 时用 CASCADE 避免被 ON DELETE RESTRICT / INDEX 挡住。
   // 注意:不 drop 其他不相关的表(比如 db.integ 的 _db_integ_demo),
   // 但它在另一个测试进程,不会在本 pool 看到残留。
-  const sql = `DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`;
-  await query(sql);
+  await resetTestSchemaForTest();
 }
 
 async function probe(): Promise<boolean> {

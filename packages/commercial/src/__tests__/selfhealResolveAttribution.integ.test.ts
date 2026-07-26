@@ -24,6 +24,7 @@ import { sweepRepairsOnce } from "../selfheal/sweeper.js";
 import { resolveIncidentByProbe } from "../selfheal/incidents.js";
 import { SELFHEAL_DRILL_TRANSPORT } from "../selfheal/conditionKeys.js";
 import { _resetPolicyCacheForTest } from "../selfheal/policy.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -47,6 +48,7 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 

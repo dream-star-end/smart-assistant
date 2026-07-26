@@ -28,19 +28,12 @@ import {
   FirstTopupAlreadyUsedError,
   InvalidOrderStateError,
 } from "../payment/orders.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
   "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
-  "agent_subscriptions", "user_preferences", "request_finalize_journal",
-  "orders", "topup_plans", "usage_records",
-  "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
-  "email_verifications", "users", "system_settings", "schema_migrations",
-];
 
 let pgAvailable = false;
 
@@ -58,13 +51,13 @@ before(async () => {
   }
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }));
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    try { await resetTestSchemaForTest(); } catch { /* */ }
     await closePool();
   }
 });

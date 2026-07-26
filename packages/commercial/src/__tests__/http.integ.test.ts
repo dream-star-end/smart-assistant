@@ -13,6 +13,7 @@ import { warmupLoginDummyHash } from "../auth/login.js";
 import { setSystemSetting } from "../admin/systemSettings.js";
 import { _resetAllowRegistrationCacheForTests } from "../http/handlers.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-16 集成:把 createCommercialHandler 装到一个真 http.Server 上,跑端到端
@@ -28,27 +29,6 @@ const TEST_REDIS_URL =
   process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "system_settings",
-  "schema_migrations",
-];
 
 const JWT_SECRET = "y".repeat(64);
 
@@ -103,14 +83,14 @@ before(async () => {
     await resetPool();
     const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
     setPoolOverride(pool);
-    await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+    await resetTestSchemaForTest();
     await runMigrations();
     await warmupLoginDummyHash();
     // 2026-05-25:DEFAULTS.allow_registration 翻 false(生产关停)。这套 HTTP
     // 集成 case 大量用 POST /api/auth/register 走打通流;handler 前置门会先于
     // rate-limit / 业务逻辑判定 allow_registration,默认 false 会让所有 register
     // 路径直接 403 REGISTRATION_DISABLED。UPSERT row=true 让 row 命中覆盖默认,
-    // beforeEach 不 TRUNCATE system_settings(见 COMMERCIAL_TABLES 列表也没动)→
+    // beforeEach 只 TRUNCATE 业务表,不动 system_settings →
     // 单次设置全套共享。
     await query(
       `INSERT INTO system_settings(key, value, updated_at)
@@ -169,7 +149,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
+    try { await resetTestSchemaForTest(); } catch { /* ignore */ }
     await closePool();
   }
 });

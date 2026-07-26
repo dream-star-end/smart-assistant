@@ -21,6 +21,7 @@ import { writeCondition } from "../selfheal/conditions.js";
 import { reconcileOnce } from "../selfheal/reconciler.js";
 import { sweepOnce } from "../selfheal/sweeper.js";
 import { _resetPolicyCacheForTest } from "../selfheal/policy.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -44,6 +45,7 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
+  await resetTestSchemaForTest();
   await runMigrations(); // 幂等;含 0133(condition function + incident_policies seed)
 });
 

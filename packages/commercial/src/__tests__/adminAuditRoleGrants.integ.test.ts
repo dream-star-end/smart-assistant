@@ -29,6 +29,7 @@ import assert from "node:assert/strict";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -72,14 +73,7 @@ before(async () => {
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 5 }));
   // 清库 + 全量迁移一次,后续断言共用。
-  const rows = await query<{ table_name: string }>(
-    `SELECT table_name FROM information_schema.tables
-      WHERE table_schema='public' AND table_type='BASE TABLE'`,
-  );
-  if (rows.rows.length > 0) {
-    const quoted = rows.rows.map((r) => `"${r.table_name.replaceAll('"', '""')}"`).join(", ");
-    await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
-  }
+  await resetTestSchemaForTest();
   await runMigrations();
   migrated = true;
 });

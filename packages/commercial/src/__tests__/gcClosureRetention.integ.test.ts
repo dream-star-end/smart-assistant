@@ -24,6 +24,7 @@ import {
   gcFinalizeJournal,
 } from "../billing/finalizeJournalReconciler.js";
 import { startAuditRetentionSweeper } from "../admin/auditRetention.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -50,6 +51,7 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
+  await resetTestSchemaForTest();
   await runMigrations();
   const u = await query<{ id: string }>(
     `INSERT INTO users(email, password_hash, credits, role, status)

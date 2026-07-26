@@ -16,6 +16,7 @@ import { verifyAccess, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "../au
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import { confirmPasswordReset, requestPasswordReset } from "../auth/verify.js";
 import { patchUser } from "../admin/users.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-14 集成:登录 + Refresh + Logout 端到端打通真 Postgres。
@@ -29,27 +30,6 @@ const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 let pgAvailable = false;
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "system_settings",
-  "users",
-  "schema_migrations",
-];
 
 const JWT_SECRET = "x".repeat(64); // ≥32 bytes
 
@@ -87,7 +67,7 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
   // 预热 dummy hash 一次性,后面测试看到的 timing 才公平
   await warmupLoginDummyHash();
@@ -95,7 +75,7 @@ before(async () => {
 
 after(async () => {
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
+    try { await resetTestSchemaForTest(); } catch { /* ignore */ }
     await closePool();
   }
 });

@@ -23,6 +23,7 @@ import {
   listLedger,
   InsufficientCreditsError,
 } from "../billing/ledger.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -33,29 +34,8 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
-
 async function cleanCommercialSchema(): Promise<void> {
-  const sql = `DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`;
-  await query(sql);
+  await resetTestSchemaForTest();
 }
 
 async function probe(): Promise<boolean> {

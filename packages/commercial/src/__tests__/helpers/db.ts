@@ -54,8 +54,12 @@ export async function truncateAllForTest(
  * 动机(2026-07-11):此前这类套件各自维护一份 COMMERCIAL_TABLES 手工清单,DROP 清单
  * 后重放迁移 —— 新迁移加的表(如 admin_alert_channels)没进清单就撞"already exists",
  * 且该清单在 33 个测试文件里各复制一份、独立漂移(一类必然复发的坑)。schema 级重置
- * 零清单维护,迁移从零重放,确定性成立。其余仍用手工清单的套件属登记债,逐个迁移时
- * 改用本函数。
+ * 零清单维护,迁移从零重放,确定性成立。
+ *
+ * 2026-07-26 收口:共享 public schema 的 integ 套件已全部改用本函数(或
+ * `resetAndMigrateTestSchema`),手工 DROP 清单在仓内归零 —— "新迁移加表 → 某个老
+ * 测试文件 already exists" 这一整类失败不再可能复发。新写 integ 套件一律用本函数,
+ * 禁止再抄手工清单(由 scripts/check-integ-tiers.ts 之外的 code review 把关)。
  *
  * 防护与 truncateAllForTest 同源:库名必须以 `_test` 结尾,防 .env 配错清了生产库。
  */
@@ -193,4 +197,16 @@ export function useDedicatedTestDatabase(dbName: string): DedicatedTestDatabase 
       return false;
     },
   };
+}
+
+/**
+ * `resetTestSchemaForTest` + 全量迁移重放 —— shared-public integ 套件的统一"干净起点"。
+ *
+ * 绝大多数套件的 before 钩子就是"清干净 → runMigrations()",这里收成一个调用,
+ * 避免每个文件各自决定清多干净(手工清单/动态 drop-all/什么都不清 三种范式并存,
+ * 是 2026-07-26 审计里 74 次 `relation "system_settings" already exists` 的根因)。
+ */
+export async function resetAndMigrateTestSchema(runner?: QueryRunner): Promise<void> {
+  await resetTestSchemaForTest(runner);
+  await runMigrations();
 }
