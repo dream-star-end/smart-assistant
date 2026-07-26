@@ -166,22 +166,32 @@ CADDY
 		}
 	}
 
-	# ── 安全:sourcemap 绝不出公网 ──
-	# 2026-07-26 实测:/assets/main-*.js.map 公网 200、901KB、含全量 sourcesContent。
-	# handle 块按**书写顺序**互斥求值,故本块必须排在 /assets/* 直服之前,先把 *.map 吃掉。
+	# ── /assets/* → 共享 union 资产池直服(lane 无关;跨 lane/abort 懒加载 chunk 仍可得,RFC §2)──
+	#
+	# 安全:sourcemap 绝不出公网。2026-07-26 实测 /assets/main-*.js.map 公网 200、901KB、
+	# 含全量 sourcesContent(= 源码泄漏)。
+	#
+	# 【必读,踩过的坑】首版把 @sourcemap 匹配器写成**独立的、排在本块之前的**
+	# handle,想当然以为"handle 按书写顺序互斥求值"。**错了** —— Caddyfile adapter 会按
+	# 路径**特异性**给同组 handle 重排,编译出来的实际顺序是:
+	#     /assets/*   ← 更具体,排前面
+	#     *.map       ← 排后面,永不命中
+	# 文本顺序断言与 self-check 全部因此失效,只有部署活体门(smoke_sourcemap_sealed 真去
+	# GET 一次)抓住了它。教训:**Caddyfile 的书写顺序不等于匹配顺序**。
+	#
+	# 现在把守卫**嵌进** /assets 处理块内,并用 route 包住 —— route 的语义就是"保持写法
+	# 顺序、不重排",这是唯一不依赖 adapter 内部排序规则的写法。
 	# 与 vite 的 sourcemap:hidden(不写 sourceMappingURL)、deploy-v5.sh 的 rsync --exclude
 	# (不进池)构成纵深防御:即使池里残留历史 .map(存量 7312 个),这一层也让它不可达。
 	# 注意:本 heredoc 是非引号形式(要插值资产池路径),注释里严禁出现反引号或
 	# 美元加圆括号的命令替换写法 —— 会被 shell 真的当命令执行掉(本块首版就踩过)。
-	@sourcemap path *.map
-	handle @sourcemap {
-		respond 404
-	}
-
-	# ── /assets/* → 共享 union 资产池直服(lane 无关;跨 lane/abort 懒加载 chunk 仍可得,RFC §2)──
 	handle /assets/* {
 		root * ${ASSETS_POOL}
-		file_server
+		route {
+			@sourcemap path *.map
+			respond @sourcemap 404
+			file_server
+		}
 	}
 CADDY
 
@@ -278,17 +288,28 @@ self_check() {
   _need "$tmp/seed"  '@v5pay path /api/payment/hupi/callback-v5' 'seed'
   # sourcemap 拦截:两种形态都必须有,且必须**先于** /assets 直服(handle 按书写顺序互斥求值;
   # 排在后面等于永不命中 —— 这正是只断言"存在"会漏掉的那类静默失效)。
+  # sourcemap 守卫必须**嵌在** /assets 处理块内、并被 route 包住。
+  # 不再断言"文本上排在前面":Caddyfile adapter 会按路径特异性重排同组 handle,
+  # 文本顺序 ≠ 匹配顺序(首版就是这么漏的,见模板里的坑注释)。route 的语义是
+  # "保持写法顺序不重排",所以只要守卫在 route 内且位于 file_server 之前即成立。
   _sourcemap_guard() { # <file> <label>
-    _need "$1" '@sourcemap path \*\.map' "$2"
-    _need "$1" 'handle @sourcemap'       "$2"
-    local m a; m="$(grep -n 'handle @sourcemap' "$1" | head -1 | cut -d: -f1)"
-    a="$(grep -n 'handle /assets/\*'      "$1" | head -1 | cut -d: -f1)"
-    if [[ -z "$m" || -z "$a" || "$m" -ge "$a" ]]; then
-      echo "  ✗ [$2] handle @sourcemap 必须先于 handle /assets/*(map=${m:-<none>} assets=${a:-<none>})" >&2; ok=0
+    local block
+    block="$(awk '/^\thandle \/assets\/\*/{f=1} f{print} f&&/^\t}/{exit}' "$1")"
+    if [[ -z "$block" ]]; then
+      echo "  ✗ [$2] 找不到 handle /assets/* 块" >&2; ok=0; return
     fi
-    # respond 404 必须在 @sourcemap 的 handle 块内(紧随其后一行)。
-    grep -A1 'handle @sourcemap' "$1" | grep -q 'respond 404' \
-      || { echo "  ✗ [$2] handle @sourcemap 块内缺 respond 404" >&2; ok=0; }
+    grep -q 'route {' <<<"$block" \
+      || { echo "  ✗ [$2] /assets 块内缺 route(不用 route 就会被 adapter 重排)" >&2; ok=0; }
+    grep -q '@sourcemap path \*\.map' <<<"$block" \
+      || { echo "  ✗ [$2] /assets 块内缺 @sourcemap 匹配器" >&2; ok=0; }
+    grep -q 'respond @sourcemap 404' <<<"$block" \
+      || { echo "  ✗ [$2] /assets 块内缺 respond @sourcemap 404" >&2; ok=0; }
+    local r f
+    r="$(grep -n 'respond @sourcemap 404' <<<"$block" | head -1 | cut -d: -f1)"
+    f="$(grep -n 'file_server'            <<<"$block" | head -1 | cut -d: -f1)"
+    if [[ -z "$r" || -z "$f" || "$r" -ge "$f" ]]; then
+      echo "  ✗ [$2] respond @sourcemap 404 必须在 route 内位于 file_server 之前(respond=${r:-<none>} file_server=${f:-<none>})" >&2; ok=0
+    fi
   }
   _sourcemap_guard "$tmp/seed" 'seed'
 
