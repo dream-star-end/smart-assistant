@@ -33,6 +33,15 @@ export interface ArchivePage {
   oldestSeq: number | null;
 }
 
+/** GET /api/sessions/:id/timeline —— 前端「查看更早历史记录」真正调用的分页端点。 */
+export interface TimelinePage {
+  messages: any[]; // 升序
+  nextCursor: string | null;
+  hasMore: boolean;
+  timelineGeneration: number;
+  snapshotMaxSeq?: number;
+}
+
 export interface TapeRecordsPage {
   records?: any[];
   nextCursor?: number | null;
@@ -137,6 +146,24 @@ export class Api {
     const res = await fetch(url, { headers: this.authHeaders(token) });
     if (!res.ok) throw new Error(`[api] archive ${id} ${res.status}`);
     return (await res.json()) as ArchivePage;
+  }
+
+  /**
+   * 真实时间线分页(UI 的「查看更早历史记录」= useChatSocket.loadOlderHistory 走的同一端点)。
+   * cursor 省略 = 首页;返回体里的 nextCursor 直接回传下一页。
+   */
+  async getTimelinePage(
+    token: string,
+    id: string,
+    cursor?: string | null,
+    limit = 100,
+  ): Promise<TimelinePage> {
+    const url = new URL(`${this.base}/api/sessions/${id}/timeline`);
+    if (typeof cursor === 'string' && cursor) url.searchParams.set('cursor', cursor);
+    url.searchParams.set('limit', String(limit));
+    const res = await fetch(url, { headers: this.authHeaders(token) });
+    if (!res.ok) throw new Error(`[api] timeline ${id} ${res.status}: ${(await res.text()).slice(0, 160)}`);
+    return (await res.json()) as TimelinePage;
   }
 
   /** 不可变 tape 真实记录分页。route-not-found → null(端点未部署);资源 404 → 抛。 */

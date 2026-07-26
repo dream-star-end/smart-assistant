@@ -35,13 +35,15 @@ npm run check:v5:incidents
 | 3 | `03-reconnect-inflight` | 断线恢复后必有完成或明确失败，绝不永久静默 |
 | 4 | `04-terminal-reconcile` | 中途刷新后 spinner 收敛到回复或错误终态 |
 | 5 | `05-turn-status` | verified terminal 状态可见，late-tape manual reconcile 不泄漏 |
-| 6 | `06-archive-paging` | 分页无重复、游标递减、空页/hasMore 诚实、有限步终止 |
+| 6 | `06-archive-paging` | 更早历史分页:UI 控件必现且有限步到底、跨页无重复无丢行、游标收敛(PG 注入夹具造出必须翻页的 260 行会话) |
 | 7 | `07-resend-dedup` | 同 clientMessageId 双发不双回复、不双计费 |
 | 8 | `08-post-final-process-order` | poisoned IDB + 空增量后过程仍在 final 前且写回稳定 |
 | 9 | `09-fixed-model-billing-evidence` | 精确模型、durable dispatch/tape 终态、验证赞助零扣费与名义成本留证 |
+| 10 | `10-stop-turn` | 失控 turn 的逃生口:执行中必有「停止」、点击 3s 内进终态、之后零增量帧、不额外计费不复活、刷新不自动重跑 |
 
-发布门强制 `OC_E2E_REQUIRE_DIRECT_TIMELINE=1`。用例 2/5 所需 PG 注入不可用时不是
-skip，而是整门失败。
+发布门强制 `OC_E2E_REQUIRE_DIRECT_TIMELINE=1`。用例 2/5/6 所需 PG 注入不可用时不是
+skip，而是整门失败 —— 用例 6 的 UI 逐页分支必须真的执行，不接受"账号里凑不出数据所以
+只跑了 API 层"。
 
 ## 验证赞助不是用户额度
 
