@@ -39,8 +39,10 @@
     "test:commercial:unit:gate": "bash .github/scripts/commercial-unit-gate.sh",
     "test:web-react": "npm run test --workspace packages/web-react",
     "test:browser": "npm run --workspace @openclaude/web-react test:browser",
-    "test:commercial:integ": "bash scripts/test-mutex.sh commercial 'npx tsx --test --test-concurrency=1 $(find packages/commercial/src -type f -name \"*.integ.test.ts\")'",
-    "test:commercial:integ:strict": "REQUIRE_TEST_DB=1 npm run test:commercial:integ",
+    "test:commercial:integ": "REQUIRE_TEST_DB=1 bash scripts/test-mutex.sh commercial 'npx tsx --test --test-force-exit --test-concurrency=1 --test-timeout=180000 $(find packages/commercial/src -type f -name \"*.integ.test.ts\")'",
+    "test:commercial:integ:strict": "npm run test:commercial:integ",
+    "test:commercial:integ:shard": "bash .github/scripts/commercial-integ-gate.sh",
+    "lint:integ-tiers": "tsx scripts/check-integ-tiers.ts",
     "test:commercial:prompt-queue": "bash scripts/test-mutex.sh commercial 'npx tsx --test --test-concurrency=1 packages/commercial/src/__tests__/internalPromptQueue.test.ts packages/commercial/src/__tests__/promptQueueDispatch.test.ts packages/commercial/src/__tests__/promptQueueStore.integ.test.ts packages/commercial/src/__tests__/userChatBridgeCodexBilling.test.ts'",
     "test:commercial": "npm run test:commercial:unit && npm run test:commercial:integ",
     "test:v5:ops": "npx tsx --test scripts/__tests__/v5ReleaseSafety.test.ts scripts/__tests__/v5RemountCcbBaseline.test.ts scripts/__tests__/knownFailuresGate.test.ts",
@@ -54,10 +56,10 @@
     "test": "npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:storage && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
     "typecheck": "tsc --build && npm run typecheck --workspace packages/web-react",
-    "check:v5": "npm run check:ci-parity && npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run typecheck && npm run test:v5:ops && npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:browser && npm run test:commercial:unit:gate",
+    "check:v5": "npm run check:ci-parity && npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run lint:integ-tiers && npm run typecheck && npm run test:v5:ops && npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:browser && npm run test:commercial:unit:gate && npm run test:commercial:integ:shard -- pr",
     "typecheck:clean": "tsc --build --clean",
     "typecheck:watch": "tsc --build --watch",
-    "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run lint:undefined-refs && npm run typecheck && npm run test"
+    "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run lint:undefined-refs && npm run lint:integ-tiers && npm run typecheck && npm run test"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

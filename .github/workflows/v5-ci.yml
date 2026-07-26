@@ -252,3 +252,126 @@ jobs:
           path: ${{ env.COMMERCIAL_UNIT_TAP }}
           if-no-files-found: error
           retention-days: 14
+
+  commercial-integ:
+    name: commercial-integ (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+
+    strategy:
+      # 一片红不取消其余:要一次看到全部分片的结果,否则每轮只能修一个。
+      fail-fast: false
+      matrix:
+        include:
+          - shard: pr-1
+            timeout: 20
+          - shard: pr-2
+            timeout: 20
+          - shard: pr-3
+            timeout: 20
+
+    # 2026-07-26 门禁审计:110 个 *.integ.test.ts / 1549 个用例在 CI、deploy、
+    # playbook 三处都不跑,而单测层白纸黑字把"SQL 真行为"delegate 给它们
+    # (turnDispatchStore.test.ts / preferences.test.ts 头注释)——委派链下游不存在。
+    # 这个 job 把 PR 门第一梯队(.github/integ-tiers/pr-*.txt)接进 CI。
+    #
+    # 分片而非一把梭:PR#131 当初 integ job 撞 45min 全局 timeout 卡了 8 天。
+    # 每片自带 max-minutes 预算(写在清单头),超了就该拆片,不该调大 timeout。
+    #
+    # fixture 与 commercial-unit 同款(postgres:16 + redis:7),整份照抄:
+    # integ 的 DB/Redis 门控是 CI==='true' || REQUIRE_TEST_DB==='1',缺 fixture 必须红。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI: 'true'
+      REQUIRE_TEST_DB: '1'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+      TEST_REDIS_URL: redis://127.0.0.1:56379/0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Tier manifest drift gate
+        # 清单是判绿下界的权威;先证明它跟磁盘一致,再谈跑没跑。
+        run: npm run lint:integ-tiers
+
+      - name: Wait for test fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if docker exec '${{ job.services.postgres.id }}' pg_isready -U test -d openclaude_test; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Postgres did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          for i in {1..30}; do
+            if docker exec '${{ job.services.redis.id }}' redis-cli ping; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Redis did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run integ shard ${{ matrix.shard }}
+        # 与 commercial-unit 同形:v5 master 生产以 root 跑,provision 契约要 chown
+        # /run/ccb-ssh/u<uid>;普通用户会稳定 EACCES。只透传门禁必需 env。
+        env:
+          TAP_OUT: commercial-integ-${{ matrix.shard }}.tap
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            "TEST_REDIS_URL=$TEST_REDIS_URL" \
+            "TAP_OUT=$TAP_OUT" \
+            bash .github/scripts/commercial-integ-gate.sh '${{ matrix.shard }}'
+
+      - name: Upload TAP output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: commercial-integ-tap-${{ matrix.shard }}
+          path: commercial-integ-${{ matrix.shard }}.tap
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,17 @@
+# PR 门第一梯队 · 分片 2 —— 计费主干
+#
+# 这一片绿,直接证明:下单加积分、同一 request_id 只结算一次(并发下也是)、
+# 余额不足会被 preCheck 拦、失败 turn 免单、图片与订阅两条独立计费路径
+# 都按定价表落账 —— 即"不会多扣用户的钱,也不会漏计"。
+#
+# min-tests: 1
+# max-minutes: 20
+packages/commercial/src/__tests__/payment.integ.test.ts
+packages/commercial/src/__tests__/orders.integ.test.ts
+packages/commercial/src/__tests__/ledger.integ.test.ts
+packages/commercial/src/__tests__/preCheckCap.integ.test.ts
+packages/commercial/src/__tests__/settleUsage.integ.test.ts
+packages/commercial/src/__tests__/settleUsageConcurrent.integ.test.ts
+packages/commercial/src/__tests__/turnWaiver.integ.test.ts
+packages/commercial/src/__tests__/imageBilling.integ.test.ts
+packages/commercial/src/__tests__/subscriptionBilling.integ.test.ts

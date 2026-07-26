@@ -1,0 +1,14 @@
+# PR 门第一梯队 · 分片 3 —— schema 权威与持久化生命周期
+#
+# 这一片绿,直接证明:迁移链能从零重放到最新且校验和不漂、队列/结算日志
+# 的原子生命周期在真 SQL 下成立、每张新表都登记了保留策略(retentionRegistry)
+# —— 即"发版带的 schema 变更不会在生产上炸,也不会留下无人清理的表"。
+#
+# min-tests: 1
+# max-minutes: 20
+packages/commercial/src/__tests__/migrate.integ.test.ts
+packages/commercial/src/__tests__/migrate_full.integ.test.ts
+packages/commercial/src/__tests__/queriesAtomicLifecycle.integ.test.ts
+packages/commercial/src/__tests__/promptQueueStore.integ.test.ts
+packages/commercial/src/__tests__/finalizeJournalReconciler.integ.test.ts
+packages/commercial/src/__tests__/retentionRegistry.integ.test.ts

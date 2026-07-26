@@ -104,7 +104,29 @@ cd packages/web-react && npx vitest run             # ≈433 个
 cd packages/web-react && npm run test:browser       # 真 Chromium 组件冒烟(见下方红线)
 npm run test:storage                                # ≈224 个
 npm run test:commercial:unit                        # 本机缺 PG/Redis 会有 ~70 个存量环境失败!
+npm run test:commercial:integ:shard -- pr           # PR 门第一梯队 integ(22 文件,真 SQL 行为)
+npm run lint:integ-tiers                            # 新增 integ 文件必须登记梯队,否则红
 ```
+🔴 **integ 层不是可选层**(2026-07-26 门禁审计整改):`packages/commercial` 的单测
+把"SQL 真行为"显式 delegate 给 `*.integ.test.ts`(`turnDispatchStore.test.ts` /
+`turnDispatchReconciler.test.ts` / `preferences.test.ts` 头注释白纸黑字写着"由 integ
+覆盖")。此前这 110 个文件 / 1549 个用例在 CI、deploy、playbook 三处都不跑 ——
+委派链的下游根本不存在,而每周还在往里加用例。现在:
+- **PR 门第一梯队**(`.github/integ-tiers/pr-*.txt`,22 文件)进 `check:v5` 与 CI
+  `commercial-integ` job,每 PR 阻塞。它绿 = 能注册 / 能收到验证信 / 能登录 /
+  refresh 家族被盗会整族吊销 / 下单加积分 / 同一 request_id 只扣一次钱 /
+  会话 tape 能落库能读回 / 迁移链能从零重放 / 新表都有保留策略。
+- **其余 87 文件**进 `.github/workflows/v5-integ-nightly.yml`(每日 03:00 沪时),
+  失败开工单不阻塞 PR。
+- 判绿判据比 unit 的基线 diff 严:`失败集 ⊆ 基线 且 skipped==0 且
+  executed>=min-tests 且 TAP plan 完整` —— 四条同时成立(见 §CI 文档)。
+  integ 层的 skip 几乎总是 fixture 缺失,而 fixture 缺失必须红:静默 skip
+  正是这一层此前长期零执行的成因。
+- 本机 fixture:PG `127.0.0.1:55432`(test/test/openclaude_test)、
+  Redis `127.0.0.1:56379`。缺任一个,门会红而不是绿。
+- 加了新的 `*.integ.test.ts` → 必须登记进 `.github/integ-tiers/` 某个清单,
+  否则 `lint:integ-tiers` 红。选梯队的判据只有一条:**它绿了能证明哪一条
+  用户可见事实?**
 🔴 **用户可感知交互面必须过真浏览器,jsdom 绿不作数**(2026-07-18 附件事故制度化):
 jsdom 对"点击→系统行为"类契约恒假阴性 —— label 激活查找走 ownerDocument 而非 tree
 scope、fireEvent 非受信不触发 React discrete 同步 flush,「点击添加附件无反应」这类
