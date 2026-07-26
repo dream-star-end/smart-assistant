@@ -127,6 +127,11 @@ export interface CommercialHttpDeps {
   mailer: Mailer
   redis: RateLimitRedis
   turnstileSecret?: string
+  /**
+   * 是否对真实用户强制人机验证(env TURNSTILE_ENFORCE,缺省=强制)。
+   * 与 turnstileBypass 是两回事:那个是测试旁路(生产禁用),这个是显式产品配置。
+   */
+  turnstileEnforce?: boolean
   /** 全局旁路(env TURNSTILE_TEST_BYPASS),仅 dev/CI —— 生产由 config.ts fail-closed 拦死 */
   turnstileBypass?: boolean
   /**
@@ -577,6 +582,7 @@ export async function handleRegister(
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
       turnstileBypassAccounts: deps.turnstileBypassAccounts,
+      turnstileEnforce: deps.turnstileEnforce,
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       verifyEmailUrlBase: deps.verifyEmailUrlBase,
@@ -661,6 +667,7 @@ export async function handleLogin(
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
       turnstileBypassAccounts: deps.turnstileBypassAccounts,
+      turnstileEnforce: deps.turnstileEnforce,
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       bindIp: ctx.authBoundIp,
@@ -977,6 +984,7 @@ export async function handleRequestPasswordReset(
         turnstileSecret: deps.turnstileSecret,
         turnstileBypass: deps.turnstileBypass,
         turnstileBypassAccounts: deps.turnstileBypassAccounts,
+        turnstileEnforce: deps.turnstileEnforce,
         // requestPasswordReset 里 remoteIp 只给 Turnstile。用 ctx.clientIp。
         remoteIp: ctx.clientIp,
         fetchImpl: deps.fetchImpl,
@@ -1173,7 +1181,10 @@ export async function handleGetPublicConfig(
     // 那时服务端还不知道来访者是谁;若让它随白名单变真,等于把"哪些账号可绕过"
     // 泄露给任意匿名请求,并且真实用户的 widget 也会被误关。账号级放行只发生在
     // 服务端(resolveTurnstileBypass),前端在生产下永远渲染真 widget。
-    turnstile_bypass: deps.turnstileBypass === true,
+    // 前端据此决定渲染真 widget 还是走占位 token。两种情况都要 true:
+    //   ① dev/CI 的全局测试旁路;② 产品配置显式不强制(TURNSTILE_ENFORCE=0)。
+    // 否则会出现"服务端不校验、前端却卡在 widget 上"的最坏组合。
+    turnstile_bypass: deps.turnstileBypass === true || deps.turnstileEnforce === false,
     require_email_verified: deps.requireEmailVerified === true,
     // FEATURE_REMOTE_SSH 灰度状态 —— 前端据此决定是否渲染执行环境切换器。
     feature_remote_ssh: deps.remoteSshEnabled === true,
