@@ -4484,6 +4484,11 @@ esac
   }
   const statePath = path.join(dir, 'state')
   const logPath = path.join(dir, 'log')
+  // 两条 master 日志 lane 的夹具文件(见下方 V5MON_MASTER_LOG_A/B 注释)。
+  const masterLogA = path.join(dir, 'master-a.log')
+  const masterLogB = path.join(dir, 'master-b.log')
+  await writeFile(masterLogA, '')
+  await writeFile(masterLogB, '')
   const result = run(monitor, args, {
     PATH: `${bin}:${process.env.PATH}`,
     V5MON_ENV_FILE: path.join(dir, 'env'),
@@ -4495,6 +4500,15 @@ esac
     // "obsolete pool 一次性迁移"那条"本轮必须全绿"的前置(该前置是刻意的 fail-closed,
     // 不能为了让测试过就把它放宽 —— 那等于把迁移模式变成通用告警静默开关)。
     V5MON_BACKUP_DIR: backupDir,
+    // 2026-07-26 同理:mail / client_4xx_storm 不再猜 A 槽日志,而是按 deploy_state 的
+    // serving slot 派生 lane,并在"serving slot 自己的日志不可读"时判 bad(那正是本次
+    // 修复的反向守卫 —— 蓝绿切到 B 之后这两项曾经读闲置槽的静默旧日志、恒判 ok)。
+    // 夹具里 /var/log/openclaude-v5*.log 不存在,两条 lane 全不可读 → mail 恒 bad,
+    // 会挡住"obsolete pool 一次性迁移"那条要求本轮全绿的前置。所以这里给两条 lane 各
+    // 指一个夹具内的空日志文件:空文件是**可读**的,判据照常跑(窗口内无失败行 → ok),
+    // 守卫本身一字未放宽 —— 与上面 backup_fresh 同一处理方式。
+    V5MON_MASTER_LOG_A: masterLogA,
+    V5MON_MASTER_LOG_B: masterLogB,
     V5MON_MAINTENANCE_FILE: path.join(dir, 'marker'),
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
     V5MON_CUTOVER_ROOT: cutoverRoot,
@@ -4581,6 +4595,11 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   // 夹具内的"健康备份"目录(见下方 V5MON_BACKUP_DIR)。
   const installBackupDir = path.join(dir, 'host-backups')
   spawnSync('mkdir', ['-p', path.join(installBackupDir, 'v5-fixture-fresh')])
+  // 两条 master 日志 lane 的夹具文件(见下方 V5MON_MASTER_LOG_A/B 注释)。
+  const installMasterLogA = path.join(dir, 'install-master-a.log')
+  const installMasterLogB = path.join(dir, 'install-master-b.log')
+  await writeFile(installMasterLogA, '')
+  await writeFile(installMasterLogB, '')
   await Promise.all([mkdir(stage), mkdir(systemdDir), mkdir(backupRoot), mkdir(bin)])
   for (const source of [
     'scripts/v5-monitor.sh',
@@ -4691,7 +4710,13 @@ esac
     // 夹具指向自己的新鲜备份目录:安装门是"任何 bad 就拒装",不指的话开发机上备份陈旧
     // 就恒红,且这条恒红与被测行为无关。安装器已支持透传该覆盖(去掉了硬编码生产假设)。
     V5MON_BACKUP_DIR: installBackupDir,
-    V5MON_MAIL_LOG: path.join(dir, 'missing-app.log'),
+    // 2026-07-26:此前这里指向一个**不存在**的 missing-app.log,依赖的是 mail 探针
+    // "日志不可读 → record ok(跳过)"的旧 fail-open 行为。那条 fail-open 已被修掉
+    // (不可读现在判 bad:"没问题"与"没看过"必须是两个结论),于是安装门的
+    // "任何 bad 就拒装"会拒掉这次安装 —— 夹具依赖了一个刚被消灭的洞。
+    // 改为提供**可读的空日志**:判据照常执行(窗口内无失败行 → ok),守卫一字未放宽。
+    V5MON_MASTER_LOG_A: installMasterLogA,
+    V5MON_MASTER_LOG_B: installMasterLogB,
     V5MON_MAINTENANCE_FILE: path.join(dir, 'missing-maintenance.json'),
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
     V5MON_CUTOVER_ROOT: path.join(dir, 'cutovers'),
