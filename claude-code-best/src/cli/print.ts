@@ -1052,11 +1052,15 @@ function runHeadlessStreaming(
   // them straight to the output stream eliminates the latency.
   const unsubscribeFlushListener = setFlushListener(events => {
     for (const event of events) {
+      // [v5 定制] SdkEvent 是 system/stream_event 形状,不在 StdoutMessage 的 zod
+      // union 里(pin 时代 StdoutMessage 是 `any` stub,上游 v2.8.4 换成了真类型才
+      // 暴露出来)。Stream<T> 只入队 + JSON 序列化写 stdout,无运行时校验,故断言安全;
+      // 帧本身由 gateway ccbMessageParser 消费(见 UPSTREAM.md §3)。
       output.enqueue({
         ...event,
         uuid: randomUUID(),
         session_id: getSessionId(),
-      })
+      } as unknown as StdoutMessage)
     }
   })
 
@@ -2298,7 +2302,7 @@ function runHeadlessStreaming(
                       .is_error
                     // Flush pending SDK events so they appear before result on the stream.
                     for (const event of drainSdkEvents()) {
-                      output.enqueue(event)
+                      output.enqueue(event as unknown as StdoutMessage)
                     }
 
                     // Hold-back: don't emit result while background agents are running
@@ -2320,7 +2324,7 @@ function runHeadlessStreaming(
                     // Flush SDK events (task_started, task_progress) so background
                     // agent progress is streamed in real-time, not batched until result.
                     for (const event of drainSdkEvents()) {
-                      output.enqueue(event)
+                      output.enqueue(event as unknown as StdoutMessage)
                     }
                     output.enqueue(message as StdoutMessage)
                   }
@@ -2497,7 +2501,7 @@ function runHeadlessStreaming(
         // Drain SDK events (task_started, task_progress) before command queue
         // so progress events precede task_notification on the stream.
         for (const event of drainSdkEvents()) {
-          output.enqueue(event)
+          output.enqueue(event as unknown as StdoutMessage)
         }
 
         runPhase = 'draining_commands'
@@ -2589,7 +2593,7 @@ function runHeadlessStreaming(
         // waitingForAgents; once we're here the next drain would be the
         // top of the next run(), which won't come if input is idle.
         for (const event of drainSdkEvents()) {
-          output.enqueue(event)
+          output.enqueue(event as unknown as StdoutMessage)
         }
       }
       running = false

@@ -141,7 +141,6 @@ import {
   EFFORT_BETA_HEADER,
   FAST_MODE_BETA_HEADER,
   PROMPT_CACHING_SCOPE_BETA_HEADER,
-  REDACT_THINKING_BETA_HEADER,
   STRUCTURED_OUTPUTS_BETA_HEADER,
   TASK_BUDGETS_BETA_HEADER,
 } from 'src/constants/betas.js'
@@ -1713,11 +1712,11 @@ async function* queryModel(
     }
 
     // Get API context management strategies if enabled
-    const contextManagement = getAPIContextManagement({
-      hasThinking,
-      isRedactThinkingActive: betasParams.includes(REDACT_THINKING_BETA_HEADER),
-      clearAllThinking: false,
-    })
+    // [v5 定制] 只传 hasThinking。我们在 2aa0359c(回 port 官方 v2.1.101)删掉了
+    // thinking-clear latch,getAPIContextManagement 的签名随之简化为 { hasThinking }。
+    // 上游 v2.8.4 这里传的 clearAllThinking:false 与删掉 latch 的效果等价,而
+    // isRedactThinkingActive 我们的实现不消费 —— 故这两个字段不采纳。
+    const contextManagement = getAPIContextManagement({ hasThinking })
 
     const enablePromptCaching =
       options.enablePromptCaching ?? getPromptCachingEnabled(retryContext.model)

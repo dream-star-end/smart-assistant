@@ -176,10 +176,9 @@ export function toPersistableEffort(
   ) {
     return value
   }
-  if (
-    (value === 'max' || value === 'xhigh') &&
-    process.env.USER_TYPE === 'ant'
-  ) {
+  // [v5] 只有 'max' 需要 ant 门控;'xhigh' 是 v5 用户可选的正常档,已在上面的
+  // 白名单里放行(合并 v2.8.4 时这里曾把 xhigh 重复列一次 → 永假分支,tsc TS2367)。
+  if (value === 'max' && process.env.USER_TYPE === 'ant') {
     return value
   }
   return undefined

@@ -579,7 +579,10 @@ export const BashTool = buildTool({
     return result.behavior === 'allow';
   },
   toAutoClassifierInput(input) {
-    return normalizeBackgroundCommand(input.command, input.run_in_background);
+    // 该回调入参是 BashToolInput 的子集,不声明 run_in_background;显式取值
+    // 保持归一化语义,同时满足 tsc。
+    const runInBackground = (input as { run_in_background?: boolean }).run_in_background;
+    return normalizeBackgroundCommand(input.command, runInBackground);
   },
   async preparePermissionMatcher(input) {
     const { command } = normalizeBashInput(input);
@@ -633,8 +636,14 @@ export const BashTool = buildTool({
     // `new RegExp` per call. userFacingName runs per-render for every bash
     // message in history; with ~50 msgs + one slow-to-tokenize command, this
     // exceeds the shimmer tick → transition abort → infinite retry (#21605).
+    // input 在此处是 Partial<BashToolInput>(command 可选)—— 先守卫再归一化,
+    // 否则 normalizeBackgroundCommand 会拿到 undefined。
+    const sandboxInput =
+      typeof input.command === 'string'
+        ? normalizeBashInput(input as { command: string; run_in_background?: boolean })
+        : input;
     return isEnvTruthy(process.env.CLAUDE_CODE_BASH_SANDBOX_SHOW_INDICATOR) &&
-      shouldUseSandbox(normalizeBashInput(input))
+      shouldUseSandbox(sandboxInput)
       ? 'SandboxedBash'
       : 'Bash';
   },
