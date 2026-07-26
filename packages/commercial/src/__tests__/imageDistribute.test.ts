@@ -114,18 +114,59 @@ describe("streamImageToHost", () => {
     );
   });
 
-  test("singleflight:同 hostId+image 并发只入 map 一次,resolve 后清空", async () => {
-    // 不真发起 SSH:让 KMS 缺失路径在 distribute 测里走;这里直接用 Promise 占
-    // 一个 inflight slot 来观察 _resetSingleflightForTest 行为。
-    // 单元测 singleflight 的核心:并发两次 streamImageToHost,要同步看到第二次
-    // coalesce(命中 inflight)。我们用 invalid image="" 触发 sync throw,
-    // 但 sync throw 不进 inflight。改用 decrypt 失败间接验证(在下面的 distribute
-    // 用例中 hosts=2 同 hostId 实际也会触发 singleflight,但 _distributeOne 自己
-    // 调一次)—— 因此此处仅断言 reset 行为正确,完整 coalesce 在 integ 里覆。
-    _resetSingleflightForTest();
-    // reset 是 idempotent
-    _resetSingleflightForTest();
-    assert.ok(true);
+  test("singleflight:同 hostId+image 并发合流成同一次传输,不同 hostId 各走各的", async () => {
+    // 为什么这条重要:image 分发是"开会话 → 新 host 起容器"的前置。合流失效
+    // = 同一 host 同一 image 被并发 `docker save | ssh docker load` 多次,几 GB
+    // 流量翻倍 + 远端 load 互相打架。此前本用例只调两次 reset 然后 assert.ok(true)
+    // ——用例名承诺了合流覆盖,实际零覆盖(2026-07-26 补真断言)。
+    //
+    // 手法:127.0.0.1:1(必然 ECONNREFUSED,快速失败)让底层传输注定失败;
+    // 合流与否与成败无关 —— 合流的判据是"第二次拿到的是同一个 promise",
+    // 表现为两次 await 抛出**同一个 error 实例**;不合流则是两个独立实例。
+    const target = {
+      host: "127.0.0.1",
+      port: 1,
+      username: "root",
+      password: Buffer.from("nope"),
+      knownHostsContent: null,
+    };
+    const coalesced: Array<{ key?: string }> = [];
+    const spyLogger = {
+      info: (_msg: string, meta?: { key?: string }) => {
+        if (/coalesced into in-flight/.test(_msg)) coalesced.push(meta ?? {});
+      },
+      warn: () => {},
+      error: () => {},
+      debug: () => {},
+    } as unknown as Parameters<typeof streamImageToHost>[2] extends infer T
+      ? (T extends { logger?: infer L } ? L : never)
+      : never;
+
+    // 注意:streamImageToHost 在第一个 await 之前就 `_inflight.set`,所以这里
+    // **不 await** 地连发两次,第二次必然同步命中 inflight。
+    const p1 = streamImageToHost(target, "img:tag", { hostId: "host-A", logger: spyLogger });
+    const p2 = streamImageToHost(target, "img:tag", { hostId: "host-A", logger: spyLogger });
+    // 同 image 但不同 hostId → 必须**不**合流(key 含 hostId)
+    const p3 = streamImageToHost(target, "img:tag", { hostId: "host-B", logger: spyLogger });
+
+    const e1 = await p1.then(() => null, (e: Error) => e);
+    const e2 = await p2.then(() => null, (e: Error) => e);
+    const e3 = await p3.then(() => null, (e: Error) => e);
+
+    assert.ok(e1 instanceof ImageDistributeError, `p1 应失败于传输层,实际 ${e1}`);
+    assert.strictEqual(e2, e1, "同 hostId+image 的第二次调用必须合流到同一个 in-flight promise");
+    assert.notStrictEqual(e3, e1, "不同 hostId 必须各自独立传输,不得被错误合流");
+    assert.equal(coalesced.length, 1, "只应有一次 coalesce 日志(host-A 的第二次)");
+    assert.equal(coalesced[0]?.key, "host-A::img:tag", "coalesce key = hostId::image");
+
+    // resolve/reject 后 map 必须被清空:同 key 再来一次要能真的重新发起
+    // (拿到一个**新**的 error 实例,而不是被已 settle 的旧 promise 粘住)。
+    const e4 = await streamImageToHost(target, "img:tag", {
+      hostId: "host-A",
+      logger: spyLogger,
+    }).then(() => null, (e: Error) => e);
+    assert.notStrictEqual(e4, e1, "settle 后 inflight 必须清空,后续调用重新发起");
+    assert.equal(coalesced.length, 1, "第四次是全新一轮,不应再产生 coalesce 日志");
   });
 });
 
