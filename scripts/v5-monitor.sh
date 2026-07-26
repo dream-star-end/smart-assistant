@@ -570,63 +570,6 @@ check_mem_oversubscribe() {
   fi
 }
 
-check_probe_result() { # <check_name> <probe_name> <默认 interval 秒>
-  # 合成旅程/表面探针的结果消费口(2026-07-26 批7)。门禁只覆盖上线那一秒,探针决定
-  # "门没拦住的回归多久被发现";而探针自己停摆是最隐蔽的失效,所以三条判据缺一不可:
-  #   ① 结果文件不存在 = 探针**未安装**(本仓只交付脚本/单元文件,安装是独立生产动作)
-  #      → ok,detail 里明说未安装。安装器会同步跑一轮首跑,此后文件必然存在。
-  #   ② at 太旧(> interval × PROBE_STALE_FACTOR)→ bad:timer 被停/脚本崩在写结果前时,
-  #      文件会永远停在最后一次的绿 —— 只看 outcome 就等于把停摆读成健康。
-  #   ③ outcome=skipped(部署窗口避让)本身不是故障,但 last_verdict_at 太旧 → bad:
-  #      "一直在跳过" = 零次真实判据,与"一直是绿的"必须区分,否则又造出一个永不点亮的门。
-  local name="$1" probe="$2" default_interval="$3"
-  local file json outcome detail at last_at interval age vage
-  if [ ! -d "$PROBE_DIR" ]; then
-    record "$name" ok "${probe} 探针未安装($PROBE_DIR 不存在;安装见 docs/V5_MONITORING.md)"; return
-  fi
-  file="$PROBE_DIR/${probe}.json"
-  if [ ! -r "$file" ]; then
-    record "$name" ok "${probe} 探针未安装(无结果文件 ${file})"; return
-  fi
-  if ! json="$(jq -e . "$file" 2>&1)"; then
-    record "$name" bad "${probe} 探针结果文件不是合法 JSON:$(printf '%s' "$json" | tr '\n' ' ' | head -c 120)"; return
-  fi
-  outcome="$(printf '%s' "$json" | jq -r '.outcome // ""')"
-  detail="$(printf '%s' "$json" | jq -r '.detail // ""' | tr '\n' ' ' | cut -c1-400)"
-  at="$(printf '%s' "$json" | jq -r '.at // 0')"
-  last_at="$(printf '%s' "$json" | jq -r '.last_verdict_at // 0')"
-  interval="$(printf '%s' "$json" | jq -r '.interval_secs // 0')"
-  [[ "$at" =~ ^[0-9]+$ ]] || at=0
-  [[ "$last_at" =~ ^[0-9]+$ ]] || last_at=0
-  [[ "$interval" =~ ^[0-9]+$ ]] || interval=0
-  # interval 取自结果文件(探针最清楚自己的 timer 周期),但**必须夹紧** —— 否则一个写了
-  # interval=99999999 的坏探针就能把自己的陈旧门永久关掉(自证清白式失效)。
-  [ "$interval" -lt 60 ] && interval="$default_interval"
-  [ "$interval" -gt 7200 ] && interval=7200
-  if [ "$at" -le 0 ]; then
-    record "$name" bad "${probe} 探针结果缺 at 时间戳,无法判定新鲜度"; return
-  fi
-  age=$(( NOW - at ))
-  if [ "$age" -gt $(( interval * PROBE_STALE_FACTOR )) ]; then
-    record "$name" bad "${probe} 探针结果已陈旧 ${age}s(周期 ${interval}s × ${PROBE_STALE_FACTOR} 为上限)—— 探针已停摆,这段时间没有任何合成覆盖;查 systemctl list-timers 'openclaude-v5-probe@*'"; return
-  fi
-  case "$outcome" in
-    fail)
-      record "$name" bad "${probe} 探针失败(${age}s 前):${detail}" ;;
-    skipped)
-      vage=$(( NOW - last_at ))
-      if [ "$last_at" -le 0 ] || [ "$vage" -gt $(( interval * PROBE_VERDICT_FACTOR )) ]; then
-        record "$name" bad "${probe} 探针连续跳过,已 ${vage}s 没有过真实判据(上限 ${interval}s × ${PROBE_VERDICT_FACTOR})—— 避让条件卡住了,等于零覆盖:${detail}"
-      else
-        record "$name" ok "${probe} 探针本轮跳过(${detail});最近真实判据 ${vage}s 前"
-      fi ;;
-    ok)
-      record "$name" ok "${probe} 探针通过(${age}s 前):${detail}" ;;
-    *)
-      record "$name" bad "${probe} 探针 outcome 非法('${outcome}';合法值 ok|fail|skipped)" ;;
-  esac
-}
-
 slot_unit() { case "$1" in A) echo openclaude-v5 ;; B) echo openclaude-v5-b ;; *) return 1 ;; esac; }
 slot_health_url() { case "$1" in A) echo "$V5_HEALTH_URL" ;; B) echo "$V5_B_HEALTH_URL" ;; *) return 1 ;; esac; }
 
@@ -709,17 +652,11 @@ check_severity() {
     # backup_fresh = critical:kl-hk 异地容灾 2026-07-26 退役后,本地每日备份是唯一数据
     # 保护面,它停摆 = 数据零保护(且和 mail 一样属于"静默数天才被发现"的历史故障形态)。
     # http_v3 已随 v3 通道彻底下线(2026-07-08)从名单摘除,不再占 critical 位。
-    # probe_turn = critical:合成真 turn 挂 = 聊天主链路挂(被动的 turn_failures 要真实用户
-    # 先失败 ≥8 次,而线上 24h 活跃只有 6 人、夜间常 0-1 人 → 100% 必挂的回归可能整夜不报)。
-    # probe_spa = critical:index.html 引用的 bundle 取不到 = 用户白屏,等于全站不可用。
-    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|public_route|pool|image|mail|turn_failures|backup_fresh|probe_turn|probe_spa) echo critical ;;
+    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|public_route|pool|image|mail|turn_failures|backup_fresh) echo critical ;;
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化;
     # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警;
     # 门禁豁免债务 = 已上线版本有未验证面 + 下次发布被阻断,不是全站故障但必须常驻可见。均按 warning。
-    # probe_e2e = UI 旅程回归(存在文案/选择器漂移的假阳性面,同部署门第一期裁定);
-    # probe_version = 线上代码与权威记录漂移(下一次发布/回滚会踩空,当下未必用户可见);
-    # probe_channels = 告警通道自身退化(自指故障域:它坏了,别的告警都发不出去)。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers|ci_base_red|probe_e2e|probe_version|probe_channels) echo warning ;;
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers|ci_base_red) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -778,12 +715,6 @@ check_ci_base_red
 check_failed_units
 check_backup_fresh
 check_mem_oversubscribe
-# 合成旅程/表面探针的结果消费(探针本体见 scripts/v5-probe-run.sh;告警走本脚本管道)。
-check_probe_result probe_turn     turn     "$PROBE_TURN_INTERVAL"
-check_probe_result probe_e2e      e2e      "$PROBE_E2E_INTERVAL"
-check_probe_result probe_spa      spa      "$PROBE_SURFACE_INTERVAL"
-check_probe_result probe_version  version  "$PROBE_SURFACE_INTERVAL"
-check_probe_result probe_channels channels "$PROBE_SURFACE_INTERVAL"
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)
