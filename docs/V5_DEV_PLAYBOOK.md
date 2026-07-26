@@ -138,7 +138,17 @@ find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort 
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
 
 ### 2.5 合并与收尾
-- 实现完 → Codex 审计到 PASS → 合并经 canonical(`git merge --no-ff`,中文合并信息说明"批次内容+验证结果")。
+- 实现完 → Codex 审计到 PASS → 在**受保护 PR 合并前**先提交全局发布队列：
+  `RQ=$(scripts/v5-release-queue.sh submit --task <slug> --branch <task-branch> --sha "$(git rev-parse HEAD)" --actor <owner>)`。
+  `submit` 对同一 branch+SHA 幂等；随后执行
+  `scripts/v5-release-queue.sh wait --id "$RQ" --owner <owner>`。只有取得唯一 `active`
+  的任务才可合并 PR，后续任务保持未合并，不能让 canonical tip 越过正在 canary/finalize 的批次。
+- 受保护 PR/CI 合并完成后，把 canonical 快进到精确远端 merge SHA，再执行
+  `scripts/v5-release-queue.sh pin --id "$RQ" --sha "$(git rev-parse HEAD)" --actor <owner>`。
+  `pin` 会验证任务 SHA 是 merge SHA 祖先且 canonical HEAD 精确一致；发布全程
+  `export OC_V5_RELEASE_QUEUE_ID="$RQ"`。成功 finalize 后才
+  `finish --result deployed`；官方 abort/rollback 收敛旧稳定版后用
+  `finish --result not-deployed`。队列项跨进程、跨会话持久化，不靠某个 shell 一直存活。
 - 合并后**只保留 canonical + 未合并分支**:`git branch --merged feat/v5-aurora-rewrite` 逐个删本地+远端分支、`git worktree remove`、`git worktree prune`。注意在 v3 checkout 里 `git branch -d` 按 v3 判断"未合并",要用 `git merge-base --is-ancestor <br> feat/v5-aurora-rewrite && git branch -D <br>` 守卫式强删。
 - push:`git push origin feat/v5-aurora-rewrite`。
 
@@ -270,9 +280,14 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 
 ### 4.2 标准部署
 
-> **部署互斥(硬机制,2026-07-10)**:deploy-v5.sh 所有写模式过
-> `/var/lock/oc-v5-deploy.lock` 全局串行(持有者在 `.holder`,等待 900s 超时 fail-loud);
-> 多会话同时部署自动排队,禁止再人工协调。
+> **全局发布队列(硬机制)**:`scripts/v5-release-queue.sh` 是“任务级”持久 FIFO，
+> 从受保护 PR 合并前一直占到 canary/验证/finalize 收敛；`deploy-v5.sh` 的
+> `/var/lock/oc-v5-deploy.lock` 只是“单命令级”互斥，不能替代发布队列。
+> 所有开发写 mode 默认要求 `OC_V5_RELEASE_QUEUE_ID` 指向唯一 active、已 pin 且等于
+> canonical HEAD 的队列项；新增 mode 默认也受门控。仅只读 smoke/census/模型观察、
+> 官方 abort/rollback/recover/reclaim/hide-luna 与 emergency 授权/关账显式豁免。
+> 自愈继承 deploy lock 的旁路必须同时由 selfheal ledger 的 deploying rrid、exact
+> approved SHA 和当前 systemd scope 证明，不能伪造布尔环境变量。
 > **代码+前端一起上 → 用 `--with-dist`**(单次重启双生效面);`deploy` 后紧跟 `--dist`
 > 的两段式成对重启会把"刚被第一次重启打断、自动续写刚跑起来"的 turn 第二次掐死
 > (2026-07-10 事故放大器),除非只改了单一生效面,否则不要拆开跑。
@@ -292,6 +307,8 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 ```bash
 cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件会被 rsync 上去)
 git status --porcelain                       # 必须为空
+scripts/v5-release-queue.sh status           # 确认本任务是唯一 active
+export OC_V5_RELEASE_QUEUE_ID="$RQ"           # §2.5 submit/acquire/pin 得到的持久 ID
 bash scripts/deploy-v5.sh [--egress]         # 快照(.prev.1..5 可 --rollback)+rsync+restart+smoke
 # 前端(涉及 web-react):走 --dist,勿再手敲 rsync --delete(会造成部署窗口 404 白屏)。
 #   竞态安全=资产加法先行 + 根文件后替换(新 index.html 永远只引用已就位资产);
@@ -563,7 +580,9 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 
 ### 4.6 发版节奏(2026-07-06 起,P1.5 制度化)
 全量现网后告别"随改随发"。规则(可按运营数据调整):
-- **常规批次攒窗口发**:非紧急改动合并 canonical 后不立即部署,攒到当日发版窗口(默认每日 1-2 个,北京时间午后/晚间)一次上线;一窗一条面向用户 changelog(改动可感知时)。
+- **常规批次攒窗口发**:非紧急任务先在 task branch 完成审查/CI，进入全局发布 FIFO；
+  只有队首 active 任务在窗口内合并 canonical 并完成上线，后续 PR 保持未合并。默认每日
+  1-2 个北京时间午后/晚间窗口；一窗一条面向用户 changelog(改动可感知时)。
 - **hotfix 例外**:现网事故/计费错账/安全面可即时发,但仍必须走 deploy-v5.sh+smoke,并在下一窗口补 changelog。
 - **dx 显式 P0 两阶段止血**:仅当 dx 明确确认当前存在真实用户/资金/安全持续损失,并明确要求
   “最小止血先上线、审查和用例事后补”时可启用;agent 不得自行推断。Phase 1 只允许已证实根因的
@@ -583,7 +602,12 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
   `deploy_state.active_slot` 推导 active unit/port,禁止固定 A/B 端口。
 - **P0 stop-the-line**:已定性且未关闭的 P0 存续期间,同一故障域/子系统禁止再合入或上线功能批;只允许诊断、修复与验证该 P0 的改动。例外必须由 boss 明确批准,不能靠临时放宽 branch protection 绕过。
 - **发版门**:check:v5 全绿(typecheck+gateway+mcp-memory+storage+web-react+commercial 基线集 diff)+生效面矩阵分类;镜像面改动放量前 canary(agent uid)。
-- **单日多批合并**:允许(canonical 持续集成),但部署窗口是节流阀;并行会话共用窗口,部署前必 fetch 核对 tip 与镜像 tag,避免互覆(07-06 教训:egress 面被并行部署漏掉)。
+- **单日多批发布**:允许，但严格按 `release_queue_jobs.seq` 串行。前一项未
+  `completed/abandoned` 前，后一项不得合并 canonical。`active` 不做超时自动接管；
+  会话丢失时先 `status`，确需释放必须用 `abandon-active --operator --reason
+  --result=deployed|not-deployed`，该命令同时持本地 deploy flock 与官方远端
+  production-mutation lease，并确认 markers absent、deploy_state stable/candidate empty
+  后才原子记审计并释放。任一证明失败都保持 active，禁止手改 SQLite。
 
 ### 4.6b 上线后核验清单
 - [ ] `/version` = 预期 commit;smoke 通过(含 OC_EGRESS_SPLIT=1 时 egress 无条件断言)

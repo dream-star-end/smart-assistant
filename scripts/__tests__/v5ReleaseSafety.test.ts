@@ -26,6 +26,7 @@ const baselineService = path.join(root, 'deploy/v5/openclaude-v5-baseline-evals.
 const manualMutationLease = path.join(root, 'scripts/with-production-mutation-lease.sh')
 const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
+const releaseQueue = path.join(root, 'scripts/v5-release-queue.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
 const monitorHostInstaller = path.join(root, 'scripts/v5-monitor-host-install-remote.sh')
 const monitorService = path.join(root, 'deploy/v5/openclaude-v5-monitor.service')
@@ -47,6 +48,475 @@ const dirs: string[] = []
 
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+})
+
+describe('V5 durable development release queue', () => {
+  async function queueFixture() {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-queue-'))
+    dirs.push(dir)
+    const repo = path.join(dir, 'repo')
+    await mkdir(repo)
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      return result.stdout.trim()
+    }
+    git('init', '--initial-branch=canon')
+    git('config', 'user.name', 'Queue Test')
+    git('config', 'user.email', 'queue@example.test')
+    await writeFile(path.join(repo, 'value.txt'), 'base\n')
+    git('add', '.')
+    git('commit', '-m', 'base')
+    const base = git('rev-parse', 'HEAD')
+    await writeFile(path.join(repo, 'value.txt'), 'candidate\n')
+    git('commit', '-am', 'candidate')
+    const candidate = git('rev-parse', 'HEAD')
+    const env = {
+      OC_V5_RELEASE_QUEUE_DB: path.join(dir, 'queue.db'),
+      OC_V5_RELEASE_QUEUE_LOCK: path.join(dir, 'queue.lock'),
+      OC_V5_DEPLOY_LOCK_FILE: path.join(dir, 'deploy.lock'),
+      OC_V5_RELEASE_QUEUE_REPO_ROOT: repo,
+    }
+    const invoke = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) =>
+      run(releaseQueue, args, { ...env, ...extraEnv })
+    return { dir, repo, base, candidate, env, invoke, git }
+  }
+
+  function outputId(result: ReturnType<typeof run>): string {
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const id = result.stdout.trim()
+    assert.match(id, /^rq-\d{8}T\d{6}Z-[0-9a-f]{12}$/)
+    return id
+  }
+
+  test('SQLite queue is durable, idempotent FIFO with one active job and exact canonical pin', async () => {
+    const fixture = await queueFixture()
+    const first = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'first',
+        '--branch',
+        'feat/first',
+        '--sha',
+        fixture.base,
+        '--actor',
+        'test',
+      ]),
+    )
+    const duplicate = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'first',
+        '--branch',
+        'feat/first',
+        '--sha',
+        fixture.base,
+        '--actor',
+        'test',
+      ]),
+    )
+    assert.equal(duplicate, first)
+    const second = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'second',
+        '--branch',
+        'feat/second',
+        '--sha',
+        fixture.base,
+        '--actor',
+        'test',
+      ]),
+    )
+    const cancelled = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'cancelled',
+        '--branch',
+        'feat/cancelled',
+        '--sha',
+        fixture.base,
+        '--actor',
+        'test',
+      ]),
+    )
+    assert.equal(
+      fixture.invoke(['cancel', '--id', cancelled, '--reason', 'superseded', '--actor', 'test'])
+        .status,
+      0,
+    )
+
+    assert.equal(fixture.invoke(['acquire', '--id', first, '--owner', 'test']).status, 0)
+    assert.equal(
+      fixture.invoke(['acquire', '--id', second, '--owner', 'test']).status,
+      75,
+      'a later task must not take over an active job',
+    )
+    assert.equal(
+      fixture.invoke(['pin', '--id', first, '--sha', fixture.base, '--actor', 'test']).status,
+      2,
+      'pin must reject a canonical SHA that is not current HEAD',
+    )
+    const pin = fixture.invoke([
+      'pin',
+      '--id',
+      first,
+      '--sha',
+      fixture.candidate,
+      '--actor',
+      'test',
+    ])
+    assert.equal(pin.status, 0, pin.stderr || pin.stdout)
+    assert.equal(
+      fixture.invoke(['assert', '--id', first]).status,
+      0,
+      'a fresh process must observe the durable active+pin state',
+    )
+
+    await writeFile(path.join(fixture.repo, 'value.txt'), 'drift\n')
+    fixture.git('commit', '-am', 'drift')
+    assert.equal(
+      fixture.invoke(['assert', '--id', first]).status,
+      2,
+      'deploy authorization must fail closed when canonical HEAD drifts',
+    )
+    fixture.git('reset', '--hard', fixture.candidate)
+    assert.equal(
+      fixture.invoke([
+        'finish',
+        '--id',
+        first,
+        '--result',
+        'deployed',
+        '--reason',
+        'validated',
+        '--actor',
+        'test',
+      ]).status,
+      0,
+    )
+    assert.equal(
+      fixture.invoke(['wait', '--id', second, '--owner', 'test', '--timeout', '2']).status,
+      0,
+    )
+
+    const status = fixture.invoke(['status', '--json'])
+    assert.equal(status.status, 0, status.stderr || status.stdout)
+    const jobs = JSON.parse(status.stdout) as Array<{ id: string; status: string }>
+    assert.equal(jobs.find((job) => job.id === first)?.status, 'completed')
+    assert.equal(jobs.find((job) => job.id === second)?.status, 'active')
+    assert.equal(jobs.find((job) => job.id === cancelled)?.status, 'cancelled')
+  })
+
+  test('abandon-active holds local deploy lock and official lease through the audited transition', async () => {
+    const fixture = await queueFixture()
+    const id = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'lost-owner',
+        '--branch',
+        'feat/lost-owner',
+        '--sha',
+        fixture.candidate,
+        '--actor',
+        'test',
+      ]),
+    )
+    assert.equal(fixture.invoke(['acquire', '--id', id, '--owner', 'lost']).status, 0)
+
+    const held = path.join(fixture.dir, 'remote-lease-held')
+    const hookProof = path.join(fixture.dir, 'hook-saw-lease')
+    const wrapper = path.join(fixture.dir, 'lease-wrapper.sh')
+    const bin = path.join(fixture.dir, 'bin')
+    await mkdir(bin)
+    await writeFile(
+      wrapper,
+      [
+        '#!/usr/bin/env bash',
+        'set -e',
+        `: >${JSON.stringify(held)}`,
+        `OC_V5_MANUAL_LEASE_NONCE=${'a'.repeat(32)} \\`,
+        'OC_V5_MANUAL_LEASE_PROOF=/run/openclaude-v5/production-mutation.lock.manual-holder \\',
+        '"$@"',
+        'rc=$?',
+        `status="$(sqlite3 -noheader "$OC_V5_RELEASE_QUEUE_DB" "SELECT status FROM release_queue_jobs WHERE id='$ABANDON_ID';")"`,
+        `if [ "$status" = abandoned ] && [ -e ${JSON.stringify(held)} ]; then : >${JSON.stringify(
+          hookProof,
+        )}; fi`,
+        `rm -f ${JSON.stringify(held)}`,
+        'exit "$rc"',
+        '',
+      ].join('\n'),
+    )
+    await writeFile(
+      path.join(bin, 'ssh'),
+      `#!/usr/bin/env bash\ncat >/dev/null\ntest -e ${JSON.stringify(held)}\n`,
+    )
+    await Promise.all([chmod(wrapper, 0o755), chmod(path.join(bin, 'ssh'), 0o755)])
+    const abandoned = fixture.invoke(
+      [
+        'abandon-active',
+        '--id',
+        id,
+        '--result',
+        'not-deployed',
+        '--reason',
+        'owner-lost-before-merge',
+        '--operator',
+        'operator',
+      ],
+      {
+        OC_V5_RELEASE_QUEUE_LEASE_WRAPPER: wrapper,
+        ABANDON_ID: id,
+        KL_HOST: 'fake',
+        PATH: `${bin}:${process.env.PATH}`,
+      },
+    )
+    assert.equal(abandoned.status, 0, abandoned.stderr || abandoned.stdout)
+    assert.equal((await readFile(hookProof, 'utf8')).length, 0)
+    const jobs = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      status: string
+    }>
+    assert.equal(jobs.find((job) => job.id === id)?.status, 'abandoned')
+  })
+
+  test('abandon-active never releases an active job when stable-state proof fails', async () => {
+    const fixture = await queueFixture()
+    const id = outputId(
+      fixture.invoke([
+        'submit',
+        '--task',
+        'unsafe',
+        '--branch',
+        'feat/unsafe',
+        '--sha',
+        fixture.candidate,
+        '--actor',
+        'test',
+      ]),
+    )
+    assert.equal(fixture.invoke(['acquire', '--id', id, '--owner', 'lost']).status, 0)
+    const wrapper = path.join(fixture.dir, 'lease-wrapper.sh')
+    const bin = path.join(fixture.dir, 'bin')
+    await mkdir(bin)
+    await writeFile(
+      wrapper,
+      `#!/usr/bin/env bash\nOC_V5_MANUAL_LEASE_NONCE=${'b'.repeat(
+        32,
+      )} OC_V5_MANUAL_LEASE_PROOF=/run/openclaude-v5/production-mutation.lock.manual-holder exec "$@"\n`,
+    )
+    await writeFile(path.join(bin, 'ssh'), '#!/usr/bin/env bash\ncat >/dev/null\nexit 1\n')
+    await Promise.all([chmod(wrapper, 0o755), chmod(path.join(bin, 'ssh'), 0o755)])
+    const result = fixture.invoke(
+      [
+        'abandon-active',
+        '--id',
+        id,
+        '--result',
+        'not-deployed',
+        '--reason',
+        'unproven',
+        '--operator',
+        'operator',
+      ],
+      {
+        OC_V5_RELEASE_QUEUE_LEASE_WRAPPER: wrapper,
+        KL_HOST: 'fake',
+        PATH: `${bin}:${process.env.PATH}`,
+      },
+    )
+    assert.notEqual(result.status, 0)
+    const jobs = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      status: string
+    }>
+    assert.equal(jobs.find((job) => job.id === id)?.status, 'active')
+
+    const skip = fixture.invoke(
+      [
+        'abandon-active',
+        '--id',
+        id,
+        '--result',
+        'not-deployed',
+        '--reason',
+        'skip-forbidden',
+        '--operator',
+        'operator',
+      ],
+      { OC_V5_RELEASE_QUEUE_LEASE_WRAPPER: wrapper, OC_V5_SKIP_MUTATION_LEASE: '1' },
+    )
+    assert.equal(skip.status, 2)
+    const afterSkip = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      status: string
+    }>
+    assert.equal(afterSkip.find((job) => job.id === id)?.status, 'active')
+
+    const arbitraryLock = path.join(fixture.dir, 'arbitrary.lock')
+    const forged = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'exec 55>"$1"',
+          'flock 55',
+          'OC_V5_RELEASE_QUEUE_INTERNAL=1',
+          'OC_V5_RELEASE_QUEUE_DEPLOY_LOCK_FD=55',
+          'OC_V5_MANUAL_LEASE_NONCE=cccccccccccccccccccccccccccccccc',
+          'OC_V5_MANUAL_LEASE_PROOF=/run/openclaude-v5/production-mutation.lock.manual-holder',
+          '"$2" __abandon-internal "$3" not-deployed forged operator',
+        ].join('; '),
+        'forged',
+        arbitraryLock,
+        releaseQueue,
+        id,
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ...fixture.env,
+        },
+      },
+    )
+    assert.notEqual(forged.status, 0, 'an arbitrary flock fd must not authorize internal abandon')
+    const afterForged = JSON.parse(fixture.invoke(['status', '--json']).stdout) as Array<{
+      id: string
+      status: string
+    }>
+    assert.equal(afterForged.find((job) => job.id === id)?.status, 'active')
+  })
+
+  test('deploy mode classification is default-closed and queue gate precedes every production side effect', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const exempt = [
+      'smoke',
+      'baseline-census',
+      'model-authority-preflight',
+      'model-authority-observation-status',
+      'abort',
+      'rollback',
+      'recover',
+      'reclaim-mutation-lease',
+      'hide-luna',
+      'authorize-emergency',
+      'close-emergency-debt',
+    ]
+    const required = [
+      'bootstrap',
+      'migrate-bluegreen',
+      'knowledge-planet-verify',
+      'baseline-remount',
+      'install-monitor',
+      'deploy',
+      'dist',
+      'enable-model-authority',
+      'disable-model-authority',
+      'enable-seed-authority-by-rev',
+      'record-model-authority-emergency-drill',
+      'model-authority-cutover',
+      'enable-runtime-tape-batching',
+      'emergency-tuple',
+      'activate-emergency-tuple',
+      'prepare-offline-cutover',
+      'offline-recycle',
+      'stage',
+      'activate-staged',
+      'canary',
+      'promote',
+      'finalize',
+      'publish-luna',
+      'future-write-mode',
+    ]
+    const classify = (mode: string) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          'set +e; deploy_path="$1"; selected_mode="$2"; set --; V5_DEPLOY_SOURCE_ONLY=1 source "$deploy_path"; release_queue_required_for_mode "$selected_mode"; exit $?',
+          'classify',
+          deploy,
+          mode,
+        ],
+        { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+      )
+    for (const mode of exempt) {
+      assert.equal(classify(mode).status, 1, `${mode} should be queue-exempt`)
+    }
+    for (const mode of required) {
+      assert.equal(classify(mode).status, 0, `${mode} should require the queue`)
+    }
+
+    const gate = source.indexOf('assert_development_release_queue || exit 3')
+    const lock = source.indexOf('DEPLOY_HOLDER_OWNED=1', source.indexOf('OC_V5_DEPLOY_LOCK_FD'))
+    const migrationGate = source.indexOf('assert_repo_required_migrations || exit 1')
+    const productionLease = source.indexOf('acquire_production_mutation_lease || exit 3')
+    assert.ok(lock >= 0 && gate > lock, 'release queue gate must run after the real local deploy lock')
+    assert.ok(gate < migrationGate, 'release queue gate must run before migration probes')
+    assert.ok(gate < productionLease, 'release queue gate must run before the remote mutation lease')
+  })
+
+  test('selfheal inherited-lock bypass requires exact durable rrid, approved HEAD and cgroup scope', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-selfheal-queue-identity-'))
+    dirs.push(dir)
+    const db = path.join(dir, 'selfheal.db')
+    const cgroup = path.join(dir, 'cgroup')
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const create = spawnSync(
+      'sqlite3',
+      [
+        db,
+        `CREATE TABLE selfheal_release_jobs(
+          release_request_id TEXT PRIMARY KEY,status TEXT,approved_sha TEXT,scope_unit TEXT);
+         INSERT INTO selfheal_release_jobs VALUES('rrid-ok','deploying','${head}','scope-ok');`,
+      ],
+      { encoding: 'utf8' },
+    )
+    assert.equal(create.status, 0, create.stderr)
+    await writeFile(cgroup, '0::/system.slice/scope-ok.scope\n')
+    const check = (rrid: string, dbPath = db, cgroupPath = cgroup) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set +e',
+            'deploy_path="$1"',
+            'rrid="$2"',
+            'db_path="$3"',
+            'cgroup_path="$4"',
+            'set --',
+            'V5_DEPLOY_SOURCE_ONLY=1 source "$deploy_path"',
+            'OC_V5_SELFHEAL_RELEASE_REQUEST_ID="$rrid"',
+            'OC_V5_SELFHEAL_DB="$db_path"',
+            'OC_V5_SELFHEAL_CGROUP_FILE="$cgroup_path"',
+            'assert_selfheal_release_identity',
+          ].join('; '),
+          'identity',
+          deploy,
+          rrid,
+          dbPath,
+          cgroupPath,
+        ],
+        { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+      )
+    assert.equal(check('').status, 1, 'missing rrid must fail')
+    assert.equal(check('rrid-ok', path.join(dir, 'missing.db')).status, 1, 'missing ledger must fail')
+    await writeFile(cgroup, '0::/system.slice/wrong.scope\n')
+    assert.equal(check('rrid-ok').status, 1, 'wrong cgroup scope must fail')
+    await writeFile(cgroup, '0::/system.slice/scope-ok.scope\n')
+    const valid = check('rrid-ok')
+    assert.equal(valid.status, 0, valid.stderr || valid.stdout)
+    assert.match(valid.stdout, /ledger\+canonical SHA\+cgroup scope/)
+  })
 })
 
 function run(script: string, args: string[], env: NodeJS.ProcessEnv = {}) {
@@ -4466,11 +4936,11 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const end = source.indexOf('\n\n  # Keepalive bounds', start)
     assert.ok(start >= 0 && end > start, '未找到 manual production-mutation remote holder')
     const holder = source.slice(start, end)
-    const signalTrap = holder.indexOf("trap 'exit 0' HUP INT TERM")
+    const signalTrap = holder.indexOf("trap 'cleanup_proof; exit 0' HUP INT TERM")
     const parentCapture = holder.indexOf('lease_parent=\\"\\$PPID\\"')
     const flock = holder.indexOf('flock -w 60 9')
     const firstKernelParent = holder.indexOf('/proc/\\$\\$/status')
-    const leased = holder.indexOf('echo LEASED')
+    const leased = holder.indexOf('echo \\"LEASED \\$nonce\\"')
     const loop = holder.indexOf('while :; do', leased)
     assert.ok(signalTrap >= 0 && signalTrap < parentCapture, 'manual holder 须在等待 flock 前安装退出 trap')
     assert.ok(parentCapture > signalTrap && parentCapture < flock, '必须在可能阻塞的 flock 前快照 sshd parent')
@@ -4478,6 +4948,8 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.ok(holder.indexOf('[ \\"\\$current_parent\\" = \\"\\$lease_parent\\" ]', firstKernelParent) < leased,
       'LEASED 前未校验取锁后的 PPid 仍是原 sshd parent')
     assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', firstKernelParent) < leased, 'LEASED 前未校验 parent 活性')
+    assert.ok(holder.indexOf('mv -f \\"\\$proof_tmp\\" \\"\\$proof\\"') < leased,
+      'LEASED 前须原子发布 exact nonce proof')
     assert.ok(loop > leased, 'manual holder 缺 parent-watch 循环')
     assert.ok(holder.indexOf('/proc/\\$\\$/status', loop) > loop, '循环未重读实时 PPid')
     assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', loop) > loop, '循环未复核 parent 活性')
@@ -4508,6 +4980,11 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         'wrapped command never started after LEASED',
       )
       assert.notEqual(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'manual holder never held flock')
+      assert.match(
+        await readFile(`${fx.lock}.manual-holder`, 'utf8'),
+        /^[0-9a-f]{32}\n$/,
+        'manual holder must publish an exact nonce proof only after acquiring flock',
+      )
       await writeFile(fx.commandRelease, '')
       assert.equal(await waitForChildExit(child, 5_000), true, 'manual wrapper did not exit after command')
       assert.equal(
@@ -4515,6 +4992,7 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         true,
         'normal cleanup left an orphaned manual holder',
       )
+      await assert.rejects(readFile(`${fx.lock}.manual-holder`, 'utf8'), { code: 'ENOENT' })
     } finally {
       child.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(fx.sshPids, fx.remotePids)
