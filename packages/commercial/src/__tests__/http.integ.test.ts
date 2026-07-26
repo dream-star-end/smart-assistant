@@ -652,10 +652,21 @@ describe("commercial HTTP router (integ)", () => {
       assert.ok(r4.headers.get("retry-after"));
       // rate_limit_events 落库:scope=verify_email_smoke_email,key=sha256 前缀
       // (绝不是明文 email)
-      const ev = await query<{ key: string }>(
+      // 429 的**拒绝**是同步的,但审计事件落库不是 —— 单次同步查询会间歇性读到 0 行
+      // (CI 实测:同一提交一次 fail 0、一次 fail 1,日志里 429 明明已出现)。
+      // 这里轮询到出现为止,而不是加固定 sleep:sleep 会把竞态窗口藏起来,并且在慢机器上
+      // 照样翻车。仍然断言"恰好 1 行"——轮询只影响什么时候读,不放宽读到的结果。
+      let ev = await query<{ key: string }>(
         "SELECT key FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
         ["verify_email_smoke_email"],
       );
+      for (let i = 0; i < 50 && ev.rows.length === 0; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        ev = await query<{ key: string }>(
+          "SELECT key FROM rate_limit_events WHERE scope = $1 AND blocked = TRUE",
+          ["verify_email_smoke_email"],
+        );
+      }
       assert.equal(ev.rows.length, 1, "exactly 1 blocked event");
       const id = ev.rows[0].key;
       assert.match(id, /^[0-9a-f]{16}$/, `key must be 16-hex sha256 prefix, got: ${id}`);
