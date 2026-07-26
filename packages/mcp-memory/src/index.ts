@@ -184,6 +184,13 @@ const TOOLS = [
       '  description — 1-2 sentence summary of when to use it (max 1024 chars)',
       '  body        — full markdown instructions: overview, prerequisites, steps, examples',
       '  tags        — optional array of topical tags',
+      '  confirmNew  — set true only to override the same-domain guard (see below)',
+      '',
+      'Prefer UPDATING an existing skill over creating a near-duplicate: pass the',
+      "existing skill's exact `name` and the new body. If the name you chose sits in",
+      'the same domain as an existing skill, the save is rejected and the similar',
+      'names are listed — inspect them with `skill_view`, then either update that',
+      'skill or re-call with confirmNew: true.',
       '',
       'The skill is stored under your agent home and will appear in `skill_list` next session.',
     ].join('\n'),
@@ -194,6 +201,11 @@ const TOOLS = [
         description: { type: 'string' },
         body: { type: 'string' },
         tags: { type: 'array', items: { type: 'string' } },
+        confirmNew: {
+          type: 'boolean',
+          description:
+            'Override the same-domain duplicate guard. Only set after checking the reported similar skills with skill_view.',
+        },
       },
       required: ['name', 'description', 'body'],
     },
@@ -612,6 +624,7 @@ async function handleSkillSave(args: {
   description: string
   body: string
   tags?: string[]
+  confirmNew?: boolean
 }) {
   const r = await skills.save(
     {
@@ -620,6 +633,7 @@ async function handleSkillSave(args: {
       tags: args.tags,
     },
     args.body,
+    { allowSimilar: args.confirmNew === true },
   )
   if (!r.ok) return toolError(r.error ?? 'save failed')
   return toolOk(`Saved skill "${args.name}".`)
