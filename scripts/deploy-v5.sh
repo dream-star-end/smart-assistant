@@ -28,7 +28,8 @@
 #   scripts/deploy-v5.sh --remount-ccb-baseline # 持部署锁，逐个 drain/reprovision 后复验
 #
 # 并发:所有写模式过 /var/lock/oc-v5-deploy.lock 全局互斥(多会话并行开发硬保证),
-#       持有者信息在 .holder;等待 900s 超时 fail-loud。
+#       持有者信息在 .holder;等待 900s 超时 fail-loud。开发发布还必须先进入
+#       scripts/v5-release-queue.sh 的持久 FIFO；一个 active 项覆盖 merge→finalize 全周期。
 #   scripts/deploy-v5.sh --prepare-offline-cutover --target-image=TAG
 #                                  # 服务在线健康时生成一次性离线切换清单/完整恢复包
 #   scripts/deploy-v5.sh --offline-recycle --cutover-nonce=NONCE
@@ -145,6 +146,11 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 [ -f "$RUNTIME_LIB" ] || { echo "FATAL: 缺 runtime release lib: $RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 source "$RUNTIME_LIB"
+RELEASE_QUEUE_SCRIPT="$SCRIPT_DIR/v5-release-queue.sh"
+[ -x "$RELEASE_QUEUE_SCRIPT" ] || {
+  echo "FATAL: 缺或不可执行的 V5 release queue: $RELEASE_QUEUE_SCRIPT" >&2
+  exit 1
+}
 # deploy_state 单一权威访问层(P3;与 v5-caddy-apply.sh 共用 CAS/read/journal/lane_hash 同源)。
 DEPLOY_STATE_LIB="$SCRIPT_DIR/v5-deploy-state-lib.sh"
 [ -f "$DEPLOY_STATE_LIB" ] || { echo "FATAL: 缺 deploy_state lib: $DEPLOY_STATE_LIB" >&2; exit 1; }
@@ -8985,6 +8991,69 @@ run_selected_mode() { # [mode]
   esac
 }
 
+# 开发发布队列是生命周期锁；本地 deploy flock 是单条命令锁。除只读、恢复/回退和
+# emergency 授权关账外，所有当前及未来写 mode 默认 fail-closed 要求 active+pinned 队列项。
+release_queue_required_for_mode() { # <mode>; 0=required, 1=exempt
+  case "$1" in
+    smoke|baseline-census|model-authority-preflight|model-authority-observation-status)
+      return 1 ;;
+    abort|rollback|recover|reclaim-mutation-lease|hide-luna)
+      return 1 ;;
+    authorize-emergency|close-emergency-debt)
+      return 1 ;;
+    *)
+      return 0 ;;
+  esac
+}
+
+assert_selfheal_release_identity() {
+  local rrid="${OC_V5_SELFHEAL_RELEASE_REQUEST_ID:-}"
+  local db="${OC_V5_SELFHEAL_DB:-/root/.openclaude/selfheal.db}"
+  local cgroup_file="${OC_V5_SELFHEAL_CGROUP_FILE:-/proc/self/cgroup}"
+  local row status approved_sha scope_unit current_head
+  [[ -n "$rrid" && "$rrid" =~ ^[A-Za-z0-9._:@+-]+$ ]] || {
+    echo "✗ 继承部署锁缺少合法 OC_V5_SELFHEAL_RELEASE_REQUEST_ID；禁止旁路开发发布队列" >&2
+    return 1
+  }
+  [[ -r "$db" ]] || {
+    echo "✗ selfheal release ledger 不可读:$db" >&2
+    return 1
+  }
+  row="$(sqlite3 -noheader "$db" \
+    "SELECT status || '|' || approved_sha || '|' || coalesce(scope_unit,'')
+       FROM selfheal_release_jobs
+      WHERE release_request_id='${rrid//\'/\'\'}'
+      LIMIT 1;" 2>/dev/null || true)"
+  IFS='|' read -r status approved_sha scope_unit <<<"$row"
+  current_head="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [[ "$status" == deploying && "$approved_sha" =~ ^[0-9a-f]{40}$ \
+      && "$approved_sha" == "$current_head" && -n "$scope_unit" ]] || {
+    echo "✗ selfheal release identity 与 deploying ledger/canonical HEAD 不一致(rrid=$rrid status=${status:-missing} approved=${approved_sha:-missing} head=${current_head:-missing} scope=${scope_unit:-missing})" >&2
+    return 1
+  }
+  [[ -r "$cgroup_file" ]] || {
+    echo "✗ 无法读取当前 selfheal scope cgroup:$cgroup_file" >&2
+    return 1
+  }
+  grep -Fq "/${scope_unit}.scope" "$cgroup_file" || {
+    echo "✗ 当前进程不属于 ledger 钉死的 selfheal scope:${scope_unit}.scope" >&2
+    return 1
+  }
+  echo "  ✓ selfheal release identity 已由 ledger+canonical SHA+cgroup scope 证明(rrid=$rrid)"
+}
+
+assert_development_release_queue() {
+  [[ "$DRY" == 1 ]] && return 0
+  release_queue_required_for_mode "$MODE" || return 0
+  if [[ -n "${OC_V5_DEPLOY_LOCK_FD:-}" ]]; then
+    # 继承 fd 只用于 selfheal release lane。上方真锁 fdinfo 验证通过后，还必须把
+    # durable rrid、approved SHA 与当前 systemd scope 三面钉死，不能用布尔 env 伪造旁路。
+    assert_selfheal_release_identity
+    return
+  fi
+  "$RELEASE_QUEUE_SCRIPT" assert --id "${OC_V5_RELEASE_QUEUE_ID:-}"
+}
+
 # ── 全局部署互斥(硬机制,2026-07-10 boss 指令:多会话并发改 v5 不靠记忆自觉)──
 # 同机所有 deploy-v5.sh 写模式实例串行:并发 rsync/restart 交错会产生半新半旧源码树
 # 与连环重启。锁文件记录持有者(pid/mode/tree/时刻)供另一会话诊断;等待 ≤900s 后
@@ -9081,6 +9150,10 @@ if [[ "$DRY" != 1 && "$MODE" != "smoke" && "$MODE" != "baseline-census" && "$MOD
     DEPLOY_HOLDER_OWNED=1
   fi
 fi
+
+# 必须在本地 deploy flock 已真实取得/复核之后、migration/marker/远端 lease/任何远端副作用之前
+# 执行。这样 normal 开发发布无法跨队，selfheal 也只能凭 durable identity 使用继承锁旁路。
+assert_development_release_queue || exit 3
 
 # bootstrap 必须先生成/保留 V5_ENV，故在 bootstrap() 的 4.5 步单独执行；其余所有写 lane
 # 在任何 release/symlink/unit/Caddy/状态机副作用前统一 fail-closed。

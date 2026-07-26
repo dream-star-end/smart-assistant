@@ -19,6 +19,7 @@ set -euo pipefail
 
 KL_HOST="${KL_HOST:-kl-mirror}"
 PRODUCTION_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"
+MANUAL_LEASE_PROOF="${PRODUCTION_MUTATION_LOCK}.manual-holder"
 MUTATION_LEASE_TTL_SECONDS="${OC_V5_MUTATION_LEASE_TTL_SECONDS:-7200}"
 [[ "$MUTATION_LEASE_TTL_SECONDS" =~ ^[1-9][0-9]*$ ]] || MUTATION_LEASE_TTL_SECONDS=7200
 (( MUTATION_LEASE_TTL_SECONDS >= 2 )) || MUTATION_LEASE_TTL_SECONDS=7200
@@ -251,10 +252,20 @@ supervisor_main() { # <outer-pid> <outer-starttime> <cmd> [args...]
   # 后台 ssh:远端 shell 自身持 flock。实时 PPid 防 SSH 断链后 orphan；硬 TTL 防本地
   # supervisor/ssh 极端同时失联时永久焊锁。TTL 到点会让本地 lease_pid 退出，随即由
   # wait-n 路径终止仍在运行的命令进程组。
-  local remote_holder
+  local remote_holder manual_lease_nonce
+  manual_lease_nonce="$(openssl rand -hex 16)"
+  [[ "$manual_lease_nonce" =~ ^[0-9a-f]{32}$ ]] \
+    || { echo "✗ 无法生成 manual lease proof nonce" >&2; return 3; }
   remote_holder="mkdir -p -m 700 '$(dirname "$PRODUCTION_MUTATION_LOCK")' 2>/dev/null || true
 exec 9>'$PRODUCTION_MUTATION_LOCK'
-trap 'exit 0' HUP INT TERM
+proof='$MANUAL_LEASE_PROOF'
+nonce='$manual_lease_nonce'
+cleanup_proof() {
+  current=\"\$(cat \"\$proof\" 2>/dev/null || true)\"
+  [ \"\$current\" != \"\$nonce\" ] || rm -f -- \"\$proof\"
+}
+trap 'cleanup_proof; exit 0' HUP INT TERM
+trap cleanup_proof EXIT
 lease_parent=\"\$PPID\"
 case \"\$lease_parent\" in ''|*[!0-9]*) exit 76 ;; esac
 [ \"\$lease_parent\" -gt 1 ] || exit 76
@@ -266,7 +277,12 @@ case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
 kill -0 \"\$lease_parent\" 2>/dev/null || exit 76
 lease_start=\"\$(date +%s)\"
 lease_ttl=$MUTATION_LEASE_TTL_SECONDS
-echo LEASED
+umask 077
+proof_tmp=\"\$proof.tmp.\$\$\"
+printf '%s\n' \"\$nonce\" >\"\$proof_tmp\" || exit 77
+chmod 600 \"\$proof_tmp\" || exit 77
+mv -f \"\$proof_tmp\" \"\$proof\" || exit 77
+echo \"LEASED \$nonce\"
 while :; do
   current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || exit 0
   case \"\$current_parent\" in ''|*[!0-9]*) exit 0 ;; esac
@@ -298,7 +314,7 @@ done"
       return 86
     fi
     same_live_process "$SUP_LEASE_PID" "$SUP_LEASE_START" || break
-    if grep -q LEASED "$SUP_LEASE_OUT" 2>/dev/null; then got=1; break; fi
+    if grep -Fxq "LEASED $manual_lease_nonce" "$SUP_LEASE_OUT" 2>/dev/null; then got=1; break; fi
     sleep 0.1
     waited=$((waited + 1))
   done
@@ -326,6 +342,8 @@ done"
       sleep 0.02
     done
     unset OC_V5_MANUAL_LEASE_INTERNAL
+    export OC_V5_MANUAL_LEASE_NONCE="$manual_lease_nonce"
+    export OC_V5_MANUAL_LEASE_PROOF="$MANUAL_LEASE_PROOF"
     exec "$@"
   ) &
   SUP_COMMAND_PID=$!
