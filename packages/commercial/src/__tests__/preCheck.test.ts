@@ -332,12 +332,18 @@ describe("InMemoryPreCheckRedis — 输入校验", () => {
  * 拒绝。boss 决策(v1.0.89)拆掉 multiplier 估算与 ceiling,统一只在 finalize 走
  * clamp 路径。本不变量防止任何"顺便加点多 multiplier 路径"的回归。
  *
- * 双重锁:
- *   1. **结构层(静态)** — preCheck.ts 与其唯一 PG 依赖 ledger.ts(getBalance)
- *      源码中不允许出现 `agent_cost_overrides` / `agentMultiplier` 字面量。
- *   2. **行为层(spy pool)** — 用注入计数的 Pool 跑一次 preCheck,检查
- *      实际 SQL 集合不包含 `agent_cost_overrides`,且仅出现 `SELECT credits FROM users`。
- *      pool 注入走 `setPoolOverride()` test seam(已有于 `db/index.ts:75`)。
+ * 双重锁(**行为层是权威**,结构层只是零成本兜底):
+ *   1. **行为层(spy pool)** — 用注入的假 Pool 真跑一次 preCheck,把它实际发出的
+ *      每条 SQL 里出现的表名收集起来,断言集合 ⊆ {users, user_subscriptions}。
+ *      这是白名单而非黑名单:换个变量名/换张新的 multiplier 表照样红。
+ *      pool 注入走 `setPoolOverride()` test seam(`db/index.ts`)。
+ *   2. **结构层(静态)** — preCheck.ts 与其唯一 PG 依赖 ledger.ts 源码中不允许出现
+ *      `agent_cost_overrides` / `agentMultiplier` 字面量。只能挡"原样写回来"的回归,
+ *      改个名就绕过 —— 保留是因为它零成本且能覆盖到未被行为层走到的分支。
+ *
+ * 2026-07-26 修复:行为层假 pool 一直返 `{credits}` 单列,而 getBalanceBreakdown
+ * 双钱包改造后读的是 `{wallet, period}` → `BigInt(undefined)` 抛,子测长期 not ok
+ * 并被 known-failures 顶层豁免吸收。假 query 现按 SQL 形状返列。
  */
 
 describe("preCheck — BINV-5: cost multiplier 不进 preCheck 路径", () => {
@@ -370,22 +376,29 @@ describe("preCheck — BINV-5: cost multiplier 不进 preCheck 路径", () => {
     );
   });
 
-  test("行为层: preCheck 执行只 SELECT credits FROM users,不触 agent_cost_overrides", async () => {
-    // duck-type fake Pool — preCheck 路径只走 getBalance → rootQuery → pool.query。
-    // 我们记录 query 字面量,断言集合不含 agent_cost_overrides。
+  test("行为层: preCheck 只读余额相关表(个人钱包 + 企业桶),不触任何 multiplier 表", async () => {
+    // duck-type fake Pool — preCheck 路径只走 getBalanceBreakdown → query → pool.query。
+    // 我们记录 query 字面量,事后对"实际访问到的表名集合"做白名单断言。
     const sqls: string[] = [];
     const fakePool = {
       async query(text: unknown, _params?: unknown) {
         const sqlText = typeof text === "string" ? text : (text as { text: string }).text;
         sqls.push(sqlText);
-        // 模拟 users 行存在,credits=1000
-        return {
-          rows: [{ credits: "1000" }],
-          rowCount: 1,
-          command: "SELECT",
-          oid: 0,
-          fields: [],
-        };
+        // 按 SQL 形状返列:getBalanceBreakdown(spend.ts)读的是 wallet/period 两列,
+        // 双钱包改造前是单列 credits —— 假 pool 必须跟着产品的列集走,否则
+        // BigInt(undefined) 会把行为层直接打成 not ok(2026-07 前的既有状态)。
+        if (/\bwallet\b/i.test(sqlText) && /\bperiod\b/i.test(sqlText)) {
+          return {
+            rows: [{ wallet: "1000", period: "0" }],
+            rowCount: 1,
+            command: "SELECT",
+            oid: 0,
+            fields: [],
+          };
+        }
+        // 兜底:任何其它 SQL 都不该出现在 preCheck 路径上;返空行让调用方自曝,
+        // 同时该 SQL 已被记进 sqls,由下面的表名白名单断言拦住。
+        return { rows: [], rowCount: 0, command: "SELECT", oid: 0, fields: [] };
       },
       async connect() {
         throw new Error("fakePool.connect() should not be called in preCheck path");
@@ -437,17 +450,35 @@ describe("preCheck — BINV-5: cost multiplier 不进 preCheck 路径", () => {
       await closePool();
     }
 
-    // 断言:实际 SQL 集合中
-    //   (a) 不含 agent_cost_overrides — preCheck 永远不查 multiplier 表
-    //   (b) 也不含 agentMultiplier 函数名等次级字符串
+    // ── 白名单断言(本用例的真正价值所在)────────────────────────────────
+    // 从实际发出的 SQL 里抽出所有 FROM / JOIN 后的表名,断言 ⊆ 余额相关表。
+    // 黑名单("不含 agent_cost_overrides")挡不住"改个表名的新 multiplier 源";
+    // 白名单能:preCheck 一旦多读任何一张表,这里立刻红。
+    //
+    // 白名单为什么是这五张:preCheck 读的是"总可用额度",= 个人钱包
+    // (users.credits + 当期 user_subscriptions.period_credits,spend.ts
+    // getBalanceBreakdown)+ 企业桶(org_memberships → orgs → 当期
+    // org_subscriptions,orgBilling)。后三张是本次补行为层断言时实测发现的
+    // ——原用例名写的"只 SELECT credits FROM users"其实已经不准了。
+    const ALLOWED_TABLES = new Set([
+      "users",
+      "user_subscriptions",
+      "org_memberships",
+      "orgs",
+      "org_subscriptions",
+    ]);
+    const touched = new Set<string>();
     for (const sql of sqls) {
-      assert.ok(
-        !/agent_cost_overrides/i.test(sql),
-        `preCheck 路径不该出现 agent_cost_overrides:${sql}`,
-      );
+      for (const m of sql.matchAll(/\b(?:FROM|JOIN)\s+([a-z_][a-z0-9_]*)/gi)) {
+        touched.add(m[1]!.toLowerCase());
+      }
     }
-    // 进一步收紧:preCheck 真实路径只该有 `SELECT credits ... FROM users`
-    const usersQueries = sqls.filter((s) => /FROM\s+users/i.test(s));
-    assert.ok(usersQueries.length > 0, "preCheck 必须 SELECT users.credits");
+    assert.ok(sqls.length > 0, "preCheck 必须真的读一次余额(SQL 数为 0 说明假 pool 没被走到)");
+    assert.deepEqual(
+      [...touched].filter((t) => !ALLOWED_TABLES.has(t)),
+      [],
+      `preCheck 只允许读 ${[...ALLOWED_TABLES].join("/")};实际 SQL=${JSON.stringify(sqls)}`,
+    );
+    assert.ok(touched.has("users"), "preCheck 必须读 users 余额");
   });
 });
