@@ -5945,7 +5945,17 @@ wait $!
     assert.match(largeTest, /page\.waitForResponse\(/)
     assert.match(largeTest, /request\.headers\(\)\.range === 'bytes=0-0'/)
     assert.match(largeTest, /expect\(probe\.status\(\)[\s\S]*\.toBe\(206\)/)
-    assert.match(largeTest, /SEL\.turnProcessCard\(page\)[\s\S]*\.toHaveCount\(0\)/)
+    // 2026-07-26:原断言锁的是 `SEL.turnProcessCard(page) … .toHaveCount(0)`,而
+    // `turn-process-card` 这个 testid 全仓只存在于 e2e 自己的 lib/ui.ts,被测应用里
+    // 根本没有 —— 那条断言恒真。这里把锁从"缺席断言必须在"换成"正向对照必须在":
+    // 大会话打开后必须真的看见非空的 assistant 正文,选择器漂移会立刻失败而不是静默恒绿。
+    // 幽灵选择器本身由 scripts/check-v5-e2e-selectors.ts 整类拦截。
+    // 只禁真实调用,不禁注释里提名字(spec 里留了一段说明为什么换掉它)。
+    assert.doesNotMatch(largeTest, /SEL\.turnProcessCard\(/)
+    assert.match(
+      largeTest,
+      /SEL\.assistantRows\(page\)[\s\S]*\.prose[\s\S]*toBeVisible\(/,
+    )
     assert.match(largeTest, /E2E_TOOL_FINAL_MARKER/)
     const loopbackBypass = runner.indexOf('export NO_PROXY=')
     const lowercaseLoopbackBypass = runner.indexOf('export no_proxy=')
