@@ -17,6 +17,12 @@
 //
 // Job output: run_id + timestamp written to ~/.openclaude/cron/outputs/<id>-<ts>.md.
 // If the agent's final text starts with [SILENT], output is archived but not delivered.
+//
+// Run outcomes are three-state (`ok` / `silent` / `failed`) and every outcome is
+// persisted to last-run.json. "Nothing to report" and "the run blew up" must never
+// share an exit: collapsing them is exactly what let skill-autotrain fail silently
+// every night from 2026-07-19 to 2026-07-26 (expired OAuth) with no trace and no
+// alert — last-run.json simply stopped advancing and nobody noticed for 8 days.
 
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
@@ -48,10 +54,54 @@ export interface CronJob {
 
 export interface CronFile {
   jobs: CronJob[]
+  /** Default jobs the user has explicitly removed. Kept so `mergeDefaultCronJobs`
+   *  can add genuinely new defaults without resurrecting ones that were deleted
+   *  on purpose. Absent (not `[]`) means "written before this field existed" and
+   *  triggers a one-time migration that freezes the current state. */
+  disabledDefaults?: string[]
+}
+
+/** Outcome of a single cron run.
+ *  - `ok`     — produced real output (delivered per job.deliver)
+ *  - `silent` — the job explicitly reported nothing to say ([SILENT]/HEARTBEAT_OK)
+ *  - `failed` — the turn threw, or produced no output at all (subprocess crash,
+ *               auth/API failure). Always recorded and alerted; never silent. */
+export type CronRunStatus = 'ok' | 'silent' | 'failed'
+
+export interface CronRunRecord {
+  /** Minute bucket the run fired in — dedupes reruns within the same minute. */
+  minuteKey: number
+  status: CronRunStatus
+  /** ISO timestamp of when the outcome was recorded. */
+  at: string
+  /** Failure reason, present only when status === 'failed'. */
+  error?: string
+  /** Consecutive `failed` runs, reset by any `ok`/`silent` run. */
+  consecutiveFailures: number
+}
+
+/** Alert on the first 3 consecutive failures, then every 5th, so a frequent job
+ *  (e.g. 4-hourly heartbeat) that stays broken cannot spam the user. */
+export function shouldAlertOnFailure(consecutiveFailures: number): boolean {
+  return consecutiveFailures <= 3 || consecutiveFailures % 5 === 0
+}
+
+/**
+ * Classify a run from what it produced.
+ *
+ * An empty transcript is a FAILURE, not silence: an agent with nothing to say
+ * emits an explicit `[SILENT]` / `HEARTBEAT_OK` marker, so producing nothing at
+ * all means the turn died (subprocess crash, auth or API error).
+ */
+export function classifyRunOutcome(failure: string | undefined, output: string): CronRunStatus {
+  if (failure) return 'failed'
+  const trimmed = output.trim()
+  if (!trimmed) return 'failed'
+  if (trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') return 'silent'
+  return 'ok'
 }
 
 export const SKILL_AUTOTRAIN_JOB_ID = 'skill-autotrain'
-const NEW_AUTO_APPEND_DEFAULT_JOB_IDS = new Set([SKILL_AUTOTRAIN_JOB_ID])
 
 const DEFAULT_JOBS: CronJob[] = [
   {
@@ -153,6 +203,25 @@ function cloneCronJob(job: CronJob): CronJob {
   return clone
 }
 
+/** Is `id` one of the built-in default jobs? */
+export function isDefaultJobId(id: string, defaults: CronJob[] = DEFAULT_JOBS): boolean {
+  return defaults.some((job) => job.id === id)
+}
+
+/**
+ * Reconcile the user's cron file against the built-in defaults.
+ *
+ * The authority for "should this default job exist" is DEFAULT_JOBS plus the
+ * user's explicit `disabledDefaults` list — not a hand-maintained allowlist of
+ * which defaults are allowed to auto-append. The old allowlist required editing
+ * a Set every time a default job was added, and silently no-op'd when someone
+ * forgot; a missing job then looked identical to a deleted one.
+ *
+ * A file with no `disabledDefaults` field predates this mechanism: the user's
+ * past deletions live there only as absence. We freeze that state into an
+ * explicit list rather than resurrecting jobs they removed on purpose — so this
+ * migration never changes which jobs actually run.
+ */
 export function mergeDefaultCronJobs(
   existing: CronFile,
   defaults: CronJob[] = DEFAULT_JOBS,
@@ -160,14 +229,23 @@ export function mergeDefaultCronJobs(
   const base = existing && typeof existing === 'object' ? existing : { jobs: [] }
   const jobs = Array.isArray(base.jobs) ? base.jobs : []
   const existingIds = new Set(jobs.map((job) => job.id))
-  const missing = defaults.filter(
-    (job) => NEW_AUTO_APPEND_DEFAULT_JOB_IDS.has(job.id) && !existingIds.has(job.id),
-  )
-  if (missing.length === 0) return { file: base, changed: false }
+  const missing = defaults.filter((job) => !existingIds.has(job.id))
+
+  if (!Array.isArray(base.disabledDefaults)) {
+    // One-time migration — record, don't resurrect.
+    return {
+      file: { ...base, jobs, disabledDefaults: missing.map((job) => job.id) },
+      changed: true,
+    }
+  }
+
+  const disabled = new Set(base.disabledDefaults)
+  const toAdd = missing.filter((job) => !disabled.has(job.id))
+  if (toAdd.length === 0) return { file: base, changed: false }
   return {
     file: {
       ...base,
-      jobs: [...jobs, ...missing.map(cloneCronJob)],
+      jobs: [...jobs, ...toAdd.map(cloneCronJob)],
     },
     changed: true,
   }
@@ -177,8 +255,9 @@ export async function ensureCronFile(): Promise<CronFile> {
   const path = paths.cronYaml
   if (!existsSync(path)) {
     await mkdir(dirname(path), { recursive: true })
-    await atomicWriteYaml(path, { jobs: DEFAULT_JOBS })
-    return { jobs: DEFAULT_JOBS }
+    const fresh: CronFile = { jobs: DEFAULT_JOBS, disabledDefaults: [] }
+    await atomicWriteYaml(path, fresh)
+    return fresh
   }
   try {
     const raw = await readFile(path, 'utf-8')
@@ -191,16 +270,58 @@ export async function ensureCronFile(): Promise<CronFile> {
   }
 }
 
-async function loadLastRun(): Promise<Record<string, number>> {
+/**
+ * Normalize one last-run entry.
+ *
+ * Legacy files stored a bare minute-bucket number per job id. Those runs were
+ * only ever recorded on success, so a bare number means "last known good run".
+ */
+export function normalizeLastRunEntry(value: unknown): CronRunRecord | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return {
+      minuteKey: value,
+      status: 'ok',
+      at: new Date(value * 60_000).toISOString(),
+      consecutiveFailures: 0,
+    }
+  }
+  if (value && typeof value === 'object') {
+    const raw = value as Partial<CronRunRecord>
+    if (typeof raw.minuteKey === 'number' && Number.isFinite(raw.minuteKey)) {
+      const status: CronRunStatus =
+        raw.status === 'failed' || raw.status === 'silent' ? raw.status : 'ok'
+      return {
+        minuteKey: raw.minuteKey,
+        status,
+        at: typeof raw.at === 'string' ? raw.at : new Date(raw.minuteKey * 60_000).toISOString(),
+        error: typeof raw.error === 'string' ? raw.error : undefined,
+        consecutiveFailures:
+          typeof raw.consecutiveFailures === 'number' && raw.consecutiveFailures >= 0
+            ? raw.consecutiveFailures
+            : 0,
+      }
+    }
+  }
+  return null
+}
+
+async function loadLastRun(): Promise<Record<string, CronRunRecord>> {
   if (!existsSync(LAST_RUN_FILE)) return {}
   try {
-    return JSON.parse(await readFile(LAST_RUN_FILE, 'utf-8'))
+    const parsed = JSON.parse(await readFile(LAST_RUN_FILE, 'utf-8'))
+    if (!parsed || typeof parsed !== 'object') return {}
+    const out: Record<string, CronRunRecord> = {}
+    for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const rec = normalizeLastRunEntry(value)
+      if (rec) out[id] = rec
+    }
+    return out
   } catch {
     return {}
   }
 }
 let _writeCounter = 0
-async function saveLastRun(map: Record<string, number>): Promise<void> {
+async function saveLastRun(map: Record<string, CronRunRecord>): Promise<void> {
   await mkdir(dirname(LAST_RUN_FILE), { recursive: true })
   const tmp = `${LAST_RUN_FILE}.${process.pid}.${++_writeCounter}.tmp`
   await writeFile(tmp, JSON.stringify(map, null, 2))
@@ -354,7 +475,7 @@ export class CronScheduler {
           if (job.enabled === false) continue
           if (!cronMatches(job.schedule, localNow)) continue
           // Dedupe: don't run twice in the same minute
-          if (lastRun[job.id] === minuteKey) continue
+          if (lastRun[job.id]?.minuteKey === minuteKey) continue
           const agent = agentsConfig.agents.find((a) => a.id === job.agent)
           if (!agent) {
             logger.warn(`job ${job.id}: agent ${job.agent} not found`, {
@@ -363,13 +484,22 @@ export class CronScheduler {
             })
             continue
           }
-          await this.runJob(job, agent)
-          lastRun[job.id] = minuteKey
+          const priorFailures = lastRun[job.id]?.consecutiveFailures ?? 0
+          // runJob never throws — it reports failure as an outcome so that a
+          // broken run is still recorded and alerted instead of vanishing.
+          const outcome = await this.runJob(job, agent, priorFailures)
+          lastRun[job.id] = {
+            minuteKey,
+            status: outcome.status,
+            at: new Date().toISOString(),
+            error: outcome.error,
+            consecutiveFailures: outcome.status === 'failed' ? priorFailures + 1 : 0,
+          }
           lastRunDirty = true
         }
       } finally {
-        // Always flush completed job timestamps so a later failure doesn't replay
-        // already-run jobs on the next tick.
+        // Always flush outcomes so a later failure doesn't replay already-run jobs
+        // on the next tick.
         if (lastRunDirty) {
           await saveLastRun(lastRun)
         }
@@ -379,7 +509,15 @@ export class CronScheduler {
     }
   }
 
-  private async runJob(job: CronJob, agent: AgentDef): Promise<void> {
+  /**
+   * Execute one job. Never throws: a crashed run is reported as a `failed`
+   * outcome so the caller can record it and alert on it.
+   */
+  private async runJob(
+    job: CronJob,
+    agent: AgentDef,
+    priorFailures = 0,
+  ): Promise<{ status: CronRunStatus; error?: string }> {
     logger.info(`running job ${job.id}`, { jobId: job.id, heartbeat: !!job.heartbeat })
 
     // Isolated session per execution for ALL jobs (heartbeat included).
@@ -390,57 +528,88 @@ export class CronScheduler {
     // (see onDeliver), which reads lastActiveChannel independently.
     const sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${Date.now()}`
 
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent,
-      channel: 'cron',
-      peerId: job.id,
-      title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
-      // (The old in-repo fork supported a `--workload cron` QoS billing tag;
-      // official Claude Code has no such flag, and on the personal version the
-      // user runs their own subscription, so there's no shared-pool QoS routing
-      // to tag for. Cron runs are plain turns.)
-    })
     let output = ''
+    let failure: string | undefined
     try {
-      await this.sessions.submit(session, job.prompt, (e) => {
-        if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
+      const session = await this.sessions.getOrCreate({
+        sessionKey,
+        agent,
+        channel: 'cron',
+        peerId: job.id,
+        title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
+        // (The old in-repo fork supported a `--workload cron` QoS billing tag;
+        // official Claude Code has no such flag, and on the personal version the
+        // user runs their own subscription, so there's no shared-pool QoS routing
+        // to tag for. Cron runs are plain turns.)
       })
-    } finally {
-      // All jobs use isolated sessions — always destroy, even if submit()
-      // threw, otherwise the subprocess + resume-map entry would leak until
-      // the eviction loop catches it on the next sweep.
-      await this.sessions
-        .destroySession(sessionKey)
-        .catch((err) =>
-          logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
-        )
+      try {
+        await this.sessions.submit(session, job.prompt, (e) => {
+          if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
+        })
+      } finally {
+        // All jobs use isolated sessions — always destroy, even if submit()
+        // threw, otherwise the subprocess + resume-map entry would leak until
+        // the eviction loop catches it on the next sweep.
+        await this.sessions
+          .destroySession(sessionKey)
+          .catch((err) =>
+            logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
+          )
+      }
+    } catch (err) {
+      failure = (err as Error)?.message || String(err)
+      logger.error(`job ${job.id} threw`, { jobId: job.id }, err as Error)
     }
-    // Persist output
+    // Persist output — kept even on failure, since partial text is evidence.
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
     const outPath = join(paths.cronOutputsDir, `${job.id}-${ts}.md`)
     try {
       await mkdir(dirname(outPath), { recursive: true })
       await writeFile(outPath, output)
     } catch {}
-    // One-shot jobs: disable after first run, regardless of delivery outcome
+
+    const trimmed = output.trim()
+    const status = classifyRunOutcome(failure, output)
+
+    if (status === 'failed') {
+      const consecutive = priorFailures + 1
+      const reason = failure ?? '本轮没有产生任何输出(子进程崩溃或模型/鉴权失败)'
+      logger.error(`job ${job.id} failed`, {
+        jobId: job.id,
+        consecutiveFailures: consecutive,
+        reason,
+      })
+      if (shouldAlertOnFailure(consecutive)) {
+        // Alert even for deliver:'local' jobs — a local job failing quietly is
+        // exactly the case that went unnoticed for 8 days.
+        this.onDeliver(
+          `定时任务 \`${job.id}\` 执行失败(连续第 ${consecutive} 次)。\n\n原因:${reason}\n\n本轮产出未生成,修复后可等待下次调度或手动触发。`,
+          {
+            ...job,
+            deliver: job.deliver && job.deliver !== 'local' ? job.deliver : 'webchat',
+            label: `⚠️ ${job.label || job.id} 执行失败`,
+          },
+        )
+      }
+      return { status, error: reason }
+    }
+
+    // One-shot jobs: disable only after a run that actually happened. Burning
+    // the single shot on a failed run would silently drop the reminder.
     if (job.oneshot) {
       logger.info(`job ${job.id} is one-shot, disabling`, { jobId: job.id })
       job.enabled = false
       await saveCronFile(await ensureCronFile(), job)
     }
 
-    // Skip delivery for silence markers AND genuinely empty output. The empty
-    // case covers subprocess crashes / API failures mid-turn: without this
-    // guard, the user sees an orphan "💓 heartbeat" card with no content.
-    const trimmed = output.trim()
-    if (!trimmed || trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
-      logger.info(`job ${job.id} silent/empty, not delivering`, {
+    if (status === 'silent') {
+      logger.info(`job ${job.id} silent, not delivering`, {
         jobId: job.id,
-        reason: !trimmed ? 'empty' : trimmed.startsWith('[SILENT]') ? 'silent' : 'heartbeat_ok',
+        reason: trimmed.startsWith('[SILENT]') ? 'silent' : 'heartbeat_ok',
       })
-      return
+      return { status }
     }
+
     logger.info(`job ${job.id} completed`, {
       jobId: job.id,
       chars: trimmed.length,
@@ -455,6 +624,7 @@ export class CronScheduler {
       })
       this.onDeliver(trimmed, job)
     }
+    return { status }
   }
 
   // ── Runtime job management (called by /api/cron) ──
@@ -471,6 +641,10 @@ export class CronScheduler {
     // Replace if same ID exists
     file.jobs = file.jobs.filter((j) => j.id !== job.id)
     file.jobs.push(job)
+    // Re-adding a default job clears its tombstone, so it stays after upgrades.
+    if (file.disabledDefaults?.length && isDefaultJobId(job.id)) {
+      file.disabledDefaults = file.disabledDefaults.filter((x) => x !== job.id)
+    }
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`added job ${job.id}`, { jobId: job.id, schedule: job.schedule })
   }
@@ -480,6 +654,12 @@ export class CronScheduler {
     const before = file.jobs.length
     file.jobs = file.jobs.filter((j) => j.id !== id)
     if (file.jobs.length === before) return false
+    // Tombstone the deletion so the next upgrade doesn't resurrect it.
+    if (isDefaultJobId(id)) {
+      const disabled = new Set(file.disabledDefaults ?? [])
+      disabled.add(id)
+      file.disabledDefaults = [...disabled]
+    }
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`removed job ${id}`, { jobId: id })
     return true
@@ -515,16 +695,32 @@ export class CronScheduler {
     return file.jobs ?? []
   }
 
-  /** List jobs with computed next-run time for UI display */
-  async listJobsWithMeta(): Promise<Array<CronJob & { nextRunAt?: string; lastRunAt?: string }>> {
+  /** List jobs with computed next-run time and last outcome for UI display */
+  async listJobsWithMeta(): Promise<
+    Array<
+      CronJob & {
+        nextRunAt?: string
+        lastRunAt?: string
+        lastStatus?: CronRunStatus
+        lastError?: string
+        consecutiveFailures?: number
+      }
+    >
+  > {
     const file = await ensureCronFile()
     const lastRun = await loadLastRun()
     const now = new Date()
     return (file.jobs ?? []).map((job) => {
-      const lastMinKey = lastRun[job.id]
-      const lastRunAt = lastMinKey ? new Date(lastMinKey * 60_000).toISOString() : undefined
+      const rec = lastRun[job.id]
       const nextRunAt = job.enabled !== false ? computeNextRun(job.schedule, now) : undefined
-      return { ...job, nextRunAt, lastRunAt }
+      return {
+        ...job,
+        nextRunAt,
+        lastRunAt: rec?.at,
+        lastStatus: rec?.status,
+        lastError: rec?.error,
+        consecutiveFailures: rec?.consecutiveFailures,
+      }
     })
   }
 

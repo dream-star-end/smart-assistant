@@ -153,11 +153,61 @@ function compareSemver(a: string, b: string): number {
   return 0
 }
 
+/** Split a skill name into comparable tokens. */
+export function skillNameTokens(name: string): string[] {
+  return name
+    .toLowerCase()
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+}
+
+/**
+ * Do two skill names describe the same domain?
+ *
+ * Saving a skill is one tool call; finding an existing one requires guessing its
+ * exact name. That asymmetry is why the library grew into 20+ single-incident
+ * `*-debug` notes that nothing ever reads. This raises the write bar to match
+ * the read bar: a near-duplicate name must be acknowledged before it lands.
+ *
+ * Heuristic: 3+ shared tokens, or Jaccard >= 0.5. Deliberately errs toward
+ * flagging — the caller can override with one extra flag.
+ */
+export function isSameDomainSkillName(a: string, b: string): boolean {
+  const ta = new Set(skillNameTokens(a))
+  const tb = new Set(skillNameTokens(b))
+  if (ta.size === 0 || tb.size === 0) return false
+  let shared = 0
+  for (const token of ta) if (tb.has(token)) shared++
+  if (shared === 0) return false
+  const union = ta.size + tb.size - shared
+  return shared >= 3 || shared / union >= 0.5
+}
+
 export class SkillStore {
   constructor(private agentId: string) {
     if (!agentId || !VALID_AGENT_ID_RE.test(agentId)) {
       throw new Error(`invalid agentId: ${agentId}`)
     }
+  }
+
+  /** Skill directory names only — cheaper than list() when just comparing names. */
+  private async listNames(): Promise<string[]> {
+    const dir = paths.agentSkillsDir(this.agentId)
+    if (!existsSync(dir)) return []
+    try {
+      const entries = await readdir(dir, { withFileTypes: true })
+      return entries
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+        .map((entry) => entry.name)
+    } catch {
+      return []
+    }
+  }
+
+  /** Existing skills whose name occupies the same domain as `name`. */
+  async findSimilarSkills(name: string): Promise<string[]> {
+    const names = await this.listNames()
+    return names.filter((other) => other !== name && isSameDomainSkillName(other, name)).sort()
   }
 
   async list(): Promise<SkillMetadata[]> {
@@ -229,7 +279,11 @@ export class SkillStore {
     }
   }
 
-  async save(meta: SkillFrontmatter, body: string): Promise<{ ok: boolean; error?: string }> {
+  async save(
+    meta: SkillFrontmatter,
+    body: string,
+    opts?: { allowSimilar?: boolean },
+  ): Promise<{ ok: boolean; error?: string; similar?: string[] }> {
     const v = validateSkillName(meta.name)
     if (!v.ok) return { ok: false, error: v.error }
     if (!meta.description || meta.description.length > MAX_SKILL_DESCRIPTION_LENGTH) {
@@ -242,6 +296,23 @@ export class SkillStore {
     const skillMd = paths.agentSkillMd(this.agentId, meta.name)
     const now = new Date().toISOString()
     const isNew = !existsSync(skillMd)
+
+    // Only new names are gated — updating an existing skill is the outcome we
+    // want and must never be blocked.
+    if (isNew && !opts?.allowSimilar) {
+      const similar = await this.findSimilarSkills(meta.name)
+      if (similar.length > 0) {
+        return {
+          ok: false,
+          similar,
+          error: [
+            `已存在同域技能:${similar.join('、')}。`,
+            '先用 skill_view 查看:如果说的是同一件事,请用那个技能的 name 调用 skill_save 来更新它(而不是新建);',
+            '确认确实是不同的事,再重新调用并带 allowSimilar/confirmNew = true。',
+          ].join('\n'),
+        }
+      }
+    }
 
     // Snapshot old version before overwriting
     let prevVersion = '1.0.0'
@@ -336,7 +407,8 @@ export class SkillStore {
     const { version: _discarded, ...metaWithoutVersion } = meta as SkillFrontmatter & {
       version?: string
     }
-    return this.save(metaWithoutVersion as SkillFrontmatter, body)
+    // Restoring a skill's own history is an explicit intent, never a near-duplicate.
+    return this.save(metaWithoutVersion as SkillFrontmatter, body, { allowSimilar: true })
   }
 
   async delete(name: string): Promise<{ ok: boolean; error?: string }> {
