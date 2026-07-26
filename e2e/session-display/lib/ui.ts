@@ -16,8 +16,13 @@ export const SEL = {
   // 用 role+正则匹配对话/发消息,排除"搜索会话"框(含"会话"而非"对话")。
   composer: (p: Page): Locator => p.getByRole('textbox', { name: /对话|发消息/ }).first(),
   newSessionBtn: (p: Page): Locator => p.getByRole('button', { name: '新建会话' }).first(),
-  sendBtn: (p: Page): Locator => p.getByRole('button', { name: '发送' }),
-  stopBtn: (p: Page): Locator => p.getByRole('button', { name: '停止' }),
+  // 发送/停止是**同一个按钮**(Composer 按 busy 翻 aria-label)。必须 exact:非 exact 的
+  // getByRole name 是子串匹配,「停止」会同时命中「停止录音」「停止朗读」,「发送」会命中
+  // 「重试发送」——两者都会让 busy 判据静默失真。
+  sendBtn: (p: Page): Locator => p.getByRole('button', { name: '发送', exact: true }),
+  stopBtn: (p: Page): Locator => p.getByRole('button', { name: '停止', exact: true }),
+  /** 助手消息动作条的「重新生成」(仅最后一条助手消息、且非流式时出现)。 */
+  regenerateBtn: (p: Page): Locator => p.getByRole('button', { name: '重新生成', exact: true }),
   // 消息行:优先本批新增 data-testid;回退到既有稳定 class 锚点(同一元素同时命中
   // testid 与 class → union 去重为一个,绝不祖先/后代双计)。这样套件对"含 testid 的本
   // 分支构建"与"尚未部署 testid 的现网构建"都能跑。
@@ -38,9 +43,17 @@ export const SEL = {
   retryExactBtn: (p: Page): Locator => p.getByRole('button', { name: '重试', exact: true }),
   retryActionBtn: (p: Page): Locator =>
     p.getByRole('button', { name: /^(?:重试|重新尝试|重试发送)$/ }),
-  // 历史分页(本地/云端两种文案)
-  loadMoreLocal: (p: Page): Locator => p.getByRole('button', { name: /加载更多历史/ }),
-  loadMoreCloud: (p: Page): Locator => p.getByRole('button', { name: /从云端加载更早的历史/ }),
+  // 历史分页(真实控件,MessageRenderer 的 history-page-loader)。
+  //
+  // 2026-07-26 审计:此处原本是 `加载更多历史` / `从云端加载更早的历史` 两个 role-name
+  // 正则,而这两句文案在 packages/web-react 的**生产组件里一次都没渲染过**
+  // (`loadOlderHistoryLabel` 只有 pure.ts 定义 + 单测引用,无组件调用点)。于是 06 的
+  // UI 逐页断言恒 count()==0:while 循环从不进,负例 toHaveCount(0) 恒真 —— 双重假绿。
+  // 真实控件是带 data-testid="history-page-loader" 的容器 + 其内单个按钮,文案四态见 TEXT。
+  // (check-v5-e2e-selectors 只校验 testid/aria-label 字面量,role-name 文案不在其覆盖内,
+  //  所以这类漂移只能靠"选择器一律指向 testid"来防,见 followup。)
+  historyPageLoader: (p: Page): Locator => p.getByTestId('history-page-loader'),
+  historyOlderBtn: (p: Page): Locator => p.getByTestId('history-page-loader').getByRole('button'),
 };
 
 /** 用户可见的错误文案(§5/错误卡契约)。 */
@@ -49,6 +62,13 @@ export const TEXT = {
   notCharged: '已确认未计费',
   serviceRestart: '服务重启，本轮已中断',
   sendFailedBanner: '发送失败',
+  /** 用户点停止后本轮的终态文案(render.ts ERROR_LABELS.stopped)。 */
+  turnStopped: '已停止本轮生成',
+  /** history-page-loader 按钮四态文案(MessageRenderer,单一权威在组件里)。 */
+  historyOlder: '查看更早历史记录',
+  historyEnd: '已到最早记录',
+  historyLoading: '加载中…',
+  historyLoadFailed: '加载失败，点击重试',
 };
 
 /** UI 登录:填表 → 提交(form onSubmit)→ 断言工作区元素出现(非 URL)。 */
@@ -189,6 +209,37 @@ export async function waitForTurnSettled(
     }
     await page.waitForTimeout(500);
   }
+}
+
+/**
+ * 等本轮进入"执行中"(composer 的同一个按钮翻成「停止」)。这是**用户可见的唯一**
+ * turn-in-flight 判据,也是「停止」这条逃生口存在的前提:按钮不出现就等于用户无法中断。
+ * 轮询实现;超时抛(不 soft-fail —— 发不出去的 turn 必须让门变红)。
+ */
+export async function waitForTurnBusy(page: Page, opts: { timeoutMs?: number } = {}): Promise<void> {
+  const timeout = opts.timeoutMs ?? 60_000;
+  await expect(
+    SEL.stopBtn(page),
+    '发送后 composer 未翻出「停止」按钮:用户没有任何中断入口(失控 turn 无逃生口)',
+  ).toBeVisible({ timeout });
+}
+
+/**
+ * 本轮流式产出的可观测快照:助手行数 + 全部助手正文长度 + 流式光标数。
+ * "点了停止之后不再有增量帧"的判据 = 两次快照完全相等(轮询取样,不死 sleep)。
+ */
+export interface StreamSnapshot {
+  assistantRows: number;
+  assistantChars: number;
+  carets: number;
+}
+export async function streamSnapshot(page: Page): Promise<StreamSnapshot> {
+  const texts = await assistantTexts(page);
+  return {
+    assistantRows: texts.length,
+    assistantChars: texts.reduce((sum, text) => sum + text.length, 0),
+    carets: await page.locator('.caret-blink').count(),
+  };
 }
 
 /** 读取当前会话所有 user 行文本(顺序)。 */
