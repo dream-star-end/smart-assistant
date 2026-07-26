@@ -2984,10 +2984,36 @@ assert_ci_green_for_source_commit() { # <full sha>
   return 0
 }
 
+# 「这次发布的源 commit」的单一权威。
+#
+# 2026-07-26 角色分离:此前直接取 `rev-parse HEAD`,于是 $REPO_ROOT 这棵树同时是
+# (a) 所有会话共享、随 base 不断 fast-forward 的开发 checkout,和 (b) 必须钉死在 pinned
+# SHA 的发布源。两个角色冲突的后果是 release queue 的 assert 必须要求 HEAD 逐字节等于
+# pinned,任何人合一个 PR 就让 active job 作废并堵住唯一 active 槽(今天真实死锁一次)。
+#
+# 现在:有 queue job 时,发布源 = 该 job 的 **pinned canonical SHA**;没有 queue 的
+# 豁免 lane 回落 HEAD(行为不变)。git archive 按任意 sha 取源、不读工作树活状态,
+# 所以开发树前进不再影响"发什么"。queue 侧 assert 相应放宽为"pinned 是 HEAD 的祖先"
+# —— 两处必须成对存在:只放宽 assert 而不在这里按 pinned 取源,就等于允许发出未 pin 的代码。
+resolve_release_source_commit() {
+  local pinned
+  if [[ -n "${OC_V5_RELEASE_QUEUE_ID:-}" ]] && [[ -x "$RELEASE_QUEUE_SCRIPT" ]]; then
+    pinned="$("$RELEASE_QUEUE_SCRIPT" pinned-sha --id "$OC_V5_RELEASE_QUEUE_ID" 2>/dev/null || true)"
+    if [[ "$pinned" =~ ^[0-9a-f]{40}$ ]]; then
+      git -C "$REPO_ROOT" cat-file -e "${pinned}^{commit}" 2>/dev/null \
+        || { echo "✗ queue pinned SHA 在本地不可达:$pinned" >&2; return 1; }
+      printf '%s\n' "$pinned"
+      return 0
+    fi
+  fi
+  git -C "$REPO_ROOT" rev-parse HEAD
+}
+
 build_release() {
   BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""; DIST_BUILD_ID=""
   local full_sha short_sha ts staging reldir cur
-  full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  full_sha="$(resolve_release_source_commit)" || return 1
+  [[ -n "$full_sha" ]] || { echo "✗ 无法解析发布源 commit(空值)" >&2; return 1; }
   BUILT_RELEASE_SOURCE_COMMIT="$full_sha"
   # 审计 9:build_release 是「哪个 commit 会变成线上 release」的唯一收口点,CI 绿门挂在这里。
   assert_ci_green_for_source_commit "$full_sha" || return 1
@@ -4945,7 +4971,12 @@ build_platform_bundle() {
   BUILT_BUNDLE_REV=""
   local src="$BUILT_RELEASE/packages/commercial/agent-sandbox/platform-runtime"
   local full_sha nonce staging
-  full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  # 与 build_release 同源:bundle 的 rev 必须标注它真正来自哪个 commit,
+  # 否则 tuple 里 release 与 bundle 会指向两个不同的 commit(release 按 pinned、
+  # bundle 按 HEAD),而 tuple 是原子回滚单元 —— 两半不同源就无法可靠回退。
+  # 优先复用 build_release 已解析好的值,避免二次查询产生新的读竞态。
+  full_sha="${BUILT_RELEASE_SOURCE_COMMIT:-$(resolve_release_source_commit)}"
+  [[ -n "$full_sha" ]] || { echo "✗ 无法解析 bundle 源 commit(空值)" >&2; return 1; }
   echo "── build platform bundle(源=pinned $src)──"
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] assert platform-runtime+prompts/ 存在;cp → bundles/.staging;seed 语义校验(validatePlatformSeedCli,缺 CLI 即 fail);finalize → bundles/<rev>"
@@ -4983,7 +5014,11 @@ build_runtime_release() {
   BUILT_RUNTIME_RELEASE=""; RUNTIME_IMAGE_REF=""; RUNTIME_IMAGE_ID=""
   local full_sha nonce raw staging runtime_caps
   local excl='packages/commercial/agent-sandbox/runtime-src-excludes.txt'
-  full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  # tuple 的第三半。runtime release / platform bundle / master release 是同一个原子
+  # 回滚单元,三者必须来自**同一个** commit —— 否则回滚一条 tuple 会把三个不同 commit
+  # 的产物混在一起。与 build_release 同源(优先复用已解析值,不二次读)。
+  full_sha="${BUILT_RELEASE_SOURCE_COMMIT:-$(resolve_release_source_commit)}"
+  [[ -n "$full_sha" ]] || { echo "✗ 无法解析 runtime release 源 commit(空值)" >&2; return 1; }
   # runtime capability 是随 pinned 源码 commit 交付的制品声明。必须读该 commit 自己的
   # metadata，而非可并发变化的 working tree；整列透传，避免新增 capability 时被旧接线抹掉。
   if ! runtime_caps="$(

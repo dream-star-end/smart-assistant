@@ -203,6 +203,15 @@ SQL
   printf '%s\n' "$canonical_sha"
 }
 
+pinned_sha_locked() {
+  local id="$1" status pinned
+  status="$(job_field_locked "$id" status)"
+  [[ "$status" == active ]] || die "发布队列项不是 active:$id status=${status:-missing}"
+  pinned="$(job_field_locked "$id" canonical_sha)"
+  valid_sha "$pinned" || die "发布队列项尚未 pin canonical SHA:$id"
+  printf '%s\n' "$pinned"
+}
+
 assert_locked() {
   local id="$1" current status pinned
   status="$(job_field_locked "$id" status)"
@@ -210,8 +219,24 @@ assert_locked() {
   pinned="$(job_field_locked "$id" canonical_sha)"
   valid_sha "$pinned" || die "发布队列项尚未 pin canonical SHA:$id"
   current="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-  [[ "$current" == "$pinned" ]] \
-    || die "canonical HEAD 漂移:queue=$pinned current=$current"
+  # 2026-07-26 角色分离:此前这里要求 HEAD 与 pinned **逐字节相等**,而
+  # $REPO_ROOT 这棵树同时承担两个互相冲突的角色 ——
+  #   (a) 所有会话共享、随 base 不断 fast-forward 的开发 canonical checkout;
+  #   (b) 必须钉死在 pinned SHA 上的生产发布源。
+  # 于是任何人在你 active 期间合入一个 PR,你的 job 就作废;而它占着唯一 active 槽,
+  # 别人 acquire 恒返回 75 —— 双向死锁,今天已真实发生一次。
+  #
+  # 根治不是"每次靠人记得别 ff",而是把角色 (b) 从工作树活状态里摘出来:
+  # 判据改为 **pinned 必须是当前 HEAD 的祖先**(证明它确实已合入 canonical),
+  # 而"发哪个 commit"由 deploy 侧显式按 pinned 取源(git archive <pinned>,
+  # 不读工作树),见 deploy-v5.sh 的 resolve_release_source_commit。
+  # 这样开发树可以自由前进,而发布内容仍被 pin 钉死。
+  if [[ "$current" != "$pinned" ]]; then
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$pinned" "$current" 2>/dev/null \
+      || die "pinned SHA 不在 canonical 历史里:queue=$pinned current=$current(pin 错了,或该 commit 尚未合入/已被改写)"
+    printf '  · canonical 已前进(HEAD=%s),pinned=%s 仍是其祖先;发布内容按 pinned 取源\n' \
+      "${current:0:12}" "${pinned:0:12}"
+  fi
   printf '✓ V5 release queue active=%s canonical_sha=%s\n' "$id" "$pinned"
 }
 
@@ -439,6 +464,20 @@ case "$command_name" in
     done
     valid_id "$id" || die "缺少/非法 OC_V5_RELEASE_QUEUE_ID:$id"
     with_queue_lock assert_locked "$id"
+    ;;
+  pinned-sha)
+    # 只读:回显该 job 的 pinned canonical SHA(deploy 用它决定"发哪个 commit")。
+    # 与 assert 分开是因为 deploy 需要**取值**而不只是判定,且这里不做 HEAD 比较 ——
+    # HEAD 是共享开发树的活状态,不该参与"发什么"的裁决。
+    id="${OC_V5_RELEASE_QUEUE_ID:-}"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id) id="${2:-}"; shift 2 ;;
+        *) die "pinned-sha 未知参数:$1" ;;
+      esac
+    done
+    valid_id "$id" || die "缺少/非法 OC_V5_RELEASE_QUEUE_ID:$id"
+    with_queue_lock pinned_sha_locked "$id"
     ;;
   finish)
     id=""; result=""; reason=""; actor=""
