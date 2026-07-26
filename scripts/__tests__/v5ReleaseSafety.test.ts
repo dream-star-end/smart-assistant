@@ -446,7 +446,7 @@ describe('V5 durable development release queue', () => {
           deploy,
           mode,
         ],
-        { cwd: root, encoding: 'utf8' },
+        { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
       )
     for (const mode of exempt) {
       assert.equal(classify(mode).status, 1, `${mode} should be queue-exempt`)
@@ -506,7 +506,7 @@ describe('V5 durable development release queue', () => {
           dbPath,
           cgroupPath,
         ],
-        { cwd: root, encoding: 'utf8' },
+        { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
       )
     assert.equal(check('').status, 1, 'missing rrid must fail')
     assert.equal(check('rrid-ok', path.join(dir, 'missing.db')).status, 1, 'missing ledger must fail')
