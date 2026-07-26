@@ -19,9 +19,12 @@
 #      注意:这 10 行覆盖的是"开会话 → 容器起来 → 挂对卷 → 注对 env → 停容器回收"整条
 #      主路径。实测在旧基线下,把 projects 卷的 bind 从 provision 里整条删掉,门依然 PASS。
 #   ② v3 migration 13 行 —— 三个文件各自对共享库 openclaude_test 做
-#      `DROP SCHEMA public CASCADE; CREATE SCHEMA public`,node:test 文件级并发下互撞
-#      42P06,before hookFailed → 整文件 cancelled。改成每文件一库(helpers/db.ts
-#      useDedicatedTestDatabase,照抄 org 系既有范式)。
+#      `DROP SCHEMA public CASCADE; CREATE SCHEMA public`,node:test 文件级并发下互撞;
+#      报错随竞态落点而变(42P06 already exists / no schema has been selected to
+#      create in / relation "schema_migrations" does not exist),before hookFailed
+#      → 整文件 cancelled。改成每文件一库(helpers/db.ts useDedicatedTestDatabase,
+#      照抄 org 系既有范式)。本机实测:旧版三文件并跑 = 0 pass / 51 cancelled;
+#      新版同样并跑 = 51 pass / 0 cancelled。
 #   ③ preCheck BINV-5 1 行 —— 行为层假 pool 只返 {credits},没跟上 spend.ts 双钱包
 #      改造后的 {wallet, period},BigInt(undefined) 抛。
 #

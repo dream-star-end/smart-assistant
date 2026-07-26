@@ -118,9 +118,11 @@ export interface DedicatedTestDatabase {
  * 动机(2026-07-26,本批):v3MigrationLedger / v3MigrationReconciler /
  * v3EnsureRunningMigrationGuard 三个文件各自对**共享**的 openclaude_test 做
  * `DROP SCHEMA public CASCADE; CREATE SCHEMA public`。commercial unit 套件 300+
- * 文件由 node:test 并发调度(默认按 CPU 数并行跑文件),三者一旦重叠,
- * 后者的 `CREATE SCHEMA public` 会撞上前者刚建好的 schema → `42P06 schema "public"
- * already exists`,before 钩子直接 hookFailed,整文件的 test 变 cancelled。
+ * 文件由 node:test 并发调度(默认按 CPU 数并行跑文件),三者一旦重叠就互相拆台:
+ * 具体报错取决于谁在竞态里输在哪一步 —— `42P06 schema "public" already exists`
+ * (重建撞重建)、`no schema has been selected to create in`(建表时 schema 刚被别人
+ * DROP)、`relation "schema_migrations" does not exist`(迁移账本被 CASCADE 带走)
+ * 都实测出现过。任何一种都让 before 钩子 hookFailed,整文件的 test 变 cancelled。
  * 这就是这三个文件长期躺在 .github/known-failures/commercial-unit.txt 里的原因
  * —— 不是产品坏,是夹具互相毒化,代价是 6 条 ledger 契约(open-migration 闸门)
  * 完全没有门禁。

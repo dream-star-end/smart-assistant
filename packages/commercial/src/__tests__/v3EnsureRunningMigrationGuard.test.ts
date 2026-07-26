@@ -46,8 +46,10 @@ import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 /**
  * 隔离策略:**专属库** openclaude_v3erg_test(见 helpers/db.ts:useDedicatedTestDatabase)。
  * 原先对共享库 openclaude_test 做 DROP/CREATE SCHEMA public,与同法的
- * v3MigrationLedger / v3MigrationReconciler 在文件级并发下互撞 42P06,
- * before hookFailed → 整文件 cancelled(长期挂 known-failures)。改专属库后零共享面。
+ * v3MigrationLedger / v3MigrationReconciler 在文件级并发下互撞(42P06 /
+ * no schema has been selected to create in / schema_migrations does not exist,
+ * 随竞态落点而变),before hookFailed → 整文件 cancelled(长期挂 known-failures)。
+ * 改专属库后零共享面。
  */
 const db = useDedicatedTestDatabase("openclaude_v3erg_test");
 

@@ -45,8 +45,9 @@ import {
  *
  * 此前本文件对共享库 openclaude_test 做 `DROP SCHEMA public CASCADE; CREATE SCHEMA public`
  * —— 与 v3MigrationReconciler / v3EnsureRunningMigrationGuard 两个同法文件在
- * node:test 的文件级并发下互撞,后到者 CREATE SCHEMA 报 42P06 `schema "public"
- * already exists`,before 钩子 hookFailed → 整文件 cancelled。三者因此长期挂在
+ * node:test 的文件级并发下互撞(实测报错随竞态落点而变:42P06 already exists /
+ * no schema has been selected to create in / schema_migrations does not exist),
+ * before 钩子 hookFailed → 整文件 cancelled。三者因此长期挂在
  * .github/known-failures/commercial-unit.txt 上,ledger 的 open-migration 闸门
  * 契约实际无门禁。改专属库后各跑各的,零共享面。
  */
