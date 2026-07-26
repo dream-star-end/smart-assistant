@@ -380,10 +380,18 @@ function checkTrailerClosure(): number {
   }
   const waivers = parseWaivers();
   const today = new Date().toISOString().slice(0, 10);
-  const log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", `${start}..HEAD`);
+  // 拓扑范围不够:CI 检出的是 PR 的 **merge ref**(base + head 的合并态),于是 base 侧
+  // 在本 PR 排队期间新合入的 commit 与 head 侧的锚点 commit 是并行两支 —— 它们不是锚点
+  // 的祖先,`start..HEAD` 会把它们一并捞进来,门于是拦住别人的提交(2026-07-26 实测拦到
+  // 另一会话的 0191 commit)。再叠加时间维度:早于锚点的提交一律不判,因为那些作者在
+  // 提交时这道门还不存在。
+  const anchorTs = Number(git("log", "-1", "--format=%ct", start));
+  const log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1f%ct%x1e", `${start}..HEAD`);
   let checked = 0;
   for (const entry of log.split("\x1e").map((line) => line.trim()).filter(Boolean)) {
-    const [sha, subject, body = ""] = entry.split("\x1f");
+    const [sha, subject, body = "", committedAt = ""] = entry.split("\x1f");
+    // 并行合入的旧提交:锚点之后(拓扑)但早于锚点(时间)→ 门当时还不存在,不判。
+    if (Number.isFinite(anchorTs) && Number(committedAt) < anchorTs) continue;
     if (!/^fix\(v5\)/.test(subject)) continue;
     const touched = commitFiles(sha);
     if (!touched.some((file) => TRAILER_GATE_SURFACES.some((prefix) => file.startsWith(prefix)))) continue;
