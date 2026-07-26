@@ -11,18 +11,47 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 
 ## Job 一览与本地等价命令
 
-| Job | CI 命令 | 本地等价 | timeout |
+| Job | CI 命令 | 证明的用户可见事实 | timeout |
 | --- | --- | --- | --- |
-| typecheck | `npm run typecheck` | 同左(`tsc --build`) | 20 min |
-| gateway | `npm run test:gateway` | 同左 | 25 min |
-| storage | `npm run test:storage` | 同左 | 15 min |
-| web-react | `npm run test:web-react` | 同左(等价 `cd packages/web-react && npx vitest run`) | 25 min |
-| commercial-unit | `npm run test:commercial:unit:gate` | 同左(需本地 PG fixture,见下) | 30 min |
+| typecheck | `npm run typecheck && npm run check:ci-parity` | 全仓类型闭合;CI 门集合 ≡ `check:v5` 门集合(见下「CI parity 门」) | 20 min |
+| lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合 | 10 min |
+| protocol | `npm run test:protocol` | gateway↔web-react↔容器的帧与错误码单一权威(frames / turnErrorTaxonomy / promptQueueFrames / modelAuthority)未漂 | 10 min |
+| channels | `npm run test:channels` | 企微 iLink 收发/媒体/配对链路契约 | 10 min |
+| gateway | `npm run test:gateway` | 网关侧会话/工具/路由行为 | 25 min |
+| storage | `npm run test:storage && npm run test:mcp-memory` | 持久化层与记忆子系统 | 15 min |
+| web-react | `npm run check:v5:incidents && npm run check:tutorials && npm run test:web-react` | 历史事故回归清单 + 教程 JSONL 只追加 + 前端组件单测(jsdom) | 30 min |
+| web-react-browser | `npm run test:browser` | 真 Chromium 受信点击:附件/选择器一类"jsdom 恒假阴性"的交互真的能点开 | 20 min |
+| v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化) | 20 min |
+| commercial-unit | `npm run test:commercial:unit:gate` | 商业后端全量 unit(基线失败集 diff 门,见下) | 30 min |
 
-一把梭:`npm run check:v5` 依次跑全部五项(与 CI 完全同一组命令)。
+一把梭:`npm run check:v5`。**它与 CI 的 job 命令并集必须逐条相等**,由 `npm run
+check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集非空即红。
+历史教训:2026-07-26 审计发现 `check:v5` 缺 `test:browser`、CI 缺 `test:mcp-memory`,
+开发者按文档跑绿却漏掉最贵的那道门。
 
-注意:`check:v5` 是 v5 的质量门,**不含** biome lint / integ 测试;v3 的全量门仍是
-`npm run check`。
+注意:`check:v5` 是 v5 的质量门,**不含** biome lint(`npm run lint`,当前 3657 error
+存量,见「已知风险」)/ integ 测试 / `test:web` / `lint:undefined-refs`(后两者只服务
+`packages/web`);v3 / 个人版的全量门仍是 `npm run check`。
+
+`packages/web` 的作用面**不是"v5 完全不加载"那么简单**,见
+`packages/web/README.md`:v5 master 注入 `OC_RUNTIME_CHANNEL=v5` → web root =
+`packages/web-react/dist`,本包确实不加载;但 master **有意不**向用户容器注入该 env
+(v3supervisor 明确注释:它会改变 in-container CLI 的 web-root 语义),所以容器里
+CLI 落到默认 `v3` 分支、`packages/web/public` 就是容器的 web root。
+因此本轮只把它移出 v5 门禁范围,**没有**把它加进任何生产分发排除清单。
+
+### CI parity 门(`scripts/check-ci-parity.ts`)
+
+它做三件事:
+1. 解析 `.github/workflows/v5-ci.yml`,展开 matrix,收集所有 job `run:` 里的
+   `npm run <script>`;
+2. 与 `package.json` 的 `check:v5` 链里的 `npm run <script>` 集合**双向比对**;
+3. 核对本文件上面那张 job 表格的首列 ≡ workflow 里真实的 job 名。
+
+硬要求:**CI 里禁止写 `npm run --workspace <ws> <script>`** —— 脚本名不在固定位置、
+无法与根脚本集合对齐。要跑 workspace 脚本就在根 `package.json` 加 alias(例:
+`test:browser` → `npm run --workspace @openclaude/web-react test:browser`),两侧都用 alias。
+违反时 parity 门直接红并给出改法。
 
 ## commercial-unit:基线失败集 diff 门
 
@@ -37,13 +66,49 @@ ledger / v3Supervisor / userChatBridge 一带,尚未在 v5 轨修复)。为了�
    `COMMERCIAL_UNIT_TAP=commercial-unit.tap` 把 `TAP_OUT` 和 artifact 上传路径绑在
    一起;无论测试成败都上传名为 `commercial-unit-tap` 的产物,产物缺失本身也会让
    job 失败,避免门禁只报套件名却丢失真实断言详情;
-2. `.github/scripts/diff-known-failures.sh` 从 TAP 提取**顶层**失败集
-   (`^not ok` 只匹配列 0 = 顶层 test/suite 名;嵌套子测试是缩进的,不参与),
-   与 `.github/known-failures/commercial-unit.txt` 逐行比较;
-3. **只有基线之外的新增失败才 fail**;基线内的存量失败放行;
-   基线里"本轮没失败"的条目打 warning 提示清理;
-   TAP 里一个测试点都没有(套件没跑起来)或 runner 非零退出但抓不到任何
-   `not ok`(基础设施崩溃)→ 直接 fail,防假绿。
+2. `.github/scripts/diff-known-failures.sh` 判定,判据见下。
+
+### diff 门的七条判据(2026-07-26 重写)
+
+重写前它只做"顶层失败名 diff"一件事,实测有三个洞(主干全绿 run 30190800591 的
+commercial-unit TAP artifact:`1..1067` / `# tests 4696 / # pass 4590 / # fail 61 /
+# cancelled 39 / # skipped 0 / # todo 6`,顶层 `not ok` 19 条、嵌套 `not ok` 103 条):
+
+- 判据只覆盖 19 个顶层名 → 61 个真实失败 + 39 个 cancelledByParent 全部不入判据;
+- 跑了一半也算绿(OOM / test-mutex 看门狗 kill rc=124 / 中途崩溃);
+- infra-failure 分支要求"actual 为空",而基线保证 actual 恒非空 → 实际走不到。
+
+现在的判据(任一不满足即红):
+
+| 判据 | 内容 | 它让"门绿"多证明什么 |
+| --- | --- | --- |
+| A | 必须有顶层 plan 行 `1..N` 且 `N` == 实际顶层测试点数;`# tests / # pass / # fail / # cancelled / # skipped` 汇总行齐全 | 这一轮**跑完了**,不是跑了 60% 被 kill |
+| B | `# skipped` 必须为 0 | fixture 真起来了(没起来时整套会静默 skip,node 还退 0) |
+| C | `# fail` / `# cancelled` 不超过 `commercial-unit.counts` 的上界 | 已登记套件**内部**没有多出失败;灵敏度从 19 提到 4696 |
+| D | 顶层新增失败(不在基线里)→ 红 | 没有新的整套件回归 |
+| E | `core-contract-suites.txt` 里的套件名一旦进基线 → 红 | 那几条用户当场可见的事实**永远没有豁免通道** |
+| F | stale 条目(基线里本轮没失败的)→ CI 里红 | 基线单调递减,不给未来的真回归预留豁免 |
+| G | runner 非零退出时,只有 A–F 全过才放行;若 TAP 显示零失败零取消却非零退出 → 红 | 非零退出不会被"没有新失败"顺手洗白 |
+
+严格档:`CI=true` 时默认开(判据 **B、C、F** 是红)。本地默认宽松档(这三条降为
+warning),因为它们都依赖"判绿环境 = CI"这个前提:CI 以 root + PG + Redis 跑,
+commercial unit 里 16 个文件的 `{ skip: !IS_ROOT … }` 环境门在那里全部命中真跑
+(实测 `# skipped 0`),而开发机非 root 必然 skip 几条;基线失败集同样按 CI 的
+docker mock 行为校准。本地想跑严格档:`KNOWN_FAILURES_STRICT=1`。
+A / D / E / G 两档下都是硬红 —— 截断就是截断,新失败就是新失败,禁豁免就是禁豁免。
+
+门自身的红绿对照锁在 `scripts/__tests__/knownFailuresGate.test.ts`(随 `test:v5:ops`
+在 CI 跑):每条判据都有"该拦的输入确实 exit 1"和"修好后 exit 0"两侧用例。
+
+### 配套的两个基线文件
+
+- `.github/known-failures/commercial-unit.counts` —— `fail_max` / `cancelled_max`
+  两个上界。**超过 → 红;低于 → warning 提示收紧,看到就把数字改小。**
+  文件里有变更记录,抬高上界必须写理由。
+- `.github/known-failures/core-contract-suites.txt` —— 禁豁免清单,以及"新增条目
+  的判据"(用户当场可见 + 无声失效 + 有事故前科/单一权威语义,三条全中才加)。
+
+这两个文件缺失时门直接红 —— 删文件不等于跳过判据。
 
 防静默 skip:商业测试的 DB 门控是 `process.env.CI === "true" ||
 process.env.REQUIRE_TEST_DB === "1"` —— 命中门控时 PG 不可用会直接 throw
@@ -64,10 +129,11 @@ artifact/seed 校验在 CI 真正执行;runner 是 GitHub 一次性虚机,不接
 格式:每行一个顶层 test/suite 名(与 TAP `not ok N - ` 后的文本一字不差,
 含 TAP 转义如 `\#`);空行与 `#` 开头整行是注释。
 
-- **修掉一个存量失败 → 从清单删掉对应行**(CI 的 stale warning 会提醒你)。
-  目标是清单单调递减、最终删空。
+- **修掉一个存量失败 → 从清单删掉对应行**,这是**硬要求**:stale 条目在 CI 里
+  直接判红(判据 F),不再只是 warning。目标是清单单调递减、最终删空。
 - **新增失败原则上禁止入清单**(那是回归,修代码去)。唯一例外:环境变化
   暴露出的、可证明与本次改动无关的历史失败,加行时必须在 PR 里说明依据。
+  `core-contract-suites.txt` 里的套件**连这个例外都没有**,只能修。
 - 重新生成 / 核对清单(在仓库根目录,需本地 PG fixture):
 
   ```bash
@@ -77,15 +143,27 @@ artifact/seed 校验在 CI 真正执行;runner 是 GitHub 一次性虚机,不接
   grep '^not ok' commercial-unit.tap | sed 's/^not ok [0-9]* - //' | sort -u
   ```
 
-  清单初版由该命令于 2026-07-05(HEAD=151f7b41)本机两次实跑取并集生成
+  清单最初由该命令于 2026-07-05(HEAD=151f7b41)本机两次实跑取并集生成
   (30 条稳定 + 1 条负载敏感 flaky)。2026-07-08 / 07-11 / 07-26 三轮清债后
-  **只剩 2 条**(见清单内注释),其中 07-26 一轮删了 24 条 —— 全部是夹具坏死
-  而非产品缺陷,顺带把"开会话 → 容器起来 → 挂对卷 → 注对 env → 停容器回收"
-  这条主路径的回归保护收回门内。
+  **只剩 2 条**(见清单内注释)。07-26 一轮删了 24 条 —— 全部是夹具坏死而非
+  产品缺陷,顺带把"开会话 → 容器起来 → 挂对卷 → 注对 env → 停容器回收"这条
+  主路径的回归保护收回门内;同一轮另按主干 run 30190800591 的 TAP artifact
+  删掉 7 条 stale,并把 stale 从 warning 升级为 CI 硬红(此前文档写的
+  "31 条"早已陈旧)。
 
-- 已知局限:基线粒度是**顶层 suite/test**。若一个 suite 已在基线内,其内部
-  新增的子测试失败不会被 diff 捕获(整个 suite 已被豁免)。所以清单越短,
-  门越灵敏 —— 又一个尽快清零存量的理由。
+- 已知局限 ①(粒度):基线粒度是**顶层 suite/test**。若一个 suite 已在基线内,
+  其内部新增的子测试失败不会被名字 diff 捕获。**这一条现在由判据 C 的
+  `fail_max` / `cancelled_max` 计数上界兜住** —— 名字看不见,数字看得见。
+  清单越短门越灵敏的结论不变。
+
+- 已知局限 ②(键的唯一性,**登记为债**):基线键是裸的顶层套件名,不含文件路径。
+  当前 19 条零重名纯属运气,不是机制:两个不同文件里出现同名 `describe` 时,
+  一条基线行会同时豁免两处。
+  触发条件:出现同名顶层套件(可用
+  `grep -rhoP '^describe\("\K[^"]+' packages/commercial/src --include='*.test.ts' | sort | uniq -d`
+  查)。届时把键升级为 `<相对路径>::<套件名>`;代价是 node:test 的 TAP 顶层行不带
+  文件名,需要改成按文件分组跑或改用 `--test-reporter` 自定义输出,不是一行改动,
+  所以本轮先登记不做。
 
 ### 本地 PG/Redis fixture
 
@@ -120,3 +198,16 @@ unit 套件只用到 PG(`TEST_REDIS_URL` 仅 integ 测试使用);测试代码内
 5. **workflow_dispatch 可见性**:GitHub UI 的手动触发入口要求 workflow 文件
    存在于仓库默认分支;在此之前只有 push/PR 到 feat/v5-aurora-rewrite 会触发
    (对该分支的 push/PR 事件按事件所在 ref 读取 workflow,不受默认分支限制)。
+6. **biome lint 尚未进 CI**:`npm run lint`(`biome check packages`)当前
+   **3657 error / 38 warning** 存量(2026-07-26 实测,退出码 1)。直接挂进 CI 会让
+   所有 PR 永久红,等于把 required check 变成噪声。正确顺序是先立"新增文件必须
+   干净"的增量门(biome 只扫改动文件),再分批清存量,最后才把全量 `npm run lint`
+   提为硬门。本轮只把 `lint:scheduler-wiring` 与 `lint:agent-containers-sql`
+   两条**已经是绿的**规则挂进 lint job。
+7. **`test:v5:ops` 仍是显式文件清单**:`scripts/__tests__/` 下有
+   `v5ModelAuthorityRollback` / `v5MutationLease` / `v5RuntimeReleaseLib` /
+   `v5SelfhealDrillSafety` 四个测试文件,全仓无任何 script / workflow / 文档引用
+   —— 写了从来没跑过。本机实跑 4 个文件共 40 断言,其中
+   `v5 runtime-release lib (hotcfg core)` 一条红(疑与本机 docker/权限环境有关,
+   未定性)。因为不能带着红进 CI,本轮只补挂了 `knownFailuresGate.test.ts`,
+   其余四个连同"改成递归 `find` 发现"一起留到下一轮。

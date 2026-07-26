@@ -149,9 +149,16 @@ describe("streamImageToHost", () => {
     // 同 image 但不同 hostId → 必须**不**合流(key 含 hostId)
     const p3 = streamImageToHost(target, "img:tag", { hostId: "host-B", logger: spyLogger });
 
-    const e1 = await p1.then(() => null, (e: Error) => e);
-    const e2 = await p2.then(() => null, (e: Error) => e);
-    const e3 = await p3.then(() => null, (e: Error) => e);
+    // handler 必须在**同步阶段**就挂上。若写成 `await p1.then(...)` 再 `await p2.then(...)`,
+    // p2/p3 从创建到附加 handler 之间存在一段 await 窗口;它们在窗口内 reject 就会被
+    // node:test 记成 unhandledRejection 而整条用例红(CI 上已实际发生:
+    // `pre-check inspect failed: ssh failed on 127.0.0.1:1: exit=255`)。
+    const r1 = p1.then(() => null, (e: Error) => e);
+    const r2 = p2.then(() => null, (e: Error) => e);
+    const r3 = p3.then(() => null, (e: Error) => e);
+    const e1 = await r1;
+    const e2 = await r2;
+    const e3 = await r3;
 
     assert.ok(e1 instanceof ImageDistributeError, `p1 应失败于传输层,实际 ${e1}`);
     assert.strictEqual(e2, e1, "同 hostId+image 的第二次调用必须合流到同一个 in-flight promise");

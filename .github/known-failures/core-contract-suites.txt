@@ -1,0 +1,59 @@
+# 核心契约套件 —— 禁豁免清单。
+#
+# 这里的每个顶层套件名,只要出现在任何 known-failures 基线文件里,
+# .github/scripts/diff-known-failures.sh 判据 E 就直接把门判红。
+# 换句话说:这些用例**不许被登记成"已知存量失败"**,只能修。
+#
+# 匹配规则:基线条目 == 本清单某一行,或以 "<该行> " 开头
+#   (基线条目常写成 `<suite> — <case>` 形态,前缀匹配把整个套件都覆盖住)。
+#
+# ── 新增条目的判据(三条全中才加,加的时候把对应事实写进本行的注释) ──────────
+#   (1) 用户当场可见:该套件红掉之后,用户/管理员在界面上会直接看到错的东西
+#       (页面 404、回复丢失、计费数字不对、鉴权放行),而不是只在日志里难看;
+#   (2) 无声失效:线上出问题时不会有别的门或告警替它兜住 —— 它就是那道门;
+#   (3) 有事故前科或明确的单一权威语义:仓内有过真实事故,或它是某个"两处必须
+#       同步"的契约的机器校验点。
+#   反过来:只是"重要"、"覆盖率高"、"跑得慢"都不构成加入理由。
+#
+# 删除条目需要 boss 或主控明确裁定,并在 PR 描述里写清为什么这条事实不再是硬要求。
+#
+# 2026-07-26 首批登记(门禁审计):
+
+# 路由注册表:routes 与 prefixes 两处必须同步。漏登记 prefixes 曾导致 /goal
+# 相关 REST 全 404(boss 真机实报,PR#96)。红 = 用户点进去整片功能不存在。
+routeOwnership
+
+# 用户会话桥:前端 ↔ 网关 ↔ 容器的 turn 收发主链路。红 = 用户发消息没有回复,
+# 或历史消息丢失。
+userChatBridge
+
+# codex 引擎计费:turn 计费与积分扣减。红 = 多扣/少扣用户的钱。
+userChatBridgeCodexBilling
+
+# 无损 turn tape:回复正文的持久化与水合。红 = 已计费的回复在刷新后消失
+# (2026-07-17 tail 洪水/乱序事故就在这层)。
+losslessTurnTape
+
+# 媒体签名鉴权:附件/图片的取用凭证。红 = 越权读到别人的文件,或用户自己的
+# 附件 401 打不开(国产内核下载必须走 ticket 化 URL)。
+mediaSignAuth
+
+# 迁移号唯一性:并行分支撞号会让某条迁移在生产被跳过。红 = 上线后 schema 与
+# 代码不一致,功能整片报错。
+migrationNumbering
+
+# 迁移 capability_profile 契约:catalog 的 capability_profile 必须 snake_case,
+# camelCase 曾让模型面 503 六分钟。红 = 用户选不了模型。
+migrationCapabilityProfiles
+
+# 静态 provider 守门:模型/供应商清单的单一权威。红 = 模型路由指向不存在的
+# provider,用户发消息直接报错。
+staticProviderGuard
+
+# usage_records 别名守门:计费表禁止别名读写(仓内明令)。红 = 用量统计与账单
+# 对不上。
+usageRecordsAliasGuard
+
+# 平台默认模型必须已配置:没有默认模型时新会话无法开始。红 = 新用户第一条消息
+# 就失败。
+assertPlatformDefaultModelConfigured

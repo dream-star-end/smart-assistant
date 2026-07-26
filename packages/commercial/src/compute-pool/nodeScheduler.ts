@@ -53,6 +53,9 @@ export interface ScheduleOptions {
  * 这里临时从 agent_containers 最多 1 条已有行的 bound_ip 反推 /24 前缀。
  */
 async function bridgeCidrFromExisting(hostId: string): Promise<string | null> {
+  // lint-agent-containers-sql: allow — 只从历史 bound_ip 反推 host 的 /24 网段,
+  // vanished 行的 IP 同样能证明网段(样本反而更全)。结果只喂 installBridge 的
+  // CIDR 推断,不进用户可见视图 / 计费聚合。
   const r = await getPool().query<{ bound_ip: string }>(
     `SELECT bound_ip
        FROM agent_containers

@@ -4295,7 +4295,6 @@ interface MonitorFixtureOptions {
   args?: string[]
   allHealthy?: boolean
   markerMode?: number
-  checkV3?: boolean
   marker?: Record<string, unknown>
   state?: Record<string, unknown>
   egressBad?: boolean
@@ -4338,7 +4337,6 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     args = ['--dry-run'],
     allHealthy = false,
     markerMode = 0o600,
-    checkV3 = false,
     marker = schema1Marker(),
     state = { checks: {} },
     egressBad = false,
@@ -4426,7 +4424,6 @@ esac
     V5MON_MAINTENANCE_FILE: path.join(dir, 'marker'),
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
     V5MON_CUTOVER_ROOT: cutoverRoot,
-    V5MON_CHECK_V3: checkV3 ? '1' : '0',
     V5MON_CONDITIONS: conditions ? '1' : '0',
   })
   return Object.assign(result, { statePath, logPath, psqlCalls })
@@ -4809,24 +4806,26 @@ describe('v5 monitor planned-maintenance scope', () => {
     assert.equal((markerSection.match(/cat "\$MAINTENANCE_FILE"/g) ?? []).length, 1)
   })
 
-  test('valid marker suppresses only expected v5/public failures and v3 is off by default', async () => {
+  test('valid marker suppresses only expected v5/public failures', async () => {
     const result = await monitorFixture()
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /PLANNED svc_v5/)
     assert.match(result.stdout, /PLANNED http_v5/)
     assert.match(result.stdout, /PLANNED public_route/)
     assert.doesNotMatch(result.stdout, /EVENT ❌ \*\*(svc_v5|http_v5|public_route)\*\*/)
+    // v3 于 2026-07-08 彻底下线,http_v3 探测项与 V5MON_CHECK_V3 开关已从 monitor 摘除;
+    // 契约由 packages/commercial/src/__tests__/opsMonitorConditionContract.test.ts 兜底。
     assert.doesNotMatch(result.stdout, /http_v3/)
   })
 
-  test('invalid marker fails open and explicit v3 check is still available', async () => {
-    const result = await monitorFixture({ checkV3: true, marker: schema1Marker({ schema: 3 }) })
+  test('invalid marker fails open', async () => {
+    const result = await monitorFixture({ marker: schema1Marker({ schema: 3 }) })
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /fail-open to normal alerts/)
     assert.match(result.stdout, /EVENT ❌ \*\*svc_v5\*\*/)
     assert.match(result.stdout, /EVENT ❌ \*\*http_v5\*\*/)
     assert.match(result.stdout, /EVENT ❌ \*\*public_route\*\*/)
-    assert.match(result.stdout, /http_v3/)
+    assert.doesNotMatch(result.stdout, /http_v3/)
   })
 
   test('schema1 without its trusted cutover manifest fails open', async () => {
