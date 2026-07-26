@@ -1,5 +1,24 @@
 import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
+import { extendTailwindMerge } from "tailwind-merge";
+
+/**
+ * tailwind-merge 必须认识本仓自定义的语义字号档位(styles.css @theme 的
+ * --text-title/section/body/meta/caption/micro)。
+ *
+ * 不注册会怎样(2026-07-26 实测):tailwind-merge 对 `text-*` 有两个类组 ——
+ * font-size(只认原厂 xs/sm/base/… 与任意值)和 text-color(兜底,任何后缀都收)。
+ * `text-meta` 不在原厂字号表里,于是被判成**颜色**,和 `text-success` 归进同一组互斥,
+ * 后写的那个把先写的**静默吃掉**:`cn("text-success", "text-meta")` → 只剩 text-meta
+ * (徽章变成默认前景色),反过来写则字号丢失。这个坑没有任何报错,只有肉眼能发现,
+ * 且随语义字号推广到全仓会成规模爆发 —— 所以权威修在 cn() 这一处,不在各调用点绕。
+ */
+const twMerge = extendTailwindMerge({
+  extend: {
+    classGroups: {
+      "font-size": [{ text: ["title", "section", "body", "meta", "caption", "micro"] }],
+    },
+  },
+});
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));

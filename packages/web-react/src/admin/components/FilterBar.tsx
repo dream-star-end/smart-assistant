@@ -64,7 +64,12 @@ export function SearchInput({
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         placeholder={placeholder}
-        className="h-9 w-full pl-9 text-sm sm:w-56"
+        // 两处刻意不写:
+        // 1. 字号 —— Input 自带 `text-base md:text-sm`(移动端 ≥16px 防 iOS 聚焦缩放),
+        //    这里原先硬写 text-sm 会把这道防线击穿;
+        // 2. 触控靶 —— Input 的 controlSurfaceClass 已带 `[@media(hover:none)]:min-h-11`,
+        //    min-height 会盖过这里的 h-9,调用方不必再补。
+        className="h-9 w-full pl-9 sm:w-56"
       />
     </div>
   );
@@ -90,6 +95,8 @@ export function SelectFilter<V extends string = string>({
   const current = options.find((o) => o.value === value);
   return (
     <DropdownMenu>
+      {/* 触发器触控靶不在这里补:Button 的 sm 档已带 `[@media(hover:none)]:min-h-11`。
+          注意 asChild 走 Children.only,槽位里只能有这一个元素。 */}
       <DropdownMenuTrigger asChild>
         <Button variant="secondary" size="sm" className={cn("gap-1.5", className)}>
           {label && <span className="text-faint">{label}</span>}
@@ -145,7 +152,9 @@ export function RangePreset({
             aria-pressed={active}
             onClick={() => onChange(o.value)}
             className={cn(
-              "rounded-md px-2.5 py-1 text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+              "rounded-md px-2.5 py-1 text-meta font-medium transition-colors",
+              "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg",
+              "[@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
               active ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
             )}
           >

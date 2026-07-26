@@ -1,7 +1,11 @@
-import { ChevronLeft, ChevronRight, Inbox } from "lucide-react";
+import { Inbox } from "lucide-react";
 import type { ReactNode } from "react";
-import { EmptyState, IconButton, Skeleton } from "../../components/ui";
+import { EmptyState, Skeleton } from "../../components/ui";
 import { cn } from "../../lib/utils";
+
+// 配套的 <Pagination/> 已提升为全站原语(components/ui/Pagination.tsx)——
+// 翻页是"分页语义"不是"表格语义",用户侧的卡片列表同样要用。
+// DataTable 本身留在 admin:用户侧是卡片列表,不需要表格。
 
 export type Column<T> = {
   /** 列 key；无 render 时用作 `row[key]` 取值，也用作表头 React key。 */
@@ -60,7 +64,7 @@ export function DataTable<T>({
                 key={c.key}
                 style={c.width ? { width: c.width } : undefined}
                 className={cn(
-                  "whitespace-nowrap px-3 py-2.5 text-[12px] font-medium text-faint",
+                  "whitespace-nowrap px-3 py-2.5 text-meta font-medium text-faint",
                   alignClass[c.align ?? "left"],
                   c.headClassName,
                 )}
@@ -100,15 +104,16 @@ export function DataTable<T>({
                 }
                 className={cn(
                   "border-b border-border/60 last:border-0",
+                  // 可点行:触屏下整行撑到 44px 靶面;焦点环走 inset(行贴着表格边,外扩环会被裁)。
                   onRowClick &&
-                    "cursor-pointer outline-none transition-colors hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                    "cursor-pointer outline-none transition-colors hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:h-11",
                 )}
               >
                 {columns.map((c) => (
                   <td
                     key={c.key}
                     className={cn(
-                      "px-3 py-2.5 text-[13px] text-fg",
+                      "px-3 py-2.5 text-body text-fg",
                       alignClass[c.align ?? "left"],
                       c.cellClassName,
                     )}
@@ -125,63 +130,6 @@ export function DataTable<T>({
 
       {showEmpty &&
         (empty ?? <EmptyState icon={Inbox} title={emptyTitle} hint={emptyHint} />)}
-    </div>
-  );
-}
-
-/**
- * offset/limit 分页条（与后端 `?offset=&limit=` 约定一致）。
- *  - 传 total → 精确页码 + 末页禁用；
- *  - 不传 total → 用本页 count 判末页（count < limit 即末页，keyset 分页常用）。
- */
-export function Pagination({
-  offset,
-  limit,
-  count,
-  total,
-  onChange,
-  className,
-}: {
-  offset: number;
-  limit: number;
-  /** 当前页返回的行数（用于无 total 时判末页）。 */
-  count: number;
-  total?: number;
-  onChange: (nextOffset: number) => void;
-  className?: string;
-}) {
-  const atStart = offset <= 0;
-  const atEnd = total !== undefined ? offset + limit >= total : count < limit;
-  const from = count === 0 ? 0 : offset + 1;
-  const to = offset + count;
-
-  return (
-    <div className={cn("flex items-center justify-between gap-3 px-1 py-2", className)}>
-      <p className="text-[12px] text-faint tabular-nums">
-        {total !== undefined ? `${from}–${to} / 共 ${total}` : `${from}–${to}`}
-      </p>
-      <div className="flex items-center gap-1">
-        <IconButton
-          size="sm"
-          shape="square"
-          disabled={atStart}
-          onClick={() => onChange(Math.max(0, offset - limit))}
-          title="上一页"
-          aria-label="上一页"
-        >
-          <ChevronLeft size={16} />
-        </IconButton>
-        <IconButton
-          size="sm"
-          shape="square"
-          disabled={atEnd}
-          onClick={() => onChange(offset + limit)}
-          title="下一页"
-          aria-label="下一页"
-        >
-          <ChevronRight size={16} />
-        </IconButton>
-      </div>
     </div>
   );
 }

@@ -28,7 +28,9 @@ describe("StatCard", () => {
     const { container } = render(<StatCard label="今日收入" value="¥1,234" loading />);
     expect(screen.queryByText("¥1,234")).toBeNull();
     expect(screen.queryByText("今日收入")).toBeNull();
-    expect(container.querySelector(".animate-pulse")).toBeTruthy();
+    // 断言骨架底色 token 而非具体动效类:Skeleton 的动画实现(animate-pulse → oc-shimmer 扫光)
+    // 属于原语内部细节,bg-skeleton 才是"这里在加载"的稳定标记。
+    expect(container.querySelector(".bg-skeleton")).toBeTruthy();
   });
 });
 
@@ -59,7 +61,7 @@ describe("DataTable", () => {
     const { container } = render(
       <DataTable columns={columns} rows={[]} rowKey={(r) => r.id} loading skeletonRows={3} />,
     );
-    expect(container.querySelectorAll(".animate-pulse").length).toBeGreaterThan(0);
+    expect(container.querySelectorAll(".bg-skeleton").length).toBeGreaterThan(0);
     // loading 时不显示空态
     expect(screen.queryByText("暂无数据")).toBeNull();
   });

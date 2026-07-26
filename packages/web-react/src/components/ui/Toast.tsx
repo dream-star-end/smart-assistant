@@ -14,7 +14,7 @@ import { cn } from "../../lib/utils";
 /**
  * 极简 toast 原语（web-react 唯一 toast 权威源）。
  *
- * 为什么自滚而非引第三方：只需"短暂提示 + 自隐"，无需队列优先级/动作按钮等重特性；
+ * 为什么自滚而非引第三方：只需"短暂提示 + 自隐"，无需队列优先级等重特性；
  * 自滚零依赖、与 Aurora token 对齐。用于 GitHub OAuth 返回提示、仓库绑定错误等
  * 一次性反馈（持久态仍用 Alert/Banner）。
  *
@@ -22,9 +22,27 @@ import { cn } from "../../lib/utils";
  */
 export type ToastTone = "success" | "error" | "info";
 
-type ToastItem = { id: number; message: string; tone: ToastTone };
+/**
+ * 可选动作。存在的理由:错误 toast 是全仓最常见的失败出口(仅 App.tsx 就有十余处
+ * `toast(…, "error")`),而它此前**没有任何出口** —— 用户读完"原始消息加载失败，请重试"
+ * 只能自己去找哪里能重试。带 action 的 toast 让失败即可原地重试。
+ */
+export type ToastOptions = {
+  actionLabel?: string;
+  onAction?: () => void;
+};
 
-const ToastContext = createContext<((message: string, tone?: ToastTone) => void) | null>(null);
+export type ToastFn = (message: string, tone?: ToastTone, options?: ToastOptions) => void;
+
+type ToastItem = {
+  id: number;
+  message: string;
+  tone: ToastTone;
+  actionLabel?: string;
+  onAction?: () => void;
+};
+
+const ToastContext = createContext<ToastFn | null>(null);
 
 const TONE_STYLE: Record<ToastTone, { icon: ReactNode; cls: string }> = {
   success: { icon: <CheckCircle2 size={16} />, cls: "border-success/40 bg-success-soft text-success" },
@@ -51,14 +69,25 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     dismissTimers.current.clear();
   }, []);
 
-  const toast = useCallback(
-    (message: string, tone: ToastTone = "info") => {
+  const toast = useCallback<ToastFn>(
+    (message, tone = "info", options) => {
       if (!message) return;
       const id = ++seq.current;
-      setItems((cur) => [...cur, { id, message, tone }]);
+      const actionable = Boolean(options?.actionLabel && options?.onAction);
+      setItems((cur) => [
+        ...cur,
+        {
+          id,
+          message,
+          tone,
+          actionLabel: actionable ? options?.actionLabel : undefined,
+          onAction: actionable ? options?.onAction : undefined,
+        },
+      ]);
       // 错误提示不自动消失(可达性:屏幕阅读器/慢读用户不会因 3.5s 自隐而错过失败原因;
-      // 用户可点 X 关闭)。成功/信息类保持短暂自隐。
-      if (tone !== "error") {
+      // 用户可点 X 关闭)。带动作的提示同理 —— 等着用户做决定的东西不能自己溜走。
+      // 其余成功/信息类保持短暂自隐。
+      if (tone !== "error" && !actionable) {
         const timer = window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
         dismissTimers.current.set(id, timer);
       }
@@ -80,17 +109,31 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               role={t.tone === "error" ? "alert" : "status"}
               aria-live={t.tone === "error" ? "assertive" : "polite"}
               className={cn(
-                "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-[13px] font-medium shadow-float backdrop-blur data-[state=open]:animate-in sm:max-w-md",
+                "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-body font-medium shadow-float backdrop-blur data-[state=open]:animate-in sm:max-w-md",
                 s.cls,
               )}
             >
               <span className="shrink-0">{s.icon}</span>
               <span className="min-w-0 flex-1 break-words">{t.message}</span>
+              {t.actionLabel && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    t.onAction?.();
+                    // 动作触发即收起:提示已经完成使命,留着只会挡住动作的结果。
+                    dismiss(t.id);
+                  }}
+                  className="shrink-0 rounded-md px-2 py-1 font-semibold underline underline-offset-2 outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11"
+                >
+                  {t.actionLabel}
+                </button>
+              )}
               <button
                 type="button"
                 aria-label="关闭提示"
                 onClick={() => dismiss(t.id)}
-                className="-mr-1 shrink-0 rounded-md p-0.5 opacity-70 outline-none transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring"
+                // 触控靶:原来 p-0.5 的关闭键只有 ~22px,在触屏上属于"看得见点不中"。
+                className="-mr-1 flex shrink-0 items-center justify-center rounded-md p-0.5 opacity-70 outline-none transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:size-11"
               >
                 <X size={14} />
               </button>
@@ -106,7 +149,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
  * 取 toast 函数。在 ToastProvider 之外调用返回 no-op（不抛），让无 Provider 的
  * 单元测试 / demo 子树也能安全调用。
  */
-export function useToast(): (message: string, tone?: ToastTone) => void {
+export function useToast(): ToastFn {
   const ctx = useContext(ToastContext);
   return useMemo(() => ctx ?? (() => {}), [ctx]);
 }
