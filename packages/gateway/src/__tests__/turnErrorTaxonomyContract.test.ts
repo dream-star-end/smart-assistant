@@ -11,13 +11,16 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/turnErrorTaxonomyContract.test.ts
  */
 import * as assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   OutboundError,
   isKnownTurnErrorCode,
   normalizeTurnErrorCode,
 } from '@openclaude/protocol'
-import { classifyRunError } from '../errorClassify.js'
+import { classifyDelegateOutputError, classifyRunError } from '../errorClassify.js'
 import { _tapeErrorCodeForGenericFailure } from '../sessionManager.js'
 
 /** 用代表性错误串驱动 classifyRunError,收集所有非 unknown 产出码(行为断言,
@@ -27,7 +30,117 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
   { input: '429 Too Many Requests', code: 'rate_limited' },
   { input: 'Selected model is at capacity. Please try a different model.', code: 'model_capacity' },
   { input: 'Anthropic returned 502 Bad Gateway', code: 'upstream_failed' },
+  {
+    input: "prompt is too long: ran out of room in the model's context window",
+    code: 'context_too_long',
+  },
 ]
+
+/**
+ * 只经 `classifyDelegateOutputError` 产出、classifyRunError 不产的码(delegate
+ * 子 agent 输出面)。分开列是因为两个入口的**值域不同**(DelegateOutputError.code
+ * = ClassifiedErrorCode | 'bad_request'),不能混进 classifyRunError 的驱动集。
+ */
+const DELEGATE_ONLY_SAMPLES: Array<{ input: string; code: string }> = [
+  {
+    input: 'API Error: 400 {"error":{"code":"BAD_BODY","message":"invalid request body"}}',
+    code: 'bad_request',
+  },
+]
+
+// ── 覆盖率权威:errorClassify 声明的产出码全集(不再手工维护第二份清单)────────
+//
+// 2026-07-26 门禁审计:本文件原来只手工列 4 条样例,却用全称措辞断言"**所有**非
+// unknown 产出码 ∈ TURN_ERROR_TAXONOMY" —— 实现只遍历自己列的那 4 条,
+// context_too_long / bad_request 从没被任何一条断言碰过(它们恰好是"上下文超长自动
+// 重建历史"和"子 agent 请求体无效"两条用户可见 UX 分支的码)。改为从 errorClassify
+// **导出的类型联合**派生全集,漏一个码即红。
+//
+// 为什么解析源码而不是 import 一个常量:`ClassifiedErrorCode` 是纯类型(运行时擦除),
+// 而本轮改动的文件所有权只含 __tests__。**根治方案**(留 followup):errorClassify.ts
+// 导出 `export const CLASSIFIED_ERROR_CODES = [...] as const` 并让类型从它派生,本处
+// 改为直接 import 该常量 —— 那时解析可整段删除。
+// 解析对象是**声明契约**(exported 类型联合的成员),不是实现细节:重排/重格式化联合
+// 成员不会让它红,只有增删码才会。锚点失效(重命名类型/改写声明)会 fail-loud 提示。
+const errorClassifySource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), '..', 'errorClassify.ts'),
+  'utf8',
+)
+
+function unionMembersAfter(anchor: string, endMarker: string): string[] {
+  const start = errorClassifySource.indexOf(anchor)
+  assert.ok(
+    start >= 0,
+    `errorClassify.ts 缺少锚点 '${anchor}' —— 产出码全集无法派生,` +
+      '请修正本测试的锚点(或改为 import 运行时导出的码集合)',
+  )
+  const rest = errorClassifySource.slice(start + anchor.length)
+  const end = rest.indexOf(endMarker)
+  assert.ok(end > 0, `锚点 '${anchor}' 之后未找到终止标记 —— 声明形状已变,请修正锚点`)
+  return [...rest.slice(0, end).matchAll(/'([a-z_]+)'/g)].map((m) => m[1]!)
+}
+
+/** classifyRunError / classifyDelegateOutputError 声明能产出的全部码(含 unknown)。 */
+const DECLARED_CODES: readonly string[] = (() => {
+  const classified = unionMembersAfter('export type ClassifiedErrorCode =', '\n\n')
+  // DelegateOutputError.code 的联合把 'bad_request' 加在 ClassifiedErrorCode 之上。
+  const delegateExtra = unionMembersAfter(
+    'export interface DelegateOutputError {',
+    '\n  /**',
+  )
+  return [...new Set([...classified, ...delegateExtra])]
+})()
+
+/** 非 unknown 的产出码 = 必须被样例集覆盖、且必须 ∈ taxonomy 的码。 */
+const DECLARED_PRODUCED_CODES = DECLARED_CODES.filter((c) => c !== 'unknown')
+
+describe('turnErrorTaxonomy 契约 — 产出码覆盖率(全集派生,漏一个即红)', () => {
+  it('锚点有效:派生出的码集合包含已知核心码且数量合理', () => {
+    // 锚点/正则若被未来的声明改写悄悄打空,这条先炸,避免覆盖率门静默降为 0 条。
+    for (const core of ['insufficient_credits', 'rate_limited', 'unknown', 'bad_request']) {
+      assert.ok(DECLARED_CODES.includes(core), `派生码集合缺少核心码 ${core}(锚点已失效)`)
+    }
+    assert.ok(
+      DECLARED_PRODUCED_CODES.length >= 5,
+      `派生的非 unknown 产出码只有 ${DECLARED_PRODUCED_CODES.length} 个,锚点可能已失效`,
+    )
+  })
+
+  it('每个声明的产出码都有代表串(新增码必须补样例,否则红)', () => {
+    const covered = new Set([
+      ...CLASSIFY_SAMPLES.map((s) => s.code),
+      ...DELEGATE_ONLY_SAMPLES.map((s) => s.code),
+    ])
+    const uncovered = DECLARED_PRODUCED_CODES.filter((code) => !covered.has(code))
+    assert.deepEqual(
+      uncovered,
+      [],
+      `errorClassify 声明能产出但本测试无任何代表串的码:${uncovered.join(', ')};` +
+        '修法=在 CLASSIFY_SAMPLES(classifyRunError 可命中)或 DELEGATE_ONLY_SAMPLES ' +
+        '补一条真实命中该码的错误串。没有样例 = 该码的 taxonomy/UX 语义从未被任何门校验。',
+    )
+    // 反向:样例集不许出现声明之外的幽灵码(否则覆盖率是假的)。
+    const ghosts = [...covered].filter((code) => !DECLARED_PRODUCED_CODES.includes(code))
+    assert.deepEqual(ghosts, [], `样例集里的码不在 errorClassify 声明值域内:${ghosts.join(', ')}`)
+  })
+
+  it('每个声明的产出码 ∈ TURN_ERROR_TAXONOMY(全集,不只样例)', () => {
+    for (const code of DECLARED_PRODUCED_CODES) {
+      assert.ok(
+        isKnownTurnErrorCode(code),
+        `errorClassify 产出码 ${code} 不在 protocol TURN_ERROR_TAXONOMY —— ` +
+          '前端按码渲染红卡/CTA 会落到 unknown 分支',
+      )
+    }
+  })
+
+  it('delegate 面代表串真的命中预期码(driver 有效)', () => {
+    for (const s of DELEGATE_ONLY_SAMPLES) {
+      const out = classifyDelegateOutputError(s.input)
+      assert.equal(out?.code, s.code, `delegate sample: ${s.input}`)
+    }
+  })
+})
 
 describe('turnErrorTaxonomy 契约 — classifyRunError 产出码', () => {
   it('每个代表串真的命中预期码(锚定驱动集有效)', () => {
