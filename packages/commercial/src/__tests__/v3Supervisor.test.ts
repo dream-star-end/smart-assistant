@@ -55,6 +55,7 @@ import {
   classifyRuntimeArtifactFailure,
 } from "../agent-sandbox/index.js";
 import { buildCodexRelayLocalBaseUrl } from "../http/internalCodexRelay.js";
+import { resetPool, setPoolOverride } from "../db/index.js";
 
 // ───────────────────────────────────────────────────────────────────────
 //  fake docker
@@ -256,9 +257,35 @@ type FakeRow = {
   updated_at: Date;
 };
 
+/** v3MayServe 读的 users 迁移状态行(channelMigration/channelState.getChannelState)。 */
+type FakeChannelRow = {
+  v5_migrated_at: Date | null;
+  v5_migration_status: "seeding" | "migrating" | "migrated" | "rolled_back" | null;
+};
+
+/**
+ * 当前活跃的 FakePool —— 由 FakePool 构造函数登记(见下方 globalPoolDelegate)。
+ * 每个 `new FakePool()` 都会顶掉上一个;单文件内 test 顺序执行,不存在交错。
+ */
+let activeFakePool: FakePool | null = null;
+
 class FakePool {
   rows: FakeRow[] = [];
   nextId = 1;
+  /**
+   * v3→v5 迁移门控 fixture:`provisionV3Container` 在 v3 channel 下先调
+   * `v3MayServe(uid)` → `getChannelState` → **全局** `getPool()`(不是 deps.pool)。
+   * key = uid(字符串),缺省 = 未迁移(两列都 NULL)→ 门放行。
+   * 用 `setChannelState()` 注入 migrated / migrating 可验证门确实拦得住。
+   */
+  channelRows: Map<string, FakeChannelRow> = new Map();
+  setChannelState(uid: number | string, row: FakeChannelRow): void {
+    this.channelRows.set(String(uid), row);
+  }
+
+  constructor() {
+    activeFakePool = this;
+  }
   /** 第几次 connect 时返回的 client。每次 BEGIN/COMMIT/ROLLBACK 都记。 */
   clientLog: Array<"BEGIN" | "COMMIT" | "ROLLBACK"> = [];
   /** test 钩子:第 N 次 INSERT 强制抛 23505(模拟 uniq 冲突),序号从 0 开始 */
@@ -304,6 +331,16 @@ class FakePool {
         // user-lifecycle 锁 + host-cap 锁,FakePool 不模拟真锁语义,直接 noop。
         if (/^SELECT pg_advisory_xact_lock/i.test(trimmed)) {
           return { rowCount: 0, rows: [] };
+        }
+        // v3→v5 迁移门控读 users(channelState.getChannelState)。走**全局** pool,
+        // 由 globalPoolDelegate 转发到本 FakePool。缺省未迁移 → v3MayServe 放行。
+        if (/SELECT v5_migrated_at, v5_migration_status\s+FROM users/i.test(trimmed)) {
+          const uid = String(params![0]);
+          const row = self.channelRows.get(uid) ?? {
+            v5_migrated_at: null,
+            v5_migration_status: null,
+          };
+          return { rowCount: 1, rows: [row] };
         }
         if (/INSERT INTO agent_containers/i.test(trimmed)) {
           const idx = self.insertCount++;
@@ -453,6 +490,53 @@ class FakePool {
     return Promise.resolve();
   }
 }
+
+// ───────────────────────────────────────────────────────────────────────
+//  全局 pool 委派(v3MayServe 门控用)
+// ───────────────────────────────────────────────────────────────────────
+//
+// provisionV3Container 在 v3 channel 下先跑 v3→v5 迁移门控 v3MayServe(uid),
+// 它走 db/index.ts 的**全局** getPool() —— 不是 deps.pool。单测进程里没有
+// DATABASE_URL/REDIS_URL,全局 getPool() 会 loadConfig() 抛 ConfigError,
+// 于是 provision/stop/status 8 个套件整体挂掉(2026-07 前长期躺在
+// .github/known-failures/commercial-unit.txt 里,等于容器供给主路径无门禁)。
+//
+// 修法:把全局 pool 指向"当前 FakePool"。门控**真跑**(默认放行),不是被绕过;
+// 新增用例零接线 —— FakePool 构造即登记 activeFakePool。
+// 不设 DATABASE_URL 走真 createPool 是有意的:单测不该依赖 PG fixture。
+const globalPoolDelegate = {
+  query(sql: string, params?: unknown[]): Promise<unknown> {
+    if (!activeFakePool) {
+      return Promise.reject(
+        new Error("global pool used before any FakePool was constructed"),
+      );
+    }
+    return activeFakePool.query(sql, params);
+  },
+  connect(): Promise<PoolClient> {
+    if (!activeFakePool) {
+      return Promise.reject(
+        new Error("global pool used before any FakePool was constructed"),
+      );
+    }
+    return activeFakePool.connect();
+  },
+  end(): Promise<void> {
+    return Promise.resolve();
+  },
+} as unknown as Pool;
+
+before(async () => {
+  // 先 resetPool:setPoolOverride 在"已有单例"时会抛(见 db/index.ts),
+  // 若同进程内有 import side effect 触发过 getPool() 就会炸在 before 里。
+  await resetPool();
+  setPoolOverride(globalPoolDelegate);
+});
+
+after(async () => {
+  activeFakePool = null;
+  await resetPool();
+});
 
 // ───────────────────────────────────────────────────────────────────────
 //  helpers
@@ -962,6 +1046,40 @@ describe("provisionV3Container", () => {
     // Tx2 走 pool.query(不 connect),不追加事务记录;成功后 clientLog 仍是 BEGIN→COMMIT。
     assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
     assert.equal(pool.rows[0]!.container_internal_id, "dockerid-1", "Tx2 已写 cid");
+  });
+
+  // v3→v5 迁移门控(channelState.v3MayServe):v3 绝不给"已迁移 / 迁移中"的用户
+  // 重建容器 —— 否则它会重新成为该用户卷的写者,与 v5 权威撞车/破坏卷迁移一致性。
+  // 门在 provisionV3Container 最前面(BEGIN / docker 副作用之前)。
+  for (const [label, row] of [
+    ["已迁移(v5_migrated_at NOT NULL)", { v5_migrated_at: new Date(), v5_migration_status: "migrated" as const }],
+    ["迁移中(status=migrating)", { v5_migrated_at: null, v5_migration_status: "migrating" as const }],
+  ] as const) {
+    test(`v3 channel + ${label} → MigratedToV5 拒建,零 docker 副作用零事务`, async () => {
+      const { docker, captured } = makeDocker();
+      pool.setChannelState(4242, row);
+      await assert.rejects(
+        provisionV3Container(
+          { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.6.6", randomSecret: fixedSecret("b".repeat(64)) },
+          4242,
+        ),
+        (err: Error) => err instanceof SupervisorError && err.code === "MigratedToV5",
+      );
+      assert.deepEqual(pool.clientLog, [], "门必须早于 BEGIN");
+      assert.equal(pool.rows.length, 0, "不得留 agent_containers 行");
+      assert.equal(captured.containersCreated.length, 0, "不得 docker create");
+      assert.equal(captured.volumesCreated.length, 0, "不得建卷");
+    });
+  }
+
+  test("v3 channel + 用户未迁移(两列 NULL)→ 门放行,provision 正常", async () => {
+    const { docker, captured } = makeDocker();
+    pool.setChannelState(4243, { v5_migrated_at: null, v5_migration_status: null });
+    await provisionV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.6.7", randomSecret: fixedSecret("c".repeat(64)) },
+      4243,
+    );
+    assert.equal(captured.containersCreated.length, 1);
   });
 
   test("rejects bad image / uid", async () => {
@@ -3407,6 +3525,15 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
   let prevOptional: string | undefined;
   let prevGuard: string | undefined;
 
+  // provision 前置其实有**两个**互相独立的 image label 门,各自 inspect 一次同一 image:
+  //   ① assertImageHasV3Sink       —— oc.runtime.features 必含 v3-sink;受 OC_V3_IMAGE_GUARD 控制
+  //   ② assertRuntimeSourcePresent —— 瘦身镜像护栏(oc.runtime.embed_source=0 且无
+  //      OC_RUNTIME_RELEASE → 拒 provision);**不受** OC_V3_IMAGE_GUARD 控制,后加的门
+  // 本组用例写于只有 ① 的年代,期望值还停在 1/0,②上线后就再没绿过。
+  // 计数仍是硬断言(不改成 >=1):少一次 = 有一个门被误删或被 short-circuit,必须红。
+  const INSPECTS_BOTH_GUARDS = 2;
+  const INSPECTS_SOURCE_GUARD_ONLY = 1; // OC_V3_IMAGE_GUARD=off:① 短路,② 照跑
+
   before(() => {
     prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
@@ -3472,7 +3599,11 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
         },
         9001,
       );
-      assert.equal(captured.imageInspected, 1, "guard 必须 inspect image 一次");
+      assert.equal(
+        captured.imageInspected,
+        INSPECTS_BOTH_GUARDS,
+        "v3-sink guard + 瘦身镜像 guard 各 inspect 一次",
+      );
       assert.equal(captured.containersCreated.length, 1, "image 合规 → docker create 走通");
     } finally {
       restoreGuardEnv();
@@ -3645,7 +3776,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
     }
   });
 
-  test("off 模式 → guard 完全 short-circuit,docker.getImage 不被调", async () => {
+  test("off 模式 → v3-sink guard short-circuit(瘦身镜像 guard 仍跑)", async () => {
     try {
       const { docker, captured } = makeDocker({
         // 故意给一个 guard 会拒的 labels — off 模式下根本不应被读
@@ -3656,7 +3787,13 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
         { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.7.8", randomSecret: fixedSecret("1".repeat(64)) },
         9008,
       );
-      assert.equal(captured.imageInspected, 0, "off 模式不应触发 docker.getImage");
+      // off 只关掉 ①(v3-sink);② 瘦身镜像 guard 不受该 env 控制,仍 inspect 一次。
+      // 若这里变回 2 = ① 的 off 分支失效(env 逃生口被吃掉),若变 0 = ② 被误删。
+      assert.equal(
+        captured.imageInspected,
+        INSPECTS_SOURCE_GUARD_ONLY,
+        "off 只短路 v3-sink guard,瘦身镜像 guard 仍 inspect",
+      );
       assert.equal(captured.containersCreated.length, 1, "provision 应通过");
     } finally {
       restoreGuardEnv();
@@ -3740,7 +3877,11 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
         undefined,
         "172.30.42.0/24",
       );
-      assert.equal(counters.inspectImageCalls, 1, "facade 路径应调 containerService.inspectImage 一次");
+      assert.equal(
+        counters.inspectImageCalls,
+        INSPECTS_BOTH_GUARDS,
+        "facade 路径下两个 image guard 都必须走 containerService.inspectImage",
+      );
       assert.equal(captured.imageInspected, 0, "facade 路径绝不能 fallback 到本机 docker.getImage");
     } finally {
       restoreGuardEnv();
@@ -3811,7 +3952,7 @@ describe("provisionV3Container — image label guard (v1.0.84 PR #4)", () => {
         undefined,
         "172.30.42.0/24",
       );
-      assert.equal(counters.inspectImageCalls, 1);
+      assert.equal(counters.inspectImageCalls, INSPECTS_BOTH_GUARDS);
       assert.ok(pool.clientLog.includes("BEGIN"));
       assert.ok(pool.clientLog.includes("COMMIT"));
     } finally {
