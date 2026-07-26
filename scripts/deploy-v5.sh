@@ -2385,9 +2385,16 @@ assert_no_open_gate_waivers() {
 # 每个 key 一次),分别记 = 重复 ssh + 权威分裂。豁免的权威语义是「操作者声明要跳过这道门」,
 # 所以记账点就是声明点 = lane 入口。fail-closed:记不上就不给跑(否则又回到"豁免无痕")。
 record_declared_gate_waivers() {
-  local key rc=0
+  local key modes rc=0
   for key in $GATE_WAIVER_KEYS; do
     gate_waiver_env_active "$key" || continue
+    # 本 lane 根本不跑该门时,豁免它是空操作(如在 deploy lane 设 OC_CAPMATRIX_COMPAT ——
+    # capability matrix 只在 canary 跑)。空操作不该欠债,否则一次操作者笔误会凭空阻断下次发布。
+    modes="$(gate_waiver_repay_modes "$key")" || { rc=1; continue; }
+    if ! grep -qw -- "$MODE" <<<"$modes"; then
+      echo "  · 忽略与本 lane 无关的豁免声明 key=$key(本 lane=$MODE 不跑该门;它只在 $modes 生效)"
+      continue
+    fi
     record_gate_waiver "$key" "lane 入口声明豁免(mode=$MODE)" || rc=1
   done
   [[ "$rc" == 0 ]] || {

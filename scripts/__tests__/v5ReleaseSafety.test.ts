@@ -5769,6 +5769,11 @@ wait $!
     )
     assert.match(declared, /for key in \$GATE_WAIVER_KEYS/, '入口记账必须遍历整个注册表')
     assert.match(declared, /return 1/, '入口记账失败必须拒绝发布')
+    assert.match(
+      declared,
+      /忽略与本 lane 无关的豁免声明/,
+      '本 lane 不跑的门,豁免它是空操作 —— 不该欠债(否则笔误会凭空阻断下次发布)',
+    )
     // ③ 闸的挂载点与放行集合:恢复/回退 lane 永不被阻断(回退优先于任何新门)。
     const gateBlock = source.slice(
       source.indexOf('# 门禁豁免债务闸(2026-07-26)'),
