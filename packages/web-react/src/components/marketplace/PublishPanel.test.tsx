@@ -100,6 +100,41 @@ test("填齐必填(分类+适用场景)→ 提交,请求体带 category/useCases
   expect(await screen.findByText("已提交，等待平台审核")).toBeInTheDocument();
 });
 
+test("校验失败的错误落在出错字段上(aria-invalid),而不是只在表单顶部飘一条 Alert", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+
+  render(<PublishPanel auth={auth} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  fillBaseFields();
+  fireEvent.click(screen.getByRole("button", { name: /发布到市场/ }));
+
+  // 分类没选 → 分类控件自身被标记为 invalid,且错误文案与它 aria-describedby 关联。
+  const category = await screen.findByRole("combobox");
+  await waitFor(() => expect(category).toHaveAttribute("aria-invalid", "true"));
+  const message = screen.getByText("请为它选择一个分类");
+  expect(category.getAttribute("aria-describedby") ?? "").toContain(message.id);
+});
+
+test("切换发布类型不丢草稿:写好的 SKILL.md 正文切走再切回仍在", async () => {
+  listSkills.mockResolvedValue([]);
+  listMarketplaceMyPublishes.mockResolvedValue([]);
+  getPublicModels.mockResolvedValue([{ id: "glm-5.2", displayName: "GLM" }]);
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<PublishPanel auth={auth} />);
+  await screen.findByPlaceholderText("例：学术翻译");
+  fireEvent.change(screen.getByPlaceholderText(/描述这个技能何时触发/), {
+    target: { value: "# 我的技能正文" },
+  });
+
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
+  await screen.findByPlaceholderText("例：法律顾问");
+  fireEvent.click(screen.getByRole("tab", { name: "发布技能" }));
+
+  expect(await screen.findByPlaceholderText(/描述这个技能何时触发/)).toHaveValue("# 我的技能正文");
+});
+
 test("API 插件展示 AI 创建入口，同时保持 connector kind 的旧调用兼容", async () => {
   listSkills.mockResolvedValue([]);
   listMarketplaceMyPublishes.mockResolvedValue([]);
@@ -107,7 +142,8 @@ test("API 插件展示 AI 创建入口，同时保持 connector kind 的旧调�
   render(<PublishPanel auth={auth} onCreateInChat={onCreateInChat} />);
   await screen.findByPlaceholderText("例：学术翻译");
 
-  fireEvent.click(screen.getByRole("button", { name: "发布插件" }));
+  // 发布类型切换已改用 Tabs 原语(role=tab + roving tabindex + 44px 触控靶),不再是裸 button。
+  fireEvent.click(screen.getByRole("tab", { name: "发布插件" }));
   const create = screen.getByRole("button", { name: /在对话中创建 API 连接插件/ });
   expect(create).toBeInTheDocument();
   fireEvent.click(create);
@@ -140,7 +176,7 @@ test("智能体可从已安装 Skill / Plugin 选择必需或可选组合能力"
 
   render(<PublishPanel auth={auth} />);
   await screen.findByPlaceholderText("例：学术翻译");
-  fireEvent.click(screen.getByRole("button", { name: "发布智能体" }));
+  fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
   const plugin = await screen.findByRole("button", { name: /Plugin · 论文 Plugin/ });
   fireEvent.click(plugin);
   expect(plugin).toHaveTextContent("必需 · Plugin");

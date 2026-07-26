@@ -1819,6 +1819,8 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       })
 
     render(<ConnectorsTab auth={auth} />)
+    // 自动回复子系统已从账号行外提到贴底 Sheet：账号行只留摘要 +「配置」入口。
+    fireEvent.click(await screen.findByRole('button', { name: '配置' }))
     const automationSwitch = await screen.findByRole('switch', {
       name: '知识星球无人值守自动回复',
     })
@@ -1909,6 +1911,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedCreateKnowledgePlanetRulesBatch.mockResolvedValue([rule, secondRule])
 
     render(<ConnectorsTab auth={auth} />)
+    fireEvent.click(await screen.findByRole('button', { name: '配置' }))
     fireEvent.click(await screen.findByRole('button', { name: '添加规则' }))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(
@@ -2017,6 +2020,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     render(<ConnectorsTab auth={auth} />)
+    fireEvent.click(await screen.findByRole('button', { name: '配置' }))
     fireEvent.click(await screen.findByRole('button', { name: '编辑' }))
     let dialog = await screen.findByRole('dialog')
     fireEvent.change(within(dialog).getByLabelText('规则名称'), {
@@ -2037,7 +2041,9 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
         maxReplyChars: 800,
       }),
     )
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    // 规则弹层已关闭。判据用弹层内的字段而不是 role=dialog —— 自动回复面板现在挂在
+    // 贴底 Sheet 里，Sheet 本身也是 dialog，保存后它仍应留在原地。
+    await waitFor(() => expect(screen.queryByLabelText('规则名称')).not.toBeInTheDocument())
 
     mockedPatchKnowledgePlanetRule.mockClear()
     fireEvent.click(screen.getByRole('button', { name: '编辑' }))

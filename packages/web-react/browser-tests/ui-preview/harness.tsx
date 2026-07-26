@@ -10,6 +10,7 @@
 import { Component, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 
+import { ToastProvider, TooltipProvider } from '../../src/components/ui'
 import type { ApiMockTable, Scene } from './types'
 import * as manageSceneModule from './scenes-manage'
 import * as marketSceneModule from './scenes-market'
@@ -154,7 +155,18 @@ window.__mountScene = (id: string) => {
   window.__ocSceneError = null
   root = createRoot(host())
   // 面板挂在 Radix Dialog Portal 里(渲染到 document.body),#root 只是宿主容器。
-  root.render(<SceneBoundary key={id}>{scene.render()}</SceneBoundary>)
+  //
+  // Provider 树必须**镜像 src/main.tsx**:面板用 TimeAgo(内部 Radix Tooltip)与 useToast,
+  // 少任何一个都会在渲染期抛 "must be used within XProvider"。2026-07-26 实测:
+  // 面板改造引入 TimeAgo 后,18 个场景一次性全崩在这上面 —— 预览台若不跟着生产的
+  // Provider 树走,就会把"生产正常、预览崩"误报成回归。
+  root.render(
+    <ToastProvider>
+      <TooltipProvider>
+        <SceneBoundary key={id}>{scene.render()}</SceneBoundary>
+      </TooltipProvider>
+    </ToastProvider>,
+  )
 }
 
 window.__unmountScene = () => {

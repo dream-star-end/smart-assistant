@@ -1783,7 +1783,7 @@ const SCENARIOS: ScenarioDefinition[] = [
     featureId: "web-research",
     async run(ctx) {
       await openManage(ctx);
-      await selectDialogTab(ctx, "文献库");
+      await selectDialogTab(ctx, "文献");
       await assertVisible(
         ctx,
         ':text("AI 办公产品 2026 趋势报告")',
@@ -2075,7 +2075,7 @@ const SCENARIOS: ScenarioDefinition[] = [
     featureId: "schedules-reminders",
     async run(ctx) {
       await openManage(ctx);
-      await selectDialogTab(ctx, "定时任务");
+      await selectDialogTab(ctx, "定时");
       await assertVisible(ctx, ':text("每日行业摘要")', "定时任务列表已加载");
       await stage(ctx, "查看任务状态与下一次执行时间");
       await tracedClick(

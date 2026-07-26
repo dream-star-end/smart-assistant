@@ -70,8 +70,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const toast = useCallback<ToastFn>(
-    (message, tone = "info", options) => {
+    // tone 的默认值在体内取(而非默认参数):options 排在它后面,默认参数不能在必填/可选参数之前。
+    (message, toneArg, options) => {
       if (!message) return;
+      const tone = toneArg ?? "info";
       const id = ++seq.current;
       const actionable = Boolean(options?.actionLabel && options?.onAction);
       setItems((cur) => [

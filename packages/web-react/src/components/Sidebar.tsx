@@ -4,13 +4,14 @@ import { BRAND } from "../lib/brand";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { Session, User } from "../lib/types";
 import { cn, formatCredits, groupLabel } from "../lib/utils";
-import { Avatar, Button, IconButton } from "./ui";
+import { Avatar, Badge, Button, IconButton } from "./ui";
 
 export function Sidebar({
   sessions,
   activeId,
   user,
   credits,
+  optimizerPending = 0,
   onSelect,
   onNew,
   onRename,
@@ -30,6 +31,11 @@ export function Sidebar({
   user: User | null;
   /** 账户余额（积分字符串大数，来自 /api/me）。null 时退化为通用文案。 */
   credits?: string | null;
+  /**
+   * Auto‑Dream 待确认建议数（与管理中心「优化」Tab 徽标同源）。>0 时管理中心入口右侧
+   * 用徽章替换静态副标题 —— 这是全面优化在侧栏唯一的曝光位。
+   */
+  optimizerPending?: number;
   onSelect: (id: string) => void;
   onNew: () => void;
   onRename: (s: Session) => void;
@@ -39,9 +45,9 @@ export function Sidebar({
   onOpenAccount?: () => void;
   /** 打开设置中心的反馈分区。省略则不渲染入口（demo）。 */
   onOpenFeedback?: () => void;
-  /** 打开管理中心（记忆/定时任务/技能）。省略则不渲染入口（demo）。 */
+  /** 打开管理中心（记忆/技能/定时/插件/文献/优化）。省略则不渲染入口（demo）。 */
   onOpenManage?: () => void;
-  /** 打开 AI 市场（技能/智能体）。省略则不渲染入口（demo）。 */
+  /** 打开 AI 市场（技能/智能体/插件）。省略则不渲染入口（demo）。 */
   onOpenMarketplace?: () => void;
   /** 打开使用教程。省略则不渲染入口（demo）。 */
   onOpenTutorial?: () => void;
@@ -70,7 +76,7 @@ export function Sidebar({
             <span className="flex size-7 items-center justify-center rounded-lg bg-grad-cta text-white">
               <Sparkles size={15} />
             </span>
-            <span className="text-[15px] font-semibold tracking-tight">{BRAND.name}</span>
+            <span className="text-title font-semibold tracking-tight">{BRAND.name}</span>
           </div>
           {onCollapse && (
             <IconButton data-product-control onClick={onCollapse} aria-label="折叠侧栏" variant="muted" size="sm" shape="square">
@@ -83,7 +89,7 @@ export function Sidebar({
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
           variant="secondary"
           onClick={onNew}
-          className="h-auto w-full justify-start gap-2.5 rounded-xl px-3 py-2.5 text-[14px] font-medium"
+          className="h-auto w-full justify-start gap-2.5 rounded-xl px-3 py-2.5 text-section font-medium"
         >
           <Plus size={17} />
           新建会话
@@ -96,7 +102,9 @@ export function Sidebar({
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="搜索会话"
-            className="w-full bg-transparent text-[13.5px] text-fg outline-none placeholder:text-faint"
+            // 表单控件红线：窄屏必须 ≥16px。侧栏在移动端是抽屉，13.5px 的搜索框一聚焦
+            // 就会被 iOS Safari 放大整页且不回弹；桌面段 md:text-sm 保持原视觉密度。
+            className="w-full bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
           />
         </div>
 
@@ -104,11 +112,19 @@ export function Sidebar({
           <button
             data-product-feature={PRODUCT_CAPABILITIES.memory.id}
             onClick={onOpenManage}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <LayoutGrid size={16} className="text-faint" />
             管理中心
-            <span className="ml-auto text-[11px] text-faint">记忆 · 定时 · 技能</span>
+            {/* 有待办 → 数量信号（Auto‑Dream 的唯一侧栏曝光）；无待办 → 分区速览，
+                文案与实际分区对齐（旧文案「记忆 · 定时 · 技能」漏了插件/文献/优化）。 */}
+            {optimizerPending > 0 ? (
+              <Badge tone="accent" size="sm" className="ml-auto">
+                {optimizerPending > 99 ? "99+" : optimizerPending} 项待确认
+              </Badge>
+            ) : (
+              <span className="ml-auto text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
+            )}
           </button>
         )}
 
@@ -116,11 +132,12 @@ export function Sidebar({
           <button
             data-product-feature={PRODUCT_CAPABILITIES.marketplace.id}
             onClick={onOpenMarketplace}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Store size={16} className="text-faint" />
             市场
-            <span className="ml-auto text-[11px] text-faint">技能 · 智能体</span>
+            {/* 市场品类实为三类，旧文案漏了插件（并列第三类）。 */}
+            <span className="ml-auto text-caption text-faint">技能 · 智能体 · 插件</span>
           </button>
         )}
 
@@ -129,11 +146,11 @@ export function Sidebar({
             type="button"
             data-product-control
             onClick={onOpenTutorial}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <BookOpen size={16} className="text-faint" />
             使用教程
-            <span className="ml-auto text-[11px] text-faint">边看边用</span>
+            <span className="ml-auto text-caption text-faint">边看边用</span>
           </button>
         )}
 
@@ -141,11 +158,11 @@ export function Sidebar({
           <button
             data-product-feature={PRODUCT_CAPABILITIES.organization.id}
             onClick={onOpenOrg}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Building2 size={16} className="text-faint" />
             组织
-            <span className="ml-auto text-[11px] text-faint">成员 · 报表 · 发票</span>
+            <span className="ml-auto text-caption text-faint">成员 · 报表 · 发票</span>
           </button>
         )}
 
@@ -153,11 +170,11 @@ export function Sidebar({
           <a
             data-product-control
             href="/admin.html"
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-section font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ShieldCheck size={16} className="text-faint" />
             管理后台
-            <span className="ml-auto text-[11px] text-faint">平台运维</span>
+            <span className="ml-auto text-caption text-faint">平台运维</span>
           </a>
         )}
       </div>
@@ -167,11 +184,11 @@ export function Sidebar({
         data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
       >
         {groups.length === 0 && (
-          <p className="px-3 py-6 text-center text-[13px] text-faint">暂无会话</p>
+          <p className="px-3 py-6 text-center text-body text-faint">暂无会话</p>
         )}
         {groups.map(([label, items]) => (
           <div key={label} className="mb-1">
-            <div className="px-3 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-faint">
+            <div className="px-3 pb-1 pt-3 text-caption font-medium uppercase tracking-wide text-faint">
               {label}
             </div>
             {items.map((s) => (
@@ -181,7 +198,7 @@ export function Sidebar({
               <div
                 key={s.id}
                 className={cn(
-                  "group flex items-center gap-2 rounded-lg pr-2 text-[14px] transition-colors",
+                  "group flex items-center gap-2 rounded-lg pr-2 text-section transition-colors",
                   s.id === activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
                 )}
               >
@@ -237,14 +254,14 @@ export function Sidebar({
           aria-label="设置"
           className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg enabled:hover:bg-hover"
         >
-          <Avatar tone="ink" className="text-[13px]">
+          <Avatar tone="ink" className="text-body">
             {(user?.displayName || "U").slice(0, 1).toUpperCase()}
           </Avatar>
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-[13.5px] font-medium text-fg">
+            <span className="block truncate text-section font-medium text-fg">
               {user?.displayName || "未登录"}
             </span>
-            <span className="block truncate text-[11.5px] text-faint">
+            <span className="block truncate text-caption text-faint">
               {credits != null ? `余额 ${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
             </span>
           </span>

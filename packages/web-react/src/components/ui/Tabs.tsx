@@ -115,8 +115,10 @@ export function Tabs({
   const listRef = useRef<HTMLDivElement | null>(null);
   const [edge, setEdge] = useState<"none" | "left" | "right" | "both">("none");
   // items 每次渲染都是新数组(调用方普遍写 TABS.map(...)),故用值序列做依赖键;
-  // 直接依赖 items 会让下面两个 effect 每帧重跑。
+  // 直接依赖 items 会让下面两个 effect 每帧重跑。选中下标同理在渲染期算好,
+  // effect 里就不必再引用 items 本身。
   const itemsKey = items.map((it) => it.value).join(" ");
+  const activeIndex = items.findIndex((it) => it.value === value);
 
   const syncEdge = useCallback(() => {
     const el = listRef.current;
@@ -128,6 +130,9 @@ export function Tabs({
   }, []);
 
   // "能不能滚"同时取决于容器宽度和 tab 集合,所以用 ResizeObserver,而不是只监听 scroll。
+  // ResizeObserver 只报被观测元素**自身**的尺寸变化 —— tab 增删导致的内容宽度变化不会触发,
+  // 故 itemsKey / layout 必须进依赖重新测量(Biome 眼里是"多余依赖",实际是本 effect 的触发源)。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: itemsKey/layout 是重新测量的触发器,ResizeObserver 覆盖不到内容宽度变化
   useEffect(() => {
     syncEdge();
     const el = listRef.current;
@@ -139,16 +144,15 @@ export function Tabs({
 
   // 受控 value 变化 → 把选中项滚进视口中央。容器不可滚时直接跳过:既省事,也避免
   // scrollIntoView 顺带滚动祖先滚动容器(整页跳动的经典来源)。
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // biome-ignore lint/correctness/useExhaustiveDependencies: itemsKey 同上,tab 集合换了也要把选中项摆回视口
   useEffect(() => {
     const list = listRef.current;
     if (!list || list.scrollWidth - list.clientWidth <= 1) return;
-    const idx = items.findIndex((it) => it.value === value);
-    const el = idx >= 0 ? refs.current[idx] : null;
+    const el = activeIndex >= 0 ? refs.current[activeIndex] : null;
     if (!el || typeof el.scrollIntoView !== "function") return;
     const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     el.scrollIntoView({ inline: "center", block: "nearest", behavior: reduced ? "auto" : "smooth" });
-  }, [value, itemsKey]);
+  }, [activeIndex, itemsKey]);
 
   const onKeyDown = (e: KeyboardEvent, idx: number) => {
     const last = items.length - 1;

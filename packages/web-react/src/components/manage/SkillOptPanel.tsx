@@ -1,23 +1,35 @@
 /**
- * SkillOpt 面板 —— 单个技能展开区里的「评测」与「训练优化」两个分区。
+ * SkillOpt 面板 —— 技能工作台(SkillEditor)里的「评测」与「训练优化」两个分区。
  *
  * 成本红线(boss):任何消耗积分的动作(运行评测/启动训练/评论重训)必须
  * 先弹成本确认(模型+费率来源+估算区间+红字提示),运行中/结束后按实际用量
  * 折算实报(与计费同公式;以账单为准)。绝不静默扣费。
+ *
+ * ── 2026-07-26 呈现层改造(功能语义不变) ──────────────────────────────────
+ * 1. 本分区从「技能列表行手风琴」迁进技能工作台弹窗(4xl 宽 / 88vh 高)。工具条
+ *    因此不再需要挤进 296px:改成标题与操作分两行 + flex-wrap,窄屏不再撑破面板。
+ * 2. **合并草稿(已扣积分)成功后零反馈**是本区最贵的缺陷:成功回调把整块 UI 卸载,
+ *    原先写好的 <Alert tone="success"> 是永远渲染不到的死代码,且技能正文缓存不失效。
+ *    现在:Toast(离开当前上下文)+ 留在原地的 mergedNotice + onSkillChanged 让外层
+ *    失效正文缓存。两处不可达分支(merged / discarded)已删除。
+ * 3. 长流程给出真实进度:训练=五阶段步骤条 + 已运行时长,评测=Progress + 组数;
+ *    两处状态容器挂 aria-live,读屏用户能听到阶段变化。成本确认框补「开始后无法中止」。
+ * 4. 草稿对照从「两块各自滚动的代码堆」改为**行级 diff**(单栏、增删着色、未变更折叠),
+ *    多份草稿可逐份切换审阅,合并确认框列出全部将写入项并标注未查看项。
+ * 5. 成功消息不再走 err 通道靠字符串前缀判色;扣费开关换 Switch 原语并在保存失败时回滚。
  */
 import {
   Check,
   ChevronRight,
   FlaskConical,
   GraduationCap,
-  Loader2,
   Play,
   Plus,
   Sparkles,
   Trash2,
   X,
 } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import {
   creditsForUsage,
@@ -39,7 +51,25 @@ import type {
   SkillTrainRun,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Badge, Button, Spinner, Textarea, useConfirm } from "../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  EmptyState,
+  Field,
+  IconButton,
+  Input,
+  ListSkeleton,
+  Progress,
+  Skeleton,
+  Spinner,
+  Switch,
+  Tabs,
+  Textarea,
+  useConfirm,
+  useToast,
+} from "../ui";
 
 /** 训练/评测锁定的模型(与 gateway SKILL_TRAIN_DEFAULT_MODEL 一致)。 */
 export const SKILL_RUN_MODEL = "deepseek-v4-pro";
@@ -78,6 +108,24 @@ function usePollingRun<T>(
   return [run, setRun];
 }
 
+/** 秒级自刷新(仅在有活跃 run 时起定时器)——「已运行 N 分」不自刷新就是一句谎话。 */
+function useTicker(active: boolean, ms = 1000) {
+  const [, bump] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(() => bump((n) => n + 1), ms);
+    return () => clearInterval(t);
+  }, [active, ms]);
+}
+
+function fmtElapsed(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} 分 ${s % 60} 秒`;
+  return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+}
+
 /** 成本确认对话框正文(所有消耗积分的动作共用同一形态)。 */
 function CostBody({
   lines,
@@ -91,7 +139,7 @@ function CostBody({
   extra?: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-2 text-[12.5px]">
+    <div className="flex flex-col gap-2 text-body">
       <ul className="list-disc pl-4 text-muted">
         {lines.map((l) => (
           <li key={l}>{l}</li>
@@ -100,7 +148,7 @@ function CostBody({
       <p>
         预计消耗:<span className="font-medium text-fg">{range}</span>
         {rates && (
-          <span className="text-faint">
+          <span className="text-muted">
             (按 {rates.displayName} 公开费率估算,实际以账单为准)
           </span>
         )}
@@ -111,17 +159,20 @@ function CostBody({
   );
 }
 
-/** 实际用量 → "tokens + 折算积分" 实报行。 */
+/**
+ * 实际用量 → "tokens + 折算积分" 实报行。
+ * 计费实报是本区最该被读懂的文案,故不用 text-faint(全站最低对比度)。
+ */
 function UsageLine({ usage, rates, label }: { usage?: SkillRunUsage; rates: ModelRates | null; label?: string }) {
   if (!usage || usage.turns === 0) return null;
   const credits = rates ? creditsForUsage(usage, rates) : null;
   return (
-    <p className="text-[11.5px] text-faint">
+    <p className="text-meta text-muted">
       {label ?? "本次消耗"}:输入 {usage.inputTokens.toLocaleString()} / 输出{" "}
       {usage.outputTokens.toLocaleString()} tokens({usage.turns} 轮)
       {credits !== null && (
         <>
-          ,折算约 <span className="font-medium text-muted">{fmtCredits(credits)} 积分</span>
+          ,折算约 <span className="font-medium text-fg">{fmtCredits(credits)} 积分</span>
           (实际扣费以账单为准)
         </>
       )}
@@ -130,6 +181,7 @@ function UsageLine({ usage, rates, label }: { usage?: SkillRunUsage; rates: Mode
 }
 
 const ARM_LABEL: Record<string, string> = { with: "有技能", without: "无技能", draft: "草稿版" };
+const OP_LABEL: Record<string, string> = { create: "新建", update: "更新", delete: "删除" };
 
 /** AI 生成端点错误 → 友好中文(409/403/404 单独措辞,其余回原始信息)。 */
 function genErrMessage(e: unknown): string {
@@ -166,6 +218,8 @@ export function SkillEvalSection({
   const [genRunId, setGenRunId] = useState<string | null>(null);
   const [draftBanner, setDraftBanner] = useState(false);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+  const toast = useToast();
+  const autoId = useId();
 
   const load = useCallback(() => {
     setLoading(true);
@@ -205,7 +259,8 @@ export function SkillEvalSection({
     ...(auto ? { autoRegression: true } : {}),
   });
 
-  const save = async (auto = autoRegression) => {
+  /** 返回是否成功 —— 扣费开关要据此决定回滚,不能只 setErr 了事。 */
+  const save = async (auto = autoRegression): Promise<boolean> => {
     setSaving(true);
     setErr(null);
     try {
@@ -214,8 +269,10 @@ export function SkillEvalSection({
       setDraftBanner(false);
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
+      return true;
     } catch (e) {
       setErr(apiErrorMessage(e, "保存失败"));
+      return false;
     } finally {
       setSaving(false);
     }
@@ -235,6 +292,7 @@ export function SkillEvalSection({
             `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定)`,
             `${n} 个用例 × 2 组对照(有技能 / 无技能)+ 每用例 1 次评分`,
             "全部在隔离会话中运行,不影响你的正常对话与技能库",
+            "开始后无法中止,请先确认用例无误",
           ]}
           range={range}
           rates={rates}
@@ -327,10 +385,16 @@ export function SkillEvalSection({
     }
   };
 
+  const perDay = rates
+    ? fmtCreditRange(estimateEvalRunCredits(Math.max(1, cases.length), 2, rates))
+    : "少量积分";
+
   // 自动回归 opt-in:显式确认成本后写回 evals.json。
+  // 保存失败必须回滚开关显示态 —— 否则界面写着「已开启」而服务端根本没写入,
+  // 用户会以为自己每天在被扣费(或以为已开而其实没开)。
   const toggleAutoRegression = async () => {
-    if (!autoRegression) {
-      const perDay = rates ? fmtCreditRange(estimateEvalRunCredits(Math.max(1, cases.length), 2, rates)) : "少量";
+    const next = !autoRegression;
+    if (next) {
       const ok = await confirmDialog({
         title: "开启每日自动回归?",
         body: (
@@ -340,40 +404,62 @@ export function SkillEvalSection({
               `每天约消耗:${perDay}`,
               "不会自动改动技能内容,更不会自动开训练 —— 只提醒",
             ]}
-            range={perDay + " / 天"}
+            range={`${perDay} / 天`}
             rates={rates}
           />
         ),
         confirmText: "开启并接受每日消耗",
       });
       if (!ok) return;
-      setAutoRegression(true);
-      await save(true);
-    } else {
-      setAutoRegression(false);
-      await save(false);
     }
+    const prev = autoRegression;
+    setAutoRegression(next);
+    const ok = await save(next);
+    if (!ok) {
+      setAutoRegression(prev);
+      toast(next ? "开启失败,已保持关闭" : "关闭失败,已保持开启", "error");
+      return;
+    }
+    toast(next ? "已开启每日自动回归" : "已关闭每日自动回归", "success");
   };
 
   if (loading)
     return (
-      <div className="flex items-center gap-2 py-4 text-[12.5px] text-faint">
-        <Spinner size={14} /> 加载评测…
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Skeleton className="h-4 w-28" />
+          <Skeleton className="h-8 w-44 rounded-md" />
+        </div>
+        <ListSkeleton rows={2} />
       </div>
     );
 
   const running = run && isActive(run);
+  const runPct = run?.progress.total ? (run.progress.done / run.progress.total) * 100 : 0;
 
   return (
     <div className="flex flex-col gap-3">
       {confirmDialogEl}
-      {err && <Alert tone="danger">{err}</Alert>}
-      {draftBanner && <Alert tone="info">AI 草稿已生成,请审阅修改后保存</Alert>}
+      {err && (
+        <Alert tone="danger" density="compact" onDismiss={() => setErr(null)}>
+          {err}
+        </Alert>
+      )}
+      {draftBanner && (
+        <Alert tone="info" density="compact">
+          AI 草稿已生成,请审阅修改后保存
+        </Alert>
+      )}
 
-      {/* 用例编辑 */}
-      <div className="flex items-center justify-between">
-        <span className="text-[12px] font-medium text-muted">评测用例({cases.length}/5)</span>
+      {/* 用例编辑:标题与操作分两行(窄屏),操作可换行 —— 4 个按钮曾横向撑破整个管理中心。 */}
+      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div className="flex items-center gap-1.5">
+          <span className="text-meta font-medium text-muted">评测用例</span>
+          <Badge tone="neutral" size="sm">
+            {cases.length}/5
+          </Badge>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
           {writable && (
             <Button
               variant="ghost"
@@ -392,21 +478,29 @@ export function SkillEvalSection({
             <Button
               variant="ghost"
               size="sm"
+              loading={generating}
               onClick={startGenerate}
-              disabled={generating || !!running || cases.length >= 5}
+              disabled={!!running || cases.length >= 5}
             >
-              {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+              {generating ? null : <Sparkles size={13} />}
               补充生成
             </Button>
           )}
           {writable && (
-            <Button variant="secondary" size="sm" disabled={!dirty || saving} onClick={() => save()}>
-              {saving ? <Loader2 size={13} className="animate-spin" /> : saved ? <Check size={13} /> : null}
+            <Button variant="secondary" size="sm" loading={saving} disabled={!dirty} onClick={() => save()}>
+              {saved && !saving ? <Check size={13} /> : null}
               {saved ? "已保存" : "保存用例"}
             </Button>
           )}
-          <Button variant="primary" size="sm" onClick={startRun} disabled={!!running || cases.length === 0 || generating}>
-            {running ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+          <Button
+            variant="primary"
+            size="sm"
+            loading={!!running}
+            onClick={startRun}
+            disabled={cases.length === 0 || generating}
+            className="max-md:w-full"
+          >
+            {running ? null : <Play size={13} />}
             运行评测
           </Button>
         </div>
@@ -414,88 +508,97 @@ export function SkillEvalSection({
 
       {/* 生成中进度(禁用运行评测与再次生成期间的可见反馈)。 */}
       {generating && (
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-bg p-3 text-[12.5px] text-muted">
-          <Spinner size={14} /> AI 正在起草评测用例…(约一个对话轮次,请稍候)
-        </div>
+        <Card tone="sunken" padding="sm" aria-live="polite" aria-atomic="true">
+          <p className="flex items-center gap-2 text-body text-muted">
+            <Spinner size={14} /> AI 正在起草评测用例…(约一个对话轮次,请稍候)
+          </p>
+        </Card>
       )}
       {cases.length === 0 ? (
-        <div className="flex flex-col gap-2.5 rounded-lg border border-dashed border-border bg-bg p-4">
-          <p className="text-[12px] text-faint">
-            还没有评测用例。用例 = 一个真实任务 + 几条可判定的验收断言;它是「这个技能到底有没有用」的
-            唯一事实标准。
-          </p>
-          {writable && (
-            <>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={startGenerate}
-                disabled={generating || !!running}
-                className="self-start"
-              >
-                {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-                AI 生成用例
-              </Button>
-              <p className="text-[11.5px] text-faint">
-                从技能内容和你的真实使用记录起草,生成后可编辑;也可点上方「加用例」手动写。
-              </p>
-            </>
-          )}
-        </div>
+        <Card tone="sunken" padding="none" className="border-dashed">
+          <EmptyState
+            icon={FlaskConical}
+            title="还没有评测用例"
+            hint="用例 = 一个真实任务 + 几条可判定的验收断言;它是「这个技能到底有没有用」的唯一事实标准。"
+            action={
+              writable ? (
+                <div className="flex flex-col items-center gap-2">
+                  <Button variant="primary" size="sm" loading={generating} disabled={!!running} onClick={startGenerate}>
+                    {generating ? null : <Sparkles size={13} />}
+                    AI 生成用例
+                  </Button>
+                  <p className="max-w-[19rem] text-meta text-muted">
+                    从技能内容和你的真实使用记录起草,生成后可编辑;也可点上方「加用例」手动写。
+                  </p>
+                </div>
+              ) : undefined
+            }
+          />
+        </Card>
       ) : (
         <ul className="flex flex-col gap-2">
           {cases.map((c, i) => (
-            <li key={i} className="rounded-lg border border-border bg-bg p-2.5">
-              <div className="mb-1 flex items-center gap-2">
-                <input
-                  value={c.id}
-                  disabled={!writable}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setCases((cs) => cs.map((x, j) => (j === i ? { ...x, id: v } : x)));
-                    setDirty(true);
-                  }}
-                  className="w-40 rounded border border-border bg-surface px-2 py-1 font-mono text-[11.5px] text-fg outline-none focus:border-accent"
-                  placeholder="case-id"
-                />
-                {writable && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCases((cs) => cs.filter((_, j) => j !== i));
+            // biome-ignore lint/suspicious/noArrayIndexKey: 用例可增删且 id 可为空,下标是此处唯一稳定键
+            <li key={i}>
+              <Card tone="sunken" padding="sm" className="flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={c.id}
+                    disabled={!writable}
+                    inputSize="sm"
+                    aria-label={`用例 ${i + 1} 的 ID`}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setCases((cs) => cs.map((x, j) => (j === i ? { ...x, id: v } : x)));
                       setDirty(true);
                     }}
-                    aria-label="删除用例"
-                    className="ml-auto flex size-6 items-center justify-center rounded text-faint hover:bg-danger-soft hover:text-danger"
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                )}
-              </div>
-              <Textarea
-                value={c.prompt}
-                disabled={!writable}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setCases((cs) => cs.map((x, j) => (j === i ? { ...x, prompt: v } : x)));
-                  setDirty(true);
-                }}
-                rows={2}
-                placeholder="任务(真实措辞,含必要上下文)…"
-                className="mb-1.5 text-[12.5px]"
-              />
-              <Textarea
-                value={c.assertions}
-                disabled={!writable}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setCases((cs) => cs.map((x, j) => (j === i ? { ...x, assertions: v } : x)));
-                  setDirty(true);
-                }}
-                rows={3}
-                placeholder={"验收断言,每行一条,例如:\n输出为英文且信息无遗漏\n保留原文数字与单位"}
-                className="font-mono text-[12px]"
-              />
+                    className="w-full font-mono md:w-44"
+                    placeholder="case-id"
+                  />
+                  {writable && (
+                    <IconButton
+                      variant="danger"
+                      size="sm"
+                      shape="square"
+                      className="ml-auto"
+                      aria-label={`删除用例 ${c.id || i + 1}`}
+                      onClick={() => {
+                        setCases((cs) => cs.filter((_, j) => j !== i));
+                        setDirty(true);
+                      }}
+                    >
+                      <Trash2 size={13} />
+                    </IconButton>
+                  )}
+                </div>
+                <Field label="任务">
+                  <Textarea
+                    value={c.prompt}
+                    disabled={!writable}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setCases((cs) => cs.map((x, j) => (j === i ? { ...x, prompt: v } : x)));
+                      setDirty(true);
+                    }}
+                    rows={2}
+                    placeholder="任务(真实措辞,含必要上下文)…"
+                  />
+                </Field>
+                <Field label="验收断言" hint="每行一条,例如:输出为英文且信息无遗漏 / 保留原文数字与单位">
+                  <Textarea
+                    value={c.assertions}
+                    disabled={!writable}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setCases((cs) => cs.map((x, j) => (j === i ? { ...x, assertions: v } : x)));
+                      setDirty(true);
+                    }}
+                    rows={3}
+                    placeholder={"验收断言,每行一条,例如:\n输出为英文且信息无遗漏\n保留原文数字与单位"}
+                    className="font-mono"
+                  />
+                </Field>
+              </Card>
             </li>
           ))}
         </ul>
@@ -503,37 +606,56 @@ export function SkillEvalSection({
 
       {/* 运行进度 / 结果 */}
       {run && (
-        <div className="rounded-lg border border-border bg-bg p-3">
+        <Card tone="sunken" padding="sm" className="flex flex-col gap-2">
           {running ? (
-            <div className="flex items-center gap-2 text-[12.5px] text-muted">
-              <Spinner size={14} />
-              {run.status === "grading" ? "评分中" : "评测中"}({run.progress.done}/{run.progress.total} 组)…
+            <div className="flex flex-col gap-1.5" aria-live="polite" aria-atomic="true">
+              <Progress
+                value={runPct}
+                size="sm"
+                aria-label="评测进度"
+                aria-valuetext={`${run.progress.done} / ${run.progress.total} 组`}
+              />
+              <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-body text-muted">
+                <Spinner size={14} />
+                {run.status === "grading" ? "评分中" : "评测中"}({run.progress.done}/{run.progress.total} 组)…
+                <span className="text-meta text-muted">本次运行不可中止</span>
+              </p>
             </div>
           ) : run.status === "failed" ? (
-            <Alert tone="danger">评测失败:{run.error}</Alert>
+            <Alert tone="danger" density="compact">
+              评测失败:{run.error}
+            </Alert>
           ) : (
             <EvalResultView run={run} rates={rates} />
           )}
-          <div className="mt-1.5">
-            <UsageLine usage={run.usage} rates={rates} label={running ? "已消耗" : "本次消耗"} />
-          </div>
-        </div>
+          <UsageLine usage={run.usage} rates={rates} label={running ? "已消耗" : "本次消耗"} />
+        </Card>
       )}
 
       {/* 上次结果(无进行中 run 时) */}
       {!run && lastRun?.benchmark && (
-        <div className="rounded-lg border border-border bg-bg p-3">
-          <p className="text-[12.5px] font-medium text-fg">上次评测:{lastRun.benchmark.verdict}</p>
+        <Card tone="sunken" padding="sm" className="flex flex-col gap-1">
+          <p className="text-body font-medium text-fg">上次评测:{lastRun.benchmark.verdict}</p>
           <UsageLine usage={lastRun.usage} rates={rates} label="上次消耗" />
-        </div>
+        </Card>
       )}
 
-      {/* P3:自动回归 opt-in */}
+      {/* P3:自动回归 opt-in(每日持续扣费,故 label 必须写清代价) */}
       {writable && cases.length > 0 && (
-        <label className="flex items-center gap-2 text-[12px] text-muted">
-          <input type="checkbox" checked={autoRegression} onChange={toggleAutoRegression} />
-          每日自动回归(明确知晓每日消耗,失败推送提醒;默认关闭)
-        </label>
+        <Card tone="sunken" padding="sm" className="flex items-start gap-3">
+          <Switch
+            id={autoId}
+            checked={autoRegression}
+            disabled={saving}
+            onCheckedChange={() => void toggleAutoRegression()}
+          />
+          <label htmlFor={autoId} className="min-w-0 flex-1 cursor-pointer">
+            <span className="block text-body font-medium text-fg">每日自动回归</span>
+            <span className="block text-meta text-muted">
+              每天约消耗 {perDay},通过率下降时推送提醒;默认关闭。
+            </span>
+          </label>
+        </Card>
       )}
     </div>
   );
@@ -541,13 +663,14 @@ export function SkillEvalSection({
 
 function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates | null }) {
   const [openCase, setOpenCase] = useState<string | null>(null);
+  const idBase = useId();
   const b = run.benchmark;
-  if (!b) return <p className="text-[12.5px] text-muted">评测完成,但没有可用结果。</p>;
+  if (!b) return <p className="text-body text-muted">评测完成,但没有可用结果。</p>;
   const pct = (x?: number) => `${Math.round((x ?? 0) * 100)}%`;
   const armsShown = run.mode === "draft" ? (["with", "draft"] as const) : (["without", "with"] as const);
   return (
     <div className="flex flex-col gap-2">
-      <p className="text-[13px] font-medium text-fg">{b.verdict}</p>
+      <p className="text-body font-medium text-fg">{b.verdict}</p>
       <div className="flex flex-wrap gap-1.5">
         {armsShown.map((arm) => (
           <Badge key={arm} tone={arm === "without" ? "neutral" : "accent"}>
@@ -565,24 +688,27 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
         {run.cases.map((c) => {
           const rs = run.results.filter((r) => r.caseId === c.id);
           const open = openCase === c.id;
+          const panelId = `${idBase}-case-${c.id}`;
           return (
-            <li key={c.id} className="rounded border border-border">
+            <li key={c.id} className="rounded-md border border-border">
               <button
                 type="button"
                 onClick={() => setOpenCase(open ? null : c.id)}
-                className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-[12px] text-muted hover:bg-hover"
+                aria-expanded={open}
+                aria-controls={panelId}
+                className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-meta text-muted outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
               >
-                <ChevronRight size={13} className={cn("transition-transform", open && "rotate-90")} />
+                <ChevronRight size={13} className={cn("shrink-0 transition-transform", open && "rotate-90")} />
                 <span className="min-w-0 flex-1 truncate font-mono">{c.id}</span>
                 {rs.map((r) => (
-                  <span key={r.arm} className="text-[11px] text-faint">
+                  <span key={r.arm} className="shrink-0 text-caption text-muted">
                     {ARM_LABEL[r.arm]}{" "}
                     {r.error ? "✗错" : `${r.assertions.filter((a) => a.passed).length}/${r.assertions.length}`}
                   </span>
                 ))}
               </button>
               {open && (
-                <div className="border-t border-border px-2.5 py-2 text-[12px]">
+                <div id={panelId} className="border-t border-border px-2.5 py-2 text-meta">
                   {rs.map((r) => (
                     <div key={r.arm} className="mb-2">
                       <p className="mb-0.5 font-medium text-fg">{ARM_LABEL[r.arm]}</p>
@@ -591,6 +717,7 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
                       ) : (
                         <ul className="flex flex-col gap-0.5">
                           {r.assertions.map((a, i) => (
+                            // biome-ignore lint/suspicious/noArrayIndexKey: 断言无稳定 id,顺序即身份
                             <li key={i} className="flex items-start gap-1.5">
                               {a.passed ? (
                                 <Check size={13} className="mt-0.5 shrink-0 text-success" />
@@ -599,7 +726,7 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
                               )}
                               <span className="min-w-0">
                                 <span className="text-fg">{a.text}</span>
-                                {a.evidence && <span className="block text-[11px] text-faint">{a.evidence}</span>}
+                                {a.evidence && <span className="block text-caption text-muted">{a.evidence}</span>}
                               </span>
                             </li>
                           ))}
@@ -619,14 +746,50 @@ function EvalResultView({ run, rates }: { run: SkillEvalRun; rates: ModelRates |
 
 // ── 训练分区 ─────────────────────────────────────────────────────────────────
 
+/** 训练阶段顺序(与 gateway 的 phase 取值一致);未知 phase 不参与步骤条着色。 */
+const TRAIN_PHASES = ["queued", "scanning_sessions", "evaluating", "drafting", "diff_ready"] as const;
+
+const PHASE_LABEL: Record<string, string> = {
+  queued: "排队中",
+  scanning_sessions: "复盘近期会话",
+  evaluating: "分析现有技能",
+  drafting: "起草改进",
+  diff_ready: "草稿就绪",
+  done: "完成",
+  failed: "失败",
+};
+
+/** 五阶段步骤条 —— 分钟级流程必须让用户看出「走到哪、还剩几步」。 */
+function PhaseSteps({ phase }: { phase: string }) {
+  const idx = TRAIN_PHASES.indexOf(phase as (typeof TRAIN_PHASES)[number]);
+  return (
+    <ol className="flex shrink-0 items-center gap-1" aria-hidden="true">
+      {TRAIN_PHASES.map((p, i) => (
+        <li
+          key={p}
+          className={cn(
+            "size-1.5 rounded-full",
+            idx >= 0 && i < idx && "bg-accent",
+            idx >= 0 && i === idx && "animate-pulse bg-accent",
+            (idx < 0 || i > idx) && "bg-border-strong",
+          )}
+        />
+      ))}
+    </ol>
+  );
+}
+
 export function SkillTrainSection({
   auth,
   skillName,
   rates,
+  onSkillChanged,
 }: {
   auth: AuthSession;
   skillName: string;
   rates: ModelRates | null;
+  /** 合并成功后通知外层:技能正文已变,缓存必须失效(否则「花了积分没生效」)。 */
+  onSkillChanged?: () => void;
 }) {
   const [err, setErr] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
@@ -634,7 +797,10 @@ export function SkillTrainSection({
   const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   // P3:启动响应带 feedbackRefs>0 → 提示本次训练命中了用户差评过的真实失败案例。
   const [feedbackNotice, setFeedbackNotice] = useState<string | null>(null);
+  // 合并成功后留在原地的成功说明(Toast 会消失,这条告诉用户「接下来去哪看」)。
+  const [mergedNotice, setMergedNotice] = useState<string | null>(null);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+  const toast = useToast();
 
   const trainFetcher = useCallback(
     () => (runId ? api.getSkillTrainRun(auth, runId) : Promise.reject(new Error("no run"))),
@@ -645,6 +811,7 @@ export function SkillTrainSection({
     [],
   );
   const [run, setRun] = usePollingRun(runId ? trainFetcher : null, isActive);
+  useTicker(!!run && isActive(run));
 
   // 挂载时从「全部训练 run」里找回本技能未完成/有草稿的 run（runId 原本只存
   // 组件 state，刷新即失联）。active → 恢复轮询；diff_ready → 恢复 diff 入口 + 提示。
@@ -685,11 +852,12 @@ export function SkillTrainSection({
             `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定,最高思考档)`,
             "AI 复盘你近期的真实会话,给这个技能起草改进(只产草稿,合并前不会改动技能)",
             "草稿产出后自动跑评测门:草稿 vs 现版实测对比,给出「是否值得合并」的量化结论",
+            "开始后无法中止(可随时放弃草稿,但已产生的消耗不退)",
           ]}
           range={total}
           rates={rates}
           extra={
-            <p className="text-[12px] text-faint">
+            <p className="text-meta text-muted">
               含训练 + 草稿评测两部分;若技能还没有评测用例,训练会一并提议用例(随草稿确认)。
             </p>
           }
@@ -701,6 +869,7 @@ export function SkillTrainSection({
     setErr(null);
     setResumeNotice(null);
     setFeedbackNotice(null);
+    setMergedNotice(null);
     try {
       const r = await api.startSkillTrain(auth, skillName, { autoEval: true });
       setRunId(r.runId);
@@ -724,79 +893,242 @@ export function SkillTrainSection({
     setRun(null);
     setResumeNotice(null);
     setFeedbackNotice(null);
-  };
-
-  const PHASE_LABEL: Record<string, string> = {
-    queued: "排队中",
-    scanning_sessions: "复盘近期会话",
-    evaluating: "分析现有技能",
-    drafting: "起草改进",
-    diff_ready: "草稿就绪",
-    done: "完成",
-    failed: "失败",
+    toast("已放弃本次训练草稿", "info");
   };
 
   return (
     <div className="flex flex-col gap-3">
       {confirmDialogEl}
-      {err && <Alert tone="danger">{err}</Alert>}
-      {resumeNotice && <Alert tone="info">{resumeNotice}</Alert>}
-      {feedbackNotice && <Alert tone="info">{feedbackNotice}</Alert>}
+      {err && (
+        <Alert tone="danger" density="compact" onDismiss={() => setErr(null)}>
+          {err}
+        </Alert>
+      )}
+      {resumeNotice && (
+        <Alert tone="info" density="compact" onDismiss={() => setResumeNotice(null)}>
+          {resumeNotice}
+        </Alert>
+      )}
+      {feedbackNotice && (
+        <Alert tone="info" density="compact" onDismiss={() => setFeedbackNotice(null)}>
+          {feedbackNotice}
+        </Alert>
+      )}
 
       {!run && (
-        <div className="flex items-start justify-between gap-3">
-          <p className="text-[12px] leading-relaxed text-muted">
-            AI 复盘你近期的真实使用,起草这个技能的改进;草稿先过评测门(草稿 vs 现版实测),
-            再由你决定是否合并 —— 技能库永远不会被自动改动。
-          </p>
-          <Button variant="primary" size="sm" onClick={start} className="shrink-0">
-            <GraduationCap size={14} /> 训练优化
-          </Button>
-        </div>
+        <>
+          {mergedNotice && (
+            <Alert tone="success" density="compact" onDismiss={() => setMergedNotice(null)}>
+              {mergedNotice}
+            </Alert>
+          )}
+          <div className="flex flex-col items-start gap-3 md:flex-row md:items-start md:justify-between">
+            <p className="text-meta leading-relaxed text-muted">
+              AI 复盘你近期的真实使用,起草这个技能的改进;草稿先过评测门(草稿 vs 现版实测),
+              再由你决定是否合并 —— 技能库永远不会被自动改动。
+            </p>
+            <Button variant="primary" size="sm" onClick={start} className="shrink-0 max-md:w-full">
+              <GraduationCap size={14} /> 训练优化
+            </Button>
+          </div>
+        </>
       )}
 
       {run && (
-        <div className="rounded-lg border border-border bg-bg p-3">
-          <div className="flex items-center gap-2">
-            {isActive(run) ? <Spinner size={14} /> : run.status === "failed" ? <X size={14} className="text-danger" /> : <Check size={14} className="text-success" />}
-            <span className="text-[12.5px] font-medium text-fg">
+        <Card tone="sunken" padding="sm" className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center gap-2" aria-live="polite" aria-atomic="true">
+            {isActive(run) ? (
+              <Spinner size={14} />
+            ) : run.status === "failed" ? (
+              <X size={14} className="shrink-0 text-danger" />
+            ) : (
+              <Check size={14} className="shrink-0 text-success" />
+            )}
+            <span className="text-body font-medium text-fg">
               {PHASE_LABEL[run.phase] ?? run.phase}
               {isActive(run) && `(已 ${run.toolCalls} 步)`}
             </span>
-            <span className="ml-auto flex gap-1.5">
-              {(run.status === "diff_ready" || isActive(run)) && (
-                <Button variant="ghost" size="sm" onClick={discard}>
-                  放弃
-                </Button>
-              )}
-            </span>
+            <PhaseSteps phase={run.phase} />
+            {isActive(run) && (
+              <span className="text-meta text-muted">
+                已运行 {fmtElapsed(Date.now() - run.startedAt)} · 不可中止
+              </span>
+            )}
+            {(run.status === "diff_ready" || isActive(run)) && (
+              <Button variant="ghost" size="sm" className="ms-auto" onClick={discard}>
+                放弃
+              </Button>
+            )}
           </div>
-          <div className="mt-1">
-            <UsageLine usage={run.usage} rates={rates} label={isActive(run) ? "已消耗" : "训练消耗"} />
-          </div>
-          {run.status === "failed" && <Alert tone="danger" className="mt-2">{run.error}</Alert>}
-          {run.status === "discarded" && (
-            <p className="mt-2 text-[12px] text-faint">本次训练没有产出可用草稿(或已放弃)。</p>
-          )}
-          {run.status === "merged" && (
-            <Alert tone="success" className="mt-2">已合并到技能库。</Alert>
+          {run.summary && !isActive(run) && <p className="text-meta text-muted">{run.summary}</p>}
+          <UsageLine usage={run.usage} rates={rates} label={isActive(run) ? "已消耗" : "训练消耗"} />
+          {run.status === "failed" && (
+            <Alert tone="danger" density="compact">
+              {run.error}
+            </Alert>
           )}
           {run.status === "diff_ready" && (
             <TrainDraftView
               auth={auth}
               run={run}
               rates={rates}
-              onMergedOrDiscarded={() => {
+              onMerged={() => {
                 setRunId(null);
                 setRun(null);
                 setResumeNotice(null);
                 setFeedbackNotice(null);
+                setMergedNotice(
+                  "已合并到技能库,可在「正文」页签查看新版本;旧版已存入「历史」,可随时回滚。",
+                );
+                toast("已合并到技能库", "success");
+                onSkillChanged?.();
               }}
               confirmDialog={confirmDialog}
             />
           )}
-        </div>
+        </Card>
       )}
+    </div>
+  );
+}
+
+// ── 草稿审阅(行级 diff) ─────────────────────────────────────────────────────
+
+type DiffLine = { type: "same" | "add" | "del"; text: string };
+
+/** LCS 单元格预算:超出就不做 diff(退回并排原文),避免超大 SKILL.md 卡住主线程。 */
+const DIFF_CELL_BUDGET = 400_000;
+/** 连续未变更行超过这个数就折叠 —— 审阅关心的是变化,不是原文全文。 */
+const CONTEXT_FOLD_MIN = 8;
+
+/** 行级 LCS diff。返回 null = 体量超预算,调用方退回「现版 / 草稿」并排原文。 */
+export function diffLines(oldText: string, newText: string): DiffLine[] | null {
+  const a = oldText.split("\n");
+  const b = newText.split("\n");
+  const n = a.length;
+  const m = b.length;
+  if (n * m > DIFF_CELL_BUDGET) return null;
+  const w = m + 1;
+  const dp = new Uint32Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * w + j] =
+        a[i] === b[j]
+          ? dp[(i + 1) * w + j + 1] + 1
+          : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
+    }
+  }
+  const out: DiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push({ type: "same", text: a[i] });
+      i++;
+      j++;
+    } else if (dp[(i + 1) * w + j] >= dp[i * w + j + 1]) {
+      out.push({ type: "del", text: a[i] });
+      i++;
+    } else {
+      out.push({ type: "add", text: b[j] });
+      j++;
+    }
+  }
+  while (i < n) out.push({ type: "del", text: a[i++] });
+  while (j < m) out.push({ type: "add", text: b[j++] });
+  return out;
+}
+
+function DraftDiff({ current, draft }: { current: string; draft: string }) {
+  const lines = useMemo(() => diffLines(current, draft), [current, draft]);
+  const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
+
+  // 连续同类行成组:未变更的长段落可折叠。
+  const groups = useMemo(() => {
+    if (!lines) return null;
+    const out: Array<{ same: boolean; lines: DiffLine[] }> = [];
+    for (const l of lines) {
+      const same = l.type === "same";
+      const tail = out[out.length - 1];
+      if (tail && tail.same === same) tail.lines.push(l);
+      else out.push({ same, lines: [l] });
+    }
+    return out;
+  }, [lines]);
+
+  if (!lines || !groups) {
+    // 体量超预算:退回并排原文(md+ 左右两栏),仍然默认展开、仍然一屏可比。
+    return (
+      <div className="grid gap-2 md:grid-cols-2">
+        <div className="flex min-w-0 flex-col gap-1">
+          <span className="text-caption font-medium text-muted">现版</span>
+          <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-muted">
+            {current || "(空)"}
+          </pre>
+        </div>
+        <div className="flex min-w-0 flex-col gap-1">
+          <span className="text-caption font-medium text-muted">草稿</span>
+          <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-fg">
+            {draft || "(空)"}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  const added = lines.filter((l) => l.type === "add").length;
+  const removed = lines.filter((l) => l.type === "del").length;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Badge tone="success" size="sm">
+          +{added} 行
+        </Badge>
+        <Badge tone="danger" size="sm">
+          -{removed} 行
+        </Badge>
+        {added === 0 && removed === 0 && <span className="text-caption text-muted">正文没有变化</span>}
+      </div>
+      <div className="overflow-hidden rounded-md bg-code py-1 font-mono text-meta leading-relaxed">
+        {groups.map((g, gi) =>
+          g.same && g.lines.length > CONTEXT_FOLD_MIN && !expanded.has(gi) ? (
+            <button
+              // biome-ignore lint/suspicious/noArrayIndexKey: 分组由 diff 结果顺序决定,下标即身份
+              key={gi}
+              type="button"
+              onClick={() =>
+                setExpanded((cur) => {
+                  const next = new Set(cur);
+                  next.add(gi);
+                  return next;
+                })
+              }
+              className="block w-full px-2.5 py-1 text-left text-caption text-accent outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+            >
+              … {g.lines.length} 行未变更(点击展开)
+            </button>
+          ) : (
+            g.lines.map((l, li) => (
+              <div
+                // biome-ignore lint/suspicious/noArrayIndexKey: diff 行无稳定 id,位置即身份
+                key={`${gi}-${li}`}
+                className={cn(
+                  "whitespace-pre-wrap break-words px-2.5",
+                  l.type === "add" && "bg-success-soft text-success",
+                  l.type === "del" && "bg-danger-soft text-danger",
+                  l.type === "same" && "text-muted",
+                )}
+              >
+                <span aria-hidden="true" className="select-none opacity-70">
+                  {l.type === "add" ? "+ " : l.type === "del" ? "- " : "  "}
+                </span>
+                {l.text || " "}
+              </div>
+            ))
+          ),
+        )}
+      </div>
     </div>
   );
 }
@@ -805,39 +1137,71 @@ function TrainDraftView({
   auth,
   run,
   rates,
-  onMergedOrDiscarded,
+  onMerged,
   confirmDialog,
 }: {
   auth: AuthSession;
   run: SkillTrainRun;
   rates: ModelRates | null;
-  onMergedOrDiscarded: () => void;
+  onMerged: () => void;
   confirmDialog: (opts: { title: string; body?: ReactNode; confirmText?: string; danger?: boolean }) => Promise<boolean>;
 }) {
   const [drafts, setDrafts] = useState<SkillDraftSummary[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [viewed, setViewed] = useState<ReadonlySet<string>>(() => new Set());
   const [detail, setDetail] = useState<SkillDraftDetail | null>(null);
-  const [showOld, setShowOld] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(true);
+  const [showDiff, setShowDiff] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [comment, setComment] = useState("");
+  const toast = useToast();
 
   useEffect(() => {
     let alive = true;
     api
       .listSkillDrafts(auth, run.runId)
-      .then(async (ds) => {
+      .then((ds) => {
         if (!alive) return;
         setDrafts(ds);
-        if (ds[0]) {
-          const d = await api.getSkillDraft(auth, run.runId, ds[0].name);
-          if (alive) setDetail(d);
-        }
+        setSelected(ds[0]?.name ?? null);
+        if (!ds[0]) setDetailLoading(false);
       })
-      .catch((e) => alive && setErr(apiErrorMessage(e, "加载草稿失败")));
+      .catch((e) => {
+        if (!alive) return;
+        setErr(apiErrorMessage(e, "加载草稿失败"));
+        setDetailLoading(false);
+      });
     return () => {
       alive = false;
     };
   }, [auth, run.runId]);
+
+  // 逐份拉详情:多份草稿现在可切换审阅(此前只拉第一份,却整 run 合并全部)。
+  useEffect(() => {
+    if (!selected) return;
+    let alive = true;
+    setDetailLoading(true);
+    api
+      .getSkillDraft(auth, run.runId, selected)
+      .then((d) => {
+        if (!alive) return;
+        setDetail(d);
+        setViewed((cur) => {
+          if (cur.has(selected)) return cur;
+          const next = new Set(cur);
+          next.add(selected);
+          return next;
+        });
+      })
+      .catch((e) => alive && setErr(apiErrorMessage(e, "加载草稿失败")))
+      .finally(() => {
+        if (alive) setDetailLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, run.runId, selected]);
 
   // 评测门结果(evalRunId 轮询到 done)
   const evalFetcher = useCallback(
@@ -850,13 +1214,31 @@ function TrainDraftView({
   );
   const [evalRun] = usePollingRun(run.evalRunId ? evalFetcher : null, evalActive);
 
+  const unviewed = drafts.filter((d) => !viewed.has(d.name));
+
   const merge = async () => {
     const evalNote = evalRun?.benchmark?.verdict
       ? `评测门结论:${evalRun.benchmark.verdict}`
       : "本草稿未经评测(无用例或评测未完成)。";
     const ok = await confirmDialog({
       title: "合并草稿到技能库?",
-      body: <p className="text-[12.5px] text-muted">{evalNote} 合并会覆盖现版(旧版自动存入历史,可回滚)。</p>,
+      body: (
+        <div className="flex flex-col gap-2 text-body">
+          <p className="text-muted">{evalNote} 合并会覆盖现版(旧版自动存入历史,可回滚)。</p>
+          <p className="font-medium text-fg">本次将合并 {drafts.length} 项:</p>
+          <ul className="list-disc pl-4 text-muted">
+            {drafts.map((d) => (
+              <li key={d.name}>
+                {d.name}（{OP_LABEL[d.op] ?? d.op}）
+                {!viewed.has(d.name) && <span className="text-warning"> · 你还没查看</span>}
+              </li>
+            ))}
+          </ul>
+          {unviewed.length > 0 && (
+            <p className="font-medium text-warning">其中 {unviewed.length} 项你还没查看。</p>
+          )}
+        </div>
+      ),
       confirmText: "合并",
     });
     if (!ok) return;
@@ -864,7 +1246,7 @@ function TrainDraftView({
     try {
       const r = await api.mergeSkillTrainRun(auth, run.runId);
       if (!r.ok) setErr(r.results.map((x) => x.error).filter(Boolean).join("; ") || "合并失败");
-      else onMergedOrDiscarded();
+      else onMerged();
     } catch (e) {
       setErr(apiErrorMessage(e, "合并失败"));
     } finally {
@@ -889,10 +1271,12 @@ function TrainDraftView({
     });
     if (!ok) return;
     setBusy(true);
+    setErr(null);
     try {
       await api.commentSkillDraft(auth, run.runId, detail.draft.record.name, c);
       setComment("");
-      setErr("已提交修订,训练会话重新运行中 —— 稍后回来看新草稿。");
+      // 成功不再塞进 err 通道靠字符串前缀判色 —— 瞬时提示走 Toast,不挂死在版面上。
+      toast("已提交修订,训练会话重新运行中,稍后回来看新草稿", "success");
     } catch (e) {
       setErr(apiErrorMessage(e, "提交修订失败"));
     } finally {
@@ -901,28 +1285,41 @@ function TrainDraftView({
   };
 
   if (!detail)
-    return err ? (
-      <Alert tone="danger" className="mt-2">{err}</Alert>
-    ) : (
-      <div className="mt-2 flex items-center gap-2 text-[12px] text-faint">
-        <Spinner size={13} /> 加载草稿…
+    return (
+      <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
+        {err && (
+          <Alert tone="danger" density="compact">
+            {err}
+          </Alert>
+        )}
+        {detailLoading && !err && (
+          <>
+            <Skeleton className="h-4 w-40" />
+            <Skeleton className="h-24 rounded-md" />
+          </>
+        )}
+        {!detailLoading && !err && <p className="text-meta text-muted">本次训练没有产出可用草稿。</p>}
       </div>
     );
 
   const d = detail.draft;
   return (
-    <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
-      {err && <Alert tone={err.startsWith("已提交") ? "info" : "danger"}>{err}</Alert>}
+    <div className="mt-2 flex flex-col gap-2 border-t border-border pt-3">
+      {err && (
+        <Alert tone="danger" density="compact" onDismiss={() => setErr(null)}>
+          {err}
+        </Alert>
+      )}
       <div className="flex flex-wrap items-center gap-1.5">
-        <FlaskConical size={14} className="text-accent" />
-        <span className="text-[13px] font-medium text-fg">草稿:{d.record.name}</span>
-        <Badge tone="accent">{d.record.op === "create" ? "新建" : d.record.op === "update" ? "更新" : "删除"}</Badge>
+        <FlaskConical size={14} className="shrink-0 text-accent" />
+        <span className="text-body font-medium text-fg">草稿:{d.record.name}</span>
+        <Badge tone="accent">{OP_LABEL[d.record.op] ?? d.record.op}</Badge>
         {drafts.length > 1 && <Badge tone="neutral">共 {drafts.length} 份草稿</Badge>}
         {d.evalsJson && <Badge tone="info">附带评测用例</Badge>}
         {evalRun &&
           (evalActive(evalRun) ? (
             <Badge tone="warning">
-              <Loader2 size={11} className="animate-spin" /> 评测门运行中
+              <Spinner size={11} /> 评测门运行中
             </Badge>
           ) : evalRun.benchmark ? (
             <Badge tone={evalRun.benchmark.verdict.startsWith("草稿更差") ? "danger" : evalRun.benchmark.verdict.startsWith("草稿更好") ? "success" : "info"}>
@@ -930,51 +1327,78 @@ function TrainDraftView({
             </Badge>
           ) : null)}
       </div>
-      {d.record.rationale && <p className="text-[12px] text-muted">理由:{d.record.rationale}</p>}
 
-      <div>
-        <button
-          type="button"
-          onClick={() => setShowOld((v) => !v)}
-          className="mb-1 text-[11.5px] text-accent hover:underline"
-        >
-          {showOld ? "收起现版对照" : "展开现版对照"}
-        </button>
-        {showOld && (
-          <pre className="mb-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-code px-2.5 py-2 font-mono text-[11.5px] text-muted">
-            {detail.current?.body || "(现版不存在 —— 新建技能)"}
+      {/* 多份草稿:逐份切换审阅。「看一份、合三份」是这块此前最危险的信息缺口。 */}
+      {drafts.length > 1 && (
+        <Tabs
+          aria-label="切换草稿"
+          layout="grid"
+          value={selected ?? drafts[0].name}
+          onValueChange={setSelected}
+          items={drafts.map((x) => ({
+            value: x.name,
+            label: `${viewed.has(x.name) ? "✓ " : ""}${x.name} · ${OP_LABEL[x.op] ?? x.op}`,
+          }))}
+        />
+      )}
+
+      {d.record.rationale && <p className="text-meta text-muted">理由:{d.record.rationale}</p>}
+
+      <div className="flex flex-col gap-1.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-caption font-medium text-muted">
+            {detail.current ? "与现版的差异" : "新建技能正文"}
+          </span>
+          {detail.current && (
+            <Button variant="link" size="sm" className="h-auto px-0" onClick={() => setShowDiff((v) => !v)}>
+              {showDiff ? "收起对照" : "展开对照"}
+            </Button>
+          )}
+        </div>
+        {detailLoading ? (
+          <Skeleton className="h-40 rounded-md" />
+        ) : detail.current ? (
+          showDiff && <DraftDiff current={detail.current.body ?? ""} draft={d.body} />
+        ) : (
+          <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-2.5 py-2 font-mono text-meta text-fg">
+            {d.body}
           </pre>
         )}
-        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-code px-2.5 py-2 font-mono text-[12px] text-fg">
-          {d.body}
-        </pre>
       </div>
 
       {evalRun && !evalActive(evalRun) && evalRun.benchmark && (
-        <div className="rounded border border-border bg-surface p-2.5">
+        <Card padding="sm" className="flex flex-col gap-2">
           <EvalResultView run={evalRun} rates={rates} />
           <UsageLine usage={evalRun.usage} rates={rates} label="评测门消耗" />
-        </div>
+        </Card>
       )}
 
-      <div className="flex items-center gap-2">
-        <Button variant="primary" size="sm" onClick={merge} disabled={busy}>
-          {busy ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />} 合并到技能库
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="primary" size="sm" loading={busy} onClick={merge} className="max-md:w-full">
+          {busy ? null : <Check size={13} />} 合并到技能库
         </Button>
-        <span className="text-[11.5px] text-faint">或对草稿留评论让 AI 修订:</span>
+        {unviewed.length > 0 && (
+          <span className="text-meta text-warning">还有 {unviewed.length} 份草稿未查看</span>
+        )}
       </div>
-      <div className="flex gap-2">
+      <Field label="对草稿留评论让 AI 修订" hint="修订会继续同一训练会话,需再次确认消耗。">
         <Textarea
           value={comment}
           onChange={(e) => setComment(e.target.value)}
           rows={2}
           placeholder="例:步骤 3 缺了鉴权说明,补上;删掉第 5 条空话"
-          className="text-[12.5px]"
         />
-        <Button variant="secondary" size="sm" onClick={sendComment} disabled={busy || !comment.trim()} className="self-end">
-          修订
-        </Button>
-      </div>
+      </Field>
+      <Button
+        variant="secondary"
+        size="sm"
+        loading={busy}
+        onClick={sendComment}
+        disabled={!comment.trim()}
+        className="self-start max-md:w-full"
+      >
+        提交修订
+      </Button>
     </div>
   );
 }

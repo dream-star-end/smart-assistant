@@ -15,6 +15,7 @@ vi.mock("../../lib/api", () => ({
     listMyAgents: (...a: unknown[]) => listMyAgents(...a),
     installMarketplace: (...a: unknown[]) => installMarketplace(...a),
   },
+  apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
 }));
 vi.mock("../../lib/clientFriction", () => ({ reportClientFriction }));
 // 富介绍走既有 <Markdown>(懒加载真实实现)。测试里用轻量桩直出文本,避免异步 chunk flake。
@@ -619,7 +620,38 @@ test("官方但非预装的 Plugin 仍显示安装按钮并可恢复安装", asy
   expect(await screen.findByText("安装成功")).toBeInTheDocument();
   expect(installMarketplace).toHaveBeenCalledWith(auth, "1606", undefined);
   expect(onInstalled).toHaveBeenCalledTimes(1);
+  // 成功不再自动关掉市场跳走(用户会看不到任何成功反馈);绑定入口改成显式的下一步按钮。
+  expect(onOpenConnectors).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "去绑定账号" }));
   expect(onOpenConnectors).toHaveBeenCalledWith("knowledge-planet");
+});
+
+test("安装失败时错误贴在底部动作区,且可原地重试", async () => {
+  getMarketplaceDetail.mockResolvedValue(detail());
+  listMyAgents.mockResolvedValue([]);
+  installMarketplace.mockRejectedValueOnce(new Error("boom")).mockResolvedValueOnce({
+    ok: true,
+    slug: "academic-translate",
+    kind: "skill",
+    version: "1.0.0",
+    installedDeps: 0,
+    installedCapabilities: [],
+    skippedOptional: [],
+    needsAuthorization: [],
+    ready: true,
+    note: "installed",
+  });
+
+  render(
+    <DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} />,
+  );
+
+  fireEvent.click(await screen.findByRole("button", { name: "安装" }));
+  // 失败提示与「重试」出口同在 footer,而不是几屏之外的滚动区顶部
+  expect(await screen.findByText("操作没有完成")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "重试" }));
+  expect(await screen.findByText("安装成功")).toBeInTheDocument();
+  expect(screen.queryByText("操作没有完成")).not.toBeInTheDocument();
 });
 
 test("精确预装 Plugin 不提供市场安装，只引导到管理中心", async () => {
@@ -677,7 +709,8 @@ test.each([
     />,
   );
 
-  expect(await screen.findByText("含可执行脚本")).toBeInTheDocument();
+  // 风险与文件清单已合并成同一个「包含内容」块:醒目度由 warning 徽章 + 脚本芯片描边承担
+  expect(await screen.findByText(/含 1 个可执行脚本/)).toBeInTheDocument();
   expect(screen.getByText(expected)).toBeInTheDocument();
   expect(screen.queryByText(forbidden)).not.toBeInTheDocument();
 });
