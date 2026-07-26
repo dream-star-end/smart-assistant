@@ -577,6 +577,98 @@ describe('CcbMessageParser: tool_result', () => {
 
 // ── Result / finalization ──
 describe('CcbMessageParser: result', () => {
+  it('attributes sequential model-call usage to each call own tool card', () => {
+    const { parser, events } = createParser()
+    const emitCall = (
+      inputTokens: number,
+      outputTokens: number,
+      toolId: string,
+    ) => {
+      parser.parse({
+        type: 'stream_event',
+        event: {
+          type: 'message_start',
+          message: { usage: { input_tokens: inputTokens } },
+        },
+      } as any)
+      parser.parse({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: toolId, name: 'Bash' },
+        },
+      } as any)
+      parser.parse({
+        type: 'stream_event',
+        event: {
+          type: 'message_delta',
+          usage: { output_tokens: outputTokens },
+        },
+      } as any)
+      parser.parse({
+        type: 'stream_event',
+        event: { type: 'message_stop' },
+      } as any)
+    }
+
+    emitCall(100, 20, 'tool-call-1')
+    emitCall(300, 40, 'tool-call-2')
+
+    const snapshots = events
+      .filter((event): event is Extract<SessionStreamEvent, { kind: 'call_usage' }> =>
+        event.kind === 'call_usage')
+      .map((event) => event.call)
+    assert.deepEqual(snapshots.filter((call) => call.callId === 'ccb-1').at(-1), {
+      callId: 'ccb-1',
+      targetIds: ['tool-call-1'],
+      usage: { totalTokens: 120, inputTokens: 100, outputTokens: 20 },
+    })
+    assert.deepEqual(snapshots.filter((call) => call.callId === 'ccb-2').at(-1), {
+      callId: 'ccb-2',
+      targetIds: ['tool-call-2'],
+      usage: { totalTokens: 340, inputTokens: 300, outputTokens: 40 },
+    })
+  })
+
+  it('keeps one exact usage value shared across parallel cards from the same call', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'message_start',
+        message: { usage: { input_tokens: 100 } },
+      },
+    } as any)
+    for (const [index, toolId] of ['parallel-1', 'parallel-2'].entries()) {
+      parser.parse({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_start',
+          index,
+          content_block: { type: 'tool_use', id: toolId, name: 'Read' },
+        },
+      } as any)
+    }
+    parser.parse({
+      type: 'stream_event',
+      event: {
+        type: 'message_delta',
+        usage: { output_tokens: 23_456 },
+      },
+    } as any)
+
+    const snapshot = events
+      .filter((event): event is Extract<SessionStreamEvent, { kind: 'call_usage' }> =>
+        event.kind === 'call_usage')
+      .at(-1)?.call
+    assert.deepEqual(snapshot, {
+      callId: 'ccb-1',
+      targetIds: ['parallel-1', 'parallel-2'],
+      usage: { totalTokens: 23_556, inputTokens: 100, outputTokens: 23_456 },
+    })
+  })
+
   it('emits absolute live snapshots across model calls and lets result usage replace them', () => {
     const { parser, events, getResult } = createParser()
 

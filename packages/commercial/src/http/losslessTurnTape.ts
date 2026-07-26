@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 import {
   isClientMessageId,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
+  type CallTokenUsageSnapshot,
   type DurableCodexBilling,
   type TurnWaiveReason,
 } from "@openclaude/protocol";
@@ -31,8 +32,20 @@ export type LosslessTurnPayload = {
   errorCode?: string;
   errorDetail?: string;
   tools?: Array<Record<string, unknown>>;
-  assistantSegments?: Array<{ index: number; text: string; ts: number; eventOrdinal?: number }>;
-  thinkingSegments?: Array<{ index: number; text: string; ts: number; eventOrdinal?: number }>;
+  assistantSegments?: Array<{
+    index: number;
+    text: string;
+    ts: number;
+    eventOrdinal?: number;
+    _callUsage?: CallTokenUsageSnapshot;
+  }>;
+  thinkingSegments?: Array<{
+    index: number;
+    text: string;
+    ts: number;
+    eventOrdinal?: number;
+    _callUsage?: CallTokenUsageSnapshot;
+  }>;
   agentGroups?: Array<Record<string, unknown>>;
   structuredBlocks?: Array<Record<string, unknown>>;
   runtimeEvents?: Array<{
@@ -144,21 +157,68 @@ function optionalObjectArray(obj: Record<string, unknown>, key: string): Array<R
   return value as Array<Record<string, unknown>>;
 }
 
+function parseCallUsage(value: unknown, path: string): CallTokenUsageSnapshot | undefined {
+  if (value === undefined) return undefined;
+  if (!isObject(value)) throw new Error(`turn tape payload.${path} must be an object`);
+  const callId = requiredString(value, "callId");
+  if (!callId) throw new Error(`turn tape payload.${path}.callId must not be empty`);
+  if (
+    !Array.isArray(value.targetIds) ||
+    value.targetIds.length === 0 ||
+    value.targetIds.some((id) => typeof id !== "string" || !id)
+  ) {
+    throw new Error(`turn tape payload.${path}.targetIds must be a non-empty string array`);
+  }
+  const usageValue = value.usage;
+  if (!isObject(usageValue)) {
+    throw new Error(`turn tape payload.${path}.usage must be an object`);
+  }
+  const count = (key: string): number | undefined => {
+    const raw = usageValue[key];
+    if (raw === undefined) return undefined;
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 0) {
+      throw new Error(`turn tape payload.${path}.usage.${key} must be a non-negative safe integer`);
+    }
+    return raw;
+  };
+  const totalTokens = count("totalTokens");
+  if (totalTokens === undefined) {
+    throw new Error(`turn tape payload.${path}.usage.totalTokens is required`);
+  }
+  const inputTokens = count("inputTokens");
+  const outputTokens = count("outputTokens");
+  const cacheReadTokens = count("cacheReadTokens");
+  const cacheCreationTokens = count("cacheCreationTokens");
+  return {
+    callId,
+    targetIds: [...value.targetIds] as string[],
+    usage: {
+      totalTokens,
+      ...(inputTokens !== undefined ? { inputTokens } : {}),
+      ...(outputTokens !== undefined ? { outputTokens } : {}),
+      ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+      ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
+    },
+  };
+}
+
 function parseSegments(
   obj: Record<string, unknown>,
   key: "assistantSegments" | "thinkingSegments",
-): Array<{ index: number; text: string; ts: number; eventOrdinal?: number }> | undefined {
+): LosslessTurnPayload[typeof key] {
   const value = obj[key];
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) throw new Error(`turn tape payload.${key} must be an array`);
   return value.map((raw, ordinal) => {
     if (!isObject(raw)) throw new Error(`turn tape payload.${key}[${ordinal}] must be an object`);
     const eventOrdinal = raw.eventOrdinal === undefined ? undefined : requiredInt(raw, "eventOrdinal");
+    const callUsage = parseCallUsage(raw._callUsage, `${key}[${ordinal}]._callUsage`);
     return {
       index: requiredInt(raw, "index"),
       text: requiredString(raw, "text"),
       ts: requiredInt(raw, "ts"),
       ...(eventOrdinal !== undefined ? { eventOrdinal } : {}),
+      ...(callUsage ? { _callUsage: callUsage } : {}),
     };
   });
 }
@@ -367,11 +427,23 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   const usage = optionalObject(raw, "usage");
   const errorCode = optionalString(raw, "errorCode");
   const errorDetail = optionalString(raw, "errorDetail");
-  const tools = optionalObjectArray(raw, "tools");
+  const tools = optionalObjectArray(raw, "tools")?.map((tool, index) => {
+    const callUsage = parseCallUsage(tool._callUsage, `tools[${index}]._callUsage`);
+    return {
+      ...tool,
+      ...(callUsage ? { _callUsage: callUsage } : {}),
+    };
+  });
   const assistantSegments = parseSegments(raw, "assistantSegments");
   const thinkingSegments = parseSegments(raw, "thinkingSegments");
   const agentGroups = parseAgentGroups(raw);
-  const structuredBlocks = optionalObjectArray(raw, "structuredBlocks");
+  const structuredBlocks = optionalObjectArray(raw, "structuredBlocks")?.map((block, index) => {
+    const callUsage = parseCallUsage(block._callUsage, `structuredBlocks[${index}]._callUsage`);
+    return {
+      ...block,
+      ...(callUsage ? { _callUsage: callUsage } : {}),
+    };
+  });
   const runtimeEvents = parseRuntimeEvents(raw);
   const engineBilling = parseEngineBilling(raw);
   if (engineBilling !== undefined) {
@@ -709,6 +781,7 @@ export function materializeLosslessTurn(
         text: segment.text,
         ts: segment.ts,
         status: body.status,
+        ...(segment._callUsage ? { _callUsage: segment._callUsage } : {}),
       }, segment.eventOrdinal));
     }
   } else if (body.thinkingText) {
@@ -857,6 +930,7 @@ export function materializeLosslessTurn(
         text: segment.text,
         ts: segment.ts,
         status: body.status,
+        ...(segment._callUsage ? { _callUsage: segment._callUsage } : {}),
         ...(last ? { _turnKey: body.turnKey } : {}),
         ...(last && body.usage ? { usage: body.usage } : {}),
         ...(last && body.truncated ? { _truncated: true } : {}),

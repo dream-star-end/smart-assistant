@@ -7,6 +7,7 @@
  */
 import { performance } from 'node:perf_hooks'
 import {
+  type CallTokenUsageSnapshot,
   type OutboundContentBlock,
   type TurnTokenUsageSnapshot,
   isToolExitCode,
@@ -386,6 +387,9 @@ export class CcbMessageParser {
    * separate until the result row supplies the authoritative turn aggregate. */
   private completedCallUsage: TurnTokenUsageSnapshot = { totalTokens: 0 }
   private currentCallUsage: TurnTokenUsageSnapshot | null = null
+  private currentCallId: string | null = null
+  private currentCallIndex = 0
+  private currentCallTargetIds = new Set<string>()
 
   private onEvent: (e: SessionStreamEvent) => void
   private onToolUse?: (tool: DetectedToolUse) => void
@@ -462,7 +466,16 @@ export class CcbMessageParser {
     nextDurableEventOrdinal?: () => number
   }) {
     this.toolUseIdToName = opts.toolUseIdToName
-    this.onEvent = opts.onEvent
+    // Observe every top-level block through one choke point so the exact
+    // per-call usage can follow the card even though usage snapshots arrive
+    // on separate stream events.
+    this.onEvent = (event) => {
+      const targetAdded =
+        event.kind === 'block' && this._trackCurrentCallTarget(event.block)
+      opts.onEvent(event)
+      // The card must exist before its first usage sideband is delivered.
+      if (targetAdded) this._emitLiveCallUsage()
+    }
     this.onToolUse = opts.onToolUse
     this.onToolResult = opts.onToolResult
     this.onBashToolObserved = opts.onBashToolObserved
@@ -801,12 +814,31 @@ export class CcbMessageParser {
     }
   }
 
+  private _trackCurrentCallTarget(block: OutboundContentBlock): boolean {
+    if (
+      !this.currentCallUsage ||
+      !this.currentCallId ||
+      ('parentToolUseId' in block && block.parentToolUseId)
+    ) {
+      return false
+    }
+    let targetId: string | undefined
+    if (block.kind === 'tool_use') targetId = block.blockId
+    else if (block.kind === 'text' || block.kind === 'thinking') targetId = block.messageId
+    else if (block.kind === 'plan' || block.kind === 'goal') targetId = block.blockId
+    if (!targetId || this.currentCallTargetIds.has(targetId)) return false
+    this.currentCallTargetIds.add(targetId)
+    return true
+  }
+
   private _handleStreamEvent(msg: SdkMessage, parentToolUseId?: string): void {
     const ev = (msg as any).event
     if (!ev || typeof ev !== 'object') return
 
     if (ev.type === 'message_start') {
       this._settleCurrentCallUsage()
+      this.currentCallId = `ccb-${++this.currentCallIndex}`
+      this.currentCallTargetIds = new Set()
       this.currentCallUsage = { totalTokens: 0 }
       const patch = tokenUsagePatch(ev.message?.usage)
       if (patch) {
@@ -1015,8 +1047,32 @@ export class CcbMessageParser {
 
   private _settleCurrentCallUsage(): void {
     if (!this.currentCallUsage) return
+    this._emitLiveCallUsage()
     this.completedCallUsage = addTokenUsage(this.completedCallUsage, this.currentCallUsage)
     this.currentCallUsage = null
+    this.currentCallId = null
+    this.currentCallTargetIds = new Set()
+  }
+
+  private _currentCallSnapshot(): CallTokenUsageSnapshot | null {
+    if (
+      !this.currentCallUsage ||
+      this.currentCallUsage.totalTokens <= 0 ||
+      !this.currentCallId ||
+      this.currentCallTargetIds.size === 0
+    ) {
+      return null
+    }
+    return {
+      callId: this.currentCallId,
+      targetIds: [...this.currentCallTargetIds],
+      usage: { ...this.currentCallUsage },
+    }
+  }
+
+  private _emitLiveCallUsage(): void {
+    const call = this._currentCallSnapshot()
+    if (call) this.onEvent({ kind: 'call_usage', call })
   }
 
   private _emitLiveTokenUsage(): void {
@@ -1024,6 +1080,7 @@ export class CcbMessageParser {
     const usage = addTokenUsage(this.completedCallUsage, this.currentCallUsage)
     if (usage.totalTokens <= 0) return
     this.onEvent({ kind: 'usage', usage })
+    this._emitLiveCallUsage()
   }
 
   private _handleAssistant(msg: SdkMessage, parentToolUseId?: string): void {

@@ -444,7 +444,13 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
   test("完整 turn:delta→text / reasoning→thinking / commandExecution→Bash / fileChange→Write / plan / tokenUsage→TurnSummary + billing", async () => {
     const h = makeHarness();
     const totals = makeTotals(0);
-    const turn = beginTurn(h, { requestId: "req-full", sessionTotals: totals });
+    const turn = beginTurn(h, {
+      requestId: "req-full",
+      sessionTotals: totals,
+      assistantMessageId: "srv-assistant",
+      thinkingMessageId: "srv-thinking",
+      toolMessageIdFactory: (blockId) => `srv-tool-${blockId}`,
+    });
     await waitForRequest(h, "turn/start");
     const p = h.proc();
     const tid = { threadId: "thr-new-1", turnId: "turn-1" };
@@ -521,10 +527,34 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
       "tool_result_detected",
       "block:plan",
       "block:text",
+      "call_usage",
       "usage", // thread/tokenUsage/updated live snapshot
       "usage", // result.usage authoritative terminal replacement
       "final",
     ]);
+    const callUsage = h.events.find(
+      (event): event is Extract<EngineEvent, { kind: "call_usage" }> =>
+        event.kind === "call_usage",
+    );
+    assert.deepEqual(callUsage?.call.usage, {
+      totalTokens: 340,
+      inputTokens: 200,
+      outputTokens: 40,
+      cacheReadTokens: 100,
+    });
+    assert.equal(callUsage?.call.callId, "codex-1");
+    assert.deepEqual(
+      new Set(callUsage?.call.targetIds),
+      new Set([
+        "srv-thinking-s0",
+        "srv-assistant-s0",
+        "srv-assistant-s1",
+        "c1",
+        "f1",
+        "codex-plan-turn-1",
+      ]),
+      "one exact model call must bind every canonical reasoning/text/tool/plan card it produced",
+    );
     const toolBlocks = h.events.filter(
       (e): e is Extract<EngineEvent, { kind: "block" }> =>
         e.kind === "block" && (e.block as { kind: string }).kind === "tool_use",

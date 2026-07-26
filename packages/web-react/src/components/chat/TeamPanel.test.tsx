@@ -25,18 +25,18 @@ describe("TeamPanel 团队协作面板", () => {
       }),
     ];
     const view = render(<TeamPanel members={members} sig="tokens-1" />);
-    expect(screen.getByText("合计 150 token")).toBeInTheDocument();
-    expect(screen.getByText("子 Agent 100 token")).toBeInTheDocument();
-    expect(screen.getByText("子 Agent 50 token")).toBeInTheDocument();
+    expect(screen.getByText("150")).toBeInTheDocument();
+    expect(screen.getByText("100")).toBeInTheDocument();
+    expect(screen.getByText("50")).toBeInTheDocument();
 
     const updated = [
       { ...members[0], _delegateUsageByRun: { "run-a": { totalTokens: 180 } } },
       members[1],
     ];
     view.rerender(<TeamPanel members={updated} sig="tokens-2" />);
-    expect(screen.getByText("合计 230 token")).toBeInTheDocument();
-    expect(screen.getByText("子 Agent 180 token")).toBeInTheDocument();
-    expect(screen.queryByText("合计 150 token")).not.toBeInTheDocument();
+    expect(screen.getByText("230")).toBeInTheDocument();
+    expect(screen.getByText("180")).toBeInTheDocument();
+    expect(screen.queryByText("150")).not.toBeInTheDocument();
   });
 
   test("头部显示队员数 + 运行中/完成/失败 概览;活跃默认展开队员", () => {

@@ -13,6 +13,7 @@ import type { MessageReplyQuote } from "@openclaude/protocol";
 import {
   applyCostCharged,
   applyCostWaived,
+  applyCallUsage,
   applyLegacyBridgeError,
   applyOutboundError,
   applyOutboundMessage,
@@ -107,6 +108,7 @@ import type {
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
   OutboundTurnUsageWire,
+  OutboundCallUsageWire,
   OutboundWire,
   GoalSnapshotWire,
   RepoBindErrorWire,
@@ -1397,6 +1399,15 @@ export class ChatSocket {
         if (sess) {
           this.confirmDispatchAdmission(sess.id, frame.clientMessageId);
           applyTurnUsage(sess, frame);
+        }
+        return;
+      }
+      case "outbound.call_usage": {
+        const frame = f as OutboundCallUsageWire;
+        const sess = this.sessions.get(frame.peer?.id);
+        if (sess) {
+          this.confirmDispatchAdmission(sess.id, frame.clientMessageId);
+          applyCallUsage(sess, frame);
         }
         return;
       }

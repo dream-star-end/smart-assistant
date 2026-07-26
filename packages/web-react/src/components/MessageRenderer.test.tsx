@@ -588,35 +588,34 @@ describe("permission 审批", () => {
   });
 });
 
-describe("MessageList 本轮 token 实时展示", () => {
-  test("同一轮所有 token 卡共享权威快照并实时替换", () => {
+describe("MessageList 每张调用卡 token 实时展示", () => {
+  test("思考和工具卡只显示自己的调用消耗，最终助手保留本轮快照", () => {
     const messages: ChatMessage[] = [
       mk("user", { id: "u-live-token", text: "继续" }),
-      mk("thinking", { id: "th-live-token", text: "分析中" }),
+      mk("thinking", {
+        id: "th-live-token",
+        text: "分析中",
+        _callUsage: {
+          callId: "a1-ccb-1",
+          targetIds: ["th-live-token"],
+          usage: { totalTokens: 64 },
+        },
+      }),
       mk("tool", {
         id: "tool-live-token",
         toolName: "Bash",
         inputJson: { command: "pwd" },
         _completed: false,
+        _callUsage: {
+          callId: "a1-ccb-2",
+          targetIds: ["tool-live-token"],
+          usage: { totalTokens: 128 },
+        },
       }),
       mk("assistant", { id: "a-live-token", text: "阶段结果" }),
       mk("plan", { id: "plan-live-token", text: "下一步计划" }),
     ];
     const view = render(
-      <MessageList
-        messages={messages}
-        sending
-        liveTurnUsage={{
-          clientMessageId: "u-live-token",
-          usage: { totalTokens: 128 },
-        }}
-        cb={{}}
-        onRespondPermission={() => {}}
-      />,
-    );
-    expect(screen.getAllByText("本轮 128 token")).toHaveLength(4);
-
-    view.rerender(
       <MessageList
         messages={messages}
         sending
@@ -628,11 +627,34 @@ describe("MessageList 本轮 token 实时展示", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getAllByText("本轮 256 token")).toHaveLength(4);
-    expect(screen.queryByText("本轮 128 token")).not.toBeInTheDocument();
+    expect(screen.getByText("64")).toBeInTheDocument();
+    expect(screen.getByText("128")).toBeInTheDocument();
+    expect(screen.getByText("256")).toBeInTheDocument();
+
+    messages[2]._callUsage = {
+      callId: "a1-ccb-2",
+      targetIds: ["tool-live-token"],
+      usage: { totalTokens: 2_048 },
+    };
+    view.rerender(
+      <MessageList
+        messages={messages}
+        sending
+        liveTurnUsage={{
+          clientMessageId: "u-live-token",
+          usage: { totalTokens: 512 },
+        }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("2.05k")).toBeInTheDocument();
+    expect(screen.queryByText("128")).not.toBeInTheDocument();
+    expect(screen.getByText("512")).toBeInTheDocument();
+    expect(screen.queryByText("256")).not.toBeInTheDocument();
   });
 
-  test("浏览器估算态明确显示约数，exact 接棒后移除约字", () => {
+  test("浏览器估算只显示在最终助手，exact 接棒后移除约字", () => {
     const messages: ChatMessage[] = [
       mk("user", { id: "u-estimated-token", text: "继续" }),
       mk("tool", {
@@ -641,6 +663,7 @@ describe("MessageList 本轮 token 实时展示", () => {
         inputJson: { command: "pwd" },
         _completed: false,
       }),
+      mk("assistant", { id: "a-estimated-token", text: "处理中" }),
     ];
     const view = render(
       <MessageList
@@ -654,7 +677,8 @@ describe("MessageList 本轮 token 实时展示", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText("本轮 约 128 token")).toBeInTheDocument();
+    expect(screen.getByText("约128")).toBeInTheDocument();
+    expect(screen.getAllByLabelText("本轮估算约 128 token")).toHaveLength(1);
 
     view.rerender(
       <MessageList
@@ -668,11 +692,11 @@ describe("MessageList 本轮 token 实时展示", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText("本轮 128 token")).toBeInTheDocument();
-    expect(screen.queryByText("本轮 约 128 token")).not.toBeInTheDocument();
+    expect(screen.getByText("128")).toBeInTheDocument();
+    expect(screen.queryByText("约128")).not.toBeInTheDocument();
   });
 
-  test("历史轮从 durable usage anchor 恢复同轮卡片 token", () => {
+  test("历史轮恢复每张卡自己的 durable 调用消耗，不复制最终助手总量", () => {
     const messages: ChatMessage[] = [
       mk("user", { id: "u-history-token", text: "运行" }),
       mk("tool", {
@@ -680,6 +704,11 @@ describe("MessageList 本轮 token 实时展示", () => {
         toolName: "Bash",
         inputJson: { command: "pwd" },
         _completed: true,
+        _callUsage: {
+          callId: "a1-ccb-1",
+          targetIds: ["tool-history-token"],
+          usage: { totalTokens: 111 },
+        },
       }),
       mk("assistant", {
         id: "a-history-token",
@@ -695,7 +724,8 @@ describe("MessageList 本轮 token 实时展示", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getAllByText("本轮 333 token")).toHaveLength(2);
+    expect(screen.getByText("111")).toBeInTheDocument();
+    expect(screen.getByText("333")).toBeInTheDocument();
   });
 });
 

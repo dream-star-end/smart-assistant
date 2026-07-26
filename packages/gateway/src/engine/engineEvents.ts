@@ -20,6 +20,7 @@
  * 只允许存在于各 adapter 内部,不得出现在本模块的任何类型里。
  */
 import type {
+  CallTokenUsageSnapshot,
   DurableCodexBilling,
   DurableRuntimeEvent,
   OutboundContentBlock,
@@ -137,6 +138,8 @@ export interface TurnToolEntry {
   eventOrdinal?: number
   inputTruncated?: boolean
   outputTruncated?: boolean
+  /** Exact model call that produced this card. Never used for billing. */
+  _callUsage?: CallTokenUsageSnapshot
 }
 
 /** One assistant/thinking text segment within a turn. A new segment starts
@@ -149,6 +152,8 @@ export interface SegmentRecord {
   ts: number
   /** Global, monotonic ordinal of the segment's first emitted byte. */
   eventOrdinal?: number
+  /** Exact model call that produced this segment. Never used for billing. */
+  _callUsage?: CallTokenUsageSnapshot
 }
 
 /** turn 终态 meta(原 SessionStreamEvent 'final' 变体的 meta,逐字段不变)。 */
@@ -178,6 +183,7 @@ export interface EngineFinalMeta {
 export type EngineContentEvent =
   | { kind: 'block'; block: OutboundContentBlock }
   | { kind: 'usage'; usage: TurnTokenUsageSnapshot }
+  | { kind: 'call_usage'; call: CallTokenUsageSnapshot }
   | { kind: 'final'; meta?: EngineFinalMeta }
   // 审计 R3:error 事件可携带 runner 现场预分类的 errorClass(codex classifyRunError
   // 产物;CCB 缺省不带)。server.ts 据此直接按码组 outbound.error,省一次原文正则;

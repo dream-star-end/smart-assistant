@@ -2828,6 +2828,175 @@ describe('handleNotification — collabAgentToolCall', () => {
 })
 
 describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', () => {
+  function tokenUsageFrame(
+    turnId: string,
+    last: { inputTokens: number; outputTokens: number; totalTokens: number },
+    total: { inputTokens: number; outputTokens: number; totalTokens: number },
+  ): Record<string, unknown> {
+    return {
+      jsonrpc: '2.0',
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'thr',
+        turnId,
+        tokenUsage: {
+          last: {
+            cachedInputTokens: 0,
+            reasoningOutputTokens: 0,
+            ...last,
+          },
+          total: {
+            cachedInputTokens: 0,
+            reasoningOutputTokens: 0,
+            ...total,
+          },
+        },
+      },
+    }
+  }
+
+  it('attributes sequential exact call usage to each own tool item', async () => {
+    const h = await makeHarness()
+    const calls: any[] = []
+    h.runner.on('call_usage', (call) => calls.push(call))
+    ;(h.runner as any).activeTurnId = 't-call-cards'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-call-cards',
+        item: { id: 'tool-1', type: 'commandExecution', command: 'pwd' },
+      },
+    })
+    feed(h.runner, tokenUsageFrame(
+      't-call-cards',
+      { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+      { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+    ))
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-call-cards',
+        item: { id: 'tool-2', type: 'webSearch', query: 'latest' },
+      },
+    })
+    feed(h.runner, tokenUsageFrame(
+      't-call-cards',
+      { inputTokens: 300, outputTokens: 40, totalTokens: 340 },
+      { inputTokens: 400, outputTokens: 60, totalTokens: 460 },
+    ))
+
+    assert.deepEqual(calls.filter((call) => call.callId === 'codex-1').at(-1), {
+      callId: 'codex-1',
+      targetIds: ['tool-1'],
+      usage: { totalTokens: 120, inputTokens: 100, outputTokens: 20, cacheReadTokens: 0 },
+    })
+    assert.deepEqual(calls.filter((call) => call.callId === 'codex-2').at(-1), {
+      callId: 'codex-2',
+      targetIds: ['tool-2'],
+      usage: { totalTokens: 340, inputTokens: 300, outputTokens: 40, cacheReadTokens: 0 },
+    })
+    await h.cleanup()
+  })
+
+  it('maps parallel tool cards to one shared exact call without averaging', async () => {
+    const h = await makeHarness()
+    const calls: any[] = []
+    h.runner.on('call_usage', (call) => calls.push(call))
+    ;(h.runner as any).activeTurnId = 't-parallel-cards'
+    for (const id of ['parallel-1', 'parallel-2']) {
+      feed(h.runner, {
+        jsonrpc: '2.0',
+        method: 'item/started',
+        params: {
+          threadId: 'thr',
+          turnId: 't-parallel-cards',
+          item: { id, type: 'commandExecution', command: `echo ${id}` },
+        },
+      })
+    }
+    feed(h.runner, tokenUsageFrame(
+      't-parallel-cards',
+      { inputTokens: 120_000, outputTokens: 3_456, totalTokens: 123_456 },
+      { inputTokens: 120_000, outputTokens: 3_456, totalTokens: 123_456 },
+    ))
+    assert.deepEqual(calls.at(-1), {
+      callId: 'codex-1',
+      targetIds: ['parallel-1', 'parallel-2'],
+      usage: {
+        totalTokens: 123_456,
+        inputTokens: 120_000,
+        outputTokens: 3_456,
+        cacheReadTokens: 0,
+      },
+    })
+    await h.cleanup()
+  })
+
+  it('late async item target stays on its synchronously bound call epoch', async () => {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    const calls: any[] = []
+    h.runner.on('call_usage', (call) => calls.push(call))
+    runner.activeTurnId = 't-late-target'
+    runner.handleItemCompleted = async (item: Record<string, unknown>) => {
+      await new Promise((resolve) => setImmediate(resolve))
+      runner.emitAssistantToolUse(item.id, 'codex:lateItem', item)
+    }
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-late-target',
+        item: { id: 'late-item', type: 'lateItem' },
+      },
+    })
+    feed(h.runner, tokenUsageFrame(
+      't-late-target',
+      { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
+      { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
+    ))
+    await waitFor(() => calls.length > 0)
+    assert.deepEqual(calls.at(-1), {
+      callId: 'codex-1',
+      targetIds: ['late-item'],
+      usage: { totalTokens: 100, inputTokens: 80, outputTokens: 20, cacheReadTokens: 0 },
+    })
+    await h.cleanup()
+  })
+
+  it('duplicate total snapshot refreshes the same call instead of advancing attribution', async () => {
+    const h = await makeHarness()
+    const calls: any[] = []
+    h.runner.on('call_usage', (call) => calls.push(call))
+    ;(h.runner as any).activeTurnId = 't-duplicate-total'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-duplicate-total',
+        item: { id: 'tool-duplicate', type: 'commandExecution', command: 'pwd' },
+      },
+    })
+    const frame = tokenUsageFrame(
+      't-duplicate-total',
+      { inputTokens: 90, outputTokens: 10, totalTokens: 100 },
+      { inputTokens: 90, outputTokens: 10, totalTokens: 100 },
+    )
+    feed(h.runner, frame)
+    feed(h.runner, frame)
+    assert.equal(calls.at(-1)?.callId, 'codex-1')
+    assert.equal((h.runner as any).callUsageEpoch, 1)
+    await h.cleanup()
+  })
+
   it('refreshes activeTurnTotal and computes baseline on first notification (no priorTurnTotal)', async () => {
     // First-ever notification on a fresh runner. priorTurnTotal is null so
     // the bootstrap path infers baseline = total - last (≈ everything before

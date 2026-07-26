@@ -10,7 +10,10 @@
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
 import type { MessageReplyQuote } from "@openclaude/protocol";
-import type { TurnTokenUsageSnapshot } from "@openclaude/protocol/frames";
+import type {
+  CallTokenUsageSnapshot,
+  TurnTokenUsageSnapshot,
+} from "@openclaude/protocol/frames";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
 import type { InboundMessage, MediaRef } from "./frames";
@@ -251,6 +254,9 @@ export type ChatMessage = {
 
   // ── assistant / 通用 ──
   usage?: MsgUsage;
+  /** Exact model call that produced this card/message. Display-only; billing
+   * continues to use the turn-level `usage` field. */
+  _callUsage?: CallTokenUsageSnapshot;
   /** max_tokens / pause_turn 截断标记（渲染 “继续” 按钮）。*/
   _truncated?: string;
   /** error 红卡：归一化 code + 折叠区原始 detail。*/

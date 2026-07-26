@@ -115,6 +115,10 @@ class FakeTurnRunner extends EventEmitter {
     });
   }
 
+  emitRawMessage(message: unknown): void {
+    this.emit("message", message);
+  }
+
   emitResult(requestId?: string): void {
     this.emit("message", {
       type: "result",
@@ -458,6 +462,100 @@ describe("SessionManager pending-persistence tracking", () => {
 });
 
 describe("SessionManager turn-scoped runner exits", () => {
+  test("forwards live call usage and freezes it onto its own durable tool card", async () => {
+    const payloads: V3MasterSinkPayload[] = [];
+    setV3MasterSinkSingleton({
+      persistOrQueue: async (payload: V3MasterSinkPayload) => {
+        payloads.push(payload);
+        return { ok: true as const };
+      },
+      attemptOnce: async () => {},
+    } as V3MasterSink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeTurnRunner((r, requestId) => {
+        setImmediate(() => {
+          r.emitRawMessage({
+            type: "stream_event",
+            event: {
+              type: "message_start",
+              message: { usage: { input_tokens: 120_000 } },
+            },
+          });
+          r.emitRawMessage({
+            type: "stream_event",
+            event: {
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "tool_use", id: "tool-own-usage", name: "Bash" },
+            },
+          });
+          r.emitRawMessage({
+            type: "assistant",
+            message: {
+              content: [{
+                type: "tool_use",
+                id: "tool-own-usage",
+                name: "Bash",
+                input: { command: "pwd" },
+              }],
+            },
+          });
+          r.emitRawMessage({
+            type: "user",
+            message: {
+              content: [{
+                type: "tool_result",
+                tool_use_id: "tool-own-usage",
+                content: "/workspace",
+              }],
+            },
+          });
+          r.emitRawMessage({
+            type: "stream_event",
+            event: {
+              type: "message_delta",
+              usage: { output_tokens: 3_456 },
+            },
+          });
+          r.emitRawMessage({
+            type: "stream_event",
+            event: { type: "message_stop" },
+          });
+          r.emitRawMessage({
+            type: "result",
+            total_cost_usd: 0.01,
+            usage: { input_tokens: 120_000, output_tokens: 3_456 },
+            ...(requestId ? { requestId } : {}),
+          });
+        });
+      });
+      const session = makeTurnSession(runner);
+      session.channel = "webchat";
+
+      await runPrivateOneTurn(sm, session, events);
+      await sm.awaitPendingPersistence();
+
+      const call = events
+        .filter((event): event is Extract<SessionStreamEvent, { kind: "call_usage" }> =>
+          event.kind === "call_usage")
+        .at(-1)?.call;
+      assert.deepEqual(call, {
+        callId: "a1-ccb-1",
+        targetIds: ["tool-own-usage"],
+        usage: {
+          totalTokens: 123_456,
+          inputTokens: 120_000,
+          outputTokens: 3_456,
+        },
+      });
+      assert.deepEqual(payloads.at(-1)?.tools?.[0]?._callUsage, call);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("clean lifecycle exit during Codex app-server respawn does not finalize the turn", async () => {
     const sm = new SessionManager(makeConfigStub());
     const events: SessionStreamEvent[] = [];
