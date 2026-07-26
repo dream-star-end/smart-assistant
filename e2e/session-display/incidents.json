@@ -621,10 +621,6 @@
       "coverageCommits": [
         "d007c3d7"
       ],
-      "proofPending": {
-        "reason": "Stop 血缘目前由 gateway/web-react unit 覆盖;真浏览器受信点击 Stop 的活体用例待补(browser-tests 尚无 Stop 场景)。",
-        "since": "2026-07-26"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -635,6 +631,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/delegateStopRepoInheritance.test.ts",
           "assertion": "exact browser Stop finds the old assistant turn and cascades through its team tree"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
+          "assertion": "停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活"
         }
       ]
     },
