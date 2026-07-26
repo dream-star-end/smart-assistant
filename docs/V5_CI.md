@@ -23,6 +23,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | web-react-browser | `npm run test:browser` | 真 Chromium 受信点击:附件/选择器一类"jsdom 恒假阴性"的交互真的能点开 | 20 min |
 | v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化) | 20 min |
 | commercial-unit | `npm run test:commercial:unit:gate` | 商业后端全量 unit(基线失败集 diff 门,见下) | 30 min |
+| commercial-integ | `bash .github/scripts/commercial-integ-gate.sh <shard>` | 真 PG 语义:能注册/能收验证信/能登录/refresh 家族被盗整族吊销/下单加积分/同一 request_id 只扣一次钱/会话 tape 落库读回/新表有保留策略 | 20 min/片 |
 
 一把梭:`npm run check:v5`。**它与 CI 的 job 命令并集必须逐条相等**,由 `npm run
 check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集非空即红。
@@ -30,8 +31,13 @@ check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集
 开发者按文档跑绿却漏掉最贵的那道门。
 
 注意:`check:v5` 是 v5 的质量门,**不含** biome lint(`npm run lint`,当前 3657 error
-存量,见「已知风险」)/ integ 测试 / `test:web` / `lint:undefined-refs`(后两者只服务
+存量,见「已知风险」)/ `test:web` / `lint:undefined-refs`(后两者只服务
 `packages/web`);v3 / 个人版的全量门仍是 `npm run check`。
+
+integ 分两档:**PR 门第一梯队**(22 文件 / 473 例,pr-1/2/3 三片)已在 `check:v5` 与 CI 里;
+**夜跑梯队**(其余 87 文件)走 `.github/workflows/v5-integ-nightly.yml`,失败开工单而非阻塞 PR。
+梯队清单由 `npm run lint:integ-tiers` 强制:新增 `*.integ.test.ts` 不登记进任一梯队即红
+(近 30 天新增了 59 个 integ 文件,没有这条门一年后又会攒出一堆谁也不跑的用例)。
 
 `packages/web` 的作用面**不是"v5 完全不加载"那么简单**,见
 `packages/web/README.md`:v5 master 注入 `OC_RUNTIME_CHANNEL=v5` → web root =
@@ -52,7 +58,6 @@ CLI 落到默认 `v3` 分支、`packages/web/public` 就是容器的 web root。
 无法与根脚本集合对齐。要跑 workspace 脚本就在根 `package.json` 加 alias(例:
 `test:browser` → `npm run --workspace @openclaude/web-react test:browser`),两侧都用 alias。
 违反时 parity 门直接红并给出改法。
-
 ## commercial-unit:基线失败集 diff 门
 
 商业 unit 套件(`test:commercial:unit`)存在**已知存量失败**(多为 v3 迁移
@@ -177,6 +182,68 @@ docker run -d --name oc-test-redis -p 56379:6379 redis:7
 
 unit 套件只用到 PG(`TEST_REDIS_URL` 仅 integ 测试使用);测试代码内置默认
 `postgres://test:test@127.0.0.1:55432/openclaude_test`,端口对上即可零配置。
+
+## commercial-integ:分层 + 四条判绿判据
+
+### 为什么单独一层
+
+`packages/commercial` 的单测把"SQL 真行为"**显式 delegate 给 integ**
+(`turnDispatchStore.test.ts` / `turnDispatchReconciler.test.ts` /
+`preferences.test.ts` 的头注释白纸黑字写着"由 integ 覆盖")。而 2026-07-26 门禁
+审计实测:这 110 个 `*.integ.test.ts` / 1549 个用例在 CI、deploy、playbook 三处
+**都不跑** —— 委派链的下游根本不存在,近 30 天还新增了 59 个文件进这个黑洞。
+本节记录把它接成真门的方案。
+
+### 分层与分片
+
+单一权威 = `.github/integ-tiers/*.txt`(格式与登记规则见该目录 README):
+
+| 梯队 | 文件数 | 在哪跑 | 红了怎么办 |
+| --- | --- | --- | --- |
+| `pr-1` / `pr-2` / `pr-3` | 22 | `v5-ci.yml` 的 `commercial-integ` matrix,每 PR | 阻塞合并 |
+| `nightly-1` … `nightly-5` | 87 | `v5-integ-nightly.yml`,每日 03:00 沪时 | 开工单,不阻塞 PR |
+
+PR 门第一梯队绿 = **能注册、能收到验证信、能登录、refresh 家族被盗会整族吊销、
+下单加积分、同一 request_id 只扣一次钱、会话 tape 能落 PG 也能读回、迁移链能从零
+重放且校验和不漂、每张新表都登记了保留策略**。
+
+分片不是为了好看:PR#131 当初就是 integ job 撞 45min 全局 timeout,把合并卡死
+8 天。每片在清单头声明 `# max-minutes: N` 预算,超预算的正确处置是**拆片**,
+不是调大 timeout。
+
+### 四条判绿判据(刻意比 unit 的基线 diff 严)
+
+`diff-known-failures.sh` 只比"失败集 ⊆ 基线",skip 掉的、根本没跑的、TAP plan 被
+截断的,它一律当绿。integ 恰恰是最容易"静默不跑"的一层 —— 实测坏连接串下
+`settleUsage.integ` 输出 `# tests 16 / pass 0 / fail 0 / skipped 16`,**exit 0**。
+照抄那套等于把 fail-open 换个地方复现。`commercial-integ-gate.sh` 要求四条同时成立:
+
+| 判据 | 含义 | 防的是 |
+| --- | --- | --- |
+| G1 | 失败集 ⊆ 基线 | 新增回归 |
+| G2 | `skipped == 0` | fixture 缺失被当成"通过" |
+| G3 | `executed >= min-tests` | 用例被删 / 被 `--test-only` 圈掉 |
+| G4 | TAP `1..N` 存在且 N == 实际测试点数 | 进程中途死掉、输出被截断 |
+
+`min-tests` 写在各清单头。**用例只增不减**,所以它取"当前实测用例数"即可;
+有人删用例导致低于下界,门会红,这是刻意的。有意删用例时同步下调并在 PR 说明。
+
+### fixture fail-closed 必须对每种 fixture 逐一成立
+
+- PG:`REQUIRE_TEST_DB=1`(gate 脚本无条件 export,CI job 又设 `CI=true`)。
+- Redis:此前 20 个用到 `TEST_REDIS_URL` 的文件只有 6 个在缺 Redis 时抛,其余 14 个
+  静默降级(HTTP handler 干脆不装配)—— "绿"只证明了没跑。现已统一补
+  `if (!redis && REQUIRE_TEST_DB) throw`。
+- docker:`agentSupervisor.integ` 用 `REQUIRE_TEST_DOCKER`(CI 上恒真,GitHub runner
+  自带 dockerd);本地开发机没 docker 仍可 skip。
+
+### 漂移门
+
+`npm run lint:integ-tiers`(`scripts/check-integ-tiers.ts`,范式同
+`scripts/check-schedulers.ts`)守 5 条规则:每个磁盘上的 integ 文件必须被某清单
+收录 / 清单里的路径必须存在 / 不得重复登记 / 每清单必须声明 `min-tests` 与
+`max-minutes` / 至少有一个 `pr-*` 清单。没有这条门,一年后又会攒出一堆谁也不跑的
+用例 —— 这正是本次审计发现的那 110 个的成因。
 
 ## 已知风险(交集成者首跑观察)
 

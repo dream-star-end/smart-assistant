@@ -25,6 +25,7 @@ import {
   markSent,
   type AlertEventInput,
 } from "../admin/alertOutbox.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -93,6 +94,7 @@ before(async () => {
   }
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 6 }));
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 

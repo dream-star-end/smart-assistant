@@ -9,6 +9,7 @@ import {
   recordRateLimitEvent,
   wrapIoredis,
 } from "../middleware/rateLimit.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-15 集成:真 Redis + 真 PG 验证
@@ -27,26 +28,6 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 let redis: IORedis | null = null;
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
 
 async function probePg(): Promise<boolean> {
   const p = createPool({
@@ -86,7 +67,7 @@ before(async () => {
     await resetPool();
     const pool = createPool({ connectionString: TEST_DB_URL, max: 5 });
     setPoolOverride(pool);
-    await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+    await resetTestSchemaForTest();
     await runMigrations();
   } else if (REQUIRE_TEST_DB) {
     throw new Error("Postgres test fixture required");
@@ -103,7 +84,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* ignore */ }
+    try { await resetTestSchemaForTest(); } catch { /* ignore */ }
     await closePool();
   }
 });

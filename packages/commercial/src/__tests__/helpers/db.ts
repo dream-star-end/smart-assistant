@@ -1,4 +1,8 @@
+import { mkdtemp, readdir, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { after, before } from "node:test";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { query, type QueryRunner } from "../../db/queries.js";
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from "../../db/index.js";
@@ -54,8 +58,12 @@ export async function truncateAllForTest(
  * 动机(2026-07-11):此前这类套件各自维护一份 COMMERCIAL_TABLES 手工清单,DROP 清单
  * 后重放迁移 —— 新迁移加的表(如 admin_alert_channels)没进清单就撞"already exists",
  * 且该清单在 33 个测试文件里各复制一份、独立漂移(一类必然复发的坑)。schema 级重置
- * 零清单维护,迁移从零重放,确定性成立。其余仍用手工清单的套件属登记债,逐个迁移时
- * 改用本函数。
+ * 零清单维护,迁移从零重放,确定性成立。
+ *
+ * 2026-07-26 收口:共享 public schema 的 integ 套件已全部改用本函数(或
+ * `resetAndMigrateTestSchema`),手工 DROP 清单在仓内归零 —— "新迁移加表 → 某个老
+ * 测试文件 already exists" 这一整类失败不再可能复发。新写 integ 套件一律用本函数,
+ * 禁止再抄手工清单(由 scripts/check-integ-tiers.ts 之外的 code review 把关)。
  *
  * 防护与 truncateAllForTest 同源:库名必须以 `_test` 结尾,防 .env 配错清了生产库。
  */
@@ -194,3 +202,69 @@ export function useDedicatedTestDatabase(dbName: string): DedicatedTestDatabase 
     },
   };
 }
+
+/**
+ * `resetTestSchemaForTest` + 全量迁移重放 —— shared-public integ 套件的统一"干净起点"。
+ *
+ * 绝大多数套件的 before 钩子就是"清干净 → runMigrations()",这里收成一个调用,
+ * 避免每个文件各自决定清多干净(手工清单/动态 drop-all/什么都不清 三种范式并存,
+ * 是 2026-07-26 审计里 74 次 `relation "system_settings" already exists` 的根因)。
+ */
+export async function resetAndMigrateTestSchema(runner?: QueryRunner): Promise<void> {
+  await resetTestSchemaForTest(runner);
+  await runMigrations();
+}
+
+/**
+ * 重放**真实迁移链**到 `beforeVersion` 之前(不含),把库停在"待应用这条迁移"的
+ * 真实前置状态,然后由调用方 apply 被测的那一条。
+ *
+ * 动机(2026-07-26 审计):13 个 migrationXXXX.integ 里有 10 个不重放迁移链 ——
+ * 它们在测试里手搓前置表(`CREATE TABLE system_settings (key TEXT PRIMARY KEY,
+ * value JSONB NOT NULL, ...)`)再 apply 单条 SQL。前置表的形状**由测试自己定义**,
+ * 于是真 schema 一漂(某列改 NOT NULL、加约束、改类型),迁移在生产会炸,而测试
+ * 照绿 —— 这类测试守的是"我写的 DDL 和我写的 DDL 一致",不是"这条迁移能落到真库上"。
+ *
+ * 实现:不改 runMigrations 的生产签名,而是用一个只含 `< beforeVersion` 的
+ * symlink 目录喂给它。symlink 零拷贝;migrate 的完整性校验(applied 必须都能在 dir
+ * 里找到文件)在子集目录下仍然成立。
+ *
+ * @param beforeVersion 被测迁移的版本前缀,如 `"0189"`(含 4 位数字即可)。
+ */
+export async function resetAndMigrateBefore(beforeVersion: string): Promise<string> {
+  if (!/^\d{4}/.test(beforeVersion)) {
+    throw new Error(`resetAndMigrateBefore: 版本前缀必须以 4 位数字开头,收到 ${JSON.stringify(beforeVersion)}`);
+  }
+  await resetTestSchemaForTest();
+  const dir = await migrationsDirBefore(beforeVersion);
+  await runMigrations({ dir });
+  return dir;
+}
+
+/** 内部:生产迁移目录。与 migrate.ts 的 defaultMigrationsDir 同源(相对模块位置,非 cwd)。 */
+function productionMigrationsDir(): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "db", "migrations");
+}
+
+/**
+ * 造一个临时目录,symlink 进所有 version < `beforeVersion` 的迁移 .sql。
+ * 同一前缀在同一进程内复用同一个目录(migration 测试通常在 before 里调一次)。
+ */
+async function migrationsDirBefore(beforeVersion: string): Promise<string> {
+  const cached = subsetDirCache.get(beforeVersion);
+  if (cached) return cached;
+  const src = productionMigrationsDir();
+  const out = await mkdtemp(path.join(tmpdir(), `oc-migrations-before-${beforeVersion}-`));
+  const files = (await readdir(src)).filter((f) => f.endsWith(".sql")).sort();
+  const kept = files.filter((f) => f.slice(0, 4) < beforeVersion.slice(0, 4));
+  if (kept.length === 0) {
+    throw new Error(
+      `resetAndMigrateBefore(${beforeVersion}): 没有任何早于该版本的迁移文件 —— 前缀写错了?`,
+    );
+  }
+  for (const f of kept) await symlink(path.join(src, f), path.join(out, f));
+  subsetDirCache.set(beforeVersion, out);
+  return out;
+}
+
+const subsetDirCache = new Map<string, string>();

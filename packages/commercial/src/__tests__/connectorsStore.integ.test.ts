@@ -62,6 +62,7 @@ import { KMS_KEY_BYTES } from '../crypto/keys.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 
 // KMS key 必须在任何 encrypt/decrypt 前就位(loadKmsKey 每次现读 env)
 process.env.OPENCLAUDE_KMS_KEY = randomBytes(KMS_KEY_BYTES).toString('base64')
@@ -90,19 +91,7 @@ async function probe(): Promise<boolean> {
 
 /** 清空 public schema 全部表(库名必须 _test 结尾,防指错库)。 */
 async function dropAllTables(): Promise<void> {
-  const db = await query<{ db: string }>('SELECT current_database() AS db')
-  const name = db.rows[0]?.db ?? ''
-  if (!/_test$/.test(name)) {
-    throw new Error(`refusing to drop tables on non-test database: ${name}`)
-  }
-  await query(`
-    DO $$ DECLARE r RECORD;
-    BEGIN
-      FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
-        EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
-      END LOOP;
-    END $$;
-  `)
+  await resetTestSchemaForTest()
 }
 
 before(async () => {
@@ -113,8 +102,6 @@ before(async () => {
   }
   await resetPool()
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
-  // 共享 fixture 里 public schema 可能被其它清理删掉 → 幂等补建
-  await query('CREATE SCHEMA IF NOT EXISTS public')
   await dropAllTables()
   await runMigrations() // 全量迁移含 0129 —— 顺带验证迁移可干净 apply
 })

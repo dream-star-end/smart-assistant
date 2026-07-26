@@ -29,6 +29,7 @@ import {
   listRuleStates,
   MAX_ATTEMPTS,
 } from "../admin/alertOutbox.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -68,10 +69,20 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  // 不 DROP 全表 — 假设 schema 已存在;只清 admin_alert_* 数据。runMigrations() 幂等。
+  await resetTestSchemaForTest();
   await runMigrations();
 
   redis = await probeRedis();
+
+  // fixture fail-closed:缺 Redis 时此前静默降级(整份套件的 HTTP 路径不装配),
+
+  // 于是"绿"只证明了没跑。REQUIRE_TEST_DB/CI 下必须红 —— 2026-07-26 门禁审计。
+
+  if (!redis && REQUIRE_TEST_DB) {
+
+    throw new Error("Redis test fixture required (TEST_REDIS_URL) — refusing to silently degrade");
+
+  }
   if (redis) {
     const handler = createCommercialHandler({
       jwtSecret: JWT_SECRET,

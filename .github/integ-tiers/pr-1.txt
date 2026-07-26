@@ -1,0 +1,15 @@
+# PR 门第一梯队 · 分片 1 —— 注册/验证/登录/会话落盘/站内信
+#
+# 这一片绿,直接证明:能注册、能收到验证信并验证通过、能登录、refresh 家族
+# 被盗会整族吊销、HTTP 中间件栈(鉴权/限流/CORS)按契约放行与拒绝、会话 tape
+# 能落 PG 也能读回、新用户 onboarding 与站内信真能送达。
+#
+# min-tests: 257
+# max-minutes: 30
+packages/commercial/src/__tests__/register.integ.test.ts
+packages/commercial/src/__tests__/verify.integ.test.ts
+packages/commercial/src/__tests__/login.integ.test.ts
+packages/commercial/src/__tests__/http.integ.test.ts
+packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts
+packages/commercial/src/__tests__/inbox.integ.test.ts
+packages/commercial/src/inbox/__tests__/onboarding.integ.test.ts

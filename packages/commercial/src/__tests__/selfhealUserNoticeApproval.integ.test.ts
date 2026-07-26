@@ -6,8 +6,13 @@ import { runMigrations } from "../db/migrate.js";
 import { startUserNoticeApproval } from "../selfheal/userNoticeApproval.js";
 import { recordUserImpact } from "../selfheal/userImpact.js";
 import type { AibotInboundHandler, AibotInboundMessage, WecomAibotConnectionManager } from "../admin/wecomAibotConnection.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const DB = process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
+// 缺 PG 时必须红,不能静默全 skip:本文件守的是自愈"要不要给真实用户发消息"的
+// 审批闸(userNoticeApproval 是用户通知的唯一出口)。此前没有这道 REQUIRE_TEST_DB,
+// 无 DB 环境下整份套件永远绿 —— 等于这道闸在 CI 里根本不存在(2026-07-26 审计)。
+const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 let available = false;
 async function probe() {
   const p=createPool({connectionString:DB,max:1,connectionTimeoutMillis:1000});
@@ -16,8 +21,14 @@ async function probe() {
 
 before(async()=>{
   process.env.OPENCLAUDE_KMS_KEY=Buffer.alloc(32,0x67).toString("base64");
-  available=await probe(); if(!available) return;
-  await resetPool(); setPoolOverride(createPool({connectionString:DB,max:10})); await runMigrations();
+  available=await probe();
+  if(!available){
+    if(REQUIRE_TEST_DB){
+      throw new Error(`[selfhealUserNoticeApproval.integ] REQUIRE_TEST_DB=1 但连不上 ${DB} —— 用户通知审批链未被验证,拒绝静默通过`);
+    }
+    return;
+  }
+  await resetPool(); setPoolOverride(createPool({connectionString:DB,max:10})); await resetTestSchemaForTest(); await runMigrations();
 });
 after(async()=>{ if(available) await closePool(); });
 beforeEach(async()=>{

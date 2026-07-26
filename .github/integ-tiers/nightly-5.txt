@@ -1,0 +1,18 @@
+# 夜跑梯队 · 分片 5 —— 会话周边 / 限流 / 偏好 / 容器供给 / 其它
+#
+# min-tests: 1
+# max-minutes: 30
+packages/commercial/src/__tests__/preferences.integ.test.ts
+packages/commercial/src/__tests__/pricing.integ.test.ts
+packages/commercial/src/__tests__/rateLimit.integ.test.ts
+packages/commercial/src/__tests__/authRateLimit.integ.test.ts
+packages/commercial/src/__tests__/refreshEvents.integ.test.ts
+packages/commercial/src/__tests__/socialLogin.linuxdo.integ.test.ts
+packages/commercial/src/__tests__/registerCommercialV3_2H.integ.test.ts
+packages/commercial/src/__tests__/goalState.integ.test.ts
+packages/commercial/src/__tests__/agentSubscriptions.integ.test.ts
+packages/commercial/src/__tests__/agentCostOverrides.integ.test.ts
+packages/commercial/src/__tests__/agentSupervisor.integ.test.ts
+packages/commercial/src/__tests__/v3ProvisionTxWindow.integ.test.ts
+packages/commercial/src/__tests__/wechatBrokerAssembly.integ.test.ts
+packages/commercial/src/__tests__/db.integ.test.ts

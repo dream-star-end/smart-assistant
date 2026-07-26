@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 /**
  * T-03 集成测试:完整跑一次所有内置迁移,验证
@@ -30,17 +31,7 @@ const REQUIRE_TEST_DB =
 let pgAvailable = false;
 
 async function cleanCommercialSchema(): Promise<void> {
-  const rows = await query<{ table_name: string }>(
-    `SELECT table_name
-       FROM information_schema.tables
-      WHERE table_schema = 'public'
-        AND table_type = 'BASE TABLE'`,
-  );
-  if (rows.rows.length === 0) return;
-  const quoted = rows.rows
-    .map((r) => `"${r.table_name.replaceAll('"', '""')}"`)
-    .join(", ");
-  await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
+  await resetTestSchemaForTest();
 }
 
 async function probe(): Promise<boolean> {
