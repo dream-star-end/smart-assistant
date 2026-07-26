@@ -91,6 +91,9 @@ describe('V5 durable development release queue', () => {
 
   test('SQLite queue is durable, idempotent FIFO with one active job and exact canonical pin', async () => {
     const fixture = await queueFixture()
+    const empty = fixture.invoke(['status', '--json'])
+    assert.equal(empty.status, 0, empty.stderr || empty.stdout)
+    assert.deepEqual(JSON.parse(empty.stdout), [])
     const first = outputId(
       fixture.invoke([
         'submit',

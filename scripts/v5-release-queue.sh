@@ -317,13 +317,14 @@ SQL
 }
 
 status_locked() {
-  local json="$1"
+  local json="$1" output
   if [[ "$json" == 1 ]]; then
-    sqlite3 -json "$QUEUE_DB" \
+    output="$(sqlite3 -json "$QUEUE_DB" \
       "SELECT seq,id,task,branch,requested_sha,canonical_sha,status,owner,result,reason,
               created_at,activated_at,pinned_at,finished_at,updated_at
          FROM release_queue_jobs
-        ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, seq;"
+        ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, seq;")"
+    printf '%s\n' "${output:-[]}"
   else
     sqlite3 -header -column "$QUEUE_DB" \
       "SELECT seq,id,task,branch,substr(requested_sha,1,12) AS requested,
