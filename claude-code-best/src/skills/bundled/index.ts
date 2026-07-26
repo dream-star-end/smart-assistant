@@ -7,9 +7,13 @@ import { registerKeybindingsSkill } from './keybindings.js'
 import { registerLoremIpsumSkill } from './loremIpsum.js'
 import { registerRememberSkill } from './remember.js'
 import { registerSimplifySkill } from './simplify.js'
+import { registerUseArtifactsSkill } from './useArtifacts.js'
 import { registerSkillifySkill } from './skillify.js'
 import { registerStuckSkill } from './stuck.js'
+import { registerUltracodeSkill } from './ultracode.js'
+import { registerCronDeleteSkill, registerCronListSkill } from './cronManage.js'
 import { registerLoopSkill } from './loop.js'
+import { registerDreamSkill } from './dream.js'
 import { registerUpdateConfigSkill } from './updateConfig.js'
 import { registerVerifySkill } from './verify.js'
 
@@ -31,15 +35,14 @@ export function initBundledSkills(): void {
   registerSkillifySkill()
   registerRememberSkill()
   registerSimplifySkill()
+  registerUseArtifactsSkill()
   registerBatchSkill()
   registerStuckSkill()
+  registerUltracodeSkill()
   registerLoopSkill()
-  if (feature('KAIROS') || feature('KAIROS_DREAM')) {
-    /* eslint-disable @typescript-eslint/no-require-imports */
-    const { registerDreamSkill } = require('./dream.js')
-    /* eslint-enable @typescript-eslint/no-require-imports */
-    registerDreamSkill()
-  }
+  registerCronListSkill()
+  registerCronDeleteSkill()
+  registerDreamSkill()
   if (feature('REVIEW_ARTIFACT')) {
     /* eslint-disable @typescript-eslint/no-require-imports */
     const { registerHunterSkill } = require('./hunter.js')

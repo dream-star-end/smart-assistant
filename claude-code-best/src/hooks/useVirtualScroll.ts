@@ -7,8 +7,7 @@ import {
   useRef,
   useSyncExternalStore,
 } from 'react'
-import type { ScrollBoxHandle } from '../ink/components/ScrollBox.js'
-import type { DOMElement } from '../ink/dom.js'
+import type { ScrollBoxHandle, DOMElement } from '@anthropic/ink'
 
 /**
  * Estimated height (rows) for items not yet measured. Intentionally LOW:
@@ -21,7 +20,7 @@ const DEFAULT_ESTIMATE = 3
  * Extra rows rendered above and below the viewport. Generous because real
  * heights can be 10x the estimate for long tool results.
  */
-const OVERSCAN_ROWS = 80
+const OVERSCAN_ROWS = 40
 /** Items rendered before the ScrollBox has laid out (viewportHeight=0). */
 const COLD_START_COUNT = 30
 /**
@@ -44,7 +43,7 @@ const SCROLL_QUANTUM = OVERSCAN_ROWS >> 1
  */
 const PESSIMISTIC_HEIGHT = 1
 /** Cap on mounted items to bound fiber allocation even in degenerate cases. */
-const MAX_MOUNTED_ITEMS = 300
+const MAX_MOUNTED_ITEMS = 200
 /**
  * Max NEW items to mount in a single commit. Scrolling into a fresh range
  * with PESSIMISTIC_HEIGHT=1 would mount 194 items at once (OVERSCAN_ROWS*2+

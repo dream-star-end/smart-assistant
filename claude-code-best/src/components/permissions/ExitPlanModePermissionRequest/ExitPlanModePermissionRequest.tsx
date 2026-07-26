@@ -3,18 +3,27 @@ import type { UUID } from 'crypto';
 import figures from 'figures';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNotifications } from 'src/context/notifications.js';
-import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEvent } from 'src/services/analytics/index.js';
+import {
+  type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+  logEvent,
+} from 'src/services/analytics/index.js';
 import { useAppState, useAppStateStore, useSetAppState } from 'src/state/AppState.js';
-import { getSdkBetas, getSessionId, isSessionPersistenceDisabled, setHasExitedPlanMode, setNeedsAutoModeExitAttachment, setNeedsPlanModeExitAttachment } from '../../../bootstrap/state.js';
+import {
+  getSdkBetas,
+  getSessionId,
+  isSessionPersistenceDisabled,
+  setHasExitedPlanMode,
+  setNeedsAutoModeExitAttachment,
+  setNeedsPlanModeExitAttachment,
+} from '../../../bootstrap/state.js';
 import { generateSessionName } from '../../../commands/rename/generateSessionName.js';
 import { launchUltraplan } from '../../../commands/ultraplan.js';
-import type { KeyboardEvent } from '../../../ink/events/keyboard-event.js';
-import { Box, Text } from '../../../ink.js';
+import { type KeyboardEvent, Box, Text } from '@anthropic/ink';
 import type { AppState } from '../../../state/AppStateStore.js';
-import { AGENT_TOOL_NAME } from '../../../tools/AgentTool/constants.js';
-import { EXIT_PLAN_MODE_V2_TOOL_NAME } from '../../../tools/ExitPlanModeTool/constants.js';
-import type { AllowedPrompt } from '../../../tools/ExitPlanModeTool/ExitPlanModeV2Tool.js';
-import { TEAM_CREATE_TOOL_NAME } from '../../../tools/TeamCreateTool/constants.js';
+import { AGENT_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/AgentTool/constants.js';
+import { EXIT_PLAN_MODE_V2_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/ExitPlanModeTool/constants.js';
+import type { AllowedPrompt } from '@claude-code-best/builtin-tools/tools/ExitPlanModeTool/ExitPlanModeV2Tool.js';
+import { TEAM_CREATE_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/TeamCreateTool/constants.js';
 import { isAgentSwarmsEnabled } from '../../../utils/agentSwarmsEnabled.js';
 import { calculateContextPercentages, getContextWindowForModel } from '../../../utils/context.js';
 import { getExternalEditor } from '../../../utils/editor.js';
@@ -24,14 +33,27 @@ import { logError } from '../../../utils/log.js';
 import { enqueuePendingNotification } from '../../../utils/messageQueueManager.js';
 import { createUserMessage } from '../../../utils/messages.js';
 import { getMainLoopModel, getRuntimeMainLoopModel } from '../../../utils/model/model.js';
-import { createPromptRuleContent, isClassifierPermissionsEnabled, PROMPT_PREFIX } from '../../../utils/permissions/bashClassifier.js';
+import {
+  createPromptRuleContent,
+  isClassifierPermissionsEnabled,
+  PROMPT_PREFIX,
+} from '../../../utils/permissions/bashClassifier.js';
 import { type PermissionMode, toExternalPermissionMode } from '../../../utils/permissions/PermissionMode.js';
 import type { PermissionUpdate } from '../../../utils/permissions/PermissionUpdateSchema.js';
-import { isAutoModeGateEnabled, restoreDangerousPermissions, stripDangerousPermissionsForAutoMode } from '../../../utils/permissions/permissionSetup.js';
+import {
+  isAutoModeGateEnabled,
+  restoreDangerousPermissions,
+  stripDangerousPermissionsForAutoMode,
+} from '../../../utils/permissions/permissionSetup.js';
 import { getPewterLedgerVariant, isPlanModeInterviewPhaseEnabled } from '../../../utils/planModeV2.js';
 import { getPlan, getPlanFilePath } from '../../../utils/plans.js';
 import { editFileInEditor, editPromptInEditor } from '../../../utils/promptEditor.js';
-import { getCurrentSessionTitle, getTranscriptPath, saveAgentName, saveCustomTitle } from '../../../utils/sessionStorage.js';
+import {
+  getCurrentSessionTitle,
+  getTranscriptPath,
+  saveAgentName,
+  saveCustomTitle,
+} from '../../../utils/sessionStorage.js';
 import { getSettings_DEPRECATED } from '../../../utils/settings/settings.js';
 import { type OptionWithDescription, Select } from '../../CustomSelect/index.js';
 import { Markdown } from '../../Markdown.js';
@@ -40,25 +62,39 @@ import type { PermissionRequestProps } from '../PermissionRequest.js';
 import { PermissionRuleExplanation } from '../PermissionRuleExplanation.js';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
-const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER') ? require('../../../utils/permissions/autoModeState.js') as typeof import('../../../utils/permissions/autoModeState.js') : null;
+const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
+  ? (require('../../../utils/permissions/autoModeState.js') as typeof import('../../../utils/permissions/autoModeState.js'))
+  : null;
+
 import type { Base64ImageSource, ImageBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs';
 /* eslint-enable @typescript-eslint/no-require-imports */
 import type { PastedContent } from '../../../utils/config.js';
 import type { ImageDimensions } from '../../../utils/imageResizer.js';
 import { maybeResizeAndDownsampleImageBlock } from '../../../utils/imageResizer.js';
 import { cacheImagePath, storeImage } from '../../../utils/imageStore.js';
-type ResponseValue = 'yes-bypass-permissions' | 'yes-accept-edits' | 'yes-accept-edits-keep-context' | 'yes-default-keep-context' | 'yes-resume-auto-mode' | 'yes-auto-clear-context' | 'ultraplan' | 'no';
+
+type ResponseValue =
+  | 'yes-bypass-permissions'
+  | 'yes-accept-edits'
+  | 'yes-accept-edits-keep-context'
+  | 'yes-default-keep-context'
+  | 'yes-resume-auto-mode'
+  | 'yes-auto-clear-context'
+  | 'ultraplan'
+  | 'no';
 
 /**
  * Build permission updates for plan approval, including prompt-based rules if provided.
  * Prompt-based rules are only added when classifier permissions are enabled (Ant-only).
  */
 export function buildPermissionUpdates(mode: PermissionMode, allowedPrompts?: AllowedPrompt[]): PermissionUpdate[] {
-  const updates: PermissionUpdate[] = [{
-    type: 'setMode',
-    mode: toExternalPermissionMode(mode),
-    destination: 'session'
-  }];
+  const updates: PermissionUpdate[] = [
+    {
+      type: 'setMode',
+      mode: toExternalPermissionMode(mode),
+      destination: 'session',
+    },
+  ];
 
   // Add prompt-based permission rules if provided (Ant-only feature)
   if (isClassifierPermissionsEnabled() && allowedPrompts && allowedPrompts.length > 0) {
@@ -66,12 +102,13 @@ export function buildPermissionUpdates(mode: PermissionMode, allowedPrompts?: Al
       type: 'addRules',
       rules: allowedPrompts.map(p => ({
         toolName: p.tool,
-        ruleContent: createPromptRuleContent(p.prompt)
+        ruleContent: createPromptRuleContent(p.prompt),
       })),
       behavior: 'allow',
-      destination: 'session'
+      destination: 'session',
     });
   }
+
   return updates;
 }
 
@@ -80,7 +117,11 @@ export function buildPermissionUpdates(mode: PermissionMode, allowedPrompts?: Al
  * if they haven't already named it via /rename or --name. Fire-and-forget.
  * Mirrors /rename: kebab-case name, updates the prompt-border badge.
  */
-export function autoNameSessionFromPlan(plan: string, setAppState: (updater: (prev: AppState) => AppState) => void, isClearContext: boolean): void {
+export function autoNameSessionFromPlan(
+  plan: string,
+  setAppState: (updater: (prev: AppState) => AppState) => void,
+  isClearContext: boolean,
+): void {
   if (isSessionPersistenceDisabled() || getSettings_DEPRECATED()?.cleanupPeriodDays === 0) {
     return;
   }
@@ -89,51 +130,50 @@ export function autoNameSessionFromPlan(plan: string, setAppState: (updater: (pr
   // Checking it would make the feature self-defeating after first use.
   if (!isClearContext && getCurrentSessionTitle(getSessionId())) return;
   void generateSessionName(
-  // generateSessionName tail-slices to the last 1000 chars (correct for
-  // conversations, where recency matters). Plans front-load the goal and
-  // end with testing steps — head-slice so Haiku sees the summary.
-  [createUserMessage({
-    content: plan.slice(0, 1000)
-  })], new AbortController().signal).then(async name => {
-    // On clear-context acceptance, regenerateSessionId() has run by now —
-    // this intentionally names the NEW execution session. Do not "fix" by
-    // capturing sessionId once; that would name the abandoned planning session.
-    if (!name || getCurrentSessionTitle(getSessionId())) return;
-    const sessionId = getSessionId() as UUID;
-    const fullPath = getTranscriptPath();
-    await saveCustomTitle(sessionId, name, fullPath, 'auto');
-    await saveAgentName(sessionId, name, fullPath, 'auto');
-    setAppState(prev => {
-      if (prev.standaloneAgentContext?.name === name) return prev;
-      return {
-        ...prev,
-        standaloneAgentContext: {
-          ...prev.standaloneAgentContext,
-          name
-        }
-      };
-    });
-  }).catch(logError);
+    // generateSessionName tail-slices to the last 1000 chars (correct for
+    // conversations, where recency matters). Plans front-load the goal and
+    // end with testing steps — head-slice so Haiku sees the summary.
+    [createUserMessage({ content: plan.slice(0, 1000) })],
+    new AbortController().signal,
+  )
+    .then(async name => {
+      // On clear-context acceptance, regenerateSessionId() has run by now —
+      // this intentionally names the NEW execution session. Do not "fix" by
+      // capturing sessionId once; that would name the abandoned planning session.
+      if (!name || getCurrentSessionTitle(getSessionId())) return;
+      const sessionId = getSessionId() as UUID;
+      const fullPath = getTranscriptPath();
+      await saveCustomTitle(sessionId, name, fullPath, 'auto');
+      await saveAgentName(sessionId, name, fullPath, 'auto');
+      setAppState(prev => {
+        if (prev.standaloneAgentContext?.name === name) return prev;
+        return {
+          ...prev,
+          standaloneAgentContext: { ...prev.standaloneAgentContext, name },
+        };
+      });
+    })
+    .catch(logError);
 }
+
 export function ExitPlanModePermissionRequest({
   toolUseConfirm,
   onDone,
   onReject,
   workerBadge,
-  setStickyFooter
+  setStickyFooter,
 }: PermissionRequestProps): React.ReactNode {
   const toolPermissionContext = useAppState(s => s.toolPermissionContext);
   const setAppState = useSetAppState();
   const store = useAppStateStore();
-  const {
-    addNotification
-  } = useNotifications();
+  const { addNotification } = useNotifications();
   // Feedback text from the 'No' option's input. Threaded through onAllow as
   // acceptFeedback when the user approves — lets users annotate the plan
   // ("also update the README") without a reject+re-plan round-trip.
   const [planFeedback, setPlanFeedback] = useState('');
   const [pastedContents, setPastedContents] = useState<Record<number, PastedContent>>({});
   const nextPasteIdRef = useRef(0);
+
   const showClearContext = useAppState(s => s.settings.showClearContextOnPlanAccept) ?? false;
   const ultraplanSessionUrl = useAppState(s => s.ultraplanSessionUrl);
   const ultraplanLaunching = useAppState(s => s.ultraplanLaunching);
@@ -143,20 +183,32 @@ export function ExitPlanModePermissionRequest({
   // feature() must sit directly in an if/ternary (bun:bundle DCE constraint).
   const showUltraplan = feature('ULTRAPLAN') ? !ultraplanSessionUrl && !ultraplanLaunching : false;
   const usage = toolUseConfirm.assistantMessage.message.usage;
-  const {
-    mode,
-    isAutoModeAvailable,
-    isBypassPermissionsModeAvailable
-  } = toolPermissionContext;
-  const options = useMemo(() => buildPlanApprovalOptions({
-    showClearContext,
-    showUltraplan,
-    usedPercent: showClearContext ? getContextUsedPercent(usage as any, mode) : null,
-    isAutoModeAvailable,
-    isBypassPermissionsModeAvailable,
-    onFeedbackChange: setPlanFeedback
-  }), [showClearContext, showUltraplan, usage, mode, isAutoModeAvailable, isBypassPermissionsModeAvailable]);
-  function onImagePaste(base64Image: string, mediaType?: string, filename?: string, dimensions?: ImageDimensions, _sourcePath?: string) {
+  const { mode, isAutoModeAvailable, isBypassPermissionsModeAvailable } = toolPermissionContext;
+  const options = useMemo(
+    () =>
+      buildPlanApprovalOptions({
+        showClearContext,
+        showUltraplan,
+        usedPercent: showClearContext
+          ? getContextUsedPercent(
+              usage as { input_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number },
+              mode,
+            )
+          : null,
+        isAutoModeAvailable,
+        isBypassPermissionsModeAvailable,
+        onFeedbackChange: setPlanFeedback,
+      }),
+    [showClearContext, showUltraplan, usage, mode, isAutoModeAvailable, isBypassPermissionsModeAvailable],
+  );
+
+  function onImagePaste(
+    base64Image: string,
+    mediaType?: string,
+    filename?: string,
+    dimensions?: ImageDimensions,
+    _sourcePath?: string,
+  ) {
     const pasteId = nextPasteIdRef.current++;
     const newContent: PastedContent = {
       id: pasteId,
@@ -164,24 +216,21 @@ export function ExitPlanModePermissionRequest({
       content: base64Image,
       mediaType: mediaType || 'image/png',
       filename: filename || 'Pasted image',
-      dimensions
+      dimensions,
     };
     cacheImagePath(newContent);
     void storeImage(newContent);
-    setPastedContents(prev => ({
-      ...prev,
-      [pasteId]: newContent
-    }));
+    setPastedContents(prev => ({ ...prev, [pasteId]: newContent }));
   }
+
   const onRemoveImage = useCallback((id: number) => {
     setPastedContents(prev => {
-      const next = {
-        ...prev
-      };
+      const next = { ...prev };
       delete next[id];
       return next;
     });
   }, []);
+
   const imageAttachments = Object.values(pastedContents).filter(c => c.type === 'image');
   const hasImages = imageAttachments.length > 0;
 
@@ -190,7 +239,7 @@ export function ExitPlanModePermissionRequest({
   // injects plan content into input.plan for hooks/SDK, which broke the old detection
   // (see issue #10878)
   const isV2 = toolUseConfirm.tool.name === EXIT_PLAN_MODE_V2_TOOL_NAME;
-  const inputPlan = isV2 ? undefined : toolUseConfirm.input.plan as string | undefined;
+  const inputPlan = isV2 ? undefined : (toolUseConfirm.input.plan as string | undefined);
   const planFilePath = isV2 ? getPlanFilePath() : undefined;
 
   // Extract allowed prompts requested by the plan (Ant-only feature)
@@ -204,7 +253,10 @@ export function ExitPlanModePermissionRequest({
   // so the value is stable across a single planning session. undefined =
   // control arm. The variant is a fixed 3-value enum of short literals,
   // not user input.
-  const [planStructureVariant] = useState(() => (getPewterLedgerVariant() ?? undefined) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS);
+  const [planStructureVariant] = useState(
+    () => (getPewterLedgerVariant() ?? undefined) as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+  );
+
   const [currentPlan, setCurrentPlan] = useState(() => {
     if (inputPlan) return inputPlan;
     const plan = getPlan();
@@ -229,6 +281,7 @@ export function ExitPlanModePermissionRequest({
     if (e.ctrl && e.key === 'g') {
       e.preventDefault();
       logEvent('tengu_plan_external_editor_used', {});
+
       void (async () => {
         if (isV2 && planFilePath) {
           const result = await editFileInEditor(planFilePath);
@@ -237,7 +290,7 @@ export function ExitPlanModePermissionRequest({
               key: 'external-editor-error',
               text: result.error,
               color: 'warning',
-              priority: 'high'
+              priority: 'high',
             });
           }
           if (result.content !== null) {
@@ -252,7 +305,7 @@ export function ExitPlanModePermissionRequest({
               key: 'external-editor-error',
               text: result.error,
               color: 'warning',
-              priority: 'high'
+              priority: 'high',
             });
           }
           if (result.content !== null && result.content !== currentPlan) {
@@ -271,6 +324,7 @@ export function ExitPlanModePermissionRequest({
       return;
     }
   };
+
   async function handleResponse(value: ResponseValue): Promise<void> {
     const trimmedFeedback = planFeedback.trim();
     const acceptFeedback = trimmedFeedback || undefined;
@@ -283,7 +337,7 @@ export function ExitPlanModePermissionRequest({
         planLengthChars: currentPlan.length,
         outcome: 'ultraplan' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
-        planStructureVariant
+        planStructureVariant,
       });
       onDone();
       onReject();
@@ -293,25 +347,23 @@ export function ExitPlanModePermissionRequest({
         seedPlan: currentPlan,
         getAppState: store.getState,
         setAppState: store.setState,
-        signal: new AbortController().signal
-      }).then(msg => enqueuePendingNotification({
-        value: msg,
-        mode: 'task-notification'
-      })).catch(logError);
+        signal: new AbortController().signal,
+      })
+        .then(msg => enqueuePendingNotification({ value: msg, mode: 'task-notification' }))
+        .catch(logError);
       return;
     }
 
     // V1: pass plan in input. V2: plan is on disk, but if the user edited it
     // via Ctrl+G we pass it through so the tool echoes the edit in tool_result
     // (otherwise the model never sees the user's changes).
-    const updatedInput = isV2 && !planEditedLocally ? {} : {
-      plan: currentPlan
-    };
+    const updatedInput = isV2 && !planEditedLocally ? {} : { plan: currentPlan };
 
     // If auto was active during plan (from auto mode or opt-in) and NOT going
     // to auto, deactivate auto + restore permissions + fire exit attachment.
     if (feature('TRANSCRIPT_CLASSIFIER')) {
-      const goingToAuto = (value === 'yes-resume-auto-mode' || value === 'yes-auto-clear-context') && isAutoModeGateEnabled();
+      const goingToAuto =
+        (value === 'yes-resume-auto-mode' || value === 'yes-auto-clear-context') && isAutoModeGateEnabled();
       // isAutoModeActive() is the authoritative signal — prePlanMode/
       // strippedDangerousRules are stale after transitionPlanAutoMode
       // deactivates mid-plan (would cause duplicate exit attachment).
@@ -323,8 +375,8 @@ export function ExitPlanModePermissionRequest({
           ...prev,
           toolPermissionContext: {
             ...restoreDangerousPermissions(prev.toolPermissionContext),
-            prePlanMode: undefined
-          }
+            prePlanMode: undefined,
+          },
         }));
       }
     }
@@ -333,10 +385,13 @@ export function ExitPlanModePermissionRequest({
     // The REPL will handle context clear and trigger a fresh query
     // Keep-context options skip this block and go through the normal flow below
     const isResumeAutoOption = feature('TRANSCRIPT_CLASSIFIER') ? value === 'yes-resume-auto-mode' : false;
-    const isKeepContextOption = value === 'yes-accept-edits-keep-context' || value === 'yes-default-keep-context' || isResumeAutoOption;
+    const isKeepContextOption =
+      value === 'yes-accept-edits-keep-context' || value === 'yes-default-keep-context' || isResumeAutoOption;
+
     if (value !== 'no') {
       autoNameSessionFromPlan(currentPlan, setAppState, !isKeepContextOption);
     }
+
     if (value !== 'no' && !isKeepContextOption) {
       // Determine the permission mode based on the selected option
       let mode: PermissionMode = 'default';
@@ -358,34 +413,44 @@ export function ExitPlanModePermissionRequest({
         clearContext: true,
         interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
         planStructureVariant,
-        hasFeedback: !!acceptFeedback
+        hasFeedback: !!acceptFeedback,
       });
 
       // Set initial message - REPL will handle context clear and fresh query
       // Add verification instruction if the feature is enabled
       // Dead code elimination: CLAUDE_CODE_VERIFY_PLAN='false' in external builds, so === 'true' check allows Bun to eliminate the string
-      const verificationInstruction = undefined === 'true' ? `\n\nIMPORTANT: When you have finished implementing the plan, you MUST call the "VerifyPlanExecution" tool directly (NOT the ${AGENT_TOOL_NAME} tool or an agent) to trigger background verification.` : '';
+      const verificationInstruction =
+        undefined === 'true'
+          ? `\n\nIMPORTANT: When you have finished implementing the plan, you MUST call the "VerifyPlanExecution" tool directly (NOT the ${AGENT_TOOL_NAME} tool or an agent) to trigger background verification.`
+          : '';
 
       // Capture the transcript path before context is cleared (session ID will be regenerated)
       const transcriptPath = getTranscriptPath();
       const transcriptHint = `\n\nIf you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: ${transcriptPath}`;
-      const teamHint = isAgentSwarmsEnabled() ? `\n\nIf this plan can be broken down into multiple independent tasks, consider using the ${TEAM_CREATE_TOOL_NAME} tool to create a team and parallelize the work.` : '';
+
+      const teamHint = isAgentSwarmsEnabled()
+        ? `\n\nIf this plan can be broken down into multiple independent tasks, consider using the ${TEAM_CREATE_TOOL_NAME} tool to create a team and parallelize the work.`
+        : '';
+
       const feedbackSuffix = acceptFeedback ? `\n\nUser feedback on this plan: ${acceptFeedback}` : '';
+
       setAppState(prev => ({
         ...prev,
         initialMessage: {
           message: {
             ...createUserMessage({
-              content: `Implement the following plan:\n\n${currentPlan}${verificationInstruction}${transcriptHint}${teamHint}${feedbackSuffix}`
+              content: `Implement the following plan:\n\n${currentPlan}${verificationInstruction}${transcriptHint}${teamHint}${feedbackSuffix}`,
             }),
-            planContent: currentPlan
+            planContent: currentPlan,
           },
           clearContext: true,
           mode,
-          allowedPrompts
-        }
+          allowedPrompts,
+        },
       }));
+
       setHasExitedPlanMode(true);
+      setNeedsPlanModeExitAttachment(true);
       onDone();
       onReject();
       // Reject the tool use to unblock the query loop
@@ -404,7 +469,7 @@ export function ExitPlanModePermissionRequest({
         clearContext: false,
         interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
         planStructureVariant,
-        hasFeedback: !!acceptFeedback
+        hasFeedback: !!acceptFeedback,
       });
       setHasExitedPlanMode(true);
       setNeedsPlanModeExitAttachment(true);
@@ -414,8 +479,8 @@ export function ExitPlanModePermissionRequest({
         toolPermissionContext: stripDangerousPermissionsForAutoMode({
           ...prev.toolPermissionContext,
           mode: 'auto',
-          prePlanMode: undefined
-        })
+          prePlanMode: undefined,
+        }),
       }));
       onDone();
       toolUseConfirm.onAllow(updatedInput, [], acceptFeedback);
@@ -428,11 +493,11 @@ export function ExitPlanModePermissionRequest({
     // Without this fallback the function would return without resolving the
     // dialog, leaving the query loop blocked and safety state corrupted.
     const keepContextModes: Record<string, PermissionMode> = {
-      'yes-accept-edits-keep-context': toolPermissionContext.isBypassPermissionsModeAvailable ? 'bypassPermissions' : 'acceptEdits',
+      'yes-accept-edits-keep-context': toolPermissionContext.isBypassPermissionsModeAvailable
+        ? 'bypassPermissions'
+        : 'acceptEdits',
       'yes-default-keep-context': 'default',
-      ...(feature('TRANSCRIPT_CLASSIFIER') ? {
-        'yes-resume-auto-mode': 'default' as const
-      } : {})
+      ...(feature('TRANSCRIPT_CLASSIFIER') ? { 'yes-resume-auto-mode': 'default' as const } : {}),
     };
     const keepContextMode = keepContextModes[value];
     if (keepContextMode) {
@@ -442,7 +507,7 @@ export function ExitPlanModePermissionRequest({
         clearContext: false,
         interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
         planStructureVariant,
-        hasFeedback: !!acceptFeedback
+        hasFeedback: !!acceptFeedback,
       });
       setHasExitedPlanMode(true);
       setNeedsPlanModeExitAttachment(true);
@@ -454,7 +519,7 @@ export function ExitPlanModePermissionRequest({
     // Handle standard approval options
     const standardModes: Record<string, PermissionMode> = {
       'yes-bypass-permissions': 'bypassPermissions',
-      'yes-accept-edits': 'acceptEdits'
+      'yes-accept-edits': 'acceptEdits',
     };
     const standardMode = standardModes[value];
     if (standardMode) {
@@ -463,7 +528,7 @@ export function ExitPlanModePermissionRequest({
         outcome: value as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
         planStructureVariant,
-        hasFeedback: !!acceptFeedback
+        hasFeedback: !!acceptFeedback,
       });
       setHasExitedPlanMode(true);
       setNeedsPlanModeExitAttachment(true);
@@ -478,34 +543,42 @@ export function ExitPlanModePermissionRequest({
         // No feedback yet - user is still on the input field
         return;
       }
+
       logEvent('tengu_plan_exit', {
         planLengthChars: currentPlan.length,
         outcome: 'no' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
-        planStructureVariant
+        planStructureVariant,
       });
 
       // Convert pasted images to ImageBlockParam[] with resizing
       let imageBlocks: ImageBlockParam[] | undefined;
       if (hasImages) {
-        imageBlocks = await Promise.all(imageAttachments.map(async img => {
-          const block: ImageBlockParam = {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: (img.mediaType || 'image/png') as Base64ImageSource['media_type'],
-              data: img.content
-            }
-          };
-          const resized = await maybeResizeAndDownsampleImageBlock(block);
-          return resized.block;
-        }));
+        imageBlocks = await Promise.all(
+          imageAttachments.map(async img => {
+            const block: ImageBlockParam = {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: (img.mediaType || 'image/png') as Base64ImageSource['media_type'],
+                data: img.content,
+              },
+            };
+            const resized = await maybeResizeAndDownsampleImageBlock(block);
+            return resized.block;
+          }),
+        );
       }
+
       onDone();
       onReject();
-      toolUseConfirm.onReject(trimmedFeedback || (hasImages ? '(See attached image)' : undefined), imageBlocks && imageBlocks.length > 0 ? imageBlocks : undefined);
+      toolUseConfirm.onReject(
+        trimmedFeedback || (hasImages ? '(See attached image)' : undefined),
+        imageBlocks && imageBlocks.length > 0 ? imageBlocks : undefined,
+      );
     }
   }
+
   const editor = getExternalEditor();
   const editorName = editor ? toIDEDisplayName(editor) : null;
 
@@ -523,7 +596,7 @@ export function ExitPlanModePermissionRequest({
       planLengthChars: currentPlan.length,
       outcome: 'no' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
-      planStructureVariant
+      planStructureVariant,
     });
     onDone();
     onReject();
@@ -532,23 +605,44 @@ export function ExitPlanModePermissionRequest({
   const useStickyFooter = !isEmpty && !!setStickyFooter;
   useLayoutEffect(() => {
     if (!useStickyFooter) return;
-    setStickyFooter(<Box flexDirection="column" borderStyle="round" borderColor="planMode" borderLeft={false} borderRight={false} borderBottom={false} paddingX={1}>
+    setStickyFooter(
+      <Box
+        flexDirection="column"
+        borderStyle="round"
+        borderColor="planMode"
+        borderLeft={false}
+        borderRight={false}
+        borderBottom={false}
+        paddingX={1}
+      >
         <Text dimColor>Would you like to proceed?</Text>
         <Box marginTop={1}>
-          <Select options={options} onChange={v => void handleResponseRef.current(v)} onCancel={() => handleCancelRef.current?.()} onImagePaste={onImagePaste} pastedContents={pastedContents} onRemoveImage={onRemoveImage} />
+          <Select
+            options={options}
+            onChange={v => void handleResponseRef.current(v)}
+            onCancel={() => handleCancelRef.current?.()}
+            onImagePaste={onImagePaste}
+            pastedContents={pastedContents}
+            onRemoveImage={onRemoveImage}
+          />
         </Box>
-        {editorName && <Box flexDirection="row" gap={1} marginTop={1}>
+        {editorName && (
+          <Box flexDirection="row" gap={1} marginTop={1}>
             <Text dimColor>ctrl-g to edit in </Text>
             <Text bold dimColor>
               {editorName}
             </Text>
             {isV2 && planFilePath && <Text dimColor> · {getDisplayPath(planFilePath)}</Text>}
-            {showSaveMessage && <>
+            {showSaveMessage && (
+              <>
                 <Text dimColor>{' · '}</Text>
                 <Text color="success">{figures.tick}Plan saved!</Text>
-              </>}
-          </Box>}
-      </Box>);
+              </>
+            )}
+          </Box>
+        )}
+      </Box>,
+    );
     return () => setStickyFooter(null);
     // onImagePaste/onRemoveImage are stable (useCallback/useRef-backed above)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -562,7 +656,7 @@ export function ExitPlanModePermissionRequest({
           planLengthChars: 0,
           outcome: 'yes-default' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
           interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
-          planStructureVariant
+          planStructureVariant,
         });
         if (feature('TRANSCRIPT_CLASSIFIER')) {
           const autoWasUsedDuringPlan = autoModeStateModule?.isAutoModeActive() ?? false;
@@ -573,88 +667,109 @@ export function ExitPlanModePermissionRequest({
               ...prev,
               toolPermissionContext: {
                 ...restoreDangerousPermissions(prev.toolPermissionContext),
-                prePlanMode: undefined
-              }
+                prePlanMode: undefined,
+              },
             }));
           }
         }
         setHasExitedPlanMode(true);
         setNeedsPlanModeExitAttachment(true);
         onDone();
-        toolUseConfirm.onAllow({}, [{
-          type: 'setMode',
-          mode: 'default',
-          destination: 'session'
-        }]);
+        toolUseConfirm.onAllow({}, [{ type: 'setMode', mode: 'default', destination: 'session' }]);
       } else {
         logEvent('tengu_plan_exit', {
           planLengthChars: 0,
           outcome: 'no' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
           interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
-          planStructureVariant
+          planStructureVariant,
         });
         onDone();
         onReject();
         toolUseConfirm.onReject();
       }
     }
-    return <PermissionDialog color="planMode" title="Exit plan mode?" workerBadge={workerBadge}>
+
+    return (
+      <PermissionDialog color="planMode" title="Exit plan mode?" workerBadge={workerBadge}>
         <Box flexDirection="column" paddingX={1} marginTop={1}>
           <Text>Claude wants to exit plan mode</Text>
           <Box marginTop={1}>
-            <Select options={[{
-            label: 'Yes',
-            value: 'yes' as const
-          }, {
-            label: 'No',
-            value: 'no' as const
-          }]} onChange={handleEmptyPlanResponse} onCancel={() => {
-            logEvent('tengu_plan_exit', {
-              planLengthChars: 0,
-              outcome: 'no' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-              interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
-              planStructureVariant
-            });
-            onDone();
-            onReject();
-            toolUseConfirm.onReject();
-          }} />
+            <Select
+              options={[
+                { label: 'Yes', value: 'yes' as const },
+                { label: 'No', value: 'no' as const },
+              ]}
+              onChange={handleEmptyPlanResponse}
+              onCancel={() => {
+                logEvent('tengu_plan_exit', {
+                  planLengthChars: 0,
+                  outcome: 'no' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+                  interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
+                  planStructureVariant,
+                });
+                onDone();
+                onReject();
+                toolUseConfirm.onReject();
+              }}
+            />
           </Box>
         </Box>
-      </PermissionDialog>;
+      </PermissionDialog>
+    );
   }
-  return <Box flexDirection="column" tabIndex={0} autoFocus onKeyDown={handleKeyDown}>
+
+  return (
+    <Box flexDirection="column" tabIndex={0} autoFocus onKeyDown={handleKeyDown}>
       <PermissionDialog color="planMode" title="Ready to code?" innerPaddingX={0} workerBadge={workerBadge}>
         <Box flexDirection="column" marginTop={1}>
           <Box paddingX={1} flexDirection="column">
             <Text>Here is Claude&apos;s plan:</Text>
           </Box>
-          <Box borderColor="subtle" borderStyle="dashed" flexDirection="column" borderLeft={false} borderRight={false} paddingX={1} marginBottom={1}
-        // Necessary for Windows Terminal to render properly
-        overflow="hidden">
+          <Box
+            borderColor="subtle"
+            borderStyle="dashed"
+            flexDirection="column"
+            borderLeft={false}
+            borderRight={false}
+            paddingX={1}
+            marginBottom={1}
+            // Necessary for Windows Terminal to render properly
+            overflow="hidden"
+          >
             <Markdown>{currentPlan}</Markdown>
           </Box>
           <Box flexDirection="column" paddingX={1}>
             <PermissionRuleExplanation permissionResult={toolUseConfirm.permissionResult} toolType="tool" />
-            {isClassifierPermissionsEnabled() && allowedPrompts && allowedPrompts.length > 0 && <Box flexDirection="column" marginBottom={1}>
-                  <Text bold>Requested permissions:</Text>
-                  {allowedPrompts.map((p, i) => <Text key={i} dimColor>
-                      {'  '}· {p.tool}({PROMPT_PREFIX} {p.prompt})
-                    </Text>)}
-                </Box>}
-            {!useStickyFooter && <>
-                <Text dimColor>
-                  Claude has written up a plan and is ready to execute. Would
-                  you like to proceed?
-                </Text>
+            {isClassifierPermissionsEnabled() && allowedPrompts && allowedPrompts.length > 0 && (
+              <Box flexDirection="column" marginBottom={1}>
+                <Text bold>Requested permissions:</Text>
+                {allowedPrompts.map((p, i) => (
+                  <Text key={i} dimColor>
+                    {'  '}· {p.tool}({PROMPT_PREFIX} {p.prompt})
+                  </Text>
+                ))}
+              </Box>
+            )}
+            {!useStickyFooter && (
+              <>
+                <Text dimColor>Claude has written up a plan and is ready to execute. Would you like to proceed?</Text>
                 <Box marginTop={1}>
-                  <Select options={options} onChange={handleResponse} onCancel={() => handleCancelRef.current?.()} onImagePaste={onImagePaste} pastedContents={pastedContents} onRemoveImage={onRemoveImage} />
+                  <Select
+                    options={options}
+                    onChange={handleResponse}
+                    onCancel={() => handleCancelRef.current?.()}
+                    onImagePaste={onImagePaste}
+                    pastedContents={pastedContents}
+                    onRemoveImage={onRemoveImage}
+                  />
                 </Box>
-              </>}
+              </>
+            )}
           </Box>
         </Box>
       </PermissionDialog>
-      {!useStickyFooter && editorName && <Box flexDirection="row" gap={1} paddingX={1} marginTop={1}>
+      {!useStickyFooter && editorName && (
+        <Box flexDirection="row" gap={1} paddingX={1} marginTop={1}>
           <Box>
             <Text dimColor>ctrl-g to edit in </Text>
             <Text bold dimColor>
@@ -662,12 +777,16 @@ export function ExitPlanModePermissionRequest({
             </Text>
             {isV2 && planFilePath && <Text dimColor> · {getDisplayPath(planFilePath)}</Text>}
           </Box>
-          {showSaveMessage && <Box>
+          {showSaveMessage && (
+            <Box>
               <Text dimColor>{' · '}</Text>
               <Text color="success">{figures.tick}Plan saved!</Text>
-            </Box>}
-        </Box>}
-    </Box>;
+            </Box>
+          )}
+        </Box>
+      )}
+    </Box>
+  );
 }
 
 /** @internal Exported for testing. */
@@ -677,7 +796,7 @@ export function buildPlanApprovalOptions({
   usedPercent,
   isAutoModeAvailable,
   isBypassPermissionsModeAvailable,
-  onFeedbackChange
+  onFeedbackChange,
 }: {
   showClearContext: boolean;
   showUltraplan: boolean;
@@ -688,21 +807,22 @@ export function buildPlanApprovalOptions({
 }): OptionWithDescription<ResponseValue>[] {
   const options: OptionWithDescription<ResponseValue>[] = [];
   const usedLabel = usedPercent !== null ? ` (${usedPercent}% used)` : '';
+
   if (showClearContext) {
     if (feature('TRANSCRIPT_CLASSIFIER') && isAutoModeAvailable) {
       options.push({
         label: `Yes, clear context${usedLabel} and use auto mode`,
-        value: 'yes-auto-clear-context'
+        value: 'yes-auto-clear-context',
       });
     } else if (isBypassPermissionsModeAvailable) {
       options.push({
         label: `Yes, clear context${usedLabel} and bypass permissions`,
-        value: 'yes-bypass-permissions'
+        value: 'yes-bypass-permissions',
       });
     } else {
       options.push({
         label: `Yes, clear context${usedLabel} and auto-accept edits`,
-        value: 'yes-accept-edits'
+        value: 'yes-accept-edits',
       });
     }
   }
@@ -711,57 +831,68 @@ export function buildPlanApprovalOptions({
   if (feature('TRANSCRIPT_CLASSIFIER') && isAutoModeAvailable) {
     options.push({
       label: 'Yes, and use auto mode',
-      value: 'yes-resume-auto-mode'
+      value: 'yes-resume-auto-mode',
     });
   } else if (isBypassPermissionsModeAvailable) {
     options.push({
       label: 'Yes, and bypass permissions',
-      value: 'yes-accept-edits-keep-context'
+      value: 'yes-accept-edits-keep-context',
     });
   } else {
     options.push({
       label: 'Yes, auto-accept edits',
-      value: 'yes-accept-edits-keep-context'
+      value: 'yes-accept-edits-keep-context',
     });
   }
+
   options.push({
     label: 'Yes, manually approve edits',
-    value: 'yes-default-keep-context'
+    value: 'yes-default-keep-context',
   });
+
   if (showUltraplan) {
     options.push({
       label: 'No, refine with Ultraplan on Claude Code on the web',
-      value: 'ultraplan'
+      value: 'ultraplan',
     });
   }
+
   options.push({
     type: 'input',
     label: 'No, keep planning',
     value: 'no',
     placeholder: 'Tell Claude what to change',
     description: 'shift+tab to approve with this feedback',
-    onChange: onFeedbackChange
+    onChange: onFeedbackChange,
   });
+
   return options;
 }
-function getContextUsedPercent(usage: {
-  input_tokens: number;
-  cache_creation_input_tokens?: number | null;
-  cache_read_input_tokens?: number | null;
-} | undefined, permissionMode: PermissionMode): number | null {
+
+function getContextUsedPercent(
+  usage:
+    | {
+        input_tokens: number;
+        cache_creation_input_tokens?: number | null;
+        cache_read_input_tokens?: number | null;
+      }
+    | undefined,
+  permissionMode: PermissionMode,
+): number | null {
   if (!usage) return null;
   const runtimeModel = getRuntimeMainLoopModel({
     permissionMode,
     mainLoopModel: getMainLoopModel(),
-    exceeds200kTokens: false
+    exceeds200kTokens: false,
   });
   const contextWindowSize = getContextWindowForModel(runtimeModel, getSdkBetas());
-  const {
-    used
-  } = calculateContextPercentages({
-    input_tokens: usage.input_tokens,
-    cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
-    cache_read_input_tokens: usage.cache_read_input_tokens ?? 0
-  }, contextWindowSize);
+  const { used } = calculateContextPercentages(
+    {
+      input_tokens: usage.input_tokens,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+    },
+    contextWindowSize,
+  );
   return used;
 }

@@ -417,6 +417,77 @@ function syncRemoteEvalToDisk(): void {
 }
 
 /**
+ * Local default overrides for GrowthBook feature gates.
+ *
+ * When GrowthBook is not connected (e.g. no 1P event logging, no adapter),
+ * these values are used instead of the hard-coded defaults (usually false).
+ * This allows enabling features that have real implementations without
+ * requiring a GrowthBook server connection.
+ *
+ * Set CLAUDE_CODE_DISABLE_LOCAL_GATES=1 to bypass these defaults.
+ *
+ * Categories:
+ *   P0 — Pure local features (no external dependencies)
+ *   P1 — Requires Claude API (works with any valid API key)
+ *   KS — Kill switches (default true, keep them true)
+ */
+const LOCAL_GATE_DEFAULTS: Record<string, unknown> = {
+  // ── P0: Pure local features ──────────────────────────────────────
+  tengu_keybinding_customization_release: true, // Custom keybindings
+  tengu_streaming_tool_execution2: true, // Streaming tool execution
+  tengu_kairos_cron: true, // Cron/scheduled tasks
+  tengu_amber_json_tools: true, // Token-efficient JSON tools (~4.5% savings)
+  tengu_immediate_model_command: true, // Instant /model, /fast, /effort during query
+  tengu_basalt_3kr: true, // MCP instructions delta (send only changes)
+  tengu_pebble_leaf_prune: true, // Session storage leaf pruning
+  tengu_chair_sermon: true, // Message smooshing (merge adjacent blocks)
+  tengu_lodestone_enabled: true, // Deep link protocol (claude://)
+  tengu_auto_background_agents: true, // Auto-background agents after 120s
+  tengu_fgts: true, // Fine-grained tool state in system prompt
+
+  // ── P1: API-dependent features ───────────────────────────────────
+  tengu_session_memory: true, // Session memory (cross-session persistence)
+  tengu_passport_quail: true, // Auto memory extraction
+  tengu_moth_copse: true, // Skip memory index, use prefetched memories
+  tengu_coral_fern: true, // "Searching past context" section
+  tengu_chomp_inflection: true, // Prompt suggestions
+  tengu_hive_evidence: true, // Verification agent
+  tengu_kairos_brief: true, // Brief mode
+  tengu_kairos_brief_config: { enable_slash_command: true }, // Brief /slash command visibility
+  tengu_sedge_lantern: true, // Away summary
+  tengu_onyx_plover: { enabled: true }, // Auto dream (memory consolidation)
+  tengu_willow_mode: 'dialog', // Idle return prompt
+
+  // ── Kill switches (keep true to prevent remote disable) ──────────
+  tengu_turtle_carbon: true, // Ultrathink extended thinking
+  tengu_amber_stoat: true, // Built-in Explore/Plan agents
+  tengu_amber_flint: true, // Agent teams/swarms
+  tengu_slim_subagent_claudemd: true, // Slim CLAUDE.md for subagents
+  tengu_birch_trellis: true, // Tree-sitter bash security analysis
+  tengu_collage_kaleidoscope: true, // macOS clipboard image reading
+  tengu_compact_cache_prefix: true, // Reuse prompt cache during compaction
+  tengu_kairos_assistant: true, // KAIROS assistant mode activation
+  tengu_kairos_cron_durable: true, // Persistent cron tasks
+  tengu_attribution_header: true, // API request attribution header
+  tengu_slate_prism: true, // Agent progress summaries
+
+  // ── Ultrareview (cloud code review via CCR) ─────────────────────
+  tengu_review_bughunter_config: { enabled: true }, // /ultrareview command visibility
+  tengu_ccr_bundle_seed_enabled: true, // Bundle seed: skip GitHub App check for branch mode
+}
+
+/**
+ * Look up a local gate default. Returns undefined if not configured,
+ * allowing the caller to fall through to the original defaultValue.
+ */
+function getLocalGateDefault(feature: string): unknown | undefined {
+  if (process.env.CLAUDE_CODE_DISABLE_LOCAL_GATES) {
+    return undefined
+  }
+  return LOCAL_GATE_DEFAULTS[feature]
+}
+
+/**
  * Check if GrowthBook operations should be enabled
  */
 function isGrowthBookEnabled(): boolean {
@@ -500,11 +571,13 @@ const getGrowthBookClient = memoize(
     const attributes = getUserAttributes()
     const clientKey = getGrowthBookClientKey()
     const baseUrl =
-      process.env.CLAUDE_GB_ADAPTER_URL
-        || (process.env.USER_TYPE === 'ant'
-          ? process.env.CLAUDE_CODE_GB_BASE_URL || 'https://api.anthropic.com/'
-          : 'https://api.anthropic.com/')
-    const isAdapterMode = !!(process.env.CLAUDE_GB_ADAPTER_URL && process.env.CLAUDE_GB_ADAPTER_KEY)
+      process.env.CLAUDE_GB_ADAPTER_URL ||
+      (process.env.USER_TYPE === 'ant'
+        ? process.env.CLAUDE_CODE_GB_BASE_URL || 'https://api.anthropic.com/'
+        : 'https://api.anthropic.com/')
+    const isAdapterMode = !!(
+      process.env.CLAUDE_GB_ADAPTER_URL && process.env.CLAUDE_GB_ADAPTER_KEY
+    )
     if (process.env.USER_TYPE === 'ant') {
       logForDebugging(
         `GrowthBook: Creating client with clientKey=${clientKey}, attributes: ${jsonStringify(attributes)}`,
@@ -537,7 +610,9 @@ const getGrowthBookClient = memoize(
       // remoteEval only works with Anthropic internal API, GrowthBook Cloud doesn't support it
       remoteEval: !isAdapterMode,
       // cacheKeyAttributes only valid with remoteEval
-      ...(!isAdapterMode ? { cacheKeyAttributes: ['id', 'organizationUUID'] } : {}),
+      ...(!isAdapterMode
+        ? { cacheKeyAttributes: ['id', 'organizationUUID'] }
+        : {}),
       // Add auth headers if available
       ...(authHeaders.error
         ? {}
@@ -691,12 +766,14 @@ async function getFeatureValueInternal<T>(
   }
 
   if (!isGrowthBookEnabled()) {
-    return defaultValue
+    const localDefault = getLocalGateDefault(feature)
+    return localDefault !== undefined ? (localDefault as T) : defaultValue
   }
 
   const growthBookClient = await initializeGrowthBook()
   if (!growthBookClient) {
-    return defaultValue
+    const localDefault = getLocalGateDefault(feature)
+    return localDefault !== undefined ? (localDefault as T) : defaultValue
   }
 
   // Use cached remote eval values if available (workaround for SDK bug)
@@ -754,7 +831,18 @@ export function getFeatureValue_CACHED_MAY_BE_STALE<T>(
   }
 
   if (!isGrowthBookEnabled()) {
-    return defaultValue
+    const localDefault = getLocalGateDefault(feature)
+    return localDefault !== undefined ? (localDefault as T) : defaultValue
+  }
+
+  // LOCAL_GATE_DEFAULTS take priority over remote values and disk cache.
+  // In fork/self-hosted deployments, the GrowthBook server may push false
+  // for gates we intentionally enable. Local defaults represent the
+  // project's intentional configuration and override everything except
+  // env/config overrides (which are explicit user intent).
+  const localDefault = getLocalGateDefault(feature)
+  if (localDefault !== undefined) {
+    return localDefault as T
   }
 
   // Log experiment exposure if data is available, otherwise defer until after init
@@ -765,10 +853,6 @@ export function getFeatureValue_CACHED_MAY_BE_STALE<T>(
   }
 
   // In-memory payload is authoritative once processRemoteEvalPayload has run.
-  // Disk is also fresh by then (syncRemoteEvalToDisk runs synchronously inside
-  // init), so this is correctness-equivalent to the disk read below — but it
-  // skips the config JSON parse and is what onGrowthBookRefresh subscribers
-  // depend on to read fresh values the instant they're notified.
   if (remoteEvalFeatureValues.has(feature)) {
     return remoteEvalFeatureValues.get(feature) as T
   }
@@ -776,10 +860,13 @@ export function getFeatureValue_CACHED_MAY_BE_STALE<T>(
   // Fall back to disk cache (survives across process restarts)
   try {
     const cached = getGlobalConfig().cachedGrowthBookFeatures?.[feature]
-    return cached !== undefined ? (cached as T) : defaultValue
+    if (cached !== undefined) {
+      return cached as T
+    }
   } catch {
-    return defaultValue
+    // Config not yet initialized — fall through to defaultValue
   }
+  return defaultValue
 }
 
 /**
@@ -823,7 +910,8 @@ export function checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
   }
 
   if (!isGrowthBookEnabled()) {
-    return false
+    const localDefault = getLocalGateDefault(gate)
+    return localDefault !== undefined ? Boolean(localDefault) : false
   }
 
   // Log experiment exposure if data is available, otherwise defer until after init
@@ -835,13 +923,23 @@ export function checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
 
   // Return cached value immediately from disk
   // First check GrowthBook cache, then fall back to Statsig cache for migration
-  const config = getGlobalConfig()
-  const gbCached = config.cachedGrowthBookFeatures?.[gate]
-  if (gbCached !== undefined) {
-    return Boolean(gbCached)
+  try {
+    const config = getGlobalConfig()
+    const gbCached = config.cachedGrowthBookFeatures?.[gate]
+    if (gbCached !== undefined) {
+      return Boolean(gbCached)
+    }
+    // Fallback to Statsig cache for migration period
+    const statsigCached = config.cachedStatsigGates?.[gate]
+    if (statsigCached !== undefined) {
+      return statsigCached
+    }
+  } catch {
+    // Config not yet initialized — fall through to local gate defaults
   }
-  // Fallback to Statsig cache for migration period
-  return config.cachedStatsigGates?.[gate] ?? false
+  // Neither cache has a value (or config not initialized) — use local gate defaults
+  const localDefault = getLocalGateDefault(gate)
+  return localDefault !== undefined ? Boolean(localDefault) : false
 }
 
 /**
@@ -923,7 +1021,8 @@ export async function checkGate_CACHED_OR_BLOCKING(
   }
 
   if (!isGrowthBookEnabled()) {
-    return false
+    const localDefault = getLocalGateDefault(gate)
+    return localDefault !== undefined ? Boolean(localDefault) : false
   }
 
   // Fast path: disk cache already says true — trust it

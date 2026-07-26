@@ -6,7 +6,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { useNotifications } from 'src/context/notifications.js';
 import { useCommandQueue } from 'src/hooks/useCommandQueue.js';
 import { type IDEAtMentioned, useIdeAtMentioned } from 'src/hooks/useIdeAtMentioned.js';
-import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEvent } from 'src/services/analytics/index.js';
+import {
+  type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+  logEvent,
+} from 'src/services/analytics/index.js';
 import { type AppState, useAppState, useAppStateStore, useSetAppState } from 'src/state/AppState.js';
 import type { FooterItem } from 'src/state/AppStateStore.js';
 import { getCwd } from 'src/utils/cwd.js';
@@ -23,6 +26,7 @@ import { useSetPromptOverlayDialog } from '../../context/promptOverlayContext.js
 import { formatImageRef, formatPastedTextRef, getPastedTextRefNumLines, parseReferences } from '../../history.js';
 import type { VerificationStatus } from '../../hooks/useApiKeyVerification.js';
 import { type HistoryMode, useArrowKeyHistory } from '../../hooks/useArrowKeyHistory.js';
+import { useBackgroundAgentTasks } from '../../hooks/useBackgroundAgentTasks.js';
 import { useDoublePress } from '../../hooks/useDoublePress.js';
 import { useHistorySearch } from '../../hooks/useHistorySearch.js';
 import type { IDESelection } from '../../hooks/useIdeSelection.js';
@@ -31,9 +35,7 @@ import { useMainLoopModel } from '../../hooks/useMainLoopModel.js';
 import { usePromptSuggestion } from '../../hooks/usePromptSuggestion.js';
 import { useTerminalSize } from '../../hooks/useTerminalSize.js';
 import { useTypeahead } from '../../hooks/useTypeahead.js';
-import type { BorderTextOptions } from '../../ink/render-border.js';
-import { stringWidth } from '../../ink/stringWidth.js';
-import { Box, type ClickEvent, type Key, Text, useInput } from '../../ink.js';
+import { Box, type BorderTextOptions, type ClickEvent, type Key, stringWidth, Text, useInput } from '@anthropic/ink';
 import { useOptionalKeybindingContext } from '../../keybindings/KeybindingContext.js';
 import { getShortcutDisplay } from '../../keybindings/shortcutFormat.js';
 import { useKeybinding, useKeybindings } from '../../keybindings/useKeybinding.js';
@@ -47,10 +49,13 @@ import { getRunningTeammatesSorted } from '../../tasks/InProcessTeammateTask/InP
 import type { InProcessTeammateTaskState } from '../../tasks/InProcessTeammateTask/types.js';
 import { isPanelAgentTask, type LocalAgentTaskState } from '../../tasks/LocalAgentTask/LocalAgentTask.js';
 import { isBackgroundTask } from '../../tasks/types.js';
-import { AGENT_COLOR_TO_THEME_COLOR, AGENT_COLORS, type AgentColorName } from '../../tools/AgentTool/agentColorManager.js';
-import type { AgentDefinition } from '../../tools/AgentTool/loadAgentsDir.js';
+import {
+  AGENT_COLOR_TO_THEME_COLOR,
+  AGENT_COLORS,
+  type AgentColorName,
+} from '@claude-code-best/builtin-tools/tools/AgentTool/agentColorManager.js';
+import type { AgentDefinition } from '@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js';
 import type { Message } from '../../types/message.js';
-import type { PermissionMode } from '../../types/permissions.js';
 import type { BaseTextInputProps, PromptInputMode, VimMode } from '../../types/textInputTypes.js';
 import { isAgentSwarmsEnabled } from '../../utils/agentSwarmsEnabled.js';
 import { count } from '../../utils/array.js';
@@ -63,7 +68,13 @@ import type { EffortLevel } from '../../utils/effort.js';
 import { env } from '../../utils/env.js';
 import { errorMessage } from '../../utils/errors.js';
 import { isBilledAsExtraUsage } from '../../utils/extraUsage.js';
-import { getFastModeUnavailableReason, isFastModeAvailable, isFastModeCooldown, isFastModeEnabled, isFastModeSupportedByModel } from '../../utils/fastMode.js';
+import {
+  getFastModeUnavailableReason,
+  isFastModeAvailable,
+  isFastModeCooldown,
+  isFastModeEnabled,
+  isFastModeSupportedByModel,
+} from '../../utils/fastMode.js';
 import { isFullscreenEnvEnabled } from '../../utils/fullscreen.js';
 import type { PromptInputHelpers } from '../../utils/handlePromptSubmit.js';
 import { getImageFromClipboard, PASTE_THRESHOLD } from '../../utils/imagePaste.js';
@@ -72,16 +83,19 @@ import { cacheImagePath, storeImage } from '../../utils/imageStore.js';
 import { isMacosOptionChar, MACOS_OPTION_SPECIAL_CHARS } from '../../utils/keyboardShortcuts.js';
 import { logError } from '../../utils/log.js';
 import { isOpus1mMergeEnabled, modelDisplayString } from '../../utils/model/model.js';
-import { setAutoModeActive } from '../../utils/permissions/autoModeState.js';
 import { cyclePermissionMode, getNextPermissionMode } from '../../utils/permissions/getNextPermissionMode.js';
-import { transitionPermissionMode } from '../../utils/permissions/permissionSetup.js';
 import { getPlatform } from '../../utils/platform.js';
 import type { ProcessUserInputContext } from '../../utils/processUserInput/processUserInput.js';
 import { editPromptInEditor } from '../../utils/promptEditor.js';
-import { hasAutoModeOptIn } from '../../utils/settings/settings.js';
+// hasAutoModeOptIn removed — auto mode is available to all users
 import { findBtwTriggerPositions } from '../../utils/sideQuestion.js';
 import { findSlashCommandPositions } from '../../utils/suggestions/commandSuggestions.js';
-import { findSlackChannelPositions, getKnownChannelsVersion, hasSlackMcpServer, subscribeKnownChannels } from '../../utils/suggestions/slackChannelSuggestions.js';
+import {
+  findSlackChannelPositions,
+  getKnownChannelsVersion,
+  hasSlackMcpServer,
+  subscribeKnownChannels,
+} from '../../utils/suggestions/slackChannelSuggestions.js';
 import { isInProcessEnabled } from '../../utils/swarm/backends/registry.js';
 import { syncTeammateMode } from '../../utils/swarm/teamHelpers.js';
 import type { TeamSummary } from '../../utils/teamDiscovery.js';
@@ -93,7 +107,7 @@ import type { Theme } from '../../utils/theme.js';
 import { findThinkingTriggerPositions, getRainbowColor, isUltrathinkEnabled } from '../../utils/thinking.js';
 import { findTokenBudgetPositions } from '../../utils/tokenBudget.js';
 import { findUltraplanTriggerPositions, findUltrareviewTriggerPositions } from '../../utils/ultraplan/keyword.js';
-import { AutoModeOptInDialog } from '../AutoModeOptInDialog.js';
+// AutoModeOptInDialog removed — auto mode is available to all users
 import { BridgeDialog } from '../BridgeDialog.js';
 import { ConfigurableShortcutHint } from '../ConfigurableShortcutHint.js';
 import { getVisibleAgentTasks, useCoordinatorTaskCount } from '../CoordinatorAgentStatus.js';
@@ -121,6 +135,7 @@ import { usePromptInputPlaceholder } from './usePromptInputPlaceholder.js';
 import { useShowFastIconHint } from './useShowFastIconHint.js';
 import { useSwarmBanner } from './useSwarmBanner.js';
 import { isNonSpacePrintable, isVimModeEnabled } from './utils.js';
+
 type Props = {
   debug: boolean;
   ideSelection: IDESelection | undefined;
@@ -138,16 +153,22 @@ type Props = {
   onInputChange: (value: string) => void;
   mode: PromptInputMode;
   onModeChange: (mode: PromptInputMode) => void;
-  stashedPrompt: {
-    text: string;
-    cursorOffset: number;
-    pastedContents: Record<number, PastedContent>;
-  } | undefined;
-  setStashedPrompt: (value: {
-    text: string;
-    cursorOffset: number;
-    pastedContents: Record<number, PastedContent>;
-  } | undefined) => void;
+  stashedPrompt:
+    | {
+        text: string;
+        cursorOffset: number;
+        pastedContents: Record<number, PastedContent>;
+      }
+    | undefined;
+  setStashedPrompt: (
+    value:
+      | {
+          text: string;
+          cursorOffset: number;
+          pastedContents: Record<number, PastedContent>;
+        }
+      | undefined,
+  ) => void;
   submitCount: number;
   onShowMessageSelector: () => void;
   /** Fullscreen message actions: shift+↑ enters cursor. */
@@ -160,15 +181,27 @@ type Props = {
   showBashesDialog: string | boolean;
   setShowBashesDialog: (show: string | boolean) => void;
   onExit: () => void;
-  getToolUseContext: (messages: Message[], newMessages: Message[], abortController: AbortController, mainLoopModel: string) => ProcessUserInputContext;
-  onSubmit: (input: string, helpers: PromptInputHelpers, speculationAccept?: {
-    state: ActiveSpeculationState;
-    speculationSessionTimeSavedMs: number;
-    setAppState: (f: (prev: AppState) => AppState) => void;
-  }, options?: {
-    fromKeybinding?: boolean;
-  }) => Promise<void>;
-  onAgentSubmit?: (input: string, task: InProcessTeammateTaskState | LocalAgentTaskState, helpers: PromptInputHelpers) => Promise<void>;
+  getToolUseContext: (
+    messages: Message[],
+    newMessages: Message[],
+    abortController: AbortController,
+    mainLoopModel: string,
+  ) => ProcessUserInputContext;
+  onSubmit: (
+    input: string,
+    helpers: PromptInputHelpers,
+    speculationAccept?: {
+      state: ActiveSpeculationState;
+      speculationSessionTimeSavedMs: number;
+      setAppState: (f: (prev: AppState) => AppState) => void;
+    },
+    options?: { fromKeybinding?: boolean },
+  ) => Promise<void>;
+  onAgentSubmit?: (
+    input: string,
+    task: InProcessTeammateTaskState | LocalAgentTaskState,
+    helpers: PromptInputHelpers,
+  ) => Promise<void>;
   isSearchingHistory: boolean;
   setIsSearchingHistory: (isSearching: boolean) => void;
   onDismissSideQuestion?: () => void;
@@ -182,15 +215,13 @@ type Props = {
     setInputWithCursor: (value: string, cursor: number) => void;
     cursorOffset: number;
   } | null>;
-  voiceInterimRange?: {
-    start: number;
-    end: number;
-  } | null;
+  voiceInterimRange?: { start: number; end: number } | null;
 };
 
 // Bottom slot has maxHeight="50%"; reserve lines for footer, border, status.
 const PROMPT_FOOTER_LINES = 5;
 const MIN_INPUT_VIEWPORT_LINES = 3;
+
 function PromptInput({
   debug,
   ideSelection,
@@ -233,7 +264,7 @@ function PromptInput({
   hasSuppressedDialogs,
   isLocalJSXCommandActive = false,
   insertTextRef,
-  voiceInterimRange
+  voiceInterimRange,
 }: Props): React.ReactNode {
   const mainLoopModel = useMainLoopModel();
   // A local-jsx command (e.g., /mcp while agent is running) renders a full-
@@ -246,9 +277,7 @@ function PromptInput({
   const [exitMessage, setExitMessage] = useState<{
     show: boolean;
     key?: string;
-  }>({
-    show: false
-  });
+  }>({ show: false });
   const [cursorOffset, setCursorOffset] = useState<number>(input.length);
   // Track the last input value set via internal handlers so we can detect
   // external input changes (e.g. speech-to-text injection) and move cursor to end.
@@ -259,10 +288,13 @@ function PromptInput({
     lastInternalInputRef.current = input;
   }
   // Wrap onInputChange to track internal changes before they trigger re-render
-  const trackAndSetInput = React.useCallback((value: string) => {
-    lastInternalInputRef.current = value;
-    onInputChange(value);
-  }, [onInputChange]);
+  const trackAndSetInput = React.useCallback(
+    (value: string) => {
+      lastInternalInputRef.current = value;
+      onInputChange(value);
+    },
+    [onInputChange],
+  );
   // Expose an insertText function so callers (e.g. STT) can splice text at the
   // current cursor position instead of replacing the entire input.
   if (insertTextRef) {
@@ -280,7 +312,7 @@ function PromptInput({
         lastInternalInputRef.current = value;
         onInputChange(value);
         setCursorOffset(cursor);
-      }
+      },
     };
   }
   const store = useAppStateStore();
@@ -294,10 +326,10 @@ function PromptInput({
   // otherwise bridge becomes an invisible selection stop.
   const bridgeFooterVisible = replBridgeConnected && (replBridgeExplicit || replBridgeReconnecting);
   // Tmux pill (ant-only) — visible when there's an active tungsten session
-  const hasTungstenSession = useAppState(s => (process.env.USER_TYPE) === 'ant' && s.tungstenActiveSession !== undefined);
-  const tmuxFooterVisible = (process.env.USER_TYPE) === 'ant' && hasTungstenSession;
+  const hasTungstenSession = useAppState(s => process.env.USER_TYPE === 'ant' && s.tungstenActiveSession !== undefined);
+  const tmuxFooterVisible = process.env.USER_TYPE === 'ant' && hasTungstenSession;
   // WebBrowser pill — visible when a browser is open
-  const bagelFooterVisible = useAppState(s => false);
+  const bagelFooterVisible = useAppState(_s => false);
   const teamContext = useAppState(s => s.teamContext);
   const queuedCommands = useCommandQueue();
   const promptSuggestionState = useAppState(s => s.promptSuggestion);
@@ -306,33 +338,31 @@ function PromptInput({
   const viewingAgentTaskId = useAppState(s => s.viewingAgentTaskId);
   const viewSelectionMode = useAppState(s => s.viewSelectionMode);
   const showSpinnerTree = useAppState(s => s.expandedView) === 'teammates';
-  const {
-    companion: _companion,
-    companionMuted
-  } = feature('BUDDY') ? getGlobalConfig() : {
-    companion: undefined,
-    companionMuted: undefined
-  };
+  const { companion: _companion, companionMuted } = feature('BUDDY')
+    ? getGlobalConfig()
+    : { companion: undefined, companionMuted: undefined };
   const companionFooterVisible = !!_companion && !companionMuted;
   // Brief mode: BriefSpinner/BriefIdleStatus own the 2-row footprint above
   // the input. Dropping marginTop here lets the spinner sit flush against
   // the input bar. viewingAgentTaskId mirrors the gate on both (Spinner.tsx,
   // REPL.tsx) — teammate view falls back to SpinnerWithVerbInner which has
   // its own marginTop, so the gap stays even without ours.
-  const briefOwnsGap = feature('KAIROS') || feature('KAIROS_BRIEF') ?
-  // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
-  useAppState(s => s.isBriefOnly) && !viewingAgentTaskId : false;
+  const isBriefOnlyState = useAppState(s => s.isBriefOnly);
+  const briefOwnsGap = feature('KAIROS') || feature('KAIROS_BRIEF') ? isBriefOnlyState && !viewingAgentTaskId : false;
   const mainLoopModel_ = useAppState(s => s.mainLoopModel);
   const mainLoopModelForSession = useAppState(s => s.mainLoopModelForSession);
   const thinkingEnabled = useAppState(s => s.thinkingEnabled);
-  const isFastMode = useAppState(s => isFastModeEnabled() ? s.fastMode : false);
+  const isFastMode = useAppState(s => (isFastModeEnabled() ? s.fastMode : false));
   const effortValue = useAppState(s => s.effortValue);
   const viewedTeammate = getViewedTeammateTask(store.getState());
   const viewingAgentName = viewedTeammate?.identity.agentName;
   // identity.color is typed as `string | undefined` (not AgentColorName) because
   // teammate identity comes from file-based config. Validate before casting to
   // ensure we only use valid color names (falls back to cyan if invalid).
-  const viewingAgentColor = viewedTeammate?.identity.color && AGENT_COLORS.includes(viewedTeammate.identity.color as AgentColorName) ? viewedTeammate.identity.color as AgentColorName : undefined;
+  const viewingAgentColor =
+    viewedTeammate?.identity.color && AGENT_COLORS.includes(viewedTeammate.identity.color as AgentColorName)
+      ? (viewedTeammate.identity.color as AgentColorName)
+      : undefined;
   // In-process teammates sorted alphabetically for footer team selector
   const inProcessTeammates = useMemo(() => getRunningTeammatesSorted(tasks), [tasks]);
 
@@ -344,20 +374,27 @@ function PromptInput({
     if (viewedTeammate) {
       return {
         ...toolPermissionContext,
-        mode: viewedTeammate.permissionMode
+        mode: viewedTeammate.permissionMode,
       };
     }
     return toolPermissionContext;
   }, [viewedTeammate, toolPermissionContext]);
-  const {
-    historyQuery,
-    setHistoryQuery,
-    historyMatch,
-    historyFailedMatch
-  } = useHistorySearch(entry => {
-    setPastedContents(entry.pastedContents);
-    void onSubmit(entry.display);
-  }, input, trackAndSetInput, setCursorOffset, cursorOffset, onModeChange, mode, isSearchingHistory, setIsSearchingHistory, setPastedContents, pastedContents);
+  const { historyQuery, setHistoryQuery, historyMatch, historyFailedMatch } = useHistorySearch(
+    entry => {
+      setPastedContents(entry.pastedContents);
+      void onSubmit(entry.display);
+    },
+    input,
+    trackAndSetInput,
+    setCursorOffset,
+    cursorOffset,
+    onModeChange,
+    mode,
+    isSearchingHistory,
+    setIsSearchingHistory,
+    setPastedContents,
+    pastedContents,
+  );
   // Counter for paste IDs (shared between images and text).
   // Compute initial value once from existing messages (for --continue/--resume).
   // useRef(fn()) evaluates fn() on every render and discards the result after
@@ -371,6 +408,7 @@ function PromptInput({
   // printable, inputFilter prepends a space before it. Any other input
   // (arrow, escape, backspace, paste, space) disarms without inserting.
   const pendingSpaceAfterPillRef = useRef(false);
+
   const [showTeamsDialog, setShowTeamsDialog] = useState(false);
   const [showBridgeDialog, setShowBridgeDialog] = useState(false);
   const [teammateFooterIndex, setTeammateFooterIndex] = useState(0);
@@ -378,20 +416,35 @@ function PromptInput({
   // First ↓ selects the pill, second ↓ moves to row 0. Prevents double-select
   // of pill + row when both bg tasks (pill) and forked agents (rows) are visible.
   const coordinatorTaskIndex = useAppState(s => s.coordinatorTaskIndex);
-  const setCoordinatorTaskIndex = useCallback((v: number | ((prev: number) => number)) => setAppState(prev => {
-    const next = typeof v === 'function' ? v(prev.coordinatorTaskIndex) : v;
-    if (next === prev.coordinatorTaskIndex) return prev;
-    return {
-      ...prev,
-      coordinatorTaskIndex: next
-    };
-  }), [setAppState]);
+  const selectedBgAgentIndex = useAppState(s => s.selectedBgAgentIndex);
+  const setSelectedBgAgentIndex = useCallback(
+    (v: number | ((prev: number) => number)) =>
+      setAppState(prev => {
+        const next = typeof v === 'function' ? v(prev.selectedBgAgentIndex) : v;
+        if (next === prev.selectedBgAgentIndex) return prev;
+        return { ...prev, selectedBgAgentIndex: next };
+      }),
+    [setAppState],
+  );
+  const setCoordinatorTaskIndex = useCallback(
+    (v: number | ((prev: number) => number)) =>
+      setAppState(prev => {
+        const next = typeof v === 'function' ? v(prev.coordinatorTaskIndex) : v;
+        if (next === prev.coordinatorTaskIndex) return prev;
+        return { ...prev, coordinatorTaskIndex: next };
+      }),
+    [setAppState],
+  );
   const coordinatorTaskCount = useCoordinatorTaskCount();
   // The pill (BackgroundTaskStatus) only renders when non-local_agent bg tasks
   // exist. When only local_agent tasks are running (coordinator/fork mode), the
   // pill is absent, so the -1 sentinel would leave nothing visually selected.
   // In that case, skip -1 and treat 0 as the minimum selectable index.
-  const hasBgTaskPill = useMemo(() => Object.values(tasks).some(t => isBackgroundTask(t) && !((process.env.USER_TYPE) === 'ant' && isPanelAgentTask(t))), [tasks]);
+  const hasBgTaskPill = useMemo(
+    () =>
+      Object.values(tasks).some(t => isBackgroundTask(t) && !(process.env.USER_TYPE === 'ant' && isPanelAgentTask(t))),
+    [tasks],
+  );
   const minCoordinatorIndex = hasBgTaskPill ? -1 : 0;
   // Clamp index when tasks complete and the list shrinks beneath the cursor
   useEffect(() => {
@@ -409,9 +462,6 @@ function PromptInput({
   const [showHistoryPicker, setShowHistoryPicker] = useState(false);
   const [showFastModePicker, setShowFastModePicker] = useState(false);
   const [showThinkingToggle, setShowThinkingToggle] = useState(false);
-  const [showAutoModeOptIn, setShowAutoModeOptIn] = useState(false);
-  const [previousModeBeforeAuto, setPreviousModeBeforeAuto] = useState<PermissionMode | null>(null);
-  const autoModeOptInTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Check if cursor is on the first line of input
   const isCursorOnFirstLine = useMemo(() => {
@@ -421,6 +471,7 @@ function PromptInput({
     }
     return cursorOffset <= firstNewlineIndex;
   }, [input, cursorOffset]);
+
   const isCursorOnLastLine = useMemo(() => {
     const lastNewlineIndex = input.lastIndexOf('\n');
     if (lastNewlineIndex === -1) {
@@ -439,12 +490,14 @@ function PromptInput({
       return [];
     }
     const teammateCount = count(Object.values(teamContext.teammates), t => t.name !== 'team-lead');
-    return [{
-      name: teamContext.teamName,
-      memberCount: teammateCount,
-      runningCount: 0,
-      idleCount: 0
-    }];
+    return [
+      {
+        name: teamContext.teamName,
+        memberCount: teammateCount,
+        runningCount: 0,
+        idleCount: 0,
+      },
+    ];
   }, [teamContext]);
 
   // ─── Footer pill navigation ─────────────────────────────────────────────
@@ -455,9 +508,34 @@ function PromptInput({
   // Panel shows retained-completed agents too (getVisibleAgentTasks), so the
   // pill must stay navigable whenever the panel has rows — not just when
   // something is running.
-  const tasksFooterVisible = (runningTaskCount > 0 || (process.env.USER_TYPE) === 'ant' && coordinatorTaskCount > 0) && !shouldHideTasksFooter(tasks, showSpinnerTree);
+  const tasksFooterVisible =
+    (runningTaskCount > 0 || (process.env.USER_TYPE === 'ant' && coordinatorTaskCount > 0)) &&
+    !shouldHideTasksFooter(tasks, showSpinnerTree);
   const teamsFooterVisible = cachedTeams.length > 0;
-  const footerItems = useMemo(() => [tasksFooterVisible && 'tasks', tmuxFooterVisible && 'tmux', bagelFooterVisible && 'bagel', teamsFooterVisible && 'teams', bridgeFooterVisible && 'bridge', companionFooterVisible && 'companion'].filter(Boolean) as FooterItem[], [tasksFooterVisible, tmuxFooterVisible, bagelFooterVisible, teamsFooterVisible, bridgeFooterVisible, companionFooterVisible]);
+  const bgAgentList = useBackgroundAgentTasks();
+  const bgAgentFooterVisible = bgAgentList.length > 0;
+
+  const footerItems = useMemo(
+    () =>
+      [
+        bgAgentFooterVisible && 'bg_agent',
+        tasksFooterVisible && 'tasks',
+        tmuxFooterVisible && 'tmux',
+        bagelFooterVisible && 'bagel',
+        teamsFooterVisible && 'teams',
+        bridgeFooterVisible && 'bridge',
+        companionFooterVisible && 'companion',
+      ].filter(Boolean) as FooterItem[],
+    [
+      bgAgentFooterVisible,
+      tasksFooterVisible,
+      tmuxFooterVisible,
+      bagelFooterVisible,
+      teamsFooterVisible,
+      bridgeFooterVisible,
+      companionFooterVisible,
+    ],
+  );
 
   // Effective selection: null if the selected pill stopped rendering (bridge
   // disconnected, task finished). The derivation makes the UI correct
@@ -465,27 +543,28 @@ function PromptInput({
   // resurrect when the same pill reappears (new task starts → focus stolen).
   const rawFooterSelection = useAppState(s => s.footerSelection);
   const footerItemSelected = rawFooterSelection && footerItems.includes(rawFooterSelection) ? rawFooterSelection : null;
+
   useEffect(() => {
     if (rawFooterSelection && !footerItemSelected) {
-      setAppState(prev => prev.footerSelection === null ? prev : {
-        ...prev,
-        footerSelection: null
-      });
+      setAppState(prev => (prev.footerSelection === null ? prev : { ...prev, footerSelection: null }));
     }
   }, [rawFooterSelection, footerItemSelected, setAppState]);
+
   const tasksSelected = footerItemSelected === 'tasks';
   const tmuxSelected = footerItemSelected === 'tmux';
-  const bagelSelected = footerItemSelected === 'bagel';
+  const _bagelSelected = footerItemSelected === 'bagel';
   const teamsSelected = footerItemSelected === 'teams';
   const bridgeSelected = footerItemSelected === 'bridge';
+  const bgAgentSelected = footerItemSelected === 'bg_agent';
+
   function selectFooterItem(item: FooterItem | null): void {
-    setAppState(prev => prev.footerSelection === item ? prev : {
-      ...prev,
-      footerSelection: item
-    });
+    setAppState(prev => (prev.footerSelection === item ? prev : { ...prev, footerSelection: item }));
     if (item === 'tasks') {
       setTeammateFooterIndex(0);
       setCoordinatorTaskIndex(minCoordinatorIndex);
+    }
+    if (item === 'bg_agent') {
+      setSelectedBgAgentIndex(-1);
     }
   }
 
@@ -510,19 +589,41 @@ function PromptInput({
     suggestion: promptSuggestion,
     markAccepted,
     logOutcomeAtSubmission,
-    markShown
+    markShown,
   } = usePromptSuggestion({
     inputValue: input,
-    isAssistantResponding: isLoading
+    isAssistantResponding: isLoading,
   });
-  const displayedValue = useMemo(() => isSearchingHistory && historyMatch ? getValueFromInput(typeof historyMatch === 'string' ? historyMatch : historyMatch.display) : input, [isSearchingHistory, historyMatch, input]);
+
+  const displayedValue = useMemo(
+    () =>
+      isSearchingHistory && historyMatch
+        ? getValueFromInput(typeof historyMatch === 'string' ? historyMatch : historyMatch.display)
+        : input,
+    [isSearchingHistory, historyMatch, input],
+  );
+
   const thinkTriggers = useMemo(() => findThinkingTriggerPositions(displayedValue), [displayedValue]);
+
   const ultraplanSessionUrl = useAppState(s => s.ultraplanSessionUrl);
   const ultraplanLaunching = useAppState(s => s.ultraplanLaunching);
-  const ultraplanTriggers = useMemo(() => feature('ULTRAPLAN') && !ultraplanSessionUrl && !ultraplanLaunching ? findUltraplanTriggerPositions(displayedValue) : [], [displayedValue, ultraplanSessionUrl, ultraplanLaunching]);
-  const ultrareviewTriggers = useMemo(() => isUltrareviewEnabled() ? findUltrareviewTriggerPositions(displayedValue) : [], [displayedValue]);
+  const ultraplanTriggers = useMemo(
+    () =>
+      feature('ULTRAPLAN') && !ultraplanSessionUrl && !ultraplanLaunching
+        ? findUltraplanTriggerPositions(displayedValue)
+        : [],
+    [displayedValue, ultraplanSessionUrl, ultraplanLaunching],
+  );
+
+  const ultrareviewTriggers = useMemo(
+    () => (isUltrareviewEnabled() ? findUltrareviewTriggerPositions(displayedValue) : []),
+    [displayedValue],
+  );
+
   const btwTriggers = useMemo(() => findBtwTriggerPositions(displayedValue), [displayedValue]);
+
   const buddyTriggers = useMemo(() => findBuddyTriggerPositions(displayedValue), [displayedValue]);
+
   const slashCommandTriggers = useMemo(() => {
     const positions = findSlashCommandPositions(displayedValue);
     // Only highlight valid commands
@@ -531,11 +632,18 @@ function PromptInput({
       return hasCommand(commandName, commands);
     });
   }, [displayedValue, commands]);
-  const tokenBudgetTriggers = useMemo(() => feature('TOKEN_BUDGET') ? findTokenBudgetPositions(displayedValue) : [], [displayedValue]);
+
+  const tokenBudgetTriggers = useMemo(
+    () => (feature('TOKEN_BUDGET') ? findTokenBudgetPositions(displayedValue) : []),
+    [displayedValue],
+  );
+
   const knownChannelsVersion = useSyncExternalStore(subscribeKnownChannels, getKnownChannelsVersion);
-  const slackChannelTriggers = useMemo(() => hasSlackMcpServer(store.getState().mcp.clients) ? findSlackChannelPositions(displayedValue) : [],
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- store is a stable ref
-  [displayedValue, knownChannelsVersion]);
+  const slackChannelTriggers = useMemo(
+    () => (hasSlackMcpServer(store.getState().mcp.clients) ? findSlackChannelPositions(displayedValue) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- store is a stable ref
+    [displayedValue, knownChannelsVersion],
+  );
 
   // Find @name mentions and highlight with team member's color
   const memberMentionHighlights = useMemo((): Array<{
@@ -545,6 +653,7 @@ function PromptInput({
   }> => {
     if (!isAgentSwarmsEnabled()) return [];
     if (!teamContext?.teammates) return [];
+
     const highlights: Array<{
       start: number;
       end: number;
@@ -571,17 +680,21 @@ function PromptInput({
           highlights.push({
             start: nameStart,
             end: nameStart + fullMatch.length,
-            themeColor
+            themeColor,
           });
         }
       }
     }
     return highlights;
   }, [displayedValue, teamContext]);
-  const imageRefPositions = useMemo(() => parseReferences(displayedValue).filter(r => r.match.startsWith('[Image')).map(r => ({
-    start: r.index,
-    end: r.index + r.match.length
-  })), [displayedValue]);
+
+  const imageRefPositions = useMemo(
+    () =>
+      parseReferences(displayedValue)
+        .filter(r => r.match.startsWith('[Image'))
+        .map(r => ({ start: r.index, end: r.index + r.match.length })),
+    [displayedValue],
+  );
 
   // chip.start is the "selected" state: the inverted chip IS the cursor.
   // chip.end stays a normal position so you can park the cursor right after
@@ -598,6 +711,7 @@ function PromptInput({
       setCursorOffset(cursorOffset < mid ? inside.start : inside.end);
     }
   }, [cursorOffset, imageRefPositions, setCursorOffset]);
+
   const combinedHighlights = useMemo((): TextHighlight[] => {
     const highlights: TextHighlight[] = [];
 
@@ -610,16 +724,17 @@ function PromptInput({
           end: ref.end,
           color: undefined,
           inverse: true,
-          priority: 8
+          priority: 8,
         });
       }
     }
+
     if (isSearchingHistory && historyMatch && !historyFailedMatch) {
       highlights.push({
         start: cursorOffset,
         end: cursorOffset + historyQuery.length,
         color: 'warning',
-        priority: 20
+        priority: 20,
       });
     }
 
@@ -629,7 +744,7 @@ function PromptInput({
         start: trigger.start,
         end: trigger.end,
         color: 'warning',
-        priority: 15
+        priority: 15,
       });
     }
 
@@ -639,7 +754,7 @@ function PromptInput({
         start: trigger.start,
         end: trigger.end,
         color: 'suggestion',
-        priority: 5
+        priority: 5,
       });
     }
 
@@ -649,15 +764,16 @@ function PromptInput({
         start: trigger.start,
         end: trigger.end,
         color: 'suggestion',
-        priority: 5
+        priority: 5,
       });
     }
+
     for (const trigger of slackChannelTriggers) {
       highlights.push({
         start: trigger.start,
         end: trigger.end,
         color: 'suggestion',
-        priority: 5
+        priority: 5,
       });
     }
 
@@ -667,7 +783,7 @@ function PromptInput({
         start: mention.start,
         end: mention.end,
         color: mention.themeColor,
-        priority: 5
+        priority: 5,
       });
     }
 
@@ -678,7 +794,7 @@ function PromptInput({
         end: voiceInterimRange.end,
         color: undefined,
         dimColor: true,
-        priority: 1
+        priority: 1,
       });
     }
 
@@ -691,7 +807,7 @@ function PromptInput({
             end: i + 1,
             color: getRainbowColor(i - trigger.start),
             shimmerColor: getRainbowColor(i - trigger.start, true),
-            priority: 10
+            priority: 10,
           });
         }
       }
@@ -706,7 +822,7 @@ function PromptInput({
             end: i + 1,
             color: getRainbowColor(i - trigger.start),
             shimmerColor: getRainbowColor(i - trigger.start, true),
-            priority: 10
+            priority: 10,
           });
         }
       }
@@ -720,7 +836,7 @@ function PromptInput({
           end: i + 1,
           color: getRainbowColor(i - trigger.start),
           shimmerColor: getRainbowColor(i - trigger.start, true),
-          priority: 10
+          priority: 10,
         });
       }
     }
@@ -733,16 +849,33 @@ function PromptInput({
           end: i + 1,
           color: getRainbowColor(i - trigger.start),
           shimmerColor: getRainbowColor(i - trigger.start, true),
-          priority: 10
+          priority: 10,
         });
       }
     }
+
     return highlights;
-  }, [isSearchingHistory, historyQuery, historyMatch, historyFailedMatch, cursorOffset, btwTriggers, imageRefPositions, memberMentionHighlights, slashCommandTriggers, tokenBudgetTriggers, slackChannelTriggers, displayedValue, voiceInterimRange, thinkTriggers, ultraplanTriggers, ultrareviewTriggers, buddyTriggers]);
-  const {
-    addNotification,
-    removeNotification
-  } = useNotifications();
+  }, [
+    isSearchingHistory,
+    historyQuery,
+    historyMatch,
+    historyFailedMatch,
+    cursorOffset,
+    btwTriggers,
+    imageRefPositions,
+    memberMentionHighlights,
+    slashCommandTriggers,
+    tokenBudgetTriggers,
+    slackChannelTriggers,
+    displayedValue,
+    voiceInterimRange,
+    thinkTriggers,
+    ultraplanTriggers,
+    ultrareviewTriggers,
+    buddyTriggers,
+  ]);
+
+  const { addNotification, removeNotification } = useNotifications();
 
   // Show ultrathink notification
   useEffect(() => {
@@ -751,31 +884,33 @@ function PromptInput({
         key: 'ultrathink-active',
         text: 'Effort set to high for this turn',
         priority: 'immediate',
-        timeoutMs: 5000
+        timeoutMs: 5000,
       });
     } else {
       removeNotification('ultrathink-active');
     }
   }, [addNotification, removeNotification, thinkTriggers.length]);
+
   useEffect(() => {
     if (feature('ULTRAPLAN') && ultraplanTriggers.length) {
       addNotification({
         key: 'ultraplan-active',
         text: 'This prompt will launch an ultraplan session in Claude Code on the web',
         priority: 'immediate',
-        timeoutMs: 5000
+        timeoutMs: 5000,
       });
     } else {
       removeNotification('ultraplan-active');
     }
   }, [addNotification, removeNotification, ultraplanTriggers.length]);
+
   useEffect(() => {
     if (isUltrareviewEnabled() && ultrareviewTriggers.length) {
       addNotification({
         key: 'ultrareview-active',
         text: 'Run /ultrareview after Claude finishes to review these changes in the cloud',
         priority: 'immediate',
-        timeoutMs: 5000
+        timeoutMs: 5000,
       });
     }
   }, [addNotification, ultrareviewTriggers.length]);
@@ -812,17 +947,19 @@ function PromptInput({
     // (rapid clears like esc-esc go from 20+ to 0 in one step)
     const clearedSubstantialInput = peakLength >= 20 && currentLength <= 5;
     const wasRapidClear = prevLength >= 20 && currentLength <= 5;
+
     if (clearedSubstantialInput && !wasRapidClear) {
       const config = getGlobalConfig();
       if (!config.hasUsedStash) {
         addNotification({
           key: 'stash-hint',
-          jsx: <Text dimColor>
-              Tip:{' '}
-              <ConfigurableShortcutHint action="chat:stash" context="Chat" fallback="ctrl+s" description="stash" />
-            </Text>,
+          jsx: (
+            <Text dimColor>
+              Tip: <ConfigurableShortcutHint action="chat:stash" context="Chat" fallback="ctrl+s" description="stash" />
+            </Text>
+          ),
           priority: 'immediate',
-          timeoutMs: FOOTER_TEMPORARY_STATUS_TIMEOUT
+          timeoutMs: FOOTER_TEMPORARY_STATUS_TIMEOUT,
         });
       }
       peakInputLengthRef.current = currentLength;
@@ -830,86 +967,88 @@ function PromptInput({
   }, [input.length, addNotification]);
 
   // Initialize input buffer for undo functionality
-  const {
-    pushToBuffer,
-    undo,
-    canUndo,
-    clearBuffer
-  } = useInputBuffer({
+  const { pushToBuffer, undo, canUndo, clearBuffer } = useInputBuffer({
     maxBufferSize: 50,
-    debounceMs: 1000
+    debounceMs: 1000,
   });
+
   useMaybeTruncateInput({
     input,
     pastedContents,
     onInputChange: trackAndSetInput,
     setCursorOffset,
-    setPastedContents
+    setPastedContents,
   });
+
   const defaultPlaceholder = usePromptInputPlaceholder({
     input,
     submitCount,
-    viewingAgentName
+    viewingAgentName,
   });
-  const onChange = useCallback((value: string) => {
-    if (value === '?') {
-      logEvent('tengu_help_toggled', {});
-      setHelpOpen(v => !v);
-      return;
-    }
-    setHelpOpen(false);
 
-    // Dismiss stash hint when user makes any input change
-    dismissStashHint();
-
-    // Cancel any pending prompt suggestion and speculation when user types
-    abortPromptSuggestion();
-    abortSpeculation(setAppState);
-
-    // Check if this is a single character insertion at the start
-    const isSingleCharInsertion = value.length === input.length + 1;
-    const insertedAtStart = cursorOffset === 0;
-    const mode = getModeFromInput(value);
-    if (insertedAtStart && mode !== 'prompt') {
-      if (isSingleCharInsertion) {
-        onModeChange(mode);
+  const onChange = useCallback(
+    (value: string) => {
+      if (value === '?') {
+        logEvent('tengu_help_toggled', {});
+        setHelpOpen(v => !v);
         return;
       }
-      // Multi-char insertion into empty input (e.g. tab-accepting "! gcloud auth login")
-      if (input.length === 0) {
-        onModeChange(mode);
-        const valueWithoutMode = getValueFromInput(value).replaceAll('\t', '    ');
+      setHelpOpen(false);
+
+      // Dismiss stash hint when user makes any input change
+      dismissStashHint();
+
+      // Cancel any pending prompt suggestion and speculation when user types
+      abortPromptSuggestion();
+      abortSpeculation(setAppState);
+
+      // Check if this is a single character insertion at the start
+      const isSingleCharInsertion = value.length === input.length + 1;
+      const insertedAtStart = cursorOffset === 0;
+      const mode = getModeFromInput(value);
+
+      if (insertedAtStart && mode !== 'prompt') {
+        if (isSingleCharInsertion) {
+          onModeChange(mode);
+          return;
+        }
+        // Multi-char insertion into empty input (e.g. tab-accepting "! gcloud auth login")
+        if (input.length === 0) {
+          onModeChange(mode);
+          const valueWithoutMode = getValueFromInput(value).replaceAll('\t', '    ');
+          pushToBuffer(input, cursorOffset, pastedContents);
+          trackAndSetInput(valueWithoutMode);
+          setCursorOffset(valueWithoutMode.length);
+          return;
+        }
+      }
+
+      const processedValue = value.replaceAll('\t', '    ');
+
+      // Push current state to buffer before making changes
+      if (input !== processedValue) {
         pushToBuffer(input, cursorOffset, pastedContents);
-        trackAndSetInput(valueWithoutMode);
-        setCursorOffset(valueWithoutMode.length);
-        return;
       }
-    }
-    const processedValue = value.replaceAll('\t', '    ');
 
-    // Push current state to buffer before making changes
-    if (input !== processedValue) {
-      pushToBuffer(input, cursorOffset, pastedContents);
-    }
+      // Deselect footer items when user types
+      setAppState(prev => (prev.footerSelection === null ? prev : { ...prev, footerSelection: null }));
 
-    // Deselect footer items when user types
-    setAppState(prev => prev.footerSelection === null ? prev : {
-      ...prev,
-      footerSelection: null
-    });
-    trackAndSetInput(processedValue);
-  }, [trackAndSetInput, onModeChange, input, cursorOffset, pushToBuffer, pastedContents, dismissStashHint, setAppState]);
-  const {
-    resetHistory,
-    onHistoryUp,
-    onHistoryDown,
-    dismissSearchHint,
-    historyIndex
-  } = useArrowKeyHistory((value: string, historyMode: HistoryMode, pastedContents: Record<number, PastedContent>) => {
-    onChange(value);
-    onModeChange(historyMode);
-    setPastedContents(pastedContents);
-  }, input, pastedContents, setCursorOffset, mode);
+      trackAndSetInput(processedValue);
+    },
+    [trackAndSetInput, onModeChange, input, cursorOffset, pushToBuffer, pastedContents, dismissStashHint, setAppState],
+  );
+
+  const { resetHistory, onHistoryUp, onHistoryDown, dismissSearchHint, historyIndex } = useArrowKeyHistory(
+    (value: string, historyMode: HistoryMode, pastedContents: Record<number, PastedContent>) => {
+      onChange(value);
+      onModeChange(historyMode);
+      setPastedContents(pastedContents);
+    },
+    input,
+    pastedContents,
+    setCursorOffset,
+    mode,
+  );
 
   // Dismiss search hint when user starts searching
   useEffect(() => {
@@ -939,8 +1078,10 @@ function PromptInput({
       void popAllCommandsFromQueue();
       return;
     }
+
     onHistoryUp();
   }
+
   function handleHistoryDown() {
     if (suggestions.length > 1) {
       return;
@@ -958,10 +1099,7 @@ function PromptInput({
       const first = footerItems[0]!;
       selectFooterItem(first);
       if (first === 'tasks' && !getGlobalConfig().hasSeenTasksHint) {
-        saveGlobalConfig(c => c.hasSeenTasksHint ? c : {
-          ...c,
-          hasSeenTasksHint: true
-        });
+        saveGlobalConfig(c => (c.hasSeenTasksHint ? c : { ...c, hasSeenTasksHint: true }));
       }
     }
   }
@@ -974,142 +1112,173 @@ function PromptInput({
   }>({
     suggestions: [],
     selectedSuggestion: -1,
-    commandArgumentHint: undefined
+    commandArgumentHint: undefined,
   });
 
   // Setter for suggestions state
-  const setSuggestionsState = useCallback((updater: typeof suggestionsState | ((prev: typeof suggestionsState) => typeof suggestionsState)) => {
-    setSuggestionsStateRaw(prev => typeof updater === 'function' ? updater(prev) : updater);
-  }, []);
-  const onSubmit = useCallback(async (inputParam: string, isSubmittingSlashCommand = false) => {
-    inputParam = inputParam.trimEnd();
+  const setSuggestionsState = useCallback(
+    (updater: typeof suggestionsState | ((prev: typeof suggestionsState) => typeof suggestionsState)) => {
+      setSuggestionsStateRaw(prev => (typeof updater === 'function' ? updater(prev) : updater));
+    },
+    [],
+  );
 
-    // Don't submit if a footer indicator is being opened. Read fresh from
-    // store — footer:openSelected calls selectFooterItem(null) then onSubmit
-    // in the same tick, and the closure value hasn't updated yet. Apply the
-    // same "still visible?" derivation as footerItemSelected so a stale
-    // selection (pill disappeared) doesn't swallow Enter.
-    const state = store.getState();
-    if (state.footerSelection && footerItems.includes(state.footerSelection)) {
-      return;
-    }
+  const onSubmit = useCallback(
+    async (inputParam: string, isSubmittingSlashCommand = false) => {
+      inputParam = inputParam.trimEnd();
 
-    // Enter in selection modes confirms selection (useBackgroundTaskNavigation).
-    // BaseTextInput's useInput registers before that hook (child effects fire first),
-    // so without this guard Enter would double-fire and auto-submit the suggestion.
-    if (state.viewSelectionMode === 'selecting-agent') {
-      return;
-    }
-
-    // Check for images early - we need this for suggestion logic below
-    const hasImages = Object.values(pastedContents).some(c => c.type === 'image');
-
-    // If input is empty OR matches the suggestion, submit it
-    // But if there are images attached, don't auto-accept the suggestion -
-    // the user wants to submit just the image(s).
-    // Only in leader view — promptSuggestion is leader-context, not teammate.
-    const suggestionText = promptSuggestionState.text;
-    const inputMatchesSuggestion = inputParam.trim() === '' || inputParam === suggestionText;
-    if (inputMatchesSuggestion && suggestionText && !hasImages && !state.viewingAgentTaskId) {
-      // If speculation is active, inject messages immediately as they stream
-      if (speculation.status === 'active') {
-        markAccepted();
-        // skipReset: resetSuggestion would abort the speculation before we accept it
-        logOutcomeAtSubmission(suggestionText, {
-          skipReset: true
-        });
-        void onSubmitProp(suggestionText, {
-          setCursorOffset,
-          clearBuffer,
-          resetHistory
-        }, {
-          state: speculation,
-          speculationSessionTimeSavedMs: speculationSessionTimeSavedMs,
-          setAppState
-        });
-        return; // Skip normal query - speculation handled it
+      // Don't submit if a footer indicator is being opened. Read fresh from
+      // store — footer:openSelected calls selectFooterItem(null) then onSubmit
+      // in the same tick, and the closure value hasn't updated yet. Apply the
+      // same "still visible?" derivation as footerItemSelected so a stale
+      // selection (pill disappeared) doesn't swallow Enter.
+      const state = store.getState();
+      if (state.footerSelection && footerItems.includes(state.footerSelection)) {
+        return;
       }
 
-      // Regular suggestion acceptance (requires shownAt > 0)
-      if (promptSuggestionState.shownAt > 0) {
-        markAccepted();
-        inputParam = suggestionText;
+      // Enter in selection modes confirms selection (useBackgroundTaskNavigation).
+      // BaseTextInput's useInput registers before that hook (child effects fire first),
+      // so without this guard Enter would double-fire and auto-submit the suggestion.
+      if (state.viewSelectionMode === 'selecting-agent') {
+        return;
       }
-    }
 
-    // Handle @name direct message
-    if (isAgentSwarmsEnabled()) {
-      const directMessage = parseDirectMemberMessage(inputParam);
-      if (directMessage) {
-        const result = await sendDirectMemberMessage(directMessage.recipientName, directMessage.message, teamContext, writeToMailbox);
-        if (result.success) {
-          addNotification({
-            key: 'direct-message-sent',
-            text: `Sent to @${result.recipientName}`,
-            priority: 'immediate',
-            timeoutMs: 3000
-          });
-          trackAndSetInput('');
-          setCursorOffset(0);
-          clearBuffer();
-          resetHistory();
-          return;
-        } else if ('error' in result && result.error === 'no_team_context') {
-          // No team context - fall through to normal prompt submission
-        } else {
-          // Unknown recipient - fall through to normal prompt submission
-          // This allows e.g. "@utils explain this code" to be sent as a prompt
+      // Check for images early - we need this for suggestion logic below
+      const hasImages = Object.values(pastedContents).some(c => c.type === 'image');
+
+      // If input is empty OR matches the suggestion, submit it
+      // But if there are images attached, don't auto-accept the suggestion -
+      // the user wants to submit just the image(s).
+      // Only in leader view — promptSuggestion is leader-context, not teammate.
+      const suggestionText = promptSuggestionState.text;
+      const inputMatchesSuggestion = inputParam.trim() === '' || inputParam === suggestionText;
+      if (inputMatchesSuggestion && suggestionText && !hasImages && !state.viewingAgentTaskId) {
+        // If speculation is active, inject messages immediately as they stream
+        if (speculation.status === 'active') {
+          markAccepted();
+          // skipReset: resetSuggestion would abort the speculation before we accept it
+          logOutcomeAtSubmission(suggestionText, { skipReset: true });
+
+          void onSubmitProp(
+            suggestionText,
+            {
+              setCursorOffset,
+              clearBuffer,
+              resetHistory,
+            },
+            {
+              state: speculation,
+              speculationSessionTimeSavedMs: speculationSessionTimeSavedMs,
+              setAppState,
+            },
+          );
+          return; // Skip normal query - speculation handled it
+        }
+
+        // Regular suggestion acceptance (requires shownAt > 0)
+        if (promptSuggestionState.shownAt > 0) {
+          markAccepted();
+          inputParam = suggestionText;
         }
       }
-    }
 
-    // Allow submission if there are images attached, even without text
-    if (inputParam.trim() === '' && !hasImages) {
-      return;
-    }
+      // Handle @name direct message
+      if (isAgentSwarmsEnabled()) {
+        const directMessage = parseDirectMemberMessage(inputParam);
+        if (directMessage) {
+          const result = await sendDirectMemberMessage(
+            directMessage.recipientName,
+            directMessage.message,
+            teamContext,
+            writeToMailbox,
+          );
 
-    // PromptInput UX: Check if suggestions dropdown is showing
-    // For directory suggestions, allow submission (Tab is used for completion)
-    const hasDirectorySuggestions = suggestionsState.suggestions.length > 0 && suggestionsState.suggestions.every(s => s.description === 'directory');
-    if (suggestionsState.suggestions.length > 0 && !isSubmittingSlashCommand && !hasDirectorySuggestions) {
-      logForDebugging(`[onSubmit] early return: suggestions showing (count=${suggestionsState.suggestions.length})`);
-      return; // Don't submit, user needs to clear suggestions first
-    }
+          if (result.success) {
+            addNotification({
+              key: 'direct-message-sent',
+              text: `Sent to @${result.recipientName}`,
+              priority: 'immediate',
+              timeoutMs: 3000,
+            });
+            trackAndSetInput('');
+            setCursorOffset(0);
+            clearBuffer();
+            resetHistory();
+            return;
+          } else if (!result.success && (result as { error: string }).error === 'no_team_context') {
+            // No team context - fall through to normal prompt submission
+          } else {
+            // Unknown recipient - fall through to normal prompt submission
+            // This allows e.g. "@utils explain this code" to be sent as a prompt
+          }
+        }
+      }
 
-    // Log suggestion outcome if one exists
-    if (promptSuggestionState.text && promptSuggestionState.shownAt > 0) {
-      logOutcomeAtSubmission(inputParam);
-    }
+      // Allow submission if there are images attached, even without text
+      if (inputParam.trim() === '' && !hasImages) {
+        return;
+      }
 
-    // Clear stash hint notification on submit
-    removeNotification('stash-hint');
+      // PromptInput UX: Check if suggestions dropdown is showing
+      // For directory suggestions, allow submission (Tab is used for completion)
+      const hasDirectorySuggestions =
+        suggestionsState.suggestions.length > 0 &&
+        suggestionsState.suggestions.every(s => s.description === 'directory');
 
-    // Route input to viewed agent (in-process teammate or named local_agent).
-    const activeAgent = getActiveAgentForInput(store.getState());
-    if (activeAgent.type !== 'leader' && onAgentSubmit) {
-      logEvent('tengu_transcript_input_to_teammate', {});
-      await onAgentSubmit(inputParam, activeAgent.task, {
+      if (suggestionsState.suggestions.length > 0 && !isSubmittingSlashCommand && !hasDirectorySuggestions) {
+        logForDebugging(`[onSubmit] early return: suggestions showing (count=${suggestionsState.suggestions.length})`);
+        return; // Don't submit, user needs to clear suggestions first
+      }
+
+      // Log suggestion outcome if one exists
+      if (promptSuggestionState.text && promptSuggestionState.shownAt > 0) {
+        logOutcomeAtSubmission(inputParam);
+      }
+
+      // Clear stash hint notification on submit
+      removeNotification('stash-hint');
+
+      // Route input to viewed agent (in-process teammate or named local_agent).
+      const activeAgent = getActiveAgentForInput(store.getState());
+      if (activeAgent.type !== 'leader' && onAgentSubmit) {
+        logEvent('tengu_transcript_input_to_teammate', {});
+        await onAgentSubmit(inputParam, activeAgent.task, {
+          setCursorOffset,
+          clearBuffer,
+          resetHistory,
+        });
+        return;
+      }
+
+      // Normal leader submission
+      await onSubmitProp(inputParam, {
         setCursorOffset,
         clearBuffer,
-        resetHistory
+        resetHistory,
       });
-      return;
-    }
-
-    // Normal leader submission
-    await onSubmitProp(inputParam, {
-      setCursorOffset,
+    },
+    [
+      promptSuggestionState,
+      speculation,
+      speculationSessionTimeSavedMs,
+      teamContext,
+      store,
+      footerItems,
+      suggestionsState.suggestions,
+      onSubmitProp,
+      onAgentSubmit,
       clearBuffer,
-      resetHistory
-    });
-  }, [promptSuggestionState, speculation, speculationSessionTimeSavedMs, teamContext, store, footerItems, suggestionsState.suggestions, onSubmitProp, onAgentSubmit, clearBuffer, resetHistory, logOutcomeAtSubmission, setAppState, markAccepted, pastedContents, removeNotification]);
-  const {
-    suggestions,
-    selectedSuggestion,
-    commandArgumentHint,
-    inlineGhostText,
-    maxColumnWidth
-  } = useTypeahead({
+      resetHistory,
+      logOutcomeAtSubmission,
+      setAppState,
+      markAccepted,
+      pastedContents,
+      removeNotification,
+    ],
+  );
+
+  const { suggestions, selectedSuggestion, commandArgumentHint, inlineGhostText, maxColumnWidth } = useTypeahead({
     commands,
     onInputChange: trackAndSetInput,
     onSubmit,
@@ -1122,7 +1291,7 @@ function PromptInput({
     suggestionsState,
     suppressSuggestions: isSearchingHistory || historyIndex > 0,
     markAccepted,
-    onModeChange
+    onModeChange,
   });
 
   // Track if prompt suggestion should be shown (computed later with terminal width).
@@ -1144,23 +1313,31 @@ function PromptInput({
         promptId: null,
         shownAt: 0,
         acceptedAt: 0,
-        generationRequestId: null
-      }
+        generationRequestId: null,
+      },
     }));
   }
-  function onImagePaste(image: string, mediaType?: string, filename?: string, dimensions?: ImageDimensions, sourcePath?: string) {
+
+  function onImagePaste(
+    image: string,
+    mediaType?: string,
+    filename?: string,
+    dimensions?: ImageDimensions,
+    sourcePath?: string,
+  ) {
     logEvent('tengu_paste_image', {});
     onModeChange('prompt');
+
     const pasteId = nextPasteIdRef.current++;
+
     const newContent: PastedContent = {
       id: pasteId,
       type: 'image',
       content: image,
-      mediaType: mediaType || 'image/png',
-      // default to PNG if not provided
+      mediaType: mediaType || 'image/png', // default to PNG if not provided
       filename: filename || 'Pasted image',
       dimensions,
-      sourcePath
+      sourcePath,
     };
 
     // Cache path immediately (fast) so links work on render
@@ -1170,10 +1347,7 @@ function PromptInput({
     void storeImage(newContent);
 
     // Update UI
-    setPastedContents(prev => ({
-      ...prev,
-      [pasteId]: newContent
-    }));
+    setPastedContents(prev => ({ ...prev, [pasteId]: newContent }));
     // Multi-image paste calls onImagePaste in a loop. If the ref is already
     // armed, the previous pill's lazy space fires now (before this pill)
     // rather than being lost.
@@ -1191,13 +1365,12 @@ function PromptInput({
     setPastedContents(prev => {
       const orphaned = Object.values(prev).filter(c => c.type === 'image' && !referencedIds.has(c.id));
       if (orphaned.length === 0) return prev;
-      const next = {
-        ...prev
-      };
+      const next = { ...prev };
       for (const img of orphaned) delete next[img.id];
       return next;
     });
   }, [input, setPastedContents]);
+
   function onTextPaste(rawText: string) {
     pendingSpaceAfterPillRef.current = false;
     // Clean up pasted text - strip ANSI escape codes and normalize line endings and tabs
@@ -1211,6 +1384,7 @@ function PromptInput({
         text = getValueFromInput(text);
       }
     }
+
     const numLines = getPastedTextRefNumLines(text);
     // Limit the number of lines to show in the input
     // If the overall layout is too high then Ink will repaint
@@ -1223,35 +1397,42 @@ function PromptInput({
     // or if it exceeds the number of lines we want to show
     if (text.length > PASTE_THRESHOLD || numLines > maxLines) {
       const pasteId = nextPasteIdRef.current++;
+
       const newContent: PastedContent = {
         id: pasteId,
         type: 'text',
-        content: text
+        content: text,
       };
-      setPastedContents(prev => ({
-        ...prev,
-        [pasteId]: newContent
-      }));
+
+      setPastedContents(prev => ({ ...prev, [pasteId]: newContent }));
+
       insertTextAtCursor(formatPastedTextRef(pasteId, numLines));
     } else {
       // For shorter pastes, just insert the text normally
       insertTextAtCursor(text);
     }
   }
+
   const lazySpaceInputFilter = useCallback((input: string, key: Key): string => {
     if (!pendingSpaceAfterPillRef.current) return input;
     pendingSpaceAfterPillRef.current = false;
     if (isNonSpacePrintable(input, key)) return ' ' + input;
     return input;
   }, []);
+
   function insertTextAtCursor(text: string) {
     // Push current state to buffer before inserting
     pushToBuffer(input, cursorOffset, pastedContents);
+
     const newInput = input.slice(0, cursorOffset) + text + input.slice(cursorOffset);
     trackAndSetInput(newInput);
     setCursorOffset(cursorOffset + text.length);
   }
-  const doublePressEscFromEmpty = useDoublePress(() => {}, () => onShowMessageSelector());
+
+  const doublePressEscFromEmpty = useDoublePress(
+    () => {},
+    () => onShowMessageSelector(),
+  );
 
   // Function to get the queued command for editing. Returns true if commands were popped.
   const popAllCommandsFromQueue = useCallback((): boolean => {
@@ -1259,6 +1440,7 @@ function PromptInput({
     if (!result) {
       return false;
     }
+
     trackAndSetInput(result.text);
     onModeChange('prompt'); // Always prompt mode for queued commands
     setCursorOffset(result.cursorOffset);
@@ -1266,15 +1448,14 @@ function PromptInput({
     // Restore images from queued commands to pastedContents
     if (result.images.length > 0) {
       setPastedContents(prev => {
-        const newContents = {
-          ...prev
-        };
+        const newContents = { ...prev };
         for (const image of result.images) {
           newContents[image.id] = image;
         }
         return newContents;
       });
     }
+
     return true;
   }, [trackAndSetInput, onModeChange, input, cursorOffset, setPastedContents]);
 
@@ -1285,7 +1466,10 @@ function PromptInput({
     let atMentionedText: string;
     const relativePath = path.relative(getCwd(), atMentioned.filePath);
     if (atMentioned.lineStart && atMentioned.lineEnd) {
-      atMentionedText = atMentioned.lineStart === atMentioned.lineEnd ? `@${relativePath}#L${atMentioned.lineStart} ` : `@${relativePath}#L${atMentioned.lineStart}-${atMentioned.lineEnd} `;
+      atMentionedText =
+        atMentioned.lineStart === atMentioned.lineEnd
+          ? `@${relativePath}#L${atMentioned.lineStart} `
+          : `@${relativePath}#L${atMentioned.lineStart}-${atMentioned.lineEnd} `;
     } else {
       atMentionedText = `@${relativePath} `;
     }
@@ -1321,20 +1505,24 @@ function PromptInput({
   const handleExternalEditor = useCallback(async () => {
     logEvent('tengu_external_editor_used', {});
     setIsExternalEditorActive(true);
+
     try {
       // Pass pastedContents to expand collapsed text references
       const result = await editPromptInEditor(input, pastedContents);
+
       if (result.error) {
         addNotification({
           key: 'external-editor-error',
           text: result.error,
           color: 'warning',
-          priority: 'high'
+          priority: 'high',
         });
       }
+
       if (result.content !== null && result.content !== input) {
         // Push current state to buffer before making changes
         pushToBuffer(input, cursorOffset, pastedContents);
+
         trackAndSetInput(result.content);
         setCursorOffset(result.content.length);
       }
@@ -1346,7 +1534,7 @@ function PromptInput({
         key: 'external-editor-error',
         text: `External editor failed: ${errorMessage(err)}`,
         color: 'warning',
-        priority: 'high'
+        priority: 'high',
       });
     } finally {
       setIsExternalEditorActive(false);
@@ -1363,21 +1551,14 @@ function PromptInput({
       setStashedPrompt(undefined);
     } else if (input.trim() !== '') {
       // Push to stash (save text, cursor position, and pasted contents)
-      setStashedPrompt({
-        text: input,
-        cursorOffset,
-        pastedContents
-      });
+      setStashedPrompt({ text: input, cursorOffset, pastedContents });
       trackAndSetInput('');
       setCursorOffset(0);
       setPastedContents({});
       // Track usage for /discover and stop showing hint
       saveGlobalConfig(c => {
         if (c.hasUsedStash) return c;
-        return {
-          ...c,
-          hasUsedStash: true
-        };
+        return { ...c, hasUsedStash: true };
       });
     }
   }, [input, cursorOffset, stashedPrompt, trackAndSetInput, setStashedPrompt, pastedContents, setPastedContents]);
@@ -1412,13 +1593,15 @@ function PromptInput({
     if (isAgentSwarmsEnabled() && viewedTeammate && viewingAgentTaskId) {
       const teammateContext: ToolPermissionContext = {
         ...toolPermissionContext,
-        mode: viewedTeammate.permissionMode
+        mode: viewedTeammate.permissionMode,
       };
       // Pass undefined for teamContext (unused but kept for API compatibility)
       const nextMode = getNextPermissionMode(teammateContext, undefined);
+
       logEvent('tengu_mode_cycle', {
-        to: nextMode as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+        to: nextMode as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       });
+
       const teammateTaskId = viewingAgentTaskId;
       setAppState(prev => {
         const task = prev.tasks[teammateTaskId];
@@ -1434,11 +1617,12 @@ function PromptInput({
             ...prev.tasks,
             [teammateTaskId]: {
               ...task,
-              permissionMode: nextMode
-            }
-          }
+              permissionMode: nextMode,
+            },
+          },
         };
       });
+
       if (helpOpen) {
         setHelpOpen(false);
       }
@@ -1446,87 +1630,22 @@ function PromptInput({
     }
 
     // Compute the next mode without triggering side effects first
-    logForDebugging(`[auto-mode] handleCycleMode: currentMode=${toolPermissionContext.mode} isAutoModeAvailable=${toolPermissionContext.isAutoModeAvailable} showAutoModeOptIn=${showAutoModeOptIn} timeoutPending=${!!autoModeOptInTimeoutRef.current}`);
+    logForDebugging(`[auto-mode] handleCycleMode: currentMode=${toolPermissionContext.mode}`);
     const nextMode = getNextPermissionMode(toolPermissionContext, teamContext);
 
-    // Check if user is entering auto mode for the first time. Gated on the
-    // persistent settings flag (hasAutoModeOptIn) rather than the broader
-    // hasAutoModeOptInAnySource so that --enable-auto-mode users still see
-    // the warning dialog once — the CLI flag should grant carousel access,
-    // not bypass the safety text.
-    let isEnteringAutoModeFirstTime = false;
-    if (feature('TRANSCRIPT_CLASSIFIER')) {
-      isEnteringAutoModeFirstTime = nextMode === 'auto' && toolPermissionContext.mode !== 'auto' && !hasAutoModeOptIn() && !viewingAgentTaskId; // Only show for primary agent, not subagents
-    }
-    if (feature('TRANSCRIPT_CLASSIFIER')) {
-      if (isEnteringAutoModeFirstTime) {
-        // Store previous mode so we can revert if user declines
-        setPreviousModeBeforeAuto(toolPermissionContext.mode);
-
-        // Only update the UI mode label — do NOT call transitionPermissionMode
-        // or cyclePermissionMode yet; we haven't confirmed with the user.
-        setAppState(prev => ({
-          ...prev,
-          toolPermissionContext: {
-            ...prev.toolPermissionContext,
-            mode: 'auto'
-          }
-        }));
-        setToolPermissionContext({
-          ...toolPermissionContext,
-          mode: 'auto'
-        });
-
-        // Show opt-in dialog after 400ms debounce
-        if (autoModeOptInTimeoutRef.current) {
-          clearTimeout(autoModeOptInTimeoutRef.current);
-        }
-        autoModeOptInTimeoutRef.current = setTimeout((setShowAutoModeOptIn, autoModeOptInTimeoutRef) => {
-          setShowAutoModeOptIn(true);
-          autoModeOptInTimeoutRef.current = null;
-        }, 400, setShowAutoModeOptIn, autoModeOptInTimeoutRef);
-        if (helpOpen) {
-          setHelpOpen(false);
-        }
-        return;
-      }
-    }
-
-    // Dismiss auto mode opt-in dialog if showing or pending (user is cycling away).
-    // Do NOT revert to previousModeBeforeAuto here — shift+tab means "advance the
-    // carousel", not "decline". Reverting causes a ping-pong loop: auto reverts to
-    // the prior mode, whose next mode is auto again, forever.
-    // The dialog's own decline button (handleAutoModeOptInDecline) handles revert.
-    if (feature('TRANSCRIPT_CLASSIFIER')) {
-      if (showAutoModeOptIn || autoModeOptInTimeoutRef.current) {
-        if (showAutoModeOptIn) {
-          logEvent('tengu_auto_mode_opt_in_dialog_decline', {});
-        }
-        setShowAutoModeOptIn(false);
-        if (autoModeOptInTimeoutRef.current) {
-          clearTimeout(autoModeOptInTimeoutRef.current);
-          autoModeOptInTimeoutRef.current = null;
-        }
-        setPreviousModeBeforeAuto(null);
-        // Fall through — mode is 'auto', cyclePermissionMode below goes to 'default'.
-      }
-    }
-
-    // Now that we know this is NOT the first-time auto mode path,
-    // call cyclePermissionMode to apply side effects (e.g. strip
+    // Call cyclePermissionMode to apply side effects (e.g. strip
     // dangerous permissions, activate classifier)
-    const {
-      context: preparedContext
-    } = cyclePermissionMode(toolPermissionContext, teamContext);
+    const { context: preparedContext } = cyclePermissionMode(toolPermissionContext, teamContext);
+
     logEvent('tengu_mode_cycle', {
-      to: nextMode as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+      to: nextMode as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     });
 
     // Track when user enters plan mode
     if (nextMode === 'plan') {
       saveGlobalConfig(current => ({
         ...current,
-        lastPlanModeUse: Date.now()
+        lastPlanModeUse: Date.now(),
       }));
     }
 
@@ -1538,12 +1657,12 @@ function PromptInput({
       ...prev,
       toolPermissionContext: {
         ...preparedContext,
-        mode: nextMode
-      }
+        mode: nextMode,
+      },
     }));
     setToolPermissionContext({
       ...preparedContext,
-      mode: nextMode
+      mode: nextMode,
     });
 
     // If this is a teammate, update config.json so team lead sees the change
@@ -1553,68 +1672,7 @@ function PromptInput({
     if (helpOpen) {
       setHelpOpen(false);
     }
-  }, [toolPermissionContext, teamContext, viewingAgentTaskId, viewedTeammate, setAppState, setToolPermissionContext, helpOpen, showAutoModeOptIn]);
-
-  // Handler for auto mode opt-in dialog acceptance
-  const handleAutoModeOptInAccept = useCallback(() => {
-    if (feature('TRANSCRIPT_CLASSIFIER')) {
-      setShowAutoModeOptIn(false);
-      setPreviousModeBeforeAuto(null);
-
-      // Now that the user accepted, apply the full transition: activate the
-      // auto mode backend (classifier, beta headers) and strip dangerous
-      // permissions (e.g. Bash(*) always-allow rules).
-      const strippedContext = transitionPermissionMode(previousModeBeforeAuto ?? toolPermissionContext.mode, 'auto', toolPermissionContext);
-      setAppState(prev => ({
-        ...prev,
-        toolPermissionContext: {
-          ...strippedContext,
-          mode: 'auto'
-        }
-      }));
-      setToolPermissionContext({
-        ...strippedContext,
-        mode: 'auto'
-      });
-
-      // Close help tips if they're open when auto mode is enabled
-      if (helpOpen) {
-        setHelpOpen(false);
-      }
-    }
-  }, [helpOpen, setHelpOpen, previousModeBeforeAuto, toolPermissionContext, setAppState, setToolPermissionContext]);
-
-  // Handler for auto mode opt-in dialog decline
-  const handleAutoModeOptInDecline = useCallback(() => {
-    if (feature('TRANSCRIPT_CLASSIFIER')) {
-      logForDebugging(`[auto-mode] handleAutoModeOptInDecline: reverting to ${previousModeBeforeAuto}, setting isAutoModeAvailable=false`);
-      setShowAutoModeOptIn(false);
-      if (autoModeOptInTimeoutRef.current) {
-        clearTimeout(autoModeOptInTimeoutRef.current);
-        autoModeOptInTimeoutRef.current = null;
-      }
-
-      // Revert to previous mode and remove auto from the carousel
-      // for the rest of this session
-      if (previousModeBeforeAuto) {
-        setAutoModeActive(false);
-        setAppState(prev => ({
-          ...prev,
-          toolPermissionContext: {
-            ...prev.toolPermissionContext,
-            mode: previousModeBeforeAuto,
-            isAutoModeAvailable: false
-          }
-        }));
-        setToolPermissionContext({
-          ...toolPermissionContext,
-          mode: previousModeBeforeAuto,
-          isAutoModeAvailable: false
-        });
-        setPreviousModeBeforeAuto(null);
-      }
-    }
-  }, [previousModeBeforeAuto, toolPermissionContext, setAppState, setToolPermissionContext]);
+  }, [toolPermissionContext, teamContext, viewedTeammate, setAppState, setToolPermissionContext, helpOpen]);
 
   // Handler for chat:imagePaste - paste image from clipboard
   const handleImagePaste = useCallback(() => {
@@ -1623,12 +1681,14 @@ function PromptInput({
         onImagePaste(imageData.base64, imageData.mediaType);
       } else {
         const shortcutDisplay = getShortcutDisplay('chat:imagePaste', 'Chat', 'ctrl+v');
-        const message = env.isSSH() ? "No image found in clipboard. You're SSH'd; try scp?" : `No image found in clipboard. Use ${shortcutDisplay} to paste images.`;
+        const message = env.isSSH()
+          ? "No image found in clipboard. You're SSH'd; try scp?"
+          : `No image found in clipboard. Use ${shortcutDisplay} to paste images.`;
         addNotification({
           key: 'no-image-in-clipboard',
           text: message,
           priority: 'immediate',
-          timeoutMs: 1000
+          timeoutMs: 1000,
         });
       }
     });
@@ -1648,7 +1708,7 @@ function PromptInput({
       context: 'Chat',
       handler: () => {
         void onSubmit(input);
-      }
+      },
     });
   }, [keybindingContext, isModalOverlayActive, onSubmit, input]);
 
@@ -1657,211 +1717,271 @@ function PromptInput({
   // onHistoryUp/onHistoryDown props to TextInput, so that useTextInput's
   // upOrHistoryUp/downOrHistoryDown can try cursor movement first and only
   // fall through to history when the cursor can't move further.
-  const chatHandlers = useMemo(() => ({
-    'chat:undo': handleUndo,
-    'chat:newline': handleNewline,
-    'chat:externalEditor': handleExternalEditor,
-    'chat:stash': handleStash,
-    'chat:modelPicker': handleModelPicker,
-    'chat:thinkingToggle': handleThinkingToggle,
-    'chat:cycleMode': handleCycleMode,
-    'chat:imagePaste': handleImagePaste
-  }), [handleUndo, handleNewline, handleExternalEditor, handleStash, handleModelPicker, handleThinkingToggle, handleCycleMode, handleImagePaste]);
+  const chatHandlers = useMemo(
+    () => ({
+      'chat:undo': handleUndo,
+      'chat:newline': handleNewline,
+      'chat:externalEditor': handleExternalEditor,
+      'chat:stash': handleStash,
+      'chat:modelPicker': handleModelPicker,
+      'chat:thinkingToggle': handleThinkingToggle,
+      'chat:cycleMode': handleCycleMode,
+      'chat:imagePaste': handleImagePaste,
+    }),
+    [
+      handleUndo,
+      handleNewline,
+      handleExternalEditor,
+      handleStash,
+      handleModelPicker,
+      handleThinkingToggle,
+      handleCycleMode,
+      handleImagePaste,
+    ],
+  );
+
   useKeybindings(chatHandlers, {
     context: 'Chat',
-    isActive: !isModalOverlayActive
+    isActive: !isModalOverlayActive,
   });
 
   // Shift+↑ enters message-actions cursor. Separate isActive so ctrl+r search
   // doesn't leave stale isSearchingHistory on cursor-exit remount.
   useKeybinding('chat:messageActions', () => onMessageActionsEnter?.(), {
     context: 'Chat',
-    isActive: !isModalOverlayActive && !isSearchingHistory
+    isActive: !isModalOverlayActive && !isSearchingHistory,
   });
 
   // Fast mode keybinding is only active when fast mode is enabled and available
   useKeybinding('chat:fastMode', handleFastModePicker, {
     context: 'Chat',
-    isActive: !isModalOverlayActive && isFastModeEnabled() && isFastModeAvailable()
+    isActive: !isModalOverlayActive && isFastModeEnabled() && isFastModeAvailable(),
   });
 
   // Handle help:dismiss keybinding (ESC closes help menu)
   // This is registered separately from Chat context so it has priority over
   // CancelRequestHandler when help menu is open
-  useKeybinding('help:dismiss', () => {
-    setHelpOpen(false);
-  }, {
-    context: 'Help',
-    isActive: helpOpen
-  });
+  useKeybinding(
+    'help:dismiss',
+    () => {
+      setHelpOpen(false);
+    },
+    { context: 'Help', isActive: helpOpen },
+  );
 
   // Quick Open / Global Search. Hook calls are unconditional (Rules of Hooks);
   // the handler body is feature()-gated so the setState calls and component
   // references get tree-shaken in external builds.
   const quickSearchActive = feature('QUICK_SEARCH') ? !isModalOverlayActive : false;
-  useKeybinding('app:quickOpen', () => {
-    if (feature('QUICK_SEARCH')) {
-      setShowQuickOpen(true);
-      setHelpOpen(false);
-    }
-  }, {
-    context: 'Global',
-    isActive: quickSearchActive
-  });
-  useKeybinding('app:globalSearch', () => {
-    if (feature('QUICK_SEARCH')) {
-      setShowGlobalSearch(true);
-      setHelpOpen(false);
-    }
-  }, {
-    context: 'Global',
-    isActive: quickSearchActive
-  });
-  useKeybinding('history:search', () => {
-    if (feature('HISTORY_PICKER')) {
-      setShowHistoryPicker(true);
-      setHelpOpen(false);
-    }
-  }, {
-    context: 'Global',
-    isActive: feature('HISTORY_PICKER') ? !isModalOverlayActive : false
-  });
+  useKeybinding(
+    'app:quickOpen',
+    () => {
+      if (feature('QUICK_SEARCH')) {
+        setShowQuickOpen(true);
+        setHelpOpen(false);
+      }
+    },
+    { context: 'Global', isActive: quickSearchActive },
+  );
+  useKeybinding(
+    'app:globalSearch',
+    () => {
+      if (feature('QUICK_SEARCH')) {
+        setShowGlobalSearch(true);
+        setHelpOpen(false);
+      }
+    },
+    { context: 'Global', isActive: quickSearchActive },
+  );
+
+  useKeybinding(
+    'history:search',
+    () => {
+      if (feature('HISTORY_PICKER')) {
+        setShowHistoryPicker(true);
+        setHelpOpen(false);
+      }
+    },
+    {
+      context: 'Global',
+      isActive: feature('HISTORY_PICKER') ? !isModalOverlayActive : false,
+    },
+  );
 
   // Handle Ctrl+C to abort speculation when idle (not loading)
   // CancelRequestHandler only handles Ctrl+C during active tasks
-  useKeybinding('app:interrupt', () => {
-    abortSpeculation(setAppState);
-  }, {
-    context: 'Global',
-    isActive: !isLoading && speculation.status === 'active'
-  });
+  useKeybinding(
+    'app:interrupt',
+    () => {
+      abortSpeculation(setAppState);
+    },
+    {
+      context: 'Global',
+      isActive: !isLoading && speculation.status === 'active',
+    },
+  );
 
   // Footer indicator navigation keybindings. ↑/↓ live here (not in
   // handleHistoryUp/Down) because TextInput focus=false when a pill is
   // selected — its useInput is inactive, so this is the only path.
-  useKeybindings({
-    'footer:up': () => {
-      // ↑ scrolls within the coordinator task list before leaving the pill
-      if (tasksSelected && (process.env.USER_TYPE) === 'ant' && coordinatorTaskCount > 0 && coordinatorTaskIndex > minCoordinatorIndex) {
-        setCoordinatorTaskIndex(prev => prev - 1);
-        return;
-      }
-      navigateFooter(-1, true);
-    },
-    'footer:down': () => {
-      // ↓ scrolls within the coordinator task list, never leaves the pill
-      if (tasksSelected && (process.env.USER_TYPE) === 'ant' && coordinatorTaskCount > 0) {
-        if (coordinatorTaskIndex < coordinatorTaskCount - 1) {
-          setCoordinatorTaskIndex(prev => prev + 1);
-        }
-        return;
-      }
-      if (tasksSelected && !isTeammateMode) {
-        setShowBashesDialog(true);
-        selectFooterItem(null);
-        return;
-      }
-      navigateFooter(1);
-    },
-    'footer:next': () => {
-      // Teammate mode: ←/→ cycles within the team member list
-      if (tasksSelected && isTeammateMode) {
-        const totalAgents = 1 + inProcessTeammates.length;
-        setTeammateFooterIndex(prev => (prev + 1) % totalAgents);
-        return;
-      }
-      navigateFooter(1);
-    },
-    'footer:previous': () => {
-      if (tasksSelected && isTeammateMode) {
-        const totalAgents = 1 + inProcessTeammates.length;
-        setTeammateFooterIndex(prev => (prev - 1 + totalAgents) % totalAgents);
-        return;
-      }
-      navigateFooter(-1);
-    },
-    'footer:openSelected': () => {
-      if (viewSelectionMode === 'selecting-agent') {
-        return;
-      }
-      switch (footerItemSelected) {
-        case 'companion':
-          if (feature('BUDDY')) {
-            selectFooterItem(null);
-            void onSubmit('/buddy');
-          }
-          break;
-        case 'tasks':
-          if (isTeammateMode) {
-            // Enter switches to the selected agent's view
-            if (teammateFooterIndex === 0) {
-              exitTeammateView(setAppState);
-            } else {
-              const teammate = inProcessTeammates[teammateFooterIndex - 1];
-              if (teammate) enterTeammateView(teammate.id, setAppState);
-            }
-          } else if (coordinatorTaskIndex === 0 && coordinatorTaskCount > 0) {
-            exitTeammateView(setAppState);
+  useKeybindings(
+    {
+      'footer:up': () => {
+        // ↑ in bg_agent pill: move selection up (-1 = main). At -1, leave pill.
+        if (bgAgentSelected) {
+          if (selectedBgAgentIndex > -1) {
+            setSelectedBgAgentIndex(prev => prev - 1);
           } else {
-            const selectedTaskId = getVisibleAgentTasks(tasks)[coordinatorTaskIndex - 1]?.id;
-            if (selectedTaskId) {
-              enterTeammateView(selectedTaskId, setAppState);
-            } else {
-              setShowBashesDialog(true);
-              selectFooterItem(null);
-            }
+            selectFooterItem(null);
           }
-          break;
-        case 'tmux':
-          if ((process.env.USER_TYPE) === 'ant') {
-            setAppState(prev => prev.tungstenPanelAutoHidden ? {
-              ...prev,
-              tungstenPanelAutoHidden: false
-            } : {
-              ...prev,
-              tungstenPanelVisible: !(prev.tungstenPanelVisible ?? true)
-            });
-          }
-          break;
-        case 'bagel':
-          break;
-        case 'teams':
-          setShowTeamsDialog(true);
-          selectFooterItem(null);
-          break;
-        case 'bridge':
-          setShowBridgeDialog(true);
-          selectFooterItem(null);
-          break;
-      }
-    },
-    'footer:clearSelection': () => {
-      selectFooterItem(null);
-    },
-    'footer:close': () => {
-      if (tasksSelected && coordinatorTaskIndex >= 1) {
-        const task = getVisibleAgentTasks(tasks)[coordinatorTaskIndex - 1];
-        if (!task) return false;
-        // When the selected row IS the viewed agent, 'x' types into the
-        // steering input. Any other row — dismiss it.
-        if (viewSelectionMode === 'viewing-agent' && task.id === viewingAgentTaskId) {
-          onChange(input.slice(0, cursorOffset) + 'x' + input.slice(cursorOffset));
-          setCursorOffset(cursorOffset + 1);
           return;
         }
-        stopOrDismissAgent(task.id, setAppState);
-        if (task.status !== 'running') {
-          setCoordinatorTaskIndex(i => Math.max(minCoordinatorIndex, i - 1));
+        // ↑ scrolls within the coordinator task list before leaving the pill
+        if (
+          tasksSelected &&
+          process.env.USER_TYPE === 'ant' &&
+          coordinatorTaskCount > 0 &&
+          coordinatorTaskIndex > minCoordinatorIndex
+        ) {
+          setCoordinatorTaskIndex(prev => prev - 1);
+          return;
         }
-        return;
-      }
-      // Not handled — let 'x' fall through to type-to-exit
-      return false;
-    }
-  }, {
-    context: 'Footer',
-    isActive: !!footerItemSelected && !isModalOverlayActive
-  });
+        navigateFooter(-1, true);
+      },
+      'footer:down': () => {
+        // ↓ in bg_agent pill: move selection down through agents. Clamp at last.
+        if (bgAgentSelected) {
+          if (selectedBgAgentIndex < bgAgentList.length - 1) {
+            setSelectedBgAgentIndex(prev => prev + 1);
+          }
+          return;
+        }
+        // ↓ scrolls within the coordinator task list, never leaves the pill
+        if (tasksSelected && process.env.USER_TYPE === 'ant' && coordinatorTaskCount > 0) {
+          if (coordinatorTaskIndex < coordinatorTaskCount - 1) {
+            setCoordinatorTaskIndex(prev => prev + 1);
+          }
+          return;
+        }
+        if (tasksSelected && !isTeammateMode) {
+          setShowBashesDialog(true);
+          selectFooterItem(null);
+          return;
+        }
+        navigateFooter(1);
+      },
+      'footer:next': () => {
+        // Teammate mode: ←/→ cycles within the team member list
+        if (tasksSelected && isTeammateMode) {
+          const totalAgents = 1 + inProcessTeammates.length;
+          setTeammateFooterIndex(prev => (prev + 1) % totalAgents);
+          return;
+        }
+        navigateFooter(1);
+      },
+      'footer:previous': () => {
+        if (tasksSelected && isTeammateMode) {
+          const totalAgents = 1 + inProcessTeammates.length;
+          setTeammateFooterIndex(prev => (prev - 1 + totalAgents) % totalAgents);
+          return;
+        }
+        navigateFooter(-1);
+      },
+      'footer:openSelected': () => {
+        if (viewSelectionMode === 'selecting-agent') {
+          return;
+        }
+        switch (footerItemSelected) {
+          case 'companion':
+            if (feature('BUDDY')) {
+              selectFooterItem(null);
+              void onSubmit('/buddy');
+            }
+            break;
+          case 'tasks':
+            if (isTeammateMode) {
+              // Enter switches to the selected agent's view
+              if (teammateFooterIndex === 0) {
+                exitTeammateView(setAppState);
+              } else {
+                const teammate = inProcessTeammates[teammateFooterIndex - 1];
+                if (teammate) enterTeammateView(teammate.id, setAppState);
+              }
+            } else if (coordinatorTaskIndex === 0 && coordinatorTaskCount > 0) {
+              exitTeammateView(setAppState);
+            } else {
+              const selectedTaskId = getVisibleAgentTasks(tasks)[coordinatorTaskIndex - 1]?.id;
+              if (selectedTaskId) {
+                enterTeammateView(selectedTaskId, setAppState);
+              } else {
+                setShowBashesDialog(true);
+                selectFooterItem(null);
+              }
+            }
+            break;
+          case 'tmux':
+            if (process.env.USER_TYPE === 'ant') {
+              setAppState(prev =>
+                prev.tungstenPanelAutoHidden
+                  ? { ...prev, tungstenPanelAutoHidden: false }
+                  : {
+                      ...prev,
+                      tungstenPanelVisible: !(prev.tungstenPanelVisible ?? true),
+                    },
+              );
+            }
+            break;
+          case 'bagel':
+            break;
+          case 'teams':
+            setShowTeamsDialog(true);
+            selectFooterItem(null);
+            break;
+          case 'bridge':
+            setShowBridgeDialog(true);
+            selectFooterItem(null);
+            break;
+          case 'bg_agent':
+            if (selectedBgAgentIndex === -1) {
+              exitTeammateView(setAppState);
+            } else {
+              const picked = bgAgentList[selectedBgAgentIndex];
+              if (picked) enterTeammateView(picked.agentId, setAppState);
+            }
+            // Keep the pill focused so ↑/↓ continue to work after Enter.
+            break;
+        }
+      },
+      'footer:clearSelection': () => {
+        selectFooterItem(null);
+      },
+      'footer:close': () => {
+        if (tasksSelected && coordinatorTaskIndex >= 1) {
+          const task = getVisibleAgentTasks(tasks)[coordinatorTaskIndex - 1];
+          if (!task) return false;
+          // When the selected row IS the viewed agent, 'x' types into the
+          // steering input. Any other row — dismiss it.
+          if (viewSelectionMode === 'viewing-agent' && task.id === viewingAgentTaskId) {
+            onChange(input.slice(0, cursorOffset) + 'x' + input.slice(cursorOffset));
+            setCursorOffset(cursorOffset + 1);
+            return;
+          }
+          stopOrDismissAgent(task.id, setAppState);
+          if (task.status !== 'running') {
+            setCoordinatorTaskIndex(i => Math.max(minCoordinatorIndex, i - 1));
+          }
+          return;
+        }
+        // Not handled — let 'x' fall through to type-to-exit
+        return false;
+      },
+    },
+    {
+      context: 'Footer',
+      isActive: !!footerItemSelected && !isModalOverlayActive,
+    },
+  );
+
   useInput((char, key) => {
     // Skip all input handling when a full-screen dialog is open. These dialogs
     // render via early return, but hooks run unconditionally — so without this
@@ -1874,15 +1994,18 @@ function PromptInput({
     if (getPlatform() === 'macos' && isMacosOptionChar(char)) {
       const shortcut = MACOS_OPTION_SPECIAL_CHARS[char];
       const terminalName = getNativeCSIuTerminalDisplayName();
-      const jsx = terminalName ? <Text dimColor>
-          To enable {shortcut}, set <Text bold>Option as Meta</Text> in{' '}
-          {terminalName} preferences (⌘,)
-        </Text> : <Text dimColor>To enable {shortcut}, run /terminal-setup</Text>;
+      const jsx = terminalName ? (
+        <Text dimColor>
+          To enable {shortcut}, set <Text bold>Option as Meta</Text> in {terminalName} preferences (⌘,)
+        </Text>
+      ) : (
+        <Text dimColor>To enable {shortcut}, run /terminal-setup</Text>
+      );
       addNotification({
         key: 'option-meta-hint',
         jsx,
         priority: 'immediate',
-        timeoutMs: 5000
+        timeoutMs: 5000,
       });
       // Don't return - let the character be typed so user sees the issue
     }
@@ -1902,7 +2025,7 @@ function PromptInput({
     }
 
     // Exit special modes when backspace/escape/delete/ctrl+u is pressed at cursor position 0
-    if (cursorOffset === 0 && (key.escape || key.backspace || key.delete || key.ctrl && char === 'u')) {
+    if (cursorOffset === 0 && (key.escape || key.backspace || key.delete || (key.ctrl && char === 'u'))) {
       onModeChange('prompt');
       setHelpOpen(false);
     }
@@ -1951,17 +2074,22 @@ function PromptInput({
         void popAllCommandsFromQueue();
         return;
       }
+
       if (messages.length > 0 && !input && !isLoading) {
         doublePressEscFromEmpty();
       }
     }
+
     if (key.return && helpOpen) {
       setHelpOpen(false);
     }
   });
+
   const swarmBanner = useSwarmBanner();
+
   const fastModeCooldown = isFastModeEnabled() ? isFastModeCooldown() : false;
   const showFastIcon = isFastModeEnabled() ? isFastMode && (isFastModeAvailable() || fastModeCooldown) : false;
+
   const showFastIconHint = useShowFastIconHint(showFastIcon ?? false);
 
   // Show effort notification on startup and when effort changes.
@@ -1977,17 +2105,15 @@ function PromptInput({
       key: 'effort-level',
       text: effortNotificationText,
       priority: 'high',
-      timeoutMs: 12_000
+      timeoutMs: 12_000,
     });
   }, [effortNotificationText, addNotification, removeNotification]);
+
   useBuddyNotification();
-  const companionSpeaking = feature('BUDDY') ?
-  // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
-  useAppState(s => s.companionReaction !== undefined) : false;
-  const {
-    columns,
-    rows
-  } = useTerminalSize();
+
+  const companionReactionState = useAppState(s => s.companionReaction);
+  const companionSpeaking = feature('BUDDY') ? companionReactionState !== undefined : false;
+  const { columns, rows } = useTerminalSize();
   const textInputColumns = columns - 3 - companionReservedColumns(columns, companionSpeaking);
 
   // POC: click-to-position-cursor. Mouse tracking is only enabled inside
@@ -1996,21 +2122,32 @@ function PromptInput({
   // tightly wraps the text input so they map directly to (column, line)
   // in the Cursor wrap model. MeasuredText.getOffsetFromPosition handles
   // wide chars, wrapped lines, and clamps past-end clicks to line end.
-  const maxVisibleLines = isFullscreenEnvEnabled() ? Math.max(MIN_INPUT_VIEWPORT_LINES, Math.floor(rows / 2) - PROMPT_FOOTER_LINES) : undefined;
-  const handleInputClick = useCallback((e: ClickEvent) => {
-    // During history search the displayed text is historyMatch, not
-    // input, and showCursor is false anyway — skip rather than
-    // compute an offset against the wrong string.
-    if (!input || isSearchingHistory) return;
-    const c = Cursor.fromText(input, textInputColumns, cursorOffset);
-    const viewportStart = c.getViewportStartLine(maxVisibleLines);
-    const offset = c.measuredText.getOffsetFromPosition({
-      line: e.localRow + viewportStart,
-      column: e.localCol
-    });
-    setCursorOffset(offset);
-  }, [input, textInputColumns, isSearchingHistory, cursorOffset, maxVisibleLines]);
-  const handleOpenTasksDialog = useCallback((taskId?: string) => setShowBashesDialog(taskId ?? true), [setShowBashesDialog]);
+  const maxVisibleLines = isFullscreenEnvEnabled()
+    ? Math.max(MIN_INPUT_VIEWPORT_LINES, Math.floor(rows / 2) - PROMPT_FOOTER_LINES)
+    : undefined;
+
+  const handleInputClick = useCallback(
+    (e: ClickEvent) => {
+      // During history search the displayed text is historyMatch, not
+      // input, and showCursor is false anyway — skip rather than
+      // compute an offset against the wrong string.
+      if (!input || isSearchingHistory) return;
+      const c = Cursor.fromText(input, textInputColumns, cursorOffset);
+      const viewportStart = c.getViewportStartLine(maxVisibleLines);
+      const offset = c.measuredText.getOffsetFromPosition({
+        line: e.localRow + viewportStart,
+        column: e.localCol,
+      });
+      setCursorOffset(offset);
+    },
+    [input, textInputColumns, isSearchingHistory, cursorOffset, maxVisibleLines],
+  );
+
+  const handleOpenTasksDialog = useCallback(
+    (taskId?: string) => setShowBashesDialog(taskId ?? true),
+    [setShowBashesDialog],
+  );
+
   const placeholder = showPromptSuggestion && promptSuggestion ? promptSuggestion : defaultPlaceholder;
 
   // Calculate if input has multiple lines
@@ -2019,39 +2156,41 @@ function PromptInput({
   // Memoized callbacks for model picker to prevent re-renders when unrelated
   // state (like notifications) changes. This prevents the inline model picker
   // from visually "jumping" when notifications arrive.
-  const handleModelSelect = useCallback((model: string | null, _effort: EffortLevel | undefined) => {
-    let wasFastModeDisabled = false;
-    setAppState(prev => {
-      wasFastModeDisabled = isFastModeEnabled() && !isFastModeSupportedByModel(model) && !!prev.fastMode;
-      return {
-        ...prev,
-        mainLoopModel: model,
-        mainLoopModelForSession: null,
-        // Turn off fast mode if switching to a model that doesn't support it
-        ...(wasFastModeDisabled && {
-          fastMode: false
-        })
-      };
-    });
-    setShowModelPicker(false);
-    const effectiveFastMode = (isFastMode ?? false) && !wasFastModeDisabled;
-    let message = `Model set to ${modelDisplayString(model)}`;
-    if (isBilledAsExtraUsage(model, effectiveFastMode, isOpus1mMergeEnabled())) {
-      message += ' · Billed as extra usage';
-    }
-    if (wasFastModeDisabled) {
-      message += ' · Fast mode OFF';
-    }
-    addNotification({
-      key: 'model-switched',
-      jsx: <Text>{message}</Text>,
-      priority: 'immediate',
-      timeoutMs: 3000
-    });
-    logEvent('tengu_model_picker_hotkey', {
-      model: model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
-    });
-  }, [setAppState, addNotification, isFastMode]);
+  const handleModelSelect = useCallback(
+    (model: string | null, _effort: EffortLevel | undefined) => {
+      let wasFastModeDisabled = false;
+      setAppState(prev => {
+        wasFastModeDisabled = isFastModeEnabled() && !isFastModeSupportedByModel(model) && !!prev.fastMode;
+        return {
+          ...prev,
+          mainLoopModel: model,
+          mainLoopModelForSession: null,
+          // Turn off fast mode if switching to a model that doesn't support it
+          ...(wasFastModeDisabled && { fastMode: false }),
+        };
+      });
+      setShowModelPicker(false);
+      const effectiveFastMode = (isFastMode ?? false) && !wasFastModeDisabled;
+      let message = `Model set to ${modelDisplayString(model)}`;
+      if (isBilledAsExtraUsage(model, effectiveFastMode, isOpus1mMergeEnabled())) {
+        message += ' · Billed as extra usage';
+      }
+      if (wasFastModeDisabled) {
+        message += ' · Fast mode OFF';
+      }
+      addNotification({
+        key: 'model-switched',
+        jsx: <Text>{message}</Text>,
+        priority: 'immediate',
+        timeoutMs: 3000,
+      });
+      logEvent('tengu_model_picker_hotkey', {
+        model: model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      });
+    },
+    [setAppState, addNotification, isFastMode],
+  );
+
   const handleModelCancel = useCallback(() => {
     setShowModelPicker(false);
   }, []);
@@ -2060,49 +2199,70 @@ function PromptInput({
   // when AppState changes for unrelated reasons (e.g., notifications arriving)
   const modelPickerElement = useMemo(() => {
     if (!showModelPicker) return null;
-    return <Box flexDirection="column" marginTop={1}>
-        <ModelPicker initial={mainLoopModel_} sessionModel={mainLoopModelForSession} onSelect={handleModelSelect} onCancel={handleModelCancel} isStandaloneCommand showFastModeNotice={isFastModeEnabled() && isFastMode && isFastModeSupportedByModel(mainLoopModel_) && isFastModeAvailable()} />
-      </Box>;
+    return (
+      <Box flexDirection="column" marginTop={1}>
+        <ModelPicker
+          initial={mainLoopModel_}
+          sessionModel={mainLoopModelForSession}
+          onSelect={handleModelSelect}
+          onCancel={handleModelCancel}
+          isStandaloneCommand
+          showFastModeNotice={
+            isFastModeEnabled() && isFastMode && isFastModeSupportedByModel(mainLoopModel_) && isFastModeAvailable()
+          }
+        />
+      </Box>
+    );
   }, [showModelPicker, mainLoopModel_, mainLoopModelForSession, handleModelSelect, handleModelCancel]);
-  const handleFastModeSelect = useCallback((result?: string) => {
-    setShowFastModePicker(false);
-    if (result) {
-      addNotification({
-        key: 'fast-mode-toggled',
-        jsx: <Text>{result}</Text>,
-        priority: 'immediate',
-        timeoutMs: 3000
-      });
-    }
-  }, [addNotification]);
+
+  const handleFastModeSelect = useCallback(
+    (result?: string) => {
+      setShowFastModePicker(false);
+      if (result) {
+        addNotification({
+          key: 'fast-mode-toggled',
+          jsx: <Text>{result}</Text>,
+          priority: 'immediate',
+          timeoutMs: 3000,
+        });
+      }
+    },
+    [addNotification],
+  );
 
   // Memoize the fast mode picker element
   const fastModePickerElement = useMemo(() => {
     if (!showFastModePicker) return null;
-    return <Box flexDirection="column" marginTop={1}>
+    return (
+      <Box flexDirection="column" marginTop={1}>
         <FastModePicker onDone={handleFastModeSelect} unavailableReason={getFastModeUnavailableReason()} />
-      </Box>;
+      </Box>
+    );
   }, [showFastModePicker, handleFastModeSelect]);
 
   // Memoized callbacks for thinking toggle
-  const handleThinkingSelect = useCallback((enabled: boolean) => {
-    setAppState(prev => ({
-      ...prev,
-      thinkingEnabled: enabled
-    }));
-    setShowThinkingToggle(false);
-    logEvent('tengu_thinking_toggled_hotkey', {
-      enabled
-    });
-    addNotification({
-      key: 'thinking-toggled-hotkey',
-      jsx: <Text color={enabled ? 'suggestion' : undefined} dimColor={!enabled}>
+  const handleThinkingSelect = useCallback(
+    (enabled: boolean) => {
+      setAppState(prev => ({
+        ...prev,
+        thinkingEnabled: enabled,
+      }));
+      setShowThinkingToggle(false);
+      logEvent('tengu_thinking_toggled_hotkey', { enabled });
+      addNotification({
+        key: 'thinking-toggled-hotkey',
+        jsx: (
+          <Text color={enabled ? 'suggestion' : undefined} dimColor={!enabled}>
             Thinking {enabled ? 'on' : 'off'}
-          </Text>,
-      priority: 'immediate',
-      timeoutMs: 3000
-    });
-  }, [setAppState, addNotification]);
+          </Text>
+        ),
+        priority: 'immediate',
+        timeoutMs: 3000,
+      });
+    },
+    [setAppState, addNotification],
+  );
+
   const handleThinkingCancel = useCallback(() => {
     setShowThinkingToggle(false);
   }, []);
@@ -2110,25 +2270,44 @@ function PromptInput({
   // Memoize the thinking toggle element
   const thinkingToggleElement = useMemo(() => {
     if (!showThinkingToggle) return null;
-    return <Box flexDirection="column" marginTop={1}>
-        <ThinkingToggle currentValue={thinkingEnabled ?? true} onSelect={handleThinkingSelect} onCancel={handleThinkingCancel} isMidConversation={messages.some(m => m.type === 'assistant')} />
-      </Box>;
+    return (
+      <Box flexDirection="column" marginTop={1}>
+        <ThinkingToggle
+          currentValue={thinkingEnabled ?? true}
+          onSelect={handleThinkingSelect}
+          onCancel={handleThinkingCancel}
+          isMidConversation={messages.some(m => m.type === 'assistant')}
+        />
+      </Box>
+    );
   }, [showThinkingToggle, thinkingEnabled, handleThinkingSelect, handleThinkingCancel, messages.length]);
 
   // Portal dialog to DialogOverlay in fullscreen so it escapes the bottom
   // slot's overflowY:hidden clip (same pattern as SuggestionsOverlay).
   // Must be called before early returns below to satisfy rules-of-hooks.
-  // Memoized so the portal useEffect doesn't churn on every PromptInput render.
-  const autoModeOptInDialog = useMemo(() => feature('TRANSCRIPT_CLASSIFIER') && showAutoModeOptIn ? <AutoModeOptInDialog onAccept={handleAutoModeOptInAccept} onDecline={handleAutoModeOptInDecline} /> : null, [showAutoModeOptIn, handleAutoModeOptInAccept, handleAutoModeOptInDecline]);
-  useSetPromptOverlayDialog(isFullscreenEnvEnabled() ? autoModeOptInDialog : null);
+  useSetPromptOverlayDialog(null);
+
   if (showBashesDialog) {
-    return <BackgroundTasksDialog onDone={() => setShowBashesDialog(false)} toolUseContext={getToolUseContext(messages, [], new AbortController(), mainLoopModel)} initialDetailTaskId={typeof showBashesDialog === 'string' ? showBashesDialog : undefined} />;
+    return (
+      <BackgroundTasksDialog
+        onDone={() => setShowBashesDialog(false)}
+        toolUseContext={getToolUseContext(messages, [], new AbortController(), mainLoopModel)}
+        initialDetailTaskId={typeof showBashesDialog === 'string' ? showBashesDialog : undefined}
+      />
+    );
   }
+
   if (isAgentSwarmsEnabled() && showTeamsDialog) {
-    return <TeamsDialog initialTeams={cachedTeams} onDone={() => {
-      setShowTeamsDialog(false);
-    }} />;
+    return (
+      <TeamsDialog
+        initialTeams={cachedTeams}
+        onDone={() => {
+          setShowTeamsDialog(false);
+        }}
+      />
+    );
   }
+
   if (feature('QUICK_SEARCH')) {
     const insertWithSpacing = (text: string) => {
       const cursorChar = input[cursorOffset - 1] ?? ' ';
@@ -2141,39 +2320,56 @@ function PromptInput({
       return <GlobalSearchDialog onDone={() => setShowGlobalSearch(false)} onInsert={insertWithSpacing} />;
     }
   }
+
   if (feature('HISTORY_PICKER') && showHistoryPicker) {
-    return <HistorySearchDialog initialQuery={input} onSelect={entry => {
-      const entryMode = getModeFromInput(entry.display);
-      const value = getValueFromInput(entry.display);
-      onModeChange(entryMode);
-      trackAndSetInput(value);
-      setPastedContents(entry.pastedContents);
-      setCursorOffset(value.length);
-      setShowHistoryPicker(false);
-    }} onCancel={() => setShowHistoryPicker(false)} />;
+    return (
+      <HistorySearchDialog
+        initialQuery={input}
+        onSelect={entry => {
+          const entryMode = getModeFromInput(entry.display);
+          const value = getValueFromInput(entry.display);
+          onModeChange(entryMode);
+          trackAndSetInput(value);
+          setPastedContents(entry.pastedContents);
+          setCursorOffset(value.length);
+          setShowHistoryPicker(false);
+        }}
+        onCancel={() => setShowHistoryPicker(false)}
+      />
+    );
   }
 
   // Show loop mode menu when requested (ant-only, eliminated from external builds)
   if (modelPickerElement) {
     return modelPickerElement;
   }
+
   if (fastModePickerElement) {
     return fastModePickerElement;
   }
+
   if (thinkingToggleElement) {
     return thinkingToggleElement;
   }
+
   if (showBridgeDialog) {
-    return <BridgeDialog onDone={() => {
-      setShowBridgeDialog(false);
-      selectFooterItem(null);
-    }} />;
+    return (
+      <BridgeDialog
+        onDone={() => {
+          setShowBridgeDialog(false);
+          selectFooterItem(null);
+        }}
+      />
+    );
   }
+
   const baseProps: BaseTextInputProps = {
     multiline: true,
     onSubmit,
     onChange,
-    value: historyMatch ? getValueFromInput(typeof historyMatch === 'string' ? historyMatch : historyMatch.display) : input,
+    value: historyMatch
+      ? getValueFromInput(typeof historyMatch === 'string' ? historyMatch : historyMatch.display)
+      : input,
     // History navigation is handled via TextInput props (onHistoryUp/onHistoryDown),
     // NOT via useKeybindings. This allows useTextInput's upOrHistoryUp/downOrHistoryDown
     // to try cursor movement first and only fall through to history navigation when the
@@ -2183,10 +2379,7 @@ function PromptInput({
     onHistoryReset: resetHistory,
     placeholder,
     onExit,
-    onExitMessage: (show, key) => setExitMessage({
-      show,
-      key
-    }),
+    onExitMessage: (show, key) => setExitMessage({ show, key }),
     onImagePaste,
     columns: textInputColumns,
     maxVisibleLines,
@@ -2199,21 +2392,24 @@ function PromptInput({
     focus: !isSearchingHistory && !isModalOverlayActive && !footerItemSelected,
     showCursor: !footerItemSelected && !isSearchingHistory && !cursorAtImageChip,
     argumentHint: commandArgumentHint,
-    onUndo: canUndo ? () => {
-      const previousState = undo();
-      if (previousState) {
-        trackAndSetInput(previousState.text);
-        setCursorOffset(previousState.cursorOffset);
-        setPastedContents(previousState.pastedContents);
-      }
-    } : undefined,
+    onUndo: canUndo
+      ? () => {
+          const previousState = undo();
+          if (previousState) {
+            trackAndSetInput(previousState.text);
+            setCursorOffset(previousState.cursorOffset);
+            setPastedContents(previousState.pastedContents);
+          }
+        }
+      : undefined,
     highlights: combinedHighlights,
     inlineGhostText,
-    inputFilter: lazySpaceInputFilter
+    inputFilter: lazySpaceInputFilter,
   };
+
   const getBorderColor = (): keyof Theme => {
     const modeColors: Record<string, keyof Theme> = {
-      bash: 'bashBorder'
+      bash: 'bashBorder',
     };
 
     // Mode colors take priority, then teammate color, then default
@@ -2231,69 +2427,177 @@ function PromptInput({
     if (teammateColorName && AGENT_COLORS.includes(teammateColorName as AgentColorName)) {
       return AGENT_COLOR_TO_THEME_COLOR[teammateColorName as AgentColorName];
     }
+
     return 'promptBorder';
   };
+
   if (isExternalEditorActive) {
-    return <Box flexDirection="row" alignItems="center" justifyContent="center" borderColor={getBorderColor()} borderStyle="round" borderLeft={false} borderRight={false} borderBottom width="100%">
+    return (
+      <Box
+        flexDirection="row"
+        alignItems="center"
+        justifyContent="center"
+        borderColor={getBorderColor()}
+        borderStyle="round"
+        borderLeft={false}
+        borderRight={false}
+        borderBottom
+        width="100%"
+      >
         <Text dimColor italic>
           Save and close editor to continue...
         </Text>
-      </Box>;
+      </Box>
+    );
   }
-  const textInputElement = isVimModeEnabled() ? <VimTextInput {...baseProps} initialMode={vimMode} onModeChange={setVimMode} /> : <TextInput {...baseProps} />;
-  return <Box flexDirection="column" marginTop={briefOwnsGap ? 0 : 1}>
+
+  const textInputElement = isVimModeEnabled() ? (
+    <VimTextInput {...baseProps} initialMode={vimMode} onModeChange={setVimMode} />
+  ) : (
+    <TextInput {...baseProps} />
+  );
+
+  return (
+    <Box flexDirection="column" marginTop={briefOwnsGap ? 0 : 1}>
       {!isFullscreenEnvEnabled() && <PromptInputQueuedCommands />}
-      {hasSuppressedDialogs && <Box marginTop={1} marginLeft={2}>
+      {hasSuppressedDialogs && (
+        <Box marginTop={1} marginLeft={2}>
           <Text dimColor>Waiting for permission…</Text>
-        </Box>}
+        </Box>
+      )}
       <PromptInputStashNotice hasStash={stashedPrompt !== undefined} />
-      {swarmBanner ? <>
+      {swarmBanner ? (
+        <>
           <Text color={swarmBanner.bgColor}>
-            {swarmBanner.text ? <>
+            {swarmBanner.text ? (
+              <>
                 {'─'.repeat(Math.max(0, columns - stringWidth(swarmBanner.text) - 4))}
                 <Text backgroundColor={swarmBanner.bgColor} color="inverseText">
                   {' '}
                   {swarmBanner.text}{' '}
                 </Text>
                 {'──'}
-              </> : '─'.repeat(columns)}
+              </>
+            ) : (
+              '─'.repeat(columns)
+            )}
           </Text>
           <Box flexDirection="row" width="100%">
-            <PromptInputModeIndicator mode={mode} isLoading={isLoading} viewingAgentName={viewingAgentName} viewingAgentColor={viewingAgentColor} />
+            <PromptInputModeIndicator
+              mode={mode}
+              isLoading={isLoading}
+              viewingAgentName={viewingAgentName}
+              viewingAgentColor={viewingAgentColor}
+            />
             <Box flexGrow={1} flexShrink={1} onClick={handleInputClick}>
               {textInputElement}
             </Box>
           </Box>
           <Text color={swarmBanner.bgColor}>{'─'.repeat(columns)}</Text>
-        </> : <Box flexDirection="row" alignItems="flex-start" justifyContent="flex-start" borderColor={getBorderColor()} borderStyle="round" borderLeft={false} borderRight={false} borderBottom width="100%" borderText={buildBorderText(showFastIcon ?? false, showFastIconHint, fastModeCooldown)}>
-          <PromptInputModeIndicator mode={mode} isLoading={isLoading} viewingAgentName={viewingAgentName} viewingAgentColor={viewingAgentColor} />
+        </>
+      ) : (
+        <Box
+          flexDirection="row"
+          alignItems="flex-start"
+          justifyContent="flex-start"
+          borderColor={getBorderColor()}
+          borderStyle="round"
+          borderLeft={false}
+          borderRight={false}
+          borderBottom
+          width="100%"
+          borderText={buildBorderText(showFastIcon ?? false, showFastIconHint, fastModeCooldown)}
+        >
+          <PromptInputModeIndicator
+            mode={mode}
+            isLoading={isLoading}
+            viewingAgentName={viewingAgentName}
+            viewingAgentColor={viewingAgentColor}
+          />
           <Box flexGrow={1} flexShrink={1} onClick={handleInputClick}>
             {textInputElement}
           </Box>
-        </Box>}
-      <PromptInputFooter apiKeyStatus={apiKeyStatus} debug={debug} exitMessage={exitMessage} vimMode={isVimModeEnabled() ? vimMode : undefined} mode={mode} autoUpdaterResult={autoUpdaterResult} isAutoUpdating={isAutoUpdating} verbose={verbose} onAutoUpdaterResult={onAutoUpdaterResult} onChangeIsUpdating={setIsAutoUpdating} suggestions={suggestions} selectedSuggestion={selectedSuggestion} maxColumnWidth={maxColumnWidth} toolPermissionContext={effectiveToolPermissionContext} helpOpen={helpOpen} suppressHint={input.length > 0} isLoading={isLoading} tasksSelected={tasksSelected} teamsSelected={teamsSelected} bridgeSelected={bridgeSelected} tmuxSelected={tmuxSelected} teammateFooterIndex={teammateFooterIndex} ideSelection={ideSelection} mcpClients={mcpClients} isPasting={isPasting} isInputWrapped={isInputWrapped} messages={messages} isSearching={isSearchingHistory} historyQuery={historyQuery} setHistoryQuery={setHistoryQuery} historyFailedMatch={historyFailedMatch} onOpenTasksDialog={isFullscreenEnvEnabled() ? handleOpenTasksDialog : undefined} />
-      {isFullscreenEnvEnabled() ? null : autoModeOptInDialog}
-      {isFullscreenEnvEnabled() ?
-    // position=absolute takes zero layout height so the spinner
-    // doesn't shift when a notification appears/disappears. Yoga
-    // anchors absolute children at the parent's content-box origin;
-    // marginTop=-1 pulls it into the marginTop=1 gap row above the
-    // prompt border. In brief mode there is no such gap (briefOwnsGap
-    // strips our marginTop) and BriefSpinner sits flush against the
-    // border — marginTop=-2 skips over the spinner content into
-    // BriefSpinner's own marginTop=1 blank row. height=1 +
-    // overflow=hidden clips multi-line notifications to a single row.
-    // flex-end anchors the bottom line so the visible row is always
-    // the most recent. Suppressed while the slash overlay or
-    // auto-mode opt-in dialog is up by height=0 (NOT unmount) — this
-    // Box renders later in tree order so it would paint over their
-    // bottom row. Keeping Notifications mounted prevents AutoUpdater's
-    // initial-check effect from re-firing on every slash-completion
-    // toggle (PR#22413).
-    <Box position="absolute" marginTop={briefOwnsGap ? -2 : -1} height={suggestions.length === 0 && !showAutoModeOptIn ? 1 : 0} width="100%" paddingLeft={2} paddingRight={1} flexDirection="column" justifyContent="flex-end" overflow="hidden">
-          <Notifications apiKeyStatus={apiKeyStatus} autoUpdaterResult={autoUpdaterResult} debug={debug} isAutoUpdating={isAutoUpdating} verbose={verbose} messages={messages} onAutoUpdaterResult={onAutoUpdaterResult} onChangeIsUpdating={setIsAutoUpdating} ideSelection={ideSelection} mcpClients={mcpClients} isInputWrapped={isInputWrapped} />
-        </Box> : null}
-    </Box>;
+        </Box>
+      )}
+      <PromptInputFooter
+        apiKeyStatus={apiKeyStatus}
+        debug={debug}
+        exitMessage={exitMessage}
+        vimMode={isVimModeEnabled() ? vimMode : undefined}
+        mode={mode}
+        autoUpdaterResult={autoUpdaterResult}
+        isAutoUpdating={isAutoUpdating}
+        verbose={verbose}
+        onAutoUpdaterResult={onAutoUpdaterResult}
+        onChangeIsUpdating={setIsAutoUpdating}
+        suggestions={suggestions}
+        selectedSuggestion={selectedSuggestion}
+        maxColumnWidth={maxColumnWidth}
+        toolPermissionContext={effectiveToolPermissionContext}
+        helpOpen={helpOpen}
+        suppressHint={input.length > 0}
+        isLoading={isLoading}
+        tasksSelected={tasksSelected}
+        teamsSelected={teamsSelected}
+        bridgeSelected={bridgeSelected}
+        tmuxSelected={tmuxSelected}
+        teammateFooterIndex={teammateFooterIndex}
+        ideSelection={ideSelection}
+        mcpClients={mcpClients}
+        isPasting={isPasting}
+        isInputWrapped={isInputWrapped}
+        messages={messages}
+        isSearching={isSearchingHistory}
+        historyQuery={historyQuery}
+        setHistoryQuery={setHistoryQuery}
+        historyFailedMatch={historyFailedMatch}
+        onOpenTasksDialog={isFullscreenEnvEnabled() ? handleOpenTasksDialog : undefined}
+      />
+      {isFullscreenEnvEnabled() ? (
+        // position=absolute takes zero layout height so the spinner
+        // doesn't shift when a notification appears/disappears. Yoga
+        // anchors absolute children at the parent's content-box origin;
+        // marginTop=-1 pulls it into the marginTop=1 gap row above the
+        // prompt border. In brief mode there is no such gap (briefOwnsGap
+        // strips our marginTop) and BriefSpinner sits flush against the
+        // border — marginTop=-2 skips over the spinner content into
+        // BriefSpinner's own marginTop=1 blank row. height=1 +
+        // overflow=hidden clips multi-line notifications to a single row.
+        // flex-end anchors the bottom line so the visible row is always
+        // the most recent. Suppressed while the slash overlay or
+        // auto-mode opt-in dialog is up by height=0 (NOT unmount) — this
+        // Box renders later in tree order so it would paint over their
+        // bottom row. Keeping Notifications mounted prevents AutoUpdater's
+        // initial-check effect from re-firing on every slash-completion
+        // toggle (PR#22413).
+        <Box
+          position="absolute"
+          marginTop={briefOwnsGap ? -2 : -1}
+          height={suggestions.length === 0 ? 1 : 0}
+          width="100%"
+          paddingLeft={2}
+          paddingRight={1}
+          flexDirection="column"
+          justifyContent="flex-end"
+          overflow="hidden"
+        >
+          <Notifications
+            apiKeyStatus={apiKeyStatus}
+            autoUpdaterResult={autoUpdaterResult}
+            debug={debug}
+            isAutoUpdating={isAutoUpdating}
+            verbose={verbose}
+            messages={messages}
+            onAutoUpdaterResult={onAutoUpdaterResult}
+            onChangeIsUpdating={setIsAutoUpdating}
+            ideSelection={ideSelection}
+            mcpClients={mcpClients}
+            isInputWrapped={isInputWrapped}
+          />
+        </Box>
+      ) : null}
+    </Box>
+  );
 }
 
 /**
@@ -2311,8 +2615,8 @@ function getInitialPasteId(messages: Message[]): number {
         }
       }
       // Check text paste references in message content
-      if (Array.isArray(message.message.content)) {
-        for (const block of message.message.content) {
+      if (Array.isArray(message.message!.content)) {
+        for (const block of message.message!.content) {
           if (block.type === 'text') {
             const refs = parseReferences(block.text);
             for (const ref of refs) {
@@ -2325,14 +2629,22 @@ function getInitialPasteId(messages: Message[]): number {
   }
   return maxId + 1;
 }
-function buildBorderText(showFastIcon: boolean, showFastIconHint: boolean, fastModeCooldown: boolean): BorderTextOptions | undefined {
+
+function buildBorderText(
+  showFastIcon: boolean,
+  showFastIconHint: boolean,
+  fastModeCooldown: boolean,
+): BorderTextOptions | undefined {
   if (!showFastIcon) return undefined;
-  const fastSeg = showFastIconHint ? `${getFastIconString(true, fastModeCooldown)} ${chalk.dim('/fast')}` : getFastIconString(true, fastModeCooldown);
+  const fastSeg = showFastIconHint
+    ? `${getFastIconString(true, fastModeCooldown)} ${chalk.dim('/fast')}`
+    : getFastIconString(true, fastModeCooldown);
   return {
     content: ` ${fastSeg} `,
     position: 'top',
     align: 'end',
-    offset: 0
+    offset: 0,
   };
 }
+
 export default React.memo(PromptInput);

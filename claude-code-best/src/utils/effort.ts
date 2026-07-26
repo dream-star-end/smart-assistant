@@ -10,9 +10,17 @@ import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 import { resolveAntModel } from './model/antModels.js'
 import { getAntModelOverrideConfig } from './model/antModels.js'
 import { getAuthorityModelCapabilities, isArkGlmModel, isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
+import {
+  isChatGPTAuthMode,
+  isChatGPTCodexReasoningModel,
+} from './model/chatgptModels.js'
 
 export type { EffortLevel }
 
+// NOTE: 'ultracode' is NOT an effort level. It is a session-scoped multi-agent
+// orchestration opt-in injected by the harness (claude.ai/client) as a
+// system-reminder, orthogonal to the effort parameter. EffortLevel / EffortValue
+// must never include 'ultracode'; /effort only accepts the levels below.
 export const EFFORT_LEVELS = [
   'low',
   'medium',
@@ -44,11 +52,19 @@ export function modelSupportsEffort(model: string): boolean {
   if (supported3P !== undefined) {
     return supported3P
   }
+  if (
+    getAPIProvider() === 'openai' &&
+    isChatGPTAuthMode() &&
+    isChatGPTCodexReasoningModel(model)
+  ) {
+    return true
+  }
   // Supported by a subset of Claude 4 models
   if (
-    m.includes('opus-4-6') ||
     m.includes('opus-4-7') ||
-    m.includes('sonnet-4-6')
+    m.includes('opus-4-6') ||
+    m.includes('sonnet-4-6') ||
+    m.includes('deepseek-v4-pro')
   ) {
     return true
   }
@@ -97,6 +113,10 @@ export function modelSupportsMaxEffort(model: string): boolean {
   if (process.env.USER_TYPE === 'ant' && resolveAntModel(model)) {
     return true
   }
+  // [v5 定制] 默认拒绝。上游 v2.8.4 把这里改成了 `return true`("API 报错是用户的
+  // 责任"),对 v5 不适用:我们接了 ark glm / kimi / qwen / deepseek 等多个 provider,
+  // 各家 effort 支持面不同,放开会让不支持 max 的 provider 收到 max → 上游 400,
+  // 用户看到红框。护栏由 resolveAppliedEffort 配套降级(max/xhigh → high)。
   return false
 }
 
@@ -148,7 +168,12 @@ export function parseEffortValue(value: unknown): EffortValue | undefined {
 export function toPersistableEffort(
   value: EffortValue | undefined,
 ): EffortLevel | undefined {
-  if (value === 'low' || value === 'medium' || value === 'high') {
+  if (
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh'
+  ) {
     return value
   }
   if (
@@ -295,9 +320,9 @@ export function getEffortLevelDescription(level: EffortLevel): string {
     case 'high':
       return 'Comprehensive implementation with extensive testing and documentation'
     case 'xhigh':
-      return 'Extended capability for long-horizon agentic and coding work (Opus 4.7 only)'
+      return 'Extended reasoning beyond high, short of max'
     case 'max':
-      return 'Maximum capability with deepest reasoning (Opus 4.6+ only)'
+      return 'Maximum capability with deepest reasoning'
   }
 }
 
@@ -377,17 +402,28 @@ export function getDefaultEffortForModel(
   // the model launch DRI and research. Default effort is a sensitive setting
   // that can greatly affect model quality and bashing.
 
+  if (
+    getAPIProvider() === 'openai' &&
+    isChatGPTAuthMode() &&
+    isChatGPTCodexReasoningModel(model)
+  ) {
+    return 'medium'
+  }
+
   // Default effort on Opus 4.6 to medium for Pro.
   // Max/Team also get medium when the tengu_grey_step2 config is enabled.
-  if (model.toLowerCase().includes('opus-4-6')) {
+  if (
+    model.toLowerCase().includes('opus-4-7') ||
+    model.toLowerCase().includes('opus-4-6')
+  ) {
     if (isProSubscriber()) {
-      return 'medium'
+      return 'high'
     }
     if (
       getOpusDefaultEffortConfig().enabled &&
       (isMaxSubscriber() || isTeamSubscriber())
     ) {
-      return 'medium'
+      return 'high'
     }
   }
 

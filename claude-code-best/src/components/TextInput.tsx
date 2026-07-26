@@ -5,7 +5,7 @@ import { useVoiceState } from '../context/voice.js';
 import { useClipboardImageHint } from '../hooks/useClipboardImageHint.js';
 import { useSettings } from '../hooks/useSettings.js';
 import { useTextInput } from '../hooks/useTextInput.js';
-import { Box, color, useAnimationFrame, useTerminalFocus, useTheme } from '../ink.js';
+import { Box, color, useAnimationFrame, useTerminalFocus, useTheme } from '@anthropic/ink';
 import type { BaseTextInputProps } from '../types/textInputTypes.js';
 import { isEnvTruthy } from '../utils/envUtils.js';
 import type { TextHighlight } from '../utils/textHighlighting.js';
@@ -31,9 +31,11 @@ const LEVEL_BOOST = 1.8;
 // grey. computeLevel returns sqrt(rms/2000), so ambient mic noise
 // typically sits at 0.05-0.15. Speech starts around 0.2+.
 const SILENCE_THRESHOLD = 0.15;
+
 export type Props = BaseTextInputProps & {
   highlights?: TextHighlight[];
 };
+
 export default function TextInput(props: Props): React.ReactNode {
   const [theme] = useTheme();
   const isTerminalFocused = useTerminalFocus();
@@ -41,18 +43,19 @@ export default function TextInput(props: Props): React.ReactNode {
   const accessibilityEnabled = useMemo(() => isEnvTruthy(process.env.CLAUDE_CODE_ACCESSIBILITY), []);
   const settings = useSettings();
   const reducedMotion = settings.prefersReducedMotion ?? false;
-  const voiceState = feature('VOICE_MODE') ?
-  // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
-  useVoiceState(s => s.voiceState) : 'idle' as const;
+
+  const voiceStateRaw = useVoiceState(s => s.voiceState);
+  const voiceState = feature('VOICE_MODE') ? voiceStateRaw : ('idle' as const);
   const isVoiceRecording = voiceState === 'recording';
-  const audioLevels = (feature('VOICE_MODE') ?
-  // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
-  useVoiceState(s_0 => s_0.voiceAudioLevels) : []) as number[];
+
+  const audioLevelsRaw = useVoiceState(s => s.voiceAudioLevels);
+  const audioLevels = feature('VOICE_MODE') ? audioLevelsRaw : [];
   const smoothedRef = useRef<number[]>(new Array(CURSOR_WAVEFORM_WIDTH).fill(0));
+
   const needsAnimation = isVoiceRecording && !reducedMotion;
-  const [animRef, animTime] = feature('VOICE_MODE') ?
-  // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
-  useAnimationFrame(needsAnimation ? 50 : null) : [() => {}, 0];
+  const [animRefRaw, animTimeRaw] = useAnimationFrame(needsAnimation ? 50 : null);
+  const animRef = feature('VOICE_MODE') ? animRefRaw : () => {};
+  const animTime = feature('VOICE_MODE') ? animTimeRaw : 0;
 
   // Show hint when terminal regains focus and clipboard has an image
   useClipboardImageHint(isTerminalFocused, !!props.onImagePaste);
@@ -69,26 +72,19 @@ export default function TextInput(props: Props): React.ReactNode {
   } else if (isVoiceRecording && !reducedMotion) {
     // Single-bar waveform from the latest audio level
     const smoothed = smoothedRef.current;
-    const raw = audioLevels.length > 0 ? audioLevels[audioLevels.length - 1] ?? 0 : 0;
+    const raw = audioLevels.length > 0 ? (audioLevels[audioLevels.length - 1] ?? 0) : 0;
     const target = Math.min(raw * LEVEL_BOOST, 1);
     smoothed[0] = (smoothed[0] ?? 0) * SMOOTH + target * (1 - SMOOTH);
     const displayLevel = smoothed[0] ?? 0;
     const barIndex = Math.max(1, Math.min(Math.round(displayLevel * (BARS.length - 1)), BARS.length - 1));
     const isSilent = raw < SILENCE_THRESHOLD;
-    const hue = animTime / 1000 * 90 % 360;
-    const {
-      r,
-      g,
-      b
-    } = isSilent ? {
-      r: 128,
-      g: 128,
-      b: 128
-    } : hueToRgb(hue);
+    const hue = ((animTime / 1000) * 90) % 360;
+    const { r, g, b } = isSilent ? { r: 128, g: 128, b: 128 } : hueToRgb(hue);
     invert = () => chalk.rgb(r, g, b)(BARS[barIndex]!);
   } else {
     invert = chalk.inverse;
   }
+
   const textInputState = useTextInput({
     value: props.value,
     onChange: props.onChange,
@@ -115,9 +111,19 @@ export default function TextInput(props: Props): React.ReactNode {
     onOffsetChange: props.onChangeCursorOffset,
     inputFilter: props.inputFilter,
     inlineGhostText: props.inlineGhostText,
-    dim: chalk.dim
+    dim: chalk.dim,
   });
-  return <Box ref={animRef}>
-      <BaseTextInput inputState={textInputState} terminalFocus={isTerminalFocused} highlights={props.highlights} invert={invert} hidePlaceholderText={isVoiceRecording} {...props} />
-    </Box>;
+
+  return (
+    <Box ref={animRef}>
+      <BaseTextInput
+        inputState={textInputState}
+        terminalFocus={isTerminalFocused}
+        highlights={props.highlights}
+        invert={invert}
+        hidePlaceholderText={isVoiceRecording}
+        {...props}
+      />
+    </Box>
+  );
 }

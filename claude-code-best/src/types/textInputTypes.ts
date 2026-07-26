@@ -2,7 +2,7 @@ import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs
 import type { UUID } from 'crypto'
 import type React from 'react'
 import type { PermissionResult } from '../entrypoints/agentSdkTypes.js'
-import type { Key } from '../ink.js'
+import type { Key } from '@anthropic/ink'
 import type { PastedContent } from '../utils/config.js'
 import type { ImageDimensions } from '../utils/imageResizer.js'
 import type { TextHighlight } from '../utils/textHighlighting.js'
@@ -90,11 +90,6 @@ export type BaseTextInputProps = {
    * Optional callback to show exit message
    */
   readonly onExitMessage?: (show: boolean, key?: string) => void
-
-  /**
-   * Optional callback to show custom message
-   */
-  // readonly onMessage?: (show: boolean, message?: string) => void
 
   /**
    * Optional callback to reset history position
@@ -355,6 +350,20 @@ export type QueuedCommand = {
    * unified the queue but lost the isolation the dual-queue accidentally had).
    */
   agentId?: AgentId
+  /**
+   * Autonomy-run provenance for system-generated automatic turns.
+   * Used by the autonomy ledger to track queue → execution lifecycle.
+   */
+  autonomy?: {
+    runId: string
+    rootDir?: string
+    trigger: 'scheduled-task' | 'proactive-tick' | 'managed-flow-step'
+    sourceId?: string
+    sourceLabel?: string
+    flowId?: string
+    flowStepId?: string
+    flowStepName?: string
+  }
 }
 
 /**

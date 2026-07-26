@@ -13,7 +13,13 @@ import { errorMessage } from '../../utils/errors.js';
 import { loadMcpServerUserConfig, saveMcpServerUserConfig } from '../../utils/plugins/mcpbHandler.js';
 import { getUnconfiguredChannels, type UnconfiguredChannel } from '../../utils/plugins/mcpPluginIntegration.js';
 import { loadAllPlugins } from '../../utils/plugins/pluginLoader.js';
-import { getUnconfiguredOptions, loadPluginOptions, type PluginOptionSchema, type PluginOptionValues, savePluginOptions } from '../../utils/plugins/pluginOptionsStorage.js';
+import {
+  getUnconfiguredOptions,
+  loadPluginOptions,
+  type PluginOptionSchema,
+  type PluginOptionValues,
+  savePluginOptions,
+} from '../../utils/plugins/pluginOptionsStorage.js';
 import { PluginOptionsDialog } from './PluginOptionsDialog.js';
 
 /**
@@ -25,10 +31,7 @@ import { PluginOptionsDialog } from './PluginOptionsDialog.js';
  * Install should have cleared caches already; loadAllPlugins reads fresh.
  */
 export async function findPluginOptionsTarget(pluginId: string): Promise<LoadedPlugin | undefined> {
-  const {
-    enabled,
-    disabled
-  } = await loadAllPlugins();
+  const { enabled, disabled } = await loadAllPlugins();
   return [...enabled, ...disabled].find(p => p.repository === pluginId || p.source === pluginId);
 }
 
@@ -46,6 +49,7 @@ type ConfigStep = {
   load: () => PluginOptionValues | undefined;
   save: (values: PluginOptionValues) => void;
 };
+
 type Props = {
   plugin: LoadedPlugin;
   /** `name@marketplace` — the savePluginOptions / saveMcpServerUserConfig key. */
@@ -56,11 +60,8 @@ type Props = {
    */
   onDone: (outcome: 'configured' | 'skipped' | 'error', detail?: string) => void;
 };
-export function PluginOptionsFlow({
-  plugin,
-  pluginId,
-  onDone
-}: Props): React.ReactNode {
+
+export function PluginOptionsFlow({ plugin, pluginId, onDone }: Props): React.ReactNode {
   // Build the step list once at mount. Re-calling after a save would drop the
   // item we just configured.
   const [steps] = React.useState<ConfigStep[]>(() => {
@@ -75,7 +76,7 @@ export function PluginOptionsFlow({
         subtitle: 'Plugin options',
         schema: unconfigured,
         load: () => loadPluginOptions(pluginId),
-        save: values => savePluginOptions(pluginId, values, plugin.manifest.userConfig!)
+        save: values => savePluginOptions(pluginId, values, plugin.manifest.userConfig!),
       });
     }
 
@@ -88,11 +89,13 @@ export function PluginOptionsFlow({
         subtitle: `Plugin: ${plugin.name}`,
         schema: channel.configSchema,
         load: () => loadMcpServerUserConfig(pluginId, channel.server) ?? undefined,
-        save: values_0 => saveMcpServerUserConfig(pluginId, channel.server, values_0, channel.configSchema)
+        save: values => saveMcpServerUserConfig(pluginId, channel.server, values, channel.configSchema),
       });
     }
+
     return result;
   });
+
   const [index, setIndex] = React.useState(0);
 
   // Latest-ref: lets the effect close over the current onDone without
@@ -108,13 +111,16 @@ export function PluginOptionsFlow({
       onDoneRef.current('skipped');
     }
   }, [steps.length]);
+
   if (steps.length === 0) {
     return null;
   }
+
   const current = steps[index]!;
-  function handleSave(values_1: PluginOptionValues): void {
+
+  function handleSave(values: PluginOptionValues): void {
     try {
-      current.save(values_1);
+      current.save(values);
     } catch (err) {
       onDone('error', errorMessage(err));
       return;
@@ -130,5 +136,15 @@ export function PluginOptionsFlow({
   // key forces a remount when advancing to the next step — React would
   // otherwise reuse the instance and carry PluginOptionsDialog's
   // internal useState (field index, typed values) over.
-  return <PluginOptionsDialog key={current.key} title={current.title} subtitle={current.subtitle} configSchema={current.schema} initialValues={current.load()} onSave={handleSave} onCancel={() => onDone('skipped')} />;
+  return (
+    <PluginOptionsDialog
+      key={current.key}
+      title={current.title}
+      subtitle={current.subtitle}
+      configSchema={current.schema}
+      initialValues={current.load()}
+      onSave={handleSave}
+      onCancel={() => onDone('skipped')}
+    />
+  );
 }

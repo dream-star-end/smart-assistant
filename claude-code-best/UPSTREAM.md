@@ -24,10 +24,15 @@
 
 ### 有意排除的上游文件
 
-vendored 时未纳入,升级时若被上游带回属正常,按需保留:
+vendored 时未纳入。升级合并会把它们带回来,处置如下:
 
-- `bun.lock` — release 构建走 `bun install` 现算(ccb 依赖用 `workspace:*`,lock 常按平台漂移)
-- `.vscode/launch.json`、`.githooks/pre-commit` — 上游开发者本地设施,与本仓工具链无关
+- `bun.lock` — **必须删除**。release 构建走 `bun install` 现算(ccb 依赖用 `workspace:*`,lock
+  常按平台漂移)。⚠️ 升级必踩:上游 lock 里 1391 处 resolved URL 指向
+  `registry.npmmirror.com`(上游作者的国内镜像),该域名在我们的出网环境不通(实测 HTTP 000)
+  → `bun install` 会有几百个包 `ConnectionClosed` 失败。`rm -f bun.lock` 后 bun 才会走
+  `~/.npmrc` 的官方 registry 重新解析。2026-07-26 升 v2.8.4 时实际踩过(297 包失败)。
+- `.vscode/launch.json`、`.githooks/pre-commit` — 上游开发者本地设施,与本仓工具链无关。
+  `.githooks/pre-commit` 在 v2.8.4 已被上游自己删除。
 
 ---
 
@@ -52,6 +57,23 @@ scripts/ccb-upstream.sh diff --stat   # 只看规模
 | 5 | 尾流帧去重 / 工具输出 tail | `src/utils/sdkEventQueue.ts`、`src/utils/task/TaskOutput.ts` | 改上游文件 |
 | 6 | 平台技能装载 | `src/tools/SkillTool/`、`src/skills/loadSkillsDir.ts` | 改上游文件 |
 | 7 | Bash 沙箱策略 | `tools/BashTool/shouldUseSandbox.ts` | 改上游文件 |
+| 8 | 构建适配(`target:'node'`、vendored ripgrep 缺失即跳过) | `build.ts` | 改上游文件 |
+
+### 2.1 有意的语义偏离(升级时会反复撞上,先看这里再裁定)
+
+上游改了行为、而我们**有意不跟**的地方。每次升级这些点都会重新变成冲突,照下表裁定即可,
+不必重新考古:
+
+| 位置 | 上游 v2.8.4 行为 | v5 保留的行为 | 为什么 |
+|---|---|---|---|
+| `modelSupportsMaxEffort` / `modelSupportsXhighEffort` | 限制全部移除,一律 `return true`("API 报错是用户的责任") | `getAuthorityModelCapabilities` 判定链 + 未知模型 `return false` | v5 接了 ark glm / kimi / qwen / deepseek 多 provider,各家 effort 支持面不同;放开会让不支持的 provider 收到 max → 上游 400,付费用户看到红框。配套 `resolveAppliedEffort` 降级 max/xhigh → high |
+| `convertEffortValueToLevel` | `>100 → max` | `101-150 → xhigh`,`>150 → max` | v5 有独立 xhigh 档(Opus 4.7);上游数值区间无 xhigh 位置 |
+| WebSearch 默认 adapter | `tavily`(需 API key) | `bing`(无 key)+ `minimax` 自动探测 | 商业容器靠 `minimaxSearchConfigured()` 探测 master 接线自动选 MiniMax;无 key 环境(个人版/dev/CI)落 bing 才不会硬失败。上游 brave/exa/tavily 仍可显式选用 |
+| `build.ts` `target` | `'bun'` | `'node'` | 容器用 Node 22 跑 `node dist/cli.js`;`'bun'` 会保留 `await using` → SyntaxError crash-loop(2026-05-22 实发) |
+
+**配套**:上游为"放开限制"写的测试(`returns true for unknown models`、`value > 100 maps to max`、
+`modelSupportsMaxEffort`/`modelSupportsXhighEffort` 两个 describe 块)与上表矛盾,**有意不采纳** ——
+不是漏合并。我们自己的 `effort.test.ts` 覆盖了对应语义(含 DeepSeek V4 回归套件)。
 
 ---
 
@@ -82,8 +104,11 @@ scripts/ccb-upstream.sh plan v2.8.4     # 三方合并预演:冲突面、搬迁�
 2. **协议闸门**:比对 `src/cli/print.ts` 的 stream-json 帧类型集合。
    **只增不减 = 可继续;有帧类型消失 = 停,先改 `ccbMessageParser` 再升。**
 3. **合并**:在 worktree 内做,逐个冲突按第 2 节的功能分组裁定"我们的定制在新结构下落在哪"。
-4. **构建**:`bun install --ignore-scripts && bun run build`,确认 `dist/cli.js` 产出。
-   上游要求 bun ≥ 1.3.11,release 构建机(kl-mirror)的 bun 版本要够。
+4. **构建**:先 `rm -f bun.lock`(见第 1 节陷阱),再 `bun install --ignore-scripts && bun run build`,
+   确认 `dist/cli.js` 产出。上游要求 bun ≥ 1.3.11,release 构建机(kl-mirror)的 bun 版本要够。
+   ⚠️ **退出码直接看,不要 `| tail`** —— 管道的退出码是 tail 的,会把 bun 的失败吞成"成功"
+   (2026-07-26 实际踩过:install 挂了 297 个包、build 报 `Could not resolve "jsonfile/utils"`,
+   但 `| tail` 让两步都显示 exit 0)。
 5. **测试**:四层测试 + 第 3 节接缝逐条实测。
 6. **e2e 硬门**:真 turn 跑通 —— 每个 Claude 系模型各一次,覆盖 effort / 搜索 / 技能 / 尾流四个改动面。
 7. **上线**:CCB 走 release 轴(ro 挂载),**不重建镜像**,常规 `deploy-v5.sh`。
