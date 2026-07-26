@@ -368,7 +368,7 @@ jobs:
             "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
             "TEST_REDIS_URL=$TEST_REDIS_URL" \
             "TAP_OUT=$TAP_OUT" \
-            bash .github/scripts/commercial-integ-gate.sh '${{ matrix.shard }}'
+            npm run test:commercial:integ:shard -- '${{ matrix.shard }}'
 
       - name: Upload TAP output
         if: always()

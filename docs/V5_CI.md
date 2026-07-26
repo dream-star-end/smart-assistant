@@ -23,7 +23,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | web-react-browser | `npm run test:browser` | 真 Chromium 受信点击:附件/选择器一类"jsdom 恒假阴性"的交互真的能点开 | 20 min |
 | v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化) | 20 min |
 | commercial-unit | `npm run test:commercial:unit:gate` | 商业后端全量 unit(基线失败集 diff 门,见下) | 30 min |
-| commercial-integ (pr-1/2/3) | `bash .github/scripts/commercial-integ-gate.sh <shard>` | 真 PG 语义:能注册/能收验证信/能登录/refresh 家族被盗整族吊销/下单加积分/同一 request_id 只扣一次钱/会话 tape 落库读回/新表有保留策略 | 20 min/片 |
+| commercial-integ | `bash .github/scripts/commercial-integ-gate.sh <shard>` | 真 PG 语义:能注册/能收验证信/能登录/refresh 家族被盗整族吊销/下单加积分/同一 request_id 只扣一次钱/会话 tape 落库读回/新表有保留策略 | 20 min/片 |
 
 一把梭:`npm run check:v5`。**它与 CI 的 job 命令并集必须逐条相等**,由 `npm run
 check:ci-parity`(挂在 typecheck job 里)机器核对 —— 任一方向差集非空即红。
