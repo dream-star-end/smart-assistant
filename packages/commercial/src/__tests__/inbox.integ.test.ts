@@ -62,6 +62,7 @@ import {
   canAccessInboxAsset,
   readInboxAssetForViewer,
 } from "../inbox/assets.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -70,43 +71,6 @@ const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB
 const JWT_SECRET = "i".repeat(64);
 const TEST_BRIDGE_SECRET = "a".repeat(64);
 const TEST_MEDIA_SIGN_KEY = deriveMediaSignKey(TEST_BRIDGE_SECRET);
-
-// 完整表列表(0001..0046)。`DROP TABLE IF EXISTS ... CASCADE` 对未列出的表
-// 不会自动级联删表本身,只会断 FK,所以必须显式枚举所有表名。
-const COMMERCIAL_TABLES = [
-  "inbox_message_assets",
-  "inbox_message_reads",
-  "inbox_messages",
-  "oauth_identities",
-  "compute_host_audit",
-  "compute_pool_state",
-  "account_refresh_events",
-  "feedback",
-  "compute_hosts",
-  "user_remote_hosts",
-  "admin_alert_silences",
-  "admin_alert_outbox",
-  "admin_alert_rule_state",
-  "admin_alert_channels",
-  "system_settings",
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
 
 let pgAvailable = false;
 let redis: IORedis | null = null;
@@ -140,10 +104,20 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 
   redis = await probeRedis();
+
+  // fixture fail-closed:缺 Redis 时此前静默降级(整份套件的 HTTP 路径不装配),
+
+  // 于是"绿"只证明了没跑。REQUIRE_TEST_DB/CI 下必须红 —— 2026-07-26 门禁审计。
+
+  if (!redis && REQUIRE_TEST_DB) {
+
+    throw new Error("Redis test fixture required (TEST_REDIS_URL) — refusing to silently degrade");
+
+  }
   if (redis) {
     const handler = createCommercialHandler({
       jwtSecret: JWT_SECRET,
@@ -181,7 +155,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    try { await resetTestSchemaForTest(); } catch { /* */ }
     await closePool();
   }
 });

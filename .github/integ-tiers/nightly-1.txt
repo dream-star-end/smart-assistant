@@ -1,0 +1,24 @@
+# 夜跑梯队 · 分片 1 —— 账号池 / 供给侧调度 / 出站通道
+#
+# 失败开工单,不阻塞 PR。覆盖 claude/codex 账号池的健康探测、配额、代理绑定、
+# 刷新与调度选路。挂了表现为"部分用户轮不到可用账号",严重但不即时,
+# 且这一片对外部上游最敏感(最容易 flaky),不适合放在 PR 阻塞路径。
+#
+# min-tests: 1
+# max-minutes: 30
+packages/commercial/src/__tests__/accountHealth.integ.test.ts
+packages/commercial/src/__tests__/accountPinnedUserId.integ.test.ts
+packages/commercial/src/__tests__/accountProxy.integ.test.ts
+packages/commercial/src/__tests__/accountQuota.integ.test.ts
+packages/commercial/src/__tests__/accountRefresh.integ.test.ts
+packages/commercial/src/__tests__/accountScheduler.integ.test.ts
+packages/commercial/src/__tests__/accountStore.integ.test.ts
+packages/commercial/src/__tests__/anthropicProxy.integ.test.ts
+packages/commercial/src/__tests__/apiKeyAdmin.integ.test.ts
+packages/commercial/src/__tests__/blockedForUser.integ.test.ts
+packages/commercial/src/__tests__/ccExternalEndpoint.integ.test.ts
+packages/commercial/src/__tests__/channelMigration.integ.test.ts
+packages/commercial/src/__tests__/codexChannelPartition.integ.test.ts
+packages/commercial/src/__tests__/codexDisableDrift.integ.test.ts
+packages/commercial/src/__tests__/computeHostRevoke.integ.test.ts
+packages/commercial/src/__tests__/leaderLease.integ.test.ts

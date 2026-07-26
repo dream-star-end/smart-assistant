@@ -29,6 +29,7 @@ import { runMigrations } from "../db/migrate.js";
 import { registerCommercial, type RegisterCommercialResult } from "../index.js";
 import { signAccess } from "../auth/jwt.js";
 import { ContainerUnreadyError } from "../ws/userChatBridge.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -37,14 +38,6 @@ const TEST_REDIS_URL =
   process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
 const REQUIRE_TEST_DB =
   process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
-
-const COMMERCIAL_TABLES = [
-  "rate_limit_events", "admin_audit", "agent_audit", "agent_containers",
-  "agent_subscriptions", "user_preferences", "request_finalize_journal",
-  "orders", "topup_plans", "usage_records",
-  "credit_ledger", "model_pricing", "claude_accounts", "refresh_tokens",
-  "email_verifications", "users", "schema_migrations",
-];
 
 let pgAvailable = false;
 const ORIGINAL_ENV: Record<string, string | undefined> = {};
@@ -89,13 +82,13 @@ before(async () => {
   process.env.COMMERCIAL_ALERTS_DISABLED = "1";
   await resetPool();
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 5 }));
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  await resetTestSchemaForTest();
   await runMigrations();
 });
 
 after(async () => {
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    try { await resetTestSchemaForTest(); } catch { /* */ }
     try { await closePool(); } catch { /* */ }
   }
   restoreEnv();

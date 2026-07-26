@@ -32,12 +32,12 @@ import {
 import type {
   AgentDefinition,
   AgentDefinitionsResult,
-} from '../tools/AgentTool/loadAgentsDir.js'
-import { SKILL_TOOL_NAME } from '../tools/SkillTool/constants.js'
+} from '@claude-code-best/builtin-tools/tools/AgentTool/loadAgentsDir.js'
+import { SKILL_TOOL_NAME } from '@claude-code-best/builtin-tools/tools/SkillTool/constants.js'
 import {
   getLimitedSkillToolCommands,
   getSkillToolInfo as getSlashCommandInfo,
-} from '../tools/SkillTool/prompt.js'
+} from '@claude-code-best/builtin-tools/tools/SkillTool/prompt.js'
 import type {
   AssistantMessage,
   AttachmentMessage,
@@ -229,6 +229,10 @@ export interface ContextData {
     cache_creation_input_tokens: number
     cache_read_input_tokens: number
   } | null
+  /** Cache hit rate percentage (0-100), undefined if no data */
+  readonly cacheHitRate?: number
+  /** Cache warning threshold percentage */
+  readonly cacheThreshold?: number
 }
 
 export async function countToolDefinitionTokens(
@@ -383,9 +387,11 @@ async function countBuiltInToolTokens(
   }
 
   // Check if tool search is enabled
-  const { isToolSearchEnabled } = await import('./toolSearch.js')
-  const { isDeferredTool } = await import('../tools/ToolSearchTool/prompt.js')
-  const isDeferred = await isToolSearchEnabled(
+  const { isSearchExtraToolsEnabled } = await import('./searchExtraTools.js')
+  const { isDeferredTool } = await import(
+    '@claude-code-best/builtin-tools/tools/SearchExtraToolsTool/prompt.js'
+  )
+  const isDeferred = await isSearchExtraToolsEnabled(
     model ?? '',
     tools,
     getToolPermissionContext,
@@ -445,8 +451,8 @@ async function countBuiltInToolTokens(
     if (messages) {
       const deferredToolNameSet = new Set(deferredBuiltinTools.map(t => t.name))
       for (const msg of messages) {
-        if (msg.type === 'assistant' && Array.isArray(msg.message.content)) {
-          for (const block of msg.message.content) {
+        if (msg.type === 'assistant' && Array.isArray(msg.message!.content)) {
+          for (const block of msg.message!.content) {
             if (
               typeof block !== 'string' &&
               'type' in block &&
@@ -666,11 +672,13 @@ export async function countMcpToolTokens(
   )
 
   // Check if tool search is enabled - if so, MCP tools are deferred
-  // isToolSearchEnabled handles threshold calculation internally for TstAuto mode
-  const { isToolSearchEnabled } = await import('./toolSearch.js')
-  const { isDeferredTool } = await import('../tools/ToolSearchTool/prompt.js')
+  // isSearchExtraToolsEnabled handles threshold calculation internally for TstAuto mode
+  const { isSearchExtraToolsEnabled } = await import('./searchExtraTools.js')
+  const { isDeferredTool } = await import(
+    '@claude-code-best/builtin-tools/tools/SearchExtraToolsTool/prompt.js'
+  )
 
-  const isDeferred = await isToolSearchEnabled(
+  const isDeferred = await isSearchExtraToolsEnabled(
     model,
     tools,
     getToolPermissionContext,
@@ -678,13 +686,13 @@ export async function countMcpToolTokens(
     'analyzeMcp',
   )
 
-  // Find MCP tools that have been used in messages (loaded via ToolSearchTool)
+  // Find MCP tools that have been used in messages (loaded via SearchExtraToolsTool)
   const loadedMcpToolNames = new Set<string>()
   if (isDeferred && messages) {
     const mcpToolNameSet = new Set(mcpTools.map(t => t.name))
     for (const msg of messages) {
-      if (msg.type === 'assistant' && Array.isArray(msg.message.content)) {
-        for (const block of msg.message.content) {
+      if (msg.type === 'assistant' && Array.isArray(msg.message!.content)) {
+        for (const block of msg.message!.content) {
           if (
             typeof block !== 'string' &&
             'type' in block &&
@@ -786,12 +794,18 @@ function processAssistantMessage(
   breakdown: MessageBreakdown,
 ): void {
   // Process each content block individually
-  const contentBlocks = Array.isArray(msg.message.content) ? msg.message.content : []
+  const contentBlocks = Array.isArray(msg.message!.content)
+    ? msg.message!.content
+    : []
   for (const block of contentBlocks) {
     const blockStr = jsonStringify(block)
     const blockTokens = roughTokenCountEstimation(blockStr)
 
-    if (typeof block !== 'string' && 'type' in block && block.type === 'tool_use') {
+    if (
+      typeof block !== 'string' &&
+      'type' in block &&
+      block.type === 'tool_use'
+    ) {
       breakdown.toolCallTokens += blockTokens
       const toolName = ('name' in block ? block.name : undefined) || 'unknown'
       breakdown.toolCallsByType.set(
@@ -811,20 +825,19 @@ function processUserMessage(
   toolUseIdToName: Map<string, string>,
 ): void {
   // Handle both string and array content
-  if (typeof msg.message.content === 'string') {
+  if (typeof msg.message!.content === 'string') {
     // Simple string content
-    const tokens = roughTokenCountEstimation(msg.message.content)
+    const tokens = roughTokenCountEstimation(msg.message!.content)
     breakdown.userMessageTokens += tokens
     return
   }
 
   // Process each content block individually
-  for (const block of msg.message.content) {
+  for (const block of msg.message!.content ?? []) {
     const blockStr = jsonStringify(block)
     const blockTokens = roughTokenCountEstimation(blockStr)
 
     if ('type' in block && block.type === 'tool_result') {
-      breakdown.toolResultTokens += blockTokens
       const toolUseId = 'tool_use_id' in block ? block.tool_use_id : undefined
       const toolName =
         (toolUseId ? toolUseIdToName.get(toolUseId) : undefined) || 'unknown'
@@ -874,12 +887,18 @@ async function approximateMessageTokens(
   // Build a map of tool_use_id to tool_name for easier lookup
   const toolUseIdToName = new Map<string, string>()
   for (const msg of microcompactResult.messages) {
-    if (msg.type === 'assistant' && Array.isArray(msg.message.content)) {
-      for (const block of msg.message.content) {
-        if (typeof block !== 'string' && 'type' in block && block.type === 'tool_use') {
+    if (msg.type === 'assistant' && Array.isArray(msg.message!.content)) {
+      for (const block of msg.message!.content) {
+        if (
+          typeof block !== 'string' &&
+          'type' in block &&
+          block.type === 'tool_use'
+        ) {
           const toolUseId = 'id' in block ? (block.id as string) : undefined
           const toolName =
-            (('name' in block ? block.name : undefined) as string | undefined) || 'unknown'
+            (('name' in block ? block.name : undefined) as
+              | string
+              | undefined) || 'unknown'
           if (toolUseId) {
             toolUseIdToName.set(toolUseId, toolName)
           }
@@ -1381,5 +1400,13 @@ export async function analyzeContextUsage(
     isAutoCompactEnabled: isAutoCompact,
     messageBreakdown: formattedMessageBreakdown,
     apiUsage,
+    ...(() => {
+      if (!apiUsage) return {}
+      const { calculateCacheHitRate, getCacheThreshold } =
+        require('./cacheWarning.js') as typeof import('./cacheWarning.js')
+      const hitRate = calculateCacheHitRate(apiUsage)
+      if (hitRate === null) return {}
+      return { cacheHitRate: hitRate, cacheThreshold: getCacheThreshold() }
+    })(),
   }
 }

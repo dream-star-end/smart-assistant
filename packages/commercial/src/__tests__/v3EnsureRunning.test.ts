@@ -45,6 +45,7 @@ import {
 } from "../agent-sandbox/v3supervisor.js";
 import { computeInboundNonce } from "../bridgeSecret.js";
 import type { TunnelDialOptions } from "../compute-pool/nodeAgentClient.js";
+import { resetPool, setPoolOverride } from "../db/index.js";
 
 // ───────────────────────────────────────────────────────────────────────
 //  Fakes —— ensureRunning 通过 supervisor.* helpers 调 docker/pool。
@@ -68,10 +69,31 @@ type FakeRow = {
   updated_at: Date;
 };
 
+/** v3MayServe 读的 users 迁移状态行(channelMigration/channelState.getChannelState)。 */
+type FakeChannelRow = {
+  v5_migrated_at: Date | null;
+  v5_migration_status: "seeding" | "migrating" | "migrated" | "rolled_back" | null;
+};
+
+/** 当前活跃 FakePool —— 构造即登记,供 globalPoolDelegate 转发(见文件下方注释)。 */
+let activeFakePool: FakePool | null = null;
+
 class FakePool {
   rows: FakeRow[] = [];
   nextId = 1;
   insertCount = 0;
+  /**
+   * v3→v5 迁移门控 fixture:provisionV3Container 在 v3 channel 下先调 v3MayServe(uid),
+   * 它读 **全局** getPool()(不是 deps.pool)。缺省 = 未迁移 → 放行。
+   */
+  channelRows: Map<string, FakeChannelRow> = new Map();
+  setChannelState(uid: number | string, row: FakeChannelRow): void {
+    this.channelRows.set(String(uid), row);
+  }
+
+  constructor() {
+    activeFakePool = this;
+  }
   /** test 钩子:第 N 次 INSERT 强制 23505 */
   forceUniqConflictOnInserts = new Set<number>();
   /**
@@ -136,6 +158,15 @@ class FakePool {
     if (/^ROLLBACK/i.test(trimmed)) return { rowCount: 0, rows: [] };
     // codex round 1 FAIL #2/#3 修复 — provision 在 BEGIN 后取双锁
     if (/^SELECT pg_advisory_xact_lock/i.test(trimmed)) return { rowCount: 0, rows: [] };
+    // v3→v5 迁移门控读 users(channelState.getChannelState),走全局 pool 转发进来。
+    if (/SELECT v5_migrated_at, v5_migration_status\s+FROM users/i.test(trimmed)) {
+      const uid = String(params![0]);
+      const row = this.channelRows.get(uid) ?? {
+        v5_migrated_at: null,
+        v5_migration_status: null,
+      };
+      return { rowCount: 1, rows: [row] };
+    }
     if (/INSERT INTO agent_containers/i.test(trimmed)) {
       const idx = this.insertCount++;
       if (this.forceUniqConflictOnInserts.has(idx)) {
@@ -253,6 +284,48 @@ class FakePool {
     throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
   }
 }
+
+// ───────────────────────────────────────────────────────────────────────
+//  全局 pool 委派(v3MayServe 门控用)—— 与 v3Supervisor.test.ts 同手法
+// ───────────────────────────────────────────────────────────────────────
+//
+// ensureRunning 的 provision 分支最终调 provisionV3Container,它在 v3 channel 下
+// 先跑 v3→v5 迁移门控 v3MayServe(uid) → db/index.ts 的**全局** getPool()。
+// 单测进程没有 DATABASE_URL/REDIS_URL,全局 getPool() 会 loadConfig() 抛 ConfigError,
+// 被 ensureRunning 的 catch-all 吞成 ContainerUnreadyError("provisioning"),于是
+// 所有走 provision 的分支(image_missing / image_outdated / host_full / 滚动回收 …)
+// 断言全部落到 'provisioning',整个 makeV3EnsureRunning 套件长期躺在
+// .github/known-failures/commercial-unit.txt 里 —— 等于"开会话→建容器"主路径无门禁。
+//
+// 把全局 pool 指向当前 FakePool:门控真跑(默认放行),新增用例零接线。
+const globalPoolDelegate = {
+  query(sql: string, params?: unknown[]): Promise<unknown> {
+    if (!activeFakePool) {
+      return Promise.reject(new Error("global pool used before any FakePool was constructed"));
+    }
+    return activeFakePool.query(sql, params);
+  },
+  connect(): Promise<PoolClient> {
+    if (!activeFakePool) {
+      return Promise.reject(new Error("global pool used before any FakePool was constructed"));
+    }
+    return activeFakePool.connect();
+  },
+  end(): Promise<void> {
+    return Promise.resolve();
+  },
+} as unknown as Pool;
+
+before(async () => {
+  // 先 resetPool:setPoolOverride 在"已有单例"时会抛(见 db/index.ts)。
+  await resetPool();
+  setPoolOverride(globalPoolDelegate);
+});
+
+after(async () => {
+  activeFakePool = null;
+  await resetPool();
+});
 
 type DockerBehavior = {
   /** docker.getContainer(id).inspect() 行为:running/stopped/missing */
@@ -587,13 +660,15 @@ describe("makeV3EnsureRunning", () => {
         runtimeChannelForTest: "v5",
         requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "accepted"; },
       });
-      await assert.rejects(ensureRunning(111n), (err) => {
-        assert.ok(err instanceof ContainerUnreadyError);
-        assert.equal(err.reason, "provisioning");
-        return true;
-      });
+      // drain accepted → 与"tag 过期回收"同一条 fall-through:stopAndRemove 后立刻
+      // 用新 image 重建并返回新 endpoint(coldStart=true)。
+      // 本用例原先断言 rejects('provisioning') —— 那是夹具缺全局 pool 时 provision 恒
+      // 抛 ConfigError 被 catch-all 吞掉的假象,等于"回收后没重建"也算过。改成断言真重建。
+      const ep = await ensureRunning(111n);
       assert.equal(drainCalls, 1);
-      assert.ok(captured.stopped >= 1);
+      assert.equal(ep.coldStart, true, "drain accepted → 回收旧容器并重建");
+      assert.ok(captured.stopped >= 1, "旧容器应被 stop");
+      assert.ok(captured.containersCreated >= 1, "必须用新镜像重建,不能只停不建");
   });
 
   test("v5 stale image + 最近有 WS 活动但仍有在途 turn → drain busy 后延期", async () => {
@@ -643,7 +718,7 @@ describe("makeV3EnsureRunning", () => {
   test("v5 force stale recycle 绕过活动与 drain", async () => {
       const pool = new FakePool();
       pool.preInsertActive(114, "172.31.1.14", "dockerid-pre-114");
-      const { docker } = makeDocker({
+      const { docker, captured } = makeDocker({
         inspectState: "running",
         containerImage: "openclaude/openclaude-runtime:old",
       });
@@ -655,12 +730,12 @@ describe("makeV3EnsureRunning", () => {
         forceStaleImageRecycle: true,
         requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "busy"; },
       });
-      await assert.rejects(ensureRunning(114n), (err) => {
-        assert.ok(err instanceof ContainerUnreadyError);
-        assert.equal(err.reason, "provisioning");
-        return true;
-      });
-      assert.equal(drainCalls, 0);
+      // force=true → 完全跳过 drain 直接回收重建(同上,原 rejects 断言是夹具假象)。
+      const ep = await ensureRunning(114n);
+      assert.equal(drainCalls, 0, "force 模式绝不询问 drain");
+      assert.equal(ep.coldStart, true, "force 回收后必须重建");
+      assert.ok(captured.stopped >= 1, "旧容器应被 stop");
+      assert.ok(captured.containersCreated >= 1, "必须重建新容器");
   });
 
   test("active + running + healthz 一直返 false → ContainerUnreadyError('starting')", async () => {

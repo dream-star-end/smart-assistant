@@ -71,11 +71,27 @@ describe("remoteCodexAuth — containerId 输入校验 (client 第一道防线)"
     );
   });
 
-  it("deleteRemoteCodexContainerAuth: 非数字 containerId → silent noop (不抛)", async () => {
-    // 与本地 removeCodexContainerAuthDir 同语义:silently noop
-    await deleteRemoteCodexContainerAuth(fakeTarget, "../bad");
-    await deleteRemoteCodexContainerAuth(fakeTarget, "");
-    // 走到这里说明没抛 — pass
-    assert.ok(true);
+  it("deleteRemoteCodexContainerAuth: 非数字 containerId → silent noop(不抛且不发 RPC)", async () => {
+    // 与本地 removeCodexContainerAuthDir 同语义:silently noop。
+    // fakeTarget 指向 https://invalid.example:1 —— 只要真发出 RPC 必然连接失败抛错,
+    // 所以"resolve 且返回 undefined"同时锁住两件事:① 不抛 ② 根本没走到网络。
+    assert.equal(await deleteRemoteCodexContainerAuth(fakeTarget, "../bad"), undefined);
+    assert.equal(await deleteRemoteCodexContainerAuth(fakeTarget, ""), undefined);
+  });
+
+  it("deleteRemoteCodexContainerAuth: 数字 containerId → 放行到 RPC(反证 noop 由 guard 造成)", async () => {
+    // 没有这条,上一条的"不抛"可能只是因为函数整体是空实现 —— 无法区分
+    // "guard 挡住了" 和 "根本没实现删除"。合法 id 必须真的走到 deleteFile,
+    // 于是被这个不可达 target 打成连接错误。
+    await assert.rejects(
+      () => deleteRemoteCodexContainerAuth(fakeTarget, "12345"),
+      (err: Error) => {
+        assert.ok(
+          !/invalid containerId/.test(err.message),
+          `合法 id 不该被 guard 拦:${err.message}`,
+        );
+        return true;
+      },
+    );
   });
 });

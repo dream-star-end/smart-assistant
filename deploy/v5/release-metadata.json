@@ -69,7 +69,8 @@
     "0187_qq_bot_channel",
     "0188_auto_dream_optimizer",
     "0189_auto_dream_deepseek_v4_flash",
-    "0190_user_signal_quality"
+    "0190_user_signal_quality",
+    "0191_claude5_models"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

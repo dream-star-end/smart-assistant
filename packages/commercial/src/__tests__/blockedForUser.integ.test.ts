@@ -36,27 +36,6 @@ const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0"
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const JWT_SECRET = "z".repeat(64);
 
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "system_settings", // 0016 —— 其他 integ test 漏列这张;裸 DROP IF EXISTS 不影响
-  "users",
-  "schema_migrations",
-];
-
 let pgAvailable = false;
 let redis: IORedis | null = null;
 let server: Server | null = null;
@@ -96,6 +75,16 @@ before(async () => {
   await runMigrations();
 
   redis = await probeRedis();
+
+  // fixture fail-closed:缺 Redis 时此前静默降级(整份套件的 HTTP 路径不装配),
+
+  // 于是"绿"只证明了没跑。REQUIRE_TEST_DB/CI 下必须红 —— 2026-07-26 门禁审计。
+
+  if (!redis && REQUIRE_TEST_DB) {
+
+    throw new Error("Redis test fixture required (TEST_REDIS_URL) — refusing to silently degrade");
+
+  }
   if (redis) {
     const handler = createCommercialHandler({
       jwtSecret: JWT_SECRET,
@@ -130,7 +119,7 @@ after(async () => {
     await redis.quit();
   }
   if (pgAvailable) {
-    try { await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`); } catch { /* */ }
+    try { await resetTestSchemaForTest(); } catch { /* */ }
     await closePool();
   }
 });

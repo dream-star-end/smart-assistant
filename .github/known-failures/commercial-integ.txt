@@ -1,0 +1,88 @@
+# commercial-integ 存量失败基线(顶层 test/suite 名,一行一条)
+#
+# 用法与 commercial-unit.txt 同源:.github/scripts/commercial-integ-gate.sh 的
+# G1 判据是"失败集 ⊆ 本清单",只有清单之外的**新增**失败才让门红。
+# 注意 G2(skipped==0)/ G3(executed>=min-tests)/ G4(plan 完整)**不接受任何豁免** ——
+# 本清单只能豁免"已知的具体断言失败",不能豁免"根本没跑"。
+#
+# ── 这些条目是怎么来的 ────────────────────────────────────────────────────────
+# 2026-07-26 门禁审计:integ 层在 CI / deploy / playbook 三处都不跑,110 个文件
+# 1549 个用例一年零执行。本批把它接成真门,第一次真跑 PR 门第一梯队(22 文件 /
+# 476 用例)就暴露了下面这批存量红。它们**在本批之前就已经是红的**,不是本批引入。
+#
+# 每一条都必须写清根因与分类,并且都是**待偿还的债,不是永久豁免**。
+# 修好一条就删一行(门会 warning 提示 stale 条目)。
+#
+# ── 分类:测试腐化(产品行为正确,测试没跟上)────────────────────────────────
+#
+# full migration suite
+#   两处腐化:(a) `seed: key model pricing and topup rows exist` 硬编码 topup_plans
+#   行数 4,而迁移链现在种 8 条(¥38 订阅 Lite 等档位后来加的);(b)
+#   `agent_containers unique user_id` 直接 INSERT 不带 secret_hash,而后来的迁移
+#   把该列改成 NOT NULL → `null value in column "secret_hash" violates not-null`。
+full migration suite
+#
+# settleUsageAndLedger (integ)
+#   `happy path` 断言 credit_ledger.memo === null,产品现在写 'cost=300'。
+#   memo 是有意加的(便于对账),测试没跟上。
+settleUsageAndLedger (integ)
+#
+# ── 分类:测试自身的并发/隔离缺陷(需要改测试,不是产品)──────────────────────
+#
+# migrate.runMigrations
+#   `credit_ledger UPDATE/DELETE are no-ops (append-only RULE)` 跑到
+#   `canceling statement due to statement timeout`(37s)。这条 case 在同一库上
+#   反复重放全链迁移,疑似与自身前一条 case 的连接抢锁。需要单独定位。
+migrate.runMigrations
+#
+# POST /api/payment/hupi/callback
+#   `total_fee 缺失` 子用例 `deadlock detected`。回调路径本身在其余 7 条子用例里
+#   全绿(签名校验 / 幂等 / 金额篡改 / 订单不存在都过),这一条是测试并发布局问题。
+POST /api/payment/hupi/callback
+#
+# ── 分类:产品真问题(不在本批修,已登记 followup,优先级最高)────────────────
+#
+# retention 反向对账门(连库跑全量迁移)
+#   18 张 base table 没有在 retentionRegistry.ts 声明离场语义:
+#   authority_turn_dispatches, auto_dream_action_receipts,
+#   auto_dream_platform_finding_occurrences, auto_dream_platform_findings,
+#   auto_dream_platform_raw_signals, emergency_containment_authorizations,
+#   emergency_containment_debts, provider_quota_blocks, qq_bind_attempts,
+#   qq_bind_tokens, qq_bot_bindings, qq_outbox, qq_running_sessions,
+#   qq_session_pointer, release_egress_transitions,
+#   release_verification_evidence, verification_runs,
+#   verification_sponsored_requests
+#   = 18 张表在生产无界增长。这道门本身是对的,红得也对 —— 它一年没人看见而已。
+retention 反向对账门(连库跑全量迁移)
+#
+# exact turn waiver + targeted inbox (integ)
+#   3 条子用例全部 PG 42P08 `inconsistent types deduced for parameter $1`,抛点在
+#   **生产代码** packages/commercial/src/billing/refund.ts 的 applyTurnWaiver:
+#   同一个 $1 既当 inbox_messages.user_id(bigint)又出现在
+#   `'billing:user:' || $1::text` 里,PG 推不出一致类型。这是计划期错误,与入参
+#   取值无关 —— 即"失败 turn 自动免单"的收据写入路径会抛。**疑似线上真缺陷**,
+#   必须单独立项核实与修复,不要因为它在基线里就当成已知无害。
+exact turn waiver + targeted inbox (integ)
+#
+# ── 分层跑(2026-07-26 第二轮,逐片跑)时新暴露的 3 条 ────────────────────────
+# 它们在同一天的"22 文件一把梭"里是绿的,分片单跑才红 —— 说明这一层还带着
+# 跨用例/跨文件的顺序依赖与异步写竞态。**这三条按 flaky 登记**,de-flake 之前
+# 先让门能上线;diff 门本身允许基线条目"来了又走"(会打 stale warning)。
+#
+# commercial HTTP router (integ)
+#   仅 `A6: verify-email per-email rate limit` 一条子用例:429 已正确返回,但
+#   紧接着 SELECT rate_limit_events WHERE blocked 读到 0 行 —— blocked 事件是
+#   异步落库,测试没等。**注意本条基线是顶层粒度,会连带遮住该 suite 里其它
+#   子用例的新增失败**(这是 diff-known-failures 顶层比较的固有弱点,与
+#   commercial-unit 同源),de-flake 后必须立刻删掉这行。
+commercial HTTP router (integ)
+#
+# auth.login (integ)
+#   `verified old-password login cannot escape a concurrent password reset`。
+#   并发口令重置窗口的时序用例,分片单跑时序变化后失败。
+auth.login (integ)
+#
+# pgSessionsBackend lossless turn tape
+#   `authorized recovery atomically replaces the source anchor...` 与
+#   `multipart finalize hydrates every full detail and exact turn billing`。
+pgSessionsBackend lossless turn tape

@@ -19,19 +19,24 @@
 //   T9 第二次明确点击继续下一不透明 cursor，已加载真实记录仍常驻;
 //   T10 真 Virtuoso 归档前插足够多行后仍锁定点击前的真实可见消息;
 //   T11 direct-timeline 思考实时展开、完成自动折叠，受信点击后完整正文恢复。
-//   T12 单 Agent 卡和团队队员卡不显示冗余原始记录入口，实际过程仍可见。
+//   T12 单 Agent 卡/团队队员卡/通用 ToolCard 的可见按钮名单恰好等于白名单(冗余原始
+//      记录入口回归即红),实际过程仍可见;
 //   T13 工具卡头部满足 44px、键盘可展开/折叠，市场长列表可继续加载且移动宽度不溢出。
 //   T14 消息反馈弹窗真浏览器焦点陷阱与关闭后焦点归还；
 //   T15 活动 turn 中 AskUserQuestion 专用 UI 在移动视口仍可点选并提交;
 //   T16/T17 容器网页预览按访问端自动选择移动/桌面、铺满真实可视区，空闲后收起
 //      chrome，且独立“…”入口不会吞掉 iframe 页面交互。
 //   T18 消息“引用”动作把精确目标送入 Composer，可取消；再次引用后随当前正文发送。
-//   T19 真 IndexedDB 多标签陈旧快照不能抹除或复活 exact pending-dispatch journal。
+//   T19 真 IndexedDB 多标签陈旧快照不能抹除或复活 exact pending-dispatch journal;
+//   T20 预览用例跑完后主 harness 页面仍完好(防 setContent 摧毁共享页面把后续缺席断言变恒真)。
+//
+// 用例清单的单一权威是同目录 cases.json:实际执行的 T 编号集合必须 ⊇ 清单,
+// 删/漏一条即红(过去删掉任意一段 check() 照样 exit 0)。新增用例必须同步登记。
 //
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
 import { createRequire } from "node:module";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -122,18 +127,24 @@ await viteBuild({
 });
 const previewCssFile = readdirSync(previewCssDir).find((name) => name.endsWith(".css"));
 if (!previewCssFile) throw new Error("browser-tests: 预览 production CSS 构建失败");
-const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${readFileSync(join(previewCssDir, previewCssFile), "utf8")}</style></head><body><div id="root"></div><script>${readFileSync(previewBundlePath, "utf8")}</script></body></html>`;
+// 单一 CSS 权威:两个 harness 都注入同一份 tailwind + src/styles.css 的 production 产物。
+// 手写同义副本已删除 —— 副本让真实规则(.sr-only / .chat-scroll-area{overflow-anchor:none}
+// / .min-h-11)被删掉后门依然全绿(2026-07-26 审计实锤:删 styles.css 的
+// .chat-scroll-area 规则,T8 照过)。现在 T4/T8/T13 断言的就是线上那份 CSS。
+const productionCss = readFileSync(join(previewCssDir, previewCssFile), "utf8");
+const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(previewBundlePath, "utf8")}</script></body></html>`;
 
-// 最小 CSS:只放断言依赖的规则。sr-only 与 tailwind 语义一致 —— T4 要用计算样式
-// 证明 input 非 display:none(display:none 会让国产内核吞掉激活,tailwind 构建产物
-// 不参与本测试,故在此内联同义规则)。
-const html = `<!doctype html><html><head><meta charset="utf-8"><style>
-  html,body{margin:0;overflow:hidden}
-  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}
-  .chat-scroll-area{overflow-anchor:none}
+// 主 harness = production CSS + 测试脚手架。脚手架放在 production CSS 之后。
+// 唯一被脚手架遮蔽的生产规则是 #root 的全屏 fixed 定位与 body 的 overflow:hidden ——
+// 本 harness 把 12 个挂载根平铺在 body 上,而线上 #root{position:fixed;inset:0} 是
+// 单挂载点应用壳,会盖住其余全部根节点(点击一律被 #root 拦截)。这两条与被断言的
+// 三条真实规则(.sr-only / .chat-scroll-area{overflow-anchor:none} / .min-h-11)
+// 无交集,遮蔽范围必须保持最小,新增覆盖前先确认不碰任何被断言的选择器。
+const html = `<!doctype html><html><head><meta charset="utf-8"><style>${productionCss}</style><style>
+  html,body{margin:0;overflow:auto;height:auto}
+  #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-  #tool-card-polish-root .min-h-11{min-height:2.75rem}
 </style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
@@ -146,9 +157,55 @@ try {
 }
 
 const page = await browser.newPage();
-const pageErrors = [];
-page.on("pageerror", (err) => pageErrors.push(String(err)));
+const DEFAULT_VIEWPORT = page.viewportSize();
+
+// 运行时异常收口:pageerror(未捕获异常/unhandledrejection)与 console.error 同等 fail。
+// 只监听 pageerror 会漏掉 React key 警告、Radix a11y 报错、受控/非受控切换、被
+// ErrorBoundary 吞掉的渲染异常 —— 那些全部只走 console.error。按用例归属(check()
+// 记起止),否则末尾一次性报错定位不到是谁引入的。
+const runtimeErrors = [];
+let currentCase = "(harness boot)";
+function watchRuntimeErrors(target, label) {
+  target.on("pageerror", (err) => {
+    runtimeErrors.push({ case: currentCase, surface: label, kind: "pageerror", message: String(err) });
+  });
+  target.on("console", (msg) => {
+    if (msg.type() !== "error") return;
+    runtimeErrors.push({ case: currentCase, surface: label, kind: "console.error", message: msg.text() });
+  });
+}
+function formatRuntimeErrors(entries) {
+  return entries
+    .map((e) => `[${e.surface}/${e.kind}] ${e.message}`.replaceAll("\n", "\n    "))
+    .join("\n  ");
+}
+watchRuntimeErrors(page, "main");
+
 const harnessUrl = "http://127.0.0.1/__openclaude_browser_tests__";
+// 静态资源自服务:注入的 production CSS 里 @font-face 指向 vite 产物(Inter 变量字体)。
+// 不服务它们就会打到 127.0.0.1:80 → ERR_CONNECTION_REFUSED → 被上面的 console.error
+// 门判红,而那是 harness 缺资源不是产品缺陷。按 basename 回源到构建目录;**未登记的
+// 外部请求一律 404**(不 abort、不放行),让真正的意外外联仍然以 console.error 变红。
+const ASSET_MIME = { ".woff2": "font/woff2", ".woff": "font/woff", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" };
+// 组件真实发出的遥测信标(succeeded 级 UX 事件也走这个出口)。harness 没有后端,
+// 显式 204 挡掉;不 stub 就会 404 → console.error → 用例被自己的埋点判红。
+const STUBBED_ENDPOINTS = new Set(["/api/client-errors"]);
+const serveBuiltAsset = (route, request) => {
+  const url = new URL(request.url());
+  if (STUBBED_ENDPOINTS.has(url.pathname)) {
+    return route.fulfill({ status: 204, contentType: "text/plain", body: "" });
+  }
+  const name = url.pathname.split("/").pop() ?? "";
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+  const file = join(previewCssDir, name);
+  if (name && ASSET_MIME[ext] && existsSync(file)) {
+    return route.fulfill({ status: 200, contentType: ASSET_MIME[ext], body: readFileSync(file) });
+  }
+  console.error(`[browser-tests] 未登记的外部请求(已 404): ${request.url()}`);
+  return route.fulfill({ status: 404, contentType: "text/plain", body: "not a browser-tests asset" });
+};
+// 先注册 catch-all,再注册 harness 页:playwright 后注册者优先,harness URL 命中专用处理。
+await page.route("**/*", serveBuiltAsset);
 await page.route(harnessUrl, (route) => route.fulfill({
   status: 200,
   contentType: "text/html",
@@ -156,22 +213,62 @@ await page.route(harnessUrl, (route) => route.fulfill({
 }));
 await page.goto(harnessUrl);
 
+// 像素锚定用例(T8/T10)用 boundingBox() 取视口坐标做 before/after 比较。点击"加载更早
+// 历史"时 playwright 可能顺带滚动**整页**(harness 把 12 个挂载根平铺在 body 上),
+// 那 500px 的页面位移会被算进"锚点跳动",与被测的容器内锚定不变量无关 → 假红。
+// 这里把文档滚动位置钉回点击前的值再测量,断言语义(≤2px)一字不改。
+async function pinPageScroll(target) {
+  const before = await target.evaluate(() => document.scrollingElement?.scrollTop ?? 0);
+  return async () => {
+    await target.evaluate((y) => {
+      if (document.scrollingElement) document.scrollingElement.scrollTop = y;
+    }, before);
+  };
+}
+
+// 用例清单门:实际执行的 T 编号集合必须 ⊇ cases.json。删掉任意一段 check() 就变红。
+const CASE_MANIFEST = JSON.parse(readFileSync(join(HERE, "cases.json"), "utf8"));
+if (CASE_MANIFEST.schema !== 1) throw new Error("browser-tests: cases.json schema 必须为 1");
+const expectedCaseIds = CASE_MANIFEST.cases.map((c) => c.id);
+if (expectedCaseIds.length === 0) throw new Error("browser-tests: cases.json 不得为空");
+const executedCaseIds = new Set();
+
 let failed = 0;
 let caseIndex = 0;
+let reportedErrorCount = 0;
+let screenshotPage = page;
 async function check(name, fn) {
   caseIndex += 1;
+  const id = /^(T\d+)\s/.exec(name)?.[1];
+  const problems = [];
+  if (!id) problems.push(`用例标题缺少 T 编号前缀(清单门无法归属): ${name}`);
+  else if (executedCaseIds.has(id)) problems.push(`用例编号重复: ${id}`);
+  else if (!expectedCaseIds.includes(id)) problems.push(`用例 ${id} 不在 cases.json 清单内(新增用例必须同步登记)`);
+  if (id) executedCaseIds.add(id);
+
+  currentCase = name;
+  const errorsBefore = runtimeErrors.length;
   try {
     await fn();
-    console.log(`ok ${caseIndex} - ${name}`);
   } catch (err) {
-    failed += 1;
-    console.error(`not ok ${caseIndex} - ${name}\n  ${String(err?.message ?? err).replaceAll("\n", "\n  ")}`);
-    const shot = join(ARTIFACTS, `browser-test-fail-${caseIndex}.png`);
-    try {
-      await page.screenshot({ path: shot, fullPage: true });
-      console.error(`  screenshot: ${shot}`);
-    } catch {}
+    problems.push(String(err?.message ?? err));
   }
+  const introduced = runtimeErrors.slice(errorsBefore);
+  reportedErrorCount = runtimeErrors.length;
+  if (introduced.length > 0) {
+    problems.push(`本用例期间出现 ${introduced.length} 条运行时错误:\n  ${formatRuntimeErrors(introduced)}`);
+  }
+  if (problems.length === 0) {
+    console.log(`ok ${caseIndex} - ${name}`);
+    return;
+  }
+  failed += 1;
+  console.error(`not ok ${caseIndex} - ${name}\n  ${problems.join("\n  ").replaceAll("\n", "\n  ")}`);
+  const shot = join(ARTIFACTS, `browser-test-fail-${caseIndex}.png`);
+  try {
+    await screenshotPage.screenshot({ path: shot, fullPage: true });
+    console.error(`  screenshot: ${shot}`);
+  } catch {}
 }
 
 const primaryComposer = page.locator("#root");
@@ -363,6 +460,7 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   }
   const loadButton = root.getByRole("button", { name: "查看更早历史记录" });
   await loadButton.waitFor({ state: "visible", timeout: 3000 });
+  const restorePageScrollT8 = await pinPageScroll(page);
   await loadButton.click();
   try {
     await page.waitForFunction(() => window.__scrollTimeline.mergedPages === 1, null, { timeout: 3000 });
@@ -383,6 +481,7 @@ await check("T8 上滑零请求，点击只取一页、像素锚定且 remount �
   if (JSON.stringify(afterClick) !== JSON.stringify(["cursor-200"])) {
     throw new Error(`单次点击未严格加载一页:${JSON.stringify(afterClick)}`);
   }
+  await restorePageScrollT8();
   const afterBox = await anchor.boundingBox();
   if (!afterBox) throw new Error("tail anchor disappeared after older page merge");
   const delta = Math.abs(afterBox.y - firstAnchorTop);
@@ -445,12 +544,14 @@ await check("T10 归档前插跨出虚拟挂载区仍保持原消息像素位置
   const beforeBox = await anchor.boundingBox();
   if (!beforeBox) throw new Error("归档前插前缺少可见锚点");
   const button = root.getByTestId("history-page-loader").getByRole("button");
+  const restorePageScrollT10 = await pinPageScroll(page);
   await button.click();
   await page.waitForFunction(() => window.__archiveTimeline.mergedPages === 1, null, { timeout: 3000 });
   await page.waitForFunction(() => {
     const button = document.querySelector("#timeline-archive-root [data-testid='history-page-loader'] button");
     return button instanceof HTMLButtonElement && button.getAttribute("aria-busy") === "false";
   }, null, { timeout: 3000 });
+  await restorePageScrollT10();
   const afterBox = await anchor.boundingBox();
   if (!afterBox) throw new Error("归档前插 80 行后原锚点被虚拟列表丢失");
   const delta = Math.abs(afterBox.y - beforeBox.y);
@@ -476,26 +577,44 @@ await check("T11 direct-timeline 思考完成后自动折叠且可完整展开",
   await body.waitFor({ state: "visible", timeout: 3000 });
 });
 
-await check("T12 Agent 卡不显示冗余原始记录入口且真实过程可见", async () => {
+// 卡片可见按钮的**正向**结构不变量。
+// 过去这里是 `getByRole('button', { name: '查看原始完整记录' }).count() === 0` 的缺席断言:
+// 那条文案早已从产品里删干净(2026-07-26 核实 packages/web-react/src 只剩测试文件提到它),
+// 断言恒真;文案一改名就更是四条同时静默失效。改成"卡内可见按钮名单恰好等于白名单":
+// 冗余入口回归 → 名单多出一项 → 红;入口改名重现 → 同样多出一项 → 红。
+async function visibleButtonNames(scopeSelector) {
+  return page.evaluate((selector) => {
+    const scope = document.querySelector(selector);
+    if (!scope) throw new Error(`缺少挂载根 ${selector}`);
+    return Array.from(scope.querySelectorAll("button"))
+      .filter((node) => node.getClientRects().length > 0)
+      .map((node) => (node.getAttribute("aria-label") ?? node.textContent ?? "").replace(/\s+/g, " ").trim());
+  }, scopeSelector);
+}
+async function assertVisibleButtonSet(scopeSelector, expected, label) {
+  const actual = await visibleButtonNames(scopeSelector);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`${label} 可见按钮名单漂移:实际=${JSON.stringify(actual)} 期望=${JSON.stringify(expected)}`);
+  }
+}
+
+await check("T12 Agent 卡按钮名单恰好为白名单(无冗余原始记录入口)且真实过程可见", async () => {
   const single = page.locator("#single-agent-card-root");
   await single.getByText("SINGLE_AGENT_CARD").click();
   await single.getByText("SINGLE_AGENT_PROCESS_MARKER").waitFor({ state: "visible", timeout: 3000 });
-  if (await single.getByRole("button", { name: "查看原始完整记录" }).count() !== 0) {
-    throw new Error("单 Agent 卡仍显示查看原始完整记录");
-  }
+  await assertVisibleButtonSet("#single-agent-card-root", ["SINGLE_AGENT_CARD完成"], "单 Agent 卡");
 
   const team = page.locator("#team-agent-card-root");
   await team.getByText("团队协作 · 1 个智能体").click();
   await team.getByText("TEAM_AGENT_CARD").click();
   await team.getByText("TEAM_AGENT_PROCESS_MARKER").waitFor({ state: "visible", timeout: 3000 });
-  if (await team.getByRole("button", { name: "查看原始完整记录" }).count() !== 0) {
-    throw new Error("团队队员卡仍显示查看原始完整记录");
-  }
+  await assertVisibleButtonSet(
+    "#team-agent-card-root",
+    ["团队协作 · 1 个智能体✓ 1 完成", "TEAM_AGENT_CARDTEAM_AGENT_GOAL完成"],
+    "团队队员卡",
+  );
 
-  const tool = page.locator("#timeline-agent-root");
-  if (await tool.getByRole("button", { name: "查看原始完整记录" }).count() !== 0) {
-    throw new Error("通用 ToolCard 仍显示查看原始完整记录");
-  }
+  await assertVisibleButtonSet("#timeline-agent-root", ["终端printf exact完成"], "通用 ToolCard");
 });
 
 await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度", async () => {
@@ -505,21 +624,24 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
   const box = await header.boundingBox();
   if (!box || box.height < TOUCH_MIN) throw new Error(`工具卡头部高度=${box?.height ?? 0}px，应至少 44px`);
 
+  // exact:true 是必需的:子串匹配下"浏览器能力 1"在展开到 10 条后会同时命中
+  // "浏览器能力 10",触发 strict mode violation = 假红。
   await header.focus();
   await header.press("Enter");
-  await root.getByText("浏览器能力 1").waitFor({ state: "visible", timeout: 3000 });
-  if (await root.getByText("浏览器能力 9").count() !== 0) throw new Error("市场列表未按需渐进展示");
+  await root.getByText("浏览器能力 1", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  if (await root.getByText("浏览器能力 9", { exact: true }).count() !== 0) {
+    throw new Error("市场列表未按需渐进展示");
+  }
   await root.getByRole("button", { name: /查看更多/ }).click();
-  await root.getByText("浏览器能力 10").waitFor({ state: "visible", timeout: 3000 });
+  await root.getByText("浏览器能力 10", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
 
   await header.focus();
   await header.press("Space");
-  await root.getByText("浏览器能力 1").waitFor({ state: "hidden", timeout: 3000 });
+  await root.getByText("浏览器能力 1", { exact: true }).waitFor({ state: "hidden", timeout: 3000 });
   const width = await root.evaluate((node) => ({ client: node.clientWidth, scroll: node.scrollWidth }));
   if (width.scroll > width.client) throw new Error(`375px 级工具卡横向溢出:${JSON.stringify(width)}`);
-  if (await root.getByText("查看原始完整记录").count() !== 0) {
-    throw new Error("美化后的工具卡仍出现原始完整记录文案");
-  }
+  // 折叠态按钮名单恰好只剩卡头(同 T12:正向名单代替恒真的文案缺席断言)。
+  await assertVisibleButtonSet("#tool-card-polish-root", ["搜索 AI 市场browser完成"], "美化后的工具卡");
 });
 
 await check("T14 消息反馈弹窗关闭后把焦点还给原消息动作", async () => {
@@ -537,7 +659,17 @@ await check("T14 消息反馈弹窗关闭后把焦点还给原消息动作", asy
 });
 
 await check("T15 活动 turn 中专用 Ask UI 在移动端可点选并提交", async () => {
-  await page.setViewportSize({ width: 390, height: 844 });
+  // 移动视口是本用例的局部条件,必须还原:主 harness 页面被后续用例复用,
+  // 遗留 390×844 会静默改变别人的布局/像素断言语义。
+  try {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await runAskQuestionMobileCase();
+  } finally {
+    if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT).catch(() => {});
+  }
+});
+
+async function runAskQuestionMobileCase() {
   await page.evaluate(() => window.__mountAskQuestion());
   const dialog = page.getByRole("dialog", { name: "用户问答" });
   await dialog.waitFor({ state: "visible", timeout: 3000 });
@@ -570,7 +702,7 @@ await check("T15 活动 turn 中专用 Ask UI 在移动端可点选并提交", a
   if (JSON.stringify(response) !== JSON.stringify(expected)) {
     throw new Error(`Ask UI 回传漂移:${JSON.stringify(response)}`);
   }
-});
+}
 
 await check("T18 点助手“引用”→预览可取消→再次引用后随正文发送", async () => {
   const root = page.locator("#message-quote-root");
@@ -610,7 +742,7 @@ await check("T19 真 IndexedDB 多标签陈旧快照不抹除/复活发送日志
   }
 });
 
-async function assertContainerPreviewFillsViewport(expectedDevice, width, height, top = 0) {
+async function assertContainerPreviewFillsViewport(page, expectedDevice, width, height, top = 0) {
   const dialog = page.getByRole("dialog", { name: "容器网页预览与元素评论" });
   await dialog.waitFor({ state: "visible", timeout: 3000 });
   const active = dialog.getByRole("button", { name: `${expectedDevice}预览` });
@@ -688,34 +820,79 @@ async function assertContainerPreviewFillsViewport(expectedDevice, width, height
   });
 }
 
+// 预览用例过去用 page.setContent() 就地摧毁主 harness 页面(#root 与全部
+// timeline 根节点随之消失),之后任何依赖主 harness 的新用例都会静默失效 ——
+// 在空页面上做"缺席断言"更是恒真。改成独立 context/page,主 harness 保持完好。
+const previewContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+const previewPage = await previewContext.newPage();
+watchRuntimeErrors(previewPage, "preview");
+// 走同一个 http 源(而不是 setContent + about:blank),字体/遥测才能命中与主 harness
+// 相同的 stub 路由;否则相对 URL 在 about:blank 下直接抛错,又变成 console.error 噪声。
+const previewUrl = "http://127.0.0.1/__openclaude_browser_preview__";
+await previewPage.route("**/*", serveBuiltAsset);
+await previewPage.route(previewUrl, (route) => route.fulfill({
+  status: 200,
+  contentType: "text/html",
+  body: previewHtml,
+}));
+await previewPage.goto(previewUrl);
+
 await check("T16 移动全屏预览空闲收起控件且不吞页面触控", async () => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.setContent(previewHtml);
-  await page.evaluate(() => {
+  screenshotPage = previewPage;
+  await previewPage.setViewportSize({ width: 390, height: 844 });
+  await previewPage.evaluate(() => {
     document.documentElement.style.setProperty("--oc-visual-offset-top", "24px");
     document.documentElement.style.setProperty("--oc-visual-height", "780px");
     window.__mountContainerPreview();
   });
-  await assertContainerPreviewFillsViewport("移动", 390, 780, 24);
-  await page.evaluate(() => window.__unmountContainerPreview());
+  await assertContainerPreviewFillsViewport(previewPage, "移动", 390, 780, 24);
+  await previewPage.evaluate(() => window.__unmountContainerPreview());
 });
 
 await check("T17 PC 全屏预览空闲收起控件且可按需恢复", async () => {
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.evaluate(() => {
+  screenshotPage = previewPage;
+  await previewPage.setViewportSize({ width: 1440, height: 900 });
+  await previewPage.evaluate(() => {
     document.documentElement.style.removeProperty("--oc-visual-offset-top");
     document.documentElement.style.removeProperty("--oc-visual-height");
     window.__mountContainerPreview();
   });
-  await assertContainerPreviewFillsViewport("桌面", 1440, 900);
-  await page.evaluate(() => window.__unmountContainerPreview());
+  await assertContainerPreviewFillsViewport(previewPage, "桌面", 1440, 900);
+  await previewPage.evaluate(() => window.__unmountContainerPreview());
+});
+screenshotPage = page;
+
+// 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
+await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
+  const alive = await page.evaluate(() => ({
+    root: Boolean(document.querySelector("#root")),
+    roots: document.querySelectorAll("[id$='-root']").length,
+  }));
+  if (!alive.root) throw new Error("主 harness #root 已消失(预览用例摧毁了共享页面)");
+  if (alive.roots < 10) throw new Error(`主 harness 挂载根节点只剩 ${alive.roots} 个,应 ≥10`);
 });
 
-if (pageErrors.length > 0) {
+const missingCases = expectedCaseIds.filter((id) => !executedCaseIds.has(id));
+if (missingCases.length > 0) {
   failed += 1;
-  console.error(`not ok - 页面出现未捕获异常:\n  ${pageErrors.join("\n  ")}`);
+  console.error(
+    `not ok - 用例清单门:cases.json 声明的用例未执行 → ${missingCases.join(", ")}` +
+      "\n  (删用例必须同步改 packages/web-react/browser-tests/cases.json)",
+  );
 }
 
+// 用例区间之外(harness 启动、用例间隙)出现的运行时错误同样 fail,不许漏网。
+const tailErrors = runtimeErrors.slice(reportedErrorCount);
+if (tailErrors.length > 0) {
+  failed += 1;
+  console.error(`not ok - 用例区间之外出现运行时错误:\n  ${formatRuntimeErrors(tailErrors)}`);
+}
+
+await previewContext.close();
 await browser.close();
-console.log(failed === 0 ? `browser-tests: ${caseIndex} 全过` : `browser-tests: ${failed} 个失败`);
+console.log(
+  failed === 0
+    ? `browser-tests: ${caseIndex} 全过(清单 ${expectedCaseIds.length} 条全部执行)`
+    : `browser-tests: ${failed} 个失败`,
+);
 process.exit(failed === 0 ? 0 : 1);

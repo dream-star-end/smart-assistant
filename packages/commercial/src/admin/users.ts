@@ -355,6 +355,9 @@ export async function listUsersWithStats(
        GROUP BY user_id
      ),
      ct_v2 AS (
+       -- lint-agent-containers-sql: allow — 纯 v2 腿:v2 行的权威生命周期列是
+       -- status(0012 给全表加的 state 对 v2 老行只是 DEFAULT 'active',不承载
+       -- 语义);v3/v5 腿在上面 ct_v3 里已显式 state='active'。
        SELECT user_id, COUNT(*) AS n
        FROM agent_containers
        WHERE status = 'running' AND subscription_id IS NOT NULL

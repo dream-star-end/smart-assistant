@@ -1,4 +1,7 @@
-import type { BetaContentBlock, BetaUsage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import type {
+  BetaContentBlock,
+  BetaUsage,
+} from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { createHash, randomUUID, type UUID } from 'crypto'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import isPlainObject from 'lodash-es/isPlainObject.js'
@@ -180,7 +183,7 @@ function mapMessages(
     if (typeof _ === 'string') {
       return f(_)
     }
-    return _.map(_ => {
+    return _!.map(_ => {
       switch (_.type) {
         case 'tool_result':
           if (typeof _.content === 'string') {

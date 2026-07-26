@@ -1,43 +1,44 @@
 # v5 commercial-unit 已知存量失败清单(顶层 test/suite 名,与 TAP `not ok` 行一致)
 # 生成/维护方法见 docs/V5_CI.md。修掉一个存量失败就从这里删掉对应行。
-# 基线取自 2026-07-05 本机两次实跑(HEAD=151f7b41)的并集:
-# admin-route-inventory: 2026-07-08 重钉 baseline(org/model-ops/account-groups/alerts 等已上线路由从未同步)已修绿,移出清单。
-getV3ContainerStatus
-makeV3EnsureRunning
-preCheck — BINV-5: cost multiplier 不进 preCheck 路径
-provisionV3Container
-# 2026-07-10 登记:下行随 07-07 NameConflict 自愈修复(b9bcd348 时代)落地,但同日起
-# commercial-unit 门被握手测试丢帧竞态挂死(46303b5b 已修),该项从未被门检出过。
-# 零改动探针 PR #15(基底 ad954fcf+仅挂死修复)复现同一失败,证实为基底存量、
-# CI 环境依赖(docker mock 行为),非任何在途分支引入。修掉后删除本行。
-provisionV3Container — docker create NameConflict 自愈
-provisionV3Container — CCB baseline 挂载分支
-provisionV3Container — RemoteContractViolation 守门(v1.0.8)
-provisionV3Container — image label guard (v1.0.84 PR \#4)
-provisionV3Container — per-host bridge gateway env injection
-provisionV3Container — per-host max_containers cap (3I)
-stopAndRemoveV3Container
+# 基线取自 2026-07-05 本机两次实跑(HEAD=151f7b41)的并集。
+#
+# 2026-07-08 清债:admin-route-inventory(org/model-ops/account-groups/alerts 等已上线路由
+#   从未同步 baseline)重钉后修绿,移出清单。
 # 2026-07-11 清债:userChatBridge 全部 6 套件修绿并移出清单——根因三类:①sys.relay_ready
-# 连接性帧插队 vs once 取帧竞态(改 frameCollector+nextBusinessFrame 过滤);②close code
-# 语义演进后断言陈腐(kick=4505/shutdown=4509/模型未授权=4507/容器超大帧=maxPayload→1011);
-# ③ring replay miss 断言锁了 1b488863 已废除的"bridge 越权 resume_failed"旧语义(现契约=
-# miss 静默,裁决在容器)。此后该文件必须保持全绿,新失败=真回归。
-v3 agent_migrations ledger — INV-8 留 placeholder
-v3 agent_migrations reconciler — INV-10 (planned phase bottom-line, R6.11 §14.2.6)
-v3 reconciler — INV-7 占位(Phase 2.D)
-v3 reconciler — 非 planned phase 静默 skip(Phase 2.C MVP, Phase 2.D 待落)
-v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3)
-v3 sweepers — INV-2 open migration exclusion(NOT EXISTS + UPDATE guard + Direction A 保护)
-v3migrationLedger — INV-6 (createPlannedMigration contract)
-v3migrationLedger — TERMINAL_PHASES 常量正确性(防 future bug)
-v3migrationLedger — findOpenByContainer / listStale (reader side)
-v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口)
-v3migrationLedger — markPhase / 终态 markers
-v3migrationLedger — markPhase 入参 guard(Codex Phase 2.A review v2 BLOCKER)
-v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2)
-# 下一条为负载敏感 flaky(同日更早一轮本机跑观测到,近两轮未复现;若长期不再出现可删):
-assertPlatformDefaultModelConfigured
-# 2026-07-11 登记:本机补长驻 octest-redis(56379)后首次暴露——该 metrics 测试在 redis
-# 可达时走到新分支稳定失败;基线树(aurora@1f4bef5c)同法复现 11/12 同一子测,非在途
-# 分支引入。修掉后删除本行。
-V3 2I-2 — anthropicProxy + bridge histograms/counters
+#   连接性帧插队 vs once 取帧竞态(改 frameCollector+nextBusinessFrame 过滤);②close code
+#   语义演进后断言陈腐(kick=4505/shutdown=4509/模型未授权=4507/容器超大帧=maxPayload→1011);
+#   ③ring replay miss 断言锁了 1b488863 已废除的"bridge 越权 resume_failed"旧语义(现契约=
+#   miss 静默,裁决在容器)。此后该文件必须保持全绿,新失败=真回归。
+#
+# 2026-07-26 清债(24 行,全部是夹具坏死而非产品缺陷,详见对应 commit):
+#   ① 容器供给链 10 行(provisionV3Container 及其 5 个子套件、stopAndRemoveV3Container、
+#      getV3ContainerStatus、makeV3EnsureRunning、docker create NameConflict 自愈)——
+#      provisionV3Container 的 v3→v5 迁移门控走**全局** getPool(),单测进程没有
+#      DATABASE_URL/REDIS_URL 于是 loadConfig() 抛 ConfigError。修法是夹具把全局 pool
+#      指向当前 FakePool(零产品改动),门控真跑。
+#      注意:这 10 行覆盖的是"开会话 → 容器起来 → 挂对卷 → 注对 env → 停容器回收"整条
+#      主路径。实测在旧基线下,把 projects 卷的 bind 从 provision 里整条删掉,门依然 PASS。
+#   ② v3 migration 13 行 —— 三个文件各自对共享库 openclaude_test 做
+#      `DROP SCHEMA public CASCADE; CREATE SCHEMA public`,node:test 文件级并发下互撞;
+#      报错随竞态落点而变(42P06 already exists / no schema has been selected to
+#      create in / relation "schema_migrations" does not exist),before hookFailed
+#      → 整文件 cancelled。改成每文件一库(helpers/db.ts useDedicatedTestDatabase,
+#      照抄 org 系既有范式)。本机实测:旧版三文件并跑 = 0 pass / 51 cancelled;
+#      新版同样并跑 = 51 pass / 0 cancelled。
+#   ③ preCheck BINV-5 1 行 —— 行为层假 pool 只返 {credits},没跟上 spend.ts 双钱包
+#      改造后的 {wallet, period},BigInt(undefined) 抛。
+#
+# 目标是清单单调递减、最终删空:清单越短,门越灵敏(粒度是顶层 suite,一行在册 =
+# 该 suite 内部所有子测试的新增失败都被豁免)。
+#
+# 2026-07-26 移出清单:assertPlatformDefaultModelConfigured 同时被登记进核心契约禁豁免
+#   清单(core-contract-suites.txt)—— 它守的是"平台默认模型 key 缺失必须 boot fail-loud",
+#   缺失的后果是全员默认模型静默 503(2026-07-16 有先例)。它此前以"负载敏感 flaky"
+#   留在豁免里,但主干 run 30190800591 的 TAP artifact 显示它已不再失败。
+#   核心契约不接受豁免:真 flaky 就修 flaky,不能拿一条"用户当场看得见"的守卫换安静。
+#   (这条矛盾是新加的门自检用例自己抓出来的,不是人工发现。)
+# 2026-07-26 清空:V3 2I-2 — anthropicProxy + bridge histograms/counters 在 CI
+#   (run 30202xxxxx,tests=4726 pass=4722)已不再失败,按 stale 硬红规则删行。
+#   **本清单现在是空的 —— 这是它应有的状态。** 新增失败一律修代码,不许回填:
+#   唯一例外是"环境变化暴露的、可证明与本次改动无关的历史失败",加行时必须在 PR 里
+#   给出依据,并同时收紧 commercial-unit.counts。

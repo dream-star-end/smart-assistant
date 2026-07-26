@@ -1,0 +1,32 @@
+# 夜跑梯队 · 分片 2 —— 管理面 / 运维告警 / 自愈
+#
+# admin 路由与审计、巡检告警 outbox、自愈派单与用户通知审批链、保留策略清理。
+# selfhealUserNoticeApproval 是"会不会误给用户发消息"的最后一道闸,
+# 它必须真跑(此前无 REQUIRE_TEST_DB,缺 DB 时永远绿)。
+#
+# min-tests: 1
+# max-minutes: 30
+packages/commercial/src/__tests__/adminAccounts.integ.test.ts
+packages/commercial/src/__tests__/adminAgentAudit.integ.test.ts
+packages/commercial/src/__tests__/adminAuditRoleGrants.integ.test.ts
+packages/commercial/src/__tests__/adminContainersDispatch.integ.test.ts
+packages/commercial/src/__tests__/adminCsvDiagnostics.integ.test.ts
+packages/commercial/src/__tests__/adminMetrics.integ.test.ts
+packages/commercial/src/__tests__/adminPricing.integ.test.ts
+packages/commercial/src/__tests__/adminRouteGate.integ.test.ts
+packages/commercial/src/__tests__/adminUsers.integ.test.ts
+packages/commercial/src/__tests__/orgAuditRemediation.integ.test.ts
+packages/commercial/src/__tests__/alertOutboxAck.integ.test.ts
+packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts
+packages/commercial/src/__tests__/patrolClaimPartition.integ.test.ts
+packages/commercial/src/__tests__/deployState.integ.test.ts
+packages/commercial/src/__tests__/gcClosureRetention.integ.test.ts
+packages/commercial/src/__tests__/selfhealReconciler.integ.test.ts
+packages/commercial/src/__tests__/selfhealReleaseRequests.integ.test.ts
+packages/commercial/src/__tests__/selfhealRepairCallbacks.integ.test.ts
+packages/commercial/src/__tests__/selfhealResolveAttribution.integ.test.ts
+packages/commercial/src/__tests__/selfhealSuppression.integ.test.ts
+packages/commercial/src/__tests__/selfhealUserNoticeApproval.integ.test.ts
+packages/commercial/src/__tests__/usageDelegateRollup.integ.test.ts
+packages/commercial/src/__tests__/usageReport.integ.test.ts
+packages/commercial/src/__tests__/responseRatings.integ.test.ts

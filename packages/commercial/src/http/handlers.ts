@@ -127,7 +127,19 @@ export interface CommercialHttpDeps {
   mailer: Mailer
   redis: RateLimitRedis
   turnstileSecret?: string
+  /**
+   * 是否对真实用户强制人机验证(env TURNSTILE_ENFORCE,缺省=强制)。
+   * 与 turnstileBypass 是两回事:那个是测试旁路(生产禁用),这个是显式产品配置。
+   */
+  turnstileEnforce?: boolean
+  /** 全局旁路(env TURNSTILE_TEST_BYPASS),仅 dev/CI —— 生产由 config.ts fail-closed 拦死 */
   turnstileBypass?: boolean
+  /**
+   * 账号级人机验证白名单(env TURNSTILE_BYPASS_ACCOUNTS,config.ts 已规范化)。
+   * 生产环境唯一合法的 turnstile 旁路:只对白名单里的自动化账号生效,判定权威在
+   * `auth/turnstile.ts` 的 resolveTurnstileBypass,命中会打日志留痕。
+   */
+  turnstileBypassAccounts?: readonly string[]
   /**
    * Turnstile 公钥(client-side site key)。
    * 经 `GET /api/public/config` 暴露给前端 auth 模态加载 widget 用。
@@ -569,6 +581,8 @@ export async function handleRegister(
       mailer: deps.mailer,
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
+      turnstileBypassAccounts: deps.turnstileBypassAccounts,
+      turnstileEnforce: deps.turnstileEnforce,
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       verifyEmailUrlBase: deps.verifyEmailUrlBase,
@@ -652,6 +666,8 @@ export async function handleLogin(
       jwtSecret: deps.jwtSecret,
       turnstileSecret: deps.turnstileSecret,
       turnstileBypass: deps.turnstileBypass,
+      turnstileBypassAccounts: deps.turnstileBypassAccounts,
+      turnstileEnforce: deps.turnstileEnforce,
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       bindIp: ctx.authBoundIp,
@@ -967,6 +983,8 @@ export async function handleRequestPasswordReset(
         resetUrlBase: deps.resetPasswordUrlBase,
         turnstileSecret: deps.turnstileSecret,
         turnstileBypass: deps.turnstileBypass,
+        turnstileBypassAccounts: deps.turnstileBypassAccounts,
+        turnstileEnforce: deps.turnstileEnforce,
         // requestPasswordReset 里 remoteIp 只给 Turnstile。用 ctx.clientIp。
         remoteIp: ctx.clientIp,
         fetchImpl: deps.fetchImpl,
@@ -1158,7 +1176,15 @@ export async function handleGetPublicConfig(
   sendJson(res, 200, {
     turnstile_site_key: deps.turnstileSiteKey ?? "",
     // turnstile_bypass=true → 前端可直接发"占位 token",dev/CI 用;生产必须 false
-    turnstile_bypass: deps.turnstileBypass === true,
+    // (生产开这个键会被 config.ts 的危险开关扫描 fail-closed 拦在启动期)。
+    // **刻意只反映全局旁路,绝不掺入账号级白名单** —— 这个字段在**登录之前**下发,
+    // 那时服务端还不知道来访者是谁;若让它随白名单变真,等于把"哪些账号可绕过"
+    // 泄露给任意匿名请求,并且真实用户的 widget 也会被误关。账号级放行只发生在
+    // 服务端(resolveTurnstileBypass),前端在生产下永远渲染真 widget。
+    // 前端据此决定渲染真 widget 还是走占位 token。两种情况都要 true:
+    //   ① dev/CI 的全局测试旁路;② 产品配置显式不强制(TURNSTILE_ENFORCE=0)。
+    // 否则会出现"服务端不校验、前端却卡在 widget 上"的最坏组合。
+    turnstile_bypass: deps.turnstileBypass === true || deps.turnstileEnforce === false,
     require_email_verified: deps.requireEmailVerified === true,
     // FEATURE_REMOTE_SSH 灰度状态 —— 前端据此决定是否渲染执行环境切换器。
     feature_remote_ssh: deps.remoteSshEnabled === true,

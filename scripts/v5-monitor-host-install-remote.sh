@@ -179,9 +179,22 @@ if [[ -f "$state_file" ]]; then cp -a -- "$state_file" "$backup/monitor-state.js
 surface_rollback_armed=1
 
 # 先用新脚本只读探测；任何当前 bad 都在状态/通知写入前拒绝安装。
+#
+# V5MON_BACKUP_DIR 透传(2026-07-26):新增的 check_backup_fresh 读的是绝对路径
+# /var/backups/openclaude-v5。安装器此前把该路径当成不可变的生产假设,于是
+#   ①测试/预发宿主的备份目录布局不同 → 装不上;
+#   ②本机备份目录本来就不在默认位置时 → 门恒红。
+# 这与仓内"不许硬编码生产假设"的证据门铁律冲突(同 CADDY_HTTP_PORT 那条)。
+# 故:调用方给了就透传,没给则沿用脚本默认 = 生产行为逐字节不变。
+declare -a monitor_env=(
+  "V5MON_ENV_FILE=$env_file"
+  "V5MON_STATE_FILE=$state_file"
+  "V5MON_LOG_FILE=$monitor_log"
+)
+[[ -n "${V5MON_BACKUP_DIR:-}" ]] && monitor_env+=("V5MON_BACKUP_DIR=$V5MON_BACKUP_DIR")
+
 dry_out="$backup/dry-run.out"
-V5MON_ENV_FILE="$env_file" V5MON_STATE_FILE="$state_file" V5MON_LOG_FILE="$monitor_log" \
-  bash "$stage/v5-monitor.sh" --dry-run > "$dry_out"
+env "${monitor_env[@]}" bash "$stage/v5-monitor.sh" --dry-run > "$dry_out"
 if awk '$2 == "bad" { found=1 } END { exit found ? 0 : 1 }' "$dry_out"; then
   echo "FATAL:新 monitor dry-run 存在 bad check" >&2
   cat "$dry_out" >&2
@@ -192,8 +205,7 @@ old_bad="$(jq -c '[(.checks // {}) | to_entries[] | select(.value.status == "bad
   || { echo "FATAL:monitor state 不是合法 JSON" >&2; exit 1; }
 if [[ "$old_bad" == '["pool"]' ]]; then
   before_counts="$(monitor_counts)" || { echo "FATAL:无法读取迁移前 monitor 通知计数" >&2; exit 1; }
-  V5MON_ENV_FILE="$env_file" V5MON_STATE_FILE="$state_file" V5MON_LOG_FILE="$monitor_log" \
-    bash "$stage/v5-monitor.sh" --migrate-obsolete-pool-state
+  env "${monitor_env[@]}" bash "$stage/v5-monitor.sh" --migrate-obsolete-pool-state
   after_counts="$(monitor_counts)" || { echo "FATAL:无法读取迁移后 monitor 通知计数" >&2; exit 1; }
   [[ "$before_counts" == "$after_counts" ]] || {
     echo "FATAL:pool 状态迁移期间 monitor 通知计数变化(before=$before_counts after=$after_counts)，保留真实记录并回滚安装" >&2

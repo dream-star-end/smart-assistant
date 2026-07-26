@@ -1,0 +1,15 @@
+# pr-1 分片计数基线 —— 与 commercial-integ-pr-1.txt 配套,
+# 由 .github/scripts/diff-known-failures.sh 判据 C 消费。
+#
+# 顶层名字清单只覆盖顶层套件,这两个上界把灵敏度下沉到单个测试点:
+#   基线内套件**内部**新增失败 → 顶层名字集合不变,但 # fail 会涨 → 红。
+#
+# 规则:超上界即红(要抬必须在此追加理由行);低于上界打 warning,看到就把数字改小。
+# # skipped 没有上界:integ gate 的 G2 判据硬钉死必须为 0。
+#
+# 注意:fail_max 比的是 TAP 汇总行 `# fail N`(**测试点**数),不是顶层 not ok 条数。
+#   本片实测:顶层 not ok 0 条,但 # fail = 0 个测试点。
+# 2026-07-26 首次登记,取值来源 = CI artifact commercial-integ-tap-pr-1
+#   (run 30204619386)。
+fail_max = 0
+cancelled_max = 0

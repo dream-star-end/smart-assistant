@@ -4,7 +4,9 @@
 // 报障 —— turn canary 只覆盖 WS 契约,健康端点不点 UI,前端交互层是自动化盲区,
 // 用户成了人肉 canary。本脚本用真 Chromium(受信事件)走一遍核心用户旅程,作为
 // 部署后的 UI 层验收门:
-//   J1 UI 登录(真实表单;依赖线上 turnstile_bypass=true,同 turn canary 的 bypass 前提)
+//   J1 登录表单形态断言(widget 必须在 + turnstile_bypass 必须 false)+ API 登录种 cookie
+//      (2026-07-26 安全整改:全局旁路改账号级白名单,widget 对 headless 出交互挑战解不了,
+//       故登录本体走 API;表单形态仍被断言,反而多了一条'旁路被偷偷打开'的活体探针)
 //   J2 附件全链:「+」菜单 → 添加附件 → filechooser 真实弹出 → 真实上传 → chip done
 //   J3 目标全链:「+」菜单 → 创建目标 → active 可见 → 清除并恢复未设置
 //   J4 带附件发送:消息上屏 + 附件区清空
@@ -126,7 +128,13 @@ try {
   fatal(2, `浏览器不可用: ${err.message}`);
 }
 
-const page = await (await browser.newContext({ viewport: { width: 1280, height: 900 } })).newPage();
+const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+const page = await context.newPage();
+// Turnstile 装载探针:只看"有没有去拉 api.js",不看 DOM —— 理由见 J1 里的长注释。
+let turnstileScriptRequested = false;
+page.on("request", (req) => {
+  if (req.url().includes("challenges.cloudflare.com/turnstile")) turnstileScriptRequested = true;
+});
 let stepName = "init";
 async function step(name, fn) {
   stepName = name;
@@ -135,14 +143,79 @@ async function step(name, fn) {
 }
 
 try {
-  await step("J1 打开站点并 UI 登录(canary 账号)", async () => {
+  await step("J1 登录表单形态断言 + API 登录种 cookie 进入应用", async () => {
     await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: STEP_TIMEOUT });
     // 根路径 = 营销首页(未登录形态),导航「登录」进 AuthGate。.first():首页存在多个
     // 登录入口(导航+CTA)时取导航首个。
     await page.getByText("登录", { exact: true }).first().click({ timeout: STEP_TIMEOUT });
-    await page.getByPlaceholder("邮箱").fill(EMAIL, { timeout: STEP_TIMEOUT });
-    await page.getByPlaceholder("密码").fill(password);
-    await page.getByRole("button", { name: /^登录/ }).click();
+    await page.getByPlaceholder("邮箱").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await page.getByPlaceholder("密码").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+
+    // ── 2026-07-26 安全整改后的形态断言 ──────────────────────────────────
+    // 生产已把全局 TURNSTILE_TEST_BYPASS 摘掉(改账号级白名单),真实用户必须看到
+    // Cloudflare widget。这里正向断言 widget 存在 —— 它同时是"全局旁路是否被人偷偷
+    // 打开"的活体探针:旁路一旦回来,前端会走占位 token 路径,widget 消失,本断言即红。
+    const publicConfig = await page.evaluate(async () => {
+      const r = await fetch("/api/public/config");
+      return r.ok ? await r.json() : null;
+    });
+    if (!publicConfig) fatal(1, "J1 读 /api/public/config 失败");
+    // 人机验证的**强制与否是产品配置**(TURNSTILE_ENFORCE),两种状态都合法,所以断言
+    // 必须先读服务端真相再决定断什么 —— 无条件断言会在关闭态让部署门恒红。
+    if (publicConfig.turnstile_bypass === true) {
+      console.log("e2e-journey: · turnstile 当前不强制(bypass=true),跳过 widget 装载断言");
+    } else {
+      // 强制态:断言前端确实在装 widget —— 判据是"页面请求了 Turnstile 的 api.js"。
+      //
+      // 【为什么不断言 iframe/DOM,踩过两个坑】
+      //   ① 选择器不成立:Turnstile 的 iframe `src` 属性通常是 about:blank / blob,真实
+      //      URL 在内部,`iframe[src*="challenges.cloudflare.com"]` 即使在公网也匹配不到。
+      //   ② 环境结构性不可满足:本旅程经 ssh 隧道访问 http://127.0.0.1:<port>,而 Turnstile
+      //      sitekey 按域名限制 —— 实测该路径下 Cloudflare 报 `Error: 110200`(域名不在
+      //      白名单)。在这里断言 widget 可用是错的。
+      //   同期公网真实域名实测:widget 正常渲染 —— 真实用户不受影响,是断言写错了。
+      //
+      // 请求 api.js 这一条既域名无关(隧道下照样发出)、又能抓住真正的回归类:
+      // 前端不再渲染 widget(比如有人把占位 token 路径改成默认)。
+      if (!turnstileScriptRequested) {
+        fatal(1, "J1 强制态下未请求 Turnstile api.js —— 前端可能已不再渲染人机验证 widget");
+      }
+    }
+
+    // ── 登录本体走 API,不走表单 ──────────────────────────────────────────
+    // 为什么不填表单点登录:widget 会对 headless 浏览器出交互式挑战(这正是它该做的),
+    // 自动化解不了。canary 邮箱在 TURNSTILE_BYPASS_ACCOUNTS 白名单里,服务端放行占位
+    // token,所以 API 登录可用。拿到 refresh cookie 后种进 context,应用启动时用它换
+    // access token —— 与真实用户的会话恢复路径完全一致,后续 J2-J5 的 UI 覆盖不打折。
+    const res = await fetch(`${BASE}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: EMAIL, password, turnstile_token: "x" }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      fatal(
+        1,
+        `J1 API 登录失败 HTTP ${res.status}:${body.slice(0, 200)}` +
+          `(若是 TURNSTILE_FAILED,说明 ${EMAIL} 不在线上 TURNSTILE_BYPASS_ACCOUNTS 白名单里)`,
+      );
+    }
+    const setCookie = res.headers.getSetCookie?.() ?? [];
+    const rt = setCookie.map((c) => /(?:^|;\s*)oc_rt=([^;]+)/.exec(c)?.[1]).find(Boolean);
+    if (!rt) fatal(1, "J1 登录响应里没有 oc_rt refresh cookie");
+    await context.addCookies([
+      {
+        name: "oc_rt",
+        value: rt,
+        domain: "127.0.0.1",
+        path: "/api/auth",
+        httpOnly: true,
+        secure: false,
+        sameSite: "Lax",
+      },
+    ]);
+    await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: STEP_TIMEOUT });
+
     // 登录成功的判据 = 侧栏「新建会话」出现(composer placeholder 随 agent 名动态变化,
     // 不可作判据 —— 实测 canary 落在已有会话时 placeholder 是「和「全能助手」对话...」)。
     await page.getByText("新建会话", { exact: true }).first().waitFor({ state: "visible", timeout: STEP_TIMEOUT });

@@ -9,18 +9,39 @@ v3 商业版后端 package。承载用户、账务、订单/支付、模型代�
 | Layer | 命令 | 依赖 |
 |---|---|---|
 | Unit | `npm run test:commercial:unit` | 无外部依赖 |
-| Integ (default) | `npm run test:commercial:integ` | PG/Redis 不可达时**静默 skip** |
-| Integ (strict) | `npm run test:commercial:integ:strict` | PG/Redis 必达;不可达 fail-fast |
+| Integ (全量) | `npm run test:commercial:integ` | PG/Redis **必达**;不可达 fail-fast |
+| Integ (梯队/分片) | `npm run test:commercial:integ:shard -- pr` | 同上,只跑 PR 门第一梯队 |
 
-`*.integ.test.ts` 文件按约定在 PG/Redis 不可达时静默 skip,以便本地 unit 测试不被 fixture 拖累。`:strict` 模式设 `REQUIRE_TEST_DB=1`,**强制** PG/Redis 必达,作为 CI 或本地"确认 integ 真跑过"的入口。
+`:strict` 是 `:integ` 的历史别名,现在两者等价 —— **fail-open 已废除**。
 
-### Strict 的语义
+> 2026-07-26 门禁审计前:`test:commercial:integ` 默认不设 `REQUIRE_TEST_DB`,
+> PG 不可达时整层静默 skip 且 **exit 0**(实测 `settleUsage.integ` 在坏连接串下
+> `# tests 16 / pass 0 / fail 0 / skipped 16`,EXITCODE=0),只有 `:strict` 才是真跑。
+> 而 `test:commercial` / `test` / `check` 聚合链串的全是 fail-open 那个版本 ——
+> 于是整层在任何入口都从未被强制执行过。现已在 `test:commercial:integ` 本身
+> `export REQUIRE_TEST_DB=1`,与 `.github/scripts/commercial-unit-gate.sh` 对齐。
 
-`:strict` 只覆盖**依赖 PG/Redis 的 integ**(占 commercial integ 绝大多数)。**仍可能 skip 的**:
+### fixture fail-closed 覆盖到哪
 
-- 依赖 Docker socket 的 integ(如 `agentSupervisor.integ.test.ts`、`v3NetworkIsolation.integ.test.ts`)— 这些用 `process.env.DOCKER_HOST` 或 socket 路径探测,strict 不影响其 skip 行为。
+fail-closed 必须**对每种 fixture 逐一成立**,漏一种就等于整条链 fail-open:
 
-简言之:`:strict` = "DB/Redis 强制",**不是** "所有 commercial integ 绝不 skip"。
+- **PG** — `REQUIRE_TEST_DB=1`(或 `CI=true`):107/107 个需要 DB 的文件已覆盖。
+- **Redis** — 用到 `TEST_REDIS_URL` 的 20 个文件此前只有 6 个会抛,其余 14 个缺
+  Redis 时静默降级(HTTP handler 干脆不装配,"绿"只证明了没跑)。现已统一补
+  `if (!redis && REQUIRE_TEST_DB) throw`。
+- **Docker socket** — `agentSupervisor.integ.test.ts` 用
+  `REQUIRE_TEST_DOCKER=1`(CI 上恒真;GitHub runner 自带 dockerd)。本地开发机
+  没有 docker 时仍允许 skip。
+  (`v3NetworkIsolation.integ.test.ts` 已于同批删除:它自己复制一份 HostConfig
+  字面量再去问内核,验的是 Linux 实现了 cap-drop,不是我们的 supervisor 传了
+  cap-drop —— 把 `v3supervisor.ts` 的 CapDrop 删光它照样全绿。真正的守门在
+  `v3Supervisor.test.ts` 断言 `createContainer` 实参,且早已进 CI。)
+
+### 分层执行:哪些进 PR 门,哪些进夜跑
+
+见 `.github/integ-tiers/README.md` 与 `docs/V5_CI.md` §commercial-integ。
+一句话:22 个文件进 PR 阻塞门,87 个进 nightly;新增 `*.integ.test.ts`
+必须登记进某个梯队,否则 `npm run lint:integ-tiers` 红。
 
 ### 本地起 PG + Redis
 

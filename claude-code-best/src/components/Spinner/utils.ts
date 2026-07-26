@@ -1,13 +1,15 @@
-import type { RGBColor as RGBColorString } from '../../ink/styles.js'
+import type { RGBColor as RGBColorString } from '@anthropic/ink'
 import type { RGBColor as RGBColorType } from './types.js'
 
 export function getDefaultCharacters(): string[] {
   if (process.env.TERM === 'xterm-ghostty') {
-    return ['·', '✢', '✳', '✶', '✻', '*'] // Use * instead of ✽ for Ghostty because the latter renders in a way that's slightly offset
+    return ['·', '✢', '✱', '✶', '✻', '*'] // ✱ replaces ✳ (emoji, renders offset in Ghostty); * replaces ✽ (same)
   }
+  // ✳ (U+2733) is matched by emoji-regex in Node.js → stringWidth returns 2 instead of 1,
+  // causing layout jitter when the spinner cycles frames. ✱ (U+2731) is visually similar but not emoji.
   return process.platform === 'darwin'
-    ? ['·', '✢', '✳', '✶', '✻', '✽']
-    : ['·', '✢', '*', '✶', '✻', '✽']
+    ? ['·', '✢', '✱', '✶', '✻', '✽']
+    : ['·', '✢', '✱', '✶', '✻', '✽']
 }
 
 // Interpolate between two RGB colors

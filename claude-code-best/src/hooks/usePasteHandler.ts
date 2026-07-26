@@ -2,7 +2,7 @@ import { basename } from 'path'
 import React from 'react'
 import { logError } from 'src/utils/log.js'
 import { useDebounceCallback } from 'usehooks-ts'
-import type { InputEvent, Key } from '../ink.js'
+import type { InputEvent, Key } from '@anthropic/ink'
 import {
   getImageFromClipboard,
   isImageFilePath,
@@ -255,7 +255,15 @@ export function usePasteHandler({
       (input.length > PASTE_THRESHOLD ||
         pastePendingRef.current ||
         hasImageFilePath ||
-        isFromPaste)
+        isFromPaste ||
+        (input.length >= 3 &&
+          !key.return &&
+          !key.tab &&
+          !key.escape &&
+          !key.upArrow &&
+          !key.downArrow &&
+          !key.leftArrow &&
+          !key.rightArrow))
 
     if (shouldHandleAsPaste) {
       pastePendingRef.current = true

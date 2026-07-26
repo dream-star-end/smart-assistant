@@ -271,11 +271,15 @@ export async function getAgentAuditStats(input: {
   // container table has no authoritative lifecycle-end timestamp, so this
   // must never be presented as historical window completeness or an SLA.
   const coverageParams: unknown[] = [now];
-  const expectedWhere = ["runtime_channel='v5'", "state='active'"];
+  // runtime_channel / state 两条谓词直接写进 SQL 字面量(不再经数组拼接):
+  // 读 agent_containers 必须显式过滤 state,否则 vanished 行会被算进"在线机队"
+  // 分母,admin 覆盖率看板当场显示错的数。lint-agent-containers-sql 现在能看见它。
+  const expectedWhere: string[] = [];
   if (userId !== null) {
     coverageParams.push(userId);
     expectedWhere.push(`user_id = $${coverageParams.length}`);
   }
+  const expectedExtraWhere = expectedWhere.length > 0 ? ` AND ${expectedWhere.join(" AND ")}` : "";
   const coverageResult = await query<{
     expected_containers: string;
     covered_containers: string;
@@ -283,7 +287,8 @@ export async function getAgentAuditStats(input: {
     ended_at: Date | null;
   }>(
     `WITH expected AS (
-       SELECT id FROM agent_containers WHERE ${expectedWhere.join(" AND ")}
+       SELECT id FROM agent_containers
+        WHERE runtime_channel='v5' AND state='active'${expectedExtraWhere}
      ), latest_run AS (
        SELECT DISTINCT ON (r.container_id)
               r.container_id, r.reporter_run_id

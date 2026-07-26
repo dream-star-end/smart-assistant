@@ -55,9 +55,11 @@ monitor oneshot 与 alert-fail 后才切换；失败会恢复原 unit、指针�
 | `http_candidate_v5` | candidate 真实 serving 时独立 GET 其 healthz | 同上；不 serving 时记 `ok/not-serving` | 双 lane 独立故障边，候选坏不会被 active 正常掩盖；不会误命中 `http_v5` 的全站自动修复 policy |
 | `http_egress` | `GET 172.31.0.1:18892/internal/v5/egress-health` | 非 `"ok":true` + `role:"egress"` | 容器出站面探活(容器网段视角) |
 | `public_route` | `Host: claudeai.chat GET 127.0.0.1/healthz` | 非 `"ok":true` + `channel:"v5"` | 覆盖 Caddy→v5 的真实公网路由，能直接发现 Cloudflare 502 的源头 |
-| `http_v3` | `GET 127.0.0.1:18789/healthz` | 非 `"ok":true` | v3 已退役，默认不运行；仅显式 `V5MON_CHECK_V3=1` 时保留兼容检查 |
 | `disk_root` / `disk_var` | `df /` 与 `df /var` 使用率 | >85% | PG/docker/日志都在盘上;85% 留出扩容反应时间(线上当前 73%) |
 | `mem` | MemAvailable/MemTotal | <10% | OOM 前兆;容器池机器内存吃紧会连环 OOM kill |
+| `failed_units` | `systemctl list-units --state=failed` | 有任何 failed 单元 | **整类根治**:单元级 `OnFailure=` 只能救已配的那几个,新单元照样漏。2026-07-26 实测:DR 两个单元连败 43 小时无人知晓,根因就是 `OnFailure=` 为空。有了本项,新单元零配置自动纳入监控 |
+| `backup_fresh` | `/var/backups/openclaude-v5` 最新子目录 mtime 年龄 | >30h(`BACKUP_MAX_AGE_HOURS`) | **critical**。kl-hk 异地容灾 2026-07-26 退役后,本地每日备份是**唯一**数据保护面,它静默停摆 = 零保护。备份每日 20:00 UTC 跑,30h 阈值容忍一次延迟但抓得住"连续两天没跑" |
+| `mem_oversubscribe` | Σ(容器 `HostConfig.Memory`) / MemTotal | >1.5 倍(`MEM_OVERSUB_MAX_RATIO`) | 结构性风险,`mem` 那项看不见:2026-07-26 实测 24 容器 × 4GiB = 96GiB limit vs 物理 31GB(5 倍),平时中位只用 236MB 毫无征兆,一旦几个容器同时吃满就是宿主级 OOM(内核不挑对象) |
 | `pool` | 运行中 v5-ccb 的 managed/channel/uid 身份标签 | 任一缺失/漂移，或 docker daemon 不响应 | 容器数量随真实用户增长，不设任意硬上限；实际容量由 `disk_root`/`disk_var`/`mem` 判定，合成 canary 也按同一身份契约纳管 |
 | `image` | `OC_RUNTIME_IMAGE`(env)必须在 `docker images` | 不存在 | tag 漂移(镜像被误删/env 手滑)→ 起新容器全挂,平时无症状,出事才发现 |
 
@@ -82,6 +84,36 @@ active。`deploy_state` 读取失败或字段非法时，独立 `deploy_state` c
 - **零输出免单**(`proxyBilling.ts` waivedNoOutput):`usage_records` `status='success' AND cost_credits=0 AND output_tokens=0 AND (input/cache tokens > 0)`;
 - **turn 级冲正退款**(`billing/refund.ts`):`credit_ledger` `reason='refund' AND ref_type='usage_record'`,按 `ref_id` 去重计笔。
 
+## 异地容灾:当前为 0(2026-07-26 起)
+
+**kl-hk 主机已下线**(hostname 无法解析),异地容灾链路于 2026-07-26 退役:
+
+- `v5-dr-sync.service` / `v5-dr-volumes.service` 及其 timer 已 disable + 归档删除
+- PG 物理复制槽 `v5_hk_dr` 已 drop —— 退役前它 inactive 且滞留 WAL 1334MB(`wal_status=extended`),
+  drop 后 `pg_wal` 由 1.4G 立即回收到 81M
+- 归档位置:`/opt/openclaude/archive/dr-kl-hk-decommissioned-20260726/`(含原 unit、原脚本与 README)
+
+### 现状必须被如实陈述
+
+当前**唯一**数据保护是 `openclaude-v5-backup.timer`(每日 20:00 UTC → `/var/backups/openclaude-v5`),
+它与生产库同处 **`/dev/vda1` 同一块盘、同一台机**。这只防"误删/误改",**不防机器级故障**。
+在重建异地容灾之前,不得对内对外声称具备容灾能力。新增的 `backup_fresh` 探针(critical)
+保证这唯一一层不会再静默停摆。
+
+### 重建 DR 时必须先修的三个缺陷
+
+退役的旧链路有三个已知缺陷,重建时不能照抄:
+
+1. **明文推送凭据**:`v5-dr-sync.sh` 用 `rsync -az` 把 `/root/.secrets/` 与 `/etc/openclaude/`
+   (含 JWT_SECRET、KMS_KEY、支付密钥、22 个模型 key)直接推到**与第三方业务共机**的目标主机,
+   全程无加密。重建必须先过 age/gpg 非对称加密,私钥离线保存。
+2. **只有发送侧自证**:成功与否只看本机脚本退出码,接收侧没有任何探针。
+   必须加接收侧的产物新鲜度检查(目标机最新备份 mtime),否则"推过去但落地失败"看不出来。
+3. **`OnFailure=` 未配**:这是连败 43 小时无人知晓的直接原因。新单元必须配
+   `OnFailure=v3-timer-failure-alert@%n.service`;同时 `failed_units` 探针已作为整类兜底。
+
+重建后必须做一次**真实恢复演练**(从备份拉起一个可用实例)才算完成,不能只验证"文件推过去了"。
+
 ## 告警通道
 
 **首选:站内信**。脚本用 psql 直接 INSERT 共享 PG 的 `inbox_messages`(0046 迁移):
@@ -99,7 +131,8 @@ active。`deploy_state` 读取失败或字段非法时，独立 `deploy_state` c
 全部阈值是两个脚本顶部的显式常量,改完无需 reload(oneshot 每次全新执行):
 
 ```
-scripts/v5-monitor.sh:      DISK_MAX_PCT / MEM_MIN_AVAIL_PCT / REALERT_SECS
+scripts/v5-monitor.sh:      DISK_MAX_PCT / MEM_MIN_AVAIL_PCT / REALERT_SECS /
+                            BACKUP_MAX_AGE_HOURS / MEM_OVERSUB_MAX_RATIO
 scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_MIN_SAMPLES / CACHE_SAMPLE_MIN_INPUT / CACHE_MIN_RECORDS / CACHE_ABSOLUTE_LOW_BPS / CACHE_REGRESSION_LOW_BPS / CACHE_DROP_MIN_BPS
 ```
 

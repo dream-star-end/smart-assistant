@@ -7,6 +7,7 @@ import type { Message } from '../../types/message.js';
 import { getCwd } from '../../utils/cwd.js';
 import { renderMessagesToPlainText } from '../../utils/exportRenderer.js';
 import { writeFileSync_DEPRECATED } from '../../utils/slowOperations.js';
+
 function formatTimestamp(date: Date): string {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -16,13 +17,17 @@ function formatTimestamp(date: Date): string {
   const seconds = String(date.getSeconds()).padStart(2, '0');
   return `${year}-${month}-${day}-${hours}${minutes}${seconds}`;
 }
+
 export function extractFirstPrompt(messages: Message[]): string {
   const firstUserMessage = messages.find(msg => msg.type === 'user');
+
   if (!firstUserMessage || firstUserMessage.type !== 'user') {
     return '';
   }
+
   const content = firstUserMessage.message?.content;
   let result = '';
+
   if (typeof content === 'string') {
     result = content.trim();
   } else if (Array.isArray(content)) {
@@ -37,20 +42,30 @@ export function extractFirstPrompt(messages: Message[]): string {
   if (result.length > 50) {
     result = result.substring(0, 49) + '…';
   }
+
   return result;
 }
+
 export function sanitizeFilename(text: string): string {
   // Replace special characters with hyphens
-  return text.toLowerCase().replace(/[^a-z0-9\s-]/g, '') // Remove special chars
-  .replace(/\s+/g, '-') // Replace spaces with hyphens
-  .replace(/-+/g, '-') // Replace multiple hyphens with single
-  .replace(/^-|-$/g, ''); // Remove leading/trailing hyphens
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '') // Remove special chars
+    .replace(/\s+/g, '-') // Replace spaces with hyphens
+    .replace(/-+/g, '-') // Replace multiple hyphens with single
+    .replace(/^-|-$/g, ''); // Remove leading/trailing hyphens
 }
+
 async function exportWithReactRenderer(context: ToolUseContext): Promise<string> {
   const tools = context.options.tools || [];
   return renderMessagesToPlainText(context.messages, tools);
 }
-export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContext, args: string): Promise<React.ReactNode> {
+
+export async function call(
+  onDone: LocalJSXCommandOnDone,
+  context: ToolUseContext,
+  args: string,
+): Promise<React.ReactNode> {
   // Render the conversation content
   const content = await exportWithReactRenderer(context);
 
@@ -59,10 +74,11 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
   if (filename) {
     const finalFilename = filename.endsWith('.txt') ? filename : filename.replace(/\.[^.]+$/, '') + '.txt';
     const filepath = join(getCwd(), finalFilename);
+
     try {
       writeFileSync_DEPRECATED(filepath, content, {
         encoding: 'utf-8',
-        flush: true
+        flush: true,
       });
       onDone(`Conversation exported to: ${filepath}`);
       return null;
@@ -75,6 +91,7 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
   // Generate default filename from first prompt or timestamp
   const firstPrompt = extractFirstPrompt(context.messages);
   const timestamp = formatTimestamp(new Date());
+
   let defaultFilename: string;
   if (firstPrompt) {
     const sanitized = sanitizeFilename(firstPrompt);
@@ -84,7 +101,13 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
   }
 
   // Return the dialog component when no args provided
-  return <ExportDialog content={content} defaultFilename={defaultFilename} onDone={result => {
-    onDone(result.message);
-  }} />;
+  return (
+    <ExportDialog
+      content={content}
+      defaultFilename={defaultFilename}
+      onDone={result => {
+        onDone(result.message);
+      }}
+    />
+  );
 }

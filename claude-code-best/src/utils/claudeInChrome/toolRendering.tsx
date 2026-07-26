@@ -1,20 +1,44 @@
 import * as React from 'react';
 import { MessageResponse } from '../../components/MessageResponse.js';
-import { supportsHyperlinks } from '../../ink/supports-hyperlinks.js';
-import { Link, Text } from '../../ink.js';
-import { renderToolResultMessage as renderDefaultMCPToolResultMessage } from '../../tools/MCPTool/UI.js';
+import { supportsHyperlinks } from '@anthropic/ink';
+import { Link, Text } from '@anthropic/ink';
+import { renderToolResultMessage as renderDefaultMCPToolResultMessage } from '@claude-code-best/builtin-tools/tools/MCPTool/UI.js';
 import type { MCPToolResult } from '../../utils/mcpValidation.js';
 import { truncateToWidth } from '../format.js';
 import { trackClaudeInChromeTabId } from './common.js';
+
 export type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 /**
  * All tool names from BROWSER_TOOLS in @ant/claude-for-chrome-mcp.
  * Keep in sync with the package's BROWSER_TOOLS array.
  */
-export type ChromeToolName = 'javascript_tool' | 'read_page' | 'find' | 'form_input' | 'computer' | 'navigate' | 'resize_window' | 'gif_creator' | 'upload_image' | 'get_page_text' | 'tabs_context_mcp' | 'tabs_create_mcp' | 'update_plan' | 'read_console_messages' | 'read_network_requests' | 'shortcuts_list' | 'shortcuts_execute';
+export type ChromeToolName =
+  | 'javascript_tool'
+  | 'read_page'
+  | 'find'
+  | 'form_input'
+  | 'computer'
+  | 'navigate'
+  | 'resize_window'
+  | 'gif_creator'
+  | 'upload_image'
+  | 'get_page_text'
+  | 'tabs_context_mcp'
+  | 'tabs_create_mcp'
+  | 'update_plan'
+  | 'read_console_messages'
+  | 'read_network_requests'
+  | 'shortcuts_list'
+  | 'shortcuts_execute';
+
 const CHROME_EXTENSION_FOCUS_TAB_URL_BASE = 'https://clau.de/chrome/tab/';
-function renderChromeToolUseMessage(input: Record<string, unknown>, toolName: ChromeToolName, verbose: boolean): React.ReactNode {
+
+function renderChromeToolUseMessage(
+  input: Record<string, unknown>,
+  toolName: ChromeToolName,
+  verbose: boolean,
+): React.ReactNode {
   const tabId = input.tabId;
   if (typeof tabId === 'number') {
     trackClaudeInChromeTabId(tabId);
@@ -22,6 +46,7 @@ function renderChromeToolUseMessage(input: Record<string, unknown>, toolName: Ch
 
   // Build secondary info based on tool type and input
   const secondaryInfo: string[] = [];
+
   switch (toolName) {
     case 'navigate':
       if (typeof input.url === 'string') {
@@ -33,15 +58,22 @@ function renderChromeToolUseMessage(input: Record<string, unknown>, toolName: Ch
         }
       }
       break;
+
     case 'find':
       if (typeof input.query === 'string') {
         secondaryInfo.push(`pattern: ${truncateToWidth(input.query, 30)}`);
       }
       break;
+
     case 'computer':
       if (typeof input.action === 'string') {
         const action = input.action;
-        if (action === 'left_click' || action === 'right_click' || action === 'double_click' || action === 'middle_click') {
+        if (
+          action === 'left_click' ||
+          action === 'right_click' ||
+          action === 'double_click' ||
+          action === 'middle_click'
+        ) {
           if (typeof input.ref === 'string') {
             secondaryInfo.push(`${action} on ${input.ref}`);
           } else if (Array.isArray(input.coordinate)) {
@@ -64,16 +96,19 @@ function renderChromeToolUseMessage(input: Record<string, unknown>, toolName: Ch
         }
       }
       break;
+
     case 'gif_creator':
       if (typeof input.action === 'string') {
         secondaryInfo.push(`${input.action}`);
       }
       break;
+
     case 'resize_window':
       if (typeof input.width === 'number' && typeof input.height === 'number') {
         secondaryInfo.push(`${input.width}x${input.height}`);
       }
       break;
+
     case 'read_console_messages':
       if (typeof input.pattern === 'string') {
         secondaryInfo.push(`pattern: ${truncateToWidth(input.pattern, 20)}`);
@@ -82,16 +117,19 @@ function renderChromeToolUseMessage(input: Record<string, unknown>, toolName: Ch
         secondaryInfo.push('errors only');
       }
       break;
+
     case 'read_network_requests':
       if (typeof input.urlPattern === 'string') {
         secondaryInfo.push(`pattern: ${truncateToWidth(input.urlPattern, 20)}`);
       }
       break;
+
     case 'shortcuts_execute':
       if (typeof input.shortcutId === 'string') {
         secondaryInfo.push(`shortcut_id: ${input.shortcutId}`);
       }
       break;
+
     case 'javascript_tool':
       // In verbose mode, show the full code
       if (verbose && typeof input.text === 'string') {
@@ -99,6 +137,7 @@ function renderChromeToolUseMessage(input: Record<string, unknown>, toolName: Ch
       }
       // In non-verbose mode, return empty string to preserve View Tab layout
       return '';
+
     case 'tabs_create_mcp':
     case 'tabs_context_mcp':
     case 'form_input':
@@ -111,6 +150,7 @@ function renderChromeToolUseMessage(input: Record<string, unknown>, toolName: Ch
       // Return empty string (not null) to ensure tool header still renders.
       return '';
   }
+
   return secondaryInfo.join(', ') || null;
 }
 
@@ -128,17 +168,20 @@ function renderChromeViewTabLink(input: unknown): React.ReactNode {
   if (typeof input !== 'object' || input === null || !('tabId' in input)) {
     return null;
   }
-  const tabId = typeof input.tabId === 'number' ? input.tabId : typeof input.tabId === 'string' ? parseInt(input.tabId, 10) : NaN;
+  const tabId =
+    typeof input.tabId === 'number' ? input.tabId : typeof input.tabId === 'string' ? parseInt(input.tabId, 10) : NaN;
   if (isNaN(tabId)) {
     return null;
   }
   const linkUrl = `${CHROME_EXTENSION_FOCUS_TAB_URL_BASE}${tabId}`;
-  return <Text>
+  return (
+    <Text>
       {' '}
       <Link url={linkUrl}>
         <Text color="subtle">[View Tab]</Text>
       </Link>
-    </Text>;
+    </Text>
+  );
 }
 
 /**
@@ -146,12 +189,15 @@ function renderChromeViewTabLink(input: unknown): React.ReactNode {
  * Shows a brief summary for successful results. Errors are handled by
  * the default renderToolUseErrorMessage when is_error is set.
  */
-export function renderChromeToolResultMessage(output: MCPToolResult, toolName: ChromeToolName, verbose: boolean): React.ReactNode {
+export function renderChromeToolResultMessage(
+  output: MCPToolResult,
+  toolName: ChromeToolName,
+  verbose: boolean,
+): React.ReactNode {
   if (verbose) {
-    return renderDefaultMCPToolResultMessage(output, [], {
-      verbose
-    });
+    return renderDefaultMCPToolResultMessage(output, [], { verbose });
   }
+
   let summary: string | null = null;
   switch (toolName) {
     case 'navigate':
@@ -206,11 +252,15 @@ export function renderChromeToolResultMessage(output: MCPToolResult, toolName: C
       summary = 'Plan updated';
       break;
   }
+
   if (summary) {
-    return <MessageResponse height={1}>
+    return (
+      <MessageResponse height={1}>
         <Text dimColor>{summary}</Text>
-      </MessageResponse>;
+      </MessageResponse>
+    );
   }
+
   return null;
 }
 
@@ -220,13 +270,13 @@ export function renderChromeToolResultMessage(output: MCPToolResult, toolName: C
  */
 export function getClaudeInChromeMCPToolOverrides(toolName: string): {
   userFacingName: (input?: Record<string, unknown>) => string;
-  renderToolUseMessage: (input: Record<string, unknown>, options: {
-    verbose: boolean;
-  }) => React.ReactNode;
+  renderToolUseMessage: (input: Record<string, unknown>, options: { verbose: boolean }) => React.ReactNode;
   renderToolUseTag: (input: Partial<Record<string, unknown>>) => React.ReactNode;
-  renderToolResultMessage: (output: string | MCPToolResult, progressMessagesForMessage: unknown[], options: {
-    verbose: boolean;
-  }) => React.ReactNode;
+  renderToolResultMessage: (
+    output: string | MCPToolResult,
+    progressMessagesForMessage: unknown[],
+    options: { verbose: boolean },
+  ) => React.ReactNode;
 } {
   return {
     userFacingName(_input?: Record<string, unknown>) {
@@ -234,28 +284,25 @@ export function getClaudeInChromeMCPToolOverrides(toolName: string): {
       const displayName = toolName.replace(/_mcp$/, '');
       return `Claude in Chrome[${displayName}]`;
     },
-    renderToolUseMessage(input: Record<string, unknown>, {
-      verbose
-    }: {
-      verbose: boolean;
-    }): React.ReactNode {
+    renderToolUseMessage(input: Record<string, unknown>, { verbose }: { verbose: boolean }): React.ReactNode {
       return renderChromeToolUseMessage(input, toolName as ChromeToolName, verbose);
     },
     renderToolUseTag(input: Partial<Record<string, unknown>>): React.ReactNode {
       return renderChromeViewTabLink(input);
     },
-    renderToolResultMessage(output: string | MCPToolResult, _progressMessagesForMessage: unknown[], {
-      verbose
-    }: {
-      verbose: boolean;
-    }): React.ReactNode {
+    renderToolResultMessage(
+      output: string | MCPToolResult,
+      _progressMessagesForMessage: unknown[],
+      { verbose }: { verbose: boolean },
+    ): React.ReactNode {
       if (!isMCPToolResult(output)) {
         return null;
       }
       return renderChromeToolResultMessage(output, toolName as ChromeToolName, verbose);
-    }
+    },
   };
 }
+
 function isMCPToolResult(output: string | MCPToolResult): output is MCPToolResult {
   return typeof output === 'object' && output !== null;
 }

@@ -1,0 +1,44 @@
+# commercial-unit 计数基线 —— 与 commercial-unit.txt 配套,由
+# .github/scripts/diff-known-failures.sh 判据 C 消费。
+#
+# 为什么要有这个文件:
+#   顶层名字清单(commercial-unit.txt)只覆盖 26 个顶层套件名,而一次 commercial
+#   unit 跑的是 4696 个测试点。2026-07-26 门禁审计实测:主干"全绿"的 run
+#   30190800591 里,顶层 `not ok` 只有 19 条,同一份 TAP 的 `# fail` 是 61、
+#   `# cancelled` 是 39 —— 也就是说 61 个真实失败 + 39 个被父套件带走的用例
+#   全部不在判据内。只要新失败落在**已登记的顶层套件内部**,旧门一个都看不见。
+#
+#   这两个上界把灵敏度从 19 提到 4696,而且不用把基线粒度改成逐用例。
+#
+# 格式:`key = value`,# 开头是注释。目前认两个键:
+#   fail_max      —— TAP `# fail N` 的上界
+#   cancelled_max —— TAP `# cancelled N` 的上界(cancelledByParent)
+#
+# 规则:
+#   · 超过上界 → CI 红。要抬高必须写明理由(在下面的"变更记录"里追加一行),
+#     并且只有"确认是既有失败被环境变化新暴露"才允许抬,回归一律修代码。
+#   · 低于上界 → 门打 warning 提示收紧。**看到 warning 就把数字改小**,
+#     否则省下来的余量马上会被下一次回归悄悄吃掉。
+#   · `# skipped` 没有上界:门里硬钉死必须为 0(fixture 没起来 = 全 skip = 假绿)。
+#
+# 变更记录:
+#   2026-07-26  首次登记 fail_max=61 / cancelled_max=39。
+#               取值来源 = 主干最近一次全绿 run 30190800591 的 commercial-unit
+#               TAP artifact(`# tests 4696 / # pass 4590 / # fail 61 /
+#               # cancelled 39 / # skipped 0 / # todo 6`)。
+#               注意:同一批审计里另有 agent 在修 v3Supervisor / v3migration /
+#               preCheck 夹具,那批合入后这两个数会明显下降,届时按 warning 提示
+#               一次性收紧。
+#   2026-07-26  夹具批合入后一次性收紧到 fail_max=0 / cancelled_max=0。
+#               依据:同批把 known-failures 从 26 行清到 2 行,判据是全量 gate 实测
+#               `known & still failing: 0`(26 条全部实跑通过),`# cancelled` 由 39
+#               归零。本机残留的 3 个 fail 全部是本 worktree 未 install
+#               `@tencent-connect/qqbot-nodejs` 导致的 ERR_MODULE_NOT_FOUND,CI 走
+#               `npm ci` 从 lock 装,不命中。
+#               **这两个 0 是故意设成"最紧"的**:如果 CI 首跑显示非零,不要习惯性
+#               抬高——先看 TAP artifact 确认那是环境问题还是真回归;确属环境且与本
+#               批无关,才按 artifact 据实登记并在此追加一行说明(基线真值只认 CI
+#               artifact,不认本机)。
+
+fail_max = 0
+cancelled_max = 0

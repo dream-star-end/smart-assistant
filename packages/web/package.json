@@ -1,6 +1,7 @@
 {
   "name": "@openclaude/web",
   "version": "0.1.0",
+  "description": "个人版 / v3 vanilla 前端。v5 master 不加载(web root=web-react/dist),但 v5 用户容器内的 CLI 仍以它为 web root —— 见 README.md。不在 v5 门禁范围。",
   "type": "module",
   "main": "./public/index.html"
 }

@@ -80,6 +80,10 @@ export async function getContainersPoolStats(): Promise<ContainersPoolStats> {
 
   // 订阅到期计数走 agent_subscriptions 独立查,因为 agent_containers 没存 end_at。
   // 只统计还在用的 v2 容器(status != 'removed')且订阅 active 且 7 天内到期。
+  // lint-agent-containers-sql: allow — 纯 v2 腿(subscription_id IS NOT NULL):
+  // v2 行的权威生命周期列是 `status`(下面 c.status <> 'removed')。`state` 是 0012
+  // 给全表加的列、v2 老行只是吃了 DEFAULT 'active',对 v2 不承载语义,写上去反而
+  // 制造"已按 v3 口径过滤"的错觉。口径只喂 admin 的"7 天内到期"计数。
   const e = await query<{ expiring_7d: string }>(
     `SELECT COUNT(*) AS expiring_7d
        FROM agent_containers c

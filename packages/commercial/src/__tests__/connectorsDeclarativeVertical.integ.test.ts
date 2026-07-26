@@ -43,6 +43,7 @@ import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import { approveMarketplaceConnectorVersion } from '../marketplace/connectorReview.js'
 import { installApprovedVersion } from '../marketplace/marketplaceDb.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -72,17 +73,7 @@ async function probe(): Promise<boolean> {
 }
 
 async function dropAllTables(): Promise<void> {
-  const db = await query<{ db: string }>('SELECT current_database() AS db')
-  const name = db.rows[0]?.db ?? ''
-  if (!/_test$/.test(name)) throw new Error(`refusing to drop tables on non-test database: ${name}`)
-  await query(`
-    DO $$ DECLARE r RECORD;
-    BEGIN
-      FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
-        EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
-      END LOOP;
-    END $$;
-  `)
+  await resetTestSchemaForTest()
 }
 
 // ─── 受控本地上游 ────────────────────────────────────────────────────────────
@@ -314,7 +305,6 @@ before(async () => {
   }
   await resetPool()
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 10 }))
-  await query('CREATE SCHEMA IF NOT EXISTS public')
   await dropAllTables()
   await runMigrations() // 全量迁移含 0136
 })

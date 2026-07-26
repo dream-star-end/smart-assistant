@@ -69,6 +69,63 @@ const turnstileSecret = z.string().trim().min(1).optional();
 const turnstileBypass = z.enum(["0", "1"]).optional().transform((v) => v === "1");
 
 /**
+ * TURNSTILE_ENFORCE —— 人机验证**是否对真实用户强制**(默认 1 = 强制)。
+ *
+ * 为什么需要它、以及它和 TURNSTILE_TEST_BYPASS 的本质区别:
+ * 后者自称"测试旁路、生产严禁开启",却在生产 env 里躺了很久 —— 名字撒谎、状态不可审计,
+ * 所以被 loadConfig 的危险开关扫描 fail-closed 钉死。本键是**显式的产品配置**:
+ * 语义诚实(就是"要不要强制")、默认强制、关闭时启动日志大声播报、并在
+ * `/api/public/config` 如实下发给前端(前端据此决定渲染真 widget 还是占位 token),
+ * 不存在"以为开着其实关着"的状态。
+ *
+ * 【当前为何在生产设为 0 —— 临时方案 + 已知债 + 偿还触发条件】
+ * 2026-07-26 实测:线上 Turnstile widget 配的是 **Managed 交互模式**,
+ * 有头浏览器 + 真实 Windows Chrome UA + 屏蔽 webdriver 标记,分别经机房 IP 与
+ * 住宅 IP 两轮验证,**都不会自动通过**,而是弹出"请验证您是真人"复选框,
+ * 且登录按钮在通过前硬禁用。即真实用户登录要多一次点击,环境受限者(国产内核 /
+ * 网络受限)可能直接登不进去,而 product_friction_events 里 turnstile 相关记录为 0 条
+ * —— 失败完全静默。同期滥用证据为零(4 个月内最高单日 12 注册、零限流事件)。
+ * 依"任何优化不得降低用户体验"的产品红线,先关强制。
+ *
+ * **偿还触发条件(三条全满足才可翻回 1)**:
+ *   1. Cloudflare 后台把该 widget 从 Managed 改为 Invisible / Non-Interactive;
+ *   2. turnstile 结果遥测已上线(成功/失败/超时进 product_friction_events,失败率可见);
+ *   3. 真机验证过鸿蒙 ArkWeb / Quark / iOS Safari 三个目标内核。
+ * 在此之前注册/登录**没有人机验证**,这是明知代价的临时状态,不是遗忘。
+ */
+const turnstileEnforce = z
+  .enum(["0", "1"])
+  .optional()
+  .transform((v) => v !== "0");
+
+/**
+ * TURNSTILE_BYPASS_ACCOUNTS —— 账号级人机验证白名单(2026-07-26 安全审计整改)。
+ *
+ * 背景:此前生产 env 挂着 `TURNSTILE_TEST_BYPASS=1`,注册/登录/找回密码三个公开
+ * 入口的人机验证**全站**失效。之所以一直没敢摘,是因为 4 条生产自动化
+ * (v5-e2e-journey-canary / v5-smoke-turn-canary / run-baseline-skill-evals /
+ * v5-market-skill-eval)都在发 `turnstile_token:'x'` 的占位 token。
+ * 根治办法不是留全局开关,而是把"旁路"从**环境级**降到**账号级**:
+ * 只有白名单里的自动化账号能跳过,真实用户一律走真 widget。
+ *
+ * 格式:逗号分隔的邮箱,解析时 trim + 小写 + 去空。缺省 = 空表 = 谁也不能旁路。
+ * 判定逻辑在 auth/turnstile.ts 的 resolveTurnstileBypass(单一权威),
+ * 命中会打 `[turnstile-account-bypass]` 结构化日志留痕。
+ */
+const turnstileBypassAccounts = z
+  .string()
+  .max(4096)
+  .optional()
+  .transform((v): readonly string[] =>
+    Object.freeze(
+      (v ?? "")
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0),
+    ),
+  );
+
+/**
  * Turnstile 公钥(Cloudflare 的 client-side site key)。
  * - 公开值,可被前端 `/api/public/config` 直接读出来嵌入 widget
  * - 缺失时前端 turnstile 走"占位 token"路径(配合 `TURNSTILE_TEST_BYPASS=1` 用)
@@ -441,6 +498,9 @@ export const commercialConfigSchema = z
     JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars").optional(),
     TURNSTILE_SECRET: turnstileSecret,
     TURNSTILE_TEST_BYPASS: turnstileBypass,
+    /** 0 → 不对真实用户强制人机验证(显式产品配置,默认 1;见常量处的债与偿还条件) */
+    TURNSTILE_ENFORCE: turnstileEnforce,
+    TURNSTILE_BYPASS_ACCOUNTS: turnstileBypassAccounts,
     TURNSTILE_SITE_KEY: turnstileSiteKey,
     /** 1 → 强制 email_verified=true 才能登录 */
     REQUIRE_EMAIL_VERIFIED: z.enum(["0", "1"]).optional().transform((v) => v === "1"),
@@ -656,12 +716,73 @@ export class ConfigError extends Error {
 }
 
 /**
+ * 生产环境危险开关识别正则(2026-07-26 安全审计整改)。
+ *
+ * 只认**整段**为 TEST / BYPASS / INSECURE / UNSAFE 的键(下划线或首尾为边界),
+ * 外加 `DEV_` 前缀。边界要求是刻意的,避免误伤两类合法键:
+ *   - `*_DISABLED` 系列(OC_IDLE_SWEEP_DISABLED 等)是正经运维开关,不含上述词根;
+ *   - `LATEST` / `CONTEST` 这类含子串但不成段的键不会命中。
+ * 注意 `REQUIRE_TEST_DB`、`OC_TEST_*` 这类会命中——这本来就是期望行为:
+ * 生产上不该出现它们。
+ */
+const PRODUCTION_FORBIDDEN_ENV_RE = /(^|_)(TEST|BYPASS|INSECURE|UNSAFE)(_|$)|^DEV_/;
+
+/** 被视为"开启"的值(大小写不敏感)。只有开启才拦,挂着 =0 的历史键不影响启动。 */
+const TRUTHY_ENV_VALUES = new Set(["1", "true", "yes"]);
+
+/**
+ * 生产 fail-closed:扫描原始 env,命中"危险开关且已开启"即拒绝启动。
+ *
+ * 为什么必须作用在**原始 env 对象**而不是 zod 输出:zod 会 strip 掉未声明的键,
+ * 而这里要拦的恰恰是"任何"危险键——包括将来别人随手加的、schema 里根本没声明的。
+ * 声明式白名单挡不住"没声明"的东西,只有扫原始 env 才闭合。
+ *
+ * 为什么 fail-closed 而不是打个 warning:与 COMMERCIAL_JWT_SECRET min(32) 同一条
+ * 先例——安全约束一旦降级成"日志里喊一声",在长期运维里等于不存在。
+ * 2026-07-26 审计实测:`TURNSTILE_TEST_BYPASS=1` 在生产 env 里挂了很久,
+ * 注册/登录/找回密码三个入口的人机验证全部失效,没有任何人被提醒过。
+ *
+ * **不设逃生开关**(与 JWT_SECRET 先例一致):留个 `ALLOW_UNSAFE_ENV=1` 之类的
+ * 后门,等于把这道门本身变成下一个 TURNSTILE_TEST_BYPASS。
+ *
+ * 正确的替代做法:需要在生产给自动化开特例时,走**账号级**白名单而不是环境级开关,
+ * 例如本文件的 `TURNSTILE_BYPASS_ACCOUNTS` —— 作用域收敛到具体账号、命中留痕、
+ * 对真实用户零影响。
+ *
+ * 消息里只列**键名**不回显值,遵守 ConfigError 的"不泄露 secrets"约定。
+ */
+function assertNoProductionDangerSwitches(env: Record<string, string | undefined>): void {
+  if (env.NODE_ENV !== "production") return;
+  const hits: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string") continue;
+    if (!PRODUCTION_FORBIDDEN_ENV_RE.test(key)) continue;
+    if (!TRUTHY_ENV_VALUES.has(value.trim().toLowerCase())) continue;
+    hits.push(key);
+  }
+  if (hits.length === 0) return;
+  hits.sort();
+  throw new ConfigError(
+    hits.map((key) => ({
+      path: key,
+      code: "production_danger_switch",
+      message:
+        "dangerous test/bypass switch is enabled under NODE_ENV=production; " +
+        "remove it and use an account-scoped allowlist (e.g. TURNSTILE_BYPASS_ACCOUNTS) instead",
+    })),
+  );
+}
+
+/**
  * 从给定的 env 对象解析配置。
  * 默认从 process.env 读;测试可显式传入。
  *
  * 注:不做单例缓存(各调用方若需要缓存自行处理),便于测试隔离。
  */
 export function loadConfig(env: Record<string, string | undefined> = process.env): CommercialConfig {
+  // 先于 schema 校验:危险开关是安全问题,必须先于"字段格式不对"暴露出来,
+  // 否则一个无关的 schema 错误会把它挤出错误消息。
+  assertNoProductionDangerSwitches(env);
   const result = commercialConfigSchema.safeParse(env);
   if (!result.success) {
     const issues = result.error.issues.map((i) => ({
@@ -671,6 +792,16 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       message: i.message,
     }));
     throw new ConfigError(issues);
+  }
+  // 关掉人机验证强制是"明知代价的临时状态",绝不能静默 —— 每次启动都大声播报,
+  // 让任何人看一眼日志就知道现在没有人机验证,以及翻回去的三个前置条件。
+  // (与 TURNSTILE_TEST_BYPASS 的核心差别正在于此:那个键假装自己不在生产。)
+  if (result.data.TURNSTILE_ENFORCE === false) {
+    console.warn(
+      "[turnstile-enforcement-off] 注册/登录/找回密码当前**不做人机验证**(TURNSTILE_ENFORCE=0)。" +
+        "翻回 1 的前置条件:①CF widget 改 Invisible/Non-Interactive ②turnstile 结果遥测上线 " +
+        "③鸿蒙 ArkWeb / Quark / iOS Safari 真机验证通过。详见 config.ts 的 turnstileEnforce 注释。",
+    );
   }
   return result.data;
 }

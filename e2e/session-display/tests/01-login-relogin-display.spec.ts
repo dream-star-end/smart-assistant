@@ -14,7 +14,14 @@ import {
   waitForHistoryLoaded,
   SEL,
   rowSequence,
+  userTexts,
+  assistantTexts,
 } from '../lib/ui';
+
+/** 行内正文比较前统一空白(渲染换行/缩进差异不算内容漂移)。 */
+function normalizeTexts(rows: string[]): string[] {
+  return rows.map((row) => row.replace(/\s+/g, ' ').trim());
+}
 
 test('@smoke login → 会话 → 发送 → 重登后展示完整且顺序正确', async ({ page, api, token, track }) => {
   const cfg = config();
@@ -43,8 +50,10 @@ test('@smoke login → 会话 → 发送 → 重登后展示完整且顺序正�
   const seq1 = await rowSequence(page);
   expect(seq1[0], '首条应为 user 行').toBe('user');
   expect(seq1.includes('assistant'), '应存在 assistant 行').toBeTruthy();
-  // user 必须出现在其后的 assistant 之前。
-  expect(seq1.indexOf('user')).toBeLessThan(seq1.indexOf('assistant'));
+  // 重登前的完整快照:行全序 + 正文。重登后必须逐条一致(见下方对照)。
+  const usersBefore = normalizeTexts(await userTexts(page));
+  const assistantsBefore = normalizeTexts(await assistantTexts(page));
+  expect(assistantsBefore.every((text) => text.length > 0), '重登前 assistant 正文不得为空').toBeTruthy();
 
   // API 佐证:会话已落库、含 user+assistant。
   const detail = await api.getSession(token, sid);
@@ -66,6 +75,12 @@ test('@smoke login → 会话 → 发送 → 重登后展示完整且顺序正�
   await waitForHistoryLoaded(page);
   await expect(SEL.userRows(page).filter({ hasText: `e2e-marker-${uniq}` })).toHaveCount(1);
   await expect(SEL.assistantRows(page).locator('.prose').filter({ hasText: /\S/ }).first()).toBeVisible();
+  // 全序 + 正文双重对照(对照 08 的 toEqual(['team','permission','assistant']) 写法)。
+  // 只验"在场"是不够的:indexOf('user') < indexOf('assistant') 允许正文被替换成占位符、
+  // 被截断、或多轮顺序错乱 —— 而 INC-20260717-HISTORY-STUCK 正是"重登后内容不对"。
   const seq2 = await rowSequence(page);
-  expect(seq2.indexOf('user')).toBeLessThan(seq2.indexOf('assistant'));
+  expect(seq2, '重登后消息行全序必须与重登前逐条一致').toEqual(seq1);
+  expect(normalizeTexts(await userTexts(page)), '重登后 user 正文必须逐条一致').toEqual(usersBefore);
+  expect(normalizeTexts(await assistantTexts(page)), '重登后 assistant 正文必须逐条一致(不得占位/截断)')
+    .toEqual(assistantsBefore);
 });

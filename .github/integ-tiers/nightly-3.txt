@@ -1,0 +1,24 @@
+# 夜跑梯队 · 分片 3 —— 连接器 / 市场 / 科研 / 模型目录
+#
+# min-tests: 1
+# max-minutes: 30
+packages/commercial/src/__tests__/connectorsDeclarativeVertical.integ.test.ts
+packages/commercial/src/__tests__/connectorsMarketplace.integ.test.ts
+packages/commercial/src/__tests__/connectorsOauth2Flow.integ.test.ts
+packages/commercial/src/__tests__/connectorsPlatformOauth.integ.test.ts
+packages/commercial/src/__tests__/connectorsRpcDeclarative.integ.test.ts
+packages/commercial/src/__tests__/connectorsSeed.integ.test.ts
+packages/commercial/src/__tests__/connectorsSpecKernelReview.integ.test.ts
+packages/commercial/src/__tests__/connectorsStore.integ.test.ts
+packages/commercial/src/__tests__/marketplaceCapabilityMigration.integ.test.ts
+packages/commercial/src/__tests__/marketplaceDb.integ.test.ts
+packages/commercial/src/__tests__/marketplacePluginKernel.integ.test.ts
+packages/commercial/src/__tests__/internalMarketplaceAgent.integ.test.ts
+packages/commercial/src/marketplace/__tests__/aiReview.integ.test.ts
+packages/commercial/src/__tests__/researchLibrary.integ.test.ts
+packages/commercial/src/__tests__/researchProxyChain.integ.test.ts
+packages/commercial/src/__tests__/researchStore.integ.test.ts
+packages/commercial/src/__tests__/modelAuthorityDbGuards.integ.test.ts
+packages/commercial/src/__tests__/modelCatalogAdmin.integ.test.ts
+packages/commercial/src/__tests__/modelCatalogDb.integ.test.ts
+packages/commercial/src/__tests__/seedPlatformAgents.integ.test.ts
