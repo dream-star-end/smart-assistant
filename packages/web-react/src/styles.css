@@ -38,6 +38,38 @@
   --color-ring: var(--ring);
   /* code surface (CodeBlock background) — tokenised, no longer hard-coded */
   --color-code: var(--code);
+  /* 控件边界(输入框/下拉/可点边框)。--border 是分隔线用色,在 --bg 上只有
+     1.16:1,当控件边界时输入框几乎看不见 —— 两种用途必须分开取色。 */
+  --color-border-control: var(--border-control);
+  /* 骨架屏底色。原先复用 --hover(浅色 4% 墨),合成后对白底仅 ≈1.05:1,
+     等于骨架本身是隐形的。 */
+  --color-skeleton: var(--skeleton);
+
+  /* ── 排版语义档位 ────────────────────────────────────────────────────
+     管理中心/市场这类紧凑工作面的字号唯一权威。存在的理由:全前端曾有
+     1551 处 `text-[Npx]` 任意值、30 个不同字号,其中 10–13.5px 之间挤了 8 档
+     (10/10.5/11/11.5/12/12.5/13/13.5)——半像素差异形不成层次,只制造不一致。
+     这里收敛为 5 档 + 1 个受限档,每档靠"字号 + 使用语义"区分,字重由使用处按
+     语义配(不进 scale,避免组合爆炸)。
+
+     ⚠️ 刻意**不**重定义 Tailwind 原厂的 text-xs/sm/base/lg:`ui/Input.tsx` 的
+     `text-base md:text-sm` 是防 iOS 聚焦缩放的专门设计(iOS Safari 在输入框
+     字号 <16px 时放大整页且不回弹)。把 text-base 改小会让全站输入框同时失守,
+     正是 CronPanel 手抄 `text-[13px]` 已经造成过的那个 bug。新增语义名是唯一
+     安全的收敛路径。 */
+  --text-title: 15px;
+  --text-title--line-height: 1.4;
+  --text-section: 13.5px;
+  --text-section--line-height: 1.45;
+  --text-body: 13px;
+  --text-body--line-height: 1.55;
+  --text-meta: 12px;
+  --text-meta--line-height: 1.5;
+  --text-caption: 11px;
+  --text-caption--line-height: 1.45;
+  /* 受限档:仅角标/序号等确无空间处。新代码不得新增,存量逐步并入 caption。 */
+  --text-micro: 10.5px;
+  --text-micro--line-height: 1.4;
 
   --radius-xl2: 28px;
   --radius-xl: 22px;
@@ -72,25 +104,33 @@
   --active: #15151b14;
   --border: #e9e9ef;
   --border-strong: #d9d9e1;
+  --border-control: #8f8f9b;
   --fg: #15151b;
   --muted: #51515c;
-  --faint: #8b8b97;
-  --accent: #6e56f0;
-  --accent-soft: #6e56f014;
+  /* 语义色一律按「前景优先」定档:实测前景用法(text-danger/success/… 307 处)
+     是填充用法(bg-danger/… 约 30 处)的 10 倍,故基础色直接取达 AA 的深值,
+     不另立 -on-soft 第二套 token。填充块配白字时底色变深,对比度只增不减。
+     每个值都同时满足:vs surface(#fff)≥4.5 且 vs 自身 -soft 徽章底 ≥4.5。 */
+  --faint: #6f6f7b; /* was #8b8b97 — 3.37:1,却承载全站说明与引导文案 */
+  --accent: #6c54f0; /* was #6e56f0 — 作徽章前景时 vs soft 底仅 4.45,压 0.4% 明度即达标 */
+  --accent-soft: #6c54f014;
   --accent-strong: #5a45d6;
   --accent-fg: #ffffff;
   --primary: #17171d;
   --primary-fg: #ffffff;
   --bubble: #f4f4f7;
-  --danger: #e04953;
-  --danger-soft: #e0495314;
-  --success: #1fa463;
-  --success-soft: #1fa46314;
-  --warning: #d9871a;
-  --warning-soft: #d9871a14;
-  --info: #3b82f6;
-  --info-soft: #3b82f614;
-  --ring: #6e56f059;
+  --danger: #d52430; /* was #e04953 — 4.00:1 */
+  --danger-soft: #d5243014;
+  --success: #187f4d; /* was #1fa463 — 3.21:1 */
+  --success-soft: #187f4d14;
+  --warning: #9e6213; /* was #d9871a — 2.83:1,连大字标准都不够 */
+  --warning-soft: #9e621314;
+  --info: #0c64f4; /* was #3b82f6 — 3.68:1 */
+  --info-soft: #0c64f414;
+  /* 焦点环必须是实色:原 #6e56f059(35% alpha)合成后仅 ≈1.6:1,键盘用户
+     看不见焦点落在哪。实色后 ≥3:1(WCAG 非文本对比)。 */
+  --ring: #5a45d6;
+  --skeleton: #e4e4ec;
   --code: #fbfbfd;
   /* brand moments only — never the app's in-workspace primary action.
      grad-cta endpoints kept dark enough for white text ≥4.5:1 (WCAG AA). */
@@ -110,9 +150,10 @@
   --active: #ffffff1a;
   --border: #27272f;
   --border-strong: #383843;
+  --border-control: #64647a;
   --fg: #f2f2f6;
   --muted: #bcbcc7;
-  --faint: #76767f;
+  --faint: #7e7e87; /* was #76767f — 4.04:1 */
   --accent: #9a8aff;
   --accent-soft: #9a8aff1f;
   --accent-strong: #ab9cff;
@@ -128,7 +169,8 @@
   --warning-soft: #e0a03a1f;
   --info: #6aa6ff;
   --info-soft: #6aa6ff1f;
-  --ring: #9a8aff66;
+  --ring: #9a8aff; /* was #9a8aff66 — 同浅色理由,焦点环取实色 */
+  --skeleton: #2a2a34;
   --code: #0a0a0e;
   --aurora: linear-gradient(135deg, #5e50a8 0%, #4a5aa0 45%, #a05878 100%);
   /* same robust endpoints as light — a brand CTA fill needn't invert per theme */
