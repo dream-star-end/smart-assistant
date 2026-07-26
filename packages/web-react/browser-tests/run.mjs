@@ -136,7 +136,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -731,6 +731,161 @@ await check("T19 真 IndexedDB 多标签陈旧快照不抹除/复活发送日志
   if (!result.resistedResurrection) {
     throw new Error("已 ACK 删除的 exact pending-dispatch 被陈旧快照复活");
   }
+});
+
+// ── T21 真 WS 帧 replay ────────────────────────────────────────────────────────
+// 断言的是**用户可见事实**:一轮真实帧进来,时间线上该出现几条、什么顺序、工具卡里
+// 是不是那条真命令与真输出、思考卡是不是实时展开而终态自动折叠、终态有没有清掉发送态。
+// 中间任何一层(帧解析 / reducer 归并键 / 虚拟条目键 / 卡片分派)漂了都会红。
+const replayRoot = page.locator("#timeline-replay-root");
+// 断言常量的单一权威是 fixtures/turnReplay.ts(TS,进 harness bundle);run.mjs 从页面
+// 读回,避免同一批标记在 .mjs 里再写一份副本(副本一旦漂移,门就变成自说自话)。
+const replayFixture = await page.evaluate(() => window.__replayFixture);
+const replayMarkers = replayFixture.markers;
+const EXPECTED_TIMELINE_ROLES = replayFixture.expectedRoles;
+
+/** 轮询而非 sleep:只放宽"什么时候读",不放宽"读到什么"。 */
+async function waitForReplay(predicate, describe, timeout = 4000) {
+  const deadline = Date.now() + timeout;
+  let last;
+  for (;;) {
+    last = await page.evaluate(() => ({
+      sending: window.__replay.sending,
+      rows: window.__replay.rows,
+      keys: Array.from(
+        document.querySelectorAll("#timeline-replay-root [data-chat-virtual-key]"),
+      ).map((node) => node.getAttribute("data-chat-virtual-key")),
+    }));
+    if (predicate(last)) return last;
+    if (Date.now() >= deadline) {
+      throw new Error(`${describe};最后一次观测=${JSON.stringify(last)}`);
+    }
+    await page.waitForTimeout(25);
+  }
+}
+
+await check("T21 真 WS 帧驱动真时间线:条目顺序、工具卡内容、思考折叠、终态清发送", async () => {
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`真实发送未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  // 乐观 user 行先落地,且 socket 认为该会话正在等响应。
+  await waitForReplay(
+    (s) => s.rows.length === 1 && s.rows[0].role === "user" && s.sending,
+    "真实发送后没有出现唯一一条 user 行 + 发送态",
+  );
+  await replayRoot.getByText(replayMarkers.userText).waitFor({ state: "visible", timeout: 3000 });
+
+  // ① thinking 帧:实时思考正文可见(live 展开),这是 #158 折叠回归的正向对照。
+  await page.evaluate(() => window.__replayDrive.pushNextFrame());
+  await replayRoot.getByText(replayMarkers.thinking).waitFor({ state: "visible", timeout: 3000 });
+
+  // ② 其余帧(tool_use → tool_output_tail → tool_result → 正文两段 delta → isFinal)。
+  const pushed = await page.evaluate(() => window.__replayDrive.pushRemainingFrames());
+  const total = await page.evaluate(() => window.__replayDrive.frameCount());
+  if (pushed !== total) throw new Error(`帧未全部推入: ${pushed}/${total}`);
+
+  // 终态:发送态清掉(isFinal 被消化),时间线恰好四条真实记录且顺序正确。
+  const settled = await waitForReplay(
+    (s) => !s.sending && s.rows.length === 4,
+    "终帧到达后没有收敛为 4 条时间线记录 + 非发送态",
+  );
+  const roles = settled.rows.map((r) => r.role);
+  if (JSON.stringify(roles) !== JSON.stringify(EXPECTED_TIMELINE_ROLES)) {
+    throw new Error(`时间线条目顺序漂移: ${JSON.stringify(roles)}`);
+  }
+  // 虚拟列表实际挂载的条目键必须与逻辑行一一对应(条目键漂移=虚拟列表重复/丢行)。
+  if (settled.keys.length !== settled.rows.length) {
+    throw new Error(
+      `虚拟条目数(${settled.keys.length})与逻辑行数(${settled.rows.length})不一致: ${JSON.stringify(settled.keys)}`,
+    );
+  }
+
+  // 工具卡:头部直出 wire 携带的真命令;展开后是 wire 携带的真输出(不是 stub 替身)。
+  await replayRoot.getByText(replayMarkers.toolCommand).first().waitFor({ state: "visible", timeout: 3000 });
+  const toolRowKey = settled.rows.find((r) => r.role === "tool")?.id;
+  if (!toolRowKey) throw new Error("时间线里没有 tool 行");
+  const toolCard = replayRoot
+    .locator("[data-chat-virtual-key]")
+    .filter({ hasText: replayMarkers.toolCommand })
+    .first();
+  await toolCard.locator("button").first().click();
+  await toolCard.getByText(replayMarkers.toolOutput).waitFor({ state: "visible", timeout: 3000 });
+
+  // assistant 终态正文:两段 delta 必须拼成同一条回答(而不是裂成两行)。
+  await replayRoot.getByText(replayMarkers.answerHead).waitFor({ state: "visible", timeout: 3000 });
+  await replayRoot.getByText(replayMarkers.answerTail).waitFor({ state: "visible", timeout: 3000 });
+  const assistantRows = settled.rows.filter((r) => r.role === "assistant");
+  if (assistantRows.length !== 1) {
+    throw new Error(`两段 text delta 没有合并成单条 assistant 行: ${assistantRows.length} 条`);
+  }
+
+  // 思考卡:终态自动折叠(正文隐藏),受信点击后完整正文恢复。
+  const thinkingBody = replayRoot.getByText(replayMarkers.thinking);
+  await thinkingBody.waitFor({ state: "hidden", timeout: 3000 });
+  const thinkingHeader = replayRoot.getByRole("button", { name: /思考|已思考/ }).first();
+  await thinkingHeader.waitFor({ state: "visible", timeout: 3000 });
+  await thinkingHeader.click();
+  await thinkingBody.waitFor({ state: "visible", timeout: 3000 });
+});
+
+// ── T22 Enter / Shift+Enter / 中文 IME ────────────────────────────────────────
+// jsdom 里合成 KeyboardEvent 不带组合态(isComposing 物理恒 false),所以
+// `!e.nativeEvent.isComposing` 这道守卫在单测里等于不存在:删掉它单测照绿,而线上
+// 中文用户选词按回车就会误发半截草稿。这里用 CDP Input.imeSetComposition 造真实组合态。
+await check("T22 Enter 发送 / Shift+Enter 换行 / IME 组合中回车不误发", async () => {
+  const composer = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  await composer.waitFor({ state: "visible", timeout: 3000 });
+  const sendCount = async () => (await page.evaluate(() => window.__sends)).length;
+  const value = () => composer.inputValue();
+  const before = await sendCount();
+
+  // ① Shift+Enter = 换行,绝不发送。
+  await composer.click();
+  await composer.fill("");
+  await page.keyboard.type("第一段");
+  await page.keyboard.press("Shift+Enter");
+  await page.keyboard.type("第二段");
+  if (await sendCount() !== before) throw new Error("Shift+Enter 误发了消息");
+  if (await value() !== "第一段\n第二段") {
+    throw new Error(`Shift+Enter 没有插入换行: ${JSON.stringify(await value())}`);
+  }
+
+  // ② 中文 IME 组合中:回车是"确认候选词",绝不能发送。
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    await composer.fill("");
+    await cdp.send("Input.imeSetComposition", {
+      text: "zhongwen",
+      selectionStart: 8,
+      selectionEnd: 8,
+    });
+    const composingValue = await value();
+    if (!composingValue.includes("zhongwen")) {
+      throw new Error(`未进入真实 IME 组合态: ${JSON.stringify(composingValue)}`);
+    }
+    await page.keyboard.press("Enter");
+    if (await sendCount() !== before) {
+      throw new Error("IME 组合过程中按回车把半截草稿发出去了(isComposing 守卫失效)");
+    }
+    // 组合结束(选词落定)→ 提交组合文本,退出组合态。
+    await cdp.send("Input.insertText", { text: "中文候选" });
+    await cdp.send("Input.imeSetComposition", { text: "", selectionStart: -1, selectionEnd: -1 });
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+
+  // ③ 组合结束后 Enter 正常发送,且载荷文本精确。
+  await composer.fill("组合已结束可以发送");
+  await page.keyboard.press("Enter");
+  const sends = await page.evaluate(() => window.__sends);
+  if (sends.length !== before + 1) {
+    throw new Error(`组合结束后的 Enter 未发送(或多发): ${sends.length - before} 次`);
+  }
+  if (sends[sends.length - 1].text !== "组合已结束可以发送") {
+    throw new Error(`发送载荷文本不精确: ${JSON.stringify(sends[sends.length - 1])}`);
+  }
+  if (await value() !== "") throw new Error("发送后草稿未清空");
 });
 
 async function assertContainerPreviewFillsViewport(page, expectedDevice, width, height, top = 0) {
