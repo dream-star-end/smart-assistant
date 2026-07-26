@@ -700,7 +700,7 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 - **写入单一权威**:`writeAdminAudit`(admin/audit.ts)。action 必须先在 `admin/auditActions.ts` 注册(编译期字面量类型+运行时 fail-fast,野字符串直接抛);每个 action 声明 `mode`:`tx`=fail-closed(资金/权限/封禁/计费配置,以及 sessions.read 敏感读——记不下就不给看),`best-effort`=业务成功后经 `writeAdminAuditBestEffort` 补写(**禁止调用点自 catch**,中央函数带 critical 告警+Prometheus 计数;对 tx 档 action 会抛)。
 - **中央脱敏**:writeAdminAudit 入口 `redactSensitive`(auditRedact.ts,SENSITIVE_KEY_RE 命中 key 后按值放行:boolean 恒放行/number 仅 TOKEN_COUNT_KEY_RE 计数形状放行(数值型口令照脱)/string·对象·数组一律脱;已脱敏形状逐字段验类型,`{__redacted:true,raw:…}` 夹带不信任);setting key 整值敏感在 systemSettings.set 调用点判。**新调用点不需要也不应该再自行脱敏大对象,但凭据类字段永远别放进 before/after**。
 - **retention 单一权威**:`admin/auditRetention.ts` 注册表 + `auditRetentionSweep` 调度器(leader shared 域,24h tick;关停 `COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED=1`,覆盖 `COMMERCIAL_AUDIT_RETENTION_OVERRIDES=table=days,…` 只认注册表内表名)。**新增事件表的清理必须登记进该注册表,禁止再造独立 sweeper**;admin_audit 在 PERMANENT_AUDIT_TABLES,配删除政策会 fail-fast。
-- 展示面:admin「审计日志」页 4 Tab(管理操作/安全事件/Agent 工具/主机审计)+请求ID反查(`GET /api/admin/trace/:traceId`→turn_traces)。新增 admin 路由记得 `UPDATE_BASELINE=1` 钉路由清单基线。
+- 展示面:admin「审计日志」页 4 Tab(管理操作/安全事件/Agent 工具/主机审计)+请求ID反查(`GET /api/admin/trace/:traceId`→turn_traces)。新增 admin 路由记得跑 `npm run baseline:admin-routes` 重钉路由清单基线(2026-07-26 起测试只读,写基线只有这一个入口)。
 
 ### P3.1 企业版速记(2026-07-06)
 - **org 面三层前缀**:`/api/me`(自己)/`/api/org/*`(org-owner/admin 自助,dispatchOrgRoute 单一鉴权收口 + requireOrgRole 每请求 DB 复核)/`/api/admin/orgs*`(平台超管)。org 一律服务端从 membership 推导,不接受客户端 org_id。
