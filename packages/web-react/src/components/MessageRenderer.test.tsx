@@ -25,6 +25,9 @@ beforeAll(async () => {
 
 function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMessage {
   return { id: "m1", role, text: "", ts: 1000, ...extra };
+  // ⚠️ 默认 ts=1000 是 1970 年。permission 卡的自动弹框有存活上界
+  // （PermissionCard 的 PENDING_PERMISSION_TTL_MS：超过服务端 TTL 的未决卡按孤儿处理、
+  // 不再自动弹），所以待审批用例必须显式给一个新鲜 ts,否则测的就不是真实场景。
 }
 
 function renderMsg(
@@ -522,7 +525,7 @@ describe("permission 审批", () => {
 
   test("待审批普通工具 → 自动弹审批框，允许经 onRespondPermission 回送", () => {
     const onRespond = vi.fn();
-    renderMsg(mk("permission", { toolName: "Bash", requestId: "r1", _resolved: false, inputPreview: "ls -la" }), {
+    renderMsg(mk("permission", { toolName: "Bash", requestId: "r1", _resolved: false, inputPreview: "ls -la", ts: Date.now() }), {
       onRespond,
     });
     // 自动弹出的 modal（Radix portal）含「允许」。
@@ -554,6 +557,7 @@ describe("permission 审批", () => {
     renderMsg(
       mk("permission", {
         toolName: "AskUserQuestion",
+        ts: Date.now(),
         requestId: "r2",
         _resolved: false,
         inputJson: {

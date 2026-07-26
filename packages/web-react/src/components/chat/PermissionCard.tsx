@@ -30,6 +30,20 @@ type AqInput = { questions: AqQuestion[] };
 
 const OTHER = "__other__";
 
+/** 服务端 pending permission 的权威存活上界，镜像 gateway 的
+ *  `Gateway.PENDING_PERMISSION_TTL_MS`（packages/gateway/src/server.ts）。
+ *
+ *  gateway 每 60s 跑 `_sweepStalePendingPermissions()`，超过该 TTL 的 pending 一律 force-deny
+ *  并广播 `outbound.permission_settled{reason:'timeout'}`；断开连接走 `'disconnect'`，容器没了
+ *  走 `'crashed'`。也就是说**超过这个时长的未决卡，服务端侧一定已经不在等了**。
+ *
+ *  两处数值必须一致，由 PermissionCard.test.tsx 的契约断言直接读 server.ts 源码锁定
+ *  （前端改不动 gateway 常量：那是容器内源码面 / runtime release 轴，见 V5_DEV_PLAYBOOK §4.1）。
+ *
+ *  ⚠️ 只用来决定「是否自动弹框」，绝不用来禁用手动回答入口 —— 万一本地时钟偏差导致误判，
+ *  用户仍须能点「回答」把真正在等的 agent 解锁（fail-safe 方向）。 */
+export const PENDING_PERMISSION_TTL_MS = 30 * 60_000;
+
 function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
   if (msg.toolName !== "AskUserQuestion") return null;
   const input = msg.inputJson as AqInput | null | undefined;
@@ -53,10 +67,19 @@ export function PermissionCard({
   const behavior = msg._behavior;
   const [open, setOpen] = useState(false);
 
+  // 孤儿待决卡的判据（见 PENDING_PERMISSION_TTL_MS 注释）。放在渲染期算：msg.ts 恒定，
+  // Date.now() 只在重渲染时前进，跨过阈值会让 effect 再跑一次——那次因 stale=true 不再弹。
+  const stale =
+    !resolved && Number.isFinite(msg.ts) && Date.now() - msg.ts > PENDING_PERMISSION_TTL_MS;
+
   // 待审批 → 挂载即自动弹审批框（agent 此刻被阻塞，等用户决策）。
+  // 但「未决」≠「agent 还在等」：permission 卡被刻意排除在服务端 tape 之外（persist.ts §⑦），
+  // 只活在客户端 IndexedDB 里，而解决状态的权威在 gateway 内存（TTL + session 回收）。断线期间
+  // 服务端 force-deny 广播的 settled 帧若没送达（ring 已轮转 / session 已回收），本地就永久留下
+  // 一张未决卡，此后每次挂载都被强行弹开。故超过服务端 TTL 的一律视为孤儿，不再自动弹。
   useEffect(() => {
-    if (!resolved && !readOnly) setOpen(true);
-  }, [resolved, readOnly]);
+    if (!resolved && !readOnly && !stale) setOpen(true);
+  }, [resolved, readOnly, stale]);
 
   const statusIcon = !resolved ? "⏳" : behavior === "allow" ? "✓" : "✗";
   const statusText = !resolved
