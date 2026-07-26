@@ -50,6 +50,21 @@ const EMAIL = process.env.V5_CANARY_EMAIL ?? "v5-canary@claudeai.chat";
 const PASSWORD_FILE = process.env.V5_CANARY_PASSWORD_FILE ?? "/root/.secrets/v5-canary.password";
 const ARTIFACTS = process.env.OC_E2E_ARTIFACTS ?? tmpdir();
 const STEP_TIMEOUT = 20_000;
+/**
+ * 冷启动窗口专用超时:**只给 J1 的首屏落地用**,其余步骤一律守 STEP_TIMEOUT。
+ *
+ * 本门挂在切流之后立即执行,此刻 master 刚重启,正在加载 pricing / catalog / host
+ * identity。App boot 的第一发 `/api/auth/refresh` 因此会明显变慢,而营销首页是
+ * `lazy()` 组件 —— boot 未落定就没有可点的「登录」。这与前端资源快慢无关:
+ * 2026-07-26 实测(每轮全新缓存、纯静态 serve、各 3 次)旧 dist 中位 1887ms、
+ * 新 dist 中位 1750ms,而那次线上失败耗时 20107ms —— 只超阈值 107ms,是被冷启动
+ * 拖过线的假阳性,却触发了整批 dist 回滚。
+ *
+ * 这正是本仓既有铁律「重启后禁止即时探针,要绝对截止轮询」在 UI 门上的同款体现:
+ * 不是放宽断言,而是把"服务尚未 ready"与"页面真的坏了"分开 —— 后续步骤仍是严格的
+ * 20s,任何真实交互回归照样拦得住。
+ */
+const BOOT_TIMEOUT = 60_000;
 /** J5 等一轮真回复的上限(journey 在 smoke-turn 之后跑,模型链路已证健康;宽限防偶发慢轮误杀)。 */
 const TURN_WAIT_TIMEOUT = 120_000;
 
@@ -144,10 +159,12 @@ async function step(name, fn) {
 
 try {
   await step("J1 登录表单形态断言 + API 登录种 cookie 进入应用", async () => {
-    await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: STEP_TIMEOUT });
+    await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded", timeout: BOOT_TIMEOUT });
     // 根路径 = 营销首页(未登录形态),导航「登录」进 AuthGate。.first():首页存在多个
     // 登录入口(导航+CTA)时取导航首个。
-    await page.getByText("登录", { exact: true }).first().click({ timeout: STEP_TIMEOUT });
+    // 这一步用 BOOT_TIMEOUT:它是整个门里唯一紧贴"服务刚重启"执行的 UI 等待,
+    // 落地页又是 lazy 组件,boot 未落定时 DOM 里根本没有可点的「登录」(见常量注释)。
+    await page.getByText("登录", { exact: true }).first().click({ timeout: BOOT_TIMEOUT });
     await page.getByPlaceholder("邮箱").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
     await page.getByPlaceholder("密码").waitFor({ state: "visible", timeout: STEP_TIMEOUT });
 

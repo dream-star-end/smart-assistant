@@ -6234,6 +6234,31 @@ wait $!
     assert.doesNotMatch(source, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
   })
 
+  test('E2E journey gives only the post-restart first paint a longer boot budget', async () => {
+    const source = await readFile(e2eJourney, 'utf8')
+    // 本门挂在切流之后立即跑,master 此刻正冷启动(加载 pricing/catalog/host identity),
+    // App boot 的首发 /api/auth/refresh 因此变慢;营销首页又是 lazy 组件,boot 未落定就
+    // 没有可点的「登录」。2026-07-26 实测该步耗时 20107ms —— 只超固定 20s 阈值 107ms,
+    // 却触发整批 dist 回滚,而纯 dist 对照证明新包首屏反而更快(中位 1750ms vs 1887ms)。
+    // 契约:**只有 J1 的首屏落地**享受 BOOT_TIMEOUT,其余步骤一律守 STEP_TIMEOUT ——
+    // 放宽范围一旦扩大,真实交互回归就会被一起放过。
+    assert.match(source, /const STEP_TIMEOUT = 20_000;/)
+    assert.match(source, /const BOOT_TIMEOUT = 60_000;/)
+    assert.match(
+      source,
+      /getByText\("登录", \{ exact: true \}\)\.first\(\)\.click\(\{ timeout: BOOT_TIMEOUT \}\)/,
+      'J1 首屏点击必须用 BOOT_TIMEOUT(冷启动窗口)',
+    )
+    // 只数**真实传参**处(注释里解释性地提到常量名不算),否则这条断言会因为写注释而红。
+    const bootUses = source.match(/timeout: BOOT_TIMEOUT/g) ?? []
+    // J1 首屏只有两处:goto 落地 + 点「登录」。多于此说明放宽蔓延到了别的步骤。
+    assert.ok(
+      bootUses.length === 2,
+      `BOOT_TIMEOUT 只应用于 J1 首屏落地(goto + 首个 click),当前传参 ${bootUses.length} 处`,
+    )
+    assert.match(source, /getByPlaceholder\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/)
+  })
+
   test('release verification accepts public Luna and keeps hidden Luna grant-gated', (t) => {
     const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
     const schema = `oc_release_verification_${process.pid}_${Date.now()}`
