@@ -1,10 +1,23 @@
 #!/usr/bin/env tsx
+// V5 P0/P1 事故回归锁。判据:manifest 里登记的每条证据,必须是**真的会跑、真的断言
+// 了那件事**的产物 —— 而不是一个存在的文件名。
+//
+// 2026-07-26 审计实锤(本文件此前只做 existsSync,于是):
+//   · 3 条事故(Weibo 图片/Weibo OOM/Kimi 配额)的唯一 proof 证据都填
+//     scripts/v5-e2e-journey-canary.mjs,而该脚本只有 J1-J5 登录/附件/目标/发送/送达,
+//     零 Weibo 零 quota;
+//   · 催生整套真浏览器门的 INC-20260718-ATTACH-NOOP,其 layer:'browser' 证据填的却是
+//     jsdom 的 composerAttach.test.tsx;
+//   · browser 层粒度是整个 run.mjs —— 删掉 T11/T15 整段,本门照样 PASS。
+// 因此新增四道校验:assertion 精确锚点、layer↔路径形态、layer→runner 可达、
+// 事故↔修复 commit 血缘,外加 fix(v5) commit 的 Incident trailer 闭环门。
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const MANIFEST = join(ROOT, "e2e/session-display/incidents.json");
+const WAIVERS = join(ROOT, "e2e/session-display/incident-waivers.json");
 const FIXED_MATRIX = [
   { engine: "codex", model: "gpt-5.6-luna" },
   { engine: "ccb", model: "deepseek-v4-flash" },
@@ -12,13 +25,42 @@ const FIXED_MATRIX = [
 const PROOF_LAYERS = new Set(["browser", "live-e2e", "deploy-gate"]);
 const ALL_LAYERS = new Set(["unit", "integration", ...PROOF_LAYERS]);
 
-type Regression = { layer: string; path: string };
+// ── 棘轮基线 ────────────────────────────────────────────────────────────────
+// 存量债务的上界,只许降不许升。新登记的条目必须直接合规,否则这两个数会被顶破。
+/** 允许没有 assertion 锚点的 unit/integration 条目数(proof 层一律必须有)。 */
+const ASSERTION_DEBT_BASELINE = 37;
+/**
+ * 允许"暂无 proof 层证据"的事故数(必须显式写 proofPending 说明)。
+ * 9 = 4 条存量(3 条 Weibo/Kimi 原本用无关脚本充数 + 1 条把 CI unit 误标 deploy-gate)
+ *   + 5 条 2026-07-25 紧急通道事故(补登记时如实标注:回归只到 unit 层)。
+ * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
+ */
+const PROOF_PENDING_BASELINE = 9;
+
+// ── Incident trailer 闭环门的生效起点 ───────────────────────────────────────
+// 这道门只检查**起点之后**的历史:起点之前的 fix(v5) commit 没有 Incident trailer
+// 约定,回溯要求会让门天天红且无法补救(commit message 不可改写)。起点写死在这里,
+// 不随 manifest 变动;要前移起点=一次显式决定。
+const TRAILER_GATE_START = "cfa210cc29bbfc41d9cc0e953e357cc036e7a98b";
+const TRAILER_GATE_SURFACES = [
+  "packages/gateway/",
+  "packages/commercial/",
+  "packages/web-react/",
+  "packages/protocol/",
+  "packages/storage/",
+];
+
+type Regression = { layer: string; path: string; assertion?: string };
 type Incident = {
   id: string;
   occurredAt: string;
   severity: string;
   symptom: string;
   rootFixCommit: string;
+  /** 同一事故的后续提交(典型:containment commit 先上线,回归用例在同 PR 的 test commit 里)。 */
+  coverageCommits?: string[];
+  /** 暂无 browser/live-e2e/deploy-gate 证据时必须显式说明,并计入 PROOF_PENDING_BASELINE。 */
+  proofPending?: { reason: string; since: string };
   regressions: Regression[];
 };
 type Manifest = {
@@ -27,6 +69,7 @@ type Manifest = {
   fixedLiveMatrix: Array<{ engine: string; model: string }>;
   incidents: Incident[];
 };
+type Waiver = { commit: string; reason: string; approvedBy: string; expiresAt: string };
 
 function fail(message: string): never {
   throw new Error(`[incident-regressions] ${message}`);
@@ -34,16 +77,114 @@ function fail(message: string): never {
 function git(...args: string[]): string {
   return execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
 }
+function commitFiles(sha: string): string[] {
+  return git("show", "--format=", "--name-only", sha).split("\n").map((line) => line.trim()).filter(Boolean);
+}
 
+// ── layer → 路径形态 ────────────────────────────────────────────────────────
+// layer 描述的是"这条证据在哪一层跑",不是"它讲的是哪个话题"。路径形态对不上就是
+// 层级标错(ATTACH-NOOP 把 jsdom 组件测试标成 browser 就是这么混过去的)。
+const LAYER_PATH_SHAPE: Record<string, { ok: (path: string) => boolean; expect: string }> = {
+  unit: {
+    ok: (p) => /\.test\.(ts|tsx)$/.test(p) && !/\.integ\.test\.ts$/.test(p)
+      && !p.startsWith("packages/web-react/browser-tests/") && !p.startsWith("e2e/"),
+    expect: "非 .integ 的 *.test.ts(x),且不在 browser-tests/ 或 e2e/ 下",
+  },
+  integration: {
+    ok: (p) => /\.integ\.test\.ts$/.test(p),
+    expect: "*.integ.test.ts",
+  },
+  browser: {
+    ok: (p) => p.startsWith("packages/web-react/browser-tests/"),
+    expect: "packages/web-react/browser-tests/ 下的真浏览器门产物",
+  },
+  "live-e2e": {
+    ok: (p) => p.startsWith("e2e/session-display/tests/") && p.endsWith(".spec.ts"),
+    expect: "e2e/session-display/tests/*.spec.ts",
+  },
+  "deploy-gate": {
+    ok: (p) => p.startsWith("scripts/") && !p.startsWith("scripts/__tests__/") && /\.(mjs|sh|ts)$/.test(p),
+    expect: "部署门真正调用的 scripts/ 脚本(scripts/__tests__ 下的属 unit 层)",
+  },
+};
+
+// ── layer → runner 可达性 ───────────────────────────────────────────────────
+// 声明了 layer 就必须能映射到一个真会执行它的 runner。映射不上直接红:否则"有证据"
+// 只是文件躺在仓里,没有任何流水线会因为它变红。
+type RunnerVerdict = { status: "wired" | "pending"; runner: string };
+const CI_WORKFLOW = readFileSync(join(ROOT, ".github/workflows/v5-ci.yml"), "utf8");
+const DEPLOY_SCRIPT = readFileSync(join(ROOT, "scripts/deploy-v5.sh"), "utf8");
+const ROOT_PACKAGE_JSON = readFileSync(join(ROOT, "package.json"), "utf8");
+
+function requireCi(script: string, runner: string): RunnerVerdict {
+  if (!CI_WORKFLOW.includes(script)) fail(`CI workflow 未调用 ${script},runner 映射已失效`);
+  return { status: "wired", runner };
+}
+function resolveRunner(layer: string, path: string): RunnerVerdict {
+  if (layer === "browser") {
+    return requireCi("test:browser", "CI job web-react → npm run --workspace @openclaude/web-react test:browser");
+  }
+  if (layer === "live-e2e") {
+    if (!DEPLOY_SCRIPT.includes("e2e/session-display/run.sh")) fail("deploy-v5.sh 不再调用 live e2e run.sh");
+    return { status: "wired", runner: "deploy-v5.sh candidate verification → e2e/session-display/run.sh" };
+  }
+  if (layer === "deploy-gate") {
+    const base = path.split("/").pop() ?? "";
+    if (!DEPLOY_SCRIPT.includes(base)) fail(`deploy-v5.sh 未调用 ${path},不能标 deploy-gate`);
+    return { status: "wired", runner: `deploy-v5.sh → ${base}` };
+  }
+  if (layer === "integration") {
+    // 已知缺口:integ 套件当前既不在 CI 也不在部署门里(另有 agent 正在把 integ 接进 CI)。
+    // 标 pending 而不是直接红:天天红不带来信息;但 pending 层不许充当事故的 proof 证据。
+    return { status: "pending", runner: "npm run test:commercial:integ(尚未接入 CI/部署门)" };
+  }
+  // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
+  if (/^packages\/gateway\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+    return requireCi("test:gateway", "CI job gateway → npm run test:gateway");
+  }
+  if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+    return requireCi("test:storage", "CI job storage → npm run test:storage");
+  }
+  if (/^packages\/web-react\/src\/.+\.test\.(ts|tsx)$/.test(path)) {
+    return requireCi("test:web-react", "CI job web-react → npm run test:web-react");
+  }
+  if (/^packages\/commercial\/src\/.+\.test\.ts$/.test(path)) {
+    return requireCi("test:commercial:unit:gate", "CI job commercial-unit → npm run test:commercial:unit:gate");
+  }
+  if (/^scripts\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+    if (!CI_WORKFLOW.includes("test:v5:ops")) fail("CI workflow 未调用 test:v5:ops");
+    if (!ROOT_PACKAGE_JSON.includes(path)) fail(`${path} 未列进 npm run test:v5:ops 的文件清单`);
+    return { status: "wired", runner: "CI job v5-ops → npm run test:v5:ops" };
+  }
+  // packages/protocol/src/__tests__ 当前没有任何 npm script 收它(2026-07-26 核实),
+  // 谁把它当证据登记,谁必须先补 runner。
+  fail(`${path} 映射不到任何 runner(layer=${layer});先把它接进 CI 再登记为证据`);
+}
+
+// ── manifest ────────────────────────────────────────────────────────────────
 const manifest = JSON.parse(readFileSync(MANIFEST, "utf8")) as Manifest;
-if (manifest.schema !== 1) fail(`schema must be 1, got ${manifest.schema}`);
+if (manifest.schema !== 2) fail(`schema must be 2, got ${manifest.schema}`);
 if (JSON.stringify(manifest.fixedLiveMatrix) !== JSON.stringify(FIXED_MATRIX)) {
   fail("fixedLiveMatrix must be exactly Codex/gpt-5.6-luna + CCB/deepseek-v4-flash");
 }
 if (!Array.isArray(manifest.incidents) || manifest.incidents.length === 0) fail("incidents must not be empty");
 
+const fileCache = new Map<string, string>();
+function readArtifact(path: string): string {
+  let text = fileCache.get(path);
+  if (text === undefined) {
+    text = readFileSync(join(ROOT, path), "utf8");
+    fileCache.set(path, text);
+  }
+  return text;
+}
+
 const ids = new Set<string>();
 const linked = new Set<string>();
+const pendingRunners: string[] = [];
+let assertionDebt = 0;
+let proofPending = 0;
+
 for (const incident of manifest.incidents) {
   if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(incident.id)) fail(`invalid id ${incident.id}`);
   if (ids.has(incident.id)) fail(`duplicate id ${incident.id}`);
@@ -51,25 +192,84 @@ for (const incident of manifest.incidents) {
   if (!/^2026-[0-9]{2}-[0-9]{2}$/.test(incident.occurredAt)) fail(`${incident.id}: invalid occurredAt`);
   if (incident.severity !== "P0" && incident.severity !== "P1") fail(`${incident.id}: severity must be P0/P1`);
   if (!incident.symptom?.trim()) fail(`${incident.id}: symptom is required`);
-  if (!/^[0-9a-f]{8}$/.test(incident.rootFixCommit)) fail(`${incident.id}: rootFixCommit must be 8 hex`);
-  try {
-    git("cat-file", "-e", `${incident.rootFixCommit}^{commit}`);
-    execFileSync("git", ["merge-base", "--is-ancestor", incident.rootFixCommit, "HEAD"], { cwd: ROOT });
-  } catch {
-    fail(`${incident.id}: root fix ${incident.rootFixCommit} is not an ancestor of HEAD`);
+
+  const lineageCommits = [incident.rootFixCommit, ...(incident.coverageCommits ?? [])];
+  for (const sha of lineageCommits) {
+    if (!/^[0-9a-f]{8}$/.test(sha)) fail(`${incident.id}: lineage commit ${sha} must be 8 hex`);
+    try {
+      git("cat-file", "-e", `${sha}^{commit}`);
+      execFileSync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { cwd: ROOT });
+    } catch {
+      fail(`${incident.id}: lineage commit ${sha} is not an ancestor of HEAD`);
+    }
   }
+  const lineageFiles = new Set(lineageCommits.flatMap((sha) => commitFiles(sha)));
+
   if (!Array.isArray(incident.regressions) || incident.regressions.length === 0) {
     fail(`${incident.id}: no automated regression`);
   }
-  if (!incident.regressions.some((item) => PROOF_LAYERS.has(item.layer))) {
-    fail(`${incident.id}: must have browser/live-e2e/deploy-gate proof`);
-  }
+
+  const seen = new Set<string>();
   for (const regression of incident.regressions) {
-    if (!ALL_LAYERS.has(regression.layer)) fail(`${incident.id}: invalid layer ${regression.layer}`);
-    if (regression.path.startsWith("/") || regression.path.includes("..")) fail(`${incident.id}: unsafe path`);
-    if (!existsSync(join(ROOT, regression.path))) fail(`${incident.id}: missing ${regression.path}`);
-    linked.add(regression.path);
+    const { layer, path } = regression;
+    if (!ALL_LAYERS.has(layer)) fail(`${incident.id}: invalid layer ${layer}`);
+    if (path.startsWith("/") || path.includes("..")) fail(`${incident.id}: unsafe path`);
+    if (!existsSync(join(ROOT, path))) fail(`${incident.id}: missing ${path}`);
+    const key = `${layer}:${path}:${regression.assertion ?? ""}`;
+    if (seen.has(key)) fail(`${incident.id}: duplicate regression ${key}`);
+    seen.add(key);
+
+    const shape = LAYER_PATH_SHAPE[layer];
+    if (!shape.ok(path)) fail(`${incident.id}: layer=${layer} 的 ${path} 形态不对,应为 ${shape.expect}`);
+
+    const verdict = resolveRunner(layer, path);
+    if (verdict.status === "pending") {
+      if (PROOF_LAYERS.has(layer)) fail(`${incident.id}: proof 层 ${layer} 不允许 pending runner`);
+      pendingRunners.push(`${incident.id} ${layer} ${path} → ${verdict.runner}`);
+    }
+
+    // assertion = 该产物内部的精确锚点(顶层用例名 / 浏览器 T 编号标题)。
+    // 只有它能挡住"挂靠一个存在但与事故无关的文件"。
+    if (regression.assertion !== undefined) {
+      if (!regression.assertion.trim()) fail(`${incident.id}: ${path} 的 assertion 不得为空串`);
+      if (!readArtifact(path).includes(regression.assertion)) {
+        fail(`${incident.id}: ${path} 内找不到 assertion 锚点「${regression.assertion}」`
+          + "(用例被删/改名,或这份证据根本不讲这件事)");
+      }
+    } else if (PROOF_LAYERS.has(layer)) {
+      fail(`${incident.id}: proof 层证据 ${path} 必须写 assertion 锚点`);
+    } else {
+      assertionDebt += 1;
+    }
+
+    linked.add(path);
   }
+
+  // 血缘:这条事故的修复/补测 commit 至少动过它登记的一份证据。全都没动过 = 挂靠。
+  // (逐条要求血缘不成立:live-e2e/browser 这类事后补的活体证据本就晚于 containment
+  //  commit,逐条要求会逼人删掉真证据。锚点 + assertion 两条合起来才是有效约束。)
+  const anchored = incident.regressions.some((item) => lineageFiles.has(item.path));
+  if (!anchored) {
+    fail(`${incident.id}: rootFixCommit/coverageCommits 没有动过任何一条登记的证据(疑似挂靠无关文件)`);
+  }
+
+  const hasProof = incident.regressions.some((item) => PROOF_LAYERS.has(item.layer));
+  if (!hasProof) {
+    if (!incident.proofPending?.reason?.trim() || !/^2026-[0-9]{2}-[0-9]{2}$/.test(incident.proofPending.since ?? "")) {
+      fail(`${incident.id}: 没有 browser/live-e2e/deploy-gate 证据时必须写 proofPending{reason,since}`);
+    }
+    proofPending += 1;
+  } else if (incident.proofPending) {
+    fail(`${incident.id}: 已有 proof 层证据,不该再挂 proofPending`);
+  }
+}
+
+if (assertionDebt > ASSERTION_DEBT_BASELINE) {
+  fail(`无 assertion 锚点的 unit/integration 证据 ${assertionDebt} 条 > 基线 ${ASSERTION_DEBT_BASELINE};`
+    + "新增证据必须带 assertion(基线只许降不许升)");
+}
+if (proofPending > PROOF_PENDING_BASELINE) {
+  fail(`proofPending 事故 ${proofPending} 条 > 基线 ${PROOF_PENDING_BASELINE};新事故必须带真 proof 证据`);
 }
 
 const specsDir = join(ROOT, "e2e/session-display/tests");
@@ -84,4 +284,75 @@ if (!runner.includes("OC_E2E_REQUIRE_DIRECT_TIMELINE=1")) fail("run.sh must fail
 if (!runner.includes('OC_E2E_EMAIL="v5-evals@claudeai.chat"')) fail("run.sh must use v5-evals");
 if (!runner.includes("export CI=1")) fail("run.sh must forbid focused test subsets");
 
-process.stdout.write(`[incident-regressions] PASS: ${manifest.incidents.length} P0/P1 incidents, ${linked.size} regression artifacts, fixed live matrix locked\n`);
+// ── Incident trailer 闭环门 ─────────────────────────────────────────────────
+// manifest 停更(最后更新停在 2026-07-23,此后 29 个 PR 自述的 5 个事故一条没登记)
+// 的根因是"补登记全靠自觉"。这里把它变成机制:生效起点之后,凡是触碰用户可见面的
+// fix(v5) commit,都必须在 trailer 里指认事故 id,或走带审批与到期日的 waiver。
+function parseWaivers(): Map<string, Waiver> {
+  const out = new Map<string, Waiver>();
+  if (!existsSync(WAIVERS)) return out;
+  const raw = JSON.parse(readFileSync(WAIVERS, "utf8")) as { schema: number; waivers: Waiver[] };
+  if (raw.schema !== 1) fail(`incident-waivers.json schema must be 1, got ${raw.schema}`);
+  for (const waiver of raw.waivers ?? []) {
+    if (!/^[0-9a-f]{8,40}$/.test(waiver.commit ?? "")) fail(`waiver commit 非法:${waiver.commit}`);
+    if (!waiver.reason?.trim()) fail(`waiver ${waiver.commit} 缺 reason`);
+    if (!waiver.approvedBy?.trim()) fail(`waiver ${waiver.commit} 缺 approvedBy(审批引用)`);
+    if (!/^2026-[0-9]{2}-[0-9]{2}$/.test(waiver.expiresAt ?? "")) fail(`waiver ${waiver.commit} 缺合法 expiresAt`);
+    out.set(waiver.commit.slice(0, 8), waiver);
+  }
+  return out;
+}
+
+function checkTrailerClosure(): number {
+  try {
+    git("cat-file", "-e", `${TRAILER_GATE_START}^{commit}`);
+    execFileSync("git", ["merge-base", "--is-ancestor", TRAILER_GATE_START, "HEAD"], { cwd: ROOT });
+  } catch {
+    // 浅克隆 / 起点尚未合入本分支:不冒充检查过(fail-closed 只针对能看见的历史)。
+    process.stdout.write("[incident-regressions] WARN: trailer 闭环门起点不可达(浅克隆?),本次跳过该门\n");
+    return 0;
+  }
+  const waivers = parseWaivers();
+  const today = new Date().toISOString().slice(0, 10);
+  const log = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", `${TRAILER_GATE_START}..HEAD`);
+  let checked = 0;
+  for (const entry of log.split("\x1e").map((line) => line.trim()).filter(Boolean)) {
+    const [sha, subject, body = ""] = entry.split("\x1f");
+    if (!/^fix\(v5\)/.test(subject)) continue;
+    const touched = commitFiles(sha);
+    if (!touched.some((file) => TRAILER_GATE_SURFACES.some((prefix) => file.startsWith(prefix)))) continue;
+    checked += 1;
+    const trailer = /^Incident:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
+    if (!trailer) {
+      fail(`${sha.slice(0, 8)} "${subject}" 触碰用户可见面但缺 trailer:`
+        + "Incident: INC-YYYYMMDD-SLUG,或 Incident: none (<理由>) 并登记 waiver");
+    }
+    if (/^none\b/.test(trailer)) {
+      const waiver = waivers.get(sha.slice(0, 8));
+      if (!waiver) fail(`${sha.slice(0, 8)} 声明 Incident: none,但 incident-waivers.json 里没有对应 waiver`);
+      if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
+      continue;
+    }
+    if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
+      fail(`${sha.slice(0, 8)} 的 Incident trailer 格式非法:${trailer}`);
+    }
+    const incident = manifest.incidents.find((item) => item.id === trailer);
+    if (!incident) fail(`${sha.slice(0, 8)} 指向的 ${trailer} 不在 incidents.json 内(补登记后再合)`);
+    const lineage = [incident.rootFixCommit, ...(incident.coverageCommits ?? [])];
+    if (!lineage.some((candidate) => sha.startsWith(candidate))) {
+      fail(`${sha.slice(0, 8)} 声明 ${trailer},但该事故的 rootFixCommit/coverageCommits 未包含本 commit`);
+    }
+  }
+  return checked;
+}
+
+const trailerChecked = checkTrailerClosure();
+
+for (const note of pendingRunners) {
+  process.stdout.write(`[incident-regressions] pending-runner: ${note}\n`);
+}
+process.stdout.write(
+  `[incident-regressions] PASS: ${manifest.incidents.length} P0/P1 incidents, ${linked.size} regression artifacts, `
+  + `assertion debt ${assertionDebt}/${ASSERTION_DEBT_BASELINE}, proofPending ${proofPending}/${PROOF_PENDING_BASELINE}, `
+  + `trailer-closure checked ${trailerChecked} fix(v5) commits, fixed live matrix locked\n`,
+);

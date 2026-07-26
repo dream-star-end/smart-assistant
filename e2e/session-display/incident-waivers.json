@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "scope": "Incident trailer 闭环门的豁免簿。凡 subject 匹配 ^fix(v5) 且触碰 packages/{gateway,commercial,web-react,protocol,storage} 的 commit,都必须在 trailer 写 `Incident: INC-YYYYMMDD-SLUG`;确实与任何事故无关的,写 `Incident: none (<理由>)` 并在此登记一条 waiver。waiver 必须带审批引用与到期日,过期即门红 —— 它是有时限的例外,不是永久出口。",
+  "waivers": []
+}
