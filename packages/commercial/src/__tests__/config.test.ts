@@ -313,6 +313,37 @@ describe("config.loadConfig 生产危险开关 fail-closed", () => {
 /**
  * TURNSTILE_BYPASS_ACCOUNTS —— 取代全局旁路的账号级白名单。
  */
+describe("config.TURNSTILE_ENFORCE", () => {
+  test("缺省 = 强制(true)", () => {
+    assert.equal(loadConfig(VALID_ENV).TURNSTILE_ENFORCE, true);
+  });
+
+  test("显式 '1' = 强制,'0' = 不强制", () => {
+    assert.equal(loadConfig({ ...VALID_ENV, TURNSTILE_ENFORCE: "1" }).TURNSTILE_ENFORCE, true);
+    assert.equal(loadConfig({ ...VALID_ENV, TURNSTILE_ENFORCE: "0" }).TURNSTILE_ENFORCE, false);
+  });
+
+  test("【关键】生产下 TURNSTILE_ENFORCE=0 不被危险开关扫描误拦", () => {
+    // 它是显式产品配置而非测试旁路,键名不含 TEST/BYPASS/INSECURE/UNSAFE 段。
+    // 若被误拦,线上就没有任何"合法关闭强制"的手段,只能退回那个被禁的 TEST_BYPASS。
+    assert.doesNotThrow(() =>
+      loadConfig({ ...VALID_ENV, NODE_ENV: "production", TURNSTILE_ENFORCE: "0" }),
+    );
+  });
+
+  test("【关键】被认可的白名单键在生产下必须放行(键名含 _BYPASS_ 段但值非真值)", () => {
+    // TURNSTILE_BYPASS_ACCOUNTS 自身匹配危险正则,靠"值非 1/true/yes"才放行。
+    // 这条缺失过一次:上线前是靠人工实测才发现的,补成回归。
+    assert.doesNotThrow(() =>
+      loadConfig({
+        ...VALID_ENV,
+        NODE_ENV: "production",
+        TURNSTILE_BYPASS_ACCOUNTS: "v5-canary@claudeai.chat,v5-evals@claudeai.chat",
+      }),
+    );
+  });
+});
+
 describe("config.TURNSTILE_BYPASS_ACCOUNTS", () => {
   test("缺省 = 空表(谁也不能旁路)", () => {
     assert.deepEqual(loadConfig(VALID_ENV).TURNSTILE_BYPASS_ACCOUNTS, []);

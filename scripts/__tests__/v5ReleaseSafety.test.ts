@@ -5686,9 +5686,14 @@ wait $!
     assert.match(fn, /CADDY_HTTP_PORT/, '必须走可配端口,不许硬编码 :80')
     assert.match(fn, /Host: claudeai\.chat/, '必须带 Host 头经 Caddy 探测(拦截规则在 Caddy 层)')
     assert.match(fn, /if ! ssh /, '远端 heredoc 的退出码必须接(不接 = fail-open)')
-    // 配置层断言:没有它,池子被清空后 curl 探测退化成"文件本来就不存在 → 404" = 空断言
-    assert.match(fn, /handle @sourcemap/, '必须断言 live Caddyfile 真有拦截块')
-    assert.match(fn, /map_line.*-ge.*assets_line|-ge "\$assets_line"/, '必须断言拦截块排在 /assets 之前')
+    // 配置层断言:没有它,池子被清空后 curl 探测退化成"文件本来就不存在 → 404" = 空断言。
+    // 断言的**形态**必须跟着模板走:守卫嵌在 /assets 块内、被 route 包住、respond 早于
+    // file_server。绝不能再断言"文本行号更小"—— adapter 会按路径特异性重排 handle,
+    // 那个前提是错的(2026-07-26 实测:文本断言全绿而线上仍 200)。
+    assert.match(fn, /handle \\\/assets/, '必须定位 live Caddyfile 的 /assets 块')
+    assert.match(fn, /@sourcemap path \*\.map/, '必须断言 /assets 块内有 @sourcemap 匹配器')
+    assert.match(fn, /respond @sourcemap 404/, '必须断言 /assets 块内有 respond 404')
+    assert.match(fn, /r_line.*-ge.*f_line|-ge "\$f_line"/, '必须断言 respond 早于 file_server')
     assert.match(fn, /= "000"/, 'curl 连不上必须与"拿到 200"分开判,探测本身坏了也要 fail-loud')
     assert.match(fn, /return 1/, '门失败必须返回非零')
 

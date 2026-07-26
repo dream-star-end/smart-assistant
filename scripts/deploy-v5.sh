@@ -5554,23 +5554,37 @@ smoke_sourcemap_sealed() {
   if ! ssh "$KL_HOST" bash -s -- "$V5_ASSETS_POOL" "$CADDY_HTTP_PORT" <<'REMOTE'
 set -euo pipefail
 POOL="$1"; PORT="$2"
-# ① 配置层断言:live Caddyfile 必须真的有拦截块,且排在 /assets 直服之前。
+# ① 配置层断言:live Caddyfile 必须真的有拦截块。
 #    没这一条,池子被清空后 curl 探测会退化成"文件本来就不存在 → 404",门变空断言。
 #    注意 caddy_render_reload 只在 canary/finalize/abort 流程调 —— 普通 deploy 不重渲染,
 #    所以改了模板必须显式跑 scripts/v5-caddy-apply.sh --apply,本断言就是那一步的活体回执。
+#
+#    【断言形态的由来,别再改回去】守卫**嵌在** handle /assets/* 内、被 route 包住:
+#      handle /assets/* { root * POOL; route { @sourcemap path *.map; respond @sourcemap 404; file_server } }
+#    早期版本把它写成独立 handle 排在 /assets 之前,并在这里断言"文本行号更小"——
+#    那个前提是错的:Caddyfile adapter 会按路径特异性给同组 handle 重排,/assets/* 反而
+#    排到前面,*.map 永不命中,而文本断言照样绿(2026-07-26 实测线上仍 200)。
+#    所以这里**不再断言文本行号**,只断言"守卫在 /assets 块内、route 内、respond 早于 file_server"。
 CADDYFILE=/etc/caddy/Caddyfile
 if [ ! -r "$CADDYFILE" ]; then
   echo "✗ 读不到 $CADDYFILE,无法确认 sourcemap 拦截已生效" >&2
   exit 1
 fi
-map_line="$(grep -n 'handle @sourcemap' "$CADDYFILE" | head -1 | cut -d: -f1)"
-assets_line="$(grep -n 'handle /assets/\*' "$CADDYFILE" | head -1 | cut -d: -f1)"
-if [ -z "$map_line" ]; then
-  echo "✗ live Caddyfile 缺 handle @sourcemap —— 需先跑 scripts/v5-caddy-apply.sh --apply" >&2
+assets_block="$(awk '/^\thandle \/assets\/\*/{f=1} f{print} f&&/^\t}/{exit}' "$CADDYFILE")"
+if [ -z "$assets_block" ]; then
+  echo "✗ live Caddyfile 找不到 handle /assets/* 块 —— 需先跑 scripts/v5-caddy-apply.sh --apply" >&2
   exit 1
 fi
-if [ -n "$assets_line" ] && [ "$map_line" -ge "$assets_line" ]; then
-  echo "✗ live Caddyfile 里 handle @sourcemap(行 $map_line)排在 handle /assets/*(行 $assets_line)之后 —— 永不命中" >&2
+for needle in 'route {' '@sourcemap path *.map' 'respond @sourcemap 404'; do
+  if ! printf '%s\n' "$assets_block" | grep -qF "$needle"; then
+    echo "✗ live Caddyfile 的 /assets 块内缺 [$needle] —— 需先跑 scripts/v5-caddy-apply.sh --apply" >&2
+    exit 1
+  fi
+done
+r_line="$(printf '%s\n' "$assets_block" | grep -nF 'respond @sourcemap 404' | head -1 | cut -d: -f1)"
+f_line="$(printf '%s\n' "$assets_block" | grep -nF 'file_server'            | head -1 | cut -d: -f1)"
+if [ -z "$r_line" ] || [ -z "$f_line" ] || [ "$r_line" -ge "$f_line" ]; then
+  echo "✗ live Caddyfile 的 route 内 respond(${r_line:-<none>})未排在 file_server(${f_line:-<none>})之前 —— 拦不住" >&2
   exit 1
 fi
 
