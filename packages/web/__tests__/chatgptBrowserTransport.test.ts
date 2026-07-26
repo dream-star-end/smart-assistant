@@ -52,7 +52,7 @@ describe('ChatGPT browser frontend WebRTC/HiDPI behavior', () => {
     assert.match(INDEX, /\/style\.css\?v=70/)
     assert.match(INDEX, /\/modules\/main\.js\?v=87/)
     assert.match(INDEX, /sw-flush-v29/)
-    assert.match(SW, /openclaude-v112/)
+    assert.match(SW, /openclaude-v113/)
     assert.match(SW, /\/style\.css\?v=70/)
     assert.match(SW, /\/modules\/main\.js\?v=87/)
   })

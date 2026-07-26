@@ -46,6 +46,25 @@ describe('effortsForModel: capability authority', () => {
       'max',
       'ultracode',
     ])
+    // Opus 5 — Opus 4.8 successor, same full ladder + ultracode; id-variant tolerant.
+    assert.deepEqual(effortsForModel('claude-opus-5'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultracode',
+    ])
+    assert.deepEqual(effortsForModel('CLAUDE-OPUS-5'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultracode',
+    ])
+    // The opus-5 regex must NOT swallow 4.x ids (they hit their own branches below).
+    assert.deepEqual(effortsForModel('claude-opus-4-5'), [])
     assert.deepEqual(effortsForModel('claude-opus-4-8'), [
       'low',
       'medium',
