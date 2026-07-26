@@ -166,6 +166,18 @@ CADDY
 		}
 	}
 
+	# ── 安全:sourcemap 绝不出公网 ──
+	# 2026-07-26 实测:/assets/main-*.js.map 公网 200、901KB、含全量 sourcesContent。
+	# handle 块按**书写顺序**互斥求值,故本块必须排在 /assets/* 直服之前,先把 *.map 吃掉。
+	# 与 vite 的 sourcemap:hidden(不写 sourceMappingURL)、deploy-v5.sh 的 rsync --exclude
+	# (不进池)构成纵深防御:即使池里残留历史 .map(存量 7312 个),这一层也让它不可达。
+	# 注意:本 heredoc 是非引号形式(要插值资产池路径),注释里严禁出现反引号或
+	# 美元加圆括号的命令替换写法 —— 会被 shell 真的当命令执行掉(本块首版就踩过)。
+	@sourcemap path *.map
+	handle @sourcemap {
+		respond 404
+	}
+
 	# ── /assets/* → 共享 union 资产池直服(lane 无关;跨 lane/abort 懒加载 chunk 仍可得,RFC §2)──
 	handle /assets/* {
 		root * ${ASSETS_POOL}
@@ -264,6 +276,21 @@ self_check() {
   _need "$tmp/seed"  'root \* /opt/openclaude/openclaude-v5-assets' 'seed'
   _need "$tmp/seed"  'import /etc/caddy/openclaude-v5-upstream-errors.caddy' 'seed'
   _need "$tmp/seed"  '@v5pay path /api/payment/hupi/callback-v5' 'seed'
+  # sourcemap 拦截:两种形态都必须有,且必须**先于** /assets 直服(handle 按书写顺序互斥求值;
+  # 排在后面等于永不命中 —— 这正是只断言"存在"会漏掉的那类静默失效)。
+  _sourcemap_guard() { # <file> <label>
+    _need "$1" '@sourcemap path \*\.map' "$2"
+    _need "$1" 'handle @sourcemap'       "$2"
+    local m a; m="$(grep -n 'handle @sourcemap' "$1" | head -1 | cut -d: -f1)"
+    a="$(grep -n 'handle /assets/\*'      "$1" | head -1 | cut -d: -f1)"
+    if [[ -z "$m" || -z "$a" || "$m" -ge "$a" ]]; then
+      echo "  ✗ [$2] handle @sourcemap 必须先于 handle /assets/*(map=${m:-<none>} assets=${a:-<none>})" >&2; ok=0
+    fi
+    # respond 404 必须在 @sourcemap 的 handle 块内(紧随其后一行)。
+    grep -A1 'handle @sourcemap' "$1" | grep -q 'respond 404' \
+      || { echo "  ✗ [$2] handle @sourcemap 块内缺 respond 404" >&2; ok=0; }
+  }
+  _sourcemap_guard "$tmp/seed" 'seed'
 
   echo "── self-check ②:canary 准备期(step<READY)matcher 不可见 ──"
   _deny "$tmp/canary_prep" '@v5canary'          'canary-prep'
@@ -278,6 +305,8 @@ self_check() {
   _need "$tmp/canary" 'health_timeout 2s'       'canary'
   _need "$tmp/canary" 'max_fails 2'             'canary'
   _need "$tmp/canary" 'fail_duration 10s'       'canary'
+  # canary 形态同样必须拦死 sourcemap(灰度用户也不得拿到源码)。
+  _sourcemap_guard "$tmp/canary" 'canary'
 
   echo "── self-check ④:finalizing/aborting 相位(相位感知 step 解释)──"
   local fin1 fin2 abo; fin1="$tmp/fin1"; fin2="$tmp/fin2"; abo="$tmp/abo"

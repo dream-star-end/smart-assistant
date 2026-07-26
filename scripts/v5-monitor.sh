@@ -10,6 +10,10 @@
 #     4. 容器池:运行中的 v5-ccb 必须全部带 managed/channel/uid 身份标签；容量由
 #        上面的磁盘与 MemAvailable 检查负责。OC_RUNTIME_IMAGE 指向的镜像必须存在于
 #        docker images(防 tag 漂移 → 起容器全挂)
+#     5. 宿主结构面(2026-07-26 审计补的三项,见 docs/V5_MONITORING.md):
+#        failed_units(任何 systemd 单元 failed —— 整类替代"逐个单元配 OnFailure")、
+#        backup_fresh(本地每日备份新鲜度;kl-hk 异地容灾退役后这是唯一数据保护)、
+#        mem_oversubscribe(容器 memory limit 合计 / 物理内存 超售倍数)
 #   告警去重:状态文件记录每项上次状态,只在翻转(好→坏 / 坏→好=恢复)时发告警,
 #   坏状态持续时每 6 小时重复提醒一次。
 #
@@ -57,6 +61,9 @@ ENV_FILE="${V5MON_ENV_FILE:-/etc/openclaude/commercial-v5.env}"
 STATE_FILE="${V5MON_STATE_FILE:-/var/lib/openclaude-v5/monitor-state.json}"
 LOG_FILE="${V5MON_LOG_FILE:-/var/log/openclaude-v5-monitor.log}"
 MEMINFO="${V5MON_MEMINFO:-/proc/meminfo}"
+# 本地备份根目录(openclaude-v5-backup.service 每日 20:00 UTC 在此建当日子目录)。
+# kl-hk 异地容灾 2026-07-26 退役后,这里是**唯一**数据保护面,见 check_backup_fresh。
+BACKUP_DIR="${V5MON_BACKUP_DIR:-/var/backups/openclaude-v5}"
 
 V5_HEALTH_URL="${V5MON_V5_URL:-http://127.0.0.1:18790/healthz}"
 V5_B_HEALTH_URL="${V5MON_V5_B_URL:-http://127.0.0.1:18795/healthz}"
@@ -82,6 +89,8 @@ fi
 
 DISK_MAX_PCT=85        # / 与 /var 使用率上限(%)
 MEM_MIN_AVAIL_PCT=10   # MemAvailable/MemTotal 下限(%)
+BACKUP_MAX_AGE_HOURS=30  # 本地备份最新子目录允许的最大 mtime 年龄(h;备份每日 20:00 UTC,留 6h 余量)
+MEM_OVERSUB_MAX_RATIO=1.5  # 容器 memory limit 合计 / 物理内存 的上限倍数
 REALERT_SECS=21600     # 坏状态持续时的重复提醒间隔(6h)
 CURL_TIMEOUT=5
 DS_STEP_CANARY_READY="${DS_STEP_CANARY_READY:-10}"
@@ -328,6 +337,104 @@ check_client_4xx_storm() {
   fi
 }
 
+check_failed_units() {
+  # systemd 单元静默失败(整类根治,不是单点补丁)。背景:2026-07-26 审计发现异地容灾
+  # v5-dr-sync.service / v5-dr-volumes.service 连败 43 小时无人知晓,根因是这两个单元的
+  # `OnFailure=` 是空的(openclaude-v5-backup.service 配了,它们漏了)。逐个单元补
+  # OnFailure 只能救已知的那几个,下一个新单元照样漏 —— 所以这里直接把"本机存在任何
+  # failed 单元"变成一项探针:新单元零配置自动纳入监控,单元级 OnFailure 退化为加速通道。
+  # severity=warning:失败单元 ≠ 全站故障,但必须可见。
+  local out rc units n extra
+  out="$(systemctl list-units --state=failed --no-legend --no-pager 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # systemctl 自身不可用(systemd 不在跑/被限权)也是 bad —— 不能静默当"没有失败单元"
+    record failed_units bad "systemctl list-units --state=failed 调用失败(rc=$rc):$(echo "$out" | head -c 120)"; return
+  fi
+  # 输出形如 `● foo.service loaded failed failed Description`(首列是状态圆点,可能缺省)。
+  # 严格按"单元名形状"取值:形状不符的行不当作单元名(否则 systemctl 输出变体会天天误报);
+  # systemctl 真挂掉的场景已由上面的 rc 分支 fail-loud 覆盖。
+  units="$(printf '%s\n' "$out" | awk \
+    -v re='^[A-Za-z0-9@:._-]+[.](service|socket|target|timer|path|mount|automount|swap|slice|scope|device)$' '
+    NF == 0 { next }
+    { u = $1; if (u !~ re) u = $2 }        # 首列是圆点时单元名在第二列(圆点是多字节,不按字符判)
+    u ~ re { print u }
+  ')"
+  n="$(printf '%s' "$units" | grep -c . || true)"
+  if [ "${n:-0}" -eq 0 ]; then
+    record failed_units ok "systemd 无 failed 单元"
+  else
+    extra=""; [ "$n" -gt 5 ] && extra=" 等 ${n} 个"
+    record failed_units bad "systemd failed 单元 ${n} 个:$(printf '%s' "$units" | head -5 | tr '\n' ' ' | sed 's/ *$//')${extra}(先 journalctl -u <unit> 看根因,再 systemctl reset-failed)"
+  fi
+}
+
+check_backup_fresh() {
+  # 本地备份新鲜度。背景:kl-hk 异地容灾 2026-07-26 退役(单元已归档、复制槽 v5_hk_dr 已 drop),
+  # 现在 $BACKUP_DIR 下的每日备份是**唯一**数据保护面 —— 它自己静默停摆就等于零保护,
+  # 所以按 critical 报。判据 = 最新子目录 mtime 年龄 ≤ BACKUP_MAX_AGE_HOURS(备份每日
+  # 20:00 UTC 跑,30h 阈值容忍一次延迟但抓得住"连续两天没跑")。目录不存在/读不到同样 bad。
+  local latest mtime name age_h dr_note
+  dr_note="当前无异地容灾(kl-hk 已于 2026-07-26 退役),本地备份是唯一数据保护"
+  if [ ! -d "$BACKUP_DIR" ] || [ ! -r "$BACKUP_DIR" ]; then
+    record backup_fresh bad "备份目录 $BACKUP_DIR 不存在或不可读 —— ${dr_note}"; return
+  fi
+  latest="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1)"
+  if [ -z "$latest" ]; then
+    record backup_fresh bad "备份目录 $BACKUP_DIR 下没有任何备份子目录 —— ${dr_note}"; return
+  fi
+  mtime="${latest%% *}"; mtime="${mtime%%.*}"; name="$(basename "${latest#* }")"
+  if ! [[ "$mtime" =~ ^[0-9]+$ ]]; then
+    record backup_fresh bad "备份目录 $BACKUP_DIR 取 mtime 失败:$(echo "$latest" | head -c 120) —— ${dr_note}"; return
+  fi
+  age_h=$(( (NOW - mtime) / 3600 ))
+  if [ "$age_h" -gt "$BACKUP_MAX_AGE_HOURS" ]; then
+    record backup_fresh bad "最新备份 ${name} 已 ${age_h}h 未更新(阈值 ${BACKUP_MAX_AGE_HOURS}h,备份每日 20:00 UTC)—— ${dr_note}"
+  else
+    record backup_fresh ok "最新备份 ${name}(${age_h}h 前;阈值 ${BACKUP_MAX_AGE_HOURS}h)"
+  fi
+}
+
+check_mem_oversubscribe() {
+  # 容器内存超售。背景:2026-07-26 审计实测 24 个容器 × 4GiB limit = 96GiB vs 物理 31GB
+  # (5 倍超售)且宿主无 swap —— 平时容器中位只用 236MB 看不出问题,一旦几个容器同时吃满
+  # limit 就是宿主级 OOM(内核直接 kill,不挑对象)。check_mem 只看"此刻 available",
+  # 看不见这种**结构性**风险,所以单开一项:合计 limit / 物理内存 > 阈值即 bad。
+  # limit=0(未设)的容器不计入合计,但同样能吃满物理内存 —— detail 里点名提示。
+  # severity=warning:是容量结构预警,不是当下故障。
+  local ids limits total mem_kb swap_kb mem_bytes zero_n ratio swap_state
+  if ! ids="$(docker ps -q 2>&1)"; then
+    record mem_oversubscribe bad "docker ps 失败:$(echo "$ids" | head -c 120)"; return
+  fi
+  mem_kb="$(awk '/^MemTotal:/{print $2; exit}' "$MEMINFO" 2>/dev/null)"
+  swap_kb="$(awk '/^SwapTotal:/{print $2; exit}' "$MEMINFO" 2>/dev/null)"
+  if ! [[ "${mem_kb:-}" =~ ^[0-9]+$ ]] || [ "$mem_kb" -le 0 ]; then
+    record mem_oversubscribe bad "读 $MEMINFO MemTotal 失败"; return
+  fi
+  mem_bytes=$(( mem_kb * 1024 ))
+  swap_state="无"
+  [[ "${swap_kb:-0}" =~ ^[0-9]+$ ]] && [ "${swap_kb:-0}" -gt 0 ] && swap_state="有($(( swap_kb / 1024 ))MiB)"
+  if [ -z "$ids" ]; then
+    record mem_oversubscribe ok "无运行中容器(limit 合计 0 / 物理 $(awk -v b="$mem_bytes" 'BEGIN{printf "%.1f", b/1073741824}') GiB,swap=${swap_state})"; return
+  fi
+  # 一次 inspect 传全部容器 ID(严禁在循环里逐个调:24 个容器 = 24 次 docker API 往返,
+  # 每 2 分钟一轮的探针不能这么花)。$ids 故意不加引号 —— 需要按行拆成多个参数。
+  # shellcheck disable=SC2086
+  if ! limits="$(docker inspect --format '{{.HostConfig.Memory}}' $ids 2>&1)"; then
+    record mem_oversubscribe bad "docker inspect 取 HostConfig.Memory 失败:$(echo "$limits" | head -c 120)"; return
+  fi
+  total="$(printf '%s\n' "$limits" | awk '/^[0-9]+$/{s+=$1} END{printf "%.0f", s+0}')"
+  zero_n="$(printf '%s\n' "$limits" | awk '/^0$/{n++} END{printf "%d", n+0}')"
+  ratio="$(awk -v a="$total" -v b="$mem_bytes" 'BEGIN{printf "%.1f", (b>0 ? a/b : 0)}')"
+  local detail
+  detail="容器 limit 合计 $(awk -v b="$total" 'BEGIN{printf "%.1f", b/1073741824}') GiB / 物理 $(awk -v b="$mem_bytes" 'BEGIN{printf "%.1f", b/1073741824}') GiB = ${ratio} 倍,swap=${swap_state}"
+  [ "${zero_n:-0}" -gt 0 ] && detail="${detail};另有 ${zero_n} 个容器未设 limit(不计入合计但可吃满物理内存)"
+  if awk -v a="$total" -v b="$mem_bytes" -v t="$MEM_OVERSUB_MAX_RATIO" 'BEGIN{exit !(b > 0 && a / b > t)}'; then
+    record mem_oversubscribe bad "内存超售:${detail}(阈值 ${MEM_OVERSUB_MAX_RATIO} 倍)——并发峰值会触发宿主级 OOM"
+  else
+    record mem_oversubscribe ok "内存超售:${detail}(阈值 ${MEM_OVERSUB_MAX_RATIO} 倍)"
+  fi
+}
+
 slot_unit() { case "$1" in A) echo openclaude-v5 ;; B) echo openclaude-v5-b ;; *) return 1 ;; esac; }
 slot_health_url() { case "$1" in A) echo "$V5_HEALTH_URL" ;; B) echo "$V5_B_HEALTH_URL" ;; *) return 1 ;; esac; }
 
@@ -402,9 +509,12 @@ check_serving_masters() {
 # mail = critical:注册/找回密码链路对新用户等同全挂,且历史上两次静默断数天。
 check_severity() {
   case "$1" in
-    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures) echo critical ;;
-    # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化。均按 warning。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm) echo warning ;;
+    # backup_fresh = critical:kl-hk 异地容灾 2026-07-26 退役后,本地每日备份是唯一数据
+    # 保护面,它停摆 = 数据零保护(且和 mail 一样属于"静默数天才被发现"的历史故障形态)。
+    deploy_state|svc_v5|svc_candidate_v5|svc_egress|http_v5|http_candidate_v5|http_egress|http_v3|public_route|pool|image|mail|turn_failures|backup_fresh) echo critical ;;
+    # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化;
+    # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警。均按 warning。
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -441,6 +551,9 @@ check_mail
 check_turn_failures
 check_kp_plugin
 check_client_4xx_storm
+check_failed_units
+check_backup_fresh
+check_mem_oversubscribe
 
 # ───────────────────────────────────────────────
 # 状态对比 → 事件(去重核心)

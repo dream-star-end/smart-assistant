@@ -19,7 +19,8 @@
 //   V5_TURN_MODEL(默认 gpt-5.6-sol —— codex 引擎侧,即 2026-07-17 的盲区面)
 //   V5_TURN_ATTEMPTS(默认 8;容器冷启动时 bridge 会 close,需重连)
 //   V5_TURN_SILENCE_MS(默认 90000;xhigh 思考档需要长窗;仅作兜底,判成靠三信号)
-//   OC_CANARY_TURNSTILE_TOKEN(默认 'x' —— 依赖 canary 账号 turnstile bypass;换机/关 bypass 时注入真 token)
+//   OC_CANARY_TURNSTILE_TOKEN(默认 'x' —— 依赖 canary 邮箱在线上 TURNSTILE_BYPASS_ACCOUNTS
+//     账号白名单里;换机时把新 canary 邮箱加进该 env 键即可,不要再打开全局旁路)
 //   V5_CANARY_REQUIRE_COST(默认 1;canary 账号落免单套餐时置 0 放宽计费断言)
 // 退出码:0=turn 三信号齐全;1=失败(错误帧/收尾或计费缺失/重试耗尽);2=配置错误。
 import { createRequire } from 'node:module'
@@ -35,7 +36,10 @@ const PASSWORD_FILE = process.env.V5_CANARY_PASSWORD_FILE ?? '/root/.secrets/v5-
 const MODEL = process.env.V5_TURN_MODEL ?? 'gpt-5.6-sol'
 const ATTEMPTS = Number(process.env.V5_TURN_ATTEMPTS ?? 8)
 const SILENCE_MS = Number(process.env.V5_TURN_SILENCE_MS ?? 90000)
-// turnstile_token: 生产依赖 kl-mirror 上对 canary 账号的 turnstile bypass(登录校验放行 'x')。
+// turnstile_token: 生产走**账号级**白名单放行占位 token —— canary 邮箱必须在
+// TURNSTILE_BYPASS_ACCOUNTS(env,见 config.ts / auth/turnstile.ts resolveTurnstileBypass)。
+// 2026-07-26 前这里依赖的是全局 TURNSTILE_TEST_BYPASS=1,那等于全站人机验证失效,已废止:
+// 生产开全局旁路会被 config.ts 的危险开关扫描在启动期直接拒绝。
 // 若 bypass 关闭/换机,用 OC_CANARY_TURNSTILE_TOKEN 注入一个真实 token 覆盖。
 const TURNSTILE_TOKEN = process.env.OC_CANARY_TURNSTILE_TOKEN ?? 'x'
 // 计费到账断言(默认必开):turn 收尾后必须收到 outbound.cost_charged。仅当 canary 账号

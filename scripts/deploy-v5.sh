@@ -5533,6 +5533,73 @@ smoke_e2e_journey() {
   fi
 }
 
+# 2026-07-26 安全整改:sourcemap 封堵活体门(第四层)。前三层是"配置对了应该没事"
+# (vite hidden / rsync --exclude / Caddy 404),这一层是**活体证明**:真的从 Caddy
+# 取一次 .map,断言拿不到 200。为什么必须有:三层里任意一层被后人改回去(改 vite、
+# 改池子同步、重生成 Caddyfile 时漏了 handle 顺序)都不会有任何报错,只会静默重新
+# 泄漏全量源码 —— 正是 2026-07-26 之前的状态。
+#
+# 探测对象取**池子里真实存在的一个 .map**(存量 7312 个),没有则回退到一个必然不
+# 存在的路径:两种情况都必须非 200。前者证明"拦截生效",后者至少证明"没有目录遍历"。
+# 走 Caddy(带 Host 头 + $CADDY_HTTP_PORT),不走 master 端口 —— 拦截规则在 Caddy 层。
+#
+# 铁律遵循:远端 heredoc 退出码必须接(不接 = fail-open,requiredMigrations 就这样漏过);
+# 不硬编码 :80;curl 失败(连不上)与"拿到 200"分开判 —— 前者是探测本身坏了,同样 fail-loud。
+smoke_sourcemap_sealed() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] sourcemap 封堵活体门:经 Caddy 取 *.map 断言非 200"
+    return 0
+  fi
+  echo "── smoke:sourcemap 封堵活体门(经 Caddy:${CADDY_HTTP_PORT})──"
+  if ! ssh "$KL_HOST" bash -s -- "$V5_ASSETS_POOL" "$CADDY_HTTP_PORT" <<'REMOTE'
+set -euo pipefail
+POOL="$1"; PORT="$2"
+# ① 配置层断言:live Caddyfile 必须真的有拦截块,且排在 /assets 直服之前。
+#    没这一条,池子被清空后 curl 探测会退化成"文件本来就不存在 → 404",门变空断言。
+#    注意 caddy_render_reload 只在 canary/finalize/abort 流程调 —— 普通 deploy 不重渲染,
+#    所以改了模板必须显式跑 scripts/v5-caddy-apply.sh --apply,本断言就是那一步的活体回执。
+CADDYFILE=/etc/caddy/Caddyfile
+if [ ! -r "$CADDYFILE" ]; then
+  echo "✗ 读不到 $CADDYFILE,无法确认 sourcemap 拦截已生效" >&2
+  exit 1
+fi
+map_line="$(grep -n 'handle @sourcemap' "$CADDYFILE" | head -1 | cut -d: -f1)"
+assets_line="$(grep -n 'handle /assets/\*' "$CADDYFILE" | head -1 | cut -d: -f1)"
+if [ -z "$map_line" ]; then
+  echo "✗ live Caddyfile 缺 handle @sourcemap —— 需先跑 scripts/v5-caddy-apply.sh --apply" >&2
+  exit 1
+fi
+if [ -n "$assets_line" ] && [ "$map_line" -ge "$assets_line" ]; then
+  echo "✗ live Caddyfile 里 handle @sourcemap(行 $map_line)排在 handle /assets/*(行 $assets_line)之后 —— 永不命中" >&2
+  exit 1
+fi
+
+# ② 活体断言:取池内任意一个真实 .map 探测;池已清空则用必然不存在的哨兵路径。
+#    两种情况都必须非 200(前者证明拦截生效,后者至少证明没有目录遍历)。
+probe="$(find "$POOL/assets" -maxdepth 1 -name '*.map' -printf '%f\n' 2>/dev/null | head -1)"
+[ -n "$probe" ] || probe="oc-sourcemap-seal-probe.js.map"
+code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+  -H 'Host: claudeai.chat' "http://127.0.0.1:${PORT}/assets/${probe}" 2>/dev/null || echo "000")"
+if [ "$code" = "000" ]; then
+  echo "✗ sourcemap 探测本身失败(curl 连不上 Caddy:${PORT}) probe=${probe}" >&2
+  exit 1
+fi
+if [ "$code" = "200" ]; then
+  echo "✗ sourcemap 仍可公网获取:/assets/${probe} → HTTP 200(源码泄漏)" >&2
+  exit 1
+fi
+echo "  · sourcemap 已封堵:/assets/${probe} → HTTP ${code}"
+REMOTE
+  then
+    echo "✗✗ sourcemap 封堵门失败 —— 前端源码可能正经公网泄漏。" >&2
+    echo "   排查:①Caddyfile 是否含 @sourcemap 且排在 handle /assets/* 之前" >&2
+    echo "        (bash scripts/v5-caddy-apply.sh 重生成并看 self-check)" >&2
+    echo "        ②资产池同步是否漏了 --exclude='*.map'" >&2
+    echo "        ③vite.config.ts 的 build.sourcemap 是否被改回 true" >&2
+    return 1
+  fi
+}
+
 # C5:rollback 收尾后的 real-turn canary —— **非阻断**。回滚本体必须能落地,故这里
 # 的真 turn 只做"回滚后引擎是否真能出正文"的健康观测:失败只大声告警,**绝不**反向翻回
 # 已成功的回滚(回滚往往正是在引擎已坏时执行,再拿 turn 结果当门会把救援自我否决)。
@@ -6178,6 +6245,7 @@ deploy() {
   if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
     echo "  ✓ setup-first 完成：扫码实时感知已上线；Plugin/安装仍钉旧 v1.0，等待用户在界面绑定"
     end_planned_maintenance
+    smoke_sourcemap_sealed || exit 1
     smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
@@ -6187,6 +6255,7 @@ deploy() {
   if [[ "$kp_deploy_bracket" == 0 ]]; then
     echo "  · Knowledge Planet:零接触部署(门未关/classify 降级),跳过 seed;promotion 顺延至下次部署或显式 verify lane"
     end_planned_maintenance
+    smoke_sourcemap_sealed || exit 1
     smoke_e2e_journey || exit 1
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
@@ -6207,6 +6276,7 @@ deploy() {
     exit 1
   fi
   end_planned_maintenance
+  smoke_sourcemap_sealed || exit 1
   smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
@@ -6456,6 +6526,7 @@ deploy_dist() {
   dist_handshake_smoke "$ACTIVE_PORT"
   end_planned_maintenance
   # dist(纯前端)是 UI 回归的最高发面(2026-07-18 附件事故即 --dist 上线),E2E 旅程门必跑。
+  smoke_sourcemap_sealed || exit 1
   smoke_e2e_journey || exit 1
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
@@ -7097,14 +7168,19 @@ sync_assets_to_pool() {
   local reldir="$1"
   echo "── 同步 assets → union 池 $V5_ASSETS_POOL/assets(加法,无 --delete)──"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] mkdir -p $V5_ASSETS_POOL/assets; rsync -a(加法) $reldir/packages/web-react/dist/assets/ → 池"
+    echo "  [dry-run] mkdir -p $V5_ASSETS_POOL/assets; rsync -a --exclude='*.map'(加法) $reldir/packages/web-react/dist/assets/ → 池"
   else
     # MAJOR 2:去 || true —— assets 未就位 = 前端 chunk 404,rsync 失败即**中止 lane**(fail-loud),
     # 绝不"绿灯放行 chunk 缺失"。(reldir 无 assets 目录=旧 release,内部 if 跳过,非失败。)
+    # --exclude='*.map':sourcemap 绝不进公网直服池(2026-07-26 安全整改第三层)。
+    # 实测事故:/assets/main-*.js.map 公网 200、901KB、含 72 个源文件完整 sourcesContent。
+    # .map 仍留在 release 目录(本机栈帧还原/排障要用),只是不 ship 到 Caddy 直服的池子。
+    # 另两层:vite `sourcemap:'hidden'`(不写 sourceMappingURL 指针)、
+    # v5-caddy-apply.sh 的 `@sourcemap → 404`(兜住池里的历史残留)。
     if ! ssh "$KL_HOST" "set -e
       mkdir -p '$V5_ASSETS_POOL/assets'
       if [ -d '$reldir/packages/web-react/dist/assets' ]; then
-        rsync -a '$reldir/packages/web-react/dist/assets/' '$V5_ASSETS_POOL/assets/'
+        rsync -a --exclude='*.map' '$reldir/packages/web-react/dist/assets/' '$V5_ASSETS_POOL/assets/'
       fi" 2>&1 | sed 's/^/  /'; then
       echo "✗ assets 同步到 union 池失败(远端 rsync/ssh 错误)—— 前端 chunk 未就位,中止 lane。" >&2
       return 1

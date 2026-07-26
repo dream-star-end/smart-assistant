@@ -31,6 +31,10 @@ auth=()
 was_installed=unknown
 installed_by_us=0
 
+# turnstile_token='x' 能过,靠的是**账号级**白名单:评测账号必须在线上 env
+# TURNSTILE_BYPASS_ACCOUNTS 里(判定权威 = auth/turnstile.ts 的 resolveTurnstileBypass)。
+# 2026-07-26 起不再依赖全局 TURNSTILE_TEST_BYPASS —— 那个键等于全站人机验证失效,
+# 现在生产开它会被 config.ts 的危险开关扫描在启动期直接拒绝。
 login() {
   TOK=$(curl -sf -b "$COOKIE_FILE" -c "$COOKIE_FILE" -X POST \
     "$V5_BASE/api/auth/login" -H 'Content-Type: application/json' \

@@ -3406,6 +3406,10 @@ export async function registerCommercial(
     redis: wrapIoredis(redis),
     turnstileSecret: cfg.TURNSTILE_SECRET,
     turnstileBypass: cfg.TURNSTILE_TEST_BYPASS,
+    // 账号级人机验证白名单(2026-07-26 安全整改)。生产上 TURNSTILE_TEST_BYPASS 已被
+    // config.ts 的危险开关扫描 fail-closed 拦死,自动化(e2e-journey / smoke-turn /
+    // 技能评测)改由这里的账号白名单放行 —— 作用域收敛到具体邮箱,真实用户零影响。
+    turnstileBypassAccounts: cfg.TURNSTILE_BYPASS_ACCOUNTS,
     turnstileSiteKey: cfg.TURNSTILE_SITE_KEY,
     requireEmailVerified: cfg.REQUIRE_EMAIL_VERIFIED,
     // HIGH#4:生产 claudeai.chat 全 HTTPS,默认 Secure cookie;

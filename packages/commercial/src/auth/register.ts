@@ -28,7 +28,7 @@ import { z } from "zod";
 import { randomBytes, createHash, randomInt } from "node:crypto";
 import { tx } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
-import { verifyTurnstile, TurnstileError } from "./turnstile.js";
+import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
 import type { Mailer } from "./mail.js";
 
 /** RFC 5322 简化邮箱正则,长度 ≤ 254(05-SEC §7) */
@@ -98,8 +98,10 @@ export interface RegisterDeps {
   mailer: Mailer;
   /** turnstile secret(env);bypass 模式可不传 */
   turnstileSecret?: string;
-  /** test bypass turnstile(env TURNSTILE_TEST_BYPASS=1) */
+  /** 全局旁路 turnstile(env TURNSTILE_TEST_BYPASS=1),仅 dev/CI;生产 fail-closed */
   turnstileBypass?: boolean;
+  /** 账号级旁路白名单(env TURNSTILE_BYPASS_ACCOUNTS),生产给自动化账号留的合法通道 */
+  turnstileBypassAccounts?: readonly string[];
   /** 用户 IP — 转给 turnstile + 反滥用日志 */
   remoteIp?: string;
   /** 测试可注入 fetch(传给 turnstile) */
@@ -205,11 +207,18 @@ export async function register(
   const input = parsed.data;
 
   // 2) Turnstile
+  // 旁路判定收口到 resolveTurnstileBypass(单一权威),register 只消费结果。
+  const turnstileBypass = resolveTurnstileBypass({
+    globalBypass: deps.turnstileBypass,
+    bypassAccounts: deps.turnstileBypassAccounts,
+    accountEmail: input.email,
+    route: "POST /api/auth/register",
+  });
   let turnstileOk = false;
   try {
     turnstileOk = await verifyTurnstile(input.turnstile_token, deps.turnstileSecret, {
       remoteIp: deps.remoteIp,
-      bypass: deps.turnstileBypass === true,
+      bypass: turnstileBypass,
       fetchImpl: deps.fetchImpl,
     });
   } catch (err) {

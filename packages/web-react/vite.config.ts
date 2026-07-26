@@ -54,7 +54,14 @@ export default defineConfig(() => {
     },
     build: {
       outDir: "dist",
-      sourcemap: true,
+      // 'hidden' = 照常产出 .map 文件(release 目录里保留,供本机栈帧还原/排障),但**不**在
+      // bundle 末尾写 `//# sourceMappingURL=` 注释 —— 浏览器/爬虫拿不到指针。
+      // 2026-07-26 实测事故:线上 /assets/main-*.js.map 公网 200、901KB、含 72 个源文件的
+      // 完整 sourcesContent(等于全量源码泄漏)。本项是四层防护的第一层(源头不留指针),
+      // 后三层见 scripts/deploy-v5.sh(rsync 排除 *.map 不进公网池 + 部署活体门)与
+      // scripts/v5-caddy-apply.sh(@sourcemap → 404)。true → 'hidden' 不影响任何构建产物
+      // 的内容哈希以外的行为,dev(vite serve)不受此项影响。
+      sourcemap: "hidden",
       manifest: true,
       // 双 Vite 入口:用户端 SPA(index.html)+ 管理后台(admin.html)。两者共享
       // 同一 assets 目录(内容哈希、可长缓存)与同一设计系统 chunk(react-vendor /
