@@ -117,6 +117,49 @@ scripts/ccb-upstream.sh plan v2.8.4     # 三方合并预演:冲突面、搬迁�
 
 ---
 
+## 4.0 UX 回退检查(每次升级必做,仓内铁律"任何优化不得降低用户体验")
+
+跟进上游可能在两个地方悄悄拿掉用户已有的能力。**代码合并绿、测试绿,都不能证明没回退** ——
+必须单独跑这两项对照:
+
+### ① feature 门控的新增
+
+上游 v2.8.4 起有 `DEFAULT_BUILD_FEATURES`(35 项默认开),而 v5 生产是零 feature(见 `build.ts`
+的 v5 定制段)。危险情形是:**pin 时代某能力不受门控(直接可用),上游给它加了门控** ——
+那我们不开就等于砍掉用户已有功能。
+
+```bash
+# 对每个 feature 名,对比两侧的门控点数量
+for f in $(feature 名单); do
+  echo "$f  pin=$(git grep -l "feature('$f')" <pin> -- src | wc -l)" \
+       "new=$(git grep -l "feature('$f')" <target> -- src packages | wc -l)"
+done
+# pin=0 且 new>0  → 重点:再查该功能在 pin 时代是否存在
+#   pin 时代无此功能 → 上游新功能,不开 = 暂不新增,不是回退
+#   pin 时代有此功能 → **必须开**,否则是回退
+```
+
+2026-07-26 v2.8.4 实测:35 项中 30 项 pin 时代就有门控(生产一直关着,关掉=维持现状);
+5 项新增门控(ACP / EXPERIMENTAL_SEARCH_EXTRA_TOOLS / POOR / AUTOFIX_PR / GOAL)经查
+**pin 时代功能均不存在** → 全关零回退。注:CCB 的 `GOAL` 与 v5 自己的 `/goal`
+(`packages/protocol/src/goalState.ts`)是两套独立机制,不要混淆。
+
+### ② 工具集缩减
+
+```bash
+git ls-tree -r --name-only <pin>    -- src/tools | grep -oE 'src/tools/[A-Za-z]+Tool' | sed 's|.*/||' | sort -u
+git ls-tree -r --name-only <target> -- src/tools packages/builtin-tools | grep -oE 'tools/[A-Za-z]+Tool' | sed 's|tools/||' | sort -u
+# comm -23 两侧 = 被上游移除的工具 → 逐个查它在 pin 时代是否受(v5 关着的)feature 门控
+```
+
+2026-07-26 实测:上游移除 `ToolSearchTool`(pin 时代由 `isToolSearchEnabledOptimistic()`
+控制,挂 EXPERIMENTAL_SKILL_SEARCH,v5 关着)与 `WorkflowTool`(pin 时代就在
+`feature('WORKFLOW_SCRIPTS')` 门内)→ 两者对 v5 用户本来都不可达,移除无影响。
+同期新增 10 个工具(ArtifactTool / ExecuteTool / GoalTool / PushNotificationTool 等),
+多数在 feature 门内,属后续 feature 批的候选增益。
+
+---
+
 ## 4.1 测试基线与判定方法(升级验证必读)
 
 CCB 的测试套件有两个坑,不知道会把好几个小时浪费在假失败上:
