@@ -199,7 +199,10 @@ describe('runner mandatory-mutator parity — 每个 engine × 每个 mutator', 
           )
         }
       }
-      await adapter.shutdown?.call?.(adapter)
+      // adapter 被断言成 Record<string, unknown>,所以 shutdown 的静态类型是 {} ——
+      // 直接 .call 过不了 tsc。这里显式收窄成"可选的零参函数"再调。
+      const shutdown = adapter.shutdown
+      if (typeof shutdown === 'function') await (shutdown as () => unknown).call(adapter)
     })
 
     it(`${engineId}: duck-typed mutator 按引擎语义齐备(缺一个 = 静默用错模型/工具)`, async () => {
@@ -233,7 +236,10 @@ describe('runner mandatory-mutator parity — 每个 engine × 每个 mutator', 
           )
         }
       }
-      await adapter.shutdown?.call?.(adapter)
+      // adapter 被断言成 Record<string, unknown>,所以 shutdown 的静态类型是 {} ——
+      // 直接 .call 过不了 tsc。这里显式收窄成"可选的零参函数"再调。
+      const shutdown = adapter.shutdown
+      if (typeof shutdown === 'function') await (shutdown as () => unknown).call(adapter)
     })
   }
 })
