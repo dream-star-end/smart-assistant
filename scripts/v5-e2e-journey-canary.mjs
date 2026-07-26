@@ -5,8 +5,9 @@
 // 用户成了人肉 canary。本脚本用真 Chromium(受信事件)走一遍核心用户旅程,作为
 // 部署后的 UI 层验收门:
 //   J1 登录表单形态断言(widget 必须在 + turnstile_bypass 必须 false)+ API 登录种 cookie
-//      (2026-07-26 安全整改:全局旁路改账号级白名单,widget 对 headless 出交互挑战解不了,
-//       故登录本体走 API;表单形态仍被断言,反而多了一条'旁路被偷偷打开'的活体探针)
+//      (2026-07-26 安全整改:旁路从环境级降为账号级白名单。widget 对 headless 会出交互
+//       挑战、自动化解不了,故登录本体走 API(canary 邮箱在白名单里);表单形态仍被
+//       无条件断言,反而多了一条'旁路被偷偷打开'的活体探针)
 //   J2 附件全链:「+」菜单 → 添加附件 → filechooser 真实弹出 → 真实上传 → chip done
 //   J3 目标全链:「+」菜单 → 创建目标 → active 可见 → 清除并恢复未设置
 //   J4 带附件发送:消息上屏 + 附件区清空
@@ -155,20 +156,18 @@ try {
       return r.ok ? await r.json() : null;
     });
     if (!publicConfig) fatal(1, "J1 读 /api/public/config 失败");
-    // 强制态下才断言 widget 存在。turnstile_bypass=true 有两种合法来源:dev/CI 的全局
-    // 测试旁路,以及产品配置 TURNSTILE_ENFORCE=0(2026-07-26 起线上暂为此态,因为 CF
-    // widget 仍是 Managed 交互模式,会让真实用户多一次勾选 —— 详见 config.ts 的债与
-    // 偿还条件)。所以这里**不能**无条件断言 bypass 必须为 false,否则暂关期间门恒红。
-    // 断言仍有价值:一旦线上翻回强制,widget 缺失就会被这道门抓住。
+    // 人机验证在生产是**无条件强制**的(不存在"暂时关掉"的开关),所以这两条断言
+    // 也无条件:turnstile_bypass 必须为 false、登录表单必须真的挂上 Cloudflare widget。
+    // 它们同时充当"全局旁路是否被偷偷打开"的活体探针 —— 旁路一旦回来,前端会走占位
+    // token 路径、widget 消失,本门立刻红。
     if (publicConfig.turnstile_bypass === true) {
-      console.log("e2e-journey: · turnstile 当前不强制(bypass=true),跳过 widget 形态断言");
-    } else {
-      await page
-        .locator('iframe[src*="challenges.cloudflare.com"]')
-        .first()
-        .waitFor({ state: "attached", timeout: STEP_TIMEOUT })
-        .catch(() => fatal(1, "J1 强制态下登录表单未挂载 Turnstile widget —— 真实用户的人机验证缺失"));
+      fatal(1, "J1 生产返回 turnstile_bypass=true —— 人机验证被旁路(安全回归)");
     }
+    await page
+      .locator('iframe[src*="challenges.cloudflare.com"]')
+      .first()
+      .waitFor({ state: "attached", timeout: STEP_TIMEOUT })
+      .catch(() => fatal(1, "J1 登录表单未挂载 Turnstile widget —— 真实用户的人机验证缺失"));
 
     // ── 登录本体走 API,不走表单 ──────────────────────────────────────────
     // 为什么不填表单点登录:widget 会对 headless 浏览器出交互式挑战(这正是它该做的),

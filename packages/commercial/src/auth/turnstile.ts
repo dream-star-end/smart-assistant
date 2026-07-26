@@ -32,12 +32,6 @@ function normalizeAccount(v: string | null | undefined): string {
 }
 
 export interface ResolveTurnstileBypassArgs {
-  /**
-   * env TURNSTILE_ENFORCE —— 是否对真实用户强制人机验证。**缺省视为 true(强制)**,
-   * 只有显式传 false 才放行。与 globalBypass 的区别见 config.ts 的常量注释:
-   * 那个是"测试旁路"(生产 fail-closed 禁用),这个是显式产品配置。
-   */
-  enforce?: boolean;
   /** env TURNSTILE_TEST_BYPASS —— 全局旁路,仅 dev/CI。 */
   globalBypass?: boolean;
   /** env TURNSTILE_BYPASS_ACCOUNTS 解析后的邮箱白名单(config.ts 已规范化)。 */
@@ -69,9 +63,6 @@ export interface ResolveTurnstileBypassArgs {
  * 日志只记 email + route,**绝不记 token**。
  */
 export function resolveTurnstileBypass(args: ResolveTurnstileBypassArgs): boolean {
-  // 0. 产品级"不强制":显式配置(TURNSTILE_ENFORCE=0)。放在最前 —— 它一旦为假,
-  //    后面的白名单/全局旁路都无关紧要。缺省(undefined)视为强制,绝不因忘传而放行。
-  if (args.enforce === false) return true;
   if (args.globalBypass === true) return true;
   const accounts = args.bypassAccounts;
   if (!accounts || accounts.length === 0) return false;

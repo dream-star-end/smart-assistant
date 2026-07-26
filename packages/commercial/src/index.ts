@@ -3410,7 +3410,6 @@ export async function registerCommercial(
     // config.ts 的危险开关扫描 fail-closed 拦死,自动化(e2e-journey / smoke-turn /
     // 技能评测)改由这里的账号白名单放行 —— 作用域收敛到具体邮箱,真实用户零影响。
     turnstileBypassAccounts: cfg.TURNSTILE_BYPASS_ACCOUNTS,
-    turnstileEnforce: cfg.TURNSTILE_ENFORCE,
     turnstileSiteKey: cfg.TURNSTILE_SITE_KEY,
     requireEmailVerified: cfg.REQUIRE_EMAIL_VERIFIED,
     // HIGH#4:生产 claudeai.chat 全 HTTPS,默认 Secure cookie;

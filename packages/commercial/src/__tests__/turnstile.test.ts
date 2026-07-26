@@ -90,32 +90,6 @@ describe("auth.turnstile.verifyTurnstile", () => {
 describe("auth.turnstile.resolveTurnstileBypass", () => {
   const ACCOUNTS = ["v5-canary@claudeai.chat", "v5-evals@claudeai.chat"] as const;
 
-  test("enforce=false 直接放行(显式产品配置,优先级最高)", () => {
-    assert.equal(resolveTurnstileBypass({ enforce: false }), true);
-    // 即使白名单为空、也没有全局旁路,不强制就是不强制
-    assert.equal(
-      resolveTurnstileBypass({ enforce: false, bypassAccounts: [], accountEmail: "someone@example.com" }),
-      true,
-    );
-  });
-
-  test("enforce 缺省(undefined)= 强制,绝不因忘传而放行", () => {
-    // 这条是本开关最危险的失效形态:新调用点忘了透传 enforce,若默认放行则等于全站关掉
-    assert.equal(resolveTurnstileBypass({ accountEmail: "someone@example.com" }), false);
-    assert.equal(resolveTurnstileBypass({}), false);
-  });
-
-  test("enforce=true 时白名单语义不变", () => {
-    assert.equal(
-      resolveTurnstileBypass({ enforce: true, bypassAccounts: ACCOUNTS, accountEmail: "v5-canary@claudeai.chat" }),
-      true,
-    );
-    assert.equal(
-      resolveTurnstileBypass({ enforce: true, bypassAccounts: ACCOUNTS, accountEmail: "someone@example.com" }),
-      false,
-    );
-  });
-
   test("全局旁路为真时直接放行(dev/CI 语义,生产由 config fail-closed 拦死)", () => {
     assert.equal(resolveTurnstileBypass({ globalBypass: true }), true);
     // 全局旁路优先级最高:即使没有白名单、没有邮箱也放行

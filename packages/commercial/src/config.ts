@@ -68,35 +68,6 @@ const turnstileSecret = z.string().trim().min(1).optional();
 
 const turnstileBypass = z.enum(["0", "1"]).optional().transform((v) => v === "1");
 
-/**
- * TURNSTILE_ENFORCE —— 人机验证**是否对真实用户强制**(默认 1 = 强制)。
- *
- * 为什么需要它、以及它和 TURNSTILE_TEST_BYPASS 的本质区别:
- * 后者自称"测试旁路、生产严禁开启",却在生产 env 里躺了很久 —— 名字撒谎、状态不可审计,
- * 所以被 loadConfig 的危险开关扫描 fail-closed 钉死。本键是**显式的产品配置**:
- * 语义诚实(就是"要不要强制")、默认强制、关闭时启动日志大声播报、并在
- * `/api/public/config` 如实下发给前端(前端据此决定渲染真 widget 还是占位 token),
- * 不存在"以为开着其实关着"的状态。
- *
- * 【当前为何在生产设为 0 —— 临时方案 + 已知债 + 偿还触发条件】
- * 2026-07-26 实测:线上 Turnstile widget 配的是 **Managed 交互模式**,
- * 有头浏览器 + 真实 Windows Chrome UA + 屏蔽 webdriver 标记,分别经机房 IP 与
- * 住宅 IP 两轮验证,**都不会自动通过**,而是弹出"请验证您是真人"复选框,
- * 且登录按钮在通过前硬禁用。即真实用户登录要多一次点击,环境受限者(国产内核 /
- * 网络受限)可能直接登不进去,而 product_friction_events 里 turnstile 相关记录为 0 条
- * —— 失败完全静默。同期滥用证据为零(4 个月内最高单日 12 注册、零限流事件)。
- * 依"任何优化不得降低用户体验"的产品红线,先关强制。
- *
- * **偿还触发条件(三条全满足才可翻回 1)**:
- *   1. Cloudflare 后台把该 widget 从 Managed 改为 Invisible / Non-Interactive;
- *   2. turnstile 结果遥测已上线(成功/失败/超时进 product_friction_events,失败率可见);
- *   3. 真机验证过鸿蒙 ArkWeb / Quark / iOS Safari 三个目标内核。
- * 在此之前注册/登录**没有人机验证**,这是明知代价的临时状态,不是遗忘。
- */
-const turnstileEnforce = z
-  .enum(["0", "1"])
-  .optional()
-  .transform((v) => v !== "0");
 
 /**
  * TURNSTILE_BYPASS_ACCOUNTS —— 账号级人机验证白名单(2026-07-26 安全审计整改)。
@@ -498,8 +469,6 @@ export const commercialConfigSchema = z
     JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars").optional(),
     TURNSTILE_SECRET: turnstileSecret,
     TURNSTILE_TEST_BYPASS: turnstileBypass,
-    /** 0 → 不对真实用户强制人机验证(显式产品配置,默认 1;见常量处的债与偿还条件) */
-    TURNSTILE_ENFORCE: turnstileEnforce,
     TURNSTILE_BYPASS_ACCOUNTS: turnstileBypassAccounts,
     TURNSTILE_SITE_KEY: turnstileSiteKey,
     /** 1 → 强制 email_verified=true 才能登录 */
@@ -792,16 +761,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       message: i.message,
     }));
     throw new ConfigError(issues);
-  }
-  // 关掉人机验证强制是"明知代价的临时状态",绝不能静默 —— 每次启动都大声播报,
-  // 让任何人看一眼日志就知道现在没有人机验证,以及翻回去的三个前置条件。
-  // (与 TURNSTILE_TEST_BYPASS 的核心差别正在于此:那个键假装自己不在生产。)
-  if (result.data.TURNSTILE_ENFORCE === false) {
-    console.warn(
-      "[turnstile-enforcement-off] 注册/登录/找回密码当前**不做人机验证**(TURNSTILE_ENFORCE=0)。" +
-        "翻回 1 的前置条件:①CF widget 改 Invisible/Non-Interactive ②turnstile 结果遥测上线 " +
-        "③鸿蒙 ArkWeb / Quark / iOS Safari 真机验证通过。详见 config.ts 的 turnstileEnforce 注释。",
-    );
   }
   return result.data;
 }

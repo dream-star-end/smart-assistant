@@ -97,8 +97,6 @@ export interface RequestResetDeps extends CommonDeps {
   resetUrlBase?: string
   /** Cloudflare Turnstile server-side secret(env);bypass 模式可不传 */
   turnstileSecret?: string
-  /** 是否对真实用户强制人机验证(env TURNSTILE_ENFORCE,缺省=强制) */
-  turnstileEnforce?: boolean
   /** 全局旁路:跳过 turnstile(env TURNSTILE_TEST_BYPASS),仅 dev/CI;生产 fail-closed */
   turnstileBypass?: boolean
   /** 账号级旁路白名单(env TURNSTILE_BYPASS_ACCOUNTS),生产给自动化账号留的合法通道 */
@@ -298,7 +296,6 @@ export async function requestPasswordReset(
     // emailSchema)——白名单比对只做 trim + 小写,不依赖格式校验结果;而且旁路
     // 判定必须在 email 校验之前完成,保持"turnstile 先于任何 email 处理"的次序。
     const turnstileBypass = resolveTurnstileBypass({
-      enforce: deps.turnstileEnforce,
       globalBypass: deps.turnstileBypass,
       bypassAccounts: deps.turnstileBypassAccounts,
       accountEmail: rawEmail,
