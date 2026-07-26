@@ -159,6 +159,8 @@ export interface LoginDeps {
   jwtSecret: string | Uint8Array;
   /** turnstile secret(env);bypass 模式可不传 */
   turnstileSecret?: string;
+  /** 是否对真实用户强制人机验证(env TURNSTILE_ENFORCE,缺省=强制) */
+  turnstileEnforce?: boolean;
   /** 全局旁路(env TURNSTILE_TEST_BYPASS),仅 dev/CI;生产由 config.ts fail-closed 拦死 */
   turnstileBypass?: boolean;
   /** 账号级旁路白名单(env TURNSTILE_BYPASS_ACCOUNTS),生产给自动化账号留的合法通道 */
@@ -229,6 +231,7 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
   // 2) Turnstile
   // 旁路判定收口到 resolveTurnstileBypass(单一权威),login 只消费结果。
   const turnstileBypass = resolveTurnstileBypass({
+    enforce: deps.turnstileEnforce,
     globalBypass: deps.turnstileBypass,
     bypassAccounts: deps.turnstileBypassAccounts,
     accountEmail: input.email,

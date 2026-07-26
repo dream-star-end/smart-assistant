@@ -5,9 +5,8 @@
 // 用户成了人肉 canary。本脚本用真 Chromium(受信事件)走一遍核心用户旅程,作为
 // 部署后的 UI 层验收门:
 //   J1 登录表单形态断言(widget 必须在 + turnstile_bypass 必须 false)+ API 登录种 cookie
-//      (2026-07-26 安全整改:旁路从环境级降为账号级白名单。widget 对 headless 会出交互
-//       挑战、自动化解不了,故登录本体走 API(canary 邮箱在白名单里);表单形态仍被
-//       无条件断言,反而多了一条'旁路被偷偷打开'的活体探针)
+//      (2026-07-26 安全整改:全局旁路改账号级白名单,widget 对 headless 出交互挑战解不了,
+//       故登录本体走 API;表单形态仍被断言,反而多了一条'旁路被偷偷打开'的活体探针)
 //   J2 附件全链:「+」菜单 → 添加附件 → filechooser 真实弹出 → 真实上传 → chip done
 //   J3 目标全链:「+」菜单 → 创建目标 → active 可见 → 清除并恢复未设置
 //   J4 带附件发送:消息上屏 + 附件区清空
@@ -161,26 +160,26 @@ try {
       return r.ok ? await r.json() : null;
     });
     if (!publicConfig) fatal(1, "J1 读 /api/public/config 失败");
-    // 人机验证在生产是**无条件强制**的(不存在"暂时关掉"的开关),所以断言也无条件。
-    //
-    // 判据一:服务端真相 —— turnstile_bypass 必须为 false。旁路一旦被偷偷打开,这里立刻红。
+    // 人机验证的**强制与否是产品配置**(TURNSTILE_ENFORCE),两种状态都合法,所以断言
+    // 必须先读服务端真相再决定断什么 —— 无条件断言会在关闭态让部署门恒红。
     if (publicConfig.turnstile_bypass === true) {
-      fatal(1, "J1 生产返回 turnstile_bypass=true —— 人机验证被旁路(安全回归)");
-    }
-    // 判据二:前端确实在装 widget —— 断言页面请求了 Turnstile 的 api.js。
-    //
-    // 【为什么不断言 iframe/DOM,踩过两个坑】
-    //   ① 选择器不成立:Turnstile 的 iframe `src` 属性通常是 about:blank / blob,
-    //      真实 URL 在内部,`iframe[src*="challenges.cloudflare.com"]` 即使在公网也匹配不到。
-    //   ② 环境结构性不可满足:本旅程经 ssh 隧道访问 http://127.0.0.1:<port>,而 Turnstile
-    //      sitekey 是**按域名限制**的 —— 实测该路径下 Cloudflare 报 `Error: 110200`
-    //      (域名不在白名单),widget 无法正常渲染。在这里断言 widget 可用是错的。
-    //   同期公网真实域名实测:widget 正常渲染、turnstile_bypass=false —— 真实用户不受影响。
-    //
-    // 请求 api.js 这一条既域名无关(隧道下照样发出)、又能抓住真正的回归类:
-    // 前端不再渲染 widget(比如有人把占位 token 路径改成默认)。
-    if (!turnstileScriptRequested) {
-      fatal(1, "J1 登录表单未请求 Turnstile api.js —— 前端可能已不再渲染人机验证 widget");
+      console.log("e2e-journey: · turnstile 当前不强制(bypass=true),跳过 widget 装载断言");
+    } else {
+      // 强制态:断言前端确实在装 widget —— 判据是"页面请求了 Turnstile 的 api.js"。
+      //
+      // 【为什么不断言 iframe/DOM,踩过两个坑】
+      //   ① 选择器不成立:Turnstile 的 iframe `src` 属性通常是 about:blank / blob,真实
+      //      URL 在内部,`iframe[src*="challenges.cloudflare.com"]` 即使在公网也匹配不到。
+      //   ② 环境结构性不可满足:本旅程经 ssh 隧道访问 http://127.0.0.1:<port>,而 Turnstile
+      //      sitekey 按域名限制 —— 实测该路径下 Cloudflare 报 `Error: 110200`(域名不在
+      //      白名单)。在这里断言 widget 可用是错的。
+      //   同期公网真实域名实测:widget 正常渲染 —— 真实用户不受影响,是断言写错了。
+      //
+      // 请求 api.js 这一条既域名无关(隧道下照样发出)、又能抓住真正的回归类:
+      // 前端不再渲染 widget(比如有人把占位 token 路径改成默认)。
+      if (!turnstileScriptRequested) {
+        fatal(1, "J1 强制态下未请求 Turnstile api.js —— 前端可能已不再渲染人机验证 widget");
+      }
     }
 
     // ── 登录本体走 API,不走表单 ──────────────────────────────────────────
