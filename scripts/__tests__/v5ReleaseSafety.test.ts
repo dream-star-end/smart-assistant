@@ -3970,10 +3970,12 @@ describe('v5 release safety lanes', () => {
     assert.equal(production.status, 0, production.stderr)
     assert.equal(
       createHash('sha256').update(production.stdout).digest('hex'),
-      // 2026-07-26 安全整改:seed 渲染新增 `@sourcemap path *.map` + `handle @sourcemap { respond 404 }`
-      // (必须排在 handle /assets/* 之前),golden 随之更新。改 golden 时必须同时看
-      // 下面那条 sourcemap 顺序断言 —— 只更 hash 不看内容等于把门关了。
-      '092968ddbf488b962deda83870584c155aa20f9042cc5620275d9d591dd9022d',
+      // 2026-07-26 安全整改:/assets 处理块内嵌 route + `@sourcemap path *.map` +
+      // `respond @sourcemap 404`,golden 随之更新。改 golden 时必须同时看下面那条
+      // sourcemap 结构断言 —— 只更 hash 不看内容等于把门关了。
+      // (首版曾用"独立 handle 排在 /assets 之前"的写法,文本断言绿但线上照样 200 —— 
+      //  adapter 按路径特异性重排,详见模板与下面那条测试的注释。)
+      'fd659d46d64c42d341a494275127e1420d16883be47ad2ff43bdfe7efac85929',
     )
     assert.doesNotMatch(production.stdout, /\tbind /)
 
@@ -5725,19 +5727,22 @@ wait $!
         /command not found/,
         `${label}: Caddy 模板 heredoc 里有被 shell 执行掉的命令替换`,
       )
-      const mapAt = rendered.stdout.indexOf('handle @sourcemap')
+      // 守卫必须**嵌在** /assets 处理块内、并被 route 包住。
+      // 【为什么不断言文本顺序】首版把 @sourcemap 写成独立 handle 排在 /assets 之前,
+      // 文本断言与 self-check 都绿,**线上照样 200** —— Caddyfile adapter 会按路径特异性
+      // 给同组 handle 重排,编译后 /assets/* 反而排前面,*.map 永不命中。
+      // route 的语义是"保持写法顺序不重排",是唯一不依赖 adapter 内部排序的写法。
       const assetsAt = rendered.stdout.indexOf('handle /assets/*')
-      assert.ok(mapAt >= 0, `${label}: 渲染结果缺 handle @sourcemap`)
       assert.ok(assetsAt >= 0, `${label}: 渲染结果缺 handle /assets/*`)
+      const blockEnd = rendered.stdout.indexOf('\n\t}', assetsAt)
+      assert.ok(blockEnd > assetsAt, `${label}: /assets 块未闭合`)
+      const block = rendered.stdout.slice(assetsAt, blockEnd)
+      assert.match(block, /route \{/, `${label}: /assets 块内缺 route(不用 route 会被 adapter 重排)`)
+      assert.match(block, /@sourcemap path \*\.map/, `${label}: /assets 块内缺 @sourcemap 匹配器`)
+      assert.match(block, /respond @sourcemap 404/, `${label}: /assets 块内缺 respond @sourcemap 404`)
       assert.ok(
-        mapAt < assetsAt,
-        `${label}: handle @sourcemap 必须排在 handle /assets/* 之前(map=${mapAt} assets=${assetsAt})`,
-      )
-      assert.match(rendered.stdout, /@sourcemap path \*\.map/, `${label}: matcher 形态不对`)
-      assert.match(
-        rendered.stdout.slice(mapAt, assetsAt),
-        /respond 404/,
-        `${label}: @sourcemap 块内缺 respond 404`,
+        block.indexOf('respond @sourcemap 404') < block.indexOf('file_server'),
+        `${label}: respond @sourcemap 404 必须在 route 内位于 file_server 之前`,
       )
     }
   })
