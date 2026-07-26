@@ -1,9 +1,9 @@
-import { c as _c } from "react/compiler-runtime";
 import * as React from 'react';
 import { useEffect, useRef } from 'react';
-import { KeyboardShortcutHint } from '../components/design-system/KeyboardShortcutHint.js';
-import { Box, Text } from '../ink.js';
+import { KeyboardShortcutHint } from '@anthropic/ink';
+import { Box, Text } from '@anthropic/ink';
 import { useKeybinding } from '../keybindings/useKeybinding.js';
+
 type Props = {
   onRun: () => void;
   onCancel: () => void;
@@ -14,66 +14,37 @@ type Props = {
  * Component that shows a notification about running /issue command
  * with the ability to cancel via ESC key
  */
-export function AutoRunIssueNotification(t0) {
-  const $ = _c(8);
-  const {
-    onRun,
-    onCancel,
-    reason
-  } = t0;
+export function AutoRunIssueNotification({ onRun, onCancel, reason }: Props): React.ReactNode {
   const hasRunRef = useRef(false);
-  let t1;
-  if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
-    t1 = {
-      context: "Confirmation"
-    };
-    $[0] = t1;
-  } else {
-    t1 = $[0];
-  }
-  useKeybinding("confirm:no", onCancel, t1);
-  let t2;
-  let t3;
-  if ($[1] !== onRun) {
-    t2 = () => {
-      if (!hasRunRef.current) {
-        hasRunRef.current = true;
-        onRun();
-      }
-    };
-    t3 = [onRun];
-    $[1] = onRun;
-    $[2] = t2;
-    $[3] = t3;
-  } else {
-    t2 = $[2];
-    t3 = $[3];
-  }
-  useEffect(t2, t3);
-  let t4;
-  if ($[4] === Symbol.for("react.memo_cache_sentinel")) {
-    t4 = <Box><Text bold={true}>Running feedback capture...</Text></Box>;
-    $[4] = t4;
-  } else {
-    t4 = $[4];
-  }
-  let t5;
-  if ($[5] === Symbol.for("react.memo_cache_sentinel")) {
-    t5 = <Box><Text dimColor={true}>Press <KeyboardShortcutHint shortcut="Esc" action="cancel" /> anytime</Text></Box>;
-    $[5] = t5;
-  } else {
-    t5 = $[5];
-  }
-  let t6;
-  if ($[6] !== reason) {
-    t6 = <Box flexDirection="column" marginTop={1}>{t4}{t5}<Box><Text dimColor={true}>Reason: {reason}</Text></Box></Box>;
-    $[6] = reason;
-    $[7] = t6;
-  } else {
-    t6 = $[7];
-  }
-  return t6;
+
+  // Handle ESC key to cancel
+  useKeybinding('confirm:no', onCancel, { context: 'Confirmation' });
+
+  // Run /issue immediately on mount
+  useEffect(() => {
+    if (!hasRunRef.current) {
+      hasRunRef.current = true;
+      onRun();
+    }
+  }, [onRun]);
+
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Box>
+        <Text bold>Running feedback capture...</Text>
+      </Box>
+      <Box>
+        <Text dimColor>
+          Press <KeyboardShortcutHint shortcut="Esc" action="cancel" /> anytime
+        </Text>
+      </Box>
+      <Box>
+        <Text dimColor>Reason: {reason}</Text>
+      </Box>
+    </Box>
+  );
 }
+
 export type AutoRunIssueReason = 'feedback_survey_bad' | 'feedback_survey_good';
 
 /**
@@ -81,9 +52,10 @@ export type AutoRunIssueReason = 'feedback_survey_bad' | 'feedback_survey_good';
  */
 export function shouldAutoRunIssue(reason: AutoRunIssueReason): boolean {
   // Only for Ant users
-  if ((process.env.USER_TYPE) !== 'ant') {
+  if (process.env.USER_TYPE !== 'ant') {
     return false;
   }
+
   switch (reason) {
     case 'feedback_survey_bad':
       return false;
@@ -100,7 +72,7 @@ export function shouldAutoRunIssue(reason: AutoRunIssueReason): boolean {
  */
 export function getAutoRunCommand(reason: AutoRunIssueReason): string {
   // Only ant builds have the /good-claude command
-  if ((process.env.USER_TYPE) === 'ant' && reason === 'feedback_survey_good') {
+  if (process.env.USER_TYPE === 'ant' && reason === 'feedback_survey_good') {
     return '/good-claude';
   }
   return '/issue';

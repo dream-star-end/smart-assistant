@@ -469,6 +469,21 @@ oc_hotcfg_build_ccb_dist() {
     oc_hotcfg__die "ccb bun install/build 失败"; rm -rf "$ccb_build"; return 1
   fi
   [ -f "$ccb_build/dist/cli.js" ] || { oc_hotcfg__die "ccb dist/cli.js 未产出"; rm -rf "$ccb_build"; return 1; }
+  # ── `await using` 泄漏门(2026-05-22 事故机制化)────────────────────────────
+  # build.ts pin 了 target='node',让 Bun 把 Stage-3 Explicit Resource Management
+  # (`using` / `await using`)降级成 ES2022 try/finally。若该 pin 被上游合并覆盖回
+  # 'bun',或 bun 默认 target 漂移,dist 里会残留 `await using` 字面量 → 容器 Node 22
+  # 的 V8 12.4 直接 SyntaxError,CCB 子进程在读第一行 stdin 前就 exit 1 =
+  # **全量用户 crash-loop**(v1.0.194 实发,见 build.ts 注释块与 commit d5493c64)。
+  # 当年只 pin 了源码侧,构建期无门禁 —— 这里补上 fail-closed 断言,让同类回归在
+  # release 构建阶段就红,而不是等用户的 turn 全挂。
+  # `--include='*.js'` 是必须的:source map(*.js.map)内嵌**原始**源码文本,里面
+  # 本来就有 `await using`,扫进去会 100% 误报把部署门钉死(2026-07-26 实测踩到)。
+  # 只有真正被 node 执行的 .js 才算。
+  if grep -rlE --include='*.js' '(^|[^A-Za-z0-9_$])await[[:space:]]+using[[:space:]]' "$ccb_build/dist" >/dev/null 2>&1; then
+    oc_hotcfg__die "ccb dist 残留 \`await using\`(容器 Node 22 会 SyntaxError):检查 claude-code-best/build.ts 的 target='node' 是否被改动"
+    rm -rf "$ccb_build"; return 1
+  fi
   # 只把 dist/ 拷回 staging(staging/claude-code-best 因此只含源 + dist,无 node_modules)
   rm -rf "$staging/claude-code-best/dist"
   cp -a "$ccb_build/dist" "$staging/claude-code-best/dist" \

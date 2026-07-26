@@ -1071,13 +1071,6 @@ export function activateConditionalSkillsForPaths(
 }
 
 /**
- * Gets the number of pending conditional skills (for testing/debugging).
- */
-export function getConditionalSkillCount(): number {
-  return conditionalSkills.size
-}
-
-/**
  * Clears dynamic skill state (for testing).
  */
 export function clearDynamicSkills(): void {

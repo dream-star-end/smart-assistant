@@ -157,7 +157,8 @@ export interface UsageAttributionTag {
 /**
  * delegate 计费归因 → CCB `CLAUDE_CODE_EXTRA_METADATA` env。
  *
- * CCB getAPIMetadata()(claude-code-best/src/services/api/claude.ts:485-510)把
+ * CCB getAPIMetadata()(claude-code-best/src/services/api/claude.ts,按函数名找 ——
+ * 行号会随上游跟进漂移,2026-07-26 升 v2.8.4 时已从 485 漂到 497)把
  * 该 env 解析为 JSON object 后 spread 进 `metadata.user_id` JSON(device_id /
  * account_uuid / session_id 在 spread 之后写入,`oc_` 前缀键永不冲突),随每次
  * LLM 请求直达 master anthropicProxy 计费点(extractUsageAttribution 提取,

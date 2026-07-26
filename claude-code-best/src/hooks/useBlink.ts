@@ -1,4 +1,8 @@
-import { type DOMElement, useAnimationFrame, useTerminalFocus } from '../ink.js'
+import {
+  type DOMElement,
+  useAnimationFrame,
+  useTerminalFocus,
+} from '@anthropic/ink'
 
 const BLINK_INTERVAL_MS = 600
 

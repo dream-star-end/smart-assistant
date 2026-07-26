@@ -1,7 +1,7 @@
 import { feature } from 'bun:bundle';
 import * as React from 'react';
 import { useMemo } from 'react';
-import { Box } from 'src/ink.js';
+import { Box } from '@anthropic/ink';
 import { useAppState } from 'src/state/AppState.js';
 import { STATUS_TAG, SUMMARY_TAG, TASK_NOTIFICATION_TAG } from '../../constants/xml.js';
 import { QueuedMessageProvider } from '../../context/QueuedMessageContext.js';
@@ -11,6 +11,7 @@ import { isQueuedCommandVisible } from '../../utils/messageQueueManager.js';
 import { createUserMessage, EMPTY_LOOKUPS, normalizeMessages } from '../../utils/messages.js';
 import { jsonParse } from '../../utils/slowOperations.js';
 import { Message } from '../Message.js';
+
 const EMPTY_SET = new Set<string>();
 
 /**
@@ -46,7 +47,9 @@ function createOverflowNotificationMessage(count: number): string {
  */
 function processQueuedCommands(queuedCommands: QueuedCommand[]): QueuedCommand[] {
   // Filter out idle notifications - they are processed silently
-  const filteredCommands = queuedCommands.filter(cmd => typeof cmd.value !== 'string' || !isIdleNotification(cmd.value));
+  const filteredCommands = queuedCommands.filter(
+    cmd => typeof cmd.value !== 'string' || !isIdleNotification(cmd.value),
+  );
 
   // Separate task notifications from other commands
   const taskNotifications = filteredCommands.filter(cmd => cmd.mode === 'task-notification');
@@ -64,10 +67,12 @@ function processQueuedCommands(queuedCommands: QueuedCommand[]): QueuedCommand[]
   // Create synthetic overflow message
   const overflowCommand: QueuedCommand = {
     value: createOverflowNotificationMessage(overflowCount),
-    mode: 'task-notification'
+    mode: 'task-notification',
   };
+
   return [...otherCommands, ...visibleNotifications, overflowCommand];
 }
+
 function PromptInputQueuedCommandsImpl(): React.ReactNode {
   const queuedCommands = useCommandQueue();
   const viewingAgent = useAppState(s => !!s.viewingAgentTaskId);
@@ -75,9 +80,8 @@ function PromptInputQueuedCommandsImpl(): React.ReactNode {
   // already indent themselves). Gate mirrors the brief-spinner/message
   // check elsewhere — no teammate-view override needed since this
   // component early-returns when viewing a teammate.
-  const useBriefLayout = feature('KAIROS') || feature('KAIROS_BRIEF') ?
-  // biome-ignore lint/correctness/useHookAtTopLevel: feature() is a compile-time constant
-  useAppState(s_0 => s_0.isBriefOnly) : false;
+  const isBriefOnlyState = useAppState(s => s.isBriefOnly);
+  const useBriefLayout = feature('KAIROS') || feature('KAIROS_BRIEF') ? isBriefOnlyState : false;
 
   // createUserMessage mints a fresh UUID per call; without memoization, streaming
   // re-renders defeat Message's areMessagePropsEqual (compares uuid) → flicker.
@@ -90,27 +94,46 @@ function PromptInputQueuedCommandsImpl(): React.ReactNode {
     const visibleCommands = queuedCommands.filter(isQueuedCommandVisible);
     if (visibleCommands.length === 0) return null;
     const processedCommands = processQueuedCommands(visibleCommands);
-    return normalizeMessages(processedCommands.map(cmd => {
-      let content = cmd.value;
-      if (cmd.mode === 'bash' && typeof content === 'string') {
-        content = `<bash-input>${content}</bash-input>`;
-      }
-      // [Image #N] placeholders are inline in the text value (inserted at
-      // paste time), so the queue preview shows them without stub blocks.
-      return createUserMessage({
-        content
-      });
-    }));
+    return normalizeMessages(
+      processedCommands.map(cmd => {
+        let content = cmd.value;
+        if (cmd.mode === 'bash' && typeof content === 'string') {
+          content = `<bash-input>${content}</bash-input>`;
+        }
+        // [Image #N] placeholders are inline in the text value (inserted at
+        // paste time), so the queue preview shows them without stub blocks.
+        return createUserMessage({ content });
+      }),
+    );
   }, [queuedCommands]);
 
   // Don't show leader's queued commands when viewing any agent's transcript
   if (viewingAgent || messages === null) {
     return null;
   }
-  return <Box marginTop={1} flexDirection="column">
-      {messages.map((message, i) => <QueuedMessageProvider key={i} isFirst={i === 0} useBriefLayout={useBriefLayout}>
-          <Message message={message} lookups={EMPTY_LOOKUPS} addMargin={false} tools={[]} commands={[]} verbose={false} inProgressToolUseIDs={EMPTY_SET} progressMessagesForMessage={[]} shouldAnimate={false} shouldShowDot={false} isTranscriptMode={false} isStatic={true} />
-        </QueuedMessageProvider>)}
-    </Box>;
+
+  return (
+    <Box marginTop={1} flexDirection="column">
+      {messages.map((message, i) => (
+        <QueuedMessageProvider key={i} isFirst={i === 0} useBriefLayout={useBriefLayout}>
+          <Message
+            message={message}
+            lookups={EMPTY_LOOKUPS}
+            addMargin={false}
+            tools={[]}
+            commands={[]}
+            verbose={false}
+            inProgressToolUseIDs={EMPTY_SET}
+            progressMessagesForMessage={[]}
+            shouldAnimate={false}
+            shouldShowDot={false}
+            isTranscriptMode={false}
+            isStatic={true}
+          />
+        </QueuedMessageProvider>
+      ))}
+    </Box>
+  );
 }
+
 export const PromptInputQueuedCommands = React.memo(PromptInputQueuedCommandsImpl);

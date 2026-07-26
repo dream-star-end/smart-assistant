@@ -4,6 +4,7 @@ import { checkHasTrustDialogAccepted } from '../config.js';
 import { logForDebugging } from '../debug.js';
 import { clearMarketplacesCache, registerSeedMarketplaces } from './marketplaceManager.js';
 import { clearPluginCache } from './pluginLoader.js';
+
 type SetAppState = (f: (prevState: AppState) => AppState) => void;
 
 /**
@@ -29,6 +30,7 @@ export async function performStartupChecks(setAppState: SetAppState): Promise<vo
     logForDebugging('Trust not accepted for current directory - skipping plugin installations');
     return;
   }
+
   try {
     logForDebugging('Starting background plugin installations');
 
@@ -51,10 +53,7 @@ export async function performStartupChecks(setAppState: SetAppState): Promise<vo
         if (prev.plugins.needsRefresh) return prev;
         return {
           ...prev,
-          plugins: {
-            ...prev.plugins,
-            needsRefresh: true
-          }
+          plugins: { ...prev.plugins, needsRefresh: true },
         };
       });
     }

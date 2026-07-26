@@ -29,6 +29,7 @@
     "test:mcp-memory": "npx tsx --test packages/mcp-memory/src/__tests__/*.test.ts",
     "test:web": "npx tsx --test packages/web/__tests__/*.test.ts",
     "lint:agent-containers-sql": "tsx packages/commercial/scripts/lint-agent-containers-sql.ts",
+    "baseline:admin-routes": "tsx packages/commercial/scripts/admin-route-inventory.ts",
     "lint:scheduler-wiring": "tsx scripts/check-schedulers.ts",
     "lint:undefined-refs": "tsx scripts/check-undefined-refs.ts",
     "test:storage": "npx tsx --test packages/storage/src/__tests__/*.test.ts",

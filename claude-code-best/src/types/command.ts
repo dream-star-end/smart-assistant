@@ -122,6 +122,8 @@ export type LocalJSXCommandOnDone = (
     metaMessages?: string[]
     nextInput?: string
     submitNextInput?: boolean
+    /** Override the args shown in the command breadcrumb (e.g. truncated). Full args still reach metaMessages. */
+    displayArgs?: string
   },
 ) => void
 
@@ -174,6 +176,18 @@ export type CommandAvailability =
 
 export type CommandBase = {
   availability?: CommandAvailability[]
+  /**
+   * Allows a local/local-jsx command to execute when it arrives over the
+   * Remote Control bridge. Only use for commands that do not require local
+   * interactive Ink UI and can safely complete headlessly.
+   */
+  bridgeSafe?: boolean
+  /**
+   * Optional per-invocation validation for bridge-delivered slash commands.
+   * Return a user-facing rejection reason when specific arguments are unsafe
+   * to run headlessly over Remote Control.
+   */
+  getBridgeInvocationError?: (args: string) => string | undefined
   description: string
   hasUserSpecifiedDescription?: boolean
   /** Defaults to true. Only set when the command has conditional enablement (feature flags, env checks, etc). */
@@ -207,7 +221,8 @@ export type Command = CommandBase &
 
 /** Resolves the user-visible name, falling back to `cmd.name` when not overridden. */
 export function getCommandName(cmd: CommandBase): string {
-  return cmd.userFacingName?.() ?? cmd.name
+  const name = cmd.userFacingName?.() ?? cmd.name
+  return name || ''
 }
 
 /** Resolves whether the command is enabled, defaulting to true. */
