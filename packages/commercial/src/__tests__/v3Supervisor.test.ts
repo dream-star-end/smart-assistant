@@ -1122,9 +1122,11 @@ describe("provisionV3Container — docker create NameConflict 自愈", () => {
     // 设 OPTIONAL=1 降级(dev 逃生),让 NameConflict 自愈用例在无 bundle 的单元环境里跑过。
     prevBundleOptional = process.env.OC_PLATFORM_BUNDLE_OPTIONAL;
     process.env.OC_PLATFORM_BUNDLE_OPTIONAL = "1";
-    // 事故 channel = v5(容器名 oc-v5-u1)。v5 provision 跳过 v3MayServe 门控
-    // (它走全局 getPool → 无 DATABASE_URL 会抛 ConfigError,是既有基线失败源),
-    // 故这里显式 v5:既忠实复现事故,又让自愈用例可在无 DB 的单元环境里独立跑过。
+    // 事故 channel = v5(容器名 oc-v5-u1),这里显式设 v5 是为了忠实复现事故。
+    // 注:原注释还写着"顺便躲开 v3MayServe 门控(它走全局 getPool → 无 DATABASE_URL
+    // 会抛 ConfigError,是既有基线失败源)"—— 那个夹具缺陷已在本文件顶部用
+    // globalPoolDelegate 根治(见该处注释),v3 channel 下门控现在能正常跑,
+    // 不再需要靠切 channel 来绕。
     savedChannel = process.env.OC_RUNTIME_CHANNEL;
     process.env.OC_RUNTIME_CHANNEL = "v5";
   });
