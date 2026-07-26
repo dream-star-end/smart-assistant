@@ -641,12 +641,21 @@ body {
 .oc-center-dialog {
   --oc-center-safe-top: max(0.5rem, env(safe-area-inset-top));
   --oc-center-safe-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  /* 调用方期望高度上限。默认 85dvh;想要更高(如接近全屏的会话查看器)就覆盖这个变量,
+     **不要**去写 max-h-* 工具类 —— 本规则是未分层的普通 CSS,层叠上打得过 @layer utilities
+     里的任何工具类,写了也会被这里压掉(2026-07-26 实测:admin SessionViewerModal 的
+     max-h-[56rem] + h-[calc(100dvh-2rem)] 被压成 85dvh,矮了约 13dvh)。
+     语义是**取小**:调用方要多高都不能超出当前可视区,这条兜底始终生效。
+     默认值**必须**沿用 --oc-visual-height-85(App.tsx 在 visualViewport 变化时按可视高 ×0.85
+     动态写入,iOS 键盘弹起时靠它收缩);写死 85dvh 会让键盘弹起后弹层不再跟随,
+     那正是这套 visualViewport 契约要解决的问题。 */
+  --oc-center-max-h: var(--oc-visual-height-85, 85dvh);
   top: calc(var(--oc-center-safe-top) + (100vh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)) / 2);
   max-height: min(85vh, calc(100vh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
   top: calc(var(--oc-center-safe-top) + (100dvh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)) / 2);
-  max-height: min(85dvh, calc(100dvh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
+  max-height: min(var(--oc-center-max-h), calc(100dvh - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
   top: calc(var(--oc-visual-offset-top, 0px) + var(--oc-center-safe-top) + (var(--oc-visual-height, 100dvh) - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)) / 2);
-  max-height: min(var(--oc-visual-height-85, 85dvh), calc(var(--oc-visual-height, 100dvh) - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
+  max-height: min(var(--oc-center-max-h), calc(var(--oc-visual-height, 100dvh) - var(--oc-center-safe-top) - var(--oc-center-safe-bottom)));
 }
 
 /* highlight.js bridged to our tokens */
