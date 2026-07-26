@@ -83,6 +83,12 @@ export type MsgUsage = {
   delegates?: MessageUsageDelegate[];
 };
 
+/** Browser-only live display shape. `estimated` is never persisted or used
+ * for billing; durable/final usage remains the exact protocol snapshot. */
+export type LiveTurnTokenUsageSnapshot = TurnTokenUsageSnapshot & {
+  estimated?: boolean;
+};
+
 /** Bash 实时 tail 快照（单调守卫：totalBytes 不回退）。*/
 export type BashTail = { tail: string; totalBytes: number; truncatedHead: boolean };
 
@@ -516,10 +522,23 @@ export type ChatSession = {
   /** Agent frozen when the active turn was dispatched.  `agentId` is the
    * current selector and may change before the old turn is stopped. */
   _activeAgentId?: string;
-  /** Current exact browser turn's authoritative live token snapshot. */
+  /** Current browser turn's live token display. Exact engine snapshots win;
+   * observable-content estimates are explicitly marked and never persisted. */
   _liveTurnUsage?: {
     clientMessageId: string;
-    usage: TurnTokenUsageSnapshot;
+    usage: LiveTurnTokenUsageSnapshot;
+    /** Last exact engine snapshot while an observable-content estimate is on
+     * screen. Browser-only; final/stop/error clears the whole state. */
+    _exactUsage?: TurnTokenUsageSnapshot;
+    /** UTF-8 units observed after `_exactUsage` (or from turn start when the
+     * engine has not emitted a live exact snapshot yet). */
+    _estimatedUtf8Bytes?: number;
+    /** Stable block identity → largest observed cumulative payload size.
+     * Prevents plan/tool snapshots from being counted again on each update. */
+    _observedBytes?: Record<string, number>;
+    /** Stable tool-input identity → accepted partial JSON buffer. Mirrors the
+     * protocol offset guard so replay overlap never inflates the estimate. */
+    _partialJsonByBlock?: Record<string, string>;
   };
   /** User Stop preserves ordinary queued prompts but prevents any implicit
    * drain.  A later explicit send/retry resumes the FIFO. */

@@ -632,6 +632,46 @@ describe("MessageList 本轮 token 实时展示", () => {
     expect(screen.queryByText("本轮 128 token")).not.toBeInTheDocument();
   });
 
+  test("浏览器估算态明确显示约数，exact 接棒后移除约字", () => {
+    const messages: ChatMessage[] = [
+      mk("user", { id: "u-estimated-token", text: "继续" }),
+      mk("tool", {
+        id: "tool-estimated-token",
+        toolName: "Bash",
+        inputJson: { command: "pwd" },
+        _completed: false,
+      }),
+    ];
+    const view = render(
+      <MessageList
+        messages={messages}
+        sending
+        liveTurnUsage={{
+          clientMessageId: "u-estimated-token",
+          usage: { totalTokens: 128, estimated: true },
+        }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("本轮 约 128 token")).toBeInTheDocument();
+
+    view.rerender(
+      <MessageList
+        messages={messages}
+        sending
+        liveTurnUsage={{
+          clientMessageId: "u-estimated-token",
+          usage: { totalTokens: 128 },
+        }}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("本轮 128 token")).toBeInTheDocument();
+    expect(screen.queryByText("本轮 约 128 token")).not.toBeInTheDocument();
+  });
+
   test("历史轮从 durable usage anchor 恢复同轮卡片 token", () => {
     const messages: ChatMessage[] = [
       mk("user", { id: "u-history-token", text: "运行" }),

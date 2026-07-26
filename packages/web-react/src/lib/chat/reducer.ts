@@ -779,6 +779,187 @@ type DelegateProgressBlock = {
   usage?: NonNullable<ChatSession["_liveTurnUsage"]>["usage"];
 };
 
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function observableBytes(value: unknown): number {
+  if (typeof value === "string") return utf8ByteLength(value);
+  if (value === undefined || value === null) return 0;
+  try {
+    return utf8ByteLength(JSON.stringify(value) ?? "");
+  } catch {
+    return 0;
+  }
+}
+
+function ensureLiveUsageEstimate(
+  sess: ChatSession,
+  clientMessageId: string,
+): NonNullable<ChatSession["_liveTurnUsage"]> | null {
+  const current = sess._liveTurnUsage;
+  if (current?.clientMessageId === clientMessageId) {
+    if (!current._observedBytes) {
+      const user = sess.messages.find(
+        (message) => message.role === "user" && message.id === clientMessageId,
+      );
+      const userBytes = observableBytes(user?._modelText || user?.text || "");
+      current._observedBytes = { [`user:${clientMessageId}`]: userBytes };
+      current._estimatedUtf8Bytes = 0;
+    }
+    return current;
+  }
+  const user = sess.messages.find(
+    (message) => message.role === "user" && message.id === clientMessageId,
+  );
+  if (!user) return null;
+  const userBytes = observableBytes(user._modelText || user.text || "");
+  const estimatedTokens = Math.ceil(userBytes / 4);
+  const state: NonNullable<ChatSession["_liveTurnUsage"]> = {
+    clientMessageId,
+    usage: { totalTokens: estimatedTokens, estimated: true },
+    _estimatedUtf8Bytes: userBytes,
+    _observedBytes: { [`user:${clientMessageId}`]: userBytes },
+  };
+  sess._liveTurnUsage = state;
+  return state;
+}
+
+function addLiveEstimatedBytes(
+  state: NonNullable<ChatSession["_liveTurnUsage"]>,
+  bytes: number,
+): void {
+  if (bytes <= 0) return;
+  state._estimatedUtf8Bytes = (state._estimatedUtf8Bytes ?? 0) + bytes;
+  const exact = state.usage.estimated ? state._exactUsage : state.usage;
+  state._exactUsage = exact
+    ? {
+        totalTokens: exact.totalTokens,
+        ...(exact.inputTokens !== undefined ? { inputTokens: exact.inputTokens } : {}),
+        ...(exact.outputTokens !== undefined ? { outputTokens: exact.outputTokens } : {}),
+        ...(exact.cacheReadTokens !== undefined ? { cacheReadTokens: exact.cacheReadTokens } : {}),
+        ...(exact.cacheCreationTokens !== undefined
+          ? { cacheCreationTokens: exact.cacheCreationTokens }
+          : {}),
+      }
+    : undefined;
+  state.usage = {
+    ...(state._exactUsage ?? {}),
+    totalTokens:
+      (state._exactUsage?.totalTokens ?? 0) +
+      Math.ceil(state._estimatedUtf8Bytes / 4),
+    estimated: true,
+  };
+}
+
+function observeCumulativeBytes(
+  state: NonNullable<ChatSession["_liveTurnUsage"]>,
+  key: string,
+  value: unknown,
+): number {
+  const next = observableBytes(value);
+  const previous = state._observedBytes?.[key] ?? 0;
+  if (!state._observedBytes) state._observedBytes = {};
+  if (next > previous) state._observedBytes[key] = next;
+  return Math.max(0, next - previous);
+}
+
+function estimatedBlockBytes(
+  state: NonNullable<ChatSession["_liveTurnUsage"]>,
+  block: OutboundContentBlock & {
+    runId?: string;
+    phase?: string;
+    block?: OutboundContentBlock;
+    partialJsonDelta?: string;
+    partialJsonOffset?: number;
+    parentToolUseId?: string;
+  },
+  scope = "root",
+): number {
+  const rawText = (block as { text?: unknown }).text;
+  const text = typeof rawText === "string" ? rawText : "";
+  if (block.kind === "text" || block.kind === "thinking") {
+    return observableBytes(text);
+  }
+  if (block.kind === "delegate_progress") {
+    const nestedScope = `${scope}:delegate:${block.runId || "unknown"}`;
+    if (block.block && typeof block.block === "object") {
+      return estimatedBlockBytes(
+        state,
+        block.block as Parameters<typeof estimatedBlockBytes>[1],
+        nestedScope,
+      );
+    }
+    return block.phase === "text" || block.phase === "thinking"
+      ? observableBytes(text)
+      : 0;
+  }
+  if (block.kind === "plan") {
+    const key = `${scope}:plan:${block.blockId || "plan"}`;
+    return observeCumulativeBytes(state, key, {
+      text: block.text,
+      explanation: block.explanation,
+      steps: block.steps,
+    });
+  }
+  if (block.kind === "goal") {
+    const key = `${scope}:goal:${block.blockId || "goal"}`;
+    return observeCumulativeBytes(state, key, {
+      objective: block.objective,
+      status: block.status,
+    });
+  }
+  if (block.kind === "tool_use") {
+    const key = `${scope}:tool-input:${block.blockId || block.toolName || "tool"}`;
+    if (typeof block.partialJsonDelta === "string") {
+      const partial = applyPartialJsonDelta(state._partialJsonByBlock?.[key], block);
+      if (partial.action === "set") {
+        if (!state._partialJsonByBlock) state._partialJsonByBlock = {};
+        state._partialJsonByBlock[key] = partial.value;
+        return observeCumulativeBytes(state, key, partial.value);
+      }
+      if (partial.action === "drop" && state._partialJsonByBlock) {
+        delete state._partialJsonByBlock[key];
+      }
+      return 0;
+    }
+    if (block.partial === false && state._partialJsonByBlock) {
+      delete state._partialJsonByBlock[key];
+    }
+    return observeCumulativeBytes(
+      state,
+      key,
+      block.inputJson ?? block.inputPreview ?? "",
+    );
+  }
+  if (block.kind === "tool_result") {
+    const key = `${scope}:tool-result:${block.toolUseBlockId || block.blockId || block.toolName || "tool"}`;
+    return observeCumulativeBytes(
+      state,
+      key,
+      block.outputJson ?? block.output ?? block.preview ?? "",
+    );
+  }
+  return 0;
+}
+
 function applyDelegateUsageSnapshot(msg: ChatMessage, block: DelegateProgressBlock): boolean {
   if (block.phase !== "usage" || !block.usageRunId || !block.usage) return false;
   msg._delegateUsageByRun = {
@@ -1275,6 +1456,19 @@ export function applyOutboundMessage(
 
   // ── block 翻译循环（§7）──
   const blocksToRender = suppressLegacyErrorText ? [] : frame.blocks || [];
+  if (!frame.isFinal && frameTurnOwnerId && blocksToRender.length > 0) {
+    const liveEstimate = ensureLiveUsageEstimate(sess, frameTurnOwnerId);
+    if (liveEstimate) {
+      let bytes = 0;
+      for (const block of blocksToRender) {
+        bytes += estimatedBlockBytes(
+          liveEstimate,
+          block as Parameters<typeof estimatedBlockBytes>[1],
+        );
+      }
+      addLiveEstimatedBytes(liveEstimate, bytes);
+    }
+  }
   for (const block of blocksToRender) {
     const b = block as OutboundContentBlock & {
       parentToolUseId?: string;
@@ -1827,9 +2021,20 @@ export function applyTurnUsage(sess: ChatSession, frame: OutboundTurnUsageWire):
   if (!acceptFrameSeq(sess, frame)) return;
   if (!frame.clientMessageId || sess._activeClientMessageId !== frame.clientMessageId) return;
   markFrameReceived(sess);
+  const observedBytes =
+    sess._liveTurnUsage?.clientMessageId === frame.clientMessageId
+      ? sess._liveTurnUsage._observedBytes
+      : undefined;
+  const partialJsonByBlock =
+    sess._liveTurnUsage?.clientMessageId === frame.clientMessageId
+      ? sess._liveTurnUsage._partialJsonByBlock
+      : undefined;
   sess._liveTurnUsage = {
     clientMessageId: frame.clientMessageId,
     usage: { ...frame.usage },
+    ...(observedBytes ? { _observedBytes: observedBytes } : {}),
+    ...(partialJsonByBlock ? { _partialJsonByBlock: partialJsonByBlock } : {}),
+    _estimatedUtf8Bytes: 0,
   };
 }
 
