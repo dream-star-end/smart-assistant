@@ -37,7 +37,8 @@
 #   留在豁免里,但主干 run 30190800591 的 TAP artifact 显示它已不再失败。
 #   核心契约不接受豁免:真 flaky 就修 flaky,不能拿一条"用户当场看得见"的守卫换安静。
 #   (这条矛盾是新加的门自检用例自己抓出来的,不是人工发现。)
-# 2026-07-11 登记:本机补长驻 octest-redis(56379)后首次暴露——该 metrics 测试在 redis
-# 可达时走到新分支稳定失败;基线树(aurora@1f4bef5c)同法复现 11/12 同一子测,非在途
-# 分支引入。修掉后删除本行。
-V3 2I-2 — anthropicProxy + bridge histograms/counters
+# 2026-07-26 清空:V3 2I-2 — anthropicProxy + bridge histograms/counters 在 CI
+#   (run 30202xxxxx,tests=4726 pass=4722)已不再失败,按 stale 硬红规则删行。
+#   **本清单现在是空的 —— 这是它应有的状态。** 新增失败一律修代码,不许回填:
+#   唯一例外是"环境变化暴露的、可证明与本次改动无关的历史失败",加行时必须在 PR 里
+#   给出依据,并同时收紧 commercial-unit.counts。

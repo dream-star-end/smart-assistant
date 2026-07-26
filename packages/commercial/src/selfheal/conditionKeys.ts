@@ -43,10 +43,12 @@ export function opsMonitorKey(check: string): string {
  * 写了一个永远不会被点亮的 key(providerHealthScheduler 就踩过同类坑)。
  */
 export const OPS_MONITOR_CHECKS: readonly string[] = [
+  "backup_fresh",
   "client_4xx_storm",
   "deploy_state",
   "disk_root",
   "disk_var",
+  "failed_units",
   "http_candidate_v5",
   "http_egress",
   "http_v5",
@@ -54,6 +56,7 @@ export const OPS_MONITOR_CHECKS: readonly string[] = [
   "kp_plugin",
   "mail",
   "mem",
+  "mem_oversubscribe",
   "pool",
   "public_route",
   "svc_candidate_v5",

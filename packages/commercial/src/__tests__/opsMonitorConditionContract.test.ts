@@ -63,9 +63,15 @@ describe("ops.monitor condition key —— bash ⇄ TS 契约", () => {
   });
 
   test("v3 已下线:两侧都不得再出现 http_v3 / V5MON_CHECK_V3", () => {
-    const src = readFileSync(MONITOR_SH, "utf8");
-    assert.ok(!src.includes("http_v3"), "v5-monitor.sh 仍残留 http_v3");
-    assert.ok(!src.includes("V5MON_CHECK_V3"), "v5-monitor.sh 仍残留 V5MON_CHECK_V3 开关");
+    // 只看**可执行代码**,整行注释剥掉:门要挡的是"v3 检查项还在跑",不是
+    // "有人在注释里解释它为什么被删"。后者是应当鼓励的历史留痕,若一并禁掉,
+    // 下一个维护者就只能悄悄删掉说明,反而丢失了上下文。
+    const code = readFileSync(MONITOR_SH, "utf8")
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+    assert.ok(!code.includes("http_v3"), "v5-monitor.sh 仍残留 http_v3");
+    assert.ok(!code.includes("V5MON_CHECK_V3"), "v5-monitor.sh 仍残留 V5MON_CHECK_V3 开关");
     assert.ok(!OPS_MONITOR_CHECKS.includes("http_v3"), "OPS_MONITOR_CHECKS 仍残留 http_v3");
   });
 
