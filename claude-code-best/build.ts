@@ -63,7 +63,17 @@ const result = await Bun.build({
   // 崩溃循环(2026-05-22 实发事故 d5493c64)。升级时这一行必须守住。
   target: 'node',
   splitting: true,
-  sourcemap: 'linked',
+  // [v5 定制] **不产 sourcemap**。上游 v2.8.4 新增了 sourcemap:'linked'('linked' 会在
+  // bundle 末尾写 //# sourceMappingURL= 指针)。不采纳的两条理由:
+  //   ① 安全:2026-07-26 平台侧刚做过 sourcemap 封堵批(vite true→'hidden' + Caddy 404 +
+  //     直服池 --exclude='*.map' + smoke_sourcemap_sealed 活体门),起因是实测公网 200
+  //     泄漏 72 个源文件的完整 sourcesContent。CCB dist 虽不经 Caddy 公网直服,但它以 ro
+  //     挂载进容器,而容器内 agent 用户是 NOPASSWD sudo —— .map 会把我们 41 个文件的
+  //     定制源码(provider 接入、effort 策略、master /internal/v3/* 路径)完整暴露,
+  //     阅读门槛从『读 bundle』降到『读原始 TS』。与平台收紧方向相反,不跟。
+  //   ② 本批原则是行为面零变化,pin 时代本就不产 sourcemap;顺带省 ~64MB/release
+  //     (实测 .js 33MB / .map 64MB)。
+  // 真需要解栈时临时本地构建一份带 map 的即可,不进 release。
   define: {
     ...getMacroDefines(),
     // React production mode — eliminates _debugStack Error objects
