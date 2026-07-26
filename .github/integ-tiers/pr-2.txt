@@ -4,7 +4,7 @@
 # 余额不足会被 preCheck 拦、失败 turn 免单、图片与订阅两条独立计费路径
 # 都按定价表落账 —— 即"不会多扣用户的钱,也不会漏计"。
 #
-# min-tests: 1
+# min-tests: 99
 # max-minutes: 20
 packages/commercial/src/__tests__/payment.integ.test.ts
 packages/commercial/src/__tests__/orders.integ.test.ts

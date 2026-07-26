@@ -263,8 +263,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # timeout 与 .github/integ-tiers/<shard>.txt 的 max-minutes 对齐。
+          # 本机(16 核)实测:pr-1 16.5min / pr-2 6.0min / pr-3 4.3min。
+          # 2 核 runner 更慢,pr-1 是长杆 —— 超预算就**拆片**,不要调大这里。
           - shard: pr-1
-            timeout: 20
+            timeout: 30
           - shard: pr-2
             timeout: 20
           - shard: pr-3

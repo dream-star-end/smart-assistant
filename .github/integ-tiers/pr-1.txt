@@ -4,8 +4,8 @@
 # 被盗会整族吊销、HTTP 中间件栈(鉴权/限流/CORS)按契约放行与拒绝、会话 tape
 # 能落 PG 也能读回、新用户 onboarding 与站内信真能送达。
 #
-# min-tests: 1
-# max-minutes: 20
+# min-tests: 257
+# max-minutes: 30
 packages/commercial/src/__tests__/register.integ.test.ts
 packages/commercial/src/__tests__/verify.integ.test.ts
 packages/commercial/src/__tests__/login.integ.test.ts
