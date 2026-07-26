@@ -13,9 +13,9 @@
 | 项 | 值 |
 |---|---|
 | upstream | https://github.com/claude-code-best/claude-code |
-| pinned commit | `a7604f65` (2026-04-03) |
-| pinned 位置 | `v1.0.2..v1.0.3` 之间(晚于 v1.0.2,早于 v1.0.3 的 OpenAI 兼容层) |
-| vendored 于 | 2026-04-12,本仓 commit `84ee42f6` |
+| pinned commit | `34b3dc99` = 上游 tag **v2.8.4**(2026-07-21,上游 main 最新) |
+| 上次跟进 | 2026-07-26,本仓 commit `ac05464c` —— 从 `a7604f65` 跨 680 commits |
+| 首次 vendored | 2026-04-12,本仓 commit `84ee42f6`,当时 pin `a7604f65`(v1.0.2..v1.0.3 之间) |
 | 构建产物 | host `bun build` → `dist/cli.js` + chunks,见 `scripts/v5-runtime-release-lib.sh:build_ccb_dist` |
 
 **pin 的含义**:`a7604f65` 的树 + 下面第 2 节的排除项 = 我们 vendored 时的原始状态。
@@ -114,6 +114,43 @@ scripts/ccb-upstream.sh plan v2.8.4     # 三方合并预演:冲突面、搬迁�
 7. **上线**:CCB 走 release 轴(ro 挂载),**不重建镜像**,常规 `deploy-v5.sh`。
    canary → 观察 → finalize,`--abort` / `--rollback` 路径原样可用。
 8. **收尾**:更新本文件第 1 节的 pin,并复核第 2 节分组是否需要增删。
+
+---
+
+## 4.1 测试基线与判定方法(升级验证必读)
+
+CCB 的测试套件有两个坑,不知道会把好几个小时浪费在假失败上:
+
+1. **必须在真实路径下跑**。有测试按 `../../../../../static-key-providers.snapshot.json`
+   读**本仓仓根**的文件(如 `staticKeyModels` 漂移守护),把 CCB 拷到独立目录跑会 ENOENT
+   假失败。跑全量前先把合并结果落回 `claude-code-best/`。
+2. **全量跑的失败集不稳定**。上游大量测试用 `mock.module`(bun 里是**进程全局、
+   last-write-wins**),失败与否取决于文件执行组合;上游自己也只在个别文件用 `afterAll`
+   重注册来缓解。所以**全量的失败数不能直接当回归证据**。
+
+判定一条失败是否真回归,三步:
+
+```
+① 单独跑该测试文件            → 过 = 全量污染,非回归
+② 在纯净上游 tag 上跑同一文件  → 也失败 = 上游自身缺陷
+③ 在 canonical(未升级)上跑   → 也失败 = 既有 bug,与升级无关
+```
+
+### 已知既有失败(不是升级引入,勿在升级批里追)
+
+- `sanitizeData > truncates arrays longer than MAX_ARRAY_LEN` —— `_openclaude/telemetry.ts:113`
+  把 `_truncatedFromN` 挂成数组的**非索引属性**,而 `JSON.stringify` 序列化数组时会丢弃
+  非索引属性 → 断言恒 `undefined`。canonical 同样红。属独立可修项(改成对象包裹或
+  单独字段),不在升级批范围内。
+
+### 2026-07-26 跟进 v2.8.4 的验证结果
+
+- CCB 全量:**5918 pass / 9 fail**(纯净 v2.8.4 同环境基线 5763 pass / 9 fail / 7 errors ——
+  我们 errors 更少,所以跑起来的测试更多、暴露的 fail 也更多)。
+- 9 条逐一走上面三步定性:5 条 mock 污染(单独跑全绿)、1 条既有 bug、其余落在上游基线内
+  → **零真实回归**。
+- 定制测试全绿:effort 54 / sdkEventQueue 11 / bashCommandNormalize 19 / bingAdapter 38 /
+  minimaxAdapter 5 / adapterFactory 4 / staticKeyModels 漂移守护 13(零漂移)。
 
 ---
 
