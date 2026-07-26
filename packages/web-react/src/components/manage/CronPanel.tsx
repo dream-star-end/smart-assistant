@@ -403,7 +403,17 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                   ))}
                 {status === "active" && job.nextRunAt ? (
                   <span className="text-muted">
-                    下次 <TimeAgo value={job.nextRunAt} />
+                    {/* nextRunAt 是未来时刻,但它会过期:调度器落后、容器没起、任务卡住时,
+                        后端回填的这个值可能已经落在过去。此时若照常渲染相对时间,用户会看到
+                        「下次 2 小时前」这种自相矛盾的话。过期一律说「即将执行」——
+                        它既诚实(确实该跑了还没跑)又不制造困惑。 */}
+                    {new Date(job.nextRunAt).getTime() <= Date.now() ? (
+                      "即将执行"
+                    ) : (
+                      <>
+                        下次 <TimeAgo value={job.nextRunAt} />
+                      </>
+                    )}
                   </span>
                 ) : null}
               </div>
