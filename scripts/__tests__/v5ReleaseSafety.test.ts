@@ -7007,10 +7007,20 @@ wait $!
     const verify = source.slice(verifyStart, verifyEnd)
     for (const invariant of [
       "u.email = 'v5-canary@claudeai.chat'",
-      "ur.session_id = '$session_id'",
+      "t.user_id = 'c:' || u.id::text",
+      'tc.user_id = t.user_id',
+      'tc.session_id = t.session_id',
+      'tc.tape_id = t.tape_id',
+      'tc.billing_anchor_id = t.billing_anchor_id',
+      'ur.user_id = u.id',
+      'ur.request_id = tc.request_id',
+      'ur.turn_key = t.turn_key',
+      "t.session_id = '$session_id'",
+      "t.status = 'completed'",
       "ur.model = '$model'",
       "ur.status = 'success'",
       'ur.cost_credits > 0',
+      'tc.cost_credits = ur.cost_credits',
       'cl.id = ur.ledger_id',
       'cl.user_id = ur.user_id',
       "cl.ref_type = 'usage_record'",
@@ -7019,6 +7029,11 @@ wait $!
     ]) {
       assert.ok(verify.includes(invariant), `candidate ledger verifier 缺精确约束:${invariant}`)
     }
+    assert.doesNotMatch(
+      verify,
+      /ur\.session_id\s*=\s*'\$session_id'/,
+      'usage_records.session_id 是 engine session，不得拿它匹配 smoke client session',
+    )
     assert.match(verify, /for i in \$\(seq 1 10\)/, 'ledger proof 必须短且有限轮询')
     assert.match(verify, /return 1/, 'SQL 错误/零行/关系不一致必须 fail-closed')
 
