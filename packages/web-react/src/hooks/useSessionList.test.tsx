@@ -1,5 +1,5 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi, type Mock } from "vitest";
 import { api } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
@@ -69,8 +69,8 @@ type ListHarness = {
     confirmText?: string;
     danger?: boolean;
   }>;
-  onDeleteSession: ReturnType<typeof vi.fn>;
-  onActiveSessionDeleted: ReturnType<typeof vi.fn>;
+  onDeleteSession: Mock<(id: string) => void>;
+  onActiveSessionDeleted: Mock<() => void>;
   deleteSession: ReturnType<typeof vi.fn>;
   patchSessionTitle: ReturnType<typeof vi.fn>;
 };
@@ -86,8 +86,8 @@ async function renderSessionList(opts: {
       removePersisted: vi.fn(),
     },
     confirmCalls: [],
-    onDeleteSession: vi.fn(),
-    onActiveSessionDeleted: vi.fn(),
+    onDeleteSession: vi.fn<(id: string) => void>(),
+    onActiveSessionDeleted: vi.fn<() => void>(),
     deleteSession: vi.fn(async () => {}),
     patchSessionTitle: vi.fn(async () => {}),
   };
