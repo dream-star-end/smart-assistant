@@ -278,6 +278,8 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  // 首屏 starter 的确认动作只递增 nonce；实际正文仍由 Composer 当前输入框持有。
+  const [composerSubmitNonce, setComposerSubmitNonce] = useState(0);
   const [messageReplyTarget, setMessageReplyTarget] = useState<{
     sessionId: string;
     quote: MessageReplyQuote;
@@ -1279,6 +1281,9 @@ export function App() {
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
+  const queuedDispatch = demo
+    ? undefined
+    : chat.getQueuedDispatchSnapshot(activeId);
   useEffect(() => {
     if (demo) return;
     sockRef.current?.setActiveSession(activeId);
@@ -1392,6 +1397,14 @@ export function App() {
     }
     setChatError(null);
   }, [demo, activeId, chat]);
+
+  const undoQueuedSend = useCallback(() => {
+    if (!activeId) {
+      return Promise.resolve({ ok: false as const, reason: "not_cancellable" as const });
+    }
+    return sockRef.current?.undoQueuedSend(activeId) ??
+      Promise.resolve({ ok: false as const, reason: "not_cancellable" as const });
+  }, [activeId]);
 
   // ── P5 渲染层接线 ──────────────────────────────────────────────────────
   // 媒体签名单一权威：把 api.mediaSign 注入渲染树（demo 无网络 → null）。容器内路径
@@ -2231,7 +2244,9 @@ export function App() {
             <EmptyState
               agent={agent}
               onPrefill={(text) => setComposerPrefill({ text, nonce: Date.now() })}
+              onRun={() => setComposerSubmitNonce((nonce) => nonce + 1)}
               onChangeAgent={() => setPickerOpen(true)}
+              getToken={demo ? undefined : () => authRef.current.snapshot().token}
             />
           ) : demo ? (
             <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
@@ -2324,11 +2339,14 @@ export function App() {
             }
             busy={sending}
             onStop={stopTurn}
+            queuedDispatch={queuedDispatch}
+            onUndoQueuedSend={demo || !activeId ? undefined : undoQueuedSend}
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
+            submitSignal={composerSubmitNonce}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
             repoSelection={demo ? null : repo.selection}

@@ -3906,6 +3906,318 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(replayed[0].idempotencyKey).toBe(firstFrame.idempotencyKey);
   });
 
+  test("later prompts journal immediately and remain strict FIFO when commits finish out of order", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const commits = new Map<string, () => void>();
+    let call = 0;
+    const persistPendingDispatch = vi.fn((_sessId: string, item: { msgId: string }) => {
+      call += 1;
+      if (call === 1) return Promise.resolve();
+      return new Promise<void>((resolve) => commits.set(item.msgId, resolve));
+    });
+    const sock = makeSocket({ persistPendingDispatch });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const inbound = () => ws.sent
+      .map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.message");
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "first" });
+    await vi.waitFor(() => expect(inbound()).toHaveLength(1));
+    const firstId = inbound()[0]!.clientMessageId;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: firstId,
+    }) });
+
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "second" });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "third" });
+    const users = sock.sessions.get("s1")!.messages.filter((message) => message.role === "user");
+    const secondId = users[1]!.id;
+    const thirdId = users[2]!.id;
+    expect(persistPendingDispatch).toHaveBeenCalledTimes(3);
+    expect(inbound().map((frame) => frame.content.text)).toEqual(["first"]);
+
+    commits.get(thirdId)!();
+    await Promise.resolve();
+    commits.get(secondId)!();
+    await vi.waitFor(() =>
+      expect(sock.getQueuedDispatchSnapshot("s1")).toMatchObject({
+        count: 2,
+        savingCount: 0,
+        canUndo: true,
+      }),
+    );
+    expect(inbound().map((frame) => frame.content.text)).toEqual(["first"]);
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      clientMessageId: firstId,
+      blocks: [{ kind: "text", text: "first done" }],
+      isFinal: true,
+    })) });
+    await vi.waitFor(() =>
+      expect(inbound().map((frame) => frame.content.text)).toEqual(["first", "second"]),
+    );
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: secondId,
+    }) });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 2,
+      clientMessageId: secondId,
+      blocks: [{ kind: "text", text: "second done" }],
+      isFinal: true,
+    })) });
+    await vi.waitFor(() =>
+      expect(inbound().map((frame) => frame.content.text)).toEqual(["first", "second", "third"]),
+    );
+  });
+
+  test("reload preserves an admitted active turn in front of its durable FIFO tail", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const original = makeSocket({ persistPendingDispatch: async () => {} });
+    original.setGateReady(true);
+    const firstWs = FakeWS.instances.at(-1)!;
+    firstWs.open();
+    original.sendMessage({ sessId: "s1", agentId: "main", text: "active" });
+    await vi.waitFor(() =>
+      expect(firstWs.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(true),
+    );
+    const activeId = original.sessions.get("s1")!._activeClientMessageId!;
+    firstWs.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: activeId,
+    }) });
+    original.sendMessage({ sessId: "s1", agentId: "main", text: "tail one" });
+    original.sendMessage({ sessId: "s1", agentId: "main", text: "tail two" });
+    await vi.waitFor(() => expect(original.getQueuedDispatchSnapshot("s1").count).toBe(2));
+    const pending = original.offlineQueue
+      .filter((item) => item.sessId === "s1")
+      .map((item) => ({
+        msgId: item.msgId,
+        payload: item.payload,
+        enqueuedAt: item.enqueuedAt,
+      }));
+
+    const restored = makeSocket();
+    restored.loadStored({
+      ...original.toStored("s1")!,
+      _pendingDispatches: pending,
+    });
+    restored.setGateReady(true);
+    const restoredWs = FakeWS.instances.at(-1)!;
+    restoredWs.open();
+    const restoredInbound = () => restoredWs.sent
+      .map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.message");
+    expect(restored.sessions.get("s1")?._sendingInFlight).toBe(true);
+    expect(restoredInbound()).toHaveLength(0);
+
+    restoredWs.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      clientMessageId: activeId,
+      blocks: [{ kind: "text", text: "active done" }],
+      isFinal: true,
+    })) });
+    await vi.waitFor(() =>
+      expect(restoredInbound().map((frame) => frame.content.text)).toEqual(["tail one"]),
+    );
+  });
+
+  test("undo waits for exact durable deletion and keeps the prompt retryable on delete failure", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let finishDelete!: () => void;
+    const deletion = new Promise<void>((resolve) => { finishDelete = resolve; });
+    const deletePendingDispatch = vi.fn(() => deletion);
+    const sock = makeSocket({
+      persistPendingDispatch: async () => {},
+      deletePendingDispatch,
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "active" });
+    await vi.waitFor(() =>
+      expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(true),
+    );
+    const activeId = sock.sessions.get("s1")!._activeClientMessageId!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: activeId,
+    }) });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "cancel me" });
+    await vi.waitFor(() => expect(sock.getQueuedDispatchSnapshot("s1").count).toBe(1));
+    const queuedUser = sock.sessions.get("s1")!.messages.filter(
+      (message) => message.role === "user",
+    )[1]!;
+
+    let settled = false;
+    const undo = sock.undoQueuedSend("s1").then((result) => {
+      settled = true;
+      return result;
+    });
+    expect(sock.getQueuedDispatchSnapshot("s1")).toMatchObject({
+      count: 1,
+      cancellingCount: 1,
+      canUndo: false,
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(deletePendingDispatch).toHaveBeenCalledWith("s1", queuedUser.id);
+
+    finishDelete();
+    await expect(undo).resolves.toEqual({ ok: true });
+    expect(sock.getQueuedDispatchSnapshot("s1").count).toBe(0);
+    expect(queuedUser.status).toBe("error");
+    expect(queuedUser._errorDetail).toBe("发送已取消");
+
+    const failedDelete = vi.fn().mockRejectedValue(new Error("idb failed"));
+    const second = makeSocket({
+      persistPendingDispatch: async () => {},
+      deletePendingDispatch: failedDelete,
+    });
+    second.loadStored({
+      ...sock.toStored("s1")!,
+      _sendingInFlight: true,
+      _activeClientMessageId: activeId,
+      _pendingDispatches: [{
+        msgId: "queued-delete-failure",
+        enqueuedAt: Date.now(),
+        payload: {
+          type: "inbound.message",
+          channel: "webchat",
+          peer: { id: "s1", kind: "dm" },
+          agentId: "main",
+          content: { text: "keep me" },
+          clientMessageId: "queued-delete-failure",
+          idempotencyKey: "web:queued-delete-failure:0",
+          ts: Date.now(),
+        },
+      }],
+    });
+    await expect(second.undoQueuedSend("s1")).resolves.toEqual({
+      ok: false,
+      reason: "delete_failed",
+    });
+    expect(second.getQueuedDispatchSnapshot("s1")).toMatchObject({
+      count: 1,
+      canUndo: true,
+    });
+  });
+
+  test("undo requested during journal commit deletes after commit and never sends", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let finishCommit!: () => void;
+    const commit = new Promise<void>((resolve) => { finishCommit = resolve; });
+    const deletePendingDispatch = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({
+      persistPendingDispatch: vi.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockImplementationOnce(() => commit),
+      deletePendingDispatch,
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "active" });
+    await vi.waitFor(() =>
+      expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(true),
+    );
+    const activeId = sock.sessions.get("s1")!._activeClientMessageId!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: activeId,
+    }) });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "cancel while saving" });
+    const queuedId = sock.sessions.get("s1")!.messages.filter(
+      (message) => message.role === "user",
+    )[1]!.id;
+    const undo = sock.undoQueuedSend("s1");
+    expect(sock.getQueuedDispatchSnapshot("s1").cancellingCount).toBe(1);
+    finishCommit();
+    await expect(undo).resolves.toEqual({ ok: true });
+    expect(deletePendingDispatch).toHaveBeenCalledWith("s1", queuedId);
+    expect(ws.sent.map((raw) => JSON.parse(raw)).filter(
+      (frame) => frame.type === "inbound.message" && frame.clientMessageId === queuedId,
+    )).toHaveLength(0);
+  });
+
+  test("a restored durable item cannot report undo success without a delete adapter", async () => {
+    const seed = makeSocket();
+    seed.ensureSession("s1", "main");
+    const restored = makeSocket();
+    restored.loadStored({
+      ...seed.toStored("s1")!,
+      _pendingDispatches: [{
+        msgId: "restored-durable",
+        enqueuedAt: Date.now(),
+        payload: {
+          type: "inbound.message",
+          channel: "webchat",
+          peer: { id: "s1", kind: "dm" },
+          agentId: "main",
+          content: { text: "must remain durable" },
+          clientMessageId: "restored-durable",
+          idempotencyKey: "web:restored-durable:0",
+          ts: Date.now(),
+        },
+      }],
+    });
+
+    await expect(restored.undoQueuedSend("s1")).resolves.toEqual({
+      ok: false,
+      reason: "delete_failed",
+    });
+    expect(restored.getQueuedDispatchSnapshot("s1")).toMatchObject({
+      count: 1,
+      canUndo: true,
+    });
+  });
+
+  test("a waiting prompt with failed journal stays visible as retryable error", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistPendingDispatch = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("quota"));
+    const sock = makeSocket({ persistPendingDispatch });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "active" });
+    await vi.waitFor(() =>
+      expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.message")).toBe(true),
+    );
+    const activeId = sock.sessions.get("s1")!._activeClientMessageId!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: activeId,
+    }) });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "must not disappear" });
+    const queued = sock.sessions.get("s1")!.messages.filter(
+      (message) => message.role === "user",
+    )[1]!;
+    await vi.waitFor(() => expect(queued.status).toBe("error"));
+    expect(queued._errorDetail).toBe("排队保存失败，请重试");
+    expect(sock.getQueuedDispatchSnapshot("s1").count).toBe(0);
+    expect(ws.sent.map((raw) => JSON.parse(raw)).filter(
+      (frame) => frame.type === "inbound.message" && frame.clientMessageId === queued.id,
+    )).toHaveLength(0);
+  });
+
   test("admission keeps the peer FIFO slot until exact final, then sends the next prompt", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();

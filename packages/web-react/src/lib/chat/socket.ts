@@ -184,8 +184,28 @@ type OfflineItem = {
   payload: InboundMessage;
   msgId: string;
   enqueuedAt: number;
-  state: "queued" | "persisting" | "awaiting_admission";
+  state: "persisting" | "persisted" | "cancelling" | "awaiting_admission";
+  /** false only for adapters without IndexedDB or the existing direct-send fallback
+   * after a journal failure. A user-visible queued item is never allowed to remain
+   * in this state: it either commits or becomes a retryable timeline error. */
+  journalCommitted: boolean;
+  cancelRequested?: boolean;
+  cancelCompletion?: {
+    promise: Promise<UndoQueuedSendResult>;
+    resolve: (result: UndoQueuedSendResult) => void;
+  };
 };
+
+export type QueuedDispatchSnapshot = {
+  count: number;
+  savingCount: number;
+  cancellingCount: number;
+  canUndo: boolean;
+};
+
+export type UndoQueuedSendResult =
+  | { ok: true }
+  | { ok: false; reason: "not_cancellable" | "delete_failed" };
 
 /** Stable key for one logical browser send attempt.  The normal minted
  * client id keeps the readable form; the deterministic 64-bit fallback only
@@ -970,7 +990,7 @@ export class ChatSocket {
     const touched = new Set<string>();
     for (const item of this.offlineQueue) {
       if (item.state !== "awaiting_admission") continue;
-      item.state = "queued";
+      item.state = "persisted";
       touched.add(item.sessId);
       const sess = this.sessions.get(item.sessId);
       const message = sess?.messages.find(
@@ -2149,8 +2169,10 @@ export class ChatSocket {
           item.payload.peer?.id === stored.id,
         )
       : [];
-    const inFlightFresh = storedPending.length === 0 &&
-      stored._sendingInFlight === true &&
+    // A durable FIFO tail may coexist with one already-admitted active turn.
+    // Preserve that active identity across reload so the restored tail cannot
+    // start mid-turn; the exact final frame releases it in normal FIFO order.
+    const inFlightFresh = stored._sendingInFlight === true &&
       inFlightReference > 0 &&
       Date.now() - inFlightReference < THINKING_SAFETY_MS;
     s._sendingInFlight = inFlightFresh;
@@ -2187,7 +2209,8 @@ export class ChatSocket {
         payload: pending.payload,
         msgId: pending.msgId,
         enqueuedAt: Number.isFinite(pending.enqueuedAt) ? pending.enqueuedAt : pending.payload.ts,
-        state: "queued",
+        state: "persisted",
+        journalCommitted: true,
       });
       const user = s.messages.find((message) => message.role === "user" && message.id === pending.msgId);
       if (user) user.status = "queued";
@@ -2833,16 +2856,18 @@ export class ChatSocket {
   }
 
   private dispatchPayload(sess: ChatSession, userMsg: ChatMessage, payload: InboundMessage): void {
-    this.tryEnqueueOffline({
+    const item: OfflineItem = {
       sessId: sess.id,
       payload,
       msgId: userMsg.id,
       enqueuedAt: payload.ts,
-      state: "queued",
-    });
+      state: "persisting",
+      journalCommitted: false,
+    };
+    this.tryEnqueueOffline(item);
     userMsg.status = "queued";
     this.scheduleNotify();
-    this.kickDispatchPump();
+    this.persistQueuedDispatch(item);
   }
 
   private dispatchTurnRecovery(
@@ -3115,55 +3140,127 @@ export class ChatSocket {
     }
   }
 
+  /**
+   * Commit every logical send to the exact outbound journal immediately after
+   * enqueue. Network eligibility is deliberately separate: a same-session turn
+   * may keep the FIFO slot for minutes, but later prompts must already survive
+   * reload during that wait.
+   */
+  private persistQueuedDispatch(item: OfflineItem): void {
+    const committed = this.deps.persistPendingDispatch?.(item.sessId, {
+      msgId: item.msgId,
+      payload: item.payload,
+      enqueuedAt: item.enqueuedAt,
+    });
+    if (!committed) {
+      // Unit/SSR adapters have no IndexedDB. Production always supplies it;
+      // keep the old in-memory direct-send behavior for those adapters.
+      item.state = "persisted";
+      this.scheduleNotify();
+      this.kickDispatchPump();
+      return;
+    }
+    void committed.then(
+      () => this.handleDispatchJournalCommitted(item),
+      () => this.handleDispatchJournalFailure(item),
+    );
+  }
+
+  private handleDispatchJournalCommitted(item: OfflineItem): void {
+    if (!this.offlineQueue.includes(item)) return;
+    item.journalCommitted = true;
+    if (item.cancelRequested) {
+      item.state = "cancelling";
+      this.scheduleNotify();
+      void this.deleteQueuedDispatchDurably(item);
+      return;
+    }
+    if (item.state !== "persisting") return;
+    item.state = "persisted";
+    this.scheduleNotify();
+    this.kickDispatchPump();
+  }
+
+  private canDispatchNow(item: OfflineItem): boolean {
+    const sess = this.sessions.get(item.sessId);
+    if (!sess || sess._dispatchPaused) return false;
+    if (!this.isSessionQueueHead(item)) return false;
+    const slot = this.dispatchSlots.get(item.sessId);
+    return !!this.ws &&
+      this.ws.readyState === 1 &&
+      this.relayReady &&
+      (slot === undefined || slot === item.msgId) &&
+      (!sess._sendingInFlight || sess._activeClientMessageId === item.msgId);
+  }
+
+  private isSessionQueueHead(item: OfflineItem): boolean {
+    return this.offlineQueue.find((candidate) => candidate.sessId === item.sessId) === item;
+  }
+
+  private handleDispatchJournalFailure(item: OfflineItem): void {
+    if (!this.offlineQueue.includes(item)) return;
+    if (item.cancelRequested) {
+      // A rejected IndexedDB transaction should be atomic, but prove the exact
+      // key absent before telling the user cancellation succeeded.
+      item.state = "cancelling";
+      this.scheduleNotify();
+      void this.deleteQueuedDispatchDurably(item);
+      return;
+    }
+    if (this.canDispatchNow(item)) {
+      // Preserve the established idle-send fallback: a local storage outage
+      // must not block a turn that can be physically sent now. The neutral
+      // admission notice remains until server authority acknowledges it.
+      item.state = "persisted";
+      item.journalCommitted = false;
+      this.scheduleNotify();
+      this.kickDispatchPump();
+      return;
+    }
+    // A prompt that has to wait cannot truthfully be called queued if it failed
+    // to persist. Keep the full text in the timeline and make retry explicit.
+    const index = this.offlineQueue.indexOf(item);
+    if (index >= 0) this.offlineQueue.splice(index, 1);
+    const sess = this.sessions.get(item.sessId);
+    const user = sess?.messages.find(
+      (message) => message.role === "user" && message.id === item.msgId,
+    );
+    if (user && user.status !== "sent") {
+      user.status = "error";
+      user._errorDetail = "排队保存失败，请重试";
+    }
+    if (sess) this.deps.persistSession?.(sess.id);
+    this.maybePromoteToConnected();
+    this.scheduleNotify();
+    this.kickDispatchPump();
+  }
+
   private pumpPendingDispatches(): void {
     if (!this.ws || this.ws.readyState !== 1 || !this.relayReady) return;
     for (const item of this.offlineQueue) {
-      if (item.state !== "queued") continue;
+      if (item.state !== "persisted") continue;
       const sess = this.sessions.get(item.sessId);
       if (!sess) continue;
       if (sess._dispatchPaused) continue;
+      if (!this.isSessionQueueHead(item)) continue;
       const slot = this.dispatchSlots.get(item.sessId);
       if (slot !== undefined && slot !== item.msgId) continue;
       if (sess._sendingInFlight && sess._activeClientMessageId !== item.msgId) continue;
       this.dispatchSlots.set(item.sessId, item.msgId);
-      item.state = "persisting";
       this.setTransientNotice(sess.id, "正在发送…");
-      const committed = this.deps.persistPendingDispatch?.(item.sessId, {
-        msgId: item.msgId,
-        payload: item.payload,
-        enqueuedAt: item.enqueuedAt,
-      });
-      if (committed) {
-        void committed.then(
-          () => this.sendPersistedDispatch(item),
-          () => this.handleDispatchJournalFailure(item),
-        );
-      } else {
-        // Unit/SSR adapters without persistence keep their existing in-memory
-        // behavior. Production always supplies persistPendingDispatch.
-        this.sendPersistedDispatch(item);
-      }
+      this.sendPersistedDispatch(item);
     }
   }
 
-  private handleDispatchJournalFailure(item: OfflineItem): void {
-    if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
-    // Local recovery storage is an enhancement, not a delivery gate. Keep the
-    // exact in-memory identity until the server ACK and send immediately.
-    this.sendPersistedDispatch(item, false);
-  }
-
-  private sendPersistedDispatch(item: OfflineItem, journalCommitted = true): void {
-    if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
+  private sendPersistedDispatch(item: OfflineItem): void {
+    if (!this.offlineQueue.includes(item) || item.state !== "persisted") return;
     if (
       !this.ws || this.ws.readyState !== 1 || !this.relayReady ||
       this.dispatchSlots.get(item.sessId) !== item.msgId
     ) {
-      item.state = "queued";
       return;
     }
     if (!this.safeWsSend(JSON.stringify(item.payload))) {
-      item.state = "queued";
       return;
     }
     item.state = "awaiting_admission";
@@ -3179,10 +3276,104 @@ export class ChatSocket {
       typeof item.payload.agentId === "string" && item.payload.agentId
         ? item.payload.agentId
         : sess.agentId;
-    if (journalCommitted) this.clearTransientNotice(sess.id);
-    else this.setTransientNotice(sess.id, "正在确认发送…");
+    if (item.journalCommitted || !this.deps.persistPendingDispatch) {
+      this.clearTransientNotice(sess.id);
+    } else {
+      this.setTransientNotice(sess.id, "正在确认发送…");
+    }
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
+  }
+
+  /** Current same-session FIFO tail for UI receipts. The active/slotted turn is
+   * intentionally excluded: this snapshot describes work waiting behind it. */
+  getQueuedDispatchSnapshot(sessId: string | undefined): QueuedDispatchSnapshot {
+    if (!sessId) return { count: 0, savingCount: 0, cancellingCount: 0, canUndo: false };
+    const sess = this.sessions.get(sessId);
+    const slotted = this.dispatchSlots.get(sessId);
+    const items = this.offlineQueue.filter(
+      (item) =>
+        item.sessId === sessId &&
+        item.state !== "awaiting_admission" &&
+        item.msgId !== slotted &&
+        item.msgId !== sess?._activeClientMessageId,
+    );
+    return {
+      count: items.length,
+      savingCount: items.filter((item) => item.state === "persisting").length,
+      cancellingCount: items.filter((item) => item.state === "cancelling").length,
+      canUndo: items.some(
+        (item) => item.state === "persisting" || item.state === "persisted",
+      ),
+    };
+  }
+
+  /**
+   * Cancel the newest same-session FIFO item without touching the active turn.
+   * Success is reported only after the exact IndexedDB journal key is deleted,
+   * so reload cannot resurrect a prompt that the UI called cancelled.
+   */
+  undoQueuedSend(sessId: string): Promise<UndoQueuedSendResult> {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return Promise.resolve({ ok: false, reason: "not_cancellable" });
+    const slotted = this.dispatchSlots.get(sessId);
+    const target = [...this.offlineQueue]
+      .reverse()
+      .find(
+        (item) =>
+          item.sessId === sessId &&
+          (item.state === "persisting" || item.state === "persisted") &&
+          item.msgId !== slotted &&
+          item.msgId !== sess._activeClientMessageId,
+      );
+    if (!target) return Promise.resolve({ ok: false, reason: "not_cancellable" });
+
+    let resolve!: (result: UndoQueuedSendResult) => void;
+    const promise = new Promise<UndoQueuedSendResult>((done) => { resolve = done; });
+    target.cancelRequested = true;
+    target.cancelCompletion = { promise, resolve };
+    const wasPersisted = target.state === "persisted";
+    target.state = "cancelling";
+    this.scheduleNotify();
+    if (wasPersisted) void this.deleteQueuedDispatchDurably(target);
+    return promise;
+  }
+
+  private async deleteQueuedDispatchDurably(item: OfflineItem): Promise<void> {
+    if (!this.offlineQueue.includes(item) || !item.cancelRequested) return;
+    try {
+      if (item.journalCommitted) {
+        if (!this.deps.deletePendingDispatch) throw new Error("dispatch journal unavailable");
+        await this.deps.deletePendingDispatch(item.sessId, item.msgId);
+      }
+    } catch {
+      item.cancelRequested = false;
+      item.state = "persisted";
+      const completion = item.cancelCompletion;
+      item.cancelCompletion = undefined;
+      completion?.resolve({ ok: false, reason: "delete_failed" });
+      this.scheduleNotify();
+      this.kickDispatchPump();
+      return;
+    }
+
+    const index = this.offlineQueue.indexOf(item);
+    if (index >= 0) this.offlineQueue.splice(index, 1);
+    const sess = this.sessions.get(item.sessId);
+    const user = sess?.messages.find(
+      (message) => message.role === "user" && message.id === item.msgId,
+    );
+    if (user && user.status !== "sent") {
+      user.status = "error";
+      user._errorDetail = "发送已取消";
+    }
+    if (sess) this.deps.persistSession?.(sess.id);
+    const completion = item.cancelCompletion;
+    item.cancelCompletion = undefined;
+    completion?.resolve({ ok: true });
+    this.maybePromoteToConnected();
+    this.scheduleNotify();
+    this.kickDispatchPump();
   }
 
   stopTurn(sessId: string): void {
