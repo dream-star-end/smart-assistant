@@ -4712,7 +4712,12 @@ export class SessionManager {
               (
                 terminalRequestEscalated &&
                 result?.isError === true &&
-                result.stopReason !== 'end_turn'
+                result.stopReason !== 'end_turn' &&
+                terminalEngineBilling?.status === 'error' &&
+                terminalEngineBilling.terminalCode === 'CODEX_ERROR' &&
+                result.errorDetail?.includes(
+                  '"result":"codex app-server exited code=',
+                ) === true
               )
             )
               ? requestedTerminal

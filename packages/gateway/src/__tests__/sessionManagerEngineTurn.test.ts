@@ -1474,6 +1474,68 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("browser Stop escalation does not hide a late unrelated engine error", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial output before an unrelated failure");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => false;
+      runner.shutdown = async () => {
+        session.runner.emit("billing", {
+          requestId: "req-unit",
+          engineSessionId: `oceng-${"e".repeat(48)}`,
+          status: "error",
+          terminalCode: "CODEX_ERROR",
+          durationMs: 5_001,
+          usage: { input_tokens: 8, output_tokens: 2 },
+        });
+        runner.result({
+          is_error: true,
+          result: "unrelated provider failure",
+          usage: { input_tokens: 8, output_tokens: 2 },
+        });
+      };
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.equal(captured.payloads[0]!.errorCode, "ENGINE_ERROR");
+      assert.equal(
+        captured.payloads[0]!.errorDetail,
+        '{"result":"unrelated provider failure"}',
+      );
+      assert.equal(captured.payloads[0]!.engineBilling?.terminalCode, "CODEX_ERROR");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop fallback kills and persists partial usage with dispatch identity", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
