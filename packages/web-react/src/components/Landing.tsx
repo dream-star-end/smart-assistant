@@ -3,6 +3,7 @@ import {
   Building2,
   Check,
   Layers,
+  Menu,
   MessageSquareText,
   Plus,
   Puzzle,
@@ -24,7 +25,7 @@ import { cn } from "../lib/utils";
 import { DemoShowcase } from "./landing/DemoShowcase";
 import { Tutorials } from "./landing/Tutorials";
 import { ThemeToggle } from "./ThemeToggle";
-import { Button, buttonVariants } from "./ui";
+import { Button, buttonVariants, IconButton } from "./ui";
 
 function Logo() {
   return (
@@ -253,6 +254,7 @@ export function Landing({
   theme: Theme;
   onCycleTheme: () => void;
 }) {
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   return (
     <div className="h-full overflow-y-auto bg-bg text-fg">
       {/* Nav */}
@@ -267,7 +269,7 @@ export function Landing({
             <a href="#enterprise" className="transition-colors hover:text-fg">企业版</a>
             <a href="#faq" className="transition-colors hover:text-fg">常见问题</a>
           </nav>
-          <div className="flex shrink-0 items-center gap-1.5">
+          <div className="hidden shrink-0 items-center gap-1.5 md:flex">
             <ThemeToggle theme={theme} onCycle={onCycleTheme} />
             <Button variant="ghost" shape="pill" onClick={onLogin} className="text-muted">
               登录
@@ -276,7 +278,64 @@ export function Landing({
               免费开始
             </Button>
           </div>
+          <div className="flex shrink-0 items-center gap-1 md:hidden">
+            <ThemeToggle theme={theme} onCycle={onCycleTheme} />
+            <IconButton
+              type="button"
+              shape="square"
+              aria-expanded={mobileNavOpen}
+              aria-controls="landing-mobile-nav"
+              aria-label={mobileNavOpen ? "关闭导航菜单" : "打开导航菜单"}
+              onClick={() => setMobileNavOpen((open) => !open)}
+            >
+              {mobileNavOpen ? <X size={18} /> : <Menu size={18} />}
+            </IconButton>
+          </div>
         </div>
+        {mobileNavOpen && (
+          <div id="landing-mobile-nav" className="border-t border-border/60 px-4 py-4 md:hidden">
+            <nav aria-label="移动端主导航" className="grid grid-cols-2 gap-1 text-[14px] text-muted">
+              {[
+                ["#demo", "演示"],
+                ["#agents", "智能体"],
+                ["#tutorials", "快速上手"],
+                ["#enterprise", "企业版"],
+                ["#faq", "常见问题"],
+              ].map(([href, label]) => (
+                <a
+                  key={href}
+                  href={href}
+                  onClick={() => setMobileNavOpen(false)}
+                  className="rounded-lg px-3 py-2.5 outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {label}
+                </a>
+              ))}
+            </nav>
+            <div className="mt-3 grid grid-cols-2 gap-2 border-t border-border/60 pt-3">
+              <Button
+                variant="secondary"
+                shape="pill"
+                onClick={() => {
+                  setMobileNavOpen(false);
+                  onLogin();
+                }}
+              >
+                登录
+              </Button>
+              <Button
+                variant="primary"
+                shape="pill"
+                onClick={() => {
+                  setMobileNavOpen(false);
+                  onStart();
+                }}
+              >
+                免费开始
+              </Button>
+            </div>
+          </div>
+        )}
       </header>
 
       {/* Hero */}
@@ -294,10 +353,9 @@ export function Landing({
             <span className="size-1.5 rounded-full bg-accent" />
             {BRAND.company} · 会干活的 AI 助手
           </div>
-          <h1 className="mx-auto max-w-3xl text-balance text-[40px] font-bold leading-[1.1] tracking-tight md:text-[60px] animate-in">
+          <h1 className="mx-auto max-w-3xl text-balance text-[36px] font-bold leading-[1.1] tracking-tight sm:text-[40px] md:text-[60px] animate-in">
             把活儿交给它
-            <br className="hidden sm:block" />
-            <span className="bg-gradient-to-r from-accent to-info bg-clip-text text-transparent">
+            <span className="block bg-gradient-to-r from-accent to-info bg-clip-text text-transparent">
               拿回能直接用的成果
             </span>
           </h1>

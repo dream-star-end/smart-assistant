@@ -7,6 +7,12 @@
       "reason": "门禁基建自身的修复(trailer 门起点重指 + 不可达改 fail-closed / integ runner 按梯队实判 / 新增 check_ci_base_red 探针),不对应任何线上用户可见事故。它触碰 packages/commercial/src/selfheal/conditionKeys.ts 仅因 bash⇄TS 契约要求新探针必须两侧同步登记。",
       "approvedBy": "dx 2026-07-26 门禁整改批(债务批,PR#256)",
       "expiresAt": "2026-08-26"
+    },
+    {
+      "commit": "25417b086",
+      "reason": "P1-E 移动端审计债修复：聊天顶栏改为不丢入口的两行自适应布局，落地页补齐移动导航与真浏览器回归门；不是线上事故根治。",
+      "approvedBy": "dx 2026-07-27 接手首个未完成会话并推进完整上线",
+      "expiresAt": "2026-08-27"
     }
   ]
 }

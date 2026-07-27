@@ -29,6 +29,8 @@
 //   T18 消息“引用”动作把精确目标送入 Composer，可取消；再次引用后随当前正文发送。
 //   T19 真 IndexedDB 多标签陈旧快照不能抹除或复活 exact pending-dispatch journal;
 //   T20 预览用例跑完后主 harness 页面仍完好(防 setContent 摧毁共享页面把后续缺席断言变恒真)。
+//   T21 320/390px 最拥挤聊天顶栏不横溢，全部真实控件可达可点；
+//   T22 320/390px 落地页移动导航完整、可收起，CTA 与主标题布局正确。
 //
 // 用例清单的单一权威是同目录 cases.json:实际执行的 T 编号集合必须 ⊇ 清单,
 // 删/漏一条即红(过去删掉任意一段 check() 照样 exit 0)。新增用例必须同步登记。
@@ -106,6 +108,21 @@ await esbuild.build({
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
 });
+const mobileBundlePath = join(outDir, "mobile-harness.js");
+await esbuild.build({
+  entryPoints: [join(HERE, "mobile-harness.tsx")],
+  bundle: true,
+  format: "iife",
+  outfile: mobileBundlePath,
+  jsx: "automatic",
+  loader: { ".css": "empty" },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "import.meta.env.MODE": '"production"',
+  },
+  alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
+  logLevel: "silent",
+});
 const previewCssDir = join(outDir, "preview-css");
 await viteBuild({
   root: join(HERE, ".."),
@@ -133,6 +150,10 @@ if (!previewCssFile) throw new Error("browser-tests: 预览 production CSS 构�
 // .chat-scroll-area 规则,T8 照过)。现在 T4/T8/T13 断言的就是线上那份 CSS。
 const productionCss = readFileSync(join(previewCssDir, previewCssFile), "utf8");
 const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(previewBundlePath, "utf8")}</script></body></html>`;
+const mobileHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style><style>
+  html,body{height:auto;min-height:100%;overflow:auto}
+  #root{position:static;height:auto;min-height:100%;overflow:visible}
+</style></head><body><div id="root"></div><script>${readFileSync(mobileBundlePath, "utf8")}</script></body></html>`;
 
 // 主 harness = production CSS + 测试脚手架。脚手架放在 production CSS 之后。
 // 唯一被脚手架遮蔽的生产规则是 #root 的全屏 fixed 定位与 body 的 overflow:hidden ——
@@ -186,12 +207,19 @@ const harnessUrl = "http://127.0.0.1/__openclaude_browser_tests__";
 // 不服务它们就会打到 127.0.0.1:80 → ERR_CONNECTION_REFUSED → 被上面的 console.error
 // 门判红,而那是 harness 缺资源不是产品缺陷。按 basename 回源到构建目录;**未登记的
 // 外部请求一律 404**(不 abort、不放行),让真正的意外外联仍然以 console.error 变红。
-const ASSET_MIME = { ".woff2": "font/woff2", ".woff": "font/woff", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" };
+const ASSET_MIME = { ".woff2": "font/woff2", ".woff": "font/woff", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".webp": "image/webp" };
 // 组件真实发出的遥测信标(succeeded 级 UX 事件也走这个出口)。harness 没有后端,
 // 显式 204 挡掉;不 stub 就会 404 → console.error → 用例被自己的埋点判红。
 const STUBBED_ENDPOINTS = new Set(["/api/client-errors"]);
 const serveBuiltAsset = (route, request) => {
   const url = new URL(request.url());
+  if (url.pathname === "/api/subscription/plans") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ plans: [] }),
+    });
+  }
   if (STUBBED_ENDPOINTS.has(url.pathname)) {
     return route.fulfill({ status: 204, contentType: "text/plain", body: "" });
   }
@@ -200,6 +228,10 @@ const serveBuiltAsset = (route, request) => {
   const file = join(previewCssDir, name);
   if (name && ASSET_MIME[ext] && existsSync(file)) {
     return route.fulfill({ status: 200, contentType: ASSET_MIME[ext], body: readFileSync(file) });
+  }
+  const publicFile = join(HERE, "..", "public", url.pathname.replace(/^\/+/, ""));
+  if (ASSET_MIME[ext] && existsSync(publicFile)) {
+    return route.fulfill({ status: 200, contentType: ASSET_MIME[ext], body: readFileSync(publicFile) });
   }
   console.error(`[browser-tests] 未登记的外部请求(已 404): ${request.url()}`);
   return route.fulfill({ status: 404, contentType: "text/plain", body: "not a browser-tests asset" });
@@ -742,6 +774,141 @@ await check("T19 真 IndexedDB 多标签陈旧快照不抹除/复活发送日志
   }
 });
 
+const mobileContext = await browser.newContext({
+  viewport: { width: 320, height: 844 },
+  hasTouch: true,
+  isMobile: true,
+});
+const mobilePage = await mobileContext.newPage();
+watchRuntimeErrors(mobilePage, "mobile");
+const mobileUrl = "http://127.0.0.1/__openclaude_browser_mobile__";
+await mobilePage.route("**/*", serveBuiltAsset);
+await mobilePage.route(mobileUrl, (route) => route.fulfill({
+  status: 200,
+  contentType: "text/html",
+  body: mobileHtml,
+}));
+await mobilePage.goto(mobileUrl);
+
+async function assertNoHorizontalOverflow(target, label) {
+  const width = await target.evaluate(() => ({
+    viewport: window.innerWidth,
+    document: document.documentElement.scrollWidth,
+    body: document.body.scrollWidth,
+  }));
+  if (width.document > width.viewport || width.body > width.viewport) {
+    throw new Error(`${label} 横向溢出:${JSON.stringify(width)}`);
+  }
+}
+
+async function assertElementNoHorizontalOverflow(locator, label) {
+  const width = await locator.evaluate((node) => ({
+    client: node.clientWidth,
+    scroll: node.scrollWidth,
+  }));
+  if (width.scroll > width.client) {
+    throw new Error(`${label} 内部横向溢出:${JSON.stringify(width)}`);
+  }
+}
+
+async function assertInsideViewport(locator, width, label) {
+  const box = await locator.boundingBox();
+  if (!box || box.x < -0.5 || box.x + box.width > width + 0.5) {
+    throw new Error(`${label} 不在 ${width}px 可视区内:${JSON.stringify(box)}`);
+  }
+}
+
+await check("T21 320/390px 最拥挤聊天顶栏不横溢且全部控件可达可点", async () => {
+  screenshotPage = mobilePage;
+  const controls = [
+    { name: "打开菜单", action: "menu" },
+    { name: /全能助手/, action: "agent" },
+    { name: "打开使用教程", action: "tutorial" },
+    { name: "站内信", action: "inbox" },
+    { name: "账户与计费", action: "billing" },
+    { name: /切换主题/, action: "theme" },
+  ];
+
+  for (const width of [320, 390]) {
+    await mobilePage.setViewportSize({ width, height: 844 });
+    await assertNoHorizontalOverflow(mobilePage, `${width}px 聊天顶栏`);
+    const header = mobilePage.getByTestId("crowded-chat-header");
+    for (const control of controls) {
+      const locator = header.getByRole("button", { name: control.name });
+      await locator.waitFor({ state: "visible", timeout: 3000 });
+      await assertInsideViewport(locator, width, `${width}px ${String(control.name)}`);
+      await locator.click();
+      const action = await mobilePage.evaluate(() => document.documentElement.dataset.mobileAction);
+      if (action !== control.action) {
+        throw new Error(`${String(control.name)} 未触发原回调:${String(action)}`);
+      }
+    }
+
+    const team = header.getByRole("button", { name: "团队模式已开启" });
+    const model = header.getByRole("button", { name: "选择对话模型" });
+    await assertInsideViewport(team, width, `${width}px 团队模式`);
+    await assertInsideViewport(model, width, `${width}px 模型选择器`);
+    await team.click();
+    await mobilePage.getByText(/队长引擎为 GPT-5\.6-Sol/).waitFor({ state: "visible", timeout: 3000 });
+    await mobilePage.keyboard.press("Escape");
+    await model.click();
+    await mobilePage.getByRole("menuitem", { name: /GLM-5\.2/ }).waitFor({ state: "visible", timeout: 3000 });
+    await mobilePage.keyboard.press("Escape");
+    await assertNoHorizontalOverflow(mobilePage, `${width}px 顶栏弹层关闭后`);
+  }
+});
+
+await check("T22 320/390px 落地页移动导航完整可收起且 CTA 与主标题布局正确", async () => {
+  screenshotPage = mobilePage;
+  const landing = mobilePage.locator("main > div");
+  for (const width of [320, 390]) {
+    await mobilePage.setViewportSize({ width, height: 844 });
+    await assertNoHorizontalOverflow(mobilePage, `${width}px 落地页`);
+    await assertElementNoHorizontalOverflow(landing, `${width}px 落地页根容器`);
+    const open = landing.getByRole("button", { name: "打开导航菜单" });
+    await open.click();
+    const mobileNav = landing.locator("#landing-mobile-nav");
+    await mobileNav.waitFor({ state: "visible", timeout: 3000 });
+    for (const label of ["演示", "智能体", "快速上手", "企业版", "常见问题"]) {
+      await mobileNav.getByRole("link", { name: label, exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    }
+    await assertNoHorizontalOverflow(mobilePage, `${width}px 展开导航`);
+    await assertElementNoHorizontalOverflow(landing, `${width}px 展开导航根容器`);
+
+    await mobileNav.getByRole("link", { name: "智能体", exact: true }).click();
+    await mobileNav.waitFor({ state: "detached", timeout: 3000 });
+
+    await landing.getByRole("button", { name: "打开导航菜单" }).click();
+    await landing.locator("#landing-mobile-nav").getByRole("button", { name: "登录" }).click();
+    const loginAction = await mobilePage.evaluate(() => document.documentElement.dataset.mobileAction);
+    if (loginAction !== "login") throw new Error(`移动登录 CTA 未触发:${String(loginAction)}`);
+    await mobileNav.waitFor({ state: "detached", timeout: 3000 });
+
+    await landing.getByRole("button", { name: "打开导航菜单" }).click();
+    await landing.locator("#landing-mobile-nav").getByRole("button", { name: "免费开始" }).click();
+    const startAction = await mobilePage.evaluate(() => document.documentElement.dataset.mobileAction);
+    if (startAction !== "start") throw new Error(`移动免费开始 CTA 未触发:${String(startAction)}`);
+    await mobileNav.waitFor({ state: "detached", timeout: 3000 });
+
+    const heading = landing.getByRole("heading", { level: 1 });
+    const gradient = heading.getByText("拿回能直接用的成果");
+    const headingLayout = await heading.evaluate((node) => ({
+      fontSize: getComputedStyle(node).fontSize,
+      breaks: node.querySelectorAll("br").length,
+    }));
+    const gradientDisplay = await gradient.evaluate((node) => getComputedStyle(node).display);
+    if (headingLayout.breaks !== 0 || gradientDisplay !== "block") {
+      throw new Error(`移动主标题仍依赖隐藏换行或渐变句未独占一行:${JSON.stringify({ headingLayout, gradientDisplay })}`);
+    }
+    if (width === 320 && headingLayout.fontSize !== "36px") {
+      throw new Error(`320px 主标题字号不是 36px:${headingLayout.fontSize}`);
+    }
+    await assertNoHorizontalOverflow(mobilePage, `${width}px CTA 操作后`);
+    await assertElementNoHorizontalOverflow(landing, `${width}px CTA 操作后根容器`);
+  }
+});
+screenshotPage = page;
+
 async function assertContainerPreviewFillsViewport(page, expectedDevice, width, height, top = 0) {
   const dialog = page.getByRole("dialog", { name: "容器网页预览与元素评论" });
   await dialog.waitFor({ state: "visible", timeout: 3000 });
@@ -889,6 +1056,7 @@ if (tailErrors.length > 0) {
 }
 
 await previewContext.close();
+await mobileContext.close();
 await browser.close();
 console.log(
   failed === 0

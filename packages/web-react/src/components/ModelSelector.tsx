@@ -96,7 +96,7 @@ export function ModelSelector({
           disabled={disabled}
           aria-label="选择对话模型"
           className={cn(
-            "flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted outline-none transition-colors",
+            "flex min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[13.5px] font-medium text-muted outline-none transition-colors",
             "hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]",
             "disabled:pointer-events-none disabled:opacity-50",
             teamEngineActive && "text-accent hover:text-accent",
@@ -110,7 +110,7 @@ export function ModelSelector({
           {teamEngineActive && (
             <span className="hidden sm:inline">{"团队模式 · "}</span>
           )}
-          <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">
+          <span className="min-w-0 max-w-[6.5rem] truncate sm:max-w-[180px]">
             {label}
           </span>
           <ChevronDown size={14} className="text-faint" />

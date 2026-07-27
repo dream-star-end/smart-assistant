@@ -67,3 +67,61 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(trigger.textContent).toContain("GLM-5.2");
   });
 });
+
+describe("ChatHeader 移动端拥挤状态", () => {
+  it("用两行自适应布局保留全部入口且不恢复固定高度", () => {
+    const { container } = renderHeader({
+      teamModeActive: true,
+      onDisableTeamMode: () => {},
+      credits: "12345678901234567890",
+      onOpenBilling: () => {},
+      onOpenMobileNav: () => {},
+      onOpenInbox: () => {},
+      onOpenTutorial: () => {},
+      unreadCount: 128,
+    });
+
+    const header = container.querySelector("header");
+    expect(header).toHaveClass("min-h-14", "flex-wrap", "md:flex-nowrap");
+    expect(header).not.toHaveClass("h-14");
+    expect(header?.querySelector(":scope > .basis-full")).toHaveClass("md:hidden");
+
+    expect(screen.getByRole("button", { name: "打开菜单" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "团队模式已开启" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "选择对话模型" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "打开使用教程" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "站内信" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "账户与计费" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /切换主题/ })).toBeInTheDocument();
+  });
+
+  it("拥挤状态下各动作仍触发原回调", () => {
+    const onOpenMobileNav = vi.fn();
+    const onOpenInbox = vi.fn();
+    const onOpenTutorial = vi.fn();
+    const onOpenBilling = vi.fn();
+    const onCycleTheme = vi.fn();
+    renderHeader({
+      teamModeActive: true,
+      onDisableTeamMode: () => {},
+      credits: "12345678901234567890",
+      onOpenBilling,
+      onOpenMobileNav,
+      onOpenInbox,
+      onOpenTutorial,
+      onCycleTheme,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "打开菜单" }));
+    fireEvent.click(screen.getByRole("button", { name: "打开使用教程" }));
+    fireEvent.click(screen.getByRole("button", { name: "站内信" }));
+    fireEvent.click(screen.getByRole("button", { name: "账户与计费" }));
+    fireEvent.click(screen.getByRole("button", { name: /切换主题/ }));
+
+    expect(onOpenMobileNav).toHaveBeenCalledTimes(1);
+    expect(onOpenTutorial).toHaveBeenCalledTimes(1);
+    expect(onOpenInbox).toHaveBeenCalledTimes(1);
+    expect(onOpenBilling).toHaveBeenCalledTimes(1);
+    expect(onCycleTheme).toHaveBeenCalledTimes(1);
+  });
+});

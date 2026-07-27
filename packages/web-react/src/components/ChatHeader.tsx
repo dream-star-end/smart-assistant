@@ -71,12 +71,12 @@ export function ChatHeader({
   const engineLabel = teamEngineLabel(models ?? []);
   return (
     <header
-      className="flex h-14 shrink-0 items-center gap-1 px-3 pb-2.5 header-safe-t"
+      className="flex min-h-14 shrink-0 flex-wrap items-center gap-x-1 gap-y-1 px-3 pb-2.5 header-safe-t md:flex-nowrap"
       data-product-entry-scope="chat-header"
     >
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
-        <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square" className="md:hidden">
+        <IconButton data-product-control onClick={onOpenMobileNav} aria-label="打开菜单" shape="square" className="order-1 md:hidden">
           <Menu size={18} />
         </IconButton>
       )}
@@ -94,11 +94,11 @@ export function ChatHeader({
       <button
         data-product-feature={PRODUCT_CAPABILITIES.agents.id}
         onClick={onAgentClick}
-        className="flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+        className="order-2 flex min-w-0 flex-1 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] md:order-none md:flex-none"
       >
         <AgentAvatar agent={agent} className="size-7 rounded-lg" iconSize={15} />
         {/* 窄屏不折行：截断而非换行（避免"全能/助手"难看的两行）。 */}
-        <span className="max-w-[7.5rem] truncate whitespace-nowrap text-[15px] font-semibold text-fg sm:max-w-none">
+        <span className="min-w-0 max-w-[5rem] truncate whitespace-nowrap text-[15px] font-semibold text-fg sm:max-w-none">
           {agent.name}
         </span>
         <ChevronDown size={15} className="shrink-0 text-faint" />
@@ -112,7 +112,7 @@ export function ChatHeader({
               type="button"
               data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
               aria-label="团队模式已开启"
-              className="flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+              className="order-5 flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] md:order-none"
             >
               <Users size={11} className="shrink-0" />
               {/* 移动端只留图标(选择器同排还有引擎标签,文案冗余挤爆头部);sm+ 显示全称。 */}
@@ -141,28 +141,35 @@ export function ChatHeader({
         </Popover>
       )}
       {models && onSelectModel && (
-        <ModelSelector
-          models={models}
-          selectedId={selectedModelId}
-          onSelect={onSelectModel}
-          loading={modelsLoading}
-          teamEngineActive={teamModeActive}
-        />
+        <div className="order-5 min-w-0 flex-1 md:order-none md:flex-none">
+          <ModelSelector
+            models={models}
+            selectedId={selectedModelId}
+            onSelect={onSelectModel}
+            loading={modelsLoading}
+            teamEngineActive={teamModeActive}
+          />
+        </div>
       )}
-      <div className="ml-auto flex shrink-0 items-center gap-1.5">
+      {/* 手机端在 Agent 行之后显式换行：不隐藏任何功能，也不靠横向滚动。 */}
+      <div aria-hidden className="order-4 basis-full md:hidden" />
+      {/* md 以下用 contents 让每个动作按 order 分到两行；md+ 恢复原单行与原顺序。 */}
+      <div className="contents md:order-none md:ml-auto md:flex md:shrink-0 md:items-center md:gap-1.5">
         {onOpenTutorial && (
-          <IconButton
-            data-product-control
-            onClick={onOpenTutorial}
-            aria-label="打开使用教程"
-            title="使用教程"
-            shape="square"
-          >
-            <BookOpen size={18} />
-          </IconButton>
+          <span className="order-6 md:order-none">
+            <IconButton
+              data-product-control
+              onClick={onOpenTutorial}
+              aria-label="打开使用教程"
+              title="使用教程"
+              shape="square"
+            >
+              <BookOpen size={18} />
+            </IconButton>
+          </span>
         )}
         {onOpenInbox && (
-          <div className="relative">
+          <div className="relative order-3 md:order-none">
             <IconButton data-product-feature={PRODUCT_CAPABILITIES.inbox.id} onClick={onOpenInbox} aria-label="站内信" shape="square">
               <Bell size={18} />
             </IconButton>
@@ -179,7 +186,7 @@ export function ChatHeader({
             onClick={onOpenBilling}
             disabled={!onOpenBilling}
             aria-label="账户与计费"
-            className={`flex items-center gap-1.5 rounded-full border px-2 py-1 text-[12.5px] font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
+            className={`order-6 flex items-center gap-1.5 rounded-full border px-2 py-1 text-[12.5px] font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 md:order-none ${
               low
                 ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
                 : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg"
@@ -190,7 +197,9 @@ export function ChatHeader({
             <span className="hidden sm:inline">{formatCredits(credits)}</span>
           </button>
         )}
-        <ThemeToggle theme={theme} onCycle={onCycleTheme} />
+        <span className="order-3 md:order-none">
+          <ThemeToggle theme={theme} onCycle={onCycleTheme} />
+        </span>
       </div>
     </header>
   );
