@@ -19,10 +19,14 @@
 //   V5_TURN_MODEL(默认 gpt-5.6-sol —— codex 引擎侧,即 2026-07-17 的盲区面)
 //   V5_TURN_ATTEMPTS(默认 8;容器冷启动时 bridge 会 close,需重连)
 //   V5_TURN_SILENCE_MS(默认 90000;xhigh 思考档需要长窗;仅作兜底,判成靠三信号)
+//   V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE(默认 0;仅供 0% candidate 的 CCB
+//     探针使用。exactText+final 到齐但 live cost frame 因 control VIP 仍归旧 active
+//     而不可达时,输出唯一 session/model proof 并以 rc=3 交给 deploy 脚本做精确 DB 核验)
 //   OC_CANARY_TURNSTILE_TOKEN(默认 'x' —— 依赖 canary 邮箱在线上 TURNSTILE_BYPASS_ACCOUNTS
 //     账号白名单里;换机时把新 canary 邮箱加进该 env 键即可,不要再打开全局旁路)
 //   V5_CANARY_REQUIRE_COST(默认 1;canary 账号落免单套餐时置 0 放宽计费断言)
-// 退出码:0=turn 三信号齐全;1=失败(错误帧/收尾或计费缺失/重试耗尽);2=配置错误。
+// 退出码:0=turn 三信号齐全;1=失败(错误帧/收尾或计费缺失/重试耗尽);2=配置错误;
+//   3=仅缺 live cost frame,且已输出供 deploy 精确核验的 candidate ledger proof。
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -36,6 +40,9 @@ const PASSWORD_FILE = process.env.V5_CANARY_PASSWORD_FILE ?? '/root/.secrets/v5-
 const MODEL = process.env.V5_TURN_MODEL ?? 'gpt-5.6-sol'
 const ATTEMPTS = Number(process.env.V5_TURN_ATTEMPTS ?? 8)
 const SILENCE_MS = Number(process.env.V5_TURN_SILENCE_MS ?? 90000)
+const ALLOW_LEDGER_COST_EVIDENCE =
+  (process.env.V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE ?? '0') === '1'
+const LEDGER_COST_GRACE_MS = 5_000
 // turnstile_token: 生产走**账号级**白名单放行占位 token —— canary 邮箱必须在
 // TURNSTILE_BYPASS_ACCOUNTS(env,见 config.ts / auth/turnstile.ts resolveTurnstileBypass)。
 // 2026-07-26 前这里依赖的是全局 TURNSTILE_TEST_BYPASS=1,那等于全站人机验证失效,已废止:
@@ -96,6 +103,7 @@ const attempt = () => new Promise((resolve) => {
   let answerText = ''
   let finalText = ''
   let silence
+  let ledgerCostGrace
   let settled = false
   const exactText = () => finalText === '2'
   const criteriaMet = () => exactText() && sawFinal && (sawCost || !REQUIRE_COST)
@@ -103,6 +111,7 @@ const attempt = () => new Promise((resolve) => {
     if (settled) return
     settled = true
     clearTimeout(silence)
+    clearTimeout(ledgerCostGrace)
     try { ws.close() } catch {}
     resolve({ reason, sawText, sawFinal, sawCost, sawError, finalText })
   }
@@ -137,6 +146,19 @@ const attempt = () => new Promise((resolve) => {
         // WebChat 正常路径会先逐块流正文,再发 blocks=[] 的 final 终止帧；
         // final-with-content 的早拒绝路径也存在。两者都按本次连接累积出的最终正文断言。
         finalText = answerText.trim()
+        if (
+          ALLOW_LEDGER_COST_EVIDENCE &&
+          REQUIRE_COST &&
+          exactText() &&
+          !sawCost &&
+          !sawError &&
+          !ledgerCostGrace
+        ) {
+          ledgerCostGrace = setTimeout(
+            () => finish('ledger-cost-evidence-required'),
+            LEDGER_COST_GRACE_MS,
+          )
+        }
       }
       if (f.error) sawError = JSON.stringify(f.error).slice(0, 300)
     }
@@ -158,6 +180,17 @@ for (let i = 1; i <= ATTEMPTS; i++) {
   if (criteriaMet) {
     console.log(`turn-canary: TURN_OK model=${MODEL} exact_text=2 final=${result.sawFinal} cost_charged=${result.sawCost}`)
     process.exit(0)
+  }
+  if (
+    ALLOW_LEDGER_COST_EVIDENCE &&
+    REQUIRE_COST &&
+    result.reason === 'ledger-cost-evidence-required' &&
+    result.finalText === '2' &&
+    result.sawFinal &&
+    !result.sawCost
+  ) {
+    console.log(`turn-canary: TURN_LEDGER_PROOF_REQUIRED session=${peerId} model=${MODEL}`)
+    process.exit(3)
   }
   if (result.reason === 'closed' && !result.sawText && !result.sawFinal) {
     // bridge 在容器冷启动期间会直接关连接("container not ready",可能发生在

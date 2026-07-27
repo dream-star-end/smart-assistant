@@ -5814,13 +5814,91 @@ knowledge_planet_plugin_smoke_gate() { # <pinned master release>
 # 100% turn 必挂时,健康端点/调度器 smoke 全绿——没有任何门跑过真 turn。
 # 失败 = 与 full smoke 同级的强校验失败(走对称补偿回滚)。V5_SMOKE_TURN=0 可跳过
 # (紧急场景明示豁免;默认必跑)。
-smoke_turn_canary() { # <pinned master release> [port] [model]
+verify_candidate_ccb_ledger_cost() { # <session-id> <model>
+  local session_id="$1" model="$2" proof i
+  [[ "$session_id" =~ ^smoketurn[a-z0-9]+$ ]] || {
+    echo "✗ candidate CCB ledger proof session 非法:$session_id" >&2
+    return 1
+  }
+  [[ "$model" == deepseek-v4-flash ]] || {
+    echo "✗ candidate CCB ledger proof model 非法:$model" >&2
+    return 1
+  }
+  # 0% candidate 的 CCB 请求仍经单例 egress 出站；egress cost-event 固定投递
+  # deploy_state.desired_control_slot 对应的 18894（此时仍是旧 active），所以真实
+  # debit 会落 PG、live cost frame 却只会在旧 active 广播。按本次 smoke 生成的
+  # 唯一 session + 精确 model + canary 邮箱核对 usage/ledger 同一事务结果；不允许
+  # 用“最近一条 DeepSeek usage”之类模糊证据放宽门禁。
+  for i in $(seq 1 10); do
+    proof="$(remote_model_authority_psql_app "
+SELECT CASE WHEN COUNT(*) = 1 THEN 'ok' ELSE 'missing' END
+  FROM usage_records ur
+  JOIN users u ON u.id = ur.user_id
+  JOIN credit_ledger cl ON cl.id = ur.ledger_id
+ WHERE u.email = 'v5-canary@claudeai.chat'
+   AND ur.session_id = '$session_id'
+   AND ur.model = '$model'
+   AND ur.status = 'success'
+   AND ur.cost_credits > 0
+   AND ur.created_at >= clock_timestamp() - interval '10 minutes'
+   AND cl.user_id = ur.user_id
+   AND cl.reason = 'chat'
+   AND cl.ref_type = 'usage_record'
+   AND cl.ref_id = ur.id::text
+   AND cl.delta = -ur.cost_credits
+" 2>/dev/null || true)"
+    if [[ "$proof" == ok ]]; then
+      echo "turn-canary: TURN_OK model=$model exact_text=2 final=true cost_evidence=ledger session=$session_id"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "✗ candidate CCB ledger proof 未在截止时间内形成精确 usage+ledger 闭环(session=$session_id model=$model)" >&2
+  return 1
+}
+
+smoke_turn_canary() { # <pinned master release> [port] [model] [cost-evidence-mode]
   local release="$1" port="${2:-$ACTIVE_PORT}" model="${3:-${V5_TURN_MODEL:-}}"
+  local cost_evidence_mode="${4:-live}" output rc proof session_id proof_model
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] real-turn canary(model=${model:-<script default>})@ $release port=$port"
+    echo "  [dry-run] real-turn canary(model=${model:-<script default>},cost=$cost_evidence_mode)@ $release port=$port"
     return 0
   fi
-  echo "── smoke:canary 真 turn(model=${model:-<script default>},port=$port)──"
+  [[ "$cost_evidence_mode" == live || "$cost_evidence_mode" == candidate-ledger ]] || {
+    echo "✗ 未知真 turn cost evidence mode:$cost_evidence_mode" >&2
+    return 1
+  }
+  echo "── smoke:canary 真 turn(model=${model:-<script default>},port=$port,cost=$cost_evidence_mode)──"
+  if [[ "$cost_evidence_mode" == candidate-ledger ]]; then
+    [[ "$model" == deepseek-v4-flash ]] || {
+      echo "✗ candidate-ledger 只允许精确模型 deepseek-v4-flash" >&2
+      return 1
+    }
+    if output="$(ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${port}' V5_TURN_MODEL='$model' V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE=1 timeout 300 node scripts/v5-smoke-turn-canary.mjs" 2>&1)"; then
+      printf '%s\n' "$output"
+      return 0
+    else
+      rc=$?
+    fi
+    printf '%s\n' "$output"
+    [[ "$rc" == 3 ]] || return "$rc"
+    mapfile -t proof < <(
+      printf '%s\n' "$output" |
+        sed -nE 's/^turn-canary: TURN_LEDGER_PROOF_REQUIRED session=(smoketurn[a-z0-9]+) model=([a-z0-9.-]+)$/\1|\2/p'
+    )
+    [[ "${#proof[@]}" == 1 ]] || {
+      echo "✗ candidate CCB ledger proof 行缺失或不唯一" >&2
+      return 1
+    }
+    session_id="${proof[0]%%|*}"
+    proof_model="${proof[0]#*|}"
+    [[ "$proof_model" == "$model" ]] || {
+      echo "✗ candidate CCB ledger proof model 不匹配:$proof_model != $model" >&2
+      return 1
+    }
+    verify_candidate_ccb_ledger_cost "$session_id" "$proof_model"
+    return $?
+  fi
   ssh "$KL_HOST" "cd '$release' && V5_BASE='http://127.0.0.1:${port}' ${model:+V5_TURN_MODEL='$model'} timeout 300 node scripts/v5-smoke-turn-canary.mjs"
 }
 
@@ -5828,10 +5906,13 @@ smoke_turn_canary() { # <pinned master release> [port] [model]
 # 旧 deploy lane 的真 turn 只跑 v5-smoke-turn-canary.mjs 默认模型(gpt-5.6-sol / codex 引擎),
 # CCB(claude)引擎在 deploy 与 --dist 通道零真 turn 覆盖 —— 与 canary 的固定 live 矩阵
 # (Codex/gpt-5.6-luna + CCB/deepseek-v4-flash)不对齐。此处对齐成双引擎各一 turn。
-# 每个 turn 的判成仍是 v5-smoke-turn-canary.mjs 的三信号(exactText='2' + isFinal + cost_charged)。
+# 稳定 lane 每个 turn 仍严格要求三信号(exactText='2' + isFinal + cost_charged)。
+# 只有 0% candidate/promote-candidate 的 deepseek-v4-flash 因 cost-event 必然投旧 active，
+# 才允许用同一 smoke session 的精确 usage+ledger 闭环替代 live cost frame；finalize
+# 交接 control VIP 后仍必须回到 live frame，不能把 candidate 拓扑例外扩散到稳定态。
 V5_TURN_ENGINE_MATRIX_DEFAULT="gpt-5.6-sol deepseek-v4-flash"
-smoke_turn_matrix() { # <pinned master release> [port]
-  local release="$1" port="${2:-$ACTIVE_PORT}" model models
+smoke_turn_matrix() { # <pinned master release> [port] [lane]
+  local release="$1" port="${2:-$ACTIVE_PORT}" lane="${3:-stable}" model models cost_evidence_mode
   if [[ "${V5_SMOKE_TURN:-1}" != 1 ]]; then
     record_gate_waiver smoke-turn "V5_SMOKE_TURN=0 关闭了双引擎真 turn 矩阵(mode=$MODE release=$release)" || return 1
     echo "  · 双引擎真 turn 矩阵已显式豁免(V5_SMOKE_TURN=0;已登记 durable debt,下次普通发布必须真跑)"
@@ -5841,9 +5922,13 @@ smoke_turn_matrix() { # <pinned master release> [port]
     record_gate_waiver canary-turn-cost "V5_CANARY_REQUIRE_COST=0 关闭了真 turn 的计费到账断言(mode=$MODE)" || return 1
   fi
   models="${V5_TURN_MODELS:-$V5_TURN_ENGINE_MATRIX_DEFAULT}"
-  echo "── 双引擎真 turn 矩阵(models=$models,port=$port)──"
+  echo "── 双引擎真 turn 矩阵(models=$models,port=$port,lane=$lane)──"
   for model in $models; do
-    smoke_turn_canary "$release" "$port" "$model" || {
+    cost_evidence_mode=live
+    if [[ ( "$lane" == canary-ready || "$lane" == promote-candidate ) && "$model" == deepseek-v4-flash ]]; then
+      cost_evidence_mode=candidate-ledger
+    fi
+    smoke_turn_canary "$release" "$port" "$model" "$cost_evidence_mode" || {
       echo "✗ 真 turn 矩阵失败(model=$model port=$port):引擎未出正文/未收尾/未计费。" >&2
       return 1
     }
@@ -5907,7 +5992,7 @@ smoke_e2e_journey() { # [port]
 minimum_functional_core() { # <lane-label> <pinned release> <port>
   local lane="$1" release="$2" port="$3"
   echo "══ 最小功能核(lane=$lane,release=$release,port=$port)══"
-  smoke_turn_matrix "$release" "$port" || {
+  smoke_turn_matrix "$release" "$port" "$lane" || {
     echo "✗ 最小功能核失败(lane=$lane):真 turn 矩阵未通过。" >&2; return 1; }
   smoke_e2e_journey "$port" || {
     echo "✗ 最小功能核失败(lane=$lane):E2E 用户旅程未通过。" >&2; return 1; }
@@ -8716,7 +8801,7 @@ promote() {
       echo "  candidate 已不健康 → 走官方 --abort 回退,不要在坏 candidate 上放量。" >&2
       exit 1
     }
-    smoke_turn_matrix "$promote_candidate" "$(slot_port "$DS_candidate_slot")" || {
+    smoke_turn_matrix "$promote_candidate" "$(slot_port "$DS_candidate_slot")" "promote-candidate" || {
       echo "✗ promote 前 candidate 真 turn 矩阵失败:拒绝放量(cohort_percent 未改)。" >&2
       echo "  candidate 引擎已不能出正文/收尾/计费 → 走官方 --abort 回退。" >&2
       exit 1
