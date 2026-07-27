@@ -24,6 +24,11 @@ import { readClassifiedErrorCodes } from './helpers/classifiedErrorCodes.js'
 /** 用代表性错误串驱动 classifyRunError,收集所有非 unknown 产出码(行为断言,
  *  不读源码正则)。每类各喂一条已知命中该码的串。 */
 const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
+  {
+    input:
+      'API Error: 409 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn"}}',
+    code: 'model_config_changed_retry_turn',
+  },
   { input: '402 INSUFFICIENT_CREDITS: balance=1 required=9', code: 'insufficient_credits' },
   { input: '429 Too Many Requests', code: 'rate_limited' },
   { input: 'Selected model is at capacity. Please try a different model.', code: 'model_capacity' },
@@ -141,6 +146,7 @@ describe('turnErrorTaxonomy 契约 — wire OutboundError.code 枚举', () => {
     }
     // model_capacity 是本批新增 wire 码,显式钉死其在枚举里(防被摘掉)。
     assert.ok(wireCodes.includes('model_capacity'))
+    assert.ok(wireCodes.includes('model_config_changed_retry_turn'))
   })
 })
 

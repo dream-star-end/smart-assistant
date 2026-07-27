@@ -12,6 +12,24 @@ import {
 } from '../errorClassify.js'
 
 describe('classifyRunError', () => {
+  it('model_config_changed_retry_turn: production model-authority 409', () => {
+    const raw =
+      'API Error: 409 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn"},"request_id":"req-1"}'
+    const r = classifyRunError(raw)
+    assert.equal(r.code, 'model_config_changed_retry_turn')
+    assert.equal(r.message, '模型配置已更新,请重发')
+    assert.equal(
+      classifyRunError(JSON.stringify({ subtype: 'success', result: raw })).code,
+      'model_config_changed_retry_turn',
+    )
+  })
+
+  it('model_config_changed_retry_turn: similar codes do not match', () => {
+    const raw =
+      'API Error: 409 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN_LATER","message":"different contract"}}'
+    assert.equal(classifyRunError(raw).code, 'unknown')
+  })
+
   it('insufficient_credits: anthropicProxy 402 INSUFFICIENT_CREDITS', () => {
     const r = classifyRunError(
       '402 INSUFFICIENT_CREDITS: insufficient credits: balance=10 required=500',

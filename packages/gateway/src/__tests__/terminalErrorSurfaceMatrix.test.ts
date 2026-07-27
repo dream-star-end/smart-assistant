@@ -63,6 +63,13 @@ interface Scenario {
 
 const SCENARIOS: readonly Scenario[] = [
   {
+    code: 'model_config_changed_retry_turn',
+    sample:
+      'API Error: 409 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn"}}',
+    attempts: 1,
+    why: '旧执行票据已失效,必须让用户在新 turn 重发,自动重试同一 turn 不会恢复',
+  },
+  {
     code: 'rate_limited',
     sample: '429 Too Many Requests',
     attempts: 4,

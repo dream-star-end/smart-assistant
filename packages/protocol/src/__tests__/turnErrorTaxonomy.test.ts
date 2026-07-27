@@ -32,6 +32,7 @@ describe('automatic turn recovery policy', () => {
       'user_cancelled',
       'session_persist_unavailable',
       'model_not_available',
+      'model_config_changed_retry_turn',
       'codex_billing',
       'unknown',
     ]) {

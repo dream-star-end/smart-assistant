@@ -258,6 +258,15 @@ export async function* withRetry<T>(
         { level: 'error' },
       )
 
+      // The model-authority gate rejects a stale execution ticket with a
+      // deterministic 409. Retrying the same turn cannot refresh that ticket;
+      // the caller must open a new turn against the current model revision.
+      // Keep this before every generic retry path, including
+      // x-should-retry:true and persistent retry mode.
+      if (isModelConfigChangedRetryTurnError(error)) {
+        throw new CannotRetryError(error, retryContext)
+      }
+
       // Fast mode fallback: on 429/529, either wait and retry (short delays)
       // or fall back to standard speed (long delays) to avoid cache thrashing.
       // Skip in persistent mode: the short-retry path below loops with fast
@@ -781,6 +790,18 @@ function shouldRetry(error: APIError): boolean {
   if (error.status && error.status >= 500) return true
 
   return false
+}
+
+function isModelConfigChangedRetryTurnError(error: unknown): boolean {
+  if (!(error instanceof APIError) || error.status !== 409) return false
+  const body = (error as APIError & { error?: unknown }).error
+  if (typeof body !== 'object' || body === null) return false
+  const detail = (body as { error?: unknown }).error
+  return (
+    typeof detail === 'object' &&
+    detail !== null &&
+    (detail as { code?: unknown }).code === 'MODEL_CONFIG_CHANGED_RETRY_TURN'
+  )
 }
 
 export function getDefaultMaxRetries(): number {

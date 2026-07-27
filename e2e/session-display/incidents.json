@@ -541,7 +541,8 @@
       "rootFixCommit": "29503944",
       "coverageCommits": [
         "0b928cb5",
-        "cc33f30d"
+        "cc33f30d",
+        "51eda7ca"
       ],
       "proofPending": {
         "reason": "containment 走紧急通道先上线,回归只补到 unit 层;禁用模型/上下文耗尽两条路径尚无 live-e2e 或真浏览器证据(需要可注入的禁用模型与超长会话夹具)。",
@@ -557,6 +558,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
           "assertion": "context_too_long: Codex exact context exhaustion error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "model_config_changed_retry_turn: production model-authority 409"
         },
         {
           "layer": "unit",

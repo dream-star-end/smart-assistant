@@ -22,6 +22,7 @@ export type ClassifiedErrorCode =
   | 'insufficient_credits'
   | 'rate_limited'
   | 'model_capacity'
+  | 'model_config_changed_retry_turn'
   | 'upstream_failed'
   | 'context_too_long'
   | 'unknown'
@@ -45,6 +46,11 @@ const PATTERNS: Array<{
   code: Exclude<ClassifiedErrorCode, 'unknown'>
   message: string
 }> = [
+  {
+    re: /(?:"code"\s*:\s*"MODEL_CONFIG_CHANGED_RETRY_TURN")|(?:\\"code\\"\s*:\s*\\"MODEL_CONFIG_CHANGED_RETRY_TURN\\")/,
+    code: 'model_config_changed_retry_turn',
+    message: '模型配置已更新,请重发',
+  },
   // anthropicProxy.ts:1362 sendJsonError(res, 402, "INSUFFICIENT_CREDITS", ...)
   // CCB 抛出的 message 形如 "402 INSUFFICIENT_CREDITS: insufficient credits: balance=... required=..."
   {
