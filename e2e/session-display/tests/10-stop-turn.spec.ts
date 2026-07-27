@@ -45,7 +45,12 @@ function dispatchEvidence(userId: string, sid: string): {
   dispatches: number;
   openDispatches: number;
   statuses: string;
+  outcomes: string;
+  tapes: number;
+  tapeStatuses: string;
+  tapeErrorCodes: string;
   usageRows: number;
+  usageTerminalCodes: string;
 } {
   const raw = queryScalar(`
     SELECT json_build_object(
@@ -56,16 +61,45 @@ function dispatchEvidence(userId: string, sid: string): {
                            AND d.status IN ('admitted','accepted','rejecting')),
       'statuses',(SELECT COALESCE(string_agg(DISTINCT d.status,','),'') FROM turn_dispatches d
                    WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)}),
+      'outcomes',(SELECT COALESCE(string_agg(DISTINCT d.outcome,','),'') FROM turn_dispatches d
+                   WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)}),
+      'tapes',(SELECT count(*) FROM client_session_turn_tapes t
+                 JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
+                WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)}
+                  AND t.finalized_at IS NOT NULL),
+      'tapeStatuses',(SELECT COALESCE(string_agg(DISTINCT t.status,','),'')
+                        FROM client_session_turn_tapes t
+                        JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
+                       WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)}
+                         AND t.finalized_at IS NOT NULL),
+      'tapeErrorCodes',(SELECT COALESCE(string_agg(DISTINCT
+                           convert_from(COALESCE(r.visible_payload,r.payload),'UTF8')::jsonb->>'_errorCode',','),'')
+                          FROM client_session_turn_tape_records r
+                          JOIN client_session_turn_tapes t
+                            ON t.session_id=r.session_id AND t.user_id=r.user_id AND t.tape_id=r.tape_id
+                          JOIN turn_dispatches d ON d.dispatch_id=t.dispatch_id
+                         WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)}
+                           AND convert_from(COALESCE(r.visible_payload,r.payload),'UTF8')::jsonb ? '_errorCode'),
       'usageRows',(SELECT count(*) FROM usage_records ur
                      JOIN turn_dispatches d ON d.dispatch_id=ur.dispatch_id
-                    WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)})
+                    WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)}),
+      'usageTerminalCodes',(SELECT COALESCE(string_agg(DISTINCT
+                              ur.price_snapshot->>'codex_terminal_code',','),'')
+                              FROM usage_records ur
+                              JOIN turn_dispatches d ON d.dispatch_id=ur.dispatch_id
+                             WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)})
     )::text
   `);
   const parsed = JSON.parse(raw) as {
     dispatches: number;
     openDispatches: number;
     statuses: string;
+    outcomes: string;
+    tapes: number;
+    tapeStatuses: string;
+    tapeErrorCodes: string;
     usageRows: number;
+    usageTerminalCodes: string;
   };
   return parsed;
 }
@@ -151,10 +185,23 @@ test('停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活', a
     settled.statuses.split(',').every((status) => status === 'terminal' || status === 'manual_reconcile'),
     `dispatch 未落终态: ${settled.statuses}`,
   ).toBeTruthy();
+  expect(settled.outcomes, '用户停止必须由真实 interrupted tape 收敛 dispatch').toBe('interrupted');
+  expect(settled.tapes, '一次被停止的 turn 必须恰好落一卷 immutable tape').toBe(1);
+  expect(settled.tapeStatuses, '停止 tape header 必须是 interrupted').toBe('interrupted');
+  expect(
+    settled.tapeErrorCodes.toUpperCase(),
+    '停止 tape 的稳定错误码必须归一到 user_cancelled',
+  ).toBe('USER_CANCELLED');
   expect(
     settled.usageRows,
     '一次被停止的 turn 至多结算一笔(≥2 = 停止后仍在继续计费)',
   ).toBeLessThanOrEqual(1);
+  if (cfg.model === 'gpt-5.6-luna' && settled.usageRows > 0) {
+    expect(
+      settled.usageTerminalCodes,
+      'Codex 强制停止的 usage 审计必须归类为 USER_CANCELLED，不能记成模型失败',
+    ).toBe('USER_CANCELLED');
+  }
 
   // 静默窗内计费与 dispatch 都不得再长:这才是"点了停止就不再花钱"。
   for (let i = 0; i < samples; i++) {
