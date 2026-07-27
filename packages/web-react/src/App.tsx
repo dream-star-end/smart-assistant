@@ -38,6 +38,7 @@ import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCe
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
+import { TurnCostReminder } from "./components/chat/TurnCostReminder";
 import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
@@ -2297,6 +2298,14 @@ export function App() {
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
+            </div>
+          )}
+          {!demo && !gated && activeSess?._turnCostReminderCredits && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              <TurnCostReminder
+                credits={activeSess._turnCostReminderCredits}
+                onStop={stopTurn}
+              />
             </div>
           )}
           {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。*/}

@@ -562,6 +562,12 @@ export type ChatSession = {
   _pendingCostCredits?: string;
   _lastFinaledAssistantId?: string | null;
   _lastFinaledAt?: number;
+  /** Browser-only actual debit accumulated during the active root turn. */
+  _turnCostCredits?: string;
+  /** Stable request ids already folded into `_turnCostCredits`. */
+  _turnCostSeenRequestIds?: Set<string>;
+  /** Set once the advisory 500-credit line is reached; UI keeps it live until turn cleanup. */
+  _turnCostReminderCredits?: string;
   _tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
 
   // ── 节流渲染 rAF 标记（render 层用）──
@@ -596,6 +602,8 @@ export function createSession(input: {
     _streamingAssistant: null,
     _streamingThinking: null,
     _pendingCostCredits: "0",
+    _turnCostCredits: "0",
+    _turnCostSeenRequestIds: new Set(),
   };
 }
 
@@ -646,6 +654,9 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
   sess._liveTurnUsage = undefined;
+  sess._turnCostCredits = "0";
+  sess._turnCostSeenRequestIds = new Set();
+  sess._turnCostReminderCredits = undefined;
 }
 
 export function resetReplyTracker(sess: ChatSession): void {

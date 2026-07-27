@@ -157,7 +157,16 @@ describe("auditActions — 注册表", () => {
   });
 
   test("资金/权限/封禁类必须 mode='tx'(政策不变量)", () => {
-    for (const a of ["user.create", "user.credits.adjust", "org.credits.adjust", "user.patch", "pricing.patch", "plan.patch", "model_grant.add"] as const) {
+    for (const a of [
+      "user.create",
+      "user.credits.adjust",
+      "org.credits.adjust",
+      "user.patch",
+      "billing.ledger.reconcile",
+      "pricing.patch",
+      "plan.patch",
+      "model_grant.add",
+    ] as const) {
       assert.equal(ADMIN_AUDIT_ACTIONS[a].mode, "tx", `${a} 必须 fail-closed`);
     }
   });

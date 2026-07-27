@@ -1,14 +1,14 @@
 /**
- * 0096 / 0115 / 0118 — 订阅轮转 + org 低水位预警 sweeper（个人订阅 + org 席位订阅 + org
- * 低水位预警,三域一套机制同 tick 跑)。
+ * 0096 / 0115 / 0118 — 订阅轮转 + org 低水位预警 + 每日计费对账 sweeper。
  *
  * 设计（镜像 payment/pendingOrdersExpirer 的 SweeperHandle 模式）：
  *   - 默认 5min interval setInterval，timer.unref() 不阻止进程退出
  *   - 每 tick 依次排空:①**个人**订阅轮转 rolloverExpiredSubscriptions() → ②**org 席位订阅**
- *     轮转 rolloverExpiredOrgSubscriptions() → ③**org 低水位预警** sweepOrgLowBalance()。
- *     三者同为 v5-owned 订阅/计费域、同 5min tick —— **并入同一 sweeper 而非新建独立 sweeper**,
- *     避免第二/三个 timer/scheduler 注册项/shutdown(不造第二套并行机制)。
- *   - **三域各自独立 try/catch**:一个域持续抛错不得饿死另两个域(§17.2 fail-open:预警失败绝不
+ *     轮转 rolloverExpiredOrgSubscriptions() → ③**org 低水位预警** sweepOrgLowBalance()
+ *     → ④到期执行的**每日计费对账**。
+ *     四者同为 v5-owned 订阅/计费域、同 5min tick —— **并入同一 sweeper 而非新建独立 sweeper**,
+ *     避免第二/第三/第四个 timer/scheduler 注册项/shutdown(不造第二套并行机制)。
+ *   - **四域各自独立 try/catch**:一个域持续抛错不得饿死另三个域(§17.2 fail-open:预警失败绝不
  *     影响订阅轮转,更不影响计费)。任一抛错 → onError 记录,该域本 tick 跳过,下一 tick 重试。
  *   - 单进程：同 commercial 单部署假设，无需分布式锁（rollover 内部 FOR UPDATE SKIP LOCKED,
  *     低水位靠 low_balance_notified_at 去重）
@@ -24,6 +24,10 @@
 import { rolloverExpiredSubscriptions } from "./subscription.js";
 import { rolloverExpiredOrgSubscriptions } from "../org/orgSubscriptions.js";
 import { sweepOrgLowBalance } from "../org/orgLowBalance.js";
+import {
+  BILLING_RECONCILIATION_INTERVAL_MS,
+  runBillingReconciliation,
+} from "./reconciliation.js";
 
 export const DEFAULT_INTERVAL_MS = 300_000; // 5min
 export const MIN_INTERVAL_MS = 1000;
@@ -47,6 +51,12 @@ export interface SubscriptionRolloverOptions {
   orgRolloverFn?: (limit: number) => Promise<bigint[]>;
   /** 测试用注入：覆盖默认 sweepOrgLowBalance（org 低水位预警,便于无 DB / 注入 mailer 单测）。 */
   lowBalanceFn?: () => Promise<number>;
+  /** 测试用注入：覆盖每日只读计费对账。 */
+  reconcileFn?: () => Promise<number>;
+  /** 默认 24h；仍复用本 sweeper 的 5min tick，不创建第二个 timer。 */
+  reconcileEveryMs?: number;
+  /** 测试用时钟。 */
+  nowFn?: () => number;
 }
 
 function defaultOnError(err: unknown): void {
@@ -64,8 +74,16 @@ export function startSubscriptionRolloverSweeper(
   const rolloverFn = opts.rolloverFn ?? rolloverExpiredSubscriptions;
   const orgRolloverFn = opts.orgRolloverFn ?? rolloverExpiredOrgSubscriptions;
   const lowBalanceFn = opts.lowBalanceFn ?? (() => sweepOrgLowBalance());
+  const reconcileFn = opts.reconcileFn ?? (() => runBillingReconciliation());
+  const reconcileEveryMs = Math.max(
+    MIN_INTERVAL_MS,
+    opts.reconcileEveryMs ?? BILLING_RECONCILIATION_INTERVAL_MS,
+  );
+  const nowFn = opts.nowFn ?? Date.now;
   const runOnStart = opts.runOnStart ?? true;
   let stopped = false;
+  let nextReconcileAt = 0;
+  let reconcileInFlight: Promise<number> | null = null;
 
   // 分批排空一类订阅轮转（每批最多 batch 行,避免一次锁太多行；空批即停/不足一批即停）。
   async function drain(fn: (limit: number) => Promise<bigint[]>): Promise<number> {
@@ -79,8 +97,30 @@ export function startSubscriptionRolloverSweeper(
     return total;
   }
 
-  // 一次 tick：依次排空个人订阅轮转 → org 席位订阅轮转 → org 低水位预警(一套机制,同 tick)。
-  // **三域各自独立 try/catch**:一个域持续抛错不得饿死另两个域(个人轮转 bug 不得让 org 到期池
+  async function reconcileIfDue(): Promise<number> {
+    if (stopped || reconcileInFlight !== null) return 0;
+    const startedAt = nowFn();
+    if (startedAt < nextReconcileAt) return 0;
+
+    // Reserve the daily deadline before invoking SQL. Promise chaining makes
+    // the in-flight marker visible before an injected function can throw.
+    nextReconcileAt = startedAt + reconcileEveryMs;
+    const task = Promise.resolve().then(reconcileFn);
+    reconcileInFlight = task;
+    try {
+      return await task;
+    } catch (err) {
+      // A failed daily scan retries on the next ordinary 5-minute tick rather
+      // than disappearing for a full day.
+      nextReconcileAt = nowFn() + interval;
+      throw err;
+    } finally {
+      if (reconcileInFlight === task) reconcileInFlight = null;
+    }
+  }
+
+  // 一次 tick：依次排空个人订阅轮转 → org 席位订阅轮转 → org 低水位预警 → 到期计费对账。
+  // **四域各自独立 try/catch**:一个域持续抛错不得饿死另三个域(个人轮转 bug 不得让 org 到期池
   // 永不清零 / org 低水位不得让订阅轮转停摆,反之亦然)。任一抛错 → onError 记录,该域本 tick
   // 跳过,下一 tick 重试(轮转幂等 + FOR UPDATE SKIP LOCKED;低水位靠 low_balance_notified_at
   // 去重,均重试安全)。返回值合计轮转行数 + 预警 org 数(仅测试可观测,不对外语义化)。
@@ -103,6 +143,13 @@ export function startSubscriptionRolloverSweeper(
         // 低水位预警是"每 org 至多一次"的通知(去重靠打戳),非批量认领 —— 单次调用即可,
         // 内部自带 batch drain。§17.2 fail-open:失败被本 try/catch 吞,绝不影响上面两域/计费。
         total += await lowBalanceFn();
+      } catch (err) {
+        onError(err);
+      }
+    }
+    if (!stopped) {
+      try {
+        total += await reconcileIfDue();
       } catch (err) {
         onError(err);
       }
