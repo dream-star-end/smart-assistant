@@ -211,7 +211,8 @@ if [[ -L "$state_file" || ( -e "$state_file" && ! -f "$state_file" ) ]]; then ec
 if [[ -f "$state_file" ]]; then cp -a -- "$state_file" "$backup/monitor-state.json"; state_existed=1; fi
 surface_rollback_armed=1
 
-# 先用新脚本只读探测；任何当前 bad 都在状态/通知写入前拒绝安装。
+# 先用新脚本只读探测；critical bad 在状态/通知写入前拒绝安装。warning bad
+# 是监控要如实接管并持续报告的风险，不能反过来永久阻断监控升级。
 #
 # V5MON_BACKUP_DIR 透传(2026-07-26):新增的 check_backup_fresh 读的是绝对路径
 # /var/backups/openclaude-v5。安装器此前把该路径当成不可变的生产假设,于是
@@ -228,15 +229,36 @@ declare -a monitor_env=(
 
 dry_out="$backup/dry-run.out"
 env "${monitor_env[@]}" bash "$stage/v5-monitor.sh" --dry-run > "$dry_out"
-if awk '$2 == "bad" { found=1 } END { exit found ? 0 : 1 }' "$dry_out"; then
-  echo "FATAL:新 monitor dry-run 存在 bad check" >&2
-  cat "$dry_out" >&2
-  exit 1
-fi
+dry_gate="$(awk '
+  $2 == "bad" {
+    if ($0 !~ /\[severity=(warning|critical)\]$/) malformed=1
+    else if ($0 ~ /\[severity=critical\]$/) critical=1
+  }
+  END {
+    if (malformed) print "malformed"
+    else if (critical) print "critical"
+    else print "ok"
+  }
+' "$dry_out")"
+case "$dry_gate" in
+  ok) ;;
+  critical)
+    echo "FATAL:新 monitor dry-run 存在 critical bad check" >&2
+    cat "$dry_out" >&2
+    exit 1
+    ;;
+  *)
+    echo "FATAL:新 monitor dry-run 的 bad check 缺少合法 severity" >&2
+    cat "$dry_out" >&2
+    exit 1
+    ;;
+esac
 
 old_bad="$(jq -c '[(.checks // {}) | to_entries[] | select(.value.status == "bad") | .key] | sort' "$state_file" 2>/dev/null)" \
   || { echo "FATAL:monitor state 不是合法 JSON" >&2; exit 1; }
-if [[ "$old_bad" == '["pool"]' ]]; then
+old_pool_severity="$(jq -r '.checks.pool.severity // ""' "$state_file" 2>/dev/null)" \
+  || { echo "FATAL:monitor state 不是合法 JSON" >&2; exit 1; }
+if [[ "$old_bad" == '["pool"]' && -z "$old_pool_severity" ]]; then
   before_counts="$(monitor_counts)" || { echo "FATAL:无法读取迁移前 monitor 通知计数" >&2; exit 1; }
   env "${monitor_env[@]}" bash "$stage/v5-monitor.sh" --migrate-obsolete-pool-state
   after_counts="$(monitor_counts)" || { echo "FATAL:无法读取迁移后 monitor 通知计数" >&2; exit 1; }
@@ -245,8 +267,17 @@ if [[ "$old_bad" == '["pool"]' ]]; then
     exit 1
   }
 elif [[ "$old_bad" != '[]' ]]; then
-  echo "FATAL:拒绝静默迁移非 pool 历史异常:$old_bad" >&2
-  exit 1
+  old_blocking_bad="$(jq -c '
+    [(.checks // {}) | to_entries[]
+      | select(.value.status == "bad" and .value.severity != "warning")
+      | .key] | sort
+  ' "$state_file" 2>/dev/null)" \
+    || { echo "FATAL:monitor state 不是合法 JSON" >&2; exit 1; }
+  if [[ "$old_blocking_bad" != '[]' ]]; then
+    echo "FATAL:拒绝迁移历史 critical/未分级异常:$old_blocking_bad" >&2
+    exit 1
+  fi
+  echo "  · 延续历史 warning 状态:$old_bad"
 fi
 
 if [[ -e "$release" && ( ! -d "$release" || -L "$release" ) ]]; then echo "FATAL:monitor release path 不可信:$release" >&2; exit 1; fi
@@ -277,8 +308,14 @@ mv -f -- "$systemd_dir/.$daily_timer_unit.new.$$" "$systemd_dir/$daily_timer_uni
 mv -f -- "$systemd_dir/.$alert_unit.new.$$" "$systemd_dir/$alert_unit"
 systemctl daemon-reload
 systemctl start "$monitor_unit"
-[[ "$(jq -c '[(.checks // {}) | to_entries[] | select(.value.status == "bad") | .key] | sort' "$state_file")" == '[]' ]] \
-  || { echo "FATAL:新 monitor 首轮出现真实异常" >&2; exit 1; }
+post_blocking_bad="$(jq -c '
+  [(.checks // {}) | to_entries[]
+    | select(.value.status == "bad" and .value.severity != "warning")
+    | .key] | sort
+' "$state_file" 2>/dev/null)" \
+  || { echo "FATAL:新 monitor 首轮 state 不是合法 JSON" >&2; exit 1; }
+[[ "$post_blocking_bad" == '[]' ]] \
+  || { echo "FATAL:新 monitor 首轮出现 critical/未分级异常:$post_blocking_bad" >&2; exit 1; }
 [[ "$(readlink -f "$current")" == "$release" ]] || { echo "FATAL:monitor current 未指向目标 release" >&2; exit 1; }
 restore_timer_only
 surface_rollback_armed=0

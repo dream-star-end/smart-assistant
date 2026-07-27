@@ -1394,6 +1394,9 @@ export class SessionManager {
   private _tailFoldMinIntervalMs = 5000
   private _tailFoldStreamCap = 24
   private _tailFoldOwnerCap = 64
+  /** Cooperative Stop grace before the gateway escalates to runner shutdown.
+   * Private test seam; the production boundary remains five seconds. */
+  private _terminalRequestGraceMs = 5_000
   /**
    * F2 — owner 级 tail 预算,按 ownerTurnKey 键控,**SessionManager 级**(跨会话共享:
    * 多个 delegate 子会话共用同一 parent ownerTurnKey 时同领一份 64 额度,而非各领 64)。
@@ -4112,6 +4115,7 @@ export class SessionManager {
         errorCode: string
         waiveReason?: TurnWaiveReason
       } | null = null
+      let terminalRequestEscalated = false
 
       // Idle timeout — refreshed on every adapter 'activity'(底座每条原始消息,
       // 含 parser 会忽略的消息 —— 与旧 runner 'message' 的 refresh 时机逐条对齐)。
@@ -4352,6 +4356,16 @@ export class SessionManager {
         partialPersistencePromise = (async () => {
           let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
           detach()
+          if (
+            status === 'interrupted' &&
+            errorCode === 'USER_CANCELLED' &&
+            terminalEngineBilling?.status === 'error'
+          ) {
+            terminalEngineBilling = {
+              ...terminalEngineBilling,
+              terminalCode: 'USER_CANCELLED',
+            }
+          }
           flushTerminalBilling()
           const snap = turn?.getPartialSnapshot() ?? {
             assistantText: '',
@@ -4486,7 +4500,7 @@ export class SessionManager {
           await Promise.race([
             targetTurn.summary.then(() => { summaryFinished = true }),
             new Promise<void>((resolveWait) => {
-              timerHandle = setTimeout(resolveWait, 5_000)
+              timerHandle = setTimeout(resolveWait, this._terminalRequestGraceMs)
             }),
           ])
           if (timerHandle) clearTimeout(timerHandle)
@@ -4503,6 +4517,9 @@ export class SessionManager {
           // supervisor's bounded shutdown return until its stdout really
           // closes. This is the no-loss barrier for escaped descendants that
           // still hold the pipe after SIGKILL.
+          if (status === 'interrupted' && errorCode === 'USER_CANCELLED') {
+            terminalRequestEscalated = true
+          }
           try {
             await runner.shutdown()
           } catch (err) {
@@ -4684,9 +4701,44 @@ export class SessionManager {
             : undefined
           // A generic runner error may be emitted before the remaining stdout
           // drains into a valid terminal result (pipe/error ordering). Preserve
-          // that diagnostic runtime event, but only a platform-owned waiver
-          // request is allowed to override a subsequently completed summary.
-          let terminalOverride = (requestedTerminal?.waiveReason ? requestedTerminal : null) ?? (modelAuthorityFailure
+          // that diagnostic runtime event, but only a platform-owned waiver or
+          // an engine-confirmed user cancellation may override the summary.
+          // If Stop races a natural end_turn, completion remains authoritative.
+          const userCancellationOverride =
+            requestedTerminal?.status === 'interrupted' &&
+            requestedTerminal.errorCode === 'USER_CANCELLED' &&
+            (
+              result?.stopReason === 'interrupted' ||
+              (
+                terminalRequestEscalated &&
+                result?.isError === true &&
+                result.stopReason !== 'end_turn' &&
+                terminalEngineBilling?.status === 'error' &&
+                terminalEngineBilling.terminalCode === 'CODEX_ERROR' &&
+                result.errorDetail?.includes(
+                  '"result":"codex app-server exited code=',
+                ) === true
+              )
+            )
+              ? requestedTerminal
+              : null
+          if (
+            userCancellationOverride &&
+            terminalEngineBilling?.status === 'error'
+          ) {
+            // A forced Codex app-server shutdown reports a generic CODEX_ERROR
+            // because the runner cannot know why its process was killed. At
+            // this layer both sides are authoritative: the browser requested
+            // USER_CANCELLED and the engine confirmed an interrupted result.
+            // Keep billing/audit classification aligned with the tape.
+            terminalEngineBilling = {
+              ...terminalEngineBilling,
+              terminalCode: 'USER_CANCELLED',
+            }
+          }
+          let terminalOverride = (
+            requestedTerminal?.waiveReason ? requestedTerminal : userCancellationOverride
+          ) ?? (modelAuthorityFailure
             ? {
                 status: 'crashed' as const,
                 reason: modelAuthorityReason!,
@@ -5254,6 +5306,16 @@ export class SessionManager {
     if (!s) return false
     const external = s._externalTurnAbort
     if (external && !external.signal.aborted) external.abort()
+    const persistActiveTurn = s._persistActiveTurn
+    if (persistActiveTurn) {
+      const persistence = persistActiveTurn(
+        'interrupted',
+        '本轮已由用户停止。',
+        'USER_CANCELLED',
+      )
+      this._trackPersistence(persistence)
+      return true
+    }
     const runnerInterrupted = s.runner.interrupt()
     return !!external || runnerInterrupted
   }

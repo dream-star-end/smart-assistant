@@ -37,6 +37,19 @@ export type NormalizedClientFrictionReport = Omit<
   "userId"
 >;
 
+export function classifyClientFrictionPersistError(err: unknown): {
+  errorClass: string;
+  errorCode: string | null;
+  errorConstraint: string | null;
+} {
+  const fields = err && typeof err === "object" ? err as Record<string, unknown> : {};
+  return {
+    errorClass: err instanceof Error ? err.constructor.name : typeof err,
+    errorCode: safeToken(fields.code, 32, /^[A-Za-z0-9_.:-]+$/),
+    errorConstraint: safeToken(fields.constraint, 128, /^[A-Za-z0-9_.:-]+$/),
+  };
+}
+
 /** Reduce an untrusted browser body to the exact bounded telemetry schema.
  * Raw message/stack/path/URL/UA and every unknown field are deliberately
  * absent from the returned value. */
@@ -100,10 +113,13 @@ export async function handleClientErrorReport(
   await recordProductFrictionEvent({
     ...report,
     userId,
-  }).catch(() => {
-    // Telemetry must never affect the user path; emit only the stable class.
+  }).catch((err: unknown) => {
+    // Telemetry must never affect the user path. Keep only structural database
+    // diagnostics: PostgreSQL messages can include rejected row values, so raw
+    // message/detail/stack must not become a second telemetry payload.
     ctx.log.warn("client_friction_persist_failed", {
       surface: report.surface, stage: report.stage, code: report.code,
+      ...classifyClientFrictionPersistError(err),
     });
   });
 

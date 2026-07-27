@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { normalizeClientFrictionReport } from "../http/clientErrors.js";
+import {
+  classifyClientFrictionPersistError,
+  normalizeClientFrictionReport,
+} from "../http/clientErrors.js";
 
 describe("client friction normalization", () => {
   test("keeps stable classifications and drops every raw browser field", () => {
@@ -78,5 +81,28 @@ describe("client friction normalization", () => {
     assert.equal(normalized.provider, null);
     assert.equal(normalized.browserFamily, null);
     assert.equal(normalized.deviceClass, "unknown");
+  });
+
+  test("persist failures expose bounded structure without leaking raw database detail", () => {
+    const err = Object.assign(new Error("DO_NOT_LOG rejected row contains private values"), {
+      code: "23514",
+      constraint: "product_friction_events_code_check",
+      detail: "DO_NOT_LOG row=(secret)",
+    });
+    const classified = classifyClientFrictionPersistError(err);
+    assert.deepEqual(classified, {
+      errorClass: "Error",
+      errorCode: "23514",
+      errorConstraint: "product_friction_events_code_check",
+    });
+    assert.equal(JSON.stringify(classified).includes("DO_NOT_LOG"), false);
+
+    assert.deepEqual(
+      classifyClientFrictionPersistError({
+        code: "bad code with spaces",
+        constraint: "../../unsafe",
+      }),
+      { errorClass: "object", errorCode: null, errorConstraint: null },
+    );
   });
 });

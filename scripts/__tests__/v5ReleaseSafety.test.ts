@@ -4378,6 +4378,8 @@ interface MonitorFixtureOptions {
   healthyHttpPorts?: number[]
   dockerRows?: string[]
   dockerPsFails?: boolean
+  turnWindowStats?: string
+  failedUnits?: string[]
 }
 
 describe('v5 daily report fanout accounting', () => {
@@ -4464,7 +4466,10 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     healthyHttpPorts = allHealthy ? [18790] : [],
     dockerRows = [],
     dockerPsFails = false,
+    turnWindowStats: explicitTurnWindowStats,
+    failedUnits = [],
   } = options
+  const turnWindowStats = explicitTurnWindowStats ?? (allHealthy ? '0|0|0|0' : undefined)
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-')); dirs.push(dir)
   // 夹具内的"健康备份"目录:一个 mtime=当下的子目录即满足 backup_fresh 的新鲜度判据。
   const backupDir = path.join(dir, 'backups')
@@ -4491,9 +4496,23 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
   spawnSync('mkdir', ['-p', bin])
   const psqlCalls = path.join(dir, 'psql-calls')
   const scripts: Record<string, string> = {
-    systemctl: allHealthy
-      ? '#!/bin/sh\necho active\n'
-      : `#!/bin/sh\ncase "$2" in openclaude-v5${egressBad ? '|openclaude-v5-egress' : ''}) echo inactive; exit 3;; *) echo active;; esac\n`,
+    systemctl: `#!/bin/sh
+case "$1" in
+  list-units)
+    case "$*" in
+      *--state=failed*) ${failedUnits.map((unit) => `printf '%s\\n' '${unit} loaded failed failed fixture'`).join('; ') || ':'} ;;
+    esac
+    exit 0
+    ;;
+  is-active)
+    case "$2" in
+      ${allHealthy ? '__never__' : `openclaude-v5${egressBad ? '|openclaude-v5-egress' : ''}`}) echo inactive; exit 3 ;;
+      *) echo active; exit 0 ;;
+    esac
+    ;;
+  *) echo active ;;
+esac
+`,
     curl: `#!/bin/sh
 case "$*" in
   ${egressBad ? '' : '*18892*) echo \'{"ok":true,"role":"egress"}\';;'}
@@ -4509,6 +4528,7 @@ esac
 printf '%s\\n' "$*" >> '${psqlCalls}'
 case "$*" in
   *"FROM deploy_state"*) printf '%s\\n' '${deployState.phase}|${deployState.step}|${deployState.active}|${deployState.candidate ?? ''}' ;;
+  ${turnWindowStats !== undefined ? `*request_finalize_journal*) printf '%s\\n' '${turnWindowStats}' ;;` : ''}
   ${allHealthy ? '*product_friction_events*) printf \'0|0\\n\' ;;' : ''}
   ${allHealthy ? '*marketplace_skill_listings*) printf \'t\\n\' ;;' : ''}
   *) exit 0 ;;
@@ -4626,6 +4646,10 @@ interface MonitorHostInstallOptions {
   invalidState?: boolean
   failUnitBackup?: boolean
   failDailyUnitBackup?: boolean
+  warningBad?: boolean
+  criticalBad?: boolean
+  malformedDryRunSeverity?: boolean
+  initialState?: Record<string, unknown>
 }
 
 async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}) {
@@ -4665,6 +4689,13 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   ]) {
     await cp(path.join(root, source), path.join(stage, path.basename(source)))
   }
+  if (options.malformedDryRunSeverity) {
+    await cp(path.join(stage, 'v5-monitor.sh'), path.join(stage, 'v5-monitor.real.sh'))
+    await writeFile(path.join(stage, 'v5-monitor.sh'), `#!/bin/bash
+bash "$(dirname "$0")/v5-monitor.real.sh" "$@" | sed -E 's/ \\[severity=(warning|critical)\\]$//'
+`)
+    await chmod(path.join(stage, 'v5-monitor.sh'), 0o755)
+  }
   const checksum = spawnSync('bash', ['-c', [
     'sha256sum v5-monitor.sh v5-daily-check.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
     'openclaude-v5-monitor.service openclaude-v5-monitor.timer',
@@ -4675,7 +4706,7 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   await writeFile(path.join(stage, 'SHA256SUMS'), checksum.stdout)
   const bundleSha = createHash('sha256').update(checksum.stdout).digest('hex')
   await writeFile(envFile, 'OC_RUNTIME_IMAGE=test/runtime:v5\nDATABASE_URL=postgres://unused\n')
-  const originalState = JSON.stringify({
+  const originalState = JSON.stringify(options.initialState ?? {
     checks: {
       pool: { status: 'bad', since: 123, last_alert: 456 },
       mem: { status: 'ok', since: 0, last_alert: 0 },
@@ -4714,9 +4745,23 @@ case "$cmd:$unit" in
   stop:openclaude-v5-daily.timer) [ "\${FAIL_DAILY_TIMER_STOP:-0}" = 1 ] && exit 1; touch '${dailyTimerStopped}'; exit 0 ;;
   start:openclaude-v5-monitor.timer) rm -f '${timerStopped}'; exit 0 ;;
   start:openclaude-v5-daily.timer) [ "\${FAIL_DAILY_TIMER_START:-0}" = 1 ] && exit 1; rm -f '${dailyTimerStopped}'; exit 0 ;;
-  start:openclaude-v5-monitor.service) [ "\${FAIL_MONITOR_START:-0}" = 1 ] && { touch '${alertActive}'; exit 1; }; exit 0 ;;
+  start:openclaude-v5-monitor.service)
+    [ "\${FAIL_MONITOR_START:-0}" = 1 ] && { touch '${alertActive}'; exit 1; }
+    if [ "\${WARNING_BAD:-0}" = 1 ]; then
+      jq '
+        if .checks.failed_units.status == "bad" then
+          .checks.failed_units.severity = "warning"
+        else
+          .checks.failed_units = {status:"bad", since:123, last_alert:456, severity:"warning"}
+        end
+      ' '${stateFile}' > '${stateFile}.new'
+      mv '${stateFile}.new' '${stateFile}'
+    fi
+    exit 0
+    ;;
   stop:openclaude-v5-alert-fail@openclaude-v5-monitor.service.service) rm -f '${alertActive}'; exit 0 ;;
   list-jobs:*) [ -f '${alertActive}' ] && printf '1 openclaude-v5-alert-fail@openclaude-v5-monitor.service.service start running\\n'; exit 0 ;;
+  list-units:--state=failed*) [ "\${WARNING_BAD:-0}" = 1 ] && printf 'fixture-warning.service loaded failed failed test\\n'; exit 0 ;;
   list-units:*) [ -f '${alertActive}' ] && printf 'openclaude-v5-alert-fail@openclaude-v5-monitor.service.service loaded active running test\\n'; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -4731,6 +4776,7 @@ esac
     psql: `#!/bin/sh
 case "$*" in
   *"FROM deploy_state"*) printf 'stable|0|A|\\n' ;;
+  *request_finalize_journal*) [ "\${CRITICAL_BAD:-0}" = 1 ] && { echo authority-down >&2; exit 2; }; printf '0|0|0|0\\n' ;;
   *product_friction_events*) printf '0|0\\n' ;;
   *marketplace_skill_listings*) printf 't\\n' ;;
   *) printf '7|11\\n' ;;
@@ -4765,6 +4811,8 @@ esac
     FAIL_DAILY_TIMER_START: options.failDailyTimerStart ? '1' : '0',
     BUSY_MONITOR: options.busyMonitor ? '1' : '0',
     BUSY_DAILY: options.busyDaily ? '1' : '0',
+    WARNING_BAD: options.warningBad ? '1' : '0',
+    CRITICAL_BAD: options.criticalBad ? '1' : '0',
     OC_V5_SYSTEMD_DIR: systemdDir,
     OC_V5_MONITOR_ENV: envFile,
     OC_V5_MONITOR_LOG: monitorLog,
@@ -4887,6 +4935,87 @@ describe('v5 host monitor independent atomic installer', () => {
     assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-OK host monitor/)
   })
 
+  test('installs with a current warning and records its explicit severity', async () => {
+    const fixture = await monitorHostInstallFixture({
+      warningBad: true,
+      initialState: { checks: {} },
+    })
+    assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    const state = JSON.parse(await readFile(fixture.stateFile, 'utf8'))
+    assert.deepEqual(state.checks.failed_units, {
+      status: 'bad',
+      since: 123,
+      last_alert: 456,
+      severity: 'warning',
+    })
+  })
+
+  test('allows a later bundle upgrade while a classified warning remains bad', async () => {
+    const fixture = await monitorHostInstallFixture({
+      warningBad: true,
+      initialState: {
+        checks: {
+          failed_units: { status: 'bad', since: 17, last_alert: 29, severity: 'warning' },
+        },
+      },
+    })
+    assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    assert.deepEqual(JSON.parse(await readFile(fixture.stateFile, 'utf8')).checks.failed_units, {
+      status: 'bad',
+      since: 17,
+      last_alert: 29,
+      severity: 'warning',
+    })
+  })
+
+  test('rejects a current critical check and restores the old monitor surface', async () => {
+    const fixture = await monitorHostInstallFixture({
+      criticalBad: true,
+      initialState: { checks: {} },
+    })
+    assert.notEqual(fixture.result.status, 0)
+    assert.match(fixture.result.stderr, /critical bad check/)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+    assert.equal(await readFile(fixture.stateFile, 'utf8'), fixture.originalState)
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'),
+      'old:openclaude-v5-monitor.service\n',
+    )
+    assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer/)
+  })
+
+  test('rejects malformed severity in a current bad dry-run result', async () => {
+    const fixture = await monitorHostInstallFixture({
+      warningBad: true,
+      malformedDryRunSeverity: true,
+      initialState: { checks: {} },
+    })
+    assert.notEqual(fixture.result.status, 0)
+    assert.match(fixture.result.stderr, /缺少合法 severity/)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+    assert.equal(await readFile(fixture.stateFile, 'utf8'), fixture.originalState)
+  })
+
+  for (const [name, severity] of [
+    ['missing', undefined],
+    ['invalid', 'urgent'],
+  ] as const) {
+    test(`rejects a historical bad state with ${name} severity`, async () => {
+      const failed: Record<string, unknown> = { status: 'bad', since: 1, last_alert: 2 }
+      if (severity !== undefined) failed.severity = severity
+      const fixture = await monitorHostInstallFixture({
+        warningBad: true,
+        initialState: { checks: { failed_units: failed } },
+      })
+      assert.notEqual(fixture.result.status, 0)
+      assert.match(fixture.result.stderr, /历史 critical\/未分级异常/)
+      assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+      assert.equal(await readFile(fixture.stateFile, 'utf8'), fixture.originalState)
+    })
+  }
+
   test('restores units, pointer, state, and timer when activation fails', async () => {
     const fixture = await monitorHostInstallFixture({ failMonitorStart: true })
     assert.notEqual(fixture.result.status, 0)
@@ -4974,6 +5103,74 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     assert.match(warningLine, /mem_oversubscribe/, 'mem_oversubscribe 必须显式分级')
   })
 
+  test('dry-run and durable state expose severity from the same authority', async () => {
+    const healthyRow = 'openclaude/openclaude-runtime:v5-ccb-test|1|v5|1'
+    const dry = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      failedUnits: ['fixture-warning.service'],
+    })
+    assert.equal(dry.status, 0, dry.stderr)
+    assert.match(dry.stdout, /failed_units\s+bad\s+.*\[severity=warning\]$/m)
+    assert.match(dry.stdout, /backup_fresh\s+ok\s+.*\[severity=critical\]$/m)
+
+    const live = await monitorFixture({
+      args: [],
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      failedUnits: ['fixture-warning.service'],
+      state: {
+        checks: {
+          failed_units: {
+            status: 'bad',
+            since: 123,
+            last_alert: 9_999_999_999,
+            severity: 'warning',
+          },
+        },
+      },
+    })
+    assert.equal(live.status, 0, live.stderr)
+    const state = JSON.parse(await readFile(live.statePath, 'utf8'))
+    assert.deepEqual(state.checks.failed_units, {
+      status: 'bad',
+      since: 123,
+      last_alert: 9_999_999_999,
+      severity: 'warning',
+    })
+    assert.equal(state.checks.backup_fresh.severity, 'critical')
+    assert.doesNotMatch(await readFile(live.psqlCalls, 'utf8'), /INSERT INTO inbox_messages/)
+  })
+
+  test('turn health uses terminal journal authority and one shared classified window', async () => {
+    const source = await readFile(monitor, 'utf8')
+    const loadStart = source.indexOf('load_turn_window_stats() {')
+    assert.ok(loadStart >= 0, 'turn window loader 缺失')
+    const loader = source.slice(loadStart, source.indexOf('\n}', loadStart))
+    assert.match(loader, /FROM request_finalize_journal rfj/)
+    assert.match(loader, /LEFT JOIN usage_records ur ON ur\.id=rfj\.usage_id/)
+    assert.match(loader, /rfj\.state IN \('committed','aborted'\)/)
+    assert.match(loader, /failure_code IN \('CLIENT_ABORT','USER_CANCELLED'\)/)
+    assert.match(loader, /codex_terminal_code'='USER_CANCELLED'/)
+    assert.match(loader, /ur\.status='success'/)
+    assert.match(loader, /COALESCE\(ur\.output_tokens,0\)>0/)
+    assert.match(loader, /terminal_outcome='failure'/)
+    assert.match(loader, /terminal_outcome='cancelled'/)
+    assert.match(loader, /FROM product_friction_events/)
+
+    const turnStart = source.indexOf('check_turn_failures() {')
+    const turn = source.slice(turnStart, source.indexOf('\n}', turnStart))
+    assert.match(turn, /load_turn_window_stats/)
+    assert.match(turn, /TURN_ERR_RATE_MIN_TOTAL/)
+    assert.doesNotMatch(turn, /psql /, '主检查不得另起第二条漂移查询')
+
+    const frictionStart = source.indexOf('check_friction_pipeline() {')
+    const friction = source.slice(frictionStart, source.indexOf('\n}', frictionStart))
+    assert.match(friction, /load_turn_window_stats/)
+    assert.doesNotMatch(friction, /psql /, '元监控必须复用同一 classified 查询')
+    assert.match(source, /^check_friction_pipeline$/m)
+  })
+
   // docker inspect 必须一次传全部容器 ID:每 2 分钟一轮的探针不能在循环里逐个调。
   test('mem_oversubscribe inspects all containers in one docker call', async () => {
     const source = await readFile(monitor, 'utf8')
@@ -4984,6 +5181,58 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     // docker 调用失败必须 fail-loud,不能静默当作"没有超售"
     assert.match(fn, /docker ps 失败/)
     assert.match(fn, /docker inspect 取 HostConfig\.Memory 失败/)
+  })
+})
+
+describe('v5 monitor terminal turn classification', () => {
+  const healthyRow = 'openclaude/openclaude-runtime:v5-ccb-test|1|v5|1'
+
+  test('alerts at the non-cancelled error-rate threshold and keeps a healthy telemetry pipe', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '10|2|3|2',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+bad\s+turn 错误率 20%\(2\/10,用户取消 3/)
+    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 2 \/ friction failed turn_error 2/)
+    const calls = await readFile(result.psqlCalls, 'utf8')
+    assert.equal((calls.match(/request_finalize_journal/g) ?? []).length, 1)
+  })
+
+  test('keeps a small sample out of the critical rate but flags a missing friction signal', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '9|1|2|0',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 9 轮\(<10,样本不足不判\),用户取消 2/)
+    assert.match(result.stdout, /friction_pipeline\s+bad\s+遥测管道疑似断裂:窗内服务端失败 1 次/)
+  })
+
+  test('does not classify user cancellations as failures or telemetry gaps', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '0|0|4|0',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 0 轮\(<10,样本不足不判\),用户取消 4/)
+    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 0 \/ friction failed turn_error 0/)
+  })
+
+  test('caches a failed authority query without treating the second consumer as healthy', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: 'invalid',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+bad\s+turn 失败率:查询返回非法行/)
+    assert.match(result.stdout, /friction_pipeline\s+bad\s+遥测管道:查询返回非法行/)
+    const calls = await readFile(result.psqlCalls, 'utf8')
+    assert.equal((calls.match(/request_finalize_journal/g) ?? []).length, 1)
   })
 })
 
