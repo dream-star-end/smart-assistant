@@ -1,3 +1,8 @@
+import {
+  LEDGER_REASONS,
+  ledgerReasonLabel,
+  type LedgerReason,
+} from "@openclaude/protocol/ledger";
 import { Download, Inbox, RotateCw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, EmptyState, Input, useToast } from "../../../components/ui";
@@ -17,26 +22,6 @@ import { adminGet, adminText, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 import { useAdminRoute } from "../../router";
 
-// ── 权威枚举(与 vanilla admin.js:28 + 后端 LEDGER_REASONS 一致)──
-const LEDGER_REASONS = [
-  "topup",
-  "chat",
-  "agent_chat",
-  "agent_subscription",
-  "refund",
-  "admin_adjust",
-  "promotion",
-] as const;
-type LedgerReason = (typeof LEDGER_REASONS)[number];
-const LEDGER_REASON_LABELS: Record<string, string> = {
-  topup: "充值",
-  chat: "对话",
-  agent_chat: "Agent 对话",
-  agent_subscription: "Agent 订阅",
-  refund: "退款",
-  admin_adjust: "管理员调整",
-  promotion: "活动赠送",
-};
 const LEDGER_CHANNEL_LABELS: Record<string, string> = { web: "网页", wechat: "微信" };
 const PAGE_SIZE = 50;
 
@@ -240,7 +225,7 @@ export default function LedgerPage() {
     donutRef,
     (theme) =>
       donutConfig(theme, {
-        labels: agg.entries.map(([k]) => LEDGER_REASON_LABELS[k] ?? k),
+        labels: agg.entries.map(([k]) => ledgerReasonLabel(k)),
         data: agg.entries.map(([, v]) => Number((v / 100).toFixed(2))),
       }),
     [agg.entries],
@@ -248,7 +233,7 @@ export default function LedgerPage() {
 
   const reasonOptions = [
     { label: "全部 reason", value: "" as const },
-    ...LEDGER_REASONS.map((r) => ({ label: LEDGER_REASON_LABELS[r], value: r })),
+    ...LEDGER_REASONS.map((r) => ({ label: ledgerReasonLabel(r), value: r })),
   ];
 
   const columns: Column<LedgerRow>[] = [
@@ -275,7 +260,7 @@ export default function LedgerPage() {
     {
       key: "reason",
       title: "reason",
-      render: (r) => <Badge tone="neutral">{LEDGER_REASON_LABELS[r.reason] ?? r.reason}</Badge>,
+      render: (r) => <Badge tone="neutral">{ledgerReasonLabel(r.reason)}</Badge>,
     },
     {
       key: "channel",

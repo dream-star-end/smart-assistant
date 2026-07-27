@@ -17,20 +17,15 @@
  * CSV 注入防护:每个单元格若以 `=`/`+`/`-`/`@`/`\t`/`\r` 开头加 `'` 前缀。
  */
 
+import {
+  LEDGER_REASONS,
+  type LedgerReason,
+} from "@openclaude/protocol/ledger";
 import { query } from "../db/queries.js";
 import { csvEscapeCell } from "./csvHelper.js";
 
-export const LEDGER_REASONS = [
-  "topup",
-  "chat",
-  "agent_chat",
-  "agent_subscription",
-  "refund",
-  "admin_adjust",
-  "promotion",
-  "minimax_media",
-] as const;
-export type LedgerReason = (typeof LEDGER_REASONS)[number];
+export { LEDGER_REASONS };
+export type { LedgerReason };
 
 export const LEDGER_DEFAULT_LIMIT = 50;
 export const LEDGER_MAX_LIMIT = 500;
