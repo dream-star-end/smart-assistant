@@ -76,6 +76,8 @@ class FakeTurnRunner extends EventEmitter {
   lastActivityAt = Date.now();
   submitted: unknown[] = [];
   isRunning = false;
+  interruptCalls = 0;
+  interruptResult = false;
 
   constructor(
     private readonly onSubmit: (runner: FakeTurnRunner, requestId?: string) => void,
@@ -84,7 +86,8 @@ class FakeTurnRunner extends EventEmitter {
   }
 
   interrupt(): boolean {
-    return false;
+    this.interruptCalls += 1;
+    return this.interruptResult;
   }
 
   clearSessionId(): void {}
@@ -233,6 +236,65 @@ describe("SessionManager pending-persistence tracking", () => {
     second.finish("completed");
     assert.equal(session._activeClientTurnCount, 0);
     assert.equal(session._externalTurnAbort, undefined);
+  });
+
+  test("user Stop delegates active turns to durable terminal persistence", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeTurnRunner(() => {});
+    const session = makeTurnSession(runner);
+    const logicalAbort = new AbortController();
+    const terminal = deferred<void>();
+    const calls: Array<{
+      status: string;
+      reason: string;
+      errorCode: string;
+    }> = [];
+    session._externalTurnAbort = logicalAbort;
+    session._persistActiveTurn = async (status, reason, errorCode) => {
+      calls.push({ status, reason, errorCode });
+      await terminal.promise;
+    };
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      session.sessionKey,
+      session,
+    );
+
+    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(logicalAbort.signal.aborted, true);
+    assert.deepEqual(calls, [{
+      status: "interrupted",
+      reason: "本轮已由用户停止。",
+      errorCode: "USER_CANCELLED",
+    }]);
+    assert.equal(
+      runner.interruptCalls,
+      0,
+      "the persistence hook owns cooperative interrupt and fallback shutdown",
+    );
+
+    let drained = false;
+    const pending = sm.awaitPendingPersistence().then(() => {
+      drained = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(drained, false);
+    terminal.resolve();
+    await pending;
+    assert.equal(drained, true);
+  });
+
+  test("user Stop retains the direct runner fallback before the persistence hook exists", () => {
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeTurnRunner(() => {});
+    runner.interruptResult = true;
+    const session = makeTurnSession(runner);
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      session.sessionKey,
+      session,
+    );
+
+    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(runner.interruptCalls, 1);
   });
 
   test("queued external turn is injected into the next provider context", async () => {

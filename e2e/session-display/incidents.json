@@ -619,7 +619,8 @@
       "symptom": "切换助手后浏览器端 Stop 被重定向到新助手,原 turn continue 不掉;自动恢复/空回复/重启续跑的后代轮次也不受用户取消约束。",
       "rootFixCommit": "6796ff82",
       "coverageCommits": [
-        "d007c3d7"
+        "d007c3d7",
+        "016019a0"
       ],
       "regressions": [
         {
