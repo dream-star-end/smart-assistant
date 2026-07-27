@@ -121,9 +121,8 @@ MAIL_ERR_WINDOW_SECS="${V5MON_MAIL_ERR_WINDOW:-1800}"  # 邮件发送失败回�
 MASTER_LOG_A="${V5MON_MASTER_LOG_A:-${V5MON_MAIL_LOG:-/var/log/openclaude-v5.log}}"
 MASTER_LOG_B="${V5MON_MASTER_LOG_B:-/var/log/openclaude-v5-b.log}"
 TURN_ERR_WINDOW_SECS="${V5MON_TURN_ERR_WINDOW:-600}"   # turn 失败回看窗口(10min)
-TURN_ERR_MIN_USERS="${V5MON_TURN_ERR_MIN_USERS:-2}"    # 多用户阈:≥N 个用户同窗失败
-TURN_ERR_MIN_EVENTS="${V5MON_TURN_ERR_MIN_EVENTS:-3}"  # 多用户阈:且总失败 ≥N 次
-TURN_ERR_SOLO_EVENTS="${V5MON_TURN_ERR_SOLO:-8}"       # 单源阈:单窗总失败 ≥N 次
+TURN_ERR_RATE_PCT="${V5MON_TURN_ERR_RATE_PCT:-20}"     # 非取消终态错误率阈值(%)
+TURN_ERR_RATE_MIN_TOTAL="${V5MON_TURN_ERR_RATE_MIN_TOTAL:-10}"  # 最小非取消终态样本
 # KP 官方托管浏览器插件版本(= KNOWLEDGE_PLANET_PLUGIN_VERSION;插件 bump 版本时同步本值)。
 KP_PLUGIN_VERSION="${V5MON_KP_VERSION:-1.5.0}"
 # 客户端 4xx 风暴:同一 clientIp × route 在窗口内 >阈值 次 4xx。背景:2026-07-17 /api/media-signed
@@ -312,32 +311,107 @@ EOF
   fi
 }
 
-check_turn_failures() {
-  # turn 失败率:product_friction_events 短窗内 stage=turn_error/outcome=failed
-  # 聚合超阈值 → 告警。背景:2026-07-17 goal 功能致 codex 引擎无目标会话每轮必挂,
-  # 健康端点全绿、无任何 turn 级监控,boss 比平台先发现 → 本检查补盲区。
-  # outcome=failed 不含 recovered(用户重试成功即自愈,不算持续故障);
-  # 阈值语义:多用户同窗失败 = 平台性故障;单用户刷高量 = 也值得看一眼。
-  # 部署重启窗口的瞬时 turn 中断由 planned-maintenance marker 静默(deploy 侧
-  # begin_planned_maintenance checks 列表含 turn_failures,两侧同步)。
-  local row events users
-  # 数据源不可读 → bad,绝不 ok:"窗口内没有失败"与"我根本没查"是两件事(2026-07-26 审计)。
-  if [ -z "$DBURL" ]; then record turn_failures bad "turn 失败率:$ENV_FILE 里读不到 DATABASE_URL —— 未做任何判定"; return; fi
-  if ! row="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
-      "SELECT count(*), count(DISTINCT user_id)
-         FROM product_friction_events
-        WHERE stage = 'turn_error' AND outcome = 'failed'
-          AND updated_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})" 2>&1)"; then
-    record turn_failures bad "turn 失败率:psql 查询失败:$(echo "$row" | head -c 120)"; return
+TURN_WINDOW_LOADED=0
+TURN_WINDOW_ERROR=""
+TURN_WINDOW_SAMPLES=""
+TURN_WINDOW_FAILURES=""
+TURN_WINDOW_CANCELLATIONS=""
+TURN_WINDOW_FRICTIONS=""
+
+load_turn_window_stats() {
+  # request_finalize_journal 的 committed/aborted 终态是请求事实源；usage_records
+  # 只按 journal.usage_id 补充结算结果。分类语义与 admin/modelOps.ts 保持一致，
+  # 用户主动取消单列且不进入故障率分母。turn 主告警和 friction 管道元监控
+  # 必须消费同一条 classified 查询，避免分母/窗口/分类各自漂移。
+  local row
+  [[ "$TURN_WINDOW_LOADED" == 1 ]] && return 0
+  [[ "$TURN_WINDOW_LOADED" == -1 ]] && return 1
+  if [ -z "$DBURL" ]; then
+    TURN_WINDOW_ERROR="$ENV_FILE 里读不到 DATABASE_URL"
+    TURN_WINDOW_LOADED=-1
+    return 1
   fi
-  IFS='|' read -r events users <<<"$row"
-  [[ "$events" =~ ^[0-9]+$ && "$users" =~ ^[0-9]+$ ]] || {
-    record turn_failures bad "turn 失败率:查询返回非法行:$(echo "$row" | head -c 120)"; return; }
-  if { [ "$users" -ge "$TURN_ERR_MIN_USERS" ] && [ "$events" -ge "$TURN_ERR_MIN_EVENTS" ]; } \
-     || [ "$events" -ge "$TURN_ERR_SOLO_EVENTS" ]; then
-    record turn_failures bad "turn 失败 ${events} 次/${users} 个用户(${TURN_ERR_WINDOW_SECS}s 窗,阈值 ${TURN_ERR_MIN_USERS}用户×${TURN_ERR_MIN_EVENTS}次 或单源${TURN_ERR_SOLO_EVENTS}次)——聊天主链路可能故障"
+  if ! row="$(psql "$DBURL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c "
+    WITH classified AS (
+      SELECT CASE
+        WHEN (rfj.state='aborted'
+               AND rfj.failure_code IN ('CLIENT_ABORT','USER_CANCELLED'))
+          OR (rfj.state='committed'
+               AND ur.price_snapshot->>'codex_terminal_code'='USER_CANCELLED')
+          THEN 'cancelled'
+        WHEN rfj.state='committed'
+          AND ur.id IS NOT NULL
+          AND ur.status='success'
+          AND COALESCE(ur.output_tokens,0)>0
+          AND COALESCE(ur.price_snapshot->>'codex_status','success')<>'error'
+          AND COALESCE(ur.price_snapshot->>'waived','')<>'no_output'
+          THEN 'success'
+        ELSE 'failure'
+      END AS terminal_outcome
+      FROM request_finalize_journal rfj
+      LEFT JOIN usage_records ur ON ur.id=rfj.usage_id
+      WHERE rfj.updated_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})
+        AND rfj.state IN ('committed','aborted')
+    ),
+    terminal_counts AS (
+      SELECT count(*) FILTER (WHERE terminal_outcome IN ('success','failure')) AS samples,
+             count(*) FILTER (WHERE terminal_outcome='failure') AS failures,
+             count(*) FILTER (WHERE terminal_outcome='cancelled') AS cancellations
+      FROM classified
+    )
+    SELECT samples,failures,cancellations,
+           (SELECT count(*) FROM product_friction_events
+             WHERE updated_at > now() - make_interval(secs => ${TURN_ERR_WINDOW_SECS})
+               AND stage='turn_error' AND outcome='failed') AS frictions
+    FROM terminal_counts" 2>&1)"; then
+    TURN_WINDOW_ERROR="psql 查询失败:$(echo "$row" | head -c 120)"
+    TURN_WINDOW_LOADED=-1
+    return 1
+  fi
+  IFS='|' read -r TURN_WINDOW_SAMPLES TURN_WINDOW_FAILURES \
+    TURN_WINDOW_CANCELLATIONS TURN_WINDOW_FRICTIONS <<<"$row"
+  if [[ ! "$TURN_WINDOW_SAMPLES" =~ ^[0-9]+$ ||
+        ! "$TURN_WINDOW_FAILURES" =~ ^[0-9]+$ ||
+        ! "$TURN_WINDOW_CANCELLATIONS" =~ ^[0-9]+$ ||
+        ! "$TURN_WINDOW_FRICTIONS" =~ ^[0-9]+$ ]]; then
+    TURN_WINDOW_ERROR="查询返回非法行:$(echo "$row" | head -c 120)"
+    TURN_WINDOW_LOADED=-1
+    return 1
+  fi
+  TURN_WINDOW_LOADED=1
+}
+
+check_turn_failures() {
+  # 部署重启窗口由 planned-maintenance marker 静默；除此之外数据源不可读
+  # 必须判 bad，绝不能把“没查到”伪装成“没有故障”。
+  local pct
+  if ! load_turn_window_stats; then
+    record turn_failures bad "turn 失败率:${TURN_WINDOW_ERROR} —— 未做任何判定"
+    return
+  fi
+  if [ "$TURN_WINDOW_SAMPLES" -lt "$TURN_ERR_RATE_MIN_TOTAL" ]; then
+    record turn_failures ok "turn 失败率:非取消终态 ${TURN_WINDOW_SAMPLES} 轮(<${TURN_ERR_RATE_MIN_TOTAL},样本不足不判),用户取消 ${TURN_WINDOW_CANCELLATIONS}"
+    return
+  fi
+  pct=$(( TURN_WINDOW_FAILURES * 100 / TURN_WINDOW_SAMPLES ))
+  if [ "$pct" -ge "$TURN_ERR_RATE_PCT" ]; then
+    record turn_failures bad "turn 错误率 ${pct}%(${TURN_WINDOW_FAILURES}/${TURN_WINDOW_SAMPLES},用户取消 ${TURN_WINDOW_CANCELLATIONS},${TURN_ERR_WINDOW_SECS}s 窗,阈值 ${TURN_ERR_RATE_PCT}%)——聊天主链路可能故障"
   else
-    record turn_failures ok "turn 失败率:${events} 次/${users} 用户(窗口内,未超阈)"
+    record turn_failures ok "turn 错误率 ${pct}%(${TURN_WINDOW_FAILURES}/${TURN_WINDOW_SAMPLES},用户取消 ${TURN_WINDOW_CANCELLATIONS},窗口内未超阈)"
+  fi
+}
+
+check_friction_pipeline() {
+  # 有服务端权威失败却没有任何客户端 turn_error，是上报链路或落库约束
+  # 断裂的直接症状。它是 warning，不替代上面的主链路 critical 判定。
+  if ! load_turn_window_stats; then
+    record friction_pipeline bad "遥测管道:${TURN_WINDOW_ERROR} —— 未做任何判定"
+    return
+  fi
+  if [ "$TURN_WINDOW_FAILURES" -gt 0 ] && [ "$TURN_WINDOW_FRICTIONS" -eq 0 ]; then
+    record friction_pipeline bad "遥测管道疑似断裂:窗内服务端失败 ${TURN_WINDOW_FAILURES} 次,product_friction_events 却零条 failed turn_error —— 查 client_friction_persist_failed 的 errorCode/errorConstraint"
+  else
+    record friction_pipeline ok "遥测管道:服务端失败 ${TURN_WINDOW_FAILURES} / friction failed turn_error ${TURN_WINDOW_FRICTIONS}(窗口内)"
   fi
 }
 
@@ -656,7 +730,7 @@ check_severity() {
     # KP 插件休眠 = 单功能降级(非全站故障);4xx 风暴 = 某客户端×路由静默退化;
     # failed_units = 有单元挂了但不一定影响服务面;mem_oversubscribe = 容量结构预警;
     # 门禁豁免债务 = 已上线版本有未验证面 + 下次发布被阻断,不是全站故障但必须常驻可见。均按 warning。
-    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers|ci_base_red) echo warning ;;
+    disk_root|disk_var|mem|kp_plugin|client_4xx_storm|failed_units|mem_oversubscribe|gate_waivers|ci_base_red|friction_pipeline) echo warning ;;
     *) echo warning ;;
   esac
 }
@@ -708,6 +782,7 @@ check_pool
 check_image
 check_mail
 check_turn_failures
+check_friction_pipeline
 check_kp_plugin
 check_gate_waivers
 check_client_4xx_storm

@@ -4377,6 +4377,7 @@ interface MonitorFixtureOptions {
   healthyHttpPorts?: number[]
   dockerRows?: string[]
   dockerPsFails?: boolean
+  turnWindowStats?: string
 }
 
 function schema1Marker(overrides: Record<string, unknown> = {}) {
@@ -4419,7 +4420,9 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     healthyHttpPorts = allHealthy ? [18790] : [],
     dockerRows = [],
     dockerPsFails = false,
+    turnWindowStats: explicitTurnWindowStats,
   } = options
+  const turnWindowStats = explicitTurnWindowStats ?? (allHealthy ? '0|0|0|0' : undefined)
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-')); dirs.push(dir)
   // 夹具内的"健康备份"目录:一个 mtime=当下的子目录即满足 backup_fresh 的新鲜度判据。
   const backupDir = path.join(dir, 'backups')
@@ -4464,6 +4467,7 @@ esac
 printf '%s\\n' "$*" >> '${psqlCalls}'
 case "$*" in
   *"FROM deploy_state"*) printf '%s\\n' '${deployState.phase}|${deployState.step}|${deployState.active}|${deployState.candidate ?? ''}' ;;
+  ${turnWindowStats !== undefined ? `*request_finalize_journal*) printf '%s\\n' '${turnWindowStats}' ;;` : ''}
   ${allHealthy ? '*product_friction_events*) printf \'0|0\\n\' ;;' : ''}
   ${allHealthy ? '*marketplace_skill_listings*) printf \'t\\n\' ;;' : ''}
   *) exit 0 ;;
@@ -4671,6 +4675,7 @@ esac
     psql: `#!/bin/sh
 case "$*" in
   *"FROM deploy_state"*) printf 'stable|0|A|\\n' ;;
+  *request_finalize_journal*) printf '0|0|0|0\\n' ;;
   *product_friction_events*) printf '0|0\\n' ;;
   *marketplace_skill_listings*) printf 't\\n' ;;
   *) printf '7|11\\n' ;;
@@ -4859,6 +4864,35 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     assert.match(warningLine, /mem_oversubscribe/, 'mem_oversubscribe 必须显式分级')
   })
 
+  test('turn health uses terminal journal authority and one shared classified window', async () => {
+    const source = await readFile(monitor, 'utf8')
+    const loadStart = source.indexOf('load_turn_window_stats() {')
+    assert.ok(loadStart >= 0, 'turn window loader 缺失')
+    const loader = source.slice(loadStart, source.indexOf('\n}', loadStart))
+    assert.match(loader, /FROM request_finalize_journal rfj/)
+    assert.match(loader, /LEFT JOIN usage_records ur ON ur\.id=rfj\.usage_id/)
+    assert.match(loader, /rfj\.state IN \('committed','aborted'\)/)
+    assert.match(loader, /failure_code IN \('CLIENT_ABORT','USER_CANCELLED'\)/)
+    assert.match(loader, /codex_terminal_code'='USER_CANCELLED'/)
+    assert.match(loader, /ur\.status='success'/)
+    assert.match(loader, /COALESCE\(ur\.output_tokens,0\)>0/)
+    assert.match(loader, /terminal_outcome='failure'/)
+    assert.match(loader, /terminal_outcome='cancelled'/)
+    assert.match(loader, /FROM product_friction_events/)
+
+    const turnStart = source.indexOf('check_turn_failures() {')
+    const turn = source.slice(turnStart, source.indexOf('\n}', turnStart))
+    assert.match(turn, /load_turn_window_stats/)
+    assert.match(turn, /TURN_ERR_RATE_MIN_TOTAL/)
+    assert.doesNotMatch(turn, /psql /, '主检查不得另起第二条漂移查询')
+
+    const frictionStart = source.indexOf('check_friction_pipeline() {')
+    const friction = source.slice(frictionStart, source.indexOf('\n}', frictionStart))
+    assert.match(friction, /load_turn_window_stats/)
+    assert.doesNotMatch(friction, /psql /, '元监控必须复用同一 classified 查询')
+    assert.match(source, /^check_friction_pipeline$/m)
+  })
+
   // docker inspect 必须一次传全部容器 ID:每 2 分钟一轮的探针不能在循环里逐个调。
   test('mem_oversubscribe inspects all containers in one docker call', async () => {
     const source = await readFile(monitor, 'utf8')
@@ -4869,6 +4903,58 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     // docker 调用失败必须 fail-loud,不能静默当作"没有超售"
     assert.match(fn, /docker ps 失败/)
     assert.match(fn, /docker inspect 取 HostConfig\.Memory 失败/)
+  })
+})
+
+describe('v5 monitor terminal turn classification', () => {
+  const healthyRow = 'openclaude/openclaude-runtime:v5-ccb-test|1|v5|1'
+
+  test('alerts at the non-cancelled error-rate threshold and keeps a healthy telemetry pipe', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '10|2|3|2',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+bad\s+turn 错误率 20%\(2\/10,用户取消 3/)
+    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 2 \/ friction failed turn_error 2/)
+    const calls = await readFile(result.psqlCalls, 'utf8')
+    assert.equal((calls.match(/request_finalize_journal/g) ?? []).length, 1)
+  })
+
+  test('keeps a small sample out of the critical rate but flags a missing friction signal', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '9|1|2|0',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 9 轮\(<10,样本不足不判\),用户取消 2/)
+    assert.match(result.stdout, /friction_pipeline\s+bad\s+遥测管道疑似断裂:窗内服务端失败 1 次/)
+  })
+
+  test('does not classify user cancellations as failures or telemetry gaps', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '0|0|4|0',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 0 轮\(<10,样本不足不判\),用户取消 4/)
+    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 0 \/ friction failed turn_error 0/)
+  })
+
+  test('caches a failed authority query without treating the second consumer as healthy', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: 'invalid',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+bad\s+turn 失败率:查询返回非法行/)
+    assert.match(result.stdout, /friction_pipeline\s+bad\s+遥测管道:查询返回非法行/)
+    const calls = await readFile(result.psqlCalls, 'utf8')
+    assert.equal((calls.match(/request_finalize_journal/g) ?? []).length, 1)
   })
 })
 
