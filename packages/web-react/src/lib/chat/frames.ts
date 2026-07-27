@@ -121,6 +121,9 @@ export type LegacyBridgeErrorWire = {
 /** 商业版扣费广播（master→user）。**不进 frameSeq 去重**（§3）。*/
 export type CostChargedWire = {
   type: "outbound.cost_charged";
+  /** Stable model-request identity. Chat billing paths always provide it;
+   * media-only charges omit it and therefore cannot drive a turn reminder. */
+  requestId?: string;
   /** agent 内部会话 UUID（引擎会话，非 client peer 键）。历史字段，直接 sessions.get 必失配。*/
   sessionId?: string;
   /** delegate 成本的父**客户端**会话 id（web-*，= sess.id / peerId）。仅委派 cost 非空。
@@ -128,7 +131,10 @@ export type CostChargedWire = {
    *  误算/丢弃（Fix B）；普通 chat 恒 undefined → 回落既有启发式。*/
   parentSessionId?: string;
   balanceAfter?: string | null;
+  /** Nominal model cost. Kept as the existing response-badge source. */
   costCredits?: string | null;
+  /** Actual credits taken from the user's spendable buckets after clamp. */
+  debitedCredits?: string | null;
 };
 
 /** turn 免单退款广播（master→user）：精确退款与站内信已同事务提交。

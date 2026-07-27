@@ -21,6 +21,7 @@ import {
 import {
   addMessage,
   type ChatMessage,
+  clearTurnTiming,
   createSession,
   isRetryingTurnStatus,
   isServerAuthoredRow,
@@ -2939,6 +2940,75 @@ describe("applyCostWaived (turn 免单退款)", () => {
 });
 
 describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
+  test("active multi-request turn reminder uses actual debit and dedupes requestId", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    const a = addMessage(s, "assistant", "ans", { ts: 1, usage: {} });
+    s._streamingAssistant = a;
+
+    applyCostCharged(s, {
+      type: "outbound.cost_charged",
+      requestId: "req-1",
+      costCredits: "600",
+      debitedCredits: "300",
+    }, {});
+    applyCostCharged(s, {
+      type: "outbound.cost_charged",
+      requestId: "req-1",
+      costCredits: "600",
+      debitedCredits: "300",
+    }, {});
+    expect(s._turnCostCredits).toBe("300");
+    expect(s._turnCostReminderCredits).toBeUndefined();
+    // Existing response badge deliberately keeps its no-frameSeq behavior.
+    expect(a.usage?.costCredits).toBe("1200");
+
+    applyCostCharged(s, {
+      type: "outbound.cost_charged",
+      requestId: "req-2",
+      costCredits: "250",
+      debitedCredits: "250",
+    }, {});
+    expect(s._turnCostCredits).toBe("550");
+    expect(s._turnCostReminderCredits).toBe("550");
+  });
+
+  test("media/legacy frame without requestId and inactive turn never drive reminder", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyCostCharged(s, {
+      type: "outbound.cost_charged",
+      costCredits: "900",
+    }, {});
+    expect(s._turnCostCredits).toBe("0");
+    expect(s._turnCostReminderCredits).toBeUndefined();
+
+    s._sendingInFlight = false;
+    applyCostCharged(s, {
+      type: "outbound.cost_charged",
+      requestId: "late-1",
+      costCredits: "900",
+    }, {});
+    expect(s._turnCostCredits).toBe("0");
+    expect(s._turnCostReminderCredits).toBeUndefined();
+  });
+
+  test("turn cleanup clears reminder counter and request-id fence", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyCostCharged(s, {
+      type: "outbound.cost_charged",
+      requestId: "req-clean",
+      costCredits: "500",
+    }, {});
+    expect(s._turnCostReminderCredits).toBe("500");
+
+    clearTurnTiming(s);
+    expect(s._turnCostCredits).toBe("0");
+    expect(s._turnCostReminderCredits).toBeUndefined();
+    expect(s._turnCostSeenRequestIds?.size).toBe(0);
+  });
+
   test("target with usage → accumulate (multi-API turn)", () => {
     const s = sess();
     const a = addMessage(s, "assistant", "ans", { ts: 1, usage: {} });
@@ -3984,6 +4054,11 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(s._activeClientMessageId).toBe(user.id);
     expect(s._sendingInFlight).toBeFalsy();
     expect(user.status).toBe("sending");
+    // Browser-only residue must be replaced at the first authoritative
+    // admission of a new root turn, not carried into its reminder.
+    s._turnCostCredits = "999";
+    s._turnCostSeenRequestIds = new Set(["old-request"]);
+    s._turnCostReminderCredits = "999";
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.ack",
       admitted: true,
@@ -3992,6 +4067,9 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     }) });
     expect(s._sendingInFlight).toBe(true);
     expect(user.status).toBe("sent");
+    expect(s._turnCostCredits).toBe("0");
+    expect(s._turnCostSeenRequestIds?.size).toBe(0);
+    expect(s._turnCostReminderCredits).toBeUndefined();
   });
 
   test("cost_waived 同时刷新余额与站内信未读角标", () => {

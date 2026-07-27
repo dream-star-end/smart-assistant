@@ -1034,6 +1034,11 @@ export class ChatSocket {
       sess._localTeardownAt = undefined;
       sess._sendingInFlight = true;
       sess._activeClientMessageId = clientMessageId;
+      // New authoritative root-turn boundary. cost_charged itself has no
+      // frameSeq, so reminder accounting uses its stable requestId set.
+      sess._turnCostCredits = "0";
+      sess._turnCostSeenRequestIds = new Set();
+      sess._turnCostReminderCredits = undefined;
       sess._activeAgentId =
         typeof pending?.payload.agentId === "string" && pending.payload.agentId
           ? pending.payload.agentId

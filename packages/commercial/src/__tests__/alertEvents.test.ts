@@ -22,6 +22,7 @@ const SEVERITIES = new Set(["info", "warning", "critical"]);
 const GROUPS = new Set([
   "account_pool",
   "payment",
+  "billing",
   "container",
   "risk",
   "health",
@@ -93,6 +94,22 @@ describe("alertEvents — EVENT_META", () => {
       eventMetaFor(EVENTS.SECURITY_ADMIN_AUDIT_WRITE_FAILED)?.severity,
       "critical",
     );
+  });
+
+  test("billing reconciliation events are registered with operational severity", () => {
+    assert.equal(eventMetaFor(EVENTS.BILLING_WALLET_DRIFT)?.severity, "critical");
+    assert.equal(eventMetaFor(EVENTS.BILLING_PERIOD_DRIFT)?.severity, "critical");
+    assert.equal(eventMetaFor(EVENTS.BILLING_USAGE_LEDGER_GAP)?.severity, "critical");
+    assert.equal(eventMetaFor(EVENTS.BILLING_CLAMP_SPIKE)?.severity, "warning");
+    for (const eventType of [
+      EVENTS.BILLING_WALLET_DRIFT,
+      EVENTS.BILLING_PERIOD_DRIFT,
+      EVENTS.BILLING_USAGE_LEDGER_GAP,
+      EVENTS.BILLING_CLAMP_SPIKE,
+    ]) {
+      assert.equal(eventMetaFor(eventType)?.group, "billing");
+      assert.equal(eventMetaFor(eventType)?.trigger, "polled");
+    }
   });
 
   test("event_type prefix (group.xxx) 与 group 字段一致", () => {

@@ -20,6 +20,7 @@ export const CHANNEL_TYPE_LABEL: Record<ChannelType, string> = {
 export const GROUP_LABEL: Record<string, string> = {
   account_pool: "账号池",
   payment: "支付",
+  billing: "计费",
   container: "容器",
   risk: "风控",
   health: "健康",
@@ -30,6 +31,7 @@ export const GROUP_LABEL: Record<string, string> = {
 export const GROUP_ORDER = [
   "account_pool",
   "payment",
+  "billing",
   "container",
   "risk",
   "health",

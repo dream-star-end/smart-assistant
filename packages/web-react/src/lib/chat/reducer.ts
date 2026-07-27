@@ -2172,7 +2172,42 @@ export function applyResumeFailed(sess: ChatSession, frame: OutboundResumeFailed
   effects.forceSync?.(sess.id);
 }
 
-// ═══════════════ cost_charged（商业版，**不去重**，§3；归因严格不跨会话/不跨 turn）═══════════════
+/** Evidence-based advisory line from the billing audit. It never rejects,
+ * pauses, or estimates a request; it only exposes settled actual debit while
+ * a multi-request root turn is still active. */
+export const TURN_COST_REMINDER_CREDITS = 500n;
+
+function applyTurnCostReminder(sess: ChatSession, frame: CostChargedWire): void {
+  if (!sess._sendingInFlight) return;
+  const requestId = typeof frame.requestId === "string" ? frame.requestId.trim() : "";
+  if (!requestId) return;
+  const seen = sess._turnCostSeenRequestIds ?? new Set<string>();
+  if (seen.has(requestId)) return;
+
+  let actualDebit: bigint;
+  try {
+    actualDebit = BigInt(frame.debitedCredits ?? frame.costCredits ?? "");
+  } catch {
+    return;
+  }
+  if (actualDebit <= 0n) return;
+
+  seen.add(requestId);
+  sess._turnCostSeenRequestIds = seen;
+  let cumulative = actualDebit;
+  try {
+    cumulative += BigInt(sess._turnCostCredits ?? "0");
+  } catch {
+    // Browser-only state cannot affect billing truth. A malformed old local
+    // value starts this reminder counter from the current settled debit.
+  }
+  sess._turnCostCredits = cumulative.toString();
+  if (cumulative >= TURN_COST_REMINDER_CREDITS) {
+    sess._turnCostReminderCredits = cumulative.toString();
+  }
+}
+
+// ═══════════════ cost_charged（商业版，响应徽章不去重；提醒按 requestId 精确去重）═══════════════
 export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWire, effects: FrameEffects = {}): void {
   const refresh = () => {
     if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) effects.refreshBalance?.();
@@ -2181,6 +2216,7 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     refresh();
     return;
   }
+  applyTurnCostReminder(sess, frame);
   // target：streamingAssistant（turn 进行中）OR 60s 内 lastFinaled（刚 final 完晚到）。
   //
   // Fix B — 委派成本精确归属:frame.parentSessionId 存在 = 这是委派子智能体的成本,它属于
