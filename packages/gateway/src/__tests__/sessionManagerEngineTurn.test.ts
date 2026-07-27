@@ -1332,6 +1332,148 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("browser Stop escalation maps a forced generic error to USER_CANCELLED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const events: SessionStreamEvent[] = [];
+      const dispatchId = "33333333-3333-4333-8333-333333333333";
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial output before forced shutdown");
+          startedResolve();
+        });
+      });
+      let interruptCalls = 0;
+      runner.interrupt = () => {
+        interruptCalls += 1;
+        return false;
+      };
+      let shutdownCalls = 0;
+      runner.shutdown = async () => {
+        shutdownCalls += 1;
+        session.runner.emit("billing", {
+          requestId: "req-unit",
+          engineSessionId: `oceng-${"f".repeat(48)}`,
+          status: "error",
+          terminalCode: "CODEX_ERROR",
+          durationMs: 5_001,
+          usage: { input_tokens: 11, output_tokens: 5 },
+        });
+        runner.result({
+          is_error: true,
+          result: "codex app-server exited code=0 signal=",
+          usage: { input_tokens: 11, output_tokens: 5 },
+        });
+      };
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-forced-error",
+          dispatchId,
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls, 1);
+      assert.equal(shutdownCalls, 1);
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.text, "partial output before forced shutdown");
+      assert.equal(payload.dispatchId, dispatchId);
+      assert.equal(payload.attemptNo, 1);
+      assert.deepEqual(payload.usage, {
+        inputTokens: 11,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 16,
+        turn: 1,
+      });
+      assert.equal(payload.engineBilling?.terminalCode, "USER_CANCELLED");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop escalation still preserves a late natural end_turn", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("answer at the escalation boundary");
+          startedResolve();
+        });
+      });
+      let interruptCalls = 0;
+      runner.interrupt = () => {
+        interruptCalls += 1;
+        return false;
+      };
+      let shutdownCalls = 0;
+      runner.shutdown = async () => {
+        shutdownCalls += 1;
+        runner.result({
+          stop_reason: "end_turn",
+          usage: { input_tokens: 6, output_tokens: 3 },
+        });
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls, 1);
+      assert.equal(shutdownCalls, 1);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.equal(captured.payloads[0]!.errorCode, undefined);
+      assert.equal(captured.payloads[0]!.text, "answer at the escalation boundary");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop fallback kills and persists partial usage with dispatch identity", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
