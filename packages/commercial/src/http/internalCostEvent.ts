@@ -71,7 +71,7 @@ export interface CostEventHandlerDeps {
     turnKey?: string | null,
     parentTurnKey?: string | null,
   ) => Promise<unknown>;
-  broadcastToUser: (uid: bigint, payload: unknown) => void;
+  broadcastToUser: (uid: bigint, payload: unknown) => void | Promise<void>;
   logger?: Logger;
 }
 
@@ -138,7 +138,7 @@ export function makeCostEventHandler(deps: CostEventHandlerDeps): CostEventHandl
             ev.parentTurnKey ?? null,
           );
         } else {
-          deps.broadcastToUser(BigInt(ev.uid), ev.payload);
+          await deps.broadcastToUser(BigInt(ev.uid), ev.payload);
         }
         accepted += 1;
       } catch (err) {
