@@ -4618,10 +4618,14 @@ describe('v5 monitor obsolete pool state migration', () => {
 interface MonitorHostInstallOptions {
   failMonitorStart?: boolean
   failTimerStop?: boolean
+  failDailyTimerStop?: boolean
+  failDailyTimerStart?: boolean
   busyMonitor?: boolean
+  busyDaily?: boolean
   invalidCurrent?: boolean
   invalidState?: boolean
   failUnitBackup?: boolean
+  failDailyUnitBackup?: boolean
 }
 
 async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}) {
@@ -4636,6 +4640,7 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   const monitorLog = path.join(dir, 'monitor.log')
   const actions = path.join(dir, 'systemctl-actions')
   const timerStopped = path.join(dir, 'timer-stopped')
+  const dailyTimerStopped = path.join(dir, 'daily-timer-stopped')
   const alertActive = path.join(dir, 'alert-active')
   // 夹具内的"健康备份"目录(见下方 V5MON_BACKUP_DIR)。
   const installBackupDir = path.join(dir, 'host-backups')
@@ -4648,18 +4653,22 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   await Promise.all([mkdir(stage), mkdir(systemdDir), mkdir(backupRoot), mkdir(bin)])
   for (const source of [
     'scripts/v5-monitor.sh',
+    'scripts/v5-daily-check.sh',
     'scripts/v5-alert-fail.sh',
     'scripts/v5-alert-fanout.sql',
     'scripts/v5-monitor-host-install-remote.sh',
     'deploy/v5/openclaude-v5-monitor.service',
     'deploy/v5/openclaude-v5-monitor.timer',
+    'deploy/v5/openclaude-v5-daily.service',
+    'deploy/v5/openclaude-v5-daily.timer',
     'deploy/v5/openclaude-v5-alert-fail@.service',
   ]) {
     await cp(path.join(root, source), path.join(stage, path.basename(source)))
   }
   const checksum = spawnSync('bash', ['-c', [
-    'sha256sum v5-monitor.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
+    'sha256sum v5-monitor.sh v5-daily-check.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
     'openclaude-v5-monitor.service openclaude-v5-monitor.timer',
+    'openclaude-v5-daily.service openclaude-v5-daily.timer',
     'openclaude-v5-alert-fail@.service',
   ].join(' ')], { cwd: stage, encoding: 'utf8' })
   assert.equal(checksum.status, 0, checksum.stderr)
@@ -4683,6 +4692,8 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   for (const unit of [
     'openclaude-v5-monitor.service',
     'openclaude-v5-monitor.timer',
+    'openclaude-v5-daily.service',
+    'openclaude-v5-daily.timer',
     'openclaude-v5-alert-fail@.service',
   ]) await writeFile(path.join(systemdDir, unit), `old:${unit}\n`)
 
@@ -4695,10 +4706,14 @@ if [ "\${1:-}" = --quiet ]; then shift; fi
 unit="\${1:-}"
 case "$cmd:$unit" in
   is-active:openclaude-v5-monitor.timer) [ -f '${timerStopped}' ] && exit 3; echo active; exit 0 ;;
+  is-active:openclaude-v5-daily.timer) [ -f '${dailyTimerStopped}' ] && exit 3; echo active; exit 0 ;;
   is-active:openclaude-v5-monitor.service) [ "\${BUSY_MONITOR:-0}" = 1 ] && { echo active; exit 0; }; exit 3 ;;
+  is-active:openclaude-v5-daily.service) [ "\${BUSY_DAILY:-0}" = 1 ] && { echo active; exit 0; }; exit 3 ;;
   is-active:*) echo active; exit 0 ;;
   stop:openclaude-v5-monitor.timer) [ "\${FAIL_TIMER_STOP:-0}" = 1 ] && exit 1; touch '${timerStopped}'; exit 0 ;;
+  stop:openclaude-v5-daily.timer) [ "\${FAIL_DAILY_TIMER_STOP:-0}" = 1 ] && exit 1; touch '${dailyTimerStopped}'; exit 0 ;;
   start:openclaude-v5-monitor.timer) rm -f '${timerStopped}'; exit 0 ;;
+  start:openclaude-v5-daily.timer) [ "\${FAIL_DAILY_TIMER_START:-0}" = 1 ] && exit 1; rm -f '${dailyTimerStopped}'; exit 0 ;;
   start:openclaude-v5-monitor.service) [ "\${FAIL_MONITOR_START:-0}" = 1 ] && { touch '${alertActive}'; exit 1; }; exit 0 ;;
   stop:openclaude-v5-alert-fail@openclaude-v5-monitor.service.service) rm -f '${alertActive}'; exit 0 ;;
   list-jobs:*) [ -f '${alertActive}' ] && printf '1 openclaude-v5-alert-fail@openclaude-v5-monitor.service.service start running\\n'; exit 0 ;;
@@ -4730,10 +4745,13 @@ case "$1" in images) echo test/runtime:v5 ;; ps) echo 'openclaude/openclaude-run
     await writeFile(path.join(bin, name), source)
     await chmod(path.join(bin, name), 0o755)
   }
-  if (options.failUnitBackup) {
+  if (options.failUnitBackup || options.failDailyUnitBackup) {
+    const failedUnit = options.failDailyUnitBackup
+      ? 'openclaude-v5-daily.service'
+      : 'openclaude-v5-monitor.service'
     await writeFile(path.join(bin, 'cp'), `#!/bin/sh
 case "$*" in
-  *${systemdDir}/openclaude-v5-monitor.service*${backupRoot}/.monitor-backup.*) exit 1 ;;
+  *${systemdDir}/${failedUnit}*${backupRoot}/.monitor-backup.*) exit 1 ;;
   *) exec /bin/cp "$@" ;;
 esac
 `)
@@ -4743,7 +4761,10 @@ esac
     PATH: `${bin}:${process.env.PATH}`,
     FAIL_MONITOR_START: options.failMonitorStart ? '1' : '0',
     FAIL_TIMER_STOP: options.failTimerStop ? '1' : '0',
+    FAIL_DAILY_TIMER_STOP: options.failDailyTimerStop ? '1' : '0',
+    FAIL_DAILY_TIMER_START: options.failDailyTimerStart ? '1' : '0',
     BUSY_MONITOR: options.busyMonitor ? '1' : '0',
+    BUSY_DAILY: options.busyDaily ? '1' : '0',
     OC_V5_SYSTEMD_DIR: systemdDir,
     OC_V5_MONITOR_ENV: envFile,
     OC_V5_MONITOR_LOG: monitorLog,
@@ -4766,7 +4787,20 @@ esac
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
     V5MON_CUTOVER_ROOT: path.join(dir, 'cutovers'),
   })
-  return { result, dir, hostRoot, systemdDir, stateFile, monitorLog, actions, alertActive, bundleSha, originalState }
+  return {
+    result,
+    dir,
+    hostRoot,
+    systemdDir,
+    stateFile,
+    monitorLog,
+    actions,
+    timerStopped,
+    dailyTimerStopped,
+    alertActive,
+    bundleSha,
+    originalState,
+  }
 }
 
 describe('v5 host monitor independent atomic installer', () => {
@@ -4827,6 +4861,7 @@ describe('v5 host monitor independent atomic installer', () => {
     assert.ok(start >= 0 && end > start)
     const body = source.slice(start, end)
     assert.match(body, /v5-monitor-host-install-remote\.sh/)
+    assert.match(body, /v5-daily-check\.sh/)
     assert.doesNotMatch(body, /slot_(src|unit|port)|active_slot/)
     assert.match(source, /\*\) acquire_production_mutation_lease \|\| exit 3/)
     assert.match(source, /\*\)\n\s*run_mutation_lane_supervised run_selected_mode "\$MODE"/)
@@ -4838,9 +4873,17 @@ describe('v5 host monitor independent atomic installer', () => {
     assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
     assert.equal(JSON.parse(await readFile(fixture.stateFile, 'utf8')).checks.pool.status, 'ok')
     assert.match(await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'), /\/opt\/openclaude\/v5-monitor\/current/)
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-daily.service'), 'utf8'),
+      await readFile(path.join(root, 'deploy/v5/openclaude-v5-daily.service'), 'utf8'),
+    )
+    await readFile(path.join(fixture.hostRoot, 'current', 'v5-daily-check.sh'), 'utf8')
     const actions = await readFile(fixture.actions, 'utf8')
     assert.ok(actions.indexOf('stop openclaude-v5-monitor.timer') < actions.indexOf('start openclaude-v5-monitor.service'))
+    assert.ok(actions.indexOf('stop openclaude-v5-daily.timer') < actions.indexOf('start openclaude-v5-monitor.service'))
     assert.ok(actions.indexOf('start openclaude-v5-monitor.service') < actions.lastIndexOf('start openclaude-v5-monitor.timer'))
+    assert.ok(actions.indexOf('start openclaude-v5-monitor.service') < actions.lastIndexOf('start openclaude-v5-daily.timer'))
+    assert.doesNotMatch(actions, /(?:start|stop) openclaude-v5-daily\.service/)
     assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-OK host monitor/)
   })
 
@@ -4853,7 +4896,13 @@ describe('v5 host monitor independent atomic installer', () => {
       await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'),
       'old:openclaude-v5-monitor.service\n',
     )
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-daily.service'), 'utf8'),
+      'old:openclaude-v5-daily.service\n',
+    )
     assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer/)
+    assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-daily.timer/)
+    assert.doesNotMatch(await readFile(fixture.actions, 'utf8'), /stop openclaude-v5-daily\.service/)
     assert.doesNotMatch(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer[\s\S]*stop openclaude-v5-alert-fail@/)
     await assert.rejects(readFile(fixture.alertActive, 'utf8'), /ENOENT/)
     assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-ROLLBACK host monitor/)
@@ -4861,19 +4910,40 @@ describe('v5 host monitor independent atomic installer', () => {
 
   for (const [name, options] of [
     ['timer stop failure', { failTimerStop: true }],
+    ['daily timer stop failure', { failDailyTimerStop: true }],
     ['drain timeout', { busyMonitor: true }],
+    ['daily drain timeout', { busyDaily: true }],
     ['invalid current', { invalidCurrent: true }],
     ['invalid state', { invalidState: true }],
     ['unit backup failure', { failUnitBackup: true }],
+    ['daily unit backup failure', { failDailyUnitBackup: true }],
   ] as const) {
-    test(`${name} restores the originally active timer`, async () => {
+    test(`${name} restores both originally active timers without killing daily`, async () => {
       const fixture = await monitorHostInstallFixture(options)
       assert.notEqual(fixture.result.status, 0)
       const actions = await readFile(fixture.actions, 'utf8')
       assert.match(actions, /start openclaude-v5-monitor.timer/)
-      assert.match(actions.trim().split('\n').at(-1) ?? '', /is-active --quiet openclaude-v5-monitor.timer/)
+      assert.match(actions, /start openclaude-v5-daily.timer/)
+      assert.match(actions.trim().split('\n').at(-1) ?? '', /is-active --quiet openclaude-v5-daily.timer/)
+      assert.doesNotMatch(actions, /stop openclaude-v5-daily\.service/)
     })
   }
+
+  test('partial timer restore returns recovery-required after restoring files and pointer', async () => {
+    const fixture = await monitorHostInstallFixture({ failDailyTimerStart: true })
+    assert.equal(fixture.result.status, 86, fixture.result.stderr || fixture.result.stdout)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-daily.service'), 'utf8'),
+      'old:openclaude-v5-daily.service\n',
+    )
+    await assert.rejects(readFile(fixture.timerStopped, 'utf8'), /ENOENT/)
+    assert.equal(await readFile(fixture.dailyTimerStopped, 'utf8'), '')
+    const actions = await readFile(fixture.actions, 'utf8')
+    assert.match(actions, /start openclaude-v5-monitor.timer/)
+    assert.match(actions, /start openclaude-v5-daily.timer/)
+    assert.doesNotMatch(actions, /stop openclaude-v5-daily\.service/)
+  })
 })
 
 describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
