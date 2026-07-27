@@ -4352,6 +4352,16 @@ export class SessionManager {
         partialPersistencePromise = (async () => {
           let persistenceAcknowledged = !MASTER_SINK_PERSIST_CHANNELS.has(session.channel)
           detach()
+          if (
+            status === 'interrupted' &&
+            errorCode === 'USER_CANCELLED' &&
+            terminalEngineBilling?.status === 'error'
+          ) {
+            terminalEngineBilling = {
+              ...terminalEngineBilling,
+              terminalCode: 'USER_CANCELLED',
+            }
+          }
           flushTerminalBilling()
           const snap = turn?.getPartialSnapshot() ?? {
             assistantText: '',
@@ -4684,9 +4694,32 @@ export class SessionManager {
             : undefined
           // A generic runner error may be emitted before the remaining stdout
           // drains into a valid terminal result (pipe/error ordering). Preserve
-          // that diagnostic runtime event, but only a platform-owned waiver
-          // request is allowed to override a subsequently completed summary.
-          let terminalOverride = (requestedTerminal?.waiveReason ? requestedTerminal : null) ?? (modelAuthorityFailure
+          // that diagnostic runtime event, but only a platform-owned waiver or
+          // an engine-confirmed user cancellation may override the summary.
+          // If Stop races a natural end_turn, completion remains authoritative.
+          const userCancellationOverride =
+            requestedTerminal?.status === 'interrupted' &&
+            requestedTerminal.errorCode === 'USER_CANCELLED' &&
+            result?.stopReason === 'interrupted'
+              ? requestedTerminal
+              : null
+          if (
+            userCancellationOverride &&
+            terminalEngineBilling?.status === 'error'
+          ) {
+            // A forced Codex app-server shutdown reports a generic CODEX_ERROR
+            // because the runner cannot know why its process was killed. At
+            // this layer both sides are authoritative: the browser requested
+            // USER_CANCELLED and the engine confirmed an interrupted result.
+            // Keep billing/audit classification aligned with the tape.
+            terminalEngineBilling = {
+              ...terminalEngineBilling,
+              terminalCode: 'USER_CANCELLED',
+            }
+          }
+          let terminalOverride = (
+            requestedTerminal?.waiveReason ? requestedTerminal : userCancellationOverride
+          ) ?? (modelAuthorityFailure
             ? {
                 status: 'crashed' as const,
                 reason: modelAuthorityReason!,
@@ -5254,6 +5287,16 @@ export class SessionManager {
     if (!s) return false
     const external = s._externalTurnAbort
     if (external && !external.signal.aborted) external.abort()
+    const persistActiveTurn = s._persistActiveTurn
+    if (persistActiveTurn) {
+      const persistence = persistActiveTurn(
+        'interrupted',
+        '本轮已由用户停止。',
+        'USER_CANCELLED',
+      )
+      this._trackPersistence(persistence)
+      return true
+    }
     const runnerInterrupted = s.runner.interrupt()
     return !!external || runnerInterrupted
   }
