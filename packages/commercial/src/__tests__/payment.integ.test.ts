@@ -32,6 +32,7 @@ import { signAccess } from "../auth/jwt.js";
 import { signHupijiao } from "../payment/hupijiao/sign.js";
 import type { HupijiaoClient } from "../payment/hupijiao/client.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
+import { reserveOrderRefund } from "../payment/refunds.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
 
@@ -55,6 +56,8 @@ let mockNextCreate:
   | { kind: "ok"; qrcode: string; providerOrder?: string | null }
   | { kind: "err"; code: string; message: string }
   | null = null;
+let mockRefundCalls = 0;
+let mockRefundStatus: "CD" | "RD" | "UD" | "OD" = "RD";
 
 const mockHupi: HupijiaoClient = {
   async createQr(_input) {
@@ -62,6 +65,20 @@ const mockHupi: HupijiaoClient = {
     mockNextCreate = null;
     if (next.kind === "err") throw new HupijiaoError(next.code, next.message);
     return { qrcodeUrl: next.qrcode, mobileUrl: null, providerOrder: next.providerOrder ?? "MOCK_PX", raw: {} };
+  },
+  async refund(input) {
+    mockRefundCalls += 1;
+    return {
+      orderNo: input.orderNo,
+      status: mockRefundStatus,
+      providerRefundNo: "RF-ADMIN-1",
+      refundAmountCents: 1000n,
+      safePayload: {
+        trade_order_id: input.orderNo,
+        refund_status: mockRefundStatus,
+        out_refund_no: "RF-ADMIN-1",
+      },
+    };
   },
 };
 
@@ -128,6 +145,8 @@ beforeEach(async () => {
   await query("TRUNCATE TABLE orders, credit_ledger, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
   await redis.flushdb();
   mockNextCreate = null;
+  mockRefundCalls = 0;
+  mockRefundStatus = "RD";
 });
 
 function skipIfMissing(t: { skip: (reason: string) => void }): boolean {
@@ -142,6 +161,18 @@ async function createUserWithToken(email: string, credits = 0n): Promise<{ id: s
   );
   const id = r.rows[0].id;
   const issued = await signAccess({ sub: id, role: "user" as const }, JWT_SECRET);
+  return { id, token: issued.token };
+}
+
+async function createAdminWithToken(email: string): Promise<{ id: string; token: string }> {
+  const r = await query<{ id: string }>(
+    `INSERT INTO users(email,password_hash,credits,email_verified,status,role)
+     VALUES($1,'argon2$stub',0,true,'active','admin')
+     RETURNING id::text AS id`,
+    [email],
+  );
+  const id = r.rows[0].id;
+  const issued = await signAccess({ sub: id, role: "admin" }, JWT_SECRET);
   return { id, token: issued.token };
 }
 
@@ -397,6 +428,57 @@ describe("POST /api/payment/hupi/callback", () => {
     assert.equal(cnt.rows[0].cnt, "1");
   });
 
+  test("签名 CD 退款回调完成已有 hold，重复/后到 UD 不降级", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("cb-refund@example.com", 0n);
+    const orderNo = await seedPendingOrder(uid);
+    const paid: Record<string, string> = {
+      trade_order_id: orderNo,
+      total_fee: "10.00",
+      status: "OD",
+      transaction_id: "TX-REFUND",
+      appid: HUPI_APP_ID,
+    };
+    paid.hash = signHupijiao(paid, HUPI_SECRET);
+    assert.equal((await postForm("/api/payment/hupi/callback", paid)).status, 200);
+    await reserveOrderRefund({
+      orderNo,
+      reason: "用户申请退款",
+      adminId: uid,
+    });
+
+    const refunded: Record<string, string> = {
+      trade_order_id: orderNo,
+      status: "CD",
+      transaction_id: "TX-REFUND",
+      out_refund_no: "RF-CALLBACK-1",
+      total_fee: "10.00",
+      appid: HUPI_APP_ID,
+    };
+    refunded.hash = signHupijiao(refunded, HUPI_SECRET);
+    const first = await postForm("/api/payment/hupi/callback", refunded);
+    assert.equal(first.status, 200);
+    assert.equal(first.text, "success");
+
+    const late: Record<string, string> = { ...refunded, status: "UD" };
+    late.hash = signHupijiao(late, HUPI_SECRET);
+    assert.equal((await postForm("/api/payment/hupi/callback", late)).status, 200);
+    const saved = await query<{ status: string; refund_state: string; provider_refund_no: string }>(
+      "SELECT status,refund_state,provider_refund_no FROM orders WHERE order_no=$1",
+      [orderNo],
+    );
+    assert.deepEqual(saved.rows[0], {
+      status: "refunded",
+      refund_state: "completed",
+      provider_refund_no: "RF-CALLBACK-1",
+    });
+    const wallet = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id=$1",
+      [uid],
+    );
+    assert.equal(wallet.rows[0].credits, "0");
+  });
+
   test("订单不存在:400 ORDER_NOT_FOUND", async (t) => {
     if (skipIfMissing(t)) return;
     const form: Record<string, string> = {
@@ -541,6 +623,88 @@ describe("POST /api/payment/hupi/callback", () => {
       "SELECT status FROM orders WHERE order_no=$1", [orderNo],
     );
     assert.equal(o.rows[0].status, "pending");
+  });
+});
+
+describe("POST /api/admin/orders/:order_no/refund", () => {
+  test("admin 一次性提交后冻结原桶；重复 POST 409 且不再外呼", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid, token: userToken } = await createUserWithToken(
+      "admin-refund-user@example.com",
+    );
+    const admin = await createAdminWithToken("admin-refund-admin@example.com");
+    const { order } = await (await import("../payment/orders.js")).createPendingOrder({
+      userId: uid,
+      planCode: "plan-10",
+    });
+    await (await import("../payment/orders.js")).markOrderPaid({
+      orderNo: order.order_no,
+      callbackPayload: { status: "OD" },
+    });
+
+    const forbidden = await postJson(
+      `/api/admin/orders/${order.order_no}/refund`,
+      { reason: "用户申请退款" },
+      userToken,
+    );
+    assert.equal(forbidden.status, 403);
+    assert.equal(mockRefundCalls, 0);
+
+    const first = await postJson(
+      `/api/admin/orders/${order.order_no}/refund`,
+      { reason: "用户申请退款" },
+      admin.token,
+    );
+    assert.equal(first.status, 202, JSON.stringify(first.json));
+    assert.equal(mockRefundCalls, 1);
+    assert.equal(
+      ((first.json.refund as Record<string, unknown>).state),
+      "channel_pending",
+    );
+    const held = await query<{ credits: string; refund_state: string }>(
+      `SELECT u.credits::text AS credits,o.refund_state
+         FROM users u JOIN orders o ON o.user_id=u.id
+        WHERE o.order_no=$1`,
+      [order.order_no],
+    );
+    assert.deepEqual(held.rows[0], { credits: "0", refund_state: "channel_pending" });
+
+    const duplicate = await postJson(
+      `/api/admin/orders/${order.order_no}/refund`,
+      { reason: "再次提交" },
+      admin.token,
+    );
+    assert.equal(duplicate.status, 409);
+    assert.equal((duplicate.json.error as Record<string, unknown>).code, "ORDER_REFUND_ALREADY_REQUESTED");
+    assert.equal(mockRefundCalls, 1, "provider refund POST must be at-most-once");
+  });
+
+  test("reason validation happens before any hold or provider call", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("admin-refund-validation@example.com");
+    const admin = await createAdminWithToken("admin-refund-validation-admin@example.com");
+    const { order } = await (await import("../payment/orders.js")).createPendingOrder({
+      userId: uid,
+      planCode: "plan-10",
+    });
+    await (await import("../payment/orders.js")).markOrderPaid({
+      orderNo: order.order_no,
+      callbackPayload: { status: "OD" },
+    });
+    const invalid = await postJson(
+      `/api/admin/orders/${order.order_no}/refund`,
+      { reason: "" },
+      admin.token,
+    );
+    assert.equal(invalid.status, 400);
+    assert.equal(mockRefundCalls, 0);
+    const saved = await query<{ refund_state: string | null; credits: string }>(
+      `SELECT o.refund_state,u.credits::text AS credits
+         FROM orders o JOIN users u ON u.id=o.user_id
+        WHERE o.order_no=$1`,
+      [order.order_no],
+    );
+    assert.deepEqual(saved.rows[0], { refund_state: null, credits: "1000" });
   });
 });
 

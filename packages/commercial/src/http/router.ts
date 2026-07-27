@@ -130,7 +130,12 @@ import {
   handleAdminModelOpsStats,
   handleAdminPutProviderOps,
 } from './admin/modelOps.js'
-import { handleAdminGetOrder, handleAdminListOrders, handleAdminOrdersKpi } from './admin/orders.js'
+import {
+  handleAdminGetOrder,
+  handleAdminListOrders,
+  handleAdminOrdersKpi,
+  handleAdminRefundOrder,
+} from './admin/orders.js'
 // 企业版(P3.1)批次 D:平台超管开票申请处理。
 import { handleAdminListOrgInvoices, handleAdminPatchOrgInvoice } from './admin/orgInvoices.js'
 // 企业版(P3.1)批次 A:org 平台超管运维 + org 成员管理分发器。
@@ -1266,6 +1271,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     //   /api/admin/orders/kpi 必须排前,否则会被 /api/admin/orders/ prefix 吞成 ORDER_NOT_FOUND
     { method: 'GET', path: '/api/admin/orders', handler: handleAdminListOrders },
     { method: 'GET', path: '/api/admin/orders/kpi', handler: handleAdminOrdersKpi },
+    { method: 'POST', pathPrefix: '/api/admin/orders/', handler: handleAdminRefundOrder },
     { method: 'GET', pathPrefix: '/api/admin/orders/', handler: handleAdminGetOrder },
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
     { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },

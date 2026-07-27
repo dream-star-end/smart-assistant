@@ -49,6 +49,15 @@ export interface OrderDetailView extends OrderRowView {
   callback_payload: Record<string, unknown> | null;
   ledger_id: string | null;
   refunded_ledger_id: string | null;
+  kind: string;
+  org_id: string | null;
+  refund_state: string | null;
+  refund_reason: string | null;
+  refund_requested_at: Date | null;
+  refund_hold_ledger_id: string | null;
+  provider_refund_no: string | null;
+  refund_payload: Record<string, unknown> | null;
+  refunded_at: Date | null;
 }
 
 const ORDER_LIST_COLS = `
@@ -72,7 +81,16 @@ const ORDER_DETAIL_COLS = `
   ${ORDER_LIST_COLS},
   o.callback_payload,
   o.ledger_id::text         AS ledger_id,
-  o.refunded_ledger_id::text AS refunded_ledger_id
+  o.refunded_ledger_id::text AS refunded_ledger_id,
+  o.kind,
+  o.org_id::text AS org_id,
+  o.refund_state,
+  o.refund_reason,
+  o.refund_requested_at,
+  o.refund_hold_ledger_id::text AS refund_hold_ledger_id,
+  o.provider_refund_no,
+  o.refund_payload,
+  o.refunded_at
 `;
 
 // ─── List ──────────────────────────────────────────────────────────

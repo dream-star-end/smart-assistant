@@ -4,6 +4,7 @@ import { TooltipProvider } from "../../../../components/ui";
 
 vi.mock("../../../lib/adminApi", () => ({
   adminGet: vi.fn(),
+  adminSend: vi.fn(),
   adminText: vi.fn(),
   ApiError: class ApiError extends Error {
     status?: number;
@@ -11,7 +12,7 @@ vi.mock("../../../lib/adminApi", () => ({
 }));
 vi.mock("chart.js/auto", () => ({ default: class { destroy() {} } }));
 
-import { adminGet } from "../../../lib/adminApi";
+import { adminGet, adminSend } from "../../../lib/adminApi";
 import OrdersPage from "../index";
 
 const order = {
@@ -24,6 +25,8 @@ const order = {
   amount_cents: "3800",
   credits: "4000",
   status: "paid",
+  kind: "topup",
+  org_id: null,
   paid_at: "2026-07-01T10:05:00Z",
   expires_at: "2026-07-01T11:00:00Z",
   created_at: "2026-07-01T10:00:00Z",
@@ -41,7 +44,21 @@ function mockGet() {
   vi.mocked(adminGet).mockImplementation(async (path: string) => {
     if (path === "/orders") return { rows: [order], next_before_created_at: null, next_before_id: null };
     if (path === "/orders/kpi") return { kpi };
-    if (path.startsWith("/orders/")) return { order: { ...order, callback_payload: { trade_status: "OK" }, ledger_id: "77", refunded_ledger_id: null } };
+    if (path.startsWith("/orders/")) return {
+      order: {
+        ...order,
+        callback_payload: { trade_status: "OK" },
+        ledger_id: "77",
+        refunded_ledger_id: null,
+        refund_state: null,
+        refund_reason: null,
+        refund_requested_at: null,
+        refund_hold_ledger_id: null,
+        provider_refund_no: null,
+        refund_payload: null,
+        refunded_at: null,
+      },
+    };
     throw new Error(`unexpected ${path}`);
   });
 }
@@ -49,6 +66,9 @@ function mockGet() {
 beforeEach(() => {
   window.location.hash = "";
   mockGet();
+  vi.mocked(adminSend).mockResolvedValue({
+    refund: { state: "channel_pending", provider_status: "RD" },
+  });
 });
 afterEach(() => {
   cleanup();
@@ -98,5 +118,27 @@ describe("OrdersPage", () => {
       );
     });
     expect(await screen.findByText(/callback_payload/)).toBeTruthy();
+  });
+
+  test("paid topup 原路退款经过原因输入与危险确认，只发送一次", async () => {
+    render(
+      <TooltipProvider>
+        <OrdersPage />
+      </TooltipProvider>,
+    );
+    await screen.findByText("ORD-20260701-1");
+    fireEvent.click(screen.getByRole("button", { name: "查看" }));
+    const refundButton = await screen.findByRole("button", { name: "原路退款" });
+    fireEvent.click(refundButton);
+    fireEvent.click(await screen.findByRole("button", { name: "下一步" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认并冻结积分" }));
+    await waitFor(() => {
+      expect(vi.mocked(adminSend)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(adminSend)).toHaveBeenCalledWith(
+        "POST",
+        "/orders/ORD-20260701-1/refund",
+        { reason: "用户申请原路退款" },
+      );
+    });
   });
 });

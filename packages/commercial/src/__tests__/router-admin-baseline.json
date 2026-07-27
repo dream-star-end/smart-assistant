@@ -738,6 +738,12 @@
     "handler": "handleAdminOrdersKpi"
   },
   {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/orders/",
+    "handler": "handleAdminRefundOrder"
+  },
+  {
     "method": "GET",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/orders/",

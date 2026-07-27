@@ -49,6 +49,10 @@ import { verifyHupijiao } from "../payment/hupijiao/sign.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
 import { recordQrIssueFailure } from "../payment/qrIssueFailure.js";
+import {
+  applyProviderRefundStatus,
+  OrderRefundProviderMismatchError,
+} from "../payment/refunds.js";
 import { safeEnqueueAlert } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
 
@@ -313,6 +317,90 @@ export async function handleHupiCallback(
   //    - PN / 其它 = 待支付 / 未知 → 静默 success(不告警,正常流程)
   //    任何分支都回 "success":否则虎皮椒认为回调失败会一直重试
   const statusRaw = pickString(form, "status");
+  if (statusRaw === "CD" || statusRaw === "RD" || statusRaw === "UD") {
+    const refundAppid = pickString(form, "appid");
+    if (refundAppid !== deps.hupijiaoConfig.appId) {
+      safeEnqueueAlert({
+        event_type: EVENTS.PAYMENT_CALLBACK_TAMPERED,
+        severity: "critical",
+        title: "虎皮椒退款回调 appid 不匹配",
+        body:
+          `订单 \`${orderNo}\` 的签名退款回调 appid 不匹配 ` +
+          `(expected=\`${deps.hupijiaoConfig.appId}\`, got=\`${refundAppid || "<missing>"}\`)。`,
+        payload: {
+          order_no: orderNo,
+          field: "appid",
+          expected: deps.hupijiaoConfig.appId,
+          got: refundAppid || "<missing>",
+          req_id: ctx.requestId,
+        },
+        dedupe_key: `payment.refund_tampered:${orderNo}:appid`,
+      });
+      throw new HttpError(400, "APPID_MISMATCH", "hupijiao refund callback appid mismatch");
+    }
+    const providerRefundNo = pickString(form, "out_refund_no") || null;
+    // notify_url 回调沿用付款协议字段 total_fee；refund_fee 只存在于
+    // /payment/refund.html 的同步 JSON 响应。
+    const callbackAmountRaw = pickString(form, "total_fee");
+    const refundAmountCents = parseTotalFeeToCents(callbackAmountRaw);
+    let applied;
+    try {
+      applied = await applyProviderRefundStatus({
+        orderNo,
+        status: statusRaw,
+        providerRefundNo,
+        refundAmountCents,
+        safePayload: {
+          source: "callback",
+          trade_order_id: orderNo,
+          transaction_id: pickString(form, "transaction_id") || null,
+          out_refund_no: providerRefundNo,
+          total_fee: callbackAmountRaw || null,
+          reason: pickString(form, "reason") || null,
+          refund_status: statusRaw,
+          refund_time: pickString(form, "refund_time") || null,
+        },
+      });
+    } catch (err) {
+      if (err instanceof OrderRefundProviderMismatchError) {
+        safeEnqueueAlert({
+          event_type: EVENTS.PAYMENT_CALLBACK_TAMPERED,
+          severity: "critical",
+          title: "虎皮椒退款金额与本地订单不匹配",
+          body:
+            `订单 \`${orderNo}\` 的退款回调金额不匹配 ` +
+            `(expected=${err.expectedAmountCents}, got=${err.receivedAmountCents ?? "<missing>"})。`,
+          payload: {
+            order_no: orderNo,
+            expected_amount_cents: err.expectedAmountCents.toString(),
+            got_amount_cents: err.receivedAmountCents?.toString() ?? null,
+            req_id: ctx.requestId,
+          },
+          dedupe_key: `payment.refund_tampered:${orderNo}:amount`,
+        });
+        throw new HttpError(
+          400,
+          "REFUND_AMOUNT_MISMATCH",
+          "hupijiao refund callback amount mismatch",
+        );
+      }
+      throw err;
+    }
+    if (applied.outcome === "unmanaged") {
+      safeEnqueueAlert({
+        event_type: EVENTS.PAYMENT_CALLBACK_CONFLICT,
+        severity: "critical",
+        title: "虎皮椒退款回调无本地退款请求",
+        body:
+          `订单 \`${orderNo}\` 收到 status=${statusRaw} 的签名退款回调，` +
+          "但本地没有可匹配的退款 hold，需立即核对渠道后台与积分账。",
+        payload: { order_no: orderNo, status: statusRaw, req_id: ctx.requestId },
+        dedupe_key: `payment.refund_unmanaged:${orderNo}:${statusRaw}`,
+      });
+    }
+    sendText(res, 200, "success");
+    return;
+  }
   if (statusRaw === "NF") {
     // eslint-disable-next-line no-console
     console.info(
