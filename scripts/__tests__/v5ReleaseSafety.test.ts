@@ -6414,7 +6414,11 @@ wait $!
     assert.ok(coreStart >= 0, 'minimum_functional_core 缺失')
     const coreEnd = source.indexOf('\n}', coreStart)
     const core = source.slice(coreStart, coreEnd)
-    assert.match(core, /smoke_turn_matrix "\$release" "\$port" \|\|/, '最小功能核缺双引擎真 turn')
+    assert.match(
+      core,
+      /smoke_turn_matrix "\$release" "\$port" "\$lane" \|\|/,
+      '最小功能核缺带 lane 身份的双引擎真 turn',
+    )
     assert.match(core, /smoke_e2e_journey "\$port" \|\|/, '最小功能核缺 J1-J5 旅程')
     const journeyCalls = source.match(/^\s*smoke_e2e_journey\b/gm) ?? []
     assert.equal(
@@ -6491,6 +6495,11 @@ wait $!
     assert.ok(
       !/vip_control_gate "\$DS_candidate_slot"/.test(promoteBody),
       'promote 不得用 vip_control_gate 做探针(canary 期 candidate 是 standby,必然失败=挡住正常放量)',
+    )
+    assert.match(
+      promoteBody,
+      /smoke_turn_matrix "\$promote_candidate" "\$\(slot_port "\$DS_candidate_slot"\)" "promote-candidate"/,
+      'promote 的 candidate 真 turn 必须显式携带 candidate lane 身份',
     )
 
     // ⑤ finalize:不可逆点之前补功能门,失败转 aborting 保留恢复路径。
@@ -6970,6 +6979,63 @@ wait $!
     assert.match(source.slice(attemptAt), /let finalText = ''/)
     assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText \}\)/)
     assert.match(source, /result\.finalText === '2'/)
+  })
+
+  test('candidate CCB cost fallback is exact ledger evidence and never weakens stable lanes', async () => {
+    const turnSource = await readFile(turnCanary, 'utf8')
+    assert.match(
+      turnSource,
+      /V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE/,
+      'turn smoke 缺显式 candidate ledger 模式',
+    )
+    assert.match(
+      turnSource,
+      /result\.reason === 'ledger-cost-evidence-required'[\s\S]*result\.finalText === '2'[\s\S]*result\.sawFinal[\s\S]*!result\.sawCost/,
+      'rc=3 只能在 exactText+final 已齐且仅缺 live cost 时产生',
+    )
+    assert.match(
+      turnSource,
+      /TURN_LEDGER_PROOF_REQUIRED session=\$\{peerId\} model=\$\{MODEL\}/,
+      'candidate ledger proof 必须绑定本次脚本生成的唯一 session 与精确 model',
+    )
+    assert.match(turnSource, /process\.exit\(3\)/, 'candidate ledger proof 必须使用独立退出码 3')
+
+    const source = await readFile(deploy, 'utf8')
+    const verifyStart = source.indexOf('\nverify_candidate_ccb_ledger_cost() {')
+    const verifyEnd = source.indexOf('\nsmoke_turn_canary() {', verifyStart)
+    assert.ok(verifyStart >= 0 && verifyEnd > verifyStart, '缺 candidate CCB 精确 ledger verifier')
+    const verify = source.slice(verifyStart, verifyEnd)
+    for (const invariant of [
+      "u.email = 'v5-canary@claudeai.chat'",
+      "ur.session_id = '$session_id'",
+      "ur.model = '$model'",
+      "ur.status = 'success'",
+      'ur.cost_credits > 0',
+      'cl.id = ur.ledger_id',
+      'cl.user_id = ur.user_id',
+      "cl.ref_type = 'usage_record'",
+      'cl.ref_id = ur.id::text',
+      'cl.delta = -ur.cost_credits',
+    ]) {
+      assert.ok(verify.includes(invariant), `candidate ledger verifier 缺精确约束:${invariant}`)
+    }
+    assert.match(verify, /for i in \$\(seq 1 10\)/, 'ledger proof 必须短且有限轮询')
+    assert.match(verify, /return 1/, 'SQL 错误/零行/关系不一致必须 fail-closed')
+
+    const matrixStart = source.indexOf('\nsmoke_turn_matrix() {')
+    const matrixEnd = source.indexOf('\n}', matrixStart)
+    const matrix = source.slice(matrixStart, matrixEnd)
+    assert.match(
+      matrix,
+      /\(\s*"\$lane" == canary-ready \|\| "\$lane" == promote-candidate\s*\) && "\$model" == deepseek-v4-flash/,
+      'ledger fallback 必须同时受 candidate lane 与精确 DeepSeek 模型约束',
+    )
+    assert.match(matrix, /cost_evidence_mode=live/, '每个模型默认必须回到 live cost frame')
+    assert.equal(
+      (source.match(/V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE=1/g) ?? []).length,
+      1,
+      'candidate ledger env 只能在受限 smoke 分支出现一次',
+    )
   })
 
   test('baseline eval tolerates transient poll failure and records terminal result', async () => {
