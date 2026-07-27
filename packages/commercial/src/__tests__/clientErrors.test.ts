@@ -23,6 +23,8 @@ describe("client friction normalization", () => {
       client_build: "abc-123",
       browser_family: "chrome",
       device_class: "desktop",
+      error_name: "type_error",
+      error_fingerprint: "0123456789abcdef",
       message: "DO_NOT_PERSIST message",
       stack: "DO_NOT_PERSIST stack",
       path: "/private/conversation",
@@ -46,6 +48,8 @@ describe("client friction normalization", () => {
       deviceClass: "desktop",
       traceId: "trace_1",
       sessionId: "session_1",
+      errorName: "type_error",
+      errorFingerprint: "0123456789abcdef",
     });
     assert.equal(JSON.stringify(normalized).includes("DO_NOT_PERSIST"), false);
   });
@@ -71,6 +75,8 @@ describe("client friction normalization", () => {
       provider: "UPPERCASE",
       browser_family: "bad/slash",
       device_class: "watch",
+      error_name: "TypeError",
+      error_fingerprint: "ABCDEF0123456789",
     }, "fallback_id");
     assert.equal(normalized.correlation, "fallback_id");
     assert.equal(normalized.surface, "client");
@@ -81,6 +87,8 @@ describe("client friction normalization", () => {
     assert.equal(normalized.provider, null);
     assert.equal(normalized.browserFamily, null);
     assert.equal(normalized.deviceClass, "unknown");
+    assert.equal(normalized.errorName, null);
+    assert.equal(normalized.errorFingerprint, null);
   });
 
   test("persist failures expose bounded structure without leaking raw database detail", () => {

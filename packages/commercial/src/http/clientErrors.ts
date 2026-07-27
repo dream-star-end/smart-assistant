@@ -19,6 +19,18 @@ import { recordProductFrictionEvent, type FrictionOutcome } from "../productFric
 
 const SAFE_LOWER = /^[a-z0-9_]{1,48}$/;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,64}$/;
+const ERROR_NAMES = new Set([
+  "error",
+  "type_error",
+  "range_error",
+  "reference_error",
+  "syntax_error",
+  "uri_error",
+  "eval_error",
+  "aggregate_error",
+  "dom_exception",
+  "non_error",
+]);
 const OUTCOMES = new Set<FrictionOutcome>([
   "pending", "failed", "recovered", "succeeded", "abandoned", "cancelled",
 ]);
@@ -68,6 +80,9 @@ export function normalizeClientFrictionReport(
     ? body.outcome as FrictionOutcome : "failed";
   const traceId = safeId(body.trace_id);
   const sessionId = safeId(body.session_id);
+  const errorName = typeof body.error_name === "string" && ERROR_NAMES.has(body.error_name)
+    ? body.error_name : null;
+  const errorFingerprint = safeToken(body.error_fingerprint, 16, /^[a-f0-9]{16}$/);
   return {
     correlation: safeId(body.event_id) ?? traceId ?? safeId(body.request_id) ?? fallbackEventId,
     surface,
@@ -85,6 +100,8 @@ export function normalizeClientFrictionReport(
       : "unknown",
     traceId,
     sessionId,
+    errorName,
+    errorFingerprint,
   };
 }
 
