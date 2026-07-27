@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol/limits";
+import type { MessageReplyQuote } from "@openclaude/protocol/messageReplyCore";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";

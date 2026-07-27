@@ -14,7 +14,16 @@
     "./modelAuthority": "./src/modelAuthority.ts",
     "./goalState": "./src/goalState.ts",
     "./containerPreview": "./src/containerPreview.ts",
-    "./containerPreviewAuth": "./src/containerPreviewAuth.ts"
+    "./containerPreviewAuth": "./src/containerPreviewAuth.ts",
+    "./engineModels": "./src/engineModels.ts",
+    "./limits": "./src/limits.ts",
+    "./losslessTurnTape": "./src/losslessTurnTape.ts",
+    "./marketplaceArtifact": "./src/marketplaceArtifact.ts",
+    "./marketplaceTaxonomy": "./src/marketplaceTaxonomy.ts",
+    "./messageIds": "./src/messageIds.ts",
+    "./messageReply": "./src/messageReply.ts",
+    "./messageReplyCore": "./src/messageReplyCore.ts",
+    "./turnErrorTaxonomy": "./src/turnErrorTaxonomy.ts"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"

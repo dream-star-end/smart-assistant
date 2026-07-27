@@ -15,7 +15,7 @@ import {
   normalizeTurnErrorCode,
   turnErrorSemantics,
   WAIVED_TURN_ERROR_CODES,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/turnErrorTaxonomy";
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import { isServerAuthoredRow } from "./model";
 import type { BashTail, ChatMessage, ChildBlock } from "./model";

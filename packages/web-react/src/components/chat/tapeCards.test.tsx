@@ -5,6 +5,7 @@ import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
 import { MessageRenderer } from "../MessageRenderer";
+import { preloadToolBody } from "../ToolCard";
 import type { CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
 
@@ -13,7 +14,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 beforeAll(async () => {
-  await import("../MarkdownImpl");
+  await Promise.all([import("../MarkdownImpl"), preloadToolBody()]);
 });
 
 function renderMsg(message: ChatMessage, cb: CardCallbacks = {}) {

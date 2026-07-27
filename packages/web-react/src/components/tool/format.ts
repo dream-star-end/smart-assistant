@@ -15,6 +15,8 @@ export type ToolLike = {
   inputJson?: unknown;
   partialJson?: string;
   inputPreview?: string;
+  /** Browser-only structured-input revision used to keep streaming cards live. */
+  _inputRevision?: number;
   _partial?: boolean;
   _completed?: boolean;
   output?: string | null;

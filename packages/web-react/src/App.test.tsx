@@ -1,10 +1,23 @@
 import '@testing-library/jest-dom/vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
 import { ToastProvider } from './components/ui'
 import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
+
+const messageRendererGate = vi.hoisted(() => {
+  let release!: () => void
+  const pending = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { pending, release }
+})
+
+vi.mock('./components/MessageRenderer', async (importOriginal) => {
+  await messageRendererGate.pending
+  return importOriginal()
+})
 
 // ---------------------------------------------------------------------------
 // v5 商业版前端骨架（P2）测试
@@ -249,6 +262,30 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const call = fetchMock.mock.calls.find(([url]) => String(url) === '/api/auth/login')
     expect(call).toBeTruthy()
     expect((call![1] as RequestInit).credentials).toBe('include')
+  })
+
+  test('消息列表 chunk 加载期间保留最新消息，完成后替换骨架并接管滚动区', async () => {
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    try {
+      await loginViaUi()
+      const input = await screen.findByPlaceholderText('和「全能助手」对话…')
+      fireEvent.change(input, { target: { value: 'LAZY_MESSAGE_COMPLETE' } })
+      fireEvent.click(screen.getByRole('button', { name: '发送' }))
+
+      const skeleton = await screen.findByLabelText('正在加载会话历史')
+      const chatScroll = skeleton.closest('.chat-scroll-area')
+      expect(chatScroll).toBeInTheDocument()
+      expect(within(chatScroll as HTMLElement).queryByText('LAZY_MESSAGE_COMPLETE')).not.toBeInTheDocument()
+
+      messageRendererGate.release()
+      expect(await within(chatScroll as HTMLElement).findByText('LAZY_MESSAGE_COMPLETE')).toBeInTheDocument()
+      expect(screen.queryByLabelText('正在加载会话历史')).not.toBeInTheDocument()
+    } finally {
+      messageRendererGate.release()
+    }
   })
 
   test('公开安全配置首次失败时点一次登录，自动恢复后完成登录', async () => {

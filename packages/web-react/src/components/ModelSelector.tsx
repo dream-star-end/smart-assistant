@@ -1,7 +1,7 @@
 import {
   DEFAULT_CODEX_ENGINE_MODEL,
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/engineModels";
 import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { PublicModel } from "../lib/types";

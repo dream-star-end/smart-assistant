@@ -5,6 +5,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import { applyServerIncremental } from "../lib/persist";
 import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer } from "./MessageRenderer";
+import { preloadToolBody } from "./ToolCard";
 import type { PermissionRespond } from "./chat/PermissionCard";
 import { ResponseRatingProvider } from "./chat/ResponseRating";
 import type { CardCallbacks } from "./chat/cards";
@@ -20,7 +21,7 @@ beforeAll(async () => {
   // MarkdownImpl 是 React.lazy 的重 chunk。全量并行时首次 transform/import 偶尔会耗尽
   // RTL 统一的 5s 查询窗口；测试先显式等模块就绪，再让 findBy* 只等待 React 提交 DOM。
   // 冷态 Suspense fallback 由 Markdown.test.tsx 的永久 suspend 替身独立覆盖。
-  await import("./MarkdownImpl");
+  await Promise.all([import("./MarkdownImpl"), preloadToolBody()]);
 });
 
 function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMessage {

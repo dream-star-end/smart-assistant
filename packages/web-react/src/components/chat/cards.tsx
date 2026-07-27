@@ -22,7 +22,10 @@ import {
   Volume2,
   Wallet,
 } from "lucide-react";
-import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
+import {
+  normalizeTurnErrorCode,
+  turnErrorSemantics,
+} from "@openclaude/protocol/turnErrorTaxonomy";
 import { memo, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {

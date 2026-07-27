@@ -1,4 +1,4 @@
-import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol/engineModels";
 import type { PublicModel } from "./types";
 
 export type PreferenceEffort = "low" | "medium" | "high" | "xhigh" | "max";

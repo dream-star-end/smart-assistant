@@ -1,7 +1,22 @@
 import { type Static, Type } from '@sinclair/typebox'
 import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
+import { MAX_ATTACHMENTS_PER_MESSAGE } from './limits.js'
+import {
+  CLIENT_MESSAGE_ID_PATTERN,
+  isClientMessageId,
+} from './messageIds.js'
 import { MessageReplyQuote } from './messageReply.js'
+
+export { MAX_ATTACHMENTS_PER_MESSAGE } from './limits.js'
+export {
+  CLIENT_MESSAGE_ID_PATTERN,
+  CLIENT_MESSAGE_ID_RE,
+  PERSISTED_CLIENT_MESSAGE_ID_PATTERN,
+  PERSISTED_CLIENT_MESSAGE_ID_RE,
+  isClientMessageId,
+  isPersistedClientMessageId,
+} from './messageIds.js'
 
 // ───────────────────────────────────────────────
 // V3 S12e — trace id schema fragment
@@ -13,22 +28,6 @@ import { MessageReplyQuote } from './messageReply.js'
 const TRACE_ID_PATTERN = '^[A-Za-z0-9_-]{16,64}$'
 const TraceIdString = Type.String({ pattern: TRACE_ID_PATTERN })
 
-/** Browser-authored user-message id carried across the active-turn replay
- * protocol. Keep one validator for gateway ingress and lossless-tape parsing
- * so the runtime marker and durable attribution cannot drift. */
-export const CLIENT_MESSAGE_ID_PATTERN = '^[A-Za-z0-9_-]{1,128}$'
-export const CLIENT_MESSAGE_ID_RE = new RegExp(CLIENT_MESSAGE_ID_PATTERN)
-export const isClientMessageId = (value: unknown): value is string =>
-  typeof value === 'string' && CLIENT_MESSAGE_ID_RE.test(value)
-/** Durable session rows predate the browser protocol contract and may contain
- * a legacy colon-delimited id (for example `cm:user:large`). Readers and the
- * legacy REST append route must accept the union without weakening new
- * browser-authored frame validation. */
-export const PERSISTED_CLIENT_MESSAGE_ID_PATTERN =
-  '^(?:[A-Za-z0-9_-]{1,128}|[A-Za-z0-9_:-]{1,80})$'
-export const PERSISTED_CLIENT_MESSAGE_ID_RE = new RegExp(PERSISTED_CLIENT_MESSAGE_ID_PATTERN)
-export const isPersistedClientMessageId = (value: unknown): value is string =>
-  typeof value === 'string' && PERSISTED_CLIENT_MESSAGE_ID_RE.test(value)
 const ClientMessageId = Type.String({ pattern: CLIENT_MESSAGE_ID_PATTERN })
 
 export const GoalStateSnapshotSchema = Type.Object({
@@ -85,17 +84,6 @@ export const MediaRef = Type.Object({
   localSrc: Type.Optional(Type.String()),
 })
 export type MediaRef = Static<typeof MediaRef>
-
-// ───────────────────────────────────────────────
-// Attachment count limit — 前后端单一权威源
-// ───────────────────────────────────────────────
-// 单条消息(inbound frame)最多携带的附件(MediaRef)个数。**前端(web-react
-// Composer)与后端(gateway dispatchInbound 帧准入)共用本常量**,消除历史上
-// 前端 8 / 后端 5 的漂移(用户挂 6-8 个上传成功却被后端拒"附件数量超过 5 个")。
-// 这是纯粹的"件数"护栏,与字节体积无关:单文件体积由 MAX_UPLOAD_SINGLE(100MB)、
-// 总体积由 MAX_UPLOAD_TOTAL(300MB)独立守护,故 8 件仍在总量预算内、无内存/帧
-// 大小硬约束需要压回 5。取 8 保用户体验(boss 铁律:优化不得降低体验)。
-export const MAX_ATTACHMENTS_PER_MESSAGE = 8
 
 /** Prompt queue durable-content budget. Keep this aligned with gateway's
  * existing per-message aggregate upload ceiling; P1 imports this authority

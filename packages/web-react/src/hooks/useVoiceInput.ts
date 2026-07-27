@@ -11,7 +11,7 @@
  *   stop  → recorder.stop() → 冲刷最后一片后 send {type:'stop'}
  *   server {type:'transcript'}(中间) / {type:'polish', text}(最终) / {type:'error'}
  */
-import { isKnownTurnErrorCode } from "@openclaude/protocol";
+import { isKnownTurnErrorCode } from "@openclaude/protocol/turnErrorTaxonomy";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { friendlyBridgeErrorMessage, normalizeBridgeErrorCode } from "../lib/chat/pure";
 

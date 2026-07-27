@@ -1,9 +1,10 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import { MediaSignProvider } from "./chat/media";
-import { ToolCard } from "./ToolCard";
+import { preloadToolBody, ToolCard } from "./ToolCard";
 
+beforeAll(preloadToolBody);
 afterEach(cleanup);
 
 describe("ToolCard 二级分派 + 状态 (P5)", () => {

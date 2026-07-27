@@ -14,7 +14,7 @@ import {
   REPORT_EXEMPT_TURN_ERROR_CODES,
   type TurnErrorCode,
   turnErrorSemantics,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/turnErrorTaxonomy";
 import type {
   OutboundContentBlock,
   OutboundMessageWire,

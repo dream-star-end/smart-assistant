@@ -1,11 +1,13 @@
 // 市场纯函数助手 —— 升级可见性、分区导航与发布校验的唯一权威（面板间共享，可测）。
 import {
-  MARKETPLACE_CATEGORIES,
   type MarketplaceArtifactKind,
   type MarketplacePluginType,
-  isMarketplaceCategoryId,
   marketplaceArtifactCompatibility,
-} from '@openclaude/protocol'
+} from '@openclaude/protocol/marketplaceArtifact'
+import {
+  MARKETPLACE_CATEGORIES,
+  isMarketplaceCategoryId,
+} from '@openclaude/protocol/marketplaceTaxonomy'
 import type { MarketplaceCard, MarketplaceInstalled } from './types'
 
 /** New additive field first; old API/cache rows fall back to the legacy kind projection. */
