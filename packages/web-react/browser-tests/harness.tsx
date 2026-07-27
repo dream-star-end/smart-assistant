@@ -5,11 +5,20 @@
 //
 // stub 原则:只 stub 网络/宿主副作用(上传/发送/目标提交),不 stub 任何 UI 结构;
 // onUpload 立即 resolve → 附件 chip 无后端也能走到 done 态,CI 零外部依赖。
-import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
+import {
+  StrictMode,
+  useCallback,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
+import { Markdown } from "../src/components/Markdown";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
+import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
 import {
@@ -25,6 +34,16 @@ import {
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 import { createMemoryAuthSession } from "../src/lib/authSession";
+import { ChatSocket } from "../src/lib/chat/socket";
+import {
+  admittedAckFrame,
+  EXPECTED_TIMELINE_ROLES,
+  relayReadyFrame,
+  REPLAY_AGENT_ID,
+  REPLAY_MARKERS,
+  REPLAY_SESSION_ID,
+  replayTurnFrames,
+} from "./fixtures/turnReplay";
 
 declare global {
   interface Window {
@@ -68,6 +87,36 @@ declare global {
     };
     __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
+    /** fixture 的精确文本标记与期望顺序,供 run.mjs 读取 —— 断言常量不在两处各写一份。 */
+    __replayFixture: {
+      markers: Record<string, string>;
+      expectedRoles: readonly string[];
+    };
+    /** T21 真 WS 帧 replay 驱动面(见文件末尾 ReplayTimelineProbe)。 */
+    __replay: {
+      /** 客户端经真 socket 实际发出的 wire 帧原文(含 hello / inbound.message)。 */
+      sent: string[];
+      /** socket 判定的会话忙态(sending),即 MessageList 收到的 sending prop。 */
+      sending: boolean;
+      /** 已渲染的时间线条目(顺序即虚拟列表顺序)。 */
+      rows: Array<{ role: string; id: string }>;
+    };
+    __replayDrive: {
+      /** relay 就绪 → 排空离线队列 → 真发 inbound.message。返回该次发送的 clientMessageId。 */
+      openTurn: () => Promise<string>;
+      /** 推入下一帧 outbound.message;返回已推入的帧数。 */
+      pushNextFrame: () => number;
+      /** 剩余帧一次推完。 */
+      pushRemainingFrames: () => number;
+      frameCount: () => number;
+    };
+    /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
+    __modelFixture: {
+      markers: Record<string, string>;
+      ids: Record<string, string>;
+    };
+    /** T23 ModelSelector.onSelect 真实收到的 model id(顺序即点击顺序)。 */
+    __modelPicks: string[];
     __runPendingDispatchJournalProbe: () => Promise<{
       survivedStaleWrite: boolean;
       resistedResurrection: boolean;
@@ -89,6 +138,20 @@ window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
 window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
+window.__replayFixture = {
+  markers: { ...REPLAY_MARKERS },
+  expectedRoles: EXPECTED_TIMELINE_ROLES,
+};
+window.__replay = { sent: [], sending: false, rows: [] };
+window.__modelPicks = [];
+window.__replayDrive = {
+  openTurn: async () => {
+    throw new Error("replay probe 未挂载");
+  },
+  pushNextFrame: () => 0,
+  pushRemainingFrames: () => 0,
+  frameCount: () => 0,
+};
 window.__runPendingDispatchJournalProbe = async () => {
   const userId = `browser-journal-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const first = new SessionStore(userId);
@@ -690,4 +753,226 @@ function ArchiveTimelineProbe() {
 
 createRoot(document.getElementById("timeline-archive-root")!).render(
   <StrictMode><ArchiveTimelineProbe /></StrictMode>,
+);
+
+// ── T21 真 WS 帧 → 真 ChatSocket → 真 MessageList ────────────────────────────
+//
+// 补的是"帧 → reducer → 虚拟列表 → 卡片"这条链的中段:jsdom 单测只喂 reducer 已经
+// 消化过的 ChatMessage 行,其他 browser 用例直接把手写 stub 行挂 MessageRenderer;
+// 真实 wire 帧被 ChatSocket 消化后到底渲成什么,过去两侧都没有人守(#147→#158 十一连修
+// 全落在这段上)。
+//
+// stub 只替换**传输**(WebSocket),ChatSocket / reducer / MessageList / 各卡片全部是
+// 生产实现;帧来自单一权威 fixture,且由 replayFrames.contract.test.ts 对 protocol
+// typebox schema 逐帧校验,不是"看起来像"的手写 JSON。
+type HarnessSocketEvent = { data: string };
+
+class HarnessWebSocket {
+  static latest: HarnessWebSocket | null = null;
+  readyState = 0;
+  bufferedAmount = 0;
+  onopen: ((ev: unknown) => void) | null = null;
+  onmessage: ((ev: HarnessSocketEvent) => void) | null = null;
+  onclose: ((ev: { code: number; reason: string }) => void) | null = null;
+  onerror: ((ev: unknown) => void) | null = null;
+
+  constructor(_url: string, _protocols?: string[]) {
+    HarnessWebSocket.latest = this;
+    // 真握手是异步的;同步 open 会把"连接前入队、就绪后排空"这条真实路径抹掉。
+    setTimeout(() => {
+      this.readyState = 1;
+      this.onopen?.({});
+    }, 0);
+  }
+
+  send(data: string): void {
+    window.__replay.sent.push(data);
+    // keepalive ping 必须有 pong,否则 10s 后 socket 自判死链主动重连,给用例引入噪声。
+    let parsed: { type?: string; id?: number } | null = null;
+    try {
+      parsed = JSON.parse(data) as { type?: string; id?: number };
+    } catch {
+      parsed = null;
+    }
+    if (parsed?.type === "ping") {
+      setTimeout(() => this.deliver({ type: "pong", id: parsed?.id }), 0);
+    }
+  }
+
+  close(code = 1000, reason = ""): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.onclose?.({ code, reason });
+  }
+
+  /** 把一帧 server → client 的 wire 帧交给真实 onmessage handler。 */
+  deliver(frame: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+}
+
+const replaySocket = new ChatSocket({
+  getToken: () => "harness-replay-token",
+  getAuthEpoch: () => 0,
+  silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 1000 }),
+  onAuthExpired: () => {},
+  defaultAgentId: REPLAY_AGENT_ID,
+});
+replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "replay 会话");
+
+function ReplayTimelineProbe() {
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const snap = useSyncExternalStore(replaySocket.subscribe, replaySocket.getSnapshot);
+  void snap.version;
+  const messages = snap.sessions.get(REPLAY_SESSION_ID)?.messages ?? [];
+  const sending = replaySocket.isSessionBusy(REPLAY_SESSION_ID);
+  window.__replay.sending = sending;
+  window.__replay.rows = messages.map((m) => ({ role: m.role, id: m.id }));
+  return (
+    <div
+      ref={setScroller}
+      className="chat-scroll-area timeline-scroll-probe"
+      data-testid="replay-timeline-probe"
+      tabIndex={0}
+    >
+      <MessageList
+        messages={messages}
+        sending={sending}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration={`replay::${REPLAY_SESSION_ID}`}
+      />
+    </div>
+  );
+}
+
+createRoot(document.getElementById("timeline-replay-root")!).render(
+  <StrictMode><ReplayTimelineProbe /></StrictMode>,
+);
+
+{
+  let pushed = 0;
+  let frames: ReturnType<typeof replayTurnFrames> = [];
+  const live = (): HarnessWebSocket => {
+    const ws = HarnessWebSocket.latest;
+    if (!ws || ws.readyState !== 1) throw new Error("replay 传输未就绪");
+    return ws;
+  };
+  window.__replayDrive = {
+    openTurn: async () => {
+      const original = window.WebSocket;
+      (window as unknown as { WebSocket: unknown }).WebSocket = HarnessWebSocket;
+      try {
+        replaySocket.setGateReady(true);
+        replaySocket.start();
+        // 等真实握手完成(onopen → hello 已发)。
+        for (let i = 0; i < 100 && HarnessWebSocket.latest?.readyState !== 1; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      } finally {
+        (window as unknown as { WebSocket: unknown }).WebSocket = original;
+      }
+      const ws = live();
+      // relay 就绪是投递前置:没有它,消息只会停在离线队列里。
+      ws.deliver(relayReadyFrame);
+      replaySocket.sendMessage({
+        sessId: REPLAY_SESSION_ID,
+        agentId: REPLAY_AGENT_ID,
+        text: REPLAY_MARKERS.userText,
+        model: "glm-5.2",
+      });
+      // 从**真实发出的帧**里取 clientMessageId,而不是回读内部状态:证明发送侧也走通了。
+      let cmid: string | undefined;
+      for (let i = 0; i < 100 && !cmid; i++) {
+        for (const raw of window.__replay.sent) {
+          try {
+            const frame = JSON.parse(raw) as { type?: string; clientMessageId?: string };
+            if (frame.type === "inbound.message" && frame.clientMessageId) {
+              cmid = frame.clientMessageId;
+            }
+          } catch {
+            /* 非 JSON 帧忽略 */
+          }
+        }
+        if (!cmid) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (!cmid) throw new Error("真实发送未产生 inbound.message 帧");
+      ws.deliver(admittedAckFrame(cmid));
+      frames = replayTurnFrames(cmid);
+      pushed = 0;
+      return cmid;
+    },
+    pushNextFrame: () => {
+      if (pushed >= frames.length) throw new Error("replay 帧已推完");
+      live().deliver(frames[pushed]);
+      pushed += 1;
+      return pushed;
+    },
+    pushRemainingFrames: () => {
+      const ws = live();
+      while (pushed < frames.length) {
+        ws.deliver(frames[pushed]);
+        pushed += 1;
+      }
+      return pushed;
+    },
+    frameCount: () => frames.length,
+  };
+}
+
+// ── T23 会话内切模型(唯一入口)──────────────────────────────────────────────
+//
+// ModelSelector 是会话内换模型的唯一入口,候选项是 Radix DropdownMenuItem —— 而
+// 2026-07-18 附件事故的根因类别正是"菜单项在受信点击派发过程中被同步卸载,杀死
+// post-dispatch 副作用",对**任何** DropdownMenuItem 内的副作用都成立。jsdom 的
+// fireEvent 不走 Radix 的 pointerdown→pointerup→select 真实序列,这一类物理上测不出。
+//
+// 这里 mount 的是生产组件本体;onSelect 回填 selectedId 与线上 App 的 selectModel
+// 同构(用户可见事实 = 点完之后顶栏显示的就是新模型)。
+const MODEL_MARKERS = {
+  current: "MODEL_CURRENT_ALPHA",
+  target: "MODEL_TARGET_BETA",
+  degraded: "MODEL_DEGRADED_GAMMA",
+} as const;
+const MODEL_IDS = { current: "m-alpha", target: "m-beta", degraded: "m-gamma" } as const;
+window.__modelFixture = { markers: { ...MODEL_MARKERS }, ids: { ...MODEL_IDS } };
+
+function ModelSelectorProbe() {
+  const [selectedId, setSelectedId] = useState<string>(MODEL_IDS.current);
+  return (
+    <ModelSelector
+      models={[
+        { id: MODEL_IDS.current, display_name: MODEL_MARKERS.current },
+        { id: MODEL_IDS.target, display_name: MODEL_MARKERS.target },
+        { id: MODEL_IDS.degraded, display_name: MODEL_MARKERS.degraded, degraded: true },
+      ]}
+      selectedId={selectedId}
+      onSelect={(id) => {
+        window.__modelPicks.push(id);
+        setSelectedId(id);
+      }}
+    />
+  );
+}
+
+createRoot(document.getElementById("model-selector-root")!).render(
+  <StrictMode><ModelSelectorProbe /></StrictMode>,
+);
+
+// ── T24 markdown 富块(mermaid)────────────────────────────────────────────────
+//
+// 助手回复 99% 经 markdown,而 MarkdownImpl 里 ```mermaid 走的是完全独立的分支
+// (dynamic import → parse → render → dangerouslySetInnerHTML)。它此前**零测试**:
+// jsdom 没有 SVG 布局,mermaid 在那里既画不出图也量不了,只能在真浏览器里证明。
+// 两个用户可见事实:①语法有效 → 真出图;②流式半截/语法错 → 回退可读源码,
+// 既不白屏、也不留"渲染中"占位、更不把 mermaid 的错误图注入 <body>。
+const MERMAID_OK = ["```mermaid", "graph TD; MERMAIDOKSTART-->MERMAIDOKEND;", "```"].join("\n");
+const MERMAID_BROKEN = ["```mermaid", "MERMAIDBROKENSOURCE {{{ not a diagram", "```"].join("\n");
+
+createRoot(document.getElementById("markdown-rich-root")!).render(
+  <StrictMode>
+    <div data-testid="mermaid-ok"><Markdown>{MERMAID_OK}</Markdown></div>
+    <div data-testid="mermaid-broken"><Markdown>{MERMAID_BROKEN}</Markdown></div>
+  </StrictMode>,
 );

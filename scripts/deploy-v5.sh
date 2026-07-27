@@ -448,9 +448,11 @@ install_v5_host_monitor() {
   echo "══ v5 host monitor bundle 原子安装(A/B 独立)══"
   local local_stage remote_stage monitor_sha rc=0
   local_stage="$(mktemp -d "${TMPDIR:-/tmp}/oc-v5-monitor-stage.XXXXXX")" || return 1
-  for file in scripts/v5-monitor.sh scripts/v5-alert-fail.sh scripts/v5-alert-fanout.sql \
+  for file in scripts/v5-monitor.sh scripts/v5-daily-check.sh \
+    scripts/v5-alert-fail.sh scripts/v5-alert-fanout.sql \
     scripts/v5-monitor-host-install-remote.sh \
     deploy/v5/openclaude-v5-monitor.service deploy/v5/openclaude-v5-monitor.timer \
+    deploy/v5/openclaude-v5-daily.service deploy/v5/openclaude-v5-daily.timer \
     deploy/v5/openclaude-v5-alert-fail@.service; do
     [[ -f "$REPO_ROOT/$file" ]] || {
       echo "✗ monitor bundle 缺文件:$file" >&2
@@ -459,14 +461,16 @@ install_v5_host_monitor() {
     }
     cp -a -- "$REPO_ROOT/$file" "$local_stage/$(basename "$file")"
   done
-  chmod 0755 "$local_stage/v5-monitor.sh" "$local_stage/v5-alert-fail.sh" \
+  chmod 0755 "$local_stage/v5-monitor.sh" "$local_stage/v5-daily-check.sh" \
+    "$local_stage/v5-alert-fail.sh" \
     "$local_stage/v5-monitor-host-install-remote.sh"
   chmod 0644 "$local_stage/v5-alert-fanout.sql" "$local_stage"/*.service "$local_stage"/*.timer
   (
     cd "$local_stage"
-    sha256sum v5-monitor.sh v5-alert-fail.sh v5-alert-fanout.sql \
+    sha256sum v5-monitor.sh v5-daily-check.sh v5-alert-fail.sh v5-alert-fanout.sql \
       v5-monitor-host-install-remote.sh \
       openclaude-v5-monitor.service openclaude-v5-monitor.timer \
+      openclaude-v5-daily.service openclaude-v5-daily.timer \
       openclaude-v5-alert-fail@.service > SHA256SUMS
   )
   monitor_sha="$(sha256sum "$local_stage/SHA256SUMS" | awk '{print $1}')"
@@ -474,7 +478,7 @@ install_v5_host_monitor() {
 
   if [[ "$DRY" == 1 ]]; then
     echo "  [dry-run] ship monitor-$monitor_sha → $KL_HOST:$V5_MONITOR_ROOT/releases/monitor-$monitor_sha"
-    echo "  [dry-run] stop+drain timer/monitor/alert-fail → exact pool-state migration → atomically install current+units → live oneshot → restore timer"
+    echo "  [dry-run] stop monitor+daily timers，等待 oneshot/alert-fail 自然排空 → exact pool-state migration → atomically install current+units → live monitor oneshot → restore both timers"
     rm -rf -- "$local_stage"
     return 0
   fi

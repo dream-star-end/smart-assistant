@@ -11,6 +11,8 @@ release="$root/releases/monitor-$bundle_sha"
 current="$root/current"
 monitor_unit=openclaude-v5-monitor.service
 timer_unit=openclaude-v5-monitor.timer
+daily_unit=openclaude-v5-daily.service
+daily_timer_unit=openclaude-v5-daily.timer
 alert_unit='openclaude-v5-alert-fail@.service'
 env_file="${OC_V5_MONITOR_ENV:-/etc/openclaude/commercial-v5.env}"
 systemd_dir="${OC_V5_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -20,10 +22,13 @@ backup="$(mktemp -d "$backup_root/.monitor-backup.XXXXXX")"
 timer_restore_armed=0
 surface_rollback_armed=0
 timer_was_active=0
+daily_timer_was_active=0
 state_existed=0
 current_existed=0
 monitor_unit_existed=0
 timer_unit_existed=0
+daily_unit_existed=0
+daily_timer_unit_existed=0
 alert_unit_existed=0
 
 monitor_counts() {
@@ -47,8 +52,9 @@ wait_monitor_surface_quiet() {
   for _ in $(seq 1 "$drain_attempts"); do
     busy=0
     systemctl is-active --quiet "$monitor_unit" && busy=1
+    systemctl is-active --quiet "$daily_unit" && busy=1
     systemctl list-jobs --no-legend --no-pager 2>/dev/null \
-      | grep -Eq 'openclaude-v5-(monitor|alert-fail@).*\.service' && busy=1
+      | grep -Eq 'openclaude-v5-(monitor|daily|alert-fail@).*\.service' && busy=1
     systemctl list-units 'openclaude-v5-alert-fail@*.service' --all --no-legend --no-pager 2>/dev/null \
       | awk '$3 ~ /^(activating|active|deactivating)$/ { found=1 } END { exit found ? 0 : 1 }' && busy=1
     if [[ "$busy" == 0 ]]; then stable=$((stable + 1)); else stable=0; fi
@@ -61,9 +67,11 @@ wait_monitor_surface_quiet() {
 stop_and_wait_monitor_surface() {
   local unit stable=0 busy
   systemctl stop "$timer_unit" >/dev/null 2>&1 || return 1
+  systemctl stop "$daily_timer_unit" >/dev/null 2>&1 || return 1
   systemctl stop "$monitor_unit" >/dev/null 2>&1 || return 1
-  # OnFailure 可能在 monitor start 返回失败后才排队。循环停止当前可见的 job/实例，
-  # 再要求连续两次完全静止，避免它跨 current/unit/state 回切继续写通知。
+  # daily 分阶段写 outbox/inbox/log，绝不强停；只停止 timer 并等待已有 oneshot 自然结束。
+  # OnFailure 可能在 monitor start 返回失败后才排队。循环停止当前可见的 monitor /
+  # alert-fail job/实例，再要求连续两次完全静止。
   for _ in $(seq 1 "$drain_attempts"); do
     while IFS= read -r unit; do
       [[ -n "$unit" ]] && systemctl stop "$unit" >/dev/null 2>&1 || true
@@ -75,8 +83,9 @@ stop_and_wait_monitor_surface() {
       | awk '$3 ~ /^(activating|active|deactivating)$/ { print $1 }')
     busy=0
     systemctl is-active --quiet "$monitor_unit" && busy=1
+    systemctl is-active --quiet "$daily_unit" && busy=1
     systemctl list-jobs --no-legend --no-pager 2>/dev/null \
-      | grep -Eq 'openclaude-v5-(monitor|alert-fail@).*\.service' && busy=1
+      | grep -Eq 'openclaude-v5-(monitor|daily|alert-fail@).*\.service' && busy=1
     systemctl list-units 'openclaude-v5-alert-fail@*.service' --all --no-legend --no-pager 2>/dev/null \
       | awk '$3 ~ /^(activating|active|deactivating)$/ { found=1 } END { exit found ? 0 : 1 }' && busy=1
     if [[ "$busy" == 0 ]]; then stable=$((stable + 1)); else stable=0; fi
@@ -87,9 +96,16 @@ stop_and_wait_monitor_surface() {
 }
 
 restore_timer_only() {
-  [[ "$timer_was_active" == 1 ]] || return 0
-  systemctl start "$timer_unit" >/dev/null 2>&1 || return 1
-  systemctl is-active --quiet "$timer_unit" || return 1
+  local rc=0
+  if [[ "$timer_was_active" == 1 ]]; then
+    systemctl start "$timer_unit" >/dev/null 2>&1 || rc=1
+    systemctl is-active --quiet "$timer_unit" || rc=1
+  fi
+  if [[ "$daily_timer_was_active" == 1 ]]; then
+    systemctl start "$daily_timer_unit" >/dev/null 2>&1 || rc=1
+    systemctl is-active --quiet "$daily_timer_unit" || rc=1
+  fi
+  return "$rc"
 }
 
 restore_unit_file() { # <unit> <existed-flag>
@@ -106,6 +122,8 @@ restore_previous() {
   stop_and_wait_monitor_surface || return 1
   restore_unit_file "$monitor_unit" "$monitor_unit_existed" || return 1
   restore_unit_file "$timer_unit" "$timer_unit_existed" || return 1
+  restore_unit_file "$daily_unit" "$daily_unit_existed" || return 1
+  restore_unit_file "$daily_timer_unit" "$daily_timer_unit_existed" || return 1
   restore_unit_file "$alert_unit" "$alert_unit_existed" || return 1
   if [[ "$current_existed" == 1 ]]; then
     ln -s -- "$(cat "$backup/current-target")" "$root/.current.restore.$$" || return 1
@@ -146,32 +164,47 @@ trap 'exit 129' HUP
 (cd "$stage" && sha256sum -c SHA256SUMS)
 [[ "$(sha256sum "$stage/SHA256SUMS" | awk '{print $1}')" == "$bundle_sha" ]] \
   || { echo "FATAL:monitor bundle identity 与 SHA256SUMS 不一致" >&2; exit 1; }
-bash -n "$stage/v5-monitor.sh" "$stage/v5-alert-fail.sh"
+bash -n "$stage/v5-monitor.sh" "$stage/v5-daily-check.sh" "$stage/v5-alert-fail.sh"
 grep -Fqx 'WorkingDirectory=/opt/openclaude/v5-monitor/current' "$stage/$monitor_unit"
 grep -Fqx 'ExecStart=/usr/bin/flock --shared --nonblock --conflict-exit-code 0 /run/openclaude-v5/production-mutation.lock /usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh' "$stage/$monitor_unit"
+grep -Fqx 'WorkingDirectory=/opt/openclaude/v5-monitor/current' "$stage/$daily_unit"
+grep -Fqx 'ExecStart=/usr/bin/bash /opt/openclaude/v5-monitor/current/v5-daily-check.sh' "$stage/$daily_unit"
 grep -Fqx 'WorkingDirectory=/opt/openclaude/v5-monitor/current' "$stage/$alert_unit"
 grep -Fqx 'ExecStart=/usr/bin/bash /opt/openclaude/v5-monitor/current/v5-alert-fail.sh %i' "$stage/$alert_unit"
-systemd-analyze verify "$stage/$monitor_unit" "$stage/$timer_unit" "$stage/$alert_unit"
+systemd-analyze verify "$stage/$monitor_unit" "$stage/$timer_unit" \
+  "$stage/$daily_unit" "$stage/$daily_timer_unit" "$stage/$alert_unit"
 
 systemctl is-active --quiet "$timer_unit" && timer_was_active=1
+systemctl is-active --quiet "$daily_timer_unit" && daily_timer_was_active=1
 [[ "$timer_was_active" == 1 ]] || { echo "FATAL:$timer_unit 原本未 active，拒绝把既有监控停摆伪装成安装成功" >&2; exit 1; }
+[[ "$daily_timer_was_active" == 1 ]] || { echo "FATAL:$daily_timer_unit 原本未 active，拒绝把既有日报停摆伪装成安装成功" >&2; exit 1; }
 timer_restore_armed=1
 systemctl stop "$timer_unit" >/dev/null 2>&1 \
   || { echo "FATAL:$timer_unit stop 失败" >&2; exit 1; }
+systemctl stop "$daily_timer_unit" >/dev/null 2>&1 \
+  || { echo "FATAL:$daily_timer_unit stop 失败" >&2; exit 1; }
 timer_stopped=0
+daily_timer_stopped=0
 for _ in $(seq 1 "$drain_attempts"); do
   if ! systemctl is-active --quiet "$timer_unit"; then timer_stopped=1; break; fi
   sleep "$drain_sleep"
 done
 [[ "$timer_stopped" == 1 ]] || { echo "FATAL:$timer_unit stop 后仍 active/activating" >&2; exit 1; }
+for _ in $(seq 1 "$drain_attempts"); do
+  if ! systemctl is-active --quiet "$daily_timer_unit"; then daily_timer_stopped=1; break; fi
+  sleep "$drain_sleep"
+done
+[[ "$daily_timer_stopped" == 1 ]] || { echo "FATAL:$daily_timer_unit stop 后仍 active/activating" >&2; exit 1; }
 
-# timer 停止后同时排空 monitor oneshot、排队 job 与它可能拉起的 alert-fail 实例。
+# timers 停止后同时等待 monitor/daily oneshot、排队 job 与 alert-fail 实例自然排空。
 wait_monitor_surface_quiet \
-  || { echo "FATAL:monitor/alert-fail 在有界等待内未排空" >&2; exit 1; }
+  || { echo "FATAL:monitor/daily/alert-fail 在有界等待内未排空" >&2; exit 1; }
 
 install -d -m 0755 "$root" "$root/releases"
 if [[ -f "$systemd_dir/$monitor_unit" ]]; then cp -a -- "$systemd_dir/$monitor_unit" "$backup/$monitor_unit"; monitor_unit_existed=1; fi
 if [[ -f "$systemd_dir/$timer_unit" ]]; then cp -a -- "$systemd_dir/$timer_unit" "$backup/$timer_unit"; timer_unit_existed=1; fi
+if [[ -f "$systemd_dir/$daily_unit" ]]; then cp -a -- "$systemd_dir/$daily_unit" "$backup/$daily_unit"; daily_unit_existed=1; fi
+if [[ -f "$systemd_dir/$daily_timer_unit" ]]; then cp -a -- "$systemd_dir/$daily_timer_unit" "$backup/$daily_timer_unit"; daily_timer_unit_existed=1; fi
 if [[ -f "$systemd_dir/$alert_unit" ]]; then cp -a -- "$systemd_dir/$alert_unit" "$backup/$alert_unit"; alert_unit_existed=1; fi
 if [[ -L "$current" ]]; then readlink "$current" > "$backup/current-target"; current_existed=1; elif [[ -e "$current" ]]; then echo "FATAL:$current 不是 symlink" >&2; exit 1; fi
 if [[ -L "$state_file" || ( -e "$state_file" && ! -f "$state_file" ) ]]; then echo "FATAL:monitor state 不是可信普通文件" >&2; exit 1; fi
@@ -251,10 +284,12 @@ if [[ -e "$release" && ( ! -d "$release" || -L "$release" ) ]]; then echo "FATAL
 if [[ ! -d "$release" ]]; then
   release_tmp="$root/releases/.monitor-$bundle_sha.$$"
   install -d -m 0755 "$release_tmp"
-  install -m 0755 "$stage/v5-monitor.sh" "$stage/v5-alert-fail.sh" \
+  install -m 0755 "$stage/v5-monitor.sh" "$stage/v5-daily-check.sh" \
+    "$stage/v5-alert-fail.sh" \
     "$stage/v5-monitor-host-install-remote.sh" "$release_tmp/"
   install -m 0644 "$stage/v5-alert-fanout.sql" "$stage/SHA256SUMS" \
-    "$stage/$monitor_unit" "$stage/$timer_unit" "$stage/$alert_unit" "$release_tmp/"
+    "$stage/$monitor_unit" "$stage/$timer_unit" \
+    "$stage/$daily_unit" "$stage/$daily_timer_unit" "$stage/$alert_unit" "$release_tmp/"
   chown -R root:root "$release_tmp"
   mv -- "$release_tmp" "$release"
 fi
@@ -263,9 +298,13 @@ ln -s -- "releases/monitor-$bundle_sha" "$root/.current.new.$$"
 mv -Tf -- "$root/.current.new.$$" "$current"
 install -m 0644 "$stage/$monitor_unit" "$systemd_dir/.$monitor_unit.new.$$"
 install -m 0644 "$stage/$timer_unit" "$systemd_dir/.$timer_unit.new.$$"
+install -m 0644 "$stage/$daily_unit" "$systemd_dir/.$daily_unit.new.$$"
+install -m 0644 "$stage/$daily_timer_unit" "$systemd_dir/.$daily_timer_unit.new.$$"
 install -m 0644 "$stage/$alert_unit" "$systemd_dir/.$alert_unit.new.$$"
 mv -f -- "$systemd_dir/.$monitor_unit.new.$$" "$systemd_dir/$monitor_unit"
 mv -f -- "$systemd_dir/.$timer_unit.new.$$" "$systemd_dir/$timer_unit"
+mv -f -- "$systemd_dir/.$daily_unit.new.$$" "$systemd_dir/$daily_unit"
+mv -f -- "$systemd_dir/.$daily_timer_unit.new.$$" "$systemd_dir/$daily_timer_unit"
 mv -f -- "$systemd_dir/.$alert_unit.new.$$" "$systemd_dir/$alert_unit"
 systemctl daemon-reload
 systemctl start "$monitor_unit"
@@ -282,4 +321,4 @@ restore_timer_only
 surface_rollback_armed=0
 timer_restore_armed=0
 echo "$(TZ=Asia/Shanghai date '+%F %T') INSTALL-OK host monitor bundle=$bundle_sha" >> "$monitor_log"
-echo "✓ host monitor bundle=$bundle_sha current=$release timer_restored=$timer_was_active"
+echo "✓ host monitor bundle=$bundle_sha current=$release timers_restored=monitor:$timer_was_active,daily:$daily_timer_was_active"

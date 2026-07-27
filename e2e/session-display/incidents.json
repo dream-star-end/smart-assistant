@@ -664,6 +664,24 @@
           "assertion": "Codex context overflow visibly rebuilds a smaller exact history suffix without backoff"
         }
       ]
+    },
+    {
+      "id": "INC-20260726-ARCHIVE-CURSOR-OVERFLOW",
+      "occurredAt": "2026-07-26",
+      "severity": "P0",
+      "symptom": "内容大半已 spill 到归档、热行只剩 anchor 的长会话首次打开即 500:首页无 cursor → beforeOrderSeq=Number.MAX_SAFE_INTEGER 被绑进 `WHERE first_seq < $3`,而该列是 integer → PG 22003 integer out of range。紧邻的 last_seq 已有 ::bigint,$3 漏了。既有 spill 用例全用 limit=10、热行即可填满,从不进归档循环,所以一直没被发现。",
+      "rootFixCommit": "c5031461",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "归档会话首页 timeline 不因 MAX_SAFE_INTEGER 游标而炸(22003 回归)"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归锁目前只到 integration 层(真 PG 复现首页 22003)。活体证明需要一个内容大半已 spill、热行只剩 anchor 的长会话——e2e 的 v5-evals 账号每条用例结束即删会话,凑不出这种形态;seedPagedArchivedSession 已具备直写 PG 的能力但刻意未 seed archive chunks(见 lib/seed.ts 注释)。补活体证据 = 扩 seed 造真实 spill 后走 UI 打开该会话。",
+        "since": "2026-07-26"
+      }
     }
   ]
 }

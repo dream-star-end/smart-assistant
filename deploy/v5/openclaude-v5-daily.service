@@ -2,7 +2,7 @@
 # openclaude-v5-daily.timer 触发 scripts/v5-daily-check.sh:计费突增/免单率/
 # 活跃度/错误日志统计,无告警也发一条日报站内信给 boss。
 # 自监(方案 §2.3-3):脚本自身崩/超时/非 0 退出时,OnFailure 拉起 alert-fail 模板,
-# 对本单元做 outbox+inbox 双写告警。依赖 openclaude-v5-alert-fail@.service 已手动安装。
+# 对本单元做 outbox+inbox 双写告警；脚本与依赖 unit 由官方 --install-monitor 同包安装。
 [Unit]
 Description=OpenClaude v5 daily check (billing anomalies + daily report)
 After=network.target postgresql.service
@@ -12,7 +12,7 @@ OnFailure=openclaude-v5-alert-fail@%n.service
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/opt/openclaude/openclaude-v5
+WorkingDirectory=/opt/openclaude/v5-monitor/current
 Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/usr/bin/bash scripts/v5-daily-check.sh
+ExecStart=/usr/bin/bash /opt/openclaude/v5-monitor/current/v5-daily-check.sh
 TimeoutStartSec=300
