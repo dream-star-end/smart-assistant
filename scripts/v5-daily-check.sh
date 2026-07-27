@@ -104,6 +104,7 @@ HOSTFQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
 # 建库至今在 admin_alert_outbox **0 行** —— 推送侧从来没有过一次"监控还活着"的心跳,
 # 而日志天天显示成功。FANOUT_LAST_TARGETS 供调用方把这个事实写进日报正文。
 FANOUT_LAST_TARGETS=""
+FANOUT_DAILY_REPORT_TARGETS=""
 fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_json>
   FANOUT_LAST_TARGETS=""
   if [ "$DRY_RUN" = 1 ]; then log "FANOUT[dry] $1 sev=$2 dedupe=$3"; return 0; fi
@@ -390,6 +391,7 @@ fanout_daily() {
     "$BODY" \
     "$(jq -nc --arg d "$REPORT_DATE" --arg n "${#ALERTS[@]}" --arg h "$HOSTFQDN" \
          '{source:"v5-daily",report_date:$d,alerts_count:($n|tonumber),host:$h,kind:"report"}')"
+  FANOUT_DAILY_REPORT_TARGETS="$FANOUT_LAST_TARGETS"
   if [ "${#ALERTS[@]}" -gt 0 ]; then
     local anom="v5 日检异常(${REPORT_DATE},北京时间自然日):"$'\n'
     for a in "${ALERTS[@]}"; do anom+="- ⚠️ $a"$'\n'; done
@@ -410,7 +412,7 @@ fanout_daily
 # 这里刻意只做"如实陈述",不把心跳升级成 warning —— 把常规日报伪装成告警会训练值班
 # 忽略 warning,代价比收益大。真正的修法是给至少一个通道配 severity_min='info'
 # (运维动作,见 docs/V5_MONITORING.md);配好后本行自动消失。
-if [ "${FANOUT_LAST_TARGETS:-}" = 0 ]; then
+if [ "${FANOUT_DAILY_REPORT_TARGETS:-}" = 0 ]; then
   BODY+=$'\n'"> ⚠️ 心跳未推送:本条日报(info)匹配到 **0** 个可投递通道 —— 推送侧没有任何正向心跳,监控整体死亡时无法靠\"心跳缺失\"察觉。修法:给一个 admin_alert_channels 通道配 severity_min='info'(见 docs/V5_MONITORING.md)。"$'\n'
   BODY="$(echo "$BODY" | head -c 16000 | iconv -f UTF-8 -t UTF-8 -c)"
   log "HEARTBEAT-NOT-PUSHED ops.daily_report 匹配 0 个通道(已写入日报正文)"

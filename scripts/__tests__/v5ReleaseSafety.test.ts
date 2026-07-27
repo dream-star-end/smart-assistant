@@ -28,6 +28,7 @@ const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
 const releaseQueue = path.join(root, 'scripts/v5-release-queue.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
+const dailyCheck = path.join(root, 'scripts/v5-daily-check.sh')
 const monitorHostInstaller = path.join(root, 'scripts/v5-monitor-host-install-remote.sh')
 const monitorService = path.join(root, 'deploy/v5/openclaude-v5-monitor.service')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
@@ -4378,6 +4379,50 @@ interface MonitorFixtureOptions {
   dockerRows?: string[]
   dockerPsFails?: boolean
 }
+
+describe('v5 daily report fanout accounting', () => {
+  test('anomaly fanout cannot hide a zero-target daily heartbeat', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-daily-fanout-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    const log = path.join(dir, 'daily.log')
+    const calls = path.join(dir, 'psql-calls')
+    const envFile = path.join(dir, 'commercial-v5.env')
+    await mkdir(bin)
+    await writeFile(envFile, 'DATABASE_URL=postgres://fixture\n')
+    await writeFile(path.join(bin, 'psql'), `#!/bin/sh
+printf '%s\\n' "$*" >>"$PSQL_CALLS"
+case "$*" in
+  *"event_type=ops.daily_report"*) cat >/dev/null; echo "fanout targets=0 inserted=0 suppressed=0" ;;
+  *"event_type=ops.daily_anomaly"*) cat >/dev/null; echo "fanout targets=1 inserted=1 suppressed=0" ;;
+  *) cat >/dev/null ;;
+esac
+`)
+    await writeFile(path.join(bin, 'sqlite3'), '#!/bin/sh\necho "0|0"\n')
+    await chmod(path.join(bin, 'psql'), 0o755)
+    await chmod(path.join(bin, 'sqlite3'), 0o755)
+
+    const result = run(dailyCheck, [], {
+      PATH: `${bin}:${process.env.PATH}`,
+      PSQL_CALLS: calls,
+      V5DAY_ENV_FILE: envFile,
+      V5DAY_LOG_FILE: log,
+      V5DAY_SESSIONS_DB: path.join(dir, 'sessions.db'),
+      V5DAY_V5_LOG: path.join(dir, 'v5.log'),
+      V5DAY_V5_LOG_YDAY: path.join(dir, 'v5.log.1'),
+      V5DAY_FANOUT_SQL: path.join(root, 'scripts/v5-alert-fanout.sql'),
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const [logText, psqlCalls] = await Promise.all([
+      readFile(log, 'utf8'),
+      readFile(calls, 'utf8'),
+    ])
+    assert.match(logText, /FANOUT-ZERO ops\.daily_report sev=info/)
+    assert.match(logText, /FANOUT-OK ops\.daily_anomaly sev=warning targets=1 inserted=1/)
+    assert.match(logText, /HEARTBEAT-NOT-PUSHED ops\.daily_report 匹配 0 个通道/)
+    assert.match(psqlCalls, /心跳未推送:本条日报\(info\)匹配到 \*\*0\*\* 个可投递通道/)
+  })
+})
 
 function schema1Marker(overrides: Record<string, unknown> = {}) {
   return {
