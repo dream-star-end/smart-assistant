@@ -1189,6 +1189,433 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("browser Stop uses one engine-confirmed USER_CANCELLED terminal tape", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const dispatchId = "11111111-1111-4111-8111-111111111111";
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial answer before Stop");
+          startedResolve();
+        });
+      });
+      let interruptCalls = 0;
+      runner.interrupt = () => {
+        interruptCalls += 1;
+        setImmediate(() => {
+          session.runner.emit("billing", {
+            requestId: "req-unit",
+            engineSessionId: `oceng-${"d".repeat(48)}`,
+            status: "error",
+            terminalCode: "USER_CANCELLED",
+            durationMs: 123,
+            usage: { input_tokens: 7, output_tokens: 3 },
+          });
+          runner.result({
+            is_error: true,
+            result: "codex turn interrupted",
+            stop_reason: "interrupted",
+            usage: { input_tokens: 7, output_tokens: 3 },
+          });
+        });
+        return false;
+      };
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-confirmed",
+          dispatchId,
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey), true, "repeat Stop remains idempotent");
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls, 1, "one logical Stop sends one cooperative interrupt");
+      assert.equal(captured.payloads.length, 1, "one logical turn writes one terminal tape");
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.text, "partial answer before Stop");
+      assert.equal(payload.dispatchId, dispatchId);
+      assert.equal(payload.attemptNo, 1);
+      assert.deepEqual(payload.usage, {
+        inputTokens: 7,
+        outputTokens: 3,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 10,
+        turn: 1,
+      });
+      assert.equal(payload.engineBilling?.terminalCode, "USER_CANCELLED");
+      assert.equal(
+        payload.runtimeEvents?.filter((event) => {
+          const terminal = event.payload as { type?: unknown; code?: unknown };
+          return terminal.type === "terminal_error" && terminal.code === "USER_CANCELLED";
+        }).length,
+        1,
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop racing a natural end_turn keeps the single completed tape", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("answer at completion boundary");
+          startedResolve();
+        });
+      });
+      let interruptCalls = 0;
+      runner.interrupt = () => {
+        interruptCalls += 1;
+        setImmediate(() => {
+          runner.result({
+            stop_reason: "end_turn",
+            usage: { input_tokens: 4, output_tokens: 2 },
+          });
+        });
+        return true;
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls, 1);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.equal(captured.payloads[0]!.errorCode, undefined);
+      assert.equal(captured.payloads[0]!.text, "answer at completion boundary");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop escalation maps a forced generic error to USER_CANCELLED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const events: SessionStreamEvent[] = [];
+      const dispatchId = "33333333-3333-4333-8333-333333333333";
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial output before forced shutdown");
+          startedResolve();
+        });
+      });
+      let interruptCalls = 0;
+      runner.interrupt = () => {
+        interruptCalls += 1;
+        return false;
+      };
+      let shutdownCalls = 0;
+      runner.shutdown = async () => {
+        shutdownCalls += 1;
+        session.runner.emit("billing", {
+          requestId: "req-unit",
+          engineSessionId: `oceng-${"f".repeat(48)}`,
+          status: "error",
+          terminalCode: "CODEX_ERROR",
+          durationMs: 5_001,
+          usage: { input_tokens: 11, output_tokens: 5 },
+        });
+        runner.result({
+          is_error: true,
+          result: "codex app-server exited code=0 signal=",
+          usage: { input_tokens: 11, output_tokens: 5 },
+        });
+      };
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-forced-error",
+          dispatchId,
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls, 1);
+      assert.equal(shutdownCalls, 1);
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.text, "partial output before forced shutdown");
+      assert.equal(payload.dispatchId, dispatchId);
+      assert.equal(payload.attemptNo, 1);
+      assert.deepEqual(payload.usage, {
+        inputTokens: 11,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 16,
+        turn: 1,
+      });
+      assert.equal(payload.engineBilling?.terminalCode, "USER_CANCELLED");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop escalation still preserves a late natural end_turn", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("answer at the escalation boundary");
+          startedResolve();
+        });
+      });
+      let interruptCalls = 0;
+      runner.interrupt = () => {
+        interruptCalls += 1;
+        return false;
+      };
+      let shutdownCalls = 0;
+      runner.shutdown = async () => {
+        shutdownCalls += 1;
+        runner.result({
+          stop_reason: "end_turn",
+          usage: { input_tokens: 6, output_tokens: 3 },
+        });
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls, 1);
+      assert.equal(shutdownCalls, 1);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.equal(captured.payloads[0]!.errorCode, undefined);
+      assert.equal(captured.payloads[0]!.text, "answer at the escalation boundary");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop escalation does not hide a late unrelated engine error", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial output before an unrelated failure");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => false;
+      runner.shutdown = async () => {
+        session.runner.emit("billing", {
+          requestId: "req-unit",
+          engineSessionId: `oceng-${"e".repeat(48)}`,
+          status: "error",
+          terminalCode: "CODEX_ERROR",
+          durationMs: 5_001,
+          usage: { input_tokens: 8, output_tokens: 2 },
+        });
+        runner.result({
+          is_error: true,
+          result: "unrelated provider failure",
+          usage: { input_tokens: 8, output_tokens: 2 },
+        });
+      };
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.equal(captured.payloads[0]!.errorCode, "ENGINE_ERROR");
+      assert.equal(
+        captured.payloads[0]!.errorDetail,
+        '{"result":"unrelated provider failure"}',
+      );
+      assert.equal(captured.payloads[0]!.engineBilling?.terminalCode, "CODEX_ERROR");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop fallback kills and persists partial usage with dispatch identity", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const dispatchId = "22222222-2222-4222-8222-222222222222";
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial output before fallback");
+          startedResolve();
+        });
+      });
+      let interruptCalls = 0;
+      runner.interrupt = () => {
+        interruptCalls += 1;
+        return false;
+      };
+      let shutdownCalls = 0;
+      runner.shutdown = async () => {
+        shutdownCalls += 1;
+        session.runner.emit("billing", {
+          requestId: "req-unit",
+          engineSessionId: `oceng-${"e".repeat(48)}`,
+          status: "error",
+          terminalCode: "CODEX_ERROR",
+          durationMs: 5_001,
+          usage: { input_tokens: 9, output_tokens: 4 },
+        });
+      };
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-fallback",
+          dispatchId,
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls, 1);
+      assert.equal(shutdownCalls, 1);
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.text, "partial output before fallback");
+      assert.equal(payload.dispatchId, dispatchId);
+      assert.equal(payload.attemptNo, 1);
+      assert.deepEqual(payload.usage, {
+        inputTokens: 9,
+        outputTokens: 4,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 13,
+        turn: 1,
+      });
+      assert.equal(payload.engineBilling?.terminalCode, "USER_CANCELLED");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   for (const [status, exit, expectedReason] of [
     ["crashed", { code: 1, signal: null, crashed: true }, "code 1"],
     ["interrupted", { code: null, signal: "SIGTERM", crashed: true }, "SIGTERM"],

@@ -18,7 +18,7 @@ export interface EventMeta {
   /** 事件默认严重度(enqueue 时一般用这个,个别场景可覆盖) */
   severity: Severity;
   /** 人类可读分组,前端按此排列 */
-  group: "account_pool" | "payment" | "container" | "risk" | "health" | "security" | "system" | "ops";
+  group: "account_pool" | "payment" | "billing" | "container" | "risk" | "health" | "security" | "system" | "ops";
   /** 简短描述,UI tooltip */
   description: string;
   /** 触发方式:polled=轮询 scheduler;passive=代码路径被动 enqueue;both=两者都有 */
@@ -49,6 +49,12 @@ export const EVENTS = {
   PAYMENT_CALLBACK_SIGNATURE_INVALID: "payment.callback_signature_invalid",
   PAYMENT_CALLBACK_CONFLICT: "payment.callback_conflict",
   PAYMENT_CALLBACK_TAMPERED: "payment.callback_tampered",
+
+  // ── 计费对账(4;每日只读探针)──────────────────────────────
+  BILLING_WALLET_DRIFT: "billing.wallet_drift",
+  BILLING_PERIOD_DRIFT: "billing.period_drift",
+  BILLING_USAGE_LEDGER_GAP: "billing.usage_ledger_gap",
+  BILLING_CLAMP_SPIKE: "billing.clamp_spike",
 
   // ── 容器(2 个已 wire)──────────────────────────────────────
   CONTAINER_PROVISION_FAILED: "container.provision_failed",
@@ -119,6 +125,16 @@ export const EVENT_META: EventMeta[] = [
     description: "回调状态与订单冲突(重复支付 / 过期订单被标 paid 等)", trigger: "passive" },
   { event_type: EVENTS.PAYMENT_CALLBACK_TAMPERED, severity: "critical", group: "payment",
     description: "回调 payload 字段与订单不匹配(total_fee / appid 被篡改)", trigger: "passive" },
+
+  // billing
+  { event_type: EVENTS.BILLING_WALLET_DRIFT, severity: "critical", group: "billing",
+    description: "用户钱包余额与 wallet 流水累计值不一致(每日对账)", trigger: "polled" },
+  { event_type: EVENTS.BILLING_PERIOD_DRIFT, severity: "critical", group: "billing",
+    description: "active 个人订阅期内余额与 period 流水累计值不一致(每日对账)", trigger: "polled" },
+  { event_type: EVENTS.BILLING_USAGE_LEDGER_GAP, severity: "critical", group: "billing",
+    description: "非 clamp 成功用量与扣费流水不一致,或有输出的完成卷缺用量记录(每日对账)", trigger: "polled" },
+  { event_type: EVENTS.BILLING_CLAMP_SPIKE, severity: "warning", group: "billing",
+    description: "过去 24 小时余额不足 clamp 笔数或未收积分超过观测阈值", trigger: "polled" },
 
   // container
   { event_type: EVENTS.CONTAINER_PROVISION_FAILED, severity: "critical", group: "container",

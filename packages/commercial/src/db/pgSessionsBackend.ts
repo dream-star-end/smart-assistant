@@ -4383,7 +4383,7 @@ async function readUnifiedTimelineOuterCandidates(
       await client.query<{ messages: string; last_seq: string }>(
         `SELECT messages,last_seq::text
            FROM client_session_archive_chunks
-          WHERE session_id=$1 AND user_id=$2 AND first_seq < $3
+          WHERE session_id=$1 AND user_id=$2 AND first_seq < $3::bigint
             AND ($4::bigint IS NULL OR last_seq < $4)
           ORDER BY last_seq DESC
           LIMIT 4`,
@@ -7916,7 +7916,7 @@ export function createPgSessionsBackend(
         const chunkRows = (
           await pool.query<{ messages: string; last_seq: string }>(
             `SELECT messages, last_seq FROM client_session_archive_chunks
-               WHERE session_id = $1 AND user_id = $2 AND first_seq < $3
+               WHERE session_id = $1 AND user_id = $2 AND first_seq < $3::bigint
                  AND ($4::bigint IS NULL OR last_seq < $4)
                ORDER BY last_seq DESC
                LIMIT 4`,

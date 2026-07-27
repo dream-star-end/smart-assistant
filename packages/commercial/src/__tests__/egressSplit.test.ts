@@ -9,6 +9,7 @@ import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -289,6 +290,49 @@ describe("internalCostEvent — 秘钥闸", () => {
     assert.deepEqual(applied, ["persist:r1", "broadcast"]);
   });
 
+  test("async broadcast 完成后才 ACK；失败返回 503", async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    const h = makeCostEventHandler({
+      ...deps,
+      broadcastToUser: async () => {
+        entered = true;
+        await blocked;
+      },
+    });
+    const pending = invokeHandler(h, {
+      headers: { [EGRESS_SECRET_HEADER]: "super-secret-egress-key" },
+      body: {
+        events: [{ kind: "broadcast", uid: "7", payload: { type: "outbound.cost_charged" } }],
+      },
+    });
+    while (!entered) await new Promise((resolve) => setTimeout(resolve, 1));
+    const ackedEarly = await Promise.race([
+      pending.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+    assert.equal(ackedEarly, false, "relay 未完成时不得提前 ACK");
+    release();
+    assert.equal((await pending).status, 200);
+
+    const rejected = makeCostEventHandler({
+      ...deps,
+      broadcastToUser: async () => {
+        throw new Error("relay failed");
+      },
+    });
+    const failed = await invokeHandler(rejected, {
+      headers: { [EGRESS_SECRET_HEADER]: "super-secret-egress-key" },
+      body: {
+        events: [{ kind: "broadcast", uid: "7", payload: { type: "outbound.cost_charged" } }],
+      },
+    });
+    assert.equal(failed.status, 503);
+  });
+
   test("persist apply 失败 → 非 2xx,egress 必须保留 durable receipt", async () => {
     const h = makeCostEventHandler({
       secret: "super-secret-egress-key",
@@ -360,6 +404,19 @@ describe("internalCostEvent — 秘钥闸", () => {
     });
     assert.equal(r.status, 400);
   });
+});
+
+test("V5 dual-master cost broadcast 经 slot relay fanout，非 dual-master 保留本地 bridge", () => {
+  const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+  const start = source.indexOf("const costEventHandler: CostEventHandler");
+  const end = source.indexOf("const cronIndexHandler:", start);
+  assert.ok(start >= 0 && end > start);
+  const wiring = source.slice(start, end);
+  assert.match(
+    wiring,
+    /if \(dualMasterEnabled\) \{\s*await slotRelayClient\.broadcastToUsers\(\[uid\.toString\(\)\], payload\);\s*return;\s*\}/,
+  );
+  assert.match(wiring, /bridgeBroadcastRef\.current\(uid, payload\);/);
 });
 
 // ─── forwarder deny-list ────────────────────────────────────────────────────

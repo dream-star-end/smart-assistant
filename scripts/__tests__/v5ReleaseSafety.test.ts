@@ -28,6 +28,7 @@ const baselineGuard = path.join(root, 'scripts/v5-baseline-security.sh')
 const releaseGc = path.join(root, 'scripts/v5-release-gc.sh')
 const releaseQueue = path.join(root, 'scripts/v5-release-queue.sh')
 const monitor = path.join(root, 'scripts/v5-monitor.sh')
+const dailyCheck = path.join(root, 'scripts/v5-daily-check.sh')
 const monitorHostInstaller = path.join(root, 'scripts/v5-monitor-host-install-remote.sh')
 const monitorService = path.join(root, 'deploy/v5/openclaude-v5-monitor.service')
 const caddy = path.join(root, 'scripts/install-v5-upstream-errors.sh')
@@ -4377,7 +4378,53 @@ interface MonitorFixtureOptions {
   healthyHttpPorts?: number[]
   dockerRows?: string[]
   dockerPsFails?: boolean
+  turnWindowStats?: string
+  failedUnits?: string[]
 }
+
+describe('v5 daily report fanout accounting', () => {
+  test('anomaly fanout cannot hide a zero-target daily heartbeat', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-daily-fanout-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    const log = path.join(dir, 'daily.log')
+    const calls = path.join(dir, 'psql-calls')
+    const envFile = path.join(dir, 'commercial-v5.env')
+    await mkdir(bin)
+    await writeFile(envFile, 'DATABASE_URL=postgres://fixture\n')
+    await writeFile(path.join(bin, 'psql'), `#!/bin/sh
+printf '%s\\n' "$*" >>"$PSQL_CALLS"
+case "$*" in
+  *"event_type=ops.daily_report"*) cat >/dev/null; echo "fanout targets=0 inserted=0 suppressed=0" ;;
+  *"event_type=ops.daily_anomaly"*) cat >/dev/null; echo "fanout targets=1 inserted=1 suppressed=0" ;;
+  *) cat >/dev/null ;;
+esac
+`)
+    await writeFile(path.join(bin, 'sqlite3'), '#!/bin/sh\necho "0|0"\n')
+    await chmod(path.join(bin, 'psql'), 0o755)
+    await chmod(path.join(bin, 'sqlite3'), 0o755)
+
+    const result = run(dailyCheck, [], {
+      PATH: `${bin}:${process.env.PATH}`,
+      PSQL_CALLS: calls,
+      V5DAY_ENV_FILE: envFile,
+      V5DAY_LOG_FILE: log,
+      V5DAY_SESSIONS_DB: path.join(dir, 'sessions.db'),
+      V5DAY_V5_LOG: path.join(dir, 'v5.log'),
+      V5DAY_V5_LOG_YDAY: path.join(dir, 'v5.log.1'),
+      V5DAY_FANOUT_SQL: path.join(root, 'scripts/v5-alert-fanout.sql'),
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const [logText, psqlCalls] = await Promise.all([
+      readFile(log, 'utf8'),
+      readFile(calls, 'utf8'),
+    ])
+    assert.match(logText, /FANOUT-ZERO ops\.daily_report sev=info/)
+    assert.match(logText, /FANOUT-OK ops\.daily_anomaly sev=warning targets=1 inserted=1/)
+    assert.match(logText, /HEARTBEAT-NOT-PUSHED ops\.daily_report 匹配 0 个通道/)
+    assert.match(psqlCalls, /心跳未推送:本条日报\(info\)匹配到 \*\*0\*\* 个可投递通道/)
+  })
+})
 
 function schema1Marker(overrides: Record<string, unknown> = {}) {
   return {
@@ -4419,7 +4466,10 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     healthyHttpPorts = allHealthy ? [18790] : [],
     dockerRows = [],
     dockerPsFails = false,
+    turnWindowStats: explicitTurnWindowStats,
+    failedUnits = [],
   } = options
+  const turnWindowStats = explicitTurnWindowStats ?? (allHealthy ? '0|0|0|0' : undefined)
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-')); dirs.push(dir)
   // 夹具内的"健康备份"目录:一个 mtime=当下的子目录即满足 backup_fresh 的新鲜度判据。
   const backupDir = path.join(dir, 'backups')
@@ -4446,9 +4496,23 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
   spawnSync('mkdir', ['-p', bin])
   const psqlCalls = path.join(dir, 'psql-calls')
   const scripts: Record<string, string> = {
-    systemctl: allHealthy
-      ? '#!/bin/sh\necho active\n'
-      : `#!/bin/sh\ncase "$2" in openclaude-v5${egressBad ? '|openclaude-v5-egress' : ''}) echo inactive; exit 3;; *) echo active;; esac\n`,
+    systemctl: `#!/bin/sh
+case "$1" in
+  list-units)
+    case "$*" in
+      *--state=failed*) ${failedUnits.map((unit) => `printf '%s\\n' '${unit} loaded failed failed fixture'`).join('; ') || ':'} ;;
+    esac
+    exit 0
+    ;;
+  is-active)
+    case "$2" in
+      ${allHealthy ? '__never__' : `openclaude-v5${egressBad ? '|openclaude-v5-egress' : ''}`}) echo inactive; exit 3 ;;
+      *) echo active; exit 0 ;;
+    esac
+    ;;
+  *) echo active ;;
+esac
+`,
     curl: `#!/bin/sh
 case "$*" in
   ${egressBad ? '' : '*18892*) echo \'{"ok":true,"role":"egress"}\';;'}
@@ -4464,6 +4528,7 @@ esac
 printf '%s\\n' "$*" >> '${psqlCalls}'
 case "$*" in
   *"FROM deploy_state"*) printf '%s\\n' '${deployState.phase}|${deployState.step}|${deployState.active}|${deployState.candidate ?? ''}' ;;
+  ${turnWindowStats !== undefined ? `*request_finalize_journal*) printf '%s\\n' '${turnWindowStats}' ;;` : ''}
   ${allHealthy ? '*product_friction_events*) printf \'0|0\\n\' ;;' : ''}
   ${allHealthy ? '*marketplace_skill_listings*) printf \'t\\n\' ;;' : ''}
   *) exit 0 ;;
@@ -4573,10 +4638,18 @@ describe('v5 monitor obsolete pool state migration', () => {
 interface MonitorHostInstallOptions {
   failMonitorStart?: boolean
   failTimerStop?: boolean
+  failDailyTimerStop?: boolean
+  failDailyTimerStart?: boolean
   busyMonitor?: boolean
+  busyDaily?: boolean
   invalidCurrent?: boolean
   invalidState?: boolean
   failUnitBackup?: boolean
+  failDailyUnitBackup?: boolean
+  warningBad?: boolean
+  criticalBad?: boolean
+  malformedDryRunSeverity?: boolean
+  initialState?: Record<string, unknown>
 }
 
 async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}) {
@@ -4591,6 +4664,7 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   const monitorLog = path.join(dir, 'monitor.log')
   const actions = path.join(dir, 'systemctl-actions')
   const timerStopped = path.join(dir, 'timer-stopped')
+  const dailyTimerStopped = path.join(dir, 'daily-timer-stopped')
   const alertActive = path.join(dir, 'alert-active')
   // 夹具内的"健康备份"目录(见下方 V5MON_BACKUP_DIR)。
   const installBackupDir = path.join(dir, 'host-backups')
@@ -4603,25 +4677,36 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   await Promise.all([mkdir(stage), mkdir(systemdDir), mkdir(backupRoot), mkdir(bin)])
   for (const source of [
     'scripts/v5-monitor.sh',
+    'scripts/v5-daily-check.sh',
     'scripts/v5-alert-fail.sh',
     'scripts/v5-alert-fanout.sql',
     'scripts/v5-monitor-host-install-remote.sh',
     'deploy/v5/openclaude-v5-monitor.service',
     'deploy/v5/openclaude-v5-monitor.timer',
+    'deploy/v5/openclaude-v5-daily.service',
+    'deploy/v5/openclaude-v5-daily.timer',
     'deploy/v5/openclaude-v5-alert-fail@.service',
   ]) {
     await cp(path.join(root, source), path.join(stage, path.basename(source)))
   }
+  if (options.malformedDryRunSeverity) {
+    await cp(path.join(stage, 'v5-monitor.sh'), path.join(stage, 'v5-monitor.real.sh'))
+    await writeFile(path.join(stage, 'v5-monitor.sh'), `#!/bin/bash
+bash "$(dirname "$0")/v5-monitor.real.sh" "$@" | sed -E 's/ \\[severity=(warning|critical)\\]$//'
+`)
+    await chmod(path.join(stage, 'v5-monitor.sh'), 0o755)
+  }
   const checksum = spawnSync('bash', ['-c', [
-    'sha256sum v5-monitor.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
+    'sha256sum v5-monitor.sh v5-daily-check.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
     'openclaude-v5-monitor.service openclaude-v5-monitor.timer',
+    'openclaude-v5-daily.service openclaude-v5-daily.timer',
     'openclaude-v5-alert-fail@.service',
   ].join(' ')], { cwd: stage, encoding: 'utf8' })
   assert.equal(checksum.status, 0, checksum.stderr)
   await writeFile(path.join(stage, 'SHA256SUMS'), checksum.stdout)
   const bundleSha = createHash('sha256').update(checksum.stdout).digest('hex')
   await writeFile(envFile, 'OC_RUNTIME_IMAGE=test/runtime:v5\nDATABASE_URL=postgres://unused\n')
-  const originalState = JSON.stringify({
+  const originalState = JSON.stringify(options.initialState ?? {
     checks: {
       pool: { status: 'bad', since: 123, last_alert: 456 },
       mem: { status: 'ok', since: 0, last_alert: 0 },
@@ -4638,6 +4723,8 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   for (const unit of [
     'openclaude-v5-monitor.service',
     'openclaude-v5-monitor.timer',
+    'openclaude-v5-daily.service',
+    'openclaude-v5-daily.timer',
     'openclaude-v5-alert-fail@.service',
   ]) await writeFile(path.join(systemdDir, unit), `old:${unit}\n`)
 
@@ -4650,13 +4737,31 @@ if [ "\${1:-}" = --quiet ]; then shift; fi
 unit="\${1:-}"
 case "$cmd:$unit" in
   is-active:openclaude-v5-monitor.timer) [ -f '${timerStopped}' ] && exit 3; echo active; exit 0 ;;
+  is-active:openclaude-v5-daily.timer) [ -f '${dailyTimerStopped}' ] && exit 3; echo active; exit 0 ;;
   is-active:openclaude-v5-monitor.service) [ "\${BUSY_MONITOR:-0}" = 1 ] && { echo active; exit 0; }; exit 3 ;;
+  is-active:openclaude-v5-daily.service) [ "\${BUSY_DAILY:-0}" = 1 ] && { echo active; exit 0; }; exit 3 ;;
   is-active:*) echo active; exit 0 ;;
   stop:openclaude-v5-monitor.timer) [ "\${FAIL_TIMER_STOP:-0}" = 1 ] && exit 1; touch '${timerStopped}'; exit 0 ;;
+  stop:openclaude-v5-daily.timer) [ "\${FAIL_DAILY_TIMER_STOP:-0}" = 1 ] && exit 1; touch '${dailyTimerStopped}'; exit 0 ;;
   start:openclaude-v5-monitor.timer) rm -f '${timerStopped}'; exit 0 ;;
-  start:openclaude-v5-monitor.service) [ "\${FAIL_MONITOR_START:-0}" = 1 ] && { touch '${alertActive}'; exit 1; }; exit 0 ;;
+  start:openclaude-v5-daily.timer) [ "\${FAIL_DAILY_TIMER_START:-0}" = 1 ] && exit 1; rm -f '${dailyTimerStopped}'; exit 0 ;;
+  start:openclaude-v5-monitor.service)
+    [ "\${FAIL_MONITOR_START:-0}" = 1 ] && { touch '${alertActive}'; exit 1; }
+    if [ "\${WARNING_BAD:-0}" = 1 ]; then
+      jq '
+        if .checks.failed_units.status == "bad" then
+          .checks.failed_units.severity = "warning"
+        else
+          .checks.failed_units = {status:"bad", since:123, last_alert:456, severity:"warning"}
+        end
+      ' '${stateFile}' > '${stateFile}.new'
+      mv '${stateFile}.new' '${stateFile}'
+    fi
+    exit 0
+    ;;
   stop:openclaude-v5-alert-fail@openclaude-v5-monitor.service.service) rm -f '${alertActive}'; exit 0 ;;
   list-jobs:*) [ -f '${alertActive}' ] && printf '1 openclaude-v5-alert-fail@openclaude-v5-monitor.service.service start running\\n'; exit 0 ;;
+  list-units:--state=failed*) [ "\${WARNING_BAD:-0}" = 1 ] && printf 'fixture-warning.service loaded failed failed test\\n'; exit 0 ;;
   list-units:*) [ -f '${alertActive}' ] && printf 'openclaude-v5-alert-fail@openclaude-v5-monitor.service.service loaded active running test\\n'; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -4671,6 +4776,7 @@ esac
     psql: `#!/bin/sh
 case "$*" in
   *"FROM deploy_state"*) printf 'stable|0|A|\\n' ;;
+  *request_finalize_journal*) [ "\${CRITICAL_BAD:-0}" = 1 ] && { echo authority-down >&2; exit 2; }; printf '0|0|0|0\\n' ;;
   *product_friction_events*) printf '0|0\\n' ;;
   *marketplace_skill_listings*) printf 't\\n' ;;
   *) printf '7|11\\n' ;;
@@ -4685,10 +4791,13 @@ case "$1" in images) echo test/runtime:v5 ;; ps) echo 'openclaude/openclaude-run
     await writeFile(path.join(bin, name), source)
     await chmod(path.join(bin, name), 0o755)
   }
-  if (options.failUnitBackup) {
+  if (options.failUnitBackup || options.failDailyUnitBackup) {
+    const failedUnit = options.failDailyUnitBackup
+      ? 'openclaude-v5-daily.service'
+      : 'openclaude-v5-monitor.service'
     await writeFile(path.join(bin, 'cp'), `#!/bin/sh
 case "$*" in
-  *${systemdDir}/openclaude-v5-monitor.service*${backupRoot}/.monitor-backup.*) exit 1 ;;
+  *${systemdDir}/${failedUnit}*${backupRoot}/.monitor-backup.*) exit 1 ;;
   *) exec /bin/cp "$@" ;;
 esac
 `)
@@ -4698,7 +4807,12 @@ esac
     PATH: `${bin}:${process.env.PATH}`,
     FAIL_MONITOR_START: options.failMonitorStart ? '1' : '0',
     FAIL_TIMER_STOP: options.failTimerStop ? '1' : '0',
+    FAIL_DAILY_TIMER_STOP: options.failDailyTimerStop ? '1' : '0',
+    FAIL_DAILY_TIMER_START: options.failDailyTimerStart ? '1' : '0',
     BUSY_MONITOR: options.busyMonitor ? '1' : '0',
+    BUSY_DAILY: options.busyDaily ? '1' : '0',
+    WARNING_BAD: options.warningBad ? '1' : '0',
+    CRITICAL_BAD: options.criticalBad ? '1' : '0',
     OC_V5_SYSTEMD_DIR: systemdDir,
     OC_V5_MONITOR_ENV: envFile,
     OC_V5_MONITOR_LOG: monitorLog,
@@ -4721,7 +4835,20 @@ esac
     V5MON_MAINTENANCE_LOCK: path.join(dir, 'maintenance.lock'),
     V5MON_CUTOVER_ROOT: path.join(dir, 'cutovers'),
   })
-  return { result, dir, hostRoot, systemdDir, stateFile, monitorLog, actions, alertActive, bundleSha, originalState }
+  return {
+    result,
+    dir,
+    hostRoot,
+    systemdDir,
+    stateFile,
+    monitorLog,
+    actions,
+    timerStopped,
+    dailyTimerStopped,
+    alertActive,
+    bundleSha,
+    originalState,
+  }
 }
 
 describe('v5 host monitor independent atomic installer', () => {
@@ -4782,6 +4909,7 @@ describe('v5 host monitor independent atomic installer', () => {
     assert.ok(start >= 0 && end > start)
     const body = source.slice(start, end)
     assert.match(body, /v5-monitor-host-install-remote\.sh/)
+    assert.match(body, /v5-daily-check\.sh/)
     assert.doesNotMatch(body, /slot_(src|unit|port)|active_slot/)
     assert.match(source, /\*\) acquire_production_mutation_lease \|\| exit 3/)
     assert.match(source, /\*\)\n\s*run_mutation_lane_supervised run_selected_mode "\$MODE"/)
@@ -4793,11 +4921,100 @@ describe('v5 host monitor independent atomic installer', () => {
     assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
     assert.equal(JSON.parse(await readFile(fixture.stateFile, 'utf8')).checks.pool.status, 'ok')
     assert.match(await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'), /\/opt\/openclaude\/v5-monitor\/current/)
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-daily.service'), 'utf8'),
+      await readFile(path.join(root, 'deploy/v5/openclaude-v5-daily.service'), 'utf8'),
+    )
+    await readFile(path.join(fixture.hostRoot, 'current', 'v5-daily-check.sh'), 'utf8')
     const actions = await readFile(fixture.actions, 'utf8')
     assert.ok(actions.indexOf('stop openclaude-v5-monitor.timer') < actions.indexOf('start openclaude-v5-monitor.service'))
+    assert.ok(actions.indexOf('stop openclaude-v5-daily.timer') < actions.indexOf('start openclaude-v5-monitor.service'))
     assert.ok(actions.indexOf('start openclaude-v5-monitor.service') < actions.lastIndexOf('start openclaude-v5-monitor.timer'))
+    assert.ok(actions.indexOf('start openclaude-v5-monitor.service') < actions.lastIndexOf('start openclaude-v5-daily.timer'))
+    assert.doesNotMatch(actions, /(?:start|stop) openclaude-v5-daily\.service/)
     assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-OK host monitor/)
   })
+
+  test('installs with a current warning and records its explicit severity', async () => {
+    const fixture = await monitorHostInstallFixture({
+      warningBad: true,
+      initialState: { checks: {} },
+    })
+    assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    const state = JSON.parse(await readFile(fixture.stateFile, 'utf8'))
+    assert.deepEqual(state.checks.failed_units, {
+      status: 'bad',
+      since: 123,
+      last_alert: 456,
+      severity: 'warning',
+    })
+  })
+
+  test('allows a later bundle upgrade while a classified warning remains bad', async () => {
+    const fixture = await monitorHostInstallFixture({
+      warningBad: true,
+      initialState: {
+        checks: {
+          failed_units: { status: 'bad', since: 17, last_alert: 29, severity: 'warning' },
+        },
+      },
+    })
+    assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    assert.deepEqual(JSON.parse(await readFile(fixture.stateFile, 'utf8')).checks.failed_units, {
+      status: 'bad',
+      since: 17,
+      last_alert: 29,
+      severity: 'warning',
+    })
+  })
+
+  test('rejects a current critical check and restores the old monitor surface', async () => {
+    const fixture = await monitorHostInstallFixture({
+      criticalBad: true,
+      initialState: { checks: {} },
+    })
+    assert.notEqual(fixture.result.status, 0)
+    assert.match(fixture.result.stderr, /critical bad check/)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+    assert.equal(await readFile(fixture.stateFile, 'utf8'), fixture.originalState)
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'),
+      'old:openclaude-v5-monitor.service\n',
+    )
+    assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer/)
+  })
+
+  test('rejects malformed severity in a current bad dry-run result', async () => {
+    const fixture = await monitorHostInstallFixture({
+      warningBad: true,
+      malformedDryRunSeverity: true,
+      initialState: { checks: {} },
+    })
+    assert.notEqual(fixture.result.status, 0)
+    assert.match(fixture.result.stderr, /缺少合法 severity/)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+    assert.equal(await readFile(fixture.stateFile, 'utf8'), fixture.originalState)
+  })
+
+  for (const [name, severity] of [
+    ['missing', undefined],
+    ['invalid', 'urgent'],
+  ] as const) {
+    test(`rejects a historical bad state with ${name} severity`, async () => {
+      const failed: Record<string, unknown> = { status: 'bad', since: 1, last_alert: 2 }
+      if (severity !== undefined) failed.severity = severity
+      const fixture = await monitorHostInstallFixture({
+        warningBad: true,
+        initialState: { checks: { failed_units: failed } },
+      })
+      assert.notEqual(fixture.result.status, 0)
+      assert.match(fixture.result.stderr, /历史 critical\/未分级异常/)
+      assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+      assert.equal(await readFile(fixture.stateFile, 'utf8'), fixture.originalState)
+    })
+  }
 
   test('restores units, pointer, state, and timer when activation fails', async () => {
     const fixture = await monitorHostInstallFixture({ failMonitorStart: true })
@@ -4808,7 +5025,13 @@ describe('v5 host monitor independent atomic installer', () => {
       await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'),
       'old:openclaude-v5-monitor.service\n',
     )
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-daily.service'), 'utf8'),
+      'old:openclaude-v5-daily.service\n',
+    )
     assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer/)
+    assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-daily.timer/)
+    assert.doesNotMatch(await readFile(fixture.actions, 'utf8'), /stop openclaude-v5-daily\.service/)
     assert.doesNotMatch(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer[\s\S]*stop openclaude-v5-alert-fail@/)
     await assert.rejects(readFile(fixture.alertActive, 'utf8'), /ENOENT/)
     assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-ROLLBACK host monitor/)
@@ -4816,19 +5039,40 @@ describe('v5 host monitor independent atomic installer', () => {
 
   for (const [name, options] of [
     ['timer stop failure', { failTimerStop: true }],
+    ['daily timer stop failure', { failDailyTimerStop: true }],
     ['drain timeout', { busyMonitor: true }],
+    ['daily drain timeout', { busyDaily: true }],
     ['invalid current', { invalidCurrent: true }],
     ['invalid state', { invalidState: true }],
     ['unit backup failure', { failUnitBackup: true }],
+    ['daily unit backup failure', { failDailyUnitBackup: true }],
   ] as const) {
-    test(`${name} restores the originally active timer`, async () => {
+    test(`${name} restores both originally active timers without killing daily`, async () => {
       const fixture = await monitorHostInstallFixture(options)
       assert.notEqual(fixture.result.status, 0)
       const actions = await readFile(fixture.actions, 'utf8')
       assert.match(actions, /start openclaude-v5-monitor.timer/)
-      assert.match(actions.trim().split('\n').at(-1) ?? '', /is-active --quiet openclaude-v5-monitor.timer/)
+      assert.match(actions, /start openclaude-v5-daily.timer/)
+      assert.match(actions.trim().split('\n').at(-1) ?? '', /is-active --quiet openclaude-v5-daily.timer/)
+      assert.doesNotMatch(actions, /stop openclaude-v5-daily\.service/)
     })
   }
+
+  test('partial timer restore returns recovery-required after restoring files and pointer', async () => {
+    const fixture = await monitorHostInstallFixture({ failDailyTimerStart: true })
+    assert.equal(fixture.result.status, 86, fixture.result.stderr || fixture.result.stdout)
+    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), 'releases/monitor-old')
+    assert.equal(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-daily.service'), 'utf8'),
+      'old:openclaude-v5-daily.service\n',
+    )
+    await assert.rejects(readFile(fixture.timerStopped, 'utf8'), /ENOENT/)
+    assert.equal(await readFile(fixture.dailyTimerStopped, 'utf8'), '')
+    const actions = await readFile(fixture.actions, 'utf8')
+    assert.match(actions, /start openclaude-v5-monitor.timer/)
+    assert.match(actions, /start openclaude-v5-daily.timer/)
+    assert.doesNotMatch(actions, /stop openclaude-v5-daily\.service/)
+  })
 })
 
 describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
@@ -4859,6 +5103,74 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     assert.match(warningLine, /mem_oversubscribe/, 'mem_oversubscribe 必须显式分级')
   })
 
+  test('dry-run and durable state expose severity from the same authority', async () => {
+    const healthyRow = 'openclaude/openclaude-runtime:v5-ccb-test|1|v5|1'
+    const dry = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      failedUnits: ['fixture-warning.service'],
+    })
+    assert.equal(dry.status, 0, dry.stderr)
+    assert.match(dry.stdout, /failed_units\s+bad\s+.*\[severity=warning\]$/m)
+    assert.match(dry.stdout, /backup_fresh\s+ok\s+.*\[severity=critical\]$/m)
+
+    const live = await monitorFixture({
+      args: [],
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      failedUnits: ['fixture-warning.service'],
+      state: {
+        checks: {
+          failed_units: {
+            status: 'bad',
+            since: 123,
+            last_alert: 9_999_999_999,
+            severity: 'warning',
+          },
+        },
+      },
+    })
+    assert.equal(live.status, 0, live.stderr)
+    const state = JSON.parse(await readFile(live.statePath, 'utf8'))
+    assert.deepEqual(state.checks.failed_units, {
+      status: 'bad',
+      since: 123,
+      last_alert: 9_999_999_999,
+      severity: 'warning',
+    })
+    assert.equal(state.checks.backup_fresh.severity, 'critical')
+    assert.doesNotMatch(await readFile(live.psqlCalls, 'utf8'), /INSERT INTO inbox_messages/)
+  })
+
+  test('turn health uses terminal journal authority and one shared classified window', async () => {
+    const source = await readFile(monitor, 'utf8')
+    const loadStart = source.indexOf('load_turn_window_stats() {')
+    assert.ok(loadStart >= 0, 'turn window loader 缺失')
+    const loader = source.slice(loadStart, source.indexOf('\n}', loadStart))
+    assert.match(loader, /FROM request_finalize_journal rfj/)
+    assert.match(loader, /LEFT JOIN usage_records ur ON ur\.id=rfj\.usage_id/)
+    assert.match(loader, /rfj\.state IN \('committed','aborted'\)/)
+    assert.match(loader, /failure_code IN \('CLIENT_ABORT','USER_CANCELLED'\)/)
+    assert.match(loader, /codex_terminal_code'='USER_CANCELLED'/)
+    assert.match(loader, /ur\.status='success'/)
+    assert.match(loader, /COALESCE\(ur\.output_tokens,0\)>0/)
+    assert.match(loader, /terminal_outcome='failure'/)
+    assert.match(loader, /terminal_outcome='cancelled'/)
+    assert.match(loader, /FROM product_friction_events/)
+
+    const turnStart = source.indexOf('check_turn_failures() {')
+    const turn = source.slice(turnStart, source.indexOf('\n}', turnStart))
+    assert.match(turn, /load_turn_window_stats/)
+    assert.match(turn, /TURN_ERR_RATE_MIN_TOTAL/)
+    assert.doesNotMatch(turn, /psql /, '主检查不得另起第二条漂移查询')
+
+    const frictionStart = source.indexOf('check_friction_pipeline() {')
+    const friction = source.slice(frictionStart, source.indexOf('\n}', frictionStart))
+    assert.match(friction, /load_turn_window_stats/)
+    assert.doesNotMatch(friction, /psql /, '元监控必须复用同一 classified 查询')
+    assert.match(source, /^check_friction_pipeline$/m)
+  })
+
   // docker inspect 必须一次传全部容器 ID:每 2 分钟一轮的探针不能在循环里逐个调。
   test('mem_oversubscribe inspects all containers in one docker call', async () => {
     const source = await readFile(monitor, 'utf8')
@@ -4869,6 +5181,58 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     // docker 调用失败必须 fail-loud,不能静默当作"没有超售"
     assert.match(fn, /docker ps 失败/)
     assert.match(fn, /docker inspect 取 HostConfig\.Memory 失败/)
+  })
+})
+
+describe('v5 monitor terminal turn classification', () => {
+  const healthyRow = 'openclaude/openclaude-runtime:v5-ccb-test|1|v5|1'
+
+  test('alerts at the non-cancelled error-rate threshold and keeps a healthy telemetry pipe', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '10|2|3|2',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+bad\s+turn 错误率 20%\(2\/10,用户取消 3/)
+    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 2 \/ friction failed turn_error 2/)
+    const calls = await readFile(result.psqlCalls, 'utf8')
+    assert.equal((calls.match(/request_finalize_journal/g) ?? []).length, 1)
+  })
+
+  test('keeps a small sample out of the critical rate but flags a missing friction signal', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '9|1|2|0',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 9 轮\(<10,样本不足不判\),用户取消 2/)
+    assert.match(result.stdout, /friction_pipeline\s+bad\s+遥测管道疑似断裂:窗内服务端失败 1 次/)
+  })
+
+  test('does not classify user cancellations as failures or telemetry gaps', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: '0|0|4|0',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 0 轮\(<10,样本不足不判\),用户取消 4/)
+    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 0 \/ friction failed turn_error 0/)
+  })
+
+  test('caches a failed authority query without treating the second consumer as healthy', async () => {
+    const result = await monitorFixture({
+      allHealthy: true,
+      dockerRows: [healthyRow],
+      turnWindowStats: 'invalid',
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /turn_failures\s+bad\s+turn 失败率:查询返回非法行/)
+    assert.match(result.stdout, /friction_pipeline\s+bad\s+遥测管道:查询返回非法行/)
+    const calls = await readFile(result.psqlCalls, 'utf8')
+    assert.equal((calls.match(/request_finalize_journal/g) ?? []).length, 1)
   })
 })
 
@@ -6050,7 +6414,11 @@ wait $!
     assert.ok(coreStart >= 0, 'minimum_functional_core 缺失')
     const coreEnd = source.indexOf('\n}', coreStart)
     const core = source.slice(coreStart, coreEnd)
-    assert.match(core, /smoke_turn_matrix "\$release" "\$port" \|\|/, '最小功能核缺双引擎真 turn')
+    assert.match(
+      core,
+      /smoke_turn_matrix "\$release" "\$port" "\$lane" \|\|/,
+      '最小功能核缺带 lane 身份的双引擎真 turn',
+    )
     assert.match(core, /smoke_e2e_journey "\$port" \|\|/, '最小功能核缺 J1-J5 旅程')
     const journeyCalls = source.match(/^\s*smoke_e2e_journey\b/gm) ?? []
     assert.equal(
@@ -6127,6 +6495,11 @@ wait $!
     assert.ok(
       !/vip_control_gate "\$DS_candidate_slot"/.test(promoteBody),
       'promote 不得用 vip_control_gate 做探针(canary 期 candidate 是 standby,必然失败=挡住正常放量)',
+    )
+    assert.match(
+      promoteBody,
+      /smoke_turn_matrix "\$promote_candidate" "\$\(slot_port "\$DS_candidate_slot"\)" "promote-candidate"/,
+      'promote 的 candidate 真 turn 必须显式携带 candidate lane 身份',
     )
 
     // ⑤ finalize:不可逆点之前补功能门,失败转 aborting 保留恢复路径。
@@ -6606,6 +6979,78 @@ wait $!
     assert.match(source.slice(attemptAt), /let finalText = ''/)
     assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText \}\)/)
     assert.match(source, /result\.finalText === '2'/)
+  })
+
+  test('candidate CCB cost fallback is exact ledger evidence and never weakens stable lanes', async () => {
+    const turnSource = await readFile(turnCanary, 'utf8')
+    assert.match(
+      turnSource,
+      /V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE/,
+      'turn smoke 缺显式 candidate ledger 模式',
+    )
+    assert.match(
+      turnSource,
+      /result\.reason === 'ledger-cost-evidence-required'[\s\S]*result\.finalText === '2'[\s\S]*result\.sawFinal[\s\S]*!result\.sawCost/,
+      'rc=3 只能在 exactText+final 已齐且仅缺 live cost 时产生',
+    )
+    assert.match(
+      turnSource,
+      /TURN_LEDGER_PROOF_REQUIRED session=\$\{peerId\} model=\$\{MODEL\}/,
+      'candidate ledger proof 必须绑定本次脚本生成的唯一 session 与精确 model',
+    )
+    assert.match(turnSource, /process\.exit\(3\)/, 'candidate ledger proof 必须使用独立退出码 3')
+
+    const source = await readFile(deploy, 'utf8')
+    const verifyStart = source.indexOf('\nverify_candidate_ccb_ledger_cost() {')
+    const verifyEnd = source.indexOf('\nsmoke_turn_canary() {', verifyStart)
+    assert.ok(verifyStart >= 0 && verifyEnd > verifyStart, '缺 candidate CCB 精确 ledger verifier')
+    const verify = source.slice(verifyStart, verifyEnd)
+    for (const invariant of [
+      "u.email = 'v5-canary@claudeai.chat'",
+      "t.user_id = 'c:' || u.id::text",
+      'tc.user_id = t.user_id',
+      'tc.session_id = t.session_id',
+      'tc.tape_id = t.tape_id',
+      'tc.billing_anchor_id = t.billing_anchor_id',
+      'ur.user_id = u.id',
+      'ur.request_id = tc.request_id',
+      'ur.turn_key = t.turn_key',
+      "t.session_id = '$session_id'",
+      "t.status = 'completed'",
+      "ur.model = '$model'",
+      "ur.status = 'success'",
+      'ur.cost_credits > 0',
+      'tc.cost_credits = ur.cost_credits',
+      'cl.id = ur.ledger_id',
+      'cl.user_id = ur.user_id',
+      "cl.ref_type = 'usage_record'",
+      'cl.ref_id = ur.id::text',
+      'cl.delta = -ur.cost_credits',
+    ]) {
+      assert.ok(verify.includes(invariant), `candidate ledger verifier 缺精确约束:${invariant}`)
+    }
+    assert.doesNotMatch(
+      verify,
+      /ur\.session_id\s*=\s*'\$session_id'/,
+      'usage_records.session_id 是 engine session，不得拿它匹配 smoke client session',
+    )
+    assert.match(verify, /for i in \$\(seq 1 10\)/, 'ledger proof 必须短且有限轮询')
+    assert.match(verify, /return 1/, 'SQL 错误/零行/关系不一致必须 fail-closed')
+
+    const matrixStart = source.indexOf('\nsmoke_turn_matrix() {')
+    const matrixEnd = source.indexOf('\n}', matrixStart)
+    const matrix = source.slice(matrixStart, matrixEnd)
+    assert.match(
+      matrix,
+      /\(\s*"\$lane" == canary-ready \|\| "\$lane" == promote-candidate\s*\) && "\$model" == deepseek-v4-flash/,
+      'ledger fallback 必须同时受 candidate lane 与精确 DeepSeek 模型约束',
+    )
+    assert.match(matrix, /cost_evidence_mode=live/, '每个模型默认必须回到 live cost frame')
+    assert.equal(
+      (source.match(/V5_CANARY_ALLOW_LEDGER_COST_EVIDENCE=1/g) ?? []).length,
+      1,
+      'candidate ledger env 只能在受限 smoke 分支出现一次',
+    )
   })
 
   test('baseline eval tolerates transient poll failure and records terminal result', async () => {

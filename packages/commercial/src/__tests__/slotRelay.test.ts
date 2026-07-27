@@ -101,6 +101,29 @@ describe("slot relay", () => {
     assert.deepEqual((await peerDown.onlineUserSubset(["1", "3"])).sort(), ["1"]);
   });
 
+  test("cost broadcast 在仅候选槽持有 WS 时仍投递到候选槽", async () => {
+    const sentA: Array<{ uids: string[]; payload: unknown }> = [];
+    const sentB: Array<{ uids: string[]; payload: unknown }> = [];
+    const portA = await listen(relayServer("secret", new Set(), sentA));
+    const portB = await listen(relayServer("secret", new Set(["247"]), sentB));
+    const client = createSlotRelayClient({
+      secret: "secret",
+      ports: [portA, portB],
+      requestTimeoutMs: 200,
+      totalBudgetMs: 500,
+    });
+    const payload = {
+      type: "outbound.cost_charged",
+      requestId: "candidate-deepseek",
+      costCredits: "5",
+    };
+
+    assert.deepEqual(await client.broadcastToUsers(["247"], payload), ["247"]);
+    assert.equal(sentA.length, 1);
+    assert.equal(sentB.length, 1);
+    assert.deepEqual(sentB[0], { uids: ["247"], payload });
+  });
+
   test("half-open peer 在预算内主动终止；4096 audience 上限 fail-closed", async () => {
     const halfOpenPort = await listen((_req, _res) => { /* 故意不响应 */ });
     const client = createSlotRelayClient({ secret: "secret", ports: [halfOpenPort], requestTimeoutMs: 50, totalBudgetMs: 120 });

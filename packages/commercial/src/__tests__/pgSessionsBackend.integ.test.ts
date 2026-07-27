@@ -744,6 +744,43 @@ describe("pgSessionsBackend contract", () => {
     assert.equal(pend.rowCount, 0, "delegate pending 应级联清");
   });
 
+  // 回归:归档会话的**首页** timeline 读取曾因缺 bigint cast 而 500。
+  //
+  // 首页没有 cursor → `beforeOrderSeq = Number.MAX_SAFE_INTEGER`(9007199254740991),
+  // 它被绑进 `WHERE first_seq < $3`,而 `client_session_archive_chunks.first_seq` 是
+  // **integer** → PG 报 22003 integer out of range。紧邻那行的 `last_seq < $4::bigint`
+  // 有 cast,`$3` 漏了。
+  //
+  // 为什么既有的 spill 用例照样绿:归档循环的进入条件是 `deduped.size <= maxCandidates`,
+  // 它们用 limit=10,热行就已经填满,压根不读归档。真正会踩到的是**热行不足以填满一页
+  // 的归档会话**——也就是内容大半已 spill、热行只剩少量 anchor 的长会话首次打开,
+  // 用户看到的就是"长会话打不开"。所以这条用例刻意把 limit 开到远大于热行数。
+  maybe("归档会话首页 timeline 不因 MAX_SAFE_INTEGER 游标而炸(22003 回归)", async () => {
+    const big = "z".repeat(40 * 1024);
+    const msgs: MessageLike[] = [];
+    for (let i = 0; i < 90; i++) msgs.push({ id: `ov-${i}`, role: "user", text: big });
+    await backend.upsertClientSession(mkSession({ id: "s-ovf", messages: msgs, updatedAt: 1 }));
+
+    const got = await backend.getClientSession("s-ovf", "u-1");
+    assert.ok((got!.archivedCount ?? 0) > 0, "前置:必须真的产生归档,否则这条用例什么都没测");
+    const through = await pool.query<{ v: string }>(
+      "SELECT archived_through_seq::text AS v FROM client_sessions WHERE id=$1 AND user_id=$2",
+      ["s-ovf", "u-1"],
+    );
+    assert.ok(
+      Number(through.rows[0]?.v ?? 0) > 0,
+      "前置:archived_through_seq 必须 > 0,否则归档循环根本不会进入(那样这条用例是空断言)",
+    );
+
+    // limit 远大于热行数 → 必须下潜到归档 chunk,也就必然把首页游标绑进 first_seq。
+    const firstPage = await backend.readClientTimelinePage("s-ovf", "u-1", null, 500);
+    assert.ok(firstPage, "归档会话首页必须能读出来(修复前这里抛 22003 → GET /api/sessions/:id 500)");
+    assert.ok(
+      (firstPage!.messages?.length ?? 0) > 0,
+      "首页必须真的带回记录,不能靠空结果蒙混过关(修复只是让查询不再抛,不代表读得回来)",
+    );
+  });
+
   maybe("readArchivedMessages 分页(升序 + hasMore + 游标)", async () => {
     const big = "y".repeat(40 * 1024);
     const msgs: MessageLike[] = [];

@@ -2097,7 +2097,13 @@ export async function registerCommercial(
       const costEventHandler: CostEventHandler = makeCostEventHandler({
         secret: cfg.OC_EGRESS_SECRET,
         appendCostCredits: appendCostCreditsForUser,
-        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        broadcastToUser: async (uid, payload) => {
+          if (dualMasterEnabled) {
+            await slotRelayClient.broadcastToUsers([uid.toString()], payload);
+            return;
+          }
+          bridgeBroadcastRef.current(uid, payload);
+        },
       });
       // /internal/v3/cron-index — 容器 gateway 上报「派生唤醒索引」(nextFireAt/enabledCount)。
       // uid 由 verifyContainerIdentity 推导;upsert cron_wake_index(runtime_channel=当前)。
