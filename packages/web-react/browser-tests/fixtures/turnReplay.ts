@@ -41,8 +41,9 @@ const TURN = `srv-${REPLAY_SESSION_ID}-${REPLAY_AGENT_ID}-t1`;
 const TOOL_BLOCK_ID = "blk-replay-bash-1";
 
 /**
- * assistant 终帧正文。故意含一段**超宽不可折行**代码块:移动视口用例据此断言整页
- * 不横向溢出(宽内容必须在自己的滚动容器里滚,不能把 body 撑宽)。
+ * assistant 终帧正文。故意含一段**超宽不可折行**代码块:真实回答里代码块就是这样,
+ * 它保证 T21 的时间线是在"有宽内容"的条件下收敛的(宽内容必须留在自己的滚动容器里,
+ * 不能把时间线撑宽)。整页横向溢出的断言在 T25,那条用例有自己的整页 harness。
  */
 const ANSWER_TAIL_MARKDOWN = [
   REPLAY_MARKERS.answerTail,
