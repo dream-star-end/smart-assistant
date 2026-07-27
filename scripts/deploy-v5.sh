@@ -5827,19 +5827,31 @@ verify_candidate_ccb_ledger_cost() { # <session-id> <model>
   # 0% candidate 的 CCB 请求仍经单例 egress 出站；egress cost-event 固定投递
   # deploy_state.desired_control_slot 对应的 18894（此时仍是旧 active），所以真实
   # debit 会落 PG、live cost frame 却只会在旧 active 广播。按本次 smoke 生成的
-  # 唯一 session + 精确 model + canary 邮箱核对 usage/ledger 同一事务结果；不允许
-  # 用“最近一条 DeepSeek usage”之类模糊证据放宽门禁。
+  # 唯一 client session + 精确 model + canary 邮箱核对 tape/cost/usage/ledger 同一
+  # 事务结果。usage_records.session_id 是 engine session，不能拿它匹配 client
+  # session；不允许用“最近一条 DeepSeek usage”之类模糊证据放宽门禁。
   for i in $(seq 1 10); do
     proof="$(remote_model_authority_psql_app "
 SELECT CASE WHEN COUNT(*) = 1 THEN 'ok' ELSE 'missing' END
-  FROM usage_records ur
-  JOIN users u ON u.id = ur.user_id
+  FROM client_session_turn_tapes t
+  JOIN users u ON t.user_id = 'c:' || u.id::text
+  JOIN turn_tape_cost_components tc
+    ON tc.user_id = t.user_id
+   AND tc.session_id = t.session_id
+   AND tc.tape_id = t.tape_id
+   AND tc.billing_anchor_id = t.billing_anchor_id
+  JOIN usage_records ur
+    ON ur.user_id = u.id
+   AND ur.request_id = tc.request_id
+   AND ur.turn_key = t.turn_key
   JOIN credit_ledger cl ON cl.id = ur.ledger_id
  WHERE u.email = 'v5-canary@claudeai.chat'
-   AND ur.session_id = '$session_id'
+   AND t.session_id = '$session_id'
+   AND t.status = 'completed'
    AND ur.model = '$model'
    AND ur.status = 'success'
    AND ur.cost_credits > 0
+   AND tc.cost_credits = ur.cost_credits
    AND ur.created_at >= clock_timestamp() - interval '10 minutes'
    AND cl.user_id = ur.user_id
    AND cl.reason = 'chat'
