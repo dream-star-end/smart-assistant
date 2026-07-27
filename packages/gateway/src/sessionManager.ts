@@ -4112,6 +4112,7 @@ export class SessionManager {
         errorCode: string
         waiveReason?: TurnWaiveReason
       } | null = null
+      let forcedShutdownForUserCancellation = false
 
       // Idle timeout — refreshed on every adapter 'activity'(底座每条原始消息,
       // 含 parser 会忽略的消息 —— 与旧 runner 'message' 的 refresh 时机逐条对齐)。
@@ -4513,6 +4514,9 @@ export class SessionManager {
           // supervisor's bounded shutdown return until its stdout really
           // closes. This is the no-loss barrier for escaped descendants that
           // still hold the pipe after SIGKILL.
+          forcedShutdownForUserCancellation =
+            requestedTerminal?.status === 'interrupted' &&
+            requestedTerminal.errorCode === 'USER_CANCELLED'
           try {
             await runner.shutdown()
           } catch (err) {
@@ -4697,10 +4701,18 @@ export class SessionManager {
           // that diagnostic runtime event, but only a platform-owned waiver or
           // an engine-confirmed user cancellation may override the summary.
           // If Stop races a natural end_turn, completion remains authoritative.
+          const forcedGenericUserCancellation =
+            forcedShutdownForUserCancellation &&
+            result?.isError === true &&
+            terminalEngineBilling?.status === 'error' &&
+            terminalEngineBilling.terminalCode === 'CODEX_ERROR'
           const userCancellationOverride =
             requestedTerminal?.status === 'interrupted' &&
             requestedTerminal.errorCode === 'USER_CANCELLED' &&
-            result?.stopReason === 'interrupted'
+            (
+              result?.stopReason === 'interrupted' ||
+              forcedGenericUserCancellation
+            )
               ? requestedTerminal
               : null
           if (
@@ -4709,8 +4721,8 @@ export class SessionManager {
           ) {
             // A forced Codex app-server shutdown reports a generic CODEX_ERROR
             // because the runner cannot know why its process was killed. At
-            // this layer both sides are authoritative: the browser requested
-            // USER_CANCELLED and the engine confirmed an interrupted result.
+            // this layer the browser request plus either an engine-confirmed
+            // interrupt or this layer's forced-shutdown evidence is authoritative.
             // Keep billing/audit classification aligned with the tape.
             terminalEngineBilling = {
               ...terminalEngineBilling,

@@ -1366,6 +1366,12 @@ describe("crash/interrupt partial persistence", () => {
           durationMs: 5_001,
           usage: { input_tokens: 9, output_tokens: 4 },
         });
+        runner.result({
+          is_error: true,
+          subtype: "error_during_execution",
+          result: "CodexAppServerRunner shutdown",
+          usage: { input_tokens: 9, output_tokens: 4 },
+        });
       };
       session = makeSession(runner, {
         channel: "webchat",
@@ -1407,6 +1413,66 @@ describe("crash/interrupt partial persistence", () => {
         turn: 1,
       });
       assert.equal(payload.engineBilling?.terminalCode, "USER_CANCELLED");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("browser Stop timeout followed by a natural end_turn remains completed", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let session!: AgentSession;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("answer completed during shutdown drain");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => false;
+      let shutdownCalls = 0;
+      runner.shutdown = async () => {
+        shutdownCalls += 1;
+        session.runner.emit("billing", {
+          requestId: "req-unit",
+          engineSessionId: `oceng-${"f".repeat(48)}`,
+          status: "success",
+          terminalCode: "OK",
+          durationMs: 5_001,
+          usage: { input_tokens: 5, output_tokens: 2 },
+        });
+        runner.result({
+          stop_reason: "end_turn",
+          usage: { input_tokens: 5, output_tokens: 2 },
+        });
+      };
+      session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(shutdownCalls, 1);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.equal(captured.payloads[0]!.errorCode, undefined);
+      assert.equal(captured.payloads[0]!.text, "answer completed during shutdown drain");
+      assert.equal(captured.payloads[0]!.engineBilling?.terminalCode, "OK");
     } finally {
       setV3MasterSinkSingleton(null);
     }
