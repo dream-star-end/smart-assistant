@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
 import { createMemoryAuthSession } from "../lib/authSession";
-import { reportClientFriction } from "../lib/clientFriction";
+import { bindClientFrictionTokenProvider, reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 
 const ADMIN_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
@@ -76,6 +76,10 @@ export function useAdminAuth(): AdminAuthState {
   const [recoverable, setRecoverable] = useState(false);
   const [retrySeq, setRetrySeq] = useState(0);
   const bootstrapMeFriction = useRef<{ id: string; attempts: number } | null>(null);
+  useEffect(
+    () => bindClientFrictionTokenProvider(() => adminSession.snapshot().token),
+    [],
+  );
 
   useEffect(() => {
     const controller = new AbortController();

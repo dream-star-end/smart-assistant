@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
 import { createMemoryAuthSession } from "../lib/authSession";
-import { reportClientFriction } from "../lib/clientFriction";
+import { bindClientFrictionTokenProvider, reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 import { useLaneGate } from "./useLaneGate";
 
@@ -122,6 +122,10 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // AuthSession 整个页面生命周期复用同一引用。expire 内部原子校验 + bump，保证并发
   // invalid 消费者只触发一次 UI teardown。
   const authRef = useRef<AuthSession>(createMemoryAuthSession(() => expiredUiRef.current()));
+  useEffect(
+    () => bindClientFrictionTokenProvider(() => authRef.current.snapshot().token),
+    [],
+  );
 
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。

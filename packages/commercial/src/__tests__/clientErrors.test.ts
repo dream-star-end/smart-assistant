@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import { normalizeClientFrictionReport } from "../http/clientErrors.js";
+import {
+  classifyClientFrictionPersistError,
+  normalizeClientFrictionReport,
+} from "../http/clientErrors.js";
 
 describe("client friction normalization", () => {
   test("keeps stable classifications and drops every raw browser field", () => {
@@ -20,6 +23,8 @@ describe("client friction normalization", () => {
       client_build: "abc-123",
       browser_family: "chrome",
       device_class: "desktop",
+      error_name: "type_error",
+      error_fingerprint: "0123456789abcdef",
       message: "DO_NOT_PERSIST message",
       stack: "DO_NOT_PERSIST stack",
       path: "/private/conversation",
@@ -43,6 +48,8 @@ describe("client friction normalization", () => {
       deviceClass: "desktop",
       traceId: "trace_1",
       sessionId: "session_1",
+      errorName: "type_error",
+      errorFingerprint: "0123456789abcdef",
     });
     assert.equal(JSON.stringify(normalized).includes("DO_NOT_PERSIST"), false);
   });
@@ -68,6 +75,8 @@ describe("client friction normalization", () => {
       provider: "UPPERCASE",
       browser_family: "bad/slash",
       device_class: "watch",
+      error_name: "TypeError",
+      error_fingerprint: "ABCDEF0123456789",
     }, "fallback_id");
     assert.equal(normalized.correlation, "fallback_id");
     assert.equal(normalized.surface, "client");
@@ -78,5 +87,30 @@ describe("client friction normalization", () => {
     assert.equal(normalized.provider, null);
     assert.equal(normalized.browserFamily, null);
     assert.equal(normalized.deviceClass, "unknown");
+    assert.equal(normalized.errorName, null);
+    assert.equal(normalized.errorFingerprint, null);
+  });
+
+  test("persist failures expose bounded structure without leaking raw database detail", () => {
+    const err = Object.assign(new Error("DO_NOT_LOG rejected row contains private values"), {
+      code: "23514",
+      constraint: "product_friction_events_code_check",
+      detail: "DO_NOT_LOG row=(secret)",
+    });
+    const classified = classifyClientFrictionPersistError(err);
+    assert.deepEqual(classified, {
+      errorClass: "Error",
+      errorCode: "23514",
+      errorConstraint: "product_friction_events_code_check",
+    });
+    assert.equal(JSON.stringify(classified).includes("DO_NOT_LOG"), false);
+
+    assert.deepEqual(
+      classifyClientFrictionPersistError({
+        code: "bad code with spaces",
+        constraint: "../../unsafe",
+      }),
+      { errorClass: "object", errorCode: null, errorConstraint: null },
+    );
   });
 });

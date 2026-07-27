@@ -70,7 +70,9 @@
     "0188_auto_dream_optimizer",
     "0189_auto_dream_deepseek_v4_flash",
     "0190_user_signal_quality",
-    "0191_claude5_models"
+    "0191_claude5_models",
+    "0192_friction_code_casing",
+    "0193_client_error_fingerprints"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

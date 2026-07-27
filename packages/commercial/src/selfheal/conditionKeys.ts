@@ -52,6 +52,7 @@ export const OPS_MONITOR_CHECKS: readonly string[] = [
   "disk_root",
   "disk_var",
   "failed_units",
+  "friction_pipeline",
   // 门禁豁免债务(deploy-v5.sh 的 record_gate_waiver 写 marker,monitor 常驻可见):
   // 已上线版本有未验证面 + 下次普通发布被阻断,不是全站故障但必须有人看见。
   "gate_waivers",
