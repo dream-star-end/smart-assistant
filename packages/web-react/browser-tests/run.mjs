@@ -748,6 +748,14 @@ await check("T21 首任务只预填，确认发送用户修改后的 Composer �
   await card.waitFor({ state: "visible", timeout: 3000 });
   await card.click();
   const composer = root.getByPlaceholder("给 OpenClaude 发消息…");
+  await page.waitForFunction(() => {
+    const node = document.querySelector("#starter-root textarea");
+    return (
+      node instanceof HTMLTextAreaElement &&
+      node.value.includes("家庭预算表") &&
+      node.value.includes(".xlsx")
+    );
+  });
   const initial = await composer.inputValue();
   if (!initial.includes("家庭预算表") || !initial.includes(".xlsx")) {
     throw new Error(`首任务没有把完整可交付 prompt 装入 Composer:${initial}`);
