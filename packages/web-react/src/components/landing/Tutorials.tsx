@@ -1,18 +1,6 @@
-import {
-  Brain,
-  Check,
-  Clock,
-  Copy,
-  GitBranch,
-  Globe,
-  type LucideIcon,
-  Paperclip,
-  PenLine,
-  Rocket,
-  SlidersHorizontal,
-  Terminal,
-} from "lucide-react";
+import { Check, Copy, Rocket } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { LANDING_STARTERS, type Starter } from "../../lib/starters";
 
 /**
  * 三步上手：把「多快能用起来」讲清楚（调研共识：3 分钟内到 wow moment）。
@@ -22,55 +10,6 @@ const QUICKSTART: { n: string; title: string; desc: string }[] = [
   { n: "1", title: "邮箱注册", desc: "一分钟拥有专属助手，免费额度即刻到账。" },
   { n: "2", title: "像派活一样开口", desc: "不用学提示词，把需求像跟同事说话一样讲出来。" },
   { n: "3", title: "需要时再加装", desc: "更专业的活儿，从 AI 市场一键装上专家智能体。" },
-];
-
-/**
- * 「开口第一句」：分类可复制的示例指令。空白输入框是新用户最大流失点，
- * 给一句能直接照抄的话；类别刻意覆盖演示区没展开的能力（定时 / 记忆 / 多模型 / GitHub…）。
- */
-type Starter = { icon: LucideIcon; tag: string; text: string };
-
-const STARTERS: Starter[] = [
-  {
-    icon: Paperclip,
-    tag: "上传文件",
-    text: "（上传 Excel）帮我做一张月度费用透视表，把异常项标出来",
-  },
-  {
-    icon: Clock,
-    tag: "定时任务",
-    text: "每个工作日早上 9 点，汇总昨晚的行业动态要点发给我",
-  },
-  {
-    icon: Brain,
-    tag: "长期记忆",
-    text: "记住：我是做母婴电商的，之后回答商业问题都贴着我的行业来",
-  },
-  {
-    icon: Globe,
-    tag: "联网调研",
-    text: "联网查一下本周新发布的 AI 工具，挑 3 个值得试的，给出理由",
-  },
-  {
-    icon: PenLine,
-    tag: "写作",
-    text: "给新品上线写 3 版朋友圈文案，语气分别专业、亲切、俏皮",
-  },
-  {
-    icon: Terminal,
-    tag: "编程",
-    text: "写个 Python 脚本，把文件夹里的发票 PDF 批量重命名成「日期_金额」",
-  },
-  {
-    icon: GitBranch,
-    tag: "GitHub",
-    text: "连上我的仓库，优化首页加载速度，跑通构建后提交推送",
-  },
-  {
-    icon: SlidersHorizontal,
-    tag: "多模型",
-    text: "换个更擅长推理的模型，再帮我推演一遍这个定价方案",
-  },
 ];
 
 /** 可点击复制的示例指令芯片。 */
@@ -89,7 +28,7 @@ function StarterChip({ s }: { s: Starter }) {
       type="button"
       onClick={() => {
         void navigator.clipboard
-          ?.writeText(s.text)
+          ?.writeText(s.prompt)
           .then(() => {
             setCopied(true);
             if (timerRef.current != null) window.clearTimeout(timerRef.current);
@@ -104,9 +43,9 @@ function StarterChip({ s }: { s: Starter }) {
         <s.icon size={14} />
       </span>
       <span className="min-w-0 flex-1">
-        <span className="block text-[11.5px] font-semibold text-accent">{s.tag}</span>
+        <span className="block text-[11.5px] font-semibold text-accent">{s.label}</span>
         <span className="mt-0.5 block text-[13.5px] leading-relaxed text-muted">
-          {copied ? "已复制，去粘贴给它吧 ✓" : `「${s.text}」`}
+          {copied ? "已复制，去粘贴给它吧 ✓" : `「${s.prompt}」`}
         </span>
       </span>
       <span className="mt-1 shrink-0 text-accent">
@@ -156,8 +95,8 @@ export function Tutorials() {
         </p>
       </div>
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        {STARTERS.map((s) => (
-          <StarterChip key={s.tag} s={s} />
+        {LANDING_STARTERS.map((s) => (
+          <StarterChip key={s.id} s={s} />
         ))}
       </div>
     </section>

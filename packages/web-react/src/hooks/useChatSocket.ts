@@ -3,7 +3,12 @@ import type { MessageReplyQuote } from "@openclaude/protocol";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
-import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
+import {
+  ChatSocket,
+  type ChatSnapshot,
+  type QueuedDispatchSnapshot,
+  type UndoQueuedSendResult,
+} from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
@@ -91,6 +96,10 @@ export type UseChatSocket = {
     teamMode?: boolean;
   }) => void;
   stop: (sessId: string) => void;
+  /** 会话级 durable FIFO 尾部快照；UI 回执只读这一份权威。 */
+  getQueuedDispatchSnapshot: (sessId: string | undefined) => QueuedDispatchSnapshot;
+  /** 只有 exact journal 删除成功才返回 ok，避免刷新后复活。 */
+  undoQueuedSend: (sessId: string) => Promise<UndoQueuedSendResult>;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   retryMessage: (p: {
     sessId: string;
@@ -398,7 +407,7 @@ export function useChatSocket(opts: {
       },
       deletePendingDispatch: async (sessId, msgId) => {
         const store = storeRef.current;
-        if (!store) return;
+        if (!store) throw new Error("session store unavailable");
         await store.deletePendingDispatch(sessId, msgId);
       },
       // GitHub 仓库绑定状态/错误帧 → 透传给 useRepoBinding（经 ref，无 stale）。
@@ -586,6 +595,19 @@ export function useChatSocket(opts: {
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
+  const getQueuedDispatchSnapshot = useCallback(
+    (sessId: string | undefined) => {
+      // The queue lives outside ChatSession, but snap.version is its render
+      // invalidation authority. Reading it here makes that dependency explicit.
+      void snap.version;
+      return socket.getQueuedDispatchSnapshot(sessId);
+    },
+    [snap.version, socket],
+  );
+  const undoQueuedSend = useCallback(
+    (sessId: string) => socket.undoQueuedSend(sessId),
+    [socket],
+  );
   const retryMessage = useCallback<UseChatSocket["retryMessage"]>((p) => socket.retryMessage(p), [socket]);
   const continueInterruptedTurn = useCallback<UseChatSocket["continueInterruptedTurn"]>(
     (p) => socket.continueInterruptedTurn(p),
@@ -860,6 +882,8 @@ export function useChatSocket(opts: {
       switchAgent,
       send,
       stop,
+      getQueuedDispatchSnapshot,
+      undoQueuedSend,
       retryMessage,
       continueInterruptedTurn,
       setActiveSession,
@@ -892,6 +916,8 @@ export function useChatSocket(opts: {
       switchAgent,
       send,
       stop,
+      getQueuedDispatchSnapshot,
+      undoQueuedSend,
       retryMessage,
       continueInterruptedTurn,
       setActiveSession,

@@ -2,7 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import type { MessageReplyQuote } from "@openclaude/protocol";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { ArrowUp, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
+import { ArrowUp, Clock, FileText, Loader2, Mic, Paperclip, Pencil, Plus, RotateCcw, Square, Target, X } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { apiErrorMessage } from "../lib/api";
@@ -11,10 +11,15 @@ import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
 import type { MediaRef } from "../lib/chat/frames";
+import type {
+  QueuedDispatchSnapshot,
+  UndoQueuedSendResult,
+} from "../lib/chat/socket";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { RepoPill } from "./github/RepoPill";
 import {
+  Alert,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -64,11 +69,18 @@ export function Composer({
   onGoalAction,
   replyTo,
   onCancelReply,
+  queuedDispatch,
+  onUndoQueuedSend,
+  submitSignal,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
   busy?: boolean;
   onStop?: () => void;
+  /** WS service 暴露的 durable FIFO 权威快照；Composer 不维护第二份计数。 */
+  queuedDispatch?: QueuedDispatchSnapshot;
+  /** 只有 exact journal 删除完成后才会返回成功。 */
+  onUndoQueuedSend?: () => Promise<UndoQueuedSendResult>;
   disabled?: boolean;
   placeholder?: string;
   /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件入口禁用）。 */
@@ -77,6 +89,8 @@ export function Composer({
   getVoiceToken?: () => string | null;
   /** 外部预填(如「在对话中创建」模板):nonce 变化即覆盖输入框并聚焦。 */
   prefill?: { text: string; nonce: number } | null;
+  /** 外部请求按一次当前 Composer 的发送按钮；正文仍只以输入框为权威。 */
+  submitSignal?: number;
   /** 当前会话的 GitHub 仓库绑定（省略 onOpenRepo 则不渲染底部仓库入口，如 demo）。 */
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
@@ -218,6 +232,29 @@ export function Composer({
     onCancelReply?.();
   };
 
+  // 首屏 starter 的确认按钮只发“按一下发送”的单调信号。用 ref 吃掉挂载时已有
+  // nonce，避免 Composer 因会话切换重挂载后误发；正文、附件、引用和清空仍全部
+  // 复用上面的唯一发送入口。
+  const lastSubmitSignalRef = useRef(submitSignal ?? 0);
+  useEffect(() => {
+    if (!submitSignal || submitSignal === lastSubmitSignalRef.current) return;
+    lastSubmitSignalRef.current = submitSignal;
+    submit();
+    // submit 每次渲染都会闭包当前草稿；这里只能由 nonce 触发，不能因草稿变化重发。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [submitSignal]);
+
+  const undoQueued = async () => {
+    const result = await onUndoQueuedSend?.();
+    if (!result || result.ok) return;
+    toast(
+      result.reason === "delete_failed"
+        ? "撤销失败，消息仍在队列里，请重试"
+        : "这条已经开始发送，来不及撤销了",
+      "info",
+    );
+  };
+
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
   // 复用原 File 对象，重试无需重选文件；成功后携带 media，供 doneMedia 汇总发送。
   const uploadOne = useCallback(
@@ -280,6 +317,33 @@ export function Composer({
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
+      {(queuedDispatch?.count ?? 0) > 0 && (
+        <Alert
+          tone="info"
+          density="compact"
+          icon={<Clock size={14} />}
+          data-testid="composer-queued-notice"
+          className="mb-2 items-center"
+          action={
+            onUndoQueuedSend && (
+              <button
+                type="button"
+                onClick={() => void undoQueued()}
+                disabled={!queuedDispatch?.canUndo}
+                className="inline-flex min-h-9 items-center rounded-md px-2 font-medium text-accent outline-none transition-colors hover:bg-accent/10 focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 [@media(hover:none)]:min-h-11"
+              >
+                {queuedDispatch?.cancellingCount ? "正在撤销…" : "撤销最后一条"}
+              </button>
+            )
+          }
+        >
+          {queuedDispatch?.savingCount
+            ? `正在保存 ${queuedDispatch.count} 条待发消息…`
+            : queuedDispatch?.count === 1
+              ? "已排队，本轮结束后自动发送"
+              : `已排队 ${queuedDispatch?.count ?? 0} 条，本轮结束后依次发送`}
+        </Alert>
+      )}
       <div
         className={cn(
           "rounded-[26px] border border-border bg-surface shadow-[var(--shadow-float)] transition-all",
@@ -470,23 +534,32 @@ export function Composer({
               <Mic size={19} />
             )}
           </IconButton>
-          <button
-            type="button"
+          {busy && (
+            <IconButton
+              data-product-control
+              aria-label="停止"
+              title="停止生成"
+              onClick={() => onStop?.()}
+              disabled={disabled}
+              className="mb-0.5 bg-fg text-bg hover:bg-fg hover:text-bg hover:opacity-90"
+            >
+              <Square size={15} className="fill-current" />
+            </IconButton>
+          )}
+          {/* 最右槽位永远是发送。busy + 空正文时仍保留禁用按钮，不能让停止钮
+              顶进用户熟悉的发送位置，重演旧版误触。 */}
+          <IconButton
             data-product-control
-            aria-label={busy ? "停止" : "发送"}
-            onClick={() => (busy ? onStop?.() : submit())}
-            disabled={(!canSend && !busy) || disabled}
-            className={cn(
-              "mb-0.5 flex size-9 shrink-0 items-center justify-center rounded-full transition-all",
-              busy
-                ? "bg-fg text-bg"
-                : canSend
-                  ? "bg-primary text-primary-fg hover:opacity-90"
-                  : "bg-hover text-faint",
-            )}
+            data-testid="composer-send"
+            aria-label={busy ? "排队发送" : "发送"}
+            title={busy ? "排队发送：本轮结束后自动发出" : "发送"}
+            onClick={submit}
+            disabled={!canSend || disabled}
+            variant={canSend ? "solid" : "subtle"}
+            className={cn("mb-0.5", !canSend && "text-faint disabled:opacity-100")}
           >
-            {busy ? <Square size={15} className="fill-current" /> : <ArrowUp size={19} />}
-          </button>
+            <ArrowUp size={19} />
+          </IconButton>
         </div>
       </div>
       {/* 底部工具条:左=GitHub 仓库绑定入口;右=语音状态(仅录音/转写时显示)。
@@ -568,7 +641,7 @@ export function AttachChip({
   return (
     <div
       className={cn(
-        "flex items-center gap-2 rounded-lg border bg-bg py-1.5 pr-1.5 text-[12.5px]",
+        "flex items-center gap-3 rounded-lg border bg-bg py-1.5 pr-1.5 text-[12.5px]",
         isImage ? "pl-1.5" : "pl-2.5",
         a.status === "error" ? "border-danger/40" : "border-border",
       )}
@@ -626,7 +699,7 @@ export function AttachChip({
         type="button"
         onClick={onRemove}
         aria-label={`移除 ${a.name}`}
-        className="flex size-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger"
+        className="flex size-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger [@media(hover:none)]:size-11"
       >
         <X size={13} />
       </button>

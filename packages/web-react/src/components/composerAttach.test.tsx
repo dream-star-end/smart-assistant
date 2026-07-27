@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import { AttachChip, Composer } from "./Composer";
+import { ToastProvider } from "./ui";
 import type { MediaRef } from "../lib/chat/frames";
 
 afterEach(cleanup);
@@ -146,6 +147,149 @@ describe("消息引用 Composer 预览", () => {
   });
 });
 
+describe("Composer durable queue controls", () => {
+  test("busy with an empty draft keeps stop separate and send in the rightmost disabled slot", () => {
+    const { container } = render(<Composer onSend={() => {}} busy onStop={() => {}} />);
+    const stop = screen.getByRole("button", { name: "停止" });
+    const send = screen.getByTestId("composer-send");
+    expect(send).toHaveAttribute("aria-label", "排队发送");
+    expect(send).toBeDisabled();
+    const buttons = Array.from(container.querySelectorAll("button"));
+    expect(buttons.indexOf(stop as HTMLButtonElement)).toBeLessThan(
+      buttons.indexOf(send as HTMLButtonElement),
+    );
+    expect(buttons.at(-1)).toBe(send);
+  });
+
+  test("busy with text sends through the queue path and renders only the service snapshot receipt", () => {
+    const onSend = vi.fn();
+    render(
+      <Composer
+        onSend={onSend}
+        busy
+        queuedDispatch={{ count: 2, savingCount: 0, cancellingCount: 0, canUndo: true }}
+        onUndoQueuedSend={async () => ({ ok: true })}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+      target: { value: "下一条任务" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "排队发送" }));
+    expect(onSend).toHaveBeenCalledWith("下一条任务", undefined, undefined);
+    expect(screen.getByTestId("composer-queued-notice")).toHaveTextContent(
+      "已排队 2 条，本轮结束后依次发送",
+    );
+  });
+
+  test("durable undo failure remains visible instead of claiming cancellation", async () => {
+    render(
+      <ToastProvider>
+        <Composer
+          onSend={() => {}}
+          queuedDispatch={{ count: 1, savingCount: 0, cancellingCount: 0, canUndo: true }}
+          onUndoQueuedSend={async () => ({ ok: false, reason: "delete_failed" })}
+        />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "撤销最后一条" }));
+    expect(
+      await screen.findByText("撤销失败，消息仍在队列里，请重试"),
+    ).toBeInTheDocument();
+  });
+
+  test("submit signal sends the user's edited composer text exactly once", async () => {
+    const onSend = vi.fn();
+    const { rerender } = render(
+      <Composer
+        onSend={onSend}
+        prefill={{ text: "starter original", nonce: 1 }}
+        submitSignal={0}
+      />,
+    );
+    const textarea = screen.getByPlaceholderText("给 OpenClaude 发消息…");
+    await waitFor(() => expect(textarea).toHaveValue("starter original"));
+    fireEvent.change(textarea, { target: { value: "用户修改后的正文" } });
+    rerender(
+      <Composer
+        onSend={onSend}
+        prefill={{ text: "starter original", nonce: 1 }}
+        submitSignal={1}
+      />,
+    );
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith("用户修改后的正文", undefined, undefined),
+    );
+    rerender(
+      <Composer
+        onSend={onSend}
+        prefill={{ text: "starter original", nonce: 1 }}
+        submitSignal={1}
+      />,
+    );
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
+  test("an empty confirmation is not consumed; a later valid confirmation sends", async () => {
+    const onSend = vi.fn();
+    const { rerender } = render(<Composer onSend={onSend} submitSignal={0} />);
+    rerender(<Composer onSend={onSend} submitSignal={1} />);
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+      target: { value: "补好正文后再发" },
+    });
+    rerender(<Composer onSend={onSend} submitSignal={2} />);
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith("补好正文后再发", undefined, undefined),
+    );
+  });
+
+  test("a disabled confirmation is not consumed; enabling and confirming again sends", async () => {
+    const onSend = vi.fn();
+    const prefill = { text: "等待门控放行", nonce: 1 };
+    const { rerender } = render(
+      <Composer onSend={onSend} disabled prefill={prefill} submitSignal={0} />,
+    );
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText("给 OpenClaude 发消息…")).toHaveValue(prefill.text),
+    );
+    rerender(<Composer onSend={onSend} disabled prefill={prefill} submitSignal={1} />);
+    expect(onSend).not.toHaveBeenCalled();
+
+    rerender(<Composer onSend={onSend} prefill={prefill} submitSignal={2} />);
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith(prefill.text, undefined, undefined),
+    );
+  });
+
+  test("an uploading confirmation is not consumed; confirming after upload sends the attachment", async () => {
+    let finishUpload!: (media: MediaRef) => void;
+    const upload = vi.fn(
+      () => new Promise<MediaRef>((resolve) => { finishUpload = resolve; }),
+    );
+    const onSend = vi.fn();
+    const { container, rerender } = render(
+      <Composer onSend={onSend} onUpload={upload} submitSignal={0} />,
+    );
+    const file = new File(["payload"], "queued.txt", { type: "text/plain" });
+    const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+    fireEvent.change(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+      target: { value: "带附件发送" },
+    });
+    rerender(<Composer onSend={onSend} onUpload={upload} submitSignal={1} />);
+    expect(onSend).not.toHaveBeenCalled();
+
+    const media = { kind: "file" as const, url: "/api/media/queued.txt", filename: "queued.txt" };
+    finishUpload(media);
+    await waitFor(() => expect(screen.getByRole("button", { name: "移除 queued.txt" })).toBeEnabled());
+    rerender(<Composer onSend={onSend} onUpload={upload} submitSignal={2} />);
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith("带附件发送", [media], undefined),
+    );
+  });
+});
+
 describe("AttachChip（附件 chip 上传失败重试）", () => {
   test("error 态且持有 File + onRetry → 显示「重试」，点击回调复用重传入口", () => {
     const onRetry = vi.fn();
@@ -187,6 +331,18 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
       />,
     );
     expect(screen.queryByLabelText("重试上传 b.txt")).toBeNull();
+  });
+
+  test("touch devices receive a 44px remove target without changing desktop density", () => {
+    render(
+      <AttachChip
+        a={{ id: "att-touch", name: "touch.txt", size: 10, kind: "file", status: "done" }}
+        onRemove={() => {}}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "移除 touch.txt" })).toHaveClass(
+      "[@media(hover:none)]:size-11",
+    );
   });
 
   test("error 态但未传 onRetry（如无持有 File）→ 不渲染重试按钮", () => {

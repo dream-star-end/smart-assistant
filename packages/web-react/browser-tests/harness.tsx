@@ -8,6 +8,7 @@
 import { StrictMode, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
+import { EmptyState } from "../src/components/EmptyState";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
 import { ToolCard } from "../src/components/ToolCard";
@@ -25,6 +26,7 @@ import {
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 import { createMemoryAuthSession } from "../src/lib/authSession";
+import { MAIN_AGENT } from "../src/lib/agents";
 
 declare global {
   interface Window {
@@ -66,6 +68,8 @@ declare global {
         replyTo?: { messageId: string; role: "user" | "assistant"; text: string };
       }>;
     };
+    __starterSends: string[];
+    __queueSends: string[];
     __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
     __runPendingDispatchJournalProbe: () => Promise<{
@@ -87,6 +91,8 @@ window.__scrollTimeline = {
 window.__archiveTimeline = { calls: 0, mergedPages: 0, messageCount: 0 };
 window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
+window.__starterSends = [];
+window.__queueSends = [];
 window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
 window.__runPendingDispatchJournalProbe = async () => {
@@ -146,6 +152,42 @@ createRoot(document.getElementById("root")!).render(
       onUpload={uploadStub}
       onSetGoal={async () => {}}
       onGoalAction={async () => {}}
+    />
+  </StrictMode>,
+);
+
+function StarterProbe() {
+  const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [submitSignal, setSubmitSignal] = useState(0);
+  return (
+    <>
+      <EmptyState
+        agent={MAIN_AGENT}
+        onPrefill={(text) => setPrefill({ text, nonce: Date.now() })}
+        onRun={() => setSubmitSignal((value) => value + 1)}
+        onChangeAgent={() => {}}
+      />
+      <Composer
+        onSend={(text) => window.__starterSends.push(text)}
+        prefill={prefill}
+        submitSignal={submitSignal}
+      />
+    </>
+  );
+}
+
+createRoot(document.getElementById("starter-root")!).render(
+  <StrictMode><StarterProbe /></StrictMode>,
+);
+
+createRoot(document.getElementById("queue-composer-root")!).render(
+  <StrictMode>
+    <Composer
+      busy
+      onStop={() => {}}
+      onSend={(text) => window.__queueSends.push(text)}
+      queuedDispatch={{ count: 2, savingCount: 0, cancellingCount: 0, canUndo: true }}
+      onUndoQueuedSend={async () => ({ ok: true })}
     />
   </StrictMode>,
 );

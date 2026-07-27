@@ -145,7 +145,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="starter-root"></div><div id="queue-composer-root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -741,6 +741,101 @@ await check("T19 真 IndexedDB 多标签陈旧快照不抹除/复活发送日志
     throw new Error("已 ACK 删除的 exact pending-dispatch 被陈旧快照复活");
   }
 });
+
+await check("T21 首任务只预填，确认发送用户修改后的 Composer 正文", async () => {
+  const root = page.locator("#starter-root");
+  const card = root.locator('[data-starter-id="budget_xlsx"]');
+  await card.waitFor({ state: "visible", timeout: 3000 });
+  await card.click();
+  const composer = root.getByPlaceholder("给 OpenClaude 发消息…");
+  await page.waitForFunction(() => {
+    const node = document.querySelector("#starter-root textarea");
+    return (
+      node instanceof HTMLTextAreaElement &&
+      node.value.includes("家庭预算表") &&
+      node.value.includes(".xlsx")
+    );
+  });
+  const initial = await composer.inputValue();
+  if (!initial.includes("家庭预算表") || !initial.includes(".xlsx")) {
+    throw new Error(`首任务没有把完整可交付 prompt 装入 Composer:${initial}`);
+  }
+  const edited = "把预算表改成 12 个月，并额外加一张年度汇总图";
+  await composer.fill(edited);
+  const confirm = root.getByRole("button", { name: "发送并开跑" });
+  await confirm.click();
+  await page.waitForFunction(() => window.__starterSends.length === 1);
+  const sends = await page.evaluate(() => window.__starterSends);
+  if (JSON.stringify(sends) !== JSON.stringify([edited])) {
+    throw new Error(`确认没有逐字发送当前 Composer 正文:${JSON.stringify(sends)}`);
+  }
+  await confirm.click();
+  await page.waitForTimeout(50);
+  const afterRepeat = await page.evaluate(() => window.__starterSends);
+  if (JSON.stringify(afterRepeat) !== JSON.stringify([edited])) {
+    throw new Error(`正文清空后重复确认产生了重复发送:${JSON.stringify(afterRepeat)}`);
+  }
+});
+
+const mobileUiContext = await browser.newContext({
+  viewport: { width: 390, height: 844 },
+  isMobile: true,
+  hasTouch: true,
+});
+const mobileUiPage = await mobileUiContext.newPage();
+watchRuntimeErrors(mobileUiPage, "mobile-ui");
+await mobileUiPage.route("**/*", serveBuiltAsset);
+await mobileUiPage.route(harnessUrl, (route) => route.fulfill({
+  status: 200,
+  contentType: "text/html",
+  body: html,
+}));
+await mobileUiPage.goto(harnessUrl);
+
+await check("T22 390px 真触屏下停止/排队发送分槽且发送保持最右", async () => {
+  screenshotPage = mobileUiPage;
+  const root = mobileUiPage.locator("#queue-composer-root");
+  const stop = root.getByRole("button", { name: "停止" });
+  const send = root.getByRole("button", { name: "排队发送" });
+  const undo = root.getByRole("button", { name: "撤销最后一条" });
+  await stop.waitFor({ state: "visible", timeout: 3000 });
+  const [stopBox, sendBox, undoBox] = await Promise.all([
+    stop.boundingBox(),
+    send.boundingBox(),
+    undo.boundingBox(),
+  ]);
+  if (!stopBox || !sendBox || !undoBox) throw new Error("排队 Composer 控件不可测量");
+  if (sendBox.x <= stopBox.x || Math.abs(sendBox.y - stopBox.y) > 1) {
+    throw new Error(`停止/发送位置漂移:${JSON.stringify({ stopBox, sendBox })}`);
+  }
+  if (
+    stopBox.width < TOUCH_MIN ||
+    stopBox.height < TOUCH_MIN ||
+    sendBox.width < TOUCH_MIN ||
+    sendBox.height < TOUCH_MIN ||
+    undoBox.height < TOUCH_MIN
+  ) {
+    throw new Error(`触控尺寸不足:${JSON.stringify({ stopBox, sendBox, undoBox })}`);
+  }
+  if (!(await send.isDisabled())) throw new Error("busy + 空正文时排队发送按钮没有禁用");
+  const receipt = root.getByTestId("composer-queued-notice");
+  if (!(await receipt.textContent())?.includes("已排队 2 条")) {
+    throw new Error("没有渲染 service 权威队列回执");
+  }
+  const overflow = await root.evaluate((node) => node.scrollWidth > node.clientWidth);
+  if (overflow) throw new Error("390px 队列回执或 Composer 产生横向溢出");
+
+  await root.getByPlaceholder("给 OpenClaude 发消息…").fill("移动端下一条");
+  if (await send.isDisabled()) throw new Error("busy + 有正文时排队发送仍被禁用");
+  await send.click();
+  await mobileUiPage.waitForFunction(() => window.__queueSends.length === 1);
+  const sends = await mobileUiPage.evaluate(() => window.__queueSends);
+  if (JSON.stringify(sends) !== JSON.stringify(["移动端下一条"])) {
+    throw new Error(`排队发送内容漂移:${JSON.stringify(sends)}`);
+  }
+});
+screenshotPage = page;
+await mobileUiContext.close();
 
 async function assertContainerPreviewFillsViewport(page, expectedDevice, width, height, top = 0) {
   const dialog = page.getByRole("dialog", { name: "容器网页预览与元素评论" });
