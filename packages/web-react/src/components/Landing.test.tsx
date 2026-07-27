@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../lib/api";
 import { Landing } from "./Landing";
@@ -51,6 +51,46 @@ describe("Landing 落地页", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: /免费开始/ })[0]);
     expect(onStart).toHaveBeenCalled();
+  });
+
+  test("移动导航可展开全部入口，导航与 CTA 操作后自动收起", () => {
+    const onStart = vi.fn();
+    const onLogin = vi.fn();
+    render(<Landing {...base} onStart={onStart} onLogin={onLogin} />);
+
+    const menu = screen.getByRole("button", { name: "打开导航菜单" });
+    expect(menu).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(menu);
+
+    const mobileNav = document.getElementById("landing-mobile-nav");
+    expect(mobileNav).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭导航菜单" })).toHaveAttribute("aria-expanded", "true");
+    const nav = within(mobileNav!);
+    for (const label of ["演示", "智能体", "快速上手", "企业版", "常见问题"]) {
+      expect(nav.getByRole("link", { name: label })).toBeInTheDocument();
+    }
+
+    fireEvent.click(nav.getByRole("link", { name: "智能体" }));
+    expect(document.getElementById("landing-mobile-nav")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "打开导航菜单" }));
+    fireEvent.click(within(document.getElementById("landing-mobile-nav")!).getByRole("button", { name: "登录" }));
+    expect(onLogin).toHaveBeenCalledTimes(1);
+    expect(document.getElementById("landing-mobile-nav")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "打开导航菜单" }));
+    fireEvent.click(within(document.getElementById("landing-mobile-nav")!).getByRole("button", { name: "免费开始" }));
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(document.getElementById("landing-mobile-nav")).toBeNull();
+  });
+
+  test("主标题渐变句独占一行且手机字号不挤压", () => {
+    render(<Landing {...base} onStart={() => {}} onLogin={() => {}} />);
+
+    const heading = screen.getByRole("heading", { level: 1 });
+    expect(heading).toHaveClass("text-[36px]", "sm:text-[40px]", "md:text-[60px]");
+    expect(heading.querySelector("br")).toBeNull();
+    expect(screen.getByText("拿回能直接用的成果")).toHaveClass("block");
   });
 });
 
