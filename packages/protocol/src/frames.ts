@@ -928,6 +928,7 @@ export const OutboundError = Type.Object({
     Type.Literal('insufficient_credits'),
     Type.Literal('rate_limited'),
     Type.Literal('model_capacity'),
+    Type.Literal('model_config_changed_retry_turn'),
     Type.Literal('upstream_failed'),
     Type.Literal('context_too_long'),
   ]),

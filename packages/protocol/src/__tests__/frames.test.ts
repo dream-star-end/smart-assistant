@@ -326,6 +326,15 @@ describe('OutboundError schema', () => {
   it('accepts frame without traceId', () => {
     assert.equal(Value.Check(OutboundError, baseOutboundError()), true)
   })
+  it('accepts model_config_changed_retry_turn', () => {
+    assert.equal(
+      Value.Check(OutboundError, {
+        ...(baseOutboundError() as object),
+        code: 'model_config_changed_retry_turn',
+      }),
+      true,
+    )
+  })
   it('accepts valid traceId', () => {
     assert.equal(
       Value.Check(OutboundError, { ...(baseOutboundError() as object), traceId: VALID_TRACE }),
