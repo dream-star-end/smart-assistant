@@ -29,26 +29,15 @@
  */
 
 import type { PoolClient } from "pg";
+import {
+  LEDGER_REASONS,
+  type LedgerReason,
+} from "@openclaude/protocol/ledger";
 import { tx, query as rootQuery } from "../db/queries.js";
 import { writeAdminAudit } from "../admin/audit.js";
 
-/** credit_ledger.reason 的 CHECK 白名单,和 0002 / 0077 / 0096 迁移保持同步。 */
-export const LEDGER_REASONS = [
-  "topup",
-  "chat",
-  "agent_chat",
-  "agent_subscription",
-  "refund",
-  "admin_adjust",
-  "promotion",
-  "minimax_media",
-  "image_generation",
-  // 0096 双钱包订阅：subscription=期内桶发放, subscription_expire=轮转清零(负), pack=加量包进期内桶。
-  "subscription",
-  "subscription_expire",
-  "pack",
-] as const;
-export type LedgerReason = (typeof LEDGER_REASONS)[number];
+export { LEDGER_REASONS };
+export type { LedgerReason };
 
 /**
  * credit_ledger.bucket 的 CHECK 白名单（与 0096 / 0112 / 0115 迁移的 DB CHECK 单一权威对齐）：

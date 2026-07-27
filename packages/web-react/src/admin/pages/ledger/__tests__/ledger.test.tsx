@@ -40,13 +40,30 @@ describe("LedgerPage", () => {
     render(<LedgerPage />);
     expect(await screen.findByText("测试备注")).toBeTruthy();
     // reason 标签
-    expect(screen.getByText("充值")).toBeTruthy();
+    expect(screen.getByText("充值到账")).toBeTruthy();
     // KPI 标签
     expect(screen.getByText("总入账")).toBeTruthy();
     expect(vi.mocked(adminGet)).toHaveBeenCalledWith(
       "/ledger",
       expect.objectContaining({ limit: 50 }),
     );
+  });
+
+  test("套餐发放显示真实方向且可作为完整 reason 过滤项", async () => {
+    window.location.hash = "#tab=ledger&reason=subscription";
+    vi.mocked(adminGet).mockResolvedValue({
+      rows: [{ ...row, reason: "subscription" }],
+      next_before: null,
+    });
+    render(<LedgerPage />);
+    expect((await screen.findAllByText("套餐额度发放")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText("订阅扣费")).toBeNull();
+    await waitFor(() => {
+      expect(vi.mocked(adminGet)).toHaveBeenCalledWith(
+        "/ledger",
+        expect.objectContaining({ reason: "subscription" }),
+      );
+    });
   });
 
   test("user_id 过滤 → 查询按正确参数重拉", async () => {

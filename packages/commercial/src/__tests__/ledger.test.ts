@@ -4,6 +4,9 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   adminAdjust,
   InsufficientCreditsError,
@@ -28,27 +31,16 @@ describe("InsufficientCreditsError", () => {
 });
 
 describe("LEDGER_REASONS (schema sync check)", () => {
-  test("expected reasons present", () => {
-    for (const r of [
-      "topup",
-      "chat",
-      "agent_chat",
-      "agent_subscription",
-      "refund",
-      "admin_adjust",
-      "promotion",
-      "minimax_media",
-      // 0096 双钱包订阅
-      "subscription",
-      "subscription_expire",
-      "pack",
-      // 0131 codex 原生生图按张计费
-      "image_generation",
-    ]) {
-      assert.ok(LEDGER_REASONS.includes(r as (typeof LEDGER_REASONS)[number]));
-    }
-    // 不允许悄悄加东西而忘了同步 0002_init_billing.sql + 后续约束迁移（0077 +1, 0096 +3, 0131 +1）。
-    assert.equal(LEDGER_REASONS.length, 12);
+  test("matches the final reason constraint migration exactly", async () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const sql = await readFile(
+      path.resolve(here, "../db/migrations/0131_image_generation_billing.sql"),
+      "utf8",
+    );
+    const constraint = /CHECK\s*\(reason IN\s*\(([\s\S]*?)\)\)\s*NOT VALID/.exec(sql)?.[1];
+    assert.ok(constraint, "0131 final credit_ledger reason CHECK must remain parseable");
+    const databaseReasons = [...constraint.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+    assert.deepEqual([...databaseReasons].sort(), [...LEDGER_REASONS].sort());
   });
 });
 
