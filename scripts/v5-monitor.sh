@@ -944,8 +944,10 @@ for name in "${CHECK_NAMES[@]}"; do
     log "PLANNED $name: $detail"
     PLANNED_SUPPRESSED["$name"]=1
     PLANNED_LIST+=("$name")
+    sev="$(check_severity "$name")"
     NEW_STATE="$(echo "$NEW_STATE" | jq --arg k "$name" --arg nonce "$MAINTENANCE_NONCE" \
-      '.checks[$k] = {status:"planned", since:0, last_alert:0, maintenance_nonce:$nonce}')"
+      --arg severity "$sev" \
+      '.checks[$k] = {status:"planned", since:0, last_alert:0, maintenance_nonce:$nonce, severity:$severity}')"
     continue
   fi
 
@@ -992,9 +994,10 @@ for name in "${CHECK_NAMES[@]}"; do
     fi
     since=0; last_alert=0
   fi
-  NEW_STATE="$(echo "$NEW_STATE" | jq --arg k "$name" --arg s "$st" \
+  sev="$(check_severity "$name")"
+  NEW_STATE="$(echo "$NEW_STATE" | jq --arg k "$name" --arg s "$st" --arg severity "$sev" \
     --argjson since "$since" --argjson la "$last_alert" \
-    '.checks[$k] = {status:$s, since:$since, last_alert:$la}')"
+    '.checks[$k] = {status:$s, since:$since, last_alert:$la, severity:$severity}')"
 done
 
 # ───────────────────────────────────────────────
@@ -1099,7 +1102,10 @@ fi
 # ───────────────────────────────────────────────
 if [ "$DRY_RUN" = 1 ]; then
   echo "── dry-run:检查结果(状态未写入)─────"
-  for name in "${CHECK_NAMES[@]}"; do printf '%-12s %-4s %s\n' "$name" "${CHECK_ST[$name]}" "${CHECK_DETAIL[$name]}"; done
+  for name in "${CHECK_NAMES[@]}"; do
+    printf '%-12s %-4s %s [severity=%s]\n' \
+      "$name" "${CHECK_ST[$name]}" "${CHECK_DETAIL[$name]}" "$(check_severity "$name")"
+  done
 else
   mkdir -p "$(dirname "$STATE_FILE")"
   echo "$NEW_STATE" | jq . > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
