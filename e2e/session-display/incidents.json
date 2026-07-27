@@ -620,7 +620,8 @@
       "rootFixCommit": "6796ff82",
       "coverageCommits": [
         "d007c3d7",
-        "016019a0"
+        "016019a0",
+        "6e02eacf"
       ],
       "regressions": [
         {
