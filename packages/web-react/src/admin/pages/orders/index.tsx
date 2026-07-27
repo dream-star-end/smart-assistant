@@ -7,6 +7,8 @@ import {
   Input,
   Modal,
   Spinner,
+  useConfirm,
+  usePrompt,
   useToast,
 } from "../../../components/ui";
 import {
@@ -23,7 +25,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
-import { adminGet, adminText, apiErrorMessage } from "../../lib/adminApi";
+import { adminGet, adminSend, adminText, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 import { useAdminRoute } from "../../router";
 
@@ -72,6 +74,15 @@ type OrderDetail = OrderRow & {
   callback_payload: unknown;
   ledger_id: string | null;
   refunded_ledger_id: string | null;
+  kind: string;
+  org_id: string | null;
+  refund_state: string | null;
+  refund_reason: string | null;
+  refund_requested_at: string | null;
+  refund_hold_ledger_id: string | null;
+  provider_refund_no: string | null;
+  refund_payload: unknown;
+  refunded_at: string | null;
 };
 type OrdersResp = {
   rows: OrderRow[];
@@ -119,13 +130,20 @@ function triggerCsvDownload(text: string, filename: string): void {
 function OrderDetailModal({
   orderNo,
   onClose,
+  onChanged,
 }: {
   orderNo: string | null;
   onClose: () => void;
+  onChanged: () => void;
 }) {
+  const toast = useToast();
+  const [promptReason, promptReasonEl] = usePrompt();
+  const [confirm, confirmEl] = useConfirm();
   const [order, setOrder] = useState<OrderDetail | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refunding, setRefunding] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [detailTick, setDetailTick] = useState(0);
 
   useEffect(() => {
     if (!orderNo) return;
@@ -148,11 +166,76 @@ function OrderDetailModal({
     return () => {
       alive = false;
     };
-  }, [orderNo]);
+  }, [orderNo, detailTick]);
 
   const payloadText = order?.callback_payload
     ? JSON.stringify(order.callback_payload, null, 2)
     : "(无 callback,可能未到账或还在 pending)";
+  const refundPayloadText = order?.refund_payload
+    ? JSON.stringify(order.refund_payload, null, 2)
+    : null;
+  const refundStateLabel: Record<string, string> = {
+    requested: "已提交，待渠道确认",
+    channel_pending: "渠道状态待核对",
+    failed_review: "退款失败待人工核对",
+    completed: "已完成",
+  };
+
+  const requestRefund = async () => {
+    if (!order || refunding) return;
+    const reason = await promptReason({
+      title: "填写退款原因",
+      body: (
+        <p className="mb-3 text-[13px] leading-relaxed text-muted">
+          原因会提交给支付渠道，并可能显示在用户收到的退款通知中。
+        </p>
+      ),
+      placeholder: "例如：用户申请原路退款",
+      initial: "用户申请原路退款",
+      confirmText: "下一步",
+      maxLength: 80,
+    });
+    if (!reason) return;
+    const ok = await confirm({
+      title: "确认原路退款？",
+      danger: true,
+      confirmText: "确认并冻结积分",
+      body: (
+        <div className="space-y-2 text-[13px] leading-relaxed text-muted">
+          <p>
+            订单 <span className="font-mono text-fg">{order.order_no}</span>，
+            金额 <span className="font-medium text-fg">{fmtCents(order.amount_cents)}</span>。
+          </p>
+          <p>
+            确认后会先从原钱包冻结该订单发放的 <strong className="text-fg">{order.credits}</strong>{" "}
+            积分，再向虎皮椒发起唯一一次全额退款请求。
+          </p>
+          <p>渠道结果不明确时不会自动重试，积分保持冻结，需在渠道后台人工核对。</p>
+        </div>
+      ),
+    });
+    if (!ok) return;
+
+    setRefunding(true);
+    try {
+      const response = await adminSend<{
+        refund: { state: string; provider_status: string | null };
+      }>("POST", `/orders/${encodeURIComponent(order.order_no)}/refund`, { reason });
+      const completed = response.refund.state === "completed";
+      toast(
+        completed ? "退款已完成" : "退款已提交，权益已冻结，请关注渠道状态",
+        completed ? "success" : "info",
+      );
+      setDetailTick((t) => t + 1);
+      onChanged();
+    } catch (e) {
+      toast(`退款未提交：${apiErrorMessage(e, "请求失败")}`, "error");
+      setDetailTick((t) => t + 1);
+      onChanged();
+    } finally {
+      setRefunding(false);
+    }
+  };
 
   return (
     <Modal
@@ -216,6 +299,53 @@ function OrderDetailModal({
               }
             />
           )}
+          {order.refund_state && (
+            <>
+              <KeyValue
+                label="退款状态"
+                value={
+                  <Badge tone={order.refund_state === "completed" ? "success" : "warning"}>
+                    {refundStateLabel[order.refund_state] ?? order.refund_state}
+                  </Badge>
+                }
+              />
+              <KeyValue label="退款原因" value={order.refund_reason ?? "—"} />
+              <KeyValue label="发起时间" value={fmtDateTime(order.refund_requested_at)} />
+              <KeyValue label="完成时间" value={fmtDateTime(order.refunded_at)} />
+              {order.provider_refund_no && (
+                <KeyValue
+                  label="渠道退款号"
+                  value={<CopyChip value={order.provider_refund_no} />}
+                />
+              )}
+              {order.refund_state !== "completed" && (
+                <div className="my-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] leading-relaxed text-warning">
+                  对应积分已冻结。当前结果不能证明渠道退款完成，请在虎皮椒后台人工核对；
+                  系统不会自动重复发起退款。
+                </div>
+              )}
+            </>
+          )}
+          {order.status === "paid" && order.kind === "topup" && !order.refund_state && (
+            <div className="flex justify-end py-3">
+              <Button variant="danger" size="sm" onClick={requestRefund} disabled={refunding}>
+                {refunding ? "提交中…" : "原路退款"}
+              </Button>
+            </div>
+          )}
+          {order.status === "paid" && order.kind !== "topup" && !order.refund_state && (
+            <div className="my-2 rounded-lg bg-hover px-3 py-2 text-[12px] leading-relaxed text-muted">
+              此类订单缺少可安全还原的付款前权益快照，不能自动原路退款，请人工核对处理。
+            </div>
+          )}
+          {refundPayloadText && (
+            <div className="pt-3">
+              <p className="mb-1.5 text-[12px] text-faint">refund_payload(脱敏渠道结果)</p>
+              <pre className="max-h-48 overflow-auto rounded-lg bg-hover p-3 font-mono text-[11px] leading-relaxed text-muted">
+                {refundPayloadText}
+              </pre>
+            </div>
+          )}
           <div className="pt-3">
             <p className="mb-1.5 text-[12px] text-faint">callback_payload(支付方原始回调)</p>
             <pre className="max-h-72 overflow-auto rounded-lg bg-hover p-3 font-mono text-[11px] leading-relaxed text-muted">
@@ -226,6 +356,8 @@ function OrderDetailModal({
       ) : (
         <p className="py-6 text-center text-[13px] text-faint">未找到该订单</p>
       )}
+      {promptReasonEl}
+      {confirmEl}
     </Modal>
   );
 }
@@ -551,7 +683,11 @@ export default function OrdersPage() {
         )}
       </div>
 
-      <OrderDetailModal orderNo={detailOrderNo} onClose={() => setDetailOrderNo(null)} />
+      <OrderDetailModal
+        orderNo={detailOrderNo}
+        onClose={() => setDetailOrderNo(null)}
+        onChanged={() => setReloadTick((t) => t + 1)}
+      />
     </div>
   );
 }

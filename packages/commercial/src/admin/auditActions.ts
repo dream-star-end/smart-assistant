@@ -44,6 +44,8 @@ export const ADMIN_AUDIT_ACTIONS = {
   // ── 计费/模型配置(tx)────────────────────────────────────────────
   "pricing.patch": { kind: "write", mode: "tx" },
   "plan.patch": { kind: "write", mode: "tx" },
+  "order.refund.request": { kind: "write", mode: "tx" },
+  "order.refund.complete": { kind: "write", mode: "tx" },
   "model_grant.add": { kind: "write", mode: "tx" },
   "model_grant.remove": { kind: "write", mode: "tx" },
   "provider_ops.put": { kind: "write", mode: "tx" },
