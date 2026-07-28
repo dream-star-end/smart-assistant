@@ -117,15 +117,8 @@ import { SelfhealCallbackPump } from './selfheal/callbackPump.js'
 import { executeSelfhealCancel } from './selfheal/cancel.js'
 import { refreshEgressPreferSelector } from './selfheal/egressRefresh.js'
 import { SelfhealJobWorker, getSelfhealJobWorkerDeps } from './selfheal/jobWorker.js'
+import { SelfhealMasterGuardian, masterGuardianConfigFromEnv } from './selfheal/masterGuardian.js'
 import { createWecomNotifier } from './selfheal/notify.js'
-import {
-  enqueueReleaseJob,
-  readCommittedCutoverPlan,
-} from './selfheal/releaseIntake.js'
-import {
-  SelfhealReleaseWorker,
-  getSelfhealReleaseWorkerDeps,
-} from './selfheal/releaseWorker.js'
 import {
   SELFHEAL_CANCEL_WEBHOOK_PATH,
   SELFHEAL_FUSE_CLEAR_WEBHOOK_PATH,
@@ -142,6 +135,8 @@ import {
   resolveReleaseJobCancel,
   verifySelfhealSignedRequest,
 } from './selfheal/receiver.js'
+import { enqueueReleaseJob, readCommittedCutoverPlan } from './selfheal/releaseIntake.js'
+import { SelfhealReleaseWorker, getSelfhealReleaseWorkerDeps } from './selfheal/releaseWorker.js'
 import { SessionManager } from './sessionManager.js'
 import {
   VOICE_WS_PATH,
@@ -263,6 +258,8 @@ export class Gateway {
   private _selfhealBroker: SelfhealBroker | null = null
   // Self-heal (batch1b): durable Tier2 release worker (deploy lane driver).
   private _selfhealReleaseWorker: SelfhealReleaseWorker | null = null
+  // Self-heal: independent serving-master process guardian.
+  private _selfhealMasterGuardian: SelfhealMasterGuardian | null = null
   private _taskStore = new TaskStore()
   private _runLog = new RunLog()
   private channels = new Map<string, ChannelAdapter>()
@@ -1041,6 +1038,14 @@ export class Gateway {
       }
     }
 
+    const masterGuardianConfig = masterGuardianConfigFromEnv()
+    if (masterGuardianConfig) {
+      this._selfhealMasterGuardian = new SelfhealMasterGuardian({
+        hostAction: masterGuardianConfig,
+      })
+      this._selfhealMasterGuardian.start()
+    }
+
     // EventBus: route webhook.received → agent execution + delivery
     eventBus.on('webhook.received', (ev) => {
       const { webhookId, agentId, payload } = ev
@@ -1343,6 +1348,11 @@ export class Gateway {
       this._selfhealReleaseWorker?.stop()
     } catch (err) {
       this.log.warn('selfheal release worker stop error', undefined, err)
+    }
+    try {
+      this._selfhealMasterGuardian?.stop()
+    } catch (err) {
+      this.log.warn('selfheal active-master guardian stop error', undefined, err)
     }
     try {
       await this._selfhealBroker?.stop()

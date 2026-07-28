@@ -18,9 +18,11 @@ set -uo pipefail
 OPCODE="${SSH_ORIGINAL_COMMAND:-${1:-}}"
 EGRESS_UNIT="openclaude-v5-egress.service"
 V5_ENV="${OC_SELFHEAL_V5_ENV:-/etc/openclaude/commercial-v5.env}"
-MASTER_HEALTH_TIMEOUT="${OC_SELFHEAL_MASTER_HEALTH_TIMEOUT:-60}"
-if [[ ! "$MASTER_HEALTH_TIMEOUT" =~ ^[1-9][0-9]?$ ]] || (( MASTER_HEALTH_TIMEOUT > 60 )); then
-  MASTER_HEALTH_TIMEOUT=60
+MASTER_TOTAL_TIMEOUT="${OC_SELFHEAL_MASTER_TOTAL_TIMEOUT:-55}"
+# Leave five seconds of transport/receipt margin inside the broker's 90s SSH
+# deadline. This budget covers state reads + restart + both health proofs.
+if [[ ! "$MASTER_TOTAL_TIMEOUT" =~ ^[1-9][0-9]?$ ]] || (( MASTER_TOTAL_TIMEOUT > 55 )); then
+  MASTER_TOTAL_TIMEOUT=55
 fi
 
 emit() { # emit <outcome> <exit_code> <detail-json>
@@ -84,6 +86,25 @@ acquire_mutation_lease() {
   fi
 }
 
+MASTER_ACTION_DEADLINE=0
+start_master_action_budget() {
+  MASTER_ACTION_DEADLINE=$(( $(date +%s) + MASTER_TOTAL_TIMEOUT ))
+}
+
+remaining_master_seconds() {
+  local remaining=$(( MASTER_ACTION_DEADLINE - $(date +%s) ))
+  (( remaining > 0 )) || return 1
+  printf '%s\n' "$remaining"
+}
+
+bounded_master_command() { # <per-command-cap-seconds> <command...>
+  local cap="$1" remaining
+  shift
+  remaining="$(remaining_master_seconds)" || return 124
+  (( remaining < cap )) && cap="$remaining"
+  timeout --signal=TERM "$cap" "$@"
+}
+
 reject_master_action() { # <reason>
   emit rejected 66 "$(printf '{"reason":"%s"}' "$1")"
   exit 66
@@ -92,16 +113,17 @@ reject_master_action() { # <reason>
 read_stable_active_master() {
   [ -r "$V5_ENV" ] || reject_master_action "v5 env unreadable"
 
-  local row rc phase active candidate extra
-  row="$(
+  local row rc phase active candidate extra dburl
+  dburl="$(
     set -a
     # shellcheck disable=SC1090
     . "$V5_ENV"
     set +a
-    [ -n "${DATABASE_URL:-}" ] || exit 3
-    psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
-      "SELECT phase,active_slot,COALESCE(candidate_slot,'') FROM deploy_state WHERE singleton=true"
+    printf '%s' "${DATABASE_URL:-}"
   )"
+  [ -n "$dburl" ] || reject_master_action "DATABASE_URL missing"
+  row="$(bounded_master_command 5 psql "$dburl" -X -v ON_ERROR_STOP=1 -tA -F '|' -c \
+    "SELECT phase,active_slot,COALESCE(candidate_slot,'') FROM deploy_state WHERE singleton=true")"
   rc=$?
   [ "$rc" -eq 0 ] || reject_master_action "deploy_state query failed"
   [[ -n "$row" && "$row" != *$'\n'* ]] || reject_master_action "deploy_state row count invalid"
@@ -126,14 +148,40 @@ read_stable_active_master() {
   esac
 }
 
+read_master_unit_state() {
+  local raw rc load active sub
+  raw="$(bounded_master_command 5 systemctl show --no-pager \
+    --property=LoadState --property=ActiveState --property=SubState "$MASTER_UNIT" 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] || reject_master_action "systemd unit state query failed"
+  if [ "$(printf '%s\n' "$raw" | grep -c '^LoadState=')" -ne 1 ] \
+    || [ "$(printf '%s\n' "$raw" | grep -c '^ActiveState=')" -ne 1 ] \
+    || [ "$(printf '%s\n' "$raw" | grep -c '^SubState=')" -ne 1 ]; then
+    reject_master_action "systemd unit state response invalid"
+  fi
+  load="$(printf '%s\n' "$raw" | sed -n 's/^LoadState=//p')"
+  active="$(printf '%s\n' "$raw" | sed -n 's/^ActiveState=//p')"
+  sub="$(printf '%s\n' "$raw" | sed -n 's/^SubState=//p')"
+  case "$load:$active:$sub" in
+    loaded:active:*)
+      MASTER_UNIT_ACTION=noop
+      ;;
+    loaded:inactive:dead|loaded:failed:failed)
+      MASTER_UNIT_ACTION=restart
+      ;;
+    *)
+      reject_master_action "systemd unit state is not safely restartable"
+      ;;
+  esac
+}
+
 master_health_ok() {
   local private public
-  PRIVATE_HEALTH_OK=0
-  PUBLIC_HEALTH_OK=0
-  private="$(curl -fsS --max-time 3 "$MASTER_HEALTH_URL" 2>/dev/null)" || return 1
+  private="$(bounded_master_command 3 curl --noproxy '*' -fsS "$MASTER_HEALTH_URL" 2>/dev/null)" \
+    || return 1
   printf '%s' "$private" | jq -e '.ok == true and .channel == "v5"' >/dev/null 2>&1 || return 1
   PRIVATE_HEALTH_OK=1
-  public="$(curl -fsS --max-time 3 -H 'Host: claudeai.chat' \
+  public="$(bounded_master_command 3 curl --noproxy '*' -fsS -H 'Host: claudeai.chat' \
     'http://127.0.0.1/healthz' 2>/dev/null)" || return 1
   printf '%s' "$public" | jq -e '.ok == true and .channel == "v5"' >/dev/null 2>&1 || return 1
   PUBLIC_HEALTH_OK=1
@@ -148,7 +196,7 @@ fi
 case "$OPCODE" in
   capabilities-v1)
     # 三层交集握手:本执行器支持的 opcode 清单(broker 启动/首用时核对)。
-    emit ok 0 '{"capabilities":["restart-v5-egress-v1","restart-v5-active-master-v1"]}'
+    emit ok 0 '{"capabilities":["restart-v5-egress-v1","ensure-v5-active-master-v1"]}'
     exit 0
     ;;
 
@@ -165,40 +213,48 @@ case "$OPCODE" in
     exit "$rc"
     ;;
 
-  restart-v5-active-master-v1)
+  ensure-v5-active-master-v1)
     stand_down_if_maintenance
     acquire_mutation_lease
-    # active slot is resolved only after taking the same production-mutation
-    # lease as deploy-v5.sh. The lease stays held through restart + health proof,
-    # so a deploy cannot switch A/B between the read and the action.
+    start_master_action_budget
+    # The active slot and exact systemd state are resolved only after taking the
+    # same production-mutation lease as deploy-v5.sh. Active is a no-op: HTTP,
+    # PG, and Redis failures are not process-crash evidence and never trigger a
+    # blind restart. Only exact inactive/dead or failed/failed is restartable.
     read_stable_active_master
-    out="$(timeout 15 systemctl restart "$MASTER_UNIT" 2>&1)"; rc=$?
+    read_master_unit_state
+    if [ "$MASTER_UNIT_ACTION" = noop ]; then
+      emit completed 0 "$(printf '{"action":"noop","slot":"%s","unit":"%s","reason":"unit active"}' \
+        "$MASTER_SLOT" "$MASTER_UNIT")"
+      exit 0
+    fi
+
+    out="$(bounded_master_command 15 systemctl restart "$MASTER_UNIT" 2>&1)"; rc=$?
     if [ "$rc" -ne 0 ]; then
       diag="$(printf '%s' "$out" | tail -c 400 | tr '\n' ' ')"
       printf '[selfheal-host-action] restart %s failed rc=%s: %s\n' \
         "$MASTER_UNIT" "$rc" "$diag" >&2
-      emit failed "$rc" "$(printf '{"slot":"%s","unit":"%s","reason":"restart failed"}' \
+      emit failed "$rc" "$(printf '{"action":"restart","slot":"%s","unit":"%s","reason":"restart failed"}' \
         "$MASTER_SLOT" "$MASTER_UNIT")"
       exit "$rc"
     fi
 
     PRIVATE_HEALTH_OK=0
     PUBLIC_HEALTH_OK=0
-    deadline=$(( $(date +%s) + MASTER_HEALTH_TIMEOUT ))
     while :; do
       if master_health_ok; then
-        emit completed 0 "$(printf '{"slot":"%s","unit":"%s","privateHealth":true,"publicHealth":true}' \
+        emit completed 0 "$(printf '{"action":"restart","slot":"%s","unit":"%s","privateHealth":true,"publicHealth":true}' \
           "$MASTER_SLOT" "$MASTER_UNIT")"
         exit 0
       fi
-      [ "$(date +%s)" -ge "$deadline" ] && break
-      sleep 2
+      remaining="$(remaining_master_seconds)" || break
+      if (( remaining < 2 )); then sleep "$remaining"; else sleep 2; fi
     done
     private_health=false
     public_health=false
     [ "$PRIVATE_HEALTH_OK" -eq 1 ] && private_health=true
     [ "$PUBLIC_HEALTH_OK" -eq 1 ] && public_health=true
-    emit failed 70 "$(printf '{"slot":"%s","unit":"%s","reason":"health timeout","privateHealth":%s,"publicHealth":%s}' \
+    emit failed 70 "$(printf '{"action":"restart","slot":"%s","unit":"%s","reason":"health timeout","privateHealth":%s,"publicHealth":%s}' \
       "$MASTER_SLOT" "$MASTER_UNIT" "$private_health" "$public_health")"
     exit 70
     ;;
