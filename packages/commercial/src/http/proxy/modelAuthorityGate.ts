@@ -204,6 +204,8 @@ export class ModelGateReject extends Error {
 export interface ModelAuthorityDecision {
   /** 本请求线性化到的快照(路由 / 能力 / 清洗 / settle 全部消费它,单一权威)。 */
   snapshot: ModelCatalogSnapshot;
+  /** 与 snapshot.securityEpoch 同一 fence 下读取的账号级硬拒绝集合。 */
+  deniedModelIds: ReadonlySet<string>;
   /** alias 归一后的 canonical model id。 */
   canonicalModel: string;
   /** catalog 派生的完整执行语义(engine / provider / upstream / capability / context / effort)。 */
@@ -345,8 +347,11 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
       descriptor,
       snapshot,
     });
-    await loadAndAssertFencedAuthz(args, snapshot, canonicalModel);
-    return decision;
+    const authz = await loadAndAssertFencedAuthz(args, snapshot, canonicalModel);
+    return {
+      ...decision,
+      deniedModelIds: authz.deniedModelIds ?? new Set<string>(),
+    };
   }
 
   if (localRaw) {
@@ -366,6 +371,7 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
     });
     return {
       snapshot,
+      deniedModelIds: authz.deniedModelIds ?? new Set<string>(),
       canonicalModel,
       descriptor,
       authorityKind: "local_catalog",
@@ -408,6 +414,7 @@ async function loadAndAssertFencedAuthz(
     uid: args.uid.toString(),
     role: authz.role,
     grantedModelIds: authz.grantedModelIds,
+    deniedModelIds: authz.deniedModelIds,
   }, canonicalModel)) {
     throw new ModelGateReject("not_available", `model '${canonicalModel}' not authorized`);
   }
@@ -437,6 +444,7 @@ async function recomputeProjectionRevision(a: {
     uid: a.uid.toString(),
     role: a.authz.role,
     grantedModelIds: a.authz.grantedModelIds,
+    deniedModelIds: a.authz.deniedModelIds,
   });
   if (computed !== a.claimed) {
     a.logger.warn("local_catalog_projection_revision_mismatch", {
@@ -463,7 +471,7 @@ function verifyBridgeAuthority(a: {
   canonicalModel: string;
   descriptor: ModelExecutionDescriptor;
   snapshot: ModelCatalogSnapshot;
-}): ModelAuthorityDecision {
+}): Omit<ModelAuthorityDecision, "deniedModelIds"> {
   if (!a.keyring || a.keyring.size === 0) {
     throw new ModelGateReject("authority_invalid", "no authority keyring configured");
   }

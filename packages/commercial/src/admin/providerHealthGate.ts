@@ -11,6 +11,7 @@
  * 空集 = 视作全健康 = 不降级不拦截,绝不因读失败误判降级。
  */
 
+import { createHash } from "node:crypto";
 import { query, type QueryRunner } from "../db/queries.js";
 import { effectiveHealth, type ProviderHealthRow } from "./providerHealth.js";
 
@@ -33,6 +34,11 @@ export interface ProviderQuotaBlock {
   probeLeaseUntil: number | null;
 }
 
+export interface ProviderRoutingAvailability {
+  unavailableProviderIds: ReadonlySet<string>;
+  revision: string;
+}
+
 type Row = {
   provider_id: string;
   health_status: string | null;
@@ -43,8 +49,12 @@ type Row = {
   quota_probe_lease_until: Date | null;
 };
 
-async function loadSnapshot(now: number, runner?: QueryRunner): Promise<CacheEntry | null> {
-  if (cache && now - cache.at < ttlMs()) return cache;
+async function loadSnapshot(
+  now: number,
+  runner?: QueryRunner,
+  forceRefresh = false,
+): Promise<CacheEntry | null> {
+  if (!forceRefresh && cache && now - cache.at < ttlMs()) return cache;
   try {
     const r = await query<Row>(
       `SELECT COALESCE(po.provider_id, qb.provider_id) AS provider_id,
@@ -100,6 +110,41 @@ export async function getDegradedProviders(
     if (block.retryAt > now || (block.probeLeaseUntil ?? 0) > now) set.add(providerId);
   }
   return set;
+}
+
+/**
+ * Team/local routing availability. Exact quota blocks always participate;
+ * heuristic/forced health participates only when its egress enforcement flag
+ * is on. The revision includes that flag, so toggling it invalidates container
+ * routing views even though no database epoch changes.
+ */
+export async function getProviderRoutingAvailability(
+  now: number = Date.now(),
+  runner?: QueryRunner,
+  enforceHealth: boolean = process.env.OC_PROVIDER_HEALTH_ENFORCE === "1",
+  forceRefresh = false,
+): Promise<ProviderRoutingAvailability> {
+  const snapshot = await loadSnapshot(now, runner, forceRefresh);
+  const quotaBlocked: string[] = [];
+  for (const [providerId, block] of snapshot?.quotaBlocks ?? []) {
+    if (block.retryAt > now || (block.probeLeaseUntil ?? 0) > now) {
+      quotaBlocked.push(providerId);
+    }
+  }
+  quotaBlocked.sort();
+  const healthDegraded = enforceHealth
+    ? [...(snapshot?.healthDegraded ?? [])].sort()
+    : [];
+  const unavailableProviderIds = new Set([...quotaBlocked, ...healthDegraded]);
+  const revision = createHash("sha256")
+    .update(JSON.stringify({
+      v: 1,
+      enforceHealth,
+      quotaBlocked,
+      healthDegraded,
+    }))
+    .digest("hex");
+  return { unavailableProviderIds, revision };
 }
 
 /** Heuristic/forced health only; quota blocks have their own unconditional gate. */

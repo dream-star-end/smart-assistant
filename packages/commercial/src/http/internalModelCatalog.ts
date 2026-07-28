@@ -43,6 +43,7 @@ import {
   type UserModelScope,
 } from "../billing/modelCatalog.js";
 import type { UserModelAuthz, UserModelAuthzLoader } from "../auth/userModelAuthz.js";
+import type { ProviderRoutingAvailability } from "../admin/providerHealthGate.js";
 import { PLATFORM_SEED_AGENT_MODEL_IDS } from "../marketplace/seedPlatformAgents.js";
 import {
   PLATFORM_DEFAULT_MODEL,
@@ -93,6 +94,8 @@ export interface ModelCatalogHandlerDeps {
   loadUserModelAuthz: UserModelAuthzLoader;
   /** DB 当前 epoch(单行读)。默认 readSecurityEpoch;测试 seam。 */
   readEpoch?: () => Promise<bigint>;
+  /** Provider quota/health routing view. Production injects providerHealthGate. */
+  loadRoutingAvailability?: () => Promise<ProviderRoutingAvailability>;
   logger?: Logger;
 }
 
@@ -119,11 +122,14 @@ export interface WireModelRow {
   capability_zero: boolean;
   supports_thinking: boolean;
   default_effort: string | null;
+  /** Missing on an old master means available=true to rolling-upgrade clients. */
+  available?: boolean;
 }
 
 export interface WireCatalogResponse {
   models: WireModelRow[];
   projection_revision: string;
+  availability_revision?: string;
   security_epoch: string;
   aliases: Record<string, string>;
 }
@@ -131,6 +137,10 @@ export interface WireCatalogResponse {
 export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCatalogHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: "internalModelCatalog" });
   const readEpoch = deps.readEpoch ?? (() => readSecurityEpoch());
+  const loadRoutingAvailability = deps.loadRoutingAvailability ?? (async () => ({
+    unavailableProviderIds: new Set<string>(),
+    revision: "legacy",
+  }));
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
@@ -161,8 +171,9 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
     //    进程可能陈旧的内存态;后者会让容器与 DB 一起陈旧(双旧共谋)。
     if (path === MODEL_CATALOG_EPOCH_PATH) {
       let epoch: bigint;
+      let availability: ProviderRoutingAvailability;
       try {
-        epoch = await readEpoch();
+        [epoch, availability] = await Promise.all([readEpoch(), loadRoutingAvailability()]);
       } catch (err) {
         log.error("epoch_read_failed", { uid: identity.userId, err: errMsg(err) });
         sendError(res, 503, "MODEL_CATALOG_UNAVAILABLE", "model catalog unavailable", requestId);
@@ -171,7 +182,7 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       sendJson(
         res,
         200,
-        { epoch: epoch.toString() },
+        { epoch: epoch.toString(), availability_revision: availability.revision },
         { [REQUEST_ID_HEADER]: requestId, [SECURITY_EPOCH_HEADER]: epoch.toString() },
       );
       return;
@@ -209,7 +220,9 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       uid: identity.userId,
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
+      deniedModelIds: authz.deniedModelIds,
     };
+    const availability = await loadRoutingAvailability();
     const body: WireCatalogResponse = {
       models: snapshot.listForUser(scope).map((r) => ({
         model_id: r.modelId,
@@ -222,9 +235,12 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
         capability_zero: r.capabilityZero,
         supports_thinking: r.supportsThinking,
         default_effort: r.defaultEffort,
+        available:
+          r.providerId === null || !availability.unavailableProviderIds.has(r.providerId),
       })),
       // per-uid 投影哈希(全局 executionRevision **不下发**,R2-M12)。
       projection_revision: snapshot.projectionRevisionFor(scope),
+      availability_revision: availability.revision,
       security_epoch: snapshot.securityEpoch.toString(),
       aliases: snapshot.aliasesForUser(scope),
     };

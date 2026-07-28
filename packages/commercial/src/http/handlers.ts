@@ -78,6 +78,7 @@ import {
   type ModelCatalogSnapshot,
   type UserModelScope,
 } from "../billing/modelCatalog.js";
+import type { UserModelAuthzLoader } from "../auth/userModelAuthz.js";
 
 /** 匿名 /api/public/models 的展示面 fence 微缓存窗口(方案 §1.2:安全/计费面禁缓存,展示面许)。 */
 const PUBLIC_MODELS_FENCE_TTL_MS = 2_000;
@@ -165,6 +166,12 @@ export interface CommercialHttpDeps {
    * 在 index.ts 注入进程级唯一快照(modelCatalogRuntime 单例)。
    */
   modelCatalog?: CatalogSource;
+  /**
+   * Production injects the same epoch-aware authz loader used by bridge/egress so
+   * `/api/public/models` reflects account-scoped denials as well as grants.
+   * Optional only for rolling compatibility and legacy test fixtures.
+   */
+  loadUserModelAuthz?: UserModelAuthzLoader;
   /**
    * T-23: chat 预检用 Redis。未注入时 /api/chat 返 503。
    * 测试可注入 `InMemoryPreCheckRedis` 跳过真 Redis。
@@ -1238,18 +1245,6 @@ export async function handleListPublicModels(
   // 前端标「暂不可用」+ 禁选)。fail-soft:读失败返回空集 → 不误标降级(UX 红线)。
   const degraded = await getDegradedProviders();
 
-  // 登录用户 —— 查一次 grants(per-user 表,无 NOTIFY 重载;每次请求查表是合理代价)
-  let scope: UserModelScope | null = null;
-  if (claims) {
-    const { listGrantsForUser } = await import("../admin/modelGrants.js");
-    const grants = await listGrantsForUser(claims.sub);
-    scope = {
-      uid: claims.sub,
-      role: claims.role,
-      grantedModelIds: new Set(grants.map((g) => g.model_id)),
-    };
-  }
-
   if (deps.modelCatalog) {
     // fence 后取快照(与 /internal/v3/model-catalog 同一道消费契约):admin 刚 disable 的模型
     // 不能还挂在前端选择器里被点。unknown / DB 不可达 → 503(fail-closed;**不**回落 legacy
@@ -1275,21 +1270,51 @@ export async function handleListPublicModels(
         });
       throw new HttpError(503, "MODEL_CATALOG_UNAVAILABLE", "model catalog unavailable");
     }
-    const effective: UserModelScope = scope ?? {
-      uid: 0,
-      role: "user",
-      grantedModelIds: new Set<string>(),
-    };
+    const effective = claims
+      ? await loadPublicModelScope(deps, claims, snapshot.securityEpoch)
+      : anonymousModelScope();
     sendJson(res, 200, { models: projectPublicModels(snapshot, effective, degraded) });
     return;
   }
 
   // ── legacy 投影(catalog 未接线)────────────────────────────────────────
   const pricing = deps.pricing!;
+  const scope = claims ? await loadPublicModelScope(deps, claims) : null;
   const models = scope
-    ? pricing.listForUser({ role: scope.role, grantedModelIds: scope.grantedModelIds })
+    ? pricing.listForUser(scope)
     : pricing.listPublic();
   sendJson(res, 200, { models: annotateDegraded(models, degraded) });
+}
+
+function anonymousModelScope(): UserModelScope {
+  return {
+    uid: 0,
+    role: "user",
+    grantedModelIds: new Set<string>(),
+  };
+}
+
+async function loadPublicModelScope(
+  deps: CommercialHttpDeps,
+  claims: CommercialJwtClaims,
+  requiredEpoch?: bigint,
+): Promise<UserModelScope> {
+  if (deps.loadUserModelAuthz) {
+    const authz = await deps.loadUserModelAuthz(BigInt(claims.sub), requiredEpoch);
+    return {
+      uid: claims.sub,
+      role: authz.role,
+      grantedModelIds: authz.grantedModelIds,
+      deniedModelIds: authz.deniedModelIds,
+    };
+  }
+  const { listGrantsForUser } = await import("../admin/modelGrants.js");
+  const grants = await listGrantsForUser(claims.sub);
+  return {
+    uid: claims.sub,
+    role: claims.role,
+    grantedModelIds: new Set(grants.map((g) => g.model_id)),
+  };
 }
 
 /** `/api/public/models` 的 catalog 投影行:PublicModel + catalog 的 provider 归属(方案 §6)。 */

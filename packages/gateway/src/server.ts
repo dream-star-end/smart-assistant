@@ -427,7 +427,13 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
 const ALLOWED_REASONING_EFFORTS = new Set<string>(PLATFORM_REASONING_EFFORTS)
 
 /** 平台执行模型兜底:v3/v5 两渠道都合法的静态 key 平台默认。 */
-export const EXECUTION_MODEL_FALLBACK = 'glm-5.2'
+export const EXECUTION_MODEL_FALLBACK_ROUTE = [
+  'glm-5.2',
+  'MiniMax-M3',
+  'deepseek-v4-pro',
+  'deepseek-v4-flash',
+] as const
+export const EXECUTION_MODEL_FALLBACK = EXECUTION_MODEL_FALLBACK_ROUTE[0]
 
 /**
  * 把 agent/config 级模型收敛到平台真实支持的集合。
@@ -453,7 +459,7 @@ export function resolveExecutionModel(
   authority?: { canonicalModel: string },
 ): string {
   if (authority !== undefined) return authority.canonicalModel
-  for (const m of [preferred, fallback]) {
+  for (const m of [preferred, fallback, ...EXECUTION_MODEL_FALLBACK_ROUTE]) {
     if (typeof m === 'string' && ALLOWED_INBOUND_MODELS.has(m)) return m
   }
   return EXECUTION_MODEL_FALLBACK
@@ -596,7 +602,12 @@ export function decideLocalExecution(args: {
   }
 
   // ② 候选阶梯:归一 → 投影可用性 → engine,三件事**全取投影**。
-  const candidates = [args.model, agent.model, args.defaultModel, EXECUTION_MODEL_FALLBACK]
+  const candidates = [
+    args.model,
+    agent.model,
+    args.defaultModel,
+    ...EXECUTION_MODEL_FALLBACK_ROUTE,
+  ]
   for (const raw of candidates) {
     if (typeof raw !== 'string' || raw === '') continue
     const canonicalModel = view.canonicalize(raw)
@@ -644,7 +655,7 @@ function downgradeSyntheticCodex(
     override,
     SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT,
     defaultModel,
-    EXECUTION_MODEL_FALLBACK,
+    ...EXECUTION_MODEL_FALLBACK_ROUTE,
   ]
   for (const raw of fallbacks) {
     if (typeof raw !== 'string' || raw === '') continue

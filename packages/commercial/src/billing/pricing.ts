@@ -378,10 +378,12 @@ export class PricingCache {
   listForUser(args: {
     role: "user" | "admin";
     grantedModelIds: ReadonlySet<string>;
+    deniedModelIds?: ReadonlySet<string>;
   }): PublicModel[] {
     return [...this.map.values()]
       .filter((p) => {
         if (!p.enabled) return false;
+        if (args.deniedModelIds?.has(p.model_id)) return false;
         if (p.visibility === "public") return true;
         if (p.visibility === "admin") {
           return args.role === "admin" || args.grantedModelIds.has(p.model_id);

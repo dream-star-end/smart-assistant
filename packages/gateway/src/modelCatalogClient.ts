@@ -82,12 +82,15 @@ export interface LocalCatalogModel {
   readonly capabilityZero: boolean
   readonly supportsThinking: boolean
   readonly defaultEffort: string | null
+  /** Provider quota/health routing availability; old masters omit it (= true). */
+  readonly available: boolean
 }
 
 /** 该 uid 的可执行模型投影(master 已按 role/grants 过滤;容器不再自己判可见性)。 */
 export interface LocalCatalogView {
   readonly models: readonly LocalCatalogModel[]
   readonly projectionRevision: string
+  readonly availabilityRevision: string
   readonly securityEpoch: string
   /**
    * alias → canonical model id 归一(方案 §2/§8「alias 全链归一」的本地路径一端)。
@@ -183,6 +186,7 @@ export interface ModelCatalogClientDeps {
 export class ModelCatalogClient {
   private snapshot: Snapshot | null = null
   private inflight: Promise<LocalCatalogView> | null = null
+  private routingInflight: Promise<LocalCatalogView> | null = null
   private lkgLoaded = false
 
   private readonly env: NodeJS.ProcessEnv
@@ -234,6 +238,7 @@ export class ModelCatalogClient {
     if (!this.configured) {
       throw new ModelCatalogUnavailableError('master base url / container token not injected')
     }
+    if (this.routingInflight) return this.routingInflight
     const snap = this.snapshot
     if (snap && this.now() - snap.verifiedAt < this.ttlMs) return snap.view
 
@@ -242,6 +247,25 @@ export class ModelCatalogClient {
       this.inflight = null
     })
     return this.inflight
+  }
+
+  /**
+   * Team/local routing must also observe provider availability, whose revision is
+   * independent from the security epoch. Concurrent delegates still share one
+   * narrow check through the same singleflight.
+   */
+  async getRoutingView(): Promise<LocalCatalogView> {
+    if (!this.configured) {
+      throw new ModelCatalogUnavailableError('master base url / container token not injected')
+    }
+    if (this.routingInflight) return this.routingInflight
+    this.routingInflight = (async () => {
+      if (this.inflight) await this.inflight
+      return this.ensureFresh(true)
+    })().finally(() => {
+      this.routingInflight = null
+    })
+    return this.routingInflight
   }
 
   /**
@@ -263,6 +287,7 @@ export class ModelCatalogClient {
   _resetForTests(): void {
     this.snapshot = null
     this.inflight = null
+    this.routingInflight = null
     this.lkgLoaded = false
   }
 
@@ -274,25 +299,31 @@ export class ModelCatalogClient {
    * 顺序不可换:先验 epoch 再决定要不要全量拉,是为了让"什么都没变"的常态只花一次单行读;
    * 但**任何一步验不出新鲜,一律拒** —— 不存在"验不了就先用着"的分支。
    */
-  private async ensureFresh(): Promise<LocalCatalogView> {
+  private async ensureFresh(checkAvailability = false): Promise<LocalCatalogView> {
     const cached = this.snapshot ?? this.loadLkg()
     if (cached) {
-      let dbEpoch: string
+      let state: { epoch: string; availabilityRevision: string }
       try {
-        dbEpoch = await this.fetchEpoch()
+        state = await this.fetchCatalogState()
       } catch (err) {
         // 证明不了新鲜 → 拒。这里**不能**回落到"用旧快照":旧快照可能是撤销授权之前的。
         throw new ModelCatalogUnavailableError(
           `epoch verification failed: ${err instanceof Error ? err.message : String(err)}`,
         )
       }
-      if (dbEpoch === cached.view.securityEpoch) {
+      if (
+        state.epoch === cached.view.securityEpoch &&
+        (!checkAvailability ||
+          state.availabilityRevision === cached.view.availabilityRevision)
+      ) {
         this.snapshot = { view: cached.view, verifiedAt: this.now() }
         return cached.view
       }
       this.log('epoch_drift_force_refetch', {
         cached: cached.view.securityEpoch,
-        db: dbEpoch,
+        db: state.epoch,
+        cachedAvailability: cached.view.availabilityRevision,
+        dbAvailability: state.availabilityRevision,
       })
       // 漂移 → 强拉。拉不到 → 拒(下面 fetchCatalog 抛)。
     }
@@ -307,13 +338,21 @@ export class ModelCatalogClient {
     return view
   }
 
-  private async fetchEpoch(): Promise<string> {
+  private async fetchCatalogState(): Promise<{
+    epoch: string
+    availabilityRevision: string
+  }> {
     const body = await this.getJson(MODEL_CATALOG_EPOCH_PATH)
     const epoch = (body as { epoch?: unknown }).epoch
     if (typeof epoch !== 'string' || !/^\d+$/.test(epoch)) {
       throw new Error('epoch endpoint returned malformed body')
     }
-    return epoch
+    const availability = (body as { availability_revision?: unknown }).availability_revision
+    return {
+      epoch,
+      availabilityRevision:
+        typeof availability === 'string' && availability !== '' ? availability : 'legacy',
+    }
   }
 
   private async getJson(path: string): Promise<unknown> {
@@ -390,7 +429,7 @@ export function _setModelCatalogClientForTests(client: ModelCatalogClient | null
  * 抛 ModelCatalogUnavailableError → **拒新 turn**(方案 §3:无 baked 回落)。
  */
 export function getLocalCatalogView(): Promise<LocalCatalogView> {
-  return getModelCatalogClient().getView()
+  return getModelCatalogClient().getRoutingView()
 }
 
 /** 本地路径上游请求要带的 `x-oc-local-catalog` header 值(§4)。 */
@@ -413,11 +452,13 @@ interface WireRow {
   capability_zero: boolean
   supports_thinking: boolean
   default_effort: string | null
+  available?: boolean
 }
 
 interface WireResponse {
   models: WireRow[]
   projection_revision: string
+  availability_revision?: string
   security_epoch: string
   /** alias → canonical model_id；旧 master 兼容期可缺席，缺席 = 空 map。 */
   aliases?: Record<string, string>
@@ -441,8 +482,10 @@ function toWire(view: LocalCatalogView): WireResponse {
       capability_zero: m.capabilityZero,
       supports_thinking: m.supportsThinking,
       default_effort: m.defaultEffort,
+      available: m.available,
     })),
     projection_revision: view.projectionRevision,
+    availability_revision: view.availabilityRevision,
     security_epoch: view.securityEpoch,
     ...(aliasEntries.length > 0 ? { aliases } : {}),
   }
@@ -484,6 +527,7 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
       capabilityZero: r.capability_zero,
       supportsThinking: r.supports_thinking,
       defaultEffort: typeof r.default_effort === 'string' ? r.default_effort : null,
+      available: r.available !== false,
     }
   })
 
@@ -513,10 +557,14 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
   return {
     models,
     projectionRevision: o.projection_revision,
+    availabilityRevision:
+      typeof o.availability_revision === 'string' && o.availability_revision !== ''
+        ? o.availability_revision
+        : 'legacy',
     securityEpoch: o.security_epoch,
     canonicalize,
     aliasEntries: () => [...aliases.entries()],
-    isRoutable: (modelId) => byId.has(modelId),
+    isRoutable: (modelId) => byId.get(modelId)?.available === true,
     resolve: (modelId) => byId.get(modelId) ?? null,
     isCodexModel: (modelId) => byId.get(modelId)?.engine === 'codex',
   }

@@ -211,6 +211,19 @@ describe("视图 API", () => {
     assert.equal(s.resolve("glm-5.2")?.upstreamModelId, "glm-5.2-0712");
   });
 
+  test("account hard denial overrides public visibility/grants and only removes that model", () => {
+    const s = snap({ entries: [GLM, SOL] });
+    const scope = {
+      uid: 1,
+      role: "admin" as const,
+      grantedModelIds: new Set(["glm-5.2"]),
+      deniedModelIds: new Set(["glm-5.2"]),
+    };
+    assert.equal(s.canUseModel(scope, "glm-5.2"), false);
+    assert.equal(s.canUseModel(scope, "gpt-5.6-sol"), true);
+    assert.deepEqual(s.listForUser(scope).map((row) => row.modelId), ["gpt-5.6-sol"]);
+  });
+
   test("active 但无价格行 → 不可路由(可用性与可计费不允许分裂)", () => {
     const s = new ModelCatalogSnapshot({
       entries: [GLM],

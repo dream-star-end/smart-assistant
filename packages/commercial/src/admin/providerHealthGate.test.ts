@@ -8,6 +8,7 @@ import { beforeEach, describe, test } from "node:test";
 import type { QueryResult } from "pg";
 import {
   getDegradedProviders,
+  getProviderRoutingAvailability,
   getProviderQuotaBlock,
   _resetGateForTest,
 } from "./providerHealthGate.js";
@@ -131,5 +132,46 @@ describe("getDegradedProviders — exact quota block", () => {
     const row = { ...base, quota_probe_lease_until: new Date(40_000) };
     const set = await getDegradedProviders(30_000, runnerReturning([row]));
     assert.equal(set.has("moonshot"), true);
+  });
+});
+
+describe("getProviderRoutingAvailability — team fallback revision", () => {
+  const rows: OpsRow[] = [
+    {
+      provider_id: "deepseek",
+      health_status: "degraded",
+      health_mode: "auto",
+      degraded_since: new Date(),
+      degrade_reason: "probe",
+      quota_retry_at: null,
+      quota_probe_lease_until: null,
+    },
+    {
+      provider_id: "ark",
+      health_status: "healthy",
+      health_mode: "auto",
+      degraded_since: null,
+      degrade_reason: null,
+      quota_retry_at: new Date(20_000),
+      quota_probe_lease_until: null,
+    },
+  ];
+
+  test("quota always blocks; health only blocks when enforcement is enabled", async () => {
+    const shadow = await getProviderRoutingAvailability(10_000, runnerReturning(rows), false);
+    assert.deepEqual([...shadow.unavailableProviderIds], ["ark"]);
+
+    _resetGateForTest();
+    const enforced = await getProviderRoutingAvailability(10_000, runnerReturning(rows), true);
+    assert.deepEqual([...enforced.unavailableProviderIds].sort(), ["ark", "deepseek"]);
+    assert.notEqual(enforced.revision, shadow.revision);
+  });
+
+  test("quota state changes the revision", async () => {
+    const blocked = await getProviderRoutingAvailability(10_000, runnerReturning(rows), false);
+    _resetGateForTest();
+    const expired = await getProviderRoutingAvailability(30_000, runnerReturning(rows), false);
+    assert.notEqual(blocked.revision, expired.revision);
+    assert.equal(expired.unavailableProviderIds.size, 0);
   });
 });

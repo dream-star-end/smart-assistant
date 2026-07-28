@@ -140,6 +140,7 @@ export interface UserModelScope {
   uid: number | string | bigint;
   role: "user" | "admin";
   grantedModelIds: ReadonlySet<string>;
+  deniedModelIds?: ReadonlySet<string>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -521,6 +522,7 @@ export class ModelCatalogSnapshot {
   canUseModel(scope: UserModelScope, modelIdOrAlias: string): boolean {
     const canonical = this.aliasToCanonical(modelIdOrAlias);
     if (!this.isRoutable(canonical)) return false;
+    if (scope.deniedModelIds?.has(canonical)) return false;
     const p = this.pricing.get(canonical);
     if (!p) return false;
     return (

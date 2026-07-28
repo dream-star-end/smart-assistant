@@ -25,6 +25,7 @@ import {
   MODEL_CATALOG_PATH,
   ModelCatalogClient,
   ModelCatalogUnavailableError,
+  parseCatalogResponse,
 } from '../modelCatalogClient.js'
 
 const ENV = {
@@ -60,6 +61,7 @@ const CATALOG_BODY = {
     },
   ],
   projection_revision: 'proj-rev-1',
+  availability_revision: 'availability-1',
   security_epoch: '5',
   aliases: { 'glm-latest': 'glm-5.2' },
 }
@@ -157,6 +159,7 @@ describe('modelCatalogClient — 新鲜快照', () => {
     const v1 = await client.getView()
     assert.equal(v1.securityEpoch, '5')
     assert.equal(v1.projectionRevision, 'proj-rev-1')
+    assert.equal(v1.availabilityRevision, 'availability-1')
     assert.ok(v1.isRoutable('glm-5.2'))
     assert.ok(!v1.isRoutable('not-granted'))
     assert.equal(v1.isCodexModel('gpt-5.6-sol'), true)
@@ -199,6 +202,117 @@ describe('modelCatalogClient — 新鲜快照', () => {
       securityEpoch: '5',
     })
     lkg.cleanup()
+  })
+})
+
+describe('modelCatalogClient — provider availability routing refresh', () => {
+  test('routing view checks narrow availability revision and refetches changed rows', async () => {
+    const calls: string[] = []
+    let revision = 'availability-1'
+    const lkg = tmpLkg()
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      fetcher: (async (url: string): Promise<any> => {
+        const isEpoch = url.includes(MODEL_CATALOG_EPOCH_PATH)
+        calls.push(isEpoch ? 'epoch' : 'catalog')
+        const body = isEpoch
+          ? { epoch: '5', availability_revision: revision }
+          : {
+              ...CATALOG_BODY,
+              availability_revision: revision,
+              models: CATALOG_BODY.models.map((model) => ({
+                ...model,
+                available: revision === 'availability-1',
+              })),
+            }
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(body), 'utf8')
+          })(),
+        }
+      }) as any,
+    })
+
+    assert.equal((await client.getRoutingView()).isRoutable('glm-5.2'), true)
+    revision = 'availability-2'
+    const refreshed = await client.getRoutingView()
+    assert.equal(refreshed.isRoutable('glm-5.2'), false)
+    assert.deepEqual(calls, ['catalog', 'epoch', 'catalog'])
+    lkg.cleanup()
+  })
+
+  test('routing refresh waits for ordinary refresh, then independently checks availability', async () => {
+    const calls: string[] = []
+    let now = 0
+    let revision = 'availability-1'
+    let releaseOrdinaryEpoch: (() => void) | null = null
+    let ordinaryEpochStarted: (() => void) | null = null
+    const ordinaryEpochReady = new Promise<void>((resolve) => {
+      ordinaryEpochStarted = resolve
+    })
+    const ordinaryEpochBlocked = new Promise<void>((resolve) => {
+      releaseOrdinaryEpoch = resolve
+    })
+    let epochCalls = 0
+    const lkg = tmpLkg()
+    const client = new ModelCatalogClient({
+      env: ENV,
+      lkgPath: lkg.path,
+      now: () => now,
+      ttlMs: 1,
+      fetcher: (async (url: string): Promise<any> => {
+        const isEpoch = url.includes(MODEL_CATALOG_EPOCH_PATH)
+        calls.push(isEpoch ? 'epoch' : 'catalog')
+        if (isEpoch) {
+          epochCalls++
+          if (epochCalls === 1) {
+            ordinaryEpochStarted!()
+            await ordinaryEpochBlocked
+          }
+        }
+        const body = isEpoch
+          ? { epoch: '5', availability_revision: revision }
+          : {
+              ...CATALOG_BODY,
+              availability_revision: revision,
+              models: CATALOG_BODY.models.map((model) => ({
+                ...model,
+                available: revision === 'availability-1',
+              })),
+            }
+        return {
+          statusCode: 200,
+          body: (async function* () {
+            yield Buffer.from(JSON.stringify(body), 'utf8')
+          })(),
+        }
+      }) as any,
+    })
+
+    assert.equal((await client.getRoutingView()).isRoutable('glm-5.2'), true)
+    now = 2
+    const ordinary = client.getView()
+    await ordinaryEpochReady
+    revision = 'availability-2'
+    const routing = client.getRoutingView()
+    releaseOrdinaryEpoch!()
+
+    assert.equal((await ordinary).isRoutable('glm-5.2'), true)
+    assert.equal((await routing).isRoutable('glm-5.2'), false)
+    assert.deepEqual(calls, ['catalog', 'epoch', 'epoch', 'catalog'])
+    lkg.cleanup()
+  })
+
+  test('old master wire defaults to available=true and legacy revision', () => {
+    const legacy = parseCatalogResponse({
+      ...CATALOG_BODY,
+      availability_revision: undefined,
+      models: CATALOG_BODY.models.map(({ ...model }) => model),
+    })
+    assert.equal(legacy.availabilityRevision, 'legacy')
+    assert.equal(legacy.isRoutable('glm-5.2'), true)
   })
 })
 
@@ -322,6 +436,7 @@ describe('modelCatalogClient — LKG + epoch 协议', () => {
     })
     const v = await c2.getView()
     assert.equal(v.projectionRevision, 'proj-rev-1')
+    assert.equal(v.availabilityRevision, 'availability-1')
     lkg.cleanup()
   })
 })

@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import { beforeEach, describe, test } from "node:test";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { QueryResult } from "pg";
+import { SignJWT } from "jose";
 
 import {
   CatalogUnknownError,
@@ -183,6 +184,14 @@ async function listAnon(d: CommercialHttpDeps): Promise<PublicModelProjection[]>
   return res.body.models as PublicModelProjection[];
 }
 
+async function authToken(secret: Uint8Array, sub = "42"): Promise<string> {
+  return new SignJWT({ role: "user" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(sub)
+    .setExpirationTime("15m")
+    .sign(secret);
+}
+
 beforeEach(async () => {
   await primeDegraded([]);
 });
@@ -224,6 +233,35 @@ describe("/api/public/models — catalog 投影行集", () => {
     const models = await listAnon(deps({ modelCatalog: catalogOf(snap()) }));
     assert.deepEqual(models.find((m) => m.id === "glm-5.2")!.supported_efforts, ["high", "max"]);
     assert.deepEqual(models.find((m) => m.id === "gpt-5.6-sol")!.supported_efforts, ["low", "high"]);
+  });
+
+  test("登录用户投影使用 epoch-aware authz loader，并应用 account hard denial", async () => {
+    const secret = new Uint8Array(32);
+    let requiredEpoch: bigint | undefined;
+    const token = await authToken(secret);
+    const res = makeRes();
+    await handleListPublicModels(
+      makeReq(`Bearer ${token}`),
+      res,
+      {} as never,
+      deps({
+        jwtSecret: secret,
+        modelCatalog: catalogOf(snap()),
+        loadUserModelAuthz: async (_uid, epoch) => {
+          requiredEpoch = epoch;
+          return {
+            role: "user",
+            grantedModelIds: new Set<string>(),
+            deniedModelIds: new Set(["glm-5.2"]),
+          };
+        },
+      }),
+    );
+    assert.equal(requiredEpoch, 5n);
+    assert.deepEqual(
+      (res.body.models as PublicModelProjection[]).map((model) => model.id),
+      ["glm-5.2-x", "gpt-5.6-sol"],
+    );
   });
 });
 
