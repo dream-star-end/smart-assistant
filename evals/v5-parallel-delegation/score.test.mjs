@@ -154,12 +154,20 @@ const manifest = {
   max_container_age_before_pair_ms: 300000,
   arms: ["A", "B"],
   policy: {
-    base_persona_rev: "a".repeat(64),
-    candidate_persona_rev: "b".repeat(64),
     rule_rev: "c".repeat(64),
     baseline_prompt_rev: "d".repeat(64),
     candidate_prompt_rev: "e".repeat(64),
     probe_rev: "9".repeat(64),
+    personas: {
+      ccb: {
+        base_persona_rev: "a".repeat(64),
+        candidate_persona_rev: "b".repeat(64),
+      },
+      codex: {
+        base_persona_rev: "1".repeat(64),
+        candidate_persona_rev: "2".repeat(64),
+      },
+    },
   },
   targets: {
     ccb: { user_id: 1, container: "oc-v5-u1" },
@@ -173,6 +181,12 @@ const manifest = {
     candidate_slot: null,
     candidate_release: null,
     cohort_percent: 0,
+  },
+  baseline_runtime_tuple: {
+    image: "image",
+    image_id: "image-id",
+    runtime_release: "release",
+    platform_bundle: "bundle",
   },
   production: {
     candidate_image: "image",
@@ -215,6 +229,7 @@ function makeRun({
   const positiveCandidate = arm === "B" && ["document_batch", "code_batch"].includes(scenario);
   const positiveScenario = ["document_batch", "code_batch"].includes(scenario);
   const userId = engine === "ccb" ? 1 : 2;
+  const personaPolicy = manifest.policy.personas[engine];
   const containerName = `oc-v5-u${userId}`;
   const tokens = arm === "A" ? 1000 : 1050;
   const costCredits = arm === "A" ? 1 : 1.05;
@@ -226,7 +241,11 @@ function makeRun({
           turn_key: "turn",
           parent_turn_key: null,
           parent_session_id: null,
+          delegate_agent_id: null,
+          dispatch_id: `${engine}-${scenario}-${pair}-${arm}-dispatch`,
           mode: "chat",
+          model: engine === "codex" ? "gpt-test" : "ccb-test",
+          authority_kind: "bridge_signed",
           status: "success",
           tokens: tokens - 3,
           cost_credits: costCredits,
@@ -237,7 +256,11 @@ function makeRun({
           turn_key: `child-turn-${index}`,
           parent_turn_key: "turn",
           parent_session_id: `${engine}-${scenario}-${pair}-${arm}-peer`,
+          delegate_agent_id: `delegate-${index}`,
+          dispatch_id: null,
           mode: "delegate",
+          model: `specialist-${index}`,
+          authority_kind: "local_catalog",
           status: "success",
           tokens: 1,
           cost_credits: 0,
@@ -249,7 +272,11 @@ function makeRun({
         turn_key: "turn",
         parent_turn_key: null,
         parent_session_id: null,
+        delegate_agent_id: null,
+        dispatch_id: `${engine}-${scenario}-${pair}-${arm}-dispatch`,
         mode: "chat",
+        model: engine === "codex" ? "gpt-test" : "ccb-test",
+        authority_kind: "bridge_signed",
         status: "success",
         tokens,
         cost_credits: costCredits,
@@ -330,6 +357,14 @@ function makeRun({
         dispatches: armFirst ? 0 : 1,
         usage_rows: armFirst ? 0 : (positiveScenario && !aFirst ? 4 : 1),
       },
+      freshness_after: {
+        user_id: userId,
+        container_started_at: new Date(Date.parse("2026-07-27T23:59:00.000Z")).toISOString(),
+        dispatches: (armFirst ? 0 : 1) + 1,
+        usage_rows:
+          (armFirst ? 0 : (positiveScenario && !aFirst ? 4 : 1)) +
+          (positiveCandidate ? 4 : 1),
+      },
       runtime_tuple: {
         image: "image",
         image_id: "image-id",
@@ -359,8 +394,8 @@ function makeRun({
     },
     persona: {
       path: "/persona",
-      rev: arm === "A" ? manifest.policy.base_persona_rev : manifest.policy.candidate_persona_rev,
-      base_rev: manifest.policy.base_persona_rev,
+      rev: arm === "A" ? personaPolicy.base_persona_rev : personaPolicy.candidate_persona_rev,
+      base_rev: personaPolicy.base_persona_rev,
       rule_injection: arm === "A" ? "none" : "persona-system-slot",
       rule_rev: arm === "A" ? null : manifest.policy.rule_rev,
     },
@@ -397,6 +432,11 @@ function productionRuns() {
         ...run.container.freshness_before,
         dispatches: 0,
         usage_rows: 0,
+      },
+      freshness_after: {
+        ...run.container.freshness_after,
+        dispatches: 1,
+        usage_rows: run.resources.usage.rows,
       },
     },
   }));
@@ -560,11 +600,84 @@ describe("v5 parallel delegation release scorer", () => {
     assert.ok(report.findings.some((finding) => finding.includes("fatal resource failure")));
   });
 
+  it("rejects a pair-consistent runtime tuple that differs from the frozen baseline", () => {
+    const runs = passingRuns();
+    for (const run of runs.filter(
+      (item) => item.engine === "ccb" && item.scenario === "code_batch" && item.pair_id === "01",
+    )) {
+      run.container.runtime_tuple = {
+        image: "other-image",
+        image_id: "other-image-id",
+        runtime_release: "other-release",
+        platform_bundle: "other-bundle",
+      };
+    }
+    const report = scoreRuns(runs, gold, { manifest });
+    assert.equal(report.passed, false);
+    assert.ok(
+      report.findings.some((finding) =>
+        finding.includes("runtime tuple differs from frozen baseline manifest"),
+      ),
+    );
+  });
+
+  it("rejects requested-model evidence when the actual root receipt model or dispatch differs", () => {
+    const runs = passingRuns();
+    const run = runs.find(
+      (item) => item.engine === "codex" && item.scenario === "simple" && item.arm === "A",
+    );
+    const root = run.resources.usage.receipts.find((receipt) => receipt.mode === "chat");
+    root.model = "fallback-model";
+    root.dispatch_id = "another-dispatch";
+    const report = scoreRuns(runs, gold, { manifest });
+    assert.equal(report.passed, false);
+    assert.ok(
+      report.findings.some((finding) =>
+        finding.includes("root actual model/authority differs from requested engine model"),
+      ),
+    );
+  });
+
+  it("allows specialist child models but rejects missing delegate attribution", () => {
+    const passing = scoreRuns(passingRuns(), gold, { manifest });
+    assert.equal(passing.passed, true, passing.findings.join("\n"));
+
+    const runs = passingRuns();
+    const run = runs.find(
+      (item) => item.engine === "ccb" && item.scenario === "code_batch" && item.arm === "B",
+    );
+    const child = run.resources.usage.receipts.find((receipt) => receipt.mode === "delegate");
+    child.delegate_agent_id = null;
+    const report = scoreRuns(runs, gold, { manifest });
+    assert.equal(report.passed, false);
+    assert.ok(
+      report.findings.some((finding) =>
+        finding.includes("delegate attribution/model evidence is incomplete"),
+      ),
+    );
+  });
+
+  it("rejects an unrelated all-agent dispatch that completes during one arm", () => {
+    const runs = passingRuns();
+    const run = runs.find(
+      (item) => item.engine === "ccb" && item.scenario === "simple" && item.arm === "B",
+    );
+    run.container.freshness_after.dispatches += 1;
+    run.container.freshness_after.usage_rows += 1;
+    const report = scoreRuns(runs, gold, { manifest });
+    assert.equal(report.passed, false);
+    assert.ok(
+      report.findings.some((finding) =>
+        finding.includes("unrelated agent dispatch or usage appeared during the run"),
+      ),
+    );
+  });
+
   it("production smoke uses the exact stable bundle lane and reduced smoke matrix", () => {
     const runs = productionRuns();
     for (const run of runs) {
       run.persona.rule_injection = "platform-bundle";
-      run.persona.rev = manifest.policy.base_persona_rev;
+      run.persona.rev = manifest.policy.personas[run.engine].base_persona_rev;
       run.prompt_rev = manifest.policy.candidate_prompt_rev;
       run.container.prompt_rev = manifest.policy.candidate_prompt_rev;
       run.container.lane = {
@@ -580,7 +693,7 @@ describe("v5 parallel delegation release scorer", () => {
     const runs = productionRuns();
     for (const run of runs) {
       run.persona.rule_injection = "platform-bundle";
-      run.persona.rev = manifest.policy.base_persona_rev;
+      run.persona.rev = manifest.policy.personas[run.engine].base_persona_rev;
       run.prompt_rev = manifest.policy.candidate_prompt_rev;
       run.container.prompt_rev = manifest.policy.candidate_prompt_rev;
       run.container.lane = {
@@ -600,7 +713,7 @@ describe("v5 parallel delegation release scorer", () => {
   it("fails policy, child-ledger, and pair-execution evidence tampering", () => {
     const runs = passingRuns();
     const target = runs.find((run) => run.engine === "ccb" && run.scenario === "code_batch" && run.arm === "B");
-    target.persona.rev = manifest.policy.base_persona_rev;
+    target.persona.rev = manifest.policy.personas[target.engine].base_persona_rev;
     target.resources.usage.child_rows = 1;
     target.pair_execution_id = "not-the-same-pair";
     const report = scoreRuns(runs, gold, { manifest });
@@ -781,6 +894,7 @@ describe("v5 parallel delegation release scorer", () => {
         binding: run.container.binding,
         usage: run.resources.usage,
         freshness_before: run.container.freshness_before,
+        freshness_after: run.container.freshness_after,
         container_before: containerInspect,
         container_after: containerInspect,
         frames,

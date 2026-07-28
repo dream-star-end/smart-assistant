@@ -80,7 +80,8 @@ python3 evals/v5-parallel-delegation/generate-fixtures.py --out "$ROOT"
 
 ```bash
 node evals/v5-parallel-delegation/persona-variant.mjs snapshot \
-  --out /secure/path/base-persona.txt
+  --out /secure/path/ccb-base-persona.txt
+# 切换到 Codex synthetic 凭据后另存 codex-base-persona.txt。
 ```
 
 把仓库内 probe 原样复制到远端只读临时路径，随后绑定 manifest：
@@ -88,7 +89,8 @@ node evals/v5-parallel-delegation/persona-variant.mjs snapshot \
 ```bash
 node evals/v5-parallel-delegation/bind-manifest.mjs \
   --manifest "$ROOT/manifest.json" \
-  --base-persona /secure/path/base-persona.txt \
+  --ccb-base-persona /secure/path/ccb-base-persona.txt \
+  --codex-base-persona /secure/path/codex-base-persona.txt \
   --rule evals/v5-parallel-delegation/candidate-rule.md \
   --baseline-prompt-rev <active-platform-prompt-sha256> \
   --candidate-prompt-file \
@@ -98,7 +100,11 @@ node evals/v5-parallel-delegation/bind-manifest.mjs \
   --codex-user-id <uid> --codex-container <oc-v5-uN> \
   --baseline-generation <deploy-generation> \
   --baseline-active-slot <A-or-B> \
-  --baseline-active-release <absolute-active-release>
+  --baseline-active-release <absolute-active-release> \
+  --baseline-image <exact-image> \
+  --baseline-image-id <exact-image-id> \
+  --baseline-runtime-release <exact-runtime-release> \
+  --baseline-platform-bundle <exact-platform-bundle>
 ```
 
 Binder 会把传入 rule、正式 prompt 和 probe 与当前 checkout 内上述三个 canonical 文件

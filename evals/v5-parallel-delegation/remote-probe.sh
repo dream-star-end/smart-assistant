@@ -21,7 +21,6 @@ SELECT json_build_object(
 )::text
 FROM turn_dispatches
 WHERE user_id=:'uid'::bigint
-  AND agent_id='main'
   AND status IN ('admitted','accepted','rejecting');
 SQL
     ;;
@@ -52,7 +51,11 @@ WITH tapes AS (
     'turn_key',turn_key,
     'parent_turn_key',parent_turn_key,
     'parent_session_id',parent_session_id,
+    'delegate_agent_id',delegate_agent_id,
+    'dispatch_id',dispatch_id::text,
     'mode',mode,
+    'model',model,
+    'authority_kind',authority_kind,
     'status',status,
     'tokens',(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens)::bigint,
     'cost_credits',cost_credits::bigint
@@ -77,8 +80,12 @@ SQL
     container=${4:-}
     [[ "$peer" =~ ^[A-Za-z0-9_-]{8,160}$ ]] || { echo "invalid peer" >&2; exit 2; }
     [[ "$container" =~ ^oc-v5-u[1-9][0-9]*$ ]] || { echo "invalid container" >&2; exit 2; }
+    inspect=$(docker inspect "$container")
+    docker_id=$(jq -r '.[0].Id' <<<"$inspect")
+    [[ "$docker_id" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid Docker identity" >&2; exit 3; }
     db_json=$(
-      psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -At -v uid="$uid" -v peer="$peer" <<'SQL'
+      psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -At \
+        -v uid="$uid" -v peer="$peer" -v docker_id="$docker_id" <<'SQL'
 WITH d AS (
   SELECT dispatch_id::text,user_id,session_id
   FROM turn_dispatches
@@ -87,7 +94,10 @@ WITH d AS (
 ), c AS (
   SELECT id::text,user_id,container_internal_id
   FROM agent_containers
-  WHERE user_id=:'uid'::bigint AND state='active'
+  WHERE user_id=:'uid'::bigint
+    AND state='active'
+    AND runtime_channel='v5'
+    AND container_internal_id=:'docker_id'
   ORDER BY id DESC LIMIT 1
 )
 SELECT json_build_object(
@@ -102,7 +112,6 @@ SELECT json_build_object(
 SQL
     )
     [[ -n "$db_json" ]] || { echo "binding not found" >&2; exit 3; }
-    inspect=$(docker inspect "$container")
     jq -nc --argjson db "$db_json" --argjson inspect "$inspect" \
       '$db + {docker_id:$inspect[0].Id,docker_name:($inspect[0].Name|ltrimstr("/"))}'
     ;;
@@ -127,7 +136,6 @@ SELECT json_build_object(
   'dispatches', (
     SELECT count(*)::int FROM turn_dispatches
     WHERE user_id=:'uid'::bigint
-      AND agent_id='main'
       AND admitted_at >= :'started_at'::timestamptz
   ),
   'usage_rows', (

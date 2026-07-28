@@ -36,8 +36,8 @@ console.log(pair.order);
 console.log(manifest.engines[engine].model);
 console.log(manifest.engines[engine].effort ?? "");
 console.log(manifest.policy.baseline_prompt_rev);
-console.log(manifest.policy.base_persona_rev);
-console.log(manifest.policy.candidate_persona_rev);
+console.log(manifest.policy.personas?.[engine]?.base_persona_rev ?? "");
+console.log(manifest.policy.personas?.[engine]?.candidate_persona_rev ?? "");
 console.log(manifest.policy.rule_rev);
 console.log(manifest.targets[engine].container);
 NODE

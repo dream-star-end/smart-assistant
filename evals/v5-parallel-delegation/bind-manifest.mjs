@@ -20,9 +20,11 @@ const args = Object.fromEntries(
   }),
 );
 for (const name of [
-  "manifest", "base-persona", "rule", "baseline-prompt-rev", "candidate-prompt-file",
+  "manifest", "ccb-base-persona", "codex-base-persona", "rule",
+  "baseline-prompt-rev", "candidate-prompt-file",
   "probe", "ccb-user-id", "ccb-container", "codex-user-id", "codex-container",
   "baseline-generation", "baseline-active-slot", "baseline-active-release",
+  "baseline-image", "baseline-image-id", "baseline-runtime-release", "baseline-platform-bundle",
 ]) {
   if (!args[name]) throw new Error(`missing --${name}`);
 }
@@ -105,18 +107,21 @@ for (const [field, path] of [
     throw new Error(`fixture ${field} differs from the generated manifest`);
   }
 }
-const base = readFileSync(args["base-persona"], "utf8");
-const candidate = `${base.replace(/\s+$/, "")}\n\n${rule}\n`;
 manifest.policy = {
-  base_persona_rev: sha(base),
-  candidate_persona_rev: sha(candidate),
   rule_rev: sha(rule),
   baseline_prompt_rev: requireSha("--baseline-prompt-rev", args["baseline-prompt-rev"]),
   candidate_prompt_rev: sha(candidatePrompt),
   probe_rev: sha(probe),
+  personas: {},
 };
 manifest.targets = {};
 for (const engine of ["ccb", "codex"]) {
+  const base = readFileSync(args[`${engine}-base-persona`], "utf8");
+  const candidate = `${base.replace(/\s+$/, "")}\n\n${rule}\n`;
+  manifest.policy.personas[engine] = {
+    base_persona_rev: sha(base),
+    candidate_persona_rev: sha(candidate),
+  };
   const userId = Number(args[`${engine}-user-id`]);
   const container = args[`${engine}-container`];
   if (!Number.isSafeInteger(userId) || userId <= 0) throw new Error(`--${engine}-user-id must be positive`);
@@ -137,6 +142,12 @@ manifest.baseline_lane = {
   candidate_slot: null,
   candidate_release: null,
   cohort_percent: 0,
+};
+manifest.baseline_runtime_tuple = {
+  image: args["baseline-image"],
+  image_id: args["baseline-image-id"],
+  runtime_release: args["baseline-runtime-release"],
+  platform_bundle: args["baseline-platform-bundle"],
 };
 const temp = `${args.manifest}.tmp`;
 writeFileSync(temp, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });

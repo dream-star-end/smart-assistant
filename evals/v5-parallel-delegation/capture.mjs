@@ -101,8 +101,6 @@ if (
   throw new Error("manifest fresh-container age gate is invalid");
 }
 for (const field of [
-  "base_persona_rev",
-  "candidate_persona_rev",
   "rule_rev",
   "baseline_prompt_rev",
   "candidate_prompt_rev",
@@ -112,13 +110,19 @@ for (const field of [
     throw new Error(`manifest policy ${field} is not a SHA-256`);
   }
 }
+const expectedPersonaPolicy = manifest.policy.personas?.[ENGINE];
+for (const field of ["base_persona_rev", "candidate_persona_rev"]) {
+  if (!/^[0-9a-f]{64}$/.test(expectedPersonaPolicy?.[field] ?? "")) {
+    throw new Error(`manifest policy personas.${ENGINE}.${field} is not a SHA-256`);
+  }
+}
 const expectedStep = RULE_INJECTION === "platform-bundle"
   ? 1
   : ORDER === "A_FIRST"
     ? (ARM === "A" ? 1 : 2)
     : (ARM === "B" ? 1 : 2);
 if (PAIR_STEP !== expectedStep) throw new Error(`pair step ${PAIR_STEP} differs from expected ${expectedStep}`);
-if (PERSONA_BASE_REV !== manifest.policy.base_persona_rev) {
+if (PERSONA_BASE_REV !== expectedPersonaPolicy.base_persona_rev) {
   throw new Error("persona base revision differs from manifest policy");
 }
 if (Number(scenario.absolute_wall_ms) !== manifest.absolute_wall_ms?.[SCENARIO]) {
@@ -336,6 +340,12 @@ const containerMeta = await readContainerMeta();
 for (const [field, value] of Object.entries(containerMeta.runtime_tuple)) {
   if (typeof value !== "string" || !value) throw new Error(`runtime tuple missing ${field}`);
 }
+if (
+  RULE_INJECTION !== "platform-bundle" &&
+  JSON.stringify(containerMeta.runtime_tuple) !== JSON.stringify(manifest.baseline_runtime_tuple)
+) {
+  throw new Error("isolated A/B runtime tuple differs from frozen baseline manifest");
+}
 const actualPromptRev = await readPromptRev();
 const freshnessBefore = await readFreshness(containerMeta.started_at);
 if (PAIR_STEP === 1) {
@@ -362,7 +372,7 @@ if (RULE_INJECTION === "none") {
   if (
     ARM !== "A" ||
     PROMPT_REV !== manifest.policy.baseline_prompt_rev ||
-    PERSONA_REV !== manifest.policy.base_persona_rev
+    PERSONA_REV !== expectedPersonaPolicy.base_persona_rev
   ) {
     throw new Error("baseline arm does not match frozen prompt/persona policy");
   }
@@ -370,7 +380,7 @@ if (RULE_INJECTION === "none") {
   if (
     ARM !== "B" ||
     PROMPT_REV !== manifest.policy.baseline_prompt_rev ||
-    PERSONA_REV !== manifest.policy.candidate_persona_rev ||
+    PERSONA_REV !== expectedPersonaPolicy.candidate_persona_rev ||
     RULE_REV !== manifest.policy.rule_rev
   ) {
     throw new Error("persona candidate arm does not match frozen policy");
@@ -381,7 +391,7 @@ if (RULE_INJECTION === "none") {
     ARM !== "B" ||
     !production ||
     PROMPT_REV !== manifest.policy.candidate_prompt_rev ||
-    PERSONA_REV !== manifest.policy.base_persona_rev ||
+    PERSONA_REV !== expectedPersonaPolicy.base_persona_rev ||
     RULE_REV !== manifest.policy.rule_rev
   ) {
     throw new Error("platform-bundle candidate arm does not match frozen policy");
@@ -632,6 +642,40 @@ for (;;) {
 if (usage.failed_rows > 0) {
   analysisResourceFailure(`usage ledger contains ${usage.failed_rows} failed row(s)`);
 }
+const rootReceipts = usage.receipts.filter((receipt) => receipt.mode === "chat");
+if (
+  rootReceipts.length < 1 ||
+  rootReceipts.some(
+    (receipt) =>
+      receipt.model !== MODEL ||
+      receipt.authority_kind !== "bridge_signed" ||
+      receipt.dispatch_id !== binding.dispatch_id,
+  )
+) {
+  throw new Error(
+    `usage ledger root model authority differs from ${MODEL}: ${JSON.stringify(rootReceipts)}`,
+  );
+}
+const delegateReceipts = usage.receipts.filter((receipt) => receipt.mode === "delegate");
+if (
+  delegateReceipts.some(
+    (receipt) =>
+      typeof receipt.model !== "string" ||
+      !receipt.model ||
+      receipt.parent_session_id !== peerId ||
+      typeof receipt.delegate_agent_id !== "string" ||
+      !receipt.delegate_agent_id,
+  )
+) {
+  throw new Error("usage ledger delegate attribution/model evidence is incomplete");
+}
+const freshnessAfter = await readFreshness(containerMeta.started_at);
+if (
+  freshnessAfter.dispatches !== freshnessBefore.dispatches + 1 ||
+  freshnessAfter.usage_rows !== freshnessBefore.usage_rows + usage.rows
+) {
+  throw new Error("unrelated agent dispatch or usage appeared during the run");
+}
 const rawFramesJson = `${JSON.stringify({
   peer_id: peerId,
   probe_rev: actualProbeRev,
@@ -646,6 +690,7 @@ const rawFramesJson = `${JSON.stringify({
   binding,
   usage,
   freshness_before: freshnessBefore,
+  freshness_after: freshnessAfter,
   container_before: containerMeta,
   container_after: afterContainerMeta,
   frames,
@@ -715,6 +760,7 @@ const run = {
   container: {
     ...containerMeta,
     freshness_before: freshnessBefore,
+    freshness_after: freshnessAfter,
     binding,
     lane: { before: laneIdentity(beforeLane), after: laneIdentity(afterLane) },
     prompt_rev: PROMPT_REV,

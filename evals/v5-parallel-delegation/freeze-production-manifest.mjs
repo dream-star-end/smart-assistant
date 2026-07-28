@@ -82,7 +82,7 @@ for (const engine of Object.keys(manifest.engines)) {
       if (
         run.manifest_sha256 !== manifestSha ||
         run.prompt_rev !== manifest.policy.baseline_prompt_rev ||
-        run.persona?.rev !== manifest.policy.base_persona_rev
+        run.persona?.rev !== manifest.policy.personas?.[engine]?.base_persona_rev
       ) {
         throw new Error(`baseline run ${run.run_id} does not match frozen isolated policy`);
       }

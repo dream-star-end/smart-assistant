@@ -359,9 +359,11 @@ function schemaFailures(run, manifest) {
   if (!Number.isInteger(run.container?.restart_count) || run.container.restart_count < 0) {
     failures.push("container restart_count must be a non-negative integer");
   }
-  for (const field of ["dispatches", "usage_rows"]) {
-    if (!Number.isInteger(run.container?.freshness_before?.[field]) || run.container.freshness_before[field] < 0) {
-      failures.push(`container freshness ${field} must be a non-negative integer`);
+  for (const phase of ["freshness_before", "freshness_after"]) {
+    for (const field of ["dispatches", "usage_rows"]) {
+      if (!Number.isInteger(run.container?.[phase]?.[field]) || run.container[phase][field] < 0) {
+        failures.push(`container ${phase} ${field} must be a non-negative integer`);
+      }
     }
   }
   if (run.prompt_rev !== run.container?.prompt_rev) failures.push("run and container prompt rev differ");
@@ -399,6 +401,12 @@ function schemaFailures(run, manifest) {
       if (typeof receipt?.turn_key !== "string" || !receipt.turn_key) {
         failures.push("usage receipt missing turn_key");
       }
+      if (typeof receipt?.model !== "string" || !receipt.model) {
+        failures.push("usage receipt missing actual model");
+      }
+      if (typeof receipt?.authority_kind !== "string" || !receipt.authority_kind) {
+        failures.push("usage receipt missing model authority kind");
+      }
       if (!finite(receipt?.tokens) || receipt.tokens < 0) failures.push("usage receipt tokens invalid");
       if (!finite(receipt?.cost_credits) || receipt.cost_credits < 0) {
         failures.push("usage receipt cost invalid");
@@ -414,6 +422,29 @@ function schemaFailures(run, manifest) {
     if (childRows !== run.resources?.usage?.child_rows) failures.push("usage receipt child count mismatch");
     if (failedRows !== run.resources?.usage?.failed_rows) failures.push("usage receipt failure count mismatch");
     if (pendingRows !== run.resources?.usage?.pending_rows) failures.push("usage receipt pending count mismatch");
+    const roots = receipts.filter((receipt) => receipt?.mode === "chat");
+    if (
+      roots.length < 1 ||
+      roots.some(
+        (receipt) =>
+          receipt?.model !== run.model ||
+          receipt?.authority_kind !== "bridge_signed" ||
+          receipt?.dispatch_id !== run.container?.binding?.dispatch_id,
+      )
+    ) {
+      failures.push("usage ledger root actual model/authority differs from requested engine model");
+    }
+    const delegates = receipts.filter((receipt) => receipt?.mode === "delegate");
+    if (
+      delegates.some(
+        (receipt) =>
+          receipt?.parent_session_id !== run.peer_id ||
+          typeof receipt?.delegate_agent_id !== "string" ||
+          !receipt.delegate_agent_id,
+      )
+    ) {
+      failures.push("usage ledger delegate attribution/model evidence is incomplete");
+    }
   }
   if (run.resources?.usage?.user_id !== manifest.targets?.[run.engine]?.user_id) {
     failures.push("usage evidence user differs from manifest target");
@@ -519,9 +550,19 @@ function contaminationFailures(run) {
   const binding = run.container?.binding;
   if (
     run.container?.freshness_before?.user_id !== target?.user_id ||
-    run.container?.freshness_before?.container_started_at !== run.container?.started_at
+    run.container?.freshness_before?.container_started_at !== run.container?.started_at ||
+    run.container?.freshness_after?.user_id !== target?.user_id ||
+    run.container?.freshness_after?.container_started_at !== run.container?.started_at
   ) {
     failures.push("container freshness identity differs from target container");
+  }
+  if (
+    run.container?.freshness_after?.dispatches !==
+      run.container?.freshness_before?.dispatches + 1 ||
+    run.container?.freshness_after?.usage_rows !==
+      run.container?.freshness_before?.usage_rows + run.resources?.usage?.rows
+  ) {
+    failures.push("unrelated agent dispatch or usage appeared during the run");
   }
   if (!target || target.container !== run.container?.binding?.docker_name) {
     failures.push("container binding name differs from manifest target");
@@ -572,8 +613,6 @@ function runKey(run) {
 
 function validateManifest(manifest, gold, mode) {
   const shaFields = [
-    "base_persona_rev",
-    "candidate_persona_rev",
     "rule_rev",
     "baseline_prompt_rev",
     "candidate_prompt_rev",
@@ -638,6 +677,11 @@ function validateManifest(manifest, gold, mode) {
     ) {
       throw new Error(`manifest target missing for ${engine}`);
     }
+    for (const field of ["base_persona_rev", "candidate_persona_rev"]) {
+      if (!/^[0-9a-f]{64}$/.test(manifest.policy.personas?.[engine]?.[field] ?? "")) {
+        throw new Error(`manifest policy personas.${engine}.${field} is not a SHA-256`);
+      }
+    }
   }
   if (
     manifest.baseline_lane?.phase !== "stable" ||
@@ -647,6 +691,14 @@ function validateManifest(manifest, gold, mode) {
     manifest.baseline_lane?.cohort_percent !== 0
   ) {
     throw new Error("manifest baseline lane is not a frozen stable release");
+  }
+  for (const field of ["image", "image_id", "runtime_release", "platform_bundle"]) {
+    if (
+      typeof manifest.baseline_runtime_tuple?.[field] !== "string" ||
+      !manifest.baseline_runtime_tuple[field]
+    ) {
+      throw new Error(`manifest baseline runtime tuple missing ${field}`);
+    }
   }
   for (const scenario of manifest.scenarios ?? []) {
     if (!Number.isFinite(manifest.absolute_wall_ms?.[scenario]) || manifest.absolute_wall_ms[scenario] <= 0) {
@@ -733,7 +785,8 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
       if (run.gates?.absolute_wall_ms !== manifest.absolute_wall_ms?.[run.scenario]) {
         failures.push("absolute wall gate differs from preregistered manifest");
       }
-      if (run.persona?.base_rev !== manifest.policy.base_persona_rev) {
+      const expectedPersona = manifest.policy.personas?.[run.engine];
+      if (run.persona?.base_rev !== expectedPersona?.base_persona_rev) {
         failures.push("persona base revision differs from frozen policy");
       }
       const expectedLane = mode === "production-smoke"
@@ -750,11 +803,14 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
       }
     }
     if (mode === "isolated-ab") {
+      if (!sameJson(run.container?.runtime_tuple, manifest.baseline_runtime_tuple)) {
+        failures.push("isolated A/B runtime tuple differs from frozen baseline manifest");
+      }
       if (
         run.arm === "A" &&
         (
           run.persona?.rule_injection !== "none" ||
-          run.persona?.rev !== manifest.policy.base_persona_rev ||
+          run.persona?.rev !== manifest.policy.personas?.[run.engine]?.base_persona_rev ||
           run.prompt_rev !== manifest.policy.baseline_prompt_rev
         )
       ) {
@@ -764,7 +820,7 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
         run.arm === "B" &&
         (
           run.persona?.rule_injection !== "persona-system-slot" ||
-          run.persona?.rev !== manifest.policy.candidate_persona_rev ||
+          run.persona?.rev !== manifest.policy.personas?.[run.engine]?.candidate_persona_rev ||
           run.prompt_rev !== manifest.policy.baseline_prompt_rev
         )
       ) {
@@ -775,7 +831,7 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
       if (run.pair_step !== 1) failures.push("production smoke B-only run must use pair_step=1");
       if (
         run.persona?.rule_injection !== "platform-bundle" ||
-        run.persona?.rev !== manifest.policy.base_persona_rev ||
+        run.persona?.rev !== manifest.policy.personas?.[run.engine]?.base_persona_rev ||
         run.prompt_rev !== manifest.policy.candidate_prompt_rev
       ) {
         failures.push("production smoke does not match frozen platform-bundle policy");
@@ -1042,7 +1098,8 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename
       for (const [label, actualValue, expectedValue] of [
         ["usage", run.resources?.usage, evidence.usage],
         ["binding", run.container?.binding, evidence.binding],
-        ["freshness", run.container?.freshness_before, evidence.freshness_before],
+        ["freshness before", run.container?.freshness_before, evidence.freshness_before],
+        ["freshness after", run.container?.freshness_after, evidence.freshness_after],
         ["before activity", run.container?.activity?.before, evidence.before_activity],
         ["after activity", run.container?.activity?.after, evidence.after_activity],
         ["before lane", run.container?.lane?.before, evidence.before_lane],

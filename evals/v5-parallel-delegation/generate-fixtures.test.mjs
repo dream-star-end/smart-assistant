@@ -40,7 +40,8 @@ function binderArgs(manifestPath, basePersona, overrides = {}) {
   return [
     BINDER,
     "--manifest", manifestPath,
-    "--base-persona", basePersona,
+    "--ccb-base-persona", basePersona,
+    "--codex-base-persona", values["codex-base-persona"] ?? basePersona,
     "--rule", values.rule,
     "--baseline-prompt-rev", "0".repeat(64),
     "--candidate-prompt-file", values["candidate-prompt-file"],
@@ -52,6 +53,10 @@ function binderArgs(manifestPath, basePersona, overrides = {}) {
     "--baseline-generation", "70",
     "--baseline-active-slot", "A",
     "--baseline-active-release", "baseline-release",
+    "--baseline-image", "baseline-image",
+    "--baseline-image-id", `sha256:${"1".repeat(64)}`,
+    "--baseline-runtime-release", "baseline-runtime-release",
+    "--baseline-platform-bundle", "baseline-platform-bundle",
   ];
 }
 
@@ -84,6 +89,13 @@ describe("v5 parallel delegation deterministic fixtures", () => {
       ["A_FIRST", "B_FIRST", "A_FIRST", "B_FIRST"],
     );
     assert.deepEqual(Object.keys(manifest.input_hashes), manifest.scenarios);
+    const probeSource = readFileSync(PROBE, "utf8");
+    assert.doesNotMatch(probeSource, /agent_id='main'/);
+    assert.match(probeSource, /runtime_channel='v5'/);
+    assert.match(probeSource, /container_internal_id=:'docker_id'/);
+    assert.match(probeSource, /'model',model/);
+    assert.match(probeSource, /'delegate_agent_id',delegate_agent_id/);
+    assert.match(probeSource, /'dispatch_id',dispatch_id::text/);
 
     const gold = JSON.parse(readFileSync(join(first, "gold", "gold.json"), "utf8"));
     assert.deepEqual(gold.pages.map((page) => page.page), Array.from({ length: 12 }, (_, index) => index + 1));
@@ -122,7 +134,9 @@ describe("v5 parallel delegation deterministic fixtures", () => {
     );
 
     const basePersona = join(first, "base-persona.md");
+    const codexPersona = join(first, "codex-base-persona.md");
     writeFileSync(basePersona, "synthetic base persona\n");
+    writeFileSync(codexPersona, "different codex synthetic persona\n");
     const alternate = {
       rule: join(first, "alternate-rule.md"),
       prompt: join(first, "alternate-prompt.md"),
@@ -148,10 +162,24 @@ describe("v5 parallel delegation deterministic fixtures", () => {
     }
     execFileSync(
       process.execPath,
-      binderArgs(join(first, "manifest.json"), basePersona),
+      binderArgs(join(first, "manifest.json"), basePersona, {
+        "codex-base-persona": codexPersona,
+      }),
     );
     const boundBytes = readFileSync(join(first, "manifest.json"));
     const bound = JSON.parse(boundBytes);
+    assert.deepEqual(bound.baseline_runtime_tuple, {
+      image: "baseline-image",
+      image_id: `sha256:${"1".repeat(64)}`,
+      runtime_release: "baseline-runtime-release",
+      platform_bundle: "baseline-platform-bundle",
+    });
+    assert.equal(bound.policy.personas.ccb.base_persona_rev, sha(basePersona));
+    assert.equal(bound.policy.personas.codex.base_persona_rev, sha(codexPersona));
+    assert.notEqual(
+      bound.policy.personas.ccb.candidate_persona_rev,
+      bound.policy.personas.codex.candidate_persona_rev,
+    );
     const boundSha = createHash("sha256").update(boundBytes).digest("hex");
     const runsDir = join(first, "isolated-runs");
     mkdirSync(runsDir);
@@ -165,7 +193,7 @@ describe("v5 parallel delegation deterministic fixtures", () => {
             scenario,
             manifest_sha256: boundSha,
             prompt_rev: bound.policy.baseline_prompt_rev,
-            persona: { rev: bound.policy.base_persona_rev },
+            persona: { rev: bound.policy.personas[engine].base_persona_rev },
             wall_ms: scenario === "document_batch" ? 100_000 : 50_000,
           };
           writeFileSync(join(runsDir, `${run.run_id}.json`), JSON.stringify(run));
