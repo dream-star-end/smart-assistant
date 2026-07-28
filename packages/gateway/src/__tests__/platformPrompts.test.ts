@@ -286,16 +286,16 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     // 这里只固化静态 prompt 契约;是否真的并行、质量和资源是否达标由
     // evals/v5-parallel-delegation 的双底座真 turn A/B 门验证。
     for (const rule of [
-      '能拆成 2–4 个输入和产物互不重叠的 shard',
-      '当前通常最多 3',
-      '各有验收条件的模块',
-      '不要改用后台 Bash 假并行',
-      '共享文件/最终产物只设一个写入者',
-      '不要继续委派子 Agent',
-      '不要再启动大量后台 Bash fan-out',
-      '不要启用或改用底座原生多 Agent 功能',
-      '只重试缺失或失败的 shard',
-      '已是被委派的子 Agent',
+      '可拆为2–4个输入/产物互不依赖',
+      '通常同时≤3，其余由平台有界排队',
+      '选匹配成员',
+      '简单、强依赖、外部限流或CPU/内存饱和时保持单Agent',
+      '依赖步骤串行',
+      '为各分片写明边界与验收条件',
+      '负责拆分、单写者、集成并逐项验证',
+      '子Agent不得再委派',
+      '禁止底座原生multi-agent及后台Bash fan-out',
+      '只重试失败或缺失分片',
     ]) {
       assert.ok(prompt.includes(rule), `普通模式提示缺受控并行契约: ${rule}`)
     }
@@ -304,8 +304,7 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       'utf8',
     ).trim()
     assert.ok(prompt.includes(evalRule), '行为 A/B 注入的候选规则必须与正式 platform prompt 逐字一致')
-    assert.match(prompt, /简单任务[\s\S]*保持单 Agent[\s\S]*不妨碍为质量进行一次专业委派/)
-    assert.match(prompt, /步骤紧密依赖[\s\S]*保持单 Agent/)
+    assert.match(prompt, /简单、强依赖[\s\S]*保持单Agent/)
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('multi_agent_v2'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
