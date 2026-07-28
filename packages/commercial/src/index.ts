@@ -469,6 +469,7 @@ import {
   qqInboundChannelProfile,
   type QqBotService,
 } from "./qqbot/service.js";
+import { makeSaveQqMediaToUserUploads } from "./qqbot/mediaIngest.js";
 import {
   QQ_OUTBOUND_PATH,
   QQ_PROACTIVE_PATH,
@@ -4304,6 +4305,33 @@ export async function registerCommercial(
       pool: getPool(),
       config: qqConfig,
       dispatcher: qqDispatcher,
+      prepareMedia:
+        userMediaResolver && ensureContainerEndpointReady
+          ? makeSaveQqMediaToUserUploads({
+              ensureContainerReady: ensureContainerEndpointReady,
+              resolveUserMediaDirs: userMediaResolver,
+              pushRemoteHostUpload,
+            })
+          : undefined,
+      handleModelCommand: async (bindingUserId, text) => {
+        const uid = BigInt(bindingUserId);
+        const [prefs, authz] = await Promise.all([
+          getPreferences(uid),
+          loadUserModelAuthz(uid),
+        ]);
+        return await handleWechatModelCommand({
+          text,
+          channelName: "QQ",
+          preferredModel: prefs.prefs.default_model,
+          visibleModels: pricing.listForUser(authz),
+          canUseModel: (modelId) =>
+            canUseModel({ pricing }, { ...authz, modelId }),
+          allowedModels: ALLOWED_INBOUND_MODELS,
+          setDefaultModel: async (modelId) => {
+            await patchPreferences(uid, { default_model: modelId });
+          },
+        });
+      },
     });
     const qqIdentityRepo = createPgIdentityRepo();
     qqOutboundRef.current = makeQqOutboundReceiver({

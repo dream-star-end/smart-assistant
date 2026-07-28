@@ -14,6 +14,10 @@ import type {
   InboundEvent,
 } from '../wechat/inboundDispatcher.js'
 import type { QqBotConfig } from './config.js'
+import type {
+  QqInboundAttachment,
+  SaveQqMediaResult,
+} from './mediaIngest.js'
 import { type QqOutboxWorker, startQqOutboxWorker } from './outbox.js'
 import {
   deleteQqSessionPointer,
@@ -31,7 +35,8 @@ const QQ_CONTEXT_HINT = [
   '【OpenClaude QQ 通道系统提示】',
   '当前这一轮用户正在 QQ 私聊里与你对话；平台会把最终文字回复完整分片发回 QQ。',
   '完整执行过程也会持久化到同一个 OpenClaude 网页会话中。',
-  'QQ 通道当前只支持文字；如果结果包含文件，请说明用户可在网页会话中查看和下载。',
+  '用户通过 QQ 发送的图片、语音和附件会保存到当前容器本地，路径会随消息一起提供。',
+  '如果结果包含新生成的文件，请说明用户可在网页会话中查看和下载。',
 ].join('\n')
 
 export const QQ_GROUP_AND_C2C_INTENTS = 1 << 25
@@ -119,6 +124,12 @@ export function makeQqBotService(args: {
   gatewayHealthPollMs?: number
   restartDelayMs?: number
   generationStopTimeoutMs?: number
+  prepareMedia?: (args: {
+    bindingUserId: string
+    attachments: QqInboundAttachment[]
+    text?: string
+  }) => Promise<SaveQqMediaResult>
+  handleModelCommand?: (bindingUserId: string, text: string) => Promise<string>
   onFatal?: (reason: string, err: unknown) => void
 }): QqBotService {
   const log = (args.logger ?? rootLogger).child({ subsys: 'qqBot' })
@@ -216,7 +227,10 @@ export function makeQqBotService(args: {
       onMessage: async (_ctx: unknown, message: QQBotInboundMessage) => {
         if (!generation.accepting) return
         try {
-          await handleMessage(args.pool, args.config, args.dispatcher, instance, message, log)
+          await handleMessage(args.pool, args.config, args.dispatcher, instance, message, log, {
+            prepareMedia: args.prepareMedia,
+            handleModelCommand: args.handleModelCommand,
+          })
         } catch (err) {
           log.error('inbound_failed', {
             messageIdHash: shortHash(message.messageId),
@@ -405,6 +419,14 @@ async function handleMessage(
   bot: QQBot,
   message: QQBotInboundMessage,
   log: Logger,
+  ux: {
+    prepareMedia?: (args: {
+      bindingUserId: string
+      attachments: QqInboundAttachment[]
+      text?: string
+    }) => Promise<SaveQqMediaResult>
+    handleModelCommand?: (bindingUserId: string, text: string) => Promise<string>
+  },
 ): Promise<void> {
   if (message.kind !== 'c2c' || message.replyTarget.scope !== 'c2c') return
   const openid = message.senderId
@@ -465,7 +487,7 @@ async function handleMessage(
     await safeReply(
       bot,
       message.replyTarget,
-      '直接发送文字即可对话。\n/new 新建会话\n/stop 停止当前任务\n/help 查看帮助',
+      '直接发送文字、图片、语音或附件即可对话。\n/model 查看或切换模型\n/new 新建会话\n/stop 停止当前任务\n/help 查看帮助',
       log,
     )
     return
@@ -475,9 +497,29 @@ async function handleMessage(
     await safeReply(bot, message.replyTarget, '已切换到新会话，下一条消息会开启新的上下文。', log)
     return
   }
-  const evt = buildInboundEvent(binding.userId, openid, text, message)
+  if (/^\/model(?:\s|$)/i.test(text)) {
+    if (!ux.handleModelCommand) {
+      await safeReply(bot, message.replyTarget, '模型切换暂时不可用，请稍后重试。', log)
+      return
+    }
+    try {
+      await safeReply(
+        bot,
+        message.replyTarget,
+        await ux.handleModelCommand(binding.userId, text),
+        log,
+      )
+    } catch (err) {
+      log.error('model_command_failed', {
+        uid: binding.userId,
+        errMessage: err instanceof Error ? err.message : String(err),
+      })
+      await safeReply(bot, message.replyTarget, '模型切换暂时失败，请稍后重试。', log)
+    }
+    return
+  }
   if (command === '/stop' || command === '停止') {
-    const outcome = await dispatcher.stop(evt)
+    const outcome = await dispatcher.stop(buildInboundEvent(binding.userId, openid, text, message))
     await safeReply(bot, message.replyTarget, outcome.reply.replaceAll('微信', 'QQ'), log)
     return
   }
@@ -490,13 +532,42 @@ async function handleMessage(
     )
     return
   }
-  if (!text) {
+  let inboundText = text
+  const attachments = message.attachments ?? []
+  if (attachments.length > 0) {
+    if (!ux.prepareMedia) {
+      await safeReply(bot, message.replyTarget, 'QQ 附件处理暂时不可用，请稍后重试。', log)
+      return
+    }
+    try {
+      inboundText = (
+        await ux.prepareMedia({
+          bindingUserId: binding.userId,
+          attachments,
+          text: text || undefined,
+        })
+      ).promptText
+    } catch (err) {
+      log.error('media_ingest_failed', {
+        uid: binding.userId,
+        messageIdHash: shortHash(message.messageId),
+        errMessage: err instanceof Error ? err.message : String(err),
+      })
+      await safeReply(
+        bot,
+        message.replyTarget,
+        '这次图片、语音或附件未能接收完整，请稍后重试。',
+        log,
+      )
+      return
+    }
+  }
+  const evt = buildInboundEvent(binding.userId, openid, inboundText, message)
+  if (!inboundText) {
     await safeReply(
       bot,
       message.replyTarget,
-      message.attachments?.length
-        ? 'QQ 图片和附件接入还未开放，请先发送文字，或在 OpenClaude 网页端上传附件。'
-        : '请输入要发送的文字。',
+      '请输入要发送的文字。',
       log,
     )
     return
