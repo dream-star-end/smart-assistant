@@ -18,6 +18,10 @@ import type {
   QqInboundAttachment,
   SaveQqMediaResult,
 } from './mediaIngest.js'
+import {
+  qqMediaFileType,
+  type ResolveQqOutboundMediaPartFn,
+} from './outboundMedia.js'
 import { type QqOutboxWorker, startQqOutboxWorker } from './outbox.js'
 import {
   deleteQqSessionPointer,
@@ -129,6 +133,7 @@ export function makeQqBotService(args: {
     attachments: QqInboundAttachment[]
     text?: string
   }) => Promise<SaveQqMediaResult>
+  resolveOutboundMedia?: ResolveQqOutboundMediaPartFn
   handleModelCommand?: (bindingUserId: string, text: string) => Promise<string>
   onFatal?: (reason: string, err: unknown) => void
 }): QqBotService {
@@ -286,6 +291,15 @@ export function makeQqBotService(args: {
         sendText: async (openid, text) => {
           await instance.sendText({ scope: 'c2c', targetId: openid }, text)
         },
+        sendMedia: async (openid, media) => {
+          await instance.sendMedia({
+            target: { scope: 'c2c', targetId: openid },
+            fileType: qqMediaFileType(media.kind),
+            buffer: media.content,
+            fileName: media.filename,
+          })
+        },
+        resolveMediaPart: args.resolveOutboundMedia,
         onError: (message, meta) => log.error(message, meta),
       })
       log.info('started')

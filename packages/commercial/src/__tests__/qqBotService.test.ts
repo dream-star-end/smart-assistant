@@ -13,12 +13,14 @@ import {
   QQ_GROUP_AND_C2C_INTENTS,
   makeQqBotService,
 } from '../qqbot/service.js'
+import type { startQqOutboxWorker } from '../qqbot/outbox.js'
 import type { InboundDispatcher } from '../wechat/inboundDispatcher.js'
 
 class FakeBot extends EventEmitter {
   terminal = false
   stopped = false
   readonly sentTexts: string[] = []
+  readonly sentMedia: unknown[] = []
   private settleStart!: () => void
   private readonly running = new Promise<void>((resolve) => {
     this.settleStart = resolve
@@ -45,7 +47,81 @@ class FakeBot extends EventEmitter {
     this.sentTexts.push(text)
     return {}
   }
+
+  async sendMedia(options: unknown): Promise<unknown> {
+    this.sentMedia.push(options)
+    return {}
+  }
 }
+
+test('QQ outbox adapter maps image, video, voice and file to SDK media uploads', async () => {
+  const bot = new FakeBot()
+  let workerArgs: Parameters<typeof startQqOutboxWorker>[0] | undefined
+  const service = makeQqBotService({
+    pool: {} as Pool,
+    config: qqConfig(),
+    dispatcher: {} as InboundDispatcher,
+    botFactory: () => bot as unknown as import('@tencent-connect/qqbot-nodejs').QQBot,
+    outboxWorkerFactory: (args) => {
+      workerArgs = args
+      return { kick() {}, async stop() {} }
+    },
+    gatewayTerminal: () => false,
+  })
+
+  await service.start()
+  assert.ok(workerArgs?.sendMedia)
+  for (const kind of ['image', 'video', 'voice', 'file'] as const) {
+    await workerArgs.sendMedia('openid-1', {
+      kind,
+      filename: `${kind}.bin`,
+      content: Buffer.from(kind),
+    })
+  }
+  assert.deepEqual(
+    bot.sentMedia.map((value) => {
+      const item = value as {
+        target: ReplyTarget
+        fileType: number
+        buffer: Buffer
+        fileName: string
+      }
+      return {
+        target: item.target,
+        fileType: item.fileType,
+        content: item.buffer.toString(),
+        fileName: item.fileName,
+      }
+    }),
+    [
+      {
+        target: { scope: 'c2c', targetId: 'openid-1' },
+        fileType: 1,
+        content: 'image',
+        fileName: 'image.bin',
+      },
+      {
+        target: { scope: 'c2c', targetId: 'openid-1' },
+        fileType: 2,
+        content: 'video',
+        fileName: 'video.bin',
+      },
+      {
+        target: { scope: 'c2c', targetId: 'openid-1' },
+        fileType: 3,
+        content: 'voice',
+        fileName: 'voice.bin',
+      },
+      {
+        target: { scope: 'c2c', targetId: 'openid-1' },
+        fileType: 4,
+        content: 'file',
+        fileName: 'file.bin',
+      },
+    ],
+  )
+  await service.stop()
+})
 
 test('QQ gateway requests only C2C intent and fully recreates a terminal SDK generation', async () => {
   const options: QQBotOptions[] = []

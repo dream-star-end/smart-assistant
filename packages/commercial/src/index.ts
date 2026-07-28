@@ -470,6 +470,7 @@ import {
   type QqBotService,
 } from "./qqbot/service.js";
 import { makeSaveQqMediaToUserUploads } from "./qqbot/mediaIngest.js";
+import { makeQqOutboundMediaResolver } from "./qqbot/outboundMedia.js";
 import {
   QQ_OUTBOUND_PATH,
   QQ_PROACTIVE_PATH,
@@ -4301,6 +4302,20 @@ export async function registerCommercial(
       transport: makeNodeHttpContainerTransport(),
       channel: qqInboundChannelProfile(),
     });
+    const resolveQqOutboundMedia =
+      userMediaResolver
+        ? makeQqOutboundMediaResolver({
+            resolveUserMediaDirs: userMediaResolver,
+            pullRemoteHostMedia: async (args) => {
+              const target = await resolveServiceableHostTarget(args.hostUuid);
+              try {
+                return await nodeAgentGetFile(target, args.remotePath);
+              } finally {
+                target.psk?.fill(0);
+              }
+            },
+          })
+        : undefined;
     qqBotService = makeQqBotService({
       pool: getPool(),
       config: qqConfig,
@@ -4313,6 +4328,7 @@ export async function registerCommercial(
               pushRemoteHostUpload,
             })
           : undefined,
+      resolveOutboundMedia: resolveQqOutboundMedia,
       handleModelCommand: async (bindingUserId, text) => {
         const uid = BigInt(bindingUserId);
         const [prefs, authz] = await Promise.all([
