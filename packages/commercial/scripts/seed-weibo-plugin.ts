@@ -263,8 +263,13 @@ async function loadUpgradeAccount(userId: number) {
   const verified = await loadVerifiedRuntimePluginContract(sourceVersionId, getPool(), {
     env: process.env,
   })
-  assertWeiboUpgradeVerificationScope(census, userId, verified.artifactHash)
-  const accountId = census.accounts[0].id
+  assertWeiboUpgradeVerificationScope(
+    census,
+    userId,
+    verified.artifactHash,
+    verified.execContractHash,
+  )
+  const accountId = census.accounts.find((account) => account.userId === userId)!.id
   const row = await getPluginAccount(accountId, userId, getPool(), { includeError: true })
   if (!row || row.status !== 'active') throw new Error('Weibo upgrade account disappeared')
   if (
@@ -278,6 +283,7 @@ async function loadUpgradeAccount(userId: number) {
   const envelope = decryptPluginAccountEnvelope(row, verified.contract, process.env)
   return {
     census,
+    accountId,
     storageState: envelope.storageState,
     accountInstanceId: envelope.accountInstanceId,
     writePolicyFingerprint: writePolicyFingerprint(row),
@@ -330,7 +336,7 @@ async function verifyUpgradedAccount(
     },
     'Weibo upgrade final census is not the exact verified scope',
   )
-  const finalRow = await getPluginAccount(reusable.census.accounts[0]!.id, userId, getPool(), {
+  const finalRow = await getPluginAccount(reusable.accountId, userId, getPool(), {
     includeError: true,
   })
   if (!finalRow || finalRow.connector_version_id !== targetVersionId)
