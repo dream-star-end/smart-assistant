@@ -8,8 +8,8 @@ import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
   existsSync,
-  mkdtempSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -125,21 +125,23 @@ describe('executeHostOpcode — strict outcome classification', () => {
     assert.equal(r.outcome, 'rejected')
     assert.equal(called, false, 'a non-whitelisted opcode is never transmitted')
   })
-  it('the retired clean-v5-disk-v1 opcode fails closed without SSH', async () => {
-    let called = false
-    const r = await executeHostOpcode(
-      'clean-v5-disk-v1',
-      {
-        ...CFG,
-        runner: async () => {
-          called = true
-          return { code: 0, stdout: '{}', stderr: '', timedOut: false }
+  it('retired disk and blind master-restart opcodes fail closed without SSH', async () => {
+    for (const opcode of ['clean-v5-disk-v1', 'restart-v5-active-master-v1']) {
+      let called = false
+      const r = await executeHostOpcode(
+        opcode,
+        {
+          ...CFG,
+          runner: async () => {
+            called = true
+            return { code: 0, stdout: '{}', stderr: '', timedOut: false }
+          },
         },
-      },
-      clock,
-    )
-    assert.equal(r.outcome, 'rejected')
-    assert.equal(called, false, 'a frozen legacy disk request must never reach SSH')
+        clock,
+      )
+      assert.equal(r.outcome, 'rejected')
+      assert.equal(called, false, `${opcode} must never reach SSH`)
+    }
   })
 })
 
@@ -149,17 +151,15 @@ describe('opcode maps stay coherent', () => {
       assert.ok(TIER1_OPCODES.has(op), `${op} must be a known Tier1 opcode`)
     }
   })
-  it('maps only the four exact service conditions; disk conditions have no Tier1 route', () => {
+  it('maps only the two egress conditions; master and disk conditions have no policy route', () => {
     assert.deepEqual(Object.keys(CONDITION_OPCODE_MAP).sort(), [
       'ops.monitor:http_egress',
-      'ops.monitor:http_v5',
       'ops.monitor:svc_egress',
-      'ops.monitor:svc_v5',
     ])
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:svc_egress'], 'restart-v5-egress-v1')
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:http_egress'], 'restart-v5-egress-v1')
-    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:svc_v5'], 'restart-v5-active-master-v1')
-    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:http_v5'], 'restart-v5-active-master-v1')
+    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:svc_v5'], undefined)
+    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:http_v5'], undefined)
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_root'], undefined)
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_var'], undefined)
   })
@@ -174,7 +174,7 @@ describe('opcode maps stay coherent', () => {
     assert.doesNotMatch(wrapper, /journalctl\s+--vacuum/)
     assert.match(
       wrapper,
-      /"capabilities":\["restart-v5-egress-v1","restart-v5-active-master-v1"\]/,
+      /"capabilities":\["restart-v5-egress-v1","ensure-v5-active-master-v1"\]/,
     )
   })
 })
@@ -183,8 +183,12 @@ interface WrapperRunOpts {
   state?: string
   curlMode?: 'ok' | 'all-fail' | 'public-fail'
   psqlRc?: number
-  systemctlRc?: number
-  healthTimeout?: number
+  unitState?: string
+  systemctlShowRc?: number
+  systemctlRestartRc?: number
+  totalTimeout?: number
+  maintenanceActive?: boolean
+  busyLease?: boolean
 }
 
 function runWrapper(opcode: string, opts: WrapperRunOpts = {}) {
@@ -214,7 +218,13 @@ function runWrapper(opcode: string, opts: WrapperRunOpts = {}) {
       'systemctl',
       `if flock -n "$LEASE_PATH" true 2>/dev/null; then exit 42; fi\n` +
         `printf '%s\\n' "$*" >> "$ACTION_LOG"\n` +
-        `rc="\${SYSTEMCTL_RC:-0}"\n` +
+        `if [ "\${1:-}" = show ]; then\n` +
+        `  rc="\${SYSTEMCTL_SHOW_RC:-0}"\n` +
+        `  [ "$rc" -eq 0 ] || exit "$rc"\n` +
+        `  printf '%s\\n' "\${UNIT_STATE-}"\n` +
+        '  exit 0\n' +
+        'fi\n' +
+        `rc="\${SYSTEMCTL_RESTART_RC:-0}"\n` +
         `if [ "$rc" -ne 0 ]; then printf 'restart failed\\n' >&2; exit "$rc"; fi`,
     )
     stub(
@@ -224,11 +234,20 @@ function runWrapper(opcode: string, opts: WrapperRunOpts = {}) {
         `if [ "\${CURL_MODE:-ok}" = all-fail ]; then exit 7; fi\n` +
         `if [ "\${CURL_MODE:-ok}" = public-fail ]; then\n` +
         `  case " $* " in *" Host: claudeai.chat "*) exit 7 ;; esac\n` +
-        `fi\n` +
+        'fi\n' +
         `printf '{"ok":true,"channel":"v5"}\\n'`,
     )
+    if (opts.maintenanceActive) {
+      writeFileSync(
+        maintenance,
+        JSON.stringify({ schema: 2, deadline: Math.floor(Date.now() / 1000) + 300 }),
+      )
+    }
 
-    const result = spawnSync('bash', [WRAPPER, opcode], {
+    const command = opts.busyLease
+      ? ['-x', lease, 'bash', WRAPPER, opcode]
+      : [WRAPPER, opcode]
+    const result = spawnSync(opts.busyLease ? 'flock' : 'bash', command, {
       encoding: 'utf8',
       env: {
         ...process.env,
@@ -236,10 +255,13 @@ function runWrapper(opcode: string, opts: WrapperRunOpts = {}) {
         OC_SELFHEAL_V5_ENV: envFile,
         OC_SELFHEAL_MUTATION_LEASE: lease,
         OC_SELFHEAL_MAINT_MARKER: maintenance,
-        OC_SELFHEAL_MASTER_HEALTH_TIMEOUT: String(opts.healthTimeout ?? 2),
+        OC_SELFHEAL_MASTER_TOTAL_TIMEOUT: String(opts.totalTimeout ?? 2),
         PSQL_ROW: opts.state ?? 'stable|A|',
         PSQL_RC: String(opts.psqlRc ?? 0),
-        SYSTEMCTL_RC: String(opts.systemctlRc ?? 0),
+        UNIT_STATE:
+          opts.unitState ?? 'LoadState=loaded\nActiveState=inactive\nSubState=dead',
+        SYSTEMCTL_SHOW_RC: String(opts.systemctlShowRc ?? 0),
+        SYSTEMCTL_RESTART_RC: String(opts.systemctlRestartRc ?? 0),
         CURL_MODE: opts.curlMode ?? 'ok',
         ACTION_LOG: actionLog,
         CURL_LOG: curlLog,
@@ -264,16 +286,17 @@ function runWrapper(opcode: string, opts: WrapperRunOpts = {}) {
   }
 }
 
-describe('remote forced-command wrapper — active master restart', () => {
-  it('derives and proves the active A/B unit while holding the mutation lease', () => {
+describe('remote forced-command wrapper — independent active-master guardian', () => {
+  it('derives and restores exact inactive A/B units while holding the mutation lease', () => {
     for (const fixture of [
       { state: 'stable|A|', unit: 'openclaude-v5.service', port: '18790' },
       { state: 'stable|B|', unit: 'openclaude-v5-b.service', port: '18795' },
     ]) {
-      const r = runWrapper('restart-v5-active-master-v1', { state: fixture.state })
+      const r = runWrapper('ensure-v5-active-master-v1', { state: fixture.state })
       assert.equal(r.status, 0)
       assert.equal(r.receipt.outcome, 'completed')
       assert.equal(r.receipt.exit, 0)
+      assert.equal(r.receipt.detail?.action, 'restart')
       assert.equal(r.receipt.detail?.unit, fixture.unit)
       assert.match(r.actions, new RegExp(`restart ${fixture.unit.replaceAll('.', '\\.')}`))
       assert.match(r.curls, new RegExp(`127\\.0\\.0\\.1:${fixture.port}/healthz`))
@@ -289,36 +312,81 @@ describe('remote forced-command wrapper — active master restart', () => {
       'canary|A|B',
       'stable|A|B',
     ]) {
-      const r = runWrapper('restart-v5-active-master-v1', { state })
+      const r = runWrapper('ensure-v5-active-master-v1', { state })
       assert.equal(r.status, 66, `state=${JSON.stringify(state)}`)
       assert.equal(r.receipt.outcome, 'rejected')
       assert.equal(r.receipt.exit, 66)
       assert.equal(r.actions, '')
     }
-    const queryFailure = runWrapper('restart-v5-active-master-v1', { psqlRc: 2 })
+    const queryFailure = runWrapper('ensure-v5-active-master-v1', { psqlRc: 2 })
     assert.equal(queryFailure.status, 66)
     assert.equal(queryFailure.receipt.outcome, 'rejected')
     assert.equal(queryFailure.actions, '')
   })
 
-  it('returns a bound failed receipt when restart or health proof fails', () => {
-    const restart = runWrapper('restart-v5-active-master-v1', { systemctlRc: 5 })
+  it('noops when active even if health would fail; transient/unknown states never restart', () => {
+    const active = runWrapper('ensure-v5-active-master-v1', {
+      unitState: 'LoadState=loaded\nActiveState=active\nSubState=running',
+      curlMode: 'all-fail',
+    })
+    assert.equal(active.status, 0)
+    assert.equal(active.receipt.outcome, 'completed')
+    assert.equal(active.receipt.detail?.action, 'noop')
+    assert.doesNotMatch(active.actions, /restart /)
+    assert.equal(active.curls, '')
+
+    for (const unitState of [
+      'LoadState=not-found\nActiveState=inactive\nSubState=dead',
+      'LoadState=loaded\nActiveState=activating\nSubState=start',
+      'LoadState=loaded\nActiveState=deactivating\nSubState=stop-sigterm',
+      'LoadState=loaded\nActiveState=inactive\nSubState=exited',
+      'LoadState=loaded\nActiveState=failed',
+    ]) {
+      const r = runWrapper('ensure-v5-active-master-v1', { unitState })
+      assert.equal(r.status, 66, unitState)
+      assert.equal(r.receipt.outcome, 'rejected')
+      assert.doesNotMatch(r.actions, /restart /)
+      assert.equal(r.curls, '')
+    }
+    const showFailure = runWrapper('ensure-v5-active-master-v1', {
+      systemctlShowRc: 4,
+    })
+    assert.equal(showFailure.status, 66)
+    assert.doesNotMatch(showFailure.actions, /restart /)
+  })
+
+  it('stands down for maintenance or a busy production mutation lease without restart', () => {
+    for (const opts of [{ maintenanceActive: true }, { busyLease: true }]) {
+      const r = runWrapper('ensure-v5-active-master-v1', opts)
+      assert.equal(r.status, 66)
+      assert.equal(r.receipt.outcome, 'rejected')
+      assert.doesNotMatch(r.actions, /restart /)
+      assert.equal(r.curls, '')
+    }
+  })
+
+  it('returns a bound failed receipt when restart or bounded health proof fails', () => {
+    const restart = runWrapper('ensure-v5-active-master-v1', {
+      systemctlRestartRc: 5,
+    })
     assert.equal(restart.status, 5)
     assert.equal(restart.receipt.outcome, 'failed')
     assert.equal(restart.receipt.exit, 5)
     assert.match(restart.stderr, /restart openclaude-v5\.service failed rc=5/)
 
-    const health = runWrapper('restart-v5-active-master-v1', {
+    const started = Date.now()
+    const health = runWrapper('ensure-v5-active-master-v1', {
       curlMode: 'all-fail',
-      healthTimeout: 1,
+      totalTimeout: 1,
     })
     assert.equal(health.status, 70)
     assert.equal(health.receipt.outcome, 'failed')
     assert.equal(health.receipt.exit, 70)
+    assert.ok(Date.now() - started < 3_000, 'restart + health proof must stay bounded')
 
-    const publicHealth = runWrapper('restart-v5-active-master-v1', {
+    const publicHealth = runWrapper('ensure-v5-active-master-v1', {
       curlMode: 'public-fail',
-      healthTimeout: 1,
+      totalTimeout: 3,
     })
     assert.equal(publicHealth.receipt.outcome, 'failed')
     assert.equal(publicHealth.receipt.detail?.privateHealth, true)
