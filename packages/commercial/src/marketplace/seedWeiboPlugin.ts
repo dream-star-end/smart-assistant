@@ -66,24 +66,29 @@ export function assertWeiboUpgradeVerificationScope(
   scope: OfficialManagedBrowserTransitionScope,
   verificationUserId: number,
   sourceArtifactHash: string,
+  sourceExecContractHash: string,
 ): void {
   const currentVersionId = scope.currentVersionId
-  const account = scope.accounts[0]
+  const account = scope.accounts.find((row) => row.userId === verificationUserId)
   if (
     !currentVersionId ||
     scope.installs.length === 0 ||
-    scope.accounts.length !== 1 ||
+    scope.accounts.length === 0 ||
     !scope.installs.some((row) => row.userId === verificationUserId) ||
     scope.installs.some(
-      (row) =>
-        row.versionId !== currentVersionId || row.artifactHash !== sourceArtifactHash,
+      (row) => row.versionId !== currentVersionId || row.artifactHash !== sourceArtifactHash,
     ) ||
-    account?.userId !== verificationUserId ||
-    account.versionId !== currentVersionId ||
-    account.status !== 'active'
+    !account ||
+    scope.accounts.some(
+      (row) =>
+        row.versionId !== currentVersionId ||
+        row.status !== 'active' ||
+        row.specHash !== sourceArtifactHash ||
+        row.execContractHash !== sourceExecContractHash,
+    )
   )
     throw new Error(
-      'Weibo upgrade scope must contain current installs and exactly one verified active account',
+      'Weibo upgrade scope must contain exact current installs/accounts and the verified active account',
     )
 }
 

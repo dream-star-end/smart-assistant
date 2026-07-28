@@ -5,6 +5,7 @@ import type { OfficialManagedBrowserTransitionScope } from '../plugins/officialM
 import { assertWeiboUpgradeVerificationScope } from './seedWeiboPlugin.js'
 
 const SOURCE_HASH = 'a'.repeat(64)
+const SOURCE_EXEC_HASH = 'b'.repeat(64)
 
 type MutableScope = {
   currentVersionId: string | null
@@ -31,7 +32,18 @@ function scope(): MutableScope {
         secretGeneration: '99',
         status: 'active',
         specHash: SOURCE_HASH,
-        execContractHash: 'b'.repeat(64),
+        execContractHash: SOURCE_EXEC_HASH,
+        authContractVersion: 1,
+      },
+      {
+        id: '4',
+        userId: 626,
+        versionId: '2211',
+        revision: 3,
+        secretGeneration: '12',
+        status: 'active',
+        specHash: SOURCE_HASH,
+        execContractHash: SOURCE_EXEC_HASH,
         authContractVersion: 1,
       },
     ],
@@ -39,39 +51,58 @@ function scope(): MutableScope {
 }
 
 describe('official Weibo upgrade verification scope', () => {
-  test('accepts multiple current installs backed by one verified active account', () => {
-    assert.doesNotThrow(() => assertWeiboUpgradeVerificationScope(scope(), 1, SOURCE_HASH))
+  test('accepts multiple exact accounts when the selected verifier is not first', () => {
+    assert.doesNotThrow(() =>
+      assertWeiboUpgradeVerificationScope(scope(), 626, SOURCE_HASH, SOURCE_EXEC_HASH),
+    )
   })
 
-  test('rejects any install artifact drift even when the verified account pins are intact', () => {
+  test('rejects any install artifact or version drift', () => {
     for (const index of [1, 2]) {
       const value = scope()
       value.installs[index] = { ...value.installs[index]!, artifactHash: 'c'.repeat(64) }
       assert.throws(
-        () => assertWeiboUpgradeVerificationScope(value, 1, SOURCE_HASH),
-        /exactly one verified active account/,
+        () => assertWeiboUpgradeVerificationScope(value, 626, SOURCE_HASH, SOURCE_EXEC_HASH),
+        /exact current installs\/accounts/,
       )
     }
-  })
-
-  test('rejects extra accounts, source-version drift, or a verifier without an install', () => {
-    const extraAccount = scope()
-    extraAccount.accounts.push({ ...extraAccount.accounts[0]!, id: '4', userId: 4 })
-    assert.throws(
-      () => assertWeiboUpgradeVerificationScope(extraAccount, 1, SOURCE_HASH),
-      /exactly one verified active account/,
-    )
 
     const versionDrift = scope()
     versionDrift.installs[1] = { ...versionDrift.installs[1]!, versionId: '2180' }
     assert.throws(
-      () => assertWeiboUpgradeVerificationScope(versionDrift, 1, SOURCE_HASH),
-      /exactly one verified active account/,
+      () => assertWeiboUpgradeVerificationScope(versionDrift, 626, SOURCE_HASH, SOURCE_EXEC_HASH),
+      /exact current installs\/accounts/,
+    )
+  })
+
+  test('rejects any account version, status, artifact, or execution-contract drift', () => {
+    const drifts = [
+      { versionId: '2180' },
+      { status: 'error' },
+      { specHash: 'c'.repeat(64) },
+      { execContractHash: 'd'.repeat(64) },
+    ]
+    for (const drift of drifts) {
+      const value = scope()
+      value.accounts[0] = { ...value.accounts[0]!, ...drift }
+      assert.throws(
+        () => assertWeiboUpgradeVerificationScope(value, 626, SOURCE_HASH, SOURCE_EXEC_HASH),
+        /exact current installs\/accounts/,
+      )
+    }
+  })
+
+  test('rejects a verifier without both a current install and active account', () => {
+    assert.throws(
+      () => assertWeiboUpgradeVerificationScope(scope(), 99, SOURCE_HASH, SOURCE_EXEC_HASH),
+      /verified active account/,
     )
 
+    const missingInstall = scope()
+    missingInstall.installs = missingInstall.installs.filter((row) => row.userId !== 626)
     assert.throws(
-      () => assertWeiboUpgradeVerificationScope(scope(), 99, SOURCE_HASH),
-      /exactly one verified active account/,
+      () => assertWeiboUpgradeVerificationScope(missingInstall, 626, SOURCE_HASH, SOURCE_EXEC_HASH),
+      /verified active account/,
     )
   })
 })
