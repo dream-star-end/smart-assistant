@@ -30,6 +30,7 @@ const WRITE_ACTIONS = new Set([
   'send_message', 'set_post_favorite', 'set_comment_like'
 ]);
 const RISK_TEXT = /安全验证|访问异常|操作频繁|账号存在风险|请完成验证|验证码|登录保护|行为异常/;
+const NORMAL_LOGIN_VERIFICATION_TEXT = /验证码登录|获取验证码/g;
 let terminal = false;
 
 function encodeFrame(value) {
@@ -196,7 +197,10 @@ function postIdentity(raw) {
 }
 async function bodyText(page) { return cleanText(await page.locator('body').innerText().catch(() => ''), 100000); }
 async function assertNoChallenge(page) {
-  const text = await bodyText(page);
+  // The standard sign-in page offers SMS as an alternative to QR login. Its
+  // labels are not a challenge; every other occurrence of 验证码 remains
+  // fail-closed below.
+  const text = (await bodyText(page)).replace(NORMAL_LOGIN_VERIFICATION_TEXT, '');
   if (RISK_TEXT.test(text) || /geetest|challenge/.test(page.url()))
     await writeTerminalAndExit({ event: 'failed', code: 'UPSTREAM_FAILED' });
 }

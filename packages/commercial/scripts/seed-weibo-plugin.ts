@@ -11,7 +11,10 @@ import IORedis from 'ioredis'
 
 import { closePool, getPool } from '../src/db/index.js'
 import { installApprovedVersion } from '../src/marketplace/marketplaceDb.js'
-import { seedWeiboPlugin } from '../src/marketplace/seedWeiboPlugin.js'
+import {
+  assertWeiboUpgradeVerificationScope,
+  seedWeiboPlugin,
+} from '../src/marketplace/seedWeiboPlugin.js'
 import {
   type BrowserStorageStateV1,
   bindManagedBrowserPluginAccount,
@@ -249,26 +252,21 @@ function writePolicyFingerprint(
 
 async function loadUpgradeAccount(userId: number) {
   const census = await readOfficialManagedBrowserTransitionCensus(WEIBO_PLUGIN_CONTRACT.id)
+  const sourceVersionIdText = census.currentVersionId
+  const sourceVersionId = Number(sourceVersionIdText)
   if (
-    census.installs.length !== 1 ||
-    census.accounts.length !== 1 ||
-    census.installs[0]?.userId !== userId ||
-    census.accounts[0]?.userId !== userId ||
-    census.accounts[0]?.status !== 'active' ||
-    census.currentVersionId === null ||
-    census.installs[0]?.versionId !== census.currentVersionId ||
-    census.accounts[0]?.versionId !== census.currentVersionId
+    sourceVersionIdText === null ||
+    !Number.isSafeInteger(sourceVersionId) ||
+    sourceVersionId <= 0
   )
-    throw new Error('Weibo upgrade scope is not exactly one active install/account for this user')
-  const accountId = census.accounts[0].id
-  const row = await getPluginAccount(accountId, userId, getPool(), { includeError: true })
-  if (!row || row.status !== 'active') throw new Error('Weibo upgrade account disappeared')
-  const sourceVersionId = Number(row.connector_version_id)
-  if (!Number.isSafeInteger(sourceVersionId) || sourceVersionId <= 0)
     throw new Error('Weibo upgrade source version is invalid')
   const verified = await loadVerifiedRuntimePluginContract(sourceVersionId, getPool(), {
     env: process.env,
   })
+  assertWeiboUpgradeVerificationScope(census, userId, verified.artifactHash)
+  const accountId = census.accounts[0].id
+  const row = await getPluginAccount(accountId, userId, getPool(), { includeError: true })
+  if (!row || row.status !== 'active') throw new Error('Weibo upgrade account disappeared')
   if (
     verified.pluginType !== 'managed-browser' ||
     verified.slug !== WEIBO_PLUGIN_CONTRACT.id ||
@@ -283,7 +281,7 @@ async function loadUpgradeAccount(userId: number) {
     storageState: envelope.storageState,
     accountInstanceId: envelope.accountInstanceId,
     writePolicyFingerprint: writePolicyFingerprint(row),
-    sourceVersionId: census.currentVersionId,
+    sourceVersionId: sourceVersionIdText,
     sourceArtifactHash: verified.artifactHash,
     sourceExecContractHash: verified.execContractHash,
   }
