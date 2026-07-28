@@ -181,6 +181,15 @@ try {
 
 const page = await browser.newPage();
 const DEFAULT_VIEWPORT = page.viewportSize();
+const weiboWorkerSource = readFileSync(
+  join(HERE, "..", "..", "commercial", "src", "plugins", "weiboWorkerSource.ts"),
+  "utf8",
+);
+function readWeiboWorkerRegex(name) {
+  const match = new RegExp(`const ${name} = /(.+)/([a-z]*);`).exec(weiboWorkerSource);
+  if (!match) throw new Error(`browser-tests: 找不到微博 worker 正则 ${name}`);
+  return { source: match[1], flags: match[2] };
+}
 
 // 运行时异常收口:pageerror(未捕获异常/unhandledrejection)与 console.error 同等 fail。
 // 只监听 pageerror 会漏掉 React key 警告、Radix a11y 报错、受控/非受控切换、被
@@ -1283,6 +1292,65 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
     throw new Error(`移动端发送结果漂移: ${JSON.stringify(sends)}`);
   }
 });
+screenshotPage = page;
+
+// ── T26 微博登录页二维码挑战判定 ────────────────────────────────────────────
+// 生产事故发生在真登录 DOM:二维码已经出现,但同页普通“验证码登录/获取验证码”标签
+// 被宽泛风险词误判,worker 随即发 failed,二维码在下一次 UI poll 前被清掉。这里从
+// production worker 源码读取同一组正则,用真 Chromium DOM 同时锁住正常页与挑战页。
+const weiboProofPage = await browser.newPage();
+watchRuntimeErrors(weiboProofPage, "weibo-qr-proof");
+await weiboProofPage.route("https://v2.qr.weibo.cn/**", (route) => route.fulfill({
+  status: 200,
+  contentType: "image/png",
+  body: Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  ),
+}));
+await check("T26 微博标准登录页二维码与普通验证码标签共存时不被误判挑战", async () => {
+  screenshotPage = weiboProofPage;
+  if (!weiboWorkerSource.includes(".replace(NORMAL_LOGIN_VERIFICATION_TEXT, '')")) {
+    throw new Error("微博 worker 未在风险判断前移除精确普通登录标签");
+  }
+  const normal = readWeiboWorkerRegex("NORMAL_LOGIN_VERIFICATION_TEXT");
+  const risk = readWeiboWorkerRegex("RISK_TEXT");
+  await weiboProofPage.setContent(`
+    <main>
+      <button>验证码登录</button>
+      <button>获取验证码</button>
+      <img alt="微博登录二维码" src="https://v2.qr.weibo.cn/inf/gen?test=1">
+    </main>
+  `);
+  const ordinary = await weiboProofPage.evaluate(({ normal, risk }) => {
+    const text = (document.body.innerText ?? "").replace(
+      new RegExp(normal.source, normal.flags),
+      "",
+    );
+    return {
+      hasQr: Boolean(document.querySelector('img[src*="v2.qr.weibo.cn/inf/gen"]')),
+      challenged: new RegExp(risk.source, risk.flags).test(text),
+    };
+  }, { normal, risk });
+  if (!ordinary.hasQr) throw new Error("标准微博登录 DOM 没有可识别二维码");
+  if (ordinary.challenged) throw new Error("普通登录标签仍被误判为挑战");
+
+  await weiboProofPage.setContent(`
+    <main>
+      <div>请输入图形验证码以完成安全验证</div>
+      <img alt="微博登录二维码" src="https://v2.qr.weibo.cn/inf/gen?test=2">
+    </main>
+  `);
+  const challenge = await weiboProofPage.evaluate(({ normal, risk }) => {
+    const text = (document.body.innerText ?? "").replace(
+      new RegExp(normal.source, normal.flags),
+      "",
+    );
+    return new RegExp(risk.source, risk.flags).test(text);
+  }, { normal, risk });
+  if (!challenge) throw new Error("真实图形验证码挑战被错误放行");
+});
+await weiboProofPage.close();
 screenshotPage = page;
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。

@@ -62,6 +62,31 @@ export interface SeedWeiboPluginResult {
   migratedPluginAccounts: number
 }
 
+export function assertWeiboUpgradeVerificationScope(
+  scope: OfficialManagedBrowserTransitionScope,
+  verificationUserId: number,
+  sourceArtifactHash: string,
+): void {
+  const currentVersionId = scope.currentVersionId
+  const account = scope.accounts[0]
+  if (
+    !currentVersionId ||
+    scope.installs.length === 0 ||
+    scope.accounts.length !== 1 ||
+    !scope.installs.some((row) => row.userId === verificationUserId) ||
+    scope.installs.some(
+      (row) =>
+        row.versionId !== currentVersionId || row.artifactHash !== sourceArtifactHash,
+    ) ||
+    account?.userId !== verificationUserId ||
+    account.versionId !== currentVersionId ||
+    account.status !== 'active'
+  )
+    throw new Error(
+      'Weibo upgrade scope must contain current installs and exactly one verified active account',
+    )
+}
+
 async function locateVersion(): Promise<LocatedVersion | null> {
   const row = await query<LocatedVersion>(
     `SELECT v.id::text, l.owner_user_id::text, v.submitted_by::text,

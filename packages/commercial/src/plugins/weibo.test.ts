@@ -64,6 +64,35 @@ function compileWorkerPostTextHarness(): {
   )() as ReturnType<typeof compileWorkerPostTextHarness>
 }
 
+function compileWorkerChallengeHarness(
+  writeTerminalAndExit: (event: unknown) => Promise<void>,
+): {
+  assertNoChallenge(page: {
+    locator(selector: string): { innerText(): Promise<string> }
+    url(): string
+  }): Promise<void>
+} {
+  const riskStart = WEIBO_WORKER_SOURCE.indexOf('const RISK_TEXT')
+  const riskEnd = WEIBO_WORKER_SOURCE.indexOf('let terminal', riskStart)
+  const bodyStart = WEIBO_WORKER_SOURCE.indexOf('async function bodyText')
+  const bodyEnd = WEIBO_WORKER_SOURCE.indexOf('async function isLoginVisible', bodyStart)
+  assert.ok(riskStart >= 0 && riskEnd > riskStart && bodyStart >= 0 && bodyEnd > bodyStart)
+  return new Function(
+    'writeTerminalAndExit',
+    'cleanText',
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(riskStart, riskEnd)}
+      ${WEIBO_WORKER_SOURCE.slice(bodyStart, bodyEnd)}
+      return { assertNoChallenge };`,
+  )(
+    writeTerminalAndExit,
+    (value: unknown, max: number) =>
+      String(value ?? '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, max),
+  ) as ReturnType<typeof compileWorkerChallengeHarness>
+}
+
 function compileWorkerProjectPostHarness(): {
   projectPost(card: unknown, selfId: string): Promise<{ text: string }>
 } {
@@ -84,6 +113,36 @@ function compileWorkerProjectPostHarness(): {
 }
 
 describe('official Weibo Plugin', () => {
+  test('does not mistake standard SMS login labels for a challenge', async () => {
+    const events: unknown[] = []
+    const { assertNoChallenge } = compileWorkerChallengeHarness(async (event) => {
+      events.push(event)
+    })
+    const page = (text: string, url = 'https://passport.weibo.com/sso/signin') => ({
+      locator: (selector: string) => {
+        assert.equal(selector, 'body')
+        return { innerText: async () => text }
+      },
+      url: () => url,
+    })
+
+    await assertNoChallenge(
+      page('扫描二维码登录 打开微博手机APP 验证码登录 +86 获取验证码 登录/注册'),
+    )
+    assert.deepEqual(events, [])
+
+    await assertNoChallenge(page('请输入图形验证码以完成安全验证'))
+    assert.deepEqual(events, [{ event: 'failed', code: 'UPSTREAM_FAILED' }])
+    events.length = 0
+
+    await assertNoChallenge(page('验证码'))
+    assert.deepEqual(events, [{ event: 'failed', code: 'UPSTREAM_FAILED' }])
+    events.length = 0
+
+    await assertNoChallenge(page('登录', 'https://passport.weibo.com/challenge'))
+    assert.deepEqual(events, [{ event: 'failed', code: 'UPSTREAM_FAILED' }])
+  })
+
   test('gives action Chromium enough memory while preserving worker-specific limits', () => {
     assert.deepEqual(resolveWeiboWorkerResources('action'), {
       memoryBytes: 768 * 1024 * 1024,

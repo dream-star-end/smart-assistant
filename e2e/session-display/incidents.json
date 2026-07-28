@@ -688,6 +688,28 @@
         "reason": "回归锁目前只到 integration 层(真 PG 复现首页 22003)。活体证明需要一个内容大半已 spill、热行只剩 anchor 的长会话——e2e 的 v5-evals 账号每条用例结束即删会话,凑不出这种形态;seedPagedArchivedSession 已具备直写 PG 的能力但刻意未 seed archive chunks(见 lib/seed.ts 注释)。补活体证据 = 扩 seed 造真实 spill 后走 UI 打开该会话。",
         "since": "2026-07-26"
       }
+    },
+    {
+      "id": "INC-20260728-WEIBO-QR-HIDDEN",
+      "occurredAt": "2026-07-28",
+      "severity": "P1",
+      "symptom": "微博标准登录页已经生成有效二维码，但 worker 把同页普通“验证码登录/获取验证码”标签误判为风控挑战并立即失败，二维码在用户下一次轮询前被清除。",
+      "rootFixCommit": "9027a6da",
+      "coverageCommits": [
+        "72e134df"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weibo.test.ts",
+          "assertion": "does not mistake standard SMS login labels for a challenge"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T26 微博标准登录页二维码与普通验证码标签共存时不被误判挑战"
+        }
+      ]
     }
   ]
 }
