@@ -40,6 +40,18 @@ describe("handleWechatModelCommand", () => {
     assert.match(out, /2\. Claude Sonnet 4\.6（当前）/)
     assert.doesNotMatch(out, /Haiku/)
     assert.match(out, /\/model 2/)
+    assert.match(out, /当前微信可用模型/)
+  })
+
+  test("channelName reuses the same model authority with QQ wording", async () => {
+    const out = await handleWechatModelCommand({
+      ...base,
+      channelName: "QQ",
+      text: "/model 1",
+      setDefaultModel: async () => {},
+    })
+    assert.match(out, /下一条QQ消息会使用这个模型/)
+    assert.doesNotMatch(out, /微信/)
   })
 
   test("/model <number> sets selected model", async () => {

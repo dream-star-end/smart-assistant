@@ -1,5 +1,12 @@
 import type { Pool, PoolClient } from 'pg'
 
+import {
+  QqOutboundMediaTooLargeError,
+  type QqOutboundMediaPart,
+  type ResolveQqOutboundMediaPartFn,
+  type ResolvedQqOutboundMedia,
+} from './outboundMedia.js'
+
 const QQ_TEXT_CHUNK_CHARS = 1800
 const STALE_LOCK_MS = 5 * 60 * 1000
 const POLL_MS = 2_000
@@ -98,6 +105,8 @@ export interface QqOutboxWorker {
 export function startQqOutboxWorker(args: {
   pool: Pool
   sendText: (openid: string, text: string) => Promise<void>
+  sendMedia?: (openid: string, media: ResolvedQqOutboundMedia) => Promise<void>
+  resolveMediaPart?: ResolveQqOutboundMediaPartFn
   onError?: (message: string, meta?: Record<string, unknown>) => void
   now?: () => number
   pollMs?: number
@@ -119,7 +128,7 @@ export function startQqOutboxWorker(args: {
 
   const kick = () => {
     if (stopped || inFlight) return
-    inFlight = drainAvailable(args.pool, args.sendText, now, () => !stopped, args.onError)
+    inFlight = drainAvailable(args, now, () => !stopped)
       .catch((err) => {
         args.onError?.('qq outbox drain failed', {
           errMessage: err instanceof Error ? err.message : String(err),
@@ -150,24 +159,33 @@ export function startQqOutboxWorker(args: {
 }
 
 async function drainAvailable(
-  pool: Pool,
-  sendText: (openid: string, text: string) => Promise<void>,
+  args: {
+    pool: Pool
+    sendText: (openid: string, text: string) => Promise<void>
+    sendMedia?: (openid: string, media: ResolvedQqOutboundMedia) => Promise<void>
+    resolveMediaPart?: ResolveQqOutboundMediaPartFn
+    onError?: (message: string, meta?: Record<string, unknown>) => void
+  },
   now: () => number,
   shouldContinue: () => boolean,
-  onError?: (message: string, meta?: Record<string, unknown>) => void,
 ): Promise<void> {
-  while (shouldContinue() && (await drainOne(pool, sendText, now, onError))) {
+  while (shouldContinue() && (await drainOneQqOutbox(args, now))) {
     // One chunk per transaction keeps unbind fencing exact while still
     // allowing arbitrarily long answers to drain without truncation.
   }
 }
 
-async function drainOne(
-  pool: Pool,
-  sendText: (openid: string, text: string) => Promise<void>,
+export async function drainOneQqOutbox(
+  args: {
+    pool: Pool
+    sendText: (openid: string, text: string) => Promise<void>
+    sendMedia?: (openid: string, media: ResolvedQqOutboundMedia) => Promise<void>
+    resolveMediaPart?: ResolveQqOutboundMediaPartFn
+    onError?: (message: string, meta?: Record<string, unknown>) => void
+  },
   now: () => number,
-  onError?: (message: string, meta?: Record<string, unknown>) => void,
 ): Promise<boolean> {
+  const { pool } = args
   const client = await pool.connect()
   let began = false
   try {
@@ -228,8 +246,8 @@ async function drainOne(
       await client.query('COMMIT')
       return true
     }
-    const chunks = parseChunks(delivery.payload)
-    if (!chunks || delivery.next_chunk >= chunks.length) {
+    const item = parseNextItem(delivery.payload, delivery.next_chunk)
+    if (!item) {
       await cancelRow(client, delivery.id, current)
       await client.query('COMMIT')
       return true
@@ -240,11 +258,28 @@ async function drainOne(
         WHERE id = $1`,
       [delivery.id, current],
     )
-    const chunk = chunks[delivery.next_chunk]!
     try {
       // The binding FOR SHARE lock stays held through the network call.
       // DELETE/rebind cannot return while a send using the old binding is live.
-      await sendText(delivery.target_openid, chunk)
+      if (item.kind === 'text') {
+        await args.sendText(delivery.target_openid, item.text)
+      } else if (item.kind === 'media') {
+        if (!args.resolveMediaPart || !args.sendMedia) {
+          throw new Error('QQ outbound media delivery is unavailable')
+        }
+        try {
+          const media = await args.resolveMediaPart({
+            bindingUserId: picked.user_id,
+            part: item.media,
+          })
+          await args.sendMedia(delivery.target_openid, media)
+        } catch (err) {
+          if (!(err instanceof QqOutboundMediaTooLargeError)) throw err
+          // The row is terminal only after the explicit size-limit notice
+          // itself reaches QQ; a notice failure remains durably retryable.
+          await args.sendText(delivery.target_openid, err.userMessage)
+        }
+      }
     } catch (err) {
       const attempts = delivery.attempts + 1
       const delay = Math.min(5 * 60 * 1000, 1_000 * 2 ** Math.min(attempts, 8))
@@ -266,14 +301,14 @@ async function drainOne(
         ],
       )
       await client.query('COMMIT')
-      onError?.('qq outbox send failed; retained for retry', {
+      args.onError?.('qq outbox send failed; retained for retry', {
         outboxId: delivery.id,
         attempts,
       })
       return false
     }
     const nextChunk = delivery.next_chunk + 1
-    if (nextChunk >= chunks.length) {
+    if (item.terminal) {
       await client.query(
         `UPDATE qq_outbox
             SET status = 'sent',
@@ -313,6 +348,56 @@ function parseChunks(payload: unknown): string[] | null {
   const chunks = (payload as { chunks?: unknown }).chunks
   if (!Array.isArray(chunks) || chunks.length === 0) return null
   return chunks.every((chunk) => typeof chunk === 'string' && chunk.length > 0) ? chunks : null
+}
+
+type QqOutboxItem =
+  | { kind: 'text'; text: string; terminal: boolean }
+  | { kind: 'media'; media: QqOutboundMediaPart; terminal: true }
+  | { kind: 'media_root'; terminal: true }
+
+function parseNextItem(payload: unknown, nextChunk: number): QqOutboxItem | null {
+  if (!payload || typeof payload !== 'object') return null
+  if ((payload as { mediaRoot?: unknown }).mediaRoot === true) {
+    return nextChunk === 0 ? { kind: 'media_root', terminal: true } : null
+  }
+  const media = parseMediaPart((payload as { media?: unknown }).media)
+  if (media) {
+    return nextChunk === 0 ? { kind: 'media', media, terminal: true } : null
+  }
+  const chunks = parseChunks(payload)
+  if (!chunks || nextChunk >= chunks.length) return null
+  return {
+    kind: 'text',
+    text: chunks[nextChunk]!,
+    terminal: nextChunk + 1 >= chunks.length,
+  }
+}
+
+function parseMediaPart(input: unknown): QqOutboundMediaPart | null {
+  if (!input || typeof input !== 'object') return null
+  const part = input as {
+    type?: unknown
+    containerPath?: unknown
+    filename?: unknown
+    mimeType?: unknown
+  }
+  if (
+    !['image', 'video', 'voice', 'file'].includes(String(part.type)) ||
+    typeof part.containerPath !== 'string' ||
+    !/^\/home\/agent\/\.openclaude\/(?:uploads|generated)\/[^/]+$/.test(part.containerPath) ||
+    typeof part.filename !== 'string' ||
+    part.filename.length === 0 ||
+    part.filename !== part.containerPath.split('/').at(-1) ||
+    (part.mimeType !== undefined && typeof part.mimeType !== 'string')
+  ) {
+    return null
+  }
+  return {
+    type: part.type as QqOutboundMediaPart['type'],
+    containerPath: part.containerPath,
+    filename: part.filename,
+    ...(part.mimeType ? { mimeType: part.mimeType } : {}),
+  }
 }
 
 async function cancelRow(client: PoolClient, id: string, now: number): Promise<void> {

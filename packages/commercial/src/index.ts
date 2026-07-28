@@ -469,6 +469,8 @@ import {
   qqInboundChannelProfile,
   type QqBotService,
 } from "./qqbot/service.js";
+import { makeSaveQqMediaToUserUploads } from "./qqbot/mediaIngest.js";
+import { makeQqOutboundMediaResolver } from "./qqbot/outboundMedia.js";
 import {
   QQ_OUTBOUND_PATH,
   QQ_PROACTIVE_PATH,
@@ -4300,10 +4302,52 @@ export async function registerCommercial(
       transport: makeNodeHttpContainerTransport(),
       channel: qqInboundChannelProfile(),
     });
+    const resolveQqOutboundMedia =
+      userMediaResolver
+        ? makeQqOutboundMediaResolver({
+            resolveUserMediaDirs: userMediaResolver,
+            pullRemoteHostMedia: async (args) => {
+              const target = await resolveServiceableHostTarget(args.hostUuid);
+              try {
+                return await nodeAgentGetFile(target, args.remotePath);
+              } finally {
+                target.psk?.fill(0);
+              }
+            },
+          })
+        : undefined;
     qqBotService = makeQqBotService({
       pool: getPool(),
       config: qqConfig,
       dispatcher: qqDispatcher,
+      prepareMedia:
+        userMediaResolver && ensureContainerEndpointReady
+          ? makeSaveQqMediaToUserUploads({
+              ensureContainerReady: ensureContainerEndpointReady,
+              resolveUserMediaDirs: userMediaResolver,
+              pushRemoteHostUpload,
+            })
+          : undefined,
+      resolveOutboundMedia: resolveQqOutboundMedia,
+      handleModelCommand: async (bindingUserId, text) => {
+        const uid = BigInt(bindingUserId);
+        const [prefs, authz] = await Promise.all([
+          getPreferences(uid),
+          loadUserModelAuthz(uid),
+        ]);
+        return await handleWechatModelCommand({
+          text,
+          channelName: "QQ",
+          preferredModel: prefs.prefs.default_model,
+          visibleModels: pricing.listForUser(authz),
+          canUseModel: (modelId) =>
+            canUseModel({ pricing }, { ...authz, modelId }),
+          allowedModels: ALLOWED_INBOUND_MODELS,
+          setDefaultModel: async (modelId) => {
+            await patchPreferences(uid, { default_model: modelId });
+          },
+        });
+      },
     });
     const qqIdentityRepo = createPgIdentityRepo();
     qqOutboundRef.current = makeQqOutboundReceiver({
