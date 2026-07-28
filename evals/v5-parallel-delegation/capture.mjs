@@ -59,6 +59,13 @@ const PAIR_EXECUTION_ID = required("V5_EVAL_PAIR_EXECUTION_ID");
 const PAIR_STEP = Number(required("V5_EVAL_PAIR_STEP"));
 const TIMEOUT_MS = Number(process.env.V5_EVAL_TIMEOUT_MS ?? 900_000);
 const SAMPLE_MS = Number(process.env.V5_EVAL_SAMPLE_MS ?? 500);
+const ISOLATED_AB = RULE_INJECTION !== "platform-bundle";
+const REPROVISION_CONTAINER_ID = ISOLATED_AB
+  ? required("V5_EVAL_REPROVISION_CONTAINER_ID")
+  : null;
+const REPROVISION_STARTED_AT = ISOLATED_AB
+  ? required("V5_EVAL_REPROVISION_STARTED_AT")
+  : null;
 
 if (!["A", "B"].includes(ARM)) throw new Error("V5_EVAL_ARM must be A or B");
 if (!["A_FIRST", "B_FIRST"].includes(ORDER)) throw new Error("V5_EVAL_ORDER must be A_FIRST or B_FIRST");
@@ -113,6 +120,7 @@ for (const field of [
   "baseline_prompt_rev",
   "candidate_prompt_rev",
   "probe_rev",
+  "reprovision_rev",
 ]) {
   if (!/^[0-9a-f]{64}$/.test(manifest.policy[field] ?? "")) {
     throw new Error(`manifest policy ${field} is not a SHA-256`);
@@ -357,6 +365,15 @@ for (const [field, value] of Object.entries(containerMeta.runtime_tuple)) {
   if (typeof value !== "string" || !value) throw new Error(`runtime tuple missing ${field}`);
 }
 if (
+  ISOLATED_AB &&
+  (
+    containerMeta.id !== REPROVISION_CONTAINER_ID ||
+    containerMeta.started_at !== REPROVISION_STARTED_AT
+  )
+) {
+  throw new Error("capture container identity differs from the arm reprovision result");
+}
+if (
   RULE_INJECTION !== "platform-bundle" &&
   JSON.stringify(containerMeta.runtime_tuple) !== JSON.stringify(manifest.baseline_runtime_tuple)
 ) {
@@ -364,7 +381,7 @@ if (
 }
 const actualPromptRev = await readPromptRev();
 const freshnessBefore = await readFreshness(containerMeta.started_at);
-if (PAIR_STEP === 1) {
+if (ISOLATED_AB || PAIR_STEP === 1) {
   const containerAge = Date.now() - Date.parse(containerMeta.started_at);
   if (
     containerMeta.restart_count !== 0 ||

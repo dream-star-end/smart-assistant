@@ -617,6 +617,7 @@ function validateManifest(manifest, gold, mode) {
     "baseline_prompt_rev",
     "candidate_prompt_rev",
     "probe_rev",
+    "reprovision_rev",
   ];
   if (!/^[0-9a-f]{64}$/.test(manifest._sha256 ?? "")) {
     throw new Error("scoreRuns requires manifest._sha256");
@@ -739,7 +740,7 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
   const expected = expectedKeys(manifest, mode);
   const actual = new Map();
   const peers = new Map();
-  const containerPairs = new Map();
+  const containerRuns = new Map();
   for (const run of runs) {
     const key = runKey(run);
     if (actual.has(key)) findings.push(`${key}: duplicate run`);
@@ -751,12 +752,11 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
       peers.set(run.peer_id, key);
     }
     if (mode === "isolated-ab" && typeof run.container?.id === "string" && run.container.id) {
-      const pairLabel = `${run.engine}/${run.scenario}/${run.pair_id}`;
-      const previous = containerPairs.get(run.container.id);
-      if (previous && previous !== pairLabel) {
-        findings.push(`${key}: container id reused by another pair ${previous}`);
+      const previous = containerRuns.get(run.container.id);
+      if (previous) {
+        findings.push(`${key}: container id reused by ${previous}`);
       } else {
-        containerPairs.set(run.container.id, pairLabel);
+        containerRuns.set(run.container.id, key);
       }
     }
   }
@@ -872,12 +872,7 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
           for (const field of ["engine", "model", "effort", "input_hash", "prompt_rev"]) {
             if (!sameJson(A[field], B[field])) findings.push(`${engine}/${scenario}/${pair.pair_id}: ${field} differs between arms`);
           }
-          for (const field of ["id", "runtime_tuple", "limits"]) {
-            if (!sameJson(A.container?.[field], B.container?.[field])) {
-              findings.push(`${engine}/${scenario}/${pair.pair_id}: container ${field} differs between arms`);
-            }
-          }
-          for (const field of ["created_at", "started_at", "restart_count"]) {
+          for (const field of ["runtime_tuple", "limits"]) {
             if (!sameJson(A.container?.[field], B.container?.[field])) {
               findings.push(`${engine}/${scenario}/${pair.pair_id}: container ${field} differs between arms`);
             }
@@ -886,6 +881,9 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
             findings.push(`${engine}/${scenario}/${pair.pair_id}: persona base rev differs between arms`);
           }
           const pairLabel = `${engine}/${scenario}/${pair.pair_id}`;
+          if (A.container?.id === B.container?.id) {
+            findings.push(`${pairLabel}: A/B arms must use different container ids`);
+          }
           if (A.pair_execution_id !== B.pair_execution_id) {
             findings.push(`${pairLabel}: arms do not share pair_execution_id`);
           } else {
@@ -897,28 +895,35 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
           }
           const first = pair.order === "A_FIRST" ? A : B;
           const second = pair.order === "A_FIRST" ? B : A;
-          const containerAge = Date.parse(first.started_at) - Date.parse(first.container?.started_at);
-          if (
-            !Number.isFinite(containerAge) ||
-            containerAge < 0 ||
-            containerAge > manifest.max_container_age_before_pair_ms
-          ) {
-            findings.push(
-              `${pairLabel}: first arm container age ${containerAge}ms exceeds fresh-container gate`,
-            );
-          }
-          if (
-            first.container?.restart_count !== 0 ||
-            first.container?.freshness_before?.dispatches !== 0 ||
-            first.container?.freshness_before?.usage_rows !== 0
-          ) {
-            findings.push(`${pairLabel}: first arm did not start from a turn-clean fresh container`);
-          }
-          if (
-            second.container?.freshness_before?.dispatches !== 1 ||
-            second.container?.freshness_before?.usage_rows !== first.resources?.usage?.rows
-          ) {
-            findings.push(`${pairLabel}: unrelated turn or usage appeared between pair arms`);
+          for (const armRun of [A, B]) {
+            const containerAge =
+              Date.parse(armRun.started_at) - Date.parse(armRun.container?.started_at);
+            if (
+              !Number.isFinite(containerAge) ||
+              containerAge < 0 ||
+              containerAge > manifest.max_container_age_before_pair_ms
+            ) {
+              findings.push(
+                `${pairLabel}/${armRun.arm}: container age ${containerAge}ms exceeds fresh-container gate`,
+              );
+            }
+            if (
+              armRun.container?.restart_count !== 0 ||
+              armRun.container?.freshness_before?.dispatches !== 0 ||
+              armRun.container?.freshness_before?.usage_rows !== 0
+            ) {
+              findings.push(
+                `${pairLabel}/${armRun.arm}: arm did not start from a turn-clean fresh container`,
+              );
+            }
+            if (
+              armRun.container?.freshness_after?.dispatches !== 1 ||
+              armRun.container?.freshness_after?.usage_rows !== armRun.resources?.usage?.rows
+            ) {
+              findings.push(
+                `${pairLabel}/${armRun.arm}: arm freshness did not increase by exactly its own run`,
+              );
+            }
           }
           if (first.pair_step !== 1 || second.pair_step !== 2) {
             findings.push(`${pairLabel}: pair steps do not match execution order`);
@@ -928,17 +933,6 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
             findings.push(`${pairLabel}: declared ${pair.order} was not executed in order`);
           } else if (gap > manifest.max_pair_gap_ms) {
             findings.push(`${pairLabel}: pair gap ${gap}ms exceeds ${manifest.max_pair_gap_ms}ms`);
-          }
-          const interloper = runs.find(
-            (other) =>
-              other !== A &&
-              other !== B &&
-              other.container?.id === A.container?.id &&
-              Date.parse(other.started_at) > Date.parse(first.finished_at) &&
-              Date.parse(other.started_at) < Date.parse(second.started_at),
-          );
-          if (interloper) {
-            findings.push(`${pairLabel}: non-pair run ${interloper.run_id} executed between arms`);
           }
           if (POSITIVE_SCENARIOS.has(scenario)) positivePairs.push({ A, B });
           if (NEGATIVE_SCENARIOS.has(scenario)) negativePairs.push({ A, B });

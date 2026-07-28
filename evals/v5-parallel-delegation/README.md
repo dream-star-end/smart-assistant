@@ -35,10 +35,10 @@ V5 没有“仅给 synthetic canary 用户切换新 platform bundle”的官方 
   **128 个 run**，两个 root 必须各自独立 PASS。
 - pair 顺序固定为 `A_FIRST/B_FIRST/A_FIRST/B_FIRST`。总体和每个顺序层内都必须
   通过速度/资源门，排除“第二臂天然热身更快”。
-- 每个 pair 使用一个全新 reprovision 后的 synthetic 容器；首臂开始时容器启动不超过
+- 每个 arm 都使用独立、全新 reprovision 后的 synthetic 容器；开始时容器启动不超过
   5 分钟、restart count=0，且该 uid 在本次容器启动后没有任何 prior dispatch/usage。
-  两臂必须是同一容器，不同 pair 的 Docker ID 不得复用。第二臂开始前只能存在首臂
-  的一个 main dispatch，usage 行数必须精确等于首臂 receipt 行数，拒绝任何插入 turn。
+  同一 pair 的 A/B Docker ID 必须不同，单 root 的 64 个 Docker ID 全部唯一。这样不让
+  第二臂继承第一臂的进程、cgroup 或模型客户端预热，同时仍拒绝任何插入 turn。
 - `document_batch` / `code_batch` 的 B 必须恰好成功调用一次 `delegate_tasks`，
   2–4 shards，且 canonical `delegate_progress` 证明至少两个 child 真实重叠。
 - `simple` / `dependent` 禁止 batch fan-out，最多一次质量型 `delegate_task`。
@@ -56,18 +56,22 @@ V5 没有“仅给 synthetic canary 用户切换新 platform bundle”的官方 
   但普通任务整体或大多数重复样本变慢”。
 - 峰值 RSS/PID 均低于容器 limit 的 90%；零 OOM/oom_kill、PID max、
   queue timeout/full、异常重试、失败/未结算 usage。
-- generator/scenarios/gold、远端 probe、synthetic uid/container、stable lane、
+- generator/scenarios/gold、远端 probe、canonical reprovision helper、
+  synthetic uid/container、stable lane、
   persona/prompt、model/effort、runtime tuple、peer→dispatch→agent_container→Docker
   的 SHA/身份全部预注册。
 - root/child token 与费用来自精确 usage receipt；capture 和 scorer 都从原始 frames、
   cgroup samples、receipt 与 transcript SHA 重算关键证据；最终答案也以 canonical WS
   text blocks 为权威，不信任 DOM 转义后的文本。
 - 每个 pair 的受支持 reprovision 登录只执行一次，并把 access expiry 与最新 `oc_rt`
-  放进该 pair 独占的 0700 临时目录/0600 session 文件。A/B capture 和 persona 切换
-  串行复用该 session；access 临期或 401 时正常 refresh，浏览器轮换后的最新 cookie
-  必须回写。pair 结束先 logout 撤销 refresh token，再无条件删除临时目录。不得通过
-  放宽生产登录限流或清 Redis 来运行评测。
+  放进该 pair 独占的 0700 临时目录/0600 session 文件。第二臂 reprovision、A/B
+  capture 和 persona 切换串行复用该 session，禁止再次 login；access 临期或 401 时
+  正常 refresh，浏览器轮换后的最新 cookie 必须回写。pair 结束先 logout 撤销 refresh
+  token，再无条件删除临时目录。不得通过放宽生产登录限流或清 Redis 来运行评测。
 - 缺失、额外、重复 run，任一 `*.failed.json`，或任一证据字段不完整，全部失败。
+- 正式评测前用产品 API 列出 synthetic 账号的定时任务；会在评测窗口触发的任务必须
+  先备份并临时停用，正常完成或失败退出后恢复并复核原状态。任何残余后台
+  dispatch/usage 仍由 arm 级 freshness 门直接拒绝，不能从报告中过滤。
 - 两个 root 的 manifest 必须 byte-identical；每个 root 内的 A/B 身份关系由完整 scorer
   逐项验证，Docker ID、peer ID、pair execution ID、transcript SHA 和 run SHA 在两个
   root 之间不得复用。两个报告在冻结生产证据时都会重新评分并要求 byte-identical。
@@ -107,6 +111,7 @@ node evals/v5-parallel-delegation/bind-manifest.mjs \
   --candidate-prompt-file \
     packages/commercial/agent-sandbox/platform-runtime/prompts/platform-capabilities.md \
   --probe evals/v5-parallel-delegation/remote-probe.sh \
+  --reprovision evals/v5-parallel-delegation/reprovision.mjs \
   --ccb-user-id <uid> --ccb-container <oc-v5-uN> \
   --codex-user-id <uid> --codex-container <oc-v5-uN> \
   --baseline-generation <deploy-generation> \
@@ -118,8 +123,9 @@ node evals/v5-parallel-delegation/bind-manifest.mjs \
   --baseline-platform-bundle <exact-platform-bundle>
 ```
 
-Binder 会把传入 rule、正式 prompt 和 probe 与当前 checkout 内上述三个 canonical 文件
-逐字比较，并要求正式 prompt 含完整 rule；替换路径或更易过门的变体会直接失败。
+Binder 会把传入 rule、正式 prompt、probe 和 reprovision helper 与当前 checkout 内
+canonical 文件逐字比较，并要求正式 prompt 含完整 rule；替换路径或更易过门的变体
+会直接失败。
 
 正式 root 一旦出现失败证据就整体保留并重建，不删除失败 run 后挑样。
 
@@ -138,10 +144,10 @@ export V5_EVAL_PERSONA_PATH=/home/agent/.openclaude/agents/main/CLAUDE.md
 export V5_EVAL_RULE_FILE="$PWD/evals/v5-parallel-delegation/candidate-rule.md"
 ```
 
-每次运行 pair 前必须通过产品支持的容器回收/reprovision 路径得到新 Docker ID，再为
-对应 engine 设置账号、密码和 base persona。reprovision 的唯一一次登录还必须原子写入
-本 pair 的 auth session；目录必须由 `mktemp -d /tmp/v5-parallel-auth.XXXXXX` 创建，
-且不得与其他 pair/engine 共用：
+每次运行 pair 前为对应 engine 设置账号、密码和 base persona。`run-pair.sh` 会先通过
+canonical reprovision helper 的产品支持路径得到第一臂的新 Docker ID。helper 的唯一
+一次登录必须原子写入本 pair 的 auth session；目录必须由
+`mktemp -d /tmp/v5-parallel-auth.XXXXXX` 创建，且不得与其他 pair/engine 共用：
 
 ```bash
 export V5_EVAL_ENGINE=ccb                 # 或 codex
@@ -153,13 +159,13 @@ chmod 0700 "$AUTH_DIR"
 export V5_EVAL_AUTH_SESSION_FILE="$AUTH_DIR/session.json"
 export V5_EVAL_SCENARIO=code_batch        # 四个 scenario 逐一执行
 export V5_EVAL_PAIR_ID=01                 # 01..04
-# 产品支持的 reprovision helper 在此执行唯一一次登录并写入 session.json。
 evals/v5-parallel-delegation/run-pair.sh
 ```
 
-`run-pair.sh` 按 manifest 顺序切 system-slot persona、连续跑两臂，并用 trap 恢复原
-persona、logout 并删除 auth session。`capture.mjs` 通过真实 Web session 上传、发送和
-WS 获取最终结果；远端
+`run-pair.sh` 按 manifest 顺序执行第一臂、恢复 base persona，再调用同一 canonical
+helper（只 refresh 已有 auth，不再 login）回收容器并为第二臂得到另一个 turn-clean
+Docker ID，然后才执行第二臂。脚本用 trap 恢复原 persona、logout 并删除 auth session。
+`capture.mjs` 通过真实 Web session 上传、发送和 WS 获取最终结果；远端
 `remote-probe.sh` 同一次 SSH 采集 uid 精确 activity、usage receipts、dispatch/
 container binding、容器启动后的 prior turn 数、deploy lane 和 cgroup 指标。
 

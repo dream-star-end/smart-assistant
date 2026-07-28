@@ -22,7 +22,7 @@ const args = Object.fromEntries(
 for (const name of [
   "manifest", "ccb-base-persona", "codex-base-persona", "rule",
   "baseline-prompt-rev", "candidate-prompt-file",
-  "probe", "ccb-user-id", "ccb-container", "codex-user-id", "codex-container",
+  "probe", "reprovision", "ccb-user-id", "ccb-container", "codex-user-id", "codex-container",
   "baseline-generation", "baseline-active-slot", "baseline-active-release",
   "baseline-image", "baseline-image-id", "baseline-runtime-release", "baseline-platform-bundle",
 ]) {
@@ -40,6 +40,7 @@ const evalDir = dirname(fileURLToPath(import.meta.url));
 const generatorPath = join(evalDir, "generate-fixtures.py");
 const canonicalRulePath = join(evalDir, "candidate-rule.md");
 const canonicalProbePath = join(evalDir, "remote-probe.sh");
+const canonicalReprovisionPath = join(evalDir, "reprovision.mjs");
 const canonicalPromptPath = join(
   evalDir,
   "..",
@@ -66,6 +67,11 @@ const candidatePrompt = requireCanonicalFile(
   canonicalPromptPath,
 );
 const probe = requireCanonicalFile("--probe", args.probe, canonicalProbePath);
+const reprovision = requireCanonicalFile(
+  "--reprovision",
+  args.reprovision,
+  canonicalReprovisionPath,
+);
 const rule = ruleBytes.toString("utf8").trim();
 if (!candidatePrompt.toString("utf8").includes(rule)) {
   throw new Error("canonical candidate prompt does not contain the reviewed candidate rule");
@@ -112,6 +118,7 @@ manifest.policy = {
   baseline_prompt_rev: requireSha("--baseline-prompt-rev", args["baseline-prompt-rev"]),
   candidate_prompt_rev: sha(candidatePrompt),
   probe_rev: sha(probe),
+  reprovision_rev: sha(reprovision),
   personas: {},
 };
 manifest.targets = {};

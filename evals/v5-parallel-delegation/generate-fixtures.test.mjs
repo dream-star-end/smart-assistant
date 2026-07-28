@@ -11,6 +11,7 @@ const BINDER = new URL("./bind-manifest.mjs", import.meta.url).pathname;
 const FREEZER = new URL("./freeze-production-manifest.mjs", import.meta.url).pathname;
 const RULE = new URL("./candidate-rule.md", import.meta.url).pathname;
 const PROBE = new URL("./remote-probe.sh", import.meta.url).pathname;
+const REPROVISION = new URL("./reprovision.mjs", import.meta.url).pathname;
 const FORMAL_PROMPT = new URL(
   "../../packages/commercial/agent-sandbox/platform-runtime/prompts/platform-capabilities.md",
   import.meta.url,
@@ -35,6 +36,7 @@ function binderArgs(manifestPath, basePersona, overrides = {}) {
     rule: RULE,
     "candidate-prompt-file": FORMAL_PROMPT,
     probe: PROBE,
+    reprovision: REPROVISION,
     ...overrides,
   };
   return [
@@ -46,6 +48,7 @@ function binderArgs(manifestPath, basePersona, overrides = {}) {
     "--baseline-prompt-rev", "0".repeat(64),
     "--candidate-prompt-file", values["candidate-prompt-file"],
     "--probe", values.probe,
+    "--reprovision", values.reprovision,
     "--ccb-user-id", "247",
     "--ccb-container", "oc-v5-u247",
     "--codex-user-id", "626",
@@ -96,6 +99,7 @@ describe("v5 parallel delegation deterministic fixtures", () => {
     assert.match(probeSource, /'model',model/);
     assert.match(probeSource, /'delegate_agent_id',delegate_agent_id/);
     assert.match(probeSource, /'dispatch_id',dispatch_id::text/);
+    assert.match(readFileSync(REPROVISION, "utf8"), /api\/admin\/agent-containers/);
 
     const gold = JSON.parse(readFileSync(join(first, "gold", "gold.json"), "utf8"));
     assert.deepEqual(gold.pages.map((page) => page.page), Array.from({ length: 12 }, (_, index) => index + 1));
@@ -141,14 +145,17 @@ describe("v5 parallel delegation deterministic fixtures", () => {
       rule: join(first, "alternate-rule.md"),
       prompt: join(first, "alternate-prompt.md"),
       probe: join(first, "alternate-probe.sh"),
+      reprovision: join(first, "alternate-reprovision.mjs"),
     };
     writeFileSync(alternate.rule, `${readFileSync(RULE, "utf8")}\nweaker replacement\n`);
     writeFileSync(alternate.prompt, `${readFileSync(FORMAL_PROMPT, "utf8")}\nreplacement\n`);
     writeFileSync(alternate.probe, "#!/bin/sh\necho '{}'\n");
+    writeFileSync(alternate.reprovision, "console.log('{}')\n");
     for (const [field, path] of [
       ["rule", alternate.rule],
       ["candidate-prompt-file", alternate.prompt],
       ["probe", alternate.probe],
+      ["reprovision", alternate.reprovision],
     ]) {
       assert.throws(
         () => execFileSync(
@@ -176,6 +183,7 @@ describe("v5 parallel delegation deterministic fixtures", () => {
     });
     assert.equal(bound.policy.personas.ccb.base_persona_rev, sha(basePersona));
     assert.equal(bound.policy.personas.codex.base_persona_rev, sha(codexPersona));
+    assert.equal(bound.policy.reprovision_rev, sha(REPROVISION));
     assert.notEqual(
       bound.policy.personas.ccb.candidate_persona_rev,
       bound.policy.personas.codex.candidate_persona_rev,

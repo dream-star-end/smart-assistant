@@ -158,6 +158,7 @@ const manifest = {
     baseline_prompt_rev: "d".repeat(64),
     candidate_prompt_rev: "e".repeat(64),
     probe_rev: "9".repeat(64),
+    reprovision_rev: "8".repeat(64),
     personas: {
       ccb: {
         base_persona_rev: "a".repeat(64),
@@ -229,10 +230,11 @@ function makeRun({
   const armFirst = (arm === "A") === aFirst;
   const started = Date.parse("2026-07-28T00:00:00.000Z") + (armFirst ? 0 : 20_000);
   const positiveCandidate = arm === "B" && ["document_batch", "code_batch"].includes(scenario);
-  const positiveScenario = ["document_batch", "code_batch"].includes(scenario);
   const userId = engine === "ccb" ? 1 : 2;
   const personaPolicy = manifest.policy.personas[engine];
   const containerName = `oc-v5-u${userId}`;
+  const containerId = `${engine}-${scenario}-${pair}-${arm}-container`;
+  const containerStartedAt = new Date(Date.parse("2026-07-27T23:59:00.000Z")).toISOString();
   const tokens = arm === "A" ? 1000 : 1050;
   const costCredits = arm === "A" ? 1 : 1.05;
   const receipts = positiveCandidate
@@ -348,24 +350,22 @@ function makeRun({
     },
     gates: { absolute_wall_ms: 2000 },
     container: {
-      id: `${engine}-${scenario}-${pair}-container`,
+      id: containerId,
       created_at: new Date(Date.parse("2026-07-27T23:58:00.000Z")).toISOString(),
-      started_at: new Date(Date.parse("2026-07-27T23:59:00.000Z")).toISOString(),
+      started_at: containerStartedAt,
       restart_count: 0,
       oom_killed: false,
       freshness_before: {
         user_id: userId,
-        container_started_at: new Date(Date.parse("2026-07-27T23:59:00.000Z")).toISOString(),
-        dispatches: armFirst ? 0 : 1,
-        usage_rows: armFirst ? 0 : (positiveScenario && !aFirst ? 4 : 1),
+        container_started_at: containerStartedAt,
+        dispatches: 0,
+        usage_rows: 0,
       },
       freshness_after: {
         user_id: userId,
-        container_started_at: new Date(Date.parse("2026-07-27T23:59:00.000Z")).toISOString(),
-        dispatches: (armFirst ? 0 : 1) + 1,
-        usage_rows:
-          (armFirst ? 0 : (positiveScenario && !aFirst ? 4 : 1)) +
-          (positiveCandidate ? 4 : 1),
+        container_started_at: containerStartedAt,
+        dispatches: 1,
+        usage_rows: positiveCandidate ? 4 : 1,
       },
       runtime_tuple: {
         image: "image",
@@ -386,8 +386,8 @@ function makeRun({
         dispatch_user_id: userId,
         dispatch_session_id: `${engine}-${scenario}-${pair}-${arm}-peer`,
         agent_container_id: "row",
-        container_internal_id: `${engine}-${scenario}-${pair}-container`,
-        docker_id: `${engine}-${scenario}-${pair}-container`,
+        container_internal_id: containerId,
+        docker_id: containerId,
         docker_name: containerName,
       },
       lane: { before: structuredClone(manifest.baseline_lane), after: structuredClone(manifest.baseline_lane) },
@@ -611,7 +611,7 @@ describe("v5 parallel delegation release scorer", () => {
     );
   });
 
-  it("rejects an unrelated main turn or usage row between pair arms", () => {
+  it("rejects a second arm that starts from the first arm's warm state", () => {
     const runs = passingRuns();
     const second = runs.find(
       (run) =>
@@ -620,13 +620,25 @@ describe("v5 parallel delegation release scorer", () => {
         run.pair_id === "01" &&
         run.arm === "B",
     );
-    second.container.freshness_before.dispatches = 2;
-    second.container.freshness_before.usage_rows += 1;
+    second.container.freshness_before.dispatches = 1;
+    second.container.freshness_before.usage_rows =
+      runs.find(
+        (run) =>
+          run.engine === "codex" &&
+          run.scenario === "code_batch" &&
+          run.pair_id === "01" &&
+          run.arm === "A",
+      ).resources.usage.rows;
+    second.container.freshness_after.dispatches =
+      second.container.freshness_before.dispatches + 1;
+    second.container.freshness_after.usage_rows =
+      second.container.freshness_before.usage_rows + second.resources.usage.rows;
     const report = scoreRuns(runs, gold, { manifest });
     assert.equal(report.passed, false);
     assert.ok(
       report.findings.some((finding) =>
-        finding.includes("unrelated turn or usage appeared between pair arms"),
+        finding.includes("code_batch/01/B") &&
+        finding.includes("arm did not start from a turn-clean fresh container"),
       ),
     );
   });
@@ -726,6 +738,10 @@ describe("v5 parallel delegation release scorer", () => {
         before: structuredClone(manifest.production.lane),
         after: structuredClone(manifest.production.lane),
       };
+      run.container.freshness_before.dispatches = 7;
+      run.container.freshness_before.usage_rows = 11;
+      run.container.freshness_after.dispatches = 8;
+      run.container.freshness_after.usage_rows = 11 + run.resources.usage.rows;
     }
     const report = scoreRuns(runs, gold, { mode: "production-smoke", manifest });
     assert.equal(report.passed, true, report.findings.join("\n"));
@@ -792,19 +808,62 @@ describe("v5 parallel delegation release scorer", () => {
     assert.ok(report.findings.some((finding) => finding.includes("declared B_FIRST was not executed in order")));
   });
 
-  it("rejects reusing a warm container across different isolated pairs", () => {
+  it("rejects reusing one Docker container for both arms of the same pair", () => {
     const runs = passingRuns();
-    const first = runs.find((run) => run.engine === "ccb" && run.scenario === "code_batch" && run.pair_id === "01");
-    for (const run of runs.filter(
-      (item) => item.engine === "ccb" && item.scenario === "code_batch" && item.pair_id === "02",
-    )) {
-      run.container.id = first.container.id;
-      run.container.binding.docker_id = first.container.id;
-      run.container.binding.container_internal_id = first.container.id;
-    }
+    const pairRuns = runs.filter(
+      (run) => run.engine === "ccb" && run.scenario === "code_batch" && run.pair_id === "01",
+    );
+    const [A, B] = ["A", "B"].map((arm) => pairRuns.find((run) => run.arm === arm));
+    B.container.id = A.container.id;
+    B.container.binding.docker_id = A.container.id;
+    B.container.binding.container_internal_id = A.container.id;
     const result = scoreRuns(runs, gold, { manifest });
     assert.equal(result.passed, false);
-    assert.ok(result.findings.some((finding) => finding.includes("container id reused by another pair")));
+    assert.ok(
+      result.findings.some((finding) =>
+        finding.includes("ccb/code_batch/01") &&
+        finding.includes("A/B arms must use different container ids"),
+      ),
+    );
+    assert.ok(result.findings.some((finding) => finding.includes("container id reused by")));
+  });
+
+  it("rejects reusing one Docker container across isolated pairs", () => {
+    const runs = passingRuns();
+    const source = runs.find(
+      (run) =>
+        run.engine === "ccb" &&
+        run.scenario === "code_batch" &&
+        run.pair_id === "01" &&
+        run.arm === "A",
+    );
+    const reused = runs.find(
+      (run) =>
+        run.engine === "ccb" &&
+        run.scenario === "code_batch" &&
+        run.pair_id === "02" &&
+        run.arm === "A",
+    );
+    reused.container.id = source.container.id;
+    reused.container.binding.docker_id = source.container.id;
+    reused.container.binding.container_internal_id = source.container.id;
+    const result = scoreRuns(runs, gold, { manifest });
+    assert.equal(result.passed, false);
+    assert.ok(
+      result.findings.some((finding) =>
+        finding.includes("ccb/code_batch/02/A") &&
+        finding.includes("container id reused by ccb/code_batch/01/A"),
+      ),
+    );
+  });
+
+  it("requires a frozen reprovision helper revision", () => {
+    const invalidManifest = structuredClone(manifest);
+    invalidManifest.policy.reprovision_rev = "not-a-sha";
+    assert.throws(
+      () => scoreRuns(passingRuns(), gold, { manifest: invalidManifest }),
+      /reprovision_rev is not a SHA-256/,
+    );
   });
 
   it("CLI ignores frame sidecars and verifies their SHA-256", () => {

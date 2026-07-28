@@ -15,6 +15,10 @@ required=(
   V5_EVAL_RULE_FILE
   V5_EVAL_PERSONA_PATH
   V5_EVAL_PROBE_PATH
+  V5_EVAL_BASE
+  V5_EVAL_EMAIL
+  V5_EVAL_PASSWORD_FILE
+  V5_EVAL_AUTH_SESSION_FILE
 )
 for name in "${required[@]}"; do
   if [[ -z "${!name:-}" ]]; then
@@ -24,6 +28,23 @@ for name in "${required[@]}"; do
 done
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cleanup_auth_session() {
+  node "$HERE/auth-session.mjs" logout \
+    --base "$V5_EVAL_BASE" \
+    --file "$V5_EVAL_AUTH_SESSION_FILE" >/dev/null 2>&1 || true
+  node "$HERE/auth-session.mjs" cleanup \
+    --file "$V5_EVAL_AUTH_SESSION_FILE"
+}
+
+cleanup_early_exit() {
+  local status=$?
+  set +e
+  cleanup_auth_session
+  trap - EXIT
+  exit "$status"
+}
+trap cleanup_early_exit EXIT
+
 readarray -t bound < <(node - "$V5_EVAL_MANIFEST" "$V5_EVAL_PAIR_ID" "$V5_EVAL_ENGINE" <<'NODE'
 const fs = require("node:fs");
 const [manifestPath, pairId, engine] = process.argv.slice(2);
@@ -40,9 +61,10 @@ console.log(manifest.policy.personas?.[engine]?.base_persona_rev ?? "");
 console.log(manifest.policy.personas?.[engine]?.candidate_persona_rev ?? "");
 console.log(manifest.policy.rule_rev);
 console.log(manifest.targets[engine].container);
+console.log(manifest.policy.reprovision_rev);
 NODE
 )
-if [[ ${#bound[@]} -ne 8 ]]; then
+if [[ ${#bound[@]} -ne 9 ]]; then
   printf 'failed to read bound manifest values\n' >&2
   exit 2
 fi
@@ -59,32 +81,23 @@ base_rev=${bound[4]}
 candidate_rev=${bound[5]}
 rule_rev=${bound[6]}
 export V5_EVAL_CONTAINER=${bound[7]}
+reprovision_rev=${bound[8]}
+actual_reprovision_rev=$(sha256sum "$HERE/reprovision.mjs" | awk '{print $1}')
+if [[ ! $reprovision_rev =~ ^[0-9a-f]{64}$ || $actual_reprovision_rev != "$reprovision_rev" ]]; then
+  printf 'canonical reprovision helper differs from bound manifest\n' >&2
+  exit 2
+fi
 export V5_EVAL_PAIR_EXECUTION_ID=${V5_EVAL_PAIR_EXECUTION_ID:-"$(
   node -e 'console.log(require("node:crypto").randomUUID())'
 )"}
 mkdir -p -- "$V5_EVAL_RUNS_DIR"
 
-candidate_active=0
-restore_candidate() {
-  if [[ $candidate_active -eq 1 ]]; then
-    if ! node "$HERE/persona-variant.mjs" restore \
+restore_base() {
+  if [[ -f "$V5_EVAL_AUTH_SESSION_FILE" ]]; then
+    node "$HERE/persona-variant.mjs" restore \
       --base "$V5_EVAL_PERSONA_BASE_FILE" \
-      --rule "$V5_EVAL_RULE_FILE"; then
-      return 1
-    fi
-    candidate_active=0
+      --rule "$V5_EVAL_RULE_FILE"
   fi
-}
-
-cleanup_auth_session() {
-  if [[ -z "${V5_EVAL_AUTH_SESSION_FILE:-}" ]]; then
-    return 0
-  fi
-  node "$HERE/auth-session.mjs" logout \
-    --base "$V5_EVAL_BASE" \
-    --file "$V5_EVAL_AUTH_SESSION_FILE" >/dev/null 2>&1 || true
-  node "$HERE/auth-session.mjs" cleanup \
-    --file "$V5_EVAL_AUTH_SESSION_FILE"
 }
 
 cleanup_pair() {
@@ -92,7 +105,7 @@ cleanup_pair() {
   local restore_status=0
   local auth_status=0
   set +e
-  restore_candidate
+  restore_base
   restore_status=$?
   cleanup_auth_session
   auth_status=$?
@@ -107,10 +120,38 @@ cleanup_pair() {
 trap cleanup_pair EXIT
 
 apply_candidate() {
-  candidate_active=1
   node "$HERE/persona-variant.mjs" apply \
     --base "$V5_EVAL_PERSONA_BASE_FILE" \
     --rule "$V5_EVAL_RULE_FILE"
+}
+
+reprovision_arm() {
+  local arm=$1
+  local step=$2
+  local result
+  local -a values=()
+  export V5_EVAL_ARM=$arm
+  export V5_EVAL_PAIR_STEP=$step
+  result=$(node "$HERE/reprovision.mjs")
+  readarray -t values < <(node -e '
+    const value = JSON.parse(process.argv[1]);
+    if (
+      typeof value.id !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.id) ||
+      typeof value.started_at !== "string" ||
+      !Number.isFinite(Date.parse(value.started_at))
+    ) {
+      throw new Error("invalid reprovision result");
+    }
+    console.log(value.id);
+    console.log(value.started_at);
+  ' "$result")
+  if [[ ${#values[@]} -ne 2 ]]; then
+    printf 'failed to read reprovision result\n' >&2
+    return 1
+  fi
+  export V5_EVAL_REPROVISION_CONTAINER_ID=${values[0]}
+  export V5_EVAL_REPROVISION_STARTED_AT=${values[1]}
 }
 
 run_arm() {
@@ -133,13 +174,17 @@ run_arm() {
 }
 
 if [[ $V5_EVAL_ORDER == A_FIRST ]]; then
+  reprovision_arm A 1
   run_arm A 1
+  restore_base
+  reprovision_arm B 2
   apply_candidate
   run_arm B 2
-  restore_candidate
 else
+  reprovision_arm B 1
   apply_candidate
   run_arm B 1
-  restore_candidate
+  restore_base
+  reprovision_arm A 2
   run_arm A 2
 fi
