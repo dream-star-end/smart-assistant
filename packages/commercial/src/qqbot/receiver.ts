@@ -19,6 +19,7 @@ import {
 } from '../http/util.js'
 import { getPreferences } from '../user/preferences.js'
 import type { WechatCodexBillingBody } from '../wechat/outboundReceiver.js'
+import { expandTextWithQqMediaParts } from './outboundMedia.js'
 import { enqueueQqDelivery } from './outbox.js'
 import { clearRunningQqSession } from './sessionPointer.js'
 import { getQqBinding } from './store.js'
@@ -119,14 +120,15 @@ export function makeQqOutboundReceiver(args: {
       sendError(res, 410, 'QQ_BINDING_GONE', 'QQ binding changed or was removed', requestId)
       return
     }
-    const text = body.blocks
+    const renderedText = body.blocks
       .filter(
         (block): block is typeof block & { text: string } =>
           block.kind === 'text' && typeof block.text === 'string',
       )
       .map((block) => block.text)
       .join('')
-    if (!text) {
+    const expanded = expandTextWithQqMediaParts(renderedText)
+    if (!expanded.text && expanded.media.length === 0) {
       sendJson(
         res,
         200,
@@ -140,9 +142,14 @@ export function makeQqOutboundReceiver(args: {
     const queued = await enqueueQqDelivery(args.pool, {
       deliveryId: body.outboundId,
       userId: String(identity.userId),
-      text,
+      text: expanded.text,
       kind: 'reply',
       sessionId: body.sessionId,
+      media: expanded.media,
+      expectedBinding: {
+        version: binding.bindingVersion,
+        openid: body.peer.meta.senderId,
+      },
     })
     if (queued.outcome === 'cancelled' || queued.outcome === 'no_binding') {
       sendError(res, 410, 'QQ_BINDING_GONE', 'QQ binding changed or was removed', requestId)

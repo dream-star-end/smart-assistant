@@ -2,18 +2,16 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import test from 'node:test'
 
-import type {
-  QQBotInboundMessage,
-  QQBotOptions,
-  ReplyTarget,
-} from '@tencent-connect/qqbot-nodejs'
+import type { QQBotInboundMessage, QQBotOptions, ReplyTarget } from '@tencent-connect/qqbot-nodejs'
 import type { Pool } from 'pg'
 
+import { QqOutboundMediaFormatError } from '../qqbot/outboundMedia.js'
+import type { startQqOutboxWorker } from '../qqbot/outbox.js'
 import {
   QQ_GROUP_AND_C2C_INTENTS,
   makeQqBotService,
+  qqInboundChannelProfile,
 } from '../qqbot/service.js'
-import type { startQqOutboxWorker } from '../qqbot/outbox.js'
 import type { InboundDispatcher } from '../wechat/inboundDispatcher.js'
 
 class FakeBot extends EventEmitter {
@@ -21,6 +19,7 @@ class FakeBot extends EventEmitter {
   stopped = false
   readonly sentTexts: string[] = []
   readonly sentMedia: unknown[] = []
+  mediaError: Error | null = null
   private settleStart!: () => void
   private readonly running = new Promise<void>((resolve) => {
     this.settleStart = resolve
@@ -50,9 +49,17 @@ class FakeBot extends EventEmitter {
 
   async sendMedia(options: unknown): Promise<unknown> {
     this.sentMedia.push(options)
+    if (this.mediaError) throw this.mediaError
     return {}
   }
 }
+
+test('QQ inbound context tells the Agent to return real media paths instead of a web fallback', () => {
+  const text = qqInboundChannelProfile().decorateInboundText?.('请发给我')
+  assert.match(text ?? '', /QQ 网关会自动把路径转换成真实媒体或附件发送/)
+  assert.match(text ?? '', /\/home\/agent\/\.openclaude\/generated/)
+  assert.doesNotMatch(text ?? '', /请说明用户可在网页会话中查看和下载/)
+})
 
 test('QQ outbox adapter maps image, video, voice and file to SDK media uploads', async () => {
   const bot = new FakeBot()
@@ -119,6 +126,39 @@ test('QQ outbox adapter maps image, video, voice and file to SDK media uploads',
         fileName: 'file.bin',
       },
     ],
+  )
+  await service.stop()
+})
+
+test('QQ SDK unsupported-format rejection becomes an explicit user-facing media error', async () => {
+  const bot = new FakeBot()
+  bot.mediaError = new Error('API Error: 富媒体文件格式不支持')
+  let workerArgs: Parameters<typeof startQqOutboxWorker>[0] | undefined
+  const service = makeQqBotService({
+    pool: {} as Pool,
+    config: qqConfig(),
+    dispatcher: {} as InboundDispatcher,
+    botFactory: () => bot as unknown as import('@tencent-connect/qqbot-nodejs').QQBot,
+    outboxWorkerFactory: (args) => {
+      workerArgs = args
+      return { kick() {}, async stop() {} }
+    },
+    gatewayTerminal: () => false,
+  })
+
+  await service.start()
+  assert.ok(workerArgs?.sendMedia)
+  await assert.rejects(
+    workerArgs.sendMedia('openid-1', {
+      kind: 'image',
+      filename: 'tiny.png',
+      content: Buffer.from('png'),
+    }),
+    (err) => {
+      assert.ok(err instanceof QqOutboundMediaFormatError)
+      assert.match(err.userMessage, /QQ 不支持“tiny\.png”的当前媒体格式/)
+      return true
+    },
   )
   await service.stop()
 })
@@ -441,9 +481,7 @@ function boundPool(): Pool {
   } as unknown as Pool
 }
 
-function inboundMessage(
-  overrides: Partial<QQBotInboundMessage> = {},
-): QQBotInboundMessage {
+function inboundMessage(overrides: Partial<QQBotInboundMessage> = {}): QQBotInboundMessage {
   return {
     rawEventType: 'C2C_MESSAGE_CREATE',
     kind: 'c2c',

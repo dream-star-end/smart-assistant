@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import type { Pool } from 'pg'
 
-import { QqOutboundMediaTooLargeError } from '../qqbot/outboundMedia.js'
+import { QqOutboundMediaFormatError, QqOutboundMediaTooLargeError } from '../qqbot/outboundMedia.js'
 import { drainOneQqOutbox } from '../qqbot/outbox.js'
 
 const OPENID = 'qq-openid-1'
@@ -49,14 +49,16 @@ function makeOutboxPool(
     if (/SELECT id, binding_version, target_openid, payload/.test(sql)) {
       return state.status === 'queued'
         ? {
-            rows: [{
-              id: '7',
-              binding_version: bindingVersion,
-              target_openid: targetOpenid,
-              payload,
-              next_chunk: state.nextChunk,
-              attempts: state.attempts,
-            }],
+            rows: [
+              {
+                id: '7',
+                binding_version: bindingVersion,
+                target_openid: targetOpenid,
+                payload,
+                next_chunk: state.nextChunk,
+                attempts: state.attempts,
+              },
+            ],
             rowCount: 1,
           }
         : { rows: [], rowCount: 0 }
@@ -280,5 +282,35 @@ describe('QQ outbox Stage A media consumer', () => {
     assert.equal(second.state.status, 'queued')
     assert.equal(second.state.attempts, 1)
     assert.equal(second.state.lastError, 'QQ notice unavailable')
+  })
+
+  test('unsupported QQ media format is terminal only after its explicit notice succeeds', async () => {
+    const { pool, state } = makeOutboxPool({
+      media: {
+        type: 'image',
+        containerPath: '/home/agent/.openclaude/generated/tiny.png',
+        filename: 'tiny.png',
+      },
+    })
+    const notices: string[] = []
+    await drainOneQqOutbox(
+      {
+        pool,
+        sendText: async (_openid, text) => {
+          notices.push(text)
+        },
+        resolveMediaPart: async () => ({
+          kind: 'image',
+          filename: 'tiny.png',
+          content: Buffer.from('png'),
+        }),
+        sendMedia: async () => {
+          throw new QqOutboundMediaFormatError('QQ 不支持“tiny.png”的当前媒体格式')
+        },
+      },
+      () => 1_000,
+    )
+    assert.deepEqual(notices, ['QQ 不支持“tiny.png”的当前媒体格式'])
+    assert.equal(state.status, 'sent')
   })
 })

@@ -78,6 +78,88 @@ describe('0187_qq_bot_channel', () => {
     assert.equal((await getQqBinding(pool, 2n))?.openid, 'openid-two')
   })
 
+  maybe(
+    'queues text before every media child and deduplicates the whole delivery tree',
+    async () => {
+      const args = {
+        deliveryId: 'delivery.stageb.mixed',
+        userId: 2n,
+        text: '请查收',
+        kind: 'reply' as const,
+        sessionId: 'wsess-0123456789abcdef',
+        media: [
+          {
+            type: 'image' as const,
+            containerPath: '/home/agent/.openclaude/generated/photo.jpg',
+            filename: 'photo.jpg',
+            mimeType: 'image/jpeg',
+          },
+          {
+            type: 'voice' as const,
+            containerPath: '/home/agent/.openclaude/generated/answer.wav',
+            filename: 'answer.wav',
+            mimeType: 'audio/wav',
+          },
+          {
+            type: 'file' as const,
+            containerPath: '/home/agent/.openclaude/generated/report.pdf',
+            filename: 'report.pdf',
+            mimeType: 'application/pdf',
+          },
+        ],
+        now: 2_500,
+      }
+      assert.equal((await enqueueQqDelivery(pool, args)).outcome, 'queued')
+      assert.equal((await enqueueQqDelivery(pool, args)).outcome, 'queued')
+
+      const rows = await pool.query<{
+        delivery_id: string
+        payload: { chunks?: string[]; media?: { filename: string } }
+      }>(
+        `SELECT delivery_id, payload
+         FROM qq_outbox
+        WHERE user_id=2 AND created_at=2500
+        ORDER BY id`,
+      )
+      assert.equal(rows.rows.length, 4)
+      assert.deepEqual(rows.rows[0]?.payload, { chunks: ['请查收'] })
+      assert.deepEqual(
+        rows.rows.slice(1).map((row) => row.payload.media?.filename),
+        ['photo.jpg', 'answer.wav', 'report.pdf'],
+      )
+      assert.equal(new Set(rows.rows.map((row) => row.delivery_id)).size, 4)
+    },
+  )
+
+  maybe('keeps a silent root before a media-only child', async () => {
+    const queued = await enqueueQqDelivery(pool, {
+      deliveryId: 'delivery.stageb.mediaonly',
+      userId: 2n,
+      text: '',
+      kind: 'reply',
+      sessionId: 'wsess-0123456789abcdef',
+      media: [
+        {
+          type: 'video',
+          containerPath: '/home/agent/.openclaude/generated/result.mp4',
+          filename: 'result.mp4',
+          mimeType: 'video/mp4',
+        },
+      ],
+      now: 2_600,
+    })
+    assert.equal(queued.outcome, 'queued')
+    const rows = await pool.query<{ payload: { mediaRoot?: boolean; media?: unknown } }>(
+      `SELECT payload
+         FROM qq_outbox
+        WHERE user_id=2 AND created_at=2600
+        ORDER BY id`,
+    )
+    assert.equal(rows.rows.length, 2)
+    assert.deepEqual(rows.rows[0]?.payload, { mediaRoot: true })
+    assert.ok(rows.rows[1]?.payload.media)
+  })
+
   maybe('unbind fences and cancels pending deliveries without deleting the tombstone', async () => {
     const binding = await getQqBinding(pool, 1n)
     assert.ok(binding)
@@ -103,4 +185,93 @@ describe('0187_qq_bot_channel', () => {
     }
     assert.equal(result?.kind, 'rate_limited')
   })
+
+  maybe(
+    'ACK-loss replay after unbind and rebind cannot attach old media to the new OpenID',
+    async () => {
+      const oldBinding = await getQqBinding(pool, 2n)
+      assert.ok(oldBinding)
+      const original = await enqueueQqDelivery(pool, {
+        deliveryId: 'delivery.stageb.rebind',
+        userId: 2n,
+        text: '旧绑定回复',
+        kind: 'reply',
+        media: [
+          {
+            type: 'file',
+            containerPath: '/home/agent/.openclaude/generated/old.pdf',
+            filename: 'old.pdf',
+          },
+        ],
+        expectedBinding: {
+          version: oldBinding.bindingVersion,
+          openid: oldBinding.openid,
+        },
+        now: 5_000,
+      })
+      assert.equal(original.outcome, 'queued')
+      assert.equal(await unbindQq(pool, 2n, 5_001), true)
+      const next = await createBindCode(pool, 2n, SECRET, 5_002)
+      assert.equal(
+        (await consumeBindCode(pool, next.code, 'openid-two-rebound', SECRET, 5_003)).kind,
+        'bound',
+      )
+
+      const firstAfterRebind = await enqueueQqDelivery(pool, {
+        deliveryId: 'delivery.stageb.first-after-rebind',
+        userId: 2n,
+        text: '旧 OpenID 会话的迟到回复',
+        kind: 'reply',
+        media: [
+          {
+            type: 'file',
+            containerPath: '/home/agent/.openclaude/generated/private.pdf',
+            filename: 'private.pdf',
+          },
+        ],
+        expectedBinding: {
+          version: oldBinding.bindingVersion,
+          openid: oldBinding.openid,
+        },
+        now: 5_004,
+      })
+      assert.equal(firstAfterRebind.outcome, 'no_binding')
+      const firstRows = await pool.query<{ count: string }>(
+        `SELECT count(*) FROM qq_outbox
+          WHERE user_id=2 AND delivery_id='delivery.stageb.first-after-rebind'`,
+      )
+      assert.deepEqual(firstRows.rows, [{ count: '0' }])
+
+      const replay = await enqueueQqDelivery(pool, {
+        deliveryId: 'delivery.stageb.rebind',
+        userId: 2n,
+        text: '旧绑定回复',
+        kind: 'reply',
+        media: [
+          {
+            type: 'file',
+            containerPath: '/home/agent/.openclaude/generated/old.pdf',
+            filename: 'old.pdf',
+          },
+        ],
+        now: 5_005,
+      })
+      assert.equal(replay.outcome, 'cancelled')
+      const rows = await pool.query<{
+        status: string
+        binding_version: string
+        target_openid: string
+      }>(
+        `SELECT status, binding_version, target_openid
+         FROM qq_outbox
+        WHERE user_id=2 AND created_at=5000
+        ORDER BY id`,
+      )
+      assert.equal(rows.rows.length, 2)
+      assert.deepEqual(new Set(rows.rows.map((row) => row.status)), new Set(['cancelled']))
+      assert.equal(new Set(rows.rows.map((row) => row.binding_version)).size, 1)
+      assert.equal(new Set(rows.rows.map((row) => row.target_openid)).size, 1)
+      assert.notEqual(rows.rows[0]?.target_openid, 'openid-two-rebound')
+    },
+  )
 })

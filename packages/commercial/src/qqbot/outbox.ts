@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
 
 import {
-  QqOutboundMediaTooLargeError,
+  QqOutboundMediaFormatError,
   type QqOutboundMediaPart,
+  QqOutboundMediaTooLargeError,
   type ResolveQqOutboundMediaPartFn,
   type ResolvedQqOutboundMedia,
 } from './outboundMedia.js'
@@ -31,12 +33,18 @@ export async function enqueueQqDelivery(
     text: string
     kind: 'reply' | 'proactive'
     sessionId?: string
+    media?: QqOutboundMediaPart[]
+    expectedBinding?: {
+      version: string
+      openid: string
+    }
     now?: number
   },
 ): Promise<{ outcome: QqOutboxOutcome; outboxId?: number }> {
   const now = args.now ?? Date.now()
   const chunks = splitQqText(args.text)
-  if (chunks.length === 0) return { outcome: 'cancelled' }
+  const media = args.media ?? []
+  if (chunks.length === 0 && media.length === 0) return { outcome: 'cancelled' }
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -55,6 +63,14 @@ export async function enqueueQqDelivery(
       await client.query('COMMIT')
       return { outcome: 'no_binding' }
     }
+    if (
+      args.expectedBinding &&
+      (active.binding_version !== args.expectedBinding.version ||
+        active.bot_openid !== args.expectedBinding.openid)
+    ) {
+      await client.query('COMMIT')
+      return { outcome: 'no_binding' }
+    }
     await client.query(
       `INSERT INTO qq_outbox
          (delivery_id, user_id, binding_version, target_openid, session_id,
@@ -68,25 +84,65 @@ export async function enqueueQqDelivery(
         active.bot_openid,
         args.sessionId ?? null,
         args.kind,
-        JSON.stringify({ chunks }),
+        JSON.stringify(chunks.length > 0 ? { chunks } : { mediaRoot: true }),
         now,
       ],
     )
-    const row = await client.query<{ id: string; status: string }>(
-      'SELECT id, status FROM qq_outbox WHERE user_id = $1 AND delivery_id = $2',
+    const row = await client.query<{
+      id: string
+      status: string
+      binding_version: string
+      target_openid: string
+    }>(
+      `SELECT id, status, binding_version, target_openid
+         FROM qq_outbox
+        WHERE user_id = $1 AND delivery_id = $2`,
       [String(args.userId), args.deliveryId],
     )
-    await client.query('COMMIT')
     const found = row.rows[0]!
+    if (
+      found.status === 'cancelled' ||
+      found.binding_version !== active.binding_version ||
+      found.target_openid !== active.bot_openid
+    ) {
+      await client.query('COMMIT')
+      return { outcome: 'cancelled', outboxId: Number(found.id) }
+    }
+    const deliveryIds = [args.deliveryId]
+    for (const [index, part] of media.entries()) {
+      const deliveryId = qqMediaDeliveryId(args.deliveryId, index)
+      deliveryIds.push(deliveryId)
+      await client.query(
+        `INSERT INTO qq_outbox
+           (delivery_id, user_id, binding_version, target_openid, session_id,
+            kind, payload, next_attempt_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8, $8)
+         ON CONFLICT (user_id, delivery_id) DO NOTHING`,
+        [
+          deliveryId,
+          String(args.userId),
+          active.binding_version,
+          active.bot_openid,
+          args.sessionId ?? null,
+          args.kind,
+          JSON.stringify({ media: part }),
+          now,
+        ],
+      )
+    }
+    let statuses = [found.status]
+    if (media.length > 0) {
+      const rows = await client.query<{ status: string }>(
+        `SELECT status
+           FROM qq_outbox
+          WHERE user_id = $1 AND delivery_id = ANY($2::text[])`,
+        [String(args.userId), deliveryIds],
+      )
+      statuses = rows.rows.map((item) => item.status)
+    }
+    await client.query('COMMIT')
     return {
-      outcome:
-        found.status === 'sent'
-          ? 'already_sent'
-          : found.status === 'cancelled'
-            ? 'cancelled'
-            : found.status === 'queued'
-              ? 'queued'
-              : 'pending',
+      outcome: qqOutboxOutcomeForStatuses(statuses),
       outboxId: Number(found.id),
     }
   } catch (err) {
@@ -95,6 +151,23 @@ export async function enqueueQqDelivery(
   } finally {
     client.release()
   }
+}
+
+function qqMediaDeliveryId(rootDeliveryId: string, index: number): string {
+  const digest = createHash('sha256')
+    .update('qq-outbound-media-v1\0')
+    .update(rootDeliveryId)
+    .update('\0')
+    .update(String(index))
+    .digest('hex')
+  return `qq.media.${digest}`
+}
+
+function qqOutboxOutcomeForStatuses(statuses: string[]): QqOutboxOutcome {
+  if (statuses.some((status) => status === 'cancelled')) return 'cancelled'
+  if (statuses.some((status) => status === 'queued')) return 'queued'
+  if (statuses.some((status) => status === 'sending')) return 'pending'
+  return 'already_sent'
 }
 
 export interface QqOutboxWorker {
@@ -274,8 +347,13 @@ export async function drainOneQqOutbox(
           })
           await args.sendMedia(delivery.target_openid, media)
         } catch (err) {
-          if (!(err instanceof QqOutboundMediaTooLargeError)) throw err
-          // The row is terminal only after the explicit size-limit notice
+          if (
+            !(err instanceof QqOutboundMediaTooLargeError) &&
+            !(err instanceof QqOutboundMediaFormatError)
+          ) {
+            throw err
+          }
+          // The row is terminal only after the explicit size/format notice
           // itself reaches QQ; a notice failure remains durably retryable.
           await args.sendText(delivery.target_openid, err.userMessage)
         }

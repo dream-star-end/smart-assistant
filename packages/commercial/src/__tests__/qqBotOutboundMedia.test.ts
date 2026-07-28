@@ -5,6 +5,7 @@ import { MediaFileType } from '@tencent-connect/qqbot-nodejs'
 
 import {
   QqOutboundMediaTooLargeError,
+  expandTextWithQqMediaParts,
   makeQqOutboundMediaResolver,
   normalizeQqMediaKind,
   qqMediaFileType,
@@ -25,6 +26,37 @@ describe('QQ outbound media contracts', () => {
     assert.equal(normalizeQqMediaKind('voice', 'answer.ogg'), 'file')
     assert.equal(normalizeQqMediaKind('voice', 'answer.oga'), 'file')
     assert.equal(normalizeQqMediaKind('voice', 'answer.amr'), 'file')
+  })
+
+  test('extracts every supported final-answer path without the WeChat five-file cap', () => {
+    const paths = [
+      'one.png',
+      'two.jpg',
+      'three.mp4',
+      'four.wav',
+      'five.pdf',
+      'six.zip',
+      'seven.ogg',
+      'eight.7z',
+      'nine.py',
+    ].map((name) => `/home/agent/.openclaude/generated/${name}`)
+    const expanded = expandTextWithQqMediaParts(`文件如下：\n${paths.join('\n')}\n请查收。`)
+
+    assert.equal(expanded.text, '文件如下：\n\n请查收。')
+    assert.deepEqual(
+      expanded.media.map(({ type, filename }) => ({ type, filename })),
+      [
+        { type: 'image', filename: 'one.png' },
+        { type: 'image', filename: 'two.jpg' },
+        { type: 'video', filename: 'three.mp4' },
+        { type: 'voice', filename: 'four.wav' },
+        { type: 'file', filename: 'five.pdf' },
+        { type: 'file', filename: 'six.zip' },
+        { type: 'file', filename: 'seven.ogg' },
+        { type: 'file', filename: 'eight.7z' },
+        { type: 'file', filename: 'nine.py' },
+      ],
+    )
   })
 
   test('enforces the SDK image ceiling after resolving the current user file', async () => {
