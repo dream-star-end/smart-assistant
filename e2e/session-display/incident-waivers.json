@@ -31,6 +31,12 @@
       "reason": "预发布运行时镜像构建上下文漏拷贝 Playwright CLI 配置；构建在产物生成前失败，未创建镜像、未部署或切流，线上用户与生产数据均未受影响。",
       "approvedBy": "dx 2026-07-30 指示继续完成 Playwright CLI + Skill 迁移上线",
       "expiresAt": "2026-08-30"
+    },
+    {
+      "commit": "4a58dc2a0",
+      "reason": "受控 synthetic A/B 在预部署发现并行委派规则带来固定 prompt 开销后进行主动优化；候选从未上线，不对应生产用户、计费或数据事故。",
+      "approvedBy": "dx 2026-07-28 指示按方案推进、一定做好评测，并后续要求继续",
+      "expiresAt": "2026-08-28"
     }
   ]
 }
