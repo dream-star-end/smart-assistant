@@ -9,6 +9,8 @@
 export type UserModelAuthz = {
   role: "user" | "admin";
   grantedModelIds: ReadonlySet<string>;
+  /** Account-scoped hard denials override visibility and explicit grants. */
+  deniedModelIds?: ReadonlySet<string>;
 };
 
 export type UserModelAuthzLoader = (
@@ -27,6 +29,15 @@ export class UserModelAuthzEpochMismatchError extends Error {
 }
 
 const AUTHZ_TTL_MS = 60_000;
+export const TEST_ACCOUNT_DENIED_MODEL_ID = "deepseek-v4-pro";
+
+export function deniedModelIdsForTrafficClass(
+  trafficClass: string | null,
+): ReadonlySet<string> {
+  return trafficClass === "synthetic_canary" || trafficClass === "e2e"
+    ? new Set([TEST_ACCOUNT_DENIED_MODEL_ID])
+    : new Set();
+}
 
 interface LoadedAuthz {
   value: UserModelAuthz;
@@ -36,8 +47,14 @@ interface LoadedAuthz {
 export function makeLoadUserModelAuthz(): UserModelAuthzLoader {
   const loadUncached = async (uid: bigint): Promise<LoadedAuthz> => {
     const { query } = await import("../db/queries.js");
-    const r = await query<{ role: string | null; epoch: string; grants: string[] }>(
+    const r = await query<{
+      role: string | null;
+      signal_traffic_class: string | null;
+      epoch: string;
+      grants: string[];
+    }>(
       `SELECT u.role,
+              u.signal_traffic_class,
               e.epoch::text AS epoch,
               COALESCE(array_agg(g.model_id ORDER BY g.model_id)
                 FILTER (WHERE g.model_id IS NOT NULL), ARRAY[]::text[]) AS grants
@@ -45,7 +62,7 @@ export function makeLoadUserModelAuthz(): UserModelAuthzLoader {
          LEFT JOIN users u ON u.id = $1::bigint
          LEFT JOIN model_visibility_grants g ON g.user_id = u.id
         WHERE e.id
-        GROUP BY u.role, e.epoch`,
+        GROUP BY u.role, u.signal_traffic_class, e.epoch`,
       [uid],
     );
     const row = r.rows[0];
@@ -55,6 +72,7 @@ export function makeLoadUserModelAuthz(): UserModelAuthzLoader {
       value: {
         role: row.role === "admin" ? "admin" : "user",
         grantedModelIds: new Set(row.grants),
+        deniedModelIds: deniedModelIdsForTrafficClass(row.signal_traffic_class),
       },
     };
   };

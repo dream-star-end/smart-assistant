@@ -37,6 +37,8 @@ export interface CanUseModelInput {
   role: 'user' | 'admin'
   /** caller 必须在调用前一次性查表得到本 uid 的 grants 集合。空集合可。 */
   grantedModelIds: ReadonlySet<string>
+  /** Account-scoped hard denials override public visibility and explicit grants. */
+  deniedModelIds?: ReadonlySet<string>
   /** 用户提交的原始 model id;函数内部走 canonicalize 后查 PricingCache。 */
   modelId: string
 }
@@ -52,6 +54,7 @@ export function canUseModel(deps: CanUseModelDeps, input: CanUseModelInput): boo
   const pricing = deps.pricing.get(canonical)
   if (!pricing) return false
   if (!pricing.enabled) return false
+  if (input.deniedModelIds?.has(canonical)) return false
   if (pricing.visibility === 'public') return true
   if (pricing.visibility === 'admin') {
     return input.role === 'admin' || input.grantedModelIds.has(pricing.model_id)

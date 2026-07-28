@@ -93,6 +93,7 @@ function snap(): ModelCatalogSnapshot {
 function gateWith(s: ModelCatalogSnapshot): ModelAuthorityDecision {
   return {
     snapshot: s,
+    deniedModelIds: new Set<string>(),
     canonicalModel: "glm-5.2-x",
     descriptor: s.resolve("glm-5.2-x")!,
     authorityKind: "local_catalog",
@@ -138,6 +139,7 @@ describe("degradedAlternatives — gate 生效:归属按 catalog provider_id", (
       gate: gateWith(s),
       pricing: legacyPricing(),
       uid: UID,
+      deniedModelIds: new Set<string>(),
       degraded: new Set(["deepseek"]),
     });
     // glm-5.2-x 的 catalog provider = deepseek → 必须被剔掉
@@ -153,6 +155,7 @@ describe("degradedAlternatives — gate 生效:归属按 catalog provider_id", (
       gate: gateWith(s),
       pricing: legacyPricing(),
       uid: UID,
+      deniedModelIds: new Set<string>(),
       degraded: new Set(["ark"]),
     });
     assert.deepEqual(alts, ["glm-5.2-x"]);
@@ -164,6 +167,7 @@ describe("degradedAlternatives — gate 生效:归属按 catalog provider_id", (
       gate: gateWith(s),
       pricing: legacyPricing(),
       uid: UID,
+      deniedModelIds: new Set<string>(),
       degraded: new Set<string>(),
     });
     assert.deepEqual(alts, ["glm-5.2", "glm-5.2-x", "deepseek-v4-pro"]);
@@ -178,8 +182,25 @@ describe("degradedAlternatives — gate 未生效(legacy):保持既有行为", (
       gate: null,
       pricing: legacyPricing(),
       uid: UID,
+      deniedModelIds: new Set<string>(),
       degraded: new Set<string>(),
     });
     assert.deepEqual(alts, ["glm-5.2", "glm-5.2-x", "deepseek-v4-pro"]);
   });
+});
+
+describe("degradedAlternatives — 账号硬拒绝", () => {
+  for (const catalogGated of [true, false]) {
+    test(`${catalogGated ? "catalog" : "legacy"} 路径不建议账号被拒绝的模型`, () => {
+      const s = snap();
+      const alts = degradedAlternatives({
+        gate: catalogGated ? gateWith(s) : null,
+        pricing: legacyPricing(),
+        uid: UID,
+        deniedModelIds: new Set(["deepseek-v4-pro"]),
+        degraded: new Set(["deepseek"]),
+      });
+      assert.ok(!alts.includes("deepseek-v4-pro"));
+    });
+  }
 });

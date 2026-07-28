@@ -724,6 +724,33 @@ describe("modelAuthorityGate — 本地路径 local_catalog token", () => {
     );
   });
 
+  test("account hard denial 在 egress gate 生效，且 projection revision 按同一 denial 重算", async () => {
+    const s = snap();
+    const authz = {
+      role: "user" as const,
+      grantedModelIds: new Set<string>(),
+      deniedModelIds: new Set(["glm-5.2"]),
+    };
+    const token = encodeLocalCatalogToken({
+      v: 1,
+      kind: "local_catalog",
+      projectionRevision: s.projectionRevisionFor({ uid: UID.toString(), ...authz }),
+      securityEpoch: s.securityEpoch.toString(),
+    });
+    await expectReject(
+      enforceModelAuthority({
+        catalog: source(s),
+        keyring: null,
+        headers: headers({ [LOCAL_CATALOG_HEADER]: token }),
+        uid: UID,
+        containerId: CONTAINER_ID,
+        model: "glm-5.2",
+        loadUserModelAuthz: authzLoader(authz),
+      }),
+      "MODEL_NOT_AVAILABLE",
+    );
+  });
+
   test("伪造 projectionRevision(冒充 admin 投影)不改变落库值,且打不一致告警", async () => {
     const s = snapWithAdminModel();
     // 攻击者拿 admin 投影的 hash 塞进 token,想让审计看起来像"在 admin 投影下消费"。

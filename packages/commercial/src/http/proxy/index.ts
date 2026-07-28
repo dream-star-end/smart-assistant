@@ -145,11 +145,17 @@ export function degradedAlternatives(args: {
   gate: ModelAuthorityDecision | null;
   pricing: AnthropicProxyDeps["pricing"];
   uid: bigint;
+  deniedModelIds: ReadonlySet<string>;
   degraded: ReadonlySet<string>;
 }): string[] {
   if (args.gate) {
     return args.gate.snapshot
-      .listForUser({ uid: args.uid.toString(), role: "user", grantedModelIds: new Set<string>() })
+      .listForUser({
+        uid: args.uid.toString(),
+        role: "user",
+        grantedModelIds: new Set<string>(),
+        deniedModelIds: args.deniedModelIds,
+      })
       .filter((m) => !m.providerId || !args.degraded.has(m.providerId))
       .map((m) => m.modelId)
       .slice(0, MAX_DEGRADED_ALTERNATIVES);
@@ -157,12 +163,22 @@ export function degradedAlternatives(args: {
   // legacy(catalog 未接线):route registry 推断归属,保持本批次之前的行为。
   return args.pricing
     .listPublic()
+    .filter((m) => !args.deniedModelIds.has(m.id))
     .filter((m) => {
       const pid = findRouteProviderForModel(m.id)?.id;
       return !pid || !args.degraded.has(pid);
     })
     .map((m) => m.id)
     .slice(0, MAX_DEGRADED_ALTERNATIVES);
+}
+
+async function deniedModelIdsForAlternatives(
+  deps: AnthropicProxyDeps,
+  gate: ModelAuthorityDecision | null,
+  uid: bigint,
+): Promise<ReadonlySet<string>> {
+  if (gate) return gate.deniedModelIds;
+  return (await deps.loadUserModelAuthz(uid)).deniedModelIds ?? new Set<string>();
 }
 
 /** 模型权威 gate 的拒绝类型 → reject metric 标签(运维仪表盘按这个分流告警)。 */
@@ -444,10 +460,12 @@ export function makeAnthropicProxyHandler(
         if (providerId) {
           const degradedSet = await getHealthDegradedProviders();
           if (degradedSet.has(providerId)) {
+            const deniedModelIds = await deniedModelIdsForAlternatives(deps, gate, uid);
             const alts = degradedAlternatives({
               gate,
               pricing: deps.pricing,
               uid,
+              deniedModelIds,
               degraded: degradedSet,
             });
             userLog.warn("proxy_provider_degraded", { model: body.model, provider: providerId });
@@ -799,7 +817,14 @@ export function makeAnthropicProxyHandler(
           const retryMs = retryAt - now;
           const retrySec = Math.max(1, Math.ceil(retryMs / 1_000));
           const degraded = await getDegradedProviders(now);
-          const alts = degradedAlternatives({ gate, pricing: deps.pricing, uid, degraded });
+          const deniedModelIds = await deniedModelIdsForAlternatives(deps, gate, uid);
+          const alts = degradedAlternatives({
+            gate,
+            pricing: deps.pricing,
+            uid,
+            deniedModelIds,
+            degraded,
+          });
           userLog.warn("proxy_provider_quota_blocked", { provider: providerId, model: body.model, retryMs });
           sendJsonError(
             res,

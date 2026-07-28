@@ -237,26 +237,72 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
     assert.equal(resolveEngine('brand-new-codex', { id: 'main' }), 'ccb', 'baked 会误判成 ccb')
   })
 
-  test('disabled / 未授权模型(不在投影)→ 逐级兜底;全都不在投影 → MODEL_NOT_AVAILABLE', () => {
-    // 投影里只有 deepseek-v4-pro;agent 钉在已 disable 的 glm-5.2,默认模型也不在投影。
+  test('disabled / 未授权模型(不在投影)→ 按多级 route 逐级兜底', () => {
+    // glm / MiniMax 都不在投影，route 第三级 deepseek-v4-pro 可用。
+    const routed = decideLocalExecution({
+      view: view([row('deepseek-v4-pro', 'ccb')]),
+      agent: { id: 'x', model: 'retired-model' },
+      defaultModel: 'missing-default',
+      kind: 'turn',
+    })
+    assert.equal(routed.canonicalModel, 'deepseek-v4-pro')
+
+    // 全 route 都不在投影 → 保持结构化 MODEL_NOT_AVAILABLE。
     assert.throws(
       () =>
         decideLocalExecution({
-          view: view([row('deepseek-v4-pro', 'ccb')]),
+          view: view([]),
           agent: { id: 'x', model: 'glm-5.2' },
           defaultModel: 'glm-5.2',
           kind: 'turn',
         }),
       (err: unknown) => (err as { code?: string })?.code === 'MODEL_NOT_AVAILABLE',
     )
-    // 兜底可用时优雅降级(存量语义:stale agent.model 不该炸掉 cron)。
+  })
+
+  test('provider unavailable 会跳过 agent/default 与 route 前级，选择下一可用模型', () => {
     const d = decideLocalExecution({
-      view: view([row('glm-5.2', 'ccb')]),
-      agent: { id: 'x', model: 'retired-model' },
+      view: view([
+        row('glm-5.2', 'ccb', { available: false }),
+        row('MiniMax-M3', 'ccb'),
+        row('deepseek-v4-pro', 'ccb'),
+      ]),
+      agent: { id: 'research-assistant', model: 'deepseek-v4-pro' },
+      model: 'glm-5.2',
       defaultModel: 'glm-5.2',
       kind: 'turn',
     })
-    assert.equal(d.canonicalModel, 'glm-5.2')
+    // agent 自身 deepseek 仍可用，所以显式/默认 glm 不可用后先尊重 agent 默认。
+    assert.equal(d.canonicalModel, 'deepseek-v4-pro')
+  })
+
+  test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Pro → Flash 多级路由', () => {
+    const d = decideLocalExecution({
+      view: view([
+        row('glm-5.2', 'ccb', { available: false }),
+        row('MiniMax-M3', 'ccb'),
+        row('deepseek-v4-pro', 'ccb', { available: false }),
+        row('deepseek-v4-flash', 'ccb'),
+      ]),
+      agent: { id: 'research-assistant', model: 'deepseek-v4-pro' },
+      defaultModel: 'glm-5.2',
+      kind: 'turn',
+    })
+    assert.equal(d.canonicalModel, 'MiniMax-M3')
+  })
+
+  test('测试账号投影没有 deepseek-v4-pro 时自动跳过，其他模型仍可路由', () => {
+    const d = decideLocalExecution({
+      view: view([
+        row('glm-5.2', 'ccb', { available: false }),
+        row('MiniMax-M3', 'ccb', { available: false }),
+        row('deepseek-v4-flash', 'ccb'),
+      ]),
+      agent: { id: 'research-assistant', model: 'deepseek-v4-pro' },
+      defaultModel: 'glm-5.2',
+      kind: 'turn',
+    })
+    assert.equal(d.canonicalModel, 'deepseek-v4-flash')
   })
 
   test('端到端:flag 开 → resolveLocalExecutionIfEnforced 真的去拉投影并按投影判定', async () => {

@@ -119,6 +119,21 @@ describe('canUseModel — visibility=public', () => {
       true,
     )
   })
+
+  test('account hard denial overrides public visibility and an explicit grant', () => {
+    assert.equal(
+      canUseModel(
+        { pricing },
+        {
+          role: 'admin',
+          grantedModelIds: new Set(['claude-opus-4-7']),
+          deniedModelIds: new Set(['claude-opus-4-7']),
+          modelId: 'claude-opus-4-7',
+        },
+      ),
+      false,
+    )
+  })
 })
 
 describe('canUseModel — visibility=admin', () => {

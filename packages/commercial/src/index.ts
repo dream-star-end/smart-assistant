@@ -478,6 +478,7 @@ import {
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
+import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
 import { makeApiKeyIdentityStrategy } from "./auth/apiKeyIdentity.js";
 import {
@@ -2183,6 +2184,10 @@ export async function registerCommercial(
             identityRepo,
             catalog: modelCatalogForProxy,
             loadUserModelAuthz,
+            // Team fallback selection must see newly opened/cleared quota circuits
+            // immediately; the endpoint itself is already a narrow local-turn call.
+            loadRoutingAvailability: () =>
+              getProviderRoutingAvailability(Date.now(), undefined, undefined, true),
           })
         : null;
       // seed 完整性(§5 / R2-M8):平台预设 agent 引用的模型必须在 catalog active,否则用户
@@ -3430,6 +3435,7 @@ export async function registerCommercial(
     // 取进程级唯一快照(modelCatalogRuntime 单例;上面 internal-proxy 装配段已 get 过)——
     // 未装配(skipInternalProxy / catalog 拉不起来的 shadow 期)→ undefined → handler 退 legacy 投影。
     modelCatalog: peekModelCatalogCache() ?? undefined,
+    loadUserModelAuthz,
     // T-23 preCheck 复用限流用的 ioredis 客户端(SCAN / SET EX 都 OK)
     preCheckRedis,
     // 2026-05-06:admin reset-cooldown 修 bug 时新接的依赖。adminResetCooldown
@@ -4816,6 +4822,7 @@ export async function registerCommercial(
           uid: uid.toString(),
           role: authz.role,
           grantedModelIds: authz.grantedModelIds,
+          deniedModelIds: authz.deniedModelIds,
         }, modelId);
       }
       // cutover 前 legacy 路径仍从 DB loader 取 role+grants，不再信 JWT role。

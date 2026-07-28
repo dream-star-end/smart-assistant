@@ -189,6 +189,7 @@ export async function authorizeProxyIdentity(
     {
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
+      deniedModelIds: authz.deniedModelIds,
       modelId: model,
     },
   );

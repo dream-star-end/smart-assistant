@@ -327,6 +327,36 @@ describe("0144 ① grants 写 → security epoch", () => {
     const fresh = await load(BigInt(testUserId!), userEpoch);
     assert.equal(fresh.role, "user", "降权不得继承同一 loader 的 60s admin cache");
   });
+
+  test("users.signal_traffic_class 变化 bump epoch：测试账号 denial 不继承旧缓存", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await query(
+      "UPDATE users SET role='user', signal_traffic_class='production_user' WHERE id=$1::bigint",
+      [testUserId],
+    );
+    const load = makeLoadUserModelAuthz();
+    const productionEpoch = await epochNow();
+    const warm = await load(BigInt(testUserId!), productionEpoch);
+    assert.equal(warm.deniedModelIds?.size, 0);
+
+    await query(
+      "UPDATE users SET signal_traffic_class='synthetic_canary' WHERE id=$1::bigint",
+      [testUserId],
+    );
+    const testEpoch = await epochNow();
+    assert.equal(testEpoch, productionEpoch + 1n);
+    const denied = await load(BigInt(testUserId!), testEpoch);
+    assert.equal(denied.deniedModelIds?.has("deepseek-v4-pro"), true);
+
+    await query(
+      "UPDATE users SET signal_traffic_class='production_user' WHERE id=$1::bigint",
+      [testUserId],
+    );
+    const restoredEpoch = await epochNow();
+    assert.equal(restoredEpoch, testEpoch + 1n);
+    const restored = await load(BigInt(testUserId!), restoredEpoch);
+    assert.equal(restored.deniedModelIds?.size, 0);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

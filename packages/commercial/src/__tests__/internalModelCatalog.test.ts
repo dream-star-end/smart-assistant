@@ -146,6 +146,8 @@ function handler(args: {
   assertFreshFails?: boolean;
   authzFails?: boolean;
   readEpoch?: () => Promise<bigint>;
+  unavailableProviders?: ReadonlySet<string>;
+  availabilityRevision?: string;
 }) {
   const snap = args.snapshot ?? snapshot();
   return makeModelCatalogHandler({
@@ -161,6 +163,10 @@ function handler(args: {
       return args.authz ?? { role: "user", grantedModelIds: new Set<string>() };
     },
     readEpoch: args.readEpoch ?? (async () => snap.securityEpoch),
+    loadRoutingAvailability: async () => ({
+      unavailableProviderIds: args.unavailableProviders ?? new Set<string>(),
+      revision: args.availabilityRevision ?? "availability-1",
+    }),
   });
 }
 
@@ -218,6 +224,43 @@ describe("internalModelCatalog — per-uid 投影下发", () => {
     assert.ok(!body.models.some((m) => m.model_id === "secret-model"));
   });
 
+  test("测试账号 hard deny 只移除 deepseek-v4-pro，其他模型仍可用", async () => {
+    const snap = new ModelCatalogSnapshot({
+      entries: [
+        entry({ entryId: 1, modelId: "glm-5.2" }),
+        entry({ entryId: 2, modelId: "deepseek-v4-pro", providerId: "deepseek" }),
+      ],
+      aliases: new Map(),
+      pricing: new Map([
+        ["glm-5.2", price("glm-5.2", { sortOrder: 1 })],
+        ["deepseek-v4-pro", price("deepseek-v4-pro", { sortOrder: 2 })],
+      ]),
+      securityEpoch: 5n,
+    });
+    const res = makeRes();
+    await handler({
+      snapshot: snap,
+      authz: {
+        role: "user",
+        grantedModelIds: new Set(["deepseek-v4-pro"]),
+        deniedModelIds: new Set(["deepseek-v4-pro"]),
+      },
+    })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    const body = res.body as WireCatalogResponse;
+    assert.deepEqual(body.models.map((m) => m.model_id), ["glm-5.2"]);
+  });
+
+  test("provider 不可用只标 available=false，并带同源 availability revision", async () => {
+    const res = makeRes();
+    await handler({
+      unavailableProviders: new Set(["ark"]),
+      availabilityRevision: "availability-2",
+    })(makeReq({ auth: `Bearer ${TOKEN}` }), res, CTX);
+    const body = res.body as WireCatalogResponse;
+    assert.equal(body.models.find((m) => m.model_id === "glm-5.2")?.available, false);
+    assert.equal(body.availability_revision, "availability-2");
+  });
+
   test("projectionRevision 随 uid 的可见集变化(换 grant → 换 revision)", async () => {
     const res1 = makeRes();
     await handler({})(makeReq({ auth: `Bearer ${TOKEN}` }), res1, CTX);
@@ -254,7 +297,7 @@ describe("internalModelCatalog — epoch 窄端点", () => {
     const res = makeRes();
     await h(makeReq({ auth: `Bearer ${TOKEN}`, url: MODEL_CATALOG_EPOCH_PATH }), res, CTX);
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.body, { epoch: "9" });
+    assert.deepEqual(res.body, { epoch: "9", availability_revision: "availability-1" });
     assert.equal(res.headers[SECURITY_EPOCH_HEADER], "9");
   });
 

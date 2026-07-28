@@ -58,10 +58,14 @@ import type {
 } from "../account-pool/scheduler.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { RateLimitRedis } from "../middleware/rateLimit.js";
-import type { PricingCache, ModelPricing } from "../billing/pricing.js";
+import { PricingCache, type ModelPricing } from "../billing/pricing.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
-import type { Pool } from "pg";
+import {
+  _resetGateForTest,
+  getDegradedProviders,
+} from "../admin/providerHealthGate.js";
+import type { Pool, QueryResult } from "pg";
 
 // ─── 通用构件 ─────────────────────────────────────────────────────────────
 
@@ -110,6 +114,12 @@ const DEEPSEEK_PRICING: ModelPricing = {
   ...FIXED_PRICING,
   model_id: "deepseek-v4-pro",
   display_name: "DeepSeek V4 Pro",
+};
+
+const GLM_PRICING: ModelPricing = {
+  ...FIXED_PRICING,
+  model_id: "glm-5.2",
+  display_name: "GLM 5.2",
 };
 
 /** 一个完整 SSE 流: message_start 带 input usage + message_delta 带 stop_reason + final usage。 */
@@ -454,12 +464,9 @@ function buildFakeScheduler(initialSpec: PickSpec | null = {}, releaseOrder?: st
 }
 
 function buildFakePricing(models: ModelPricing[] = [FIXED_PRICING]): PricingCache {
-  const m = new Map(models.map((p) => [p.model_id, p]));
-  return {
-    get(id: string) {
-      return m.get(id) ?? null;
-    },
-  } as unknown as PricingCache;
+  const pricing = new PricingCache();
+  pricing._setForTests(models);
+  return pricing;
 }
 
 // ─── Mock IncomingMessage / ServerResponse ─────────────────────────────────
@@ -554,11 +561,17 @@ interface HarnessOpts {
   /** 注入 fetch:测试上游响应 */
   fetchImpl?: typeof fetch;
   /** 用户 model authz:默认 user role + 空 grants */
-  authz?: { role: "user" | "admin"; grantedModelIds: ReadonlySet<string> };
+  authz?: {
+    role: "user" | "admin";
+    grantedModelIds: ReadonlySet<string>;
+    deniedModelIds?: ReadonlySet<string>;
+  };
   /** loadUserModelAuthz throw → 模拟 500 路径 */
   authzError?: Error;
   /** deepseekApiKey 注入 */
   deepseekApiKey?: string;
+  /** arkApiKey 注入 */
+  arkApiKey?: string;
   /** 注入 refreshDeps 启用 refresh 路径(为 invariant 1(b) 用)。 */
   refreshHttpPost?: (
     url: string,
@@ -650,7 +663,11 @@ function buildHarness(opts: HarnessOpts = {}) {
   // "post-auth 流量计数只在 verify 成功后 fire,且 authz deny 不回滚"。
   let authzImpl: (
     uid: bigint,
-  ) => Promise<{ role: "user" | "admin"; grantedModelIds: ReadonlySet<string> }> =
+  ) => Promise<{
+    role: "user" | "admin";
+    grantedModelIds: ReadonlySet<string>;
+    deniedModelIds?: ReadonlySet<string>;
+  }> =
     async () => {
       if (opts.authzError) throw opts.authzError;
       return opts.authz ?? {
@@ -682,7 +699,10 @@ function buildHarness(opts: HarnessOpts = {}) {
     refreshDeps,
     logger: testLogger,
     // 静态 provider key:harness 只注入 deepseek(测试只覆盖 deepseek+claude),保持现有 scope。
-    staticProviderKeys: { deepseek: opts.deepseekApiKey },
+    staticProviderKeys: {
+      deepseek: opts.deepseekApiKey,
+      ark: opts.arkApiKey,
+    },
     appendCostCredits: opts.appendCostCreditsImpl
       ?? (async (requestId, userIdArg, costCredits) => {
         appendCostCreditsCalls.push({ requestId, userId: userIdArg, costCredits });
@@ -734,6 +754,7 @@ function buildHarness(opts: HarnessOpts = {}) {
       fn: (uid: bigint) => Promise<{
         role: "user" | "admin";
         grantedModelIds: ReadonlySet<string>;
+        deniedModelIds?: ReadonlySet<string>;
       }>,
     ) {
       authzImpl = fn;
@@ -745,6 +766,7 @@ function buildHarness(opts: HarnessOpts = {}) {
 
 // 每个 test 跑完都重置 module-level pool override(避免泄漏到下个 test)
 afterEach(async () => {
+  _resetGateForTest();
   await resetPool();
 });
 
@@ -762,6 +784,15 @@ function minBody(modelOverride?: string): Record<string, unknown> {
     messages: [{ role: "user", content: "hi" }],
     stream: true,
   };
+}
+
+async function primeProviderGate(rows: Array<Record<string, unknown>>): Promise<void> {
+  _resetGateForTest();
+  await getDegradedProviders(Date.now(), {
+    async query() {
+      return { rows, rowCount: rows.length } as unknown as QueryResult;
+    },
+  });
 }
 
 // ─── 不变量 (1):Release ownership 4 阶段 ─────────────────────────────────
@@ -1093,6 +1124,72 @@ describe("invariant 5 — 模型门关:pricing.enabled=false → 400 UNKNOWN_MOD
     // authz 失败后,后续不应继续到 preCheck / pick
     assert.equal(h.preCheckSpy.reserveCalls.length, 0);
     assert.equal(h.schedulerSpy.pickCalls.length, 0);
+  });
+});
+
+describe("provider unavailable responses — alternatives honor account denials", () => {
+  test("health degraded response does not recommend a test-account denied model", async () => {
+    const previous = process.env.OC_PROVIDER_HEALTH_ENFORCE;
+    process.env.OC_PROVIDER_HEALTH_ENFORCE = "1";
+    try {
+      await primeProviderGate([{
+        provider_id: "ark",
+        health_status: "degraded",
+        health_mode: "auto",
+        degraded_since: new Date(Date.now() - 60_000),
+        degrade_reason: "probe",
+        quota_retry_at: null,
+        quota_probe_lease_until: null,
+      }]);
+      const h = buildHarness({
+        pricings: [GLM_PRICING, DEEPSEEK_PRICING],
+        authz: {
+          role: "user",
+          grantedModelIds: new Set<string>(),
+          deniedModelIds: new Set(["deepseek-v4-pro"]),
+        },
+      });
+
+      const res = await h.run(minBody("glm-5.2"));
+      const error = (res.bodyJson() as {
+        error: { code: string; alternatives: string[] };
+      }).error;
+      assert.equal(res.statusCode, 503);
+      assert.equal(error.code, "PROVIDER_DEGRADED");
+      assert.deepEqual(error.alternatives, []);
+    } finally {
+      if (previous === undefined) delete process.env.OC_PROVIDER_HEALTH_ENFORCE;
+      else process.env.OC_PROVIDER_HEALTH_ENFORCE = previous;
+    }
+  });
+
+  test("quota exhausted response does not recommend a test-account denied model", async () => {
+    await primeProviderGate([{
+      provider_id: "ark",
+      health_status: "healthy",
+      health_mode: "auto",
+      degraded_since: null,
+      degrade_reason: null,
+      quota_retry_at: new Date(Date.now() + 60_000),
+      quota_probe_lease_until: null,
+    }]);
+    const h = buildHarness({
+      pricings: [GLM_PRICING, DEEPSEEK_PRICING],
+      arkApiKey: "ark-test-key",
+      authz: {
+        role: "user",
+        grantedModelIds: new Set<string>(),
+        deniedModelIds: new Set(["deepseek-v4-pro"]),
+      },
+    });
+
+    const res = await h.run(minBody("glm-5.2"));
+    const error = (res.bodyJson() as {
+      error: { code: string; alternatives: string[] };
+    }).error;
+    assert.equal(res.statusCode, 400);
+    assert.equal(error.code, "PROVIDER_QUOTA_EXHAUSTED");
+    assert.deepEqual(error.alternatives, []);
   });
 });
 
