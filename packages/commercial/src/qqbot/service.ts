@@ -14,13 +14,11 @@ import type {
   InboundEvent,
 } from '../wechat/inboundDispatcher.js'
 import type { QqBotConfig } from './config.js'
-import type {
-  QqInboundAttachment,
-  SaveQqMediaResult,
-} from './mediaIngest.js'
+import type { QqInboundAttachment, SaveQqMediaResult } from './mediaIngest.js'
 import {
-  qqMediaFileType,
   type ResolveQqOutboundMediaPartFn,
+  qqMediaFileType,
+  qqUnsupportedMediaFormat,
 } from './outboundMedia.js'
 import { type QqOutboxWorker, startQqOutboxWorker } from './outbox.js'
 import {
@@ -37,10 +35,12 @@ const QQ_CONTEXT_HINT = [
   '',
   '---',
   '【OpenClaude QQ 通道系统提示】',
-  '当前这一轮用户正在 QQ 私聊里与你对话；平台会把最终文字回复完整分片发回 QQ。',
+  '当前这一轮用户正在 QQ 私聊里与你对话；平台会把最终回复完整发回 QQ。',
   '完整执行过程也会持久化到同一个 OpenClaude 网页会话中。',
   '用户通过 QQ 发送的图片、语音和附件会保存到当前容器本地，路径会随消息一起提供。',
-  '如果结果包含新生成的文件，请说明用户可在网页会话中查看和下载。',
+  '如果需要发送文件、图片、视频、语音或附件，请先把资源创建或复制到 `/home/agent/.openclaude/generated/<安全文件名.ext>`；也可以复用 `/home/agent/.openclaude/uploads/<安全文件名.ext>`。',
+  '最终回复里必须单独写出这个绝对路径；QQ 网关会自动把路径转换成真实媒体或附件发送，不能只让用户去网页查看。',
+  '安全文件名使用 `[A-Za-z0-9._@+=,-]{1,180}`，不要使用子目录。图片、视频和 wav/mp3/silk 会按原生媒体发送，其他安全扩展名按普通附件发送。',
 ].join('\n')
 
 export const QQ_GROUP_AND_C2C_INTENTS = 1 << 25
@@ -292,12 +292,19 @@ export function makeQqBotService(args: {
           await instance.sendText({ scope: 'c2c', targetId: openid }, text)
         },
         sendMedia: async (openid, media) => {
-          await instance.sendMedia({
-            target: { scope: 'c2c', targetId: openid },
-            fileType: qqMediaFileType(media.kind),
-            buffer: media.content,
-            fileName: media.filename,
-          })
+          try {
+            await instance.sendMedia({
+              target: { scope: 'c2c', targetId: openid },
+              fileType: qqMediaFileType(media.kind),
+              buffer: media.content,
+              fileName: media.filename,
+            })
+          } catch (err) {
+            if (err instanceof Error && err.message.includes('富媒体文件格式不支持')) {
+              throw qqUnsupportedMediaFormat(media.filename)
+            }
+            throw err
+          }
         },
         resolveMediaPart: args.resolveOutboundMedia,
         onError: (message, meta) => log.error(message, meta),
@@ -370,10 +377,7 @@ export function makeQqBotService(args: {
     retryTimer.unref?.()
   }
 
-  async function restartGeneration(
-    generation: QqBotGeneration,
-    reason: string,
-  ): Promise<void> {
+  async function restartGeneration(generation: QqBotGeneration, reason: string): Promise<void> {
     if (!desiredRunning || active !== generation) return
     active = null
     log.warn('gateway_restarting', { reason })
@@ -578,12 +582,7 @@ async function handleMessage(
   }
   const evt = buildInboundEvent(binding.userId, openid, inboundText, message)
   if (!inboundText) {
-    await safeReply(
-      bot,
-      message.replyTarget,
-      '请输入要发送的文字。',
-      log,
-    )
+    await safeReply(bot, message.replyTarget, '请输入要发送的文字。', log)
     return
   }
   const outcome = await dispatcher.dispatch(evt)

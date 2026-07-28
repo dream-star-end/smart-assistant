@@ -1,16 +1,17 @@
-import {
-  MediaFileType,
-  getMaxUploadSize,
-} from '@tencent-connect/qqbot-nodejs'
+import { basename } from 'node:path'
+import { MediaFileType, getMaxUploadSize } from '@tencent-connect/qqbot-nodejs'
 
 import {
-  makeWechatOutboundMediaResolver,
   type OutboundMediaResolverDeps,
   type ResolvedWechatOutboundMedia,
+  classifyWechatMediaFilename,
+  makeWechatOutboundMediaResolver,
 } from '../wechat/outboundMedia.js'
 import type { IlinkMediaPart } from '../wechat/types.js'
 
 const QQ_NATIVE_VOICE_EXTENSIONS = new Set(['wav', 'mp3', 'silk'])
+const QQ_CONTAINER_MEDIA_RE =
+  /(?:`)?(\/home\/agent\/\.openclaude\/(?:uploads|generated)\/([^\s`"'<>/\\]{1,260}\.[A-Za-z0-9]+))(?:`)?(?=$|[\s`"'<>，。！？、；：,.!?;:)）\]}】])/gu
 
 export type QqOutboundMediaPart = IlinkMediaPart
 export type ResolvedQqOutboundMedia = ResolvedWechatOutboundMedia
@@ -23,6 +24,53 @@ export class QqOutboundMediaTooLargeError extends Error {
   constructor(readonly userMessage: string) {
     super(userMessage)
     this.name = 'QqOutboundMediaTooLargeError'
+  }
+}
+
+export class QqOutboundMediaFormatError extends Error {
+  constructor(readonly userMessage: string) {
+    super(userMessage)
+    this.name = 'QqOutboundMediaFormatError'
+  }
+}
+
+export function qqUnsupportedMediaFormat(filename: string): QqOutboundMediaFormatError {
+  return new QqOutboundMediaFormatError(
+    `QQ 不支持“${filename}”的当前媒体格式，请在 OpenClaude 网页会话中下载。`,
+  )
+}
+
+export function expandTextWithQqMediaParts(text: string): {
+  text: string
+  media: QqOutboundMediaPart[]
+} {
+  const media: QqOutboundMediaPart[] = []
+  let out = ''
+  let last = 0
+  for (const match of text.matchAll(QQ_CONTAINER_MEDIA_RE)) {
+    const raw = match[0] ?? ''
+    const containerPath = match[1] ?? ''
+    const filename = basename(match[2] ?? '')
+    const start = match.index ?? 0
+    out += text.slice(last, start)
+    last = start + raw.length
+    if (!isSafeQqMediaBasename(filename)) {
+      out += raw
+      continue
+    }
+    const classified = classifyWechatMediaFilename(filename)
+    const type = normalizeQqMediaKind(classified?.kind ?? 'file', filename)
+    media.push({
+      type,
+      containerPath,
+      filename,
+      mimeType: classified?.mimeType ?? 'application/octet-stream',
+    })
+  }
+  out += text.slice(last)
+  return {
+    text: compactTextAfterMediaRemoval(out),
+    media,
   }
 }
 
@@ -92,4 +140,25 @@ function qqMediaLabel(kind: QqOutboundMediaPart['type']): string {
     case 'file':
       return '文件'
   }
+}
+
+function isSafeQqMediaBasename(filename: string): boolean {
+  if (filename === '.' || filename === '..' || filename.includes('/') || filename.includes('\\')) {
+    return false
+  }
+  const points = Array.from(filename)
+  return (
+    points.length <= 180 &&
+    points.every((char) => {
+      const code = char.codePointAt(0) ?? 0
+      return code > 31 && code !== 127
+    })
+  )
+}
+
+function compactTextAfterMediaRemoval(text: string): string {
+  return text
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
