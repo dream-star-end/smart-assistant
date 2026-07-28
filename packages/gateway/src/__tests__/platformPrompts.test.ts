@@ -283,7 +283,31 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     }
     assert.ok(prompt.includes('即使未开启团队模式'))
     assert.ok(prompt.includes('按收益机会式委派'))
+    // 这里只固化静态 prompt 契约;是否真的并行、质量和资源是否达标由
+    // evals/v5-parallel-delegation 的双底座真 turn A/B 门验证。
+    for (const rule of [
+      '能拆成 2–4 个输入和产物互不重叠的 shard',
+      '当前通常最多 3',
+      '各有验收条件的模块',
+      '不要改用后台 Bash 假并行',
+      '共享文件/最终产物只设一个写入者',
+      '不要继续委派子 Agent',
+      '不要再启动大量后台 Bash fan-out',
+      '不要启用或改用底座原生多 Agent 功能',
+      '只重试缺失或失败的 shard',
+      '已是被委派的子 Agent',
+    ]) {
+      assert.ok(prompt.includes(rule), `普通模式提示缺受控并行契约: ${rule}`)
+    }
+    const evalRule = readFileSync(
+      join(process.cwd(), 'evals/v5-parallel-delegation/candidate-rule.md'),
+      'utf8',
+    ).trim()
+    assert.ok(prompt.includes(evalRule), '行为 A/B 注入的候选规则必须与正式 platform prompt 逐字一致')
+    assert.match(prompt, /简单任务[\s\S]*保持单 Agent[\s\S]*不妨碍为质量进行一次专业委派/)
+    assert.match(prompt, /步骤紧密依赖[\s\S]*保持单 Agent/)
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
+    assert.ok(!prompt.includes('multi_agent_v2'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })
   it('选择题使用运行时专用 Ask 工具，不再把 options 富块当交互入口', () => {

@@ -52,7 +52,7 @@
     "check:v5:e2e-selectors": "tsx scripts/check-v5-e2e-selectors.ts",
     "tutorials:accept": "tsx scripts/check-v5-tutorials.ts accept",
     "tutorials:media": "tsx scripts/generate-v5-tutorial-media.ts",
-    "test:evals": "npx tsx --test --test-force-exit evals/run.test.ts",
+    "test:evals": "npx tsx --test --test-force-exit evals/run.test.ts evals/v5-parallel-delegation/*.test.mjs",
     "test": "npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:storage && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
     "typecheck": "tsc --build && npm run typecheck --workspace packages/web-react",
