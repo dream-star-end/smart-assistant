@@ -401,6 +401,8 @@ if (RULE_INJECTION === "none") {
     "isolated_report_sha256",
     "baseline_run_set_sha256",
     "isolated_run_set_sha256",
+    "replicate_report_sha256",
+    "replicate_run_set_sha256",
   ]) {
     if (!/^[0-9a-f]{64}$/.test(production[field] ?? "")) {
       throw new Error(`production manifest ${field} is not frozen`);

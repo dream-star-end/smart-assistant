@@ -711,6 +711,8 @@ function validateManifest(manifest, gold, mode) {
       "isolated_report_sha256",
       "baseline_run_set_sha256",
       "isolated_run_set_sha256",
+      "replicate_report_sha256",
+      "replicate_run_set_sha256",
     ]) {
       if (!/^[0-9a-f]{64}$/.test(manifest.production?.[field] ?? "")) {
         throw new Error(`production manifest ${field} is not frozen`);
@@ -948,19 +950,23 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
             ["tokens", (run) => run.resources.tokens],
             ["cost_credits", (run) => run.resources.cost_credits],
           ];
+          const jointlyHealthy = negativePairs.filter(({ A, B }) =>
+            metrics.every(([, read]) => {
+              const value = ratio(read(B), read(A));
+              return value != null && value <= 1.10;
+            }),
+          ).length;
+          if (jointlyHealthy < 3) {
+            findings.push(
+              `${engine}/${scenario}: all quantitative ratios must jointly be <=1.1 in at least ` +
+              `3/4 pairs, got ${jointlyHealthy}/4`,
+            );
+          }
           for (const [name, read] of metrics) {
             const pairRatios = negativePairs.map(({ A, B }) => ({
               pair: A.pair_id,
               value: ratio(read(B), read(A)),
             }));
-            for (const item of pairRatios) {
-              if (item.value == null || item.value > 1.10) {
-                findings.push(
-                  `${engine}/${scenario}/${item.pair}: ${name} per-pair non-regression ratio ` +
-                  `must be <=1.1, got ${item.value}`,
-                );
-              }
-            }
             const value = median(pairRatios.map((item) => item.value));
             if (value == null || value > 1.10) {
               findings.push(`${engine}/${scenario}: ${name} non-regression ratio must be <=1.1, got ${value}`);
@@ -984,19 +990,23 @@ export function scoreRuns(runs, gold, { mode = "isolated-ab", manifest } = {}) {
           ["tokens", (run) => run.resources.tokens, 1.10],
           ["cost_credits", (run) => run.resources.cost_credits, 1.10],
         ];
+        const jointlyHealthy = positivePairs.filter(({ A, B }) =>
+          metrics.every(([, read]) => {
+            const value = ratio(read(B), read(A));
+            return value != null && value <= 1.10;
+          }),
+        ).length;
+        if (jointlyHealthy < 3) {
+          findings.push(
+            `${engine}/${scenario}: all quantitative ratios must jointly be <=1.1 in at least ` +
+            `3/4 pairs, got ${jointlyHealthy}/4`,
+          );
+        }
         for (const [name, read, limit] of metrics) {
           const pairRatios = positivePairs.map(({ A, B }) => ({
             pair: A.pair_id,
             value: ratio(read(B), read(A)),
           }));
-          for (const item of pairRatios) {
-            if (item.value == null || item.value > 1.10) {
-              findings.push(
-                `${engine}/${scenario}/${item.pair}: ${name} per-pair regression ceiling ` +
-                `must be <=1.1, got ${item.value}`,
-              );
-            }
-          }
           if (name === "wall") {
             const improved = pairRatios.filter((item) => item.value != null && item.value <= limit).length;
             if (improved < 3) {

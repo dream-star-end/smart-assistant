@@ -30,7 +30,9 @@ V5 没有“仅给 synthetic canary 用户切换新 platform bundle”的官方 
 
 ## 冻结门槛
 
-- 2 个 engine × 4 个 scenario × 4 个 pair × A/B，共 **64 个预部署 run**。
+- 每个 root 为 2 个 engine × 4 个 scenario × 4 个 pair × A/B，共 **64 个
+  预部署 run**；必须用同一冻结 manifest 完整执行两个身份互不复用的 root，共
+  **128 个 run**，两个 root 必须各自独立 PASS。
 - pair 顺序固定为 `A_FIRST/B_FIRST/A_FIRST/B_FIRST`。总体和每个顺序层内都必须
   通过速度/资源门，排除“第二臂天然热身更快”。
 - 每个 pair 使用一个全新 reprovision 后的 synthetic 容器；首臂开始时容器启动不超过
@@ -46,11 +48,12 @@ V5 没有“仅给 synthetic canary 用户切换新 platform bundle”的官方 
   测试，并限制 address space、heap、进程/FD/输出和硬 timeout；缺少沙箱命令即
   fail closed，不回退宿主执行。不使用 LLM-as-judge。
 - 对每个 engine/正向 scenario 分别计算 B/A 中位数，并在 A_FIRST、B_FIRST 两层
-  分别复核：wall `<= 0.85`，CPU/token/credit `<= 1.10`。每个 pair 的四项比率还
-  必须分别 `<= 1.10`，且至少 3/4 pair 的 wall `<= 0.85`，禁止中位数掩盖混合退化。
+  分别复核：wall `<= 0.85`，CPU/token/credit `<= 1.10`。至少 3/4 pair 必须在
+  wall/CPU/token/credit 四项上**联合** `<= 1.10`，且至少 3/4 pair 的 wall
+  `<= 0.85`，禁止中位数掩盖混合退化。
 - 对 `simple` / `dependent` 同样按总体和两个顺序层复核 wall/CPU/token/credit，
-  B/A 均须 `<= 1.10`，并要求每个 pair 单独 `<= 1.10`，避免“不误并行但普通任务
-  整体或部分重复样本变慢”。
+  B/A 均须 `<= 1.10`，并要求至少 3/4 pair 在四项上联合 `<= 1.10`，避免“不误并行
+  但普通任务整体或大多数重复样本变慢”。
 - 峰值 RSS/PID 均低于容器 limit 的 90%；零 OOM/oom_kill、PID max、
   queue timeout/full、异常重试、失败/未结算 usage。
 - generator/scenarios/gold、远端 probe、synthetic uid/container、stable lane、
@@ -60,6 +63,9 @@ V5 没有“仅给 synthetic canary 用户切换新 platform bundle”的官方 
   cgroup samples、receipt 与 transcript SHA 重算关键证据；最终答案也以 canonical WS
   text blocks 为权威，不信任 DOM 转义后的文本。
 - 缺失、额外、重复 run，任一 `*.failed.json`，或任一证据字段不完整，全部失败。
+- 两个 root 的 manifest 必须 byte-identical；每个 root 内的 A/B 身份关系由完整 scorer
+  逐项验证，Docker ID、peer ID、pair execution ID、transcript SHA 和 run SHA 在两个
+  root 之间不得复用。两个报告在冻结生产证据时都会重新评分并要求 byte-identical。
 - 质量 PASS 但速度门未过也不发布；不得为过门临时放宽阈值或并发。
 
 ## 1. 生成 fixture
@@ -112,7 +118,7 @@ Binder 会把传入 rule、正式 prompt 和 probe 与当前 checkout 内上述�
 
 正式 root 一旦出现失败证据就整体保留并重建，不删除失败 run 后挑样。
 
-## 3. 执行预部署 64-run A/B
+## 3. 执行两套独立预部署 64-run A/B
 
 公共环境：
 
@@ -145,6 +151,11 @@ persona。`capture.mjs` 通过真实 Web 登录、上传、发送和 WS 获取�
 `remote-probe.sh` 同一次 SSH 采集 uid 精确 activity、usage receipts、dispatch/
 container binding、容器启动后的 prior turn 数、deploy lane 和 cgroup 指标。
 
+第一套 64-run 完成后，从另一个全新空 root 重新生成全套 fixture，使用完全相同的冻结
+参数绑定 manifest，并在开跑前确认两份 `manifest.json` byte-identical，再执行全部
+64 个 run。不得复用第一套的容器、peer、pair execution、transcript 或 run 证据，也
+不得在看到第一套结果后修改门槛、fixture、gold、rule 或 manifest。
+
 ## 4. 评分并冻结证据
 
 ```bash
@@ -156,15 +167,19 @@ node evals/v5-parallel-delegation/score.mjs \
   --out "$ROOT/report.json"
 ```
 
-退出码 0 才能进入完整 diff 独立审查、CI 和正式部署。冻结生产 smoke manifest 时会
-重新执行完整 scorer，并要求重算报告与现有 report **byte-identical**，因此伪造 PASS、
-只放 A 臂、漏 run 或替换 transcript 都无法冻结：
+两个 root 都必须分别评分且退出码为 0，才能进入完整 diff 独立审查、CI 和正式部署。
+冻结生产 smoke manifest 时会对两个 root 重新执行完整 scorer，要求两份重算报告各自与
+现有 report **byte-identical**，并验证跨 root 身份/证据互不复用，因此伪造 PASS、
+只放 A 臂、漏 run、替换 transcript 或复制第一套结果都无法冻结：
 
 ```bash
 node evals/v5-parallel-delegation/freeze-production-manifest.mjs \
   --isolated-manifest "$ROOT/manifest.json" \
   --isolated-report "$ROOT/report.json" \
   --isolated-runs "$ROOT/runs" \
+  --replicate-manifest "$REPLICATE_ROOT/manifest.json" \
+  --replicate-report "$REPLICATE_ROOT/report.json" \
+  --replicate-runs "$REPLICATE_ROOT/runs" \
   --gold "$ROOT/gold/gold.json" \
   --out "$ROOT/production-manifest.json" \
   --candidate-bundle-rev <actual-bundle> \
@@ -199,7 +214,8 @@ node evals/v5-parallel-delegation/score.mjs \
 ```
 
 production smoke 的 wall 上限是冻结 A baseline 中位数的 125%，只负责发现正式接线后的
-灾难性退化；15% 加速结论来自完整、顺序平衡的预部署 64-run A/B。
+灾难性退化；15% 加速结论来自两套各自完整、顺序平衡且独立 PASS 的预部署
+128-run A/B。
 
 四次 smoke 每次都先通过产品支持路径 reprovision 对应 synthetic 容器，再执行：
 

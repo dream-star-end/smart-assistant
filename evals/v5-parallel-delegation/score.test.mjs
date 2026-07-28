@@ -197,6 +197,8 @@ const manifest = {
     isolated_report_sha256: "2".repeat(64),
     baseline_run_set_sha256: "3".repeat(64),
     isolated_run_set_sha256: "4".repeat(64),
+    replicate_report_sha256: "5".repeat(64),
+    replicate_run_set_sha256: "6".repeat(64),
     lane: {
       phase: "stable",
       generation: "71",
@@ -543,12 +545,52 @@ describe("v5 parallel delegation release scorer", () => {
     assert.equal(report.passed, false);
     assert.ok(
       report.findings.some((finding) =>
-        finding.includes("code_batch/02") && finding.includes("per-pair regression ceiling"),
+        finding.includes("ccb/code_batch") && finding.includes("jointly be <=1.1"),
       ),
     );
     assert.ok(
       report.findings.some((finding) =>
-        finding.includes("simple/02") && finding.includes("per-pair non-regression ratio"),
+        finding.includes("ccb/simple") && finding.includes("jointly be <=1.1"),
+      ),
+    );
+  });
+
+  it("requires three pairs to jointly pass every quantitative metric", () => {
+    const runs = passingRuns();
+    const fields = [
+      ["01", "wall_ms"],
+      ["02", "cpu_seconds"],
+      ["03", "tokens"],
+      ["04", "cost_credits"],
+    ];
+    for (const [pairId, field] of fields) {
+      const run = runs.find(
+        (item) =>
+          item.engine === "ccb" &&
+          item.scenario === "simple" &&
+          item.pair_id === pairId &&
+          item.arm === "B",
+      );
+      if (field === "wall_ms") {
+        run.wall_ms = 1200;
+        run.finished_at = new Date(Date.parse(run.started_at) + run.wall_ms).toISOString();
+      } else if (field === "cpu_seconds") {
+        run.resources.cpu_seconds = 120;
+      } else if (field === "tokens") {
+        run.resources.tokens = 1200;
+        run.resources.usage.tokens = 1200;
+        run.resources.usage.receipts[0].tokens += 150;
+      } else {
+        run.resources.cost_credits = 1.2;
+        run.resources.usage.cost_credits = 1.2;
+        run.resources.usage.receipts[0].cost_credits += 0.15;
+      }
+    }
+    const report = scoreRuns(runs, gold, { manifest });
+    assert.equal(report.passed, false);
+    assert.ok(
+      report.findings.some((finding) =>
+        finding.includes("ccb/simple") && finding.includes("jointly be <=1.1"),
       ),
     );
   });
