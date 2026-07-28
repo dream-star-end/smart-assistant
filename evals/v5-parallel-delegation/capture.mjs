@@ -13,6 +13,13 @@ import { promisify } from "node:util";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveBrowserExecutable } from "../../scripts/lib/resolve-browser.mjs";
+import {
+  authorizedFetch,
+  ensureAuthSession,
+  loadAuthSession,
+  loginAuthSession,
+  updateAuthSessionFromBrowserCookies,
+} from "./auth-session.mjs";
 import { analyzeFrames } from "./frame-analysis.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -27,7 +34,8 @@ const required = (name) => {
 
 const BASE = required("V5_EVAL_BASE").replace(/\/$/, "");
 const EMAIL = required("V5_EVAL_EMAIL");
-const PASSWORD_FILE = required("V5_EVAL_PASSWORD_FILE");
+const AUTH_SESSION_FILE = process.env.V5_EVAL_AUTH_SESSION_FILE?.trim() || null;
+const PASSWORD_FILE = AUTH_SESSION_FILE ? null : required("V5_EVAL_PASSWORD_FILE");
 const FIXTURES = resolve(required("V5_EVAL_FIXTURES"));
 const SCENARIO = required("V5_EVAL_SCENARIO");
 const ARM = required("V5_EVAL_ARM");
@@ -317,8 +325,16 @@ async function readPromptRev() {
 }
 
 let cleanupBrowser = null;
+let cleanupContext = null;
 let cleanupSampler = null;
 let stopSampling = null;
+async function persistBrowserRefreshCookie() {
+  if (!AUTH_SESSION_FILE || !cleanupContext) return;
+  updateAuthSessionFromBrowserCookies(
+    AUTH_SESSION_FILE,
+    await cleanupContext.cookies(),
+  );
+}
 const attemptStartedAt = Date.now();
 try {
 const actualProbeRev = (await remote(`sha256sum ${shellQuote(PROBE_PATH)}`)).split(/\s+/, 1)[0];
@@ -421,31 +437,33 @@ if (RULE_INJECTION === "none") {
 const beforeSample = await readSample();
 const beforeResource = beforeSample.resource;
 
-const password = readFileSync(PASSWORD_FILE, "utf8").trim();
-const login = await fetch(`${BASE}/api/auth/login`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ email: EMAIL, password, turnstile_token: "x" }),
-});
-if (!login.ok) throw new Error(`login failed ${login.status}: ${(await login.text()).slice(0, 300)}`);
-const loginBody = await login.json();
-const token = loginBody.access_token;
-const setCookies = login.headers.getSetCookie?.() ?? [login.headers.get("set-cookie")].filter(Boolean);
-const refresh = setCookies.map((cookie) => /(?:^|;\s*)oc_rt=([^;]+)/.exec(cookie)?.[1]).find(Boolean);
-if (!token || !refresh) throw new Error("login response missing access token or refresh cookie");
+let authSession;
+if (AUTH_SESSION_FILE) {
+  authSession = await ensureAuthSession(BASE, AUTH_SESSION_FILE);
+} else {
+  const password = readFileSync(PASSWORD_FILE, "utf8").trim();
+  authSession = await loginAuthSession(BASE, EMAIL, password);
+}
 
 const peerId = `eval${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
-const put = await fetch(`${BASE}/api/sessions/${peerId}`, {
+const putInit = {
   method: "PUT",
-  headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+  headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     agentId: "main",
     title: `parallel eval ${SCENARIO} ${ARM}`,
     modelId: MODEL,
     messages: [],
   }),
-});
+};
+const put = AUTH_SESSION_FILE
+  ? await authorizedFetch(BASE, AUTH_SESSION_FILE, `${BASE}/api/sessions/${peerId}`, putInit)
+  : await fetch(`${BASE}/api/sessions/${peerId}`, {
+    ...putInit,
+    headers: { ...putInit.headers, Authorization: `Bearer ${authSession.access_token}` },
+  });
 if (!put.ok) throw new Error(`session PUT failed ${put.status}: ${(await put.text()).slice(0, 300)}`);
+if (AUTH_SESSION_FILE) authSession = loadAuthSession(AUTH_SESSION_FILE);
 
 const browser = await chromium.launch({
   executablePath: resolveBrowserExecutable(),
@@ -453,9 +471,10 @@ const browser = await chromium.launch({
 });
 cleanupBrowser = browser;
 const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+cleanupContext = context;
 await context.addCookies([{
   name: "oc_rt",
-  value: refresh,
+  value: authSession.refresh_cookie,
   domain: new URL(BASE).hostname,
   path: "/api/auth",
   httpOnly: true,
@@ -606,7 +625,10 @@ if (JSON.stringify(laneIdentity(afterLane)) !== JSON.stringify(laneIdentity(befo
   analysisResourceFailure("deployment lane changed during run");
 }
 if (afterActivity.parents !== 0) exclusiveTurn = false;
+await persistBrowserRefreshCookie();
 await browser.close();
+cleanupBrowser = null;
+cleanupContext = null;
 
 if (afterResource.cpu_usec < beforeResource.cpu_usec) {
   analysisResourceFailure("container restarted or cgroup CPU counter reset during run");
@@ -778,6 +800,9 @@ console.log(OUTPUT);
   stopSampling?.();
   try {
     await cleanupSampler;
+  } catch {}
+  try {
+    await persistBrowserRefreshCookie();
   } catch {}
   try {
     await cleanupBrowser?.close();

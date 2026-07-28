@@ -67,19 +67,50 @@ mkdir -p -- "$V5_EVAL_RUNS_DIR"
 candidate_active=0
 restore_candidate() {
   if [[ $candidate_active -eq 1 ]]; then
-    node "$HERE/persona-variant.mjs" restore \
+    if ! node "$HERE/persona-variant.mjs" restore \
       --base "$V5_EVAL_PERSONA_BASE_FILE" \
-      --rule "$V5_EVAL_RULE_FILE"
+      --rule "$V5_EVAL_RULE_FILE"; then
+      return 1
+    fi
     candidate_active=0
   fi
 }
-trap restore_candidate EXIT
+
+cleanup_auth_session() {
+  if [[ -z "${V5_EVAL_AUTH_SESSION_FILE:-}" ]]; then
+    return 0
+  fi
+  node "$HERE/auth-session.mjs" logout \
+    --base "$V5_EVAL_BASE" \
+    --file "$V5_EVAL_AUTH_SESSION_FILE" >/dev/null 2>&1 || true
+  node "$HERE/auth-session.mjs" cleanup \
+    --file "$V5_EVAL_AUTH_SESSION_FILE"
+}
+
+cleanup_pair() {
+  local status=$?
+  local restore_status=0
+  local auth_status=0
+  set +e
+  restore_candidate
+  restore_status=$?
+  cleanup_auth_session
+  auth_status=$?
+  trap - EXIT
+  if [[ $status -eq 0 && $restore_status -ne 0 ]]; then
+    status=$restore_status
+  elif [[ $status -eq 0 && $auth_status -ne 0 ]]; then
+    status=$auth_status
+  fi
+  exit "$status"
+}
+trap cleanup_pair EXIT
 
 apply_candidate() {
+  candidate_active=1
   node "$HERE/persona-variant.mjs" apply \
     --base "$V5_EVAL_PERSONA_BASE_FILE" \
     --rule "$V5_EVAL_RULE_FILE"
-  candidate_active=1
 }
 
 run_arm() {
@@ -112,6 +143,3 @@ else
   restore_candidate
   run_arm A 2
 fi
-
-trap - EXIT
-restore_candidate

@@ -62,6 +62,11 @@ V5 没有“仅给 synthetic canary 用户切换新 platform bundle”的官方 
 - root/child token 与费用来自精确 usage receipt；capture 和 scorer 都从原始 frames、
   cgroup samples、receipt 与 transcript SHA 重算关键证据；最终答案也以 canonical WS
   text blocks 为权威，不信任 DOM 转义后的文本。
+- 每个 pair 的受支持 reprovision 登录只执行一次，并把 access expiry 与最新 `oc_rt`
+  放进该 pair 独占的 0700 临时目录/0600 session 文件。A/B capture 和 persona 切换
+  串行复用该 session；access 临期或 401 时正常 refresh，浏览器轮换后的最新 cookie
+  必须回写。pair 结束先 logout 撤销 refresh token，再无条件删除临时目录。不得通过
+  放宽生产登录限流或清 Redis 来运行评测。
 - 缺失、额外、重复 run，任一 `*.failed.json`，或任一证据字段不完整，全部失败。
 - 两个 root 的 manifest 必须 byte-identical；每个 root 内的 A/B 身份关系由完整 scorer
   逐项验证，Docker ID、peer ID、pair execution ID、transcript SHA 和 run SHA 在两个
@@ -134,20 +139,27 @@ export V5_EVAL_RULE_FILE="$PWD/evals/v5-parallel-delegation/candidate-rule.md"
 ```
 
 每次运行 pair 前必须通过产品支持的容器回收/reprovision 路径得到新 Docker ID，再为
-对应 engine 设置账号、密码和 base persona：
+对应 engine 设置账号、密码和 base persona。reprovision 的唯一一次登录还必须原子写入
+本 pair 的 auth session；目录必须由 `mktemp -d /tmp/v5-parallel-auth.XXXXXX` 创建，
+且不得与其他 pair/engine 共用：
 
 ```bash
 export V5_EVAL_ENGINE=ccb                 # 或 codex
 export V5_EVAL_EMAIL=<synthetic-email>
 export V5_EVAL_PASSWORD_FILE=<password-file>
 export V5_EVAL_PERSONA_BASE_FILE=/secure/path/base-persona.txt
+AUTH_DIR=$(mktemp -d /tmp/v5-parallel-auth.XXXXXX)
+chmod 0700 "$AUTH_DIR"
+export V5_EVAL_AUTH_SESSION_FILE="$AUTH_DIR/session.json"
 export V5_EVAL_SCENARIO=code_batch        # 四个 scenario 逐一执行
 export V5_EVAL_PAIR_ID=01                 # 01..04
+# 产品支持的 reprovision helper 在此执行唯一一次登录并写入 session.json。
 evals/v5-parallel-delegation/run-pair.sh
 ```
 
 `run-pair.sh` 按 manifest 顺序切 system-slot persona、连续跑两臂，并用 trap 恢复原
-persona。`capture.mjs` 通过真实 Web 登录、上传、发送和 WS 获取最终结果；远端
+persona、logout 并删除 auth session。`capture.mjs` 通过真实 Web session 上传、发送和
+WS 获取最终结果；远端
 `remote-probe.sh` 同一次 SSH 采集 uid 精确 activity、usage receipts、dispatch/
 container binding、容器启动后的 prior turn 数、deploy lane 和 cgroup 指标。
 
