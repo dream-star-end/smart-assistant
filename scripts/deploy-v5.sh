@@ -5983,7 +5983,8 @@ smoke_e2e_journey() { # [port]
     return 1
   fi
   echo "── smoke:E2E 旅程门(真浏览器·登录/附件/目标/发送,remote port=$port)──"
-  if ! V5_E2E_REMOTE_PORT="$port" timeout 240 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
+  # 外层只作最终失控保护；脚本内 J1-J4 总预算 240s、J5 独立 180s，另留 30s 清理余量。
+  if ! V5_E2E_REMOTE_PORT="$port" timeout 450 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"; then
     echo "✗✗ E2E 旅程门失败:用户可感知路径疑似回归(登录/附件/目标/发送其一)。" >&2
     echo "   核查失败截图(/tmp/e2e-journey-fail-*.png);本门已进补偿链,调用方会走对称回滚/abort。" >&2
     echo "   确认假阳性则修 journey 脚本断言并登记;紧急放行用 V5_SMOKE_E2E=0(会登记 durable debt)。" >&2

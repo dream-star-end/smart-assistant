@@ -6387,6 +6387,7 @@ wait $!
 
   test('E2E journey gate is part of the shared minimum functional core and fails loud', async () => {
     const source = await readFile(deploy, 'utf8')
+    const journeySource = await readFile(e2eJourney, 'utf8')
     // 函数本体契约。
     const fnStart = source.indexOf('\nsmoke_e2e_journey() { # [port]')
     assert.ok(fnStart >= 0, 'smoke_e2e_journey 函数缺失或未参数化目标端口')
@@ -6403,6 +6404,35 @@ wait $!
     assert.match(fn, /\[dry-run\]/, '缺 dry-run 分支')
     assert.match(fn, /v5-e2e-journey-canary\.mjs/, '未调用旅程脚本')
     assert.match(fn, /V5_E2E_REMOTE_PORT="\$port"/, '旅程必须打调用方指定的端口(candidate lane 切流前跑)')
+    const preJ5Timeout = /const PRE_J5_TIMEOUT = ([\d_]+);/.exec(journeySource)
+    const j5Timeout = /const TURN_WAIT_TIMEOUT = ([\d_]+);/.exec(journeySource)
+    const outerTimeout = /timeout (\d+) node "\$SCRIPT_DIR\/v5-e2e-journey-canary\.mjs"/.exec(fn)
+    assert.ok(preJ5Timeout, 'J1-J4 必须保留有限总防挂预算')
+    assert.ok(j5Timeout, 'J5 必须保留有限等待上限')
+    assert.ok(outerTimeout, 'journey 必须保留外层有限总超时')
+    const preJ5TimeoutMs = Number(preJ5Timeout[1].replaceAll('_', ''))
+    const j5TimeoutMs = Number(j5Timeout[1].replaceAll('_', ''))
+    const outerTimeoutMs = Number(outerTimeout[1]) * 1_000
+    assert.match(
+      journeySource,
+      /setTimeout\(\(\) => fatal\(1, "[^"]+"\), PRE_J5_TIMEOUT\)/,
+      'J1-J4 总防挂预算必须实际启动计时',
+    )
+    assert.match(
+      journeySource,
+      /clearTimeout\(preJ5Timer\);\s+await step\("J5 /,
+      '只有进入 J5 时才可结束 J1-J4 总防挂计时',
+    )
+    assert.match(
+      journeySource,
+      /const deadline = Date\.now\(\) \+ TURN_WAIT_TIMEOUT;/,
+      'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT',
+    )
+    assert.ok(j5TimeoutMs >= 180_000, '生产正常慢轮已超过 120s，J5 等待窗不得退回旧阈值')
+    assert.ok(
+      outerTimeoutMs >= preJ5TimeoutMs + j5TimeoutMs + 30_000,
+      '外层总超时必须覆盖 J1-J4 总预算、完整 J5 等待窗和清理余量',
+    )
     // 旧的「成功出口裸接 || exit 1」形态必须彻底消失 —— 它正是本次整改要消灭的无效门。
     assert.equal(
       (source.match(/smoke_e2e_journey \|\| exit 1/g) ?? []).length,

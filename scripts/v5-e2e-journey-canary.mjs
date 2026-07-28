@@ -65,13 +65,20 @@ const STEP_TIMEOUT = 20_000;
  * 20s,任何真实交互回归照样拦得住。
  */
 const BOOT_TIMEOUT = 60_000;
-/** J5 等一轮真回复的上限(journey 在 smoke-turn 之后跑,模型链路已证健康;宽限防偶发慢轮误杀)。 */
-const TURN_WAIT_TIMEOUT = 120_000;
+/** J1-J4 的总防挂预算；进入 J5 后改由 TURN_WAIT_TIMEOUT 单独计时。 */
+const PRE_J5_TIMEOUT = 240_000;
+/**
+ * J5 等一轮真回复的上限。2026-07-28 两次生产慢轮分别在 122.53s / 126.70s
+ * 正常 completed，120s 会把真实成功误判成挂起；180s 只扩等待窗，失败签名与附件
+ * 探针等成功判据仍保持不变。
+ */
+const TURN_WAIT_TIMEOUT = 180_000;
 
 function fatal(code, msg) {
   console.error(`e2e-journey: ${msg}`);
   process.exit(code);
 }
+const preJ5Timer = setTimeout(() => fatal(1, "J1-J4 在总防挂预算内未完成"), PRE_J5_TIMEOUT);
 
 // ── 凭据(单一权威在 kl-mirror,不落本机副本)──────────────────────────────
 let password;
@@ -300,6 +307,7 @@ try {
     }
   });
 
+  clearTimeout(preJ5Timer);
   await step("J5 送达硬断言:失败卡零容忍+最终正文含附件探针", async () => {
     // 2026-07-18 受理竞态事故:发送失败时乐观气泡照样上屏,旧断言「上屏=成功」让新会话
     // 首发必挂的回归穿门(canary 账号当场撞到、被重试语义掩蔽后门照放绿)。送达升硬门:
