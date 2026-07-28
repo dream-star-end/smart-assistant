@@ -4,8 +4,20 @@ import * as assert from 'node:assert/strict'
  * classification (completed/failed/unknown), config fail-closed, and the
  * option-injection guard on the host env. No real SSH — the runner is injected.
  */
-import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
   CONDITION_OPCODE_MAP,
   TIER1_OPCODES,
@@ -15,6 +27,9 @@ import {
 
 const CFG = { host: 'kl-mirror', keyPath: '/root/.secrets/x', timeoutMs: 5000 }
 const clock = () => 1_000
+const WRAPPER = fileURLToPath(
+  new URL('../../../../ops/oc-selfheal-host-action.sh', import.meta.url),
+)
 
 describe('hostActionConfigFromEnv — fail-closed', () => {
   it('returns null when host or key is unset', () => {
@@ -134,13 +149,17 @@ describe('opcode maps stay coherent', () => {
       assert.ok(TIER1_OPCODES.has(op), `${op} must be a known Tier1 opcode`)
     }
   })
-  it('maps only the two service conditions; disk conditions have no Tier1 route', () => {
+  it('maps only the four exact service conditions; disk conditions have no Tier1 route', () => {
     assert.deepEqual(Object.keys(CONDITION_OPCODE_MAP).sort(), [
       'ops.monitor:http_egress',
+      'ops.monitor:http_v5',
       'ops.monitor:svc_egress',
+      'ops.monitor:svc_v5',
     ])
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:svc_egress'], 'restart-v5-egress-v1')
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:http_egress'], 'restart-v5-egress-v1')
+    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:svc_v5'], 'restart-v5-active-master-v1')
+    assert.equal(CONDITION_OPCODE_MAP['ops.monitor:http_v5'], 'restart-v5-active-master-v1')
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_root'], undefined)
     assert.equal(CONDITION_OPCODE_MAP['ops.monitor:disk_var'], undefined)
   })
@@ -153,6 +172,156 @@ describe('opcode maps stay coherent', () => {
     assert.doesNotMatch(wrapper, /clean-v5-disk-v1/)
     assert.doesNotMatch(wrapper, /docker\s+system\s+prune/)
     assert.doesNotMatch(wrapper, /journalctl\s+--vacuum/)
-    assert.match(wrapper, /"capabilities":\["restart-v5-egress-v1"\]/)
+    assert.match(
+      wrapper,
+      /"capabilities":\["restart-v5-egress-v1","restart-v5-active-master-v1"\]/,
+    )
+  })
+})
+
+interface WrapperRunOpts {
+  state?: string
+  curlMode?: 'ok' | 'all-fail' | 'public-fail'
+  psqlRc?: number
+  systemctlRc?: number
+  healthTimeout?: number
+}
+
+function runWrapper(opcode: string, opts: WrapperRunOpts = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-selfheal-host-action-'))
+  const bin = join(dir, 'bin')
+  const envFile = join(dir, 'commercial-v5.env')
+  const lease = join(dir, 'production-mutation.lock')
+  const maintenance = join(dir, 'maintenance.json')
+  const actionLog = join(dir, 'actions.log')
+  const curlLog = join(dir, 'curl.log')
+  try {
+    mkdirSync(bin)
+    writeFileSync(envFile, 'DATABASE_URL=postgres://fixture\n', { mode: 0o600 })
+    const stub = (name: string, body: string) => {
+      const path = join(bin, name)
+      writeFileSync(path, `#!/bin/sh\nset -eu\n${body}\n`)
+      chmodSync(path, 0o755)
+    }
+    stub(
+      'psql',
+      `if flock -n "$LEASE_PATH" true 2>/dev/null; then exit 42; fi\n` +
+        `rc="\${PSQL_RC:-0}"\n` +
+        `if [ "$rc" -ne 0 ]; then exit "$rc"; fi\n` +
+        `printf '%s' "\${PSQL_ROW-}"`,
+    )
+    stub(
+      'systemctl',
+      `if flock -n "$LEASE_PATH" true 2>/dev/null; then exit 42; fi\n` +
+        `printf '%s\\n' "$*" >> "$ACTION_LOG"\n` +
+        `rc="\${SYSTEMCTL_RC:-0}"\n` +
+        `if [ "$rc" -ne 0 ]; then printf 'restart failed\\n' >&2; exit "$rc"; fi`,
+    )
+    stub(
+      'curl',
+      `printf '%s\\n' "$*" >> "$CURL_LOG"\n` +
+        `if flock -n "$LEASE_PATH" true 2>/dev/null; then exit 42; fi\n` +
+        `if [ "\${CURL_MODE:-ok}" = all-fail ]; then exit 7; fi\n` +
+        `if [ "\${CURL_MODE:-ok}" = public-fail ]; then\n` +
+        `  case " $* " in *" Host: claudeai.chat "*) exit 7 ;; esac\n` +
+        `fi\n` +
+        `printf '{"ok":true,"channel":"v5"}\\n'`,
+    )
+
+    const result = spawnSync('bash', [WRAPPER, opcode], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+        OC_SELFHEAL_V5_ENV: envFile,
+        OC_SELFHEAL_MUTATION_LEASE: lease,
+        OC_SELFHEAL_MAINT_MARKER: maintenance,
+        OC_SELFHEAL_MASTER_HEALTH_TIMEOUT: String(opts.healthTimeout ?? 2),
+        PSQL_ROW: opts.state ?? 'stable|A|',
+        PSQL_RC: String(opts.psqlRc ?? 0),
+        SYSTEMCTL_RC: String(opts.systemctlRc ?? 0),
+        CURL_MODE: opts.curlMode ?? 'ok',
+        ACTION_LOG: actionLog,
+        CURL_LOG: curlLog,
+        LEASE_PATH: lease,
+      },
+    })
+    const lines = result.stdout.trim().split('\n').filter(Boolean)
+    return {
+      status: result.status,
+      stderr: result.stderr,
+      receipt: JSON.parse(lines.at(-1) ?? '{}') as {
+        opcode?: string
+        outcome?: string
+        exit?: number
+        detail?: Record<string, unknown>
+      },
+      actions: existsSync(actionLog) ? readFileSync(actionLog, 'utf8') : '',
+      curls: existsSync(curlLog) ? readFileSync(curlLog, 'utf8') : '',
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+describe('remote forced-command wrapper — active master restart', () => {
+  it('derives and proves the active A/B unit while holding the mutation lease', () => {
+    for (const fixture of [
+      { state: 'stable|A|', unit: 'openclaude-v5.service', port: '18790' },
+      { state: 'stable|B|', unit: 'openclaude-v5-b.service', port: '18795' },
+    ]) {
+      const r = runWrapper('restart-v5-active-master-v1', { state: fixture.state })
+      assert.equal(r.status, 0)
+      assert.equal(r.receipt.outcome, 'completed')
+      assert.equal(r.receipt.exit, 0)
+      assert.equal(r.receipt.detail?.unit, fixture.unit)
+      assert.match(r.actions, new RegExp(`restart ${fixture.unit.replaceAll('.', '\\.')}`))
+      assert.match(r.curls, new RegExp(`127\\.0\\.0\\.1:${fixture.port}/healthz`))
+      assert.match(r.curls, /-H Host: claudeai\.chat http:\/\/127\.0\.0\.1\/healthz/)
+    }
+  })
+
+  it('rejects missing, multiple, invalid, non-stable, or candidate deploy state without restart', () => {
+    for (const state of [
+      '',
+      'stable|A|\nstable|B|',
+      'stable|C|',
+      'canary|A|B',
+      'stable|A|B',
+    ]) {
+      const r = runWrapper('restart-v5-active-master-v1', { state })
+      assert.equal(r.status, 66, `state=${JSON.stringify(state)}`)
+      assert.equal(r.receipt.outcome, 'rejected')
+      assert.equal(r.receipt.exit, 66)
+      assert.equal(r.actions, '')
+    }
+    const queryFailure = runWrapper('restart-v5-active-master-v1', { psqlRc: 2 })
+    assert.equal(queryFailure.status, 66)
+    assert.equal(queryFailure.receipt.outcome, 'rejected')
+    assert.equal(queryFailure.actions, '')
+  })
+
+  it('returns a bound failed receipt when restart or health proof fails', () => {
+    const restart = runWrapper('restart-v5-active-master-v1', { systemctlRc: 5 })
+    assert.equal(restart.status, 5)
+    assert.equal(restart.receipt.outcome, 'failed')
+    assert.equal(restart.receipt.exit, 5)
+    assert.match(restart.stderr, /restart openclaude-v5\.service failed rc=5/)
+
+    const health = runWrapper('restart-v5-active-master-v1', {
+      curlMode: 'all-fail',
+      healthTimeout: 1,
+    })
+    assert.equal(health.status, 70)
+    assert.equal(health.receipt.outcome, 'failed')
+    assert.equal(health.receipt.exit, 70)
+
+    const publicHealth = runWrapper('restart-v5-active-master-v1', {
+      curlMode: 'public-fail',
+      healthTimeout: 1,
+    })
+    assert.equal(publicHealth.receipt.outcome, 'failed')
+    assert.equal(publicHealth.receipt.detail?.privateHealth, true)
+    assert.equal(publicHealth.receipt.detail?.publicHealth, false)
   })
 })
