@@ -11,7 +11,7 @@
 //   ① 长 turn 执行中,composer 必须给出「停止」入口(没有 = 用户无法中断);
 //   ② 受信点击后 3s 内进终态:「停止」消失、「发送」回归;
 //   ③ 终态后不再有增量帧(助手行数/正文长度/流式光标 在观察窗内完全不动);
-//   ④ 停止不额外计费、不复活:该会话的 durable dispatch 恒 1 条且收敛到终态,
+//   ④ 停止请求后不额外计费、不复活:该会话的 durable dispatch 恒 1 条且收敛到终态,
 //      绑定它的 usage 行不超过 1 条且在观察窗内不再增长;刷新后不自动重启本轮。
 // 另加"可重来":用户原文必须保留、composer 可再次发送(停止不等于把输入吞掉)。
 
@@ -185,22 +185,42 @@ test('停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活', a
     settled.statuses.split(',').every((status) => status === 'terminal' || status === 'manual_reconcile'),
     `dispatch 未落终态: ${settled.statuses}`,
   ).toBeTruthy();
-  expect(settled.outcomes, '用户停止必须由真实 interrupted tape 收敛 dispatch').toBe('interrupted');
-  expect(settled.tapes, '一次被停止的 turn 必须恰好落一卷 immutable tape').toBe(1);
-  expect(settled.tapeStatuses, '停止 tape header 必须是 interrupted').toBe('interrupted');
   expect(
-    settled.tapeErrorCodes.toUpperCase(),
-    '停止 tape 的稳定错误码必须归一到 user_cancelled',
-  ).toBe('USER_CANCELLED');
+    ['interrupted', 'completed'],
+    `Stop 请求只能收敛为 interrupted，或由竞态中的自然 end_turn 先收敛为 completed: ${settled.outcomes}`,
+  ).toContain(settled.outcomes);
+  expect(settled.tapes, '一次被停止的 turn 必须恰好落一卷 immutable tape').toBe(1);
+  if (settled.outcomes === 'interrupted') {
+    expect(settled.tapeStatuses, '中断终态的 tape header 必须是 interrupted').toBe('interrupted');
+    expect(
+      settled.tapeErrorCodes.toUpperCase(),
+      '中断终态的稳定错误码必须归一到 user_cancelled',
+    ).toBe('USER_CANCELLED');
+  } else {
+    // Stop 点击和自然 end_turn 可以竞速；若自然完成先落权威终态，不能把完整答复改写成取消。
+    // 用户契约仍由上面的 3s 退出执行态、静默窗，以及下面的不复活/不重复计费共同锁定。
+    expect(settled.tapeStatuses, '自然完成竞态的 tape header 必须与 outcome 一致').toBe('completed');
+    expect(
+      settled.tapeErrorCodes.toUpperCase(),
+      '自然完成竞态不得伪造 USER_CANCELLED 错误',
+    ).not.toContain('USER_CANCELLED');
+  }
   expect(
     settled.usageRows,
     '一次被停止的 turn 至多结算一笔(≥2 = 停止后仍在继续计费)',
   ).toBeLessThanOrEqual(1);
   if (cfg.model === 'gpt-5.6-luna' && settled.usageRows > 0) {
-    expect(
-      settled.usageTerminalCodes,
-      'Codex 强制停止的 usage 审计必须归类为 USER_CANCELLED，不能记成模型失败',
-    ).toBe('USER_CANCELLED');
+    if (settled.outcomes === 'interrupted') {
+      expect(
+        settled.usageTerminalCodes,
+        'Codex 强制停止的 usage 审计必须归类为 USER_CANCELLED，不能记成模型失败',
+      ).toBe('USER_CANCELLED');
+    } else {
+      expect(
+        settled.usageTerminalCodes,
+        '自然完成竞态的 usage 审计不得伪装成 USER_CANCELLED',
+      ).not.toBe('USER_CANCELLED');
+    }
   }
 
   // 静默窗内计费与 dispatch 都不得再长:这才是"点了停止就不再花钱"。
