@@ -64,9 +64,7 @@ function compileWorkerPostTextHarness(): {
   )() as ReturnType<typeof compileWorkerPostTextHarness>
 }
 
-function compileWorkerChallengeHarness(
-  writeTerminalAndExit: (event: unknown) => Promise<void>,
-): {
+function compileWorkerChallengeHarness(writeTerminalAndExit: (event: unknown) => Promise<void>): {
   assertNoChallenge(page: {
     locator(selector: string): { innerText(): Promise<string> }
     url(): string
@@ -83,13 +81,11 @@ function compileWorkerChallengeHarness(
     `'use strict'; ${WEIBO_WORKER_SOURCE.slice(riskStart, riskEnd)}
       ${WEIBO_WORKER_SOURCE.slice(bodyStart, bodyEnd)}
       return { assertNoChallenge };`,
-  )(
-    writeTerminalAndExit,
-    (value: unknown, max: number) =>
-      String(value ?? '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, max),
+  )(writeTerminalAndExit, (value: unknown, max: number) =>
+    String(value ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, max),
   ) as ReturnType<typeof compileWorkerChallengeHarness>
 }
 
@@ -110,6 +106,29 @@ function compileWorkerProjectPostHarness(): {
     (value: unknown) => JSON.stringify(value),
     () => 0,
   ) as ReturnType<typeof compileWorkerProjectPostHarness>
+}
+
+function compileWorkerMessageReadHarness(overrides: Record<string, unknown>): {
+  collectMessageThreads(page: unknown, count: number): Promise<unknown>
+  actionRead(page: unknown, input: unknown): Promise<unknown>
+} {
+  const messageStart = WEIBO_WORKER_SOURCE.indexOf('function isMessagePageEmptyResponse')
+  const messageEnd = WEIBO_WORKER_SOURCE.indexOf(
+    'async function prepareMessageComposer',
+    messageStart,
+  )
+  const actionStart = WEIBO_WORKER_SOURCE.indexOf('async function actionRead')
+  const actionEnd = WEIBO_WORKER_SOURCE.indexOf('async function newestOwnPost', actionStart)
+  assert.ok(
+    messageStart >= 0 && messageEnd > messageStart && actionStart >= 0 && actionEnd > actionStart,
+  )
+  const names = Object.keys(overrides)
+  return new Function(
+    ...names,
+    `'use strict'; ${WEIBO_WORKER_SOURCE.slice(messageStart, messageEnd)}
+      ${WEIBO_WORKER_SOURCE.slice(actionStart, actionEnd)}
+      return { collectMessageThreads, actionRead };`,
+  )(...names.map((name) => overrides[name])) as ReturnType<typeof compileWorkerMessageReadHarness>
 }
 
 describe('official Weibo Plugin', () => {
@@ -399,6 +418,102 @@ describe('official Weibo Plugin', () => {
     const createPostSource = WEIBO_WORKER_SOURCE.slice(createPostStart, createPostEnd)
     assert.doesNotMatch(createPostSource, /force:\s*true|\.evaluate\([^)]*\.click|keyboard\./)
     assert.match(WEIBO_WORKER_SOURCE, /send\.click\(\{ timeout: 10_000, noWaitAfter: true \}\)/)
+  })
+
+  test('message reads expose exact empty-response degradation without weakening sends', async () => {
+    const emptyResponse = new Error(
+      'page.goto: net::ERR_EMPTY_RESPONSE at https://m.weibo.cn/message',
+    )
+    const messageReads = compileWorkerMessageReadHarness({
+      gotoMessagePage: async () => {
+        throw emptyResponse
+      },
+      ensureSelfId: async () => '12345',
+      collectMessageThread: async () => {
+        throw emptyResponse
+      },
+    })
+
+    assert.deepEqual(await messageReads.collectMessageThreads({}, 5), {
+      threads: [],
+      complete: false,
+      degradedReason: 'upstream_message_page_empty_response',
+    })
+    assert.deepEqual(
+      await messageReads.actionRead(
+        {},
+        { actionId: 'get_message_thread', params: { userId: '67890', count: 5 } },
+      ),
+      {
+        messages: [],
+        complete: false,
+        degradedReason: 'upstream_message_page_empty_response',
+      },
+    )
+
+    const events: string[] = []
+    const writes = compileWorkerPostHarness({
+      ensureSelfId: async () => '12345',
+      collectMessageThread: async () => {
+        throw emptyResponse
+      },
+      prepareMessageComposer: async () => {
+        events.push('prepare')
+        return { recipient: '', send: { click: async () => events.push('click') } }
+      },
+      awaitDispatch: async () => events.push('dispatch'),
+      assertNoChallenge: async () => {},
+      cleanText: (value: unknown) => String(value).trim(),
+    })
+    await assert.rejects(
+      writes.writeAction(
+        {},
+        { actionId: 'send_message', params: { userId: '67890', text: 'hello' } },
+      ),
+      /ERR_EMPTY_RESPONSE/,
+    )
+    assert.deepEqual(events, [])
+  })
+
+  test('message reads keep non-empty-response failures fail-closed', async () => {
+    const failure = new Error('page.goto: net::ERR_CONNECTION_RESET')
+    const messageReads = compileWorkerMessageReadHarness({
+      gotoMessagePage: async () => {
+        throw failure
+      },
+      ensureSelfId: async () => '12345',
+      collectMessageThread: async () => {
+        throw failure
+      },
+    })
+
+    await assert.rejects(messageReads.collectMessageThreads({}, 5), /ERR_CONNECTION_RESET/)
+    await assert.rejects(
+      messageReads.actionRead(
+        {},
+        { actionId: 'get_message_thread', params: { userId: '67890', count: 5 } },
+      ),
+      /ERR_CONNECTION_RESET/,
+    )
+
+    const suffixedFailure = new Error('page.goto: net::ERR_EMPTY_RESPONSE_SUFFIX')
+    const suffixed = compileWorkerMessageReadHarness({
+      gotoMessagePage: async () => {
+        throw suffixedFailure
+      },
+      ensureSelfId: async () => '12345',
+      collectMessageThread: async () => {
+        throw suffixedFailure
+      },
+    })
+    await assert.rejects(suffixed.collectMessageThreads({}, 5), /ERR_EMPTY_RESPONSE_SUFFIX/)
+    await assert.rejects(
+      suffixed.actionRead(
+        {},
+        { actionId: 'get_message_thread', params: { userId: '67890', count: 5 } },
+      ),
+      /ERR_EMPTY_RESPONSE_SUFFIX/,
+    )
   })
 
   test('create_post proves pointer actionability before dispatch and clicks exactly once', async () => {

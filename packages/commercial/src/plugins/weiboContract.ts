@@ -466,6 +466,10 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
         properties: {
           threads: { type: 'array', maxItems: 50, items: messageThreadSchema },
           complete: { type: 'boolean' },
+          degradedReason: {
+            type: 'string',
+            enum: ['upstream_message_page_empty_response'],
+          },
         },
         required: ['threads', 'complete'],
         additionalProperties: false,
@@ -490,6 +494,10 @@ export const WEIBO_PLUGIN_ARTIFACT = Object.freeze({
         properties: {
           messages: { type: 'array', maxItems: 50, items: messageSchema },
           complete: { type: 'boolean' },
+          degradedReason: {
+            type: 'string',
+            enum: ['upstream_message_page_empty_response'],
+          },
         },
         required: ['messages', 'complete'],
         additionalProperties: false,

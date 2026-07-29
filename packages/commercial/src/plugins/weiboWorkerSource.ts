@@ -771,6 +771,9 @@ async function gotoMessagePage(page, url) {
   }
   throw failure || new Error('message');
 }
+function isMessagePageEmptyResponse(error) {
+  return /(?:^|\s)net::ERR_EMPTY_RESPONSE(?:\s|$)/.test(String(error));
+}
 function avatarUserId(src) {
   let filename = '';
   try { filename = new URL(src).pathname.split('/').pop() || ''; } catch { return null; }
@@ -790,7 +793,16 @@ function avatarUserId(src) {
   return /^\d{5,20}$/.test(userId) ? userId : null;
 }
 async function collectMessageThreads(page, count) {
-  await gotoMessagePage(page, 'https://m.weibo.cn/message');
+  try {
+    await gotoMessagePage(page, 'https://m.weibo.cn/message');
+  } catch (error) {
+    if (isMessagePageEmptyResponse(error)) return {
+      threads: [],
+      complete: false,
+      degradedReason: 'upstream_message_page_empty_response'
+    };
+    throw error;
+  }
   await page.waitForFunction(() => document.querySelectorAll('.lite-msg-list').length >= 4 || /暂无|出错|重试/.test(document.body.innerText || ''), null, { timeout: 15_000 }).catch(() => {});
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const before = await page.locator('.lite-msg-list').count();
@@ -972,7 +984,18 @@ async function actionRead(page, input) {
   }
   if (input.actionId === 'get_unread_counts') return unreadCounts(page);
   if (input.actionId === 'list_message_threads') return collectMessageThreads(page, Math.min(params.count || 20, 50));
-  if (input.actionId === 'get_message_thread') return collectMessageThread(page, params.userId, selfId, Math.min(params.count || 20, 50));
+  if (input.actionId === 'get_message_thread') {
+    try {
+      return await collectMessageThread(page, params.userId, selfId, Math.min(params.count || 20, 50));
+    } catch (error) {
+      if (isMessagePageEmptyResponse(error)) return {
+        messages: [],
+        complete: false,
+        degradedReason: 'upstream_message_page_empty_response'
+      };
+      throw error;
+    }
+  }
   if (input.actionId === 'list_notifications') {
     const limit = Math.min(params.count || 20, 50);
     if (params.category === 'followers') {
