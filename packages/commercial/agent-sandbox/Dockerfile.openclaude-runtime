@@ -239,9 +239,10 @@ COPY --chown=root:root ./platform-runtime/bin/oc-web-context.py /usr/local/bin/o
 # oc-web: CLI front-end over the web-context core (replaces the retired
 # web_context_* MCP tools; documented by the `web-context` baseline skill).
 COPY --chown=root:root ./platform-runtime/bin/oc-web.sh /usr/local/bin/oc-web
-# oc-browser: thin client over the oc-browser daemon (replaces the retired
-# browser_* MCP tools; documented by the `browser` baseline skill).
+# oc-browser: isolated launcher for the pinned official Playwright CLI. It
+# preserves the product command/card while removing Agent-side MCP transport.
 COPY --chown=root:root ./platform-runtime/bin/oc-browser.sh /usr/local/bin/oc-browser
+COPY --chown=root:root ./playwright-cli.config.json /etc/openclaude/playwright-cli.config.json
 # oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
 # master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
 COPY --chown=root:root ./platform-runtime/bin/oc-market.sh /usr/local/bin/oc-market
@@ -365,22 +366,28 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
 COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/codex/managed_config.toml
 
 # ------------------------------------------------------------
-# Playwright MCP + Chromium for the oc-browser daemon
+# Playwright CLI + Chromium for Agent browser automation
 # ------------------------------------------------------------
-# browser is the stateful oc-browser daemon (packages/gateway/src/ocBrowserDaemon.ts):
-# it keeps ONE @playwright/mcp session alive and serves it over a per-agent Unix
-# socket. We PIN @playwright/mcp (no @latest) and pre-install the matching Chromium
-# so the first browser call is instant and fully offline — the daemon launches it
-# with `npx --no-install @playwright/mcp`. Browsers cached at a shared, world-
-# readable path so the unprivileged `agent` user can run them.
-# ⚠️ Phase 5: confirm OC_PLAYWRIGHT_MCP_VERSION is a published version (the build
-#    fails loudly otherwise) and that the bundled chromium installs cleanly.
+# Agent turns use @playwright/cli through the browser Skill + oc-browser launcher;
+# no Agent subprocess starts @playwright/mcp. The MCP package remains installed
+# only because containerPreview and managed-browser plugin workers currently use
+# its bundled Playwright library/version contract directly (not its MCP server).
+# Pin CLI and MCP to releases that depend on the exact same Playwright build so
+# one browser install serves both paths without duplicate Chromium payloads.
 ARG OC_PLAYWRIGHT_MCP_VERSION=0.0.76
+ARG OC_PLAYWRIGHT_CLI_VERSION=0.1.14
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright
 RUN set -eux; \
-    npm install -g "@playwright/mcp@${OC_PLAYWRIGHT_MCP_VERSION}" --no-audit --no-fund; \
+    npm install -g \
+      "@playwright/mcp@${OC_PLAYWRIGHT_MCP_VERSION}" \
+      "@playwright/cli@${OC_PLAYWRIGHT_CLI_VERSION}" \
+      --no-audit --no-fund; \
+    MCP_PW_VERSION="$(node -p "require('/usr/local/lib/node_modules/@playwright/mcp/package.json').dependencies.playwright")"; \
+    CLI_PW_VERSION="$(node -p "require('/usr/local/lib/node_modules/@playwright/cli/package.json').dependencies.playwright")"; \
+    test "$MCP_PW_VERSION" = "$CLI_PW_VERSION"; \
     PW_BIN="$(npm root -g)/@playwright/mcp/node_modules/.bin/playwright"; \
     "$PW_BIN" install --with-deps chromium; \
+    playwright-cli --version; \
     chmod -R a+rX /usr/local/share/ms-playwright; \
     npm cache clean --force; \
     rm -rf /root/.npm

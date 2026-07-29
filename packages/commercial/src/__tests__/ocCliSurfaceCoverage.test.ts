@@ -7,7 +7,6 @@ import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 
-import { parseOcBrowserCommand } from '../../../gateway/src/ocBrowserCli.js'
 import { runOcConnectCli, runOcPluginCli } from '../../../gateway/src/ocConnectCli.js'
 import { planSkillCommand } from '../../../gateway/src/ocSkillCli.js'
 import { runOcWebCli } from '../../../gateway/src/ocWebCli.js'
@@ -95,11 +94,14 @@ function scriptProbe(
   }
 }
 
-function browserProbe(argv: string[]): Probe {
-  return () => {
-    const parsed = parseOcBrowserCommand(argv)
-    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.message)
-  }
+function browserLauncherProbe(): void {
+  const value = readFileSync(join(BIN_DIR, 'oc-browser.sh'), 'utf8')
+  assert.match(value, /cli_bin=\/usr\/local\/bin\/playwright-cli/)
+  assert.match(value, /XDG_CACHE_HOME="\$cache_home" PLAYWRIGHT_CLI_SESSION="\$session_name"/)
+  assert.match(value, /sha256sum/)
+  assert.match(value, /flock -x 9/)
+  assert.match(value, /__openclaude_reap/)
+  assert.match(value, /"\$cli_bin" "\$@" 9>&-/)
 }
 
 function skillProbe(argv: string[], expectedKind: string): Probe {
@@ -189,13 +191,7 @@ function xlsxCommandProbe(command: string): Probe {
  */
 const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-browser': {
-    navigate: browserProbe(['navigate', '--url', 'https://example.com']),
-    snapshot: browserProbe(['snapshot']),
-    click: browserProbe(['click', '--ref', 'e1', '--element', 'button']),
-    type: browserProbe(['type', '--ref', 'e1', '--element', 'field', '--text', 'value']),
-    'press-key': browserProbe(['press-key', '--key', 'Enter']),
-    screenshot: browserProbe(['screenshot', '--path', '/tmp/probe.png']),
-    'wait-for': browserProbe(['wait-for', '--time', '0']),
+    forward: browserLauncherProbe,
   },
   'oc-cite': {
     verify: tsFailureProbe('packages/gateway/src/ocCiteCli.ts', ['verify'], /verify <id/),
@@ -442,7 +438,6 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
 }
 
 const THIN_WRAPPERS: Record<string, string> = {
-  'oc-browser': 'packages/gateway/src/ocBrowserCli.ts',
   'oc-cite': 'packages/gateway/src/ocCiteCli.ts',
   'oc-connect': 'packages/gateway/src/ocConnectCli.ts',
   'oc-figcheck': 'packages/gateway/src/ocFigCheckCli.ts',
@@ -524,39 +519,6 @@ function tsDispatchCommands(relativePath: string, variable: 'cmd' | 'command'): 
   assert.equal(foundDispatcher, true, `${relativePath}: ${variable} dispatcher not found`)
   for (const help of HELP_COMMANDS) commands.delete(help)
   assert.ok(commands.size > 0, `${relativePath}: no production commands discovered`)
-  return commands
-}
-
-/** Browser commands are the keys of the production SUBCOMMANDS registry. */
-function tsObjectCommands(relativePath: string, objectName: string): Set<string> {
-  const commands = new Set<string>()
-  let found = false
-  const visit = (node: ts.Node): void => {
-    if (
-      ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
-      node.name.text === objectName &&
-      node.initializer &&
-      ts.isObjectLiteralExpression(node.initializer)
-    ) {
-      found = true
-      for (const property of node.initializer.properties) {
-        assert.ok(
-          ts.isPropertyAssignment(property),
-          `${relativePath}: unsupported ${objectName} row`,
-        )
-        const value =
-          stringValue(property.name) ??
-          (ts.isIdentifier(property.name) ? property.name.text : undefined)
-        assert.ok(value, `${relativePath}: non-static ${objectName} key`)
-        commands.add(value)
-      }
-    }
-    ts.forEachChild(node, visit)
-  }
-  visit(tsAst(relativePath))
-  assert.equal(found, true, `${relativePath}: ${objectName} registry not found`)
-  assert.ok(commands.size > 0, `${relativePath}: ${objectName} registry is empty`)
   return commands
 }
 
@@ -689,7 +651,11 @@ function productionSurfaces(): Record<string, Set<string>> {
   assert.equal(memory.delete('memory'), true, 'oc-memory: retired memory branch not discovered')
   memory.add('memory.retired')
   return {
-    'oc-browser': tsObjectCommands('packages/gateway/src/ocBrowserCli.ts', 'SUBCOMMANDS'),
+    'oc-browser': singlePurpose(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-browser.sh',
+      'forward',
+      /\/usr\/local\/bin\/playwright-cli/,
+    ),
     'oc-cite': tsDispatchCommands('packages/gateway/src/ocCiteCli.ts', 'cmd'),
     'oc-connect': new Set(connect),
     'oc-diagram': singlePurpose(
@@ -732,6 +698,14 @@ function productionSurfaces(): Record<string, Set<string>> {
 }
 
 describe('V5 oc-* public surface coverage contract', () => {
+  test('oc-browser pins the official CLI to the same Playwright build as internal MCP consumers', () => {
+    const dockerfile = source('packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
+    assert.match(dockerfile, /ARG OC_PLAYWRIGHT_MCP_VERSION=0\.0\.76/)
+    assert.match(dockerfile, /ARG OC_PLAYWRIGHT_CLI_VERSION=0\.1\.14/)
+    assert.match(dockerfile, /test "\$MCP_PW_VERSION" = "\$CLI_PW_VERSION"/)
+    assert.match(dockerfile, /playwright-cli --version/)
+  })
+
   test('every bundled oc-* tool has an executable operation matrix (and no stale row)', () => {
     const actual = readdirSync(BIN_DIR)
       .filter((file) => /^oc-.*\.(?:sh|py)$/.test(file))

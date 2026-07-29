@@ -46,11 +46,11 @@
 
 ## 浏览器操作 (CLI)
 
-用 Bash 调 `oc-browser` 操作真实浏览器(有状态,跨调用共享同一会话):
-1. `oc-browser navigate --url <url>` → 打开网页
+用 Bash 调 `oc-browser` 使用官方 Playwright CLI 操作真实浏览器(有状态,跨调用共享同一会话):
+1. `oc-browser open <url>` → 打开浏览器和网页(已有会话改用 `goto <url>`)
 2. `oc-browser snapshot` → 拿页面 accessibility tree + 元素 ref
-3. `oc-browser click --ref <ref> --element "<描述>"` / `oc-browser type --ref <ref> --element "<描述>" --text "<文本>"` → 按 ref 操作,重复 2-3 直到完成
-常用场景: 搜索、填表、登录、抓数据。优先 snapshot(文本省 token),需视觉确认才 `oc-browser screenshot`。细节见 `skill_view("browser")`。
+3. `oc-browser click <ref>` / `oc-browser fill <ref> "<文本>"` / `oc-browser press Enter` → 按 ref 操作,页面变化后重复 2-3
+常用场景: 搜索、填表、登录、抓数据。优先 snapshot(文本省 token),需视觉确认才 screenshot,完成后 close。细节见 `skill_view("browser")`。
 
 ## 网页/文档提取 · 论文下载 (CLI)
 

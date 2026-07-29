@@ -1873,8 +1873,8 @@ export class SubprocessRunner extends EventEmitter {
         }
       }
 
-      // (browser per-agent profile now handled by the oc-browser daemon, which
-      // owns its own per-agent --user-data-dir; browser is no longer an MCP.)
+      // Browser is no longer an MCP. The oc-browser launcher isolates the
+      // official Playwright CLI registry/profile per Agent.
 
       if (Object.keys(mcpServers).length > 0) {
         const mcpPath = resolve(sessionDir, 'mcp-config.json')

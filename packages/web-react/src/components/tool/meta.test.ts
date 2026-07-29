@@ -193,14 +193,14 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(toolSummary("Bash", { command: "mmx image generate 'a cat' -o /out.png" })).toBe("");
   });
   test("oc-browser / oc-market 根据动作提供友好标签和摘要", () => {
-    expect(resolveToolMeta("Bash", { command: "oc-browser navigate --url https://example.com/a" }).label).toBe(
+    expect(resolveToolMeta("Bash", { command: "oc-browser open https://example.com/a" }).label).toBe(
       "打开网页",
     );
-    expect(toolSummary("Bash", { command: "oc-browser navigate --url https://example.com/a" })).toBe(
+    expect(toolSummary("Bash", { command: "oc-browser open https://example.com/a" })).toBe(
       "example.com",
     );
-    expect(resolveToolMeta("Bash", { command: "oc-browser click --element '登录按钮'" }).label).toBe("点击页面");
-    expect(toolSummary("Bash", { command: "oc-browser click --element '登录按钮'" })).toBe("登录按钮");
+    expect(resolveToolMeta("Bash", { command: "oc-browser click e12" }).label).toBe("点击页面");
+    expect(toolSummary("Bash", { command: "oc-browser click e12" })).toBe("元素 e12");
     expect(resolveToolMeta("Bash", { command: "oc-market search image" }).label).toBe("搜索 AI 市场");
     expect(toolSummary("Bash", { command: "oc-market search image" })).toBe("image");
   });

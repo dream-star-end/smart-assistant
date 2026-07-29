@@ -268,8 +268,8 @@ const WEB_CONTEXT_TOOLSET_ID = "web_context";
 
 // Retired MCP server — id retained only so upsertPlatformMcpIntegrations can
 // strip stale platform-owned entries from existing user volumes. Browser is now
-// the stateful oc-browser daemon (keeps one Playwright session alive) +
-// thin `oc-browser` CLI, documented by the `browser` baseline skill.
+// the official Playwright CLI through the isolated `oc-browser` launcher,
+// documented by the `browser` baseline skill.
 const BROWSER_MCP_ID = "browser";
 
 // Retired MCP servers — ids retained only so upsertPlatformMcpIntegrations can
@@ -403,7 +403,8 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
 
   // v3 runtime default is deliberately lightweight: `core` is the only toolset
   // and mounts no MCP servers — browser/scansci-pdf/web-context all moved to the
-  // oc-browser / scansci-pdf / oc-web CLIs (documented by baseline skills).
+  // oc-browser(official Playwright CLI) / scansci-pdf / oc-web CLIs
+  // (documented by baseline skills).
   const toolsets = isRecord(config.toolsets) ? { ...config.toolsets } : {};
   let toolsetsMutated = !isRecord(config.toolsets);
   toolsetsMutated = setToolset(toolsets, CORE_TOOLSET_ID, []) || toolsetsMutated;
@@ -789,7 +790,8 @@ try {
       },
       toolsets: {
         // `core` is the only toolset; browser/scansci-pdf/web-context all moved
-        // from MCP to the oc-browser / scansci-pdf / oc-web CLIs (baseline skills).
+        // from MCP to oc-browser(official Playwright CLI) / scansci-pdf / oc-web
+        // (baseline skills).
         [CORE_TOOLSET_ID]: [],
       },
       mcpServers: [],
