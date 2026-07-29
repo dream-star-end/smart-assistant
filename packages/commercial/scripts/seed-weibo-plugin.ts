@@ -113,7 +113,12 @@ async function loadVerifiedState(): Promise<BrowserStorageStateV1> {
 async function exactImageSmoke(
   service: WeiboDockerService,
   initialState: BrowserStorageStateV1,
-): Promise<{ storageState: BrowserStorageStateV1; selfId: string; passed: string[] }> {
+): Promise<{
+  storageState: BrowserStorageStateV1
+  selfId: string
+  passed: string[]
+  degraded: string[]
+}> {
   const runtime = new ManagedBrowserRuntime({
     ...createWeiboRuntimeRegistries(service),
     profileRoot: '/run/openclaude-v5/weibo-plugin-smoke-profiles',
@@ -121,6 +126,7 @@ async function exactImageSmoke(
   })
   let storageState = initialState
   const passed: string[] = []
+  const degraded: string[] = []
   const run = async (actionId: string, params: Record<string, unknown>) => {
     const executed = await runtime.runReadAction({
       contract: WEIBO_PLUGIN_CONTRACT,
@@ -132,6 +138,23 @@ async function exactImageSmoke(
     storageState = executed.storageState
     if (!passed.includes(actionId)) passed.push(actionId)
     return executed.result as Record<string, unknown>
+  }
+  const markIncompleteMessageRead = (
+    actionId: 'list_message_threads' | 'get_message_thread',
+    result: Record<string, unknown>,
+    collectionKey: 'threads' | 'messages',
+  ): void => {
+    const collection = result[collectionKey]
+    if (
+      result.degradedReason !== 'upstream_message_page_empty_response' ||
+      result.complete !== false ||
+      !Array.isArray(collection) ||
+      collection.length !== 0
+    )
+      return
+    const passedIndex = passed.indexOf(actionId)
+    if (passedIndex >= 0) passed.splice(passedIndex, 1)
+    if (!degraded.includes(actionId)) degraded.push(actionId)
   }
   const self = await run('get_self', {})
   const user = self.user as Record<string, unknown>
@@ -173,14 +196,16 @@ async function exactImageSmoke(
   await run('list_liked_posts', { count: 5 })
   await run('list_hot_searches', { count: 10 })
   const threads = await run('list_message_threads', { count: 5 })
+  markIncompleteMessageRead('list_message_threads', threads, 'threads')
   const messageTarget = [threads.threads, following.users, followers.users, searchedUsers.users]
     .flatMap((items) => (Array.isArray(items) ? (items as Record<string, unknown>[]) : []))
     .map((item) => String(item.userId ?? item.id ?? ''))
     .find((candidate) => /^\d{5,20}$/.test(candidate))
   if (!messageTarget)
     throw new Error('verified account has no readable user for message-thread smoke')
-  await run('get_message_thread', { userId: messageTarget, count: 5 })
-  return { storageState, selfId, passed }
+  const thread = await run('get_message_thread', { userId: messageTarget, count: 5 })
+  markIncompleteMessageRead('get_message_thread', thread, 'messages')
+  return { storageState, selfId, passed, degraded }
 }
 
 async function qrSmoke(service: WeiboDockerService): Promise<string> {
@@ -470,6 +495,7 @@ async function main(): Promise<void> {
           userId,
           selfIdDigest: createHash('sha256').update(smoke.selfId).digest('hex'),
           passedActionIds: smoke.passed,
+          degradedActionIds: smoke.degraded,
           qrDigest,
           imageId,
           artifactHash: COMPILED_WEIBO_PLUGIN.artifactHash,
