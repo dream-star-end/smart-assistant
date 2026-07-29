@@ -48,6 +48,15 @@ function mediaKindOf(mime: string): MediaRef["kind"] {
   return "file";
 }
 
+function clipboardImages(data: DataTransfer): File[] {
+  const itemImages = Array.from(data.items)
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file != null);
+  if (itemImages.length > 0) return itemImages;
+  return Array.from(data.files).filter((file) => file.type.startsWith("image/"));
+}
+
 export function Composer({
   onSend,
   busy,
@@ -442,6 +451,13 @@ export function Composer({
             value={value}
             disabled={disabled}
             onChange={(e) => setValue(e.target.value)}
+            onPaste={(e) => {
+              if (!onUpload) return;
+              const images = clipboardImages(e.clipboardData);
+              if (images.length === 0) return;
+              e.preventDefault();
+              void onFiles(images);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。

@@ -361,6 +361,42 @@ await check("T4 file input 结构红线:type=file/无 accept/非 display:none/ta
   if (info.tabIndex !== -1) throw new Error(`file input tabindex=${info.tabIndex},应为 -1`);
 });
 
+await check("T27 输入框粘贴 PNG 直接上传为图片附件", async () => {
+  const textarea = primaryComposer.getByPlaceholder("给 OpenClaude 发消息…");
+  await textarea.fill("保留这段正文");
+  const pasteResult = await textarea.evaluate((element) => {
+    const png = Uint8Array.from(
+      atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="),
+      (char) => char.charCodeAt(0),
+    );
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([png], "paste-probe.png", { type: "image/png" }));
+    transfer.setData("text/plain", "不应进入正文");
+    transfer.setData("text/html", "<b>不应进入正文</b>");
+    const event = new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: transfer,
+    });
+    const dispatched = element.dispatchEvent(event);
+    return { defaultPrevented: event.defaultPrevented, dispatched };
+  });
+  if (!pasteResult.defaultPrevented || pasteResult.dispatched) {
+    throw new Error(`图片 paste 未阻止默认行为:${JSON.stringify(pasteResult)}`);
+  }
+  await page.getByRole("button", { name: "移除 paste-probe.png" }).waitFor({ state: "visible", timeout: 3000 });
+  const retry = await page.getByRole("button", { name: "重试上传 paste-probe.png" }).count();
+  if (retry !== 0) throw new Error("粘贴图片 chip 进入了 error 态");
+  const state = await page.evaluate(() => ({
+    value: document.querySelector("textarea")?.value,
+    uploads: window.__uploads.filter((name) => name === "paste-probe.png"),
+  }));
+  if (state.value !== "保留这段正文") throw new Error(`粘贴图片污染正文:${JSON.stringify(state.value)}`);
+  if (state.uploads.length !== 1) {
+    throw new Error(`粘贴图片上传次数=${state.uploads.length},应为 1:${JSON.stringify(state.uploads)}`);
+  }
+});
+
 await check("T5 惰性 user sidecar 水合为原文且重试收到精确 payload", async () => {
   const root = page.locator("#timeline-user-root");
   await root.getByText("EXACT_DEFERRED_USER_MARKER").waitFor({ state: "visible", timeout: 3000 });

@@ -85,6 +85,108 @@ describe("F1 附件选择器可靠性（+ 菜单附件项 = 原生 <label htmlFo
   });
 });
 
+describe("F1b 剪贴板图片直接上传", () => {
+  function imageFile(name = "paste-probe.png"): File {
+    return new File(["png"], name, { type: "image/png" });
+  }
+
+  function paste(
+    textarea: HTMLElement,
+    clipboardData: {
+      items?: Array<{ kind: string; type: string; getAsFile: () => File | null }>;
+      files?: File[];
+    },
+  ): Event {
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: clipboardData });
+    fireEvent(textarea, event);
+    return event;
+  }
+
+  test("items 中的图片直接上传；files 同时含同一图片也只上传一次", async () => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:paste-probe"),
+    });
+    const file = imageFile();
+    const onUpload = vi.fn(async () => ({ kind: "image", url: "/api/media/paste.png" }) as MediaRef);
+    render(<Composer onSend={() => {}} onUpload={onUpload} />);
+
+    const event = paste(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+      items: [{ kind: "file", type: file.type, getAsFile: () => file }],
+      files: [file],
+    });
+
+    expect(event.defaultPrevented).toBe(true);
+    await waitFor(() => expect(onUpload).toHaveBeenCalledTimes(1));
+    expect(onUpload).toHaveBeenCalledWith(file);
+    expect(screen.getByRole("button", { name: "移除 paste-probe.png" })).toBeInTheDocument();
+  });
+
+  test("items 图片项取不到 File 时回退 files 上传", async () => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:paste-fallback"),
+    });
+    const file = imageFile("paste-fallback.png");
+    const onUpload = vi.fn(async () => ({ kind: "image", url: "/api/media/fallback.png" }) as MediaRef);
+    render(<Composer onSend={() => {}} onUpload={onUpload} />);
+
+    const event = paste(screen.getByPlaceholderText("给 OpenClaude 发消息…"), {
+      items: [{ kind: "file", type: file.type, getAsFile: () => null }],
+      files: [file],
+    });
+
+    expect(event.defaultPrevented).toBe(true);
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file));
+  });
+
+  test("图片与文本/HTML 混合粘贴时只附图，不污染已有正文", async () => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:paste-mixed"),
+    });
+    const file = imageFile("paste-mixed.png");
+    const onUpload = vi.fn(async () => ({ kind: "image", url: "/api/media/mixed.png" }) as MediaRef);
+    render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const textarea = screen.getByPlaceholderText("给 OpenClaude 发消息…");
+    fireEvent.change(textarea, { target: { value: "保留这段正文" } });
+
+    const event = paste(textarea, {
+      items: [
+        { kind: "string", type: "text/plain", getAsFile: () => null },
+        { kind: "string", type: "text/html", getAsFile: () => null },
+        { kind: "file", type: file.type, getAsFile: () => file },
+      ],
+      files: [file],
+    });
+
+    expect(event.defaultPrevented).toBe(true);
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file));
+    expect(textarea).toHaveValue("保留这段正文");
+  });
+
+  test("纯文本或非图片文件不被拦截，也不触发上传", () => {
+    const onUpload = vi.fn(async () => ({ kind: "file", url: "/api/media/file" }) as MediaRef);
+    render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const textarea = screen.getByPlaceholderText("给 OpenClaude 发消息…");
+
+    const textEvent = paste(textarea, {
+      items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
+      files: [],
+    });
+    const pdf = new File(["pdf"], "report.pdf", { type: "application/pdf" });
+    const fileEvent = paste(textarea, {
+      items: [{ kind: "file", type: pdf.type, getAsFile: () => pdf }],
+      files: [pdf],
+    });
+
+    expect(textEvent.defaultPrevented).toBe(false);
+    expect(fileEvent.defaultPrevented).toBe(false);
+    expect(onUpload).not.toHaveBeenCalled();
+  });
+});
+
 describe("F2 「+」按钮闭合态目标角标", () => {
   test("有活跃目标（未近预算）→ 触发按钮显 accent 圆点", () => {
     render(<Composer onSend={() => {}} onUpload={uploadStub} goal={goalFixture()} />);
