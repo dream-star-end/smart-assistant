@@ -37,6 +37,12 @@
       "reason": "受控 synthetic A/B 在预部署发现并行委派规则带来固定 prompt 开销后进行主动优化；候选从未上线，不对应生产用户、计费或数据事故。",
       "approvedBy": "dx 2026-07-28 指示按方案推进、一定做好评测，并后续要求继续",
       "expiresAt": "2026-08-28"
+    },
+    {
+      "commit": "aeb97a4f7",
+      "reason": "受控 synthetic pilot 在预部署发现并行工具清单与规则命令性不足后进行纠偏；候选从未上线，synthetic persona 与定时任务均已恢复，不对应生产用户、计费或数据事故。",
+      "approvedBy": "dx 2026-07-30 指示继续完成并充分评测后上线",
+      "expiresAt": "2026-08-30"
     }
   ]
 }
