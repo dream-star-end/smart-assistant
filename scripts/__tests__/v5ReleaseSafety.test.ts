@@ -6428,6 +6428,21 @@ wait $!
       /const deadline = Date\.now\(\) \+ TURN_WAIT_TIMEOUT;/,
       'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT',
     )
+    const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "deepseek-v4-flash";')
+    const modelTrigger = journeySource.indexOf('page.getByRole("button", { name: "选择对话模型" })')
+    const modelItem = journeySource.indexOf('page.locator(`[data-model-id="${JOURNEY_MODEL_ID}"]`)')
+    const modelApplied = journeySource.indexOf('modelTrigger.textContent()')
+    const j2 = journeySource.indexOf('await step("J2 ')
+    const j4 = journeySource.indexOf('await step("J4 ')
+    assert.ok(modelPin >= 0, 'journey 必须固定使用刚由最小功能核真 turn 验证过的 DeepSeek V4 Flash')
+    assert.ok(
+      modelTrigger > modelPin && modelItem > modelTrigger && modelApplied > modelItem,
+      'journey 必须经真实模型选择器选中固定模型并等待触发器回显',
+    )
+    assert.ok(
+      modelApplied < j2 && modelApplied < j4,
+      '固定模型必须在附件上传与首次 UI 发送之前生效，禁止账号历史粘滞模型决定 J5',
+    )
     assert.ok(j5TimeoutMs >= 180_000, '生产正常慢轮已超过 120s，J5 等待窗不得退回旧阈值')
     assert.ok(
       outerTimeoutMs >= preJ5TimeoutMs + j5TimeoutMs + 30_000,

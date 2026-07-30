@@ -68,6 +68,12 @@ const BOOT_TIMEOUT = 60_000;
 /** J1-J4 的总防挂预算；进入 J5 后改由 TURN_WAIT_TIMEOUT 单独计时。 */
 const PRE_J5_TIMEOUT = 240_000;
 /**
+ * 旅程固定使用刚由同一 minimum_functional_core 真 turn 矩阵验证过的 CCB 模型。
+ * 不继承 canary 账号历史会话的粘滞模型，否则 provider 的既有波动会把 UI/附件门
+ * 变成随机模型健康探针，既重复前一道门，又无法归因到 J1-J5 用户路径。
+ */
+const JOURNEY_MODEL_ID = "deepseek-v4-flash";
+/**
  * J5 等一轮真回复的上限。2026-07-28 两次生产慢轮分别在 122.53s / 126.70s
  * 正常 completed，120s 会把真实成功误判成挂起；180s 只扩等待窗，失败签名与附件
  * 探针等成功判据仍保持不变。
@@ -246,6 +252,24 @@ try {
     // 旅程在全新会话里跑,不污染既有会话的历史。
     await page.getByText("新建会话", { exact: true }).first().click();
     await page.locator("textarea").first().waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+
+    // 走真实模型选择器固定本轮模型，不直接改 storage/API。触发器回显菜单项的权威
+    // display_name 才算选择生效；模型缺失、降级禁选或 UI 状态未更新都会 fail-loud。
+    const modelTrigger = page.getByRole("button", { name: "选择对话模型" });
+    await modelTrigger.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    await modelTrigger.click();
+    const modelItem = page.locator(`[data-model-id="${JOURNEY_MODEL_ID}"]`);
+    await modelItem.waitFor({ state: "visible", timeout: STEP_TIMEOUT });
+    const journeyModelLabel = (await modelItem.textContent())?.trim();
+    if (!journeyModelLabel) throw new Error(`旅程模型 ${JOURNEY_MODEL_ID} 缺少可见展示名`);
+    await modelItem.click();
+    const modelDeadline = Date.now() + STEP_TIMEOUT;
+    while (!((await modelTrigger.textContent()) ?? "").includes(journeyModelLabel)) {
+      if (Date.now() > modelDeadline) {
+        throw new Error(`模型选择器未在超时窗内切换到 ${JOURNEY_MODEL_ID}`);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
   });
 
   const probeName = `e2e-journey-${Date.now().toString(36)}.txt`;
