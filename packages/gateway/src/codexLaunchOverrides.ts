@@ -100,7 +100,7 @@ See the \`memory-management\` skill for details.
 
 - \`skill_search\` / \`skill_list\` / \`skill_view\` / \`skill_save\` / \`skill_delete\` — platform skills.
 - \`create_reminder\` / \`list_reminders\` / \`update_reminder\` / \`delete_reminder\` — manage scheduled reminders/tasks.
-- \`delegate_task\` (sync) / \`send_to_agent\` (async) — talk to sibling agents.
+- \`delegate_task\` (sync) / \`delegate_tasks\` (parallel fan-out) / \`send_to_agent\` (async) — talk to sibling agents.
 
 Do **not** read OR write codex's built-in \`~/.codex/memories/\` or
 \`~/.codex/skills/\` to manage platform state — those are codex-private and
@@ -134,7 +134,6 @@ design mockups, prefer a fenced \`htmlpreview\` block directly in the reply
 unless the user explicitly asks for a saved/downloadable file.
 
 ---
-
 `
 
 // ── mcp-memory / vision entry resolution + vision MCP env ──

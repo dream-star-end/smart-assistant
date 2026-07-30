@@ -286,7 +286,10 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     // 这里只固化静态 prompt 契约;是否真的并行、质量和资源是否达标由
     // evals/v5-parallel-delegation 的双底座真 turn A/B 门验证。
     for (const rule of [
+      '用户未明确要求单Agent',
+      '平台已列出合适可用成员',
       '可拆为2–4个输入/产物互不依赖',
+      '首轮必须恰好调用一次`delegate_tasks`',
       '通常同时≤3，其余由平台有界排队',
       '选匹配成员',
       '简单、强依赖、外部限流或CPU/内存饱和时保持单Agent',
@@ -295,7 +298,7 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       '负责拆分、单写者、集成并逐项验证',
       '子Agent不得再委派',
       '禁止底座原生multi-agent及后台Bash fan-out',
-      '只重试失败或缺失分片',
+      '返回后只重试失败或缺失分片',
     ]) {
       assert.ok(prompt.includes(rule), `普通模式提示缺受控并行契约: ${rule}`)
     }
@@ -373,6 +376,10 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.equal(
       readFileSync(join(dir, 'codex-preamble.md'), 'utf8'),
       codexInternals.CODEX_PREAMBLE,
+    )
+    assert.ok(
+      codexInternals.CODEX_PREAMBLE.includes('`delegate_tasks` (parallel fan-out)'),
+      'Codex preamble 必须明确列出平台并行委派工具',
     )
   })
 })
