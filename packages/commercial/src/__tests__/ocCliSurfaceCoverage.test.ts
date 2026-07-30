@@ -700,10 +700,19 @@ function productionSurfaces(): Record<string, Set<string>> {
 describe('V5 oc-* public surface coverage contract', () => {
   test('oc-browser pins the official CLI to the same Playwright build as internal MCP consumers', () => {
     const dockerfile = source('packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
+    const buildImage = source('packages/commercial/agent-sandbox/build-image.sh')
     assert.match(dockerfile, /ARG OC_PLAYWRIGHT_MCP_VERSION=0\.0\.76/)
     assert.match(dockerfile, /ARG OC_PLAYWRIGHT_CLI_VERSION=0\.1\.14/)
     assert.match(dockerfile, /test "\$MCP_PW_VERSION" = "\$CLI_PW_VERSION"/)
     assert.match(dockerfile, /playwright-cli --version/)
+    assert.match(
+      dockerfile,
+      /COPY --chown=root:root \.\/playwright-cli\.config\.json \/etc\/openclaude\/playwright-cli\.config\.json/,
+    )
+    assert.match(
+      buildImage,
+      /cp "\$SANDBOX_DIR\/playwright-cli\.config\.json" "\$BUILD_CTX\/playwright-cli\.config\.json"/,
+    )
   })
 
   test('every bundled oc-* tool has an executable operation matrix (and no stale row)', () => {

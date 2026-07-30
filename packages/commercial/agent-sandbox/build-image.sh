@@ -370,6 +370,7 @@ fi
 
 # 2. Dockerfile + runtime/(镜像薄壳+构建期文件) + platform-runtime/(bundle 源,dev fallback COPY)
 cp "$SANDBOX_DIR/Dockerfile.openclaude-runtime" "$BUILD_CTX/Dockerfile.openclaude-runtime"
+cp "$SANDBOX_DIR/playwright-cli.config.json" "$BUILD_CTX/playwright-cli.config.json"
 rm -rf "$BUILD_CTX/runtime"
 cp -r "$SANDBOX_DIR/runtime" "$BUILD_CTX/runtime"
 rm -rf "$BUILD_CTX/platform-runtime"
