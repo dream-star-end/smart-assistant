@@ -35,7 +35,7 @@ oc-browser close
 
 ```bash
 oc-browser goto https://example.com/next
-oc-browser find "登录"
+oc-browser snapshot  # 在输出中定位“登录”对应的 ref
 oc-browser click e12
 oc-browser dblclick e12
 oc-browser fill e5 "文本" --submit
@@ -47,7 +47,7 @@ oc-browser reload
 oc-browser tab-list
 oc-browser tab-new https://example.com
 oc-browser tab-select 0
-oc-browser eval "document.title"
+oc-browser eval "() => document.title"
 oc-browser state-save /home/agent/.openclaude/generated/auth-state.json
 ```
 
