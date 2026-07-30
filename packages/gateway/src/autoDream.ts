@@ -133,7 +133,11 @@ export class AutoDreamStructuredOutputCollector {
       }
       return
     }
-    if (event.kind === 'turn_status') return
+    // Token metering is a sideband of the same hermetic model turn. It carries
+    // no proposal content or tool authority; the single structured final
+    // remains the only accepted Auto-Dream result.
+    if (event.kind === 'turn_status' || event.kind === 'usage' || event.kind === 'call_usage')
+      return
     this.invalidEvent ??= event.kind
   }
 
