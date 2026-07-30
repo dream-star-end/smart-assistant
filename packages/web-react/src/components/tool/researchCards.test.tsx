@@ -450,18 +450,18 @@ describe("4 个新专属卡", () => {
     expect(screen.getByText(/任务号 abc123/)).toBeInTheDocument();
   });
 
-  test("oc-browser navigate → 打开网页语义正文(URL 链接,无原始 stdout)", () => {
+  test("oc-browser open → 打开网页语义正文(URL 链接,无原始 stdout)", () => {
     const { container } = render(
       <div>
         {researchToolCard(
-          "oc-browser navigate --url https://example.com",
+          "oc-browser open https://example.com",
           tool({ output: "- Ran Playwright code\n- Page snapshot: huge a11y tree ..." }),
         )}
       </div>,
     );
     expect(screen.getByText("打开网页")).toBeInTheDocument();
     expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
-    // navigate 不展示原始 a11y dump。
+    // open 不展示原始 a11y dump。
     expect(container.textContent).not.toContain("huge a11y tree");
   });
 
@@ -471,7 +471,7 @@ describe("4 个新专属卡", () => {
     const { container } = render(
       <MediaSignProvider sign={sign}>
         {researchToolCard(
-          "oc-browser screenshot --path /home/agent/shot.png",
+          "oc-browser screenshot --filename=/home/agent/shot.png",
           tool({ output: "Saved screenshot" }),
         )}
       </MediaSignProvider>,
@@ -482,7 +482,7 @@ describe("4 个新专属卡", () => {
 });
 
 describe("BrowserCliCard 复合命令 + 失败原因", () => {
-  // 真实 playwright-mcp 成功输出形状(navigate 后的 markdown)。
+  // 官方 Playwright CLI 成功输出形状(open 后的 markdown)。
   const PLAYWRIGHT_OK = [
     "### Ran Playwright code",
     "```js",
@@ -495,18 +495,17 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
     "- generic [ref=e1]: huge a11y tree ...",
   ].join("\n");
 
-  // 真实失败输出(取证自生产:文件在允许根之外)。
+  // 官方 CLI 的失败由 Bash 非零退出码标记；正文保留首个 Error 行。
   const BROWSER_ERR = [
-    "### Error",
-    "Error: File access denied: /home/agent/.openclaude/generated/tool-card-example.png is outside allowed roots. Allowed roots: /opt/openclaude/.playwright-mcp, /opt/openclaude",
-    "ls: cannot access '/home/agent/.openclaude/generated/tool-card-example.png': No such file or directory",
+    "Error: Browser 'browser' is not open.",
+    "Run oc-browser open to start the browser session.",
   ].join("\n");
 
-  test("navigate && snapshot 复合命令 → 动作序列标题 + 快照折叠", () => {
+  test("open && snapshot 复合命令 → 动作序列标题 + 快照折叠", () => {
     const { container } = render(
       <div>
         {researchToolCard(
-          "oc-browser navigate --url https://example.com && oc-browser snapshot",
+          "oc-browser open https://example.com && oc-browser snapshot",
           tool({ output: PLAYWRIGHT_OK }),
         )}
       </div>,
@@ -517,12 +516,12 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
     expect(screen.getByText("查看页面快照")).toBeInTheDocument();
   });
 
-  test("navigate 成功 → 从输出提取 Page Title 一行标题,其余 markdown 照旧隐藏", () => {
+  test("open 成功 → 从输出提取 Page Title 一行标题,其余 markdown 照旧隐藏", () => {
     render(
-      <div>{researchToolCard("oc-browser navigate --url https://example.com", tool({ output: PLAYWRIGHT_OK }))}</div>,
+      <div>{researchToolCard("oc-browser open https://example.com", tool({ output: PLAYWRIGHT_OK }))}</div>,
     );
     expect(screen.getByText("Example Domain")).toBeInTheDocument();
-    // 纯 navigate 无折叠详情 → 原始 markdown 不进 DOM。
+    // 纯 open 无折叠详情 → 原始 markdown 不进 DOM。
     expect(screen.queryByText(/Ran Playwright code/)).toBeNull();
     expect(screen.queryByText(/huge a11y tree/)).toBeNull();
   });
@@ -531,23 +530,23 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
     render(
       <div>
         {researchToolCard(
-          "oc-browser screenshot --path /home/agent/.openclaude/generated/tool-card-example.png",
+          "oc-browser screenshot --filename=/home/agent/.openclaude/generated/tool-card-example.png",
           tool({ output: BROWSER_ERR, error: true }),
         )}
       </div>,
     );
     expect(screen.getByText("截图")).toBeInTheDocument();
-    const reason = screen.getByText(/^Error: File access denied/);
+    const reason = screen.getAllByText(/^Error: Browser/)[0];
     expect(reason.className).toContain("text-danger");
-    expect(reason.textContent).not.toContain("### Error"); // 标头已剥
+    expect(reason.textContent).not.toContain("### Error");
     expect(screen.getByText("错误详情")).toBeInTheDocument(); // 完整输出进折叠区
   });
 
-  test("输出含 ### Error(Bash exit 0 未标 error)也给出 danger 原因", () => {
+  test("输出含 Error 时即使上层漏标 error 也不给绿色完成", () => {
     render(
-      <div>{researchToolCard("oc-browser navigate --url https://bad.example", tool({ output: BROWSER_ERR }))}</div>,
+      <div>{researchToolCard("oc-browser open https://bad.example", tool({ output: BROWSER_ERR }))}</div>,
     );
-    expect(screen.getByText(/^Error: File access denied/).className).toContain("text-danger");
+    expect(screen.getAllByText(/^Error: Browser/)[0].className).toContain("text-danger");
   });
 
   test("非 oc-browser 的失败仍走通用错误正文(不受 error-aware 白名单影响)", () => {

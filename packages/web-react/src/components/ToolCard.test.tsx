@@ -286,17 +286,17 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       <ToolCard
         message={{
           toolName: "Bash",
-          inputJson: { command: "oc-browser click --element '登录按钮' --ref e12" },
+          inputJson: { command: "oc-browser click e12" },
           output: "Clicked element e12",
           _completed: true,
         }}
       />,
     );
-    const header = screen.getByRole("button", { name: /点击页面.*登录按钮.*完成/ });
+    const header = screen.getByRole("button", { name: /点击页面.*元素 e12.*完成/ });
     expect(container.querySelectorAll(".rounded-xl.border")).toHaveLength(1);
     fireEvent.click(header);
     expect(screen.getAllByText("点击页面").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText(/登录按钮/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/元素 e12/).length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText(/oc-browser click/)).not.toBeInTheDocument();
   });
 

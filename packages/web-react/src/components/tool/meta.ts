@@ -40,6 +40,7 @@ import {
   Users,
   Video,
   Wrench,
+  XCircle,
   type LucideIcon,
 } from "lucide-react";
 import { agentDisplayName } from "../chat/agentNames";
@@ -295,6 +296,15 @@ function commandFlag(command: string, flag: string): string {
   return match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
 }
 
+function browserCommandArgs(command: string, op: string): string[] {
+  if (!op) return [];
+  const match = new RegExp(`oc-browser\\s+${op.replace("-", "\\-")}\\b([^\\n;&|]*)`, "i").exec(command);
+  if (!match) return [];
+  return [...(match[1] ?? "").matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(
+    (token) => token[1] ?? token[2] ?? token[3] ?? "",
+  );
+}
+
 function displayDomain(value: string): string {
   try {
     return new URL(value).hostname.replace(/^www\./, "");
@@ -308,13 +318,19 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
   const op = commandOp(command, cli);
   if (cli === "oc-browser") {
     const map: Record<string, ToolMeta> = {
-      navigate: { icon: Globe, label: "打开网页", tone: "info" },
+      open: { icon: Globe, label: "打开网页", tone: "info" },
+      goto: { icon: Globe, label: "打开网页", tone: "info" },
       snapshot: { icon: AppWindow, label: "读取页面", tone: "info" },
+      find: { icon: Search, label: "查找页面", tone: "info" },
       click: { icon: MousePointer2, label: "点击页面", tone: "info" },
+      dblclick: { icon: MousePointer2, label: "双击页面", tone: "info" },
+      fill: { icon: Keyboard, label: "输入文本", tone: "info" },
       type: { icon: Keyboard, label: "输入文本", tone: "info" },
-      "press-key": { icon: Keyboard, label: "按键", tone: "info" },
+      press: { icon: Keyboard, label: "按键", tone: "info" },
       screenshot: { icon: Camera, label: "网页截图", tone: "info" },
-      "wait-for": { icon: Clock, label: "等待页面", tone: "info" },
+      "go-back": { icon: Globe, label: "返回上一页", tone: "info" },
+      reload: { icon: Globe, label: "刷新网页", tone: "info" },
+      close: { icon: XCircle, label: "关闭浏览器", tone: "info" },
     };
     return map[op] ?? base;
   }
@@ -353,14 +369,14 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
 function ocCommandSummary(cli: OcCli, command: string): string {
   const op = commandOp(command, cli);
   if (cli === "oc-browser") {
-    const url = commandFlag(command, "url");
-    if (url) return displayDomain(url);
-    return (
-      commandFlag(command, "element") ||
-      commandFlag(command, "text").slice(0, 60) ||
-      commandFlag(command, "key") ||
-      op
-    );
+    const args = browserCommandArgs(command, op);
+    if (op === "open" || op === "goto" || op === "tab-new") {
+      return args[0] ? displayDomain(args[0]) : op;
+    }
+    if (op === "fill") return (args[1] ?? args[0] ?? op).slice(0, 60);
+    if (op === "type" || op === "press" || op === "find") return (args[0] ?? op).slice(0, 60);
+    if (op === "click" || op === "dblclick") return args[0] ? `元素 ${args[0]}` : op;
+    return commandFlag(command, "filename") || op;
   }
   if (cli === "oc-web") {
     const url = commandFlag(command, "url") || command.match(/https?:\/\/[^\s'";|]+/)?.[0] || "";

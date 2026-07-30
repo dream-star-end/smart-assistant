@@ -1310,16 +1310,22 @@ function MinimaxCliCard({ command, tool }: { command: string; tool: ToolLike }):
 // ── oc-browser(浏览器操作)──────────────────────────────────────────────────────
 
 const BROWSER_ACTIONS: Record<string, { icon: ReactNode; title: string }> = {
-  navigate: { icon: <Globe className="size-4" />, title: "打开网页" },
+  open: { icon: <Globe className="size-4" />, title: "打开网页" },
+  goto: { icon: <Globe className="size-4" />, title: "打开网页" },
   snapshot: { icon: <AppWindow className="size-4" />, title: "页面快照" },
+  find: { icon: <Search className="size-4" />, title: "查找页面" },
   click: { icon: <MousePointer2 className="size-4" />, title: "点击" },
+  dblclick: { icon: <MousePointer2 className="size-4" />, title: "双击" },
+  fill: { icon: <Keyboard className="size-4" />, title: "输入文本" },
   type: { icon: <Keyboard className="size-4" />, title: "输入文本" },
-  "press-key": { icon: <Keyboard className="size-4" />, title: "按键" },
+  press: { icon: <Keyboard className="size-4" />, title: "按键" },
   screenshot: { icon: <Camera className="size-4" />, title: "截图" },
-  "wait-for": { icon: <Clock className="size-4" />, title: "等待" },
+  "go-back": { icon: <Globe className="size-4" />, title: "返回上一页" },
+  reload: { icon: <Globe className="size-4" />, title: "刷新网页" },
+  close: { icon: <XCircle className="size-4" />, title: "关闭浏览器" },
 };
 
-/** 命令里全部 oc-browser <verb>(复合命令 `navigate … && oc-browser snapshot` 按出现顺序全识别;
+/** 命令里全部 oc-browser <verb>(复合命令 `open … && oc-browser snapshot` 按出现顺序全识别;
  *  只收已登记动作,一个都不认 → 空数组,调用方回落)。 */
 function browserSubcommands(command: string): string[] {
   const verbs: string[] = [];
@@ -1330,6 +1336,14 @@ function browserSubcommands(command: string): string[] {
   return verbs;
 }
 
+function browserArgs(command: string, verb: string): string[] {
+  const match = new RegExp(`oc-browser\\s+${verb.replace("-", "\\-")}\\b([^\\n;&|]*)`, "i").exec(command);
+  if (!match) return [];
+  return [...(match[1] ?? "").matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(
+    (token) => token[1] ?? token[2] ?? token[3] ?? "",
+  );
+}
+
 /** 从文本里找容器绝对图片路径(截图落盘路径),用于截图预览。 */
 function findImagePath(text: string | null): string | null {
   if (!text) return null;
@@ -1337,7 +1351,7 @@ function findImagePath(text: string | null): string | null {
   return m ? m[0] : null;
 }
 
-/** playwright-mcp 成功输出里的页面标题(`- Page Title: …` 行);无 → ""。 */
+/** Playwright CLI 成功输出里的页面标题(`- Page Title: …` 行);无 → ""。 */
 function pageTitleOf(text: string | null): string {
   if (!text) return "";
   const m = /^\s*-?\s*Page Title:\s*(.+)$/im.exec(text);
@@ -1353,24 +1367,26 @@ function firstErrorLine(text: string | null): string {
 }
 
 /** oc-browser <verb…> → 动作序列 + URL/元素/文本 + 结果状态;截图产物缩略图;失败给出首个
- *  Error 行(danger)+ 完整输出折叠。成功的 navigate 从输出提取 Page Title 作一行标题。隐藏原始 stdout。 */
+ *  Error 行(danger)+ 完整输出折叠。成功的 open/goto 从输出提取 Page Title。 */
 function BrowserCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
   const subs = browserSubcommands(command);
   if (subs.length === 0) return null;
   const out = outputText(tool);
-  // playwright-mcp 的失败是 markdown "### Error" 段(Bash 本身可能 exit 0 → tool.error 为假),
-  // 与 tool.error 同视为失败,否则错误卡显示"已完成"误导用户。
-  const error = !!tool.error || /^#{1,6}\s*Error\b/m.test(out ?? "");
+  const error = !!tool.error || /^(?:#{1,6}\s*)?Error\b/im.test(out ?? "");
   const reason = error ? firstErrorLine(out) : "";
-  const url = parseCommandFlag(command, "url");
-  const element = parseCommandFlag(command, "element");
-  const text = parseCommandFlag(command, "text");
-  const key = parseCommandFlag(command, "key");
+  const navigationVerb = subs.find((sub) => sub === "open" || sub === "goto" || sub === "tab-new");
+  const url = navigationVerb ? (browserArgs(command, navigationVerb)[0] ?? "") : "";
+  const elementVerb = subs.find((sub) => sub === "click" || sub === "dblclick" || sub === "fill");
+  const elementRef = elementVerb ? (browserArgs(command, elementVerb)[0] ?? "") : "";
+  const fillArgs = subs.includes("fill") ? browserArgs(command, "fill") : [];
+  const typeArgs = subs.includes("type") ? browserArgs(command, "type") : [];
+  const text = fillArgs[1] ?? typeArgs[0] ?? "";
+  const key = subs.includes("press") ? (browserArgs(command, "press")[0] ?? "") : "";
   const shot =
     !error && subs.includes("screenshot")
-      ? safeArtifactSrc(parseCommandFlag(command, "path")) || findImagePath(out)
+      ? safeArtifactSrc(parseCommandFlag(command, "filename")) || findImagePath(out)
       : null;
-  const pageTitle = !error && subs.includes("navigate") ? pageTitleOf(out) : "";
+  const pageTitle = !error && navigationVerb ? pageTitleOf(out) : "";
   const domain = url ? domainOf(url) : undefined;
   return (
     <CardShell
@@ -1384,7 +1400,7 @@ function BrowserCliCard({ command, tool }: { command: string; tool: ToolLike }):
           <Chip href={url}>{domain ?? url}</Chip>
         </div>
       )}
-      {element && <div className="mt-1.5 text-[13px] leading-snug text-fg">{element}</div>}
+      {elementRef && <div className="mt-1.5 text-[13px] leading-snug text-fg">元素 {elementRef}</div>}
       {text && <div className="mt-1 text-[13px] leading-snug text-fg">输入:{text}</div>}
       {key && <div className="mt-1 text-[13px] leading-snug text-fg">按键:{key}</div>}
       {shot && (

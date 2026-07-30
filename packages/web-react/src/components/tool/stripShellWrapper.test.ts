@@ -28,7 +28,7 @@ describe("stripShellWrapperForDisplay(legacy Bash 包装)", () => {
   });
 
   test("非包装命令原样透传(oc-browser 复合命令不受影响)", () => {
-    const raw = "oc-browser navigate --url https://example.com && oc-browser snapshot";
+    const raw = "oc-browser open https://example.com && oc-browser snapshot";
     expect(stripShellWrapperForDisplay(raw)).toBe(raw);
   });
 

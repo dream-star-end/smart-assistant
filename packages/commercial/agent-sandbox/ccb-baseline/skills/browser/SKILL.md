@@ -1,40 +1,64 @@
 ---
 name: browser
-description: 用 `oc-browser` 命令行操作真实浏览器(有状态,跨调用共享同一会话):导航、抓 accessibility 快照拿元素 ref、按 ref 点击/输入、截图、等待。用户要打开网页、点按钮、填表单、登录、抓动态页面数据时使用。
+description: 用官方 Playwright CLI 操作真实浏览器：打开网页、抓 accessibility 快照、按 ref 点击/输入、管理标签页、截图和保存登录状态。用户要操作动态网页、填表、登录或视觉确认时使用。
 tags: [browser, playwright, automation, web]
 priority: 5
 ---
 
-# 浏览器操作（oc-browser CLI）
+# 浏览器操作（Playwright CLI）
 
-当用户要**打开网页、点击、填表单、登录、操作页面、抓取需要交互/渲染的动态内容**时,用容器内的 **`oc-browser` 命令行**(Bash 调用)。它背后是一个常驻 daemon,keep-alive 一个 Playwright 浏览器会话——所以**多次 `oc-browser` 调用共享同一个浏览器**(先 navigate/snapshot,再 click,状态连续)。普通"读一个公开 URL 的正文"用 `oc-web extract`(见 `skill_view("web-context")`)更轻;需要点/填/登录/等渲染才用浏览器。
+当用户要**打开网页、点击、填表单、登录、操作页面或抓取动态内容**时，用 Bash 调
+`oc-browser`。它是平台为每个 Agent 隔离的官方 `playwright-cli` 启动器：命令语法、
+退出码和浏览器状态均来自 Playwright CLI，不经过 Playwright MCP。普通公开 URL 正文优先
+用 `oc-web extract`（见 `skill_view("web-context")`），需要交互或渲染时才开浏览器。
 
-## 核心工作流:先 snapshot 拿 ref,再按 ref 操作
+## 核心流程：open → snapshot → 按 ref 操作
 
 ```bash
-oc-browser navigate --url https://example.com        # 打开页面
-oc-browser snapshot                                  # 拿 accessibility tree + 每个元素的 ref(如 e7)和描述
-oc-browser click --ref e7 --element "登录按钮"        # 按 ref 点击(--element 是给人看的元素描述,必填)
-oc-browser type --ref e3 --element "邮箱输入框" --text "a@b.com" [--submit]
-oc-browser press-key --key Enter
-oc-browser wait-for --text "登录成功"                 # 或 --time <秒> / --text-gone <文本>
-oc-browser screenshot --path /home/agent/.openclaude/generated/page.png   # 需视觉确认时
+oc-browser open https://example.com
+oc-browser snapshot
+oc-browser click e7
+oc-browser fill e3 "a@b.com"
+oc-browser press Enter
+oc-browser snapshot
+oc-browser screenshot --filename=/home/agent/.openclaude/generated/page.png
+oc-browser close
 ```
 
-- **ref 来自 snapshot**:不要凭空编 ref。每次页面变化(导航、点击后)重新 `snapshot` 拿最新 ref。
-- `--element` 是必填的人类可读描述(配合 ref 提高稳健性)。
-- 优先 `snapshot`(文本、省 token)理解页面;只有需要给用户看视觉效果时才 `screenshot`。
-- 加 `--json` 看原始结果(含错误细节)。
+- 第一次使用必须 `open [url]`；已有会话后用 `goto <url>` 导航。
+- ref 必须来自最近一次 `snapshot`，不要猜。页面变化后重新 snapshot。
+- 输入框优先 `fill <ref> <text>`；当前已聚焦的输入框才用 `type <text>`。
+- 截图仅在视觉确认或交付图片时使用；普通理解页面优先 snapshot。
+- 完成后执行 `close`。Agent 中断时平台会在 30 分钟无浏览器操作后兜底回收。
 
-## 注意
+## 常用命令
 
-- 浏览器是 headless 的;会话有 idle 超时(一段时间无操作自动回收),长流程要连续操作。
-- 不要绕过 CAPTCHA、登录墙、反爬;遇到拦截如实告知用户并改用官方 API 或用户提供的数据。
-- 截图存到 `/home/agent/.openclaude/generated/<安全文件名>` 再把绝对路径写进最终回复,平台会渲染成文件卡片。
-- 每个 agent 有独立浏览器会话(独立 profile),互不干扰。
+```bash
+oc-browser goto https://example.com/next
+oc-browser find "登录"
+oc-browser click e12
+oc-browser dblclick e12
+oc-browser fill e5 "文本" --submit
+oc-browser hover e8
+oc-browser select e9 "option-value"
+oc-browser check e10
+oc-browser go-back
+oc-browser reload
+oc-browser tab-list
+oc-browser tab-new https://example.com
+oc-browser tab-select 0
+oc-browser eval "document.title"
+oc-browser state-save /home/agent/.openclaude/generated/auth-state.json
+```
 
-## 工具调用纪律(重要)
+如需登录状态跨浏览器重开保留，可在 `open` 时使用 `--persistent`；不要传 `-s`、
+`--session` 或 `--profile`，会话与 profile 由平台按 Agent 隔离。
 
-- **只用本 skill 对应的命令/工具传参调用**;它已把鉴权、端点、底层请求全封装好,你只需给参数。
-- **绝不**自己拼 `curl` / `wget` / 直连 HTTP,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token。
-- 命令失败时按本 skill 的失败处理重试或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
+## 失败恢复
+
+- 若提示浏览器未打开，只执行一次 `open <最后确认的 URL>`，然后重新 snapshot。
+- **绝不自动重放** click/fill/press 等可能产生副作用的动作。
+- 命令失败就读取 stderr，修正 ref/参数或如实说明；不要改用 curl/私有接口绕过网页流程。
+- 不绕过 CAPTCHA、登录墙或反爬；遇到拦截时请用户接管登录或改用官方 API/用户数据。
+
+截图和交付文件写到 `/home/agent/.openclaude/generated/<安全文件名>`，最终回复给出绝对路径。

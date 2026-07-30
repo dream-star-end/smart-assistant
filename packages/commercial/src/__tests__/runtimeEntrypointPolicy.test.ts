@@ -239,7 +239,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(
       src,
       /mcpServers:\s*\[\]/,
-      "minimal openclaude.json must mount no MCP servers now (browser is the oc-browser daemon)",
+      "minimal openclaude.json must mount no MCP servers now (browser uses the official CLI)",
     );
     // browser + scansci-pdf + web-context all retired from MCP → CLI (baseline
     // skills). The minimal config must not re-introduce them, and upsert must
@@ -252,7 +252,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.doesNotMatch(
       src,
       /@playwright\/mcp/,
-      "entrypoint must not reference @playwright/mcp (browser is the oc-browser daemon now)",
+      "entrypoint must not reference @playwright/mcp (Agent browser uses the official CLI)",
     );
     assert.doesNotMatch(
       src,

@@ -32,13 +32,14 @@ describe('WeChat channel operation skill prompt', () => {
     assert.match(slot.content, /txt` 或 `md/)
   })
 
-  it('always advertises the oc-browser CLI workflow (browser retired from MCP)', async () => {
-    // browser is now the always-available oc-browser daemon + CLI, so the section
-    // no longer depends on availableMcpTools and never mentions browser_* tools.
+  it('always advertises the official Playwright CLI workflow (browser retired from MCP)', async () => {
+    // Browser is now the always-available isolated oc-browser launcher +
+    // official Playwright CLI; it never depends on browser_* MCP tools.
     const slot = await buildAgentsSlot({ agentId: 'main', availableMcpTools: [] })
     assert.match(slot.content, /## 浏览器操作 \(CLI\)/)
-    assert.match(slot.content, /oc-browser navigate --url/)
+    assert.match(slot.content, /oc-browser open <url>/)
     assert.match(slot.content, /oc-browser snapshot/)
+    assert.match(slot.content, /oc-browser fill <ref>/)
     assert.match(slot.content, /skill_view\("browser"\)/)
     assert.doesNotMatch(slot.content, /browser_navigate|browser_snapshot/)
   })
