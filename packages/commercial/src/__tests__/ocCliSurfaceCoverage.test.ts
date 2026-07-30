@@ -98,6 +98,7 @@ function browserLauncherProbe(): void {
   const value = readFileSync(join(BIN_DIR, 'oc-browser.sh'), 'utf8')
   assert.match(value, /cli_bin=\/usr\/local\/bin\/playwright-cli/)
   assert.match(value, /XDG_CACHE_HOME="\$cache_home" PLAYWRIGHT_CLI_SESSION="\$session_name"/)
+  assert.match(value, /PWTEST_SOCKETS_DIR="\$state_dir\/sockets"/)
   assert.match(value, /sha256sum/)
   assert.match(value, /flock -x 9/)
   assert.match(value, /__openclaude_reap/)
@@ -701,10 +702,22 @@ describe('V5 oc-* public surface coverage contract', () => {
   test('oc-browser pins the official CLI to the same Playwright build as internal MCP consumers', () => {
     const dockerfile = source('packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
     const buildImage = source('packages/commercial/agent-sandbox/build-image.sh')
+    const cliConfig = JSON.parse(
+      source('packages/commercial/agent-sandbox/playwright-cli.config.json'),
+    )
     assert.match(dockerfile, /ARG OC_PLAYWRIGHT_MCP_VERSION=0\.0\.76/)
     assert.match(dockerfile, /ARG OC_PLAYWRIGHT_CLI_VERSION=0\.1\.14/)
     assert.match(dockerfile, /test "\$MCP_PW_VERSION" = "\$CLI_PW_VERSION"/)
     assert.match(dockerfile, /playwright-cli --version/)
+    assert.deepEqual(cliConfig, {
+      browser: {
+        browserName: 'chromium',
+        launchOptions: { chromiumSandbox: false },
+      },
+    })
+    assert.match(dockerfile, /oc-browser open about:blank/)
+    assert.match(dockerfile, /oc-browser snapshot/)
+    assert.match(dockerfile, /oc-browser close/)
     assert.match(
       dockerfile,
       /COPY --chown=root:root \.\/playwright-cli\.config\.json \/etc\/openclaude\/playwright-cli\.config\.json/,

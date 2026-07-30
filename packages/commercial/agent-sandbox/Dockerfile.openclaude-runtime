@@ -389,6 +389,18 @@ RUN set -eux; \
     "$PW_BIN" install --with-deps chromium; \
     playwright-cli --version; \
     chmod -R a+rX /usr/local/share/ms-playwright; \
+    SMOKE_HOME="$(mktemp -d)"; \
+    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
+      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
+      oc-browser open about:blank >/dev/null; \
+    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
+      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
+      oc-browser snapshot >/dev/null; \
+    OPENCLAUDE_AGENT_ID=image-build-smoke OPENCLAUDE_HOME="$SMOKE_HOME" \
+      OPENCLAUDE_PLAYWRIGHT_CLI_IDLE_SECONDS=60 OPENCLAUDE_PLAYWRIGHT_CLI_POLL_SECONDS=1 \
+      oc-browser close >/dev/null; \
+    sleep 2; \
+    rm -rf "$SMOKE_HOME" /tmp/openclaude-playwright-cli /tmp/pw-*; \
     npm cache clean --force; \
     rm -rf /root/.npm
 

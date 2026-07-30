@@ -31,6 +31,12 @@
       "reason": "预发布运行时镜像构建上下文漏拷贝 Playwright CLI 配置；构建在产物生成前失败，未创建镜像、未部署或切流，线上用户与生产数据均未受影响。",
       "approvedBy": "dx 2026-07-30 指示继续完成 Playwright CLI + Skill 迁移上线",
       "expiresAt": "2026-08-30"
+    },
+    {
+      "commit": "aa0a8c898",
+      "reason": "合成 v5-evals 上线验收发现 Playwright CLI 默认选择镜像中不存在的系统 Chrome；发现后立即使用官方 rollback 恢复旧稳定 tuple。GPT、计费和数据始终正常，未收到真实用户故障报告。",
+      "approvedBy": "dx 2026-07-30 指示继续完成 Playwright CLI + Skill 迁移上线",
+      "expiresAt": "2026-08-30"
     }
   ]
 }
