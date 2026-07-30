@@ -17,6 +17,27 @@ type Probe = () => void | Promise<void>
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
 const BIN_DIR = join(REPO_ROOT, 'packages/commercial/agent-sandbox/platform-runtime/bin')
 const TSX = join(REPO_ROOT, 'node_modules/tsx/dist/cli.mjs')
+const BROWSER_SKILL_ALLOWED_COMMANDS = new Set([
+  'check',
+  'click',
+  'close',
+  'dblclick',
+  'eval',
+  'fill',
+  'go-back',
+  'goto',
+  'hover',
+  'open',
+  'press',
+  'reload',
+  'screenshot',
+  'select',
+  'snapshot',
+  'state-save',
+  'tab-list',
+  'tab-new',
+  'tab-select',
+])
 
 function childEnv(patch: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...patch }
@@ -699,6 +720,21 @@ function productionSurfaces(): Record<string, Set<string>> {
 }
 
 describe('V5 oc-* public surface coverage contract', () => {
+  test('browser Skill only documents reviewed commands from the pinned Playwright CLI', () => {
+    const skill = source(
+      'packages/commercial/agent-sandbox/ccb-baseline/skills/browser/SKILL.md',
+    )
+    const commands = [...skill.matchAll(/^oc-browser\s+([a-z-]+)/gm)].map((match) => match[1]!)
+    const unsupported = [...new Set(commands)].filter(
+      (command) => !BROWSER_SKILL_ALLOWED_COMMANDS.has(command),
+    )
+    assert.deepEqual(unsupported, [])
+
+    for (const example of skill.match(/^oc-browser eval .*$/gm) ?? []) {
+      assert.match(example, /^oc-browser eval "\(\) => /)
+    }
+  })
+
   test('oc-browser pins the official CLI to the same Playwright build as internal MCP consumers', () => {
     const dockerfile = source('packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
     const buildImage = source('packages/commercial/agent-sandbox/build-image.sh')
