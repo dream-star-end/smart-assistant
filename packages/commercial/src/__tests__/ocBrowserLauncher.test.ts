@@ -43,7 +43,7 @@ function fixture(): {
   writeFileSync(
     fakeCli,
     `#!/bin/sh
-printf 'start\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$PLAYWRIGHT_CLI_SESSION" "$XDG_CACHE_HOME" "$PWD" "$*" "$PLAYWRIGHT_MCP_CONFIG" "\${PLAYWRIGHT_MCP_CDP_ENDPOINT:-}" >> "$OC_BROWSER_TEST_LOG"
+printf 'start\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$PLAYWRIGHT_CLI_SESSION" "$XDG_CACHE_HOME" "$PWD" "$*" "$PLAYWRIGHT_MCP_CONFIG" "\${PLAYWRIGHT_MCP_CDP_ENDPOINT:-}" "$PWTEST_SOCKETS_DIR" >> "$OC_BROWSER_TEST_LOG"
 if [ "\${1:-}" = hold ]; then sleep 2; fi
 printf 'end\\t%s\\n' "$*" >> "$OC_BROWSER_TEST_LOG"
 `,
@@ -111,6 +111,7 @@ test('registry/cache key includes raw Agent identity hash and CLI receives fixed
         OPENCLAUDE_AGENT_ID: agentId,
         PLAYWRIGHT_MCP_CDP_ENDPOINT: 'http://127.0.0.1:9222',
         PLAYWRIGHT_MCP_USER_DATA_DIR: '/tmp/shared-profile',
+        PWTEST_SOCKETS_DIR: '/tmp/shared-sockets',
       })
       assert.equal(result.code, 0, result.stderr)
     }
@@ -125,6 +126,8 @@ test('registry/cache key includes raw Agent identity hash and CLI receives fixed
     assert.equal(fields[1]?.[3], f.home)
     assert.notEqual(fields[0]?.[2], fields[1]?.[2], 'raw-id hash must prevent sanitized collisions')
     assert.match(fields[0]?.[2] ?? '', /\/tmp\/openclaude-playwright-cli\/a_b-[0-9a-f]{16}\/cache$/)
+    assert.notEqual(fields[0]?.[7], fields[1]?.[7], 'each Agent must use a distinct socket directory')
+    assert.match(fields[0]?.[7] ?? '', /\/tmp\/openclaude-playwright-cli\/a_b-[0-9a-f]{16}\/sockets$/)
     assert.equal(fields[0]?.[5], join(f.root, 'playwright-cli.config.json'))
     assert.equal(fields[0]?.[6], '')
   } finally {
@@ -161,6 +164,12 @@ test('per-Agent flock serializes commands and detached reaper closes only after 
     const snapshotEnd = afterReap.indexOf('end\tsnapshot')
     const closeStart = afterReap.findIndex((line) => line.endsWith('\tclose'))
     assert.ok(closeStart > snapshotEnd, 'idle reaper must close only after queued activity completes')
+    const starts = afterReap
+      .filter((line) => line.startsWith('start\t'))
+      .map((line) => line.split('\t'))
+    const snapshot = starts.find((fields) => fields[4] === 'snapshot')
+    const close = starts.find((fields) => fields[4] === 'close')
+    assert.equal(close?.[7], snapshot?.[7], 'idle reaper must close the same Agent socket')
   } finally {
     f.cleanup()
   }

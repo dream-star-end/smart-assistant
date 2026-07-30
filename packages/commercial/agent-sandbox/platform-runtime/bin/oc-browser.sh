@@ -75,6 +75,7 @@ reap_idle_session() {
         PLAYWRIGHT_MCP_CDP_TIMEOUT PLAYWRIGHT_MCP_EXTENSION \
         PLAYWRIGHT_MCP_STORAGE_STATE PLAYWRIGHT_MCP_USER_DATA_DIR
       XDG_CACHE_HOME="$cache_home" PLAYWRIGHT_CLI_SESSION="$session_name" \
+        PWTEST_SOCKETS_DIR="$state_dir/sockets" \
         PLAYWRIGHT_MCP_CONFIG="$config_file" \
         "$cli_bin" close 9>&- >/dev/null 2>&1 || true
     )
@@ -187,6 +188,7 @@ set +e
     PLAYWRIGHT_MCP_CDP_TIMEOUT PLAYWRIGHT_MCP_EXTENSION \
     PLAYWRIGHT_MCP_STORAGE_STATE PLAYWRIGHT_MCP_USER_DATA_DIR
   XDG_CACHE_HOME="$cache_home" PLAYWRIGHT_CLI_SESSION="$session_name" \
+    PWTEST_SOCKETS_DIR="$state_dir/sockets" \
     PLAYWRIGHT_MCP_CONFIG="$config_file" \
     "$cli_bin" "$@" 9>&-
 )
