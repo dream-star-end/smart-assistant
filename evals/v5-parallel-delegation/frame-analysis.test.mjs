@@ -142,6 +142,56 @@ describe("v5 parallel delegation frame evidence", () => {
     assert.equal(result.behavior.native_agent_calls, 1);
   });
 
+  it("unwraps CCB deferred ExecuteExtraTool delegate_tasks input", () => {
+    const frames = [
+      frame(1, [{
+        kind: "tool_use",
+        blockId: "ccb-batch",
+        toolName: "ExecuteExtraTool",
+        inputJson: {
+          tool_name: "mcp__openclaude-memory__delegate_tasks",
+          params: { tasks: [{ goal: "a" }, { goal: "b" }] },
+        },
+        partial: false,
+      }]),
+      frame(2, [{
+        kind: "tool_result",
+        blockId: "ccb-batch:result",
+        toolUseBlockId: "ccb-batch",
+        toolName: "ExecuteExtraTool",
+        isError: false,
+      }]),
+    ];
+    const result = analyzeFrames(frames, peer);
+    assert.equal(result.behavior.delegate_tasks_calls, 1);
+    assert.equal(result.behavior.max_shards, 2);
+    assert.equal(result.behavior.delegate_tasks_errors, 0);
+    assert.equal(result.retries, 0);
+  });
+
+  it("counts a malformed root ExecuteExtraTool as an abnormal retry", () => {
+    const frames = [
+      frame(1, [{
+        kind: "tool_use",
+        blockId: "ccb-malformed",
+        toolName: "ExecuteExtraTool",
+        inputJson: {},
+        partial: false,
+      }]),
+      frame(2, [{
+        kind: "tool_result",
+        blockId: "ccb-malformed:result",
+        toolUseBlockId: "ccb-malformed",
+        toolName: "ExecuteExtraTool",
+        isError: true,
+      }]),
+    ];
+    const result = analyzeFrames(frames, peer);
+    assert.equal(result.behavior.delegate_tasks_calls, 0);
+    assert.equal(result.behavior.delegate_tasks_errors, 0);
+    assert.equal(result.retries, 1);
+  });
+
   it("sums root tokens with one terminal snapshot per child usageRunId", () => {
     const frames = [
       {

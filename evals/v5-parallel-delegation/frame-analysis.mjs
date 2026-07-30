@@ -23,7 +23,23 @@ function normalizeTool(name, input) {
     }
     return { name: `${server}:${tool}`, input: args };
   }
-  return { name, input };
+  if (/^ExecuteExtraTool$/i.test(name)) {
+    const tool = input?.tool_name ?? "";
+    let params = input?.params ?? {};
+    if (typeof params === "string") {
+      try {
+        params = JSON.parse(params);
+      } catch {
+        params = {};
+      }
+    }
+    return {
+      name: typeof tool === "string" && tool ? tool : name,
+      input: params,
+      wrapper: "ExecuteExtraTool",
+    };
+  }
+  return { name, input, wrapper: null };
 }
 
 export function analyzeFrames(frames, peerId) {
@@ -76,6 +92,7 @@ export function analyzeFrames(frames, peerId) {
         tools.set(id, {
           name: normalized.name,
           input: normalized.input,
+          wrapper: normalized.wrapper ?? null,
           nested: insideDelegate || Boolean(node.parentToolUseId),
         });
       }
@@ -158,6 +175,13 @@ export function analyzeFrames(frames, peerId) {
   for (const [id, tool] of tools) {
     if (/delegate_tasks$/.test(tool.name) && results.get(id)?.isError !== false) {
       delegateTasksErrors++;
+    }
+    if (
+      tool.wrapper === "ExecuteExtraTool" &&
+      !tool.nested &&
+      results.get(id)?.isError === true
+    ) {
+      retries++;
     }
   }
 
