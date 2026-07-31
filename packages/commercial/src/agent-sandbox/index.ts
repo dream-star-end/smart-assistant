@@ -196,6 +196,19 @@ export { makePrewarmContainer } from "./v3prewarm.js";
 // 详见 ensureContainerSingleflight.ts 文件头注释 + index.ts `sharedEnsureRunning`。
 export { makeUidSingleflight } from "./ensureContainerSingleflight.js";
 
+// V5 exact-prompt evaluation overlay. Default path is inert; only the two fixed
+// synthetic UIDs plus a root-owned expiring record can activate it.
+export {
+  createSyntheticEvalOverlayRuntime,
+  DEFAULT_SYNTHETIC_EVAL_RECORD_PATH,
+  DEFAULT_SYNTHETIC_EVAL_RECORD_LOCK_PATH,
+  DEFAULT_SYNTHETIC_EVAL_STAGING_ROOT,
+  readSyntheticEvalReleaseSourceCommit,
+  sha256SyntheticEvalTree,
+  type SyntheticEvalOverlayRuntime,
+  type SyntheticEvalOverlayRuntimeOptions,
+} from "./syntheticEvalOverlayRuntime.js";
+
 // V3 multi-tenant media resolver — gateway 用它把 `/api/uploads` 写路径 +
 // `/api/media` 读路径(同时覆盖 codex image_gen 输出的 generated/ 子目录)
 // 路由到具体用户的 docker volume host path,避免 master/container 单租户

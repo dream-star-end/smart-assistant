@@ -98,6 +98,11 @@ import {
   OPENCLAUDE_DEFAULT_WORKSPACE_VALUE,
   OPENCLAUDE_WEB_CONTEXT_BIN_VALUE,
 } from "./platformBundle.js";
+import {
+  SYNTHETIC_EVAL_PROMPTS_BIND_TARGET,
+  SYNTHETIC_EVAL_PROMPT_SLOTS_BIND_TARGET,
+  type SyntheticEvalOverlayRuntime,
+} from "./syntheticEvalOverlayRuntime.js";
 
 // ───────────────────────────────────────────────────────────────────────
 // 常量(硬编码,设计有意为之)
@@ -991,6 +996,13 @@ export interface V3SupervisorDeps {
    * 行为逐字节同旧(v3 常态)。
    */
   runtimeTuple?: V3RuntimeTuple;
+  /**
+   * Default-no-op exact-prompt evaluation overlay. Production wiring only
+   * recognizes two fixed synthetic UIDs and a root-owned, expiring record.
+   * Omitted in tests/v3 and all normal containers retain byte-for-byte env,
+   * binds and labels.
+   */
+  syntheticEvalOverlay?: SyntheticEvalOverlayRuntime;
 }
 
 /** provision 成功后返回。3D ensureRunning 拿来注入到 userChatBridge */
@@ -2354,6 +2366,9 @@ export async function provisionV3Container(
   let boundCodexAccountId: bigint | null = null;
   // 实际打上的 bundle_rev label(在下方 runtimeLabels 组装处赋值)—— 中段块作用域外要读,故在此声明。
   let appliedBundleRev: string | undefined;
+  let syntheticEvalOverlay: ReturnType<
+    SyntheticEvalOverlayRuntime["resolvePrepared"]
+  > = null;
   try {
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
 
@@ -2386,6 +2401,13 @@ export async function provisionV3Container(
       );
     }
     const internalProxyUrl = `http://${hostGatewayIp}:${ocInternalProxyPortForChannel()}`;
+    // Evaluation overlays are local-v5-only and are authorized by an expiring
+    // root-owned prepared record. Real users and an absent/invalid record return
+    // null without changing the normal container spec.
+    syntheticEvalOverlay =
+      getRuntimeChannel() === "v5" && !useRemote
+        ? deps.syntheticEvalOverlay?.resolvePrepared(uid) ?? null
+        : null;
 
     const env: string[] = [
       `ANTHROPIC_BASE_URL=${internalProxyUrl}`,
@@ -2551,7 +2573,10 @@ export async function provisionV3Container(
       baselineMounts = remotePaths;
       baselineDir = remotePaths.skillsDirHostPath.replace(/\/skills$/, "");
     } else {
-      baselineDir = deps.ccbBaselineDir ?? readCcbBaselineDirFromEnv();
+      baselineDir =
+        syntheticEvalOverlay?.baselineHostPath
+        ?? deps.ccbBaselineDir
+        ?? readCcbBaselineDirFromEnv();
       baselineMounts = resolveCcbBaselineMounts(baselineDir);
     }
     const baselineOptional = readCcbBaselineOptionalFromEnv();
@@ -2699,6 +2724,14 @@ export async function provisionV3Container(
         `OPENCLAUDE_PLATFORM_PROMPTS_DIR=${OPENCLAUDE_PLATFORM_PROMPTS_DIR_VALUE}`,
         `OPENCLAUDE_WEB_CONTEXT_BIN=${OPENCLAUDE_WEB_CONTEXT_BIN_VALUE}`,
         `OC_PLATFORM_BUNDLE_REV=${injectedBundleRev}`,
+      );
+    }
+    if (syntheticEvalOverlay) {
+      const prefix = "OPENCLAUDE_PLATFORM_PROMPTS_DIR=";
+      const existing = env.findIndex((item) => item.startsWith(prefix));
+      if (existing >= 0) env.splice(existing, 1);
+      env.push(
+        `OPENCLAUDE_PLATFORM_PROMPTS_DIR=${SYNTHETIC_EVAL_PROMPTS_BIND_TARGET}`,
       );
     }
     // ── release 轴 env(仅 release 挂载生效时)── /opt/openclaude 变 ro,默认 cwd 必须离开只读源码树。
@@ -2888,6 +2921,16 @@ export async function provisionV3Container(
     // 挂载顺序:docker 按挂载点深度排序,release(/opt/openclaude)先于 baseline 的
     // /opt/openclaude/AGENTS.md 叠加,基线 AGENTS.md 仍覆盖 release 里的同名文件(意图不变)。
     if (platformBinds.length > 0) binds.push(...platformBinds);
+    if (syntheticEvalOverlay) {
+      binds.push(
+        `${syntheticEvalOverlay.promptsHostPath}:${SYNTHETIC_EVAL_PROMPTS_BIND_TARGET}:ro`,
+        `${syntheticEvalOverlay.promptSlotsHostPath}:${SYNTHETIC_EVAL_PROMPT_SLOTS_BIND_TARGET}:ro`,
+      );
+      Object.assign(
+        runtimeLabels,
+        deps.syntheticEvalOverlay!.labels(syntheticEvalOverlay),
+      );
+    }
 
     // v3 容器资源硬限额(Memory / NanoCpus / PidsLimit)。env 覆盖见 resolveV3ResourceLimits。
     const { memoryBytes, nanoCpus, pidsLimit } = resolveV3ResourceLimits();
@@ -3110,6 +3153,12 @@ export async function provisionV3Container(
       throw new SupervisorError(
         "NameConflict",
         `provision row ${row.id} vanished before Tx2 commit (concurrent lifecycle action); retry`,
+      );
+    }
+    if (syntheticEvalOverlay) {
+      deps.syntheticEvalOverlay!.activatePrepared(
+        syntheticEvalOverlay,
+        createdDockerId,
       );
     }
   } catch (err) {
