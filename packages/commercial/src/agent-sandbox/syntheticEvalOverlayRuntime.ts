@@ -161,12 +161,12 @@ export function sha256SyntheticEvalTree(root: string): string {
 }
 
 export function readSyntheticEvalReleaseSourceCommit(
-  releaseResolvedPath: string | undefined,
+  applicationReleasePath: string | undefined,
 ): string | undefined {
-  if (!releaseResolvedPath) return undefined;
+  if (!applicationReleasePath) return undefined;
   const releasePath = assertAbsoluteConfiguredPath(
-    releaseResolvedPath,
-    "synthetic eval runtime release path",
+    applicationReleasePath,
+    "synthetic eval application release path",
   );
   assertRootOwnedSafe(releasePath, "dir");
   const markerPath = join(releasePath, ".complete");
@@ -178,7 +178,7 @@ export function readSyntheticEvalReleaseSourceCommit(
     || typeof marker.sourceCommit !== "string"
     || !GIT_COMMIT_RE.test(marker.sourceCommit)
   ) {
-    throw new Error("synthetic eval runtime release sourceCommit is invalid");
+    throw new Error("synthetic eval application release sourceCommit is invalid");
   }
   return marker.sourceCommit;
 }
