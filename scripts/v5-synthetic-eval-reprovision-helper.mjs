@@ -114,12 +114,11 @@ async function remoteReprovision(encodedConfig) {
         "-F",
         "|",
         ...variables.flatMap(([name, value]) => ["-v", `${name}=${value}`]),
-        "-c",
-        sql,
       ],
       {
         encoding: "utf8",
         env: commandEnvironment,
+        input: `${sql}\n`,
         maxBuffer: 4 * 1024 * 1024,
       },
     ).trim();

@@ -55,6 +55,12 @@
       "reason": "exact synthetic eval 预检查把容器运行时正常写出的 1000:1000 cron.yaml 误当成不安全 owner；失败发生在 overlay staging、容器重建和真实 turn 之前，线上用户、计费与数据均未受影响。本提交仅让固定合成用户 cron 文件接受既有 1000:1000 运行契约，其他远端安全面仍 root-only。",
       "approvedBy": "dx 2026-07-31 指示继续并以通用、多类活跃用户任务的严格评测验证 Agent 效率改进",
       "expiresAt": "2026-08-31"
+    },
+    {
+      "commit": "fbd975d1e",
+      "reason": "exact synthetic eval 校准的版本化 helper 把带 psql 变量的固定 SELECT 通过 -c 发送，变量未展开而在任何支持的容器 restart 前失败；既有标准合成容器、真实用户、计费和生产流量均未改变。本提交仅改为 psql stdin 以恢复既定变量契约。",
+      "approvedBy": "dx 2026-07-31 指示继续并以通用、多类活跃用户任务的严格评测验证 Agent 效率改进",
+      "expiresAt": "2026-08-31"
     }
   ]
 }
