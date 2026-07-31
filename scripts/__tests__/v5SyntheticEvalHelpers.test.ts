@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = resolve(fileURLToPath(import.meta.url), "..");
 const repoRoot = resolve(here, "../..");
@@ -105,6 +105,76 @@ describe("V5 synthetic exact-eval helpers", () => {
       1,
     );
     assert.doesNotMatch(source, /inbound\.message/);
+  });
+
+  test("reprovision sends fixed SELECT through psql stdin so uid variables expand", async () => {
+    const helper = await import(
+      `${pathToFileURL(reprovisionHelper).href}?test=${Date.now()}`
+    ) as { REPROVISION_REMOTE_SCRIPT: string };
+    const calls: Array<{
+      command: string;
+      args: string[];
+      options: { input?: string };
+    }> = [];
+    Reflect.set(globalThis, "__syntheticEvalExecFileSync", (
+      command: string,
+      args: string[],
+      options: { input?: string },
+    ) => {
+      if (command === "/bin/bash") {
+        return Buffer.from(
+          "DATABASE_URL=postgresql://mock\0COMMERCIAL_JWT_SECRET=secret\0",
+        );
+      }
+      if (command === "psql") {
+        calls.push({ command, args, options });
+        throw new Error("STOP_AFTER_FIRST_PSQL");
+      }
+      throw new Error(`unexpected command before psql: ${command}`);
+    });
+    const instrumented = helper.REPROVISION_REMOTE_SCRIPT.replace(
+      /^  const \{ execFileSync \} = .*;$/m,
+      "  const execFileSync = globalThis.__syntheticEvalExecFileSync;",
+    );
+    assert.notEqual(instrumented, helper.REPROVISION_REMOTE_SCRIPT);
+    const encoded = Buffer.from(JSON.stringify({
+      uid: 247,
+      engine: "ccb",
+      agentId: "main",
+      phase: "overlay",
+    })).toString("base64url");
+    const argvLength = process.argv.length;
+    process.argv.push(encoded);
+    try {
+      const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+      await assert.rejects(
+        async () => new AsyncFunction(instrumented)(),
+        /STOP_AFTER_FIRST_PSQL/,
+      );
+    } finally {
+      process.argv.length = argvLength;
+      Reflect.deleteProperty(globalThis, "__syntheticEvalExecFileSync");
+    }
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].args, [
+      "postgresql://mock",
+      "-X",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-At",
+      "-F",
+      "|",
+      "-v",
+      "uid=247",
+    ]);
+    assert.equal(calls[0].args.includes("-c"), false);
+    assert.equal(
+      calls[0].options.input,
+      "SELECT id,container_internal_id FROM agent_containers " +
+        "WHERE user_id=:'uid'::bigint AND state='active' AND runtime_channel='v5' " +
+        "ORDER BY id DESC\n",
+    );
   });
 
   test("identity validation fails before ssh for non-synthetic or mismatched phase", () => {
