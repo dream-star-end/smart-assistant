@@ -26,6 +26,8 @@ import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import type Docker from "dockerode";
 import type { Pool, PoolClient } from "pg";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -38,6 +40,7 @@ import {
   RUNTIME_EMBED_SOURCE_LABEL_KEY,
   RELEASE_MOUNT_TARGET,
   OPENCLAUDE_DEFAULT_WORKSPACE_VALUE,
+  V3_CCB_BASELINE_SKILL_NAMES,
   type V3SupervisorDeps,
   type V3RuntimeTuple,
   type SyntheticEvalOverlayRuntime,
@@ -555,11 +558,38 @@ describe("R2-B3:workspace env 绑 release 轴(bundle 未启用也注入,离开�
 describe("V5 synthetic exact-eval overlay container wiring", () => {
   let savedChannel: string | undefined;
   let savedBaselineOpt: string | undefined;
+  let stableBaseline = "";
+  let overlaySpec: SyntheticEvalOverlaySpec;
   before(() => {
     savedChannel = process.env.OC_RUNTIME_CHANNEL;
     savedBaselineOpt = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
     process.env.OC_RUNTIME_CHANNEL = "v5";
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "0";
+    stableBaseline = mkdtempSync(join(tmpdir(), "v5-synthetic-baseline-"));
+    writeFileSync(join(stableBaseline, "AGENTS.md"), "# test agents\n", {
+      mode: 0o644,
+    });
+    writeFileSync(join(stableBaseline, "CLAUDE.md"), "# test claude\n", {
+      mode: 0o644,
+    });
+    const skillsDir = join(stableBaseline, "skills");
+    mkdirSync(skillsDir, { mode: 0o755 });
+    for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
+      const skillDir = join(skillsDir, name);
+      mkdirSync(skillDir, { mode: 0o755 });
+      writeFileSync(join(skillDir, "SKILL.md"), `# ${name}\n`, {
+        mode: 0o644,
+      });
+    }
+    overlaySpec = {
+      uid: 247,
+      nonce: "1".repeat(32),
+      manifestSha: "a".repeat(64),
+      candidateTreePath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree",
+      promptsHostPath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree/prompts",
+      promptSlotsHostPath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree/promptSlots.ts",
+      baselineHostPath: stableBaseline,
+    };
   });
   after(() => {
     const restore = (key: string, value: string | undefined) => {
@@ -568,22 +598,8 @@ describe("V5 synthetic exact-eval overlay container wiring", () => {
     };
     restore("OC_RUNTIME_CHANNEL", savedChannel);
     restore("OC_V3_CCB_BASELINE_OPTIONAL", savedBaselineOpt);
+    rmSync(stableBaseline, { recursive: true, force: true });
   });
-
-  const stableBaseline = join(
-    process.cwd(),
-    "packages/commercial/agent-sandbox/ccb-baseline",
-  );
-  const overlaySpec: SyntheticEvalOverlaySpec = {
-    uid: 247,
-    nonce: "1".repeat(32),
-    manifestSha: "a".repeat(64),
-    candidateTreePath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree",
-    promptsHostPath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree/prompts",
-    promptSlotsHostPath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree/promptSlots.ts",
-    baselineHostPath: stableBaseline,
-  };
-
   function fakeOverlay(
     prepared: boolean,
     onActivate: (containerId: string) => void = () => undefined,
