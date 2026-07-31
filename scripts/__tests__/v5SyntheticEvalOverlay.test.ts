@@ -461,6 +461,10 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     assert.match(REMOTE_HELPER_SOURCE, /process\.getuid\(\) !== 0/);
     assert.match(
       REMOTE_HELPER_SOURCE,
+      /secureStat\(cronPath, "file", undefined, \[0, 1000\]\)/,
+    );
+    assert.match(
+      REMOTE_HELPER_SOURCE,
       /production-mutation\.lock\.manual-holder/,
     );
     assert.match(REMOTE_HELPER_SOURCE, /state\.phase !== "stable"/);
@@ -515,6 +519,70 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     assert.match(REMOTE_HELPER_SOURCE, /unrelatedNewUsageCount/);
     assert.match(REMOTE_HELPER_SOURCE, /runtime tuple is incomplete/);
     assert.doesNotMatch(REMOTE_HELPER_SOURCE, /OC_V5_SKIP_MUTATION_LEASE/);
+  });
+
+  test("remote helper keeps root-only by default and limits the cron owner exception", () => {
+    const start = REMOTE_HELPER_SOURCE.indexOf("function secureStat(");
+    const end = REMOTE_HELPER_SOURCE.indexOf("\nfunction assertLease()", start);
+    assert.ok(start >= 0 && end > start);
+    const source = REMOTE_HELPER_SOURCE.slice(start, end);
+    const load = (stat: {
+      uid: number;
+      mode: number;
+      isSymbolicLink: () => boolean;
+      isFile: () => boolean;
+      isDirectory: () => boolean;
+    }) => new Function(
+      "fs",
+      `function fail(message) { throw new Error(message); }\n${source}\nreturn secureStat;`,
+    )({ lstatSync: () => stat }) as (
+      target: string,
+      kind: "file" | "dir",
+      mode?: number,
+      allowedUids?: number[],
+    ) => unknown;
+    const regular = (uid: number, mode = 0o644) => ({
+      uid,
+      mode,
+      isSymbolicLink: () => false,
+      isFile: () => true,
+      isDirectory: () => false,
+    });
+
+    assert.throws(() => load(regular(1000))("cron.yaml", "file"), /unexpected owner/);
+    assert.doesNotThrow(() => load(regular(0))("cron.yaml", "file", undefined, [0, 1000]));
+    assert.doesNotThrow(() => load(regular(1000))("cron.yaml", "file", undefined, [0, 1000]));
+    assert.throws(
+      () => load(regular(1001))("cron.yaml", "file", undefined, [0, 1000]),
+      /unexpected owner/,
+    );
+    assert.throws(
+      () => load({ ...regular(1000), isSymbolicLink: () => true })(
+        "cron.yaml",
+        "file",
+        undefined,
+        [0, 1000],
+      ),
+      /symlink is forbidden/,
+    );
+    assert.throws(
+      () => load({ ...regular(1000), isFile: () => false })(
+        "cron.yaml",
+        "file",
+        undefined,
+        [0, 1000],
+      ),
+      /expected regular file/,
+    );
+    assert.throws(
+      () => load(regular(1000, 0o664))(
+        "cron.yaml",
+        "file",
+        undefined,
+        [0, 1000],
+      ),
+      /group\/other writable/,
+    );
   });
 
   test("local manifest tree hash equals the remote helper algorithm byte-for-byte", () => {

@@ -394,10 +394,10 @@ function assertRoot() {
     fail("remote synthetic overlay helper must run as root");
   }
 }
-function secureStat(target, kind, mode) {
+function secureStat(target, kind, mode, allowedUids = [0]) {
   const stat = fs.lstatSync(target);
   if (stat.isSymbolicLink()) fail("symlink is forbidden: " + target);
-  if (stat.uid !== 0) fail("path is not root-owned: " + target);
+  if (!allowedUids.includes(stat.uid)) fail("path has an unexpected owner: " + target);
   if ((stat.mode & 0o022) !== 0) fail("path is group/other writable: " + target);
   if (kind === "file" && !stat.isFile()) fail("expected regular file: " + target);
   if (kind === "dir" && !stat.isDirectory()) fail("expected directory: " + target);
@@ -431,7 +431,10 @@ function countEnabledCronFile(activeRelease, uid) {
   const cronPath =
     "/var/lib/docker/volumes/oc-v5-data-u" + uid + "/_data/cron.yaml";
   if (!fs.existsSync(cronPath)) return 0;
-  secureStat(cronPath, "file");
+  // Persistent agent data is written by the enforced container identity
+  // (1000:1000); legacy/root-created files remain valid. This exception is
+  // fixed here and is never taken from the remote payload.
+  secureStat(cronPath, "file", undefined, [0, 1000]);
   const requireFromRelease = createRequire(path.join(activeRelease, "package.json"));
   const yaml = requireFromRelease("yaml");
   const parsed = yaml.parse(fs.readFileSync(cronPath, "utf8"));
