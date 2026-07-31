@@ -43,6 +43,12 @@
       "reason": "合成 v5-evals 上线验收发现浏览器 Skill 混有 Playwright CLI 不支持的旧命令示例；发现后立即使用官方 rollback 恢复旧稳定 master/runtime/baseline。GPT、DeepSeek、计费和数据正常，未收到真实用户浏览器故障报告。",
       "approvedBy": "dx 2026-07-30 指示继续完成 Playwright CLI + Skill 迁移上线",
       "expiresAt": "2026-08-30"
+    },
+    {
+      "commit": "52b4709e7",
+      "reason": "合成 exact-eval 基础设施首次 canary 在 READY 前发现把 runtime release 身份误作 application release 基线；官方发布脚本在切流前自动恢复旧稳定版，真实用户、计费和数据均未受影响。本提交仅修正评测基础设施的发布身份绑定。",
+      "approvedBy": "dx 2026-07-31 指示继续并以通用、多类活跃用户任务的严格评测验证 Agent 效率改进",
+      "expiresAt": "2026-08-31"
     }
   ]
 }
