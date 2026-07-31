@@ -29,6 +29,7 @@ import {
 } from "../agent-sandbox/syntheticEvalOverlay.js";
 import {
   createSyntheticEvalOverlayRuntime,
+  readSyntheticEvalReleaseSourceCommit,
   sha256SyntheticEvalTree,
 } from "../agent-sandbox/syntheticEvalOverlayRuntime.js";
 
@@ -211,6 +212,42 @@ function buildRuntimeFixture(): {
 }
 
 describe("syntheticEvalOverlay filesystem runtime", () => {
+  test("uses the application release only when the runtime release axis resolved", () => {
+    const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+    assert.match(
+      source,
+      /expectedBaseCommit:\s*readSyntheticEvalReleaseSourceCommit\(\s*runtimeTuple\?\.releaseResolvedPath\s*\?\s*process\.cwd\(\)\s*:\s*undefined,?\s*\)/,
+    );
+  });
+
+  test("reads the source commit from the application release marker contract", () => {
+    const root = mkdtempSync(join(tmpdir(), "oc-synthetic-eval-release-"));
+    const sourceCommit = "1".repeat(40);
+    try {
+      assert.equal(readSyntheticEvalReleaseSourceCommit(undefined), undefined);
+      writeSafe(
+        join(root, ".complete"),
+        JSON.stringify({ schemaVersion: 1, sourceCommit, digest: "a".repeat(12) }),
+      );
+      assert.equal(readSyntheticEvalReleaseSourceCommit(root), sourceCommit);
+      writeSafe(
+        join(root, ".complete"),
+        JSON.stringify({ schemaVersion: 1, sourceCommit: "short" }),
+      );
+      assert.throws(
+        () => readSyntheticEvalReleaseSourceCommit(root),
+        /sourceCommit is invalid/,
+      );
+      unlinkSync(join(root, ".complete"));
+      assert.throws(
+        () => readSyntheticEvalReleaseSourceCommit(root),
+        /ENOENT/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("verifies exact staged bytes and CAS-activates the prepared record", () => {
     const fixture = buildRuntimeFixture();
     try {

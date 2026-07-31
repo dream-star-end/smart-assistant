@@ -2912,7 +2912,7 @@ export async function registerCommercial(
         ? {
             syntheticEvalOverlay: createSyntheticEvalOverlayRuntime({
               expectedBaseCommit: readSyntheticEvalReleaseSourceCommit(
-                runtimeTuple?.releaseResolvedPath,
+                runtimeTuple?.releaseResolvedPath ? process.cwd() : undefined,
               ),
             }),
           }
