@@ -28,13 +28,13 @@
       "sourceHash": "f662c6b2d0263f2956851a3e13cd32b89039801925ad3d020d864c2ff2f4b0e4"
     },
     "chat-basics": {
-      "contentHash": "87a8a79fb4e8e378d70196406e37414407d486e0602556d1f68b19531049ae0d",
-      "contentVersion": 2,
+      "contentHash": "4a484f6cd607e93404f941f86ba41da22a19ead32b0312f6ced61a4ab530a28d",
+      "contentVersion": 3,
       "mediaHash": "0cc612d377280f73f9fcc131c43e8ebde31ec42226e82a8745b0cb6534649779",
       "mediaKey": "chat-basics",
       "mediaVersion": 3,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "1b6f25624464ef265bb377fe2e494657f0f01987a943b887c55c4528f481d8b7"
+      "sourceHash": "5983c167e15aee627b8b4ae8f20c2e4a6eecb91f2b3f869b171b396974b883fb"
     },
     "connectors": {
       "contentHash": "3273aeac669b33e701c19aad3473ab19adc5e6f0db455d0a975ea2927b0d3b48",
@@ -64,13 +64,13 @@
       "sourceHash": "1155002f9f0669816e544cc5713bdcae81102ade80e03c955cdeb2af87afd344"
     },
     "files-media": {
-      "contentHash": "bb63c819fc8460f7cfbc3807b965e0373c35714ff87d90c6a54694e90347a332",
-      "contentVersion": 2,
+      "contentHash": "fe18dee5d554d68a75ea19a409461d893a715a4b918056751b6faa6d94d9cfc5",
+      "contentVersion": 3,
       "mediaHash": "0a4e678112498ae49805dd9e408f9ec1b8c42ada9b993cb70a9e8dd07b891d70",
       "mediaKey": "files-media",
       "mediaVersion": 3,
       "registryHash": "a4788dc8e858a3a4a7fea3d3871867574bc6482b8dd239b053d234321febc305",
-      "sourceHash": "c22741021ee1d382fdb637ab8839d680cbef1349f747c953cc7fd5d43abf9e59"
+      "sourceHash": "97d55c23e2c693822c504d4b990f3d16efbd9b4806e5f356cdb3861b50604f5c"
     },
     "github-repository": {
       "contentHash": "98494ec3b35e6b93ac1309f0313dc1b07cc47da79cd3722c9ba8f98458c70250",

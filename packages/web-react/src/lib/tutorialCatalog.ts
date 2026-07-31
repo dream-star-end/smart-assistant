@@ -99,7 +99,7 @@ export type TutorialTopic = {
 export const TUTORIAL_TOPICS = {
   "chat-basics": {
     featureId: "chat-basics",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
       "Aurora 不是只回答一句话的聊天框，而是能持续执行任务的工作区。你可以像给同事派活一样说明目标、材料、限制和交付格式；过程中会看到思考、工具、进度与阶段结果，任务结束后还能继续追问或让它修改。",
     outcome: "把一个模糊想法变成可核验、可继续迭代的完整交付。",
@@ -115,7 +115,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "补充材料与约束",
-        body: "告诉它受众、期限、格式、不能做什么；有文件就直接上传，不必手工粘贴全文。",
+        body: "告诉它受众、期限、格式、不能做什么；图片可直接粘贴到输入框，其他文件点“+”上传，不必手工粘贴全文。",
       },
       {
         title: "观察执行而不是反复催促",
@@ -212,9 +212,9 @@ export const TUTORIAL_TOPICS = {
   },
   "files-media": {
     featureId: "files-media",
-    contentVersion: 2,
+    contentVersion: 3,
     intro:
-      "输入框左侧的附件按钮可以上传图片、PDF、Word、Excel、音频、视频和常见文本文件。上传完成后，文件会作为本条消息的材料交给智能体；图片可先预览，失败的附件可单独重试或移除。",
+      "图片可以直接粘贴到输入框，也可以和 PDF、Word、Excel、音频、视频及常见文本文件一样从“+”菜单上传。上传完成后，文件会作为本条消息的材料交给智能体；图片可先预览，失败的附件可单独重试或移除。",
     outcome: "直接让 AI 阅读真实材料，而不是复制粘贴后丢失格式与上下文。",
     scenarios: [
       "分析表格与合同",
@@ -223,8 +223,8 @@ export const TUTORIAL_TOPICS = {
     ],
     steps: [
       {
-        title: "先选附件",
-        body: "点击“+”选择一个或多个文件，等待每个附件显示上传完成。",
+        title: "先添加附件",
+        body: "图片可直接粘贴到输入框；也可点击“+”选择一个或多个文件，等待每个附件显示上传完成。",
       },
       {
         title: "说明材料角色",
