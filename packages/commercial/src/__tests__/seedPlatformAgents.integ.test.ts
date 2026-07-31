@@ -229,6 +229,22 @@ describe('seedPlatformResearchAgents (integ)', () => {
     const agents = await listApprovedForSearch('agent')
     const slugs = agents.map((a) => a.slug).sort()
     assert.deepEqual(slugs, [...EXPECTED_SLUGS].sort(), '科研助手应可搜(approved + active)')
+    const current = await query<{ version: string; persona: string }>(
+      `SELECT v.version, v.manifest->>'persona' AS persona
+         FROM marketplace_skill_listings l
+         JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+        WHERE l.kind = 'agent' AND l.slug = 'research-assistant'`,
+    )
+    assert.equal(current.rows[0]?.version, '1.0.2', '当前批准版本必须指向范围校准后的科研助手')
+    assert.match(current.rows[0]?.persona ?? '', /交付范围与效率:/)
+    assert.match(current.rows[0]?.persona ?? '', /写综述\/研究报告\/论文.*明确要完整稿件/s)
+    assert.match(current.rows[0]?.persona ?? '', /未明确要求完整稿件/)
+    assert.match(current.rows[0]?.persona ?? '', /不要例行运行 command -v、--help/)
+    assert.match(current.rows[0]?.persona ?? '', /不设硬工具调用\s*上限/)
+    assert.match(current.rows[0]?.persona ?? '', /完整研究任务仍应跑完所需流程/)
+    assert.match(current.rows[0]?.persona ?? '', /引用接地是硬性门禁/)
+    assert.match(current.rows[0]?.persona ?? '', /简短直接答案.*oc-cite format/s)
+    assert.match(current.rows[0]?.persona ?? '', /只有完整报告\/稿件才用\s*oc-report/s)
 
     // kind 隔离:不在 skill 目录(配合 search 默认 'skill' → v3 技能市场看不到)。
     const skills = await listApprovedForSearch('skill')
