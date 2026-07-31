@@ -22,6 +22,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  existsSync,
   lstatSync,
   openSync,
   readFileSync,
@@ -46,7 +47,10 @@ import {
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const CASE_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,80}$/;
 const PEER_ID_RE = /^[A-Za-z0-9_-]{8,160}$/;
+const CLIENT_MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const DEFAULT_TIMEOUT_SECONDS = 900;
 const MAX_TIMEOUT_SECONDS = 1_050;
 const HELPER_TIMEOUT_MS = 180_000;
@@ -82,6 +86,15 @@ export function parseRunArmArgs(args) {
     else if (option === "--uid") options.uid = assertAllowedUid(value);
     else if (option === "--engine") options.engine = value;
     else if (option === "--agent-id") options.agentId = value;
+    else if (option === "--model") options.model = value;
+    else if (option === "--case-pack") options.casePack = value;
+    else if (option === "--case-pack-sha") options.casePackSha = value;
+    else if (option === "--case-id") options.caseId = value;
+    else if (option === "--pair-id") options.pairId = value;
+    else if (option === "--order") options.order = value;
+    else if (option === "--expected-prompt-delta-sha") {
+      options.expectedPromptDeltaSha = value;
+    }
     else if (option === "--base-sha") options.baseCommit = value;
     else if (option === "--candidate-sha") options.candidateCommit = value;
     else if (option === "--reprovision-helper") options.reprovisionHelper = value;
@@ -102,6 +115,12 @@ export function parseRunArmArgs(args) {
     || options.uid === undefined
     || !["ccb", "codex"].includes(options.engine)
     || !AGENT_ID_RE.test(options.agentId ?? "")
+    || !MODEL_ID_RE.test(options.model ?? "")
+    || !CASE_ID_RE.test(options.caseId ?? "")
+    || !CASE_ID_RE.test(options.pairId ?? "")
+    || !["A_FIRST", "B_FIRST"].includes(options.order)
+    || !SHA256_RE.test(options.casePackSha ?? "")
+    || !SHA256_RE.test(options.expectedPromptDeltaSha ?? "")
     || !COMMIT_RE.test(options.baseCommit ?? "")
     || !COMMIT_RE.test(options.candidateCommit ?? "")
     || !SHA256_RE.test(options.reprovisionHelperSha ?? "")
@@ -119,6 +138,7 @@ export function parseRunArmArgs(args) {
     ["reprovision helper root", options.reprovisionHelperRoot],
     ["turn helper", options.turnHelper],
     ["turn helper root", options.turnHelperRoot],
+    ["case pack", options.casePack],
     ["evidence file", options.evidenceFile],
   ]) {
     if (
@@ -213,7 +233,73 @@ export function verifyHelper(
   return { path, sha256: actualSha, root: rootReal, treeSha256 };
 }
 
-function helperEnvironment(options, phase) {
+export function verifyCasePack(path, expectedSha, caseId, engine, model) {
+  assertRootOwnedSafe(path, "file", 0o600);
+  const real = realpathSync(path);
+  if (real !== path) fail(`case pack path must already be canonical: ${path}`);
+  if (
+    real === repoRoot
+    || real.startsWith(`${repoRoot}/`)
+    || real.startsWith("/opt/openclaude/")
+    || real.startsWith("/var/lib/openclaude-v5/")
+  ) {
+    fail("real held-out case pack must stay outside the repository/release tree");
+  }
+  const bytes = readFileSync(real);
+  const actualSha = createHash("sha256").update(bytes).digest("hex");
+  if (actualSha !== expectedSha) fail("case pack SHA mismatch");
+  const pack = JSON.parse(bytes);
+  const entry = pack?.schemaVersion === 1 && pack.cases
+    && typeof pack.cases === "object"
+    ? pack.cases[caseId]
+    : null;
+  if (
+    !entry
+    || typeof entry !== "object"
+    || entry.id !== caseId
+    || typeof entry.category !== "string"
+    || entry.category.length === 0
+    || typeof entry.prompt !== "string"
+    || entry.prompt.trim().length === 0
+    || entry.prompt.includes("\0")
+    || !entry.models
+    || entry.models[engine] !== model
+    || !["none", "temporary"].includes(entry.workspace)
+  ) {
+    fail("case pack entry or engine/model binding is invalid");
+  }
+  const temporaryWorkspace = `/tmp/oc-synthetic-eval-${caseId}`;
+  if (
+    entry.workspace === "temporary"
+    && !entry.prompt.includes("{{EVAL_WORKSPACE}}")
+  ) {
+    fail("temporary-workspace case must name its deterministic workspace");
+  }
+  if (
+    entry.workspace === "none"
+    && entry.prompt.includes("{{EVAL_WORKSPACE}}")
+  ) {
+    fail("non-workspace case contains an unexpected workspace placeholder");
+  }
+  const prompt = entry.prompt.replaceAll(
+    "{{EVAL_WORKSPACE}}",
+    temporaryWorkspace,
+  );
+  return {
+    path: real,
+    sha256: actualSha,
+    id: caseId,
+    category: entry.category,
+    workspace: entry.workspace,
+    temporaryWorkspace:
+      entry.workspace === "temporary" ? temporaryWorkspace : null,
+    prompt,
+    promptSha256: createHash("sha256").update(prompt).digest("hex"),
+    model,
+  };
+}
+
+function helperEnvironment(options, phase, evaluationCase, outputs) {
   const inherited = Object.fromEntries(
     Object.entries(process.env).filter(
       ([name]) =>
@@ -227,6 +313,16 @@ function helperEnvironment(options, phase) {
     OC_SYNTHETIC_EVAL_UID: String(options.uid),
     OC_SYNTHETIC_EVAL_ENGINE: options.engine,
     OC_SYNTHETIC_EVAL_AGENT_ID: options.agentId,
+    OC_SYNTHETIC_EVAL_MODEL: options.model,
+    OC_SYNTHETIC_EVAL_CASE_ID: evaluationCase.id,
+    OC_SYNTHETIC_EVAL_PAIR_ID: options.pairId,
+    OC_SYNTHETIC_EVAL_ORDER: options.order,
+    OC_SYNTHETIC_EVAL_CASE_PACK_SHA: evaluationCase.sha256,
+    OC_SYNTHETIC_EVAL_PROMPT_SHA: evaluationCase.promptSha256,
+    OC_SYNTHETIC_EVAL_PROMPT: evaluationCase.prompt,
+    OC_SYNTHETIC_EVAL_TURN_PATH: outputs.turn,
+    OC_SYNTHETIC_EVAL_FRAMES_PATH: outputs.frames,
+    OC_SYNTHETIC_EVAL_TIMEOUT_SECONDS: String(options.timeoutSeconds),
     OC_SYNTHETIC_EVAL_BASE_SHA: options.baseCommit,
     OC_SYNTHETIC_EVAL_CANDIDATE_SHA: options.candidateCommit,
     OC_SYNTHETIC_EVAL_PHASE: phase,
@@ -389,18 +485,183 @@ export function parseReprovisionResult(stdout) {
   return { ...parsed, id: value.id, startedAt: value.started_at };
 }
 
-export function parseTurnResult(stdout) {
-  const parsed = parseJsonOutput(stdout, "turn");
+function readEvidenceFile(path, label) {
+  assertRootOwnedSafe(path, "file", 0o600);
+  if (realpathSync(path) !== path) fail(`${label} path must already be canonical`);
+  const bytes = readFileSync(path);
+  return {
+    value: JSON.parse(bytes),
+    source: {
+      path,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      bytes: bytes.length,
+    },
+  };
+}
+
+export function parseTurnResult(stdout, resultPath, framesPath, identity) {
+  const lastLine = stdout.split("\n").filter(Boolean).at(-1) ?? "";
+  if (lastLine !== resultPath) {
+    fail("turn helper did not return the runner-assigned result path");
+  }
+  const parsed = readEvidenceFile(resultPath, "turn result");
+  const frames = readEvidenceFile(framesPath, "turn frames");
   const value = parsed.value;
   if (
     !value
     || typeof value !== "object"
     || typeof value.peer_id !== "string"
     || !PEER_ID_RE.test(value.peer_id)
+    || !CLIENT_MESSAGE_ID_RE.test(value.client_message_id ?? "")
+    || value.case_id !== identity.caseId
+    || value.case_pack_sha !== identity.casePackSha
+    || value.pair_id !== identity.pairId
+    || value.order !== identity.order
+    || value.prompt_sha !== identity.promptSha
+    || value.model !== identity.model
+    || value.uid !== identity.uid
+    || value.engine !== identity.engine
+    || value.agent_id !== identity.agentId
+    || value.frames_path !== framesPath
+    || value.frames_sha256 !== frames.source.sha256
+    || value.frames_bytes !== frames.source.bytes
+    || !Number.isSafeInteger(value.frame_count)
+    || value.frame_count < 1
+    || !Number.isFinite(value.wall_ms)
+    || value.wall_ms < 0
+    || (
+      value.ttft_ms !== null
+      && (!Number.isFinite(value.ttft_ms) || value.ttft_ms < 0)
+    )
+    || typeof value.final_text !== "string"
   ) {
-    fail("turn helper result must contain a valid peer_id");
+    fail("turn helper result identity/evidence is invalid");
   }
-  return { ...parsed, peerId: value.peer_id };
+  const frameValue = frames.value;
+  if (
+    !frameValue
+    || frameValue.schema_version !== 1
+    || frameValue.peer_id !== value.peer_id
+    || frameValue.client_message_id !== value.client_message_id
+    || frameValue.case_id !== identity.caseId
+    || frameValue.case_pack_sha !== identity.casePackSha
+    || frameValue.pair_id !== identity.pairId
+    || frameValue.order !== identity.order
+    || frameValue.prompt_sha !== identity.promptSha
+    || frameValue.uid !== identity.uid
+    || frameValue.engine !== identity.engine
+    || frameValue.agent_id !== identity.agentId
+    || frameValue.model !== identity.model
+    || !Array.isArray(frameValue.frames)
+    || frameValue.connection?.opens !== 1
+    || frameValue.connection?.closes !== 1
+    || frameValue.connection?.reconnects !== 0
+    || frameValue.runtime?.login_requests !== 1
+    || frameValue.runtime?.session_puts !== 1
+    || frameValue.runtime?.websocket_instances !== 1
+    || frameValue.runtime?.inbound_messages !== 1
+    || frameValue.runtime?.finals !== 1
+    || !Number.isSafeInteger(frameValue.runtime?.matching_costs)
+    || frameValue.runtime.matching_costs < 1
+    || JSON.stringify(value.connection) !== JSON.stringify(frameValue.connection)
+    || JSON.stringify(value.runtime) !== JSON.stringify(frameValue.runtime)
+  ) {
+    fail("raw turn frame evidence does not prove one WebSocket connection");
+  }
+  const parsedFrames = frameValue.frames.map((frame, index) => {
+    if (
+      frame?.seq !== index
+      || !["sent", "received"].includes(frame.direction)
+      || typeof frame.at !== "string"
+      || !Number.isFinite(Date.parse(frame.at))
+      || !Number.isSafeInteger(frame.bytes)
+      || frame.bytes < 0
+      || typeof frame.text !== "string"
+      || Buffer.byteLength(frame.text) !== frame.bytes
+    ) {
+      fail("raw turn frames are incomplete or out of order");
+    }
+    let payload;
+    try {
+      payload = JSON.parse(frame.text);
+    } catch {
+      fail("raw turn frame is not exact JSON protocol text");
+    }
+    return { ...frame, payload };
+  });
+  const sentInbound = parsedFrames.filter(
+    (frame) =>
+      frame?.direction === "sent"
+      && frame?.payload?.type === "inbound.message",
+  );
+  if (sentInbound.length !== 1) {
+    fail("raw turn frames do not prove exactly one inbound.message send");
+  }
+  const sent = sentInbound[0].payload;
+  const sentText = sent?.content?.text;
+  if (
+    sent?.peer?.id !== value.peer_id
+    || sent?.clientMessageId !== value.client_message_id
+    || sent?.agentId !== identity.agentId
+    || sent?.model !== identity.model
+    || typeof sentText !== "string"
+    || createHash("sha256").update(sentText).digest("hex")
+      !== identity.promptSha
+  ) {
+    fail("actual sent prompt/routing differs from the frozen case identity");
+  }
+  const received = parsedFrames.filter(
+    (frame) => frame?.direction === "received",
+  );
+  const finalFrames = received.filter(
+    (frame) =>
+      frame?.payload?.type === "outbound.message"
+      && frame?.payload?.peer?.id === value.peer_id
+      && frame?.payload?.isFinal === true,
+  );
+  const costFrames = received.filter(
+    (frame) => frame?.payload?.type === "outbound.cost_charged",
+  );
+  const errorFrames = received.filter(
+    (frame) =>
+      ["outbound.error", "outbound.turn_error", "error"].includes(
+        frame?.payload?.type,
+      ),
+  );
+  if (finalFrames.length !== 1 || costFrames.length < 1 || errorFrames.length) {
+    fail("raw turn frames do not prove a clean final plus authoritative cost");
+  }
+  const final = finalFrames[0].payload;
+  const finalTrace = final.traceId ?? final.requestId;
+  const reconstructedText = received
+    .filter(
+      (frame) =>
+        frame.payload?.type === "outbound.message"
+        && frame.payload?.peer?.id === value.peer_id,
+    )
+    .flatMap((frame) => frame.payload.blocks ?? [])
+    .filter(
+      (block) => block?.kind === "text" && typeof block.text === "string",
+    )
+    .map((block) => block.text)
+    .join("")
+    .trim();
+  if (
+    value.frame_count !== parsedFrames.length
+    || !/^[0-9a-f]{32}$/.test(value.trace_id ?? "")
+    || finalTrace !== value.trace_id
+    || reconstructedText !== value.final_text
+  ) {
+    fail("turn result is not an exact projection of the raw protocol frames");
+  }
+  return {
+    ...parsed,
+    peerId: value.peer_id,
+    frames: frames.source,
+    parsedFrames,
+    sent,
+    costFrames: costFrames.map((frame) => frame.payload),
+  };
 }
 
 function runOverlay(args, timeoutMs = HELPER_TIMEOUT_MS) {
@@ -470,6 +731,249 @@ export function assertSameLane(before, after) {
   }
 }
 
+export function assertDynamicInputsStable(before, after, workspaceMode) {
+  const beforeInputs = before?.inputs;
+  const afterInputs = after?.inputs;
+  if (!beforeInputs || !afterInputs) fail("dynamic input evidence is missing");
+  for (const name of [
+    "agentClaude",
+    "agentMemoryIndex",
+    "agentMemoryTree",
+    "userSoul",
+    "userProfile",
+    "userSkills",
+    "workspace",
+  ]) {
+    if (
+      JSON.stringify(beforeInputs[name])
+      !== JSON.stringify(afterInputs[name])
+    ) {
+      fail(`dynamic input changed during exact arm: ${name}`);
+    }
+  }
+  if (beforeInputs.temporaryWorkspace?.state !== "absent") {
+    fail("temporary evaluation workspace was not clean before the turn");
+  }
+  if (
+    workspaceMode === "none"
+    && afterInputs.temporaryWorkspace?.state !== "absent"
+  ) {
+    fail("non-workspace case created the reserved temporary workspace");
+  }
+}
+
+function assertTurnUsageMatchesFrames(turn, evidence) {
+  const usage = [...evidence.rootUsage, ...evidence.delegateUsage];
+  const newIds = new Set(evidence.newUsage.map((row) => row.id));
+  if (
+    newIds.size !== usage.length
+    || usage.some((row) => !newIds.has(row.id))
+  ) {
+    fail("new usage rows are not exactly the evaluated root/delegate usage");
+  }
+  const byRequest = new Map();
+  for (const row of usage) {
+    if (
+      typeof row.request_id !== "string"
+      || row.request_id.length === 0
+      || byRequest.has(row.request_id)
+    ) {
+      fail("authoritative usage request identities are missing or duplicated");
+    }
+    byRequest.set(row.request_id, row);
+  }
+  const seen = new Set();
+  for (const frame of turn.costFrames) {
+    const row = byRequest.get(frame.requestId);
+    if (
+      typeof frame.requestId !== "string"
+      || seen.has(frame.requestId)
+      || !row
+      || (
+        frame.model !== undefined
+        && frame.model !== row.model
+      )
+      || String(frame.costCredits) !== String(row.cost_credits)
+    ) {
+      fail("cost frame is not uniquely bound to exact authoritative usage");
+    }
+    seen.add(frame.requestId);
+  }
+  for (const row of usage) {
+    if (BigInt(row.cost_credits) > 0n && !seen.has(row.request_id)) {
+      fail("positive authoritative usage has no exact cost frame");
+    }
+  }
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map(
+    (key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`,
+  ).join(",")}}`;
+}
+
+function walkJson(value, visit, nested = false) {
+  if (value === null || typeof value !== "object") return;
+  const childNested = nested || value.kind === "delegate_progress";
+  visit(value, childNested);
+  if (Array.isArray(value)) {
+    for (const child of value) walkJson(child, visit, childNested);
+  } else {
+    for (const child of Object.values(value)) {
+      walkJson(child, visit, childNested);
+    }
+  }
+}
+
+function normalizedTool(node) {
+  const rawName = node.toolName ?? node.name;
+  if (typeof rawName !== "string" || rawName.length === 0) return null;
+  let name = rawName;
+  let input = node.inputJson ?? node.input ?? node.args ?? {};
+  if (typeof input === "string") {
+    try {
+      input = JSON.parse(input);
+    } catch {
+      input = { raw: input };
+    }
+  }
+  if (/^codex:mcpToolCall$/i.test(name)) {
+    name = `${input?.server ?? ""}:${input?.tool ?? input?.name ?? ""}`;
+    let args = input?.arguments ?? {};
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = { raw: args };
+      }
+    }
+    input = args;
+  } else if (/^ExecuteExtraTool$/i.test(name)) {
+    name = input?.tool_name ?? name;
+    let params = input?.params ?? {};
+    if (typeof params === "string") {
+      try {
+        params = JSON.parse(params);
+      } catch {
+        params = { raw: params };
+      }
+    }
+    input = params;
+  }
+  return {
+    name: String(name),
+    input,
+    signature: `${String(name)}\0${canonicalJson(input)}`,
+  };
+}
+
+function sumUsage(records, field) {
+  return records.reduce(
+    (total, row) => total + BigInt(row[field] ?? 0),
+    0n,
+  ).toString();
+}
+
+export function analyzeEfficiency(turn, turnEvidence) {
+  const toolCalls = new Map();
+  const toolResults = new Set();
+  const signatures = new Map();
+  let topLevelToolCalls = 0;
+  let nestedToolCalls = 0;
+  let delegationCalls = 0;
+  let parallelToolCallFrames = 0;
+  let maxToolCallsInFrame = 0;
+  let modelToolBoundaries = 0;
+  let lastStage = null;
+  const markStage = (stage) => {
+    if (lastStage !== null && lastStage !== stage) modelToolBoundaries += 1;
+    lastStage = stage;
+  };
+
+  for (const frame of turn.parsedFrames) {
+    if (frame.direction !== "received") continue;
+    let newToolCalls = 0;
+    walkJson(frame.payload, (node, nested) => {
+      if (
+        node.kind === "text"
+        && typeof node.text === "string"
+        && node.text.length > 0
+      ) {
+        markStage("model");
+      }
+      if (node.kind === "tool_use" && node.partial !== true) {
+        const tool = normalizedTool(node);
+        if (!tool) return;
+        const id =
+          node.blockId
+          ?? node.toolUseId
+          ?? tool.signature;
+        if (toolCalls.has(id)) return;
+        toolCalls.set(id, tool);
+        markStage("tool");
+        signatures.set(
+          tool.signature,
+          (signatures.get(tool.signature) ?? 0) + 1,
+        );
+        newToolCalls += 1;
+        if (nested || node.parentToolUseId) nestedToolCalls += 1;
+        else topLevelToolCalls += 1;
+        if (/(^|[:_.])(?:delegate_tasks?|spawn_agent)$/i.test(tool.name)) {
+          delegationCalls += 1;
+        }
+      }
+      if (node.kind === "tool_result") {
+        const id =
+          node.toolUseBlockId
+          ?? node.toolUseId
+          ?? node.blockId?.replace(/:result$/, "");
+        if (typeof id === "string" && !toolResults.has(id)) {
+          toolResults.add(id);
+          markStage("tool");
+        }
+      }
+    });
+    if (newToolCalls > 1) parallelToolCallFrames += 1;
+    maxToolCallsInFrame = Math.max(maxToolCallsInFrame, newToolCalls);
+  }
+
+  const usage = [...turnEvidence.rootUsage, ...turnEvidence.delegateUsage];
+  return {
+    wallMs: turn.value.wall_ms,
+    ttftMs: turn.value.ttft_ms,
+    receivedFrameCount: turn.parsedFrames.filter(
+      (frame) => frame.direction === "received",
+    ).length,
+    totalFrameBytes: turn.parsedFrames.reduce(
+      (total, frame) => total + frame.bytes,
+      0,
+    ),
+    finalTextBytes: Buffer.byteLength(turn.value.final_text),
+    modelToolBoundaries,
+    toolCallCount: toolCalls.size,
+    toolResultCount: toolResults.size,
+    topLevelToolCalls,
+    nestedToolCalls,
+    parallelToolCallFrames,
+    maxToolCallsInFrame,
+    duplicateExactToolCallCount: [...signatures.values()].reduce(
+      (total, count) => total + Math.max(0, count - 1),
+      0,
+    ),
+    delegationCalls,
+    usageRecordCount: usage.length,
+    rootUsageRecordCount: turnEvidence.rootUsage.length,
+    delegateUsageRecordCount: turnEvidence.delegateUsage.length,
+    inputTokens: sumUsage(usage, "input_tokens"),
+    outputTokens: sumUsage(usage, "output_tokens"),
+    cacheReadTokens: sumUsage(usage, "cache_read_tokens"),
+    cacheWriteTokens: sumUsage(usage, "cache_write_tokens"),
+    costCredits: sumUsage(usage, "cost_credits"),
+  };
+}
+
 function safeWriteExclusive(path, bytes, mode = 0o600) {
   const fd = openSync(path, "wx", mode);
   try {
@@ -483,7 +987,10 @@ function safeWriteExclusive(path, bytes, mode = 0o600) {
 function usage() {
   return `Usage:
   scripts/with-production-mutation-lease.sh node scripts/v5-synthetic-eval-run-arm.mjs \\
-    --arm A|B --uid 247|626 --engine ccb|codex --agent-id <id> \\
+    --arm A|B --uid 247|626 --engine ccb|codex --agent-id <id> --model <id> \\
+    --case-pack </absolute/root-owned-0600.json> --case-pack-sha <64hex> \\
+    --case-id <id> --pair-id <id> --order A_FIRST|B_FIRST \\
+    --expected-prompt-delta-sha <64hex> \\
     --base-sha <40hex> --candidate-sha <40hex> \\
     --reprovision-helper </absolute/helper.mjs> --reprovision-helper-sha <64hex> \\
     --reprovision-helper-root </absolute/frozen-tree> --reprovision-helper-tree-sha <64hex> \\
@@ -520,14 +1027,46 @@ export function main(argv = process.argv.slice(2)) {
       options.turnHelperTreeSha,
     ),
   };
+  const evaluationCase = verifyCasePack(
+    options.casePack,
+    options.casePackSha,
+    options.caseId,
+    options.engine,
+    options.model,
+  );
   const evidenceParent = dirname(options.evidenceFile);
   assertRootOwnedSafe(evidenceParent, "dir", 0o700);
+  const evidenceStem = options.evidenceFile.slice(0, -".json".length);
+  const outputPaths = {
+    turn: `${evidenceStem}.turn.json`,
+    frames: `${evidenceStem}.frames.json`,
+    extraPrompt: `${evidenceStem}.extra-prompt.md`,
+  };
+  for (const path of [
+    options.evidenceFile,
+    outputPaths.turn,
+    outputPaths.frames,
+    outputPaths.extraPrompt,
+  ]) {
+    if (existsSync(path)) fail(`evaluation evidence path already exists: ${path}`);
+  }
   if (!options.apply) {
     process.stdout.write(`${JSON.stringify({
       applied: false,
       arm: options.arm,
       uid: options.uid,
       engine: options.engine,
+      model: options.model,
+      pairId: options.pairId,
+      order: options.order,
+      expectedPromptDeltaSha: options.expectedPromptDeltaSha,
+      evaluationCase: {
+        id: evaluationCase.id,
+        category: evaluationCase.category,
+        workspace: evaluationCase.workspace,
+        casePackSha256: evaluationCase.sha256,
+        promptSha256: evaluationCase.promptSha256,
+      },
       baseCommit: options.baseCommit,
       candidateCommit: options.candidateCommit,
       helpers,
@@ -549,7 +1088,11 @@ export function main(argv = process.argv.slice(2)) {
   let prepareAttempted = false;
   let prepared = null;
   let overlayContainer = null;
+  let dynamicInputsPre = null;
+  let dynamicInputsPost = null;
   let turn = null;
+  let turnEvidence = null;
+  let efficiency = null;
   let promptEvidence = null;
   let post = null;
   let restored = null;
@@ -584,7 +1127,7 @@ export function main(argv = process.argv.slice(2)) {
 
     const reprovisionOutput = runNodeHelper(
       options.reprovisionHelper,
-      helperEnvironment(options, "overlay"),
+      helperEnvironment(options, "overlay", evaluationCase, outputPaths),
       HELPER_TIMEOUT_MS,
     );
     const reprovisioned = parseReprovisionResult(reprovisionOutput);
@@ -607,20 +1150,90 @@ export function main(argv = process.argv.slice(2)) {
     ) {
       fail("overlay arm did not provision a fresh Docker container");
     }
+    dynamicInputsPre = runRemote("dynamic-input-evidence", {
+      ...remoteCommon(lease),
+      uid: options.uid,
+      expectedBase: options.baseCommit,
+      candidateCommit: options.candidateCommit,
+      manifestSha: prepared.manifestSha,
+      recordNonce: prepared.nonce,
+      containerId: overlayContainer.containerId,
+      agentId: options.agentId,
+      caseId: evaluationCase.id,
+      phase: "pre",
+    });
 
     const turnOutput = runNodeHelper(
       options.turnHelper,
-      helperEnvironment(options, "turn"),
+      helperEnvironment(options, "turn", evaluationCase, outputPaths),
       options.timeoutSeconds * 1_000,
     );
-    turn = parseTurnResult(turnOutput);
+    turn = parseTurnResult(
+      turnOutput,
+      outputPaths.turn,
+      outputPaths.frames,
+      {
+        caseId: evaluationCase.id,
+        casePackSha: evaluationCase.sha256,
+        pairId: options.pairId,
+        order: options.order,
+        promptSha: evaluationCase.promptSha256,
+        model: options.model,
+        uid: options.uid,
+        engine: options.engine,
+        agentId: options.agentId,
+      },
+    );
     assertHelperTreesUnchanged(helpers);
+    const caseAfterTurn = verifyCasePack(
+      options.casePack,
+      options.casePackSha,
+      options.caseId,
+      options.engine,
+      options.model,
+    );
+    if (
+      caseAfterTurn.promptSha256 !== evaluationCase.promptSha256
+      || caseAfterTurn.category !== evaluationCase.category
+      || caseAfterTurn.workspace !== evaluationCase.workspace
+    ) {
+      fail("held-out case identity changed during the exact arm");
+    }
     if (
       turn.value.container?.id !== undefined
       && turn.value.container.id !== overlayContainer.containerId
     ) {
       fail("turn result is bound to a different Docker container");
     }
+    turnEvidence = runRemote("turn-evidence", {
+      ...remoteCommon(lease),
+      uid: options.uid,
+      expectedBase: options.baseCommit,
+      peerId: turn.peerId,
+      clientMessageId: turn.value.client_message_id,
+      agentId: options.agentId,
+      model: options.model,
+      usageFloor: pre.usageMaxId,
+    });
+    assertTurnUsageMatchesFrames(turn, turnEvidence);
+    efficiency = analyzeEfficiency(turn, turnEvidence);
+    dynamicInputsPost = runRemote("dynamic-input-evidence", {
+      ...remoteCommon(lease),
+      uid: options.uid,
+      expectedBase: options.baseCommit,
+      candidateCommit: options.candidateCommit,
+      manifestSha: prepared.manifestSha,
+      recordNonce: prepared.nonce,
+      containerId: overlayContainer.containerId,
+      agentId: options.agentId,
+      caseId: evaluationCase.id,
+      phase: "post",
+    });
+    assertDynamicInputsStable(
+      dynamicInputsPre,
+      dynamicInputsPost,
+      evaluationCase.workspace,
+    );
     const sessionKey =
       `agent:${options.agentId}:webchat:dm:${turn.peerId}`;
     promptEvidence = runRemote("extra-prompt-evidence", {
@@ -646,8 +1259,15 @@ export function main(argv = process.argv.slice(2)) {
     if (post.dispatchCount !== pre.dispatchCount + 1) {
       fail("exact arm did not create exactly one top-level turn dispatch");
     }
-    if (post.usageCount <= pre.usageCount) {
-      fail("exact arm created no authoritative usage evidence");
+    if (post.usageCount !== pre.usageCount + turnEvidence.newUsage.length) {
+      fail("post snapshot usage count differs from exact bound turn evidence");
+    }
+    const expectedUsageMaxId = Math.max(
+      pre.usageMaxId,
+      ...turnEvidence.newUsage.map((row) => row.id),
+    );
+    if (post.usageMaxId !== expectedUsageMaxId) {
+      fail("post snapshot usage high-water mark differs from exact turn evidence");
     }
   } catch (error) {
     primaryError = error;
@@ -664,7 +1284,7 @@ export function main(argv = process.argv.slice(2)) {
         ]);
         const restoreOutput = runNodeHelper(
           options.reprovisionHelper,
-          helperEnvironment(options, "restore"),
+          helperEnvironment(options, "restore", evaluationCase, outputPaths),
           HELPER_TIMEOUT_MS,
         );
         const restoreResult = parseReprovisionResult(restoreOutput);
@@ -691,8 +1311,7 @@ export function main(argv = process.argv.slice(2)) {
     }
   }
 
-  const extraPromptPath =
-    `${options.evidenceFile.slice(0, -".json".length)}.extra-prompt.md`;
+  const extraPromptPath = outputPaths.extraPrompt;
   if (promptEvidence?.extraPrompt?.contentBase64) {
     const {
       contentBase64,
@@ -716,12 +1335,23 @@ export function main(argv = process.argv.slice(2)) {
 
   const completedAt = new Date().toISOString();
   const evidence = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: primaryError || cleanupError ? "failed" : "completed",
     arm: options.arm,
     uid: options.uid,
     engine: options.engine,
     agentId: options.agentId,
+    model: options.model,
+    pairId: options.pairId,
+    order: options.order,
+    expectedPromptDeltaSha: options.expectedPromptDeltaSha,
+    evaluationCase: {
+      id: evaluationCase.id,
+      category: evaluationCase.category,
+      workspace: evaluationCase.workspace,
+      casePackSha256: evaluationCase.sha256,
+      promptSha256: evaluationCase.promptSha256,
+    },
     baseCommit: options.baseCommit,
     candidateCommit: options.candidateCommit,
     timeoutSeconds: options.timeoutSeconds,
@@ -733,13 +1363,22 @@ export function main(argv = process.argv.slice(2)) {
     pre,
     prepared,
     overlayContainer,
+    dynamicInputs: dynamicInputsPre && dynamicInputsPost
+      ? { pre: dynamicInputsPre, post: dynamicInputsPost }
+      : null,
     turn: turn && {
       peerId: turn.peerId,
       source: turn.source,
-      resultSha256: createHash("sha256")
-        .update(JSON.stringify(turn.value))
+      frames: turn.frames,
+      resultSha256: turn.source.sha256,
+      wallMs: turn.value.wall_ms,
+      ttftMs: turn.value.ttft_ms,
+      finalTextSha256: createHash("sha256")
+        .update(turn.value.final_text)
         .digest("hex"),
     },
+    turnEvidence,
+    efficiency,
     promptEvidence: promptEvidence && {
       ...promptEvidence,
       extraPrompt: {

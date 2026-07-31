@@ -303,6 +303,7 @@ export function assertDeploySnapshot(snapshot, expectedBase, expectedLockVersion
       "dispatchCount",
       "openDispatchCount",
       "usageCount",
+      "usageMaxId",
       "cronFileEnabled",
       "v3State",
       "syntheticContainerId",
@@ -321,6 +322,8 @@ export function assertDeploySnapshot(snapshot, expectedBase, expectedLockVersion
     || snapshot.openDispatchCount !== 0
     || !Number.isSafeInteger(snapshot.usageCount)
     || snapshot.usageCount < 0
+    || !Number.isSafeInteger(snapshot.usageMaxId)
+    || snapshot.usageMaxId < 0
     || snapshot.cronFileEnabled !== 0
     || snapshot.v3State !== "inactive"
     || (
@@ -457,7 +460,9 @@ function readSnapshot() {
     "   WHERE user_id = " + payload.uid,
     "     AND status IN ('admitted','accepted','rejecting')),",
     " 'usageCount', (SELECT count(*)::int FROM usage_records",
-    "   WHERE user_id = " + payload.uid + ")",
+    "   WHERE user_id = " + payload.uid + "),",
+    " 'usageMaxId', COALESCE((SELECT max(id) FROM usage_records",
+    "   WHERE user_id = " + payload.uid + "), 0)",
     ")::text FROM deploy_state WHERE singleton = true;",
   ].join("\n");
   const raw = psql(sql);
@@ -477,6 +482,8 @@ function readSnapshot() {
     || state.openDispatchCount !== 0
     || !Number.isSafeInteger(state.usageCount)
     || state.usageCount < 0
+    || !Number.isSafeInteger(state.usageMaxId)
+    || state.usageMaxId < 0
   ) {
     fail("deploy_state is not stable/candidate-null/cohort-0/cron-free");
   }
@@ -983,6 +990,21 @@ const EXTRA_PROMPT_SOURCE = [
   'process.stdout.write(JSON.stringify({pid:candidate.pid,startTime:candidate.startTime,path:candidate.promptPath,bytes:bytes.length,sha256:sha(bytes),cmdlineSha256:sha(Buffer.from(candidate.args.join("\\0")+"\\0")),candidateCount:candidates.length,selection:engine==="ccb"?"exact-session-key":"earliest-in-fresh-exclusive-container",contentBase64:bytes.toString("base64")}));',
 ].join("\n");
 
+const DYNAMIC_INPUT_SOURCE = [
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'const { createHash } = require("node:crypto");',
+  'const [agentId,caseId,phase] = process.argv.slice(1);',
+  'if(!/^[A-Za-z0-9_-]{1,80}$/.test(agentId)||!/^[A-Za-z0-9_-]{1,80}$/.test(caseId)||!["pre","post"].includes(phase))throw new Error("invalid dynamic input identity");',
+  'const sha=(value)=>createHash("sha256").update(value).digest("hex");',
+  'function identity(target){if(!fs.existsSync(target))return {state:"absent"};const root=fs.realpathSync(target);if(root!==target)throw new Error("dynamic input path is not canonical:"+target);const stat=fs.lstatSync(root);if(stat.isSymbolicLink())throw new Error("dynamic input symlink:"+target);if(stat.isFile()){const bytes=fs.readFileSync(root);return {state:"file",bytes:bytes.length,sha256:sha(bytes)}}if(!stat.isDirectory())throw new Error("dynamic input has unsafe type:"+target);const hash=createHash("sha256");let files=0;let directories=0;function walk(current){for(const name of fs.readdirSync(current).sort()){const absolute=path.join(current,name);const child=fs.lstatSync(absolute);if(child.isSymbolicLink())throw new Error("dynamic input symlink:"+absolute);const relative=path.relative(root,absolute).split(path.sep).join("/");if(child.isDirectory()){directories++;hash.update("D  "+relative+"\\n");walk(absolute)}else if(child.isFile()){files++;hash.update("F  "+sha(fs.readFileSync(absolute))+"  "+relative+"\\n")}else throw new Error("dynamic input has unsafe entry:"+absolute)}}walk(root);return {state:"tree",files,directories,sha256:hash.digest("hex")}}',
+  'const agentRoot="/home/agent/.openclaude/agents/"+agentId;',
+  'const temporary="/tmp/oc-synthetic-eval-"+caseId;',
+  'const value={agentClaude:identity(agentRoot+"/CLAUDE.md"),agentMemoryIndex:identity(agentRoot+"/MEMORY.md"),agentMemoryTree:identity(agentRoot+"/memory"),userSoul:identity("/home/agent/.openclaude/SOUL.md"),userProfile:identity("/home/agent/.openclaude/USER.md"),userSkills:identity("/home/agent/.openclaude/hub/skills"),workspace:identity("/home/agent/.openclaude/workspace"),temporaryWorkspace:identity(temporary)};',
+  'if(phase==="pre"&&value.temporaryWorkspace.state!=="absent")throw new Error("temporary evaluation workspace already exists");',
+  'process.stdout.write(JSON.stringify(value));',
+].join("\n");
+
 function dockerExecJson(container, source, args = []) {
   const result = spawnSync(
     "docker",
@@ -1061,6 +1083,29 @@ function inspectContainer() {
   if (env.OPENCLAUDE_PLATFORM_PROMPTS_DIR !== "/run/oc/synthetic-eval/prompts") {
     fail("synthetic eval prompt directory env is not exact");
   }
+  const runtimeTuple = {
+    image: env.OC_RUNTIME_IMAGE || info.Config?.Image || null,
+    imageId:
+      env.OC_RUNTIME_IMAGE_ID
+      || labels["com.openclaude.runtime.image_id"]
+      || info.Image
+      || null,
+    runtimeRelease:
+      env.OC_RUNTIME_RELEASE
+      || labels["com.openclaude.runtime.release"]
+      || null,
+    platformBundle:
+      env.OC_PLATFORM_BUNDLE
+      || labels["com.openclaude.runtime.bundle_rev"]
+      || null,
+  };
+  if (
+    Object.values(runtimeTuple).some(
+      (value) => typeof value !== "string" || value.length === 0,
+    )
+  ) {
+    fail("synthetic eval container runtime tuple is incomplete");
+  }
   const actual = dockerExecJson(container, CONTAINER_HASH_SOURCE);
   if (JSON.stringify(actual) !== JSON.stringify(manifest.files)) {
     fail("fresh container prompt hashes differ from staged manifest");
@@ -1072,6 +1117,7 @@ function inspectContainer() {
     startedAt: info.State.StartedAt,
     manifestSha: payload.manifestSha,
     nonce: payload.recordNonce,
+    runtimeTuple,
     hashes: actual,
   };
 }
@@ -1093,6 +1139,163 @@ function inspectExtraPrompt() {
       [payload.engine, payload.sessionKey],
     ),
   };
+}
+
+function inspectDynamicInputs() {
+  if (
+    typeof payload.agentId !== "string"
+    || !/^[A-Za-z0-9_-]{1,80}$/.test(payload.agentId)
+    || typeof payload.caseId !== "string"
+    || !/^[A-Za-z0-9_-]{1,80}$/.test(payload.caseId)
+    || !["pre", "post"].includes(payload.phase)
+  ) {
+    fail("dynamic input evidence identity is invalid");
+  }
+  const evidence = inspectContainer();
+  return {
+    ...evidence,
+    phase: payload.phase,
+    inputs: dockerExecJson(
+      evidence.container,
+      DYNAMIC_INPUT_SOURCE,
+      [payload.agentId, payload.caseId, payload.phase],
+    ),
+  };
+}
+
+function inspectTurnEvidence() {
+  assertUid(payload.uid);
+  if (
+    typeof payload.peerId !== "string"
+    || !/^[A-Za-z0-9_-]{8,160}$/.test(payload.peerId)
+    || typeof payload.clientMessageId !== "string"
+    || !/^[A-Za-z0-9_-]{1,128}$/.test(payload.clientMessageId)
+    || typeof payload.agentId !== "string"
+    || !/^[A-Za-z0-9_-]{1,80}$/.test(payload.agentId)
+    || typeof payload.model !== "string"
+    || !/^[A-Za-z0-9._-]{1,80}$/.test(payload.model)
+    || !Number.isSafeInteger(payload.usageFloor)
+    || payload.usageFloor < 0
+  ) {
+    fail("turn evidence identity is invalid");
+  }
+  const peer = payload.peerId.replaceAll("'", "''");
+  const clientMessageId = payload.clientMessageId.replaceAll("'", "''");
+  const agent = payload.agentId.replaceAll("'", "''");
+  const model = payload.model.replaceAll("'", "''");
+  const sql = [
+    "WITH exact_dispatch AS (",
+    " SELECT dispatch_id,user_id,session_id,client_message_id,agent_id,model,",
+    "        billing_request_id,status,outcome,admitted_at,terminal_at",
+    "   FROM turn_dispatches",
+    "  WHERE user_id=" + payload.uid,
+    "    AND session_id='" + peer + "'",
+    "    AND client_message_id='" + clientMessageId + "'",
+    "    AND agent_id='" + agent + "'",
+    "),",
+    "root_usage AS (",
+    " SELECT id,session_id,mode,model,request_id,dispatch_id,turn_key,",
+    "        parent_turn_key,parent_session_id,delegate_agent_id,status,",
+    "        input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,",
+    "        cost_credits,created_at",
+    "   FROM usage_records",
+    "  WHERE user_id=" + payload.uid,
+    "    AND dispatch_id=(SELECT dispatch_id FROM exact_dispatch)",
+    "),",
+    "root_turn AS (",
+    " SELECT min(turn_key) AS turn_key,",
+    "        count(DISTINCT turn_key) FILTER (WHERE turn_key IS NOT NULL) AS keys",
+    "   FROM root_usage",
+    "),",
+    "delegate_usage AS (",
+    " SELECT id,session_id,mode,model,request_id,dispatch_id,turn_key,",
+    "        parent_turn_key,parent_session_id,delegate_agent_id,status,",
+    "        input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,",
+    "        cost_credits,created_at",
+    "   FROM usage_records",
+    "  WHERE user_id=" + payload.uid,
+    "    AND parent_session_id='" + peer + "'",
+    "    AND parent_turn_key=(SELECT turn_key FROM root_turn)",
+    "),",
+    "bound_usage AS (",
+    " SELECT id FROM root_usage",
+    " UNION ALL",
+    " SELECT id FROM delegate_usage",
+    "),",
+    "new_usage AS (",
+    " SELECT id,session_id,mode,model,request_id,dispatch_id,turn_key,",
+    "        parent_turn_key,parent_session_id,delegate_agent_id,status,",
+    "        input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,",
+    "        cost_credits,created_at",
+    "   FROM usage_records",
+    "  WHERE user_id=" + payload.uid + " AND id>" + payload.usageFloor,
+    ")",
+    "SELECT json_build_object(",
+    " 'dispatchCount',(SELECT count(*)::int FROM exact_dispatch),",
+    " 'dispatch',(SELECT row_to_json(exact_dispatch) FROM exact_dispatch),",
+    " 'rootTurnKey',(SELECT turn_key FROM root_turn),",
+    " 'rootTurnKeyCount',(SELECT keys::int FROM root_turn),",
+    " 'rootUsage',COALESCE((SELECT json_agg(root_usage ORDER BY id) FROM root_usage),'[]'::json),",
+    " 'delegateUsage',COALESCE((SELECT json_agg(delegate_usage ORDER BY id) FROM delegate_usage),'[]'::json),",
+    " 'newUsage',COALESCE((SELECT json_agg(new_usage ORDER BY id) FROM new_usage),'[]'::json),",
+    " 'unrelatedNewUsageCount',(",
+    "   SELECT count(*)::int FROM new_usage",
+    "    WHERE id NOT IN (SELECT id FROM bound_usage)",
+    " ),",
+    " 'expectedModel','" + model + "'",
+    ")::text;",
+  ].join("\n");
+  const raw = psql(sql);
+  if (!raw) fail("turn evidence query returned no row");
+  const value = JSON.parse(raw);
+  if (
+    value.dispatchCount !== 1
+    || !value.dispatch
+    || value.dispatch.user_id !== payload.uid
+    || value.dispatch.session_id !== payload.peerId
+    || value.dispatch.client_message_id !== payload.clientMessageId
+    || value.dispatch.agent_id !== payload.agentId
+    || value.dispatch.model !== payload.model
+    || value.dispatch.status !== "terminal"
+    || value.dispatch.outcome !== "completed"
+    || typeof value.rootTurnKey !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.rootTurnKey)
+    || value.rootTurnKeyCount !== 1
+    || !Array.isArray(value.rootUsage)
+    || value.rootUsage.length < 1
+    || !Array.isArray(value.delegateUsage)
+    || !Array.isArray(value.newUsage)
+    || value.newUsage.length < 1
+    || value.unrelatedNewUsageCount !== 0
+    || value.newUsage.some(
+      (row) =>
+        !Number.isSafeInteger(row.id)
+        || row.id <= payload.usageFloor
+        || typeof row.request_id !== "string"
+        || row.request_id.length === 0,
+    )
+    || new Set(value.newUsage.map((row) => row.id)).size !== value.newUsage.length
+    || value.rootUsage.some(
+      (row) =>
+        row.dispatch_id !== value.dispatch.dispatch_id
+        || row.turn_key !== value.rootTurnKey
+        || row.status !== "success"
+        || row.model !== payload.model,
+    )
+    || !value.rootUsage.some(
+      (row) => row.request_id === value.dispatch.billing_request_id,
+    )
+    || value.delegateUsage.some(
+      (row) =>
+        row.parent_session_id !== payload.peerId
+        || row.parent_turn_key !== value.rootTurnKey
+        || row.mode !== "delegate"
+        || row.status !== "success",
+    )
+  ) {
+    fail("turn dispatch/usage evidence is not exact");
+  }
+  return value;
 }
 
 function inspectStandardContainer() {
@@ -1155,6 +1358,10 @@ try {
     result = inspectContainer();
   } else if (action === "extra-prompt-evidence") {
     result = inspectExtraPrompt();
+  } else if (action === "dynamic-input-evidence") {
+    result = inspectDynamicInputs();
+  } else if (action === "turn-evidence") {
+    result = inspectTurnEvidence();
   } else if (action === "standard-container-evidence") {
     result = inspectStandardContainer();
   } else {

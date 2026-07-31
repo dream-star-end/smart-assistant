@@ -387,6 +387,7 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       dispatchCount: 12,
       openDispatchCount: 0,
       usageCount: 30,
+      usageMaxId: 55,
       cronFileEnabled: 0,
       v3State: "inactive",
       syntheticContainerId: "f".repeat(64),
@@ -403,6 +404,7 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       { dispatchCount: -1 },
       { openDispatchCount: 1 },
       { usageCount: -1 },
+      { usageMaxId: -1 },
       { cronFileEnabled: 1 },
       { v3State: "active" },
       { syntheticContainerId: "short" },
@@ -507,6 +509,11 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       /recover without a record requires the exact manifest SHA/,
       "uncertain prepare commits must be recoverable by caller-known nonce and manifest",
     );
+    assert.match(REMOTE_HELPER_SOURCE, /function inspectDynamicInputs\(\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /function inspectTurnEvidence\(\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /temporary evaluation workspace already exists/);
+    assert.match(REMOTE_HELPER_SOURCE, /unrelatedNewUsageCount/);
+    assert.match(REMOTE_HELPER_SOURCE, /runtime tuple is incomplete/);
     assert.doesNotMatch(REMOTE_HELPER_SOURCE, /OC_V5_SKIP_MUTATION_LEASE/);
   });
 
