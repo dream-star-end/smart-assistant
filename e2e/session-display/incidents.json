@@ -710,6 +710,25 @@
           "assertion": "T26 微博标准登录页二维码与普通验证码标签共存时不被误判挑战"
         }
       ]
+    },
+    {
+      "id": "INC-20260728-AUTODREAM-USAGE-SIDEBAND",
+      "occurredAt": "2026-07-28",
+      "severity": "P1",
+      "symptom": "Auto-Dream 已完成并计费的结构化整理轮次因新增 usage/call_usage token 侧信道被误判为非法事件，最终持续显示“整理未完成”且没有改动记忆。",
+      "rootFixCommit": "506874f2",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/autoDream.test.ts",
+          "assertion": "ignores turn and per-call token usage sidebands around structured output"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-auto-dream-collector-smoke.ts",
+          "assertion": "Auto-Dream usage/call_usage sidebands preserve structured output"
+        }
+      ]
     }
   ]
 }

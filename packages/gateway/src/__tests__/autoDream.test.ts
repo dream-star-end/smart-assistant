@@ -134,6 +134,28 @@ describe('AutoDreamStructuredOutputCollector', () => {
     assert.equal(result.upserts[0]?.file, 'stable-preference.md')
   })
 
+  it('ignores turn and per-call token usage sidebands around structured output', () => {
+    const collector = new AutoDreamStructuredOutputCollector()
+    collector.accept(structuredToolUse)
+    collector.accept({ kind: 'usage', usage: { totalTokens: 21 } })
+    collector.accept({
+      kind: 'call_usage',
+      call: {
+        callId: 'auto-dream-call-1',
+        targetIds: ['structured-output'],
+        usage: { totalTokens: 21 },
+      },
+    })
+    collector.accept(structuredToolResult)
+    collector.accept({
+      kind: 'final',
+      meta: { stopReason: 'tool_use', structuredOutput: JSON.parse(valid()) },
+    })
+
+    const result = validateProposal(collector.finish(), memory)
+    assert.equal(result.upserts[0]?.file, 'stable-preference.md')
+  })
+
   it('rejects non-StructuredOutput tools even when a structured result is present', () => {
     const collector = new AutoDreamStructuredOutputCollector()
     collector.accept({

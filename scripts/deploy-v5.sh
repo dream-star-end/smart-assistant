@@ -8451,6 +8451,7 @@ run_candidate_release_verification() {
   local cand="$1" release="$2" generation="$3" incident_sha result_sha
   [[ "$DRY" == 1 ]] && { echo "  [dry-run] fixed Luna/DeepSeek live E2E + zero-skip evidence"; return 0; }
   npm run check:v5:incidents || return 1
+  npx --no-install tsx "$REPO_ROOT/scripts/v5-auto-dream-collector-smoke.ts" || return 1
   create_release_verification_run "$release" "$generation" || return 1
   rm -rf "$REPO_ROOT/e2e/session-display/reports" "$REPO_ROOT/e2e/session-display/test-results"
   if [[ ! -x "$REPO_ROOT/e2e/session-display/node_modules/.bin/playwright" ]]; then
