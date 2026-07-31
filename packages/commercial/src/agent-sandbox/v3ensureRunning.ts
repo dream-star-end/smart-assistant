@@ -655,13 +655,39 @@ export function makeV3EnsureRunning(
     const runtimeStale = status
       ? computeRuntimeStale(status, deps, desiredRuntime)
       : { stale: false, reasons: [] as string[] };
+    let syntheticEvalStale = false;
+    if (status?.state === "running" && deps.syntheticEvalOverlay) {
+      const overlayState = deps.syntheticEvalOverlay.classifyContainer(
+        uid,
+        status.labels,
+        status.dockerContainerId,
+      );
+      if (overlayState.mode === "stale") {
+        syntheticEvalStale = true;
+        runtimeStale.stale = true;
+        runtimeStale.reasons.push(`synthetic_eval ${overlayState.reason}`);
+      }
+    }
     // 变量名保留 recycleStaleImage + 日志保留 "stale-image" 字样(兼容既有 grep / 告警规则);
     // 新增 staleReasons 字段承载泛化后的具体原因(image_id/release/boot_hash)。
     let recycleStaleImage = runtimeStale.stale;
     if (runtimeStale.stale && applyV5StalePolicy) {
       const force = options.forceStaleImageRecycle
         ?? process.env.OC_V5_FORCE_STALE_IMAGE_RECYCLE === "1";
-      if (!force && status) {
+      if (syntheticEvalStale && status) {
+        const drainResult = await drainRuntime(deps, status);
+        if (drainResult !== "accepted") {
+          console.warn("[v3ensureRunning] synthetic-eval recycle blocked", {
+            uid,
+            reason: drainResult === "busy" ? "active_turn" : "drain_failed",
+            staleReasons: runtimeStale.reasons,
+          });
+          throw new ContainerUnreadyError(
+            RETRY_AFTER_PROVISIONING_SEC,
+            "synthetic_eval_recycle_blocked",
+          );
+        }
+      } else if (!force && status) {
         const drainResult = await drainRuntime(deps, status);
         if (drainResult !== "accepted") {
           recycleStaleImage = false;

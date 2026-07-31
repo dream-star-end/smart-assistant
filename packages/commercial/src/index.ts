@@ -538,7 +538,9 @@ import {
   startV3ContainerEventsWorker,
   startVolumeGcScheduler,
   createUserMediaResolver,
+  createSyntheticEvalOverlayRuntime,
   isUserVolumeMediaPath,
+  readSyntheticEvalReleaseSourceCommit,
   resolvePlatformBundleMount,
   resolveRuntimeReleaseMount,
   DEFAULT_PLATFORM_ROOT,
@@ -2904,6 +2906,17 @@ export async function registerCommercial(
         : {}),
       // V5 runtime tuple(启动期已解析);未配 → undefined → provision/ensureRunning 走旧路径。
       ...(runtimeTuple ? { runtimeTuple } : {}),
+      // Default-no-op exact-prompt evaluation lane. The runtime adapter rejects
+      // every real UID and any absent/invalid/expired root-owned active record.
+      ...(getRuntimeChannel() === "v5"
+        ? {
+            syntheticEvalOverlay: createSyntheticEvalOverlayRuntime({
+              expectedBaseCommit: readSyntheticEvalReleaseSourceCommit(
+                runtimeTuple?.releaseResolvedPath,
+              ),
+            }),
+          }
+        : {}),
       // 多机路由 wiring:selfHostUuid 取到才同时注入 containerService + selfHostId,
       // 避免出现 "containerService 注入但 selfHostId undefined" 的半 wire 状态
       // (provisionV3Container 的 useRemote 判定依赖 selfHostId 非空)。

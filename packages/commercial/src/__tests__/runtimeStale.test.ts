@@ -26,6 +26,9 @@ import { describe, test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import type Docker from "dockerode";
 import type { Pool, PoolClient } from "pg";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   makeV3EnsureRunning,
@@ -37,9 +40,19 @@ import {
   RUNTIME_EMBED_SOURCE_LABEL_KEY,
   RELEASE_MOUNT_TARGET,
   OPENCLAUDE_DEFAULT_WORKSPACE_VALUE,
+  V3_CCB_BASELINE_SKILL_NAMES,
   type V3SupervisorDeps,
   type V3RuntimeTuple,
+  type SyntheticEvalOverlayRuntime,
 } from "../agent-sandbox/index.js";
+import {
+  SYNTHETIC_EVAL_MANIFEST_LABEL,
+  SYNTHETIC_EVAL_NONCE_LABEL,
+  SYNTHETIC_EVAL_UID_LABEL,
+  syntheticEvalOverlayLabels,
+  type SyntheticEvalOverlaySpec,
+} from "../agent-sandbox/syntheticEvalOverlay.js";
+import { ContainerUnreadyError } from "../ws/userChatBridge.js";
 
 const TEST_HOST = "11111111-1111-1111-1111-111111111111";
 const TEST_HOST_ALT = "22222222-2222-2222-2222-222222222222";
@@ -218,7 +231,7 @@ function makeDocker(b: DockerBehavior = {}): { docker: Docker; captured: DockerC
     createContainer: async (opts: CreateOptsShape) => {
       captured.created++;
       captured.lastCreateOpts = opts;
-      const id = `dockerid-new-${captured.created}`;
+      const id = captured.created.toString(16).padStart(64, "0");
       return { id, start: async () => { captured.started++; }, remove: async () => { captured.removed++; } };
     },
     getContainer: (_id: string) => ({
@@ -538,6 +551,205 @@ describe("R2-B3:workspace env 绑 release 轴(bundle 未启用也注入,离开�
     assert.ok(
       binds.includes(`${RELEASE_PATH}:${RELEASE_MOUNT_TARGET}:ro`),
       "release 挂载 bind 必须在",
+    );
+  });
+});
+
+describe("V5 synthetic exact-eval overlay container wiring", () => {
+  let savedChannel: string | undefined;
+  let savedBaselineOpt: string | undefined;
+  let stableBaseline = "";
+  let overlaySpec: SyntheticEvalOverlaySpec;
+  before(() => {
+    savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    savedBaselineOpt = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "0";
+    stableBaseline = mkdtempSync(join(tmpdir(), "v5-synthetic-baseline-"));
+    writeFileSync(join(stableBaseline, "AGENTS.md"), "# test agents\n", {
+      mode: 0o644,
+    });
+    writeFileSync(join(stableBaseline, "CLAUDE.md"), "# test claude\n", {
+      mode: 0o644,
+    });
+    const skillsDir = join(stableBaseline, "skills");
+    mkdirSync(skillsDir, { mode: 0o755 });
+    for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
+      const skillDir = join(skillsDir, name);
+      mkdirSync(skillDir, { mode: 0o755 });
+      writeFileSync(join(skillDir, "SKILL.md"), `# ${name}\n`, {
+        mode: 0o644,
+      });
+    }
+    overlaySpec = {
+      uid: 247,
+      nonce: "1".repeat(32),
+      manifestSha: "a".repeat(64),
+      candidateTreePath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree",
+      promptsHostPath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree/prompts",
+      promptSlotsHostPath: "/var/lib/openclaude-v5/synthetic-eval-overlay/a/tree/promptSlots.ts",
+      baselineHostPath: stableBaseline,
+    };
+  });
+  after(() => {
+    const restore = (key: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    restore("OC_RUNTIME_CHANNEL", savedChannel);
+    restore("OC_V3_CCB_BASELINE_OPTIONAL", savedBaselineOpt);
+    rmSync(stableBaseline, { recursive: true, force: true });
+  });
+  function fakeOverlay(
+    prepared: boolean,
+    onActivate: (containerId: string) => void = () => undefined,
+  ): SyntheticEvalOverlayRuntime {
+    return {
+      resolvePrepared: (uid) => prepared && uid === 247 ? overlaySpec : null,
+      activatePrepared: (_spec, containerId) => onActivate(containerId),
+      classifyContainer: () => ({ mode: "standard" }),
+      labels: syntheticEvalOverlayLabels,
+    };
+  }
+
+  test("prepared synthetic UID gets exact prompt/baseline binds, env, labels and activation", async () => {
+    const pool = new FakePool();
+    const { docker, captured } = makeDocker();
+    let activated = "";
+    const deps = makeDeps(docker, pool);
+    deps.syntheticEvalOverlay = fakeOverlay(true, (id) => { activated = id; });
+    await provisionV3Container(deps, 247);
+
+    const opts = captured.lastCreateOpts!;
+    const env = opts.Env ?? [];
+    const binds = opts.HostConfig?.Binds ?? [];
+    assert.deepEqual(
+      env.filter((item) => item.startsWith("OPENCLAUDE_PLATFORM_PROMPTS_DIR=")),
+      ["OPENCLAUDE_PLATFORM_PROMPTS_DIR=/run/oc/synthetic-eval/prompts"],
+    );
+    assert.ok(binds.includes(
+      `${overlaySpec.promptsHostPath}:/run/oc/synthetic-eval/prompts:ro`,
+    ));
+    assert.ok(binds.includes(
+      `${overlaySpec.promptSlotsHostPath}:/opt/openclaude/packages/gateway/src/promptSlots.ts:ro`,
+    ));
+    assert.ok(binds.includes(
+      `${stableBaseline}/AGENTS.md:/opt/openclaude/AGENTS.md:ro`,
+    ));
+    assert.equal(opts.Labels?.[SYNTHETIC_EVAL_MANIFEST_LABEL], overlaySpec.manifestSha);
+    assert.equal(opts.Labels?.[SYNTHETIC_EVAL_NONCE_LABEL], overlaySpec.nonce);
+    assert.equal(opts.Labels?.[SYNTHETIC_EVAL_UID_LABEL], "247");
+    assert.equal(activated, "1".padStart(64, "0"));
+  });
+
+  test("injected runtime remains byte-identical for a non-synthetic UID", async () => {
+    const plainPool = new FakePool();
+    const wiredPool = new FakePool();
+    const plain = makeDocker();
+    const wired = makeDocker();
+    const plainDeps = makeDeps(plain.docker, plainPool);
+    plainDeps.ccbBaselineDir = stableBaseline;
+    await provisionV3Container(plainDeps, 123);
+    const wiredDeps = makeDeps(wired.docker, wiredPool);
+    wiredDeps.ccbBaselineDir = stableBaseline;
+    wiredDeps.syntheticEvalOverlay = fakeOverlay(true);
+    await provisionV3Container(wiredDeps, 123);
+    assert.deepEqual(wired.captured.lastCreateOpts, plain.captured.lastCreateOpts);
+  });
+
+  test("orphan overlay labels force safe recycle back to the standard container", async () => {
+    const pool = new FakePool();
+    pool.preInsertActive(247, "172.31.1.247", "dockerid-pre-overlay");
+    const { docker, captured } = makeDocker({
+      runningLabels: syntheticEvalOverlayLabels(overlaySpec),
+    });
+    const deps = makeDeps(docker, pool);
+    deps.ccbBaselineDir = stableBaseline;
+    deps.syntheticEvalOverlay = {
+      ...fakeOverlay(false),
+      classifyContainer: () => ({
+        mode: "stale",
+        reason: "synthetic overlay labels do not match active record",
+      }),
+    };
+    const result = await makeEnsure(deps)(247n);
+    assert.equal(result.coldStart, true);
+    assert.ok(captured.stopped >= 1);
+    assert.equal(captured.created, 1);
+    assert.equal(
+      captured.lastCreateOpts?.Labels?.[SYNTHETIC_EVAL_MANIFEST_LABEL],
+      undefined,
+    );
+  });
+
+  for (const [drainResult, uid] of [
+    ["busy", 247],
+    ["failed", 626],
+  ] as const) {
+    test(`overlay mismatch with V5 drain ${drainResult} fails closed instead of warm reuse`, async () => {
+      const pool = new FakePool();
+      pool.preInsertActive(uid, `172.31.1.${uid % 255}`, `dockerid-pre-${uid}`);
+      const { docker, captured } = makeDocker({
+        runningLabels: syntheticEvalOverlayLabels({
+          ...overlaySpec,
+          uid,
+        }),
+      });
+      const deps = makeDeps(docker, pool);
+      deps.ccbBaselineDir = stableBaseline;
+      deps.syntheticEvalOverlay = {
+        ...fakeOverlay(false),
+        classifyContainer: () => ({
+          mode: "stale",
+          reason: "synthetic overlay labels do not match active record",
+        }),
+      };
+      const ensure = makeV3EnsureRunning(deps, {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        sleep: noSleep,
+        now: fixedNow,
+        runtimeChannelForTest: "v5",
+        forceStaleImageRecycle: true,
+        requestRuntimeRecycleDrain: async () => drainResult,
+      });
+      await assert.rejects(
+        () => ensure(BigInt(uid)),
+        (error: unknown) => {
+          assert.ok(error instanceof ContainerUnreadyError);
+          assert.equal(error.reason, "synthetic_eval_recycle_blocked");
+          return true;
+        },
+      );
+      assert.equal(captured.stopped, 0);
+      assert.equal(captured.removed, 0);
+      assert.equal(captured.created, 0);
+    });
+  }
+
+  test("overlay activation happens only after Tx2 and activation failure compensates the container", async () => {
+    const pool = new FakePool();
+    const { docker, captured } = makeDocker();
+    const deps = makeDeps(docker, pool);
+    let sawCommittedIdentity = false;
+    deps.syntheticEvalOverlay = fakeOverlay(true, (containerId) => {
+      sawCommittedIdentity = pool.rows.some(
+        (row) =>
+          row.state === "active"
+          && row.container_internal_id === containerId,
+      );
+      throw new Error("activation failed");
+    });
+
+    await assert.rejects(
+      () => provisionV3Container(deps, 247),
+      /activation failed/,
+    );
+    assert.equal(sawCommittedIdentity, true);
+    assert.ok(captured.removed >= 1);
+    assert.equal(
+      pool.rows.some((row) => row.state === "active"),
+      false,
     );
   });
 });
