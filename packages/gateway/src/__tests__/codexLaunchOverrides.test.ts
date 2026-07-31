@@ -298,6 +298,13 @@ describe('buildCodexLaunchOverrides', () => {
     assert.match(out.instructionsContent, /## 定时任务/)
     assert.match(out.instructionsContent, /create_reminder/)
     assert.match(out.instructionsContent, /list_reminders/)
+    assert.doesNotMatch(out.instructionsContent, /after a complex multi-step task/)
+    assert.equal(
+      out.instructionsContent.match(/工具调用次数本身不构成沉淀触发/g)?.length,
+      1,
+      'Codex 最终 instructions 应只保留一份证据触发的 skill 沉淀规则',
+    )
+    assert.match(out.instructionsContent, /确实验证出可复用的新流程/)
   })
 
   it('mcp-memory keys appear in stable order when entry resolves', async () => {

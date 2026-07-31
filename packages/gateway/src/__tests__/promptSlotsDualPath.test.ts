@@ -70,6 +70,23 @@ afterEach(() => {
 })
 
 describe('buildPromptContext — env-absent (personal hook path)', () => {
+  it('CCB 与 Codex 都只注入一次通用交付契约', async () => {
+    for (const provider of ['anthropic', 'codex-native']) {
+      const result = await buildPromptContext({
+        agentId: `execution-contract-${provider}`,
+        provider,
+        model: provider === 'codex-native' ? 'gpt-5.6-sol' : 'claude-sonnet-4-6',
+      })
+      assert.equal(
+        result.content.match(/## 交付范围、工具效率与失败自愈/g)?.length,
+        1,
+        `${provider} 应只注入一次通用交付契约`,
+      )
+      assert.match(result.content, /实际缩短关键路径/)
+      assert.match(result.content, /明确要求的完整任务仍须完整交付/)
+    }
+  })
+
   it('两个 hook 都被调,literature hook 返回的内容进 applied', async () => {
     // 不设 env -> personal 路径
     let litCalls = 0

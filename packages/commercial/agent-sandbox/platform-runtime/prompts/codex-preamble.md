@@ -43,10 +43,6 @@ OpenClaude memory files (see `# Memory`), recall / archival through the
 *explicitly* asks you to inspect a codex-native rollout file — and even then,
 do not migrate that content into a parallel store.)
 
-For reusable workflows, be proactive: after a complex multi-step task, call
-`skill_search` to check existing coverage, then `skill_save` to create or
-update a platform skill when the pattern is likely to recur.
-
 ## How to interpret tool descriptions in the sections below
 
 The platform context was authored primarily for the ccb (Claude Code) backend,

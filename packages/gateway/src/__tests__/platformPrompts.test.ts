@@ -19,7 +19,7 @@ import {
   _internals,
   type PlatformPromptKey,
 } from '../platformPrompts.js'
-import { _platformPromptFallbacks } from '../promptSlots.js'
+import { _platformPromptFallbacks, buildToolsSlot } from '../promptSlots.js'
 import { _internals as codexInternals } from '../codexLaunchOverrides.js'
 
 const KEYS: PlatformPromptKey[] = ['platform-capabilities', 'memory-instructions', 'codex-preamble']
@@ -285,6 +285,42 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(prompt.includes('按收益机会式委派'))
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
+  })
+  it('通用交付契约约束范围、机会式并行和证据触发工具发现', () => {
+    const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+    assert.equal(prompt.match(/## 交付范围、工具效率与失败自愈/g)?.length, 1)
+    for (const fragment of [
+      '直接答案、执行动作还是文件/项目等产物',
+      '实现、修改、导出等请求隐含的必要产物属于交付',
+      '不要把直接',
+      '相关专业 skill',
+      '可以直接 `skill_view`',
+      '不要做仪式化预检',
+      '实际缩短关键路径',
+      '共享状态修改和强依赖链直接完成',
+      '长驻服务应后台启动',
+      '已有仍有效的通过结果',
+      '相关配置和运行环境均未变化',
+      '不得设置硬工具、时长或步骤上限',
+      '明确要求的完整任务仍须完整交付',
+    ]) {
+      assert.ok(prompt.includes(fragment), `通用执行契约缺片段: ${fragment}`)
+    }
+  })
+  it('技能沉淀由可复用证据触发，不再按工具次数例行搜索', () => {
+    const tools = buildToolsSlot().content
+    assert.ok(tools.includes('工具调用次数本身不构成沉淀触发'))
+    assert.ok(tools.includes('确实验证出可复用的新流程'))
+    assert.ok(tools.includes('不得为例行沉淀延迟当前答复'))
+    assert.doesNotMatch(tools, /完成 3\+ 工具调用/)
+
+    const agents = readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md', 'utf8')
+    const claude = readFileSync('packages/commercial/agent-sandbox/ccb-baseline/CLAUDE.md', 'utf8')
+    assert.ok(agents.includes('工具调用次数本身不构成沉淀触发'))
+    assert.ok(agents.includes('不要因任务看起来陌生'))
+    assert.ok(claude.includes('工具次数本身不触发'))
+    assert.doesNotMatch(agents, /开始不熟悉的任务时/)
+    assert.doesNotMatch(agents, /完成 3\+ 工具调用/)
   })
   it('选择题使用运行时专用 Ask 工具，不再把 options 富块当交互入口', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
