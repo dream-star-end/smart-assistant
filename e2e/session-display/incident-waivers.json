@@ -49,6 +49,12 @@
       "reason": "合成 exact-eval 基础设施首次 canary 在 READY 前发现把 runtime release 身份误作 application release 基线；官方发布脚本在切流前自动恢复旧稳定版，真实用户、计费和数据均未受影响。本提交仅修正评测基础设施的发布身份绑定。",
       "approvedBy": "dx 2026-07-31 指示继续并以通用、多类活跃用户任务的严格评测验证 Agent 效率改进",
       "expiresAt": "2026-08-31"
+    },
+    {
+      "commit": "b26a03a4a7",
+      "reason": "exact synthetic eval 预检查把容器运行时正常写出的 1000:1000 cron.yaml 误当成不安全 owner；失败发生在 overlay staging、容器重建和真实 turn 之前，线上用户、计费与数据均未受影响。本提交仅让固定合成用户 cron 文件接受既有 1000:1000 运行契约，其他远端安全面仍 root-only。",
+      "approvedBy": "dx 2026-07-31 指示继续并以通用、多类活跃用户任务的严格评测验证 Agent 效率改进",
+      "expiresAt": "2026-08-31"
     }
   ]
 }
