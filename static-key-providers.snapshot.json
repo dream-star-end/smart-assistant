@@ -7,7 +7,7 @@
       "maxInputTokens": null,
       "upstreamEndpoint": "https://api.deepseek.com/anthropic/v1/messages",
       "capabilityZero": false,
-      "contextWindow": null,
+      "contextWindow": 1000000,
       "supportsVision": false
     },
     {

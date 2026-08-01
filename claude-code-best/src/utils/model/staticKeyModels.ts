@@ -61,7 +61,7 @@ export function getAuthorityModelCapabilities(
 //      isCapabilityZeroStaticModel 注释)。
 //      **deepseek 不在此集**:deepseek-v4-flash/pro 仍保留 effort='max'(走默认路径,见 effort.ts),
 //      betas/thinking 也走默认路径,本次一字不动。
-//   2) 静态模型的 context window(auto-compact 上限)。deepseek 无特判 → 落 MODEL_CONTEXT_WINDOW_DEFAULT。
+//   2) 静态模型的 context window(auto-compact 上限)。DeepSeek V4 Flash / Pro 官方窗口均为 1M。
 
 /** 火山方舟 Ark Coding Plan 模型:**glm-5.2**(2026-06-17 起主力 = coder/队长/平台默认)+ glm-5.1
  *  (退 picker 但兼容存量)。两者同走火山 ark 端点,能力处理一致(capabilityZero / thinking / 200k 窗口)。
@@ -122,7 +122,7 @@ export function isCapabilityZeroStaticModel(model: string): boolean {
 }
 
 /**
- * 静态模型 context window 显式特判表(deepseek 不在内 —— 它无特判,落 MODEL_CONTEXT_WINDOW_DEFAULT)。
+ * 静态模型 context window 显式特判表。
  * **per-model**:glm-5.2=1M(火山规格,boss 2026-06-17 确认)、glm-5.1=200k(退场,沿用旧规格)。
  * auto-compact 上限必须 per-model:glm-5.1 存量会话若按 1M 不压缩会超 200k 窗 → 火山拒。
  * 顺序敏感:glm-5.2 条目必须在 glm-5.1 之前(find 短路);二者大小写/空白不敏感,与 isArkGlmModel 一致口径。
@@ -132,6 +132,14 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
   contextWindow: number
 }> = [
   { matches: isMiniMaxM3Model, contextWindow: 512_000 },
+  // DeepSeek 只放行已接入的两个精确 canonical id；未来 deepseek-* 仍落默认值。
+  {
+    matches: (m) => {
+      const model = m.trim().toLowerCase()
+      return model === 'deepseek-v4-flash' || model === 'deepseek-v4-pro'
+    },
+    contextWindow: 1_000_000,
+  },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.2', contextWindow: 1_000_000 },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
   // qwen3.7-max/plus 官方规格均 1M(max input 991.8k);两型号同窗,家族函数一条即可。

@@ -72,7 +72,8 @@
     "0190_user_signal_quality",
     "0191_claude5_models",
     "0192_friction_code_casing",
-    "0193_test_account_model_denials"
+    "0193_test_account_model_denials",
+    "0194_deepseek_1m_context"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
