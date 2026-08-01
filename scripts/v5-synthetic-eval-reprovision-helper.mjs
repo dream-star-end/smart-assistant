@@ -5,8 +5,10 @@
  * This local helper has no mutable dependency tree. It starts exactly one
  * foreground ssh process to kl-mirror and feeds it the fixed Node script
  * below. The remote script performs exactly one supported admin restart API
- * call, then opens exactly one user relay WebSocket and waits for
- * `sys.relay_ready`. It never sends a turn and never retries the WebSocket.
+ * call, then waits for the user relay to become ready. A supported restart is
+ * asynchronous, so the relay may answer with the normal 4503
+ * `starting`/`provisioning` contract before `sys.relay_ready`. The helper
+ * follows only that bounded readiness contract and never sends a turn.
  */
 
 import { spawnSync } from "node:child_process";
@@ -54,7 +56,113 @@ export function readReprovisionIdentity() {
   return { uid, engine, agentId, phase };
 }
 
-async function remoteReprovision(encodedConfig) {
+export async function waitForFreshRelay(
+  url,
+  accessToken,
+  {
+    WebSocketCtor = WebSocket,
+    timeoutMs = 140_000,
+    sleep = (milliseconds) =>
+      new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error("fresh relay did not become ready in 140s");
+    }
+    const outcome = await new Promise((resolve) => {
+      const socket = new WebSocketCtor(url, ["bearer", accessToken]);
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        try {
+          socket.close();
+        } finally {
+          finish({ type: "timeout" });
+        }
+      }, remainingMs);
+      socket.addEventListener("message", (event) => {
+        let frame;
+        try {
+          frame = JSON.parse(String(event.data));
+        } catch {
+          return;
+        }
+        if (frame?.type === "sys.relay_ready") {
+          try {
+            socket.close(1000, "relay verified");
+          } finally {
+            finish({ type: "ready" });
+          }
+        } else if (
+          ["outbound.error", "outbound.turn_error", "error"].includes(frame?.type)
+        ) {
+          try {
+            socket.close();
+          } finally {
+            finish({ type: "error", frame });
+          }
+        }
+      });
+      socket.addEventListener("error", () => {
+        try {
+          socket.close();
+        } finally {
+          finish({ type: "socket-error" });
+        }
+      });
+      socket.addEventListener("close", (event) => {
+        finish({ type: "close", code: event.code, reason: event.reason });
+      });
+    });
+
+    if (outcome.type === "ready") return;
+    if (outcome.type === "timeout") {
+      throw new Error("fresh relay did not become ready in 140s");
+    }
+    if (outcome.type === "error") {
+      throw new Error(
+        `fresh relay returned an error: ${JSON.stringify(outcome.frame).slice(0, 500)}`,
+      );
+    }
+    if (outcome.type === "socket-error") {
+      throw new Error("fresh relay WebSocket failed");
+    }
+
+    let close;
+    try {
+      close = JSON.parse(outcome.reason);
+    } catch {
+      throw new Error(`fresh relay closed before ready (${outcome.code})`);
+    }
+    if (
+      outcome.code !== 4503
+      || !["starting", "provisioning"].includes(close?.reason)
+      || !Number.isFinite(close?.retryAfterSec)
+      || close.retryAfterSec <= 0
+    ) {
+      throw new Error(`fresh relay closed before ready (${outcome.code})`);
+    }
+    const delayMs = Math.min(
+      Math.max(1_000, close.retryAfterSec * 1_000),
+      60_000,
+      deadline - Date.now(),
+    );
+    if (delayMs <= 0) {
+      throw new Error("fresh relay did not become ready in 140s");
+    }
+    await sleep(delayMs);
+  }
+}
+
+async function remoteReprovision(encodedConfig, waitForFreshRelay) {
   const { execFileSync } = await import("node:child_process");
   const { createHmac, randomBytes } = await import("node:crypto");
   const { readFileSync } = await import("node:fs");
@@ -258,52 +366,10 @@ async function remoteReprovision(encodedConfig) {
     throw new Error(`supported admin restart failed ${restart.status}: ${(await restart.text()).slice(0, 200)}`);
   }
 
-  // One connection only. A cold/unready close is a hard failure; this helper
-  // deliberately never reconnects and never sends an inbound turn.
-  await new Promise((resolve, reject) => {
-    const socket = new WebSocket(
-      `${base.replace(/^http/, "ws")}/ws/user-chat-bridge`,
-      ["bearer", accessToken],
-    );
-    let settled = false;
-    const timer = setTimeout(() => finish(new Error("fresh relay did not become ready in 140s")), 140_000);
-    const finish = (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve();
-    };
-    socket.addEventListener("message", (event) => {
-      let frame;
-      try {
-        frame = JSON.parse(String(event.data));
-      } catch {
-        return;
-      }
-      if (frame?.type === "sys.relay_ready") {
-        try {
-          socket.close(1000, "relay verified");
-        } finally {
-          finish();
-        }
-      } else if (
-        ["outbound.error", "outbound.turn_error", "error"].includes(frame?.type)
-      ) {
-        try {
-          socket.close();
-        } finally {
-          finish(new Error(`fresh relay returned an error: ${JSON.stringify(frame).slice(0, 500)}`));
-        }
-      }
-    });
-    socket.addEventListener("error", () => finish(new Error("fresh relay WebSocket failed")));
-    socket.addEventListener("close", (event) => {
-      if (!settled) {
-        finish(new Error(`fresh relay closed before ready (${event.code})`));
-      }
-    });
-  });
+  await waitForFreshRelay(
+    `${base.replace(/^http/, "ws")}/ws/user-chat-bridge`,
+    accessToken,
+  );
 
   let afterInspect;
   let databaseIdentity;
@@ -347,7 +413,8 @@ async function remoteReprovision(encodedConfig) {
 }
 
 export const REPROVISION_REMOTE_SCRIPT =
-  `await (${remoteReprovision.toString()})(process.argv.at(-1));\n`;
+  `const waitForFreshRelay = ${waitForFreshRelay.toString()};\n` +
+  `await (${remoteReprovision.toString()})(process.argv.at(-1), waitForFreshRelay);\n`;
 
 export function parseReprovisionOutput(stdout) {
   const lines = stdout.trim().split("\n").filter(Boolean);

@@ -99,12 +99,135 @@ describe("V5 synthetic exact-eval helpers", () => {
     ]);
 
     const source = readFileSync(reprovisionHelper, "utf8");
-    assert.equal(source.match(/new WebSocket\(/g)?.length, 1);
+    assert.equal(source.match(/new WebSocketCtor\(/g)?.length, 1);
     assert.equal(
       source.match(/api\/admin\/agent-containers\/\$\{rowId\}\/restart/g)?.length,
       1,
     );
     assert.doesNotMatch(source, /inbound\.message/);
+  });
+
+  test("reprovision follows only bounded 4503 starting/provisioning readiness", async () => {
+    const helper = await import(
+      `${pathToFileURL(reprovisionHelper).href}?readiness=${Date.now()}`
+    ) as {
+      waitForFreshRelay: (
+        url: string,
+        accessToken: string,
+        options: {
+          WebSocketCtor: new (url: string, protocols: string[]) => FakeSocket;
+          timeoutMs: number;
+          sleep: (milliseconds: number) => Promise<void>;
+        },
+      ) => Promise<void>;
+    };
+
+    type Listener = (event: { data?: string; code?: number; reason?: string }) => void;
+    type SocketScript = (socket: FakeSocket) => void;
+    let scripts: SocketScript[] = [];
+    let active = 0;
+    let maxActive = 0;
+    let sends = 0;
+    const sockets: FakeSocket[] = [];
+
+    class FakeSocket {
+      readonly listeners = new Map<string, Listener[]>();
+      closed = false;
+
+      constructor(readonly url: string, readonly protocols: string[]) {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        sockets.push(this);
+        const script = scripts.shift();
+        assert.ok(script, "unexpected WebSocket attempt");
+        queueMicrotask(() => script(this));
+      }
+
+      addEventListener(type: string, listener: Listener): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      emit(type: string, event: { data?: string; code?: number; reason?: string }): void {
+        if (type === "close" && !this.closed) {
+          this.closed = true;
+          active -= 1;
+        }
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+
+      close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        active -= 1;
+      }
+
+      send(): void {
+        sends += 1;
+      }
+    }
+
+    const sleeps: number[] = [];
+    scripts = [
+      (socket) => socket.emit("close", {
+        code: 4503,
+        reason: JSON.stringify({ reason: "starting", retryAfterSec: 5 }),
+      }),
+      (socket) => socket.emit("message", {
+        data: JSON.stringify({ type: "sys.relay_ready" }),
+      }),
+    ];
+    await helper.waitForFreshRelay("ws://relay", "token", {
+      WebSocketCtor: FakeSocket,
+      timeoutMs: 10_000,
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+      },
+    });
+    assert.deepEqual(sleeps, [5_000]);
+    assert.equal(sockets.length, 2);
+    assert.equal(maxActive, 1);
+    assert.equal(active, 0);
+    assert.equal(sends, 0);
+    assert.ok(sockets.every((socket) => socket.closed));
+
+    for (const close of [
+      { code: 4503, reason: "not-json" },
+      {
+        code: 4503,
+        reason: JSON.stringify({ reason: "image_outdated", retryAfterSec: 5 }),
+      },
+      {
+        code: 4503,
+        reason: JSON.stringify({ reason: "provisioning" }),
+      },
+      { code: 1006, reason: "" },
+    ]) {
+      scripts = [(socket) => socket.emit("close", close)];
+      await assert.rejects(
+        helper.waitForFreshRelay("ws://relay", "token", {
+          WebSocketCtor: FakeSocket,
+          timeoutMs: 1_000,
+          sleep: async () => {},
+        }),
+        new RegExp(`closed before ready \\(${close.code}\\)`),
+      );
+    }
+
+    scripts = [() => {}];
+    const deadlineSocketIndex = sockets.length;
+    await assert.rejects(
+      helper.waitForFreshRelay("ws://relay", "token", {
+        WebSocketCtor: FakeSocket,
+        timeoutMs: 10,
+        sleep: async () => {},
+      }),
+      /did not become ready in 140s/,
+    );
+    assert.equal(sockets.length, deadlineSocketIndex + 1);
+    assert.equal(sockets.at(-1)?.closed, true);
+    assert.equal(active, 0);
   });
 
   test("reprovision sends fixed SELECT through psql stdin so uid variables expand", async () => {
