@@ -114,9 +114,10 @@ describe("getStaticModelContextWindow", () => {
     expect(getStaticModelContextWindow("kimi-k2.7-code")).toBe(256_000);
     expect(getStaticModelContextWindow("kimi-k3-ark")).toBe(1_048_576);
   });
-  test("deepseek 无特判 → undefined(由 caller 落 MODEL_CONTEXT_WINDOW_DEFAULT,等价现状)", () => {
-    expect(getStaticModelContextWindow("deepseek-v4-pro")).toBeUndefined();
-    expect(getStaticModelContextWindow("deepseek-v4-flash")).toBeUndefined();
+  test("deepseek V4 Flash / Pro 精确命中 1M，未声明的 deepseek-* 不扩放", () => {
+    expect(getStaticModelContextWindow("deepseek-v4-pro")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("  DEEPSEEK-V4-FLASH  ")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("deepseek-v4-preview")).toBeUndefined();
   });
   test("非静态模型 → undefined", () => {
     expect(getStaticModelContextWindow("claude-opus-4-7")).toBeUndefined();

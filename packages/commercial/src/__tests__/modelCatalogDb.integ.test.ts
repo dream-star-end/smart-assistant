@@ -130,10 +130,12 @@ function expectedContextWindow(modelId: string): number | null {
   if (isCodexEngineModel(modelId)) return null;
   const m = modelId.trim().toLowerCase();
   if (m === "minimax-m3") return 512_000;
+  if (m === "deepseek-v4-flash" || m === "deepseek-v4-pro") return 1_000_000;
   if (m === "glm-5.2") return 1_000_000;
   if (m === "glm-5.1") return 200_000;
   if (m === "qwen3.7-max" || m === "qwen3.7-plus") return 1_000_000;
   if (m === "kimi-k2.7-code") return 256_000;
+  if (m === "kimi-k3" || m === "kimi-k3-ark") return 1_048_576;
   return 200_000;
 }
 
@@ -157,7 +159,8 @@ describe("0143 回填 == protocol 常量", () => {
     }>(
       `SELECT c.model_id, c.engine, c.provider_id, c.upstream_model_id, c.context_window,
               c.capability_profile, c.capability_schema_version, c.state, p.enabled
-         FROM model_catalog c JOIN model_pricing p USING (model_id)`,
+         FROM model_catalog c JOIN model_pricing p USING (model_id)
+        WHERE c.state IN ('staged', 'active', 'disabled')`,
     );
     assert.ok(rows.rows.length >= 14, `expected the seeded model set, got ${rows.rows.length}`);
 
@@ -176,16 +179,20 @@ describe("0143 回填 == protocol 常量", () => {
       // engine='ccb' → provider_id 必非空(DB CHECK 的语义复核)
       if (r.engine === "ccb") assert.ok(r.provider_id, `${id}: ccb must carry provider_id`);
 
-      // upstream:当前全部 = 同名(NULL)
-      assert.equal(r.upstream_model_id, null, `${id}: upstream_model_id`);
+      // Ark K3 uses the platform alias kimi-k3-ark for pricing and rewrites only upstream.
+      assert.equal(
+        r.upstream_model_id,
+        id === "kimi-k3-ark" ? "kimi-k3" : null,
+        `${id}: upstream_model_id`,
+      );
 
       // context_window
       assert.equal(r.context_window, expectedContextWindow(id), `${id}: context_window`);
 
-      // capability_profile.supports_vision = provider?.supportsVision ?? false
+      // Luna's later verified version enables vision; other live rows mirror the provider registry.
       assert.equal(
         r.capability_profile.supports_vision,
-        provider?.supportsVision ?? false,
+        id === "gpt-5.6-luna" ? true : (provider?.supportsVision ?? false),
         `${id}: supports_vision`,
       );
 
@@ -213,7 +220,7 @@ describe("0143 回填 == protocol 常量", () => {
     for (const m of CODEX_ENGINE_MODELS) {
       const r = await query<{ def: string | null; engine: string }>(
         `SELECT capability_profile->'reasoning'->>'codex_model_default' AS def, engine
-           FROM model_catalog WHERE model_id = $1`,
+           FROM model_catalog WHERE model_id = $1 AND state = 'active'`,
         [m.id],
       );
       assert.equal(r.rows.length, 1, `${m.id} must exist in catalog`);

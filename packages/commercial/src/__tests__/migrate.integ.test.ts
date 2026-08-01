@@ -1,10 +1,11 @@
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, readdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
-import { query } from "../db/queries.js";
+import { query, tx } from "../db/queries.js";
 import { runMigrations, MigrationIntegrityError } from "../db/migrate.js";
 import { PricingCache } from "../billing/pricing.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
@@ -90,6 +91,35 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   return false;
 }
 
+function tested0194RollbackSql(migrationSql: string): string {
+  const start = "-- BEGIN TESTED MANUAL ROLLBACK 0194";
+  const end = "-- END TESTED MANUAL ROLLBACK 0194";
+  assert.ok(migrationSql.includes(start) && migrationSql.includes(end));
+  const body = migrationSql.slice(
+    migrationSql.indexOf(start) + start.length,
+    migrationSql.indexOf(end),
+  );
+  return body
+    .split("\n")
+    .map((line) => line.replace(/^-- ?/, ""))
+    .join("\n");
+}
+
+async function runBuiltInMigrationsBefore0194(): Promise<void> {
+  const source = fileURLToPath(new URL("../db/migrations/", import.meta.url));
+  const dir = await mkdtemp(path.join(tmpdir(), "mig-before-0194-"));
+  try {
+    for (const file of await readdir(source)) {
+      if (file.endsWith(".sql") && file !== "0194_deepseek_1m_context.sql") {
+        await copyFile(path.join(source, file), path.join(dir, file));
+      }
+    }
+    await runMigrations({ dir });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 describe("migrate.runMigrations", () => {
   test("empty DB → apply all built-in migrations → tables + schema_migrations rows exist", async (t) => {
     if (skipIfNoPg(t)) return;
@@ -138,6 +168,148 @@ describe("migrate.runMigrations", () => {
       "SELECT COUNT(*)::text AS cnt FROM schema_migrations",
     );
     assert.equal(cnt.rows[0].cnt, String(before), "schema_migrations count unchanged");
+  });
+
+  test("0194 switches exact DeepSeek V4 models to 1M and ships a fail-closed rollback", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await runBuiltInMigrationsBefore0194();
+    // Production pricing legitimately differs from the historical seed.  The
+    // context migration must accept and preserve the current commercial values.
+    await query(
+      `UPDATE model_pricing
+          SET input_per_mtok = CASE model_id WHEN 'deepseek-v4-flash' THEN 150 ELSE 400 END,
+              output_per_mtok = CASE model_id WHEN 'deepseek-v4-flash' THEN 300 ELSE 1500 END,
+              cache_read_per_mtok = CASE model_id WHEN 'deepseek-v4-flash' THEN 5 ELSE 50 END,
+              sort_order = CASE model_id WHEN 'deepseek-v4-flash' THEN 120 ELSE 80 END
+        WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')`,
+    );
+    const applied = await runMigrations();
+    assert.deepEqual(applied.applied, ["0194_deepseek_1m_context"]);
+
+    const expectedProfile = {
+      supports_vision: false,
+      reasoning: {
+        supported: ["low", "medium", "high", "xhigh", "max"],
+        codex_model_default: null,
+      },
+      ccb: { capability_zero: false, supports_thinking: true },
+    };
+    const readCatalog = () => query<{
+      entry_id: string;
+      model_id: string;
+      engine: string;
+      provider_id: string;
+      upstream_model_id: string | null;
+      context_window: number;
+      capability_profile: Record<string, unknown>;
+      capability_schema_version: number;
+      state: string;
+    }>(
+      `SELECT entry_id::text, model_id, engine, provider_id, upstream_model_id,
+              context_window, capability_profile, capability_schema_version, state
+         FROM model_catalog
+        WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')
+        ORDER BY model_id, entry_id`,
+    );
+    const pricing = await query<{
+      model_id: string;
+      display_name: string;
+      input_per_mtok: string;
+      output_per_mtok: string;
+      cache_read_per_mtok: string;
+      cache_write_per_mtok: string;
+      multiplier: string;
+      enabled: boolean;
+      sort_order: number;
+      visibility: string;
+    }>(
+      `SELECT model_id, display_name, input_per_mtok::text, output_per_mtok::text,
+              cache_read_per_mtok::text, cache_write_per_mtok::text,
+              multiplier::text, enabled, sort_order, visibility
+         FROM model_pricing
+        WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')
+        ORDER BY model_id`,
+    );
+    assert.deepEqual(pricing.rows, [
+      {
+        model_id: "deepseek-v4-flash", display_name: "DeepSeek V4 Flash (1M)",
+        input_per_mtok: "150", output_per_mtok: "300", cache_read_per_mtok: "5",
+        cache_write_per_mtok: "0", multiplier: "1.000", enabled: true,
+        sort_order: 120, visibility: "public",
+      },
+      {
+        model_id: "deepseek-v4-pro", display_name: "DeepSeek V4 Pro (1M)",
+        input_per_mtok: "400", output_per_mtok: "1500", cache_read_per_mtok: "50",
+        cache_write_per_mtok: "0", multiplier: "1.000", enabled: true,
+        sort_order: 80, visibility: "public",
+      },
+    ]);
+
+    const migrated = await readCatalog();
+    assert.equal(migrated.rows.length, 4);
+    for (const modelId of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
+      const rows = migrated.rows.filter((row) => row.model_id === modelId);
+      assert.equal(rows.length, 2);
+      const retired = rows.find((row) => row.state === "retired")!;
+      const active = rows.find((row) => row.state === "active")!;
+      assert.equal(retired.context_window, 200_000);
+      assert.equal(active.context_window, 1_000_000);
+      assert.ok(BigInt(active.entry_id) > BigInt(retired.entry_id));
+      for (const row of rows) {
+        assert.equal(row.engine, "ccb");
+        assert.equal(row.provider_id, "deepseek");
+        assert.equal(row.upstream_model_id, null);
+        assert.equal(row.capability_schema_version, 1);
+        assert.deepEqual(row.capability_profile, expectedProfile);
+      }
+    }
+
+    const migrationSql = await readFile(
+      new URL("../db/migrations/0194_deepseek_1m_context.sql", import.meta.url),
+      "utf8",
+    );
+    await query(migrationSql);
+    assert.deepEqual((await readCatalog()).rows, migrated.rows, "direct reapply must not add versions");
+
+    const rollbackSql = tested0194RollbackSql(migrationSql);
+    await tx(async (client) => { await client.query(rollbackSql); });
+    const rolledBack = await readCatalog();
+    assert.equal(rolledBack.rows.length, 6);
+    for (const modelId of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
+      const rows = rolledBack.rows.filter((row) => row.model_id === modelId);
+      assert.equal(rows.filter((row) => row.state === "active" && row.context_window === 200_000).length, 1);
+      assert.equal(rows.filter((row) => row.state === "retired" && row.context_window === 1_000_000).length, 1);
+      assert.equal(rows.filter((row) => row.state === "retired" && row.context_window === 200_000).length, 1);
+    }
+    const derived = await query<{ flash: number; pro: number }>(
+      `SELECT fn_model_catalog_context_window('deepseek-v4-flash') AS flash,
+              fn_model_catalog_context_window('deepseek-v4-pro') AS pro`,
+    );
+    assert.deepEqual(derived.rows, [{ flash: 200_000, pro: 200_000 }]);
+    const ledger = await query<{ present: boolean }>(
+      `SELECT EXISTS(SELECT 1 FROM schema_migrations
+                      WHERE version = '0194_deepseek_1m_context') AS present`,
+    );
+    assert.equal(ledger.rows[0].present, true, "manual rollback must retain the 0194 ledger");
+
+    const beforeRejectedRerun = (await readCatalog()).rows;
+    await assert.rejects(
+      tx(async (client) => { await client.query(rollbackSql); }),
+      /0194 rollback:/,
+    );
+    assert.deepEqual(
+      (await readCatalog()).rows,
+      beforeRejectedRerun,
+      "rejected rollback re-run must not create another catalog version",
+    );
+    assert.deepEqual((await query(
+      `SELECT model_id, display_name, input_per_mtok::text, output_per_mtok::text,
+              cache_read_per_mtok::text, cache_write_per_mtok::text,
+              multiplier::text, enabled, sort_order, visibility
+         FROM model_pricing
+        WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')
+        ORDER BY model_id`,
+    )).rows, pricing.rows, "0194 forward/rollback must not change pricing");
   });
 
   test("0179/0186 publishes Ark K3 with the official K3 pricing", async (t) => {
