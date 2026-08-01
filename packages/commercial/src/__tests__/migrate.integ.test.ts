@@ -91,9 +91,9 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   return false;
 }
 
-function tested0194RollbackSql(migrationSql: string): string {
-  const start = "-- BEGIN TESTED MANUAL ROLLBACK 0194";
-  const end = "-- END TESTED MANUAL ROLLBACK 0194";
+function testedManualRollbackSql(migrationSql: string, version: "0194" | "0195"): string {
+  const start = `-- BEGIN TESTED MANUAL ROLLBACK ${version}`;
+  const end = `-- END TESTED MANUAL ROLLBACK ${version}`;
   assert.ok(migrationSql.includes(start) && migrationSql.includes(end));
   const body = migrationSql.slice(
     migrationSql.indexOf(start) + start.length,
@@ -110,11 +110,26 @@ async function runBuiltInMigrationsBefore0194(): Promise<void> {
   const dir = await mkdtemp(path.join(tmpdir(), "mig-before-0194-"));
   try {
     for (const file of await readdir(source)) {
-      if (file.endsWith(".sql") && file !== "0194_deepseek_1m_context.sql") {
+      if (file.endsWith(".sql") && file < "0194_deepseek_1m_context.sql") {
         await copyFile(path.join(source, file), path.join(dir, file));
       }
     }
     await runMigrations({ dir });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function runBuiltInMigrationsThrough(file: string): Promise<Awaited<ReturnType<typeof runMigrations>>> {
+  const source = fileURLToPath(new URL("../db/migrations/", import.meta.url));
+  const dir = await mkdtemp(path.join(tmpdir(), "mig-through-"));
+  try {
+    for (const candidate of await readdir(source)) {
+      if (candidate.endsWith(".sql") && candidate <= file) {
+        await copyFile(path.join(source, candidate), path.join(dir, candidate));
+      }
+    }
+    return await runMigrations({ dir });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -170,7 +185,7 @@ describe("migrate.runMigrations", () => {
     assert.equal(cnt.rows[0].cnt, String(before), "schema_migrations count unchanged");
   });
 
-  test("0194 switches exact DeepSeek V4 models to 1M and ships a fail-closed rollback", async (t) => {
+  test("0194 rollback → 0195 reactivates exact DeepSeek V4 models and both rollbacks fail closed", async (t) => {
     if (skipIfNoPg(t)) return;
     await runBuiltInMigrationsBefore0194();
     // Production pricing legitimately differs from the historical seed.  The
@@ -183,7 +198,7 @@ describe("migrate.runMigrations", () => {
               sort_order = CASE model_id WHEN 'deepseek-v4-flash' THEN 120 ELSE 80 END
         WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')`,
     );
-    const applied = await runMigrations();
+    const applied = await runBuiltInMigrationsThrough("0194_deepseek_1m_context.sql");
     assert.deepEqual(applied.applied, ["0194_deepseek_1m_context"]);
 
     const expectedProfile = {
@@ -271,7 +286,7 @@ describe("migrate.runMigrations", () => {
     await query(migrationSql);
     assert.deepEqual((await readCatalog()).rows, migrated.rows, "direct reapply must not add versions");
 
-    const rollbackSql = tested0194RollbackSql(migrationSql);
+    const rollbackSql = testedManualRollbackSql(migrationSql, "0194");
     await tx(async (client) => { await client.query(rollbackSql); });
     const rolledBack = await readCatalog();
     assert.equal(rolledBack.rows.length, 6);
@@ -310,6 +325,224 @@ describe("migrate.runMigrations", () => {
         WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')
         ORDER BY model_id`,
     )).rows, pricing.rows, "0194 forward/rollback must not change pricing");
+
+    const applied0195 = await runBuiltInMigrationsThrough(
+      "0195_deepseek_1m_reactivate.sql",
+    );
+    assert.deepEqual(applied0195.applied, ["0195_deepseek_1m_reactivate"]);
+    const reactivated = await readCatalog();
+    assert.equal(reactivated.rows.length, 8);
+    for (const modelId of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
+      const rows = reactivated.rows.filter((row) => row.model_id === modelId);
+      assert.equal(rows.length, 4);
+      assert.equal(
+        rows.filter(
+          (row) => row.state === "active" && row.context_window === 1_000_000,
+        ).length,
+        1,
+      );
+      assert.equal(
+        rows.filter(
+          (row) => row.state === "retired" && row.context_window === 1_000_000,
+        ).length,
+        1,
+      );
+      assert.equal(
+        rows.filter(
+          (row) => row.state === "retired" && row.context_window === 200_000,
+        ).length,
+        2,
+      );
+      for (const row of rows) {
+        assert.equal(row.engine, "ccb");
+        assert.equal(row.provider_id, "deepseek");
+        assert.equal(row.upstream_model_id, null);
+        assert.equal(row.capability_schema_version, 1);
+        assert.deepEqual(row.capability_profile, expectedProfile);
+      }
+    }
+    assert.deepEqual(
+      (
+        await query<{ flash: number; pro: number }>(
+          `SELECT fn_model_catalog_context_window('deepseek-v4-flash') AS flash,
+              fn_model_catalog_context_window('deepseek-v4-pro') AS pro`,
+        )
+      ).rows,
+      [{ flash: 1_000_000, pro: 1_000_000 }],
+    );
+
+    const migration0195Sql = await readFile(
+      new URL(
+        "../db/migrations/0195_deepseek_1m_reactivate.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    await query(migration0195Sql);
+    assert.deepEqual(
+      (await readCatalog()).rows,
+      reactivated.rows,
+      "0195 direct reapply must not add versions",
+    );
+
+    const rollback0195Sql = testedManualRollbackSql(migration0195Sql, "0195");
+    await tx(async (client) => {
+      await client.query(rollback0195Sql);
+    });
+    const rolledBack0195 = await readCatalog();
+    assert.equal(rolledBack0195.rows.length, 10);
+    for (const modelId of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
+      const rows = rolledBack0195.rows.filter(
+        (row) => row.model_id === modelId,
+      );
+      assert.equal(rows.length, 5);
+      assert.equal(
+        rows.filter(
+          (row) => row.state === "active" && row.context_window === 200_000,
+        ).length,
+        1,
+      );
+      assert.equal(
+        rows.filter(
+          (row) => row.state === "retired" && row.context_window === 1_000_000,
+        ).length,
+        2,
+      );
+      assert.equal(
+        rows.filter(
+          (row) => row.state === "retired" && row.context_window === 200_000,
+        ).length,
+        2,
+      );
+    }
+    assert.deepEqual(
+      (
+        await query<{ flash: number; pro: number }>(
+          `SELECT fn_model_catalog_context_window('deepseek-v4-flash') AS flash,
+              fn_model_catalog_context_window('deepseek-v4-pro') AS pro`,
+        )
+      ).rows,
+      [{ flash: 200_000, pro: 200_000 }],
+    );
+    const ledgers = await query<{ version: string }>(
+      `SELECT version FROM schema_migrations
+        WHERE version IN ('0194_deepseek_1m_context', '0195_deepseek_1m_reactivate')
+        ORDER BY version`,
+    );
+    assert.deepEqual(
+      ledgers.rows.map((row) => row.version),
+      ["0194_deepseek_1m_context", "0195_deepseek_1m_reactivate"],
+    );
+
+    const before0195RejectedRerun = (await readCatalog()).rows;
+    await assert.rejects(
+      tx(async (client) => {
+        await client.query(rollback0195Sql);
+      }),
+      /0195 rollback:/,
+    );
+    assert.deepEqual(
+      (await readCatalog()).rows,
+      before0195RejectedRerun,
+      "rejected 0195 rollback re-run must not create another catalog version",
+    );
+    assert.deepEqual(
+      (
+        await query(
+          `SELECT model_id, display_name, input_per_mtok::text, output_per_mtok::text,
+              cache_read_per_mtok::text, cache_write_per_mtok::text,
+              multiplier::text, enabled, sort_order, visibility
+         FROM model_pricing
+        WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')
+        ORDER BY model_id`,
+        )
+      ).rows,
+      pricing.rows,
+      "0195 forward/rollback must not change pricing",
+    );
+  });
+
+  test("0195 is a no-op on the clean 0194-forward lineage and its reactivation rollback refuses it", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const first = await runMigrations();
+    assert.ok(first.applied.includes("0194_deepseek_1m_context"));
+    assert.ok(first.applied.includes("0195_deepseek_1m_reactivate"));
+    const readLineage = () =>
+      query<{
+        model_id: string;
+        state: string;
+        context_window: number;
+      }>(
+        `SELECT model_id, state, context_window
+         FROM model_catalog
+        WHERE model_id IN ('deepseek-v4-flash', 'deepseek-v4-pro')
+        ORDER BY model_id, entry_id`,
+      );
+    const clean = await readLineage();
+    assert.equal(clean.rows.length, 4);
+    for (const modelId of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
+      const rows = clean.rows.filter((row) => row.model_id === modelId);
+      assert.deepEqual(
+        rows.map((row) => [row.state, row.context_window]),
+        [
+          ["retired", 200_000],
+          ["active", 1_000_000],
+        ],
+      );
+    }
+    const migration0195Sql = await readFile(
+      new URL(
+        "../db/migrations/0195_deepseek_1m_reactivate.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    await query(migration0195Sql);
+    assert.deepEqual(
+      (await readLineage()).rows,
+      clean.rows,
+      "0195 direct reapply must no-op on clean lineage",
+    );
+    const rollback0195Sql = testedManualRollbackSql(migration0195Sql, "0195");
+    await assert.rejects(
+      tx(async (client) => {
+        await client.query(rollback0195Sql);
+      }),
+      /0195 rollback:/,
+    );
+    assert.deepEqual(
+      (await readLineage()).rows,
+      clean.rows,
+      "0195 rollback must not undo clean 0194 lineage",
+    );
+
+    await query(
+      `SELECT fn_model_switch_version(
+         model_id, engine, provider_id, upstream_model_id, 200000,
+         capability_profile, capability_schema_version, NULL, lock_version
+       )
+         FROM model_catalog
+        WHERE model_id = 'deepseek-v4-flash' AND state = 'active'`,
+    );
+    const mixed = await readLineage();
+    await assert.rejects(query(migration0195Sql), /mixed lineage states/);
+    assert.deepEqual(
+      (await readLineage()).rows,
+      mixed.rows,
+      "0195 must reject a mixed clean/rollback lineage atomically",
+    );
+    assert.deepEqual(
+      (
+        await query<{ flash: number; pro: number }>(
+          `SELECT fn_model_catalog_context_window('deepseek-v4-flash') AS flash,
+                  fn_model_catalog_context_window('deepseek-v4-pro') AS pro`,
+        )
+      ).rows,
+      [{ flash: 1_000_000, pro: 1_000_000 }],
+      "rejected mixed-lineage migration must not change the helper",
+    );
+    const second = await runMigrations();
+    assert.equal(second.applied.length, 0);
   });
 
   test("0179/0186 publishes Ark K3 with the official K3 pricing", async (t) => {

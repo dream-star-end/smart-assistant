@@ -73,7 +73,8 @@
     "0191_claude5_models",
     "0192_friction_code_casing",
     "0193_test_account_model_denials",
-    "0194_deepseek_1m_context"
+    "0194_deepseek_1m_context",
+    "0195_deepseek_1m_reactivate"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
