@@ -4623,6 +4623,44 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
+  test("hello never advertises an exact turn already fenced by user Stop", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [
+        { id: "srv-old", role: "assistant", text: "old", ts: now - 3 },
+        { id: "m-user-stopped", role: "user", text: "stopped", ts: now - 2, status: "sent" },
+        { id: "m-user-running", role: "user", text: "running", ts: now - 1, status: "sent" },
+      ],
+      createdAt: now - 3,
+      lastAt: now - 1,
+      _cancelledAutomaticRecoveryIds: { "m-user-stopped": true },
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
+    expect(hello.peers[0].resumeActiveTurnCandidateMessageIds).toEqual(["m-user-running"]);
+
+    const restored = sock.sessions.get("s1")!;
+    restored._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 42 };
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.active_turn_replay_start",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: "m-user-stopped",
+    }) });
+    expect(restored._lastFrameSeqByKey["agent:main:webchat:dm:s1"]).toBe(42);
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    sock.stop();
+  });
+
   test("hello keeps the oldest lock-owner candidate when a queued user block exceeds 32 rows", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -4714,6 +4752,74 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(active.messages.some((m) => m.role === "assistant" && m.text === "prefix restored")).toBe(true);
     expect(active.messages.find((m) => m.role === "assistant")?._clientMessageId).toBe("m-user-running");
     expect(persistSession).toHaveBeenCalledWith("s1");
+    sock.stop();
+  });
+
+  test("a replay-start already in flight cannot resurrect the exact turn after user Stop", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const active = sock.sessions.get("s1")!;
+    const clientMessageId = active.messages.find((message) => message.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+    active._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 42 };
+
+    sock.stopTurn("s1");
+    const teardownAt = active._localTeardownAt;
+    expect(active._cancelledAutomaticRecoveryIds?.[clientMessageId]).toBe(true);
+    expect(sock.isSessionBusy("s1")).toBe(false);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.active_turn_replay_start",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
+    expect(active._activeClientMessageId).toBeUndefined();
+    expect(active._localTeardownAt).toBe(teardownAt);
+    expect(sock.isSessionBusy("s1")).toBe(false);
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 43,
+      ts: Date.now(),
+      blocks: [{ kind: "text", text: "late after Stop" }],
+    })) });
+    expect(active.messages.some((message) => message.text === "late after Stop")).toBe(false);
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    sock.stop();
+  });
+
+  test("a user Stop fence does not block a different exact active-turn replay", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const active = sock.sessions.get("s1")!;
+    active._cancelledAutomaticRecoveryIds = { "m-user-stopped": true };
+    active._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 42 };
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.active_turn_replay_start",
+      sessionKey: "agent:main:webchat:dm:s1",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: "m-user-new",
+    }) });
+    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
+    expect(active._activeClientMessageId).toBe("m-user-new");
+    expect(sock.isSessionBusy("s1")).toBe(true);
     sock.stop();
   });
 

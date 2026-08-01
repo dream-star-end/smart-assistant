@@ -1459,6 +1459,10 @@ export class ChatSocket {
         const frame = f as OutboundActiveTurnReplayStartWire;
         const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : null;
         if (!sess || !isClientMessageId(frame.clientMessageId)) return;
+        // A reconnect hello can race an exact user Stop while the gateway is
+        // still settling that turn. Never let its already-in-flight replay
+        // acknowledgement revoke the browser-owned cancellation fence.
+        if (sess._cancelledAutomaticRecoveryIds?.[frame.clientMessageId] === true) return;
         // Only this direct, server-verified boundary may move an agent-scoped
         // cursor backwards. The following replay contains exclusively frames
         // after that exact turn's server-owned baseSeq.
@@ -1703,6 +1707,7 @@ export class ChatSocket {
       if (message?._genPlaceholder) continue;
       if (message?.role !== "user") break;
       if (!isClientMessageId(message.id)) continue;
+      if (sess._cancelledAutomaticRecoveryIds?.[message.id] === true) continue;
       validCount++;
       oldestValid = message.id;
       // The lock owner is normally the oldest user in a contiguous queued
