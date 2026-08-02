@@ -23,6 +23,7 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   openSync,
   readFileSync,
@@ -31,7 +32,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -54,9 +55,17 @@ const CLIENT_MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const DEFAULT_TIMEOUT_SECONDS = 900;
 const MAX_TIMEOUT_SECONDS = 1_050;
 const HELPER_TIMEOUT_MS = 180_000;
+// The turn timeout starts only after relay readiness. The helper also needs
+// 120s for readiness, 60s for post-final billing persistence, 10s for the
+// clean WebSocket close, plus 20s of process-boundary margin.
+const TURN_HELPER_FIXED_OVERHEAD_MS = 210_000;
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
 const overlayDriver = resolve(here, "v5-synthetic-eval-overlay.mjs");
+
+export function turnHelperTimeoutMs(turnTimeoutSeconds) {
+  return turnTimeoutSeconds * 1_000 + TURN_HELPER_FIXED_OVERHEAD_MS;
+}
 
 function fail(message) {
   throw new Error(message);
@@ -510,6 +519,7 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
   if (
     !value
     || typeof value !== "object"
+    || value.schema_version !== 2
     || typeof value.peer_id !== "string"
     || !PEER_ID_RE.test(value.peer_id)
     || !CLIENT_MESSAGE_ID_RE.test(value.client_message_id ?? "")
@@ -529,18 +539,56 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     || value.frame_count < 1
     || !Number.isFinite(value.wall_ms)
     || value.wall_ms < 0
+    || typeof value.billing_evidence_at !== "string"
+    || !Number.isFinite(Date.parse(value.billing_evidence_at))
+    || !Number.isFinite(value.billing_evidence_wait_ms)
+    || value.billing_evidence_wait_ms < 0
+    || value.billing_evidence_wait_ms > 66_000
+    || Date.parse(value.finished_at) - Date.parse(value.started_at)
+      !== value.wall_ms
+    || Date.parse(value.billing_evidence_at) - Date.parse(value.finished_at)
+      !== value.billing_evidence_wait_ms
     || (
       value.ttft_ms !== null
       && (!Number.isFinite(value.ttft_ms) || value.ttft_ms < 0)
     )
     || typeof value.final_text !== "string"
+    || value.billing_binding?.mode !== (
+      identity.engine === "ccb"
+        ? "ccb_authority_dispatch_attempt"
+        : "codex_server_trace"
+    )
+    || (
+      identity.engine === "ccb"
+      && (
+        value.billing_binding.finalTraceId !== value.trace_id
+        || typeof value.billing_binding.dispatchBillingRequestId !== "string"
+        || value.billing_binding.dispatchBillingRequestId.length === 0
+        || !/^[0-9a-f]{32}$/.test(value.billing_binding.authorityTurnId ?? "")
+        || typeof value.billing_binding.dispatchId !== "string"
+        || !Number.isSafeInteger(value.billing_binding.attemptNo)
+        || value.billing_binding.attemptNo < 1
+        || !Array.isArray(value.billing_binding.requestIds)
+        || value.billing_binding.requestIds.length < 1
+        || !Array.isArray(value.billing_binding.rootRequestIds)
+        || value.billing_binding.rootRequestIds.length < 1
+        || !Array.isArray(value.billing_binding.usageIds)
+        || value.billing_binding.usageIds.length < 1
+        || !Array.isArray(value.billing_binding.ledgerIds)
+        || value.billing_binding.ledgerIds.length < 1
+      )
+    )
+    || (
+      identity.engine === "codex"
+      && value.billing_binding.traceId !== value.trace_id
+    )
   ) {
     fail("turn helper result identity/evidence is invalid");
   }
   const frameValue = frames.value;
   if (
     !frameValue
-    || frameValue.schema_version !== 1
+    || frameValue.schema_version !== 2
     || frameValue.peer_id !== value.peer_id
     || frameValue.client_message_id !== value.client_message_id
     || frameValue.case_id !== identity.caseId
@@ -561,10 +609,16 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     || frameValue.runtime?.websocket_instances !== 1
     || frameValue.runtime?.inbound_messages !== 1
     || frameValue.runtime?.finals !== 1
+    || !Number.isSafeInteger(frameValue.runtime?.binding_queries)
+    || frameValue.runtime.binding_queries < 0
+    || (identity.engine === "ccb" && frameValue.runtime.binding_queries < 1)
+    || (identity.engine === "codex" && frameValue.runtime.binding_queries !== 0)
     || !Number.isSafeInteger(frameValue.runtime?.matching_costs)
     || frameValue.runtime.matching_costs < 1
     || JSON.stringify(value.connection) !== JSON.stringify(frameValue.connection)
     || JSON.stringify(value.runtime) !== JSON.stringify(frameValue.runtime)
+    || JSON.stringify(value.billing_binding)
+      !== JSON.stringify(frameValue.billing_binding)
   ) {
     fail("raw turn frame evidence does not prove one WebSocket connection");
   }
@@ -631,6 +685,18 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
   if (finalFrames.length !== 1 || costFrames.length < 1 || errorFrames.length) {
     fail("raw turn frames do not prove a clean final plus authoritative cost");
   }
+  const exactCostFrames = costFrames.filter((frame) =>
+    identity.engine === "ccb"
+      ? value.billing_binding.requestIds.includes(frame.payload.requestId)
+      : frame.payload.traceId === value.trace_id
+        || frame.payload.requestId === value.trace_id
+  );
+  if (
+    exactCostFrames.length !== frameValue.runtime.matching_costs
+    || (identity.engine === "ccb" && exactCostFrames.length !== costFrames.length)
+  ) {
+    fail("raw cost frames differ from the engine-specific billing binding");
+  }
   const final = finalFrames[0].payload;
   const finalTrace = final.traceId ?? final.requestId;
   const reconstructedText = received
@@ -662,6 +728,186 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     sent,
     costFrames: costFrames.map((frame) => frame.payload),
   };
+}
+
+function safeArtifactRelativePath(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && !value.includes("\0")
+    && !value.startsWith("/")
+    && posix.normalize(value) === value
+    && value !== "."
+    && value !== ".."
+    && !value.startsWith("../");
+}
+
+export function verifyWorkspaceArtifactDocument(
+  document,
+  remote,
+  expected,
+) {
+  if (
+    !document
+    || typeof document !== "object"
+    || Array.isArray(document)
+    || document.schemaVersion !== 1
+    || document.uid !== expected.uid
+    || document.engine !== expected.engine
+    || document.agentId !== expected.agentId
+    || document.caseId !== expected.caseId
+    || document.workspaceMode !== expected.workspaceMode
+    || document.containerId !== expected.containerId
+    || document.manifestSha !== expected.manifestSha
+    || JSON.stringify(document.identity) !== JSON.stringify(expected.identity)
+    || JSON.stringify(document.identity) !== JSON.stringify(remote.identity)
+    || !Array.isArray(document.entries)
+    || document.entries.length !== remote.entryCount
+    || document.identity?.state !== remote.state
+  ) {
+    fail("workspace artifact document identity is invalid");
+  }
+  if (
+    document.identity.state === "absent"
+    && document.entries.length !== 0
+  ) {
+    fail("absent workspace artifact document contains entries");
+  }
+  const seen = new Set();
+  const hash = createHash("sha256");
+  let files = 0;
+  let directories = 0;
+  let completeBytes = 0;
+  for (const entry of document.entries) {
+    if (
+      !entry
+      || typeof entry !== "object"
+      || Array.isArray(entry)
+      || !safeArtifactRelativePath(entry.path)
+      || seen.has(entry.path)
+      || !Number.isSafeInteger(entry.mode)
+      || entry.mode < 0
+      || entry.mode > 0o777
+    ) {
+      fail("workspace artifact entry identity is invalid");
+    }
+    seen.add(entry.path);
+    if (entry.type === "directory") {
+      if (
+        Object.keys(entry).sort().join(",") !== "mode,path,type"
+      ) {
+        fail("workspace artifact directory has unexpected fields");
+      }
+      directories += 1;
+      hash.update(`D  ${entry.path}\n`);
+      continue;
+    }
+    if (
+      entry.type !== "file"
+      || Object.keys(entry).sort().join(",")
+        !== "bytes,contentBase64,mode,path,sha256,type"
+      || !Number.isSafeInteger(entry.bytes)
+      || entry.bytes < 0
+      || typeof entry.contentBase64 !== "string"
+      || !SHA256_RE.test(entry.sha256 ?? "")
+    ) {
+      fail("workspace artifact file entry is invalid");
+    }
+    const bytes = Buffer.from(entry.contentBase64, "base64");
+    if (
+      bytes.toString("base64") !== entry.contentBase64
+      || bytes.length !== entry.bytes
+      || createHash("sha256").update(bytes).digest("hex") !== entry.sha256
+    ) {
+      fail("workspace artifact file bytes are incomplete or corrupted");
+    }
+    files += 1;
+    completeBytes += bytes.length;
+    hash.update(`F  ${entry.sha256}  ${entry.path}\n`);
+  }
+  const identity = document.identity;
+  if (identity.state === "tree") {
+    if (
+      identity.files !== files
+      || identity.directories !== directories
+      || identity.sha256 !== hash.digest("hex")
+    ) {
+      fail("workspace artifact tree identity differs from complete entries");
+    }
+  } else if (
+    identity.state !== "absent"
+    || files !== 0
+    || directories !== 0
+  ) {
+    fail("workspace artifact state is invalid");
+  }
+  return { files, directories, completeBytes };
+}
+
+function fetchWorkspaceArtifact(remote, outputPath, expected) {
+  const host = process.env.KL_HOST || "kl-mirror";
+  if (!/^[A-Za-z0-9_.@-]+$/.test(host)) fail(`unsafe KL_HOST: ${host}`);
+  if (
+    !remote
+    || typeof remote !== "object"
+    || !["absent", "tree"].includes(remote.state)
+    || !remote.identity
+    || !Number.isSafeInteger(remote.entryCount)
+    || remote.entryCount < 0
+    || typeof remote.remotePath !== "string"
+    || !/^\/var\/lib\/openclaude-v5\/synthetic-eval-overlay\/[0-9a-f]{64}\/evidence\/[0-9a-f]{32}-[A-Za-z0-9_-]{1,80}\.workspace\.json$/.test(
+      remote.remotePath,
+    )
+    || !Number.isSafeInteger(remote.bytes)
+    || remote.bytes < 1
+    || !SHA256_RE.test(remote.sha256 ?? "")
+  ) {
+    fail("remote workspace artifact evidence is invalid");
+  }
+  if (existsSync(outputPath)) fail("workspace artifact output already exists");
+  const copied = spawnSync(
+    "scp",
+    ["-q", `${host}:${remote.remotePath}`, outputPath],
+    { encoding: "utf8" },
+  );
+  if (copied.error) throw copied.error;
+  if (copied.status !== 0) {
+    fail(`workspace artifact copy failed: ${copied.stderr || copied.stdout}`);
+  }
+  chmodSync(outputPath, 0o600);
+  assertRootOwnedSafe(outputPath, "file", 0o600);
+  if (realpathSync(outputPath) !== outputPath) {
+    fail("workspace artifact output path is not canonical");
+  }
+  const bytes = readFileSync(outputPath);
+  if (
+    bytes.length !== remote.bytes
+    || createHash("sha256").update(bytes).digest("hex") !== remote.sha256
+  ) {
+    fail("copied workspace artifact bytes differ from remote evidence");
+  }
+  const document = JSON.parse(bytes.toString("utf8"));
+  const complete = verifyWorkspaceArtifactDocument(document, remote, expected);
+  durablyPersistWorkspaceArtifact(outputPath);
+  return {
+    state: remote.state,
+    identity: remote.identity,
+    entryCount: remote.entryCount,
+    capturedPath: outputPath,
+    bytes: bytes.length,
+    sha256: remote.sha256,
+    ...complete,
+  };
+}
+
+export function durablyPersistWorkspaceArtifact(path, sync = fsyncSync) {
+  for (const target of [path, dirname(path)]) {
+    const fd = openSync(target, "r");
+    try {
+      sync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
 }
 
 function runOverlay(args, timeoutMs = HELPER_TIMEOUT_MS) {
@@ -762,7 +1008,7 @@ export function assertDynamicInputsStable(before, after, workspaceMode) {
   }
 }
 
-function assertTurnUsageMatchesFrames(turn, evidence) {
+export function assertTurnUsageMatchesFrames(turn, evidence) {
   const usage = [...evidence.rootUsage, ...evidence.delegateUsage];
   const newIds = new Set(evidence.newUsage.map((row) => row.id));
   if (
@@ -803,6 +1049,72 @@ function assertTurnUsageMatchesFrames(turn, evidence) {
     if (BigInt(row.cost_credits) > 0n && !seen.has(row.request_id)) {
       fail("positive authoritative usage has no exact cost frame");
     }
+  }
+  if (turn.value.billing_binding?.mode !== evidence.billingBindingMode) {
+    fail("turn helper and durable evidence use different billing bindings");
+  }
+  if (evidence.billingBindingMode === "ccb_authority_dispatch_attempt") {
+    const positiveRequests = usage
+      .filter((row) => BigInt(row.cost_credits) > 0n)
+      .map((row) => row.request_id)
+      .sort();
+    const positiveRootRequests = evidence.rootUsage
+      .filter((row) => BigInt(row.cost_credits) > 0n)
+      .map((row) => row.request_id)
+      .sort();
+    const binding = turn.value.billing_binding;
+    const authority = evidence.authorityBindings?.[0];
+    if (
+      !authority
+      || binding.finalTraceId !== turn.value.trace_id
+      || binding.dispatchBillingRequestId
+        !== evidence.dispatch.billing_request_id
+      || binding.authorityTurnId !== authority.authority_turn_id
+      || binding.dispatchId !== evidence.dispatch.dispatch_id
+      || binding.attemptNo !== evidence.dispatch.attempt_no
+      || JSON.stringify(binding.requestIds) !== JSON.stringify(positiveRequests)
+      || JSON.stringify(binding.rootRequestIds)
+        !== JSON.stringify(positiveRootRequests)
+      || JSON.stringify(binding.usageIds) !== JSON.stringify(
+        usage.map((row) => String(row.id)).sort((left, right) =>
+          BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0
+        ),
+      )
+      || JSON.stringify(binding.ledgerIds) !== JSON.stringify(
+        evidence.ledger.map((row) => row.id).sort((left, right) =>
+          BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0
+        ),
+      )
+    ) {
+      fail("CCB helper binding differs from exact authority/usage/ledger evidence");
+    }
+  } else if (
+    evidence.billingBindingMode === "codex_server_trace"
+  ) {
+    const binding = turn.value.billing_binding;
+    const dispatchRequestId = evidence.dispatch?.billing_request_id;
+    const rootUsage = evidence.rootUsage.find((row) =>
+      row.request_id === dispatchRequestId && BigInt(row.cost_credits) > 0n
+    );
+    const rootCostFrame = turn.costFrames.find((frame) =>
+      frame.requestId === dispatchRequestId
+    );
+    if (
+      binding?.traceId !== turn.value.trace_id
+      || typeof dispatchRequestId !== "string"
+      || dispatchRequestId.length === 0
+      || !binding.requestIds?.includes(dispatchRequestId)
+      || !rootUsage
+      || !rootCostFrame
+      || (
+        rootCostFrame.traceId !== turn.value.trace_id
+        && rootCostFrame.requestId !== turn.value.trace_id
+      )
+    ) {
+      fail("Codex helper binding differs from the exact root dispatch trace");
+    }
+  } else {
+    fail("turn evidence uses an unsupported billing binding");
   }
 }
 
@@ -1041,12 +1353,14 @@ export function main(argv = process.argv.slice(2)) {
     turn: `${evidenceStem}.turn.json`,
     frames: `${evidenceStem}.frames.json`,
     extraPrompt: `${evidenceStem}.extra-prompt.md`,
+    workspaceArtifact: `${evidenceStem}.workspace.json`,
   };
   for (const path of [
     options.evidenceFile,
     outputPaths.turn,
     outputPaths.frames,
     outputPaths.extraPrompt,
+    outputPaths.workspaceArtifact,
   ]) {
     if (existsSync(path)) fail(`evaluation evidence path already exists: ${path}`);
   }
@@ -1093,6 +1407,7 @@ export function main(argv = process.argv.slice(2)) {
   let turn = null;
   let turnEvidence = null;
   let efficiency = null;
+  let workspaceArtifact = null;
   let promptEvidence = null;
   let post = null;
   let restored = null;
@@ -1166,7 +1481,7 @@ export function main(argv = process.argv.slice(2)) {
     const turnOutput = runNodeHelper(
       options.turnHelper,
       helperEnvironment(options, "turn", evaluationCase, outputPaths),
-      options.timeoutSeconds * 1_000,
+      turnHelperTimeoutMs(options.timeoutSeconds),
     );
     turn = parseTurnResult(
       turnOutput,
@@ -1213,6 +1528,8 @@ export function main(argv = process.argv.slice(2)) {
       clientMessageId: turn.value.client_message_id,
       agentId: options.agentId,
       model: options.model,
+      engine: options.engine,
+      traceId: turn.value.trace_id,
       usageFloor: pre.usageMaxId,
     });
     assertTurnUsageMatchesFrames(turn, turnEvidence);
@@ -1233,6 +1550,34 @@ export function main(argv = process.argv.slice(2)) {
       dynamicInputsPre,
       dynamicInputsPost,
       evaluationCase.workspace,
+    );
+    const remoteWorkspaceArtifact = runRemote("workspace-artifact-evidence", {
+      ...remoteCommon(lease),
+      uid: options.uid,
+      expectedBase: options.baseCommit,
+      candidateCommit: options.candidateCommit,
+      manifestSha: prepared.manifestSha,
+      recordNonce: prepared.nonce,
+      containerId: overlayContainer.containerId,
+      engine: options.engine,
+      agentId: options.agentId,
+      caseId: evaluationCase.id,
+      workspaceMode: evaluationCase.workspace,
+      expectedIdentity: dynamicInputsPost.inputs.temporaryWorkspace,
+    });
+    workspaceArtifact = fetchWorkspaceArtifact(
+      remoteWorkspaceArtifact,
+      outputPaths.workspaceArtifact,
+      {
+        uid: options.uid,
+        engine: options.engine,
+        agentId: options.agentId,
+        caseId: evaluationCase.id,
+        workspaceMode: evaluationCase.workspace,
+        containerId: overlayContainer.containerId,
+        manifestSha: prepared.manifestSha,
+        identity: dynamicInputsPost.inputs.temporaryWorkspace,
+      },
     );
     const sessionKey =
       `agent:${options.agentId}:webchat:dm:${turn.peerId}`;
@@ -1335,7 +1680,7 @@ export function main(argv = process.argv.slice(2)) {
 
   const completedAt = new Date().toISOString();
   const evidence = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: primaryError || cleanupError ? "failed" : "completed",
     arm: options.arm,
     uid: options.uid,
@@ -1379,6 +1724,7 @@ export function main(argv = process.argv.slice(2)) {
     },
     turnEvidence,
     efficiency,
+    workspaceArtifact,
     promptEvidence: promptEvidence && {
       ...promptEvidence,
       extraPrompt: {

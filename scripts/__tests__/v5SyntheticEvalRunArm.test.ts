@@ -15,13 +15,17 @@ import { fileURLToPath } from "node:url";
 
 import {
   assertSameLane,
+  assertTurnUsageMatchesFrames,
   analyzeEfficiency,
+  durablyPersistWorkspaceArtifact,
   hashSafeTree,
   parseReprovisionResult,
   parseRunArmArgs,
   parseTurnResult,
+  turnHelperTimeoutMs,
   verifyCasePack,
   verifyHelper,
+  verifyWorkspaceArtifactDocument,
 } from "../v5-synthetic-eval-run-arm.mjs";
 
 const here = resolve(fileURLToPath(import.meta.url), "..");
@@ -246,7 +250,7 @@ describe("V5 synthetic exact-eval run-arm", () => {
       agentId: "research-assistant",
     };
     const frames = {
-      schema_version: 1,
+      schema_version: 2,
       peer_id: "peer_0123456789",
       client_message_id: clientMessageId,
       case_id: identity.caseId,
@@ -266,6 +270,19 @@ describe("V5 synthetic exact-eval run-arm", () => {
         inbound_messages: 1,
         finals: 1,
         matching_costs: 1,
+        binding_queries: 1,
+      },
+      billing_binding: {
+        mode: "ccb_authority_dispatch_attempt",
+        finalTraceId: traceId,
+        dispatchBillingRequestId: "d".repeat(32),
+        authorityTurnId: "b".repeat(32),
+        dispatchId: "50af992a-0bca-4e19-ba11-24df12de0bed",
+        attemptNo: 1,
+        requestIds: ["request-1"],
+        rootRequestIds: ["request-1"],
+        usageIds: ["101"],
+        ledgerIds: ["201"],
       },
       frames: [
         {
@@ -284,7 +301,7 @@ describe("V5 synthetic exact-eval run-arm", () => {
         },
         {
           seq: 1,
-          at: "2026-07-31T10:00:00.300Z",
+          at: "2026-07-31T10:14:59.900Z",
           direction: "received",
           bytes: 0,
           text: JSON.stringify({
@@ -297,13 +314,12 @@ describe("V5 synthetic exact-eval run-arm", () => {
         },
         {
           seq: 2,
-          at: "2026-07-31T10:00:01.200Z",
+          at: "2026-07-31T10:15:59.900Z",
           direction: "received",
           bytes: 0,
           text: JSON.stringify({
             type: "outbound.cost_charged",
             requestId: "request-1",
-            traceId,
             model: identity.model,
             costCredits: "3",
           }),
@@ -317,6 +333,7 @@ describe("V5 synthetic exact-eval run-arm", () => {
     chmodSync(framesPath, 0o600);
     const frameBytes = readFileSync(framesPath);
     writeFileSync(resultPath, JSON.stringify({
+      schema_version: 2,
       peer_id: "peer_0123456789",
       client_message_id: clientMessageId,
       case_id: identity.caseId,
@@ -332,11 +349,16 @@ describe("V5 synthetic exact-eval run-arm", () => {
       frames_sha256: createHash("sha256").update(frameBytes).digest("hex"),
       frames_bytes: frameBytes.length,
       frame_count: frames.frames.length,
+      started_at: "2026-07-31T10:00:00.000Z",
+      finished_at: "2026-07-31T10:14:59.900Z",
+      billing_evidence_at: "2026-07-31T10:15:59.900Z",
       trace_id: traceId,
+      billing_binding: frames.billing_binding,
       connection: frames.connection,
       runtime: frames.runtime,
-      wall_ms: 1200,
-      ttft_ms: 300,
+      wall_ms: 899_900,
+      billing_evidence_wait_ms: 60_000,
+      ttft_ms: 899_900,
       final_text: "Done.",
     }), {
       mode: 0o600,
@@ -355,6 +377,9 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.equal(turn.frames?.path, framesPath);
     assert.equal(turn.costFrames.length, 1);
     assert.equal(turn.parsedFrames.length, 3);
+    assert.equal(turn.value.wall_ms, 899_900);
+    assert.equal(turn.value.billing_evidence_wait_ms, 60_000);
+    assert.equal(turnHelperTimeoutMs(900), 1_110_000);
     assert.throws(
       () => parseTurnResult(
         `${resultPath}\n`,
@@ -453,6 +478,241 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.equal(efficiency.costCredits, "3");
   });
 
+  test("binds CCB cost frames through authority/dispatch/attempt and preserves Codex trace binding", () => {
+    const ccbTurn = {
+      value: {
+        trace_id: "a".repeat(32),
+        billing_binding: {
+          mode: "ccb_authority_dispatch_attempt",
+          finalTraceId: "a".repeat(32),
+          dispatchBillingRequestId: "d".repeat(32),
+          authorityTurnId: "b".repeat(32),
+          dispatchId: "50af992a-0bca-4e19-ba11-24df12de0bed",
+          attemptNo: 1,
+          requestIds: ["request-root", "request-delegate"].sort(),
+          rootRequestIds: ["request-root"],
+          usageIds: ["101", "102"],
+          ledgerIds: ["201", "202"],
+        },
+      },
+      costFrames: [
+        { requestId: "request-root", model: "glm-5.2", costCredits: "4" },
+        { requestId: "request-delegate", model: "glm-5.2", costCredits: "2" },
+      ],
+    };
+    const ccbEvidence = {
+      billingBindingMode: "ccb_authority_dispatch_attempt",
+      dispatch: {
+        dispatch_id: "50af992a-0bca-4e19-ba11-24df12de0bed",
+        attempt_no: 1,
+        billing_request_id: "d".repeat(32),
+      },
+      authorityBindings: [{ authority_turn_id: "b".repeat(32) }],
+      rootUsage: [{
+        id: 101,
+        request_id: "request-root",
+        model: "glm-5.2",
+        cost_credits: 4,
+      }],
+      delegateUsage: [{
+        id: 102,
+        request_id: "request-delegate",
+        model: "glm-5.2",
+        cost_credits: 2,
+      }],
+      newUsage: [{ id: 101 }, { id: 102 }],
+      ledger: [{ id: "201" }, { id: "202" }],
+    };
+    assert.doesNotThrow(() =>
+      assertTurnUsageMatchesFrames(ccbTurn, ccbEvidence)
+    );
+
+    const wrongAuthority = structuredClone(ccbEvidence);
+    wrongAuthority.authorityBindings[0].authority_turn_id = "c".repeat(32);
+    assert.throws(
+      () => assertTurnUsageMatchesFrames(ccbTurn, wrongAuthority),
+      /CCB helper binding differs/,
+    );
+    const wrongRequest = structuredClone(ccbTurn);
+    wrongRequest.costFrames[1].requestId = "unbound-request";
+    assert.throws(
+      () => assertTurnUsageMatchesFrames(wrongRequest, ccbEvidence),
+      /cost frame is not uniquely bound/,
+    );
+
+    const codexTurn = {
+      value: {
+        trace_id: "d".repeat(32),
+        billing_binding: {
+          mode: "codex_server_trace",
+          traceId: "d".repeat(32),
+          requestIds: ["codex-request"],
+        },
+      },
+      costFrames: [{
+        requestId: "codex-request",
+        traceId: "d".repeat(32),
+        model: "gpt-5.6-sol",
+        costCredits: "5",
+      }],
+    };
+    assert.doesNotThrow(() =>
+      assertTurnUsageMatchesFrames(codexTurn, {
+        billingBindingMode: "codex_server_trace",
+        dispatch: {
+          dispatch_id: "d",
+          attempt_no: 1,
+          billing_request_id: "codex-request",
+        },
+        authorityBindings: [],
+        rootUsage: [{
+          id: 103,
+          request_id: "codex-request",
+          model: "gpt-5.6-sol",
+          cost_credits: 5,
+        }],
+        delegateUsage: [],
+        newUsage: [{ id: 103 }],
+        ledger: [{ id: "203" }],
+      })
+    );
+
+    const wrongRootTrace = structuredClone(codexTurn);
+    wrongRootTrace.value.billing_binding.requestIds = ["delegate-request"];
+    wrongRootTrace.costFrames = [
+      {
+        requestId: "codex-request",
+        traceId: "e".repeat(32),
+        model: "gpt-5.6-sol",
+        costCredits: "5",
+      },
+      {
+        requestId: "delegate-request",
+        traceId: "d".repeat(32),
+        model: "gpt-5.6-sol",
+        costCredits: "2",
+      },
+    ];
+    assert.throws(
+      () => assertTurnUsageMatchesFrames(wrongRootTrace, {
+        billingBindingMode: "codex_server_trace",
+        dispatch: {
+          dispatch_id: "d",
+          attempt_no: 1,
+          billing_request_id: "codex-request",
+        },
+        authorityBindings: [],
+        rootUsage: [{
+          id: 103,
+          request_id: "codex-request",
+          model: "gpt-5.6-sol",
+          cost_credits: 5,
+        }],
+        delegateUsage: [{
+          id: 104,
+          request_id: "delegate-request",
+          model: "gpt-5.6-sol",
+          cost_credits: 2,
+        }],
+        newUsage: [{ id: 103 }, { id: 104 }],
+        ledger: [{ id: "203" }, { id: "204" }],
+      }),
+      /exact root dispatch trace/,
+    );
+  });
+
+  test("fsyncs the local workspace artifact and its parent before recovery", () => {
+    const parent = temp("v5-eval-workspace-durable-");
+    const artifact = join(parent, "workspace.json");
+    writeFileSync(artifact, "{}", { mode: 0o600 });
+    chmodSync(artifact, 0o600);
+
+    assert.doesNotThrow(() => durablyPersistWorkspaceArtifact(artifact));
+    const synced: number[] = [];
+    assert.doesNotThrow(() =>
+      durablyPersistWorkspaceArtifact(artifact, (fd) => synced.push(fd))
+    );
+    assert.equal(synced.length, 2);
+    assert.throws(
+      () => durablyPersistWorkspaceArtifact(artifact, () => {
+        throw new Error("fsync failed");
+      }),
+      /fsync failed/,
+    );
+    let calls = 0;
+    assert.throws(
+      () => durablyPersistWorkspaceArtifact(artifact, () => {
+        calls += 1;
+        if (calls === 2) throw new Error("parent fsync failed");
+      }),
+      /parent fsync failed/,
+    );
+  });
+
+  test("verifies complete workspace bytes and rejects path or content corruption", () => {
+    const fileBytes = Buffer.from("console.log('ok');\n");
+    const fileSha = createHash("sha256").update(fileBytes).digest("hex");
+    const tree = createHash("sha256")
+      .update("D  src\n")
+      .update(`F  ${fileSha}  src/index.js\n`)
+      .digest("hex");
+    const identity = {
+      state: "tree",
+      files: 1,
+      directories: 1,
+      sha256: tree,
+    };
+    const document = {
+      schemaVersion: 1,
+      uid: 247,
+      engine: "ccb",
+      agentId: "research-assistant",
+      caseId: "software-build-01",
+      workspaceMode: "temporary",
+      containerId: "e".repeat(64),
+      manifestSha: "f".repeat(64),
+      identity,
+      entries: [
+        { path: "src", type: "directory", mode: 0o755 },
+        {
+          path: "src/index.js",
+          type: "file",
+          mode: 0o644,
+          bytes: fileBytes.length,
+          sha256: fileSha,
+          contentBase64: fileBytes.toString("base64"),
+        },
+      ],
+    };
+    const remote = { state: "tree", identity, entryCount: 2 };
+    const expected = {
+      uid: 247,
+      engine: "ccb",
+      agentId: "research-assistant",
+      caseId: "software-build-01",
+      workspaceMode: "temporary",
+      containerId: "e".repeat(64),
+      manifestSha: "f".repeat(64),
+      identity,
+    };
+    assert.deepEqual(
+      verifyWorkspaceArtifactDocument(document, remote, expected),
+      { files: 1, directories: 1, completeBytes: fileBytes.length },
+    );
+    const escaped = structuredClone(document);
+    escaped.entries[1].path = "../index.js";
+    assert.throws(
+      () => verifyWorkspaceArtifactDocument(escaped, remote, expected),
+      /entry identity is invalid/,
+    );
+    const corrupted = structuredClone(document);
+    corrupted.entries[1].contentBase64 = Buffer.from("changed").toString("base64");
+    assert.throws(
+      () => verifyWorkspaceArtifactDocument(corrupted, remote, expected),
+      /incomplete or corrupted/,
+    );
+  });
+
   test("lane comparison ignores expected per-turn counters but rejects production drift", () => {
     const before = {
       phase: "stable",
@@ -500,6 +760,7 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.match(source, /"container-evidence"/);
     assert.match(source, /"extra-prompt-evidence"/);
     assert.match(source, /"dynamic-input-evidence"/);
+    assert.match(source, /"workspace-artifact-evidence"/);
     assert.match(source, /"turn-evidence"/);
     assert.match(source, /clientMessageId: turn\.value\.client_message_id/);
     assert.match(source, /"standard-container-evidence"/);
@@ -526,6 +787,11 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.match(source, /post\.usageMaxId !== expectedUsageMaxId/);
     assert.match(source, /verifyCasePack\(/);
     assert.match(source, /OC_SYNTHETIC_EVAL_PROMPT:/);
+    assert.match(source, /spawnSync\(\s+"scp"/);
+    assert.ok(
+      source.indexOf("durablyPersistWorkspaceArtifact(outputPath)")
+        > source.indexOf("verifyWorkspaceArtifactDocument(document"),
+    );
   });
 
   test("help is side-effect free and a real arm fails before git/ssh without wrapper proof", () => {

@@ -1000,7 +1000,7 @@ const DYNAMIC_INPUT_SOURCE = [
   'const [agentId,caseId,phase] = process.argv.slice(1);',
   'if(!/^[A-Za-z0-9_-]{1,80}$/.test(agentId)||!/^[A-Za-z0-9_-]{1,80}$/.test(caseId)||!["pre","post"].includes(phase))throw new Error("invalid dynamic input identity");',
   'const sha=(value)=>createHash("sha256").update(value).digest("hex");',
-  'function identity(target){if(!fs.existsSync(target))return {state:"absent"};const root=fs.realpathSync(target);if(root!==target)throw new Error("dynamic input path is not canonical:"+target);const stat=fs.lstatSync(root);if(stat.isSymbolicLink())throw new Error("dynamic input symlink:"+target);if(stat.isFile()){const bytes=fs.readFileSync(root);return {state:"file",bytes:bytes.length,sha256:sha(bytes)}}if(!stat.isDirectory())throw new Error("dynamic input has unsafe type:"+target);const hash=createHash("sha256");let files=0;let directories=0;function walk(current){for(const name of fs.readdirSync(current).sort()){const absolute=path.join(current,name);const child=fs.lstatSync(absolute);if(child.isSymbolicLink())throw new Error("dynamic input symlink:"+absolute);const relative=path.relative(root,absolute).split(path.sep).join("/");if(child.isDirectory()){directories++;hash.update("D  "+relative+"\\n");walk(absolute)}else if(child.isFile()){files++;hash.update("F  "+sha(fs.readFileSync(absolute))+"  "+relative+"\\n")}else throw new Error("dynamic input has unsafe entry:"+absolute)}}walk(root);return {state:"tree",files,directories,sha256:hash.digest("hex")}}',
+  'function identity(target){let stat;try{stat=fs.lstatSync(target)}catch(error){if(error&&error.code==="ENOENT")return {state:"absent"};throw error}if(stat.isSymbolicLink())throw new Error("dynamic input symlink:"+target);const root=fs.realpathSync(target);if(root!==target)throw new Error("dynamic input path is not canonical:"+target);if(stat.isFile()){const bytes=fs.readFileSync(root);return {state:"file",bytes:bytes.length,sha256:sha(bytes)}}if(!stat.isDirectory())throw new Error("dynamic input has unsafe type:"+target);const hash=createHash("sha256");let files=0;let directories=0;function walk(current){for(const name of fs.readdirSync(current).sort()){const absolute=path.join(current,name);const child=fs.lstatSync(absolute);if(child.isSymbolicLink())throw new Error("dynamic input symlink:"+absolute);const relative=path.relative(root,absolute).split(path.sep).join("/");if(child.isDirectory()){directories++;hash.update("D  "+relative+"\\n");walk(absolute)}else if(child.isFile()){files++;hash.update("F  "+sha(fs.readFileSync(absolute))+"  "+relative+"\\n")}else throw new Error("dynamic input has unsafe entry:"+absolute)}}walk(root);return {state:"tree",files,directories,sha256:hash.digest("hex")}}',
   'const agentRoot="/home/agent/.openclaude/agents/"+agentId;',
   'const temporary="/tmp/oc-synthetic-eval-"+caseId;',
   'const value={agentClaude:identity(agentRoot+"/CLAUDE.md"),agentMemoryIndex:identity(agentRoot+"/MEMORY.md"),agentMemoryTree:identity(agentRoot+"/memory"),userSoul:identity("/home/agent/.openclaude/SOUL.md"),userProfile:identity("/home/agent/.openclaude/USER.md"),userSkills:identity("/home/agent/.openclaude/hub/skills"),workspace:identity("/home/agent/.openclaude/workspace"),temporaryWorkspace:identity(temporary)};',
@@ -1166,6 +1166,189 @@ function inspectDynamicInputs() {
   };
 }
 
+function captureCopiedWorkspace(root) {
+  const rootReal = fs.realpathSync(root);
+  if (rootReal !== root) fail("copied workspace path is not canonical");
+  const entries = [];
+  const hash = createHash("sha256");
+  let files = 0;
+  let directories = 0;
+  function walk(current) {
+    for (const name of fs.readdirSync(current).sort()) {
+      const absolute = path.join(current, name);
+      const before = fs.lstatSync(absolute);
+      if (before.isSymbolicLink()) fail("workspace artifact symlink is forbidden: " + absolute);
+      if (![0, 1000].includes(before.uid) || (before.mode & 0o022) !== 0) {
+        fail("workspace artifact has unsafe owner or mode: " + absolute);
+      }
+      const relative = path.relative(rootReal, absolute).split(path.sep).join("/");
+      if (!relative || relative.startsWith("../") || path.isAbsolute(relative)) {
+        fail("workspace artifact path escaped its root");
+      }
+      if (before.isDirectory()) {
+        directories += 1;
+        entries.push({ path: relative, type: "directory", mode: before.mode & 0o777 });
+        hash.update("D  " + relative + "\n");
+        walk(absolute);
+        const after = fs.lstatSync(absolute);
+        if (
+          !after.isDirectory()
+          || after.isSymbolicLink()
+          || before.dev !== after.dev
+          || before.ino !== after.ino
+          || before.mtimeMs !== after.mtimeMs
+        ) {
+          fail("workspace artifact directory changed while capturing: " + absolute);
+        }
+      } else if (before.isFile()) {
+        const bytes = fs.readFileSync(absolute);
+        const after = fs.lstatSync(absolute);
+        if (
+          !after.isFile()
+          || after.isSymbolicLink()
+          || before.dev !== after.dev
+          || before.ino !== after.ino
+          || before.size !== after.size
+          || before.mtimeMs !== after.mtimeMs
+        ) {
+          fail("workspace artifact file changed while capturing: " + absolute);
+        }
+        const digest = sha256(bytes);
+        files += 1;
+        entries.push({
+          path: relative,
+          type: "file",
+          mode: before.mode & 0o777,
+          bytes: bytes.length,
+          sha256: digest,
+          contentBase64: bytes.toString("base64"),
+        });
+        hash.update("F  " + digest + "  " + relative + "\n");
+      } else {
+        fail("workspace artifact contains a non-file entry: " + absolute);
+      }
+    }
+  }
+  walk(rootReal);
+  return {
+    identity: {
+      state: "tree",
+      files,
+      directories,
+      sha256: hash.digest("hex"),
+    },
+    entries,
+  };
+}
+
+function inspectWorkspaceArtifacts() {
+  if (
+    typeof payload.agentId !== "string"
+    || !/^[A-Za-z0-9_-]{1,80}$/.test(payload.agentId)
+    || typeof payload.caseId !== "string"
+    || !/^[A-Za-z0-9_-]{1,80}$/.test(payload.caseId)
+    || !["ccb", "codex"].includes(payload.engine)
+    || !["none", "temporary"].includes(payload.workspaceMode)
+    || !payload.expectedIdentity
+    || typeof payload.expectedIdentity !== "object"
+    || !["absent", "tree"].includes(payload.expectedIdentity.state)
+  ) {
+    fail("workspace artifact evidence identity is invalid");
+  }
+  const evidence = inspectContainer();
+  const liveBefore = dockerExecJson(
+    evidence.container,
+    DYNAMIC_INPUT_SOURCE,
+    [payload.agentId, payload.caseId, "post"],
+  ).temporaryWorkspace;
+  if (JSON.stringify(liveBefore) !== JSON.stringify(payload.expectedIdentity)) {
+    fail("workspace artifact live identity differs from post-turn evidence");
+  }
+  if (
+    (payload.workspaceMode === "none" && liveBefore.state !== "absent")
+    || (payload.workspaceMode === "temporary" && !["absent", "tree"].includes(liveBefore.state))
+  ) {
+    fail("workspace artifact state differs from case contract");
+  }
+  const stage = path.join(STAGING_ROOT, payload.manifestSha);
+  validateStage(stage);
+  const evidenceRoot = path.join(stage, "evidence");
+  fs.mkdirSync(evidenceRoot, { mode: 0o700 });
+  fs.chownSync(evidenceRoot, 0, 0);
+  fs.chmodSync(evidenceRoot, 0o700);
+  secureStat(evidenceRoot, "dir", 0o700);
+  const stem = payload.recordNonce + "-" + payload.caseId;
+  const copyRoot = path.join(evidenceRoot, ".copy-" + stem);
+  const documentPath = path.join(evidenceRoot, stem + ".workspace.json");
+  if (fs.existsSync(copyRoot) || fs.existsSync(documentPath)) {
+    fail("workspace artifact evidence path already exists");
+  }
+  let captured = { identity: { state: "absent" }, entries: [] };
+  try {
+    if (liveBefore.state === "tree") {
+      fs.mkdirSync(copyRoot, { mode: 0o700 });
+      fs.chownSync(copyRoot, 0, 0);
+      fs.chmodSync(copyRoot, 0o700);
+      const workspace = "/tmp/oc-synthetic-eval-" + payload.caseId;
+      const copied = spawnSync(
+        "docker",
+        ["cp", evidence.container + ":" + workspace + "/.", copyRoot],
+        { encoding: "utf8" },
+      );
+      if (copied.error) throw copied.error;
+      if (copied.status !== 0) {
+        fail("workspace artifact docker copy failed: " + (copied.stderr || copied.stdout));
+      }
+      captured = captureCopiedWorkspace(copyRoot);
+      const liveAfter = dockerExecJson(
+        evidence.container,
+        DYNAMIC_INPUT_SOURCE,
+        [payload.agentId, payload.caseId, "post"],
+      ).temporaryWorkspace;
+      if (
+        JSON.stringify(liveAfter) !== JSON.stringify(liveBefore)
+        || JSON.stringify(captured.identity) !== JSON.stringify(liveBefore)
+      ) {
+        fail("workspace artifact changed during complete capture");
+      }
+    }
+    const document = {
+      schemaVersion: 1,
+      uid: payload.uid,
+      engine: payload.engine,
+      agentId: payload.agentId,
+      caseId: payload.caseId,
+      workspaceMode: payload.workspaceMode,
+      containerId: evidence.containerId,
+      manifestSha: payload.manifestSha,
+      identity: captured.identity,
+      entries: captured.entries,
+    };
+    const bytes = Buffer.from(JSON.stringify(document) + "\n");
+    const fd = fs.openSync(documentPath, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, bytes);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.chownSync(documentPath, 0, 0);
+    fs.chmodSync(documentPath, 0o600);
+    fsyncDirectory(evidenceRoot);
+    secureStat(documentPath, "file", 0o600);
+    return {
+      state: captured.identity.state,
+      identity: captured.identity,
+      entryCount: captured.entries.length,
+      remotePath: documentPath,
+      bytes: bytes.length,
+      sha256: sha256(bytes),
+    };
+  } finally {
+    fs.rmSync(copyRoot, { recursive: true, force: true });
+  }
+}
+
 function inspectTurnEvidence() {
   assertUid(payload.uid);
   if (
@@ -1179,31 +1362,39 @@ function inspectTurnEvidence() {
     || !/^[A-Za-z0-9._-]{1,80}$/.test(payload.model)
     || !Number.isSafeInteger(payload.usageFloor)
     || payload.usageFloor < 0
+    || !["ccb", "codex"].includes(payload.engine)
+    || typeof payload.traceId !== "string"
+    || !/^[0-9a-f]{32}$/.test(payload.traceId)
   ) {
     fail("turn evidence identity is invalid");
   }
   const peer = payload.peerId.replaceAll("'", "''");
   const clientMessageId = payload.clientMessageId.replaceAll("'", "''");
-  const agent = payload.agentId.replaceAll("'", "''");
-  const model = payload.model.replaceAll("'", "''");
   const sql = [
     "WITH exact_dispatch AS (",
     " SELECT dispatch_id,user_id,session_id,client_message_id,agent_id,model,",
-    "        billing_request_id,status,outcome,admitted_at,terminal_at",
+    "        billing_request_id,attempt_no,status,outcome,admitted_at,terminal_at",
     "   FROM turn_dispatches",
     "  WHERE user_id=" + payload.uid,
     "    AND session_id='" + peer + "'",
     "    AND client_message_id='" + clientMessageId + "'",
-    "    AND agent_id='" + agent + "'",
+    "),",
+    "authority_binding AS (",
+    " SELECT atd.authority_turn_id,atd.user_id,atd.dispatch_model,",
+    "        atd.canonical_model,atd.session_id,atd.dispatch_id,atd.attempt_no",
+    "   FROM authority_turn_dispatches atd",
+    "   JOIN exact_dispatch d",
+    "     ON d.dispatch_id=atd.dispatch_id AND d.attempt_no=atd.attempt_no",
     "),",
     "root_usage AS (",
-    " SELECT id,session_id,mode,model,request_id,dispatch_id,turn_key,",
-    "        parent_turn_key,parent_session_id,delegate_agent_id,status,",
-    "        input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,",
-    "        cost_credits,created_at",
-    "   FROM usage_records",
-    "  WHERE user_id=" + payload.uid,
-    "    AND dispatch_id=(SELECT dispatch_id FROM exact_dispatch)",
+    " SELECT u.id,u.session_id,u.mode,u.model,u.request_id,u.dispatch_id,u.turn_key,",
+    "        u.parent_turn_key,u.parent_session_id,u.delegate_agent_id,u.status,",
+    "        u.input_tokens,u.output_tokens,u.cache_read_tokens,u.cache_write_tokens,",
+    "        u.cost_credits,u.ledger_id::text,u.attempt_no,u.created_at",
+    "   FROM usage_records u",
+    "   JOIN exact_dispatch d",
+    "     ON d.dispatch_id=u.dispatch_id AND d.attempt_no=u.attempt_no",
+    "  WHERE u.user_id=" + payload.uid,
     "),",
     "root_turn AS (",
     " SELECT min(turn_key) AS turn_key,",
@@ -1214,7 +1405,7 @@ function inspectTurnEvidence() {
     " SELECT id,session_id,mode,model,request_id,dispatch_id,turn_key,",
     "        parent_turn_key,parent_session_id,delegate_agent_id,status,",
     "        input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,",
-    "        cost_credits,created_at",
+    "        cost_credits,ledger_id::text,attempt_no,created_at",
     "   FROM usage_records",
     "  WHERE user_id=" + payload.uid,
     "    AND parent_session_id='" + peer + "'",
@@ -1224,6 +1415,13 @@ function inspectTurnEvidence() {
     " SELECT id FROM root_usage",
     " UNION ALL",
     " SELECT id FROM delegate_usage",
+    "),",
+    "bound_ledger AS (",
+    " SELECT id::text,delta::text,reason,ref_type,ref_id",
+    "   FROM credit_ledger",
+    "  WHERE user_id=" + payload.uid,
+    "    AND ref_type='usage_record'",
+    "    AND ref_id IN (SELECT id::text FROM bound_usage)",
     "),",
     "new_usage AS (",
     " SELECT id,session_id,mode,model,request_id,dispatch_id,turn_key,",
@@ -1236,16 +1434,17 @@ function inspectTurnEvidence() {
     "SELECT json_build_object(",
     " 'dispatchCount',(SELECT count(*)::int FROM exact_dispatch),",
     " 'dispatch',(SELECT row_to_json(exact_dispatch) FROM exact_dispatch),",
+    " 'authorityBindings',COALESCE((SELECT json_agg(authority_binding ORDER BY authority_turn_id) FROM authority_binding),'[]'::json),",
     " 'rootTurnKey',(SELECT turn_key FROM root_turn),",
     " 'rootTurnKeyCount',(SELECT keys::int FROM root_turn),",
     " 'rootUsage',COALESCE((SELECT json_agg(root_usage ORDER BY id) FROM root_usage),'[]'::json),",
     " 'delegateUsage',COALESCE((SELECT json_agg(delegate_usage ORDER BY id) FROM delegate_usage),'[]'::json),",
+    " 'ledger',COALESCE((SELECT json_agg(bound_ledger ORDER BY id::bigint) FROM bound_ledger),'[]'::json),",
     " 'newUsage',COALESCE((SELECT json_agg(new_usage ORDER BY id) FROM new_usage),'[]'::json),",
     " 'unrelatedNewUsageCount',(",
     "   SELECT count(*)::int FROM new_usage",
     "    WHERE id NOT IN (SELECT id FROM bound_usage)",
-    " ),",
-    " 'expectedModel','" + model + "'",
+    " )",
     ")::text;",
   ].join("\n");
   const raw = psql(sql);
@@ -1261,12 +1460,16 @@ function inspectTurnEvidence() {
     || value.dispatch.model !== payload.model
     || value.dispatch.status !== "terminal"
     || value.dispatch.outcome !== "completed"
+    || !Number.isSafeInteger(value.dispatch.attempt_no)
+    || value.dispatch.attempt_no < 1
     || typeof value.rootTurnKey !== "string"
     || !/^[0-9a-f]{64}$/.test(value.rootTurnKey)
     || value.rootTurnKeyCount !== 1
     || !Array.isArray(value.rootUsage)
     || value.rootUsage.length < 1
     || !Array.isArray(value.delegateUsage)
+    || !Array.isArray(value.authorityBindings)
+    || !Array.isArray(value.ledger)
     || !Array.isArray(value.newUsage)
     || value.newUsage.length < 1
     || value.unrelatedNewUsageCount !== 0
@@ -1281,12 +1484,10 @@ function inspectTurnEvidence() {
     || value.rootUsage.some(
       (row) =>
         row.dispatch_id !== value.dispatch.dispatch_id
+        || row.attempt_no !== value.dispatch.attempt_no
         || row.turn_key !== value.rootTurnKey
         || row.status !== "success"
         || row.model !== payload.model,
-    )
-    || !value.rootUsage.some(
-      (row) => row.request_id === value.dispatch.billing_request_id,
     )
     || value.delegateUsage.some(
       (row) =>
@@ -1298,6 +1499,68 @@ function inspectTurnEvidence() {
   ) {
     fail("turn dispatch/usage evidence is not exact");
   }
+  if (payload.engine === "ccb") {
+    const binding = value.authorityBindings[0];
+    if (
+      typeof value.dispatch.billing_request_id !== "string"
+      || value.dispatch.billing_request_id.length === 0
+      || value.authorityBindings.length !== 1
+      || !binding
+      || !/^[0-9a-f]{32}$/.test(binding.authority_turn_id || "")
+      || binding.user_id !== payload.uid
+      || binding.dispatch_id !== value.dispatch.dispatch_id
+      || binding.attempt_no !== value.dispatch.attempt_no
+      || binding.session_id !== payload.peerId
+      || binding.dispatch_model !== value.dispatch.model
+      || binding.canonical_model !== payload.model
+    ) {
+      fail("CCB authority/dispatch binding evidence is not exact");
+    }
+  } else if (
+    value.authorityBindings.length !== 0
+    || !value.rootUsage.some(
+      (row) => row.request_id === value.dispatch.billing_request_id,
+    )
+  ) {
+    fail("Codex trace/dispatch/usage binding evidence is not exact");
+  }
+  const usage = [...value.rootUsage, ...value.delegateUsage];
+  const ledgerByUsage = new Map();
+  for (const row of value.ledger) {
+    if (
+      typeof row.id !== "string"
+      || !/^[1-9][0-9]*$/.test(row.id)
+      || typeof row.ref_id !== "string"
+      || row.ref_type !== "usage_record"
+      || row.reason !== "chat"
+      || typeof row.delta !== "string"
+      || !/^-?[0-9]+$/.test(row.delta)
+    ) {
+      fail("turn ledger evidence has an invalid identity");
+    }
+    const rows = ledgerByUsage.get(row.ref_id) || [];
+    rows.push(row);
+    ledgerByUsage.set(row.ref_id, rows);
+  }
+  for (const row of usage) {
+    const ledger = ledgerByUsage.get(String(row.id)) || [];
+    if (BigInt(row.cost_credits) === 0n) {
+      if (ledger.length !== 0) fail("zero-cost usage unexpectedly has ledger debits");
+      continue;
+    }
+    if (
+      typeof row.ledger_id !== "string"
+      || !ledger.some((entry) => entry.id === row.ledger_id)
+      || ledger.some((entry) => BigInt(entry.delta) >= 0n)
+      || ledger.reduce((sum, entry) => sum - BigInt(entry.delta), 0n)
+        !== BigInt(row.cost_credits)
+    ) {
+      fail("turn ledger evidence does not equal exact usage cost");
+    }
+  }
+  value.billingBindingMode = payload.engine === "ccb"
+    ? "ccb_authority_dispatch_attempt"
+    : "codex_server_trace";
   return value;
 }
 
@@ -1363,6 +1626,8 @@ try {
     result = inspectExtraPrompt();
   } else if (action === "dynamic-input-evidence") {
     result = inspectDynamicInputs();
+  } else if (action === "workspace-artifact-evidence") {
+    result = inspectWorkspaceArtifacts();
   } else if (action === "turn-evidence") {
     result = inspectTurnEvidence();
   } else if (action === "standard-container-evidence") {

@@ -515,6 +515,24 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     );
     assert.match(REMOTE_HELPER_SOURCE, /function inspectDynamicInputs\(\)/);
     assert.match(REMOTE_HELPER_SOURCE, /function inspectTurnEvidence\(\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /function inspectWorkspaceArtifacts\(\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /function captureCopiedWorkspace\(root\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /workspace-artifact-evidence/);
+    assert.match(REMOTE_HELPER_SOURCE, /workspace artifact symlink is forbidden/);
+    assert.match(REMOTE_HELPER_SOURCE, /workspace artifact path escaped its root/);
+    assert.match(REMOTE_HELPER_SOURCE, /\["cp", evidence\.container \+ ":" \+ workspace \+ "\/\.", copyRoot\]/);
+    assert.match(REMOTE_HELPER_SOURCE, /workspace artifact changed during complete capture/);
+    assert.match(REMOTE_HELPER_SOURCE, /contentBase64: bytes\.toString\("base64"\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /FROM authority_turn_dispatches atd/);
+    assert.match(REMOTE_HELPER_SOURCE, /d\.attempt_no=atd\.attempt_no/);
+    assert.match(REMOTE_HELPER_SOURCE, /ccb_authority_dispatch_attempt/);
+    assert.match(REMOTE_HELPER_SOURCE, /codex_server_trace/);
+    assert.match(REMOTE_HELPER_SOURCE, /ref_type='usage_record'/);
+    assert.match(REMOTE_HELPER_SOURCE, /BigInt\(entry\.delta\) >= 0n/);
+    assert.match(
+      REMOTE_HELPER_SOURCE,
+      /ledger\.reduce\(\(sum, entry\) => sum - BigInt\(entry\.delta\), 0n\)/,
+    );
     assert.match(REMOTE_HELPER_SOURCE, /temporary evaluation workspace already exists/);
     assert.match(REMOTE_HELPER_SOURCE, /unrelatedNewUsageCount/);
     assert.match(REMOTE_HELPER_SOURCE, /runtime tuple is incomplete/);
@@ -615,5 +633,164 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       `${source}; return hashTree;`,
     )(fs, path, createHash, listFiles, digest) as (root: string) => string;
     assert.equal(remoteHashTree(directory), hashTree(directory));
+  });
+
+  test("dynamic input identity rejects a broken symlink instead of recording it absent", () => {
+    const assignment = REMOTE_HELPER_SOURCE.match(
+      /const DYNAMIC_INPUT_SOURCE = (\[[\s\S]*?\]\.join\("\\n"\));/,
+    );
+    assert.ok(assignment?.[1]);
+    const probeSource = new Function(`return ${assignment[1]};`)() as string;
+    const start = probeSource.indexOf("const sha=");
+    const end = probeSource.indexOf("\nconst agentRoot=", start);
+    assert.ok(start >= 0 && end > start);
+    const identity = new Function(
+      "fs",
+      "path",
+      "createHash",
+      `${probeSource.slice(start, end)}; return identity;`,
+    )(fs, path, createHash) as (target: string) => Record<string, unknown>;
+
+    const directory = temp("v5-synthetic-dynamic-input-");
+    const absent = path.join(directory, "absent");
+    assert.deepEqual(identity(absent), { state: "absent" });
+    const broken = path.join(directory, "broken");
+    symlinkSync(path.join(directory, "missing-target"), broken);
+    assert.throws(() => identity(broken), /dynamic input symlink/);
+  });
+
+  test("workspace capture executes symlink, path-escape, special-node, and TOCTOU guards", () => {
+    const start = REMOTE_HELPER_SOURCE.indexOf("function captureCopiedWorkspace(root) {");
+    const end = REMOTE_HELPER_SOURCE.indexOf("\nfunction inspectWorkspaceArtifacts()", start);
+    assert.ok(start >= 0 && end > start);
+    const source = REMOTE_HELPER_SOURCE.slice(start, end);
+    const fail = (message: string): never => { throw new Error(message); };
+    const sha256 = (value: string | Buffer): string =>
+      createHash("sha256").update(value).digest("hex");
+    const load = (fsValue: typeof fs = fs, pathValue: typeof path = path) =>
+      new Function(
+        "fs",
+        "path",
+        "createHash",
+        "sha256",
+        "fail",
+        `${source}; return captureCopiedWorkspace;`,
+      )(fsValue, pathValue, createHash, sha256, fail) as (
+        root: string,
+      ) => { identity: Record<string, unknown>; entries: unknown[] };
+
+    const normal = temp("v5-synthetic-workspace-capture-");
+    write(normal, "nested/output.txt", "complete bytes\n");
+    const captured = load()(normal);
+    assert.equal(captured.identity.state, "tree");
+    assert.equal(captured.identity.files, 1);
+    assert.equal(captured.identity.directories, 1);
+    assert.equal(captured.entries.length, 2);
+
+    const linked = temp("v5-synthetic-workspace-symlink-");
+    symlinkSync("missing-target", path.join(linked, "broken"));
+    assert.throws(() => load()(linked), /workspace artifact symlink is forbidden/);
+
+    const special = temp("v5-synthetic-workspace-special-");
+    execFileSync("mkfifo", [path.join(special, "pipe")]);
+    assert.throws(() => load()(special), /contains a non-file entry/);
+
+    const escapedPath = new Proxy(path, {
+      get(target, property, receiver) {
+        if (property === "relative") return () => "../escaped";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    assert.throws(() => load(fs, escapedPath)(normal), /path escaped its root/);
+
+    const changing = temp("v5-synthetic-workspace-changing-");
+    const changingFile = path.join(changing, "output.txt");
+    writeFileSync(changingFile, "stable bytes\n", { mode: 0o644 });
+    let fileStats = 0;
+    const changingFs = new Proxy(fs, {
+      get(target, property, receiver) {
+        if (property !== "lstatSync") return Reflect.get(target, property, receiver);
+        return (file: fs.PathLike) => {
+          const stat = fs.lstatSync(file);
+          if (String(file) !== changingFile || ++fileStats !== 2) return stat;
+          return new Proxy(stat, {
+            get(statTarget, statProperty) {
+              if (statProperty === "mtimeMs") return statTarget.mtimeMs + 1;
+              const value = Reflect.get(statTarget, statProperty, statTarget);
+              return typeof value === "function" ? value.bind(statTarget) : value;
+            },
+          });
+        };
+      },
+    });
+    assert.throws(
+      () => load(changingFs)(changing),
+      /file changed while capturing/,
+    );
+  });
+
+  test("workspace evidence rejects a live identity change across docker copy", () => {
+    const captureStart = REMOTE_HELPER_SOURCE.indexOf("function captureCopiedWorkspace(root) {");
+    const captureEnd = REMOTE_HELPER_SOURCE.indexOf("\nfunction inspectWorkspaceArtifacts()", captureStart);
+    const inspectStart = captureEnd + 1;
+    const inspectEnd = REMOTE_HELPER_SOURCE.indexOf("\nfunction inspectTurnEvidence()", inspectStart);
+    assert.ok(captureStart >= 0 && captureEnd > captureStart && inspectEnd > inspectStart);
+    const captureSource = REMOTE_HELPER_SOURCE.slice(captureStart, captureEnd);
+    const inspectSource = REMOTE_HELPER_SOURCE.slice(inspectStart, inspectEnd);
+    const fail = (message: string): never => { throw new Error(message); };
+    const sha256 = (value: string | Buffer): string =>
+      createHash("sha256").update(value).digest("hex");
+    const capture = new Function(
+      "fs", "path", "createHash", "sha256", "fail",
+      `${captureSource}; return captureCopiedWorkspace;`,
+    )(fs, path, createHash, sha256, fail);
+
+    const stagingRoot = temp("v5-synthetic-workspace-live-");
+    const manifestSha = "a".repeat(64);
+    mkdirSync(path.join(stagingRoot, manifestSha), { mode: 0o700 });
+    const content = Buffer.from("stable bytes\n");
+    const fileSha = sha256(content);
+    const before = {
+      state: "tree",
+      files: 1,
+      directories: 0,
+      sha256: sha256(`F  ${fileSha}  output.txt\n`),
+    };
+    let probes = 0;
+    const payload = {
+      uid: 247,
+      engine: "ccb",
+      agentId: "main",
+      caseId: "toctou_case",
+      workspaceMode: "temporary",
+      expectedIdentity: before,
+      manifestSha,
+      recordNonce: "b".repeat(32),
+    };
+    const inspect = new Function(
+      "payload", "inspectContainer", "dockerExecJson", "DYNAMIC_INPUT_SOURCE",
+      "STAGING_ROOT", "validateStage", "fs", "path", "spawnSync",
+      "captureCopiedWorkspace", "sha256", "fsyncDirectory", "secureStat", "fail",
+      `${inspectSource}; return inspectWorkspaceArtifacts;`,
+    )(
+      payload,
+      () => ({ container: "oc-v5-u247", containerId: "c".repeat(64) }),
+      () => ({ temporaryWorkspace: probes++ === 0 ? before : { ...before, sha256: "d".repeat(64) } }),
+      "ignored",
+      stagingRoot,
+      () => undefined,
+      fs,
+      path,
+      (_command: string, args: string[]) => {
+        writeFileSync(path.join(args[2], "output.txt"), content, { mode: 0o644 });
+        return { status: 0, stdout: "", stderr: "" };
+      },
+      capture,
+      sha256,
+      () => undefined,
+      () => undefined,
+      fail,
+    ) as () => unknown;
+    assert.throws(() => inspect(), /changed during complete capture/);
   });
 });

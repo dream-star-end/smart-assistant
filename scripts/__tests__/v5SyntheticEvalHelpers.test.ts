@@ -351,7 +351,6 @@ describe("V5 synthetic exact-eval helpers", () => {
     const cost = JSON.stringify({
       type: "outbound.cost_charged",
       requestId: "request-1",
-      traceId,
     });
     const remote = {
       peer_id: peerId,
@@ -367,16 +366,29 @@ describe("V5 synthetic exact-eval helpers", () => {
       agent_id: "research-assistant",
       started_at: "2026-07-31T10:00:00.000Z",
       finished_at: "2026-07-31T10:00:01.250Z",
+      billing_evidence_at: "2026-07-31T10:00:01.500Z",
       wall_ms: 1_250,
+      billing_evidence_wait_ms: 250,
       ttft_ms: 500,
       final_text: "done",
       trace_id: traceId,
       cost_request_id: "request-1",
-      cost_trace_id: traceId,
+      cost_trace_id: null,
       cost: {
         type: "outbound.cost_charged",
         requestId: "request-1",
-        traceId,
+      },
+      billing_binding: {
+        mode: "ccb_authority_dispatch_attempt",
+        finalTraceId: traceId,
+        dispatchBillingRequestId: "d".repeat(32),
+        authorityTurnId: "b".repeat(32),
+        dispatchId: "50af992a-0bca-4e19-ba11-24df12de0bed",
+        attemptNo: 1,
+        requestIds: ["request-1"],
+        rootRequestIds: ["request-1"],
+        usageIds: ["52247"],
+        ledgerIds: ["57327"],
       },
       connection: { opens: 1, closes: 1, reconnects: 0 },
       runtime: {
@@ -386,6 +398,7 @@ describe("V5 synthetic exact-eval helpers", () => {
         inbound_messages: 1,
         finals: 1,
         matching_costs: 1,
+        binding_queries: 1,
       },
       frames: [
         {
@@ -455,6 +468,8 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.deepEqual(turn.connection, { opens: 1, closes: 1, reconnects: 0 });
     assert.deepEqual(frames.connection, turn.connection);
     assert.equal(turn.final_text, "done");
+    assert.equal(turn.billing_binding.mode, "ccb_authority_dispatch_attempt");
+    assert.equal(turn.cost_trace_id, null);
 
     const second = spawnSync(process.execPath, [turnHelper], {
       encoding: "utf8",
@@ -514,6 +529,254 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.throws(() => readFileSync(fake.log, "utf8"), /ENOENT/);
   });
 
+  test("CCB remote turn completes on authority-bound upstream cost without trace equality", async () => {
+    const helper = await import(
+      `${pathToFileURL(turnHelper).href}?ccb-binding=${Date.now()}`
+    ) as { TURN_REMOTE_SCRIPT: string };
+    const traceId = "a".repeat(32);
+    const dispatchBillingId = "d".repeat(32);
+    const authorityTurnId = "b".repeat(32);
+    const dispatchId = "50af992a-0bca-4e19-ba11-24df12de0bed";
+    const usageRequestId = "upstream-request-1";
+    let bindingVariant:
+      | "exact"
+      | "missing_dispatch"
+      | "missing_authority"
+      | "nonterminal_missing_authority"
+      | "terminal_failed" = "exact";
+    let bindingQueries = 0;
+    const token = [
+      Buffer.from("{}").toString("base64url"),
+      Buffer.from(JSON.stringify({ sub: "247" })).toString("base64url"),
+      "signature",
+    ].join(".");
+    const execFileSync = (
+      command: string,
+      args: string[],
+      options: { input?: string },
+    ): Buffer | string => {
+      if (command === "/bin/bash") {
+        return Buffer.from("DATABASE_URL=postgresql://mock\0");
+      }
+      assert.equal(command, "psql");
+      if (args.includes("-c")) return "stable|B||0\n";
+      bindingQueries += 1;
+      assert.match(options.input ?? "", /authority_turn_dispatches/);
+      const variables = Object.fromEntries(
+        args.flatMap((value, index) =>
+          args[index - 1] === "-v" && value.includes("=")
+            ? [value.split(/=(.*)/s).slice(0, 2)]
+            : []
+        ),
+      );
+      return `${JSON.stringify({
+        dispatchCount: bindingVariant === "missing_dispatch" ? 0 : 1,
+        dispatch: bindingVariant === "missing_dispatch" ? null : {
+          dispatch_id: dispatchId,
+          user_id: 247,
+          session_id: variables.peer,
+          client_message_id: variables.client_message_id,
+          agent_id: "main",
+          model: "glm-5.2",
+          billing_request_id: dispatchBillingId,
+          attempt_no: 1,
+          status: bindingVariant === "nonterminal_missing_authority"
+            ? "admitted"
+            : "terminal",
+          outcome: bindingVariant === "terminal_failed" ? "failed" : "completed",
+        },
+        authorityBindings: ["missing_authority", "nonterminal_missing_authority"]
+          .includes(bindingVariant) ? [] : [{
+          authority_turn_id: authorityTurnId,
+          user_id: 247,
+          dispatch_model: "glm-5.2",
+          canonical_model: "glm-5.2",
+          session_id: variables.peer,
+          dispatch_id: dispatchId,
+          attempt_no: 1,
+        }],
+        rootTurnKeyCount: 1,
+        rootUsage: [{
+          id: "52247",
+          request_id: usageRequestId,
+          model: "glm-5.2",
+          status: "success",
+          cost_credits: "4",
+          ledger_id: "57327",
+          turn_key: "c".repeat(64),
+          dispatch_id: dispatchId,
+          attempt_no: 1,
+        }],
+        delegateUsage: [],
+        ledger: [{
+          id: "57327",
+          delta: "-1",
+          reason: "chat",
+          ref_type: "usage_record",
+          ref_id: "52247",
+        }, {
+          id: "57328",
+          delta: "-3",
+          reason: "chat",
+          ref_type: "usage_record",
+          ref_id: "52247",
+        }],
+      })}\n`;
+    };
+    const readFileSync = (path: string): string => {
+      if (path.endsWith("openclaude.json")) return JSON.stringify({ gateway: { port: 18789 } });
+      if (path.endsWith("v5-canary.password")) return "secret\n";
+      throw new Error(`unexpected read: ${path}`);
+    };
+    const fetch = async (url: string): Promise<Record<string, unknown>> => {
+      if (url.endsWith("/api/auth/login")) {
+        return { ok: true, json: async () => ({ access_token: token }) };
+      }
+      if (url.includes("/api/sessions/")) {
+        return { ok: true, text: async () => "" };
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+    type Listener = (event: { data?: string; code?: number }) => void;
+    class FakeSocket {
+      listeners = new Map<string, Listener[]>();
+
+      constructor() {
+        queueMicrotask(() => {
+          this.emit("open", {});
+          this.emit("message", { data: JSON.stringify({ type: "sys.relay_ready" }) });
+        });
+      }
+
+      addEventListener(type: string, listener: Listener): void {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      emit(type: string, event: { data?: string; code?: number }): void {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+
+      send(text: string): void {
+        const inbound = JSON.parse(text);
+        queueMicrotask(() => {
+          this.emit("message", { data: JSON.stringify({
+            type: "outbound.message",
+            peer: inbound.peer,
+            blocks: [{ kind: "text", text: "done" }],
+            isFinal: true,
+            traceId,
+          }) });
+          this.emit("message", { data: JSON.stringify({
+            type: "outbound.cost_charged",
+            requestId: usageRequestId,
+            model: "glm-5.2",
+            costCredits: "4",
+          }) });
+        });
+      }
+
+      close(): void {
+        queueMicrotask(() => this.emit("close", { code: 1000 }));
+      }
+    }
+    Reflect.set(globalThis, "__syntheticEvalExecFileSync", execFileSync);
+    Reflect.set(globalThis, "__syntheticEvalReadFileSync", readFileSync);
+    Reflect.set(globalThis, "__syntheticEvalFetch", fetch);
+    Reflect.set(globalThis, "WebSocket", FakeSocket);
+    const instrumented = helper.TURN_REMOTE_SCRIPT
+      .replace(
+        /^  const \{ execFileSync \} = .*;$/m,
+        "  const execFileSync = globalThis.__syntheticEvalExecFileSync;",
+      )
+      .replace(
+        /^  const \{ readFileSync \} = .*;$/m,
+        "  const readFileSync = globalThis.__syntheticEvalReadFileSync;",
+      )
+      .replaceAll("await fetch(", "await globalThis.__syntheticEvalFetch(")
+      .replace(
+        /  process\.stdout\.write\(`\$\{JSON\.stringify\(result\)\}\\n`\);/,
+        "  globalThis.__syntheticEvalResult = result;",
+      );
+    const encoded = Buffer.from(JSON.stringify({
+      uid: 247,
+      engine: "ccb",
+      agentId: "main",
+      caseId: "ccb-binding",
+      pairId: "ccb-binding-pair",
+      order: "A_FIRST",
+      casePackSha: "d".repeat(64),
+      prompt: "answer once",
+      promptSha: createHash("sha256").update("answer once").digest("hex"),
+      model: "glm-5.2",
+      timeoutSeconds: 60,
+    })).toString("base64url");
+    const argvLength = process.argv.length;
+    process.argv.push(encoded);
+    try {
+      const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+      const execute = new AsyncFunction(instrumented);
+      await execute();
+      const result = Reflect.get(globalThis, "__syntheticEvalResult") as Record<string, any>;
+      assert.equal(result.trace_id, traceId);
+      assert.equal(result.cost_request_id, usageRequestId);
+      assert.equal(result.cost_trace_id, null);
+      assert.equal(result.billing_binding.mode, "ccb_authority_dispatch_attempt");
+      assert.equal(result.billing_binding.finalTraceId, traceId);
+      assert.equal(
+        result.billing_binding.dispatchBillingRequestId,
+        dispatchBillingId,
+      );
+      assert.equal(result.billing_binding.authorityTurnId, authorityTurnId);
+      assert.deepEqual(result.billing_binding.ledgerIds, ["57327", "57328"]);
+      assert.equal(result.runtime.binding_queries, 1);
+      assert.equal(result.runtime.matching_costs, 1);
+      assert.ok(result.billing_evidence_wait_ms < 1_000);
+
+      bindingVariant = "missing_dispatch";
+      const beforeMissingDispatch = bindingQueries;
+      await assert.rejects(
+        () => execute(),
+        /dispatch is missing after the final frame/,
+      );
+      assert.equal(bindingQueries - beforeMissingDispatch, 1);
+
+      bindingVariant = "missing_authority";
+      const beforeMissingAuthority = bindingQueries;
+      await assert.rejects(
+        () => execute(),
+        /authority binding is missing after the final frame/,
+      );
+      assert.equal(bindingQueries - beforeMissingAuthority, 1);
+
+      bindingVariant = "nonterminal_missing_authority";
+      const beforeNonterminalConflict = bindingQueries;
+      await assert.rejects(
+        () => execute(),
+        /authority binding is missing after the final frame/,
+      );
+      assert.equal(bindingQueries - beforeNonterminalConflict, 1);
+
+      bindingVariant = "terminal_failed";
+      const beforeTerminalFailure = bindingQueries;
+      await assert.rejects(
+        () => execute(),
+        /terminal dispatch did not complete/,
+      );
+      assert.equal(bindingQueries - beforeTerminalFailure, 1);
+    } finally {
+      process.argv.length = argvLength;
+      for (const name of [
+        "__syntheticEvalExecFileSync",
+        "__syntheticEvalReadFileSync",
+        "__syntheticEvalFetch",
+        "__syntheticEvalResult",
+        "WebSocket",
+      ]) Reflect.deleteProperty(globalThis, name);
+    }
+  });
+
   test("turn remote contract has one PUT, one WebSocket, and one inbound send", () => {
     const source = readFileSync(turnHelper, "utf8");
     assert.equal(source.match(/new WebSocket\(/g)?.length, 1);
@@ -522,6 +785,19 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.match(source, /clientMessageId,/);
     assert.equal(source.match(/socket\.send\(frame\)/g)?.length, 1);
     assert.match(source, /turn relay closed before final\+cost/);
+    assert.match(source, /authority_turn_dispatches/);
+    assert.match(source, /d\.attempt_no=u\.attempt_no/);
+    const exactDispatchSql = source.slice(
+      source.indexOf('"WITH exact_dispatch AS ("'),
+      source.indexOf('"),",\n        "authority_binding AS ("'),
+    );
+    assert.doesNotMatch(exactDispatchSql, /agent_id=|model=/);
+    assert.match(source, /value\.dispatch\.agent_id !== config\.agentId/);
+    assert.match(source, /authority\.dispatch_model !== value\.dispatch\.model/);
+    assert.doesNotMatch(source, /billing_request_id !== turnTraceId/);
+    assert.match(source, /ccb_authority_dispatch_attempt/);
+    assert.match(source, /codex_server_trace/);
+    assert.match(source, /CCB final billing evidence did not become exact in 60s/);
     assert.match(source, /socket\.addEventListener\("close"/);
     assert.match(source, /connection\.closes \+= 1/);
     assert.match(source, /runtime\.finals !== 1/);
