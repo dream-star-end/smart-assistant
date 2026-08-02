@@ -514,6 +514,12 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       "uncertain prepare commits must be recoverable by caller-known nonce and manifest",
     );
     assert.match(REMOTE_HELPER_SOURCE, /function inspectDynamicInputs\(\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /synthetic eval tmpfs targets are not exact/);
+    assert.match(REMOTE_HELPER_SOURCE, /synthetic eval tmpfs options are not exact/);
+    assert.match(REMOTE_HELPER_SOURCE, /restored standard container retains synthetic eval scratch tmpfs/);
+    assert.match(REMOTE_HELPER_SOURCE, /browserCliScratch:scratch/);
+    assert.match(REMOTE_HELPER_SOURCE, /browserMcpScratch:scratch/);
+    assert.match(REMOTE_HELPER_SOURCE, /persistentScratch: dockerExecJson/);
     assert.match(REMOTE_HELPER_SOURCE, /function inspectTurnEvidence\(\)/);
     assert.match(REMOTE_HELPER_SOURCE, /function inspectWorkspaceArtifacts\(\)/);
     assert.match(REMOTE_HELPER_SOURCE, /const WORKSPACE_CAPTURE_SOURCE =/);

@@ -98,11 +98,24 @@ function armEvidence(
     userSoul: { state: "file", bytes: 13, sha256: digest("user-soul") },
     userProfile: { state: "file", bytes: 14, sha256: digest("user-profile") },
     userSkills: { state: "tree", files: 4, directories: 2, sha256: digest("user-skills") },
-    workspace: { state: "tree", files: 1, directories: 0, sha256: digest("workspace") },
+  };
+  const emptyScratch = {
+    state: "tree",
+    files: 0,
+    directories: 0,
+    sha256: digest(""),
+    uid: 1000,
+    gid: 1000,
+    mode: 0o700,
+  };
+  const persistentScratch = {
+    workspace: { state: "tree", files: 8, directories: 0, sha256: digest("persistent-workspace") },
+    browserCli: { state: "tree", files: 2, directories: 0, sha256: digest("persistent-browser-cli") },
+    browserMcp: { state: "tree", files: 0, directories: 0, sha256: digest("") },
   };
   const turnResultSha = digest(`turn-result-${arm}`);
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     status: "completed",
     arm,
     uid: 247,
@@ -127,6 +140,9 @@ function armEvidence(
         manifestSha: digest(`prepared-manifest-${arm}`),
         inputs: {
           ...structuredClone(persistentInputs),
+          workspace: structuredClone(emptyScratch),
+          browserCliScratch: structuredClone(emptyScratch),
+          browserMcpScratch: structuredClone(emptyScratch),
           temporaryWorkspace: { state: "absent" },
         },
       },
@@ -136,6 +152,17 @@ function armEvidence(
         manifestSha: digest(`prepared-manifest-${arm}`),
         inputs: {
           ...structuredClone(persistentInputs),
+          workspace: {
+            ...structuredClone(emptyScratch),
+            files: 1,
+            sha256: digest(`workspace-scratch-${arm}`),
+          },
+          browserCliScratch: {
+            ...structuredClone(emptyScratch),
+            files: 1,
+            sha256: digest(`browser-scratch-${arm}`),
+          },
+          browserMcpScratch: structuredClone(emptyScratch),
           temporaryWorkspace: {
             ...structuredClone(artifactIdentity),
           },
@@ -186,6 +213,14 @@ function armEvidence(
       usage: arm === "A" ? 22 : 24,
       container: (arm === "A" ? "5" : "6").repeat(64),
     }),
+    standardBefore: {
+      standard: true,
+      persistentScratch: structuredClone(persistentScratch),
+    },
+    restored: {
+      standard: true,
+      persistentScratch: structuredClone(persistentScratch),
+    },
     turn: {
       source: {
         path: `/ignored/${arm}/turn-result.json`,
@@ -360,7 +395,7 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
     assert.deepEqual(result.efficiencyRaw.B, fixture.evidence.B.efficiency);
     assert.equal("winner" in result, false);
     assert.equal("recommendation" in result, false);
-    assert.equal(result.schemaVersion, 3);
+    assert.equal(result.schemaVersion, 4);
     assert.equal(result.identity.billingBindingMode, "ccb_authority_dispatch_attempt");
     assert.equal(result.workspaceArtifacts.A.files, 1);
     assert.equal(result.workspaceArtifacts.B.files, 1);
@@ -628,6 +663,40 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
       () => aggregatePair(unsafePost.armAPath, unsafePost.armBPath),
       /post state must be absent or tree/,
     );
+
+    const dirtyScratch = makeFixture();
+    dirtyScratch.evidence.B.dynamicInputs.pre.inputs.workspace.files = 1;
+    dirtyScratch.evidence.B.dynamicInputs.pre.inputs.workspace.sha256 =
+      digest("dirty-scratch");
+    rewriteArmB(dirtyScratch);
+    assert.throws(
+      () => aggregatePair(dirtyScratch.armAPath, dirtyScratch.armBPath),
+      /isolated scratch pre identity is invalid/,
+    );
+
+    const persistentScratchDrift = makeFixture();
+    persistentScratchDrift.evidence.B.restored.persistentScratch.workspace.sha256 =
+      digest("persistent-scratch-drift");
+    rewriteArmB(persistentScratchDrift);
+    assert.throws(
+      () => aggregatePair(
+        persistentScratchDrift.armAPath,
+        persistentScratchDrift.armBPath,
+      ),
+      /persistent scratch before\/restore differs/,
+    );
+
+    const absentPersistentScratch = makeFixture();
+    (absentPersistentScratch.evidence.B.standardBefore.persistentScratch as
+      Record<string, unknown>).browserMcp = { state: "absent" };
+    rewriteArmB(absentPersistentScratch);
+    assert.throws(
+      () => aggregatePair(
+        absentPersistentScratch.armAPath,
+        absentPersistentScratch.armBPath,
+      ),
+      /browserMcp tree identity is invalid/,
+    );
   });
 
   test("rejects incomplete/wrong arms and invalid manifest or turn hashes", () => {
@@ -635,7 +704,7 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
       [
         "schema version",
         (value) => value.schemaVersion = 1,
-        /schemaVersion must be 3/,
+        /schemaVersion must be 4/,
       ],
       ["status", (value) => value.status = "failed", /status must be completed/],
       ["arm", (value) => value.arm = "A", /arm must be B/],

@@ -48,6 +48,8 @@ import {
 import {
   SYNTHETIC_EVAL_MANIFEST_LABEL,
   SYNTHETIC_EVAL_NONCE_LABEL,
+  SYNTHETIC_EVAL_SCRATCH_TMPFS_OPTIONS,
+  SYNTHETIC_EVAL_SCRATCH_TMPFS_TARGETS,
   SYNTHETIC_EVAL_UID_LABEL,
   syntheticEvalOverlayLabels,
   type SyntheticEvalOverlaySpec,
@@ -639,6 +641,25 @@ describe("V5 synthetic exact-eval overlay container wiring", () => {
     assert.equal(opts.Labels?.[SYNTHETIC_EVAL_MANIFEST_LABEL], overlaySpec.manifestSha);
     assert.equal(opts.Labels?.[SYNTHETIC_EVAL_NONCE_LABEL], overlaySpec.nonce);
     assert.equal(opts.Labels?.[SYNTHETIC_EVAL_UID_LABEL], "247");
+    assert.deepEqual(
+      Object.fromEntries(
+        Object.entries(
+          (opts.HostConfig as { Tmpfs?: Record<string, string> } | undefined)
+            ?.Tmpfs ?? {},
+        )
+          .filter(([target]) =>
+            SYNTHETIC_EVAL_SCRATCH_TMPFS_TARGETS.includes(
+              target as (typeof SYNTHETIC_EVAL_SCRATCH_TMPFS_TARGETS)[number],
+            )
+          ),
+      ),
+      Object.fromEntries(
+        SYNTHETIC_EVAL_SCRATCH_TMPFS_TARGETS.map((target) => [
+          target,
+          SYNTHETIC_EVAL_SCRATCH_TMPFS_OPTIONS,
+        ]),
+      ),
+    );
     assert.equal(activated, "1".padStart(64, "0"));
   });
 
@@ -654,6 +675,21 @@ describe("V5 synthetic exact-eval overlay container wiring", () => {
     wiredDeps.ccbBaselineDir = stableBaseline;
     wiredDeps.syntheticEvalOverlay = fakeOverlay(true);
     await provisionV3Container(wiredDeps, 123);
+    assert.deepEqual(wired.captured.lastCreateOpts, plain.captured.lastCreateOpts);
+  });
+
+  test("synthetic UID without a prepared record keeps the standard container spec", async () => {
+    const plainPool = new FakePool();
+    const wiredPool = new FakePool();
+    const plain = makeDocker();
+    const wired = makeDocker();
+    const plainDeps = makeDeps(plain.docker, plainPool);
+    plainDeps.ccbBaselineDir = stableBaseline;
+    await provisionV3Container(plainDeps, 247);
+    const wiredDeps = makeDeps(wired.docker, wiredPool);
+    wiredDeps.ccbBaselineDir = stableBaseline;
+    wiredDeps.syntheticEvalOverlay = fakeOverlay(false);
+    await provisionV3Container(wiredDeps, 247);
     assert.deepEqual(wired.captured.lastCreateOpts, plain.captured.lastCreateOpts);
   });
 

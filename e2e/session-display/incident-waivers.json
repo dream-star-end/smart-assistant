@@ -61,6 +61,12 @@
       "reason": "exact synthetic eval 校准的版本化 helper 把带 psql 变量的固定 SELECT 通过 -c 发送，变量未展开而在任何支持的容器 restart 前失败；既有标准合成容器、真实用户、计费和生产流量均未改变。本提交仅改为 psql stdin 以恢复既定变量契约。",
       "approvedBy": "dx 2026-07-31 指示继续并以通用、多类活跃用户任务的严格评测验证 Agent 效率改进",
       "expiresAt": "2026-08-31"
+    },
+    {
+      "commit": "e3a551c8d6276f8b0dc917c37773f22a51a9731c",
+      "reason": "exact synthetic eval 的 baseline 合成 arm 在隔离评测账号内合法写入 scratch，却被评测器误判为输入漂移；本提交只隔离并精确验证评测 scratch。无真实用户、真实用户计费或生产流量切换影响；仅隔离合成账号产生了预期且精确绑定的评测 usage/ledger，无计费异常。",
+      "approvedBy": "dx 2026-08-02 指示继续直到完整上线，并以通用、多活跃用户任务做严格评测",
+      "expiresAt": "2026-09-02"
     }
   ]
 }
