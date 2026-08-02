@@ -31,6 +31,19 @@ export const isPersistedClientMessageId = (value: unknown): value is string =>
   typeof value === 'string' && PERSISTED_CLIENT_MESSAGE_ID_RE.test(value)
 const ClientMessageId = Type.String({ pattern: CLIENT_MESSAGE_ID_PATTERN })
 
+/**
+ * Server-persisted workspace policy for a client session. The commercial
+ * master strips browser input and injects the authoritative database value;
+ * gateways use it only to choose the session's default cwd.
+ */
+export const SessionWorkspaceMode = Type.Union([
+  Type.Literal('legacy'),
+  Type.Literal('isolated_v1'),
+])
+export type SessionWorkspaceMode = Static<typeof SessionWorkspaceMode>
+export const parseSessionWorkspaceMode = (value: unknown): SessionWorkspaceMode | null =>
+  value === 'legacy' || value === 'isolated_v1' ? value : null
+
 export const GoalStateSnapshotSchema = Type.Object({
   sessionId: Type.String(),
   goalId: Type.String({ format: 'uuid' }),
@@ -227,6 +240,9 @@ export const InboundMessage = Type.Object({
   /** Master-only turn attribution. Browser input is stripped before this field
    * is populated; the container treats it as immutable for the whole turn. */
   _goalState: Type.Optional(Type.Union([GoalStateSnapshotSchema, Type.Null()])),
+  /** Master-only, database-authoritative default workspace policy. Browser
+   * input is always stripped before the master injects this field. */
+  _workspaceMode: Type.Optional(SessionWorkspaceMode),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>

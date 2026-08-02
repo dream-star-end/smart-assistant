@@ -58,9 +58,11 @@ import {
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
   turnRecoveryIdentity,
+  parseSessionWorkspaceMode,
   type DurableCodexBilling,
   type LosslessTurnTapeFinalizeRequest,
   type LosslessTurnTapePartRequest,
+  type SessionWorkspaceMode,
 } from "@openclaude/protocol";
 import {
   type AppendCostCreditsResult,
@@ -465,6 +467,7 @@ interface SessionWriteRow {
   deleted_at: string | null;
   archived_through_seq: number | null;
   archived_count: number | null;
+  workspace_mode: string;
 }
 
 const USER_MESSAGE_INLINE_BYTES = 256 * 1024;
@@ -589,27 +592,45 @@ function seqOfMessage(msgs: MessageLike[], id: string): number | undefined {
   return typeof hit?._seq === "number" ? hit._seq : undefined;
 }
 
+type PgAppendCoreResult = ServerAuthoredAppendResult & {
+  seq?: number;
+  workspaceMode?: SessionWorkspaceMode;
+};
+
+function stripWorkspaceMode(
+  result: PgAppendCoreResult,
+): ServerAuthoredAppendResult & { seq?: number } {
+  const { workspaceMode: _workspaceMode, ...publicResult } = result;
+  return publicResult;
+}
+
 async function pgAppendServerAuthoredCore(
   client: PoolClient,
   sessId: string,
   userId: string,
   message: MessageLike & { id: string },
-): Promise<ServerAuthoredAppendResult & { seq?: number }> {
+): Promise<PgAppendCoreResult> {
   const row = (
     await client.query<SessionWriteRow>(
-      "SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
+      "SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count, workspace_mode FROM client_sessions WHERE id = $1 AND user_id = $2 FOR UPDATE",
       [sessId, userId],
     )
   ).rows[0];
   if (!row) return { applied: false, reason: "session_not_found" };
   if (row.deleted_at !== null) return { applied: false, reason: "session_deleted" };
+  const workspaceMode = parseSessionWorkspaceMode(row.workspace_mode);
+  if (workspaceMode === null) {
+    throw new Error(`client_sessions.workspace_mode invalid for ${sessId}`);
+  }
 
   // 幂等升级(热尾巴+归档):id 已归档视为 already_exists(防 sink 重放把归档搬回尾巴)。
   const archivedHit = await client.query(
     "SELECT 1 FROM client_session_archived_ids WHERE session_id = $1 AND msg_id = $2",
     [sessId, message.id],
   );
-  if ((archivedHit.rowCount ?? 0) > 0) return { applied: false, reason: "already_exists" };
+  if ((archivedHit.rowCount ?? 0) > 0) {
+    return { applied: false, reason: "already_exists", workspaceMode };
+  }
 
   let msgs: MessageLike[];
   try {
@@ -630,7 +651,12 @@ async function pgAppendServerAuthoredCore(
   const plan = planAppendServerAuthored(msgs, plannedMessage, currentNextSeq, bigIntNumOr(row.archived_through_seq, 0));
   if (plan.kind === "already_exists") {
     // 幂等重发:该消息行已在热尾巴,回其现有 _seq 供 admit 复用 anchor(dispatch 通常也已存在)。
-    return { applied: false, reason: "already_exists", seq: seqOfMessage(msgs, message.id) };
+    return {
+      applied: false,
+      reason: "already_exists",
+      seq: seqOfMessage(msgs, message.id),
+      workspaceMode,
+    };
   }
   if (plan.kind === "oversized") return { applied: false, reason: "oversized" };
 
@@ -655,7 +681,7 @@ async function pgAppendServerAuthoredCore(
     return { applied: false, reason: "session_deleted" };
   }
   // 新 append 的消息拿到的 _seq = admit 的 anchor_seq(user 行顺序键)。
-  return { applied: true, seq: seqOfMessage(tail, message.id) };
+  return { applied: true, seq: seqOfMessage(tail, message.id), workspaceMode };
 }
 
 /**
@@ -669,7 +695,7 @@ export async function appendPromptQueueUserMessageInTransaction(
   userId: string,
   message: MessageLike & { id: string; role: "user" },
 ): Promise<ServerAuthoredAppendResult> {
-  return pgAppendServerAuthoredCore(client, sessionId, userId, message);
+  return stripWorkspaceMode(await pgAppendServerAuthoredCore(client, sessionId, userId, message));
 }
 
 // ── wechat_bindings 行 → 领域对象(复刻 storage/wechatBindings.ts 的私有 rowToBinding;
@@ -985,7 +1011,7 @@ export interface AdmitUserTurnInput {
 }
 
 export type AdmitUserTurnResult =
-  | AdmitDispatchResult
+  | (AdmitDispatchResult & { workspaceMode: SessionWorkspaceMode })
   | { kind: "session_not_found" }
   | { kind: "session_deleted" }
   | { kind: "recovery_conflict"; reason: string }
@@ -1008,6 +1034,12 @@ export interface TurnTapeStateResult {
 export interface DispatchAdmissionBackend {
   /** 单事务:幂等 append user 行 → 取 _seq → UPSERT dispatch 冲突表裁定(RFC §2.1)。 */
   admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult>;
+  /** Read the server-persisted cwd policy for lanes whose user row was
+   * materialized before this bridge invocation (for example prompt queue). */
+  getClientSessionWorkspaceMode(
+    sessionId: string,
+    sessionUserId: string,
+  ): Promise<SessionWorkspaceMode | null>;
   /** 容器 boot recovery 用:按 dispatch 身份查 tape 三态(none/partial/finalized)+ 精确 status。 */
   getTurnTapeStateByDispatch(
     userId: string,
@@ -5826,7 +5858,7 @@ export function createPgSessionsBackend(
         // 2) anchor_seq = 该 user 行的 _seq(会话顺序键;不在热尾巴时 null)。
         const anchorSeq = typeof appended.seq === "number" ? BigInt(appended.seq) : null;
         // 3) UPSERT dispatch + 冲突表裁定(同一 tx,受理即拥有 I1)。
-        return admitDispatch(client, {
+        const dispatch = await admitDispatch(client, {
           dispatchId: input.dispatchId,
           userId: input.uid,
           sessionId: input.sessionId,
@@ -5840,7 +5872,31 @@ export function createPgSessionsBackend(
           ...(input.leaseTtlMs !== undefined ? { leaseTtlMs: input.leaseTtlMs } : {}),
           ...(input.now !== undefined ? { now: input.now } : {}),
         });
+        if (appended.workspaceMode === undefined) {
+          throw new Error(`workspace mode missing after append for ${input.sessionId}`);
+        }
+        return { ...dispatch, workspaceMode: appended.workspaceMode };
       });
+    },
+
+    async getClientSessionWorkspaceMode(
+      sessionId: string,
+      sessionUserId: string,
+    ): Promise<SessionWorkspaceMode | null> {
+      const row = (
+        await pool.query<{ workspace_mode: string }>(
+          `SELECT workspace_mode
+             FROM client_sessions
+            WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+          [sessionId, sessionUserId],
+        )
+      ).rows[0];
+      if (!row) return null;
+      const workspaceMode = parseSessionWorkspaceMode(row.workspace_mode);
+      if (workspaceMode === null) {
+        throw new Error(`client_sessions.workspace_mode invalid for ${sessionId}`);
+      }
+      return workspaceMode;
     },
 
     async getTurnTapeStateByDispatch(
@@ -6987,7 +7043,7 @@ export function createPgSessionsBackend(
           if (pending && (r.reason === "session_deleted" || r.reason === "oversized")) {
             await client.query("DELETE FROM pending_usage_patches WHERE request_id = $1 AND user_id = $2", [requestId, userId]);
           }
-          return r;
+          return stripWorkspaceMode(r);
         }
 
         // 插 map(existingMap 已在上面 FOR UPDATE 校验一致;不存在则新插)。advisory_xact_lock 已
@@ -7056,7 +7112,7 @@ export function createPgSessionsBackend(
         }
 
         const r = await pgAppendServerAuthoredCore(client, sessId, userId, msgToWrite);
-        if (!r.applied) return r;
+        if (!r.applied) return stripWorkspaceMode(r);
 
         if (pendings.length) {
           for (const p of pendings) {

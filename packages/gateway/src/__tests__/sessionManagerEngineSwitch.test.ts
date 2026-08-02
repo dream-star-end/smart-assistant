@@ -58,6 +58,56 @@ const KEY = "agent:main:webchat:dm:switch-peer";
 const mainAgent = { id: "main", model: "glm-5.2" } as AgentDef;
 
 describe("跨 engine 切模型(glm-5.2 ↔ gpt-5.6-sol 同 sessionKey)", () => {
+  test("legacy prewarm → authoritative isolated_v1 recycles the idle runner", async () => {
+    const { sm } = makeSm();
+    const pinnedCwdAgent = { ...mainAgent, cwd: process.cwd() } as AgentDef;
+    const prewarmed = await sm.getOrCreate({
+      sessionKey: KEY,
+      agent: pinnedCwdAgent,
+      channel: "webchat",
+      peerId: "switch-peer",
+    });
+    assert.equal(prewarmed.workspaceMode, "legacy");
+    let shutdown = false;
+    const originalShutdown = prewarmed.runner.shutdown.bind(prewarmed.runner);
+    prewarmed.runner.shutdown = async () => {
+      shutdown = true;
+      await originalShutdown();
+    };
+    const isolated = await sm.getOrCreate({
+      sessionKey: KEY,
+      agent: pinnedCwdAgent,
+      channel: "webchat",
+      peerId: "switch-peer",
+      workspaceMode: "isolated_v1",
+    });
+    assert.equal(shutdown, true);
+    assert.notEqual(isolated, prewarmed);
+    assert.equal(isolated.workspaceMode, "isolated_v1");
+  });
+
+  test("engine replacement preserves an existing isolated mode when caller omits it", async () => {
+    const { sm } = makeSm();
+    const pinnedCwdAgent = { ...mainAgent, cwd: process.cwd() } as AgentDef;
+    const isolated = await sm.getOrCreate({
+      sessionKey: KEY,
+      agent: pinnedCwdAgent,
+      channel: "webchat",
+      peerId: "switch-peer",
+      model: "glm-5.2",
+      workspaceMode: "isolated_v1",
+    });
+    const switched = await sm.getOrCreate({
+      sessionKey: KEY,
+      agent: pinnedCwdAgent,
+      channel: "webchat",
+      peerId: "switch-peer",
+      model: "gpt-5.6-sol",
+    });
+    assert.notEqual(switched, isolated);
+    assert.equal(switched.workspaceMode, "isolated_v1");
+  });
+
   test("ccb → codex:teardown 旧 runner,resume-map/cost 基线不串", async () => {
     const { sm, ins } = makeSm();
     const ccbSession = await sm.getOrCreate({

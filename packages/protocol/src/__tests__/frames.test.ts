@@ -124,6 +124,20 @@ describe('InboundMessage schema', () => {
   it('accepts frame without traceId / clientTraceId (backward compat)', () => {
     assert.equal(Value.Check(InboundMessage, baseInbound()), true)
   })
+  it('accepts only declared master workspace modes', () => {
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      _workspaceMode: 'legacy',
+    }), true)
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      _workspaceMode: 'isolated_v1',
+    }), true)
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      _workspaceMode: 'isolated_v2',
+    }), false)
+  })
   it('accepts exact browser displayText alongside a different model prompt', () => {
     assert.equal(Value.Check(InboundMessage, {
       ...(baseInbound() as object),

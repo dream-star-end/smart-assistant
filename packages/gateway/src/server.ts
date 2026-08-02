@@ -47,6 +47,7 @@ import {
   REVIEW_VERDICT_PASS,
   REVIEW_VERDICT_NEEDS_FIX,
   newTraceId,
+  parseSessionWorkspaceMode,
   parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
   CODEX_ENGINE_MODEL_IDS,
@@ -9366,6 +9367,7 @@ export class Gateway {
   }): {
     sessionKey: string
     repoSessionId?: string
+    workspaceMode: 'legacy' | 'isolated_v1'
     billingParentTurnKey?: string
     platformGoal?: GoalStateSnapshot | null
   } | null {
@@ -9379,6 +9381,7 @@ export class Gateway {
     return {
       sessionKey: parent.sessionKey,
       repoSessionId: parent.repoSessionId ?? parent.peerId,
+      workspaceMode: parent.workspaceMode,
       // A nested delegate must keep charging the root user-visible turn. Its
       // direct parent turn is an ephemeral delegate session and has no master
       // tape/anchor of its own.
@@ -9842,6 +9845,7 @@ export class Gateway {
         channel: 'delegate',
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
+        workspaceMode: delegateParent?.workspaceMode,
         // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
         parentSessionKey: delegateParent?.sessionKey,
         title: `[delegate] ${goal.slice(0, 40)}`,
@@ -13332,6 +13336,7 @@ export class Gateway {
       frame.channel === 'webchat' && isClientMessageId((frame as any).clientMessageId)
         ? (frame as any).clientMessageId
         : undefined
+    const safeWorkspaceMode = parseSessionWorkspaceMode((frame as any)._workspaceMode) ?? undefined
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
@@ -13424,6 +13429,7 @@ export class Gateway {
       // this the handleResult hook calls `getClientSession(peerId)`, gets
       // null, and silently drops the reply.
       userId: activeUserId,
+      workspaceMode: safeWorkspaceMode,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
       // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。

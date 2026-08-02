@@ -75,6 +75,7 @@ async function startRig(opts: {
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   loadGoalState?: UserChatBridgeDeps["loadGoalState"];
   persistMasterUserMessage?: UserChatBridgeDeps["persistMasterUserMessage"];
+  loadSessionWorkspaceMode?: UserChatBridgeDeps["loadSessionWorkspaceMode"];
   logger?: Logger;
   getFrontendBuildId?: () => string | null;
 } = {}): Promise<TestRig> {
@@ -112,6 +113,7 @@ async function startRig(opts: {
     loadMasterSessionMessages: opts.loadMasterSessionMessages,
     loadGoalState: opts.loadGoalState,
     persistMasterUserMessage: opts.persistMasterUserMessage,
+    loadSessionWorkspaceMode: opts.loadSessionWorkspaceMode,
     logger: opts.logger,
     getFrontendBuildId: opts.getFrontendBuildId,
   });
@@ -1198,6 +1200,78 @@ describe("userChatBridge — model authorization", () => {
     }
   });
 
+  test("browser workspace mode is stripped and replaced with the database authority", async () => {
+    const rig = await startRig({
+      persistMasterUserMessage: async () => ({ applied: true }),
+      loadSessionWorkspaceMode: async (uid, sessionId) => {
+        assert.equal(uid, 211n);
+        assert.equal(sessionId, "sess-workspace-authority");
+        return "isolated_v1";
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("211"));
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      const containerWs = await containerOpenP;
+      const forwardedP = new Promise<Record<string, unknown>>((resolve) => {
+        containerWs.once("message", (data) => resolve(JSON.parse(data.toString())));
+      });
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-workspace-authority", kind: "dm" },
+        clientMessageId: "m-workspace-authority",
+        idempotencyKey: "web:m-workspace-authority:0",
+        content: { text: "isolate me" },
+        _workspaceMode: "legacy",
+      }));
+      const forwarded = await forwardedP;
+      assert.equal(forwarded._workspaceMode, "isolated_v1");
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("an unavailable authoritative workspace mode rejects before container execution", async () => {
+    const rig = await startRig({
+      persistMasterUserMessage: async () => ({ applied: true }),
+      loadSessionWorkspaceMode: async () => null,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("212"));
+      const frames = frameCollector(ws);
+      await new Promise<void>((resolve) => ws.once("open", () => resolve()));
+      await containerOpenP;
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-workspace-missing", kind: "dm" },
+        clientMessageId: "m-workspace-missing",
+        idempotencyKey: "web:m-workspace-missing:0",
+        content: { text: "must not execute" },
+      }));
+      let errorFrame: { type?: string; code?: string } = {};
+      for (let i = 0; i < 3 && errorFrame.type !== "error"; i++) {
+        errorFrame = JSON.parse(await frames.next()) as { type?: string; code?: string };
+      }
+      assert.equal(errorFrame.type, "error");
+      assert.equal(errorFrame.code, "SESSION_WORKSPACE_UNAVAILABLE");
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      assert.equal(
+        rig.containerSeen.some(({ data }) => data.toString().includes("must not execute")),
+        false,
+      );
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
   test("completed clientMessageId deduplicates with exact ACK and no container execution", async () => {
     const rig = await startRig({
       persistMasterUserMessage: async () => ({ applied: false, reason: "already_exists" }),
@@ -2063,14 +2137,14 @@ describe("userChatBridge — CG2a canonical traceId injection", () => {
     assert.match(frame.traceId as string, /^[a-f0-9]{32}$/, "32-hex from randomBytes");
     assert.ok(!("clientTraceId" in frame), "无 clientTraceId 字段(未传)");
     // V3 S12e CG10 — Contract 5a 私字段-absence 回归保护:bridge inbound
-    // forward 路径绝不能把任何 `_`-prefix routing 字段(_userId / _traceId /
-    // _connectionTraceId 等)stamp 到过线的 wire frame 上。私字段只属于
-    // gateway-side stash,跨进程 leak 会破坏 contract A/B 的私公分离。
+    // forward 路径除显式协议化的 master-owned workspace authority 外,不能把
+    // `_userId` / `_traceId` / `_connectionTraceId` 等 gateway stash 泄到 wire。
     const privateKeys = Object.keys(frame).filter((k) => k.startsWith("_"));
     assert.deepEqual(
-      privateKeys, [],
+      privateKeys, ["_workspaceMode"],
       `wire frame must not carry _-prefixed private fields; got: ${privateKeys.join(",")}`,
     );
+    assert.equal(frame._workspaceMode, "legacy");
 
     const turnLog = logs.find((l) => l.msg === TURN_START_MSG);
     assert.ok(turnLog, "找不到 turn start log");

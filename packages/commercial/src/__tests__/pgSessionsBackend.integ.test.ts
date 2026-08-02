@@ -71,6 +71,7 @@ const MIGRATION_0173 = path.resolve(here, "../db/migrations/0173_client_session_
 const MIGRATION_0176 = path.resolve(here, "../db/migrations/0176_direct_turn_timeline.sql");
 const MIGRATION_0177 = path.resolve(here, "../db/migrations/0177_unified_client_timeline.sql");
 const MIGRATION_0181 = path.resolve(here, "../db/migrations/0181_turn_tape_recovery_links.sql");
+const MIGRATION_0196 = path.resolve(here, "../db/migrations/0196_client_session_workspace_mode.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -196,6 +197,7 @@ before(async () => {
     INSERT INTO users(id) VALUES (1)
   `);
   await pool.query(await readFile(MIGRATION_0181, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0196, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -373,6 +375,26 @@ describe("pgSessionsBackend contract", () => {
     assert.equal(got.title, "新会话");
     assert.equal((got.messages as MessageLike[]).length, 1);
     assert.equal((got.messages as MessageLike[])[0].id, "m-1");
+  });
+
+  maybe("workspace mode defaults legacy and the authority reader returns exact persisted mode", async () => {
+    const sessionId = "s-workspace-mode";
+    const userId = "u-workspace-mode";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    assert.equal(await backend.getClientSessionWorkspaceMode(sessionId, userId), "legacy");
+    await pool.query(
+      "UPDATE client_sessions SET workspace_mode='isolated_v1' WHERE id=$1 AND user_id=$2",
+      [sessionId, userId],
+    );
+    assert.equal(await backend.getClientSessionWorkspaceMode(sessionId, userId), "isolated_v1");
+    await assert.rejects(
+      pool.query(
+        "UPDATE client_sessions SET workspace_mode='unknown' WHERE id=$1 AND user_id=$2",
+        [sessionId, userId],
+      ),
+      /check constraint/i,
+    );
+    assert.equal(await backend.getClientSessionWorkspaceMode("missing-session", userId), null);
   });
 
   maybe("history revision 匹配才 partial，PUT 缺席删除 bump 并强制 full", async () => {
@@ -4541,6 +4563,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     await backend.upsertClientSession(mkSession({ id: "s-dd-admit-1", userId: CUSER }));
     const fresh = await backend.admitUserTurn(admitInput());
     assert.equal(fresh.kind, "admitted");
+    assert.equal("workspaceMode" in fresh ? fresh.workspaceMode : null, "legacy");
     const d0 = (fresh as { dispatch: { dispatchId: string; anchorSeq: bigint | null } }).dispatch;
     assert.ok(d0.anchorSeq !== null, "受理事务内应带回 user 行 anchorSeq");
     // user 行已幂等落库(受理与 append 同事务)。

@@ -4934,6 +4934,12 @@ export async function registerCommercial(
     admitUserTurn: dispatchAdmissionBackend
       ? (input) => dispatchAdmissionBackend!.admitUserTurn(input)
       : undefined,
+    loadSessionWorkspaceMode: dispatchAdmissionBackend
+      ? (uid, sessionId) => dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
+          sessionId,
+          MASTER_USER_PREFIX + uid.toString(),
+        )
+      : undefined,
     // plan v3 G5/G7 → M2 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
     codexBinding,

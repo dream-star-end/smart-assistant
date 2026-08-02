@@ -107,6 +107,7 @@ import {
   modelHistorySemanticText,
   newTraceId,
   normalizeMessageReplyQuote,
+  parseSessionWorkspaceMode,
   parseTraceIdCandidate,
   stripModelAuthorityField,
   turnRecoveryIdentity,
@@ -117,6 +118,7 @@ import {
   type GoalStateSnapshot,
   type MessageReplyQuote,
   type DispatchRequestContent,
+  type SessionWorkspaceMode,
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
@@ -982,11 +984,18 @@ export interface UserChatBridgeDeps {
   ) => Promise<{
     applied: boolean;
     reason?: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized";
+    workspaceMode?: SessionWorkspaceMode;
   }>;
   /** durable turn dispatch 受理面(RFC-v5-durable-turn-dispatch §2.1)。注入且容器 attest
    * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
    * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
+  /** Authoritative session cwd policy. V5 production always injects this;
+   * legacy/test compositions may omit it and retain the shared workspace. */
+  loadSessionWorkspaceMode?: (
+    uid: bigint,
+    sessionId: string,
+  ) => Promise<SessionWorkspaceMode | null>;
   /**
    * plan v3 G5/G7 — codex per-account 并发槽 + 严格单飞 acquire/release。
    *
@@ -2965,6 +2974,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 失败出口(goal unavailable / sanitize 抛 / 任意异常 / 未预期早 return)必须据此 CAS terminal +
       // drop,否则留 admitted 永续租孤儿 + 无可见终态(违反 I1)。成功交棒调用方前置空(所有权移交)。
       let admittedThisFrame: string | null = null;
+      let sessionWorkspaceMode: SessionWorkspaceMode | null = null;
 
       // 主会话历史**只读一次**,给「dispatch 受理前 dedup」与「受理/持久化后 enrichment」共用。
       // fail-open:读失败绝不阻断受理/转发(历史只是 UX 上下文,不是 authz/billing)。
@@ -3158,6 +3168,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             );
             return null;
           }
+          if ("workspaceMode" in admit) {
+            sessionWorkspaceMode = parseSessionWorkspaceMode(admit.workspaceMode);
+          }
           // R4-B1:cleaned 检查**不得**早于 admitted 接管 —— admit await 期间连接可能已 cleanup,
           // 提交成功的 dispatch 若在登记前 early return 就成了孤儿 lease(admitted 永续租、无
           // durable status)。顺序铁律:先接管所有权,再判连接死活;死了立即终态化。
@@ -3289,6 +3302,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             try {
               const result = await deps.persistMasterUserMessage(uid, peerId, message);
               if (result.applied || result.reason === "already_exists") {
+                sessionWorkspaceMode = parseSessionWorkspaceMode(result.workspaceMode);
                 persisted = true;
                 break;
               }
@@ -3324,11 +3338,39 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 终态化本帧受理的 dispatch —— try/finally 收口:成功交棒前置空 admittedThisFrame(所有权移交
       // 调用方,由它 lookupAdmittedDispatch 后走 failDispatchPreForward);未交棒即离开 → CAS terminal。
       try {
+        if (sessionWorkspaceMode === null) {
+          if (deps.loadSessionWorkspaceMode) {
+            try {
+              sessionWorkspaceMode = await deps.loadSessionWorkspaceMode(uid, peerId);
+            } catch (err) {
+              turnLog?.error("user-chat-bridge: load session workspace mode failed", {
+                sessionId: peerId,
+                err,
+              });
+            }
+            if (sessionWorkspaceMode === null) {
+              onReject?.("SESSION_WORKSPACE_UNAVAILABLE");
+              sendErrorFrame(
+                userWs,
+                "SESSION_WORKSPACE_UNAVAILABLE",
+                "session workspace unavailable; retry this turn shortly",
+                { peerId, clientMessageId },
+              );
+              return null;
+            }
+          } else {
+            // Non-commercial/legacy compositions have no PG workspace column.
+            sessionWorkspaceMode = "legacy";
+          }
+        }
         await ensureHistory();
         // legacy 路径的 dedup 在持久之后判定(dispatch 路径已在受理前 dedup,useDispatchAdmission 分支
         // 内 tryDedupCompleted 已消费;此处仅对 legacy 生效,避免二次 dedup 同一轮)。
         if (!useDispatchAdmission && await tryDedupCompleted()) return null;
-        let enriched = frameObj;
+        let enriched: Record<string, unknown> = {
+          ...frameObj,
+          _workspaceMode: sessionWorkspaceMode,
+        };
         if (rawHistory !== null) {
           const historical = _sanitizeMasterHistoricalMessagesForFrame(rawHistory, {
             ...(clientMessageId ? { excludeClientMessageId: clientMessageId } : {}),
@@ -3980,8 +4022,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             // sanitize:
             //   - 非法 clientTraceId 不透传给 container — 合法 / undefined 保留原 parsed
-            //   - __oc_codex_route 永远是 master-owned 私有字段;client 输入即使形状合法也必须剥离,
-            //     后面只有 server 侧 createCodexRoute 成功时才会重新注入。
+            //   - __oc_codex_route / _workspaceMode 永远是 master-owned 私有字段;
+            //     client 输入即使形状合法也必须剥离,后面只由 server 重新注入。
             //   - teamMode main 固定 GPT 队长:即使客户端传/省略其它 model 或省略
             //     agentId,转发给容器的 frame.agentId/model 也必须归一为
             //     main/DEFAULT_CODEX_ENGINE_MODEL,否则 master 已按 GPT 预扣/注 requestId,
@@ -3991,9 +4033,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "__oc_codex_route",
             );
+            const hasClientWorkspaceMode = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "_workspaceMode",
+            );
             if (
               (rawClientTrace !== undefined && !clientHint.ok) ||
               hasClientCodexRoute ||
+              hasClientWorkspaceMode ||
               teamModeMain
             ) {
               sanitizedParsed = { ...sanitizedParsed };
@@ -4002,6 +4049,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               if (hasClientCodexRoute) {
                 delete sanitizedParsed.__oc_codex_route;
+              }
+              if (hasClientWorkspaceMode) {
+                const { _workspaceMode: _discard, ...withoutWorkspaceMode } = sanitizedParsed;
+                sanitizedParsed = withoutWorkspaceMode;
               }
               if (teamModeMain) {
                 sanitizedParsed.agentId = "main";
