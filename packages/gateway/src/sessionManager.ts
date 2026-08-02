@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -61,6 +61,7 @@ import {
   type DurableGoalUsageRecord,
   type GoalStateSnapshot,
   type OutboundContentBlock,
+  type SessionWorkspaceMode,
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
 import { classifyRunError } from './errorClassify.js'
@@ -97,20 +98,35 @@ export function _tapeErrorCodeForGenericFailure(detail: string | undefined): str
  *
  * 设计 §3.2:商业版容器里 supervisor 注入 OPENCLAUDE_DEFAULT_WORKSPACE =
  * /home/agent/.openclaude/workspace(在 data named volume 内,容器重建后文件仍在);
- * entrypoint 负责 mkdir。这里只在「env 已设 **且** 目录已存在」时采用它,否则回落
- * process.cwd()(个人版/宿主机不设该 env → 行为与改造前逐字一致,零变化)。
- * 目录不存在时保守回落而非在此 mkdir:创建责任在 entrypoint,gateway 不擅自造目录。
+ * entrypoint 负责创建持久化根目录。legacy 模式只在「env 已设 **且** 目录已存在」
+ * 时采用它,否则回落 process.cwd()(个人版/宿主机不设该 env → 行为与改造前一致)。
+ * isolated_v1 只在该根目录内按可信 client session id 惰性创建 `sessions/<id>`;
+ * 根目录缺失时 fail closed,不把隔离会话悄悄落回共享 cwd。
  */
-export function resolveDefaultWorkspaceCwd(env: NodeJS.ProcessEnv = process.env): string {
+export function resolveDefaultWorkspaceCwd(
+  workspaceMode: SessionWorkspaceMode = 'legacy',
+  sessionId?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
   const ws = env.OPENCLAUDE_DEFAULT_WORKSPACE?.trim()
+  let baseDir: string | null = null
   if (ws) {
     try {
-      if (statSync(ws).isDirectory()) return ws
+      if (statSync(ws).isDirectory()) baseDir = ws
     } catch {
       // 目录不存在/不可 stat → 回落现状
     }
   }
-  return process.cwd()
+  if (workspaceMode === 'legacy') return baseDir ?? process.cwd()
+  if (baseDir === null) {
+    throw new Error('isolated session workspace requires OPENCLAUDE_DEFAULT_WORKSPACE')
+  }
+  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]{8,50}$/.test(sessionId)) {
+    throw new Error('isolated session workspace requires a valid client session id')
+  }
+  const sessionDir = join(baseDir, 'sessions', sessionId)
+  mkdirSync(sessionDir, { recursive: true })
+  return sessionDir
 }
 
 /**
@@ -446,6 +462,9 @@ export interface AgentSession {
    * webchat peerId here so nested delegate_task calls stay in the same repo.
    */
   repoSessionId?: string
+  /** Server-persisted default cwd policy. Delegates inherit their root web
+   * session's value so the whole task tree shares one isolated directory. */
+  workspaceMode: SessionWorkspaceMode
   /**
    * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
    * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
@@ -2670,6 +2689,9 @@ export class SessionManager {
      * impersonating that parent session identity.
      */
     repoSessionId?: string
+    /** Database-authoritative default cwd policy injected by the commercial
+     * master. Missing means legacy for prewarm/personal callers. */
+    workspaceMode?: SessionWorkspaceMode
     /**
      * 直接父会话键(仅 delegate 子会话传入,已由 handleDelegateTask 经 _resolveDelegateParent
      * 校验存在于内存 + channel 合法 + sourceAgent 匹配)。物化到 AgentSession.parentSessionKey,
@@ -2756,6 +2778,7 @@ export class SessionManager {
       requireAuthority: isModelAuthorityRequired(),
     })
     const existing = this.sessions.get(opts.sessionKey)
+    const workspaceMode = opts.workspaceMode ?? existing?.workspaceMode ?? 'legacy'
     if (existing) {
       // 跨 engine 切换判定:只有"caller 明确给了 model"/"有 master 权威"/"agent 显式 pin
       // 到 codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见 opts.model
@@ -2767,7 +2790,9 @@ export class SessionManager {
         opts.agent.provider === 'codex-native'
           ? engineId
           : existing.providerTag
-      if (existing.providerTag !== desiredEngine) {
+      const workspaceModeChanged =
+        opts.workspaceMode !== undefined && existing.workspaceMode !== workspaceMode
+      if (existing.providerTag !== desiredEngine || workspaceModeChanged) {
         if (
           this._promptQueueExecutionKeys.has(opts.sessionKey) ||
           (this._promptQueueDispatchFences.has(opts.sessionKey) && !ownsDispatchFence)
@@ -2785,7 +2810,11 @@ export class SessionManager {
           await existing.lock
           await existing.runner.shutdown()
         } catch (err) {
-          log.warn('engine-switch shutdown failed', { sessionKey: opts.sessionKey }, err)
+          log.warn('session-replacement shutdown failed', {
+            sessionKey: opts.sessionKey,
+            engineChanged: existing.providerTag !== desiredEngine,
+            workspaceModeChanged,
+          }, err)
         }
         this.sessions.delete(opts.sessionKey)
       } else {
@@ -2805,11 +2834,11 @@ export class SessionManager {
     }
     // 显式 pin 的 agent cwd(如 repo session)优先,永不被 workspace 缺省覆盖;
     // 仅在没有显式 cwd 时用 OPENCLAUDE_DEFAULT_WORKSPACE(存在且是目录)/否则 process.cwd()。
-    const cwd = opts.agent.cwd ?? resolveDefaultWorkspaceCwd()
+    const repoSessionId = opts.repoSessionId ?? opts.peerId
+    const cwd = opts.agent.cwd ?? resolveDefaultWorkspaceCwd(workspaceMode, repoSessionId)
     const persona = opts.hermeticNoTools
       ? undefined
       : opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
-    const repoSessionId = opts.repoSessionId ?? opts.peerId
     // M0/M1a engine 适配层:runner 构造收口到 registry factory。
     //   - executionModel / engineId 已在函数头部一次收口(见上方注释)——
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
@@ -2856,6 +2885,7 @@ export class SessionManager {
       channel: opts.channel ?? 'webchat',
       peerId: opts.peerId ?? 'unknown',
       userId: opts.userId,
+      workspaceMode,
       repoSessionId,
       title: opts.title ?? 'New conversation',
       // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度

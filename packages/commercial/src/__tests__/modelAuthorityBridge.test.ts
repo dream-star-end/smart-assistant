@@ -1020,6 +1020,7 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
   const now = new Date();
   return {
     kind: "admitted",
+    workspaceMode: "legacy",
     takeover: false,
     dispatch: {
       dispatchId: input.dispatchId,
@@ -1171,7 +1172,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
         admitUserTurn: async (input) => {
           const admitted = fakeAdmittedDispatch(input);
           assert.equal(admitted.kind, "admitted");
-          return { kind, dispatch: admitted.dispatch };
+          return { kind, dispatch: admitted.dispatch, workspaceMode: "legacy" };
         },
         hasCompletedClientTurn: async () => false,
       });
