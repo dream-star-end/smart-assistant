@@ -694,7 +694,13 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     || frameValue.connection?.opens !== 1
     || frameValue.connection?.closes !== 1
     || frameValue.connection?.reconnects !== 0
-    || frameValue.runtime?.login_requests !== 1
+    || !frameValue.runtime
+    || typeof frameValue.runtime !== "object"
+    || Object.keys(frameValue.runtime).sort().join(",")
+      !== "admin_access_token_issues,binding_queries,finals,inbound_messages,login_requests,matching_costs,prompt_captures,prompt_ready,prompt_watchers,session_puts,user_access_token_issues,websocket_instances"
+    || frameValue.runtime.login_requests !== 0
+    || frameValue.runtime.user_access_token_issues !== 1
+    || frameValue.runtime.admin_access_token_issues !== 0
     || frameValue.runtime?.session_puts !== 1
     || frameValue.runtime?.websocket_instances !== 1
     || frameValue.runtime?.inbound_messages !== 1
