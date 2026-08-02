@@ -19,10 +19,17 @@
  * 的 diff/内容据此边流边渲；_completed 后切完整 inputJson。
  */
 import { Check, ChevronRight } from "lucide-react";
-import { useState } from "react";
+import {
+  Component,
+  lazy,
+  Suspense,
+  type ErrorInfo,
+  type ReactNode,
+  useState,
+} from "react";
 import { cn } from "../lib/utils";
+import { isChunkLoadError } from "./ChunkErrorBoundary";
 import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
-import { ToolBody } from "./tool/bodies";
 import {
   type ToolLike,
   normalizeToolForDisplay,
@@ -31,6 +38,103 @@ import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { Badge, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
+
+type ToolBodiesModule = typeof import("./tool/bodies");
+let preloadedToolBodies: ToolBodiesModule | undefined;
+let toolBodiesPromise: Promise<ToolBodiesModule> | undefined;
+
+function importToolBodies(): Promise<ToolBodiesModule> {
+  toolBodiesPromise ??= import("./tool/bodies").then((module) => {
+    preloadedToolBodies = module;
+    return module;
+  });
+  return toolBodiesPromise;
+}
+
+/** Warm the optional tool-detail chunk without changing the synchronous shell. */
+export async function preloadToolBody(): Promise<void> {
+  await importToolBodies();
+}
+
+const LazyToolBody = lazy(() => {
+  if (preloadedToolBodies) {
+    const module = { default: preloadedToolBodies.ToolBody };
+    const resolvedModule = {
+      then(resolve: (value: typeof module) => unknown) {
+        resolve(module);
+      },
+    };
+    return resolvedModule as unknown as Promise<typeof module>;
+  }
+  return importToolBodies().then((module) => ({ default: module.ToolBody }));
+});
+
+type ToolBodyBoundaryProps = {
+  revision: string;
+  children: ReactNode;
+};
+type ToolBodyBoundaryState = {
+  failed: boolean;
+  failedRevision: string | null;
+  staleChunk: boolean;
+};
+
+/** Keep a failed optional body local to its card. Streaming data revisions
+ * retry ordinary render failures; stale chunk failures offer the only honest
+ * recovery path, a page refresh that fetches the current asset manifest. */
+class ToolBodyBoundary extends Component<
+  ToolBodyBoundaryProps,
+  ToolBodyBoundaryState
+> {
+  state: ToolBodyBoundaryState = {
+    failed: false,
+    failedRevision: null,
+    staleChunk: false,
+  };
+
+  static getDerivedStateFromError(error: unknown): Partial<ToolBodyBoundaryState> {
+    return { failed: true, staleChunk: isChunkLoadError(error) };
+  }
+
+  static getDerivedStateFromProps(
+    props: ToolBodyBoundaryProps,
+    state: ToolBodyBoundaryState,
+  ): Partial<ToolBodyBoundaryState> | null {
+    if (
+      state.failed &&
+      state.failedRevision !== null &&
+      state.failedRevision !== props.revision
+    ) {
+      return { failed: false, failedRevision: null, staleChunk: false };
+    }
+    return null;
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo) {
+    console.error("[ToolCard] 工具详情渲染失败", error, info.componentStack);
+    this.setState({ failedRevision: this.props.revision });
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-muted">
+        <span>
+          {this.state.staleChunk
+            ? "页面已更新，刷新后可加载完整工具内容。"
+            : "工具详情加载失败；数据更新后会自动重试。"}
+        </span>
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="rounded-full border border-border px-2.5 py-1 font-medium text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          刷新重试
+        </button>
+      </div>
+    );
+  }
+}
 
 // 图标底色按工具语义分色(对齐设计稿 .tic.tn-*);error 单独走红。
 const TONE_TILE: Record<string, string> = {
@@ -79,6 +183,16 @@ export function ToolCard({
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
   const hasBody = hasInput || hasOutput || isError || isBlocked;
+  const bodyRevision = [
+    name,
+    String(renderTool._completed),
+    String(renderTool.error),
+    String(renderTool._inputRevision ?? ""),
+    String(renderTool.partialJson?.length ?? 0),
+    String(outputText.length),
+    String(renderTool.bashTail?.totalBytes ?? 0),
+    String(renderTool.bashTail?.tail.length ?? 0),
+  ].join(":");
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
@@ -153,7 +267,18 @@ export function ToolCard({
       </button>
       {open && hasBody && (
         <div className="border-t border-border/80 bg-bg/35 px-3.5 py-3 [&>*:first-child]:mt-0">
-          <ToolBody name={name} input={input} tool={renderTool} />
+          <ToolBodyBoundary revision={bodyRevision}>
+            <Suspense
+              fallback={
+                <div role="status" className="flex items-center gap-2 text-xs text-muted">
+                  <Spinner size={13} className="text-accent" />
+                  <span>正在加载完整工具内容…</span>
+                </div>
+              }
+            >
+              <LazyToolBody name={name} input={input} tool={renderTool} />
+            </Suspense>
+          </ToolBodyBoundary>
         </div>
       )}
     </div>

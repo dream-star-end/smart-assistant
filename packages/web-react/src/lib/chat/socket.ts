@@ -9,7 +9,7 @@
  * ping-pong watchdog、hello + 三层断点续传、safeWsSend 2MB 背压、离线队列三段式
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import type { MessageReplyQuote } from "@openclaude/protocol/messageReplyCore";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -115,14 +115,14 @@ import type {
   RepoStatusWire,
 } from "./frames";
 import { incidentStore } from "../incidentStore";
+import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol/engineModels";
+import { isClientMessageId } from "@openclaude/protocol/messageIds";
 import {
   assessTurnRecoveryTape,
-  DEFAULT_CODEX_ENGINE_MODEL,
-  isClientMessageId,
   normalizeTurnErrorCode,
   supportsAutomaticTurnRecovery,
   turnRecoveryIdentity,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/turnErrorTaxonomy";
 import type { RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };

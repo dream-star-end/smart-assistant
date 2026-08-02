@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
@@ -39,9 +41,89 @@ function ocBuildMeta(): Plugin {
   };
 }
 
+const WEB_SYNC_GZIP_BUDGET_BYTES = 300_000;
+
+type ManifestChunk = {
+  file: string;
+  imports?: string[];
+  css?: string[];
+};
+
+/**
+ * Guard the assets a first-time visitor must fetch before any lazy route or
+ * expanded tool body is requested. The gate follows the emitted manifest
+ * rather than source guesses, so a future import regression cannot silently
+ * pull TypeBox or the heavy tool renderer back into the first-load closure.
+ */
+function webSyncBundleBudget(): Plugin {
+  return {
+    name: "web-sync-bundle-budget",
+    apply: "build",
+    closeBundle() {
+      const distDir = fileURLToPath(new URL("./dist/", import.meta.url));
+      const manifest = JSON.parse(
+        readFileSync(`${distDir}.vite/manifest.json`, "utf8"),
+      ) as Record<string, ManifestChunk>;
+      const chunks = new Set<string>();
+      const files = new Set<string>(["index.html"]);
+
+      const visit = (key: string) => {
+        if (chunks.has(key)) return;
+        const chunk = manifest[key];
+        if (!chunk) throw new Error(`web-sync-bundle-budget: manifest 缺少 ${key}`);
+        chunks.add(key);
+        files.add(chunk.file);
+        for (const css of chunk.css ?? []) files.add(css);
+        for (const imported of chunk.imports ?? []) visit(imported);
+      };
+      visit("index.html");
+
+      let gzipBytes = 0;
+      const forbiddenSources = new Set<string>();
+      for (const file of files) {
+        const bytes = readFileSync(`${distDir}${file}`);
+        gzipBytes += gzipSync(bytes, { level: 9 }).length;
+        if (!file.endsWith(".js") || !existsSync(`${distDir}${file}.map`)) {
+          continue;
+        }
+        const sourceMap = JSON.parse(
+          readFileSync(`${distDir}${file}.map`, "utf8"),
+        ) as { sources?: string[] };
+        for (const source of sourceMap.sources ?? []) {
+          if (
+            source.includes("/@sinclair/typebox/") ||
+            source.includes("/react-virtuoso/") ||
+            /\/src\/components\/MessageRenderer\.tsx$/.test(source) ||
+            /\/src\/lib\/chat\/tapePayload(?:Core)?\.ts$/.test(source) ||
+            /\/src\/components\/tool\/(?:bodies|researchCards|connectorCards|skillCards|memoryReminderCards|mcpResourceCards|delegateFanoutCard)\.tsx?$/.test(
+              source,
+            )
+          ) {
+            forbiddenSources.add(source);
+          }
+        }
+      }
+
+      if (forbiddenSources.size > 0) {
+        throw new Error(
+          `web-sync-bundle-budget: 首屏同步闭包含重依赖:\n${[...forbiddenSources].sort().join("\n")}`,
+        );
+      }
+      if (gzipBytes > WEB_SYNC_GZIP_BUDGET_BYTES) {
+        throw new Error(
+          `web-sync-bundle-budget: 首屏同步 JS/CSS/HTML gzip ${gzipBytes}B > ${WEB_SYNC_GZIP_BUDGET_BYTES}B`,
+        );
+      }
+      console.log(
+        `web-sync-bundle-budget: ${gzipBytes}B gzip · ${files.size} files · PASS`,
+      );
+    },
+  };
+}
+
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss(), ocBuildMeta()],
+    plugins: [react(), tailwindcss(), ocBuildMeta(), webSyncBundleBudget()],
     server: {
       host: "127.0.0.1",
       port: 5174,

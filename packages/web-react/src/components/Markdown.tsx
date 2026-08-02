@@ -56,8 +56,8 @@ function PlainFallbackText({ children }: { children: string }) {
 
 function HtmlPreviewFallback({ code, live }: { code: string; live?: boolean }) {
   return (
-    <div className="not-prose my-3 overflow-hidden rounded-lg border border-border bg-background shadow-sm">
-      <div className="border-b border-border bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground">
+    <div className="not-prose my-3 overflow-hidden rounded-lg border border-border bg-surface shadow-sm">
+      <div className="border-b border-border bg-hover px-3 py-2 text-xs font-medium text-muted">
         HTML {live ? "预览(生成中)" : "预览"}
       </div>
       {live ? (

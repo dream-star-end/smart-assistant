@@ -1,4 +1,7 @@
-import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
+import {
+  isMarketplaceCategoryId,
+  marketplaceCategoryLabel,
+} from "@openclaude/protocol/marketplaceTaxonomy";
 import {
   ArrowUpCircle,
   BarChart3,

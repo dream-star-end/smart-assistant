@@ -1,9 +1,9 @@
 import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { isCodexEngineModel } from "@openclaude/protocol/engineModels";
 import {
-  isCodexEngineModel,
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/messageReplyCore";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
@@ -36,7 +36,7 @@ import type { SettingsSection } from "./components/SettingsCenter";
 import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
-import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
+import type { MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
 import { TurnCostReminder } from "./components/chat/TurnCostReminder";
 import {
@@ -138,6 +138,9 @@ const TutorialCenter = lazy(() =>
 );
 const ContainerWebPreview = lazy(() =>
   import("./components/ContainerWebPreview").then((m) => ({ default: m.ContainerWebPreview })),
+);
+const MessageList = lazy(() =>
+  import("./components/MessageRenderer").then((m) => ({ default: m.MessageList })),
 );
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
@@ -2267,19 +2270,21 @@ export function App() {
             // ResponseRatingProvider 下发逐条评价态：AssistantCard 内的评价卡作为 Context
             // 消费者，随 ratings 变更穿透 MessageRenderer 的 sig-memo 重渲（无需改渲染签名）。
             <ResponseRatingProvider value={ratingCtx}>
-              <MessageList
-                key={activeId}
-                messages={wsMessages}
-                sending={wsSending}
-                liveTurnUsage={activeSess?._liveTurnUsage}
-                turnActivity={turnActivity}
-                transientNotice={transientNotice}
-                archive={messageListArchive}
-                cb={cardCallbacks}
-                onRespondPermission={onRespondPermission}
-                scrollParent={chatScrollParent}
-                historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
-              />
+              <LazyBoundary fallback={<MessageListSkeleton />}>
+                <MessageList
+                  key={activeId}
+                  messages={wsMessages}
+                  sending={wsSending}
+                  liveTurnUsage={activeSess?._liveTurnUsage}
+                  turnActivity={turnActivity}
+                  transientNotice={transientNotice}
+                  archive={messageListArchive}
+                  cb={cardCallbacks}
+                  onRespondPermission={onRespondPermission}
+                  scrollParent={chatScrollParent}
+                  historyGeneration={`${activeId ?? "none"}::${activeSess?._timelineGeneration ?? "legacy"}`}
+                />
+              </LazyBoundary>
             </ResponseRatingProvider>
           )}
         </div>

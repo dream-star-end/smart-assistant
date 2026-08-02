@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import type { MessageReplyQuote } from "@openclaude/protocol/messageReplyCore";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
-import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
+import type { TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
 import type { AuthSession } from "../lib/types";
@@ -704,6 +704,7 @@ export function useChatSocket(opts: {
       const cacheKey = tapePayloadCacheKey(userId, sessId, tapeId, recordOrdinal, expected);
       return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
         const payload = await api.getTapeRecordPayload(a, sessId, tapeId, recordOrdinal, queueSignal);
+        const { parseTapeRecordPayload } = await import("../lib/chat/tapePayload");
         const records = await parseTapeRecordPayload(payload, expected, queueSignal);
         if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
           throw new DOMException("auth identity changed", "AbortError");
@@ -782,6 +783,7 @@ export function useChatSocket(opts: {
       const cacheKey = userPayloadCacheKey(userId, sessId, messageId, expected);
       return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
         const payload = await api.getUserMessagePayload(a, sessId, messageId, queueSignal);
+        const { parseTapeRecordPayload } = await import("../lib/chat/tapePayload");
         const records = await parseTapeRecordPayload(payload, expected, queueSignal);
         if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
           throw new DOMException("auth identity changed", "AbortError");

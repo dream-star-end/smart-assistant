@@ -1,6 +1,6 @@
 import { Check, Loader2, Store, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
+import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol/engineModels'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
