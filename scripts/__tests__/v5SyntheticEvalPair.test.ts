@@ -395,7 +395,12 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
     assert.deepEqual(result.efficiencyRaw.B, fixture.evidence.B.efficiency);
     assert.equal("winner" in result, false);
     assert.equal("recommendation" in result, false);
-    assert.equal(result.schemaVersion, 4);
+    assert.equal(result.schemaVersion, 5);
+    assert.equal(
+      result.promptDelta.algorithm,
+      "myers-byte-hunks-v1-delete-tie",
+    );
+    assert.equal(result.promptDelta.hunkCount > 0, true);
     assert.equal(result.identity.billingBindingMode, "ccb_authority_dispatch_attempt");
     assert.equal(result.workspaceArtifacts.A.files, 1);
     assert.equal(result.workspaceArtifacts.B.files, 1);
@@ -407,11 +412,145 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
     const first = controlledPromptDelta(base, candidate);
     const second = controlledPromptDelta(Buffer.from(base), Buffer.from(candidate));
     assert.deepEqual(first, second);
+    assert.equal(first.schemaVersion, 2);
+    assert.equal(first.algorithm, "myers-byte-hunks-v1-delete-tie");
     assert.equal(first.prefixBytes, 2);
     assert.equal(first.suffixBytes, 2);
     assert.equal(first.removedBase64, Buffer.from([2, 3]).toString("base64"));
     assert.equal(first.addedBase64, Buffer.from([9, 8]).toString("base64"));
+    assert.deepEqual(first.hunks, [
+      {
+        removedBase64: Buffer.from([2, 3]).toString("base64"),
+        addedBase64: Buffer.from([9, 8]).toString("base64"),
+      },
+    ]);
     assert.match(first.sha256, /^[0-9a-f]{64}$/);
+  });
+
+  test("hunk identity excludes unchanged task bytes even between same-line edits", () => {
+    const baseOne = Buffer.from(
+      "before-old-A|task-context-one|old-B-after",
+    );
+    const candidateOne = Buffer.from(
+      "before-new-A|task-context-one|new-B-after",
+    );
+    const baseTwo = Buffer.from(
+      "before-old-A|different-task-context|old-B-after",
+    );
+    const candidateTwo = Buffer.from(
+      "before-new-A|different-task-context|new-B-after",
+    );
+    const first = controlledPromptDelta(baseOne, candidateOne);
+    const second = controlledPromptDelta(baseTwo, candidateTwo);
+
+    assert.equal(first.sha256, second.sha256);
+    assert.deepEqual(first.hunks, second.hunks);
+    assert.notEqual(first.removedBase64, second.removedBase64);
+    assert.notEqual(first.addedBase64, second.addedBase64);
+
+    const drifted = controlledPromptDelta(
+      baseTwo,
+      Buffer.from("before-new-A|unexpected-A-B-drift|new-B-after"),
+    );
+    assert.notEqual(drifted.sha256, second.sha256);
+  });
+
+  test("hunk identity is lossless and deterministic at binary and newline boundaries", () => {
+    const cases = [
+      [Buffer.alloc(0), Buffer.from("\n")],
+      [Buffer.from("a"), Buffer.from("a\n")],
+      [Buffer.from("\n"), Buffer.alloc(0)],
+      [Buffer.from([0, 255, 10]), Buffer.from([0, 10, 255, 10])],
+      [Buffer.from("abab"), Buffer.from("baba")],
+    ];
+    const deltas: ReturnType<typeof controlledPromptDelta>[] = [];
+    for (const [base, candidate] of cases) {
+      const first = controlledPromptDelta(base, candidate);
+      const second = controlledPromptDelta(
+        Buffer.from(base),
+        Buffer.from(candidate),
+      );
+      assert.deepEqual(first, second);
+      assert.equal(first.hunkCount, first.hunks.length);
+      assert.equal(first.hunkCount > 0, true);
+      deltas.push(first);
+    }
+    assert.equal(deltas[0].sha256, deltas[1].sha256);
+    assert.equal(deltas[0].sha256, deltas[3].sha256);
+    assert.deepEqual(deltas[3].hunks, [{
+      removedBase64: "",
+      addedBase64: Buffer.from([10]).toString("base64"),
+    }]);
+    assert.notEqual(deltas[0].sha256, deltas[2].sha256);
+    const repeatedTieHunks = [
+      {
+        removedBase64: Buffer.from("a").toString("base64"),
+        addedBase64: "",
+      },
+      {
+        removedBase64: "",
+        addedBase64: Buffer.from("a").toString("base64"),
+      },
+    ];
+    assert.deepEqual(deltas[4].hunks, repeatedTieHunks);
+    assert.equal(deltas[4].sha256, digest(JSON.stringify({
+      schemaVersion: 2,
+      algorithm: "myers-byte-hunks-v1-delete-tie",
+      hunks: repeatedTieHunks,
+    })));
+    assert.notEqual(deltas[0].sha256, deltas[4].sha256);
+
+    const unchanged = controlledPromptDelta(Buffer.alloc(0), Buffer.alloc(0));
+    assert.equal(unchanged.hunkCount, 0);
+    assert.deepEqual(unchanged.hunks, []);
+  });
+
+  test("Myers byte edit distance matches a reference insertion/deletion DP", () => {
+    const referenceDistance = (base: Buffer, candidate: Buffer): number => {
+      let previous = Array.from(
+        { length: candidate.length + 1 },
+        (_, index) => index,
+      );
+      for (let baseIndex = 1; baseIndex <= base.length; baseIndex += 1) {
+        const current = [baseIndex];
+        for (
+          let candidateIndex = 1;
+          candidateIndex <= candidate.length;
+          candidateIndex += 1
+        ) {
+          current[candidateIndex] = base[baseIndex - 1]
+            === candidate[candidateIndex - 1]
+            ? previous[candidateIndex - 1]
+            : Math.min(
+              previous[candidateIndex] + 1,
+              current[candidateIndex - 1] + 1,
+            );
+        }
+        previous = current;
+      }
+      return previous[candidate.length];
+    };
+    let state = 0x51f15e;
+    const randomByte = (): number => {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      return state & 0x07;
+    };
+
+    for (let sample = 0; sample < 200; sample += 1) {
+      const base = Buffer.from(
+        Array.from({ length: randomByte() }, randomByte),
+      );
+      const candidate = Buffer.from(
+        Array.from({ length: randomByte() }, randomByte),
+      );
+      const delta = controlledPromptDelta(base, candidate);
+      assert.equal(
+        delta.editDistanceBytes,
+        referenceDistance(base, candidate),
+        `sample ${sample}: ${base.toString("hex")} -> ${candidate.toString("hex")}`,
+      );
+      assert.equal(controlledPromptDelta(base, base).editDistanceBytes, 0);
+    }
   });
 
   const identityDrifts: Array<{
@@ -798,7 +937,7 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
       rewriteArmB(fixture);
       assert.throws(
         () => aggregatePair(fixture.armAPath, fixture.armBPath),
-        /captured full-prompt delta differs/,
+        /captured full-prompt hunk delta differs/,
       );
     }
   });
