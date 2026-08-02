@@ -516,13 +516,20 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     assert.match(REMOTE_HELPER_SOURCE, /function inspectDynamicInputs\(\)/);
     assert.match(REMOTE_HELPER_SOURCE, /function inspectTurnEvidence\(\)/);
     assert.match(REMOTE_HELPER_SOURCE, /function inspectWorkspaceArtifacts\(\)/);
-    assert.match(REMOTE_HELPER_SOURCE, /function captureCopiedWorkspace\(root\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /const WORKSPACE_CAPTURE_SOURCE =/);
+    assert.match(REMOTE_HELPER_SOURCE, /function captureContainerWorkspace\(container, workspace, capturePath\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /function validateCapturedWorkspace\(captured\)/);
     assert.match(REMOTE_HELPER_SOURCE, /workspace-artifact-evidence/);
     assert.match(REMOTE_HELPER_SOURCE, /workspace artifact symlink is forbidden/);
     assert.match(REMOTE_HELPER_SOURCE, /workspace artifact path escaped its root/);
-    assert.match(REMOTE_HELPER_SOURCE, /\["cp", evidence\.container \+ ":" \+ workspace \+ "\/\.", copyRoot\]/);
+    assert.match(
+      REMOTE_HELPER_SOURCE,
+      /\["exec", container, "node", "-e", WORKSPACE_CAPTURE_SOURCE, workspace\]/,
+    );
+    assert.match(REMOTE_HELPER_SOURCE, /stdio: \["ignore", captureFd, "pipe"\]/);
+    assert.doesNotMatch(REMOTE_HELPER_SOURCE, /\["cp", evidence\.container/);
     assert.match(REMOTE_HELPER_SOURCE, /workspace artifact changed during complete capture/);
-    assert.match(REMOTE_HELPER_SOURCE, /contentBase64: bytes\.toString\("base64"\)/);
+    assert.match(REMOTE_HELPER_SOURCE, /contentBase64:\s*bytes\.toString\("base64"\)/);
     assert.match(REMOTE_HELPER_SOURCE, /FROM authority_turn_dispatches atd/);
     assert.match(REMOTE_HELPER_SOURCE, /d\.attempt_no=atd\.attempt_no/);
     assert.match(REMOTE_HELPER_SOURCE, /ccb_authority_dispatch_attempt/);
@@ -659,11 +666,16 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     assert.throws(() => identity(broken), /dynamic input symlink/);
   });
 
-  test("workspace capture executes symlink, path-escape, special-node, and TOCTOU guards", () => {
-    const start = REMOTE_HELPER_SOURCE.indexOf("function captureCopiedWorkspace(root) {");
-    const end = REMOTE_HELPER_SOURCE.indexOf("\nfunction inspectWorkspaceArtifacts()", start);
+  test("container workspace capture executes byte, symlink, path, special-node, and TOCTOU guards", () => {
+    const assignment = REMOTE_HELPER_SOURCE.match(
+      /const WORKSPACE_CAPTURE_SOURCE = (\[[\s\S]*?\]\.join\("\\n"\));/,
+    );
+    assert.ok(assignment?.[1]);
+    const probeSource = new Function(`return ${assignment[1]};`)() as string;
+    const start = probeSource.indexOf("function captureWorkspace(root){");
+    const end = probeSource.indexOf("\nprocess.stdout.write", start);
     assert.ok(start >= 0 && end > start);
-    const source = REMOTE_HELPER_SOURCE.slice(start, end);
+    const source = probeSource.slice(start, end);
     const fail = (message: string): never => { throw new Error(message); };
     const sha256 = (value: string | Buffer): string =>
       createHash("sha256").update(value).digest("hex");
@@ -674,7 +686,7 @@ describe("V5 synthetic exact-eval overlay driver", () => {
         "createHash",
         "sha256",
         "fail",
-        `${source}; return captureCopiedWorkspace;`,
+        `${source}; return captureWorkspace;`,
       )(fsValue, pathValue, createHash, sha256, fail) as (
         root: string,
       ) => { identity: Record<string, unknown>; entries: unknown[] };
@@ -686,6 +698,11 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     assert.equal(captured.identity.files, 1);
     assert.equal(captured.identity.directories, 1);
     assert.equal(captured.entries.length, 2);
+    assert.equal(
+      Buffer.from((captured.entries[1] as { contentBase64: string }).contentBase64, "base64")
+        .toString("utf8"),
+      "complete bytes\n",
+    );
 
     const linked = temp("v5-synthetic-workspace-symlink-");
     symlinkSync("missing-target", path.join(linked, "broken"));
@@ -727,23 +744,60 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       () => load(changingFs)(changing),
       /file changed while capturing/,
     );
+
+    const validateStart = REMOTE_HELPER_SOURCE.indexOf("function safeWorkspaceEntryPath(value) {");
+    const validateEnd = REMOTE_HELPER_SOURCE.indexOf(
+      "\nfunction captureContainerWorkspace(",
+      validateStart,
+    );
+    assert.ok(validateStart >= 0 && validateEnd > validateStart);
+    const validateSource = REMOTE_HELPER_SOURCE.slice(validateStart, validateEnd);
+    const validate = new Function(
+      "path", "createHash", "sha256", "exactKeys", "SHA", "fail",
+      `${validateSource}; return validateCapturedWorkspace;`,
+    )(
+      path,
+      createHash,
+      sha256,
+      (value: unknown, expected: string[]) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        const actual = Object.keys(value).sort();
+        const wanted = [...expected].sort();
+        return actual.length === wanted.length
+          && actual.every((key, index) => key === wanted[index]);
+      },
+      /^[0-9a-f]{64}$/,
+      fail,
+    ) as (value: unknown) => unknown;
+    assert.deepEqual(validate(captured), captured);
+    const corrupted = structuredClone(captured) as {
+      entries: Array<{ type: string; contentBase64?: string }>;
+    };
+    const file = corrupted.entries.find((entry) => entry.type === "file");
+    assert.ok(file);
+    file.contentBase64 = Buffer.from("corrupted bytes\n").toString("base64");
+    assert.throws(() => validate(corrupted), /file bytes are invalid/);
+    const unsafeMode = structuredClone(captured) as {
+      entries: Array<{ mode: number }>;
+    };
+    unsafeMode.entries[0].mode = 0o666;
+    assert.throws(() => validate(unsafeMode), /entry is invalid/);
   });
 
-  test("workspace evidence rejects a live identity change across docker copy", () => {
-    const captureStart = REMOTE_HELPER_SOURCE.indexOf("function captureCopiedWorkspace(root) {");
-    const captureEnd = REMOTE_HELPER_SOURCE.indexOf("\nfunction inspectWorkspaceArtifacts()", captureStart);
-    const inspectStart = captureEnd + 1;
+  test("workspace evidence streams through docker exec and rejects a live identity change", () => {
+    const captureStart = REMOTE_HELPER_SOURCE.indexOf("function safeWorkspaceEntryPath(value) {");
+    const inspectStart = REMOTE_HELPER_SOURCE.indexOf("function inspectWorkspaceArtifacts()", captureStart);
     const inspectEnd = REMOTE_HELPER_SOURCE.indexOf("\nfunction inspectTurnEvidence()", inspectStart);
-    assert.ok(captureStart >= 0 && captureEnd > captureStart && inspectEnd > inspectStart);
-    const captureSource = REMOTE_HELPER_SOURCE.slice(captureStart, captureEnd);
-    const inspectSource = REMOTE_HELPER_SOURCE.slice(inspectStart, inspectEnd);
+    assert.ok(captureStart >= 0 && inspectStart > captureStart && inspectEnd > inspectStart);
+    const source = REMOTE_HELPER_SOURCE.slice(captureStart, inspectEnd);
+    const assignment = REMOTE_HELPER_SOURCE.match(
+      /const WORKSPACE_CAPTURE_SOURCE = (\[[\s\S]*?\]\.join\("\\n"\));/,
+    );
+    assert.ok(assignment?.[1]);
+    const workspaceCaptureSource = new Function(`return ${assignment[1]};`)() as string;
     const fail = (message: string): never => { throw new Error(message); };
     const sha256 = (value: string | Buffer): string =>
       createHash("sha256").update(value).digest("hex");
-    const capture = new Function(
-      "fs", "path", "createHash", "sha256", "fail",
-      `${captureSource}; return captureCopiedWorkspace;`,
-    )(fs, path, createHash, sha256, fail);
 
     const stagingRoot = temp("v5-synthetic-workspace-live-");
     const manifestSha = "a".repeat(64);
@@ -755,6 +809,17 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       files: 1,
       directories: 0,
       sha256: sha256(`F  ${fileSha}  output.txt\n`),
+    };
+    const captured = {
+      identity: before,
+      entries: [{
+        path: "output.txt",
+        type: "file",
+        mode: 0o644,
+        bytes: content.length,
+        sha256: fileSha,
+        contentBase64: content.toString("base64"),
+      }],
     };
     let probes = 0;
     const payload = {
@@ -769,9 +834,10 @@ describe("V5 synthetic exact-eval overlay driver", () => {
     };
     const inspect = new Function(
       "payload", "inspectContainer", "dockerExecJson", "DYNAMIC_INPUT_SOURCE",
-      "STAGING_ROOT", "validateStage", "fs", "path", "spawnSync",
-      "captureCopiedWorkspace", "sha256", "fsyncDirectory", "secureStat", "fail",
-      `${inspectSource}; return inspectWorkspaceArtifacts;`,
+      "STAGING_ROOT", "validateStage", "fs", "path", "spawnSync", "createHash",
+      "sha256", "exactKeys", "SHA", "WORKSPACE_CAPTURE_SOURCE", "fsyncDirectory",
+      "secureStat", "fail",
+      `${source}; return inspectWorkspaceArtifacts;`,
     )(
       payload,
       () => ({ container: "oc-v5-u247", containerId: "c".repeat(64) }),
@@ -781,16 +847,61 @@ describe("V5 synthetic exact-eval overlay driver", () => {
       () => undefined,
       fs,
       path,
-      (_command: string, args: string[]) => {
-        writeFileSync(path.join(args[2], "output.txt"), content, { mode: 0o644 });
-        return { status: 0, stdout: "", stderr: "" };
+      (command: string, args: string[], options: { stdio: [string, number, string] }) => {
+        assert.equal(command, "docker");
+        assert.deepEqual(args.slice(0, 4), ["exec", "oc-v5-u247", "node", "-e"]);
+        assert.notEqual(args[0], "cp");
+        fs.writeSync(options.stdio[1], JSON.stringify(captured));
+        return { status: 0, stdout: null, stderr: "" };
       },
-      capture,
+      createHash,
       sha256,
+      (value: unknown, expected: string[]) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        const actual = Object.keys(value).sort();
+        const wanted = [...expected].sort();
+        return actual.length === wanted.length
+          && actual.every((key, index) => key === wanted[index]);
+      },
+      /^[0-9a-f]{64}$/,
+      workspaceCaptureSource,
       () => undefined,
       () => undefined,
       fail,
     ) as () => unknown;
     assert.throws(() => inspect(), /changed during complete capture/);
+  });
+
+  test("failed container workspace capture removes partial evidence", () => {
+    const start = REMOTE_HELPER_SOURCE.indexOf("function safeWorkspaceEntryPath(value) {");
+    const end = REMOTE_HELPER_SOURCE.indexOf("\nfunction inspectWorkspaceArtifacts()", start);
+    assert.ok(start >= 0 && end > start);
+    const source = REMOTE_HELPER_SOURCE.slice(start, end);
+    const fail = (message: string): never => { throw new Error(message); };
+    const capture = new Function(
+      "fs", "path", "createHash", "sha256", "exactKeys", "SHA",
+      "spawnSync", "WORKSPACE_CAPTURE_SOURCE", "secureStat", "fail",
+      `${source}; return captureContainerWorkspace;`,
+    )(
+      fs,
+      path,
+      createHash,
+      (value: string | Buffer) => createHash("sha256").update(value).digest("hex"),
+      () => true,
+      /^[0-9a-f]{64}$/,
+      (_command: string, _args: string[], options: { stdio: [string, number, string] }) => {
+        fs.writeSync(options.stdio[1], "partial");
+        return { status: 2, stdout: null, stderr: "simulated read failure" };
+      },
+      "ignored",
+      () => undefined,
+      fail,
+    ) as (container: string, workspace: string, output: string) => unknown;
+    const output = path.join(temp("v5-synthetic-workspace-partial-"), "capture.json");
+    assert.throws(
+      () => capture("oc-v5-u247", "/tmp/oc-synthetic-eval-case", output),
+      /simulated read failure/,
+    );
+    assert.equal(fs.existsSync(output), false);
   });
 });

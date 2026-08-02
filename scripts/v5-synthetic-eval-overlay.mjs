@@ -1130,79 +1130,134 @@ function inspectDynamicInputs() {
   };
 }
 
-function captureCopiedWorkspace(root) {
-  const rootReal = fs.realpathSync(root);
-  if (rootReal !== root) fail("copied workspace path is not canonical");
-  const entries = [];
+const WORKSPACE_CAPTURE_SOURCE = [
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'const { createHash } = require("node:crypto");',
+  'const [root] = process.argv.slice(1);',
+  'if(typeof root!=="string"||!/^\\/tmp\\/oc-synthetic-eval-[A-Za-z0-9_-]{1,80}$/.test(root))throw new Error("invalid workspace capture root");',
+  'const sha256=(value)=>createHash("sha256").update(value).digest("hex");',
+  'function fail(message){throw new Error(message)}',
+  'function captureWorkspace(root){const rootStat=fs.lstatSync(root);if(rootStat.isSymbolicLink()||!rootStat.isDirectory())fail("workspace artifact root is not a directory");if(![0,1000].includes(rootStat.uid)||(rootStat.mode&0o022)!==0)fail("workspace artifact root has unsafe owner or mode");const rootReal=fs.realpathSync(root);if(rootReal!==root)fail("workspace artifact root path is not canonical");const entries=[];const hash=createHash("sha256");let files=0;let directories=0;function walk(current){for(const name of fs.readdirSync(current).sort()){const absolute=path.join(current,name);const before=fs.lstatSync(absolute);if(before.isSymbolicLink())fail("workspace artifact symlink is forbidden: "+absolute);if(![0,1000].includes(before.uid)||(before.mode&0o022)!==0)fail("workspace artifact has unsafe owner or mode: "+absolute);const relative=path.relative(rootReal,absolute).split(path.sep).join("/");if(!relative||relative.includes("\\0")||relative.startsWith("../")||path.posix.isAbsolute(relative)||path.posix.normalize(relative)!==relative)fail("workspace artifact path escaped its root");if(before.isDirectory()){directories+=1;entries.push({path:relative,type:"directory",mode:before.mode&0o777});hash.update("D  "+relative+"\\n");walk(absolute);const after=fs.lstatSync(absolute);if(!after.isDirectory()||after.isSymbolicLink()||before.dev!==after.dev||before.ino!==after.ino||before.uid!==after.uid||before.mode!==after.mode||before.mtimeMs!==after.mtimeMs)fail("workspace artifact directory changed while capturing: "+absolute)}else if(before.isFile()){const bytes=fs.readFileSync(absolute);const after=fs.lstatSync(absolute);if(!after.isFile()||after.isSymbolicLink()||before.dev!==after.dev||before.ino!==after.ino||before.uid!==after.uid||before.mode!==after.mode||before.size!==after.size||before.mtimeMs!==after.mtimeMs)fail("workspace artifact file changed while capturing: "+absolute);const digest=sha256(bytes);files+=1;entries.push({path:relative,type:"file",mode:before.mode&0o777,bytes:bytes.length,sha256:digest,contentBase64:bytes.toString("base64")});hash.update("F  "+digest+"  "+relative+"\\n")}else fail("workspace artifact contains a non-file entry: "+absolute)}}walk(rootReal);const rootAfter=fs.lstatSync(root);if(!rootAfter.isDirectory()||rootAfter.isSymbolicLink()||rootStat.dev!==rootAfter.dev||rootStat.ino!==rootAfter.ino||rootStat.uid!==rootAfter.uid||rootStat.mode!==rootAfter.mode||rootStat.mtimeMs!==rootAfter.mtimeMs)fail("workspace artifact root changed while capturing");return {identity:{state:"tree",files,directories,sha256:hash.digest("hex")},entries}}',
+  'process.stdout.write(JSON.stringify(captureWorkspace(root)));',
+].join("\n");
+
+function safeWorkspaceEntryPath(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && !value.includes("\0")
+    && !value.startsWith("/")
+    && path.posix.normalize(value) === value
+    && value !== "."
+    && value !== ".."
+    && !value.startsWith("../");
+}
+
+function validateCapturedWorkspace(captured) {
+  if (
+    !exactKeys(captured, ["identity", "entries"])
+    || !exactKeys(captured.identity, ["state", "files", "directories", "sha256"])
+    || captured.identity.state !== "tree"
+    || !Number.isSafeInteger(captured.identity.files)
+    || captured.identity.files < 0
+    || !Number.isSafeInteger(captured.identity.directories)
+    || captured.identity.directories < 0
+    || !SHA.test(captured.identity.sha256 || "")
+    || !Array.isArray(captured.entries)
+  ) {
+    fail("captured workspace artifact shape is invalid");
+  }
+  const seen = new Set();
   const hash = createHash("sha256");
   let files = 0;
   let directories = 0;
-  function walk(current) {
-    for (const name of fs.readdirSync(current).sort()) {
-      const absolute = path.join(current, name);
-      const before = fs.lstatSync(absolute);
-      if (before.isSymbolicLink()) fail("workspace artifact symlink is forbidden: " + absolute);
-      if (![0, 1000].includes(before.uid) || (before.mode & 0o022) !== 0) {
-        fail("workspace artifact has unsafe owner or mode: " + absolute);
-      }
-      const relative = path.relative(rootReal, absolute).split(path.sep).join("/");
-      if (!relative || relative.startsWith("../") || path.isAbsolute(relative)) {
-        fail("workspace artifact path escaped its root");
-      }
-      if (before.isDirectory()) {
-        directories += 1;
-        entries.push({ path: relative, type: "directory", mode: before.mode & 0o777 });
-        hash.update("D  " + relative + "\n");
-        walk(absolute);
-        const after = fs.lstatSync(absolute);
-        if (
-          !after.isDirectory()
-          || after.isSymbolicLink()
-          || before.dev !== after.dev
-          || before.ino !== after.ino
-          || before.mtimeMs !== after.mtimeMs
-        ) {
-          fail("workspace artifact directory changed while capturing: " + absolute);
-        }
-      } else if (before.isFile()) {
-        const bytes = fs.readFileSync(absolute);
-        const after = fs.lstatSync(absolute);
-        if (
-          !after.isFile()
-          || after.isSymbolicLink()
-          || before.dev !== after.dev
-          || before.ino !== after.ino
-          || before.size !== after.size
-          || before.mtimeMs !== after.mtimeMs
-        ) {
-          fail("workspace artifact file changed while capturing: " + absolute);
-        }
-        const digest = sha256(bytes);
-        files += 1;
-        entries.push({
-          path: relative,
-          type: "file",
-          mode: before.mode & 0o777,
-          bytes: bytes.length,
-          sha256: digest,
-          contentBase64: bytes.toString("base64"),
-        });
-        hash.update("F  " + digest + "  " + relative + "\n");
-      } else {
-        fail("workspace artifact contains a non-file entry: " + absolute);
-      }
+  for (const entry of captured.entries) {
+    if (
+      !safeWorkspaceEntryPath(entry && entry.path)
+      || seen.has(entry.path)
+      || !Number.isSafeInteger(entry.mode)
+      || entry.mode < 0
+      || entry.mode > 0o777
+      || (entry.mode & 0o022) !== 0
+    ) {
+      fail("captured workspace artifact entry is invalid");
     }
+    seen.add(entry.path);
+    if (entry.type === "directory") {
+      if (!exactKeys(entry, ["path", "type", "mode"])) {
+        fail("captured workspace artifact directory shape is invalid");
+      }
+      directories += 1;
+      hash.update("D  " + entry.path + "\n");
+      continue;
+    }
+    if (
+      entry.type !== "file"
+      || !exactKeys(entry, ["path", "type", "mode", "bytes", "sha256", "contentBase64"])
+      || !Number.isSafeInteger(entry.bytes)
+      || entry.bytes < 0
+      || !SHA.test(entry.sha256 || "")
+      || typeof entry.contentBase64 !== "string"
+    ) {
+      fail("captured workspace artifact file shape is invalid");
+    }
+    const bytes = Buffer.from(entry.contentBase64, "base64");
+    if (
+      bytes.toString("base64") !== entry.contentBase64
+      || bytes.length !== entry.bytes
+      || sha256(bytes) !== entry.sha256
+    ) {
+      fail("captured workspace artifact file bytes are invalid");
+    }
+    files += 1;
+    hash.update("F  " + entry.sha256 + "  " + entry.path + "\n");
   }
-  walk(rootReal);
-  return {
-    identity: {
-      state: "tree",
-      files,
-      directories,
-      sha256: hash.digest("hex"),
-    },
-    entries,
-  };
+  if (
+    files !== captured.identity.files
+    || directories !== captured.identity.directories
+    || hash.digest("hex") !== captured.identity.sha256
+  ) {
+    fail("captured workspace artifact identity is invalid");
+  }
+  return captured;
+}
+
+function captureContainerWorkspace(container, workspace, capturePath) {
+  if (!/^\/tmp\/oc-synthetic-eval-[A-Za-z0-9_-]{1,80}$/.test(workspace)) {
+    fail("workspace capture path is invalid");
+  }
+  if (fs.existsSync(capturePath)) fail("workspace capture path already exists");
+  let captureFd = null;
+  try {
+    captureFd = fs.openSync(capturePath, "wx", 0o600);
+    const captured = spawnSync(
+      "docker",
+      ["exec", container, "node", "-e", WORKSPACE_CAPTURE_SOURCE, workspace],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", captureFd, "pipe"],
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    );
+    if (captured.error) throw captured.error;
+    if (captured.status !== 0) {
+      fail("workspace artifact container capture failed: " + captured.stderr);
+    }
+    fs.fsyncSync(captureFd);
+    fs.closeSync(captureFd);
+    captureFd = null;
+    fs.chownSync(capturePath, 0, 0);
+    fs.chmodSync(capturePath, 0o600);
+    secureStat(capturePath, "file", 0o600);
+    if (fs.realpathSync(capturePath) !== capturePath) {
+      fail("workspace capture path is not canonical");
+    }
+    return validateCapturedWorkspace(JSON.parse(fs.readFileSync(capturePath, "utf8")));
+  } catch (error) {
+    if (captureFd !== null) fs.closeSync(captureFd);
+    fs.rmSync(capturePath, { force: true });
+    throw error;
+  }
 }
 
 function inspectWorkspaceArtifacts() {
@@ -1242,28 +1297,16 @@ function inspectWorkspaceArtifacts() {
   fs.chmodSync(evidenceRoot, 0o700);
   secureStat(evidenceRoot, "dir", 0o700);
   const stem = payload.recordNonce + "-" + payload.caseId;
-  const copyRoot = path.join(evidenceRoot, ".copy-" + stem);
+  const capturePath = path.join(evidenceRoot, ".capture-" + stem + ".json");
   const documentPath = path.join(evidenceRoot, stem + ".workspace.json");
-  if (fs.existsSync(copyRoot) || fs.existsSync(documentPath)) {
+  if (fs.existsSync(capturePath) || fs.existsSync(documentPath)) {
     fail("workspace artifact evidence path already exists");
   }
   let captured = { identity: { state: "absent" }, entries: [] };
   try {
     if (liveBefore.state === "tree") {
-      fs.mkdirSync(copyRoot, { mode: 0o700 });
-      fs.chownSync(copyRoot, 0, 0);
-      fs.chmodSync(copyRoot, 0o700);
       const workspace = "/tmp/oc-synthetic-eval-" + payload.caseId;
-      const copied = spawnSync(
-        "docker",
-        ["cp", evidence.container + ":" + workspace + "/.", copyRoot],
-        { encoding: "utf8" },
-      );
-      if (copied.error) throw copied.error;
-      if (copied.status !== 0) {
-        fail("workspace artifact docker copy failed: " + (copied.stderr || copied.stdout));
-      }
-      captured = captureCopiedWorkspace(copyRoot);
+      captured = captureContainerWorkspace(evidence.container, workspace, capturePath);
       const liveAfter = dockerExecJson(
         evidence.container,
         DYNAMIC_INPUT_SOURCE,
@@ -1309,7 +1352,7 @@ function inspectWorkspaceArtifacts() {
       sha256: sha256(bytes),
     };
   } finally {
-    fs.rmSync(copyRoot, { recursive: true, force: true });
+    fs.rmSync(capturePath, { force: true });
   }
 }
 
