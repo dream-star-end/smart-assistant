@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -330,6 +332,12 @@ describe("V5 synthetic exact-eval helpers", () => {
     const casePackSha = "b".repeat(64);
     const turnPath = join(directory, "turn.json");
     const framesPath = join(directory, "frames.json");
+    const extraPromptPath = join(directory, "extra-prompt.md");
+    const containerId = "e".repeat(64);
+    const extraPromptBytes = Buffer.from("exact live engine prompt\n");
+    const extraPromptSha = createHash("sha256")
+      .update(extraPromptBytes)
+      .digest("hex");
     const peerId = "eval_peer_0123456789";
     const traceId = "a".repeat(32);
     const clientMessageId = "evalmsg_0123456789";
@@ -367,6 +375,7 @@ describe("V5 synthetic exact-eval helpers", () => {
       started_at: "2026-07-31T10:00:00.000Z",
       finished_at: "2026-07-31T10:00:01.250Z",
       billing_evidence_at: "2026-07-31T10:00:01.500Z",
+      prompt_captured_at: "2026-07-31T10:00:00.750Z",
       wall_ms: 1_250,
       billing_evidence_wait_ms: 250,
       ttft_ms: 500,
@@ -390,6 +399,26 @@ describe("V5 synthetic exact-eval helpers", () => {
         usageIds: ["52247"],
         ledgerIds: ["57327"],
       },
+      extra_prompt: {
+        type: "captured",
+        schemaVersion: 1,
+        containerId,
+        engine: "ccb",
+        sessionKey: `agent:research-assistant:webchat:dm:${peerId}`,
+        path: "/tmp/oc-eval/extra-prompt.md",
+        bytes: extraPromptBytes.length,
+        sha256: extraPromptSha,
+        candidateCount: 1,
+        selection: "exact-session-process",
+        processes: [{
+          pid: 42,
+          startTime: "12345",
+          cmdlineSha256: "c".repeat(64),
+          aliveAtOpen: true,
+          aliveAfter: false,
+        }],
+        contentBase64: extraPromptBytes.toString("base64"),
+      },
       connection: { opens: 1, closes: 1, reconnects: 0 },
       runtime: {
         login_requests: 1,
@@ -399,6 +428,9 @@ describe("V5 synthetic exact-eval helpers", () => {
         finals: 1,
         matching_costs: 1,
         binding_queries: 1,
+        prompt_watchers: 1,
+        prompt_ready: 1,
+        prompt_captures: 1,
       },
       frames: [
         {
@@ -436,6 +468,8 @@ describe("V5 synthetic exact-eval helpers", () => {
       OC_SYNTHETIC_EVAL_MODEL: "gpt-5.6-sol",
       OC_SYNTHETIC_EVAL_TURN_PATH: turnPath,
       OC_SYNTHETIC_EVAL_FRAMES_PATH: framesPath,
+      OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH: extraPromptPath,
+      OC_SYNTHETIC_EVAL_CONTAINER_ID: containerId,
       FAKE_SSH_OUTPUT: JSON.stringify(remote),
     };
     const result = spawnSync(process.execPath, [turnHelper], {
@@ -447,6 +481,8 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.equal(readFileSync(fake.log, "utf8").trim().split("\n").length, 1);
     assert.equal(statSync(turnPath).mode & 0o777, 0o600);
     assert.equal(statSync(framesPath).mode & 0o777, 0o600);
+    assert.equal(statSync(extraPromptPath).mode & 0o777, 0o600);
+    assert.deepEqual(readFileSync(extraPromptPath), extraPromptBytes);
 
     const framesBytes = readFileSync(framesPath);
     const frames = JSON.parse(framesBytes.toString("utf8"));
@@ -470,6 +506,10 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.equal(turn.final_text, "done");
     assert.equal(turn.billing_binding.mode, "ccb_authority_dispatch_attempt");
     assert.equal(turn.cost_trace_id, null);
+    assert.equal(turn.extra_prompt.captured_path, extraPromptPath);
+    assert.equal(turn.extra_prompt.sha256, extraPromptSha);
+    assert.equal(turn.extra_prompt.processes[0].aliveAfter, false);
+    assert.equal("contentBase64" in turn.extra_prompt, false);
 
     const second = spawnSync(process.execPath, [turnHelper], {
       encoding: "utf8",
@@ -489,6 +529,10 @@ describe("V5 synthetic exact-eval helpers", () => {
         ...env,
         OC_SYNTHETIC_EVAL_TURN_PATH: join(directory, "invalid-turn.json"),
         OC_SYNTHETIC_EVAL_FRAMES_PATH: join(directory, "invalid-frames.json"),
+        OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH: join(
+          directory,
+          "invalid-extra-prompt.md",
+        ),
         FAKE_SSH_OUTPUT: JSON.stringify({
           ...remote,
           connection: { opens: 1, closes: 0, reconnects: 0 },
@@ -502,6 +546,27 @@ describe("V5 synthetic exact-eval helpers", () => {
       2,
       "invalid runtime evidence is rejected after exactly one ssh",
     );
+
+    const corruptPromptPath = join(directory, "corrupt-extra-prompt.md");
+    const corruptPrompt = spawnSync(process.execPath, [turnHelper], {
+      encoding: "utf8",
+      env: {
+        ...env,
+        OC_SYNTHETIC_EVAL_TURN_PATH: join(directory, "corrupt-turn.json"),
+        OC_SYNTHETIC_EVAL_FRAMES_PATH: join(directory, "corrupt-frames.json"),
+        OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH: corruptPromptPath,
+        FAKE_SSH_OUTPUT: JSON.stringify({
+          ...remote,
+          extra_prompt: {
+            ...remote.extra_prompt,
+            contentBase64: Buffer.from("wrong bytes").toString("base64"),
+          },
+        }),
+      },
+    });
+    assert.notEqual(corruptPrompt.status, 0);
+    assert.match(corruptPrompt.stderr, /extra-prompt bytes|corrupt|invalid/);
+    assert.equal(existsSync(corruptPromptPath), false);
   });
 
   test("turn rejects prompt identity drift before ssh", () => {
@@ -628,6 +693,58 @@ describe("V5 synthetic exact-eval helpers", () => {
       if (path.endsWith("v5-canary.password")) return "secret\n";
       throw new Error(`unexpected read: ${path}`);
     };
+    const containerId = "e".repeat(64);
+    const livePrompt = Buffer.from("captured before the engine exits\n");
+    let watcherExitCode = 0;
+    const spawn = (
+      command: string,
+      args: string[],
+    ): EventEmitter & {
+      stdout: EventEmitter & { setEncoding: () => void };
+      stderr: EventEmitter & { setEncoding: () => void };
+      kill: () => boolean;
+    } => {
+      assert.equal(command, "docker");
+      assert.deepEqual(args.slice(0, 4), ["exec", containerId, "node", "-e"]);
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: EventEmitter & { setEncoding: () => void };
+        stderr: EventEmitter & { setEncoding: () => void };
+        kill: () => boolean;
+      };
+      child.stdout = Object.assign(new EventEmitter(), { setEncoding() {} });
+      child.stderr = Object.assign(new EventEmitter(), { setEncoding() {} });
+      child.kill = () => true;
+      const sessionKey = args[6];
+      queueMicrotask(() => {
+        child.stdout.emit("data", `${JSON.stringify({
+          type: "ready",
+          schemaVersion: 1,
+          containerId,
+          pollMs: 100,
+        })}\n${JSON.stringify({
+          type: "captured",
+          schemaVersion: 1,
+          containerId,
+          engine: "ccb",
+          sessionKey,
+          path: "/tmp/turn/extra-prompt.md",
+          bytes: livePrompt.length,
+          sha256: createHash("sha256").update(livePrompt).digest("hex"),
+          candidateCount: 1,
+          selection: "exact-session-process",
+          processes: [{
+            pid: 17,
+            startTime: "9001",
+            cmdlineSha256: "f".repeat(64),
+            aliveAtOpen: true,
+            aliveAfter: false,
+          }],
+          contentBase64: livePrompt.toString("base64"),
+        })}\n`);
+        child.emit("close", watcherExitCode, null);
+      });
+      return child;
+    };
     const fetch = async (url: string): Promise<Record<string, unknown>> => {
       if (url.endsWith("/api/auth/login")) {
         return { ok: true, json: async () => ({ access_token: token }) };
@@ -682,13 +799,15 @@ describe("V5 synthetic exact-eval helpers", () => {
       }
     }
     Reflect.set(globalThis, "__syntheticEvalExecFileSync", execFileSync);
+    Reflect.set(globalThis, "__syntheticEvalSpawn", spawn);
     Reflect.set(globalThis, "__syntheticEvalReadFileSync", readFileSync);
     Reflect.set(globalThis, "__syntheticEvalFetch", fetch);
     Reflect.set(globalThis, "WebSocket", FakeSocket);
     const instrumented = helper.TURN_REMOTE_SCRIPT
       .replace(
-        /^  const \{ execFileSync \} = .*;$/m,
-        "  const execFileSync = globalThis.__syntheticEvalExecFileSync;",
+        /^  const \{ execFileSync, spawn \} = .*;$/m,
+        "  const execFileSync = globalThis.__syntheticEvalExecFileSync;\n" +
+          "  const spawn = globalThis.__syntheticEvalSpawn;",
       )
       .replace(
         /^  const \{ readFileSync \} = .*;$/m,
@@ -711,6 +830,7 @@ describe("V5 synthetic exact-eval helpers", () => {
       promptSha: createHash("sha256").update("answer once").digest("hex"),
       model: "glm-5.2",
       timeoutSeconds: 60,
+      containerId,
     })).toString("base64url");
     const argvLength = process.argv.length;
     process.argv.push(encoded);
@@ -732,7 +852,18 @@ describe("V5 synthetic exact-eval helpers", () => {
       assert.deepEqual(result.billing_binding.ledgerIds, ["57327", "57328"]);
       assert.equal(result.runtime.binding_queries, 1);
       assert.equal(result.runtime.matching_costs, 1);
+      assert.equal(result.runtime.prompt_watchers, 1);
+      assert.equal(result.runtime.prompt_ready, 1);
+      assert.equal(result.runtime.prompt_captures, 1);
+      assert.equal(result.extra_prompt.processes[0].aliveAfter, false);
       assert.ok(result.billing_evidence_wait_ms < 1_000);
+
+      watcherExitCode = 1;
+      await assert.rejects(
+        () => execute(),
+        /prompt watcher failed/,
+      );
+      watcherExitCode = 0;
 
       bindingVariant = "missing_dispatch";
       const beforeMissingDispatch = bindingQueries;
@@ -769,6 +900,7 @@ describe("V5 synthetic exact-eval helpers", () => {
       process.argv.length = argvLength;
       for (const name of [
         "__syntheticEvalExecFileSync",
+        "__syntheticEvalSpawn",
         "__syntheticEvalReadFileSync",
         "__syntheticEvalFetch",
         "__syntheticEvalResult",
@@ -801,7 +933,26 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.match(source, /socket\.addEventListener\("close"/);
     assert.match(source, /connection\.closes \+= 1/);
     assert.match(source, /runtime\.finals !== 1/);
+    assert.match(source, /Atomics\.wait\(sleepView,0,0,100\)/);
+    assert.match(source, /type:"ready",schemaVersion:1,containerId,pollMs:100/);
+    assert.match(source, /fs\.constants\.O_RDONLY\|fs\.constants\.O_NOFOLLOW/);
+    assert.match(source, /const before=fs\.fstatSync\(fd\)/);
+    assert.match(source, /const after=fs\.fstatSync\(fd\)/);
+    assert.match(source, /promptPaths\.size!==1/);
+    assert.match(source, /candidate\.sessionKey!==sessionKey/);
+    assert.ok(
+      source.indexOf("promptWatcher.ready.then")
+        < source.indexOf("socket.send(frame)"),
+      "the exact watcher READY gate precedes the one inbound send",
+    );
+    assert.match(source, /billingEvidenceAtMs = Date\.now\(\)/);
+    assert.match(source, /promptCapturedAtMs = Date\.now\(\)/);
+    assert.match(source, /billingEvidenceAtMs === null[\s\S]*promptCapturedAtMs === null/);
     assert.match(source, /openSync\(path, "wx"/);
+    assert.ok(
+      (source.match(/fsyncDirectory\(parent\)/g) ?? []).length >= 2,
+      "prompt publication fsyncs the directory before and after temp cleanup",
+    );
     for (const imported of source.matchAll(/from "([^"]+)"/g)) {
       assert.match(imported[1], /^node:/);
     }
