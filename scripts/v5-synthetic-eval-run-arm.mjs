@@ -4,7 +4,7 @@
  * lease. This process owns the whole critical section:
  *
  * stable precheck → overlay prepare → supported reprovision → actual container
- * hashes → one foreground true turn → actual extra-prompt bytes → postcheck →
+ * hashes → one foreground true turn with live extra-prompt capture → postcheck →
  * exact overlay recovery → supported reprovision back to standard stable.
  *
  * The two supplied helpers are immutable, root-owned files:
@@ -308,7 +308,13 @@ export function verifyCasePack(path, expectedSha, caseId, engine, model) {
   };
 }
 
-function helperEnvironment(options, phase, evaluationCase, outputs) {
+function helperEnvironment(
+  options,
+  phase,
+  evaluationCase,
+  outputs,
+  containerId = null,
+) {
   const inherited = Object.fromEntries(
     Object.entries(process.env).filter(
       ([name]) =>
@@ -331,11 +337,15 @@ function helperEnvironment(options, phase, evaluationCase, outputs) {
     OC_SYNTHETIC_EVAL_PROMPT: evaluationCase.prompt,
     OC_SYNTHETIC_EVAL_TURN_PATH: outputs.turn,
     OC_SYNTHETIC_EVAL_FRAMES_PATH: outputs.frames,
+    OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH: outputs.extraPrompt,
     OC_SYNTHETIC_EVAL_TIMEOUT_SECONDS: String(options.timeoutSeconds),
     OC_SYNTHETIC_EVAL_BASE_SHA: options.baseCommit,
     OC_SYNTHETIC_EVAL_CANDIDATE_SHA: options.candidateCommit,
     OC_SYNTHETIC_EVAL_PHASE: phase,
   };
+  if (containerId !== null) {
+    env.OC_SYNTHETIC_EVAL_CONTAINER_ID = containerId;
+  }
   return env;
 }
 
@@ -508,6 +518,83 @@ function readEvidenceFile(path, label) {
   };
 }
 
+function verifyTurnPromptEvidence(value, identity) {
+  const extra = value?.extra_prompt;
+  const sessionKey = `agent:${identity.agentId}:webchat:dm:${value?.peer_id}`;
+  if (
+    !extra
+    || typeof extra !== "object"
+    || extra.type !== "captured"
+    || extra.schemaVersion !== 1
+    || extra.containerId !== identity.containerId
+    || extra.engine !== identity.engine
+    || extra.sessionKey !== sessionKey
+    || typeof extra.path !== "string"
+    || !posix.isAbsolute(extra.path)
+    || posix.normalize(extra.path) !== extra.path
+    || posix.basename(extra.path) !== "extra-prompt.md"
+    || extra.captured_path !== identity.extraPromptPath
+    || Object.hasOwn(extra, "contentBase64")
+    || !Number.isSafeInteger(extra.bytes)
+    || extra.bytes < 1
+    || extra.bytes > 2 * 1024 * 1024
+    || !SHA256_RE.test(extra.sha256 ?? "")
+    || !Number.isSafeInteger(extra.candidateCount)
+    || extra.candidateCount < 1
+    || extra.selection !== (
+      identity.engine === "ccb"
+        ? "exact-session-process"
+        : "exact-session-unique-prompt-path"
+    )
+    || !Array.isArray(extra.processes)
+    || extra.processes.length !== extra.candidateCount
+  ) {
+    fail("turn helper extra-prompt identity/evidence is invalid");
+  }
+  if (identity.engine === "ccb" && extra.candidateCount !== 1) {
+    fail("turn helper CCB prompt evidence is not process-unique");
+  }
+  let priorPid = 0;
+  let aliveAtOpen = 0;
+  for (const processIdentity of extra.processes) {
+    if (
+      !Number.isSafeInteger(processIdentity?.pid)
+      || processIdentity.pid <= priorPid
+      || !/^[1-9][0-9]*$/.test(processIdentity.startTime ?? "")
+      || !SHA256_RE.test(processIdentity.cmdlineSha256 ?? "")
+      || typeof processIdentity.aliveAtOpen !== "boolean"
+      || typeof processIdentity.aliveAfter !== "boolean"
+    ) {
+      fail("turn helper extra-prompt process evidence is invalid");
+    }
+    priorPid = processIdentity.pid;
+    if (processIdentity.aliveAtOpen) aliveAtOpen += 1;
+  }
+  if (aliveAtOpen < 1) {
+    fail("turn helper extra-prompt evidence lacks a live engine process");
+  }
+  assertRootOwnedSafe(identity.extraPromptPath, "file", 0o600);
+  if (realpathSync(identity.extraPromptPath) !== identity.extraPromptPath) {
+    fail("captured extra-prompt path must already be canonical");
+  }
+  const bytes = readFileSync(identity.extraPromptPath);
+  if (
+    bytes.length !== extra.bytes
+    || createHash("sha256").update(bytes).digest("hex") !== extra.sha256
+  ) {
+    fail("captured extra-prompt bytes differ from live-turn evidence");
+  }
+  const { captured_path: _capturedPath, ...evidence } = extra;
+  return {
+    ...evidence,
+    source: {
+      path: identity.extraPromptPath,
+      bytes: bytes.length,
+      sha256: extra.sha256,
+    },
+  };
+}
+
 export function parseTurnResult(stdout, resultPath, framesPath, identity) {
   const lastLine = stdout.split("\n").filter(Boolean).at(-1) ?? "";
   if (lastLine !== resultPath) {
@@ -541,6 +628,8 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     || value.wall_ms < 0
     || typeof value.billing_evidence_at !== "string"
     || !Number.isFinite(Date.parse(value.billing_evidence_at))
+    || typeof value.prompt_captured_at !== "string"
+    || !Number.isFinite(Date.parse(value.prompt_captured_at))
     || !Number.isFinite(value.billing_evidence_wait_ms)
     || value.billing_evidence_wait_ms < 0
     || value.billing_evidence_wait_ms > 66_000
@@ -585,6 +674,7 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
   ) {
     fail("turn helper result identity/evidence is invalid");
   }
+  const prompt = verifyTurnPromptEvidence(value, identity);
   const frameValue = frames.value;
   if (
     !frameValue
@@ -609,6 +699,9 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     || frameValue.runtime?.websocket_instances !== 1
     || frameValue.runtime?.inbound_messages !== 1
     || frameValue.runtime?.finals !== 1
+    || frameValue.runtime?.prompt_watchers !== 1
+    || frameValue.runtime?.prompt_ready !== 1
+    || frameValue.runtime?.prompt_captures !== 1
     || !Number.isSafeInteger(frameValue.runtime?.binding_queries)
     || frameValue.runtime.binding_queries < 0
     || (identity.engine === "ccb" && frameValue.runtime.binding_queries < 1)
@@ -727,6 +820,7 @@ export function parseTurnResult(stdout, resultPath, framesPath, identity) {
     parsedFrames,
     sent,
     costFrames: costFrames.map((frame) => frame.payload),
+    prompt,
   };
 }
 
@@ -1480,7 +1574,13 @@ export function main(argv = process.argv.slice(2)) {
 
     const turnOutput = runNodeHelper(
       options.turnHelper,
-      helperEnvironment(options, "turn", evaluationCase, outputPaths),
+      helperEnvironment(
+        options,
+        "turn",
+        evaluationCase,
+        outputPaths,
+        overlayContainer.containerId,
+      ),
       turnHelperTimeoutMs(options.timeoutSeconds),
     );
     turn = parseTurnResult(
@@ -1497,6 +1597,8 @@ export function main(argv = process.argv.slice(2)) {
         uid: options.uid,
         engine: options.engine,
         agentId: options.agentId,
+        containerId: overlayContainer.containerId,
+        extraPromptPath: outputPaths.extraPrompt,
       },
     );
     assertHelperTreesUnchanged(helpers);
@@ -1520,6 +1622,11 @@ export function main(argv = process.argv.slice(2)) {
     ) {
       fail("turn result is bound to a different Docker container");
     }
+    const { source: _promptSource, ...extraPrompt } = turn.prompt;
+    promptEvidence = {
+      ...overlayContainer,
+      extraPrompt,
+    };
     turnEvidence = runRemote("turn-evidence", {
       ...remoteCommon(lease),
       uid: options.uid,
@@ -1579,23 +1686,6 @@ export function main(argv = process.argv.slice(2)) {
         identity: dynamicInputsPost.inputs.temporaryWorkspace,
       },
     );
-    const sessionKey =
-      `agent:${options.agentId}:webchat:dm:${turn.peerId}`;
-    promptEvidence = runRemote("extra-prompt-evidence", {
-      ...remoteCommon(lease),
-      uid: options.uid,
-      expectedBase: options.baseCommit,
-      candidateCommit: options.candidateCommit,
-      manifestSha: prepared.manifestSha,
-      recordNonce: prepared.nonce,
-      containerId: overlayContainer.containerId,
-      engine: options.engine,
-      sessionKey,
-    });
-    if (!SHA256_RE.test(promptEvidence.extraPrompt?.sha256 ?? "")) {
-      fail("actual extra-prompt evidence is invalid");
-    }
-
     post = snapshot(lease, options, pre.lockVersion);
     assertSameLane(pre, post);
     if (post.syntheticContainerId !== overlayContainer.containerId) {
@@ -1656,28 +1746,6 @@ export function main(argv = process.argv.slice(2)) {
     }
   }
 
-  const extraPromptPath = outputPaths.extraPrompt;
-  if (promptEvidence?.extraPrompt?.contentBase64) {
-    const {
-      contentBase64,
-      ...extraPromptWithoutContent
-    } = promptEvidence.extraPrompt;
-    const bytes = Buffer.from(contentBase64, "base64");
-    if (
-      bytes.length !== promptEvidence.extraPrompt.bytes
-      || createHash("sha256").update(bytes).digest("hex")
-        !== promptEvidence.extraPrompt.sha256
-    ) {
-      primaryError ??= new Error("extra-prompt evidence bytes failed local verification");
-    } else {
-      safeWriteExclusive(extraPromptPath, bytes);
-    }
-    promptEvidence = {
-      ...promptEvidence,
-      extraPrompt: extraPromptWithoutContent,
-    };
-  }
-
   const completedAt = new Date().toISOString();
   const evidence = {
     schemaVersion: 3,
@@ -1729,7 +1797,7 @@ export function main(argv = process.argv.slice(2)) {
       ...promptEvidence,
       extraPrompt: {
         ...promptEvidence.extraPrompt,
-        capturedPath: extraPromptPath,
+        capturedPath: outputPaths.extraPrompt,
       },
     },
     post,

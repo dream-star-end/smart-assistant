@@ -10,13 +10,15 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   openSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -29,6 +31,7 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const TRACE_ID_RE = /^[0-9a-f]{32}$/;
 const PEER_ID_RE = /^[A-Za-z0-9_-]{8,160}$/;
 const CLIENT_MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const CONTAINER_ID_RE = /^[0-9a-f]{64}$/;
 
 function requiredEnv(name, trim = true) {
   const raw = process.env[name];
@@ -127,11 +130,19 @@ export function readTurnInputs() {
   }
   const turnPath = absoluteNormalizedPath("OC_SYNTHETIC_EVAL_TURN_PATH");
   const framesPath = absoluteNormalizedPath("OC_SYNTHETIC_EVAL_FRAMES_PATH");
-  if (turnPath === framesPath) {
-    throw new Error("turn and frames output paths must be distinct");
+  const extraPromptPath = absoluteNormalizedPath(
+    "OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH",
+  );
+  if (new Set([turnPath, framesPath, extraPromptPath]).size !== 3) {
+    throw new Error("turn, frames, and extra-prompt output paths must be distinct");
   }
   assertSecureOutput(turnPath);
   assertSecureOutput(framesPath);
+  assertSecureOutput(extraPromptPath);
+  const containerId = requiredEnv("OC_SYNTHETIC_EVAL_CONTAINER_ID");
+  if (!CONTAINER_ID_RE.test(containerId)) {
+    throw new Error("OC_SYNTHETIC_EVAL_CONTAINER_ID must be a 64-hex Docker ID");
+  }
   return {
     uid,
     engine,
@@ -146,12 +157,14 @@ export function readTurnInputs() {
     timeoutSeconds,
     turnPath,
     framesPath,
+    extraPromptPath,
+    containerId,
   };
 }
 
 async function remoteTurn(encodedConfig) {
-  const { execFileSync } = await import("node:child_process");
-  const { randomBytes } = await import("node:crypto");
+  const { execFileSync, spawn } = await import("node:child_process");
+  const { createHash, randomBytes } = await import("node:crypto");
   const { readFileSync } = await import("node:fs");
 
   const config = JSON.parse(
@@ -179,6 +192,7 @@ async function remoteTurn(encodedConfig) {
     || typeof config.prompt !== "string"
     || !/^[0-9a-f]{64}$/.test(config.promptSha ?? "")
     || !/^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$/.test(config.model ?? "")
+    || !/^[0-9a-f]{64}$/.test(config.containerId ?? "")
     || !Number.isSafeInteger(config.timeoutSeconds)
     || config.timeoutSeconds < 60
     || config.timeoutSeconds > 1_050
@@ -257,6 +271,9 @@ async function remoteTurn(encodedConfig) {
     finals: 0,
     matching_costs: 0,
     binding_queries: 0,
+    prompt_watchers: 0,
+    prompt_ready: 0,
+    prompt_captures: 0,
   };
   runtime.login_requests += 1;
   const login = await fetch(`${base}/api/auth/login`, {
@@ -309,6 +326,194 @@ async function remoteTurn(encodedConfig) {
     throw new Error(`synthetic session PUT failed ${put.status}: ${(await put.text()).slice(0, 200)}`);
   }
 
+  const sessionKey = `agent:${config.agentId}:webchat:dm:${peerId}`;
+  const promptWatcherSource = [
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    'const { createHash } = require("node:crypto");',
+    'const [engine,sessionKey,containerId,timeoutText] = process.argv.slice(1);',
+    'if(!["ccb","codex"].includes(engine)||!/^agent:[A-Za-z0-9_-]+:webchat:dm:[A-Za-z0-9_-]{8,160}$/.test(sessionKey)||!/^[0-9a-f]{64}$/.test(containerId)||!/^[1-9][0-9]*$/.test(timeoutText))throw new Error("invalid prompt watcher identity");',
+    'const timeoutMs=Number(timeoutText);if(!Number.isSafeInteger(timeoutMs)||timeoutMs<60000||timeoutMs>1050000)throw new Error("invalid prompt watcher timeout");',
+    'const sha=(value)=>createHash("sha256").update(value).digest("hex");',
+    'const sleepView=new Int32Array(new SharedArrayBuffer(4));',
+    'const sleep=()=>Atomics.wait(sleepView,0,0,100);',
+    'const processStart=(pid)=>fs.readFileSync("/proc/"+pid+"/stat","utf8").split(" ")[21];',
+    'const parseEnv=(pid)=>Object.fromEntries(fs.readFileSync("/proc/"+pid+"/environ").toString("utf8").split("\\0").filter(Boolean).map((entry)=>{const index=entry.indexOf("=");return index<0?[entry,""]:[entry.slice(0,index),entry.slice(index+1)]}));',
+    'const promptSettings=(args)=>{const values=[];for(let index=0;index<args.length-1;index++){if(args[index]!=="-c"||!args[index+1].startsWith("model_instructions_file="))continue;let value=args[index+1].slice("model_instructions_file=".length);if(value.startsWith("\\\""))value=JSON.parse(value);values.push(value)}return values};',
+    'const codexSessions=(args)=>{const values=[];for(const arg of args){if(!arg.startsWith("mcp_servers.openclaude_memory.env="))continue;for(const match of arg.matchAll(/"OPENCLAUDE_SESSION_KEY"="([^"]+)"/g))values.push(match[1])}return values};',
+    'process.stdout.write(JSON.stringify({type:"ready",schemaVersion:1,containerId,pollMs:100})+"\\n");',
+    'const deadline=Date.now()+timeoutMs;let captureComplete=false;',
+    'captureLoop: while(Date.now()<deadline){',
+    ' const candidates=[];',
+    ' for(const name of fs.readdirSync("/proc")){',
+    '  if(!/^[0-9]+$/.test(name))continue;const root="/proc/"+name;',
+    '  try{',
+    '   const args=fs.readFileSync(root+"/cmdline").toString("utf8").split("\\0").filter(Boolean);',
+    '   if(engine==="ccb"){',
+    '    if(!args.includes("--append-system-prompt-file"))continue;',
+    '    const env=parseEnv(name);if(env.OPENCLAUDE_SESSION_KEY!==sessionKey)continue;',
+    '    const indexes=[];for(let index=0;index<args.length;index++)if(args[index]==="--append-system-prompt-file")indexes.push(index);',
+    '    if(indexes.length!==1||typeof args[indexes[0]+1]!=="string")throw new Error("session-bound CCB prompt argv is ambiguous");',
+    '    candidates.push({pid:Number(name),startTime:processStart(name),args,promptPath:args[indexes[0]+1],sessionKey});',
+    '   }else{',
+    '    if(!args.includes("app-server"))continue;',
+    '    const prompts=promptSettings(args);const sessions=codexSessions(args);',
+    '    if(prompts.length!==1||sessions.length!==1)throw new Error("Codex app-server prompt/session argv is ambiguous");',
+    '    candidates.push({pid:Number(name),startTime:processStart(name),args,promptPath:prompts[0],sessionKey:sessions[0]});',
+    '   }',
+    '  }catch(error){if(error&&["ENOENT","ESRCH"].includes(error.code))continue;throw error}',
+    ' }',
+    ' if(engine==="ccb"&&candidates.length>1)throw new Error("expected one session-bound CCB process, got "+candidates.length);',
+    ' if(candidates.length===0){sleep();continue}',
+    ' if(candidates.some((candidate)=>candidate.sessionKey!==sessionKey))throw new Error("fresh container has a Codex app-server for another session");',
+    ' const promptPaths=new Set();',
+    ' for(const candidate of candidates){if(typeof candidate.promptPath!=="string"||!path.isAbsolute(candidate.promptPath)||path.resolve(candidate.promptPath)!==candidate.promptPath||path.basename(candidate.promptPath)!=="extra-prompt.md")throw new Error("invalid extra prompt path");const real=fs.realpathSync(candidate.promptPath);if(real!==candidate.promptPath)throw new Error("extra prompt path is not canonical");promptPaths.add(real)}',
+    ' if(promptPaths.size!==1)throw new Error("session-bound engine processes use multiple prompt paths");',
+    ' const promptPath=[...promptPaths][0];let fd;',
+    ' try{fd=fs.openSync(promptPath,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW)}catch(error){if(error&&["ENOENT","ESRCH"].includes(error.code)){sleep();continue}throw error}',
+    ' try{',
+    '  const before=fs.fstatSync(fd);if(!before.isFile()||before.size>2097152)throw new Error("extra prompt is not a bounded regular file");',
+    '  const livePids=new Set();for(const candidate of candidates){try{if(processStart(candidate.pid)!==candidate.startTime)throw new Error("engine process identity changed before prompt capture");livePids.add(candidate.pid)}catch(error){if(!error||!["ENOENT","ESRCH"].includes(error.code))throw error}}',
+    '  if(livePids.size<1){fs.closeSync(fd);fd=undefined;sleep();continue}',
+    '  const bytes=fs.readFileSync(fd);const after=fs.fstatSync(fd);',
+    '  if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size||before.mtimeMs!==after.mtimeMs||bytes.length!==after.size)throw new Error("extra prompt file changed while reading exact fd");',
+    '  const processes=candidates.map((candidate)=>{let aliveAfter=false;try{aliveAfter=processStart(candidate.pid)===candidate.startTime}catch(error){if(!error||!["ENOENT","ESRCH"].includes(error.code))throw error}return {pid:candidate.pid,startTime:candidate.startTime,cmdlineSha256:sha(Buffer.from(candidate.args.join("\\0")+"\\0")),aliveAtOpen:livePids.has(candidate.pid),aliveAfter}}).sort((left,right)=>left.pid-right.pid);',
+    '  process.stdout.write(JSON.stringify({type:"captured",schemaVersion:1,containerId,engine,sessionKey,path:promptPath,bytes:bytes.length,sha256:sha(bytes),candidateCount:processes.length,selection:engine==="ccb"?"exact-session-process":"exact-session-unique-prompt-path",processes,contentBase64:bytes.toString("base64")})+"\\n");',
+    '  captureComplete=true;break captureLoop;',
+    ' }finally{if(fd!==undefined)fs.closeSync(fd)}',
+    '}',
+    'if(!captureComplete)throw new Error("session-bound extra prompt did not appear before watcher deadline");',
+  ].join("\n");
+
+  function startPromptWatcher() {
+    runtime.prompt_watchers += 1;
+    const child = spawn(
+      "docker",
+      [
+        "exec",
+        config.containerId,
+        "node",
+        "-e",
+        promptWatcherSource,
+        config.engine,
+        sessionKey,
+        config.containerId,
+        String(config.timeoutSeconds * 1_000),
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    let readyDone = false;
+    let captureSeen = false;
+    let captureSettled = false;
+    let captureEvent = null;
+    let exited = false;
+    let resolveReady;
+    let rejectReady;
+    let resolveCapture;
+    let rejectCapture;
+    const ready = new Promise((resolveReadyValue, rejectReadyValue) => {
+      resolveReady = resolveReadyValue;
+      rejectReady = rejectReadyValue;
+    });
+    const captured = new Promise((resolveCaptureValue, rejectCaptureValue) => {
+      resolveCapture = resolveCaptureValue;
+      rejectCapture = rejectCaptureValue;
+    });
+    const rejectPending = (error) => {
+      if (!readyDone) {
+        readyDone = true;
+        rejectReady(error);
+      }
+      if (!captureSettled) {
+        captureSettled = true;
+        rejectCapture(error);
+      }
+    };
+    const acceptLine = (line) => {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        throw new Error("prompt watcher returned non-JSON evidence");
+      }
+      if (!readyDone) {
+        if (
+          event?.type !== "ready"
+          || event.schemaVersion !== 1
+          || event.containerId !== config.containerId
+          || event.pollMs !== 100
+          || Object.keys(event).sort().join(",")
+            !== "containerId,pollMs,schemaVersion,type"
+        ) {
+          throw new Error("prompt watcher READY evidence is invalid");
+        }
+        readyDone = true;
+        runtime.prompt_ready += 1;
+        resolveReady(event);
+        return;
+      }
+      if (captureSeen || event?.type !== "captured") {
+        throw new Error("prompt watcher returned duplicate or unordered evidence");
+      }
+      captureSeen = true;
+      captureEvent = event;
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      try {
+        stdout += chunk;
+        if (Buffer.byteLength(stdout) > 4 * 1024 * 1024) {
+          throw new Error("prompt watcher stdout exceeds 4 MiB");
+        }
+        for (;;) {
+          const newline = stdout.indexOf("\n");
+          if (newline < 0) break;
+          const line = stdout.slice(0, newline);
+          stdout = stdout.slice(newline + 1);
+          if (line) acceptLine(line);
+        }
+      } catch (error) {
+        rejectPending(error);
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      if (Buffer.byteLength(stderr) > 64 * 1024) {
+        stderr = stderr.slice(-64 * 1024);
+      }
+    });
+    child.on("error", rejectPending);
+    child.on("close", (code, signal) => {
+      exited = true;
+      if (stdout.trim().length > 0) {
+        rejectPending(new Error("prompt watcher ended with an incomplete frame"));
+        return;
+      }
+      if (code !== 0 || !readyDone || !captureSeen) {
+        rejectPending(new Error(
+          `prompt watcher failed (${code ?? signal ?? "unknown"}): ${stderr.trim()}`,
+        ));
+        return;
+      }
+      if (!captureSettled) {
+        captureSettled = true;
+        runtime.prompt_captures += 1;
+        resolveCapture(captureEvent);
+      }
+    });
+    return {
+      ready,
+      captured,
+      cancel() {
+        if (!exited) child.kill("SIGKILL");
+      },
+    };
+  }
+
   const result = await new Promise((resolve, reject) => {
     runtime.websocket_instances += 1;
     const socket = new WebSocket(
@@ -318,12 +523,14 @@ async function remoteTurn(encodedConfig) {
     const frames = [];
     const connection = { opens: 0, closes: 0, reconnects: 0 };
     let sequence = 0;
+    let sendPreparing = false;
     let sent = false;
     let settled = false;
     let completionReady = false;
     let startedAtMs = null;
     let finalAtMs = null;
     let billingEvidenceAtMs = null;
+    let promptCapturedAtMs = null;
     let firstOutputAtMs = null;
     let finalText = "";
     let turnTraceId = null;
@@ -332,11 +539,13 @@ async function remoteTurn(encodedConfig) {
     let costFrame = null;
     const costFrames = [];
     let billingBinding = null;
+    let extraPrompt = null;
+    let promptWatcher = null;
     let bindingPoll = null;
     let bindingDeadlineMs = null;
     let billingDeadline = null;
     const connectDeadline = setTimeout(
-      () => fail(new Error("relay did not become ready in 120s")),
+      () => fail(new Error("relay and prompt watcher did not become ready in 120s")),
       120_000,
     );
     let turnDeadline = null;
@@ -358,6 +567,7 @@ async function remoteTurn(encodedConfig) {
       clearTimeout(billingDeadline);
       clearTimeout(closeDeadline);
       clearTimeout(bindingPoll);
+      promptWatcher?.cancel();
     };
     const fail = (error) => {
       if (settled) return;
@@ -368,17 +578,25 @@ async function remoteTurn(encodedConfig) {
       } catch {}
       reject(error);
     };
-    const requestSuccessfulClose = () => {
-      if (completionReady) return;
+    const maybeRequestSuccessfulClose = () => {
+      if (
+        completionReady
+        || billingEvidenceAtMs === null
+        || promptCapturedAtMs === null
+      ) return;
       completionReady = true;
-      billingEvidenceAtMs = Date.now();
       clearTimeout(turnDeadline);
-      clearTimeout(billingDeadline);
       closeDeadline = setTimeout(
         () => fail(new Error("turn relay did not close after successful capture")),
         10_000,
       );
       socket.close(1000, "turn captured");
+    };
+    const markBillingCaptured = () => {
+      if (billingEvidenceAtMs !== null) return;
+      billingEvidenceAtMs = Date.now();
+      clearTimeout(billingDeadline);
+      maybeRequestSuccessfulClose();
     };
     const readCcbBinding = () => {
       runtime.binding_queries += 1;
@@ -625,7 +843,7 @@ async function remoteTurn(encodedConfig) {
           costFrame = byRequest.get(binding.rootRequestIds[0]);
           costRequestId = costFrame.requestId;
           costTraceId = typeof costFrame.traceId === "string" ? costFrame.traceId : null;
-          requestSuccessfulClose();
+          markBillingCaptured();
           return;
         }
       }
@@ -637,6 +855,7 @@ async function remoteTurn(encodedConfig) {
     };
     const maybeComplete = () => {
       if (runtime.finals !== 1 || turnTraceId === null) return;
+      if (billingEvidenceAtMs !== null) return;
       if (config.engine === "ccb") {
         bindingDeadlineMs ??= finalAtMs + 60_000;
         if (bindingPoll === null) bindingPoll = setTimeout(pollCcbBinding, 0);
@@ -663,30 +882,104 @@ async function remoteTurn(encodedConfig) {
           (requestId) => typeof requestId === "string",
         ),
       };
-      requestSuccessfulClose();
+      markBillingCaptured();
     };
-    const sendTurn = () => {
-      if (sent) return;
-      sent = true;
-      clearTimeout(connectDeadline);
-      startedAtMs = Date.now();
-      const frame = JSON.stringify({
-        type: "inbound.message",
-        channel: "webchat",
-        peer: { id: peerId, kind: "dm" },
-        clientMessageId,
-        agentId: config.agentId,
-        model: config.model,
-        content: { text: config.prompt },
-        ts: startedAtMs,
-      });
-      record("sent", frame);
-      socket.send(frame);
-      runtime.inbound_messages += 1;
-      turnDeadline = setTimeout(
-        () => fail(new Error(`turn did not complete in ${config.timeoutSeconds}s`)),
-        config.timeoutSeconds * 1_000,
-      );
+    const validatePromptCapture = (event) => {
+      if (
+        !event
+        || event.type !== "captured"
+        || event.schemaVersion !== 1
+        || event.containerId !== config.containerId
+        || event.engine !== config.engine
+        || event.sessionKey !== sessionKey
+        || typeof event.path !== "string"
+        || !event.path.startsWith("/")
+        || !event.path.endsWith("/extra-prompt.md")
+        || !Number.isSafeInteger(event.bytes)
+        || event.bytes < 1
+        || event.bytes > 2 * 1024 * 1024
+        || !/^[0-9a-f]{64}$/.test(event.sha256 ?? "")
+        || !Number.isSafeInteger(event.candidateCount)
+        || event.candidateCount < 1
+        || event.selection !== (
+          config.engine === "ccb"
+            ? "exact-session-process"
+            : "exact-session-unique-prompt-path"
+        )
+        || !Array.isArray(event.processes)
+        || event.processes.length !== event.candidateCount
+        || typeof event.contentBase64 !== "string"
+      ) {
+        throw new Error("prompt watcher capture identity is invalid");
+      }
+      if (config.engine === "ccb" && event.candidateCount !== 1) {
+        throw new Error("CCB prompt capture is not bound to one process");
+      }
+      const pids = new Set();
+      for (const processIdentity of event.processes) {
+        if (
+          !Number.isSafeInteger(processIdentity?.pid)
+          || processIdentity.pid < 1
+          || !/^[1-9][0-9]*$/.test(processIdentity.startTime ?? "")
+          || !/^[0-9a-f]{64}$/.test(processIdentity.cmdlineSha256 ?? "")
+          || typeof processIdentity.aliveAtOpen !== "boolean"
+          || typeof processIdentity.aliveAfter !== "boolean"
+          || pids.has(processIdentity.pid)
+        ) {
+          throw new Error("prompt watcher process identity is invalid");
+        }
+        pids.add(processIdentity.pid);
+      }
+      if (!event.processes.some((identity) => identity.aliveAtOpen)) {
+        throw new Error("prompt watcher did not capture a live engine process");
+      }
+      const bytes = Buffer.from(event.contentBase64, "base64");
+      if (
+        bytes.toString("base64") !== event.contentBase64
+        || bytes.length !== event.bytes
+        || createHash("sha256").update(bytes).digest("hex") !== event.sha256
+      ) {
+        throw new Error("prompt watcher capture bytes are invalid");
+      }
+      return event;
+    };
+    const prepareAndSendTurn = () => {
+      if (sent || sendPreparing) return;
+      sendPreparing = true;
+      promptWatcher = startPromptWatcher();
+      promptWatcher.captured.then((event) => {
+        if (settled) return;
+        try {
+          extraPrompt = validatePromptCapture(event);
+          promptCapturedAtMs = Date.now();
+          maybeRequestSuccessfulClose();
+        } catch (error) {
+          fail(error);
+        }
+      }, fail);
+      promptWatcher.ready.then(() => {
+        if (settled) return;
+        sent = true;
+        clearTimeout(connectDeadline);
+        startedAtMs = Date.now();
+        const frame = JSON.stringify({
+          type: "inbound.message",
+          channel: "webchat",
+          peer: { id: peerId, kind: "dm" },
+          clientMessageId,
+          agentId: config.agentId,
+          model: config.model,
+          content: { text: config.prompt },
+          ts: startedAtMs,
+        });
+        record("sent", frame);
+        socket.send(frame);
+        runtime.inbound_messages += 1;
+        turnDeadline = setTimeout(
+          () => fail(new Error(`turn did not complete in ${config.timeoutSeconds}s`)),
+          config.timeoutSeconds * 1_000,
+        );
+      }, fail);
     };
 
     socket.addEventListener("open", () => {
@@ -706,7 +999,7 @@ async function remoteTurn(encodedConfig) {
         return;
       }
       if (!sent) {
-        if (frame?.type === "sys.relay_ready") sendTurn();
+        if (frame?.type === "sys.relay_ready") prepareAndSendTurn();
         return;
       }
       if (
@@ -783,6 +1076,12 @@ async function remoteTurn(encodedConfig) {
         || runtime.inbound_messages !== 1
         || runtime.finals !== 1
         || runtime.matching_costs < 1
+        || runtime.prompt_watchers !== 1
+        || runtime.prompt_ready !== 1
+        || runtime.prompt_captures !== 1
+        || extraPrompt === null
+        || promptCapturedAtMs === null
+        || billingEvidenceAtMs === null
       ) {
         fail(new Error("turn connection/runtime counts are not exact"));
         return;
@@ -804,6 +1103,7 @@ async function remoteTurn(encodedConfig) {
         started_at: new Date(startedAtMs).toISOString(),
         finished_at: new Date(finalAtMs).toISOString(),
         billing_evidence_at: new Date(billingEvidenceAtMs).toISOString(),
+        prompt_captured_at: new Date(promptCapturedAtMs).toISOString(),
         wall_ms: finalAtMs - startedAtMs,
         billing_evidence_wait_ms: billingEvidenceAtMs - finalAtMs,
         ttft_ms: firstOutputAtMs === null ? null : firstOutputAtMs - startedAtMs,
@@ -813,6 +1113,7 @@ async function remoteTurn(encodedConfig) {
         cost_trace_id: costTraceId,
         cost: costFrame,
         billing_binding: billingBinding,
+        extra_prompt: extraPrompt,
         connection,
         runtime,
         frames,
@@ -825,6 +1126,70 @@ async function remoteTurn(encodedConfig) {
 
 export const TURN_REMOTE_SCRIPT =
   `await (${remoteTurn.toString()})(process.argv.at(-1));\n`;
+
+function extraPromptBytes(value, expected, peerId) {
+  const sessionKey = `agent:${expected.agentId}:webchat:dm:${peerId}`;
+  if (
+    !value
+    || typeof value !== "object"
+    || value.type !== "captured"
+    || value.schemaVersion !== 1
+    || value.containerId !== expected.containerId
+    || value.engine !== expected.engine
+    || value.sessionKey !== sessionKey
+    || typeof value.path !== "string"
+    || !isAbsolute(value.path)
+    || resolve(value.path) !== value.path
+    || !value.path.endsWith("/extra-prompt.md")
+    || !Number.isSafeInteger(value.bytes)
+    || value.bytes < 1
+    || value.bytes > 2 * 1024 * 1024
+    || !SHA256_RE.test(value.sha256 ?? "")
+    || !Number.isSafeInteger(value.candidateCount)
+    || value.candidateCount < 1
+    || value.selection !== (
+      expected.engine === "ccb"
+        ? "exact-session-process"
+        : "exact-session-unique-prompt-path"
+    )
+    || !Array.isArray(value.processes)
+    || value.processes.length !== value.candidateCount
+    || typeof value.contentBase64 !== "string"
+  ) {
+    throw new Error("remote extra-prompt evidence is invalid");
+  }
+  if (expected.engine === "ccb" && value.candidateCount !== 1) {
+    throw new Error("remote CCB extra-prompt evidence is not process-unique");
+  }
+  let priorPid = 0;
+  let aliveAtOpen = 0;
+  for (const identity of value.processes) {
+    if (
+      !Number.isSafeInteger(identity?.pid)
+      || identity.pid <= priorPid
+      || !/^[1-9][0-9]*$/.test(identity.startTime ?? "")
+      || !SHA256_RE.test(identity.cmdlineSha256 ?? "")
+      || typeof identity.aliveAtOpen !== "boolean"
+      || typeof identity.aliveAfter !== "boolean"
+    ) {
+      throw new Error("remote extra-prompt process evidence is invalid");
+    }
+    priorPid = identity.pid;
+    if (identity.aliveAtOpen) aliveAtOpen += 1;
+  }
+  if (aliveAtOpen < 1) {
+    throw new Error("remote extra-prompt evidence lacks a live engine process");
+  }
+  const bytes = Buffer.from(value.contentBase64, "base64");
+  if (
+    bytes.toString("base64") !== value.contentBase64
+    || bytes.length !== value.bytes
+    || createHash("sha256").update(bytes).digest("hex") !== value.sha256
+  ) {
+    throw new Error("remote extra-prompt bytes are corrupt or non-canonical");
+  }
+  return bytes;
+}
 
 function parseRemoteTurn(stdout, expected) {
   const lines = stdout.trim().split("\n").filter(Boolean);
@@ -852,6 +1217,8 @@ function parseRemoteTurn(stdout, expected) {
     || !Number.isFinite(Date.parse(value.finished_at))
     || typeof value.billing_evidence_at !== "string"
     || !Number.isFinite(Date.parse(value.billing_evidence_at))
+    || typeof value.prompt_captured_at !== "string"
+    || !Number.isFinite(Date.parse(value.prompt_captured_at))
     || !Number.isFinite(value.wall_ms)
     || value.wall_ms < 0
     || !Number.isFinite(value.billing_evidence_wait_ms)
@@ -907,11 +1274,15 @@ function parseRemoteTurn(stdout, expected) {
     || value.runtime?.websocket_instances !== 1
     || value.runtime?.inbound_messages !== 1
     || value.runtime?.finals !== 1
+    || value.runtime?.prompt_watchers !== 1
+    || value.runtime?.prompt_ready !== 1
+    || value.runtime?.prompt_captures !== 1
     || !Number.isSafeInteger(value.runtime?.matching_costs)
     || value.runtime.matching_costs < 1
   ) {
     throw new Error("remote turn output is invalid or differs from runner identity");
   }
+  extraPromptBytes(value.extra_prompt, expected, value.peer_id);
   let inboundCount = 0;
   let finalCount = 0;
   let matchingFinalCount = 0;
@@ -1007,6 +1378,44 @@ function writeExclusive(path, bytes) {
   chmodSync(path, 0o600);
 }
 
+function fsyncDirectory(path) {
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeDurableExclusive(path, bytes) {
+  const parent = dirname(path);
+  const temporary = `${path}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  let fd = null;
+  let temporaryExists = false;
+  try {
+    fd = openSync(temporary, "wx", 0o600);
+    temporaryExists = true;
+    writeFileSync(fd, bytes);
+    chmodSync(temporary, 0o600);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    linkSync(temporary, path);
+    fsyncDirectory(parent);
+    unlinkSync(temporary);
+    temporaryExists = false;
+    fsyncDirectory(parent);
+  } finally {
+    if (fd !== null) closeSync(fd);
+    if (temporaryExists) {
+      try {
+        unlinkSync(temporary);
+        fsyncDirectory(parent);
+      } catch {}
+    }
+  }
+}
+
 export function main() {
   const inputs = readTurnInputs();
   const sshBinary = process.env.OC_SYNTHETIC_EVAL_SSH_BINARY?.trim() || "ssh";
@@ -1025,6 +1434,7 @@ export function main() {
     promptSha: inputs.promptSha,
     model: inputs.model,
     timeoutSeconds: inputs.timeoutSeconds,
+    containerId: inputs.containerId,
   };
   const encoded = Buffer.from(JSON.stringify(remoteConfig)).toString("base64url");
   const result = spawnSync(
@@ -1052,6 +1462,11 @@ export function main() {
     );
   }
   const remote = parseRemoteTurn(result.stdout, inputs);
+  const promptBytes = extraPromptBytes(remote.extra_prompt, inputs, remote.peer_id);
+  const {
+    contentBase64: _contentBase64,
+    ...extraPromptEvidence
+  } = remote.extra_prompt;
   const frameDocument = {
     schema_version: 2,
     peer_id: remote.peer_id,
@@ -1088,6 +1503,7 @@ export function main() {
     started_at: remote.started_at,
     finished_at: remote.finished_at,
     billing_evidence_at: remote.billing_evidence_at,
+    prompt_captured_at: remote.prompt_captured_at,
     wall_ms: remote.wall_ms,
     billing_evidence_wait_ms: remote.billing_evidence_wait_ms,
     ttft_ms: remote.ttft_ms,
@@ -1097,6 +1513,10 @@ export function main() {
     cost_trace_id: remote.cost_trace_id,
     cost: remote.cost,
     billing_binding: remote.billing_binding,
+    extra_prompt: {
+      ...extraPromptEvidence,
+      captured_path: inputs.extraPromptPath,
+    },
     connection: remote.connection,
     runtime: remote.runtime,
     frames_path: inputs.framesPath,
@@ -1105,6 +1525,7 @@ export function main() {
     frame_count: remote.frames.length,
   };
   const turnBytes = Buffer.from(`${JSON.stringify(turnDocument)}\n`);
+  writeDurableExclusive(inputs.extraPromptPath, promptBytes);
   writeExclusive(inputs.framesPath, frameBytes);
   writeExclusive(inputs.turnPath, turnBytes);
   process.stdout.write(`${inputs.turnPath}\n`);

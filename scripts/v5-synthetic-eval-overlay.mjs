@@ -976,23 +976,6 @@ const CONTAINER_HASH_SOURCE = [
   'process.stdout.write(JSON.stringify({promptsTree:tree("/run/oc/synthetic-eval/prompts"),promptSlots:regular("/opt/openclaude/packages/gateway/src/promptSlots.ts"),agents:regular("/opt/openclaude/AGENTS.md"),claude:regular("/run/oc/claude-config/CLAUDE.md"),skillsTree:tree("/run/oc/claude-config/skills")}));',
 ].join("\n");
 
-const EXTRA_PROMPT_SOURCE = [
-  'const fs = require("node:fs");',
-  'const path = require("node:path");',
-  'const { createHash } = require("node:crypto");',
-  'const [engine,sessionKey] = process.argv.slice(1);',
-  'const sha = (value) => createHash("sha256").update(value).digest("hex");',
-  'const candidates=[];',
-  'for(const name of fs.readdirSync("/proc")){if(!/^[0-9]+$/.test(name))continue;const root="/proc/"+name;try{const args=fs.readFileSync(root+"/cmdline").toString("utf8").split("\\0").filter(Boolean);const env=Object.fromEntries(fs.readFileSync(root+"/environ").toString("utf8").split("\\0").filter(Boolean).map((entry)=>{const index=entry.indexOf("=");return index<0?[entry,""]:[entry.slice(0,index),entry.slice(index+1)]}));let promptPath=null;if(engine==="ccb"&&env.OPENCLAUDE_SESSION_KEY===sessionKey){const index=args.indexOf("--append-system-prompt-file");if(index>=0)promptPath=args[index+1]||null}else if(engine==="codex"&&args.some((arg)=>arg==="app-server")){for(let index=0;index<args.length-1;index++){if(args[index]!=="-c"||!args[index+1].startsWith("model_instructions_file="))continue;let value=args[index+1].slice("model_instructions_file=".length);if(value.startsWith("\\""))value=JSON.parse(value);promptPath=value;break}}if(promptPath)candidates.push({pid:Number(name),args,promptPath,startTime:fs.readFileSync(root+"/stat","utf8").split(" ")[21]})}catch{}}',
-  'let candidate;if(engine==="ccb"){if(candidates.length!==1)throw new Error("expected exactly one session-bound CCB process, got "+candidates.length);candidate=candidates[0]}else{if(candidates.length<1)throw new Error("no Codex app-server process found");candidates.sort((left,right)=>BigInt(left.startTime)<BigInt(right.startTime)?-1:BigInt(left.startTime)>BigInt(right.startTime)?1:0);if(candidates.length>1&&candidates[0].startTime===candidates[1].startTime)throw new Error("cannot identify the unique earliest Codex app-server");candidate=candidates[0]}',
-  'if(!path.isAbsolute(candidate.promptPath)||path.basename(candidate.promptPath)!=="extra-prompt.md")throw new Error("invalid extra prompt path");',
-  'const before=fs.lstatSync(candidate.promptPath);if(!before.isFile()||before.isSymbolicLink())throw new Error("extra prompt is not a regular file");',
-  'const bytes=fs.readFileSync(candidate.promptPath);if(bytes.length>2097152)throw new Error("extra prompt evidence exceeds 2 MiB");',
-  'const after=fs.lstatSync(candidate.promptPath);const startAfter=fs.readFileSync("/proc/"+candidate.pid+"/stat","utf8").split(" ")[21];',
-  'if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size||before.mtimeMs!==after.mtimeMs||candidate.startTime!==startAfter)throw new Error("extra prompt/process changed while hashing");',
-  'process.stdout.write(JSON.stringify({pid:candidate.pid,startTime:candidate.startTime,path:candidate.promptPath,bytes:bytes.length,sha256:sha(bytes),cmdlineSha256:sha(Buffer.from(candidate.args.join("\\0")+"\\0")),candidateCount:candidates.length,selection:engine==="ccb"?"exact-session-key":"earliest-in-fresh-exclusive-container",contentBase64:bytes.toString("base64")}));',
-].join("\n");
-
 const DYNAMIC_INPUT_SOURCE = [
   'const fs = require("node:fs");',
   'const path = require("node:path");',
@@ -1122,25 +1105,6 @@ function inspectContainer() {
     nonce: payload.recordNonce,
     runtimeTuple,
     hashes: actual,
-  };
-}
-
-function inspectExtraPrompt() {
-  if (!["ccb", "codex"].includes(payload.engine)) fail("extra prompt engine is invalid");
-  if (
-    typeof payload.sessionKey !== "string"
-    || !/^agent:[A-Za-z0-9_-]+:webchat:dm:[A-Za-z0-9_-]{8,160}$/.test(payload.sessionKey)
-  ) {
-    fail("extra prompt session key is invalid");
-  }
-  const evidence = inspectContainer();
-  return {
-    ...evidence,
-    extraPrompt: dockerExecJson(
-      evidence.container,
-      EXTRA_PROMPT_SOURCE,
-      [payload.engine, payload.sessionKey],
-    ),
   };
 }
 
@@ -1622,8 +1586,6 @@ try {
     result = withRecordLock((assertHeld) => removeRecord(true, assertHeld));
   } else if (action === "container-evidence") {
     result = inspectContainer();
-  } else if (action === "extra-prompt-evidence") {
-    result = inspectExtraPrompt();
   } else if (action === "dynamic-input-evidence") {
     result = inspectDynamicInputs();
   } else if (action === "workspace-artifact-evidence") {

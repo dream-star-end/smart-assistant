@@ -234,6 +234,11 @@ describe("V5 synthetic exact-eval run-arm", () => {
     const directory = temp("v5-run-arm-result-");
     const resultPath = join(directory, "turn.json");
     const framesPath = join(directory, "frames.json");
+    const extraPromptPath = join(directory, "extra-prompt.md");
+    const extraPromptBytes = Buffer.from("live captured prompt\n");
+    const extraPromptSha = createHash("sha256")
+      .update(extraPromptBytes)
+      .digest("hex");
     const prompt = "Evaluate this exact task.";
     const promptSha = createHash("sha256").update(prompt).digest("hex");
     const traceId = "a".repeat(32);
@@ -248,6 +253,8 @@ describe("V5 synthetic exact-eval run-arm", () => {
       uid: 247,
       engine: "ccb",
       agentId: "research-assistant",
+      containerId,
+      extraPromptPath,
     };
     const frames = {
       schema_version: 2,
@@ -271,6 +278,9 @@ describe("V5 synthetic exact-eval run-arm", () => {
         finals: 1,
         matching_costs: 1,
         binding_queries: 1,
+        prompt_watchers: 1,
+        prompt_ready: 1,
+        prompt_captures: 1,
       },
       billing_binding: {
         mode: "ccb_authority_dispatch_attempt",
@@ -331,6 +341,8 @@ describe("V5 synthetic exact-eval run-arm", () => {
     }
     writeFileSync(framesPath, JSON.stringify(frames), { mode: 0o600 });
     chmodSync(framesPath, 0o600);
+    writeFileSync(extraPromptPath, extraPromptBytes, { mode: 0o600 });
+    chmodSync(extraPromptPath, 0o600);
     const frameBytes = readFileSync(framesPath);
     writeFileSync(resultPath, JSON.stringify({
       schema_version: 2,
@@ -352,6 +364,7 @@ describe("V5 synthetic exact-eval run-arm", () => {
       started_at: "2026-07-31T10:00:00.000Z",
       finished_at: "2026-07-31T10:14:59.900Z",
       billing_evidence_at: "2026-07-31T10:15:59.900Z",
+      prompt_captured_at: "2026-07-31T10:00:01.000Z",
       trace_id: traceId,
       billing_binding: frames.billing_binding,
       connection: frames.connection,
@@ -360,6 +373,27 @@ describe("V5 synthetic exact-eval run-arm", () => {
       billing_evidence_wait_ms: 60_000,
       ttft_ms: 899_900,
       final_text: "Done.",
+      extra_prompt: {
+        type: "captured",
+        schemaVersion: 1,
+        containerId,
+        engine: identity.engine,
+        sessionKey:
+          `agent:${identity.agentId}:webchat:dm:peer_0123456789`,
+        path: "/tmp/turn/extra-prompt.md",
+        captured_path: extraPromptPath,
+        bytes: extraPromptBytes.length,
+        sha256: extraPromptSha,
+        candidateCount: 1,
+        selection: "exact-session-process",
+        processes: [{
+          pid: 88,
+          startTime: "123456",
+          cmdlineSha256: "c".repeat(64),
+          aliveAtOpen: true,
+          aliveAfter: false,
+        }],
+      },
     }), {
       mode: 0o600,
     });
@@ -379,7 +413,44 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.equal(turn.parsedFrames.length, 3);
     assert.equal(turn.value.wall_ms, 899_900);
     assert.equal(turn.value.billing_evidence_wait_ms, 60_000);
+    assert.equal(turn.prompt.source.path, extraPromptPath);
+    assert.equal(turn.prompt.processes[0].aliveAfter, false);
     assert.equal(turnHelperTimeoutMs(900), 1_110_000);
+
+    const storedTurn = JSON.parse(readFileSync(resultPath, "utf8"));
+    const injectedPath = join(directory, "turn-with-injected-bytes.json");
+    writeFileSync(injectedPath, JSON.stringify({
+      ...storedTurn,
+      extra_prompt: {
+        ...storedTurn.extra_prompt,
+        contentBase64: extraPromptBytes.toString("base64"),
+      },
+    }), { mode: 0o600 });
+    chmodSync(injectedPath, 0o600);
+    assert.throws(
+      () => parseTurnResult(`${injectedPath}\n`, injectedPath, framesPath, identity),
+      /extra-prompt identity\/evidence/,
+    );
+
+    const wrongContainerPath = join(directory, "turn-wrong-container.json");
+    writeFileSync(wrongContainerPath, JSON.stringify({
+      ...storedTurn,
+      extra_prompt: {
+        ...storedTurn.extra_prompt,
+        containerId: "0".repeat(64),
+      },
+    }), { mode: 0o600 });
+    chmodSync(wrongContainerPath, 0o600);
+    assert.throws(
+      () => parseTurnResult(
+        `${wrongContainerPath}\n`,
+        wrongContainerPath,
+        framesPath,
+        identity,
+      ),
+      /extra-prompt identity\/evidence/,
+    );
+
     assert.throws(
       () => parseTurnResult(
         `${resultPath}\n`,
@@ -388,6 +459,12 @@ describe("V5 synthetic exact-eval run-arm", () => {
         { ...identity, model: "gpt-5.6-sol" },
       ),
       /identity\/evidence/,
+    );
+    writeFileSync(extraPromptPath, "corrupted", { mode: 0o600 });
+    chmodSync(extraPromptPath, 0o600);
+    assert.throws(
+      () => parseTurnResult(`${resultPath}\n`, resultPath, framesPath, identity),
+      /captured extra-prompt bytes differ/,
     );
   });
 
@@ -758,7 +835,10 @@ describe("V5 synthetic exact-eval run-arm", () => {
       "the wrapper name appears only in usage; the runner never nests it",
     );
     assert.match(source, /"container-evidence"/);
-    assert.match(source, /"extra-prompt-evidence"/);
+    assert.doesNotMatch(source, /"extra-prompt-evidence"/);
+    assert.match(source, /OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH/);
+    assert.match(source, /OC_SYNTHETIC_EVAL_CONTAINER_ID/);
+    assert.match(source, /const \{ source: _promptSource, \.\.\.extraPrompt \} = turn\.prompt/);
     assert.match(source, /"dynamic-input-evidence"/);
     assert.match(source, /"workspace-artifact-evidence"/);
     assert.match(source, /"turn-evidence"/);
