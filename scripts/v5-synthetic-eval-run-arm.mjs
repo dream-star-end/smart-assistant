@@ -59,6 +59,13 @@ const HELPER_TIMEOUT_MS = 180_000;
 // 120s for readiness, 60s for post-final billing persistence, 10s for the
 // clean WebSocket close, plus 20s of process-boundary margin.
 const TURN_HELPER_FIXED_OVERHEAD_MS = 210_000;
+const EMPTY_TREE_SHA256 =
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const SCRATCH_INPUT_NAMES = [
+  "workspace",
+  "browserCliScratch",
+  "browserMcpScratch",
+];
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
 const overlayDriver = resolve(here, "v5-synthetic-eval-overlay.mjs");
@@ -1088,13 +1095,40 @@ export function assertDynamicInputsStable(before, after, workspaceMode) {
     "userSoul",
     "userProfile",
     "userSkills",
-    "workspace",
   ]) {
     if (
       JSON.stringify(beforeInputs[name])
       !== JSON.stringify(afterInputs[name])
     ) {
       fail(`dynamic input changed during exact arm: ${name}`);
+    }
+  }
+  for (const name of SCRATCH_INPUT_NAMES) {
+    const beforeScratch = beforeInputs[name];
+    const afterScratch = afterInputs[name];
+    if (
+      beforeScratch?.state !== "tree"
+      || beforeScratch.files !== 0
+      || beforeScratch.directories !== 0
+      || beforeScratch.sha256 !== EMPTY_TREE_SHA256
+      || beforeScratch.uid !== 1000
+      || beforeScratch.gid !== 1000
+      || beforeScratch.mode !== 0o700
+    ) {
+      fail(`isolated scratch was not an empty agent-owned tree before the turn: ${name}`);
+    }
+    if (
+      afterScratch?.state !== "tree"
+      || !Number.isSafeInteger(afterScratch.files)
+      || afterScratch.files < 0
+      || !Number.isSafeInteger(afterScratch.directories)
+      || afterScratch.directories < 0
+      || !SHA256_RE.test(afterScratch.sha256 ?? "")
+      || afterScratch.uid !== 1000
+      || afterScratch.gid !== 1000
+      || afterScratch.mode !== 0o700
+    ) {
+      fail(`isolated scratch identity is invalid after the turn: ${name}`);
     }
   }
   if (beforeInputs.temporaryWorkspace?.state !== "absent") {
@@ -1106,6 +1140,55 @@ export function assertDynamicInputsStable(before, after, workspaceMode) {
   ) {
     fail("non-workspace case created the reserved temporary workspace");
   }
+}
+
+export function assertStandardScratchRestored(before, after) {
+  if (!before?.standard || !after?.standard) {
+    fail("standard container scratch evidence is missing");
+  }
+  assertPersistentScratchIdentity(
+    before.persistentScratch,
+    "standard container scratch before the arm",
+  );
+  assertPersistentScratchIdentity(
+    after.persistentScratch,
+    "standard container scratch after restoration",
+  );
+  if (
+    JSON.stringify(before.persistentScratch)
+    !== JSON.stringify(after.persistentScratch)
+  ) {
+    fail("persistent scratch changed across exact arm restoration");
+  }
+}
+
+export function assertPersistentScratchIdentity(value, label) {
+  if (
+    !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || JSON.stringify(Object.keys(value).sort())
+      !== JSON.stringify(["browserCli", "browserMcp", "workspace"])
+  ) {
+    fail(`${label} has an invalid shape`);
+  }
+  for (const name of ["workspace", "browserCli", "browserMcp"]) {
+    const identity = value[name];
+    if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
+      fail(`${label}.${name} is missing`);
+    }
+    if (
+      identity.state !== "tree"
+      || !Number.isSafeInteger(identity.files)
+      || identity.files < 0
+      || !Number.isSafeInteger(identity.directories)
+      || identity.directories < 0
+      || !SHA256_RE.test(identity.sha256 ?? "")
+    ) {
+      fail(`${label}.${name} tree identity is invalid`);
+    }
+  }
+  return value;
 }
 
 export function assertTurnUsageMatchesFrames(turn, evidence) {
@@ -1500,6 +1583,7 @@ export function main(argv = process.argv.slice(2)) {
   const expectedManifestSha = identityBundle.manifestSha;
   rmSync(identityBundle.bundleRoot, { recursive: true, force: true });
   let prepareAttempted = false;
+  let standardBefore = null;
   let prepared = null;
   let overlayContainer = null;
   let dynamicInputsPre = null;
@@ -1516,6 +1600,18 @@ export function main(argv = process.argv.slice(2)) {
   let cleanupError = null;
 
   try {
+    standardBefore = runRemote("standard-container-evidence", {
+      ...remoteCommon(lease),
+      uid: options.uid,
+      containerId: pre.syntheticContainerId,
+    });
+    if (standardBefore?.standard !== true) {
+      fail("standard container scratch evidence is missing before the arm");
+    }
+    assertPersistentScratchIdentity(
+      standardBefore.persistentScratch,
+      "standard container scratch before the arm",
+    );
     prepareAttempted = true;
     prepared = runOverlay([
       "prepare",
@@ -1735,6 +1831,7 @@ export function main(argv = process.argv.slice(2)) {
           uid: options.uid,
           containerId: restoreResult.id,
         });
+        assertStandardScratchRestored(standardBefore, restored);
         if (
           overlayContainer
           && restored.containerId === overlayContainer.containerId
@@ -1754,7 +1851,7 @@ export function main(argv = process.argv.slice(2)) {
 
   const completedAt = new Date().toISOString();
   const evidence = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     status: primaryError || cleanupError ? "failed" : "completed",
     arm: options.arm,
     uid: options.uid,
@@ -1780,6 +1877,7 @@ export function main(argv = process.argv.slice(2)) {
     prepareNonce,
     expectedManifestSha,
     pre,
+    standardBefore,
     prepared,
     overlayContainer,
     dynamicInputs: dynamicInputsPre && dynamicInputsPost

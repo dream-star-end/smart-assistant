@@ -14,7 +14,9 @@ import { afterEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  assertDynamicInputsStable,
   assertSameLane,
+  assertStandardScratchRestored,
   assertTurnUsageMatchesFrames,
   analyzeEfficiency,
   durablyPersistWorkspaceArtifact,
@@ -886,6 +888,93 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.throws(
       () => assertSameLane(before, { ...before, v3State: "active" }),
       /v3State/,
+    );
+  });
+
+  test("allows isolated scratch writes but keeps real inputs and persistent scratch exact", () => {
+    const emptyScratch = {
+      state: "tree",
+      files: 0,
+      directories: 0,
+      sha256: createHash("sha256").update("").digest("hex"),
+      uid: 1000,
+      gid: 1000,
+      mode: 0o700,
+    };
+    const stable = {
+      agentClaude: { state: "file", bytes: 1, sha256: "a".repeat(64) },
+      agentMemoryIndex: { state: "absent" },
+      agentMemoryTree: { state: "absent" },
+      userSoul: { state: "absent" },
+      userProfile: { state: "absent" },
+      userSkills: { state: "tree", files: 0, directories: 0, sha256: "b".repeat(64) },
+    };
+    const before = {
+      inputs: {
+        ...structuredClone(stable),
+        workspace: structuredClone(emptyScratch),
+        browserCliScratch: structuredClone(emptyScratch),
+        browserMcpScratch: structuredClone(emptyScratch),
+        temporaryWorkspace: { state: "absent" },
+      },
+    };
+    const after = structuredClone(before);
+    after.inputs.workspace.files = 50;
+    after.inputs.workspace.directories = 1;
+    after.inputs.workspace.sha256 = "c".repeat(64);
+    after.inputs.browserCliScratch.files = 2;
+    after.inputs.browserCliScratch.sha256 = "d".repeat(64);
+    assert.doesNotThrow(() => assertDynamicInputsStable(before, after, "none"));
+
+    const realInputDrift = structuredClone(after);
+    realInputDrift.inputs.userSkills.sha256 = "e".repeat(64);
+    assert.throws(
+      () => assertDynamicInputsStable(before, realInputDrift, "none"),
+      /dynamic input changed.*userSkills/,
+    );
+
+    const dirtyPre = structuredClone(before);
+    dirtyPre.inputs.workspace.files = 1;
+    dirtyPre.inputs.workspace.sha256 = "f".repeat(64);
+    assert.throws(
+      () => assertDynamicInputsStable(dirtyPre, after, "none"),
+      /isolated scratch was not an empty agent-owned tree.*workspace/,
+    );
+
+    const persistent = {
+      standard: true,
+      persistentScratch: {
+        workspace: { state: "tree", files: 8, directories: 0, sha256: "1".repeat(64) },
+        browserCli: { state: "tree", files: 2, directories: 0, sha256: "2".repeat(64) },
+        browserMcp: { state: "tree", files: 0, directories: 0, sha256: emptyScratch.sha256 },
+      },
+    };
+    assert.doesNotThrow(() =>
+      assertStandardScratchRestored(persistent, structuredClone(persistent))
+    );
+    const changed = structuredClone(persistent);
+    changed.persistentScratch.workspace.sha256 = "3".repeat(64);
+    assert.throws(
+      () => assertStandardScratchRestored(persistent, changed),
+      /persistent scratch changed/,
+    );
+
+    const missing = structuredClone(persistent);
+    delete (missing.persistentScratch as Partial<
+      typeof missing.persistentScratch
+    >).browserMcp;
+    assert.throws(
+      () => assertStandardScratchRestored(missing, persistent),
+      /invalid shape/,
+    );
+
+    const absent = structuredClone(persistent);
+    (absent.persistentScratch as Record<string, unknown>).browserMcp = {
+      state: "absent",
+    };
+    assert.throws(
+      () => assertStandardScratchRestored(absent, persistent),
+      /tree identity is invalid/,
     );
   });
 

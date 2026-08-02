@@ -369,6 +369,14 @@ const RECORD_LOCK = "/run/openclaude-v5/synthetic-eval-overlay.lock";
 const RECORD_LOCK_REAPER = "/run/openclaude-v5/synthetic-eval-overlay.lock.reaper";
 const PROOF = "/run/openclaude-v5/production-mutation.lock.manual-holder";
 const RELEASE_ROOT = "/opt/openclaude/openclaude-v5-releases";
+const CONFIG_TMPFS_TARGET = "/run/oc/claude-config";
+const CONFIG_TMPFS_OPTIONS = "rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000";
+const SCRATCH_TMPFS_OPTIONS = "rw,nosuid,nodev,mode=0700,uid=1000,gid=1000";
+const SCRATCH_TMPFS_TARGETS = [
+  "/home/agent/.openclaude/workspace",
+  "/home/agent/.openclaude/.playwright-cli",
+  "/home/agent/.openclaude/.playwright-mcp",
+];
 const SHA = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const NONCE = /^[0-9a-f]{32}$/;
@@ -984,11 +992,21 @@ const DYNAMIC_INPUT_SOURCE = [
   'if(!/^[A-Za-z0-9_-]{1,80}$/.test(agentId)||!/^[A-Za-z0-9_-]{1,80}$/.test(caseId)||!["pre","post"].includes(phase))throw new Error("invalid dynamic input identity");',
   'const sha=(value)=>createHash("sha256").update(value).digest("hex");',
   'function identity(target){let stat;try{stat=fs.lstatSync(target)}catch(error){if(error&&error.code==="ENOENT")return {state:"absent"};throw error}if(stat.isSymbolicLink())throw new Error("dynamic input symlink:"+target);const root=fs.realpathSync(target);if(root!==target)throw new Error("dynamic input path is not canonical:"+target);if(stat.isFile()){const bytes=fs.readFileSync(root);return {state:"file",bytes:bytes.length,sha256:sha(bytes)}}if(!stat.isDirectory())throw new Error("dynamic input has unsafe type:"+target);const hash=createHash("sha256");let files=0;let directories=0;function walk(current){for(const name of fs.readdirSync(current).sort()){const absolute=path.join(current,name);const child=fs.lstatSync(absolute);if(child.isSymbolicLink())throw new Error("dynamic input symlink:"+absolute);const relative=path.relative(root,absolute).split(path.sep).join("/");if(child.isDirectory()){directories++;hash.update("D  "+relative+"\\n");walk(absolute)}else if(child.isFile()){files++;hash.update("F  "+sha(fs.readFileSync(absolute))+"  "+relative+"\\n")}else throw new Error("dynamic input has unsafe entry:"+absolute)}}walk(root);return {state:"tree",files,directories,sha256:hash.digest("hex")}}',
+  'function scratch(target){const value=identity(target);if(value.state!=="tree")return value;const stat=fs.lstatSync(target);return {...value,uid:stat.uid,gid:stat.gid,mode:stat.mode&0o777}}',
   'const agentRoot="/home/agent/.openclaude/agents/"+agentId;',
   'const temporary="/tmp/oc-synthetic-eval-"+caseId;',
-  'const value={agentClaude:identity(agentRoot+"/CLAUDE.md"),agentMemoryIndex:identity(agentRoot+"/MEMORY.md"),agentMemoryTree:identity(agentRoot+"/memory"),userSoul:identity("/home/agent/.openclaude/SOUL.md"),userProfile:identity("/home/agent/.openclaude/USER.md"),userSkills:identity("/home/agent/.openclaude/hub/skills"),workspace:identity("/home/agent/.openclaude/workspace"),temporaryWorkspace:identity(temporary)};',
+  'const value={agentClaude:identity(agentRoot+"/CLAUDE.md"),agentMemoryIndex:identity(agentRoot+"/MEMORY.md"),agentMemoryTree:identity(agentRoot+"/memory"),userSoul:identity("/home/agent/.openclaude/SOUL.md"),userProfile:identity("/home/agent/.openclaude/USER.md"),userSkills:identity("/home/agent/.openclaude/hub/skills"),workspace:scratch("/home/agent/.openclaude/workspace"),browserCliScratch:scratch("/home/agent/.openclaude/.playwright-cli"),browserMcpScratch:scratch("/home/agent/.openclaude/.playwright-mcp"),temporaryWorkspace:identity(temporary)};',
   'if(phase==="pre"&&value.temporaryWorkspace.state!=="absent")throw new Error("temporary evaluation workspace already exists");',
   'process.stdout.write(JSON.stringify(value));',
+].join("\n");
+
+const STANDARD_PERSISTENT_SCRATCH_SOURCE = [
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'const { createHash } = require("node:crypto");',
+  'const sha=(value)=>createHash("sha256").update(value).digest("hex");',
+  'function identity(target){let stat;try{stat=fs.lstatSync(target)}catch(error){if(error&&error.code==="ENOENT")return {state:"absent"};throw error}if(stat.isSymbolicLink())throw new Error("persistent scratch symlink:"+target);const root=fs.realpathSync(target);if(root!==target)throw new Error("persistent scratch path is not canonical:"+target);if(!stat.isDirectory())throw new Error("persistent scratch has unsafe type:"+target);const hash=createHash("sha256");let files=0;let directories=0;function walk(current){for(const name of fs.readdirSync(current).sort()){const absolute=path.join(current,name);const child=fs.lstatSync(absolute);if(child.isSymbolicLink())throw new Error("persistent scratch symlink:"+absolute);const relative=path.relative(root,absolute).split(path.sep).join("/");if(child.isDirectory()){directories++;hash.update("D  "+relative+"\\n");walk(absolute)}else if(child.isFile()){files++;hash.update("F  "+sha(fs.readFileSync(absolute))+"  "+relative+"\\n")}else throw new Error("persistent scratch has unsafe entry:"+absolute)}}walk(root);return {state:"tree",files,directories,sha256:hash.digest("hex")}}',
+  'process.stdout.write(JSON.stringify({workspace:identity("/home/agent/.openclaude/workspace"),browserCli:identity("/home/agent/.openclaude/.playwright-cli"),browserMcp:identity("/home/agent/.openclaude/.playwright-mcp")}));',
 ].join("\n");
 
 function dockerExecJson(container, source, args = []) {
@@ -1040,6 +1058,21 @@ function inspectContainer() {
     || labels["openclaude.synthetic-eval.uid"] !== String(payload.uid)
   ) {
     fail("synthetic eval container labels are not exact");
+  }
+  const tmpfs = info.HostConfig?.Tmpfs;
+  const expectedTmpfs = {
+    [CONFIG_TMPFS_TARGET]: CONFIG_TMPFS_OPTIONS,
+    ...Object.fromEntries(
+      SCRATCH_TMPFS_TARGETS.map((target) => [target, SCRATCH_TMPFS_OPTIONS]),
+    ),
+  };
+  if (!exactKeys(tmpfs, Object.keys(expectedTmpfs))) {
+    fail("synthetic eval tmpfs targets are not exact");
+  }
+  for (const [target, options] of Object.entries(expectedTmpfs)) {
+    if (tmpfs[target] !== options) {
+      fail("synthetic eval tmpfs options are not exact: " + target);
+    }
   }
   const manifestDir = path.join(STAGING_ROOT, payload.manifestSha);
   const manifest = validateStage(manifestDir);
@@ -1603,12 +1636,20 @@ function inspectStandardContainer() {
   if ((info.Mounts || []).some((mount) => forbidden.has(mount.Destination))) {
     fail("restored standard container retains synthetic eval mounts");
   }
+  const tmpfs = info.HostConfig?.Tmpfs || {};
+  if (SCRATCH_TMPFS_TARGETS.some((target) => Object.hasOwn(tmpfs, target))) {
+    fail("restored standard container retains synthetic eval scratch tmpfs");
+  }
   return {
     uid: payload.uid,
     container,
     containerId: info.Id,
     startedAt: info.State.StartedAt,
     standard: true,
+    persistentScratch: dockerExecJson(
+      container,
+      STANDARD_PERSISTENT_SCRATCH_SOURCE,
+    ),
   };
 }
 

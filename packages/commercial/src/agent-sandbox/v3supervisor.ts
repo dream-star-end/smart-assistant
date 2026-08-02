@@ -101,6 +101,8 @@ import {
 import {
   SYNTHETIC_EVAL_PROMPTS_BIND_TARGET,
   SYNTHETIC_EVAL_PROMPT_SLOTS_BIND_TARGET,
+  SYNTHETIC_EVAL_SCRATCH_TMPFS_OPTIONS,
+  SYNTHETIC_EVAL_SCRATCH_TMPFS_TARGETS,
   type SyntheticEvalOverlayRuntime,
 } from "./syntheticEvalOverlayRuntime.js";
 
@@ -3079,6 +3081,14 @@ export async function provisionV3Container(
             // 看到"AI 进程异常退出"(2026-04-22 修复)。
             Tmpfs: {
               [V3_CONFIG_TMPFS_PATH]: "rw,nosuid,nodev,size=4m,mode=0700,uid=1000,gid=1000",
+              ...(syntheticEvalOverlay
+                ? Object.fromEntries(
+                    SYNTHETIC_EVAL_SCRATCH_TMPFS_TARGETS.map((target) => [
+                      target,
+                      SYNTHETIC_EVAL_SCRATCH_TMPFS_OPTIONS,
+                    ]),
+                  )
+                : {}),
             },
             // 双 volume:
             //   - 主 volume → /home/agent/.openclaude(个人版状态目录)

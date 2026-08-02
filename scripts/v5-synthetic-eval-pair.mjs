@@ -23,13 +23,23 @@ import {
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { verifyWorkspaceArtifactDocument } from "./v5-synthetic-eval-run-arm.mjs";
+import {
+  assertPersistentScratchIdentity,
+  verifyWorkspaceArtifactDocument,
+} from "./v5-synthetic-eval-run-arm.mjs";
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,80}$/;
 const SYNTHETIC_UIDS = new Set([247, 626]);
+const EMPTY_TREE_SHA256 =
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const SCRATCH_INPUT_NAMES = [
+  "workspace",
+  "browserCliScratch",
+  "browserMcpScratch",
+];
 const VOLATILE_SNAPSHOT_FIELDS = new Set([
   "dispatchCount",
   "openDispatchCount",
@@ -311,7 +321,7 @@ function dynamicInputIdentity(evidence, label) {
     "userSoul",
     "userProfile",
     "userSkills",
-    "workspace",
+    ...SCRATCH_INPUT_NAMES,
   ]) {
     requireRecord(
       preInputs[name],
@@ -336,10 +346,45 @@ function dynamicInputIdentity(evidence, label) {
   if (!["absent", "tree"].includes(postTemporary.state)) {
     fail(`${label} temporaryWorkspace post state must be absent or tree`);
   }
+  for (const name of SCRATCH_INPUT_NAMES) {
+    const preScratch = requireRecord(
+      preInputs[name],
+      `${label}.dynamicInputs.pre.inputs.${name}`,
+    );
+    const postScratch = requireRecord(
+      postInputs[name],
+      `${label}.dynamicInputs.post.inputs.${name}`,
+    );
+    if (
+      preScratch.state !== "tree"
+      || preScratch.files !== 0
+      || preScratch.directories !== 0
+      || preScratch.sha256 !== EMPTY_TREE_SHA256
+      || preScratch.uid !== 1000
+      || preScratch.gid !== 1000
+      || preScratch.mode !== 0o700
+    ) {
+      fail(`${label} isolated scratch pre identity is invalid: ${name}`);
+    }
+    if (
+      postScratch.state !== "tree"
+      || !Number.isSafeInteger(postScratch.files)
+      || postScratch.files < 0
+      || !Number.isSafeInteger(postScratch.directories)
+      || postScratch.directories < 0
+      || !SHA256_RE.test(postScratch.sha256 ?? "")
+      || postScratch.uid !== 1000
+      || postScratch.gid !== 1000
+      || postScratch.mode !== 0o700
+    ) {
+      fail(`${label} isolated scratch post identity is invalid: ${name}`);
+    }
+  }
+  const mutable = new Set(["temporaryWorkspace", ...SCRATCH_INPUT_NAMES]);
   const persistent = (inputs) =>
     Object.fromEntries(
       Object.entries(inputs)
-        .filter(([name]) => name !== "temporaryWorkspace")
+        .filter(([name]) => !mutable.has(name))
         .sort(([left], [right]) => left.localeCompare(right)),
     );
   assertSame(
@@ -348,6 +393,37 @@ function dynamicInputIdentity(evidence, label) {
     `${label} persistent dynamic inputs pre/post`,
   );
   return canonicalValue(preInputs, `${label}.dynamicInputs.pre.inputs`);
+}
+
+function persistentScratchIdentity(evidence, label) {
+  const before = requireRecord(
+    evidence.standardBefore,
+    `${label}.standardBefore`,
+  );
+  const restored = requireRecord(evidence.restored, `${label}.restored`);
+  if (before.standard !== true || restored.standard !== true) {
+    fail(`${label} standard scratch evidence is not bound to standard containers`);
+  }
+  const beforeScratch = canonicalValue(
+    assertPersistentScratchIdentity(
+      before.persistentScratch,
+      `${label}.standardBefore.persistentScratch`,
+    ),
+    `${label}.standardBefore.persistentScratch`,
+  );
+  const restoredScratch = canonicalValue(
+    assertPersistentScratchIdentity(
+      restored.persistentScratch,
+      `${label}.restored.persistentScratch`,
+    ),
+    `${label}.restored.persistentScratch`,
+  );
+  assertSame(
+    beforeScratch,
+    restoredScratch,
+    `${label} persistent scratch before/restore`,
+  );
+  return beforeScratch;
 }
 
 function turnHashIdentity(evidence, label) {
@@ -567,7 +643,7 @@ export function controlledPromptDelta(baseBytes, candidateBytes) {
 }
 
 function validateArm(evidence, expectedArm, label) {
-  if (evidence.schemaVersion !== 3) fail(`${label}.schemaVersion must be 3`);
+  if (evidence.schemaVersion !== 4) fail(`${label}.schemaVersion must be 4`);
   if (evidence.status !== "completed") fail(`${label}.status must be completed`);
   if (evidence.arm !== expectedArm) fail(`${label}.arm must be ${expectedArm}`);
   const uid = evidence.uid;
@@ -623,6 +699,7 @@ function validateArm(evidence, expectedArm, label) {
     `${label}.evaluationCase`,
   );
   const dynamicPre = dynamicInputIdentity(evidence, label);
+  const persistentScratch = persistentScratchIdentity(evidence, label);
   const helpers = helperIdentity(evidence, label);
   const deployment = deploymentIdentity(evidence, label);
   const runtimeTuple = runtimeTupleIdentity(evidence, label);
@@ -682,6 +759,7 @@ function validateArm(evidence, expectedArm, label) {
     candidateCommit,
     caseIdentity,
     dynamicPre,
+    persistentScratch,
     helpers,
     deployment,
     runtimeTuple,
@@ -713,6 +791,7 @@ export function aggregatePair(armAPath, armBPath) {
     ["evaluationCase", armA.caseIdentity, armB.caseIdentity],
     ["helper file/tree SHA identity", armA.helpers, armB.helpers],
     ["dynamicInputs.pre", armA.dynamicPre, armB.dynamicPre],
+    ["persistent scratch", armA.persistentScratch, armB.persistentScratch],
     ["deployment identity", armA.deployment, armB.deployment],
     ["runtime tuple", armA.runtimeTuple, armB.runtimeTuple],
     ["billing binding mode", armA.billingBindingMode, armB.billingBindingMode],
@@ -734,7 +813,7 @@ export function aggregatePair(armAPath, armBPath) {
   }
 
   const pairIdentity = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     pairId: armA.pairId,
     order: armA.order,
     baseCommit: armA.baseCommit,
@@ -751,6 +830,7 @@ export function aggregatePair(armAPath, armBPath) {
       B: armB.expectedManifestSha,
     },
     dynamicInputs: { pre: armA.dynamicPre },
+    persistentScratch: armA.persistentScratch,
     deployment: armA.deployment,
     runtimeTuple: armA.runtimeTuple,
     billingBindingMode: armA.billingBindingMode,
@@ -758,7 +838,7 @@ export function aggregatePair(armAPath, armBPath) {
   const pairIdentityHash = sha256(Buffer.from(canonicalJson(pairIdentity)));
 
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     valid: true,
     pairIdentityHash,
     identity: canonicalValue(pairIdentity),
