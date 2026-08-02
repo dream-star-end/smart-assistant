@@ -606,6 +606,152 @@ function workspaceArtifactCapture(evidence, label, caseEvidence) {
   };
 }
 
+const PROMPT_DELTA_ALGORITHM = "myers-byte-hunks-v1-delete-tie";
+
+function layerValue(layer, distance, diagonal) {
+  if (
+    layer === undefined
+    || diagonal < -distance
+    || diagonal > distance
+    || (diagonal + distance) % 2 !== 0
+  ) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return layer[(diagonal + distance) / 2];
+}
+
+function promptEditScript(base, candidate) {
+  const maximumDistance = base.length + candidate.length;
+  const layers = [];
+  let finalDistance = -1;
+
+  for (let distance = 0; distance <= maximumDistance; distance += 1) {
+    const current = new Int32Array(distance + 1);
+    const previous = layers[distance - 1];
+    for (
+      let diagonal = -distance;
+      diagonal <= distance;
+      diagonal += 2
+    ) {
+      let baseOffset;
+      if (distance === 0) {
+        baseOffset = 0;
+      } else {
+        const deleteOffset = layerValue(
+          previous,
+          distance - 1,
+          diagonal - 1,
+        );
+        const insertOffset = layerValue(
+          previous,
+          distance - 1,
+          diagonal + 1,
+        );
+        if (
+          diagonal === -distance
+          || (diagonal !== distance && deleteOffset < insertOffset)
+        ) {
+          baseOffset = insertOffset;
+        } else {
+          baseOffset = deleteOffset + 1;
+        }
+      }
+      let candidateOffset = baseOffset - diagonal;
+      while (
+        baseOffset < base.length
+        && candidateOffset < candidate.length
+        && base[baseOffset] === candidate[candidateOffset]
+      ) {
+        baseOffset += 1;
+        candidateOffset += 1;
+      }
+      current[(diagonal + distance) / 2] = baseOffset;
+      if (
+        baseOffset === base.length
+        && candidateOffset === candidate.length
+      ) {
+        finalDistance = distance;
+        break;
+      }
+    }
+    layers.push(current);
+    if (finalDistance !== -1) break;
+  }
+  if (finalDistance === -1) fail("cannot compute full-prompt byte diff");
+
+  const reversed = [];
+  let baseOffset = base.length;
+  let candidateOffset = candidate.length;
+  for (let distance = finalDistance; distance > 0; distance -= 1) {
+    const diagonal = baseOffset - candidateOffset;
+    const previous = layers[distance - 1];
+    const deleteOffset = layerValue(previous, distance - 1, diagonal - 1);
+    const insertOffset = layerValue(previous, distance - 1, diagonal + 1);
+    const inserted = diagonal === -distance
+      || (diagonal !== distance && deleteOffset < insertOffset);
+    const previousDiagonal = inserted ? diagonal + 1 : diagonal - 1;
+    const previousBaseOffset = layerValue(
+      previous,
+      distance - 1,
+      previousDiagonal,
+    );
+    const previousCandidateOffset = previousBaseOffset - previousDiagonal;
+    while (
+      baseOffset > previousBaseOffset
+      && candidateOffset > previousCandidateOffset
+    ) {
+      baseOffset -= 1;
+      candidateOffset -= 1;
+      reversed.push({ type: "equal", byte: base[baseOffset] });
+    }
+    if (inserted) {
+      candidateOffset -= 1;
+      reversed.push({ type: "added", byte: candidate[candidateOffset] });
+    } else {
+      baseOffset -= 1;
+      reversed.push({ type: "removed", byte: base[baseOffset] });
+    }
+  }
+  while (baseOffset > 0 && candidateOffset > 0) {
+    baseOffset -= 1;
+    candidateOffset -= 1;
+    if (base[baseOffset] !== candidate[candidateOffset]) {
+      fail("full-prompt byte diff backtracking is incomplete");
+    }
+    reversed.push({ type: "equal", byte: base[baseOffset] });
+  }
+  if (baseOffset !== 0 || candidateOffset !== 0) {
+    fail("full-prompt byte diff did not consume both prompts");
+  }
+  return reversed.reverse();
+}
+
+function promptEditHunks(base, candidate) {
+  const hunks = [];
+  let removed = [];
+  let added = [];
+  const flush = () => {
+    if (removed.length === 0 && added.length === 0) return;
+    hunks.push({
+      removedBase64: Buffer.from(removed).toString("base64"),
+      addedBase64: Buffer.from(added).toString("base64"),
+    });
+    removed = [];
+    added = [];
+  };
+  for (const edit of promptEditScript(base, candidate)) {
+    if (edit.type === "equal") {
+      flush();
+    } else if (edit.type === "removed") {
+      removed.push(edit.byte);
+    } else {
+      added.push(edit.byte);
+    }
+  }
+  flush();
+  return hunks;
+}
+
 export function controlledPromptDelta(baseBytes, candidateBytes) {
   const base = Buffer.from(baseBytes);
   const candidate = Buffer.from(candidateBytes);
@@ -627,16 +773,29 @@ export function controlledPromptDelta(baseBytes, candidateBytes) {
   }
   const removedEnd = base.length - suffixBytes;
   const addedEnd = candidate.length - suffixBytes;
-  const canonicalDelta = {
-    schemaVersion: 1,
+  const hunks = promptEditHunks(base, candidate);
+  const canonicalHunks = {
+    schemaVersion: 2,
+    algorithm: PROMPT_DELTA_ALGORITHM,
+    hunks,
+  };
+  const editDistanceBytes = hunks.reduce(
+    (total, hunk) => total
+      + Buffer.from(hunk.removedBase64, "base64").length
+      + Buffer.from(hunk.addedBase64, "base64").length,
+    0,
+  );
+  return {
+    schemaVersion: 2,
+    algorithm: PROMPT_DELTA_ALGORITHM,
+    sha256: sha256(Buffer.from(JSON.stringify(canonicalHunks))),
+    hunkCount: hunks.length,
+    editDistanceBytes,
+    hunks,
     prefixBytes,
     removedBase64: base.subarray(prefixBytes, removedEnd).toString("base64"),
     addedBase64: candidate.subarray(prefixBytes, addedEnd).toString("base64"),
     suffixBytes,
-  };
-  return {
-    ...canonicalDelta,
-    sha256: sha256(Buffer.from(JSON.stringify(canonicalDelta))),
     removedBytes: removedEnd - prefixBytes,
     addedBytes: addedEnd - prefixBytes,
   };
@@ -809,11 +968,11 @@ export function aggregatePair(armAPath, armBPath) {
     armB.prompt.bytes,
   );
   if (promptDelta.sha256 !== armA.expectedPromptDeltaSha) {
-    fail("captured full-prompt delta differs from preregistered expectedPromptDeltaSha");
+    fail("captured full-prompt hunk delta differs from preregistered expectedPromptDeltaSha");
   }
 
   const pairIdentity = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     pairId: armA.pairId,
     order: armA.order,
     baseCommit: armA.baseCommit,
@@ -838,7 +997,7 @@ export function aggregatePair(armAPath, armBPath) {
   const pairIdentityHash = sha256(Buffer.from(canonicalJson(pairIdentity)));
 
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     valid: true,
     pairIdentityHash,
     identity: canonicalValue(pairIdentity),
@@ -847,8 +1006,11 @@ export function aggregatePair(armAPath, armBPath) {
       B: armBFile.sha256,
     },
     promptDelta: {
+      algorithm: promptDelta.algorithm,
       expectedSha256: armA.expectedPromptDeltaSha,
       actualSha256: promptDelta.sha256,
+      hunkCount: promptDelta.hunkCount,
+      editDistanceBytes: promptDelta.editDistanceBytes,
       prefixBytes: promptDelta.prefixBytes,
       suffixBytes: promptDelta.suffixBytes,
       removedBytes: promptDelta.removedBytes,
