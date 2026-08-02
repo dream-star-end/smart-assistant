@@ -75,6 +75,7 @@ interface Fixture {
   armBPath: string;
   outputPath: string;
   prompts: { A: string; B: string };
+  artifacts: { A: string; B: string };
   evidence: { A: Record<string, any>; B: Record<string, any> };
 }
 
@@ -83,6 +84,9 @@ function armEvidence(
   promptPath: string,
   promptBytes: Buffer,
   expectedPromptDeltaSha: string,
+  artifactPath: string,
+  artifactBytes: Buffer,
+  artifactIdentity: Record<string, unknown>,
 ): Record<string, any> {
   const baseCommit = "a".repeat(40);
   const candidateCommit = arm === "A" ? baseCommit : "b".repeat(40);
@@ -98,7 +102,7 @@ function armEvidence(
   };
   const turnResultSha = digest(`turn-result-${arm}`);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     status: "completed",
     arm,
     uid: 247,
@@ -133,10 +137,7 @@ function armEvidence(
         inputs: {
           ...structuredClone(persistentInputs),
           temporaryWorkspace: {
-            state: "tree",
-            files: 2,
-            directories: 1,
-            sha256: digest(`temporary-workspace-${arm}`),
+            ...structuredClone(artifactIdentity),
           },
         },
       },
@@ -197,6 +198,20 @@ function armEvidence(
       },
       resultSha256: turnResultSha,
     },
+    turnEvidence: {
+      billingBindingMode: "ccb_authority_dispatch_attempt",
+    },
+    workspaceArtifact: {
+      state: "tree",
+      identity: structuredClone(artifactIdentity),
+      entryCount: 1,
+      capturedPath: artifactPath,
+      bytes: artifactBytes.length,
+      sha256: createHash("sha256").update(artifactBytes).digest("hex"),
+      files: 1,
+      directories: 0,
+      completeBytes: Buffer.byteLength(`artifact-${arm}`),
+    },
     promptEvidence: {
       extraPrompt: {
         capturedPath: promptPath,
@@ -226,13 +241,70 @@ function makeFixture(): Fixture {
   };
   writeFileSync(prompts.A, promptBytes.A, { mode: 0o600 });
   writeFileSync(prompts.B, promptBytes.B, { mode: 0o600 });
+  const artifacts = {
+    A: join(directory, "A.workspace.json"),
+    B: join(directory, "B.workspace.json"),
+  };
+  const artifactBytes = {} as Record<Arm, Buffer>;
+  const artifactIdentities = {} as Record<Arm, Record<string, unknown>>;
+  for (const arm of ["A", "B"] as const) {
+    const content = Buffer.from(`artifact-${arm}`);
+    const contentSha = createHash("sha256").update(content).digest("hex");
+    const identity = {
+      state: "tree",
+      files: 1,
+      directories: 0,
+      sha256: createHash("sha256")
+        .update(`F  ${contentSha}  output.txt\n`)
+        .digest("hex"),
+    };
+    const containerPrefix = arm === "A" ? "1" : "2";
+    const document = {
+      schemaVersion: 1,
+      uid: 247,
+      engine: "ccb",
+      agentId: "research-assistant",
+      caseId: "multi-source-research",
+      workspaceMode: "temporary",
+      containerId: containerPrefix.repeat(64),
+      manifestSha: digest(`prepared-manifest-${arm}`),
+      identity,
+      entries: [{
+        path: "output.txt",
+        type: "file",
+        mode: 0o644,
+        bytes: content.length,
+        sha256: contentSha,
+        contentBase64: content.toString("base64"),
+      }],
+    };
+    artifactBytes[arm] = Buffer.from(`${JSON.stringify(document)}\n`);
+    artifactIdentities[arm] = identity;
+    writeFileSync(artifacts[arm], artifactBytes[arm], { mode: 0o600 });
+  }
   const expectedPromptDeltaSha = controlledPromptDelta(
     promptBytes.A,
     promptBytes.B,
   ).sha256;
   const evidence = {
-    A: armEvidence("A", prompts.A, promptBytes.A, expectedPromptDeltaSha),
-    B: armEvidence("B", prompts.B, promptBytes.B, expectedPromptDeltaSha),
+    A: armEvidence(
+      "A",
+      prompts.A,
+      promptBytes.A,
+      expectedPromptDeltaSha,
+      artifacts.A,
+      artifactBytes.A,
+      artifactIdentities.A,
+    ),
+    B: armEvidence(
+      "B",
+      prompts.B,
+      promptBytes.B,
+      expectedPromptDeltaSha,
+      artifacts.B,
+      artifactBytes.B,
+      artifactIdentities.B,
+    ),
   };
   const armAPath = join(directory, "arm-a.json");
   const armBPath = join(directory, "arm-b.json");
@@ -243,7 +315,15 @@ function makeFixture(): Fixture {
   writeFileSync(armBPath, `${JSON.stringify(evidence.B, null, 2)}\n`, {
     mode: 0o600,
   });
-  return { directory, armAPath, armBPath, outputPath, prompts, evidence };
+  return {
+    directory,
+    armAPath,
+    armBPath,
+    outputPath,
+    prompts,
+    artifacts,
+    evidence,
+  };
 }
 
 function rewriteArmB(fixture: Fixture): void {
@@ -280,7 +360,10 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
     assert.deepEqual(result.efficiencyRaw.B, fixture.evidence.B.efficiency);
     assert.equal("winner" in result, false);
     assert.equal("recommendation" in result, false);
-    assert.equal(result.schemaVersion, 2);
+    assert.equal(result.schemaVersion, 3);
+    assert.equal(result.identity.billingBindingMode, "ccb_authority_dispatch_attempt");
+    assert.equal(result.workspaceArtifacts.A.files, 1);
+    assert.equal(result.workspaceArtifacts.B.files, 1);
   });
 
   test("controlled full-prompt diff is deterministic and byte-exact", () => {
@@ -361,21 +444,21 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
       mutate: ({ evidence }) => {
         evidence.B.uid = 626;
       },
-      message: /uid differs/,
+      message: /uid differs|workspace artifact document identity/,
     },
     {
       name: "engine",
       mutate: ({ evidence }) => {
         evidence.B.engine = "codex";
       },
-      message: /engine differs/,
+      message: /engine differs|workspace artifact document identity/,
     },
     {
       name: "agent id",
       mutate: ({ evidence }) => {
         evidence.B.agentId = "software-engineer";
       },
-      message: /agentId differs/,
+      message: /agentId differs|workspace artifact document identity/,
     },
     {
       name: "model",
@@ -403,21 +486,21 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
       mutate: ({ evidence }) => {
         evidence.B.evaluationCase.id = "different-case";
       },
-      message: /evaluationCase differs/,
+      message: /evaluationCase differs|workspace artifact document identity/,
     },
     {
       name: "case category",
       mutate: ({ evidence }) => {
         evidence.B.evaluationCase.category = "software";
       },
-      message: /evaluationCase differs/,
+      message: /evaluationCase differs|workspace artifact document identity/,
     },
     {
       name: "case workspace mode",
       mutate: ({ evidence }) => {
         evidence.B.evaluationCase.workspace = "none";
       },
-      message: /evaluationCase differs/,
+      message: /evaluationCase differs|workspace artifact document identity/,
     },
     {
       name: "case pack SHA",
@@ -552,7 +635,7 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
       [
         "schema version",
         (value) => value.schemaVersion = 1,
-        /schemaVersion must be 2/,
+        /schemaVersion must be 3/,
       ],
       ["status", (value) => value.status = "failed", /status must be completed/],
       ["arm", (value) => value.arm = "A", /arm must be B/],
@@ -660,6 +743,50 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
     );
   });
 
+  test("reads complete workspace captures and rejects content, path, and counter tampering", () => {
+    {
+      const fixture = makeFixture();
+      const document = JSON.parse(readFileSync(fixture.artifacts.B, "utf8"));
+      document.entries[0].contentBase64 = Buffer.from("tampered").toString("base64");
+      const bytes = Buffer.from(`${JSON.stringify(document)}\n`);
+      writeFileSync(fixture.artifacts.B, bytes, { mode: 0o600 });
+      fixture.evidence.B.workspaceArtifact.bytes = bytes.length;
+      fixture.evidence.B.workspaceArtifact.sha256 = createHash("sha256")
+        .update(bytes)
+        .digest("hex");
+      rewriteArmB(fixture);
+      assert.throws(
+        () => aggregatePair(fixture.armAPath, fixture.armBPath),
+        /file bytes are incomplete or corrupted/,
+      );
+    }
+    {
+      const fixture = makeFixture();
+      const document = JSON.parse(readFileSync(fixture.artifacts.B, "utf8"));
+      document.entries[0].path = "../escaped.txt";
+      const bytes = Buffer.from(`${JSON.stringify(document)}\n`);
+      writeFileSync(fixture.artifacts.B, bytes, { mode: 0o600 });
+      fixture.evidence.B.workspaceArtifact.bytes = bytes.length;
+      fixture.evidence.B.workspaceArtifact.sha256 = createHash("sha256")
+        .update(bytes)
+        .digest("hex");
+      rewriteArmB(fixture);
+      assert.throws(
+        () => aggregatePair(fixture.armAPath, fixture.armBPath),
+        /entry identity is invalid/,
+      );
+    }
+    {
+      const fixture = makeFixture();
+      fixture.evidence.B.workspaceArtifact.completeBytes += 1;
+      rewriteArmB(fixture);
+      assert.throws(
+        () => aggregatePair(fixture.armAPath, fixture.armBPath),
+        /completeness counters differ/,
+      );
+    }
+  });
+
   test("requires canonical root-owned 0600 inputs and a canonical root-owned 0700 output parent", () => {
     {
       const fixture = makeFixture();
@@ -675,6 +802,25 @@ describe("V5 synthetic exact-eval pair aggregator", () => {
       assert.throws(
         () => aggregatePair(fixture.armAPath, fixture.armBPath),
         /captured prompt must be canonical, root-owned, and mode 0600/,
+      );
+    }
+    {
+      const fixture = makeFixture();
+      chmodSync(fixture.artifacts.B, 0o644);
+      assert.throws(
+        () => aggregatePair(fixture.armAPath, fixture.armBPath),
+        /captured workspace artifact must be canonical, root-owned, and mode 0600/,
+      );
+    }
+    {
+      const fixture = makeFixture();
+      const linkedArtifact = join(fixture.directory, "linked-workspace.json");
+      symlinkSync(fixture.artifacts.B, linkedArtifact);
+      fixture.evidence.B.workspaceArtifact.capturedPath = linkedArtifact;
+      rewriteArmB(fixture);
+      assert.throws(
+        () => aggregatePair(fixture.armAPath, fixture.armBPath),
+        /captured workspace artifact must be a regular file, not a symlink/,
       );
     }
     {

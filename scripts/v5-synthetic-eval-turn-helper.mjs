@@ -256,6 +256,7 @@ async function remoteTurn(encodedConfig) {
     inbound_messages: 0,
     finals: 0,
     matching_costs: 0,
+    binding_queries: 0,
   };
   runtime.login_requests += 1;
   const login = await fetch(`${base}/api/auth/login`, {
@@ -321,7 +322,8 @@ async function remoteTurn(encodedConfig) {
     let settled = false;
     let completionReady = false;
     let startedAtMs = null;
-    let finishedAtMs = null;
+    let finalAtMs = null;
+    let billingEvidenceAtMs = null;
     let firstOutputAtMs = null;
     let finalText = "";
     let turnTraceId = null;
@@ -329,6 +331,10 @@ async function remoteTurn(encodedConfig) {
     let costTraceId = null;
     let costFrame = null;
     const costFrames = [];
+    let billingBinding = null;
+    let bindingPoll = null;
+    let bindingDeadlineMs = null;
+    let billingDeadline = null;
     const connectDeadline = setTimeout(
       () => fail(new Error("relay did not become ready in 120s")),
       120_000,
@@ -349,7 +355,9 @@ async function remoteTurn(encodedConfig) {
     const cleanup = () => {
       clearTimeout(connectDeadline);
       clearTimeout(turnDeadline);
+      clearTimeout(billingDeadline);
       clearTimeout(closeDeadline);
+      clearTimeout(bindingPoll);
     };
     const fail = (error) => {
       if (settled) return;
@@ -363,16 +371,277 @@ async function remoteTurn(encodedConfig) {
     const requestSuccessfulClose = () => {
       if (completionReady) return;
       completionReady = true;
-      finishedAtMs = Date.now();
+      billingEvidenceAtMs = Date.now();
       clearTimeout(turnDeadline);
+      clearTimeout(billingDeadline);
       closeDeadline = setTimeout(
         () => fail(new Error("turn relay did not close after successful capture")),
         10_000,
       );
       socket.close(1000, "turn captured");
     };
+    const readCcbBinding = () => {
+      runtime.binding_queries += 1;
+      const sql = [
+        "WITH exact_dispatch AS (",
+        " SELECT dispatch_id,user_id,session_id,client_message_id,agent_id,model,",
+        "        billing_request_id,attempt_no,status,outcome",
+        "   FROM turn_dispatches",
+        "  WHERE user_id=:'uid'::bigint",
+        "    AND session_id=:'peer'",
+        "    AND client_message_id=:'client_message_id'",
+        "),",
+        "authority_binding AS (",
+        " SELECT atd.authority_turn_id,atd.user_id,atd.dispatch_model,",
+        "        atd.canonical_model,atd.session_id,atd.dispatch_id,atd.attempt_no",
+        "   FROM authority_turn_dispatches atd",
+        "   JOIN exact_dispatch d",
+        "     ON d.dispatch_id=atd.dispatch_id AND d.attempt_no=atd.attempt_no",
+        "),",
+        "root_usage AS (",
+        " SELECT u.id::text,u.request_id,u.model,u.status,u.cost_credits::text,",
+        "        u.ledger_id::text,u.turn_key,u.dispatch_id,u.attempt_no",
+        "   FROM usage_records u",
+        "   JOIN exact_dispatch d",
+        "     ON d.dispatch_id=u.dispatch_id AND d.attempt_no=u.attempt_no",
+        "  WHERE u.user_id=:'uid'::bigint",
+        "),",
+        "root_turn AS (",
+        " SELECT min(turn_key) AS turn_key,",
+        "        count(DISTINCT turn_key) FILTER (WHERE turn_key IS NOT NULL) AS keys",
+        "   FROM root_usage",
+        "),",
+        "delegate_usage AS (",
+        " SELECT u.id::text,u.request_id,u.model,u.status,u.cost_credits::text,",
+        "        u.ledger_id::text,u.turn_key,u.dispatch_id,u.attempt_no",
+        "   FROM usage_records u",
+        "  WHERE u.user_id=:'uid'::bigint",
+        "    AND u.parent_session_id=:'peer'",
+        "    AND u.parent_turn_key=(SELECT turn_key FROM root_turn)",
+        "),",
+        "bound_usage AS (",
+        " SELECT * FROM root_usage UNION ALL SELECT * FROM delegate_usage",
+        "),",
+        "bound_ledger AS (",
+        " SELECT l.id::text,l.delta::text,l.reason,l.ref_type,l.ref_id",
+        "   FROM credit_ledger l",
+        "  WHERE l.user_id=:'uid'::bigint",
+        "    AND l.ref_type='usage_record'",
+        "    AND l.ref_id IN (SELECT id FROM bound_usage)",
+        ")",
+        "SELECT json_build_object(",
+        " 'dispatchCount',(SELECT count(*)::int FROM exact_dispatch),",
+        " 'dispatch',(SELECT row_to_json(exact_dispatch) FROM exact_dispatch),",
+        " 'authorityBindings',COALESCE((SELECT json_agg(authority_binding ORDER BY authority_turn_id) FROM authority_binding),'[]'::json),",
+        " 'rootTurnKeyCount',(SELECT keys::int FROM root_turn),",
+        " 'rootUsage',COALESCE((SELECT json_agg(root_usage ORDER BY id::bigint) FROM root_usage),'[]'::json),",
+        " 'delegateUsage',COALESCE((SELECT json_agg(delegate_usage ORDER BY id::bigint) FROM delegate_usage),'[]'::json),",
+        " 'ledger',COALESCE((SELECT json_agg(bound_ledger ORDER BY id::bigint) FROM bound_ledger),'[]'::json)",
+        ")::text;",
+      ].join("\n");
+      const raw = execFileSync(
+        "psql",
+        [
+          commandEnvironment.DATABASE_URL,
+          "-X",
+          "-v",
+          "ON_ERROR_STOP=1",
+          "-At",
+          "-v",
+          `uid=${config.uid}`,
+          "-v",
+          `peer=${peerId}`,
+          "-v",
+          `client_message_id=${clientMessageId}`,
+        ],
+        {
+          encoding: "utf8",
+          env: commandEnvironment,
+          input: `${sql}\n`,
+          maxBuffer: 4 * 1024 * 1024,
+          timeout: 5_000,
+          killSignal: "SIGKILL",
+        },
+      ).trim();
+      if (!raw) throw new Error("CCB billing binding query returned no row");
+      const value = JSON.parse(raw);
+      if (value.dispatchCount === 0) {
+        throw new Error("CCB dispatch is missing after the final frame");
+      }
+      if (
+        value.dispatchCount !== 1
+        || !value.dispatch
+        || value.dispatch.user_id !== config.uid
+        || value.dispatch.session_id !== peerId
+        || value.dispatch.client_message_id !== clientMessageId
+        || value.dispatch.agent_id !== config.agentId
+        || value.dispatch.model !== config.model
+      ) {
+        throw new Error("CCB dispatch identity mismatch");
+      }
+      if (
+        typeof value.dispatch.billing_request_id !== "string"
+        || value.dispatch.billing_request_id.length === 0
+      ) {
+        throw new Error("CCB dispatch billing identity is missing");
+      }
+      if (!Array.isArray(value.authorityBindings)) {
+        throw new Error("CCB authority binding evidence is invalid");
+      }
+      if (value.authorityBindings.length === 0) {
+        throw new Error("CCB authority binding is missing after the final frame");
+      }
+      if (value.authorityBindings.length !== 1) {
+        throw new Error("CCB authority binding is not unique");
+      }
+      const authority = value.authorityBindings[0];
+      if (
+        !/^[0-9a-f]{32}$/.test(authority.authority_turn_id ?? "")
+        || authority.user_id !== config.uid
+        || authority.dispatch_id !== value.dispatch.dispatch_id
+        || authority.attempt_no !== value.dispatch.attempt_no
+        || authority.session_id !== peerId
+        || authority.dispatch_model !== value.dispatch.model
+        || authority.canonical_model !== config.model
+      ) {
+        throw new Error("CCB authority binding identity mismatch");
+      }
+      if (value.dispatch.status !== "terminal") return null;
+      if (value.dispatch.outcome !== "completed") {
+        throw new Error("CCB terminal dispatch did not complete");
+      }
+      if (!Array.isArray(value.rootUsage) || !Array.isArray(value.delegateUsage)) {
+        throw new Error("CCB usage binding evidence is invalid");
+      }
+      if (value.rootUsage.length === 0) return null;
+      if (value.rootTurnKeyCount !== 1) {
+        throw new Error("CCB root usage has ambiguous turn identity");
+      }
+      const usage = [...value.rootUsage, ...value.delegateUsage];
+      if (
+        usage.some((row) =>
+          typeof row.id !== "string"
+          || !/^[1-9][0-9]*$/.test(row.id)
+          || typeof row.request_id !== "string"
+          || row.request_id.length === 0
+          || row.status !== "success"
+          || !/^[0-9]+$/.test(row.cost_credits ?? "")
+        )
+        || new Set(usage.map((row) => row.request_id)).size !== usage.length
+        || value.rootUsage.some((row) =>
+          row.dispatch_id !== value.dispatch.dispatch_id
+          || row.attempt_no !== value.dispatch.attempt_no
+          || row.model !== config.model
+        )
+      ) {
+        throw new Error("CCB usage binding identity mismatch");
+      }
+      if (!Array.isArray(value.ledger)) {
+        throw new Error("CCB ledger evidence is invalid");
+      }
+      const ledgerByUsage = new Map();
+      for (const row of value.ledger) {
+        if (
+          typeof row.id !== "string"
+          || !/^[1-9][0-9]*$/.test(row.id)
+          || typeof row.ref_id !== "string"
+          || row.ref_type !== "usage_record"
+          || row.reason !== "chat"
+          || !/^-?[0-9]+$/.test(row.delta ?? "")
+        ) {
+          throw new Error("CCB ledger identity mismatch");
+        }
+        const rows = ledgerByUsage.get(row.ref_id) ?? [];
+        rows.push(row);
+        ledgerByUsage.set(row.ref_id, rows);
+      }
+      const positive = usage.filter((row) => BigInt(row.cost_credits) > 0n);
+      const positiveRoot = value.rootUsage.filter(
+        (row) => BigInt(row.cost_credits) > 0n,
+      );
+      if (positive.length === 0 || positiveRoot.length === 0) return null;
+      for (const row of positive) {
+        const ledger = ledgerByUsage.get(row.id) ?? [];
+        if (ledger.length === 0) return null;
+        if (
+          typeof row.ledger_id !== "string"
+          || !ledger.some((entry) => entry.id === row.ledger_id)
+          || ledger.some((entry) => BigInt(entry.delta) >= 0n)
+          || ledger.reduce((sum, entry) => sum - BigInt(entry.delta), 0n)
+            !== BigInt(row.cost_credits)
+        ) {
+          throw new Error("CCB ledger amount or primary identity mismatch");
+        }
+      }
+      return {
+        mode: "ccb_authority_dispatch_attempt",
+        finalTraceId: turnTraceId,
+        dispatchBillingRequestId: value.dispatch.billing_request_id,
+        authorityTurnId: authority.authority_turn_id,
+        dispatchId: value.dispatch.dispatch_id,
+        attemptNo: value.dispatch.attempt_no,
+        requestIds: positive.map((row) => row.request_id).sort(),
+        rootRequestIds: positiveRoot.map((row) => row.request_id).sort(),
+        usageIds: usage.map((row) => row.id).sort((left, right) =>
+          BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0
+        ),
+        ledgerIds: value.ledger.map((row) => row.id).sort((left, right) =>
+          BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0
+        ),
+      };
+    };
+    const pollCcbBinding = () => {
+      bindingPoll = null;
+      if (settled || completionReady || runtime.finals !== 1 || turnTraceId === null) {
+        return;
+      }
+      let binding;
+      try {
+        binding = readCcbBinding();
+      } catch (error) {
+        fail(error);
+        return;
+      }
+      if (binding !== null) {
+        const byRequest = new Map();
+        for (const frame of costFrames) {
+          if (typeof frame.requestId !== "string" || byRequest.has(frame.requestId)) {
+            fail(new Error("CCB cost frame request identity is missing or duplicated"));
+            return;
+          }
+          byRequest.set(frame.requestId, frame);
+        }
+        const expected = new Set(binding.requestIds);
+        const unexpected = [...byRequest.keys()].filter((requestId) =>
+          !expected.has(requestId)
+        );
+        if (unexpected.length > 0) {
+          fail(new Error("CCB cost frame is not bound to the exact durable usage"));
+          return;
+        }
+        if (binding.requestIds.every((requestId) => byRequest.has(requestId))) {
+          billingBinding = binding;
+          runtime.matching_costs = binding.requestIds.length;
+          costFrame = byRequest.get(binding.rootRequestIds[0]);
+          costRequestId = costFrame.requestId;
+          costTraceId = typeof costFrame.traceId === "string" ? costFrame.traceId : null;
+          requestSuccessfulClose();
+          return;
+        }
+      }
+      if (Date.now() >= bindingDeadlineMs) {
+        fail(new Error("CCB final billing evidence did not become exact in 60s"));
+        return;
+      }
+      bindingPoll = setTimeout(pollCcbBinding, 250);
+    };
     const maybeComplete = () => {
       if (runtime.finals !== 1 || turnTraceId === null) return;
+      if (config.engine === "ccb") {
+        bindingDeadlineMs ??= finalAtMs + 60_000;
+        if (bindingPoll === null) bindingPoll = setTimeout(pollCcbBinding, 0);
+        return;
+      }
       const matchingCosts = costFrames.filter((frame) =>
         frame.traceId === turnTraceId || frame.requestId === turnTraceId
       );
@@ -387,6 +656,13 @@ async function remoteTurn(encodedConfig) {
         typeof costFrame.traceId === "string"
           ? costFrame.traceId
           : null;
+      billingBinding = {
+        mode: "codex_server_trace",
+        traceId: turnTraceId,
+        requestIds: matchingCosts.map((frame) => frame.requestId).filter(
+          (requestId) => typeof requestId === "string",
+        ),
+      };
       requestSuccessfulClose();
     };
     const sendTurn = () => {
@@ -473,10 +749,15 @@ async function remoteTurn(encodedConfig) {
             fail(new Error("final frame has an invalid server request identity"));
             return;
           }
+          finalAtMs = Date.now();
+          clearTimeout(turnDeadline);
+          billingDeadline = setTimeout(
+            () => fail(new Error("final billing evidence did not become exact in 60s")),
+            60_000,
+          );
         }
       } else if (
         frame?.type === "outbound.cost_charged"
-        && (frame.model === undefined || frame.model === config.model)
       ) {
         costFrames.push(frame);
       }
@@ -521,14 +802,17 @@ async function remoteTurn(encodedConfig) {
         engine: config.engine,
         agent_id: config.agentId,
         started_at: new Date(startedAtMs).toISOString(),
-        finished_at: new Date(finishedAtMs).toISOString(),
-        wall_ms: finishedAtMs - startedAtMs,
+        finished_at: new Date(finalAtMs).toISOString(),
+        billing_evidence_at: new Date(billingEvidenceAtMs).toISOString(),
+        wall_ms: finalAtMs - startedAtMs,
+        billing_evidence_wait_ms: billingEvidenceAtMs - finalAtMs,
         ttft_ms: firstOutputAtMs === null ? null : firstOutputAtMs - startedAtMs,
         final_text: finalText.trim(),
         trace_id: turnTraceId,
         cost_request_id: costRequestId,
         cost_trace_id: costTraceId,
         cost: costFrame,
+        billing_binding: billingBinding,
         connection,
         runtime,
         frames,
@@ -566,8 +850,17 @@ function parseRemoteTurn(stdout, expected) {
     || !Number.isFinite(Date.parse(value.started_at))
     || typeof value.finished_at !== "string"
     || !Number.isFinite(Date.parse(value.finished_at))
+    || typeof value.billing_evidence_at !== "string"
+    || !Number.isFinite(Date.parse(value.billing_evidence_at))
     || !Number.isFinite(value.wall_ms)
     || value.wall_ms < 0
+    || !Number.isFinite(value.billing_evidence_wait_ms)
+    || value.billing_evidence_wait_ms < 0
+    || value.billing_evidence_wait_ms > 66_000
+    || Date.parse(value.finished_at) - Date.parse(value.started_at)
+      !== value.wall_ms
+    || Date.parse(value.billing_evidence_at) - Date.parse(value.finished_at)
+      !== value.billing_evidence_wait_ms
     || (
       value.ttft_ms !== null
       && (!Number.isFinite(value.ttft_ms) || value.ttft_ms < 0)
@@ -575,8 +868,26 @@ function parseRemoteTurn(stdout, expected) {
     || typeof value.final_text !== "string"
     || !TRACE_ID_RE.test(value.trace_id ?? "")
     || !value.cost
+    || !value.billing_binding
+    || value.billing_binding.mode !== (
+      expected.engine === "ccb"
+        ? "ccb_authority_dispatch_attempt"
+        : "codex_server_trace"
+    )
     || (
-      value.cost.traceId !== value.trace_id
+      expected.engine === "ccb"
+      && (
+        value.billing_binding.finalTraceId !== value.trace_id
+        || typeof value.billing_binding.dispatchBillingRequestId !== "string"
+        || value.billing_binding.dispatchBillingRequestId.length === 0
+        || !Array.isArray(value.billing_binding.requestIds)
+        || !Array.isArray(value.billing_binding.rootRequestIds)
+        || !value.billing_binding.rootRequestIds.includes(value.cost_request_id)
+      )
+    )
+    || (
+      expected.engine === "codex"
+      && value.cost.traceId !== value.trace_id
       && value.cost.requestId !== value.trace_id
     )
     || !Array.isArray(value.frames)
@@ -659,10 +970,14 @@ function parseRemoteTurn(stdout, expected) {
     if (
       frame.direction === "received"
       && payload?.type === "outbound.cost_charged"
-      && (payload.model === undefined || payload.model === expected.model)
       && (
-        payload.traceId === value.trace_id
-        || payload.requestId === value.trace_id
+        expected.engine === "ccb"
+          ? value.billing_binding.requestIds?.includes(payload.requestId)
+          : (payload.model === undefined || payload.model === expected.model)
+            && (
+              payload.traceId === value.trace_id
+              || payload.requestId === value.trace_id
+            )
       )
     ) {
       matchingCostCount += 1;
@@ -738,7 +1053,7 @@ export function main() {
   }
   const remote = parseRemoteTurn(result.stdout, inputs);
   const frameDocument = {
-    schema_version: 1,
+    schema_version: 2,
     peer_id: remote.peer_id,
     client_message_id: remote.client_message_id,
     case_id: inputs.caseId,
@@ -752,12 +1067,13 @@ export function main() {
     model: inputs.model,
     connection: remote.connection,
     runtime: remote.runtime,
+    billing_binding: remote.billing_binding,
     frames: remote.frames,
   };
   const frameBytes = Buffer.from(`${JSON.stringify(frameDocument)}\n`);
   const framesSha = createHash("sha256").update(frameBytes).digest("hex");
   const turnDocument = {
-    schema_version: 1,
+    schema_version: 2,
     peer_id: remote.peer_id,
     client_message_id: remote.client_message_id,
     case_id: inputs.caseId,
@@ -771,13 +1087,16 @@ export function main() {
     agent_id: inputs.agentId,
     started_at: remote.started_at,
     finished_at: remote.finished_at,
+    billing_evidence_at: remote.billing_evidence_at,
     wall_ms: remote.wall_ms,
+    billing_evidence_wait_ms: remote.billing_evidence_wait_ms,
     ttft_ms: remote.ttft_ms,
     final_text: remote.final_text,
     trace_id: remote.trace_id,
     cost_request_id: remote.cost_request_id,
     cost_trace_id: remote.cost_trace_id,
     cost: remote.cost,
+    billing_binding: remote.billing_binding,
     connection: remote.connection,
     runtime: remote.runtime,
     frames_path: inputs.framesPath,

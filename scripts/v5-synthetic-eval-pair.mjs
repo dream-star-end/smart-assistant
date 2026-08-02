@@ -23,6 +23,8 @@ import {
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { verifyWorkspaceArtifactDocument } from "./v5-synthetic-eval-run-arm.mjs";
+
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
@@ -441,6 +443,93 @@ function promptCapture(evidence, label) {
   return { bytes, sha256: actualSha };
 }
 
+function workspaceArtifactCapture(evidence, label, caseEvidence) {
+  const artifact = requireRecord(
+    evidence.workspaceArtifact,
+    `${label}.workspaceArtifact`,
+  );
+  const capturedPath = requireString(
+    artifact.capturedPath,
+    `${label}.workspaceArtifact.capturedPath`,
+  );
+  assertSecureRegularFile(capturedPath, `${label} captured workspace artifact`);
+  const bytes = readFileSync(capturedPath);
+  if (
+    bytes.length !== requireSafeCount(
+      artifact.bytes,
+      `${label}.workspaceArtifact.bytes`,
+    )
+    || sha256(bytes) !== requireSha(
+      artifact.sha256,
+      `${label}.workspaceArtifact.sha256`,
+    )
+  ) {
+    fail(`${label} captured workspace artifact bytes differ from evidence`);
+  }
+  const dynamicInputs = requireRecord(
+    evidence.dynamicInputs,
+    `${label}.dynamicInputs`,
+  );
+  const post = requireRecord(dynamicInputs.post, `${label}.dynamicInputs.post`);
+  const postInputs = requireRecord(
+    post.inputs,
+    `${label}.dynamicInputs.post.inputs`,
+  );
+  const temporaryIdentity = requireRecord(
+    postInputs.temporaryWorkspace,
+    `${label}.dynamicInputs.post.inputs.temporaryWorkspace`,
+  );
+  const overlay = requireRecord(
+    evidence.overlayContainer,
+    `${label}.overlayContainer`,
+  );
+  const expectedManifestSha = requireSha(
+    evidence.expectedManifestSha,
+    `${label}.expectedManifestSha`,
+  );
+  let document;
+  try {
+    document = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    fail(`${label} captured workspace artifact is not valid JSON`);
+  }
+  const complete = verifyWorkspaceArtifactDocument(
+    document,
+    {
+      state: artifact.state,
+      identity: artifact.identity,
+      entryCount: artifact.entryCount,
+    },
+    {
+      uid: evidence.uid,
+      engine: evidence.engine,
+      agentId: evidence.agentId,
+      caseId: caseEvidence.id,
+      workspaceMode: caseEvidence.workspace,
+      containerId: overlay.containerId,
+      manifestSha: expectedManifestSha,
+      identity: temporaryIdentity,
+    },
+  );
+  if (
+    artifact.files !== complete.files
+    || artifact.directories !== complete.directories
+    || artifact.completeBytes !== complete.completeBytes
+  ) {
+    fail(`${label} workspace artifact completeness counters differ`);
+  }
+  return {
+    state: artifact.state,
+    identity: canonicalValue(artifact.identity),
+    entryCount: artifact.entryCount,
+    files: complete.files,
+    directories: complete.directories,
+    completeBytes: complete.completeBytes,
+    bytes: bytes.length,
+    sha256: sha256(bytes),
+  };
+}
+
 export function controlledPromptDelta(baseBytes, candidateBytes) {
   const base = Buffer.from(baseBytes);
   const candidate = Buffer.from(candidateBytes);
@@ -478,7 +567,7 @@ export function controlledPromptDelta(baseBytes, candidateBytes) {
 }
 
 function validateArm(evidence, expectedArm, label) {
-  if (evidence.schemaVersion !== 2) fail(`${label}.schemaVersion must be 2`);
+  if (evidence.schemaVersion !== 3) fail(`${label}.schemaVersion must be 3`);
   if (evidence.status !== "completed") fail(`${label}.status must be completed`);
   if (evidence.arm !== expectedArm) fail(`${label}.arm must be ${expectedArm}`);
   const uid = evidence.uid;
@@ -554,6 +643,28 @@ function validateArm(evidence, expectedArm, label) {
   );
   const turn = turnHashIdentity(evidence, label);
   const prompt = promptCapture(evidence, label);
+  const workspaceArtifact = workspaceArtifactCapture(
+    evidence,
+    label,
+    caseEvidence,
+  );
+  const turnEvidence = requireRecord(
+    evidence.turnEvidence,
+    `${label}.turnEvidence`,
+  );
+  const billingBindingMode = requireString(
+    turnEvidence.billingBindingMode,
+    `${label}.turnEvidence.billingBindingMode`,
+  );
+  if (
+    billingBindingMode !== (
+      evidence.engine === "ccb"
+        ? "ccb_authority_dispatch_attempt"
+        : "codex_server_trace"
+    )
+  ) {
+    fail(`${label} billing binding mode differs from its engine`);
+  }
   const efficiency = canonicalValue(
     requireRecord(evidence.efficiency, `${label}.efficiency`),
     `${label}.efficiency`,
@@ -579,6 +690,8 @@ function validateArm(evidence, expectedArm, label) {
     order,
     turn,
     prompt,
+    workspaceArtifact,
+    billingBindingMode,
     efficiency,
   };
 }
@@ -602,6 +715,7 @@ export function aggregatePair(armAPath, armBPath) {
     ["dynamicInputs.pre", armA.dynamicPre, armB.dynamicPre],
     ["deployment identity", armA.deployment, armB.deployment],
     ["runtime tuple", armA.runtimeTuple, armB.runtimeTuple],
+    ["billing binding mode", armA.billingBindingMode, armB.billingBindingMode],
     [
       "expectedPromptDeltaSha",
       armA.expectedPromptDeltaSha,
@@ -620,7 +734,7 @@ export function aggregatePair(armAPath, armBPath) {
   }
 
   const pairIdentity = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     pairId: armA.pairId,
     order: armA.order,
     baseCommit: armA.baseCommit,
@@ -639,11 +753,12 @@ export function aggregatePair(armAPath, armBPath) {
     dynamicInputs: { pre: armA.dynamicPre },
     deployment: armA.deployment,
     runtimeTuple: armA.runtimeTuple,
+    billingBindingMode: armA.billingBindingMode,
   };
   const pairIdentityHash = sha256(Buffer.from(canonicalJson(pairIdentity)));
 
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     valid: true,
     pairIdentityHash,
     identity: canonicalValue(pairIdentity),
@@ -666,6 +781,10 @@ export function aggregatePair(armAPath, armBPath) {
     turnHashes: {
       A: armA.turn,
       B: armB.turn,
+    },
+    workspaceArtifacts: {
+      A: armA.workspaceArtifact,
+      B: armB.workspaceArtifact,
     },
     efficiencyRaw: {
       A: armA.efficiency,
