@@ -12,15 +12,16 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHmac, randomBytes } from "node:crypto";
 
 const SYNTHETIC_USERS = new Map([
   [247, {
     email: "v5-canary@claudeai.chat",
-    passwordFile: "/root/.secrets/v5-canary.password",
+    trafficClass: "synthetic_canary",
   }],
   [626, {
     email: "v5-evals@claudeai.chat",
-    passwordFile: "/root/.secrets/v5-evals.password",
+    trafficClass: "e2e",
   }],
 ]);
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
@@ -54,6 +55,39 @@ export function readReprovisionIdentity() {
     throw new Error("OC_SYNTHETIC_EVAL_PHASE must be overlay or restore");
   }
   return { uid, engine, agentId, phase };
+}
+
+export function issueSyntheticUserAccessToken(
+  uid,
+  secret,
+  now,
+  createHmacFn = createHmac,
+  randomBytesFn = randomBytes,
+) {
+  if (!Number.isSafeInteger(uid) || ![247, 626].includes(uid)) {
+    throw new Error("synthetic access token uid is invalid");
+  }
+  if (typeof secret !== "string" || Buffer.byteLength(secret, "utf8") < 32) {
+    throw new Error("commercial JWT secret must be at least 32 UTF-8 bytes");
+  }
+  if (!Number.isSafeInteger(now) || now < 1) {
+    throw new Error("synthetic access token time is invalid");
+  }
+  const encode = (value) =>
+    Buffer.from(JSON.stringify(value)).toString("base64url");
+  const header = encode({ alg: "HS256", typ: "JWT" });
+  const payload = encode({
+    role: "user",
+    sub: String(uid),
+    iat: now,
+    exp: now + 900,
+    jti: randomBytesFn(16).toString("hex"),
+  });
+  const unsigned = `${header}.${payload}`;
+  const signature = createHmacFn("sha256", secret)
+    .update(unsigned)
+    .digest("base64url");
+  return `${unsigned}.${signature}`;
 }
 
 export async function waitForFreshRelay(
@@ -162,7 +196,11 @@ export async function waitForFreshRelay(
   }
 }
 
-async function remoteReprovision(encodedConfig, waitForFreshRelay) {
+async function remoteReprovision(
+  encodedConfig,
+  waitForFreshRelay,
+  issueSyntheticUserAccessToken,
+) {
   const { execFileSync } = await import("node:child_process");
   const { createHmac, randomBytes } = await import("node:crypto");
   const { readFileSync } = await import("node:fs");
@@ -173,11 +211,11 @@ async function remoteReprovision(encodedConfig, waitForFreshRelay) {
   const users = {
     247: {
       email: "v5-canary@claudeai.chat",
-      passwordFile: "/root/.secrets/v5-canary.password",
+      trafficClass: "synthetic_canary",
     },
     626: {
       email: "v5-evals@claudeai.chat",
-      passwordFile: "/root/.secrets/v5-evals.password",
+      trafficClass: "e2e",
     },
   };
   if (
@@ -242,6 +280,26 @@ async function remoteReprovision(encodedConfig, waitForFreshRelay) {
       maxBuffer: 16 * 1024 * 1024,
     }));
 
+  const user = users[config.uid];
+  const syntheticIdentity = oneRow(
+    query(
+      "SELECT id,email,email_verified,role,status,signal_traffic_class " +
+        "FROM users WHERE id=:'uid'::bigint",
+      [["uid", config.uid]],
+    ),
+    "synthetic user identity",
+  ).split("|");
+  if (
+    syntheticIdentity.length !== 6
+    || syntheticIdentity[0] !== String(config.uid)
+    || syntheticIdentity[1] !== user.email
+    || syntheticIdentity[2] !== "t"
+    || syntheticIdentity[3] !== "user"
+    || syntheticIdentity[4] !== "active"
+    || syntheticIdentity[5] !== user.trafficClass
+  ) {
+    throw new Error("synthetic user identity differs from the fixed account");
+  }
   const [rowId, databaseContainerId] = oneRow(
     query(
       "SELECT id,container_internal_id FROM agent_containers " +
@@ -302,38 +360,22 @@ async function remoteReprovision(encodedConfig, waitForFreshRelay) {
   }
   const base = `http://127.0.0.1:${activePort}`;
 
-  const user = users[config.uid];
-  const password = readFileSync(user.passwordFile, "utf8").trim();
-  if (!password) throw new Error("synthetic account password is empty");
-  const login = await fetch(`${base}/api/auth/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      email: user.email,
-      password,
-      turnstile_token: "x",
-    }),
-  });
-  if (!login.ok) {
-    throw new Error(`synthetic login failed ${login.status}: ${(await login.text()).slice(0, 200)}`);
-  }
-  const loginBody = await login.json();
-  const accessToken = loginBody?.access_token;
-  if (typeof accessToken !== "string" || !accessToken) {
-    throw new Error("synthetic login did not return an access token");
-  }
-  const tokenParts = accessToken.split(".");
-  if (tokenParts.length !== 3) throw new Error("synthetic access token is malformed");
-  const accessClaims = JSON.parse(
-    Buffer.from(tokenParts[1], "base64url").toString("utf8"),
+  const runtime = {
+    login_requests: 0,
+    user_access_token_issues: 0,
+    admin_access_token_issues: 0,
+  };
+  const now = Math.floor(Date.now() / 1000);
+  runtime.user_access_token_issues += 1;
+  const accessToken = issueSyntheticUserAccessToken(
+    config.uid,
+    commandEnvironment.COMMERCIAL_JWT_SECRET,
+    now,
+    createHmac,
+    randomBytes,
   );
-  if (String(accessClaims.sub) !== String(config.uid)) {
-    throw new Error("synthetic login identity differs from requested uid");
-  }
-
   const encode = (value) =>
     Buffer.from(JSON.stringify(value)).toString("base64url");
-  const now = Math.floor(Date.now() / 1000);
   const header = encode({ alg: "HS256", typ: "JWT" });
   const payload = encode({
     role: "admin",
@@ -347,6 +389,7 @@ async function remoteReprovision(encodedConfig, waitForFreshRelay) {
     "sha256",
     commandEnvironment.COMMERCIAL_JWT_SECRET,
   ).update(unsigned).digest("base64url");
+  runtime.admin_access_token_issues += 1;
   const adminToken = `${unsigned}.${signature}`;
 
   // The sole container mutation in this helper.
@@ -409,12 +452,17 @@ async function remoteReprovision(encodedConfig, waitForFreshRelay) {
   ) {
     throw new Error("fresh synthetic container evidence is invalid");
   }
-  process.stdout.write(`${JSON.stringify({ id: databaseIdentity, started_at: startedAt })}\n`);
+  process.stdout.write(`${JSON.stringify({
+    id: databaseIdentity,
+    started_at: startedAt,
+    runtime,
+  })}\n`);
 }
 
 export const REPROVISION_REMOTE_SCRIPT =
   `const waitForFreshRelay = ${waitForFreshRelay.toString()};\n` +
-  `await (${remoteReprovision.toString()})(process.argv.at(-1), waitForFreshRelay);\n`;
+  `const issueSyntheticUserAccessToken = ${issueSyntheticUserAccessToken.toString()};\n` +
+  `await (${remoteReprovision.toString()})(process.argv.at(-1), waitForFreshRelay, issueSyntheticUserAccessToken);\n`;
 
 export function parseReprovisionOutput(stdout) {
   const lines = stdout.trim().split("\n").filter(Boolean);
@@ -425,10 +473,17 @@ export function parseReprovisionOutput(stdout) {
   if (
     !value
     || typeof value !== "object"
-    || Object.keys(value).sort().join(",") !== "id,started_at"
+    || Object.keys(value).sort().join(",") !== "id,runtime,started_at"
     || !CONTAINER_ID_RE.test(value.id ?? "")
     || typeof value.started_at !== "string"
     || !Number.isFinite(Date.parse(value.started_at))
+    || !value.runtime
+    || typeof value.runtime !== "object"
+    || Object.keys(value.runtime).sort().join(",")
+      !== "admin_access_token_issues,login_requests,user_access_token_issues"
+    || value.runtime.login_requests !== 0
+    || value.runtime.user_access_token_issues !== 1
+    || value.runtime.admin_access_token_issues !== 1
   ) {
     throw new Error("remote reprovision output is invalid");
   }
@@ -467,7 +522,10 @@ export function main() {
     );
   }
   const value = parseReprovisionOutput(result.stdout);
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  process.stdout.write(`${JSON.stringify({
+    id: value.id,
+    started_at: value.started_at,
+  })}\n`);
 }
 
 if (process.argv[1] === new URL(import.meta.url).pathname) {

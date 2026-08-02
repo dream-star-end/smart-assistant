@@ -4,13 +4,14 @@
  *
  * The local helper validates runner-bound case/prompt/output identities before
  * opening exactly one foreground ssh process to kl-mirror. The fixed remote
- * Node script performs one login, one session PUT, one relay WebSocket, and one
- * `inbound.message`. A disconnect, error, missing final, or missing cost frame
+ * Node script issues one fixed synthetic-user token, performs one session PUT,
+ * one relay WebSocket, and one `inbound.message`. A disconnect, error, missing
+ * final, or missing cost frame
  * fails without retry.
  */
 
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -23,7 +24,16 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
-const SYNTHETIC_USERS = new Set([247, 626]);
+const SYNTHETIC_USERS = new Map([
+  [247, {
+    email: "v5-canary@claudeai.chat",
+    trafficClass: "synthetic_canary",
+  }],
+  [626, {
+    email: "v5-evals@claudeai.chat",
+    trafficClass: "e2e",
+  }],
+]);
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const CASE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$/;
@@ -162,9 +172,42 @@ export function readTurnInputs() {
   };
 }
 
-async function remoteTurn(encodedConfig) {
+export function issueSyntheticUserAccessToken(
+  uid,
+  secret,
+  now,
+  createHmacFn = createHmac,
+  randomBytesFn = randomBytes,
+) {
+  if (!Number.isSafeInteger(uid) || ![247, 626].includes(uid)) {
+    throw new Error("synthetic access token uid is invalid");
+  }
+  if (typeof secret !== "string" || Buffer.byteLength(secret, "utf8") < 32) {
+    throw new Error("commercial JWT secret must be at least 32 UTF-8 bytes");
+  }
+  if (!Number.isSafeInteger(now) || now < 1) {
+    throw new Error("synthetic access token time is invalid");
+  }
+  const encode = (value) =>
+    Buffer.from(JSON.stringify(value)).toString("base64url");
+  const header = encode({ alg: "HS256", typ: "JWT" });
+  const payload = encode({
+    role: "user",
+    sub: String(uid),
+    iat: now,
+    exp: now + 900,
+    jti: randomBytesFn(16).toString("hex"),
+  });
+  const unsigned = `${header}.${payload}`;
+  const signature = createHmacFn("sha256", secret)
+    .update(unsigned)
+    .digest("base64url");
+  return `${unsigned}.${signature}`;
+}
+
+async function remoteTurn(encodedConfig, issueSyntheticUserAccessToken) {
   const { execFileSync, spawn } = await import("node:child_process");
-  const { createHash, randomBytes } = await import("node:crypto");
+  const { createHash, createHmac, randomBytes } = await import("node:crypto");
   const { readFileSync } = await import("node:fs");
 
   const config = JSON.parse(
@@ -173,11 +216,11 @@ async function remoteTurn(encodedConfig) {
   const users = {
     247: {
       email: "v5-canary@claudeai.chat",
-      passwordFile: "/root/.secrets/v5-canary.password",
+      trafficClass: "synthetic_canary",
     },
     626: {
       email: "v5-evals@claudeai.chat",
-      passwordFile: "/root/.secrets/v5-evals.password",
+      trafficClass: "e2e",
     },
   };
   if (
@@ -216,8 +259,53 @@ async function remoteTurn(encodedConfig) {
     }
   }
   const commandEnvironment = { ...process.env, ...serviceEnvironment };
-  if (!commandEnvironment.DATABASE_URL) {
+  if (!commandEnvironment.DATABASE_URL || !commandEnvironment.COMMERCIAL_JWT_SECRET) {
     throw new Error("commercial service environment is incomplete");
+  }
+  const query = (sql, variables = []) =>
+    execFileSync(
+      "psql",
+      [
+        commandEnvironment.DATABASE_URL,
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-At",
+        "-F",
+        "|",
+        ...variables.flatMap(([name, value]) => ["-v", `${name}=${value}`]),
+      ],
+      {
+        encoding: "utf8",
+        env: commandEnvironment,
+        input: `${sql}\n`,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    ).trim();
+  const oneRow = (output, label) => {
+    const rows = output.split("\n").filter(Boolean);
+    if (rows.length !== 1) throw new Error(`${label} must contain exactly one row`);
+    return rows[0];
+  };
+  const user = users[config.uid];
+  const syntheticIdentity = oneRow(
+    query(
+      "SELECT id,email,email_verified,role,status,signal_traffic_class " +
+        "FROM users WHERE id=:'uid'::bigint",
+      [["uid", config.uid]],
+    ),
+    "synthetic user identity",
+  ).split("|");
+  if (
+    syntheticIdentity.length !== 6
+    || syntheticIdentity[0] !== String(config.uid)
+    || syntheticIdentity[1] !== user.email
+    || syntheticIdentity[2] !== "t"
+    || syntheticIdentity[3] !== "user"
+    || syntheticIdentity[4] !== "active"
+    || syntheticIdentity[5] !== user.trafficClass
+  ) {
+    throw new Error("synthetic user identity differs from the fixed account");
   }
   const lane = execFileSync(
     "psql",
@@ -260,11 +348,10 @@ async function remoteTurn(encodedConfig) {
   }
   const base = `http://127.0.0.1:${activePort}`;
 
-  const user = users[config.uid];
-  const password = readFileSync(user.passwordFile, "utf8").trim();
-  if (!password) throw new Error("synthetic account password is empty");
   const runtime = {
     login_requests: 0,
+    user_access_token_issues: 0,
+    admin_access_token_issues: 0,
     session_puts: 0,
     websocket_instances: 0,
     inbound_messages: 0,
@@ -275,32 +362,14 @@ async function remoteTurn(encodedConfig) {
     prompt_ready: 0,
     prompt_captures: 0,
   };
-  runtime.login_requests += 1;
-  const login = await fetch(`${base}/api/auth/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      email: user.email,
-      password,
-      turnstile_token: "x",
-    }),
-  });
-  if (!login.ok) {
-    throw new Error(`synthetic login failed ${login.status}: ${(await login.text()).slice(0, 200)}`);
-  }
-  const loginBody = await login.json();
-  const accessToken = loginBody?.access_token;
-  if (typeof accessToken !== "string" || !accessToken) {
-    throw new Error("synthetic login did not return an access token");
-  }
-  const tokenParts = accessToken.split(".");
-  if (tokenParts.length !== 3) throw new Error("synthetic access token is malformed");
-  const accessClaims = JSON.parse(
-    Buffer.from(tokenParts[1], "base64url").toString("utf8"),
+  runtime.user_access_token_issues += 1;
+  const accessToken = issueSyntheticUserAccessToken(
+    config.uid,
+    commandEnvironment.COMMERCIAL_JWT_SECRET,
+    Math.floor(Date.now() / 1000),
+    createHmac,
+    randomBytes,
   );
-  if (String(accessClaims.sub) !== String(config.uid)) {
-    throw new Error("synthetic login identity differs from requested uid");
-  }
 
   const peerId = `eval${Date.now().toString(36)}${randomBytes(8).toString("hex")}`;
   const clientMessageId =
@@ -1070,7 +1139,9 @@ async function remoteTurn(encodedConfig) {
         || connection.opens !== 1
         || connection.closes !== 1
         || connection.reconnects !== 0
-        || runtime.login_requests !== 1
+        || runtime.login_requests !== 0
+        || runtime.user_access_token_issues !== 1
+        || runtime.admin_access_token_issues !== 0
         || runtime.session_puts !== 1
         || runtime.websocket_instances !== 1
         || runtime.inbound_messages !== 1
@@ -1125,7 +1196,8 @@ async function remoteTurn(encodedConfig) {
 }
 
 export const TURN_REMOTE_SCRIPT =
-  `await (${remoteTurn.toString()})(process.argv.at(-1));\n`;
+  `const issueSyntheticUserAccessToken = ${issueSyntheticUserAccessToken.toString()};\n` +
+  `await (${remoteTurn.toString()})(process.argv.at(-1), issueSyntheticUserAccessToken);\n`;
 
 function extraPromptBytes(value, expected, peerId) {
   const sessionKey = `agent:${expected.agentId}:webchat:dm:${peerId}`;
@@ -1269,7 +1341,13 @@ function parseRemoteTurn(stdout, expected) {
     || value.connection?.opens !== 1
     || value.connection?.closes !== 1
     || value.connection?.reconnects !== 0
-    || value.runtime?.login_requests !== 1
+    || !value.runtime
+    || typeof value.runtime !== "object"
+    || Object.keys(value.runtime).sort().join(",")
+      !== "admin_access_token_issues,binding_queries,finals,inbound_messages,login_requests,matching_costs,prompt_captures,prompt_ready,prompt_watchers,session_puts,user_access_token_issues,websocket_instances"
+    || value.runtime.login_requests !== 0
+    || value.runtime.user_access_token_issues !== 1
+    || value.runtime.admin_access_token_issues !== 0
     || value.runtime?.session_puts !== 1
     || value.runtime?.websocket_instances !== 1
     || value.runtime?.inbound_messages !== 1

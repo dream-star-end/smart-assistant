@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   chmodSync,
@@ -15,6 +15,7 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { verifyAccess } from "../../packages/commercial/src/auth/jwt.ts";
 
 const here = resolve(fileURLToPath(import.meta.url), "..");
 const repoRoot = resolve(here, "../..");
@@ -80,12 +81,20 @@ describe("V5 synthetic exact-eval helpers", () => {
       id: "a".repeat(64),
       started_at: "2026-07-31T10:00:00.000Z",
     };
+    const remoteOutput = {
+      ...output,
+      runtime: {
+        login_requests: 0,
+        user_access_token_issues: 1,
+        admin_access_token_issues: 1,
+      },
+    };
     const result = spawnSync(process.execPath, [reprovisionHelper], {
       encoding: "utf8",
       env: {
         ...commonEnv(fake.path, fake.log),
         OC_SYNTHETIC_EVAL_PHASE: "overlay",
-        FAKE_SSH_OUTPUT: JSON.stringify(output),
+        FAKE_SSH_OUTPUT: JSON.stringify(remoteOutput),
       },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -107,6 +116,101 @@ describe("V5 synthetic exact-eval helpers", () => {
       1,
     );
     assert.doesNotMatch(source, /inbound\.message/);
+    assert.doesNotMatch(source, /api\/auth\/login|passwordFile|turnstile_token/);
+    assert.match(
+      source,
+      /SELECT id,email,email_verified,role,status,signal_traffic_class/,
+    );
+    assert.match(source, /syntheticIdentity\[2\] !== "t"/);
+    assert.ok(
+      source.indexOf("const base = `http://127.0.0.1:${activePort}`")
+        < source.indexOf("const now = Math.floor(Date.now() / 1000)"),
+      "admin/user token lifetime starts only after synchronous safety preflights",
+    );
+  });
+
+  test("fixed helper JWTs verify with the production access-token verifier", async () => {
+    const secret = "fixed-eval-secret-is-at-least-32-bytes";
+    const now = 1_785_600_000;
+    const helpers = await Promise.all([
+      import(`${pathToFileURL(reprovisionHelper).href}?jwt=${Date.now()}`),
+      import(`${pathToFileURL(turnHelper).href}?jwt=${Date.now()}`),
+    ]) as Array<{
+      issueSyntheticUserAccessToken: (
+        uid: number,
+        secret: string,
+        now: number,
+        createHmacFn: typeof createHmac,
+        randomBytesFn: typeof randomBytes,
+      ) => string;
+    }>;
+
+    for (const helper of helpers) {
+      for (const uid of [247, 626]) {
+        const token = helper.issueSyntheticUserAccessToken(
+          uid,
+          secret,
+          now,
+          createHmac,
+          randomBytes,
+        );
+        const [encodedHeader, encodedClaims] = token.split(".");
+        assert.deepEqual(
+          JSON.parse(Buffer.from(encodedHeader, "base64url").toString("utf8")),
+          { alg: "HS256", typ: "JWT" },
+        );
+        const rawClaims = JSON.parse(
+          Buffer.from(encodedClaims, "base64url").toString("utf8"),
+        );
+        const verified = await verifyAccess(token, secret, { now: now + 1 });
+        assert.deepEqual(verified, rawClaims);
+        assert.equal(verified.sub, String(uid));
+        assert.equal(verified.role, "user");
+        assert.equal(Number.isSafeInteger(verified.iat), true);
+        assert.equal(Number.isSafeInteger(verified.exp), true);
+        assert.equal(verified.exp - verified.iat, 900);
+        assert.match(verified.jti, /^[0-9a-f]{32}$/);
+      }
+      assert.throws(
+        () => helper.issueSyntheticUserAccessToken(
+          247,
+          "界".repeat(10),
+          now,
+          createHmac,
+          randomBytes,
+        ),
+        /at least 32 UTF-8 bytes/,
+      );
+    }
+  });
+
+  test("reprovision parser requires exact zero-login and two-token evidence", async () => {
+    const helper = await import(
+      `${pathToFileURL(reprovisionHelper).href}?runtime=${Date.now()}`
+    ) as { parseReprovisionOutput: (stdout: string) => unknown };
+    const exact = {
+      id: "a".repeat(64),
+      started_at: "2026-07-31T10:00:00.000Z",
+      runtime: {
+        login_requests: 0,
+        user_access_token_issues: 1,
+        admin_access_token_issues: 1,
+      },
+    };
+    assert.deepEqual(
+      helper.parseReprovisionOutput(`${JSON.stringify(exact)}\n`),
+      exact,
+    );
+    for (const runtime of [
+      { ...exact.runtime, login_requests: 1 },
+      { login_requests: 0, user_access_token_issues: 1 },
+      { ...exact.runtime, access_token_issues: 2 },
+    ]) {
+      assert.throws(
+        () => helper.parseReprovisionOutput(JSON.stringify({ ...exact, runtime })),
+        /remote reprovision output is invalid/,
+      );
+    }
   });
 
   test("reprovision follows only bounded 4503 starting/provisioning readiness", async () => {
@@ -248,7 +352,8 @@ describe("V5 synthetic exact-eval helpers", () => {
     ) => {
       if (command === "/bin/bash") {
         return Buffer.from(
-          "DATABASE_URL=postgresql://mock\0COMMERCIAL_JWT_SECRET=secret\0",
+          "DATABASE_URL=postgresql://mock\0" +
+            "COMMERCIAL_JWT_SECRET=fixed-eval-secret-is-at-least-32-bytes\0",
         );
       }
       if (command === "psql") {
@@ -296,10 +401,93 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.equal(calls[0].args.includes("-c"), false);
     assert.equal(
       calls[0].options.input,
-      "SELECT id,container_internal_id FROM agent_containers " +
-        "WHERE user_id=:'uid'::bigint AND state='active' AND runtime_channel='v5' " +
-        "ORDER BY id DESC\n",
+      "SELECT id,email,email_verified,role,status,signal_traffic_class " +
+        "FROM users WHERE id=:'uid'::bigint\n",
     );
+  });
+
+  test("both remote helpers reject email-verification drift before token use", async () => {
+    const encodedReprovision = Buffer.from(JSON.stringify({
+      uid: 247,
+      engine: "ccb",
+      agentId: "main",
+      phase: "overlay",
+    })).toString("base64url");
+    const encodedTurn = Buffer.from(JSON.stringify({
+      uid: 247,
+      engine: "ccb",
+      agentId: "main",
+      caseId: "identity-drift",
+      pairId: "identity-drift-pair",
+      order: "A_FIRST",
+      casePackSha: "d".repeat(64),
+      prompt: "do not run",
+      promptSha: createHash("sha256").update("do not run").digest("hex"),
+      model: "glm-5.2",
+      timeoutSeconds: 60,
+      containerId: "e".repeat(64),
+    })).toString("base64url");
+    const modules = await Promise.all([
+      import(`${pathToFileURL(reprovisionHelper).href}?drift=${Date.now()}`),
+      import(`${pathToFileURL(turnHelper).href}?drift=${Date.now()}`),
+    ]) as Array<{ REPROVISION_REMOTE_SCRIPT?: string; TURN_REMOTE_SCRIPT?: string }>;
+    let psqlCalls = 0;
+    let fetchCalls = 0;
+    Reflect.set(globalThis, "__syntheticEvalExecFileSync", (
+      command: string,
+      _args: string[],
+      _options: { input?: string },
+    ) => {
+      if (command === "/bin/bash") {
+        return Buffer.from(
+          "DATABASE_URL=postgresql://mock\0" +
+            "COMMERCIAL_JWT_SECRET=fixed-eval-secret-is-at-least-32-bytes\0",
+        );
+      }
+      assert.equal(command, "psql");
+      psqlCalls += 1;
+      return "247|v5-canary@claudeai.chat|f|user|active|synthetic_canary\n";
+    });
+    Reflect.set(globalThis, "__syntheticEvalFetch", async () => {
+      fetchCalls += 1;
+      throw new Error("fetch must not run after identity drift");
+    });
+    const argvLength = process.argv.length;
+    try {
+      for (const [source, encoded] of [
+        [modules[0].REPROVISION_REMOTE_SCRIPT, encodedReprovision],
+        [modules[1].TURN_REMOTE_SCRIPT, encodedTurn],
+      ] as const) {
+        assert.equal(typeof source, "string");
+        const instrumented = source
+          .replace(
+            /^  const \{ execFileSync \} = .*;$/m,
+            "  const execFileSync = globalThis.__syntheticEvalExecFileSync;",
+          )
+          .replace(
+            /^  const \{ execFileSync, spawn \} = .*;$/m,
+            "  const execFileSync = globalThis.__syntheticEvalExecFileSync;\n" +
+              "  const spawn = () => { throw new Error('spawn must not run'); };",
+          )
+          .replaceAll("await fetch(", "await globalThis.__syntheticEvalFetch(");
+        process.argv.push(encoded);
+        try {
+          const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+          await assert.rejects(
+            async () => new AsyncFunction(instrumented)(),
+            /synthetic user identity differs from the fixed account/,
+          );
+        } finally {
+          process.argv.pop();
+        }
+      }
+    } finally {
+      process.argv.length = argvLength;
+      Reflect.deleteProperty(globalThis, "__syntheticEvalExecFileSync");
+      Reflect.deleteProperty(globalThis, "__syntheticEvalFetch");
+    }
+    assert.equal(psqlCalls, 2);
+    assert.equal(fetchCalls, 0);
   });
 
   test("identity validation fails before ssh for non-synthetic or mismatched phase", () => {
@@ -421,7 +609,9 @@ describe("V5 synthetic exact-eval helpers", () => {
       },
       connection: { opens: 1, closes: 1, reconnects: 0 },
       runtime: {
-        login_requests: 1,
+        login_requests: 0,
+        user_access_token_issues: 1,
+        admin_access_token_issues: 0,
         session_puts: 1,
         websocket_instances: 1,
         inbound_messages: 1,
@@ -610,21 +800,22 @@ describe("V5 synthetic exact-eval helpers", () => {
       | "nonterminal_missing_authority"
       | "terminal_failed" = "exact";
     let bindingQueries = 0;
-    const token = [
-      Buffer.from("{}").toString("base64url"),
-      Buffer.from(JSON.stringify({ sub: "247" })).toString("base64url"),
-      "signature",
-    ].join(".");
+    const jwtSecret = "fixed-eval-secret-is-at-least-32-bytes";
     const execFileSync = (
       command: string,
       args: string[],
       options: { input?: string },
     ): Buffer | string => {
       if (command === "/bin/bash") {
-        return Buffer.from("DATABASE_URL=postgresql://mock\0");
+        return Buffer.from(
+          `DATABASE_URL=postgresql://mock\0COMMERCIAL_JWT_SECRET=${jwtSecret}\0`,
+        );
       }
       assert.equal(command, "psql");
       if (args.includes("-c")) return "stable|B||0\n";
+      if (options.input?.includes("FROM users WHERE")) {
+        return "247|v5-canary@claudeai.chat|t|user|active|synthetic_canary\n";
+      }
       bindingQueries += 1;
       assert.match(options.input ?? "", /authority_turn_dispatches/);
       const variables = Object.fromEntries(
@@ -690,7 +881,6 @@ describe("V5 synthetic exact-eval helpers", () => {
     };
     const readFileSync = (path: string): string => {
       if (path.endsWith("openclaude.json")) return JSON.stringify({ gateway: { port: 18789 } });
-      if (path.endsWith("v5-canary.password")) return "secret\n";
       throw new Error(`unexpected read: ${path}`);
     };
     const containerId = "e".repeat(64);
@@ -745,11 +935,13 @@ describe("V5 synthetic exact-eval helpers", () => {
       });
       return child;
     };
-    const fetch = async (url: string): Promise<Record<string, unknown>> => {
-      if (url.endsWith("/api/auth/login")) {
-        return { ok: true, json: async () => ({ access_token: token }) };
-      }
+    let sessionAccessToken = "";
+    const fetch = async (
+      url: string,
+      options?: { headers?: Record<string, string> },
+    ): Promise<Record<string, unknown>> => {
       if (url.includes("/api/sessions/")) {
+        sessionAccessToken = options?.headers?.authorization?.replace(/^Bearer /, "") ?? "";
         return { ok: true, text: async () => "" };
       }
       throw new Error(`unexpected fetch: ${url}`);
@@ -851,12 +1043,18 @@ describe("V5 synthetic exact-eval helpers", () => {
       assert.equal(result.billing_binding.authorityTurnId, authorityTurnId);
       assert.deepEqual(result.billing_binding.ledgerIds, ["57327", "57328"]);
       assert.equal(result.runtime.binding_queries, 1);
+      assert.equal(result.runtime.login_requests, 0);
+      assert.equal(result.runtime.user_access_token_issues, 1);
+      assert.equal(result.runtime.admin_access_token_issues, 0);
       assert.equal(result.runtime.matching_costs, 1);
       assert.equal(result.runtime.prompt_watchers, 1);
       assert.equal(result.runtime.prompt_ready, 1);
       assert.equal(result.runtime.prompt_captures, 1);
       assert.equal(result.extra_prompt.processes[0].aliveAfter, false);
       assert.ok(result.billing_evidence_wait_ms < 1_000);
+      const claims = await verifyAccess(sessionAccessToken, jwtSecret);
+      assert.equal(claims.sub, "247");
+      assert.equal(claims.role, "user");
 
       watcherExitCode = 1;
       await assert.rejects(
@@ -911,6 +1109,12 @@ describe("V5 synthetic exact-eval helpers", () => {
 
   test("turn remote contract has one PUT, one WebSocket, and one inbound send", () => {
     const source = readFileSync(turnHelper, "utf8");
+    assert.doesNotMatch(source, /api\/auth\/login|passwordFile|turnstile_token/);
+    assert.match(
+      source,
+      /SELECT id,email,email_verified,role,status,signal_traffic_class/,
+    );
+    assert.match(source, /syntheticIdentity\[2\] !== "t"/);
     assert.equal(source.match(/new WebSocket\(/g)?.length, 1);
     assert.equal(source.match(/method: "PUT"/g)?.length, 1);
     assert.equal(source.match(/type: "inbound\.message"/g)?.length, 1);

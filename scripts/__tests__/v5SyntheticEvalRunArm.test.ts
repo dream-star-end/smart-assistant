@@ -271,7 +271,9 @@ describe("V5 synthetic exact-eval run-arm", () => {
       agent_id: identity.agentId,
       connection: { opens: 1, closes: 1, reconnects: 0 },
       runtime: {
-        login_requests: 1,
+        login_requests: 0,
+        user_access_token_issues: 1,
+        admin_access_token_issues: 0,
         session_puts: 1,
         websocket_instances: 1,
         inbound_messages: 1,
@@ -418,6 +420,67 @@ describe("V5 synthetic exact-eval run-arm", () => {
     assert.equal(turnHelperTimeoutMs(900), 1_110_000);
 
     const storedTurn = JSON.parse(readFileSync(resultPath, "utf8"));
+    const writeRuntimeVariant = (
+      name: string,
+      runtime: Record<string, number>,
+    ): { turnPath: string; framesPath: string } => {
+      const variantFramesPath = join(directory, `${name}-frames.json`);
+      const variantTurnPath = join(directory, `${name}-turn.json`);
+      const variantFramesBytes = Buffer.from(`${JSON.stringify({
+        ...frames,
+        runtime,
+      })}\n`);
+      writeFileSync(variantFramesPath, variantFramesBytes, { mode: 0o600 });
+      writeFileSync(variantTurnPath, JSON.stringify({
+        ...storedTurn,
+        runtime,
+        frames_path: variantFramesPath,
+        frames_sha256: createHash("sha256").update(variantFramesBytes).digest("hex"),
+        frames_bytes: variantFramesBytes.length,
+      }), { mode: 0o600 });
+      chmodSync(variantFramesPath, 0o600);
+      chmodSync(variantTurnPath, 0o600);
+      return { turnPath: variantTurnPath, framesPath: variantFramesPath };
+    };
+    const oldLoginRuntime = writeRuntimeVariant("old-login", {
+      ...frames.runtime,
+      login_requests: 1,
+    });
+    assert.throws(
+      () => parseTurnResult(
+        `${oldLoginRuntime.turnPath}\n`,
+        oldLoginRuntime.turnPath,
+        oldLoginRuntime.framesPath,
+        identity,
+      ),
+      /does not prove one WebSocket connection/,
+    );
+    const missingTokenRuntime = { ...frames.runtime };
+    delete (missingTokenRuntime as Partial<typeof frames.runtime>)
+      .admin_access_token_issues;
+    const missingToken = writeRuntimeVariant("missing-token-key", missingTokenRuntime);
+    assert.throws(
+      () => parseTurnResult(
+        `${missingToken.turnPath}\n`,
+        missingToken.turnPath,
+        missingToken.framesPath,
+        identity,
+      ),
+      /does not prove one WebSocket connection/,
+    );
+    const extraToken = writeRuntimeVariant("extra-token-key", {
+      ...frames.runtime,
+      access_token_issues: 1,
+    });
+    assert.throws(
+      () => parseTurnResult(
+        `${extraToken.turnPath}\n`,
+        extraToken.turnPath,
+        extraToken.framesPath,
+        identity,
+      ),
+      /does not prove one WebSocket connection/,
+    );
     const injectedPath = join(directory, "turn-with-injected-bytes.json");
     writeFileSync(injectedPath, JSON.stringify({
       ...storedTurn,
