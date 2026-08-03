@@ -283,6 +283,24 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     }
     assert.ok(prompt.includes('即使未开启团队模式'))
     assert.ok(prompt.includes('按收益机会式委派'))
+    assert.equal(prompt.match(/### 关键路径并行规则（唯一权威）/g)?.length, 1)
+    assert.equal(prompt.match(/一次原生批量\/并发命令同时启动/g)?.length, 1)
+    assert.ok(
+      !prompt.includes('多个互不依赖的读取、搜索或状态检查应在一次工具调用里批量执行'),
+    )
+    for (const contract of [
+      '必需的读取、搜索或检查已经明确且互不依赖',
+      '一次原生批量/并发命令同时启动',
+      '上下文边界明确',
+      '委派开销低于可节省的关键路径时间',
+      '平台强制的 1–4 fan-out、递归、并发、轮次、计费和工具集限制',
+      '来源、范围、格式、安全和验收标准',
+      '父 agent 仍负责解决冲突、检查完整性与产物并完成最终验证',
+      '共享状态写入、简单任务或协调开销较高的工作保持串行/直接执行',
+      '不要为了满足本规则而委派',
+    ]) {
+      assert.ok(prompt.includes(contract), `关键路径并行规则缺契约: ${contract}`)
+    }
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })
