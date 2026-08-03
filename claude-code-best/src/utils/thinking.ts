@@ -7,7 +7,16 @@ import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
-import { getAuthorityModelCapabilities, isArkGlmModel, isArkPlanKimiK3Model, isArkPlanKimiModel, isCapabilityZeroStaticModel, isMoonshotKimiK3Model, isOpencodeQwenModel } from './model/staticKeyModels.js'
+import {
+  getAuthorityModelCapabilities,
+  isArkGlmModel,
+  isArkPlanKimiK3Model,
+  isArkPlanKimiModel,
+  isBailianQwen38MaxModel,
+  isCapabilityZeroStaticModel,
+  isMoonshotKimiK3Model,
+  isOpencodeQwenModel,
+} from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type ThinkingConfig =
@@ -131,6 +140,11 @@ export function modelSupportsThinking(model: string): boolean {
   // (默认即返回带 signature 的 thinking block),且 {type:disabled} 真关思考(纯直答,
   // 同 qwen 语义,与 k2.7 的火山 400 不同)。同走 enabled+budget 分支。
   if (isMoonshotKimiK3Model(model)) {
+    return true
+  }
+  // 阿里百炼 qwen3.8-max 的 Anthropic 端点支持 enabled+budget 与 disabled；保持
+  // capability-zero 的其余 first-party 字段关闭，只放行标准 thinking。
+  if (isBailianQwen38MaxModel(model)) {
     return true
   }
   if (isCapabilityZeroStaticModel(model)) {

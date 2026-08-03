@@ -27,7 +27,7 @@ describe("effortMetaForModel — protocol 推导适用性", () => {
     assert.deepEqual(effortMetaForModel("glm-5.2"), { applicable: true, allowed: ["high", "max"] });
   });
   it("capability-zero 静态(strip output_config):kimi/qwen/minimax → 不适用", () => {
-    for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "qwen3.7-max", "qwen3.7-plus", "MiniMax-M3"]) {
+    for (const m of ["kimi-k2.7-code", "kimi-k3-ark", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max", "MiniMax-M3"]) {
       assert.deepEqual(effortMetaForModel(m), { applicable: false, allowed: [] }, m);
     }
   });
@@ -47,9 +47,10 @@ describe("effortMetaForModel — protocol 推导适用性", () => {
 });
 
 describe("provider ops 派生枚举", () => {
-  it("包含火山 ark-k3 与 Moonshot，默认展示名由完整类型映射守护", () => {
+  it("包含火山 ark-k3、Moonshot 与百炼，默认展示名由完整类型映射守护", () => {
     assert.ok(opsProviderIds().includes("ark-k3"));
     assert.ok(opsProviderIds().includes("moonshot"));
+    assert.ok(opsProviderIds().includes("bailian"));
   });
 });
 

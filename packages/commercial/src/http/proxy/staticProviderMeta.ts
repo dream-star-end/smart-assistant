@@ -21,7 +21,8 @@ export interface StaticProviderCommercialMeta {
     | "ARK_CODING_PLAN_KEY"
     | "ARK_AGENT_PLAN_KEY"
     | "OPENCODE_GO_API_KEY"
-    | "MOONSHOT_CODING_PLAN_KEY";
+    | "MOONSHOT_CODING_PLAN_KEY"
+    | "BAILIAN_TOKEN_PLAN_KEY";
   /** 缺 key → 503 错误码 */
   readonly notConfiguredHttpCode:
     | "DEEPSEEK_NOT_CONFIGURED"
@@ -30,7 +31,8 @@ export interface StaticProviderCommercialMeta {
     | "OPENCODEGO_NOT_CONFIGURED"
     | "KIMI_NOT_CONFIGURED"
     | "ARK_K3_NOT_CONFIGURED"
-    | "MOONSHOT_NOT_CONFIGURED";
+    | "MOONSHOT_NOT_CONFIGURED"
+    | "BAILIAN_NOT_CONFIGURED";
   /** 缺 key → reject metric label(须与 admin/metrics.ts ProxyRejectReason 一致) */
   readonly rejectMetricLabel:
     | "deepseek_config"
@@ -39,7 +41,8 @@ export interface StaticProviderCommercialMeta {
     | "opencodego_config"
     | "kimi_config"
     | "ark_k3_config"
-    | "moonshot_config";
+    | "moonshot_config"
+    | "bailian_config";
   /**
    * 出站出口策略(commercial 部署网络拓扑语义,非 protocol 路由契约,故落本表)。
    *
@@ -117,6 +120,15 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
     // 2026-07-17 实测经日本节点 SSL_ERROR_SYSCALL)→ 必须 direct。
     egress: "direct",
   },
+  bailian: {
+    // 阿里云百炼 Token Plan 正式 qwen3.8-max。聊天中出现过的 key 只用于开发验证，
+    // 生产必须先旋转并通过 EnvironmentFile 注入。
+    keyConfigField: "BAILIAN_TOKEN_PLAN_KEY",
+    notConfiguredHttpCode: "BAILIAN_NOT_CONFIGURED",
+    rejectMetricLabel: "bailian_config",
+    // token-plan.cn-beijing.maas.aliyuncs.com 为北京端点，显式直连避免绕全局日本代理。
+    egress: "direct",
+  },
 };
 
 /**
@@ -136,6 +148,7 @@ export function assertPlatformDefaultModelConfigured(cfg: {
   ARK_AGENT_PLAN_KEY?: string;
   OPENCODE_GO_API_KEY?: string;
   MOONSHOT_CODING_PLAN_KEY?: string;
+  BAILIAN_TOKEN_PLAN_KEY?: string;
 }): void {
   const provider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
   if (!provider) return;

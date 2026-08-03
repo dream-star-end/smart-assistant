@@ -588,6 +588,15 @@ export const commercialConfigSchema = z
      */
     MOONSHOT_CODING_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
+     * 阿里云百炼 Token Plan key(2026-08-04 接入正式 qwen3.8-max)。
+     * - Anthropic Messages:https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages
+     * - x-api-key 鉴权；只存在于 master/egress EnvironmentFile，绝不注入用户容器或写入 git
+     * - 未配置 → 503 BAILIAN_NOT_CONFIGURED + reject 'bailian_config'
+     * - Token Plan 仅用于 V5 Claude Code/CCB Agent；不开放通用后端 API
+     * - 已在聊天出现的 key 上线前必须在阿里控制台旋转
+     */
+    BAILIAN_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
      * Deepgram Nova-3 streaming ASR key for browser voice input.
      *
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。

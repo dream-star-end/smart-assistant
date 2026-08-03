@@ -574,6 +574,8 @@ export type ProxyRejectReason =
   | "ark_k3_config"
   // Moonshot 官方 Kimi For Coding(kimi-k3,2026-07-17):缺 MOONSHOT_CODING_PLAN_KEY 时独立打点。
   | "moonshot_config"
+  // 阿里百炼 Token Plan(qwen3.8-max,2026-08-04):缺 BAILIAN_TOKEN_PLAN_KEY 时独立打点。
+  | "bailian_config"
   // glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置(火山方舟 Coding Plan 文本路由 503)
   | "ark_config"
   // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader

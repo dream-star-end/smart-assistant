@@ -41,6 +41,7 @@ const MINIMAX_ROUTE = { kind: "static" as const, provider: getStaticProvider("mi
 const ARK_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark") };
 const OPENCODEGO_ROUTE = { kind: "static" as const, provider: getStaticProvider("opencodego") };
 const ARK_K3_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark-k3") };
+const BAILIAN_ROUTE = { kind: "static" as const, provider: getStaticProvider("bailian") };
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
@@ -148,6 +149,12 @@ describe("selectUpstreamRoute", () => {
       if (r.kind === "static") assert.equal(r.provider.id, "opencodego");
     }
   });
+  test("qwen3.8-max → static/bailian；preview 不误路由", () => {
+    const r = selectUpstreamRoute("qwen3.8-max");
+    assert.equal(r.kind, "static");
+    if (r.kind === "static") assert.equal(r.provider.id, "bailian");
+    assert.deepEqual(selectUpstreamRoute("qwen3.8-max-preview"), { kind: "oauth" });
+  });
   test("kimi-k3-ark → static/ark-k3 + legacy upstream rewrite", () => {
     const r = selectUpstreamRoute("kimi-k3-ark");
     assert.equal(r.kind, "static");
@@ -185,6 +192,10 @@ describe("validateUpstreamConfig", () => {
       kind: "static_not_configured",
       providerId: "ark-k3",
     });
+    assert.deepEqual(validateUpstreamConfig(BAILIAN_ROUTE, {}), {
+      kind: "static_not_configured",
+      providerId: "bailian",
+    });
   });
   test("static 路由 + 有自己的 key → null(放行)", () => {
     assert.equal(
@@ -201,6 +212,10 @@ describe("validateUpstreamConfig", () => {
     );
     assert.equal(
       validateUpstreamConfig(ARK_K3_ROUTE, { staticProviderKeys: { "ark-k3": "ark-plan-key" } }),
+      null,
+    );
+    assert.equal(
+      validateUpstreamConfig(BAILIAN_ROUTE, { staticProviderKeys: { bailian: "sk-sp-test" } }),
       null,
     );
   });
@@ -519,6 +534,45 @@ describe("pickUpstream — OpenCode Go 同 provider 历史", () => {
     assert.equal(cleaned, onlyBound);
     const plain = [{ role: "assistant", content: "plain" }];
     assert.equal(res.session.sanitizeMessages(plain, "qwen3.7-plus", log), plain);
+  });
+});
+
+describe("pickUpstream — 阿里百炼 qwen3.8-max", () => {
+  test("x-api-key + 北京直连；strip first-party 字段但保留 thinking/vision 内容", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { bailian: "sk-sp-test" } },
+      bodyFor("qwen3.8-max"),
+      BAILIAN_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(sched.pickCalls, 0);
+    assert.equal(
+      res.session.endpoint,
+      "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages",
+    );
+    assert.equal(res.session.upstreamModel, "qwen3.8-max");
+    assert.equal(res.session.dispatcher, directEgressDispatcher());
+
+    const headers: Record<string, string> = { "anthropic-beta": "should-strip" };
+    const requestBody = {
+      model: "qwen3.8-max",
+      output_config: { effort: "xhigh" },
+      context_management: { edits: [] },
+      service_tier: "auto",
+      thinking: { type: "disabled" },
+      messages: [{ role: "user", content: [{ type: "image", source: { type: "base64" } }] }],
+    } as unknown as Parameters<typeof res.session.applyUpstreamAuth>[1];
+    res.session.applyUpstreamAuth(headers, requestBody, log);
+    assert.equal(headers["x-api-key"], "sk-sp-test");
+    assert.equal(headers.authorization, undefined);
+    assert.equal(headers["anthropic-beta"], undefined);
+    assert.equal((requestBody as { output_config?: unknown }).output_config, undefined);
+    assert.equal((requestBody as { context_management?: unknown }).context_management, undefined);
+    assert.equal((requestBody as { service_tier?: unknown }).service_tier, undefined);
+    assert.deepEqual((requestBody as { thinking?: unknown }).thinking, { type: "disabled" });
   });
 });
 

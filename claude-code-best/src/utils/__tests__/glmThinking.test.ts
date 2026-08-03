@@ -61,6 +61,11 @@ describe("glm-5.1 (Ark) thinking capability", () => {
     expect(modelSupportsAdaptiveThinking("kimi-k3-ark")).toBe(false);
   });
 
+  test("qwen3.8-max(百炼 Token Plan)thinking=true、adaptive=false", () => {
+    expect(modelSupportsThinking("qwen3.8-max")).toBe(true);
+    expect(modelSupportsAdaptiveThinking("qwen3.8-max")).toBe(false);
+  });
+
   test("glm-5.1/glm-5.2 不支持 adaptive thinking → CCB 走 enabled+budget(Ark 实测可用的格式)", () => {
     expect(modelSupportsAdaptiveThinking("glm-5.1")).toBe(false);
     expect(modelSupportsAdaptiveThinking("glm-5.2")).toBe(false);

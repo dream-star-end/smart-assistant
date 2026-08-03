@@ -58,6 +58,8 @@ export const KNOWN_SEED_PROVIDERS: readonly string[] = [
   "ark-k3",
   // Moonshot 官方 Kimi For Coding(kimi-k3,2026-07-17)。
   "moonshot",
+  // 阿里云百炼 Token Plan(qwen3.8-max,2026-08-04)。
+  "bailian",
   // 引擎路由 pin(非静态 key provider):gateway registry 按 provider==='codex-native' 硬 pin codex engine。
   "codex-native",
 ];

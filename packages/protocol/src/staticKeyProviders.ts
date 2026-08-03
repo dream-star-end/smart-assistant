@@ -26,6 +26,7 @@ export type StaticProviderId =
   | 'kimi'
   | 'ark-k3'
   | 'moonshot'
+  | 'bailian'
 
 /**
  * 静态 provider key 解析表:provider id → 该 provider 的静态 key。
@@ -314,6 +315,31 @@ const MOONSHOT_CODING: StaticKeyProviderSpec = {
   supportsVision: true,
 }
 
+const BAILIAN_TOKEN_PLAN: StaticKeyProviderSpec = {
+  id: 'bailian',
+  // 阿里云百炼 Token Plan 的 Anthropic Messages 端点。qwen3.8-max 是 2026-08-04
+  // 发布的正式型号（不是 qwen3.8-max-preview）；平台 canonical id 与上游 literal 相同。
+  // 官方 Claude Code / Anthropic API 文档声明 983,616 上下文、131,072 最大输出，支持
+  // vision、thinking enabled+budget/disabled、tool use/result 与 prompt cache。
+  upstreamEndpoint: 'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages',
+  // Token Plan Anthropic 端点使用原生 x-api-key；key 只留 commercial master/egress，
+  // 不注入用户容器。
+  authScheme: 'x-api-key',
+  matchesRoute(modelId) {
+    return modelId.toLowerCase() === 'qwen3.8-max'
+  },
+  inboundModelIds: ['qwen3.8-max'],
+  canonicalizeForPricing(modelId) {
+    return modelId.toLowerCase() === 'qwen3.8-max' ? 'qwen3.8-max' : null
+  },
+  stripHeaders: ['anthropic-beta'],
+  // thinking 是标准支持能力，必须保留。output_config.effort 的 Anthropic 文档只为
+  // glm/deepseek 声明，不对 Qwen 暴露；CCB 侧 capability-zero 不生成，proxy 再兜底 strip。
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  maxInputTokens: 983_616,
+  supportsVision: true,
+}
+
 export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   DEEPSEEK,
   MINIMAX,
@@ -322,6 +348,7 @@ export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   ARK_PLAN_KIMI,
   ARK_PLAN_KIMI_K3,
   MOONSHOT_CODING,
+  BAILIAN_TOKEN_PLAN,
 ]
 
 const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
@@ -332,6 +359,7 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   kimi: ARK_PLAN_KIMI,
   'ark-k3': ARK_PLAN_KIMI_K3,
   moonshot: MOONSHOT_CODING,
+  bailian: BAILIAN_TOKEN_PLAN,
 }
 
 /** commercial proxy 路由判定：返回命中的 provider(用 matchesRoute)，否则 undefined(走 OAuth)。 */
