@@ -405,6 +405,7 @@ describe('server-authoritative client session tape', () => {
       frame: { type: 'outbound.message', blocks: [{ kind: 'tool_output_tail', tail: 'late' }] },
     })
     assert.equal(first.tapeSeq, 1)
+    assert.equal(first.inserted, true)
     assert.equal(second.tapeSeq, 2)
 
     const latest = await listClientSessionTapePage('sess-tape-order', 'tape-owner', { turns: 1 })
@@ -438,6 +439,7 @@ describe('server-authoritative client session tape', () => {
       frame: { type: 'inbound.message', clientMessage: { id: 'duplicate' } },
     })
     assert.equal(duplicateInbound.tapeSeq, 3, 'inbound retry reuses the committed tape row')
+    assert.equal(duplicateInbound.inserted, false)
     const unchanged = await listClientSessionTapePage('sess-tape-order', 'tape-owner', { turns: 2 })
     assert.equal(unchanged?.frames.length, 5)
   })

@@ -1481,7 +1481,7 @@ export async function appendClientSessionTapeFrame(input: {
   direction: 'inbound' | 'outbound'
   ts: number
   frame: Record<string, unknown>
-}): Promise<ClientSessionTapeFrame> {
+}): Promise<ClientSessionTapeFrame & { inserted: boolean }> {
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
     if (input.direction === 'inbound') {
@@ -1500,6 +1500,7 @@ export async function appendClientSessionTapeFrame(input: {
           direction: 'inbound' as const,
           ts: existing.ts,
           frame: JSON.parse(existing.frame_json) as Record<string, unknown>,
+          inserted: false,
         }
       }
     }
@@ -1528,6 +1529,7 @@ export async function appendClientSessionTapeFrame(input: {
       direction: input.direction,
       ts: input.ts,
       frame: input.frame,
+      inserted: true,
     }
   })
   return txn.immediate()

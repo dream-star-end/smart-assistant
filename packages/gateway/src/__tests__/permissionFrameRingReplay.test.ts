@@ -20,6 +20,12 @@ import { describe, it } from 'node:test'
 process.env.OPENCLAUDE_HOME = mkdtempSync(join(tmpdir(), 'oc-permission-ring-'))
 const { OutboundRingBuffer } = await import('../outboundRing.js')
 const { Gateway } = await import('../server.js')
+const {
+  appendClientSessionTapeFrame,
+  listClientSessionTapePage,
+  listClientSessions,
+  upsertClientSession,
+} = await import('@openclaude/storage')
 
 // Minimal mock WebSocket that just records sent payloads.
 function createMockWs(): { send: (data: string) => void; sent: string[] } {
@@ -45,7 +51,15 @@ type TestHarness = {
     sessionKey: string,
     peerKey: string,
     wireFrame: Record<string, unknown>,
+    tapeTurnKey?: string,
   ) => void
+  _deliverWebchatAsync: (
+    wire: Record<string, unknown>,
+    peerKey: string,
+    sessionKey: string,
+    userId: string,
+    turnKey: string,
+  ) => Promise<void>
   _handleRedisSessionFrame: (frame: Record<string, unknown>) => void
 }
 
@@ -186,6 +200,90 @@ describe('permission frame ring replay', () => {
     assert.equal(stored.type, 'outbound.permission_settled')
     assert.equal(stored.requestId, 'req-orphan')
     assert.equal(stored.reason, 'disconnect')
+  })
+
+  it('keeps permission sidecars and the final inside one canonical tape turn', async () => {
+    const gw = harness()
+    const sessionId = 'p-unified'
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`
+    const peerKey = `default:webchat:${sessionId}`
+    const turnKey = 'client-turn-key'
+    await upsertClientSession({
+      id: sessionId,
+      userId: 'default',
+      agentId: 'main',
+      title: 'Unified',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 1,
+      updatedAt: 1,
+      messages: [],
+    })
+    await appendClientSessionTapeFrame({
+      sessionId,
+      userId: 'default',
+      turnKey,
+      direction: 'inbound',
+      ts: 1,
+      frame: { type: 'inbound.message', clientMessage: { id: 'u-unified' } },
+    })
+    gw._sendStampedSessionFrame(
+      sessionKey,
+      peerKey,
+      {
+        type: 'outbound.permission_request',
+        sessionKey,
+        channel: 'webchat',
+        peer: { id: sessionId, kind: 'dm' },
+        requestId: 'req-unified',
+        toolName: 'Bash',
+      },
+      turnKey,
+    )
+    gw._sendStampedSessionFrame(
+      sessionKey,
+      peerKey,
+      {
+        type: 'outbound.permission_settled',
+        sessionKey,
+        channel: 'webchat',
+        peer: { id: sessionId, kind: 'dm' },
+        requestId: 'req-unified',
+        behavior: 'allow',
+        reason: 'remote',
+      },
+      turnKey,
+    )
+    await flushSessionDelivery(gw, sessionKey)
+    await gw._deliverWebchatAsync(
+      {
+        type: 'outbound.message',
+        sessionKey,
+        channel: 'webchat',
+        peer: { id: sessionId, kind: 'dm' },
+        blocks: [],
+        isFinal: true,
+      },
+      peerKey,
+      sessionKey,
+      'default',
+      turnKey,
+    )
+
+    const page = await listClientSessionTapePage(sessionId, 'default', { turns: 1 })
+    assert.deepEqual(new Set(page?.frames.map((frame) => frame.turnKey)), new Set([turnKey]))
+    assert.deepEqual(
+      page?.frames.map((frame) => frame.frame.type),
+      [
+        'inbound.message',
+        'outbound.permission_request',
+        'outbound.permission_settled',
+        'outbound.message',
+      ],
+    )
+    assert.equal(page?.hasMore, false)
+    const meta = (await listClientSessions('default')).find((item) => item.id === sessionId)
+    assert.equal(meta?.tapeTurnCount, 1)
   })
 
   it('empty sessionKey skips ring storage but still broadcasts', () => {

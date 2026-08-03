@@ -380,6 +380,7 @@ export class Gateway {
     string,
     {
       sessionKey: string
+      tapeTurnKey: string
       toolName: string
       input: Record<string, unknown>
       toolUseId?: string
@@ -416,6 +417,7 @@ export class Gateway {
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
       sessionKey: string
+      tapeTurnKey: string
       /** Authenticated userId from the originating request — needed to
        *  reconstruct the per-user peerKey on already-settled replay. */
       userId: string
@@ -5819,6 +5821,7 @@ export class Gateway {
           sessionKey: prior.sessionKey,
           channel: prior.channel,
           peer: prior.peer,
+          tapeTurnKey: prior.tapeTurnKey,
           requestId: frame.requestId,
           behavior: prior.behavior,
           reason: 'already_settled',
@@ -5858,12 +5861,14 @@ export class Gateway {
         channel: pending.channel,
         peer: pending.peer,
         sessionKey: pending.sessionKey,
+        tapeTurnKey: pending.tapeTurnKey,
         userId: pending.userId,
       })
       this._broadcastPermissionSettled(pending.peerKey, {
         sessionKey: pending.sessionKey,
         channel: pending.channel,
         peer: pending.peer,
+        tapeTurnKey: pending.tapeTurnKey,
         requestId: frame.requestId,
         behavior: 'deny',
         reason: 'disconnect',
@@ -5959,6 +5964,7 @@ export class Gateway {
       channel: pending.channel,
       peer: pending.peer,
       sessionKey: pending.sessionKey,
+      tapeTurnKey: pending.tapeTurnKey,
       userId: pending.userId,
       ...(settledAnswers ? { answers: settledAnswers } : {}),
     })
@@ -5971,6 +5977,7 @@ export class Gateway {
       sessionKey: pending.sessionKey,
       channel: pending.channel,
       peer: pending.peer,
+      tapeTurnKey: pending.tapeTurnKey,
       requestId: frame.requestId,
       behavior: effectiveBehavior,
       reason: 'remote',
@@ -5989,6 +5996,7 @@ export class Gateway {
       sessionKey: string
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
+      tapeTurnKey?: string
       requestId: string
       behavior: 'allow' | 'deny'
       reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed'
@@ -6000,10 +6008,16 @@ export class Gateway {
     // tab that missed the live broadcast (e.g. iOS Safari suspended its WS)
     // can then receive the settled frame via ring replay and update the
     // inline permission card from "Waiting" to "Allowed/Denied".
-    this._sendStampedSessionFrame(payload.sessionKey, peerKey, {
-      type: 'outbound.permission_settled',
-      ...payload,
-    })
+    const { tapeTurnKey, ...wirePayload } = payload
+    this._sendStampedSessionFrame(
+      payload.sessionKey,
+      peerKey,
+      {
+        type: 'outbound.permission_settled',
+        ...wirePayload,
+      },
+      tapeTurnKey,
+    )
   }
 
   /** Send a session-scoped wire frame to all WS clients at a peerKey, stamping
@@ -6019,6 +6033,7 @@ export class Gateway {
     sessionKey: string,
     peerKey: string,
     wireFrame: Record<string, unknown>,
+    tapeTurnKey?: string,
   ): void {
     if (sessionKey) {
       const durable =
@@ -6028,7 +6043,13 @@ export class Gateway {
       void this._enqueueSessionDelivery(sessionKey, async () => {
         if (durable && this._tapePoisoned.has(sessionKey)) return
         try {
-          await this._sendStampedSessionFrameAsync(sessionKey, peerKey, wireFrame, durable)
+          await this._sendStampedSessionFrameAsync(
+            sessionKey,
+            peerKey,
+            wireFrame,
+            durable,
+            tapeTurnKey,
+          )
         } catch (err) {
           if (durable) {
             sessionTapeAppendTotal.inc({ direction: 'outbound', outcome: 'failed' })
@@ -6055,6 +6076,7 @@ export class Gateway {
     peerKey: string,
     wireFrame: Record<string, unknown>,
     durable = false,
+    tapeTurnKey?: string,
   ): Promise<void> {
     const now = Date.now()
     const { seq: frameSeq, redisBacked } = await this._allocateFrameSeq(sessionKey)
@@ -6065,6 +6087,7 @@ export class Gateway {
       const session = this.sessions.getByKey(sessionKey)
       const userId = session?.userId ?? 'default'
       const turnKey =
+        tapeTurnKey ??
         session?._activeTurnId ??
         (typeof wireFrame.requestId === 'string'
           ? wireFrame.requestId
@@ -6119,6 +6142,7 @@ export class Gateway {
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
       sessionKey: string
+      tapeTurnKey: string
       userId: string
       answers?: Record<string, string>
     },
@@ -6138,6 +6162,7 @@ export class Gateway {
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
     sessionKey: string
+    tapeTurnKey: string
     userId: string
     answers?: Record<string, string>
   } | null {
@@ -6152,6 +6177,7 @@ export class Gateway {
       channel: e.channel,
       peer: e.peer,
       sessionKey: e.sessionKey,
+      tapeTurnKey: e.tapeTurnKey,
       userId: e.userId,
       answers: e.answers,
     }
@@ -6192,6 +6218,7 @@ export class Gateway {
       channel: pending.channel,
       peer: pending.peer,
       sessionKey: pending.sessionKey,
+      tapeTurnKey: pending.tapeTurnKey,
       userId: pending.userId,
     })
     // Broadcast so any still-connected tab dismisses its modal immediately.
@@ -6200,6 +6227,7 @@ export class Gateway {
       sessionKey: pending.sessionKey,
       channel: pending.channel,
       peer: pending.peer,
+      tapeTurnKey: pending.tapeTurnKey,
       requestId,
       behavior: 'deny',
       reason,
@@ -6707,6 +6735,7 @@ export class Gateway {
     const activeUserId: string =
       typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
     if (!adapter && frame.channel === 'webchat') {
+      let inboundInserted = false
       const rawClientMessage = (frame as InboundMessage).clientMessage
       const clientMessage =
         rawClientMessage &&
@@ -6742,7 +6771,7 @@ export class Gateway {
             this._tapePoisoned.delete(sessionKey)
           }
           try {
-            await appendClientSessionTapeFrame({
+            const taped = await appendClientSessionTapeFrame({
               sessionId: frame.peer.id,
               userId: activeUserId,
               turnKey: frame.idempotencyKey,
@@ -6750,7 +6779,11 @@ export class Gateway {
               ts: Date.now(),
               frame: { type: 'inbound.message', clientMessage },
             })
-            sessionTapeAppendTotal.inc({ direction: 'inbound', outcome: 'committed' })
+            inboundInserted = taped.inserted
+            sessionTapeAppendTotal.inc({
+              direction: 'inbound',
+              outcome: taped.inserted ? 'committed' : 'duplicate',
+            })
             this._redisSessionBus.invalidateSessionList(activeUserId)
           } catch (err) {
             sessionTapeAppendTotal.inc({ direction: 'inbound', outcome: 'failed' })
@@ -6777,6 +6810,25 @@ export class Gateway {
             ws.send(data)
           } catch {}
         }
+        return
+      }
+      if (!inboundInserted) {
+        const peerKey = Gateway.makePeerKey(activeUserId, frame.channel, frame.peer.id)
+        const data = JSON.stringify({
+          type: 'outbound.ack',
+          idempotencyKey: frame.idempotencyKey,
+          deduplicated: true,
+          ts: Date.now(),
+        })
+        for (const ws of this.clientsByPeer.get(peerKey) ?? []) {
+          try {
+            ws.send(data)
+          } catch {}
+        }
+        this.log.info('durable inbound replay skipped model submission', {
+          sessionKey,
+          idempotencyKey: frame.idempotencyKey,
+        })
         return
       }
     }
@@ -7280,24 +7332,29 @@ export class Gateway {
               const dispatchUserId: string =
                 typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
               const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
-              this._sendStampedSessionFrame(sessionKey, peerKey, {
-                type: 'outbound.workflow_progress',
+              this._sendStampedSessionFrame(
                 sessionKey,
-                channel: frame.channel,
-                peer: frame.peer,
-                agentId: session.agentId,
-                taskId: e.taskId,
-                stage: e.stage,
-                workflowName: e.workflowName,
-                toolUseId: e.toolUseId,
-                description: e.description,
-                summary: e.summary,
-                lastTool: e.lastTool,
-                usage: e.usage,
-                items: e.items,
-                status: e.status,
-                ts: Date.now(),
-              })
+                peerKey,
+                {
+                  type: 'outbound.workflow_progress',
+                  sessionKey,
+                  channel: frame.channel,
+                  peer: frame.peer,
+                  agentId: session.agentId,
+                  taskId: e.taskId,
+                  stage: e.stage,
+                  workflowName: e.workflowName,
+                  toolUseId: e.toolUseId,
+                  description: e.description,
+                  summary: e.summary,
+                  lastTool: e.lastTool,
+                  usage: e.usage,
+                  items: e.items,
+                  status: e.status,
+                  ts: Date.now(),
+                },
+                frame.idempotencyKey,
+              )
             }
           } else if (e.kind === 'permission_request') {
             // Forward permission prompt to WebSocket clients for user approval.
@@ -7332,6 +7389,7 @@ export class Gateway {
                 // Register pending request for single-settlement + disconnect auto-deny
                 this._pendingPermissions.set(e.request.requestId, {
                   sessionKey,
+                  tapeTurnKey: frame.idempotencyKey,
                   toolName: e.request.toolName,
                   input: e.request.input,
                   toolUseId: e.request.toolUseId,
@@ -7345,7 +7403,7 @@ export class Gateway {
                 // Safari restored a suspended tab) can replay the request via
                 // autoResumeFromHello. Without ring storage the modal would never
                 // re-fire after a disconnect window.
-                this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
+                this._sendStampedSessionFrame(sessionKey, peerKey, permFrame, frame.idempotencyKey)
               } else {
                 // No connected client — auto-deny
                 session.runner.sendPermissionResponse(e.request.requestId, {
