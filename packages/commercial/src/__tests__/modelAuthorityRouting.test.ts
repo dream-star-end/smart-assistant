@@ -47,6 +47,7 @@ const NOOP_DEPS: PickUpstreamDeps = {
     deepseek: "ds-key",
     minimax: "mm-key",
     "ark-k3": "ark-plan-key",
+    bailian: "bailian-key",
   },
 };
 
@@ -101,6 +102,19 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
     assert.equal(headers["anthropic-beta"], undefined);
     assert.equal((requestBody as { output_config?: unknown }).output_config, undefined);
     assert.deepEqual((requestBody as { thinking?: unknown }).thinking, { type: "disabled" });
+  });
+
+  test("bailian catalog descriptor 选择 qwen3.8-max 机制与 x-api-key", async () => {
+    const route = selectUpstreamRoute("catalog-qwen-max", {
+      providerId: "bailian",
+      upstreamModelId: "qwen3.8-max",
+    });
+    const r = await pickUpstream(NOOP_DEPS, body("catalog-qwen-max"), route, log);
+    assert.ok(r.ok);
+    const headers: Record<string, string> = {};
+    r.session.applyUpstreamAuth(headers, body("catalog-qwen-max"), log);
+    assert.equal(headers["x-api-key"], "bailian-key");
+    assert.equal(r.session.upstreamModel, "qwen3.8-max");
   });
 
   test("provider_id='anthropic' / null → OAuth 池", () => {

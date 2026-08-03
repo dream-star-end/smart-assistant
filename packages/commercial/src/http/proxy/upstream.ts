@@ -119,6 +119,7 @@ const STATIC_PROVIDER_IDS: ReadonlySet<string> = new Set<StaticProviderId>([
   "kimi",
   "ark-k3",
   "moonshot",
+  "bailian",
 ]);
 
 /**

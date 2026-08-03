@@ -98,6 +98,12 @@ export function isMoonshotKimiK3Model(model: string): boolean {
   return model.trim().toLowerCase() === 'kimi-k3'
 }
 
+/** 阿里云百炼 Token Plan 正式 Qwen3.8 Max。精确匹配，避免 preview/未来家族型号
+ * 在未登记能力与计费前被静默放行。 */
+export function isBailianQwen38MaxModel(model: string): boolean {
+  return model.trim().toLowerCase() === 'qwen3.8-max'
+}
+
 /**
  * 「firstParty 能力基本全关」静态模型集 = MiniMax-M3 + glm-5.1/glm-5.2 + qwen3.7-max/plus
  * (**不含 deepseek**)。命中 → effort/betas/context-management/structured-output/adaptive-thinking
@@ -117,7 +123,8 @@ export function isCapabilityZeroStaticModel(model: string): boolean {
     isOpencodeQwenModel(model) ||
     isArkPlanKimiModel(model) ||
     isArkPlanKimiK3Model(model) ||
-    isMoonshotKimiK3Model(model)
+    isMoonshotKimiK3Model(model) ||
+    isBailianQwen38MaxModel(model)
   )
 }
 
@@ -152,6 +159,8 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
   // (无 descriptor 的回落路径);角色分档(admin 1M/其他 500k)由 authority descriptor 下发,
   // getAuthorityModelCapabilities 先判已覆盖。
   { matches: isMoonshotKimiK3Model, contextWindow: 1_048_576 },
+  // 百炼 qwen3.8-max 官方 Claude Code / OpenCode 配置给出的精确上下文窗口。
+  { matches: isBailianQwen38MaxModel, contextWindow: 983_616 },
 ]
 
 /** 命中静态模型 context 特判表 → 返回其 contextWindow;否则 undefined(由 caller 落默认)。 */

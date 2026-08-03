@@ -170,6 +170,8 @@ export async function startEgress(): Promise<void> {
     "ark-k3": cfg.ARK_AGENT_PLAN_KEY,
     // 2026-07-17:Moonshot 官方 Kimi For Coding(kimi-k3),独立订阅独立 key。
     moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
+    // 2026-08-04:阿里百炼 Token Plan(qwen3.8-max)，独立订阅独立 key。
+    bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
   };
 
   // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)────────────────────────────

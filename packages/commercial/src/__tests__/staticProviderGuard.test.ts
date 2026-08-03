@@ -92,5 +92,11 @@ describe("STATIC_PROVIDER_META 完整性", () => {
       rejectMetricLabel: "ark_k3_config",
       egress: "direct",
     });
+    assert.deepEqual(STATIC_PROVIDER_META.bailian, {
+      keyConfigField: "BAILIAN_TOKEN_PLAN_KEY",
+      notConfiguredHttpCode: "BAILIAN_NOT_CONFIGURED",
+      rejectMetricLabel: "bailian_config",
+      egress: "direct",
+    });
   });
 });

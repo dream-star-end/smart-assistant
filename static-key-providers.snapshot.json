@@ -63,6 +63,15 @@
       "capabilityZero": true,
       "contextWindow": 1048576,
       "supportsVision": true
+    },
+    {
+      "id": "bailian",
+      "inboundModelIds": ["qwen3.8-max"],
+      "maxInputTokens": 983616,
+      "upstreamEndpoint": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 983616,
+      "supportsVision": true
     }
   ]
 }

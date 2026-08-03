@@ -56,6 +56,7 @@ const PROVIDER_DEFAULT_DISPLAY: Record<string, string> = {
   kimi: "火山方舟 Agent Plan(Kimi)",
   "ark-k3": "火山方舟 Agent Plan(Kimi K3)",
   moonshot: "Moonshot 官方(Kimi For Coding)",
+  bailian: "阿里云百炼 Token Plan(Qwen)",
   [CODEX_PROVIDER_ID]: "ChatGPT 订阅(Codex / GPT-5.6)",
 } satisfies Record<StaticProviderId | typeof CODEX_PROVIDER_ID, string>;
 

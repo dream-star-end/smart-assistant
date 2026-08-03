@@ -81,6 +81,13 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(arkK3.matchesRoute('kimi-k3'), false)
     assert.equal(getStaticProvider('moonshot').matchesRoute('kimi-k3-ark'), false)
   })
+  it('bailian 只匹配正式 qwen3.8-max，不抢 preview/旧 Qwen', () => {
+    const bailian = getStaticProvider('bailian')
+    assert.equal(bailian.matchesRoute('qwen3.8-max'), true)
+    assert.equal(bailian.matchesRoute('Qwen3.8-Max'), true)
+    assert.equal(bailian.matchesRoute('qwen3.8-max-preview'), false)
+    assert.equal(bailian.matchesRoute('qwen3.7-max'), false)
+  })
 })
 
 describe('staticKeyProviders — findRouteProviderForModel', () => {
@@ -94,6 +101,7 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
     assert.equal(findRouteProviderForModel('kimi-k3-ark')?.id, 'ark-k3')
     assert.equal(findRouteProviderForModel('kimi-k3')?.id, 'moonshot')
+    assert.equal(findRouteProviderForModel('qwen3.8-max')?.id, 'bailian')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
     assert.equal(findRouteProviderForModel(''), undefined)
@@ -117,6 +125,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
     assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3'])
+    assert.deepEqual([...getStaticProvider('bailian').inboundModelIds], ['qwen3.8-max'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
@@ -130,6 +139,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'kimi-k2.7-code',
       'kimi-k3-ark',
       'kimi-k3',
+      'qwen3.8-max',
     ])
   })
 })
@@ -179,6 +189,12 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(arkK3.canonicalizeForPricing('Kimi-K3-Ark'), 'kimi-k3-ark')
     assert.equal(arkK3.canonicalizeForPricing('kimi-k3'), null)
     assert.equal(arkK3.upstreamModelForRequest?.('Kimi-K3-Ark'), 'kimi-k3')
+  })
+  it('bailian → qwen3.8-max(小写归一)', () => {
+    const bailian = getStaticProvider('bailian')
+    assert.equal(bailian.canonicalizeForPricing('qwen3.8-max'), 'qwen3.8-max')
+    assert.equal(bailian.canonicalizeForPricing('Qwen3.8-Max'), 'qwen3.8-max')
+    assert.equal(bailian.canonicalizeForPricing('qwen3.8-max-preview'), null)
   })
 })
 
@@ -266,6 +282,24 @@ describe('staticKeyProviders — strip / endpoint', () => {
       'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
     )
   })
+  it('bailian qwen3.8-max 使用 Token Plan x-api-key、983616 窗口并保留 thinking', () => {
+    const bailian = getStaticProvider('bailian')
+    assert.equal(
+      bailian.upstreamEndpoint,
+      'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages',
+    )
+    assert.equal(bailian.authScheme, 'x-api-key')
+    assert.deepEqual([...bailian.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...bailian.stripBodyFields], [
+      'output_config',
+      'context_management',
+      'service_tier',
+    ])
+    assert.equal(bailian.stripBodyFields.includes('thinking'), false)
+    assert.equal(bailian.stripDisabledThinking, undefined)
+    assert.equal(bailian.maxInputTokens, 983_616)
+    assert.equal(bailian.supportsVision, true)
+  })
 })
 
 describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
@@ -276,6 +310,7 @@ describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
     assert.equal(getStaticProvider('ark').authScheme, undefined)
     assert.equal(getStaticProvider('kimi').authScheme, undefined)
     assert.equal(getStaticProvider('ark-k3').authScheme, undefined)
+    assert.equal(getStaticProvider('bailian').authScheme, 'x-api-key')
   })
 })
 
@@ -287,6 +322,7 @@ describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜�
     assert.equal(getStaticProvider('ark').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('opencodego').stripDisabledThinking, undefined)
     assert.equal(getStaticProvider('ark-k3').stripDisabledThinking, undefined)
+    assert.equal(getStaticProvider('bailian').stripDisabledThinking, undefined)
   })
 })
 
@@ -301,6 +337,7 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
     assert.equal(getStaticProvider('opencodego').allowedOutputConfigEfforts, undefined)
     assert.equal(getStaticProvider('kimi').allowedOutputConfigEfforts, undefined)
     assert.equal(getStaticProvider('ark-k3').allowedOutputConfigEfforts, undefined)
+    assert.equal(getStaticProvider('bailian').allowedOutputConfigEfforts, undefined)
   })
   it('硬约束:声明 allowedOutputConfigEfforts 的 provider 不能把 output_config 放进 stripBodyFields', () => {
     for (const p of STATIC_KEY_PROVIDERS) {
@@ -316,10 +353,11 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
 })
 
 describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
-  it('minimax/ark-k3/moonshot=true;deepseek/ark/opencodego/kimi(纯文本)=false', () => {
+  it('minimax/ark-k3/moonshot/bailian=true;deepseek/ark/opencodego/kimi(纯文本)=false', () => {
     assert.equal(getStaticProvider('minimax').supportsVision, true)
     assert.equal(getStaticProvider('ark-k3').supportsVision, true)
     assert.equal(getStaticProvider('moonshot').supportsVision, true)
+    assert.equal(getStaticProvider('bailian').supportsVision, true)
     assert.equal(getStaticProvider('deepseek').supportsVision ?? false, false)
     assert.equal(getStaticProvider('ark').supportsVision ?? false, false)
     // opencodego 2026-07-05 实测 image block → 400 InvalidParameter,纯文本接入。
