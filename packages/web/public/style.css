@@ -2648,6 +2648,23 @@ a:hover {
   background: var(--bg-hover);
   color: var(--fg);
 }
+/* Partial-history notice: shown above the transcript when the local body is
+   known-incomplete (_needsFetch) but we still have messages worth rendering.
+   Replaces the old full-pane placeholder, which hid live content. */
+.history-gap-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: var(--space-3);
+  background: var(--bg-raised);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
 .media-filename {
   font-size: var(--text-xs);
   color: var(--fg-muted);

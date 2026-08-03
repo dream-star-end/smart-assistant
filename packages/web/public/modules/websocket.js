@@ -4,7 +4,7 @@ import { shouldSuppressGoalStatusToast } from './goalControl.js?v=3'
 import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=3'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=10'
+import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=11'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -1967,6 +1967,20 @@ export function handleOutbound(frame) {
   _deps.scheduleSave(sess, !!frame.isFinal, { rebuildSearchIndex: !!frame.isFinal })
   // Only rebuild sidebar on final message (not every streaming delta)
   if (frame.isFinal) _deps.renderSidebar()
+  // The turn is over and the streaming pointers are cleared, so the gate that
+  // refused an earlier hydration has lifted. Settle any recorded debt now —
+  // otherwise a session that was mid-hydration when this stream arrived keeps
+  // a truncated history until the user manually switches away and back (the
+  // cross-device "it finished but the history isn't there" report).
+  if (frame.isFinal && sess._needsFetch && sess._hydrateDeferred) {
+    retryDeferredHydration(sess.id, {
+      onHydrated: (hydrated) => {
+        if (hydrated.id !== state.currentSessionId) return
+        _deps.renderMessages()
+        _deps.renderSidebar()
+      },
+    }).catch(() => {})
+  }
 }
 
 // Background-workflow (ultracode) progress side-channel → live workflow card.

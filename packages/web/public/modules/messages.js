@@ -2028,7 +2028,16 @@ export function renderMessages() {
   $('session-title').textContent = s.title
   updateSessionSub(s)
   renderGoalModePanel()
-  if (s._needsFetch) {
+  const msgs = s.messages.filter(_isTranscriptMessage)
+  // Only take over the whole pane when there is genuinely nothing to show.
+  // `_needsFetch` means "the local body may be incomplete" — NOT "there is
+  // nothing to render". Messages already in memory (a live stream arriving
+  // over WS while hydration is still pending or was skipped to protect the
+  // streaming tail) MUST stay visible; short-circuiting here used to blank
+  // them out, so a turn could finish with its reply sitting in sess.messages
+  // and the user staring at a placeholder. The gap is surfaced by the banner
+  // below instead.
+  if (s._needsFetch && msgs.length === 0) {
     const empty = document.createElement('div')
     empty.className = 'empty-state'
     const count =
@@ -2048,7 +2057,6 @@ export function renderMessages() {
     refreshPlanPanel()
     return
   }
-  const msgs = s.messages.filter(_isTranscriptMessage)
   if (msgs.length === 0) {
     const empty = document.createElement('div')
     empty.className = 'empty-state'
@@ -2063,6 +2071,24 @@ export function renderMessages() {
   const inner = document.createElement('div')
   inner.className = 'messages-inner'
   main.appendChild(inner)
+  // Partial body: render what we have, but say so. Hydration may be in flight,
+  // deferred behind a live stream (see sync.js _canHydrateNow), or have failed.
+  if (s._needsFetch) {
+    const gap = document.createElement('div')
+    gap.className = 'history-gap-banner'
+    const known = typeof s._messageCount === 'number' ? s._messageCount : 0
+    const missing = known > msgs.length ? known - msgs.length : 0
+    const what = missing > 0 ? `更早的 ${missing} 条消息` : '更早的历史'
+    gap.innerHTML = `<span>${htmlSafeEscape(what)}尚未加载</span><button class="btn btn-ghost btn-sm" type="button" data-hydrate-current>${s._hydrating ? '加载中…' : '加载完整历史'}</button>`
+    const gapBtn = gap.querySelector('[data-hydrate-current]')
+    if (gapBtn) {
+      gapBtn.disabled = !!s._hydrating
+      gapBtn.addEventListener('click', () => {
+        window.dispatchEvent(new CustomEvent('openclaude:hydrate-current-session'))
+      })
+    }
+    inner.appendChild(gap)
+  }
   // Performance: only render last 100 messages; show "load more" for older ones
   const MAX_INITIAL = 100
   if (msgs.length > MAX_INITIAL) {

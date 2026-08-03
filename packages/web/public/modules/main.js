@@ -36,7 +36,7 @@ import {
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=10'
+import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=11'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setThemeAppliedFn, setToastFn } from './theme.js'
@@ -143,7 +143,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=48'
+} from './messages.js?v=49'
 
 // ── WebSocket ──
 import {
@@ -171,7 +171,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=54'
+} from './websocket.js?v=55'
 
 // ── Slash commands ──
 import {

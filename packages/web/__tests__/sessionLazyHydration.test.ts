@@ -37,19 +37,30 @@ function makeLazySyncHarness() {
   const combined = [
     'const AUTO_HYDRATE_RECENT_LIMIT = 1',
     'const _pendingDeletes = new Set()',
+    'const DEFERRED_HYDRATE_DELAYS_MS = [0, 0, 0]',
     'function _emitSyncStatus() {}',
     'function _rebindStreamingPointers() {}',
     extractTopLevelFn(SYNC_SRC, '_copyLocalSessionRuntimeState'),
     extractTopLevelFn(SYNC_SRC, '_buildSessionFromRemote'),
     extractTopLevelFn(SYNC_SRC, '_sessionDbSnapshot'),
     extractTopLevelFn(SYNC_SRC, '_canHydrateNow'),
+    extractTopLevelFn(SYNC_SRC, '_markHydrateDebt'),
+    extractTopLevelFn(SYNC_SRC, '_serverSnapshotLosesLocalTail'),
     extractTopLevelFn(SYNC_SRC, 'hydrateSession'),
+    extractTopLevelFn(SYNC_SRC, 'retryDeferredHydration'),
     extractTopLevelFn(SYNC_SRC, 'syncSessionsFromServer'),
   ].join('\n')
   return new Function(
     'deps',
-    `const { apiGet, apiJson, dbGetAll, dbPut, dbDelete, state, isDeletePending, clearDeleteTombstone, _rebuildSearchIndex, pushSessionToServer } = deps; ${combined}; return { syncSessionsFromServer, hydrateSession, _buildSessionFromRemote };`,
+    `const { apiGet, apiJson, dbGetAll, dbPut, dbDelete, state, isDeletePending, clearDeleteTombstone, _rebuildSearchIndex, pushSessionToServer } = deps; ${combined}; return { syncSessionsFromServer, hydrateSession, retryDeferredHydration, _serverSnapshotLosesLocalTail, _buildSessionFromRemote };`,
   )
+}
+
+// Mirrors the real short-circuit in messages.js renderMessages(): the full-pane
+// placeholder is only allowed when there is genuinely nothing to render.
+function rendersPlaceholderInsteadOfContent(sess: any): boolean {
+  const msgs = (sess?.messages || []).filter((m: any) => m?.role !== 'goal')
+  return !!sess?._needsFetch && msgs.length === 0
 }
 
 describe('lazy session hydration', () => {
@@ -66,7 +77,12 @@ describe('lazy session hydration', () => {
       updatedAt: 3_000 + i,
       messageCount: 50,
     }))
-    const state = { token: 'tok', sessions: new Map(), currentSessionId: null, sendingInFlight: false }
+    const state = {
+      token: 'tok',
+      sessions: new Map(),
+      currentSessionId: null,
+      sendingInFlight: false,
+    }
     const dbWrites: any[] = []
     const { syncSessionsFromServer } = makeHarness({
       state,
@@ -135,7 +151,12 @@ describe('lazy session hydration', () => {
       (s: any) => s,
     )
 
-    await pushSessionToServer({ id: 'web-placeholder', messages: [], _needsFetch: true, _syncedAt: 1 })
+    await pushSessionToServer({
+      id: 'web-placeholder',
+      messages: [],
+      _needsFetch: true,
+      _syncedAt: 1,
+    })
     assert.equal(called, false)
   })
 
@@ -404,6 +425,186 @@ describe('lazy session hydration', () => {
     // that would later bypass the live-pointer protection.
     assert.equal(hydrated._liveStreamBroken, false)
     assert.equal(dbWrites.at(-1)?._liveStreamBroken, false)
+  })
+
+  // ── Cross-device: "the turn finished but the content isn't showing" ──
+  //
+  // Device B cold-starts into a placeholder session, then a turn started on
+  // device A streams in over WS while B's hydration GET is still in flight.
+  // The GET result must be dropped (it would clobber the tail), but the gap has
+  // to be remembered and settled once the turn ends — otherwise the session
+  // stays truncated until the user manually switches away and back.
+  it('hydration lost to an arriving stream is retried after the turn ends', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const sess: any = {
+      id: 'web-crossdevice',
+      title: '跨设备会话',
+      agentId: 'main',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [],
+      _syncedAt: 10,
+      _needsFetch: true,
+      _messageCount: 42,
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([['web-crossdevice', sess]]),
+      currentSessionId: 'web-crossdevice',
+      sendingInFlight: false,
+    }
+    const history = Array.from({ length: 42 }, (_, i) => ({
+      id: `m-${i}`,
+      role: i % 2 ? 'assistant' : 'user',
+      text: `历史消息 ${i}`,
+    }))
+    const sessionGets: string[] = []
+    const { hydrateSession, retryDeferredHydration } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async (path: string) => {
+        sessionGets.push(path)
+        if (sessionGets.length === 1) {
+          // Device A's stream lands mid-GET → runtime pointer appears.
+          const live = state.sessions.get('web-crossdevice')!
+          live._streamingAssistant = { id: 'stream-1', role: 'assistant', text: '回答中…' }
+          live.messages.push(live._streamingAssistant)
+          return { id: 'web-crossdevice', messages: history, updatedAt: 20 }
+        }
+        // By retry time the gateway's server-authored write has landed.
+        return {
+          id: 'web-crossdevice',
+          messages: [...history, { id: 's-final', role: 'assistant', text: '完整回答' }],
+          updatedAt: 30,
+        }
+      },
+      dbGetAll: async () => [sess],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    const raced = await hydrateSession('web-crossdevice')
+    assert.deepEqual(sessionGets, ['/api/sessions/web-crossdevice'])
+    assert.equal(raced.messages.length, 1, 'server body correctly not adopted mid-stream')
+    assert.equal(raced._needsFetch, true)
+    assert.equal(raced._hydrateDeferred, true, 'the gap must be recorded as debt')
+    // Content already in memory stays visible — no full-pane placeholder.
+    assert.equal(rendersPlaceholderInsteadOfContent(raced), false)
+
+    // isFinal: pointers cleared, local tail holds the complete reply.
+    const live = state.sessions.get('web-crossdevice')!
+    live._streamingAssistant = null
+    live._sendingInFlight = false
+    live.messages[live.messages.length - 1].text = '完整回答'
+
+    let rendered = 0
+    await retryDeferredHydration('web-crossdevice', { onHydrated: () => rendered++ })
+
+    const settled = state.sessions.get('web-crossdevice')!
+    assert.equal(settled.messages.length, 43, 'full history recovered automatically')
+    assert.equal(settled._needsFetch, false)
+    assert.equal(settled._hydrateDeferred, false)
+    assert.equal(rendered, 1, 'UI told to repaint')
+  })
+
+  // The gateway persists the authoritative assistant message with a
+  // fire-and-forget write that is NOT ordered against isFinal, so a retry can
+  // race it. Adopting a snapshot without the just-finished reply would erase a
+  // visible answer — the exact bug in reverse.
+  it('refuses a server snapshot that still lacks the finished reply', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const sess: any = {
+      id: 'web-race',
+      title: 'Race',
+      agentId: 'main',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [
+        { id: 'm-0', role: 'user', text: '问题' },
+        { id: 'm-1', role: 'assistant', text: '刚刚流式完成的完整回答' },
+      ],
+      _syncedAt: 10,
+      _needsFetch: true,
+      _hydrateDeferred: true,
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([['web-race', sess]]),
+      currentSessionId: 'web-race',
+      sendingInFlight: false,
+    }
+    let gets = 0
+    const { retryDeferredHydration } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async () => {
+        gets++
+        // Persistence never lands: snapshot has history but not the reply.
+        return {
+          id: 'web-race',
+          messages: [{ id: 'm-0', role: 'user', text: '问题' }],
+          updatedAt: 20,
+        }
+      },
+      dbGetAll: async () => [sess],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    let rendered = 0
+    await retryDeferredHydration('web-race', { onHydrated: () => rendered++ })
+
+    const after = state.sessions.get('web-race')!
+    assert.equal(after.messages.length, 2, 'the streamed reply must survive')
+    assert.equal(after.messages[1].text, '刚刚流式完成的完整回答')
+    assert.equal(rendered, 0)
+    assert.ok(gets >= 1 && gets <= 3, 'retries are bounded, not infinite')
+    // Still incomplete, but the transcript renders — banner offers manual retry.
+    assert.equal(rendersPlaceholderInsteadOfContent(after), false)
+  })
+
+  it('tail guard accepts a server snapshot that re-authored a superset', () => {
+    const { _serverSnapshotLosesLocalTail } = makeLazySyncHarness()({
+      state: { sessions: new Map() },
+      apiGet: async () => ({}),
+      apiJson: async () => ({}),
+      dbGetAll: async () => [],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+    const local = [{ id: 'm-1', role: 'assistant', text: '部分回' }]
+    // Server re-authored the complete text under a different id — must adopt.
+    assert.equal(
+      _serverSnapshotLosesLocalTail(
+        [{ id: 's-1', role: 'assistant', text: '部分回答完整版' }],
+        local,
+      ),
+      false,
+    )
+    // Server is genuinely behind — must refuse.
+    assert.equal(
+      _serverSnapshotLosesLocalTail([{ id: 'm-0', role: 'user', text: '问' }], local),
+      true,
+    )
+    // No local assistant content to lose — nothing to guard.
+    assert.equal(
+      _serverSnapshotLosesLocalTail([], [{ id: 'm-0', role: 'user', text: '问' }]),
+      false,
+    )
   })
 
   it('hello peer filter includes current placeholder and active sessions only', () => {

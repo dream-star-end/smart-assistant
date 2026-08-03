@@ -561,13 +561,68 @@ function _canHydrateNow(id, sess) {
   return true
 }
 
+/**
+ * Record that a hydration attempt was refused (or its result discarded)
+ * while the body is still known-incomplete. Without this, a session whose
+ * hydrate lost the race against an arriving live stream stayed `_needsFetch`
+ * forever: nothing re-triggered hydration once the stream ended, so the
+ * history gap persisted until the user manually switched away and back.
+ * Cleared on a successful adopt (see hydrateSession) — see
+ * `retryDeferredHydration`, called from the isFinal path in websocket.js.
+ */
+function _markHydrateDebt(sess) {
+  if (!sess || !sess._needsFetch) return
+  sess._hydrateDeferred = true
+}
+
+/**
+ * Does `serverMessages` still lack content we can already see locally?
+ *
+ * The gateway persists the authoritative assistant message with a
+ * fire-and-forget `appendServerAuthoredMessageDurable` that is NOT ordered
+ * against the isFinal frame (sessionManager.ts) — so a GET issued right after
+ * a turn ends can legitimately return a snapshot without that turn's reply.
+ * Adopting it would replace a locally-streamed, fully-rendered answer with a
+ * shorter body, i.e. make a finished reply disappear. We refuse and retry.
+ *
+ * Only the assistant tail is checked: client-authored bubbles being absent is
+ * normal (the server drops phantom `m-*` rows for turns it re-authored, see
+ * dropPhantomClientAssistants), so a stricter id-based rule would defer
+ * forever.
+ */
+export function _serverSnapshotLosesLocalTail(serverMessages, localMessages) {
+  const server = Array.isArray(serverMessages) ? serverMessages : []
+  const local = Array.isArray(localMessages) ? localMessages : []
+  let tailText = ''
+  for (let i = local.length - 1; i >= 0; i--) {
+    const m = local[i]
+    if (m?.role !== 'assistant') continue
+    const t = typeof m.text === 'string' ? m.text : ''
+    if (t.trim()) {
+      tailText = t
+      break
+    }
+  }
+  if (!tailText) return false
+  for (const m of server) {
+    if (m?.role !== 'assistant') continue
+    const s = typeof m.text === 'string' ? m.text : ''
+    // Equal, or the server re-authored a superset of what we streamed.
+    if (s?.startsWith(tailText)) return false
+  }
+  return true
+}
+
 export async function hydrateSession(id, { force = false } = {}) {
   if (!id || !state.token) return state.sessions.get(id) || null
   const existing = state.sessions.get(id)
   if (existing?._dirty) return existing
   if (existing && !existing._needsFetch && !force) return existing
   if (existing?._hydratePromise) return existing._hydratePromise
-  if (!_canHydrateNow(id, existing)) return existing || null
+  if (!_canHydrateNow(id, existing)) {
+    _markHydrateDebt(existing)
+    return existing || null
+  }
 
   const hydration = (async () => {
     const started = state.sessions.get(id)
@@ -584,10 +639,23 @@ export async function hydrateSession(id, { force = false } = {}) {
     const remote = await apiGet(`/api/sessions/${id}`)
     if (!remote?.id) return state.sessions.get(id) || null
     const live = state.sessions.get(id)
-    if (!_canHydrateNow(id, live)) return live || null
+    // A live stream can start while this GET is in flight (cross-device: the
+    // other device's turn streams to us mid-hydration). Dropping the response
+    // is correct — it would clobber the tail — but the gap must be remembered.
+    if (!_canHydrateNow(id, live)) {
+      _markHydrateDebt(live)
+      return live || null
+    }
     if (live?._dirty) return live
+    // Fire-and-forget server persistence may not have landed yet; never trade
+    // a visible reply for a shorter snapshot.
+    if (_serverSnapshotLosesLocalTail(remote.messages, live?.messages)) {
+      _markHydrateDebt(live)
+      return live || null
+    }
     const sess = _buildSessionFromRemote(remote, live, { placeholder: false })
     sess._needsFetch = false
+    sess._hydrateDeferred = false
     sess._hydrating = false
     // This GET is itself the authoritative REST reconciliation, so retire the
     // broken-stream override here (memory + the dbPut snapshot below). Otherwise
@@ -625,6 +693,44 @@ export async function hydrateSession(id, { force = false } = {}) {
     existing._hydrating = true
   }
   return trackedHydration
+}
+
+// Bounded because the two reasons a retry can keep failing are both
+// self-limiting-by-nature rather than transient: the server snapshot stays
+// behind local (nothing to gain by asking again), or another turn started (the
+// next isFinal re-arms us anyway). Delays straddle the fire-and-forget
+// persistence window observed in production (sub-second to a few seconds).
+const DEFERRED_HYDRATE_DELAYS_MS = [800, 2500, 6000]
+
+/**
+ * Settle a hydration debt recorded by `_markHydrateDebt`.
+ *
+ * Called once a turn ends and the streaming pointers are cleared, which is
+ * exactly when the gate that refused the earlier attempt has lifted. Retries
+ * are spaced to let the gateway's fire-and-forget server-authored write land;
+ * a snapshot that still lacks our tail is refused (not adopted) and simply
+ * re-marks the debt, so nothing visible is ever traded away.
+ *
+ * Gives up quietly after the last delay: the transcript stays rendered (see
+ * renderMessages) and the gap banner keeps a manual retry one tap away.
+ */
+export async function retryDeferredHydration(id, { onHydrated } = {}) {
+  for (const delay of DEFERRED_HYDRATE_DELAYS_MS) {
+    const sess = state.sessions.get(id)
+    if (!sess?._needsFetch || !sess._hydrateDeferred) return
+    await new Promise((r) => setTimeout(r, delay))
+    const before = state.sessions.get(id)
+    if (!before?._needsFetch || !before._hydrateDeferred) return
+    // A new turn began — its isFinal will re-arm the debt; don't fight it.
+    if (!_canHydrateNow(id, before)) continue
+    const hydrated = await hydrateSession(id).catch(() => null)
+    if (hydrated && !hydrated._needsFetch) {
+      try {
+        onHydrated?.(hydrated)
+      } catch {}
+      return
+    }
+  }
 }
 
 /**
