@@ -730,6 +730,30 @@
           "assertion": "Auto-Dream usage/call_usage sidebands preserve structured output"
         }
       ]
+    },
+    {
+      "id": "INC-20260803-MOBILE-WECHAT-QR",
+      "occurredAt": "2026-08-03",
+      "severity": "P1",
+      "symptom": "React 手机支付入口忽略虎皮椒 mobile_url，只展示同屏二维码并要求截图；手机无法扫描自身屏幕上的截图，导致订阅和充值订单无法完成。",
+      "rootFixCommit": "d5208edd",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/payment/HupijiaoPaymentEntry.test.tsx",
+          "assertion": "普通手机只挂载安全的手机支付链接，不请求二维码"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/payment/PendingPaymentRecovery.test.tsx",
+          "assertion": "手机支付返回后立即查单、清理 pending 并刷新余额"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T28 iPhone 支付跳 mobile_url，微信 WebView 不误导航"
+        }
+      ]
     }
   ]
 }
