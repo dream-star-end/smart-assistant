@@ -656,6 +656,106 @@ describe("migrate.runMigrations", () => {
     );
   });
 
+  test("0197 stages Bailian Qwen3.8 Max for admins with Qwen3.7 Max pricing", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await runMigrations();
+
+    const catalog = await query<{
+      engine: string;
+      provider_id: string;
+      upstream_model_id: string;
+      context_window: number;
+      capability_profile: Record<string, unknown>;
+      capability_schema_version: number;
+      state: string;
+    }>(
+      `SELECT engine, provider_id, upstream_model_id, context_window,
+              capability_profile, capability_schema_version, state
+         FROM model_catalog
+        WHERE model_id = 'qwen3.8-max'`,
+    );
+    assert.deepEqual(catalog.rows, [{
+      engine: "ccb",
+      provider_id: "bailian",
+      upstream_model_id: "qwen3.8-max",
+      context_window: 983_616,
+      capability_profile: {
+        supports_vision: true,
+        reasoning: { supported: [], codex_model_default: null },
+        ccb: { capability_zero: true, supports_thinking: true },
+      },
+      capability_schema_version: 1,
+      state: "active",
+    }]);
+
+    const pricing = await query<{
+      model_id: string;
+      display_name: string;
+      input_per_mtok: string;
+      output_per_mtok: string;
+      cache_read_per_mtok: string;
+      cache_write_per_mtok: string;
+      multiplier: string;
+      enabled: boolean;
+      sort_order: number;
+      visibility: string;
+    }>(
+      `SELECT model_id, display_name,
+              input_per_mtok::text, output_per_mtok::text,
+              cache_read_per_mtok::text, cache_write_per_mtok::text,
+              multiplier::text, enabled, sort_order, visibility
+         FROM model_pricing
+        WHERE model_id IN ('qwen3.7-max', 'qwen3.8-max')
+        ORDER BY model_id`,
+    );
+    assert.equal(pricing.rows.length, 2);
+    const source = pricing.rows.find((row) => row.model_id === "qwen3.7-max")!;
+    const target = pricing.rows.find((row) => row.model_id === "qwen3.8-max")!;
+    for (const field of [
+      "input_per_mtok",
+      "output_per_mtok",
+      "cache_read_per_mtok",
+      "cache_write_per_mtok",
+      "multiplier",
+      "enabled",
+    ] as const) {
+      assert.equal(target[field], source[field], field);
+    }
+    assert.equal(target.display_name, "Qwen3.8 Max");
+    assert.equal(target.sort_order, 88);
+    assert.equal(target.visibility, "admin");
+
+    const cache = new PricingCache();
+    await cache.load();
+    try {
+      assert.ok(
+        cache.listForUser({ role: "admin", grantedModelIds: new Set() })
+          .some((model) => model.id === "qwen3.8-max"),
+      );
+      assert.ok(
+        !cache.listForUser({ role: "user", grantedModelIds: new Set() })
+          .some((model) => model.id === "qwen3.8-max"),
+      );
+    } finally {
+      await cache.shutdown();
+    }
+
+    await query(
+      `UPDATE model_pricing
+          SET visibility = 'public'
+        WHERE model_id = 'qwen3.8-max'`,
+    );
+    const migrationSql = await readFile(
+      new URL("../db/migrations/0197_bailian_qwen38_max.sql", import.meta.url),
+      "utf8",
+    );
+    await assert.rejects(
+      query(migrationSql),
+      /0197 qwen3.8-max pricing copy verification failed/,
+      "reapplying 0197 must fail closed when the target pricing row has drifted",
+    );
+  });
+
   test("0183/0184 activate hidden Luna and create release-bound verification fences", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
