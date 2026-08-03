@@ -326,7 +326,11 @@ export function SubscriptionDialog({
               </div>
               <div className="text-[12.5px] text-faint">{stage.note}</div>
             </div>
-            <HupijiaoPaymentEntry qrcodeUrl={stage.order.qrcodeUrl} />
+            <HupijiaoPaymentEntry
+              qrcodeUrl={stage.order.qrcodeUrl}
+              mobileUrl={stage.order.mobileUrl}
+              pendingPayment={{ orderNo: stage.order.orderNo, label: stage.note }}
+            />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">
               <RefreshCw size={14} /> 返回套餐
             </Button>

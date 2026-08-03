@@ -126,6 +126,21 @@ await esbuild.build({
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
 });
+const paymentBundlePath = join(outDir, "payment-harness.js");
+await esbuild.build({
+  entryPoints: [join(HERE, "payment-harness.tsx")],
+  bundle: true,
+  format: "iife",
+  outfile: paymentBundlePath,
+  jsx: "automatic",
+  loader: { ".css": "empty" },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "import.meta.env.MODE": '"production"',
+  },
+  alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
+  logLevel: "silent",
+});
 const previewCssDir = join(outDir, "preview-css");
 await viteBuild({
   root: join(HERE, ".."),
@@ -156,6 +171,7 @@ const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name
 // 移动整页(T25):与线上 index.html 同构 —— 同一份 production CSS、同一条 viewport meta、
 // 单一 #root 挂载点,**零测试脚手架样式**(加一条覆盖就等于把被测的布局改掉了)。
 const mobileHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(mobileBundlePath, "utf8")}</script></body></html>`;
+const paymentHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(paymentBundlePath, "utf8")}</script></body></html>`;
 
 // 主 harness = production CSS + 测试脚手架。脚手架放在 production CSS 之后。
 // 唯一被脚手架遮蔽的生产规则是 #root 的全屏 fixed 定位与 body 的 overflow:hidden ——
@@ -1387,6 +1403,116 @@ await check("T26 微博标准登录页二维码与普通验证码标签共存时
   if (!challenge) throw new Error("真实图形验证码挑战被错误放行");
 });
 await weiboProofPage.close();
+screenshotPage = page;
+
+// ── T28 手机微信支付导航 ───────────────────────────────────────────────────
+// jsdom 能断言 href，却不能证明受信点击后的真导航，也看不到移动首屏是否偷偷请求了
+// PC 二维码。两个独立 context 分别锁住 Safari 与微信 WebView 的真实浏览器分支。
+const paymentHarnessUrl = "http://127.0.0.1/__openclaude_browser_payment__";
+const mobilePaymentContext = await browser.newContext({
+  viewport: { width: 390, height: 844 },
+  userAgent:
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5.2 Mobile/15E148 Safari/604.1",
+});
+const mobilePaymentPage = await mobilePaymentContext.newPage();
+watchRuntimeErrors(mobilePaymentPage, "mobile-payment");
+let mobileQrRequests = 0;
+let mobilePaymentPaid = false;
+await mobilePaymentPage.route("**/*", (route, request) => {
+  if (request.url() === paymentHarnessUrl) {
+    return route.fulfill({ status: 200, contentType: "text/html", body: paymentHtml });
+  }
+  if (request.url() === "https://pay.xunhupay.com/wechat/browser-proof") {
+    mobilePaymentPaid = true;
+    return route.fulfill({ status: 200, contentType: "text/html", body: "<!doctype html><title>pay</title>" });
+  }
+  if (request.url() === "http://127.0.0.1/api/payment/orders/browser-order-1") {
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        data: {
+          order_no: "browser-order-1",
+          status: mobilePaymentPaid ? "paid" : "pending",
+          amount_cents: "3800",
+          credits: "4000",
+          expires_at: "2099-01-01T00:00:00.000Z",
+          paid_at: mobilePaymentPaid ? "2026-08-03T00:00:00.000Z" : null,
+          created_at: "2026-08-03T00:00:00.000Z",
+          provider: "hupijiao",
+        },
+      }),
+    });
+  }
+  if (request.url() === "https://pay.test/mobile-should-not-load.png") {
+    mobileQrRequests += 1;
+    return route.fulfill({ status: 200, contentType: "image/png", body: Buffer.alloc(0) });
+  }
+  return serveBuiltAsset(route, request);
+});
+await mobilePaymentPage.goto(paymentHarnessUrl);
+
+const wechatPaymentContext = await browser.newContext({
+  viewport: { width: 390, height: 844 },
+  userAgent:
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 MicroMessenger/8.0.60",
+});
+const wechatPaymentPage = await wechatPaymentContext.newPage();
+watchRuntimeErrors(wechatPaymentPage, "wechat-payment");
+let wechatExternalRequests = 0;
+await wechatPaymentPage.route("**/*", (route, request) => {
+  if (request.url() === paymentHarnessUrl) {
+    return route.fulfill({ status: 200, contentType: "text/html", body: paymentHtml });
+  }
+  if (request.url().startsWith("https://pay.xunhupay.com/") || request.url().startsWith("https://pay.test/")) {
+    wechatExternalRequests += 1;
+    return route.fulfill({ status: 404, contentType: "text/plain", body: "unexpected payment request" });
+  }
+  return serveBuiltAsset(route, request);
+});
+await wechatPaymentPage.goto(paymentHarnessUrl);
+
+await check("T28 iPhone 支付跳 mobile_url，微信 WebView 不误导航", async () => {
+  screenshotPage = mobilePaymentPage;
+  if (await mobilePaymentPage.getByRole("img", { name: "微信支付二维码" }).count()) {
+    throw new Error("iPhone Safari 首屏仍挂载了 PC 二维码");
+  }
+  if (mobileQrRequests !== 0) {
+    throw new Error(`iPhone Safari 首屏请求了 PC 二维码 ${mobileQrRequests} 次`);
+  }
+  await Promise.all([
+    mobilePaymentPage.waitForURL("https://pay.xunhupay.com/wechat/browser-proof"),
+    mobilePaymentPage.getByRole("link", { name: "前往微信支付" }).click(),
+  ]);
+  // 虎皮椒 return_url 会让同一 tab 重新加载站点；sessionStorage 必须跨这次 document
+  // 重建恢复订单，而不是依赖离站前仍在内存里的 React state / timer。
+  await mobilePaymentPage.goto(paymentHarnessUrl);
+  await mobilePaymentPage.getByTestId("payment-recovery-paid").waitFor({
+    state: "visible",
+    timeout: 5000,
+  });
+  if (await mobilePaymentPage.evaluate(() => sessionStorage.getItem("openclaude_pending_order"))) {
+    throw new Error("支付确认后 sessionStorage pending 订单未清理");
+  }
+
+  screenshotPage = wechatPaymentPage;
+  if (await wechatPaymentPage.getByRole("img", { name: "微信支付二维码" }).count()) {
+    throw new Error("微信 WebView 挂载了 PC 二维码");
+  }
+  if (await wechatPaymentPage.getByRole("link", { name: "前往微信支付" }).count()) {
+    throw new Error("微信 WebView 暴露了手机支付链接");
+  }
+  await wechatPaymentPage.getByText("请在系统浏览器打开本页后重新下单").waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if (wechatExternalRequests !== 0) {
+    throw new Error(`微信 WebView 发生了 ${wechatExternalRequests} 次外部请求`);
+  }
+});
+await mobilePaymentContext.close();
+await wechatPaymentContext.close();
 screenshotPage = page;
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
