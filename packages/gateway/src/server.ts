@@ -36,13 +36,16 @@ import {
   type OpenClaudeConfig,
   SkillStore,
   TaskStore,
+  appendClientSessionTapeFrame,
   claimSession,
   defaultModels,
   deleteClientSession,
   effortsForModel,
   getClientSession,
+  getClientSessionTapeMeta,
   getJob as getSelfhealJob,
   getUsageSummary,
+  listClientSessionTapePage,
   listClientSessions,
   listUnclaimedSessions,
   paths,
@@ -79,6 +82,7 @@ import {
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
 import { runDelegateExecution } from './delegateExecution.js'
+import { collectDevStatus, renderDevStatusHtml } from './devStatus.js'
 import { parseDocument } from './documentParser.js'
 import {
   EgressHttpError,
@@ -91,6 +95,7 @@ import { createEvent, eventBus } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { createLogger } from './logger.js'
 import {
+  delegateCleanupTotal,
   httpRequestDuration,
   httpRequestsTotal,
   outboundRingEvictedTotal,
@@ -98,13 +103,14 @@ import {
   outboundRingReplayMissTotal,
   outboundRingSizeBytes,
   serializeMetrics,
+  sessionTapeAppendTotal,
   sessionsActive,
   startMetricsCollection,
+  turnInterruptTotal,
   wsConnectionsTotal,
 } from './metrics.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, type EvictionStats, OutboundRingBuffer } from './outboundRing.js'
-import { collectDevStatus, renderDevStatusHtml } from './devStatus.js'
 import { looksRedactedProxyUrl, maskProxyUrl, normalizeProxyUrl } from './proxyEnv.js'
 import { RateLimiter } from './rateLimit.js'
 import { type RedisFrameEnvelope, RedisSessionBus } from './redisSessionBus.js'
@@ -280,6 +286,10 @@ export class Gateway {
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
+  /** Serializes tape commits and externally visible frames per session. */
+  private _sessionDeliveryChains = new Map<string, Promise<void>>()
+  /** A failed tape commit stops later frames from overtaking the missing row. */
+  private _tapePoisoned = new Set<string>()
   private static readonly IDEMPOTENCY_MAX_KEYS = 1000
   private static readonly IDEMPOTENCY_TTL_MS = 5 * 60_000 // 5 minutes
 
@@ -307,6 +317,19 @@ export class Gateway {
   /** Record an idempotency key as processed. */
   private _markIdempotencyKey(key: string): void {
     if (key) this._seenIdempotencyKeys.set(key, Date.now())
+  }
+
+  private _enqueueSessionDelivery(sessionKey: string, op: () => Promise<void>): Promise<void> {
+    const previous = this._sessionDeliveryChains.get(sessionKey) ?? Promise.resolve()
+    const current = previous.then(op)
+    const settled = current.catch(() => {})
+    this._sessionDeliveryChains.set(sessionKey, settled)
+    void settled.finally(() => {
+      if (this._sessionDeliveryChains.get(sessionKey) === settled) {
+        this._sessionDeliveryChains.delete(sessionKey)
+      }
+    })
+    return current
   }
 
   // ── Cached task list for high-frequency eventBus lookups ──
@@ -1794,7 +1817,10 @@ export class Gateway {
           loadavg: () => loadavg(),
         })
         if (url.searchParams.get('format') === 'html') {
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+          })
           res.end(renderDevStatusHtml(status))
         } else {
           this.sendJson(res, 200, status)
@@ -1987,14 +2013,41 @@ export class Gateway {
         .catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
       return
     }
+    const clientTapeMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/tape$/)
+    if (clientTapeMatch && req.method === 'GET') {
+      const sessId = clientTapeMatch[1]
+      const userId = this.getUserId(req)
+      const beforeRaw = url.searchParams.get('before')
+      const turnsRaw = url.searchParams.get('turns')
+      const before = beforeRaw === null ? undefined : Number(beforeRaw)
+      const turns = turnsRaw === null ? undefined : Number(turnsRaw)
+      if (
+        (before !== undefined && (!Number.isSafeInteger(before) || before <= 0)) ||
+        (turns !== undefined && (!Number.isSafeInteger(turns) || turns <= 0))
+      ) {
+        this.sendJson(res, 400, { error: 'invalid tape cursor' })
+        return
+      }
+      listClientSessionTapePage(sessId, userId, { before, turns })
+        .then((page) =>
+          page ? this.sendJson(res, 200, page) : this.sendJson(res, 404, { error: 'not found' }),
+        )
+        .catch(() => this.sendJson(res, 500, { error: 'tape query failed' }))
+      return
+    }
     const clientSessMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})$/)
     if (clientSessMatch) {
       const sessId = clientSessMatch[1]
       const userId = this.getUserId(req)
       if (req.method === 'GET') {
-        this._getClientSessionCached(userId, sessId)
-          .then((s) =>
-            s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }),
+        Promise.all([
+          this._getClientSessionCached(userId, sessId),
+          getClientSessionTapeMeta(sessId, userId),
+        ])
+          .then(([s, tape]) =>
+            s
+              ? this.sendJson(res, 200, { ...s, tape })
+              : this.sendJson(res, 404, { error: 'not found' }),
           )
           .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
         return
@@ -3399,7 +3452,17 @@ export class Gateway {
             }),
           )
         },
-        releaseActive,
+        cleanup: async () => {
+          try {
+            await this.sessions.destroySession(sessionKey)
+            delegateCleanupTotal.inc({ outcome: 'destroyed' })
+          } catch (err) {
+            delegateCleanupTotal.inc({ outcome: 'failed' })
+            this.log.error('delegate session cleanup failed', { sessionKey }, err)
+          } finally {
+            releaseActive()
+          }
+        },
       })
 
     if (runAsync) {
@@ -3661,10 +3724,7 @@ export class Gateway {
    * POST /api/webhooks/v5-selfheal-fuse-clear { repairId:"fuse", reason, clearedBy }
    * (batch1b §3.3) — clear the LOCAL Tier2 release fuse (same HMAC trust chain).
    */
-  private async _handleSelfhealFuseClear(
-    req: IncomingMessage,
-    res: ServerResponse,
-  ): Promise<void> {
+  private async _handleSelfhealFuseClear(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'POST') {
       this.sendError(res, 405, 'method not allowed')
       return
@@ -5441,6 +5501,7 @@ export class Gateway {
           this._outboundRing.clear(sessionKey)
           this._redisPendingFrames.delete(sessionKey)
           this._clearRedisGapTimer(sessionKey)
+          this._tapePoisoned.delete(sessionKey)
           outboundRingSizeBytes.value = this._outboundRing.totalBytes()
           this.log.info('reset destroyed session', { sessionKey })
         } else if ((frame as any).type === 'control.session.compact') {
@@ -5714,6 +5775,7 @@ export class Gateway {
       }
     }
     const ok = this.sessions.interrupt(sessionKey)
+    turnInterruptTotal.inc({ source: 'user', outcome: ok ? 'interrupted' : 'not_running' })
     this.log.info('interrupt', { sessionKey, ok })
   }
 
@@ -5958,22 +6020,27 @@ export class Gateway {
     peerKey: string,
     wireFrame: Record<string, unknown>,
   ): void {
-    if (sessionKey && this._redisSessionBus?.enabled) {
-      void this._sendStampedSessionFrameAsync(sessionKey, peerKey, wireFrame).catch((err) =>
-        this.log.warn('redis-backed stamped frame failed', { sessionKey }, err),
-      )
+    if (sessionKey) {
+      const durable =
+        wireFrame.type === 'outbound.workflow_progress' ||
+        wireFrame.type === 'outbound.permission_request' ||
+        wireFrame.type === 'outbound.permission_settled'
+      void this._enqueueSessionDelivery(sessionKey, async () => {
+        if (durable && this._tapePoisoned.has(sessionKey)) return
+        try {
+          await this._sendStampedSessionFrameAsync(sessionKey, peerKey, wireFrame, durable)
+        } catch (err) {
+          if (durable) {
+            sessionTapeAppendTotal.inc({ direction: 'outbound', outcome: 'failed' })
+            this._tapePoisoned.add(sessionKey)
+          }
+          throw err
+        }
+      }).catch((err) => this.log.warn('ordered stamped frame failed', { sessionKey }, err))
       return
     }
     const now = Date.now()
-    let data: string
-    if (sessionKey) {
-      const frameSeq = this._outboundRing.nextSeq(sessionKey)
-      data = JSON.stringify({ ...wireFrame, ts: now, frameSeq })
-      const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
-      this._recordRingEvictions(evicted)
-    } else {
-      data = JSON.stringify({ ...wireFrame, ts: now })
-    }
+    const data = JSON.stringify({ ...wireFrame, ts: now })
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
     for (const ws of set) {
@@ -5987,10 +6054,40 @@ export class Gateway {
     sessionKey: string,
     peerKey: string,
     wireFrame: Record<string, unknown>,
+    durable = false,
   ): Promise<void> {
     const now = Date.now()
     const { seq: frameSeq, redisBacked } = await this._allocateFrameSeq(sessionKey)
-    const data = JSON.stringify({ ...wireFrame, ts: now, frameSeq })
+    let tapeSeq: number | undefined
+    if (durable) {
+      const peer = wireFrame.peer as { id?: unknown } | undefined
+      if (typeof peer?.id !== 'string') throw new Error('durable session frame missing peer id')
+      const session = this.sessions.getByKey(sessionKey)
+      const userId = session?.userId ?? 'default'
+      const turnKey =
+        session?._activeTurnId ??
+        (typeof wireFrame.requestId === 'string'
+          ? wireFrame.requestId
+          : typeof wireFrame.taskId === 'string'
+            ? wireFrame.taskId
+            : sessionKey)
+      const tape = await appendClientSessionTapeFrame({
+        sessionId: peer.id,
+        userId,
+        turnKey,
+        direction: 'outbound',
+        ts: now,
+        frame: { ...wireFrame, ts: now, frameSeq },
+      })
+      tapeSeq = tape.tapeSeq
+      sessionTapeAppendTotal.inc({ direction: 'outbound', outcome: 'committed' })
+    }
+    const data = JSON.stringify({
+      ...wireFrame,
+      ts: now,
+      frameSeq,
+      ...(tapeSeq !== undefined ? { tapeSeq } : {}),
+    })
     const evicted = redisBacked
       ? this._outboundRing.storeExternal(sessionKey, frameSeq, now, data)
       : this._outboundRing.store(sessionKey, frameSeq, now, data)
@@ -6471,7 +6568,7 @@ export class Gateway {
       // the interrupted turn. Without this, the client shows a permanent typing indicator
       // and the resumed subprocess sits idle — neither side moves first.
       const peerInFlight = peers.find((p) => p.peerId === peerId)?.inFlight
-      if (peerInFlight && session && !session.runner.isRunning) {
+      if (peerInFlight && session && !session._turnActiveSince) {
         try {
           // Single-ws send (only the hello-ing client should see this notice),
           // so deliver() isn't appropriate here — stamp ts inline.
@@ -6497,6 +6594,20 @@ export class Gateway {
           })
         } catch {}
       }
+
+      // Reconcile the browser's persisted in-flight marker from authoritative
+      // server turn state. A Codex app-server process is long-lived, so
+      // runner.isRunning cannot distinguish an active turn from an idle thread.
+      this._sendStampedSessionFrame(sessionKey, peerKey, {
+        type: 'outbound.turn_status',
+        sessionKey,
+        channel: 'webchat',
+        peer: { id: peerId, kind: 'dm' },
+        agentId: aid,
+        status: session?._turnActiveSince ? 'running' : 'idle',
+        ...(session?._turnActiveSince ? { startedAt: session._turnActiveSince } : {}),
+        ts: Date.now(),
+      })
     }
 
     // Single close handler for all peers registered via this hello (avoids listener accumulation)
@@ -6595,6 +6706,80 @@ export class Gateway {
     // Track last active channel for proactive push
     const activeUserId: string =
       typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+    if (!adapter && frame.channel === 'webchat') {
+      const rawClientMessage = (frame as InboundMessage).clientMessage
+      const clientMessage =
+        rawClientMessage &&
+        typeof rawClientMessage.id === 'string' &&
+        typeof rawClientMessage.text === 'string' &&
+        typeof rawClientMessage.ts === 'number'
+          ? {
+              id: rawClientMessage.id,
+              role: 'user' as const,
+              text: rawClientMessage.text,
+              ts: rawClientMessage.ts,
+              status: 'sent' as const,
+              ...(rawClientMessage._media ? { _media: rawClientMessage._media } : {}),
+              ...(rawClientMessage._modelText ? { _modelText: rawClientMessage._modelText } : {}),
+            }
+          : {
+              id: `user-${frame.idempotencyKey}`,
+              role: 'user' as const,
+              text: frame.content.text ?? '',
+              ts: Number.isFinite(frame.ts) ? frame.ts : Date.now(),
+              status: 'sent' as const,
+            }
+      try {
+        await this._enqueueSessionDelivery(sessionKey, async () => {
+          if (this._tapePoisoned.has(sessionKey)) {
+            if (this.sessions.getByKey(sessionKey)?._turnActiveSince) {
+              throw new Error(
+                'session transcript tape is unavailable while the prior turn is active',
+              )
+            }
+            // The prior ordered chain has drained and no model turn can emit
+            // more old frames. A user retry may now probe the tape again.
+            this._tapePoisoned.delete(sessionKey)
+          }
+          try {
+            await appendClientSessionTapeFrame({
+              sessionId: frame.peer.id,
+              userId: activeUserId,
+              turnKey: frame.idempotencyKey,
+              direction: 'inbound',
+              ts: Date.now(),
+              frame: { type: 'inbound.message', clientMessage },
+            })
+            sessionTapeAppendTotal.inc({ direction: 'inbound', outcome: 'committed' })
+            this._redisSessionBus.invalidateSessionList(activeUserId)
+          } catch (err) {
+            sessionTapeAppendTotal.inc({ direction: 'inbound', outcome: 'failed' })
+            this._tapePoisoned.add(sessionKey)
+            throw err
+          }
+        })
+      } catch (err) {
+        this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+        this.log.error(
+          'inbound transcript tape commit failed; turn not submitted',
+          { sessionKey },
+          err,
+        )
+        const peerKey = Gateway.makePeerKey(activeUserId, frame.channel, frame.peer.id)
+        const clients = this.clientsByPeer.get(peerKey)
+        const data = JSON.stringify({
+          type: 'error',
+          error: '消息未提交：服务端会话记录暂时不可用，请稍后重试。',
+          ts: Date.now(),
+        })
+        for (const ws of clients ?? []) {
+          try {
+            ws.send(data)
+          } catch {}
+        }
+        return
+      }
+    }
     this.lastActiveChannel.set(agent.id, {
       channel: frame.channel,
       peerId: frame.peer.id,
@@ -6673,6 +6858,7 @@ export class Gateway {
     // Private userId stamp for deliver() — must be stripped before sending.
     // Fixed in deliver() via destructure so this never reaches the wire.
     ;(out as any)._userId = activeUserId
+    ;(out as any)._tapeTurnKey = frame.idempotencyKey
     // Adapters (Telegram/WeChat/Feishu) can't take 30 small messages per second.
     // Accumulate all blocks and send a single message at final.
     // WebChat (no adapter) keeps streaming via WS broadcast.
@@ -6700,6 +6886,7 @@ export class Gateway {
       // the wire); without this, a non-default user could miss the final error
       // and see the turn hang after we return.
       ;(failFrame as any)._userId = activeUserId
+      ;(failFrame as any)._tapeTurnKey = frame.idempotencyKey
       this.deliver(failFrame, adapter)
     }
 
@@ -6721,17 +6908,7 @@ export class Gateway {
           byteLen,
           sessionKey,
         })
-        this.deliver(
-          {
-            type: 'outbound.message',
-            sessionKey: sessionKey!,
-            channel: frame.channel,
-            peer: frame.peer,
-            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
-            isFinal: true,
-          },
-          adapter,
-        )
+        failUpload(errMsg)
         return
       }
       totalMediaSize += byteLen
@@ -6742,17 +6919,7 @@ export class Gateway {
           totalMediaSize,
           sessionKey,
         })
-        this.deliver(
-          {
-            type: 'outbound.message',
-            sessionKey: sessionKey!,
-            channel: frame.channel,
-            peer: frame.peer,
-            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
-            isFinal: true,
-          },
-          adapter,
-        )
+        failUpload(errMsg)
         return
       }
       const mime = m.mimeType || ''
@@ -6763,17 +6930,7 @@ export class Gateway {
       ) {
         const errMsg = `不支持的文件类型: ${mime}`
         this.log.warn('upload rejected: disallowed MIME', { mime, sessionKey })
-        this.deliver(
-          {
-            type: 'outbound.message',
-            sessionKey: sessionKey!,
-            channel: frame.channel,
-            peer: frame.peer,
-            blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
-            isFinal: true,
-          },
-          adapter,
-        )
+        failUpload(errMsg)
         return
       }
     }
@@ -7015,186 +7172,218 @@ export class Gateway {
       sessionKey,
       taskType,
     })
-    await this.sessions.submit(
-      session,
-      payload,
-      (e) => {
-        if (e.kind === 'block') {
-          const b = e.block as any
-          // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
-          // bg-bash 在 turn 结束后跨 turn 继续 emit。如果累积到 out.blocks /
-          // aggregatedBlocks 里,旧 turn 闭包会随 bash 生命周期持续增长内存。
-          // 直接派送(WebChat)/丢弃(adapter,非流式不需要快照)即可。
-          const isTail = b?.kind === 'tool_output_tail'
-          if (adapter) {
-            if (isTail) return
-            // For partial tool_use blocks, replace any prior block with same blockId
-            if (b.blockId) {
-              const idx = aggregatedBlocks.findIndex((x: any) => x.blockId === b.blockId)
-              if (idx >= 0) aggregatedBlocks[idx] = e.block
-              else aggregatedBlocks.push(e.block)
+    const turnStatusPeerKey = adapter
+      ? null
+      : Gateway.makePeerKey(activeUserId, frame.channel, frame.peer.id)
+    const sendAuthoritativeTurnStatus = (status: 'running' | 'compacting' | 'idle') => {
+      if (!turnStatusPeerKey) return
+      this._sendStampedSessionFrame(sessionKey, turnStatusPeerKey, {
+        type: 'outbound.turn_status',
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        agentId: session.agentId,
+        status,
+        startedAt: session._turnActiveSince ?? Date.now(),
+        ts: Date.now(),
+      })
+    }
+    sendAuthoritativeTurnStatus('running')
+    const turnHeartbeat = turnStatusPeerKey
+      ? setInterval(() => sendAuthoritativeTurnStatus('running'), 30_000)
+      : null
+    turnHeartbeat?.unref()
+    try {
+      await this.sessions.submit(
+        session,
+        payload,
+        (e) => {
+          if (e.kind === 'block') {
+            const b = e.block as any
+            // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
+            // bg-bash 在 turn 结束后跨 turn 继续 emit。如果累积到 out.blocks /
+            // aggregatedBlocks 里,旧 turn 闭包会随 bash 生命周期持续增长内存。
+            // 直接派送(WebChat)/丢弃(adapter,非流式不需要快照)即可。
+            const isTail = b?.kind === 'tool_output_tail'
+            if (adapter) {
+              if (isTail) return
+              // For partial tool_use blocks, replace any prior block with same blockId
+              if (b.blockId) {
+                const idx = aggregatedBlocks.findIndex((x: any) => x.blockId === b.blockId)
+                if (idx >= 0) aggregatedBlocks[idx] = e.block
+                else aggregatedBlocks.push(e.block)
+              } else {
+                aggregatedBlocks.push(e.block)
+              }
             } else {
-              aggregatedBlocks.push(e.block)
+              // WebChat: stream each block immediately via WS
+              if (!isTail) out.blocks.push(e.block)
+              this.deliver(
+                { ...out, blocks: [e.block], isFinal: false, turnId: session._activeTurnId },
+                undefined,
+              )
             }
-          } else {
-            // WebChat: stream each block immediately via WS
-            if (!isTail) out.blocks.push(e.block)
-            this.deliver(
-              { ...out, blocks: [e.block], isFinal: false, turnId: session._activeTurnId },
-              undefined,
-            )
-          }
-        } else if (e.kind === 'final') {
-          this._runLog.complete(_run, {
-            status: 'completed',
-            cost: e.meta?.cost,
-            inputTokens: e.meta?.inputTokens,
-            outputTokens: e.meta?.outputTokens,
-            turn: e.meta?.turn,
-          })
-          if (adapter) {
-            // adapter.send() 是 async,内部可能在 await 之后才读 wire.blocks。
-            // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
-            // 拷贝一份脱钩本地引用。
+          } else if (e.kind === 'final') {
+            this._runLog.complete(_run, {
+              status: 'completed',
+              cost: e.meta?.cost,
+              inputTokens: e.meta?.inputTokens,
+              outputTokens: e.meta?.outputTokens,
+              turn: e.meta?.turn,
+            })
+            if (adapter) {
+              // adapter.send() 是 async,内部可能在 await 之后才读 wire.blocks。
+              // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
+              // 拷贝一份脱钩本地引用。
+              this.deliver(
+                {
+                  ...out,
+                  blocks: aggregatedBlocks.slice(),
+                  isFinal: true,
+                  meta: e.meta,
+                },
+                adapter,
+              )
+            } else {
+              this.deliver(
+                { ...out, blocks: [], isFinal: true, meta: e.meta, turnId: session._activeTurnId },
+                undefined,
+              )
+            }
+            // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
+            // 跨 turn message listener 调用(转发 bg-bash bash_output_tail);
+            // 不清空的话 out.blocks / aggregatedBlocks 引用的旧 block 实例
+            // 会被钉到下一轮 listener 替换之前。
+            out.blocks.length = 0
+            aggregatedBlocks.length = 0
+          } else if (e.kind === 'turn_status') {
+            if (!adapter) {
+              const dispatchUserId: string =
+                typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+              const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
+              this._sendStampedSessionFrame(sessionKey, peerKey, {
+                type: 'outbound.turn_status',
+                sessionKey,
+                channel: frame.channel,
+                peer: frame.peer,
+                agentId: session.agentId,
+                status: e.status === 'compacting' ? 'compacting' : 'running',
+                startedAt: session._turnActiveSince ?? Date.now(),
+                ts: Date.now(),
+              })
+            }
+          } else if (e.kind === 'workflow_progress') {
+            // Background-workflow (ultracode) progress side-channel — same stamped
+            // delivery as turn_status (WebChat only; non-interactive adapters get
+            // no live workflow card). Never a chat block, never finalizes a turn.
+            if (!adapter) {
+              const dispatchUserId: string =
+                typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+              const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
+              this._sendStampedSessionFrame(sessionKey, peerKey, {
+                type: 'outbound.workflow_progress',
+                sessionKey,
+                channel: frame.channel,
+                peer: frame.peer,
+                agentId: session.agentId,
+                taskId: e.taskId,
+                stage: e.stage,
+                workflowName: e.workflowName,
+                toolUseId: e.toolUseId,
+                description: e.description,
+                summary: e.summary,
+                lastTool: e.lastTool,
+                usage: e.usage,
+                items: e.items,
+                status: e.status,
+                ts: Date.now(),
+              })
+            }
+          } else if (e.kind === 'permission_request') {
+            // Forward permission prompt to WebSocket clients for user approval.
+            // userId is stashed on the frame by the WS handler (see handleWsConnection)
+            // so adapter-dispatched frames fall back to 'default'. On personal-edition
+            // (single-user) this is always 'default' in practice.
+            const dispatchUserId: string =
+              typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+            const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
+            const permFrame = {
+              type: 'outbound.permission_request' as const,
+              sessionKey,
+              channel: frame.channel,
+              peer: frame.peer,
+              requestId: e.request.requestId,
+              toolName: e.request.toolName,
+              toolUseId: e.request.toolUseId,
+              inputPreview: JSON.stringify(e.request.input).slice(0, 400),
+              inputJson: e.request.input,
+            }
+            // Permission requests only make sense for interactive clients (WebChat)
+            // Non-interactive adapters auto-deny.
+            if (adapter) {
+              session.runner.sendPermissionResponse(e.request.requestId, {
+                behavior: 'deny',
+                message: 'Permission prompts not supported on this channel',
+                toolUseID: e.request.toolUseId,
+              })
+            } else {
+              const clients = this.clientsByPeer.get(peerKey)
+              if (clients && clients.size > 0) {
+                // Register pending request for single-settlement + disconnect auto-deny
+                this._pendingPermissions.set(e.request.requestId, {
+                  sessionKey,
+                  toolName: e.request.toolName,
+                  input: e.request.input,
+                  toolUseId: e.request.toolUseId,
+                  peerKey,
+                  userId: dispatchUserId,
+                  channel: frame.channel,
+                  peer: frame.peer,
+                  expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
+                })
+                // Stamp + store in outbound ring so a reconnecting client (e.g. iOS
+                // Safari restored a suspended tab) can replay the request via
+                // autoResumeFromHello. Without ring storage the modal would never
+                // re-fire after a disconnect window.
+                this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
+              } else {
+                // No connected client — auto-deny
+                session.runner.sendPermissionResponse(e.request.requestId, {
+                  behavior: 'deny',
+                  message: 'No connected client to approve',
+                  toolUseID: e.request.toolUseId,
+                })
+              }
+            }
+          } else if (e.kind === 'error') {
+            this._runLog.complete(_run, { status: 'failed', error: e.error })
+            // Remove idempotency key on failure to allow client retry
+            if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
             this.deliver(
               {
                 ...out,
-                blocks: aggregatedBlocks.slice(),
+                blocks: [
+                  {
+                    kind: 'text',
+                    text: `[error] ${e.error}\n\n本轮连接已结束；已发起的外部操作状态未知，请先核对实际状态再重试。`,
+                  },
+                ],
                 isFinal: true,
-                meta: e.meta,
+                turnId: session._activeTurnId,
               },
               adapter,
             )
-          } else {
-            this.deliver(
-              { ...out, blocks: [], isFinal: true, meta: e.meta, turnId: session._activeTurnId },
-              undefined,
-            )
           }
-          // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
-          // 跨 turn message listener 调用(转发 bg-bash bash_output_tail);
-          // 不清空的话 out.blocks / aggregatedBlocks 引用的旧 block 实例
-          // 会被钉到下一轮 listener 替换之前。
-          out.blocks.length = 0
-          aggregatedBlocks.length = 0
-        } else if (e.kind === 'turn_status') {
-          if (!adapter) {
-            const dispatchUserId: string =
-              typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
-            const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
-            this._sendStampedSessionFrame(sessionKey, peerKey, {
-              type: 'outbound.turn_status',
-              sessionKey,
-              channel: frame.channel,
-              peer: frame.peer,
-              agentId: session.agentId,
-              status: e.status,
-              ts: Date.now(),
-            })
-          }
-        } else if (e.kind === 'workflow_progress') {
-          // Background-workflow (ultracode) progress side-channel — same stamped
-          // delivery as turn_status (WebChat only; non-interactive adapters get
-          // no live workflow card). Never a chat block, never finalizes a turn.
-          if (!adapter) {
-            const dispatchUserId: string =
-              typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
-            const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
-            this._sendStampedSessionFrame(sessionKey, peerKey, {
-              type: 'outbound.workflow_progress',
-              sessionKey,
-              channel: frame.channel,
-              peer: frame.peer,
-              agentId: session.agentId,
-              taskId: e.taskId,
-              stage: e.stage,
-              workflowName: e.workflowName,
-              toolUseId: e.toolUseId,
-              description: e.description,
-              summary: e.summary,
-              lastTool: e.lastTool,
-              usage: e.usage,
-              items: e.items,
-              status: e.status,
-              ts: Date.now(),
-            })
-          }
-        } else if (e.kind === 'permission_request') {
-          // Forward permission prompt to WebSocket clients for user approval.
-          // userId is stashed on the frame by the WS handler (see handleWsConnection)
-          // so adapter-dispatched frames fall back to 'default'. On personal-edition
-          // (single-user) this is always 'default' in practice.
-          const dispatchUserId: string =
-            typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
-          const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
-          const permFrame = {
-            type: 'outbound.permission_request' as const,
-            sessionKey,
-            channel: frame.channel,
-            peer: frame.peer,
-            requestId: e.request.requestId,
-            toolName: e.request.toolName,
-            toolUseId: e.request.toolUseId,
-            inputPreview: JSON.stringify(e.request.input).slice(0, 400),
-            inputJson: e.request.input,
-          }
-          // Permission requests only make sense for interactive clients (WebChat)
-          // Non-interactive adapters auto-deny.
-          if (adapter) {
-            session.runner.sendPermissionResponse(e.request.requestId, {
-              behavior: 'deny',
-              message: 'Permission prompts not supported on this channel',
-              toolUseID: e.request.toolUseId,
-            })
-          } else {
-            const clients = this.clientsByPeer.get(peerKey)
-            if (clients && clients.size > 0) {
-              // Register pending request for single-settlement + disconnect auto-deny
-              this._pendingPermissions.set(e.request.requestId, {
-                sessionKey,
-                toolName: e.request.toolName,
-                input: e.request.input,
-                toolUseId: e.request.toolUseId,
-                peerKey,
-                userId: dispatchUserId,
-                channel: frame.channel,
-                peer: frame.peer,
-                expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
-              })
-              // Stamp + store in outbound ring so a reconnecting client (e.g. iOS
-              // Safari restored a suspended tab) can replay the request via
-              // autoResumeFromHello. Without ring storage the modal would never
-              // re-fire after a disconnect window.
-              this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
-            } else {
-              // No connected client — auto-deny
-              session.runner.sendPermissionResponse(e.request.requestId, {
-                behavior: 'deny',
-                message: 'No connected client to approve',
-                toolUseID: e.request.toolUseId,
-              })
-            }
-          }
-        } else if (e.kind === 'error') {
-          this._runLog.complete(_run, { status: 'failed', error: e.error })
-          // Remove idempotency key on failure to allow client retry
-          if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
-          this.deliver(
-            {
-              ...out,
-              blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
-              isFinal: true,
-              turnId: session._activeTurnId,
-            },
-            adapter,
-          )
-        }
-      },
-      safeEffortLevel,
-      safeConversationMode,
-      goalObjective,
-      safeModel,
-    )
+        },
+        safeEffortLevel,
+        safeConversationMode,
+        goalObjective,
+        safeModel,
+      )
+    } finally {
+      if (turnHeartbeat) clearInterval(turnHeartbeat)
+      sendAuthoritativeTurnStatus('idle')
+    }
   }
 
   private deliver(out: OutboundMessage, adapter?: ChannelAdapter): void {
@@ -7203,8 +7392,13 @@ export class Gateway {
     // value locally lets the WS branch still route per-user. Stripping
     // here (rather than only just before ws.send) prevents future adapters
     // / debug logs from accidentally leaking internal routing fields.
-    const { _userId: stampedUserId, ...wire } = out as OutboundMessage & {
+    const {
+      _userId: stampedUserId,
+      _tapeTurnKey: tapeTurnKey,
+      ...wire
+    } = out as OutboundMessage & {
       _userId?: string
+      _tapeTurnKey?: string
     }
     if (adapter) {
       adapter
@@ -7221,31 +7415,32 @@ export class Gateway {
     const deliverUserId: string = typeof stampedUserId === 'string' ? stampedUserId : 'default'
     const peerKey = Gateway.makePeerKey(deliverUserId, wire.channel, wire.peer.id)
     const sessionKey = (wire as { sessionKey?: string }).sessionKey
-    if (sessionKey && this._redisSessionBus?.enabled) {
-      void this._deliverWebchatAsync(wire, peerKey, sessionKey).catch((err) =>
-        this.log.warn('redis-backed webchat deliver failed', { sessionKey }, err),
+    if (sessionKey) {
+      void this._enqueueSessionDelivery(sessionKey, async () => {
+        if (this._tapePoisoned.has(sessionKey)) return
+        try {
+          await this._deliverWebchatAsync(
+            wire,
+            peerKey,
+            sessionKey,
+            deliverUserId,
+            tapeTurnKey || wire.turnId || sessionKey,
+          )
+        } catch (err) {
+          sessionTapeAppendTotal.inc({ direction: 'outbound', outcome: 'failed' })
+          this._tapePoisoned.add(sessionKey)
+          throw err
+        }
+      }).catch((err) =>
+        this.log.error(
+          'webchat transcript tape commit failed; session delivery stopped',
+          { sessionKey },
+          err,
+        ),
       )
       return
     }
-    // ── Phase 0.3: stamp frameSeq + push to ring buffer ──
-    // We stamp + store even if no clients are currently connected — that's
-    // the whole point: a later autoResumeFromHello for this sessionKey needs
-    // the frames to be in the buffer regardless of whether anyone was
-    // listening at the moment of the original deliver.
-    // Stamp a server-assigned monotonic timestamp on every outbound frame so
-    // the web client can reject stale / out-of-order frames after reconnect
-    // or agent switches. Schema keeps `ts` unvalidated (extra field is
-    // tolerated), so no protocol version bump is required.
-    const now = Date.now()
-    let data: string
-    if (sessionKey) {
-      const frameSeq = this._outboundRing.nextSeq(sessionKey)
-      data = JSON.stringify({ ...wire, ts: now, frameSeq })
-      const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
-      this._recordRingEvictions(evicted)
-    } else {
-      data = JSON.stringify({ ...wire, ts: now })
-    }
+    const data = JSON.stringify({ ...wire, ts: Date.now() })
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
     for (const ws of set) {
@@ -7259,10 +7454,21 @@ export class Gateway {
     wire: OutboundMessage,
     peerKey: string,
     sessionKey: string,
+    userId: string,
+    turnKey: string,
   ): Promise<void> {
     const now = Date.now()
     const { seq: frameSeq, redisBacked } = await this._allocateFrameSeq(sessionKey)
-    const data = JSON.stringify({ ...wire, ts: now, frameSeq })
+    const tape = await appendClientSessionTapeFrame({
+      sessionId: wire.peer.id,
+      userId,
+      turnKey,
+      direction: 'outbound',
+      ts: now,
+      frame: { ...wire, ts: now, frameSeq },
+    })
+    sessionTapeAppendTotal.inc({ direction: 'outbound', outcome: 'committed' })
+    const data = JSON.stringify({ ...wire, ts: now, frameSeq, tapeSeq: tape.tapeSeq })
     const evicted = redisBacked
       ? this._outboundRing.storeExternal(sessionKey, frameSeq, now, data)
       : this._outboundRing.store(sessionKey, frameSeq, now, data)

@@ -22,6 +22,7 @@ import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import { CodexRunner } from './codexRunner.js'
 import { createEvent, eventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
+import { turnInterruptTotal } from './metrics.js'
 import { normalizeProxyUrl } from './proxyEnv.js'
 import { SubprocessRunner } from './subprocessRunner.js'
 
@@ -39,15 +40,6 @@ export type CodexGoalControlInput = {
 export const LIVENESS_IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_COMPACTING_MS = 20 * 60_000
-// Codex app-server only: cold-start grace until a turn's first observable-output
-// block. codex liveness counts only visible progress (getLivenessIdleMs ignores
-// its raw stdout), and Codex GPT-5 at high reasoning effort (esp. Goal mode) can
-// reason server-side for >5min before emitting its first block. The 5min DEFAULT
-// tier is tuned for claude's dense streaming and falsely kills codex's cold
-// phase. Until the first block of a turn, codex measures idle from turnStartedAt
-// against this window; once a block lands it falls back to the normal tiers, so
-// steady-state deadlock detection is unchanged.
-export const LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS = 20 * 60_000
 export const IDLE_TIMEOUT_TURN_DRAIN_MS = 2_000
 // Continuation watch backstop — how long a post-turn continuation watch may stay
 // armed before it force-ends itself (it also ends earlier on result/exit).
@@ -65,13 +57,9 @@ export function getLivenessIdleTimeoutMs(
 }
 
 export function shouldHardResetRunnerAfterIdleTimeout(runner: unknown): boolean {
-  // Both long-lived runner types can wedge such that a plain interrupt() cannot
-  // free them: codex app-server (JSON-RPC process stuck high-CPU) and the claude
-  // subprocess (stdin ended / internal deadlock — interrupt is a no-op, as
-  // observed when a wedged turn ignored a turn/interrupt and stayed `running`).
-  // For both, the only reliable recovery is shutdown() so the next submit()
-  // respawns a fresh process. shutdown() is idempotent on already-dead runners.
-  return runner instanceof CodexAppServerRunner || runner instanceof SubprocessRunner
+  // Claude's subprocess can wedge after stdin/internal failure. Codex app-server
+  // is excluded because it no longer has an automatic silence timeout at all.
+  return runner instanceof SubprocessRunner
 }
 
 export function getLivenessIdleMs(
@@ -92,14 +80,10 @@ export function getLivenessIdleMs(
 /**
  * Resolve the idle measurement + threshold for one liveness watchdog tick.
  *
- * Codex cold-start exception: before a turn emits its first observable-output
- * block (`hasVisibleProgress=false`), a CodexAppServerRunner measures idle from
- * `turnStartedAt` against the wide first-token grace window instead of the 5min
- * DEFAULT tier — high-effort server-side reasoning can legitimately stay silent
- * longer than 5min before the first block. Once a block lands, or for any
- * non-codex runner, the normal liveness clock (`getLivenessIdleMs`) + tiers
- * (`getLivenessIdleTimeoutMs`) apply, so steady-state deadlock detection is
- * unchanged.
+ * Codex app-server has no silence threshold. Process exit, protocol failure,
+ * explicit user cancellation and gateway shutdown remain authoritative; quiet
+ * reasoning and long external commands are not failures. Other runners retain
+ * the existing state-aware idle thresholds.
  */
 export function resolveLivenessIdle(args: {
   runner: unknown
@@ -110,10 +94,10 @@ export function resolveLivenessIdle(args: {
   now?: number
 }): { idleMs: number; threshold: number } {
   const now = args.now ?? Date.now()
-  if (args.runner instanceof CodexAppServerRunner && !args.hasVisibleProgress) {
+  if (args.runner instanceof CodexAppServerRunner) {
     return {
-      idleMs: now - args.turnStartedAt,
-      threshold: LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS,
+      idleMs: 0,
+      threshold: Number.POSITIVE_INFINITY,
     }
   }
   return {
@@ -1152,8 +1136,7 @@ export class SessionManager {
       //   - Context compaction in progress: 20 min (do not kill ordinary
       //     auto-compact because it has no user-visible token stream)
       //   - No tool call pending (API streaming / idle): 5 min
-      // _runOneTurn has a separate 30-min idle timer as a tighter
-      // turn-level backstop that resets on every stdout message.
+      // _runOneTurn has a separate 30-min idle timer for non-Codex runners.
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
       const turnStartedAt = Date.now()
@@ -1161,8 +1144,8 @@ export class SessionManager {
       // Latched on this turn's first observable-output event (block /
       // permission_request — the same "producedOutput" signal used by the
       // continuation watcher). Status / heartbeat-only events do NOT count.
-      // Gates the codex cold-start grace (see
-      // LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS / resolveLivenessIdle).
+      // Retained for the common event-gate state passed to resolveLivenessIdle;
+      // Codex ignores it because silence is not a cancellation signal.
       let hasVisibleProgress = false
       eventGate = createIdleTimeoutEventGate(
         (e) => {
@@ -1186,25 +1169,29 @@ export class SessionManager {
           }
         },
       )
-      const livenessPromise = new Promise<never>((_, reject) => {
-        livenessTimer = setInterval(() => {
-          const { idleMs, threshold } = resolveLivenessIdle({
-            runner: session.runner,
-            hasVisibleProgress,
-            parser: session._currentParser,
-            turnStartedAt,
-            visibleActivityAt,
-            now: Date.now(),
-          })
-          if (idleMs > threshold) {
-            reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
-          }
-        }, CHECK_INTERVAL)
-      })
+      const livenessPromise =
+        session.runner instanceof CodexAppServerRunner
+          ? null
+          : new Promise<never>((_, reject) => {
+              livenessTimer = setInterval(() => {
+                const { idleMs, threshold } = resolveLivenessIdle({
+                  runner: session.runner,
+                  hasVisibleProgress,
+                  parser: session._currentParser,
+                  turnStartedAt,
+                  visibleActivityAt,
+                  now: Date.now(),
+                })
+                if (Number.isFinite(threshold) && idleMs > threshold) {
+                  reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
+                }
+              }, CHECK_INTERVAL)
+            })
       if (recoveryNotice) eventGate.emit(recoveryNotice)
       turnPromise = this.runOneTurnWithRetry(session, runnerPayload, eventGate.emit)
       try {
-        await Promise.race([turnPromise, livenessPromise])
+        if (livenessPromise) await Promise.race([turnPromise, livenessPromise])
+        else await turnPromise
       } finally {
         if (livenessTimer) clearInterval(livenessTimer)
       }
@@ -1223,16 +1210,16 @@ export class SessionManager {
         })
         eventGate.suppress()
 
-        // Actually interrupt the active turn. For codex app-server, an
-        // interrupt can leave the long-lived JSON-RPC process wedged/high-CPU;
-        // hard-reset that runner so the next submit respawns a fresh process
-        // instead of reusing the stuck one. Keep this scoped to app-server:
-        // legacy codex exec is per-turn, and CCB has different interrupt
-        // semantics.
+        // Actually interrupt the timed-out non-Codex turn.
         let interrupted = false
         try {
           interrupted = session.runner.interrupt()
+          turnInterruptTotal.inc({
+            source: 'system_liveness',
+            outcome: interrupted ? 'interrupted' : 'not_running',
+          })
         } catch (interruptErr) {
+          turnInterruptTotal.inc({ source: 'system_liveness', outcome: 'failed' })
           log.warn('idle timeout interrupt failed', {
             sessionKey: session.sessionKey,
             err: (interruptErr as Error).message,
@@ -1526,23 +1513,33 @@ export class SessionManager {
         }
       }
 
-      // Idle timeout — refreshed on every runner message (see handleMessage below).
-      // A turn is only killed if the agent produces no output for this long, so long
-      // active tasks keep running while genuinely stuck turns still get interrupted.
+      // Claude/legacy runners retain their established raw-message watchdog.
+      // Codex app-server deliberately has no silence timeout: an alive process
+      // may reason or run an external command without emitting frames. Explicit
+      // cancel, process exit, protocol failure and shutdown still end the turn.
       const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
-      const timer = setTimeout(() => {
-        if (!parser.finalized) {
-          try {
-            runner.interrupt()
-          } catch {}
-          onEvent({
-            kind: 'error',
-            error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。',
-          })
-          detach()
-          settle(() => resolve())
-        }
-      }, IDLE_TIMEOUT_MS)
+      const timer =
+        runner instanceof CodexAppServerRunner
+          ? null
+          : setTimeout(() => {
+              if (!parser.finalized) {
+                try {
+                  const interrupted = runner.interrupt()
+                  turnInterruptTotal.inc({
+                    source: 'system_idle',
+                    outcome: interrupted ? 'interrupted' : 'not_running',
+                  })
+                } catch {
+                  turnInterruptTotal.inc({ source: 'system_idle', outcome: 'failed' })
+                }
+                onEvent({
+                  kind: 'error',
+                  error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。',
+                })
+                detach()
+                settle(() => resolve())
+              }
+            }, IDLE_TIMEOUT_MS)
 
       // Background-workflow continuation soft cap. After a sub-turn launches a
       // background Workflow we hold the turn open for the proactive result turn
@@ -1609,7 +1606,7 @@ export class SessionManager {
       const detach = () => {
         if (detached) return
         detached = true
-        clearTimeout(timer)
+        if (timer) clearTimeout(timer)
         if (continuationTimer) {
           clearTimeout(continuationTimer)
           continuationTimer = null
@@ -1872,7 +1869,12 @@ export class SessionManager {
                   const r = writeResult?.r
                   if (r?.applied && writeResult?.userId)
                     this.onClientSessionMutated?.(peerId, writeResult.userId)
-                  if (r && !r.applied && r.reason !== 'already_exists') {
+                  if (
+                    r &&
+                    !r.applied &&
+                    r.reason !== 'already_exists' &&
+                    r.reason !== 'tape_authoritative'
+                  ) {
                     // 'queued_to_outbox' is an expected degraded-mode outcome
                     // (DB unavailable); log as warn not error so we don't spam
                     // error aggregators when disk/SQLite has a hiccup. The
@@ -1921,6 +1923,8 @@ export class SessionManager {
                   cacheCreationTokens: result.cacheCreationTokens,
                   costUsd: result.cost,
                   model: session.model,
+                  usageStatus: result.usageStatus,
+                  costStatus: result.costStatus,
                 },
                 toolCalls: turnToolCallCount,
                 durationMs: turnDurationMs,
@@ -1940,6 +1944,8 @@ export class SessionManager {
                   cacheCreationTokens: result.cacheCreationTokens,
                   costUsd: result.cost,
                   model: session.model,
+                  usageStatus: result.usageStatus,
+                  costStatus: result.costStatus,
                 },
                 sessionTotalCostUsd: session.totalCostUSD,
               }),
@@ -1998,7 +2004,7 @@ export class SessionManager {
               parser = new ClaudeMessageParser(parserConfig)
               session._currentParser = parser
               if (!detached) {
-                timer.refresh()
+                timer?.refresh()
                 armContinuationTimer()
               }
               return
@@ -2020,7 +2026,7 @@ export class SessionManager {
         // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
         // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
         if (!detached) {
-          timer.refresh()
+          timer?.refresh()
           // Any runner output (workflow progress, the continuation turn itself)
           // resets the continuation soft-cap so it only fires on true silence.
           if (continuationTimer) armContinuationTimer()
@@ -2294,6 +2300,8 @@ export class SessionManager {
                 cacheCreationTokens: result.cacheCreationTokens,
                 costUsd: result.cost,
                 model: session.model,
+                usageStatus: result.usageStatus,
+                costStatus: result.costStatus,
               },
               toolCalls: 0,
               durationMs: 0,

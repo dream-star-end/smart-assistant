@@ -23,8 +23,17 @@ const testHome = await mkdtemp(join(tmpdir(), 'oc-msgoutbox-'))
 process.env.OPENCLAUDE_HOME = testHome
 
 const {
+  appendClientSessionTapeFrame,
+  appendServerAuthoredMessage,
   appendServerAuthoredMessageDurable,
+  claimSession,
+  deleteClientSession,
   getClientSession,
+  getClientSessionTapeMeta,
+  getUsageSummary,
+  insertUsageLog,
+  listClientSessionTapePage,
+  listClientSessions,
   parseQueuedMessageLine,
   queueMessageToOutbox,
   queuedMessageToLine,
@@ -339,5 +348,245 @@ describe('upsertClientSession: initial-insert _source scrub (Codex R4 defense)',
     )
     assert.ok(real, 'server row still present after round-trip')
     assert.equal(real!._source, 'server', '_source preserved for authoritative id')
+  })
+})
+
+describe('server-authoritative client session tape', () => {
+  it('allocates ordered rows, pages complete turns, and rejects another owner', async () => {
+    await upsertClientSession({
+      id: 'sess-tape-order',
+      userId: 'tape-owner',
+      agentId: 'main',
+      title: 'Tape',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 1,
+      updatedAt: 1,
+      messages: [],
+    })
+    const first = await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-order',
+      userId: 'tape-owner',
+      turnKey: 'turn-1',
+      direction: 'inbound',
+      ts: 100,
+      frame: { type: 'inbound.message', clientMessage: { id: 'u1' } },
+    })
+    const second = await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-order',
+      userId: 'tape-owner',
+      turnKey: 'turn-1',
+      direction: 'outbound',
+      ts: 110,
+      frame: { type: 'outbound.message', blocks: [{ kind: 'text', text: 'one' }] },
+    })
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-order',
+      userId: 'tape-owner',
+      turnKey: 'turn-2',
+      direction: 'inbound',
+      ts: 200,
+      frame: { type: 'inbound.message', clientMessage: { id: 'u2' } },
+    })
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-order',
+      userId: 'tape-owner',
+      turnKey: 'turn-2',
+      direction: 'outbound',
+      ts: 210,
+      frame: { type: 'outbound.message', blocks: [{ kind: 'text', text: 'two' }] },
+    })
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-order',
+      userId: 'tape-owner',
+      turnKey: 'turn-1',
+      direction: 'outbound',
+      ts: 220,
+      frame: { type: 'outbound.message', blocks: [{ kind: 'tool_output_tail', tail: 'late' }] },
+    })
+    assert.equal(first.tapeSeq, 1)
+    assert.equal(second.tapeSeq, 2)
+
+    const latest = await listClientSessionTapePage('sess-tape-order', 'tape-owner', { turns: 1 })
+    assert.deepEqual(
+      latest?.frames.map((row) => row.turnKey),
+      ['turn-2', 'turn-2'],
+    )
+    assert.equal(latest?.hasMore, true)
+    const older = await listClientSessionTapePage('sess-tape-order', 'tape-owner', {
+      before: latest?.nextBefore ?? undefined,
+      turns: 1,
+    })
+    assert.deepEqual(
+      older?.frames.map((row) => row.turnKey),
+      ['turn-1', 'turn-1', 'turn-1'],
+    )
+    assert.equal(older?.hasMore, false)
+    assert.equal(await listClientSessionTapePage('sess-tape-order', 'other-user'), null)
+    const meta = (await listClientSessions('tape-owner')).find(
+      (session) => session.id === 'sess-tape-order',
+    )
+    assert.equal(meta?.messageCount, 4, 'list metadata signals two taped turns for lazy hydration')
+    assert.equal(meta?.tapeTurnCount, 2, 'list metadata explicitly forces cursor rehydration')
+
+    const duplicateInbound = await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-order',
+      userId: 'tape-owner',
+      turnKey: 'turn-2',
+      direction: 'inbound',
+      ts: 999,
+      frame: { type: 'inbound.message', clientMessage: { id: 'duplicate' } },
+    })
+    assert.equal(duplicateInbound.tapeSeq, 3, 'inbound retry reuses the committed tape row')
+    const unchanged = await listClientSessionTapePage('sess-tape-order', 'tape-owner', { turns: 2 })
+    assert.equal(unchanged?.frames.length, 5)
+  })
+
+  it('makes the tape range authoritative over later browser PUTs and legacy append', async () => {
+    await upsertClientSession({
+      id: 'sess-tape-boundary',
+      userId: 'boundary-owner',
+      agentId: 'main',
+      title: 'Boundary',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 1,
+      updatedAt: 100,
+      messages: [
+        { id: 'legacy', role: 'user', text: 'before', ts: 5000 },
+        { id: 'current', role: 'user', text: 'current', ts: 10 },
+      ],
+    })
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-boundary',
+      userId: 'boundary-owner',
+      turnKey: 'turn-1',
+      direction: 'inbound',
+      ts: 100,
+      frame: { type: 'inbound.message', clientMessage: { id: 'current' } },
+    })
+    const applied = await upsertClientSession(
+      {
+        id: 'sess-tape-boundary',
+        userId: 'boundary-owner',
+        agentId: 'main',
+        title: 'Boundary',
+        pinned: false,
+        createdAt: 1,
+        lastAt: 300,
+        updatedAt: 300,
+        messages: [
+          { id: 'legacy', role: 'user', text: 'before', ts: 5000 },
+          { id: 'current', role: 'user', text: 'current', ts: 10 },
+          { id: 'stale-client', role: 'assistant', text: 'partial', ts: 150 },
+        ],
+      },
+      100,
+    )
+    assert.equal(applied, true)
+    const stored = await getClientSession('sess-tape-boundary', 'boundary-owner')
+    assert.deepEqual(
+      (stored?.messages as Array<{ id: string }>).map((message) => message.id),
+      ['legacy'],
+    )
+    const legacyAppend = await appendServerAuthoredMessage('sess-tape-boundary', 'boundary-owner', {
+      id: 'srv-old-path',
+      role: 'assistant',
+      text: 'must not duplicate tape',
+      ts: 200,
+    })
+    assert.deepEqual(legacyAppend, { applied: false, reason: 'tape_authoritative' })
+  })
+
+  it('freezes a legacy prefix when the first browser PUT lands after the tape', async () => {
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-first-put',
+      userId: 'first-put-owner',
+      turnKey: 'turn-new',
+      direction: 'inbound',
+      ts: 100,
+      frame: { type: 'inbound.message', clientMessage: { id: 'current-new' } },
+    })
+    await upsertClientSession({
+      id: 'sess-tape-first-put',
+      userId: 'first-put-owner',
+      agentId: 'main',
+      title: 'First PUT',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 200,
+      updatedAt: 200,
+      messages: [
+        { id: 'legacy-new', role: 'assistant', text: 'old', ts: 5000 },
+        { id: 'current-new', role: 'user', text: 'current', ts: 10 },
+        { id: 'partial-new', role: 'assistant', text: 'partial', ts: 20 },
+      ],
+    })
+    const stored = await getClientSession('sess-tape-first-put', 'first-put-owner')
+    assert.deepEqual(
+      (stored?.messages as Array<{ id: string }>).map((message) => message.id),
+      ['legacy-new'],
+    )
+  })
+
+  it('moves tape ownership on claim and deletes rows with the session', async () => {
+    await upsertClientSession({
+      id: 'sess-tape-claim',
+      userId: 'default',
+      agentId: 'main',
+      title: 'Claim',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 1,
+      updatedAt: 1,
+      messages: [],
+    })
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-claim',
+      userId: 'default',
+      turnKey: 'turn-1',
+      direction: 'inbound',
+      ts: 10,
+      frame: { type: 'inbound.message' },
+    })
+    assert.equal(await claimSession('sess-tape-claim', 'claimed-owner'), true)
+    assert.equal(
+      (await getClientSessionTapeMeta('sess-tape-claim', 'claimed-owner')).lastTapeSeq,
+      1,
+    )
+    assert.equal((await getClientSessionTapeMeta('sess-tape-claim', 'default')).lastTapeSeq, null)
+    assert.equal(await deleteClientSession('sess-tape-claim', 'claimed-owner'), true)
+    assert.equal(
+      (await getClientSessionTapeMeta('sess-tape-claim', 'claimed-owner')).lastTapeSeq,
+      null,
+    )
+  })
+})
+
+describe('usage availability labels', () => {
+  it('distinguishes observed tokens from unavailable subscription cost', async () => {
+    await insertUsageLog({
+      id: 'usage-availability-1',
+      sessionId: 'usage-session',
+      agentId: 'codex',
+      turnIndex: 1,
+      model: 'gpt-test',
+      inputTokens: 123,
+      outputTokens: 45,
+      cacheReadTokens: 20,
+      cacheCreationTokens: 0,
+      costUsd: 0,
+      usageStatus: 'observed',
+      costStatus: 'unavailable',
+      durationMs: 10,
+      toolCalls: 0,
+      timestamp: 1,
+    })
+    const summary = await getUsageSummary({ sessionId: 'usage-session' })
+    assert.equal(summary.totalInputTokens, 123)
+    assert.equal(summary.usageObservedTurns, 1)
+    assert.equal(summary.usageUnavailableTurns, 0)
+    assert.equal(summary.costObservedTurns, 0)
+    assert.equal(summary.costUnavailableTurns, 1)
   })
 })

@@ -82,6 +82,8 @@ export async function getSessionsDb(): Promise<Database.Database> {
       cache_read_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
       cost_usd REAL NOT NULL DEFAULT 0,
+      usage_status TEXT NOT NULL DEFAULT 'unknown',
+      cost_status TEXT NOT NULL DEFAULT 'unknown',
       duration_ms INTEGER NOT NULL DEFAULT 0,
       tool_calls INTEGER NOT NULL DEFAULT 0,
       timestamp INTEGER NOT NULL
@@ -129,6 +131,20 @@ export async function getSessionsDb(): Promise<Database.Database> {
     }
   } catch {
     /* table just created with columns already, or migration ran */
+  }
+
+  // 4. Availability labels prevent a numeric zero from masquerading as an
+  // observed token count or attributable subscription cost.
+  try {
+    const cols = db.pragma('table_info(usage_log)') as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'usage_status')) {
+      db.exec("ALTER TABLE usage_log ADD COLUMN usage_status TEXT NOT NULL DEFAULT 'unknown'")
+    }
+    if (!cols.some((c) => c.name === 'cost_status')) {
+      db.exec("ALTER TABLE usage_log ADD COLUMN cost_status TEXT NOT NULL DEFAULT 'unknown'")
+    }
+  } catch {
+    /* table just created with columns already */
   }
 
   // ── Create indexes (after migrations) ──
@@ -206,6 +222,32 @@ export async function getSessionsDb(): Promise<Database.Database> {
   } catch {
     /* table just created with column already */
   }
+
+  // Server-authoritative, append-only transcript tape. Unlike the legacy
+  // `messages` JSON snapshot this is written by the gateway before a frame is
+  // exposed to WebSocket clients, so browser suspension cannot create holes.
+  // It intentionally has no FK: the first inbound frame may win the race with
+  // the client's initial session PUT. Ownership is still part of the primary
+  // key and every read route verifies the matching client_sessions row.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS client_session_tape (
+      session_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      tape_seq INTEGER NOT NULL,
+      turn_key TEXT NOT NULL,
+      direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+      ts INTEGER NOT NULL,
+      frame_json TEXT NOT NULL,
+      PRIMARY KEY (session_id, user_id, tape_seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_client_session_tape_turn
+      ON client_session_tape(session_id, user_id, turn_key, tape_seq);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_client_session_tape_inbound_turn
+      ON client_session_tape(session_id, user_id, turn_key)
+      WHERE direction = 'inbound';
+    CREATE INDEX IF NOT EXISTS idx_client_session_tape_ts
+      ON client_session_tape(session_id, user_id, ts);
+  `)
   // Migration: store message counts separately so list endpoints don't parse
   // every session's messages JSON on each request.
   try {
@@ -497,6 +539,8 @@ export interface UsageLogEntry {
   cacheReadTokens: number
   cacheCreationTokens: number
   costUsd: number
+  usageStatus: 'observed' | 'unavailable'
+  costStatus: 'observed' | 'unavailable'
   durationMs: number
   toolCalls: number
   timestamp: number
@@ -507,9 +551,11 @@ export async function insertUsageLog(entry: UsageLogEntry): Promise<void> {
   db.prepare(`
     INSERT OR IGNORE INTO usage_log
       (id, session_id, agent_id, turn_index, model, input_tokens, output_tokens,
-       cache_read_tokens, cache_creation_tokens, cost_usd, duration_ms, tool_calls, timestamp)
+       cache_read_tokens, cache_creation_tokens, cost_usd, usage_status, cost_status,
+       duration_ms, tool_calls, timestamp)
     VALUES (@id, @sessionId, @agentId, @turnIndex, @model, @inputTokens, @outputTokens,
-            @cacheReadTokens, @cacheCreationTokens, @costUsd, @durationMs, @toolCalls, @timestamp)
+            @cacheReadTokens, @cacheCreationTokens, @costUsd, @usageStatus, @costStatus,
+            @durationMs, @toolCalls, @timestamp)
   `).run(entry)
 }
 
@@ -518,6 +564,10 @@ export interface UsageSummary {
   totalInputTokens: number
   totalOutputTokens: number
   totalTurns: number
+  usageObservedTurns: number
+  usageUnavailableTurns: number
+  costObservedTurns: number
+  costUnavailableTurns: number
 }
 
 export async function getUsageSummary(opts: {
@@ -546,15 +596,32 @@ export async function getUsageSummary(opts: {
       `SELECT COALESCE(SUM(cost_usd), 0) as total_cost,
             COALESCE(SUM(input_tokens), 0) as total_in,
             COALESCE(SUM(output_tokens), 0) as total_out,
-            COUNT(*) as total_turns
+            COUNT(*) as total_turns,
+            COALESCE(SUM(CASE WHEN usage_status = 'observed' THEN 1 ELSE 0 END), 0) as usage_observed,
+            COALESCE(SUM(CASE WHEN usage_status = 'unavailable' THEN 1 ELSE 0 END), 0) as usage_unavailable,
+            COALESCE(SUM(CASE WHEN cost_status = 'observed' THEN 1 ELSE 0 END), 0) as cost_observed,
+            COALESCE(SUM(CASE WHEN cost_status = 'unavailable' THEN 1 ELSE 0 END), 0) as cost_unavailable
      FROM usage_log ${where}`,
     )
-    .get(params) as { total_cost: number; total_in: number; total_out: number; total_turns: number }
+    .get(params) as {
+    total_cost: number
+    total_in: number
+    total_out: number
+    total_turns: number
+    usage_observed: number
+    usage_unavailable: number
+    cost_observed: number
+    cost_unavailable: number
+  }
   return {
     totalCostUsd: row.total_cost,
     totalInputTokens: row.total_in,
     totalOutputTokens: row.total_out,
     totalTurns: row.total_turns,
+    usageObservedTurns: row.usage_observed,
+    usageUnavailableTurns: row.usage_unavailable,
+    costObservedTurns: row.cost_observed,
+    costUnavailableTurns: row.cost_unavailable,
   }
 }
 
@@ -570,6 +637,12 @@ export interface ClientSession {
   lastAt: number
   messages: unknown[]
   updatedAt: number
+  tape?: {
+    firstTapeSeq: number | null
+    firstTapeTs: number | null
+    lastTapeSeq: number | null
+    turnCount: number
+  }
 }
 
 export interface ClientSessionMeta {
@@ -580,6 +653,7 @@ export interface ClientSessionMeta {
   createdAt: number
   lastAt: number
   messageCount: number
+  tapeTurnCount?: number
   updatedAt: number
 }
 
@@ -996,8 +1070,61 @@ export async function upsertClientSession(
         /* malformed existing messages JSON — fall through with oldMsgs=[] */
       }
     }
-    const clientMsgs = session.messages as MessageLike[]
-    const finalMessages = mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[]
+    const tapeBoundary = db
+      .prepare(
+        'SELECT MIN(ts) AS first_ts FROM client_session_tape WHERE session_id = ? AND user_id = ?',
+      )
+      .get(session.id, session.userId) as { first_ts: number | null }
+    const tapedClientIds = new Set<string>()
+    if (tapeBoundary.first_ts !== null) {
+      const inboundRows = db
+        .prepare(
+          `SELECT frame_json FROM client_session_tape
+           WHERE session_id = ? AND user_id = ? AND direction = 'inbound'
+           ORDER BY tape_seq`,
+        )
+        .all(session.id, session.userId) as Array<{ frame_json: string }>
+      for (const row of inboundRows) {
+        try {
+          const parsed = JSON.parse(row.frame_json) as { clientMessage?: { id?: unknown } }
+          if (typeof parsed.clientMessage?.id === 'string') {
+            tapedClientIds.add(parsed.clientMessage.id)
+          }
+        } catch {
+          /* malformed tape rows surface on the read path; ignore only for legacy-boundary matching */
+        }
+      }
+    }
+    const beforeTape = (message: MessageLike) =>
+      tapeBoundary.first_ts === null ||
+      (typeof message?.ts === 'number' && message.ts < tapeBoundary.first_ts)
+    // Once the gateway has started a server tape, browser snapshots no longer
+    // own that time range. Remove user rows already represented by an inbound
+    // tape record; unlike a timestamp cut this remains correct under device
+    // clock skew.
+    oldMsgs = oldMsgs.filter(
+      (message) => typeof message?.id !== 'string' || !tapedClientIds.has(message.id),
+    )
+    // Existing taped rows already froze their legacy prefix on the first
+    // post-tape write. From then on, no browser-authored message body is
+    // accepted at all (metadata still updates). This avoids re-opening the
+    // boundary when another device's wall clock is skewed behind the first.
+    const submittedMessages = session.messages as MessageLike[]
+    const firstTapedClientIndex = submittedMessages.findIndex(
+      (message) => typeof message?.id === 'string' && tapedClientIds.has(message.id),
+    )
+    const clientMsgs =
+      existing && tapeBoundary.first_ts !== null
+        ? []
+        : tapeBoundary.first_ts === null
+          ? submittedMessages
+          : firstTapedClientIndex >= 0
+            ? submittedMessages.slice(0, firstTapedClientIndex)
+            : submittedMessages.filter(beforeTape)
+    const finalMessages =
+      existing && tapeBoundary.first_ts !== null
+        ? oldMsgs
+        : (mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[])
 
     const result = db
       .prepare(`
@@ -1029,7 +1156,7 @@ export async function upsertClientSession(
       })
     return result.changes > 0
   })
-  return txn()
+  return txn.immediate()
 }
 
 /**
@@ -1062,7 +1189,10 @@ export async function appendServerAuthoredMessage(
     ts?: number
     [k: string]: unknown
   },
-): Promise<{ applied: boolean; reason?: 'session_not_found' | 'already_exists' | 'malformed' }> {
+): Promise<{
+  applied: boolean
+  reason?: 'session_not_found' | 'already_exists' | 'malformed' | 'tape_authoritative'
+}> {
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
     const row = db
@@ -1071,6 +1201,11 @@ export async function appendServerAuthoredMessage(
       )
       .get(sessId, userId) as { messages: string } | undefined
     if (!row) return { applied: false, reason: 'session_not_found' as const }
+
+    const tape = db
+      .prepare('SELECT 1 FROM client_session_tape WHERE session_id = ? AND user_id = ? LIMIT 1')
+      .get(sessId, userId)
+    if (tape) return { applied: false, reason: 'tape_authoritative' as const }
 
     let msgs: MessageLike[]
     try {
@@ -1187,7 +1322,7 @@ export async function appendServerAuthoredMessageDurable(
   },
 ): Promise<
   | { applied: true }
-  | { applied: false; reason: 'already_exists' | 'malformed' }
+  | { applied: false; reason: 'already_exists' | 'malformed' | 'tape_authoritative' }
   | { applied: false; reason: 'queued_to_outbox'; error: string }
 > {
   try {
@@ -1290,7 +1425,8 @@ export async function replayMsgOutbox(): Promise<{
       } else if (
         r.reason === 'already_exists' ||
         r.reason === 'session_not_found' ||
-        r.reason === 'malformed'
+        r.reason === 'malformed' ||
+        r.reason === 'tape_authoritative'
       ) {
         dropped++
       } else {
@@ -1315,12 +1451,216 @@ export async function replayMsgOutbox(): Promise<{
   return { processed, applied, dropped, requeued, malformed }
 }
 
+// ── Server-authoritative client transcript tape ──
+
+export interface ClientSessionTapeFrame {
+  tapeSeq: number
+  turnKey: string
+  direction: 'inbound' | 'outbound'
+  ts: number
+  frame: Record<string, unknown>
+}
+
+export interface ClientSessionTapePage {
+  frames: ClientSessionTapeFrame[]
+  firstTapeSeq: number | null
+  firstTapeTs: number | null
+  nextBefore: number | null
+  hasMore: boolean
+}
+
+/**
+ * Append one frame and allocate its per-session sequence in the same SQLite
+ * transaction. Callers serialize operations per session and MUST wait for this
+ * commit before making the frame externally visible.
+ */
+export async function appendClientSessionTapeFrame(input: {
+  sessionId: string
+  userId: string
+  turnKey: string
+  direction: 'inbound' | 'outbound'
+  ts: number
+  frame: Record<string, unknown>
+}): Promise<ClientSessionTapeFrame> {
+  const db = await getSessionsDb()
+  const txn = db.transaction(() => {
+    if (input.direction === 'inbound') {
+      const existing = db
+        .prepare(
+          `SELECT tape_seq, ts, frame_json FROM client_session_tape
+           WHERE session_id = ? AND user_id = ? AND turn_key = ? AND direction = 'inbound'`,
+        )
+        .get(input.sessionId, input.userId, input.turnKey) as
+        | { tape_seq: number; ts: number; frame_json: string }
+        | undefined
+      if (existing) {
+        return {
+          tapeSeq: existing.tape_seq,
+          turnKey: input.turnKey,
+          direction: 'inbound' as const,
+          ts: existing.ts,
+          frame: JSON.parse(existing.frame_json) as Record<string, unknown>,
+        }
+      }
+    }
+    const row = db
+      .prepare(
+        'SELECT COALESCE(MAX(tape_seq), 0) AS max_seq FROM client_session_tape WHERE session_id = ? AND user_id = ?',
+      )
+      .get(input.sessionId, input.userId) as { max_seq: number }
+    const tapeSeq = row.max_seq + 1
+    db.prepare(
+      `INSERT INTO client_session_tape
+       (session_id, user_id, tape_seq, turn_key, direction, ts, frame_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.sessionId,
+      input.userId,
+      tapeSeq,
+      input.turnKey,
+      input.direction,
+      input.ts,
+      JSON.stringify(input.frame),
+    )
+    return {
+      tapeSeq,
+      turnKey: input.turnKey,
+      direction: input.direction,
+      ts: input.ts,
+      frame: input.frame,
+    }
+  })
+  return txn.immediate()
+}
+
+export async function getClientSessionTapeMeta(
+  sessionId: string,
+  userId: string,
+): Promise<{
+  firstTapeSeq: number | null
+  firstTapeTs: number | null
+  lastTapeSeq: number | null
+  turnCount: number
+}> {
+  const db = await getSessionsDb()
+  const row = db
+    .prepare(
+      `SELECT MIN(tape_seq) AS first_seq, MIN(ts) AS first_ts,
+              MAX(tape_seq) AS last_seq, COUNT(DISTINCT turn_key) AS turn_count
+       FROM client_session_tape WHERE session_id = ? AND user_id = ?`,
+    )
+    .get(sessionId, userId) as {
+    first_seq: number | null
+    first_ts: number | null
+    last_seq: number | null
+    turn_count: number
+  }
+  return {
+    firstTapeSeq: row.first_seq,
+    firstTapeTs: row.first_ts,
+    lastTapeSeq: row.last_seq,
+    turnCount: row.turn_count,
+  }
+}
+
+/** Return complete turn groups, newest page first but frames chronologically. */
+export async function listClientSessionTapePage(
+  sessionId: string,
+  userId: string,
+  opts: { before?: number; turns?: number } = {},
+): Promise<ClientSessionTapePage | null> {
+  const db = await getSessionsDb()
+  const owned = db
+    .prepare('SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL')
+    .get(sessionId, userId)
+  if (!owned) return null
+
+  const before =
+    Number.isSafeInteger(opts.before) && Number(opts.before) > 0
+      ? Number(opts.before)
+      : Number.MAX_SAFE_INTEGER
+  // This is a page-size bound, not a transcript bound: callers receive a
+  // cursor and may continue until hasMore=false.
+  const turns = Math.max(1, Math.min(50, Math.floor(opts.turns ?? 5)))
+  const turnRows = db
+    .prepare(
+      `SELECT turn_key, MIN(tape_seq) AS first_seq
+       FROM client_session_tape
+       WHERE session_id = ? AND user_id = ?
+       GROUP BY turn_key
+       HAVING MIN(tape_seq) < ?
+       ORDER BY first_seq DESC LIMIT ?`,
+    )
+    .all(sessionId, userId, before, turns) as Array<{ turn_key: string; first_seq: number }>
+
+  const meta = await getClientSessionTapeMeta(sessionId, userId)
+  if (turnRows.length === 0) {
+    return {
+      frames: [],
+      firstTapeSeq: meta.firstTapeSeq,
+      firstTapeTs: meta.firstTapeTs,
+      nextBefore: null,
+      hasMore: false,
+    }
+  }
+
+  const keys = turnRows.map((r) => r.turn_key)
+  const placeholders = keys.map(() => '?').join(',')
+  const rows = db
+    .prepare(
+      `SELECT tape_seq, turn_key, direction, ts, frame_json
+       FROM client_session_tape
+       WHERE session_id = ? AND user_id = ? AND turn_key IN (${placeholders})
+       ORDER BY tape_seq ASC`,
+    )
+    .all(sessionId, userId, ...keys) as Array<{
+    tape_seq: number
+    turn_key: string
+    direction: 'inbound' | 'outbound'
+    ts: number
+    frame_json: string
+  }>
+  const frames = rows.map((row) => ({
+    tapeSeq: row.tape_seq,
+    turnKey: row.turn_key,
+    direction: row.direction,
+    ts: row.ts,
+    frame: JSON.parse(row.frame_json) as Record<string, unknown>,
+  }))
+  const nextBefore = Math.min(...turnRows.map((row) => row.first_seq))
+  const older = nextBefore
+    ? (db
+        .prepare(
+          `SELECT 1 FROM client_session_tape
+           WHERE session_id = ? AND user_id = ?
+           GROUP BY turn_key HAVING MIN(tape_seq) < ? LIMIT 1`,
+        )
+        .get(sessionId, userId, nextBefore) as unknown)
+    : null
+  return {
+    frames,
+    firstTapeSeq: meta.firstTapeSeq,
+    firstTapeTs: meta.firstTapeTs,
+    nextBefore,
+    hasMore: !!older,
+  }
+}
+
 export async function listClientSessions(userId: string): Promise<ClientSessionMeta[]> {
   const db = await getSessionsDb()
   const rows = db
     .prepare(`
     SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
-           message_count as msg_count
+           (
+             SELECT COUNT(DISTINCT turn_key) FROM client_session_tape tape
+             WHERE tape.session_id = client_sessions.id
+               AND tape.user_id = client_sessions.user_id
+           ) as tape_turn_count,
+           message_count + 2 * (
+             SELECT COUNT(DISTINCT turn_key) FROM client_session_tape tape
+             WHERE tape.session_id = client_sessions.id
+               AND tape.user_id = client_sessions.user_id
+           ) as msg_count
     FROM client_sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY last_at DESC
   `)
     .all(userId) as Array<{
@@ -1332,6 +1672,7 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
     last_at: number
     updated_at: number
     msg_count: number
+    tape_turn_count: number
   }>
   return rows.map((r) => ({
     id: r.id,
@@ -1341,6 +1682,7 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
     createdAt: r.created_at,
     lastAt: r.last_at,
     messageCount: r.msg_count,
+    tapeTurnCount: r.tape_turn_count,
     updatedAt: r.updated_at,
   }))
 }
@@ -1364,6 +1706,7 @@ export async function getClientSession(id: string, userId?: string): Promise<Cli
       }
     | undefined
   if (!row) return null
+  const tape = await getClientSessionTapeMeta(row.id, row.user_id)
   return {
     id: row.id,
     userId: row.user_id,
@@ -1374,18 +1717,40 @@ export async function getClientSession(id: string, userId?: string): Promise<Cli
     lastAt: row.last_at,
     messages: JSON.parse(row.messages),
     updatedAt: row.updated_at,
+    tape,
   }
 }
 
 /** Soft-delete: zero out messages and mark as deleted. Prevents stale PUTs from resurrecting. */
 export async function deleteClientSession(id: string, userId?: string): Promise<boolean> {
   const db = await getSessionsDb()
-  const sql = userId
-    ? "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND deleted_at IS NULL"
-  const now = Date.now()
-  const result = userId ? db.prepare(sql).run(now, id, userId) : db.prepare(sql).run(now, id)
-  return result.changes > 0
+  const txn = db.transaction(() => {
+    const row = (
+      userId
+        ? db
+            .prepare(
+              'SELECT user_id FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+            )
+            .get(id, userId)
+        : db
+            .prepare('SELECT user_id FROM client_sessions WHERE id = ? AND deleted_at IS NULL')
+            .get(id)
+    ) as { user_id: string } | undefined
+    if (!row) return false
+    const result = db
+      .prepare(
+        "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+      )
+      .run(Date.now(), id, row.user_id)
+    if (result.changes > 0) {
+      db.prepare('DELETE FROM client_session_tape WHERE session_id = ? AND user_id = ?').run(
+        id,
+        row.user_id,
+      )
+    }
+    return result.changes > 0
+  })
+  return txn()
 }
 
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
@@ -1443,13 +1808,21 @@ export async function listUnclaimedSessions(): Promise<
  *  Returns true if claimed, false if already claimed by someone else. */
 export async function claimSession(sessionId: string, userId: string): Promise<boolean> {
   const db = await getSessionsDb()
-  const result = db
-    .prepare(`
-    UPDATE client_sessions SET user_id = ?, updated_at = ?
-    WHERE id = ? AND user_id = 'default' AND deleted_at IS NULL
-  `)
-    .run(userId, Date.now(), sessionId)
-  return result.changes > 0
+  const txn = db.transaction(() => {
+    const result = db
+      .prepare(`
+      UPDATE client_sessions SET user_id = ?, updated_at = ?
+      WHERE id = ? AND user_id = 'default' AND deleted_at IS NULL
+    `)
+      .run(userId, Date.now(), sessionId)
+    if (result.changes > 0) {
+      db.prepare(
+        "UPDATE client_session_tape SET user_id = ? WHERE session_id = ? AND user_id = 'default'",
+      ).run(userId, sessionId)
+    }
+    return result.changes > 0
+  })
+  return txn()
 }
 
 export async function closeSessionsDb(): Promise<void> {

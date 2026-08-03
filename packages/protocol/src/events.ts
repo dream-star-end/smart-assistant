@@ -130,6 +130,8 @@ export const UsageInfo = Type.Object({
   cacheCreationTokens: Type.Optional(Type.Number()),
   costUsd: Type.Optional(Type.Number()),
   model: Type.Optional(Type.String()),
+  usageStatus: Type.Optional(Type.Union([Type.Literal('observed'), Type.Literal('unavailable')])),
+  costStatus: Type.Optional(Type.Union([Type.Literal('observed'), Type.Literal('unavailable')])),
 })
 export type UsageInfo = Static<typeof UsageInfo>
 

@@ -10,7 +10,12 @@ import { chmodSync, chownSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type OpenClaudeConfig, type RunAsUserName, paths, resolveRunAsUserIds } from '@openclaude/storage'
+import {
+  type OpenClaudeConfig,
+  type RunAsUserName,
+  paths,
+  resolveRunAsUserIds,
+} from '@openclaude/storage'
 import {
   type CodexLaunchOverrides,
   type CodexReasoningEffort,
@@ -341,7 +346,13 @@ interface RunnerMessage {
   total_cost_usd?: number
   duration_ms?: number
   is_error?: boolean
-  usage?: { input_tokens?: number; output_tokens?: number }
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_input_tokens?: number
+  }
+  usage_status?: 'observed' | 'unavailable'
+  cost_status?: 'observed' | 'unavailable'
   event?: unknown
 }
 
@@ -504,6 +515,11 @@ export class CodexAppServerRunner extends EventEmitter {
    *  the proc requires re-attaching even when threadId is known. */
   private attached = false
   private activeTurnId: string | null = null
+  private currentTokenUsage: {
+    input_tokens: number
+    output_tokens: number
+    cache_read_input_tokens: number
+  } | null = null
   /** Promise wired into `turn/completed` notification handling. Set by runTurn
    *  before sending `turn/start`, resolved by handleNotification on
    *  `turn/completed` for the matching turnId. */
@@ -1282,6 +1298,20 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emitGoalBlock(normalizeCodexGoal(undefined, true))
       return
     }
+    if (method === 'thread/tokenUsage/updated') {
+      if (!turnId) return
+      if (typeof p.threadId === 'string' && this.threadId && p.threadId !== this.threadId) return
+      const tokenUsage = p.tokenUsage as Record<string, unknown> | undefined
+      const last = tokenUsage?.last as Record<string, unknown> | undefined
+      if (!last) return
+      this.currentTokenUsage = {
+        input_tokens: typeof last.inputTokens === 'number' ? last.inputTokens : 0,
+        output_tokens: typeof last.outputTokens === 'number' ? last.outputTokens : 0,
+        cache_read_input_tokens:
+          typeof last.cachedInputTokens === 'number' ? last.cachedInputTokens : 0,
+      }
+      return
+    }
     if (method === 'item/agentMessage/delta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
@@ -1818,6 +1848,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.currentPlanDrafts.clear()
     this.activePlanBlockId = null
     this.reasoningItemsWithDeltas.clear()
+    this.currentTokenUsage = null
 
     try {
       await this.ensureThreadAttached()
@@ -1865,6 +1896,7 @@ export class CodexAppServerRunner extends EventEmitter {
           durationMs,
           ok: true,
           text: this.currentAssistantBuf,
+          usage: this.currentTokenUsage ?? undefined,
         })
       } else if (status === 'failed') {
         const errMsg = turn?.error?.message ?? 'codex turn failed'
@@ -1879,14 +1911,25 @@ export class CodexAppServerRunner extends EventEmitter {
             delta: { type: 'text_delta', text: `\n\n[turn failed: ${errMsg}]\n` },
           },
         } as unknown as RunnerMessage)
-        this.emitResult({ durationMs, ok: false, error: errMsg })
+        this.emitResult({
+          durationMs,
+          ok: false,
+          error: errMsg,
+          usage: this.currentTokenUsage ?? undefined,
+        })
       } else if (status === 'interrupted') {
-        this.emitResult({ durationMs, ok: false, error: 'codex turn interrupted' })
+        this.emitResult({
+          durationMs,
+          ok: false,
+          error: 'codex turn interrupted',
+          usage: this.currentTokenUsage ?? undefined,
+        })
       } else {
         this.emitResult({
           durationMs,
           ok: false,
           error: `codex turn unexpected status=${status ?? 'unknown'}`,
+          usage: this.currentTokenUsage ?? undefined,
         })
       }
     } catch (err) {
@@ -1907,6 +1950,7 @@ export class CodexAppServerRunner extends EventEmitter {
         durationMs,
         ok: false,
         error: `codex app-server: ${(err as Error).message}`,
+        usage: this.currentTokenUsage ?? undefined,
       })
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
@@ -1947,7 +1991,11 @@ export class CodexAppServerRunner extends EventEmitter {
     ok: boolean
     text?: string
     error?: string
-    usage?: { input_tokens?: number; output_tokens?: number }
+    usage?: {
+      input_tokens?: number
+      output_tokens?: number
+      cache_read_input_tokens?: number
+    }
   }): void {
     const msg: RunnerMessage = {
       type: 'result',
@@ -1958,6 +2006,11 @@ export class CodexAppServerRunner extends EventEmitter {
       is_error: !opts.ok,
       result: opts.ok ? (opts.text ?? '') : (opts.error ?? 'codex error'),
       usage: opts.usage,
+      usage_status: opts.usage ? 'observed' : 'unavailable',
+      // Subscription app-server does not expose an attributable dollar cost.
+      // Keep the numeric compatibility field at zero, but label it explicitly
+      // so dashboards never mistake zero for a measured free turn.
+      cost_status: 'unavailable',
     }
     this.emit('message', msg)
   }

@@ -38,6 +38,20 @@ export const InboundMessage = Type.Object({
     text: Type.Optional(Type.String()),
     media: Type.Optional(Type.Array(MediaRef)),
   }),
+  // Exact user bubble persisted by the gateway before model submission.
+  // This lets transcript recovery use the server tape rather than depending
+  // on a browser PUT that may never run after suspension or navigation.
+  clientMessage: Type.Optional(
+    Type.Object({
+      id: Type.String(),
+      role: Type.Literal('user'),
+      text: Type.String(),
+      ts: Type.Number(),
+      status: Type.Optional(Type.Union([Type.Literal('sending'), Type.Literal('sent')])),
+      _media: Type.Optional(Type.Array(MediaRef)),
+      _modelText: Type.Optional(Type.String()),
+    }),
+  ),
   replyToId: Type.Optional(Type.String()),
   // Effort/reasoning-depth override for this session (一般来自 Web 前端的思考深度选择器,低/中/高/极高/最高/多agent工作流)。
   //   - 字符串 ∈ EFFORT_LEVELS:CCB 写 --effort; Codex 写 model_reasoning_effort(支持的取值)
@@ -260,6 +274,12 @@ export const OutboundMessage = Type.Object({
       cacheReadTokens: Type.Optional(Type.Number()),
       cacheCreationTokens: Type.Optional(Type.Number()),
       totalCost: Type.Optional(Type.Number()),
+      usageStatus: Type.Optional(
+        Type.Union([Type.Literal('observed'), Type.Literal('unavailable')]),
+      ),
+      costStatus: Type.Optional(
+        Type.Union([Type.Literal('observed'), Type.Literal('unavailable')]),
+      ),
       turn: Type.Optional(Type.Number()),
       // Anthropic stop_reason, extracted from CCB result row. Used by the
       // frontend to pick a precise empty-turn notice instead of the old

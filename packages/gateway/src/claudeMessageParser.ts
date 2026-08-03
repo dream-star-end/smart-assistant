@@ -59,6 +59,8 @@ export type SessionStreamEvent =
          *  | 'pause_turn' | 'refusal'. Used by sessionManager for phantom
          *  judgment and by frontend for empty-turn notice text. */
         stopReason?: string
+        usageStatus?: 'observed' | 'unavailable'
+        costStatus?: 'observed' | 'unavailable'
       }
     }
   | { kind: 'error'; error: string }
@@ -100,6 +102,8 @@ export interface TurnResult {
   stopReason: string | null
   /** num_turns from claude result row, for diagnostics. null when absent. */
   numTurns: number | null
+  usageStatus: 'observed' | 'unavailable'
+  costStatus: 'observed' | 'unavailable'
 }
 
 /**
@@ -711,6 +715,8 @@ export class ClaudeMessageParser {
       isError: !!(msg as any).is_error,
       stopReason,
       numTurns,
+      usageStatus: (msg as any).usage_status === 'unavailable' ? 'unavailable' : 'observed',
+      costStatus: (msg as any).cost_status === 'unavailable' ? 'unavailable' : 'observed',
     }
 
     this.finalized = true
@@ -726,6 +732,8 @@ export class ClaudeMessageParser {
         turn: this._sessionTotals.turns,
         isError: this.turnResult.isError,
         ...(stopReason !== null ? { stopReason } : {}),
+        usageStatus: this.turnResult.usageStatus,
+        costStatus: this.turnResult.costStatus,
       },
     })
     this.onFinish(this.turnResult)

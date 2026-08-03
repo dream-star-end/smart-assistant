@@ -12,9 +12,14 @@ import * as assert from 'node:assert/strict'
  * `permission_request` (in the active turn loop) and `_broadcastPermissionSettled`
  * — they must both stamp `frameSeq` + store in the ring, not naked `ws.send()`.
  */
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
-import { OutboundRingBuffer } from '../outboundRing.js'
-import { Gateway } from '../server.js'
+
+process.env.OPENCLAUDE_HOME = mkdtempSync(join(tmpdir(), 'oc-permission-ring-'))
+const { OutboundRingBuffer } = await import('../outboundRing.js')
+const { Gateway } = await import('../server.js')
 
 // Minimal mock WebSocket that just records sent payloads.
 function createMockWs(): { send: (data: string) => void; sent: string[] } {
@@ -31,9 +36,10 @@ function createMockWs(): { send: (data: string) => void; sent: string[] } {
 // reduces intersections containing private members to `never`), so we
 // describe the test surface independently and `any`-cast through.
 type TestHarness = {
-  _outboundRing: OutboundRingBuffer
+  _outboundRing: InstanceType<typeof OutboundRingBuffer>
   _redisPendingFrames: Map<string, Map<number, unknown>>
   _redisGapTimers: Map<string, ReturnType<typeof setTimeout>>
+  _sessionDeliveryChains: Map<string, Promise<void>>
   clientsByPeer: Map<string, Set<unknown>>
   _sendStampedSessionFrame: (
     sessionKey: string,
@@ -52,12 +58,26 @@ function harness(): TestHarness {
   gw._outboundRing = new OutboundRingBuffer()
   gw._redisPendingFrames = new Map()
   gw._redisGapTimers = new Map()
+  gw._sessionDeliveryChains = new Map()
+  gw._tapePoisoned = new Set()
+  gw.sessions = { getByKey: () => ({ userId: 'default', _activeTurnId: 'turn-test' }) }
+  gw._redisSessionBus = {
+    reserveFrameSeq: async () => null,
+    advanceFrameSeq: async () => null,
+    publishFrame: () => {},
+  }
+  gw.log = { warn: () => {} }
   gw.clientsByPeer = new Map()
   return gw as TestHarness
 }
 
+async function flushSessionDelivery(gw: TestHarness, sessionKey: string): Promise<void> {
+  const pending = gw._sessionDeliveryChains.get(sessionKey)
+  if (pending) await pending
+}
+
 describe('permission frame ring replay', () => {
-  it('permission_request via _sendStampedSessionFrame stamps frameSeq + stores in ring', () => {
+  it('permission_request via _sendStampedSessionFrame stamps frameSeq + stores in ring', async () => {
     const gw = harness()
     const ws = createMockWs()
     const peerKey = 'default:webchat:p1'
@@ -74,6 +94,7 @@ describe('permission frame ring replay', () => {
       inputPreview: '{"file_path":"/tmp/x"}',
       inputJson: { file_path: '/tmp/x', content: 'hi' },
     })
+    await flushSessionDelivery(gw, sessionKey)
 
     // Live broadcast lands on the connected ws with frameSeq stamped.
     assert.equal(ws.sent.length, 1)
@@ -94,7 +115,7 @@ describe('permission frame ring replay', () => {
     assert.equal(replayed.requestId, 'req-1')
   })
 
-  it('settled frame stamped after request preserves request → settled order on replay', () => {
+  it('settled frame stamped after request preserves request → settled order on replay', async () => {
     const gw = harness()
     const ws = createMockWs()
     const peerKey = 'default:webchat:p1'
@@ -118,6 +139,7 @@ describe('permission frame ring replay', () => {
       behavior: 'allow',
       reason: 'remote',
     })
+    await flushSessionDelivery(gw, sessionKey)
 
     const replay = gw._outboundRing.peekReplay(sessionKey, 0)
     assert.equal(replay.ok, true)
@@ -130,7 +152,7 @@ describe('permission frame ring replay', () => {
     assert.ok(f2.frameSeq > f1.frameSeq, 'settled frameSeq must follow request')
   })
 
-  it('helper still stamps + stores when no clients are connected', () => {
+  it('helper still stamps + stores when no clients are connected', async () => {
     // The disconnect-time settled path uses this: when the last WS for a
     // peerKey closes, _autoDenyPendingPermissions broadcasts a settled frame
     // to a now-empty client set. Writing it to the ring lets the next
@@ -154,6 +176,7 @@ describe('permission frame ring replay', () => {
       behavior: 'deny',
       reason: 'disconnect',
     })
+    await flushSessionDelivery(gw, sessionKey)
 
     const replay = gw._outboundRing.peekReplay(sessionKey, 0)
     assert.equal(replay.ok, true)

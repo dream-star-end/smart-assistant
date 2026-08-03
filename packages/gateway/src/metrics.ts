@@ -104,6 +104,10 @@ export const sessionsActive = { value: 0 }
 export const sessionCrashesTotal = new Counter()
 
 export const wsConnectionsTotal = new Counter()
+export const turnInterruptTotal = new Counter() // labels: source,outcome
+export const delegateCleanupTotal = new Counter() // labels: outcome
+export const sessionTapeAppendTotal = new Counter() // labels: direction,outcome
+export const usageAvailabilityTotal = new Counter() // labels: usage,cost
 
 // ── Outbound ring buffer observability ──
 // Lets ops watch how often the resume replay path actually rescues a
@@ -130,6 +134,10 @@ export function startMetricsCollection(): void {
     turnTokens.inc({ agent: ev.agentId, direction: 'output' }, ev.usage.outputTokens ?? 0)
     if (ev.usage.cacheReadTokens)
       turnTokens.inc({ agent: ev.agentId, direction: 'cache_read' }, ev.usage.cacheReadTokens)
+    usageAvailabilityTotal.inc({
+      usage: ev.usage.usageStatus ?? 'unknown',
+      cost: ev.usage.costStatus ?? 'unknown',
+    })
   })
 
   eventBus.on('tool.called', (ev) => {
@@ -167,6 +175,19 @@ export function serializeMetrics(): string {
     costTotal.serialize('oc_cost_usd_total', 'Total cost in USD'),
     sessionCrashesTotal.serialize('oc_session_crashes_total', 'Total session crashes'),
     wsConnectionsTotal.serialize('oc_ws_connections_total', 'Total WebSocket connections'),
+    turnInterruptTotal.serialize('oc_turn_interrupt_total', 'Turn interruption attempts'),
+    delegateCleanupTotal.serialize(
+      'oc_delegate_cleanup_total',
+      'Delegate session cleanup outcomes',
+    ),
+    sessionTapeAppendTotal.serialize(
+      'oc_session_tape_append_total',
+      'Server transcript tape appends by direction and outcome',
+    ),
+    usageAvailabilityTotal.serialize(
+      'oc_usage_availability_total',
+      'Completed turns by token and cost availability',
+    ),
     outboundRingReplayHitTotal.serialize(
       'oc_outbound_ring_replay_hit_total',
       'Outbound ring replay served frames after client reconnect',

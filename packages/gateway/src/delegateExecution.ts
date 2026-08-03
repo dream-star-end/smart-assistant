@@ -12,7 +12,7 @@ export interface DelegateExecutionOptions {
   runEntry: RunLogEntry
   submit: (onEvent: (event: any) => void) => Promise<void>
   emitCompleted: (result: DelegateExecutionResult) => void
-  releaseActive: () => void
+  cleanup: () => Promise<void>
   outputPreviewLimit?: number
 }
 
@@ -51,6 +51,6 @@ export async function runDelegateExecution(
     opts.emitCompleted(result)
     return result
   } finally {
-    opts.releaseActive()
+    await opts.cleanup()
   }
 }

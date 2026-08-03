@@ -37,7 +37,7 @@ describe('runDelegateExecution', () => {
         onEvent({ kind: 'block', block: { kind: 'text', text: 'training done' } })
       },
       emitCompleted: (r) => ctx.completed.push(r),
-      releaseActive: ctx.releaseActive,
+      cleanup: async () => ctx.releaseActive(),
     })
 
     assert.deepEqual(result, { output: 'training done', error: '' })
@@ -60,7 +60,7 @@ describe('runDelegateExecution', () => {
         onEvent({ kind: 'error', error: 'model failed' })
       },
       emitCompleted: (r) => ctx.completed.push(r),
-      releaseActive: ctx.releaseActive,
+      cleanup: async () => ctx.releaseActive(),
     })
 
     assert.equal(ctx.runEntry.status, 'failed')
@@ -82,7 +82,7 @@ describe('runDelegateExecution', () => {
         throw new Error('submit exploded')
       },
       emitCompleted: (r) => ctx.completed.push(r),
-      releaseActive: ctx.releaseActive,
+      cleanup: async () => ctx.releaseActive(),
     })
 
     assert.equal(ctx.runEntry.status, 'failed')

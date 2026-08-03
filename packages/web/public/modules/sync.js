@@ -4,7 +4,8 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=11'
+import { projectSessionTape } from './sessionTape.js?v=1'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=12'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -509,10 +510,12 @@ export function _buildSessionFromRemote(remote, existingLocal, { placeholder = f
     pinned: !!remote.pinned,
     _syncedAt: remote.updatedAt,
     _messageCount: messageCount,
+    _tapeTurnCount: remote.tapeTurnCount || existingLocal?._tapeTurnCount || 0,
   }
   if (
     placeholder &&
     (messageCount > messages.length ||
+      (remote.tapeTurnCount > 0 && !existingLocal?._tapeFrames) ||
       (existingLocal?._syncedAt &&
         remote.updatedAt &&
         existingLocal._syncedAt !== remote.updatedAt))
@@ -536,6 +539,12 @@ function _sessionDbSnapshot(sess, extra = {}) {
     _searchText,
     _hydratePromise,
     _hydrating,
+    _tapeFrames,
+    _tapeBefore,
+    _tapeHasMore,
+    _tapeFirstTs,
+    _tapeLoadingPromise,
+    _legacyMessages,
     ...persist
   } = sess || {}
   return { ...persist, ...extra }
@@ -638,6 +647,9 @@ export async function hydrateSession(id, { force = false } = {}) {
     }
     const remote = await apiGet(`/api/sessions/${id}`)
     if (!remote?.id) return state.sessions.get(id) || null
+    const tapePage = remote.tape?.lastTapeSeq
+      ? await apiGet(`/api/sessions/${id}/tape?turns=5`)
+      : null
     const live = state.sessions.get(id)
     // A live stream can start while this GET is in flight (cross-device: the
     // other device's turn streams to us mid-hydration). Dropping the response
@@ -647,13 +659,36 @@ export async function hydrateSession(id, { force = false } = {}) {
       return live || null
     }
     if (live?._dirty) return live
-    // Fire-and-forget server persistence may not have landed yet; never trade
-    // a visible reply for a shorter snapshot.
-    if (_serverSnapshotLosesLocalTail(remote.messages, live?.messages)) {
+    let hydratedRemote = remote
+    const legacyMessages = Array.isArray(remote.messages) ? remote.messages : []
+    if (tapePage) {
+      // The server freezes this JSON body as the pre-tape legacy prefix. Do
+      // not re-cut it by browser timestamps here: device clock skew can put a
+      // legitimate old message on either side of the server commit time.
+      const projected = projectSessionTape(tapePage.frames)
+      const representedIds = new Set(
+        [...legacyMessages, ...projected].map((message) => message?.id).filter(Boolean),
+      )
+      const pendingUsers = (live?.messages || []).filter(
+        (message) =>
+          message?.role === 'user' &&
+          message?._source !== 'tape' &&
+          !representedIds.has(message?.id),
+      )
+      hydratedRemote = {
+        ...remote,
+        messages: [...legacyMessages, ...projected, ...pendingUsers].sort(
+          (a, b) => (a?.ts || 0) - (b?.ts || 0),
+        ),
+      }
+    }
+    // Never trade a visible reply for a shorter snapshot. For taped sessions
+    // compare against the tape projection, not the legacy JSON column.
+    if (!tapePage && _serverSnapshotLosesLocalTail(hydratedRemote.messages, live?.messages)) {
       _markHydrateDebt(live)
       return live || null
     }
-    const sess = _buildSessionFromRemote(remote, live, { placeholder: false })
+    const sess = _buildSessionFromRemote(hydratedRemote, live, { placeholder: false })
     sess._needsFetch = false
     sess._hydrateDeferred = false
     sess._hydrating = false
@@ -664,6 +699,13 @@ export async function hydrateSession(id, { force = false } = {}) {
     // and risk clobbering a future streaming tail. Mirrors the in-memory clear in
     // websocket.js handleResumeFailed onResult, but also clears the persisted copy.
     sess._liveStreamBroken = false
+    if (tapePage) {
+      sess._tapeFrames = tapePage.frames
+      sess._tapeBefore = tapePage.nextBefore
+      sess._tapeHasMore = !!tapePage.hasMore
+      sess._tapeFirstTs = tapePage.firstTapeTs
+      sess._legacyMessages = legacyMessages
+    }
     _rebindStreamingPointers(sess)
     _rebuildSearchIndex(sess)
     clearDeleteTombstone(sess.id)
@@ -693,6 +735,48 @@ export async function hydrateSession(id, { force = false } = {}) {
     existing._hydrating = true
   }
   return trackedHydration
+}
+
+/** Load one older complete-turn page from the append-only server tape. */
+export async function loadOlderTape(id) {
+  const sess = state.sessions.get(id)
+  if (!sess || !state.token || !sess._tapeHasMore || !sess._tapeBefore) return sess || null
+  if (sess._tapeLoadingPromise) return sess._tapeLoadingPromise
+  const load = (async () => {
+    const before = sess._tapeBefore
+    const older = await apiGet(`/api/sessions/${id}/tape?before=${before}&turns=5`)
+    const bySeq = new Map()
+    for (const row of [...(sess._tapeFrames || []), ...(older.frames || [])]) {
+      bySeq.set(row.tapeSeq, row)
+    }
+    const frames = [...bySeq.values()].sort((a, b) => a.tapeSeq - b.tapeSeq)
+    const legacy = Array.isArray(sess._legacyMessages) ? sess._legacyMessages : []
+    const knownIds = new Set(legacy.map((message) => message?.id).filter(Boolean))
+    const projected = projectSessionTape(frames)
+    const projectedIds = new Set(projected.map((message) => message?.id).filter(Boolean))
+    const localOnly = (sess.messages || []).filter(
+      (message) =>
+        message?._source !== 'tape' && !knownIds.has(message?.id) && !projectedIds.has(message?.id),
+    )
+    sess.messages = [...legacy, ...projected, ...localOnly].sort(
+      (a, b) => (a?.ts || 0) - (b?.ts || 0),
+    )
+    sess._tapeFrames = frames
+    sess._tapeBefore = older.nextBefore
+    sess._tapeHasMore = !!older.hasMore
+    sess._tapeFirstTs = older.firstTapeTs ?? sess._tapeFirstTs
+    sess._messageCount = Math.max(sess._messageCount || 0, sess.messages.length)
+    _rebindStreamingPointers(sess)
+    _rebuildSearchIndex(sess)
+    try {
+      await dbPut(_sessionDbSnapshot(sess, { _syncedAt: sess._syncedAt }))
+    } catch {}
+    return sess
+  })()
+  sess._tapeLoadingPromise = load.finally(() => {
+    sess._tapeLoadingPromise = null
+  })
+  return sess._tapeLoadingPromise
 }
 
 // Bounded because the two reasons a retry can keep failing are both

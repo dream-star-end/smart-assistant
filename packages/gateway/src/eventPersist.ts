@@ -68,6 +68,8 @@ export function startEventPersistence(): void {
         cacheReadTokens: te.usage.cacheReadTokens ?? 0,
         cacheCreationTokens: te.usage.cacheCreationTokens ?? 0,
         costUsd: te.usage.costUsd ?? 0,
+        usageStatus: te.usage.usageStatus ?? 'observed',
+        costStatus: te.usage.costStatus ?? 'observed',
         durationMs: te.durationMs,
         toolCalls: te.toolCalls,
         timestamp: te.timestamp,

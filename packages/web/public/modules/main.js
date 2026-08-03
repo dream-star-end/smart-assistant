@@ -36,7 +36,13 @@ import {
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=11'
+import {
+  hydrateSession,
+  loadOlderTape,
+  maybeSyncNow,
+  setSyncDeps,
+  syncSessionsFromServer,
+} from './sync.js?v=12'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setThemeAppliedFn, setToastFn } from './theme.js'
@@ -128,7 +134,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=11'
+} from './sessions.js?v=12'
 
 // ── Messages ──
 import {
@@ -143,7 +149,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=49'
+} from './messages.js?v=50'
 
 // ── WebSocket ──
 import {
@@ -171,7 +177,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=55'
+} from './websocket.js?v=56'
 
 // ── Slash commands ──
 import {
@@ -353,6 +359,22 @@ window.addEventListener('openclaude:hydrate-current-session', async () => {
   if (!sess?._needsFetch) return
   const hydrated = await hydrateSession(sess.id).catch(() => null)
   if (!hydrated || hydrated.id !== state.currentSessionId) return
+  renderSidebar()
+  renderMessages()
+})
+
+window.addEventListener('openclaude:load-older-tape', async () => {
+  const sess = getSession()
+  if (!sess?._tapeHasMore) return
+  const loading = loadOlderTape(sess.id)
+  renderMessages()
+  const loaded = await loading.catch(() => null)
+  if (!loaded) {
+    toast('更早历史加载失败，请稍后重试', 'error')
+    renderMessages()
+    return
+  }
+  if (loaded.id !== state.currentSessionId) return
   renderSidebar()
   renderMessages()
 })
@@ -897,6 +919,13 @@ async function send() {
   const model = getModelForSubmit()
   const conversationMode = getConversationModeForSubmit(text, state.attachments)
   const goalMode = getGoalModeForSubmit()
+  // Create the exact visible user bubble first so the same stable id/content
+  // can be committed to the server transcript tape before model submission.
+  const userMsg = addMessage(sess, 'user', displayText, {
+    status: 'sending',
+    _media: media.length > 0 ? media : undefined,
+    _modelText: modelText !== text ? modelText : undefined,
+  })
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -904,6 +933,15 @@ async function send() {
     peer: { id: sess.id, kind: 'dm' },
     agentId: sess.agentId || state.defaultAgentId,
     content: { text: modelText, media: media.length > 0 ? media : undefined },
+    clientMessage: {
+      id: userMsg.id,
+      role: 'user',
+      text: userMsg.text,
+      ts: userMsg.ts,
+      status: 'sent',
+      ...(userMsg._media ? { _media: userMsg._media } : {}),
+      ...(userMsg._modelText ? { _modelText: userMsg._modelText } : {}),
+    },
     // string='xhigh'/'max' → 切到该 effort;null → 显式清除回模型默认;
     // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
     ...(effortLevel !== undefined ? { effortLevel } : {}),
@@ -914,12 +952,6 @@ async function send() {
     ts: Date.now(),
   }
   if (goalMode === true) markGoalModeSeeded()
-  // Add user message with status tracking + persist media & full text for regen
-  const userMsg = addMessage(sess, 'user', displayText, {
-    status: 'sending',
-    _media: media.length > 0 ? media : undefined,
-    _modelText: modelText !== text ? modelText : undefined, // Full text with attachments for replay
-  })
   sess._streamingAssistant = null
   sess._streamingThinking = null
   sess._streamingPlan = null

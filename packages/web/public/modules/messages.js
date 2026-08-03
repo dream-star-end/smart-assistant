@@ -2089,6 +2089,19 @@ export function renderMessages() {
     }
     inner.appendChild(gap)
   }
+  if (s._tapeHasMore) {
+    const gap = document.createElement('div')
+    gap.className = 'history-gap-banner'
+    gap.innerHTML = `<span>更早的完整回合已安全保存在服务器</span><button class="btn btn-ghost btn-sm" type="button" data-load-older-tape>${s._tapeLoadingPromise ? '加载中…' : '加载更早回合'}</button>`
+    const button = gap.querySelector('[data-load-older-tape]')
+    if (button) {
+      button.disabled = !!s._tapeLoadingPromise
+      button.addEventListener('click', () => {
+        window.dispatchEvent(new CustomEvent('openclaude:load-older-tape'))
+      })
+    }
+    inner.appendChild(gap)
+  }
   // Performance: only render last 100 messages; show "load more" for older ones
   const MAX_INITIAL = 100
   if (msgs.length > MAX_INITIAL) {

@@ -4,7 +4,7 @@ import { shouldSuppressGoalStatusToast } from './goalControl.js?v=3'
 import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=3'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=11'
+import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=12'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -117,61 +117,19 @@ function _probeWsAlive(ws, timeoutMs, label, onPong) {
 
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
 
-// ── Per-session thinking safety timer ──
-// Clears stuck _sendingInFlight if no outbound frame arrives within 10 minutes.
-// Must be longer than backend's idle timeout (5min default, 15min for tool calls)
-// so it only fires as a last resort when backend fails to send isFinal.
-// Reset on every handleOutbound frame; cleared on isFinal.
-const THINKING_SAFETY_MS = 10 * 60_000
-const _thinkingTimers = new Map() // sessId -> timeoutId
-
-function _resetThinkingSafety(sessId) {
-  if (_thinkingTimers.has(sessId)) clearTimeout(_thinkingTimers.get(sessId))
-  const tid = setTimeout(() => {
-    _thinkingTimers.delete(sessId)
-    const s = state.sessions.get(sessId)
-    if (s?._sendingInFlight) {
-      console.warn('[ws] Thinking safety timeout for session', sessId)
-      // Send stop to backend so the turn is actually interrupted,
-      // preventing late frames from being misattributed to a future turn.
-      try {
-        if (state.ws && state.ws.readyState === 1) {
-          state.ws.send(
-            JSON.stringify({
-              type: 'inbound.control.stop',
-              channel: 'webchat',
-              peer: { id: sessId, kind: 'dm' },
-              agentId: s.agentId || state.defaultAgentId,
-            }),
-          )
-        }
-      } catch {}
-      s._sendingInFlight = false
-      clearTurnTiming(s)
-      // Abandon the reply tracker — the turn is being torn down by timeout,
-      // so any belated isFinal must NOT retroactively flag this message as
-      // an empty turn (or attach to whatever message comes next).
-      resetReplyTracker(s)
-      if (s.id === state.currentSessionId) {
-        state.sendingInFlight = false
-        updateSendEnabled()
-        hideTypingIndicator()
-        setTitleBusy(false)
-      }
-    }
-  }, THINKING_SAFETY_MS)
-  _thinkingTimers.set(sessId, tid)
-}
+// Turn lifetime is server-authoritative. Silence is valid while Codex reasons,
+// runs a long command, or waits on an external deployment. The old browser
+// timer converted ten minutes without a frame into a user-equivalent stop and
+// killed healthy work. These compatibility hooks intentionally do nothing;
+// explicit Stop remains the only browser action that interrupts a turn.
+function _resetThinkingSafety(_sessId) {}
 
 export function resetThinkingSafety(sessId) {
   _resetThinkingSafety(sessId)
 }
 
 function _clearThinkingSafety(sessId) {
-  if (_thinkingTimers.has(sessId)) {
-    clearTimeout(_thinkingTimers.get(sessId))
-    _thinkingTimers.delete(sessId)
-  }
+  void sessId
 }
 
 // Notification sound (local copy — avoids exporting private from notifications.js)
@@ -592,34 +550,10 @@ function _drainNextOfflineItem() {
     state._offlineQueueDraining = false
     state._offlineDrainingCurrent = null
   }
-  // Safety timeout: if no isFinal arrives in 120s, advance the drain to prevent wedge
-  state._drainTimeout = setTimeout(() => {
-    if (state._offlineDrainingCurrent === item) {
-      console.warn('[ws] Drain isFinal timeout for session', item.sessId)
-      // Clear stale sending state for this session
-      const stuckSess = state.sessions.get(item.sessId)
-      if (stuckSess) {
-        stuckSess._sendingInFlight = false
-        clearTurnTiming(stuckSess)
-        // Drain timeout is abandoning this turn; drop the reply tracker so a
-        // belated isFinal can't flag the user message as empty or attach to
-        // the next turn that the user kicks off.
-        resetReplyTracker(stuckSess)
-        if (stuckSess.id === state.currentSessionId) {
-          state.sendingInFlight = false
-          updateSendEnabled()
-          hideTypingIndicator()
-          setTitleBusy(false)
-        }
-      }
-      state._offlineDrainingCurrent = null
-      if (state._offlineQueuePending?.length > 0) {
-        _drainNextOfflineItem()
-      } else {
-        state._offlineQueueDraining = false
-      }
-    }
-  }, 120000)
+  // Do not advance this FIFO on a wall-clock guess. A long-running turn owns
+  // the session until an authoritative final/idle status arrives or the user
+  // explicitly cancels it; skipping after 120s used to run later messages out
+  // of order while the original command was still active.
   // If no more items, we're done after this response (handleOutbound will clear the flag)
   if (queue.length === 0) state._offlineQueueDraining = false
 }
@@ -924,42 +858,16 @@ export function connect() {
       showTypingIndicator()
       setTitleBusy(true)
     }
-    // Safety timeout: if sessions that were in-flight BEFORE this reconnect still
-    // have _sendingInFlight after 30s, auto-clear them. The snapshot Set is stored
-    // in state so that isFinal handlers can remove resolved sessions — preventing
-    // the timer from accidentally clearing a NEW turn started after reconnect.
+    // Snapshot reconnecting in-flight sessions. The gateway answers hello with
+    // an authoritative running/idle status; never turn thirty seconds of local
+    // silence into a fake completion.
     if (state._reconnectInFlightTimer) clearTimeout(state._reconnectInFlightTimer)
+    state._reconnectInFlightTimer = null
     state._reconnectInFlightSet = new Set()
     for (const [id, s] of state.sessions) {
       if (s._sendingInFlight) state._reconnectInFlightSet.add(id)
     }
-    if (state._reconnectInFlightSet.size > 0) {
-      state._reconnectInFlightTimer = setTimeout(() => {
-        state._reconnectInFlightTimer = null
-        const snapped = state._reconnectInFlightSet
-        state._reconnectInFlightSet = null
-        if (!snapped) return
-        for (const sessId of snapped) {
-          const s = state.sessions.get(sessId)
-          if (s?._sendingInFlight) {
-            console.warn('[ws] Clearing stuck _sendingInFlight for session', s.id)
-            s._sendingInFlight = false
-            clearTurnTiming(s)
-            // Reconnect safety cleared the turn locally — drop the reply
-            // tracker so any isFinal the gateway eventually delivers cannot
-            // retroactively flag the abandoned turn as empty or mis-attach
-            // to a later user message.
-            resetReplyTracker(s)
-            if (s.id === state.currentSessionId) {
-              state.sendingInFlight = false
-              updateSendEnabled()
-              hideTypingIndicator()
-              setTitleBusy(false)
-            }
-          }
-        }
-      }, 30000)
-    } else {
+    if (state._reconnectInFlightSet.size === 0) {
       state._reconnectInFlightSet = null
     }
     // Send hello with all active session peer IDs so gateway can auto-resume.
@@ -1165,7 +1073,8 @@ export function connect() {
 export function formatMeta(m) {
   if (!m) return ''
   const parts = []
-  if (typeof m.cost === 'number') parts.push(`$${m.cost.toFixed(4)}`)
+  if (m.costStatus === 'unavailable') parts.push('订阅计费不可用')
+  else if (typeof m.cost === 'number') parts.push(`$${m.cost.toFixed(4)}`)
   if (typeof m.totalCost === 'number' && m.totalCost !== m.cost)
     parts.push(`total $${m.totalCost.toFixed(4)}`)
   if (typeof m.inputTokens === 'number') parts.push(`in ${m.inputTokens}`)
@@ -1173,6 +1082,7 @@ export function formatMeta(m) {
   if (m.cacheReadTokens > 0) parts.push(`cache-r ${m.cacheReadTokens}`)
   if (m.cacheCreationTokens > 0) parts.push(`cache-w ${m.cacheCreationTokens}`)
   if (typeof m.turn === 'number') parts.push(`T${m.turn}`)
+  if (m.usageStatus === 'unavailable') parts.push('token 用量不可用')
   return parts.join(' · ')
 }
 export function buildToolUseLabel(block) {
@@ -2053,8 +1963,33 @@ function handleOutboundTurnStatus(frame) {
   const sess = peerId ? state.sessions.get(peerId) : null
   if (!sess) return
   markFrameReceived(sess)
-  const status = frame.status === 'compacting' ? 'compacting' : null
+  const status =
+    frame.status === 'running' || frame.status === 'compacting' || frame.status === 'idle'
+      ? frame.status
+      : null
   sess._turnStatus = status
+  if (status === 'running' || status === 'compacting') {
+    sess._sendingInFlight = true
+    if (typeof frame.startedAt === 'number' && !sess._turnStartedAt) {
+      sess._turnStartedAt = frame.startedAt
+    }
+    if (sess.id === state.currentSessionId) {
+      state.sendingInFlight = true
+      updateSendEnabled()
+      showTypingIndicator()
+      setTitleBusy(true)
+    }
+  } else if (status === 'idle' && sess._sendingInFlight) {
+    sess._sendingInFlight = false
+    clearTurnTiming(sess)
+    if (state._reconnectInFlightSet) state._reconnectInFlightSet.delete(sess.id)
+    if (sess.id === state.currentSessionId) {
+      state.sendingInFlight = false
+      updateSendEnabled()
+      hideTypingIndicator()
+      setTitleBusy(false)
+    }
+  }
   if (sess.id !== state.currentSessionId) return
   const el = document.getElementById('__typing')
   if (!el) return
@@ -2068,6 +2003,9 @@ function handleOutboundTurnStatus(frame) {
     label.textContent = `${name} 正在压缩上下文 (${secs}s)`
     el.classList.remove('stale-warn', 'stale-danger')
     el.classList.add('compacting')
+  } else if (status === 'running') {
+    label.textContent = `${name} 仍在运行 (${secs}s，可随时取消)`
+    el.classList.remove('stale-warn', 'stale-danger', 'compacting')
   } else {
     el.classList.remove('compacting')
   }

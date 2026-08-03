@@ -117,6 +117,15 @@ describe('CODEX_PREAMBLE', () => {
       'preamble should disclaim authoritative tool list',
     )
   })
+
+  it('requires evidence-backed diagnosis, bounded reviews, corrections, and side-effect reconciliation', () => {
+    assert.match(CODEX_PREAMBLE, /bounded, verifiable success criteria/)
+    assert.match(CODEX_PREAMBLE, /one plan reviewer and one full-diff reviewer/)
+    assert.match(CODEX_PREAMBLE, /categorical diagnosis/)
+    assert.match(CODEX_PREAMBLE, /timestamped evidence/)
+    assert.match(CODEX_PREAMBLE, /correct it explicitly/)
+    assert.match(CODEX_PREAMBLE, /reconcile the actual external\s+state/)
+  })
 })
 
 describe('resolveMcpMemoryEntry', () => {

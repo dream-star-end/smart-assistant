@@ -1462,6 +1462,83 @@ describe('handleNotification — item/completed', () => {
   })
 })
 
+describe('handleNotification — thread/tokenUsage/updated', () => {
+  it('emits matching current-turn token usage and marks subscription cost unavailable', async () => {
+    const h = await makeHarness()
+    try {
+      ;(h.runner as any).threadId = 'thread-usage'
+      ;(h.runner as any).activeTurnId = 'turn-current'
+      ;(h.runner as any).currentTurnCompleter = { resolve() {}, reject() {} }
+      ;(h.runner as any).handleNotification('thread/tokenUsage/updated', {
+        threadId: 'thread-usage',
+        turnId: 'turn-current',
+        tokenUsage: {
+          last: {
+            inputTokens: 123,
+            cachedInputTokens: 45,
+            outputTokens: 67,
+            reasoningOutputTokens: 8,
+            totalTokens: 190,
+          },
+        },
+      })
+      ;(h.runner as any).emitResult({
+        durationMs: 5,
+        ok: true,
+        text: 'done',
+        usage: (h.runner as any).currentTokenUsage,
+      })
+      const result = h.messages.at(-1)
+      assert.deepEqual(result.usage, {
+        input_tokens: 123,
+        output_tokens: 67,
+        cache_read_input_tokens: 45,
+      })
+      assert.equal(result.usage_status, 'observed')
+      assert.equal(result.cost_status, 'unavailable')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  it('ignores usage for another turn instead of contaminating the active result', async () => {
+    const h = await makeHarness()
+    try {
+      ;(h.runner as any).threadId = 'thread-usage'
+      ;(h.runner as any).activeTurnId = 'turn-current'
+      ;(h.runner as any).currentTurnCompleter = { resolve() {}, reject() {} }
+      ;(h.runner as any).handleNotification('thread/tokenUsage/updated', {
+        threadId: 'thread-usage',
+        turnId: 'turn-other',
+        tokenUsage: { last: { inputTokens: 999, outputTokens: 999 } },
+      })
+      ;(h.runner as any).emitResult({ durationMs: 5, ok: true, text: 'done' })
+      const result = h.messages.at(-1)
+      assert.equal(result.usage, undefined)
+      assert.equal(result.usage_status, 'unavailable')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  it('ignores malformed usage notifications without a turn identity', async () => {
+    const h = await makeHarness()
+    try {
+      ;(h.runner as any).threadId = 'thread-usage'
+      ;(h.runner as any).activeTurnId = 'turn-current'
+      ;(h.runner as any).currentTurnCompleter = { resolve() {}, reject() {} }
+      ;(h.runner as any).handleNotification('thread/tokenUsage/updated', {
+        threadId: 'thread-usage',
+        tokenUsage: { last: { inputTokens: 999, outputTokens: 999 } },
+      })
+      ;(h.runner as any).emitResult({ durationMs: 5, ok: true, text: 'done' })
+      assert.equal(h.messages.at(-1).usage_status, 'unavailable')
+    } finally {
+      await h.cleanup()
+    }
+  })
+})
+
 describe('handleNotification — turn/completed', () => {
   it('status=completed → resolves currentTurnCompleter with the turn record', async () => {
     const h = await makeHarness()

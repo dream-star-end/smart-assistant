@@ -89,12 +89,19 @@ export interface SdkMessage {
       is_error?: boolean
     }>
     stop_reason?: string
-    usage?: { input_tokens?: number; output_tokens?: number }
+    usage?: {
+      input_tokens?: number
+      output_tokens?: number
+      cache_read_input_tokens?: number
+      cache_creation_input_tokens?: number
+    }
   }
   result?: string
   total_cost_usd?: number
   duration_ms?: number
   is_error?: boolean
+  usage_status?: 'observed' | 'unavailable'
+  cost_status?: 'observed' | 'unavailable'
 }
 
 /** Permission response from the user (sent back to claude as control_response) */
