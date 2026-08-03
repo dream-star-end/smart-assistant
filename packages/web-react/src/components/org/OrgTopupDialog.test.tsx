@@ -1,5 +1,24 @@
-import { describe, expect, test } from "vitest";
-import { yuanToCents } from "./OrgTopupDialog";
+import "@testing-library/jest-dom/vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { createMemoryAuthSession } from "../../lib/authSession";
+import { OrgTopupDialog, yuanToCents } from "./OrgTopupDialog";
+
+const apiMocks = vi.hoisted(() => ({
+  orgTopup: vi.fn(),
+  getOrgBalance: vi.fn(),
+}));
+
+vi.mock("../../lib/api", () => ({ api: apiMocks }));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  Object.defineProperties(window.navigator, {
+    userAgent: { configurable: true, value: "Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0" },
+    userAgentData: { configurable: true, value: undefined },
+  });
+});
 
 describe("yuanToCents（元 → 分，纯字符串/BigInt，禁浮点）", () => {
   test("整数元换算", () => {
@@ -33,4 +52,35 @@ describe("yuanToCents（元 → 分，纯字符串/BigInt，禁浮点）", () =>
     expect(yuanToCents("1,000")).toBeNull();
     expect(yuanToCents("1e3")).toBeNull();
   });
+});
+
+test("组织充值下单后把 mobileUrl 透传到手机支付入口", async () => {
+  Object.defineProperties(window.navigator, {
+    userAgent: { configurable: true, value: "Mozilla/5.0 (iPhone) Mobile Safari/604.1" },
+    userAgentData: { configurable: true, value: { mobile: true } },
+  });
+  apiMocks.orgTopup.mockResolvedValue({
+    orderNo: "org-topup-1",
+    qr: "https://pay.test/qr.png",
+    mobileUrl: "https://pay.xunhupay.com/wechat/org-topup-1",
+  });
+  apiMocks.getOrgBalance.mockResolvedValue("1000");
+
+  render(
+    <OrgTopupDialog
+      open
+      auth={createMemoryAuthSession(() => {}, "t")}
+      baselineCredits="1000"
+      onClose={() => {}}
+      onPaid={() => {}}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "¥100" }));
+  fireEvent.click(screen.getByRole("button", { name: "发起充值" }));
+
+  expect(await screen.findByTestId("mobile-payment-link")).toHaveAttribute(
+    "href",
+    "https://pay.xunhupay.com/wechat/org-topup-1",
+  );
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
 });

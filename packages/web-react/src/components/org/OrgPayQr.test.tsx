@@ -1,8 +1,8 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
-import type { AuthSession } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import type { AuthSession } from "../../lib/types";
 import { OrgPayQr } from "./OrgPayQr";
 
 vi.mock("../../lib/api", () => ({
@@ -19,7 +19,7 @@ afterEach(() => {
   });
 });
 
-test("组织支付在手机只展示截图相册扫码，不显示手机跳转", () => {
+test("组织支付在手机只展示手机支付跳转，不加载二维码", () => {
   Object.defineProperties(window.navigator, {
     userAgent: {
       configurable: true,
@@ -34,7 +34,7 @@ test("组织支付在手机只展示截图相册扫码，不显示手机跳转",
       order={{
         orderNo: "org-order-1",
         qr: "https://pay.test/qr.png",
-        mobileUrl: "https://pay.test/mobile",
+        mobileUrl: "https://pay.xunhupay.com/wechat/org-order-1",
       }}
       amountCents="3800"
       note="企业订阅"
@@ -42,10 +42,9 @@ test("组织支付在手机只展示截图相册扫码，不显示手机跳转",
     />,
   );
 
-  expect(screen.getByRole("img", { name: "微信支付二维码" })).toHaveAttribute(
-    "src",
-    "https://pay.test/qr.png",
+  expect(screen.getByTestId("mobile-payment-link")).toHaveAttribute(
+    "href",
+    "https://pay.xunhupay.com/wechat/org-order-1",
   );
-  expect(screen.getByTestId("mobile-screenshot-payment-hint")).toHaveTextContent("从相册选择");
-  expect(screen.queryByTestId("mobile-payment-link")).not.toBeInTheDocument();
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
 });

@@ -28,6 +28,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { GithubRepoModal } from "./components/github/GithubRepoModal";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { InboxDialog } from "./components/InboxDialog";
+import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
@@ -2380,6 +2381,8 @@ export function App() {
           setChatError(null);
         }}
       />
+
+      {!demo && authed && auth && <PendingPaymentRecovery auth={auth} onPaid={refreshMe} />}
 
       {/* 仅在打开时挂载 → 懒块首屏零下载;Dialog 无 exit 动画(仅 data-[state=open]),
           即时卸载无视觉回退。tab 等状态由 App 持有或组件 open 时自 resync,卸载安全。*/}

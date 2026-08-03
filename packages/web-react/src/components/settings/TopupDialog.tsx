@@ -219,7 +219,11 @@ export function TopupDialog({
                 到账 {formatCredits(stage.order.credits)} 积分
               </div>
             </div>
-            <HupijiaoPaymentEntry qrcodeUrl={stage.order.qrcodeUrl} />
+            <HupijiaoPaymentEntry
+              qrcodeUrl={stage.order.qrcodeUrl}
+              mobileUrl={stage.order.mobileUrl}
+              pendingPayment={{ orderNo: stage.order.orderNo, label: "积分充值" }}
+            />
             <Button variant="ghost" size="sm" onClick={backToPlans} className="text-muted">
               <RefreshCw size={14} /> 换个套餐
             </Button>
