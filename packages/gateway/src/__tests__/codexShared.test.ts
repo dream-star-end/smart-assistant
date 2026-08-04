@@ -16,6 +16,7 @@ import { afterEach, describe, it } from 'node:test'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexModelCatalogArgs,
   buildCodexMultiAgentDisableArgs,
   buildCodexProviderConfigArgs,
   buildCodexReasoningSummaryArgs,
@@ -58,6 +59,39 @@ describe('codexReasoningEffortConfig', () => {
 
   it('Codex 0.144 passes max through without downgrading to xhigh', () => {
     assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-sol', 'max'), ['-c', 'model_reasoning_effort="max"'])
+  })
+
+  it('qwen3.8-max only accepts its three Codex Responses efforts and defaults to xhigh', () => {
+    assert.deepEqual(codexReasoningEffortConfig('qwen3.8-max', undefined), [
+      '-c',
+      'model_reasoning_effort="xhigh"',
+    ])
+    for (const effort of ['low', 'medium', 'xhigh']) {
+      assert.deepEqual(codexReasoningEffortConfig('qwen3.8-max', effort), [
+        '-c',
+        `model_reasoning_effort="${effort}"`,
+      ])
+    }
+    assert.deepEqual(codexReasoningEffortConfig('qwen3.8-max', 'high'), [
+      '-c',
+      'model_reasoning_effort="xhigh"',
+    ])
+    assert.deepEqual(codexReasoningEffortConfig('qwen3.8-max-preview', 'xhigh'), [
+      '-c',
+      'model_reasoning_effort="xhigh"',
+    ])
+  })
+})
+
+describe('buildCodexModelCatalogArgs', () => {
+  it('injects the trusted platform catalog only for exact qwen3.8-max', () => {
+    assert.deepEqual(buildCodexModelCatalogArgs('qwen3.8-max'), [
+      '-c',
+      'model_catalog_json="/run/oc/platform/current/etc-codex/model-catalog.local.json"',
+    ])
+    assert.deepEqual(buildCodexModelCatalogArgs('Qwen3.8-Max'), [])
+    assert.deepEqual(buildCodexModelCatalogArgs('qwen3.8-max-preview'), [])
+    assert.deepEqual(buildCodexModelCatalogArgs('gpt-5.6-sol'), [])
   })
 })
 

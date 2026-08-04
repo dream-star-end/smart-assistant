@@ -656,7 +656,7 @@ describe("migrate.runMigrations", () => {
     );
   });
 
-  test("0197 stages Bailian Qwen3.8 Max for admins with Qwen3.7 Max pricing", async (t) => {
+  test("0197/0199 preserve admin pricing while switching Qwen3.8 Max to Codex Responses", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
 
@@ -672,21 +672,40 @@ describe("migrate.runMigrations", () => {
       `SELECT engine, provider_id, upstream_model_id, context_window,
               capability_profile, capability_schema_version, state
          FROM model_catalog
-        WHERE model_id = 'qwen3.8-max'`,
+        WHERE model_id = 'qwen3.8-max'
+        ORDER BY entry_id`,
     );
-    assert.deepEqual(catalog.rows, [{
-      engine: "ccb",
-      provider_id: "bailian",
-      upstream_model_id: "qwen3.8-max",
-      context_window: 983_616,
-      capability_profile: {
-        supports_vision: true,
-        reasoning: { supported: [], codex_model_default: null },
-        ccb: { capability_zero: true, supports_thinking: true },
+    assert.deepEqual(catalog.rows, [
+      {
+        engine: "ccb",
+        provider_id: "bailian",
+        upstream_model_id: "qwen3.8-max",
+        context_window: 983_616,
+        capability_profile: {
+          supports_vision: true,
+          reasoning: { supported: [], codex_model_default: null },
+          ccb: { capability_zero: true, supports_thinking: true },
+        },
+        capability_schema_version: 1,
+        state: "retired",
       },
-      capability_schema_version: 1,
-      state: "active",
-    }]);
+      {
+        engine: "codex",
+        provider_id: "codex",
+        upstream_model_id: "qwen3.8-max",
+        context_window: 983_616,
+        capability_profile: {
+          supports_vision: true,
+          reasoning: {
+            supported: ["low", "medium", "xhigh"],
+            codex_model_default: "xhigh",
+          },
+          ccb: { capability_zero: false, supports_thinking: false },
+        },
+        capability_schema_version: 1,
+        state: "active",
+      },
+    ]);
 
     const pricing = await query<{
       model_id: string;
@@ -699,11 +718,12 @@ describe("migrate.runMigrations", () => {
       enabled: boolean;
       sort_order: number;
       visibility: string;
+      default_effort: string | null;
     }>(
       `SELECT model_id, display_name,
               input_per_mtok::text, output_per_mtok::text,
               cache_read_per_mtok::text, cache_write_per_mtok::text,
-              multiplier::text, enabled, sort_order, visibility
+              multiplier::text, enabled, sort_order, visibility, default_effort
          FROM model_pricing
         WHERE model_id IN ('qwen3.7-max', 'qwen3.8-max')
         ORDER BY model_id`,
@@ -724,6 +744,7 @@ describe("migrate.runMigrations", () => {
     assert.equal(target.display_name, "Qwen3.8 Max");
     assert.equal(target.sort_order, 88);
     assert.equal(target.visibility, "admin");
+    assert.equal(target.default_effort, "xhigh");
 
     const cache = new PricingCache();
     await cache.load();
@@ -740,19 +761,31 @@ describe("migrate.runMigrations", () => {
       await cache.shutdown();
     }
 
-    await query(
-      `UPDATE model_pricing
-          SET visibility = 'public'
-        WHERE model_id = 'qwen3.8-max'`,
-    );
     const migrationSql = await readFile(
-      new URL("../db/migrations/0197_bailian_qwen38_max.sql", import.meta.url),
+      new URL("../db/migrations/0199_qwen38_codex_responses.sql", import.meta.url),
       "utf8",
+    );
+    await query(migrationSql);
+    const active = await query<{ lock_version: number }>(
+      `SELECT lock_version FROM model_catalog
+        WHERE model_id = 'qwen3.8-max' AND state = 'active'`,
+    );
+    await query(
+      `SELECT fn_model_switch_version(
+         'qwen3.8-max', 'ccb', 'bailian', 'qwen3.8-max', 983616,
+         '{
+           "supports_vision": true,
+           "reasoning": { "supported": [], "codex_model_default": null },
+           "ccb": { "capability_zero": true, "supports_thinking": true }
+         }'::jsonb,
+         1, NULL, $1
+       )`,
+      [active.rows[0].lock_version],
     );
     await assert.rejects(
       query(migrationSql),
-      /0197 qwen3.8-max pricing copy verification failed/,
-      "reapplying 0197 must fail closed when the target pricing row has drifted",
+      /0199 qwen3.8-max catalog predecessor\/terminal verification failed/,
+      "reapplying 0199 must fail closed when catalog history/current state drifted",
     );
   });
 

@@ -53,15 +53,17 @@ function countStageVersionCalls(sql: string): number {
 
 describe('迁移文件 capability_profile ↔ parseCapabilityProfile 契约', () => {
   const files = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql'))
-  // 只审"直接往 model_catalog 写 profile"的迁移(fn_model_stage_version / INSERT INTO
-  // model_catalog 的调用点);其余 jsonb 字面量(别表)不适用本契约。
+  // 只审"直接往 model_catalog 写 profile"的迁移(fn_model_stage_version /
+  // fn_model_switch_version / INSERT INTO model_catalog 的调用点);其余 jsonb 字面量
+  // (别表)不适用本契约。
   const candidates = files.filter((f) => {
     const sql = readFileSync(path.join(MIGRATIONS_DIR, f), 'utf8')
-    return /fn_model_stage_version|INSERT INTO model_catalog/i.test(sql)
+    return /fn_model_(?:stage|switch)_version|INSERT INTO model_catalog/i.test(sql)
   })
 
   test('候选迁移集非空(0160 起适用;找不到=过滤器坏了)', () => {
     assert.ok(candidates.includes('0160_moonshot_kimi_k3.sql'))
+    assert.ok(candidates.includes('0199_qwen38_codex_responses.sql'))
   })
 
   for (const f of candidates) {
@@ -104,6 +106,9 @@ describe('迁移文件 capability_profile ↔ parseCapabilityProfile 契约', ()
       if (f === '0160_moonshot_kimi_k3.sql') {
         assert.ok(literals.length > 0, '0160 的 profile 字面量必须被本契约覆盖')
         assert.equal(callCount, 1, '0160 应恰有 1 次 fn_model_stage_version 调用(计数器基准锚)')
+      }
+      if (f === '0199_qwen38_codex_responses.sql') {
+        assert.ok(literals.length > 0, '0199 的 Codex profile 字面量必须被本契约覆盖')
       }
     })
   }

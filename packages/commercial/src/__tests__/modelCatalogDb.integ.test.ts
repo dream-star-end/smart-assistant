@@ -127,6 +127,7 @@ beforeEach(async () => {
  * codex 型号:平台无 context window 常量 → NULL(不臆造)。
  */
 function expectedContextWindow(modelId: string): number | null {
+  if (modelId === "qwen3.8-max") return 983_616;
   if (isCodexEngineModel(modelId)) return null;
   const m = modelId.trim().toLowerCase();
   if (m === "minimax-m3") return 512_000;
@@ -139,8 +140,8 @@ function expectedContextWindow(modelId: string): number | null {
   return 200_000;
 }
 
-describe("0143 回填 == protocol 常量", () => {
-  test("每个 model_pricing 行都有唯一 live catalog 行,engine/provider/context/capability 与 protocol 逐一等价", async (t) => {
+describe("0143 回填 + 后续 catalog engine 迁移", () => {
+  test("每个 model_pricing 行都有唯一 live catalog 行，静态基线与 protocol 等价、显式 engine 迁移匹配 catalog 终态", async (t) => {
     if (skipIfNoPg(t)) return;
 
     const rows = await query<{
@@ -166,7 +167,10 @@ describe("0143 回填 == protocol 常量", () => {
 
     for (const r of rows.rows) {
       const id = r.model_id;
-      const codex = isCodexEngineModel(id);
+      // 0199 有意只通过签名 catalog authority 把正式 qwen3.8-max 切到 Codex；
+      // baked registry 保持 0197 回退地板语义，不成为第二执行权威。
+      const catalogSwitchedQwen = id === "qwen3.8-max";
+      const codex = isCodexEngineModel(id) || catalogSwitchedQwen;
       const provider = findRouteProviderForModel(id);
       const policy = modelReasoningPolicy(id);
 
@@ -182,7 +186,7 @@ describe("0143 回填 == protocol 常量", () => {
       // Ark K3 uses the platform alias kimi-k3-ark for pricing and rewrites only upstream.
       assert.equal(
         r.upstream_model_id,
-        id === "kimi-k3-ark" ? "kimi-k3" : null,
+        id === "kimi-k3-ark" ? "kimi-k3" : (catalogSwitchedQwen ? "qwen3.8-max" : null),
         `${id}: upstream_model_id`,
       );
 
@@ -192,19 +196,21 @@ describe("0143 回填 == protocol 常量", () => {
       // Luna's later verified version enables vision; other live rows mirror the provider registry.
       assert.equal(
         r.capability_profile.supports_vision,
-        id === "gpt-5.6-luna" ? true : (provider?.supportsVision ?? false),
+        id === "gpt-5.6-luna" || catalogSwitchedQwen
+          ? true
+          : (provider?.supportsVision ?? false),
         `${id}: supports_vision`,
       );
 
       // capability_profile.reasoning == protocol modelReasoningPolicy(id)
       assert.deepEqual(
         r.capability_profile.reasoning.supported,
-        [...policy.supported],
+        catalogSwitchedQwen ? ["low", "medium", "xhigh"] : [...policy.supported],
         `${id}: reasoning.supported`,
       );
       assert.equal(
         r.capability_profile.reasoning.codex_model_default,
-        policy.codexModelDefault,
+        catalogSwitchedQwen ? "xhigh" : policy.codexModelDefault,
         `${id}: codex_model_default`,
       );
 

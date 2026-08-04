@@ -111,6 +111,7 @@ mk_staging() {   # $1=dest  $2=extra_marker(用于制造不同内容)
   printf '# Memory\n' > "$d/prompts/memory-instructions.md"
   printf '# preamble\n' > "$d/prompts/codex-preamble.md"
   printf 'model_reasoning_effort = "high"\n' > "$d/etc-codex/managed_config.toml"
+  printf '{"models":[]}\n' > "$d/etc-codex/model-catalog.local.json"
   printf '# skill\n' > "$d/codex-skills/base.md"
 }
 
@@ -162,6 +163,8 @@ mk_staging "$WORK/bad6" A; rm -f "$WORK/bad6/entrypoint/platformBundle.ts"
 chk "M8 缺 entrypoint/platformBundle.ts → finalize fail-loud" "! oc_hotcfg_finalize_bundle '$WORK/bad6' 1 deadbeef 2>/dev/null"
 mk_staging "$WORK/bad7" A; rm -f "$WORK/bad7/etc-codex/managed_config.toml"
 chk "M8 缺 etc-codex/managed_config.toml → finalize fail-loud" "! oc_hotcfg_finalize_bundle '$WORK/bad7' 1 deadbeef 2>/dev/null"
+mk_staging "$WORK/bad9" A; rm -f "$WORK/bad9/etc-codex/model-catalog.local.json"
+chk "缺 etc-codex/model-catalog.local.json → finalize fail-loud" "! oc_hotcfg_finalize_bundle '$WORK/bad9' 1 deadbeef 2>/dev/null"
 mk_staging "$WORK/bad8" A; rm -f "$WORK/bad8/bin/oc-web-context.py"
 chk "R2-M2① 缺 bin/oc-web-context → finalize fail-loud" "! oc_hotcfg_finalize_bundle '$WORK/bad8' 1 deadbeef 2>/dev/null"
 
