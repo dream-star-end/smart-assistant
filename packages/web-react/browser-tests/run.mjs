@@ -1515,18 +1515,14 @@ await mobilePaymentContext.close();
 await wechatPaymentContext.close();
 screenshotPage = page;
 
-await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度", async () => {
+await check("T29 中间 API 错误不生成红卡且重试成功保持实时可见", async () => {
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`重试证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
   }
   await waitForReplay((state) => state.sending, "重试证明轮没有进入真实发送态");
-  await page.evaluate(() => window.__replayDrive.pushLegacyRetryStatus());
+  await page.evaluate(() => window.__replayDrive.pushRetryStatus());
   await replayRoot.getByText("模型繁忙，正在自动重试中（2/10）", { exact: true }).waitFor({
-    state: "visible",
-    timeout: 3000,
-  });
-  await replayRoot.getByText(replayMarkers.retrySource, { exact: true }).waitFor({
     state: "visible",
     timeout: 3000,
   });
@@ -1541,6 +1537,15 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度", asy
   }
   if (await replayRoot.getByText(/2\/3|服务重启|连接中断|请重新发送/).count()) {
     throw new Error("自动重试活动行泄漏旧预算或第二种错误 UI");
+  }
+  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+  await replayRoot.getByText(replayMarkers.retrySuccess, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await waitForReplay((state) => !state.sending, "重试成功终帧没有结束发送态");
+  if (await replayRoot.getByText(/并发会话已达上限|concurrent limit|API Error: 429/).count()) {
+    throw new Error("已恢复的中间 API 错误仍渲染为终态红卡");
   }
 });
 

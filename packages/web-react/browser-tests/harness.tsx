@@ -110,9 +110,10 @@ declare global {
       /** 剩余帧一次推完。 */
       pushRemainingFrames: () => number;
       frameCount: () => number;
-      /** Push a real rolling-predecessor retry status through ChatSocket after
-       * seeding durable recovery control rows in the same production timeline. */
-      pushLegacyRetryStatus: () => void;
+      /** Push the real retry-status frame for the current in-flight turn. */
+      pushRetryStatus: () => void;
+      /** Complete the same turn with a live text block plus final terminator. */
+      pushRetrySuccess: () => void;
     };
     /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
     __modelFixture: {
@@ -155,7 +156,8 @@ window.__replayDrive = {
   pushNextFrame: () => 0,
   pushRemainingFrames: () => 0,
   frameCount: () => 0,
-  pushLegacyRetryStatus: () => {},
+  pushRetryStatus: () => {},
+  pushRetrySuccess: () => {},
 };
 window.__runPendingDispatchJournalProbe = async () => {
   const userId = `browser-journal-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -866,6 +868,7 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
 {
   let pushed = 0;
   let frames: ReturnType<typeof replayTurnFrames> = [];
+  let activeClientMessageId: string | undefined;
   const live = (): HarnessWebSocket => {
     const ws = HarnessWebSocket.latest;
     if (!ws || ws.readyState !== 1) throw new Error("replay 传输未就绪");
@@ -913,6 +916,7 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
       if (!cmid) throw new Error("真实发送未产生 inbound.message 帧");
       ws.deliver(admittedAckFrame(cmid));
       frames = replayTurnFrames(cmid);
+      activeClientMessageId = cmid;
       pushed = 0;
       return cmid;
     },
@@ -931,43 +935,34 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
       return pushed;
     },
     frameCount: () => frames.length,
-    pushLegacyRetryStatus: () => {
+    pushRetryStatus: () => {
       const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
       if (!session || !session._sendingInFlight) {
         throw new Error("retry status 注入前没有真实在途 turn");
       }
-      const baseTs = Date.now() - 10_000;
-      session.messages.push(
-        {
-          id: "browser-retry-source",
-          role: "user",
-          text: REPLAY_MARKERS.retrySource,
-          status: "error",
-          ts: baseTs,
-          _source: "server",
-        },
-        {
-          id: "browser-retry-intermediate-error",
-          role: "assistant",
-          text: REPLAY_MARKERS.retryIntermediateError,
-          ts: baseTs + 1,
-          _source: "server",
-          _clientMessageId: "browser-retry-source",
-          _errorCode: "model_capacity",
-        },
-        {
-          id: "browser-retry-control-child",
-          role: "user",
-          text: REPLAY_MARKERS.retryControl,
-          ts: baseTs + 2,
-          _source: "server",
-          _isAutoRetry: true,
-          _automaticRecovery: true,
-          _recoveryOfClientMessageId: "browser-retry-source",
-        },
-      );
       // 真 wire → HarnessWebSocket → ChatSocket.dispatch → reducer → MessageList footer。
       live().deliver(legacyRetryStatusFrame(Date.now() + 1_000));
+    },
+    pushRetrySuccess: () => {
+      if (!activeClientMessageId) throw new Error("retry success 注入前缺 clientMessageId");
+      const base = {
+        type: "outbound.message",
+        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+        clientMessageId: activeClientMessageId,
+      };
+      live().deliver({
+        ...base,
+        frameSeq: 7,
+        blocks: [{
+          kind: "text",
+          text: REPLAY_MARKERS.retrySuccess,
+          messageId: "srv-browser-retry-success",
+        }],
+        isFinal: false,
+      });
+      live().deliver({ ...base, frameSeq: 8, blocks: [], isFinal: true });
     },
   };
 }

@@ -35,6 +35,7 @@ export const REPLAY_MARKERS = {
   retrySource: "RETRY_SOURCE_QUESTION_VISIBLE",
   retryControl: "AUTO_RETRY_CONTROL_ROW_SHOULD_HIDE",
   retryIntermediateError: "INTERMEDIATE_RETRY_ERROR_SHOULD_HIDE",
+  retrySuccess: "RETRY_SUCCESS_VISIBLE_LIVE",
 } as const;
 
 const peer = { id: REPLAY_SESSION_ID, kind: "dm" as const };
