@@ -258,6 +258,45 @@ describe("auth.login (integ)", () => {
     assert.equal(rt.rows[0].revoked_at, null);
   });
 
+  test("successful login bootstraps free subscription before the response and stays idempotent", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { userId } = await setupUser("bootstrap@example.com", "bootstrap password");
+
+    const first = await login(
+      { email: "bootstrap@example.com", password: "bootstrap password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+    const second = await login(
+      { email: "bootstrap@example.com", password: "bootstrap password", turnstile_token: "tok" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true },
+    );
+
+    assert.equal(first.user.credits, "300", "login response must not depend on a later /api/me call");
+    assert.equal(second.user.credits, "300");
+    const state = await query<{
+      settled: boolean;
+      plan_code: string;
+      period_credits: string;
+      ledger_count: string;
+    }>(
+      `SELECT u.free_bootstrap_settled AS settled,
+              us.plan_code,
+              us.period_credits::text AS period_credits,
+              (SELECT COUNT(*)::text FROM credit_ledger cl
+                WHERE cl.user_id=u.id AND cl.reason='subscription') AS ledger_count
+         FROM users u
+         JOIN user_subscriptions us ON us.user_id=u.id
+        WHERE u.id=$1`,
+      [userId],
+    );
+    assert.deepEqual(state.rows[0], {
+      settled: true,
+      plan_code: "free",
+      period_credits: "300",
+      ledger_count: "1",
+    });
+  });
+
   test("replacement login revokes a stale cookie's whole rotated family", async (t) => {
     if (skipIfNoPg(t)) return;
     await setupUser("old-tab@example.com", "old tab password");

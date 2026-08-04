@@ -30,6 +30,7 @@
 import { z } from "zod";
 import { query, tx } from "../db/queries.js";
 import { getBalanceBreakdown } from "../billing/spend.js";
+import { ensureFreeSubscription } from "../billing/subscription.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "./jwt.js";
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
@@ -369,14 +370,16 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
     return current;
   });
 
+  // 登录成功响应必须已经兑现“免费档每月 300 积分”。SPA 会直接使用本响应
+  // 建立聊天连接，不保证先访问 /api/me；仅在 /api/me 兜底会让首轮 preCheck 看到 0。
+  await ensureFreeSubscription(validatedUser.id);
+  // 双钱包（0096）：返回"总可用"= 持久钱包 + active 未过期订阅期内桶，与 /api/me 一致。
+  const totalCredits = (await getBalanceBreakdown(validatedUser.id)).total;
   const access = await signAccess(
     { sub: validatedUser.id, role: validatedUser.role },
     deps.jwtSecret,
     { now: issueNow, ttlSeconds: deps.accessTtlSeconds },
   );
-
-  // 双钱包（0096）：返回"总可用"= 持久钱包 + active 未过期订阅期内桶，与 /api/me 一致。
-  const totalCredits = (await getBalanceBreakdown(validatedUser.id)).total;
 
   return {
     user: {

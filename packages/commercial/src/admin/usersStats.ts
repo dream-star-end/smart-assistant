@@ -106,17 +106,18 @@ export async function getUsersStats(): Promise<UsersStatsResult> {
 //                   AT TIME ZONE 'Asia/Shanghai'         (今日 0 点 +08:00 → UTC)
 //   cohort_lo    := today_start - (days - 1) * INTERVAL '1 day'
 //   cohort_hi    := today_start + INTERVAL '1 day'        (含今天)
-//   cohort: users WHERE created_at >= cohort_lo AND created_at < cohort_hi AND deleted_at IS NULL
+//   cohort:真实生产用户(role='user' + signal_traffic_class='production_user')，排除 admin/E2E/canary
 //
 // 阶段定义:
 //   verified            email_verified = TRUE
 //   first_topup         EXISTS credit_ledger reason='topup' delta>0
-//   first_request       EXISTS usage_records (任意一次)
+//   first_attempt       EXISTS turn_dispatches（durable send）OR usage_records（legacy 兼容）
 //   first_success       EXISTS usage_records status='success'(至少拿到一次成功结果)
 //
-// 留存窗口(D1 = 注册次日 24h 内有 usage_records,Asia/Shanghai 自然日):
+// 留存窗口（只认 status='success'，错误/扣费失败不冒充留存）:
 //   d1_window: created_at_day + INTERVAL '1 day' .. + INTERVAL '2 days'
 //   d7_window: created_at_day + INTERVAL '7 days' .. + INTERVAL '8 days'
+//   rolling_d1_7_window: created_at_day + INTERVAL '1 day' .. + INTERVAL '8 days'
 //
 // 留存的 eligible 分母(诚实分母 — 只有 D1/D7 窗口已完整结束的 cohort 才计入):
 //   D1 窗口 [created_day+1d, created_day+2d) 完整结束 ⇔ created_day+2d ≤ tz0
@@ -134,8 +135,8 @@ export interface FunnelStatsResult {
   verified: number;
   /** cohort 中至少有 1 笔 topup(delta>0)的人数。 */
   first_topup: number;
-  /** cohort 中至少有 1 条 usage_records 的人数。 */
-  first_request: number;
+  /** cohort 中至少发起过一次真实请求（durable dispatch 或 legacy usage）的用户数。 */
+  first_attempt: number;
   /** cohort 中至少有 1 条 status='success' usage_records 的人数。 */
   first_success: number;
   /** D1 留存合格分母 — D1 窗口已完整结束的 cohort 子集(created_day < tz0 - 1d)。 */
@@ -146,6 +147,8 @@ export interface FunnelStatsResult {
   d1_retained: number;
   /** D7 留存命中(eligible_for_d7 中,在 [d+7,d+8) 自然日窗口内有 usage_records)。 */
   d7_retained: number;
+  /** 滚动 D1–D7 留存命中(eligible_for_d7 中,在 [d+1,d+8) 任一自然日成功)。 */
+  rolling_d1_7_retained: number;
 }
 
 /** allowlist days,避免 caller 传任意大窗口。 */
@@ -156,7 +159,7 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
     throw new RangeError(`getFunnelStats: days must be 7 or 30 (got ${days})`);
   }
 
-  // 一次 SQL 查完所有 8 个数 — cohort + 阶段 + 分母 + 留存。
+  // 一次 SQL 查完 cohort + 阶段 + 分母 + 精确/滚动留存。
   // - tz0 = Asia/Shanghai 今日 0 点(UTC tstamp)
   // - cohort 用 LATERAL 把每个用户的 created_at_day(自然日 0 点)算出来,
   //   方便 d1/d7 窗口直接 day + interval。
@@ -164,12 +167,13 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
     cohort_total: string;
     verified: string;
     first_topup: string;
-    first_request: string;
+    first_attempt: string;
     first_success: string;
     eligible_for_d1: string;
     eligible_for_d7: string;
     d1_retained: string;
     d7_retained: string;
+    rolling_d1_7_retained: string;
   }>(
     `WITH params AS (
        SELECT
@@ -183,6 +187,8 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
          (date_trunc('day', u.created_at AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai') AS created_day
        FROM users u, params p
        WHERE u.deleted_at IS NULL
+         AND u.role = 'user'
+         AND u.signal_traffic_class = 'production_user'
          AND u.created_at >= (p.tz0 - ((p.days - 1) || ' days')::interval)
          AND u.created_at <  (p.tz0 + INTERVAL '1 day')
      ),
@@ -195,9 +201,11 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
            SELECT 1 FROM credit_ledger cl
            WHERE cl.user_id = c.id AND cl.reason = 'topup' AND cl.delta > 0
          ) AS has_topup,
-         EXISTS (
+         (EXISTS (
+           SELECT 1 FROM turn_dispatches td WHERE td.user_id = c.id
+         ) OR EXISTS (
            SELECT 1 FROM usage_records ur WHERE ur.user_id = c.id
-         ) AS has_request,
+         )) AS has_attempt,
          EXISTS (
            SELECT 1 FROM usage_records ur
            WHERE ur.user_id = c.id AND ur.status = 'success'
@@ -205,45 +213,58 @@ export async function getFunnelStats(days: number): Promise<FunnelStatsResult> {
          EXISTS (
            SELECT 1 FROM usage_records ur
            WHERE ur.user_id = c.id
+             AND ur.status = 'success'
              AND ur.created_at >= c.created_day + INTERVAL '1 day'
              AND ur.created_at <  c.created_day + INTERVAL '2 days'
          ) AS d1_hit,
          EXISTS (
            SELECT 1 FROM usage_records ur
            WHERE ur.user_id = c.id
+             AND ur.status = 'success'
              AND ur.created_at >= c.created_day + INTERVAL '7 days'
              AND ur.created_at <  c.created_day + INTERVAL '8 days'
-         ) AS d7_hit
+         ) AS d7_hit,
+         EXISTS (
+           SELECT 1 FROM usage_records ur
+           WHERE ur.user_id = c.id
+             AND ur.status = 'success'
+             AND ur.created_at >= c.created_day + INTERVAL '1 day'
+             AND ur.created_at <  c.created_day + INTERVAL '8 days'
+         ) AS rolling_d1_7_hit
        FROM cohort c
      )
      SELECT
        COUNT(*)::text                                                 AS cohort_total,
        COUNT(*) FILTER (WHERE email_verified)::text                   AS verified,
        COUNT(*) FILTER (WHERE has_topup)::text                        AS first_topup,
-       COUNT(*) FILTER (WHERE has_request)::text                      AS first_request,
+       COUNT(*) FILTER (WHERE has_attempt)::text                      AS first_attempt,
        COUNT(*) FILTER (WHERE has_success)::text                      AS first_success,
        COUNT(*) FILTER (WHERE created_day < (SELECT tz0 - INTERVAL '1 day' FROM params))::text             AS eligible_for_d1,
        COUNT(*) FILTER (WHERE created_day < (SELECT tz0 - INTERVAL '7 days' FROM params))::text             AS eligible_for_d7,
        COUNT(*) FILTER (WHERE d1_hit AND created_day < (SELECT tz0 - INTERVAL '1 day' FROM params))::text   AS d1_retained,
-       COUNT(*) FILTER (WHERE d7_hit AND created_day < (SELECT tz0 - INTERVAL '7 days' FROM params))::text  AS d7_retained
+       COUNT(*) FILTER (WHERE d7_hit AND created_day < (SELECT tz0 - INTERVAL '7 days' FROM params))::text  AS d7_retained,
+       COUNT(*) FILTER (WHERE rolling_d1_7_hit AND created_day < (SELECT tz0 - INTERVAL '7 days' FROM params))::text
+         AS rolling_d1_7_retained
      FROM enriched`,
     [days],
   );
 
   const u = r.rows[0] ?? {
-    cohort_total: "0", verified: "0", first_topup: "0", first_request: "0", first_success: "0",
+    cohort_total: "0", verified: "0", first_topup: "0", first_attempt: "0", first_success: "0",
     eligible_for_d1: "0", eligible_for_d7: "0", d1_retained: "0", d7_retained: "0",
+    rolling_d1_7_retained: "0",
   };
   return {
     days,
     cohort_total: Number(u.cohort_total),
     verified: Number(u.verified),
     first_topup: Number(u.first_topup),
-    first_request: Number(u.first_request),
+    first_attempt: Number(u.first_attempt),
     first_success: Number(u.first_success),
     eligible_for_d1: Number(u.eligible_for_d1),
     eligible_for_d7: Number(u.eligible_for_d7),
     d1_retained: Number(u.d1_retained),
     d7_retained: Number(u.d7_retained),
+    rolling_d1_7_retained: Number(u.rolling_d1_7_retained),
   };
 }

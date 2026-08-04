@@ -31,6 +31,9 @@ test('@smoke login → 会话 → 发送 → 重登后展示完整且顺序正�
   const marker = `e2e-marker-${uniq} 请只回复两个字:收到`;
   track(sid);
 
+  const login = await api.login();
+  expect(BigInt(login.credits), '登录响应必须已有可用额度，不依赖后续 /api/me').toBeGreaterThan(0n);
+
   // ── 预建会话(控制 id + 唯一标题,便于列表定位与清理)。turn 本身走真实 UI 发送。
   const put = await api.putSession(token, sid, { title, model: cfg.model });
   expect(put.ok, `putSession 失败: ${put.status} ${put.text.slice(0, 160)}`).toBeTruthy();
