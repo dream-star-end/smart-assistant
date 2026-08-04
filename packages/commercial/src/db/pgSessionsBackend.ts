@@ -4521,10 +4521,28 @@ async function readUnifiedTimelineTapeHeads(
          JOIN LATERAL (
            SELECT msg_id,ordinal,role,ts,content_sha256,payload,visible_payload,
                   visible_content_sha256
-             FROM client_session_turn_tape_records
-            WHERE session_id=$1 AND user_id=$2 AND tape_id=requested.tape_id
-              AND ordinal < requested.before_ordinal
-              AND role <> 'runtime-event'
+             FROM client_session_turn_tape_records r
+            WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=requested.tape_id
+              AND r.ordinal < requested.before_ordinal
+              AND r.role <> 'runtime-event'
+              -- SessionManager persists every retry attempt. Once a later
+              -- assistant result exists, the earlier provider API error is
+              -- audit evidence rather than a browser conversation record.
+              AND NOT (
+                r.role='assistant'
+                AND EXISTS (
+                  SELECT 1 FROM client_session_turn_tape_model_records failed
+                   WHERE failed.session_id=r.session_id AND failed.user_id=r.user_id
+                     AND failed.tape_id=r.tape_id AND failed.physical_ordinal=r.ordinal
+                     AND failed.role='assistant' AND failed.semantic_text LIKE 'API Error:%'
+                )
+                AND EXISTS (
+                  SELECT 1 FROM client_session_turn_tape_model_records recovered
+                   WHERE recovered.session_id=r.session_id AND recovered.user_id=r.user_id
+                     AND recovered.tape_id=r.tape_id AND recovered.physical_ordinal > r.ordinal
+                     AND recovered.role='assistant' AND recovered.semantic_text NOT LIKE 'API Error:%'
+                )
+              )
             ORDER BY ordinal DESC
             LIMIT $5
          ) r ON TRUE
