@@ -66,8 +66,6 @@ import {
   contextRebuiltNotice,
   INTERRUPTED_CONTINUE_DISPLAY,
   INTERRUPTED_CONTINUE_PROMPT,
-  RESTART_CONTINUE_DISPLAY,
-  RESTART_CONTINUE_PROMPT,
   backoffDelay,
   type ChatStatusClass,
   classifyClose,
@@ -116,11 +114,14 @@ import type {
 } from "./frames";
 import { incidentStore } from "../incidentStore";
 import {
+  AUTOMATIC_TURN_RETRY_MAX,
   assessTurnRecoveryTape,
   DEFAULT_CODEX_ENGINE_MODEL,
   isClientMessageId,
   normalizeTurnErrorCode,
+  maxAutomaticTurnRetryAttempt,
   supportsAutomaticTurnRecovery,
+  turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from "@openclaude/protocol";
 import type { RefreshOutcome } from "../types";
@@ -218,6 +219,9 @@ export type InterruptedContinuationTarget = {
   mode: "checkpoint" | "replay";
   clientMessageId: string;
   idempotencyKey: string;
+  rootClientMessageId?: string;
+  attempt?: number;
+  max?: number;
 };
 
 function baseTurnRecoveryTarget(
@@ -241,19 +245,15 @@ function baseTurnRecoveryTarget(
   if (messages.slice(userIndex + 1).some((message) => message.role === "user")) {
     return undefined;
   }
-  const identity = interruptedContinuationIdentity(sessionId, interruptedClientMessageId);
-  if (
-    messages.some(
-      (message) =>
-        message.id === identity.clientMessageId ||
-        message._idem === identity.idempotencyKey ||
-        message._continuationOfClientMessageId === interruptedClientMessageId ||
-        message._recoveryOfClientMessageId === interruptedClientMessageId,
-    )
-  ) {
-    return undefined;
-  }
   return { user, error, rows: messages.slice(userIndex + 1, errorIndex) };
+}
+
+function recoveryIdentityAlreadyExists(
+  messages: ChatMessage[],
+  identity: { clientMessageId: string; idempotencyKey: string },
+): boolean {
+  return messages.some((message) =>
+    message.id === identity.clientMessageId || message._idem === identity.idempotencyKey);
 }
 
 /** Manual fallback for a durable interrupted turn. It stays visible when an
@@ -269,16 +269,18 @@ export function interruptedContinuationTarget(
     (message) => message._source === "server" || !!message._turnTapeId,
   );
   if (assessTurnRecoveryTape(durableRows).mode !== "checkpoint") return undefined;
+  const identity = interruptedContinuationIdentity(sessionId, base.user.id);
+  if (recoveryIdentityAlreadyExists(messages, identity)) return undefined;
   return {
     user: base.user,
     error: base.error,
     mode: "checkpoint",
-    ...interruptedContinuationIdentity(sessionId, base.user.id),
+    ...identity,
   };
 }
 
-/** Automatic recovery is deliberately stricter than the manual CTA: exact
- * durable rows only, one outer hop, and no unresolved tool/permission state. */
+/** Automatic recovery is deliberately stricter than the manual CTA: every
+ * hop rechecks exact durable rows and advances one shared 1..10 lineage. */
 export function automaticTurnRecoveryTarget(
   messages: ChatMessage[],
   error: ChatMessage,
@@ -287,7 +289,6 @@ export function automaticTurnRecoveryTarget(
   const base = baseTurnRecoveryTarget(messages, error, sessionId);
   if (
     !base ||
-    base.user._automaticRecovery === true ||
     base.user._automaticRecoveryAttempted === true ||
     (base.user._source !== "server" && !base.user._turnTapeId)
   ) {
@@ -305,11 +306,42 @@ export function automaticTurnRecoveryTarget(
   ) {
     return undefined;
   }
+  const rootClientMessageId = isClientMessageId(base.user._automaticRecoveryRootClientMessageId)
+    ? base.user._automaticRecoveryRootClientMessageId
+    : base.user._automaticRecovery === true && isClientMessageId(base.user._recoveryOfClientMessageId)
+      ? base.user._recoveryOfClientMessageId
+      : base.user.id;
+  if (!isClientMessageId(rootClientMessageId)) return undefined;
+  const sourceAttempt = typeof base.user._automaticRecoveryAttempt === "number" &&
+      Number.isSafeInteger(base.user._automaticRecoveryAttempt) &&
+      base.user._automaticRecoveryAttempt >= 1
+    ? base.user._automaticRecoveryAttempt
+    : base.user._automaticRecovery === true
+      ? 1
+      : 0;
+  const terminalAttempt =
+    error._automaticRetryRootClientMessageId === rootClientMessageId &&
+    error._automaticRetryMax === AUTOMATIC_TURN_RETRY_MAX &&
+    Number.isSafeInteger(error._automaticRetryAttempt)
+      ? Number(error._automaticRetryAttempt)
+      : 0;
+  const currentAttempt = Math.max(
+    sourceAttempt,
+    terminalAttempt,
+    maxAutomaticTurnRetryAttempt(durableRows, rootClientMessageId),
+  );
+  if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return undefined;
+  const attempt = currentAttempt + 1;
+  const identity = turnRecoveryAttemptIdentity(sessionId, rootClientMessageId, attempt);
+  if (recoveryIdentityAlreadyExists(messages, identity)) return undefined;
   return {
     user: base.user,
     error: base.error,
     mode,
-    ...interruptedContinuationIdentity(sessionId, base.user.id),
+    ...identity,
+    rootClientMessageId,
+    attempt,
+    max: AUTOMATIC_TURN_RETRY_MAX,
   };
 }
 
@@ -1122,9 +1154,6 @@ export class ChatSocket {
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
-      },
-      scheduleRestartContinue: (sessId) => {
-        setTimeout(() => this.autoContinueAfterRestart(sessId), 0);
       },
       scheduleAutomaticRecovery: (sessId, clientMessageId) => {
         setTimeout(() => void this.autoRecoverTerminalTurn(sessId, clientMessageId), 0);
@@ -2887,11 +2916,20 @@ export class ChatSocket {
       ...(replay?.media ? { media: replay.media } : {}),
       ...(replay?.imageEdit ? { imageEdit: replay.imageEdit } : {}),
       ...(replay?.replyTo ? { replyTo: replay.replyTo } : {}),
-      recovery: {
-        sourceClientMessageId: target.user.id,
-        mode: target.mode,
-        automatic,
-      },
+      recovery: automatic
+        ? {
+            sourceClientMessageId: target.user.id,
+            mode: target.mode,
+            automatic: true,
+            rootClientMessageId: target.rootClientMessageId!,
+            attempt: target.attempt!,
+            max: AUTOMATIC_TURN_RETRY_MAX,
+          }
+        : {
+            sourceClientMessageId: target.user.id,
+            mode: target.mode,
+            automatic: false,
+          },
     };
     const payload: InboundMessage = {
       type: "inbound.message",
@@ -2926,7 +2964,22 @@ export class ChatSocket {
       _recoveryOfClientMessageId: target.user.id,
       _recoveryMode: target.mode,
       _automaticRecovery: automatic,
+      ...(automatic
+        ? {
+            _automaticRecoveryRootClientMessageId: target.rootClientMessageId,
+            _automaticRecoveryAttempt: target.attempt,
+            _automaticRecoveryMax: AUTOMATIC_TURN_RETRY_MAX,
+          }
+        : {}),
     });
+    if (automatic && target.attempt) {
+      sess._turnStatus = {
+        kind: "retrying",
+        attempt: target.attempt,
+        max: AUTOMATIC_TURN_RETRY_MAX,
+        retryAt: Date.now(),
+      };
+    }
     sess._lastRouting = { ...routing };
     if (replay?.imageEdit) {
       this.ensureGenPlaceholder(sess, replay.imageEdit, true, userMsg.id);
@@ -3329,65 +3382,6 @@ export class ChatSocket {
       msg._behavior = p.behavior;
     }
     this.scheduleNotify();
-  }
-
-  // ═══════════════ 服务重启中断 → 自动续写(§7 变体)═══════════════
-  //
-  // 容器的模型调用经 master 内部代理,master 部署重启会掐断生成中的上游流,容器
-  // 合成 meta.interrupted='service_restart' 的 isFinal。此处自动续写被截断的回复:
-  //  - 仅当被打断的助手消息**已有内容**(partial 非空)且 10 分钟内 —— 空 turn 走
-  //    原「请重新发送」提示,老会话的迟到中断帧不触发;
-  //  - 确定性幂等键(autocont-restart-<sess>-<msgId>):双 tab/重放只执行一次,
-  //    dedup ack 复用既有清理链路。
-  private restartContinued = new Set<string>();
-  private autoContinueAfterRestart(sessId: string): void {
-    const sess = this.sessions.get(sessId);
-    if (!sess || sess._sendingInFlight || sess._dispatchPaused) return;
-    if (!(this.ws && this.ws.readyState === 1 && this.relayReady)) return;
-    const target = [...sess.messages]
-      .reverse()
-      .find((m) => m && m.role === "assistant" && !m._emptyTurn && (m.text ?? "").trim().length > 0);
-    if (!target) return; // 没有被截断的内容 → 保持"请重新发送"提示
-    if (
-      target._clientMessageId &&
-      sess._cancelledAutomaticRecoveryIds?.[target._clientMessageId] === true
-    ) {
-      return;
-    }
-    if (typeof target.ts === "number" && Date.now() - target.ts > 10 * 60_000) return;
-    const idem = `autocont-restart-${sessId}-${target.id}`;
-    if (this.restartContinued.has(idem)) return;
-    this.restartContinued.add(idem);
-    // 复用被中断 turn 的路由字段(model/teamMode/effort):缺了它桥按默认模型分类,
-    // 暖 codex 会话的续写会被 CODEX_BILLING_GUARD fail-closed 拒绝(2026-07-07 事故)。
-    const routing = sess._lastRouting;
-    const payload: InboundMessage = {
-      type: "inbound.message",
-      idempotencyKey: idem,
-      channel: "webchat",
-      peer: { id: sess.id, kind: "dm" },
-      agentId: sess.agentId || this.deps.defaultAgentId || "main",
-      content: { text: RESTART_CONTINUE_PROMPT },
-      ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
-      ...(routing?.model ? { model: routing.model } : {}),
-      ...(routing?.teamMode ? { teamMode: true } : {}),
-      ts: Date.now(),
-    };
-    const userMsg = addMessage(sess, "user", RESTART_CONTINUE_DISPLAY, {
-      status: "sending",
-      _isAutoRetry: true,
-      _automaticRecovery: true,
-      ...(target._clientMessageId
-        ? {
-            _recoveryOfClientMessageId: target._clientMessageId,
-            _continuationOfClientMessageId: target._clientMessageId,
-          }
-        : {}),
-      _modelText: RESTART_CONTINUE_PROMPT,
-      _idem: idem,
-    });
-    payload.clientMessageId = userMsg.id;
-    this.dispatchPayload(sess, userMsg, payload);
   }
 
   // ═══════════════ 单次 auto-continue（确定性 idempotencyKey，§7）═══════════════

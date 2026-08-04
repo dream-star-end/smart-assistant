@@ -24,6 +24,7 @@ import {
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import type {
+  AutomaticRetryState,
   CollabAgentPolicy,
   EngineAdapter,
   EngineTurnRun,
@@ -50,6 +51,8 @@ import {
 } from './v3MasterSink.js'
 import { failClosedOnRunningCasMiss } from './turnDispatchInbox.js'
 import {
+  AUTOMATIC_TURN_RETRY_MAX,
+  assessTurnRecoveryTape,
   type CallTokenUsageSnapshot,
   AUTHORITY_TURN_MAX_LIFETIME_MS,
   modelHistoryRoleLabel,
@@ -3112,6 +3115,8 @@ export class SessionManager {
       }
       /** Token returned by beginPromptQueueExecutionFence(). */
       queueExecutionFence?: PromptQueueExecutionFence
+      /** Shared browser/master/gateway automatic retry lineage. */
+      automaticRetryState?: AutomaticRetryState
     },
   ): Promise<void> {
     if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
@@ -3535,6 +3540,7 @@ export class SessionManager {
         opts?.queueLifecycle,
         logicalTurnAbort.signal,
         contextOverflowRetryInputs,
+        opts?.automaticRetryState,
       )
       try {
         await Promise.race([
@@ -3689,8 +3695,13 @@ export class SessionManager {
     /** Fresh-thread prompts with progressively smaller exact history suffixes.
      * Used only after a real Codex context-window rejection. */
     contextOverflowRetryInputs: string[] = [],
+    automaticRetryState?: AutomaticRetryState,
   ): Promise<void> {
-    const MAX_RETRIES = 3
+    const retryState: AutomaticRetryState = automaticRetryState ?? {
+      rootClientMessageId: clientMessageId ?? session.sessionKey,
+      attempt: 0,
+      max: AUTOMATIC_TURN_RETRY_MAX,
+    }
     // PHANTOM_TURN 用独立计数器,不和 transient 共用 attempt budget。
     // 第 0 次 phantom → 重启子进程 + retry 1 次;第 1 次还是 phantom → 终态 error,不再重试。
     let phantomRetryUsed = false
@@ -3815,30 +3826,42 @@ export class SessionManager {
     const retryStructuredBlocks: Array<Record<string, unknown>> = []
     let retryInput = userTextOrBlocks
     let contextOverflowRetryIndex = 0
-    const emitRetryStatus = (text: string, code: string): void => {
-      const block: OutboundContentBlock = {
-        kind: 'text',
-        text,
-        messageId: assistantMessageId,
-      }
+    const canRetry = (): boolean => retryState.attempt < retryState.max
+    const emitRetryStatus = (code: string, delayMs = 0): boolean => {
+      if (!canRetry()) return false
+      retryState.attempt += 1
       const ordinal = takeDurableEventOrdinal(session)
       const observedAt = Date.now()
-      retryAssistantSegments.push({
-        index: retryAssistantSegments.length,
-        text,
-        ts: observedAt,
-        eventOrdinal: ordinal,
-      })
       retryRuntimeEvents.push({
         ordinal,
         observedAt,
         source: 'gateway',
-        payload: { type: 'retry_status', code, event: { kind: 'block', block } },
+        payload: {
+          type: 'retry_status',
+          code,
+          rootClientMessageId: retryState.rootClientMessageId,
+          attempt: retryState.attempt,
+          max: retryState.max,
+        },
       })
-      onEvent({ kind: 'block', block })
+      onEvent({
+        kind: 'turn_status',
+        status: {
+          status: 'retrying',
+          retry: {
+            attempt: retryState.attempt,
+            max: retryState.max,
+            delayMs,
+            retryAt: Date.now() + delayMs,
+          },
+        },
+      })
+      return true
     }
+    const clearRetryStatus = (): void => onEvent({ kind: 'turn_status', status: null })
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    let attemptOrdinal = 0
+    for (;;) {
       throwIfLogicalTurnCancelled(logicalTurnSignal)
       try {
         await this._runOneTurn(
@@ -3860,10 +3883,11 @@ export class SessionManager {
           retryTools,
           retryStructuredBlocks,
           queueLifecycle?.queueTurn === true,
-          attempt < MAX_RETRIES,
+          canRetry(),
           !phantomRetryUsed,
-          attempt < MAX_RETRIES,
-          attempt,
+          canRetry(),
+          attemptOrdinal,
+          retryState,
         )
         return // success
       } catch (err: any) {
@@ -3886,54 +3910,20 @@ export class SessionManager {
           await session.runner.shutdown()
           throwIfLogicalTurnCancelled(logicalTurnSignal)
           if (phantomRetryUsed) {
-            // New adapters persist and resolve the terminal phantom inside
-            // _runOneTurn. Keep a visible fallback for legacy test doubles.
-            emitRetryStatus(
-              '\n\nCCB 子进程持续返回空响应,已重启子进程。\n',
-              'PHANTOM_TERMINAL',
-            )
             return
           }
+          if (!canRetry()) throw err
           phantomRetryUsed = true
-          emitRetryStatus(
-            '\n\n🔄 CCB 子进程返回空响应(未调模型),已重启子进程并自动重试...\n',
-            'PHANTOM_RETRY',
-          )
-          // Don't consume transient-retry budget on a phantom retry. The for-loop's
-          // `attempt++` would otherwise eat one slot from MAX_RETRIES (originally
-          // intended for 529/503/rate-limit), which would silently shorten the
-          // retry budget for any subsequent transient error in this turn.
-          attempt--
+          emitRetryStatus('PHANTOM_RETRY')
+          clearRetryStatus()
+          attemptOrdinal += 1
           continue
         }
 
-        // Auth error (401): refresh credentials and restart subprocess
+        // Authentication/user-policy failures require explicit user action.
+        // Never fold them into the model-busy automatic retry loop.
         if (/AUTH_ERROR/i.test(msg)) {
-          log.warn('auth error, refreshing credentials and restarting subprocess', {
-            sessionKey: session.sessionKey,
-            attempt: attempt + 1,
-            ...(traceId ? { traceId } : {}),
-          })
-          // Trigger immediate token refresh via gateway callback
-          if (this.onAuthError) {
-            try { await this.onAuthError() } catch (e) {
-              log.error(
-                'onAuthError callback failed',
-                { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
-                e as Error,
-              )
-            }
-          }
-          // Shutdown subprocess — next submit() auto-restarts with fresh config.
-          // Runner 'spawn' listener resets _lastCcbCumulativeCost automatically.
-          await session.runner.shutdown()
-          throwIfLogicalTurnCancelled(logicalTurnSignal)
-          if (attempt >= MAX_RETRIES) throw err
-          emitRetryStatus(
-            '\n\n🔄 认证已过期,正在刷新凭据并重试...\n',
-            'AUTH_RETRY',
-          )
-          continue
+          throw err
         }
 
         const errorClass = classifyRunError(msg).code
@@ -3943,7 +3933,7 @@ export class SessionManager {
         if (
           errorClass === 'context_too_long' &&
           session.providerTag === 'codex' &&
-          attempt < MAX_RETRIES &&
+          canRetry() &&
           contextOverflowRetryIndex < contextOverflowRetryInputs.length
         ) {
           contextOverflowRetryIndex += 1
@@ -3951,13 +3941,12 @@ export class SessionManager {
           log.warn('codex context window exhausted; rebuilding with smaller history', {
             sessionKey: session.sessionKey,
             attempt: contextOverflowRetryIndex,
-            maxRetries: MAX_RETRIES,
+            maxRetries: retryState.max,
             ...(traceId ? { traceId } : {}),
           })
-          emitRetryStatus(
-            `\n\n🧭 会话上下文较长，正在整理历史并继续 (${contextOverflowRetryIndex}/${MAX_RETRIES})...\n`,
-            'CONTEXT_REBUILD_RETRY',
-          )
+          emitRetryStatus('CONTEXT_REBUILD_RETRY')
+          clearRetryStatus()
+          attemptOrdinal += 1
           continue
         }
 
@@ -3965,30 +3954,32 @@ export class SessionManager {
         const isTransient =
           TRANSIENT_RETRY_ERROR_CODES.has(errorClass) ||
           /AbortError|operation was aborted|timed?\s*out/i.test(msg)
-        if (!isTransient || attempt >= MAX_RETRIES) throw err
-        const delay = this._transientRetryDelayMs(attempt)
+        if (!isTransient || !canRetry()) throw err
+        const delay = this._transientRetryDelayMs(retryState.attempt)
         log.warn('transient error, retrying', {
           sessionKey: session.sessionKey,
-          attempt: attempt + 1,
-          maxRetries: MAX_RETRIES,
+          attempt: retryState.attempt + 1,
+          maxRetries: retryState.max,
           delayS: Math.round(delay / 1000),
           error: msg,
           ...(traceId ? { traceId } : {}),
         })
-        emitRetryStatus(
-          `\n\n⚠️ 遇到临时错误,${Math.round(delay / 1000)}秒后自动重试 (${attempt + 1}/${MAX_RETRIES})...\n`,
-          'TRANSIENT_RETRY',
-        )
+        emitRetryStatus('TRANSIENT_RETRY', delay)
         // Match the only recovery action a user would take: continue the same
         // engine session. Codex/CC own tool and conversation continuation.
         retryInput = '继续'
-        await waitForRetryDelay(delay, logicalTurnSignal)
+        try {
+          await waitForRetryDelay(delay, logicalTurnSignal)
+        } finally {
+          clearRetryStatus()
+        }
+        attemptOrdinal += 1
       }
     }
   }
 
   private _transientRetryDelayMs(attempt: number): number {
-    return 2000 * 2 ** attempt + Math.random() * 1000
+    return Math.min(30_000, 2000 * 2 ** attempt) + Math.random() * 1000
   }
 
   // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
@@ -4045,6 +4036,7 @@ export class SessionManager {
     retryTransientErrors = false,
     /** Zero-based retry attempt; names call ids so frozen attempts never collide. */
     attemptOrdinal = 0,
+    automaticRetryState?: AutomaticRetryState,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -4182,6 +4174,45 @@ export class SessionManager {
         onEvent({ kind: 'codex_billing', ...billing })
       }
       const handleEngineEvent = (e: EngineEvent) => {
+        if (
+          e.kind === 'turn_status' &&
+          e.status &&
+          typeof e.status === 'object' &&
+          e.status.status === 'retrying'
+        ) {
+          // Codex mutates the shared counter before emitting. Native CCB
+          // api_retry has only its own local numbering, so advance it here.
+          if (session.providerTag !== 'codex' && automaticRetryState) {
+            automaticRetryState.attempt = Math.min(
+              automaticRetryState.max,
+              automaticRetryState.attempt + 1,
+            )
+          }
+          const shared = automaticRetryState ?? {
+            rootClientMessageId: clientMessageId ?? turnKey ?? session.sessionKey,
+            attempt: e.status.retry.attempt,
+            max: e.status.retry.max,
+          }
+          const retry = {
+            ...e.status.retry,
+            attempt: shared.attempt,
+            max: shared.max,
+          }
+          retryRuntimeEvents.push({
+            ordinal: takeDurableEventOrdinal(session),
+            observedAt: Date.now(),
+            source: 'gateway',
+            payload: {
+              type: 'retry_status',
+              code: session.providerTag === 'codex' ? 'CODEX_TURN_START_RETRY' : 'CCB_API_RETRY',
+              rootClientMessageId: shared.rootClientMessageId,
+              attempt: retry.attempt,
+              max: retry.max,
+            },
+          })
+          onEvent({ kind: 'turn_status', status: { status: 'retrying', retry } })
+          return
+        }
         // CCB 私有 detected 事件(原 parser onToolUse/onToolResult 回调的升格形态):
         // cron 桥接 + tool.called 指标属 engine 中立编排,在此就地消费,**不进**
         // server.ts 的 outbound 流(与旧回调语义一致)。事件与内容 block 同一条
@@ -4672,9 +4703,21 @@ export class SessionManager {
             result.thinkingSegments.length === 0 &&
             result.tools.length === 0 &&
             !contextOverflowHasUsage
+          const transientContinuationIsSafe =
+            turnPermissionCount === 0 &&
+            assessTurnRecoveryTape(
+              (result?.tools ?? []).map((tool) => ({
+                role: 'tool',
+                ...tool,
+                // TurnToolEntry omits completed for a matched result; the
+                // durable recovery contract requires an explicit terminal bit.
+                _completed: tool.completed !== false,
+              })),
+            ).checkpointSafe
           if (
             result?.isError &&
             retryTransientErrors &&
+            transientContinuationIsSafe &&
             (
               TRANSIENT_RETRY_ERROR_CODES.has(transientErrorClass) ||
               contextOverflowIsSafeToRetry
@@ -5300,6 +5343,7 @@ export class SessionManager {
         nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
         onPostTerminalRuntimeEvent,
         collabAgentPolicy,
+        automaticRetryState,
         ...(session._usageAttribution
           ? { usageAttribution: session._usageAttribution }
           : {}),

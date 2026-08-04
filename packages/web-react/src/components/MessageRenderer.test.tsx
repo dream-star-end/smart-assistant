@@ -1193,6 +1193,50 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.getByText("EXACT_LIVE_TO_COMPLETE_THINKING")).toBeInTheDocument();
   });
 
+  test("自动恢复只保留原问题、真实过程和最终结果，不展示控制 user 行或中间错误卡", () => {
+    const rows: ChatMessage[] = [
+      mk("user", { id: "retry-root", text: "原始用户问题", status: "error", ts: 1 }),
+      mk("assistant", {
+        id: "retry-intermediate-error",
+        text: "INTERMEDIATE_ERROR_SHOULD_HIDE",
+        ts: 2,
+        _source: "server",
+        _clientMessageId: "retry-root",
+        _errorCode: "model_capacity",
+      }),
+      mk("user", {
+        id: "retry-child",
+        text: "AUTO_RETRY_CONTROL_ROW_SHOULD_HIDE",
+        ts: 3,
+        _source: "server",
+        _isAutoRetry: true,
+        _automaticRecovery: true,
+        _recoveryOfClientMessageId: "retry-root",
+      }),
+      mk("thinking", {
+        id: "retry-thinking",
+        text: "恢复后的真实过程",
+        ts: 4,
+        _source: "server",
+        _clientMessageId: "retry-child",
+      }),
+      mk("assistant", {
+        id: "retry-final",
+        text: "最终恢复结果",
+        ts: 5,
+        _source: "server",
+        _clientMessageId: "retry-child",
+      }),
+    ];
+    render(<MessageList messages={rows} sending={false} cb={{}} onRespondPermission={() => {}} />);
+    expect(screen.getByText("原始用户问题")).toBeInTheDocument();
+    expect(screen.getByText("最终恢复结果")).toBeInTheDocument();
+    expect(screen.queryByText("INTERMEDIATE_ERROR_SHOULD_HIDE")).toBeNull();
+    expect(screen.queryByText("AUTO_RETRY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
+    expect(screen.getByText("恢复后的真实过程")).toBeInTheDocument();
+  });
+
   test("生产滚动容器尚未绑定时不先挂载整个超长会话", () => {
     render(
       <MessageList

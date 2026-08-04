@@ -53,6 +53,7 @@ import {
   CODEX_ENGINE_MODEL_IDS,
   PLATFORM_REASONING_EFFORTS,
   MAX_ATTACHMENTS_PER_MESSAGE,
+  AUTOMATIC_TURN_RETRY_MAX,
   isCodexEngineModel,
   isClientMessageId,
   isPersistedClientMessageId,
@@ -14667,9 +14668,30 @@ export class Gateway {
     // 据此在**模型调用前**把 inbox queued→running(同事务落 finalize 元数据),turn-end
     // tape 带 dispatchId/attemptNo。无 descriptor(本地/legacy)→ undefined,现状语义。
     const turnDispatchContext = getDispatchContext(frame as object)
+    const inboundRecovery = frame.content.recovery
+    const automaticRetryState = inboundRecovery?.automatic === true
+      ? {
+          rootClientMessageId:
+            'rootClientMessageId' in inboundRecovery
+              ? inboundRecovery.rootClientMessageId
+              : inboundRecovery.sourceClientMessageId,
+          attempt:
+            'attempt' in inboundRecovery
+              ? inboundRecovery.attempt
+              : 1,
+          max: AUTOMATIC_TURN_RETRY_MAX,
+        }
+      : safeClientMessageId
+        ? {
+            rootClientMessageId: safeClientMessageId,
+            attempt: 0,
+            max: AUTOMATIC_TURN_RETRY_MAX,
+          }
+        : undefined
     const leaderSubmitOpts = {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      ...(automaticRetryState ? { automaticRetryState } : {}),
       // DispatchTurnContext(uid/…)→ sessionManager 逻辑键形状(userId/…)。
       ...(turnDispatchContext
         ? {

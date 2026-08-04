@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 
 import {
+  AUTOMATIC_TURN_RETRY_MAX,
   isClientMessageId,
   LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID,
   type CallTokenUsageSnapshot,
@@ -759,6 +760,30 @@ export function materializeLosslessTurn(
     : `${body.sessionId}-${body.agentId}`;
   const prefix = `srv-${idPart}-t${body.turnIndex}`;
   const records: LosslessTurnRecord[] = [];
+  let terminalRetry:
+    | { rootClientMessageId: string; attempt: number; max: number }
+    | undefined;
+  for (const event of body.runtimeEvents ?? []) {
+    const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+      ? event.payload as Record<string, unknown>
+      : null;
+    if (
+      payload?.type === "retry_status" &&
+      isClientMessageId(payload.rootClientMessageId) &&
+      payload.max === AUTOMATIC_TURN_RETRY_MAX &&
+      typeof payload.attempt === "number" &&
+      Number.isSafeInteger(payload.attempt) &&
+      payload.attempt >= 1 &&
+      payload.attempt <= AUTOMATIC_TURN_RETRY_MAX &&
+      (!terminalRetry || payload.attempt > terminalRetry.attempt)
+    ) {
+      terminalRetry = {
+        rootClientMessageId: payload.rootClientMessageId,
+        attempt: payload.attempt,
+        max: AUTOMATIC_TURN_RETRY_MAX,
+      };
+    }
+  }
 
   if (
     body.thinkingSegments?.length &&
@@ -936,6 +961,11 @@ export function materializeLosslessTurn(
         ...(last && body.truncated ? { _truncated: true } : {}),
         ...(last && body.errorCode ? { _errorCode: body.errorCode } : {}),
         ...(last && body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
+        ...(last && terminalRetry ? {
+          _automaticRetryRootClientMessageId: terminalRetry.rootClientMessageId,
+          _automaticRetryAttempt: terminalRetry.attempt,
+          _automaticRetryMax: terminalRetry.max,
+        } : {}),
       }, segment.eventOrdinal));
     }
   } else if (body.text.length > 0 || body.errorDetail || body.errorCode) {
@@ -954,6 +984,11 @@ export function materializeLosslessTurn(
       ...(body.truncated ? { _truncated: true } : {}),
       ...(body.errorCode ? { _errorCode: body.errorCode } : {}),
       ...(body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
+      ...(terminalRetry ? {
+        _automaticRetryRootClientMessageId: terminalRetry.rootClientMessageId,
+        _automaticRetryAttempt: terminalRetry.attempt,
+        _automaticRetryMax: terminalRetry.max,
+      } : {}),
     }));
   }
   records.push(...assistantRecords);

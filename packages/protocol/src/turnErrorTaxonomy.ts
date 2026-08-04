@@ -203,17 +203,80 @@ function stableTurnRecoveryHash(value: string): string {
   return hash.toString(36)
 }
 
+/** First user execution is attempt 0; the platform may schedule at most ten
+ * additional, evidence-backed automatic recoveries. All retrying layers use
+ * this one wire/persistence authority so the UI never restarts at 1/10. */
+export const AUTOMATIC_TURN_RETRY_MAX = 10
+
+export function turnRecoveryAttemptIdentity(
+  sessionId: string,
+  rootClientMessageId: string,
+  attempt: number,
+): { clientMessageId: string; idempotencyKey: string } {
+  const safeAttempt = Number.isSafeInteger(attempt) && attempt >= 1 ? attempt : 1
+  // Preserve the deployed first-hop identity for rolling compatibility. Later
+  // attempts bind the immutable root plus the exact monotonic attempt.
+  const material = safeAttempt === 1
+    ? `${sessionId}\0${rootClientMessageId}`
+    : `${sessionId}\0${rootClientMessageId}\0${safeAttempt}`
+  const hash = stableTurnRecoveryHash(material)
+  return {
+    clientMessageId: `m-recover-${hash}`,
+    idempotencyKey: `recover-turn-${hash}`,
+  }
+}
+
 /** Browser/master shared deterministic identity for one recovery child of one
  * failed client turn. Durable admission, not a tab-local TTL, owns dedup. */
 export function turnRecoveryIdentity(
   sessionId: string,
   sourceClientMessageId: string,
 ): { clientMessageId: string; idempotencyKey: string } {
-  const hash = stableTurnRecoveryHash(`${sessionId}\0${sourceClientMessageId}`)
-  return {
-    clientMessageId: `m-recover-${hash}`,
-    idempotencyKey: `recover-turn-${hash}`,
+  return turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 1)
+}
+
+/** Read the highest durable retry attempt for one recovery root. Tape payloads
+ * may expose raw runtime events, hydrated rows, or the terminal assistant
+ * stamp retained when runtime events were compacted into an opaque batch. */
+export function maxAutomaticTurnRetryAttempt(
+  records: readonly unknown[],
+  rootClientMessageId: string,
+): number {
+  let maxAttempt = 0
+  const visit = (value: unknown, seen: Set<unknown>): void => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return
+    seen.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, seen)
+      return
+    }
+    const row = value as Record<string, unknown>
+    if (
+      row._automaticRetryRootClientMessageId === rootClientMessageId &&
+      row._automaticRetryMax === AUTOMATIC_TURN_RETRY_MAX &&
+      typeof row._automaticRetryAttempt === 'number' &&
+      Number.isSafeInteger(row._automaticRetryAttempt) &&
+      row._automaticRetryAttempt >= 1 &&
+      row._automaticRetryAttempt <= AUTOMATIC_TURN_RETRY_MAX
+    ) {
+      maxAttempt = Math.max(maxAttempt, row._automaticRetryAttempt)
+    }
+    if (
+      row.type === 'retry_status' &&
+      row.rootClientMessageId === rootClientMessageId &&
+      row.max === AUTOMATIC_TURN_RETRY_MAX &&
+      typeof row.attempt === 'number' &&
+      Number.isSafeInteger(row.attempt) &&
+      row.attempt >= 1 &&
+      row.attempt <= AUTOMATIC_TURN_RETRY_MAX
+    ) {
+      maxAttempt = Math.max(maxAttempt, row.attempt)
+    }
+    for (const nested of Object.values(row)) visit(nested, seen)
   }
+  const seen = new Set<unknown>()
+  for (const record of records) visit(record, seen)
+  return maxAttempt
 }
 
 const NON_TERMINAL_RECOVERY_STATES = new Set([

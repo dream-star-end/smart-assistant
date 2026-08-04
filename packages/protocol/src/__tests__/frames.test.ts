@@ -144,10 +144,25 @@ describe('InboundMessage schema', () => {
       content: { text: '模型正文\n[附件提示]', displayText: '模型正文' },
     }), true)
   })
-  it('accepts complete recovery lineage and rejects partial lineage', () => {
+  it('accepts complete retry lineage plus the rolling legacy first hop, and rejects partial lineage', () => {
     assert.equal(Value.Check(InboundMessage, {
       ...(baseInbound() as object),
       clientMessageId: 'm-recover-abc',
+      content: {
+        text: 'continue',
+        recovery: {
+          sourceClientMessageId: 'cm-source',
+          mode: 'checkpoint',
+          automatic: true,
+          rootClientMessageId: 'cm-source',
+          attempt: 2,
+          max: 10,
+        },
+      },
+    }), true)
+    assert.equal(Value.Check(InboundMessage, {
+      ...(baseInbound() as object),
+      clientMessageId: 'm-recover-legacy',
       content: {
         text: 'continue',
         recovery: {
@@ -165,6 +180,9 @@ describe('InboundMessage schema', () => {
         recovery: {
           sourceClientMessageId: 'cm-source',
           mode: 'checkpoint',
+          automatic: true,
+          rootClientMessageId: 'cm-source',
+          attempt: 2,
         },
       },
     }), false)

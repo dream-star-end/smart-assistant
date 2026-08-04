@@ -394,7 +394,7 @@ describe("applyTurnStatus retrying 判别联合", () => {
     const retryAt = Date.now() + 5000;
     applyTurnStatus(s, turnStatusFrame({ status: "retrying", retry: { attempt: 2, max: 3, delayMs: 5000, retryAt } }));
     expect(isRetryingTurnStatus(s._turnStatus)).toBe(true);
-    expect(s._turnStatus).toEqual({ kind: "retrying", attempt: 2, max: 3, retryAt });
+    expect(s._turnStatus).toEqual({ kind: "retrying", attempt: 2, max: 10, retryAt });
   });
 
   test("compacting 现状不变(字符串态)", () => {
@@ -2849,12 +2849,24 @@ describe("interruptedContinuationTarget (durable 断点续跑)", () => {
     }
   });
 
-  test("自动恢复最多一层，认证/配额等不可自动码不进入", () => {
+  test("自动恢复沿同一根单调推进至 10 次，认证/配额等不可自动码不进入", () => {
     const alreadyAutomatic = rows();
     alreadyAutomatic[0]._automaticRecovery = true;
-    expect(
-      automaticTurnRecoveryTarget(alreadyAutomatic, alreadyAutomatic[2], "s1"),
-    ).toBeUndefined();
+    alreadyAutomatic[0]._automaticRecoveryRootClientMessageId = "u-interrupted";
+    alreadyAutomatic[0]._automaticRecoveryAttempt = 1;
+    expect(automaticTurnRecoveryTarget(
+      alreadyAutomatic,
+      alreadyAutomatic[2],
+      "s1",
+    )).toMatchObject({ rootClientMessageId: "u-interrupted", attempt: 2, max: 10 });
+    alreadyAutomatic[2]._automaticRetryRootClientMessageId = "u-interrupted";
+    alreadyAutomatic[2]._automaticRetryAttempt = 10;
+    alreadyAutomatic[2]._automaticRetryMax = 10;
+    expect(automaticTurnRecoveryTarget(
+      alreadyAutomatic,
+      alreadyAutomatic[2],
+      "s1",
+    )).toBeUndefined();
 
     const auth = rows();
     auth[2]._errorCode = "auth_error";
@@ -3105,13 +3117,13 @@ describe("service_restart 合成 final：无在途流 → 不生成 phantom 中�
   // 根因：gateway 对上报 inFlight 的 warm session 补推 service_restart final；旧代码让其
   // ⚠️ text 块走进 §7 block 循环 → findOrCreateStreamingRow 新建 assistant 气泡 → 持久落库。
   // 修复：仅「本地确有在途流式内容」才当真被掐断（续写）；否则带外静默收口、绝不建气泡。
-  test("无 streamingAssistant + ⚠️ text 块（旧服务端形态）→ 不新建气泡、清发送态、不续写", () => {
+  test("无 streamingAssistant + ⚠️ text 块（旧服务端形态）→ 不新建气泡、清发送态并调度 exact 恢复核验", () => {
     const s = sess();
     addMessage(s, "user", "问题", { status: "read", ts: 1 });
     const done = addMessage(s, "assistant", "上一轮答案", { ts: 2, completedAt: 3 });
     s._sendingInFlight = true; // stale：turn 早已结束但 flag 卡住（dropped final / tool-only 卡死）
     const before = s.messages.length;
-    const scheduleRestartContinue = vi.fn();
+    const scheduleAutomaticRecovery = vi.fn();
     const onFinal = vi.fn();
     applyOutboundMessage(
       s,
@@ -3122,35 +3134,35 @@ describe("service_restart 合成 final：无在途流 → 不生成 phantom 中�
         blocks: [{ kind: "text", text: "\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。" }],
         meta: { interrupted: "service_restart" },
       }),
-      { scheduleRestartContinue, onFinal },
+      { scheduleAutomaticRecovery, onFinal },
     );
     expect(s.messages.length).toBe(before); // phantom 气泡不产生
     expect(s.messages.some((m) => (m.text ?? "").includes("上一轮对话被服务重启中断"))).toBe(false);
     expect(s._sendingInFlight).toBe(false);
-    expect(scheduleRestartContinue).not.toHaveBeenCalled();
+    expect(scheduleAutomaticRecovery).toHaveBeenCalledWith(s.id, undefined);
     expect(onFinal).toHaveBeenCalledTimes(1);
     expect(done.text).toBe("上一轮答案"); // 已完成答案不受影响
   });
 
-  test("空 blocks（新服务端对称形态）+ 无在途流 → 同样静默收口、不续写、不建气泡", () => {
+  test("空 blocks（新服务端对称形态）+ 无在途流 → 静默收口并调度 exact 恢复核验", () => {
     const s = sess();
     s._sendingInFlight = true;
     const before = s.messages.length;
-    const scheduleRestartContinue = vi.fn();
+    const scheduleAutomaticRecovery = vi.fn();
     applyOutboundMessage(
       s,
       msgFrame({ frameSeq: 1, isFinal: true, ts: 9e12, blocks: [], meta: { interrupted: "service_restart" } }),
-      { scheduleRestartContinue },
+      { scheduleAutomaticRecovery },
     );
     expect(s.messages.length).toBe(before);
     expect(s._sendingInFlight).toBe(false);
-    expect(scheduleRestartContinue).not.toHaveBeenCalled();
+    expect(scheduleAutomaticRecovery).toHaveBeenCalledWith(s.id, undefined);
   });
 
   test("双发（12ms 内两帧，双 tab/双 reconnect）→ 都被拦，仍不建任何气泡", () => {
     const s = sess();
     s._sendingInFlight = true;
-    const scheduleRestartContinue = vi.fn();
+    const scheduleAutomaticRecovery = vi.fn();
     const restartFinal = (seq: number) =>
       msgFrame({
         frameSeq: seq,
@@ -3159,10 +3171,10 @@ describe("service_restart 合成 final：无在途流 → 不生成 phantom 中�
         blocks: [{ kind: "text", text: "\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。" }],
         meta: { interrupted: "service_restart" },
       });
-    applyOutboundMessage(s, restartFinal(1), { scheduleRestartContinue });
-    applyOutboundMessage(s, restartFinal(2), { scheduleRestartContinue });
+    applyOutboundMessage(s, restartFinal(1), { scheduleAutomaticRecovery });
+    applyOutboundMessage(s, restartFinal(2), { scheduleAutomaticRecovery });
     expect(s.messages.some((m) => (m.text ?? "").includes("上一轮对话被服务重启中断"))).toBe(false);
-    expect(scheduleRestartContinue).not.toHaveBeenCalled();
+    expect(scheduleAutomaticRecovery).toHaveBeenCalledTimes(2);
   });
 
   test("有在途流式正文（真·被上游断流掐断）→ 落通用 final：调度自动续写、清发送态、正文保留", () => {
@@ -3171,25 +3183,25 @@ describe("service_restart 合成 final：无在途流 → 不生成 phantom 中�
     const streaming = addMessage(s, "assistant", "已经写了一半…", { ts: 2 });
     s._streamingAssistant = streaming;
     s._sendingInFlight = true;
-    const scheduleRestartContinue = vi.fn();
+    const scheduleAutomaticRecovery = vi.fn();
     applyOutboundMessage(
       s,
       msgFrame({ frameSeq: 1, isFinal: true, ts: 9e12, blocks: [], meta: { interrupted: "service_restart" } }),
-      { scheduleRestartContinue },
+      { scheduleAutomaticRecovery },
     );
-    expect(scheduleRestartContinue).toHaveBeenCalledWith(s.id); // 1b488863 语义不回归
+    expect(scheduleAutomaticRecovery).toHaveBeenCalledWith(s.id, undefined);
     expect(s._sendingInFlight).toBe(false);
     expect(streaming.text).toContain("已经写了一半"); // 在途正文保留
   });
 
-  test("有 queued user → 带外清扫不绑新轮、不续写、不建气泡（原语义保留）", () => {
+  test("有 queued user → 带外清扫不绑新轮、仅调度 exact 核验、不建气泡", () => {
     const s = sess();
     addMessage(s, "user", "已发", { status: "read", ts: 1 });
     const streaming = addMessage(s, "assistant", "半句", { ts: 2 });
     s._streamingAssistant = streaming;
     addMessage(s, "user", "排队中的下一条", { status: "queued", ts: 3 });
     s._sendingInFlight = true;
-    const scheduleRestartContinue = vi.fn();
+    const scheduleAutomaticRecovery = vi.fn();
     applyOutboundMessage(
       s,
       msgFrame({
@@ -3199,10 +3211,10 @@ describe("service_restart 合成 final：无在途流 → 不生成 phantom 中�
         blocks: [{ kind: "text", text: "\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。" }],
         meta: { interrupted: "service_restart" },
       }),
-      { scheduleRestartContinue },
+      { scheduleAutomaticRecovery },
     );
     expect(s._sendingInFlight).toBe(false);
-    expect(scheduleRestartContinue).not.toHaveBeenCalled(); // queued-user 分支不续写
+    expect(scheduleAutomaticRecovery).toHaveBeenCalledWith(s.id, undefined);
     expect(s.messages.some((m) => m.role === "user" && m.status === "queued")).toBe(true); // 排队消息仍在
     expect(s.messages.some((m) => (m.text ?? "").includes("上一轮对话被服务重启中断"))).toBe(false);
   });
@@ -3498,6 +3510,9 @@ describe("ChatSocket interrupted continuation", () => {
           sourceClientMessageId: "u-auto-checkpoint",
           mode: "checkpoint",
           automatic: true,
+          rootClientMessageId: "u-auto-checkpoint",
+          attempt: 1,
+          max: 10,
         },
       },
     });
@@ -3587,6 +3602,9 @@ describe("ChatSocket interrupted continuation", () => {
           sourceClientMessageId: "u-auto-replay",
           mode: "replay",
           automatic: true,
+          rootClientMessageId: "u-auto-replay",
+          attempt: 1,
+          max: 10,
         },
       },
     });
@@ -5308,7 +5326,7 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     expect(autocont.effortLevel).toBe("high");
   });
 
-  test("服务重启自动续写同样复用路由字段", () => {
+  test("服务重启 exact tape 自动恢复同样复用路由字段", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -5316,7 +5334,8 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "跑团队任务", model: "gpt-5.6-sol", teamMode: true });
-    // 有内容的助手行 + service_restart 中断 final → 触发重启续写。
+    // 模型尚未吐出首帧时恰逢部署：service_restart 必须释放旧 dispatch slot，
+    // exact sync 带回安全终态后才能把恢复子轮真正发出去。
     ws.onmessage?.({
       data: JSON.stringify({
         type: "outbound.message",
@@ -5324,31 +5343,41 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
         channel: "webchat",
         peer: { id: "s1", kind: "dm" },
         frameSeq: 1,
-        isFinal: false,
-        ts: 9e12,
-        blocks: [{ kind: "text", text: "已经写了一半的回复…" }],
-      }),
-    });
-    ws.onmessage?.({
-      data: JSON.stringify({
-        type: "outbound.message",
-        sessionKey: "agent:main:webchat:dm:s1",
-        channel: "webchat",
-        peer: { id: "s1", kind: "dm" },
-        frameSeq: 2,
         isFinal: true,
-        ts: 9e12 + 1,
+        ts: 9e12,
         blocks: [],
         meta: { interrupted: "service_restart" },
       }),
     });
+    const session = sock.sessions.get("s1")!;
+    const source = session.messages.find((message) => message.role === "user")!;
+    source._source = "server";
+    session.messages.push({
+      id: "restart-terminal",
+      role: "assistant",
+      text: "",
+      ts: 9e12 + 2,
+      _source: "server",
+      _turnTapeId: "tape-restart",
+      _clientMessageId: source.id,
+      _errorCode: "service_restart",
+    });
     vi.advanceTimersByTime(10);
+    await Promise.resolve();
+    await Promise.resolve();
     const cont = ws.sent
       .map((d) => JSON.parse(d))
-      .find((p) => typeof p.idempotencyKey === "string" && p.idempotencyKey.startsWith("autocont-restart-"));
+      .find((p) => typeof p.idempotencyKey === "string" && p.idempotencyKey.startsWith("recover-turn-"));
     expect(cont).toBeTruthy();
     expect(cont.model).toBe("gpt-5.6-sol");
     expect(cont.teamMode).toBe(true);
+    expect(cont.content.recovery).toMatchObject({
+      sourceClientMessageId: source.id,
+      rootClientMessageId: source.id,
+      attempt: 1,
+      max: 10,
+      automatic: true,
+    });
   });
 });
 

@@ -1116,7 +1116,7 @@ describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => 
     // 不产 result → 不产 final;成功的 attempt 2 产唯一一个。重发不得多发 turn 终态。
     const finalEvents = h.events.filter((e) => e.kind === "final");
     assert.equal(finalEvents.length, 1, `expected exactly one final, got ${JSON.stringify(blockKinds(h.events))}`);
-    // retrying 侧信道:一帧 retrying(attempt=2/max=3)+ 随后一帧 null 清除。
+    // 初始执行是 0；第一次额外执行是一帧 retrying(1/10)，随后 null 清除。
     const statusEvents = h.events.filter((e) => e.kind === "turn_status") as Array<{
       kind: "turn_status";
       status: unknown;
@@ -1125,9 +1125,9 @@ describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => 
     assert.deepEqual((statusEvents[0].status as { status: string; retry: { attempt: number; max: number } }).status, "retrying");
     assert.equal(
       (statusEvents[0].status as { retry: { attempt: number; max: number } }).retry.attempt,
-      2,
+      1,
     );
-    assert.equal((statusEvents[0].status as { retry: { max: number } }).retry.max, 3);
+    assert.equal((statusEvents[0].status as { retry: { max: number } }).retry.max, 10);
     assert.equal(statusEvents[1].status, null);
   });
 });

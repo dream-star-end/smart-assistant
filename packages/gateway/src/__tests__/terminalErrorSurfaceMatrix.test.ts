@@ -47,8 +47,8 @@ import { readClassifiedErrorCodes } from './helpers/classifiedErrorCodes.js'
 
 // ── 期望决策表(每个引擎可产出的 errorClass 都必须在此回答"该不该自动重试")──────
 //
-// attempts = 用户这一条消息实际发生的引擎尝试次数(1 = 不重试;4 = 初次 + 3 次自动重试,
-// MAX_RETRIES=3)。这张表是**声明**,不是从实现读的镜子:改了实现的重试集合而不改这里
+// attempts = 用户这一条消息实际发生的引擎尝试次数(1 = 不重试;11 = 初次 + 10 次自动重试)。
+// 这张表是**声明**,不是从实现读的镜子:改了实现的重试集合而不改这里
 // 就会红,改了这里则两种投递形态必须同时满足 —— 两处判定漂移由此暴露。
 interface Scenario {
   /** errorClass / classifyRunError 产出码。 */
@@ -72,19 +72,19 @@ const SCENARIOS: readonly Scenario[] = [
   {
     code: 'rate_limited',
     sample: '429 Too Many Requests',
-    attempts: 4,
+    attempts: 11,
     why: '账号限流是临时的,自动续跑比让用户手点重试更符合"不降 UX"',
   },
   {
     code: 'model_capacity',
     sample: 'Selected model is at capacity. Please try a different model.',
-    attempts: 4,
+    attempts: 11,
     why: '#229 本体:容量故障必须自动重试,而不是把红卡摔给用户',
   },
   {
     code: 'upstream_failed',
     sample: 'Anthropic returned 502 Bad Gateway',
-    attempts: 4,
+    attempts: 11,
     why: '上游 5xx 属瞬时故障',
   },
   {

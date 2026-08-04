@@ -1569,6 +1569,11 @@ export class SubprocessRunner extends EventEmitter {
         ..._buildAnthropicCustomHeadersEnv(runtime.headers),
         ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution, turnKey),
         [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
+        // SessionManager owns the one global 1..10 retry budget. CCB's native
+        // withRetry loop is per API call, so leaving it enabled can exceed the
+        // remaining turn budget after tools or a browser recovery hop. Disable
+        // it for this user turn; the outer safety-gated loop performs retries.
+        CLAUDE_CODE_MAX_RETRIES: '0',
       },
     )
 

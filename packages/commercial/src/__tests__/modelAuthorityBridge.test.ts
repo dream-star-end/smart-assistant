@@ -24,6 +24,7 @@ import {
   verifyAuthority,
   verifyTurnLease,
   assertLeaseMatchesAuthority,
+  turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from "@openclaude/protocol";
 
@@ -1205,7 +1206,7 @@ describe("bridge automatic recovery lineage", () => {
   test("valid deterministic lineage reaches atomic admission and preserves control metadata", async () => {
     const sessionId = "sess-recovery-valid";
     const sourceClientMessageId = "cm-source-valid";
-    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const identity = turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 4);
     let admittedInput: AdmitUserTurnInput | null = null;
     const rig = await startRig({
       attest: "yes",
@@ -1229,6 +1230,9 @@ describe("bridge automatic recovery lineage", () => {
             sourceClientMessageId,
             mode: "checkpoint",
             automatic: true,
+            rootClientMessageId: sourceClientMessageId,
+            attempt: 4,
+            max: 10,
           },
         },
       }));
@@ -1239,6 +1243,9 @@ describe("bridge automatic recovery lineage", () => {
         sourceClientMessageId,
         mode: "checkpoint",
         automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 4,
+        max: 10,
       });
       await waitFor(() => rig.containerSeen.some((raw) => {
         try {
