@@ -754,6 +754,35 @@
           "assertion": "T28 iPhone 支付跳 mobile_url，微信 WebView 不误导航"
         }
       ]
+    },
+    {
+      "id": "INC-20260804-DEPLOY-RETRY-RECOVERY",
+      "occurredAt": "2026-08-04",
+      "severity": "P1",
+      "symptom": "V5 部署升级中断正在运行的 Agent turn 后，旧 dispatch slot 未释放会让恢复子轮静默阻塞；同时不同重试层各自计数和展示，自动恢复不能持续且前端错误 UI 不统一。",
+      "rootFixCommit": "6ef8add7",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "服务重启 exact tape 自动恢复同样复用路由字段"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "capacity failure after a completed tool with unknown external outcome never auto-continues"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "recovery admission atomically persists lineage, deduplicates ACK loss, and accepts the next monotonic hop"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度"
+        }
+      ]
     }
   ]
 }

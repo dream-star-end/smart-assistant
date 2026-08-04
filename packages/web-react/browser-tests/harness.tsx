@@ -42,6 +42,7 @@ import {
   REPLAY_AGENT_ID,
   REPLAY_MARKERS,
   REPLAY_SESSION_ID,
+  legacyRetryStatusFrame,
   replayTurnFrames,
 } from "./fixtures/turnReplay";
 
@@ -109,6 +110,9 @@ declare global {
       /** 剩余帧一次推完。 */
       pushRemainingFrames: () => number;
       frameCount: () => number;
+      /** Push a real rolling-predecessor retry status through ChatSocket after
+       * seeding durable recovery control rows in the same production timeline. */
+      pushLegacyRetryStatus: () => void;
     };
     /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
     __modelFixture: {
@@ -151,6 +155,7 @@ window.__replayDrive = {
   pushNextFrame: () => 0,
   pushRemainingFrames: () => 0,
   frameCount: () => 0,
+  pushLegacyRetryStatus: () => {},
 };
 window.__runPendingDispatchJournalProbe = async () => {
   const userId = `browser-journal-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -824,7 +829,8 @@ function ReplayTimelineProbe() {
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const snap = useSyncExternalStore(replaySocket.subscribe, replaySocket.getSnapshot);
   void snap.version;
-  const messages = snap.sessions.get(REPLAY_SESSION_ID)?.messages ?? [];
+  const session = snap.sessions.get(REPLAY_SESSION_ID);
+  const messages = session?.messages ?? [];
   const sending = replaySocket.isSessionBusy(REPLAY_SESSION_ID);
   window.__replay.sending = sending;
   window.__replay.rows = messages.map((m) => ({ role: m.role, id: m.id }));
@@ -838,6 +844,12 @@ function ReplayTimelineProbe() {
       <MessageList
         messages={messages}
         sending={sending}
+        turnActivity={sending ? {
+          startedAt: session?._turnStartedAt ?? null,
+          lastFrameAt: session?._lastFrameAt,
+          turnStatus: session?._turnStatus ?? null,
+          agentName: "助手",
+        } : null}
         cb={{}}
         onRespondPermission={() => {}}
         scrollParent={scroller}
@@ -876,6 +888,7 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
       const ws = live();
       // relay 就绪是投递前置:没有它,消息只会停在离线队列里。
       ws.deliver(relayReadyFrame);
+      const sentBefore = window.__replay.sent.length;
       replaySocket.sendMessage({
         sessId: REPLAY_SESSION_ID,
         agentId: REPLAY_AGENT_ID,
@@ -885,7 +898,7 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
       // 从**真实发出的帧**里取 clientMessageId,而不是回读内部状态:证明发送侧也走通了。
       let cmid: string | undefined;
       for (let i = 0; i < 100 && !cmid; i++) {
-        for (const raw of window.__replay.sent) {
+        for (const raw of window.__replay.sent.slice(sentBefore)) {
           try {
             const frame = JSON.parse(raw) as { type?: string; clientMessageId?: string };
             if (frame.type === "inbound.message" && frame.clientMessageId) {
@@ -918,6 +931,44 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
       return pushed;
     },
     frameCount: () => frames.length,
+    pushLegacyRetryStatus: () => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("retry status 注入前没有真实在途 turn");
+      }
+      const baseTs = Date.now() - 10_000;
+      session.messages.push(
+        {
+          id: "browser-retry-source",
+          role: "user",
+          text: REPLAY_MARKERS.retrySource,
+          status: "error",
+          ts: baseTs,
+          _source: "server",
+        },
+        {
+          id: "browser-retry-intermediate-error",
+          role: "assistant",
+          text: REPLAY_MARKERS.retryIntermediateError,
+          ts: baseTs + 1,
+          _source: "server",
+          _clientMessageId: "browser-retry-source",
+          _errorCode: "model_capacity",
+        },
+        {
+          id: "browser-retry-control-child",
+          role: "user",
+          text: REPLAY_MARKERS.retryControl,
+          ts: baseTs + 2,
+          _source: "server",
+          _isAutoRetry: true,
+          _automaticRecovery: true,
+          _recoveryOfClientMessageId: "browser-retry-source",
+        },
+      );
+      // 真 wire → HarnessWebSocket → ChatSocket.dispatch → reducer → MessageList footer。
+      live().deliver(legacyRetryStatusFrame(Date.now() + 1_000));
+    },
   };
 }
 

@@ -1515,6 +1515,35 @@ await mobilePaymentContext.close();
 await wechatPaymentContext.close();
 screenshotPage = page;
 
+await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度", async () => {
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`重试证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  await waitForReplay((state) => state.sending, "重试证明轮没有进入真实发送态");
+  await page.evaluate(() => window.__replayDrive.pushLegacyRetryStatus());
+  await replayRoot.getByText("模型繁忙，正在自动重试中（2/10）", { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText(replayMarkers.retrySource, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  if (await replayRoot.getByText(replayMarkers.retryControl, { exact: true }).count()) {
+    throw new Error("自动恢复控制 user 行重新显示为聊天气泡");
+  }
+  if (await replayRoot.getByText(replayMarkers.retryIntermediateError, { exact: true }).count()) {
+    throw new Error("自动恢复中间错误重新显示为聊天气泡");
+  }
+  if (await replayRoot.getByLabel("生成中").count() !== 1) {
+    throw new Error("真实时间线没有且仅有一行自动重试活动 UI");
+  }
+  if (await replayRoot.getByText(/2\/3|服务重启|连接中断|请重新发送/).count()) {
+    throw new Error("自动重试活动行泄漏旧预算或第二种错误 UI");
+  }
+});
+
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({

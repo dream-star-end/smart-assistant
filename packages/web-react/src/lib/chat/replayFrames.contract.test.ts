@@ -10,12 +10,13 @@
  */
 import { Value } from "@sinclair/typebox/value";
 import { describe, expect, test } from "vitest";
-import { OutboundMessage } from "@openclaude/protocol/frames";
+import { OutboundMessage, OutboundTurnStatus } from "@openclaude/protocol/frames";
 import {
   admittedAckFrame,
   EXPECTED_TIMELINE_ROLES,
   relayReadyFrame,
   REPLAY_MARKERS,
+  legacyRetryStatusFrame,
   replayTurnFrames,
 } from "../../../browser-tests/fixtures/turnReplay";
 
@@ -78,6 +79,14 @@ describe("browser replay fixture ↔ protocol wire 契约", () => {
     const ack = admittedAckFrame(CMID);
     expect(ack).toMatchObject({ type: "outbound.ack", admitted: true, clientMessageId: CMID });
     expect(ack.idempotencyKey).toBe(`web:${CMID}:0`);
+  });
+
+  test("滚动旧 gateway 的 max=3 retry status 仍符合兼容 wire 契约", () => {
+    const frame = legacyRetryStatusFrame(Date.now() + 1_000);
+    const errors = [...Value.Errors(OutboundTurnStatus, frame)].map(
+      (e) => `${e.path}: ${e.message}`,
+    );
+    expect(errors).toEqual([]);
   });
 
   test("DOM 断言用的精确文本标记互不相同(避免断言互相误命中)", () => {

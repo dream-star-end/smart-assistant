@@ -32,6 +32,9 @@ export const REPLAY_MARKERS = {
   answerHead: "REPLAY_ANSWER_HEAD",
   answerTail: "REPLAY_ANSWER_TAIL",
   wideCode: "REPLAY_WIDE_CODE_LINE",
+  retrySource: "RETRY_SOURCE_QUESTION_VISIBLE",
+  retryControl: "AUTO_RETRY_CONTROL_ROW_SHOULD_HIDE",
+  retryIntermediateError: "INTERMEDIATE_RETRY_ERROR_SHOULD_HIDE",
 } as const;
 
 const peer = { id: REPLAY_SESSION_ID, kind: "dm" as const };
@@ -70,6 +73,19 @@ export function admittedAckFrame(clientMessageId: string): ReplayFrame {
     peer,
     clientMessageId,
     idempotencyKey: `web:${clientMessageId}:0`,
+  };
+}
+
+/** Rolling predecessor gateway retry frame: old max=3 must be accepted on wire
+ * and normalized by the current reducer/UI to the shared 10-retry budget. */
+export function legacyRetryStatusFrame(retryAt: number): ReplayFrame {
+  return {
+    type: "outbound.turn_status",
+    sessionKey: REPLAY_SESSION_KEY,
+    channel: "webchat",
+    peer,
+    status: "retrying",
+    retry: { attempt: 2, max: 3, delayMs: 1_000, retryAt },
   };
 }
 
