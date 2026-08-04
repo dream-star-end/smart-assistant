@@ -5680,6 +5680,62 @@ describe("pgSessionsBackend direct turn timeline", () => {
       "the compatibility per-tape endpoint still excludes only its separately rendered billing anchor");
   });
 
+  maybe("unified timeline hides only a recovered API Error attempt and preserves its immutable audit rows", async () => {
+    const sessionId = "s-direct-recovered-api-error";
+    const userId = "u-direct-recovered-api-error";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    const recoveredError = 'API Error: 429 {"error":{"code":"RATE_LIMITED"}}';
+    const tape = directTape(sessionId, "9".repeat(64), {
+      text: `${recoveredError}重试后的完整回答`,
+      assistantSegments: [
+        { index: 0, text: recoveredError, ts: 1_783_944_000_001, eventOrdinal: 1 },
+        { index: 1, text: "重试后的完整回答", ts: 1_783_944_000_002, eventOrdinal: 2 },
+      ],
+    });
+    await stageAndFinalize(userId, tape);
+
+    const timeline = await backend.getClientSession(sessionId, userId, { view: "timeline" });
+    assert.ok(timeline);
+    assert.deepEqual(browserVisibleTimeline(timeline.messages as MessageLike[]).map(
+      (message) => [message.role, message.text]), [
+      ["assistant", "重试后的完整回答"],
+    ]);
+    const singleUnitPage = await backend.readClientTimelinePage(sessionId, userId, null, 1);
+    assert.ok(singleUnitPage);
+    assert.deepEqual(browserVisibleTimeline(singleUnitPage.messages).map(
+      (message) => [message.role, message.text]), [["assistant", "重试后的完整回答"]]);
+    assert.equal(singleUnitPage.hasMore, false,
+      "the hidden failed attempt must not consume a pagination slot or cursor");
+
+    const rawRows = (await pool.query<{ ordinal: number; semantic_text: string }>(
+      `SELECT r.ordinal,m.semantic_text
+         FROM client_session_turn_tape_records r
+         JOIN client_session_turn_tape_model_records m
+           ON m.session_id=r.session_id AND m.user_id=r.user_id AND m.tape_id=r.tape_id
+          AND m.physical_ordinal=r.ordinal AND m.role='assistant'
+        WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3
+        ORDER BY r.ordinal`,
+      [sessionId, userId, tape.finalize.tapeId],
+    )).rows;
+    assert.deepEqual(rawRows.map((row) => row.semantic_text), [
+      recoveredError,
+      "重试后的完整回答",
+    ], "projection filtering must not delete or rewrite exact audit/model evidence");
+
+    const exhaustedSessionId = "s-direct-exhausted-api-error";
+    const exhaustedUserId = "u-direct-exhausted-api-error";
+    await backend.upsertClientSession(mkSession({ id: exhaustedSessionId, userId: exhaustedUserId }));
+    const exhausted = directTape(exhaustedSessionId, "8".repeat(64), { text: recoveredError });
+    await stageAndFinalize(exhaustedUserId, exhausted);
+    const exhaustedTimeline = await backend.getClientSession(
+      exhaustedSessionId, exhaustedUserId, { view: "timeline" },
+    );
+    assert.ok(exhaustedTimeline);
+    assert.equal(browserVisibleTimeline(exhaustedTimeline.messages as MessageLike[]).some(
+      (message) => message.role === "assistant" && message.text === recoveredError), true,
+    "an unrecovered terminal API Error remains available to the terminal error surface");
+  });
+
   maybe("transport-only continuation rows never consume logical page slots or hide the real final answer", async () => {
     const sessionId = "s-direct-runtime-flood";
     const userId = "u-direct-runtime-flood";
