@@ -85,7 +85,14 @@ type Manifest = {
   fixedLiveMatrix: Array<{ engine: string; model: string }>;
   incidents: Incident[];
 };
-type Waiver = { commit: string; reason: string; approvedBy: string; expiresAt: string };
+type Waiver = {
+  commit: string;
+  reason: string;
+  approvedBy: string;
+  expiresAt: string;
+  /** Exact P0 containment commits are immutable once production provenance is recorded. */
+  emergencyMissingTrailer?: boolean;
+};
 
 function fail(message: string): never {
   throw new Error(`[incident-regressions] ${message}`);
@@ -398,8 +405,17 @@ function checkTrailerClosure(): number {
     checked += 1;
     const trailer = /^Incident:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
     if (!trailer) {
-      fail(`${sha.slice(0, 8)} "${subject}" 触碰用户可见面但缺 trailer:`
-        + "Incident: INC-YYYYMMDD-SLUG,或 Incident: none (<理由>) 并登记 waiver");
+      const waiver = waivers.get(sha.slice(0, 8));
+      const incident = manifest.incidents.find((item) =>
+        [item.rootFixCommit, ...(item.coverageCommits ?? [])]
+          .some((candidate) => sha.startsWith(candidate))
+      );
+      if (!waiver?.emergencyMissingTrailer || incident?.severity !== "P0") {
+        fail(`${sha.slice(0, 8)} "${subject}" 触碰用户可见面但缺 trailer:`
+          + "Incident: INC-YYYYMMDD-SLUG,或仅对已登记 exact P0 containment 使用带审批的 emergencyMissingTrailer waiver");
+      }
+      if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 emergency trailer waiver 已于 ${waiver.expiresAt} 过期`);
+      continue;
     }
     if (/^none\b/.test(trailer)) {
       const waiver = waivers.get(sha.slice(0, 8));

@@ -67,6 +67,13 @@
       "reason": "exact synthetic eval 的 baseline 合成 arm 在隔离评测账号内合法写入 scratch，却被评测器误判为输入漂移；本提交只隔离并精确验证评测 scratch。无真实用户、真实用户计费或生产流量切换影响；仅隔离合成账号产生了预期且精确绑定的评测 usage/ledger，无计费异常。",
       "approvedBy": "dx 2026-08-02 指示继续直到完整上线，并以通用、多活跃用户任务做严格评测",
       "expiresAt": "2026-09-02"
+    },
+    {
+      "commit": "aa583b702d5e454801e90ff3c6b25df38e808a98",
+      "reason": "dx-declared P0 止血提交已按 emergency lane 先推送并部署，随后回填事故清单时发现该不可变生产 commit 漏写 Incident trailer；amend 会破坏已经落账的 exact production provenance。该 commit 已由 INC-20260804-RETRY-ERROR-REDCARD 的 rootFixCommit 与后续 unit/browser coverage commits 精确闭环。",
+      "approvedBy": "dx 2026-08-04 明确指令“p0问题，立刻修复并上线”",
+      "expiresAt": "2026-09-04",
+      "emergencyMissingTrailer": true
     }
   ]
 }
