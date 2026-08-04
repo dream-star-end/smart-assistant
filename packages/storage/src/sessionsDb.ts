@@ -654,6 +654,7 @@ export interface ClientSessionMeta {
   lastAt: number
   messageCount: number
   tapeTurnCount?: number
+  lastTapeSeq: number | null
   updatedAt: number
 }
 
@@ -1658,6 +1659,11 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
              WHERE tape.session_id = client_sessions.id
                AND tape.user_id = client_sessions.user_id
            ) as tape_turn_count,
+           (
+             SELECT MAX(tape_seq) FROM client_session_tape tape
+             WHERE tape.session_id = client_sessions.id
+               AND tape.user_id = client_sessions.user_id
+           ) as last_tape_seq,
            message_count + 2 * (
              SELECT COUNT(DISTINCT turn_key) FROM client_session_tape tape
              WHERE tape.session_id = client_sessions.id
@@ -1675,6 +1681,7 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
     updated_at: number
     msg_count: number
     tape_turn_count: number
+    last_tape_seq: number | null
   }>
   return rows.map((r) => ({
     id: r.id,
@@ -1685,6 +1692,7 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
     lastAt: r.last_at,
     messageCount: r.msg_count,
     tapeTurnCount: r.tape_turn_count,
+    lastTapeSeq: r.last_tape_seq,
     updatedAt: r.updated_at,
   }))
 }

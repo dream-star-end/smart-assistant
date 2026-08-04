@@ -46,6 +46,7 @@ type TestHarness = {
   _redisPendingFrames: Map<string, Map<number, unknown>>
   _redisGapTimers: Map<string, ReturnType<typeof setTimeout>>
   _sessionDeliveryChains: Map<string, Promise<void>>
+  invalidatedSessionLists: string[]
   clientsByPeer: Map<string, Set<unknown>>
   _sendStampedSessionFrame: (
     sessionKey: string,
@@ -74,11 +75,13 @@ function harness(): TestHarness {
   gw._redisGapTimers = new Map()
   gw._sessionDeliveryChains = new Map()
   gw._tapePoisoned = new Set()
+  gw.invalidatedSessionLists = []
   gw.sessions = { getByKey: () => ({ userId: 'default', _activeTurnId: 'turn-test' }) }
   gw._redisSessionBus = {
     reserveFrameSeq: async () => null,
     advanceFrameSeq: async () => null,
     publishFrame: () => {},
+    invalidateSessionList: (userId: string) => gw.invalidatedSessionLists.push(userId),
   }
   gw.log = { warn: () => {} }
   gw.clientsByPeer = new Map()
@@ -282,6 +285,11 @@ describe('permission frame ring replay', () => {
       ],
     )
     assert.equal(page?.hasMore, false)
+    assert.deepEqual(
+      gw.invalidatedSessionLists,
+      ['default'],
+      'final tape commit makes the new lastTapeSeq visible to the next list sync',
+    )
     const meta = (await listClientSessions('default')).find((item) => item.id === sessionId)
     assert.equal(meta?.tapeTurnCount, 1)
   })

@@ -42,7 +42,7 @@ import {
   maybeSyncNow,
   setSyncDeps,
   syncSessionsFromServer,
-} from './sync.js?v=12'
+} from './sync.js?v=13'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setThemeAppliedFn, setToastFn } from './theme.js'
@@ -134,7 +134,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=12'
+} from './sessions.js?v=13'
 
 // ── Messages ──
 import {
@@ -177,7 +177,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=56'
+} from './websocket.js?v=57'
 
 // ── Slash commands ──
 import {
@@ -190,7 +190,7 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=9'
+} from './commands.js?v=10'
 import { getEffortForSubmit, initEffortPicker, renderEffortPicker } from './effortMode.js?v=3'
 import {
   getGoalModeForSubmit,

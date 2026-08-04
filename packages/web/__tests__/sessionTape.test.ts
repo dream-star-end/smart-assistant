@@ -255,7 +255,7 @@ test('session tape projection restores permission settlement and workflow progre
 
 test('taped IndexedDB snapshots always rehydrate cursors after reload', () => {
   const build = new Function(
-    `${extractFunction('_copyLocalSessionRuntimeState')}\n${extractFunction('_buildSessionFromRemote')}\nreturn _buildSessionFromRemote`,
+    `${extractFunction('_copyLocalSessionRuntimeState')}\n${extractFunction('_serverTapeLastSeq')}\n${extractFunction('_buildSessionFromRemote')}\nreturn _buildSessionFromRemote`,
   )() as (remote: any, local: any, opts: { placeholder: boolean }) => any
   const remote = {
     id: 'session-reload',
