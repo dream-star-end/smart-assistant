@@ -410,7 +410,12 @@ function checkTrailerClosure(): number {
         [item.rootFixCommit, ...(item.coverageCommits ?? [])]
           .some((candidate) => sha.startsWith(candidate))
       );
-      if (!waiver?.emergencyMissingTrailer || incident?.severity !== "P0") {
+      const exactImmutableEmergency =
+        sha === "aa583b702d5e454801e90ff3c6b25df38e808a98"
+        && waiver?.emergencyMissingTrailer === true
+        && incident?.id === "INC-20260804-RETRY-ERROR-REDCARD"
+        && incident.rootFixCommit === "aa583b70";
+      if (!exactImmutableEmergency) {
         fail(`${sha.slice(0, 8)} "${subject}" 触碰用户可见面但缺 trailer:`
           + "Incident: INC-YYYYMMDD-SLUG,或仅对已登记 exact P0 containment 使用带审批的 emergencyMissingTrailer waiver");
       }

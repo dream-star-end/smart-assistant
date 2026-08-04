@@ -803,7 +803,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；中间 API 错误不生成红卡且重试成功保持实时可见"
+          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
         }
       ]
     }

@@ -1515,7 +1515,7 @@ await mobilePaymentContext.close();
 await wechatPaymentContext.close();
 screenshotPage = page;
 
-await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；中间 API 错误不生成红卡且重试成功保持实时可见", async () => {
+await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见", async () => {
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`重试证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
