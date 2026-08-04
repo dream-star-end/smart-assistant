@@ -14284,6 +14284,41 @@ export class Gateway {
     // 永远拦不到。
     let _apiErrorIntercepted = false
     let _apiErrorText = ''
+    let _pendingApiErrorFrame: (OutboundError & { _userId?: string }) | null = null
+    let _pendingApiErrorFinalized = false
+    const discardPendingApiErrorAttempt = () => {
+      _apiErrorIntercepted = false
+      _apiErrorText = ''
+      _pendingApiErrorFrame = null
+      _pendingApiErrorFinalized = false
+    }
+    const deliverPendingApiErrorTerminal = (): boolean => {
+      if (!_pendingApiErrorFrame || !_pendingApiErrorFinalized) return false
+      turnErrored = true
+      session.currentTurnStatus = null
+      this._runLog.complete(currentRun, { status: 'failed', error: _apiErrorText })
+      if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
+        this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
+      }
+      if (frame.idempotencyKey && !(frame as any)._idempotencyPreReserved) {
+        this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+      }
+      this.deliver(_pendingApiErrorFrame, liveWechatAdapter ? undefined : adapter)
+      if (liveWechatAdapter) {
+        const errBlocks = [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any]
+        this.deliver({ ...out, blocks: errBlocks, isFinal: true }, undefined)
+        enqueueLiveWechatMessage(errBlocks, true, 'error')
+      } else {
+        this.deliver(
+          { ...out, blocks: [{ kind: 'text', text: `[error] ${_apiErrorText}` }], isFinal: true },
+          adapter,
+        )
+      }
+      out.blocks.length = 0
+      aggregatedBlocks.length = 0
+      discardPendingApiErrorAttempt()
+      return true
+    }
     // 参数类型加宽为 GatewayStreamEvent(见 ccbMessageParser):error 事件可带
     // runner 预分类的 errorClass,turn_status 的 status 可为 retrying 形态。
     // SessionStreamEvent ⊆ GatewayStreamEvent,故本 handler 仍可下传给要求
@@ -14336,7 +14371,7 @@ export class Gateway {
           // Every canonical API error gets the structured UX. Unknown
           // provider text is deliberately mapped to the generic retryable
           // category; the exact string remains available only in `detail`.
-          const errFrame: OutboundError & { _userId?: string } = {
+          _pendingApiErrorFrame = {
             type: 'outbound.error',
             ..._inheritOutboundRouting(out),
             code: _cls.code === 'unknown' ? 'upstream_failed' : _cls.code,
@@ -14346,7 +14381,6 @@ export class Gateway {
             detail: _b0.text,
             isFinal: false,
           }
-          this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
           return
         }
 
@@ -14400,45 +14434,10 @@ export class Gateway {
         // 不会粘住。前端拿到 isFinal=true 自然回到空闲态,不依赖额外帧。
         session.currentTurnStatus = null
         if (_apiErrorIntercepted) {
-          // P2 债C — 已识别 API 错误 = 终态错误帧自投递,硬编排 review pass 不介入。
-          turnErrored = true
-          // 替代原 final:发 [error] text final 关闭 turn。不附 e.meta(boss
-          // 决策:错误卡不显示 cost),与 e.kind === 'error' 分支一致;runLog
-          // 也按 failed 记账,idempotency key 释放允许 client retry。
-          this._runLog.complete(currentRun, { status: 'failed', error: _apiErrorText })
-          if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
-            this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
-          }
-          if (frame.idempotencyKey && !(frame as any)._idempotencyPreReserved) {
-            this._seenIdempotencyKeys.delete(frame.idempotencyKey)
-          }
-          if (liveWechatAdapter) {
-            const errBlocks = [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any]
-            this.deliver(
-              {
-                ...out,
-                blocks: errBlocks,
-                isFinal: true,
-              },
-              undefined,
-            )
-            enqueueLiveWechatMessage(
-              errBlocks,
-              true,
-              'error',
-            )
-          } else {
-            this.deliver(
-              {
-                ...out,
-                blocks: [{ kind: 'text', text: `[error] ${_apiErrorText}` }],
-                isFinal: true,
-              },
-              adapter,
-            )
-          }
-          // 跨 turn message listener 仍持有这个闭包(供 bg-bash tail 转发),
-          // 不清空数组的话,API_ERROR 前已聚合的 block 会被钉到下次 turn 替换 listener。
+          // SessionManager 只有在完整 attempt 收尾后才能判定是否安全自动重试。
+          // 先暂存终态；若随后收到 retrying 就丢弃本次中间错误，只有整个 submit
+          // 真正结束时才向用户下发红卡和兼容 final。
+          _pendingApiErrorFinalized = true
           out.blocks.length = 0
           aggregatedBlocks.length = 0
           return
@@ -14554,6 +14553,13 @@ export class Gateway {
         // e.status 是 GatewayTurnPhase('compacting' | null | retrying 形态)。
         // session cache 直接存 phase;wire 帧按 protocol OutboundTurnStatus 判别
         // 联合展平(retrying → status:'retrying' + 平级 retry;其余 → status)。
+        if (
+          e.status &&
+          typeof e.status === 'object' &&
+          e.status.status === 'retrying'
+        ) {
+          discardPendingApiErrorAttempt()
+        }
         session.currentTurnStatus = e.status
         const turnStatusFrame = _buildTurnStatusFrame(_inheritOutboundRouting(out), e.status)
         // ts / frameSeq 由 deliver() 在 ring 落地时一并 stamp,这里不预填
@@ -14816,10 +14822,12 @@ export class Gateway {
         safeConversationMode,
         leaderSubmitOpts,
       )
+      deliverPendingApiErrorTerminal()
 
     } catch (err) {
       clientTurnThrew = true
       clientTurnError = err
+      if (deliverPendingApiErrorTerminal()) replayTerminalizedUnhandledError = true
       if (!replayTerminalizedUnhandledError) throw err
       this.log.warn('accepted turn failed after replay-safe terminal delivery', {
         sessionKey,

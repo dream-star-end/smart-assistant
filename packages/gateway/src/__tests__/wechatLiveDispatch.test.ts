@@ -210,3 +210,72 @@ test('non-WeChat adapters keep historical aggregate-on-final behavior', async ()
   assert.equal(out.isFinal, true)
   assert.deepEqual(out.blocks.map((b: any) => b.kind), ['thinking', 'tool_use', 'tool_result', 'text'])
 })
+
+test('retrying API error attempt stays non-terminal and the next successful attempt streams live', async () => {
+  const delivered: any[] = []
+  const gateway = makeGateway([
+    {
+      kind: 'block',
+      block: {
+        kind: 'text',
+        text: 'API Error: 429 {"error":{"code":"CONCURRENT_LIMIT","message":"concurrent limit reached"}}',
+      },
+    },
+    { kind: 'final', meta: { turn: 1 } },
+    {
+      kind: 'turn_status',
+      status: {
+        status: 'retrying',
+        retry: { attempt: 2, max: 10, delayMs: 1000, retryAt: 1_700_000_001_000 },
+      },
+    },
+    { kind: 'block', block: { kind: 'text', text: '重试成功' } },
+    { kind: 'final', meta: { turn: 2 } },
+  ], delivered)
+
+  await gateway.dispatchInbound(makeFrame())
+
+  assert.equal(
+    delivered.some(({ out }) => out.type === 'outbound.error'),
+    false,
+    'an intermediate failed attempt must not become a red terminal error card',
+  )
+  assert.deepEqual(
+    delivered.map(({ out }) => ({
+      type: out.type,
+      status: out.status,
+      text: out.blocks?.[0]?.text,
+      final: out.isFinal === true,
+    })),
+    [
+      { type: 'outbound.turn_status', status: 'retrying', text: undefined, final: false },
+      { type: 'outbound.message', status: undefined, text: '重试成功', final: false },
+      { type: 'outbound.message', status: undefined, text: undefined, final: true },
+    ],
+  )
+})
+
+test('exhausted API error attempt still emits the structured terminal error and final', async () => {
+  const delivered: any[] = []
+  const gateway = makeGateway([
+    {
+      kind: 'block',
+      block: {
+        kind: 'text',
+        text: 'API Error: 429 {"error":{"code":"CONCURRENT_LIMIT","message":"concurrent limit reached"}}',
+      },
+    },
+    { kind: 'final', meta: { turn: 1 } },
+  ], delivered)
+
+  await gateway.dispatchInbound(makeFrame())
+
+  assert.deepEqual(delivered.map(({ out }) => out.type), [
+    'outbound.error',
+    'outbound.message',
+  ])
+  assert.equal(delivered[0]!.out.code, 'rate_limited')
+  assert.equal(delivered[0]!.out.isFinal, false)
+  assert.equal(delivered[1]!.out.isFinal, true)
+  assert.match(delivered[1]!.out.blocks[0]!.text, /^\[error\] API Error: 429/)
+})

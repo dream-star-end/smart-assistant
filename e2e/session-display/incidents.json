@@ -783,6 +783,29 @@
           "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度"
         }
       ]
+    },
+    {
+      "id": "INC-20260804-RETRY-ERROR-REDCARD",
+      "occurredAt": "2026-08-04",
+      "severity": "P0",
+      "symptom": "CCB 上游并发容量错误本可由 SessionManager 自动重试恢复，但 gateway 在每次失败 attempt 的 final 到达时立刻向前端发送 outbound.error 红卡；随后 retrying 虽继续执行，错误卡已把本轮终态化，而且 attempt 级拦截状态未重置会吞掉后续成功正文，用户只能刷新后从持久化时间线看到结果。",
+      "rootFixCommit": "aa583b70",
+      "coverageCommits": [
+        "0ced65d4",
+        "d500d037"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/wechatLiveDispatch.test.ts",
+          "assertion": "retrying API error attempt stays non-terminal and the next successful attempt streams live"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
+        }
+      ]
     }
   ]
 }
