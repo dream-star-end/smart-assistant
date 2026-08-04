@@ -1054,6 +1054,16 @@ export function MessageList({
   // engine transport envelopes. The latter remain byte-complete in the tape;
   // their canonical immutable Agent blocks are the user-facing timeline.
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(messages);
+  // Automatic recovery rows remain in memory/IndexedDB/PG as exact lineage,
+  // but are transport controls rather than another user utterance. While a
+  // child exists, its source terminal card is likewise an intermediate state;
+  // only the final exhausted/unsafe error remains visible.
+  const automaticallyRecoveredSourceIds = new Set(
+    messages
+      .filter((message) => message.role === "user" && message._automaticRecovery === true)
+      .map((message) => message._recoveryOfClientMessageId)
+      .filter((id): id is string => typeof id === "string" && id.length > 0),
+  );
   const renderableMessages = messages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
@@ -1062,6 +1072,13 @@ export function MessageList({
       m._turnTapeProcess !== true &&
       m._timelineAuxiliary === undefined &&
       m.role !== "runtime-event" &&
+      !(m.role === "user" && m._isAutoRetry === true && m._automaticRecovery === true) &&
+      !(
+        m.role === "assistant" &&
+        !!m._errorCode &&
+        typeof m._clientMessageId === "string" &&
+        automaticallyRecoveredSourceIds.has(m._clientMessageId)
+      ) &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );

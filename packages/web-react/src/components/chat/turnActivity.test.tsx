@@ -56,16 +56,15 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByLabelText("生成中").textContent).toContain("正在压缩上下文");
   });
 
-  test("retrying → 「模型繁忙，自动重试中(第 n/m 次)」+ 秒级倒计时(软提示 warning tone)", () => {
+  test("retrying → 滚动旧 max 也统一为「模型繁忙，正在自动重试中（n/10）」", () => {
     renderTA({
       startedAt: Date.now(),
       turnStatus: { kind: "retrying", attempt: 2, max: 3, retryAt: Date.now() + 4500 },
     });
     const node = screen.getByLabelText("生成中");
     const t = node.textContent ?? "";
-    expect(t).toContain("模型繁忙，自动重试中");
-    expect(t).toContain("第 2/3 次");
-    expect(t).toMatch(/\ds 后重试/); // 倒计时秒数
+    expect(t).toContain("模型繁忙，正在自动重试中（2/10）");
+    expect(t).not.toContain("后重试");
     // 软提示走 warning 色(text-warning),不是红卡。
     expect(node.className).toContain("text-warning");
   });

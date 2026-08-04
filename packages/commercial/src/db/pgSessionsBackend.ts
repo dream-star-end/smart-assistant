@@ -45,6 +45,7 @@ import { freemem } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import { gzipSync, gunzipSync } from "node:zlib";
 import {
+  AUTOMATIC_TURN_RETRY_MAX,
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_SHA256_RE,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
@@ -55,8 +56,10 @@ import {
   exactModelHistoryTextSuffix,
   modelHistorySemanticRole,
   modelHistorySemanticText,
+  maxAutomaticTurnRetryAttempt,
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
+  turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
   type DurableCodexBilling,
@@ -1001,11 +1004,20 @@ export interface AdmitUserTurnInput {
   message: MessageLike & { id: string };
   /** Master-validated recovery lineage. The PG transaction revalidates it
    * under the same session-row lock used by ordinary user appends. */
-  recovery?: {
-    sourceClientMessageId: string;
-    mode: "checkpoint" | "replay";
-    automatic: boolean;
-  };
+  recovery?:
+    | {
+        sourceClientMessageId: string;
+        mode: "checkpoint" | "replay";
+        automatic: false;
+      }
+    | {
+        sourceClientMessageId: string;
+        mode: "checkpoint" | "replay";
+        automatic: true;
+        rootClientMessageId: string;
+        attempt: number;
+        max: typeof AUTOMATIC_TURN_RETRY_MAX;
+      };
   leaseTtlMs?: number;
   now?: number;
 }
@@ -5687,10 +5699,16 @@ export function createPgSessionsBackend(
       return withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
         let message = input.message;
         if (input.recovery) {
-          const expected = turnRecoveryIdentity(
-            input.sessionId,
-            input.recovery.sourceClientMessageId,
-          );
+          const expected = input.recovery.automatic
+            ? turnRecoveryAttemptIdentity(
+                input.sessionId,
+                input.recovery.rootClientMessageId,
+                input.recovery.attempt,
+              )
+            : turnRecoveryIdentity(
+                input.sessionId,
+                input.recovery.sourceClientMessageId,
+              );
           if (expected.clientMessageId !== input.clientMessageId) {
             return { kind: "recovery_conflict", reason: "identity_mismatch" };
           }
@@ -5719,7 +5737,12 @@ export function createPgSessionsBackend(
             if (
               existingRecovery._recoveryOfClientMessageId !== input.recovery.sourceClientMessageId ||
               existingRecovery._recoveryMode !== input.recovery.mode ||
-              existingRecovery._automaticRecovery !== input.recovery.automatic
+              existingRecovery._automaticRecovery !== input.recovery.automatic ||
+              (input.recovery.automatic && (
+                existingRecovery._automaticRecoveryRootClientMessageId !== input.recovery.rootClientMessageId ||
+                existingRecovery._automaticRecoveryAttempt !== input.recovery.attempt ||
+                existingRecovery._automaticRecoveryMax !== input.recovery.max
+              ))
             ) {
               return { kind: "recovery_conflict", reason: "identity_reused" };
             }
@@ -5728,14 +5751,41 @@ export function createPgSessionsBackend(
               _recoveryOfClientMessageId: input.recovery.sourceClientMessageId,
               _recoveryMode: input.recovery.mode,
               _automaticRecovery: input.recovery.automatic,
+              ...(input.recovery.automatic
+                ? {
+                    _automaticRecoveryRootClientMessageId: input.recovery.rootClientMessageId,
+                    _automaticRecoveryAttempt: input.recovery.attempt,
+                    _automaticRecoveryMax: input.recovery.max,
+                  }
+                : {}),
             };
           } else {
             const latestUser = [...current].reverse().find((item) => item?.role === "user");
             if (!latestUser || latestUser.id !== input.recovery.sourceClientMessageId) {
               return { kind: "recovery_conflict", reason: "source_not_latest" };
             }
-            if (input.recovery.automatic && latestUser._automaticRecovery === true) {
-              return { kind: "recovery_conflict", reason: "automatic_hop_exhausted" };
+            let automaticRoot = latestUser.id;
+            let automaticSourceAttempt = 0;
+            if (input.recovery.automatic) {
+              automaticRoot = typeof latestUser._automaticRecoveryRootClientMessageId === "string"
+                ? latestUser._automaticRecoveryRootClientMessageId
+                : latestUser._automaticRecovery === true &&
+                    typeof latestUser._recoveryOfClientMessageId === "string"
+                  ? latestUser._recoveryOfClientMessageId
+                  : latestUser.id;
+              automaticSourceAttempt = typeof latestUser._automaticRecoveryAttempt === "number" &&
+                  Number.isSafeInteger(latestUser._automaticRecoveryAttempt) &&
+                  latestUser._automaticRecoveryAttempt >= 1
+                ? latestUser._automaticRecoveryAttempt
+                : latestUser._automaticRecovery === true
+                  ? 1
+                  : 0;
+              if (
+                input.recovery.rootClientMessageId !== automaticRoot ||
+                input.recovery.max !== AUTOMATIC_TURN_RETRY_MAX
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_lineage_mismatch" };
+              }
             }
             const sourceIndex = current.lastIndexOf(latestUser);
             const recoverableTapeError = current.slice(sourceIndex + 1).some((item) =>
@@ -5778,6 +5828,7 @@ export function createPgSessionsBackend(
             ) {
               return { kind: "recovery_conflict", reason: "source_not_recoverable" };
             }
+            let authoritativeRetryAttempt = automaticSourceAttempt;
             if (finalized) {
               if (finalized.status !== "crashed" && finalized.status !== "interrupted") {
                 return { kind: "recovery_conflict", reason: "source_tape_completed" };
@@ -5804,6 +5855,12 @@ export function createPgSessionsBackend(
                 return { kind: "recovery_conflict", reason: "source_tape_malformed" };
               }
               const assessment = assessTurnRecoveryTape(records);
+              if (input.recovery.automatic) {
+                authoritativeRetryAttempt = Math.max(
+                  authoritativeRetryAttempt,
+                  maxAutomaticTurnRetryAttempt(records, automaticRoot),
+                );
+              }
               if (assessment.mode !== input.recovery.mode) {
                 return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
               }
@@ -5816,11 +5873,32 @@ export function createPgSessionsBackend(
             ) {
               return { kind: "recovery_conflict", reason: "source_not_safely_replayable" };
             }
+            if (
+              input.recovery.automatic &&
+              (
+                authoritativeRetryAttempt >= AUTOMATIC_TURN_RETRY_MAX ||
+                input.recovery.attempt !== authoritativeRetryAttempt + 1
+              )
+            ) {
+              return {
+                kind: "recovery_conflict",
+                reason: authoritativeRetryAttempt >= AUTOMATIC_TURN_RETRY_MAX
+                  ? "automatic_retry_exhausted"
+                  : "automatic_attempt_mismatch",
+              };
+            }
             message = {
               ...input.message,
               _recoveryOfClientMessageId: input.recovery.sourceClientMessageId,
               _recoveryMode: input.recovery.mode,
               _automaticRecovery: input.recovery.automatic,
+              ...(input.recovery.automatic
+                ? {
+                    _automaticRecoveryRootClientMessageId: input.recovery.rootClientMessageId,
+                    _automaticRecoveryAttempt: input.recovery.attempt,
+                    _automaticRecoveryMax: input.recovery.max,
+                  }
+                : {}),
             };
           }
         }

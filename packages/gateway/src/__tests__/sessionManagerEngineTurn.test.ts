@@ -494,7 +494,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("persists every visible retry notice as assistant text and as a raw gateway event", async () => {
+  test("authentication failure is terminal and never enters the model-busy retry UI", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -511,9 +511,6 @@ describe("crash/interrupt partial persistence", () => {
               message: { content: [{ type: "text", text: "Failed to authenticate. run /login" }] },
             });
             r.result({ is_error: true, total_cost_usd: 0 });
-          } else {
-            r.text("retry succeeded exactly");
-            r.result({ stop_reason: "end_turn", usage: { output_tokens: 2 } });
           }
         });
       });
@@ -522,37 +519,27 @@ describe("crash/interrupt partial persistence", () => {
         userId: "user-1",
       } as Partial<AgentSession>);
 
-      await sm.submit(
-        session,
-        "retry me",
-        (event) => events.push(event),
-        undefined,
-        undefined,
-        "c".repeat(32),
+      await assert.rejects(
+        sm.submit(
+          session,
+          "retry me",
+          (event) => events.push(event),
+          undefined,
+          undefined,
+          "c".repeat(32),
+        ),
+        /AUTH_ERROR/,
       );
 
-      assert.equal(submits, 2);
-      assert.equal(captured.payloads.length, 1);
-      const payload = captured.payloads[0]!;
-      const retryText = "\n\n🔄 认证已过期,正在刷新凭据并重试...\n";
-      assert.equal(payload.text, retryText + "retry succeeded exactly");
-      assert.deepEqual(payload.assistantSegments?.map((segment) => segment.text), [
-        retryText,
-        "retry succeeded exactly",
-      ]);
-      assert.ok(payload.runtimeEvents?.some((event) => {
-        const raw = event.payload as { type?: unknown; code?: unknown };
-        return raw.type === "retry_status" && raw.code === "AUTH_RETRY";
-      }));
-      assert.ok(events.some((event) =>
-        event.kind === "block" && event.block.kind === "text" && event.block.text === retryText
-      ));
+      assert.equal(submits, 1);
+      assert.equal(captured.payloads.length, 0);
+      assert.equal(events.some((event) => event.kind === "turn_status"), false);
     } finally {
       setV3MasterSinkSingleton(null);
     }
   });
 
-  test("capacity failure automatically continues up to three times and persists one exact paid turn", async () => {
+  test("capacity failure succeeds within the shared 10-retry budget and persists one exact paid turn", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -611,7 +598,7 @@ describe("crash/interrupt partial persistence", () => {
         requestId,
       );
 
-      assert.equal(submits, 4, "initial attempt + exactly three automatic retries");
+      assert.equal(submits, 4, "initial attempt + three automatic retries before success");
       assert.deepEqual(runner.submittedInputs, [
         "finish the task",
         "继续",
@@ -666,7 +653,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("capacity failure stops after the third retry and emits only the terminal error billing", async () => {
+  test("capacity failure stops after ten retries and emits only the terminal error billing", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -712,15 +699,124 @@ describe("crash/interrupt partial persistence", () => {
         requestId,
       );
 
-      assert.equal(submits, 4);
-      assert.deepEqual(runner.submittedInputs, ["finish the task", "继续", "继续", "继续"]);
+      assert.equal(submits, 11);
+      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(10).fill("继续")]);
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
       assert.equal(payload.errorCode, "model_capacity");
-      assert.equal(payload.engineBilling?.engineSessionId, `oceng-${"4".repeat(48)}`);
+      assert.equal(payload.engineBilling?.engineSessionId, `oceng-${"11".repeat(48)}`);
       assert.equal(events.filter((event) => event.kind === "codex_billing").length, 1);
       assert.equal(events.filter((event) => event.kind === "error").length, 1);
       assert.deepEqual(session._durableDelegateEngineBillings, [payload.engineBilling]);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("capacity failure after an unresolved tool boundary never auto-continues", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          r.msg({
+            type: "assistant",
+            message: {
+              content: [{ type: "tool_use", id: "tool-unresolved", name: "Bash", input: { k: 1 } }],
+            },
+          });
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Selected model is at capacity. Please try a different model.",
+            errorClass: "model_capacity",
+          });
+        });
+      });
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
+
+      await sm.submit(
+        session,
+        "run once",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "9".repeat(32),
+      );
+
+      assert.equal(submits, 1);
+      assert.equal(events.some((event) => event.kind === "turn_status"), false);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "model_capacity");
+      assert.equal(captured.payloads[0]!.tools?.[0]?.completed, false);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("capacity failure after a completed tool with unknown external outcome never auto-continues", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          r.msg({
+            type: "assistant",
+            message: {
+              content: [{ type: "tool_use", id: "tool-unknown", name: "Bash", input: { k: 1 } }],
+            },
+          });
+          r.msg({
+            type: "user",
+            message: {
+              content: [{
+                type: "tool_result",
+                tool_use_id: "tool-unknown",
+                content: JSON.stringify({ outcome: "unknown" }),
+                is_error: false,
+              }],
+            },
+          });
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Selected model is at capacity. Please try a different model.",
+            errorClass: "model_capacity",
+          });
+        });
+      });
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
+
+      await sm.submit(
+        session,
+        "run once",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "a".repeat(32),
+      );
+
+      assert.equal(submits, 1);
+      assert.equal(events.some((event) => event.kind === "turn_status"), false);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "model_capacity");
+      assert.notEqual(captured.payloads[0]!.tools?.[0]?.completed, false);
+      assert.match(
+        JSON.stringify(captured.payloads[0]!.tools?.[0]?.outputJson),
+        /unknown/,
+      );
     } finally {
       setV3MasterSinkSingleton(null);
     }
@@ -791,12 +887,11 @@ describe("crash/interrupt partial persistence", () => {
       assert.match(String(runner.submittedInputs[1]), /<openclaude_previous_context>/);
       assert.match(String(runner.submittedInputs[1]), /-tail/);
       assert.match(String(runner.submittedInputs[1]), /<current_user_message>\n继续原任务/);
-      assert.ok(
-        events.some((event) =>
-          event.kind === "block" &&
-          event.block.kind === "text" &&
-          event.block.text.includes("正在整理历史并继续 (1/3)")),
-      );
+      assert.ok(events.some((event) =>
+        event.kind === "turn_status" && typeof event.status === "object" &&
+        event.status?.status === "retrying" && event.status.retry.attempt === 1 &&
+        event.status.retry.max === 10
+      ));
       assert.equal(events.filter((event) => event.kind === "error").length, 0);
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0]!.status, "completed");
@@ -854,9 +949,8 @@ describe("crash/interrupt partial persistence", () => {
       assert.match(String(runner.submittedInputs[0]), /执行一次写操作/);
       assert.equal(
         events.some((event) =>
-          event.kind === "block" &&
-          event.block.kind === "text" &&
-          event.block.text.includes("正在整理历史并继续")),
+          event.kind === "turn_status" && typeof event.status === "object" &&
+          event.status?.status === "retrying"),
         false,
       );
       assert.equal(captured.payloads.length, 1);
@@ -894,9 +988,8 @@ describe("crash/interrupt partial persistence", () => {
       "finish the task",
       (event) => {
         if (
-          event.kind === "block" &&
-          event.block.kind === "text" &&
-          event.block.text.includes("自动重试")
+          event.kind === "turn_status" && typeof event.status === "object" &&
+          event.status?.status === "retrying"
         ) {
           retryNotice();
         }

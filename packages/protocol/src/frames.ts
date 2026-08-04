@@ -2,6 +2,7 @@ import { type Static, Type } from '@sinclair/typebox'
 import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 import { MessageReplyQuote } from './messageReply.js'
+import { AUTOMATIC_TURN_RETRY_MAX } from './turnErrorTaxonomy.js'
 
 // ───────────────────────────────────────────────
 // V3 S12e — trace id schema fragment
@@ -173,11 +174,30 @@ export const InboundMessage = Type.Object({
      * replays a verified not-accepted dispatch. Master validates lineage
      * atomically; container model input consumes only `text`. */
     recovery: Type.Optional(
-      Type.Object({
-        sourceClientMessageId: ClientMessageId,
-        mode: Type.Union([Type.Literal('checkpoint'), Type.Literal('replay')]),
-        automatic: Type.Boolean(),
-      }),
+      Type.Union([
+        Type.Object({
+          sourceClientMessageId: ClientMessageId,
+          mode: Type.Union([Type.Literal('checkpoint'), Type.Literal('replay')]),
+          automatic: Type.Literal(false),
+        }, { additionalProperties: false }),
+        Type.Object({
+          sourceClientMessageId: ClientMessageId,
+          mode: Type.Union([Type.Literal('checkpoint'), Type.Literal('replay')]),
+          automatic: Type.Literal(true),
+          /** Immutable first user row for the complete retry lineage. */
+          rootClientMessageId: ClientMessageId,
+          /** Additional automatic execution number:1..10. */
+          attempt: Type.Integer({ minimum: 1, maximum: AUTOMATIC_TURN_RETRY_MAX }),
+          max: Type.Literal(AUTOMATIC_TURN_RETRY_MAX),
+        }, { additionalProperties: false }),
+        /** Rolling compatibility for an already-cached frontend. The master
+         * normalizes this legacy first hop to root=source, attempt=1, max=10. */
+        Type.Object({
+          sourceClientMessageId: ClientMessageId,
+          mode: Type.Union([Type.Literal('checkpoint'), Type.Literal('replay')]),
+          automatic: Type.Literal(true),
+        }, { additionalProperties: false }),
+      ]),
     ),
   }),
   replyToId: Type.Optional(Type.String()),
@@ -1094,11 +1114,12 @@ export const OutboundTurnStatus = Type.Union([
   Type.Object({
     ..._turnStatusCommon,
     status: Type.Literal('retrying'),
-    /** 自动重试侧信道(不进 tape):attempt 从 1 计,max 含首次尝试。
-     *  retryAt = 下一次尝试的绝对 epoch ms(断线重连后前端按它重算剩余
-     *  倒计时,不从完整 delayMs 重头显示)。 */
+    /** 自动重试侧信道:首次正常执行是 0,attempt=1..10 表示额外自动重试。
+     *  retryAt = 下一次尝试的绝对 epoch ms。 */
     retry: Type.Object({
-      attempt: Type.Integer({ minimum: 1 }),
+      attempt: Type.Integer({ minimum: 1, maximum: AUTOMATIC_TURN_RETRY_MAX }),
+      /** Kept broad for rolling predecessor gateways; current consumers
+       * normalize this compatibility value to AUTOMATIC_TURN_RETRY_MAX. */
       max: Type.Integer({ minimum: 1 }),
       delayMs: Type.Integer({ minimum: 0 }),
       retryAt: Type.Integer({ minimum: 0 }),

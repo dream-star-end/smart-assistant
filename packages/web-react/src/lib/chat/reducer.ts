@@ -42,6 +42,7 @@ import {
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
 import { errorLabel } from "./render";
+import { AUTOMATIC_TURN_RETRY_MAX } from "@openclaude/protocol";
 
 /** teardown 后非 final 帧的压制时间窗(客户端同域):覆盖 stop 后 server 收尾期,不无界压制多端新 turn。*/
 const TEARDOWN_DROP_WINDOW_MS = 3 * 60_000;
@@ -72,8 +73,6 @@ export type FrameEffects = {
     isCronOrHeartbeat: boolean,
     clientMessageId?: string,
   ) => void;
-  /** service_restart 中断 final:调度自动续写(socket 决定是否真续,见其守卫)。 */
-  scheduleRestartContinue?: (sessId: string) => void;
   /** Terminal recoverable error: sync the finalized exact tape, then let the
    * socket attempt one safety-gated checkpoint/replay child turn. */
   scheduleAutomaticRecovery?: (sessId: string, clientMessageId?: string) => void;
@@ -1280,14 +1279,14 @@ export function applyOutboundMessage(
   // 的 isFinal（server.ts autoResumeFromHello）。它本质是**清扫在途发送态**的信号，权威
   // 只在 client：唯有本地确有「在途流式内容」（assistant 正文已流 / thinking 已流）才说明
   // 真有一轮被上游断流掐断（1b488863 场景）——此时落到下方通用 final：⚠️ 文本（若服务端仍
-  // 带）追加到既有流式行、并 scheduleRestartContinue 自动续写，语义不回归。
+  // 带）追加到既有流式行，随后统一走 exact-tape 自动恢复。
   //
   // 其余全部走**带外清扫**：有 queued user（按原语义不绑新轮）；或本地**无在途流**（tool-only
   // 在途 / 卡死残留发送态 / 已完成轮的 stale inFlight）。后者正是 bug 形态：peerInFlight 上报
   // 为真但根本没有正文在途，旧代码让 ⚠️ text 走进 §7 block 循环，findOrCreateStreamingRow
   // 在 `!_streamingAssistant` 时**新建一条 assistant 气泡**（reducer §7:967），phantom 中断卡
   // 就此凭空生成、随 onFinal→persistSession 永久落库（生产实证 10/24 条为此形态）。带外清扫
-  // 直接 return，绝不进 block 循环、也不 scheduleRestartContinue（无正文可续），一并根治「落库
+  // 直接 return，绝不进 block 循环；恢复必须先 exact sync，一并根治「落库
   // 放大」。清流式指针与 reconcile('turn_completed') 分支对称，避免 stale 指针渗入下一轮。
   if (frame.isFinal && frame.meta?.interrupted === "service_restart") {
     const hasQueuedUser = sess.messages.some((m) => m.role === "user" && m.status === "queued");
@@ -1303,7 +1302,11 @@ export function applyOutboundMessage(
       clearTurnTiming(sess);
       resetReplyTracker(sess);
       sess.messages = repairPostFinalProcessOrder(sess.messages);
-      effects.onFinal?.(sess, frame, true, clientMessageId);
+      // This is still the terminal of a real client turn. Release its exact
+      // dispatch slot before the recovery child is queued; treating it like a
+      // cron final leaves the old slot occupied and silently blocks recovery.
+      effects.onFinal?.(sess, frame, false, clientMessageId);
+      effects.scheduleAutomaticRecovery?.(sess.id, clientMessageId);
       return;
     }
   }
@@ -1992,8 +1995,10 @@ export function applyOutboundMessage(
     resolveGenPlaceholders(sess, extractImageEditJobId(frame));
     sess.messages = repairPostFinalProcessOrder(sess.messages);
     effects.onFinal?.(sess, frame, isCronOrHeartbeat, clientMessageId);
-    // 服务重启掐断上游生成流的合成 final:有截断内容则自动续写(守卫在 socket 侧)。
-    if (frame.meta?.interrupted === "service_restart") effects.scheduleRestartContinue?.(sess.id);
+    // 服务重启一律先 exact sync：仍在运行则恢复原 turn；已落安全终态才自动恢复。
+    if (frame.meta?.interrupted === "service_restart") {
+      effects.scheduleAutomaticRecovery?.(sess.id, clientMessageId);
+    }
   }
 }
 
@@ -2010,7 +2015,10 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
     sess._turnStatus = {
       kind: "retrying",
       attempt: frame.retry.attempt,
-      max: frame.retry.max,
+      // Rolling predecessor gateways may still send their historical max=3.
+      // The product contract is one platform-wide 10-retry budget, so the
+      // compatibility field is accepted on wire but normalized at the UI edge.
+      max: AUTOMATIC_TURN_RETRY_MAX,
       retryAt: frame.retry.retryAt,
     };
   } else {

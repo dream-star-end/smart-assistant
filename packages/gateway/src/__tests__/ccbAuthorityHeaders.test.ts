@@ -176,6 +176,11 @@ describe('CCB authority headers — stdin 写入序列', () => {
     // 已经把 env 写进 process.env ⇒ 本 turn 的第一个 /v1/messages 必带本 turn 的票。
     const vars = parseEnvLine(writes[0]!)
     assert.ok('ANTHROPIC_CUSTOM_HEADERS' in vars)
+    assert.equal(
+      vars.CLAUDE_CODE_MAX_RETRIES,
+      '0',
+      'CCB native per-call retries must not bypass SessionManager shared budget',
+    )
     assert.deepEqual(JSON.parse(vars[MODEL_EXECUTION_DESCRIPTOR_ENV]!), EXECUTION_DESCRIPTOR)
     const userMsg = JSON.parse(writes[1]!) as { type: string; message: { role: string } }
     assert.equal(userMsg.type, 'user')

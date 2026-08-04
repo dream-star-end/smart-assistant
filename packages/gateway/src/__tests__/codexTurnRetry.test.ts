@@ -5,7 +5,7 @@ import * as assert from 'node:assert/strict'
  * computeRetryDelayMs),断言:
  *   - failed 分支不再注入 `[turn failed:]` text_delta,改带结构化 errorClass;
  *   - 仅 turn/start 请求被 JSON-RPC application error 拒 + retryable 语义 + 台账
- *     全清时才重试(共 3 attempt),retrying 状态帧发射并随后被 null 清除;
+ *     全清时才重试(初始执行 + 最多 10 次),retrying 状态帧发射并随后被 null 清除;
  *   - 台账 flag 置位 / transport 形状错误 / pendingUserInputs 非空 / status=
  *     'failed' 一律**不**重试(fail-closed);
  *   - 退避期间 interrupt() → USER_CANCELLED 终态 + 无第二次 turn/start + status null。
@@ -131,7 +131,7 @@ describe('runTurn — failed 分支结构化(无裸文本注入)', () => {
 })
 
 describe('runTurn — turn/start 窄路径自动重试', () => {
-  it('第一次 JSON-RPC application error(capacity)第二次成功 → attempt=2,恰好一个 result,retrying 帧发射且被 null 清除', async () => {
+  it('第一次 JSON-RPC application error(capacity)第二次成功 → retry=1/10,恰好一个 result,retrying 帧发射且被 null 清除', async () => {
     const h = await makeRetryHarness({ delayMs: 5 })
     let turnStarts = 0
     h.r.sendRequest = async (method: string) => {
@@ -151,12 +151,12 @@ describe('runTurn — turn/start 窄路径自动重试', () => {
     assert.equal(res.length, 1, 'exactly one terminal result frame for the whole turn')
     assert.equal(res[0].is_error, false)
     assert.equal(res[0].requestId, 'req-retry')
-    // 侧信道:一帧 retrying(attempt=2/max=3/delayMs=5)+ 一帧 null 清除,顺序为先 retrying 后 null。
+    // 初始执行是 0；第一次额外执行是 retrying(1/10)。
     const st = statusFrames(h.messages)
     assert.equal(st.length, 2)
     assert.equal(st[0].status, 'retrying')
-    assert.equal(st[0].retry.attempt, 2)
-    assert.equal(st[0].retry.max, 3)
+    assert.equal(st[0].retry.attempt, 1)
+    assert.equal(st[0].retry.max, 10)
     assert.equal(st[0].retry.delayMs, 5)
     assert.ok(st[0].retry.retryAt >= t0, 'retryAt is an absolute epoch ms in the future')
     assert.equal(st[1].status, null)
@@ -168,7 +168,36 @@ describe('runTurn — turn/start 窄路径自动重试', () => {
     await h.cleanup()
   })
 
-  it('两次连续 capacity 拒 → 三次 attempt 后走终态(共 2 retry,3 attempt)', async () => {
+  it('从浏览器恢复 attempt=4 继续共享预算，底座下一次重试显示 5/10', async () => {
+    const h = await makeRetryHarness({ delayMs: 1 })
+    let turnStarts = 0
+    h.r.sendRequest = async (method: string) => {
+      if (method !== 'turn/start') return {}
+      turnStarts++
+      if (turnStarts === 1) throw jsonRpcAppError('the model is at capacity, retry later')
+      setImmediate(() => {
+        h.r.currentTurnCompleter?.resolve({ status: 'completed', durationMs: 1 })
+      })
+      return { turn: { id: 't-shared-retry' } }
+    }
+    const shared = { rootClientMessageId: 'cm-root', attempt: 4, max: 10 }
+    await h.r.runTurn('hi', 'req-shared-retry', undefined, shared)
+
+    assert.equal(shared.attempt, 5)
+    assert.equal(turnStarts, 2)
+    const st = statusFrames(h.messages)
+    assert.equal(st[0].status, 'retrying')
+    assert.deepEqual(st[0].retry, {
+      attempt: 5,
+      max: 10,
+      delayMs: 1,
+      retryAt: st[0].retry.retryAt,
+    })
+    assert.equal(st[1].status, null)
+    await h.cleanup()
+  })
+
+  it('连续 capacity 拒 → 初始执行加 10 次自动重试后终态', async () => {
     const h = await makeRetryHarness({ delayMs: 2 })
     let turnStarts = 0
     h.r.sendRequest = async (method: string) => {
@@ -177,16 +206,16 @@ describe('runTurn — turn/start 窄路径自动重试', () => {
       throw jsonRpcAppError('server overloaded, at capacity')
     }
     await h.r.runTurn('hi', 'req-exhaust')
-    assert.equal(turnStarts, 3, '3 attempts total (initial + 2 retries)')
+    assert.equal(turnStarts, 11, '11 attempts total (initial + 10 retries)')
     const res = results(h.messages)
     assert.equal(res.length, 1)
     assert.equal(res[0].is_error, true)
-    // 两次重试 → 两组 (retrying, null) 状态帧。
+    // 十次重试 → 十组 (retrying, null) 状态帧。
     const st = statusFrames(h.messages)
-    assert.equal(st.length, 4)
+    assert.equal(st.length, 20)
     assert.deepEqual(
       st.map((s) => (s.status === 'retrying' ? s.retry.attempt : s.status)),
-      [2, null, 3, null],
+      Array.from({ length: 10 }, (_, index) => [index + 1, null]).flat(),
     )
     await h.cleanup()
   })

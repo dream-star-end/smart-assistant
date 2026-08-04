@@ -25,6 +25,7 @@ import {
   formatMessageReplyPrompt,
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_VERSION,
+  turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from "@openclaude/protocol";
 import { createHash, randomUUID } from "node:crypto";
@@ -4155,6 +4156,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           sourceClientMessageId,
           mode: "checkpoint",
           automatic: true,
+          rootClientMessageId: sourceClientMessageId,
+          attempt: 1,
+          max: 10,
         },
       })),
       {
@@ -4207,7 +4211,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     }
   });
 
-  maybe("recovery admission atomically persists lineage and fences a second automatic hop", async () => {
+  maybe("recovery admission atomically persists lineage, deduplicates ACK loss, and accepts the next monotonic hop", async () => {
     const sessionId = "s-dd-recovery";
     const sourceClientMessageId = "cm-dd-recovery-source";
     await seedRecoverableSource({ sessionId, sourceClientMessageId });
@@ -4226,6 +4230,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         sourceClientMessageId,
         mode: "checkpoint",
         automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
       },
     }));
     assert.equal(recovered.kind, "admitted");
@@ -4244,6 +4251,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         sourceClientMessageId,
         mode: "checkpoint",
         automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
       },
     }));
     assert.ok(
@@ -4289,7 +4299,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         identity.clientMessageId,
       ],
     );
-    const secondIdentity = turnRecoveryIdentity(sessionId, identity.clientMessageId);
+    const secondIdentity = turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 2);
     const second = await backend.admitUserTurn(admitInput({
       sessionId,
       clientMessageId: secondIdentity.clientMessageId,
@@ -4302,14 +4312,14 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       } as MessageLike & { id: string },
       recovery: {
         sourceClientMessageId: identity.clientMessageId,
-        mode: "checkpoint",
+        mode: "replay",
         automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 2,
+        max: 10,
       },
     }));
-    assert.deepEqual(second, {
-      kind: "recovery_conflict",
-      reason: "automatic_hop_exhausted",
-    });
+    assert.equal(second.kind, "admitted");
   });
 
   maybe("newer ordinary user and recovery serialize under one session-row lock", async () => {
@@ -4343,6 +4353,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           sourceClientMessageId,
           mode: "checkpoint",
           automatic: true,
+          rootClientMessageId: sourceClientMessageId,
+          attempt: 1,
+          max: 10,
         },
       })),
     ]);
@@ -4430,6 +4443,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           sourceClientMessageId,
           mode: "checkpoint",
           automatic: true,
+          rootClientMessageId: sourceClientMessageId,
+          attempt: 1,
+          max: 10,
         },
       });
       assert.deepEqual(await backend.admitUserTurn(recoveryInput), {
@@ -4505,6 +4521,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         sourceClientMessageId,
         mode: "checkpoint",
         automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
       },
     })), {
       kind: "recovery_conflict",
@@ -4554,6 +4573,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         sourceClientMessageId,
         mode: "replay",
         automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
       },
     }));
     assert.equal(recovered.kind, "admitted");

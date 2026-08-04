@@ -248,6 +248,10 @@ export type ChatMessage = {
   _recoveryOfClientMessageId?: string;
   _recoveryMode?: "checkpoint" | "replay";
   _automaticRecovery?: boolean;
+  /** Immutable retry lineage persisted by the master for automatic children. */
+  _automaticRecoveryRootClientMessageId?: string;
+  _automaticRecoveryAttempt?: number;
+  _automaticRecoveryMax?: number;
   /** Client-local one-shot fence for the source turn. Server rejection must
    * not make a full-session sync schedule the same automatic recovery again. */
   _automaticRecoveryAttempted?: boolean;
@@ -262,6 +266,10 @@ export type ChatMessage = {
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
   _errorCode?: string;
   _errorDetail?: string;
+  /** Highest gateway-local retry consumed before this terminal error. */
+  _automaticRetryRootClientMessageId?: string;
+  _automaticRetryAttempt?: number;
+  _automaticRetryMax?: number;
   /**
    * durable turn dispatch server 侧持久化标记:该行证明其 _clientMessageId 的
    * dispatch 已终态失败。`_turnStatusRecord` 表示它是状态记录、不是 Agent 输出。

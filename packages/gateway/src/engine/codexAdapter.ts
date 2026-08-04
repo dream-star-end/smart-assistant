@@ -494,6 +494,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       params.requestId,
       params.collabAgentPolicy,
       params.queueTurn,
+      params.automaticRetryState,
     )
     return {
       submitted,

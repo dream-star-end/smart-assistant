@@ -43,6 +43,50 @@ describe("materializeLosslessTurn", () => {
     }
   });
 
+  test("stamps the highest shared retry counter on the terminal assistant despite runtime batching", () => {
+    const turn = materializeLosslessTurn({
+      sessionId: "web-lossless-retry",
+      agentId: "main",
+      turnIndex: 7,
+      clientMessageId: "m-retry-child",
+      status: "crashed",
+      turnKey: TURN_KEY,
+      text: "",
+      errorCode: "model_capacity",
+      errorDetail: "busy",
+      createdAt: 1_783_944_000_000,
+      runtimeEvents: [
+        {
+          ordinal: 1,
+          observedAt: 2,
+          source: "gateway",
+          payload: {
+            type: "retry_status",
+            rootClientMessageId: "m-retry-root",
+            attempt: 3,
+            max: 10,
+          },
+        },
+        {
+          ordinal: 2,
+          observedAt: 3,
+          source: "gateway",
+          payload: {
+            type: "retry_status",
+            rootClientMessageId: "m-retry-root",
+            attempt: 6,
+            max: 10,
+          },
+        },
+      ],
+    });
+    const terminal = turn.records.find((record) =>
+      record.payload.role === "assistant" && record.payload._errorCode === "model_capacity");
+    assert.equal(terminal?.payload._automaticRetryRootClientMessageId, "m-retry-root");
+    assert.equal(terminal?.payload._automaticRetryAttempt, 6);
+    assert.equal(terminal?.payload._automaticRetryMax, 10);
+  });
+
   test("rejects malformed attribution and forbids it on content-only continuations", () => {
     const base = {
       sessionId: "web-lossless-123",

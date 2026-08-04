@@ -93,6 +93,7 @@ import { recordProductFrictionEvent } from "../productFriction/events.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
+  AUTOMATIC_TURN_RETRY_MAX,
   DEFAULT_CODEX_ENGINE_MODEL,
   MODEL_AUTHORITY_CAPABILITY,
   MODEL_AUTHORITY_FIELD,
@@ -110,6 +111,7 @@ import {
   parseSessionWorkspaceMode,
   parseTraceIdCandidate,
   stripModelAuthorityField,
+  turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   type ModelAuthorityBundle,
   type ModelAuthorityEngine,
@@ -2937,16 +2939,36 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const sourceClientMessageId = recovery?.sourceClientMessageId;
         const mode = recovery?.mode;
         const automatic = recovery?.automatic;
+        const rootClientMessageId = recovery?.rootClientMessageId;
+        const attempt = recovery?.attempt;
+        const max = recovery?.max;
         const keys = recovery ? Object.keys(recovery) : [];
-        const identity = typeof sourceClientMessageId === "string"
-          ? turnRecoveryIdentity(peerId, sourceClientMessageId)
+        const legacyAutomatic = automatic === true &&
+          rootClientMessageId === undefined && attempt === undefined && max === undefined;
+        const normalizedRoot = legacyAutomatic ? sourceClientMessageId : rootClientMessageId;
+        const normalizedAttempt = legacyAutomatic ? 1 : attempt;
+        const identity = automatic === true && typeof normalizedRoot === "string" &&
+            typeof normalizedAttempt === "number"
+          ? turnRecoveryAttemptIdentity(peerId, normalizedRoot, normalizedAttempt)
+          : typeof sourceClientMessageId === "string"
+            ? turnRecoveryIdentity(peerId, sourceClientMessageId)
           : null;
+        const allowedKeys = automatic === true && !legacyAutomatic
+          ? ["sourceClientMessageId", "mode", "automatic", "rootClientMessageId", "attempt", "max"]
+          : ["sourceClientMessageId", "mode", "automatic"];
         if (
           clientMessageId === null ||
           !isClientMessageId(sourceClientMessageId) ||
           (mode !== "checkpoint" && mode !== "replay") ||
           typeof automatic !== "boolean" ||
-          keys.some((key) => !["sourceClientMessageId", "mode", "automatic"].includes(key)) ||
+          (automatic === true && !legacyAutomatic && (
+            !isClientMessageId(normalizedRoot) ||
+            !Number.isSafeInteger(normalizedAttempt) ||
+            Number(normalizedAttempt) < 1 ||
+            Number(normalizedAttempt) > AUTOMATIC_TURN_RETRY_MAX ||
+            max !== AUTOMATIC_TURN_RETRY_MAX
+          )) ||
+          keys.some((key) => !allowedKeys.includes(key)) ||
           identity?.clientMessageId !== clientMessageId ||
           identity?.idempotencyKey !== frameObj.idempotencyKey
         ) {
@@ -2957,7 +2979,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           sendRecoverySkippedAck();
           return null;
         }
-        validatedRecovery = { sourceClientMessageId, mode, automatic };
+        validatedRecovery = automatic
+          ? {
+              sourceClientMessageId,
+              mode,
+              automatic: true,
+              rootClientMessageId: normalizedRoot as string,
+              attempt: normalizedAttempt as number,
+              max: AUTOMATIC_TURN_RETRY_MAX,
+            }
+          : { sourceClientMessageId, mode, automatic: false };
       }
 
       // The browser's optimistic POST is intentionally not a dispatch gate.

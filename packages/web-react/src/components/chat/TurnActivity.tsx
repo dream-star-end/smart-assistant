@@ -11,6 +11,7 @@
  * 语义一致、不再各写一份三个点。
  */
 import { useEffect, useState } from "react";
+import { AUTOMATIC_TURN_RETRY_MAX } from "@openclaude/protocol";
 import type { TodoItem } from "./PinnedTaskTracker";
 import { isRetryingTurnStatus, type TurnStatusState } from "../../lib/chat/model";
 import { computeTypingLabel } from "../../lib/chat/pure";
@@ -27,7 +28,7 @@ export type TurnActivityInfo = {
   /** 最近一帧到达时刻（_lastFrameAt），用于静默时长升级文案。 */
   lastFrameAt?: number;
   /** turn 非流式阶段态(判别联合,单一权威 model.ts TurnStatusState):
-   *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 「模型繁忙，自动重试中」+ 倒计时。 */
+   *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 统一自动重试文案。 */
   turnStatus?: TurnStatusState | null;
   /** 容器冷启（sys.cold_start）：typing 文案追加「容器首次加载中」后缀。 */
   coldStart?: boolean;
@@ -73,18 +74,14 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   const secs = Math.max(0, Math.round((now - started) / 1000));
   const silenceMs = info.lastFrameAt ? Math.max(0, now - info.lastFrameAt) : 0;
 
-  // 自动重试软提示优先级最高:此时 turn 未流式(上一 attempt 失败、等待下一次),秒级倒计时
-  // 由本组件自带的 1s tick 驱动(retryAt - now,断线重连按绝对时刻重算,不精确亦可)。软提示走
-  // warning tone、**不是红卡**——错误仍在自动挽救中,不该吓用户。
+  // 自动重试软提示优先级最高。所有底座/跨 turn 恢复只呈现这一行，不再各自
+  // 插 assistant notice、synthetic user bubble 或倒计时变体。
   const retry = isRetryingTurnStatus(info.turnStatus) ? info.turnStatus : null;
 
   let text: string;
   let cls = "";
   if (retry) {
-    const remain = Math.max(0, Math.ceil((retry.retryAt - now) / 1000));
-    text = `模型繁忙，自动重试中（第 ${retry.attempt}/${retry.max} 次）${
-      remain > 0 ? ` · ${remain}s 后重试` : "…"
-    }`;
+    text = `模型繁忙，正在自动重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
     cls = "retrying";
   } else if (info.turnStatus === "compacting") {
     // 压缩上下文（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。

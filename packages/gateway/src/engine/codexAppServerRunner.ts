@@ -11,6 +11,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
   type GoalStateSnapshot,
   type ToolTerminationReason,
@@ -36,7 +37,7 @@ import {
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
-import type { CollabAgentPolicy } from './engineAdapter.js'
+import type { AutomaticRetryState, CollabAgentPolicy } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
@@ -48,7 +49,6 @@ const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 // error + retryable 语义 + 本 attempt 零可观测输出/零 usage/零终态帧)。**status=
 // 'failed' 一律不重试**:实测②——failed 后 user input 已落 thread(rollout
 // response_item 在 API 调用前落盘且不回滚),重发 turn/start 会重复 user input。
-const RETRY_MAX_ATTEMPTS = 3
 /** 第 N 次失败后、第 N+1 次尝试前的基础退避(index = 失败的 attempt 序号 − 1)。 */
 const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
 const RETRY_JITTER_MS = 500
@@ -210,6 +210,7 @@ interface QueuedTurn {
   requestId?: string
   collabAgentPolicy?: CollabAgentPolicy
   queueTurn?: boolean
+  automaticRetryState?: AutomaticRetryState
 }
 
 export class PromptQueueRunnerInvariantError extends Error {
@@ -1609,6 +1610,7 @@ export class CodexAppServerRunner extends EventEmitter {
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
     queueTurn = false,
+    automaticRetryState?: AutomaticRetryState,
   ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
@@ -1618,7 +1620,15 @@ export class CodexAppServerRunner extends EventEmitter {
     const prompt = normalisePrompt(textOrBlocks)
     assertPromptQueueRunnerAdmission(queueTurn, this.processing, this.queue.length)
     return new Promise((resolve, reject) => {
-      this.queue.push({ prompt, resolve, reject, requestId, collabAgentPolicy, queueTurn })
+      this.queue.push({
+        prompt,
+        resolve,
+        reject,
+        requestId,
+        collabAgentPolicy,
+        queueTurn,
+        automaticRetryState,
+      })
       void this.drain()
     })
   }
@@ -1743,7 +1753,12 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!turn) return
     this.processing = true
     try {
-      await this.runTurn(turn.prompt, turn.requestId, turn.collabAgentPolicy)
+      await this.runTurn(
+        turn.prompt,
+        turn.requestId,
+        turn.collabAgentPolicy,
+        turn.automaticRetryState,
+      )
       turn.resolve()
     } catch (err) {
       turn.reject(err as Error)
@@ -3410,7 +3425,7 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   /** turn/start 窄路径自动重试门。**全部**满足才允许重试(fail-closed):
-   *   1. 还有重试额度(failedAttempt < RETRY_MAX_ATTEMPTS,共 3 attempt);
+   *   1. 共享自动重试额度尚未用尽;
    *   2. err 是明确的 JSON-RPC application error(有 rpcCode/rpcMessage 且
    *      rpcMethod==='turn/start');transport 断连/进程 exit/超时形状(裸 Error,
    *      无 rpcCode)一律不算;
@@ -3421,8 +3436,8 @@ export class CodexAppServerRunner extends EventEmitter {
    *   5. classifyRunError(rpcMessage) 命中 retryable 语义(turnErrorSemantics);
    *   6. 本 attempt 两台账 flag 均 false、usage 为零、未 emit 过终态帧;
    *   7. pendingUserInputs 为空(非空 = 违反门,放弃重试走终态,不静默清)。 */
-  private shouldRetryTurnStart(err: unknown, failedAttempt: number): boolean {
-    if (failedAttempt >= RETRY_MAX_ATTEMPTS) return false
+  private shouldRetryTurnStart(err: unknown, retryState: AutomaticRetryState): boolean {
+    if (retryState.attempt >= retryState.max) return false
     const e = err as Partial<JsonRpcCallError> | null | undefined
     if (
       !e ||
@@ -3447,6 +3462,7 @@ export class CodexAppServerRunner extends EventEmitter {
     prompt: string,
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
+    automaticRetryState?: AutomaticRetryState,
   ): Promise<void> {
     const startedAt = Date.now()
     this.activeRequestId = requestId
@@ -3473,9 +3489,11 @@ export class CodexAppServerRunner extends EventEmitter {
     // priorTurnTotal 跨 turn 保留(累计基线),不在此清。这里只做 turn 级一次性准备。
     this.currentCollabAgentPolicy = collabAgentPolicy
 
-    // turn-retry 批:失败次数计数(1 = 首次尝试)。仅 turn/start 请求被拒的窄路径
-    // 允许递增(见 shouldRetryTurnStart);status='failed' 等一切 turn 内失败均不重试。
-    let attempt = 1
+    const retryState = automaticRetryState ?? {
+      rootClientMessageId: `local-${this.opts.sessionKey}`,
+      attempt: 0,
+      max: AUTOMATIC_TURN_RETRY_MAX,
+    }
     try {
       if (
         this.proc &&
@@ -3576,7 +3594,7 @@ export class CodexAppServerRunner extends EventEmitter {
             | { turn?: { id?: string } }
             | undefined
         } catch (startErr) {
-          if (this.shouldRetryTurnStart(startErr, attempt)) {
+          if (this.shouldRetryTurnStart(startErr, retryState)) {
             // 本 attempt 的 completed promise 就此放弃(无人 await)。必须立即
             // 解除 completer 并挂 no-op catch:否则退避期间 close-only 路径
             // (close → failAllPending)会 reject 一个无人接的 Promise →
@@ -3584,12 +3602,13 @@ export class CodexAppServerRunner extends EventEmitter {
             // 退出,codex 子进程崩溃就此放大成整个 gateway 退出)。
             this.currentTurnCompleter = null
             void completed.catch(() => {})
-            const nextAttempt = attempt + 1
-            const delayMs = this.computeRetryDelayMs(attempt)
+            const nextAttempt = retryState.attempt + 1
+            retryState.attempt = nextAttempt
+            const delayMs = this.computeRetryDelayMs(nextAttempt)
             const cls = classifyRunError((startErr as JsonRpcCallError).rpcMessage).code
             log.warn('codex turn/start rejected — auto-retrying (narrow path)', {
               sessionKey: this.opts.sessionKey,
-              attempt,
+              attempt: nextAttempt,
               nextAttempt,
               delayMs,
               errorClass: cls,
@@ -3600,7 +3619,7 @@ export class CodexAppServerRunner extends EventEmitter {
             // 重发**前**清(不等 final)。
             this.emitRetryingStatus({
               attempt: nextAttempt,
-              max: RETRY_MAX_ATTEMPTS,
+              max: retryState.max,
               delayMs,
               retryAt: Date.now() + delayMs,
             })
@@ -3643,7 +3662,6 @@ export class CodexAppServerRunner extends EventEmitter {
               })
               return
             }
-            attempt = nextAttempt
             continue
           }
           // 不满足重试门 → 抛给外层 catch 走终态(fail closed)。
