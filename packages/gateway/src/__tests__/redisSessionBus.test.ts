@@ -1,7 +1,7 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { RedisSessionBus, type RedisFrameEnvelope, validateReplay } from '../redisSessionBus.js'
+import { type RedisFrameEnvelope, RedisSessionBus, validateReplay } from '../redisSessionBus.js'
 
 const frameData = (seq: number) =>
   JSON.stringify({
@@ -151,9 +151,26 @@ describe('RedisSessionBus', () => {
         createdAt: 1,
         lastAt: 2,
         messageCount: 3,
+        lastTapeSeq: 5,
         updatedAt: 4,
       },
     ]
+
+    broker.strings.set(
+      `testprefix:client:list:${Buffer.from('user-A').toString('base64url')}`,
+      JSON.stringify({
+        version: 1,
+        userId: 'user-A',
+        ts: 1,
+        sessions: [{ ...list[0], lastTapeSeq: undefined }],
+      }),
+    )
+    assert.equal(
+      await bus.getSessionList('user-A'),
+      null,
+      'pre-cursor list cache schema must be refreshed from SQLite',
+    )
+
     bus.setSessionList('user-A', list)
     await Promise.resolve()
 
@@ -324,6 +341,7 @@ function createFakeRedisBroker() {
   })
   return {
     channels,
+    strings,
     createClient,
     publish: async (channel: string, message: string) => channels.get(channel)?.(message),
   }

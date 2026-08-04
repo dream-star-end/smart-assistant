@@ -372,6 +372,9 @@ describe('server-authoritative client session tape', () => {
       ts: 100,
       frame: { type: 'inbound.message', clientMessage: { id: 'u1' } },
     })
+    const afterInbound = (await listClientSessions('tape-owner')).find(
+      (session) => session.id === 'sess-tape-order',
+    )
     const second = await appendClientSessionTapeFrame({
       sessionId: 'sess-tape-order',
       userId: 'tape-owner',
@@ -380,6 +383,9 @@ describe('server-authoritative client session tape', () => {
       ts: 110,
       frame: { type: 'outbound.message', blocks: [{ kind: 'text', text: 'one' }] },
     })
+    const afterSameTurnGrowth = (await listClientSessions('tape-owner')).find(
+      (session) => session.id === 'sess-tape-order',
+    )
     await appendClientSessionTapeFrame({
       sessionId: 'sess-tape-order',
       userId: 'tape-owner',
@@ -407,6 +413,10 @@ describe('server-authoritative client session tape', () => {
     assert.equal(first.tapeSeq, 1)
     assert.equal(first.inserted, true)
     assert.equal(second.tapeSeq, 2)
+    assert.equal(afterInbound?.tapeTurnCount, 1)
+    assert.equal(afterInbound?.lastTapeSeq, 1)
+    assert.equal(afterSameTurnGrowth?.tapeTurnCount, 1)
+    assert.equal(afterSameTurnGrowth?.lastTapeSeq, 2, 'same-turn tape growth advances the cursor')
 
     const latest = await listClientSessionTapePage('sess-tape-order', 'tape-owner', { turns: 1 })
     assert.deepEqual(
@@ -429,6 +439,7 @@ describe('server-authoritative client session tape', () => {
     )
     assert.equal(meta?.messageCount, 4, 'list metadata signals two taped turns for lazy hydration')
     assert.equal(meta?.tapeTurnCount, 2, 'list metadata explicitly forces cursor rehydration')
+    assert.equal(meta?.lastTapeSeq, 5, 'list metadata exposes the authoritative tape head')
 
     const duplicateInbound = await appendClientSessionTapeFrame({
       sessionId: 'sess-tape-order',

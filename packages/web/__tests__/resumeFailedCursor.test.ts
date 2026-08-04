@@ -31,6 +31,7 @@ const WS_JS = readFileSync(
 // maybeSyncNow REST-escalation call), where the cursor assignment lives.
 const hrfStart = WS_JS.indexOf('function handleResumeFailed')
 const hrfCursorRegion = WS_JS.slice(hrfStart, WS_JS.indexOf('maybeSyncNow', hrfStart))
+const hrfRegion = WS_JS.slice(hrfStart, WS_JS.indexOf('// ══', hrfStart))
 
 describe('T01: handleResumeFailed re-anchors cursor to server frame.to (source guard)', () => {
   it('handleResumeFailed exists', () => {
@@ -52,12 +53,19 @@ describe('T01: handleResumeFailed re-anchors cursor to server frame.to (source g
       'cursor must be set from server-authoritative frame.to',
     )
   })
+
+  it('does not clear the replay-miss marker after a list-only sync', () => {
+    assert.doesNotMatch(
+      hrfRegion,
+      /_liveStreamBroken\s*=\s*false/,
+      'only hydrateSession may retire the marker after adopting REST/tape',
+    )
+  })
 })
 
 describe('T02: cursor decision picks server currentLast for every reason', () => {
   // Behaviorally re-execute the extracted decision exactly as written in source.
-  const pickCursor = (frame: { to?: number }) =>
-    typeof frame.to === 'number' ? frame.to : 0
+  const pickCursor = (frame: { to?: number }) => (typeof frame.to === 'number' ? frame.to : 0)
 
   it('buffer_miss → jump up to server currentLast (no more stale request)', () => {
     assert.equal(pickCursor({ to: 3864 }), 3864)

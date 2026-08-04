@@ -44,6 +44,7 @@ const DEFAULT_MAX_REPLAY_FRAMES = 2000
 const DEFAULT_RESERVE_TIMEOUT_MS = 50
 const DEFAULT_SESSION_CACHE_TTL_MS = 60_000
 const DEFAULT_MAX_SESSION_SNAPSHOT_BYTES = 2_000_000
+const CLIENT_SESSION_LIST_CACHE_VERSION = 2
 
 export class RedisSessionBus {
   readonly enabled: boolean
@@ -202,7 +203,7 @@ export class RedisSessionBus {
 
   setSessionList(userId: string, sessions: ClientSessionMeta[]): void {
     const payload = JSON.stringify({
-      version: 1,
+      version: CLIENT_SESSION_LIST_CACHE_VERSION,
       userId,
       ts: Date.now(),
       sessions,
@@ -450,7 +451,12 @@ function parseSessionListCache(
       userId?: unknown
       sessions?: unknown
     }
-    if (!obj || obj.version !== 1 || obj.userId !== userId || !Array.isArray(obj.sessions))
+    if (
+      !obj ||
+      obj.version !== CLIENT_SESSION_LIST_CACHE_VERSION ||
+      obj.userId !== userId ||
+      !Array.isArray(obj.sessions)
+    )
       return null
     if (!obj.sessions.every(isClientSessionMeta)) return null
     return { sessions: obj.sessions as ClientSessionMeta[] }
@@ -492,6 +498,8 @@ function isClientSessionMeta(x: unknown): x is ClientSessionMeta {
     typeof o.createdAt === 'number' &&
     typeof o.lastAt === 'number' &&
     typeof o.messageCount === 'number' &&
+    (o.lastTapeSeq === null ||
+      (Number.isSafeInteger(o.lastTapeSeq) && (o.lastTapeSeq as number) > 0)) &&
     typeof o.updatedAt === 'number'
   )
 }

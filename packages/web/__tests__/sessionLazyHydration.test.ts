@@ -41,6 +41,7 @@ function makeLazySyncHarness() {
     'function _emitSyncStatus() {}',
     'function _rebindStreamingPointers() {}',
     extractTopLevelFn(SYNC_SRC, '_copyLocalSessionRuntimeState'),
+    extractTopLevelFn(SYNC_SRC, '_serverTapeLastSeq'),
     extractTopLevelFn(SYNC_SRC, '_buildSessionFromRemote'),
     extractTopLevelFn(SYNC_SRC, '_sessionDbSnapshot'),
     extractTopLevelFn(SYNC_SRC, '_canHydrateNow'),
@@ -52,7 +53,7 @@ function makeLazySyncHarness() {
   ].join('\n')
   return new Function(
     'deps',
-    `const { apiGet, apiJson, dbGetAll, dbPut, dbDelete, state, isDeletePending, clearDeleteTombstone, _rebuildSearchIndex, pushSessionToServer } = deps; ${combined}; return { syncSessionsFromServer, hydrateSession, retryDeferredHydration, _serverSnapshotLosesLocalTail, _buildSessionFromRemote };`,
+    `const { apiGet, apiJson, dbGetAll, dbPut, dbDelete, state, isDeletePending, clearDeleteTombstone, _rebuildSearchIndex, pushSessionToServer, projectSessionTape } = deps; ${combined}; return { syncSessionsFromServer, hydrateSession, retryDeferredHydration, _serverSnapshotLosesLocalTail, _buildSessionFromRemote };`,
   )
 }
 
@@ -116,6 +117,222 @@ describe('lazy session hydration', () => {
     assert.equal(dbWrites.length, 101) // 100 metadata rows + 1 hydrated current row
   })
 
+  it('same-turn tape growth hydrates the latest cursor even when updatedAt and turnCount stay equal', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const local: any = {
+      id: 'web-tape-growth',
+      title: 'Tape growth',
+      agentId: 'codex',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [{ id: 'old', role: 'assistant', text: '旧回答' }],
+      _syncedAt: 20,
+      _tapeTurnCount: 1,
+      _tapeLastSeq: 1,
+      _tapeFrames: [{ tapeSeq: 1 }],
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([['web-tape-growth', local]]),
+      currentSessionId: 'web-tape-growth',
+      sendingInFlight: false,
+    }
+    const gets: string[] = []
+    const { syncSessionsFromServer } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async (path: string) => {
+        gets.push(path)
+        if (path === '/api/sessions/list') {
+          return {
+            sessions: [
+              {
+                id: local.id,
+                title: local.title,
+                agentId: local.agentId,
+                pinned: false,
+                createdAt: 1,
+                lastAt: 2,
+                updatedAt: 20,
+                messageCount: 2,
+                tapeTurnCount: 1,
+                lastTapeSeq: 3,
+              },
+            ],
+          }
+        }
+        if (path === '/api/sessions/web-tape-growth') {
+          return { ...local, messages: [], updatedAt: 20, tape: { lastTapeSeq: 3 } }
+        }
+        return { frames: [{ tapeSeq: 3 }], nextBefore: null, hasMore: false }
+      },
+      projectSessionTape: () => [{ id: 'latest', role: 'assistant', text: '最新回答' }],
+      dbGetAll: async () => [local],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    await syncSessionsFromServer()
+
+    assert.deepEqual(gets, [
+      '/api/sessions/list',
+      '/api/sessions/web-tape-growth',
+      '/api/sessions/web-tape-growth/tape?turns=5',
+    ])
+    assert.equal(state.sessions.get(local.id)._tapeLastSeq, 3)
+    assert.equal(state.sessions.get(local.id).messages.at(-1)?.text, '最新回答')
+  })
+
+  it('an unchanged authoritative tape cursor does not refetch a hydrated session', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const local: any = {
+      id: 'web-tape-stable',
+      title: 'Tape stable',
+      agentId: 'codex',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [{ id: 'latest', role: 'assistant', text: '最新回答' }],
+      _syncedAt: 20,
+      _tapeTurnCount: 1,
+      _tapeLastSeq: 3,
+      _tapeFrames: [{ tapeSeq: 3 }],
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([['web-tape-stable', local]]),
+      currentSessionId: 'web-tape-stable',
+      sendingInFlight: false,
+    }
+    const gets: string[] = []
+    const { syncSessionsFromServer } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async (path: string) => {
+        gets.push(path)
+        return {
+          sessions: [
+            {
+              id: local.id,
+              title: local.title,
+              agentId: local.agentId,
+              pinned: false,
+              createdAt: 1,
+              lastAt: 2,
+              updatedAt: 20,
+              messageCount: 2,
+              tapeTurnCount: 1,
+              lastTapeSeq: 3,
+            },
+          ],
+        }
+      },
+      dbGetAll: async () => [local],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    await syncSessionsFromServer()
+    assert.deepEqual(gets, ['/api/sessions/list'])
+    assert.equal(state.sessions.get(local.id), local)
+  })
+
+  it('resume failure forces tape hydration despite equal metadata and the ordinary hydrate limit', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const fallback: any = {
+      id: 'web-fallback',
+      title: 'Fallback',
+      agentId: 'codex',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 3,
+      messages: [],
+      _syncedAt: 10,
+      _needsFetch: true,
+    }
+    const broken: any = {
+      id: 'web-broken-equal',
+      title: 'Broken',
+      agentId: 'codex',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [{ id: 'old', role: 'assistant', text: '旧回答' }],
+      _syncedAt: 20,
+      _tapeTurnCount: 1,
+      _tapeLastSeq: 3,
+      _tapeFrames: [{ tapeSeq: 3 }],
+      _liveStreamBroken: true,
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([
+        [fallback.id, fallback],
+        [broken.id, broken],
+      ]),
+      currentSessionId: fallback.id,
+      sendingInFlight: false,
+    }
+    const gets: string[] = []
+    const { syncSessionsFromServer } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async (path: string) => {
+        gets.push(path)
+        if (path === '/api/sessions/list') {
+          return {
+            sessions: [
+              { ...fallback, messageCount: 1, updatedAt: 10 },
+              {
+                id: broken.id,
+                title: broken.title,
+                agentId: broken.agentId,
+                pinned: false,
+                createdAt: 1,
+                lastAt: 2,
+                updatedAt: 20,
+                messageCount: 2,
+                tapeTurnCount: 1,
+                lastTapeSeq: 3,
+              },
+            ],
+          }
+        }
+        if (path === '/api/sessions/web-broken-equal') {
+          return { ...broken, messages: [], tape: { lastTapeSeq: 3 } }
+        }
+        if (path === '/api/sessions/web-broken-equal/tape?turns=5') {
+          return { frames: [{ tapeSeq: 3 }], nextBefore: null, hasMore: false }
+        }
+        return { ...fallback, messages: [{ id: 'fallback-full', role: 'user', text: 'q' }] }
+      },
+      projectSessionTape: () => [{ id: 'recovered', role: 'assistant', text: '恢复的最新回答' }],
+      dbGetAll: async () => [fallback, broken],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    await syncSessionsFromServer()
+
+    assert.ok(gets.includes('/api/sessions/web-broken-equal/tape?turns=5'))
+    assert.ok(gets.includes('/api/sessions/web-fallback'))
+    assert.equal(state.sessions.get(broken.id)._liveStreamBroken, false)
+    assert.equal(state.sessions.get(broken.id).messages.at(-1)?.text, '恢复的最新回答')
+  })
+
   it('placeholder sessions are never pushed before hydration', async () => {
     const pushSrc = extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')
     let called = false
@@ -162,7 +379,7 @@ describe('lazy session hydration', () => {
 
   it('placeholder builder preserves live turn state while marking stale body', () => {
     const helpers = new Function(
-      `${extractTopLevelFn(SYNC_SRC, '_copyLocalSessionRuntimeState')}\n${extractTopLevelFn(SYNC_SRC, '_buildSessionFromRemote')}; return { _buildSessionFromRemote };`,
+      `${extractTopLevelFn(SYNC_SRC, '_copyLocalSessionRuntimeState')}\n${extractTopLevelFn(SYNC_SRC, '_serverTapeLastSeq')}\n${extractTopLevelFn(SYNC_SRC, '_buildSessionFromRemote')}; return { _buildSessionFromRemote };`,
     )() as { _buildSessionFromRemote: (remote: any, existing: any, opts: any) => any }
     const sess = helpers._buildSessionFromRemote(
       {
@@ -205,6 +422,7 @@ describe('lazy session hydration', () => {
       messages: [{ id: 'local-msg', role: 'user', text: 'local unsynced' }],
       _syncedAt: 10,
       _dirty: true,
+      _liveStreamBroken: true,
     }
     const state = {
       token: 'tok',
@@ -257,6 +475,11 @@ describe('lazy session hydration', () => {
     assert.equal(state.sessions.get('web-dirty'), localDirty)
     assert.equal(state.sessions.get('web-dirty').title, 'Local dirty title')
     assert.equal(state.sessions.get('web-dirty')._dirty, true)
+    assert.equal(
+      state.sessions.get('web-dirty')._liveStreamBroken,
+      true,
+      'a list-only sync must not retire an unreconciled replay miss',
+    )
     assert.equal(state.sessions.get('web-dirty')._needsFetch, undefined)
 
     const hydrated = await hydrateSession('web-dirty')

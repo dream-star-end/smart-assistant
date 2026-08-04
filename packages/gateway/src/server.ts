@@ -7526,6 +7526,7 @@ export class Gateway {
       frame: { ...wire, ts: now, frameSeq },
     })
     sessionTapeAppendTotal.inc({ direction: 'outbound', outcome: 'committed' })
+    if (wire.isFinal) this._redisSessionBus.invalidateSessionList(userId)
     const data = JSON.stringify({ ...wire, ts: now, frameSeq, tapeSeq: tape.tapeSeq })
     const evicted = redisBacked
       ? this._outboundRing.storeExternal(sessionKey, frameSeq, now, data)

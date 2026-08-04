@@ -4,7 +4,7 @@ import { shouldSuppressGoalStatusToast } from './goalControl.js?v=3'
 import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=3'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=12'
+import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=13'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -2106,13 +2106,9 @@ function handleGoalStatus(frame) {
 //      any future frameSeq as forward-progress. Without this, a server restart
 //      (where currentLast drops back to a low number) would make every
 //      subsequent frame look "stale" to the dedupe check in handleOutbound.
-//   2. Clear the stale `_sendingInFlight` marker on the affected session.
-//      syncSessionsFromServer skips refetching the current session while
-//      `state.sendingInFlight` is true (it avoids stomping a live stream).
-//      But resume_failed *proves* the live stream is broken, so keeping the
-//      marker would cause the sync to skip exactly the session we most need
-//      to reconcile. Clear it and rely on the just-triggered sync to pull
-//      authoritative server-persisted state.
+//   2. Mark the affected stream broken so syncSessionsFromServer bypasses the
+//      normal in-flight protection. hydrateSession clears that marker only
+//      after it actually adopts the authoritative REST/tape snapshot.
 function handleResumeFailed(frame) {
   const peerId = frame.peer?.id
   const affectedSessId = peerId
@@ -2137,8 +2133,8 @@ function handleResumeFailed(frame) {
       // would lie about a still-running long REPL turn in buffer_miss
       // cases), flag the live stream as known-broken. syncSessionsFromServer
       // reads this flag and refetches the session from the server-authored
-      // tape even when state.sendingInFlight is true. The flag clears
-      // naturally on the next successful sync.
+      // tape even when state.sendingInFlight is true. A list-only sync is not
+      // sufficient evidence to clear it; hydrateSession owns retirement.
       sess._liveStreamBroken = true
     }
   }
@@ -2153,13 +2149,6 @@ function handleResumeFailed(frame) {
     freshAfterInFlight: true,
     onResult: (result) => {
       if (!result) return
-      // Successful sync — live stream has been reconciled from REST. Clear
-      // the override so subsequent maybeSyncNow calls respect the normal
-      // in-flight skip again.
-      if (affectedSessId) {
-        const live = state.sessions.get(affectedSessId)
-        if (live) live._liveStreamBroken = false
-      }
       try {
         _deps.renderSidebar()
       } catch {}

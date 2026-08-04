@@ -5,7 +5,7 @@
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
 import { projectSessionTape } from './sessionTape.js?v=1'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=12'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=13'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -488,6 +488,12 @@ function _copyLocalSessionRuntimeState(sess, existingLocal) {
   return sess
 }
 
+function _serverTapeLastSeq(remote) {
+  const value = remote?.tape?.lastTapeSeq ?? remote?.lastTapeSeq
+  if (value === null) return 0
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
 export function _buildSessionFromRemote(remote, existingLocal, { placeholder = false } = {}) {
   const remoteMessageCount =
     typeof remote?.messageCount === 'number'
@@ -500,6 +506,10 @@ export function _buildSessionFromRemote(remote, existingLocal, { placeholder = f
   const messages = placeholder ? existingMessages : fullMessages
   const messageCount =
     typeof remoteMessageCount === 'number' ? remoteMessageCount : messages.length || 0
+  const remoteTapeLastSeq = _serverTapeLastSeq(remote)
+  const localTapeLastSeq = Number.isSafeInteger(existingLocal?._tapeLastSeq)
+    ? existingLocal._tapeLastSeq
+    : null
   const sess = {
     id: remote.id,
     title: remote.title || existingLocal?.title || '新会话',
@@ -511,11 +521,13 @@ export function _buildSessionFromRemote(remote, existingLocal, { placeholder = f
     _syncedAt: remote.updatedAt,
     _messageCount: messageCount,
     _tapeTurnCount: remote.tapeTurnCount || existingLocal?._tapeTurnCount || 0,
+    _tapeLastSeq: remoteTapeLastSeq ?? localTapeLastSeq ?? 0,
   }
   if (
     placeholder &&
     (messageCount > messages.length ||
       (remote.tapeTurnCount > 0 && !existingLocal?._tapeFrames) ||
+      (remoteTapeLastSeq !== null && remoteTapeLastSeq !== localTapeLastSeq) ||
       (existingLocal?._syncedAt &&
         remote.updatedAt &&
         existingLocal._syncedAt !== remote.updatedAt))
@@ -696,8 +708,8 @@ export async function hydrateSession(id, { force = false } = {}) {
     // broken-stream override here (memory + the dbPut snapshot below). Otherwise
     // a persisted `_liveStreamBroken=true` would survive into a later reload and,
     // via the escape hatch in _canHydrateNow, bypass the live-pointer protection
-    // and risk clobbering a future streaming tail. Mirrors the in-memory clear in
-    // websocket.js handleResumeFailed onResult, but also clears the persisted copy.
+    // and risk clobbering a future streaming tail. This is the sole retirement
+    // point for both memory and the persisted copy.
     sess._liveStreamBroken = false
     if (tapePage) {
       sess._tapeFrames = tapePage.frames
@@ -875,6 +887,7 @@ export async function syncSessionsFromServer() {
   let currentSessionUpdated = false
   let fetchedCount = 0
   let metadataCount = 0
+  const forcedHydrateIds = new Set()
   const hydrateIds = new Set()
   const fallbackCurrentId = state.currentSessionId || serverList[0]?.id || null
   for (const meta of serverList) {
@@ -889,7 +902,7 @@ export async function syncSessionsFromServer() {
       try {
         await dbPut(_sessionDbSnapshot(sess, { _syncedAt: meta.updatedAt }))
       } catch {}
-    } else if (local._syncedAt && meta.updatedAt > local._syncedAt) {
+    } else {
       // Server has a newer version than our last sync point (server clock only).
       // Normally we skip the current in-flight session to avoid stomping a
       // live stream — but if something has flagged the session's live
@@ -897,10 +910,20 @@ export async function syncSessionsFromServer() {
       // `_liveStreamBroken = true`), we MUST refetch: the whole point of
       // the force sync is to reconcile from the server-authored tape.
       const live = state.sessions.get(meta.id)
-      if (local._dirty || live?._dirty) continue
-      if (meta.id === state.currentSessionId && state.sendingInFlight && !live?._liveStreamBroken)
+      const remoteTapeLastSeq = _serverTapeLastSeq(meta)
+      const localTapeLastSeq = Number.isSafeInteger(local?._tapeLastSeq) ? local._tapeLastSeq : null
+      const tapeChanged = remoteTapeLastSeq !== null && remoteTapeLastSeq !== localTapeLastSeq
+      const serverMetaNewer = !!local._syncedAt && meta.updatedAt > local._syncedAt
+      const liveStreamBroken = !!live?._liveStreamBroken
+      if (!serverMetaNewer && !tapeChanged && !liveStreamBroken) {
+        if (local._needsFetch && meta.id === fallbackCurrentId) hydrateIds.add(meta.id)
         continue
-      if (meta.id === fallbackCurrentId || live?._liveStreamBroken) {
+      }
+      if (local._dirty || live?._dirty) continue
+      if (meta.id === state.currentSessionId && state.sendingInFlight && !liveStreamBroken) continue
+      if (liveStreamBroken) {
+        forcedHydrateIds.add(meta.id)
+      } else if (meta.id === fallbackCurrentId) {
         hydrateIds.add(meta.id)
       } else {
         const sess = _buildSessionFromRemote(meta, live || local, { placeholder: true })
@@ -912,8 +935,18 @@ export async function syncSessionsFromServer() {
           await dbPut(_sessionDbSnapshot(sess, { _syncedAt: meta.updatedAt }))
         } catch {}
       }
-    } else if (local._needsFetch && meta.id === fallbackCurrentId) {
-      hydrateIds.add(meta.id)
+    }
+  }
+
+  // Replay misses are explicit correctness failures, not ordinary cold-start
+  // prefetch. Reconcile every affected session before applying the one-session
+  // background hydration budget; hydrateSession retires the flag only after it
+  // has actually adopted the authoritative REST/tape snapshot.
+  for (const id of forcedHydrateIds) {
+    const full = await hydrateSession(id, { force: true })
+    if (full && !full._needsFetch && !full._liveStreamBroken) {
+      fetchedCount++
+      if (id === state.currentSessionId || id === fallbackCurrentId) currentSessionUpdated = true
     }
   }
 
@@ -924,7 +957,7 @@ export async function syncSessionsFromServer() {
     if (hydrated >= AUTO_HYDRATE_RECENT_LIMIT) break
     const before = state.sessions.get(id)
     if (!_canHydrateNow(id, before)) continue
-    const full = await hydrateSession(id)
+    const full = await hydrateSession(id, { force: true })
     if (full && !full._needsFetch) {
       hydrated++
       fetchedCount++
