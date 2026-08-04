@@ -15,6 +15,7 @@ import {
   assertContainerLabels,
   assertLocalCensusHost,
   assertNamedVolumesPreserved,
+  hasExpectedRuntimeLabels,
   loadBridgeSecretReadOnly,
   remountTargets,
   type SafeRemovalTarget,
@@ -26,6 +27,7 @@ const root = path.resolve(here, "../..");
 const sources: Record<string, string> = Object.fromEntries(
   CCB_BASELINE_TARGETS.map((target, index) => [target, `/trusted/baseline/source-${index}`]),
 );
+const runtimeLabels = { "com.openclaude.runtime.release": "rel-current" };
 
 function completeMounts(): MountLike[] {
   return CCB_BASELINE_TARGETS.map((destination) => ({
@@ -134,6 +136,7 @@ describe("V5 CCB baseline remount classification", () => {
       {} as never,
       1n,
       sources,
+      runtimeLabels,
       10_000,
       {
         getStatus: async () => running as never,
@@ -153,10 +156,11 @@ describe("V5 CCB baseline remount classification", () => {
       {} as never,
       1n,
       sources,
+      runtimeLabels,
       10_000,
       {
         getStatus: async () => running as never,
-        inspect: async () => ({ Mounts: completeMounts() }),
+        inspect: async () => ({ Mounts: completeMounts(), Config: { Labels: runtimeLabels } }),
         requestDrain: async () => { drainCalled = true; return "accepted" as never; },
         now: () => 0,
         sleep: async () => undefined,
@@ -165,12 +169,33 @@ describe("V5 CCB baseline remount classification", () => {
     assert.equal(converged, null);
     assert.equal(drainCalled, false);
 
+    const staleRuntime = await acquireSafeRemovalTarget(
+      {} as never,
+      {} as never,
+      1n,
+      sources,
+      runtimeLabels,
+      10_000,
+      {
+        getStatus: async () => running as never,
+        inspect: async () => ({
+          Mounts: completeMounts(),
+          Config: { Labels: { "com.openclaude.runtime.release": "rel-old" } },
+        }),
+        requestDrain: async () => "accepted" as never,
+        now: () => 0,
+        sleep: async () => undefined,
+      },
+    );
+    assert.equal(staleRuntime?.status.dockerContainerId, "docker-1");
+
     await assert.rejects(
       acquireSafeRemovalTarget(
         { selfHostId: "host-local" } as never,
         {} as never,
         1n,
         sources,
+        runtimeLabels,
         10_000,
         {
           getStatus: async () => ({ ...running, hostId: null }) as never,
@@ -190,6 +215,7 @@ describe("V5 CCB baseline remount classification", () => {
         {} as never,
         1n,
         sources,
+        runtimeLabels,
         50,
         {
           getStatus: async () => ({ state: "provisioning" }) as never,
@@ -210,6 +236,7 @@ describe("V5 CCB baseline remount classification", () => {
         {} as never,
         1n,
         sources,
+        runtimeLabels,
         50,
         {
           getStatus: async () => running as never,
@@ -305,6 +332,7 @@ describe("V5 CCB baseline remount classification", () => {
           {} as never,
           uid,
           sources,
+          runtimeLabels,
           deadlineMs,
           {
             getStatus: async () => target.status,
@@ -334,7 +362,7 @@ describe("V5 CCB baseline remount classification", () => {
       /named volume changed/,
     );
 
-    const runtime = { "com.openclaude.runtime.release": "rel-current" };
+    const runtime = runtimeLabels;
     const labels = {
       "com.openclaude.v3.managed": "1",
       "com.openclaude.v3.uid": "7",
@@ -342,6 +370,14 @@ describe("V5 CCB baseline remount classification", () => {
       ...runtime,
     };
     assert.doesNotThrow(() => assertContainerLabels(labels, 7n, runtime));
+    assert.equal(hasExpectedRuntimeLabels(labels, runtime), true);
+    assert.equal(
+      hasExpectedRuntimeLabels(
+        { ...labels, "com.openclaude.runtime.release": "rel-old" },
+        runtime,
+      ),
+      false,
+    );
     for (const key of [
       "com.openclaude.v3.managed",
       "com.openclaude.v3.uid",
