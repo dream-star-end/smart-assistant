@@ -32,6 +32,8 @@
 
 import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
+import { getBalanceBreakdown } from '../billing/spend.js'
+import { ensureFreeSubscription } from '../billing/subscription.js'
 import { query, tx } from '../db/queries.js'
 import { REFRESH_TOKEN_TTL_SECONDS, issueRefresh, refreshTokenHash, signAccess } from './jwt.js'
 import { hashPassword } from './passwords.js'
@@ -440,6 +442,10 @@ export async function socialLoginOrCreate(
     }
   })
 
+  // OAuth callback 完成后前端会直接进入应用；不能依赖随后恰好访问 /api/me
+  // 才创建免费档，否则新用户首轮会以 0 余额被 preCheck 拒绝。
+  await ensureFreeSubscription(validated.userId)
+  const totalCredits = (await getBalanceBreakdown(validated.userId)).total
   const access = await signAccess({ sub: validated.userId, role: validated.role }, deps.jwtSecret, {
     now: issueNow,
     ttlSeconds: deps.accessTtlSeconds,
@@ -453,7 +459,7 @@ export async function socialLoginOrCreate(
       role: validated.role,
       display_name: validated.displayName,
       avatar_url: validated.avatarUrl,
-      credits: validated.credits,
+      credits: totalCredits.toString(),
     },
     isNew: validated.isNew,
     access_token: access.token,
