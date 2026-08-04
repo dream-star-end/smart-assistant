@@ -193,10 +193,20 @@ export interface SafeRemovalTarget {
 
 export interface AcquireSafeRemovalOps {
   getStatus: () => Promise<Awaited<ReturnType<typeof getV3ContainerStatus>>>;
-  inspect: (dockerId: string) => Promise<{ Mounts?: readonly MountLike[] }>;
+  inspect: (dockerId: string) => Promise<{
+    Mounts?: readonly MountLike[];
+    Config?: { Labels?: Record<string, string> | null } | null;
+  }>;
   requestDrain: (status: ContainerStatus) => Promise<Awaited<ReturnType<typeof requestRuntimeRecycleDrain>>>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
+}
+
+export function hasExpectedRuntimeLabels(
+  labels: Readonly<Record<string, string>> | null | undefined,
+  expected: Readonly<Record<string, string>>,
+): boolean {
+  return Object.entries(expected).every(([key, value]) => labels?.[key] === value);
 }
 
 export async function acquireSafeRemovalTarget(
@@ -204,6 +214,7 @@ export async function acquireSafeRemovalTarget(
   docker: Docker,
   uid: bigint,
   expectedSources: Readonly<Record<string, string>>,
+  expectedRuntimeLabels: Readonly<Record<string, string>>,
   deadlineMs: number,
   ops: AcquireSafeRemovalOps = {
     getStatus: () => getV3ContainerStatus(deps, uidNumber(uid)),
@@ -239,7 +250,9 @@ export async function acquireSafeRemovalTarget(
     // idempotent skip and is never put into the temporary drain gate.
     const info = await ops.inspect(status.dockerContainerId);
     const classification = classifyBaselineMounts(info.Mounts, expectedSources);
-    if (classification.complete) return null;
+    if (classification.complete && hasExpectedRuntimeLabels(info.Config?.Labels, expectedRuntimeLabels)) {
+      return null;
+    }
     const beforeVolumes = namedVolumes(info.Mounts);
     if (status.state !== "running") return { status, beforeVolumes };
 
@@ -422,7 +435,7 @@ export async function main(): Promise<void> {
     }
     const info = await inspectContainer(docker, status.dockerContainerId);
     const classification = classifyBaselineMounts(info.Mounts, expectedSources);
-    if (!classification.complete) {
+    if (!classification.complete || !hasExpectedRuntimeLabels(info.Config?.Labels, runtimeLabels)) {
       targets.push(uid);
     }
   }
@@ -437,6 +450,7 @@ export async function main(): Promise<void> {
         docker,
         uid,
         expectedSources,
+        runtimeLabels,
         deadline,
       );
       if (target) assertLocalCensusHost(target.status.hostId, selfHost.id);
