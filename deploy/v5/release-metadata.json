@@ -76,7 +76,8 @@
     "0194_deepseek_1m_context",
     "0195_deepseek_1m_reactivate",
     "0196_client_session_workspace_mode",
-    "0197_bailian_qwen38_max"
+    "0197_bailian_qwen38_max",
+    "0198_client_session_workspace_default"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

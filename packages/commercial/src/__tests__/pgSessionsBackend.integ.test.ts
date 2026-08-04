@@ -73,6 +73,7 @@ const MIGRATION_0176 = path.resolve(here, "../db/migrations/0176_direct_turn_tim
 const MIGRATION_0177 = path.resolve(here, "../db/migrations/0177_unified_client_timeline.sql");
 const MIGRATION_0181 = path.resolve(here, "../db/migrations/0181_turn_tape_recovery_links.sql");
 const MIGRATION_0196 = path.resolve(here, "../db/migrations/0196_client_session_workspace_mode.sql");
+const MIGRATION_0198 = path.resolve(here, "../db/migrations/0198_client_session_workspace_default.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -396,6 +397,37 @@ describe("pgSessionsBackend contract", () => {
       /check constraint/i,
     );
     assert.equal(await backend.getClientSessionWorkspaceMode("missing-session", userId), null);
+  });
+
+  maybe("0198 changes only fresh session defaults to isolated_v1", async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO client_sessions
+           (id,user_id,agent_id,title,pinned,created_at,last_at,messages,message_count,updated_at)
+         VALUES ('s-workspace-before-0198','u-workspace-0198','main','before',0,1,1,'[]',0,1)`,
+      );
+      await client.query(await readFile(MIGRATION_0198, { encoding: "utf8" }));
+      await client.query(
+        `INSERT INTO client_sessions
+           (id,user_id,agent_id,title,pinned,created_at,last_at,messages,message_count,updated_at)
+         VALUES ('s-workspace-after-0198','u-workspace-0198','main','after',0,2,2,'[]',0,2)`,
+      );
+      const rows = await client.query<{ id: string; workspace_mode: string }>(
+        `SELECT id, workspace_mode
+           FROM client_sessions
+          WHERE user_id='u-workspace-0198'
+          ORDER BY id`,
+      );
+      assert.deepEqual(rows.rows, [
+        { id: "s-workspace-after-0198", workspace_mode: "isolated_v1" },
+        { id: "s-workspace-before-0198", workspace_mode: "legacy" },
+      ]);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
   });
 
   maybe("history revision 匹配才 partial，PUT 缺席删除 bump 并强制 full", async () => {
