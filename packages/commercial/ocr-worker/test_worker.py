@@ -4,6 +4,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -152,6 +154,79 @@ class WorkerTest(unittest.TestCase):
         ensure_count("test stage", 2, 2)
         with self.assertRaisesRegex(RuntimeError, "refusing incomplete OCR"):
             ensure_count("test stage", 2, 1)
+
+    def test_ssh_stdout_disconnect_stops_supervisor_and_all_children(self) -> None:
+        worker_dir = Path(__file__).resolve().parent
+        state = self.root / "supervisor-state"
+        fake_python = self.root / "fake-python"
+        fake_python.write_text(
+            """#!/bin/bash
+set -euo pipefail
+ready=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == --ready ]]; then ready=$2; shift 2; else shift; fi
+done
+if [[ -n "$ready" ]]; then mkdir -p "$(dirname "$ready")"; : >"$ready"; fi
+printf '%s\\n' "$$" >>"$FAKE_CHILD_PIDS"
+exec sleep 300
+""",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        dtk_env = self.root / "dtk-env.sh"
+        dtk_env.write_text(":\n", encoding="utf-8")
+        child_pids = self.root / "child-pids"
+        env = {
+            **os.environ,
+            "OC_OCR_ROOT": str(state),
+            "OC_OCR_WORKER_TOKEN": "test-token",
+            "OC_OCR_WORKER_RELEASE": "test-release",
+            "OC_OCR_CARDS": "0",
+            "OC_OCR_PP_PYTHON": str(fake_python),
+            "OC_OCR_VL_PYTHON": str(fake_python),
+            "OC_OCR_DET_MODEL": "det",
+            "OC_OCR_REC_MODEL": "rec",
+            "OC_OCR_VL_MODEL": "vl",
+            "OC_OCR_PROBE_IMAGE": "probe",
+            "OC_OCR_DTK_ENV": str(dtk_env),
+            "OC_OCR_SSH_HEARTBEAT_SECONDS": "0.05",
+            "FAKE_CHILD_PIDS": str(child_pids),
+        }
+        supervisor = subprocess.Popen(
+            ["bash", str(worker_dir / "run-supervisor.sh")],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if child_pids.exists() and len(child_pids.read_text().splitlines()) == 3:
+                    break
+                time.sleep(0.02)
+            self.assertTrue(child_pids.exists(), "fake model/server children did not start")
+            pids = [int(value) for value in child_pids.read_text().splitlines()]
+            self.assertEqual(len(pids), 3)
+            assert supervisor.stdout is not None
+            supervisor.stdout.close()
+            self.assertNotEqual(supervisor.wait(timeout=5), 0)
+            for pid in pids:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            self.assertEqual(list((state / "ready").iterdir()), [])
+            self.assertEqual(list((state / "run").glob("*.sock")), [])
+        finally:
+            if supervisor.poll() is None:
+                supervisor.send_signal(signal.SIGTERM)
+                supervisor.wait(timeout=5)
+            assert supervisor.stderr is not None
+            supervisor.stderr.close()
+
+    def test_host_tunnel_discards_only_heartbeat_stdout(self) -> None:
+        source = (Path(__file__).resolve().parent / "host-tunnel.sh").read_text()
+        self.assertIn('run-supervisor.sh\'" \\\n  >/dev/null', source)
+        self.assertNotIn("2>/dev/null", source)
 
 
 if __name__ == "__main__":
