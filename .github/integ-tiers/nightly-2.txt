@@ -30,3 +30,4 @@ packages/commercial/src/__tests__/selfhealUserNoticeApproval.integ.test.ts
 packages/commercial/src/__tests__/usageDelegateRollup.integ.test.ts
 packages/commercial/src/__tests__/usageReport.integ.test.ts
 packages/commercial/src/__tests__/responseRatings.integ.test.ts
+packages/commercial/src/__tests__/usersStats.integ.test.ts

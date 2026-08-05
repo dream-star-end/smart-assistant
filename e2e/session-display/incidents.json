@@ -814,6 +814,25 @@
       ]
     },
     {
+      "id": "INC-20260804-NEW-USER-FREE-CREDITS",
+      "occurredAt": "2026-08-04",
+      "severity": "P1",
+      "symptom": "新用户验证成功后，登录响应可在免费订阅尚未物化时返回 0 额度；用户不经过后续 /api/me 就直接发起首轮时，会被余额预检拒绝。",
+      "rootFixCommit": "aa74a0eb",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "successful login bootstraps free subscription before the response and stays idempotent"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/01-login-relogin-display.spec.ts",
+          "assertion": "登录响应必须已有可用额度，不依赖后续 /api/me"
+        }
+      ]
+    },
+    {
       "id": "INC-20260804-QWEN38-CODEX-ADAPTER",
       "occurredAt": "2026-08-04",
       "severity": "P1",

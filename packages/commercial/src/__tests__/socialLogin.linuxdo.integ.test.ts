@@ -10,8 +10,8 @@ import { resetTestSchemaForTest } from './helpers/db.js'
  * LDC SSO 业务编排集成测试 — socialLoginOrCreate 端到端打通真 Postgres。
  *
  * 验收点:
- *   1. 首登:users + oauth_identities 各 1 行;赠金已下线(2026-07-07)→
- *      credits=0、credit_ledger 零行;
+ *   1. 首登:users + oauth_identities 各 1 行;旧促销赠金已下线，免费订阅仍应
+ *      在登录响应前发放 300 期内积分且只写 1 条 subscription ledger;
  *      access/refresh token 都签出来,refresh_tokens 插入一行(remember_me=TRUE)。
  *   2. 二登:同 (provider, provider_user_id) 不创建新用户、不双发积分,
  *      **trust_level 升级也不补差额**。LDC 侧改昵称/换头像/升 TL → identity
@@ -20,7 +20,7 @@ import { resetTestSchemaForTest } from './helpers/db.js'
  *   4. provider_user_id 不合法 → 抛 SocialLoginError(INVALID_INPUT)。
  *   5. 并发首登 race:两个 tx 同时落 → advisory_xact_lock 串行化,
  *      共建 1 个 user / 1 个 identity / 1 行 ledger,无 23505。
- *   6. trust_level 覆盖:TL0/TL3/TL4 首登一律零赠金(TL 只作 identity 快照)。
+ *   6. trust_level 覆盖:TL0/TL3/TL4 的免费档均为 300(TL 只作 identity 快照)。
  *
  * 全部用 testJwtSecret 签 token,不调外网。
  */
@@ -103,7 +103,7 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
 }
 
 describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
-  test('first login (TL2) creates user + identity,零赠金零 ledger(赠金已下线)', async (t) => {
+  test('first login (TL2) creates user + identity and bootstraps the free plan', async (t) => {
     if (skipIfNoPg(t)) return
     const result = await socialLoginOrCreate(
       {
@@ -123,7 +123,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
     assert.equal(result.remember, true)
     assert.equal(result.user.email, 'linuxdo-12345@users.claudeai.chat')
     assert.equal(result.user.email_verified, true)
-    assert.equal(result.user.credits, '0')
+    assert.equal(result.user.credits, '300')
     assert.equal(result.user.role, 'user')
     assert.equal(result.user.display_name, 'alice_ldo')
 
@@ -166,7 +166,13 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
               MIN(balance_after::text) AS balance_after, MIN(reason) AS reason,
               MIN(memo) AS memo FROM credit_ledger`,
     )
-    assert.equal(led.rows[0].cnt, '0', '首登不写任何 ledger(赠金已下线)')
+    assert.deepEqual(led.rows[0], {
+      cnt: '1',
+      delta: '300',
+      balance_after: '300',
+      reason: 'subscription',
+      memo: 'free subscription bootstrap',
+    })
 
     const rt = await query<{
       cnt: string
@@ -217,11 +223,13 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
       `SELECT COUNT(*)::text AS cnt, MIN(credits::text) AS credits FROM users`,
     )
     assert.equal(u.rows[0].cnt, '1', '二登必须复用同一行 user')
-    // 首登赠金已下线;二登 TL 升级同样零积分。
-    assert.equal(u.rows[0].credits, '0', '首登/二登均零积分')
+    // 持久钱包仍为 0；免费 300 位于 subscription period bucket。
+    assert.equal(u.rows[0].credits, '0')
+    assert.equal(r1.user.credits, '300')
+    assert.equal(r2.user.credits, '300')
 
     const led = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM credit_ledger')
-    assert.equal(led.rows[0].cnt, '0', '二登同样零 ledger(赠金已下线)')
+    assert.equal(led.rows[0].cnt, '1', '二登不得重复发放免费档')
 
     const oi = await query<{
       username: string
@@ -336,7 +344,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
 
     // 不双发积分;identity 快照按常规升级路径 UPDATE
     const led = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM credit_ledger')
-    assert.equal(led.rows[0].cnt, '0', '老用户复登零 ledger(赠金已下线)')
+    assert.equal(led.rows[0].cnt, '1', '老用户复登不得重复发放免费档')
     const oi = await query<{ username: string; trust_level: number | null }>(
       `SELECT username, trust_level FROM oauth_identities WHERE provider_user_id='8002'`,
     )
@@ -364,7 +372,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
     assert.equal(u.rows[0].cnt, '0', 'INVALID_INPUT 不应留下任何 DB 副作用')
   })
 
-  test('concurrent first login: advisory lock serializes — 1 user, 1 identity, 0 ledger', async (t) => {
+  test('concurrent first login: advisory lock serializes — 1 user, 1 identity, 1 free-plan ledger', async (t) => {
     if (skipIfNoPg(t)) return
     // 同 provider_user_id 并发两个 callback,advisory lock 必须把第二个阻塞到第一个
     // commit 后,第二个 SELECT 命中已建 identity,走"已存在"路径不重复送积分。
@@ -409,8 +417,7 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
       `SELECT COUNT(*)::text AS cnt, MIN(credits::text) AS credits FROM users`,
     )
     assert.equal(u.rows[0].cnt, '1', '并发只该建 1 个 user')
-    // 赠金已下线:并发首登同样零积分(advisory lock 序列化只保 1 user)
-    assert.equal(u.rows[0].credits, '0', '并发首登零积分')
+    assert.equal(u.rows[0].credits, '0', '免费额度不得混入持久钱包')
 
     const oi = await query<{ cnt: string }>(
       `SELECT COUNT(*)::text AS cnt FROM oauth_identities WHERE provider_user_id='424242'`,
@@ -418,13 +425,12 @@ describe('auth.socialLoginOrCreate (linuxdo, integ)', () => {
     assert.equal(oi.rows[0].cnt, '1', '并发只该建 1 个 identity')
 
     const led = await query<{ cnt: string }>('SELECT COUNT(*)::text AS cnt FROM credit_ledger')
-    assert.equal(led.rows[0].cnt, '0', '并发首登零 ledger(赠金已下线)')
+    assert.equal(led.rows[0].cnt, '1', '并发首登只发放一次免费档')
   })
 })
 
-describe('auth.socialLoginOrCreate (linuxdo) — 首登零赠金,与 TL 无关(赠金已下线)', () => {
-  // 2026-07-07 起注册赠金机制整体下线。覆盖 TL0/TL3/TL4 三档回归:任何 TL 首登
-  // credits 恒 0、零 ledger;TL 仅存 oauth_identities 快照。
+describe('auth.socialLoginOrCreate (linuxdo) — 免费档与 TL 无关', () => {
+  // 旧注册促销赠金已下线；TL 只存 identity 快照，免费订阅额度统一为 300。
   const tiers: Array<{ tl: number; pid: string }> = [
     { tl: 0, pid: '500000' },
     { tl: 3, pid: '500003' },
@@ -432,7 +438,7 @@ describe('auth.socialLoginOrCreate (linuxdo) — 首登零赠金,与 TL 无关(�
   ]
 
   for (const tier of tiers) {
-    test(`first login (TL${tier.tl}) → 零赠金零 ledger`, async (t) => {
+    test(`first login (TL${tier.tl}) → 免费档 300`, async (t) => {
       if (skipIfNoPg(t)) return
       const result = await socialLoginOrCreate(
         {
@@ -446,7 +452,7 @@ describe('auth.socialLoginOrCreate (linuxdo) — 首登零赠金,与 TL 无关(�
         { jwtSecret: testJwtSecret },
       )
       assert.equal(result.isNew, true)
-      assert.equal(result.user.credits, '0')
+      assert.equal(result.user.credits, '300')
 
       const u = await query<{ credits: string }>(
         'SELECT credits::text AS credits FROM users WHERE id = $1',
@@ -458,7 +464,7 @@ describe('auth.socialLoginOrCreate (linuxdo) — 首登零赠金,与 TL 无关(�
         'SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1',
         [result.user.id],
       )
-      assert.equal(led.rows[0].cnt, '0', '零 ledger 行')
+      assert.equal(led.rows[0].cnt, '1', '只写一条免费订阅 ledger')
     })
   }
 })

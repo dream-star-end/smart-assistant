@@ -333,7 +333,7 @@ export default function UsersPage() {
         </h2>
         <RangePreset value={funnelDays} onChange={setFunnelDays} />
       </div>
-      <StatCardRow className="lg:grid-cols-7">
+      <StatCardRow className="lg:grid-cols-8">
         <FunnelKpi
           label="cohort 总数"
           value={funnel.data?.cohort_total}
@@ -355,8 +355,8 @@ export default function UsersPage() {
           tone="success"
         />
         <FunnelKpi
-          label="首次请求"
-          value={funnel.data?.first_request}
+          label="发起尝试"
+          value={funnel.data?.first_attempt}
           of={funnel.data?.cohort_total}
           loading={funnel.loading && !funnel.data}
         />
@@ -368,14 +368,20 @@ export default function UsersPage() {
           tone="success"
         />
         <RetentionKpi
-          label="D1 留存"
+          label="精确 D1"
           retained={funnel.data?.d1_retained}
           eligible={funnel.data?.eligible_for_d1}
           loading={funnel.loading && !funnel.data}
         />
         <RetentionKpi
-          label="D7 留存"
+          label="精确 D7"
           retained={funnel.data?.d7_retained}
+          eligible={funnel.data?.eligible_for_d7}
+          loading={funnel.loading && !funnel.data}
+        />
+        <RetentionKpi
+          label="滚动 D1–D7"
+          retained={funnel.data?.rolling_d1_7_retained}
           eligible={funnel.data?.eligible_for_d7}
           loading={funnel.loading && !funnel.data}
         />
@@ -537,23 +543,23 @@ function FunnelChart({
     ref,
     (t) =>
       barConfig(t, {
-        labels: ['cohort 总数', '已验证', '首次请求', '首次成功'],
+        labels: ['cohort 总数', '已验证', '发起尝试', '首次成功'],
         series: [
           {
             label: `最近 ${days} 天`,
             data: [
               data?.cohort_total ?? 0,
               data?.verified ?? 0,
-              data?.first_request ?? 0,
+              data?.first_attempt ?? 0,
               data?.first_success ?? 0,
             ],
           },
         ],
       }),
-    [data?.cohort_total, data?.verified, data?.first_request, data?.first_success, loading, error],
+    [data?.cohort_total, data?.verified, data?.first_attempt, data?.first_success, loading, error],
   )
   return (
-    <ChartCard title="激活漏斗" hint={`最近 ${days} 天 · cohort → 验证 → 请求 → 成功结果`} height={220}>
+    <ChartCard title="激活漏斗" hint={`最近 ${days} 天 · 仅真实生产用户 · cohort → 验证 → 发起 → 成功结果`} height={220}>
       {loading ? (
         <div className="h-full w-full animate-pulse rounded-lg bg-hover" />
       ) : error ? (

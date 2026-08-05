@@ -102,12 +102,13 @@ function installFixtures() {
         cohort_total: 40,
         verified: 30,
         first_topup: 8,
-        first_request: 20,
+        first_attempt: 24,
         first_success: 18,
         eligible_for_d1: 35,
         eligible_for_d7: 10,
         d1_retained: 12,
         d7_retained: 3,
+        rolling_d1_7_retained: 9,
       })
     if (path === '/users') return Promise.resolve({ rows: [USER1], next_cursor: null })
     if (/^\/users\/\d+\/detail$/.test(path))
@@ -278,7 +279,9 @@ describe('UsersPage', () => {
     expect(await screen.findByText('总用户数')).toBeTruthy()
     expect(screen.getByText('5,000')).toBeTruthy() // total_users
     expect(screen.getByText('cohort 总数')).toBeTruthy()
+    expect(screen.getByText('发起尝试')).toBeTruthy()
     expect(screen.getByText('首次成功')).toBeTruthy()
+    expect(screen.getByText('滚动 D1–D7')).toBeTruthy()
     expect(screen.getByText('激活漏斗')).toBeTruthy()
     expect(await screen.findByText('alice@example.com')).toBeTruthy() // 表格行
   })
