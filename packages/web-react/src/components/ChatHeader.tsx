@@ -1,4 +1,4 @@
-import { Bell, BookOpen, ChevronDown, Film, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
+import { Bell, BookOpen, ChevronDown, Menu, PanelLeft, PenSquare, Users, Wallet } from "lucide-react";
 import { useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
@@ -26,7 +26,6 @@ export function ChatHeader({
   onNew,
   onOpenMobileNav,
   onOpenInbox,
-  onOpenMediaTasks,
   onOpenTutorial,
   unreadCount,
   theme,
@@ -58,8 +57,6 @@ export function ChatHeader({
   onOpenMobileNav?: () => void;
   /** 打开站内信面板（省略则不渲染铃铛，如 demo / 未登录）。 */
   onOpenInbox?: () => void;
-  /** 打开账号级异步视频任务中心。 */
-  onOpenMediaTasks?: () => void;
   /** 打开与真实功能联动的教程中心。 */
   onOpenTutorial?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
@@ -153,11 +150,6 @@ export function ChatHeader({
         />
       )}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
-        {onOpenMediaTasks && (
-          <IconButton data-product-control onClick={onOpenMediaTasks} aria-label="视频任务" title="视频任务" shape="square">
-            <Film size={18} />
-          </IconButton>
-        )}
         {onOpenTutorial && (
           <IconButton
             data-product-control

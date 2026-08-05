@@ -78,8 +78,6 @@ import { connectorErrorText } from "./lib/connectors";
 import { imageByteCache } from "./lib/chat/imageBytes";
 import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
-import type { MediaJobWire } from "./lib/chat/frames";
-import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import {
@@ -142,9 +140,6 @@ const TutorialCenter = lazy(() =>
 const ContainerWebPreview = lazy(() =>
   import("./components/ContainerWebPreview").then((m) => ({ default: m.ContainerWebPreview })),
 );
-const MediaTaskCenter = lazy(() =>
-  import("./components/MediaTaskCenter").then((m) => ({ default: m.MediaTaskCenter })),
-);
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
 // loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
@@ -158,7 +153,6 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/MarketplaceCenter").catch(() => {});
     void import("./components/OrgCenter").catch(() => {});
     void import("./components/TutorialCenter").catch(() => {});
-    void import("./components/MediaTaskCenter").catch(() => {});
   };
   if (typeof requestIdleCallback === "function") {
     requestIdleCallback(prefetch, { timeout: 8000 });
@@ -271,8 +265,6 @@ export function App() {
   const [messageFeedback, setMessageFeedback] = useState<FeedbackContext | null>(null);
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
   const [inboxOpen, setInboxOpen] = useState(false);
-  const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
-  const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>(DEFAULT_MANAGE_TAB);
@@ -393,8 +385,6 @@ export function App() {
       setChatError(null);
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
-      setMediaTasksOpen(false);
-      setLiveMediaJob(null);
       setManageAutoAuthorizePluginSlug(null);
       setOrgOpen(false);
       setTutorialOpen(false);
@@ -1237,7 +1227,6 @@ export function App() {
     // GitHub 仓库绑定状态/错误帧 → useRepoBinding（经 ref，见 repoStatusHandlerRef）。
     onRepoStatus: (f) => repoStatusHandlerRef.current(f),
     onRepoBindError: (f) => repoBindErrorHandlerRef.current(f),
-    onMediaJob: (frame: MediaJobWire) => setLiveMediaJob(frame.job),
     // 会话模型收敛写与显式选择共用同一 per-session 串行器(防跨写者乱序)。
     queueModelPatch,
   });
@@ -2207,7 +2196,6 @@ export function App() {
           onNew={newSession}
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
-          onOpenMediaTasks={demo ? undefined : () => setMediaTasksOpen(true)}
           onOpenTutorial={demo ? undefined : () => openTutorial()}
           unreadCount={inbox.unreadCount}
           theme={theme}
@@ -2439,17 +2427,6 @@ export function App() {
         onClose={() => setInboxOpen(false)}
         onUnreadChange={inbox.refreshUnread}
       />
-
-      {!demo && mediaTasksOpen && (
-        <LazyBoundary fallback={<DialogFallback />}>
-          <MediaTaskCenter
-            open={mediaTasksOpen}
-            auth={auth}
-            liveJob={liveMediaJob}
-            onOpenChange={setMediaTasksOpen}
-          />
-        </LazyBoundary>
-      )}
 
       <GithubRepoModal
         open={repoModalOpen}
