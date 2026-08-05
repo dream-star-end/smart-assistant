@@ -907,6 +907,30 @@
           "assertion": "OCR worker tunnel stability drifted during smoke"
         }
       ]
+    },
+    {
+      "id": "INC-20260805-V5-IP-RETRY-TX",
+      "occurredAt": "2026-08-05",
+      "severity": "P1",
+      "symptom": "V5 存量容器 remount 时，随机 bound_ip 首次撞上 23505 unique 冲突后直接在同一 PostgreSQL 事务继续 INSERT，导致事务已中止并在下一次尝试稳定触发 25P02，阻断容器重建。",
+      "rootFixCommit": "43da0df4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/v3Supervisor.test.ts",
+          "assertion": "IP 分配重试的子事务序列；真 PG 会在 23505 后要求 ROLLBACK TO 才能继续"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/v3ProvisionTxWindow.integ.test.ts",
+          "assertion": "随机 IP 首次撞 unique 后回滚到 savepoint，Tx1 可继续用第二个 IP（不触发 25P02）"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-remount-ccb-baseline.ts",
+          "assertion": "reprovision failed"
+        }
+      ]
     }
   ]
 }
