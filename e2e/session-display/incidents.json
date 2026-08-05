@@ -838,6 +838,9 @@
       "severity": "P1",
       "symptom": "qwen3.8-max 通过 Claude Code/Anthropic 兼容协议接入时无法稳定完成 V5 Agent turn，商业版与测试版均表现为模型不可用；直接 OpenAI Responses 探测证明供应商服务正常，故切换到 Codex Responses 适配路径。",
       "rootFixCommit": "ece3f5f8",
+      "coverageCommits": [
+        "7767576a"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -853,6 +856,11 @@
           "layer": "deploy-gate",
           "path": "scripts/v5-runtime-release-lib.sh",
           "assertion": "etc-codex/model-catalog.local.json"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalCodexRelay.test.ts",
+          "assertion": "promotes vision tool output only for the qwen3.8-max Bailian Responses route"
         }
       ]
     }
