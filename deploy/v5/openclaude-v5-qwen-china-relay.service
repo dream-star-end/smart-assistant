@@ -1,0 +1,30 @@
+[Unit]
+Description=OpenClaude V5 Qwen China relay (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/node /opt/openclaude/v5-qwen-china-relay/v5-qwen-china-relay.mjs
+LoadCredential=bailian.key:/root/.secrets/bailian-token-plan.key
+Environment=QWEN_RELAY_HOST=127.0.0.1
+Environment=QWEN_RELAY_PORT=19080
+Restart=always
+RestartSec=3
+TimeoutStopSec=120
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
