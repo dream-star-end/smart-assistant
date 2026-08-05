@@ -1,7 +1,7 @@
 ---
 name: oc-ingest
-description: 用 `oc-ingest` 命令行把用户上传的论文/文档(PDF/TXT/MD/HTML 等)解析成可检索、可引用接地的权威文档。用户上传了 PDF/CAJ/文档要"读这篇""基于这篇分析/综述/提取证据"时使用。解析在平台侧完成,产出 docId 供 oc-litrag 检索。
-tags: [research, ingest, parse, pdf]
+description: 用 `oc-ingest` 把用户文档解析成可检索、可引用接地的权威文档；扫描PDF/图片先用私有 `oc-ocr` 异步OCR，再把完整Markdown入库。用户上传 PDF/图片/CAJ/文档要读、分析、综述或提取证据时使用。
+tags: [research, ingest, parse, pdf, ocr]
 ---
 
 # oc-ingest 文档解析(CLI)
@@ -18,10 +18,25 @@ oc-ingest parse <文件路径>
 - 支持:PDF(有文字层)、TXT、Markdown、HTML。
 - 输出 `{ docId, lang, title, sections, spanCount }`;或 `{ needsOcr: true, reason }`(扫描件无文字层 / CAJ 等需 OCR 引擎)。
 
+## 扫描件 / 图片 OCR
+
+`needsOcr: true` 时不要让用户另找文字版，也不要逐页调用视觉模型。平台有可取消、可见进度的批量 OCR 队列：
+
+```bash
+oc-ocr run <原文件> --out <原文件名>.ocr.md --mode hybrid
+oc-ingest parse <原文件名>.ocr.md
+```
+
+- 默认 `hybrid`：PP-OCRv6 高吞吐识别全部页面，再把每页低置信区域交给 PaddleOCR-VL 修正；适合几百页文档。
+- `--mode pp`：只用 PP，最快；用户明确只要速度或版面很简单时用。
+- `--mode vl`：整页纯 VL，最慢但可用于复杂页面对照；不要默认用于几百页文档。
+- 进度在 stderr 持续显示；Ctrl-C 会取消排队/运行任务。命令一开始会打印 ticket；连接中断后可用 `oc-ocr status <ticket>`、`oc-ocr download <ticket> --out ...` 续取，或 `oc-ocr cancel <ticket>` 取消。
+- OCR 输出按页完整写入 Markdown，不用摘要替代正文、不静默跳页；任何页触发安全物理边界或模型输出不完整时，整单会明确失败。
+
 ## 默认行为
 
 - 拿到 `docId` 后,告诉用户"已解析:<title>(N 段)",并用 `docId` 调 **oc-litrag query** 检索证据。
-- 返回 `needsOcr: true` 时:明确告诉用户该文件是扫描件/需 OCR(当前 runtime 的 local 引擎无文字层可取),建议用户提供有文字层的 PDF;**不要**假装解析成功。
+- 返回 `needsOcr: true` 时：按上面的 `oc-ocr → oc-ingest` 流程继续；若 OCR 服务明确失败，原样说明错误和可重试条件，**不要**假装解析成功。
 - **权威段落文本不会回传到容器** —— 你拿不到全文,只能通过 oc-litrag query 取 quote handle 引用。这是引用接地的设计(防止 LLM 改写原文)。
 
 ## 引用接地链(必读)
@@ -32,7 +47,7 @@ oc-ingest parse <文件路径>
 
 ## 工具调用纪律(重要)
 
-- **只用本 skill 对应的 `oc-*` 命令传参调用**;CLI 已把鉴权、端点、proxy 全部封装好,你只需给参数,不必关心底层怎么请求。
+- **只用本 skill 对应的 `oc-ingest` / `oc-ocr` / `oc-litrag` 命令传参调用**;CLI 已把鉴权、端点、proxy 全部封装好,你只需给参数,不必关心底层怎么请求。
 - **绝不**自己拼 `curl` / `wget` / 直连 HTTP 调用,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token —— 那样既会失败也不安全。
 - 命令失败(401/429/503/超时)按下方「安全」段处理:重试本命令、或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
 
