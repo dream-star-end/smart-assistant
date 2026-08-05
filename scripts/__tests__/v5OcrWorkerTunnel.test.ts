@@ -29,6 +29,25 @@ test("official deploy smoke proves exact OCR readiness, stable tunnel identity, 
   assert.match(smoke, /OCR worker tunnel stability drifted during smoke/);
 });
 
+test("nested supervisor census SSH cannot consume the remaining remote smoke script", () => {
+  const smoke = readFileSync(path.join(root, "scripts/v5-ocr-worker-smoke.sh"), "utf8");
+  assert.match(smoke, /census=\$\(ssh -n "\$\{ssh_args\[@\]\}"/);
+
+  const draining = spawnSync("bash", ["-s"], {
+    input: "consume() { cat >/dev/null; }\nconsume\nprintf 'TAIL_REACHED\\n'\n",
+    encoding: "utf8",
+  });
+  assert.equal(draining.status, 0, draining.stderr);
+  assert.equal(draining.stdout, "", "a nested reader demonstrates how the remaining stdin is lost");
+
+  const isolated = spawnSync("bash", ["-s"], {
+    input: "consume() { cat </dev/null; }\nconsume\nprintf 'TAIL_REACHED\\n'\n",
+    encoding: "utf8",
+  });
+  assert.equal(isolated.status, 0, isolated.stderr);
+  assert.equal(isolated.stdout, "TAIL_REACHED\n");
+});
+
 test("OCR supervisor census excludes its own query shell instead of self-matching", () => {
   const fixture = [
     " 4242 4100 4242 /bin/bash /opt/openclaude-ocr-worker/current/run-supervisor.sh",
