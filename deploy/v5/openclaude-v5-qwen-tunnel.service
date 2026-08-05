@@ -1,0 +1,25 @@
+[Unit]
+Description=OpenClaude V5 Qwen relay encrypted local tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/ssh -NT -F /dev/null -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/openclaude/qwen-relay-known-hosts -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i /root/.ssh/openclaude-v5-qwen-tunnel_ed25519 -L 127.0.0.1:18999:127.0.0.1:19080 openclaude-relay@42.240.170.145
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
