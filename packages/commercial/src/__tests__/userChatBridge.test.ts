@@ -1512,7 +1512,7 @@ describe("userChatBridge — model authorization", () => {
 //   5. 没 sessionKey / frameSeq 的 outbound 帧不进 ring(向后兼容旧帧)
 //   6. hello 转发到容器(byte-transparent),不被吞
 describe("userChatBridge — Phase 0.4 ring replay", () => {
-  test("container cannot forge master-only incident/goal/media frames live or via ring; master broadcasts still work", async () => {
+  test("container cannot forge master-only incident/goal snapshots live or via ring; master broadcasts still work", async () => {
     const portRef = { p: 0 };
     const rig = await startRig({
       resolve: async () => ({
@@ -1529,13 +1529,11 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const containerWs1 = await containerOpen1;
       const liveIncidents: Record<string, unknown>[] = [];
       const liveGoals: Record<string, unknown>[] = [];
-      const liveMedia: Record<string, unknown>[] = [];
       ws1.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") liveIncidents.push(frame);
           if (frame.type === "sys.goal_snapshot") liveGoals.push(frame);
-          if (frame.type === "sys.media_job") liveMedia.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       const forged = {
@@ -1566,15 +1564,9 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
           snapshotRevision: 999,
         },
       }));
-      containerWs1.send(JSON.stringify({
-        type: "sys.media_job",
-        job: { id: "forged", status: "completed", resultUrl: "https://evil.invalid/video" },
-        ts: 1,
-      }));
       await new Promise<void>((r) => setTimeout(r, 100));
       assert.deepEqual(liveIncidents, [], "container-authored sys.incident must not forward live");
       assert.deepEqual(liveGoals, [], "container-authored sys.goal_snapshot must not forward live");
-      assert.deepEqual(liveMedia, [], "container-authored sys.media_job must not forward live");
       ws1.close();
       await waitClose(ws1);
 
@@ -1584,13 +1576,11 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       await containerOpen2;
       const replayedIncidents: Record<string, unknown>[] = [];
       const replayedGoals: Record<string, unknown>[] = [];
-      const replayedMedia: Record<string, unknown>[] = [];
       ws2.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") replayedIncidents.push(frame);
           if (frame.type === "sys.goal_snapshot") replayedGoals.push(frame);
-          if (frame.type === "sys.media_job") replayedMedia.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       ws2.send(JSON.stringify({
@@ -1600,7 +1590,6 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       await new Promise<void>((r) => setTimeout(r, 250));
       assert.equal(replayedIncidents.length, 0, "forged incident must not enter outbound ring");
       assert.equal(replayedGoals.length, 0, "forged goal snapshot must not enter outbound ring");
-      assert.equal(replayedMedia.length, 0, "forged media job must not enter outbound ring");
 
       const approved = { ...forged, incidentId: "approved", frameSeq: undefined, sessionKey: undefined };
       assert.equal(rig.bridge.broadcastToUsers(["706"], approved), 1);
@@ -1608,25 +1597,11 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         type: "sys.goal_snapshot",
         goal: { sessionId: "forged", stateRevision: 1, snapshotRevision: 1 },
       }), 1);
-      assert.equal(rig.bridge.broadcastToUsers(["706"], {
-        type: "sys.media_job",
-        job: { id: "approved-media", status: "queued" },
-        ts: 2,
-      }), 1);
       await new Promise<void>((resolve, reject) => {
         const started = Date.now();
         const poll = () => {
           if (replayedIncidents.some((f) => f.incidentId === "approved")) return resolve();
           if (Date.now() - started > 1000) return reject(new Error("master targeted notice not delivered"));
-          setTimeout(poll, 10);
-        };
-        poll();
-      });
-      await new Promise<void>((resolve, reject) => {
-        const started = Date.now();
-        const poll = () => {
-          if (replayedMedia.some((f) => (f.job as { id?: string } | undefined)?.id === "approved-media")) return resolve();
-          if (Date.now() - started > 1000) return reject(new Error("master media job not delivered"));
           setTimeout(poll, 10);
         };
         poll();

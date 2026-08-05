@@ -44,7 +44,6 @@ import type {
   TurnTokenUsageSnapshot,
 } from "@openclaude/protocol/frames";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 
 export type {
   InboundPromptQueueDelete,
@@ -201,12 +200,6 @@ export type IncidentWire = {
   ts: number;
 };
 
-export type MediaJobWire = {
-  type: "sys.media_job";
-  job: MediaGenerationJob;
-  ts: number;
-};
-
 /** server durable admission / completed-dedup acknowledgement. */
 export type AckWire = {
   type: "outbound.ack";
@@ -270,7 +263,6 @@ export type OutboundWire =
   | ContextRebuiltWire
   | GoalSnapshotWire
   | IncidentWire
-  | MediaJobWire
   | AckWire
   | PongWire
   | RepoStatusWire

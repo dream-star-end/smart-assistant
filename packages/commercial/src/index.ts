@@ -451,12 +451,6 @@ import {
   makeMiniMaxWebSearchHandler,
   type MiniMaxWebSearchHandler,
 } from "./minimax/webSearchProxy.js";
-import { MediaGenerationService } from "./media-generation/service.js";
-import {
-  MEDIA_GENERATION_INTERNAL_PREFIX,
-  makeMediaGenerationInternalHandler,
-  type MediaGenerationInternalHandler,
-} from "./media-generation/http.js";
 import {
   makeInboundDispatcher,
   type PrepareWechatCodexTurnResult,
@@ -1603,22 +1597,6 @@ export async function registerCommercial(
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
   };
-  const mediaGenerationService = new MediaGenerationService({
-    workerUrl: cfg.MEDIA_GENERATION_WORKER_URL,
-    workerToken: cfg.MEDIA_GENERATION_WORKER_TOKEN,
-    stateRoot: cfg.MEDIA_GENERATION_STATE_ROOT,
-    allowUserIds: cfg.MEDIA_GENERATION_ALLOW_USER_IDS,
-    maxInputBytes: cfg.MEDIA_GENERATION_MAX_INPUT_BYTES,
-    maxUserStoredInputBytes: cfg.MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES,
-    broadcast: (uid, frame) => bridgeBroadcastRef.current(uid, frame),
-  });
-  if (runtimeChannel === "v5" && mediaGenerationService.configured()) {
-    leaderBundle.add({
-      name: "mediaGeneration",
-      domain: "v5-owned",
-      start: () => mediaGenerationService.start(),
-    });
-  }
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -1954,8 +1932,6 @@ export async function registerCommercial(
         pgPool: getPool(),
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
       });
-      const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
-        makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService });
       // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
       // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
       // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
@@ -2265,12 +2241,6 @@ export async function registerCommercial(
         }
         if (path === MINIMAX_MEDIA_PATH) {
           return minimaxMediaHandler(req, res, ctx);
-        }
-        if (
-          path === MEDIA_GENERATION_INTERNAL_PREFIX ||
-          path.startsWith(`${MEDIA_GENERATION_INTERNAL_PREFIX}/`)
-        ) {
-          return mediaGenerationInternalHandler(req, res, ctx);
         }
         if (path === MINIMAX_WEB_SEARCH_PATH) {
           return minimaxWebSearchHandler(req, res, ctx);
@@ -3452,7 +3422,6 @@ export async function registerCommercial(
 
   const handler = createCommercialHandler({
     jwtSecret,
-    mediaGeneration: mediaGenerationService,
     goalStateService,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,

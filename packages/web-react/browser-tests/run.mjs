@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -254,50 +254,6 @@ const serveBuiltAsset = (route, request) => {
 };
 // 先注册 catch-all,再注册 harness 页:playwright 后注册者优先,harness URL 命中专用处理。
 await page.route("**/*", serveBuiltAsset);
-await page.route("**/api/media-generation/**", (route, request) => {
-  const url = new URL(request.url());
-  if (url.pathname === "/api/media-generation/capabilities") {
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ available: true }) });
-  }
-  if (url.pathname === "/api/media-generation/jobs" && request.method() === "GET") {
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
-      jobs: [{
-        id: "33333333-3333-4333-8333-333333333333",
-        requestId: "browser-media-request",
-        kind: "h3_generate",
-        resourceClass: "gpu-h3",
-        status: "queued",
-        phase: "queued",
-        prompt: "BROWSER_MEDIA_TASK",
-        sessionId: null,
-        projectId: null,
-        projectShotId: null,
-        currentStep: null,
-        totalSteps: 20,
-        queuePosition: 2,
-        resultUrl: null,
-        resultSha256: null,
-        resultSize: null,
-        errorCode: null,
-        errorMessage: null,
-        createdAt: "2026-08-05T00:00:00.000Z",
-        updatedAt: "2026-08-05T00:00:00.000Z",
-      }],
-      nextCursor: null,
-    }) });
-  }
-  if (url.pathname === "/api/media-generation/projects" && request.method() === "GET") {
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: [], nextCursor: null }) });
-  }
-  if (url.pathname.endsWith("/cancel") && request.method() === "POST") {
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job: {
-      id: "33333333-3333-4333-8333-333333333333", requestId: "browser-media-request",
-      kind: "h3_generate", resourceClass: "gpu-h3", status: "canceled", phase: "canceled",
-      prompt: "BROWSER_MEDIA_TASK", createdAt: "2026-08-05T00:00:00.000Z", updatedAt: "2026-08-05T00:00:01.000Z",
-    } }) });
-  }
-  return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND" } }) });
-});
 await page.route(harnessUrl, (route) => route.fulfill({
   status: 200,
   contentType: "text/html",
@@ -1591,42 +1547,6 @@ await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重
   if (await replayRoot.getByText(/并发会话已达上限|concurrent limit|API Error: 429/).count()) {
     throw new Error("已恢复的中间 API 错误仍渲染为终态红卡");
   }
-});
-
-await check("T30 视频任务中心持久排队、实时进度与可信取消交互", async () => {
-  await page.evaluate(() => window.__openMediaTask(true));
-  await page.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
-  await page.getByText("排队中 · queued", { exact: true }).waitFor({ state: "visible" });
-  await page.evaluate(() => window.__pushMediaJob({
-    id: "33333333-3333-4333-8333-333333333333",
-    requestId: "browser-media-request",
-    kind: "h3_generate",
-    resourceClass: "gpu-h3",
-    status: "running",
-    phase: "sampling",
-    prompt: "BROWSER_MEDIA_TASK",
-    sessionId: null,
-    projectId: null,
-    projectShotId: null,
-    currentStep: 7,
-    totalSteps: 20,
-    queuePosition: null,
-    resultUrl: null,
-    resultSha256: null,
-    resultSize: null,
-    errorCode: null,
-    errorMessage: null,
-    createdAt: "2026-08-05T00:00:00.000Z",
-    updatedAt: "2026-08-05T00:00:01.000Z",
-  }));
-  await page.getByText("7/20", { exact: true }).waitFor({ state: "visible" });
-  const canceled = page.waitForRequest((request) =>
-    request.method() === "POST" && request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
-  );
-  await page.getByRole("button", { name: "取消" }).click();
-  const request = await canceled;
-  if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
-  await page.evaluate(() => window.__openMediaTask(false));
 });
 
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
