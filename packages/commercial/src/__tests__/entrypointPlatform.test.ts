@@ -479,29 +479,29 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     assert.match(src, /minimal main-only/);
   });
 
-  test("entrypoint.ts exposes oc-plugin to login shells without violating validate-only or overwriting user files", () => {
+  test("entrypoint.ts exposes bundle-only CLIs to login shells without violating validate-only or overwriting user files", () => {
     const src = readFileSync(ENTRYPOINT_TS, "utf8");
-    assert.match(
-      src,
-      /const PLATFORM_PLUGIN_SOURCE = "\/run\/oc\/platform\/current\/bin\/oc-plugin"/,
-    );
+    assert.match(src, /const PLATFORM_BIN_DIR = "\/run\/oc\/platform\/current\/bin"/);
     assert.match(src, /const USER_PLATFORM_BIN_DIR = "\/home\/agent\/\.local\/bin"/);
-    assert.match(src, /lstatSync\(USER_PLUGIN_LINK\)/);
-    assert.match(src, /readlinkSync\(USER_PLUGIN_LINK\) !== PLATFORM_PLUGIN_SOURCE/);
-    assert.match(src, /symlinkSync\(PLATFORM_PLUGIN_SOURCE, USER_PLUGIN_LINK\)/);
+    assert.match(src, /const PLATFORM_LINKED_CLIS = \["oc-plugin", "oc-ocr"\] as const/);
+    assert.match(src, /const source = join\(PLATFORM_BIN_DIR, cliName\)/);
+    assert.match(src, /const userLink = join\(USER_PLATFORM_BIN_DIR, cliName\)/);
+    assert.match(src, /lstatSync\(userLink\)/);
+    assert.match(src, /readlinkSync\(userLink\) !== source/);
+    assert.match(src, /symlinkSync\(source, userLink\)/);
     assert.match(src, /already exists with an unexpected target; preserved/);
     assert.doesNotMatch(
       src,
-      /unlinkSync\(USER_PLUGIN_LINK\)/,
+      /unlinkSync\(userLink\)/,
       "entrypoint 不得删除用户已有的普通文件、目录或异向链接",
     );
 
     const validateOnlyIdx = src.indexOf('if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1")');
     const validateExitIdx = src.indexOf("process.exit(0);", validateOnlyIdx);
-    const pluginLinkIdx = src.indexOf("const PLATFORM_PLUGIN_SOURCE");
+    const platformLinkIdx = src.indexOf("const PLATFORM_LINKED_CLIS");
     assert.ok(
-      validateOnlyIdx > 0 && validateExitIdx > validateOnlyIdx && pluginLinkIdx > validateExitIdx,
-      "oc-plugin 链接写入必须位于 validate-only 早退之后",
+      validateOnlyIdx > 0 && validateExitIdx > validateOnlyIdx && platformLinkIdx > validateExitIdx,
+      "platform CLI 链接写入必须位于 validate-only 早退之后",
     );
   });
 

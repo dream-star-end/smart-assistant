@@ -864,6 +864,30 @@
           "assertion": "promotes vision tool output only for the qwen3.8-max Bailian Responses route"
         }
       ]
+    },
+    {
+      "id": "INC-20260805-OCR-CLI-PATH",
+      "occurredAt": "2026-08-05",
+      "severity": "P1",
+      "symptom": "V5 OCR 的 platform bundle 已包含 oc-ocr 可执行文件，但登录 shell 的 PATH 不含 bundle bin，entrypoint 又只为 oc-plugin 创建保留名链接，导致真实存量容器中 Agent 按技能调用 oc-ocr 时命令不存在。",
+      "rootFixCommit": "ee3b2e6e",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/entrypointPlatform.test.ts",
+          "assertion": "entrypoint.ts exposes bundle-only CLIs to login shells without violating validate-only or overwriting user files"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5RemountCcbBaseline.test.ts",
+          "assertion": "official remount fail-loud verifies oc-plugin and oc-ocr PATH links inside the rebuilt container"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-remount-ccb-baseline.ts",
+          "assertion": "reprovisioned container platform CLI PATH links are incomplete"
+        }
+      ]
     }
   ]
 }
