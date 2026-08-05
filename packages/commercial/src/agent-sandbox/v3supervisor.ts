@@ -1748,8 +1748,9 @@ async function ensureSshUserRunDir(uid: number): Promise<string> {
 // ───────────────────────────────────────────────────────────────────────
 
 /**
- * 在事务内 INSERT 一行 active container 占住 bound_ip,撞 uniq 冲突就 ROLLBACK
- * 重试。成功返回 row id(用于拼 token,然后再 UPDATE container_internal_id)。
+ * 在事务内 INSERT 一行 active container 占住 bound_ip,撞 IP uniq 冲突就回滚到
+ * 本次尝试的 SAVEPOINT 后换 IP 重试。成功返回 row id(用于拼 token,然后再 UPDATE
+ * container_internal_id)。
  *
  * 为什么用"先 INSERT 占位、后 docker create"的顺序:
  *   - 占位的 row 决定 row id,row id 进 token,token 进容器 env。
@@ -1813,10 +1814,15 @@ async function allocateBoundIpAndInsertRow(
   // 单机 MVP 路径:randomIp + retry-on-uniq-conflict
   for (let attempt = 0; attempt < V3_IP_ALLOC_MAX_ATTEMPTS; attempt++) {
     const candidate = pickIp();
+    // PostgreSQL 任一语句错误都会把当前事务置为 aborted；若 23505 后直接
+    // continue，下一次 INSERT 必然得到 25P02。每次尝试用 SAVEPOINT 隔离，
+    // 只对明确的 IP unique 冲突回滚子事务，外层 Tx1/双 advisory lock 仍保持。
+    await client.query("SAVEPOINT oc_v3_ip_alloc_attempt");
     try {
       const r = await client.query<{ id: string }>(insertSql, [
         String(uid), hostUuid, candidate, secretHash, V3_CONTAINER_PORT, image, getRuntimeChannel(),
       ]);
+      await client.query("RELEASE SAVEPOINT oc_v3_ip_alloc_attempt");
       const id = Number.parseInt(r.rows[0]!.id, 10);
       return { id, boundIp: candidate };
     } catch (err) {
@@ -1835,7 +1841,9 @@ async function allocateBoundIpAndInsertRow(
           || /uniq_ac_bound_ip_active|idx_ac_host_bound_ip_active/i.test(String((err as Error).message))
         )
       ) {
-        // IP 撞了,换一个继续
+        // IP 撞了：先恢复事务可用态并释放本次 savepoint，再换一个继续。
+        await client.query("ROLLBACK TO SAVEPOINT oc_v3_ip_alloc_attempt");
+        await client.query("RELEASE SAVEPOINT oc_v3_ip_alloc_attempt");
         continue;
       }
       throw err;

@@ -189,6 +189,47 @@ function skip(t: { skip: (r: string) => void }): boolean {
 }
 
 describe("provisionV3Container saga — 真 PG 事务窗口", () => {
+  test("随机 IP 首次撞 unique 后回滚到 savepoint，Tx1 可继续用第二个 IP（不触发 25P02）", async (t) => {
+    if (skip(t)) return;
+    const hostId = await insertSelfHost(10);
+    await seedUser(4202);
+    await seedUser(4203);
+    const occupiedIp = "172.31.0.42";
+    const freeIp = "172.31.0.43";
+    await query(
+      `INSERT INTO agent_containers(
+         user_id, host_uuid, bound_ip, secret_hash, state, port, image,
+         runtime_channel, container_internal_id, last_ws_activity, created_at, updated_at
+       ) VALUES (
+         $1::bigint, $2::uuid, $3::inet, decode(repeat('01', 32), 'hex'),
+         'active', 18789, $4, 'v5', 'occupied-container', NOW(), NOW(), NOW()
+       )`,
+      ["4202", hostId, occupiedIp, TEST_IMAGE],
+    );
+    const pool = createPool({ connectionString: TEST_DB_URL, max: 4 });
+    try {
+      const { docker } = makeIntegFakeDocker();
+      const ips = [occupiedIp, freeIp];
+      const deps = makeDeps(pool, docker, hostId);
+      deps.randomIp = () => {
+        const next = ips.shift();
+        if (!next) throw new Error("randomIp fixture exhausted");
+        return next;
+      };
+      const result = await provisionV3Container(deps, 4203, hostId);
+      assert.equal(result.boundIp, freeIp);
+      const row = await query<{ bound_ip: string; state: string }>(
+        `SELECT host(bound_ip) AS bound_ip, state
+           FROM agent_containers
+          WHERE user_id=$1::bigint AND state='active'`,
+        ["4203"],
+      );
+      assert.deepEqual(row.rows, [{ bound_ip: freeIp, state: "active" }]);
+    } finally {
+      await pool.end();
+    }
+  });
+
   test("判决性:idle_in_transaction_session_timeout=1s + docker create 睡 2s → provision 成功,连接不被强断", async (t) => {
     if (skip(t)) return;
     const hostId = await insertSelfHost(10);

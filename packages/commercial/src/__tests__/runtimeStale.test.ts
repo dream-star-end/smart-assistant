@@ -118,6 +118,9 @@ class FakePool {
 
   private runQuery(sql: string, params?: unknown[]): unknown {
     const t = String(sql).trim();
+    if (/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) oc_v3_ip_alloc_attempt$/i.test(t)) {
+      return { rowCount: 0, rows: [] };
+    }
     if (/^BEGIN/i.test(t) || /^COMMIT/i.test(t) || /^ROLLBACK/i.test(t)) return { rowCount: 0, rows: [] };
     if (/^SELECT pg_advisory_xact_lock/i.test(t)) return { rowCount: 0, rows: [] };
     if (/INSERT INTO agent_containers/i.test(t)) {

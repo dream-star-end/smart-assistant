@@ -153,6 +153,9 @@ class FakePool {
 
   private async runQuery(sql: string, params?: unknown[]): Promise<unknown> {
     const trimmed = String(sql).trim();
+    if (/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT) oc_v3_ip_alloc_attempt$/i.test(trimmed)) {
+      return { rowCount: 0, rows: [] };
+    }
     if (/^BEGIN/i.test(trimmed)) return { rowCount: 0, rows: [] };
     if (/^COMMIT/i.test(trimmed)) return { rowCount: 0, rows: [] };
     if (/^ROLLBACK/i.test(trimmed)) return { rowCount: 0, rows: [] };

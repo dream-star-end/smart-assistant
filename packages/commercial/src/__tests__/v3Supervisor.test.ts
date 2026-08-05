@@ -288,6 +288,8 @@ class FakePool {
   }
   /** 第几次 connect 时返回的 client。每次 BEGIN/COMMIT/ROLLBACK 都记。 */
   clientLog: Array<"BEGIN" | "COMMIT" | "ROLLBACK"> = [];
+  /** IP 分配重试的子事务序列；真 PG 会在 23505 后要求 ROLLBACK TO 才能继续。 */
+  ipSavepointLog: Array<"SAVEPOINT" | "ROLLBACK TO" | "RELEASE"> = [];
   /** test 钩子:第 N 次 INSERT 强制抛 23505(模拟 uniq 冲突),序号从 0 开始 */
   forceUniqConflictOnInserts: Set<number> = new Set();
   /**
@@ -321,6 +323,18 @@ class FakePool {
         }
         if (/^COMMIT/i.test(trimmed)) {
           log.push("COMMIT");
+          return { rowCount: 0, rows: [] };
+        }
+        if (/^SAVEPOINT oc_v3_ip_alloc_attempt$/i.test(trimmed)) {
+          self.ipSavepointLog.push("SAVEPOINT");
+          return { rowCount: 0, rows: [] };
+        }
+        if (/^ROLLBACK TO SAVEPOINT oc_v3_ip_alloc_attempt$/i.test(trimmed)) {
+          self.ipSavepointLog.push("ROLLBACK TO");
+          return { rowCount: 0, rows: [] };
+        }
+        if (/^RELEASE SAVEPOINT oc_v3_ip_alloc_attempt$/i.test(trimmed)) {
+          self.ipSavepointLog.push("RELEASE");
           return { rowCount: 0, rows: [] };
         }
         if (/^ROLLBACK/i.test(trimmed)) {
@@ -949,6 +963,11 @@ describe("provisionV3Container", () => {
     assert.equal(result.boundIp, "172.30.0.12");
     assert.equal(pool.insertCount, 3);
     assert.equal(pool.rows.length, 1);
+    assert.deepEqual(pool.ipSavepointLog, [
+      "SAVEPOINT", "ROLLBACK TO", "RELEASE",
+      "SAVEPOINT", "ROLLBACK TO", "RELEASE",
+      "SAVEPOINT", "RELEASE",
+    ]);
     // retry 路径每次重试都要带 image,不能 conflict 后丢字段(v1.0.200 image col 回归锁)
     assert.equal(pool.rows[0]!.image, TEST_IMAGE);
   });
@@ -986,6 +1005,11 @@ describe("provisionV3Container", () => {
     assert.equal(result.boundIp, "172.30.0.12");
     assert.equal(pool.insertCount, 3);
     assert.equal(pool.rows.length, 1);
+    assert.deepEqual(pool.ipSavepointLog, [
+      "SAVEPOINT", "ROLLBACK TO", "RELEASE",
+      "SAVEPOINT", "ROLLBACK TO", "RELEASE",
+      "SAVEPOINT", "RELEASE",
+    ]);
   });
 
   test("docker createContainer 失败 → Tx1 提交后中段失败,补偿翻 vanished(不留 active 行)", async () => {
