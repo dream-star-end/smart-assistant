@@ -27,6 +27,8 @@ export type WorkerUpload = Pick<
   'storagePath' | 'sha256' | 'sizeBytes' | 'mime' | 'kind' | 'workerFilename'
 >
 
+const WORKER_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+
 export class MediaWorkerHttpError extends Error {
   constructor(
     readonly status: number,
@@ -97,22 +99,35 @@ export class MediaWorkerClient {
     input: WorkerUpload,
     external?: AbortSignal,
   ): Promise<void> {
-    const response = await fetch(this.url(job, `inputs/${ordinal}`), {
-      method: 'PUT',
-      headers: {
-        ...this.headers(job),
-        'content-length': String(input.sizeBytes),
-        'content-type': input.mime,
-        'x-content-sha256': input.sha256,
-        'x-content-size': String(input.sizeBytes),
-        'x-input-kind': input.kind,
-        'x-input-filename': input.workerFilename,
-      },
-      body: createReadStream(input.storagePath) as unknown as BodyInit,
-      duplex: 'half',
-      signal: this.signal(30 * 60_000, external),
-    } as RequestInit & { duplex: 'half' })
-    await this.checked(response)
+    let offset = 0
+    do {
+      const chunkSize = Math.min(WORKER_UPLOAD_CHUNK_BYTES, input.sizeBytes - offset)
+      const body =
+        chunkSize === 0
+          ? Buffer.alloc(0)
+          : createReadStream(input.storagePath, {
+              start: offset,
+              end: offset + chunkSize - 1,
+            })
+      const response = await fetch(this.url(job, `inputs/${ordinal}`), {
+        method: 'PUT',
+        headers: {
+          ...this.headers(job),
+          'content-length': String(chunkSize),
+          'content-type': input.mime,
+          'x-content-sha256': input.sha256,
+          'x-content-size': String(input.sizeBytes),
+          'x-input-kind': input.kind,
+          'x-input-filename': input.workerFilename,
+          'x-upload-offset': String(offset),
+        },
+        body: body as unknown as BodyInit,
+        duplex: 'half',
+        signal: this.signal(30 * 60_000, external),
+      } as RequestInit & { duplex: 'half' })
+      await this.checked(response)
+      offset += chunkSize
+    } while (offset < input.sizeBytes)
   }
 
   async submit(

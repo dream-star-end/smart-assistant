@@ -166,7 +166,10 @@ class Store:
                 (job_id, attempt_id, item["ordinal"]),
             ).fetchone()
             if existing is not None:
-                if existing["sha256"] != item["sha256"] or existing["size"] != item["size"]:
+                if any(
+                    existing[key] != item[key]
+                    for key in ("sha256", "size", "mime", "kind", "filename")
+                ):
                     raise Conflict("input_ordinal_conflict")
                 return
             self.db.execute(
@@ -273,6 +276,7 @@ class Worker:
         (self.root / "attempts").mkdir(exist_ok=True)
         self.store = Store(self.root / "worker.sqlite")
         self.process_lock = threading.RLock()
+        self.upload_lock = threading.RLock()
         self.ffmpeg = shutil.which(os.environ.get("H3_WORKER_FFMPEG", "ffmpeg"))
         self.ffprobe = shutil.which(os.environ.get("H3_WORKER_FFPROBE", "ffprobe"))
         self.compose_capable = self._probe_compose()
@@ -353,6 +357,27 @@ class Worker:
         directory = self._attempt_dir(job_id, attempt_id) / "inputs"
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{ordinal:03d}-{sha}-{filename}"
+        offset_header = headers.get("X-Upload-Offset")
+        if offset_header is not None:
+            chunk_size = int(headers.get("Content-Length", "-1"))
+            offset = int(offset_header)
+            if offset < 0 or chunk_size < 0 or offset + chunk_size > size:
+                raise ValueError("invalid_upload_range")
+            return self._put_input_chunk(
+                job_id,
+                attempt_id,
+                fence,
+                ordinal,
+                sha,
+                size,
+                mime,
+                kind,
+                filename,
+                target,
+                offset,
+                chunk_size,
+                stream,
+            )
         temp = target.with_suffix(target.suffix + ".part")
         digest = hashlib.sha256()
         remaining = size
@@ -373,6 +398,155 @@ class Worker:
             "ordinal": ordinal, "kind": kind, "filename": filename, "sha256": sha,
             "size": size, "mime": mime, "path": str(target),
         })
+
+    @staticmethod
+    def _input_matches(row, manifest):
+        return all(row[key] == manifest[key] for key in ("sha256", "size", "mime", "kind", "filename"))
+
+    @staticmethod
+    def _chunk_ranges(upload_dir):
+        ranges = []
+        for path in upload_dir.glob("*.chunk"):
+            match = re.fullmatch(r"(\d{20})-(\d{20})\.chunk", path.name)
+            if match:
+                ranges.append((int(match.group(1)), int(match.group(2)), path))
+        ranges.sort()
+        coverage = 0
+        for offset, length, _path in ranges:
+            if offset != coverage:
+                raise Conflict("upload_range_state_invalid")
+            coverage += length
+        return ranges, coverage
+
+    @staticmethod
+    def _write_atomic(path, data):
+        temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        with temp.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+
+    def _put_input_chunk(
+        self,
+        job_id,
+        attempt_id,
+        fence,
+        ordinal,
+        sha,
+        size,
+        mime,
+        kind,
+        filename,
+        target,
+        offset,
+        chunk_size,
+        stream,
+    ):
+        directory = target.parent
+        upload_dir = directory / f".upload-{ordinal:03d}"
+        pending = directory / (
+            f".upload-{ordinal:03d}-pending-{offset:020d}-{os.getpid()}-"
+            f"{threading.get_ident()}-{time.time_ns()}"
+        )
+        remaining = chunk_size
+        try:
+            with pending.open("xb") as handle:
+                while remaining:
+                    chunk = stream.read1(min(64 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("short_input_stream")
+                    self.touch_session_lease()
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            manifest = {
+                "fence": fence,
+                "sha256": sha,
+                "size": size,
+                "mime": mime,
+                "kind": kind,
+                "filename": filename,
+            }
+            encoded_manifest = json.dumps(
+                manifest, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            item = {
+                "ordinal": ordinal,
+                "kind": kind,
+                "filename": filename,
+                "sha256": sha,
+                "size": size,
+                "mime": mime,
+                "path": str(target),
+            }
+
+            with self.upload_lock:
+                self.store.ensure_staging(job_id, attempt_id, fence)
+                existing = next(
+                    (row for row in self.store.inputs(job_id, attempt_id) if row["ordinal"] == ordinal),
+                    None,
+                )
+                if existing is not None:
+                    if not self._input_matches(existing, manifest):
+                        raise Conflict("input_ordinal_conflict")
+                    shutil.rmtree(upload_dir, ignore_errors=True)
+                    return
+
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = upload_dir / "manifest.json"
+                if manifest_path.exists():
+                    if manifest_path.read_bytes() != encoded_manifest:
+                        raise Conflict("upload_manifest_conflict")
+                else:
+                    self._write_atomic(manifest_path, encoded_manifest)
+
+                if target.exists():
+                    if target.stat().st_size != size or sha256_file(target) != sha:
+                        raise Conflict("published_input_integrity_failed")
+                    self.store.put_input(job_id, attempt_id, item)
+                    shutil.rmtree(upload_dir, ignore_errors=True)
+                    return
+
+                ranges, coverage = self._chunk_ranges(upload_dir)
+                canonical = upload_dir / f"{offset:020d}-{chunk_size:020d}.chunk"
+                if canonical.exists():
+                    if canonical.stat().st_size != chunk_size or sha256_file(canonical) != sha256_file(pending):
+                        raise Conflict("upload_chunk_conflict")
+                else:
+                    if offset != coverage:
+                        raise Conflict("upload_offset_conflict")
+                    os.replace(pending, canonical)
+
+                ranges, coverage = self._chunk_ranges(upload_dir)
+                if coverage < size:
+                    return
+                if coverage != size:
+                    raise Conflict("upload_range_state_invalid")
+
+                final_temp = upload_dir / (
+                    f".final-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}.tmp"
+                )
+                digest = hashlib.sha256()
+                with final_temp.open("xb") as output:
+                    for _chunk_offset, _chunk_length, path in ranges:
+                        with path.open("rb") as source:
+                            for block in iter(lambda: source.read(1024 * 1024), b""):
+                                digest.update(block)
+                                output.write(block)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if digest.hexdigest() != sha:
+                    final_temp.unlink(missing_ok=True)
+                    shutil.rmtree(upload_dir)
+                    raise ValueError("input_sha256_mismatch")
+                os.replace(final_temp, target)
+                self.store.put_input(job_id, attempt_id, item)
+                shutil.rmtree(upload_dir, ignore_errors=True)
+        finally:
+            pending.unlink(missing_ok=True)
 
     def submit(self, job_id, attempt_id, body):
         self._validate_ids(job_id, attempt_id)
@@ -413,19 +587,20 @@ class Worker:
         return self.public_row(self.store.row(job_id, attempt_id))
 
     def ack(self, job_id, attempt_id, fence):
-        row = self.store.row(job_id, attempt_id)
-        if row is None:
-            raise FileNotFoundError
-        if row["fence_version"] != fence:
-            raise Conflict("stale_fence")
-        if row["status"] not in TERMINAL:
-            raise Conflict("attempt_not_terminal")
-        directory = self._attempt_dir(job_id, attempt_id)
-        if directory.exists():
-            shutil.rmtree(directory)
-        if directory.exists():
-            raise OSError("attempt_directory_cleanup_failed")
-        self.store.ack_scrub(job_id, attempt_id)
+        with self.upload_lock:
+            row = self.store.row(job_id, attempt_id)
+            if row is None:
+                raise FileNotFoundError
+            if row["fence_version"] != fence:
+                raise Conflict("stale_fence")
+            if row["status"] not in TERMINAL:
+                raise Conflict("attempt_not_terminal")
+            directory = self._attempt_dir(job_id, attempt_id)
+            if directory.exists():
+                shutil.rmtree(directory)
+            if directory.exists():
+                raise OSError("attempt_directory_cleanup_failed")
+            self.store.ack_scrub(job_id, attempt_id)
 
     def public_row(self, row):
         if row is None:

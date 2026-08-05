@@ -6,6 +6,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -43,6 +44,30 @@ class WorkerContractTest(unittest.TestCase):
             "Content-Type": "image/png",
             "X-Input-Kind": "reference_image",
             "X-Input-Filename": "reference.png",
+        })
+        self.worker.put_input(job, attempt, fence, ordinal, headers, io.BytesIO(data))
+        return digest
+
+    def chunk_upload(
+        self,
+        data,
+        full_data,
+        offset,
+        job="job-chunk",
+        attempt="attempt-chunk",
+        fence=1,
+        ordinal=0,
+        mime="application/octet-stream",
+    ):
+        digest = hashlib.sha256(full_data).hexdigest()
+        headers = Headers({
+            "X-Content-SHA256": digest,
+            "X-Content-Size": str(len(full_data)),
+            "Content-Length": str(len(data)),
+            "Content-Type": mime,
+            "X-Input-Kind": "reference_image",
+            "X-Input-Filename": "chunked.bin",
+            "X-Upload-Offset": str(offset),
         })
         self.worker.put_input(job, attempt, fence, ordinal, headers, io.BytesIO(data))
         return digest
@@ -133,6 +158,127 @@ class WorkerContractTest(unittest.TestCase):
         self.worker.put_input("lease-read1", "a1", 1, 0, headers, IncrementalStream())
         row = self.worker.store.inputs("lease-read1", "a1")[0]
         self.assertEqual(Path(row["path"]).read_bytes(), data)
+
+    def test_chunked_input_is_immutable_idempotent_and_published_only_when_complete(self):
+        payload = b"abcdefghij"
+        self.chunk_upload(payload[:4], payload, 0)
+        self.chunk_upload(payload[:4], payload, 0)
+        upload_dir = self.worker._attempt_dir("job-chunk", "attempt-chunk") / "inputs/.upload-000"
+        self.assertEqual(len(list(upload_dir.glob("*.chunk"))), 1)
+        self.assertEqual(self.worker.store.inputs("job-chunk", "attempt-chunk"), [])
+
+        self.chunk_upload(payload[4:8], payload, 4)
+        self.chunk_upload(payload[8:], payload, 8)
+        rows = self.worker.store.inputs("job-chunk", "attempt-chunk")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(Path(rows[0]["path"]).read_bytes(), payload)
+        self.assertFalse(upload_dir.exists())
+
+        self.chunk_upload(payload[:4], payload, 0)
+        self.assertEqual(len(self.worker.store.inputs("job-chunk", "attempt-chunk")), 1)
+
+    def test_chunked_input_rejects_gaps_overlaps_and_manifest_drift_without_committing_them(self):
+        payload = b"abcdefghij"
+        self.chunk_upload(payload[:4], payload, 0)
+        upload_dir = self.worker._attempt_dir("job-chunk", "attempt-chunk") / "inputs/.upload-000"
+        committed = [(path.name, path.read_bytes()) for path in upload_dir.glob("*.chunk")]
+
+        with self.assertRaisesRegex(Conflict, "upload_offset_conflict"):
+            self.chunk_upload(payload[8:], payload, 8)
+        with self.assertRaisesRegex(Conflict, "upload_offset_conflict"):
+            self.chunk_upload(payload[2:6], payload, 2)
+        with self.assertRaisesRegex(Conflict, "upload_manifest_conflict"):
+            self.chunk_upload(payload[4:8], payload, 4, mime="image/png")
+        self.assertEqual([(path.name, path.read_bytes()) for path in upload_dir.glob("*.chunk")], committed)
+
+    def test_chunked_input_short_body_commits_nothing_and_whole_sha_failure_resets_cleanly(self):
+        payload = b"abcdef"
+        headers = Headers({
+            "X-Content-SHA256": hashlib.sha256(payload).hexdigest(),
+            "X-Content-Size": str(len(payload)),
+            "Content-Length": "4",
+            "Content-Type": "application/octet-stream",
+            "X-Input-Kind": "reference_image",
+            "X-Input-Filename": "chunked.bin",
+            "X-Upload-Offset": "0",
+        })
+        with self.assertRaisesRegex(ValueError, "short_input_stream"):
+            self.worker.put_input("short", "a1", 1, 0, headers, io.BytesIO(b"ab"))
+        short_inputs = self.worker._attempt_dir("short", "a1") / "inputs"
+        self.assertEqual(list(short_inputs.iterdir()), [])
+
+        self.chunk_upload(b"abcX", payload, 0)
+        with self.assertRaisesRegex(ValueError, "input_sha256_mismatch"):
+            self.chunk_upload(payload[4:], payload, 4)
+        upload_dir = self.worker._attempt_dir("job-chunk", "attempt-chunk") / "inputs/.upload-000"
+        self.assertFalse(upload_dir.exists())
+        self.assertEqual(self.worker.store.inputs("job-chunk", "attempt-chunk"), [])
+
+        self.chunk_upload(payload[:4], payload, 0)
+        self.chunk_upload(payload[4:], payload, 4)
+        row = self.worker.store.inputs("job-chunk", "attempt-chunk")[0]
+        self.assertEqual(Path(row["path"]).read_bytes(), payload)
+
+    def test_ack_wins_after_chunk_body_lands_without_recreating_attempt_artifacts(self):
+        payload = b"abcdefgh"
+        digest = hashlib.sha256(payload).hexdigest()
+        headers = Headers({
+            "X-Content-SHA256": digest,
+            "X-Content-Size": str(len(payload)),
+            "Content-Length": str(len(payload)),
+            "Content-Type": "application/octet-stream",
+            "X-Input-Kind": "reference_image",
+            "X-Input-Filename": "chunked.bin",
+            "X-Upload-Offset": "0",
+        })
+        job_id = "job-ack-race"
+        attempt_id = "attempt-ack-race"
+        errors = []
+
+        def upload():
+            try:
+                self.worker.put_input(
+                    job_id, attempt_id, 1, 0, headers, io.BytesIO(payload)
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        directory = self.worker._attempt_dir(job_id, attempt_id)
+        with self.worker.upload_lock:
+            thread = threading.Thread(target=upload)
+            thread.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                pending = list((directory / "inputs").glob(".upload-000-pending-*"))
+                if pending and pending[0].stat().st_size == len(payload):
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("chunk body did not land before timeout")
+            self.assertTrue(
+                self.worker.store.cas_terminal(job_id, attempt_id, 1, "canceled")
+            )
+            self.worker.ack(job_id, attempt_id, 1)
+
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], Conflict)
+        self.assertEqual(str(errors[0]), "attempt_not_staging")
+        self.assertFalse(directory.exists())
+        self.assertEqual(self.worker.store.inputs(job_id, attempt_id), [])
+
+    def test_chunked_input_recovers_final_publish_before_database_registration(self):
+        payload = b"abcdefgh"
+        self.chunk_upload(payload[:4], payload, 0)
+        with patch.object(self.worker.store, "put_input", side_effect=RuntimeError("lost-db-write")):
+            with self.assertRaisesRegex(RuntimeError, "lost-db-write"):
+                self.chunk_upload(payload[4:], payload, 4)
+        self.assertEqual(self.worker.store.inputs("job-chunk", "attempt-chunk"), [])
+
+        self.chunk_upload(payload[:4], payload, 0)
+        row = self.worker.store.inputs("job-chunk", "attempt-chunk")[0]
+        self.assertEqual(Path(row["path"]).read_bytes(), payload)
 
     def test_only_authenticated_requests_refresh_session_lease(self):
         server, thread = self.server()

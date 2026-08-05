@@ -246,18 +246,45 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     download: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['download'], /download <ticket>/),
   },
   'oc-h3': {
-    generate: scriptProbe('oc-h3.py', ['generate', '--help'], { code: 0, stdout: /--duration \{5,10,15\}/ }),
+    generate: scriptProbe('oc-h3.py', ['generate', '--help'], {
+      code: 0,
+      stdout: /--duration \{5,10,15\}/,
+    }),
     status: scriptProbe('oc-h3.py', ['status', '--help'], { code: 0, stdout: /job_id/ }),
     cancel: scriptProbe('oc-h3.py', ['cancel', '--help'], { code: 0, stdout: /job_id/ }),
     download: scriptProbe('oc-h3.py', ['download', '--help'], { code: 0, stdout: /--out/ }),
-    project: scriptProbe('oc-h3.py', ['project', '--help'], { code: 0, stdout: /regenerate-shot,accept-shot/ }),
-    'project.create': scriptProbe('oc-h3.py', ['project', 'create', '--help'], { code: 0, stdout: /--last-frame/ }),
-    'project.status': scriptProbe('oc-h3.py', ['project', 'status', '--help'], { code: 0, stdout: /project_id/ }),
-    'project.edit': scriptProbe('oc-h3.py', ['project', 'edit', '--help'], { code: 0, stdout: /--storyboard/ }),
-    'project.start': scriptProbe('oc-h3.py', ['project', 'start', '--help'], { code: 0, stdout: /--expected-rev/ }),
-    'project.render': scriptProbe('oc-h3.py', ['project', 'render', '--help'], { code: 0, stdout: /--expected-rev/ }),
-    'project.regenerate-shot': scriptProbe('oc-h3.py', ['project', 'regenerate-shot', '--help'], { code: 0, stdout: /shot_id/ }),
-    'project.accept-shot': scriptProbe('oc-h3.py', ['project', 'accept-shot', '--help'], { code: 0, stdout: /shot_id/ }),
+    project: scriptProbe('oc-h3.py', ['project', '--help'], {
+      code: 0,
+      stdout: /regenerate-shot,accept-shot/,
+    }),
+    'project.create': scriptProbe('oc-h3.py', ['project', 'create', '--help'], {
+      code: 0,
+      stdout: /--last-frame/,
+    }),
+    'project.status': scriptProbe('oc-h3.py', ['project', 'status', '--help'], {
+      code: 0,
+      stdout: /project_id/,
+    }),
+    'project.edit': scriptProbe('oc-h3.py', ['project', 'edit', '--help'], {
+      code: 0,
+      stdout: /--storyboard/,
+    }),
+    'project.start': scriptProbe('oc-h3.py', ['project', 'start', '--help'], {
+      code: 0,
+      stdout: /--expected-rev/,
+    }),
+    'project.render': scriptProbe('oc-h3.py', ['project', 'render', '--help'], {
+      code: 0,
+      stdout: /--expected-rev/,
+    }),
+    'project.regenerate-shot': scriptProbe('oc-h3.py', ['project', 'regenerate-shot', '--help'], {
+      code: 0,
+      stdout: /shot_id/,
+    }),
+    'project.accept-shot': scriptProbe('oc-h3.py', ['project', 'accept-shot', '--help'], {
+      code: 0,
+      stdout: /shot_id/,
+    }),
   },
   'oc-lit': {
     search: tsFailureProbe('packages/gateway/src/ocLitCli.ts', ['search'], /search <query>/),
@@ -441,8 +468,14 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     edit: scriptProbe('oc-video.sh', ['edit', '--help'], { code: 0, stdout: /--storyboard/ }),
     start: scriptProbe('oc-video.sh', ['start', '--help'], { code: 0, stdout: /--expected-rev/ }),
     render: scriptProbe('oc-video.sh', ['render', '--help'], { code: 0, stdout: /--expected-rev/ }),
-    'regenerate-shot': scriptProbe('oc-video.sh', ['regenerate-shot', '--help'], { code: 0, stdout: /shot_id/ }),
-    'accept-shot': scriptProbe('oc-video.sh', ['accept-shot', '--help'], { code: 0, stdout: /shot_id/ }),
+    'regenerate-shot': scriptProbe('oc-video.sh', ['regenerate-shot', '--help'], {
+      code: 0,
+      stdout: /shot_id/,
+    }),
+    'accept-shot': scriptProbe('oc-video.sh', ['accept-shot', '--help'], {
+      code: 0,
+      stdout: /shot_id/,
+    }),
   },
   'oc-web-context': {
     health_check: webContextProbe({ op: 'health_check' }, (value) => {
@@ -652,17 +685,48 @@ function xlsxCommands(): Set<string> {
 function h3Commands(projectOnly = false): Set<string> {
   const value = source('packages/commercial/agent-sandbox/platform-runtime/bin/oc-h3.py')
   const required = [
-    'generate', 'status', 'cancel', 'download', 'project',
-    'create', 'edit', 'start', 'render', 'regenerate-shot', 'accept-shot',
+    'generate',
+    'status',
+    'cancel',
+    'download',
+    'project',
+    'create',
+    'edit',
+    'start',
+    'render',
+    'regenerate-shot',
+    'accept-shot',
   ]
   for (const command of required) {
-    assert.match(value, new RegExp(`add_parser\\(["']${command}["']`), `oc-h3.py: ${command} missing`)
+    assert.match(
+      value,
+      new RegExp(`add_parser\\(["']${command}["']`),
+      `oc-h3.py: ${command} missing`,
+    )
   }
-  if (projectOnly) return new Set(['create', 'status', 'edit', 'start', 'render', 'regenerate-shot', 'accept-shot'])
+  if (projectOnly)
+    return new Set([
+      'create',
+      'status',
+      'edit',
+      'start',
+      'render',
+      'regenerate-shot',
+      'accept-shot',
+    ])
   return new Set([
-    'generate', 'status', 'cancel', 'download', 'project',
-    'project.create', 'project.status', 'project.edit', 'project.start', 'project.render',
-    'project.regenerate-shot', 'project.accept-shot',
+    'generate',
+    'status',
+    'cancel',
+    'download',
+    'project',
+    'project.create',
+    'project.status',
+    'project.edit',
+    'project.start',
+    'project.render',
+    'project.regenerate-shot',
+    'project.accept-shot',
   ])
 }
 
@@ -772,9 +836,7 @@ function productionSurfaces(): Record<string, Set<string>> {
 
 describe('V5 oc-* public surface coverage contract', () => {
   test('browser Skill only documents reviewed commands from the pinned Playwright CLI', () => {
-    const skill = source(
-      'packages/commercial/agent-sandbox/ccb-baseline/skills/browser/SKILL.md',
-    )
+    const skill = source('packages/commercial/agent-sandbox/ccb-baseline/skills/browser/SKILL.md')
     const commands = [...skill.matchAll(/^oc-browser\s+([a-z-]+)/gm)].map((match) => match[1]!)
     const unsupported = [...new Set(commands)].filter(
       (command) => !BROWSER_SKILL_ALLOWED_COMMANDS.has(command),

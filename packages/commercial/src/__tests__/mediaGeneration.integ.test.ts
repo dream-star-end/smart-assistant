@@ -20,6 +20,7 @@ import {
 } from '../media-generation/http.js'
 import { MediaGenerationService } from '../media-generation/service.js'
 import {
+  type MediaJobRow,
   acceptStaleShot,
   cancelProject,
   claimNextJob,
@@ -41,6 +42,7 @@ import {
   requestCancel,
   withJobExecutionLease,
 } from '../media-generation/store.js'
+import { MediaWorkerClient } from '../media-generation/workerClient.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -163,6 +165,64 @@ function workerStatus(
 }
 
 describe('media generation durable queue and projects', () => {
+  test('worker client splits large uploads into fixed-length streams without transfer encoding', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'oc-media-worker-chunks-'))
+    const inputPath = path.join(root, 'large-input.bin')
+    const inputBody = Buffer.alloc(9 * 1024 * 1024 + 17, 0x5a)
+    await writeFile(inputPath, inputBody)
+    const received: Buffer[] = []
+    const offsets: string[] = []
+    const lengths: string[] = []
+    const worker = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+      req.on('end', () => {
+        assert.equal(req.method, 'PUT')
+        assert.equal(req.headers.authorization, 'Bearer test-worker-token-that-is-long-enough')
+        assert.equal(req.headers['x-content-size'], String(inputBody.length))
+        assert.equal(req.headers['transfer-encoding'], undefined)
+        offsets.push(String(req.headers['x-upload-offset']))
+        lengths.push(String(req.headers['content-length']))
+        received.push(Buffer.concat(chunks))
+        res.end(JSON.stringify({ ok: true }))
+      })
+    })
+    await new Promise<void>((resolve) => worker.listen(0, '127.0.0.1', resolve))
+    const address = worker.address()
+    assert.ok(address && typeof address === 'object')
+    try {
+      const client = new MediaWorkerClient(
+        `http://127.0.0.1:${address.port}`,
+        'test-worker-token-that-is-long-enough',
+      )
+      const job = {
+        id: 'chunk-client-job',
+        attemptId: 'chunk-client-attempt',
+        fenceVersion: 7,
+        resourceClass: 'gpu-h3',
+      } as MediaJobRow
+      await client.upload(job, 0, {
+        storagePath: inputPath,
+        sha256: createHash('sha256').update(inputBody).digest('hex'),
+        sizeBytes: inputBody.length,
+        mime: 'application/octet-stream',
+        kind: 'reference_image',
+        workerFilename: 'large-input.bin',
+      })
+      assert.deepEqual(offsets, ['0', String(4 * 1024 * 1024), String(8 * 1024 * 1024)])
+      assert.deepEqual(lengths, [
+        String(4 * 1024 * 1024),
+        String(4 * 1024 * 1024),
+        String(1024 * 1024 + 17),
+      ])
+      assert.deepEqual(Buffer.concat(received), inputBody)
+    } finally {
+      worker.closeAllConnections()
+      await new Promise<void>((resolve) => worker.close(() => resolve()))
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('an empty rollout allowlist fails closed for reads, creation, and mutations', async (t) => {
     if (!maybe(t)) return
     const denied = new MediaGenerationService({
@@ -962,6 +1022,7 @@ describe('media generation durable queue and projects', () => {
         } else if (match[3]?.startsWith('inputs/')) {
           assert.equal(req.headers['content-length'], String(inputBody.length))
           assert.equal(req.headers['transfer-encoding'], undefined)
+          assert.equal(req.headers['x-upload-offset'], '0')
           uploaded = body
           res.end(JSON.stringify({ ok: true }))
         } else if (match[3] === 'submit') {
