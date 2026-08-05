@@ -238,6 +238,13 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-ingest': {
     parse: tsFailureProbe('packages/gateway/src/ocIngestCli.ts', ['parse'], /parse <file>/),
   },
+  'oc-ocr': {
+    run: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['run'], /run <file>/),
+    submit: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['submit'], /submit <file>/),
+    status: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['status'], /status <ticket>/),
+    cancel: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['cancel'], /cancel <ticket>/),
+    download: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['download'], /download <ticket>/),
+  },
   'oc-lit': {
     search: tsFailureProbe('packages/gateway/src/ocLitCli.ts', ['search'], /search <query>/),
     snowball: tsFailureProbe('packages/gateway/src/ocLitCli.ts', ['snowball'], /snowball <DOI/),
@@ -464,6 +471,7 @@ const THIN_WRAPPERS: Record<string, string> = {
   'oc-connect': 'packages/gateway/src/ocConnectCli.ts',
   'oc-figcheck': 'packages/gateway/src/ocFigCheckCli.ts',
   'oc-ingest': 'packages/gateway/src/ocIngestCli.ts',
+  'oc-ocr': 'packages/gateway/src/ocOcrCli.ts',
   'oc-lit': 'packages/gateway/src/ocLitCli.ts',
   'oc-litrag': 'packages/gateway/src/ocLitragCli.ts',
   'oc-market': 'packages/gateway/src/ocMarketCli.ts',
@@ -696,6 +704,7 @@ function productionSurfaces(): Record<string, Set<string>> {
       /usage: oc-figcheck/,
     ),
     'oc-ingest': tsDispatchCommands('packages/gateway/src/ocIngestCli.ts', 'cmd'),
+    'oc-ocr': tsDispatchCommands('packages/gateway/src/ocOcrCli.ts', 'cmd'),
     'oc-lit': tsDispatchCommands('packages/gateway/src/ocLitCli.ts', 'cmd'),
     'oc-litrag': tsDispatchCommands('packages/gateway/src/ocLitragCli.ts', 'cmd'),
     'oc-market': marketCommands(),

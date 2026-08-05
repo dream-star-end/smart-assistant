@@ -18,7 +18,7 @@ export const SCANSCI_PAPER_HINT_MARKER = "【OpenClaude 论文任务系统提示
 // 历史债:本模块符号仍带 "ScanSci" 旧名(detectScanSciPaperIntent / SCANSCI_PAPER_HINT_MARKER /
 // appendScanSciPaperIntentHintToFrame),为限制改动面(userChatBridge + 测试只依赖这些名字与
 // 意图 kind,不依赖 hint 文案)未连带重命名。**权威已迁移**:文献检索/引用统一走研究子系统的
-// oc-* CLI(oc-lit / oc-cite / oc-ingest);旧的 `scansci-pdf` CLI 在当前镜像仅 server 模式
+// oc-* CLI(oc-lit / oc-cite / oc-ingest / oc-ocr);旧的 `scansci-pdf` CLI 在当前镜像仅 server 模式
 // (只有 run/check 子命令,无 search/download)——继续指向它会让 agent 每次都先跑必失败的
 // `scansci-pdf search` 再回落。下面的提示已改为只指向 oc-*,并显式禁用 scansci-pdf 做检索。
 const SCANSCI_PAPER_HINT = [
@@ -29,7 +29,7 @@ const SCANSCI_PAPER_HINT = [
   "- 单个 DOI / arXiv / 论文 URL / 精确题名：用 `oc-lit search` 定位元数据；`oa.isOA=true` 时给出 `oa.url` 开放全文链接，付费墙且无 OA 链接时不要代下载，提示用户经机构 IP 自取或上传 PDF(随后用 `oc-ingest` 解析入库)。",
   "- 引用 / BibTeX / RIS / APA / GB-T7714：用 `oc-cite verify <DOI|arXiv|OpenAlex id>` 接地校验并生成结构化引用(撤稿/未命中可信记录会标注)；引用接地是红线，绝不臆造。",
   "- 多篇列表或阅读清单：逐条 `oc-lit`/`oc-cite` 小批量处理，汇总成功/失败与下一步建议。",
-  "- 子命令与参数见 `skill_view(\"oc-lit\")` / `skill_view(\"oc-cite\")` / `skill_view(\"oc-ingest\")`。**不要**用 `scansci-pdf` 做检索或下载(当前环境它只有 server 模式，无 search/download 子命令，调用必失败)。",
+  "- 子命令与参数见 `skill_view(\"oc-lit\")` / `skill_view(\"oc-cite\")` / `skill_view(\"oc-ingest\")`。扫描PDF/图片由 oc-ingest skill 指引使用 `oc-ocr` 批量识别。**不要**用 `scansci-pdf` 做检索或下载(当前环境它只有 server 模式，无 search/download 子命令，调用必失败)。",
 ].join("\n");
 
 export type ScanSciPaperIntentKind = "download" | "search" | "citation" | "batch" | "health" | "browser";

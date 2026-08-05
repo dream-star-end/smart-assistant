@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenClaude V5 private OCR worker tunnel
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/openclaude-v5-ocr-tunnel
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/etc/openclaude
+
+[Install]
+WantedBy=multi-user.target
