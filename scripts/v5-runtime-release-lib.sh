@@ -73,6 +73,7 @@ OC_HOTCFG_BUNDLE_REQUIRED_LEAVES=(
   prompts/memory-instructions.md
   prompts/codex-preamble.md
   etc-codex/managed_config.toml
+  etc-codex/model-catalog.local.json
 )
 
 oc_hotcfg__die() { echo "FATAL[hotcfg]: $*" >&2; return 1; }

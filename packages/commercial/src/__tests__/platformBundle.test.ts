@@ -92,6 +92,7 @@ function bundleContents(): Record<string, string> {
     "prompts/memory-instructions.md": "# Memory\n",
     "prompts/codex-preamble.md": "# preamble\n",
     "etc-codex/managed_config.toml": "check_for_update_on_startup = false\n",
+    "etc-codex/model-catalog.local.json": '{"models":[]}\n',
   };
 }
 

@@ -54,6 +54,7 @@ function buildFixtureStaging(stagingDir: string): void {
   // M8 必需叶子:entrypoint/platformBundle.ts(与 PLATFORM_BUNDLE_REQUIRED_LEAVES 对齐)。
   write(pathJoin(stagingDir, "entrypoint/platformBundle.ts"), "export const bundle = true;\n");
   write(pathJoin(stagingDir, "etc-codex/managed_config.toml"), "check_for_update_on_startup = false\n");
+  write(pathJoin(stagingDir, "etc-codex/model-catalog.local.json"), '{"models":[]}\n');
   write(pathJoin(stagingDir, "codex-skills/document-writing/SKILL.md"), "# document-writing\n");
   write(pathJoin(stagingDir, "seed/platform-seed.yaml"), "schemaVersion: 1\nagents: []\n");
   write(pathJoin(stagingDir, "seed/personas/main.md"), "# main persona\n");

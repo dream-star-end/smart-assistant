@@ -20,6 +20,15 @@ import { createLogger } from '../logger.js'
 
 const log = createLogger({ module: 'codexShared' })
 
+const QWEN38_CODEX_MODEL_ID = 'qwen3.8-max'
+const QWEN38_CODEX_REASONING_EFFORTS: ReadonlySet<PlatformReasoningEffort> = new Set([
+  'low',
+  'medium',
+  'xhigh',
+])
+const QWEN38_CODEX_MODEL_CATALOG =
+  '/run/oc/platform/current/etc-codex/model-catalog.local.json'
+
 /**
  * Per-thread directory where codex CLI persists images created via the built-in
  * `image_gen` skill. threadId is sanitized: codex thread_ids are ULID-like
@@ -93,6 +102,16 @@ export function normalizeCodexReasoningEffort(
   modelId: string | undefined,
   level: string | undefined | null,
 ): PlatformReasoningEffort | null {
+  // qwen3.8-max 通过签名 catalog authority 动态切到 Codex engine；它有意不进
+  // baked CODEX_ENGINE_MODELS，避免旧镜像/无 authority 路径把静态 Bailian 型号
+  // 误判成 Codex。Codex spawn 这里因此需要 exact-model 的三档策略，不能再让
+  // 静态 provider 的 stripBodyFields 把 signed descriptor 已校验的 effort 丢掉。
+  if (modelId === QWEN38_CODEX_MODEL_ID) {
+    return typeof level === 'string'
+      && QWEN38_CODEX_REASONING_EFFORTS.has(level as PlatformReasoningEffort)
+      ? level as PlatformReasoningEffort
+      : 'xhigh'
+  }
   const policy = modelReasoningPolicy(modelId ?? '')
   if (
     typeof level === 'string' &&
@@ -101,6 +120,15 @@ export function normalizeCodexReasoningEffort(
     return level as PlatformReasoningEffort
   }
   return policy.codexModelDefault
+}
+
+/**
+ * qwen3.8-max 的 Codex 模型元数据由 root-owned platform bundle 提供。只对 exact
+ * canonical id 注入，不能按 provider 放大作用面；其它 Codex/GPT spawn argv 不变。
+ */
+export function buildCodexModelCatalogArgs(modelId: string | undefined): string[] {
+  if (modelId !== QWEN38_CODEX_MODEL_ID) return []
+  return ['-c', `model_catalog_json=${JSON.stringify(QWEN38_CODEX_MODEL_CATALOG)}`]
 }
 
 export function codexReasoningEffortConfig(

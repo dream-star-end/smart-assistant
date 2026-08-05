@@ -831,6 +831,30 @@
           "assertion": "登录响应必须已有可用额度，不依赖后续 /api/me"
         }
       ]
+    },
+    {
+      "id": "INC-20260804-QWEN38-CODEX-ADAPTER",
+      "occurredAt": "2026-08-04",
+      "severity": "P1",
+      "symptom": "qwen3.8-max 通过 Claude Code/Anthropic 兼容协议接入时无法稳定完成 V5 Agent turn，商业版与测试版均表现为模型不可用；直接 OpenAI Responses 探测证明供应商服务正常，故切换到 Codex Responses 适配路径。",
+      "rootFixCommit": "ece3f5f8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/qwen38CodexCatalog.test.ts",
+          "assertion": "qwen3.8-max Codex catalog matches the signed execution capability"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/migrate.integ.test.ts",
+          "assertion": "0197/0199 preserve admin pricing while switching Qwen3.8 Max to Codex Responses"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-runtime-release-lib.sh",
+          "assertion": "etc-codex/model-catalog.local.json"
+        }
+      ]
     }
   ]
 }

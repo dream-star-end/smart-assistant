@@ -110,6 +110,7 @@ export const PLATFORM_BUNDLE_REQUIRED_LEAVES: readonly string[] = [
   "prompts/memory-instructions.md",
   "prompts/codex-preamble.md",
   "etc-codex/managed_config.toml",
+  "etc-codex/model-catalog.local.json",
 ];
 
 /** 文件扩展名白名单(plan §1.3)。MANIFEST.json 走 .json;其它文件必须命中其一。 */

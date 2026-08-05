@@ -25,6 +25,7 @@ import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexModelCatalogArgs,
   buildCodexMultiAgentDisableArgs,
   buildCodexProviderConfigArgs,
   buildCodexReasoningSummaryArgs,
@@ -1836,6 +1837,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // Sol 缺省 low、Terra/Luna 缺省 medium；用户显式 max 原样透传。
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
+    const modelCatalogArgs = buildCodexModelCatalogArgs(this.opts.model)
     const effortArgs = codexReasoningEffortConfig(this.opts.model, this.effortLevel)
     // T3:reasoning summary 与 effort 是同一 provider 的推理配置,co-locate 在这里
     // 一起拼(仅 codex-native/gpt-5.5 官方 OAuth 路径生效,env 可秒关)。让队长思考
@@ -1876,6 +1878,7 @@ export class CodexAppServerRunner extends EventEmitter {
       'app-server',
       ...argvOverrides,
       ...providerArgs,
+      ...modelCatalogArgs,
       ...effortArgs,
       ...reasoningSummaryArgs,
       ...multiAgentDisableArgs,
