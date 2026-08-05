@@ -16,6 +16,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 ROOT="$OC_OCR_ROOT"
+DTK_ENV="${OC_OCR_DTK_ENV:-/opt/dtk/env.sh}"
 mkdir -p "$ROOT/jobs" "$ROOT/ready" "$ROOT/run" "$ROOT/log"
 rm -f "$ROOT/ready"/* "$ROOT/run"/*.sock
 
@@ -28,10 +29,20 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+# SCNet closes remote commands that produce no application output even while
+# OpenSSH ServerAlive packets are flowing. Keep the SSH channel active; if the
+# channel disappears, printf gets EPIPE, this child exits, and wait -n drives
+# the same cleanup path as a model/server failure.
+(
+  while sleep "${OC_OCR_SSH_HEARTBEAT_SECONDS:-5}"; do
+    printf 'OCR_HEARTBEAT\n'
+  done
+) & PIDS+=("$!")
+
 IFS=',' read -r -a CARDS <<<"$OC_OCR_CARDS"
 for card in "${CARDS[@]}"; do
   (
-    set +u; source /opt/dtk/env.sh >/dev/null 2>&1; set -u
+    set +u; source "$DTK_ENV" >/dev/null 2>&1; set -u
     export HIP_VISIBLE_DEVICES="$card" CUDA_VISIBLE_DEVICES="$card" TOKENIZERS_PARALLELISM=false
     export OC_OCR_VL_PROBE_IMAGE="$OC_OCR_PROBE_IMAGE"
     exec "$OC_OCR_VL_PYTHON" "$HERE/vl_runner.py" --socket "$ROOT/run/vl-$card.sock" --ready "$ROOT/ready/vl-$card" --model "$OC_OCR_VL_MODEL"
@@ -40,7 +51,7 @@ done
 
 for card in "${CARDS[@]}"; do
   (
-    set +u; source /opt/dtk/env.sh >/dev/null 2>&1; set -u
+    set +u; source "$DTK_ENV" >/dev/null 2>&1; set -u
     export HIP_VISIBLE_DEVICES="$card" CUDA_VISIBLE_DEVICES="$card" TOKENIZERS_PARALLELISM=false
     export OMP_NUM_THREADS="${OC_OCR_CPU_THREADS:-30}" MKL_NUM_THREADS="${OC_OCR_CPU_THREADS:-30}" OPENBLAS_NUM_THREADS="${OC_OCR_CPU_THREADS:-30}"
     exec "$OC_OCR_PP_PYTHON" "$HERE/pp_runner.py" --db "$ROOT/jobs.sqlite3" --jobs-dir "$ROOT/jobs" --card "$card" --ready "$ROOT/ready/pp-$card" --vl-socket "$ROOT/run/vl-$card.sock" --det-model "$OC_OCR_DET_MODEL" --rec-model "$OC_OCR_REC_MODEL" --rasterizer "$HERE/rasterize.py" --probe-image "$OC_OCR_PROBE_IMAGE" --raster-workers "${OC_OCR_RASTER_WORKERS:-6}"

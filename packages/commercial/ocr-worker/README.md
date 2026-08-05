@@ -23,3 +23,9 @@ directories; switching `current` and restarting the SSH tunnel is atomic.
 The PP environment needs `pypdfium2`; PP/VL models and both pre-existing
 Python environments are supplied by the SCNet host rather than downloaded at
 service start.
+
+`run-supervisor.sh` writes a fixed heartbeat over the SSH stdout channel. The
+V5 host discards only that stdout while keeping SSH stderr in journald. This
+prevents SCNet's application-idle disconnect; a real disconnect breaks the
+heartbeat pipe and drives the supervisor's existing child cleanup before the
+host tunnel reconnects.

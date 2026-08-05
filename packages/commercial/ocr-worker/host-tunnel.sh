@@ -22,4 +22,5 @@ exec /usr/bin/ssh \
   -o ServerAliveCountMax=3 \
   -L "127.0.0.1:${OC_OCR_LOCAL_PORT}:127.0.0.1:${OC_OCR_REMOTE_PORT}" \
   "root@${OC_OCR_SSH_HOST}" \
-  "/bin/bash -lc 'set -a; source /opt/openclaude-ocr-worker/ocr-worker.env; set +a; exec /opt/openclaude-ocr-worker/current/run-supervisor.sh'"
+  "/bin/bash -lc 'set -a; source /opt/openclaude-ocr-worker/ocr-worker.env; set +a; exec /opt/openclaude-ocr-worker/current/run-supervisor.sh'" \
+  >/dev/null
