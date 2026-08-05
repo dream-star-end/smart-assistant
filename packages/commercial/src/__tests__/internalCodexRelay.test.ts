@@ -22,6 +22,7 @@ import {
   mapCodexRelayUrl,
   mapCodexRelayUrlMulti,
   parseAnnotatedImageRequest,
+  promoteBailianCodexVisionToolOutputs,
   resolveCodexRelayUpstreamBases,
   type CodexRelayDb,
 } from '../http/internalCodexRelay.js'
@@ -41,6 +42,8 @@ async function close(server: ReturnType<typeof createServer>): Promise<void> {
 }
 
 async function drainBody(body: unknown): Promise<string> {
+  if (typeof body === 'string') return body
+  if (Buffer.isBuffer(body)) return body.toString('utf8')
   if (!body || typeof (body as AsyncIterable<unknown>)[Symbol.asyncIterator] !== 'function') return ''
   const chunks: Buffer[] = []
   for await (const chunk of body as AsyncIterable<Buffer | Uint8Array | string>) {
@@ -128,6 +131,51 @@ describe('internalCodexRelay path mapping', () => {
     }
   })
 
+})
+
+describe('Bailian Codex vision compatibility', () => {
+  test('promotes captured function tool image output into a provider-supported user message', () => {
+    const image = { type: 'input_image', image_url: 'data:image/png;base64,AAAA', detail: 'auto' }
+    const originalToolOutput = {
+      type: 'function_call_output',
+      call_id: 'call-view-image',
+      output: [image],
+    }
+    const body = Buffer.from(JSON.stringify({
+      model: 'qwen3.8-max',
+      input: [
+        { type: 'function_call', name: 'view_image', call_id: 'call-view-image', arguments: '{}' },
+        originalToolOutput,
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'after' }] },
+      ],
+    }))
+
+    const promoted = promoteBailianCodexVisionToolOutputs(body)
+    assert.equal(promoted.promotedImageCount, 1)
+    const parsed = JSON.parse(promoted.body.toString('utf8')) as { input: unknown[] }
+    assert.equal(parsed.input.length, 4)
+    assert.deepEqual(parsed.input[1], originalToolOutput)
+    assert.deepEqual(parsed.input[2], {
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_text', text: 'The image below is the result returned by the preceding image-view tool call.' },
+        image,
+      ],
+    })
+  })
+
+  test('keeps non-image and malformed bodies byte-identical', () => {
+    for (const body of [
+      Buffer.from('{not-json'),
+      Buffer.from(JSON.stringify({ model: 'qwen3.8-max', input: [{ type: 'function_call_output', output: 'text' }] })),
+      Buffer.from(JSON.stringify({ model: 'qwen3.8-max', input: [{ type: 'function_call_output', output: [{ type: 'input_text', text: 'ok' }] }] })),
+    ]) {
+      const promoted = promoteBailianCodexVisionToolOutputs(body)
+      assert.strictEqual(promoted.body, body)
+      assert.equal(promoted.promotedImageCount, 0)
+    }
+  })
 })
 
 // ─── annotated-edits body 解析:annotated(带 mask)与 outpaint(无 mask + aspect)
@@ -309,6 +357,74 @@ describe('internalCodexRelay handler', () => {
       assert.deepEqual(failures, [])
     } finally {
       await close(server)
+    }
+  })
+
+  test('promotes vision tool output only for the qwen3.8-max Bailian Responses route', async () => {
+    const token = 'd'.repeat(64)
+    const image = { type: 'input_image', image_url: 'data:image/png;base64,AAAA', detail: 'auto' }
+    const originalBody = JSON.stringify({
+      model: 'qwen3.8-max',
+      input: [{ type: 'function_call_output', call_id: 'call-image', output: [image] }],
+    })
+    const textOnlyBody = JSON.stringify({
+      model: 'qwen3.8-max',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+    })
+    for (const testCase of [
+      { modelId: 'qwen3.8-max', modelProvider: 'bailian', body: originalBody, expectedInputCount: 2 },
+      { modelId: 'qwen3.8-max', modelProvider: 'bailian', body: textOnlyBody, expectedInputCount: 1 },
+      { modelId: 'gpt-5.6-sol', modelProvider: 'api111', body: originalBody, expectedInputCount: 1 },
+    ]) {
+      let capturedBody = ''
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(),
+        db: makeDb({ codexAccountId: null, provider: null, accountStatus: null }),
+        resolveRouteContext: async () => ({
+          modelId: testCase.modelId,
+          group: { id: 9n, label: 'relay', kind: 'api_relay', provider: 'codex', enabled: true, priority: 1, models: [testCase.modelId], created_at: new Date(), updated_at: new Date() },
+          credential: {
+            id: 8n,
+            group_id: 9n,
+            label: 'route',
+            base_url: 'https://example.invalid/v1',
+            model_provider: testCase.modelProvider,
+            provider_name: 'Provider',
+            wire_api: 'responses',
+            preferred_auth_method: 'apikey',
+            disable_response_storage: true,
+            status: 'active',
+            health_score: 100,
+            cooldown_until: null,
+            last_used_at: null,
+            last_error: null,
+            success_count: 0n,
+            fail_count: 0n,
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+          apiKey: Buffer.from('route-api-key', 'utf8'),
+        }),
+        fetchImpl: (async (_input, init) => {
+          capturedBody = await drainBody(init?.body)
+          return new Response('ok', { status: 200 })
+        }) as typeof fetch,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/route/${token}/responses`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+          body: testCase.body,
+        })
+        assert.equal(res.status, 200)
+        const parsed = JSON.parse(capturedBody) as { input: unknown[] }
+        assert.equal(parsed.input.length, testCase.expectedInputCount)
+        if (testCase.expectedInputCount === 1) assert.equal(capturedBody, testCase.body)
+      } finally {
+        await close(server)
+      }
     }
   })
 

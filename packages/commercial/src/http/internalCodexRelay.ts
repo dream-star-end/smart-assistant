@@ -12,7 +12,9 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createHash } from 'node:crypto'
-import { Readable } from 'node:stream'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -460,6 +462,96 @@ async function readBoundedBody(req: IncomingMessage, maxBytes = 40 * 1024 * 1024
     chunks.push(buffer)
   }
   return Buffer.concat(chunks)
+}
+
+type BailianVisionCompatResult = {
+  body: Buffer
+  promotedImageCount: number
+}
+
+/**
+ * Alibaba Token Plan accepts Responses `input_image` content in a user message,
+ * but ignores the Codex app-server shape that nests the same content inside a
+ * `function_call_output.output` array. Keep the native tool result intact and
+ * add the provider-supported companion message immediately after it.
+ */
+export function promoteBailianCodexVisionToolOutputs(body: Buffer): BailianVisionCompatResult {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body.toString('utf8'))
+  } catch {
+    return { body, promotedImageCount: 0 }
+  }
+  if (!parsed || typeof parsed !== 'object') return { body, promotedImageCount: 0 }
+  const request = parsed as { input?: unknown }
+  if (!Array.isArray(request.input)) return { body, promotedImageCount: 0 }
+
+  const input: unknown[] = []
+  let promotedImageCount = 0
+  for (const item of request.input) {
+    input.push(item)
+    if (!item || typeof item !== 'object') continue
+    const output = (item as { type?: unknown; output?: unknown }).output
+    if ((item as { type?: unknown }).type !== 'function_call_output' || !Array.isArray(output)) continue
+    const images = output.filter((part): part is Record<string, unknown> => (
+      Boolean(part)
+      && typeof part === 'object'
+      && (part as { type?: unknown }).type === 'input_image'
+      && typeof (part as { image_url?: unknown }).image_url === 'string'
+      && ((part as { image_url: string }).image_url).startsWith('data:image/')
+    ))
+    if (images.length === 0) continue
+    input.push({
+      type: 'message',
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text: 'The image below is the result returned by the preceding image-view tool call.',
+        },
+        ...images,
+      ],
+    })
+    promotedImageCount += images.length
+  }
+  if (promotedImageCount === 0) return { body, promotedImageCount: 0 }
+  request.input = input
+  return { body: Buffer.from(JSON.stringify(parsed)), promotedImageCount }
+}
+
+async function spoolBailianCodexResponseBody(req: IncomingMessage): Promise<{
+  tempDir: string
+  path: string
+  mayContainVisionToolOutput: boolean
+}> {
+  // The relay previously streamed Responses bodies without a size cap. Spool
+  // instead of introducing a new context/history limit or buffering every
+  // large text-only turn in RAM; only image-bearing candidates are parsed.
+  const tempDir = await mkdtemp(join(tmpdir(), 'oc-codex-relay-'))
+  const path = join(tempDir, 'request.json')
+  const functionMarker = Buffer.from('function_call_output')
+  const imageMarker = Buffer.from('input_image')
+  const tailBytes = Math.max(functionMarker.length, imageMarker.length) - 1
+  let tail = Buffer.alloc(0)
+  let sawFunctionOutput = false
+  let sawInputImage = false
+  const scanner = new Transform({
+    transform(chunk, _encoding, callback) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      const searchable = tail.length > 0 ? Buffer.concat([tail, bytes]) : bytes
+      sawFunctionOutput ||= searchable.includes(functionMarker)
+      sawInputImage ||= searchable.includes(imageMarker)
+      tail = searchable.subarray(Math.max(0, searchable.length - tailBytes))
+      callback(null, bytes)
+    },
+  })
+  try {
+    await pipeline(req, scanner, createWriteStream(path, { mode: 0o600 }))
+    return { tempDir, path, mayContainVisionToolOutput: sawFunctionOutput && sawInputImage }
+  } catch (err) {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+    throw err
+  }
 }
 
 async function readBoundedResponseBody(response: Response, maxBytes = 64 * 1024 * 1024): Promise<Buffer> {
@@ -998,6 +1090,8 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       || isAnnotatedImageRequest
     )
     let imageRequestBody: BodyInit | null = null
+    let responsesRequestBody: BodyInit | null = null
+    let responsesRequestTempDir: string | null = null
     let imageRequestContentType: string | null = null
     let imageRequestId: string | null = null
     let imageOperation: 'annotated_edit' | 'native_image' | null = null
@@ -1013,6 +1107,39 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     let activeImageAttemptId: bigint | null = null
     let activeImageAttemptNo = 0
     let imageUpstreamSucceeded = false
+
+    const needsBailianVisionCompat = method === 'POST'
+      && mappedSuffix === '/responses'
+      && routeContext?.modelId === 'qwen3.8-max'
+      && routeContext.credential.model_provider === 'bailian'
+      && routeContext.credential.wire_api === 'responses'
+    if (needsBailianVisionCompat && routeContext) {
+      try {
+        const spooled = await spoolBailianCodexResponseBody(req)
+        responsesRequestTempDir = spooled.tempDir
+        if (spooled.mayContainVisionToolOutput) {
+          const promoted = promoteBailianCodexVisionToolOutputs(await readFile(spooled.path))
+          if (promoted.promotedImageCount > 0) {
+            responsesRequestBody = promoted.body.toString('utf8')
+            relayLog.info('bailian_codex_vision_tool_outputs_promoted', {
+              promotedImageCount: promoted.promotedImageCount,
+            })
+          }
+        }
+        responsesRequestBody ??= createReadStream(spooled.path) as unknown as BodyInit
+      } catch (err) {
+        zeroBuffer(routeContext.apiKey)
+        if (fallbackAccessToken) zeroBuffer(fallbackAccessToken)
+        if (responsesRequestTempDir) {
+          await rm(responsesRequestTempDir, { recursive: true, force: true }).catch(() => {})
+          responsesRequestTempDir = null
+        }
+        if (!controller.signal.aborted) {
+          sendJsonError(res, 400, 'INVALID_CODEX_RELAY_REQUEST', 'codex relay request body could not be read', requestId)
+        }
+        return
+      }
+    }
 
     if (isImageRequest) {
       if (activeImageHeavyWork >= 4) {
@@ -1166,7 +1293,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         headers,
         body: method === 'GET' || method === 'HEAD'
           ? undefined
-          : imageRequestBody ?? (req as unknown as BodyInit),
+          : imageRequestBody ?? responsesRequestBody ?? (req as unknown as BodyInit),
         dispatcher: egress?.dispatcher,
         duplex: 'half',
         signal: controller.signal,
@@ -1440,6 +1567,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       }
     } finally {
       if (imageHeavySlot) activeImageHeavyWork--
+      if (responsesRequestTempDir) await rm(responsesRequestTempDir, { recursive: true, force: true }).catch(() => {})
       if (annotatedTempDir) await rm(annotatedTempDir, { recursive: true, force: true }).catch(() => {})
       req.off('aborted', abort)
       res.off('close', abort)
