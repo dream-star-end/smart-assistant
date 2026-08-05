@@ -5434,7 +5434,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
-      // `sys.incident` and `sys.goal_snapshot` are master-authored namespaces.
+      // Incident, GoalState and durable media progress are master-authored namespaces.
       // Containers are tenant-controlled execution surfaces and must never forge
       // either an approval notice or the platform-authoritative PG GoalState.
       // Reject before TTFT accounting, outboundRing.storeStamped and live forwarding,
@@ -5451,7 +5451,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ? (parsedMasterFrameCandidate as { type?: unknown }).type
           : null;
       if (
-        masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot"
+        masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
+        masterOnlyFrameType === "sys.media_job"
       ) {
         if (!loggedRejectedContainerIncident) {
           loggedRejectedContainerIncident = true;

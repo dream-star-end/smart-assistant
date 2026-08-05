@@ -6,7 +6,7 @@ import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
-import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
+import type { InboundMessage, MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
 import type { AuthSession } from "../lib/types";
 
@@ -248,6 +248,7 @@ export function useChatSocket(opts: {
   onRepoStatus?: (frame: RepoStatusWire) => void;
   /** GitHub 绑定校验失败帧回调。*/
   onRepoBindError?: (frame: RepoBindErrorWire) => void;
+  onMediaJob?: (frame: MediaJobWire) => void;
   /** 会话模型服务端同步入口(= useSessionList.queueModelPatch,App 经 ref 注入)。
    *  首发建行确认后的收敛写**必须**走它进同一 per-session 串行器 —— 队列外直发 api 会与
    *  显式选择的 PATCH 形成跨写者乱序(后完成的旧值覆盖新选择,Codex 审 REJECT)。*/
@@ -271,6 +272,8 @@ export function useChatSocket(opts: {
   onRepoStatusRef.current = opts.onRepoStatus;
   const onRepoBindErrorRef = useRef(opts.onRepoBindError);
   onRepoBindErrorRef.current = opts.onRepoBindError;
+  const onMediaJobRef = useRef(opts.onMediaJob);
+  onMediaJobRef.current = opts.onMediaJob;
   const queueModelPatchRef = useRef(opts.queueModelPatch);
   queueModelPatchRef.current = opts.queueModelPatch;
 
@@ -404,6 +407,7 @@ export function useChatSocket(opts: {
       // GitHub 仓库绑定状态/错误帧 → 透传给 useRepoBinding（经 ref，无 stale）。
       onRepoStatus: (frame) => onRepoStatusRef.current?.(frame),
       onRepoBindError: (frame) => onRepoBindErrorRef.current?.(frame),
+      onMediaJob: (frame) => onMediaJobRef.current?.(frame),
       defaultAgentId: defaultAgentRef.current,
     });
   }

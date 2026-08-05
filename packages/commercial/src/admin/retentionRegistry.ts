@@ -113,6 +113,11 @@ export const DURABLE_TABLES: readonly string[] = [
   "marketplace_installs",
   "marketplace_skill_listings",
   "marketplace_skill_versions",
+  // User-owned source media, durable jobs, projects, and shot history are retained
+  // losslessly until the owning user is deleted; there is no silent age-based GC.
+  "media_generation_inputs",
+  "media_generation_job_inputs",
+  "media_generation_jobs",
   "minimax_media_usage_records",
   "model_aliases",
   "model_authority_deploy_state",
@@ -172,6 +177,8 @@ export const DURABLE_TABLES: readonly string[] = [
   "user_subscriptions",
   "users",
   "v5_migration_audit",
+  "video_project_shots",
+  "video_projects",
   "wechat_bindings",
   // 设计上永久保留(purgeSentTombstones/purgeFailedAged 均为 no-op,见 outboxStore.ts)。
   "wechat_outbox",
