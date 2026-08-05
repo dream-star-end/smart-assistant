@@ -96,6 +96,7 @@ import type {
   CostChargedWire,
   CostWaivedWire,
   IncidentWire,
+  MediaJobWire,
   InboundMessage,
   LegacyBridgeErrorWire,
   OutboundErrorWire,
@@ -177,6 +178,7 @@ export type ChatSocketDeps = {
   onRepoStatus?: (frame: RepoStatusWire) => void;
   /** GitHub 绑定校验失败帧（bridge→client，stale / link 失效 / 内部错）。*/
   onRepoBindError?: (frame: RepoBindErrorWire) => void;
+  onMediaJob?: (frame: MediaJobWire) => void;
   defaultAgentId?: string;
 };
 
@@ -1561,6 +1563,10 @@ export class ChatSocket {
         // 仅审批后的 approved_recovery resolved 帧会被 store 接受并弹一次 success toast；
         // 普通/open incident 静默丢弃，socket 层不维护任何运维横幅 UI。
         incidentStore.ingest(f as IncidentWire);
+        return;
+      }
+      case "sys.media_job": {
+        this.deps.onMediaJob?.(f as MediaJobWire);
         return;
       }
       case "sys.context_rebuilt": {

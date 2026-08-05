@@ -106,9 +106,12 @@ import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetu
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
+import type { MediaGenerationService } from '../media-generation/service.js'
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
+  /** Durable local H3 jobs and long-form storyboard projects. */
+  mediaGeneration?: MediaGenerationService;
   /** Platform-authoritative session GoalState service. */
   goalStateService?: GoalStateService;
   /** Short-lived one-time browser tickets for V5 container-local preview. */

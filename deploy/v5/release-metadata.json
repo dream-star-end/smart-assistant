@@ -78,7 +78,8 @@
     "0196_client_session_workspace_mode",
     "0197_bailian_qwen38_max",
     "0198_client_session_workspace_default",
-    "0199_qwen38_codex_responses"
+    "0199_qwen38_codex_responses",
+    "0200_media_generation_jobs"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

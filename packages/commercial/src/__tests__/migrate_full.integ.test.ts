@@ -106,6 +106,9 @@ describe("full migration suite", () => {
       "credit_ledger",
       "email_verifications",
       "inbox_message_assets",
+      "media_generation_inputs",
+      "media_generation_job_inputs",
+      "media_generation_jobs",
       "model_pricing",
       "orders",
       "prompt_queue_heads",
@@ -124,6 +127,8 @@ describe("full migration suite", () => {
       "turn_tape_cost_components",
       "usage_records",
       "users",
+      "video_project_shots",
+      "video_projects",
     ];
     for (const t of expected) {
       assert.ok(names.has(t), `missing table: ${t}`);

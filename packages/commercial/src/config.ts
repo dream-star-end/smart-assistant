@@ -622,8 +622,35 @@ export const commercialConfigSchema = z
      * - 未配置 → 媒体 proxy 503(文本/识图路由已不依赖本字段,改依赖 ARK_AGENT_PLAN_KEY)
      * - 不入 git;由 systemd EnvironmentFile 注入。用户已在聊天里暴露过的 key
      *   上线前必须在 MiniMax 控制台旋转后再写入生产 env。
-     */
+    */
     MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /** Loopback endpoint of the SSH-tunneled SCNet H3 worker. */
+    MEDIA_GENERATION_WORKER_URL: urlStringWithProtocols(
+      ["http:", "https:"],
+      "MEDIA_GENERATION_WORKER_URL",
+    )
+      .refine((value) => {
+        const hostname = new URL(value).hostname;
+        return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+      }, "MEDIA_GENERATION_WORKER_URL must be loopback")
+      .optional(),
+    MEDIA_GENERATION_WORKER_TOKEN: z.string().trim().min(32).max(512).optional(),
+    MEDIA_GENERATION_STATE_ROOT: absolutePath("MEDIA_GENERATION_STATE_ROOT"),
+    MEDIA_GENERATION_MAX_INPUT_BYTES: positiveInt(1_099_511_627_776),
+    MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES: positiveInt(1_099_511_627_776),
+    MEDIA_GENERATION_ALLOW_USER_IDS: z
+      .string()
+      .max(8192)
+      .optional()
+      .transform((value) =>
+        Object.freeze(
+          (value ?? "")
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean),
+        ),
+      )
+      .refine((values) => values.every((value) => /^\d+$/.test(value)), "user ids must be decimal"),
     /**
      * 火山方舟 Ark Coding Plan key(2026-06-15 接入)。glm-5.1 当前是 **coder 默认模型**
      * (2026-06-16 起平台默认改为 MiniMax-M3,见 platformDefaults.ts / entrypoint COMMERCIAL_DEFAULT_MODEL;
@@ -700,6 +727,49 @@ export const commercialConfigSchema = z
             message: `${key} required when other HUPIJIAO_* fields are set`,
           });
         }
+      }
+    }
+    if (
+      (cfg.MEDIA_GENERATION_WORKER_URL === undefined) !==
+      (cfg.MEDIA_GENERATION_WORKER_TOKEN === undefined)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [
+          cfg.MEDIA_GENERATION_WORKER_URL === undefined
+            ? "MEDIA_GENERATION_WORKER_URL"
+            : "MEDIA_GENERATION_WORKER_TOKEN",
+        ],
+        message:
+          "MEDIA_GENERATION_WORKER_URL and MEDIA_GENERATION_WORKER_TOKEN must be configured together",
+      });
+    }
+    if (cfg.MEDIA_GENERATION_WORKER_URL !== undefined) {
+      for (const [key, value] of [
+        ["MEDIA_GENERATION_MAX_INPUT_BYTES", cfg.MEDIA_GENERATION_MAX_INPUT_BYTES],
+        [
+          "MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES",
+          cfg.MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES,
+        ],
+      ] as const) {
+        if (value === undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [key],
+            message: `${key} required when MEDIA_GENERATION_WORKER_URL is configured`,
+          });
+        }
+      }
+      if (
+        cfg.MEDIA_GENERATION_MAX_INPUT_BYTES !== undefined &&
+        cfg.MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES !== undefined &&
+        cfg.MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES < cfg.MEDIA_GENERATION_MAX_INPUT_BYTES
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES"],
+          message: "user media input quota must be at least the per-file quota",
+        });
       }
     }
   });
