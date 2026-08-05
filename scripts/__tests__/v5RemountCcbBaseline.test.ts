@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +20,7 @@ import {
   loadBridgeSecretReadOnly,
   remountTargets,
   type SafeRemovalTarget,
+  verifyPlatformCliLinks,
 } from "../v5-remount-ccb-baseline.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -388,5 +390,48 @@ describe("V5 CCB baseline remount classification", () => {
       delete broken[key as keyof typeof broken];
       assert.throws(() => assertContainerLabels(broken, 7n, runtime), new RegExp(key.replaceAll(".", "\\.")));
     }
+  });
+
+  test("official remount fail-loud verifies oc-plugin and oc-ocr PATH links inside the rebuilt container", async () => {
+    let command = "";
+    const container = {
+      exec: async (options: { Cmd?: string[] }) => {
+        command = options.Cmd?.[2] ?? "";
+        return {
+          start: async () => Readable.from([]),
+          inspect: async () => ({ ExitCode: 0 }),
+        };
+      },
+    };
+    await verifyPlatformCliLinks(container as never);
+    assert.match(command, /for name in oc-plugin oc-ocr/);
+    assert.match(command, /\/home\/agent\/\.local\/bin\/\$name/);
+    assert.match(command, /\/run\/oc\/platform\/current\/bin\/\$name/);
+    assert.match(command, /readlink/);
+
+    await assert.rejects(
+      verifyPlatformCliLinks({
+        exec: async () => ({
+          start: async () => Readable.from([]),
+          inspect: async () => ({ ExitCode: 1 }),
+        }),
+      } as never),
+      /platform CLI PATH links are incomplete/,
+    );
+
+    const broken = new Readable({
+      read() {
+        this.destroy(new Error("exec stream failed"));
+      },
+    });
+    await assert.rejects(
+      verifyPlatformCliLinks({
+        exec: async () => ({
+          start: async () => broken,
+          inspect: async () => ({ ExitCode: 0 }),
+        }),
+      } as never),
+      /exec stream failed/,
+    );
   });
 });

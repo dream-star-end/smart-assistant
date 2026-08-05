@@ -9,6 +9,7 @@
 
 import Docker from "dockerode";
 import { readFileSync } from "node:fs";
+import { finished } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
 import { PLATFORM_AUX_MODEL_IDS } from "../packages/commercial/src/billing/modelCatalog.js";
@@ -182,6 +183,33 @@ export function assertContainerLabels(
     if (labels?.[key] !== value) {
       throw new Error(`container label mismatch after reprovision: ${key}`);
     }
+  }
+}
+
+export async function verifyPlatformCliLinks(
+  container: Pick<Docker.Container, "exec">,
+): Promise<void> {
+  const command = [
+    "set -eu",
+    "for name in oc-plugin oc-ocr; do",
+    '  link="/home/agent/.local/bin/$name"',
+    '  source="/run/oc/platform/current/bin/$name"',
+    '  test -L "$link"',
+    '  test "$(readlink "$link")" = "$source"',
+    '  test -x "$source"',
+    "done",
+  ].join("\n");
+  const runner = await container.exec({
+    Cmd: ["/bin/sh", "-lc", command],
+    AttachStdout: true,
+    AttachStderr: true,
+  });
+  const stream = await runner.start({ Detach: false, Tty: false });
+  stream.resume();
+  await finished(stream);
+  const result = await runner.inspect();
+  if (result.ExitCode !== 0) {
+    throw new Error("reprovisioned container platform CLI PATH links are incomplete");
   }
 }
 
@@ -482,6 +510,7 @@ export async function main(): Promise<void> {
       }
       assertNamedVolumesPreserved(target.beforeVolumes, namedVolumes(info.Mounts));
       assertContainerLabels(info.Config.Labels, uid, runtimeLabels);
+      await verifyPlatformCliLinks(docker.getContainer(newStatus.dockerContainerId));
     },
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
