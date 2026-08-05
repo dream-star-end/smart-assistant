@@ -491,31 +491,35 @@ if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1") {
 
 // Debian `/etc/profile` 会在 `bash -lc` 中重置 Dockerfile 注入的 PATH，导致 Codex
 // 看不到 `/run/oc/platform/current/bin`。用户 profile 会稳定把 `~/.local/bin` 加回
-// PATH，因此为 platform-bundle 新增但镜像尚未内置的 oc-plugin 安装一个保留名链接。
+// PATH，因此为 platform-bundle 新增但镜像尚未内置的 CLI 安装保留名链接。
 // 不覆盖普通文件/目录/异向链接：这些异常只告警，避免 entrypoint 擅自删除用户内容。
-const PLATFORM_PLUGIN_SOURCE = "/run/oc/platform/current/bin/oc-plugin";
+const PLATFORM_BIN_DIR = "/run/oc/platform/current/bin";
 const USER_PLATFORM_BIN_DIR = "/home/agent/.local/bin";
-const USER_PLUGIN_LINK = join(USER_PLATFORM_BIN_DIR, "oc-plugin");
-try {
-  if (!existsSync(PLATFORM_PLUGIN_SOURCE)) {
-    throw new Error("platform oc-plugin source is missing");
-  }
-  mkdirSync(USER_PLATFORM_BIN_DIR, { recursive: true });
+const PLATFORM_LINKED_CLIS = ["oc-plugin", "oc-ocr"] as const;
+for (const cliName of PLATFORM_LINKED_CLIS) {
+  const source = join(PLATFORM_BIN_DIR, cliName);
+  const userLink = join(USER_PLATFORM_BIN_DIR, cliName);
   try {
-    const target = lstatSync(USER_PLUGIN_LINK);
-    if (!target.isSymbolicLink() || readlinkSync(USER_PLUGIN_LINK) !== PLATFORM_PLUGIN_SOURCE) {
-      console.error(
-        `[entrypoint] WARN: reserved ${USER_PLUGIN_LINK} already exists with an unexpected target; preserved`,
-      );
+    if (!existsSync(source)) {
+      throw new Error(`platform ${cliName} source is missing`);
     }
-  } catch (linkErr) {
-    if ((linkErr as NodeJS.ErrnoException).code !== "ENOENT") throw linkErr;
-    symlinkSync(PLATFORM_PLUGIN_SOURCE, USER_PLUGIN_LINK);
+    mkdirSync(USER_PLATFORM_BIN_DIR, { recursive: true });
+    try {
+      const target = lstatSync(userLink);
+      if (!target.isSymbolicLink() || readlinkSync(userLink) !== source) {
+        console.error(
+          `[entrypoint] WARN: reserved ${userLink} already exists with an unexpected target; preserved`,
+        );
+      }
+    } catch (linkErr) {
+      if ((linkErr as NodeJS.ErrnoException).code !== "ENOENT") throw linkErr;
+      symlinkSync(source, userLink);
+    }
+  } catch (platformLinkErr) {
+    console.error(
+      `[entrypoint] WARN: ${cliName} PATH link setup failed (non-fatal): ${(platformLinkErr as Error).message}`,
+    );
   }
-} catch (pluginLinkErr) {
-  console.error(
-    `[entrypoint] WARN: oc-plugin PATH link setup failed (non-fatal): ${(pluginLinkErr as Error).message}`,
-  );
 }
 
 const CODEX_HOME_DIR = "/home/agent/.codex";
