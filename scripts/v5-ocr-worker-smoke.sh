@@ -57,7 +57,7 @@ assert_ready() {
 assert_owned_supervisor() {
   local census total orphan
   census=$(ssh "${ssh_args[@]}" "root@$OC_OCR_SSH_HOST" \
-    "ps -eo ppid=,args= | awk '\$0 ~ /\\/opt\\/openclaude-ocr-worker\\/(current|releases\\/.+)\\/run-supervisor\\.sh/ { total++; if (\$1 == 1) orphan++ } END { print total+0, orphan+0 }'") || {
+    "ps -eo ppid=,args= | awk '\$2 == \"/bin/bash\" && \$3 ~ /^\\/opt\\/openclaude-ocr-worker\\/(current|releases\\/[^/]+)\\/run-supervisor\\.sh\$/ && NF == 3 { total++; if (\$1 == 1) orphan++ } END { print total+0, orphan+0 }'") || {
       echo "OCR worker supervisor census failed" >&2
       return 1
     }
