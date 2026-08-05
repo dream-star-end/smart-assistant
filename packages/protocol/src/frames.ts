@@ -2,6 +2,7 @@ import { type Static, Type } from '@sinclair/typebox'
 import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 import { MessageReplyQuote } from './messageReply.js'
+import { SysMediaJob } from './mediaGeneration.js'
 import { AUTOMATIC_TURN_RETRY_MAX } from './turnErrorTaxonomy.js'
 
 // ───────────────────────────────────────────────
@@ -1275,6 +1276,7 @@ export const AnyFrame = Type.Union([
   SysContextRebuilt,
   SysIncident,
   SysGoalSnapshot,
+  SysMediaJob,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

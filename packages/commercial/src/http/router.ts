@@ -27,6 +27,7 @@ import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
+import { dispatchMediaGenerationRoute } from '../media-generation/http.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplaceAiReviews,
@@ -660,6 +661,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/wx/live', handler: handleWechatLivePage },
     { method: 'GET', path: '/api/wechat/live', handler: handleWechatLiveSnapshot },
     { method: 'GET', path: '/api/me', handler: handleMe },
+    { method: ANY_METHOD, path: '/api/media-generation', handler: dispatchMediaGenerationRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
     // Session GoalState. Method/action semantics are centralized in the
     // dispatcher; ownership is rechecked against client_sessions in PG.
     {
@@ -1367,6 +1370,7 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     // 401/404("not found")。2026-07-11 连接器目录 not found 事故根因即漏登本处。
     '/api/connectors',
     '/api/plugins',
+    '/api/media-generation',
     // 会话目标(GoalState)REST 面。2026-07-17 事故:PR#76 只登了 routes 数组漏了
     // 本清单 → goal 全部 REST 404(GET 被前端当"无目标"吞,PUT 炸出 not found)。
     // 两处同步铁律由 routeOwnership.test.ts 契约测试锁死。
