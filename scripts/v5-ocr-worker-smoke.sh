@@ -56,7 +56,9 @@ assert_ready() {
 
 assert_owned_supervisor() {
   local census total orphan
-  census=$(ssh "${ssh_args[@]}" "root@$OC_OCR_SSH_HOST" \
+  # This script itself arrives over `ssh ... bash -s`. The nested SSH must not
+  # read that same stdin or it can consume the still-unparsed stability checks.
+  census=$(ssh -n "${ssh_args[@]}" "root@$OC_OCR_SSH_HOST" \
     "ps -eo pid=,ppid=,pgid=,args= | awk '\$1 == \$3 && \$4 == \"/bin/bash\" && \$5 ~ /^\\/opt\\/openclaude-ocr-worker\\/(current|releases\\/[^/]+)\\/run-supervisor\\.sh\$/ && NF == 5 { total++; if (\$2 == 1) orphan++ } END { print total+0, orphan+0 }'") || {
       echo "OCR worker supervisor census failed" >&2
       return 1
