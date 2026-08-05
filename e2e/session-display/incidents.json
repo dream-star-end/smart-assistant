@@ -931,6 +931,25 @@
           "assertion": "reprovision failed"
         }
       ]
+    },
+    {
+      "id": "INC-20260805-OCR-SMOKE-STDIN",
+      "occurredAt": "2026-08-05",
+      "severity": "P1",
+      "symptom": "V5 OCR worker 官方 smoke 的远端脚本通过 stdin 传给 bash -s，但其中的 supervisor census 又启动了未禁用 stdin 的嵌套 SSH；该 SSH 吞掉后续脚本后仍返回 0，导致稳定窗口、二次 ready/owner 校验和最终成功证据被静默跳过。",
+      "rootFixCommit": "e3958999",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5OcrWorkerTunnel.test.ts",
+          "assertion": "nested supervisor census SSH cannot consume the remaining remote smoke script"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-ocr-worker-smoke.sh",
+          "assertion": "OCR worker ready: release="
+        }
+      ]
     }
   ]
 }
