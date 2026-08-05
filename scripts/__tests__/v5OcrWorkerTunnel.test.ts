@@ -28,3 +28,20 @@ test("official deploy smoke proves exact OCR readiness, stable tunnel identity, 
   assert.match(smoke, /orphan.*== 0/);
   assert.match(smoke, /OCR worker tunnel stability drifted during smoke/);
 });
+
+test("OCR supervisor census excludes its own query shell instead of self-matching", () => {
+  const fixture = [
+    " 4242 /bin/bash /opt/openclaude-ocr-worker/current/run-supervisor.sh",
+    " 4243 bash -c ps -eo ppid=,args= | awk $0~run-supervisor.sh",
+    "    1 /bin/bash /root/unrelated/run-supervisor.sh",
+  ].join("\n");
+  const program = '$2 == "/bin/bash" && $3 ~ /^\\/opt\\/openclaude-ocr-worker\\/(current|releases\\/[^/]+)\\/run-supervisor\\.sh$/ && NF == 3 { total++; if ($1 == 1) orphan++ } END { print total+0, orphan+0 }';
+  const result = spawnSync("awk", [program], { input: fixture, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "1 0");
+
+  const smoke = readFileSync(path.join(root, "scripts/v5-ocr-worker-smoke.sh"), "utf8");
+  assert.match(smoke, /\\\$2 == \\"\/bin\/bash\\"/);
+  assert.match(smoke, /\\\$3 ~ \/\^\\\\\/opt/);
+  assert.match(smoke, /&& NF == 3/);
+});
