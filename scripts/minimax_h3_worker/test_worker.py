@@ -152,6 +152,23 @@ class WorkerContractTest(unittest.TestCase):
         finally:
             self.stop_server(server, thread)
 
+    def test_exact_root_readiness_is_public_without_refreshing_session_lease(self):
+        server, thread = self.server()
+        root = f"http://127.0.0.1:{server.server_port}/"
+        try:
+            with patch.object(self.worker, "touch_session_lease") as touch:
+                with urlopen(root, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.load(response), {"ok": True})
+                touch.assert_not_called()
+
+                with self.assertRaises(HTTPError) as unauthorized:
+                    urlopen(f"{root}?probe=1", timeout=5)
+                self.assertEqual(unauthorized.exception.code, 401)
+                touch.assert_not_called()
+        finally:
+            self.stop_server(server, thread)
+
     def test_result_transfer_refreshes_session_lease_per_progress_chunk(self):
         job = "lease-result"
         attempt = "a1"

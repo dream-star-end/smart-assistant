@@ -802,6 +802,8 @@ class Handler(BaseHTTPRequestHandler):
         return match.group(1), match.group(2), match.group(3) or ""
 
     def _handle(self, method):
+        if method == "GET" and self.path == "/":
+            return self._json(200, {"ok": True})
         if not self._authorized():
             return self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
         self.worker.touch_session_lease()
