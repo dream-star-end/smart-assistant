@@ -32,5 +32,9 @@ Every request requires `Authorization: Bearer $H3_WORKER_TOKEN`; mutations and
 result reads also require the matching `X-Fence-Version`.
 
 The GPU resource stays occupied through the `releasing_gpus` phase. Completion
-is published only after both H3 ranks have stopped and both cards report at most
-2% memory use.
+is published only after both H3 ranks have stopped and both cards return within
+`H3_WORKER_GPU_RELEASE_MAX_PERCENT`. The strict default is `2,2`. On a host with
+a proven persistent co-tenant such as the OCR model on card 0, configure the two
+per-card ceilings from the measured idle floor plus a small margin (for example,
+`18,2` for a measured `16,0` floor). A card above its ceiling keeps the H3 lease
+poisoned and retries cleanup instead of admitting the next job.
