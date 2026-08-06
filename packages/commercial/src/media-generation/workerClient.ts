@@ -3,6 +3,8 @@ import { mkdir, rename, rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import type { Dispatcher } from 'undici'
+import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import type { MediaInputRow, MediaJobRow } from './store.js'
 
 export interface WorkerStatus {
@@ -57,6 +59,13 @@ export class MediaWorkerClient {
     }
   }
 
+  private request(url: string, init: RequestInit = {}): Promise<Response> {
+    return fetch(url, {
+      ...init,
+      dispatcher: directEgressDispatcher(),
+    } as RequestInit & { dispatcher: Dispatcher })
+  }
+
   private signal(timeoutMs: number, external?: AbortSignal): AbortSignal {
     const timeout = AbortSignal.timeout(timeoutMs)
     return external ? AbortSignal.any([external, timeout]) : timeout
@@ -78,7 +87,7 @@ export class MediaWorkerClient {
   }
 
   async health(): Promise<unknown> {
-    const response = await fetch(`${this.baseUrl}/v1/health`, {
+    const response = await this.request(`${this.baseUrl}/v1/health`, {
       headers: this.headers(),
       signal: AbortSignal.timeout(10_000),
     })
@@ -86,7 +95,7 @@ export class MediaWorkerClient {
   }
 
   async capabilities(): Promise<unknown> {
-    const response = await fetch(`${this.baseUrl}/v1/capabilities`, {
+    const response = await this.request(`${this.baseUrl}/v1/capabilities`, {
       headers: this.headers(),
       signal: AbortSignal.timeout(10_000),
     })
@@ -109,7 +118,7 @@ export class MediaWorkerClient {
               start: offset,
               end: offset + chunkSize - 1,
             })
-      const response = await fetch(this.url(job, `inputs/${ordinal}`), {
+      const response = await this.request(this.url(job, `inputs/${ordinal}`), {
         method: 'PUT',
         headers: {
           ...this.headers(job),
@@ -135,7 +144,7 @@ export class MediaWorkerClient {
     request: Record<string, unknown>,
     external?: AbortSignal,
   ): Promise<WorkerStatus> {
-    const response = await fetch(this.url(job, 'submit'), {
+    const response = await this.request(this.url(job, 'submit'), {
       method: 'POST',
       headers: { ...this.headers(job), 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -149,7 +158,7 @@ export class MediaWorkerClient {
   }
 
   async status(job: MediaJobRow, external?: AbortSignal): Promise<WorkerStatus> {
-    const response = await fetch(this.url(job, 'status'), {
+    const response = await this.request(this.url(job, 'status'), {
       headers: this.headers(job),
       signal: this.signal(15_000, external),
     })
@@ -157,7 +166,7 @@ export class MediaWorkerClient {
   }
 
   async cancel(job: MediaJobRow, external?: AbortSignal): Promise<WorkerStatus> {
-    const response = await fetch(this.url(job, 'cancel'), {
+    const response = await this.request(this.url(job, 'cancel'), {
       method: 'POST',
       headers: { ...this.headers(job), 'content-type': 'application/json' },
       body: '{}',
@@ -171,7 +180,7 @@ export class MediaWorkerClient {
     target: string,
     external?: AbortSignal,
   ): Promise<{ sha256: string; size: number }> {
-    const response = await fetch(this.url(job, 'result'), {
+    const response = await this.request(this.url(job, 'result'), {
       headers: this.headers(job),
       signal: this.signal(30 * 60_000, external),
     })
@@ -194,7 +203,7 @@ export class MediaWorkerClient {
   }
 
   async ack(job: MediaJobRow, external?: AbortSignal): Promise<void> {
-    const response = await fetch(this.url(job, 'ack'), {
+    const response = await this.request(this.url(job, 'ack'), {
       method: 'POST',
       headers: { ...this.headers(job), 'content-type': 'application/json' },
       body: '{}',
