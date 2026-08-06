@@ -74,6 +74,12 @@
       "approvedBy": "dx 2026-08-04 明确指令“p0问题，立刻修复并上线”",
       "expiresAt": "2026-09-04",
       "emergencyMissingTrailer": true
+    },
+    {
+      "commit": "bef5fc291d4ad7d427604ce8b8e081e604e08f4e",
+      "reason": "H3 新功能在合成生产验收中暴露 worker 请求被 gateway 全局代理接管；官方 rollback 在真实用户使用该功能前恢复旧稳定版，既有聊天、计费与数据验证正常，未观察到真实用户影响。",
+      "approvedBy": "dx 2026-08-06 指示继续完成 H3 接入上线",
+      "expiresAt": "2026-09-06"
     }
   ]
 }
