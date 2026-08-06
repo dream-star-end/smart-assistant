@@ -10,6 +10,7 @@ import { Readable } from 'node:stream'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { Pool } from 'pg'
+import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici'
 
 import { signAccess } from '../auth/jwt.js'
 import { resetPool, setPoolOverride } from '../db/index.js'
@@ -165,6 +166,41 @@ function workerStatus(
 }
 
 describe('media generation durable queue and projects', () => {
+  test('worker client bypasses the gateway global proxy dispatcher', async () => {
+    const job = {
+      id: 'direct-egress-job',
+      attemptId: 'direct-egress-attempt',
+      fenceVersion: 1,
+      resourceClass: 'gpu-h3',
+    } as MediaJobRow
+    const worker = createServer((req, res) => {
+      assert.equal(req.url, '/v1/attempts/direct-egress-job/direct-egress-attempt/status')
+      assert.equal(req.headers.authorization, 'Bearer test-worker-token-that-is-long-enough')
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify(workerStatus(job.id, job.attemptId!, 'canceled')))
+    })
+    await new Promise<void>((resolve) => worker.listen(0, '127.0.0.1', resolve))
+    const address = worker.address()
+    assert.ok(address && typeof address === 'object')
+    const previousDispatcher = getGlobalDispatcher()
+    const proxyTrap = new MockAgent()
+    proxyTrap.disableNetConnect()
+    setGlobalDispatcher(proxyTrap)
+    try {
+      const client = new MediaWorkerClient(
+        `http://127.0.0.1:${address.port}`,
+        'test-worker-token-that-is-long-enough',
+      )
+      const status = await client.status(job)
+      assert.equal(status.status, 'canceled')
+    } finally {
+      setGlobalDispatcher(previousDispatcher)
+      await proxyTrap.close()
+      worker.closeAllConnections()
+      await new Promise<void>((resolve) => worker.close(() => resolve()))
+    }
+  })
+
   test('worker client splits large uploads into fixed-length streams without transfer encoding', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'oc-media-worker-chunks-'))
     const inputPath = path.join(root, 'large-input.bin')
