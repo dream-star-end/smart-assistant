@@ -19,6 +19,20 @@ Exceptions:
 - the dx-declared V5 P0 emergency lane below. This exception does **not** apply to personal/master
   product code, so the Personal Dev Instance First Rule remains absolute.
 
+### Review efficiency discipline (BLOCKING)
+
+- Each task that requires review uses exactly **one plan reviewer and one full-diff reviewer**. Do not send the same plan
+  or diff to multiple agents for reassurance. If a reviewer is unavailable, replace it once rather
+  than duplicating the review.
+- Ask for all evidence-backed correctness, security, data, and deployment blockers in one pass.
+  Style preferences, speculative defenses, adjacent audits, and optional refactors are non-blocking.
+- Close a blocking finding in the same review thread with only the incremental correction and proof.
+  Do not resend the whole plan/diff or start a new reviewer.
+- Freeze the reproduced root cause, requested scope, and acceptance criteria before implementation.
+  A reviewer may block unsafe work, but may not grow the task beyond that frozen scope.
+- Run the smallest relevant local tests while iterating. Run each required broad gate once at the
+  final boundary (normally protected CI), not after every small edit.
+
 ### Dx-declared V5 P0 emergency lane (BLOCKING)
 
 This two-phase lane exists only when dx explicitly states that V5 production is causing ongoing
@@ -61,6 +75,29 @@ proved, do not improvise a bypass: state the single blocker immediately.
   a competing `--abort`, `--rollback`, or `--recover`. Takeover is allowed only after the holder exits,
   the flock is released, and official state/marker recovery selects the next command. If ownership
   cannot be proved, remain read-only and report it.
+
+## V5 production is not a test environment (BLOCKING)
+
+- Before entering a V5 production canary, declare the exact candidate, touched deployment surfaces,
+  rollback target, and finite acceptance checks. Facts that can be proven in a worktree, CI,
+  isolated host, or production-equivalent systemd/proxy/worker environment must be proven there
+  first; do not discover them by repeatedly rolling production forward and back.
+- A rollback/abort ends that release attempt. Do not retry under the same conditions. First reproduce
+  the failed check outside the rollout and prove the code, environment, or validation-harness fix.
+  A retry requires new evidence and either a new candidate or a documented environment-only
+  correction; "probably transient" is not evidence.
+- For ordinary planned work, the production release queue is only for tasks that will mutate
+  production. Such a task may skip it only when proven to touch no production lock/lease, runtime
+  state, persistent data, hot config, migration, tunnel, credential, worker, service/unit/env/runtime
+  tuple, or user traffic. If unsure, it remains a queued production task.
+- Safety/recovery modes (`abort/rollback/recover/reclaim/hide-luna`), authorized emergency
+  authorization/closure, and the proven self-heal ledger bypass use only the explicit queue
+  exceptions in the V5 playbook. They never waive the official mutation lease, owner/fencing, clean
+  canonical, or official-script requirements; in particular, queue waiting must never delay abort.
+- Regular long V5 mutation commands must run through the repository's official detached runner so a
+  Web session timeout cannot kill the controlling process. Emergency/offline lanes that synchronously
+  return a nonce follow their exact playbook command. The runner is not the mutation owner: owner
+  identity still comes solely from the official remote flock and lease-fencing evidence.
 
 ### Codex Review ≠ Blind Acceptance
 
@@ -105,9 +142,16 @@ git -C /opt/openclaude/openclaude worktree add \
 cd ../openclaude-<slug>                                     # 在这里改
 ```
 
-- 路径前缀:个人版 `/opt/openclaude/openclaude-<slug>`,v3 `/opt/openclaude/openclaude-v3-<slug>`
+V5 商业版使用独立 canonical，不得套用 v3 示例：
+
+```bash
+git -C /opt/openclaude/openclaude-v5-aurora worktree add \
+    ../openclaude-v5-<slug> -b <type>/v5-<slug> origin/feat/v5-aurora-rewrite
+```
+
+- 路径前缀:个人版 `/opt/openclaude/openclaude-<slug>`,v3 `/opt/openclaude/openclaude-v3-<slug>`,V5 `/opt/openclaude/openclaude-v5-<slug>`
 - 分支前缀:`feat/` / `fix/` / `chore/`(活跃),`wip/`(草稿或长期参考,跟活跃分支区分)
-- base:个人版 `origin/master`,商用版 `origin/v3`
+- base:个人版 `origin/master`,v3 `origin/v3`,V5 `origin/feat/v5-aurora-rewrite`
 - 任务结束清理:`git worktree remove` + `git branch -d`(merged)+ 如远端也已无价值 `git push origin --delete <branch>`
 
 **理由**:boss 同时跑多个独立开发任务,共用工作树会导致 `git status` 脏文件归属混乱、rebase/push 互相污染、dev 实例读到不属于自己的代码。2026-05-18 大扫除清了 25 个 0-ahead 死分支 + 5 个 stale worktree 记录,根因就是没遵守这条。

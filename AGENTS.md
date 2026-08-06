@@ -18,6 +18,11 @@ git worktree add ../openclaude-<slug> -b <type>/<slug> origin/master
 cd /opt/openclaude/openclaude-v3
 git fetch origin
 git worktree add ../openclaude-v3-<slug> -b <type>/<slug> origin/v3
+
+# Commercial V5 work
+cd /opt/openclaude/openclaude-v5-aurora
+git fetch origin
+git worktree add ../openclaude-v5-<slug> -b <type>/v5-<slug> origin/feat/v5-aurora-rewrite
 ```
 
 Rules:
@@ -26,6 +31,10 @@ Rules:
 - run `git status -sb` and record the base commit before editing
 - with parallel agents, assign disjoint file/module ownership; never revert or overwrite another worker's changes
 - keep canonical checkouts as clean integration lanes only
+
+For V5 work, also follow `CLAUDE.md` sections **Review efficiency discipline**, **Diagnostic intent
+and V5 production mutation boundary**, and **V5 production is not a test environment**. These keep
+rollback-first safety while forbidding duplicate review, blind rollout retry, and production-as-test.
 
 ## Integration and cleanup
 
