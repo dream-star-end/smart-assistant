@@ -2318,6 +2318,7 @@ describe("userChatBridge / codex relay — enabled groups fail closed", () => {
 describe("userChatBridge / codex relay — route expiry", () => {
   let rig: BillingRig;
   const routeToken = "b".repeat(64);
+  const survivingRouteToken = "d".repeat(64);
   const expiredTokens: string[] = [];
   let delayedRoute:
     | { token: string; gate: Promise<void>; started: () => void }
@@ -2345,9 +2346,10 @@ describe("userChatBridge / codex relay — route expiry", () => {
             credentialId: "8",
           };
         }
+        const selectedToken = args.userId === 22n ? survivingRouteToken : routeToken;
         return {
-          token: routeToken,
-          baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${routeToken}`,
+          token: selectedToken,
+          baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${selectedToken}`,
           modelProvider: "api111",
           providerName: "Yunwu",
           wireApi: "responses",
@@ -2402,6 +2404,35 @@ describe("userChatBridge / codex relay — route expiry", () => {
     ws.close();
   });
 
+  test("forwarded route token survives bridge drain timeout for the continuing turn", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const token = await makeJwt("22");
+    const ws = openClient(rig.gatewayPort, token);
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      agentId: "codex",
+      model: "gpt-5.6-sol",
+      content: "x",
+    }));
+    const frameToContainer = await waitContainerNextFrame(containerWs);
+    const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+    const route = parsed.__oc_codex_route as { baseUrl?: string } | undefined;
+    assert.equal(route?.baseUrl?.includes(survivingRouteToken), true);
+
+    ws.close();
+    const containerClosed = await waitContainerClose(containerWs, 2_000);
+    assert.equal(containerClosed, true, "container bridge must close after drain timeout");
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      expiredTokens.includes(survivingRouteToken),
+      false,
+      "bridge teardown must not expire a route owned by the surviving turn",
+    );
+  });
+
   test("route token is expired if the bridge closes while route creation is in flight", async () => {
     const delayedToken = "c".repeat(64);
     let resolveRoute!: () => void;
@@ -2414,7 +2445,7 @@ describe("userChatBridge / codex relay — route expiry", () => {
       const token = await makeJwt("21");
       const ws = openClient(rig.gatewayPort, token);
       await waitOpen(ws);
-      await containerOpenP;
+      const containerWs = await containerOpenP;
 
       ws.send(JSON.stringify({
         type: "inbound.message",
@@ -2426,13 +2457,11 @@ describe("userChatBridge / codex relay — route expiry", () => {
       const closedP = new Promise<void>((resolve) => ws.once("close", () => resolve()));
       ws.close();
       await closedP;
+      const containerClosed = await waitContainerClose(containerWs, 2_000);
+      assert.equal(containerClosed, true, "bridge must finish cleanup before route creation resumes");
       resolveRoute();
-      // 两种合法时序都必须以 expire 收尾(资源安全不变量):
-      //   a) server 侧 close 先于 route 创建完成 → cleaned=true → IIFE 走
-      //      cleanup_during_route_creation 立即 expire;
-      //   b) route 创建先完成(client 'close' 事件可先于 server close 处理,竞态真实
-      //      存在)→ turn 注册 inflight → close 进 drain → 窗口(300ms)超时
-      //      finalCleanup → abandon + bridge_cleanup expire。
+      // finalCleanup 已先完成,这个 route 从未转发给容器；late creation 必须
+      // 由 identity fence 立即 expire,不能借“跨桥存活”语义泄漏到 TTL。
       await waitUntil(() => expiredTokens.includes(delayedToken), 3_000);
     } finally {
       delayedRoute = null;
