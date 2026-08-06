@@ -840,7 +840,8 @@
       "rootFixCommit": "ece3f5f8",
       "coverageCommits": [
         "7767576a",
-        "7f0d03eb"
+        "7f0d03eb",
+        "eb3bd177"
       ],
       "regressions": [
         {
@@ -862,6 +863,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalCodexRelay.test.ts",
           "assertion": "promotes vision tool output only for the qwen3.8-max Bailian Responses route"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridgeCodexBilling.test.ts",
+          "assertion": "forwarded route token survives bridge drain timeout for the continuing turn"
         }
       ]
     },
