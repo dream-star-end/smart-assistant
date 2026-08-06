@@ -32,6 +32,17 @@ ATTEMPT_PATH = re.compile(r"^/v1/attempts/([^/]+)/([^/]+)(?:/(.*))?$")
 TERMINAL = {"completed", "failed", "canceled"}
 
 
+def gpu_release_limits(value):
+    raw = value if value is not None else "2,2"
+    parts = raw.split(",")
+    if len(parts) != 2 or any(not re.fullmatch(r"\d{1,3}", part) for part in parts):
+        raise SystemExit("H3_WORKER_GPU_RELEASE_MAX_PERCENT must be two comma-separated integers")
+    limits = tuple(int(part) for part in parts)
+    if any(limit > 100 for limit in limits):
+        raise SystemExit("H3_WORKER_GPU_RELEASE_MAX_PERCENT values must be between 0 and 100")
+    return limits
+
+
 def now_ms():
     return int(time.time() * 1000)
 
@@ -270,6 +281,9 @@ class Worker:
         self.sp_state = Path(os.environ.get("H3_SP_STATE_ROOT", "/root/minimax-h3-sp-runtime"))
         self.python = Path(os.environ.get("H3_SP_PYTHON", "/root/minimax-h3-runtime/venv/bin/python"))
         self.token = os.environ.get("H3_WORKER_TOKEN", "")
+        self.gpu_release_max_percent = gpu_release_limits(
+            os.environ.get("H3_WORKER_GPU_RELEASE_MAX_PERCENT")
+        )
         supervisor_pid = os.environ.get("H3_SESSION_SUPERVISOR_PID")
         self.session_supervisor_pid = int(supervisor_pid) if supervisor_pid else None
         self.root.mkdir(parents=True, exist_ok=True)
@@ -717,15 +731,23 @@ class Worker:
             raise RuntimeError("hy-smi is unavailable; cannot prove the GPU lease was released")
         deadline = time.monotonic() + 90
         pattern = re.compile(r"HCU\[(\d+)\].*memory use \(%\):\s*(\d+)")
+        usage = {}
         while time.monotonic() < deadline:
             output = subprocess.check_output(
                 [str(smi), "--showmemuse"], text=True, timeout=15, stderr=subprocess.STDOUT
             )
             usage = {int(rank): int(percent) for rank, percent in pattern.findall(output)}
-            if usage.keys() >= {0, 1} and max(usage[0], usage[1]) <= 2:
+            if (
+                usage.keys() >= {0, 1}
+                and usage[0] <= self.gpu_release_max_percent[0]
+                and usage[1] <= self.gpu_release_max_percent[1]
+            ):
                 return
             time.sleep(2)
-        raise RuntimeError("H3 ranks stopped but GPU memory did not return below 2%")
+        raise RuntimeError(
+            "H3 ranks stopped but GPU memory did not return within release thresholds "
+            f"(limits={self.gpu_release_max_percent}, observed={usage})"
+        )
 
     def _execute_h3(self, row):
         request = json.loads(row["request_json"])

@@ -13,7 +13,14 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from worker import Conflict, Handler, ThreadingHTTPServer, Worker, worker_bind_host
+from worker import (
+    Conflict,
+    Handler,
+    ThreadingHTTPServer,
+    Worker,
+    gpu_release_limits,
+    worker_bind_host,
+)
 
 
 class Headers(dict):
@@ -30,6 +37,7 @@ class WorkerContractTest(unittest.TestCase):
         os.environ.pop("H3_SESSION_SUPERVISOR_PID", None)
         os.environ.pop("H3_WORKER_HOST", None)
         os.environ.pop("H3_WORKER_ALLOW_PUBLIC_BIND", None)
+        os.environ.pop("H3_WORKER_GPU_RELEASE_MAX_PERCENT", None)
         self.worker = Worker()
 
     def tearDown(self):
@@ -110,6 +118,40 @@ class WorkerContractTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SystemExit, "loopback-only"):
                 worker_bind_host()
+
+    def test_gpu_release_limits_are_strict_and_default_to_exclusive_cards(self):
+        self.assertEqual(gpu_release_limits(None), (2, 2))
+        self.assertEqual(gpu_release_limits("18,2"), (18, 2))
+        for value in ("18", "18,2,2", "18,-1", "18, 2", "101,2"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                gpu_release_limits(value)
+
+    def test_gpu_release_allows_the_configured_per_card_cotenant_floor(self):
+        self.worker.gpu_release_max_percent = (18, 2)
+        output = "HCU[0] : HCU memory use (%): 16\nHCU[1] : HCU memory use (%): 0\n"
+        with (
+            patch("worker.Path.is_file", return_value=True),
+            patch("worker.subprocess.run") as stop,
+            patch("worker.subprocess.check_output", return_value=output),
+        ):
+            self.worker._stop_ranks()
+        stop.assert_called_once()
+
+    def test_gpu_release_keeps_the_lease_poisoned_above_a_card_limit(self):
+        self.worker.gpu_release_max_percent = (18, 2)
+        output = "HCU[0] : HCU memory use (%): 19\nHCU[1] : HCU memory use (%): 0\n"
+        with (
+            patch("worker.Path.is_file", return_value=True),
+            patch("worker.subprocess.run"),
+            patch("worker.subprocess.check_output", return_value=output),
+            patch("worker.time.monotonic", side_effect=[0, 1, 91]),
+            patch("worker.time.sleep"),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"limits=\(18, 2\), observed=\{0: 19, 1: 0\}",
+            ),
+        ):
+            self.worker._stop_ranks()
 
     def test_session_lease_signal_is_pinned_to_supervisor_parent(self):
         with patch("worker.os.kill") as kill:
