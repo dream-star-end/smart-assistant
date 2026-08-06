@@ -1,4 +1,7 @@
-# Hotfix 上线检查清单 (kl-mirror)
+# Legacy V3 Hotfix 上线检查清单 (kl-mirror)
+
+> **仅适用于历史 V3，禁止用于 Aurora V5。** V5 开发、诊断和发布统一读取
+> `docs/V5_DEV_PLAYBOOK.md` 与 `v5-commercial-deploy` skill。
 
 > 用户报"现网坏了"时,从看到截图到 kl-mirror 跑上新版本,目标 **15 分钟内**。
 > 本清单基于 2026-05-16 Phase 2 read-path 修复中踩到的坑总结,每条都有

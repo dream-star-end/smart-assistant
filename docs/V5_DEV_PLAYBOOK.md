@@ -40,22 +40,23 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
 
 ---
 
-## 1. 角色分工体系(Codex × Claude Code)
+## 1. 主执行 Agent × 独立 Codex Reviewer
 
-个人版里有两个 AI 工位,固定分工,不要混用:
+V5 任务不绑定某个模型做实现；绑定的是职责和唯一性：
 
 | 阶段 | 主责 | 说明 |
 |---|---|---|
-| 需求调研/方案 | CC 起草 → **Codex 审方案** | CLAUDE.md 强制:方案先过 Codex 再写码 |
-| 实现 | CC(worktree 隔离) | 多任务并行时按 §2.3 文件所有权分工 |
-| 代码审计 | **Codex**(codex-review-loop skill) | 迭代到 PASS 才算完成;prompt 遵守上下文经济(大 diff 让 Codex 自己 `git diff`,不贴全文) |
-| 独立视角排查 | Codex | CC 卡住/怀疑自己结论时,把"现象+已排除项"丢给 Codex 独立复查 |
-| 部署 | CC 按 §4 执行 | Codex 不做部署操作 |
+| 需求调研/方案 | 主执行 Agent → **一个 Codex reviewer** | 一次给齐根因、最小范围、验收与发布面；禁止重复 reviewer |
+| 实现 | 主执行 Agent(worktree 隔离) | 多任务并行时按 §2.3 文件所有权分工 |
+| 代码审计 | **一个 Codex reviewer** | 只看证据充分的 blocker；需要复审时在同一线程只发增量 |
+| 卡点复核 | 原 reviewer 或一次替代 reviewer | 仅在真实阻塞/不可用时触发，不做“再保险”审计 |
+| 部署 | 唯一 production-mutation owner | 按 §4 走 detached runner + 官方脚本，owner 仍以远端 flock/lease 为准 |
 
 **给较弱模型的三条铁律**(Fable 退场后尤其重要):
 1. **不猜,先取证**。任何"应该是 X"都要用命令验证(git log / 线上 grep / 实跑测试)。本手册每个流程都带验证命令,照抄。
 2. **改前找权威源**。v5 大量问题源于双权威(两份清单/两套机制/两处 seed)。动手前先问:这个数据/行为的单一权威在哪?若发现第二份,先收敛再改。
-3. **常规完成的定义 = 测试实跑通过 + Codex PASS + 按 §4 分类部署 + smoke 通过**。缺一项就不许说
+3. **常规完成的定义 = 精准测试 + protected CI + Codex PASS + 必要时按 §4 部署/smoke**。纯
+   no-production-mutation 任务不为凑流程而部署或占 production queue。其余任务缺一项就不许说
    “已完成”。dx 显式 P0 emergency lane 可在 Phase 1 后只说“止血已上线”；补测、单一 Codex
    审查和受保护 CI/PR 未关账前，不得说任务或根治完成。
 
@@ -65,19 +66,27 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
 
 ### 2.1 开工前
 ```bash
-cd /opt/openclaude/openclaude-v3            # canonical(v3 分支 checkout,只做集成不做开发)
-git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrite
+cd /opt/openclaude/openclaude-v5-aurora      # V5 canonical,只做集成/部署
+git fetch origin feat/v5-aurora-rewrite
+git status -sb
+git worktree add ../openclaude-v5-<slug> \
+  -b <type>/v5-<slug> origin/feat/v5-aurora-rewrite
 ```
 - v5 的基永远是 `feat/v5-aurora-rewrite`(**单一 canonical 分支**;部署树=`/opt/openclaude/openclaude-v5-aurora`)。
 - 新 worktree 无依赖时,从部署树硬链复制(秒级):
   `cp -al /opt/openclaude/openclaude-v5-aurora/node_modules ../openclaude-v5-<slug>/node_modules`
   ⚠️ 坑:某些 worktree 的 node_modules 是**指向别的 worktree 的 symlink**,`@openclaude/*` 会解析到别人的源码树。校验:`readlink -f node_modules/@openclaude/protocol` 必须落在自己树内;不对就做本地 shim:
   `mkdir -p packages/<pkg>/node_modules/@openclaude && ln -sfn ../../../protocol packages/<pkg>/node_modules/@openclaude/protocol`
-- 先充分调研(git log 相关文件、找既有抽象),方案过 Codex,再写码。
+- 先取证到能写出“根因→最小改动→有限验收”,一次方案 review 后冻结范围再写码。禁止把
+  “充分调研”扩成无边界全仓审计。
 
 ### 2.2 v5 设计原则(与 v3 的关键差异)
-- **v5 未全量上线 → 放开走最优解**:发现次优结构就大胆重构(换抽象/删旧机制/改数据模型),不为"改动小"迁就。架构妥协零容忍;v3 仍守现网约束。
-- 判断标准:worktree 基于 feat/v5-aurora-rewrite → 最优解;基于 v3 → 现网纪律。
+- **V5 已有真实用户，最小充分改动优先**：只修复已复现问题或明确需求，不顺手重构、扩审计、
+  改无关抽象或增加推测性防御。
+- 架构调整只有在它本身就是需求、或已证实根因无法用更小改动正确修复时才进入范围；测试同时
+  覆盖问题路径和原有正常路径。
+- 用户体验仍是第一优先级：容量问题优先分页、流式、懒加载和分层存储，不用任意硬上限、截断或
+  投影替身换取实现便利。
 
 ### 2.3 多任务并行(多 agent 同 worktree)
 按**包级文件所有权**切分,严禁交叉写:
@@ -88,6 +97,18 @@ git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrit
   stash pop 自愈纯属侥幸)。要对比基线用 `git diff HEAD -- <自己的文件>` 或另开只读 worktree。
 
 ### 2.4 测试(每层的实跑命令)
+
+**默认节奏是 targeted-first，不是每次本地全仓重跑：**
+
+1. 迭代时只跑能复现问题的用例和受影响 package/typecheck；每个相同命令有新相关改动才重跑。
+2. 最终 commit 前跑一次 `npm run check:v5:prequeue`，先关闭 incident、integ tier、CI parity
+   等便宜的确定性门，避免入队后才 amend/cancel。
+3. 单一 full-diff review 看最终范围；修 blocker 后只跑受影响测试和 prequeue 增量相关门。
+4. `npm run check:v5` 由 protected CI 跑一次。只有跨包/部署脚本改动、CI 复现或明确要求时才在
+   本机额外跑全门；不得把重复全量测试当作“更稳”。
+
+按生效面选本地验证：React 交互跑目标 Vitest + 真 Chromium；SQL 语义跑目标 integ；gateway/
+storage/protocol 跑各自目标用例；部署脚本跑 Bash syntax + `test:v5:ops` 相关文件。
 
 > **跨树互斥(硬机制,2026-07-10)**:`test:commercial:unit/integ` 已经由
 > `scripts/test-mutex.sh` 包裹 —— 共享 octest PG/端口的测试族在
@@ -160,7 +181,13 @@ find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort 
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
 
 ### 2.5 合并与收尾
-- 实现完 → Codex 审计到 PASS → 在**受保护 PR 合并前**先提交全局发布队列：
+- 最终 commit 前完成 targeted tests + `npm run check:v5:prequeue` + `git diff --check`；然后让唯一
+  full-diff reviewer 审最终范围。审查/gate 后若 SHA 改变，先补相应精准验证，禁止先占队列再 amend。
+- **只有将触发生产 mutation 的任务才进入全局发布队列。** 例外必须证明任务不会触发任何
+  production lock/lease、运行态、持久数据、hot-config、迁移、隧道、凭据、worker、
+  service/unit/env/runtime tuple 或用户流量变化；docs/tests/CI/eval-only 也必须满足这条才能跳过。
+  不确定就仍按生产任务入队。
+- 需要生产变更时，在**受保护 PR 合并前**提交全局发布队列：
   `RQ=$(scripts/v5-release-queue.sh submit --task <slug> --branch <task-branch> --sha "$(git rev-parse HEAD)" --actor <owner>)`。
   `submit` 对同一 branch+SHA 幂等；随后执行
   `scripts/v5-release-queue.sh wait --id "$RQ" --owner <owner>`。只有取得唯一 `active`
@@ -171,7 +198,9 @@ find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort 
   `export OC_V5_RELEASE_QUEUE_ID="$RQ"`。成功 finalize 后才
   `finish --result deployed`；官方 abort/rollback 收敛旧稳定版后用
   `finish --result not-deployed`。队列项跨进程、跨会话持久化，不靠某个 shell 一直存活。
-- 合并后**只保留 canonical + 未合并分支**:`git branch --merged feat/v5-aurora-rewrite` 逐个删本地+远端分支、`git worktree remove`、`git worktree prune`。注意在 v3 checkout 里 `git branch -d` 按 v3 判断"未合并",要用 `git merge-base --is-ancestor <br> feat/v5-aurora-rewrite && git branch -D <br>` 守卫式强删。
+- 合并后清理任务 worktree 前逐项证明：clean、已合并、无进程/锁占用。只用
+  `git worktree remove <path>`；dirty/unmerged/locked/process-in-use 只报告，禁止 `--force`。
+  随后删除已验证合并的本地/远端任务分支并 `git worktree prune`。
 - push:`git push origin feat/v5-aurora-rewrite`。
 
 ---
@@ -302,6 +331,21 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 
 ### 4.2 标准部署
 
+**进入 production mutation 前一次性完成 readiness：**
+
+- exact candidate/queue/CI 已固定，canonical clean；部署生效面、previous release/runtime tuple、
+  官方 abort/rollback 目标和有限验收清单已写明。
+- 代码语义用 targeted tests + protected CI 证明；外部 provider/worker/tunnel/GPU/proxy/systemd
+  类任务还必须在隔离宿主或生产等价环境证明真实链路与共驻资源地板。生产 0% canary 不负责
+  首次发现这些事实。
+- 验收清单在 canary 前冻结；canary 中不得扩范围、临时改断言后继续放量或边调试边重跑。
+- 任一 abort/rollback 都结束当前 release attempt。先在 rollout 外复现失败门并证明修复，再用新
+  evidence 重入队；同一条件下“再试一次”禁止。
+- 常规长耗时 mutation（deploy/canary/finalize/dist/egress/runtime/remount，以及官方
+  abort/rollback/recover）必须经 `scripts/v5-deploy-detached.sh` 发起，避免控制会话/前台时限
+  杀死 outer 进程。只读短命令与需要同步取 nonce 的 emergency/offline 专用 lane 仍按本节精确
+  命令执行。wrapper 只负责生存性和状态查询，不改变官方 owner/lease/phase 裁决。
+
 > **全局发布队列(硬机制)**:`scripts/v5-release-queue.sh` 是“任务级”持久 FIFO，
 > 从受保护 PR 合并前一直占到 canary/验证/finalize 收敛；`deploy-v5.sh` 的
 > `/var/lock/oc-v5-deploy.lock` 只是“单命令级”互斥，不能替代发布队列。
@@ -331,15 +375,19 @@ cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件�
 git status --porcelain                       # 必须为空
 scripts/v5-release-queue.sh status           # 确认本任务是唯一 active
 export OC_V5_RELEASE_QUEUE_ID="$RQ"           # §2.5 submit/acquire/pin 得到的持久 ID
-bash scripts/deploy-v5.sh [--egress]         # 快照(.prev.1..5 可 --rollback)+rsync+restart+smoke
+UNIT=$(scripts/v5-deploy-detached.sh start -- --egress) # 不需要 egress 时省略该参数
+scripts/v5-deploy-detached.sh wait "$UNIT"   # wrapper退出码=官方deploy-v5.sh退出码
 # 前端(涉及 web-react):走 --dist,勿再手敲 rsync --delete(会造成部署窗口 404 白屏)。
 #   竞态安全=资产加法先行 + 根文件后替换(新 index.html 永远只引用已就位资产);
 #   资产 14 天 GC;版本握手 smoke 断言线上 oc-build == 本地构建。
-bash scripts/deploy-v5.sh --dist
+UNIT=$(scripts/v5-deploy-detached.sh start -- --dist)
+scripts/v5-deploy-detached.sh wait "$UNIT"
 bash scripts/deploy-v5.sh --smoke
 
 # 仅隔离预发宿主的 80 已被无关服务占用时，在线 deploy/P3 lane 可显式覆盖 Caddy 端口：
-CADDY_HTTP_PORT=18081 KL_HOST=kl-hk bash scripts/deploy-v5.sh --canary
+UNIT=$(CADDY_HTTP_PORT=18081 KL_HOST=kl-hk \
+  scripts/v5-deploy-detached.sh start -- --canary)
+scripts/v5-deploy-detached.sh wait "$UNIT"
 # 非 80 配置会自动 bind 127.0.0.1；预发 monitor 同步传
 # V5MON_PUBLIC_URL=http://127.0.0.1:18081/healthz。生产不得设置 CADDY_HTTP_PORT，恒用默认 80。
 # 此覆盖不支持 prepare/offline-cutover lane（该紧急通道仍固定生产 80）。
@@ -379,8 +427,10 @@ verification run 命中的请求才零扣费；每笔仍在 `usage_records` 保�
 ```bash
 # 普通发布：--canary 自动跑固定矩阵并写 exact release/generation evidence；缺证据的
 # --finalize 会先 abort。涉及 commercial egress/计费代码时必须带 --egress。
-bash scripts/deploy-v5.sh --canary --egress
-bash scripts/deploy-v5.sh --finalize
+UNIT=$(scripts/v5-deploy-detached.sh start -- --canary --egress)
+scripts/v5-deploy-detached.sh wait "$UNIT"
+UNIT=$(scripts/v5-deploy-detached.sh start -- --finalize)
+scripts/v5-deploy-detached.sh wait "$UNIT"
 
 # Luna 只在 stable active 与当前 generation 已有双模型证据后公开；该操作有 admin_audit。
 bash scripts/deploy-v5.sh --publish-luna
@@ -472,11 +522,13 @@ Docker census、inspect 或 Source 解析任一失败时，整轮 GC 在首个 `
 ```bash
 # deploy 脚本从 deploy_state 自动解析 active A/B，不手填 unit/path。
 scripts/deploy-v5.sh --census-ccb-baseline
-scripts/deploy-v5.sh --remount-ccb-baseline
+UNIT=$(scripts/v5-deploy-detached.sh start -- --remount-ccb-baseline)
+scripts/v5-deploy-detached.sh wait "$UNIT"
 
 # 仅需调整总 deadline 时（单位：秒，允许 60..7200）：
-OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS=3600 \
-  scripts/deploy-v5.sh --remount-ccb-baseline
+UNIT=$(OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS=3600 \
+  scripts/v5-deploy-detached.sh start -- --remount-ccb-baseline)
+scripts/v5-deploy-detached.sh wait "$UNIT"
 ```
 
 红线:只从部署树发;绝不手工 rsync+restart 绕过脚本;v3 的 service/env/Caddy 一律不碰。
@@ -602,6 +654,9 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 
 ### 4.6 发版节奏(2026-07-06 起,P1.5 制度化)
 全量现网后告别"随改随发"。规则(可按运营数据调整):
+- **生产队列只串行生产 mutation**:纯 docs/tests/CI/eval-only 且已证明不碰任何生产
+  lock/lease、运行态、持久数据、hot-config、迁移、隧道、凭据、worker、service/unit/env/
+  runtime tuple 或用户流量的任务直接走 protected merge，不占 release queue；无法证明则入队。
 - **常规批次攒窗口发**:非紧急任务先在 task branch 完成审查/CI，进入全局发布 FIFO；
   只有队首 active 任务在窗口内合并 canonical 并完成上线，后续 PR 保持未合并。默认每日
   1-2 个北京时间午后/晚间窗口；一窗一条面向用户 changelog(改动可感知时)。
@@ -630,6 +685,10 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
   --result=deployed|not-deployed`，该命令同时持本地 deploy flock 与官方远端
   production-mutation lease，并确认 markers absent、deploy_state stable/candidate empty
   后才原子记审计并释放。任一证明失败都保持 active，禁止手改 SQLite。
+- **回退不是重试按钮**:官方 abort/rollback 收敛旧 stable 后立即以 `not-deployed` 结束当前
+  attempt。下一 attempt 必须附 rollout 外复现与修复证据；验证器假阳性必须同时用旧 stable
+  control 和 fixed candidate 证明，外部环境问题必须在等价 systemd/proxy/worker/资源条件下证明。
+  同 SHA 仅在有明确 environment-only correction 且条件已改变时可重新使用。
 
 ### 4.6b 上线后核验清单
 - [ ] `/version` = 预期 commit;smoke 通过(含 OC_EGRESS_SPLIT=1 时 egress 无条件断言)
@@ -737,7 +796,13 @@ runner 会按 out-of-order 纪律拒绝；必须先备份，再按上面模板�
 
 ## 6. 本手册的维护
 
-每次踩到新坑/建立新机制,**当场更新本文对应小节**(部署类进 §4,定位类进 §3,债进 §5),并同步 bump 相关 skill(`~/.claude/skills/v5-*`)。文档腐烂比没有文档更危险。
+每次踩到新坑/建立新机制,**当场更新本文对应小节**(部署类进 §4,定位类进 §3,债进 §5),并通过
+`openclaude_memory` MCP 同步更新相关 skill。文档腐烂比没有文档更危险。
+
+通用流程只维护一份：review 规则归 `codex-review-loop`，worktree 归
+`parallel-worktree-workflow`，V5 发布/回退/重试归 `v5-commercial-deploy`。专项 skill 只记录
+领域特有的验证事实，并引用上述权威；不得复制整套通用部署步骤。skill 更新必须通过
+`openclaude_memory` MCP，更新后 `skill_view` 回读并保留可审查的 before/after diff。
 
 ### 2026-07-17 自愈批1a(Tier1 运维自愈激活)速记
 - **纯机器路径**:有确定 opcode 的运维类(egress/disk)**不起 codex 会话**——jobWorker 冻结路由后直接 ssh 跑 opcode→机器 done→master probe 裁决。模型对"重启/清盘"这种死动作零决策价值,只增延迟/成本/注入面;且机器 done 由 root 侧绑定真实 SSH exit 签发,天然满足"模型自述 done≠证据"。**tier2(代码类)才 prepareClone+codex,懒执行**。
