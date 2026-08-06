@@ -182,6 +182,87 @@ describe("config.loadConfig", () => {
     assert.equal("SESSION_PIN_MODE" in cfg, false);
     assert.equal("PHASE6_ACCOUNT_UUID_ENFORCE" in cfg, false);
   });
+
+  test("media generation worker requires a paired safe URL and strong token", () => {
+    const token = "m".repeat(32);
+    const cfg = loadConfig({
+      ...VALID_ENV,
+      MEDIA_GENERATION_WORKER_URL: "http://127.0.0.1:18883",
+      MEDIA_GENERATION_WORKER_TOKEN: token,
+      MEDIA_GENERATION_STATE_ROOT: "/var/lib/openclaude-v5/media-generation",
+      MEDIA_GENERATION_ALLOW_USER_IDS: "4, 9",
+      MEDIA_GENERATION_MAX_INPUT_BYTES: "2147483648",
+      MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES: "42949672960",
+    });
+    assert.equal(cfg.MEDIA_GENERATION_WORKER_URL, "http://127.0.0.1:18883");
+    assert.equal(cfg.MEDIA_GENERATION_WORKER_TOKEN, token);
+    assert.deepEqual(cfg.MEDIA_GENERATION_ALLOW_USER_IDS, ["4", "9"]);
+    assert.equal(cfg.MEDIA_GENERATION_MAX_INPUT_BYTES, 2_147_483_648);
+    assert.equal(cfg.MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES, 42_949_672_960);
+
+    const remote = loadConfig({
+      ...VALID_ENV,
+      MEDIA_GENERATION_WORKER_URL: "https://worker.example.com",
+      MEDIA_GENERATION_WORKER_TOKEN: token,
+      MEDIA_GENERATION_ALLOW_REMOTE_HTTPS: "1",
+      MEDIA_GENERATION_MAX_INPUT_BYTES: "1024",
+      MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES: "2048",
+    });
+    assert.equal(remote.MEDIA_GENERATION_WORKER_URL, "https://worker.example.com");
+    assert.equal(remote.MEDIA_GENERATION_ALLOW_REMOTE_HTTPS, true);
+
+    assert.throws(
+      () => loadConfig({ ...VALID_ENV, MEDIA_GENERATION_WORKER_URL: "http://127.0.0.1:18883" }),
+      ConfigError,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          ...VALID_ENV,
+          MEDIA_GENERATION_WORKER_URL: "http://worker.example.com",
+          MEDIA_GENERATION_WORKER_TOKEN: token,
+          MEDIA_GENERATION_ALLOW_REMOTE_HTTPS: "1",
+          MEDIA_GENERATION_MAX_INPUT_BYTES: "1024",
+          MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES: "2048",
+        }),
+      ConfigError,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          ...VALID_ENV,
+          MEDIA_GENERATION_WORKER_URL: "http://127.0.0.1:18883",
+          MEDIA_GENERATION_WORKER_TOKEN: token,
+        }),
+      ConfigError,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          ...VALID_ENV,
+          MEDIA_GENERATION_WORKER_URL: "http://127.0.0.1:18883",
+          MEDIA_GENERATION_WORKER_TOKEN: token,
+          MEDIA_GENERATION_MAX_INPUT_BYTES: "1024",
+          MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES: "512",
+        }),
+      ConfigError,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          ...VALID_ENV,
+          MEDIA_GENERATION_WORKER_URL: "https://worker.example.com",
+          MEDIA_GENERATION_WORKER_TOKEN: token,
+          MEDIA_GENERATION_MAX_INPUT_BYTES: "1024",
+          MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES: "2048",
+        }),
+      ConfigError,
+    );
+    assert.throws(
+      () => loadConfig({ ...VALID_ENV, MEDIA_GENERATION_WORKER_TOKEN: token }),
+      ConfigError,
+    );
+  });
 });
 
 /**

@@ -16,6 +16,7 @@ import {
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageFeedbackDialog } from "../src/components/chat/MessageFeedbackDialog";
+import { MediaTaskCenter } from "../src/components/MediaTaskCenter";
 import { Markdown } from "../src/components/Markdown";
 import { MessageList, MessageRenderer } from "../src/components/MessageRenderer";
 import { ModelSelector } from "../src/components/ModelSelector";
@@ -33,6 +34,7 @@ import {
 } from "../src/lib/persist";
 import type { ChatMessage } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
+import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import { createMemoryAuthSession } from "../src/lib/authSession";
 import { ChatSocket } from "../src/lib/chat/socket";
 import {
@@ -126,6 +128,8 @@ declare global {
       survivedStaleWrite: boolean;
       resistedResurrection: boolean;
     }>;
+    __pushMediaJob: (job: MediaGenerationJob) => void;
+    __openMediaTask: (open: boolean) => void;
   }
 }
 window.__sends = [];
@@ -201,6 +205,27 @@ window.__runPendingDispatchJournalProbe = async () => {
   stale.close();
   return { survivedStaleWrite, resistedResurrection };
 };
+
+const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
+
+function MediaTaskProbe() {
+  const [liveJob, setLiveJob] = useState<MediaGenerationJob | null>(null);
+  const [open, setOpen] = useState(false);
+  window.__pushMediaJob = setLiveJob;
+  window.__openMediaTask = setOpen;
+  return (
+    <MediaTaskCenter
+      open={open}
+      auth={mediaTaskAuth}
+      liveJob={liveJob}
+      onOpenChange={setOpen}
+    />
+  );
+}
+
+createRoot(document.getElementById("media-task-root")!).render(
+  <StrictMode><MediaTaskProbe /></StrictMode>,
+);
 
 const uploadStub = async (file: File): Promise<MediaRef> => {
   window.__uploads.push(file.name);

@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenClaude MiniMax H3 durable worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/root/.secrets/openclaude-h3-worker.env
+ExecStart=/root/minimax-h3-runtime/venv/bin/python /root/private_data/minimax-h3-v5-worker/scripts/minimax_h3_worker/worker.py
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
