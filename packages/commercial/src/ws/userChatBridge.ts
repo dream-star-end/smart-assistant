@@ -2504,6 +2504,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       acquiredAccountId: bigint | null;
       acquiredSlotId: string | null;
       apiRelayRouteToken: string | null;
+      turnForwarded: boolean;
       releaseTimer: ReturnType<typeof setTimeout> | null;
     };
     const activeCodexTurnsByPeer = new Map<string, ActiveCodexTurnState>();
@@ -2529,6 +2530,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const releaseCodexTurnState = (
       state: ActiveCodexTurnState,
       reason: string,
+      expireRouteTokenOnRelease = true,
     ): void => {
       if (state.releaseTimer !== null) {
         clearTimeout(state.releaseTimer);
@@ -2553,7 +2555,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
         try { deps.codexBinding.release(accountId, slotId); } catch { /* best effort */ }
       }
-      expireCodexRouteToken(routeToken, reason);
+      if (expireRouteTokenOnRelease) {
+        expireCodexRouteToken(routeToken, reason);
+      }
     };
 
     // Phase 4 — GitHub session-repo auto-rebind:bridge 实例级 cache。
@@ -4302,6 +4306,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           acquiredAccountId: null,
           acquiredSlotId: null,
           apiRelayRouteToken: null,
+          turnForwarded: false,
           releaseTimer: null,
         };
         activeCodexTurnsByPeer.set(peerKeyForAcquire, codexTurnState);
@@ -4902,6 +4907,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 frameForwardLen,
               );
               turnForwarded = forwardCommitted;
+              codexTurnState.turnForwarded = forwardCommitted;
               if (!forwardCommitted) abandonReason = "container_forward_rejected";
               if (forwardCommitted && dispatchRequest) {
                 promptQueueDispatchCancellations.set(dispatchRequest.grantId, {
@@ -4987,6 +4993,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               frameForwardIsBinary,
               frameForwardLen,
             );
+            codexTurnState.turnForwarded = turnForwarded;
             if (turnForwarded && dispatchRequest) {
               promptQueueDispatchCancellations.set(dispatchRequest.grantId, {
                 request: dispatchRequest,
@@ -6879,9 +6886,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
       // Release every session-scoped admission state. Awaiting acquire/route
       // continuations carry the state identity fence and release any resource
-      // they receive after this map has been cleared.
+      // they receive after this map has been cleared. A route already handed to
+      // the container belongs to the surviving turn, not to this browser bridge:
+      // keep it active across reconnect and let its container+user-bound TTL own
+      // cleanup if no later terminal frame reaches this bridge.
       for (const state of [...activeCodexTurnsByPeer.values()]) {
-        releaseCodexTurnState(state, "bridge_cleanup");
+        releaseCodexTurnState(state, "bridge_cleanup", !state.turnForwarded);
       }
       try { connectAbort.abort(); } catch { /* */ }
       try {
