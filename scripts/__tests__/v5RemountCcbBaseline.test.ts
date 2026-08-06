@@ -392,7 +392,7 @@ describe("V5 CCB baseline remount classification", () => {
     }
   });
 
-  test("official remount fail-loud verifies oc-plugin and oc-ocr PATH links inside the rebuilt container", async () => {
+  test("official remount fail-loud verifies every bundle-only CLI PATH link inside the rebuilt container", async () => {
     let command = "";
     const container = {
       exec: async (options: { Cmd?: string[] }) => {
@@ -404,7 +404,7 @@ describe("V5 CCB baseline remount classification", () => {
       },
     };
     await verifyPlatformCliLinks(container as never);
-    assert.match(command, /for name in oc-plugin oc-ocr/);
+    assert.match(command, /for name in oc-plugin oc-ocr oc-h3 oc-video/);
     assert.match(command, /\/home\/agent\/\.local\/bin\/\$name/);
     assert.match(command, /\/run\/oc\/platform\/current\/bin\/\$name/);
     assert.match(command, /readlink/);
