@@ -956,6 +956,30 @@
           "assertion": "OCR worker ready: release="
         }
       ]
+    },
+    {
+      "id": "INC-20260807-LIVE-PROCESS-LOSS",
+      "occurredAt": "2026-08-07",
+      "severity": "P0",
+      "symptom": "V5 容器被管理重启或进程异常终止后，Agent 已经实时响应到浏览器的 thinking、工具调用与中间正文没有中央持久副本；刷新后只剩中断卡，已生成的大量过程永久不可见。",
+      "rootFixCommit": "640ed19b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "journal page1 → overlapping WS frame → page2 applies thinking/tool/text exactly once"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "commits exact gateway bytes idempotently, pages without a total cap, and switches to tape"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
+        }
+      ]
     }
   ]
 }
