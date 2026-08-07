@@ -966,6 +966,9 @@
       "severity": "P0",
       "symptom": "V5 容器被管理重启或进程异常终止后，Agent 已经实时响应到浏览器的 thinking、工具调用与中间正文没有中央持久副本；刷新后只剩中断卡，已生成的大量过程永久不可见。",
       "rootFixCommit": "640ed19b",
+      "coverageCommits": [
+        "120e850d"
+      ],
       "regressions": [
         {
           "layer": "unit",
