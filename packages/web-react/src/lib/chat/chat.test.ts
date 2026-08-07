@@ -2570,6 +2570,56 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(err._errorDetail).not.toMatch(/server shutting down/);
   });
 
+  test("legacy Stop terminal renders as cancelled without telemetry or automatic recovery", () => {
+    const s = sess();
+    const user = addMessage(s, "user", "long task", { status: "sent", ts: 1 });
+    const reportTurnError = vi.fn();
+    const scheduleAutomaticRecovery = vi.fn();
+    applyOutboundError(s, {
+      type: "outbound.error",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: user.id,
+      code: "upstream_failed",
+      message: "任务执行暂时中断，请直接重试本条消息",
+      detail: "本轮已由用户停止。",
+      isFinal: false,
+    } as never, { reportTurnError, scheduleAutomaticRecovery });
+
+    expect(s.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      text: "本轮已取消。",
+      _errorCode: "user_cancelled",
+      _errorDetail: "本轮已取消。",
+    });
+    expect(reportTurnError).not.toHaveBeenCalled();
+    expect(scheduleAutomaticRecovery).not.toHaveBeenCalled();
+  });
+
+  test("only automatic-recovery taxonomy codes schedule recovery", () => {
+    const nonRecoverable = vi.fn();
+    applyOutboundError(sess(), {
+      type: "outbound.error",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      code: "insufficient_credits",
+      message: "no credits",
+      isFinal: true,
+    } as never, { scheduleAutomaticRecovery: nonRecoverable });
+    expect(nonRecoverable).not.toHaveBeenCalled();
+
+    const recoverable = vi.fn();
+    applyOutboundError(sess(), {
+      type: "outbound.error",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      code: "upstream_failed",
+      message: "upstream failed",
+      isFinal: true,
+    } as never, { scheduleAutomaticRecovery: recoverable });
+    expect(recoverable).toHaveBeenCalledWith("s1", undefined);
+  });
+
   test("scoped stale error marks only its client row and cannot tear down a newer turn", () => {
     const s = sess();
     const older = addMessage(s, "user", "older", { status: "sent", ts: 1 });
@@ -3767,6 +3817,51 @@ describe("ChatSocket interrupted continuation", () => {
         },
       },
     });
+    sock.stop();
+  });
+
+  test("historical non-tail error persists a no-recovery decision before sync", async () => {
+    const syncSession = vi.fn();
+    const persistSession = vi.fn();
+    const sock = makeSocket({ syncSession, persistSession });
+    const session = sock.ensureSession("s-historical-error", "main");
+    session.messages.push(
+      {
+        id: "u-historical-error",
+        role: "user",
+        text: "old task",
+        ts: 1,
+        status: "error",
+        _source: "server",
+        _routing: { model: "kimi-k3-ark", teamMode: false, effortLevel: null },
+      },
+      {
+        id: "error-historical-error",
+        role: "assistant",
+        text: "",
+        ts: 2,
+        _source: "server",
+        _turnTapeId: "tape-historical-error",
+        _clientMessageId: "u-historical-error",
+        _errorCode: "upstream_failed",
+      },
+      {
+        id: "u-newer",
+        role: "user",
+        text: "new task",
+        ts: 3,
+        status: "sent",
+        _source: "server",
+      },
+    );
+
+    await (sock as any).autoRecoverTerminalTurn("s-historical-error", "u-historical-error");
+    await (sock as any).autoRecoverTerminalTurn("s-historical-error", "u-historical-error");
+
+    expect(syncSession).not.toHaveBeenCalled();
+    expect(persistSession).toHaveBeenCalledTimes(1);
+    expect(session._automaticRecoveryDecisions?.["u-historical-error"]).toBe(true);
+    expect(session.messages).toHaveLength(3);
     sock.stop();
   });
 

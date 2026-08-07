@@ -42,7 +42,10 @@ import {
 } from "./model";
 import { repairPostFinalProcessOrder } from "./order";
 import { errorLabel } from "./render";
-import { AUTOMATIC_TURN_RETRY_MAX } from "@openclaude/protocol";
+import {
+  AUTOMATIC_TURN_RETRY_MAX,
+  supportsAutomaticTurnRecovery,
+} from "@openclaude/protocol";
 
 /** teardown 后非 final 帧的压制时间窗(客户端同域):覆盖 stop 后 server 收尾期,不无界压制多端新 turn。*/
 const TEARDOWN_DROP_WINDOW_MS = 3 * 60_000;
@@ -2067,10 +2070,15 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     if (!acceptFrameSeq(sess, frame)) return;
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
   }
-  const normalized = normalizeBridgeErrorCode(frame.code);
-  addMessage(sess, "assistant", friendlyBridgeErrorMessage(frame.code, frame.message || "出错了"), {
+  // The rolling gateway wire enum cannot carry user_cancelled yet, so the
+  // container's proven Stop terminal arrives as this exact legacy pair.
+  const normalized = normalizeBridgeErrorCode(frame.code) === "upstream_failed" &&
+      frame.detail === "本轮已由用户停止。"
+    ? "user_cancelled"
+    : normalizeBridgeErrorCode(frame.code);
+  addMessage(sess, "assistant", friendlyBridgeErrorMessage(normalized, frame.message || "出错了"), {
     _errorCode: normalized,
-    _errorDetail: safeBridgeErrorDetail(frame.code, frame.traceId),
+    _errorDetail: safeBridgeErrorDetail(normalized, frame.traceId),
     ...(frame.clientMessageId ? { _clientMessageId: frame.clientMessageId } : {}),
     ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
   });
@@ -2116,7 +2124,9 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     });
   }
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
-  effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
+  if (supportsAutomaticTurnRecovery(normalized)) {
+    effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
+  }
 }
 
 // ═══════════════ legacy bridge error（type:'error'）═══════════════

@@ -3147,6 +3147,21 @@ export class ChatSocket {
     const pendingKey = `${sessId}\0${clientMessageId ?? "tail"}`;
     const beforeSync = this.sessions.get(sessId);
     if (beforeSync?._automaticRecoveryDecisions?.[clientMessageId ?? "tail"] === true) return;
+    if (beforeSync && clientMessageId) {
+      const sourceUserIndex = beforeSync.messages.findIndex((message) =>
+        message.role === "user" && message.id === clientMessageId);
+      if (
+        sourceUserIndex >= 0 &&
+        beforeSync.messages.slice(sourceUserIndex + 1).some((message) => message.role === "user")
+      ) {
+        beforeSync._automaticRecoveryDecisions = {
+          ...(beforeSync._automaticRecoveryDecisions ?? {}),
+          [clientMessageId]: true,
+        };
+        this.deps.persistSession?.(sessId);
+        return;
+      }
+    }
     if (this.automaticRecoveryPending.has(pendingKey)) return;
     this.automaticRecoveryPending.add(pendingKey);
     try {
