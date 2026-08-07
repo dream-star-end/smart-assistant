@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -18,36 +17,16 @@ test("OCR tunnel heartbeat exits on broken stdout and cleans every worker child"
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
 
-test("official deploy smoke proves exact OCR readiness, stable tunnel identity, and no orphan supervisor", () => {
+test("OCR readiness remains a strict standalone smoke and is not a master release gate", () => {
   const deploy = readFileSync(path.join(root, "scripts/deploy-v5.sh"), "utf8");
   const smoke = readFileSync(path.join(root, "scripts/v5-ocr-worker-smoke.sh"), "utf8");
-  assert.match(deploy, /v5-ocr-worker-smoke\.sh" --advisory/);
+  assert.doesNotMatch(deploy, /v5-ocr-worker-smoke\.sh/);
   assert.match(smoke, /before_restarts=.*NRestarts/);
   assert.match(smoke, /after_restarts=.*NRestarts/);
   assert.match(smoke, /after_pid.*before_pid/);
   assert.match(smoke, /\.ready == true and \.protocol_major == 1 and \.release == \$release/);
   assert.match(smoke, /orphan.*== 0/);
   assert.match(smoke, /OCR worker tunnel stability drifted during smoke/);
-});
-
-test("OCR smoke stays strict by default and is non-blocking only in advisory deploy mode", () => {
-  const fakeBin = mkdtempSync(path.join(tmpdir(), "v5-ocr-smoke-"));
-  const fakeSsh = path.join(fakeBin, "ssh");
-  writeFileSync(fakeSsh, "#!/bin/bash\nexit 37\n");
-  chmodSync(fakeSsh, 0o755);
-
-  try {
-    const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` };
-    const smoke = path.join(root, "scripts/v5-ocr-worker-smoke.sh");
-    const strict = spawnSync("bash", [smoke], { encoding: "utf8", env });
-    assert.equal(strict.status, 37, strict.stderr);
-
-    const advisory = spawnSync("bash", [smoke, "--advisory"], { encoding: "utf8", env });
-    assert.equal(advisory.status, 0, advisory.stderr);
-    assert.match(advisory.stderr, /OCR worker smoke failed\(status=37\).*does not block the V5 master release/);
-  } finally {
-    rmSync(fakeBin, { recursive: true, force: true });
-  }
 });
 
 test("nested supervisor census SSH cannot consume the remaining remote smoke script", () => {

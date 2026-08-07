@@ -904,19 +904,11 @@
       "severity": "P1",
       "symptom": "SCNet 会关闭长期无应用输出的 OCR SSH remote command；远端 supervisor 随 sshd 消失后被 PID 1 收养并继续占用模型与 18960 端口，V5 宿主 tunnel 随后反复重连且每次因 EADDRINUSE 退出。",
       "rootFixCommit": "ef5bc3e8",
-      "coverageCommits": [
-        "8ed6b46f"
-      ],
       "regressions": [
         {
           "layer": "unit",
           "path": "scripts/__tests__/v5OcrWorkerTunnel.test.ts",
           "assertion": "OCR tunnel heartbeat exits on broken stdout and cleans every worker child"
-        },
-        {
-          "layer": "unit",
-          "path": "scripts/__tests__/v5OcrWorkerTunnel.test.ts",
-          "assertion": "OCR smoke stays strict by default and is non-blocking only in advisory deploy mode"
         },
         {
           "layer": "deploy-gate",

@@ -4,16 +4,11 @@ set -euo pipefail
 
 KL_HOST="${KL_HOST:-kl-mirror}"
 STABILITY_SECONDS="${OC_OCR_STABILITY_SECONDS:-12}"
-MODE="${1:-}"
-[[ $# -le 1 && ( -z "$MODE" || "$MODE" == "--advisory" ) ]] || {
-  echo "Usage: v5-ocr-worker-smoke.sh [--advisory]" >&2
-  exit 2
-}
-run_strict_smoke() {
 [[ "$STABILITY_SECONDS" =~ ^[0-9]+$ && "$STABILITY_SECONDS" -ge 1 && "$STABILITY_SECONDS" -le 60 ]] || {
   echo "OCR worker stability window must be 1..60 seconds" >&2
-  return 2
+  exit 2
 }
+
 ssh "$KL_HOST" bash -s -- "$STABILITY_SECONDS" <<'REMOTE'
 set -euo pipefail
 stability_seconds=$1
@@ -105,17 +100,3 @@ assert_owned_supervisor
 printf 'OCR worker ready: release=%s tunnel_pid=%s restarts=%s\n' \
   "$OC_OCR_WORKER_EXPECTED_RELEASE" "$after_pid" "$after_restarts"
 REMOTE
-}
-
-if run_strict_smoke; then
-  exit 0
-else
-  status=$?
-fi
-
-if [[ "$MODE" == "--advisory" ]]; then
-  echo "⚠ OCR worker smoke failed(status=$status); SCNet/OCR is optional and does not block the V5 master release." >&2
-  exit 0
-fi
-
-exit "$status"
