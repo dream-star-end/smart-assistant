@@ -5573,7 +5573,6 @@ smoke() {
       || { echo "✗ OC_MODEL_AUTHORITY=1 但 egress 未广播 '$MODEL_AUTHORITY_EGRESS_CAP'(caps=[${ecaps:-<none>}])—— 旧 egress 进程无每请求 epoch fence;修法:deploy-v5.sh --egress" >&2; return 1; }
     echo "  ✓ 模型权威:master=[$mcaps] egress=[$ecaps](flag=1,两进程活体 capability 齐)"
   fi
-  KL_HOST="$KL_HOST" "$REPO_ROOT/scripts/v5-ocr-worker-smoke.sh" || return 1
   local baseline_slot
   case "$sport" in
     18790) baseline_slot=A ;;

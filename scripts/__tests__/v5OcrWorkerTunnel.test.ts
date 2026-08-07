@@ -17,10 +17,10 @@ test("OCR tunnel heartbeat exits on broken stdout and cleans every worker child"
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
 
-test("official deploy smoke proves exact OCR readiness, stable tunnel identity, and no orphan supervisor", () => {
+test("OCR readiness remains a strict standalone smoke and is not a master release gate", () => {
   const deploy = readFileSync(path.join(root, "scripts/deploy-v5.sh"), "utf8");
   const smoke = readFileSync(path.join(root, "scripts/v5-ocr-worker-smoke.sh"), "utf8");
-  assert.match(deploy, /v5-ocr-worker-smoke\.sh/);
+  assert.doesNotMatch(deploy, /v5-ocr-worker-smoke\.sh/);
   assert.match(smoke, /before_restarts=.*NRestarts/);
   assert.match(smoke, /after_restarts=.*NRestarts/);
   assert.match(smoke, /after_pid.*before_pid/);
@@ -32,6 +32,7 @@ test("official deploy smoke proves exact OCR readiness, stable tunnel identity, 
 test("nested supervisor census SSH cannot consume the remaining remote smoke script", () => {
   const smoke = readFileSync(path.join(root, "scripts/v5-ocr-worker-smoke.sh"), "utf8");
   assert.match(smoke, /census=\$\(ssh -n "\$\{ssh_args\[@\]\}"/);
+  assert.match(smoke, /OCR worker ready: release=/);
 
   const draining = spawnSync("bash", ["-s"], {
     input: "consume() { cat >/dev/null; }\nconsume\nprintf 'TAIL_REACHED\\n'\n",

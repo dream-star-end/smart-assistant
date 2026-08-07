@@ -31,11 +31,12 @@ const ALL_LAYERS = new Set(["unit", "integration", ...PROOF_LAYERS]);
 const ASSERTION_DEBT_BASELINE = 37;
 /**
  * 允许"暂无 proof 层证据"的事故数(必须显式写 proofPending 说明)。
- * 9 = 4 条存量(3 条 Weibo/Kimi 原本用无关脚本充数 + 1 条把 CI unit 误标 deploy-gate)
- *   + 5 条 2026-07-25 紧急通道事故(补登记时如实标注:回归只到 unit 层)。
+ * 11 = 4 条存量(3 条 Weibo/Kimi 原本用无关脚本充数 + 1 条把 CI unit 误标 deploy-gate)
+ *   + 5 条 2026-07-25 紧急通道事故(补登记时如实标注:回归只到 unit 层)
+ *   + 2 条 SCNet 关机后从 V5 主发布门移除的 OCR 活体 proof。
  * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
  */
-const PROOF_PENDING_BASELINE = 9;
+const PROOF_PENDING_BASELINE = 11;
 
 // ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
 // 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
