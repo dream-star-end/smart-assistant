@@ -877,6 +877,9 @@
       "severity": "P1",
       "symptom": "V5 OCR 的 platform bundle 已包含 oc-ocr 可执行文件，但登录 shell 的 PATH 不含 bundle bin，entrypoint 又只为 oc-plugin 创建保留名链接，导致真实存量容器中 Agent 按技能调用 oc-ocr 时命令不存在。",
       "rootFixCommit": "ee3b2e6e",
+      "coverageCommits": [
+        "c8b146e9"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -886,7 +889,7 @@
         {
           "layer": "unit",
           "path": "scripts/__tests__/v5RemountCcbBaseline.test.ts",
-          "assertion": "official remount fail-loud verifies oc-plugin and oc-ocr PATH links inside the rebuilt container"
+          "assertion": "official remount fail-loud verifies every bundle-only CLI PATH link inside the rebuilt container"
         },
         {
           "layer": "deploy-gate",
