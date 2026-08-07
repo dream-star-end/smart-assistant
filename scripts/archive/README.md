@@ -16,7 +16,7 @@
 **重启用条件**:如果未来再次部署独立 node-agent host pool,需:
 1. 把脚本从 archive 取回 `scripts/`
 2. KL self 上重新装 Go builder
-3. 更新 `docs/hotfix-deploy-checklist.md` Step 4 把"坑 4.2 dormant"段恢复
+3. 更新 `docs/v3/hotfix-deploy-checklist.md` Step 4 把"坑 4.2 dormant"段恢复
 
 源码仍在 `packages/commercial/node-agent/`,改它**不影响 prod**,只是为未来重启用作准备。
 

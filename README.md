@@ -8,7 +8,8 @@
 > - 架构总览:[`docs/v3/01-OVERVIEW.md`](docs/v3/01-OVERVIEW.md)
 > - 开发计划:[`docs/v3/02-DEVELOPMENT-PLAN.md`](docs/v3/02-DEVELOPMENT-PLAN.md)
 > - 部署入口:[`scripts/deploy-v3.sh`](scripts/deploy-v3.sh)(**不是**下方 `deploy/` 那套)
-> - Hotfix 流程:[`docs/hotfix-deploy-checklist.md`](docs/hotfix-deploy-checklist.md)
+> - V5 开发/发布流程:[`docs/V5_DEV_PLAYBOOK.md`](docs/V5_DEV_PLAYBOOK.md)
+> - 历史 V3 Hotfix:[`docs/v3/hotfix-deploy-checklist.md`](docs/v3/hotfix-deploy-checklist.md)
 >
 > 下文 Quickstart / 配置 / 项目结构 主要描述个人版资产(`deploy/legacy-master/` 等),
 > 阅读时请注意区分,不要把个人版步骤套到 v3 商用版上。

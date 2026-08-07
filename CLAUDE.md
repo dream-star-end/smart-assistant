@@ -29,6 +29,20 @@ Exceptions:
 - single-line typo fixes;
 - the dx-declared V5 P0 emergency lane below.
 
+### Review efficiency discipline (BLOCKING)
+
+- Each task that requires review uses exactly **one plan reviewer and one full-diff reviewer**. Do not send the same plan
+  or diff to multiple agents for reassurance. If a reviewer is unavailable, replace it once rather
+  than duplicating the review.
+- Ask for all evidence-backed correctness, security, data, and deployment blockers in one pass.
+  Style preferences, speculative defenses, adjacent audits, and optional refactors are non-blocking.
+- Close a blocking finding in the same review thread with only the incremental correction and proof.
+  Do not resend the whole plan/diff or start a new reviewer.
+- Freeze the reproduced root cause, requested scope, and acceptance criteria before implementation.
+  A reviewer may block unsafe work, but may not grow the task beyond that frozen scope.
+- Run the smallest relevant local tests while iterating. Run each required broad gate once at the
+  final boundary (normally protected CI), not after every small edit.
+
 ### Dx-declared V5 P0 emergency lane (BLOCKING)
 
 Only dx may activate this lane, by explicitly stating that V5 production is causing ongoing
@@ -71,102 +85,53 @@ single blocker immediately instead of inventing a bypass.
   and official state/marker recovery selects the next command. If ownership cannot be proved, stay
   read-only and report it.
 
+## V5 production is not a test environment (BLOCKING)
+
+- Before entering a production canary, declare the exact candidate, touched deployment surfaces,
+  rollback target, and finite acceptance checks. Facts that can be proven in a worktree, CI,
+  isolated host, or production-equivalent systemd/proxy/worker environment must be proven there
+  first; do not discover them by repeatedly rolling production forward and back.
+- A rollback/abort ends that release attempt. Do not retry under the same conditions. First reproduce
+  the failed check outside the rollout and prove the code, environment, or validation-harness fix.
+  A retry requires new evidence and either a new candidate or a documented environment-only
+  correction; "probably transient" is not evidence.
+- For ordinary planned work, the production release queue is only for tasks that will mutate
+  production. Such a task may skip it only when proven to touch no production lock/lease, runtime
+  state, persistent data, hot config, migration, tunnel, credential, worker, service/unit/env/runtime
+  tuple, or user traffic. If unsure, it remains a queued production task.
+- Safety/recovery modes (`abort/rollback/recover/reclaim/hide-luna`), authorized emergency
+  authorization/closure, and the proven self-heal ledger bypass use only the explicit queue
+  exceptions in `docs/V5_DEV_PLAYBOOK.md`. They never waive the official mutation lease,
+  owner/fencing, clean canonical, or official-script requirements; queue waiting must never delay
+  abort.
+- Regular long mutation commands must run through `scripts/v5-deploy-detached.sh` so a Web session
+  timeout cannot kill the controlling process. Emergency/offline lanes that synchronously return a
+  nonce follow their exact playbook command. The detached unit and queue ID are not mutation-owner
+  proof; owner identity still comes solely from the official remote flock and lease-fencing evidence.
+
 ## Parallel Worktree Workflow (BLOCKING)
 
-**When a task says "create a new workspace", "parallel development", "do not affect other work", or the repo already has unrelated dirty/unpushed work, use an isolated git worktree. Do not implement in the shared main checkout.**
-
-Goals:
-- keep multiple agents/features from touching the same working tree
-- make the deploy branch (`master` for personal, `v3` for commercial) a clean integration lane
-- make cleanup deterministic after merge/deploy
-
-### 1. Create an isolated workspace
-
-From the canonical checkout, create a task-scoped worktree and branch:
+Every V5 modification starts in an isolated task worktree. The canonical checkout is a clean
+integration/deployment lane, never a development workspace.
 
 ```bash
-# Personal/master work
-cd /opt/openclaude/openclaude
-git fetch origin
-git worktree add ../openclaude-<slug> -b <type>/<slug> origin/master
-
-# Commercial v3 work
-cd /opt/openclaude/openclaude-v3
-git fetch origin
-git worktree add ../openclaude-v3-<slug> -b <type>/<slug> origin/v3
-```
-
-Rules:
-- branch names must be task-scoped (`fix/...`, `feat/...`, `chore/...`)
-- workspace names must include the task slug (`openclaude-v3-media-healthz-direct`, etc.)
-- before editing, run `git status -sb` and note the base commit
-- if multiple workers are active, assign disjoint file/module ownership; never revert or overwrite another worker's changes
-
-### 2. Work inside the isolated workspace only
-
-Inside the worktree:
-- implement, test, and commit normally
-- keep commits small and reviewable
-- do not deploy from feature worktrees unless the deployment script explicitly supports that branch
-- for commercial v3, still obey the v3 commercial deployment rules, especially the runtime-image rebuild decision
-
-Commercial v3 deployment lane:
-- develop in `/opt/openclaude/openclaude-v3-<slug>`
-- merge/cherry-pick the reviewed commit(s) into `/opt/openclaude/openclaude-v3` on branch `v3`
-- deploy only from `/opt/openclaude/openclaude-v3` using `scripts/deploy-v3.sh`
-- after deploy, push `origin/v3` and the produced tags
-
-### 3. Merge back through the canonical checkout
-
-Before merging:
-
-```bash
-cd /opt/openclaude/openclaude-v3   # or /opt/openclaude/openclaude for master
+cd /opt/openclaude/openclaude-v5-aurora
+git fetch origin feat/v5-aurora-rewrite
 git status -sb
-git fetch origin
-git log --oneline --decorate -5
+git worktree add ../openclaude-v5-<slug> \
+  -b <type>/v5-<slug> origin/feat/v5-aurora-rewrite
 ```
 
-Then integrate with one of:
-
-```bash
-git merge --no-ff <branch>
-# or, for hotfixes / selected commits:
-git cherry-pick <commit>
-```
-
-After integration:
-- rerun the relevant targeted tests in the canonical checkout
-- for commercial v3, run deploy dry-run before real deploy
-- push the canonical branch after successful merge/deploy:
-
-```bash
-git push origin v3      # commercial
-git push origin master  # personal
-git push origin <tags-if-created>
-```
-
-### 4. Clean up after merge/deploy
-
-Only after the commit is present on the canonical branch and pushed:
-
-```bash
-cd /opt/openclaude/openclaude-v3   # or canonical master checkout
-git worktree list
-git worktree remove --force ../openclaude-v3-<slug>
-git branch -D <type>/<slug>
-git worktree prune
-git status -sb
-```
-
-Final state must be:
-- canonical checkout clean
-- canonical branch aligned with origin unless intentionally holding local deployment commits
-- temporary worktree removed
-- temporary branch deleted
-- no leftover detached review worktrees for the task
-
-If a worktree is locked or contains unmerged work, stop and report it instead of force-deleting blindly.
+- Record the exact base commit before editing. Use task-scoped `feat/`, `fix/`, or `chore/` branches.
+- Develop, test, review, and commit only in the task worktree. Never deploy from it.
+- Merge through protected PR/CI into `feat/v5-aurora-rewrite`; update the canonical checkout to the
+  exact remote merge SHA before any release action.
+- Deploy only from clean canonical `/opt/openclaude/openclaude-v5-aurora` with the official V5
+  scripts and, when production mutation is required, the durable release queue.
+- After merge and any required production verification, remove only a clean merged worktree without
+  `--force`, delete its verified merged branch, and run `git worktree prune`.
+- Locked, dirty, unmerged, or process-in-use worktrees are report-only. Never reset, stash, overwrite,
+  or force-delete them while parallel work may own their files.
 
 ## Personal Instance (45.32 master) — Dev Instance First Rule
 

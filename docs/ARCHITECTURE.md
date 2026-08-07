@@ -8,7 +8,8 @@
 > **当前 v3 商用版权威文档**:
 > - `docs/v3/01-OVERVIEW.md` — v3 总览
 > - `docs/v3/02-DEVELOPMENT-PLAN.md` — 开发计划与 R-series 实施记录
-> - `docs/hotfix-deploy-checklist.md` — 部署与诊断
+> - `docs/V5_DEV_PLAYBOOK.md` — V5 部署与诊断权威
+> - `docs/v3/hotfix-deploy-checklist.md` — 历史 V3 专用
 >
 > 本文保留作为个人版历史参考。修个人版可继续读;读 v3 请去上面三个文档。
 

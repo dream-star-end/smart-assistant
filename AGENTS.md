@@ -22,98 +22,40 @@
   marker/sentinel 匹配，禁止拿不同标识的 `deploy_id` 与 marker nonce 互比。无法证明 owner 时保持
   只读；另一会话不得竞争执行 abort/rollback/recover。
 
+## V5 效率与生产非试验场(BLOCKING)
+
+- 每个需要评审的任务固定一个方案 reviewer 和一个 full-diff reviewer；同一方案/diff 禁止重复委派。
+  blocker 只在同一线程看增量；风格、推测性防御、相邻审计和可选重构不得阻塞。
+- 开发前冻结已证实根因、最小范围和有限验收项；本地迭代只跑受影响层测试，广泛门禁在最终
+  protected CI 跑一次。canary 期间不得临时扩充范围或发明新验收门槛。
+- 生产 canary 前，凡能在 worktree、CI、隔离宿主或等价 systemd/proxy/worker 环境证明的事实
+  必须先证明。abort/rollback 结束本次尝试；生产外复现并证明修复前禁止按原条件重试。
+- 普通计划任务只有明确不触发任何 production lock/lease、运行态、持久数据、hot-config、迁移、
+  隧道、凭据、worker、service/unit/env/runtime tuple 或用户流量时才可不进 production release
+  queue；不确定就入队。官方 abort/rollback/recover/reclaim/hide-luna、已授权 emergency/关账和
+  可证明的 self-heal ledger 旁路只按 playbook 明示例外执行，绝不能因等队列延迟 abort；这些例外
+  不豁免官方 lease、owner/fencing、clean canonical 或官方脚本。
+- 常规长 mutation 命令从 canonical 通过 `scripts/v5-deploy-detached.sh` 发起；同步返回 nonce 的
+  emergency/offline lane 按 playbook 精确命令执行。systemd unit/queue ID 不是 owner 证明；owner
+  仍只认官方远端 flock、lease fencing meta 与本 invocation nonce。
+
 
 Codex agents working in this repository must follow this file first. The shared project rules also live in `CLAUDE.md`; open and follow `CLAUDE.md` before editing code. If this file and `CLAUDE.md` differ, follow the stricter rule.
 
 ## Parallel Worktree Workflow (BLOCKING)
 
-When a task says "create a new workspace", "parallel development", "do not affect other work", or the canonical checkout has unrelated dirty/unpushed work, use an isolated git worktree. Do not implement in the shared main checkout.
-
-Goals:
-- keep multiple agents/features from touching the same working tree
-- make the deploy branch (`master` for personal, `v3` for commercial) a clean integration lane
-- make cleanup deterministic after merge/deploy
-
-### Create an isolated workspace
+Every V5 modification uses a task worktree based on the current V5 canonical branch:
 
 ```bash
-# Personal/master work
-cd /opt/openclaude/openclaude
-git fetch origin
-git worktree add ../openclaude-<slug> -b <type>/<slug> origin/master
-
-# Commercial v3 work
-cd /opt/openclaude/openclaude-v3
-git fetch origin
-git worktree add ../openclaude-v3-<slug> -b <type>/<slug> origin/v3
-```
-
-Rules:
-- branch names must be task-scoped (`fix/...`, `feat/...`, `chore/...`)
-- workspace names must include the task slug (`openclaude-v3-media-healthz-direct`, etc.)
-- before editing, run `git status -sb` and note the base commit
-- if multiple workers are active, assign disjoint file/module ownership; never revert or overwrite another worker's changes
-
-### Work inside the isolated workspace only
-
-Inside the worktree:
-- implement, test, and commit normally
-- keep commits small and reviewable
-- do not deploy from feature worktrees unless the deployment script explicitly supports that branch
-- for commercial v3, still obey the v3 commercial deployment rules, especially the runtime-image rebuild decision
-
-Commercial v3 deployment lane:
-- develop in `/opt/openclaude/openclaude-v3-<slug>`
-- merge/cherry-pick reviewed commit(s) into `/opt/openclaude/openclaude-v3` on branch `v3`
-- deploy only from `/opt/openclaude/openclaude-v3` using `scripts/deploy-v3.sh`
-- after deploy, push `origin/v3` and produced tags
-
-### Merge back through the canonical checkout
-
-```bash
-cd /opt/openclaude/openclaude-v3   # or /opt/openclaude/openclaude for master
+cd /opt/openclaude/openclaude-v5-aurora
+git fetch origin feat/v5-aurora-rewrite
 git status -sb
-git fetch origin
-git merge --no-ff <branch>         # or: git cherry-pick <commit>
+git worktree add ../openclaude-v5-<slug> \
+  -b <type>/v5-<slug> origin/feat/v5-aurora-rewrite
 ```
 
-After integration:
-- rerun relevant targeted tests in the canonical checkout
-- for commercial v3, run deploy dry-run before real deploy
-- push the canonical branch after successful merge/deploy:
-
-```bash
-git push origin v3      # commercial
-git push origin master  # personal
-git push origin <tags-if-created>
-```
-
-### Clean up after merge/deploy
-
-Only after the commit is present on the canonical branch and pushed:
-
-```bash
-cd /opt/openclaude/openclaude-v3   # or canonical master checkout
-git worktree list
-git worktree remove --force ../openclaude-v3-<slug>
-git branch -D <type>/<slug>
-git worktree prune
-git status -sb
-```
-
-Final state must be:
-- canonical checkout clean
-- canonical branch aligned with origin unless intentionally holding local deployment commits
-- temporary worktree removed
-- temporary branch deleted
-- no leftover detached review worktrees for the task
-
-If a worktree is locked or contains unmerged work, stop and report it instead of force-deleting blindly.
-
-## Commercial v3 deployment reminder
-
-For any `claudeai.chat` / OpenClaude v3 commercial code or deploy task:
-- load and follow the `v3-commercial-deploy` skill/instructions
-- explicitly classify touched paths and answer whether a runtime image rebuild is required
-- never treat manual rsync + systemctl restart as final deployment
-- deploy only with `scripts/deploy-v3.sh` from `/opt/openclaude/openclaude-v3`
+- Record the exact base SHA. Develop/test/review/commit only in the task worktree; never deploy from it.
+- Merge through protected PR/CI, then update clean canonical to the exact remote merge SHA.
+- Deploy only from `/opt/openclaude/openclaude-v5-aurora` through official V5 scripts.
+- Remove only clean, merged, process-free worktrees without `--force`; dirty, unmerged, locked, or
+  process-in-use worktrees are report-only.
