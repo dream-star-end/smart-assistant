@@ -76,6 +76,16 @@ describe('ccb-baseline skills ↔ manifest', () => {
     assert.ok((V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('market'))
   })
 
+  it('routes ordinary video requests to durable H3 instead of the MiniMax Token Plan', () => {
+    const body = readFileSync(join(skillsDir, 'minimax-media', 'SKILL.md'), 'utf8')
+    assert.match(body, /For ordinary video requests, use `oc-h3`/)
+    assert.match(body, /oc-h3 generate/)
+    assert.match(body, /one 5, 10, or 15 second shot/)
+    assert.match(body, /oc-video create/)
+    assert.match(body, /Only use `mmx video` when the user explicitly requests Hailuo/)
+    assert.doesNotMatch(body, /### Video\s+Submit only:\s+```bash\s+mmx video generate/)
+  })
+
   it('ships the connector authoring workflow with its authority and safety gates', () => {
     assert.ok(
       (V3_CCB_BASELINE_SKILL_NAMES as readonly string[]).includes('connector-authoring'),
