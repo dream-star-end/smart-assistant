@@ -483,7 +483,10 @@ describe("entrypoint.sh 分流 + entrypoint.ts 关键不变量", () => {
     const src = readFileSync(ENTRYPOINT_TS, "utf8");
     assert.match(src, /const PLATFORM_BIN_DIR = "\/run\/oc\/platform\/current\/bin"/);
     assert.match(src, /const USER_PLATFORM_BIN_DIR = "\/home\/agent\/\.local\/bin"/);
-    assert.match(src, /const PLATFORM_LINKED_CLIS = \["oc-plugin", "oc-ocr"\] as const/);
+    assert.match(
+      src,
+      /const PLATFORM_LINKED_CLIS = \["oc-plugin", "oc-ocr", "oc-h3", "oc-video"\] as const/,
+    );
     assert.match(src, /const source = join\(PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /const userLink = join\(USER_PLATFORM_BIN_DIR, cliName\)/);
     assert.match(src, /lstatSync\(userLink\)/);

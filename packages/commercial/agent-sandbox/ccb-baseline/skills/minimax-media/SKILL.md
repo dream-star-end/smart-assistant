@@ -1,12 +1,14 @@
 ---
 name: minimax-media
-description: Use MiniMax Token Plan media capabilities from OpenClaude commercial containers through the safe `mmx` wrapper for image, video, speech, music, and lyrics generation. Use when the user asks to generate MiniMax images, videos, speech/audio, music, lyrics, or asks to use MiniMax CLI/MMX.
+description: Generate ordinary videos with durable local MiniMax H3 jobs and minute-scale projects; use the safe `mmx` wrapper for images, speech, music, lyrics, and explicitly requested Hailuo/MMX cloud video.
 priority: 4
 ---
 
 # MiniMax media in OpenClaude commercial
 
-Use the built-in `mmx` command. It is an OpenClaude-safe, MiniMax-compatible wrapper: it does **not** expose the platform MiniMax Token Plan key in the container. It sends requests to the OpenClaude master, which performs billing and calls MiniMax.
+For ordinary video requests, use `oc-h3` or `oc-video`. For images, speech, music,
+lyrics, or an explicitly requested Hailuo/MMX cloud video, use the built-in `mmx`
+command. These platform commands keep credentials outside the Agent container.
 
 Do not ask for or print API keys. Do not run `mmx auth login` / `mmx config` / `mmx quota`; account commands are intentionally unavailable.
 
@@ -38,24 +40,50 @@ mmx lyrics generate --prompt "一首关于夏日海边的轻快情歌" --out min
 
 ### Video
 
-Submit only:
+Queue one 5, 10, or 15 second shot and return its job ID immediately:
 
 ```bash
-mmx video generate --prompt "夕阳下，一只猫坐在窗边望向远方" --model MiniMax-Hailuo-2.3 --duration 6 --resolution 768P
+oc-h3 generate --prompt "夕阳下，一只猫坐在窗边望向远方" --duration 5 --aspect 16:9
 ```
 
-Wait and download:
+First frame, last frame, and reference images may be combined:
 
 ```bash
-mmx video generate --prompt "夕阳下，一只猫坐在窗边望向远方" --wait --out minimax-output/video.mp4
+oc-h3 generate --prompt "让人物走向镜头" --duration 10 --aspect 16:9 \
+  --first-frame first.png --last-frame last.png --reference person.png
 ```
 
-If you already have IDs:
+Do not block a normal Agent turn while generation runs. Use the durable job ID for
+status, cancellation, and download:
 
 ```bash
-mmx video query --task-id <task_id>
-mmx video download --file-id <file_id> --out minimax-output/video.mp4
+oc-h3 status <job_id>
+oc-h3 cancel <job_id>
+oc-h3 download <job_id> --out result.mp4
 ```
+
+For a minute-scale video, write a storyboard JSON, create a draft, show it to the
+user, and start only after approval:
+
+```bash
+oc-video create --title "项目标题" --storyboard storyboard.json --reference person.png
+oc-video status <project_id>
+oc-video start <project_id> --expected-rev <rev>
+oc-video render <project_id> --expected-rev <rev>
+```
+
+### Explicit Hailuo/MMX cloud video
+
+Only use `mmx video` when the user explicitly requests Hailuo, MMX, or the
+MiniMax Token Plan cloud service:
+
+```bash
+mmx video generate --prompt "夕阳下，一只猫坐在窗边望向远方" \
+  --model MiniMax-Hailuo-2.3 --duration 6 --resolution 768P
+```
+
+If an H3 command fails, report the exact failure. Do not silently replace H3 with
+Hailuo or a locally rendered procedural animation.
 
 ## Output convention
 
