@@ -994,6 +994,30 @@
           "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
         }
       ]
+    },
+    {
+      "id": "INC-20260807-CLIENT-ERROR-REPLAY",
+      "occurredAt": "2026-08-07",
+      "severity": "P1",
+      "symptom": "历史 live-frame 中的终态错误在会话同步时被反复重放；用户 Stop 又被旧 wire 误归为 upstream_failed，导致浏览器循环上报 /api/client-errors、触发 429 与告警。",
+      "rootFixCommit": "788ecc51",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "legacy Stop terminal renders as cancelled without telemetry or automatic recovery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "historical non-tail error persists a no-recovery decision before sync"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T32 durable error replay：用户 Stop 不上报，历史非尾错误不触发同步循环"
+        }
+      ]
     }
   ]
 }

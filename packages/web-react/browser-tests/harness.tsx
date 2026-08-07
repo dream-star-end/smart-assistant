@@ -124,6 +124,16 @@ declare global {
         answerCount: number;
         cursor: number;
       }>;
+      /** Replay the two production error shapes through durable hydration. */
+      runDurableErrorReplay: () => Promise<{
+        stopErrorCode?: string;
+        stopErrorText?: string;
+        stopReports: number;
+        stopSyncs: number;
+        historicalReports: number;
+        historicalSyncs: number;
+        historicalDecision: boolean;
+      }>;
     };
     /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
     __modelFixture: {
@@ -172,6 +182,9 @@ window.__replayDrive = {
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
+  },
+  runDurableErrorReplay: async () => {
+    throw new Error("durable error replay probe 未挂载");
   },
 };
 window.__runPendingDispatchJournalProbe = async () => {
@@ -854,12 +867,16 @@ class HarnessWebSocket {
   }
 }
 
+let replayReportedErrors = 0;
+let replaySyncCalls = 0;
 const replaySocket = new ChatSocket({
   getToken: () => "harness-replay-token",
   getAuthEpoch: () => 0,
   silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 1000 }),
   onAuthExpired: () => {},
   defaultAgentId: REPLAY_AGENT_ID,
+  reportClientError: () => { replayReportedErrors += 1; },
+  syncSession: () => { replaySyncCalls += 1; },
 });
 replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "replay 会话");
 
@@ -1077,6 +1094,92 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         answerCount: session.messages.filter((m) =>
           m.role === "assistant" && m.text === markers.answer).length,
         cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
+      };
+    },
+    runDurableErrorReplay: async () => {
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const record = (
+        recordId: string,
+        clientMessageId: string,
+        detail: string,
+      ) => ({
+        recordId,
+        streamKey: "dispatch:44444444-4444-4444-8444-444444444444:1",
+        source: "gateway" as const,
+        clientMessageId,
+        payload: {
+          type: "outbound.error",
+          sessionKey,
+          frameSeq: 1,
+          channel: "webchat",
+          peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+          clientMessageId,
+          code: "upstream_failed",
+          message: "任务执行暂时中断，请直接重试本条消息",
+          detail,
+          isFinal: false,
+          ts: 2,
+        },
+      });
+      const seed = (clientMessageId: string) => {
+        replaySocket.removeSession(REPLAY_SESSION_ID);
+        const session = replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "durable error");
+        session.messages.push(
+          {
+            id: clientMessageId,
+            role: "user",
+            text: "old task",
+            ts: 1,
+            status: "error",
+            _source: "server",
+            _routing: { model: "glm-5.2", teamMode: false, effortLevel: null },
+          },
+          {
+            id: `${clientMessageId}-newer`,
+            role: "user",
+            text: "new task",
+            ts: 3,
+            status: "sent",
+            _source: "server",
+          },
+        );
+        session._lastFrameSeqByKey = { [sessionKey]: 99 };
+        session._lastFrameSeq = 99;
+        return session;
+      };
+
+      replayReportedErrors = 0;
+      replaySyncCalls = 0;
+      const stoppedId = "m-browser-durable-stop";
+      const stopped = seed(stoppedId);
+      replaySocket.applyDurableLiveFrames(
+        REPLAY_SESSION_ID,
+        [record("stop", stoppedId, "本轮已由用户停止。")],
+        [stoppedId],
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const stoppedError = [...stopped.messages].reverse().find((message) => message.role === "assistant");
+      const stopReports = replayReportedErrors;
+      const stopSyncs = replaySyncCalls;
+
+      replayReportedErrors = 0;
+      replaySyncCalls = 0;
+      const historicalId = "m-browser-durable-historical";
+      const historical = seed(historicalId);
+      replaySocket.applyDurableLiveFrames(
+        REPLAY_SESSION_ID,
+        [record("historical", historicalId, "raw provider detail")],
+        [historicalId],
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return {
+        stopErrorCode: stoppedError?._errorCode,
+        stopErrorText: stoppedError?.text,
+        stopReports,
+        stopSyncs,
+        historicalReports: replayReportedErrors,
+        historicalSyncs: replaySyncCalls,
+        historicalDecision: historical._automaticRecoveryDecisions?.[historicalId] === true,
       };
     },
   };
