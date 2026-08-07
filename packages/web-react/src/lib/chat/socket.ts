@@ -2601,7 +2601,7 @@ export class ChatSocket {
    * 终态收敛(RFC §5 M5):REST 对账载荷自证「已收尾 turn」时,显式落 user 行终态并清发送态。
    * 覆盖 durable dispatch 下真 final 帧永不到达的丢 turn场景(verified status / 静默收尾),
    * 不依赖既有 completion-evidence 的巧合命中。
-   *  - completed:user 行 → replied;error:user 行 → error(不覆盖已 replied)。
+   *  - completed:user 行 → replied;可重试 error → error;运行中断 → sent(不覆盖已 replied)。
    *  - 该 turn 恰为当前活跃在飞轮 → clearSendingState 收口("回复中"停转、drain 推进)。
    */
   private convergeTerminalTurns(s: ChatSession, terminalTurns: Map<string, ServerTurnTerminal>): void {
@@ -2611,8 +2611,10 @@ export class ChatSocket {
       if (userRow) {
         if (kind === "completed") {
           userRow.status = "replied";
+        } else if (kind === "error" && userRow.status !== "replied") {
+          userRow.status = "error";
         } else if (userRow.status !== "replied") {
-          // This row was durably admitted.  A runtime interruption belongs on
+          // A service restart happened after durable admission. It belongs on
           // the turn status card, never on the user's transport state.
           userRow.status = "sent";
         }

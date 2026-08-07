@@ -325,6 +325,19 @@ describe("detectServerTerminalTurns (persist)", () => {
     ]);
     expect(m.get("cm1")).toBe("error");
   });
+  test("service_restart 终态 → interrupted，不伪装成发送失败", () => {
+    const m = detectServerTerminalTurns([
+      srvRow({
+        id: "turn-status:d2",
+        role: "system",
+        _turnStatusRecord: true,
+        _dispatchTerminal: true,
+        _errorCode: "service_restart",
+        _clientMessageId: "cm2",
+      }),
+    ]);
+    expect(m.get("cm2")).toBe("interrupted");
+  });
   test("server-authored 生成行 → completed", () => {
     const m = detectServerTerminalTurns([srvRow({ id: "srv-a-t1-s0", text: "答复", _clientMessageId: "cm1" })]);
     expect(m.get("cm1")).toBe("completed");
@@ -384,7 +397,7 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     vi.unstubAllGlobals();
   });
 
-  test("durable failure status 到达 → 清发送态 + 已成功送达的 user 行保持 sent", () => {
+  test("durable not_accepted status 到达 → 清发送态 + user 行置 error 以保留重试", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -406,6 +419,39 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
       "main",
       [srvRow({ id: "turn-status:d1", role: "system", _seq: 2, _turnStatusRecord: true,
         _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: cmid })],
+      true,
+      2,
+      { serverUpdatedAt: 100 },
+    );
+
+    expect(s._sendingInFlight).toBe(false);
+    expect(s._activeClientMessageId).toBeUndefined();
+    const userRow = s.messages.find((m) => m.role === "user" && m.id === cmid)!;
+    expect(userRow.status).toBe("error");
+    sock.stop();
+  });
+
+  test("service_restart status 到达 → 清发送态 + 已成功送达的 user 行保持 sent", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s-restart", agentId: "main", text: "已经开始处理" });
+    const s = sock.sessions.get("s-restart")!;
+    const cmid = s.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s-restart", kind: "dm" },
+      clientMessageId: cmid,
+    }) });
+
+    sock.applyServerMessages(
+      "s-restart",
+      "main",
+      [srvRow({ id: "turn-status:d2", role: "system", _seq: 2, _turnStatusRecord: true,
+        _dispatchTerminal: true, _errorCode: "service_restart", _clientMessageId: cmid })],
       true,
       2,
       { serverUpdatedAt: 100 },

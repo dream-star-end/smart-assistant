@@ -14,6 +14,7 @@
  *    无需真实 IndexedDB 即可单测核心逻辑。
  */
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
+import { normalizeTurnErrorCode } from "@openclaude/protocol";
 import type {
   BashTail,
   ChatMessage,
@@ -31,7 +32,7 @@ import {
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 
 /** turn 终态收敛(RFC §5 M5):server 载荷自证的 turn 终态类别。 */
-export type ServerTurnTerminal = "completed" | "error";
+export type ServerTurnTerminal = "completed" | "error" | "interrupted";
 
 /** A browser turn that has not yet received the server's durable-admission
  * acknowledgement. The exact wire payload is journaled without a count/byte
@@ -58,6 +59,7 @@ export function detectServerTerminalTurns(
   serverRows: readonly ChatMessage[],
 ): Map<string, ServerTurnTerminal> {
   const errored = new Set<string>();
+  const interrupted = new Set<string>();
   const completed = new Set<string>();
   for (const m of serverRows) {
     const cmid = m?._clientMessageId;
@@ -69,14 +71,18 @@ export function detectServerTerminalTurns(
     if (m._turnTapeComplete === true || isTurnTapeProcessControl(m)) {
       const kind = collapsedAnchorTerminalKind(m._dispatchOutcome);
       if (kind === "completed") completed.add(cmid);
-      else if (kind === "error") errored.add(cmid);
+      else if (kind === "error") {
+        if (normalizeTurnErrorCode(m._errorCode) === "service_restart") interrupted.add(cmid);
+        else errored.add(cmid);
+      }
       if (kind !== null) continue;
     }
     if (
       m._turnStatusRecord === true ||
       (typeof m._errorCode === "string" && m._errorCode.length > 0)
     ) {
-      errored.add(cmid);
+      if (normalizeTurnErrorCode(m._errorCode) === "service_restart") interrupted.add(cmid);
+      else errored.add(cmid);
     } else if (
       isServerAuthoredRow(m) &&
       (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
@@ -85,6 +91,7 @@ export function detectServerTerminalTurns(
     }
   }
   const out = new Map<string, ServerTurnTerminal>();
+  for (const cmid of interrupted) out.set(cmid, "interrupted");
   for (const cmid of errored) out.set(cmid, "error");
   for (const cmid of completed) out.set(cmid, "completed");
   return out;
