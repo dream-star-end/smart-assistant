@@ -1668,6 +1668,21 @@ await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文
   }
 });
 
+await check("T32 durable error replay：用户 Stop 不上报，历史非尾错误不触发同步循环", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runDurableErrorReplay());
+  if (
+    result.stopErrorCode !== "user_cancelled" ||
+    result.stopErrorText !== "本轮已取消。" ||
+    result.stopReports !== 0 ||
+    result.stopSyncs !== 0 ||
+    result.historicalReports !== 1 ||
+    result.historicalSyncs !== 0 ||
+    result.historicalDecision !== true
+  ) {
+    throw new Error(`durable error replay 未收敛:${JSON.stringify(result)}`);
+  }
+});
+
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({
