@@ -900,6 +900,11 @@ export interface V3SupervisorDeps {
    * containerFileProxy 探测到 CONTAINER_OUTDATED → 503(等同 file proxy 未启用)。
    */
   bridgeSecret?: string;
+  /** Admin-only v5 drain seam. Production leaves this unset and uses the
+   * authenticated host→container handshake; tests may inject the decision. */
+  adminRuntimeRecycleDrain?: (
+    status: V3ContainerStatus,
+  ) => Promise<"accepted" | "busy" | "failed">;
   /**
    * 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7 步 4)。
    *
@@ -3297,9 +3302,14 @@ export async function stopAndRemoveV3Container(
     `UPDATE agent_containers
         SET state='vanished',
             updated_at=NOW()
-      WHERE id = $1 AND runtime_channel = $2${guardSql}
+      WHERE id = $1 AND runtime_channel = $2
+        AND container_internal_id IS NOT DISTINCT FROM $3${guardSql}
       RETURNING host_uuid`,
-    [String(containerRow.id), getRuntimeChannel()],
+    [
+      String(containerRow.id),
+      getRuntimeChannel(),
+      containerRow.container_internal_id ?? null,
+    ],
   );
   const rowFound = (updateResult.rowCount ?? 0) > 0;
   if (!rowFound) {

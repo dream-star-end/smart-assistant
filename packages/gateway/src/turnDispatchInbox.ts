@@ -667,7 +667,7 @@ export function buildSyntheticCrashedTapePayload(row: TurnDispatchInboxRow): {
     createdAt: row.createdAt,
     text: '',
     errorCode: 'SERVICE_RESTART',
-    errorDetail: '任务因服务重启中断,未能恢复已生成内容',
+    errorDetail: '任务因服务重启中断，此前已生成的过程已完整保留',
     dispatchId: row.dispatchId,
     attemptNo: row.attemptNo,
   }

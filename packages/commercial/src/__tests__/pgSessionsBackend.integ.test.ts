@@ -35,6 +35,12 @@ import {
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
 import {
+  importRolloutLiveFrames,
+  persistGatewayLiveFrame,
+  readClientSessionLiveFrames,
+  reconcileLiveStreamWithFinalTape,
+} from "../db/liveTurnFrames.js";
+import {
   casAdmittedToAccepted,
   casAdmittedToRejecting,
   casToManualReconcile,
@@ -74,6 +80,7 @@ const MIGRATION_0177 = path.resolve(here, "../db/migrations/0177_unified_client_
 const MIGRATION_0181 = path.resolve(here, "../db/migrations/0181_turn_tape_recovery_links.sql");
 const MIGRATION_0196 = path.resolve(here, "../db/migrations/0196_client_session_workspace_mode.sql");
 const MIGRATION_0198 = path.resolve(here, "../db/migrations/0198_client_session_workspace_default.sql");
+const MIGRATION_0201 = path.resolve(here, "../db/migrations/0201_durable_live_turn_frames.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -200,6 +207,7 @@ before(async () => {
   `);
   await pool.query(await readFile(MIGRATION_0181, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0196, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0201, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -3660,6 +3668,136 @@ describe("pgSessionsBackend lossless turn tape", () => {
       if (previousBatching === undefined) Reflect.deleteProperty(process.env, "LOSSLESS_TURN_TAPE_RUNTIME_BATCHING");
       else process.env.LOSSLESS_TURN_TAPE_RUNTIME_BATCHING = previousBatching;
     }
+  });
+});
+
+describe("durable live turn frame journal", () => {
+  maybe("commits exact gateway bytes idempotently, pages without a total cap, and switches to tape", async () => {
+    const sessionId = "s-live-frame-journal";
+    const userId = "c:901";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,owner_id,lease_until)
+       VALUES ($1,901,$2,'cm-live','main',$3,$4,'accepted','test-owner',NOW()+INTERVAL '1 minute')`,
+      [dispatchId, sessionId, "1".repeat(64), `billing-${dispatchId}`],
+    );
+    const payload1 = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:s-live-frame-journal",
+      frameSeq: 1,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId: "cm-live",
+      blocks: [{ kind: "thinking", text: "step one" }],
+    });
+    const payload2 = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:s-live-frame-journal",
+      frameSeq: 2,
+      peer: { id: sessionId, kind: "dm" },
+      clientMessageId: "cm-live",
+      blocks: [{ kind: "text", text: "step two" }],
+    });
+    const base = {
+      uid: 901n,
+      sessionId,
+      clientMessageId: "cm-live",
+      agentContainerId: 444,
+      sessionKey: "agent:main:webchat:dm:s-live-frame-journal",
+    };
+    await persistGatewayLiveFrame(pool, { ...base, frameSeq: 1, payload: payload1 });
+    await persistGatewayLiveFrame(pool, { ...base, frameSeq: 1, payload: payload1 });
+    await persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: payload2 });
+    await assert.rejects(
+      persistGatewayLiveFrame(pool, { ...base, frameSeq: 2, payload: `${payload2} ` }),
+      /immutable payload conflict/,
+    );
+
+    const first = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 1);
+    assert.ok(first);
+    assert.equal(first.frames.length, 1);
+    assert.equal(first.hasMore, true);
+    assert.equal(first.hasTapeProjection, false);
+    assert.deepEqual(first.streamClientMessageIds, ["cm-live"]);
+    assert.deepEqual(first.frames[0]!.payload, JSON.parse(payload1));
+    const second = await readClientSessionLiveFrames(
+      pool,
+      sessionId,
+      userId,
+      Number(first.nextCursor),
+      1,
+    );
+    assert.ok(second);
+    assert.equal(second.hasMore, false);
+    assert.deepEqual(second.frames[0]!.payload, JSON.parse(payload2));
+    assert.equal(await readClientSessionLiveFrames(pool, sessionId, "c:other", 0, 10), null);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await reconcileLiveStreamWithFinalTape(client, {
+        dispatchId,
+        status: "completed",
+        tapeId: "a".repeat(64),
+        tapeSha256: "b".repeat(64),
+      });
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+    const projected = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(projected);
+    assert.deepEqual(projected.frames, []);
+    assert.deepEqual(projected.streamClientMessageIds, []);
+    assert.equal(projected.hasTapeProjection, true);
+  });
+
+  maybe("imports one proven crashed rollout atomically and rejects identity or payload drift", async () => {
+    const sessionId = "s-live-rollout-import";
+    const userId = "c:902";
+    const dispatchId = randomUUID();
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id,user_id,session_id,client_message_id,agent_id,request_hash,
+          billing_request_id,status,outcome,terminal_at)
+       VALUES ($1,902,$2,'cm-import','main',$3,$4,'terminal','crashed',NOW())`,
+      [dispatchId, sessionId, "2".repeat(64), `billing-${dispatchId}`],
+    );
+    const payloads = [
+      JSON.stringify({ type: "outbound.message", peer: { id: sessionId, kind: "dm" }, blocks: [{ kind: "thinking", text: "kept" }] }),
+      JSON.stringify({ type: "outbound.message", peer: { id: sessionId, kind: "dm" }, blocks: [{ kind: "tool_result", toolName: "exec", isError: false, output: "exact" }] }),
+    ];
+    const input = {
+      uid: 902n,
+      sessionId,
+      clientMessageId: "cm-import",
+      dispatchId,
+      attemptNo: 1,
+      rolloutSha256: "c".repeat(64),
+      provenance: { threadId: "thread-exact", bytes: 42 },
+      payloads,
+    };
+    assert.deepEqual(await importRolloutLiveFrames(pool, input), { inserted: 2, idempotent: 0 });
+    assert.deepEqual(await importRolloutLiveFrames(pool, input), { inserted: 0, idempotent: 2 });
+    await assert.rejects(
+      importRolloutLiveFrames(pool, { ...input, payloads: [payloads[0]!, `${payloads[1]} `] }),
+      /immutable payload conflict/,
+    );
+    await assert.rejects(
+      importRolloutLiveFrames(pool, { ...input, dispatchId: randomUUID() }),
+      /authoritative crash/,
+    );
+    const page = await readClientSessionLiveFrames(pool, sessionId, userId, 0, 10);
+    assert.ok(page);
+    assert.equal(page.frames.length, 2);
+    assert.deepEqual(page.frames.map((frame) => frame.payload), payloads.map((value) => JSON.parse(value)));
+
+    await pool.query("DELETE FROM client_sessions WHERE id=$1 AND user_id=$2", [sessionId, userId]);
+    const rows = await pool.query("SELECT 1 FROM client_session_live_frames");
+    assert.equal(rows.rowCount, 0, "session deletion owns journal retention via cascade");
   });
 });
 

@@ -4281,6 +4281,23 @@ export interface ReadArchivedMessagesResult {
   historyRevision?: number
 }
 
+/** Exact runtime frames that were durably committed before browser delivery.
+ * The cursor is an append-only record id; callers can keep paging until
+ * `hasMore=false` without any total-content cap. */
+export interface ClientSessionLiveFramePage {
+  frames: Array<{
+    recordId: string
+    streamKey: string
+    source: 'gateway' | 'rollout_import'
+    clientMessageId: string | null
+    payload: unknown
+  }>
+  nextCursor: string | null
+  hasMore: boolean
+  streamClientMessageIds: string[]
+  hasTapeProjection: boolean
+}
+
 /** Private model-context read. This is deliberately separate from browser
  * history: browser rows are exact/pageable, while this read returns only the
  * contiguous narrative suffix that can physically fit the selected model. */
@@ -4426,6 +4443,22 @@ async function _sqliteReadArchivedMessages(
     oldestSeq,
     historyRevision: row.history_revision,
   }
+}
+
+/** Personal/container SQLite has no commercial master live-frame journal. */
+async function _sqliteReadClientSessionLiveFrames(
+  sessId: string,
+  userId: string,
+  _afterRecordId = 0,
+  _limit = 200,
+): Promise<ClientSessionLiveFramePage | null> {
+  const db = await getSessionsDb()
+  const row = db.prepare(
+    'SELECT 1 FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessId, userId)
+  return row
+    ? { frames: [], nextCursor: null, hasMore: false, streamClientMessageIds: [], hasTapeProjection: false }
+    : null
 }
 
 /** 引擎上下文读(RFC §9)。个人版/容器按所选模型的真实上下文预算，从热行向归档
@@ -4951,6 +4984,7 @@ const sqliteBackend = {
   classifyClientSessions: _sqliteClassifyClientSessions,
   getClientSessionPartial: _sqliteGetClientSessionPartial,
   readArchivedMessages: _sqliteReadArchivedMessages,
+  readClientSessionLiveFrames: _sqliteReadClientSessionLiveFrames,
   readClientTimelinePage: _sqliteReadClientTimelinePage,
   getEngineContextMessages: _sqliteGetEngineContextMessages,
   hasCompletedClientTurn: _sqliteHasCompletedClientTurn,
@@ -5060,6 +5094,9 @@ export const getClientSessionPartial: ClientSessionsBackend['getClientSessionPar
 
 export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages'] =
   (...args) => getActiveBackend().readArchivedMessages(...args)
+
+export const readClientSessionLiveFrames: ClientSessionsBackend['readClientSessionLiveFrames'] =
+  (...args) => getActiveBackend().readClientSessionLiveFrames(...args)
 
 export const readClientTimelinePage: ClientSessionsBackend['readClientTimelinePage'] =
   (...args) => getActiveBackend().readClientTimelinePage(...args)

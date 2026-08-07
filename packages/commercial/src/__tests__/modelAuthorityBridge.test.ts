@@ -1301,6 +1301,8 @@ describe("bridge automatic recovery lineage", () => {
       assert.equal(admitCalls, 1);
       assert.equal(ack.type, "outbound.ack");
       assert.equal(ack.recoverySkipped, true);
+      assert.equal(ack.recoverySkippedReason, "source_not_latest");
+      assert.equal(ack.sourceClientMessageId, sourceClientMessageId);
       assert.equal(ack.clientMessageId, identity.clientMessageId);
       let build = await frames.next();
       while (build.type !== "sys.frontend_build") build = await frames.next();
@@ -1320,15 +1322,13 @@ describe("bridge automatic recovery lineage", () => {
         },
       }));
       let terminal = await frames.next();
-      while (terminal.type !== "outbound.message") terminal = await frames.next();
+      while (terminal.type !== "outbound.ack") terminal = await frames.next();
       assert.equal(admitCalls, 2);
+      assert.equal(terminal.recoverySkipped, true);
+      assert.equal(terminal.recoverySkippedReason, "source_not_latest");
+      assert.equal(terminal.sourceClientMessageId, sourceClientMessageId);
       assert.equal(terminal.clientMessageId, identity.clientMessageId);
       assert.deepEqual(terminal.peer, { id: sessionId, kind: "dm" });
-      assert.deepEqual(terminal.blocks, [{
-        kind: "text",
-        text: "已停止重复恢复。你可以直接继续发送消息。",
-      }]);
-      assert.equal(terminal.isFinal, true);
       await new Promise((resolve) => setTimeout(resolve, 40));
       assert.equal(rig.containerSeen.some((raw) => {
         try { return (JSON.parse(raw) as { type?: string }).type === "inbound.message"; }

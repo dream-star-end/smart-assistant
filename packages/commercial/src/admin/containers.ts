@@ -47,9 +47,12 @@ import {
 } from "../agent-sandbox/supervisor.js";
 import {
   PROVISION_INFLIGHT_GRACE_MS,
+  getV3ContainerStatus,
   stopAndRemoveV3Container,
   type V3SupervisorDeps,
 } from "../agent-sandbox/v3supervisor.js";
+import { requestRuntimeRecycleDrain } from "../agent-sandbox/v3ensureRunning.js";
+import { isV5Channel } from "../runtimeChannel.js";
 import { writeAdminAuditBestEffort } from "./audit.js";
 import type { AdminAuditAction } from "./auditActions.js";
 import type { AdminAuditCtx } from "./accounts.js";
@@ -261,6 +264,13 @@ export class V3SupervisorMissingError extends Error {
   }
 }
 
+export class V3ContainerBusyError extends Error {
+  constructor(id: bigint | string, reason: string) {
+    super(`agent_container ${String(id)} has active or unverified work (${reason})`);
+    this.name = "V3ContainerBusyError";
+  }
+}
+
 /**
  * 行类型 dispatch:
  *   - v2:docker_name 非空,直接走 supervisor 系列
@@ -270,7 +280,7 @@ export class V3SupervisorMissingError extends Error {
  */
 type ContainerLookup =
   | { kind: "v2"; userId: number; dockerName: string }
-  | { kind: "v3"; rowId: number; containerInternalId: string | null };
+  | { kind: "v3"; userId: number; rowId: number; containerInternalId: string | null };
 
 /** 由 id 查 user_id(num)+ docker_name + container_internal_id。 */
 async function lookupContainer(id: bigint | string): Promise<ContainerLookup | null> {
@@ -313,8 +323,33 @@ async function lookupContainer(id: bigint | string): Promise<ContainerLookup | n
   // 极短窗口可能仍是 NULL(provision 跑 docker create 之间 / failed mid-flight),
   // stopAndRemoveV3Container 兼容 NULL 路径(不调 docker,只 UPDATE state='vanished')。
   const rowIdNum = Number(row.id);
+  const userIdNum = Number(row.user_id);
   if (!Number.isInteger(rowIdNum) || rowIdNum <= 0) throw new RangeError("invalid_container_id_in_row");
-  return { kind: "v3", rowId: rowIdNum, containerInternalId: row.container_internal_id };
+  if (!Number.isInteger(userIdNum) || userIdNum <= 0) throw new RangeError("invalid_user_id_in_row");
+  return { kind: "v3", userId: userIdNum, rowId: rowIdNum, containerInternalId: row.container_internal_id };
+}
+
+async function drainV3BeforeAdminMutation(
+  id: bigint | string,
+  info: Extract<ContainerLookup, { kind: "v3" }>,
+  deps: V3SupervisorDeps,
+): Promise<void> {
+  if (!isV5Channel()) return;
+  const status = await getV3ContainerStatus(deps, info.userId);
+  if (!status || status.containerId !== info.rowId) return;
+  if (status.state === "provisioning") {
+    throw new V3ContainerBusyError(id, "container_generation_changed");
+  }
+  if (status.state !== "running") return;
+  if (status.dockerContainerId !== (info.containerInternalId ?? "")) {
+    throw new V3ContainerBusyError(id, "container_generation_changed");
+  }
+  const drained = deps.adminRuntimeRecycleDrain
+    ? await deps.adminRuntimeRecycleDrain(status)
+    : await requestRuntimeRecycleDrain(deps, status);
+  if (drained !== "accepted") {
+    throw new V3ContainerBusyError(id, drained === "busy" ? "active_turn" : "drain_failed");
+  }
 }
 
 // 失败行为已收口到 audit.ts writeAdminAuditBestEffort(整改批);本函数只剩
@@ -556,6 +591,7 @@ export async function adminRestartContainer(
   }
   // v3:restart = stop+remove,触发下一次 ensureRunning 自动 reprovision
   if (!v3Deps) throw new V3SupervisorMissingError(id);
+  await drainV3BeforeAdminMutation(id, info, v3Deps);
   await stopAndRemoveV3Container(v3Deps, {
     id: info.rowId,
     container_internal_id: info.containerInternalId,
@@ -594,6 +630,7 @@ export async function adminStopContainer(
   }
   // v3:stop = stop+remove(ephemeral 没有持久 stopped 态)
   if (!v3Deps) throw new V3SupervisorMissingError(id);
+  await drainV3BeforeAdminMutation(id, info, v3Deps);
   await stopAndRemoveV3Container(v3Deps, {
     id: info.rowId,
     container_internal_id: info.containerInternalId,
@@ -624,6 +661,7 @@ export async function adminRemoveContainer(
   }
   // v3:remove = stop+remove,与 stop 等价(ephemeral 模型语义合并)
   if (!v3Deps) throw new V3SupervisorMissingError(id);
+  await drainV3BeforeAdminMutation(id, info, v3Deps);
   await stopAndRemoveV3Container(v3Deps, {
     id: info.rowId,
     container_internal_id: info.containerInternalId,

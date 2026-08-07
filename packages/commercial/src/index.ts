@@ -382,6 +382,7 @@ import {
   startSessionsGcSweeper,
   type LosslessTurnTapeStorage,
 } from "./db/pgSessionsBackend.js";
+import { persistGatewayLiveFrame } from "./db/liveTurnFrames.js";
 import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.js";
 import {
   resolveDispatchStuckThresholdMs,
@@ -4973,6 +4974,7 @@ export async function registerCommercial(
         MASTER_USER_PREFIX + uid.toString(),
         message,
       ),
+    persistOutboundFrame: (input) => persistGatewayLiveFrame(getPool(), input),
     // durable turn dispatch 受理面(RFC §2.1):容器 attest durable-turn-dispatch-v1 时
     // 替代 persistMasterUserMessage(单事务 append + dispatch 冲突表)。未装 backend → undefined → legacy。
     admitUserTurn: dispatchAdmissionBackend

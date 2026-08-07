@@ -62,6 +62,10 @@ const WHITELIST = new Set<string>([
   "packages/storage/src/clientSessionsPlan.ts",
   "packages/storage/src/sessionsMigrate.ts",
   "packages/commercial/src/db/pgSessionsBackend.ts",
+  // Durable live-turn frame journal 是 commercial PG sessions backend 的拆分模块；它在同一
+  // 事务内校验 client_sessions 租户归属并读写新的 live stream/frame 表，不能经另一个
+  // backend 调用拆开 ownership snapshot。
+  "packages/commercial/src/db/liveTurnFrames.ts",
   "packages/commercial/src/db/sessionsStoreAuthority.ts",
   "packages/commercial/src/goal/goalStateService.ts",
   // Exact-turn waiver 必须在同一 PG 事务内完成退款、定向站内信、pending→applied，

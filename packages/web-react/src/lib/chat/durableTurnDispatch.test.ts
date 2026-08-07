@@ -384,7 +384,7 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     vi.unstubAllGlobals();
   });
 
-  test("durable failure status 到达 → 清发送态 + user 行置 error", () => {
+  test("durable failure status 到达 → 清发送态 + 已成功送达的 user 行保持 sent", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -414,7 +414,7 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     expect(s._sendingInFlight).toBe(false);
     expect(s._activeClientMessageId).toBeUndefined();
     const userRow = s.messages.find((m) => m.role === "user" && m.id === cmid)!;
-    expect(userRow.status).toBe("error");
+    expect(userRow.status).toBe("sent");
     sock.stop();
   });
 
@@ -490,7 +490,8 @@ describe("durable failure status 渲染 (RFC §5)", () => {
   test("errorPresentation SERVICE_RESTART(大小写归一)→ 免单 tone", () => {
     const p = errorPresentation("SERVICE_RESTART", "", undefined);
     expect(p.waived).toBe(true);
-    expect(p.title).toBe("服务重启，本轮已中断");
+    expect(p.title).toBe("任务已中断");
+    expect(p.message).toContain("此前已生成的过程已完整保留");
   });
   test("isDispatchLostCode", () => {
     expect(isDispatchLostCode("dispatch_lost")).toBe(true);

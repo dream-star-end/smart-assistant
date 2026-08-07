@@ -128,6 +128,7 @@ export type StoredSession = {
   _activeAgentId?: string;
   _dispatchPaused?: boolean;
   _cancelledAutomaticRecoveryIds?: Record<string, true>;
+  _automaticRecoveryDecisions?: Record<string, true>;
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;

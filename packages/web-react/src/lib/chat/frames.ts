@@ -215,6 +215,8 @@ export type AckWire = {
   /** Master atomically rejected a stale/unsafe recovery child. The browser
    * removes only that deterministic optimistic row and keeps the old tape. */
   recoverySkipped?: boolean;
+  recoverySkippedReason?: string;
+  sourceClientMessageId?: string;
   idempotencyKey?: string;
   peer?: Peer;
   clientMessageId?: string;

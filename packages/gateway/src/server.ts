@@ -125,6 +125,7 @@ import {
   getClientSession,
   getClientSessionPartial,
   readArchivedMessages,
+  readClientSessionLiveFrames,
   readClientTimelinePage,
   encodeClientTimelineCursor,
   decodeClientTimelineCursor,
@@ -4119,6 +4120,35 @@ export class Gateway {
       readArchivedMessages(sessId, userId, beforeSeq, limit, { view: 'timeline' })
         .then((r) => this.sendJson(res, 200, r))
         .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
+      return
+    }
+    // Exact browser-visible process frames, committed by the commercial
+    // master before live WS delivery.  This is cursor-paged with no total cap;
+    // personal/container SQLite returns an empty page.
+    const liveFramesMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/live-frames$/)
+    if (liveFramesMatch) {
+      const sessId = liveFramesMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const afterRaw = url.searchParams.get('after')
+      const limitRaw = url.searchParams.get('limit')
+      const after = afterRaw === null ? 0 : Number(afterRaw)
+      const limit = limitRaw === null ? 200 : Number(limitRaw)
+      if (
+        !Number.isSafeInteger(after) || after < 0 ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 500
+      ) {
+        this.sendJson(res, 400, { error: 'invalid live frame cursor' })
+        return
+      }
+      readClientSessionLiveFrames(sessId, userId, after, limit)
+        .then((page) => page
+          ? this.sendJson(res, 200, page)
+          : this.sendJson(res, 404, { error: 'not found' }))
+        .catch(() => this.sendJson(res, 500, { error: 'live frame read failed' }))
       return
     }
     const clientSessMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})$/)

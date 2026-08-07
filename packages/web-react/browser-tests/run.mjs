@@ -1629,6 +1629,45 @@ await check("T30 视频任务中心持久排队、实时进度与可信取消交
   await page.evaluate(() => window.__openMediaTask(false));
 });
 
+await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runDurableOverlap());
+  if (
+    result.thinkingCount !== 1 ||
+    result.toolCount !== 1 ||
+    result.answerCount !== 1 ||
+    result.cursor !== 2
+  ) {
+    throw new Error(`durable hydration 重复/丢失:${JSON.stringify(result)}`);
+  }
+  const thinkingHeader = replayRoot.getByRole("button", { name: /思考|已思考/ }).first();
+  await thinkingHeader.waitFor({ state: "visible", timeout: 3000 });
+  await thinkingHeader.click();
+  await replayRoot.getByText(result.markers.thinking, { exact: false }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const toolButton = replayRoot.getByRole("button", { name: /exec_command/ }).first();
+  await toolButton.waitFor({ state: "visible", timeout: 3000 });
+  await toolButton.click();
+  await replayRoot.getByText(result.markers.toolOutput, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  await replayRoot.getByText(result.markers.answer, { exact: true }).waitFor({
+    state: "visible",
+    timeout: 3000,
+  });
+  const toolRows = replayRoot
+    .locator("[data-chat-virtual-key]")
+    .filter({ hasText: result.markers.toolOutput });
+  if (await toolRows.count() !== 1) {
+    throw new Error("durable hydration 工具卡重复渲染");
+  }
+  if (await replayRoot.getByText(result.markers.answer, { exact: true }).count() !== 1) {
+    throw new Error("durable hydration 正文重复渲染");
+  }
+});
+
 // 主 harness 仍在:预览用例没有把它换成空页面(否则后续缺席断言全部恒真)。
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({

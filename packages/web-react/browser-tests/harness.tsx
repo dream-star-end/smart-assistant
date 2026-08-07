@@ -116,6 +116,14 @@ declare global {
       pushRetryStatus: () => void;
       /** Complete the same turn with a live text block plus final terminator. */
       pushRetrySuccess: () => void;
+      /** Reproduce page1 → WS N → page2(N) during durable journal hydration. */
+      runDurableOverlap: () => Promise<{
+        markers: { thinking: string; toolCommand: string; toolOutput: string; answer: string };
+        thinkingCount: number;
+        toolCount: number;
+        answerCount: number;
+        cursor: number;
+      }>;
     };
     /** T23 会话内切模型:候选项展示名与 id 的单一权威(run.mjs 从页面读回)。 */
     __modelFixture: {
@@ -162,6 +170,9 @@ window.__replayDrive = {
   frameCount: () => 0,
   pushRetryStatus: () => {},
   pushRetrySuccess: () => {},
+  runDurableOverlap: async () => {
+    throw new Error("durable overlap probe 未挂载");
+  },
 };
 window.__runPendingDispatchJournalProbe = async () => {
   const userId = `browser-journal-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -988,6 +999,85 @@ createRoot(document.getElementById("timeline-replay-root")!).render(
         isFinal: false,
       });
       live().deliver({ ...base, frameSeq: 8, blocks: [], isFinal: true });
+    },
+    runDurableOverlap: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "durable overlap");
+      const clientMessageId = "m-browser-durable-overlap";
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const markers = {
+        thinking: "BROWSER_DURABLE_THOUGHT_ONCE",
+        toolCommand: "printf BROWSER_DURABLE_TOOL_ONCE",
+        toolOutput: "BROWSER_DURABLE_OUTPUT_ONCE",
+        answer: "BROWSER_DURABLE_ANSWER_ONCE",
+      };
+      session.messages.push({
+        id: clientMessageId,
+        role: "user",
+        text: "BROWSER_DURABLE_USER",
+        ts: 1,
+        status: "sent",
+      });
+      session._lastFrameSeqByKey = { [sessionKey]: 99 };
+      session._lastFrameSeq = 99;
+      const payload = (frameSeq: number, blocks: unknown[]) => ({
+        type: "outbound.message",
+        sessionKey,
+        frameSeq,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+        clientMessageId,
+        blocks,
+        isFinal: false,
+        ts: frameSeq + 10,
+      });
+      const record = (recordId: string, frameSeq: number, blocks: unknown[]) => ({
+        recordId,
+        streamKey: "dispatch:33333333-3333-4333-8333-333333333333:1",
+        source: "gateway" as const,
+        clientMessageId,
+        payload: payload(frameSeq, blocks),
+      });
+      const overlapBlocks = [
+        { kind: "thinking", text: markers.thinking },
+        {
+          kind: "tool_use",
+          blockId: "browser-durable-call",
+          toolName: "exec_command",
+          inputJson: { cmd: markers.toolCommand },
+          partial: false,
+        },
+        {
+          kind: "tool_result",
+          blockId: "browser-durable-result",
+          toolUseBlockId: "browser-durable-call",
+          toolName: "exec_command",
+          isError: false,
+          output: markers.toolOutput,
+        },
+        { kind: "text", text: markers.answer },
+      ];
+      await replaySocket.runDurableLiveFrameHydration(REPLAY_SESSION_ID, async () => {
+        const page1 = record("1", 1, [{ kind: "thinking", text: "BROWSER_DURABLE_PAGE1" }]);
+        live().deliver(payload(2, overlapBlocks));
+        const page2 = record("2", 2, overlapBlocks);
+        replaySocket.applyDurableLiveFrames(
+          REPLAY_SESSION_ID,
+          [page1, page2],
+          [clientMessageId],
+        );
+      });
+      return {
+        markers,
+        thinkingCount: session.messages
+          .filter((m) => m.role === "thinking")
+          .reduce((count, m) => count + (m.text.split(markers.thinking).length - 1), 0),
+        toolCount: session.messages.filter((m) =>
+          m.role === "tool" && m.output === markers.toolOutput).length,
+        answerCount: session.messages.filter((m) =>
+          m.role === "assistant" && m.text === markers.answer).length,
+        cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
+      };
     },
   };
 }

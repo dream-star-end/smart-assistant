@@ -646,7 +646,8 @@ export function errorPresentation(
   const ref = requestReference(detail, text);
   // durable turn dispatch failure-status 文案。三者恒免单 tone(waived:true → 温和
   // ShieldCheck 卡):dispatch_lost / dispatch_not_accepted = 受理成功但从未开始执行(durable
-  // not_accepted 证明,未计费);service_restart = 服务重启掐断,已生成内容无法恢复(已退款)。
+  // not_accepted 证明,未计费);service_restart = 服务重启掐断，但 master 的
+  // durable live-frame journal 保留此前所有已展示过程。
   // 均非平台内部错误,不甩堆栈。dispatch_not_accepted 是 reconciler 对「容器 rejected tombstone」
   // 铸的精确码(MIN2),与 dispatch_lost 同免单文案。
   if (normalized === "dispatch_lost" || normalized === "dispatch_not_accepted") {
@@ -659,8 +660,8 @@ export function errorPresentation(
   }
   if (normalized === "service_restart") {
     return {
-      title: ERROR_LABELS.service_restart,
-      message: "任务因服务重启中断，未能恢复已生成内容。本轮未计费；如已扣除，积分已原路退回，你可以重新尝试。",
+      title: "任务已中断",
+      message: "此前已生成的过程已完整保留。你可以从现有进度继续；本轮未计费，如已扣除，积分已原路退回。",
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
       waived: true,
     };

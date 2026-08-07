@@ -31,6 +31,7 @@ import {
   adminStopContainer,
   adminRemoveContainer,
   ContainerNotFoundError,
+  V3ContainerBusyError,
   V3SupervisorMissingError,
   listContainers,
 } from "../admin/containers.js";
@@ -288,6 +289,50 @@ describe("admin/containers HIGH#6 v2/v3 dispatch", () => {
       [String(id)],
     );
     assert.equal(r.rows[0]!.state, "vanished");
+  });
+
+  test("v5 admin destructive action drains first and returns busy without touching the container", async (t) => {
+    if (!pgAvailable) return t.skip("PG fixture not available");
+    const previousChannel = process.env.OC_RUNTIME_CHANNEL;
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    t.after(() => {
+      if (previousChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+      else process.env.OC_RUNTIME_CHANNEL = previousChannel;
+    });
+    const uid = await insertUser();
+    const id = await insertV3Container(uid, "running-v5-container");
+    await query("UPDATE agent_containers SET runtime_channel='v5' WHERE id=$1", [String(id)]);
+    const cap = freshCapture();
+    const docker = {
+      getContainer: (name: string) => ({
+        inspect: async () => ({ State: { Running: true }, Config: { Image: "runtime:test", Labels: {} } }),
+        stop: async () => { cap.stopCalled = true; cap.stopName = name; },
+        remove: async () => { cap.removeCalled = true; cap.removeName = name; },
+      }),
+    } as unknown as Docker;
+    let drainCalls = 0;
+    const v3Deps: V3SupervisorDeps = {
+      docker,
+      pool: getPool(),
+      image: "runtime:test",
+      adminRuntimeRecycleDrain: async () => {
+        drainCalls++;
+        return "busy";
+      },
+    };
+
+    await assert.rejects(
+      () => adminRestartContainer(id, docker, makeAuditCtx(uid), v3Deps),
+      (error: unknown) => error instanceof V3ContainerBusyError,
+    );
+    assert.equal(drainCalls, 1);
+    assert.equal(cap.stopCalled, false);
+    assert.equal(cap.removeCalled, false);
+    const row = await query<{ state: string }>(
+      "SELECT state FROM agent_containers WHERE id=$1",
+      [String(id)],
+    );
+    assert.equal(row.rows[0]!.state, "active");
   });
 
   test("v3 行 + 没传 v3Supervisor → V3SupervisorMissingError", async (t) => {

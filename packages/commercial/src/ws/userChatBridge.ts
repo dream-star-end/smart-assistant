@@ -988,6 +988,17 @@ export interface UserChatBridgeDeps {
     reason?: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized";
     workspaceMode?: SessionWorkspaceMode;
   }>;
+  /** Exact stamped container frame journal.  The bridge MUST await this
+   * commit before ring insertion or physical browser delivery. */
+  persistOutboundFrame?: (input: {
+    uid: bigint;
+    sessionId: string;
+    clientMessageId: string | null;
+    agentContainerId: number;
+    sessionKey: string;
+    frameSeq: number;
+    payload: string;
+  }) => Promise<void>;
   /** durable turn dispatch 受理面(RFC-v5-durable-turn-dispatch §2.1)。注入且容器 attest
    * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
    * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
@@ -1549,6 +1560,49 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    * frameSeq dedupe (websocket.js handleOutbound) absorbs any duplicate frames.
    */
   const outboundRing = new OutboundRingBuffer(DEFAULT_RING_CONFIG);
+  // Process-singleton namespace queues preserve commit→send order even when
+  // the same container broadcasts duplicate frames through multiple browser
+  // bridges.  A failed namespace is poisoned: later sequence numbers are not
+  // allowed to leap over the missing durable row.
+  const outboundPersistQueues = new Map<string, { tail: Promise<void>; failedSeq: number | null }>();
+  const enqueuePersistedOutbound = (
+    key: string,
+    frameSeq: number,
+    work: () => Promise<void>,
+    onFailure: (error: unknown) => void,
+  ): void => {
+    let state = outboundPersistQueues.get(key);
+    if (!state) {
+      state = { tail: Promise.resolve(), failedSeq: null };
+      outboundPersistQueues.set(key, state);
+    }
+    const task = state.tail.then(async () => {
+      // A reconnect may replay the exact failed sequence from the container's
+      // own ring.  That exact retry is allowed to heal the namespace; a later
+      // sequence must never overtake it.
+      if (state!.failedSeq !== null && state!.failedSeq !== frameSeq) {
+        onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
+        return;
+      }
+      try {
+        await work();
+        if (state!.failedSeq === frameSeq) state!.failedSeq = null;
+      } catch (error) {
+        state!.failedSeq = frameSeq;
+        onFailure(error);
+      }
+    });
+    state.tail = task;
+    void task.finally(() => {
+      if (
+        state!.failedSeq === null &&
+        outboundPersistQueues.get(key) === state &&
+        state!.tail === task
+      ) {
+        outboundPersistQueues.delete(key);
+      }
+    });
+  };
 
   /**
    * 周期性 lazy prune 兜底。
@@ -2895,35 +2949,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }));
         } catch { /* durable admission remains replayable */ }
       };
-      const sendRecoverySkippedAck = (): void => {
+      const sendRecoverySkippedAck = (reason: string): void => {
         if (clientMessageId === null) return;
         const idempotencyKey = typeof frameObj.idempotencyKey === "string"
           ? frameObj.idempotencyKey
           : undefined;
         try {
           if (skippedRecoveryIds.has(clientMessageId)) {
-            userWs.send(JSON.stringify({
-              type: "outbound.message",
-              sessionKey: `recovery:${peerId}`,
-              channel: "webchat",
-              peer: { id: peerId, kind: "dm" },
-              clientMessageId,
-              blocks: [{
-                kind: "text",
-                text: "已停止重复恢复。你可以直接继续发送消息。",
-              }],
-              isFinal: true,
-            }));
             turnLog?.info("user-chat-bridge: stopped legacy rejected-recovery retry loop", {
               sessionId: peerId,
               clientMessageId,
             });
-            return;
           }
           skippedRecoveryIds.add(clientMessageId);
           userWs.send(JSON.stringify({
             type: "outbound.ack",
             recoverySkipped: true,
+            recoverySkippedReason: reason,
+            ...(isClientMessageId(recovery?.sourceClientMessageId)
+              ? { sourceClientMessageId: recovery.sourceClientMessageId }
+              : {}),
             ...(idempotencyKey ? { idempotencyKey } : {}),
             peer: { id: peerId, kind: "dm" },
             clientMessageId,
@@ -2980,7 +3025,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             sessionId: peerId,
             clientMessageId,
           });
-          sendRecoverySkippedAck();
+          sendRecoverySkippedAck("invalid_lineage");
           return null;
         }
         validatedRecovery = automatic
@@ -3001,7 +3046,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // journal/history injection or any physical forward can happen.
       const useDispatchAdmission = containerHasDurableDispatch && deps.admitUserTurn !== undefined;
       if (validatedRecovery && !useDispatchAdmission) {
-        sendRecoverySkippedAck();
+        sendRecoverySkippedAck("capability_unavailable");
         return null;
       }
 
@@ -3299,7 +3344,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 clientMessageId,
                 reason: admit.reason,
               });
-              sendRecoverySkippedAck();
+              sendRecoverySkippedAck(admit.reason);
               return null;
             case "session_not_found":
             case "session_deleted":
@@ -5857,10 +5902,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // process-singleton ring, so we'd see the same `(storeKey, seq)` write
       // multiple times. `storeStamped` skips silently when `seq <= prevLast`.
       //
-      // Container reset: a recycled container gets a fresh `containerId`
-      // from the supervisor — the storeKey namespace is fresh, so the
-      // restarted container's seq=1 never collides with the previous
-      // container's seq=1. Old namespaces age out via the 10min TTL.
+      let durableStampedFrame: {
+        storeKey: string;
+        sessionId: string | null;
+        clientMessageId: string | null;
+        sessionKey: string;
+        frameSeq: number;
+        payload: string;
+      } | null = null;
       if (containerId !== undefined && !isBinary) {
         let frameStr: string | null = null;
         if (typeof data === "string") frameStr = data;
@@ -5871,14 +5920,32 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           let parsedOut: unknown = null;
           try { parsedOut = JSON.parse(frameStr); } catch { /* non-JSON: skip */ }
           if (parsedOut !== null && typeof parsedOut === "object") {
-            const wire = parsedOut as { sessionKey?: unknown; frameSeq?: unknown };
+            const wire = parsedOut as {
+              sessionKey?: unknown;
+              frameSeq?: unknown;
+              clientMessageId?: unknown;
+              peer?: { id?: unknown };
+            };
             if (
               typeof wire.sessionKey === "string" &&
               typeof wire.frameSeq === "number" &&
+              Number.isSafeInteger(wire.frameSeq) &&
               wire.frameSeq > 0
             ) {
               const storeKey = `${uid.toString()}:${containerId.toString()}:${wire.sessionKey}`;
-              outboundRing.storeStamped(storeKey, wire.frameSeq, Date.now(), frameStr);
+              durableStampedFrame = {
+                storeKey,
+                sessionId: wire.peer && typeof wire.peer === "object" &&
+                  typeof wire.peer.id === "string"
+                  ? wire.peer.id
+                  : null,
+                clientMessageId: isClientMessageId(wire.clientMessageId)
+                  ? wire.clientMessageId
+                  : null,
+                sessionKey: wire.sessionKey,
+                frameSeq: wire.frameSeq,
+                payload: frameStr,
+              };
             }
           }
         }
@@ -5929,13 +5996,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // Goal usage broadcasts are commit-driven by the PG tape/cost backend.
       // Do not guess durability with a one-shot terminal-frame timer: CCB cost
       // settlement and the GC late-fold can legitimately happen much later.
-      if (userWs.readyState !== WebSocket.OPEN) {
-        // user 已经走了 — billing 帧已在上面分支处理,这里是非 billing 容器帧,丢
-        // Note: ring write above ALREADY captured the frame for late-reconnect
-        // replay, so dropping the live forward here is the intended behavior
-        // (was previously a silent-drop bug because there was no ring layer).
-        return;
-      }
       // Terminal release is exact by peer + clientMessageId. Peer-only fallback
       // is restricted to genuinely legacy inbound turns that never had a client
       // id; otherwise a late id-less final from turn A could ABA-release a newer
@@ -5982,41 +6042,76 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
-      // 简单 backpressure:看 userWs.bufferedAmount(ws lib 维护的 socket 待发量)
-      if (userWs.bufferedAmount + len > maxBufferedBytes) {
-        bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
-          buffered: userWs.bufferedAmount, len,
-        });
-        // 背压=连接态瞬态信号:只走 close code,不发 turn 级 error 帧(同 agent-slow 侧)。
-        try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
-        // user-WS 不可写但 container 仍在跑 codex turn → 走 drain 让 billing 落账
-        // (broadcast 会 no-op 因 user-WS 已关,但 ledger debit 必须完成)
-        cleanup("backpressure");
+      const forwardCommittedFrame = (): void => {
+        if (durableStampedFrame !== null) {
+          outboundRing.storeStamped(
+            durableStampedFrame.storeKey,
+            durableStampedFrame.frameSeq,
+            Date.now(),
+            durableStampedFrame.payload,
+          );
+        }
+        if (userWs.readyState !== WebSocket.OPEN) return;
+        if (userWs.bufferedAmount + len > maxBufferedBytes) {
+          bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
+            buffered: userWs.bufferedAmount, len,
+          });
+          try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "backpressure"); } catch { /* */ }
+          cleanup("backpressure");
+          return;
+        }
+        try {
+          userWs.send(data, { binary: isBinary }, (err) => {
+            if (err) bridgeLog?.warn("user-chat-bridge: user send error", { err });
+          });
+          bytesCU += len;
+          bufferedCU = userWs.bufferedAmount;
+          metrics.onContainerFrame?.(uid, len, isBinary);
+          metrics.onBufferedBytes?.(uid, "container_to_user", bufferedCU);
+        } catch (err) {
+          bridgeLog?.warn("user-chat-bridge: user send threw", { err });
+          try { userWs.close(CLOSE_BRIDGE.INTERNAL, "user send failed"); } catch { /* */ }
+          cleanup("internal_error");
+        }
+      };
+
+      const durableSessionId = durableStampedFrame?.sessionId ?? null;
+      if (
+        durableStampedFrame !== null &&
+        durableSessionId !== null &&
+        deps.persistOutboundFrame
+      ) {
+        const stamped = durableStampedFrame;
+        enqueuePersistedOutbound(
+          stamped.storeKey,
+          stamped.frameSeq,
+          async () => {
+            await deps.persistOutboundFrame!({
+              uid,
+              sessionId: durableSessionId,
+              clientMessageId: stamped.clientMessageId,
+              agentContainerId: containerId!,
+              sessionKey: stamped.sessionKey,
+              frameSeq: stamped.frameSeq,
+              payload: stamped.payload,
+            });
+            forwardCommittedFrame();
+          },
+          (error) => {
+            bridgeLog?.error("user-chat-bridge: outbound durability commit failed", {
+              sessionId: stamped.sessionId,
+              clientMessageId: stamped.clientMessageId,
+              containerId,
+              sessionKey: stamped.sessionKey,
+              frameSeq: stamped.frameSeq,
+              err: (error as Error)?.message ?? String(error),
+            });
+            try { userWs.close(CLOSE_BRIDGE.INTERNAL, "output persistence unavailable"); } catch { /* */ }
+          },
+        );
         return;
       }
-      // 容器 → user 默认**透传**:除上面显式拦下的 outbound.codex_billing(内部计费
-      // 侧信道,绝不给浏览器)外,其余帧一律照发。长会话热尾巴+归档的 sys.context_rebuilt
-      // 提示帧(容器 gateway deliver() 产生、带 sessionKey+frameSeq)就走这条路到达 user
-      // —— 上面 ring 写入已捕获它供重连重放,这里 live 透传。
-      // **契约红线**:未来若在此加"按 type 的转发白名单/丢弃表",必须放行 sys.* 命名空间
-      // (含 sys.context_rebuilt),否则用户上下文重建提示会被静默吞掉(帧被吞前科)。
-      try {
-        userWs.send(data, { binary: isBinary }, (err) => {
-          if (err) {
-            bridgeLog?.warn("user-chat-bridge: user send error", { err });
-          }
-        });
-        bytesCU += len;
-        bufferedCU = userWs.bufferedAmount;
-        metrics.onContainerFrame?.(uid, len, isBinary);
-        metrics.onBufferedBytes?.(uid, "container_to_user", bufferedCU);
-      } catch (err) {
-        bridgeLog?.warn("user-chat-bridge: user send threw", { err });
-        try { userWs.close(CLOSE_BRIDGE.INTERNAL, "user send failed"); } catch { /* */ }
-        // user-WS send 抛但 container 还在 — billing 帧仍可能到,走 drain 让 ledger
-        // debit 落账(broadcast 因 user-WS 死会 no-op,但 settle 不能漏)
-        cleanup("internal_error");
-      }
+      forwardCommittedFrame();
     };
 
     // ---------- container WS 生命周期 ----------
@@ -6929,6 +7024,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   async function shutdown(reason = "server shutting down"): Promise<void> {
     clearInterval(ringPruneTimer);
     registry.closeAll(reason);
+    await Promise.allSettled([...outboundPersistQueues.values()].map((state) => state.tail));
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
     });
