@@ -32,6 +32,7 @@ test("OCR readiness remains a strict standalone smoke and is not a master releas
 test("nested supervisor census SSH cannot consume the remaining remote smoke script", () => {
   const smoke = readFileSync(path.join(root, "scripts/v5-ocr-worker-smoke.sh"), "utf8");
   assert.match(smoke, /census=\$\(ssh -n "\$\{ssh_args\[@\]\}"/);
+  assert.match(smoke, /OCR worker ready: release=/);
 
   const draining = spawnSync("bash", ["-s"], {
     input: "consume() { cat >/dev/null; }\nconsume\nprintf 'TAIL_REACHED\\n'\n",

@@ -911,11 +911,15 @@
           "assertion": "OCR tunnel heartbeat exits on broken stdout and cleans every worker child"
         },
         {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-ocr-worker-smoke.sh",
+          "layer": "unit",
+          "path": "scripts/__tests__/v5OcrWorkerTunnel.test.ts",
           "assertion": "OCR worker tunnel stability drifted during smoke"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "SCNet 已由产品负责人明确关机，OCR 不再属于 V5 主版本上线验证；独立严格 smoke 及其 CI 单测保留，活体 OCR proof 待专门 OCR 环境恢复后执行。",
+        "since": "2026-08-07"
+      }
     },
     {
       "id": "INC-20260805-V5-IP-RETRY-TX",
@@ -954,11 +958,15 @@
           "assertion": "nested supervisor census SSH cannot consume the remaining remote smoke script"
         },
         {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-ocr-worker-smoke.sh",
+          "layer": "unit",
+          "path": "scripts/__tests__/v5OcrWorkerTunnel.test.ts",
           "assertion": "OCR worker ready: release="
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "SCNet 已由产品负责人明确关机，OCR 不再属于 V5 主版本上线验证；独立严格 smoke 及其 CI 单测保留，活体 OCR proof 待专门 OCR 环境恢复后执行。",
+        "since": "2026-08-07"
+      }
     },
     {
       "id": "INC-20260807-LIVE-PROCESS-LOSS",
