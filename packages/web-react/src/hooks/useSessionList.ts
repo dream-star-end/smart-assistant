@@ -3,7 +3,7 @@ import { ApiError, api } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
-import type { AuthSession, Session, SessionMeta, User } from "../lib/types";
+import type { AuthSession, DurableLiveFrame, Session, SessionMeta, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
 
 /** 历史重拉冷却（S2）：同会话此窗口内只拉一次；过后允许增量重拉（sinceSeq + server-wins 幂等）。*/
@@ -284,6 +284,65 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
           invalidateHistoryCache: detail._historyRevisionUnsupported === true,
         });
+        const liveSocket = cbRef.current.sockRef.current;
+        if (liveSocket) {
+          await liveSocket.runDurableLiveFrameHydration(id, async () => {
+            let liveCursor = "0";
+            let sawTapeProjection = false;
+            let streamClientMessageIds: string[] = [];
+            const stagedFrames: DurableLiveFrame[] = [];
+            for (;;) {
+              const page = await api.getSessionLiveFrames(
+                cbRef.current.authSession,
+                id,
+                liveCursor,
+                500,
+              );
+              sawTapeProjection ||= page.hasTapeProjection === true;
+              if (streamClientMessageIds.length === 0) {
+                streamClientMessageIds = page.streamClientMessageIds;
+              }
+              stagedFrames.push(...page.frames);
+              if (page.hasMore && !page.nextCursor) throw new Error("live frame page missing cursor");
+              if (page.nextCursor) liveCursor = page.nextCursor;
+              if (!page.hasMore) break;
+            }
+            liveSocket.applyDurableLiveFrames(id, stagedFrames, streamClientMessageIds);
+            for (;;) {
+              const page = await api.getSessionLiveFrames(
+                cbRef.current.authSession,
+                id,
+                liveCursor,
+                500,
+              );
+              sawTapeProjection ||= page.hasTapeProjection === true;
+              liveSocket.applyDurableLiveFrames(id, page.frames);
+              if (page.hasMore && !page.nextCursor) throw new Error("live frame page missing cursor");
+              if (page.nextCursor) liveCursor = page.nextCursor;
+              if (!page.hasMore) break;
+            }
+            if (sawTapeProjection) {
+              const tapeDetail = await api.getSession(cbRef.current.authSession, id, 0);
+              liveSocket.mergeServerHistory({
+                sessId: id,
+                agentId: tapeDetail.agentId || agentId,
+                messages: Array.isArray(tapeDetail.messages) ? tapeDetail.messages as ChatMessage[] : [],
+                full: !tapeDetail.isPartial,
+                maxSeq: tapeDetail.maxSeq,
+                archivedThroughSeq: tapeDetail.archivedThroughSeq,
+                archivedCount: tapeDetail.archivedCount,
+                serverUpdatedAt: tapeDetail.updatedAt,
+                modelId: tapeDetail.modelId,
+                historyRevision: tapeDetail.historyRevision,
+                timelineGeneration: tapeDetail.timelineGeneration,
+                timelineCursor: tapeDetail.timelineCursor,
+                timelineHasMore: tapeDetail.timelineHasMore,
+                timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
+                invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+              });
+            }
+          });
+        }
         // 会话级模型选择的侧栏回填:detail 比 boot 时的 listSessions 新(他设备刚改过),
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地
         // (服务端 NULL 只表示"从未显式选择",不存在"清除"流,缺席=不表态)。

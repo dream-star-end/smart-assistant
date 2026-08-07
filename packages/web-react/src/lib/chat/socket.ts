@@ -125,7 +125,7 @@ import {
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from "@openclaude/protocol";
-import type { RefreshOutcome } from "../types";
+import type { DurableLiveFrame, RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
 
@@ -511,6 +511,11 @@ export class ChatSocket {
   // ── 对账（S1：切回前台 / 重连成功 → REST syncSession 追回静默丢失）──
   /** 同会话对账去抖戳（SYNC_DEBOUNCE_MS 内至多一次）。*/
   private readonly lastSyncAt = new Map<string, number>();
+  /** REST live-journal hydration is serialized per session. Stamped WS frames
+   * are held until the immutable snapshot has rebuilt the process rows, then
+   * released through the same frameSeq reducer so REST/WS overlap is exact. */
+  private readonly durableHydrationStates = new Map<string, { buffered: OutboundWire[] }>();
+  private readonly durableHydrationTails = new Map<string, Promise<void>>();
   /** Exact active-turn candidate sets already attempted on the current WS.
    * History can arrive after the initial shell hello; each new candidate set
    * gets one targeted registration hello, then waits for a reconnect before
@@ -1314,6 +1319,7 @@ export class ChatSocket {
         }
         return;
       }
+      if (this.bufferStampedFrameDuringDurableHydration(f)) return;
       try {
         this.dispatch(f);
       } catch {
@@ -1630,6 +1636,29 @@ export class ChatSocket {
     }
   }
 
+  private bufferStampedFrameDuringDurableHydration(f: OutboundWire): boolean {
+    const frame = f as OutboundWire & {
+      peer?: { id?: unknown };
+      sessionKey?: unknown;
+      frameSeq?: unknown;
+    };
+    const sessId = frame.peer && typeof frame.peer === "object" &&
+      typeof frame.peer.id === "string"
+      ? frame.peer.id
+      : null;
+    if (
+      sessId === null ||
+      typeof frame.sessionKey !== "string" ||
+      typeof frame.frameSeq !== "number" ||
+      !Number.isSafeInteger(frame.frameSeq) ||
+      frame.frameSeq <= 0
+    ) return false;
+    const state = this.durableHydrationStates.get(sessId);
+    if (!state) return false;
+    state.buffered.push(f);
+    return true;
+  }
+
   /** Reconcile a server-confirmed duplicate without touching another queued
    * or newer turn on the same peer. Returns false for legacy/unscoped ACKs. */
   private reconcileDeduplicatedTurn(frame: AckWire): boolean {
@@ -1660,12 +1689,24 @@ export class ChatSocket {
     if (!sessId || !clientMessageId) return false;
     const sess = this.sessions.get(sessId);
     if (!sess) return false;
+    const sourceClientMessageId = isClientMessageId(frame.sourceClientMessageId)
+      ? frame.sourceClientMessageId
+      : undefined;
+    if (sourceClientMessageId) {
+      sess._automaticRecoveryDecisions = {
+        ...(sess._automaticRecoveryDecisions ?? {}),
+        [sourceClientMessageId]: true,
+      };
+    }
     const userIndex = sess.messages.findIndex((message) =>
       message.role === "user" &&
       message.id === clientMessageId &&
       message._isAutoRetry === true &&
       !!message._recoveryOfClientMessageId);
-    if (userIndex < 0) return false;
+    if (userIndex < 0) {
+      this.deps.persistSession?.(sessId);
+      return sourceClientMessageId !== undefined;
+    }
     this.finishDispatch(sessId, clientMessageId);
     if (sess._activeClientMessageId === clientMessageId) {
       this.clearSendingState(sess, { clearThinking: true, persist: false });
@@ -2125,6 +2166,9 @@ export class ChatSocket {
       ...(s._cancelledAutomaticRecoveryIds
         ? { _cancelledAutomaticRecoveryIds: { ...s._cancelledAutomaticRecoveryIds } }
         : {}),
+      ...(s._automaticRecoveryDecisions
+        ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }
+        : {}),
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
@@ -2215,6 +2259,11 @@ export class ChatSocket {
       stored._cancelledAutomaticRecoveryIds &&
       typeof stored._cancelledAutomaticRecoveryIds === "object"
         ? { ...stored._cancelledAutomaticRecoveryIds }
+        : undefined;
+    s._automaticRecoveryDecisions =
+      stored._automaticRecoveryDecisions &&
+      typeof stored._automaticRecoveryDecisions === "object"
+        ? { ...stored._automaticRecoveryDecisions }
         : undefined;
     s._trackerResetAt = typeof stored._trackerResetAt === "number" ? stored._trackerResetAt : undefined;
     s._trackerResetServerTs =
@@ -2435,7 +2484,11 @@ export class ChatSocket {
       !!message._errorCode &&
       (message._source === "server" || !!message._turnTapeId) &&
       supportsAutomaticTurnRecovery(message._errorCode));
-    if (tailRecoverableError) {
+    const recoveryDecisionKey = tailRecoverableError?._clientMessageId ?? "tail";
+    if (
+      tailRecoverableError &&
+      s._automaticRecoveryDecisions?.[recoveryDecisionKey] !== true
+    ) {
       setTimeout(
         () => void this.autoRecoverTerminalTurn(
           s.id,
@@ -2454,6 +2507,96 @@ export class ChatSocket {
     }
   }
 
+  /** Serialize one session's REST journal rebuild and hold overlapping stamped
+   * WS frames. The caller may page/fetch freely inside `hydrate`; the finally
+   * path always releases live frames through the ordinary frameSeq reducer. */
+  runDurableLiveFrameHydration(sessId: string, hydrate: () => Promise<void>): Promise<void> {
+    const previous = this.durableHydrationTails.get(sessId) ?? Promise.resolve();
+    const run = previous.catch(() => { /* a failed older read must not wedge later sync */ }).then(async () => {
+      const state = { buffered: [] as OutboundWire[] };
+      this.durableHydrationStates.set(sessId, state);
+      try {
+        await hydrate();
+      } finally {
+        if (this.durableHydrationStates.get(sessId) === state) {
+          this.durableHydrationStates.delete(sessId);
+        }
+        // Synchronous drain: browser WS callbacks cannot interleave between
+        // deleting the hold and replaying this already ordered buffer.
+        for (const frame of state.buffered) {
+          try { this.dispatch(frame); } catch { /* match live dispatch isolation */ }
+        }
+        if (state.buffered.length > 0) this.scheduleNotify();
+      }
+    });
+    let tracked!: Promise<void>;
+    tracked = run.finally(() => {
+      if (this.durableHydrationTails.get(sessId) === tracked) {
+        this.durableHydrationTails.delete(sessId);
+      }
+    });
+    this.durableHydrationTails.set(sessId, tracked);
+    return tracked;
+  }
+
+  /**
+   * Rebuild one abnormal/open turn from the exact master-side frame journal.
+   * The first call clears only client-owned rows for the listed turn owners,
+   * resets the affected stream cursors, then replays immutable frames through
+   * the same frameSeq reducer used by WS. Later pages/confirmations therefore
+   * deduplicate exactly against any buffered live delivery.
+   */
+  applyDurableLiveFrames(
+    sessId: string,
+    frames: DurableLiveFrame[],
+    resetClientMessageIds: string[] = [],
+  ): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    if (resetClientMessageIds.length > 0) {
+      const resetSessionKeys = new Set<string>();
+      for (const record of frames) {
+        const payload = record.payload;
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+        const sessionKey = (payload as { sessionKey?: unknown }).sessionKey;
+        if (typeof sessionKey === "string") resetSessionKeys.add(sessionKey);
+      }
+      for (const sessionKey of resetSessionKeys) {
+        resetFrameSeqCursor(sess, { sessionKey });
+      }
+      const owners = new Set(resetClientMessageIds);
+      sess.messages = sess.messages.filter((message) => {
+        if (message.role === "user") return true;
+        if (message._source === "server" || !!message._turnTapeId) return true;
+        return !(
+          (typeof message._turnOwnerId === "string" && owners.has(message._turnOwnerId)) ||
+          (typeof message._clientMessageId === "string" && owners.has(message._clientMessageId))
+        );
+      });
+      sess._streamingAssistant = null;
+      sess._streamingThinking = null;
+      sess._blockIdToMsgId = new Map();
+      sess._agentGroups = new Map();
+      rebuildIndexes(sess);
+    }
+    for (const record of frames) {
+      if (!record.payload || typeof record.payload !== "object" || Array.isArray(record.payload)) continue;
+      const raw = record.payload as Record<string, unknown>;
+      const peer = raw.peer;
+      if (
+        !peer || typeof peer !== "object" || Array.isArray(peer) ||
+        (peer as { id?: unknown }).id !== sessId
+      ) continue;
+      this.dispatch(raw as unknown as OutboundWire);
+    }
+    rebuildIndexes(sess);
+    normalizeDelegateCards(sess);
+    normalizeGoalCards(sess);
+    sess.messages = repairPostFinalProcessOrder(sess.messages);
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+  }
+
   /**
    * 终态收敛(RFC §5 M5):REST 对账载荷自证「已收尾 turn」时,显式落 user 行终态并清发送态。
    * 覆盖 durable dispatch 下真 final 帧永不到达的丢 turn场景(verified status / 静默收尾),
@@ -2469,7 +2612,9 @@ export class ChatSocket {
         if (kind === "completed") {
           userRow.status = "replied";
         } else if (userRow.status !== "replied") {
-          userRow.status = "error";
+          // This row was durably admitted.  A runtime interruption belongs on
+          // the turn status card, never on the user's transport state.
+          userRow.status = "sent";
         }
       }
       if (s._sendingInFlight && s._activeClientMessageId === cmid) {
@@ -2998,6 +3143,8 @@ export class ChatSocket {
     clientMessageId?: string,
   ): Promise<void> {
     const pendingKey = `${sessId}\0${clientMessageId ?? "tail"}`;
+    const beforeSync = this.sessions.get(sessId);
+    if (beforeSync?._automaticRecoveryDecisions?.[clientMessageId ?? "tail"] === true) return;
     if (this.automaticRecoveryPending.has(pendingKey)) return;
     this.automaticRecoveryPending.add(pendingKey);
     try {
@@ -3015,6 +3162,12 @@ export class ChatSocket {
       const target = automaticTurnRecoveryTarget(sess.messages, error, sess.id);
       if (!target) return;
       if (sess._cancelledAutomaticRecoveryIds?.[target.user.id] === true) return;
+      if (sess._automaticRecoveryDecisions?.[target.user.id] === true) return;
+      sess._automaticRecoveryDecisions = {
+        ...(sess._automaticRecoveryDecisions ?? {}),
+        [target.user.id]: true,
+      };
+      this.deps.persistSession?.(sess.id);
       this.dispatchTurnRecovery(
         sess,
         target,

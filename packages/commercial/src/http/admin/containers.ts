@@ -34,6 +34,7 @@ import {
   adminContainerLogs,
   LOGS_MAX_LINES,
   ContainerNotFoundError,
+  V3ContainerBusyError,
   V3SupervisorMissingError,
   type AdminContainerRowView,
 } from "../../admin/containers.js";
@@ -278,6 +279,9 @@ export async function handleAdminAgentContainerAction(
     // 缺失 / 启动跳过)→ 503,告诉 admin 配置缺,而不是 dockerode 抛 "No such container: undefined"。
     if (err instanceof V3SupervisorMissingError) {
       throw new HttpError(503, "V3_SUPERVISOR_NOT_READY", err.message);
+    }
+    if (err instanceof V3ContainerBusyError) {
+      throw new HttpError(409, "V3_CONTAINER_BUSY", err.message);
     }
     // R2 finding 加固:v3 已 DB 翻 vanished 但 docker 清理失败 → 502 + 明确文案。
     // admin UI 拿到 V3_CLEANUP_PARTIAL 知道 row 已 vanished,容器残骸 reconciler

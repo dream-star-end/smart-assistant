@@ -60,6 +60,7 @@ import type {
   RegisterResult,
   SessionArchivePage,
   SessionDetail,
+  DurableLiveFramePage,
   SessionMeta,
   SessionTimelinePage,
   TapeRecordPayload,
@@ -1635,6 +1636,25 @@ export const api = {
         ? { ...detail, _historyRevisionUnsupported: true as const }
         : detail;
     });
+  },
+
+  /** Cursor-paged exact runtime frames persisted before their original WS
+   * delivery.  Callers keep paging until hasMore=false; there is no total cap. */
+  getSessionLiveFrames: (
+    a: AuthSession,
+    id: string,
+    after = "0",
+    limit = 200,
+  ): Promise<DurableLiveFramePage> => {
+    const params = new URLSearchParams({ after, limit: String(limit) });
+    return jsonOrThrow<DurableLiveFramePage>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/live-frames?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
   },
 
   getSessionGoal: (a: AuthSession, id: string): Promise<GoalStateSnapshot | null> =>

@@ -329,6 +329,22 @@ export type SessionDetail = {
   archivedThroughSeq?: number;
 };
 
+export type DurableLiveFrame = {
+  recordId: string;
+  streamKey: string;
+  source: "gateway" | "rollout_import";
+  clientMessageId: string | null;
+  payload: unknown;
+};
+
+export type DurableLiveFramePage = {
+  frames: DurableLiveFrame[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  streamClientMessageIds: string[];
+  hasTapeProjection: boolean;
+};
+
 /** GET /api/sessions/:id/timeline — one exact chronological page containing
  * user, thinking, tool, agent-group and assistant records at equal rank. */
 export type SessionTimelinePage = {

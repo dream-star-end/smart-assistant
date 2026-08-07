@@ -3444,6 +3444,162 @@ describe("ChatSocket interrupted continuation", () => {
     sockets.forEach((sock) => sock.stop());
   });
 
+  test("durable live-frame pages rebuild the exact interrupted process without deleting user or tape rows", () => {
+    const persisted: string[] = [];
+    const sock = makeSocket({ persistSession: (id) => persisted.push(id) });
+    const session = sock.ensureSession("s-live-restore", "main");
+    session.messages.push(
+      {
+        id: "cm-live-restore",
+        role: "user",
+        text: "long task",
+        ts: 1,
+        status: "sent",
+        _source: "server",
+      },
+      {
+        id: "stale-client-thinking",
+        role: "thinking",
+        text: "stale projection",
+        ts: 2,
+        _turnOwnerId: "cm-live-restore",
+      },
+      {
+        id: "server-error",
+        role: "assistant",
+        text: "",
+        ts: 9,
+        _source: "server",
+        _turnTapeId: "tape-crashed",
+        _clientMessageId: "cm-live-restore",
+        _errorCode: "service_restart",
+      },
+    );
+    const record = (recordId: string, frameSeq: number, blocks: unknown[]) => ({
+      recordId,
+      streamKey: "dispatch:11111111-1111-4111-8111-111111111111:1",
+      source: "gateway" as const,
+      clientMessageId: "cm-live-restore",
+      payload: {
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s-live-restore",
+        frameSeq,
+        peer: { id: "s-live-restore", kind: "dm" },
+        clientMessageId: "cm-live-restore",
+        blocks,
+        isFinal: false,
+        ts: frameSeq + 10,
+      },
+    });
+
+    sock.applyDurableLiveFrames(
+      "s-live-restore",
+      [record("1", 1, [{ kind: "thinking", text: "exact thought" }])],
+      ["cm-live-restore"],
+    );
+    sock.applyDurableLiveFrames(
+      "s-live-restore",
+      [
+        record("2", 2, [{
+          kind: "tool_use",
+          blockId: "call-1",
+          toolName: "exec_command",
+          inputJson: { cmd: "echo exact" },
+          partial: false,
+        }]),
+        record("3", 3, [{
+          kind: "tool_result",
+          blockId: "result-call-1",
+          toolUseBlockId: "call-1",
+          toolName: "exec_command",
+          isError: false,
+          output: "exact output",
+        }]),
+        record("4", 4, [{ kind: "text", text: "exact partial answer" }]),
+      ],
+    );
+
+    expect(session.messages.find((message) => message.id === "stale-client-thinking")).toBeUndefined();
+    expect(session.messages.find((message) => message.id === "cm-live-restore")?.text).toBe("long task");
+    expect(session.messages.find((message) => message.id === "server-error")?._turnTapeId).toBe("tape-crashed");
+    expect(session.messages.some((message) => message.role === "thinking" && message.text === "exact thought")).toBe(true);
+    expect(session.messages.some((message) => message.role === "tool" && message.output === "exact output")).toBe(true);
+    expect(session.messages.some((message) => message.role === "assistant" && message.text === "exact partial answer")).toBe(true);
+    expect(persisted).toEqual(["s-live-restore", "s-live-restore"]);
+    sock.stop();
+  });
+
+  test("journal page1 → overlapping WS frame → page2 applies thinking/tool/text exactly once", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const sessId = "s-live-overlap";
+    const clientMessageId = "cm-live-overlap";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({
+      id: clientMessageId,
+      role: "user",
+      text: "long task",
+      ts: 1,
+      status: "sent",
+    });
+    session._lastFrameSeqByKey = { [sessionKey]: 99 };
+    session._lastFrameSeq = 99;
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    const payload = (frameSeq: number, blocks: unknown[]) => ({
+      type: "outbound.message",
+      sessionKey,
+      frameSeq,
+      peer: { id: sessId, kind: "dm" },
+      clientMessageId,
+      blocks,
+      isFinal: false,
+      ts: frameSeq + 10,
+    });
+    const record = (recordId: string, frameSeq: number, blocks: unknown[]) => ({
+      recordId,
+      streamKey: "dispatch:22222222-2222-4222-8222-222222222222:1",
+      source: "gateway" as const,
+      clientMessageId,
+      payload: payload(frameSeq, blocks),
+    });
+    const overlapBlocks = [
+      {
+        kind: "tool_use",
+        blockId: "call-overlap",
+        toolName: "exec_command",
+        inputJson: { cmd: "echo once" },
+        partial: false,
+      },
+      {
+        kind: "tool_result",
+        blockId: "result-call-overlap",
+        toolUseBlockId: "call-overlap",
+        toolName: "exec_command",
+        isError: false,
+        output: "tool output once",
+      },
+      { kind: "text", text: "answer once" },
+    ];
+
+    await sock.runDurableLiveFrameHydration(sessId, async () => {
+      const page1 = record("1", 1, [{ kind: "thinking", text: "thought once" }]);
+      // This live frame is committed after page1 and will also be returned by page2.
+      ws.onmessage?.({ data: JSON.stringify(payload(2, overlapBlocks)) } as MessageEvent);
+      const page2 = record("2", 2, overlapBlocks);
+      sock.applyDurableLiveFrames(sessId, [page1, page2], [clientMessageId]);
+    });
+
+    expect(session.messages.filter((m) => m.role === "thinking" && m.text === "thought once")).toHaveLength(1);
+    expect(session.messages.filter((m) => m.role === "tool" && m.output === "tool output once")).toHaveLength(1);
+    expect(session.messages.filter((m) => m.role === "assistant" && m.text === "answer once")).toHaveLength(1);
+    expect(session._lastFrameSeqByKey?.[sessionKey]).toBe(2);
+    sock.stop();
+  });
+
   test("automatic checkpoint keeps the exact old tape and skipped ACK removes only its optimistic child", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket({ syncSession: async () => {} });
@@ -3522,6 +3678,8 @@ describe("ChatSocket interrupted continuation", () => {
       data: JSON.stringify({
         type: "outbound.ack",
         recoverySkipped: true,
+        recoverySkippedReason: "source_not_latest",
+        sourceClientMessageId: "u-auto-checkpoint",
         peer: { id: "s-auto-checkpoint", kind: "dm" },
         clientMessageId: recovery.id,
       }),
@@ -3552,6 +3710,7 @@ describe("ChatSocket interrupted continuation", () => {
     await Promise.resolve();
     expect(sentRecoveries()).toBe(1);
     expect(sock.toStored("s-auto-checkpoint")?.messages[0]._automaticRecoveryAttempted).toBe(true);
+    expect(sock.toStored("s-auto-checkpoint")?._automaticRecoveryDecisions?.["u-auto-checkpoint"]).toBe(true);
     sock.stop();
   });
 

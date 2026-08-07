@@ -75,6 +75,7 @@ async function startRig(opts: {
   loadMasterSessionMessages?: UserChatBridgeDeps["loadMasterSessionMessages"];
   loadGoalState?: UserChatBridgeDeps["loadGoalState"];
   persistMasterUserMessage?: UserChatBridgeDeps["persistMasterUserMessage"];
+  persistOutboundFrame?: UserChatBridgeDeps["persistOutboundFrame"];
   loadSessionWorkspaceMode?: UserChatBridgeDeps["loadSessionWorkspaceMode"];
   logger?: Logger;
   getFrontendBuildId?: () => string | null;
@@ -113,6 +114,7 @@ async function startRig(opts: {
     loadMasterSessionMessages: opts.loadMasterSessionMessages,
     loadGoalState: opts.loadGoalState,
     persistMasterUserMessage: opts.persistMasterUserMessage,
+    persistOutboundFrame: opts.persistOutboundFrame,
     loadSessionWorkspaceMode: opts.loadSessionWorkspaceMode,
     logger: opts.logger,
     getFrontendBuildId: opts.getFrontendBuildId,
@@ -476,6 +478,120 @@ describe("userChatBridge — happy path", () => {
     containerWs.close(1000, "agent done");
     const close = await closeP;
     assert.equal(close.code, 1000);
+  });
+});
+
+describe("userChatBridge — durable outbound frame ordering", () => {
+  test("commits exact stamped frames serially before either becomes browser-visible", async () => {
+    const persisted: Array<Parameters<NonNullable<UserChatBridgeDeps["persistOutboundFrame"]>>[0]> = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 77 }),
+      persistOutboundFrame: async (input) => {
+        persisted.push(input);
+        if (input.frameSeq === 1) await firstGate;
+      },
+    });
+    portRef.value = rig.containerPort;
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("701"));
+      await new Promise<void>((resolve) => ws.once("open", resolve));
+      const containerWs = await containerOpen;
+      const business: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        try {
+          const frame = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof frame.type === "string" && !frame.type.startsWith("sys.")) business.push(frame);
+        } catch { /* irrelevant */ }
+      });
+      const first = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-durable",
+        frameSeq: 1,
+        peer: { id: "sess-durable", kind: "dm" },
+        clientMessageId: "cm-durable",
+        blocks: [{ kind: "text", text: "one" }],
+      });
+      const second = JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:sess-durable",
+        frameSeq: 2,
+        peer: { id: "sess-durable", kind: "dm" },
+        clientMessageId: "cm-durable",
+        blocks: [{ kind: "text", text: "two" }],
+      });
+      containerWs.send(first);
+      containerWs.send(second);
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      assert.deepEqual(persisted.map((input) => input.frameSeq), [1]);
+      assert.equal(business.length, 0);
+
+      releaseFirst();
+      await waitFor(() => business.length === 2);
+      assert.deepEqual(persisted.map((input) => input.frameSeq), [1, 2]);
+      assert.equal(persisted[0]!.payload, first);
+      assert.equal(persisted[1]!.payload, second);
+      assert.deepEqual(business.map((frame) => frame.frameSeq), [1, 2]);
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("a failed commit is never shown and the exact container replay can heal it", async () => {
+    let attempts = 0;
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 78 }),
+      persistOutboundFrame: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("db unavailable");
+      },
+    });
+    portRef.value = rig.containerPort;
+    const frame = JSON.stringify({
+      type: "outbound.message",
+      sessionKey: "agent:main:webchat:dm:sess-replay-heal",
+      frameSeq: 9,
+      peer: { id: "sess-replay-heal", kind: "dm" },
+      clientMessageId: "cm-replay-heal",
+      blocks: [{ kind: "text", text: "kept" }],
+    });
+    try {
+      const firstContainerOpen = waitNextContainerSocket(rig);
+      const ws1 = openClient(rig.gatewayPort, await makeJwt("702"));
+      await new Promise<void>((resolve) => ws1.once("open", resolve));
+      const firstContainer = await firstContainerOpen;
+      const firstBusiness: Record<string, unknown>[] = [];
+      ws1.on("message", (data) => {
+        try {
+          const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
+          if (typeof parsed.type === "string" && !parsed.type.startsWith("sys.")) firstBusiness.push(parsed);
+        } catch { /* irrelevant */ }
+      });
+      const firstClose = waitClose(ws1);
+      firstContainer.send(frame);
+      assert.equal((await firstClose).code, CLOSE_BRIDGE.INTERNAL);
+      assert.deepEqual(firstBusiness, []);
+
+      const secondContainerOpen = waitNextContainerSocket(rig);
+      const ws2 = openClient(rig.gatewayPort, await makeJwt("702"));
+      await new Promise<void>((resolve) => ws2.once("open", resolve));
+      const secondContainer = await secondContainerOpen;
+      const frames = frameCollector(ws2);
+      secondContainer.send(frame);
+      const visible = await nextBusinessFrame(frames);
+      assert.equal(visible.frameSeq, 9);
+      assert.equal(attempts, 2);
+      ws2.close();
+      await waitClose(ws2);
+    } finally {
+      await stopRig(rig);
+    }
   });
 });
 

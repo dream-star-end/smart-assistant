@@ -560,6 +560,9 @@ export type ChatSession = {
   /** Persistent fence for automatic continuation/recovery lineages stopped by
    * the user.  Server history sync must not erase this browser-owned intent. */
   _cancelledAutomaticRecoveryIds?: Record<string, true>;
+  /** One durable decision per recovery source/lineage.  Unlike a field on the
+   * user row, server-wins history replacement cannot erase this fence. */
+  _automaticRecoveryDecisions?: Record<string, true>;
   _isFirstTurnAfterReady?: boolean;
   _liveStreamBroken?: boolean;
 

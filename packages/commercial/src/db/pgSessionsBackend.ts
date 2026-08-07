@@ -130,6 +130,10 @@ import {
   casToTerminal,
   getDispatch,
 } from "../dispatch/turnDispatchStore.js";
+import {
+  readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
+  reconcileLiveStreamWithFinalTape,
+} from "./liveTurnFrames.js";
 
 // ── BIGINT codec(RFC D7)─────────────────────────────────────────────────────
 // node-postgres 默认把 int8/BIGINT 返回 string(避免 JS number 精度丢失)。这些列全是
@@ -6388,6 +6392,12 @@ export function createPgSessionsBackend(
           if (tape.dispatch_id !== null) {
             const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
             replayLate = convergence.lateTape;
+            await reconcileLiveStreamWithFinalTape(client, {
+              dispatchId: tape.dispatch_id,
+              status: tape.status,
+              tapeId: request.tapeId,
+              tapeSha256: request.tapeSha256,
+            });
             if (convergence.removedVisibleStatus) {
               // 直接状态读以 dispatch.status 为准。late tape 改成 manual_reconcile 后 bump
               // revision，在线客户端会立刻重读并移除旧失败状态。
@@ -6840,6 +6850,12 @@ export function createPgSessionsBackend(
         if (tape.dispatch_id !== null) {
           const convergence = await convergeDispatchOnFinalize(client, tape.dispatch_id, tape.status);
           dispatchLate = convergence.lateTape;
+          await reconcileLiveStreamWithFinalTape(client, {
+            dispatchId: tape.dispatch_id,
+            status: tape.status,
+            tapeId: request.tapeId,
+            tapeSha256: request.tapeSha256,
+          });
           if (convergence.removedVisibleStatus) {
             // 当前事务已持 session 锁；revision 让浏览器移除此前的 verified failure 状态。
             await client.query(
@@ -8108,6 +8124,21 @@ export function createPgSessionsBackend(
         });
       }
       return { messages: hydrated, hasMore, oldestSeq, historyRevision };
+    },
+
+    async readClientSessionLiveFrames(
+      sessionId: string,
+      userId: string,
+      afterRecordId = 0,
+      limit = 200,
+    ) {
+      return readDurableClientSessionLiveFrames(
+        pool,
+        sessionId,
+        userId,
+        afterRecordId,
+        limit,
+      );
     },
 
     async readClientTimelinePage(
