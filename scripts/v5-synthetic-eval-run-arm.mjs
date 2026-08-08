@@ -53,7 +53,9 @@ const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,80}$/;
 const PEER_ID_RE = /^[A-Za-z0-9_-]{8,160}$/;
 const CLIENT_MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const DEFAULT_TIMEOUT_SECONDS = 900;
-const MAX_TIMEOUT_SECONDS = 1_050;
+// One bounded capture may span the current 45-minute platform turn-lease TTL.
+// The runtime can renew that lease; this cap only bounds one unattended eval.
+const MAX_TIMEOUT_SECONDS = 2_700;
 const HELPER_TIMEOUT_MS = 180_000;
 // The turn timeout starts only after relay readiness. The helper also needs
 // 120s for readiness, 60s for post-final billing persistence, 10s for the

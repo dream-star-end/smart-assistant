@@ -134,9 +134,9 @@ export function readTurnInputs() {
   if (
     !Number.isSafeInteger(timeoutSeconds)
     || timeoutSeconds < 60
-    || timeoutSeconds > 1_050
+    || timeoutSeconds > 2_700
   ) {
-    throw new Error("OC_SYNTHETIC_EVAL_TIMEOUT_SECONDS must be 60..1050");
+    throw new Error("OC_SYNTHETIC_EVAL_TIMEOUT_SECONDS must be 60..2700");
   }
   const turnPath = absoluteNormalizedPath("OC_SYNTHETIC_EVAL_TURN_PATH");
   const framesPath = absoluteNormalizedPath("OC_SYNTHETIC_EVAL_FRAMES_PATH");
@@ -238,7 +238,7 @@ async function remoteTurn(encodedConfig, issueSyntheticUserAccessToken) {
     || !/^[0-9a-f]{64}$/.test(config.containerId ?? "")
     || !Number.isSafeInteger(config.timeoutSeconds)
     || config.timeoutSeconds < 60
-    || config.timeoutSeconds > 1_050
+    || config.timeoutSeconds > 2_700
   ) {
     throw new Error("remote synthetic turn identity is invalid");
   }
@@ -402,7 +402,7 @@ async function remoteTurn(encodedConfig, issueSyntheticUserAccessToken) {
     'const { createHash } = require("node:crypto");',
     'const [engine,sessionKey,containerId,timeoutText] = process.argv.slice(1);',
     'if(!["ccb","codex"].includes(engine)||!/^agent:[A-Za-z0-9_-]+:webchat:dm:[A-Za-z0-9_-]{8,160}$/.test(sessionKey)||!/^[0-9a-f]{64}$/.test(containerId)||!/^[1-9][0-9]*$/.test(timeoutText))throw new Error("invalid prompt watcher identity");',
-    'const timeoutMs=Number(timeoutText);if(!Number.isSafeInteger(timeoutMs)||timeoutMs<60000||timeoutMs>1050000)throw new Error("invalid prompt watcher timeout");',
+    'const timeoutMs=Number(timeoutText);if(!Number.isSafeInteger(timeoutMs)||timeoutMs<60000||timeoutMs>2700000)throw new Error("invalid prompt watcher timeout");',
     'const sha=(value)=>createHash("sha256").update(value).digest("hex");',
     'const sleepView=new Int32Array(new SharedArrayBuffer(4));',
     'const sleep=()=>Atomics.wait(sleepView,0,0,100);',

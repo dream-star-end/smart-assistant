@@ -382,9 +382,10 @@ export function shouldAttemptHistoricalContextInjection(opts: {
  *     GPT 5.5/Codex 高推理档在首个 reasoning/tool/text 事件前可能静默数分钟
  *     (尤其长文档/上下文整理),且当前 Codex app-server 没有 CCB 那样的
  *     `status=compacting` side-channel,所以按 TOOL 档保守放行。
- *   - DEFAULT_MS (5 min) — API stream / 普通 idle。子进程预期在持续吐 token
- *     或至少有 telemetry 事件刷 lastActivityAt;真静默 > 5 min 通常意味着
- *     deadlock 或 SDK 卡死,需要尽快 kill 释放 session lock。
+ *   - DEFAULT_MS (5 min) — 只保留给没有解析出 engine id 的 legacy 调用。
+ *     真实 CCB 静态模型在大 context / 高思考档的一次 API 请求中可能合法静默
+ *     超过 5 分钟；科研与编码实跑都复现了 5min 误杀。因此已解析的 CCB 与
+ *     Codex 一律走 TOOL_MS，仍由 15min idle watchdog 释放真死锁。
  *
  * 历史:pre-2026-04-19 这两个阈值是 30 / 60 min,过宽导致 deadlock 检测慢。
  * 2026-04-19 收紧到 15 / 5。本次(2026-05-25)发现 compacting 误归到 DEFAULT,
@@ -418,7 +419,12 @@ export function pickIdleTimeoutMs(
   const inNonStreamingPhase =
     currentTurnStatus === 'compacting' ||
     (typeof currentTurnStatus === 'object' && currentTurnStatus !== null)
-  if (pendingToolCalls > 0 || inNonStreamingPhase || engineId === 'codex') {
+  if (
+    pendingToolCalls > 0 ||
+    inNonStreamingPhase ||
+    engineId === 'ccb' ||
+    engineId === 'codex'
+  ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
   return IDLE_TIMEOUT_DEFAULT_MS
