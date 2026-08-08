@@ -1000,8 +1000,17 @@
       "occurredAt": "2026-08-07",
       "severity": "P1",
       "symptom": "历史 live-frame 中的终态错误在会话同步时被反复重放；用户 Stop 又被旧 wire 误归为 upstream_failed，导致浏览器循环上报 /api/client-errors、触发 429 与告警。",
-      "rootFixCommit": "788ecc51",
+      "rootFixCommit": "03adb5f1",
+      "coverageCommits": [
+        "788ecc51",
+        "6ac77ac1"
+      ],
       "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "browser Stop maps the real CCB Request was aborted result to USER_CANCELLED"
+        },
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
@@ -1016,6 +1025,11 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T32 durable error replay：用户 Stop 不上报，历史非尾错误不触发同步循环"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
+          "assertion": "用户主动停止是预期终态，不得上报 turn_error 产品故障信号"
         }
       ]
     }

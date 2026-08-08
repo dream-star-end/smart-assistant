@@ -4617,6 +4617,7 @@ export class SessionManager {
           detach()
           let persistenceAcknowledged = true
           let terminalErrorForClient: string | undefined
+          let terminalErrorCodeForClient: 'user_cancelled' | undefined
 
           // Detect stale --resume session id. CCB emits an error result with
           // `errors: ["No conversation found with session ID: <id>"]` when
@@ -4777,11 +4778,20 @@ export class SessionManager {
           // that diagnostic runtime event, but only a platform-owned waiver or
           // an engine-confirmed user cancellation may override the summary.
           // If Stop races a natural end_turn, completion remains authoritative.
+          // CCB confirms its cooperative AbortController path with this exact
+          // null-stop-reason result shape instead of stopReason='interrupted'.
+          const ccbUserCancellationResult =
+            session.providerTag === 'ccb' &&
+            result?.isError === true &&
+            result.stopReason === null &&
+            result.errorDetail?.includes('"subtype":"error_during_execution"') === true &&
+            result.errorDetail.includes('Error: Request was aborted.')
           const userCancellationOverride =
             requestedTerminal?.status === 'interrupted' &&
             requestedTerminal.errorCode === 'USER_CANCELLED' &&
             (
               result?.stopReason === 'interrupted' ||
+              ccbUserCancellationResult ||
               (
                 terminalRequestEscalated &&
                 result?.isError === true &&
@@ -5083,6 +5093,10 @@ export class SessionManager {
             if (completedHasError) {
               terminalErrorForClient =
                 terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
+              terminalErrorCodeForClient =
+                terminalOverride?.errorCode === 'USER_CANCELLED'
+                  ? 'user_cancelled'
+                  : undefined
             }
             if (
               MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
@@ -5264,6 +5278,7 @@ export class SessionManager {
                 kind: 'error',
                 error: terminalErrorForClient,
                 ...(preClassified ? { errorClass: preClassified } : {}),
+                ...(terminalErrorCodeForClient ? { errorCode: terminalErrorCodeForClient } : {}),
               })
             } else if (pendingFinal) {
               onEvent(pendingFinal)

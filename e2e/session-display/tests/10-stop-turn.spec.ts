@@ -51,6 +51,7 @@ function dispatchEvidence(userId: string, sid: string): {
   tapeErrorCodes: string;
   usageRows: number;
   usageTerminalCodes: string;
+  turnErrorFriction: number;
 } {
   const raw = queryScalar(`
     SELECT json_build_object(
@@ -87,7 +88,10 @@ function dispatchEvidence(userId: string, sid: string): {
                               ur.price_snapshot->>'codex_terminal_code',','),'')
                               FROM usage_records ur
                               JOIN turn_dispatches d ON d.dispatch_id=ur.dispatch_id
-                             WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)})
+                             WHERE d.user_id=${userId} AND d.session_id=${sqlText(sid)}),
+      'turnErrorFriction',(SELECT count(*) FROM product_friction_events e
+                            WHERE e.user_id=${userId} AND e.session_id=${sqlText(sid)}
+                              AND e.stage='turn_error')
     )::text
   `);
   const parsed = JSON.parse(raw) as {
@@ -100,6 +104,7 @@ function dispatchEvidence(userId: string, sid: string): {
     tapeErrorCodes: string;
     usageRows: number;
     usageTerminalCodes: string;
+    turnErrorFriction: number;
   };
   return parsed;
 }
@@ -209,6 +214,10 @@ test('停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活', a
     settled.usageRows,
     '一次被停止的 turn 至多结算一笔(≥2 = 停止后仍在继续计费)',
   ).toBeLessThanOrEqual(1);
+  expect(
+    settled.turnErrorFriction,
+    '用户主动停止是预期终态，不得上报 turn_error 产品故障信号',
+  ).toBe(0);
   if (cfg.model === 'gpt-5.6-luna' && settled.usageRows > 0) {
     if (settled.outcomes === 'interrupted') {
       expect(
@@ -229,6 +238,7 @@ test('停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活', a
     const now = dispatchEvidence(userId, sid);
     expect(now.usageRows, `停止后第 ${i + 1} 次取样计费行增长(仍在扣费)`).toBe(settled.usageRows);
     expect(now.dispatches, `停止后第 ${i + 1} 次取样 dispatch 增长(本轮被复活)`).toBe(settled.dispatches);
+    expect(now.turnErrorFriction, `停止后第 ${i + 1} 次取样上报了 turn_error`).toBe(0);
   }
 
   // ── 刷新后不自动重启本轮(Stop 围栏跨刷新持久) ──────────────────────────
@@ -240,6 +250,7 @@ test('停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活', a
   ).toHaveCount(0, { timeout: 5_000 });
   const afterReload = dispatchEvidence(userId, sid);
   expect(afterReload.dispatches, '刷新触发了新的 dispatch(停止轮次被自动重发)').toBe(settled.dispatches);
+  expect(afterReload.turnErrorFriction, '刷新重放不得把已停止轮次上报成 turn_error').toBe(0);
 
   // ── 可重来:原文保留 + composer 可再次发送 ──────────────────────────────
   await expect(

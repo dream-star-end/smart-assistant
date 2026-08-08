@@ -14654,24 +14654,10 @@ export class Gateway {
         // runner 已把错误预分类(errorClass)时优先用之,文案按码取(与
         // classifyRunError 同源);否则回落到对原始错误串做正则粗分类。
         // 'model_capacity' 是新增 wire code(容量满载),直接透传。
-        const preClass = e.errorClass
-        const cls =
-          preClass && preClass !== 'unknown'
-            ? { code: preClass, message: classifiedMessageForCode(preClass) }
-            : classifyRunError(e.error)
         // Always emit the structured error card.  Older clients still get
         // the compatibility `[error]` final below; modern clients suppress
         // that raw bubble and keep the technical string folded in `detail`.
-        const errFrame: OutboundError & { _userId?: string } = {
-          type: 'outbound.error',
-          ..._inheritOutboundRouting(out),
-          code: cls.code === 'unknown' ? 'upstream_failed' : cls.code,
-          message: cls.code === 'unknown'
-            ? '任务执行暂时中断，请直接重试本条消息'
-            : cls.message,
-          detail: e.error,
-          isFinal: false,
-        }
+        const errFrame = _buildEngineErrorFrame(_inheritOutboundRouting(out), e)
         this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
         if (liveWechatAdapter) {
           const errBlocks = [{ kind: 'text', text: `[error] ${e.error}` } as any]
@@ -15311,6 +15297,38 @@ export function _inheritOutboundRouting(
     ...(out.clientMessageId ? { clientMessageId: out.clientMessageId } : {}),
     ...(out._userId ? { _userId: out._userId } : {}),
     ...(out.traceId ? { traceId: out.traceId } : {}),
+  }
+}
+
+/** Build the exact structured error wire frame used by dispatchInbound. */
+export function _buildEngineErrorFrame(
+  routing: ReturnType<typeof _inheritOutboundRouting>,
+  event: Extract<SessionStreamEvent, { kind: 'error' }>,
+): OutboundError & { _userId?: string } {
+  if (event.errorCode === 'user_cancelled') {
+    return {
+      type: 'outbound.error',
+      ...routing,
+      code: 'user_cancelled',
+      message: event.error,
+      detail: event.error,
+      isFinal: false,
+    }
+  }
+  const preClass = event.errorClass
+  const classified =
+    preClass && preClass !== 'unknown'
+      ? { code: preClass, message: classifiedMessageForCode(preClass) }
+      : classifyRunError(event.error)
+  return {
+    type: 'outbound.error',
+    ...routing,
+    code: classified.code === 'unknown' ? 'upstream_failed' : classified.code,
+    message: classified.code === 'unknown'
+      ? '任务执行暂时中断，请直接重试本条消息'
+      : classified.message,
+    detail: event.error,
+    isFinal: false,
   }
 }
 
