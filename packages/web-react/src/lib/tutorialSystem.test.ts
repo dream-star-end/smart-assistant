@@ -7,6 +7,12 @@ import {
 } from "./productCapabilities";
 import { resolveTutorialAction } from "./tutorialActions";
 import {
+  TUTORIAL_CASES,
+  TUTORIAL_CASE_BY_ID,
+  TUTORIAL_CASE_IDS,
+  parseTutorialCaseId,
+} from "./tutorialCaseCatalog";
+import {
   TUTORIAL_MEDIA,
   TUTORIAL_TOPICS,
   tutorialById,
@@ -89,6 +95,52 @@ describe("v5 教程单一能力注册表", () => {
       enabled: false,
       disabledReason: expect.stringContaining("管理员"),
     });
+  });
+});
+
+describe("v5 真实场景案例注册表", () => {
+  it("固定提供科研 5、编码 5、通用 2 个稳定案例", () => {
+    expect(TUTORIAL_CASES).toHaveLength(12);
+    expect(TUTORIAL_CASE_IDS).toHaveLength(12);
+    expect(new Set(TUTORIAL_CASE_IDS).size).toBe(12);
+    expect(TUTORIAL_CASES.filter((item) => item.category === "research")).toHaveLength(5);
+    expect(TUTORIAL_CASES.filter((item) => item.category === "coding")).toHaveLength(5);
+    expect(TUTORIAL_CASES.filter((item) => item.category === "general")).toHaveLength(2);
+  });
+
+  it("每个案例包含来源、完整阶段、产物和确定性验收，未实跑时不伪造重放", () => {
+    for (const item of TUTORIAL_CASES) {
+      expect(TUTORIAL_CASE_BY_ID[item.id]).toBe(item);
+      expect(item.contentVersion).toBeGreaterThan(0);
+      expect(item.sources.length).toBeGreaterThan(0);
+      expect(item.inputMaterials.length).toBeGreaterThan(0);
+      expect(item.stages.length).toBeGreaterThanOrEqual(4);
+      expect(item.artifacts.length).toBeGreaterThan(0);
+      expect(item.checks.length).toBeGreaterThanOrEqual(2);
+      expect(item.starterPrompt.length).toBeGreaterThan(100);
+      for (const capabilityId of item.capabilityIds)
+        expect(capabilityById(capabilityId).id).toBe(capabilityId);
+      for (const source of item.sources) {
+        expect(source.url).toMatch(/^https:\/\//);
+        expect(source.license.trim()).not.toBe("");
+        expect(source.usageNote.trim()).not.toBe("");
+      }
+      for (const stage of item.stages) {
+        expect(stage.visibleProcess.length).toBeGreaterThan(0);
+        expect(stage.acceptance.length).toBeGreaterThan(0);
+      }
+      if (item.replay.status === "pending_capture") {
+        expect(item.replay.messagesPath).toBeUndefined();
+        expect(item.replay.provenance).toBeUndefined();
+        expect(item.replay.disclosure).toContain("尚未完成三次独立运行");
+      }
+    }
+  });
+
+  it("深链解析只接受登记过的稳定案例 id", () => {
+    expect(parseTutorialCaseId("research-bike-demand")).toBe("research-bike-demand");
+    expect(parseTutorialCaseId("removed-case")).toBeNull();
+    expect(parseTutorialCaseId(null)).toBeNull();
   });
 });
 

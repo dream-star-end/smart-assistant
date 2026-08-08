@@ -34,6 +34,10 @@ import {
   TUTORIAL_TOPICS,
   type TutorialMediaKey,
 } from "../packages/web-react/src/lib/tutorialCatalog.ts";
+import {
+  TUTORIAL_CASES,
+  TUTORIAL_CASE_IDS,
+} from "../packages/web-react/src/lib/tutorialCaseCatalog.ts";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const WEB_ROOT = join(ROOT, "packages/web-react");
@@ -485,6 +489,143 @@ function validateCatalog(markers: Marker[]): void {
     fail(`存在未被任何教程引用的媒体：${unusedMedia.join(", ")}`);
 }
 
+function validateCaseCatalog(): void {
+  if (TUTORIAL_CASES.length !== 12 || TUTORIAL_CASE_IDS.length !== 12)
+    fail("场景教程必须固定包含 12 个旗舰案例");
+  if (new Set(TUTORIAL_CASE_IDS).size !== TUTORIAL_CASE_IDS.length)
+    fail("场景教程稳定 ID 不得重复");
+
+  const expectedCounts = { research: 5, coding: 5, general: 2 } as const;
+  for (const [category, count] of Object.entries(expectedCounts)) {
+    const actual = TUTORIAL_CASES.filter(
+      (item) => item.category === category,
+    ).length;
+    if (actual !== count)
+      fail(`场景教程 ${category} 应有 ${count} 个，实际 ${actual} 个`);
+  }
+
+  const registeredIds = new Set<string>(TUTORIAL_CASE_IDS);
+  const seenIds = new Set<string>();
+  for (const item of TUTORIAL_CASES) {
+    if (!registeredIds.has(item.id) || seenIds.has(item.id))
+      fail(`${item.id}: 案例 ID 未登记或重复`);
+    seenIds.add(item.id);
+    if (!Number.isSafeInteger(item.contentVersion) || item.contentVersion < 1)
+      fail(`${item.id}: contentVersion 必须是正整数`);
+    if (
+      item.title.trim().length < 8 ||
+      item.summary.trim().length < 30 ||
+      item.outcome.trim().length < 20 ||
+      item.starterPrompt.trim().length < 100
+    ) {
+      fail(`${item.id}: 标题、摘要、结果或开工指令过于表面`);
+    }
+    if (
+      item.sources.length < 2 ||
+      item.inputMaterials.length < 1 ||
+      item.stages.length < 4 ||
+      item.artifacts.length < 1 ||
+      item.checks.length < 2
+    ) {
+      fail(`${item.id}: 缺少来源、输入、全流程、产物或确定性验收`);
+    }
+    for (const capabilityId of item.capabilityIds) {
+      if (!FEATURE_IDS.has(capabilityId))
+        fail(`${item.id}: 引用了未知产品能力 ${capabilityId}`);
+    }
+    const stageIds = new Set<string>();
+    for (const stage of item.stages) {
+      if (!stage.id.trim() || stageIds.has(stage.id))
+        fail(`${item.id}: 阶段 ID 为空或重复 ${stage.id}`);
+      stageIds.add(stage.id);
+      if (
+        !stage.input.trim() ||
+        !stage.operation.trim() ||
+        !stage.output.trim() ||
+        stage.visibleProcess.length < 2 ||
+        stage.acceptance.length < 2
+      ) {
+        fail(`${item.id}/${stage.id}: 未完整说明输入、操作、可见过程、输出与验收`);
+      }
+    }
+    for (const source of item.sources) {
+      let url: URL;
+      try {
+        url = new URL(source.url);
+      } catch {
+        fail(`${item.id}: 来源 URL 无效 ${source.url}`);
+      }
+      if (url.protocol !== "https:" || !url.hostname)
+        fail(`${item.id}: 来源必须使用 HTTPS ${source.url}`);
+      if (!source.license.trim() || !source.usageNote.trim())
+        fail(`${item.id}: 来源必须写明许可与使用边界 ${source.url}`);
+    }
+
+    if (item.replay.status === "pending_capture") {
+      if (
+        item.replay.messagesPath !== undefined ||
+        item.replay.provenance !== undefined ||
+        !item.replay.disclosure.includes("尚未完成三次独立运行")
+      ) {
+        fail(`${item.id}: 待采集案例不得携带或暗示真实回放`);
+      }
+      continue;
+    }
+
+    const { messagesPath, provenance, checkReport } = item.replay;
+    if (
+      !/^\/tutorials\/cases\/[a-z0-9-]+\/messages\.json$/.test(
+        messagesPath,
+      ) ||
+      !/^\/tutorials\/cases\/[a-z0-9-]+\/checks\.json$/.test(checkReport)
+    ) {
+      fail(`${item.id}: 已验证回放必须使用同源案例资产路径`);
+    }
+    if (
+      provenance.repeatRuns !== 3 ||
+      provenance.runIds.length !== 3 ||
+      new Set(provenance.runIds).size !== 3 ||
+      !/^[a-f0-9]{64}$/.test(provenance.inputSha256) ||
+      !/^[a-f0-9]{64}$/.test(provenance.messagesSha256) ||
+      provenance.messageCount < 2 ||
+      provenance.bytes < 2 ||
+      !Number.isFinite(Date.parse(provenance.capturedAt))
+    ) {
+      fail(`${item.id}: 已验证回放缺少三次运行或完整哈希/计数证据`);
+    }
+    const messagesFile = join(WEB_ROOT, "public", messagesPath);
+    const checksFile = join(WEB_ROOT, "public", checkReport);
+    if (!existsSync(messagesFile) || !existsSync(checksFile))
+      fail(`${item.id}: 已验证回放或检查报告文件不存在`);
+    const bytes = readFileSync(messagesFile);
+    if (
+      bytes.length !== provenance.bytes ||
+      sha256(bytes) !== provenance.messagesSha256
+    ) {
+      fail(`${item.id}: 公开回放字节与 provenance 不一致`);
+    }
+    let messages: unknown;
+    try {
+      messages = JSON.parse(bytes.toString("utf8"));
+    } catch {
+      fail(`${item.id}: 公开回放不是有效 JSON`);
+    }
+    const rows = Array.isArray(messages)
+      ? messages
+      : (messages as { messages?: unknown[] } | null)?.messages;
+    if (!Array.isArray(rows) || rows.length !== provenance.messageCount)
+      fail(`${item.id}: 公开回放消息计数与 provenance 不一致`);
+    const publicBytes = `${bytes.toString("utf8")}\n${readFileSync(checksFile, "utf8")}`;
+    if (
+      /claudeai\.chat|\/root\/|\/home\/agent\/|\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]{20,}\./i.test(
+        publicBytes,
+      )
+    ) {
+      fail(`${item.id}: 公开回放含生产域名、绝对私有路径或疑似凭据`);
+    }
+  }
+}
+
 function webPublicPath(urlPath: string): string {
   if (!urlPath.startsWith("/tutorials/"))
     fail(`教程媒体必须是本地 /tutorials/ 路径：${urlPath}`);
@@ -838,6 +979,7 @@ function validateCaptureProvenance(
 function buildSnapshot(): TutorialSnapshot {
   const markers = collectMarkers();
   validateCatalog(markers);
+  validateCaseCatalog();
   const media = collectMedia();
   validateCaptureProvenance(media);
   const capabilities: Record<string, CapabilitySnapshot> = {};
@@ -1285,7 +1427,7 @@ function main(): void {
     0,
   );
   console.log(
-    `check:tutorials OK · ${Object.keys(snapshot.capabilities).length} capabilities · ${Object.keys(snapshot.media).length} media pairs · ${totalBytes} B`,
+    `check:tutorials OK · ${Object.keys(snapshot.capabilities).length} capabilities · ${TUTORIAL_CASES.length} real-world cases · ${Object.keys(snapshot.media).length} media pairs · ${totalBytes} B`,
   );
 }
 

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
-import { parsePanelParam, parseTutorialTopic, withPanelParams } from './useAppRoute'
+import {
+  parsePanelParam,
+  parseTutorialCase,
+  parseTutorialTopic,
+  withPanelParams,
+} from './useAppRoute'
 
 describe('教程 URL 深链', () => {
   it('只接受稳定的 help topic id，未知值回退由 App 处理', () => {
@@ -26,8 +31,39 @@ describe('教程 URL 深链', () => {
     expect(settings.has('topic')).toBe(false)
   })
 
-  it('help 未给 topic 时规范化为默认入门教程', () => {
+  it('help 未给选择时保持案例总览，不再强制跳到功能教程', () => {
     const value = withPanelParams(new URLSearchParams(), 'help')
-    expect(value.get('topic')).toBe(PRODUCT_CAPABILITIES.chatBasics.id)
+    expect(value.get('panel')).toBe('help')
+    expect(value.has('topic')).toBe(false)
+    expect(value.has('case')).toBe(false)
+  })
+
+  it('案例深链只接受稳定 id，并与旧 topic 互斥且案例优先', () => {
+    const both = new URLSearchParams(
+      'campaign=summer&panel=help&topic=chat-basics&case=research-bike-demand',
+    )
+    expect(parseTutorialCase(both)).toBe('research-bike-demand')
+    expect(parseTutorialTopic(both)).toBeNull()
+    expect(
+      parseTutorialCase(new URLSearchParams('panel=help&case=unknown-case')),
+    ).toBeNull()
+
+    const caseLink = withPanelParams(
+      new URLSearchParams('campaign=summer&topic=chat-basics'),
+      'help',
+      null,
+      'coding-swe-bench-fix',
+    )
+    expect(caseLink.get('campaign')).toBe('summer')
+    expect(caseLink.get('case')).toBe('coding-swe-bench-fix')
+    expect(caseLink.has('topic')).toBe(false)
+
+    const legacy = withPanelParams(
+      caseLink,
+      'help',
+      PRODUCT_CAPABILITIES.github.id,
+    )
+    expect(legacy.get('topic')).toBe('github-repository')
+    expect(legacy.has('case')).toBe(false)
   })
 })
