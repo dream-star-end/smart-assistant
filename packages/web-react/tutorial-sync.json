@@ -208,6 +208,56 @@
       "sourceHash": "59e6f782afa60eec0b7a9a6ff1e95e693f81d9701ff79042445547a16a398f5a"
     }
   },
+  "cases": {
+    "coding-dependency-upgrade": {
+      "contentHash": "55eddfe4711266bd2b7d292e910b11c17a35ec812b9db1bf848b53d4039019d5",
+      "contentVersion": 1
+    },
+    "coding-feature-delivery": {
+      "contentHash": "b9b57f54b2eb0ae59ccab631fb4272500308c26b493a85741f9d3fc492f73f4c",
+      "contentVersion": 1
+    },
+    "coding-frontend-quality": {
+      "contentHash": "877d629372d31096857a69fbc365b784f24b4090151c231a904f6f9cf0fd5ce7",
+      "contentVersion": 1
+    },
+    "coding-regression-rescue": {
+      "contentHash": "82ed05a88ec35f6e65fcded64ce009cdbcc033f18555ef03286287100c87d5f1",
+      "contentVersion": 1
+    },
+    "coding-swe-bench-fix": {
+      "contentHash": "35c5f6f76802e8c2f63ceaf37069fb70f0944178870b600a8e6a2f2b916cca31",
+      "contentVersion": 1
+    },
+    "general-meeting-actions": {
+      "contentHash": "913f9ae77f5b0f527d054ab36bf694734f2889a6dfa68ed97bae7653d23a29ac",
+      "contentVersion": 1
+    },
+    "general-public-data-brief": {
+      "contentHash": "608d70c91a7d6bff46dd60d591708ad246f00463bfb03ea459d04e73e851619c",
+      "contentVersion": 1
+    },
+    "research-bike-demand": {
+      "contentHash": "8ccdb1766ff5c9e708c969123e81f2fd53b427d9748682792febb729e47399a4",
+      "contentVersion": 1
+    },
+    "research-evidence-map": {
+      "contentHash": "56c1ce01afc97712d09d15eee7b5f7e6d1c52cd0a3c13bbbbab84c538552c589",
+      "contentVersion": 1
+    },
+    "research-open-peer-review": {
+      "contentHash": "0cb4cd1b59bfcd9009bf56cedb218803e93659c369f373b89c0a2ab850410921",
+      "contentVersion": 1
+    },
+    "research-replication-audit": {
+      "contentHash": "2d8bda5bed3b794c50c6bea234572e471d7b8c60a7fe06a8ca9863b0e56463c4",
+      "contentVersion": 1
+    },
+    "research-systematic-screening": {
+      "contentHash": "7a58feea44b4ec8d11a4263435a61760d0a85a66d1da305da343cb979de13521",
+      "contentVersion": 1
+    }
+  },
   "catalogSchema": 2,
   "media": {
     "agents": {
