@@ -15,7 +15,17 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from server import Api, Handler
-from worker_common import claim_job, cleanup_expired, connect, ensure_count, init_db, mark_terminal
+from worker_common import (
+    claim_job,
+    cleanup_expired,
+    connect,
+    ensure_count,
+    init_db,
+    load_page_checkpoints,
+    mark_terminal,
+    mark_waiting,
+    publish_page_checkpoint,
+)
 
 
 TOKEN = "test-worker-token"
@@ -49,18 +59,21 @@ class WorkerTest(unittest.TestCase):
         conn.close()
         return response.status, response.headers, data
 
-    def submit(self, payload: bytes = b"fake-pdf") -> dict:
+    def submit(self, payload: bytes = b"fake-pdf", request_id: str | None = None) -> dict:
+        headers = {
+            "x-ocr-owner": OWNER,
+            "x-ocr-filename": "scan.pdf",
+            "x-ocr-mode": "hybrid",
+            "x-ocr-fallback": "0.10",
+            "content-length": str(len(payload)),
+        }
+        if request_id is not None:
+            headers["x-ocr-request-id"] = request_id
         status, _, data = self.request(
             "POST",
             "/v1/jobs",
             payload,
-            {
-                "x-ocr-owner": OWNER,
-                "x-ocr-filename": "scan.pdf",
-                "x-ocr-mode": "hybrid",
-                "x-ocr-fallback": "0.10",
-                "content-length": str(len(payload)),
-            },
+            headers,
         )
         self.assertEqual(status, 202, data)
         return json.loads(data)
@@ -91,8 +104,132 @@ class WorkerTest(unittest.TestCase):
         db = connect(self.api.db_path)
         rows = db.execute("SELECT id,status,pages_done FROM jobs ORDER BY created_at,id").fetchall()
         db.close()
-        self.assertEqual([row["status"] for row in rows], ["queued", "queued"])
+        self.assertEqual([row["status"] for row in rows], ["waiting", "waiting"])
         self.assertEqual([row["pages_done"] for row in rows], [0, 0])
+
+    def test_restart_preserves_cancel_and_converges_running_job_to_cancelled(self) -> None:
+        job = self.submit(b"cancel-me")
+        claimed = claim_job(self.api.db_path, 0)
+        self.assertEqual(claimed["id"], job["job_id"])
+        db = connect(self.api.db_path)
+        db.execute(
+            "UPDATE jobs SET cancel_requested=1,pages_done=3,phase='cancelling' WHERE id=?",
+            (job["job_id"],),
+        )
+        db.close()
+        init_db(self.api.db_path)
+        db = connect(self.api.db_path)
+        row = db.execute("SELECT * FROM jobs WHERE id=?", (job["job_id"],)).fetchone()
+        db.close()
+        self.assertEqual(row["status"], "cancelled")
+        self.assertEqual(row["phase"], "cancelled")
+        self.assertEqual(row["cancel_requested"], 1)
+        self.assertFalse((self.api.jobs / job["job_id"] / "source").exists())
+
+    def test_transient_waiting_retry_preserves_page_checkpoint_progress(self) -> None:
+        job = self.submit(b"retry-me")
+        claimed = claim_job(self.api.db_path, 0)
+        db = connect(self.api.db_path)
+        db.execute("UPDATE jobs SET pages_done=3 WHERE id=?", (job["job_id"],))
+        db.close()
+        mark_waiting(
+            self.api.db_path, self.api.jobs, job["job_id"],
+            "temporary socket failure", self.api.retention_s,
+        )
+        db = connect(self.api.db_path)
+        row = db.execute("SELECT * FROM jobs WHERE id=?", (job["job_id"],)).fetchone()
+        self.assertEqual(row["status"], "waiting")
+        self.assertEqual(row["pages_done"], 3)
+        db.execute("UPDATE jobs SET next_retry_at=0 WHERE id=?", (job["job_id"],))
+        db.close()
+        retried = claim_job(self.api.db_path, 1)
+        self.assertEqual(retried["id"], claimed["id"])
+        self.assertEqual(retried["pages_done"], 3)
+
+    def test_request_id_reuses_same_contract_and_rejects_drift(self) -> None:
+        first = self.submit(b"same-source", "stable.request.1")
+        self.api.owner_max_jobs = 1
+        replay = self.submit(b"same-source", "stable.request.1")
+        self.assertEqual(replay["job_id"], first["job_id"])
+        db = connect(self.api.db_path)
+        self.assertEqual(db.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"], 1)
+        db.close()
+        status, _, body = self.request(
+            "POST", "/v1/jobs", b"different-source",
+            {
+                "x-ocr-owner": OWNER,
+                "x-ocr-request-id": "stable.request.1",
+                "x-ocr-mode": "hybrid",
+                "x-ocr-fallback": "0.10",
+                "content-length": str(len(b"different-source")),
+            },
+        )
+        self.assertEqual(status, 409, body)
+
+    def test_page_checkpoint_recovers_only_durable_contiguous_prefix(self) -> None:
+        job_dir = self.root / "checkpoint-job"
+        job_dir.mkdir()
+        contract = "a" * 64
+        release, pipeline = "release-a", "c" * 64
+        publish_page_checkpoint(job_dir, contract, release, pipeline, 1, {"page": 1, "text": "one"}, "one")
+        publish_page_checkpoint(job_dir, contract, release, pipeline, 2, {"page": 2, "text": "two"}, "two")
+        entries = load_page_checkpoints(job_dir, contract, release, pipeline)
+        self.assertEqual([entry["page"] for entry in entries], [1, 2])
+        (job_dir / "pages" / "page-00000002.jsonl").write_text("corrupt")
+        entries = load_page_checkpoints(job_dir, contract, release, pipeline)
+        self.assertEqual([entry["page"] for entry in entries], [1])
+
+    def test_page_checkpoint_never_crosses_contract_digest(self) -> None:
+        job_dir = self.root / "checkpoint-contract-job"
+        job_dir.mkdir()
+        old_contract, new_contract = "a" * 64, "b" * 64
+        release, pipeline = "release-a", "c" * 64
+        publish_page_checkpoint(
+            job_dir, old_contract, release, pipeline, 1, {"page": 1, "text": "old"}, "old"
+        )
+        self.assertEqual(len(load_page_checkpoints(job_dir, old_contract, release, pipeline)), 1)
+        self.assertEqual(load_page_checkpoints(job_dir, new_contract, release, pipeline), [])
+        manifest = json.loads((job_dir / "page-manifest.json").read_text())
+        self.assertEqual(manifest["contract_digest"], new_contract)
+        self.assertFalse((job_dir / "pages").exists())
+
+    def test_page_checkpoint_never_crosses_worker_release_or_pipeline(self) -> None:
+        job_dir = self.root / "checkpoint-release-job"
+        job_dir.mkdir()
+        contract = "a" * 64
+        publish_page_checkpoint(
+            job_dir, contract, "release-a", "c" * 64,
+            1, {"page": 1, "text": "old"}, "old",
+        )
+        self.assertEqual(
+            load_page_checkpoints(job_dir, contract, "release-b", "d" * 64),
+            [],
+        )
+        manifest = json.loads((job_dir / "page-manifest.json").read_text())
+        self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["worker_release"], "release-b")
+        self.assertEqual(manifest["pipeline_digest"], "d" * 64)
+        self.assertFalse((job_dir / "pages").exists())
+
+    def test_cancel_wins_atomic_mark_waiting_race(self) -> None:
+        job = self.submit(b"cancel-during-retry")
+        claimed = claim_job(self.api.db_path, 0)
+        self.assertEqual(claimed["id"], job["job_id"])
+        db = connect(self.api.db_path)
+        db.execute(
+            "UPDATE jobs SET cancel_requested=1,phase='cancelling' WHERE id=?",
+            (job["job_id"],),
+        )
+        db.close()
+        mark_waiting(
+            self.api.db_path, self.api.jobs, job["job_id"],
+            "temporary socket failure", self.api.retention_s,
+        )
+        db = connect(self.api.db_path)
+        row = db.execute("SELECT status,phase FROM jobs WHERE id=?", (job["job_id"],)).fetchone()
+        db.close()
+        self.assertEqual((row["status"], row["phase"]), ("cancelled", "cancelled"))
+        self.assertFalse((self.api.jobs / job["job_id"] / "source").exists())
 
     def test_complete_result_is_streamed_without_truncation_then_expires(self) -> None:
         job = self.submit()
@@ -163,10 +300,20 @@ class WorkerTest(unittest.TestCase):
             """#!/bin/bash
 set -euo pipefail
 ready=""
+root=""
+script=${1:-}
 while [[ $# -gt 0 ]]; do
-  if [[ "$1" == --ready ]]; then ready=$2; shift 2; else shift; fi
+  if [[ "$1" == --ready ]]; then ready=$2; shift 2
+  elif [[ "$1" == --root ]]; then root=$2; shift 2
+  else shift
+  fi
 done
 if [[ -n "$ready" ]]; then mkdir -p "$(dirname "$ready")"; : >"$ready"; fi
+if [[ "$script" == *server.py && -n "$root" ]]; then
+  mkdir -p "$root/run"
+  printf '{"version":1,"release":"%s","pipeline_digest":"%064d"}\n' \
+    "$OC_OCR_WORKER_RELEASE" 0 >"$root/run/pipeline-contract.json"
+fi
 printf '%s\\n' "$$" >>"$FAKE_CHILD_PIDS"
 exec sleep 300
 """,
@@ -227,6 +374,39 @@ exec sleep 300
         source = (Path(__file__).resolve().parent / "host-tunnel.sh").read_text()
         self.assertIn('run-supervisor.sh\'" \\\n  >/dev/null', source)
         self.assertNotIn("2>/dev/null", source)
+
+    def test_release_staging_is_manifest_bound_and_activation_rejects_unstaged_candidate(self) -> None:
+        release = "a" * 40
+        worker_dir = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "release-root"
+            env = {**os.environ, "OC_OCR_RELEASE_ROOT": str(root)}
+            staged = subprocess.run(
+                ["bash", str(worker_dir / "stage-release.sh"), str(worker_dir), release],
+                env=env, check=True, capture_output=True, text=True,
+            )
+            self.assertEqual(staged.stdout.strip(), release)
+            candidate = root / "releases" / release
+            manifest = root / "manifests" / f"{release}.sha256"
+            self.assertTrue(candidate.is_dir())
+            self.assertTrue(manifest.is_file())
+            subprocess.run(
+                ["sha256sum", "-c", str(manifest)], cwd=candidate,
+                check=True, capture_output=True, text=True,
+            )
+
+            unstaged = "b" * 40
+            unstaged_dir = root / "releases" / unstaged
+            unstaged_dir.mkdir()
+            supervisor = unstaged_dir / "run-supervisor.sh"
+            supervisor.write_text("#!/bin/bash\n", encoding="utf-8")
+            supervisor.chmod(0o755)
+            rejected = subprocess.run(
+                ["bash", str(worker_dir / "activate-release.sh"), unstaged],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("missing OCR worker release manifest", rejected.stderr)
 
 
 if __name__ == "__main__":

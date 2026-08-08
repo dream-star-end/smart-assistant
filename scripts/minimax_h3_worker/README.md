@@ -10,6 +10,26 @@ PostgreSQL in OpenClaude V5 remains the queue authority. The worker only mirrors
 the currently fenced attempt, so reconnecting a tunnel never creates a second
 GPU process.
 
+## Versioned activation
+
+`install-service.sh` stages the exact Git commit with `git archive`, writes an
+external SHA-256 manifest, and makes the candidate read-only. Existing unsigned
+or modified release directories are rejected rather than trusted in place.
+The worker SQLite database and attempt artifacts stay in the shared
+`H3_WORKER_STATE` directory. Activate, inspect, or roll back only through:
+
+```bash
+scripts/minimax_h3_worker/activate-release.sh <release>
+scripts/minimax_h3_worker/activate-release.sh --status
+scripts/minimax_h3_worker/activate-release.sh --rollback
+```
+
+The script serializes mutations with `flock`, atomically switches `current` /
+`previous`, takes and integrity-checks an online `worker.sqlite` backup, proves
+the candidate can open/migrate a copy, restarts the unit, and verifies that
+authenticated health reports the exact candidate release. A failed verification
+restores the old symlink while retaining the recorded backup path.
+
 The listener defaults to loopback. Public binding is accepted only when
 `H3_WORKER_HOST=0.0.0.0` and `H3_WORKER_ALLOW_PUBLIC_BIND=1` are both set; use
 that mode only behind the SCNet HTTPS custom-service proxy. Bearer authentication

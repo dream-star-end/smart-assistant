@@ -38,6 +38,7 @@ import {
   queuePosition,
   regenerateShot,
   requestCancel,
+  rotateRecoverableAttempt,
   startProject,
   updateActiveJob,
   updateDraftProject,
@@ -657,7 +658,8 @@ export class MediaGenerationService {
       await markWorkerAcked(job.id, job.attemptId)
     } catch (error) {
       if (error instanceof MediaWorkerHttpError && error.status === 404) {
-        await markWorkerAcked(job.id, job.attemptId)
+        // A plain 404 does not prove the exact attempt tombstone was released;
+        // keep the durable ACK outbox pending for reconciliation.
         return
       }
       if (
@@ -672,8 +674,7 @@ export class MediaGenerationService {
         await this.worker.ack(job, signal)
         await markWorkerAcked(job.id, job.attemptId)
       } catch (cancelError) {
-        if (cancelError instanceof MediaWorkerHttpError && cancelError.status === 404)
-          await markWorkerAcked(job.id, job.attemptId)
+        if (cancelError instanceof MediaWorkerHttpError && cancelError.status === 404) return
       }
     }
   }
@@ -781,14 +782,16 @@ export class MediaGenerationService {
             canceled = await this.worker.cancel(job, signal)
           } catch (error) {
             if (error instanceof MediaWorkerHttpError && error.status === 404) {
-              await this.terminalizeJob(
-                job,
-                'canceled',
-                'user_canceled',
-                'canceled by user',
-                signal,
-              )
-              return
+              const unknown = await updateActiveJob(job.id, job.attemptId!, {
+                status: 'reconnecting',
+                phase: 'worker_cancel_state_unknown',
+              })
+              if (unknown) {
+                job = unknown
+                await this.emit(unknown)
+              }
+              await new Promise((resolve) => setTimeout(resolve, 3_000))
+              continue
             }
             throw error
           }
@@ -861,29 +864,101 @@ export class MediaGenerationService {
         if (updated) job = updated
         if (worker.status === 'completed') {
           const target = join(this.root, 'results', job.userId, `${job.id}.mp4`)
-          const result = await this.worker.download(job, target, signal)
-          const actual = await stat(target)
-          const digest = await sha256File(target)
-          if (actual.size !== result.size || digest !== result.sha256) {
-            await rm(target, { force: true })
-            throw new Error('downloaded_result_integrity_mismatch')
-          }
-          const completed = await completeJob(job, {
-            path: target,
-            sha256: digest,
-            size: actual.size,
-          })
-          if (!completed) return
-          await this.emit(completed)
           try {
-            await this.worker.ack(job, signal)
-            await markWorkerAcked(completed.id, completed.attemptId!)
-          } catch {
-            /* worker_ack_pending remains durable and the scheduler reconciles it */
+            const result = await this.worker.download(job, target, signal)
+            const actual = await stat(target)
+            const digest = await sha256File(target)
+            if (actual.size !== result.size || digest !== result.sha256) {
+              await rm(target, { force: true })
+              throw new Error('downloaded_result_integrity_mismatch')
+            }
+            const completed = await completeJob(job, {
+              path: target,
+              sha256: digest,
+              size: actual.size,
+            })
+            if (!completed) return
+            await this.emit(completed)
+            try {
+              await this.worker.ack(job, signal)
+              await markWorkerAcked(completed.id, completed.attemptId!)
+            } catch {
+              /* worker_ack_pending remains durable and the scheduler reconciles it */
+            }
+            return
+          } catch (error) {
+            // completeJob may have committed even if the client observed a
+            // connection failure. Reconcile before deleting the local result;
+            // a committed DB row is the sole authority that permits ACK.
+            let durable: MediaJobRow | null = null
+            try {
+              durable = await getJob(job.userId, job.id)
+            } catch {
+              mediaLogger.warn('could not reconcile media completion after persistence error', {
+                jobId: job.id,
+              })
+              await new Promise((resolve) => setTimeout(resolve, 1_000))
+              continue
+            }
+            if (durable?.status === 'completed') {
+              await this.emit(durable)
+              try {
+                await this.worker.ack(durable, signal)
+                await markWorkerAcked(durable.id, durable.attemptId!)
+              } catch {
+                /* durable ACK outbox will reconcile */
+              }
+              return
+            }
+            await rm(target, { force: true }).catch(() => {})
+            const pending = await updateActiveJob(job.id, job.attemptId!, {
+              status: 'reconnecting',
+              phase: 'result_pending',
+            })
+            if (pending) {
+              job = pending
+              await this.emit(pending)
+            }
+            mediaLogger.warn('worker result remains pending after local persistence failure', {
+              jobId: job.id,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            await new Promise((resolve) => setTimeout(resolve, 1_000))
+            continue
           }
-          return
         }
         if (worker.status === 'failed' || worker.status === 'canceled') {
+          if (
+            worker.status === 'failed' &&
+            worker.error_code === 'worker_lost' &&
+            worker.recovery_disposition === 'definitive_retry_safe' &&
+            Boolean(worker.cleanup_proven) &&
+            Boolean(job.requestDigest) &&
+            worker.request_digest === job.requestDigest &&
+            worker.attempt_id === job.attemptId &&
+            worker.fence_version === job.fenceVersion &&
+            typeof worker.origin_release === 'string' &&
+            worker.origin_release.length > 0
+          ) {
+            try {
+              await this.worker.ack(job, signal)
+              const rotated = await rotateRecoverableAttempt(job)
+              if (rotated) await this.emit(rotated)
+            } catch (error) {
+              const reconnecting = await updateActiveJob(job.id, job.attemptId!, {
+                status: 'reconnecting',
+                phase: 'worker_retry_proof_pending',
+              })
+              if (reconnecting) await this.emit(reconnecting)
+              mediaLogger.warn('definitive worker retry proof remains pending', {
+                jobId: job.id,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
+            // The old attempt lease must be released before the scheduler
+            // claims the rotated attempt; never recurse in this stack.
+            return
+          }
           await this.terminalizeJob(
             job,
             worker.status === 'canceled' ? 'canceled' : 'failed',
@@ -901,14 +976,17 @@ export class MediaGenerationService {
           error.status === 404 &&
           (submitted || job.requestDigest || job.submitStartedAt)
         ) {
-          await this.terminalizeJob(
-            job,
-            'failed',
-            'worker_lost',
-            'worker attempt is no longer recoverable',
-            signal,
-          )
-          return
+          workerKnown = false
+          const unknown = await updateActiveJob(job.id, job.attemptId!, {
+            status: 'reconnecting',
+            phase: 'worker_state_unknown',
+          })
+          if (unknown) {
+            job = unknown
+            await this.emit(unknown)
+          }
+          await new Promise((resolve) => setTimeout(resolve, 3_000))
+          continue
         }
         if (
           (error instanceof MediaWorkerHttpError && error.status >= 400 && error.status < 500) ||

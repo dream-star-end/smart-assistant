@@ -22,7 +22,11 @@ import type {
   ChildBlock,
   TimelineBashTailEvidence,
 } from "./chat/model";
-import type { InboundMessage } from "./chat/frames";
+import type {
+  InboundControlStop,
+  InboundMessage,
+  InboundPermissionResponse,
+} from "./chat/frames";
 import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
 import { repairPostFinalProcessOrder } from "./chat/order";
 import {
@@ -45,6 +49,23 @@ export type StoredPendingDispatch = {
 
 export type StoredPendingDispatchRecord = StoredPendingDispatch & {
   sessId: string;
+};
+
+export type StoredPendingControl = {
+  kind: "control";
+  sessId: string;
+  controlId: string;
+  controlKind: "stop" | "permission";
+  clientMessageId?: string;
+  requestId?: string;
+  behavior?: "allow" | "deny";
+  agentId: string;
+  payload:
+    | (InboundControlStop & { controlId: string })
+    | (InboundPermissionResponse & { controlId: string });
+  enqueuedAt: number;
+  attempt: number;
+  status?: "queued" | "awaiting_receipt" | "persisted";
 };
 
 /**
@@ -109,13 +130,17 @@ function pendingDispatchKey(sessId: string, msgId: string): string {
   return `${sessId}\0${msgId}`;
 }
 
+function pendingControlKey(sessId: string, controlId: string): string {
+  return `control\0${sessId}\0${controlId}`;
+}
+
 /**
  * 持久化的会话快照。**刻意只持久 reducer 产出的稳定数据 + 断点续传游标**，剥离流式
  * 指针 / Map 等运行期瞬态（注水后由 rebuildIndexes 重建，详见 socket.loadStored）。
  * `_lastFrameSeqByKey` / `_lastFrameSeq` 是断点续传游标（resume_failed 推进后必须落地，
  * 否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环）。
- * `_sendingInFlight` / `_turnStartedAt` / `_lastFrameAt` 是 reload 恢复中的近期 turn
- * 活跃标记；loadStored 会按 THINKING_SAFETY_MS 丢弃过期标记，避免永久 loading。
+ * `_sendingInFlight` / `_turnStartedAt` / `_lastFrameAt` 是 reload 恢复中的 exact turn
+ * 活跃标记；只要带合法 clientMessageId，loadStored 就持续对账至服务端权威终态。
  * `_maxSeq` 是 server canonical 增量游标（下次 getSession 的 sinceSeq）。`_trackerResetAt` /
  * `_localTeardownAt` / `_agentSwitchedAt` 是 stop/timeout/switch 后的 late-frame cutoff，
  * 必须随 reload 保留，否则刷新会丢守卫、让旧非 final 帧把发送态复活。
@@ -157,6 +182,9 @@ export type StoredSession = {
    *  server-wins。与 _lastRouting 语义不同:那是"最近实际发送"供合成续写,这是"用户选择"。 */
   _selectedModelId?: string;
   _pendingDispatches?: StoredPendingDispatch[];
+  /** Hydration-only view of the exact durable control journal. It is stored in
+   * the existing v1 dispatch DB, never inline in the best-effort session row. */
+  _pendingControls?: StoredPendingControl[];
 };
 
 /** 解析可用的 IDBFactory；不可用（SSR/jsdom/禁用）返回 null。*/
@@ -1380,8 +1408,9 @@ export class SessionStore {
 
   async putSession(s: StoredSession): Promise<void> {
     if (this.dead || !s?.id) return;
-    const { _pendingDispatches: legacyPending, ...clean } = s;
+    const { _pendingDispatches: legacyPending, _pendingControls: pendingControls, ...clean } = s;
     void legacyPending;
+    void pendingControls;
     await this.sessionsKv.put(SESSION_STORE, s.id, clean);
   }
   /** Whole-session durable write. It deliberately cannot mutate the exact
@@ -1389,8 +1418,9 @@ export class SessionStore {
   async putSessionDurably(s: StoredSession): Promise<void> {
     if (this.dead) throw new Error("session store is closed");
     if (!s?.id) throw new Error("session id is required");
-    const { _pendingDispatches: legacyPending, ...clean } = s;
+    const { _pendingDispatches: legacyPending, _pendingControls: pendingControls, ...clean } = s;
     void legacyPending;
+    void pendingControls;
     await this.sessionsKv.putDurably(SESSION_STORE, s.id, clean);
   }
   /** Exact journal write: success means its own readwrite transaction committed. */
@@ -1426,6 +1456,57 @@ export class SessionStore {
         remaining.length > 0 ? { ...clean, _pendingDispatches: remaining } : clean,
       );
     }
+  }
+
+  /** Exact control journal reuses the v1 dispatch stores so rolling back to an
+   * older bundle can still open the DB. `kind` + key prefix keep message rows
+   * and controls disjoint without an object-store migration. */
+  async putPendingControl(item: StoredPendingControl): Promise<void> {
+    if (this.dead) throw new Error("session store is closed");
+    if (!item?.sessId || !item.controlId || item.kind !== "control") {
+      throw new Error("pending control identity is required");
+    }
+    const write = this.dispatchKv.putDurably(
+      PENDING_DISPATCH_STORE,
+      pendingControlKey(item.sessId, item.controlId),
+      item,
+    );
+    this.pendingJournalWrites.add(write);
+    try {
+      await write;
+    } finally {
+      this.pendingJournalWrites.delete(write);
+    }
+  }
+
+  async deletePendingControl(sessId: string, controlId: string): Promise<void> {
+    if (this.dead || !sessId || !controlId) return;
+    await this.dispatchKv.settleDispatchDurably(
+      pendingControlKey(sessId, controlId),
+      Date.now(),
+    );
+  }
+
+  private async collectPendingControls(): Promise<StoredPendingControl[]> {
+    const [pending, settled] = await Promise.all([
+      this.dispatchKv.getAll<StoredPendingControl>(PENDING_DISPATCH_STORE),
+      this.dispatchKv.getAll<{ key?: string }>(SETTLED_DISPATCH_STORE),
+    ]);
+    const settledKeys = new Set(
+      settled.flatMap((item) => typeof item?.key === "string" ? [item.key] : []),
+    );
+    return pending
+      .filter((item) =>
+        item?.kind === "control" &&
+        typeof item.sessId === "string" && item.sessId.length > 0 &&
+        typeof item.controlId === "string" && item.controlId.length > 0 &&
+        !settledKeys.has(pendingControlKey(item.sessId, item.controlId)))
+      .sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+  }
+
+  async getPendingControls(): Promise<StoredPendingControl[]> {
+    if (this.dead) return [];
+    return this.collectPendingControls();
   }
 
   private async collectPendingDispatches(
@@ -1467,7 +1548,10 @@ export class SessionStore {
   async getAllForHydration(): Promise<StoredSession[]> {
     if (this.dead) return [];
     const sessions = await this.sessionsKv.getAll<StoredSession>(SESSION_STORE);
-    const pending = await this.collectPendingDispatches(sessions);
+    const [pending, pendingControls] = await Promise.all([
+      this.collectPendingDispatches(sessions),
+      this.collectPendingControls(),
+    ]);
     const bySession = new Map<string, StoredPendingDispatch[]>();
     for (const item of pending) {
       if (!item || typeof item.sessId !== "string") continue;
@@ -1475,14 +1559,31 @@ export class SessionStore {
       list.push({ msgId: item.msgId, payload: item.payload, enqueuedAt: item.enqueuedAt });
       bySession.set(item.sessId, list);
     }
+    const controlsBySession = new Map<string, StoredPendingControl[]>();
+    for (const control of pendingControls) {
+      const list = controlsBySession.get(control.sessId) ?? [];
+      list.push(control);
+      controlsBySession.set(control.sessId, list);
+    }
     const hydrated = sessions.map((session) => {
       const items = bySession.get(session.id);
+      const controls = controlsBySession.get(session.id);
       bySession.delete(session.id);
-      const { _pendingDispatches: legacyPending, ...clean } = session;
+      controlsBySession.delete(session.id);
+      const {
+        _pendingDispatches: legacyPending,
+        _pendingControls: legacyControls,
+        ...clean
+      } = session;
       void legacyPending;
-      if (!items?.length) return clean;
-      items.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
-      return { ...clean, _pendingDispatches: items };
+      void legacyControls;
+      if (items?.length) items.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+      if (controls?.length) controls.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+      return {
+        ...clean,
+        ...(items?.length ? { _pendingDispatches: items } : {}),
+        ...(controls?.length ? { _pendingControls: controls } : {}),
+      };
     });
     // The exact journal commits before the physical send and before the
     // best-effort whole-session cache write. A crash in that narrow window may
@@ -1531,14 +1632,33 @@ export class SessionStore {
         _pendingDispatches: items,
       });
     }
+    for (const [sessId, controls] of controlsBySession) {
+      const first = controls[0]!;
+      hydrated.push({
+        id: sessId,
+        agentId: first.agentId || "main",
+        title: "恢复中的会话",
+        messages: [],
+        createdAt: first.enqueuedAt,
+        lastAt: controls.at(-1)!.enqueuedAt,
+        ...(first.controlKind === "stop" && first.clientMessageId
+          ? {
+              _sendingInFlight: true,
+              _activeClientMessageId: first.clientMessageId,
+            }
+          : {}),
+        _pendingControls: controls,
+      });
+    }
     return hydrated;
   }
   getSession(id: string): Promise<StoredSession | undefined> {
     if (this.dead) return Promise.resolve(undefined);
     return this.sessionsKv.get<StoredSession>(SESSION_STORE, id).then((session) => {
       if (!session) return undefined;
-      const { _pendingDispatches: legacyPending, ...clean } = session;
+      const { _pendingDispatches: legacyPending, _pendingControls: pendingControls, ...clean } = session;
       void legacyPending;
+      void pendingControls;
       return clean;
     });
   }
@@ -1546,33 +1666,48 @@ export class SessionStore {
     if (this.dead) return [];
     const sessions = await this.sessionsKv.getAll<StoredSession>(SESSION_STORE);
     return sessions.map((session) => {
-      const { _pendingDispatches: legacyPending, ...clean } = session;
+      const { _pendingDispatches: legacyPending, _pendingControls: pendingControls, ...clean } = session;
       void legacyPending;
+      void pendingControls;
       return clean;
     });
   }
   async deleteSession(id: string): Promise<void> {
     if (this.dead) return;
-    const pending = await this.getPendingDispatches();
-    await Promise.all(
-      pending
+    const [pending, controls] = await Promise.all([
+      this.getPendingDispatches(),
+      this.getPendingControls(),
+    ]);
+    await Promise.all([
+      ...pending
         .filter((item) => item.sessId === id)
         .map((item) => this.deletePendingDispatch(id, item.msgId)),
-    );
+      ...controls
+        .filter((item) => item.sessId === id)
+        .map((item) => this.deletePendingControl(id, item.controlId)),
+    ]);
     await this.sessionsKv.delete(SESSION_STORE, id);
   }
   /** 清空本 user 命名空间（登出/隐私收尾）。同步置 dead 防 wipe 与 final flush 竞态。*/
   async wipe(): Promise<void> {
     this.dead = true;
     await Promise.allSettled([...this.pendingJournalWrites]);
-    const pending = await this.collectPendingDispatches();
-    await Promise.allSettled(
-      pending.map((item) =>
+    const [pending, controls] = await Promise.all([
+      this.collectPendingDispatches(),
+      this.collectPendingControls(),
+    ]);
+    await Promise.allSettled([
+      ...pending.map((item) =>
         this.dispatchKv.settleDispatchDurably(
           pendingDispatchKey(item.sessId, item.msgId),
           Date.now(),
         )),
-    );
+      ...controls.map((item) =>
+        this.dispatchKv.settleDispatchDurably(
+          pendingControlKey(item.sessId, item.controlId),
+          Date.now(),
+        )),
+    ]);
     // Settled identities contain no payload and deliberately survive logout:
     // an old v1 tab may still write an acknowledged inline journal back later.
     await Promise.all([

@@ -15,12 +15,15 @@ import { Value } from '@sinclair/typebox/value'
 import {
   InboundControlStop,
   InboundMessage,
+  InboundPermissionResponse,
   OutboundCallUsage,
   OutboundCodexBilling,
   OutboundError,
   OutboundMessage,
   OutboundPermissionRequest,
+  OutboundControlReceipt,
   isClientMessageId,
+  isControlId,
   isPersistedClientMessageId,
 } from '../frames.js'
 
@@ -117,6 +120,34 @@ describe('client message id contracts', () => {
       ...legacy,
       clientMessageId: 'bad:colon',
     }), false)
+  })
+
+  it('accepts stable control identities and rejects wire-unsafe values', () => {
+    assert.equal(isControlId('ctrl.stop:session_1-2'), true)
+    assert.equal(isControlId('bad/control'), false)
+    const stop = {
+      type: 'inbound.control.stop',
+      controlId: 'ctrl-stop-1',
+      channel: 'webchat',
+      peer,
+    }
+    assert.equal(Value.Check(InboundControlStop, stop), true)
+    assert.equal(Value.Check(InboundPermissionResponse, {
+      type: 'inbound.permission_response',
+      controlId: 'ctrl-permission-1',
+      channel: 'webchat',
+      peer,
+      requestId: 'permission-1',
+      behavior: 'allow',
+    }), true)
+    assert.equal(Value.Check(OutboundControlReceipt, {
+      type: 'outbound.control.receipt',
+      controlId: 'ctrl-stop-1',
+      controlKind: 'stop',
+      status: 'persisted',
+      peer,
+      clientMessageId: 'm-stop-exact-1',
+    }), true)
   })
 })
 

@@ -11,6 +11,8 @@ export interface WorkerStatus {
   job_id: string
   attempt_id: string
   fence_version: number
+  /** Immutable worker release that created this attempt/tombstone. */
+  origin_release: string
   resource_class: 'gpu-h3' | 'cpu-compose'
   status: 'staging' | 'queued' | 'running' | 'completed' | 'failed' | 'canceled'
   phase: string
@@ -21,6 +23,8 @@ export interface WorkerStatus {
   result_size: number | null
   error_code: string | null
   error_message: string | null
+  recovery_disposition: 'unknown' | 'definitive_retry_safe'
+  cleanup_proven: boolean | number
   result_ready: boolean
 }
 

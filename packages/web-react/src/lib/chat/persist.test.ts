@@ -70,6 +70,7 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
       storedFix("s1", {
         messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 2000 })],
         _sendingInFlight: true,
+        _activeClientMessageId: "u1",
         _turnStartedAt: now - 2000,
         _lastFrameAt: now - 1000,
       }),
@@ -81,21 +82,25 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
     s.stop();
   });
 
-  test("注水过期 in-flight 标记：丢弃，避免 reload 后永久 loading", () => {
+  test("注水任意年龄 exact in-flight：保留身份并进入持续权威对账", () => {
     const now = Date.now();
     const s = socket();
     s.loadStored(
       storedFix("s1", {
         messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 20 * 60_000 })],
         _sendingInFlight: true,
+        _activeClientMessageId: "u1",
         _turnStartedAt: now - 20 * 60_000,
         _lastFrameAt: now - 20 * 60_000,
       }),
     );
     const sess = s.sessions.get("s1")!;
-    expect(sess._sendingInFlight).toBe(false);
-    expect(sess._turnStartedAt).toBeUndefined();
-    expect(sess._lastFrameAt).toBeUndefined();
+    expect(sess._sendingInFlight).toBe(true);
+    expect(sess._activeClientMessageId).toBe("u1");
+    expect(sess._reconciling).toBe(true);
+    expect(sess._recoveryStatus?.kind).toBe("waiting-service");
+    expect(sess._turnStartedAt).toBe(now - 20 * 60_000);
+    expect(sess._lastFrameAt).toBe(now - 20 * 60_000);
   });
 
   test("已存在的 live 会话不被磁盘快照覆盖（live 优先）", () => {

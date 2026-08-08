@@ -12,6 +12,7 @@ import {
   stableSortByTs,
   type StoredPendingDispatch,
   type StoredPendingDispatchRecord,
+  type StoredPendingControl,
   type StoredSession,
 } from "./persist";
 
@@ -1325,6 +1326,48 @@ describe("persist — SessionStore（注入内存 IDB round-trip）", () => {
       content: { text: "exact" },
       ts: 10,
     },
+  });
+
+  const control = (sessId: string, controlId: string): StoredPendingControl => ({
+    kind: "control",
+    sessId,
+    controlId,
+    controlKind: "stop",
+    clientMessageId: "m-active",
+    agentId: "main",
+    payload: {
+      type: "inbound.control.stop",
+      controlId,
+      channel: "webchat",
+      peer: { id: sessId, kind: "dm" },
+      agentId: "main",
+      clientMessageId: "m-active",
+    },
+    enqueuedAt: 10,
+    attempt: 0,
+  });
+
+  test("control journal reuses v1 dispatch stores and survives reload until authoritative settle", async () => {
+    const f = fakeIDBFactory();
+    const store = new SessionStore("control-v1", f);
+    await store.putSession(stored("s1"));
+    await store.putPendingControl(control("s1", "control:stop:m-active"));
+
+    expect(f.versionOf(dispatchDbNameForUser("control-v1"))).toBe(1);
+    expect(await store.getPendingControls()).toEqual([
+      expect.objectContaining({
+        kind: "control",
+        sessId: "s1",
+        controlId: "control:stop:m-active",
+      }),
+    ]);
+    expect((await store.getAllForHydration())[0]?._pendingControls).toEqual([
+      expect.objectContaining({ controlId: "control:stop:m-active" }),
+    ]);
+
+    await store.deletePendingControl("s1", "control:stop:m-active");
+    expect(await store.getPendingControls()).toEqual([]);
+    expect((await store.getAllForHydration())[0]?._pendingControls).toBeUndefined();
   });
 
   test("durable put waits for readwrite transaction completion", async () => {

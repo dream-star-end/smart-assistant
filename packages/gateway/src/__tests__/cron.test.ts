@@ -32,6 +32,8 @@ const {
   deliveryFailureOutcome,
   cronDeliveryId,
   deliverCronViaAdapter,
+  classifyCronOccurrenceRecovery,
+  cronExecutionTapeIsReplaySafe,
   CRON_MAX_ATTEMPTS,
   CronScheduler,
 } = await import('../cron.js')
@@ -184,6 +186,33 @@ describe('catalogRejectOutcome — retry contract', () => {
 })
 
 describe('cron retry occurrence + delivery contract', () => {
+  it('only a prepared occurrence is safe to execute again after restart', () => {
+    assert.equal(classifyCronOccurrenceRecovery({ state: 'prepared' }), 'rerun')
+    assert.equal(
+      classifyCronOccurrenceRecovery({ state: 'executing', tapeEvents: 0 }),
+      'unknown',
+      'an empty tape cannot prove submit performed no side effects',
+    )
+    assert.equal(
+      classifyCronOccurrenceRecovery({ state: 'completed', outputFile: 'done.md' }),
+      'deliver_only',
+    )
+    const safeTape = [
+      { kind: 'block', block: { kind: 'tool_use', blockId: 'read-1', toolName: 'Read' } },
+      { kind: 'block', block: { kind: 'tool_result', toolUseBlockId: 'read-1', toolName: 'Read' } },
+    ]
+    assert.equal(cronExecutionTapeIsReplaySafe(safeTape), true)
+    assert.equal(
+      classifyCronOccurrenceRecovery({ state: 'executing', tapeEvents: 2 }, safeTape),
+      'rerun',
+    )
+    assert.equal(cronExecutionTapeIsReplaySafe([]), false)
+    assert.equal(cronExecutionTapeIsReplaySafe([
+      { kind: 'block', block: { kind: 'tool_use', blockId: 'write-1', toolName: 'Write' } },
+      { kind: 'block', block: { kind: 'tool_result', toolUseBlockId: 'write-1', toolName: 'Write' } },
+    ]), false)
+  })
+
   it('binds execution retries to the original due minute and treats consumed execution as stale', () => {
     const now = at(9, 30)
     const retry = {
@@ -239,6 +268,21 @@ describe('cron retry occurrence + delivery contract', () => {
     const newer = planCronRetry(third.entry, { ...args, dueMinuteKey: 101 })
     assert.equal(newer.kind, 'retry')
     if (newer.kind === 'retry') assert.equal(newer.entry.failures, 1, 'new occurrence never inherits old failures')
+  })
+
+  it('keeps delivery retryable without re-running the Agent after the execution limit', () => {
+    const previous = {
+      dueMinuteKey: 100, schedule: '0 9 * * *', failures: 20,
+      nextAttemptAt: 0, code: 'DELIVERY_TRANSIENT', phase: 'delivery' as const,
+      outputFile: 'result.md', deliveryId: cronDeliveryId('r', 100),
+    }
+    const planned = planCronRetry(previous, {
+      dueMinuteKey: 100, schedule: previous.schedule, nowEpoch: 1_000,
+      code: 'DELIVERY_TRANSIENT', phase: 'delivery', outputFile: previous.outputFile,
+      deliveryId: previous.deliveryId,
+    })
+    assert.equal(planned.kind, 'retry')
+    if (planned.kind === 'retry') assert.equal(planned.entry.failures, 21)
   })
 
   it('treats unknown delivery exceptions as transient; only explicit stable tags are permanent', () => {
@@ -716,7 +760,7 @@ describe('CronScheduler execution retry boundary', () => {
     assert.equal(submits, 0)
   })
 
-  it('disabled one-shot survives a last-run write failure and submits exactly once after restart retry', async () => {
+  it('fails closed without replay when the submit-started record precedes a last-run write failure', async () => {
     process.env.OC_SEED_DEFAULT_CRON = '0'
     const retryPath = join(TEST_HOME, 'cron', 'retry-state.json')
     const lastRunPath = join(TEST_HOME, 'cron', 'last-run.json')
@@ -759,14 +803,12 @@ describe('CronScheduler execution retry boundary', () => {
     const disabled = parseYaml(readFileSync(paths.cronYaml, 'utf8')) as any
     assert.equal(disabled.jobs[0].enabled, false)
     const retryState = JSON.parse(readFileSync(retryPath, 'utf8')) as Record<string, any>
-    assert.equal(retryState[job.id].phase, 'execution')
-    retryState[job.id].nextAttemptAt = 0
-    writeFileSync(retryPath, JSON.stringify(retryState))
+    assert.equal(retryState[job.id], undefined)
 
     await (sched as any).tick()
-    assert.equal(submits, 1)
+    assert.equal(submits, 0)
     await (sched as any).tick()
-    assert.equal(submits, 1, 'completed one-shot cannot fire again after retry cleanup')
+    assert.equal(submits, 0, 'unknown submit boundary cannot be replayed')
   })
 
   it('never retries after submit began, even when partial output/tool side effects preceded the throw', async () => {
@@ -789,6 +831,33 @@ describe('CronScheduler execution retry boundary', () => {
     })
     assert.equal(destroys, 1)
     assert.equal(deliveries, 0, 'partial output after an execution failure must not be delivered')
+  })
+
+  it('retries after submit only from a complete read-only tool checkpoint', async () => {
+    const events: unknown[] = []
+    const sched = new CronScheduler(
+      { defaults: { model: 'glm-5.2' } } as any,
+      {
+        getOrCreate: async (opts: any) => ({ sessionKey: opts.sessionKey }),
+        submit: async (_session: any, _prompt: any, cb: any) => {
+          cb({ kind: 'block', block: { kind: 'tool_use', blockId: 'read-1', toolName: 'Read' } })
+          cb({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: 'read-1', toolName: 'Read', isError: false } })
+          throw new Error('runner disconnected after a read-only checkpoint')
+        },
+        destroySession: async () => {},
+      } as any,
+      async () => {},
+    )
+    const outcome = await (sched as any).runJob(job, agent, {
+      consumeOccurrence: async () => {},
+      markSubmitStarted: async () => {},
+      recordEvent: (event: unknown) => events.push(event),
+      stageDelivery: async () => {},
+      recoverInterruptedExecution: async () => cronExecutionTapeIsReplaySafe(events),
+    })
+    assert.deepEqual(outcome, {
+      kind: 'retryable_failure', code: 'SAFE_CHECKPOINT_RECOVERY',
+    })
   })
 })
 

@@ -41,6 +41,7 @@ import {
   markWorkerStagingStarted,
   regenerateShot,
   requestCancel,
+  rotateRecoverableAttempt,
   withJobExecutionLease,
 } from '../media-generation/store.js'
 import { MediaWorkerClient } from '../media-generation/workerClient.js'
@@ -166,6 +167,23 @@ function workerStatus(
 }
 
 describe('media generation durable queue and projects', () => {
+  test('recoverable attempt rotation is exact-attempt fenced and single-use', async (t) => {
+    if (!maybe(t)) return
+    const queued = await createMediaJob({
+      userId: '1', requestId: 'rotate-on-proof', prompt: 'recover me',
+      options: { durationSeconds: 5, steps: 20 },
+    })
+    const claimed = await claimNextJob('gpu-h3')
+    assert.equal(claimed?.id, queued.id)
+    assert.ok(claimed?.attemptId)
+    const rotated = await rotateRecoverableAttempt(claimed)
+    assert.ok(rotated?.attemptId)
+    assert.notEqual(rotated.attemptId, claimed.attemptId)
+    assert.equal(rotated.fenceVersion, claimed.fenceVersion + 1)
+    assert.equal(rotated.status, 'dispatching')
+    assert.equal(await rotateRecoverableAttempt(claimed), null)
+  })
+
   test('worker client bypasses the gateway global proxy dispatcher', async () => {
     const job = {
       id: 'direct-egress-job',
@@ -710,6 +728,44 @@ describe('media generation durable queue and projects', () => {
     assert.equal((await listAckPendingJobs()).length, 0)
   })
 
+  test('an ordinary ACK 404 never releases the worker fence', async (t) => {
+    if (!maybe(t)) return
+    const worker = createServer((_req, res) => {
+      res.statusCode = 404
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ error: 'attempt_not_found' }))
+    })
+    await new Promise<void>((resolve) => worker.listen(0, '127.0.0.1', resolve))
+    const address = worker.address()
+    assert.ok(address && typeof address === 'object')
+    const queued = await createMediaJob({
+      userId: '1', requestId: 'ack-404-unknown', prompt: 'terminal',
+      options: { durationSeconds: 5 },
+    })
+    const claimed = await claimNextJob('gpu-h3')
+    assert.ok(claimed?.attemptId)
+    const staged = await markWorkerStagingStarted(claimed.id, claimed.attemptId)
+    assert.ok(staged)
+    const terminal = await failJob(staged, 'failed', 'worker_failed', 'failed')
+    assert.ok(terminal?.workerAckPending)
+    const runner = new MediaGenerationService({
+      workerUrl: `http://127.0.0.1:${address.port}`,
+      workerToken: 'test-worker-token-that-is-long-enough',
+      allowUserIds: ['1'],
+    })
+    const handle = runner.start(60_000)
+    try {
+      await handle.runNow()
+      const current = await getJob('1', queued.id)
+      assert.equal(current?.workerAckPending, true)
+      assert.equal(current?.workerAckedAt, null)
+    } finally {
+      await handle.stop()
+      worker.closeAllConnections()
+      await new Promise<void>((resolve) => worker.close(() => resolve()))
+    }
+  })
+
   test('a claimed pre-staging cancellation terminates locally without contacting the worker', async (t) => {
     if (!maybe(t)) return
     let workerRequests = 0
@@ -753,7 +809,7 @@ describe('media generation durable queue and projects', () => {
     }
   })
 
-  test('canceling after staging intent treats a missing worker attempt as canceled, not failed', async (t) => {
+  test('canceling after staging keeps an ordinary missing worker attempt unknown', async (t) => {
     if (!maybe(t)) return
     let workerRequests = 0
     const worker = createServer((_req, res) => {
@@ -784,15 +840,16 @@ describe('media generation durable queue and projects', () => {
     const handle = runner.start(60_000)
     try {
       let canceled = await getJob('1', queued.id)
-      for (let index = 0; index < 100 && !canceled?.workerAckedAt; index += 1) {
+      for (let index = 0; index < 100 && canceled?.phase !== 'worker_cancel_state_unknown'; index += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10))
         canceled = await getJob('1', queued.id)
       }
-      assert.equal(canceled?.status, 'canceled')
-      assert.equal(canceled?.errorCode, 'user_canceled')
+      assert.equal(canceled?.status, 'reconnecting')
+      assert.equal(canceled?.phase, 'worker_cancel_state_unknown')
+      assert.equal(canceled?.errorCode, null)
       assert.equal(canceled?.workerAckPending, false)
-      assert.ok(canceled?.workerAckedAt)
-      assert.equal(workerRequests, 2)
+      assert.equal(canceled?.workerAckedAt, null)
+      assert.equal(workerRequests, 1)
     } finally {
       await handle.stop()
       worker.closeAllConnections()
@@ -1024,6 +1081,7 @@ describe('media generation durable queue and projects', () => {
     const resultSha = createHash('sha256').update(resultBody).digest('hex')
     let submitted = false
     let ackAttempts = 0
+    let downloadAttempts = 0
     let uploaded = Buffer.alloc(0)
     const worker = createServer((req, res) => {
       const chunks: Buffer[] = []
@@ -1074,10 +1132,12 @@ describe('media generation durable queue and projects', () => {
         } else if (match[3] === 'status') {
           res.end(JSON.stringify({ ...base, status: 'completed' }))
         } else if (match[3] === 'result') {
+          downloadAttempts += 1
+          const delivered = downloadAttempts === 1 ? Buffer.from('truncated') : resultBody
           res.setHeader('content-type', 'video/mp4')
-          res.setHeader('content-length', String(resultBody.length))
+          res.setHeader('content-length', String(delivered.length))
           res.setHeader('x-content-sha256', resultSha)
-          res.end(resultBody)
+          res.end(delivered)
         } else {
           ackAttempts += 1
           if (ackAttempts === 1) {
@@ -1098,7 +1158,7 @@ describe('media generation durable queue and projects', () => {
       workerToken: 'test-worker-token-that-is-long-enough',
       stateRoot: root,
       allowUserIds: ['1'],
-      broadcast: (_userId, frame) => broadcasts.push(frame.job.status),
+      broadcast: (_userId, frame) => broadcasts.push(`${frame.job.status}:${frame.job.phase}`),
     })
     let handle: ReturnType<MediaGenerationService['start']> | undefined
     try {
@@ -1130,6 +1190,7 @@ describe('media generation durable queue and projects', () => {
       assert.equal(completed?.status, 'completed')
       assert.equal(completed?.requestDigest, 'worker-request-digest')
       assert.equal(completed?.resultSha256, resultSha)
+      assert.equal(downloadAttempts, 2)
       assert.deepEqual(uploaded, inputBody)
       for (let index = 0; index < 100 && ackAttempts < 2; index += 1) {
         await handle.runNow()
@@ -1139,8 +1200,9 @@ describe('media generation durable queue and projects', () => {
       assert.equal(ackAttempts, 2)
       assert.equal(acknowledged?.workerAckPending, false)
       assert.ok(acknowledged?.workerAckedAt)
-      assert.ok(broadcasts.includes('running'))
-      assert.equal(broadcasts.at(-1), 'completed')
+      assert.ok(broadcasts.some((value) => value.startsWith('running:')))
+      assert.ok(broadcasts.includes('reconnecting:result_pending'))
+      assert.equal(broadcasts.at(-1), 'completed:completed')
       assert.deepEqual(await readFile(completed!.resultPath!), resultBody)
     } finally {
       await handle?.stop()
@@ -1212,7 +1274,7 @@ describe('media generation durable queue and projects', () => {
     }
   })
 
-  test('an accepted submit with a lost response is never blindly recomputed after worker loss', async (t) => {
+  test('an accepted submit with an ordinary worker 404 remains unknown and is never recomputed', async (t) => {
     if (!maybe(t)) return
     const sockets = new Set<Socket>()
     let submitAttempts = 0
@@ -1254,19 +1316,92 @@ describe('media generation durable queue and projects', () => {
     const handle = runner.start(60_000)
     try {
       let failed = await getJob('1', queued.id)
-      for (let index = 0; index < 250 && !failed?.workerAckedAt; index += 1) {
+      for (let index = 0; index < 250 && failed?.phase !== 'worker_state_unknown'; index += 1) {
         await new Promise((resolve) => setTimeout(resolve, 20))
         failed = await getJob('1', queued.id)
       }
-      assert.equal(failed?.status, 'failed')
-      assert.equal(failed?.errorCode, 'worker_lost')
+      assert.equal(failed?.status, 'reconnecting')
+      assert.equal(failed?.phase, 'worker_state_unknown')
+      assert.equal(failed?.errorCode, null)
       assert.ok(failed?.submitStartedAt)
       assert.equal(failed?.workerAckPending, false)
-      assert.ok(failed?.workerAckedAt)
+      assert.equal(failed?.workerAckedAt, null)
       assert.equal(submitAttempts, 1)
     } finally {
       await handle.stop()
       for (const socket of sockets) socket.destroy()
+      worker.closeAllConnections()
+      await new Promise<void>((resolve) => worker.close(() => resolve()))
+    }
+  })
+
+  test('only an exact definitive worker tombstone rotates attempt and fence', async (t) => {
+    if (!maybe(t)) return
+    let submitted = false
+    let submitAttempts = 0
+    let ackAttempts = 0
+    const worker = createServer((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        const match = /^\/v1\/attempts\/([^/]+)\/([^/]+)\/(status|submit|ack)$/.exec(req.url ?? '')
+        assert.ok(match)
+        res.setHeader('content-type', 'application/json')
+        if (match[3] === 'status' && !submitted) {
+          res.statusCode = 404
+          res.end(JSON.stringify({ error: 'attempt_not_found' }))
+        } else if (match[3] === 'submit') {
+          submitted = true
+          submitAttempts += 1
+          res.end(JSON.stringify({
+            job_id: match[1], attempt_id: match[2], fence_version: 1,
+            origin_release: 'test-release-1',
+            resource_class: 'gpu-h3', status: 'running', phase: 'sampling',
+            request_digest: 'proof-digest', current_step: 1, total_steps: 20,
+            result_sha256: null, result_size: null, error_code: null, error_message: null,
+            recovery_disposition: 'unknown', cleanup_proven: 0, result_ready: false,
+          }))
+        } else if (match[3] === 'status') {
+          res.end(JSON.stringify({
+            job_id: match[1], attempt_id: match[2], fence_version: 1,
+            origin_release: 'test-release-1',
+            resource_class: 'gpu-h3', status: 'failed', phase: 'failed',
+            request_digest: 'proof-digest', current_step: null, total_steps: 20,
+            result_sha256: null, result_size: null, error_code: 'worker_lost',
+            error_message: 'coordinator disappeared',
+            recovery_disposition: 'definitive_retry_safe', cleanup_proven: 1,
+            result_ready: false,
+          }))
+        } else {
+          ackAttempts += 1
+          res.end(JSON.stringify({ ok: true }))
+        }
+      })
+    })
+    await new Promise<void>((resolve) => worker.listen(0, '127.0.0.1', resolve))
+    const address = worker.address()
+    assert.ok(address && typeof address === 'object')
+    const queued = await createMediaJob({
+      userId: '1', requestId: 'definitive-proof', prompt: 'retry safely',
+      options: { durationSeconds: 5, steps: 20 },
+    })
+    const runner = new MediaGenerationService({
+      workerUrl: `http://127.0.0.1:${address.port}`,
+      workerToken: 'test-worker-token-that-is-long-enough', allowUserIds: ['1'],
+    })
+    const handle = runner.start(60_000)
+    try {
+      let rotated = await getJob('1', queued.id)
+      for (let index = 0; index < 200 && rotated?.fenceVersion !== 2; index += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        rotated = await getJob('1', queued.id)
+      }
+      assert.equal(rotated?.fenceVersion, 2)
+      assert.equal(rotated?.status, 'dispatching')
+      assert.equal(rotated?.phase, 'transferring_inputs')
+      assert.equal(submitAttempts, 1)
+      assert.equal(ackAttempts, 1)
+    } finally {
+      await handle.stop()
       worker.closeAllConnections()
       await new Promise<void>((resolve) => worker.close(() => resolve()))
     }

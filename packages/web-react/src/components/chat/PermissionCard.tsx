@@ -64,6 +64,7 @@ export function PermissionCard({
 }) {
   const questions = useMemo(() => asAskUserQuestion(msg), [msg]);
   const resolved = !!msg._resolved;
+  const pending = msg._controlPending === true;
   const behavior = msg._behavior;
   const [open, setOpen] = useState(false);
 
@@ -78,14 +79,16 @@ export function PermissionCard({
   // 服务端 force-deny 广播的 settled 帧若没送达（ring 已轮转 / session 已回收），本地就永久留下
   // 一张未决卡，此后每次挂载都被强行弹开。故超过服务端 TTL 的一律视为孤儿，不再自动弹。
   useEffect(() => {
-    if (!resolved && !readOnly && !stale) setOpen(true);
-  }, [resolved, readOnly, stale]);
+    if (!resolved && !pending && !readOnly && !stale) setOpen(true);
+  }, [resolved, pending, readOnly, stale]);
 
   const statusIcon = !resolved ? "⏳" : behavior === "allow" ? "✓" : "✗";
   const statusText = !resolved
-    ? questions
-      ? "等待回答…"
-      : "等待审批…"
+    ? pending
+      ? "正在提交…"
+      : questions
+        ? "等待回答…"
+        : "等待审批…"
     : behavior === "allow"
       ? questions
         ? "已提交"
@@ -124,7 +127,7 @@ export function PermissionCard({
       </div>
 
       {/* 待审批：内联快捷 + 打开审批框 */}
-      {!resolved && !readOnly && (
+      {!resolved && !pending && !readOnly && (
         <div className="flex items-center gap-2 border-t border-border px-3.5 py-2">
           <Button size="sm" variant="accent" shape="pill" onClick={() => setOpen(true)}>
             {questions ? "回答" : "审批"}
@@ -171,6 +174,7 @@ export function PermissionCard({
 
       {/* 审批 modal */}
       {!resolved &&
+        !pending &&
         !readOnly &&
         (questions ? (
           <AskUserQuestionModal

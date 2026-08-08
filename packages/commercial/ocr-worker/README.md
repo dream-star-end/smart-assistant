@@ -20,6 +20,16 @@ pin `OC_OCR_WORKER_RELEASE` to the exact source commit. `GET /ready` reports
 that release and protocol major 1. Releases are installed into versioned
 directories; switching `current` and restarting the SSH tunnel is atomic.
 
+Stage candidates first with
+`stage-release.sh <source-directory> <40-character-source-commit>`. It copies
+the candidate into a versioned directory, writes an external SHA-256 manifest,
+and makes the directory read-only. `activate-release.sh <release>` refuses an
+unstaged or modified candidate, serializes the symlink switch, takes and checks
+an online SQLite backup, restarts the tunnel-owned supervisor, then requires an
+authenticated `/ready` response for that exact release. A failed activation
+restores and verifies the previous release. Use `--status` to inspect state and
+`--rollback` to atomically swap back without discarding the shared queue.
+
 The PP environment needs `pypdfium2`; PP/VL models and both pre-existing
 Python environments are supplied by the SCNet host rather than downloaded at
 service start.

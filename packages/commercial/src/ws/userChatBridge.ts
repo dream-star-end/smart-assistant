@@ -131,6 +131,22 @@ import {
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
 } from "../dispatch/turnDispatchStore.js";
+import {
+  admitDurableControl,
+  claimDueTurnControls,
+  markTurnControlReceipt,
+  persistPermissionAuthority,
+  releaseTurnControlForRetry,
+  TurnControlConflictError,
+} from "../dispatch/turnControlStore.js";
+import {
+  claimDueRecoveryJobs,
+  forwardRecoveryUnderRootFence,
+  markRecoveryContainerReceipt,
+  releaseRecoveryPreReceipt,
+  releaseRecoveryForTransportWait,
+  type ClaimedRecoveryJob,
+} from "../dispatch/turnRecoveryStore.js";
 import type {
   AdmitUserTurnInput,
   AdmitUserTurnResult,
@@ -160,6 +176,9 @@ export const BRIDGE_WS_PATH = "/ws/user-chat-bridge";
 /** 五枚举目标画面比例(与 protocol imageEdit.targetAspect / gateway OUTPAINT_ASPECT_RATIOS
  * 同源;master 侧只做识别不算几何,故内联而非跨包 import 保持接帧热路径零新依赖)。 */
 const OUTPAINT_ASPECTS = new Set(["16:9", "4:3", "9:16", "3:4", "1:1"]);
+const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const isControlId = (value: unknown): value is string =>
+  typeof value === "string" && CONTROL_ID_RE.test(value);
 
 /** Strictly recognize a server-completed image-edit envelope before bypassing
  * ordinary Codex precheck/journal plumbing. A loose `imageEdit` presence
@@ -1003,6 +1022,7 @@ export interface UserChatBridgeDeps {
    * DURABLE_TURN_DISPATCH_CAPABILITY 时,替代 persistMasterUserMessage:单事务幂等 append
    * user 行 + UPSERT dispatch 冲突表裁定(受理即拥有 I1)。未注入 / 无 capability → legacy。 */
   admitUserTurn?: (input: AdmitUserTurnInput) => Promise<AdmitUserTurnResult>;
+  reconcileAutomaticRecoveryJobs?: (uid: bigint, limit?: number) => Promise<number>;
   /** Authoritative session cwd policy. V5 production always injects this;
    * legacy/test compositions may omit it and retain the shared workspace. */
   loadSessionWorkspaceMode?: (
@@ -1638,6 +1658,109 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   const uidToUserWs = new Map<string, Set<WebSocket>>();
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
+  const uidToRecoveryExecutors = new Map<
+    string,
+    Set<(job: ClaimedRecoveryJob) => void>
+  >();
+  const controlDrainRunning = new Set<string>();
+  const recoveryDrainRunning = new Set<string>();
+  const recoveryLastScanAt = new Map<string, number>();
+  const controlLeaseOwner = `master:${randomUUID()}`;
+  const recoveryLeaseOwner = `master-recovery:${randomUUID()}`;
+  const controlLeaseMs = 15_000;
+  const recoveryLeaseMs = 120_000;
+
+  /** Master-owned control outbox drainer. The physical bridge is only a
+   * transport candidate: PostgreSQL claim/lease is the delivery authority,
+   * so browser disconnects and Master restarts cannot erase Stop/permission. */
+  const drainDurableControlsForUser = async (uid: bigint): Promise<void> => {
+    if (!deps.pgPool) return;
+    const key = uid.toString();
+    if (controlDrainRunning.has(key)) return;
+    const sockets = uidToContainerWs.get(key);
+    const socket = sockets && [...sockets].find((candidate) => candidate.readyState === WebSocket.OPEN);
+    if (!socket) return;
+    controlDrainRunning.add(key);
+    try {
+      const controls = await claimDueTurnControls(deps.pgPool, {
+        userId: uid,
+        ownerId: controlLeaseOwner,
+        leaseMs: controlLeaseMs,
+      });
+      for (const control of controls) {
+        const live = [...(uidToContainerWs.get(key) ?? [])]
+          .find((candidate) => candidate.readyState === WebSocket.OPEN);
+        if (!live) {
+          await releaseTurnControlForRetry(deps.pgPool, control);
+          continue;
+        }
+        const encoded = JSON.stringify({ ...control.payload, controlId: control.controlId });
+        try {
+          live.send(encoded, { binary: false }, (error) => {
+            if (!error) return;
+            void releaseTurnControlForRetry(deps.pgPool!, control).catch(() => {});
+          });
+        } catch {
+          await releaseTurnControlForRetry(deps.pgPool, control);
+        }
+      }
+    } catch (error) {
+      log?.warn("user-chat-bridge: durable control drain failed", { uid: key, error });
+    }
+    controlDrainRunning.delete(key);
+  };
+  const controlDrainTimer = setInterval(() => {
+    for (const uid of uidToContainerWs.keys()) {
+      void drainDurableControlsForUser(BigInt(uid));
+    }
+  }, 1_000);
+  controlDrainTimer.unref?.();
+
+  /** Master-owned semantic recovery scheduler. Executors are registered only
+   * by attested durable-dispatch bridges; every claimed request then enters
+   * the same executeAdmittedTurn pipeline as an ordinary browser message. */
+  const drainDurableRecoveryForUser = async (uid: bigint): Promise<void> => {
+    if (!deps.pgPool) return;
+    const key = uid.toString();
+    if (recoveryDrainRunning.has(key)) return;
+    const executors = uidToRecoveryExecutors.get(key);
+    const executor = executors && [...executors][0];
+    if (!executor) return;
+    recoveryDrainRunning.add(key);
+    try {
+      const lastScanAt = recoveryLastScanAt.get(key) ?? 0;
+      if (deps.reconcileAutomaticRecoveryJobs && Date.now() - lastScanAt >= 30_000) {
+        recoveryLastScanAt.set(key, Date.now());
+        await deps.reconcileAutomaticRecoveryJobs(uid, 100);
+      }
+      const jobs = await claimDueRecoveryJobs(deps.pgPool, {
+        userId: uid,
+        ownerId: recoveryLeaseOwner,
+        leaseMs: recoveryLeaseMs,
+      });
+      for (const job of jobs) {
+        const liveExecutor = [...(uidToRecoveryExecutors.get(key) ?? [])][0];
+        if (!liveExecutor) {
+          await releaseRecoveryForTransportWait(deps.pgPool, job);
+          continue;
+        }
+        try {
+          liveExecutor(job);
+        } catch {
+          await releaseRecoveryForTransportWait(deps.pgPool, job);
+        }
+      }
+    } catch (error) {
+      log?.warn("user-chat-bridge: durable recovery drain failed", { uid: key, error });
+    }
+    recoveryDrainRunning.delete(key);
+  };
+  const recoveryDrainTimer = setInterval(() => {
+    for (const uid of uidToRecoveryExecutors.keys()) {
+      void drainDurableRecoveryForUser(BigInt(uid));
+    }
+  }, 1_000);
+  recoveryDrainTimer.unref?.();
 
   function handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean {
     const url = parseWsUrl(req);
@@ -2198,12 +2321,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let attestState: "pending" | "ok" | "failed" = authorityOn ? "pending" : "ok";
     /** 容器 attest 是否携带 durable-turn-dispatch-v1:true 才走 dispatch 受理,否则 legacy。 */
     let containerHasDurableDispatch = false;
+    let recoveryExecutor: ((job: ClaimedRecoveryJob) => void) | null = null;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
     const attestQueue: Array<{
       data: RawData;
       isBinary: boolean;
-      ingress: "browser" | "prompt_queue";
+      ingress: "browser" | "prompt_queue" | "recovery";
       dispatchRequest?: PromptQueueDispatchRequest;
+      recoveryJob?: ClaimedRecoveryJob;
     }> = [];
     let attestQueuedBytes = 0;
 
@@ -2275,6 +2400,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // capability 门:容器广播 durable-turn-dispatch-v1 才走 dispatch 受理(RFC §2.2)。
       containerHasDurableDispatch = caps.includes(DURABLE_TURN_DISPATCH_CAPABILITY);
       attestState = "ok";
+      if (containerHasDurableDispatch && deps.pgPool && recoveryExecutor === null) {
+        recoveryExecutor = (job) => {
+          const encoded = Buffer.from(JSON.stringify(job.request), "utf8");
+          executeAdmittedTurn(encoded, false, "recovery", undefined, job);
+        };
+        const key = uid.toString();
+        let executors = uidToRecoveryExecutors.get(key);
+        if (!executors) {
+          executors = new Set();
+          uidToRecoveryExecutors.set(key, executors);
+        }
+        executors.add(recoveryExecutor);
+        void drainDurableRecoveryForUser(uid);
+      }
       if (attestTimer !== null) {
         clearTimeout(attestTimer);
         attestTimer = null;
@@ -2296,10 +2435,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         keyIds: attestedKeyIds,
         keyIdsUnknown,
       });
-      // 原样重放:缓冲的是**未处理的原始帧**,重放即走完整 prepareQueuedTurn 流程
+      // 原样重放:缓冲的是**未处理的原始帧**,重放即走完整 executeAdmittedTurn 流程
       // (authz / codex 分类 / 计费编排 / 签发注入),不存在"半处理帧"的中间态。
       for (const m of queued) {
-        prepareQueuedTurn(m.data, m.isBinary, m.ingress, m.dispatchRequest);
+        executeAdmittedTurn(m.data, m.isBinary, m.ingress, m.dispatchRequest, m.recoveryJob);
       }
     };
 
@@ -2743,6 +2882,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       anchorSeq: bigint | null;
       /** = envelope payloadHash(sha256 内容身份;容器验帧体 hash 用)。 */
       requestHash: string;
+      /** Present only for a Master-scheduled automatic recovery. */
+      recoveryJob?: ClaimedRecoveryJob;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
     let dispatchHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -2786,6 +2927,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const pool = deps.pgPool;
       dropAdmittedDispatch(record.clientMessageId);
       if (!pool) return;
+      if (record.recoveryJob) {
+        void releaseRecoveryPreReceipt(pool, {
+          job: record.recoveryJob,
+          dispatchId: record.dispatchId,
+          dispatchOwner: connId,
+          dispatchLeaseEpoch: record.leaseEpoch,
+        }).catch(() => {});
+        return;
+      }
       void casToTerminal(pool, {
         dispatchId: record.dispatchId,
         outcome: "executed_error",
@@ -2907,6 +3057,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       persistUserRow = true,
       onReject?: (code: string) => void,
       historyModel: string | null = typeof frameObj.model === "string" ? frameObj.model : null,
+      recoveryJob?: ClaimedRecoveryJob,
     ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
@@ -3235,6 +3386,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               ownerId: connId,
               message,
               ...(validatedRecovery ? { recovery: validatedRecovery } : {}),
+              ...(recoveryJob ? {
+                recoveryJob: {
+                  jobId: recoveryJob.jobId,
+                  leaseOwner: recoveryJob.leaseOwner,
+                  leaseEpoch: recoveryJob.leaseEpoch,
+                },
+              } : {}),
             });
           } catch (err) {
             turnLog?.error("user-chat-bridge: dispatch admission threw", {
@@ -3266,6 +3424,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 leaseEpoch: d.leaseEpoch,
                 anchorSeq: d.anchorSeq,
                 requestHash,
+                ...(recoveryJob ? { recoveryJob } : {}),
               });
               // B3(R3):标记本帧已受理 —— 受理后任何 pre-forward 失败出口据此终态化(下方 try/finally)。
               admittedThisFrame = clientMessageId;
@@ -3513,16 +3672,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // this one preparation pipeline. Consequently catalog/epoch fencing,
     // Codex slot acquisition, preCheck, journal creation and authority sealing
     // cannot diverge between the two paths.
-    const prepareQueuedTurn = (
+    const executeAdmittedTurn = (
       data: RawData,
       isBinary: boolean,
-      ingress: "browser" | "prompt_queue" = "browser",
+      ingress: "browser" | "prompt_queue" | "recovery" = "browser",
       dispatchRequest?: PromptQueueDispatchRequest,
+      recoveryJob?: ClaimedRecoveryJob,
     ): void => {
       const isPromptQueueDispatch = ingress === "prompt_queue";
       let promptQueueResolved = false;
       let promptQueueFallbackTimer: ReturnType<typeof setTimeout> | null = null;
       const rejectPromptQueueDispatch = (reasonCode: string): void => {
+        if (recoveryJob && deps.pgPool) {
+          void releaseRecoveryForTransportWait(deps.pgPool, recoveryJob).catch(() => {});
+        }
         if (!dispatchRequest || promptQueueResolved) return;
         promptQueueResolved = true;
         if (promptQueueFallbackTimer !== null) clearTimeout(promptQueueFallbackTimer);
@@ -3545,19 +3708,51 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         frameData: RawData,
         frameIsBinary: boolean,
         frameLength: number,
-      ): boolean => {
+      ): boolean | Promise<boolean> => {
         // `rejectPromptQueueDispatch` is also the cancellation edge. Every
         // async preparation lane funnels through this helper, so a timeout or
         // earlier negative result prevents a late physical execution. Codex
         // callers observe `false` and run their existing slot/journal/precheck
         // compensation before returning.
         if (dispatchRequest && promptQueueResolved) return false;
-        const accepted = forwardInboundFrame(frameData, frameIsBinary, frameLength);
-        if (accepted && dispatchRequest && !promptQueueResolved) {
-          promptQueueResolved = true;
-          if (promptQueueFallbackTimer !== null) clearTimeout(promptQueueFallbackTimer);
+        const completeForward = (accepted: boolean): boolean => {
+          if (accepted && dispatchRequest && !promptQueueResolved) {
+            promptQueueResolved = true;
+            if (promptQueueFallbackTimer !== null) clearTimeout(promptQueueFallbackTimer);
+          }
+          return accepted;
+        };
+        if (!recoveryJob || !deps.pgPool) {
+          return completeForward(forwardInboundFrame(frameData, frameIsBinary, frameLength));
         }
-        return accepted;
+        const record = [...admittedDispatches.values()].find(
+          (candidate) => candidate.recoveryJob?.jobId === recoveryJob.jobId,
+        );
+        if (!record) return false;
+        return forwardRecoveryUnderRootFence(
+          deps.pgPool,
+          {
+            job: recoveryJob,
+            dispatchId: record.dispatchId,
+            dispatchAttemptNo: record.attemptNo,
+            dispatchOwner: connId,
+            dispatchLeaseEpoch: record.leaseEpoch,
+          },
+          () => forwardInboundFrame(frameData, frameIsBinary, frameLength),
+        ).then(
+          (accepted) => {
+            if (!accepted) failDispatchPreForward(record, "recovery_forward_fenced");
+            return completeForward(accepted);
+          },
+          (error) => {
+            bridgeLog?.warn("user-chat-bridge: recovery forward fence failed", {
+              jobId: recoveryJob.jobId,
+              error,
+            });
+            failDispatchPreForward(record, "recovery_forward_fence_failed");
+            return false;
+          },
+        );
       };
       const len = rawDataLen(data);
       if (len > maxFrameBytes) {
@@ -3584,7 +3779,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
         attestQueuedBytes += len;
-        attestQueue.push({ data, isBinary, ingress, dispatchRequest });
+        attestQueue.push({ data, isBinary, ingress, dispatchRequest, recoveryJob });
         return;
       }
       if (dispatchRequest) {
@@ -3708,6 +3903,90 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const strippedStr = JSON.stringify(parsedObj);
               passthroughData = Buffer.from(strippedStr, "utf8");
               passthroughLen = Buffer.byteLength(strippedStr);
+            }
+          }
+
+          // Stop and permission responses are Master-owned durable controls,
+          // not best-effort websocket writes.  Commit first, acknowledge the
+          // persisted state to every tab, then let the lease drainer perform
+          // runtime delivery.  Legacy/test compositions without PG retain the
+          // transparent path during rolling deployment.
+          if (
+            !isPromptQueueDispatch && deps.pgPool && parsed !== null &&
+            typeof parsed === "object" && !Array.isArray(parsed)
+          ) {
+            const controlFrame = parsed as Record<string, unknown>;
+            const controlType = controlFrame.type;
+            if (
+              controlType === "inbound.control.stop" ||
+              controlType === "inbound.permission_response"
+            ) {
+              const peer = isPlainRecord(controlFrame.peer) ? controlFrame.peer : null;
+              const sessionId = peer && typeof peer.id === "string" ? peer.id : null;
+              if (sessionId === null) return;
+              const kind = controlType === "inbound.control.stop" ? "stop" : "permission";
+              const controlId = isControlId(controlFrame.controlId)
+                ? controlFrame.controlId
+                : `control-${randomUUID()}`;
+              const rootClientMessageId = isClientMessageId(controlFrame.clientMessageId)
+                ? controlFrame.clientMessageId
+                : null;
+              const requestId = kind === "permission" && typeof controlFrame.requestId === "string"
+                ? controlFrame.requestId
+                : null;
+              if (kind === "permission" && requestId === null) return;
+              const durablePayload = { ...controlFrame, controlId };
+              void (async () => {
+                try {
+                  const admission = await admitDurableControl(deps.pgPool!, {
+                    controlId,
+                    userId: uid,
+                    sessionId,
+                    rootClientMessageId,
+                    kind,
+                    requestId,
+                    payload: durablePayload,
+                  });
+                  broadcastToUser(uid, {
+                    type: "outbound.control.receipt",
+                    controlId,
+                    controlKind: kind,
+                    status: admission.status === "terminal" ? "terminal" : "persisted",
+                    peer,
+                    ...(rootClientMessageId ? { clientMessageId: rootClientMessageId } : {}),
+                    ...(requestId ? { requestId } : {}),
+                  });
+                  if (admission.status === "pending" || admission.status === "leased") {
+                    await drainDurableControlsForUser(uid);
+                  }
+                } catch (error) {
+                  const conflict = error instanceof TurnControlConflictError;
+                  const errorCode = conflict ? error.code : "CONTROL_PERSIST_UNAVAILABLE";
+                  bridgeLog?.warn("user-chat-bridge: durable control admission failed", {
+                    controlId,
+                    kind,
+                    errorCode,
+                  });
+                  if (conflict) {
+                    broadcastToUser(uid, {
+                      type: "outbound.control.receipt",
+                      controlId,
+                      controlKind: kind,
+                      status: "terminal",
+                      peer,
+                      ...(rootClientMessageId ? { clientMessageId: rootClientMessageId } : {}),
+                      ...(requestId ? { requestId } : {}),
+                      errorCode,
+                    });
+                  } else if (userWs.readyState === WebSocket.OPEN) {
+                    // A storage outage is not a terminal control outcome. Keep
+                    // the browser journal authoritative and force reconnect so
+                    // the exact same controlId is replayed after PG recovers.
+                    try { userWs.close(CLOSE_BRIDGE.SERVER_RESTART, "control_persist_unavailable"); } catch { /* */ }
+                  }
+                }
+              })();
+              return;
             }
           }
 
@@ -4223,6 +4502,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               !isPromptQueueDispatch,
               rejectPromptQueueDispatch,
               authorityModelCapture,
+              recoveryJob,
             );
             // null:attachMasterTurnState 已在内部拒轮(含 dispatch 终态化 + onReject);此处直接 return。
             if (enrichedParsed === null) return;
@@ -4289,7 +4569,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             // forwardPreparedFrame:queue lane 走它兜住 promptQueueResolved(cancel 边);browser
             // lane 无 dispatchRequest → 等价 forwardInboundFrame。dispatch 已 accepted 交容器,不终态化。
-            forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+            await forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
           } catch (err) {
             bridgeLog?.error("user-chat-bridge: annotated image IIFE unexpected error", { err });
             rejectPromptQueueDispatch("ERR_INTERNAL");
@@ -4408,6 +4688,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               !isPromptQueueDispatch,
               rejectPromptQueueDispatch,
               authorityModelCapture,
+              recoveryJob,
             );
             if (preparedInbound === null || !isCurrentCodexTurnState(codexTurnState)) return;
             dispatchRecordB = lookupAdmittedDispatch(preparedInbound);
@@ -4946,7 +5227,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // 转 Buffer 走文本帧(isBinary=false)— 接收端 .toString() 行为一致。
               frameForwardData = Buffer.from(rewrittenStr, "utf8");
               frameForwardLen = rewrittenLen;
-              forwardCommitted = forwardPreparedFrame(
+              forwardCommitted = await forwardPreparedFrame(
                 frameForwardData,
                 frameForwardIsBinary,
                 frameForwardLen,
@@ -5033,7 +5314,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
             // 已 acquire(+ billing 注册若启用)完毕,继续同步 forward 路径
             // (等价于"放行 frame")。两条分支都已 rewrite 注入 traceId(CG2a 合同)。
-            turnForwarded = forwardPreparedFrame(
+            turnForwarded = await forwardPreparedFrame(
               frameForwardData,
               frameForwardIsBinary,
               frameForwardLen,
@@ -5146,6 +5427,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               !isPromptQueueDispatch,
               rejectPromptQueueDispatch,
               authorityModelCapture,
+              recoveryJob,
             );
             if (enrichedParsed === null) return;
             dispatchRecordC = lookupAdmittedDispatch(enrichedParsed);
@@ -5228,7 +5510,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             // forwardPreparedFrame:queue lane 兜住 promptQueueResolved;browser lane 等价
             // forwardInboundFrame。dispatch 已 accepted 交容器,forward 后不终态化。
-            forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
+            await forwardPreparedFrame(Buffer.from(rewrittenStr, "utf8"), false, rewrittenLen);
           } catch (err) {
             bridgeLog?.error("user-chat-bridge: ccb inbound IIFE unexpected error", { err });
             rejectPromptQueueDispatch("ERR_INTERNAL");
@@ -5240,11 +5522,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         })();
         return;
       }
-      forwardPreparedFrame(passthroughData, isBinary, passthroughLen);
+      const passthroughForward = forwardPreparedFrame(passthroughData, isBinary, passthroughLen);
+      if (passthroughForward instanceof Promise) void passthroughForward;
     };
 
     const onUserMessage = (data: RawData, isBinary: boolean): void => {
-      prepareQueuedTurn(data, isBinary, "browser");
+      executeAdmittedTurn(data, isBinary, "browser");
     };
 
     /**
@@ -5368,13 +5651,55 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ) {
               const pool = deps.pgPool;
               if (pool) {
-                void casAdmittedToAccepted(pool, {
-                  dispatchId: rec.dispatchId,
-                  expectedEpoch: rec.leaseEpoch,
-                }).catch(() => {});
+                if (rec.recoveryJob) {
+                  void markRecoveryContainerReceipt(pool, {
+                    dispatchId: rec.dispatchId,
+                    dispatchAttemptNo: rec.attemptNo,
+                    expectedDispatchLeaseEpoch: rec.leaseEpoch,
+                  }).catch(() => {});
+                } else {
+                  void casAdmittedToAccepted(pool, {
+                    dispatchId: rec.dispatchId,
+                    expectedEpoch: rec.leaseEpoch,
+                  }).catch(() => {});
+                }
               }
               dropAdmittedDispatch(rec.clientMessageId);
             }
+            return;
+          }
+        }
+        // Durable Stop/permission runtime receipt. Commit the lifecycle edge
+        // before notifying tabs; if PG is unavailable the lease expires and
+        // the identical control is retried instead of being guessed applied.
+        if (attestPeek !== null && attestPeek.includes('"outbound.control.receipt"')) {
+          let parsedControl: unknown = null;
+          try { parsedControl = JSON.parse(attestPeek); } catch { /* ordinary frame */ }
+          if (
+            isPlainRecord(parsedControl) &&
+            parsedControl.type === "outbound.control.receipt" &&
+            isControlId(parsedControl.controlId) &&
+            (parsedControl.status === "applied" || parsedControl.status === "terminal")
+          ) {
+            if (!deps.pgPool) return;
+            const receipt = parsedControl as {
+              controlId: string
+              status: "applied" | "terminal"
+              errorCode?: unknown
+            };
+            void markTurnControlReceipt(deps.pgPool, {
+              userId: uid,
+              controlId: receipt.controlId,
+              status: receipt.status,
+              errorCode: typeof receipt.errorCode === "string" ? receipt.errorCode : null,
+            }).then((committed) => {
+              if (committed) broadcastToUser(uid, parsedControl);
+            }).catch((error) => {
+              bridgeLog?.warn("user-chat-bridge: durable control receipt commit failed", {
+                controlId: receipt.controlId,
+                error,
+              });
+            });
             return;
           }
         }
@@ -5476,7 +5801,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               claimToken: request.claim.claimToken,
             },
           };
-          prepareQueuedTurn(
+          executeAdmittedTurn(
             Buffer.from(JSON.stringify(inbound), "utf8"),
             false,
             "prompt_queue",
@@ -5827,6 +6152,50 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           }
         }
       }
+      // Permission prompt authority is durable before browser visibility. The
+      // exact runtime-authored tool identity/input survives a browser or
+      // Master restart; bridge disconnect is therefore no longer an implicit
+      // denial signal at the commercial boundary.
+      let permissionAuthorityCommit: Promise<void> | null = null;
+      if (!isBinary && deps.pgPool) {
+        let permissionText: string | null = null;
+        if (typeof data === "string") permissionText = data;
+        else if (Buffer.isBuffer(data)) {
+          try { permissionText = data.toString("utf8"); } catch { permissionText = null; }
+        }
+        if (permissionText?.includes('"outbound.permission_request"')) {
+          let parsedPermission: unknown = null;
+          try { parsedPermission = JSON.parse(permissionText); } catch { /* generic frame */ }
+          if (
+            isPlainRecord(parsedPermission) &&
+            parsedPermission.type === "outbound.permission_request" &&
+            typeof parsedPermission.requestId === "string" &&
+            typeof parsedPermission.toolName === "string" &&
+            isPlainRecord(parsedPermission.peer) &&
+            typeof parsedPermission.peer.id === "string" &&
+            isPlainRecord(parsedPermission.inputJson)
+          ) {
+            permissionAuthorityCommit = persistPermissionAuthority(deps.pgPool, {
+              userId: uid,
+              requestId: parsedPermission.requestId,
+              sessionId: parsedPermission.peer.id,
+              clientMessageId: isClientMessageId(parsedPermission.clientMessageId)
+                ? parsedPermission.clientMessageId
+                : null,
+              toolUseId: typeof parsedPermission.toolUseId === "string"
+                ? parsedPermission.toolUseId
+                : null,
+              toolName: parsedPermission.toolName,
+              input: parsedPermission.inputJson,
+              askPayload: parsedPermission.toolName === "AskUserQuestion"
+                ? parsedPermission.inputJson
+                : null,
+              expiresAt: new Date(Date.now() + 30 * 60_000),
+            }).then(() => {});
+          }
+        }
+      }
+
       // Phase 4 — outbound.control.session_repo_status 侧信道(容器→master→user):
       //   master 须**先**落 DB(applyStatusFrame:更新 status / token_invalid 触发
       //   revoke + clear sessions),再让帧流到 userWs 让前端 UI 反映状态。
@@ -6086,6 +6455,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           stamped.storeKey,
           stamped.frameSeq,
           async () => {
+            if (permissionAuthorityCommit !== null) await permissionAuthorityCommit;
             await deps.persistOutboundFrame!({
               uid,
               sessionId: durableSessionId,
@@ -6109,6 +6479,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             try { userWs.close(CLOSE_BRIDGE.INTERNAL, "output persistence unavailable"); } catch { /* */ }
           },
         );
+        return;
+      }
+      if (permissionAuthorityCommit !== null) {
+        void permissionAuthorityCommit.then(forwardCommittedFrame).catch((error) => {
+          bridgeLog?.error("user-chat-bridge: permission authority commit failed", {
+            error: (error as Error)?.message ?? String(error),
+          });
+          try { userWs.close(CLOSE_BRIDGE.INTERNAL, "permission persistence unavailable"); } catch { /* */ }
+        });
         return;
       }
       forwardCommittedFrame();
@@ -6152,9 +6531,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // sys.* 命名;前端 default case 忽略未知 type,加 case 是 additive。
       if (userWs.readyState === WebSocket.OPEN) {
         try {
-          userWs.send(JSON.stringify({ type: "sys.relay_ready" }));
+          userWs.send(JSON.stringify({
+            type: "sys.relay_ready",
+            automaticRecoveryOwner: "master-v1",
+          }));
         } catch { /* swallow */ }
       }
+      void drainDurableControlsForUser(uid);
       // 冲刷 preopen queue
       for (const m of preopenQueue) sendToContainer(m.data, m.isBinary, m.len);
       preopenQueue.length = 0;
@@ -6903,6 +7286,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (set.size === 0) uidToContainerWs.delete(key);
         }
       }
+      if (recoveryExecutor !== null) {
+        const key = uid.toString();
+        const executors = uidToRecoveryExecutors.get(key);
+        if (executors) {
+          executors.delete(recoveryExecutor);
+          if (executors.size === 0) uidToRecoveryExecutors.delete(key);
+        }
+        recoveryExecutor = null;
+      }
     }
 
     /**
@@ -7023,6 +7415,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   async function shutdown(reason = "server shutting down"): Promise<void> {
     clearInterval(ringPruneTimer);
+    clearInterval(controlDrainTimer);
+    clearInterval(recoveryDrainTimer);
     registry.closeAll(reason);
     await Promise.allSettled([...outboundPersistQueues.values()].map((state) => state.tail));
     await new Promise<void>((resolve) => {

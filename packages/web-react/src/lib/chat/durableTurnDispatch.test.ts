@@ -92,10 +92,16 @@ function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
     ...overrides,
   });
 }
-function helloFrames(ws: FakeWS): Array<{ peers: Array<Record<string, unknown>> }> {
+function helloFrames(ws: FakeWS): Array<{
+  peers: Array<Record<string, unknown>>;
+  automaticRecoveryOwner?: string;
+}> {
   return ws.sent
     .filter((raw) => raw.includes('"inbound.hello"'))
-    .map((raw) => JSON.parse(raw) as { peers: Array<Record<string, unknown>> });
+    .map((raw) => JSON.parse(raw) as {
+      peers: Array<Record<string, unknown>>;
+      automaticRecoveryOwner?: string;
+    });
 }
 
 // ═══════════════ 1. hello 携带在飞 turn 身份 ═══════════════
@@ -134,6 +140,7 @@ describe("hello inFlightClientMessageId (RFC §4)", () => {
     expect(ws2).not.toBe(ws1);
     ws2.open();
     const helloInflight = helloFrames(ws2).at(-1)!;
+    expect(helloInflight.automaticRecoveryOwner).toBe("master-v1");
     expect(helloInflight.peers[0]).toMatchObject({ inFlight: true, inFlightClientMessageId: userId });
 
     // 收尾后再重连 → inFlight=false 且不带 inFlightClientMessageId。
@@ -148,6 +155,35 @@ describe("hello inFlightClientMessageId (RFC §4)", () => {
     expect(helloIdle.peers[0].inFlight).toBe(false);
     expect(helloIdle.peers[0].inFlightClientMessageId).toBeUndefined();
     sock.stop();
+  });
+
+  test("only an explicit master-v1 relay owner disables browser semantic recovery", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+
+    const masterOwned = makeSocket();
+    masterOwned.setGateReady(true);
+    const masterWs = FakeWS.instances.at(-1)!;
+    masterWs.open();
+    masterWs.onmessage?.({ data: JSON.stringify({
+      type: "sys.relay_ready",
+      automaticRecoveryOwner: "master-v1",
+    }) });
+    const masterRecovery = vi.spyOn(masterOwned as any, "autoRecoverTerminalTurn");
+    (masterOwned as any).effects().scheduleAutomaticRecovery("s-master", "u-master");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(masterRecovery).not.toHaveBeenCalled();
+
+    const legacy = makeSocket();
+    legacy.setGateReady(true);
+    FakeWS.instances.at(-1)!.open(); // relay_ready without an owner = rolling legacy peer
+    const legacyRecovery = vi.spyOn(legacy as any, "autoRecoverTerminalTurn");
+    (legacy as any).effects().scheduleAutomaticRecovery("s-legacy", "u-legacy");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(legacyRecovery).toHaveBeenCalledWith("s-legacy", "u-legacy");
+
+    masterOwned.stop();
+    legacy.stop();
   });
 });
 
@@ -495,6 +531,34 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     sock.stop();
   });
 
+  test("REST terminal authority also settles a Stop whose live final was lost", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const deletePendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ deletePendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "stop then lose final" });
+    const s = sock.sessions.get("s1")!;
+    const cmid = s.messages.find((m) => m.role === "user")!.id;
+    sock.stopTurn("s1");
+    const controlId = s._stopSettlement!.controlId!;
+
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [srvRow({ id: "srv-stop-final", _seq: 2, text: "stopped", _clientMessageId: cmid })],
+      true,
+      2,
+      { serverUpdatedAt: 100 },
+    );
+
+    expect(s._stopSettlement).toBeUndefined();
+    expect(s._sendingInFlight).toBe(false);
+    expect(deletePendingControl).toHaveBeenCalledWith("s1", controlId);
+    sock.stop();
+  });
+
   test("非活跃轮的终态证据不误清其他会话的发送态", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -608,6 +672,15 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     const oldId = userMsg.id;
     // 模拟 dispatch 终态:发送态清空、user 行 error、durable status 到位。
     sock.stopTurn("s1");
+    const stopped = s._stopSettlement!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stopped.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: oldId,
+    }) });
     userMsg.status = "error";
     s.messages.push(
       srvRow({ id: "turn-status:d1", role: "system", _seq: 2, _turnStatusRecord: true,
@@ -699,6 +772,15 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     const oldId = userMsg.id;
     // 普通失败:无 dispatch 终态证据。
     sock.stopTurn("s1");
+    const stopped = s._stopSettlement!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stopped.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: oldId,
+    }) });
     userMsg.status = "error";
     ws.sent.length = 0;
 

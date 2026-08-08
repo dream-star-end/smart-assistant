@@ -29,7 +29,17 @@ except AttributeError:
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForObjectDetection, AutoModelForTextRecognition
 
-from worker_common import claim_job, connect, ensure_count, mark_terminal, owner_usage
+from worker_common import (
+    assemble_page_checkpoints,
+    claim_job,
+    connect,
+    ensure_count,
+    load_page_checkpoints,
+    mark_terminal,
+    mark_waiting,
+    owner_usage,
+    publish_page_checkpoint,
+)
 
 
 class Cancelled(Exception):
@@ -145,19 +155,16 @@ def raster_pages(rasterizer: Path, source: Path, job_dir: Path, numbers: list[in
         return [future.result() for future in futures]
 
 
-def write_page(jsonl, markdown, page: int, mode: str, text: str, blocks: list[dict], replacements: int) -> None:
-    payload = {"page": page, "engine": mode, "text": text, "blocks": blocks, "vl_replacements": replacements}
-    jsonl.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    markdown.write(f"\n\n## Page {page}\n\n{text.rstrip()}\n")
-    jsonl.flush(); markdown.flush()
+def page_payload(page: int, mode: str, text: str, blocks: list[dict], replacements: int) -> dict:
+    return {"page": page, "engine": mode, "text": text, "blocks": blocks, "vl_replacements": replacements}
 
 
-def assert_storage_budget(db_path: Path, jobs_dir: Path, row, json_tmp: Path, md_tmp: Path) -> None:
+def assert_storage_budget(db_path: Path, jobs_dir: Path, row, job_dir: Path) -> None:
     usage = shutil.disk_usage(jobs_dir)
     reserve = int(os.environ.get("OC_OCR_DISK_RESERVE_BYTES", str(20 * 1024**3)))
     divisor = max(1, int(os.environ.get("OC_OCR_OWNER_DISK_SHARE_DIVISOR", "8")))
     owner_budget = max(0, usage.total - reserve) // divisor
-    result_bytes = (json_tmp.stat().st_size if json_tmp.exists() else 0) + (md_tmp.stat().st_size if md_tmp.exists() else 0)
+    result_bytes = sum(path.stat().st_size for path in (job_dir / "pages").glob("page-*"))
     db = connect(db_path)
     _, stored = owner_usage(db, row["owner"])
     db.close()
@@ -169,19 +176,26 @@ def process_job(args, row, det_p, det, rec_p, rec) -> None:
     job_id = row["id"]
     job_dir = args.jobs_dir / job_id
     source = Path(row["source_path"])
-    for path in [job_dir / "result.jsonl.tmp", job_dir / "result.md.tmp"]:
-        path.unlink(missing_ok=True)
     manifest = run_limited([sys.executable, str(args.rasterizer), "manifest", str(source)], args.db, job_id, int(os.environ.get("OC_OCR_RASTER_WALL_SECONDS", "180")))
     total = int(manifest["pages"])
     if total < 1:
         raise RuntimeError("document has no pages")
+    contract_digest = str(row["contract_digest"] or "")
+    if not contract_digest:
+        raise RuntimeError("OCR job contract digest is missing")
+    checkpoint_entries = load_page_checkpoints(
+        job_dir, contract_digest, args.worker_release, args.pipeline_digest
+    )
+    if len(checkpoint_entries) > total:
+        raise RuntimeError("OCR checkpoint exceeds current document page count")
+    resume_page = len(checkpoint_entries) + 1
     db = connect(args.db)
-    db.execute("UPDATE jobs SET pages_total=?,phase='rasterizing',updated_at=? WHERE id=?", (total, time.time(), job_id))
+    db.execute(
+        "UPDATE jobs SET pages_total=?,pages_done=?,phase='rasterizing',updated_at=? WHERE id=?",
+        (total, len(checkpoint_entries), time.time(), job_id),
+    )
     db.close()
-    json_tmp, md_tmp = job_dir / "result.jsonl.tmp", job_dir / "result.md.tmp"
-    with json_tmp.open("w", encoding="utf-8") as jsonl, md_tmp.open("w", encoding="utf-8") as markdown:
-        markdown.write(f"# OCR: {row['filename']}\n")
-        for start in range(1, total + 1, 24):
+    for start in range(resume_page, total + 1, 24):
             if cancelled(args.db, job_id):
                 raise Cancelled()
             numbers = list(range(start, min(total + 1, start + 24)))
@@ -191,8 +205,12 @@ def process_job(args, row, det_p, det, rec_p, rec) -> None:
                     if cancelled(args.db, job_id):
                         raise Cancelled()
                     values = call_vl(args.vl_socket, [str(path)], 1, "OCR:", int(os.environ.get("OC_OCR_VL_PAGE_MAX_TOKENS", "8192")))
-                    write_page(jsonl, markdown, page, "vl", values[0]["text"], [], 0)
-                    assert_storage_budget(args.db, args.jobs_dir, row, json_tmp, md_tmp)
+                    payload = page_payload(page, "vl", values[0]["text"], [], 0)
+                    publish_page_checkpoint(
+                        job_dir, contract_digest, args.worker_release,
+                        args.pipeline_digest, page, payload, values[0]["text"],
+                    )
+                    assert_storage_budget(args.db, args.jobs_dir, row, job_dir)
                     path.unlink(missing_ok=True)
                     db = connect(args.db); db.execute("UPDATE jobs SET pages_done=?,phase='vl',updated_at=? WHERE id=?", (page, time.time(), job_id)); db.close()
                 continue
@@ -236,9 +254,9 @@ def process_job(args, row, det_p, det, rec_p, rec) -> None:
                 if cancelled(args.db, job_id):
                     raise Cancelled()
                 if page_index in whole_pages:
-                    write_page(jsonl, markdown, page, "hybrid", whole_pages[page_index], [], 1)
+                    text = whole_pages[page_index]
+                    payload = page_payload(page, "hybrid", text, [], 1)
                     phase = "hybrid-vl"
-                    replacement_count = 1
                 else:
                     page_replacements = {
                         item_index: text
@@ -254,12 +272,30 @@ def process_job(args, row, det_p, det, rec_p, rec) -> None:
                         blocks.append({"box": item["box"], "text": text, "pp_score": item["rec_score"], "vl": index in page_replacements})
                     replacement_count = len(page_replacements)
                     phase = "hybrid-vl" if replacement_count else "pp"
-                    write_page(jsonl, markdown, page, row["mode"], "\n".join(lines), blocks, replacement_count)
-                assert_storage_budget(args.db, args.jobs_dir, row, json_tmp, md_tmp)
+                    text = "\n".join(lines)
+                    payload = page_payload(page, row["mode"], text, blocks, replacement_count)
+                publish_page_checkpoint(
+                    job_dir, contract_digest, args.worker_release,
+                    args.pipeline_digest, page, payload, text,
+                )
+                assert_storage_budget(args.db, args.jobs_dir, row, job_dir)
                 path.unlink(missing_ok=True)
                 db = connect(args.db); db.execute("UPDATE jobs SET pages_done=?,phase=?,updated_at=? WHERE id=?", (page, phase, time.time(), job_id)); db.close()
-    os.replace(json_tmp, job_dir / "result.jsonl")
-    os.replace(md_tmp, job_dir / "result.md")
+    if len(load_page_checkpoints(
+        job_dir, contract_digest, args.worker_release, args.pipeline_digest
+    )) != total:
+        raise RuntimeError("OCR checkpoint manifest is incomplete")
+    assemble_page_checkpoints(
+        job_dir, contract_digest, args.worker_release,
+        args.pipeline_digest, row["filename"],
+    )
+
+
+def transient_failure(exc: Exception) -> bool:
+    if isinstance(exc, (OSError, ConnectionError, TimeoutError, socket.timeout)):
+        return True
+    message = str(exc).lower()
+    return "vl runner failed" in message or "temporarily unavailable" in message
 
 
 def main() -> None:
@@ -275,6 +311,10 @@ def main() -> None:
     parser.add_argument("--probe-image", type=Path, required=True)
     parser.add_argument("--raster-workers", type=int, default=6)
     args = parser.parse_args()
+    args.worker_release = os.environ.get("OC_OCR_WORKER_RELEASE", "")
+    args.pipeline_digest = os.environ.get("OC_OCR_PIPELINE_DIGEST", "")
+    if not args.worker_release or not args.pipeline_digest:
+        raise RuntimeError("OCR worker release/pipeline identity is required")
     det_p = AutoImageProcessor.from_pretrained(args.det_model, local_files_only=True)
     det = AutoModelForObjectDetection.from_pretrained(args.det_model, local_files_only=True).to("cuda").eval()
     rec_p = AutoImageProcessor.from_pretrained(args.rec_model, local_files_only=True)
@@ -301,7 +341,12 @@ def main() -> None:
             mark_terminal(args.db, args.jobs_dir, row["id"], "cancelled", None, retention)
         except Exception as exc:
             print(json.dumps({"event": "job_failed", "job": row["id"], "error": str(exc), "trace": traceback.format_exc(limit=5)}), flush=True)
-            mark_terminal(args.db, args.jobs_dir, row["id"], "failed", str(exc)[:1000], retention)
+            if cancelled(args.db, row["id"]):
+                mark_terminal(args.db, args.jobs_dir, row["id"], "cancelled", None, retention)
+            elif transient_failure(exc):
+                mark_waiting(args.db, args.jobs_dir, row["id"], str(exc), retention)
+            else:
+                mark_terminal(args.db, args.jobs_dir, row["id"], "failed", str(exc)[:1000], retention)
 
 
 if __name__ == "__main__":

@@ -82,6 +82,18 @@ describe("PermissionCard 自动弹框的存活边界", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  test("durable decision waiting for Master receipt cannot be submitted twice", () => {
+    render(
+      <PermissionCard
+        msg={askMsg({ _controlPending: true })}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByText("正在提交…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "回答" })).toBeNull();
+  });
+
   test("readOnly surface（管理端会话查看）永不弹框", () => {
     render(<PermissionCard msg={askMsg()} onRespond={vi.fn()} readOnly />);
     expect(screen.queryByRole("dialog")).toBeNull();

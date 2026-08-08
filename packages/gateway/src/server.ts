@@ -63,6 +63,10 @@ import {
   stripDispatchAuthorityField,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
+
+const CONTROL_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
+const isControlId = (value: unknown): value is string =>
+  typeof value === 'string' && CONTROL_ID_RE.test(value)
 import {
   classifiedMessageForCode,
   classifyDelegateOutputError,
@@ -11633,16 +11637,16 @@ export class Gateway {
           this.clientsByPeer.set(peerKey, set)
         }
         if (!set.has(ws)) {
-          set.add(ws)
-          ws.once('close', () => {
-            set?.delete(ws)
-            if (set?.size === 0) {
-              this.clientsByPeer.delete(peerKey)
-              // Auto-deny all pending permission requests for this peer
-              // since no client is available to respond.
-              this._autoDenyPendingPermissions(peerKey)
-            }
-          })
+            set.add(ws)
+            ws.once('close', () => {
+              set?.delete(ws)
+              if (set?.size === 0) {
+                this.clientsByPeer.delete(peerKey)
+                // Browser/bridge disconnect is transport loss, not a user's
+                // permission decision. Keep pending authority + ring replay so
+                // a reconnect can answer the exact same request.
+              }
+            })
         }
         // ── durable inbox 准入(RFC-v5-durable-turn-dispatch §3.b)───────────
         // 有 descriptor(webchat-DM 已验签):INSERT queued;已有行 → 回执帧给
@@ -11704,13 +11708,42 @@ export class Gateway {
         if (!isFromBridge) return
         await this.sessions.syncGoalState(frame.goal.sessionId, frame.goal)
       } else if (frame.type === 'inbound.control.stop') {
-        await this.handleStop(frame)
+        const applied = await this.handleStop(frame)
+        const controlId = (frame as unknown as { controlId?: unknown }).controlId
+        if (isControlId(controlId)) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'outbound.control.receipt',
+              controlId,
+              controlKind: 'stop',
+              status: applied ? 'applied' : 'terminal',
+              peer: frame.peer,
+              ...(isClientMessageId(frame.clientMessageId)
+                ? { clientMessageId: frame.clientMessageId }
+                : {}),
+              ...(applied ? {} : { errorCode: 'TURN_NOT_ACTIVE' }),
+            }))
+          } catch {}
+        }
       } else if ((frame as any).type === 'inbound.permission_response') {
         // Stash userId so handlePermissionResponse can rebuild per-user
         // peerKey on the late-duplicate no-pending-entry fallback path
         // (the only path where we have no server-trusted user identity).
         ;(frame as any)._userId = this.getWsUserId(ws)
         await this.handlePermissionResponse(frame as any)
+        const controlId = (frame as unknown as { controlId?: unknown }).controlId
+        if (isControlId(controlId)) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'outbound.control.receipt',
+              controlId,
+              controlKind: 'permission',
+              status: 'terminal',
+              peer: (frame as any).peer,
+              requestId: (frame as any).requestId,
+            }))
+          } catch {}
+        }
       } else if ((frame as any).type === 'inbound.control.reset') {
         // Reset: kill the CCB subprocess AND remove session from manager,
         // so next message creates an entirely fresh session with no history
@@ -14539,33 +14572,21 @@ export class Gateway {
             toolUseID: e.request.toolUseId,
           })
         } else {
-          const clients = this.clientsByPeer.get(peerKey)
-          if (clients && clients.size > 0) {
-            // Register pending request for single-settlement + disconnect auto-deny
-            this._pendingPermissions.set(e.request.requestId, {
-              sessionKey,
-              toolName: e.request.toolName,
-              input: e.request.input,
-              toolUseId: e.request.toolUseId,
-              peerKey,
-              userId: dispatchUserId,
-              channel: frame.channel,
-              peer: frame.peer,
-              expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
-            })
-            // Stamp + store in outbound ring so a reconnecting client (e.g. iOS
-            // Safari restored a suspended tab) can replay the request via
-            // autoResumeFromHello. Without ring storage the modal would never
-            // re-fire after a disconnect window.
-            this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
-          } else {
-            // No connected client — auto-deny
-            session.runner.sendPermissionResponse(e.request.requestId, {
-              behavior: 'deny',
-              message: 'No connected client to approve',
-              toolUseID: e.request.toolUseId,
-            })
-          }
+          // Register regardless of current websocket presence. A brief mobile
+          // suspend or Master restart must not be interpreted as a denial; the
+          // stamped ring replays this exact request after reconnect.
+          this._pendingPermissions.set(e.request.requestId, {
+            sessionKey,
+            toolName: e.request.toolName,
+            input: e.request.input,
+            toolUseId: e.request.toolUseId,
+            peerKey,
+            userId: dispatchUserId,
+            channel: frame.channel,
+            peer: frame.peer,
+            expiresAt: Date.now() + Gateway.PENDING_PERMISSION_TTL_MS,
+          })
+          this._sendStampedSessionFrame(sessionKey, peerKey, permFrame)
         }
       } else if (e.kind === 'turn_status') {
         // Plan 2 (compact-progress-frame) — CCB setSDKStatus 侧信道。CcbMessageParser

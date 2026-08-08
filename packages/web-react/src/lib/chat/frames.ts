@@ -108,6 +108,17 @@ export type OutboundActiveTurnReplayStartWire = OutboundActiveTurnReplayStart;
 export type OutboundTurnStatusWire = OutboundTurnStatus & WireRuntimeFields;
 export type OutboundTurnUsageWire = OutboundTurnUsage & WireRuntimeFields;
 export type OutboundCallUsageWire = OutboundCallUsage & WireRuntimeFields;
+export type OutboundControlReceiptWire = {
+  type: "outbound.control.receipt";
+  controlId: string;
+  controlKind: "stop" | "permission";
+  status: "persisted" | "applied" | "terminal";
+  peer?: Peer;
+  clientMessageId?: string;
+  requestId?: string;
+  attempt?: number;
+  errorCode?: string;
+} & WireRuntimeFields;
 
 /** legacy bridge error 帧（`type:'error'`，protocol 未建模）。*/
 export type LegacyBridgeErrorWire = {
@@ -157,7 +168,11 @@ export type ColdStartWire = { type: "sys.cold_start"; peer?: Peer };
 
 /** bridge↔容器 relay 真建立的就绪信号（containerWs open，冷暖都发）。readiness 单一权威：
  *  前端据此立即排空离线队列（冷启时 ws.onopen 早于 relay 就绪，期间消息排队等此信号）。*/
-export type RelayReadyWire = { type: "sys.relay_ready"; peer?: Peer };
+export type RelayReadyWire = {
+  type: "sys.relay_ready";
+  peer?: Peer;
+  automaticRecoveryOwner?: "master-v1";
+};
 
 /** 前端版本握手：bridge 在 userWs accept 时下发（服务端权威=dist/index.html 的 oc-build meta）。
  *  build=服务端当前 oc-build id 字符串；appUpdate governor 据此在安全点软刷新长驻旧 bundle。*/
@@ -262,6 +277,7 @@ export type OutboundWire =
   | OutboundTurnStatusWire
   | OutboundTurnUsageWire
   | OutboundCallUsageWire
+  | OutboundControlReceiptWire
   | PromptQueueSnapshot
   | LegacyBridgeErrorWire
   | CostChargedWire
@@ -285,6 +301,7 @@ export type { InboundControlStop, InboundMessage, InboundPermissionResponse };
 export type InboundHelloWire = {
   type: "inbound.hello";
   channel: "webchat";
+  automaticRecoveryOwner: "master-v1";
   peers: Array<{
     peerId: string;
     agentId: string;

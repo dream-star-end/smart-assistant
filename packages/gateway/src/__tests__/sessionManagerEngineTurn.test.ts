@@ -565,7 +565,7 @@ describe("crash/interrupt partial persistence", () => {
           if (attempt <= 3) {
             r.thinking(`attempt ${attempt} thinking`);
             r.text(`attempt ${attempt} process`);
-            r.toolPair(`retry-tool-${attempt}`, "Bash", `attempt ${attempt} output`);
+            r.toolPair(`retry-tool-${attempt}`, "Read", `attempt ${attempt} output`);
             r.plan({
               blockId: `retry-plan-${attempt}`,
               text: `attempt ${attempt} plan`,
@@ -620,6 +620,12 @@ describe("crash/interrupt partial persistence", () => {
         payload.tools?.map((tool) => tool.output),
         ["attempt 1 output", "attempt 2 output", "attempt 3 output"],
       );
+      assert.ok(payload.tools?.every((tool) =>
+        (tool as typeof tool & { _toolEffect?: { authority?: string; safety?: string } })
+          ._toolEffect?.authority === "gateway-v1" &&
+        (tool as typeof tool & { _toolEffect?: { authority?: string; safety?: string } })
+          ._toolEffect?.safety === "read_only"
+      ));
       assert.deepEqual(
         payload.structuredBlocks?.map((block) => block.text),
         ["attempt 1 plan", "attempt 2 plan", "attempt 3 plan"],
@@ -1275,6 +1281,7 @@ describe("crash/interrupt partial persistence", () => {
 
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0].status, "interrupted");
+      assert.equal(captured.payloads[0].errorCode, "RUNNER_CRASHED");
       assert.equal(captured.payloads[0].text, "stopped midway");
       assert.ok(events.some((e) => e.kind === "error" && e.error.includes("SIGTERM")));
     } finally {
@@ -2344,9 +2351,36 @@ describe("crash/interrupt partial persistence", () => {
       assert.ok(
         captured.payloads[0]!.runtimeEvents?.some((event) =>
           (event.payload as { type?: unknown }).type === "terminal_error" &&
+          (event.payload as { code?: unknown }).code === "RUNNER_CRASHED" &&
           (event.payload as { detail?: unknown }).detail === "pipe reported failure before close"
         ),
       );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("submit failure persists the canonical RUNNER_CRASHED recovery code", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const runner = new FakeCcbRunner(() => {
+        throw new Error("stdin closed before submit");
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, []);
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "crashed");
+      assert.equal(captured.payloads[0]!.errorCode, "RUNNER_CRASHED");
+      assert.match(captured.payloads[0]!.errorDetail ?? "", /stdin closed before submit/);
     } finally {
       setV3MasterSinkSingleton(null);
     }

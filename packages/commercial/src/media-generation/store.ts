@@ -543,6 +543,30 @@ export async function updateActiveJob(
   return result.rows[0] ? mapJob(result.rows[0]) : null
 }
 
+/** Rotate only an already fenced attempt for which the worker supplied an
+ * exact retry-safe tombstone. The caller must ACK/scrub the old attempt first;
+ * a failed CAS leaves the master reconnecting to that durable tombstone. */
+export async function rotateRecoverableAttempt(
+  job: Pick<MediaJobRow, 'id' | 'attemptId' | 'fenceVersion'>,
+): Promise<MediaJobRow | null> {
+  if (!job.attemptId) return null
+  const nextAttemptId = randomUUID()
+  const result = await query<JobDb>(
+    `UPDATE media_generation_jobs
+        SET status='dispatching',phase='transferring_inputs',attempt_id=$4,
+            fence_version=fence_version+1,request_digest=NULL,
+            worker_staging_started_at=NULL,submit_started_at=NULL,
+            current_step=NULL,total_steps=NULL,error_code=NULL,error_message=NULL,
+            worker_ack_pending=FALSE,worker_acked_at=NULL,locked_at=NOW(),updated_at=NOW()
+      WHERE id=$1 AND attempt_id=$2 AND fence_version=$3
+        AND status IN ('dispatching','running','reconnecting')
+        AND cancel_requested_at IS NULL
+      RETURNING ${JOB_COLUMNS}`,
+    [job.id, job.attemptId, job.fenceVersion, nextAttemptId],
+  )
+  return result.rows[0] ? mapJob(result.rows[0]) : null
+}
+
 export async function completeJob(
   job: MediaJobRow,
   result: { path: string; sha256: string; size: number },
