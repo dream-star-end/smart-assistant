@@ -1510,6 +1510,74 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("browser Stop maps the DeepSeek CCB empty-message null-stop diagnostic to USER_CANCELLED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const dispatchId = "66666666-6666-4666-8666-666666666666";
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.thinking("partial DeepSeek thinking before Stop");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => {
+        setImmediate(() => {
+          runner.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            errors: [
+              "[ede_diagnostic] result_type=undefined last_content_type=n/a stop_reason=null",
+            ],
+            usage: { input_tokens: 30_870, output_tokens: 0 },
+          });
+        });
+        return true;
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-deepseek-empty-message",
+          dispatchId,
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.errorDetail, "本轮已由用户停止。");
+      assert.equal(payload.thinkingText, "partial DeepSeek thinking before Stop");
+      assert.equal(payload.dispatchId, dispatchId);
+      assert.deepEqual(
+        events.filter((event) => event.kind === "error"),
+        [{ kind: "error", error: "本轮已由用户停止。", errorCode: "user_cancelled" }],
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop does not hide a real CCB error after the null-stop diagnostic", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
