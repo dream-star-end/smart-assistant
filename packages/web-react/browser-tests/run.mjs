@@ -184,7 +184,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #root{position:static;height:auto;overflow:visible}
   .timeline-scroll-probe{height:360px;width:640px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
   #timeline-archive-root .chat-virtual-item{min-height:40px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -295,6 +295,69 @@ await page.route("**/api/media-generation/**", (route, request) => {
       kind: "h3_generate", resourceClass: "gpu-h3", status: "canceled", phase: "canceled",
       prompt: "BROWSER_MEDIA_TASK", createdAt: "2026-08-05T00:00:00.000Z", updatedAt: "2026-08-05T00:00:01.000Z",
     } }) });
+  }
+  return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND" } }) });
+});
+const weiboRelinkHttp = { starts: [], accountDeletes: [] };
+await page.route("**/api/connectors**", (route, request) => {
+  const url = new URL(request.url());
+  if (url.pathname === "/api/connectors") {
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ providers: [], connections: [] }) });
+  }
+  if (url.pathname === "/api/connectors/declarative/management") {
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ connectors: [], connections: [] }) });
+  }
+  return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND" } }) });
+});
+const weiboSetupView = {
+  sessionId: "38383838-3838-4838-8838-383838383838",
+  status: "waiting_for_scan",
+  phase: "generating_qr",
+  qrReady: false,
+  createdAt: "2026-08-08T00:00:00.000Z",
+  expiresAt: "2026-08-08T00:04:00.000Z",
+};
+await page.route("**/api/plugins/**", (route, request) => {
+  const url = new URL(request.url());
+  if (url.pathname === "/api/plugins/management" && request.method() === "GET") {
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      catalog: [{
+        versionId: "301", slug: "weibo", pluginType: "managed-browser", label: "微博",
+        description: "通过受管浏览器读取微博", accountMode: "required",
+        actions: [{ id: "list_home_posts", description: "读取首页微博", readOnly: true }],
+        installed: true, installedVersion: "1.2.0", latestVersionId: "301",
+        latestVersion: "1.2.0", installedCurrent: true, updateAvailable: false, available: true,
+      }],
+      accounts: [{
+        id: "902", provider: "weibo", pluginType: "managed-browser", displayName: "我的微博",
+        accountHint: "微博扫码账号", status: "active", versionId: "301", executable: true,
+        actions: [{ id: "list_home_posts", description: "读取首页微博", readOnly: true }],
+        writeControl: {
+          available: true, enabled: true, disclaimerVersion: 2, acceptedVersion: 2,
+          acceptedAt: "2026-08-08T00:00:00.000Z", disclaimerText: "微博写入免责声明",
+          preapproval: {
+            available: true, enabled: true, disclaimerVersion: 1, acceptedVersion: 1,
+            acceptedAt: "2026-08-08T00:00:00.000Z", disclaimerText: "微博免逐次确认免责声明",
+          },
+        },
+      }],
+    }) });
+  }
+  if (url.pathname === "/api/plugins/weibo/setup" && request.method() === "POST") {
+    weiboRelinkHttp.starts.push(JSON.parse(request.postData() ?? "null"));
+    return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify(weiboSetupView) });
+  }
+  if (url.pathname === `/api/plugins/weibo/setup/${weiboSetupView.sessionId}` && request.method() === "GET") {
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(weiboSetupView) });
+  }
+  if (url.pathname === `/api/plugins/weibo/setup/${weiboSetupView.sessionId}` && request.method() === "DELETE") {
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      ...weiboSetupView, status: "cancelled", phase: "cancelled",
+    }) });
+  }
+  if (/^\/api\/plugins\/accounts\/\d+$/.test(url.pathname) && request.method() === "DELETE") {
+    weiboRelinkHttp.accountDeletes.push(url.pathname);
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "revoked" }) });
   }
   return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND" } }) });
 });
@@ -1448,6 +1511,31 @@ await check("T26 微博标准登录页二维码与普通验证码标签共存时
 });
 await weiboProofPage.close();
 screenshotPage = page;
+
+await check("T33 当前微博账号重新扫码登录不会先解绑旧连接", async () => {
+  const connectors = page.locator("#connectors-root");
+  await connectors.getByText("我的微博").waitFor({ state: "visible", timeout: 3000 });
+  await connectors.getByRole("button", { name: "重新扫码登录" }).click();
+  const confirmation = page.getByRole("dialog").filter({ hasText: "重新登录「微博」?" });
+  await confirmation.getByText(/新扫码成功前会保留当前登录状态/).waitFor({ state: "visible" });
+  await confirmation.getByText(/写入能力和免逐次确认/).waitFor({ state: "visible" });
+  await confirmation.getByRole("button", { name: "重新扫码登录" }).click();
+
+  const setup = page.getByRole("dialog").filter({ hasText: "重新登录微博" });
+  await setup.getByText(/扫码成功前会保留当前登录/).waitFor({ state: "visible" });
+  await setup.getByRole("button", { name: "同意并生成二维码" }).click();
+  for (let attempt = 0; attempt < 50 && weiboRelinkHttp.starts.length === 0; attempt += 1) {
+    await page.waitForTimeout(20);
+  }
+  if (JSON.stringify(weiboRelinkHttp.starts) !== JSON.stringify([{ acceptTerms: true, accountId: "902" }])) {
+    throw new Error(`重新登录请求未精确绑定原账号:${JSON.stringify(weiboRelinkHttp.starts)}`);
+  }
+  if (weiboRelinkHttp.accountDeletes.length !== 0) {
+    throw new Error(`重新登录前错误解绑了旧连接:${weiboRelinkHttp.accountDeletes.join(",")}`);
+  }
+  await setup.getByRole("button", { name: "取消" }).click();
+  await setup.waitFor({ state: "hidden" });
+});
 
 // ── T28 手机微信支付导航 ───────────────────────────────────────────────────
 // jsdom 能断言 href，却不能证明受信点击后的真导航，也看不到移动首屏是否偷偷请求了

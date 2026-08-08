@@ -1470,6 +1470,7 @@ export async function registerCommercial(
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     weiboSetup = new WeiboSetupManager(weiboService, {
+      redis,
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)

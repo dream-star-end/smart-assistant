@@ -174,6 +174,7 @@ export function ConnectorsTab({
   /** 打开声明式绑定弹层的 catalog 条目。 */
   const [bindDeclFor, setBindDeclFor] = useState<DeclarativeCatalogEntry | null>(null)
   const [setupRuntimeFor, setSetupRuntimeFor] = useState<RuntimePluginCatalogEntry | null>(null)
+  const [setupRuntimeAccountId, setSetupRuntimeAccountId] = useState<string | null>(null)
   const [confirm, confirmEl] = useConfirm()
   const toast = useToast()
   const noticeFor = useCallback(
@@ -255,6 +256,7 @@ export function ConnectorsTab({
       return
     }
     if (plugin?.installedCurrent && plugin.available) {
+      setSetupRuntimeAccountId(null)
       setSetupRuntimeFor(plugin)
       return
     }
@@ -476,22 +478,31 @@ export function ConnectorsTab({
   )
 
   /**
-   * 失效账号的恢复出口：解绑旧凭据 → 直接串上扫码弹层。
-   * 改造前授权按钮只在 `accounts.length === 0` 时渲染，一旦账号存在就永远不再出现，
-   * 用户唯一的"出路"是先走一遍破坏性解绑二次确认 —— 那是死胡同，不是恢复流程。
+   * 微博当前版本账号直接原位换新登录状态：新扫码成功前旧连接仍可用；失败或取消不动旧状态。
+   * 旧版本账号与知识星球继续走原有解绑后重建，避免把跨版本迁移混进本次修复。
    */
   const reauthorizeRuntimeAccount = useCallback(
     async (account: RuntimePluginAccount, plugin: RuntimePluginCatalogEntry) => {
+      const relinkInPlace =
+        plugin.slug === 'weibo' && plugin.installedCurrent && account.versionId === plugin.versionId
       const ok = await confirm({
-        title: `重新授权「${plugin.label}」?`,
-        body: '将替换当前已失效的登录状态，旧凭据会被销毁。随后会打开扫码弹层，扫码完成即恢复。',
-        confirmText: '重新扫码授权',
+        title: `重新登录「${plugin.label}」?`,
+        body: relinkInPlace
+          ? '新扫码成功前会保留当前登录状态；成功后将替换登录，并自动关闭写入能力和免逐次确认，需重新手动开启。'
+          : '将销毁当前登录状态并打开扫码弹层，扫码完成后重新绑定。',
+        confirmText: '重新扫码登录',
       })
       if (!ok) return
       setCardNotice(null)
       setErr(null)
+      if (relinkInPlace) {
+        setSetupRuntimeAccountId(account.id)
+        setSetupRuntimeFor(plugin)
+        return
+      }
       try {
         await api.revokePluginAccount(auth, account.id)
+        setSetupRuntimeAccountId(null)
         setSetupRuntimeFor(plugin)
         reload()
       } catch (e) {
@@ -604,6 +615,7 @@ export function ConnectorsTab({
         onAuthorize={() => {
           setCardNotice(null)
           setErr(null)
+          setSetupRuntimeAccountId(null)
           setSetupRuntimeFor(card.plugin)
         }}
         onUpdate={() => updateRuntimePlugin(card.plugin, card.accounts.length)}
@@ -771,10 +783,14 @@ export function ConnectorsTab({
         }}
       />
       <ManagedBrowserSetupDialog
-        key={setupRuntimeFor?.versionId ?? 'closed'}
+        key={`${setupRuntimeFor?.versionId ?? 'closed'}:${setupRuntimeAccountId ?? 'new'}`}
         auth={auth}
         plugin={setupRuntimeFor}
-        onClose={() => setSetupRuntimeFor(null)}
+        relinkAccountId={setupRuntimeAccountId}
+        onClose={() => {
+          setSetupRuntimeFor(null)
+          setSetupRuntimeAccountId(null)
+        }}
         onBound={(agentReady) => {
           setErr(null)
           const label = setupRuntimeFor?.label ?? 'Plugin'
@@ -783,9 +799,11 @@ export function ConnectorsTab({
             setCardNotice({
               slug: setupRuntimeFor.slug,
               tone: 'success',
-              text: agentReady
-                ? `${label}账号已授权，Agent 现在可以直接读取相关内容；写入能力默认关闭。`
-                : `${label}登录信息已加密保存；系统完成 Plugin 升级后会自动启用。`,
+              text: setupRuntimeAccountId
+                ? `${label}登录已更新；为保护新账号，写入能力和免逐次确认均已关闭，可按需重新开启。`
+                : agentReady
+                  ? `${label}账号已授权，Agent 现在可以直接读取相关内容；写入能力默认关闭。`
+                  : `${label}登录信息已加密保存；系统完成 Plugin 升级后会自动启用。`,
             })
           reload()
         }}
@@ -1093,7 +1111,7 @@ function RuntimePluginCard({
                     )}
                   </div>
                 </div>
-                {accountState.needsReauth && canSelfAuthorize && (
+                {canSelfAuthorize && (accountState.needsReauth || plugin.slug === 'weibo') && (
                   <Button
                     variant="secondary"
                     size="sm"
@@ -1101,7 +1119,8 @@ function RuntimePluginCard({
                     loading={busyAction === `reauth:${account.id}`}
                     disabled={busyAction !== null}
                   >
-                    <QrCode size={13} /> 重新扫码授权
+                    <QrCode size={13} />
+                    {plugin.slug === 'weibo' ? '重新扫码登录' : '重新扫码授权'}
                   </Button>
                 )}
                 {account.writeControl && (
@@ -1369,11 +1388,13 @@ function RuntimePluginCard({
 function ManagedBrowserSetupDialog({
   auth,
   plugin,
+  relinkAccountId,
   onClose,
   onBound,
 }: {
   auth: AuthSession
   plugin: RuntimePluginCatalogEntry | null
+  relinkAccountId: string | null
   onClose: () => void
   onBound: (agentReady: boolean) => void
 }) {
@@ -1468,11 +1489,13 @@ function ManagedBrowserSetupDialog({
         .catch(async (e) => {
           if (cancelled) return
           if (e instanceof ApiError && e.code === 'SETUP_NOT_FOUND') {
-            const account = await findExistingAccount().catch(() => undefined)
-            if (cancelled) return
-            if (account) {
-              markExistingAccountActive(account, setupSessionId)
-              return
+            if (!relinkAccountId) {
+              const account = await findExistingAccount().catch(() => undefined)
+              if (cancelled) return
+              if (account) {
+                markExistingAccountActive(account, setupSessionId)
+                return
+              }
             }
             setSetup((current) =>
               current
@@ -1493,7 +1516,15 @@ function ManagedBrowserSetupDialog({
       cancelled = true
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [auth, findExistingAccount, isWeibo, markExistingAccountActive, setupSessionId, setupStatus])
+  }, [
+    auth,
+    findExistingAccount,
+    isWeibo,
+    markExistingAccountActive,
+    relinkAccountId,
+    setupSessionId,
+    setupStatus,
+  ])
 
   useEffect(() => {
     if (!setupQrReady || !setupSessionId) return
@@ -1542,18 +1573,33 @@ function ManagedBrowserSetupDialog({
 
   useEffect(() => {
     if (setupStatus !== 'active' || reportedActive) return
+    if (relinkAccountId && setup?.accountId !== relinkAccountId) {
+      setSetup((current) =>
+        current
+          ? { ...current, status: 'failed', phase: 'failed', qrReady: false, errorCode: 'ACCOUNT_STALE' }
+          : current,
+      )
+      setError('重新登录结果与目标账号不一致，请重试。')
+      return
+    }
     setReportedActive(true)
     onBound(setup?.agentReady !== false)
-  }, [onBound, reportedActive, setup?.agentReady, setupStatus])
+  }, [onBound, relinkAccountId, reportedActive, setup?.accountId, setup?.agentReady, setupStatus])
 
   const start = async () => {
     if (starting) return
     setStarting(true)
     setError(null)
     try {
-      setSetup(await (isWeibo ? api.startWeiboSetup(auth) : api.startKnowledgePlanetSetup(auth)))
+      setSetup(
+        await (isWeibo
+          ? relinkAccountId
+            ? api.startWeiboSetup(auth, relinkAccountId)
+            : api.startWeiboSetup(auth)
+          : api.startKnowledgePlanetSetup(auth)),
+      )
     } catch (e) {
-      if (e instanceof ApiError && e.code === 'ACCOUNT_ALREADY_EXISTS') {
+      if (!relinkAccountId && e instanceof ApiError && e.code === 'ACCOUNT_ALREADY_EXISTS') {
         const account = await findExistingAccount().catch(() => undefined)
         if (account) {
           markExistingAccountActive(account)
@@ -1598,8 +1644,12 @@ function ManagedBrowserSetupDialog({
     <Modal
       open={plugin != null}
       onOpenChange={(open) => !open && void close()}
-      title={`授权${label}`}
-      description={`${scanner}扫码一次即可复用登录。读取能力授权后可用；发布媒体、互动、编辑和删除默认关闭，需另行阅读免责声明并手动开启。`}
+      title={relinkAccountId ? `重新登录${label}` : `授权${label}`}
+      description={
+        relinkAccountId
+          ? `${scanner}扫码成功前会保留当前登录；成功后替换登录状态，并关闭写入能力和免逐次确认。`
+          : `${scanner}扫码一次即可复用登录。读取能力授权后可用；发布媒体、互动、编辑和删除默认关闭，需另行阅读免责声明并手动开启。`
+      }
       footer={
         <>
           {setup?.status !== 'active' && (

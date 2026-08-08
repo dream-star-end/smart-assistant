@@ -22,6 +22,7 @@ import { MessageList, MessageRenderer } from "../src/components/MessageRenderer"
 import { ModelSelector } from "../src/components/ModelSelector";
 import { ToolCard } from "../src/components/ToolCard";
 import { TeamPanel } from "../src/components/chat/TeamPanel";
+import { ConnectorsTab } from "../src/components/settings/ConnectorsTab";
 import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
@@ -231,6 +232,11 @@ window.__runPendingDispatchJournalProbe = async () => {
 };
 
 const mediaTaskAuth = createMemoryAuthSession(() => {}, "browser-media-token");
+const connectorsAuth = createMemoryAuthSession(() => {}, "browser-connectors-token");
+
+createRoot(document.getElementById("connectors-root")!).render(
+  <StrictMode><ConnectorsTab auth={connectorsAuth} /></StrictMode>,
+);
 
 function MediaTaskProbe() {
   const [liveJob, setLiveJob] = useState<MediaGenerationJob | null>(null);

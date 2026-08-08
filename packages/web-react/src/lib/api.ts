@@ -3465,14 +3465,17 @@ export const api = {
       ),
     ),
 
-  startWeiboSetup: (a: AuthSession): Promise<KnowledgePlanetSetupView> =>
+  startWeiboSetup: (
+    a: AuthSession,
+    accountId?: string,
+  ): Promise<KnowledgePlanetSetupView> =>
     jsonOrThrow<KnowledgePlanetSetupView>(
       callWithRefresh(a, (t) =>
         fetch('/api/plugins/weibo/setup', {
           method: 'POST',
           credentials: 'include',
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ acceptTerms: true }),
+          body: JSON.stringify({ acceptTerms: true, ...(accountId ? { accountId } : {}) }),
         }),
       ),
     ),

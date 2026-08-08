@@ -480,6 +480,8 @@ interface ManagedBrowserPluginAccountBindInput {
   expectedExistingAccountInstanceId?: string
   /** Predetermined replacement identity makes a verified relink replayable after a crash. */
   replacementAccountInstanceId?: string
+  /** A fresh interactive login may belong to another upstream identity; drop prior write grants. */
+  resetWriteAuthorization?: boolean
 }
 
 export interface ManagedBrowserPluginAccountBindResult {
@@ -547,6 +549,11 @@ export async function bindManagedBrowserPluginAccount(
           'ACCOUNT_STALE',
           'managed-browser Plugin replacement identity is invalid',
         )
+      if (input.resetWriteAuthorization === true && input.existing !== 'refresh-fenced')
+        throw new PluginAccountError(
+          'INVALID_STATE',
+          'write authorization reset requires a fenced account refresh',
+        )
       const storageState = validateBrowserStorageState(input.storageState, verified.contract)
       const existing = await client.query<PluginAccountRow>(
         `SELECT ${ACCOUNT_COLS} FROM connections
@@ -592,6 +599,12 @@ export async function bindManagedBrowserPluginAccount(
           const reused = await client.query<{ id: string }>(
             `UPDATE connections
                 SET status = 'active', last_error_code = NULL, last_verified_at = NOW(),
+                    plugin_write_enabled = CASE WHEN $7::boolean THEN FALSE ELSE plugin_write_enabled END,
+                    plugin_write_disclaimer_version = CASE WHEN $7::boolean THEN NULL ELSE plugin_write_disclaimer_version END,
+                    plugin_write_disclaimer_accepted_at = CASE WHEN $7::boolean THEN NULL ELSE plugin_write_disclaimer_accepted_at END,
+                    plugin_write_preapproval_enabled = CASE WHEN $7::boolean THEN FALSE ELSE plugin_write_preapproval_enabled END,
+                    plugin_write_preapproval_disclaimer_version = CASE WHEN $7::boolean THEN NULL ELSE plugin_write_preapproval_disclaimer_version END,
+                    plugin_write_preapproval_accepted_at = CASE WHEN $7::boolean THEN NULL ELSE plugin_write_preapproval_accepted_at END,
                     revision = revision + 1, secret_generation = secret_generation + 1,
                     updated_at = NOW()
               WHERE id = $1::bigint AND user_id = $2 AND provider = $3
@@ -605,6 +618,7 @@ export async function bindManagedBrowserPluginAccount(
               verified.versionId,
               current.revision,
               current.secret_generation,
+              input.resetWriteAuthorization === true,
             ],
           )
           if (reused.rowCount !== 1)
@@ -637,6 +651,12 @@ export async function bindManagedBrowserPluginAccount(
                 SET display_name = $7, account_key = $8, aad_seed = $9::uuid,
                     secret_enc = $10, secret_nonce = $11, meta = $12::jsonb,
                     status = 'active', last_error_code = NULL, last_verified_at = NOW(),
+                    plugin_write_enabled = CASE WHEN $13::boolean THEN FALSE ELSE plugin_write_enabled END,
+                    plugin_write_disclaimer_version = CASE WHEN $13::boolean THEN NULL ELSE plugin_write_disclaimer_version END,
+                    plugin_write_disclaimer_accepted_at = CASE WHEN $13::boolean THEN NULL ELSE plugin_write_disclaimer_accepted_at END,
+                    plugin_write_preapproval_enabled = CASE WHEN $13::boolean THEN FALSE ELSE plugin_write_preapproval_enabled END,
+                    plugin_write_preapproval_disclaimer_version = CASE WHEN $13::boolean THEN NULL ELSE plugin_write_preapproval_disclaimer_version END,
+                    plugin_write_preapproval_accepted_at = CASE WHEN $13::boolean THEN NULL ELSE plugin_write_preapproval_accepted_at END,
                     revision = revision + 1, secret_generation = secret_generation + 1,
                     updated_at = NOW()
               WHERE id = $1::bigint AND user_id = $2 AND provider = $3
@@ -662,6 +682,7 @@ export async function bindManagedBrowserPluginAccount(
                 plugin_type: 'managed-browser',
                 account_hint: (input.accountHint ?? '').slice(0, 128),
               }),
+              input.resetWriteAuthorization === true,
             ],
           )
           if (refreshed.rowCount !== 1)

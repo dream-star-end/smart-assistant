@@ -942,6 +942,8 @@ describe('marketplace Plugin kernel migration', () => {
       const refreshedHandoffBinds: Array<
         Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
       > = []
+      const reusedRefreshBinds: Array<Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>> =
+        []
       const replacementHandoffBinds: Array<
         Awaited<ReturnType<typeof bindManagedBrowserPluginAccount>>
       > = []
@@ -996,6 +998,17 @@ describe('marketplace Plugin kernel migration', () => {
             }),
             /handoff account identity changed/,
           )
+          await query(
+            `UPDATE connections
+                SET plugin_write_enabled = TRUE,
+                    plugin_write_disclaimer_version = 7,
+                    plugin_write_disclaimer_accepted_at = NOW(),
+                    plugin_write_preapproval_enabled = TRUE,
+                    plugin_write_preapproval_disclaimer_version = 8,
+                    plugin_write_preapproval_accepted_at = NOW()
+              WHERE id = $1::bigint`,
+            [initialHandoffBinds[0]!.id],
+          )
           refreshedHandoffBinds.push(
             await bindManagedBrowserPluginAccount({
               userId: noAccountUserId,
@@ -1005,6 +1018,7 @@ describe('marketplace Plugin kernel migration', () => {
               storageState: verifiedHandoffState,
               existing: 'refresh-fenced',
               expectedExistingAccountInstanceId: initialHandoffBinds[0]!.accountInstanceId,
+              resetWriteAuthorization: true,
               unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
               env: process.env,
             }),
@@ -1032,6 +1046,75 @@ describe('marketplace Plugin kernel migration', () => {
               .storageState,
             verifiedHandoffState,
           )
+          const resetAfterRefresh = await query<{
+            plugin_write_enabled: boolean
+            plugin_write_disclaimer_version: number | null
+            plugin_write_disclaimer_accepted_at: Date | null
+            plugin_write_preapproval_enabled: boolean
+            plugin_write_preapproval_disclaimer_version: number | null
+            plugin_write_preapproval_accepted_at: Date | null
+          }>(
+            `SELECT plugin_write_enabled, plugin_write_disclaimer_version,
+                    plugin_write_disclaimer_accepted_at, plugin_write_preapproval_enabled,
+                    plugin_write_preapproval_disclaimer_version,
+                    plugin_write_preapproval_accepted_at
+               FROM connections WHERE id = $1::bigint`,
+            [refreshedHandoffBinds[0]!.id],
+          )
+          assert.deepEqual(resetAfterRefresh.rows[0], {
+            plugin_write_enabled: false,
+            plugin_write_disclaimer_version: null,
+            plugin_write_disclaimer_accepted_at: null,
+            plugin_write_preapproval_enabled: false,
+            plugin_write_preapproval_disclaimer_version: null,
+            plugin_write_preapproval_accepted_at: null,
+          })
+          await query(
+            `UPDATE connections
+                SET plugin_write_enabled = TRUE,
+                    plugin_write_disclaimer_version = 7,
+                    plugin_write_disclaimer_accepted_at = NOW(),
+                    plugin_write_preapproval_enabled = TRUE,
+                    plugin_write_preapproval_disclaimer_version = 8,
+                    plugin_write_preapproval_accepted_at = NOW()
+              WHERE id = $1::bigint`,
+            [refreshedHandoffBinds[0]!.id],
+          )
+          reusedRefreshBinds.push(
+            await bindManagedBrowserPluginAccount({
+              userId: noAccountUserId,
+              versionId: Number(versionId),
+              storageState: verifiedHandoffState,
+              existing: 'refresh-fenced',
+              expectedExistingAccountInstanceId: refreshedHandoffBinds[0]!.accountInstanceId,
+              resetWriteAuthorization: true,
+              unlistedGateReason: OFFICIAL_MANAGED_BROWSER_TRANSITION_GATE_REASON,
+              env: process.env,
+            }),
+          )
+          const resetAfterReuse = await query<{
+            plugin_write_enabled: boolean
+            plugin_write_disclaimer_version: number | null
+            plugin_write_disclaimer_accepted_at: Date | null
+            plugin_write_preapproval_enabled: boolean
+            plugin_write_preapproval_disclaimer_version: number | null
+            plugin_write_preapproval_accepted_at: Date | null
+          }>(
+            `SELECT plugin_write_enabled, plugin_write_disclaimer_version,
+                    plugin_write_disclaimer_accepted_at, plugin_write_preapproval_enabled,
+                    plugin_write_preapproval_disclaimer_version,
+                    plugin_write_preapproval_accepted_at
+               FROM connections WHERE id = $1::bigint`,
+            [refreshedHandoffBinds[0]!.id],
+          )
+          assert.deepEqual(resetAfterReuse.rows[0], {
+            plugin_write_enabled: false,
+            plugin_write_disclaimer_version: null,
+            plugin_write_disclaimer_accepted_at: null,
+            plugin_write_preapproval_enabled: false,
+            plugin_write_preapproval_disclaimer_version: null,
+            plugin_write_preapproval_accepted_at: null,
+          })
           await assert.rejects(
             bindManagedBrowserPluginAccount({
               userId: noAccountUserId,
@@ -1069,6 +1152,7 @@ describe('marketplace Plugin kernel migration', () => {
       assert.equal(seeded.retiredLegacyListing, true)
       assert.equal(initialHandoffBinds[0]?.outcome, 'created')
       assert.equal(refreshedHandoffBinds[0]?.outcome, 'refreshed')
+      assert.equal(reusedRefreshBinds[0]?.outcome, 'reused')
       assert.equal(replacementHandoffBinds[0]?.outcome, 'replaced')
       assert.equal(replacementHandoffBinds[0]?.accountInstanceId, relinkedAccountInstanceId)
 
