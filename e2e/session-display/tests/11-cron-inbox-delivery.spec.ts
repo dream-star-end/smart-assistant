@@ -43,34 +43,61 @@ function sqlText(value: string): string {
 }
 
 async function ensureEvalContainerReady(token: string): Promise<void> {
-  const ws = new WebSocket(`${config().wsBase}/ws/user-chat-bridge`, ['bearer', token])
-  await new Promise<void>((resolve, reject) => {
-    let settled = false
-    const finish = (error?: Error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      try { ws.close() } catch { /* already closed */ }
-      if (error) reject(error)
-      else resolve()
-    }
-    const timer = setTimeout(
-      () => finish(new Error('v5-evals container relay readiness timed out')),
-      90_000,
-    )
-
-    ws.on('message', (data) => {
-      try {
-        if (JSON.parse(String(data))?.type === 'sys.relay_ready') finish()
-      } catch {
-        // Ignore non-JSON frames while waiting for the authoritative ready signal.
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    const retryAfterMs = await new Promise<number | null>((resolve, reject) => {
+      const ws = new WebSocket(`${config().wsBase}/ws/user-chat-bridge`, ['bearer', token])
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = (retryMs: number | null, error?: Error) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        ws.removeAllListeners()
+        ws.once('error', () => { /* consume terminate while CONNECTING */ })
+        try { ws.terminate() } catch { /* already closed */ }
+        if (error) reject(error)
+        else resolve(retryMs)
       }
+      timer = setTimeout(
+        () => finish(null, new Error('v5-evals container relay readiness timed out')),
+        deadline - Date.now(),
+      )
+
+      ws.on('message', (data) => {
+        try {
+          if (JSON.parse(String(data))?.type === 'sys.relay_ready') finish(null)
+        } catch {
+          // Ignore non-JSON frames while waiting for the authoritative ready signal.
+        }
+      })
+      ws.on('error', (error) => finish(null, new Error(`v5-evals container relay error: ${error.message}`)))
+      ws.on('close', (code, reasonBuffer) => {
+        const reason = String(reasonBuffer)
+        try {
+          const parsed = JSON.parse(reason) as { reason?: unknown; retryAfterSec?: unknown }
+          const retryAfterSec = Number(parsed.retryAfterSec)
+          if (
+            code === 4503
+            && (parsed.reason === 'starting' || parsed.reason === 'provisioning')
+            && Number.isFinite(retryAfterSec)
+            && retryAfterSec > 0
+          ) {
+            finish(Math.min(Math.max(retryAfterSec * 1000, 1000), 60_000))
+            return
+          }
+        } catch {
+          // Malformed or non-JSON close reasons are not retryable readiness signals.
+        }
+        finish(null, new Error(`v5-evals container relay closed before ready: ${code} ${reason}`))
+      })
     })
-    ws.on('error', (error) => finish(new Error(`v5-evals container relay error: ${error.message}`)))
-    ws.on('close', (code, reason) => {
-      finish(new Error(`v5-evals container relay closed before ready: ${code} ${String(reason)}`))
-    })
-  })
+    if (retryAfterMs === null) return
+    const remainingMs = deadline - Date.now()
+    if (retryAfterMs >= remainingMs) break
+    await new Promise((resolve) => setTimeout(resolve, retryAfterMs))
+  }
+  throw new Error('v5-evals container relay readiness timed out')
 }
 
 function postFromEvalContainer(
