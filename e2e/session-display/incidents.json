@@ -1010,7 +1010,8 @@
         "58dacb06",
         "e6930cfe",
         "793f7fe2",
-        "f50bbc59"
+        "f50bbc59",
+        "01a0f277"
       ],
       "regressions": [
         {
@@ -1042,6 +1043,11 @@
           "layer": "live-e2e",
           "path": "e2e/session-display/tests/10-stop-turn.spec.ts",
           "assertion": "用户主动停止是预期终态，不得上报 turn_error 产品故障信号"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/deploy-v5.sh",
+          "assertion": "P3 会保留 OC_RUNTIME_RELEASE，但 candidate 含未生效的 runtime-source 改动"
         }
       ]
     }

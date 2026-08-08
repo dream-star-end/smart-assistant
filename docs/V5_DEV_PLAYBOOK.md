@@ -264,7 +264,7 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 |---|---|---|---|
 | `packages/commercial/**`<br>`packages/storage/**`<br>`packages/cli/**`<br>`packages/protocol/**`<br>`docs/**` | master 进程 | deploy-v5.sh | `test:commercial:unit` |
 | `packages/web-react/**` | dist 静态资源 | deploy-v5.sh --dist(与后端代码同批时用 --with-dist) | `test:web-react` |
-| `packages/storage/**`<br>`packages/protocol/**`<br>`packages/gateway/**`<br>`packages/mcp-memory/**` | runtime source release | deploy-v5.sh(部署前活体断言 runtime-release 轴已启用,否则 manual) | `test:storage`, `test:gateway`, `test:mcp-memory` |
+| `packages/storage/**`<br>`packages/cli/**`<br>`packages/protocol/**`<br>`packages/gateway/**`<br>`packages/mcp-memory/**` | runtime source release | deploy-v5.sh(部署前活体断言 runtime-release 轴已启用,否则 manual) | `test:storage`, `test:gateway`, `test:mcp-memory` |
 | `**/agent-sandbox/platform-runtime/**` | platform bundle | deploy-v5.sh(部署前活体断言 platform-bundle 轴已启用,否则 manual) | — |
 | `packages/commercial/src/egress/**` | egress 进程 | deploy-v5.sh --egress(egress 进程;需 boss 明确放行后机器执行) | `test:commercial:unit` |
 | (见下方 manual-only 清单) | **manual-only(fail-closed)** | 人工受控(§4.5 apply / RFC §3);另:rules 零命中 / 未知路径 / 未知 manifest version / symlink·gitlink·typechange 亦整体 manual | — |

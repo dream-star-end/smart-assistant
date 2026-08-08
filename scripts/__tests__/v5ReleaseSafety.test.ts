@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const deploySurfaceCheck = path.join(root, 'scripts/v5-deploy-surface-check.mjs')
 const e2eJourney = path.join(root, 'scripts/v5-e2e-journey-canary.mjs')
 const turnCanary = path.join(root, 'scripts/v5-smoke-turn-canary.mjs')
 const sessionDisplayRunner = path.join(root, 'e2e/session-display/run.sh')
@@ -49,6 +50,232 @@ const dirs: string[] = []
 
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+})
+
+describe('V5 P3 preserved runtime tuple surface gate', () => {
+  async function fixture() {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-p3-surface-'))
+    dirs.push(dir)
+    const repo = path.join(dir, 'repo')
+    await mkdir(path.join(repo, 'deploy/v5'), { recursive: true })
+    await cp(
+      path.join(root, 'deploy/v5/selfheal-deploy-surfaces.json'),
+      path.join(repo, 'deploy/v5/selfheal-deploy-surfaces.json'),
+    )
+    const write = async (relative: string, contents = 'fixture\n') => {
+      const target = path.join(repo, relative)
+      await mkdir(path.dirname(target), { recursive: true })
+      await writeFile(target, contents)
+    }
+    await write('packages/gateway/src/old.ts')
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      return result.stdout.trim()
+    }
+    git('init', '--initial-branch=main')
+    git('config', 'user.name', 'Surface Test')
+    git('config', 'user.email', 'surface@example.test')
+    git('add', '.')
+    git('commit', '-m', 'base')
+    const base = git('rev-parse', 'HEAD')
+    const commit = (message = 'candidate') => {
+      git('add', '-A')
+      git('commit', '-m', message)
+      return git('rev-parse', 'HEAD')
+    }
+    const invoke = (from: string, target: string) => spawnSync(
+      process.execPath,
+      [deploySurfaceCheck, '--repo', repo, '--base', from, '--target', target],
+      { encoding: 'utf8' },
+    )
+    return { repo, base, write, git, commit, invoke }
+  }
+
+  test('classifies gateway and CLI as runtime-source and platform files as platform-runtime', async () => {
+    for (const [file, surface] of [
+      ['packages/gateway/src/new.ts', 'runtime-source'],
+      ['packages/cli/src/new.ts', 'runtime-source'],
+      ['packages/commercial/agent-sandbox/platform-runtime/entrypoint/new.ts', 'platform-runtime'],
+    ] as const) {
+      const f = await fixture()
+      await f.write(file)
+      const target = f.commit()
+      const result = f.invoke(f.base, target)
+      assert.equal(result.status, 0, result.stderr || result.stdout)
+      const plan = JSON.parse(result.stdout)
+      assert.ok(plan.surfaces.includes(surface), `${file} missed ${surface}`)
+      assert.deepEqual(plan.manual, [])
+    }
+  })
+
+  test('master/web-only changes pass while rename old paths, manual paths, and unmatched paths fail closed', async () => {
+    const clean = await fixture()
+    await clean.write('packages/web-react/src/new.ts')
+    await clean.write('docs/new.md')
+    const cleanTarget = clean.commit()
+    const cleanResult = clean.invoke(clean.base, cleanTarget)
+    assert.equal(cleanResult.status, 0, cleanResult.stderr || cleanResult.stdout)
+    const cleanPlan = JSON.parse(cleanResult.stdout)
+    assert.deepEqual(cleanPlan.manual, [])
+    assert.deepEqual(cleanPlan.surfaces, ['master', 'web'])
+
+    const renamed = await fixture()
+    await renamed.write('docs/moved.ts')
+    await rm(path.join(renamed.repo, 'packages/gateway/src/old.ts'))
+    const renameTarget = renamed.commit()
+    const renameResult = renamed.invoke(renamed.base, renameTarget)
+    assert.equal(renameResult.status, 0, renameResult.stderr || renameResult.stdout)
+    const renamePlan = JSON.parse(renameResult.stdout)
+    assert.ok(renamePlan.matches['runtime-source'].includes('packages/gateway/src/old.ts'))
+
+    const rejected = await fixture()
+    await rejected.write('scripts/new.sh')
+    await rejected.write('e2e/unmatched.txt')
+    const rejectedTarget = rejected.commit()
+    const rejectedResult = rejected.invoke(rejected.base, rejectedTarget)
+    assert.equal(rejectedResult.status, 0, rejectedResult.stderr || rejectedResult.stdout)
+    const rejectedPlan = JSON.parse(rejectedResult.stdout)
+    assert.ok(rejectedPlan.manual.some((entry: { reason: string }) => entry.reason.startsWith('manual_glob:')))
+    assert.ok(rejectedPlan.manual.some((entry: { reason: string }) => entry.reason === 'unmatched_path'))
+  })
+
+  test('symlink/type changes, invalid manifests, invalid commits, and non-ancestor ranges fail closed', async () => {
+    const changedType = await fixture()
+    await rm(path.join(changedType.repo, 'packages/gateway/src/old.ts'))
+    await symlink('/tmp/not-runtime-source', path.join(changedType.repo, 'packages/gateway/src/old.ts'))
+    const typeTarget = changedType.commit()
+    const typeResult = changedType.invoke(changedType.base, typeTarget)
+    assert.equal(typeResult.status, 0, typeResult.stderr || typeResult.stdout)
+    assert.ok(JSON.parse(typeResult.stdout).manual.some(
+      (entry: { reason: string }) => entry.reason.startsWith('unsupported_'),
+    ))
+
+    const invalidManifest = await fixture()
+    await invalidManifest.write('packages/web-react/src/new.ts')
+    const invalidTarget = invalidManifest.commit()
+    const manifestPath = path.join(invalidManifest.repo, 'deploy/v5/selfheal-deploy-surfaces.json')
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    manifest.version = 2
+    await writeFile(manifestPath, JSON.stringify(manifest))
+    const invalidResult = invalidManifest.invoke(invalidManifest.base, invalidTarget)
+    assert.equal(invalidResult.status, 2)
+    assert.match(invalidResult.stderr, /manifest schema\/version\/shape is invalid/)
+
+    const ancestry = await fixture()
+    await ancestry.write('docs/new.md')
+    const descendant = ancestry.commit()
+    const backwards = ancestry.invoke(descendant, ancestry.base)
+    assert.equal(backwards.status, 2)
+    assert.match(backwards.stderr, /merge-base --is-ancestor/)
+    const missing = ancestry.invoke('f'.repeat(40), descendant)
+    assert.equal(missing.status, 2)
+    assert.match(missing.stderr, /cat-file -e/)
+  })
+
+  test('deploy integration rejects tuple drift before authorization/debt or any other canary mutation', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const canaryStart = source.indexOf('\ncanary() {')
+    const canary = source.slice(canaryStart, source.indexOf('\n# 内部账号 allowlist', canaryStart))
+    const guard = canary.indexOf('assert_p3_preserved_tuple_matches_candidate')
+    assert.ok(guard >= 0)
+    for (const later of [
+      'consume_emergency_authorization',
+      'prepare_live_baseline_safety',
+      'ds_snapshot',
+      'ds_cas_or_die',
+      'build_release',
+    ]) {
+      assert.ok(guard < canary.indexOf(later), `P3 surface guard must precede ${later}`)
+    }
+    const manifest = JSON.parse(await readFile(path.join(root, 'deploy/v5/selfheal-deploy-surfaces.json'), 'utf8'))
+    assert.ok(manifest.rules.some(
+      (rule: { glob: string, surface: string }) => rule.glob === 'packages/cli/**' && rule.surface === 'runtime-source',
+    ))
+
+    const invokeGuard = (repo: string, base: string, target: string) => spawnSync('bash', ['-c', [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      `REPO_ROOT='${repo}'`,
+      'DRY=0',
+      'remote_env_get() {',
+      '  case "$1" in',
+      '    OC_RUNTIME_RELEASE) printf "%s\\n" /runtime/current ;;',
+      '    OC_PLATFORM_BUNDLE) printf "%s\\n" /bundle/current ;;',
+      '    *) return 97 ;;',
+      '  esac',
+      '}',
+      'ssh() { cat >/dev/null || true; printf "%s\\n" "$BASE"; }',
+      `assert_p3_preserved_tuple_matches_candidate '${target}'`,
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', BASE: base },
+    })
+
+    const runtime = await fixture()
+    await runtime.write('packages/gateway/src/new.ts')
+    const runtimeTarget = runtime.commit()
+    const runtimeResult = invokeGuard(runtime.repo, runtime.base, runtimeTarget)
+    assert.notEqual(runtimeResult.status, 0)
+    assert.match(runtimeResult.stderr, /candidate 含未生效的 runtime-source/)
+
+    const platform = await fixture()
+    await platform.write('packages/commercial/agent-sandbox/platform-runtime/entrypoint/new.ts')
+    const platformTarget = platform.commit()
+    const platformResult = invokeGuard(platform.repo, platform.base, platformTarget)
+    assert.notEqual(platformResult.status, 0)
+    assert.match(platformResult.stderr, /candidate 含未生效的 platform-runtime/)
+
+    const clean = await fixture()
+    await clean.write('packages/web-react/src/new.ts')
+    await clean.write('docs/new.md')
+    const cleanTarget = clean.commit()
+    const cleanResult = invokeGuard(clean.repo, clean.base, cleanTarget)
+    assert.equal(cleanResult.status, 0, cleanResult.stderr || cleanResult.stdout)
+  })
+
+  test('empty tuple axes trust only an immutable image identity and require embedded runtime source', () => {
+    const imageId = `sha256:${'a'.repeat(64)}`
+    const sourceCommit = 'b'.repeat(40)
+    const harness = [
+      'set -euo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'DRY=0',
+      'remote_env_get() {',
+      '  case "$1" in',
+      '    OC_RUNTIME_RELEASE|OC_PLATFORM_BUNDLE) printf "\\n" ;;',
+      '    OC_RUNTIME_IMAGE) printf "%s\\n" runtime:test ;;',
+      `    OC_RUNTIME_IMAGE_ID) printf '%s\\n' '${imageId}' ;;`,
+      '    *) return 97 ;;',
+      '  esac',
+      '}',
+      `ssh() { printf '%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" '${sourceCommit}' "\${EMBED_SOURCE:-1}"; }`,
+      'p3_tuple_axis_source_commit "$SURFACE"',
+    ].join('\n')
+    const invoke = (surface: string, env: NodeJS.ProcessEnv = {}) => spawnSync('bash', ['-c', harness], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', SURFACE: surface, ...env },
+    })
+    const runtime = invoke('runtime-source')
+    assert.equal(runtime.status, 0, runtime.stderr || runtime.stdout)
+    assert.equal(runtime.stdout.trim(), sourceCommit)
+
+    const slim = invoke('runtime-source', { EMBED_SOURCE: '0' })
+    assert.notEqual(slim.status, 0)
+    assert.match(slim.stderr, /没有 embedded-source image 证明/)
+
+    const drifted = invoke('runtime-source', { ACTUAL_ID: `sha256:${'c'.repeat(64)}` })
+    assert.notEqual(drifted.status, 0)
+    assert.match(drifted.stderr, /image ID\/sourceCommit 不可信/)
+
+    const bakedPlatform = invoke('platform-runtime', { EMBED_SOURCE: '0' })
+    assert.equal(bakedPlatform.status, 0, bakedPlatform.stderr || bakedPlatform.stdout)
+    assert.equal(bakedPlatform.stdout.trim(), sourceCommit)
+  })
 })
 
 describe('V5 durable development release queue', () => {
