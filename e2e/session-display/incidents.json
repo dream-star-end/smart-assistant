@@ -1011,7 +1011,8 @@
         "e6930cfe",
         "793f7fe2",
         "f50bbc59",
-        "01a0f277"
+        "01a0f277",
+        "67d8ed4e"
       ],
       "regressions": [
         {
@@ -1033,6 +1034,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "historical non-tail error persists a no-recovery decision before sync"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "durable final replay stays inside the current authoritative hydration"
         },
         {
           "layer": "browser",
