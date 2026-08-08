@@ -1000,9 +1000,10 @@
       "occurredAt": "2026-08-07",
       "severity": "P1",
       "symptom": "历史 live-frame 中的终态错误在会话同步时被反复重放；用户 Stop 又被旧 wire 误归为 upstream_failed，导致浏览器循环上报 /api/client-errors、触发 429 与告警。",
-      "rootFixCommit": "6ac77ac1",
+      "rootFixCommit": "03adb5f1",
       "coverageCommits": [
-        "788ecc51"
+        "788ecc51",
+        "6ac77ac1"
       ],
       "regressions": [
         {
