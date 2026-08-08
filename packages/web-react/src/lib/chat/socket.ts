@@ -994,15 +994,7 @@ export class ChatSocket {
       return;
     }
     const syncSession = this.deps.syncSession;
-    if (!syncSession) {
-      const sess = this.sessions.get(sessId);
-      if (sess?._stopSettlement === settlement) {
-        sess._stopSettlement = undefined;
-        this.deps.persistSession?.(sessId);
-        this.scheduleNotify();
-      }
-      return;
-    }
+    if (!syncSession) return;
     void Promise.resolve(syncSession(sessId, context)).then(
       (synced) => {
         const sess = this.sessions.get(sessId);
@@ -1180,7 +1172,7 @@ export class ChatSocket {
         if (
           !isCronOrHeartbeat &&
           settlement?.phase === "terminal" &&
-          clientMessageId === settlement.clientMessageId
+          frame.clientMessageId === settlement.clientMessageId
         ) {
           sess._stopSettlement = {
             clientMessageId: settlement.clientMessageId,
