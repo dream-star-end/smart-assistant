@@ -4617,6 +4617,7 @@ export class SessionManager {
           detach()
           let persistenceAcknowledged = true
           let terminalErrorForClient: string | undefined
+          let terminalErrorCodeForClient: 'user_cancelled' | undefined
 
           // Detect stale --resume session id. CCB emits an error result with
           // `errors: ["No conversation found with session ID: <id>"]` when
@@ -5092,6 +5093,10 @@ export class SessionManager {
             if (completedHasError) {
               terminalErrorForClient =
                 terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
+              terminalErrorCodeForClient =
+                terminalOverride?.errorCode === 'USER_CANCELLED'
+                  ? 'user_cancelled'
+                  : undefined
             }
             if (
               MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
@@ -5273,6 +5278,7 @@ export class SessionManager {
                 kind: 'error',
                 error: terminalErrorForClient,
                 ...(preClassified ? { errorClass: preClassified } : {}),
+                ...(terminalErrorCodeForClient ? { errorCode: terminalErrorCodeForClient } : {}),
               })
             } else if (pendingFinal) {
               onEvent(pendingFinal)

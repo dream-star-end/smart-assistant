@@ -147,6 +147,7 @@ describe('turnErrorTaxonomy 契约 — wire OutboundError.code 枚举', () => {
     // model_capacity 是本批新增 wire 码,显式钉死其在枚举里(防被摘掉)。
     assert.ok(wireCodes.includes('model_capacity'))
     assert.ok(wireCodes.includes('model_config_changed_retry_turn'))
+    assert.ok(wireCodes.includes('user_cancelled'))
   })
 })
 

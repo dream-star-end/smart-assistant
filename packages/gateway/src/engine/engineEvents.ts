@@ -189,7 +189,13 @@ export type EngineContentEvent =
   // 产物;CCB 缺省不带)。server.ts 据此直接按码组 outbound.error,省一次原文正则;
   // 缺省 undefined → 回落 classifyRunError,行为不变。此前是 ccbMessageParser 的本地
   // 加宽(GatewayStreamEvent)+ 边界 cast,现上提进权威类型。
-  | { kind: 'error'; error: string; errorClass?: ClassifiedErrorCode }
+  | {
+      kind: 'error'
+      error: string
+      errorClass?: ClassifiedErrorCode
+      /** Gateway-owned expected terminal code; never inferred from provider text. */
+      errorCode?: 'user_cancelled'
+    }
   | { kind: 'permission_request'; request: PermissionRequest }
   // 当前 turn 的 backend-side 非流式阶段状态。CCB 由 stdout
   // `{type:'system', subtype:'status', status:'compacting'|null}` 触发;codex runner

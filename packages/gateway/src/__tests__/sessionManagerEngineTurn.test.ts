@@ -1435,7 +1435,7 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(payload.dispatchId, dispatchId);
       assert.deepEqual(
         events.filter((event) => event.kind === "error"),
-        [{ kind: "error", error: "本轮已由用户停止。" }],
+        [{ kind: "error", error: "本轮已由用户停止。", errorCode: "user_cancelled" }],
       );
     } finally {
       setV3MasterSinkSingleton(null);

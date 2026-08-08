@@ -968,6 +968,7 @@ export const OutboundError = Type.Object({
     Type.Literal('model_config_changed_retry_turn'),
     Type.Literal('upstream_failed'),
     Type.Literal('context_too_long'),
+    Type.Literal('user_cancelled'),
   ]),
   /** 简短人类文案,前端直接渲染。 */
   message: Type.String(),

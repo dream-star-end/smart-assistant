@@ -12,12 +12,46 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  _buildEngineErrorFrame,
   _buildTurnStatusFrame,
   _earlyRejectErrorFrames,
   _turnStatusWireFields,
 } from '../server.js'
 
 const PEER = { id: 'u1', kind: 'dm' as const }
+
+describe('_buildEngineErrorFrame — turn 终态 wire', () => {
+  const routing = {
+    sessionKey: 'sk-stop',
+    channel: 'webchat',
+    peer: PEER,
+    clientMessageId: 'm-stop-1',
+    traceId: 'trace-stop',
+  }
+
+  it('gateway 权威 USER_CANCELLED 原样成为 user_cancelled wire code', () => {
+    const frame = _buildEngineErrorFrame(routing, {
+      kind: 'error',
+      error: '本轮已由用户停止。',
+      errorCode: 'user_cancelled',
+    })
+    assert.equal(frame.type, 'outbound.error')
+    assert.equal(frame.code, 'user_cancelled')
+    assert.equal(frame.message, '本轮已由用户停止。')
+    assert.equal(frame.detail, '本轮已由用户停止。')
+    assert.equal(frame.clientMessageId, 'm-stop-1')
+    assert.equal(frame.isFinal, false)
+  })
+
+  it('无权威终态码的 unknown 错误仍保持 upstream_failed 兼容语义', () => {
+    const frame = _buildEngineErrorFrame(routing, {
+      kind: 'error',
+      error: 'unclassified failure',
+    })
+    assert.equal(frame.code, 'upstream_failed')
+    assert.equal(frame.message, '任务执行暂时中断，请直接重试本条消息')
+  })
+})
 
 describe('_earlyRejectErrorFrames — 结构化双帧', () => {
   const frames = _earlyRejectErrorFrames({
