@@ -28,7 +28,6 @@
  */
 import { existsSync, readFileSync } from 'node:fs'
 import {
-  MemoryDir,
   type SkillStore,
   buildAgentSkillStore,
   paths,
@@ -123,54 +122,50 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
  *  renderMemoryInstructions 注入运行时值。对应 prompts/memory-instructions.md。 */
 const MEMORY_INSTRUCTIONS_FALLBACK = `# Memory
 
-你有一份跨会话持久的长期记忆:由「一个索引 + 若干记忆文件」组成。索引常驻在本段末尾,
-每条一行;记忆正文按需自己去读,不会自动进上下文。
+长期记忆默认不进入新会话。当前请求和当前可验证事实永远优先。
+
+## 何时检索
+
+- 仅当缺少某项具体的存量用户事实、决定或偏好就无法准确完成当前任务,或用户明确表示连续性(如“之前/继续/还记得/按照我的持仓”)时,才运行 \`oc-memory core-search "<具体主题>"\`;命中后按结果路径用 Read 分段读取正文。
+- 当前请求信息已经自足时直接回答;不要仅因主题相似或“可能有用”搜索记忆。Core 不会预加载,无关查询也会返回 No match。
+- \`session-search\` / \`archival-search\` 仍只用于用户明确要求回忆旧会话、历史或已保存/归档资料的场景;不得用它们探索性扫描过去内容。
+- 用户说“忽略历史/从头开始”时,本轮不要搜索、采用或提及记忆。
+- 时间敏感事实不能由旧记忆覆盖当前消息或当前状态。
 
 ## 何时写
 
-**硬触发(命中即本轮就写,不等收尾、不等用户要求)**:
-- 用户明确陈述自己的身份/偏好/习惯(「我喜欢…」「我不喜欢/讨厌…」「我是…」「以后都…」)→ 写 \`type: user\`;
-- 用户明确纠正你的行为或结论(「不要这样」「你错了,应该…」)→ 写 \`type: feedback\`(带 Why / How to apply)。
-这两类写入是回复动作的一部分:先答后写、先写后答皆可,但**同一轮内必须完成**。
+用户明确要求“记住”,或信息被明确表述为长期默认/未来会话均适用,且范围清楚时才写。项目关键决定、可复用纠正也可在任务收尾时写。拿不准是否长期有效时留在当前会话,不要写入 Core。
 
-软触发(对话或任务收尾时回顾):正在推进项目的关键事实与决定、踩坑与结论、值得留存的参考资料。
-流水账不记(见「何时不写」),但**用户亲口说出的偏好与纠正永远不算流水账**——拿不准时偏向写入,
-写错了下一轮还能删,漏掉了未来每一轮都在重复犯错。
+**每次写 Core 前必须先对同一主题运行 \`oc-memory core-search\`**;命中则更新已有文件,避免近似重复。
 
-## 四类记忆(写文件时在 frontmatter 的 \`type\` 里标注,各配一例)
+## 四类记忆
 
-- **user** — 用户是谁、长期偏好与风格。例:「用户是射电天文研究员,回答默认按同行水平、公式可保留」。
-- **feedback** — 用户对你的明确纠正/评价,必须附「为什么」与「下次怎么做」。例:「用户指出系统误差不能套 √N —— Why: 只有热噪声主导才成立;How to apply: 先分随机/系统误差再做 RSS 合成」。
-- **project** — 正在做的项目/任务的关键事实与决定。例:「X 项目部署在 kl-mirror,出站统一走 18991 订阅代理」。
-- **reference** — 稳定可复用的知识/资料/清单。例:「常用论文检索入口与各自的检索语法」。
+- **user** — 用户的长期偏好。
+- **feedback** — 可复用纠正,写清 Why / How to apply。
+- **project** — 项目关键事实与决定。
+- **reference** — 稳定可复用资料。
 
 ## 何时不写
 
-一次性的临时细节、当场能算出或查到的东西、纯寒暄,以及**任何密钥 / token / 密码 / 隐私原文**,
-都不要写进记忆。
+一次性细节、未经确认的推断、可随时查询的信息、纯寒暄,以及任何密钥/token/密码/隐私原文都不写。
 
-## 怎么保存(两步,直接用你的原生文件工具 —— 已经没有 \`oc-memory memory\` 命令了)
+## 怎么保存(两步,直接用原生文件工具;没有 \`oc-memory memory\` 命令)
 
-1. **写记忆文件**:用 Write 在 \`{{MEMORY_DIR}}/\` 下新建 \`<slug>.md\`(slug 用小写中划线,如 \`user-radio-astronomer.md\`),文件顶部带 frontmatter:
+1. 用 Write 在 \`{{MEMORY_DIR}}/\` 新建 \`<slug>.md\`,带 frontmatter:
    \`\`\`markdown
    ---
    name: <kebab-slug>
-   description: <一句话摘要,决定未来会话是否召回这条>
+   description: <一句话召回摘要>
    type: user | feedback | project | reference
    ---
-   <正文;feedback / project 记得写清 Why 与 How to apply>
+   <正文>
    \`\`\`
-2. **加索引行**:用 Edit 往 \`{{MEMORY_MD}}\` 追加一行:\`- [标题](memory/<slug>.md) — 一句话钩子\`(整行 ≤150 字符;钩子写清「什么情况下该翻开这条」)。
+2. 用 Edit 往 \`{{MEMORY_MD}}\` 追加 \`- [标题](memory/<slug>.md) — 一句话钩子\`。
 
-## 维护
+更新优先于新建。删除错误/过时记忆时同步删除文件和索引行。索引与正文不会自动进入上下文。
 
-- **更新优先于新建**:同一主题已有文件,直接 Edit 那个文件,不要另建近似条目。
-- **发现错误 / 过时的记忆就删**:删掉 \`{{MEMORY_DIR}}/<slug>.md\`,并同步删掉 \`{{MEMORY_MD}}\` 里对应那一行。
-- 想看某条正文时,用 Read 打开索引里对应的 \`{{MEMORY_DIR}}/<slug>.md\`(只有索引常驻,正文不会自动进上下文)。
-
-## 当前索引
-
-{{MEMORY_INDEX}}`
+只有用户明确说某偏好是“默认/所有未来会话”都适用时,才可把它放进 \`{{USER_MD}}\` 的 \`<!-- oc-user-always:start -->\` 与 \`<!-- oc-user-always:end -->\` 之间;普通身份、背景和项目资料仍按需检索。
+`
 
 const WECHAT_VISION_HINT_PLACEHOLDER = '{{WECHAT_VISION_HINT}}'
 /** needsVisionCli=true:模型看不到图,提示走 oc-vision CLI 识图。 */
@@ -226,10 +221,22 @@ export interface PromptSlot {
 //   - 用户画像整段注入,buildUserSlot 按此上限截断(超出附提示行)。
 // 存储层写多少都不拒,注入侧只取前 N 字符 —— 这是「触发少」问题的解:指令段常驻、
 // 索引常驻,不依赖存量规模。
-const MEMORY_INDEX_INJECT_MAX_CHARS = 6000
 // 导出:memory/user API 把它作为响应里的 `limit` 回报给 UI(memdir 下不再有写侧硬预算,
 // 此 cap = user.md 实际会被注入的上限,也是 UI 预算条唯一有意义的界)。单一权威。
 export const USER_PROFILE_INJECT_MAX_CHARS = 4000
+const USER_ALWAYS_START = '<!-- oc-user-always:start -->'
+const USER_ALWAYS_END = '<!-- oc-user-always:end -->'
+
+function extractUserAlwaysBlock(text: string): string | null {
+  if (text.split(USER_ALWAYS_START).length - 1 !== 1) return null
+  if (text.split(USER_ALWAYS_END).length - 1 !== 1) return null
+  const start = text.indexOf(USER_ALWAYS_START)
+  const end = text.indexOf(USER_ALWAYS_END)
+  if (start < 0 || end <= start) return null
+  const body = text.slice(start + USER_ALWAYS_START.length, end)
+  if (body.includes(USER_ALWAYS_START) || body.includes(USER_ALWAYS_END)) return null
+  return body.trim() || null
+}
 
 function buildPromptSkillStore(agentId: string): SkillStore {
   // Overlay (single wiring in @openclaude/storage): baseline(ro) > agent-seed(ro)
@@ -262,7 +269,7 @@ export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot 
     // user.md 读/去§失败不能拖垮系统提示构建,静默不注入即可。
     return null
   }
-  const trimmed = text.trim()
+  const trimmed = extractUserAlwaysBlock(text)
   if (!trimmed) return null
   // 读侧兜底扫描(注入唯一权威):模型可能用原生 Write 直接改 user.md,绕过 API 写侧 scan;
   // 命中注入类/外泄类模式 → 整段不注入,不做局部剔除(用户画像是单文档,一处脏就不信任整篇)。
@@ -273,7 +280,7 @@ export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot 
   }
   return {
     name: 'USER',
-    content: `# USER IDENTITY (重要 — 回答任何关于用户的问题时必须参考此节)\n\n${body}`,
+    content: `# USER DEFAULTS (仅在相关时采用;当前请求与当前事实优先)\n\n${body}`,
   }
 }
 
@@ -457,47 +464,27 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
  * `index` 为 null(仅 marker / 空)时,指令段照样常驻,索引段落降级为「(空)」。
  * 这是「记忆触发少」问题的根治点:指令不依赖存量,永远在系统提示里。
  */
-function renderMemoryInstructions(args: {
-  memoryDir: string
-  memoryMd: string
-  index: string | null
-}): string {
-  const { memoryDir, memoryMd, index } = args
-  const indexBlock = index && index.trim() ? index.trim() : '(空 —— 还没有任何记忆条目)'
-  // `# Memory` 常驻指令段已上移 platform bundle(商业版真热),商业版权威 =
-  // prompts/memory-instructions.md,个人版权威 = 下方 MEMORY_INSTRUCTIONS_FALLBACK。
-  // per-agent 的绝对路径与当前索引是运行时值,用占位符注入 —— 用函数式替换避免
-  // `$` 特殊模式(memoryDir/index 里若含 `$` 不会被误解释)。
+function renderMemoryInstructions(args: { memoryDir: string; memoryMd: string; userMd: string }): string {
   return getPlatformPrompt('memory-instructions', MEMORY_INSTRUCTIONS_FALLBACK)
-    .replaceAll('{{MEMORY_DIR}}', () => memoryDir)
-    .replaceAll('{{MEMORY_MD}}', () => memoryMd)
-    .replaceAll('{{MEMORY_INDEX}}', () => indexBlock)
+    .replaceAll('{{MEMORY_DIR}}', () => args.memoryDir)
+    .replaceAll('{{MEMORY_MD}}', () => args.memoryMd)
+    .replaceAll('{{USER_MD}}', () => args.userMd)
 }
 
-/**
- * MEMORY slot —— memdir 范式。**始终返回**(指令段常驻,索引为空也注入),故返回类型
- * 不再是 `PromptSlot | null`。索引由 MemoryDir.renderForInjection 现算(内部含
- * ensureMigrated + reconcileIndex + 逐行 scan + cap 截断)。
- */
 export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot> {
-  const md = new MemoryDir(ctx.agentId)
-  let index: string | null = null
-  try {
-    index = await md.renderForInjection(MEMORY_INDEX_INJECT_MAX_CHARS)
-  } catch {
-    // 索引读/对账失败不能拖垮系统提示:指令段仍常驻,索引段落降级为「(空)」。
-    index = null
+  return {
+    name: 'MEMORY',
+    content: renderMemoryInstructions({
+      memoryDir: paths.agentMemoryDir(ctx.agentId),
+      memoryMd: paths.agentMemoryMd(ctx.agentId),
+      userMd: paths.sharedUserMd,
+    }),
   }
-  const memoryDir = paths.agentMemoryDir(ctx.agentId)
-  const memoryMd = paths.agentMemoryMd(ctx.agentId)
-  return { name: 'MEMORY', content: renderMemoryInstructions({ memoryDir, memoryMd, index }) }
 }
 
-/** 测试用内部导出(非稳定 API):暴露纯函数 renderMemoryInstructions 与两个注入 cap,
- *  让 # Memory 指令段渲染无需 storage MemoryDir 即可被单测覆盖。 */
 export const _memoryInternals = {
   renderMemoryInstructions,
-  MEMORY_INDEX_INJECT_MAX_CHARS,
+  extractUserAlwaysBlock,
   USER_PROFILE_INJECT_MAX_CHARS,
 }
 
@@ -511,11 +498,11 @@ export function buildToolsSlot(): PromptSlot {
       '',
       '| 层级 | 怎么用 | 容量 | 何时用 |',
       '|------|------|------|--------|',
-      '| Core | 直接用 Write/Edit 写记忆文件(详见上面 `# Memory` 段) | 索引常驻 | 高频事实、用户身份、明确反馈,每次对话自动可见 |',
+      '| Core | `oc-memory core-search "<query>"` 后按路径 Read/Write/Edit | 按需检索 | 稳定偏好、项目决定与明确反馈 |',
       '| Recall | 在 Bash 里运行 `oc-memory session-search "<query>"` | 无限 | 回忆过去对话内容 |',
       '| Archival | 在 Bash 里运行 `oc-memory archival-add/archival-search/archival-delete` | 无限 | 详细知识、文档、代码模式(需搜索才可见) |',
       '',
-      'Core 记忆**直接写文件**(见上面 `# Memory` 段),已经**没有** `oc-memory memory` 命令;',
+      'Core 记忆先用 `oc-memory core-search` 按需查找,再直接编辑文件;已经**没有** `oc-memory memory` 命令;',
       'Recall / Archival 仍是 `oc-memory` 命令行工具(在 Bash 里运行),不是独立工具调用。详见 `skill_view("memory-management")`。',
       '**原则**: 高频→Core(直接写文件), 详细→Archival, Core 里某条太长→迁到 Archival',
       '',

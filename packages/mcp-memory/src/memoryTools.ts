@@ -22,6 +22,7 @@
  */
 import {
   type EmbeddingProvider,
+  MemoryDir,
   archivalAdd,
   archivalCount,
   archivalDelete,
@@ -34,9 +35,20 @@ import {
   isEmbeddingAvailable,
   loadSessionTurns,
   recordAccess,
+  readUserProfile,
+  scanMemoryContent,
+  paths,
+  isManagedAgentRuntime,
+  readMemoryTurnPolicy,
+  reciprocalRankFusion,
   searchSessions,
   upsertArchivalVector,
 } from '@openclaude/storage'
+import {
+  type CoreMemoryDocument,
+  type CoreMemorySemanticOptions,
+  rankCoreMemorySemantically,
+} from './coreMemorySemantic.js'
 
 export interface MemoryToolResult {
   content: Array<{ type: 'text'; text: string }>
@@ -106,6 +118,147 @@ export async function drainPendingEmbeds(ctx: MemoryToolsContext): Promise<void>
   if (pending.length > 0) await Promise.allSettled(pending)
 }
 
+async function memorySearchPolicyError(kind: 'core' | 'deep'): Promise<MemoryToolResult | null> {
+  if (!isManagedAgentRuntime()) return null
+  const sessionKey =
+    process.env.OPENCLAUDE_SESSION_KEY?.trim() || process.env.OC_SESSION_KEY?.trim()
+  if (!sessionKey) return toolError('memory search is unavailable without an active turn policy')
+  const policy = await readMemoryTurnPolicy(sessionKey)
+  if (!policy) return toolError('memory search is unavailable because the active turn policy is missing or expired')
+  if (!policy.allowed)
+    return toolError(`memory search is disabled for this turn (${policy.reason}); answer from the current request`)
+  if (
+    kind === 'deep' &&
+    (policy.reason === 'on_demand_core' || policy.reason === 'inherited_parent_core')
+  ) {
+    return toolError(
+      `session and archival search require explicit continuity or stored-material intent (${policy.reason})`,
+    )
+  }
+  return null
+}
+
+export async function handleCoreSearch(args: {
+  agentId: string
+  query: string
+  limit?: number
+  offset?: number
+  /** Test seam for the authenticated master relay; omitted by the CLI. */
+  semanticOptions?: CoreMemorySemanticOptions
+}): Promise<MemoryToolResult> {
+  const denied = await memorySearchPolicyError('core')
+  if (denied) return denied
+  const query = args.query.trim()
+  if (!query) return toolError('core-search requires a non-empty query string')
+  const limit = args.limit ?? 5
+  const offset = args.offset ?? 0
+  if (!Number.isInteger(limit) || limit < 1 || limit > 20)
+    return toolError('core-search --limit must be an integer from 1 to 20')
+  if (!Number.isInteger(offset) || offset < 0)
+    return toolError('core-search --offset must be a non-negative integer')
+
+  const q = query.normalize('NFKC').toLocaleLowerCase()
+  const terms = [
+    ...new Set([
+      ...[...new Intl.Segmenter('zh', { granularity: 'word' }).segment(q)]
+        .filter((part) => part.isWordLike)
+        .map((part) => part.segment),
+    ].filter((term) => term.length >= 2 || term === q)),
+  ]
+  const totalTermCharacters = terms.reduce((total, term) => total + term.length, 0)
+  type CoreHit = { score: number; path: string; label: string; size: number; snippet: string }
+  const lexicalHits: CoreHit[] = []
+  const strongLexicalHits: CoreHit[] = []
+  const documents: CoreMemoryDocument[] = []
+  const add = (path: string, label: string, content: string, size: number) => {
+    if (!content.trim() || !scanMemoryContent(content).ok) return
+    documents.push({ path, label, content, size })
+    const normalized = content.normalize('NFKC').toLocaleLowerCase()
+    let at = normalized.indexOf(q)
+    let score = at >= 0 ? 100 : 0
+    let matchedTerms = 0
+    let matchedCharacters = 0
+    for (const term of terms) {
+      const i = normalized.indexOf(term)
+      if (i >= 0) {
+        score += 10
+        matchedTerms++
+        matchedCharacters += term.length
+        if (at < 0 || i < at) at = i
+      }
+    }
+    if (score === 0) return
+    const from = Math.max(0, at - 180)
+    const excerpt = content.slice(from, from + 600).replace(/\s+/g, ' ').trim()
+    const hit = {
+      score,
+      path,
+      label,
+      size,
+      snippet: `${from > 0 ? '…' : ''}${excerpt}${from + 600 < content.length ? '…' : ''}`,
+    }
+    lexicalHits.push(hit)
+    if (score >= 100 || (matchedTerms >= 2 && matchedCharacters * 3 >= totalTermCharacters)) {
+      strongLexicalHits.push(hit)
+    }
+  }
+
+  try {
+    const { text } = await readUserProfile()
+    add(paths.sharedUserMd, 'user profile', text, Buffer.byteLength(text))
+  } catch {}
+  const dir = new MemoryDir(args.agentId)
+  for (const meta of await dir.list()) {
+    const read = await dir.read(meta.file)
+    if (read) add(`${dir.dirPath()}/${meta.file}`, `${meta.name} (${meta.type})`, read.content, meta.size)
+  }
+  lexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+  strongLexicalHits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+
+  const semanticFiles = await rankCoreMemorySemantically(query, documents, args.semanticOptions)
+  // Preserve keyword-only availability when the local ranker is unavailable.
+  // When it did run, require meaningful lexical coverage so a lone generic
+  // word cannot override an explicit semantic no-match.
+  let hits = semanticFiles === null ? lexicalHits : strongLexicalHits
+  if (semanticFiles?.length) {
+    const documentByPath = new Map(documents.map((document) => [document.path, document]))
+    const lexicalByPath = new Map(strongLexicalHits.map((hit) => [hit.path, hit]))
+    hits = reciprocalRankFusion(
+      strongLexicalHits.map((hit) => hit.path),
+      semanticFiles.map((file) => file.path),
+    ).flatMap((candidate) => {
+      const lexical = lexicalByPath.get(candidate.id)
+      if (lexical) return [{ ...lexical, score: candidate.score }]
+      const semantic = semanticFiles.find((file) => file.path === candidate.id)
+      const document = documentByPath.get(candidate.id)
+      if (!semantic || !document) return []
+      const from = Math.max(0, semantic.start - 80)
+      const excerpt = document.content.slice(from, from + 600).replace(/\s+/g, ' ').trim()
+      return [{
+        score: candidate.score,
+        path: document.path,
+        label: document.label,
+        size: document.size,
+        snippet: `${from > 0 ? '…' : ''}${excerpt}${from + 600 < document.content.length ? '…' : ''}`,
+      }]
+    })
+  }
+  const page = hits.slice(offset, offset + limit)
+  if (hits.length === 0) return toolOk(`No safe Core memories match "${query}".`)
+  if (!page.length)
+    return toolOk(
+      `Found ${hits.length} safe Core matches for "${query}", but offset ${offset} is past the last result.`,
+    )
+  const lines = [`Found ${hits.length} safe Core matches for "${query}". Showing ${offset + 1}-${offset + page.length}:`, '']
+  page.forEach((hit, i) => {
+    lines.push(`[${offset + i + 1}] ${hit.label}\npath: ${hit.path}\nsize: ${hit.size} bytes\nexcerpt: ${hit.snippet}`, '')
+  })
+  if (offset + page.length < hits.length)
+    lines.push(`More matches available: rerun with --offset ${offset + page.length}.`)
+  lines.push('Excerpts are bounded; use Read with offset/limit on the path for complete content.')
+  return toolOk(lines.join('\n'))
+}
+
 // ── memory (Core) 已退役 ──
 // memdir 重构:Core 记忆(旧 memory add/replace/remove/read)改为引擎原生直接编辑文件
 // (agents/<id>/memory/<slug>.md + MEMORY.md 索引)。此处不再有 handleMemory;
@@ -121,6 +274,8 @@ export async function handleSessionSearch(
     summarize?: boolean
   },
 ): Promise<MemoryToolResult> {
+  const denied = await memorySearchPolicyError('deep')
+  if (denied) return denied
   // Default: search only THIS agent's sessions. Pass agentId to search another agent.
   const searchAgentId = args.agentId ?? ctx.agentId
   const limit = args.limit ?? 5
@@ -217,6 +372,8 @@ export async function handleArchivalSearch(
   ctx: MemoryToolsContext,
   args: { query: string; limit?: number },
 ): Promise<MemoryToolResult> {
+  const denied = await memorySearchPolicyError('deep')
+  if (denied) return denied
   if (typeof args.query !== 'string' || args.query.trim() === '') {
     return toolError('archival_search requires a non-empty query string')
   }

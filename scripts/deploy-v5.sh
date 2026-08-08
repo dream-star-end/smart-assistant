@@ -3136,7 +3136,7 @@ build_release() {
   reldir="$RELEASES_ROOT/rel-$short_sha-$ts"
   echo "── 建 release(staging→原子改名):$reldir(pinned $short_sha)──" >&2
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] build→$staging(archive+node_modules+dist 从 staging pinned 源构建+VERSION+.complete)→ mv -T→$reldir" >&2
+    echo "  [dry-run] build→$staging(archive+node_modules+dist+固定 revision/SHA Core q8 模型+离线真实推理+VERSION+.complete)→ mv -T→$reldir" >&2
     BUILT_RELEASE="$reldir"; return 0
   fi
   [[ -n "$cur" && "$cur" == "$CAPTURED_RELEASE_PREDECESSOR" ]] || {
@@ -3172,6 +3172,29 @@ build_release() {
   fi
   DIST_BUILD_ID="$(ssh "$KL_HOST" "grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' '$staging/packages/web-react/dist/index.html' 2>/dev/null | grep -o '[0-9a-f]\\{8,32\\}' | head -1" 2>/dev/null || true)"
   [[ -n "$DIST_BUILD_ID" ]] || { echo "✗ staging dist 缺 oc-build meta" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
+  # Core semantic recall runs in the master host process, not in a user
+  # container. Materialize the pinned q8 assets inside this master staging tree,
+  # verify every SHA, disable remote model access, then execute real inference
+  # before VERSION/.complete. The model therefore switches and rolls back
+  # atomically with the master release. Current release reuse is checksum-gated.
+  if ! ssh "$KL_HOST" bash -s -- "$staging" "$cur" <<'REMOTE'
+set -Eeuo pipefail
+staging="$1"
+current="$2"
+target="$staging/.models/core-memory/multilingual-e5-small"
+args=(--target "$target")
+if [[ -n "$current" ]]; then
+  args+=(--reuse "$current/.models/core-memory/multilingual-e5-small")
+fi
+cd "$staging"
+node scripts/materialize-core-memory-model.mjs "${args[@]}"
+npx --no-install tsx scripts/core-memory-local-ranker-smoke.ts --model-dir "$target"
+REMOTE
+  then
+    echo "✗ staging Core memory q8 模型物化/离线真实推理失败" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # VERSION(钉死 short_sha)；所有 npm/vite/dist 步骤完成后才收紧 baseline，随后用
   # 当前 checkout 的可信 guard 做最终只读复验。guard 失败时 staging 必须清掉，绝不能
   # 写 .complete 或进入 rel-* 命名空间。

@@ -11,6 +11,10 @@ import {
   getMaxTurnIdx,
   indexTurn,
   MemoryDir,
+  type MemoryTurnPolicyDecision,
+  classifyMemoryTurnPolicy,
+  inheritMemoryTurnPolicy,
+  readMemoryTurnPolicy,
   recordTurnDispatchRunning,
   reserveTurnIndex,
   paths,
@@ -76,6 +80,7 @@ import {
 } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
+import { startMemoryTurnPolicyLease } from './memoryTurnPolicyLease.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -3225,6 +3230,8 @@ export class SessionManager {
     const prev = session.lock
     let release: () => void = () => {}
     let memoryTurnBarrier: KernelFileLock | undefined
+    let memoryTurnPolicy: MemoryTurnPolicyDecision | undefined
+    let memoryTurnPolicyLease: { stop: () => Promise<void> } | undefined
     let replayLifecycleStarted = false
     let unhandledTurnError: unknown | undefined
     const logicalTurnAbort = new AbortController()
@@ -3353,6 +3360,25 @@ export class SessionManager {
               .filter((b) => b.type === 'text')
               .map((b) => (b as any).text ?? '')
               .join('\n')
+      memoryTurnPolicy = session.parentSessionKey
+        ? inheritMemoryTurnPolicy(await readMemoryTurnPolicy(session.parentSessionKey))
+        : classifyMemoryTurnPolicy(session.currentUserText, session.channel)
+      // Write before any model submission. A stale allow from a prior turn must
+      // never survive an I/O failure into this turn, so failure aborts before
+      // the runner sees input.
+      memoryTurnPolicyLease = await startMemoryTurnPolicyLease({
+        sessionKey: session.sessionKey,
+        decision: memoryTurnPolicy,
+        logicalTurnAbort,
+        interrupt: () => session.runner.interrupt(),
+        onRefreshFailure: (err) => {
+          log.error('memory turn policy refresh failed; interrupting turn', {
+            sessionKey: session.sessionKey,
+            reason: memoryTurnPolicy?.reason,
+            err: String(err),
+          })
+        },
+      })
       session.currentAssistantBuf = ''
       // Reset activity baseline so idle timeout measures from turn start, not last stdout
       session.runner.lastActivityAt = Date.now()
@@ -3640,6 +3666,9 @@ export class SessionManager {
         throw err
       }
     } finally {
+      await memoryTurnPolicyLease?.stop().catch((err) => {
+        log.warn('memory turn policy cleanup failed', { sessionKey: session.sessionKey, err: String(err) })
+      })
       await memoryTurnBarrier?.release().catch(() => {})
       // turn-alive-heartbeat (Plan 1) — turn-level inFlight 真值源 --。
       // 配对的 ++ 在 submit() 头部。`?? 0` 容忍字段缺失:历史 session 对象 /

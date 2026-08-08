@@ -24,7 +24,15 @@ import {
   _codexUsageToAnthropicShape,
   _stringifyItemBounded,
   stripShellWrapper,
+  _codexMemoryTurnEnv,
 } from '../engine/codexAppServerRunner.js'
+
+it('injects non-scrubbed Codex memory turn identity', () => {
+  assert.deepEqual(_codexMemoryTurnEnv('research', 'web-session-1'), {
+    OC_AGENT_ID: 'research',
+    OC_SESSION_KEY: 'web-session-1',
+  })
+})
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 

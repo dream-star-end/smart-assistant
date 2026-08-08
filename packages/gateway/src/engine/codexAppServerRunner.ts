@@ -5,6 +5,9 @@ let _spawnFn: typeof spawn = spawn
 export function __setCodexAppServerSpawnForTests(fn: typeof spawn | null): void {
   _spawnFn = fn ?? spawn
 }
+export function _codexMemoryTurnEnv(agentId: string, sessionKey: string): Record<string, string> {
+  return { OC_AGENT_ID: agentId, OC_SESSION_KEY: sessionKey }
+}
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
@@ -1902,7 +1905,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // 用**非 OPENCLAUDE_ 前缀**的 OC_AGENT_ID 显式注入(不被 scrub):agent-id 不是密钥
       // (模型本就从 persona/SOUL 知道自己是谁),暴露给 codex shell 零敏感。旧 MCP 是靠
       // mcp_servers.X.env 显式注入 agent-id 才没这问题;CLI 走 ambient env 需本行补齐。
-      env: { ...buildCodexEnv(), OC_AGENT_ID: this.opts.agentId },
+      env: { ...buildCodexEnv(), ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey) },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
     this.outputDrainPromise = new Promise<void>((resolve) => {

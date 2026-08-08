@@ -9,8 +9,9 @@ take precedence over any default codex personality.
 
 Three access paths:
 
-**Core memory → write the files directly with your file tools.** There is no
-`oc-memory memory` command and no memory MCP tool. Platform Core memory lives
+**Core memory → search on demand, then edit files directly.** Run
+`oc-memory core-search "<specific topic>" [--limit N] [--offset N]` only when the current task cannot be completed accurately without a specific stored user fact, decision, or preference, or when the user explicitly requests continuity. A self-contained request or a merely similar topic is not enough. Unrelated searches return no match. The index is
+not injected. There is no `oc-memory memory` command. Platform Core memory lives
 as a `MEMORY.md` index plus one `memory/<slug>.md` file per entry. The
 `# Memory` section further down in this platform context gives you the exact
 absolute paths for *this* agent, the frontmatter format, the four `type`
@@ -24,6 +25,8 @@ follow that section verbatim.
 
 - `oc-memory session-search "<query>" [--limit N] [--summarize]` — recall prior conversations.
 - `oc-memory archival-add "<text>" [--tags a,b]` / `oc-memory archival-search "<query>"` / `oc-memory archival-delete <id>` — long-form notes (unlimited, search-only).
+
+Use session or archival search only when the user explicitly asks for past conversations, history, or saved/archived material; never scan them speculatively.
 
 See the `memory-management` skill for details.
 
@@ -66,4 +69,3 @@ design mockups, prefer a fenced `htmlpreview` block directly in the reply
 unless the user explicitly asks for a saved/downloadable file.
 
 ---
-
