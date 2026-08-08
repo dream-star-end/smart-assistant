@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import {
   PRODUCT_CAPABILITIES,
@@ -38,6 +39,10 @@ import {
   TUTORIAL_CASES,
   TUTORIAL_CASE_IDS,
 } from "../packages/web-react/src/lib/tutorialCaseCatalog.ts";
+import {
+  isPrivatePublicReplayField,
+  validatePublicCheckEvidence,
+} from "../packages/web-react/src/lib/tutorialReplayContract.ts";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const WEB_ROOT = join(ROOT, "packages/web-react");
@@ -511,9 +516,6 @@ const PUBLIC_MESSAGE_ROLES = new Set([
   "system",
 ]);
 
-const FORBIDDEN_PUBLIC_IDENTITY_KEY =
-  /^(?:traceId|requestId|sessionKey|sessionId|peerId|containerId|uid|_turnTapeId|_clientMessageId|_turnOwnerId|_turnKey|_continuationOfTurnKey|_continuationOfClientMessageId|_recoveryOfClientMessageId|_automaticRetryRootClientMessageId|_automaticRecoveryRootClientMessageId|_idem)$/i;
-
 const FORBIDDEN_PUBLIC_TEXT =
   /claudeai\.chat|\/root\/|\/home\/(?:agent|openclaude)\/|\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]{20,}\.|\b(?:trace|request|session|peer|container)[-_ ]?id\b/i;
 
@@ -586,7 +588,7 @@ function assertPublicValue(value: unknown, label: string): void {
   }
   if (!value || typeof value !== "object") return;
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (FORBIDDEN_PUBLIC_IDENTITY_KEY.test(key))
+    if (isPrivatePublicReplayField(key))
       fail(`${label}.${key} 是禁止公开的生产身份字段`);
     assertPublicValue(entry, `${label}.${key}`);
   }
@@ -637,12 +639,13 @@ type ValidatedReplayManifest = {
 function validateReplayManifest(
   caseId: string,
   messagesPath: string,
+  publicRoot: string,
 ): ValidatedReplayManifest {
   const expectedManifestPath = `/tutorials/cases/${caseId}/messages-manifest.json`;
   if (messagesPath !== expectedManifestPath)
     fail(`${caseId}: replay manifest 路径必须绑定案例 ID`);
   const parsed = parseJsonFile(
-    join(WEB_ROOT, "public", messagesPath),
+    join(publicRoot, messagesPath),
     `${caseId}: replay manifest`,
   );
   const manifest = record(parsed.value, `${caseId}: replay manifest`);
@@ -708,7 +711,7 @@ function validateReplayManifest(
     if (startOrdinal !== messages.length || expectedCount < 1)
       fail(`${caseId}: replay 页游标不连续`);
     const pageParsed = parseJsonFile(
-      join(WEB_ROOT, "public", pagePath),
+      join(publicRoot, pagePath),
       `${caseId}: replay page ${pageIndex}`,
     );
     if (
@@ -754,7 +757,10 @@ function validateReplayManifest(
   return { bytes: parsed.bytes, messageCount, messages };
 }
 
-function validateVerifiedEvidence(item: (typeof TUTORIAL_CASES)[number]): void {
+export function validateVerifiedEvidenceForTest(
+  item: (typeof TUTORIAL_CASES)[number],
+  publicRoot = join(WEB_ROOT, "public"),
+): void {
   const caseId = item.id;
   const replay = record(item.replay, `${caseId}: replay`);
   const messagesPath = stringField(replay, "messagesPath", `${caseId}: replay`);
@@ -783,7 +789,7 @@ function validateVerifiedEvidence(item: (typeof TUTORIAL_CASES)[number]): void {
     stringField(provenance, field, `${caseId}: provenance`);
   }
 
-  const manifest = validateReplayManifest(caseId, messagesPath);
+  const manifest = validateReplayManifest(caseId, messagesPath, publicRoot);
   if (
     manifest.bytes.length !== provenance.bytes ||
     sha256(manifest.bytes) !== provenance.messagesSha256 ||
@@ -793,7 +799,7 @@ function validateVerifiedEvidence(item: (typeof TUTORIAL_CASES)[number]): void {
   }
 
   const parsedChecks = parseJsonFile(
-    join(WEB_ROOT, "public", checkReportPath),
+    join(publicRoot, checkReportPath),
     `${caseId}: checks`,
   );
   const checks = record(parsedChecks.value, `${caseId}: checks`);
@@ -813,7 +819,7 @@ function validateVerifiedEvidence(item: (typeof TUTORIAL_CASES)[number]): void {
   const inputSha = stringField(input, "sha256", `${caseId}: checks.input`);
   const inputBytes = integerField(input, "bytes", `${caseId}: checks.input`);
   const parsedInput = parseJsonFile(
-    join(WEB_ROOT, "public", inputPath),
+    join(publicRoot, inputPath),
     `${caseId}: input asset`,
   );
   if (
@@ -920,7 +926,7 @@ function validateVerifiedEvidence(item: (typeof TUTORIAL_CASES)[number]): void {
         `${caseId}: run ${index} check ${checkIndex}`,
       );
       const evidence = parseJsonFile(
-        join(WEB_ROOT, "public", evidencePath),
+        join(publicRoot, evidencePath),
         `${caseId}: run ${index} check ${checkIndex} evidence`,
       );
       if (
@@ -928,6 +934,11 @@ function validateVerifiedEvidence(item: (typeof TUTORIAL_CASES)[number]): void {
         sha256(evidence.bytes) !== check.evidenceSha256
       )
         fail(`${caseId}: 验收证据字节或哈希不一致`);
+      validatePublicCheckEvidence(evidence.value, {
+        caseId,
+        runId,
+        checkTitle: title,
+      });
       assertPublicValue(
         evidence.value,
         `${caseId}: run ${index} check ${checkIndex} evidence`,
@@ -983,7 +994,7 @@ function validateVerifiedEvidence(item: (typeof TUTORIAL_CASES)[number]): void {
       "bytes",
       `${caseId}: artifact ${index}`,
     );
-    const bytes = readFileSync(join(WEB_ROOT, "public", path));
+    const bytes = readFileSync(join(publicRoot, path));
     if (bytes.length !== expectedBytes || sha256(bytes) !== expectedSha)
       fail(`${caseId}: 实际产物字节或哈希不一致`);
   }
@@ -1108,6 +1119,19 @@ function validateCaseCatalog(): void {
         if (sourceUrl.protocol !== "https:")
           fail(`${item.id}: 输入来源必须使用 HTTPS ${input.sourceUrl}`);
       }
+      const immutableGitSource =
+        input.sourceUrl !== undefined &&
+        /^https:\/\/codeload\.github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/tar\.gz\/[a-f0-9]{40}$/.test(
+          input.sourceUrl,
+        ) &&
+        /^[a-f0-9]{40}$/.test(input.revision) &&
+        input.sourceUrl.endsWith(`/${input.revision}`);
+      if (
+        input.inlineContent === undefined &&
+        !immutableGitSource &&
+        !input.assetPath
+      )
+        fail(`${item.id}: 可变外部输入必须发布同案例静态冻结副本`);
       if (input.assetPath) {
         if (input.inlineContent !== undefined) {
           if (!input.assetPath.startsWith(`tutorialCaseCatalog.ts#${item.id}/`))
@@ -1149,7 +1173,7 @@ function validateCaseCatalog(): void {
       continue;
     }
 
-    validateVerifiedEvidence(item);
+    validateVerifiedEvidenceForTest(item);
   }
 }
 
@@ -2024,9 +2048,11 @@ function main(): void {
   );
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
+if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  }
 }

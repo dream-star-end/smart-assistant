@@ -222,40 +222,40 @@
       "contentVersion": 1
     },
     "coding-regression-rescue": {
-      "contentHash": "82ed05a88ec35f6e65fcded64ce009cdbcc033f18555ef03286287100c87d5f1",
-      "contentVersion": 1
+      "contentHash": "ff1a5fce302358d72fd77dc823b171af281fb3229771445b5f20ad73a8bfbd8c",
+      "contentVersion": 2
     },
     "coding-swe-bench-fix": {
       "contentHash": "35c5f6f76802e8c2f63ceaf37069fb70f0944178870b600a8e6a2f2b916cca31",
       "contentVersion": 1
     },
     "general-meeting-actions": {
-      "contentHash": "913f9ae77f5b0f527d054ab36bf694734f2889a6dfa68ed97bae7653d23a29ac",
-      "contentVersion": 1
+      "contentHash": "17b0e2955d5feb43491db7c36e5939bf84c3332aa8fb4cb5ef2d5bd5f8ace23f",
+      "contentVersion": 2
     },
     "general-public-data-brief": {
-      "contentHash": "608d70c91a7d6bff46dd60d591708ad246f00463bfb03ea459d04e73e851619c",
-      "contentVersion": 1
+      "contentHash": "2e71f0fa07b827a1991d864a81a38160ddf39d505324f60de4e0a6ee95ed0074",
+      "contentVersion": 2
     },
     "research-bike-demand": {
-      "contentHash": "8ccdb1766ff5c9e708c969123e81f2fd53b427d9748682792febb729e47399a4",
-      "contentVersion": 1
+      "contentHash": "7e76256cdd43e10dccc94a61ef578d9d8949f383ed7742c9bedb3ac2b77f9586",
+      "contentVersion": 2
     },
     "research-evidence-map": {
-      "contentHash": "56c1ce01afc97712d09d15eee7b5f7e6d1c52cd0a3c13bbbbab84c538552c589",
-      "contentVersion": 1
+      "contentHash": "379b354b22dfdd8dc0dc0c6a89c27145de11579b3f7d74332263abbbc8d64d72",
+      "contentVersion": 2
     },
     "research-open-peer-review": {
-      "contentHash": "0cb4cd1b59bfcd9009bf56cedb218803e93659c369f373b89c0a2ab850410921",
-      "contentVersion": 1
+      "contentHash": "97e316997c7aa94ab558cafe39865fa98b3b341ab3845cc7f5ca93e7520e717f",
+      "contentVersion": 2
     },
     "research-replication-audit": {
       "contentHash": "2d8bda5bed3b794c50c6bea234572e471d7b8c60a7fe06a8ca9863b0e56463c4",
       "contentVersion": 1
     },
     "research-systematic-screening": {
-      "contentHash": "7a58feea44b4ec8d11a4263435a61760d0a85a66d1da305da343cb979de13521",
-      "contentVersion": 1
+      "contentHash": "a9bef68d1f0f5ede4b755adb373875a96a07495bc7c81ca17d2ee20de17874a1",
+      "contentVersion": 2
     }
   },
   "catalogSchema": 2,

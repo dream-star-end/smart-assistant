@@ -5,6 +5,7 @@ import type {
   TutorialCase,
   TutorialCaseId,
 } from "../../lib/tutorialCaseCatalog";
+import { hasPrivatePublicReplayField } from "../../lib/tutorialReplayContract";
 import { MessageList } from "../MessageRenderer";
 import { Button } from "../ui";
 
@@ -50,41 +51,6 @@ const MESSAGE_ROLES = new Set<ChatMessage["role"]>([
   "system",
 ]);
 
-// Public tutorial replay must never carry tenant/user authentication identity as structured data.
-// Text remains the exact already-sanitized visible transcript and is not rewritten in the browser.
-const PRIVATE_FIELD_NAMES = new Set([
-  "email",
-  "emailaddress",
-  "phone",
-  "phonenumber",
-  "userid",
-  "accountid",
-  "tenantid",
-  "orgid",
-  "ip",
-  "ipaddress",
-  "password",
-  "secret",
-  "accesstoken",
-  "refreshtoken",
-  "sessiontoken",
-  "authorization",
-  "cookie",
-  "traceid",
-  "requestid",
-  "turntapeid",
-  "clientmessageid",
-  "sessionkey",
-  "sessionid",
-  "peerid",
-  "containerid",
-  "turnownerid",
-  "turnkey",
-  "idem",
-  "idempotencykey",
-  "retrymedia",
-]);
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -107,21 +73,6 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-}
-
-function hasPrivateIdentityField(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(hasPrivateIdentityField);
-  if (!isRecord(value)) return false;
-  return Object.entries(value).some(([key, child]) => {
-    const normalized = key.replace(/[-_]/g, "").toLowerCase();
-    return (
-      normalized === "__proto__" ||
-      normalized === "constructor" ||
-      normalized === "prototype" ||
-      PRIVATE_FIELD_NAMES.has(normalized) ||
-      hasPrivateIdentityField(child)
-    );
-  });
 }
 
 function parseManifest(payload: unknown, caseId: TutorialCaseId): ReplayManifest {
@@ -188,7 +139,7 @@ function parseMessage(
   previousTs: number | null,
 ): ChatMessage {
   if (!isRecord(value)) throw new Error("轨迹消息必须是对象");
-  if (hasPrivateIdentityField(value)) throw new Error("轨迹消息包含禁止的隐私身份字段");
+  if (hasPrivatePublicReplayField(value)) throw new Error("轨迹消息包含禁止的隐私身份字段");
   if (typeof value.id !== "string" || !/^(?:msg|tutorial)-[A-Za-z0-9_-]+$/.test(value.id)) throw new Error("轨迹消息 id 未使用脱敏公共格式");
   if (seenIds.has(value.id)) throw new Error(`轨迹消息 id 重复：${value.id}`);
   if (typeof value.role !== "string" || !MESSAGE_ROLES.has(value.role as ChatMessage["role"])) throw new Error(`轨迹消息 ${value.id} role 无效`);
@@ -310,7 +261,7 @@ export function TutorialReplay({
       controllerRef.current?.abort();
       controllerRef.current = null;
     };
-  }, [caseId, sourcePath]);
+  }, [sourcePath]);
 
   const beginRequest = () => {
     requestIdentityRef.current += 1;
@@ -459,6 +410,7 @@ export function TutorialReplay({
   const preview = replay.video || replay.poster ? (
     <div className="mt-3 overflow-hidden rounded-xl border border-border bg-sidebar">
       {replay.video ? (
+        // biome-ignore lint/a11y/useMediaCaption: 教程操作预览不含语音或其他音轨。
         <video controls playsInline preload="metadata" poster={replay.poster} className="aspect-video w-full object-cover">
           <source src={replay.video} type="video/webm" />
         </video>

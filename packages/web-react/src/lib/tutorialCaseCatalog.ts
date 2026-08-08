@@ -160,7 +160,7 @@ const PENDING_REPLAY: TutorialCaseReplay = {
 export const TUTORIAL_CASES = [
   {
     id: 'research-evidence-map',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'research',
     title: '从 30 篇论文到可追溯证据图谱',
     summary:
@@ -219,8 +219,9 @@ export const TUTORIAL_CASES = [
         description: '按冻结检索式返回的 30 条原始 works JSON；后续候选 CSV 从这里确定性生成。',
         sourceUrl:
           'https://api.openalex.org/works?search=microplastics%20cardiovascular%20human&filter=from_publication_date:2020-01-01,to_publication_date:2026-08-08&sort=cited_by_count:desc&per-page=30',
+        assetPath: '/tutorials/cases/research-evidence-map/inputs/openalex-works.json',
         revision: 'captured-2026-08-08',
-        sha256: '9624daa064900fdce77f1143d94945907feb089c8bc10b85963699003996cf2f',
+        sha256: 'e4397d6d448d4b4d12e00a103f2fe707404ffd0705c83d25f4020ad4220d595b',
         bytes: 1655066,
         preparation: '先只填元数据；研究设计和结论必须在打开来源后再标注。',
       },
@@ -301,7 +302,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-bike-demand',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'research',
     title: '公开数据到可复现的单车需求分析',
     summary:
@@ -332,6 +333,7 @@ export const TUTORIAL_CASES = [
         title: 'Bike-Sharing-Dataset.zip',
         description: 'UCI 页面提供的 hour.csv、day.csv 与说明文件。',
         sourceUrl: 'https://archive.ics.uci.edu/static/public/275/bike+sharing+dataset.zip',
+        assetPath: '/tutorials/cases/research-bike-demand/inputs/bike-sharing-dataset.zip',
         revision: 'uci-275-2026-08-08',
         sha256: 'b70182d0d0508e9abbb79306ce5c0cec34869000f8220175ac83d11dbe845401',
         bytes: 279992,
@@ -421,7 +423,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-systematic-screening',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'research',
     title: '把系统综述筛选做成可审计流水线',
     summary:
@@ -471,8 +473,9 @@ export const TUTORIAL_CASES = [
         description: 'Europe PMC 与 OpenAlex 原始响应按行保留，附数据库和查询批次。',
         sourceUrl:
           'https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=%28generative%20AI%20OR%20large%20language%20model%29%20AND%20%28software%20developer%20OR%20programming%29%20AND%20productivity&format=json&pageSize=100',
+        assetPath: '/tutorials/cases/research-systematic-screening/inputs/europe-pmc-records.json',
         revision: 'captured-2026-08-08',
-        sha256: '5b4f1ba3cf49e635b4fcae71eb5c9c2443fe4a7e699743b0a5ebc09369bd9e8f',
+        sha256: 'f30e288719041ac24b91ab82d428baabe3ee723e9c88f1f8544b2203ae7fa054',
         bytes: 81111,
         preparation: '保留响应原文；规范化副本另存，禁止覆盖来源字段。',
       },
@@ -553,7 +556,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'research-open-peer-review',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'research',
     title: '对开放论文做逐条可核验同行评议',
     summary:
@@ -584,6 +587,7 @@ export const TUTORIAL_CASES = [
         title: '开放论文 HTML/PDF 与补充材料',
         description: '从 eLife 文章页获取，保留固定访问 URL 和下载日期。',
         sourceUrl: 'https://api.elifesciences.org/articles/84364',
+        assetPath: '/tutorials/cases/research-open-peer-review/inputs/elife-84364.json',
         revision: 'elife-84364-captured-2026-08-08',
         sha256: 'a831a91e32d0e576d96865142f4bbb5ff004a53c7988600dceb6031a77568899',
         bytes: 297930,
@@ -1079,7 +1083,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'coding-regression-rescue',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'coding',
     title: '修复 pytest 的 walrus 重复求值回归',
     summary:
@@ -1125,6 +1129,7 @@ export const TUTORIAL_CASES = [
         title: '固定公开 issue 快照',
         description: 'pytest #14445 的固定 GitHub API 响应，包含 walrus 重复求值最小复现。',
         sourceUrl: 'https://api.github.com/repos/pytest-dev/pytest/issues/14445',
+        assetPath: '/tutorials/cases/coding-regression-rescue/inputs/pytest-issue-14445.json',
         revision: 'issue-14445-updated-2026-06-02T12:55:32Z',
         sha256: 'b12818a7a7eb4e388c56f0af149f73212dd5fd49d06a3dfdf7bc69e9ecdb8f3a',
         bytes: 7324,
@@ -1496,7 +1501,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'general-meeting-actions',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'general',
     title: '把公开会议记录变成可追责行动表',
     summary:
@@ -1527,6 +1532,7 @@ export const TUTORIAL_CASES = [
         title: '一份固定 W3C 公开纪要',
         description: '包含议题、发言、决议或 action 的 HTML/文本。',
         sourceUrl: 'https://www.w3.org/2025/12/04-did-minutes.html',
+        assetPath: '/tutorials/cases/general-meeting-actions/inputs/w3c-did-minutes.html',
         revision: 'w3c-did-minutes-2025-12-04',
         sha256: '6c597851d31641c1cd1ba6e9141bed1434107160b8f56fe376e1f6087a9ddf51',
         bytes: 22724,
@@ -1621,7 +1627,7 @@ export const TUTORIAL_CASES = [
   },
   {
     id: 'general-public-data-brief',
-    contentVersion: 1,
+    contentVersion: 2,
     category: 'general',
     title: '用公开数据做一页市场进入简报',
     summary:
@@ -1668,6 +1674,7 @@ export const TUTORIAL_CASES = [
         description: '三国 2022 年 NY.GDP.PCAP.CD 的固定 JSON 响应。',
         sourceUrl:
           'https://api.worldbank.org/v2/country/IDN;VNM;PHL/indicator/NY.GDP.PCAP.CD?format=json&date=2022&per_page=100',
+        assetPath: '/tutorials/cases/general-public-data-brief/inputs/world-bank-gdp.json',
         revision: 'world-bank-2022-gdp-captured-2026-08-08',
         sha256: '4999c2a6235c3c510ac06c8276d91f07b803be668ab2a7ac08b3414ad0b6b713',
         bytes: 752,
@@ -1678,6 +1685,7 @@ export const TUTORIAL_CASES = [
         description: '三国 2022 年 SP.POP.TOTL 的固定 JSON 响应。',
         sourceUrl:
           'https://api.worldbank.org/v2/country/IDN;VNM;PHL/indicator/SP.POP.TOTL?format=json&date=2022&per_page=100',
+        assetPath: '/tutorials/cases/general-public-data-brief/inputs/world-bank-population.json',
         revision: 'world-bank-2022-population-captured-2026-08-08',
         sha256: '1681702d6f9ba85240240cd258618c5bad6b35b8a2256239de9df40713987b3b',
         bytes: 688,
@@ -1688,6 +1696,7 @@ export const TUTORIAL_CASES = [
         description: '三国 2022 年 IT.NET.USER.ZS 的固定 JSON 响应。',
         sourceUrl:
           'https://api.worldbank.org/v2/country/IDN;VNM;PHL/indicator/IT.NET.USER.ZS?format=json&date=2022&per_page=100',
+        assetPath: '/tutorials/cases/general-public-data-brief/inputs/world-bank-internet.json',
         revision: 'world-bank-2022-internet-captured-2026-08-08',
         sha256: '3337d51f8246765e71acd81313f5f0cabac1e2bd59c70836c4ad733595929a83',
         bytes: 797,

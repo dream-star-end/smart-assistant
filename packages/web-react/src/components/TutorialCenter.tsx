@@ -67,8 +67,8 @@ import {
   tutorialIsRead,
 } from "../lib/tutorialProgress";
 import { cn } from "../lib/utils";
-import { Badge, Button, IconButton } from "./ui";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
+import { Badge, Button, IconButton } from "./ui";
 
 const ICONS: Record<string, LucideIcon> = {
   message: MessageCircle,
@@ -676,6 +676,14 @@ function CaseDetail({
                   查看原始材料 <ExternalLink size={11} />
                 </a>
               )}
+              {input.assetPath?.startsWith("/") && (
+                <a href={input.assetPath} download className="ml-3 mt-2 inline-flex items-center gap-1 text-[11.5px] font-medium text-accent hover:underline">
+                  下载冻结副本 <Download size={11} />
+                </a>
+              )}
+              <p className="mt-2 break-all text-[10.5px] leading-4 text-faint">
+                固定版本：{input.revision} · {input.bytes.toLocaleString()} B<br />SHA-256：{input.sha256}
+              </p>
             </div>
           ))}
         </div>
