@@ -5932,11 +5932,15 @@ export function createPgSessionsBackend(
         //    session_not_found / session_deleted 语义不变,不会跨用户建行或复活墓碑。
         //    后到的 ensure PUT(baseSyncedAt=0)命中本行 → rejected_stale 空操作,不 clobber。
         if (!input.recovery) {
+          const firstUserText = typeof message.text === "string" ? message.text : "";
+          const initialTitle = firstUserText.length > 50
+            ? `${firstUserText.slice(0, 50)}…`
+            : firstUserText || "新会话";
           await client.query(
             `INSERT INTO client_sessions (id, user_id, agent_id, title, created_at, last_at, updated_at)
-             VALUES ($1, $2, $3, DEFAULT, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL})
+             VALUES ($1, $2, $3, $4, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL})
              ON CONFLICT (id) DO NOTHING`,
-            [input.sessionId, input.sessionUserId, input.agentId],
+            [input.sessionId, input.sessionUserId, input.agentId, initialTitle],
           );
         }
         // 1) 幂等 append user 行(既有 id 幂等)。
