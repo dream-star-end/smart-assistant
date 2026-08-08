@@ -14,14 +14,14 @@ const {
   clearMemoryTurnPolicy,
 } = await import('../memoryTurnPolicy.js')
 
-test('用户4真实新任务默认拒绝，明确忽略拒绝，明确连续任务允许', () => {
+test('普通任务只开放按需 Core，明确忽略拒绝，明确连续任务开放全部检索', () => {
   assert.deepEqual(
     classifyMemoryTurnPolicy('请评阅一下该采购方案文件，看看有什么问题？', 'webchat'),
-    { allowed: false, reason: 'clean_default' },
+    { allowed: true, reason: 'on_demand_core' },
   )
   assert.deepEqual(
     classifyMemoryTurnPolicy('我有过敏性鼻炎，咳嗽变异性哮喘，长期接触手机壳的部位出现疹子', 'webchat'),
-    { allowed: false, reason: 'clean_default' },
+    { allowed: true, reason: 'on_demand_core' },
   )
   assert.deepEqual(
     classifyMemoryTurnPolicy('把我的各种琐碎的记忆都删掉，或者新开会话不要加载记忆，我不需要新开会话有倾向性', 'webchat'),
@@ -47,8 +47,8 @@ test('用户4真实新任务默认拒绝，明确忽略拒绝，明确连续任�
     '请解释继续教育政策',
   ]) {
     assert.deepEqual(classifyMemoryTurnPolicy(text, 'webchat'), {
-      allowed: false,
-      reason: 'clean_default',
+      allowed: true,
+      reason: 'on_demand_core',
     })
   }
   assert.deepEqual(classifyMemoryTurnPolicy('nightly memory maintenance', 'cron'), {
@@ -76,6 +76,14 @@ test('delegate 只能继承父 policy，不能按子任务文字升级', () => {
   assert.deepEqual(inheritMemoryTurnPolicy({ allowed: true, reason: 'explicit_continuity' }), {
     allowed: true,
     reason: 'inherited_parent_allow',
+  })
+  assert.deepEqual(inheritMemoryTurnPolicy({ allowed: true, reason: 'on_demand_core' }), {
+    allowed: true,
+    reason: 'inherited_parent_core',
+  })
+  assert.deepEqual(inheritMemoryTurnPolicy({ allowed: true, reason: 'inherited_parent_core' }), {
+    allowed: true,
+    reason: 'inherited_parent_core',
   })
   assert.deepEqual(inheritMemoryTurnPolicy(null), {
     allowed: false,

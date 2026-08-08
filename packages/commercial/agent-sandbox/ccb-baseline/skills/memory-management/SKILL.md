@@ -1,7 +1,7 @@
 ---
 name: memory-management
 description: "按需检索并维护 Core、Recall 与 Archival 长期记忆，避免跨项目污染和重复写入"
-version: "3.0.0"
+version: "3.1.0"
 tags: [system, meta, learning]
 related_skills: [skill-management]
 priority: 6
@@ -12,9 +12,9 @@ priority: 6
 ## 默认原则
 
 - Core 的 `MEMORY.md` 索引和正文**不会自动进入新会话**。
-- 没有明确连续性/存量事实信号时直接回答，不因主题相似或“可能有用”搜索记忆；官方命令也会代码层拒绝。
-- 只有用户明确表示连续性或调用存量事实（之前、上次、继续、还记得、按照我的习惯、我的持仓、检索已保存资料等）时，才运行：
+- 仅当缺少某项具体的存量用户事实、决定或偏好就无法准确完成当前任务，或用户明确表示连续性时，才运行：
   `oc-memory core-search "<具体主题>" [--limit N] [--offset N]`
+- 当前请求信息已经自足时直接回答；不因主题相似或“可能有用”搜索记忆。Core 不预加载，无关查询返回 No match。
 - 搜索结果只是有界 excerpt；需要完整内容时，按返回的绝对路径用 `Read` 的 offset/limit 分段读取。
 - 用户说“忽略历史/从头开始”时，本轮不搜索、不采用、不提及记忆。
 - 当前消息和当前可验证事实优先；旧记忆不得覆盖新证据。
@@ -55,5 +55,5 @@ type: user | feedback | project | reference
 
 ## Recall 与 Archival
 
-用户要求回忆过去对话时：`oc-memory session-search "<query>" [--limit N] [--summarize]`。
-长篇、低频资料用 `oc-memory archival-add/search/delete`，不要塞进 Core。
+只有用户明确要求回忆旧会话/历史时：`oc-memory session-search "<query>" [--limit N] [--summarize]`。
+长篇、低频资料用 `oc-memory archival-add/search/delete`，不要塞进 Core；`archival-search` 也只在用户明确调用已保存/归档资料时使用，不探索性扫描。

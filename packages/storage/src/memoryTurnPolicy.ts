@@ -9,9 +9,11 @@ export const MEMORY_TURN_POLICY_REFRESH_MS = 60_000
 
 export type MemoryTurnPolicyReason =
   | 'clean_default'
+  | 'on_demand_core'
   | 'explicit_ignore'
   | 'explicit_continuity'
   | 'trusted_cron'
+  | 'inherited_parent_core'
   | 'inherited_parent_allow'
   | 'inherited_parent_deny'
 
@@ -25,8 +27,8 @@ interface MemoryTurnPolicyRecord extends MemoryTurnPolicyDecision {
   expiresAt: number
 }
 const MEMORY_TURN_POLICY_REASONS = new Set<MemoryTurnPolicyReason>([
-  'clean_default', 'explicit_ignore', 'explicit_continuity', 'trusted_cron',
-  'inherited_parent_allow', 'inherited_parent_deny',
+  'clean_default', 'on_demand_core', 'explicit_ignore', 'explicit_continuity', 'trusted_cron',
+  'inherited_parent_core', 'inherited_parent_allow', 'inherited_parent_deny',
 ])
 
 const IGNORE_MEMORY_RE =
@@ -54,15 +56,20 @@ export function classifyMemoryTurnPolicy(
   if (IGNORE_MEMORY_RE.test(userText)) return { allowed: false, reason: 'explicit_ignore' }
   if (CONTINUITY_RES.some((pattern) => pattern.test(userText)))
     return { allowed: true, reason: 'explicit_continuity' }
-  return { allowed: false, reason: 'clean_default' }
+  // Default is a capability for high-confidence Core lookup, not permission to
+  // scan old sessions/archives. The agent instructions still require a concrete
+  // task dependency, and Core's semantic no-match gate filters unrelated topics.
+  return { allowed: true, reason: 'on_demand_core' }
 }
 
 export function inheritMemoryTurnPolicy(
   parent: MemoryTurnPolicyDecision | null,
 ): MemoryTurnPolicyDecision {
-  return parent?.allowed
-    ? { allowed: true, reason: 'inherited_parent_allow' }
-    : { allowed: false, reason: 'inherited_parent_deny' }
+  if (!parent?.allowed) return { allowed: false, reason: 'inherited_parent_deny' }
+  if (parent.reason === 'on_demand_core' || parent.reason === 'inherited_parent_core') {
+    return { allowed: true, reason: 'inherited_parent_core' }
+  }
+  return { allowed: true, reason: 'inherited_parent_allow' }
 }
 
 function policyPath(sessionKey: string): string {
