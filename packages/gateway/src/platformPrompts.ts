@@ -43,12 +43,12 @@ const PROMPT_KEYS = Object.keys(PROMPT_FILES) as PlatformPromptKey[]
  * 该轮整套加载失败(保留 LKG + 告警,fail-soft)。防止 bundle 侧误删占位符导致运行时
  * `replaceAll` 静默 no-op、注入契约悄悄断裂(如微信识图提示 / memdir 运行时路径注不进去)。
  *   - platform-capabilities:{{WECHAT_VISION_HINT}}(buildAgentsSlot 按模型注入 CLI/原生变体);
- *   - memory-instructions:{{MEMORY_DIR}}/{{MEMORY_MD}}/{{MEMORY_INDEX}}(renderMemoryInstructions 注入);
+ *   - memory-instructions:{{MEMORY_DIR}}/{{MEMORY_MD}}/{{USER_MD}}(renderMemoryInstructions 注入);
  *   - codex-preamble:无(纯静态文案,无运行时注入点)。
  */
 const REQUIRED_PLACEHOLDERS: Record<PlatformPromptKey, readonly string[]> = {
   'platform-capabilities': ['{{WECHAT_VISION_HINT}}'],
-  'memory-instructions': ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{MEMORY_INDEX}}'],
+  'memory-instructions': ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{USER_MD}}'],
   'codex-preamble': [],
 }
 

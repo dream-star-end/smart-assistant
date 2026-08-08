@@ -33,6 +33,7 @@ import {
   handleArchivalAdd,
   handleArchivalDelete,
   handleArchivalSearch,
+  handleCoreSearch,
   handleSessionSearch,
   type MemoryToolResult,
 } from './memoryTools.js'
@@ -71,8 +72,16 @@ function parseLimit(raw: string | undefined): number | undefined {
   return n
 }
 
+function parseOffset(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0) fail(`--offset must be a non-negative integer (got "${raw}")`)
+  return n
+}
+
 const USAGE = [
   'usage:',
+  '  oc-memory core-search "<query>" [--limit N] [--offset N]',
   '  oc-memory session-search "<query>" [--limit N] [--agent-id ID] [--summarize]',
   '  oc-memory archival-add "<text>" [--tags a,b,c]',
   '  oc-memory archival-search "<query>" [--limit N]',
@@ -128,9 +137,19 @@ async function main(): Promise<void> {
     process.exit(2)
   }
 
-  const ctx = await createMemoryToolsContext(agentId)
-
   const { positional, flags } = parseFlags(rest)
+  if (cmd === 'core-search') {
+    const query = positional[0]
+    if (!query) fail('core-search requires a "<query>" positional argument')
+    emit(await handleCoreSearch({
+      agentId,
+      query,
+      limit: parseLimit(flags.limit),
+      offset: parseOffset(flags.offset),
+    }))
+  }
+
+  const ctx = await createMemoryToolsContext(agentId)
 
   switch (cmd) {
     case 'session-search': {

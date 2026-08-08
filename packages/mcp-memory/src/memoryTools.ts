@@ -22,6 +22,7 @@
  */
 import {
   type EmbeddingProvider,
+  MemoryDir,
   archivalAdd,
   archivalCount,
   archivalDelete,
@@ -34,6 +35,9 @@ import {
   isEmbeddingAvailable,
   loadSessionTurns,
   recordAccess,
+  readUserProfile,
+  scanMemoryContent,
+  paths,
   searchSessions,
   upsertArchivalVector,
 } from '@openclaude/storage'
@@ -104,6 +108,68 @@ export async function createMemoryToolsContext(agentId: string): Promise<MemoryT
 export async function drainPendingEmbeds(ctx: MemoryToolsContext): Promise<void> {
   const pending = [...ctx.pendingEmbeds.values()]
   if (pending.length > 0) await Promise.allSettled(pending)
+}
+
+export async function handleCoreSearch(args: {
+  agentId: string
+  query: string
+  limit?: number
+  offset?: number
+}): Promise<MemoryToolResult> {
+  const query = args.query.trim()
+  if (!query) return toolError('core-search requires a non-empty query string')
+  const limit = args.limit ?? 5
+  const offset = args.offset ?? 0
+  if (!Number.isInteger(limit) || limit < 1 || limit > 20)
+    return toolError('core-search --limit must be an integer from 1 to 20')
+  if (!Number.isInteger(offset) || offset < 0)
+    return toolError('core-search --offset must be a non-negative integer')
+
+  const q = query.normalize('NFKC').toLocaleLowerCase()
+  const terms = [...new Set(q.split(/[\s\p{P}\p{S}]+/u).filter(Boolean))]
+  const hits: Array<{ score: number; path: string; label: string; size: number; snippet: string }> = []
+  const add = (path: string, label: string, content: string, size: number) => {
+    if (!scanMemoryContent(content).ok) return
+    const normalized = content.normalize('NFKC').toLocaleLowerCase()
+    let at = normalized.indexOf(q)
+    let score = at >= 0 ? 100 : 0
+    for (const term of terms) {
+      const i = normalized.indexOf(term)
+      if (i >= 0) {
+        score += 10
+        if (at < 0 || i < at) at = i
+      }
+    }
+    if (score === 0) return
+    const from = Math.max(0, at - 180)
+    const excerpt = content.slice(from, from + 600).replace(/\s+/g, ' ').trim()
+    hits.push({ score, path, label, size, snippet: `${from > 0 ? '…' : ''}${excerpt}${from + 600 < content.length ? '…' : ''}` })
+  }
+
+  try {
+    const { text } = await readUserProfile()
+    add(paths.sharedUserMd, 'user profile', text, Buffer.byteLength(text))
+  } catch {}
+  const dir = new MemoryDir(args.agentId)
+  for (const meta of await dir.list()) {
+    const read = await dir.read(meta.file)
+    if (read) add(`${dir.dirPath()}/${meta.file}`, `${meta.name} (${meta.type})`, read.content, meta.size)
+  }
+  hits.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+  const page = hits.slice(offset, offset + limit)
+  if (hits.length === 0) return toolOk(`No safe Core memories match "${query}".`)
+  if (!page.length)
+    return toolOk(
+      `Found ${hits.length} safe Core matches for "${query}", but offset ${offset} is past the last result.`,
+    )
+  const lines = [`Found ${hits.length} safe Core matches for "${query}". Showing ${offset + 1}-${offset + page.length}:`, '']
+  page.forEach((hit, i) => {
+    lines.push(`[${offset + i + 1}] ${hit.label}\npath: ${hit.path}\nsize: ${hit.size} bytes\nexcerpt: ${hit.snippet}`, '')
+  })
+  if (offset + page.length < hits.length)
+    lines.push(`More matches available: rerun with --offset ${offset + page.length}.`)
+  lines.push('Excerpts are bounded; use Read with offset/limit on the path for complete content.')
+  return toolOk(lines.join('\n'))
 }
 
 // ── memory (Core) 已退役 ──

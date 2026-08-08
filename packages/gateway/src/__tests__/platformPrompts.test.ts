@@ -51,7 +51,7 @@ function promptsDirVia(root: string): string {
 // 合法样本必须携带各 key 的必需占位符(m2 校验),否则整套加载失败(那正是占位符测试要单独构造的)。
 const sample = (tag: string): Record<PlatformPromptKey, string> => ({
   'platform-capabilities': `CAP-${tag} {{WECHAT_VISION_HINT}}`,
-  'memory-instructions': `MEM-${tag} {{MEMORY_DIR}} {{MEMORY_MD}} {{MEMORY_INDEX}}`,
+  'memory-instructions': `MEM-${tag} {{MEMORY_DIR}} {{MEMORY_MD}} {{USER_MD}}`,
   'codex-preamble': `CODEX-${tag}`,
 })
 // 便捷取样(替代早期硬编码的 'CAP-r1' 等 —— 现样本含占位符)。
@@ -243,7 +243,7 @@ describe('platformPrompts LKG 加载器', () => {
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
     assert.equal(getPlatformPrompt('memory-instructions', 'FB'), sample('r1')['memory-instructions'], '首轮加载成功')
 
-    // r2:memory 去掉一个必需占位符 {{MEMORY_INDEX}}(其余合法)
+    // r2:memory 去掉一个必需占位符 {{USER_MD}}(其余合法)
     const c = sample('r2')
     c['memory-instructions'] = 'MEM-r2 {{MEMORY_DIR}} {{MEMORY_MD}} 缺 index 占位符'
     writeBundle(root, 'r2', c)
@@ -257,7 +257,7 @@ describe('platformPrompts LKG 加载器', () => {
   it('m2 占位符登记表:三 key 必需占位符与消费方注入契约一致', () => {
     const req = _internals.REQUIRED_PLACEHOLDERS
     assert.deepEqual([...req['platform-capabilities']], ['{{WECHAT_VISION_HINT}}'])
-    assert.deepEqual([...req['memory-instructions']].sort(), ['{{MEMORY_DIR}}', '{{MEMORY_INDEX}}', '{{MEMORY_MD}}'])
+    assert.deepEqual([...req['memory-instructions']].sort(), ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{USER_MD}}'])
     assert.deepEqual([...req['codex-preamble']], [])
   })
 })
@@ -342,7 +342,7 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
   it('memory-instructions.md === MEMORY_INSTRUCTIONS_FALLBACK', () => {
     const fb = _platformPromptFallbacks.MEMORY_INSTRUCTIONS_FALLBACK
     assert.equal(readFileSync(join(dir, 'memory-instructions.md'), 'utf8'), fb)
-    for (const ph of ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{MEMORY_INDEX}}']) {
+    for (const ph of ['{{MEMORY_DIR}}', '{{MEMORY_MD}}', '{{USER_MD}}']) {
       assert.ok(fb.includes(ph), `memory 模板必须含占位符 ${ph}`)
     }
   })
