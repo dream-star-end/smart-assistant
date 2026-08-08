@@ -110,11 +110,11 @@ describe("V5 synthetic exact-eval run-arm", () => {
     const armB = parseRunArmArgs([
       ...validArgs("B"),
       "--timeout-seconds",
-      "1050",
+      "2700",
       "--apply",
     ]);
     assert.equal(armB.uid, 626);
-    assert.equal(armB.timeoutSeconds, 1_050);
+    assert.equal(armB.timeoutSeconds, 2_700);
     assert.equal(armB.apply, true);
 
     const wrongA = validArgs("A");
@@ -124,7 +124,7 @@ describe("V5 synthetic exact-eval run-arm", () => {
     wrongB[wrongB.indexOf("--candidate-sha") + 1] = "a".repeat(40);
     assert.throws(() => parseRunArmArgs(wrongB), /arm B must stage/);
     assert.throws(
-      () => parseRunArmArgs([...validArgs("A"), "--timeout-seconds", "1051"]),
+      () => parseRunArmArgs([...validArgs("A"), "--timeout-seconds", "2701"]),
       /incomplete or invalid/,
     );
     assert.throws(

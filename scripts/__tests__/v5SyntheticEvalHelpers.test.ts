@@ -656,6 +656,7 @@ describe("V5 synthetic exact-eval helpers", () => {
       OC_SYNTHETIC_EVAL_PROMPT: prompt,
       OC_SYNTHETIC_EVAL_PROMPT_SHA: promptSha,
       OC_SYNTHETIC_EVAL_MODEL: "gpt-5.6-sol",
+      OC_SYNTHETIC_EVAL_TIMEOUT_SECONDS: "2700",
       OC_SYNTHETIC_EVAL_TURN_PATH: turnPath,
       OC_SYNTHETIC_EVAL_FRAMES_PATH: framesPath,
       OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH: extraPromptPath,
@@ -700,6 +701,24 @@ describe("V5 synthetic exact-eval helpers", () => {
     assert.equal(turn.extra_prompt.sha256, extraPromptSha);
     assert.equal(turn.extra_prompt.processes[0].aliveAfter, false);
     assert.equal("contentBase64" in turn.extra_prompt, false);
+
+    const overLeaseWindow = spawnSync(process.execPath, [turnHelper], {
+      encoding: "utf8",
+      env: {
+        ...env,
+        OC_SYNTHETIC_EVAL_TIMEOUT_SECONDS: "2701",
+        OC_SYNTHETIC_EVAL_TURN_PATH: join(directory, "over-timeout-turn.json"),
+        OC_SYNTHETIC_EVAL_FRAMES_PATH: join(directory, "over-timeout-frames.json"),
+        OC_SYNTHETIC_EVAL_EXTRA_PROMPT_PATH: join(directory, "over-timeout-prompt.md"),
+      },
+    });
+    assert.notEqual(overLeaseWindow.status, 0);
+    assert.match(overLeaseWindow.stderr, /60\.\.2700/);
+    assert.equal(
+      readFileSync(fake.log, "utf8").trim().split("\n").length,
+      1,
+      "timeout beyond the bounded eval window rejects before ssh",
+    );
 
     const second = spawnSync(process.execPath, [turnHelper], {
       encoding: "utf8",
