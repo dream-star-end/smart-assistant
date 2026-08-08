@@ -131,16 +131,15 @@ test('停止:3s 内进终态 + 不再有增量帧 + 不额外计费不复活', a
   await sendMessage(page, `${marker} 请从 1 数到 2000，每行一个数字，不要省略、不要总结。`);
   await waitForTurnBusy(page);
 
-  // 等到"确有产出或明确在生成中"再停:停在完全无输出的瞬间走的是另一条路径,
-  // 而用户抱怨的场景是"已经在刷字了但停不下来"。60s 内既无正文又无生成指示 =
-  // 本身就是静默 turn,让门红。
+  // 只在确有 assistant 正文/流式光标后再停。排队中的乐观 UI 也会显示「停止」和
+  // 「生成中」,但此时 durable dispatch 可能尚未建立；把它当作引擎执行会让用例提前
+  // 取消排队项，永远覆盖不到真实 abort 路径。60s 内无真实产出 = 静默 turn,让门红。
   await pollUntil(
     async () => {
       const snap = await streamSnapshot(page);
-      if (snap.assistantChars > 0 || snap.carets > 0) return true;
-      return (await SEL.typing(page).count()) > 0;
+      return snap.assistantChars > 0 || snap.carets > 0;
     },
-    { timeoutMs: 60_000, intervalMs: 500, label: '长 turn 开始产出(正文/流式光标/生成中指示)' },
+    { timeoutMs: 60_000, intervalMs: 500, label: '长 turn 开始真实产出(正文/流式光标)' },
   );
 
   // ── ② 受信点击「停止」→ 3s 内终态 ────────────────────────────────────────
