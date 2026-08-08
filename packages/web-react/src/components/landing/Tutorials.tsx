@@ -1,4 +1,5 @@
 import {
+  ArrowRight,
   Brain,
   Check,
   Clock,
@@ -13,6 +14,11 @@ import {
   Terminal,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { tutorialHref } from "../../hooks/useAppRoute";
+import {
+  TUTORIAL_CASES,
+  type TutorialCaseCategory,
+} from "../../lib/tutorialCaseCatalog";
 
 /**
  * 三步上手：把「多快能用起来」讲清楚（调研共识：3 分钟内到 wow moment）。
@@ -72,6 +78,17 @@ const STARTERS: Starter[] = [
     text: "换个更擅长推理的模型，再帮我推演一遍这个定价方案",
   },
 ];
+
+const FEATURED_CASES = [
+  ...TUTORIAL_CASES.filter((item) => item.category === "research").slice(0, 3),
+  ...TUTORIAL_CASES.filter((item) => item.category === "coding").slice(0, 3),
+];
+
+function caseCategoryLabel(category: TutorialCaseCategory): string {
+  if (category === "research") return "科研";
+  if (category === "coding") return "编码";
+  return "通用";
+}
 
 /** 可点击复制的示例指令芯片。 */
 function StarterChip({ s }: { s: Starter }) {
@@ -148,9 +165,36 @@ export function Tutorials() {
         ))}
       </div>
 
-      {/* 开口第一句 */}
+      {/* 真实案例：教程中心的主入口，不再只列功能名。 */}
       <div className="mb-6 text-center">
-        <h3 className="text-[22px] font-bold tracking-tight">不知道说什么？开口第一句，照抄就行</h3>
+        <h3 className="text-[22px] font-bold tracking-tight">从一个真实任务，看到完整交付</h3>
+        <p className="mx-auto mt-2 max-w-xl text-[14.5px] text-muted">
+          每个案例都公开输入材料、Agent 与模型选择、执行过程、产物和验收方法，重点覆盖科研与编码。
+        </p>
+      </div>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        {FEATURED_CASES.map((item) => (
+          <a
+            key={item.id}
+            href={tutorialHref(window.location, null, item.id)}
+            className="group rounded-2xl border border-border bg-surface p-5 outline-none transition-[border-color,background-color,transform] duration-200 ease-standard hover:-translate-y-0.5 hover:border-accent/50 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <div className="flex items-center justify-between gap-3">
+              <span className="rounded-full bg-accent-soft px-2.5 py-1 text-[11.5px] font-semibold text-accent">
+                {caseCategoryLabel(item.category)} · {item.difficulty}
+              </span>
+              <ArrowRight size={15} className="text-faint transition-transform group-hover:translate-x-0.5 group-hover:text-accent" />
+            </div>
+            <h4 className="mt-3 text-[16px] font-semibold text-fg">{item.title}</h4>
+            <p className="mt-1.5 line-clamp-2 text-[13.5px] leading-6 text-muted">{item.summary}</p>
+            <p className="mt-3 text-[12px] font-medium text-accent">查看输入 → 过程 → 产物 → 验收</p>
+          </a>
+        ))}
+      </div>
+
+      {/* 开口第一句 */}
+      <div className="mb-6 mt-14 text-center">
+        <h3 className="text-[22px] font-bold tracking-tight">只想马上试试？开口第一句，照抄就行</h3>
         <p className="mx-auto mt-2 max-w-xl text-[14.5px] text-muted">
           点一下复制，注册后粘进对话框 —— 定时、记忆、连仓库这些活儿它也全接。
         </p>

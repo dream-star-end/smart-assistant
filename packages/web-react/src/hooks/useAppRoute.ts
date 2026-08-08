@@ -1,9 +1,12 @@
 import { useEffect, useRef } from "react";
 import {
-  PRODUCT_CAPABILITIES,
   isProductFeatureId,
   type ProductFeatureId,
 } from "../lib/productCapabilities";
+import {
+  parseTutorialCaseId,
+  type TutorialCaseId,
+} from "../lib/tutorialCaseCatalog";
 import type { Session } from "../lib/types";
 
 /**
@@ -24,7 +27,7 @@ import type { Session } from "../lib/types";
  * - popstate：按 URL 切会话（/s/<id> 且会话存在 → selectSession；已删除的死条目 →
  *   清选中 + replaceState 修正 URL；/ → 清选中回空会话态）。
  * - 面板深链 `?panel=settings|market|manage|org|help`：boot 由 App 在 useState 初始化时读取
- *   （parsePanelParam）；教程另带稳定 `topic`。打开/关闭经本 hook replaceState 同步回 query
+ *   （parsePanelParam）；教程另带稳定 `case` 或兼容旧版的 `topic`。打开/关闭经本 hook replaceState 同步回 query
  *   （面板不压栈，且保留其他无关 query）。
  * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
  */
@@ -47,22 +50,57 @@ export function parsePanelParam(sp: URLSearchParams): PanelParam | null {
 /** `?panel=help&topic=` → 稳定教程 id；非 help / 未知 id 返回 null。 */
 export function parseTutorialTopic(sp: URLSearchParams): ProductFeatureId | null {
   if (parsePanelParam(sp) !== "help") return null;
+  // case 与 topic 同时出现时，案例优先；这样复制过的新链接不会被旧参数抢走。
+  if (parseTutorialCase(sp)) return null;
   const topic = sp.get("topic");
   return isProductFeatureId(topic) ? topic : null;
 }
 
-/** 保留其他 query；非 help 时清 topic，help 的空/未知 topic 规范化为默认教程。 */
+/** `?panel=help&case=` → 稳定案例 id；非 help / 未知 id 返回 null。 */
+export function parseTutorialCase(sp: URLSearchParams): TutorialCaseId | null {
+  if (parsePanelParam(sp) !== "help") return null;
+  return parseTutorialCaseId(sp.get("case"));
+}
+
+/** 保留其他 query；case/topic 互斥；无选择即案例总览；离开 help 时两者都清理。 */
 export function withPanelParams(
   input: URLSearchParams,
   panel: PanelParam | null,
   topic?: ProductFeatureId | null,
+  caseId?: TutorialCaseId | null,
 ): URLSearchParams {
   const next = new URLSearchParams(input);
   if (panel) next.set("panel", panel);
   else next.delete("panel");
-  if (panel === "help") next.set("topic", topic ?? PRODUCT_CAPABILITIES.chatBasics.id);
-  else next.delete("topic");
+  if (panel === "help" && caseId) {
+    next.set("case", caseId);
+    next.delete("topic");
+  } else if (panel === "help" && topic) {
+    next.set("topic", topic);
+    next.delete("case");
+  } else {
+    next.delete("case");
+    next.delete("topic");
+  }
   return next;
+}
+
+/**
+ * 生成可复制/新标签打开的教程深链。与状态镜像共用 withPanelParams，确保 campaign、
+ * 邀请码等无关 query 以及当前 pathname/hash 都不会被卡片链接静默丢掉。
+ */
+export function tutorialHref(
+  locationLike: { pathname: string; search: string; hash: string },
+  topic?: ProductFeatureId | null,
+  caseId?: TutorialCaseId | null,
+): string {
+  const query = withPanelParams(
+    new URLSearchParams(locationLike.search),
+    "help",
+    topic,
+    caseId,
+  ).toString();
+  return `${locationLike.pathname}${query ? `?${query}` : ""}${locationLike.hash}`;
 }
 
 export type UseAppRouteOptions = {
@@ -82,15 +120,21 @@ export type UseAppRouteOptions = {
   onPopToRoot: () => void;
   /** 当前打开的面板（App 派生；顶层中心互斥并按单一优先级镜像）。 */
   activePanel: PanelParam | null;
-  /** help 打开时的当前教程；其他面板忽略。 */
+  /** help 打开时的旧版功能教程；案例总览/案例详情为 null。 */
   activeTopic?: ProductFeatureId | null;
+  /** help 打开时的案例；功能教程/案例总览为 null。 */
+  activeCase?: TutorialCaseId | null;
   /** popstate 反灌面板/query（外部 help 深链恢复时使用）。 */
-  onPopPanel?: (panel: PanelParam | null, topic: ProductFeatureId | null) => void;
+  onPopPanel?: (
+    panel: PanelParam | null,
+    topic: ProductFeatureId | null,
+    caseId: TutorialCaseId | null,
+  ) => void;
 };
 
 export function useAppRoute(opts: UseAppRouteOptions): void {
   const { enabled, inWorkspace, activeId, sessions, serverListSettled, pendingSessionId } = opts;
-  const { activePanel, activeTopic } = opts;
+  const { activePanel, activeTopic, activeCase } = opts;
   // 回调/最新值经 ref 镜像（App 每渲染传新闭包；popstate 监听只挂一次仍读最新）。
   const cbRef = useRef(opts);
   cbRef.current = opts;
@@ -102,7 +146,11 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     const onPop = () => {
       if (!cbRef.current.inWorkspace) return;
       const query = new URLSearchParams(location.search);
-      cbRef.current.onPopPanel?.(parsePanelParam(query), parseTutorialTopic(query));
+      cbRef.current.onPopPanel?.(
+        parsePanelParam(query),
+        parseTutorialTopic(query),
+        parseTutorialCase(query),
+      );
       const id = parseSessionPath(location.pathname);
       if (id) {
         if (cbRef.current.sessions.some((s) => s.id === id)) {
@@ -173,9 +221,9 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
   useEffect(() => {
     if (!enabled) return;
     const current = new URLSearchParams(location.search);
-    const next = withPanelParams(current, activePanel, activeTopic);
+    const next = withPanelParams(current, activePanel, activeTopic, activeCase);
     const q = next.toString();
     if (q === current.toString()) return;
     history.replaceState({}, "", location.pathname + (q ? `?${q}` : "") + location.hash);
-  }, [enabled, activePanel, activeTopic]);
+  }, [enabled, activePanel, activeTopic, activeCase]);
 }

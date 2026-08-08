@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang=en>
+<head>
+<meta charset=utf-8>
+<title>Decentralized Identifier Working Group &ndash; 04 December 2025</title>
+<meta name=viewport content="width=device-width">
+<link rel="stylesheet" type="text/css" title="2018" href="https://www.w3.org/StyleSheets/scribe2/public.css">
+<link rel="alternate stylesheet" type="text/css" title="2004" href="https://www.w3.org/StyleSheets/base.css">
+<link rel="alternate stylesheet" type="text/css" title="2004" href="https://www.w3.org/StyleSheets/public.css">
+<link rel="alternate stylesheet" type="text/css" title="2004" href="https://www.w3.org/2004/02/minutes-style.css">
+<link rel="alternate stylesheet" type="text/css" title="Fancy" href="https://www.w3.org/StyleSheets/scribe2/fancy.css">
+<link rel="alternate stylesheet" type="text/css" title="Typewriter" href="https://www.w3.org/StyleSheets/scribe2/tt-member.css">
+</head>
+
+<body>
+<header>
+<p><a href="https://www.w3.org/"><img src="https://www.w3.org/assets/logos/w3c-2025/svg/w3c-white.svg" alt=W3C border=0 height=60 width=60></a></p>
+
+<h1>&ndash; DRAFT &ndash;<br>
+Decentralized Identifier Working Group</h1>
+<h2>04 December 2025</h2>
+
+<nav id=links>
+<a href="https://www.w3.org/2025/11/11-did-minutes.html"><img alt="Previous meeting." title="Previous meeting" src="https://www.w3.org/StyleSheets/scribe2/go-previous.png"></a>
+<a href="https://lists.w3.org/Archives/Public/public-did-wg/2025Dec/0002.html"><img alt="Agenda." title="Agenda" src="https://www.w3.org/StyleSheets/scribe2/chronometer.png"></a>
+<a href="https://www.w3.org/2025/12/04-did-irc"><img alt="IRC log." title="IRC log" src="https://www.w3.org/StyleSheets/scribe2/text-plain.png"></a>
+<a href="https://www.w3.org/2025/12/11-did-minutes.html"><img alt="Next meeting." title="Next meeting" src="https://www.w3.org/StyleSheets/scribe2/go-next.png"></a>
+</nav>
+</header>
+
+<div id=prelims>
+<div id=attendees>
+<h2>Attendees</h2>
+<dl class=intro>
+<dt>Present</dt><dd>JoeAndrieu, KevinDean, manu, ottomorac, pchampin, smccown, swcurran, TallTed</dd>
+<dt>Regrets</dt><dd>-</dd>
+<dt>Chair</dt><dd>ottomorac</dd>
+<dt>Scribe</dt><dd>pchampin</dd>
+</dl>
+</div>
+
+<nav id=toc>
+<h2>Contents</h2>
+<ol>
+<li><a href="#5be1">Agenda Review, Introductions (5 min)</a></li>
+<li><a href="#59b8">Debrief from TPAC (5 min)</a></li>
+<li><a href="#43a5">DID Resolution PR Processing \[1\] (15 min)</a>
+<ol>
+<li><a href="#bc09">w3c/<wbr>did-resolution#242</a></li>
+<li><a href="#f168">w3c/<wbr>did-resolution#206</a></li>
+<li><a href="#5639">w3c/<wbr>did-resolution#215</a></li>
+<li><a href="#2cfe">w3c/<wbr>did-resolution#217</a></li>
+</ol>
+</li>
+<li><a href="#9029">Unclear definition of &quot;&quot;Read&quot;&quot; operation for DID methods #230 \[2\] (7 min)</a></li>
+<li><a href="#b363">DID-Resolution issues</a>
+<ol>
+<li><a href="#bc67">w3c/<wbr>did-resolution#234</a></li>
+<li><a href="#92e8">w3c/<wbr>did-resolution#217</a></li>
+<li><a href="#dc55">w3c/<wbr>did-resolution#232</a></li>
+<li><a href="#2c97">w3c/<wbr>did-resolution#228</a></li>
+<li><a href="#b64a">w3c/<wbr>did-resolution#225</a></li>
+</ol>
+</li>
+<li><a href="#fe95">next meeting</a></li>
+</ol>
+</nav>
+</div>
+
+<main id=meeting class=meeting>
+<h2>Meeting minutes</h2>
+<section></section>
+
+<section>
+<h3 id=5be1>Agenda Review, Introductions (5 min)</h3>
+</section>
+
+<section>
+<h3 id=59b8>Debrief from TPAC (5 min)</h3>
+<p id=f94c class="phone s01"><cite>ottomorac:</cite> any impression from TPAC, for those who were there?</p>
+<p id=708f class=irc><cite>&lt;ottomorac&gt;</cite> Here are TPAC meeting minutes: <a href="https://www.w3.org/2025/11/11-did-minutes.html">https://<wbr>www.w3.org/<wbr>2025/<wbr>11/<wbr>11-did-minutes.html</a></p>
+<p id=390d class="phone s02"><cite>manu:</cite> we processed a lot of issues<br>
+<span id=19e9>… we had a lot of things ready for PR</span><br>
+<span id=901e>… which means that now we need people to write those PRs</span><br>
+<span id=7e63>… we identified that we need to raise PR at a faster rate than what we have been doing</span><br>
+<span id=ff45>… Not much discussion on the DID core specification.</span><br>
+<span id=0bc5>… I think we were supposed to publish a CR in November, but nothing published yet.</span><br>
+<span id=0d96>… For DID Resolution, we went through a lot of issues, nothing really blocking.</span></p>
+<p id=d381 class="phone s01"><cite>ottomorac:</cite> I know swcurran has been preparing some things about DID Path discussion<br>
+<span id=23bb>… my understanding is that Wil will allocate some time next Thursday for that topic</span></p>
+</section>
+
+<section>
+<h3 id=43a5>DID Resolution PR Processing \[1\] (15 min)</h3>
+<h4 id=bc09><a href="https://github.com/w3c/did-resolution/pull/242">w3c/<wbr>did-resolution#242</a></h4>
+<p id=72aa class="phone s01"><cite>ottomorac:</cite> just some clean up, approval from swcurran<br>
+<span id=093d>… it would be good to have more approval, it seems straightforwad</span></p>
+<h4 id=f168><a href="https://github.com/w3c/did-resolution/pull/206">w3c/<wbr>did-resolution#206</a></h4>
+<p id=e3a9 class="phone s01"><cite>ottomorac:</cite> this one is about self-attested DID document metadata<br>
+<span id=6e36>… also approved by swcurran, some changes by manu</span><br>
+<span id=a1c2>… it would be good to have Markus for this one</span></p>
+<p id=bdef class="phone s03"><cite>JoeAndrieu:</cite> some text close to the PR, but not changed by the PR, is incorrect<br>
+<span id=0442>… I can raise this as an issue</span></p>
+<p id=a161 class="phone s04"><cite>swcurran:</cite> [proposes alternative text, that JoeAndrieu is happy about]</p>
+<h4 id=5639><a href="https://github.com/w3c/did-resolution/pull/215">w3c/<wbr>did-resolution#215</a></h4>
+<p id=9427 class="phone s01"><cite>ottomorac:</cite> this one has no review yet</p>
+<p id=b80f class=irc><cite>&lt;JoeAndrieu&gt;</cite> Alternative language from &quot;the metadata ... or from the did method&quot; to something about &quot;from the did resolver, as defined by the did method&quot;</p>
+<p id=3482 class="phone s01"><cite>ottomorac:</cite> probably one for Markus, but maybe others have feeedback?</p>
+<p id=f6a8 class=irc><cite>&lt;swcurran&gt;</cite> swcurran: The DID Method defines the metadata, and JoeAndrieu noted that the DID Resolver implements and could be compromised.</p>
+<h4 id=2cfe><a href="https://github.com/w3c/did-resolution/pull/217">w3c/<wbr>did-resolution#217</a></h4>
+<p id=2260 class=irc><cite>&lt;ottomorac&gt;</cite> Prefer UTF-8 for DID Parameters <a href="https://github.com/w3c/did-resolution/issues/217">#217</a></p>
+<p id=165d class="phone s01"><cite>ottomorac:</cite> related to an issue raised by Addison Philips as part of the i18n review</p>
+<p id=2da9 class=irc><cite>&lt;ottomorac&gt;</cite> Also appreciate reviews on 219, 248, 253</p>
+</section>
+
+<section>
+<h3 id=9029>Unclear definition of &quot;&quot;Read&quot;&quot; operation for DID methods <a href="https://github.com/w3c/did-resolution/issues/230">#230</a> \[2\] (7 min)</h3>
+<p id=3e9b class=irc><cite>&lt;ottomorac&gt;</cite> <a href="https://github.com/w3c/did-resolution/issues/230">w3c/<wbr>did-resolution#230</a></p>
+<p id=24b2 class=irc><cite>&lt;ottomorac&gt;</cite> There is one additional clarification that Will requested on this issue regarding the Resolve vs. Read Operation and how we are managing that in DID Core. Markus has provided his perspective, and Will would like Manu to weigh in here as well.</p>
+<p id=623b class="phone s01"><cite>ottomorac:</cite> this issue had some conversation in the past day<br>
+<span id=61cb>… Markus would like Manu's take on this, as it may also impact DID core.</span></p>
+<p id=9c0f class="phone s02"><cite>manu:</cite> I think I agree with what Markus is saying in this issue<br>
+<span id=2e8e>… I need to look in more depth on how it impacts DID core</span><br>
+<span id=6f16>… Markus says that there is a difference between read and resolve</span><br>
+<span id=08a0>… &quot;read&quot; just instructs the resolver to perform the resolution</span><br>
+<span id=114a>… &quot;resolve&quot; is the process applied by the resolver</span><br>
+<span id=69ae>… we could transfer this issue to DID core, I believe it is editorial, so we could make it in CR</span></p>
+<p id=41aa class="phone s03"><cite>JoeAndrieu:</cite> I do think we need this nuance, but I'm not sure I would put it exactly as manu did.</p>
+<p id=c248 class=irc><cite>&lt;manu&gt;</cite> +1 that there is nuance to tease out</p>
+<p id=7c5e class="phone s03"><cite>JoeAndrieu:</cite> for me &quot;read&quot; is what the resolver is doing, &quot;resolve&quot; is what the method defines</p>
+<p id=fb8a class=irc><cite>&lt;KevinDean&gt;</cite> &quot;Resolve&quot; is a function within &quot;Read&quot;.</p>
+<p id=f6a5 class="phone s03"><cite>JoeAndrieu:</cite> we can discuss on proposed text</p>
+<p id=d982 class=irc><cite>&lt;swcurran&gt;</cite> Wow...Joe, I think the reverse.</p>
+<p id=daa2 class="phone s04"><cite>swcurran:</cite> I think the only reason the term &quot;read&quot; is here is because the acronym CRUD is used.<br>
+<span id=0b8b>… if DID core dropped &quot;CRUD&quot;, resolve would be enough</span></p>
+<p id=cdfd class=irc><cite>&lt;manu&gt;</cite> We'd have Create, Resolve, Update, and Deactivate :)</p>
+<p id=e8ab class="phone s04"><cite>swcurran:</cite> but +1 to tease it out in a PR</p>
+</section>
+
+<section>
+<h3 id=b363>DID-Resolution issues</h3>
+<h4 id=bc67><a href="https://github.com/w3c/did-resolution/issues/234">w3c/<wbr>did-resolution#234</a></h4>
+<p id=9deb class="phone s01"><cite>ottomorac:</cite> this one is pretty much ready for PR<br>
+<span id=1cee>… Will has added some elements</span></p>
+<p id=bb7f class=irc><cite>&lt;ottomorac1&gt;</cite> q&gt;</p>
+<p id=a7dd class=irc><cite>&lt;Zakim&gt;</cite> JoeAndrieu, you wanted to comment on <a href="https://github.com/w3c/did-resolution/issues/217">#217</a></p>
+<p id=6716 class="phone s03"><cite>JoeAndrieu:</cite> the resolution was about the accept headers in HTTP</p>
+<p id=ecde class="phone s01"><cite>ottomorac:</cite> which of the two statements would be correct?</p>
+<p id=5a0c class="phone s03"><cite>JoeAndrieu:</cite> I think that it reads akwardly more than it is wrong</p>
+<p id=b1b8 class="phone s01"><cite>ottomorac:</cite> do you think you could propose a better wording?</p>
+<p id=068f class="phone s03"><cite>JoeAndrieu:</cite> maybe. I think Will has an idea about how to resolve this.</p>
+<h4 id=92e8><a href="https://github.com/w3c/did-resolution/issues/217">w3c/<wbr>did-resolution#217</a></h4>
+<p id=c6d7 class="phone s03"><cite>JoeAndrieu:</cite> I just added a comment. The language that removed the percent-encoding bit that caught my eye.<br>
+<span id=ae4a>… I don't think that we can remove it, because if we use UTF-8 in a URL, it will get percent-encoded.</span></p>
+<p id=cee1 class="phone s05"><cite>pchampin:</cite> is percent-encoding our responsibility?</p>
+<p id=ac20 class="phone s03"><cite>JoeAndrieu:</cite> as we are defining URL parameter, they are defined as being part of a URL, so they need to be percent-encoded</p>
+<p id=b0f5 class="phone s02"><cite>manu:</cite> there are 3 different things here<br>
+<span id=dd53>… I agree with JoeAndrieu that things will need to be percent-encoded; we should not re-define it, but refer to the RFC</span></p>
+<p id=2f09 class=irc><cite>&lt;ottomorac1&gt;</cite> Addison talked about  RFC3987:  <a href="https://github.com/w3c/did-resolution/issues/200#issuecomment-3335817636">w3c/<wbr>did-resolution#200 (comment)</a></p>
+<p id=ccbc class="phone s02"><cite>manu:</cite> another point is: are we talking about the the value space, which need to support UTF-8, or the lexical space, where percent-encoding is required</p>
+<p id=0dfe class=irc><cite>&lt;Zakim&gt;</cite> TallTed, you wanted to check whether we're staying with RFC 3986/7 or moving to WHAT WG's URL spec</p>
+<p id=84b2 class="phone s06"><cite>TallTed:</cite> RCF3986 and RFC3987 travel together, they don't really make sense without each other<br>
+<span id=e591>… another question is: are we sticking to these RFCs, or moving to the WHATWG's definition of URL</span></p>
+<p id=b32e class=irc><cite>&lt;ottomorac1&gt;</cite> <a href="https://github.com/w3c/did-resolution/issues/200#issuecomment-3335817636">w3c/<wbr>did-resolution#200 (comment)</a></p>
+<p id=68b1 class="phone s06"><cite>TallTed:</cite> (mostly the same, but slightly different)</p>
+<p id=9807 class=irc><cite>&lt;Zakim&gt;</cite> JoeAndrieu, you wanted to say I see the fix</p>
+<p id=e7e7 class="phone s03"><cite>JoeAndrieu:</cite> my concerns have actually been addressed<br>
+<span id=8283>… there is a global statement stating that everything must be serialized</span><br>
+<span id=f227>… I got distracted by the title of the issue; with TallTed's clarification, the text seems fine</span><br>
+<span id=0064>… I think we should talk about the issue raised by TallTed; the VC WG has moved to the WHATWG's definition of URL</span></p>
+<p id=91fd class="phone s02"><cite>manu:</cite> now reading Addison's commentary, it is aligned with what I said.<br>
+<span id=6d6e>… He calls it &quot;logical&quot; vs &quot;serialized&quot;, what I called &quot;value space&quot; vs &quot;lexical space&quot;</span><br>
+<span id=f62b>… He says we don't make the distinction and we should make it.</span><br>
+<span id=6539>… He says &quot;don't constraint systems to be ASCII only&quot;, talking about the value space</span><br>
+<span id=8542>… There are two encoding algorithms, we need to be carefuly which one we refer to.</span><br>
+<span id=a798>… We need to be sure this change does not impact also DID core, looking at it right now.</span></p>
+<p id=c4ac class="phone s01"><cite>ottomorac:</cite> Will pointed out that DID parameters were dropped from DID core 1.1 .</p>
+<p id=648a class="phone s02"><cite>manu:</cite> if that right?</p>
+<p id=74ac class="phone s03"><cite>JoeAndrieu:</cite> if that's right, it feels weird to me.</p>
+<p id=1219 class="phone s02"><cite>manu:</cite> DID URLs define parameters, it talks mostly about the lexical space<br>
+<span id=3aeb>… we should be good.</span><br>
+<span id=2ce4>… I agree with JoeAndrieu that it would have been wrong to completely remove them.</span><br>
+<span id=e82f>… This now raises the question of DID Resolution re-stating something that DID core states more cleanly.</span></p>
+<p id=1181 class="phone s03"><cite>JoeAndrieu:</cite> looking at the differences between RFC3986 and RFC3987. They are not many, but they may be significant.<br>
+<span id=712e>… RFC3987 aims to support international characters that are not supported by RFC3986.</span><br>
+<span id=dc6f>… We could switch to RFC3987. There are questions about similarly-looking characters, but I don't think that's our issue.</span></p>
+<p id=8801 class="phone s02"><cite>manu:</cite> going back to the PR. I think it is fine as is.<br>
+<span id=a3df>… I don't think we need to change anything.</span><br>
+<span id=d82f>… JoeAndrieu would you agree?</span></p>
+<p id=f2be class="phone s03"><cite>JoeAndrieu:</cite> it addresses my concern with percent-encoding.<br>
+<span id=53e8>… But there is a shift about international characters.</span><br>
+<span id=eaf6>… The shift to RFC3987 would allow characters that were not allowed before.</span><br>
+<span id=2049>… We need to think whether it would break implementations?</span><br>
+<span id=5a70>… Allowing international characters is a good thing as long as we don't introduce security or privacy problems.</span></p>
+<p id=3e7f class="phone s02"><cite>manu:</cite> trying to get closure on this. §3.1 in RFC3987 describes how to map an IRI to a URI.</p>
+<p id=c9d5 class="phone s03"><cite>JoeAndrieu:</cite> I was looking to the ABNF, §2.2. 'ucschar' is a class of new characters</p>
+<p id=332d class="phone s02"><cite>manu:</cite> ucschar is not UTF-8, but can be converted to UTF-8.<br>
+<span id=f715>… I think we are fine with the PR as is.</span></p>
+<p id=f5c8 class="phone s03"><cite>JoeAndrieu:</cite> +1</p>
+<h4 id=dc55><a href="https://github.com/w3c/did-resolution/issues/232">w3c/<wbr>did-resolution#232</a></h4>
+<p id=cc79 class=irc><cite>&lt;ottomorac1&gt;</cite> Can we avoid term definition duplication across DID specs? <a href="https://github.com/w3c/did-resolution/issues/232">#232</a></p>
+<p id=7d39 class="phone s07"><cite>ottomorac1:</cite> we have some guidance from manu, now we need a willing participant to implement the changes<br>
+<span id=9440>… I could try this on</span><br>
+<span id=b42f>… I may require some help, but I can make an initial proposal.</span></p>
+<h4 id=2c97><a href="https://github.com/w3c/did-resolution/issues/228">w3c/<wbr>did-resolution#228</a></h4>
+<p id=0a40 class=irc><cite>&lt;ottomorac1&gt;</cite> Fix bug in implementer overview description <a href="https://github.com/w3c/did-resolution/issues/228">#228</a></p>
+<p id=08d6 class="phone s07"><cite>ottomorac1:</cite> we discuss that on a previous call, but manu was not here<br>
+<span id=50f6>… did it get discussed at TPAC?</span></p>
+<p id=e414 class="phone s03"><cite>JoeAndrieu:</cite> this is about the fact that we define DID resolution as only using the DID<br>
+<span id=8aac>… but that's not exactly how it works.</span></p>
+<p id=cca3 class=irc><cite>&lt;swcurran&gt;</cite> +1 to Joe's description</p>
+<p id=5532 class="phone s03"><cite>JoeAndrieu:</cite> we start with a DID URL with parameters; we extract the DID and the parameters, and use the parameters to configure the resolution</p>
+<p id=9cfb class=irc><cite>&lt;manu&gt;</cite> +1 to Joe</p>
+<p id=7908 class="phone s07"><cite>ottomorac1:</cite> I think this is an issue for Markus</p>
+<p id=eafa class="phone s02"><cite>manu:</cite> we talked about this at TPAC and came to a resolution. This is marked &quot;ready for PR&quot;. What JoeAndrieu said should be addressed.</p>
+<h4 id=b64a><a href="https://github.com/w3c/did-resolution/issues/225">w3c/<wbr>did-resolution#225</a></h4>
+<p id=636d class="phone s02"><cite>manu:</cite> it is editorial<br>
+<span id=c818>… I'm wondering: should we spend call-time discussing issues that are marked &quot;ready for PR&quot;.</span><br>
+<span id=e64d>… All those issues need is someone taking them on.</span><br>
+<span id=768f>… We processed these at TPAC, let's not re-process them.</span><br>
+<span id=2707>… Some discussions brought clarifications, but this one does not need any.</span><br>
+<span id=d597>… At this point, I think the chairs should appoint people; asking nicely for volunteers will not work.</span><br>
+<span id=556f>… This is just a suggestion, though.</span></p>
+</section>
+
+<section>
+<h3 id=fe95>next meeting</h3>
+<p id=f71f class="phone s07"><cite>ottomorac1:</cite> next week we will allocate time to discuss path</p>
+<p id=10d0 class="phone s04"><cite>swcurran:</cite> yes, I think we need to align on that</p>
+<p id=6060 class=irc><cite>&lt;ottomorac&gt;</cite> m2gbot, link issues with transcript</p>
+<p id=ffff class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/pull/242#issuecomment-3613327740">w3c/<wbr>did-resolution#242 (comment)</a></p>
+<p id=e9b7 class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/pull/206#issuecomment-3613327877">w3c/<wbr>did-resolution#206 (comment)</a></p>
+<p id=475f class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/pull/215#issuecomment-3613327953">w3c/<wbr>did-resolution#215 (comment)</a></p>
+<p id=9fa7 class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/pull/217#issuecomment-3613328017">w3c/<wbr>did-resolution#217 (comment)</a></p>
+<p id=1801 class=irc><cite>&lt;m2gbot&gt;</cite> comment already there: <a href="https://github.com/w3c/did-resolution/pull/217#issuecomment-3613328017">w3c/<wbr>did-resolution#217 (comment)</a></p>
+<p id=c61a class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/issues/230#issuecomment-3613328289">w3c/<wbr>did-resolution#230 (comment)</a></p>
+<p id=9b77 class=irc><cite>&lt;m2gbot&gt;</cite> comment already there: <a href="https://github.com/w3c/did-resolution/issues/230#issuecomment-3613328289">w3c/<wbr>did-resolution#230 (comment)</a></p>
+<p id=58b8 class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/issues/234#issuecomment-3613328529">w3c/<wbr>did-resolution#234 (comment)</a></p>
+<p id=fdc8 class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/pull/217#issuecomment-3613328684">w3c/<wbr>did-resolution#217 (comment)</a></p>
+<p id=e110 class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/issues/232#issuecomment-3613328809">w3c/<wbr>did-resolution#232 (comment)</a></p>
+<p id=143d class=irc><cite>&lt;m2gbot&gt;</cite> comment already there: <a href="https://github.com/w3c/did-resolution/issues/232#issuecomment-3613328809">w3c/<wbr>did-resolution#232 (comment)</a></p>
+<p id=23a3 class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/issues/228#issuecomment-3613329023">w3c/<wbr>did-resolution#228 (comment)</a></p>
+<p id=d8b6 class=irc><cite>&lt;m2gbot&gt;</cite> comment already there: <a href="https://github.com/w3c/did-resolution/issues/228#issuecomment-3613329023">w3c/<wbr>did-resolution#228 (comment)</a></p>
+<p id=e3b6 class=irc><cite>&lt;m2gbot&gt;</cite> comment created: <a href="https://github.com/w3c/did-resolution/issues/225#issuecomment-3613329213">w3c/<wbr>did-resolution#225 (comment)</a></p>
+</section>
+</main>
+
+
+<address>Minutes manually created (not a transcript), formatted by <a
+href="https://w3c.github.io/scribe2/scribedoc.html"
+>scribe.perl</a> version 248 (Mon Oct 27 20:04:16 2025 UTC).</address>
+
+<div class=diagnostics>
+<h2>Diagnostics</h2>
+<p class=warning>Succeeded: s/Topic: Debrief from TPAC//</p>
+<p class=warning>Succeeded: i|agendum 3|... my understanding is that Wil will allocate some time next Thursday for that topic</p>
+<p class=warning>Succeeded: s/elemenrs/elements/</p>
+<p class=warning>Succeeded: i|subtopic: https://github.com/w3c/did-resolution/issues/234|topic: DID-Resolution issues</p>
+<p class=warning>Maybe present: ottomorac1</p>
+<p class=warning>All speakers: JoeAndrieu, manu, ottomorac, ottomorac1, pchampin, swcurran, TallTed</p>
+<p class=warning>Active on IRC: JoeAndrieu, KevinDean, m2gbot, manu, ottomorac, ottomorac1, pchampin, smccown, swcurran, TallTed</p>
+</div>
+</body>
+</html>

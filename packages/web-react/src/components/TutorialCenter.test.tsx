@@ -7,6 +7,7 @@ import {
   type ProductCapability,
   type ProductFeatureId,
 } from "../lib/productCapabilities";
+import type { TutorialCaseId } from "../lib/tutorialCaseCatalog";
 import { TutorialCenter } from "./TutorialCenter";
 
 afterEach(() => {
@@ -45,7 +46,68 @@ function Harness({
   );
 }
 
+function CaseHarness({ initial = null }: { initial?: TutorialCaseId | null }) {
+  const [caseId, setCaseId] = useState<TutorialCaseId | null>(initial);
+  const [topicId, setTopicId] = useState<ProductFeatureId | null>(null);
+  return (
+    <TutorialCenter
+      open
+      topicId={topicId}
+      caseId={caseId}
+      onTopicChange={(id) => {
+        setTopicId(id);
+        setCaseId(null);
+      }}
+      onCaseChange={(id) => {
+        setCaseId(id);
+        setTopicId(null);
+      }}
+      onShowCaseGallery={() => {
+        setCaseId(null);
+        setTopicId(null);
+      }}
+      onClose={() => {}}
+      actionState={() => ({ enabled: true, label: "回到功能位置" })}
+      onRunAction={() => {}}
+    />
+  );
+}
+
 describe("TutorialCenter", () => {
+  it("默认以真实案例为主视图，并保留旧功能索引入口", () => {
+    render(<CaseHarness />);
+
+    expect(
+      screen.getByRole("heading", { name: "不讲功能清单，直接完成真实任务" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("12 个公开、可复查的任务场景")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /从 30 篇论文到可追溯证据图谱/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "功能索引" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "功能索引" }));
+    expect(
+      screen.getByRole("heading", { name: "开始一场高质量对话" }),
+    ).toBeInTheDocument();
+  });
+
+  it("案例详情公开输入、全过程和验收，但待采集轨迹不伪装成实跑", () => {
+    render(<CaseHarness initial="research-bike-demand" />);
+
+    expect(
+      screen.getByRole("heading", { name: "公开数据到可复现的单车需求分析" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "输入材料与授权" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "全流程：输入 → 操作 → 过程 → 输出 → 验收" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/待真实运行采集/)).toBeInTheDocument();
+    expect(screen.queryByText("加载真实完整过程")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /UCI Bike Sharing Dataset/ })).toHaveAttribute(
+      "href",
+      "https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset",
+    );
+  });
+
   it("展示详细步骤、本地演示媒体、风险提示与真实功能 CTA", () => {
     const onRun = vi.fn();
     render(<Harness onRun={onRun} />);

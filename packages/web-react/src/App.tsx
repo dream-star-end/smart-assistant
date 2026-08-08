@@ -62,6 +62,7 @@ import {
   type PanelParam,
   parsePanelParam,
   parseSessionPath,
+  parseTutorialCase,
   parseTutorialTopic,
   useAppRoute,
 } from "./hooks/useAppRoute";
@@ -109,6 +110,7 @@ import {
   type ProductFeatureId,
 } from "./lib/productCapabilities";
 import { resolveTutorialAction } from "./lib/tutorialActions";
+import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage } from "./lib/api";
 import {
   effectiveEffortModelId,
@@ -218,9 +220,10 @@ export function App() {
   // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
   const routingEnabled = !demo && !resetToken;
   const bootPanel = routingEnabled ? parsePanelParam(params) : null;
-  const bootTutorialTopic = routingEnabled
-    ? (parseTutorialTopic(params) ?? PRODUCT_CAPABILITIES.chatBasics.id)
-    : PRODUCT_CAPABILITIES.chatBasics.id;
+  const bootTutorialCase = routingEnabled ? parseTutorialCase(params) : null;
+  const bootTutorialTopic = routingEnabled && !bootTutorialCase
+    ? parseTutorialTopic(params)
+    : null;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -283,7 +286,8 @@ export function App() {
   const [orgOpen, setOrgOpen] = useState(bootPanel === "org");
   const [orgSection, setOrgSection] = useState<OrgSection>("overview");
   const [tutorialOpen, setTutorialOpen] = useState(bootPanel === "help");
-  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId>(bootTutorialTopic);
+  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(bootTutorialTopic);
+  const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(bootTutorialCase);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -382,7 +386,8 @@ export function App() {
     demo,
     resetToken,
     initialUser: demo ? DEMO_USER : null,
-    // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/面板态,回首页。
+    // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/私有面板态,回首页。
+    // help 是公开内容：若 URL 明确携带案例/功能深链，静默续期发现未登录时仍应保留。
     onClearAuth: () => {
       // signPath 只在单一租户内唯一；鉴权身份退出/过期时必须丢弃内存图片字节，避免
       // 同一 SPA 随后登录另一账号后以相同容器路径命中上一账号的 Blob。
@@ -397,7 +402,11 @@ export function App() {
       setLiveMediaJob(null);
       setManageAutoAuthorizePluginSlug(null);
       setOrgOpen(false);
-      setTutorialOpen(false);
+      const publicQuery = new URLSearchParams(location.search);
+      const keepPublicTutorial = routingEnabled && parsePanelParam(publicQuery) === "help";
+      setTutorialOpen(keepPublicTutorial);
+      setTutorialCase(keepPublicTutorial ? parseTutorialCase(publicQuery) : null);
+      setTutorialTopic(keepPublicTutorial ? parseTutorialTopic(publicQuery) : null);
       setView("home");
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
@@ -927,13 +936,14 @@ export function App() {
     setOrgOpen(true);
   }, [refreshMe]);
 
-  const openTutorial = useCallback((id: ProductFeatureId = PRODUCT_CAPABILITIES.chatBasics.id) => {
+  const openTutorial = useCallback((id?: ProductFeatureId) => {
     // 教程是单一顶层中心：打开前收起其他中心，避免多层 Radix Dialog 叠加与焦点陷阱互抢。
     setSettingsOpen(false);
     setManageOpen(false);
     setMarketplaceOpen(false);
     setOrgOpen(false);
-    setTutorialTopic(id);
+    setTutorialTopic(id ?? null);
+    setTutorialCase(null);
     setTutorialOpen(true);
   }, []);
 
@@ -1046,6 +1056,20 @@ export function App() {
       openRepo,
       openOrg,
     ],
+  );
+
+  const runTutorialCase = useCallback(
+    (item: TutorialCase) => {
+      setTutorialOpen(false);
+      if (!inWorkspace) {
+        setAuthMode("login");
+        setView("app");
+        return;
+      }
+      newSession();
+      setComposerPrefill({ text: item.starterPrompt, nonce: Date.now() });
+    },
+    [inWorkspace, newSession],
   );
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
@@ -2004,13 +2028,17 @@ export function App() {
     },
     activePanel,
     activeTopic: tutorialOpen ? tutorialTopic : null,
-    onPopPanel: (panel, topic) => {
+    activeCase: tutorialOpen ? tutorialCase : null,
+    onPopPanel: (panel, topic, caseId) => {
       setSettingsOpen(panel === "settings");
       setMarketplaceOpen(panel === "market");
       setManageOpen(panel === "manage");
       setOrgOpen(panel === "org");
       setTutorialOpen(panel === "help");
-      if (panel === "help") setTutorialTopic(topic ?? PRODUCT_CAPABILITIES.chatBasics.id);
+      if (panel === "help") {
+        setTutorialTopic(topic);
+        setTutorialCase(caseId);
+      }
     },
   });
 
@@ -2026,30 +2054,65 @@ export function App() {
   // action immediately instead of hiding it behind the ordinary landing page.
   if (!demo && view === "home" && !authRecoveryAvailable) {
     return (
-      <LazyBoundary fallback={<SplashFallback />}>
-        <Landing
-          onStart={() => {
-            // 「免费开始」入口进登录页（login）：登录页本身有「立即注册」链接，新用户不受阻。
-            setAuthMode("login");
-            setView("app");
-          }}
-          onLogin={() => {
-            setAuthMode("login");
-            setView("app");
-          }}
-          onCreateOrg={() => {
-            // 「创建组织」深链(/?panel=org 等价):置 org 打开态 → 进 app。
-            // 未登录 → AuthGate(login 模式,与深链默认一致);登录后工作区渲染即呈现
-            // OrgCenter(无 org→向导 / 有 org→正常视图);useAppRoute 会把 orgOpen 镜像回
-            // ?panel=org。已登录用户不经此路径(booted authed 已在 app 视图)。
-            setAuthMode("login");
-            setOrgOpen(true);
-            setView("app");
-          }}
-          theme={theme}
-          onCycleTheme={cycle}
-        />
-      </LazyBoundary>
+      <>
+        <LazyBoundary fallback={<SplashFallback />}>
+          <Landing
+            onStart={() => {
+              // 「免费开始」入口进登录页（login）：登录页本身有「立即注册」链接，新用户不受阻。
+              setAuthMode("login");
+              setView("app");
+            }}
+            onLogin={() => {
+              setAuthMode("login");
+              setView("app");
+            }}
+            onCreateOrg={() => {
+              // 「创建组织」深链(/?panel=org 等价):置 org 打开态 → 进 app。
+              // 未登录 → AuthGate(login 模式,与深链默认一致);登录后工作区渲染即呈现
+              // OrgCenter(无 org→向导 / 有 org→正常视图);useAppRoute 会把 orgOpen 镜像回
+              // ?panel=org。已登录用户不经此路径(booted authed 已在 app 视图)。
+              setAuthMode("login");
+              setOrgOpen(true);
+              setView("app");
+            }}
+            theme={theme}
+            onCycleTheme={cycle}
+          />
+        </LazyBoundary>
+        {tutorialOpen && (
+          <LazyBoundary fallback={<DialogFallback />}>
+            <TutorialCenter
+              open={tutorialOpen}
+              topicId={tutorialTopic}
+              caseId={tutorialCase}
+              onTopicChange={(id) => {
+                setTutorialTopic(id);
+                setTutorialCase(null);
+              }}
+              onCaseChange={(id) => {
+                setTutorialCase(id);
+                setTutorialTopic(null);
+              }}
+              onShowCaseGallery={() => {
+                setTutorialCase(null);
+                setTutorialTopic(null);
+              }}
+              caseActionLabel="登录后试用"
+              onRunCase={runTutorialCase}
+              onClose={() => setTutorialOpen(false)}
+              actionState={() => ({
+                enabled: true,
+                label: "登录后试用",
+              })}
+              onRunAction={() => {
+                setTutorialOpen(false);
+                setAuthMode("login");
+                setView("app");
+              }}
+            />
+          </LazyBoundary>
+        )}
+      </>
     );
   }
   if (!demo && (!auth || !user)) {
@@ -2565,7 +2628,21 @@ export function App() {
           <TutorialCenter
             open={tutorialOpen}
             topicId={tutorialTopic}
-            onTopicChange={setTutorialTopic}
+            caseId={tutorialCase}
+            onTopicChange={(id) => {
+              setTutorialTopic(id);
+              setTutorialCase(null);
+            }}
+            onCaseChange={(id) => {
+              setTutorialCase(id);
+              setTutorialTopic(null);
+            }}
+            onShowCaseGallery={() => {
+              setTutorialCase(null);
+              setTutorialTopic(null);
+            }}
+            caseActionLabel="带着指令去对话"
+            onRunCase={runTutorialCase}
             onClose={() => setTutorialOpen(false)}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}

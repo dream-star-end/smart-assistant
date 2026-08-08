@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import {
   PRODUCT_CAPABILITIES,
@@ -34,6 +35,14 @@ import {
   TUTORIAL_TOPICS,
   type TutorialMediaKey,
 } from "../packages/web-react/src/lib/tutorialCatalog.ts";
+import {
+  TUTORIAL_CASES,
+  TUTORIAL_CASE_IDS,
+} from "../packages/web-react/src/lib/tutorialCaseCatalog.ts";
+import {
+  isPrivatePublicReplayField,
+  validatePublicCheckEvidence,
+} from "../packages/web-react/src/lib/tutorialReplayContract.ts";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const WEB_ROOT = join(ROOT, "packages/web-react");
@@ -78,10 +87,16 @@ type CapabilitySnapshot = {
   mediaHash: string;
 };
 
+type CaseSnapshot = {
+  contentVersion: number;
+  contentHash: string;
+};
+
 type TutorialSnapshot = {
   schema: 1;
   catalogSchema: number;
   capabilities: Record<string, CapabilitySnapshot>;
+  cases: Record<string, CaseSnapshot>;
   media: Record<TutorialMediaKey, MediaSnapshot>;
 };
 
@@ -97,6 +112,8 @@ type TutorialAudit = {
   registryChanged: string[];
   contentChanged: string[];
   mediaChanged: string[];
+  /** Added after the case-first tutorial catalog; absent on historical rows. */
+  caseChanged?: string[];
   added: string[];
   retired: string[];
   snapshotSha256: string;
@@ -485,6 +502,681 @@ function validateCatalog(markers: Marker[]): void {
     fail(`存在未被任何教程引用的媒体：${unusedMedia.join(", ")}`);
 }
 
+const PUBLIC_MESSAGE_ROLES = new Set([
+  "user",
+  "assistant",
+  "thinking",
+  "tool",
+  "agent-group",
+  "plan",
+  "goal",
+  "permission",
+  "delegate-progress",
+  "runtime-event",
+  "system",
+]);
+
+const FORBIDDEN_PUBLIC_TEXT =
+  /claudeai\.chat|\/root\/|\/home\/(?:agent|openclaude)\/|\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]{20,}\.|\b(?:trace|request|session|peer|container)[-_ ]?id\b/i;
+
+function record(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    fail(`${label} 必须是 JSON object`);
+  return value as Record<string, unknown>;
+}
+
+function stringField(
+  value: Record<string, unknown>,
+  field: string,
+  label: string,
+): string {
+  const result = value[field];
+  if (typeof result !== "string" || !result.trim())
+    fail(`${label}.${field} 必须是非空字符串`);
+  return result;
+}
+
+function integerField(
+  value: Record<string, unknown>,
+  field: string,
+  label: string,
+): number {
+  const result = value[field];
+  if (!Number.isSafeInteger(result) || (result as number) < 0)
+    fail(`${label}.${field} 必须是非负安全整数`);
+  return result as number;
+}
+
+function exactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (stable(actual) !== stable(wanted))
+    fail(`${label} 字段不符：${actual.join(", ")}`);
+}
+
+function parseJsonFile(
+  path: string,
+  label: string,
+): {
+  bytes: Buffer;
+  value: unknown;
+} {
+  if (!existsSync(path)) fail(`${label} 文件不存在`);
+  const bytes = readFileSync(path);
+  try {
+    return { bytes, value: JSON.parse(bytes.toString("utf8")) };
+  } catch {
+    fail(`${label} 不是有效 JSON`);
+  }
+}
+
+function assertPublicValue(value: unknown, label: string): void {
+  if (typeof value === "string") {
+    if (FORBIDDEN_PUBLIC_TEXT.test(value))
+      fail(`${label} 含禁止公开的身份、路径或凭据`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) =>
+      assertPublicValue(entry, `${label}[${index}]`),
+    );
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (isPrivatePublicReplayField(key))
+      fail(`${label}.${key} 是禁止公开的生产身份字段`);
+    assertPublicValue(entry, `${label}.${key}`);
+  }
+}
+
+function validatePublicMessage(
+  raw: unknown,
+  caseId: string,
+  ordinal: number,
+): { id: string; ts: number } {
+  const message = record(raw, `${caseId}: message ${ordinal}`);
+  const id = stringField(message, "id", `${caseId}: message ${ordinal}`);
+  if (!/^(?:msg|tutorial)-[a-z0-9][a-z0-9-]*$/.test(id))
+    fail(`${caseId}: message ${ordinal} 必须使用脱敏公共 ID`);
+  const role = stringField(message, "role", `${caseId}: message ${ordinal}`);
+  if (!PUBLIC_MESSAGE_ROLES.has(role))
+    fail(`${caseId}: message ${ordinal} role 无效`);
+  if (typeof message.text !== "string")
+    fail(`${caseId}: message ${ordinal}.text 必须是字符串`);
+  const ts = integerField(message, "ts", `${caseId}: message ${ordinal}`);
+  const media = message._media;
+  if (media !== undefined) {
+    if (!Array.isArray(media))
+      fail(`${caseId}: message ${ordinal}._media 必须是数组`);
+    for (const [index, entry] of media.entries()) {
+      const item = record(entry, `${caseId}: media ${ordinal}/${index}`);
+      if ("base64" in item || "localSrc" in item || item.hidden === true)
+        fail(`${caseId}: 公开媒体不得内嵌 base64、blob 或隐藏附件`);
+      const url = stringField(
+        item,
+        "url",
+        `${caseId}: media ${ordinal}/${index}`,
+      );
+      if (!url.startsWith(`/tutorials/cases/${caseId}/media/`))
+        fail(`${caseId}: 公开媒体必须绑定当前案例的同源静态目录`);
+    }
+  }
+  assertPublicValue(message, `${caseId}: message ${ordinal}`);
+  return { id, ts };
+}
+
+type ValidatedReplayManifest = {
+  bytes: Buffer;
+  messageCount: number;
+  messages: unknown[];
+};
+
+function validateReplayManifest(
+  caseId: string,
+  messagesPath: string,
+  publicRoot: string,
+): ValidatedReplayManifest {
+  const expectedManifestPath = `/tutorials/cases/${caseId}/messages-manifest.json`;
+  if (messagesPath !== expectedManifestPath)
+    fail(`${caseId}: replay manifest 路径必须绑定案例 ID`);
+  const parsed = parseJsonFile(
+    join(publicRoot, messagesPath),
+    `${caseId}: replay manifest`,
+  );
+  const manifest = record(parsed.value, `${caseId}: replay manifest`);
+  exactKeys(
+    manifest,
+    ["schemaVersion", "caseId", "messageCount", "pages"],
+    `${caseId}: replay manifest`,
+  );
+  if (manifest.schemaVersion !== 1 || manifest.caseId !== caseId)
+    fail(`${caseId}: replay manifest schema/caseId 不一致`);
+  const messageCount = integerField(
+    manifest,
+    "messageCount",
+    `${caseId}: replay manifest`,
+  );
+  if (
+    messageCount < 2 ||
+    !Array.isArray(manifest.pages) ||
+    manifest.pages.length < 1
+  )
+    fail(`${caseId}: replay manifest 缺少完整分页`);
+
+  const messages: unknown[] = [];
+  const ids = new Set<string>();
+  let lastTs = -1;
+  for (const [pageIndex, rawPageMeta] of manifest.pages.entries()) {
+    const pageMeta = record(rawPageMeta, `${caseId}: page meta ${pageIndex}`);
+    exactKeys(
+      pageMeta,
+      ["path", "sha256", "bytes", "messageCount", "startOrdinal"],
+      `${caseId}: page meta ${pageIndex}`,
+    );
+    const pageNumber = String(pageIndex + 1).padStart(4, "0");
+    const pagePath = stringField(
+      pageMeta,
+      "path",
+      `${caseId}: page meta ${pageIndex}`,
+    );
+    if (pagePath !== `/tutorials/cases/${caseId}/messages-${pageNumber}.json`)
+      fail(`${caseId}: replay 页路径或顺序不正确`);
+    const expectedSha = stringField(
+      pageMeta,
+      "sha256",
+      `${caseId}: page meta ${pageIndex}`,
+    );
+    if (!/^[a-f0-9]{64}$/.test(expectedSha))
+      fail(`${caseId}: replay 页 SHA-256 无效`);
+    const expectedBytes = integerField(
+      pageMeta,
+      "bytes",
+      `${caseId}: page meta ${pageIndex}`,
+    );
+    const expectedCount = integerField(
+      pageMeta,
+      "messageCount",
+      `${caseId}: page meta ${pageIndex}`,
+    );
+    const startOrdinal = integerField(
+      pageMeta,
+      "startOrdinal",
+      `${caseId}: page meta ${pageIndex}`,
+    );
+    if (startOrdinal !== messages.length || expectedCount < 1)
+      fail(`${caseId}: replay 页游标不连续`);
+    const pageParsed = parseJsonFile(
+      join(publicRoot, pagePath),
+      `${caseId}: replay page ${pageIndex}`,
+    );
+    if (
+      pageParsed.bytes.length !== expectedBytes ||
+      sha256(pageParsed.bytes) !== expectedSha
+    )
+      fail(`${caseId}: replay 页字节或哈希不一致`);
+    const page = record(
+      pageParsed.value,
+      `${caseId}: replay page ${pageIndex}`,
+    );
+    exactKeys(
+      page,
+      ["schemaVersion", "caseId", "pageIndex", "startOrdinal", "messages"],
+      `${caseId}: replay page ${pageIndex}`,
+    );
+    if (
+      page.schemaVersion !== 1 ||
+      page.caseId !== caseId ||
+      page.pageIndex !== pageIndex ||
+      page.startOrdinal !== startOrdinal ||
+      !Array.isArray(page.messages) ||
+      page.messages.length !== expectedCount
+    ) {
+      fail(`${caseId}: replay 页 schema、案例、游标或计数不一致`);
+    }
+    for (const rawMessage of page.messages) {
+      const validated = validatePublicMessage(
+        rawMessage,
+        caseId,
+        messages.length,
+      );
+      if (ids.has(validated.id)) fail(`${caseId}: replay message ID 重复`);
+      if (validated.ts < lastTs) fail(`${caseId}: replay 时间顺序倒退`);
+      ids.add(validated.id);
+      lastTs = validated.ts;
+      messages.push(rawMessage);
+    }
+  }
+  if (messages.length !== messageCount)
+    fail(`${caseId}: replay manifest 总消息数不一致`);
+  assertPublicValue(manifest, `${caseId}: replay manifest`);
+  return { bytes: parsed.bytes, messageCount, messages };
+}
+
+export function validateVerifiedEvidenceForTest(
+  item: (typeof TUTORIAL_CASES)[number],
+  publicRoot = join(WEB_ROOT, "public"),
+): void {
+  const caseId = item.id;
+  const replay = record(item.replay, `${caseId}: replay`);
+  const messagesPath = stringField(replay, "messagesPath", `${caseId}: replay`);
+  const checkReportPath = stringField(
+    replay,
+    "checkReport",
+    `${caseId}: replay`,
+  );
+  if (checkReportPath !== `/tutorials/cases/${caseId}/checks.json`)
+    fail(`${caseId}: checks 路径必须绑定案例 ID`);
+  const provenance = record(replay.provenance, `${caseId}: provenance`);
+  const runIds = provenance.runIds;
+  if (
+    provenance.repeatRuns !== 3 ||
+    !Array.isArray(runIds) ||
+    runIds.length !== 3 ||
+    stable(runIds) !== stable(["run-1", "run-2", "run-3"]) ||
+    new Set(runIds).size !== 3 ||
+    !/^[a-f0-9]{64}$/.test(String(provenance.inputSha256)) ||
+    !/^[a-f0-9]{64}$/.test(String(provenance.messagesSha256)) ||
+    !Number.isFinite(Date.parse(String(provenance.capturedAt)))
+  ) {
+    fail(`${caseId}: provenance 缺少三次独立运行或完整哈希证据`);
+  }
+  for (const field of ["release", "agentId", "modelId", "engine"] as const) {
+    stringField(provenance, field, `${caseId}: provenance`);
+  }
+
+  const manifest = validateReplayManifest(caseId, messagesPath, publicRoot);
+  if (
+    manifest.bytes.length !== provenance.bytes ||
+    sha256(manifest.bytes) !== provenance.messagesSha256 ||
+    manifest.messageCount !== provenance.messageCount
+  ) {
+    fail(`${caseId}: replay manifest 字节、哈希或总消息数与 provenance 不一致`);
+  }
+
+  const parsedChecks = parseJsonFile(
+    join(publicRoot, checkReportPath),
+    `${caseId}: checks`,
+  );
+  const checks = record(parsedChecks.value, `${caseId}: checks`);
+  exactKeys(
+    checks,
+    ["schemaVersion", "caseId", "input", "selectedRunId", "runs", "artifacts"],
+    `${caseId}: checks`,
+  );
+  if (checks.schemaVersion !== 1 || checks.caseId !== caseId)
+    fail(`${caseId}: checks schema/caseId 不一致`);
+
+  const input = record(checks.input, `${caseId}: checks.input`);
+  exactKeys(input, ["path", "sha256", "bytes"], `${caseId}: checks.input`);
+  const inputPath = stringField(input, "path", `${caseId}: checks.input`);
+  if (inputPath !== `/tutorials/cases/${caseId}/input.json`)
+    fail(`${caseId}: input 资产路径必须绑定案例 ID`);
+  const inputSha = stringField(input, "sha256", `${caseId}: checks.input`);
+  const inputBytes = integerField(input, "bytes", `${caseId}: checks.input`);
+  const parsedInput = parseJsonFile(
+    join(publicRoot, inputPath),
+    `${caseId}: input asset`,
+  );
+  if (
+    inputSha !== provenance.inputSha256 ||
+    parsedInput.bytes.length !== inputBytes ||
+    sha256(parsedInput.bytes) !== inputSha
+  ) {
+    fail(`${caseId}: input 资产字节/哈希与 checks/provenance 不一致`);
+  }
+  const inputAsset = record(parsedInput.value, `${caseId}: input asset`);
+  exactKeys(
+    inputAsset,
+    ["schemaVersion", "caseId", "starterPrompt", "materials"],
+    `${caseId}: input asset`,
+  );
+  if (
+    inputAsset.schemaVersion !== 1 ||
+    inputAsset.caseId !== caseId ||
+    inputAsset.starterPrompt !== item.starterPrompt ||
+    stable(inputAsset.materials) !== stable(item.inputMaterials)
+  )
+    fail(`${caseId}: input 资产未与 catalog 冻结指令和材料逐字绑定`);
+
+  const selectedRunId = stringField(
+    checks,
+    "selectedRunId",
+    `${caseId}: checks`,
+  );
+  if (!runIds.includes(selectedRunId))
+    fail(`${caseId}: selectedRunId 不属于 provenance 三次运行`);
+  if (!Array.isArray(checks.runs) || checks.runs.length !== 3)
+    fail(`${caseId}: checks 必须包含恰好三次运行`);
+  const reportRunIds = new Set<string>();
+  const expectedCheckTitles = new Set(item.checks.map((check) => check.title));
+  for (const [index, rawRun] of checks.runs.entries()) {
+    const run = record(rawRun, `${caseId}: checks.run ${index}`);
+    exactKeys(
+      run,
+      ["runId", "status", "agentId", "modelId", "engine", "checks"],
+      `${caseId}: checks.run ${index}`,
+    );
+    const runId = stringField(run, "runId", `${caseId}: checks.run ${index}`);
+    if (
+      run.status !== "passed" ||
+      !runIds.includes(runId) ||
+      reportRunIds.has(runId) ||
+      run.agentId !== provenance.agentId ||
+      run.modelId !== provenance.modelId ||
+      run.engine !== provenance.engine
+    ) {
+      fail(`${caseId}: checks 运行身份、状态或唯一性不一致`);
+    }
+    reportRunIds.add(runId);
+    if (
+      !Array.isArray(run.checks) ||
+      run.checks.length !== expectedCheckTitles.size
+    )
+      fail(`${caseId}: 每次运行都必须覆盖全部确定性验收`);
+    const seenChecks = new Set<string>();
+    for (const [checkIndex, rawCheck] of run.checks.entries()) {
+      const check = record(
+        rawCheck,
+        `${caseId}: run ${index} check ${checkIndex}`,
+      );
+      exactKeys(
+        check,
+        [
+          "title",
+          "status",
+          "evidencePath",
+          "evidenceSha256",
+          "evidenceBytes",
+        ],
+        `${caseId}: run ${index} check ${checkIndex}`,
+      );
+      const title = stringField(
+        check,
+        "title",
+        `${caseId}: run ${index} check ${checkIndex}`,
+      );
+      if (
+        check.status !== "passed" ||
+        !expectedCheckTitles.has(title) ||
+        seenChecks.has(title) ||
+        !/^[a-f0-9]{64}$/.test(String(check.evidenceSha256))
+      ) {
+        fail(`${caseId}: 运行验收状态、标题或证据哈希无效`);
+      }
+      const evidencePath = stringField(
+        check,
+        "evidencePath",
+        `${caseId}: run ${index} check ${checkIndex}`,
+      );
+      if (
+        !evidencePath.startsWith(
+          `/tutorials/cases/${caseId}/evidence/${runId}/`,
+        ) ||
+        !evidencePath.endsWith(".json")
+      )
+        fail(`${caseId}: 验收证据路径必须绑定案例和公开运行别名`);
+      const evidenceBytes = integerField(
+        check,
+        "evidenceBytes",
+        `${caseId}: run ${index} check ${checkIndex}`,
+      );
+      const evidence = parseJsonFile(
+        join(publicRoot, evidencePath),
+        `${caseId}: run ${index} check ${checkIndex} evidence`,
+      );
+      if (
+        evidence.bytes.length !== evidenceBytes ||
+        sha256(evidence.bytes) !== check.evidenceSha256
+      )
+        fail(`${caseId}: 验收证据字节或哈希不一致`);
+      validatePublicCheckEvidence(evidence.value, {
+        caseId,
+        runId,
+        checkTitle: title,
+      });
+      assertPublicValue(
+        evidence.value,
+        `${caseId}: run ${index} check ${checkIndex} evidence`,
+      );
+      seenChecks.add(title);
+    }
+  }
+
+  const actualArtifacts = replay.actualArtifacts;
+  if (!Array.isArray(actualArtifacts) || actualArtifacts.length < 1)
+    fail(`${caseId}: verified replay 必须声明实际下载产物`);
+  if (!Array.isArray(checks.artifacts))
+    fail(`${caseId}: checks.artifacts 必须是数组`);
+  if (stable(actualArtifacts) !== stable(checks.artifacts))
+    fail(`${caseId}: catalog 与 checks 的实际产物清单不一致`);
+  const expectedArtifactTitles = new Set(
+    item.artifacts.map((artifact) => artifact.title),
+  );
+  const actualArtifactTitles = new Set(
+    actualArtifacts.map((artifact) =>
+      stringField(
+        record(artifact, `${caseId}: artifact`),
+        "title",
+        `${caseId}: artifact`,
+      ),
+    ),
+  );
+  for (const title of expectedArtifactTitles) {
+    if (!actualArtifactTitles.has(title))
+      fail(`${caseId}: 缺少预期实际产物 ${title}`);
+  }
+  for (const [index, rawArtifact] of actualArtifacts.entries()) {
+    const artifact = record(rawArtifact, `${caseId}: artifact ${index}`);
+    exactKeys(
+      artifact,
+      ["title", "path", "sha256", "bytes", "mimeType"],
+      `${caseId}: artifact ${index}`,
+    );
+    stringField(artifact, "title", `${caseId}: artifact ${index}`);
+    stringField(artifact, "mimeType", `${caseId}: artifact ${index}`);
+    const path = stringField(artifact, "path", `${caseId}: artifact ${index}`);
+    if (!path.startsWith(`/tutorials/cases/${caseId}/artifacts/`))
+      fail(`${caseId}: 实际产物路径必须绑定案例 ID`);
+    const expectedSha = stringField(
+      artifact,
+      "sha256",
+      `${caseId}: artifact ${index}`,
+    );
+    if (!/^[a-f0-9]{64}$/.test(expectedSha))
+      fail(`${caseId}: 实际产物哈希无效`);
+    const expectedBytes = integerField(
+      artifact,
+      "bytes",
+      `${caseId}: artifact ${index}`,
+    );
+    const bytes = readFileSync(join(publicRoot, path));
+    if (bytes.length !== expectedBytes || sha256(bytes) !== expectedSha)
+      fail(`${caseId}: 实际产物字节或哈希不一致`);
+  }
+  assertPublicValue(parsedChecks.value, `${caseId}: checks`);
+  assertPublicValue(parsedInput.value, `${caseId}: input asset`);
+}
+
+function validateCaseCatalog(): void {
+  if (TUTORIAL_CASES.length !== 12 || TUTORIAL_CASE_IDS.length !== 12)
+    fail("场景教程必须固定包含 12 个旗舰案例");
+  if (new Set(TUTORIAL_CASE_IDS).size !== TUTORIAL_CASE_IDS.length)
+    fail("场景教程稳定 ID 不得重复");
+
+  const expectedCounts = { research: 5, coding: 5, general: 2 } as const;
+  for (const [category, count] of Object.entries(expectedCounts)) {
+    const actual = TUTORIAL_CASES.filter(
+      (item) => item.category === category,
+    ).length;
+    if (actual !== count)
+      fail(`场景教程 ${category} 应有 ${count} 个，实际 ${actual} 个`);
+  }
+
+  const registeredIds = new Set<string>(TUTORIAL_CASE_IDS);
+  const seenIds = new Set<string>();
+  for (const item of TUTORIAL_CASES) {
+    if (!registeredIds.has(item.id) || seenIds.has(item.id))
+      fail(`${item.id}: 案例 ID 未登记或重复`);
+    seenIds.add(item.id);
+    if (!Number.isSafeInteger(item.contentVersion) || item.contentVersion < 1)
+      fail(`${item.id}: contentVersion 必须是正整数`);
+    if (
+      item.title.trim().length < 8 ||
+      item.summary.trim().length < 30 ||
+      item.outcome.trim().length < 20 ||
+      item.starterPrompt.trim().length < 100
+    ) {
+      fail(`${item.id}: 标题、摘要、结果或开工指令过于表面`);
+    }
+    if (
+      item.sources.length < 2 ||
+      item.inputMaterials.length < 1 ||
+      item.stages.length < 4 ||
+      item.artifacts.length < 1 ||
+      item.checks.length < 2
+    ) {
+      fail(`${item.id}: 缺少来源、输入、全流程、产物或确定性验收`);
+    }
+    for (const capabilityId of item.capabilityIds) {
+      if (!FEATURE_IDS.has(capabilityId))
+        fail(`${item.id}: 引用了未知产品能力 ${capabilityId}`);
+    }
+    const officialAgents = {
+      "research-assistant": { name: "科研助手", model: "deepseek-v4-pro" },
+      "coding-assistant": { name: "编程助手", model: "glm-5.2" },
+      "office-assistant": { name: "办公助手", model: "MiniMax-M3" },
+    } as const;
+    const officialAgent = officialAgents[item.suggestion.agentId];
+    if (
+      !officialAgent ||
+      item.suggestion.agentName !== officialAgent.name ||
+      item.suggestion.modelId !== officialAgent.model ||
+      !item.suggestion.modelGuidance.trim() ||
+      !item.suggestion.why.trim()
+    ) {
+      fail(`${item.id}: 建议 Agent/模型必须与产品官方登记一致`);
+    }
+    const stageIds = new Set<string>();
+    for (const stage of item.stages) {
+      if (!stage.id.trim() || stageIds.has(stage.id))
+        fail(`${item.id}: 阶段 ID 为空或重复 ${stage.id}`);
+      stageIds.add(stage.id);
+      if (
+        !stage.input.trim() ||
+        !stage.operation.trim() ||
+        !stage.output.trim() ||
+        stage.visibleProcess.length < 2 ||
+        stage.acceptance.length < 2
+      ) {
+        fail(
+          `${item.id}/${stage.id}: 未完整说明输入、操作、可见过程、输出与验收`,
+        );
+      }
+    }
+    for (const source of item.sources) {
+      let url: URL;
+      try {
+        url = new URL(source.url);
+      } catch {
+        fail(`${item.id}: 来源 URL 无效 ${source.url}`);
+      }
+      if (url.protocol !== "https:" || !url.hostname)
+        fail(`${item.id}: 来源必须使用 HTTPS ${source.url}`);
+      if (!source.license.trim() || !source.usageNote.trim())
+        fail(`${item.id}: 来源必须写明许可与使用边界 ${source.url}`);
+    }
+    for (const [inputIndex, input] of item.inputMaterials.entries()) {
+      if (
+        !input.revision.trim() ||
+        !/^[a-f0-9]{64}$/.test(input.sha256) ||
+        !Number.isSafeInteger(input.bytes) ||
+        input.bytes < 1
+      ) {
+        fail(
+          `${item.id}: 输入 ${inputIndex + 1} 缺少固定 revision/SHA-256/字节数`,
+        );
+      }
+      if (
+        !input.sourceUrl &&
+        !input.assetPath &&
+        input.inlineContent === undefined
+      )
+        fail(
+          `${item.id}: 输入 ${inputIndex + 1} 必须指向固定来源、静态资产或内联字节`,
+        );
+      if (input.sourceUrl) {
+        let sourceUrl: URL;
+        try {
+          sourceUrl = new URL(input.sourceUrl);
+        } catch {
+          fail(`${item.id}: 输入来源 URL 无效 ${input.sourceUrl}`);
+        }
+        if (sourceUrl.protocol !== "https:")
+          fail(`${item.id}: 输入来源必须使用 HTTPS ${input.sourceUrl}`);
+      }
+      const immutableGitSource =
+        input.sourceUrl !== undefined &&
+        /^https:\/\/codeload\.github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/tar\.gz\/[a-f0-9]{40}$/.test(
+          input.sourceUrl,
+        ) &&
+        /^[a-f0-9]{40}$/.test(input.revision) &&
+        input.sourceUrl.endsWith(`/${input.revision}`);
+      if (
+        input.inlineContent === undefined &&
+        !immutableGitSource &&
+        !input.assetPath
+      )
+        fail(`${item.id}: 可变外部输入必须发布同案例静态冻结副本`);
+      if (input.assetPath) {
+        if (input.inlineContent !== undefined) {
+          if (!input.assetPath.startsWith(`tutorialCaseCatalog.ts#${item.id}/`))
+            fail(`${item.id}: 内联输入定位符必须绑定当前案例`);
+        } else {
+          if (
+            !input.assetPath.startsWith(`/tutorials/cases/${item.id}/inputs/`)
+          )
+            fail(`${item.id}: 输入资产路径必须绑定当前案例`);
+          const bytes = readFileSync(join(WEB_ROOT, "public", input.assetPath));
+          if (bytes.length !== input.bytes || sha256(bytes) !== input.sha256)
+            fail(`${item.id}: 输入资产字节或哈希不一致`);
+        }
+      }
+      if (input.inlineContent !== undefined) {
+        const bytes = Buffer.from(input.inlineContent, "utf8");
+        if (bytes.length !== input.bytes || sha256(bytes) !== input.sha256)
+          fail(`${item.id}: 内联输入字节或哈希不一致`);
+      }
+      const frozenDescription = `${input.title}\n${input.description}\n${input.preparation}`;
+      if (
+        /运行时再(?:选择|任选)|请.{0,8}运行时.{0,8}(?:选择|任选)|待选择/i.test(
+          frozenDescription,
+        )
+      )
+        fail(`${item.id}: 输入 ${inputIndex + 1} 仍要求运行时再选择，未冻结`);
+    }
+
+    if (item.replay.status === "pending_capture") {
+      if (
+        item.replay.messagesPath !== undefined ||
+        item.replay.provenance !== undefined ||
+        item.replay.checkReport !== undefined ||
+        item.replay.actualArtifacts !== undefined ||
+        !item.replay.disclosure.includes("尚未完成三次独立运行")
+      ) {
+        fail(`${item.id}: 待采集案例不得携带或暗示真实回放`);
+      }
+      continue;
+    }
+
+    validateVerifiedEvidenceForTest(item);
+  }
+}
+
 function webPublicPath(urlPath: string): string {
   if (!urlPath.startsWith("/tutorials/"))
     fail(`教程媒体必须是本地 /tutorials/ 路径：${urlPath}`);
@@ -838,9 +1530,11 @@ function validateCaptureProvenance(
 function buildSnapshot(): TutorialSnapshot {
   const markers = collectMarkers();
   validateCatalog(markers);
+  validateCaseCatalog();
   const media = collectMedia();
   validateCaptureProvenance(media);
   const capabilities: Record<string, CapabilitySnapshot> = {};
+  const cases: Record<string, CaseSnapshot> = {};
   for (const feature of [...PRODUCT_CAPABILITY_LIST].sort((a, b) =>
     a.id.localeCompare(b.id),
   )) {
@@ -868,10 +1562,21 @@ function buildSnapshot(): TutorialSnapshot {
       ),
     };
   }
+  for (const item of [...TUTORIAL_CASES].sort((a, b) =>
+    a.id.localeCompare(b.id),
+  )) {
+    const { contentVersion: _contentVersion, ...contentBody } = item;
+    cases[item.id] = {
+      contentVersion: item.contentVersion,
+      // 案例正文、固定输入、来源、执行建议、验收和 replay 状态全部防漂移。
+      contentHash: sha256(stable(contentBody)),
+    };
+  }
   return {
     schema: 1,
     catalogSchema: TUTORIAL_CATALOG_SCHEMA,
     capabilities,
+    cases,
     media,
   };
 }
@@ -937,6 +1642,30 @@ function changedCapabilityIds(
       (id) =>
         stable(before?.capabilities[id] ?? null) !==
         stable(after.capabilities[id] ?? null),
+    )
+    .sort();
+}
+
+function snapshotCaseIds(
+  before: TutorialSnapshot | null,
+  after: TutorialSnapshot,
+): string[] {
+  return [
+    ...new Set([
+      ...Object.keys(before?.cases ?? {}),
+      ...Object.keys(after.cases),
+    ]),
+  ].sort();
+}
+
+function changedCaseIds(
+  before: TutorialSnapshot | null,
+  after: TutorialSnapshot,
+): string[] {
+  return snapshotCaseIds(before, after)
+    .filter(
+      (id) =>
+        stable(before?.cases?.[id] ?? null) !== stable(after.cases[id] ?? null),
     )
     .sort();
 }
@@ -1068,6 +1797,13 @@ function readAndValidateHistory(manifest: TutorialSnapshot): TutorialAudit[] {
         fail(`tutorial-sync-history.jsonl 第 ${index + 1} 行 ${field} 无效`);
       }
     }
+    if (
+      audit.caseChanged !== undefined &&
+      (!Array.isArray(audit.caseChanged) ||
+        audit.caseChanged.some((id) => typeof id !== "string"))
+    ) {
+      fail(`tutorial-sync-history.jsonl 第 ${index + 1} 行 caseChanged 无效`);
+    }
     audits.push(audit);
   }
   const expectedSnapshot = sha256(stable(manifest));
@@ -1133,6 +1869,7 @@ function accept(
   const contentChanged = changedIds(before, after, "contentHash");
   const mediaChanged = changedIds(before, after, "mediaHash");
   const allIds = new Set(changedCapabilityIds(before, after));
+  const caseChanged = changedCaseIds(before, after);
   const added = addedCapabilityIds(before, after);
   const retired = retiredCapabilityIds(before, after);
   const retireSet = new Set(args.retire);
@@ -1153,6 +1890,9 @@ function accept(
   }
   if (args.sourceOnly && (added.length > 0 || retired.length > 0)) {
     fail("--source-only 不能接受能力新增或下线");
+  }
+  if (args.sourceOnly && caseChanged.length > 0) {
+    fail("--source-only 不能接受场景案例变化");
   }
 
   if (before) {
@@ -1202,14 +1942,30 @@ function accept(
         );
       }
     }
+    for (const id of caseChanged) {
+      const oldValue = before.cases?.[id];
+      const newValue = after.cases[id];
+      if (!oldValue || !newValue) continue;
+      const hashChanged = oldValue.contentHash !== newValue.contentHash;
+      const versionRaised = newValue.contentVersion > oldValue.contentVersion;
+      if (
+        newValue.contentVersion !== oldValue.contentVersion &&
+        !versionRaised
+      ) {
+        fail(`${id}: 案例 contentVersion 不得降低`);
+      }
+      if (hashChanged !== versionRaised) {
+        fail(`${id}: 案例正文哈希变化与 contentVersion 递增必须同时发生`);
+      }
+    }
   }
 
   if (args.sourceOnly && registryChanged.length > 0)
     fail("--source-only 不能接受能力标题、分类、别名、CTA 或权限变化");
   if (args.sourceOnly && sourceChanged.length === 0)
     fail("--source-only 仅用于存在真实功能源语义变化的情况");
-  if (before && allIds.size === 0)
-    fail("当前能力、教程、入口与媒体没有待接受的变化");
+  if (before && allIds.size === 0 && caseChanged.length === 0)
+    fail("当前能力、教程、入口、案例与媒体没有待接受的变化");
   const serialized = `${JSON.stringify(JSON.parse(stable(after)), null, 2)}\n`;
   writeAtomic(MANIFEST_PATH, serialized);
   const audit: TutorialAudit = {
@@ -1228,6 +1984,7 @@ function accept(
     registryChanged,
     contentChanged,
     mediaChanged,
+    caseChanged,
     added,
     retired,
     snapshotSha256: sha256(stable(after)),
@@ -1241,7 +1998,7 @@ function accept(
   writeHistoryAnchor(nextHistory);
   readAndValidateHistory(after);
   console.log(
-    `tutorials:accept OK · ${audit.mode} · ${allIds.size} capability snapshots changed`,
+    `tutorials:accept OK · ${audit.mode} · ${allIds.size} capability snapshots changed · ${caseChanged.length} case snapshots changed`,
   );
 }
 
@@ -1267,6 +2024,7 @@ function main(): void {
     const mediaChanged = changedIds(manifest, snapshot, "mediaHash");
     const added = addedCapabilityIds(manifest, snapshot);
     const retired = retiredCapabilityIds(manifest, snapshot);
+    const caseChanged = changedCaseIds(manifest, snapshot);
     fail(
       [
         "教程同步快照已漂移，CI 不会自动改写文件。",
@@ -1274,6 +2032,7 @@ function main(): void {
         `功能源变化: ${sourceChanged.join(", ") || "无"}`,
         `教程正文变化: ${contentChanged.join(", ") || "无"}`,
         `教程媒体变化: ${mediaChanged.join(", ") || "无"}`,
+        `场景案例变化: ${caseChanged.join(", ") || "无"}`,
         `新增能力: ${added.join(", ") || "无"}`,
         `待确认下线: ${retired.join(", ") || "无"}`,
         '确认教程同步后运行 npm run tutorials:accept -- --note "说明"。',
@@ -1285,13 +2044,15 @@ function main(): void {
     0,
   );
   console.log(
-    `check:tutorials OK · ${Object.keys(snapshot.capabilities).length} capabilities · ${Object.keys(snapshot.media).length} media pairs · ${totalBytes} B`,
+    `check:tutorials OK · ${Object.keys(snapshot.capabilities).length} capabilities · ${TUTORIAL_CASES.length} real-world cases · ${Object.keys(snapshot.media).length} media pairs · ${totalBytes} B`,
   );
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
+if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  }
 }
