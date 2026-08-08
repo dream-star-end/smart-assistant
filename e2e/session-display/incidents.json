@@ -41,6 +41,9 @@
       "severity": "P0",
       "symptom": "新会话首条消息在受理时因 session_not_found 确定失败。",
       "rootFixCommit": "9cbbb1df",
+      "coverageCommits": [
+        "137c6a67"
+      ],
       "regressions": [
         {
           "layer": "integration",
