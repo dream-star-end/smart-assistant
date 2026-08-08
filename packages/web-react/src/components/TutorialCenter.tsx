@@ -38,6 +38,7 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { tutorialHref } from "../hooks/useAppRoute";
 import {
   PRODUCT_CAPABILITIES,
   PRODUCT_CAPABILITY_LIST,
@@ -136,7 +137,9 @@ export function tutorialCaseMatches(item: TutorialCase, query: string): boolean 
       item.summary,
       item.audience,
       item.outcome,
-      item.suggestion.agent,
+      item.suggestion.agentName,
+      item.suggestion.agentId,
+      item.suggestion.modelId,
       item.suggestion.modelGuidance,
       ...item.requirements,
       ...item.sources.flatMap((source) => [source.title, source.usageNote]),
@@ -163,6 +166,8 @@ export function TutorialCenter({
   onTopicChange,
   onCaseChange = () => {},
   onShowCaseGallery = () => {},
+  caseActionLabel,
+  onRunCase,
   onClose,
   actionState,
   onRunAction,
@@ -173,6 +178,8 @@ export function TutorialCenter({
   onTopicChange: (id: ProductFeatureId) => void;
   onCaseChange?: (id: TutorialCaseId) => void;
   onShowCaseGallery?: () => void;
+  caseActionLabel?: string;
+  onRunCase?: (item: TutorialCase) => void;
   onClose: () => void;
   actionState: (feature: ProductCapability) => TutorialActionState;
   onRunAction: (feature: ProductCapability) => void;
@@ -401,7 +408,14 @@ export function TutorialCenter({
               <main className="tutorial-detail min-h-0 flex-1 overflow-y-auto">
                 {mode === "cases" ? (
                   selectedCase ? (
-                    <CaseDetail item={selectedCase} copied={copied} onCopy={() => copyText(selectedCase.starterPrompt)} onBack={onShowCaseGallery} />
+                    <CaseDetail
+                      item={selectedCase}
+                      copied={copied}
+                      onCopy={() => copyText(selectedCase.starterPrompt)}
+                      onBack={onShowCaseGallery}
+                      actionLabel={caseActionLabel}
+                      onRun={onRunCase}
+                    />
                   ) : (
                     <CaseGallery items={filteredCases} onSelect={onCaseChange} />
                   )
@@ -508,7 +522,7 @@ function CaseSidebar({
             {items.map((item) => (
               <a
                 key={item.id}
-                href={`?panel=help&case=${item.id}`}
+                href={tutorialHref(window.location, null, item.id)}
                 aria-current={item.id === activeId ? "page" : undefined}
                 onClick={(event) => {
                   event.preventDefault();
@@ -579,11 +593,15 @@ function CaseDetail({
   copied,
   onCopy,
   onBack,
+  actionLabel,
+  onRun,
 }: {
   item: TutorialCase;
   copied: boolean;
   onCopy: () => void;
   onBack: () => void;
+  actionLabel?: string;
+  onRun?: (item: TutorialCase) => void;
 }) {
   return (
     <article className="mx-auto max-w-3xl px-4 pb-14 pt-5 sm:px-7 sm:pt-7" data-case-id={item.id}>
@@ -613,8 +631,8 @@ function CaseDetail({
         <div className="flex items-start gap-3">
           <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-surface text-accent shadow-sm"><Bot size={17} /></span>
           <div>
-            <h2 className="text-[14px] font-semibold text-fg">建议 Agent：{item.suggestion.agent}</h2>
-            <p className="mt-1 text-[13px] leading-5 text-muted"><strong className="font-medium text-fg">模型：</strong>{item.suggestion.modelGuidance}</p>
+            <h2 className="text-[14px] font-semibold text-fg">建议 Agent：{item.suggestion.agentName}（{item.suggestion.agentId}）</h2>
+            <p className="mt-1 text-[13px] leading-5 text-muted"><strong className="font-medium text-fg">模型：</strong>{item.suggestion.modelId} · {item.suggestion.modelGuidance}</p>
             <p className="mt-1 text-[12.5px] leading-5 text-muted">{item.suggestion.why}</p>
           </div>
         </div>
@@ -636,6 +654,13 @@ function CaseDetail({
           </Button>
         </div>
         <blockquote className="mt-3 whitespace-pre-wrap border-l-2 border-accent pl-3 text-[13.5px] leading-6 text-muted">{item.starterPrompt}</blockquote>
+        {actionLabel && onRun && (
+          <div className="mt-4 flex justify-end">
+            <Button variant="primary" onClick={() => onRun(item)}>
+              {actionLabel} <ArrowRight size={15} />
+            </Button>
+          </div>
+        )}
       </section>
 
       <section className="mt-9">
@@ -706,7 +731,7 @@ function CaseDetail({
           <TriangleAlert size={18} className="mt-0.5 shrink-0 text-warning" />
           <div>
             <h2 className="text-[14px] font-semibold text-fg">真实运行重放</h2>
-            <TutorialReplay replay={item.replay} />
+            <TutorialReplay caseId={item.id} replay={item.replay} />
             <p className="mt-2 text-[11.5px] leading-5 text-faint">{item.replay.disclosure}</p>
           </div>
         </div>

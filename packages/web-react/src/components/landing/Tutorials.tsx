@@ -14,6 +14,7 @@ import {
   Terminal,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { tutorialHref } from "../../hooks/useAppRoute";
 import {
   TUTORIAL_CASES,
   type TutorialCaseCategory,
@@ -175,7 +176,7 @@ export function Tutorials() {
         {FEATURED_CASES.map((item) => (
           <a
             key={item.id}
-            href={`/?panel=help&case=${item.id}`}
+            href={tutorialHref(window.location, null, item.id)}
             className="group rounded-2xl border border-border bg-surface p-5 outline-none transition-[border-color,background-color,transform] duration-200 ease-standard hover:-translate-y-0.5 hover:border-accent/50 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
           >
             <div className="flex items-center justify-between gap-3">

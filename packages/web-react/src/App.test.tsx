@@ -929,6 +929,35 @@ describe('Aurora v5 — P7 最小路由', () => {
     expect(window.location.search).toContain('campaign=docs')
   })
 
+  test('未登录首页的案例深链在 Landing 上方打开详情，并可转入登录后试用', async () => {
+    window.history.replaceState(
+      {},
+      '',
+      '/?campaign=docs&panel=help&case=research-bike-demand',
+    )
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(
+      () =>
+        expect(
+          screen.getByRole('heading', { name: '公开数据到可复现的单车需求分析' }),
+        ).toBeInTheDocument(),
+      { timeout: 5000 },
+    )
+    expect(window.location.search).toContain('campaign=docs')
+    expect(window.location.search).toContain('case=research-bike-demand')
+
+    fireEvent.click(screen.getByRole('button', { name: '登录后试用' }))
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: '欢迎使用 Aurora' })).toBeInTheDocument(),
+    )
+    expect(window.location.search).toContain('campaign=docs')
+    expect(window.location.search).not.toContain('panel=help')
+    expect(window.location.search).not.toContain('case=')
+  })
+
   test('教程 CTA 联动真实功能：反馈教程直达设置·反馈，且不会自动提交', async () => {
     window.history.replaceState({}, '', '/?panel=help&topic=feedback-support')
     fetchMock = routedFetchTwoSessions()

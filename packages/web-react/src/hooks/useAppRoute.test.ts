@@ -4,6 +4,7 @@ import {
   parsePanelParam,
   parseTutorialCase,
   parseTutorialTopic,
+  tutorialHref,
   withPanelParams,
 } from './useAppRoute'
 
@@ -65,5 +66,19 @@ describe('教程 URL 深链', () => {
     )
     expect(legacy.get('topic')).toBe('github-repository')
     expect(legacy.has('case')).toBe(false)
+  })
+
+  it('案例和功能链接保留 pathname、hash 与所有无关 query', () => {
+    const source = {
+      pathname: '/s/keep-session',
+      search: '?campaign=summer&invite=abc&panel=settings&topic=chat-basics',
+      hash: '#result',
+    }
+    expect(tutorialHref(source, null, 'coding-swe-bench-fix')).toBe(
+      '/s/keep-session?campaign=summer&invite=abc&panel=help&case=coding-swe-bench-fix#result',
+    )
+    expect(tutorialHref(source, PRODUCT_CAPABILITIES.github.id)).toBe(
+      '/s/keep-session?campaign=summer&invite=abc&panel=help&topic=github-repository#result',
+    )
   })
 })

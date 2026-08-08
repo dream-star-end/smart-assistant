@@ -85,6 +85,24 @@ export function withPanelParams(
   return next;
 }
 
+/**
+ * 生成可复制/新标签打开的教程深链。与状态镜像共用 withPanelParams，确保 campaign、
+ * 邀请码等无关 query 以及当前 pathname/hash 都不会被卡片链接静默丢掉。
+ */
+export function tutorialHref(
+  locationLike: { pathname: string; search: string; hash: string },
+  topic?: ProductFeatureId | null,
+  caseId?: TutorialCaseId | null,
+): string {
+  const query = withPanelParams(
+    new URLSearchParams(locationLike.search),
+    "help",
+    topic,
+    caseId,
+  ).toString();
+  return `${locationLike.pathname}${query ? `?${query}` : ""}${locationLike.hash}`;
+}
+
 export type UseAppRouteOptions = {
   /** 非 demo 且非 reset-password 时启用。 */
   enabled: boolean;
