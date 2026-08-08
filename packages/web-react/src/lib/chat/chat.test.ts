@@ -5593,7 +5593,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("Stop persists before send; persisted receipt stays busy, applied receipt settles exactly once", async () => {
+  test("online Stop stays busy through exact terminal and authoritative sync", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     let commit!: () => void;
     const persistPendingControl = vi.fn(() => new Promise<void>((resolve) => { commit = resolve; }));
