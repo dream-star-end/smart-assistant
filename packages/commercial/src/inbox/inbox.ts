@@ -357,6 +357,57 @@ export async function readAll(userId: string | bigint): Promise<{ inserted: numb
   return { inserted: r.rowCount ?? 0 };
 }
 
+export interface CronDeliveryInboxInput {
+  userId: string | number | bigint;
+  title: string;
+  bodyMd: string;
+  level: Level;
+  createdBy: string | bigint;
+  deliveryKey: string;
+}
+
+/** Persist one cron delivery with its stable occurrence key. */
+export async function createCronDeliveryInboxMessage(
+  input: CronDeliveryInboxInput,
+): Promise<void> {
+  const userId = String(input.userId);
+  const existing = await query<{ title: string; body_md: string }>(
+    `SELECT title,body_md FROM inbox_messages
+      WHERE source_type='cron_delivery' AND source_id=$1::bigint AND source_phase=$2`,
+    [userId, input.deliveryKey],
+  );
+  if (existing.rows[0]) {
+    if (existing.rows[0].title !== input.title || existing.rows[0].body_md !== input.bodyMd) {
+      throw new Error("inbox-post: delivery key content collision");
+    }
+    return;
+  }
+
+  const inserted = await query(
+    `INSERT INTO inbox_messages
+       (audience,user_id,title,body_md,level,category,thread_key,created_by,
+        source_type,source_id,source_phase)
+     SELECT 'user',$1::bigint,$2,$3,$4,'automation',
+            'cron:user:' || ($1::bigint)::text,$5::bigint,
+            'cron_delivery',$1::bigint,$6
+      WHERE EXISTS (
+        SELECT 1 FROM users WHERE id=$1::bigint AND status='active'
+      )
+     ON CONFLICT (source_type,source_id,source_phase)
+       WHERE source_type IS NOT NULL DO NOTHING`,
+    [userId, input.title, input.bodyMd, input.level, String(input.createdBy), input.deliveryKey],
+  );
+  if ((inserted.rowCount ?? 0) === 1) return;
+
+  const raced = await query<{ title: string; body_md: string }>(
+    `SELECT title,body_md FROM inbox_messages
+      WHERE source_type='cron_delivery' AND source_id=$1::bigint AND source_phase=$2`,
+    [userId, input.deliveryKey],
+  );
+  if (raced.rows[0]?.title === input.title && raced.rows[0]?.body_md === input.bodyMd) return;
+  throw new Error("inbox-post: recipient missing or delivery key collision");
+}
+
 // ─── Admin 侧:create / list / delete ─────────────────────────────
 
 /** createInboxMessage 返回 — 总是带 email 字段,未启用 notify_email 时全部置零/null. */
