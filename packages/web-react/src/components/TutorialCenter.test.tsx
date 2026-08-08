@@ -78,10 +78,14 @@ describe("TutorialCenter", () => {
     render(<CaseHarness />);
 
     expect(
-      screen.getByRole("heading", { name: "不讲功能清单，直接完成真实任务" }),
+      screen.getByRole("heading", { name: "你今天想完成什么？" }),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/从公开需求和可授权材料出发/)).not.toBeInTheDocument();
     expect(screen.getByText("12 个公开、可复查的任务场景")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /从 30 篇论文到可追溯证据图谱/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /论文越读越多.*从 30 篇论文到可追溯证据图谱.*每个结论都能点回原文/ })).toBeInTheDocument();
+    expect(screen.getAllByRole("img", { name: /成果示意/ })).toHaveLength(12);
+    expect(new Set(Array.from(document.querySelectorAll("[data-artwork-kind]"), (node) => node.getAttribute("data-artwork-kind"))).size).toBe(12);
+    expect(screen.queryByText(/个阶段 · .*项产物/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "功能索引" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "功能索引" }));
@@ -96,10 +100,11 @@ describe("TutorialCenter", () => {
     expect(
       screen.getByRole("heading", { name: "公开数据到可复现的单车需求分析" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "输入材料与授权" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "全流程：输入 → 操作 → 过程 → 输出 → 验收" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "成果示意：可一键重跑的单车需求分析工程" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "准备材料" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "4 步完成" })).toBeInTheDocument();
+    expect(screen.getAllByText("展开输入、操作与验收标准")).toHaveLength(4);
+    expect(screen.getByText(/research-assistant · deepseek-v4-pro/)).toBeInTheDocument();
     expect(screen.getByText(/待真实运行采集/)).toBeInTheDocument();
     expect(screen.queryByText("加载真实完整过程")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: /UCI Bike Sharing Dataset/ })).toHaveAttribute(

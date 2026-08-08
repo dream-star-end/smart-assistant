@@ -7,6 +7,7 @@ import {
   Brain,
   Building2,
   Check,
+  ChevronDown,
   ClipboardCheck,
   Clock3,
   Copy,
@@ -67,6 +68,7 @@ import {
   tutorialIsRead,
 } from "../lib/tutorialProgress";
 import { cn } from "../lib/utils";
+import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
 import { Badge, Button, IconButton } from "./ui";
 
@@ -546,42 +548,57 @@ function CaseSidebar({
 
 function CaseGallery({ items, onSelect }: { items: readonly TutorialCase[]; onSelect: (id: TutorialCaseId) => void }) {
   return (
-    <section className="mx-auto max-w-4xl px-4 pb-12 pt-7 sm:px-7 sm:pt-9">
-      <div className="max-w-2xl">
-        <Badge tone="accent">案例式教学</Badge>
-        <h1 className="mt-3 text-balance text-[25px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">
-          不讲功能清单，直接完成真实任务
-        </h1>
-        <p className="mt-3 text-[14.5px] leading-7 text-muted">
-          从公开需求和可授权材料出发，说明为什么这样选 Agent 与模型，并把输入、操作、可见过程、产物和验收逐步展开。科研与编码案例优先。
-        </p>
+    <section className="mx-auto max-w-5xl px-3 pb-12 pt-4 sm:px-7 sm:pt-7">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between sm:gap-6">
+        <div>
+          <h1 className="text-balance text-[22px] font-bold leading-tight tracking-tight text-fg sm:text-[28px]">
+            你今天想完成什么？
+          </h1>
+          <p className="mt-1.5 text-[13px] leading-5 text-muted sm:text-[14px]">
+            选一个和你当前难题最像的，先看成果，再跟着做。
+          </p>
+        </div>
+        <p className="hidden shrink-0 text-[11.5px] text-faint sm:block">科研 · 编码 · 日常工作</p>
       </div>
       {items.length === 0 ? (
-        <div className="mt-10 rounded-2xl border border-dashed border-border px-5 py-12 text-center text-[13.5px] text-faint">
+        <div className="mt-7 rounded-2xl border border-dashed border-border px-5 py-12 text-center text-[13.5px] text-faint">
           没有匹配案例，试试“文献”“引用”“回归测试”或清空筛选。
         </div>
       ) : (
-        <div className="mt-8 grid gap-4 md:grid-cols-2">
-          {items.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => onSelect(item.id)}
-              className="group flex flex-col rounded-2xl border border-border bg-surface p-5 text-left outline-none transition-[border-color,background-color,transform] hover:-translate-y-0.5 hover:border-accent/50 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <div className="flex items-center justify-between gap-3">
-                <span className="rounded-full bg-accent-soft px-2.5 py-1 text-[11px] font-semibold text-accent">
-                  {caseCategoryLabel(item.category)} · {item.difficulty}
-                </span>
-                <ArrowRight size={15} className="text-faint transition-transform group-hover:translate-x-0.5 group-hover:text-accent" />
-              </div>
-              <h2 className="mt-3 text-[16px] font-semibold leading-6 text-fg">{item.title}</h2>
-              <p className="mt-1.5 line-clamp-3 text-[13px] leading-5.5 text-muted">{item.summary}</p>
-              <div className="mt-auto pt-4 text-[11.5px] text-faint">
-                {item.stages.length} 个阶段 · {item.artifacts.length} 项产物 · {item.checks.length} 个验收检查
-              </div>
-            </button>
-          ))}
+        <div className="mt-5 grid gap-4 md:grid-cols-2 sm:mt-6">
+          {items.map((item) => {
+            const presentation = CASE_PRESENTATION[item.id];
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onSelect(item.id)}
+                aria-label={`${presentation.pain} ${item.title}，完成后得到${presentation.result}，查看完整过程`}
+                className="group overflow-hidden rounded-2xl border border-border bg-surface text-left shadow-sm outline-none transition-[border-color,box-shadow,transform] hover:-translate-y-1 hover:border-accent/40 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <CaseArtwork caseId={item.id} />
+                <div className="p-4 sm:p-5">
+                  <div className="flex items-center gap-2">
+                    <span className="rounded-full bg-accent-soft px-2.5 py-1 text-[10.5px] font-semibold text-accent">
+                      {caseCategoryLabel(item.category)} · {item.difficulty}
+                    </span>
+                    {item.artifacts.slice(0, 2).map((artifact) => (
+                      <span key={artifact.title} className="rounded-full bg-hover px-2 py-1 text-[10px] text-faint">
+                        {artifact.format}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="mt-3 text-[13px] font-medium leading-5 text-accent">{presentation.pain}</p>
+                  <h2 className="mt-1 text-[17px] font-semibold leading-6 text-fg">{item.title}</h2>
+                  <p className="mt-1.5 line-clamp-2 text-[12.5px] leading-5 text-muted">{presentation.result}</p>
+                  <span className="mt-4 inline-flex items-center gap-1.5 text-[12px] font-semibold text-fg transition-colors group-hover:text-accent">
+                    查看完整过程
+                    <ArrowRight size={14} className="transition-transform group-hover:translate-x-1" />
+                  </span>
+                </div>
+              </button>
+            );
+          })}
         </div>
       )}
     </section>
@@ -603,36 +620,211 @@ function CaseDetail({
   actionLabel?: string;
   onRun?: (item: TutorialCase) => void;
 }) {
+  const presentation = CASE_PRESENTATION[item.id];
   return (
-    <article className="mx-auto max-w-3xl px-4 pb-14 pt-5 sm:px-7 sm:pt-7" data-case-id={item.id}>
+    <article className="mx-auto max-w-4xl px-3 pb-14 pt-4 sm:px-7 sm:pt-6" data-case-id={item.id}>
       <button type="button" onClick={onBack} className="inline-flex items-center gap-1.5 text-[12.5px] text-muted hover:text-fg">
         <ArrowLeft size={14} /> 返回全部案例
       </button>
-      <div className="mt-5 flex flex-wrap items-center gap-2">
-        <Badge tone="accent">{caseCategoryLabel(item.category)}</Badge>
-        <span className="rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted">{item.difficulty}</span>
-        <span className="text-[11px] text-faint">内容版本 {item.contentVersion}</span>
-      </div>
-      <h1 className="mt-3 text-balance text-[25px] font-bold leading-tight tracking-tight text-fg sm:text-[32px]">{item.title}</h1>
-      <p className="mt-3 text-[14.5px] leading-7 text-muted">{item.summary}</p>
-
-      <section className="mt-7 grid gap-4 rounded-2xl border border-border bg-surface p-5 sm:grid-cols-2">
-        <InfoDatum title="真实问题 / 适合谁" body={item.audience} />
-        <InfoDatum title="最终完成" body={item.outcome} />
-        <div className="sm:col-span-2">
-          <h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-faint">开始前需要</h2>
-          <ul className="mt-2 flex list-disc flex-col gap-1 pl-4 text-[13px] leading-5 text-muted">
-            {item.requirements.map((requirement) => <li key={requirement}>{requirement}</li>)}
-          </ul>
+      <section className="mt-4 overflow-hidden rounded-3xl border border-border bg-surface shadow-sm md:grid md:grid-cols-[1.05fr_.95fr]">
+        <CaseArtwork caseId={item.id} className="md:h-full md:min-h-[320px] md:aspect-auto" />
+        <div className="flex flex-col p-5 sm:p-7">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone="accent">{caseCategoryLabel(item.category)}</Badge>
+            <span className="rounded-full bg-hover px-2.5 py-1 text-[11px] text-muted">{item.difficulty}</span>
+            <span className="text-[10.5px] text-faint">内容版本 {item.contentVersion}</span>
+          </div>
+          <p className="mt-4 text-[13px] font-semibold leading-5 text-accent">{presentation.pain}</p>
+          <h1 className="mt-1.5 text-balance text-[24px] font-bold leading-tight tracking-tight text-fg sm:text-[30px]">{item.title}</h1>
+          <p className="mt-3 text-[13px] leading-6 text-muted">{item.summary}</p>
+          <div className="mt-4 rounded-2xl bg-accent-soft p-3.5">
+            <p className="text-[10.5px] font-semibold uppercase tracking-[0.12em] text-accent">最终成果</p>
+            <p className="mt-1 text-[13px] font-medium leading-5 text-fg">{presentation.result}</p>
+          </div>
+          {actionLabel && onRun && (
+            <Button variant="primary" onClick={() => onRun(item)} className="mt-5 self-start">
+              {actionLabel} <ArrowRight size={15} />
+            </Button>
+          )}
         </div>
       </section>
 
-      <section className="mt-7 rounded-2xl bg-accent-soft p-5">
+      <section className="mt-8">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-[11px] font-semibold text-accent">先看结果</p>
+            <h2 className="mt-0.5 text-[19px] font-semibold tracking-tight text-fg">你会拿到这些成果</h2>
+          </div>
+          <span className="rounded-full bg-hover px-2.5 py-1 text-[10.5px] text-faint">{item.artifacts.length} 份可交付文件</span>
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          {item.artifacts.map((artifact, index) => (
+            <div key={artifact.title} className="group rounded-2xl border border-border bg-surface p-4 transition-colors hover:border-accent/30 hover:bg-accent-soft">
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex size-9 items-center justify-center rounded-xl bg-accent-soft text-accent"><FileOutput size={17} /></span>
+                <span className="rounded-full bg-hover px-2 py-0.5 text-[10px] font-medium text-faint">{artifact.format}</span>
+              </div>
+              <p className="mt-3 text-[13px] font-semibold leading-5 text-fg">{artifact.title}</p>
+              <p className="mt-1 text-[11.5px] leading-5 text-muted">{artifact.description}</p>
+              <span className="mt-3 block text-[10.5px] font-medium text-accent">成果 {index + 1}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="mt-9 grid gap-3 sm:grid-cols-3">
+        <OverviewDatum icon={Users} title="适合你，如果" body={item.audience} />
+        <OverviewDatum icon={FileOutput} title="最终完成" body={item.outcome} />
+        <OverviewDatum
+          icon={Bot}
+          title={`推荐 ${item.suggestion.agentName}`}
+          body={`${item.suggestion.agentId} · ${item.suggestion.modelId} · ${item.suggestion.modelGuidance}`}
+        />
+      </section>
+
+      <section className="mt-10">
+        <div>
+          <p className="text-[11px] font-semibold text-accent">跟着画面走</p>
+          <h2 className="mt-0.5 text-[19px] font-semibold tracking-tight text-fg">{item.stages.length} 步完成</h2>
+        </div>
+        <ol className="mt-5">
+          {item.stages.map((stage, index) => (
+            <li key={stage.id} className="relative flex gap-3.5 pb-5 last:pb-0 sm:gap-5">
+              <div className="flex w-8 shrink-0 flex-col items-center">
+                <span className="z-10 flex size-8 items-center justify-center rounded-full bg-grad-cta text-[12px] font-bold text-white shadow-sm">{index + 1}</span>
+                {index < item.stages.length - 1 && <span className="mt-1 w-px flex-1 bg-border" aria-hidden />}
+              </div>
+              <div className="min-w-0 flex-1 overflow-hidden rounded-2xl border border-border bg-surface shadow-sm">
+                <div className="p-4 sm:p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <h3 className="text-[15px] font-semibold text-fg">{stage.title}</h3>
+                    <span className="rounded-full bg-success-soft px-2 py-0.5 text-[10px] font-medium text-success">输出可验收</span>
+                  </div>
+                  <div className="mt-3 rounded-xl bg-accent-soft p-3">
+                    <p className="text-[10.5px] font-semibold text-accent">这一步会产出</p>
+                    <p className="mt-1 text-[12.5px] leading-5 text-fg">{stage.output}</p>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-1.5" aria-label="可见过程">
+                    {stage.visibleProcess.map((process) => (
+                      <span key={process} className="rounded-full border border-border bg-bg px-2.5 py-1 text-[10.5px] text-muted">{process}</span>
+                    ))}
+                  </div>
+                </div>
+                <details className="group border-t border-border">
+                  <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-[11.5px] font-medium text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5">
+                    展开输入、操作与验收标准
+                    <ChevronDown size={14} className="transition-transform group-open:rotate-180" />
+                  </summary>
+                  <div className="border-t border-border bg-sidebar px-4 pb-4 pt-1 sm:px-5">
+                    <StageField label="输入" text={stage.input} />
+                    <StageField label="操作" text={stage.operation} />
+                    <div className="mt-3">
+                      <p className="text-[11px] font-semibold text-success">验收标准</p>
+                      <ul className="mt-1.5 flex flex-col gap-1.5 text-[12px] leading-5 text-muted">
+                        {stage.acceptance.map((criterion) => (
+                          <li key={criterion} className="flex gap-2"><Check size={13} className="mt-0.5 shrink-0 text-success" />{criterion}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                </details>
+              </div>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <section className="mt-9 rounded-2xl border border-border bg-surface p-4 sm:p-5">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-[10.5px] font-semibold text-accent">可以直接改成你的任务</p>
+            <h2 className="mt-0.5 text-[15px] font-semibold text-fg">开工指令</h2>
+          </div>
+          <Button variant="ghost" size="sm" onClick={onCopy}>
+            {copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "已复制" : "复制指令"}
+          </Button>
+        </div>
+        <details className="group mt-3 rounded-xl bg-sidebar">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3.5 py-3 text-[12px] font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring">
+            查看完整指令
+            <ChevronDown size={14} className="transition-transform group-open:rotate-180" />
+          </summary>
+          <blockquote className="whitespace-pre-wrap border-t border-border px-3.5 py-3 text-[12.5px] leading-6 text-muted">{item.starterPrompt}</blockquote>
+        </details>
+      </section>
+
+      <section className="mt-10">
+        <h2 className="flex items-center gap-2 text-[19px] font-semibold tracking-tight text-fg"><FileInput size={18} className="text-accent" /> 准备材料</h2>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          {item.inputMaterials.map((input) => (
+            <div key={input.title} className="rounded-2xl border border-border bg-surface p-4">
+              <div className="flex items-start gap-3">
+                <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent"><FileInput size={16} /></span>
+                <div className="min-w-0">
+                  <h3 className="text-[13.5px] font-semibold text-fg">{input.title}</h3>
+                  <p className="mt-1 text-[12px] leading-5 text-muted">{input.description}</p>
+                </div>
+              </div>
+              <p className="mt-3 rounded-xl bg-sidebar p-3 text-[11.5px] leading-5 text-muted"><strong className="font-semibold text-fg">怎么准备：</strong>{input.preparation}</p>
+              <div className="mt-3 flex flex-wrap gap-x-3 gap-y-2">
+                {input.sourceUrl && (
+                  <a href={input.sourceUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[11.5px] font-medium text-accent hover:underline">
+                    原始材料 <ExternalLink size={11} />
+                  </a>
+                )}
+                {input.assetPath?.startsWith("/") && (
+                  <a href={input.assetPath} download className="inline-flex items-center gap-1 text-[11.5px] font-medium text-accent hover:underline">
+                    下载案例副本 <Download size={11} />
+                  </a>
+                )}
+              </div>
+              <details className="group mt-3 border-t border-border pt-2">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-[10.5px] text-faint outline-none hover:text-muted focus-visible:ring-2 focus-visible:ring-ring">
+                  查看固定版本与校验值
+                  <ChevronDown size={12} className="transition-transform group-open:rotate-180" />
+                </summary>
+                <p className="mt-2 break-all text-[10px] leading-4 text-faint">
+                  固定版本：{input.revision} · {input.bytes.toLocaleString()} B<br />SHA-256：{input.sha256}
+                </p>
+              </details>
+            </div>
+          ))}
+        </div>
+        <div className="mt-4 rounded-2xl border border-border bg-surface p-4">
+          <h3 className="text-[13px] font-semibold text-fg">开始前确认</h3>
+          <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+            {item.requirements.map((requirement) => (
+              <li key={requirement} className="flex gap-2 text-[11.5px] leading-5 text-muted"><Check size={13} className="mt-0.5 shrink-0 text-success" />{requirement}</li>
+            ))}
+          </ul>
+        </div>
+        <details className="group mt-3 overflow-hidden rounded-2xl border border-border bg-surface">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3.5 text-[12px] font-semibold text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+            查看来源与授权（{item.sources.length}）
+            <ChevronDown size={14} className="text-faint transition-transform group-open:rotate-180" />
+          </summary>
+          <div className="border-t border-border">
+            {item.sources.map((source, index) => (
+              <div key={`${source.url}-${source.role}`} className={cn("p-4", index > 0 && "border-t border-border")}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <a href={source.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-fg hover:text-accent hover:underline">
+                    {source.title} <ExternalLink size={11} />
+                  </a>
+                  <span className="rounded-full bg-hover px-2 py-0.5 text-[10px] text-faint">{sourceRoleLabel(source.role)}</span>
+                  <span className="rounded-full bg-hover px-2 py-0.5 text-[10px] text-faint">{source.license}</span>
+                </div>
+                <p className="mt-1 text-[11.5px] leading-5 text-muted">{source.usageNote}</p>
+              </div>
+            ))}
+          </div>
+        </details>
+      </section>
+
+      <section className="mt-9 rounded-2xl bg-accent-soft p-5">
         <div className="flex items-start gap-3">
           <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-surface text-accent shadow-sm"><Bot size={17} /></span>
           <div>
-            <h2 className="text-[14px] font-semibold text-fg">建议 Agent：{item.suggestion.agentName}（{item.suggestion.agentId}）</h2>
-            <p className="mt-1 text-[13px] leading-5 text-muted"><strong className="font-medium text-fg">模型：</strong>{item.suggestion.modelId} · {item.suggestion.modelGuidance}</p>
+            <h2 className="text-[14px] font-semibold text-fg">为什么推荐 {item.suggestion.agentName}</h2>
             <p className="mt-1 text-[12.5px] leading-5 text-muted">{item.suggestion.why}</p>
           </div>
         </div>
@@ -641,97 +833,6 @@ function CaseDetail({
             <span key={id} className="rounded-full bg-surface px-2.5 py-1 text-[11px] text-muted shadow-sm">{capabilityById(id).shortTitle}</span>
           ))}
         </div>
-      </section>
-
-      <section className="mt-7 rounded-2xl border border-border bg-surface p-4 sm:p-5">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <h2 className="text-[15px] font-semibold text-fg">开工指令</h2>
-            <p className="mt-0.5 text-[11.5px] text-faint">复制后可按自己的材料、约束和交付格式修改。</p>
-          </div>
-          <Button variant="ghost" size="sm" onClick={onCopy}>
-            {copied ? <Check size={14} /> : <Copy size={14} />}{copied ? "已复制" : "复制指令"}
-          </Button>
-        </div>
-        <blockquote className="mt-3 whitespace-pre-wrap border-l-2 border-accent pl-3 text-[13.5px] leading-6 text-muted">{item.starterPrompt}</blockquote>
-        {actionLabel && onRun && (
-          <div className="mt-4 flex justify-end">
-            <Button variant="primary" onClick={() => onRun(item)}>
-              {actionLabel} <ArrowRight size={15} />
-            </Button>
-          </div>
-        )}
-      </section>
-
-      <section className="mt-9">
-        <h2 className="flex items-center gap-2 text-[19px] font-semibold tracking-tight text-fg"><FileInput size={18} className="text-accent" /> 输入材料与授权</h2>
-        <div className="mt-4 grid gap-3 sm:grid-cols-2">
-          {item.inputMaterials.map((input) => (
-            <div key={input.title} className="rounded-2xl border border-border bg-surface p-4">
-              <h3 className="text-[13.5px] font-semibold text-fg">{input.title}</h3>
-              <p className="mt-1 text-[12.5px] leading-5 text-muted">{input.description}</p>
-              <p className="mt-2 text-[11.5px] leading-5 text-faint"><strong className="font-medium text-muted">准备：</strong>{input.preparation}</p>
-              {input.sourceUrl && (
-                <a href={input.sourceUrl} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-[11.5px] font-medium text-accent hover:underline">
-                  查看原始材料 <ExternalLink size={11} />
-                </a>
-              )}
-              {input.assetPath?.startsWith("/") && (
-                <a href={input.assetPath} download className="ml-3 mt-2 inline-flex items-center gap-1 text-[11.5px] font-medium text-accent hover:underline">
-                  下载冻结副本 <Download size={11} />
-                </a>
-              )}
-              <p className="mt-2 break-all text-[10.5px] leading-4 text-faint">
-                固定版本：{input.revision} · {input.bytes.toLocaleString()} B<br />SHA-256：{input.sha256}
-              </p>
-            </div>
-          ))}
-        </div>
-        <div className="mt-3 overflow-hidden rounded-2xl border border-border bg-surface">
-          {item.sources.map((source, index) => (
-            <div key={`${source.url}-${source.role}`} className={cn("p-4", index > 0 && "border-t border-border")}>
-              <div className="flex flex-wrap items-center gap-2">
-                <a href={source.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12.5px] font-semibold text-fg hover:text-accent hover:underline">
-                  {source.title} <ExternalLink size={11} />
-                </a>
-                <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-faint">{sourceRoleLabel(source.role)}</span>
-                <span className="rounded-full bg-hover px-2 py-0.5 text-[10.5px] text-faint">授权：{source.license}</span>
-              </div>
-              <p className="mt-1 text-[11.5px] leading-5 text-muted">{source.usageNote}</p>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="mt-9">
-        <h2 className="text-[19px] font-semibold tracking-tight text-fg">全流程：输入 → 操作 → 过程 → 输出 → 验收</h2>
-        <ol className="mt-4 flex flex-col gap-4">
-          {item.stages.map((stage, index) => (
-            <li key={stage.id} className="rounded-2xl border border-border bg-surface p-4 sm:p-5">
-              <div className="flex items-start gap-3">
-                <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-grad-cta text-[12px] font-semibold text-white">{index + 1}</span>
-                <div className="min-w-0 flex-1">
-                  <h3 className="text-[15px] font-semibold text-fg">{stage.title}</h3>
-                  <StageField label="输入" text={stage.input} />
-                  <StageField label="操作" text={stage.operation} />
-                  <div className="mt-3 rounded-xl bg-sidebar p-3">
-                    <p className="text-[11px] font-semibold text-accent">用户能看到的过程</p>
-                    <ul className="mt-1.5 flex list-disc flex-col gap-1 pl-4 text-[12.5px] leading-5 text-muted">
-                      {stage.visibleProcess.map((process) => <li key={process}>{process}</li>)}
-                    </ul>
-                  </div>
-                  <StageField label="输出" text={stage.output} />
-                  <div className="mt-3">
-                    <p className="text-[11px] font-semibold text-success">本阶段验收</p>
-                    <ul className="mt-1 flex list-disc flex-col gap-1 pl-4 text-[12.5px] leading-5 text-muted">
-                      {stage.acceptance.map((criterion) => <li key={criterion}>{criterion}</li>)}
-                    </ul>
-                  </div>
-                </div>
-              </div>
-            </li>
-          ))}
-        </ol>
       </section>
 
       <section className="mt-9 rounded-2xl border border-warning/25 bg-warning-soft p-5">
@@ -745,37 +846,24 @@ function CaseDetail({
         </div>
       </section>
 
-      <div className="mt-9 grid gap-4 sm:grid-cols-2">
-        <section className="rounded-2xl border border-border bg-surface p-5">
-          <h2 className="flex items-center gap-2 text-[15px] font-semibold text-fg"><FileOutput size={16} className="text-accent" /> 应交付产物</h2>
-          <ul className="mt-3 flex flex-col gap-3">
-            {item.artifacts.map((artifact) => (
-              <li key={artifact.title}>
-                <div className="flex items-center gap-2"><span className="text-[13px] font-medium text-fg">{artifact.title}</span><span className="rounded bg-hover px-1.5 py-0.5 text-[10.5px] text-faint">{artifact.format}</span></div>
-                <p className="mt-1 text-[12px] leading-5 text-muted">{artifact.description}</p>
-              </li>
-            ))}
-          </ul>
-        </section>
-        <section className="rounded-2xl border border-success/20 bg-success-soft p-5">
-          <h2 className="flex items-center gap-2 text-[15px] font-semibold text-fg"><ClipboardCheck size={16} className="text-success" /> 确定性检查</h2>
-          <ul className="mt-3 flex flex-col gap-3">
-            {item.checks.map((check) => (
-              <li key={check.title}>
-                <p className="text-[13px] font-medium text-fg">{check.title}</p>
-                <p className="mt-1 text-[12px] leading-5 text-muted">{check.method}</p>
-                <p className="mt-1 text-[11.5px] leading-5 text-success">通过：{check.passCriterion}</p>
-              </li>
-            ))}
-          </ul>
-        </section>
-      </div>
+      <section className="mt-9">
+        <h2 className="flex items-center gap-2 text-[17px] font-semibold text-fg"><ClipboardCheck size={17} className="text-success" /> 怎么确认真的做对了</h2>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          {item.checks.map((check) => (
+            <div key={check.title} className="rounded-2xl border border-success/20 bg-success-soft p-4">
+              <p className="flex items-center gap-2 text-[13px] font-semibold text-fg"><Check size={14} className="text-success" />{check.title}</p>
+              <p className="mt-2 text-[11.5px] leading-5 text-muted">{check.method}</p>
+              <p className="mt-2 rounded-xl bg-surface/70 p-2.5 text-[11px] leading-5 text-success">通过：{check.passCriterion}</p>
+            </div>
+          ))}
+        </div>
+      </section>
     </article>
   );
 }
 
-function InfoDatum({ title, body }: { title: string; body: string }) {
-  return <div><h2 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-faint">{title}</h2><p className="mt-1.5 text-[13px] leading-5 text-muted">{body}</p></div>;
+function OverviewDatum({ icon: Icon, title, body }: { icon: LucideIcon; title: string; body: string }) {
+  return <div className="rounded-2xl border border-border bg-surface p-4"><span className="flex size-8 items-center justify-center rounded-xl bg-accent-soft text-accent"><Icon size={15} /></span><h2 className="mt-3 text-[11px] font-semibold text-faint">{title}</h2><p className="mt-1 text-[12px] leading-5 text-muted">{body}</p></div>;
 }
 
 function StageField({ label, text }: { label: string; text: string }) {
