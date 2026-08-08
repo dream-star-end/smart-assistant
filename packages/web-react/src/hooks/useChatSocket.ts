@@ -324,11 +324,11 @@ export function useChatSocket(opts: {
       // 为最终权威源并走 applyServerMessages 收口（含 client-owned 行保留与团队卡归一化）。
       syncSession: async (sessId, context) => {
         const a = authRef.current;
-        if (!a) return;
+        if (!a) return false;
         const socket = socketRef.current;
-        if (!socket) return;
+        if (!socket) return false;
         const sess = socket.sessions.get(sessId);
-        if (!sess) return;
+        if (!sess) return false;
         try {
           const sinceSeq = typeof sess._maxSeq === "number" && sess._maxSeq > 0 ? sess._maxSeq : 0;
           const detail = await api.getSession(a, sessId, sinceSeq, sess._historyRevision);
@@ -424,8 +424,10 @@ export function useChatSocket(opts: {
           });
           sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
+          return true;
         } catch {
           /* sync 失败：保留现状，下次重连/前台再试 */
+          return false;
         }
       },
       syncGoalState: async (sessId) => {

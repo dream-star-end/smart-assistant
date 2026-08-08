@@ -533,6 +533,16 @@ export type ChatSession = {
   _turnStatus?: TurnStatusState | null;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
+  /**
+   * Browser-only stop settlement fence. A successful online Stop stays busy
+   * until this exact turn reaches a terminal frame and the authoritative REST
+   * hydration succeeds, so late full-session sync cannot visibly append after
+   * the composer has already returned to idle.
+   */
+  _stopSettlement?: {
+    clientMessageId: string;
+    phase: "terminal" | "sync";
+  };
   /** Agent frozen when the active turn was dispatched.  `agentId` is the
    * current selector and may change before the old turn is stopped. */
   _activeAgentId?: string;
