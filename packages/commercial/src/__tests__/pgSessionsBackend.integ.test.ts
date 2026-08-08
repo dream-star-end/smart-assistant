@@ -5125,18 +5125,30 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
 
   maybe("受理即建行(PUT-vs-WS 竞态根治):无预建行 admitted;ensure PUT 后到 rejected_stale;墓碑/他人行不动", async () => {
     // ① 无预建行(前端 ensure PUT 尚未到达,2026-07-18 线上新会话首条消息必失败根因):
-    //    受理事务自建行 → admitted,user 行与 anchorSeq 同事务落地。
+    //    受理事务自建行 → admitted,user 行、自动标题与 anchorSeq 同事务落地。
+    const firstText =
+      "请分析这张截图里的会话自动命名问题,并说明为什么首条消息后仍然显示新会话。".repeat(2);
+    const expectedTitle = `${firstText.slice(0, 50)}…`;
     const fresh = await backend.admitUserTurn(
-      admitInput({ sessionId: "s-dd-race-1", clientMessageId: "cm-dd-race-1" }),
+      admitInput({
+        sessionId: "s-dd-race-1",
+        clientMessageId: "cm-dd-race-1",
+        message: {
+          id: "cm-dd-race-1",
+          role: "user",
+          text: firstText,
+          ts: 1_783_950_000_000,
+        },
+      }),
     );
     assert.equal(fresh.kind, "admitted");
     assert.ok((fresh as { dispatch: { anchorSeq: bigint | null } }).dispatch.anchorSeq !== null);
     const sess = await backend.getClientSession("s-dd-race-1", CUSER);
     assert.ok(sess);
     assert.equal(sess.agentId, "main");
-    assert.equal(sess.title, "新会话");
+    assert.equal(sess.title, expectedTitle);
     assert.ok(sess.messages.some((m) => (m as { id?: string }).id === "cm-dd-race-1"));
-    // ② 后到的 ensure PUT(messages:[]、baseSyncedAt=0)→ rejected_stale 空操作,user 行不丢。
+    // ② 后到的 ensure PUT(messages:[]、baseSyncedAt=0)→ rejected_stale 空操作,user 行与标题不丢。
     const late = await backend.upsertClientSession(
       mkSession({ id: "s-dd-race-1", userId: CUSER, updatedAt: 0 }),
       0,
@@ -5144,6 +5156,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(late, "rejected_stale");
     const after = await backend.getClientSession("s-dd-race-1", CUSER);
     assert.ok(after!.messages.some((m) => (m as { id?: string }).id === "cm-dd-race-1"));
+    assert.equal(after!.title, expectedTitle);
     // ③ 墓碑不复活:已删会话受理仍 session_deleted。
     await backend.upsertClientSession(mkSession({ id: "s-dd-race-2", userId: CUSER }));
     await backend.deleteClientSession("s-dd-race-2", CUSER);
