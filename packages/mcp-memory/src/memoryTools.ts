@@ -126,7 +126,14 @@ export async function handleCoreSearch(args: {
     return toolError('core-search --offset must be a non-negative integer')
 
   const q = query.normalize('NFKC').toLocaleLowerCase()
-  const terms = [...new Set(q.split(/[\s\p{P}\p{S}]+/u).filter(Boolean))]
+  const terms = [
+    ...new Set([
+      ...q.split(/[\s\p{P}\p{S}]+/u),
+      ...[...new Intl.Segmenter('zh', { granularity: 'word' }).segment(q)]
+        .filter((part) => part.isWordLike)
+        .map((part) => part.segment),
+    ].filter((term) => term.length >= 2 || term === q)),
+  ]
   const hits: Array<{ score: number; path: string; label: string; size: number; snippet: string }> = []
   const add = (path: string, label: string, content: string, size: number) => {
     if (!scanMemoryContent(content).ok) return
