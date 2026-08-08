@@ -5027,9 +5027,10 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("a replay-start already in flight cannot resurrect the exact turn after user Stop", () => {
+  test("a replay-start already in flight cannot resurrect the exact turn after user Stop", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ syncSession });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
@@ -5047,7 +5048,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stopTurn("s1");
     const teardownAt = active._localTeardownAt;
     expect(active._cancelledAutomaticRecoveryIds?.[clientMessageId]).toBe(true);
-    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.active_turn_replay_start",
@@ -5057,9 +5058,9 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       clientMessageId,
     }) });
     expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
-    expect(active._activeClientMessageId).toBeUndefined();
+    expect(active._activeClientMessageId).toBe(clientMessageId);
     expect(active._localTeardownAt).toBe(teardownAt);
-    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
       frameSeq: 43,
@@ -5067,7 +5068,23 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       blocks: [{ kind: "text", text: "late after Stop" }],
     })) });
     expect(active.messages.some((message) => message.text === "late after Stop")).toBe(false);
-    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(active._sendingInFlight).toBe(false);
+    expect(sock.isSessionBusy("s1")).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 44,
+      ts: Date.now() + 1,
+      clientMessageId,
+      blocks: [],
+      isFinal: true,
+      meta: { interrupted: "user_cancelled" },
+    })) });
+    expect(active._stopSettlement?.phase).toBe("sync");
+    expect(syncSession).toHaveBeenCalled();
+    await vi.waitFor(() => expect(active._stopSettlement).toBeUndefined());
+    expect(active._sendingInFlight).toBe(false);
+    expect((sock as any).offlineQueue).toHaveLength(0);
+    await vi.waitFor(() => expect(sock.isSessionBusy("s1")).toBe(false));
     sock.stop();
   });
 
@@ -5230,6 +5247,185 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(restored._sendingInFlight).toBe(false);
     expect(restored.messages.some((m) => m.text === "stale after stop+refresh")).toBe(false);
     expect(onLiveFrame).not.toHaveBeenCalled();
+  });
+
+  test("online Stop stays busy through exact terminal and authoritative sync", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let resolveSync!: (value: boolean) => void;
+    const syncSession = vi.fn(() => new Promise<boolean>((resolve) => {
+      resolveSync = resolve;
+    }));
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      ts: 1,
+      clientMessageId,
+      blocks: [{ kind: "text", text: "partial", messageId: "srv-stop" }],
+    })) });
+
+    sock.stopTurn("s1");
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(sock.isSessionBusy("s1")).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 2,
+      ts: 2,
+      clientMessageId,
+      blocks: [],
+      isFinal: true,
+      meta: { stopReason: "end_turn" },
+    })) });
+    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "sync" });
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId });
+    expect(sock.isSessionBusy("s1")).toBe(true);
+
+    session.messages.find((m) => m.role === "assistant")!.text = "authoritative complete";
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    resolveSync(true);
+    await vi.waitFor(() => expect(sock.isSessionBusy("s1")).toBe(false));
+    expect(session.messages.find((m) => m.role === "assistant")!.text).toBe("authoritative complete");
+    sock.stop();
+  });
+
+  test("exact terminal cannot release Stop without an authoritative sync result", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    sock.stopTurn("s1");
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      ts: Date.now() + 1,
+      clientMessageId,
+      blocks: [],
+      isFinal: true,
+      meta: { stopReason: "end_turn" },
+    })) });
+
+    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "sync" });
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    sock.stop();
+  });
+
+  test("mismatched final and nonterminal forceSync cannot settle another stopped turn", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    sock.stopTurn("s1");
+
+    (sock as any).effects().forceSync("s1", { clientMessageId });
+    await Promise.resolve();
+    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(sock.isSessionBusy("s1")).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      ts: Date.now() + 1,
+      blocks: [],
+      isFinal: true,
+      meta: { stopReason: "end_turn" },
+    })) });
+    await Promise.resolve();
+    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(sock.isSessionBusy("s1")).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 2,
+      ts: Date.now() + 2,
+      clientMessageId: "other-turn",
+      blocks: [],
+      isFinal: true,
+      meta: { stopReason: "end_turn" },
+    })) });
+    await Promise.resolve();
+    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    sock.stop();
+  });
+
+  test("failed terminal sync settles on a later reconciliation", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    sock.stopTurn("s1");
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 1,
+      ts: Date.now() + 1,
+      clientMessageId,
+      blocks: [],
+      isFinal: true,
+      meta: { stopReason: "end_turn" },
+    })) });
+    await vi.waitFor(() => expect(syncSession).toHaveBeenCalledTimes(1));
+    expect(session._stopSettlement?.phase).toBe("sync");
+    expect(sock.isSessionBusy("s1")).toBe(true);
+
+    (sock as any).reconcileSession("s1");
+    await vi.waitFor(() => expect(syncSession).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(sock.isSessionBusy("s1")).toBe(false));
+    sock.stop();
+  });
+
+  test("late admission ACK cannot revive a stopped turn", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    sock.stopTurn("s1");
+    const teardownAt = session._localTeardownAt;
+
+    expect((sock as any).confirmDispatchAdmission("s1", clientMessageId)).toBe(true);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._localTeardownAt).toBe(teardownAt);
+    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    sock.stop();
+  });
+
+  test("failed Stop transport does not create an unfinishable settlement", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "queued task" });
+    ws.bufferedAmount = Number.MAX_SAFE_INTEGER;
+
+    sock.stopTurn("s1");
+
+    const session = sock.sessions.get("s1")!;
+    expect(session._stopSettlement).toBeUndefined();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    sock.stop();
   });
 
   test("deduplicated auto-continue ack clears and persists pending turn state", () => {

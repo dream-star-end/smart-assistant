@@ -1007,7 +1007,9 @@
       "coverageCommits": [
         "788ecc51",
         "6ac77ac1",
-        "58dacb06"
+        "58dacb06",
+        "e6930cfe",
+        "793f7fe2"
       ],
       "regressions": [
         {
@@ -1019,6 +1021,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "legacy Stop terminal renders as cancelled without telemetry or automatic recovery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "online Stop stays busy through exact terminal and authoritative sync"
         },
         {
           "layer": "unit",

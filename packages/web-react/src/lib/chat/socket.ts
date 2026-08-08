@@ -148,7 +148,7 @@ export type ChatSocketDeps = {
   syncSession?: (
     sessId: string,
     context?: { clientMessageId?: string },
-  ) => Promise<void> | void;
+  ) => Promise<boolean | void> | boolean | void;
   /** Every successful WS open (initial or reconnect) refreshes the selected
    * and in-flight sessions from the PG GoalState REST authority. Live goal
    * broadcasts are intentionally not trusted to be a replay log. */
@@ -589,7 +589,9 @@ export class ChatSocket {
   /** Composer busy/stop affordance includes pre-admission journal work, while
    * TurnActivity still keys only off server-admitted `_sendingInFlight`. */
   isSessionBusy(sessId: string): boolean {
-    return !!this.sessions.get(sessId)?._sendingInFlight ||
+    const sess = this.sessions.get(sessId);
+    return !!sess?._sendingInFlight ||
+      !!sess?._stopSettlement ||
       this.offlineQueue.some((item) => item.sessId === sessId);
   }
 
@@ -970,7 +972,41 @@ export class ChatSocket {
     const last = this.lastSyncAt.get(sessId) || 0;
     if (now - last < SYNC_DEBOUNCE_MS) return;
     this.lastSyncAt.set(sessId, now);
+    if (this.sessions.get(sessId)?._stopSettlement?.phase === "sync") {
+      this.syncSessionAndSettleStop(sessId);
+      return;
+    }
     void this.deps.syncSession(sessId);
+  }
+
+  /**
+   * Release an online Stop only after the authoritative session hydration
+   * explicitly succeeds. Object identity prevents an older async hydration
+   * from clearing a newer Stop on the same session.
+   */
+  private syncSessionAndSettleStop(
+    sessId: string,
+    context?: { clientMessageId?: string },
+  ): void {
+    const settlement = this.sessions.get(sessId)?._stopSettlement;
+    if (!settlement || settlement.phase !== "sync") {
+      void this.deps.syncSession?.(sessId, context);
+      return;
+    }
+    const syncSession = this.deps.syncSession;
+    if (!syncSession) return;
+    void Promise.resolve(syncSession(sessId, context)).then(
+      (synced) => {
+        const sess = this.sessions.get(sessId);
+        if (synced !== true || sess?._stopSettlement !== settlement) return;
+        sess._stopSettlement = undefined;
+        this.deps.persistSession?.(sessId);
+        this.scheduleNotify();
+      },
+      () => {
+        // Keep the settlement busy. Foreground/reconnect reconciliation retries.
+      },
+    );
   }
 
   /**
@@ -1060,6 +1096,10 @@ export class ChatSocket {
     );
     const ownsTurn = sess._activeClientMessageId === clientMessageId || pending !== undefined;
     if (!ownsTurn) return false;
+    // Stop keeps the exact correlation id in memory while waiting for terminal
+    // authority. A late admission ACK must not revive sending or remove the
+    // local teardown fence during that settlement window.
+    if (sess._stopSettlement?.clientMessageId === clientMessageId) return true;
     this.clearPendingDispatch(sessId, clientMessageId);
     this.dispatchSlots.set(sessId, clientMessageId);
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
@@ -1128,6 +1168,17 @@ export class ChatSocket {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
         this.clearThinkingSafety(sess.id);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
+        const settlement = sess._stopSettlement;
+        if (
+          !isCronOrHeartbeat &&
+          settlement?.phase === "terminal" &&
+          frame.clientMessageId === settlement.clientMessageId
+        ) {
+          sess._stopSettlement = {
+            clientMessageId: settlement.clientMessageId,
+            phase: "sync",
+          };
+        }
         if (this.reconnectInFlightSet) {
           this.reconnectInFlightSet.delete(sess.id);
           if (this.reconnectInFlightSet.size === 0 && this.reconnectInFlightTimer) {
@@ -1147,10 +1198,15 @@ export class ChatSocket {
         if (
           !isCronOrHeartbeat &&
           frame.meta?.reconcile !== "turn_completed" &&
-          !frame.meta?.interrupted
+          frame.meta?.reconcile !== "interrupted" &&
+          (sess._stopSettlement?.phase === "sync" || !frame.meta?.interrupted)
         ) {
-          if (clientMessageId) void this.deps.syncSession?.(sess.id, { clientMessageId });
-          else void this.deps.syncSession?.(sess.id);
+          const context = clientMessageId ? { clientMessageId } : undefined;
+          if (sess._stopSettlement?.phase === "sync") {
+            this.syncSessionAndSettleStop(sess.id, context);
+          } else {
+            void this.deps.syncSession?.(sess.id, context);
+          }
         }
       },
       onLiveFrame: (sess) => {
@@ -1169,7 +1225,11 @@ export class ChatSocket {
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
       forceSync: (sessId, context) => {
-        void this.deps.syncSession?.(sessId, context);
+        if (this.sessions.get(sessId)?._stopSettlement?.phase === "sync") {
+          this.syncSessionAndSettleStop(sessId, context);
+        } else {
+          void this.deps.syncSession?.(sessId, context);
+        }
       },
       onTurnStateUnknown: (sessId) => {
         // 在飞 turn 终态未知:把 thinking-safety 首窗降至 60s(仍不清发送态),尽快 REST 复检。
@@ -3491,8 +3551,8 @@ export class ChatSocket {
     const mayHaveReachedServer =
       sess._sendingInFlight ||
       activeItem?.state === "awaiting_admission";
-    if (mayHaveReachedServer && this.ws?.readyState === 1) {
-      this.safeWsSend(
+    const stopSent = mayHaveReachedServer && this.ws?.readyState === 1
+      ? this.safeWsSend(
         JSON.stringify({
           type: "inbound.control.stop",
           channel: "webchat",
@@ -3507,8 +3567,8 @@ export class ChatSocket {
             ? { clientMessageId: activeClientMessageId }
             : {}),
         }),
-      );
-    }
+      )
+      : false;
     for (const item of cancelPending) {
       this.clearPendingDispatch(sess.id, item.msgId);
       const user = sess.messages.find(
@@ -3528,6 +3588,15 @@ export class ChatSocket {
     this.dispatchSlots.delete(sess.id);
     // 本地立即收尾（不等后端 isFinal）。
     this.clearSendingState(sess, { clearThinking: true });
+    if (stopSent && activeClientMessageId) {
+      sess._stopSettlement = {
+        clientMessageId: activeClientMessageId,
+        phase: "terminal",
+      };
+      // Browser-only correlation for the exact late terminal. clearSendingState
+      // already persisted the idle snapshot, so this fence never survives reload.
+      sess._activeClientMessageId = activeClientMessageId;
+    }
     this.clearTransientNotice(sess.id); // 用户手动停止：清 transient 软提示
     this.scheduleNotify();
   }

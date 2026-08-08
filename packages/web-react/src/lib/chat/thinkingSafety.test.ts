@@ -207,8 +207,10 @@ describe("retryMessage：发送失败原地重发", () => {
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "带图问题", displayText: "看这张图", media: [{ path: "/x.png", kind: "image" } as never] });
     const s = sock.sessions.get("s1")!;
     const userMsg = s.messages.find((m) => m.role === "user")!;
-    // 模拟先前发送失败。
+    // 模拟先前发送失败：Stop 控制帧未进入传输，故不存在等待服务端终态的 settlement。
+    ws.readyState = 0;
     sock.stopTurn("s1");
+    ws.readyState = 1;
     userMsg.status = "error";
     ws.sent.length = 0;
 
