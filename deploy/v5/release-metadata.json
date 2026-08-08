@@ -80,7 +80,8 @@
     "0198_client_session_workspace_default",
     "0199_qwen38_codex_responses",
     "0200_media_generation_jobs",
-    "0201_durable_live_turn_frames"
+    "0201_durable_live_turn_frames",
+    "0202_turn_recovery_control"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

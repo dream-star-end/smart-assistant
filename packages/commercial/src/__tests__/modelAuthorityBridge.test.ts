@@ -271,6 +271,10 @@ async function startRig(opts: {
               throw err;
             }
           }
+          if (/FROM turn_control_requests/.test(sql) && /FOR UPDATE SKIP LOCKED/.test(sql))
+            return { rows: [], rowCount: 0 };
+          if (/FROM turn_recovery_jobs/.test(sql) && /FOR UPDATE SKIP LOCKED/.test(sql))
+            return { rows: [], rowCount: 0 };
           const err = new Error(`unexpected durable rig pool query: ${sql}`);
           deferredPoolErrors.push(err);
           throw err;

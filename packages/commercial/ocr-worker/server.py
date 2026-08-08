@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
 import time
+import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,8 +32,50 @@ class Api:
         self.disk_reserve = int(os.environ.get("OC_OCR_DISK_RESERVE_BYTES", str(20 * 1024**3)))
         self.owner_share_divisor = int(os.environ.get("OC_OCR_OWNER_DISK_SHARE_DIVISOR", "8"))
         self.owner_max_jobs = int(os.environ.get("OC_OCR_OWNER_MAX_ACTIVE_JOBS", str(max(2, 2 * len(cards)))))
+        self.upload_lock = threading.Lock()
+        self.protocol_major = 1
+        def model_manifest(value: str) -> list[dict]:
+            path = Path(value)
+            if not value or not path.exists():
+                return [{"path": value, "missing": True}]
+            files = [path] if path.is_file() else sorted(item for item in path.rglob("*") if item.is_file())
+            return [
+                {
+                    "path": str(item.relative_to(path) if path.is_dir() else item.name),
+                    "size": item.stat().st_size,
+                    "mtime_ns": item.stat().st_mtime_ns,
+                }
+                for item in files
+            ]
+        det_model = os.environ.get("OC_OCR_DET_MODEL", "")
+        rec_model = os.environ.get("OC_OCR_REC_MODEL", "")
+        vl_model = os.environ.get("OC_OCR_VL_MODEL", "")
+        self.pipeline_manifest = {
+            "release": release,
+            "protocol_major": self.protocol_major,
+            "detector": model_manifest(det_model),
+            "recognizer": model_manifest(rec_model),
+            "vl": model_manifest(vl_model),
+            "explicit_manifest": os.environ.get("OC_OCR_PIPELINE_MANIFEST", ""),
+        }
+        self.pipeline_digest = hashlib.sha256(
+            json.dumps(self.pipeline_manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         self.jobs.mkdir(parents=True, exist_ok=True)
         self.ready.mkdir(parents=True, exist_ok=True)
+        run_dir = root / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        contract_path = run_dir / "pipeline-contract.json"
+        contract_tmp = run_dir / f".pipeline-contract.{os.getpid()}.tmp"
+        contract_tmp.write_text(
+            json.dumps({
+                "version": 1,
+                "release": self.release,
+                "pipeline_digest": self.pipeline_digest,
+            }, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(contract_tmp, contract_path)
         init_db(self.db_path)
 
     def disk(self) -> tuple[int, int]:
@@ -75,10 +119,13 @@ class Handler(BaseHTTPRequestHandler):
         self.json(400, {"error": "invalid owner"})
         return None
 
-    def read_stream(self, target: Path, job_id: str, owner: str, owner_budget: int) -> int:
+    def read_stream(
+        self, target: Path, owner: str, owner_budget: int, existing_credit: int = 0,
+    ) -> tuple[int, str]:
         transfer = self.headers.get("transfer-encoding", "").lower()
         remaining = int(self.headers["content-length"]) if self.headers.get("content-length") else None
         total = 0
+        digest = hashlib.sha256()
         with target.open("wb") as output:
             while True:
                 if "chunked" in transfer:
@@ -101,21 +148,18 @@ class Handler(BaseHTTPRequestHandler):
                         remaining -= len(chunk)
                 output.write(chunk)
                 total += len(chunk)
+                digest.update(chunk)
                 free, _ = self.api.disk()
                 db = connect(self.api.db_path)
                 try:
-                    db.execute("BEGIN IMMEDIATE")
                     _, used = owner_usage(db, owner)
-                    if used + len(chunk) > owner_budget or free - len(chunk) < self.api.disk_reserve:
-                        db.execute("ROLLBACK")
+                    if max(0, used - existing_credit) + total > owner_budget or free < self.api.disk_reserve:
                         raise OSError("storage quota exceeded")
-                    db.execute("UPDATE jobs SET source_bytes=?, updated_at=? WHERE id=?", (total, time.time(), job_id))
-                    db.execute("COMMIT")
                 finally:
                     db.close()
         if remaining not in (None, 0):
             raise ValueError("incomplete upload")
-        return total
+        return total, digest.hexdigest()
 
     def do_GET(self) -> None:
         if not self.authorized():
@@ -124,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/ready":
             value = {
                 "release": self.api.release,
-                "protocol_major": 1,
+                "protocol_major": self.api.protocol_major,
                 "ready": self.api.engines_ready(),
                 "cards": self.api.cards,
                 "capabilities": {
@@ -132,6 +176,8 @@ class Handler(BaseHTTPRequestHandler):
                     "max_page_pixels": int(os.environ.get("OC_OCR_MAX_PAGE_PIXELS", "24000000")),
                     "max_page_dimension": int(os.environ.get("OC_OCR_MAX_PAGE_DIMENSION", "10000")),
                 },
+                "pipeline_manifest_version": 1,
+                "pipeline_digest": self.api.pipeline_digest,
             }
             self.json(200 if value["ready"] else 503, value)
             return
@@ -201,50 +247,113 @@ class Handler(BaseHTTPRequestHandler):
         if mode not in {"pp", "hybrid", "vl"} or not 0 <= fallback <= 1:
             self.json(400, {"error": "invalid mode or fallback"})
             return
-        cleanup_expired(self.api.db_path, self.api.jobs)
-        free, owner_budget = self.api.disk()
-        declared = int(self.headers.get("content-length", "0") or 0)
-        db = connect(self.api.db_path)
-        db.execute("BEGIN IMMEDIATE")
-        active, used = owner_usage(db, owner)
-        if active >= self.api.owner_max_jobs:
-            db.execute("ROLLBACK")
-            db.close()
-            self.json(429, {"error": "owner active-job capacity reached", "details": {"active": active, "limit": self.api.owner_max_jobs}})
+        request_id = self.headers.get("x-ocr-request-id")
+        if request_id is not None and not re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", request_id):
+            self.json(400, {"error": "invalid request id"})
             return
-        if declared and (used + declared > owner_budget or free - declared < self.api.disk_reserve):
-            db.execute("ROLLBACK")
-            db.close()
-            self.json(507, {"error": "storage quota exceeded", "details": {"used_bytes": used, "budget_bytes": owner_budget, "free_bytes": free, "reserve_bytes": self.api.disk_reserve}})
-            return
-        job_id = str(uuid.uuid4())
-        job_dir = self.api.jobs / job_id
-        job_dir.mkdir(mode=0o700)
-        source = job_dir / "source"
-        now = time.time()
-        db.execute(
-            "INSERT INTO jobs(id,owner,filename,mode,fallback,status,phase,source_path,created_at,updated_at) VALUES(?,?,?,?,?,'uploading','uploading',?,?,?)",
-            (job_id, owner, self.headers.get("x-ocr-filename", "document")[:240], mode, fallback, str(source), now, now),
-        )
-        db.execute("COMMIT")
-        db.close()
         try:
-            size = self.read_stream(source, job_id, owner, owner_budget)
-            if size <= 0:
-                raise ValueError("empty upload")
-            db = connect(self.api.db_path)
-            db.execute("UPDATE jobs SET status='queued',phase='queued',source_bytes=?,updated_at=? WHERE id=?", (size, time.time(), job_id))
-            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-            value = public_status(db, row)
-            db.close()
-            self.json(202, value)
-        except Exception as exc:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            db = connect(self.api.db_path)
-            db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
-            db.close()
-            status = 507 if isinstance(exc, OSError) else 400
-            self.json(status, {"error": str(exc), "details": {"budget_bytes": owner_budget, "reserve_bytes": self.api.disk_reserve}})
+            declared = int(self.headers.get("content-length", "0") or 0)
+        except ValueError:
+            self.json(400, {"error": "invalid content length"})
+            return
+        temporary = self.api.jobs / f".upload-{uuid.uuid4()}.tmp"
+        owner_budget = 0
+        job_dir: Path | None = None
+        with self.api.upload_lock:
+            try:
+                cleanup_expired(self.api.db_path, self.api.jobs)
+                free, owner_budget = self.api.disk()
+                db = connect(self.api.db_path)
+                active, used = owner_usage(db, owner)
+                preexisting = db.execute(
+                    "SELECT source_bytes FROM jobs WHERE owner=? AND request_id=?",
+                    (owner, request_id),
+                ).fetchone() if request_id is not None else None
+                db.close()
+                existing_credit = int(preexisting["source_bytes"] or 0) if preexisting else 0
+                if active >= self.api.owner_max_jobs and preexisting is None:
+                    self.json(429, {"error": "owner active-job capacity reached", "details": {"active": active, "limit": self.api.owner_max_jobs}})
+                    return
+                if declared and (max(0, used - existing_credit) + declared > owner_budget or free - declared < self.api.disk_reserve):
+                    self.json(507, {"error": "storage quota exceeded", "details": {"used_bytes": used, "budget_bytes": owner_budget, "free_bytes": free, "reserve_bytes": self.api.disk_reserve}})
+                    return
+                size, source_sha256 = self.read_stream(
+                    temporary, owner, owner_budget, existing_credit,
+                )
+                if size <= 0:
+                    raise ValueError("empty upload")
+                contract = {
+                    "source_sha256": source_sha256,
+                    "mode": mode,
+                    "fallback": fallback,
+                    "protocol_major": self.api.protocol_major,
+                    "pipeline_digest": self.api.pipeline_digest,
+                    "release": self.api.release,
+                }
+                contract_digest = hashlib.sha256(
+                    json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+                db = connect(self.api.db_path)
+                db.execute("BEGIN IMMEDIATE")
+                existing = None
+                if request_id is not None:
+                    existing = db.execute(
+                        "SELECT * FROM jobs WHERE owner=? AND request_id=?", (owner, request_id)
+                    ).fetchone()
+                if existing is not None:
+                    db.execute("COMMIT")
+                    if existing["contract_digest"] != contract_digest:
+                        db.close()
+                        self.json(409, {"error": "request id contract conflict"})
+                        return
+                    value = public_status(db, existing)
+                    db.close()
+                    self.json(202, value)
+                    return
+                job_id = str(uuid.uuid4())
+                job_dir = self.api.jobs / job_id
+                job_dir.mkdir(mode=0o700)
+                source = job_dir / "source"
+                os.replace(temporary, source)
+                now = time.time()
+                try:
+                    db.execute(
+                        "INSERT INTO jobs(id,owner,request_id,contract_digest,source_sha256,filename,mode,fallback,status,phase,source_path,source_bytes,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,'queued','queued',?,?,?,?)",
+                        (job_id, owner, request_id, contract_digest, source_sha256,
+                         self.headers.get("x-ocr-filename", "document")[:240], mode, fallback,
+                         str(source), size, now, now),
+                    )
+                except sqlite3.IntegrityError:
+                    existing = db.execute(
+                        "SELECT * FROM jobs WHERE owner=? AND request_id=?", (owner, request_id)
+                    ).fetchone()
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    if existing is None or existing["contract_digest"] != contract_digest:
+                        db.execute("ROLLBACK")
+                        db.close()
+                        self.json(409, {"error": "request id contract conflict"})
+                        return
+                    db.execute("COMMIT")
+                    value = public_status(db, existing)
+                    db.close()
+                    self.json(202, value)
+                    return
+                db.execute("COMMIT")
+                # From here the queue row owns the source directory. A client
+                # disconnect while sending the 202 response must not delete it.
+                job_dir = None
+                row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                value = public_status(db, row)
+                db.close()
+                self.json(202, value)
+            except Exception as exc:
+                if job_dir is not None:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                status = 507 if isinstance(exc, OSError) else 400
+                self.json(status, {"error": str(exc), "details": {"budget_bytes": owner_budget, "reserve_bytes": self.api.disk_reserve}})
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def cancel(self, job_id: str) -> None:
         owner = self.owner()
@@ -259,7 +368,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json(404, {"error": "job not found"})
             return
         now = time.time()
-        if row["status"] in {"uploading", "queued"}:
+        if row["status"] in {"uploading", "queued", "waiting"}:
             shutil.rmtree(self.api.jobs / job_id, ignore_errors=True)
             db.execute(
                 "UPDATE jobs SET status='cancelled',phase='cancelled',source_path=NULL,source_bytes=0,result_bytes=0,completed_at=?,result_expires_at=?,updated_at=? WHERE id=?",

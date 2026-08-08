@@ -47,6 +47,19 @@ export type ChatRoutingSnapshot = {
   effortLevel?: string | null;
 };
 
+export type RecoveryStatusState = {
+  kind:
+    | "waiting-service"
+    | "retrying"
+    | "resumed"
+    | "needs-confirmation"
+    | "stopping"
+    | "completed";
+  attempt?: number;
+  errorCode?: string;
+  masterPersisted?: boolean;
+};
+
 /** Plan 卡步骤（frames.ts plan.steps）。*/
 export type PlanStep = { step: string; status: "pending" | "inProgress" | "completed" };
 
@@ -451,6 +464,9 @@ export type ChatMessage = {
   _behavior?: "allow" | "deny";
   _settledReason?: string | null;
   _answers?: Record<string, string>;
+  /** Durable permission response exists but Master has not yet reported an
+   * applied/terminal outcome. The card stays non-resolved during this phase. */
+  _controlPending?: boolean;
 };
 
 /**
@@ -540,8 +556,9 @@ export type ChatSession = {
    * the composer has already returned to idle.
    */
   _stopSettlement?: {
-    clientMessageId: string;
-    phase: "terminal" | "sync";
+    clientMessageId?: string;
+    controlId?: string;
+    phase: "persisting" | "awaiting_receipt" | "persisted" | "terminal" | "sync";
   };
   /** Agent frozen when the active turn was dispatched.  `agentId` is the
    * current selector and may change before the old turn is stopped. */
@@ -575,6 +592,11 @@ export type ChatSession = {
   _automaticRecoveryDecisions?: Record<string, true>;
   _isFirstTurnAfterReady?: boolean;
   _liveStreamBroken?: boolean;
+  /** Exact restored/disconnected turn is being reconciled with REST authority.
+   * Delay is capped; attempts are not. */
+  _reconciling?: boolean;
+  /** Single low-cognition user-visible recovery/control state. */
+  _recoveryStatus?: RecoveryStatusState;
 
   // ── 双帧 error 抑制（§11）──
   _suppressErrorBubbleAtSeq?: number;

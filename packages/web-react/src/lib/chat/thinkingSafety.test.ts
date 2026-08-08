@@ -187,7 +187,10 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
 
     sock.stopTurn("s1");
     expect(sock.getTransientNotice("s1")).toBeNull();
-    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(false);
+    // Stop is a durable control now: keep the turn visibly busy until Master
+    // confirms the exact request reached a terminal state.
+    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(true);
+    expect(sock.sessions.get("s1")!._recoveryStatus?.kind).toBe("stopping");
   });
 });
 
@@ -211,6 +214,15 @@ describe("retryMessage：发送失败原地重发", () => {
     ws.readyState = 0;
     sock.stopTurn("s1");
     ws.readyState = 1;
+    const stopped = s._stopSettlement!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stopped.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: stopped.clientMessageId,
+    }) });
     userMsg.status = "error";
     ws.sent.length = 0;
 

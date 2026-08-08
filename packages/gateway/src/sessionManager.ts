@@ -79,6 +79,30 @@ import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner
 
 const log = createLogger({ module: 'sessionManager' })
 
+/** Exact Gateway registry for tool results that are safe to checkpoint past.
+ * Everything else (Bash/browser/MCP/third-party and all writes) stays unknown
+ * unless its owning adapter later adds a durable downstream-idempotency
+ * proof. Runtime-provided lookalike fields are always stripped first. */
+const RECOVERY_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep'])
+function stampGatewayToolEffect(tool: TurnToolEntry): TurnToolEntry {
+  const frozen = structuredClone(tool) as TurnToolEntry & { _toolEffect?: unknown }
+  delete frozen._toolEffect
+  if (!RECOVERY_READ_ONLY_TOOLS.has(frozen.toolName) || frozen.completed === false) {
+    return frozen
+  }
+  return {
+    ...frozen,
+    _toolEffect: {
+      authority: 'gateway-v1',
+      registryEntrySha256: createHash('sha256')
+        .update(`gateway-v1\0${frozen.toolName}\0read_only`)
+        .digest('hex'),
+      outcome: 'completed',
+      safety: 'read_only',
+    },
+  } as TurnToolEntry
+}
+
 /**
  * generic 引擎失败(非 auth、非 terminalOverride 控制码)的 tape errorCode 细分。
  *
@@ -4055,7 +4079,7 @@ export class SessionManager {
       tools.map((tool) => {
         const call = callUsageByTarget.get(tool.blockId)
         return {
-          ...structuredClone(tool),
+          ...stampGatewayToolEffect(tool),
           ...(call ? { _callUsage: freezeCall(call) } : {}),
         }
       })
@@ -4707,7 +4731,7 @@ export class SessionManager {
           const transientContinuationIsSafe =
             turnPermissionCount === 0 &&
             assessTurnRecoveryTape(
-              (result?.tools ?? []).map((tool) => ({
+              freezeTools(result?.tools ?? []).map((tool) => ({
                 role: 'tool',
                 ...tool,
                 // TurnToolEntry omits completed for a matched result; the
@@ -5294,7 +5318,10 @@ export class SessionManager {
       }
 
       const handleError = (err: Error) => {
-        const persistence = requestTerminalPersistence?.('crashed', err.message, 'RUNNER_ERROR')
+        // All unexpected runner failures share one recovery-facing code.  The
+        // immutable detail still preserves the concrete transport/process
+        // error, while the Master can make one deterministic retry decision.
+        const persistence = requestTerminalPersistence?.('crashed', err.message, 'RUNNER_CRASHED')
           ?? Promise.resolve()
         this._trackPersistence(persistence)
       }
@@ -5331,8 +5358,7 @@ export class SessionManager {
                 ? `子进程异常退出 (code ${info.code})`
                 : '子进程意外退出'
             const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
-            const code = info.signal ? 'RUNNER_INTERRUPTED' : 'RUNNER_CRASHED'
-            void (persistTerminalSnapshot?.(status, reason, code) ?? Promise.resolve())
+            void (persistTerminalSnapshot?.(status, reason, 'RUNNER_CRASHED') ?? Promise.resolve())
               .finally(resolveFlush)
           }, 150)
         })
@@ -5381,7 +5407,7 @@ export class SessionManager {
         const persistence = requestTerminalPersistence?.(
           'crashed',
           String(err),
-          'TURN_SUBMIT_FAILED',
+          'RUNNER_CRASHED',
         ) ?? Promise.resolve()
         this._trackPersistence(persistence)
       })

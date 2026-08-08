@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import signal
 import subprocess
 import tempfile
@@ -83,8 +84,13 @@ class WorkerContractTest(unittest.TestCase):
     def running_attempt(self, job="job-running", attempt="attempt-running", resource="gpu-h3", request=None):
         if request is None:
             request = {"prompt": {"1": {"class_type": "Output", "inputs": {}}}}
-        self.worker.store.ensure_staging(job, attempt, 1, resource)
-        self.worker.store.submit(job, attempt, 1, resource, "d" * 64, request)
+        self.worker.store.ensure_staging(
+            job, attempt, 1, resource, origin_release=self.worker.release
+        )
+        self.worker.store.submit(
+            job, attempt, 1, resource, "d" * 64, request,
+            origin_release=self.worker.release,
+        )
         return self.worker.store.start_execution(job, attempt)
 
     def server(self):
@@ -572,7 +578,7 @@ class WorkerContractTest(unittest.TestCase):
             return terminal(*args, **kwargs)
 
         with (
-            patch.object(self.worker, "_process_matches", return_value=False),
+            patch.object(self.worker, "_process_identity", return_value="dead"),
             patch.object(self.worker, "_publish_h3_result", side_effect=publish),
             patch.object(self.worker, "_stop_ranks", side_effect=stop_ranks),
             patch.object(self.worker.store, "cas_terminal", side_effect=record_terminal),
@@ -585,11 +591,34 @@ class WorkerContractTest(unittest.TestCase):
         self.assertIsNone(recovered["pid"])
         self.assertIsNone(recovered["pid_start_ticks"])
 
+    def test_recovered_worker_lost_is_retry_safe_only_after_gpu_cleanup(self):
+        row = self.running_attempt(job="lost", attempt="attempt-lost")
+        with (
+            patch.object(self.worker, "_process_identity", return_value="dead"),
+            patch.object(self.worker, "_stop_ranks") as stop_ranks,
+        ):
+            self.worker._monitor_recovered(dict(row))
+        stop_ranks.assert_called_once()
+        recovered = self.worker.store.row(row["job_id"], row["attempt_id"])
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["error_code"], "worker_lost")
+        self.assertEqual(recovered["recovery_disposition"], "definitive_retry_safe")
+        self.assertEqual(recovered["cleanup_proven"], 1)
+
+        self.worker.ack(row["job_id"], row["attempt_id"], row["fence_version"])
+        tombstone = self.worker.store.row(row["job_id"], row["attempt_id"])
+        self.assertEqual(tombstone["attempt_id"], row["attempt_id"])
+        self.assertEqual(tombstone["fence_version"], row["fence_version"])
+        self.assertEqual(tombstone["request_digest"], row["request_digest"])
+        self.assertEqual(tombstone["recovery_disposition"], "definitive_retry_safe")
+        self.assertEqual(tombstone["cleanup_proven"], 1)
+        self.assertEqual(tombstone["origin_release"], self.worker.release)
+
     def test_gpu_cleanup_failure_keeps_resource_poisoned_and_retries(self):
         row = self.running_attempt(job="poison", attempt="attempt-poison")
         self.worker.store.update(row["job_id"], row["attempt_id"], cancel_requested_at=1)
         with (
-            patch.object(self.worker, "_process_matches", return_value=False),
+            patch.object(self.worker, "_process_identity", return_value="dead"),
             patch.object(self.worker, "_stop_ranks", side_effect=RuntimeError("still allocated")),
             patch.object(self.worker, "_schedule_recovery_retry") as retry,
         ):
@@ -598,6 +627,7 @@ class WorkerContractTest(unittest.TestCase):
         self.assertEqual(poisoned["status"], "running")
         self.assertEqual(poisoned["phase"], "gpu_cleanup_failed")
         self.assertEqual(poisoned["error_code"], "gpu_cleanup_failed")
+        self.assertNotEqual(poisoned["recovery_disposition"], "definitive_retry_safe")
         retry.assert_called_once()
         self.worker.store.ensure_staging("next", "attempt-next", 1)
         with self.assertRaisesRegex(Conflict, "resource_busy"):
@@ -605,6 +635,22 @@ class WorkerContractTest(unittest.TestCase):
                 "next", "attempt-next", 1, "gpu-h3", "e" * 64,
                 {"prompt": {"1": {"class_type": "Output", "inputs": {}}}},
             )
+
+    def test_unknown_recovered_process_identity_never_authorizes_retry(self):
+        row = self.running_attempt(job="identity-unknown", attempt="attempt-unknown")
+        with (
+            patch.object(self.worker, "_process_identity", return_value="unknown"),
+            patch.object(self.worker, "_stop_ranks") as stop_ranks,
+            patch.object(self.worker, "_schedule_recovery_retry") as retry,
+        ):
+            self.worker._monitor_recovered(dict(row))
+        current = self.worker.store.row(row["job_id"], row["attempt_id"])
+        self.assertEqual(current["status"], "running")
+        self.assertEqual(current["phase"], "recovery_identity_unknown")
+        self.assertEqual(current["recovery_disposition"], "unknown")
+        self.assertEqual(current["cleanup_proven"], 0)
+        stop_ranks.assert_not_called()
+        retry.assert_called_once()
 
     def test_process_reattach_rejects_reused_or_unrelated_pid(self):
         row = dict(self.running_attempt(resource="cpu-compose", request={"mode": "normalize"}))
@@ -619,6 +665,95 @@ class WorkerContractTest(unittest.TestCase):
         finally:
             process.terminate()
             process.wait(timeout=5)
+
+    def test_install_rejects_an_existing_unsigned_release(self):
+        worker_dir = Path(__file__).resolve().parent
+        repo = worker_dir.parents[1]
+        release = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        release_root = Path(self.tmp.name) / "install-root"
+        (release_root / "releases" / release).mkdir(parents=True)
+        env_file = Path(self.tmp.name) / "h3.env"
+        env_file.write_text("H3_WORKER_TOKEN=test-token\n")
+        result = subprocess.run(
+            ["bash", str(worker_dir / "install-service.sh")],
+            env={
+                **os.environ,
+                "H3_WORKER_RELEASE_ROOT": str(release_root),
+                "H3_WORKER_ENV_FILE": str(env_file),
+            },
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incomplete or unsigned", result.stderr)
+
+    def test_activation_backs_up_real_worker_db_and_status_reports_it(self):
+        worker_dir = Path(__file__).resolve().parent
+        release_root = Path(self.tmp.name) / "activation-root"
+        state_root = Path(self.tmp.name) / "activation-state"
+        release = "a" * 40
+        candidate_worker = (
+            release_root / "releases" / release /
+            "scripts" / "minimax_h3_worker" / "worker.py"
+        )
+        candidate_worker.parent.mkdir(parents=True)
+        candidate_worker.write_bytes((worker_dir / "worker.py").read_bytes())
+        manifest = release_root / "manifests" / f"{release}.sha256"
+        manifest.parent.mkdir(parents=True)
+        digest = hashlib.sha256(candidate_worker.read_bytes()).hexdigest()
+        manifest.write_text(
+            f"{digest}  scripts/minimax_h3_worker/worker.py\n",
+            encoding="utf-8",
+        )
+        state_root.mkdir()
+        db = sqlite3.connect(state_root / "worker.sqlite")
+        db.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+        db.execute("INSERT INTO evidence VALUES ('durable')")
+        db.commit()
+        db.close()
+
+        fake_bin = Path(self.tmp.name) / "fake-bin"
+        fake_bin.mkdir()
+        systemctl = fake_bin / "systemctl"
+        systemctl.write_text("#!/bin/bash\nexit 0\n")
+        systemctl.chmod(0o755)
+        curl = fake_bin / "curl"
+        curl.write_text(
+            f"#!/bin/bash\nprintf '%s\\n' '{{\"release\":\"{release}\"}}'\n"
+        )
+        curl.chmod(0o755)
+        env = {
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "H3_WORKER_RELEASE_ROOT": str(release_root),
+            "H3_WORKER_STATE": str(state_root),
+            "H3_WORKER_SYSTEMCTL": str(systemctl),
+            "H3_WORKER_TOKEN": "test-token",
+            "H3_WORKER_HEALTH_ATTEMPTS": "1",
+        }
+        activated = subprocess.run(
+            ["bash", str(worker_dir / "activate-release.sh"), release],
+            env=env, check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(activated.stdout.strip(), release)
+        backups = list((release_root / "backups").glob("worker-*.sqlite"))
+        self.assertEqual(len(backups), 1)
+        backup_db = sqlite3.connect(backups[0])
+        self.assertEqual(
+            backup_db.execute("SELECT value FROM evidence").fetchone(),
+            ("durable",),
+        )
+        self.assertEqual(backup_db.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+        backup_db.close()
+        status = subprocess.run(
+            ["bash", str(worker_dir / "activate-release.sh"), "--status"],
+            env=env, check=True, capture_output=True, text=True,
+        )
+        payload = json.loads(status.stdout)
+        self.assertEqual(payload["worker_db"], str(state_root / "worker.sqlite"))
+        self.assertEqual(payload["state"]["db_backup"], str(backups[0]))
 
     def test_compose_rejects_options_the_worker_does_not_implement(self):
         unsupported = self.running_attempt(

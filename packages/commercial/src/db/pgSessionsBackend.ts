@@ -54,9 +54,11 @@ import {
   modelHistoryReservedTokens,
   estimateModelHistoryTokens,
   exactModelHistoryTextSuffix,
+  isClientMessageId,
   modelHistorySemanticRole,
   modelHistorySemanticText,
   maxAutomaticTurnRetryAttempt,
+  normalizeTurnErrorCode,
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
   turnRecoveryAttemptIdentity,
@@ -115,6 +117,7 @@ import {
   isLosslessRuntimeBatchingEnabled,
   materializeLosslessTurn,
   type LosslessTurnRecord,
+  type LosslessTurnPayload,
 } from "../http/losslessTurnTape.js";
 import { bumpGoalUsageSnapshotForTape } from "../goal/goalStateService.js";
 import { ensurePendingTurnWaiverInTransaction } from "../billing/refund.js";
@@ -130,6 +133,13 @@ import {
   casToTerminal,
   getDispatch,
 } from "../dispatch/turnDispatchStore.js";
+import {
+  bindRecoveryJobDispatch,
+  enqueueAutomaticRecoveryJob,
+  lockRecoveryRoot,
+  settleRecoveryJobForTape,
+} from "../dispatch/turnRecoveryStore.js";
+import { settleStopControlsForTurn } from "../dispatch/turnControlStore.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
   reconcileLiveStreamWithFinalTape,
@@ -1022,6 +1032,14 @@ export interface AdmitUserTurnInput {
         attempt: number;
         max: typeof AUTOMATIC_TURN_RETRY_MAX;
       };
+  /** Master scheduler lease fence. Browser-authored frames never populate
+   * this field; admission validates it in the same transaction as the user
+   * append and dispatch binding. */
+  recoveryJob?: {
+    jobId: string;
+    leaseOwner: string;
+    leaseEpoch: number;
+  };
   leaseTtlMs?: number;
   now?: number;
 }
@@ -1032,6 +1050,13 @@ export type AdmitUserTurnResult =
   | { kind: "session_deleted" }
   | { kind: "recovery_conflict"; reason: string }
   | { kind: "append_error"; reason: string };
+
+class RecoveryJobAdmissionConflict extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "RecoveryJobAdmissionConflict";
+  }
+}
 
 export type TurnTapeDispatchState = "none" | "partial" | "finalized";
 
@@ -1050,6 +1075,9 @@ export interface TurnTapeStateResult {
 export interface DispatchAdmissionBackend {
   /** 单事务:幂等 append user 行 → 取 _seq → UPSERT dispatch 冲突表裁定(RFC §2.1)。 */
   admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult>;
+  /** Rolling-upgrade compensator: reconstruct finalized recoverable tapes
+   * that committed before the scheduler-owning Master published their job. */
+  reconcileAutomaticRecoveryJobs(userId: bigint, limit?: number): Promise<number>;
   /** Read the server-persisted cwd policy for lanes whose user row was
    * materialized before this bridge invocation (for example prompt queue). */
   getClientSessionWorkspaceMode(
@@ -1148,6 +1176,220 @@ async function mergeVerifiedTurnStatusRows(
 
 function sha256Bytes(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+const AUTOMATIC_RECOVERY_CONTINUE_PROMPT =
+  "继续完成刚才因临时异常中断的任务。以本会话中已经生成并持久化的思考、工具结果和部分回答为依据，从断点继续；不要重新执行已经完成的步骤，不要重复已经输出的内容。若外部写操作的结果仍不明确，不得重复提交，先核对状态或向用户说明。";
+
+// Kept byte-for-byte aligned with protocol's exported pre-execution policy.
+// This commercial copy is intentional during the rolling workspace window:
+// production may load the protocol package from the previous runtime image
+// while Master has already migrated its recovery rows.
+const PRE_EXECUTION_RECOVERY_CODES = new Set([
+  "model_authority_unavailable", "model_catalog_unavailable",
+  "codex_pool_busy", "codex_route_unavailable", "codex_container_recycled",
+]);
+function recoveryWithoutCheckpointIsProven(code: string): boolean {
+  return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));
+}
+
+async function hydrateRecoverySourceUser(
+  client: PoolClient,
+  sessionId: string,
+  userId: string,
+  source: MessageLike,
+): Promise<MessageLike | null> {
+  if (source._userPayloadDeferred !== true) return source;
+  if (typeof source.id !== "string") return null;
+  const row = (
+    await client.query<{ payload: Buffer }>(
+      `SELECT payload FROM client_session_user_payloads
+        WHERE session_id=$1 AND user_id=$2 AND msg_id=$3`,
+      [sessionId, userId, source.id],
+    )
+  ).rows[0];
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(row.payload).toString("utf8"));
+    if (
+      !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+      parsed.id !== source.id || parsed.role !== "user"
+    ) return null;
+    return parsed as MessageLike;
+  } catch {
+    return null;
+  }
+}
+
+function replayMediaIsDurable(media: unknown[]): boolean {
+  return media.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const ref = item as { url?: unknown; base64?: unknown };
+    return (typeof ref.url === "string" && ref.url.length > 0) ||
+      (typeof ref.base64 === "string" && ref.base64.length > 0);
+  });
+}
+
+/** Build and enqueue the next semantic recovery from the exact finalized
+ * tape while its session/dispatch transaction is still open. This is the
+ * primary publication path; the table's lineage UNIQUE key makes finalize
+ * ACK-loss replays harmless. */
+async function scheduleAutomaticRecoveryForFinalizedTurn(
+  client: PoolClient,
+  input: {
+    uid: bigint;
+    sessionUserId: string;
+    sessionId: string;
+    turn: {
+      payload: Pick<
+        LosslessTurnPayload,
+        | "clientMessageId"
+        | "status"
+        | "errorCode"
+        | "waiveReason"
+        | "agentId"
+        | "turnKey"
+      >;
+      records: Array<{ payload: MessageLike }>;
+    };
+    clientMessageId: string | null;
+    tapeSha256: string;
+    currentMessages: MessageLike[];
+  },
+): Promise<void> {
+  const clientMessageId = input.clientMessageId;
+  if (!clientMessageId || !isClientMessageId(clientMessageId)) return;
+
+  await settleStopControlsForTurn(client, {
+    userId: input.uid,
+    sessionId: input.sessionId,
+    clientMessageId,
+  });
+
+  await settleRecoveryJobForTape(client, {
+    userId: input.uid,
+    sessionId: input.sessionId,
+    clientMessageId,
+    outcome: input.turn.payload.status,
+  });
+  if (
+    input.turn.payload.status !== "crashed" &&
+    input.turn.payload.status !== "interrupted"
+  ) return;
+  const errorCode = input.turn.payload.errorCode ?? input.turn.payload.waiveReason ?? "";
+  if (!supportsAutomaticTurnRecovery(errorCode)) return;
+
+  const latestUser = [...input.currentMessages].reverse()
+    .find((message) => message?.role === "user");
+  if (!latestUser || latestUser.id !== clientMessageId) return;
+  const source = await hydrateRecoverySourceUser(
+    client,
+    input.sessionId,
+    input.sessionUserId,
+    latestUser,
+  );
+  if (!source) return;
+  const routing = source._routing;
+  if (!routing || typeof routing !== "object" || Array.isArray(routing)) return;
+  const route = routing as Record<string, unknown>;
+
+  const assessment = assessTurnRecoveryTape(
+    input.turn.records.map((record) => record.payload),
+  );
+  if (!assessment.checkpointSafe) return;
+  if (
+    assessment.mode === "replay" &&
+    !recoveryWithoutCheckpointIsProven(errorCode)
+  ) return;
+  const mode = assessment.mode;
+  const rootClientMessageId = isClientMessageId(source._automaticRecoveryRootClientMessageId)
+    ? source._automaticRecoveryRootClientMessageId
+    : source._automaticRecovery === true && isClientMessageId(source._recoveryOfClientMessageId)
+      ? source._recoveryOfClientMessageId
+      : clientMessageId;
+  const sourceAttempt = typeof source._automaticRecoveryAttempt === "number" &&
+      Number.isSafeInteger(source._automaticRecoveryAttempt) &&
+      source._automaticRecoveryAttempt >= 1
+    ? source._automaticRecoveryAttempt
+    : source._automaticRecovery === true ? 1 : 0;
+  const currentAttempt = Math.max(
+    sourceAttempt,
+    maxAutomaticTurnRetryAttempt(
+      input.turn.records.map((record) => record.payload),
+      rootClientMessageId,
+    ),
+  );
+  if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) return;
+  const semanticRecoveryAttempt = currentAttempt + 1;
+  const identity = turnRecoveryAttemptIdentity(
+    input.sessionId,
+    rootClientMessageId,
+    semanticRecoveryAttempt,
+  );
+
+  const displayText = mode === "checkpoint" ? "↻ 自动从断点继续" : "↻ 自动重试";
+  const exactText = typeof source._modelText === "string"
+    ? source._modelText
+    : typeof source.text === "string" ? source.text : "";
+  const sourceMedia = Array.isArray(source._retryMedia)
+    ? source._retryMedia
+    : Array.isArray(source._media) ? source._media : undefined;
+  if (mode === "replay" && sourceMedia && !replayMediaIsDurable(sourceMedia)) return;
+  const replyTo = source._replyTo && typeof source._replyTo === "object" &&
+      !Array.isArray(source._replyTo)
+    ? source._replyTo as Record<string, unknown>
+    : undefined;
+  const imageEdit = source._imageEdit && typeof source._imageEdit === "object" &&
+      !Array.isArray(source._imageEdit)
+    ? source._imageEdit as Record<string, unknown>
+    : undefined;
+  const content: Record<string, unknown> = {
+    text: mode === "checkpoint" ? AUTOMATIC_RECOVERY_CONTINUE_PROMPT : exactText,
+    displayText,
+    ...(mode === "replay" && sourceMedia ? { media: sourceMedia } : {}),
+    ...(mode === "replay" && imageEdit ? { imageEdit } : {}),
+    ...(mode === "replay" && replyTo ? { replyTo } : {}),
+    recovery: {
+      sourceClientMessageId: clientMessageId,
+      mode,
+      automatic: true,
+      rootClientMessageId,
+      attempt: semanticRecoveryAttempt,
+      max: AUTOMATIC_TURN_RETRY_MAX,
+    },
+  };
+  const request: Record<string, unknown> = {
+    type: "inbound.message",
+    idempotencyKey: identity.idempotencyKey,
+    channel: "webchat",
+    peer: { id: input.sessionId, kind: "dm" },
+    agentId: input.turn.payload.agentId,
+    content,
+    ...(mode === "replay" && typeof replyTo?.messageId === "string"
+      ? { replyToId: replyTo.messageId }
+      : {}),
+    ...(typeof route.effortLevel === "string" || route.effortLevel === null
+      ? { effortLevel: route.effortLevel }
+      : {}),
+    ...(typeof route.model === "string" && route.model.length > 0
+      ? { model: route.model }
+      : {}),
+    ...(route.teamMode === true ? { teamMode: true } : {}),
+    ts: Date.now(),
+    clientMessageId: identity.clientMessageId,
+  };
+  await enqueueAutomaticRecoveryJob(client, {
+    userId: input.uid,
+    sessionId: input.sessionId,
+    rootClientMessageId,
+    sourceClientMessageId: clientMessageId,
+    sourceTurnKey: input.turn.payload.turnKey,
+    errorCode,
+    recoveryMode: mode,
+    semanticRecoveryAttempt,
+    request,
+    tapeSha256: input.tapeSha256,
+  });
 }
 
 function tapeAnchor(
@@ -5718,7 +5960,18 @@ export function createPgSessionsBackend(
 
   const backend: PgSessionsBackend = {
     async admitUserTurn(input: AdmitUserTurnInput): Promise<AdmitUserTurnResult> {
-      return withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
+      try {
+        return await withTx(pool, async (client): Promise<AdmitUserTurnResult> => {
+        if (input.recoveryJob) {
+          if (!input.recovery?.automatic) {
+            throw new RecoveryJobAdmissionConflict("scheduler_lineage_missing");
+          }
+          await lockRecoveryRoot(client, {
+            userId: input.uid,
+            sessionId: input.sessionId,
+            rootClientMessageId: input.recovery.rootClientMessageId,
+          });
+        }
         let message = input.message;
         if (input.recovery) {
           const expected = input.recovery.automatic
@@ -5877,6 +6130,13 @@ export function createPgSessionsBackend(
                 return { kind: "recovery_conflict", reason: "source_tape_malformed" };
               }
               const assessment = assessTurnRecoveryTape(records);
+              const terminalError = [...records].reverse().find((record) =>
+                !!record && typeof record === "object" && !Array.isArray(record) &&
+                typeof (record as MessageLike)._errorCode === "string"
+              ) as MessageLike | undefined;
+              const terminalErrorCode = typeof terminalError?._errorCode === "string"
+                ? terminalError._errorCode
+                : "";
               if (input.recovery.automatic) {
                 authoritativeRetryAttempt = Math.max(
                   authoritativeRetryAttempt,
@@ -5888,6 +6148,15 @@ export function createPgSessionsBackend(
               }
               if (input.recovery.automatic && !assessment.checkpointSafe) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
+              }
+              if (
+                input.recovery.automatic &&
+                assessment.mode === "replay" &&
+                !recoveryWithoutCheckpointIsProven(
+                  terminalErrorCode || finalized.waive_reason || "",
+                )
+              ) {
+                return { kind: "recovery_conflict", reason: "automatic_replay_not_proven" };
               }
             } else if (
               input.recovery.mode !== "replay" ||
@@ -5976,11 +6245,170 @@ export function createPgSessionsBackend(
           ...(input.leaseTtlMs !== undefined ? { leaseTtlMs: input.leaseTtlMs } : {}),
           ...(input.now !== undefined ? { now: input.now } : {}),
         });
+        if (input.recoveryJob) {
+          const bound = await bindRecoveryJobDispatch(client, {
+            jobId: input.recoveryJob.jobId,
+            userId: input.uid,
+            sessionId: input.sessionId,
+            rootClientMessageId: input.recovery!.automatic
+              ? input.recovery!.rootClientMessageId
+              : "",
+            semanticRecoveryAttempt: input.recovery!.automatic
+              ? input.recovery!.attempt
+              : 0,
+            leaseOwner: input.recoveryJob.leaseOwner,
+            leaseEpoch: input.recoveryJob.leaseEpoch,
+            dispatchId: dispatch.dispatch.dispatchId,
+            dispatchAttemptNo: dispatch.dispatch.attemptNo,
+          });
+          if (!bound) throw new RecoveryJobAdmissionConflict("scheduler_lease_lost");
+          if (dispatch.kind === "in_flight") {
+            await client.query(
+              `UPDATE turn_recovery_jobs
+                  SET status='forwarded',container_receipt_at=COALESCE(container_receipt_at,NOW()),
+                      lease_owner=NULL,lease_until=NULL,updated_at=NOW()
+                WHERE job_id=$1 AND lease_owner=$2 AND lease_epoch=$3`,
+              [input.recoveryJob.jobId, input.recoveryJob.leaseOwner, input.recoveryJob.leaseEpoch],
+            );
+          } else if (
+            dispatch.kind === "deduplicated" ||
+            dispatch.kind === "previously_failed" ||
+            dispatch.kind === "manual_hold"
+          ) {
+            await client.query(
+              `UPDATE turn_recovery_jobs
+                  SET status=CASE WHEN $4='manual_hold' THEN 'manual_reconcile' ELSE 'completed' END,
+                      lease_owner=NULL,lease_until=NULL,updated_at=NOW()
+                WHERE job_id=$1 AND lease_owner=$2 AND lease_epoch=$3`,
+              [
+                input.recoveryJob.jobId,
+                input.recoveryJob.leaseOwner,
+                input.recoveryJob.leaseEpoch,
+                dispatch.kind,
+              ],
+            );
+          }
+        }
         if (appended.workspaceMode === undefined) {
           throw new Error(`workspace mode missing after append for ${input.sessionId}`);
         }
         return { ...dispatch, workspaceMode: appended.workspaceMode };
-      });
+        });
+      } catch (error) {
+        if (error instanceof RecoveryJobAdmissionConflict) {
+          return { kind: "recovery_conflict", reason: error.reason };
+        }
+        throw error;
+      }
+    },
+
+    async reconcileAutomaticRecoveryJobs(userId: bigint, limit = 100): Promise<number> {
+      const sessionUserId = `c:${userId.toString()}`;
+      const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+      const candidates = await pool.query<{
+        session_id: string;
+        tape_id: string;
+        tape_sha256: string;
+        agent_id: string;
+        status: "interrupted" | "crashed";
+        turn_key: string;
+        waive_reason: string | null;
+        client_message_id: string;
+      }>(
+        `SELECT t.session_id,t.tape_id,t.tape_sha256,t.agent_id,t.status,
+                t.turn_key,t.waive_reason,t.client_message_id
+           FROM client_session_turn_tapes t
+          WHERE t.user_id=$1 AND t.finalized_at IS NOT NULL
+            AND t.status IN ('interrupted','crashed')
+            AND t.client_message_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM turn_recovery_jobs j
+               WHERE j.user_id=$2 AND j.session_id=t.session_id
+                 AND j.source_turn_key=t.turn_key
+            )
+          ORDER BY t.finalized_at DESC
+          LIMIT $3`,
+        [sessionUserId, userId.toString(), boundedLimit],
+      );
+      let scheduled = 0;
+      for (const candidate of candidates.rows) {
+        const inserted = await withTx(pool, async (client): Promise<boolean> => {
+          const tape = (
+            await client.query<typeof candidate & { finalized_at: string | null }>(
+              `SELECT session_id,tape_id,tape_sha256,agent_id,status,turn_key,
+                      waive_reason,client_message_id,finalized_at
+                 FROM client_session_turn_tapes
+                WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+                FOR UPDATE`,
+              [candidate.session_id, sessionUserId, candidate.tape_id],
+            )
+          ).rows[0];
+          if (!tape || tape.finalized_at === null) return false;
+          const session = (
+            await client.query<{ messages: string; deleted_at: string | null }>(
+              `SELECT messages,deleted_at FROM client_sessions
+                WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+              [candidate.session_id, sessionUserId],
+            )
+          ).rows[0];
+          if (!session || session.deleted_at !== null) return false;
+          let currentMessages: MessageLike[];
+          try {
+            const parsed = JSON.parse(session.messages);
+            if (!Array.isArray(parsed)) return false;
+            currentMessages = parsed as MessageLike[];
+          } catch {
+            return false;
+          }
+          const rows = await client.query<{ payload: Buffer }>(
+            `SELECT payload FROM client_session_turn_tape_records
+              WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
+              ORDER BY ordinal`,
+            [candidate.session_id, sessionUserId, candidate.tape_id],
+          );
+          const records: Array<{ payload: MessageLike }> = [];
+          try {
+            for (const row of rows.rows) {
+              const parsed = JSON.parse(Buffer.from(row.payload).toString("utf8"));
+              if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+              records.push({ payload: parsed as MessageLike });
+            }
+          } catch {
+            return false;
+          }
+          const recordError = [...records].reverse().find(
+            (record) => typeof record.payload._errorCode === "string",
+          )?.payload._errorCode;
+          await scheduleAutomaticRecoveryForFinalizedTurn(client, {
+            uid: userId,
+            sessionUserId,
+            sessionId: candidate.session_id,
+            clientMessageId: candidate.client_message_id,
+            tapeSha256: candidate.tape_sha256,
+            currentMessages,
+            turn: {
+              payload: {
+                clientMessageId: candidate.client_message_id,
+                status: candidate.status,
+                agentId: candidate.agent_id,
+                turnKey: candidate.turn_key,
+                ...(typeof recordError === "string"
+                  ? { errorCode: recordError }
+                  : candidate.waive_reason ? { waiveReason: candidate.waive_reason as LosslessTurnPayload["waiveReason"] } : {}),
+              },
+              records,
+            },
+          });
+          const exists = await client.query(
+            `SELECT 1 FROM turn_recovery_jobs
+              WHERE user_id=$1 AND session_id=$2 AND source_turn_key=$3 LIMIT 1`,
+            [userId.toString(), candidate.session_id, candidate.turn_key],
+          );
+          return (exists.rowCount ?? 0) === 1;
+        });
+        if (inserted) scheduled++;
+      }
+      return scheduled;
     },
 
     async getClientSessionWorkspaceMode(
@@ -6871,6 +7299,17 @@ export function createPgSessionsBackend(
               [request.sessionId, userId],
             );
           }
+        }
+        if (billingUserId !== null && !turn.payload.continuationOfTurnKey) {
+          await scheduleAutomaticRecoveryForFinalizedTurn(client, {
+            uid: billingUserId,
+            sessionUserId: userId,
+            sessionId: request.sessionId,
+            turn,
+            clientMessageId,
+            tapeSha256: request.tapeSha256,
+            currentMessages: existingMessages,
+          });
         }
         return {
           applied: "finalized",

@@ -4958,6 +4958,9 @@ export async function registerCommercial(
     admitUserTurn: dispatchAdmissionBackend
       ? (input) => dispatchAdmissionBackend!.admitUserTurn(input)
       : undefined,
+    reconcileAutomaticRecoveryJobs: dispatchAdmissionBackend
+      ? (uid, limit) => dispatchAdmissionBackend!.reconcileAutomaticRecoveryJobs(uid, limit)
+      : undefined,
     loadSessionWorkspaceMode: dispatchAdmissionBackend
       ? (uid, sessionId) => dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
           sessionId,

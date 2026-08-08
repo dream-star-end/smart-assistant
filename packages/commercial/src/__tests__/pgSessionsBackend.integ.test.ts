@@ -50,6 +50,11 @@ import {
   scanOpenSessionGone,
 } from "../dispatch/turnDispatchStore.js";
 import { runReconcileTick } from "../dispatch/turnDispatchReconciler.js";
+import {
+  claimDueRecoveryJobs,
+  markRecoveryContainerReceipt,
+  releaseRecoveryPreReceipt,
+} from "../dispatch/turnRecoveryStore.js";
 import { authorizeTurnTapeRecovery } from "../admin/turnTapeRecovery.js";
 import { _sanitizeMasterHistoricalMessagesForFrame } from "../ws/userChatBridge.js";
 import {
@@ -81,6 +86,7 @@ const MIGRATION_0181 = path.resolve(here, "../db/migrations/0181_turn_tape_recov
 const MIGRATION_0196 = path.resolve(here, "../db/migrations/0196_client_session_workspace_mode.sql");
 const MIGRATION_0198 = path.resolve(here, "../db/migrations/0198_client_session_workspace_default.sql");
 const MIGRATION_0201 = path.resolve(here, "../db/migrations/0201_durable_live_turn_frames.sql");
+const MIGRATION_0202 = path.resolve(here, "../db/migrations/0202_turn_recovery_control.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -208,6 +214,7 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0181, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0196, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0201, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0202, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE admin_audit (
       id BIGSERIAL PRIMARY KEY,
@@ -4338,6 +4345,136 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     );
   });
 
+  maybe("Master recovery lease binds admission and commits only on the durable container receipt", async () => {
+    const sessionId = "s-dd-master-recovery-lease";
+    const sourceClientMessageId = "cm-dd-master-recovery-source";
+    await seedRecoverableSource({ sessionId, sourceClientMessageId });
+    const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
+    const jobId = randomUUID();
+    await pool.query(
+      `INSERT INTO turn_recovery_jobs (
+         job_id,user_id,session_id,root_client_message_id,source_client_message_id,
+         source_turn_key,error_code,recovery_mode,semantic_recovery_attempt,
+         request_json,tape_sha256,status,lease_owner,lease_epoch,lease_until
+       ) VALUES ($1,$2,$3,$4,$4,$5,'RUNNER_CRASHED','checkpoint',1,$6::jsonb,$7,
+                 'leased','master-test',3,NOW()+INTERVAL '2 minutes')`,
+      [
+        jobId,
+        UID.toString(),
+        sessionId,
+        sourceClientMessageId,
+        "b".repeat(64),
+        JSON.stringify({ clientMessageId: identity.clientMessageId }),
+        "c".repeat(64),
+      ],
+    );
+    const admitted = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-${identity.clientMessageId}`,
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "automatic checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
+      },
+      recoveryJob: { jobId, leaseOwner: "master-test", leaseEpoch: 3 },
+    }));
+    assert.equal(admitted.kind, "admitted");
+    if (admitted.kind !== "admitted") return;
+    const bound = (
+      await pool.query<{
+        status: string;
+        dispatch_id: string | null;
+        dispatch_attempt_no: number | null;
+      }>(
+        `SELECT status,dispatch_id,dispatch_attempt_no FROM turn_recovery_jobs WHERE job_id=$1`,
+        [jobId],
+      )
+    ).rows[0]!;
+    assert.equal(bound.status, "leased");
+    assert.equal(bound.dispatch_id, admitted.dispatch.dispatchId);
+    assert.equal(bound.dispatch_attempt_no, admitted.dispatch.attemptNo);
+
+    // Physical enqueue may have succeeded even when the Master loses the SQL
+    // COMMIT acknowledgement. Its compensation must release only ownership,
+    // never rotate the container's at-most-once dispatch identity.
+    assert.equal(await releaseRecoveryPreReceipt(pool, {
+      job: {
+        jobId,
+        leaseOwner: "master-test",
+        leaseEpoch: 3,
+        transportWaitAttempt: 0,
+      },
+      dispatchId: admitted.dispatch.dispatchId,
+      dispatchOwner: admitted.dispatch.ownerId!,
+      dispatchLeaseEpoch: admitted.dispatch.leaseEpoch,
+    }), true);
+    await pool.query(
+      `UPDATE turn_recovery_jobs SET next_attempt_at=NOW() WHERE job_id=$1`,
+      [jobId],
+    );
+    const [reclaimed] = await claimDueRecoveryJobs(pool, {
+      userId: UID,
+      ownerId: "master-after-send-unknown",
+      leaseMs: 120_000,
+      limit: 1,
+    });
+    assert.ok(reclaimed);
+    const replayed = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: identity.clientMessageId,
+      billingRequestId: `brq-replayed-${identity.clientMessageId}`,
+      dispatchId: randomUUID(),
+      message: {
+        id: identity.clientMessageId,
+        role: "user",
+        text: "automatic checkpoint",
+        ts: 3,
+      } as MessageLike & { id: string },
+      recovery: {
+        sourceClientMessageId,
+        mode: "checkpoint",
+        automatic: true,
+        rootClientMessageId: sourceClientMessageId,
+        attempt: 1,
+        max: 10,
+      },
+      recoveryJob: {
+        jobId,
+        leaseOwner: reclaimed.leaseOwner,
+        leaseEpoch: reclaimed.leaseEpoch,
+      },
+    }));
+    assert.equal(replayed.kind, "admitted");
+    if (replayed.kind !== "admitted") return;
+    assert.equal(replayed.dispatch.dispatchId, admitted.dispatch.dispatchId);
+    assert.equal(replayed.dispatch.attemptNo, admitted.dispatch.attemptNo);
+    assert.ok(replayed.dispatch.leaseEpoch > admitted.dispatch.leaseEpoch);
+    assert.equal(await markRecoveryContainerReceipt(pool, {
+      dispatchId: replayed.dispatch.dispatchId,
+      dispatchAttemptNo: replayed.dispatch.attemptNo,
+      expectedDispatchLeaseEpoch: replayed.dispatch.leaseEpoch,
+    }), true);
+    const committed = (
+      await pool.query<{ status: string; container_receipt_at: Date | null }>(
+        `SELECT status,container_receipt_at FROM turn_recovery_jobs WHERE job_id=$1`,
+        [jobId],
+      )
+    ).rows[0]!;
+    assert.equal(committed.status, "forwarded");
+    assert.ok(committed.container_receipt_at instanceof Date);
+    assert.equal((await getDispatch(pool, replayed.dispatch.dispatchId))?.status, "accepted");
+  });
+
   maybe("lossless tape waiver recovery rejects completed, missing, and non-recoverable waivers", async () => {
     const cases = [
       { suffix: "completed", tapeStatus: "completed" as const, waiveReason: "idle_timeout" as const },
@@ -4442,7 +4579,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     await casToTerminal(pool, {
       dispatchId: (recovered as { dispatch: { dispatchId: string } }).dispatch.dispatchId,
       outcome: "executed_error",
-      failureCode: "upstream_failed",
+      failureCode: "model_authority_unavailable",
       clientNotified: true,
     });
     await backend.appendServerAuthoredMessage(sessionId, CUSER, {
@@ -4452,14 +4589,22 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       ts: 4,
       _source: "server",
       _clientMessageId: identity.clientMessageId,
-      _errorCode: "upstream_failed",
+      _errorCode: "model_authority_unavailable",
     });
     const secondTapeId = sha256(`recoverable-tape\0${sessionId}\0${identity.clientMessageId}`);
+    const secondTerminal = Buffer.from(JSON.stringify({
+      id: `tape-error-${identity.clientMessageId}`,
+      role: "assistant",
+      text: "temporary control-plane failure",
+      ts: 4,
+      _clientMessageId: identity.clientMessageId,
+      _errorCode: "model_authority_unavailable",
+    }));
     await pool.query(
       `INSERT INTO client_session_turn_tapes
          (session_id,user_id,tape_id,agent_id,turn_index,status,turn_key,tape_sha256,
           total_bytes,part_count,created_at,finalized_at,client_message_id)
-       VALUES ($1,$2,$3,'main',2,'crashed',$4,$5,1,1,1,1,$6)`,
+       VALUES ($1,$2,$3,'main',2,'crashed',$4,$5,$7,1,1,1,$6)`,
       [
         sessionId,
         CUSER,
@@ -4467,6 +4612,20 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         sha256(`recoverable-turn\0${sessionId}\0${identity.clientMessageId}`),
         sha256(secondTapeId),
         identity.clientMessageId,
+        secondTerminal.length,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO client_session_turn_tape_records
+         (session_id,user_id,tape_id,msg_id,ordinal,role,ts,content_sha256,payload)
+       VALUES ($1,$2,$3,$4,0,'assistant',4,$5,$6)`,
+      [
+        sessionId,
+        CUSER,
+        secondTapeId,
+        `tape-error-${identity.clientMessageId}`,
+        sha256(secondTerminal),
+        secondTerminal,
       ],
     );
     const secondIdentity = turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 2);

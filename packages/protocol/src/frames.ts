@@ -32,6 +32,11 @@ export const PERSISTED_CLIENT_MESSAGE_ID_RE = new RegExp(PERSISTED_CLIENT_MESSAG
 export const isPersistedClientMessageId = (value: unknown): value is string =>
   typeof value === 'string' && PERSISTED_CLIENT_MESSAGE_ID_RE.test(value)
 const ClientMessageId = Type.String({ pattern: CLIENT_MESSAGE_ID_PATTERN })
+export const CONTROL_ID_PATTERN = '^[A-Za-z0-9._:-]{1,128}$'
+export const CONTROL_ID_RE = new RegExp(CONTROL_ID_PATTERN)
+export const isControlId = (value: unknown): value is string =>
+  typeof value === 'string' && CONTROL_ID_RE.test(value)
+const ControlId = Type.String({ pattern: CONTROL_ID_PATTERN })
 
 /**
  * Server-persisted workspace policy for a client session. The commercial
@@ -270,6 +275,9 @@ export type InboundMessage = Static<typeof InboundMessage>
 
 export const InboundControlStop = Type.Object({
   type: Type.Literal('inbound.control.stop'),
+  /** Stable browser-authored identity. The commercial Master durably owns
+   * delivery and deduplication; old clients may omit it during rollout. */
+  controlId: Type.Optional(ControlId),
   sessionKey: Type.Optional(Type.String()),
   channel: Type.String(),
   peer: Peer,
@@ -283,6 +291,8 @@ export type InboundControlStop = Static<typeof InboundControlStop>
 
 export const InboundPermissionResponse = Type.Object({
   type: Type.Literal('inbound.permission_response'),
+  /** Stable response identity for durable Master→runtime delivery. */
+  controlId: Type.Optional(ControlId),
   channel: Type.String(),
   peer: Peer,
   agentId: Type.Optional(Type.String()),
@@ -902,6 +912,27 @@ export const OutboundPermissionSettled = Type.Object({
 })
 export type OutboundPermissionSettled = Static<typeof OutboundPermissionSettled>
 
+/** Durable control lifecycle. `persisted` is authored by the commercial
+ * Master after PostgreSQL commit; `applied`/`terminal` are runtime receipts
+ * relayed by the Master.  The UI never has to infer success from a socket
+ * close or from the disappearance of a local button. */
+export const OutboundControlReceipt = Type.Object({
+  type: Type.Literal('outbound.control.receipt'),
+  controlId: ControlId,
+  controlKind: Type.Union([Type.Literal('stop'), Type.Literal('permission')]),
+  status: Type.Union([
+    Type.Literal('persisted'),
+    Type.Literal('applied'),
+    Type.Literal('terminal'),
+  ]),
+  peer: Type.Optional(Peer),
+  clientMessageId: Type.Optional(ClientMessageId),
+  requestId: Type.Optional(Type.String()),
+  attempt: Type.Optional(Type.Integer({ minimum: 1 })),
+  errorCode: Type.Optional(Type.String()),
+})
+export type OutboundControlReceipt = Static<typeof OutboundControlReceipt>
+
 // ───────────────────────────────────────────────
 // Resume-failed notification (gateway → client)
 //
@@ -1266,6 +1297,7 @@ export const AnyFrame = Type.Union([
   OutboundMessage,
   OutboundPermissionRequest,
   OutboundPermissionSettled,
+  OutboundControlReceipt,
   OutboundResumeFailed,
   OutboundActiveTurnReplayStart,
   OutboundError,

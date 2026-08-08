@@ -4652,6 +4652,15 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       teamMode: false,
     });
     sock.stopTurn("s1");
+    const stopped = session._stopSettlement!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stopped.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: stopped.clientMessageId,
+    }) });
 
     sock.retryMessage({ sessId: "s1", msgId: userMessage.id, agentId: "main" });
 
@@ -4759,10 +4768,20 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     // 用户 Stop 只停止当前轮，后面的手动消息保留但绝不自动发出。
     sock.stopTurn("s1");
-    expect(s._sendingInFlight).toBeFalsy();
+    expect(s._sendingInFlight).toBe(true);
     expect(ws.sent.some((d) => d.includes('"inbound.message"') && d.includes("second"))).toBe(false);
     expect(s.messages.find((m) => m.text === "second")?.status).toBe("queued");
     expect(sock.toStored("s1")?._dispatchPaused).toBe(true);
+    const stop = s._stopSettlement!;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: firstId,
+    }) });
+    expect(s._sendingInFlight).toBe(false);
 
     // 下一次用户主动发送是明确恢复动作：旧 queued 仍按 FIFO 先发，新消息排在后面。
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "third" });
@@ -4795,12 +4814,18 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       .map((raw) => JSON.parse(raw))
       .find((frame) => frame.type === "inbound.control.stop");
     expect(stop).toMatchObject({
+      controlId: `control:stop:${clientMessageId}`,
       agentId: "main",
       clientMessageId,
       peer: { id: "s1", kind: "dm" },
     });
     expect(s.agentId).toBe("coding-assistant");
-    expect(s._sendingInFlight).toBe(false);
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._stopSettlement).toMatchObject({
+      clientMessageId,
+      controlId: stop.controlId,
+      phase: "awaiting_receipt",
+    });
     sock.stop();
   });
 
@@ -4816,6 +4841,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       createdAt: now - 1000,
       lastAt: now - 1000,
       _sendingInFlight: true,
+      _activeClientMessageId: "u1",
       _turnStartedAt: now - 1000,
       _lastFrameAt: now - 500,
       _lastFrameSeqByKey: { "agent:main:webchat:dm:s1": 7 },
@@ -5068,7 +5094,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       blocks: [{ kind: "text", text: "late after Stop" }],
     })) });
     expect(active.messages.some((message) => message.text === "late after Stop")).toBe(false);
-    expect(active._sendingInFlight).toBe(false);
+    expect(active._sendingInFlight).toBe(true);
     expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
@@ -5079,9 +5105,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       isFinal: true,
       meta: { interrupted: "user_cancelled" },
     })) });
-    expect(active._stopSettlement?.phase).toBe("sync");
-    expect(syncSession).toHaveBeenCalled();
-    await vi.waitFor(() => expect(active._stopSettlement).toBeUndefined());
+    expect(active._stopSettlement).toBeUndefined();
     expect(active._sendingInFlight).toBe(false);
     expect((sock as any).offlineQueue).toHaveLength(0);
     await vi.waitFor(() => expect(sock.isSessionBusy("s1")).toBe(false));
@@ -5211,7 +5235,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("stopTurn clears and persists pending turn state immediately", () => {
+  test("stopTurn persists the exact active identity without claiming remote completion", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const persistSession = vi.fn();
     const sock = makeSocket({ persistSession });
@@ -5223,16 +5247,32 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     sock.stopTurn("s1");
 
-    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(false);
+    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(true);
     const stored = sock.toStored("s1")!;
-    expect(stored._sendingInFlight).toBeFalsy();
+    expect(stored._sendingInFlight).toBe(true);
+    expect(stored._activeClientMessageId).toBe(stored.messages.find((m) => m.role === "user")!.id);
     expect(typeof stored._trackerResetAt).toBe("number");
     expect(stored._localTeardownAt).toBe(stored._trackerResetAt);
     expect(persistSession).toHaveBeenCalledWith("s1");
     expect(ws.sent.some((d) => d.includes('"inbound.control.stop"'))).toBe(true);
+    const stop = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.control.stop");
 
     const reloaded = makeSocket();
-    reloaded.loadStored(stored);
+    reloaded.loadStored({
+      ...stored,
+      _pendingControls: [{
+        kind: "control",
+        sessId: "s1",
+        controlId: stop.controlId,
+        controlKind: "stop",
+        clientMessageId: stored._activeClientMessageId,
+        agentId: "main",
+        payload: stop,
+        enqueuedAt: Date.now(),
+        attempt: 1,
+        status: "persisted",
+      }],
+    });
     const restored = reloaded.sessions.get("s1")!;
     const onLiveFrame = vi.fn();
     applyOutboundMessage(
@@ -5244,17 +5284,14 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       }),
       { onLiveFrame },
     );
-    expect(restored._sendingInFlight).toBe(false);
+    expect(restored._sendingInFlight).toBe(true);
     expect(restored.messages.some((m) => m.text === "stale after stop+refresh")).toBe(false);
     expect(onLiveFrame).not.toHaveBeenCalled();
   });
 
-  test("online Stop stays busy through exact terminal and authoritative sync", async () => {
+  test("legacy exact terminal remains authoritative and clears a durable Stop", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    let resolveSync!: (value: boolean) => void;
-    const syncSession = vi.fn(() => new Promise<boolean>((resolve) => {
-      resolveSync = resolve;
-    }));
+    const syncSession = vi.fn();
     const sock = makeSocket({ syncSession });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
@@ -5270,8 +5307,12 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     })) });
 
     sock.stopTurn("s1");
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._stopSettlement).toMatchObject({
+      clientMessageId,
+      controlId: `control:stop:${clientMessageId}`,
+      phase: "awaiting_receipt",
+    });
     expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
@@ -5282,19 +5323,13 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       isFinal: true,
       meta: { stopReason: "end_turn" },
     })) });
-    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "sync" });
+    expect(session._stopSettlement).toBeUndefined();
     expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId });
-    expect(sock.isSessionBusy("s1")).toBe(true);
-
-    session.messages.find((m) => m.role === "assistant")!.text = "authoritative complete";
-    expect(sock.isSessionBusy("s1")).toBe(true);
-    resolveSync(true);
-    await vi.waitFor(() => expect(sock.isSessionBusy("s1")).toBe(false));
-    expect(session.messages.find((m) => m.role === "assistant")!.text).toBe("authoritative complete");
+    expect(sock.isSessionBusy("s1")).toBe(false);
     sock.stop();
   });
 
-  test("exact terminal cannot release Stop without an authoritative sync result", () => {
+  test("exact terminal releases Stop without requiring an extra REST success", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -5314,8 +5349,44 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       meta: { stopReason: "end_turn" },
     })) });
 
-    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "sync" });
-    expect(sock.isSessionBusy("s1")).toBe(true);
+    expect(session._stopSettlement).toBeUndefined();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    sock.stop();
+  });
+
+  test("a resend attempt gets a fresh Stop control identity", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "retryable task" });
+    const session = sock.sessions.get("s1")!;
+    const user = session.messages.find((m) => m.role === "user")!;
+    const clientMessageId = user.id;
+
+    sock.stopTurn("s1");
+    const first = ws.sent.map((raw) => JSON.parse(raw)).filter(
+      (frame) => frame.type === "inbound.control.stop",
+    ).at(-1);
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: first.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+
+    user.status = "error";
+    sock.retryMessage({ sessId: "s1", msgId: clientMessageId, agentId: "main" });
+    expect(user._sendAttempt).toBe(1);
+    sock.stopTurn("s1");
+    const stops = ws.sent.map((raw) => JSON.parse(raw)).filter(
+      (frame) => frame.type === "inbound.control.stop",
+    );
+    expect(stops.at(-1).controlId).toBe(`control:stop:${clientMessageId}:attempt:1`);
+    expect(stops.at(-1).controlId).not.toBe(first.controlId);
     sock.stop();
   });
 
@@ -5333,62 +5404,72 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     (sock as any).effects().forceSync("s1", { clientMessageId });
     await Promise.resolve();
-    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(session._stopSettlement).toMatchObject({
+      clientMessageId,
+      controlId: `control:stop:${clientMessageId}`,
+      phase: "awaiting_receipt",
+    });
     expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
       frameSeq: 1,
       ts: Date.now() + 1,
+      clientMessageId: "other-turn-a",
       blocks: [],
       isFinal: true,
       meta: { stopReason: "end_turn" },
     })) });
     await Promise.resolve();
-    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(session._stopSettlement).toMatchObject({ clientMessageId, phase: "awaiting_receipt" });
     expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
       frameSeq: 2,
       ts: Date.now() + 2,
-      clientMessageId: "other-turn",
+      clientMessageId: "other-turn-b",
       blocks: [],
       isFinal: true,
       meta: { stopReason: "end_turn" },
     })) });
     await Promise.resolve();
-    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(session._stopSettlement).toMatchObject({ clientMessageId, phase: "awaiting_receipt" });
     expect(sock.isSessionBusy("s1")).toBe(true);
     sock.stop();
   });
 
-  test("failed terminal sync settles on a later reconciliation", async () => {
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const syncSession = vi.fn()
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
-    const sock = makeSocket({ syncSession });
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+  test("restored exact in-flight turn retries REST with backoff until authority completes it", async () => {
+    vi.useFakeTimers();
+    let sock!: ChatSocket;
+    const syncSession = vi.fn(async () => {
+      if (syncSession.mock.calls.length === 1) return false;
+      const session = sock.sessions.get("s1")!;
+      session._sendingInFlight = false;
+      session._activeClientMessageId = undefined;
+      return true;
+    });
+    sock = makeSocket({ syncSession });
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u-old", role: "user", text: "long task", ts: now - 20 * 60_000, status: "sent" }],
+      createdAt: now - 20 * 60_000,
+      lastAt: now - 20 * 60_000,
+      _sendingInFlight: true,
+      _activeClientMessageId: "u-old",
+      _turnStartedAt: now - 20 * 60_000,
+    });
     const session = sock.sessions.get("s1")!;
-    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
-    sock.stopTurn("s1");
-    ws.onmessage?.({ data: JSON.stringify(msgFrame({
-      frameSeq: 1,
-      ts: Date.now() + 1,
-      clientMessageId,
-      blocks: [],
-      isFinal: true,
-      meta: { stopReason: "end_turn" },
-    })) });
-    await vi.waitFor(() => expect(syncSession).toHaveBeenCalledTimes(1));
-    expect(session._stopSettlement?.phase).toBe("sync");
-    expect(sock.isSessionBusy("s1")).toBe(true);
 
-    (sock as any).reconcileSession("s1");
-    await vi.waitFor(() => expect(syncSession).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(sock.isSessionBusy("s1")).toBe(false));
+    await Promise.resolve();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    expect(session._recoveryStatus).toMatchObject({ kind: "retrying", errorCode: "sync_failed" });
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    expect(session._reconciling).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("completed");
     sock.stop();
   });
 
@@ -5405,26 +5486,225 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const teardownAt = session._localTeardownAt;
 
     expect((sock as any).confirmDispatchAdmission("s1", clientMessageId)).toBe(true);
-    expect(session._sendingInFlight).toBe(false);
+    expect(session._sendingInFlight).toBe(true);
     expect(session._localTeardownAt).toBe(teardownAt);
-    expect(session._stopSettlement).toEqual({ clientMessageId, phase: "terminal" });
+    expect(session._stopSettlement).toMatchObject({ clientMessageId, phase: "awaiting_receipt" });
     sock.stop();
   });
 
-  test("failed Stop transport does not create an unfinishable settlement", () => {
+  test("failed Stop transport keeps the exact turn active and durably retries the same control", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
+    const persistPendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ persistPendingControl });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "queued task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
     ws.bufferedAmount = Number.MAX_SAFE_INTEGER;
 
     sock.stopTurn("s1");
+    await vi.waitFor(() => expect(persistPendingControl).toHaveBeenCalledTimes(1));
 
+    expect(session._stopSettlement).toMatchObject({
+      clientMessageId,
+      phase: "persisting",
+    });
+    expect(session._sendingInFlight).toBe(true);
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    sock.stop();
+  });
+
+  test("a failed control journal never leaks onto the wire or reorders a later same-session decision", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let rejectedStop = false;
+    const persistPendingControl = vi.fn(async (item: { controlKind: string }) => {
+      if (item.controlKind === "stop" && !rejectedStop) {
+        rejectedStop = true;
+        throw new Error("idb unavailable");
+      }
+    });
+    const sock = makeSocket({ persistPendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
     const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+
+    sock.stopTurn("s1");
+    await Promise.resolve();
+    addMessage(session, "permission", "Bash", { requestId: "req-after-stop", _resolved: false });
+    sock.respondPermission({ sessId: "s1", requestId: "req-after-stop", behavior: "deny" });
+    await Promise.resolve();
+    const controlFrames = () => ws.sent
+      .map((raw) => JSON.parse(raw))
+      .filter((frame) => frame.type === "inbound.control.stop" || frame.type === "inbound.permission_response");
+    expect(controlFrames()).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(controlFrames().map((frame) => frame.type)).toEqual([
+      "inbound.control.stop",
+      "inbound.permission_response",
+    ]);
+    sock.stop();
+  });
+
+  test("legacy active turn without an exact client id still uses a durable peer-scoped Stop", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistPendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ persistPendingControl });
+    const session = sock.ensureSession("s1", "main");
+    session._sendingInFlight = true;
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+
+    sock.stopTurn("s1");
+    await vi.waitFor(() => expect(persistPendingControl).toHaveBeenCalledTimes(1));
+    const stop = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.control.stop");
+    expect(stop.controlId).toMatch(/^control:stop:/);
+    expect(stop.clientMessageId).toBeUndefined();
+    expect(session._sendingInFlight).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+    }) });
+    expect(session._sendingInFlight).toBe(false);
     expect(session._stopSettlement).toBeUndefined();
-    expect(sock.isSessionBusy("s1")).toBe(false);
+    sock.stop();
+  });
+
+  test("online Stop stays busy through exact terminal and authoritative sync", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let commit!: () => void;
+    const persistPendingControl = vi.fn(() => new Promise<void>((resolve) => { commit = resolve; }));
+    const deletePendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ persistPendingControl, deletePendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+
+    sock.stopTurn("s1");
+    expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.control.stop")).toBe(false);
+    expect(session._sendingInFlight).toBe(true);
+    commit();
+    await vi.waitFor(() => expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.control.stop")).toBe(true));
+    const stop = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.control.stop");
+    expect(stop.controlId).toBe(`control:stop:${clientMessageId}`);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "persisted",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+      attempt: 1,
+    }) });
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._stopSettlement?.phase).toBe("persisted");
+    expect(session._recoveryStatus?.kind).toBe("stopping");
+    expect(deletePendingControl).not.toHaveBeenCalled();
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "applied",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+    expect(session._sendingInFlight).toBe(true);
+    expect(session._stopSettlement?.phase).toBe("persisted");
+    expect(deletePendingControl).not.toHaveBeenCalled();
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: stop.controlId,
+      controlKind: "stop",
+      status: "terminal",
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId,
+    }) });
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._stopSettlement).toBeUndefined();
+    expect(session._recoveryStatus?.kind).toBe("completed");
+    expect(deletePendingControl).toHaveBeenCalledWith("s1", stop.controlId);
+    sock.stop();
+  });
+
+  test("permission decision is durable and remains unresolved until Master applied receipt", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistPendingControl = vi.fn().mockResolvedValue(undefined);
+    const deletePendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ persistPendingControl, deletePendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const session = sock.ensureSession("s1", "main");
+    const permission = addMessage(session, "permission", "Bash", {
+      requestId: "req-1",
+      _resolved: false,
+    });
+
+    sock.respondPermission({ sessId: "s1", requestId: "req-1", behavior: "allow" });
+    await vi.waitFor(() => expect(ws.sent.some((raw) => JSON.parse(raw).type === "inbound.permission_response")).toBe(true));
+    const decision = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.permission_response");
+    expect(decision.controlId).toBe("control:permission:req-1:allow");
+    expect(permission._resolved).toBe(false);
+    expect(permission._controlPending).toBe(true);
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: decision.controlId,
+      controlKind: "permission",
+      status: "persisted",
+      peer: { id: "s1", kind: "dm" },
+      requestId: "req-1",
+    }) });
+    expect(permission._resolved).toBe(false);
+    expect(deletePendingControl).not.toHaveBeenCalled();
+
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt",
+      controlId: decision.controlId,
+      controlKind: "permission",
+      status: "applied",
+      peer: { id: "s1", kind: "dm" },
+      requestId: "req-1",
+    }) });
+    expect(permission._resolved).toBe(true);
+    expect(permission._behavior).toBe("allow");
+    expect(permission._controlPending).toBe(false);
+    expect(session._recoveryStatus?.kind).toBe("resumed");
+    expect(deletePendingControl).toHaveBeenCalledWith("s1", decision.controlId);
     sock.stop();
   });
 

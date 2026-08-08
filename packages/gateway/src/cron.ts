@@ -29,7 +29,17 @@
 // Job output: run_id + timestamp written to ~/.openclaude/cron/outputs/<id>-<ts>.md.
 // If the agent's final text starts with [SILENT], output is archived but not delivered.
 
-import { existsSync } from 'node:fs'
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs'
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
@@ -65,6 +75,187 @@ const logger = createLogger({ module: 'cron' })
 
 const LAST_RUN_FILE = join(paths.home, 'cron', 'last-run.json')
 const RETRY_STATE_FILE = join(paths.home, 'cron', 'retry-state.json')
+const OCCURRENCE_DIR = join(paths.home, 'cron', 'occurrences')
+const OCCURRENCE_SETTLED_DIR = join(paths.home, 'cron', 'occurrences-settled')
+const OCCURRENCE_TAPE_DIR = join(paths.home, 'cron', 'occurrence-tapes')
+
+type CronOccurrenceState =
+  | 'prepared'
+  | 'executing'
+  | 'completed'
+  | 'delivery_pending'
+  | 'delivered'
+  | 'delivery_terminal'
+  | 'execution_terminal'
+  | 'needs_confirmation'
+
+interface CronOccurrenceRecord {
+  version: 1
+  deliveryId: string
+  jobId: string
+  dueMinuteKey: number
+  schedule: string
+  state: CronOccurrenceState
+  sessionKey: string
+  tapeEvents: number
+  outputFile?: string
+  updatedAt: number
+}
+
+export function classifyCronOccurrenceRecovery(
+  record: Pick<CronOccurrenceRecord, 'state'> & Partial<Pick<CronOccurrenceRecord, 'tapeEvents' | 'outputFile'>>,
+  executionTape: readonly unknown[] = [],
+): 'rerun' | 'deliver_only' | 'done' | 'unknown' {
+  if (record.state === 'prepared') return 'rerun'
+  if (record.state === 'executing' && cronExecutionTapeIsReplaySafe(executionTape)) return 'rerun'
+  if (
+    (record.state === 'completed' || record.state === 'delivery_pending') &&
+    typeof record.outputFile === 'string'
+  ) return 'deliver_only'
+  if (
+    record.state === 'delivered' ||
+    record.state === 'delivery_terminal' ||
+    record.state === 'execution_terminal' ||
+    record.state === 'needs_confirmation'
+  ) return 'done'
+  // Once submit_started is durable, even an empty tape cannot prove that no
+  // tool ran immediately before the process died. Safe-tool replay remains
+  // fail-closed until the complete exposed tool set can be proven read-only.
+  return 'unknown'
+}
+
+const CRON_RECOVERY_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep'])
+
+/** A post-submit retry is allowed only when the fsynced tape proves that at
+ * least one tool ran, every tool is in the exact read-only registry, and every
+ * observed use has its matching terminal result. Empty/partial/unknown tapes
+ * deliberately require confirmation rather than repeating effects. */
+export function cronExecutionTapeIsReplaySafe(events: readonly unknown[]): boolean {
+  const pending = new Map<string, string>()
+  let observedTool = false
+  for (const value of events) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const event = value as Record<string, unknown>
+    if (event.kind === 'permission_request') return false
+    if (event.kind === 'tool_use_detected') {
+      const tool = event.tool
+      if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return false
+      const row = tool as Record<string, unknown>
+      if (
+        typeof row.id !== 'string' || !row.id ||
+        typeof row.name !== 'string' || !CRON_RECOVERY_READ_ONLY_TOOLS.has(row.name)
+      ) return false
+      observedTool = true
+      pending.set(row.id, row.name)
+    }
+    if (event.kind === 'block') {
+      const block = event.block
+      if (!block || typeof block !== 'object' || Array.isArray(block)) return false
+      const row = block as Record<string, unknown>
+      if (row.kind === 'tool_use') {
+        if (
+          typeof row.blockId !== 'string' || !row.blockId ||
+          typeof row.toolName !== 'string' || !CRON_RECOVERY_READ_ONLY_TOOLS.has(row.toolName)
+        ) return false
+        observedTool = true
+        pending.set(row.blockId, row.toolName)
+      } else if (row.kind === 'tool_result') {
+        if (
+          typeof row.toolUseBlockId !== 'string' ||
+          typeof row.toolName !== 'string' ||
+          pending.get(row.toolUseBlockId) !== row.toolName
+        ) return false
+        pending.delete(row.toolUseBlockId)
+      }
+    }
+    if (event.kind === 'tool_result_detected') {
+      const result = event.result
+      if (!result || typeof result !== 'object' || Array.isArray(result)) return false
+      const row = result as Record<string, unknown>
+      if (
+        typeof row.toolUseId !== 'string' ||
+        typeof row.toolName !== 'string' ||
+        pending.get(row.toolUseId) !== row.toolName
+      ) return false
+      pending.delete(row.toolUseId)
+    }
+  }
+  return observedTool && pending.size === 0
+}
+
+function occurrencePath(deliveryId: string): string {
+  return join(OCCURRENCE_DIR, `${deliveryId}.json`)
+}
+
+function durableJsonWrite(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const temporary = `${path}.${process.pid}.${++_writeCounter}.tmp`
+  const fd = openSync(temporary, 'w', 0o600)
+  try {
+    writeFileSync(fd, JSON.stringify(value, null, 2))
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  renameSync(temporary, path)
+  const dir = openSync(dirname(path), 'r')
+  try { fsyncSync(dir) } finally { closeSync(dir) }
+}
+
+function writeOccurrence(record: CronOccurrenceRecord): void {
+  durableJsonWrite(occurrencePath(record.deliveryId), record)
+}
+
+function settleOccurrence(
+  record: CronOccurrenceRecord,
+  state: 'delivered' | 'delivery_terminal' | 'execution_terminal' | 'needs_confirmation' = 'delivered',
+): void {
+  writeOccurrence({ ...record, state, updatedAt: Date.now() })
+  mkdirSync(OCCURRENCE_SETTLED_DIR, { recursive: true })
+  renameSync(
+    occurrencePath(record.deliveryId),
+    join(OCCURRENCE_SETTLED_DIR, `${record.deliveryId}.json`),
+  )
+  for (const directory of [OCCURRENCE_DIR, OCCURRENCE_SETTLED_DIR]) {
+    const fd = openSync(directory, 'r')
+    try { fsyncSync(fd) } finally { closeSync(fd) }
+  }
+}
+
+function readOccurrence(deliveryId: string): CronOccurrenceRecord | null {
+  try {
+    const raw = JSON.parse(readFileSync(occurrencePath(deliveryId), 'utf8')) as CronOccurrenceRecord
+    return raw?.version === 1 && raw.deliveryId === deliveryId ? raw : null
+  } catch {
+    return null
+  }
+}
+
+function appendOccurrenceTape(deliveryId: string, event: unknown): number {
+  mkdirSync(OCCURRENCE_TAPE_DIR, { recursive: true })
+  const path = join(OCCURRENCE_TAPE_DIR, `${deliveryId}.jsonl`)
+  const fd = openSync(path, 'a', 0o600)
+  try {
+    appendFileSync(fd, `${JSON.stringify({ observedAt: Date.now(), event })}\n`)
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  const record = readOccurrence(deliveryId)
+  return (record?.tapeEvents ?? 0) + 1
+}
+
+function readOccurrenceTape(deliveryId: string): unknown[] {
+  try {
+    return readFileSync(join(OCCURRENCE_TAPE_DIR, `${deliveryId}.jsonl`), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { event?: unknown })
+      .map((row) => row.event)
+  } catch {
+    return []
+  }
+}
 
 // 连续「余额不足」失败自动暂停阈值。余额不足是**持续性**失败(用户不充值不会自愈),
 // 放任任务按 schedule 空转 = 每次产出同一段 "API Error: 402…"(线上事故:每 5 分钟
@@ -117,8 +308,19 @@ export async function deliverCronViaAdapter<T>(
 interface CronRunDurabilityHooks {
   /** Persist the owned due occurrence before submit can execute tools. */
   consumeOccurrence(): Promise<void>
+  /** Cross the fail-closed boundary immediately before submit can run tools. */
+  markSubmitStarted?(): Promise<void>
+  /** Append-only, fsynced observation tape. */
+  recordEvent?(event: unknown): void
+  /** Persist the immutable archived result before delivery. */
+  markCompleted?(outputFile: string): Promise<void>
+  markDelivered?(): Promise<void>
+  markDeliveryTerminal?(): Promise<void>
   /** Persist the archived delivery payload before the first channel send. */
   stageDelivery(outputFile: string): Promise<void>
+  /** Convert an executing occurrence back to prepared only when its fsynced
+   * tool tape proves full read-only completion. */
+  recoverInterruptedExecution?(): Promise<boolean>
 }
 
 export const CRON_MAX_ATTEMPTS = 4
@@ -143,7 +345,8 @@ export function planCronRetry(
   const failures = previous?.dueMinuteKey === args.dueMinuteKey && previous.schedule === args.schedule && samePhase
     ? previous.failures + 1
     : 1
-  if (failures >= CRON_MAX_ATTEMPTS) return { kind: 'exhausted', attempts: failures }
+  if (phase !== 'delivery' && failures >= CRON_MAX_ATTEMPTS)
+    return { kind: 'exhausted', attempts: failures }
   const delayMs = CRON_RETRY_DELAYS_MS[Math.min(failures - 1, CRON_RETRY_DELAYS_MS.length - 1)]
   return {
     kind: 'retry',
@@ -173,7 +376,8 @@ function stableCronErrorClass(err: unknown): string {
 
 /** Unknown delivery exceptions are transient by default. A delivery adapter
  * may explicitly tag a stable code with retryable=false for a permanent target
- * rejection; bounded cron retries still terminate after CRON_MAX_ATTEMPTS. */
+ * rejection. Transient delivery retries retain the immutable archived payload
+ * and back off indefinitely; they never re-run the Agent. */
 export function deliveryFailureOutcome(err: unknown):
   | { kind: 'terminal_failure'; code: string }
   | { kind: 'retryable_failure'; code: string } {
@@ -438,7 +642,7 @@ async function loadRetryState(): Promise<Map<string, CronRetryEntry>> {
         typeof row.schedule === 'string' && row.schedule.length <= 128 &&
         Number.isSafeInteger(row.failures) &&
         Number(row.failures) >= (phase === 'delivery' ? 0 : 1) &&
-        Number(row.failures) < CRON_MAX_ATTEMPTS &&
+        (phase === 'delivery' || Number(row.failures) < CRON_MAX_ATTEMPTS) &&
         Number.isSafeInteger(row.nextAttemptAt) && Number(row.nextAttemptAt) >= 0 &&
         typeof row.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(row.code) &&
         validOutput
@@ -462,6 +666,29 @@ async function saveRetryState(map: Map<string, CronRetryEntry>): Promise<void> {
   const tmp = RETRY_STATE_FILE + `.${process.pid}.${++_writeCounter}.tmp`
   await writeFile(tmp, JSON.stringify(Object.fromEntries(map), null, 2))
   await rename(tmp, RETRY_STATE_FILE)
+}
+
+async function loadOccurrenceRecords(): Promise<CronOccurrenceRecord[]> {
+  if (!existsSync(OCCURRENCE_DIR)) return []
+  const records: CronOccurrenceRecord[] = []
+  for (const name of await readdir(OCCURRENCE_DIR)) {
+    if (!name.endsWith('.json')) continue
+    try {
+      const row = JSON.parse(await readFile(join(OCCURRENCE_DIR, name), 'utf8')) as CronOccurrenceRecord
+      if (
+        row?.version === 1 &&
+        typeof row.deliveryId === 'string' &&
+        name === `${row.deliveryId}.json` &&
+        typeof row.jobId === 'string' &&
+        Number.isSafeInteger(row.dueMinuteKey) &&
+        typeof row.schedule === 'string' &&
+        typeof row.sessionKey === 'string'
+      ) records.push(row)
+    } catch {
+      // Invalid/torn records are fail-closed and never authorize execution.
+    }
+  }
+  return records
 }
 
 /** Atomically write a YAML file by writing to a unique .tmp then renaming. */
@@ -916,11 +1143,16 @@ export class CronScheduler {
       const now = new Date()
       const localNow = getLocalDate()
       const agentsConfig = await readAgentsConfig()
+      const occurrenceRecords = await loadOccurrenceRecords()
+      const pendingOccurrenceJobs = new Set(
+        occurrenceRecords.filter((row) => row.state !== 'delivered').map((row) => row.jobId),
+      )
 
       // Cleanup: remove completed oneshot jobs from yaml
       const before = file.jobs.length
       file.jobs = file.jobs.filter((j) => !(
-        j.oneshot && j.enabled === false && !this.retryState.has(j.id)
+        j.oneshot && j.enabled === false && !this.retryState.has(j.id) &&
+        !pendingOccurrenceJobs.has(j.id)
       ))
       if (file.jobs.length < before) {
         await atomicWriteYaml(paths.cronYaml, file)
@@ -934,6 +1166,91 @@ export class CronScheduler {
       let retryStateDirty = false
       const completedRetryIds = new Set<string>()
       const liveJobs = new Map(file.jobs.map((job) => [job.id, job]))
+      for (const occurrence of occurrenceRecords) {
+        const job = liveJobs.get(occurrence.jobId)
+        if (!job || job.schedule !== occurrence.schedule) continue
+        const recovery = classifyCronOccurrenceRecovery(
+          occurrence,
+          occurrence.state === 'executing' ? readOccurrenceTape(occurrence.deliveryId) : [],
+        )
+        if (recovery === 'rerun') {
+          if (occurrence.state === 'executing') {
+            writeOccurrence({ ...occurrence, state: 'prepared', updatedAt: Date.now() })
+          }
+          const existing = this.retryState.get(job.id)
+          if (!existing || existing.deliveryId !== occurrence.deliveryId) {
+            this.retryState.set(job.id, {
+              dueMinuteKey: occurrence.dueMinuteKey,
+              schedule: occurrence.schedule,
+              failures: 1,
+              nextAttemptAt: 0,
+              code: 'OCCURRENCE_PREPARED',
+              phase: 'execution',
+              deliveryId: occurrence.deliveryId,
+            })
+            retryStateDirty = true
+          }
+        } else if (recovery === 'deliver_only' && (job.deliver ?? 'local') === 'local') {
+          // Execution and archive are already durable; local delivery is a
+          // no-op, so a crash between markCompleted and markDelivered is done.
+          settleOccurrence(occurrence)
+        } else if (recovery === 'deliver_only') {
+          const outputFile = occurrence.outputFile
+          const existing = this.retryState.get(job.id)
+          if (
+            outputFile && outputFile === basename(outputFile) &&
+            !(existing?.phase === 'delivery' && existing.deliveryId === occurrence.deliveryId)
+          ) {
+            this.retryState.set(job.id, {
+              dueMinuteKey: occurrence.dueMinuteKey,
+              schedule: occurrence.schedule,
+              failures: 0,
+              nextAttemptAt: 0,
+              code: 'DELIVERY_PENDING',
+              phase: 'delivery',
+              outputFile,
+              deliveryId: occurrence.deliveryId,
+            })
+            retryStateDirty = true
+          }
+        } else if (recovery === 'unknown') {
+          if (lastRun[job.id] === undefined || lastRun[job.id]! < occurrence.dueMinuteKey) {
+            lastRun[job.id] = occurrence.dueMinuteKey
+            lastRunDirty = true
+          }
+          const existing = this.retryState.get(job.id)
+          if (existing?.deliveryId === occurrence.deliveryId) {
+            this.retryState.delete(job.id)
+            retryStateDirty = true
+          }
+          job.enabled = false
+          await atomicWriteYaml(paths.cronYaml, file)
+          settleOccurrence(occurrence, 'needs_confirmation')
+          if (isUserInitiatedCronJob(job)) {
+            const label = job.label || job.id
+            try {
+              await this.onDeliver(
+                `⏸️ 定时任务「${label}」上次执行中断，外部操作结果无法确认。` +
+                  `为避免重复操作已自动暂停；请确认结果后再重新启用。`,
+                (job.deliver ?? 'local') === 'local'
+                  ? { ...job, deliver: 'webchat' }
+                  : job,
+                {
+                  dueMinuteKey: occurrence.dueMinuteKey,
+                  deliveryId: occurrence.deliveryId,
+                },
+              )
+            } catch (err) {
+              logger.warn(`needs-confirmation notice failed for ${job.id}`, {
+                jobId: job.id,
+                errorClass: stableCronErrorClass(err),
+              })
+            }
+          }
+        } else if (recovery === 'done') {
+          settleOccurrence(occurrence)
+        }
+      }
       // A replaced/disabled job must not inherit an old occurrence. A retry
       // whose due minute was already durably consumed is stale after a crash
       // between last-run save and retry-file cleanup, so prune it without run.
@@ -988,23 +1305,91 @@ export class CronScheduler {
               try {
                 outcome = await this.runJob(job, agent, {
                   consumeOccurrence: async () => {
-                    // At-most-once execution boundary: once submit may run
-                    // tools, a crash must never replay the occurrence. A
-                    // one-shot is disabled first so it cannot fire on a later
-                    // schedule after restart.
+                    const record: CronOccurrenceRecord = {
+                      version: 1,
+                      deliveryId: deliveryContext.deliveryId,
+                      jobId: job.id,
+                      dueMinuteKey,
+                      schedule: job.schedule,
+                      state: 'prepared',
+                      sessionKey: `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`,
+                      tapeEvents: 0,
+                      updatedAt: Date.now(),
+                    }
+                    const existing = readOccurrence(deliveryContext.deliveryId)
+                    if (!existing) writeOccurrence(record)
+                    this.retryState.set(job.id, {
+                      dueMinuteKey,
+                      schedule: job.schedule,
+                      failures: Math.max(1, existingRetry?.failures ?? 1),
+                      nextAttemptAt: 0,
+                      code: 'OCCURRENCE_PREPARED',
+                      phase: 'execution',
+                      deliveryId: deliveryContext.deliveryId,
+                    })
+                    await this.persistRetryState()
+                    retryStateDirty = false
                     if (job.oneshot && job.enabled !== false) {
                       job.enabled = false
                       await saveCronFile(await ensureCronFile(), job)
                     }
+                  },
+                  markSubmitStarted: async () => {
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    if (!record || record.state !== 'prepared')
+                      throw new Error('cron occurrence is not prepared')
+                    writeOccurrence({ ...record, state: 'executing', updatedAt: Date.now() })
                     lastRun[job.id] = dueMinuteKey
                     await this.persistLastRun(lastRun)
                     lastRunDirty = false
+                  },
+                  recordEvent: (event) => {
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    if (!record || record.state !== 'executing') return
+                    const tapeEvents = appendOccurrenceTape(deliveryContext.deliveryId, event)
+                    writeOccurrence({ ...record, tapeEvents, updatedAt: Date.now() })
+                  },
+                  markCompleted: async (outputFile) => {
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    if (!record) throw new Error('cron occurrence record missing')
+                    writeOccurrence({
+                      ...record,
+                      state: 'completed',
+                      outputFile,
+                      updatedAt: Date.now(),
+                    })
+                  },
+                  markDelivered: async () => {
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    if (!record) return
+                    settleOccurrence(record)
+                  },
+                  markDeliveryTerminal: async () => {
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    if (!record) return
+                    settleOccurrence(record, 'delivery_terminal')
                   },
                   stageDelivery: async (outputFile) => {
                     await this.stageDeliveryOutbox(
                       job, dueMinuteKey, now.getTime(), outputFile,
                     )
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    if (record) writeOccurrence({
+                      ...record,
+                      state: 'delivery_pending',
+                      outputFile,
+                      updatedAt: Date.now(),
+                    })
                     retryStateDirty = false
+                  },
+                  recoverInterruptedExecution: async () => {
+                    const record = readOccurrence(deliveryContext.deliveryId)
+                    if (!record || record.state !== 'executing') return false
+                    if (!cronExecutionTapeIsReplaySafe(readOccurrenceTape(record.deliveryId))) {
+                      return false
+                    }
+                    writeOccurrence({ ...record, state: 'prepared', updatedAt: Date.now() })
+                    return true
                   },
                 }, deliveryContext)
               } catch (err) {
@@ -1053,6 +1438,34 @@ export class CronScheduler {
               dueMinuteKey,
             })
             outcome = { kind: 'terminal_failure', code: 'RETRY_EXHAUSTED' }
+          }
+          if (outcome.kind === 'terminal_failure') {
+            const occurrence = readOccurrence(deliveryContext.deliveryId)
+            if (occurrence?.state === 'executing' && outcome.code === 'EXECUTION_ERROR') {
+              job.enabled = false
+              await saveCronFile(await ensureCronFile(), job)
+              settleOccurrence(occurrence, 'needs_confirmation')
+              if (isUserInitiatedCronJob(job)) {
+                const label = job.label || job.id
+                try {
+                  await this.onDeliver(
+                    `⏸️ 定时任务「${label}」执行中断，外部操作结果无法确认。` +
+                      `为避免重复操作已自动暂停；请确认结果后再重新启用。`,
+                    (job.deliver ?? 'local') === 'local'
+                      ? { ...job, deliver: 'webchat' }
+                      : job,
+                    deliveryContext,
+                  )
+                } catch (err) {
+                  logger.warn(`needs-confirmation notice failed for ${job.id}`, {
+                    jobId: job.id,
+                    errorClass: stableCronErrorClass(err),
+                  })
+                }
+              }
+            } else if (occurrence?.state === 'prepared' || occurrence?.state === 'executing') {
+              settleOccurrence(occurrence, 'execution_terminal')
+            }
           }
           // A one-shot remains enabled across retryable failures. Completed,
           // silent, permanent and explicitly exhausted outcomes consume it.
@@ -1105,9 +1518,13 @@ export class CronScheduler {
         code: missing ? 'DELIVERY_PAYLOAD_MISSING' : 'DELIVERY_PAYLOAD_READ_FAILED',
         errorClass: stableCronErrorClass(err),
       })
-      return missing
-        ? { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_MISSING' }
-        : {
+      if (missing) {
+        const deliveryId = retry.deliveryId ?? cronDeliveryId(job.id, retry.dueMinuteKey)
+        const occurrence = readOccurrence(deliveryId)
+        if (occurrence) settleOccurrence(occurrence, 'delivery_terminal')
+        return { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_MISSING' }
+      }
+      return {
             kind: 'retryable_failure', code: 'DELIVERY_PAYLOAD_READ_FAILED',
             retry: { phase: 'delivery', outputFile: retry.outputFile },
           }
@@ -1117,6 +1534,9 @@ export class CronScheduler {
         dueMinuteKey: retry.dueMinuteKey,
         deliveryId: retry.deliveryId ?? cronDeliveryId(job.id, retry.dueMinuteKey),
       })
+      const deliveryId = retry.deliveryId ?? cronDeliveryId(job.id, retry.dueMinuteKey)
+      const occurrence = readOccurrence(deliveryId)
+      if (occurrence) settleOccurrence(occurrence)
       return { kind: 'completed' }
     } catch (err) {
       const failure = deliveryFailureOutcome(err)
@@ -1126,9 +1546,12 @@ export class CronScheduler {
         errorClass: stableCronErrorClass(err),
         retryable: failure.kind === 'retryable_failure',
       })
-      return failure.kind === 'retryable_failure'
-        ? { ...failure, retry: { phase: 'delivery', outputFile: retry.outputFile } }
-        : failure
+      if (failure.kind === 'retryable_failure')
+        return { ...failure, retry: { phase: 'delivery', outputFile: retry.outputFile } }
+      const deliveryId = retry.deliveryId ?? cronDeliveryId(job.id, retry.dueMinuteKey)
+      const occurrence = readOccurrence(deliveryId)
+      if (occurrence) settleOccurrence(occurrence, 'delivery_terminal')
+      return failure
     }
   }
 
@@ -1149,7 +1572,7 @@ export class CronScheduler {
     // that caused the user's follow-up messages to return "本轮响应为空".
     // Delivery still targets the user's last-active channel via server.ts
     // (see onDeliver), which reads lastActiveChannel independently.
-    const sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${Date.now()}`
+    const sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${deliveryContext.deliveryId}`
 
     // 合成首帧路由字段补齐:cron 是进程内直接派发的会话首帧,完全绕过 master bridge
     // 的 codex 计费编排(preCheck / server-owned requestId / inflight journal)。host
@@ -1230,10 +1653,12 @@ export class CronScheduler {
     let output = ''
     let submitError: unknown = null
     try {
+      await durability.markSubmitStarted?.()
       await this.sessions.submit(
         session,
         job.prompt,
         (e) => {
+          durability.recordEvent?.(e)
           if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
         },
         // effortLevel: 不指定(cron 用模型默认档位)
@@ -1275,6 +1700,9 @@ export class CronScheduler {
         jobId: job.id,
         errorClass: stableCronErrorClass(submitError),
       })
+      if (await durability.recoverInterruptedExecution?.()) {
+        return { kind: 'retryable_failure', code: 'SAFE_CHECKPOINT_RECOVERY' }
+      }
       return { kind: 'terminal_failure', code: 'EXECUTION_ERROR' }
     }
     // Skip delivery for silence markers AND genuinely empty output. The empty
@@ -1286,6 +1714,9 @@ export class CronScheduler {
       return { kind: 'terminal_failure', code: 'EMPTY_OUTPUT' }
     }
     if (trimmed.startsWith('[SILENT]') || trimmed === 'HEARTBEAT_OK') {
+      if (!archivedOutputFile) return { kind: 'terminal_failure', code: 'OUTPUT_ARCHIVE_FAILED' }
+      await durability.markCompleted?.(archivedOutputFile)
+      await durability.markDelivered?.()
       logger.info(`job ${job.id} silent/empty, not delivering`, {
         jobId: job.id,
         reason: trimmed.startsWith('[SILENT]') ? 'silent' : 'heartbeat_ok',
@@ -1340,6 +1771,8 @@ export class CronScheduler {
     }
     // 正常产出 → 清失败计数(偶发失败不累积成误杀)。
     this.creditFailStreak.delete(job.id)
+    if (!archivedOutputFile) return { kind: 'terminal_failure', code: 'OUTPUT_ARCHIVE_FAILED' }
+    await durability.markCompleted?.(archivedOutputFile)
     logger.info(`job ${job.id} completed`, {
       jobId: job.id,
       chars: trimmed.length,
@@ -1347,6 +1780,7 @@ export class CronScheduler {
     })
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
+      await durability.markDelivered?.()
     } else {
       if (!archivedOutputFile) {
         return { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_UNAVAILABLE' }
@@ -1368,6 +1802,7 @@ export class CronScheduler {
       })
       try {
         await this.onDeliver(trimmed, job, deliveryContext)
+        await durability.markDelivered?.()
       } catch (err) {
         const failure = deliveryFailureOutcome(err)
         logger.warn(`delivery failed for ${job.id}`, {
@@ -1381,6 +1816,7 @@ export class CronScheduler {
             ? { ...failure, retry: { phase: 'delivery', outputFile: archivedOutputFile } }
             : { kind: 'terminal_failure', code: 'DELIVERY_PAYLOAD_UNAVAILABLE' }
         }
+        await durability.markDeliveryTerminal?.()
         return failure
       }
     }

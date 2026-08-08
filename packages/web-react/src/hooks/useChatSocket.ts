@@ -35,7 +35,7 @@ export function isArchiveHistoryRevisionCompatible(
 function persistSignature(s: StoredSession): string {
   const last = s.messages[s.messages.length - 1];
   const lastSig = last
-    ? `${last.text?.length ?? 0}/${last.output?.length ?? 0}/${last.partialJson?.length ?? 0}/${last._completed ? 1 : 0}/${last.status ?? ""}`
+    ? `${last.text?.length ?? 0}/${last.output?.length ?? 0}/${last.partialJson?.length ?? 0}/${last._completed ? 1 : 0}/${last.status ?? ""}/${last._resolved ? 1 : 0}/${last._controlPending ? 1 : 0}/${last._behavior ?? ""}`
     : "";
   // title 计入:rename 是纯元数据变更,漏掉它 IndexedDB 永远存旧标题(reload 即回退)。
   // _selectedModelId 同理:会话级模型选择也是纯元数据变更,漏掉则选完不发消息时 reload 即回退。
@@ -476,6 +476,16 @@ export function useChatSocket(opts: {
         const store = storeRef.current;
         if (!store) return;
         await store.deletePendingDispatch(sessId, msgId);
+      },
+      persistPendingControl: async (item) => {
+        const store = storeRef.current;
+        if (!store) throw new Error("session store unavailable");
+        await store.putPendingControl(item);
+      },
+      deletePendingControl: async (sessId, controlId) => {
+        const store = storeRef.current;
+        if (!store) return;
+        await store.deletePendingControl(sessId, controlId);
       },
       // GitHub 仓库绑定状态/错误帧 → 透传给 useRepoBinding（经 ref，无 stale）。
       onRepoStatus: (frame) => onRepoStatusRef.current?.(frame),

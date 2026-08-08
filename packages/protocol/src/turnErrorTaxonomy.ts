@@ -153,6 +153,12 @@ const LEGACY_CODE_ALIASES: Record<string, TurnErrorCode> = {
   TURN_LIMIT: 'turn_limit',
   USER_CANCELLED: 'user_cancelled',
   RUNNER_CRASHED: 'runner_crashed',
+  // Rolling compatibility: older gateways emitted three implementation-
+  // specific labels for the same unexpected runner loss.  Recovery policy
+  // must not depend on which side of a rolling deploy finalized the tape.
+  RUNNER_ERROR: 'runner_crashed',
+  RUNNER_INTERRUPTED: 'runner_crashed',
+  TURN_SUBMIT_FAILED: 'runner_crashed',
   CODEX_ERROR: 'engine_error',
   INSUFFICIENT_CREDITS: 'insufficient_credits',
   ERR_INSUFFICIENT_CREDITS: 'insufficient_credits',
@@ -192,6 +198,27 @@ export function turnErrorSemantics(code: string): TurnErrorSemantics {
  * codes stay false. */
 export function supportsAutomaticTurnRecovery(code: string): boolean {
   return turnErrorSemantics(normalizeTurnErrorCode(code)).automaticRecovery === true
+}
+
+/** Errors whose authoritative terminal code proves execution never crossed a
+ * local tool/effect boundary. An empty tape is otherwise ambiguous after a
+ * runner/process loss and must not be replayed automatically. */
+const PRE_EXECUTION_AUTOMATIC_RECOVERY_CODES: ReadonlySet<TurnErrorCode> = new Set([
+  // These are emitted by the control plane before a runner/tool can start.
+  // Model/upstream/network errors are deliberately absent: the same code can
+  // also occur on a continuation after a tool, so an empty tape alone cannot
+  // prove that no external effect happened.
+  'model_authority_unavailable',
+  'model_catalog_unavailable',
+  'codex_pool_busy',
+  'codex_route_unavailable',
+  'codex_container_recycled',
+])
+
+export function supportsAutomaticRecoveryWithoutCheckpoint(code: string): boolean {
+  const normalized = normalizeTurnErrorCode(code)
+  return isKnownTurnErrorCode(normalized) &&
+    PRE_EXECUTION_AUTOMATIC_RECOVERY_CODES.has(normalized)
 }
 
 function stableTurnRecoveryHash(value: string): string {
@@ -321,12 +348,33 @@ function recoveryChildToolsAreTerminal(value: unknown): boolean {
     const child = item as Record<string, unknown>
     if (
       child.kind === 'tool_use' &&
-      (child._completed !== true || containsNonTerminalRecoveryState(child))
+      (
+        child._completed !== true ||
+        containsNonTerminalRecoveryState(child) ||
+        !hasAuthoritativeToolEffect(child)
+      )
     ) {
       return false
     }
     return recoveryChildToolsAreTerminal(child.childBlocks)
   })
+}
+
+/** A completed-looking tool result is not sufficient evidence for automatic
+ * continuation: Bash/MCP/browser/third-party adapters can have committed an
+ * external effect before the runtime disappeared.  Only the Gateway may
+ * attach this registry proof, after the owning adapter has either declared
+ * the operation read-only or durably committed its downstream idempotency
+ * key.  Unknown/legacy records deliberately remain manual-reconcile. */
+function hasAuthoritativeToolEffect(record: Record<string, unknown>): boolean {
+  const raw = record._toolEffect
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const effect = raw as Record<string, unknown>
+  return effect.authority === 'gateway-v1' &&
+    typeof effect.registryEntrySha256 === 'string' &&
+    /^[0-9a-f]{64}$/.test(effect.registryEntrySha256) &&
+    effect.outcome === 'completed' &&
+    (effect.safety === 'read_only' || effect.safety === 'idempotency_committed')
 }
 
 function isDurableRecoveryProcessRecord(record: Record<string, unknown>): boolean {
@@ -365,7 +413,7 @@ function recoveryRecordIsSafe(record: Record<string, unknown>): boolean {
   if (record.role === 'permission' && record._resolved !== true) return false
   if (
     record.role === 'tool' &&
-    record._completed !== true
+    (record._completed !== true || !hasAuthoritativeToolEffect(record))
   ) {
     return false
   }
@@ -379,6 +427,58 @@ function recoveryRecordIsSafe(record: Record<string, unknown>): boolean {
     return false
   }
   return true
+}
+
+function toolObservationId(record: Record<string, unknown>): string | null {
+  for (const key of ['toolUseId', 'tool_use_id', 'blockId', 'id']) {
+    if (typeof record[key] === 'string' && record[key].length > 0) return record[key]
+  }
+  return null
+}
+
+/** Match every durable tool-use observation to a completed Gateway-stamped
+ * effect record. This closes the crash window where a raw runtime block was
+ * persisted but the summarized `role:tool` record never materialized. */
+function observedToolEffectsAreProven(records: readonly Record<string, unknown>[]): boolean {
+  const observed = new Set<string>()
+  const proven = new Set<string>()
+  let unboundObservation = false
+  const visit = (value: unknown, seen: Set<unknown>): void => {
+    if (typeof value === 'string') {
+      if (/["']?(?:kind|type)["']?\s*[:=]\s*["']tool_use\b/i.test(value)) {
+        unboundObservation = true
+      }
+      return
+    }
+    if (!value || typeof value !== 'object' || seen.has(value)) return
+    seen.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, seen)
+      return
+    }
+    const row = value as Record<string, unknown>
+    const isObservation = row.kind === 'tool_use' || row.type === 'tool_use'
+    const isSummary = row.role === 'tool'
+    if (isObservation || isSummary) {
+      const id = toolObservationId(row)
+      if (isObservation) {
+        if (id) observed.add(id)
+        else unboundObservation = true
+      }
+      if (
+        id &&
+        row._completed === true &&
+        !containsNonTerminalRecoveryState(row) &&
+        hasAuthoritativeToolEffect(row)
+      ) {
+        proven.add(id)
+      }
+    }
+    for (const nested of Object.values(row)) visit(nested, seen)
+  }
+  const seen = new Set<unknown>()
+  for (const record of records) visit(record, seen)
+  return !unboundObservation && [...observed].every((id) => proven.has(id))
 }
 
 /**
@@ -397,7 +497,9 @@ export function assessTurnRecoveryTape(records: readonly unknown[]): {
   )
   return {
     mode: structured.some(isDurableRecoveryProcessRecord) ? 'checkpoint' : 'replay',
-    checkpointSafe: structured.every(recoveryRecordIsSafe),
+    checkpointSafe:
+      structured.every(recoveryRecordIsSafe) &&
+      observedToolEffectsAreProven(structured),
   }
 }
 

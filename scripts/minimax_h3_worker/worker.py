@@ -86,6 +86,7 @@ class Store:
                     job_id TEXT NOT NULL,
                     attempt_id TEXT NOT NULL,
                     fence_version INTEGER NOT NULL,
+                    origin_release TEXT,
                     resource_class TEXT NOT NULL,
                     request_digest TEXT,
                     request_json TEXT,
@@ -100,6 +101,8 @@ class Store:
                     result_size INTEGER,
                     error_code TEXT,
                     error_message TEXT,
+                    recovery_disposition TEXT NOT NULL DEFAULT 'unknown',
+                    cleanup_proven INTEGER NOT NULL DEFAULT 0,
                     cancel_requested_at INTEGER,
                     acked_at INTEGER,
                     created_at INTEGER NOT NULL,
@@ -123,6 +126,12 @@ class Store:
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(attempts)")}
             if "pid_start_ticks" not in columns:
                 self.db.execute("ALTER TABLE attempts ADD COLUMN pid_start_ticks INTEGER")
+            if "recovery_disposition" not in columns:
+                self.db.execute("ALTER TABLE attempts ADD COLUMN recovery_disposition TEXT NOT NULL DEFAULT 'unknown'")
+            if "cleanup_proven" not in columns:
+                self.db.execute("ALTER TABLE attempts ADD COLUMN cleanup_proven INTEGER NOT NULL DEFAULT 0")
+            if "origin_release" not in columns:
+                self.db.execute("ALTER TABLE attempts ADD COLUMN origin_release TEXT")
             self.db.commit()
 
     def ack_scrub(self, job_id, attempt_id):
@@ -132,7 +141,7 @@ class Store:
             )
             self.db.execute(
                 """UPDATE attempts SET request_json=NULL,result_path=NULL,pid=NULL,
-                   pid_start_ticks=NULL,acked_at=?,updated_at=?
+                   pid_start_ticks=NULL,error_message=NULL,acked_at=?,updated_at=?
                    WHERE job_id=? AND attempt_id=?""",
                 (now_ms(), now_ms(), job_id, attempt_id),
             )
@@ -151,21 +160,26 @@ class Store:
                 "SELECT * FROM inputs WHERE job_id=? AND attempt_id=? ORDER BY ordinal", (job_id, attempt_id)
             ).fetchall()
 
-    def ensure_staging(self, job_id, attempt_id, fence, resource_class="gpu-h3"):
+    def ensure_staging(
+        self, job_id, attempt_id, fence, resource_class="gpu-h3", origin_release=None
+    ):
         ts = now_ms()
+        release = origin_release or "unknown"
         with self.lock:
             row = self.row(job_id, attempt_id)
             if row is not None:
                 if row["fence_version"] != fence:
                     raise Conflict("stale_fence")
+                if origin_release is not None and row["origin_release"] != origin_release:
+                    raise Conflict("attempt_release_conflict")
                 if row["status"] not in {"staging", "queued"}:
                     raise Conflict("attempt_not_staging")
                 return row
             self.db.execute(
                 """INSERT INTO attempts
-                   (job_id,attempt_id,fence_version,resource_class,status,phase,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (job_id, attempt_id, fence, resource_class, "staging", "transferring_inputs", ts, ts),
+                   (job_id,attempt_id,fence_version,origin_release,resource_class,status,phase,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (job_id, attempt_id, fence, release, resource_class, "staging", "transferring_inputs", ts, ts),
             )
             self.db.commit()
             return self.row(job_id, attempt_id)
@@ -192,16 +206,23 @@ class Store:
             )
             self.db.commit()
 
-    def submit(self, job_id, attempt_id, fence, resource_class, digest, request):
+    def submit(
+        self, job_id, attempt_id, fence, resource_class, digest, request,
+        origin_release=None,
+    ):
         ts = now_ms()
         encoded = json.dumps(request, sort_keys=True, separators=(",", ":"))
         with self.lock:
             row = self.row(job_id, attempt_id)
             if row is None:
-                self.ensure_staging(job_id, attempt_id, fence, resource_class)
+                self.ensure_staging(
+                    job_id, attempt_id, fence, resource_class, origin_release=origin_release
+                )
                 row = self.row(job_id, attempt_id)
             if row["fence_version"] != fence:
                 raise Conflict("stale_fence")
+            if origin_release is not None and row["origin_release"] != origin_release:
+                raise Conflict("attempt_release_conflict")
             if row["status"] in TERMINAL and row["request_digest"] is None:
                 raise Conflict("attempt_not_staging")
             if row["request_digest"] is not None:
@@ -288,13 +309,13 @@ class Worker:
         self.session_supervisor_pid = int(supervisor_pid) if supervisor_pid else None
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "attempts").mkdir(exist_ok=True)
+        self.release = self._release_id()
         self.store = Store(self.root / "worker.sqlite")
         self.process_lock = threading.RLock()
         self.upload_lock = threading.RLock()
         self.ffmpeg = shutil.which(os.environ.get("H3_WORKER_FFMPEG", "ffmpeg"))
         self.ffprobe = shutil.which(os.environ.get("H3_WORKER_FFPROBE", "ffprobe"))
         self.compose_capable = self._probe_compose()
-        self.release = self._release_id()
         self._recover()
 
     def _release_id(self):
@@ -306,7 +327,10 @@ class Worker:
                 stderr=subprocess.DEVNULL,
             ).strip()
         except Exception:
-            return "unknown"
+            try:
+                return self.worktree.resolve().name
+            except OSError:
+                return "unknown"
 
     def touch_session_lease(self):
         pid = self.session_supervisor_pid
@@ -367,7 +391,7 @@ class Worker:
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,255}", filename)
         ):
             raise ValueError("invalid_input_manifest")
-        self.store.ensure_staging(job_id, attempt_id, fence)
+        self.store.ensure_staging(job_id, attempt_id, fence, origin_release=self.release)
         directory = self._attempt_dir(job_id, attempt_id) / "inputs"
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{ordinal:03d}-{sha}-{filename}"
@@ -498,7 +522,9 @@ class Worker:
             }
 
             with self.upload_lock:
-                self.store.ensure_staging(job_id, attempt_id, fence)
+                self.store.ensure_staging(
+                    job_id, attempt_id, fence, origin_release=self.release
+                )
                 existing = next(
                     (row for row in self.store.inputs(job_id, attempt_id) if row["ordinal"] == ordinal),
                     None,
@@ -577,7 +603,10 @@ class Worker:
         expected = body.get("request_digest")
         if expected is not None and not hmac.compare_digest(expected, digest):
             raise ValueError("request_digest_mismatch")
-        row, start = self.store.submit(job_id, attempt_id, fence, resource, digest, request)
+        row, start = self.store.submit(
+            job_id, attempt_id, fence, resource, digest, request,
+            origin_release=self.release,
+        )
         if start:
             threading.Thread(target=self._execute, args=(job_id, attempt_id), daemon=True).start()
         return self.public_row(row)
@@ -620,34 +649,51 @@ class Worker:
         if row is None:
             raise FileNotFoundError
         result = {key: row[key] for key in (
-            "job_id", "attempt_id", "fence_version", "resource_class", "status", "phase",
+            "job_id", "attempt_id", "fence_version", "origin_release", "resource_class", "status", "phase",
             "request_digest", "current_step", "total_steps", "result_sha256", "result_size", "error_code",
             "error_message", "created_at", "updated_at",
+            "recovery_disposition", "cleanup_proven",
         )}
         result["result_ready"] = bool(row["result_path"] and Path(row["result_path"]).is_file())
         return result
 
-    def _process_matches(self, row):
+    def _process_identity(self, row):
         pid = row["pid"]
-        if not pid_alive(pid) or not row["pid_start_ticks"]:
-            return False
-        if pid_start_ticks(pid) != row["pid_start_ticks"]:
-            return False
+        if not pid:
+            return "dead"
+        try:
+            start_ticks = int(Path(f"/proc/{int(pid)}/stat").read_text().split()[21])
+        except FileNotFoundError:
+            return "dead"
+        except (OSError, ValueError, IndexError):
+            return "unknown"
+        if not row["pid_start_ticks"]:
+            return "unknown"
+        if start_ticks != row["pid_start_ticks"]:
+            # The PID was reused; the exact fenced process is definitively gone.
+            return "dead"
         try:
             argv = Path(f"/proc/{int(pid)}/cmdline").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            return "dead"
         except OSError:
-            return False
+            return "unknown"
         values = [value.decode("utf-8", "replace") for value in argv if value]
         attempt_dir = str(self._attempt_dir(row["job_id"], row["attempt_id"]))
         if row["resource_class"] == "gpu-h3":
             pairs = dict(zip(values, values[1:]))
-            return (
+            matches = (
                 any(value.endswith("coordinator.py") for value in values)
                 and pairs.get("--job-id") == row["job_id"]
                 and pairs.get("--attempt-id") == row["attempt_id"]
                 and any(value.startswith(attempt_dir + os.sep) for value in values)
             )
-        return any(value.startswith(attempt_dir + os.sep) for value in values)
+        else:
+            matches = any(value.startswith(attempt_dir + os.sep) for value in values)
+        return "alive" if matches else "unknown"
+
+    def _process_matches(self, row):
+        return self._process_identity(row) == "alive"
 
     def result_path(self, job_id, attempt_id, fence):
         row = self.store.row(job_id, attempt_id)
@@ -910,8 +956,20 @@ class Worker:
         retry.start()
 
     def _monitor_recovered(self, row):
-        while self._process_matches(row):
-            time.sleep(1)
+        while True:
+            identity = self._process_identity(row)
+            if identity == "alive":
+                time.sleep(1)
+                continue
+            if identity == "unknown":
+                self.store.update(
+                    row["job_id"], row["attempt_id"], phase="recovery_identity_unknown"
+                )
+                self._schedule_recovery_retry(
+                    dict(self.store.row(row["job_id"], row["attempt_id"]))
+                )
+                return
+            break
         current = self.store.row(row["job_id"], row["attempt_id"])
         if current is None or current["status"] != "running":
             return
@@ -954,6 +1012,14 @@ class Worker:
                 )
                 self._schedule_recovery_retry(dict(self.store.row(row["job_id"], row["attempt_id"])))
                 return
+
+        if terminal == "failed" and fields.get("error_code") == "worker_lost" and row["resource_class"] == "gpu-h3":
+            # This is the sole replay authorization. Reaching here proves the
+            # fenced coordinator PID is gone and rank cleanup succeeded.
+            fields.update(
+                recovery_disposition="definitive_retry_safe",
+                cleanup_proven=1,
+            )
 
         self.store.cas_terminal(
             row["job_id"], row["attempt_id"], row["fence_version"], terminal,

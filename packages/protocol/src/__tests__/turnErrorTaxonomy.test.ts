@@ -6,6 +6,7 @@ import {
   TURN_ERROR_TAXONOMY,
   assessTurnRecoveryTape,
   maxAutomaticTurnRetryAttempt,
+  supportsAutomaticRecoveryWithoutCheckpoint,
   supportsAutomaticTurnRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
@@ -59,6 +60,44 @@ describe('automatic turn recovery policy', () => {
     }
   })
 
+  it('normalizes every deployed unexpected runner label to one recovery policy', () => {
+    for (const code of [
+      'RUNNER_CRASHED',
+      'RUNNER_ERROR',
+      'RUNNER_INTERRUPTED',
+      'TURN_SUBMIT_FAILED',
+    ]) {
+      assert.equal(supportsAutomaticTurnRecovery(code), true, code)
+    }
+  })
+
+  it('requires a checkpoint for ambiguous process-loss errors', () => {
+    for (const code of [
+      'model_authority_unavailable',
+      'model_catalog_unavailable',
+      'codex_pool_busy',
+      'codex_route_unavailable',
+      'codex_container_recycled',
+    ]) {
+      assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), true, code)
+    }
+    for (const code of [
+      'rate_limited',
+      'model_capacity',
+      'upstream_failed',
+      'upstream_timeout',
+      'network_error',
+      'RUNNER_CRASHED',
+      'ENGINE_ERROR',
+      'internal_error',
+      'service_restart',
+      'NO_RESPONSE',
+      'PHANTOM_TURN',
+    ]) {
+      assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false, code)
+    }
+  })
+
   it('mints one protocol-valid deterministic identity per source turn', () => {
     const first = turnRecoveryIdentity('session-1', 'client-1')
     const again = turnRecoveryIdentity('session-1', 'client-1')
@@ -104,7 +143,17 @@ describe('automatic turn recovery policy', () => {
     })
     assert.deepEqual(assessTurnRecoveryTape([
       { role: 'thinking', text: 'kept' },
-      { role: 'tool', _completed: true, outputJson: { status: 'done' } },
+      {
+        role: 'tool',
+        _completed: true,
+        outputJson: { status: 'done' },
+        _toolEffect: {
+          authority: 'gateway-v1',
+          registryEntrySha256: 'a'.repeat(64),
+          outcome: 'completed',
+          safety: 'read_only',
+        },
+      },
     ]), {
       mode: 'checkpoint',
       checkpointSafe: true,
@@ -112,6 +161,17 @@ describe('automatic turn recovery policy', () => {
     for (const unsafe of [
       { role: 'permission', _resolved: false },
       { role: 'tool', _completed: false },
+      { role: 'tool', _completed: true, outputJson: { status: 'done' } },
+      {
+        role: 'tool',
+        _completed: true,
+        _toolEffect: {
+          authority: 'runtime',
+          registryEntrySha256: 'a'.repeat(64),
+          outcome: 'completed',
+          safety: 'read_only',
+        },
+      },
       { role: 'tool', _completed: true, outputJson: { outcome: 'unknown' } },
       {
         role: 'agent-group',
@@ -119,11 +179,43 @@ describe('automatic turn recovery policy', () => {
         childBlocks: [{ kind: 'tool_use', _completed: false }],
       },
       { role: 'runtime-event', outcome: 'incomplete' },
+      {
+        role: 'runtime-event',
+        payload: {
+          kind: 'block',
+          block: { kind: 'tool_use', blockId: 'tool-unfinished', toolName: 'Bash' },
+        },
+      },
     ]) {
       assert.deepEqual(assessTurnRecoveryTape([unsafe]), {
         mode: 'checkpoint',
         checkpointSafe: false,
       })
     }
+
+    assert.deepEqual(assessTurnRecoveryTape([
+      {
+        role: 'runtime-event',
+        payload: {
+          kind: 'block',
+          block: { kind: 'tool_use', blockId: 'tool-read', toolName: 'Read' },
+        },
+      },
+      {
+        role: 'tool',
+        toolUseId: 'tool-read',
+        blockId: 'tool-read',
+        _completed: true,
+        _toolEffect: {
+          authority: 'gateway-v1',
+          registryEntrySha256: 'b'.repeat(64),
+          outcome: 'completed',
+          safety: 'read_only',
+        },
+      },
+    ]), {
+      mode: 'checkpoint',
+      checkpointSafe: true,
+    })
   })
 })

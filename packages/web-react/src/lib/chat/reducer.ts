@@ -1348,6 +1348,24 @@ export function applyOutboundMessage(
     return;
   }
 
+  // A persisted Stop is still remotely active until Master confirms its
+  // terminal state, but the user's cancellation boundary is immediate. Keep
+  // the lifecycle busy for truthful recovery while suppressing late streamed
+  // content from the exact stopped turn. Final authority remains accepted by
+  // the normal terminal path below.
+  if (
+    !frame.isFinal &&
+    !frame.cronJob &&
+    sess._stopSettlement &&
+    (
+      !sess._stopSettlement.clientMessageId ||
+      !frame.clientMessageId ||
+      frame.clientMessageId === sess._stopSettlement.clientMessageId
+    )
+  ) {
+    return;
+  }
+
   // ── §11 stale 守卫 ──
   // stale 判定优先走 **server 时钟域同域比较**（frame.ts ≤ reset 前所见最大 server ts →
   // 帧发出不晚于 reset 前已见内容 → stale）；仅当从未见过 server ts（_trackerResetServerTs
