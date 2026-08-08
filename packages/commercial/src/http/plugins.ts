@@ -32,6 +32,18 @@ type ManagedSetupManager = KnowledgePlanetSetupManager | WeiboSetupManager
 
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: 'knowledge-planet',
+): KnowledgePlanetSetupManager
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: 'weibo',
+): WeiboSetupManager
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: 'knowledge-planet' | 'weibo',
+): ManagedSetupManager
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
   provider: 'knowledge-planet' | 'weibo',
 ): ManagedSetupManager {
   const manager = provider === 'knowledge-planet' ? deps.knowledgePlanetSetup : deps.weiboSetup
@@ -165,19 +177,27 @@ export async function dispatchPluginsRoute(
 
   const setupRoot = /^\/api\/plugins\/(knowledge-planet|weibo)\/setup$/.exec(path)
   if (method === 'POST' && setupRoot) {
-    const body = await readJsonBody(req, 1024)
+    const raw = await readJsonBody(req, 1024)
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+      throw new HttpError(400, 'BAD_REQUEST', 'Plugin setup body is invalid')
+    const body = raw as Record<string, unknown>
+    const provider = setupRoot[1] as 'knowledge-planet' | 'weibo'
+    const allowed = provider === 'weibo' ? ['acceptTerms', 'accountId'] : ['acceptTerms']
     if (
-      body === null ||
-      typeof body !== 'object' ||
-      Array.isArray(body) ||
-      Object.keys(body).some((key) => key !== 'acceptTerms')
+      !exactBodyKeys(body, allowed) ||
+      (body.accountId !== undefined &&
+        (typeof body.accountId !== 'string' || !/^\d{1,16}$/.test(body.accountId)))
     )
-      throw new HttpError(400, 'BAD_REQUEST', 'body must contain only acceptTerms')
+      throw new HttpError(400, 'BAD_REQUEST', 'Plugin setup body is invalid')
     try {
-      const setup = await setupManager(deps, setupRoot[1] as 'knowledge-planet' | 'weibo').start(
-        userId,
-        (body as Record<string, unknown>).acceptTerms === true,
-      )
+      const setup =
+        provider === 'weibo'
+          ? await setupManager(deps, provider).start(
+              userId,
+              body.acceptTerms === true,
+              body.accountId as string | undefined,
+            )
+          : await setupManager(deps, provider).start(userId, body.acceptTerms === true)
       sendJson(res, 201, setup)
       return
     } catch (error) {

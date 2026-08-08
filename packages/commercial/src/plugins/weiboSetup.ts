@@ -6,10 +6,14 @@ import { ConnectorError } from '../connectors/errors.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { resolvePinnedAddress } from '../connectors/outboundPolicy.js'
 import { getPool } from '../db/index.js'
+import { type PluginLeaseRedis, acquirePluginAccountLease } from './accountLease.js'
 import {
   PluginAccountError,
   assertRuntimePluginInstallEntitlement,
+  bindManagedBrowserPluginAccount,
   createManagedBrowserPluginAccount,
+  decryptPluginAccountEnvelope,
+  getPluginAccount,
 } from './accounts.js'
 import type { ManagedBrowserPinnedOrigin } from './browserRuntime.js'
 import type { ManagedBrowserPluginContractV1 } from './contracts.js'
@@ -26,6 +30,7 @@ import { classifyWeiboSetupPin } from './weiboContract.js'
 
 const SETUP_TTL_MS = 4 * 60_000
 const TERMINAL_RETENTION_MS = 15 * 60_000
+const RELINK_COMMIT_TIMEOUT_MS = 30_000
 
 export class WeiboSetupError extends Error {
   readonly code:
@@ -81,6 +86,7 @@ interface SetupSession {
   handle: WeiboLoginWorkerHandle | null
   completion: Promise<void> | null
   accountId: string | null
+  relinkTarget: { accountId: string; expectedAccountInstanceId: string } | null
   errorCode: string | null
   agentReady: boolean
 }
@@ -99,6 +105,12 @@ export interface WeiboSetupView {
 
 function safeUserId(value: number): number {
   if (!Number.isSafeInteger(value) || value <= 0) throw new WeiboSetupError('SETUP_NOT_FOUND')
+  return value
+}
+
+function safeAccountId(value: string | undefined): string | null {
+  if (value === undefined) return null
+  if (!/^\d{1,16}$/.test(value)) throw new WeiboSetupError('SETUP_NOT_FOUND')
   return value
 }
 
@@ -149,13 +161,17 @@ export class WeiboSetupManager {
   private readonly pool: Pool
   private readonly sessions = new Map<string, SetupSession>()
   private readonly currentByUser = new Map<number, string>()
-  private readonly startsByUser = new Map<number, Promise<WeiboSetupView>>()
+  private readonly startsByUser = new Map<
+    number,
+    { relinkAccountId: string | null; promise: Promise<WeiboSetupView> }
+  >()
   private closing = false
 
   constructor(
     private readonly service: WeiboDockerService,
     private readonly opts: {
       pool?: Pool
+      redis?: PluginLeaseRedis
       resolver?: DnsResolver
       env?: NodeJS.ProcessEnv
       now?: () => number
@@ -166,6 +182,18 @@ export class WeiboSetupManager {
       createAccount?: (input: {
         userId: number
         versionId: number
+        storageState: unknown
+      }) => Promise<{ id: string }>
+      loadRelinkTarget?: (input: {
+        userId: number
+        versionId: number
+        accountId: string
+      }) => Promise<{ accountId: string; expectedAccountInstanceId: string }>
+      bindRefreshedAccount?: (input: {
+        userId: number
+        versionId: number
+        accountId: string
+        expectedAccountInstanceId: string
         storageState: unknown
       }) => Promise<{ id: string }>
       resolvePins?: () => Promise<ManagedBrowserPinnedOrigin[]>
@@ -267,22 +295,104 @@ export class WeiboSetupManager {
     session.errorCode = code
   }
 
-  async start(userIdInput: number, acceptTerms: boolean): Promise<WeiboSetupView> {
-    if (this.closing) throw new WeiboSetupError('CLOSING')
-    if (acceptTerms !== true) throw new WeiboSetupError('TERMS_REQUIRED')
-    const userId = safeUserId(userIdInput)
-    const pending = this.startsByUser.get(userId)
-    if (pending) return pending
-    const started = this.startForUser(userId)
-    this.startsByUser.set(userId, started)
-    try {
-      return await started
-    } finally {
-      if (this.startsByUser.get(userId) === started) this.startsByUser.delete(userId)
+  private async loadRelinkTarget(
+    userId: number,
+    versionId: number,
+    accountId: string,
+  ): Promise<{ accountId: string; expectedAccountInstanceId: string }> {
+    if (this.opts.loadRelinkTarget) {
+      const target = await this.opts.loadRelinkTarget({ userId, versionId, accountId })
+      if (target.accountId !== accountId) throw new WeiboSetupError('SETUP_NOT_FOUND')
+      return target
+    }
+    const row = await getPluginAccount(accountId, userId, this.pool, { includeError: true })
+    if (!row || row.provider !== WEIBO_PLUGIN_SLUG) throw new WeiboSetupError('SETUP_NOT_FOUND')
+    if (row.status !== 'active' && row.status !== 'error')
+      throw new WeiboSetupError('SETUP_NOT_FOUND')
+    if (row.connector_version_id !== String(versionId))
+      throw new WeiboSetupError(
+        'ACCOUNT_ALREADY_EXISTS',
+        'Weibo account version must be updated before relink',
+      )
+    const verified = await loadVerifiedRuntimePluginContract(versionId, this.pool, {
+      env: this.opts.env,
+    })
+    if (
+      verified.pluginType !== 'managed-browser' ||
+      verified.slug !== WEIBO_PLUGIN_SLUG ||
+      row.spec_hash.toString('hex') !== verified.artifactHash ||
+      row.exec_contract_hash.toString('hex') !== verified.execContractHash ||
+      row.auth_contract_version !== verified.contract.account.contractVersion
+    )
+      throw new WeiboSetupError('UNAVAILABLE', 'official Plugin trust pin mismatch')
+    return {
+      accountId,
+      expectedAccountInstanceId: decryptPluginAccountEnvelope(row, verified.contract, this.opts.env)
+        .accountInstanceId,
     }
   }
 
-  private async startForUser(userId: number): Promise<WeiboSetupView> {
+  private async refreshAccount(
+    input: NonNullable<SetupSession['relinkTarget']> & {
+      userId: number
+      versionId: number
+      storageState: unknown
+    },
+  ): Promise<{ id: string }> {
+    const lease = await acquirePluginAccountLease(this.opts.redis, input.accountId, {
+      hardTimeoutMs: RELINK_COMMIT_TIMEOUT_MS,
+    })
+    try {
+      await lease.assertHeld()
+      const account = this.opts.bindRefreshedAccount
+        ? await this.opts.bindRefreshedAccount(input)
+        : await bindManagedBrowserPluginAccount({
+            userId: input.userId,
+            versionId: input.versionId,
+            displayName: '微博',
+            accountHint: '微博扫码账号',
+            storageState: input.storageState,
+            existing: 'refresh-fenced',
+            expectedExistingAccountInstanceId: input.expectedAccountInstanceId,
+            resetWriteAuthorization: true,
+            env: this.opts.env,
+            pool: this.pool,
+          })
+      if (account.id !== input.accountId)
+        throw new PluginAccountError('ACCOUNT_STALE', 'Weibo relink target changed')
+      return { id: account.id }
+    } finally {
+      await lease.release()
+    }
+  }
+
+  async start(
+    userIdInput: number,
+    acceptTerms: boolean,
+    relinkAccountIdInput?: string,
+  ): Promise<WeiboSetupView> {
+    if (this.closing) throw new WeiboSetupError('CLOSING')
+    if (acceptTerms !== true) throw new WeiboSetupError('TERMS_REQUIRED')
+    const userId = safeUserId(userIdInput)
+    const relinkAccountId = safeAccountId(relinkAccountIdInput)
+    const pending = this.startsByUser.get(userId)
+    if (pending) {
+      if (pending.relinkAccountId !== relinkAccountId) throw new WeiboSetupError('SETUP_ACTIVE')
+      return pending.promise
+    }
+    const started = this.startForUser(userId, relinkAccountId)
+    this.startsByUser.set(userId, { relinkAccountId, promise: started })
+    try {
+      return await started
+    } finally {
+      if (this.startsByUser.get(userId)?.promise === started) this.startsByUser.delete(userId)
+    }
+  }
+
+  private async startForUser(
+    userId: number,
+    relinkAccountId: string | null,
+  ): Promise<WeiboSetupView> {
     if (this.closing) throw new WeiboSetupError('CLOSING')
     this.prune()
     const currentId = this.currentByUser.get(userId)
@@ -292,21 +402,27 @@ export class WeiboSetupManager {
       if (current) await this.expireIfNeeded(current)
       // Starting is idempotent for an in-flight setup. A refreshed browser can
       // recover the private session id instead of being locked out until TTL.
-      if (current && ['waiting_for_scan', 'finalizing'].includes(current.status))
+      if (current && ['waiting_for_scan', 'finalizing'].includes(current.status)) {
+        if ((current.relinkTarget?.accountId ?? null) !== relinkAccountId)
+          throw new WeiboSetupError('SETUP_ACTIVE')
         return this.view(current)
+      }
       // A terminal setup is only a UI/history cache. The encrypted account row
       // remains authoritative: unlink may happen immediately after success, so
       // retaining an `active` session must never block re-authorization for the
       // remainder of the 15-minute setup TTL.
       if (current?.status === 'active') staleActive = current
     }
-    const existing = await this.pool.query(
-      `SELECT 1 FROM connections
+    const existing = await this.pool.query<{ id: string }>(
+      `SELECT id::text AS id FROM connections
         WHERE user_id = $1 AND provider = $2 AND revoked_at IS NULL
         LIMIT 1`,
       [userId, WEIBO_PLUGIN_SLUG],
     )
-    if ((existing.rowCount ?? 0) !== 0) throw new WeiboSetupError('ACCOUNT_ALREADY_EXISTS')
+    const existingAccountId = existing.rows[0]?.id ?? null
+    if (existingAccountId && existingAccountId !== relinkAccountId)
+      throw new WeiboSetupError('ACCOUNT_ALREADY_EXISTS')
+    if (!existingAccountId && relinkAccountId) throw new WeiboSetupError('SETUP_NOT_FOUND')
     if (staleActive) {
       wipe(staleActive.qr)
       staleActive.qr = null
@@ -316,6 +432,9 @@ export class WeiboSetupManager {
       if (this.currentByUser.get(userId) === staleActive.id) this.currentByUser.delete(userId)
     }
     const entitled = await this.loadEntitledVersion(userId)
+    const relinkTarget = relinkAccountId
+      ? await this.loadRelinkTarget(userId, entitled.versionId, relinkAccountId)
+      : null
     const pins = this.opts.resolvePins
       ? await this.opts.resolvePins()
       : await resolveWeiboLoginPins(this.opts.resolver)
@@ -334,6 +453,7 @@ export class WeiboSetupManager {
       handle: null,
       completion: null,
       accountId: null,
+      relinkTarget,
       errorCode: null,
       agentReady: entitled.agentReady,
     }
@@ -383,21 +503,28 @@ export class WeiboSetupManager {
           try {
             session.phase = 'saving'
             const storageState = JSON.parse(stateBuffer.toString('utf8'))
-            const account = this.opts.createAccount
-              ? await this.opts.createAccount({
+            const account = session.relinkTarget
+              ? await this.refreshAccount({
+                  ...session.relinkTarget,
                   userId: session.userId,
                   versionId: session.versionId,
                   storageState,
                 })
-              : await createManagedBrowserPluginAccount({
-                  userId: session.userId,
-                  versionId: session.versionId,
-                  displayName: '微博',
-                  accountHint: '微博扫码账号',
-                  storageState,
-                  env: this.opts.env,
-                  pool: this.pool,
-                })
+              : this.opts.createAccount
+                ? await this.opts.createAccount({
+                    userId: session.userId,
+                    versionId: session.versionId,
+                    storageState,
+                  })
+                : await createManagedBrowserPluginAccount({
+                    userId: session.userId,
+                    versionId: session.versionId,
+                    displayName: '微博',
+                    accountHint: '微博扫码账号',
+                    storageState,
+                    env: this.opts.env,
+                    pool: this.pool,
+                  })
             session.accountId = account.id
             session.status = 'active'
             session.phase = 'active'
@@ -466,7 +593,7 @@ export class WeiboSetupManager {
 
   async closeAndDrain(): Promise<void> {
     this.closing = true
-    await Promise.all([...this.startsByUser.values()].map((started) => started.catch(() => {})))
+    await Promise.all([...this.startsByUser.values()].map(({ promise }) => promise.catch(() => {})))
     const stops: Promise<void>[] = []
     for (const session of this.sessions.values()) {
       if (claim(session, 'cancelled')) {

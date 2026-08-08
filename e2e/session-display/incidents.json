@@ -1069,6 +1069,35 @@
           "assertion": "cron durable inbox：真实容器直投 candidate 后用户 API 可见且字段完整"
         }
       ]
+    },
+    {
+      "id": "INC-20260808-WEIBO-RELINK",
+      "occurredAt": "2026-08-08",
+      "severity": "P1",
+      "symptom": "微博上游登录状态失效或触发未归类挑战后，V5 账号可能仍显示可用且没有重新扫码入口；即使进入旧恢复流程也会先销毁连接，扫码中断后用户无法继续使用或安全重绑。",
+      "rootFixCommit": "169c06f7",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/weiboSetup.test.ts",
+          "assertion": "refreshes the requested account in place only after the login worker exits"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/ConnectorsTab.test.tsx",
+          "assertion": "当前版本微博账号始终可原位重新登录，扫码成功前不销毁旧连接"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/marketplacePluginKernel.integ.test.ts",
+          "assertion": "reusedRefreshBinds[0]?.outcome, 'reused'"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T33 当前微博账号重新扫码登录不会先解绑旧连接"
+        }
+      ]
     }
   ]
 }

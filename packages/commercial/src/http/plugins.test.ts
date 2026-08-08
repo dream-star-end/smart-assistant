@@ -210,22 +210,60 @@ describe('Plugin management HTTP dispatcher', () => {
   })
 
   test('Weibo setup uses the provider-bound manager and a private no-store QR endpoint', async () => {
+    const starts: unknown[] = []
+    const custom = deps()
+    custom.weiboSetup.start = async (userId: number, accepted: boolean, accountId?: string) => {
+      starts.push([userId, accepted, accountId])
+      return {
+        sessionId: SESSION,
+        status: accepted && userId === 42 ? 'waiting_for_scan' : 'failed',
+      }
+    }
     let res = response()
     await dispatchPluginsRoute(
-      await request('POST', '/api/plugins/weibo/setup', { acceptTerms: true }),
+      await request('POST', '/api/plugins/weibo/setup', {
+        acceptTerms: true,
+        accountId: '901',
+      }),
       res,
       ctx,
-      deps(),
+      custom,
     )
     assert.equal(res.statusCode, 201)
     assert.deepEqual(res.body, { sessionId: SESSION, status: 'waiting_for_scan' })
+    assert.deepEqual(starts, [[42, true, '901']])
+
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('POST', '/api/plugins/knowledge-planet/setup', {
+          acceptTerms: true,
+          accountId: '901',
+        }),
+        response(),
+        ctx,
+        custom,
+      ),
+      (error: unknown) => error instanceof HttpError && error.status === 400,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('POST', '/api/plugins/weibo/setup', {
+          acceptTerms: true,
+          accountId: 'not-an-id',
+        }),
+        response(),
+        ctx,
+        custom,
+      ),
+      (error: unknown) => error instanceof HttpError && error.status === 400,
+    )
 
     res = response()
     await dispatchPluginsRoute(
       await request('GET', `/api/plugins/weibo/setup/${SESSION}/qr`),
       res,
       ctx,
-      deps(),
+      custom,
     )
     assert.equal(res.statusCode, 200)
     assert.equal(res.headers.get('content-type'), 'image/png')
@@ -237,7 +275,7 @@ describe('Plugin management HTTP dispatcher', () => {
       await request('DELETE', `/api/plugins/weibo/setup/${SESSION}`),
       res,
       ctx,
-      deps(),
+      custom,
     )
     assert.equal(res.statusCode, 200)
     assert.deepEqual(res.body, { sessionId: SESSION, status: 'cancelled' })

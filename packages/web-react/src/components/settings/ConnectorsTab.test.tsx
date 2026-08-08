@@ -1184,6 +1184,101 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
   })
 
+  test('当前版本微博账号始终可原位重新登录，扫码成功前不销毁旧连接', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [weiboPlugin()],
+      accounts: [
+        {
+          id: '902',
+          provider: 'weibo',
+          pluginType: 'managed-browser',
+          displayName: '我的微博',
+          accountHint: '微博扫码账号',
+          status: 'active',
+          actions: [{ id: 'list_home_posts', description: '读取首页微博', readOnly: true }],
+          versionId: '301',
+          executable: true,
+          writeControl: weiboWriteControl(),
+        },
+      ],
+    })
+    mockedWeiboStart.mockResolvedValue({
+      sessionId: '36363636-3636-4636-8636-363636363636',
+      status: 'waiting_for_scan',
+      qrReady: false,
+      createdAt: '2026-08-08T00:00:00.000Z',
+      expiresAt: '2026-08-08T00:04:00.000Z',
+    })
+    mockedWeiboStatus.mockImplementation(() => new Promise(() => {}))
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('我的微博')
+    fireEvent.click(
+      within(providerCard('微博')).getByRole('button', { name: '重新扫码登录' }),
+    )
+
+    const confirmDialog = await screen.findByRole('dialog')
+    expect(within(confirmDialog).getByText(/新扫码成功前会保留当前登录状态/)).toBeInTheDocument()
+    expect(within(confirmDialog).getByText(/写入能力和免逐次确认/)).toBeInTheDocument()
+    fireEvent.click(within(confirmDialog).getByRole('button', { name: '重新扫码登录' }))
+
+    expect(await screen.findByText('重新登录微博')).toBeInTheDocument()
+    const setupDialog = screen.getByRole('dialog')
+    fireEvent.click(within(setupDialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    await waitFor(() => expect(mockedWeiboStart).toHaveBeenCalledWith(auth, '902'))
+    expect(mockedPluginRevoke).not.toHaveBeenCalled()
+  })
+
+  test('微博原位重登只接受目标账号本身的成功结果', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [weiboPlugin()],
+      accounts: [
+        {
+          id: '902',
+          provider: 'weibo',
+          pluginType: 'managed-browser',
+          displayName: '我的微博',
+          accountHint: '微博扫码账号',
+          status: 'error',
+          actions: [{ id: 'list_home_posts', description: '读取首页微博', readOnly: true }],
+          versionId: '301',
+          executable: false,
+          writeControl: weiboWriteControl(),
+        },
+      ],
+    })
+    mockedWeiboStart.mockResolvedValue({
+      sessionId: '37373737-3737-4737-8737-373737373737',
+      status: 'active',
+      phase: 'active',
+      qrReady: false,
+      agentReady: true,
+      accountId: '999',
+      createdAt: '2026-08-08T00:00:00.000Z',
+      expiresAt: '2026-08-08T00:04:00.000Z',
+    })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('我的微博')
+    fireEvent.click(
+      within(providerCard('微博')).getByRole('button', { name: '重新扫码登录' }),
+    )
+    fireEvent.click(
+      within(await screen.findByRole('dialog')).getByRole('button', { name: '重新扫码登录' }),
+    )
+    const setupDialog = await screen.findByRole('dialog')
+    fireEvent.click(within(setupDialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(
+      await within(setupDialog).findByText('重新登录结果与目标账号不一致，请重试。'),
+    ).toBeInTheDocument()
+    expect(within(setupDialog).queryByRole('button', { name: '完成' })).not.toBeInTheDocument()
+    expect(mockedPluginRevoke).not.toHaveBeenCalled()
+  })
+
   test('微博安全验证失败时给出可操作指引，未知失败仍使用通用兜底', async () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     mockedPluginManagement.mockResolvedValue({ catalog: [weiboPlugin()], accounts: [] })
