@@ -4785,7 +4785,11 @@ export class SessionManager {
             result?.isError === true &&
             result.stopReason === null &&
             result.errorDetail?.includes('"subtype":"error_during_execution"') === true &&
-            result.errorDetail.includes('Error: Request was aborted.')
+            (
+              result.errorDetail.includes('Error: Request was aborted.') ||
+              result.errorDetail ===
+                '{"subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"]}'
+            )
           const userCancellationOverride =
             requestedTerminal?.status === 'interrupted' &&
             requestedTerminal.errorCode === 'USER_CANCELLED' &&
