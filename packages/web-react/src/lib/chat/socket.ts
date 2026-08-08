@@ -1362,6 +1362,9 @@ export class ChatSocket {
         // server-authored srv-* 行替换这一轮的 m-* fallback。reconcile 已在
         // forceSync 分支恰好拉一次；interrupted/cron 没有新权威 tape，均不拉。
         if (
+          // REST journal replay is already inside the authoritative sync.
+          // Re-entering it from its persisted final creates a self-sustaining hydration loop.
+          !this.durableHydrationStates.has(sess.id) &&
           !isCronOrHeartbeat &&
           frame.meta?.reconcile !== "turn_completed" &&
           frame.meta?.reconcile !== "interrupted" &&

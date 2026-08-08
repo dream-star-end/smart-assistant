@@ -3579,6 +3579,54 @@ describe("ChatSocket interrupted continuation", () => {
     sock.stop();
   });
 
+  test("durable final replay stays inside the current authoritative hydration", async () => {
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ syncSession });
+    const sessId = "s-live-final";
+    const clientMessageId = "cm-live-final";
+    const sessionKey = `agent:main:webchat:dm:${sessId}`;
+    const session = sock.ensureSession(sessId, "main");
+    session.messages.push({
+      id: clientMessageId,
+      role: "user",
+      text: "long task",
+      ts: 1,
+      status: "sent",
+    });
+    session._sendingInFlight = true;
+    session._activeClientMessageId = clientMessageId;
+
+    await sock.runDurableLiveFrameHydration(sessId, async () => {
+      sock.applyDurableLiveFrames(
+        sessId,
+        [{
+          recordId: "final-1",
+          streamKey: "dispatch:33333333-3333-4333-8333-333333333333:1",
+          source: "gateway",
+          clientMessageId,
+          payload: {
+            type: "outbound.message",
+            sessionKey,
+            frameSeq: 1,
+            peer: { id: sessId, kind: "dm" },
+            clientMessageId,
+            blocks: [{ kind: "text", text: "exact final answer" }],
+            isFinal: true,
+            ts: 2,
+          },
+        }],
+        [clientMessageId],
+      );
+    });
+
+    expect(syncSession).not.toHaveBeenCalled();
+    expect(session._sendingInFlight).toBe(false);
+    expect(session.messages.some((message) =>
+      message.role === "assistant" && message.text === "exact final answer"
+    )).toBe(true);
+    sock.stop();
+  });
+
   test("journal page1 → overlapping WS frame → page2 applies thinking/tool/text exactly once", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
