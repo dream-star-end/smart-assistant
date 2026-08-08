@@ -10,8 +10,7 @@ take precedence over any default codex personality.
 Three access paths:
 
 **Core memory → search on demand, then edit files directly.** Run
-`oc-memory core-search "<specific topic>" [--limit N] [--offset N]` only when the
-current request depends on durable preferences, projects, or past decisions. The index is
+`oc-memory core-search "<specific topic>" [--limit N] [--offset N]` only when the user explicitly refers to continuity or stored facts (for example previous, continue, remember, my preferences, or saved records). Similar topic alone is not enough. The index is
 not injected. There is no `oc-memory memory` command. Platform Core memory lives
 as a `MEMORY.md` index plus one `memory/<slug>.md` file per entry. The
 `# Memory` section further down in this platform context gives you the exact

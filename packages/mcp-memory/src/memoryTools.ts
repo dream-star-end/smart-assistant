@@ -38,6 +38,8 @@ import {
   readUserProfile,
   scanMemoryContent,
   paths,
+  isManagedAgentRuntime,
+  readMemoryTurnPolicy,
   searchSessions,
   upsertArchivalVector,
 } from '@openclaude/storage'
@@ -110,12 +112,26 @@ export async function drainPendingEmbeds(ctx: MemoryToolsContext): Promise<void>
   if (pending.length > 0) await Promise.allSettled(pending)
 }
 
+async function memorySearchPolicyError(): Promise<MemoryToolResult | null> {
+  if (!isManagedAgentRuntime()) return null
+  const sessionKey =
+    process.env.OPENCLAUDE_SESSION_KEY?.trim() || process.env.OC_SESSION_KEY?.trim()
+  if (!sessionKey) return toolError('memory search is unavailable without an active turn policy')
+  const policy = await readMemoryTurnPolicy(sessionKey)
+  if (!policy) return toolError('memory search is unavailable because the active turn policy is missing or expired')
+  if (!policy.allowed)
+    return toolError(`memory search is disabled for this turn (${policy.reason}); answer from the current request`)
+  return null
+}
+
 export async function handleCoreSearch(args: {
   agentId: string
   query: string
   limit?: number
   offset?: number
 }): Promise<MemoryToolResult> {
+  const denied = await memorySearchPolicyError()
+  if (denied) return denied
   const query = args.query.trim()
   if (!query) return toolError('core-search requires a non-empty query string')
   const limit = args.limit ?? 5
@@ -194,6 +210,8 @@ export async function handleSessionSearch(
     summarize?: boolean
   },
 ): Promise<MemoryToolResult> {
+  const denied = await memorySearchPolicyError()
+  if (denied) return denied
   // Default: search only THIS agent's sessions. Pass agentId to search another agent.
   const searchAgentId = args.agentId ?? ctx.agentId
   const limit = args.limit ?? 5
@@ -290,6 +308,8 @@ export async function handleArchivalSearch(
   ctx: MemoryToolsContext,
   args: { query: string; limit?: number },
 ): Promise<MemoryToolResult> {
+  const denied = await memorySearchPolicyError()
+  if (denied) return denied
   if (typeof args.query !== 'string' || args.query.trim() === '') {
     return toolError('archival_search requires a non-empty query string')
   }

@@ -233,6 +233,59 @@ test("logical-turn cancellation fences the gateway retry loop above one EngineTu
   }
 });
 
+test("an aborted logical-turn signal fences both pre-submit and retry backoff windows", async () => {
+  const sm = new SessionManager(makeConfigStub());
+  const runner = new FakeCcbRunner(() => {});
+  const session = makeSession(runner);
+  const originalRun = (sm as unknown as { _runOneTurn: unknown })._runOneTurn;
+  const originalDelay = (sm as unknown as { _transientRetryDelayMs: unknown })._transientRetryDelayMs;
+  let attempts = 0;
+  try {
+    (sm as unknown as { _runOneTurn: () => Promise<void> })._runOneTurn = async () => {
+      attempts += 1;
+      throw new Error("Selected model is at capacity. Please try a different model.");
+    };
+    (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 30_000;
+
+    const beforeSubmit = new AbortController();
+    const beforeSubmitReason = new Error("memory turn policy refresh failed before submit");
+    beforeSubmit.abort(beforeSubmitReason);
+    await assert.rejects(
+      (sm as unknown as { runOneTurnWithRetry: (...args: unknown[]) => Promise<void> })
+        .runOneTurnWithRetry(
+          session, "hello", () => {}, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, beforeSubmit.signal,
+        ),
+      (error) => error === beforeSubmitReason,
+    );
+    assert.equal(attempts, 0);
+
+    const duringBackoff = new AbortController();
+    const duringBackoffReason = new Error("memory turn policy refresh failed during retry backoff");
+    await assert.rejects(
+      (sm as unknown as { runOneTurnWithRetry: (...args: unknown[]) => Promise<void> })
+        .runOneTurnWithRetry(
+          session,
+          "hello",
+          (event: SessionStreamEvent) => {
+            if (
+              event.kind === "turn_status" &&
+              typeof event.status === "object" &&
+              event.status?.status === "retrying"
+            ) duringBackoff.abort(duringBackoffReason);
+          },
+          undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          duringBackoff.signal,
+        ),
+      (error) => error === duringBackoffReason,
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    (sm as unknown as { _runOneTurn: unknown })._runOneTurn = originalRun;
+    (sm as unknown as { _transientRetryDelayMs: unknown })._transientRetryDelayMs = originalDelay;
+  }
+});
+
 describe("tool.called structured metadata", () => {
   test("parser result metadata reaches the observability event unchanged", async () => {
     const sm = new SessionManager(makeConfigStub());
