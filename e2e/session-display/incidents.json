@@ -1006,7 +1006,8 @@
       "rootFixCommit": "03adb5f1",
       "coverageCommits": [
         "788ecc51",
-        "6ac77ac1"
+        "6ac77ac1",
+        "58dacb06"
       ],
       "regressions": [
         {
