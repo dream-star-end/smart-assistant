@@ -31,6 +31,13 @@ export type TutorialCaseInput = {
   title: string
   description: string
   sourceUrl?: string
+  assetPath?: string
+  /** Immutable upstream revision, capture date, or inline template version. */
+  revision: string
+  /** SHA-256 of the exact downloaded bytes or inlineContent UTF-8 bytes. */
+  sha256: string
+  bytes: number
+  inlineContent?: string
   preparation: string
 }
 
@@ -57,9 +64,34 @@ export type TutorialCaseCheck = {
 }
 
 export type TutorialCaseSuggestion = {
-  agent: string
+  agentId: 'research-assistant' | 'coding-assistant' | 'office-assistant'
+  agentName: '科研助手' | '编程助手' | '办公助手'
+  modelId: 'deepseek-v4-pro' | 'glm-5.2' | 'MiniMax-M3'
   modelGuidance: string
   why: string
+}
+
+export type TutorialCaseActualArtifact = {
+  title: string
+  path: string
+  sha256: string
+  bytes: number
+  mimeType: string
+}
+
+export type TutorialCaseReplayManifestPage = {
+  path: string
+  sha256: string
+  bytes: number
+  messageCount: number
+  startOrdinal: number
+}
+
+export type TutorialCaseReplayManifest = {
+  schemaVersion: 1
+  caseId: TutorialCaseId
+  messageCount: number
+  pages: readonly TutorialCaseReplayManifestPage[]
 }
 
 export type TutorialCaseReplayProvenance = {
@@ -71,6 +103,9 @@ export type TutorialCaseReplayProvenance = {
   messageCount: number
   bytes: number
   repeatRuns: number
+  agentId: string
+  modelId: string
+  engine: 'ccb' | 'codex'
 }
 
 export type TutorialCaseReplay =
@@ -82,6 +117,7 @@ export type TutorialCaseReplay =
       poster?: undefined
       video?: undefined
       checkReport?: undefined
+      actualArtifacts?: undefined
     }
   | {
       status: 'verified'
@@ -91,6 +127,7 @@ export type TutorialCaseReplay =
       poster?: string
       video?: string
       checkReport: string
+      actualArtifacts: readonly TutorialCaseActualArtifact[]
     }
 
 export type TutorialCase = {
@@ -169,11 +206,22 @@ export const TUTORIAL_CASES = [
         description: '固定研究问题、日期范围、纳排标准、关键词与结局指标，避免看过结果后再改规则。',
         sourceUrl:
           'https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists',
+        assetPath: 'tutorialCaseCatalog.ts#research-evidence-map/search-protocol',
+        revision: 'protocol-v1',
+        sha256: '1b69f824f0174cb4e534ec2b7d323dce1d1f227a9f6a7499f76ecfa7eca66297',
+        bytes: 152,
+        inlineContent:
+          'question=microplastics cardiovascular human\nfrom=2020-01-01\nto=2026-08-08\nlanguages=en\ninclude=peer-reviewed human studies\nexclude=title-only inference\n',
         preparation: '保存检索式和执行时间；请求 OpenAlex works 后把原始 JSON 原样留作审计附件。',
       },
       {
-        title: '候选文献.csv',
-        description: 'DOI、OpenAlex ID、题名、年份、研究设计、来源 URL 与筛选状态。',
+        title: 'OpenAlex 30 条固定响应.json',
+        description: '按冻结检索式返回的 30 条原始 works JSON；后续候选 CSV 从这里确定性生成。',
+        sourceUrl:
+          'https://api.openalex.org/works?search=microplastics%20cardiovascular%20human&filter=from_publication_date:2020-01-01,to_publication_date:2026-08-08&sort=cited_by_count:desc&per-page=30',
+        revision: 'captured-2026-08-08',
+        sha256: '9624daa064900fdce77f1143d94945907feb089c8bc10b85963699003996cf2f',
+        bytes: 1655066,
         preparation: '先只填元数据；研究设计和结论必须在打开来源后再标注。',
       },
     ],
@@ -243,7 +291,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '科研助手（需要并行核验时开启团队模式）',
+      agentId: 'research-assistant',
+      agentName: '科研助手',
+      modelId: 'deepseek-v4-pro',
       modelGuidance: '优先选择擅长长上下文与工具调用的高推理模型；筛选阶段不必追求最高档。',
       why: '任务难点在检索留痕与逐条引文核验，不在生成更长的综述。',
     },
@@ -281,12 +331,21 @@ export const TUTORIAL_CASES = [
       {
         title: 'Bike-Sharing-Dataset.zip',
         description: 'UCI 页面提供的 hour.csv、day.csv 与说明文件。',
-        sourceUrl: 'https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset',
+        sourceUrl: 'https://archive.ics.uci.edu/static/public/275/bike+sharing+dataset.zip',
+        revision: 'uci-275-2026-08-08',
+        sha256: 'b70182d0d0508e9abbb79306ce5c0cec34869000f8220175ac83d11dbe845401',
+        bytes: 279992,
         preparation: '通过数据集页面下载，记录下载时间与 SHA-256；原始文件只读保存。',
       },
       {
         title: 'analysis-question.md',
         description: '主问题、主要结局、候选协变量、切分方案与禁止数据泄漏规则。',
+        assetPath: 'tutorialCaseCatalog.ts#research-bike-demand/analysis-question',
+        revision: 'question-v1',
+        sha256: '16bf375a70712b9609a680b65708d2d4172c920d4d744d1cea3bc5b1410e838f',
+        bytes: 134,
+        inlineContent:
+          'outcome=cnt\nquestion=weather association stratified by workingday\nsplit=chronological\nseed=20260808\nleakage_columns=casual,registered\n',
         preparation: '明确以时间顺序切分；cnt 与 casual/registered 的关系需要在建模前检查。',
       },
     ],
@@ -352,7 +411,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '科研助手或数据分析智能体',
+      agentId: 'research-assistant',
+      agentName: '科研助手',
+      modelId: 'deepseek-v4-pro',
       modelGuidance: '用高推理模型制定计划与审查泄漏；机械绘图和测试可交给更快模型。',
       why: '需要代码、统计解释与可复现性三条链同时闭合。',
     },
@@ -397,12 +458,22 @@ export const TUTORIAL_CASES = [
       {
         title: 'protocol.md',
         description: '研究问题、数据库、日期、检索式、纳排标准和冲突裁决规则。',
+        assetPath: 'tutorialCaseCatalog.ts#research-systematic-screening/protocol',
+        revision: 'protocol-v1',
+        sha256: '004c2284c0f8607fb320c933a0684d9033ae0dcb1a9de7575c8b9af18f260afe',
+        bytes: 151,
+        inlineContent:
+          'topic=generative AI and professional developer productivity\ndatabases=Europe PMC,OpenAlex\nfirst_pass=title,abstract\nunknown=maybe\nfinal_decision=human\n',
         preparation: '在任何检索结果进入上下文之前冻结版本并计算 SHA-256。',
       },
       {
         title: 'records.jsonl',
         description: 'Europe PMC 与 OpenAlex 原始响应按行保留，附数据库和查询批次。',
-        sourceUrl: 'https://europepmc.org/RestfulWebService',
+        sourceUrl:
+          'https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=%28generative%20AI%20OR%20large%20language%20model%29%20AND%20%28software%20developer%20OR%20programming%29%20AND%20productivity&format=json&pageSize=100',
+        revision: 'captured-2026-08-08',
+        sha256: '5b4f1ba3cf49e635b4fcae71eb5c9c2443fe4a7e699743b0a5ebc09369bd9e8f',
+        bytes: 81111,
         preparation: '保留响应原文；规范化副本另存，禁止覆盖来源字段。',
       },
     ],
@@ -472,7 +543,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '科研助手 + 团队模式',
+      agentId: 'research-assistant',
+      agentName: '科研助手',
+      modelId: 'deepseek-v4-pro',
       modelGuidance: '使用两个相互独立的高推理筛选子任务；最后由人做裁决。',
       why: '独立判断与完整分歧记录比让同一模型自我确认更有价值。',
     },
@@ -510,12 +583,21 @@ export const TUTORIAL_CASES = [
       {
         title: '开放论文 HTML/PDF 与补充材料',
         description: '从 eLife 文章页获取，保留固定访问 URL 和下载日期。',
-        sourceUrl: 'https://elifesciences.org/articles/84364',
+        sourceUrl: 'https://api.elifesciences.org/articles/84364',
+        revision: 'elife-84364-captured-2026-08-08',
+        sha256: 'a831a91e32d0e576d96865142f4bbb5ff004a53c7988600dceb6031a77568899',
+        bytes: 297930,
         preparation: '只下载页面明确开放的文件，并保留原文件名、许可和 SHA-256。',
       },
       {
         title: 'review-scope.md',
         description: '限定主要问题、次要问题、统计复核和不在范围事项。',
+        assetPath: 'tutorialCaseCatalog.ts#research-open-peer-review/review-scope',
+        revision: 'scope-v1',
+        sha256: '61045b8b5a22c274541522bb14599d3fba026b6d80d073cd1ead8d1d0a4ff69b',
+        bytes: 136,
+        inlineContent:
+          'sections=design,statistics,figures,reproducibility,reporting\nseverity=major,minor,question\nmissing_data=unverified\nrole=teaching-review\n',
         preparation: '声明无法访问原始数据时，不重新声称论文数值已被复现。',
       },
     ],
@@ -582,7 +664,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '科研助手 + 团队模式',
+      agentId: 'research-assistant',
+      agentName: '科研助手',
+      modelId: 'deepseek-v4-pro',
       modelGuidance: '高推理模型负责方法和统计审查；另一模型独立检查文字与引用。',
       why: '分工可减少一份流畅总评掩盖证据和严重性边界。',
     },
@@ -592,9 +676,9 @@ export const TUTORIAL_CASES = [
     id: 'research-replication-audit',
     contentVersion: 1,
     category: 'research',
-    title: '复跑开放研究并定位复现差异',
+    title: '复跑固定开放研究并定位复现差异',
     summary:
-      '从 ReScience C 的公开复现项目选择一项固定提交，在隔离环境中重建、复跑并把差异定位到数据、环境、随机性或实现。',
+      '复跑 diversity_abm_replication 的固定提交 67af994，在隔离环境中重建并把差异定位到数据、环境、随机性或实现。',
     audience: '需要复核论文代码、教学复现或验收计算研究交付的团队',
     difficulty: '挑战',
     outcome: '一份不把“能启动”冒充“已复现”的审计报告、环境清单和差异证据。',
@@ -631,25 +715,35 @@ export const TUTORIAL_CASES = [
     inputMaterials: [
       {
         title: '固定的 ReScience 提交仓库',
-        description: '从候选中选择依赖可取得、许可清楚、资源可承受的一项。',
-        sourceUrl: 'https://github.com/ReScience/ReScience-submission',
-        preparation: '在执行记录中写入仓库 URL、commit SHA、LICENSE 路径和选择理由。',
+        description: '固定的 diversity_abm_replication 仓库归档，不在运行时另选项目。',
+        sourceUrl:
+          'https://codeload.github.com/LukasWallrich/diversity_abm_replication/tar.gz/67af9948843eb1543da67f4987483f62a270361b',
+        revision: '67af9948843eb1543da67f4987483f62a270361b',
+        sha256: 'e4a7d65b6ea3d427821b523c3b67f1756f983d40629593f6009e8093132ad537',
+        bytes: 16620050,
+        preparation: '核对归档 SHA-256，并在执行记录中写入仓库 URL、commit SHA 与 LICENSE 路径。',
       },
       {
         title: 'expected-results.md',
         description: '从项目 README/文章中逐字转录预期命令、指标、图表和容差。',
+        assetPath: 'tutorialCaseCatalog.ts#research-replication-audit/expected-results',
+        revision: 'criteria-v1',
+        sha256: '2a2d0a8302c5258fe576c4d8f1bb977ed3bad0de75fafb7d42610ffc9b4bcbfe',
+        bytes: 185,
+        inlineContent:
+          'repository=LukasWallrich/diversity_abm_replication\ncommit=67af9948843eb1543da67f4987483f62a270361b\nlevels=environment,execution,main-results,full-reproduction\nundeclared_tolerance=fail\n',
         preparation: '转录时附来源位置；作者未给容差就不要事后自定为通过。',
       },
     ],
-    starterPrompt: `对我选定并固定 commit 的 ReScience C 公开项目做复现审计。先读取 LICENSE、README、文章和资源要求，再建立“作者声称—验收方法—容差—来源位置”表。
+    starterPrompt: `对已冻结的 LukasWallrich/diversity_abm_replication@67af9948843eb1543da67f4987483f62a270361b 做复现审计。先校验归档 SHA-256，再读取 LICENSE、README、文章和资源要求，建立“作者声称—验收方法—容差—来源位置”表。
 不要修改原仓库来让它通过：先在隔离环境按作者步骤原样运行并保留完整日志；失败后再在单独分支做最小诊断实验。区分环境重建成功、程序运行成功、主要结果接近和完整复现四个层级。
 输出 environment.lock、commands.log、result-comparison.csv、reproduction-report.md 和最小诊断补丁（如有），任何失败都作为结果保留。`,
     stages: [
       {
         id: 'select',
-        title: '选择并冻结复现对象',
-        input: 'ReScience 候选仓库与资源边界。',
-        operation: '核对许可、数据可得性和依赖，固定 commit 与预期结果。',
+        title: '核验冻结的复现对象',
+        input: 'diversity_abm_replication 固定归档与资源边界。',
+        operation: '校验归档哈希、许可、数据可得性、固定 commit 与预期结果。',
         visibleProcess: ['仓库浏览', '许可读取', 'commit 和文件哈希'],
         output: 'selection-manifest.json 与 expected-results.md。',
         acceptance: ['commit 不可漂移', '每项预期有来源位置'],
@@ -708,7 +802,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '科研助手与编码智能体组队',
+      agentId: 'research-assistant',
+      agentName: '科研助手',
+      modelId: 'deepseek-v4-pro',
       modelGuidance: '编码模型负责环境和日志，科研模型负责预期结果与结论边界。',
       why: '复现失败常混合工程与科研判断，分工后证据边界更清晰。',
     },
@@ -762,13 +858,23 @@ export const TUTORIAL_CASES = [
       {
         title: '一个固定 Verified 实例',
         description: 'instance_id、problem_statement、repo、base_commit 和官方容器定义。',
-        sourceUrl: 'https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified',
+        assetPath: 'tutorialCaseCatalog.ts#coding-swe-bench-fix/instance',
+        revision: 'astropy__astropy-12907',
+        sha256: '60868938a47c575f10e7232e95b8b0dd95dd1c0c56281a00589d8515d37856e2',
+        bytes: 204,
+        inlineContent:
+          'instance_id=astropy__astropy-12907\nrepo=astropy/astropy\nbase_commit=d16bfe05a744909de4b27f5875fe0d4ed41ce607\nproblem=separability_matrix is incorrect for nested CompoundModels\ngold_patch_access=forbidden\n',
         preparation:
           '从公开 split 选择后保存整条 JSON 与 SHA-256；移除 gold patch/test patch 的可见性。',
       },
       {
         title: '仓库基线',
         description: '在 base_commit 建立只用于本案例的 worktree。',
+        sourceUrl:
+          'https://codeload.github.com/astropy/astropy/tar.gz/d16bfe05a744909de4b27f5875fe0d4ed41ce607',
+        revision: 'd16bfe05a744909de4b27f5875fe0d4ed41ce607',
+        sha256: '4ffc67512585ebd76f93abe9544e3563f826ccf70e1576492d3f21eb8d3d4979',
+        bytes: 7774271,
         preparation: '记录 git status -sb 和基线测试；不在上游仓库直接修改。',
       },
     ],
@@ -835,7 +941,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '编码智能体 + 独立审查子任务',
+      agentId: 'coding-assistant',
+      agentName: '编程助手',
+      modelId: 'glm-5.2',
       modelGuidance: '高推理编码模型负责复现与根因；审查者只报告正确性、安全和数据 blocker。',
       why: '真实修复需要可失败测试和独立 harness，不应由生成补丁的模型自行宣布成功。',
     },
@@ -878,13 +986,23 @@ export const TUTORIAL_CASES = [
       {
         title: '固定模板 fork',
         description: '记录 fork URL、base commit 与现有 CI。',
-        sourceUrl: 'https://github.com/fastapi/full-stack-fastapi-template',
+        sourceUrl:
+          'https://codeload.github.com/fastapi/full-stack-fastapi-template/tar.gz/d506ea4883c0f7bfcf5280921cfc407c46808711',
+        revision: 'd506ea4883c0f7bfcf5280921cfc407c46808711',
+        sha256: '538250a42afb8fc0be383d2a8af66cb182b08d1cfadfd766eff39b2d7c476f0b',
+        bytes: 683209,
         preparation: '创建 task-scoped branch；用示例环境变量，禁止接触线上数据库。',
       },
       {
         title: 'feature-request.md',
         description:
           '练习需求：为当前用户新增可选时区偏好，API 可读写，前端设置页可编辑，旧用户保持 UTC。',
+        assetPath: 'tutorialCaseCatalog.ts#coding-feature-delivery/feature-request',
+        revision: 'request-v1',
+        sha256: '7d8545d25022bcdcc3c968f3df8185cff2388690d1a533d7dd6074eff3acf2f1',
+        bytes: 185,
+        inlineContent:
+          'feature=user timezone preference\nformat=IANA timezone name\ndefault=UTC\npaths=API read/write,settings edit,refresh persistence,invalid-value error\ncompatibility=existing users unchanged\n',
         preparation: '写清合法时区、缺省行为、权限、API 响应和回滚/迁移边界。',
       },
     ],
@@ -951,7 +1069,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '编码智能体',
+      agentId: 'coding-assistant',
+      agentName: '编程助手',
+      modelId: 'glm-5.2',
       modelGuidance: '选择能长时间操作仓库、运行测试和浏览器的编码模型；复杂迁移用高推理档。',
       why: '案例强调跨数据库、API、前端的最小纵向交付，而不是生成孤立代码。',
     },
@@ -961,16 +1081,16 @@ export const TUTORIAL_CASES = [
     id: 'coding-regression-rescue',
     contentVersion: 1,
     category: 'coding',
-    title: '救回一个只能偶发复现的回归测试',
+    title: '修复 pytest 的 walrus 重复求值回归',
     summary:
-      '在 pytest 自身的公开仓库中选择一个带复现信息的未决缺陷，把“偶尔红”变成固定失败证据，再做最小修复与重复运行。',
-    audience: '正在被 flaky test、竞态或环境差异拖慢的维护者',
+      '固定 pytest #14445 与 base commit 28e86a6，用已验证的两条失败用例定位 assertion rewriting 对 walrus 表达式的重复求值。',
+    audience: '需要从公开 issue、确定性复现一路交付回归修复的维护者',
     difficulty: '挑战',
     outcome: '可重复触发的最小测试、环境矩阵和不掩盖问题的修复证据。',
     capabilityIds: ['github-repository', 'team-mode', 'artifacts-download'],
     requirements: [
       '只在 fork/worktree 操作',
-      '选择有明确复现步骤且许可允许的公开 issue',
+      '固定公开 issue #14445 与 base commit 28e86a6c2ae0173831e4925a4af89b02a2936d09',
       '不能用重试或放宽断言当修复',
     ],
     sources: [
@@ -979,50 +1099,70 @@ export const TUTORIAL_CASES = [
         url: 'https://github.com/pytest-dev/pytest',
         role: 'input',
         license: 'MIT',
-        usageNote: '运行时固定 commit 和一个仍可复现的公开 issue；不向上游自动发 PR。',
+        usageNote:
+          '案例固定 issue #14445 和 base commit 28e86a6；不在运行时另选 issue，也不自动发 PR。',
       },
       {
-        title: 'pytest flaky tests 说明',
-        url: 'https://docs.pytest.org/en/stable/explanation/flaky.html',
+        title: 'pytest issue #14445：walrus duplicate evaluation',
+        url: 'https://github.com/pytest-dev/pytest/issues/14445',
         role: 'method',
         license: 'MIT（pytest 文档）',
-        usageNote: '用作诊断分类参考，不把 rerun 当成根因修复。',
+        usageNote: '使用 issue 中公开的最小复现；不复制评论中的候选补丁。',
       },
     ],
     inputMaterials: [
       {
-        title: '固定公开 issue 快照',
-        description: '从 pytest issue 中选取包含环境与复现信息、仍适用于固定 commit 的一项。',
-        sourceUrl: 'https://github.com/pytest-dev/pytest/issues',
-        preparation: '保存 issue URL、抓取时间、正文快照和 base commit；先确认不是已修复问题。',
+        title: 'pytest 固定仓库归档',
+        description: 'pytest base commit 28e86a6 的完整源码归档。',
+        sourceUrl:
+          'https://codeload.github.com/pytest-dev/pytest/tar.gz/28e86a6c2ae0173831e4925a4af89b02a2936d09',
+        revision: '28e86a6c2ae0173831e4925a4af89b02a2936d09',
+        sha256: '8130ee6de2457c9c434656de22fa0c786971c05baf6e1d480b10e3df470938a2',
+        bytes: 1719201,
+        preparation: '下载后先核对 SHA-256，再建立隔离 worktree；不得在归档目录直接改。',
       },
       {
-        title: 'environment-matrix.yml',
-        description: '从 issue 提炼最小 Python/OS/依赖组合。',
+        title: '固定公开 issue 快照',
+        description: 'pytest #14445 的固定 GitHub API 响应，包含 walrus 重复求值最小复现。',
+        sourceUrl: 'https://api.github.com/repos/pytest-dev/pytest/issues/14445',
+        revision: 'issue-14445-updated-2026-06-02T12:55:32Z',
+        sha256: 'b12818a7a7eb4e388c56f0af149f73212dd5fd49d06a3dfdf7bc69e9ecdb8f3a',
+        bytes: 7324,
+        preparation: '核对响应 SHA-256；使用固定 base commit，不读取 issue 评论中的候选修复。',
+      },
+      {
+        title: 'reproducer.yml',
+        description: '固定 Python 3.12.3 命令与预期：rewrite 模式 2 failed，plain 模式为控制路径。',
+        assetPath: 'tutorialCaseCatalog.ts#coding-regression-rescue/reproducer',
+        revision: 'reproducer-v1',
+        sha256: 'db2c5b6a344abe04b944916da0e6f648e2ea99a182a5dad0a9121006fc2514f8',
+        bytes: 237,
+        inlineContent:
+          'base_commit: 28e86a6c2ae0173831e4925a4af89b02a2936d09\nissue: https://github.com/pytest-dev/pytest/issues/14445\npython: 3.12.3\ncommand: python -m pytest -q test_walrus_case.py\nexpected_baseline: 2 failed\nplain_assertion_control: 2 passed\n',
         preparation: '矩阵必须有限且有问题证据，不为猜测无限扩容。',
       },
     ],
-    starterPrompt: `在 pytest 的隔离 fork 中处理我固定的公开 issue。先判断它在 base commit 是否仍成立；记录精确环境并用循环、seed 或调度控制把偶发现象压缩为稳定复现，但不得通过 sleep、自动重试或放宽断言掩盖失败。
-找到第一次产生错误状态的直接代码路径，写确定性回归测试，再做最小修复。分别运行目标测试 100 次、相关模块测试和原有正常路径；如果仍无法稳定复现，交付诊断结果并停止，不要声称已修复。
+    starterPrompt: `在 pytest@28e86a6c2ae0173831e4925a4af89b02a2936d09 的隔离 worktree 中处理公开 issue #14445。先校验仓库归档与 issue 快照哈希，再用 reproducer.yml 的固定命令证明 assertion rewriting 会让 walrus 表达式重复求值；--assert=plain 是必须通过的对照路径。禁止查找现成补丁、自动重试或放宽断言。
+找到第一次重复求值的直接代码路径，写确定性回归测试，再做最小修复。分别运行目标测试、相关 assertion rewrite 测试和原有正常路径；如果固定基线不能复现，交付诊断结果并停止，不要声称已修复。
 输出 reproducer.py、root-cause.md、fix.patch 和 run-matrix.json。`,
     stages: [
       {
         id: 'confirm',
         title: '确认问题仍存在',
         input: 'issue 快照、base commit 与环境矩阵。',
-        operation: '原样执行报告步骤，记录成功/失败频率和环境差异。',
-        visibleProcess: ['环境探测', '重复命令', '频率统计'],
+        operation: '运行固定 rewrite 与 plain 两条命令，记录退出码和环境。',
+        visibleProcess: ['环境探测', '两条固定命令', '失败断言对照'],
         output: 'baseline-runs.json。',
         acceptance: ['问题在固定基线有证据', '未复现则明确停止修复'],
       },
       {
         id: 'stabilize',
-        title: '把概率失败变成确定证据',
-        input: '失败日志和相关代码路径。',
-        operation: '控制随机 seed、时钟或调度，缩小到确定性触发条件。',
+        title: '把重复求值缩成最小证据',
+        input: '两条失败断言和 assertion rewrite 代码路径。',
+        operation: '缩小 AST rewrite 触发条件，同时保留 plain 模式正常对照。',
         visibleProcess: ['时间线日志', '状态 diff', '最小 reproducer'],
         output: 'reproducer.py 与失败测试。',
-        acceptance: ['基线连续运行稳定失败', '没有用 sleep/rerun 隐藏失败'],
+        acceptance: ['rewrite 基线 2/2 失败', 'plain 控制路径 2/2 通过'],
       },
       {
         id: 'fix',
@@ -1065,7 +1205,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '编码智能体 + 独立诊断子任务',
+      agentId: 'coding-assistant',
+      agentName: '编程助手',
+      modelId: 'glm-5.2',
       modelGuidance: '用高推理模型分析时间线；让第二任务只复核因果链而不另起重构。',
       why: '偶发问题需要可重复证据，更多防御代码不能代替定位。',
     },
@@ -1077,7 +1219,7 @@ export const TUTORIAL_CASES = [
     category: 'coding',
     title: '用真实浏览器修一条前端可访问性问题',
     summary:
-      '在 TodoMVC React 示例的固定提交上先用键盘、axe 和性能轨迹发现问题，只修一个已证实的用户路径并做前后对照。',
+      '在 TodoMVC React@ff43b02 上修复已冻结的 checkbox accessible-name 缺陷，并用键盘、axe 和真实浏览器做前后对照。',
     audience: '希望 AI 不只看代码，还能在真实页面中验收体验的前端开发者',
     difficulty: '进阶',
     outcome: '带浏览器证据、自动化回归和移动端/键盘路径验收的最小前端补丁。',
@@ -1087,7 +1229,11 @@ export const TUTORIAL_CASES = [
       'artifacts-download',
       'team-mode',
     ],
-    requirements: ['固定仓库 commit', '真实浏览器而非只看 DOM 字符串', '只修已复现问题'],
+    requirements: [
+      '固定仓库 commit ff43b02e59dfa604386bb382034b2cd07c2bcd8a',
+      '真实浏览器而非只看 DOM 字符串',
+      '目标仅限 todo item checkbox 缺少 accessible name',
+    ],
     sources: [
       {
         title: 'TodoMVC monorepo',
@@ -1115,33 +1261,44 @@ export const TUTORIAL_CASES = [
       {
         title: 'TodoMVC React 示例固定提交',
         description: '选择仓库内当前 React 示例并记录启动命令、commit 与依赖锁。',
-        sourceUrl: 'https://github.com/tastejs/todomvc',
+        sourceUrl:
+          'https://codeload.github.com/tastejs/todomvc/tar.gz/ff43b02e59dfa604386bb382034b2cd07c2bcd8a',
+        revision: 'ff43b02e59dfa604386bb382034b2cd07c2bcd8a',
+        sha256: '22fd7c5251b636773561cc0ab606896f48c8dbcad80e79b427989bfc0e134718',
+        bytes: 20046745,
         preparation: '安装依赖后不修改基线，先保存桌面/移动视口与键盘操作录像。',
       },
       {
         title: 'journey.md',
         description: '添加任务、编辑、完成、筛选、清空的键盘与窄屏用户路径。',
+        assetPath: 'tutorialCaseCatalog.ts#coding-frontend-quality/journey',
+        revision: 'journey-v1',
+        sha256: '4a3a22bdeb348ac012ccd3117dd7fb21b40b482d0889f9eb8acdce378bf18952',
+        bytes: 247,
+        inlineContent:
+          'target=examples/react/src/todo/components/item.jsx\ndefect=todo item checkbox has no accessible name because input has no id and adjacent label has no htmlFor\npath=add item,focus checkbox,read accessible name,toggle item\nviewports=1280x800,375x812\n',
         preparation: '给每步定义可观察预期；审计只选择一条实际失败进入修复。',
       },
     ],
-    starterPrompt: `在 TodoMVC React 示例的固定 commit 上执行一次证据优先的前端质量修复。先启动页面，用真实浏览器按 journey.md 完成桌面、375px 窄屏和纯键盘路径，保存截图、axe 结果、控制台与 Lighthouse 配置。
-只选择一条已复现、能对应具体 WCAG 成功准则或明确性能根因的问题。先写自动化回归，再做最小 HTML/CSS/React 修复；不要顺手重设计或追分。用相同浏览器与条件做前后对照，并确认主要正常路径未回归。
+    starterPrompt: `在 TodoMVC React@ff43b02e59dfa604386bb382034b2cd07c2bcd8a 上修复已冻结缺陷：examples/react/src/todo/components/item.jsx 的 todo item checkbox 没有 id，旁边 label 没有 htmlFor，因此 checkbox 没有 accessible name。先校验归档哈希，再用真实浏览器按 journey.md 在桌面、375px 窄屏和纯键盘路径复现，保存截图、axe 结果和 accessible-name 断言。
+先写自动化回归，再做最小 HTML/React 修复；不要顺手重设计或追分。用相同浏览器与条件做前后对照，并确认添加、编辑、完成和筛选路径未回归。
 输出 before-after.md、e2e 测试、trace/ 和 fix.patch。`,
     stages: [
       {
         id: 'baseline',
         title: '捕获真实基线',
         input: '固定页面和 journey.md。',
-        operation: '按相同视口、浏览器和节流执行键盘、axe 与 Lighthouse。',
+        operation:
+          '按相同视口和浏览器定位 todo item checkbox，执行键盘、axe 与 accessible-name 检查。',
         visibleProcess: ['浏览器操作', '元素定位', '控制台/网络/性能记录'],
         output: '基线截图、录像、axe JSON 和 trace。',
         acceptance: ['问题可由用户路径复现', '环境和测试条件已记录'],
       },
       {
         id: 'scope',
-        title: '选择一个证实的根因',
+        title: '确认已冻结缺陷的根因',
         input: '基线证据。',
-        operation: '把失败对应到具体元素、事件或渲染路径，冻结本次范围。',
+        operation: '确认 input 缺 id、相邻 label 缺 htmlFor 的命名关系，范围不扩到其他评分项。',
         visibleProcess: ['代码定位', '规则映射', '范围声明'],
         output: 'root-cause.md 和验收标准。',
         acceptance: ['问题有用户影响证据', '不以综合评分替代根因'],
@@ -1187,7 +1344,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '编码智能体（启用容器网页预览）',
+      agentId: 'coding-assistant',
+      agentName: '编程助手',
+      modelId: 'glm-5.2',
       modelGuidance: '选择能操控真实浏览器和修改仓库的模型；视觉审查可由独立任务复核。',
       why: '前端质量必须以用户可操作页面为证据，静态代码审查不够。',
     },
@@ -1199,12 +1358,16 @@ export const TUTORIAL_CASES = [
     category: 'coding',
     title: '把依赖升级做成可回退的工程变更',
     summary:
-      '在 pypa/sampleproject 固定 fork 中选择一个实际过期的开发依赖，先读上游变更，再更新锁定、验证包构建与安装，不做盲目全量升级。',
+      '在 pypa/sampleproject@621e497 的教学约束中把 coverage 7.9.2 升至 7.15.4，验证包构建与安装，不做盲目全量升级。',
     audience: '维护 Python 服务、库或模板并担心升级引入隐性回归的开发者',
     difficulty: '进阶',
     outcome: '仅包含一个有依据依赖升级、兼容性说明、构建/安装证据和明确回退方式的 PR。',
     capabilityIds: ['github-repository', 'web-research', 'artifacts-download'],
-    requirements: ['固定 fork/base commit', '从仓库实际依赖状态选择目标', '一次只升级一个直接依赖'],
+    requirements: [
+      '固定 base commit 621e4974ca25ce531773def586ba3ed8e736b3fc',
+      '固定 coverage 7.9.2 → 7.15.4',
+      '一次只升级一个直接测试依赖',
+    ],
     sources: [
       {
         title: 'PyPA sampleproject',
@@ -1214,11 +1377,12 @@ export const TUTORIAL_CASES = [
         usageNote: '用于隔离练习；保留许可证，不自动向上游创建 PR。',
       },
       {
-        title: 'Python Packaging User Guide：Packaging projects',
-        url: 'https://packaging.python.org/en/latest/tutorials/packaging-projects/',
+        title: 'Python Packaging User Guide 官方源码',
+        url: 'https://github.com/pypa/packaging.python.org',
         role: 'method',
-        license: 'MIT（packaging.python.org 内容仓库）',
-        usageNote: '按当前官方构建和安装方法验证，不依赖过时博客命令。',
+        license: 'CC BY-SA 3.0',
+        usageNote:
+          '按当前官方构建和安装方法验证；文档源码见 https://github.com/pypa/packaging.python.org，改编须保持同许可。',
       },
       {
         title: 'PyPI JSON API',
@@ -1232,24 +1396,34 @@ export const TUTORIAL_CASES = [
       {
         title: 'sampleproject 固定 fork',
         description: '仓库 base commit、依赖声明和 CI 配置。',
-        sourceUrl: 'https://github.com/pypa/sampleproject',
+        sourceUrl:
+          'https://codeload.github.com/pypa/sampleproject/tar.gz/621e4974ca25ce531773def586ba3ed8e736b3fc',
+        revision: '621e4974ca25ce531773def586ba3ed8e736b3fc',
+        sha256: 'fd8597e4d351a9fd42007f48339dc93ee6469d8555fd0ff24906c69905357c01',
+        bytes: 5978,
         preparation: '创建隔离 worktree，保存基线测试、构建和安装日志。',
       },
       {
         title: 'upgrade-target.md',
-        description: '从实际依赖中选择一个有新稳定版的直接开发依赖。',
+        description: '固定教学约束 coverage 7.9.2 → 7.15.4，不在运行时另选依赖或版本。',
+        assetPath: 'tutorialCaseCatalog.ts#coding-dependency-upgrade/upgrade-target',
+        revision: 'target-v1',
+        sha256: '2269bc18f725d9d5713f12024eb9c306578fef34ef516edb3e6d59dc1b0a8bb0',
+        bytes: 161,
+        inlineContent:
+          'dependency=coverage\nfrom=7.9.2\nto=7.15.4\nlocation=project.optional-dependencies.test tutorial constraint\npython_requires=>=3.10\nscope=one direct test dependency\n',
         preparation: '记录旧/新版本、发布日期、Python 要求、上游 changelog URL 和选择理由。',
       },
     ],
-    starterPrompt: `审查固定 sampleproject fork 的实际依赖，只选择一个直接开发依赖做升级。先从 PyPI 和上游 changelog 核对目标稳定版本、Python 支持、弃用和破坏性变化；没有升级必要或不兼容就停止并说明。
-保存基线测试、sdist/wheel 构建和全新虚拟环境安装证据；然后最小修改依赖声明/锁定与必要兼容代码，不做全量刷新。重复相同验证，并检查 wheel 内容、元数据和 import smoke。
+    starterPrompt: `在 sampleproject@621e4974ca25ce531773def586ba3ed8e736b3fc 的教学测试约束中，把唯一目标 coverage 从 7.9.2 升至 7.15.4。先校验归档和 upgrade-target.md 哈希，再从 PyPI 与 coverage 官方 changelog 核对 Python 支持、弃用和破坏性变化；若与仓库 requires-python 矩阵不兼容就停止并说明。
+保存 coverage 7.9.2 基线测试、sdist/wheel 构建和全新虚拟环境安装证据；然后只更新该测试约束和被实际失败证明必要的兼容代码，不刷新其他依赖。重复相同验证，并检查 wheel 内容、元数据和 import smoke。
 输出 upgrade-note.md、before-after.json、构建产物摘要和 patch；回退方式必须只是还原该提交。`,
     stages: [
       {
         id: 'inventory',
-        title: '盘点并选择真实升级目标',
-        input: '依赖声明、CI 和 PyPI/上游信息。',
-        operation: '只比较直接依赖，读取版本要求和 changelog，形成升级或停止理由。',
+        title: '核验固定升级目标',
+        input: 'coverage 7.9.2 → 7.15.4、仓库 CI 和 PyPI/上游信息。',
+        operation: '读取两个固定版本的 Python 要求和 changelog，形成升级或停止理由。',
         visibleProcess: ['仓库搜索', 'PyPI 请求', 'changelog 来源'],
         output: 'upgrade-target.md。',
         acceptance: ['目标存在于当前仓库', '兼容性判断有一手来源'],
@@ -1312,7 +1486,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '编码智能体',
+      agentId: 'coding-assistant',
+      agentName: '编程助手',
+      modelId: 'glm-5.2',
       modelGuidance: '普通编码模型可执行；涉及破坏性版本或复杂矩阵时提高推理档。',
       why: '重点是读取上游契约和可回退验证，不是一次更新更多依赖。',
     },
@@ -1332,11 +1508,11 @@ export const TUTORIAL_CASES = [
     requirements: ['只使用公开纪要', '不得从上下文猜测负责人/截止日期', '发布前由参会者确认'],
     sources: [
       {
-        title: 'W3C 公开会议纪要索引（示例输入来源）',
-        url: 'https://www.w3.org/events/meetings/',
+        title: 'W3C DID 2025-12-04 固定会议纪要',
+        url: 'https://www.w3.org/2025/12/04-did-minutes.html',
         role: 'input',
         license: 'W3C Document License；具体纪要以页面声明为准',
-        usageNote: '运行时选择一份公开可访问纪要并记录永久 URL/日期，不处理成员私密会议。',
+        usageNote: '仅使用该固定公开纪要，并在运行前核对 SHA-256；不处理成员私密会议。',
       },
       {
         title: 'W3C Document License',
@@ -1350,13 +1526,21 @@ export const TUTORIAL_CASES = [
       {
         title: '一份固定 W3C 公开纪要',
         description: '包含议题、发言、决议或 action 的 HTML/文本。',
-        sourceUrl: 'https://www.w3.org/events/meetings/',
+        sourceUrl: 'https://www.w3.org/2025/12/04-did-minutes.html',
+        revision: 'w3c-did-minutes-2025-12-04',
+        sha256: '6c597851d31641c1cd1ba6e9141bed1434107160b8f56fe376e1f6087a9ddf51',
+        bytes: 22724,
         preparation: '保存永久 URL、会议日期和页面快照哈希；确认页面公开。',
       },
       {
         title: 'action-schema.csv',
         description:
           'id、action、owner、due、status、evidence_url、confidence、needs_confirmation。',
+        assetPath: 'tutorialCaseCatalog.ts#general-meeting-actions/action-schema',
+        revision: 'schema-v1',
+        sha256: '2b7942c40344257f666b477802011e419d71cc51ba75c0d30d02592d0c333dd8',
+        bytes: 70,
+        inlineContent: 'id,action,owner,due,status,evidence_url,confidence,needs_confirmation\n',
         preparation: 'owner/due 缺失时允许空值，不设自动默认人和日期。',
       },
     ],
@@ -1427,7 +1611,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '通用助手',
+      agentId: 'office-assistant',
+      agentName: '办公助手',
+      modelId: 'MiniMax-M3',
       modelGuidance: '默认模型即可；长纪要可提高上下文能力，不需要最高推理档。',
       why: '关键是结构化、来源锚点和缺失值诚实，而不是复杂推理。',
     },
@@ -1469,16 +1655,46 @@ export const TUTORIAL_CASES = [
       {
         title: 'market-question.md',
         description: '固定比较国家、产品假设、年份规则与宏观指标边界。',
-        preparation: '示例比较印度尼西亚、越南、菲律宾；使用三国均有值的最新共同年份。',
+        assetPath: 'tutorialCaseCatalog.ts#general-public-data-brief/market-question',
+        revision: 'question-v1',
+        sha256: '2674dee70dcc4942cdce32954a05bf81d2641d4213062162b74fa40e72f9c282',
+        bytes: 181,
+        inlineContent:
+          'countries=IDN,VNM,PHL\nyear=2022\nindicators=SP.POP.TOTL,NY.GDP.PCAP.CD,IT.NET.USER.ZS\nproduct=AI coding subscription for individual developers\nmacro_metrics_are_not_market_size=true\n',
+        preparation: '固定比较印度尼西亚、越南、菲律宾与 2022 年，不在看过结果后改年份。',
       },
       {
-        title: 'World Bank API 响应',
-        description: 'SP.POP.TOTL、NY.GDP.PCAP.CD、IT.NET.USER.ZS 三个指标的 JSON。',
-        sourceUrl: 'https://api.worldbank.org/v2/',
+        title: 'World Bank 人均 GDP 响应',
+        description: '三国 2022 年 NY.GDP.PCAP.CD 的固定 JSON 响应。',
+        sourceUrl:
+          'https://api.worldbank.org/v2/country/IDN;VNM;PHL/indicator/NY.GDP.PCAP.CD?format=json&date=2022&per_page=100',
+        revision: 'world-bank-2022-gdp-captured-2026-08-08',
+        sha256: '4999c2a6235c3c510ac06c8276d91f07b803be668ab2a7ac08b3414ad0b6b713',
+        bytes: 752,
+        preparation: '保存完整请求 URL、响应、抓取时间和 SHA-256，不手抄网页数字。',
+      },
+      {
+        title: 'World Bank 人口响应',
+        description: '三国 2022 年 SP.POP.TOTL 的固定 JSON 响应。',
+        sourceUrl:
+          'https://api.worldbank.org/v2/country/IDN;VNM;PHL/indicator/SP.POP.TOTL?format=json&date=2022&per_page=100',
+        revision: 'world-bank-2022-population-captured-2026-08-08',
+        sha256: '1681702d6f9ba85240240cd258618c5bad6b35b8a2256239de9df40713987b3b',
+        bytes: 688,
+        preparation: '保存完整请求 URL、响应、抓取时间和 SHA-256，不手抄网页数字。',
+      },
+      {
+        title: 'World Bank 互联网使用率响应',
+        description: '三国 2022 年 IT.NET.USER.ZS 的固定 JSON 响应。',
+        sourceUrl:
+          'https://api.worldbank.org/v2/country/IDN;VNM;PHL/indicator/IT.NET.USER.ZS?format=json&date=2022&per_page=100',
+        revision: 'world-bank-2022-internet-captured-2026-08-08',
+        sha256: '3337d51f8246765e71acd81313f5f0cabac1e2bd59c70836c4ad733595929a83',
+        bytes: 797,
         preparation: '保存完整请求 URL、响应、抓取时间和 SHA-256，不手抄网页数字。',
       },
     ],
-    starterPrompt: `为一个面向个人开发者的 AI 编程订阅产品制作市场初筛简报。比较印度尼西亚、越南和菲律宾，只用 World Bank API 的人口（SP.POP.TOTL）、人均 GDP（NY.GDP.PCAP.CD）和互联网使用率（IT.NET.USER.ZS），选择三国都有值的最新共同年份。
+    starterPrompt: `为一个面向个人开发者的 AI 编程订阅产品制作市场初筛简报。比较印度尼西亚、越南和菲律宾，只用已冻结的 World Bank API 2022 年人口（SP.POP.TOTL）、人均 GDP（NY.GDP.PCAP.CD）和互联网使用率（IT.NET.USER.ZS）响应；先逐个校验 SHA-256，不在运行时改年份。
 保存原始 JSON 和请求 URL，用脚本生成 tidy-data.csv；每个数字注明指标、国家、年份和来源。把“数据事实”“计算结果”“商业假设”分开，明确这三个宏观指标不能直接代表付费开发者人数或市场规模。
 输出 one-page-brief.html、tidy-data.csv、sources.md 和 assumptions.md，并在浏览器中检查桌面/移动版。`,
     stages: [
@@ -1495,7 +1711,7 @@ export const TUTORIAL_CASES = [
         id: 'fetch',
         title: '获取并保存原始响应',
         input: '固定 API 请求。',
-        operation: '下载三个指标，保留响应并用脚本选择最新共同年份。',
+        operation: '校验三个 2022 年固定响应的哈希，再生成结构化表。',
         visibleProcess: ['API URL', '响应保存', '共同年份计算'],
         output: 'raw/*.json 与 tidy-data.csv。',
         acceptance: ['所有数值来自保存的响应', '三国使用同一年份'],
@@ -1541,7 +1757,9 @@ export const TUTORIAL_CASES = [
       },
     ],
     suggestion: {
-      agent: '研究助手或通用助手',
+      agentId: 'research-assistant',
+      agentName: '科研助手',
+      modelId: 'deepseek-v4-pro',
       modelGuidance: '默认模型即可；开启联网和成果预览。',
       why: '数据量小，价值来自来源血缘和结论边界，而不是更昂贵的推理。',
     },
