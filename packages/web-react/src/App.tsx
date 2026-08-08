@@ -62,6 +62,7 @@ import {
   type PanelParam,
   parsePanelParam,
   parseSessionPath,
+  parseTutorialCase,
   parseTutorialTopic,
   useAppRoute,
 } from "./hooks/useAppRoute";
@@ -109,6 +110,7 @@ import {
   type ProductFeatureId,
 } from "./lib/productCapabilities";
 import { resolveTutorialAction } from "./lib/tutorialActions";
+import type { TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage } from "./lib/api";
 import {
   effectiveEffortModelId,
@@ -218,9 +220,10 @@ export function App() {
   // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
   const routingEnabled = !demo && !resetToken;
   const bootPanel = routingEnabled ? parsePanelParam(params) : null;
-  const bootTutorialTopic = routingEnabled
-    ? (parseTutorialTopic(params) ?? PRODUCT_CAPABILITIES.chatBasics.id)
-    : PRODUCT_CAPABILITIES.chatBasics.id;
+  const bootTutorialCase = routingEnabled ? parseTutorialCase(params) : null;
+  const bootTutorialTopic = routingEnabled && !bootTutorialCase
+    ? parseTutorialTopic(params)
+    : null;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -283,7 +286,8 @@ export function App() {
   const [orgOpen, setOrgOpen] = useState(bootPanel === "org");
   const [orgSection, setOrgSection] = useState<OrgSection>("overview");
   const [tutorialOpen, setTutorialOpen] = useState(bootPanel === "help");
-  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId>(bootTutorialTopic);
+  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(bootTutorialTopic);
+  const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(bootTutorialCase);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -927,13 +931,14 @@ export function App() {
     setOrgOpen(true);
   }, [refreshMe]);
 
-  const openTutorial = useCallback((id: ProductFeatureId = PRODUCT_CAPABILITIES.chatBasics.id) => {
+  const openTutorial = useCallback((id?: ProductFeatureId) => {
     // 教程是单一顶层中心：打开前收起其他中心，避免多层 Radix Dialog 叠加与焦点陷阱互抢。
     setSettingsOpen(false);
     setManageOpen(false);
     setMarketplaceOpen(false);
     setOrgOpen(false);
-    setTutorialTopic(id);
+    setTutorialTopic(id ?? null);
+    setTutorialCase(null);
     setTutorialOpen(true);
   }, []);
 
@@ -2004,13 +2009,17 @@ export function App() {
     },
     activePanel,
     activeTopic: tutorialOpen ? tutorialTopic : null,
-    onPopPanel: (panel, topic) => {
+    activeCase: tutorialOpen ? tutorialCase : null,
+    onPopPanel: (panel, topic, caseId) => {
       setSettingsOpen(panel === "settings");
       setMarketplaceOpen(panel === "market");
       setManageOpen(panel === "manage");
       setOrgOpen(panel === "org");
       setTutorialOpen(panel === "help");
-      if (panel === "help") setTutorialTopic(topic ?? PRODUCT_CAPABILITIES.chatBasics.id);
+      if (panel === "help") {
+        setTutorialTopic(topic);
+        setTutorialCase(caseId);
+      }
     },
   });
 
@@ -2565,7 +2574,19 @@ export function App() {
           <TutorialCenter
             open={tutorialOpen}
             topicId={tutorialTopic}
-            onTopicChange={setTutorialTopic}
+            caseId={tutorialCase}
+            onTopicChange={(id) => {
+              setTutorialTopic(id);
+              setTutorialCase(null);
+            }}
+            onCaseChange={(id) => {
+              setTutorialCase(id);
+              setTutorialTopic(null);
+            }}
+            onShowCaseGallery={() => {
+              setTutorialCase(null);
+              setTutorialTopic(null);
+            }}
             onClose={() => setTutorialOpen(false)}
             actionState={(feature) => resolveTutorialAction(feature, tutorialActionContext)}
             onRunAction={runTutorialAction}
