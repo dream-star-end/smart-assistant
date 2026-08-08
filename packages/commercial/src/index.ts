@@ -178,7 +178,7 @@ import {
   type CronWakeSchedulerHandle,
   type CronWakeRunner,
 } from "./agent-sandbox/cronWake.js";
-import { createInboxMessage } from "./inbox/inbox.js";
+import { createCronDeliveryInboxMessage, createInboxMessage } from "./inbox/inbox.js";
 import {
   startMarketplaceAiReviewScheduler,
   type MarketplaceAiReviewSchedulerHandle,
@@ -2165,38 +2165,15 @@ export async function registerCommercial(
           const senderId = adminRow.rows[0]?.id;
           if (!senderId) throw new Error("inbox-post: no active admin sender");
           if (msg.deliveryKey) {
-            const existing = await getPool().query<{ title: string; body_md: string }>(
-              `SELECT title,body_md FROM inbox_messages
-                WHERE source_type='cron_delivery' AND source_id=$1 AND source_phase=$2`,
-              [uid, msg.deliveryKey],
-            );
-            if (existing.rows[0]) {
-              if (existing.rows[0].title !== msg.title || existing.rows[0].body_md !== msg.bodyMd) {
-                throw new Error("inbox-post: delivery key content collision");
-              }
-              return;
-            }
-            const inserted = await getPool().query(
-              `INSERT INTO inbox_messages
-                 (audience,user_id,title,body_md,level,category,thread_key,created_by,
-                  source_type,source_id,source_phase)
-               SELECT 'user',$1,$2,$3,$4,'automation','cron:user:' || $1::text,$5,
-                      'cron_delivery',$1,$6
-                WHERE EXISTS (
-                  SELECT 1 FROM users WHERE id=$1 AND status='active'
-                )
-               ON CONFLICT (source_type,source_id,source_phase)
-                 WHERE source_type IS NOT NULL DO NOTHING`,
-              [uid, msg.title, msg.bodyMd, msg.level, senderId, msg.deliveryKey],
-            );
-            if ((inserted.rowCount ?? 0) === 1) return;
-            const raced = await getPool().query<{ title: string; body_md: string }>(
-              `SELECT title,body_md FROM inbox_messages
-                WHERE source_type='cron_delivery' AND source_id=$1 AND source_phase=$2`,
-              [uid, msg.deliveryKey],
-            );
-            if (raced.rows[0]?.title === msg.title && raced.rows[0]?.body_md === msg.bodyMd) return;
-            throw new Error("inbox-post: recipient missing or delivery key collision");
+            await createCronDeliveryInboxMessage({
+              userId: uid,
+              title: msg.title,
+              bodyMd: msg.bodyMd,
+              level: msg.level,
+              createdBy: senderId,
+              deliveryKey: msg.deliveryKey,
+            });
+            return;
           }
           await createInboxMessage(senderId, {
             audience: "user",

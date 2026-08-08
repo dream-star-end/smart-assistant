@@ -53,6 +53,7 @@ import {
   markRead,
   readAll,
   createInboxMessage,
+  createCronDeliveryInboxMessage,
   adminListInbox,
   adminDeleteInbox,
   InboxError,
@@ -239,6 +240,69 @@ describe("inbox DB ops (integ)", () => {
     assert.equal(b.messages.length, 0);
     assert.equal(a.unread_count, 1);
     assert.equal(b.unread_count, 0);
+  });
+
+  test("cron delivery key 真 PG 写入、幂等与冲突保护", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const deliveryKey = `cron.${"a".repeat(64)}`;
+    const input = {
+      userId: alice,
+      title: "定时任务完成",
+      bodyMd: "结果正文",
+      level: "info" as const,
+      createdBy: admin,
+      deliveryKey,
+    };
+
+    await createCronDeliveryInboxMessage(input);
+    const first = await query<{
+      audience: string;
+      user_id: string;
+      title: string;
+      body_md: string;
+      category: string;
+      thread_key: string;
+      created_by: string;
+      source_type: string;
+      source_id: string;
+      source_phase: string;
+    }>(
+      `SELECT audience,user_id::text AS user_id,title,body_md,category,thread_key,
+              created_by::text AS created_by,source_type,source_id::text AS source_id,source_phase
+         FROM inbox_messages WHERE source_type='cron_delivery' AND source_phase=$1`,
+      [deliveryKey],
+    );
+    assert.deepEqual(first.rows, [{
+      audience: "user",
+      user_id: alice.toString(),
+      title: input.title,
+      body_md: input.bodyMd,
+      category: "automation",
+      thread_key: `cron:user:${alice.toString()}`,
+      created_by: admin.toString(),
+      source_type: "cron_delivery",
+      source_id: alice.toString(),
+      source_phase: deliveryKey,
+    }]);
+
+    await createCronDeliveryInboxMessage(input);
+    const count = await query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM inbox_messages
+        WHERE source_type='cron_delivery' AND source_id=$1::bigint AND source_phase=$2`,
+      [alice.toString(), deliveryKey],
+    );
+    assert.equal(count.rows[0]!.count, "1");
+
+    await assert.rejects(
+      createCronDeliveryInboxMessage({ ...input, bodyMd: "冲突正文" }),
+      /delivery key content collision/,
+    );
+    const preserved = await query<{ body_md: string }>(
+      `SELECT body_md FROM inbox_messages
+        WHERE source_type='cron_delivery' AND source_id=$1::bigint AND source_phase=$2`,
+      [alice.toString(), deliveryKey],
+    );
+    assert.equal(preserved.rows[0]!.body_md, input.bodyMd);
   });
 
   test("富图片与消息同事务写入，按收件人隔离且删除级联失效", async (t) => {
