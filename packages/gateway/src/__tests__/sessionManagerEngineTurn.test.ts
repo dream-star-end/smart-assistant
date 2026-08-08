@@ -1373,6 +1373,75 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("browser Stop maps the real CCB Request was aborted result to USER_CANCELLED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const dispatchId = "44444444-4444-4444-8444-444444444444";
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("partial CCB answer before Stop");
+          startedResolve();
+        });
+      });
+      runner.interrupt = () => {
+        setImmediate(() => {
+          runner.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            errors: [
+              "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+              "Error: Request was aborted.\n    at withRetry (/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js:1:1)",
+            ],
+            usage: { input_tokens: 7, output_tokens: 0 },
+          });
+        });
+        return true;
+      };
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        _currentDispatch: {
+          userId: "user-1",
+          sessionId: "engine-peer",
+          clientMessageId: "msg-stop-real-ccb-abort",
+          dispatchId,
+          attemptNo: 1,
+        },
+      } as Partial<AgentSession>);
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        session.sessionKey,
+        session,
+      );
+
+      const completion = runOneTurn(sm, session, events);
+      await started;
+      assert.equal(sm.interrupt(session.sessionKey), true);
+      await completion;
+      await sm.awaitPendingPersistence();
+
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.status, "interrupted");
+      assert.equal(payload.errorCode, "USER_CANCELLED");
+      assert.equal(payload.errorDetail, "本轮已由用户停止。");
+      assert.equal(payload.text, "partial CCB answer before Stop");
+      assert.equal(payload.dispatchId, dispatchId);
+      assert.deepEqual(
+        events.filter((event) => event.kind === "error"),
+        [{ kind: "error", error: "本轮已由用户停止。" }],
+      );
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop racing a natural end_turn keeps the single completed tape", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
@@ -1567,7 +1636,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("browser Stop escalation does not hide a late unrelated engine error", async () => {
+  test("browser Stop does not override an authoritative CCB refusal terminal", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -1597,7 +1666,9 @@ describe("crash/interrupt partial persistence", () => {
         });
         runner.result({
           is_error: true,
-          result: "unrelated provider failure",
+          subtype: "error_during_execution",
+          errors: ["Error: Request was aborted."],
+          stop_reason: "refusal",
           usage: { input_tokens: 8, output_tokens: 2 },
         });
       };
@@ -1621,7 +1692,7 @@ describe("crash/interrupt partial persistence", () => {
       assert.equal(captured.payloads[0]!.errorCode, "ENGINE_ERROR");
       assert.equal(
         captured.payloads[0]!.errorDetail,
-        '{"result":"unrelated provider failure"}',
+        '{"subtype":"error_during_execution","errors":["Error: Request was aborted."]}',
       );
       assert.equal(captured.payloads[0]!.engineBilling?.terminalCode, "CODEX_ERROR");
     } finally {

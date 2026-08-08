@@ -4777,11 +4777,20 @@ export class SessionManager {
           // that diagnostic runtime event, but only a platform-owned waiver or
           // an engine-confirmed user cancellation may override the summary.
           // If Stop races a natural end_turn, completion remains authoritative.
+          // CCB confirms its cooperative AbortController path with this exact
+          // null-stop-reason result shape instead of stopReason='interrupted'.
+          const ccbUserCancellationResult =
+            session.providerTag === 'ccb' &&
+            result?.isError === true &&
+            result.stopReason === null &&
+            result.errorDetail?.includes('"subtype":"error_during_execution"') === true &&
+            result.errorDetail.includes('Error: Request was aborted.')
           const userCancellationOverride =
             requestedTerminal?.status === 'interrupted' &&
             requestedTerminal.errorCode === 'USER_CANCELLED' &&
             (
               result?.stopReason === 'interrupted' ||
+              ccbUserCancellationResult ||
               (
                 terminalRequestEscalated &&
                 result?.isError === true &&
