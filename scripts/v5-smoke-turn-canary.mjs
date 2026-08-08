@@ -8,7 +8,8 @@
 //   ① exactText——最终正文精确为“2”(引擎真执行了题目,而非任意占位文本);
 //   ② sawFinal —— outbound.message{isFinal:true} 干净收尾帧(webchat turn 终止契约);
 //   ③ sawCost  —— outbound.cost_charged 计费到账(REQUIRE_COST=0 才放宽)。
-// error 帧(outbound.error/outbound.turn_error/error)= 立即失败。
+// 与本次 peer + clientMessageId 精确匹配的 error 帧
+// (outbound.error/outbound.turn_error/error)= 立即失败；同账号其它会话帧忽略。
 //
 // 用法(在 kl-mirror 上、release 根目录为 cwd 运行,node >= 20):
 //   node scripts/v5-smoke-turn-canary.mjs
@@ -93,6 +94,7 @@ if (!put.ok) {
 //   sawCost  = 收尾后广播 outbound.cost_charged(计费真到账;REQUIRE_COST=0 才放宽)。
 // 错误帧(outbound.error / outbound.turn_error / error)= 立即失败。
 const wsBase = BASE.replace(/^http/, 'ws')
+const clientMessageId = `m-deploy-smoke-${Date.now().toString(36)}-${process.pid}`
 
 const attempt = () => new Promise((resolve) => {
   const ws = new WebSocket(`${wsBase}/ws/user-chat-bridge`, ['bearer', token])
@@ -124,6 +126,7 @@ const attempt = () => new Promise((resolve) => {
       type: 'inbound.message',
       channel: 'webchat',
       peer: { id: peerId, kind: 'dm' },
+      clientMessageId,
       content: { text: '请回答:1+1等于几?只回答数字。' },
       ts: Date.now(),
       model: MODEL,
@@ -131,10 +134,14 @@ const attempt = () => new Promise((resolve) => {
     resetSilence()
   }
   ws.onmessage = (ev) => {
-    resetSilence()
     let f
     try { f = JSON.parse(ev.data) } catch { return }
+    const ownTurn =
+      f?.peer?.id === peerId &&
+      f?.clientMessageId === clientMessageId
     if (f.type === 'outbound.message') {
+      if (!ownTurn) return
+      resetSilence()
       for (const b of f.blocks ?? []) {
         if (b.kind === 'text' && b.text?.trim()) {
           sawText = true
@@ -162,8 +169,14 @@ const attempt = () => new Promise((resolve) => {
       }
       if (f.error) sawError = JSON.stringify(f.error).slice(0, 300)
     }
-    if (f.type === 'outbound.cost_charged') sawCost = true
+    if (f.type === 'outbound.cost_charged') {
+      // CCB cost 广播当前不带 peer/clientMessageId；保留原计费 smoke 契约。
+      resetSilence()
+      sawCost = true
+    }
     if (f.type === 'outbound.error' || f.type === 'outbound.turn_error' || f.type === 'error') {
+      if (!ownTurn) return
+      resetSilence()
       sawError = JSON.stringify(f).slice(0, 300)
     }
     // 三信号集齐即提前收连接,不必空等满 SILENCE_MS(cost_charged 通常是最后一帧)。

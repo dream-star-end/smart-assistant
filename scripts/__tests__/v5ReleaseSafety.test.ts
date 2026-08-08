@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { chmod, cp, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -47,6 +49,130 @@ const v5UnitB = path.join(root, 'deploy/v5/openclaude-v5-b.service')
 const v5BaselinePortGuardSocket = path.join(root, 'deploy/v5/openclaude-v5-baseline-port-guard.socket')
 const v5BaselinePortGuardService = path.join(root, 'deploy/v5/openclaude-v5-baseline-port-guard.service')
 const dirs: string[] = []
+const require_ = createRequire(path.join(root, 'package.json'))
+const { WebSocketServer } = require_('ws')
+
+async function runTurnCanaryFixture(
+  mode: 'foreign-then-success' | 'foreign-only' | 'own-error',
+): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v5-turn-canary-'))
+  dirs.push(dir)
+  const passwordFile = path.join(dir, 'password')
+  await writeFile(passwordFile, 'fixture-password\n')
+
+  const server = createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/api/auth/login') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ access_token: 'fixture-token' }))
+      return
+    }
+    if (req.method === 'PUT' && req.url?.startsWith('/api/sessions/')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end('{}')
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  const wss = new WebSocketServer({ server, path: '/ws/user-chat-bridge' })
+  let inboundAt = 0
+  wss.on('connection', (ws: {
+    once: (event: 'message', listener: (raw: { toString(): string }) => void) => void
+    send: (data: string) => void
+  }) => {
+    ws.once('message', (raw) => {
+      inboundAt = Date.now()
+      const inbound = JSON.parse(raw.toString())
+      const foreignErrors = [
+        JSON.stringify({
+          type: 'error',
+          code: 'UNAUTHORIZED_MODEL',
+          message: 'foreign recovery peer',
+          peer: { id: 'web-foreign-recovery', kind: 'dm' },
+          clientMessageId: inbound.clientMessageId,
+        }),
+        JSON.stringify({
+          type: 'error',
+          code: 'UNAUTHORIZED_MODEL',
+          message: 'foreign recovery turn',
+          peer: inbound.peer,
+          clientMessageId: 'm-recover-foreign',
+        }),
+      ]
+      const sendForeignErrors = () => foreignErrors.forEach((frame) => ws.send(frame))
+      if (mode === 'foreign-only') {
+        const timer = setInterval(sendForeignErrors, 15)
+        setTimeout(() => clearInterval(timer), 1_200)
+        return
+      }
+      sendForeignErrors()
+      if (mode === 'own-error') {
+        ws.send(JSON.stringify({
+          type: 'error',
+          code: 'UPSTREAM_FAILED',
+          message: 'own turn failed',
+          peer: inbound.peer,
+          clientMessageId: inbound.clientMessageId,
+        }))
+        return
+      }
+      ws.send(JSON.stringify({
+        type: 'outbound.message',
+        sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
+        channel: 'webchat',
+        peer: inbound.peer,
+        clientMessageId: inbound.clientMessageId,
+        blocks: [{ kind: 'text', text: '2' }],
+        isFinal: false,
+      }))
+      ws.send(JSON.stringify({
+        type: 'outbound.message',
+        sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
+        channel: 'webchat',
+        peer: inbound.peer,
+        clientMessageId: inbound.clientMessageId,
+        blocks: [],
+        isFinal: true,
+      }))
+      ws.send(JSON.stringify({ type: 'outbound.cost_charged' }))
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => resolve())
+  })
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const startedAt = Date.now()
+  const child = spawn(process.execPath, [turnCanary], {
+    cwd: root,
+    env: {
+      ...process.env,
+      V5_BASE: `http://127.0.0.1:${address.port}`,
+      V5_CANARY_PASSWORD_FILE: passwordFile,
+      V5_TURN_ATTEMPTS: '1',
+      V5_TURN_SILENCE_MS: '60',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString() })
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 3_000)
+    child.once('error', reject)
+    child.once('exit', (exitCode) => {
+      clearTimeout(timeout)
+      resolve(exitCode)
+    })
+  })
+  const elapsedMs = Date.now() - (inboundAt || startedAt)
+  await new Promise<void>((resolve) => wss.close(() => resolve()))
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  return { code, stdout, stderr, elapsedMs }
+}
 
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
@@ -7251,6 +7377,24 @@ wait $!
     assert.match(source.slice(attemptAt), /let finalText = ''/)
     assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText \}\)/)
     assert.match(source, /result\.finalText === '2'/)
+  })
+
+  test('real-turn canary ignores foreign recovery frames but still fails its own exact error', async () => {
+    const success = await runTurnCanaryFixture('foreign-then-success')
+    assert.equal(success.code, 0, success.stderr || success.stdout)
+    assert.match(success.stdout, /TURN_OK model=gpt-5\.6-sol exact_text=2 final=true cost_charged=true/)
+
+    const ownError = await runTurnCanaryFixture('own-error')
+    assert.equal(ownError.code, 1, ownError.stdout)
+    assert.match(ownError.stderr, /TURN_FAILED.*own turn failed/)
+
+    const foreignOnly = await runTurnCanaryFixture('foreign-only')
+    assert.equal(foreignOnly.code, 1, foreignOnly.stdout)
+    assert.match(foreignOnly.stderr, /TURN_INCOMPLETE.*resolve=silence/)
+    assert.ok(
+      foreignOnly.elapsedMs < 900,
+      `foreign frames incorrectly refreshed the 60ms silence timer (${foreignOnly.elapsedMs}ms)`,
+    )
   })
 
   test('candidate CCB cost fallback is exact ledger evidence and never weakens stable lanes', async () => {
