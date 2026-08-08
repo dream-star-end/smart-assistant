@@ -1192,11 +1192,12 @@ describe('media generation durable queue and projects', () => {
       assert.equal(completed?.resultSha256, resultSha)
       assert.equal(downloadAttempts, 2)
       assert.deepEqual(uploaded, inputBody)
-      for (let index = 0; index < 100 && ackAttempts < 2; index += 1) {
+      let acknowledged = await getJob('1', queued.id)
+      for (let index = 0; index < 100 && acknowledged?.workerAckPending; index += 1) {
         await handle.runNow()
         await new Promise((resolve) => setTimeout(resolve, 25))
+        acknowledged = await getJob('1', queued.id)
       }
-      const acknowledged = await getJob('1', queued.id)
       assert.equal(ackAttempts, 2)
       assert.equal(acknowledged?.workerAckPending, false)
       assert.ok(acknowledged?.workerAckedAt)
