@@ -1036,6 +1036,25 @@
           "assertion": "用户主动停止是预期终态，不得上报 turn_error 产品故障信号"
         }
       ]
+    },
+    {
+      "id": "INC-20260808-CRON-INBOX-DELIVERY",
+      "occurredAt": "2026-08-08",
+      "severity": "P1",
+      "symptom": "定时任务完成后通过 durable inbox 送达结果时，PostgreSQL 将复用参数推断为 text，再与 bigint 用户 ID 比较，导致站内信写入稳定失败，用户看不到任务结果。",
+      "rootFixCommit": "48717c15",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/inbox.integ.test.ts",
+          "assertion": "cron delivery key 真 PG 写入、幂等与冲突保护"
+        },
+        {
+          "layer": "live-e2e",
+          "path": "e2e/session-display/tests/11-cron-inbox-delivery.spec.ts",
+          "assertion": "cron durable inbox：真实容器直投 candidate 后用户 API 可见且字段完整"
+        }
+      ]
     }
   ]
 }
