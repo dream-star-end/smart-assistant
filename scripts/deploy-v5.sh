@@ -151,6 +151,11 @@ RELEASE_QUEUE_SCRIPT="$SCRIPT_DIR/v5-release-queue.sh"
   echo "FATAL: 缺或不可执行的 V5 release queue: $RELEASE_QUEUE_SCRIPT" >&2
   exit 1
 }
+DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
+[ -x "$DEPLOY_SURFACE_CHECK" ] || {
+  echo "FATAL: 缺或不可执行的 V5 deploy surface check: $DEPLOY_SURFACE_CHECK" >&2
+  exit 1
+}
 # deploy_state 单一权威访问层(P3;与 v5-caddy-apply.sh 共用 CAS/read/journal/lane_hash 同源)。
 DEPLOY_STATE_LIB="$SCRIPT_DIR/v5-deploy-state-lib.sh"
 [ -f "$DEPLOY_STATE_LIB" ] || { echo "FATAL: 缺 deploy_state lib: $DEPLOY_STATE_LIB" >&2; exit 1; }
@@ -3011,6 +3016,109 @@ resolve_release_source_commit() {
     fi
   fi
   git -C "$REPO_ROOT" rev-parse HEAD
+}
+
+# P3 canary only replaces master/web and deliberately preserves the active
+# container runtime tuple.  Before it consumes emergency authorization or
+# mutates deploy_state, prove that the preserved runtime/platform artifacts
+# already contain every candidate change mapped to those surfaces.
+p3_tuple_axis_source_commit() { # runtime-source|platform-runtime
+  local surface="$1" artifact="" manifest_source="" image="" expected_id="" inspect=""
+  local actual_id="" image_source="" embed_source=""
+  case "$surface" in
+    runtime-source) artifact="$(remote_env_get OC_RUNTIME_RELEASE)" ;;
+    platform-runtime) artifact="$(remote_env_get OC_PLATFORM_BUNDLE)" ;;
+    *) echo "✗ P3 tuple surface 非法:$surface" >&2; return 1 ;;
+  esac
+  if [[ -n "$artifact" ]]; then
+    manifest_source="$(ssh "$KL_HOST" bash -s -- "$artifact" <<'REMOTE'
+set -Eeuo pipefail
+artifact="$1"
+test -d "$artifact" && test -f "$artifact/MANIFEST.json"
+jq -er '.sourceCommit | select(type == "string" and test("^[0-9a-f]{40}$"))' "$artifact/MANIFEST.json"
+REMOTE
+)" || {
+      echo "✗ P3 无法从 $surface active artifact 读取可信 sourceCommit:$artifact" >&2
+      return 1
+    }
+    printf '%s\n' "$manifest_source"
+    return 0
+  fi
+
+  # Empty axes fall back to files baked into the immutable image.  The tag and
+  # configured ID must still identify the same image.  Runtime source additionally
+  # requires embed_source!=0; a slim image's source label is provenance only.
+  image="$(remote_env_get OC_RUNTIME_IMAGE)"
+  expected_id="$(remote_env_get OC_RUNTIME_IMAGE_ID)"
+  [[ -n "$image" && "$expected_id" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "✗ P3 $surface 空轴且 runtime image/tag identity 不完整" >&2
+    return 1
+  }
+  inspect="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}|{{ index .Config.Labels \"oc.runtime.source_commit\" }}|{{ index .Config.Labels \"oc.runtime.embed_source\" }}' '$image'" 2>/dev/null)" || {
+    echo "✗ P3 $surface 空轴无法 inspect immutable runtime image:$image" >&2
+    return 1
+  }
+  IFS='|' read -r actual_id image_source embed_source <<<"$inspect"
+  [[ "$actual_id" == "$expected_id" && "$image_source" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "✗ P3 $surface baked fallback 的 image ID/sourceCommit 不可信" >&2
+    return 1
+  }
+  if [[ "$surface" == runtime-source && ! "$embed_source" =~ ^[1-9][0-9]*$ ]]; then
+    echo "✗ P3 runtime-source 空轴却没有 embedded-source image 证明(embed_source=${embed_source:-<missing>}):source label 不代表容器内源码" >&2
+    return 1
+  fi
+  printf '%s\n' "$image_source"
+}
+
+p3_surface_plan_or_die() { # <base commit> <target commit> <label>
+  local base="$1" target="$2" label="$3" plan
+  if ! plan="$(node "$DEPLOY_SURFACE_CHECK" --repo "$REPO_ROOT" --base "$base" --target "$target")"; then
+    echo "✗ P3 $label 生效面分类失败(fail-closed)" >&2
+    return 1
+  fi
+  jq -e '
+    (.surfaces | type == "array") and (.manual | type == "array")
+    and (.matches | type == "object")
+  ' >/dev/null <<<"$plan" || {
+    echo "✗ P3 $label 生效面分类输出非法(fail-closed)" >&2
+    return 1
+  }
+  if jq -e '.manual | length > 0' >/dev/null <<<"$plan"; then
+    echo "✗ P3 $label 基准到 candidate 含 manual/unmatched/unsupported diff，不能证明保留 tuple 可生效:" >&2
+    jq -r '.manual[0:12][] | "   · \(.path):\(.reason)"' <<<"$plan" >&2
+    return 1
+  fi
+  printf '%s\n' "$plan"
+}
+
+assert_p3_preserved_tuple_matches_candidate() { # <target full commit>
+  local target="$1" runtime_base platform_base runtime_plan platform_plan
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] P3 生效面门:对 active runtime release/platform bundle sourceCommit..$target 严格分类；tuple surface 漂移即拒"
+    return 0
+  fi
+  [[ "$target" =~ ^[0-9a-f]{40}$ ]] \
+    && git -C "$REPO_ROOT" cat-file -e "${target}^{commit}" 2>/dev/null || {
+    echo "✗ P3 candidate source commit 非法/不可达:$target" >&2
+    return 1
+  }
+  runtime_base="$(p3_tuple_axis_source_commit runtime-source)" || return 1
+  platform_base="$(p3_tuple_axis_source_commit platform-runtime)" || return 1
+  runtime_plan="$(p3_surface_plan_or_die "$runtime_base" "$target" runtime-source)" || return 1
+  if jq -e '.surfaces | index("runtime-source") != null' >/dev/null <<<"$runtime_plan"; then
+    echo "✗ P3 会保留 OC_RUNTIME_RELEASE，但 candidate 含未生效的 runtime-source 改动:" >&2
+    jq -r '.matches["runtime-source"][] | "   · \(.)"' <<<"$runtime_plan" >&2
+    echo "  改走官方 ordinary deploy --with-dist，让 runtime release 与 master/web 由 joint saga 原子激活。" >&2
+    return 1
+  fi
+  platform_plan="$(p3_surface_plan_or_die "$platform_base" "$target" platform-runtime)" || return 1
+  if jq -e '.surfaces | index("platform-runtime") != null' >/dev/null <<<"$platform_plan"; then
+    echo "✗ P3 会保留 OC_PLATFORM_BUNDLE，但 candidate 含未生效的 platform-runtime 改动:" >&2
+    jq -r '.matches["platform-runtime"][] | "   · \(.)"' <<<"$platform_plan" >&2
+    echo "  改走官方 ordinary deploy --with-dist，让 platform bundle 与 master/web 由 joint saga 原子激活。" >&2
+    return 1
+  fi
+  echo "  ✓ P3 preserved tuple 生效面与 candidate 一致(runtime_base=$runtime_base platform_base=$platform_base)"
 }
 
 build_release() {
@@ -8589,20 +8697,32 @@ SQL
 
 canary() {
   echo "══ v5 --canary(蓝绿双 master 起手;RFC D5)══"
-  if [[ -n "$EMERGENCY_INCIDENT" ]]; then
-    consume_emergency_authorization || exit 1
-  fi
   resolve_active_lane
   assert_bluegreen_layout "$ACTIVE_SRC"
   [[ "$DRY" == 1 ]] || assert_release_marker "$(bg_current_release "$ACTIVE_SRC")"
   assert_runtime_channel_column
-  prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,拒绝 canary" >&2; exit 1; }
+  local requested_release="" p3_target_source=""
   if [[ -n "$CANARY_RELEASE" ]]; then
-    local requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
+    requested_release="$RELEASES_ROOT/$CANARY_RELEASE"
     [[ "$CANARY_RELEASE" == /* ]] && requested_release="$CANARY_RELEASE"
     assert_release_marker "$requested_release"
     assert_release_required_migrations "$requested_release"
+    if [[ "$DRY" == 1 ]]; then
+      p3_target_source="$(resolve_release_source_commit)" || exit 1
+    else
+      p3_target_source="$(ssh "$KL_HOST" "jq -er '.sourceCommit | select(type == \"string\" and test(\"^[0-9a-f]{40}$\"))' '$requested_release/.complete'" 2>/dev/null)" || {
+        echo "✗ P3 指定 release 缺可信 strong sourceCommit:$requested_release" >&2
+        exit 1
+      }
+    fi
+  else
+    p3_target_source="$(resolve_release_source_commit)" || exit 1
   fi
+  assert_p3_preserved_tuple_matches_candidate "$p3_target_source" || exit 1
+  if [[ -n "$EMERGENCY_INCIDENT" ]]; then
+    consume_emergency_authorization || exit 1
+  fi
+  prepare_live_baseline_safety || { echo "✗ live baseline 安全迁移失败,拒绝 canary" >&2; exit 1; }
   ds_snapshot
   ds_assert_phase stable
   local predecessor_release="$DS_active_release" predecessor_runtime_tuple
@@ -8634,7 +8754,7 @@ canary() {
   # step1:build release(--canary=<rel> 复用现有 release;否则从 HEAD build_release --with-dist)
   local reldir
   if [[ -n "$CANARY_RELEASE" ]]; then
-    reldir="$RELEASES_ROOT/$CANARY_RELEASE"; [[ "$CANARY_RELEASE" == /* ]] && reldir="$CANARY_RELEASE"
+    reldir="$requested_release"
     echo "── 复用指定 release:$reldir ──"
   else
     WITH_DIST=1
