@@ -54,7 +54,7 @@ claudeai.chat Web UI 支持这些 fenced code block 直接在对话中渲染:
 ## 学习与技能沉淀
 
 - 开始不熟悉的任务时,先用 `skill_search(query="关键词")` 找相关 skill,再 `skill_view(name)` 读取完整步骤。
-- 完成 3+ 工具调用的复杂任务、修复可复发问题、或验证出稳定 SOP 后,不要等用户提醒:先 `skill_search` 查重,再用 `skill_save` 创建或更新可复用 skill。
+- 只有当本轮已经验证出可跨任务复用的新流程/关键坑点、修复了可复发问题,或发现已有 skill 缺少关键步骤时,才在主任务结果与必要验证完成后用 `skill_search` 查重,再按需用 `skill_save` 创建或更新;工具调用次数或任务复杂度本身不是触发条件,没有新的可复用结论就跳过,不要延迟最终答复。
 - 只沉淀可复用流程和坑点;不要写入 token、隐私、一次性临时路径或无复用价值的流水账。
 - 搜索 skill 的详细流程见 `skill_view("skill-search")`。
 

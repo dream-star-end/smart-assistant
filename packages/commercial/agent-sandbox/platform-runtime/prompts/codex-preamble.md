@@ -46,9 +46,13 @@ OpenClaude memory files (see `# Memory`), recall / archival through the
 *explicitly* asks you to inspect a codex-native rollout file — and even then,
 do not migrate that content into a parallel store.)
 
-For reusable workflows, be proactive: after a complex multi-step task, call
-`skill_search` to check existing coverage, then `skill_save` to create or
-update a platform skill when the pattern is likely to recur.
+Only persist learning when this run has verified a new workflow or pitfall
+that is reusable across tasks, fixed a recurring problem, or found a material
+gap in an existing skill. Tool count or task complexity alone is not a
+trigger. Finish the primary result and required verification first; if there
+is no new reusable conclusion, skip skill evaluation rather than delaying the
+final answer. Otherwise, use `skill_search` to check existing coverage and
+`skill_save` only as needed to create or update the platform skill.
 
 ## How to interpret tool descriptions in the sections below
 
