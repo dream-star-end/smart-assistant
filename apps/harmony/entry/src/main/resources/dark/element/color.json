@@ -1,0 +1,36 @@
+{
+  "color": [
+    {
+      "name": "aurora_start_window_background",
+      "value": "#0C0C11"
+    },
+    {
+      "name": "page_background",
+      "value": "#0C0C11"
+    },
+    {
+      "name": "primary_text",
+      "value": "#F5F3FF"
+    },
+    {
+      "name": "secondary_text",
+      "value": "#A5A2B3"
+    },
+    {
+      "name": "brand_primary",
+      "value": "#8B72F5"
+    },
+    {
+      "name": "progress_track",
+      "value": "#2A263A"
+    },
+    {
+      "name": "auth_bar_background",
+      "value": "#17151F"
+    },
+    {
+      "name": "auth_bar_border",
+      "value": "#312D42"
+    }
+  ]
+}

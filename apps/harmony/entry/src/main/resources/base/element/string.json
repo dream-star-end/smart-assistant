@@ -1,0 +1,72 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Aurora HarmonyOS client"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Aurora AI assistant"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Aurora"
+    },
+    {
+      "name": "loading",
+      "value": "正在连接 Aurora"
+    },
+    {
+      "name": "load_failed",
+      "value": "暂时无法连接"
+    },
+    {
+      "name": "load_failed_hint",
+      "value": "请检查网络连接后重试"
+    },
+    {
+      "name": "retry",
+      "value": "重新加载"
+    },
+    {
+      "name": "blocked_link",
+      "value": "已拦截不安全链接"
+    },
+    {
+      "name": "external_link_failed",
+      "value": "无法打开外部链接"
+    },
+    {
+      "name": "external_authorization",
+      "value": "外部授权网站 · 请核对域名"
+    },
+    {
+      "name": "cancel_authorization",
+      "value": "取消"
+    },
+    {
+      "name": "continue_authorization",
+      "value": "确认并继续"
+    },
+    {
+      "name": "authorization_prompt_title",
+      "value": "即将打开外部网站"
+    },
+    {
+      "name": "authorization_prompt_hint",
+      "value": "仅当你刚刚发起登录或连接器授权，并确认以下域名属于服务提供方时继续。"
+    },
+    {
+      "name": "download_saved",
+      "value": "文件已保存"
+    },
+    {
+      "name": "download_failed",
+      "value": "文件保存失败"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "用于在对话中发送语音消息"
+    }
+  ]
+}

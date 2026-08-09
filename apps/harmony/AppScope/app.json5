@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "chat.claudeai.aurora",
+    "vendor": "Aurora",
+    "versionCode": 1000000,
+    "versionName": "1.0.0",
+    "icon": "$media:aurora_icon",
+    "label": "$string:app_name"
+  }
+}
