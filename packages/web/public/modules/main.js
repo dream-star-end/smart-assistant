@@ -42,7 +42,7 @@ import {
   maybeSyncNow,
   setSyncDeps,
   syncSessionsFromServer,
-} from './sync.js?v=13'
+} from './sync.js?v=14'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setThemeAppliedFn, setToastFn } from './theme.js'
@@ -134,7 +134,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=13'
+} from './sessions.js?v=14'
 
 // ── Messages ──
 import {
@@ -149,7 +149,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=50'
+} from './messages.js?v=51'
 
 // ── WebSocket ──
 import {
@@ -177,7 +177,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=57'
+} from './websocket.js?v=58'
 
 // ── Slash commands ──
 import {
@@ -190,7 +190,7 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=10'
+} from './commands.js?v=11'
 import { getEffortForSubmit, initEffortPicker, renderEffortPicker } from './effortMode.js?v=3'
 import {
   getGoalModeForSubmit,
@@ -967,6 +967,7 @@ async function send() {
     state.ws.send(JSON.stringify(wsPayload))
     userMsg.status = 'sent'
     updateMsgStatus(userMsg)
+    sess._inFlightClientMessageId = wsPayload.idempotencyKey
     setSending(true)
     resetThinkingSafety(sess.id)
     updateSendEnabled()
@@ -1154,6 +1155,7 @@ function buildPaletteItems(query) {
             sess._streamingThinking = null
             sess._streamingPlan = null
             sess._sendingInFlight = false
+            sess._inFlightClientMessageId = null
             clearTurnTiming(sess)
             // Drop reply tracker so any stray isFinal from the old agent's
             // aborted turn can't mis-attribute to a fresh turn after switch
@@ -2454,6 +2456,7 @@ async function init() {
     sess._streamingThinking = null
     sess._streamingPlan = null
     sess._sendingInFlight = false
+    sess._inFlightClientMessageId = null
     // Drop reply tracker so a late isFinal from the old agent doesn't bind to
     // a new user message on the switched-to agent.
     resetReplyTracker(sess)

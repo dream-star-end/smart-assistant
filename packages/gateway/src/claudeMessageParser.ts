@@ -560,17 +560,6 @@ export class ClaudeMessageParser {
           this.onToolUse({ name: c.name, id: c.id, input: inputRaw as Record<string, any> })
         }
 
-        // Cap inputJson to avoid sending excessively large payloads to the frontend.
-        // For tools with large content fields (Write, Edit), truncate string values.
-        let inputJson: unknown = inputRaw
-        if (inputStr.length > 8000) {
-          const capped: Record<string, unknown> = {}
-          for (const [k, v] of Object.entries(inputRaw as Record<string, unknown>)) {
-            capped[k] = typeof v === 'string' && v.length > 3000 ? `${v.slice(0, 3000)}…` : v
-          }
-          inputJson = capped
-        }
-
         // Only track pending-tool-calls / tool.called metrics for the main
         // agent turn. pendingToolCalls gates turn completion in SessionManager;
         // counting subagent tools here would leave the counter permanently
@@ -592,7 +581,9 @@ export class ClaudeMessageParser {
           blockId: c.id,
           toolName: c.name ?? 'unknown',
           inputPreview,
-          inputJson,
+          // Preview is intentionally short, but the durable frame keeps the
+          // exact tool input. The web client materializes large values lazily.
+          inputJson: inputRaw,
           partial: false,
         }
         if (parentToolUseId) block.parentToolUseId = parentToolUseId
@@ -647,6 +638,7 @@ export class ClaudeMessageParser {
         } else {
           preview = JSON.stringify(previewRaw ?? '')
         }
+        const fullOutput = preview
         if (preview.length > 3000) preview = `${preview.slice(0, 3000)}…`
         const block: Record<string, unknown> = {
           kind: 'tool_result',
@@ -655,6 +647,8 @@ export class ClaudeMessageParser {
           toolName,
           isError: !!c.is_error,
           preview,
+          output: fullOutput,
+          outputJson: previewRaw,
         }
         if (parentToolUseId) block.parentToolUseId = parentToolUseId
         this.onEvent({ kind: 'block', block: block as any })

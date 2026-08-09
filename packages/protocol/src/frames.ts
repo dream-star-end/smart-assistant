@@ -185,6 +185,10 @@ export const OutboundContentBlock = Type.Union([
     toolUseBlockId: Type.Optional(Type.String()),
     toolName: Type.String(),
     isError: Type.Boolean(),
+    /** Complete tool result. `preview` is display-only and may be shortened. */
+    output: Type.Optional(Type.String()),
+    /** Exact structured result before text rendering, when supplied by the engine. */
+    outputJson: Type.Optional(Type.Unknown()),
     preview: Type.Optional(Type.String()),
     parentToolUseId: Type.Optional(Type.String()),
   }),
@@ -262,6 +266,10 @@ export const OutboundMessage = Type.Object({
   // legacy pointer path). NOT a transport cursor — frameSeq still owns
   // ordering/replay dedup.
   turnId: Type.Optional(Type.String()),
+  // Exact browser submit identity. Unlike turnId (the model/runtime turn),
+  // this matches InboundMessage.idempotencyKey and lets a reconnecting tab
+  // settle only the submit it actually owns.
+  clientMessageId: Type.Optional(Type.String()),
   channel: Type.String(),
   peer: Peer,
   blocks: Type.Array(OutboundContentBlock),
@@ -375,6 +383,26 @@ export const OutboundResumeFailed = Type.Object({
 })
 export type OutboundResumeFailed = Static<typeof OutboundResumeFailed>
 
+export const OutboundTurnStatus = Type.Object({
+  type: Type.Literal('outbound.turn_status'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  agentId: Type.Optional(Type.String()),
+  status: Type.Union([
+    Type.Literal('running'),
+    Type.Literal('compacting'),
+    Type.Literal('idle'),
+    Type.Literal('completed'),
+    Type.Literal('interrupted'),
+    Type.Literal('unknown'),
+  ]),
+  clientMessageId: Type.Optional(Type.String()),
+  startedAt: Type.Optional(Type.Number()),
+  ts: Type.Optional(Type.Number()),
+})
+export type OutboundTurnStatus = Static<typeof OutboundTurnStatus>
+
 export const OutboundGoalStatus = Type.Object({
   type: Type.Literal('outbound.goal_status'),
   sessionKey: Type.String(),
@@ -423,6 +451,7 @@ export const AnyFrame = Type.Union([
   OutboundPermissionRequest,
   OutboundPermissionSettled,
   OutboundResumeFailed,
+  OutboundTurnStatus,
   OutboundGoalStatus,
   ControlFrame,
 ])

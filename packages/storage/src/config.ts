@@ -126,6 +126,13 @@ export interface UserEntry {
 
 export interface OpenClaudeConfig {
   version: 1
+  storage?: {
+    sessions?: {
+      /** Browser session/timeline authority. PostgreSQL credentials stay in
+       * OPENCLAUDE_SESSIONS_DATABASE_URL, never in this config file. */
+      driver?: 'sqlite' | 'postgres'
+    }
+  }
   gateway: {
     bind: string // e.g. "127.0.0.1"
     port: number // 18789

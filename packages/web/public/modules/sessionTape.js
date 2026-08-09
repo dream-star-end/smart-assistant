@@ -60,7 +60,8 @@ function appendChild(group, block) {
     }
     tool._completed = true
     tool._partial = false
-    tool.output = block.preview || ''
+    tool.output = block.output ?? block.preview ?? ''
+    tool.outputJson = block.outputJson ?? null
     tool.error = !!block.isError
     return
   }
@@ -301,15 +302,16 @@ export function projectSessionTape(rows) {
         if (tool) {
           tool._completed = true
           tool._partial = false
-          tool.output = block.preview || ''
+          tool.output = block.output ?? block.preview ?? ''
+          tool.outputJson = block.outputJson ?? null
           tool.error = !!block.isError
           tool.completedAt = row.ts
           if (tool.role === 'agent-group') {
-            tool._resultPreview = (block.preview || '').slice(0, 200)
+            tool._resultPreview = (block.preview || block.output || '').slice(0, 200)
             tool._isError = !!block.isError
             tool._duration = row.ts - tool.startTime
           }
-        } else if (block.preview) {
+        } else if (block.output || block.preview) {
           const key = `${turn}:result:${block.blockId || row.tapeSeq}`
           add(key, {
             id: stableId('tool', key),
@@ -322,7 +324,8 @@ export function projectSessionTape(rows) {
             inputJson: null,
             _partial: false,
             _completed: true,
-            output: block.preview,
+            output: block.output ?? block.preview ?? '',
+            outputJson: block.outputJson ?? null,
             error: !!block.isError,
             _source: 'tape',
           })

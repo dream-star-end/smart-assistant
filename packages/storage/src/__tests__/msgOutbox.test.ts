@@ -37,6 +37,7 @@ const {
   parseQueuedMessageLine,
   queueMessageToOutbox,
   queuedMessageToLine,
+  readClientSessionTapePayload,
   replayMsgOutbox,
   upsertClientSession,
 } = await import('../sessionsDb.js')
@@ -352,6 +353,43 @@ describe('upsertClientSession: initial-insert _source scrub (Codex R4 defense)',
 })
 
 describe('server-authoritative client session tape', () => {
+  it('initializes list counters when tape arrives before the session row', async () => {
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-first',
+      userId: 'tape-first-owner',
+      turnKey: 'turn-before-put',
+      direction: 'inbound',
+      ts: 10,
+      frame: { type: 'inbound.message', clientMessage: { id: 'u-before-put' } },
+    })
+    await appendClientSessionTapeFrame({
+      sessionId: 'sess-tape-first',
+      userId: 'tape-first-owner',
+      turnKey: 'turn-before-put',
+      direction: 'outbound',
+      ts: 11,
+      frame: { type: 'outbound.message', blocks: [{ kind: 'text', text: 'done' }] },
+    })
+    await upsertClientSession({
+      id: 'sess-tape-first',
+      userId: 'tape-first-owner',
+      agentId: 'main',
+      title: 'Tape first',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 11,
+      updatedAt: 12,
+      messages: [],
+    })
+
+    const meta = (await listClientSessions('tape-first-owner')).find(
+      (session) => session.id === 'sess-tape-first',
+    )
+    assert.equal(meta?.tapeTurnCount, 1)
+    assert.equal(meta?.lastTapeSeq, 2)
+    assert.equal(meta?.messageCount, 2)
+  })
+
   it('allocates ordered rows, pages complete turns, and rejects another owner', async () => {
     await upsertClientSession({
       id: 'sess-tape-order',
@@ -573,6 +611,18 @@ describe('server-authoritative client session tape', () => {
       (await getClientSessionTapeMeta('sess-tape-claim', 'claimed-owner')).lastTapeSeq,
       null,
     )
+  })
+
+  it('returns an owned tape frame as exact UTF-8 bytes with a stable digest', async () => {
+    const record = await readClientSessionTapePayload('sess-tape-order', 'tape-owner', 1)
+    assert.ok(record)
+    assert.equal(record.bytes, record.payload.byteLength)
+    assert.equal(record.sha256.length, 64)
+    assert.deepEqual(JSON.parse(record.payload.toString('utf8')), {
+      type: 'inbound.message',
+      clientMessage: { id: 'u1' },
+    })
+    assert.equal(await readClientSessionTapePayload('sess-tape-order', 'other-user', 1), null)
   })
 })
 

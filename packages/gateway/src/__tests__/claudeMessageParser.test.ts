@@ -206,6 +206,33 @@ describe('ClaudeMessageParser: tool_use', () => {
     }
   })
 
+  it('keeps a large tool input exact while shortening only its preview', () => {
+    const { parser, events } = createParser()
+    const content = '完整输入'.repeat(3000)
+
+    parser.parse({
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tu_large_input',
+            name: 'Write',
+            input: { file: 'large.txt', content },
+          },
+        ],
+      },
+    } as any)
+
+    assert.equal(events.length, 1)
+    if (events[0].kind === 'block') {
+      const block = events[0].block as any
+      assert.ok(block.inputPreview.length <= 400)
+      assert.equal(block.inputJson.content, content)
+      assert.equal(Buffer.byteLength(block.inputJson.content), Buffer.byteLength(content))
+    }
+  })
+
   it('calls onToolUse callback for detected tools', () => {
     const detected: any[] = []
     const { parser } = createParser({ onToolUse: (t) => detected.push(t) })
@@ -268,7 +295,7 @@ describe('ClaudeMessageParser: tool_result', () => {
     assert.equal(events.length, 1, 'should emit only once')
   })
 
-  it('truncates long previews to 3000 chars', () => {
+  it('keeps the complete tool result while shortening only its preview', () => {
     const { parser, events, toolUseIdToName } = createParser()
     toolUseIdToName.set('tu_6', 'Bash')
 
@@ -283,6 +310,8 @@ describe('ClaudeMessageParser: tool_result', () => {
       const preview = (events[0].block as any).preview
       assert.equal(preview.length, 3001) // 3000 + '…'
       assert.ok(preview.endsWith('…'))
+      assert.equal((events[0].block as any).output, 'x'.repeat(4000))
+      assert.equal((events[0].block as any).outputJson, 'x'.repeat(4000))
     }
   })
 })

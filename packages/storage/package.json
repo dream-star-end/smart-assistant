@@ -9,10 +9,12 @@
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
+    "pg": "^8.23.0",
     "sqlite-vec": "^0.1.9",
     "yaml": "^2.6.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.11"
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/pg": "^8.21.0"
   }
 }

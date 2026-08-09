@@ -182,7 +182,7 @@ describe('lazy session hydration', () => {
     assert.deepEqual(gets, [
       '/api/sessions/list',
       '/api/sessions/web-tape-growth',
-      '/api/sessions/web-tape-growth/tape?turns=5',
+      '/api/sessions/web-tape-growth/timeline?turns=5',
     ])
     assert.equal(state.sessions.get(local.id)._tapeLastSeq, 3)
     assert.equal(state.sessions.get(local.id).messages.at(-1)?.text, '最新回答')
@@ -246,7 +246,7 @@ describe('lazy session hydration', () => {
     assert.equal(state.sessions.get(local.id), local)
   })
 
-  it('resume failure forces tape hydration despite equal metadata and the ordinary hydrate limit', async () => {
+  it('background resume failure stays lazy until that session is selected', async () => {
     const makeHarness = makeLazySyncHarness()
     const fallback: any = {
       id: 'web-fallback',
@@ -283,7 +283,7 @@ describe('lazy session hydration', () => {
       sendingInFlight: false,
     }
     const gets: string[] = []
-    const { syncSessionsFromServer } = makeHarness({
+    const { syncSessionsFromServer, hydrateSession } = makeHarness({
       state,
       apiJson: async () => ({}),
       apiGet: async (path: string) => {
@@ -310,7 +310,7 @@ describe('lazy session hydration', () => {
         if (path === '/api/sessions/web-broken-equal') {
           return { ...broken, messages: [], tape: { lastTapeSeq: 3 } }
         }
-        if (path === '/api/sessions/web-broken-equal/tape?turns=5') {
+        if (path === '/api/sessions/web-broken-equal/timeline?turns=5') {
           return { frames: [{ tapeSeq: 3 }], nextBefore: null, hasMore: false }
         }
         return { ...fallback, messages: [{ id: 'fallback-full', role: 'user', text: 'q' }] }
@@ -327,8 +327,15 @@ describe('lazy session hydration', () => {
 
     await syncSessionsFromServer()
 
-    assert.ok(gets.includes('/api/sessions/web-broken-equal/tape?turns=5'))
+    assert.ok(!gets.includes('/api/sessions/web-broken-equal'))
+    assert.ok(!gets.includes('/api/sessions/web-broken-equal/timeline?turns=5'))
     assert.ok(gets.includes('/api/sessions/web-fallback'))
+    assert.equal(state.sessions.get(broken.id)._liveStreamBroken, true)
+    assert.equal(state.sessions.get(broken.id)._needsFetch, true)
+
+    state.currentSessionId = broken.id
+    await hydrateSession(broken.id)
+    assert.ok(gets.includes('/api/sessions/web-broken-equal/timeline?turns=5'))
     assert.equal(state.sessions.get(broken.id)._liveStreamBroken, false)
     assert.equal(state.sessions.get(broken.id).messages.at(-1)?.text, '恢复的最新回答')
   })
@@ -844,17 +851,37 @@ describe('lazy session hydration', () => {
           ['web-inactive-placeholder', { agentId: 'codex', _needsFetch: true }],
           ['web-active', { agentId: 'main', _sendingInFlight: true }],
           ['web-cursor', { agentId: 'codex', _lastFrameSeq: 7 }],
+          [
+            'web-active-exact',
+            {
+              agentId: 'codex',
+              _sendingInFlight: true,
+              _inFlightClientMessageId: 'submit-42',
+            },
+          ],
         ]),
       },
       50,
-    ) as () => Array<{ peerId: string; lastFrameSeq: number; inFlight: boolean }>
+    ) as () => Array<{
+      peerId: string
+      lastFrameSeq: number
+      inFlight: boolean
+      inFlightClientMessageId?: string
+    }>
 
     const peers = buildHelloPeers()
     assert.deepEqual(
       peers.map((p) => p.peerId),
-      ['web-current-placeholder', 'web-active', 'web-cursor'],
+      ['web-current-placeholder', 'web-active', 'web-active-exact'],
     )
-    assert.equal(peers.find((p) => p.peerId === 'web-cursor')?.lastFrameSeq, 7)
+    assert.equal(
+      peers.some((p) => p.peerId === 'web-cursor'),
+      false,
+    )
     assert.equal(peers.find((p) => p.peerId === 'web-active')?.inFlight, true)
+    assert.equal(
+      peers.find((p) => p.peerId === 'web-active-exact')?.inFlightClientMessageId,
+      'submit-42',
+    )
   })
 })

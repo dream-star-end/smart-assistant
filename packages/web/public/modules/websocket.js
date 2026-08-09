@@ -4,7 +4,7 @@ import { shouldSuppressGoalStatusToast } from './goalControl.js?v=3'
 import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=3'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=13'
+import { maybeSyncNow, retryDeferredHydration } from './sync.js?v=14'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -375,7 +375,8 @@ function _appendSubagentBlock(sess, groupMsg, block, blockText) {
       : null
     if (target) {
       target._completed = true
-      target.output = block.preview || ''
+      target.output = block.output ?? block.preview ?? ''
+      target.outputJson = block.outputJson ?? null
       target.error = !!block.isError
       target._partial = false
     } else {
@@ -388,7 +389,8 @@ function _appendSubagentBlock(sess, groupMsg, block, blockText) {
         inputJson: null,
         _partial: false,
         _completed: true,
-        output: block.preview || '',
+        output: block.output ?? block.preview ?? '',
+        outputJson: block.outputJson ?? null,
         error: !!block.isError,
       })
     }
@@ -534,6 +536,7 @@ function _drainNextOfflineItem() {
         msg.status = 'sent'
         updateMsgStatus(msg)
       }
+      sess._inFlightClientMessageId = item.payload?.idempotencyKey || null
       sess._sendingInFlight = true
       _resetThinkingSafety(sess.id)
       if (sess.id === state.currentSessionId) {
@@ -603,18 +606,14 @@ export function buildHelloPeers() {
   return [...state.sessions.entries()]
     .filter(([id, s]) => {
       const isCurrent = id === state.currentSessionId
-      const hasCursor = typeof s._lastFrameSeq === 'number' && s._lastFrameSeq > 0
-      return isCurrent || s._sendingInFlight || hasCursor || s._liveStreamBroken
+      // A historical cursor alone is not a reason to register/replay that
+      // session on every reconnect. Only the visible session and turns that
+      // the browser still believes are running need live reconciliation.
+      return isCurrent || s._sendingInFlight
     })
     .sort((a, b) => {
-      const pa =
-        (a[0] === state.currentSessionId ? 4 : 0) +
-        (a[1]._sendingInFlight ? 2 : 0) +
-        (a[1]._liveStreamBroken ? 1 : 0)
-      const pb =
-        (b[0] === state.currentSessionId ? 4 : 0) +
-        (b[1]._sendingInFlight ? 2 : 0) +
-        (b[1]._liveStreamBroken ? 1 : 0)
+      const pa = (a[0] === state.currentSessionId ? 4 : 0) + (a[1]._sendingInFlight ? 2 : 0)
+      const pb = (b[0] === state.currentSessionId ? 4 : 0) + (b[1]._sendingInFlight ? 2 : 0)
       return pb - pa || (b[1].lastAt || 0) - (a[1].lastAt || 0)
     })
     .slice(0, HELLO_PEERS_LIMIT)
@@ -622,6 +621,9 @@ export function buildHelloPeers() {
       peerId: id,
       agentId: s.agentId || state.defaultAgentId,
       inFlight: !!s._sendingInFlight,
+      ...(s._sendingInFlight && s._inFlightClientMessageId
+        ? { inFlightClientMessageId: s._inFlightClientMessageId }
+        : {}),
       lastFrameSeq: s._lastFrameSeq || 0,
     }))
 }
@@ -669,6 +671,7 @@ export function resetReplyTracker(sess) {
 export function localStopTeardown(sess) {
   if (!sess) return
   sess._sendingInFlight = false
+  sess._inFlightClientMessageId = null
   clearTurnTiming(sess)
   if (sess._regenSafetyTimer) {
     clearTimeout(sess._regenSafetyTimer)
@@ -1155,27 +1158,34 @@ export function handleOutbound(frame) {
       }
     }
   }
-  // A service-restart synthetic final is only meant to clear a stale
-  // `_sendingInFlight` marker after reconnect. If the user already pressed
-  // "继续" while the socket was reconnecting, that new user message is still
-  // queued locally when hello/resume frames arrive. Rendering the synthetic
-  // notice in that window makes it appear as the answer to the fresh
-  // "继续" turn. Treat it as out-of-band cleanup instead and let the queued
-  // turn drain normally.
+  // Compatibility with an older gateway: this synthetic final was a control
+  // signal, never real assistant content. Never turn it into a persisted chat
+  // bubble; reconcile the visible transcript from durable storage instead.
   if (frame.isFinal && frame.meta?.interrupted === 'service_restart') {
-    const hasQueuedUser = sess.messages.some((m) => m.role === 'user' && m.status === 'queued')
-    if (hasQueuedUser) {
-      sess._sendingInFlight = false
-      clearTurnTiming(sess)
-      resetReplyTracker(sess)
-      if (sess.id === state.currentSessionId) {
-        state.sendingInFlight = false
-        updateSendEnabled()
-        hideTypingIndicator()
-        setTitleBusy(false)
-      }
-      return
+    sess._sendingInFlight = false
+    sess._inFlightClientMessageId = null
+    sess._needsFetch = true
+    sess._liveStreamBroken = true
+    clearTurnTiming(sess)
+    resetReplyTracker(sess)
+    if (sess.id === state.currentSessionId) {
+      state.sendingInFlight = false
+      updateSendEnabled()
+      hideTypingIndicator()
+      setTitleBusy(false)
+      maybeSyncNow({ force: true, freshAfterInFlight: true })
     }
+    return
+  }
+  if (
+    sess._inFlightClientMessageId &&
+    typeof frame.clientMessageId === 'string' &&
+    frame.clientMessageId !== sess._inFlightClientMessageId
+  ) {
+    // A different tab owns this live turn. Do not bind its blocks/final to
+    // this tab's exact pending submit; the durable timeline will hydrate it.
+    sess._needsFetch = true
+    return
   }
   // Early stale-final guard (best effort): drop late isFinal frames from a
   // turn the user already abandoned locally (stop / agent switch / timeout).
@@ -1667,11 +1677,11 @@ export function handleOutbound(frame) {
         if (groupMsg) {
           groupMsg._completed = true
           groupMsg._duration = Date.now() - (groupMsg.startTime || Date.now())
-          groupMsg._resultPreview = (block.preview || '').slice(0, 200)
+          groupMsg._resultPreview = (block.preview || block.output || '').slice(0, 200)
           groupMsg._isError = !!block.isError
           if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
           completeBgTask(agentToolUseId, block.isError ? 'failed' : 'done', {
-            preview: (block.preview || '').slice(0, 100),
+            preview: (block.preview || block.output || '').slice(0, 100),
           })
         }
         continue
@@ -1685,7 +1695,8 @@ export function handleOutbound(frame) {
         const existing = sess.messages.find((m) => m.id === mid)
         if (existing) {
           existing._completed = true
-          existing.output = block.preview || ''
+          existing.output = block.output ?? block.preview ?? ''
+          existing.outputJson = block.outputJson ?? null
           existing.error = !!block.isError
           existing._partial = false
           if (sess.id === state.currentSessionId) _deps.updateMessageEl(existing)
@@ -1694,12 +1705,13 @@ export function handleOutbound(frame) {
       }
 
       // Fallback: create standalone result card
-      if (!block.preview) continue
+      if (!block.output && !block.preview) continue
       const m = addMessage(sess, 'tool', block.toolName || 'unknown', {
         toolName: block.toolName,
         blockId: block.blockId,
         _completed: true,
-        output: block.preview || '',
+        output: block.output ?? block.preview ?? '',
+        outputJson: block.outputJson ?? null,
         error: !!block.isError,
         inputJson: null,
         inputPreview: '',
@@ -1812,6 +1824,7 @@ export function handleOutbound(frame) {
     sess._streamingThinking = null
     sess._streamingPlan = null
     sess._sendingInFlight = false
+    sess._inFlightClientMessageId = null
     // Turn has ended — clear timing so the next turn starts fresh (regardless of whether
     // this session is currently viewed; otherwise a later switch would reuse stale timing).
     clearTurnTiming(sess)
@@ -1963,13 +1976,30 @@ function handleOutboundTurnStatus(frame) {
   const sess = peerId ? state.sessions.get(peerId) : null
   if (!sess) return
   markFrameReceived(sess)
-  const status =
-    frame.status === 'running' || frame.status === 'compacting' || frame.status === 'idle'
-      ? frame.status
-      : null
+  const status = ['running', 'compacting', 'idle', 'completed', 'interrupted', 'unknown'].includes(
+    frame.status,
+  )
+    ? frame.status
+    : null
+  const localClientMessageId = sess._inFlightClientMessageId
+  const frameClientMessageId =
+    typeof frame.clientMessageId === 'string' ? frame.clientMessageId : null
+  // Another tab may be running a different submit for the same session. Its
+  // status is useful replay traffic, but it must never claim or settle the
+  // exact submit this tab persisted locally.
+  if (
+    localClientMessageId &&
+    frameClientMessageId &&
+    localClientMessageId !== frameClientMessageId
+  ) {
+    return
+  }
   sess._turnStatus = status
   if (status === 'running' || status === 'compacting') {
     sess._sendingInFlight = true
+    if (typeof frame.clientMessageId === 'string') {
+      sess._inFlightClientMessageId = frame.clientMessageId
+    }
     if (typeof frame.startedAt === 'number' && !sess._turnStartedAt) {
       sess._turnStartedAt = frame.startedAt
     }
@@ -1979,8 +2009,19 @@ function handleOutboundTurnStatus(frame) {
       showTypingIndicator()
       setTitleBusy(true)
     }
-  } else if (status === 'idle' && sess._sendingInFlight) {
+  } else if (
+    (status === 'idle' ||
+      status === 'completed' ||
+      status === 'interrupted' ||
+      status === 'unknown') &&
+    sess._sendingInFlight
+  ) {
     sess._sendingInFlight = false
+    sess._inFlightClientMessageId = null
+    if (status !== 'idle') {
+      sess._needsFetch = true
+      sess._liveStreamBroken = true
+    }
     clearTurnTiming(sess)
     if (state._reconnectInFlightSet) state._reconnectInFlightSet.delete(sess.id)
     if (sess.id === state.currentSessionId) {
@@ -1988,6 +2029,9 @@ function handleOutboundTurnStatus(frame) {
       updateSendEnabled()
       hideTypingIndicator()
       setTitleBusy(false)
+    }
+    if (status !== 'idle' && sess.id === state.currentSessionId) {
+      maybeSyncNow({ force: true, freshAfterInFlight: true })
     }
   }
   if (sess.id !== state.currentSessionId) return
@@ -2136,8 +2180,14 @@ function handleResumeFailed(frame) {
       // tape even when state.sendingInFlight is true. A list-only sync is not
       // sufficient evidence to clear it; hydrateSession owns retirement.
       sess._liveStreamBroken = true
+      sess._needsFetch = true
     }
   }
+  // A background replay gap is reconciled lazily when the user opens that
+  // session. Pulling it now recreates the reconnect fan-out this path exists
+  // to avoid. The current transcript remains correctness-critical and is
+  // refreshed immediately.
+  if (!affectedSessId || affectedSessId !== state.currentSessionId) return
   // `freshAfterInFlight: true` guards against a race where a sync was already
   // running when we set `_liveStreamBroken` — that sync may have decided to
   // skip the affected session BEFORE we flagged it. Without the tail sync,
@@ -2152,13 +2202,7 @@ function handleResumeFailed(frame) {
       try {
         _deps.renderSidebar()
       } catch {}
-      // Re-render the transcript only if the affected session is what's
-      // currently on screen — a background-session resume_failed shouldn't
-      // steal focus from whatever the user is looking at.
-      if (
-        result.needsRenderMessages ||
-        (affectedSessId && affectedSessId === state.currentSessionId)
-      ) {
+      if (result.needsRenderMessages || affectedSessId === state.currentSessionId) {
         try {
           _deps.renderMessages()
         } catch {}

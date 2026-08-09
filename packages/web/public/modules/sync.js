@@ -4,8 +4,8 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { projectSessionTape } from './sessionTape.js?v=1'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=13'
+import { projectSessionTape } from './sessionTape.js?v=2'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=14'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -146,6 +146,7 @@ function _toolLikeSupersedes(localMsg, serverMsg) {
   if (!_stringPrefixSupersedes(localMsg, serverMsg, 'inputPreview')) return false
   if (!_jsonSupersedesIfServerHas(localMsg, serverMsg, 'inputJson')) return false
   if (!_stringPrefixSupersedes(localMsg, serverMsg, 'output')) return false
+  if (!_jsonSupersedesIfServerHas(localMsg, serverMsg, 'outputJson')) return false
   if (!_bashTailSupersedes(localMsg, serverMsg)) return false
   return true
 }
@@ -479,6 +480,8 @@ function _rebindStreamingPointers(sess) {
 function _copyLocalSessionRuntimeState(sess, existingLocal) {
   if (!sess || !existingLocal) return sess
   if (existingLocal._sendingInFlight) sess._sendingInFlight = true
+  if (existingLocal._inFlightClientMessageId)
+    sess._inFlightClientMessageId = existingLocal._inFlightClientMessageId
   if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
   if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
   if (typeof existingLocal._lastFrameSeq === 'number')
@@ -660,7 +663,7 @@ export async function hydrateSession(id, { force = false } = {}) {
     const remote = await apiGet(`/api/sessions/${id}`)
     if (!remote?.id) return state.sessions.get(id) || null
     const tapePage = remote.tape?.lastTapeSeq
-      ? await apiGet(`/api/sessions/${id}/tape?turns=5`)
+      ? await apiGet(`/api/sessions/${id}/timeline?turns=5`)
       : null
     const live = state.sessions.get(id)
     // A live stream can start while this GET is in flight (cross-device: the
@@ -756,7 +759,7 @@ export async function loadOlderTape(id) {
   if (sess._tapeLoadingPromise) return sess._tapeLoadingPromise
   const load = (async () => {
     const before = sess._tapeBefore
-    const older = await apiGet(`/api/sessions/${id}/tape?before=${before}&turns=5`)
+    const older = await apiGet(`/api/sessions/${id}/timeline?before=${before}&turns=5`)
     const bySeq = new Map()
     for (const row of [...(sess._tapeFrames || []), ...(older.frames || [])]) {
       bySeq.set(row.tapeSeq, row)
@@ -921,12 +924,13 @@ export async function syncSessionsFromServer() {
       }
       if (local._dirty || live?._dirty) continue
       if (meta.id === state.currentSessionId && state.sendingInFlight && !liveStreamBroken) continue
-      if (liveStreamBroken) {
+      if (liveStreamBroken && meta.id === fallbackCurrentId) {
         forcedHydrateIds.add(meta.id)
       } else if (meta.id === fallbackCurrentId) {
         hydrateIds.add(meta.id)
       } else {
         const sess = _buildSessionFromRemote(meta, live || local, { placeholder: true })
+        if (liveStreamBroken) sess._needsFetch = true
         _rebuildSearchIndex(sess)
         clearDeleteTombstone(sess.id)
         state.sessions.set(sess.id, sess)
@@ -938,10 +942,10 @@ export async function syncSessionsFromServer() {
     }
   }
 
-  // Replay misses are explicit correctness failures, not ordinary cold-start
-  // prefetch. Reconcile every affected session before applying the one-session
-  // background hydration budget; hydrateSession retires the flag only after it
-  // has actually adopted the authoritative REST/tape snapshot.
+  // A replay miss is reconciled immediately only for the visible session.
+  // Background sessions retain `_needsFetch/_liveStreamBroken` and hydrate on
+  // explicit selection; otherwise one reconnect can fan out into dozens of
+  // full transcript downloads.
   for (const id of forcedHydrateIds) {
     const full = await hydrateSession(id, { force: true })
     if (full && !full._needsFetch && !full._liveStreamBroken) {
