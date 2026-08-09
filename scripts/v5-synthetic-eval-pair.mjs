@@ -39,6 +39,10 @@ const SCRATCH_INPUT_NAMES = [
   "workspace",
   "browserCliScratch",
   "browserMcpScratch",
+  "sharedSkillsScratch",
+  "skillDraftsScratch",
+  "skillEvalsScratch",
+  "agentSkillsScratch",
 ];
 const VOLATILE_SNAPSHOT_FIELDS = new Set([
   "dispatchCount",

@@ -112,6 +112,10 @@ function armEvidence(
     workspace: { state: "tree", files: 8, directories: 0, sha256: digest("persistent-workspace") },
     browserCli: { state: "tree", files: 2, directories: 0, sha256: digest("persistent-browser-cli") },
     browserMcp: { state: "tree", files: 0, directories: 0, sha256: digest("") },
+    sharedSkills: { state: "tree", files: 4, directories: 2, sha256: digest("shared-skills") },
+    skillDrafts: { state: "absent" },
+    skillEvals: { state: "tree", files: 1, directories: 1, sha256: digest("skill-evals") },
+    agentSkills: { state: "absent" },
   };
   const turnResultSha = digest(`turn-result-${arm}`);
   return {
@@ -143,6 +147,10 @@ function armEvidence(
           workspace: structuredClone(emptyScratch),
           browserCliScratch: structuredClone(emptyScratch),
           browserMcpScratch: structuredClone(emptyScratch),
+          sharedSkillsScratch: structuredClone(emptyScratch),
+          skillDraftsScratch: structuredClone(emptyScratch),
+          skillEvalsScratch: structuredClone(emptyScratch),
+          agentSkillsScratch: structuredClone(emptyScratch),
           temporaryWorkspace: { state: "absent" },
         },
       },
@@ -163,6 +171,17 @@ function armEvidence(
             sha256: digest(`browser-scratch-${arm}`),
           },
           browserMcpScratch: structuredClone(emptyScratch),
+          sharedSkillsScratch: {
+            ...structuredClone(emptyScratch),
+            files: arm === "A" ? 1 : 0,
+            directories: arm === "A" ? 1 : 0,
+            sha256: arm === "A"
+              ? digest(`shared-skills-${arm}`)
+              : emptyScratch.sha256,
+          },
+          skillDraftsScratch: structuredClone(emptyScratch),
+          skillEvalsScratch: structuredClone(emptyScratch),
+          agentSkillsScratch: structuredClone(emptyScratch),
           temporaryWorkspace: {
             ...structuredClone(artifactIdentity),
           },

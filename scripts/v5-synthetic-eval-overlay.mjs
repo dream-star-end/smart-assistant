@@ -376,6 +376,10 @@ const SCRATCH_TMPFS_TARGETS = [
   "/home/agent/.openclaude/workspace",
   "/home/agent/.openclaude/.playwright-cli",
   "/home/agent/.openclaude/.playwright-mcp",
+  "/home/agent/.openclaude/skills",
+  "/home/agent/.openclaude/skill-drafts",
+  "/home/agent/.openclaude/skill-evals",
+  "/home/agent/.openclaude/agents/main/skills",
 ];
 const SHA = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
@@ -995,7 +999,7 @@ const DYNAMIC_INPUT_SOURCE = [
   'function scratch(target){const value=identity(target);if(value.state!=="tree")return value;const stat=fs.lstatSync(target);return {...value,uid:stat.uid,gid:stat.gid,mode:stat.mode&0o777}}',
   'const agentRoot="/home/agent/.openclaude/agents/"+agentId;',
   'const temporary="/tmp/oc-synthetic-eval-"+caseId;',
-  'const value={agentClaude:identity(agentRoot+"/CLAUDE.md"),agentMemoryIndex:identity(agentRoot+"/MEMORY.md"),agentMemoryTree:identity(agentRoot+"/memory"),userSoul:identity("/home/agent/.openclaude/SOUL.md"),userProfile:identity("/home/agent/.openclaude/USER.md"),userSkills:identity("/home/agent/.openclaude/hub/skills"),workspace:scratch("/home/agent/.openclaude/workspace"),browserCliScratch:scratch("/home/agent/.openclaude/.playwright-cli"),browserMcpScratch:scratch("/home/agent/.openclaude/.playwright-mcp"),temporaryWorkspace:identity(temporary)};',
+  'const value={agentClaude:identity(agentRoot+"/CLAUDE.md"),agentMemoryIndex:identity(agentRoot+"/MEMORY.md"),agentMemoryTree:identity(agentRoot+"/memory"),userSoul:identity("/home/agent/.openclaude/SOUL.md"),userProfile:identity("/home/agent/.openclaude/USER.md"),userSkills:identity("/home/agent/.openclaude/hub/skills"),workspace:scratch("/home/agent/.openclaude/workspace"),browserCliScratch:scratch("/home/agent/.openclaude/.playwright-cli"),browserMcpScratch:scratch("/home/agent/.openclaude/.playwright-mcp"),sharedSkillsScratch:scratch("/home/agent/.openclaude/skills"),skillDraftsScratch:scratch("/home/agent/.openclaude/skill-drafts"),skillEvalsScratch:scratch("/home/agent/.openclaude/skill-evals"),agentSkillsScratch:scratch("/home/agent/.openclaude/agents/main/skills"),temporaryWorkspace:identity(temporary)};',
   'if(phase==="pre"&&value.temporaryWorkspace.state!=="absent")throw new Error("temporary evaluation workspace already exists");',
   'process.stdout.write(JSON.stringify(value));',
 ].join("\n");
@@ -1006,7 +1010,7 @@ const STANDARD_PERSISTENT_SCRATCH_SOURCE = [
   'const { createHash } = require("node:crypto");',
   'const sha=(value)=>createHash("sha256").update(value).digest("hex");',
   'function identity(target){let stat;try{stat=fs.lstatSync(target)}catch(error){if(error&&error.code==="ENOENT")return {state:"absent"};throw error}if(stat.isSymbolicLink())throw new Error("persistent scratch symlink:"+target);const root=fs.realpathSync(target);if(root!==target)throw new Error("persistent scratch path is not canonical:"+target);if(!stat.isDirectory())throw new Error("persistent scratch has unsafe type:"+target);const hash=createHash("sha256");let files=0;let directories=0;function walk(current){for(const name of fs.readdirSync(current).sort()){const absolute=path.join(current,name);const child=fs.lstatSync(absolute);if(child.isSymbolicLink())throw new Error("persistent scratch symlink:"+absolute);const relative=path.relative(root,absolute).split(path.sep).join("/");if(child.isDirectory()){directories++;hash.update("D  "+relative+"\\n");walk(absolute)}else if(child.isFile()){files++;hash.update("F  "+sha(fs.readFileSync(absolute))+"  "+relative+"\\n")}else throw new Error("persistent scratch has unsafe entry:"+absolute)}}walk(root);return {state:"tree",files,directories,sha256:hash.digest("hex")}}',
-  'process.stdout.write(JSON.stringify({workspace:identity("/home/agent/.openclaude/workspace"),browserCli:identity("/home/agent/.openclaude/.playwright-cli"),browserMcp:identity("/home/agent/.openclaude/.playwright-mcp")}));',
+  'process.stdout.write(JSON.stringify({workspace:identity("/home/agent/.openclaude/workspace"),browserCli:identity("/home/agent/.openclaude/.playwright-cli"),browserMcp:identity("/home/agent/.openclaude/.playwright-mcp"),sharedSkills:identity("/home/agent/.openclaude/skills"),skillDrafts:identity("/home/agent/.openclaude/skill-drafts"),skillEvals:identity("/home/agent/.openclaude/skill-evals"),agentSkills:identity("/home/agent/.openclaude/agents/main/skills")}));',
 ].join("\n");
 
 function dockerExecJson(container, source, args = []) {
