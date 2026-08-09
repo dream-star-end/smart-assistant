@@ -10,6 +10,8 @@ import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
 import { WeiboSetupError } from '../plugins/weiboSetup.js'
+import type { ZhihuSetupManager } from '../plugins/zhihuSetup.js'
+import { ZhihuSetupError } from '../plugins/zhihuSetup.js'
 import { requireAuth } from './auth.js'
 import type { CommercialHttpDeps, RequestContext } from './handlers.js'
 import { HttpError, readJsonBody, sendJson } from './util.js'
@@ -18,6 +20,7 @@ export interface PluginHttpDeps {
   pluginRuntime?: PluginRuntimeFacade
   knowledgePlanetSetup?: KnowledgePlanetSetupManager
   weiboSetup?: WeiboSetupManager
+  zhihuSetup?: ZhihuSetupManager
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
 }
 
@@ -28,7 +31,8 @@ function userIdFrom(value: string): number {
   return id
 }
 
-type ManagedSetupManager = KnowledgePlanetSetupManager | WeiboSetupManager
+type ManagedSetupProvider = 'knowledge-planet' | 'weibo' | 'zhihu'
+type ManagedSetupManager = KnowledgePlanetSetupManager | WeiboSetupManager | ZhihuSetupManager
 
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
@@ -40,13 +44,22 @@ function setupManager(
 ): WeiboSetupManager
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
-  provider: 'knowledge-planet' | 'weibo',
+  provider: 'zhihu',
+): ZhihuSetupManager
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: ManagedSetupProvider,
 ): ManagedSetupManager
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
-  provider: 'knowledge-planet' | 'weibo',
+  provider: ManagedSetupProvider,
 ): ManagedSetupManager {
-  const manager = provider === 'knowledge-planet' ? deps.knowledgePlanetSetup : deps.weiboSetup
+  const manager =
+    provider === 'knowledge-planet'
+      ? deps.knowledgePlanetSetup
+      : provider === 'weibo'
+        ? deps.weiboSetup
+        : deps.zhihuSetup
   if (!manager) throw new HttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   return manager
 }
@@ -85,7 +98,11 @@ function exactBodyKeys(body: Record<string, unknown>, allowed: readonly string[]
 }
 
 function mapSetupError(error: unknown): never {
-  if (!(error instanceof KnowledgePlanetSetupError) && !(error instanceof WeiboSetupError))
+  if (
+    !(error instanceof KnowledgePlanetSetupError) &&
+    !(error instanceof WeiboSetupError) &&
+    !(error instanceof ZhihuSetupError)
+  )
     throw error
   switch (error.code) {
     case 'NOT_INSTALLED':
@@ -145,13 +162,12 @@ function mapRuntimeError(error: unknown): never {
 
 function setupMatch(
   path: string,
-): { provider: 'knowledge-planet' | 'weibo'; sessionId: string; qr: boolean } | null {
-  const match = /^\/api\/plugins\/(knowledge-planet|weibo)\/setup\/([0-9a-f-]{36})(\/qr)?$/.exec(
-    path,
-  )
+): { provider: ManagedSetupProvider; sessionId: string; qr: boolean } | null {
+  const match =
+    /^\/api\/plugins\/(knowledge-planet|weibo|zhihu)\/setup\/([0-9a-f-]{36})(\/qr)?$/.exec(path)
   return match
     ? {
-        provider: match[1] as 'knowledge-planet' | 'weibo',
+        provider: match[1] as ManagedSetupProvider,
         sessionId: match[2]!,
         qr: match[3] === '/qr',
       }
@@ -175,14 +191,14 @@ export async function dispatchPluginsRoute(
     return
   }
 
-  const setupRoot = /^\/api\/plugins\/(knowledge-planet|weibo)\/setup$/.exec(path)
+  const setupRoot = /^\/api\/plugins\/(knowledge-planet|weibo|zhihu)\/setup$/.exec(path)
   if (method === 'POST' && setupRoot) {
     const raw = await readJsonBody(req, 1024)
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
       throw new HttpError(400, 'BAD_REQUEST', 'Plugin setup body is invalid')
     const body = raw as Record<string, unknown>
-    const provider = setupRoot[1] as 'knowledge-planet' | 'weibo'
-    const allowed = provider === 'weibo' ? ['acceptTerms', 'accountId'] : ['acceptTerms']
+    const provider = setupRoot[1] as ManagedSetupProvider
+    const allowed = provider === 'knowledge-planet' ? ['acceptTerms'] : ['acceptTerms', 'accountId']
     if (
       !exactBodyKeys(body, allowed) ||
       (body.accountId !== undefined &&
@@ -191,7 +207,7 @@ export async function dispatchPluginsRoute(
       throw new HttpError(400, 'BAD_REQUEST', 'Plugin setup body is invalid')
     try {
       const setup =
-        provider === 'weibo'
+        provider !== 'knowledge-planet'
           ? await setupManager(deps, provider).start(
               userId,
               body.acceptTerms === true,

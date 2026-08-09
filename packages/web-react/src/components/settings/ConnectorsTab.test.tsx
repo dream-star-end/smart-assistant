@@ -59,6 +59,10 @@ vi.mock("../../lib/api", async (importOriginal) => {
       getWeiboSetup: vi.fn(),
       getWeiboSetupQr: vi.fn(),
       cancelWeiboSetup: vi.fn(),
+      startZhihuSetup: vi.fn(),
+      getZhihuSetup: vi.fn(),
+      getZhihuSetupQr: vi.fn(),
+      cancelZhihuSetup: vi.fn(),
       revokePluginAccount: vi.fn(),
       setPluginWriteAccess: vi.fn(),
       setPluginWritePreapproval: vi.fn(),
@@ -98,6 +102,10 @@ const mockedWeiboStart = vi.mocked(api.startWeiboSetup)
 const mockedWeiboStatus = vi.mocked(api.getWeiboSetup)
 const mockedWeiboQr = vi.mocked(api.getWeiboSetupQr)
 const mockedWeiboCancel = vi.mocked(api.cancelWeiboSetup)
+const mockedZhihuStart = vi.mocked(api.startZhihuSetup)
+const mockedZhihuStatus = vi.mocked(api.getZhihuSetup)
+const mockedZhihuQr = vi.mocked(api.getZhihuSetupQr)
+const mockedZhihuCancel = vi.mocked(api.cancelZhihuSetup)
 const mockedPluginRevoke = vi.mocked(api.revokePluginAccount)
 const mockedSetPluginWriteAccess = vi.mocked(api.setPluginWriteAccess)
 const mockedSetPluginWritePreapproval = vi.mocked(api.setPluginWritePreapproval)
@@ -332,6 +340,28 @@ function weiboPlugin() {
     installedVersion: '1.2.0',
     latestVersionId: '301',
     latestVersion: '1.2.0',
+    installedCurrent: true,
+    updateAvailable: false,
+    available: true,
+  }
+}
+
+function zhihuPlugin() {
+  return {
+    versionId: '401',
+    slug: 'zhihu',
+    pluginType: 'managed-browser' as const,
+    label: '知乎',
+    description: '通过受管浏览器读取知乎，并在逐次确认后执行常用写操作',
+    accountMode: 'required' as const,
+    actions: [
+      { id: 'search_content', description: '搜索知乎内容', readOnly: true as const },
+      { id: 'create_answer', description: '发布知乎回答', readOnly: false as const },
+    ],
+    installed: true,
+    installedVersion: '1.0.0',
+    latestVersionId: '401',
+    latestVersion: '1.0.0',
     installedCurrent: true,
     updateAvailable: false,
     available: true,
@@ -1181,6 +1211,54 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: '取消' }))
     await waitFor(() =>
       expect(mockedWeiboCancel).toHaveBeenCalledWith(auth, '33333333-3333-4333-8333-333333333333'),
+    )
+  })
+
+  test('知乎使用知乎 App 扫码，并在生成二维码前展示自动化风险', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [zhihuPlugin()], accounts: [] })
+    mockedZhihuStart.mockResolvedValue({
+      sessionId: '44444444-4444-4444-8444-444444444444',
+      status: 'waiting_for_scan',
+      qrReady: true,
+      createdAt: '2026-08-09T00:00:00.000Z',
+      expiresAt: '2026-08-09T00:04:00.000Z',
+    })
+    mockedZhihuStatus.mockImplementation(() => new Promise(() => {}))
+    mockedZhihuQr.mockResolvedValue(new Blob(['png'], { type: 'image/png' }))
+    mockedZhihuCancel.mockResolvedValue({
+      sessionId: '44444444-4444-4444-8444-444444444444',
+      status: 'cancelled',
+      qrReady: false,
+      createdAt: '2026-08-09T00:00:00.000Z',
+      expiresAt: '2026-08-09T00:04:00.000Z',
+    })
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:zhihu-qr'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知乎')
+    fireEvent.click(within(providerCard('知乎')).getByRole('button', { name: '知乎扫码授权' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/不是知乎官方产品/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/平台规则可能限制自动化访问/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
+
+    expect(await within(dialog).findByAltText('知乎登录二维码')).toHaveAttribute(
+      'src',
+      'blob:zhihu-qr',
+    )
+    expect(mockedZhihuStart).toHaveBeenCalledWith(auth)
+    expect(mockedZhihuQr).toHaveBeenCalledWith(auth, '44444444-4444-4444-8444-444444444444')
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }))
+    await waitFor(() =>
+      expect(mockedZhihuCancel).toHaveBeenCalledWith(
+        auth,
+        '44444444-4444-4444-8444-444444444444',
+      ),
     )
   })
 

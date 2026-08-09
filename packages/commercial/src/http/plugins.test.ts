@@ -108,6 +108,15 @@ function deps(overrides: Record<string, unknown> = {}): any {
       qr: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 2]),
       cancel: async () => ({ sessionId: SESSION, status: 'cancelled' }),
     },
+    zhihuSetup: {
+      start: async (userId: number, accepted: boolean) => ({
+        sessionId: SESSION,
+        status: accepted && userId === 42 ? 'waiting_for_scan' : 'failed',
+      }),
+      status: async () => ({ sessionId: SESSION, status: 'finalizing' }),
+      qr: async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 3]),
+      cancel: async () => ({ sessionId: SESSION, status: 'cancelled' }),
+    },
     knowledgePlanetAutomation: {
       get: async () => ({
         control: {
@@ -273,6 +282,49 @@ describe('Plugin management HTTP dispatcher', () => {
     res = response()
     await dispatchPluginsRoute(
       await request('DELETE', `/api/plugins/weibo/setup/${SESSION}`),
+      res,
+      ctx,
+      custom,
+    )
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.body, { sessionId: SESSION, status: 'cancelled' })
+  })
+
+  test('Zhihu setup supports in-place relink and a private no-store QR endpoint', async () => {
+    const starts: unknown[] = []
+    const custom = deps()
+    custom.zhihuSetup.start = async (userId: number, accepted: boolean, accountId?: string) => {
+      starts.push([userId, accepted, accountId])
+      return { sessionId: SESSION, status: 'waiting_for_scan' }
+    }
+    let res = response()
+    await dispatchPluginsRoute(
+      await request('POST', '/api/plugins/zhihu/setup', {
+        acceptTerms: true,
+        accountId: '902',
+      }),
+      res,
+      ctx,
+      custom,
+    )
+    assert.equal(res.statusCode, 201)
+    assert.deepEqual(starts, [[42, true, '902']])
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('GET', `/api/plugins/zhihu/setup/${SESSION}/qr`),
+      res,
+      ctx,
+      custom,
+    )
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.headers.get('content-type'), 'image/png')
+    assert.equal(res.headers.get('cache-control'), 'no-store, private')
+    assert.deepEqual([...res.bytes], [137, 80, 78, 71, 13, 10, 26, 10, 3])
+
+    res = response()
+    await dispatchPluginsRoute(
+      await request('DELETE', `/api/plugins/zhihu/setup/${SESSION}`),
       res,
       ctx,
       custom,

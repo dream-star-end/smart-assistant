@@ -377,7 +377,7 @@ function DetailSkeleton() {
 type LastAction = 'install' | 'update' | 'scope'
 
 /** 装完必须去管理中心绑定账号的托管浏览器类插件。 */
-const MANAGED_BROWSER_PLUGINS = ['knowledge-planet', 'weibo']
+const MANAGED_BROWSER_PLUGINS = ['knowledge-planet', 'weibo', 'zhihu']
 
 /**
  * 市场条目详情 + 安装/更新确认。展示完整 SKILL.md(用户安装前看清「装的到底是什么」),

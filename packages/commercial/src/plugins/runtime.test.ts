@@ -378,4 +378,107 @@ describe('Plugin runtime facade', () => {
       (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST',
     )
   })
+
+  test('seals Zhihu edit, delete, and reply targets from exact DOM reads', async () => {
+    const facade = new PluginRuntimeFacade({
+      pool: { query: async () => result([]) } as never,
+      redis: null,
+    })
+    const prepare = (
+      facade as unknown as {
+        prepareZhihuWriteParams(input: {
+          userId: number
+          targetId: string
+          actionId: string
+          params: Record<string, unknown>
+        }): Promise<Record<string, unknown>>
+      }
+    ).prepareZhihuWriteParams.bind(facade)
+    const base = { userId: 7, targetId: '41' }
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      assert.equal(input.actionId, 'get_answer')
+      assert.deepEqual(input.params, { answerId: '123' })
+      return {
+        answer: { id: '123', owned: true, contentDigest: 'a'.repeat(64) },
+      }
+    }
+    const answer = await prepare({
+      ...base,
+      actionId: 'edit_answer',
+      params: { answerId: '123', content: 'changed' },
+    })
+    assert.deepEqual(answer.editSnapshot, {
+      expectedDigest: 'a'.repeat(64),
+      owned: true,
+    })
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      assert.equal(input.actionId, 'get_article')
+      return {
+        article: { id: '456', owned: true, contentDigest: 'b'.repeat(64) },
+      }
+    }
+    const article = await prepare({
+      ...base,
+      actionId: 'delete_article',
+      params: { articleId: '456' },
+    })
+    assert.deepEqual(article.deleteSnapshot, {
+      expectedDigest: 'b'.repeat(64),
+      owned: true,
+    })
+    ;(facade as unknown as { call: PluginRuntimeFacade['call'] }).call = async (input) => {
+      assert.equal(input.actionId, 'get_comment')
+      return {
+        comment: {
+          id: 'c'.repeat(64),
+          targetKind: 'answer',
+          targetId: '123',
+          parentCommentId: 'd'.repeat(64),
+          owned: false,
+          contentDigest: 'e'.repeat(64),
+        },
+      }
+    }
+    const reply = await prepare({
+      ...base,
+      actionId: 'reply_comment',
+      params: {
+        targetKind: 'answer',
+        targetId: '123',
+        commentId: 'c'.repeat(64),
+        text: 'reply',
+      },
+    })
+    assert.deepEqual(reply.replySnapshot, {
+      expectedDigest: 'e'.repeat(64),
+      targetKind: 'answer',
+      targetId: '123',
+      owned: false,
+      parentCommentId: 'd'.repeat(64),
+    })
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'delete_comment',
+        params: {
+          targetKind: 'answer',
+          targetId: '123',
+          commentId: 'c'.repeat(64),
+        },
+      }),
+      (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST',
+    )
+    await assert.rejects(
+      prepare({
+        ...base,
+        actionId: 'edit_answer',
+        params: {
+          answerId: '123',
+          content: 'changed',
+          editSnapshot: { expectedDigest: 'f'.repeat(64), owned: true },
+        },
+      }),
+      (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST',
+    )
+  })
 })

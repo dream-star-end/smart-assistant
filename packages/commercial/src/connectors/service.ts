@@ -268,6 +268,76 @@ export function buildWriteSummary(
         `用微博${hint}把评论 ${String(params.commentId ?? '')} 设置为${params.liked === true ? '已点赞' : '未点赞'}`,
         2000,
       )
+    case 'zhihu/create_question':
+      return ellipsize(
+        `用知乎${hint}发布问题：「${ellipsize(String(params.title ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/create_answer':
+      return ellipsize(
+        `用知乎${hint}回答问题 ${String(params.questionId ?? '')}：「${ellipsize(String(params.content ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/edit_answer':
+      return ellipsize(
+        `用知乎${hint}编辑回答 ${String(params.answerId ?? '')}：「${ellipsize(String(params.content ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/delete_answer':
+      return ellipsize(
+        `用知乎${hint}永久删除回答 ${String(params.answerId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'zhihu/create_article':
+      return ellipsize(
+        `用知乎${hint}发布文章「${ellipsize(String(params.title ?? ''), 200)}」：「${ellipsize(String(params.content ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/edit_article':
+      return ellipsize(
+        `用知乎${hint}编辑文章 ${String(params.articleId ?? '')}「${ellipsize(String(params.title ?? ''), 200)}」`,
+        2000,
+      )
+    case 'zhihu/delete_article':
+      return ellipsize(
+        `用知乎${hint}永久删除文章 ${String(params.articleId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'zhihu/create_comment':
+      return ellipsize(
+        `用知乎${hint}评论${String(params.targetKind ?? '')} ${String(params.targetId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/reply_comment':
+      return ellipsize(
+        `用知乎${hint}回复评论 ${String(params.commentId ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」`,
+        2000,
+      )
+    case 'zhihu/delete_comment':
+      return ellipsize(
+        `用知乎${hint}永久删除评论 ${String(params.commentId ?? '')}（不可撤销）`,
+        2000,
+      )
+    case 'zhihu/set_answer_vote':
+      return ellipsize(
+        `用知乎${hint}把回答 ${String(params.answerId ?? '')} 设置为${params.vote === 'up' ? '已赞同' : params.vote === 'down' ? '已反对' : '无赞同或反对'}`,
+        2000,
+      )
+    case 'zhihu/set_comment_vote':
+      return ellipsize(
+        `用知乎${hint}把评论 ${String(params.commentId ?? '')} 设置为${params.voted === true ? '已赞同' : '未赞同'}`,
+        2000,
+      )
+    case 'zhihu/set_favorite':
+      return ellipsize(
+        `用知乎${hint}把${String(params.targetKind ?? '')} ${String(params.targetId ?? '')} 设置为${params.favorited === true ? '已收藏' : '未收藏'}`,
+        2000,
+      )
+    case 'zhihu/set_following':
+      return ellipsize(
+        `用知乎${hint}把${String(params.targetKind ?? '')} ${String(params.targetId ?? '')} 设置为${params.following === true ? '已关注' : '未关注'}`,
+        2000,
+      )
     default:
       return ellipsize(`${provider} 写操作 ${action}`, 2000)
   }
@@ -465,6 +535,94 @@ export function buildWriteDetail(
         postId: String(params.postId ?? ''),
         commentId: String(params.commentId ?? ''),
         liked: params.liked === true,
+      }
+    case 'zhihu/create_question':
+      return {
+        kind: 'zhihu_question',
+        title: String(params.title ?? ''),
+        detail: String(params.detail ?? ''),
+        topics: Array.isArray(params.topics) ? params.topics : [],
+      }
+    case 'zhihu/create_answer':
+    case 'zhihu/edit_answer':
+      return {
+        kind: action === 'edit_answer' ? 'zhihu_answer_edit' : 'zhihu_answer',
+        questionId: String(params.questionId ?? ''),
+        answerId: params.answerId ?? null,
+        content: String(params.content ?? ''),
+        warning:
+          action === 'edit_answer'
+            ? '知乎回答正文将被修改；最终复核与网页点击之间仍存在极短竞态窗口。'
+            : undefined,
+      }
+    case 'zhihu/delete_answer':
+      return {
+        kind: 'zhihu_delete_answer',
+        answerId: String(params.answerId ?? ''),
+        irreversible: true,
+      }
+    case 'zhihu/create_article':
+    case 'zhihu/edit_article':
+      return {
+        kind: action === 'edit_article' ? 'zhihu_article_edit' : 'zhihu_article',
+        articleId: params.articleId ?? null,
+        title: String(params.title ?? ''),
+        content: String(params.content ?? ''),
+        warning:
+          action === 'edit_article'
+            ? '知乎文章标题和正文将被修改；最终复核与网页点击之间仍存在极短竞态窗口。'
+            : undefined,
+      }
+    case 'zhihu/delete_article':
+      return {
+        kind: 'zhihu_delete_article',
+        articleId: String(params.articleId ?? ''),
+        irreversible: true,
+      }
+    case 'zhihu/create_comment':
+    case 'zhihu/reply_comment':
+      return {
+        kind: action === 'reply_comment' ? 'zhihu_comment_reply' : 'zhihu_comment',
+        targetKind: String(params.targetKind ?? ''),
+        targetId: String(params.targetId ?? ''),
+        commentId: params.commentId ?? null,
+        text: String(params.text ?? ''),
+      }
+    case 'zhihu/delete_comment':
+      return {
+        kind: 'zhihu_delete_comment',
+        targetKind: String(params.targetKind ?? ''),
+        targetId: String(params.targetId ?? ''),
+        commentId: String(params.commentId ?? ''),
+        irreversible: true,
+      }
+    case 'zhihu/set_answer_vote':
+      return {
+        kind: 'zhihu_answer_vote',
+        answerId: String(params.answerId ?? ''),
+        vote: String(params.vote ?? ''),
+      }
+    case 'zhihu/set_comment_vote':
+      return {
+        kind: 'zhihu_comment_vote',
+        targetKind: String(params.targetKind ?? ''),
+        targetId: String(params.targetId ?? ''),
+        commentId: String(params.commentId ?? ''),
+        voted: params.voted === true,
+      }
+    case 'zhihu/set_favorite':
+      return {
+        kind: 'zhihu_favorite',
+        targetKind: String(params.targetKind ?? ''),
+        targetId: String(params.targetId ?? ''),
+        favorited: params.favorited === true,
+      }
+    case 'zhihu/set_following':
+      return {
+        kind: 'zhihu_following',
+        targetKind: String(params.targetKind ?? ''),
+        targetId: String(params.targetId ?? ''),
+        following: params.following === true,
       }
     default:
       // 兜底:原样返回(params 本身已过严格 schema,无凭据)

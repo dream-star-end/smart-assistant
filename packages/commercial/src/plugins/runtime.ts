@@ -44,6 +44,7 @@ import {
 } from './review.js'
 import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
 import { managedPluginWritePolicy, managedPluginWritePreapprovalPolicy } from './writePolicy.js'
+import { ZHIHU_PLUGIN_SLUG } from './zhihuContract.js'
 
 export class PluginRuntimeFacadeError extends Error {
   readonly code:
@@ -1298,6 +1299,87 @@ export class PluginRuntimeFacade {
     return prepared
   }
 
+  private async prepareZhihuWriteParams(input: {
+    userId: number
+    targetId: string
+    actionId: string
+    params: Record<string, unknown>
+  }): Promise<Record<string, unknown>> {
+    if (
+      Object.hasOwn(input.params, 'editSnapshot') ||
+      Object.hasOwn(input.params, 'deleteSnapshot') ||
+      Object.hasOwn(input.params, 'replySnapshot')
+    )
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'server-owned Plugin fields are forbidden')
+
+    const prepared: Record<string, unknown> = { ...input.params }
+    if (
+      ['edit_answer', 'delete_answer', 'edit_article', 'delete_article'].includes(input.actionId)
+    ) {
+      const answer = input.actionId.endsWith('_answer')
+      const id = String(input.params[answer ? 'answerId' : 'articleId'] ?? '')
+      const read = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: answer ? 'get_answer' : 'get_article',
+        params: { [answer ? 'answerId' : 'articleId']: id },
+      })) as { answer?: Record<string, unknown>; article?: Record<string, unknown> }
+      const item = answer ? read.answer : read.article
+      const expectedDigest = item?.contentDigest
+      if (
+        !item ||
+        item.id !== id ||
+        item.owned !== true ||
+        typeof expectedDigest !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(expectedDigest)
+      )
+        throw new PluginRuntimeFacadeError(
+          'BAD_REQUEST',
+          'Plugin owned-content snapshot is unavailable',
+        )
+      const snapshot = { expectedDigest, owned: true }
+      if (input.actionId.startsWith('edit_')) prepared.editSnapshot = snapshot
+      else prepared.deleteSnapshot = snapshot
+    }
+
+    if (input.actionId === 'reply_comment' || input.actionId === 'delete_comment') {
+      const targetKind = String(input.params.targetKind ?? '')
+      const targetId = String(input.params.targetId ?? '')
+      const commentId = String(input.params.commentId ?? '')
+      const read = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: 'get_comment',
+        params: { targetKind, targetId, commentId },
+      })) as { comment?: Record<string, unknown> }
+      const comment = read.comment
+      const expectedDigest = comment?.contentDigest
+      if (
+        !comment ||
+        comment.id !== commentId ||
+        comment.targetKind !== targetKind ||
+        comment.targetId !== targetId ||
+        (input.actionId === 'delete_comment' && comment.owned !== true) ||
+        typeof comment.owned !== 'boolean' ||
+        typeof expectedDigest !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(expectedDigest)
+      )
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin comment snapshot is unavailable')
+      const snapshot = {
+        expectedDigest,
+        targetKind,
+        targetId,
+        owned: comment.owned,
+        ...(typeof comment.parentCommentId === 'string'
+          ? { parentCommentId: comment.parentCommentId }
+          : {}),
+      }
+      if (input.actionId === 'reply_comment') prepared.replySnapshot = snapshot
+      else prepared.deleteSnapshot = snapshot
+    }
+    return prepared
+  }
+
   async proposeWrite(input: {
     userId: number
     targetId: string
@@ -1332,7 +1414,9 @@ export class PluginRuntimeFacade {
         ? await this.prepareKnowledgePlanetWriteParams(input)
         : initial.verified.slug === WEIBO_PLUGIN_SLUG
           ? await this.prepareWeiboWriteParams(input)
-          : input.params
+          : initial.verified.slug === ZHIHU_PLUGIN_SLUG
+            ? await this.prepareZhihuWriteParams(input)
+            : input.params
 
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: 15_000,

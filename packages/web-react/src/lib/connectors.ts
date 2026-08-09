@@ -493,6 +493,20 @@ const CONFIRM_ACTION_LABEL: Record<string, string> = {
   "weibo/send_message": "发送微博私信",
   "weibo/set_post_favorite": "设置微博收藏",
   "weibo/set_comment_like": "设置评论点赞",
+  "zhihu/create_question": "发布知乎问题",
+  "zhihu/create_answer": "发布知乎回答",
+  "zhihu/edit_answer": "编辑知乎回答",
+  "zhihu/delete_answer": "删除知乎回答",
+  "zhihu/create_article": "发布知乎文章",
+  "zhihu/edit_article": "编辑知乎文章",
+  "zhihu/delete_article": "删除知乎文章",
+  "zhihu/create_comment": "发布知乎评论",
+  "zhihu/reply_comment": "回复知乎评论",
+  "zhihu/delete_comment": "删除知乎评论",
+  "zhihu/set_answer_vote": "设置回答赞同",
+  "zhihu/set_comment_vote": "设置评论赞同",
+  "zhihu/set_favorite": "设置知乎收藏",
+  "zhihu/set_following": "设置知乎关注",
 };
 
 /** 写动作 → 中文名（未知动作回退原文，不吞未知类型）。 */

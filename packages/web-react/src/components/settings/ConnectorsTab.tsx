@@ -66,12 +66,14 @@ function errText(e: unknown, fallback: string): string {
 }
 
 function managedSetupFailureText(
-  isWeibo: boolean,
+  provider: 'knowledge-planet' | 'weibo' | 'zhihu',
   setup: Pick<KnowledgePlanetSetupView, 'status' | 'errorCode'>,
 ): string {
   if (setup.status === 'expired') return '二维码已过期，请重新授权。'
-  if (isWeibo && setup.errorCode === 'UPSTREAM_FAILED')
+  if (provider === 'weibo' && setup.errorCode === 'UPSTREAM_FAILED')
     return '微博触发了安全验证，本次授权已安全停止。请先在微博 App 完成安全验证并确认账号可正常使用，再重新授权；若仍反复出现，请稍后再试。'
+  if (provider === 'zhihu' && setup.errorCode === 'UPSTREAM_FAILED')
+    return '知乎触发了安全验证，本次授权已安全停止。请先在知乎 App 完成安全验证并确认账号可正常使用，再重新授权；若仍反复出现，请稍后再试。'
   return '本次授权未完成，请重试。'
 }
 
@@ -478,13 +480,15 @@ export function ConnectorsTab({
   )
 
   /**
-   * 微博当前版本账号直接原位换新登录状态：新扫码成功前旧连接仍可用；失败或取消不动旧状态。
+   * 微博/知乎当前版本账号直接原位换新登录状态：新扫码成功前旧连接仍可用；失败或取消不动旧状态。
    * 旧版本账号与知识星球继续走原有解绑后重建，避免把跨版本迁移混进本次修复。
    */
   const reauthorizeRuntimeAccount = useCallback(
     async (account: RuntimePluginAccount, plugin: RuntimePluginCatalogEntry) => {
       const relinkInPlace =
-        plugin.slug === 'weibo' && plugin.installedCurrent && account.versionId === plugin.versionId
+        ['weibo', 'zhihu'].includes(plugin.slug) &&
+        plugin.installedCurrent &&
+        account.versionId === plugin.versionId
       const ok = await confirm({
         title: `重新登录「${plugin.label}」?`,
         body: relinkInPlace
@@ -847,8 +851,13 @@ function RuntimePluginCard({
 }) {
   const Icon = connectorIcon(plugin.slug)
   const canSelfAuthorize =
-    ['knowledge-planet', 'weibo'].includes(plugin.slug) && plugin.installedCurrent
-  const authorizeLabel = plugin.slug === 'weibo' ? '微博扫码授权' : '微信扫码授权'
+    ['knowledge-planet', 'weibo', 'zhihu'].includes(plugin.slug) && plugin.installedCurrent
+  const authorizeLabel =
+    plugin.slug === 'weibo'
+      ? '微博扫码授权'
+      : plugin.slug === 'zhihu'
+        ? '知乎扫码授权'
+        : '微信扫码授权'
   const readCount = plugin.actions.filter((action) => action.readOnly).length
   const writeCount = plugin.actions.length - readCount
   const [consentAccount, setConsentAccount] = useState<RuntimePluginAccount | null>(null)
@@ -1111,7 +1120,8 @@ function RuntimePluginCard({
                     )}
                   </div>
                 </div>
-                {canSelfAuthorize && (accountState.needsReauth || plugin.slug === 'weibo') && (
+                {canSelfAuthorize &&
+                  (accountState.needsReauth || ['weibo', 'zhihu'].includes(plugin.slug)) && (
                   <Button
                     variant="secondary"
                     size="sm"
@@ -1120,7 +1130,7 @@ function RuntimePluginCard({
                     disabled={busyAction !== null}
                   >
                     <QrCode size={13} />
-                    {plugin.slug === 'weibo' ? '重新扫码登录' : '重新扫码授权'}
+                    {['weibo', 'zhihu'].includes(plugin.slug) ? '重新扫码登录' : '重新扫码授权'}
                   </Button>
                 )}
                 {account.writeControl && (
@@ -1398,10 +1408,11 @@ function ManagedBrowserSetupDialog({
   onClose: () => void
   onBound: (agentReady: boolean) => void
 }) {
-  const provider = plugin?.slug === 'weibo' ? 'weibo' : 'knowledge-planet'
-  const isWeibo = provider === 'weibo'
-  const label = isWeibo ? '微博' : '知识星球'
-  const scanner = isWeibo ? '微博客户端' : '微信'
+  const provider =
+    plugin?.slug === 'weibo' ? 'weibo' : plugin?.slug === 'zhihu' ? 'zhihu' : 'knowledge-planet'
+  const isRefreshableQr = provider !== 'knowledge-planet'
+  const label = provider === 'weibo' ? '微博' : provider === 'zhihu' ? '知乎' : '知识星球'
+  const scanner = provider === 'weibo' ? '微博客户端' : provider === 'zhihu' ? '知乎 App' : '微信'
   const [starting, setStarting] = useState(false)
   const [setup, setSetup] = useState<KnowledgePlanetSetupView | null>(null)
   const [qrUrl, setQrUrl] = useState<string | null>(null)
@@ -1476,9 +1487,12 @@ function ManagedBrowserSetupDialog({
     let cancelled = false
     let timer: number | undefined
     const poll = () => {
-      const request = isWeibo
-        ? api.getWeiboSetup(auth, setupSessionId)
-        : api.getKnowledgePlanetSetup(auth, setupSessionId)
+      const request =
+        provider === 'weibo'
+          ? api.getWeiboSetup(auth, setupSessionId)
+          : provider === 'zhihu'
+            ? api.getZhihuSetup(auth, setupSessionId)
+            : api.getKnowledgePlanetSetup(auth, setupSessionId)
       void request
         .then((next) => {
           if (!cancelled) {
@@ -1519,7 +1533,7 @@ function ManagedBrowserSetupDialog({
   }, [
     auth,
     findExistingAccount,
-    isWeibo,
+    provider,
     markExistingAccountActive,
     relinkAccountId,
     setupSessionId,
@@ -1529,14 +1543,17 @@ function ManagedBrowserSetupDialog({
   useEffect(() => {
     if (!setupQrReady || !setupSessionId) return
     const qrKey = `${setupSessionId}:${setupQrRevision}`
-    const revisionBound = !isWeibo && hasSetupQrRevision
+    const revisionBound = !isRefreshableQr && hasSetupQrRevision
     if (revisionBound && loadedQrKey === qrKey) return
     let cancelled = false
     let timer: number | undefined
     const load = () => {
-      const request = isWeibo
-        ? api.getWeiboSetupQr(auth, setupSessionId)
-        : api.getKnowledgePlanetSetupQr(auth, setupSessionId)
+      const request =
+        provider === 'weibo'
+          ? api.getWeiboSetupQr(auth, setupSessionId)
+          : provider === 'zhihu'
+            ? api.getZhihuSetupQr(auth, setupSessionId)
+            : api.getKnowledgePlanetSetupQr(auth, setupSessionId)
       void request
         .then((blob) => {
           if (cancelled) return
@@ -1564,8 +1581,9 @@ function ManagedBrowserSetupDialog({
   }, [
     auth,
     hasSetupQrRevision,
-    isWeibo,
+    isRefreshableQr,
     loadedQrKey,
+    provider,
     setupQrReady,
     setupQrRevision,
     setupSessionId,
@@ -1592,11 +1610,15 @@ function ManagedBrowserSetupDialog({
     setError(null)
     try {
       setSetup(
-        await (isWeibo
+        await (provider === 'weibo'
           ? relinkAccountId
             ? api.startWeiboSetup(auth, relinkAccountId)
             : api.startWeiboSetup(auth)
-          : api.startKnowledgePlanetSetup(auth)),
+          : provider === 'zhihu'
+            ? relinkAccountId
+              ? api.startZhihuSetup(auth, relinkAccountId)
+              : api.startZhihuSetup(auth)
+            : api.startKnowledgePlanetSetup(auth)),
       )
     } catch (e) {
       if (!relinkAccountId && e instanceof ApiError && e.code === 'ACCOUNT_ALREADY_EXISTS') {
@@ -1619,7 +1641,8 @@ function ManagedBrowserSetupDialog({
       setCancelling(true)
       setError(null)
       try {
-        if (isWeibo) await api.cancelWeiboSetup(auth, setup.sessionId)
+        if (provider === 'weibo') await api.cancelWeiboSetup(auth, setup.sessionId)
+        else if (provider === 'zhihu') await api.cancelZhihuSetup(auth, setup.sessionId)
         else await api.cancelKnowledgePlanetSetup(auth, setup.sessionId)
       } catch (e) {
         setError(errText(e, '取消授权失败，请重试'))
@@ -1648,7 +1671,7 @@ function ManagedBrowserSetupDialog({
       description={
         relinkAccountId
           ? `${scanner}扫码成功前会保留当前登录；成功后替换登录状态，并关闭写入能力和免逐次确认。`
-          : `${scanner}扫码一次即可复用登录。读取能力授权后可用；发布媒体、互动、编辑和删除默认关闭，需另行阅读免责声明并手动开启。`
+          : `${scanner}扫码一次即可复用登录。读取能力授权后可用；发布内容、互动、编辑和删除默认关闭，需另行阅读免责声明并手动开启。`
       }
       footer={
         <>
@@ -1689,10 +1712,17 @@ function ManagedBrowserSetupDialog({
       <div className="flex flex-col gap-3">
         {error && <Alert tone="danger" density="compact">{error}</Alert>}
         {!setup && (
-          <div className="rounded-lg bg-hover px-3 py-2.5 text-meta leading-relaxed text-muted">
-            点击“同意并生成二维码”即表示你同意使用{scanner}扫码保存{label}
-            登录状态。登录状态仅保存在服务端加密账号库中；Plugin
-            只访问固定域名白名单。扫码本身不会开启发布能力，写入需在账号卡片中另行同意并开启，且每次执行仍需确认。
+          <div className="flex flex-col gap-2 rounded-lg bg-hover px-3 py-2.5 text-meta leading-relaxed text-muted">
+            <p>
+              点击“同意并生成二维码”即表示你同意使用{scanner}扫码保存{label}
+              登录状态。登录状态仅保存在服务端加密账号库中；Plugin
+              只访问固定域名白名单。扫码本身不会开启发布能力，写入需在账号卡片中另行同意并开启，且每次执行仍需确认。
+            </p>
+            {provider === 'zhihu' && (
+              <p className="text-warning">
+                该 Plugin 不是知乎官方产品，仅自动操作网页中可见界面；知乎现行服务协议或平台规则可能限制自动化访问并带来账号限制风险。继续即表示你已自行确认有权使用并接受相关风险。
+              </p>
+            )}
           </div>
         )}
         {setup && !terminalFailure && (
@@ -1746,7 +1776,13 @@ function ManagedBrowserSetupDialog({
               <div className="flex justify-center rounded-xl border border-border bg-white p-4">
                 <img
                   src={qrUrl}
-                  alt={isWeibo ? '微博登录二维码' : '知识星球微信登录二维码'}
+                  alt={
+                    provider === 'weibo'
+                      ? '微博登录二维码'
+                      : provider === 'zhihu'
+                        ? '知乎登录二维码'
+                        : '知识星球微信登录二维码'
+                  }
                   className="size-56 object-contain"
                 />
               </div>
@@ -1793,7 +1829,7 @@ function ManagedBrowserSetupDialog({
           </Alert>
         )}
         {terminalFailure && (
-          <Alert tone="warning">{managedSetupFailureText(isWeibo, setup)}</Alert>
+          <Alert tone="warning">{managedSetupFailureText(provider, setup)}</Alert>
         )}
       </div>
     </Modal>

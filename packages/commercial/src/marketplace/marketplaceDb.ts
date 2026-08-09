@@ -36,6 +36,12 @@ import {
   isOfficialWeiboPluginIdentity,
 } from '../plugins/weiboContract.js'
 import {
+  COMPILED_ZHIHU_PLUGIN,
+  ZHIHU_PLUGIN_SLUG,
+  ZHIHU_PLUGIN_VERSION,
+  isOfficialZhihuPluginIdentity,
+} from '../plugins/zhihuContract.js'
+import {
   lockMarketplaceListing,
   lockMarketplaceMutationSet,
   lockMarketplaceVersion,
@@ -580,7 +586,7 @@ async function publishSkillVersionInternal(
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
   if (
     isDefaultConnectorSlug(input.slug) ||
-    ([KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG].includes(input.slug) &&
+    ([KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG, ZHIHU_PLUGIN_SLUG].includes(input.slug) &&
       !allowOfficialKnowledgePlanetSeed)
   )
     throw new MarketplaceError(
@@ -734,6 +740,26 @@ export async function publishOfficialWeiboVersion(
     throw new MarketplaceError(
       'ARTIFACT_MISMATCH',
       'Weibo platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
+}
+
+/** Narrow platform-seed bypass for the exact version-controlled Zhihu artifact. */
+export async function publishOfficialZhihuVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  if (
+    input.slug !== ZHIHU_PLUGIN_SLUG ||
+    input.version !== ZHIHU_PLUGIN_VERSION ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'managed-browser' ||
+    input.artifactHash !== COMPILED_ZHIHU_PLUGIN.artifactHash ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'Zhihu platform seed identity does not match the pinned artifact',
     )
   return publishSkillVersionInternal(input, true)
 }
@@ -1421,6 +1447,13 @@ export async function listApprovedForSearch(
           artifactHash: x.artifact_hash,
           execContractHash: verifiedRuntime?.execContractHash ?? null,
           reviewSource: x.review_source,
+        }) ||
+        isOfficialZhihuPluginIdentity({
+          slug: x.slug,
+          pluginType: x.plugin_type,
+          artifactHash: x.artifact_hash,
+          execContractHash: verifiedRuntime?.execContractHash ?? null,
+          reviewSource: x.review_source,
         }))
     out.push({
       versionId: x.id,
@@ -1665,6 +1698,13 @@ export async function getListingDetail(
               reviewSource: x.review_source,
             }) ||
             isOfficialWeiboPluginIdentity({
+              slug: x.slug,
+              pluginType: x.plugin_type,
+              artifactHash: x.artifact_hash,
+              execContractHash: verifiedRuntimeExecContractHash,
+              reviewSource: x.review_source,
+            }) ||
+            isOfficialZhihuPluginIdentity({
               slug: x.slug,
               pluginType: x.plugin_type,
               artifactHash: x.artifact_hash,
