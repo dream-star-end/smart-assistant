@@ -949,7 +949,7 @@ describe('Aurora v5 — P7 最小路由', () => {
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).toContain('case=research-bike-demand')
 
-    fireEvent.click(screen.getByRole('button', { name: '登录后试用' }))
+    fireEvent.click(screen.getByRole('button', { name: /带着我的材料开始.*登录后试用/ }))
     await waitFor(() =>
       expect(screen.getByRole('heading', { name: '欢迎使用 Aurora' })).toBeInTheDocument(),
     )

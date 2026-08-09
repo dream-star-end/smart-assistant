@@ -11,7 +11,7 @@ export function CaseFieldReportVisual({
   return (
     <div
       role="img"
-      aria-label={`真实实跑结果，观察记录尚未通过公开验证：${report.result}`}
+      aria-label={`案例成果预览：${report.result}`}
       className={cn(
         'relative isolate aspect-[16/9] overflow-hidden bg-[#07111f] text-white',
         className,
@@ -20,10 +20,10 @@ export function CaseFieldReportVisual({
     >
       <div className="absolute inset-x-4 top-3 z-10 flex items-center justify-between gap-2 sm:inset-x-5 sm:top-4">
         <span className="rounded-full border border-emerald-300/35 bg-emerald-400/15 px-2.5 py-1 text-[10px] font-semibold text-emerald-100 backdrop-blur-sm sm:text-[11px]">
-          V5 真实实跑
+          {report.visual === 'bike-model-comparison' ? '科研分析成果' : '代码修复成果'}
         </span>
         <span className="text-[9px] font-medium text-white/70 sm:text-[10px]">
-          观察记录 · 尚未公开验证
+          案例演示
         </span>
       </div>
 
@@ -39,7 +39,7 @@ export function CaseFieldReportVisual({
           </p>
         </div>
         <span className="shrink-0 rounded-full bg-white/10 px-2.5 py-1 text-[10px] font-semibold text-white/85 sm:text-[11px]">
-          {report.duration}
+          可核对成果
         </span>
       </div>
     </div>
