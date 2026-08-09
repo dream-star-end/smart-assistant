@@ -2,18 +2,9 @@ name: Aurora v5 Windows Desktop
 
 on:
   pull_request:
-    branches: [feat/v5-aurora-rewrite]
-    paths:
-      - 'packages/desktop/**'
-      - 'docs/V5_WINDOWS_DESKTOP.md'
-      - '.github/workflows/v5-windows-desktop.yml'
+    branches: [feat/v5-aurora-rewrite, feat/v5-windows-app]
   push:
-    branches: [feat/v5-aurora-rewrite]
-    paths:
-      - 'packages/desktop/**'
-      - 'docs/V5_WINDOWS_DESKTOP.md'
-      - '.github/workflows/v5-windows-desktop.yml'
-  workflow_dispatch:
+    branches: [feat/v5-aurora-rewrite, feat/v5-windows-app]
 
 permissions:
   contents: read
@@ -23,7 +14,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  scope:
+    name: Windows app scope
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.scope.outputs.build }}
+
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether installer validation is required
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$BASE_REF" == "feat/v5-windows-app" || "$REF_NAME" == "feat/v5-windows-app" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            from="$BASE_SHA"
+          else
+            from="$BEFORE_SHA"
+          fi
+
+          if [[ -z "$from" || "$from" =~ ^0+$ ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git cat-file -e "${from}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          changed_files="$(git diff --name-only --no-renames "$from" "$HEAD_SHA")"
+          if grep -Eq '^(packages/desktop/|apps/windows/|docs/V5_WINDOWS_DESKTOP\.md$|\.github/workflows/v5-windows-desktop\.yml$)' <<< "$changed_files"; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
   windows-nsis:
+    needs: scope
+    if: needs.scope.outputs.build == 'true'
     name: Windows NSIS (unsigned)
     runs-on: windows-latest
     timeout-minutes: 35
@@ -35,7 +78,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22.12.0'
+          node-version: "22.12.0"
           cache: npm
           cache-dependency-path: packages/desktop/package-lock.json
 
@@ -50,7 +93,7 @@ jobs:
         # builds unsigned artifacts on every trigger; the protected release-signing
         # lane is documented in docs/V5_WINDOWS_DESKTOP.md and is not enabled yet.
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm --prefix packages/desktop run dist:win
 
       - name: Smoke packaged executable without public network
@@ -111,3 +154,34 @@ jobs:
             packages/desktop/release/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
+
+  gate:
+    name: Windows app gate
+    if: ${{ always() }}
+    needs: [scope, windows-nsis]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify required Windows result
+        shell: bash
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          BUILD_REQUIRED: ${{ needs.scope.outputs.build }}
+          WINDOWS_RESULT: ${{ needs.windows-nsis.result }}
+        run: |
+          set -euo pipefail
+          [[ "$SCOPE_RESULT" == "success" ]] || {
+            echo "scope job did not succeed: $SCOPE_RESULT" >&2
+            exit 1
+          }
+          if [[ "$BUILD_REQUIRED" == "true" ]]; then
+            [[ "$WINDOWS_RESULT" == "success" ]] || {
+              echo "Windows installer validation did not succeed: $WINDOWS_RESULT" >&2
+              exit 1
+            }
+          else
+            [[ "$WINDOWS_RESULT" == "skipped" ]] || {
+              echo "unexpected Windows installer result for an out-of-scope change: $WINDOWS_RESULT" >&2
+              exit 1
+            }
+          fi

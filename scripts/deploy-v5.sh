@@ -156,6 +156,13 @@ DEPLOY_SURFACE_CHECK="$SCRIPT_DIR/v5-deploy-surface-check.mjs"
   echo "FATAL: 缺或不可执行的 V5 deploy surface check: $DEPLOY_SURFACE_CHECK" >&2
   exit 1
 }
+BRANCH_POLICY_SCRIPT="$SCRIPT_DIR/v5-branch-policy.sh"
+[ -f "$BRANCH_POLICY_SCRIPT" ] || {
+  echo "FATAL: 缺 V5 branch policy: $BRANCH_POLICY_SCRIPT" >&2
+  exit 1
+}
+# shellcheck source=scripts/v5-branch-policy.sh
+source "$BRANCH_POLICY_SCRIPT"
 # deploy_state 单一权威访问层(P3;与 v5-caddy-apply.sh 共用 CAS/read/journal/lane_hash 同源)。
 DEPLOY_STATE_LIB="$SCRIPT_DIR/v5-deploy-state-lib.sh"
 [ -f "$DEPLOY_STATE_LIB" ] || { echo "FATAL: 缺 deploy_state lib: $DEPLOY_STATE_LIB" >&2; exit 1; }
@@ -168,10 +175,9 @@ OC_HOTCFG_RELEASES_ROOT="${OC_HOTCFG_RELEASES_ROOT:-/var/lib/openclaude-v5/runti
 OC_HOTCFG_HISTORY="/etc/openclaude/runtime-tuple.history"
 HOTCFG_REMOTE_LIB="/var/lib/openclaude-v5/.deploy-lib/v5-runtime-release-lib.sh"
 
-# Sanity:必须在 v5 worktree(分支 feat/v5-aurora-rewrite),不能在 v3/master 误跑。
+# Sanity:服务端部署只能来自 V5 server 分支；独立 Windows app 分支永远 fail-closed。
 BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-if [[ "$BR" != feat/v5-* && "${ALLOW_ANY_BRANCH:-0}" != "1" ]]; then
-  echo "✗ 当前分支 '$BR' 不是 v5 分支(feat/v5-*)。拒绝部署(ALLOW_ANY_BRANCH=1 跳过)。" >&2
+if ! assert_v5_deploy_branch_allowed "$BR" "${ALLOW_ANY_BRANCH:-0}"; then
   exit 1
 fi
 

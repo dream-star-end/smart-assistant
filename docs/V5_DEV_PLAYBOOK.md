@@ -69,6 +69,11 @@ cd /opt/openclaude/openclaude-v3            # canonical(v3 分支 checkout,只�
 git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrite
 ```
 - v5 的基永远是 `feat/v5-aurora-rewrite`(**单一 canonical 分支**;部署树=`/opt/openclaude/openclaude-v5-aurora`)。
+- **独立客户端例外**：Windows app 的长期 canonical 是 `feat/v5-windows-app`；`apps/windows/**`、
+  Electron、NSIS 和 Windows 原生集成的任务 worktree 必须基于它，PR 也只回它，任务分支必须
+  命名为 `<type>/v5-windows-<slug>`。app-only 改动不进 V5 server release queue，禁止运行
+  `deploy-v5.sh`。若同时需要 server/protocol/web 兼容改动，先以独立 PR 合入
+  `feat/v5-aurora-rewrite`，再用显式 upstream-sync PR 同步到 Windows canonical。
 - 新 worktree 无依赖时,从部署树硬链复制(秒级):
   `cp -al /opt/openclaude/openclaude-v5-aurora/node_modules ../openclaude-v5-<slug>/node_modules`
   ⚠️ 坑:某些 worktree 的 node_modules 是**指向别的 worktree 的 symlink**,`@openclaude/*` 会解析到别人的源码树。校验:`readlink -f node_modules/@openclaude/protocol` 必须落在自己树内;不对就做本地 shim:
@@ -271,6 +276,7 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 
 **manual-only globs**(命中任一 → 整体 `manual_required`):
 
+- `apps/windows/**` — Windows app 独立 installer release lane；禁止进入 V5 server deploy/release queue
 - `**/migrations/**` — RFC §3 manual:DB migrations 人工受控 apply(§4.5)
 - `deploy/**` — RFC §3 manual:deploy/**(含 env overrides / systemd 单元 / release metadata)
 - `scripts/**` — RFC §3 manual:scripts/**(部署/告警/运维脚本随 rsync 生效,非自愈可安全自动)
