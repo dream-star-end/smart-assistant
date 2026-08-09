@@ -942,14 +942,14 @@ describe('Aurora v5 — P7 最小路由', () => {
     await waitFor(
       () =>
         expect(
-          screen.getByRole('heading', { name: '公开数据到可复现的单车需求分析' }),
+          screen.getByRole('heading', { name: '你不用守着它。回来时，过程和成果都还在。' }),
         ).toBeInTheDocument(),
       { timeout: 5000 },
     )
     expect(window.location.search).toContain('campaign=docs')
     expect(window.location.search).toContain('case=research-bike-demand')
 
-    fireEvent.click(screen.getByRole('button', { name: /带着我的材料开始.*登录后试用/ }))
+    fireEvent.click(screen.getByRole('button', { name: /用我的材料开始.*登录后试用/ }))
     await waitFor(() =>
       expect(screen.getByRole('heading', { name: '欢迎使用 Aurora' })).toBeInTheDocument(),
     )
