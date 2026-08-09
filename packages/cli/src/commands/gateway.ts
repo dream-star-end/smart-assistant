@@ -2,7 +2,13 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Gateway, log } from '@openclaude/gateway'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
-import { type OpenClaudeConfig, readAgentsConfig, readConfig } from '@openclaude/storage'
+import {
+  type OpenClaudeConfig,
+  createPgClientSessionsBackend,
+  readAgentsConfig,
+  readConfig,
+  setClientSessionsBackend,
+} from '@openclaude/storage'
 
 export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   let gw: Gateway | null = null
@@ -90,6 +96,18 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   if (!config) {
     console.error('未找到配置。请先运行 `openclaude onboard`')
     process.exit(1)
+  }
+  if (config.storage?.sessions?.driver === 'postgres') {
+    const connectionString = process.env.OPENCLAUDE_SESSIONS_DATABASE_URL
+    if (!connectionString) {
+      throw new Error('storage.sessions.driver=postgres requires OPENCLAUDE_SESSIONS_DATABASE_URL')
+    }
+    const sessionsBackend = createPgClientSessionsBackend(connectionString)
+    // Startup is deliberately fail-closed: never fall back to stale SQLite
+    // after the PostgreSQL authority has accepted mutations.
+    await sessionsBackend.probe()
+    setClientSessionsBackend(sessionsBackend)
+    log.info('gateway: PostgreSQL browser-session authority enabled')
   }
   const agentsConfig = await readAgentsConfig()
   const here = fileURLToPath(new URL('.', import.meta.url))

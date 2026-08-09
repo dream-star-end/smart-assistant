@@ -1542,7 +1542,7 @@ export class CodexAppServerRunner extends EventEmitter {
       itemType !== 'reasoning' &&
       typeof itemType === 'string'
     ) {
-      this.emitAssistantToolUse(itemId, `Codex:${itemType}`, item)
+      this.emitAssistantToolUse(itemId, `codex:${itemType}`, item)
     }
   }
 
@@ -1607,7 +1607,7 @@ export class CodexAppServerRunner extends EventEmitter {
       const saved = typeof item.savedPath === 'string' ? item.savedPath : ''
       const resultB64 = typeof item.result === 'string' ? item.result : ''
       if (!this.threadId || (!saved && !resultB64)) {
-        this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
+        this.emitToolResult(itemId, JSON.stringify(item), false)
         return
       }
       let publicPaths: string[] = []
@@ -1710,7 +1710,7 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     // Generic completion for unknown item types
-    this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
+    this.emitToolResult(itemId, JSON.stringify(item), false)
   }
 
   /** Spawn a brand-new codex thread and wire its id into runner state +

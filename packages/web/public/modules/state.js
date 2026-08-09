@@ -28,6 +28,9 @@ export function isSending() {
 
 export function setSending(val) {
   const sess = getSession()
-  if (sess) sess._sendingInFlight = val
+  if (sess) {
+    sess._sendingInFlight = val
+    if (!val) sess._inFlightClientMessageId = null
+  }
   state.sendingInFlight = val
 }

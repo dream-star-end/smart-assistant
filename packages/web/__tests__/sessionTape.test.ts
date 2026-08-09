@@ -94,7 +94,9 @@ test('session tape projection restores user, streamed text, tool lifecycle and f
             blockId: 'tool-1:result',
             toolUseBlockId: 'tool-1',
             toolName: 'Bash',
-            preview: '/tmp',
+            preview: '/tmp…',
+            output: '/tmp\ncomplete output',
+            outputJson: { stdout: '/tmp\ncomplete output' },
             isError: false,
           },
         ],
@@ -131,7 +133,37 @@ test('session tape projection restores user, streamed text, tool lifecycle and f
   assert.match(answer?.metaText || '', /in 12/)
   const tool = messages.find((message) => message.role === 'tool')
   assert.equal(tool?._completed, true)
-  assert.equal(tool?.output, '/tmp')
+  assert.equal(tool?.output, '/tmp\ncomplete output')
+  assert.deepEqual(tool?.outputJson, { stdout: '/tmp\ncomplete output' })
+})
+
+test('session tape projection preserves a large exact tool input byte-for-byte', () => {
+  const content = '无损内容'.repeat(3000)
+  const projected = projectSessionTape([
+    {
+      tapeSeq: 1,
+      turnKey: 'turn-large-input',
+      direction: 'outbound',
+      ts: 100,
+      frame: {
+        type: 'outbound.message',
+        turnId: 'turn-large-input',
+        blocks: [
+          {
+            kind: 'tool_use',
+            blockId: 'large-write',
+            toolName: 'Write',
+            inputPreview: '{"file":"large.txt"',
+            inputJson: { file: 'large.txt', content },
+          },
+        ],
+        isFinal: false,
+      },
+    },
+  ] as any)
+  const tool = projected.find((message) => message.role === 'tool') as any
+  assert.equal(tool.inputJson.content, content)
+  assert.equal(Buffer.byteLength(tool.inputJson.content), Buffer.byteLength(content))
 })
 
 test('session tape projection is deterministic for unsorted pages and nested agent blocks', () => {

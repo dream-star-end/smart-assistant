@@ -21,11 +21,13 @@ describe('conversation turn lifetime', () => {
     assert.match(SRC, /if \(allBusy\) \{/)
   })
 
-  it('accepts only authoritative running or idle status after reconnect', () => {
+  it('accepts exact running and terminal reconciliation states after reconnect', () => {
     assert.match(
       SRC,
-      /frame\.status === 'running' \|\| frame\.status === 'compacting' \|\| frame\.status === 'idle'/,
+      /status === 'idle' \|\|\s+status === 'completed' \|\|\s+status === 'interrupted' \|\|\s+status === 'unknown'/,
     )
-    assert.match(SRC, /else if \(status === 'idle' && sess\._sendingInFlight\)/)
+    assert.match(SRC, /if \(status !== 'idle'\) \{\s+sess\._needsFetch = true/)
+    assert.match(SRC, /status !== 'idle' && sess\.id === state\.currentSessionId/)
+    assert.match(SRC, /localClientMessageId !== frameClientMessageId/)
   })
 })

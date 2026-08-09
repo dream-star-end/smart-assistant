@@ -5,10 +5,10 @@ import { exportSessionDocx } from './export-docx.js'
 import { exportSessionTex } from './export-tex.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=13'
+import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=14'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
-import { nudgeDrain } from './websocket.js?v=57'
+import { nudgeDrain } from './websocket.js?v=58'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -429,6 +429,7 @@ export function sanitizeLoadedTurnState(sess) {
   const newest = Math.max(startedAt, lastFrameAt)
   if (!newest || Date.now() - newest > STALE_TURN_THRESHOLD_MS) {
     sess._sendingInFlight = false
+    sess._inFlightClientMessageId = null
     sess._turnStartedAt = null
     sess._lastFrameAt = null
   }

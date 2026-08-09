@@ -345,8 +345,34 @@ function _humanizeOp(op) {
 }
 
 // Resolve icon + label for a tool name (handles MCP names).
-function _toolMeta(name) {
+const _CODEX_TYPE_META = {
+  plan: { icon: _ICON_CHECK_LIST, label: '任务列表' },
+  todo_list: { icon: _ICON_CHECK_LIST, label: '任务列表' },
+  mcpToolCall: { icon: _ICON_GEAR, label: 'MCP 工具' },
+  dynamicToolCall: { icon: _ICON_GEAR, label: '工具调用' },
+  collabAgentToolCall: { icon: _ICON_BOT, label: '委托子任务' },
+  webSearch: { icon: _ICON_GLOBE, label: '网页搜索' },
+  imageView: { icon: _ICON_EYE, label: '查看图片' },
+  imageGeneration: { icon: _ICON_IMAGE, label: '生成图片' },
+  contextCompaction: { icon: _ICON_ARCHIVE, label: '压缩上下文' },
+}
+
+function _parseCodexTypeName(name) {
+  return typeof name === 'string' && name.startsWith('codex:') ? name.slice(6) : null
+}
+
+function _toolMeta(name, input) {
   if (_TOOL_ICONS[name]) return { icon: _TOOL_ICONS[name], label: _TOOL_LABELS[name] || name }
+  const codexType = _parseCodexTypeName(name)
+  if (codexType) {
+    if (codexType === 'mcpToolCall' && input && typeof input === 'object') {
+      const server = input.server || input.serverName || ''
+      const tool = input.tool || input.toolName || input.name || ''
+      const opMeta = _MCP_OP_META[`${server}:${tool}`]
+      if (opMeta) return opMeta
+    }
+    return _CODEX_TYPE_META[codexType] || { icon: _ICON_BOT, label: `Codex: ${codexType}` }
+  }
   const mcp = _parseMcpName(name)
   if (mcp) {
     const opMeta = _MCP_OP_META[`${mcp.server}:${mcp.op}`]
@@ -626,8 +652,8 @@ function _renderWorkflowGroup(el, msg) {
 
 function _buildToolCard(el, msg) {
   const name = msg.toolName || 'unknown'
-  const meta = _toolMeta(name)
   const input = _safeInput(msg)
+  const meta = _toolMeta(name, input)
   const completed = msg._completed
   const isError = msg.error
   const isRunning = !completed && !isError
@@ -674,10 +700,13 @@ function _buildToolCard(el, msg) {
   const body = document.createElement('div')
   body.className = 'tool-card-body'
   _renderToolBody(body, name, input, msg)
+  _appendExactInput(body, input)
   el.appendChild(body)
 }
 
 function _renderToolBody(body, name, input, msg) {
+  const codexType = _parseCodexTypeName(name)
+  if (codexType) return _renderCodexItem(body, codexType, input, msg)
   switch (name) {
     case 'Bash':
       return _renderBash(body, input, msg)
@@ -740,6 +769,11 @@ function _toolSummary(name, input, msg) {
     case 'Codex:multiAgent':
       return (input.description || input.codexTool || input.prompt || '').slice(0, 60)
   }
+  const codexType = _parseCodexTypeName(name)
+  if (codexType === 'webSearch') return String(input.query || input.searchQuery || '').slice(0, 80)
+  if (codexType === 'imageView') return _shortPath(input.path || input.url || '')
+  if (codexType === 'imageGeneration') return String(input.prompt || '').slice(0, 80)
+  if (codexType) return String(input.tool || input.toolName || input.name || '').slice(0, 80)
   // MCP fallback summaries
   const mcp = _parseMcpName(name)
   if (!mcp) return ''
@@ -798,18 +832,22 @@ function _mcpSummary(server, op, input) {
 // ── Bash: terminal-like card ──
 function _renderBash(body, input, msg) {
   if (input?.command) {
-    const cmdText = typeof input.command === 'string' ? input.command.slice(0, 2000) : ''
-    const cmdBlock = document.createElement('div')
-    cmdBlock.className = 'tool-terminal'
-    const prompt = document.createElement('span')
-    prompt.className = 'tool-terminal-prompt'
-    prompt.textContent = '$ '
-    const cmd = document.createElement('span')
-    cmd.className = 'tool-terminal-cmd'
-    cmd.textContent = cmdText
-    cmdBlock.appendChild(prompt)
-    cmdBlock.appendChild(cmd)
-    body.appendChild(cmdBlock)
+    const cmdText = typeof input.command === 'string' ? input.command : ''
+    if (_utf8Bytes(cmdText) > _INLINE_TOOL_BYTES) {
+      _appendLazyDisclosure(body, '完整命令', cmdText, 'tool-output tool-code-block')
+    } else {
+      const cmdBlock = document.createElement('div')
+      cmdBlock.className = 'tool-terminal'
+      const prompt = document.createElement('span')
+      prompt.className = 'tool-terminal-prompt'
+      prompt.textContent = '$ '
+      const cmd = document.createElement('span')
+      cmd.className = 'tool-terminal-cmd'
+      cmd.textContent = cmdText
+      cmdBlock.appendChild(prompt)
+      cmdBlock.appendChild(cmd)
+      body.appendChild(cmdBlock)
+    }
   }
   // Detect "background placeholder" — BashTool.tsx returns one of three forms
   // for backgrounded shells (auto / manual / explicit run_in_background:true).
@@ -858,10 +896,7 @@ function _renderBash(body, input, msg) {
     // Final tool_result preview wins once the command finishes. The
     // streaming bashTail is hidden in this branch — the gateway-emitted
     // tool_result.preview is the canonical truncated output sent by CCB.
-    const outBlock = document.createElement('pre')
-    outBlock.className = 'tool-output'
-    outBlock.textContent = msg.output
-    body.appendChild(outBlock)
+    _appendLosslessPre(body, msg.output)
   } else if (msg.bashTail && typeof msg.bashTail.tail === 'string') {
     // Live tail snapshot from CCB's TaskOutput poller (~1 Hz). Replace
     // semantics: the snapshot already contains the latest tail window
@@ -882,50 +917,48 @@ function _renderBash(body, input, msg) {
   }
 }
 
-// ── Edit: diff view ──
-const _MAX_DIFF_LINES = 60
+// ── Edit: complete diff view ──
 function _renderEdit(body, input, msg) {
   if (input?.old_string || input?.new_string) {
-    const diffBlock = document.createElement('div')
-    diffBlock.className = 'tool-diff'
-    let lineCount = 0
-    const oldStr = typeof input.old_string === 'string' ? input.old_string.slice(0, 3000) : ''
-    const newStr = typeof input.new_string === 'string' ? input.new_string.slice(0, 3000) : ''
-    if (oldStr) {
-      for (const line of oldStr.split('\n')) {
-        if (++lineCount > _MAX_DIFF_LINES) break
-        const el = document.createElement('div')
-        el.className = 'tool-diff-del'
-        el.textContent = `- ${line}`
-        diffBlock.appendChild(el)
+    const oldStr = typeof input.old_string === 'string' ? input.old_string : ''
+    const newStr = typeof input.new_string === 'string' ? input.new_string : ''
+    if (_utf8Bytes(oldStr) + _utf8Bytes(newStr) > _INLINE_TOOL_BYTES) {
+      const text = [
+        ...(oldStr ? oldStr.split('\n').map((line) => `- ${line}`) : []),
+        ...(newStr ? newStr.split('\n').map((line) => `+ ${line}`) : []),
+      ].join('\n')
+      _appendLazyDisclosure(body, '完整差异', text, 'tool-output tool-code-block')
+    } else {
+      const diffBlock = document.createElement('div')
+      diffBlock.className = 'tool-diff'
+      if (oldStr) {
+        for (const line of oldStr.split('\n')) {
+          const el = document.createElement('div')
+          el.className = 'tool-diff-del'
+          el.textContent = `- ${line}`
+          diffBlock.appendChild(el)
+        }
       }
-    }
-    if (newStr) {
-      for (const line of newStr.split('\n')) {
-        if (++lineCount > _MAX_DIFF_LINES) break
-        const el = document.createElement('div')
-        el.className = 'tool-diff-add'
-        el.textContent = `+ ${line}`
-        diffBlock.appendChild(el)
+      if (newStr) {
+        for (const line of newStr.split('\n')) {
+          const el = document.createElement('div')
+          el.className = 'tool-diff-add'
+          el.textContent = `+ ${line}`
+          diffBlock.appendChild(el)
+        }
       }
+      body.appendChild(diffBlock)
     }
-    if (lineCount > _MAX_DIFF_LINES) {
-      const more = document.createElement('div')
-      more.className = 'tool-file-meta'
-      more.textContent = '… (diff 过长，已截断)'
-      diffBlock.appendChild(more)
-    }
-    body.appendChild(diffBlock)
   }
   if (msg.output && !msg.error) {
     const status = document.createElement('div')
     status.className = 'tool-status-ok'
-    status.textContent = msg.output.slice(0, 200)
+    status.textContent = msg.output
     body.appendChild(status)
   } else if (msg.output && msg.error) {
     const status = document.createElement('div')
     status.className = 'tool-status-err'
-    status.textContent = msg.output.slice(0, 300)
+    status.textContent = msg.output
     body.appendChild(status)
   }
 }
@@ -942,27 +975,19 @@ function _renderRead(body, input, msg) {
     if (parts.length) body.appendChild(meta)
   }
   if (msg.output) {
-    const pre = document.createElement('pre')
-    pre.className = 'tool-output tool-file-content'
-    pre.textContent = msg.output.slice(0, 2000)
-    if (msg.output.length > 2000) pre.textContent += '\n…'
-    body.appendChild(pre)
+    _appendLosslessPre(body, msg.output, 'tool-output tool-file-content')
   }
 }
 
 // ── Write: file creation ──
 function _renderWrite(body, input, msg) {
   if (input?.content) {
-    const preview = document.createElement('pre')
-    preview.className = 'tool-output'
-    preview.textContent = input.content.slice(0, 500)
-    if (input.content.length > 500) preview.textContent += '\n…'
-    body.appendChild(preview)
+    _appendLosslessPre(body, input.content)
   }
   if (msg.output) {
     const status = document.createElement('div')
     status.className = msg.error ? 'tool-status-err' : 'tool-status-ok'
-    status.textContent = msg.output.slice(0, 200)
+    status.textContent = msg.output
     body.appendChild(status)
   }
 }
@@ -982,11 +1007,7 @@ function _renderGrep(body, input, msg) {
     }
   }
   if (msg.output) {
-    const pre = document.createElement('pre')
-    pre.className = 'tool-output tool-search-results'
-    pre.textContent = msg.output.slice(0, 2000)
-    if (msg.output.length > 2000) pre.textContent += '\n…'
-    body.appendChild(pre)
+    _appendLosslessPre(body, msg.output, 'tool-output tool-search-results')
   }
 }
 
@@ -999,11 +1020,7 @@ function _renderGlob(body, input, msg) {
     body.appendChild(meta)
   }
   if (msg.output) {
-    const pre = document.createElement('pre')
-    pre.className = 'tool-output tool-file-list'
-    pre.textContent = msg.output.slice(0, 2000)
-    if (msg.output.length > 2000) pre.textContent += '\n…'
-    body.appendChild(pre)
+    _appendLosslessPre(body, msg.output, 'tool-output tool-file-list')
   }
 }
 
@@ -1075,10 +1092,51 @@ function _renderKvList(parent, obj, opts) {
   if (list.children.length) parent.appendChild(list)
 }
 
-// Render output as text. If JSON, pretty-print; if URL, embed.
-function _renderOutput(body, output, opts) {
+// Inline modest payloads; large payloads remain exact but only materialize in
+// the DOM after an explicit disclosure. This is a rendering strategy, not a
+// content limit: the full value remains in the session model and timeline.
+const _INLINE_TOOL_BYTES = 64 * 1024
+
+function _utf8Bytes(text) {
+  return new Blob([String(text)]).size
+}
+
+function _appendLazyDisclosure(body, label, text, className = 'tool-output') {
+  const value = String(text)
+  const details = document.createElement('details')
+  details.className = 'tool-exact-payload'
+  const summary = document.createElement('summary')
+  summary.textContent = `${label} (${_utf8Bytes(value).toLocaleString()} 字节)`
+  const pre = document.createElement('pre')
+  pre.className = className
+  details.appendChild(summary)
+  details.appendChild(pre)
+  details.addEventListener(
+    'toggle',
+    () => {
+      if (details.open) pre.textContent = value
+    },
+    { once: true },
+  )
+  body.appendChild(details)
+}
+
+function _appendLosslessPre(body, text, className = 'tool-output') {
+  const value = String(text)
+  if (_utf8Bytes(value) > _INLINE_TOOL_BYTES) {
+    _appendLazyDisclosure(body, '完整工具内容', value, className)
+    return
+  }
+  const pre = document.createElement('pre')
+  pre.className = className
+  pre.textContent = value
+  body.appendChild(pre)
+}
+
+// Render output as text. If small JSON, pretty-print; large JSON stays raw and
+// lazy so merely opening a long session does not parse or build a huge DOM.
+function _renderOutput(body, output) {
   if (!output) return
-  const max = opts?.max || 1500
   let text = String(output)
   // Try JSON pretty-print
   if (text.length < 4000 && /^\s*[\[{]/.test(text)) {
@@ -1087,14 +1145,68 @@ function _renderOutput(body, output, opts) {
       text = JSON.stringify(obj, null, 2)
     } catch {}
   }
+  _appendLosslessPre(body, text)
+}
+
+function _appendExactInput(body, input) {
+  if (!input || typeof input !== 'object') return
+  let text
+  try {
+    text = JSON.stringify(input, null, 2)
+  } catch {
+    return
+  }
+  if (text.length <= 500) return
+  const details = document.createElement('details')
+  details.className = 'tool-exact-payload'
+  const summary = document.createElement('summary')
+  summary.textContent = `完整输入 (${_utf8Bytes(text).toLocaleString()} 字节)`
   const pre = document.createElement('pre')
   pre.className = 'tool-output'
-  if (text.length > max) {
-    pre.textContent = `${text.slice(0, max)}\n…`
-  } else {
-    pre.textContent = text
+  details.appendChild(summary)
+  details.appendChild(pre)
+  details.addEventListener(
+    'toggle',
+    () => {
+      if (details.open) pre.textContent = text
+    },
+    { once: true },
+  )
+  body.appendChild(details)
+}
+
+function _renderCodexItem(body, codexType, input, msg) {
+  if (codexType === 'webSearch') {
+    _renderKvList(body, {
+      query: input?.query || input?.searchQuery,
+      action: input?.action,
+    })
+  } else if (input && typeof input === 'object') {
+    _renderKvList(body, input)
   }
-  body.appendChild(pre)
+  if (!msg.output) return
+  const details = document.createElement('details')
+  details.className = 'tool-exact-payload'
+  const summary = document.createElement('summary')
+  summary.textContent = `完整工具结果 (${_utf8Bytes(msg.output).toLocaleString()} 字节)`
+  const pre = document.createElement('pre')
+  pre.className = 'tool-output'
+  let text = String(msg.output)
+  if (_utf8Bytes(text) <= _INLINE_TOOL_BYTES) {
+    try {
+      text = JSON.stringify(JSON.parse(text), null, 2)
+    } catch {}
+  }
+  details.appendChild(summary)
+  details.appendChild(pre)
+  details.addEventListener(
+    'toggle',
+    () => {
+      if (details.open) pre.textContent = text
+    },
+    { once: true },
+  )
+  body.appendChild(details)
 }
 
 // ── TodoWrite: checklist ──
@@ -1163,7 +1275,7 @@ function _renderBrowser(body, op, input, msg) {
     if (code) {
       const block = document.createElement('pre')
       block.className = 'tool-output tool-code-block'
-      block.textContent = String(code).slice(0, 1500)
+      block.textContent = String(code)
       body.appendChild(block)
     }
   } else if (input) {
@@ -1581,6 +1693,7 @@ export function _buildMessageEl(msg) {
             )
           }
           sess._sendingInFlight = false
+          sess._inFlightClientMessageId = null
           _clearTurnTiming?.(sess)
           // Reset reply tracker BEFORE we re-post the same user message below.
           // Regen special case: since it reuses the same boundMsg, the primary
@@ -1644,6 +1757,7 @@ export function _buildMessageEl(msg) {
         if (state.ws && state.ws.readyState === 1 && !_hasQueued) {
           state.ws.send(JSON.stringify(wsPayload))
           sess._sendingInFlight = true
+          sess._inFlightClientMessageId = wsPayload.idempotencyKey
           // Clear any leftover regen timer from a previous regen/stop cycle
           if (sess._regenSafetyTimer) {
             clearTimeout(sess._regenSafetyTimer)
@@ -1667,6 +1781,7 @@ export function _buildMessageEl(msg) {
                 }
               } catch {}
               sess._sendingInFlight = false
+              sess._inFlightClientMessageId = null
               _clearTurnTiming?.(sess)
               // Abandon the reply tracker so any belated isFinal arriving for
               // this timed-out regen can't retroactively flag the user message
@@ -2102,14 +2217,16 @@ export function renderMessages() {
     }
     inner.appendChild(gap)
   }
-  // Performance: only render last 100 messages; show "load more" for older ones
+  // DOM windowing only: all loaded messages stay in memory and are available
+  // through an explicit button. Scrolling never fetches or silently reveals
+  // another server page; server pagination has its own button above.
   const MAX_INITIAL = 100
   if (msgs.length > MAX_INITIAL) {
     const LOAD_BATCH = 50
     let _loadedUpTo = msgs.length - MAX_INITIAL // index: messages before this are not yet rendered
     const loadMore = document.createElement('button')
     loadMore.className = 'load-more-btn'
-    loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
+    loadMore.textContent = `显示更早的已加载 ${_loadedUpTo} 条消息`
     const _doLoadMore = () => {
       const batchStart = Math.max(0, _loadedUpTo - LOAD_BATCH)
       const batchEnd = _loadedUpTo
@@ -2123,7 +2240,7 @@ export function renderMessages() {
       _loadedUpTo = batchStart
       if (_loadedUpTo > 0) {
         // Still more to load -- update button text and keep it
-        loadMore.textContent = `加载更早的 ${_loadedUpTo} 条消息`
+        loadMore.textContent = `显示更早的已加载 ${_loadedUpTo} 条消息`
         loadMore.after(frag)
       } else {
         // All loaded -- remove button
@@ -2133,19 +2250,6 @@ export function renderMessages() {
       main.scrollTop += main.scrollHeight - scrollBefore
     }
     loadMore.onclick = _doLoadMore
-    // Auto-load when scrolled to top (IntersectionObserver)
-    if (window.IntersectionObserver) {
-      const obs = new IntersectionObserver(
-        ([entry]) => {
-          if (entry.isIntersecting) {
-            obs.disconnect()
-            _doLoadMore()
-          }
-        },
-        { root: main },
-      )
-      obs.observe(loadMore)
-    }
     inner.appendChild(loadMore)
     for (let i = msgs.length - MAX_INITIAL; i < msgs.length; i++) renderMessage(msgs[i], true)
   } else {

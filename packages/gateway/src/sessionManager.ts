@@ -13,6 +13,7 @@ import {
   getMaxTurnIdx,
   indexTurn,
   paths,
+  recordClientTurnState,
   reopenExecutionForRedrive,
   setExecutionStatus,
   upsertSessionMeta,
@@ -334,6 +335,16 @@ export interface AgentSession {
   // 唯一消费方是 /api/dev-status 看板与 safe-restart 静默门(in-flight turn 计数),
   // 不参与任何执行语义。
   _turnActiveSince?: number | null
+  // Exact browser submit identity for reconnect reconciliation. This is set
+  // only after the per-session submit lock is acquired, so a queued submit
+  // cannot masquerade as the turn that is actually running.
+  _activeClientMessageId?: string
+  // Most recent terminal outcome retained on the warm AgentSession. After a
+  // process/session eviction the gateway intentionally answers `unknown` and
+  // lets the browser reconcile from the durable transcript instead of
+  // guessing that a restart interrupted the turn.
+  _lastClientMessageId?: string
+  _lastClientMessageOutcome?: 'completed' | 'interrupted'
   // 跨 turn 累积
   totalCostUSD: number
   totalInputTokens: number
@@ -454,6 +465,7 @@ export interface CronBridgeEvent {
 
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
+  private _shuttingDown = false
   private maxIdleMsCron = 30 * 60 * 1000 // 30 min for cron/task sessions
   private maxIdleMsChat = 30 * 60 * 1000 // 30 min for webchat sessions — aggressive eviction to curb subprocess accumulation on small personal VPS (bun+playwright+mcp stack per peer); resume-map (7d persist) handles cold reconnect via --resume
   /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
@@ -473,6 +485,11 @@ export class SessionManager {
 
   constructor(public config: OpenClaudeConfig) {
     this._loadResumeMap()
+  }
+
+  /** Stop accepting new sessions/turns before the gateway joins queued work. */
+  beginShutdown(): void {
+    this._shuttingDown = true
   }
 
   /** Update config reference (e.g. after OAuth token refresh) and propagate to all runners */
@@ -675,6 +692,7 @@ export class SessionManager {
      *  原子串行,避免 getOrCreate→submit 之间的窗口期被另一条并发消息覆盖。 */
     effortLevel?: string | null
   }): Promise<AgentSession> {
+    if (this._shuttingDown) throw new Error('session manager is shutting down')
     // 新建时 null 等同 undefined(都让 claude 用模型默认)
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
@@ -926,7 +944,10 @@ export class SessionManager {
      *  与 effort 同机制、同 lock chain。缺省则不动(用 agent 默认 model)。
      *  仅对支持 setModel 的 runner(SubprocessRunner)生效;codex runner 无则忽略。 */
     model?: string,
+    /** Browser idempotency key used to reconcile this exact turn after a WS reconnect. */
+    clientMessageId?: string,
   ): Promise<void> {
+    if (this._shuttingDown) throw new Error('session manager is shutting down')
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined = effortLevel === null ? undefined : effortLevel
     const callerSpecifiedEffort = effortLevel !== undefined
@@ -938,7 +959,21 @@ export class SessionManager {
     let turnPromise: Promise<void> | null = null
     try {
       await prev
+      // A queued submit may wake only after shutdown has terminated the turn
+      // ahead of it. Retire it without spawning a fresh runner; the gateway
+      // records the exact submit as interrupted in its dispatch finally block.
+      if (this._shuttingDown) return
       session._turnActiveSince = Date.now()
+      session._activeClientMessageId = clientMessageId
+      if (clientMessageId && session.peerId && session.userId) {
+        await recordClientTurnState({
+          sessionId: session.peerId,
+          userId: session.userId,
+          clientMessageId,
+          state: 'running',
+          startedAt: session._turnActiveSince,
+        })
+      }
       // P2.2 minimal strict gate: if a continuation watch from the prior turn is
       // still delivering/persisting the late continuation (out-of-lock), let it
       // finish BEFORE this user submit repoints the pump / writes stdin — otherwise
@@ -2511,11 +2546,13 @@ export class SessionManager {
   }
 
   async shutdownAll(): Promise<void> {
+    this.beginShutdown()
     // Persist resume map BEFORE killing subprocesses — ensures state survives restart
     // (runner.shutdown() sets shuttingDown=true so the exit handler won't call _saveResumeMap)
     this._saveResumeMap()
     await this._resumeMapWrite
-    for (const s of this.sessions.values()) {
+    const sessions = [...this.sessions.values()]
+    for (const s of sessions) {
       this._endContinuationWatch(s)
       if (s._messagePump) {
         try {
@@ -2525,7 +2562,11 @@ export class SessionManager {
       }
       s._currentTurnHandler = null
     }
-    await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
+    await Promise.all(sessions.map((s) => s.runner.shutdown()))
+    // session.lock points at the tail of the per-session submit chain. Once
+    // active runners are stopped, awaiting every tail joins both the active
+    // turn and every submit that had already queued behind it.
+    await Promise.all(sessions.map((s) => s.lock))
     this.sessions.clear()
   }
 

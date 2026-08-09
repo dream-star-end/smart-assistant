@@ -10,6 +10,7 @@
 // assistant_text) for the turn into sessions_fts. Queries use MATCH and
 // group hits by session_id to return top-N unique sessions.
 
+import { createHash } from 'node:crypto'
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -196,6 +197,8 @@ export async function getSessionsDb(): Promise<Database.Database> {
       last_at INTEGER NOT NULL,
       messages TEXT NOT NULL DEFAULT '[]',
       message_count INTEGER NOT NULL DEFAULT 0,
+      tape_turn_count INTEGER NOT NULL DEFAULT 0,
+      last_tape_seq INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_client_sessions_last ON client_sessions(last_at);
@@ -222,6 +225,35 @@ export async function getSessionsDb(): Promise<Database.Database> {
   } catch {
     /* table just created with column already */
   }
+  // Migration: denormalized tape counters keep `/api/sessions/list` O(number
+  // of sessions) instead of running correlated scans over the full tape.
+  // Backfill also covers the valid tape-before-session ordering.
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'tape_turn_count')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN tape_turn_count INTEGER NOT NULL DEFAULT 0')
+    }
+    if (!cols.some((c) => c.name === 'last_tape_seq')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN last_tape_seq INTEGER NOT NULL DEFAULT 0')
+    }
+    db.exec(`
+      UPDATE client_sessions
+      SET tape_turn_count = COALESCE((
+            SELECT COUNT(DISTINCT tape.turn_key)
+            FROM client_session_tape tape
+            WHERE tape.session_id = client_sessions.id
+              AND tape.user_id = client_sessions.user_id
+          ), 0),
+          last_tape_seq = COALESCE((
+            SELECT MAX(tape.tape_seq)
+            FROM client_session_tape tape
+            WHERE tape.session_id = client_sessions.id
+              AND tape.user_id = client_sessions.user_id
+          ), 0)
+    `)
+  } catch {
+    /* table just created or migration will retry on the next open */
+  }
 
   // Server-authoritative, append-only transcript tape. Unlike the legacy
   // `messages` JSON snapshot this is written by the gateway before a frame is
@@ -247,6 +279,17 @@ export async function getSessionsDb(): Promise<Database.Database> {
       WHERE direction = 'inbound';
     CREATE INDEX IF NOT EXISTS idx_client_session_tape_ts
       ON client_session_tape(session_id, user_id, ts);
+    CREATE TABLE IF NOT EXISTS client_session_turns (
+      session_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      client_message_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('running', 'completed', 'interrupted')),
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER DEFAULT NULL,
+      PRIMARY KEY (session_id, user_id, client_message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_client_session_turns_latest
+      ON client_session_turns(session_id, user_id, started_at DESC);
   `)
   // Migration: store message counts separately so list endpoints don't parse
   // every session's messages JSON on each request.
@@ -1040,7 +1083,7 @@ export function appendServerAuthoredPure<T extends MessageLike>(
  * delegate merging to {@link mergePreservingServerAuthored} so the policy is
  * testable in isolation.
  */
-export async function upsertClientSession(
+async function _sqliteUpsertClientSession(
   session: ClientSession,
   baseSyncedAt = 0,
 ): Promise<boolean> {
@@ -1126,11 +1169,22 @@ export async function upsertClientSession(
       existing && tapeBoundary.first_ts !== null
         ? oldMsgs
         : (mergePreservingServerAuthored(oldMsgs, clientMsgs) as unknown[])
+    const tapeCounters = db
+      .prepare(
+        `SELECT COUNT(DISTINCT turn_key) AS turn_count,
+                COALESCE(MAX(tape_seq), 0) AS last_seq
+         FROM client_session_tape WHERE session_id = ? AND user_id = ?`,
+      )
+      .get(session.id, session.userId) as { turn_count: number; last_seq: number }
 
     const result = db
       .prepare(`
-      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at)
-      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt)
+      INSERT INTO client_sessions
+        (id, user_id, agent_id, title, pinned, created_at, last_at, messages,
+         message_count, tape_turn_count, last_tape_seq, updated_at)
+      VALUES
+        (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages,
+         @messageCount, @tapeTurnCount, @lastTapeSeq, @updatedAt)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         title = excluded.title,
@@ -1138,6 +1192,8 @@ export async function upsertClientSession(
         last_at = excluded.last_at,
         messages = excluded.messages,
         message_count = excluded.message_count,
+        tape_turn_count = MAX(client_sessions.tape_turn_count, excluded.tape_turn_count),
+        last_tape_seq = MAX(client_sessions.last_tape_seq, excluded.last_tape_seq),
         updated_at = excluded.updated_at
       WHERE client_sessions.updated_at <= @baseSyncedAt
         AND client_sessions.user_id = @userId
@@ -1152,6 +1208,8 @@ export async function upsertClientSession(
         lastAt: session.lastAt,
         messages: JSON.stringify(finalMessages),
         messageCount: finalMessages.length,
+        tapeTurnCount: tapeCounters.turn_count,
+        lastTapeSeq: tapeCounters.last_seq,
         updatedAt: session.updatedAt,
         baseSyncedAt,
       })
@@ -1180,7 +1238,7 @@ export async function upsertClientSession(
  * should ensure the client has created it first) or when a message with the
  * same id already exists.
  */
-export async function appendServerAuthoredMessage(
+async function _sqliteAppendServerAuthoredMessage(
   sessId: string,
   userId: string,
   message: {
@@ -1470,12 +1528,25 @@ export interface ClientSessionTapePage {
   hasMore: boolean
 }
 
+export interface ClientSessionTapePayload {
+  payload: Buffer
+  bytes: number
+  sha256: string
+}
+
+export interface ClientTurnState {
+  clientMessageId: string
+  state: 'running' | 'completed' | 'interrupted'
+  startedAt: number
+  finishedAt: number | null
+}
+
 /**
  * Append one frame and allocate its per-session sequence in the same SQLite
  * transaction. Callers serialize operations per session and MUST wait for this
  * commit before making the frame externally visible.
  */
-export async function appendClientSessionTapeFrame(input: {
+async function _sqliteAppendClientSessionTapeFrame(input: {
   sessionId: string
   userId: string
   turnKey: string
@@ -1524,6 +1595,12 @@ export async function appendClientSessionTapeFrame(input: {
       input.ts,
       JSON.stringify(input.frame),
     )
+    db.prepare(
+      `UPDATE client_sessions
+       SET last_tape_seq = ?,
+           tape_turn_count = tape_turn_count + ?
+       WHERE id = ? AND user_id = ?`,
+    ).run(tapeSeq, input.direction === 'inbound' ? 1 : 0, input.sessionId, input.userId)
     return {
       tapeSeq,
       turnKey: input.turnKey,
@@ -1536,7 +1613,7 @@ export async function appendClientSessionTapeFrame(input: {
   return txn.immediate()
 }
 
-export async function getClientSessionTapeMeta(
+async function _sqliteGetClientSessionTapeMeta(
   sessionId: string,
   userId: string,
 ): Promise<{
@@ -1567,7 +1644,7 @@ export async function getClientSessionTapeMeta(
 }
 
 /** Return complete turn groups, newest page first but frames chronologically. */
-export async function listClientSessionTapePage(
+async function _sqliteListClientSessionTapePage(
   sessionId: string,
   userId: string,
   opts: { before?: number; turns?: number } = {},
@@ -1596,7 +1673,7 @@ export async function listClientSessionTapePage(
     )
     .all(sessionId, userId, before, turns) as Array<{ turn_key: string; first_seq: number }>
 
-  const meta = await getClientSessionTapeMeta(sessionId, userId)
+  const meta = await _sqliteGetClientSessionTapeMeta(sessionId, userId)
   if (turnRows.length === 0) {
     return {
       frames: [],
@@ -1649,26 +1726,37 @@ export async function listClientSessionTapePage(
   }
 }
 
-export async function listClientSessions(userId: string): Promise<ClientSessionMeta[]> {
+async function _sqliteReadClientSessionTapePayload(
+  sessionId: string,
+  userId: string,
+  tapeSeq: number,
+): Promise<ClientSessionTapePayload | null> {
+  const db = await getSessionsDb()
+  const row = db
+    .prepare(
+      `SELECT t.frame_json FROM client_session_tape t
+       JOIN client_sessions s ON s.id = t.session_id AND s.user_id = t.user_id
+       WHERE t.session_id = ? AND t.user_id = ? AND t.tape_seq = ?
+         AND s.deleted_at IS NULL`,
+    )
+    .get(sessionId, userId, tapeSeq) as { frame_json: string } | undefined
+  if (!row) return null
+  const payload = Buffer.from(row.frame_json, 'utf8')
+  return {
+    payload,
+    bytes: payload.byteLength,
+    sha256: createHash('sha256').update(payload).digest('hex'),
+  }
+}
+
+async function _sqliteListClientSessions(userId: string): Promise<ClientSessionMeta[]> {
   const db = await getSessionsDb()
   const rows = db
     .prepare(`
     SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
-           (
-             SELECT COUNT(DISTINCT turn_key) FROM client_session_tape tape
-             WHERE tape.session_id = client_sessions.id
-               AND tape.user_id = client_sessions.user_id
-           ) as tape_turn_count,
-           (
-             SELECT MAX(tape_seq) FROM client_session_tape tape
-             WHERE tape.session_id = client_sessions.id
-               AND tape.user_id = client_sessions.user_id
-           ) as last_tape_seq,
-           message_count + 2 * (
-             SELECT COUNT(DISTINCT turn_key) FROM client_session_tape tape
-             WHERE tape.session_id = client_sessions.id
-               AND tape.user_id = client_sessions.user_id
-           ) as msg_count
+           tape_turn_count,
+           NULLIF(last_tape_seq, 0) AS last_tape_seq,
+           message_count + 2 * tape_turn_count AS msg_count
     FROM client_sessions WHERE user_id = ? AND deleted_at IS NULL ORDER BY last_at DESC
   `)
     .all(userId) as Array<{
@@ -1697,7 +1785,7 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
   }))
 }
 
-export async function getClientSession(id: string, userId?: string): Promise<ClientSession | null> {
+async function _sqliteGetClientSession(id: string, userId?: string): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
     ? 'SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
@@ -1716,7 +1804,7 @@ export async function getClientSession(id: string, userId?: string): Promise<Cli
       }
     | undefined
   if (!row) return null
-  const tape = await getClientSessionTapeMeta(row.id, row.user_id)
+  const tape = await _sqliteGetClientSessionTapeMeta(row.id, row.user_id)
   return {
     id: row.id,
     userId: row.user_id,
@@ -1732,7 +1820,7 @@ export async function getClientSession(id: string, userId?: string): Promise<Cli
 }
 
 /** Soft-delete: zero out messages and mark as deleted. Prevents stale PUTs from resurrecting. */
-export async function deleteClientSession(id: string, userId?: string): Promise<boolean> {
+async function _sqliteDeleteClientSession(id: string, userId?: string): Promise<boolean> {
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
     const row = (
@@ -1757,6 +1845,10 @@ export async function deleteClientSession(id: string, userId?: string): Promise<
         id,
         row.user_id,
       )
+      db.prepare('DELETE FROM client_session_turns WHERE session_id = ? AND user_id = ?').run(
+        id,
+        row.user_id,
+      )
     }
     return result.changes > 0
   })
@@ -1764,7 +1856,7 @@ export async function deleteClientSession(id: string, userId?: string): Promise<
 }
 
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
-export async function listUnclaimedSessions(): Promise<
+async function _sqliteListUnclaimedSessions(): Promise<
   Array<{
     id: string
     agentId: string
@@ -1816,7 +1908,7 @@ export async function listUnclaimedSessions(): Promise<
 
 /** Claim an unclaimed session: atomically change user_id from 'default' to the target userId.
  *  Returns true if claimed, false if already claimed by someone else. */
-export async function claimSession(sessionId: string, userId: string): Promise<boolean> {
+async function _sqliteClaimSession(sessionId: string, userId: string): Promise<boolean> {
   const db = await getSessionsDb()
   const txn = db.transaction(() => {
     const result = db
@@ -1829,11 +1921,158 @@ export async function claimSession(sessionId: string, userId: string): Promise<b
       db.prepare(
         "UPDATE client_session_tape SET user_id = ? WHERE session_id = ? AND user_id = 'default'",
       ).run(userId, sessionId)
+      db.prepare(
+        "UPDATE client_session_turns SET user_id = ? WHERE session_id = ? AND user_id = 'default'",
+      ).run(userId, sessionId)
     }
     return result.changes > 0
   })
   return txn()
 }
+
+async function _sqliteRecordClientTurnState(input: {
+  sessionId: string
+  userId: string
+  clientMessageId: string
+  state: ClientTurnState['state']
+  startedAt: number
+  finishedAt?: number | null
+}): Promise<void> {
+  const db = await getSessionsDb()
+  db.prepare(
+    `INSERT INTO client_session_turns
+       (session_id, user_id, client_message_id, state, started_at, finished_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(session_id, user_id, client_message_id) DO UPDATE SET
+       state = excluded.state,
+       started_at = MIN(client_session_turns.started_at, excluded.started_at),
+       finished_at = excluded.finished_at`,
+  ).run(
+    input.sessionId,
+    input.userId,
+    input.clientMessageId,
+    input.state,
+    input.startedAt,
+    input.finishedAt ?? null,
+  )
+}
+
+async function _sqliteGetClientTurnState(
+  sessionId: string,
+  userId: string,
+  clientMessageId: string,
+): Promise<ClientTurnState | null> {
+  const db = await getSessionsDb()
+  const row = db
+    .prepare(
+      `SELECT client_message_id, state, started_at, finished_at
+       FROM client_session_turns
+       WHERE session_id = ? AND user_id = ? AND client_message_id = ?`,
+    )
+    .get(sessionId, userId, clientMessageId) as
+    | {
+        client_message_id: string
+        state: ClientTurnState['state']
+        started_at: number
+        finished_at: number | null
+      }
+    | undefined
+  return row
+    ? {
+        clientMessageId: row.client_message_id,
+        state: row.state,
+        startedAt: row.started_at,
+        finishedAt: row.finished_at,
+      }
+    : null
+}
+
+// ── Browser session authority backend ─────────────────────────────────────
+// Memory/FTS/event/usage functions above remain SQLite-only. Only the hot
+// browser session + transcript surface is delegated so the personal instance
+// can move that lock-heavy workload to PostgreSQL without rewriting unrelated
+// stores in the same release.
+const sqliteClientSessionsBackend = {
+  probe: async () => {
+    await getSessionsDb()
+  },
+  close: async () => {},
+  upsertClientSession: _sqliteUpsertClientSession,
+  appendServerAuthoredMessage: _sqliteAppendServerAuthoredMessage,
+  appendClientSessionTapeFrame: _sqliteAppendClientSessionTapeFrame,
+  getClientSessionTapeMeta: _sqliteGetClientSessionTapeMeta,
+  listClientSessionTapePage: _sqliteListClientSessionTapePage,
+  readClientSessionTapePayload: _sqliteReadClientSessionTapePayload,
+  listClientSessions: _sqliteListClientSessions,
+  getClientSession: _sqliteGetClientSession,
+  deleteClientSession: _sqliteDeleteClientSession,
+  listUnclaimedSessions: _sqliteListUnclaimedSessions,
+  claimSession: _sqliteClaimSession,
+  recordClientTurnState: _sqliteRecordClientTurnState,
+  getClientTurnState: _sqliteGetClientTurnState,
+}
+
+export type ClientSessionsBackend = typeof sqliteClientSessionsBackend
+
+let _activeClientSessionsBackend: ClientSessionsBackend = sqliteClientSessionsBackend
+let _clientSessionsBackendInjected = false
+
+/** Composition-root-only, fail-closed backend selection. */
+export function setClientSessionsBackend(backend: ClientSessionsBackend): void {
+  if (_clientSessionsBackendInjected) {
+    throw new Error('client sessions backend already injected')
+  }
+  _activeClientSessionsBackend = backend
+  _clientSessionsBackendInjected = true
+}
+
+export function getActiveClientSessionsBackend(): ClientSessionsBackend {
+  return _activeClientSessionsBackend
+}
+
+export const upsertClientSession: ClientSessionsBackend['upsertClientSession'] = (...args) =>
+  _activeClientSessionsBackend.upsertClientSession(...args)
+
+export const appendServerAuthoredMessage: ClientSessionsBackend['appendServerAuthoredMessage'] = (
+  ...args
+) => _activeClientSessionsBackend.appendServerAuthoredMessage(...args)
+
+export const appendClientSessionTapeFrame: ClientSessionsBackend['appendClientSessionTapeFrame'] = (
+  ...args
+) => _activeClientSessionsBackend.appendClientSessionTapeFrame(...args)
+
+export const getClientSessionTapeMeta: ClientSessionsBackend['getClientSessionTapeMeta'] = (
+  ...args
+) => _activeClientSessionsBackend.getClientSessionTapeMeta(...args)
+
+export const listClientSessionTapePage: ClientSessionsBackend['listClientSessionTapePage'] = (
+  ...args
+) => _activeClientSessionsBackend.listClientSessionTapePage(...args)
+
+export const readClientSessionTapePayload: ClientSessionsBackend['readClientSessionTapePayload'] = (
+  ...args
+) => _activeClientSessionsBackend.readClientSessionTapePayload(...args)
+
+export const listClientSessions: ClientSessionsBackend['listClientSessions'] = (...args) =>
+  _activeClientSessionsBackend.listClientSessions(...args)
+
+export const getClientSession: ClientSessionsBackend['getClientSession'] = (...args) =>
+  _activeClientSessionsBackend.getClientSession(...args)
+
+export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] = (...args) =>
+  _activeClientSessionsBackend.deleteClientSession(...args)
+
+export const listUnclaimedSessions: ClientSessionsBackend['listUnclaimedSessions'] = (...args) =>
+  _activeClientSessionsBackend.listUnclaimedSessions(...args)
+
+export const claimSession: ClientSessionsBackend['claimSession'] = (...args) =>
+  _activeClientSessionsBackend.claimSession(...args)
+
+export const recordClientTurnState: ClientSessionsBackend['recordClientTurnState'] = (...args) =>
+  _activeClientSessionsBackend.recordClientTurnState(...args)
+
+export const getClientTurnState: ClientSessionsBackend['getClientTurnState'] = (...args) =>
+  _activeClientSessionsBackend.getClientTurnState(...args)
 
 export async function closeSessionsDb(): Promise<void> {
   if (_walTimer !== null) {

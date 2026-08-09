@@ -974,7 +974,7 @@ export class CodexRunner extends EventEmitter {
         })
       } else if (itemType && itemType !== 'agent_message' && itemType !== 'reasoning') {
         // Surface other item types generically so the user knows something happened
-        this.emitAssistantToolUse(itemId, `Codex:${String(itemType)}`, item)
+        this.emitAssistantToolUse(itemId, `codex:${String(itemType)}`, item)
       }
       return {}
     }
@@ -1022,7 +1022,7 @@ export class CodexRunner extends EventEmitter {
         return {}
       }
       // Generic completion for unknown item types
-      this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
+      this.emitToolResult(itemId, JSON.stringify(item), false)
       return {}
     }
 

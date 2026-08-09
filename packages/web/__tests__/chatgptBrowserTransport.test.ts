@@ -50,10 +50,10 @@ describe('ChatGPT browser frontend WebRTC/HiDPI behavior', () => {
 
   it('cache-busts the changed frontend assets consistently', () => {
     assert.match(INDEX, /\/style\.css\?v=71/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=89/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=90/)
     assert.match(INDEX, /sw-flush-v29/)
-    assert.match(SW, /openclaude-v116/)
+    assert.match(SW, /openclaude-v117/)
     assert.match(SW, /\/style\.css\?v=71/)
-    assert.match(SW, /\/modules\/main\.js\?v=89/)
+    assert.match(SW, /\/modules\/main\.js\?v=90/)
   })
 })

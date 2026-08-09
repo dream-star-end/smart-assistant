@@ -43,6 +43,7 @@ import {
   effortsForModel,
   getClientSession,
   getClientSessionTapeMeta,
+  getClientTurnState,
   getJob as getSelfhealJob,
   getUsageSummary,
   listClientSessionTapePage,
@@ -51,7 +52,9 @@ import {
   paths,
   queryEvents,
   readAgentsConfig,
+  readClientSessionTapePayload,
   readConfig,
+  recordClientTurnState,
   searchSessions,
   upsertClientSession,
   writeAgentsConfig,
@@ -143,7 +146,7 @@ import {
 } from './selfheal/receiver.js'
 import { enqueueReleaseJob, readCommittedCutoverPlan } from './selfheal/releaseIntake.js'
 import { SelfhealReleaseWorker, getSelfhealReleaseWorkerDeps } from './selfheal/releaseWorker.js'
-import { SessionManager } from './sessionManager.js'
+import { type AgentSession, SessionManager } from './sessionManager.js'
 import {
   VOICE_WS_PATH,
   type VoiceTranscribeHandler,
@@ -163,6 +166,92 @@ function envNumber(name: string): number | undefined {
   if (!raw) return undefined
   const n = Number(raw)
   return Number.isFinite(n) ? n : undefined
+}
+
+type HelloPeerTurn = {
+  inFlight?: boolean
+  inFlightClientMessageId?: string
+}
+
+export type ReconnectTurnStatus = {
+  status: 'running' | 'idle' | 'completed' | 'interrupted' | 'unknown'
+  clientMessageId?: string
+  startedAt?: number
+}
+
+/**
+ * Reconcile one browser-owned submit against exact server state.
+ *
+ * An idle runner is not proof that the submit was interrupted: it may have
+ * completed while the tab was disconnected. When the warm session cannot
+ * prove a matching terminal outcome we answer `unknown`; the browser then
+ * reads the durable transcript without creating a synthetic chat message.
+ */
+export function resolveReconnectTurnStatus(
+  peer: HelloPeerTurn,
+  session: AgentSession | null | undefined,
+  durableTurn?: {
+    clientMessageId: string
+    state: 'running' | 'completed' | 'interrupted'
+  } | null,
+): ReconnectTurnStatus {
+  if (session?._turnActiveSince) {
+    return {
+      status: 'running',
+      ...(session._activeClientMessageId
+        ? { clientMessageId: session._activeClientMessageId }
+        : {}),
+      startedAt: session._turnActiveSince,
+    }
+  }
+  if (!peer.inFlight) return { status: 'idle' }
+  const requestedId = peer.inFlightClientMessageId
+  if (
+    requestedId &&
+    session?._lastClientMessageId === requestedId &&
+    session._lastClientMessageOutcome
+  ) {
+    return {
+      status: session._lastClientMessageOutcome,
+      clientMessageId: requestedId,
+    }
+  }
+  if (
+    requestedId &&
+    durableTurn?.clientMessageId === requestedId &&
+    durableTurn.state !== 'running'
+  ) {
+    return { status: durableTurn.state, clientMessageId: requestedId }
+  }
+  return {
+    status: 'unknown',
+    ...(requestedId ? { clientMessageId: requestedId } : {}),
+  }
+}
+
+export function resolveHttpByteRange(
+  header: string,
+  totalBytes: number,
+): { start: number; end: number } | null {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header)
+  if (!match || totalBytes <= 0 || (!match[1] && !match[2])) return null
+  if (!match[1]) {
+    const suffix = Number(match[2])
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return null
+    return { start: Math.max(0, totalBytes - suffix), end: totalBytes - 1 }
+  }
+  const start = Number(match[1])
+  const requestedEnd = match[2] ? Number(match[2]) : totalBytes - 1
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(requestedEnd) ||
+    start < 0 ||
+    start >= totalBytes ||
+    requestedEnd < start
+  ) {
+    return null
+  }
+  return { start, end: Math.min(requestedEnd, totalBytes - 1) }
 }
 
 /** Normalize a raw Node header value to a single string (first of a list). */
@@ -288,6 +377,10 @@ export class Gateway {
   private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
   /** Serializes tape commits and externally visible frames per session. */
   private _sessionDeliveryChains = new Map<string, Promise<void>>()
+  /** In-flight REST mutations of the browser session authority. */
+  private _sessionAuthorityWrites = new Set<Promise<unknown>>()
+  /** Inbound dispatches accepted before the shutdown ingress guard closed. */
+  private _inboundDispatches = new Set<Promise<void>>()
   /** A failed tape commit stops later frames from overtaking the missing row. */
   private _tapePoisoned = new Set<string>()
   private static readonly IDEMPOTENCY_MAX_KEYS = 1000
@@ -330,6 +423,44 @@ export class Gateway {
       }
     })
     return current
+  }
+
+  private async _awaitSessionDeliveryDrain(): Promise<void> {
+    // shutdownAll may emit final frames, which append new tails while it is
+    // running. Re-snapshot until the map is empty rather than awaiting only
+    // the chains that happened to exist at shutdown entry.
+    while (this._sessionDeliveryChains.size > 0) {
+      await Promise.all([...this._sessionDeliveryChains.values()])
+    }
+    if (this._tapePoisoned.size > 0) {
+      throw new Error(
+        `cannot establish transcript write barrier: ${this._tapePoisoned.size} session tape(s) poisoned`,
+      )
+    }
+  }
+
+  private _trackSessionAuthorityWrite<T>(operation: Promise<T>): Promise<T> {
+    const tracked = operation.finally(() => this._sessionAuthorityWrites.delete(tracked))
+    this._sessionAuthorityWrites.add(tracked)
+    return tracked
+  }
+
+  private async _awaitSessionAuthorityWriteDrain(): Promise<void> {
+    while (this._sessionAuthorityWrites.size > 0) {
+      await Promise.all([...this._sessionAuthorityWrites])
+    }
+  }
+
+  private _trackInboundDispatch(operation: Promise<void>): Promise<void> {
+    const tracked = operation.finally(() => this._inboundDispatches.delete(tracked))
+    this._inboundDispatches.add(tracked)
+    return tracked
+  }
+
+  private async _awaitInboundDispatchDrain(): Promise<void> {
+    while (this._inboundDispatches.size > 0) {
+      await Promise.allSettled([...this._inboundDispatches])
+    }
   }
 
   // ── Cached task list for high-frequency eventBus lookups ──
@@ -1289,6 +1420,7 @@ export class Gateway {
 
   private async _doShutdown(exit: boolean): Promise<void> {
     this.log.info('shutting down')
+    this.sessions.beginShutdown()
 
     // ── Stage 1: stop accepting new traffic ──
     // `httpServer.close()` stops accepting new HTTP connections but lets
@@ -1398,12 +1530,36 @@ export class Gateway {
     try {
       await this.sessions.shutdownAll()
     } catch (err) {
-      this.log.warn('sessions shutdownAll error', undefined, err)
+      this.log.error('sessions shutdownAll error', undefined, err)
+      throw err
     }
+    await this._awaitInboundDispatchDrain()
     try {
       await this.sessions.awaitResumeMapFlush()
     } catch (err) {
-      this.log.warn('resume map flush error', undefined, err)
+      this.log.error('resume map flush error', undefined, err)
+      throw err
+    }
+    try {
+      await this._awaitSessionDeliveryDrain()
+    } catch (err) {
+      // The chain wrapper records failures as settled so this is unexpected;
+      // keep it visible and fail the shutdown rather than declaring a safe
+      // storage-cutover barrier with uncommitted transcript work.
+      this.log.error('session delivery drain failed', undefined, err)
+      throw err
+    }
+    await this._awaitSessionAuthorityWriteDrain()
+    // A REST mutation cannot enqueue tape delivery today, but repeat the
+    // transcript drain so the shutdown barrier remains correct if those two
+    // paths are composed later.
+    await this._awaitSessionDeliveryDrain()
+    const { replayMsgOutbox } = await import('@openclaude/storage')
+    const outbox = await replayMsgOutbox()
+    if (outbox.requeued > 0 || outbox.malformed > 0) {
+      throw new Error(
+        `cannot establish transcript write barrier: outbox requeued=${outbox.requeued} malformed=${outbox.malformed}`,
+      )
     }
 
     // ── Stage 5: force-close remaining sockets ──
@@ -1994,28 +2150,78 @@ export class Gateway {
     }
     if (url.pathname === '/api/sessions/claim' && req.method === 'POST') {
       const userId = this.getUserId(req)
-      this.readBody(req)
-        .then(async (body) => {
-          const { sessionIds } = JSON.parse(body) as { sessionIds: string[] }
-          if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
-            this.sendJson(res, 400, { error: 'sessionIds required' })
-            return
-          }
-          const results: Record<string, boolean> = {}
-          for (const sid of sessionIds) {
-            results[sid] = await claimSession(sid, userId)
-            if (results[sid]) {
-              this._redisSessionBus.invalidateSessionList(userId)
-              this._redisSessionBus.invalidateSessionList('default')
-              this._redisSessionBus.deleteClientSessionCache('default', sid)
+      void this._trackSessionAuthorityWrite(
+        this.readBody(req)
+          .then(async (body) => {
+            const { sessionIds } = JSON.parse(body) as { sessionIds: string[] }
+            if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+              this.sendJson(res, 400, { error: 'sessionIds required' })
+              return
             }
-          }
-          this.sendJson(res, 200, { ok: true, results })
-        })
-        .catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+            const results: Record<string, boolean> = {}
+            for (const sid of sessionIds) {
+              results[sid] = await claimSession(sid, userId)
+              if (results[sid]) {
+                this._redisSessionBus.invalidateSessionList(userId)
+                this._redisSessionBus.invalidateSessionList('default')
+                this._redisSessionBus.deleteClientSessionCache('default', sid)
+              }
+            }
+            this.sendJson(res, 200, { ok: true, results })
+          })
+          .catch(() => this.sendJson(res, 400, { error: 'invalid body' })),
+      )
       return
     }
-    const clientTapeMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/tape$/)
+    const clientTapePayloadMatch = url.pathname.match(
+      /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/timeline\/(\d+)\/payload$/,
+    )
+    if (clientTapePayloadMatch && req.method === 'GET') {
+      const sessId = clientTapePayloadMatch[1]
+      const tapeSeq = Number(clientTapePayloadMatch[2])
+      const userId = this.getUserId(req)
+      if (!Number.isSafeInteger(tapeSeq) || tapeSeq <= 0) {
+        this.sendJson(res, 400, { error: 'invalid timeline sequence' })
+        return
+      }
+      readClientSessionTapePayload(sessId, userId, tapeSeq)
+        .then((record) => {
+          if (!record) {
+            this.sendJson(res, 404, { error: 'not found' })
+            return
+          }
+          let start = 0
+          let end = record.bytes - 1
+          let status = 200
+          const range = req.headers.range
+          if (range) {
+            const resolved = resolveHttpByteRange(range, record.bytes)
+            if (!resolved) {
+              res.writeHead(416, { 'Content-Range': `bytes */${record.bytes}` })
+              res.end()
+              return
+            }
+            ;({ start, end } = resolved)
+            status = 206
+          }
+          const payload = record.payload.subarray(start, end + 1)
+          res.writeHead(status, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Length': payload.byteLength,
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'private, no-store',
+            ETag: `"${record.sha256}"`,
+            'X-Content-SHA256': record.sha256,
+            ...(status === 206 ? { 'Content-Range': `bytes ${start}-${end}/${record.bytes}` } : {}),
+          })
+          res.end(payload)
+        })
+        .catch(() => this.sendJson(res, 500, { error: 'timeline payload query failed' }))
+      return
+    }
+    const clientTapeMatch = url.pathname.match(
+      /^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/(?:timeline|tape)$/,
+    )
     if (clientTapeMatch && req.method === 'GET') {
       const sessId = clientTapeMatch[1]
       const userId = this.getUserId(req)
@@ -2055,47 +2261,51 @@ export class Gateway {
         return
       }
       if (req.method === 'PUT') {
-        this.readBody(req)
-          .then(async (body) => {
-            const data = JSON.parse(body)
-            const updatedAt = Date.now()
-            const applied = await upsertClientSession(
-              {
-                id: sessId,
-                userId,
-                agentId: data.agentId || 'main',
-                title: data.title || '新会话',
-                pinned: !!data.pinned,
-                createdAt: data.createdAt || Date.now(),
-                lastAt: data.lastAt || Date.now(),
-                messages: data.messages || [],
-                updatedAt,
-              },
-              data._baseSyncedAt || 0,
-            )
-            if (!applied) {
-              this.sendJson(res, 409, { error: 'conflict' })
-            } else {
-              this._redisSessionBus.invalidateSessionList(userId)
-              getClientSession(sessId, userId)
-                .then((merged) => {
-                  if (merged) this._redisSessionBus.setClientSession(userId, merged)
-                })
-                .catch(() => {})
-              this.sendJson(res, 200, { ok: true, applied: true, updatedAt })
-            }
-          })
-          .catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+        void this._trackSessionAuthorityWrite(
+          this.readBody(req)
+            .then(async (body) => {
+              const data = JSON.parse(body)
+              const updatedAt = Date.now()
+              const applied = await upsertClientSession(
+                {
+                  id: sessId,
+                  userId,
+                  agentId: data.agentId || 'main',
+                  title: data.title || '新会话',
+                  pinned: !!data.pinned,
+                  createdAt: data.createdAt || Date.now(),
+                  lastAt: data.lastAt || Date.now(),
+                  messages: data.messages || [],
+                  updatedAt,
+                },
+                data._baseSyncedAt || 0,
+              )
+              if (!applied) {
+                this.sendJson(res, 409, { error: 'conflict' })
+              } else {
+                this._redisSessionBus.invalidateSessionList(userId)
+                getClientSession(sessId, userId)
+                  .then((merged) => {
+                    if (merged) this._redisSessionBus.setClientSession(userId, merged)
+                  })
+                  .catch(() => {})
+                this.sendJson(res, 200, { ok: true, applied: true, updatedAt })
+              }
+            })
+            .catch(() => this.sendJson(res, 400, { error: 'invalid body' })),
+        )
         return
       }
       if (req.method === 'DELETE') {
-        deleteClientSession(sessId, userId)
-          .then(() => {
-            this._redisSessionBus.deleteClientSessionCache(userId, sessId)
-            this._redisSessionBus.invalidateSessionList(userId)
-            this.sendJson(res, 200, { ok: true })
-          })
-          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
+        void this._trackSessionAuthorityWrite(
+          deleteClientSession(sessId, userId)
+            .then(() => {
+              this._redisSessionBus.deleteClientSessionCache(userId, sessId)
+              this._redisSessionBus.invalidateSessionList(userId)
+              this.sendJson(res, 200, { ok: true })
+            })
+            .catch(() => this.sendJson(res, 500, { error: 'delete failed' })),
+        )
         return
       }
     }
@@ -6390,6 +6600,7 @@ export class Gateway {
       peerId: string
       agentId: string
       inFlight?: boolean
+      inFlightClientMessageId?: string
       lastFrameSeq?: number
     }>,
     ws: WebSocket,
@@ -6590,50 +6801,23 @@ export class Gateway {
         }
       }
 
-      // Push a synthetic isFinal to the reconnected client for sessions that the client
-      // reports as in-flight (had _sendingInFlight=true) but whose subprocess is not
-      // currently running. This clears the client's stuck _sendingInFlight state from
-      // the interrupted turn. Without this, the client shows a permanent typing indicator
-      // and the resumed subprocess sits idle — neither side moves first.
-      const peerInFlight = peers.find((p) => p.peerId === peerId)?.inFlight
-      if (peerInFlight && session && !session._turnActiveSince) {
-        try {
-          // Single-ws send (only the hello-ing client should see this notice),
-          // so deliver() isn't appropriate here — stamp ts inline.
-          const interruptFrame = JSON.stringify({
-            type: 'outbound.message',
-            sessionKey,
-            channel: 'webchat',
-            peer: { id: peerId, kind: 'dm' },
-            agentId: aid,
-            blocks: [
-              {
-                kind: 'text',
-                text: '\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。',
-              },
-            ],
-            meta: { interrupted: 'service_restart' } as any,
-            isFinal: true,
-            ts: Date.now(),
-          })
-          ws.send(interruptFrame)
-          this.log.info('auto-resume pushed turn-interrupted isFinal', {
-            sessionKey,
-          })
-        } catch {}
-      }
-
-      // Reconcile the browser's persisted in-flight marker from authoritative
-      // server turn state. A Codex app-server process is long-lived, so
-      // runner.isRunning cannot distinguish an active turn from an idle thread.
+      // Reconcile the exact browser submit. Never turn "server is idle" into
+      // a synthetic interruption bubble: the turn may have completed while the
+      // tab was disconnected. An unprovable outcome is `unknown` and is settled
+      // by the browser from the durable transcript.
+      const peerTurn = peers.find((p) => p.peerId === peerId)
+      const durableTurn =
+        peerTurn?.inFlightClientMessageId && !session?._turnActiveSince
+          ? await getClientTurnState(peerId, helloUserId, peerTurn.inFlightClientMessageId)
+          : null
+      const reconciled = resolveReconnectTurnStatus(peerTurn ?? {}, session, durableTurn)
       this._sendStampedSessionFrame(sessionKey, peerKey, {
         type: 'outbound.turn_status',
         sessionKey,
         channel: 'webchat',
         peer: { id: peerId, kind: 'dm' },
         agentId: aid,
-        status: session?._turnActiveSince ? 'running' : 'idle',
-        ...(session?._turnActiveSince ? { startedAt: session._turnActiveSince } : {}),
+        ...reconciled,
         ts: Date.now(),
       })
     }
@@ -6652,10 +6836,14 @@ export class Gateway {
     }
   }
 
-  private async dispatchInbound(frame: InboundFrame, adapter?: ChannelAdapter): Promise<void> {
+  private dispatchInbound(frame: InboundFrame, adapter?: ChannelAdapter): Promise<void> {
     // Ingress guard: drop new messages once shutdown begins so we don't spin
     // up work that `shutdownAll()` then has to tear back down.
-    if (this._shuttingDown) return
+    if (this._shuttingDown) return Promise.resolve()
+    return this._trackInboundDispatch(this._dispatchInbound(frame, adapter))
+  }
+
+  private async _dispatchInbound(frame: InboundFrame, adapter?: ChannelAdapter): Promise<void> {
     if (frame.type !== 'inbound.message') {
       // TODO: 权限响应处理
       return
@@ -7227,7 +7415,10 @@ export class Gateway {
     const turnStatusPeerKey = adapter
       ? null
       : Gateway.makePeerKey(activeUserId, frame.channel, frame.peer.id)
-    const sendAuthoritativeTurnStatus = (status: 'running' | 'compacting' | 'idle') => {
+    const turnStartedAt = Date.now()
+    const sendAuthoritativeTurnStatus = (
+      status: 'running' | 'compacting' | 'completed' | 'interrupted',
+    ) => {
       if (!turnStatusPeerKey) return
       this._sendStampedSessionFrame(sessionKey, turnStatusPeerKey, {
         type: 'outbound.turn_status',
@@ -7236,7 +7427,10 @@ export class Gateway {
         peer: frame.peer,
         agentId: session.agentId,
         status,
-        startedAt: session._turnActiveSince ?? Date.now(),
+        clientMessageId: frame.idempotencyKey,
+        ...(status === 'running' || status === 'compacting'
+          ? { startedAt: session._turnActiveSince ?? turnStartedAt }
+          : {}),
         ts: Date.now(),
       })
     }
@@ -7245,6 +7439,7 @@ export class Gateway {
       ? setInterval(() => sendAuthoritativeTurnStatus('running'), 30_000)
       : null
     turnHeartbeat?.unref()
+    let terminalOutcome: 'completed' | 'interrupted' = 'interrupted'
     try {
       await this.sessions.submit(
         session,
@@ -7271,11 +7466,18 @@ export class Gateway {
               // WebChat: stream each block immediately via WS
               if (!isTail) out.blocks.push(e.block)
               this.deliver(
-                { ...out, blocks: [e.block], isFinal: false, turnId: session._activeTurnId },
+                {
+                  ...out,
+                  blocks: [e.block],
+                  isFinal: false,
+                  turnId: session._activeTurnId,
+                  clientMessageId: frame.idempotencyKey,
+                },
                 undefined,
               )
             }
           } else if (e.kind === 'final') {
+            terminalOutcome = 'completed'
             this._runLog.complete(_run, {
               status: 'completed',
               cost: e.meta?.cost,
@@ -7298,7 +7500,14 @@ export class Gateway {
               )
             } else {
               this.deliver(
-                { ...out, blocks: [], isFinal: true, meta: e.meta, turnId: session._activeTurnId },
+                {
+                  ...out,
+                  blocks: [],
+                  isFinal: true,
+                  meta: e.meta,
+                  turnId: session._activeTurnId,
+                  clientMessageId: frame.idempotencyKey,
+                },
                 undefined,
               )
             }
@@ -7320,6 +7529,7 @@ export class Gateway {
                 peer: frame.peer,
                 agentId: session.agentId,
                 status: e.status === 'compacting' ? 'compacting' : 'running',
+                clientMessageId: frame.idempotencyKey,
                 startedAt: session._turnActiveSince ?? Date.now(),
                 ts: Date.now(),
               })
@@ -7414,6 +7624,7 @@ export class Gateway {
               }
             }
           } else if (e.kind === 'error') {
+            terminalOutcome = 'completed'
             this._runLog.complete(_run, { status: 'failed', error: e.error })
             // Remove idempotency key on failure to allow client retry
             if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
@@ -7428,6 +7639,7 @@ export class Gateway {
                 ],
                 isFinal: true,
                 turnId: session._activeTurnId,
+                clientMessageId: frame.idempotencyKey,
               },
               adapter,
             )
@@ -7437,10 +7649,28 @@ export class Gateway {
         safeConversationMode,
         goalObjective,
         safeModel,
+        frame.idempotencyKey,
       )
     } finally {
       if (turnHeartbeat) clearInterval(turnHeartbeat)
-      sendAuthoritativeTurnStatus('idle')
+      session._lastClientMessageId = frame.idempotencyKey
+      session._lastClientMessageOutcome = terminalOutcome
+      if (session._activeClientMessageId === frame.idempotencyKey) {
+        session._activeClientMessageId = undefined
+      }
+      try {
+        await recordClientTurnState({
+          sessionId: frame.peer.id,
+          userId: activeUserId,
+          clientMessageId: frame.idempotencyKey,
+          state: terminalOutcome,
+          startedAt: turnStartedAt,
+          finishedAt: Date.now(),
+        })
+      } catch (err) {
+        this.log.error('client turn terminal state commit failed', { sessionKey }, err)
+      }
+      sendAuthoritativeTurnStatus(terminalOutcome)
     }
   }
 
