@@ -1422,6 +1422,11 @@ class TurnHardLimitError extends Error {
   }
 }
 
+/** Internal proof that a resolved CCB terminal contained only the canonical
+ * provider context-overflow diagnostic, so replaying the same user turn with
+ * a smaller master-history suffix cannot duplicate observable work. */
+class SafeCcbContextRebuildRetryError extends Error {}
+
 export interface PromptQueueExecutionFence {
   readonly sessionKey: string
   readonly token: symbol
@@ -3991,14 +3996,18 @@ export class SessionManager {
         // user and do not add transient backoff latency.
         if (
           errorClass === 'context_too_long' &&
-          session.providerTag === 'codex' &&
+          (
+            session.providerTag === 'codex' ||
+            err instanceof SafeCcbContextRebuildRetryError
+          ) &&
           canRetry() &&
           contextOverflowRetryIndex < contextOverflowRetryInputs.length
         ) {
           contextOverflowRetryIndex += 1
           retryInput = contextOverflowRetryInputs[contextOverflowRetryIndex - 1]!
-          log.warn('codex context window exhausted; rebuilding with smaller history', {
+          log.warn('native context window exhausted; rebuilding with smaller history', {
             sessionKey: session.sessionKey,
+            provider: session.providerTag,
             attempt: contextOverflowRetryIndex,
             maxRetries: retryState.max,
             ...(traceId ? { traceId } : {}),
@@ -4704,9 +4713,15 @@ export class SessionManager {
             return
           }
 
-          if (result?.errorClass === 'context_too_long' && session.providerTag === 'codex') {
-            log.warn('codex context window exhausted; clearing native resume for next turn', {
+          const terminalResultErrorClass =
+            result?.errorClass ?? classifyRunError(result?.errorDetail).code
+          if (
+            terminalResultErrorClass === 'context_too_long' &&
+            (session.providerTag === 'ccb' || session.providerTag === 'codex')
+          ) {
+            log.warn('native context window exhausted; clearing resume before context rebuild', {
               sessionKey: session.sessionKey,
+              provider: session.providerTag,
               ...(traceId ? { traceId } : {}),
             })
             await runner.shutdown()
@@ -4735,8 +4750,7 @@ export class SessionManager {
             return
           }
 
-          const transientErrorClass =
-            result?.errorClass ?? classifyRunError(result?.errorDetail).code
+          const transientErrorClass = terminalResultErrorClass
           const contextOverflowHasUsage =
             result !== null &&
             (
@@ -4749,17 +4763,26 @@ export class SessionManager {
                 (value) => typeof value === 'number' && value !== 0,
               )
             )
+          const ccbContextDiagnostic =
+            session.providerTag === 'ccb' &&
+            result !== null &&
+            result.assistantSegments.length === 1 &&
+            /^API Error:\s*413\b[\s\S]*\bPROMPT_TOO_LONG\b[\s\S]*$/i.test(
+              result.assistantSegments[0]!.text.trim(),
+            ) &&
+            result.assistantText.trim() === result.assistantSegments[0]!.text.trim()
           const contextOverflowIsSafeToRetry =
             result !== null &&
             transientErrorClass === 'context_too_long' &&
-            session.providerTag === 'codex' &&
-            turnBlockCount === 0 &&
+            (session.providerTag === 'ccb' || session.providerTag === 'codex') &&
+            (session.providerTag === 'codex' || ccbContextDiagnostic) &&
+            turnBlockCount === (ccbContextDiagnostic ? 1 : 0) &&
             turnPermissionCount === 0 &&
             turnToolCallCount === 0 &&
             structuredBlocks.length === 0 &&
-            result.assistantText.length === 0 &&
+            (result.assistantText.length === 0 || ccbContextDiagnostic) &&
             result.thinkingText.length === 0 &&
-            result.assistantSegments.length === 0 &&
+            (result.assistantSegments.length === 0 || ccbContextDiagnostic) &&
             result.thinkingSegments.length === 0 &&
             result.tools.length === 0 &&
             !contextOverflowHasUsage
@@ -4822,9 +4845,13 @@ export class SessionManager {
             // The failed attempt is free and must not claim the shared
             // request/turn identity before the terminal attempt.
             terminalEngineBilling = undefined
-            settle(() => reject(new Error(
-              result.errorDetail ?? `${transientErrorClass}: transient model failure`,
-            )))
+            const retryError = result.errorDetail ??
+              `${transientErrorClass}: transient model failure`
+            settle(() => reject(
+              contextOverflowIsSafeToRetry && session.providerTag === 'ccb'
+                ? new SafeCcbContextRebuildRetryError(retryError)
+                : new Error(retryError),
+            ))
             return
           }
 

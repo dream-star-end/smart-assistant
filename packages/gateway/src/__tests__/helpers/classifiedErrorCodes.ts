@@ -51,7 +51,7 @@ function parseUnionLiterals(source: string, marker: string): string[] {
 export interface ClassifiedErrorCodeInventory {
   /** classifyRunError 能产出的非 unknown 码(= ClassifiedErrorCode − 'unknown')。 */
   readonly classifyCodes: readonly string[]
-  /** 只有 delegate 输出分类器会产出的额外码(DelegateOutputError.code 的扩展成员)。 */
+  /** Delegate 输出分类器声明的额外码（当前值域已统一，因此为空）。 */
   readonly delegateOnlyCodes: readonly string[]
   /** 两者并集 —— gateway 侧一切 turn 级错误分类的完整非 unknown 值域。 */
   readonly allCodes: readonly string[]
@@ -71,7 +71,7 @@ export async function readClassifiedErrorCodes(): Promise<ClassifiedErrorCodeInv
     anchorFailure("ClassifiedErrorCode 的 'unknown' 兜底成员")
   }
 
-  // `code: ClassifiedErrorCode | 'bad_request'` —— delegate 专属扩展成员。
+  // Parse any future `code: ClassifiedErrorCode | '...'` delegate-only extension.
   const delegateMarker = 'export interface DelegateOutputError {'
   const delegateStart = source.indexOf(delegateMarker)
   if (delegateStart < 0) anchorFailure(delegateMarker)
